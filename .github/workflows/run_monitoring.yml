@@ -38,8 +38,10 @@ jobs:
         chmod 600 kalshi_private_key.pem
 
     - name: Write GCP service account key
+      env:
+        GCP_SA_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
       run: |
-        echo "${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}" > gcp_sa_key.json
+        printenv GCP_SA_KEY > gcp_sa_key.json
 
     - name: Run monitoring script
       env:
