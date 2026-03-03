@@ -1,16 +1,15 @@
-name: NBAMENTION v4.2 Trading Bot
+name: NBAMENTION Daily Monitoring
 
-# Runs every 2 hours (offset by 2 min to avoid top-of-hour congestion)
-# Times in UTC: 0:02, 2:02, 4:02, 6:02, 8:02, 10:02, 12:02, 14:02, 16:02, 18:02, 20:02, 22:02
+# Runs once daily at 10:00 AM UTC (5:00 AM ET)
 on:
   schedule:
-    - cron: '2 */2 * * *'
+    - cron: '0 10 * * *'
   workflow_dispatch:  # Manual trigger
 
 jobs:
-  run-trading-script:
+  run-monitoring:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
     - name: Checkout repository
@@ -26,14 +25,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install \
           pandas \
+          numpy \
           requests \
           cryptography \
           google-auth \
           google-cloud-bigquery \
-          pandas-gbq \
-          pyarrow \
-          scipy \
-          pytz
+          pyarrow
 
     - name: Write Kalshi private key
       run: |
@@ -46,14 +43,14 @@ jobs:
       run: |
         printenv GCP_SA_KEY > gcp_sa_key.json
 
-    - name: Run trading script
+    - name: Run monitoring script
       env:
         KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
         KALSHI_PRIVATE_KEY_PATH: kalshi_private_key.pem
         GOOGLE_APPLICATION_CREDENTIALS: gcp_sa_key.json
         GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
-      run: python nbamention_v4_2.py
+      run: python nbamention_monitoring.py
 
     - name: Cleanup secrets
       if: always()
