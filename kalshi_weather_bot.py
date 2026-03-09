@@ -150,7 +150,7 @@ def decode_private_key(b64_key="", file_path=""):
     elif file_path and os.path.exists(file_path):
         with open(file_path, "rb") as f: pem = f.read()
     else:
-        raise FileNotFoundError(f"No private key. Set KALSHI_PRIVATE_KEY_B64 or place at '{file_path}'.")
+        raise FileNotFoundError(f"No private key. Set KALSHI_PRIVATE_KEY or place at '{file_path}'.")
     return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
 
 def resolve_gcp_credentials():
@@ -697,7 +697,7 @@ def main():
     log.info("="*60)
 
     if not KALSHI_API_KEY_ID: log.error("KALSHI_API_KEY_ID not set."); sys.exit(1)
-    if not KALSHI_PRIVATE_KEY_B64 and not os.path.exists(KALSHI_PRIVATE_KEY_PATH):
+    if not KALSHI_PRIVATE_KEY and not os.path.exists(KALSHI_PRIVATE_KEY_PATH):
         log.error("No Kalshi private key found."); sys.exit(1)
 
     central_time = datetime.now(pytz.timezone("US/Central"))
@@ -705,7 +705,7 @@ def main():
     log.info("CT: %s | %s (var=%d)", central_time.strftime("%Y-%m-%d %H:%M:%S"),
              "evening" if variable else "morning", variable)
 
-    pk = decode_private_key(b64_key=KALSHI_PRIVATE_KEY_B64, file_path=KALSHI_PRIVATE_KEY_PATH)
+    pk = decode_private_key(b64_key=KALSHI_PRIVATE_KEY, file_path=KALSHI_PRIVATE_KEY_PATH)
     xc = ExchangeClient(exchange_api_base=KALSHI_API_BASE, key_id=KALSHI_API_KEY_ID, private_key=pk)
     st = xc.get_exchange_status(); log.info("Exchange: %s", st)
     if not st.get("trading_active"): log.warning("Trading inactive."); sys.exit(0)
