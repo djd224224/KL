@@ -1,4 +1,4 @@
-name: Scheduled Kalshi Workflow
+name: High Temp Trading
 
 # Runs at 7:02 PM, 11:02 PM, 6:02 AM, and 7:02 AM CT every day
 # CT = UTC-6 (CST) or UTC-5 (CDT)
@@ -29,8 +29,7 @@ jobs:
       - name: Run Kalshi script
         env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
-          KALSHI_PRIVATE_KEY_B64: ${{ secrets.KALSHI_PRIVATE_KEY_B64 }}
-          GCP_CREDENTIALS_B64: ${{ secrets.GCP_CREDENTIALS_B64 }}
+          KALSHI_PRIVATE_KEY_B64: ${{ secrets.KALSHI_PRIVATE_KEY }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
           WEATHER_UNDERGROUND_KEY: ${{ secrets.WEATHER_UNDERGROUND_KEY }}
