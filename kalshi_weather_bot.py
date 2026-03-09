@@ -149,7 +149,22 @@ def decode_private_key(b64_key="", file_path=""):
         try:
             pem = base64.b64decode(b64_key)
         except Exception:
-            pem = b64_key.encode()
+            # Raw PEM — restore newlines if GitHub stripped them
+            raw = b64_key.strip()
+            raw = raw.replace("\\n", "\n")
+            if "-----" in raw and "\n" not in raw.split("-----")[1]:
+                # Newlines were stripped — reconstruct
+                raw = raw.replace("-----BEGIN ", "\n-----BEGIN ")
+                raw = raw.replace("-----END ", "\n-----END ")
+                raw = raw.replace(" PRIVATE KEY-----", " PRIVATE KEY-----\n")
+                # Re-chunk the base64 body into 64-char lines
+                parts = raw.strip().split("\n")
+                header = parts[0]
+                footer = parts[-1]
+                body = "".join(parts[1:-1])
+                chunked = "\n".join([body[i:i+64] for i in range(0, len(body), 64)])
+                raw = f"{header}\n{chunked}\n{footer}\n"
+            pem = raw.encode()
     elif file_path and os.path.exists(file_path):
         with open(file_path, "rb") as f: pem = f.read()
     else:
