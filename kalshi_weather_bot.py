@@ -58,7 +58,7 @@ log = logging.getLogger("kalshi_weather_bot")
 # ---------------------------------------------------------------------------
 KALSHI_API_KEY_ID      = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
 KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
-KALSHI_PRIVATE_KEY_B64 = os.environ.get("KALSHI_PRIVATE_KEY", "")
+KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY", "")
 KALSHI_API_BASE        = "https://api.elections.kalshi.com/trade-api/v2"
 
 BQ_PROJECT          = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
