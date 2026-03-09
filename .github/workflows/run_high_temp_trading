@@ -1,28 +1,38 @@
-# name: Scheduled Kalshi Workflow
+name: Scheduled Kalshi Workflow
 
-#   #To run the job at 7:02 PM, 11:02 PM, 6:02 AM, and 7:02 AM CT Time every day, you need to adjust the cron expression accordingly:
-# on:
-#   schedule:
-#     - cron: '2 0,5,12,13 * * *'
-#   workflow_dispatch:
+# Runs at 7:02 PM, 11:02 PM, 6:02 AM, and 7:02 AM CT every day
+# CT = UTC-6 (CST) or UTC-5 (CDT)
+on:
+  schedule:
+    - cron: '2 0,5,12,13 * * *'
+  workflow_dispatch:
 
-# jobs:
-#   run-kalshi-script:
-#     runs-on: ubuntu-latest
+jobs:
+  run-kalshi-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
-#     steps:
-#     - name: Checkout repository
-#       uses: actions/checkout@v2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
 
-#     - name: Set up Python
-#       uses: actions/setup-python@v2
-#       with:
-#         python-version: '3.x'
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.x'
 
-#     - name: Install dependencies
-#       run: |
-#         python -m pip install --upgrade pip
-#         pip install pandas requests cryptography google-auth google-api-python-client scipy pytz
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests cryptography google-auth google-auth-oauthlib google-api-python-client google-cloud-bigquery db-dtypes pyarrow scipy pytz
 
-#     - name: Run Kalshi script
-#       run: python jane_kalshi.py
+      - name: Run Kalshi script
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY_B64: ${{ secrets.KALSHI_PRIVATE_KEY_B64 }}
+          GCP_CREDENTIALS_B64: ${{ secrets.GCP_CREDENTIALS_B64 }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
+          WEATHER_UNDERGROUND_KEY: ${{ secrets.WEATHER_UNDERGROUND_KEY }}
+          ACCUWEATHER_KEY: ${{ secrets.ACCUWEATHER_KEY }}
+        run: python kalshi_weather_bot.py
