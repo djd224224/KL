@@ -57,7 +57,8 @@ log = logging.getLogger("kalshi_weather_bot")
 # Configuration — env vars with Colab defaults
 # ---------------------------------------------------------------------------
 KALSHI_API_KEY_ID      = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
-KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
+# KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
+KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "Lisa_Kalshi.txt")
 KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY", "")
 KALSHI_API_BASE        = "https://api.elections.kalshi.com/trade-api/v2"
 
@@ -145,28 +146,13 @@ def get_session_variable():
     return 1 if 14 <= ct.hour < 23 else 0
 
 def decode_private_key(b64_key="", file_path=""):
-    if b64_key:
+    if file_path and os.path.exists(file_path):
+        with open(file_path, "rb") as f: pem = f.read()
+    elif b64_key:
         try:
             pem = base64.b64decode(b64_key)
         except Exception:
-            # Raw PEM — restore newlines if GitHub stripped them
-            raw = b64_key.strip()
-            raw = raw.replace("\\n", "\n")
-            if "-----" in raw and "\n" not in raw.split("-----")[1]:
-                # Newlines were stripped — reconstruct
-                raw = raw.replace("-----BEGIN ", "\n-----BEGIN ")
-                raw = raw.replace("-----END ", "\n-----END ")
-                raw = raw.replace(" PRIVATE KEY-----", " PRIVATE KEY-----\n")
-                # Re-chunk the base64 body into 64-char lines
-                parts = raw.strip().split("\n")
-                header = parts[0]
-                footer = parts[-1]
-                body = "".join(parts[1:-1])
-                chunked = "\n".join([body[i:i+64] for i in range(0, len(body), 64)])
-                raw = f"{header}\n{chunked}\n{footer}\n"
-            pem = raw.encode()
-    elif file_path and os.path.exists(file_path):
-        with open(file_path, "rb") as f: pem = f.read()
+            pem = b64_key.encode()
     else:
         raise FileNotFoundError(f"No private key. Set KALSHI_PRIVATE_KEY or place at '{file_path}'.")
     return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
