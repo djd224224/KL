@@ -146,13 +146,16 @@ def get_session_variable():
 
 def decode_private_key(b64_key="", file_path=""):
     if b64_key:
-        pem = base64.b64decode(b64_key)
+        try:
+            pem = base64.b64decode(b64_key)
+        except Exception:
+            pem = b64_key.encode()
     elif file_path and os.path.exists(file_path):
         with open(file_path, "rb") as f: pem = f.read()
     else:
         raise FileNotFoundError(f"No private key. Set KALSHI_PRIVATE_KEY or place at '{file_path}'.")
     return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
-
+  
 def resolve_gcp_credentials():
     """Authenticate to GCP. Colab: interactive login. GitHub Actions: uses ADC."""
     if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
