@@ -12,8 +12,7 @@ Runs in two environments:
 
 GitHub Actions secrets:
     KALSHI_API_KEY_ID       - Kalshi API key ID
-    KALSHI_PRIVATE_KEY_B64  - Base64-encoded RSA private key (PEM)
-    GCP_CREDENTIALS_B64     - Base64-encoded GCP service account JSON
+    KALSHI_PRIVATE_KEY      - Base64-encoded RSA private key (PEM)
     GCP_PROJECT_ID          - Google Cloud project ID for BigQuery
     GCP_DATASET_ID          - BigQuery dataset name
     WEATHER_UNDERGROUND_KEY - Weather Underground (weather.com) API key
@@ -30,7 +29,6 @@ import json
 import uuid
 import base64
 import logging
-import tempfile
 from datetime import datetime, timedelta
 
 IS_COLAB = "google.colab" in sys.modules or "COLAB_RELEASE_TAG" in os.environ
@@ -59,15 +57,12 @@ log = logging.getLogger("kalshi_weather_bot")
 # Configuration — env vars with Colab defaults
 # ---------------------------------------------------------------------------
 KALSHI_API_KEY_ID      = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
-# KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
-KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "Lisa_Kalshi.txt")
+KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
 KALSHI_PRIVATE_KEY_B64 = os.environ.get("KALSHI_PRIVATE_KEY", "")
 KALSHI_API_BASE        = "https://api.elections.kalshi.com/trade-api/v2"
 
 BQ_PROJECT          = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
 BQ_DATASET          = os.environ.get("GCP_DATASET_ID", "Kalshi")
-GCP_CREDENTIALS_PATH = os.environ.get("GCP_CREDENTIALS_PATH", "google_credentials.json")
-GCP_CREDENTIALS_B64  = os.environ.get("GCP_CREDENTIALS_B64", "")
 
 WEATHER_UNDERGROUND_KEY = os.environ.get("WEATHER_UNDERGROUND_KEY", "a828c2a178844147a8c2a17884a147a5")
 ACCUWEATHER_KEY         = os.environ.get("ACCUWEATHER_KEY", "lEl0lfAft6PncVXwatr92Y2YjGJL5YKs")
@@ -159,20 +154,14 @@ def decode_private_key(b64_key="", file_path=""):
     return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
 
 def resolve_gcp_credentials():
-    import google.auth
-    if GCP_CREDENTIALS_B64:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="wb")
-        tmp.write(base64.b64decode(GCP_CREDENTIALS_B64)); tmp.close()
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
+    """Authenticate to GCP. Colab: interactive login. GitHub Actions: uses ADC."""
     if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         try:
-            from google.colab import auth; auth.authenticate_user()
+            from google.colab import auth
+            auth.authenticate_user()
             log.info("Authenticated via Colab")
         except ImportError:
-            if os.path.exists(GCP_CREDENTIALS_PATH):
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GCP_CREDENTIALS_PATH
-    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/bigquery"])
-    return credentials
+            pass
 
 def get_city_abv(ticker):
     for key in CITY_ABV_KEYS:
@@ -196,9 +185,9 @@ def build_yesterday_tickers(central_time, variable):
 # ===========================================================================
 # BigQuery
 # ===========================================================================
-def setup_bigquery(credentials):
+def setup_bigquery():
     from google.cloud import bigquery
-    client = bigquery.Client(project=BQ_PROJECT, credentials=credentials)
+    client = bigquery.Client(project=BQ_PROJECT)
     dataset_ref = bigquery.DatasetReference(BQ_PROJECT, BQ_DATASET)
     try: client.get_dataset(dataset_ref)
     except Exception:
@@ -722,7 +711,8 @@ def main():
     if not st.get("trading_active"): log.warning("Trading inactive."); sys.exit(0)
 
     log.info("BigQuery: project=%s dataset=%s", BQ_PROJECT, BQ_DATASET)
-    bq, schemas = setup_bigquery(resolve_gcp_credentials())
+    resolve_gcp_credentials()
+    bq, schemas = setup_bigquery()
 
     # Phase 1: Forecasts
     log.info("--- PHASE 1: Forecasts ---")
