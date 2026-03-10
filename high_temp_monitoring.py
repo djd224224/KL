@@ -1,41 +1,39 @@
 #!/usr/bin/env python3
 """
-Kalshi High Temperature Monitoring — FILLS, SETTLEMENTS, FINALIZED MARKETS
-===========================================================================
-Runs AFTER markets settle (evening session only) to collect:
-  1. Fills   — every execution of your orders (links back to orders via order_id)
-  2. Settlements — P&L per settled market
-  3. Finalized markets — post-settlement volume, winner, and trade stats
+Kalshi High Temperature Monitoring — FULL REFRESH
+==================================================
+Pulls ALL fills + settlements from Kalshi API, computes P&L per settled
+market, joins fills→orders for strategy lineage, uploads to BigQuery
+with WRITE_TRUNCATE (full refresh every run — nothing slips through).
 
-LINEAGE for reporting:
-  KXHIGH_orders.client_order_id  →  KXHIGH_fills.order_id  →  KXHIGH_settlements.ticker
-                                                              →  KXHIGH_finalized_markets.market_ticker
+Tables written:
+  KXHIGH_fills         — every execution, with order metadata (TRUNCATE)
+  KXHIGH_settlements   — every settled market with P&L (TRUNCATE)
 
-  Example BigQuery join:
-    SELECT o.city, o.market_ticker, o.no_price, o.contracts,
-           f.no_price as fill_price, f.count as fill_count,
-           s.profit, s.revenue,
-           fm.winning_temp, fm.volume_traded
-    FROM `project.Kalshi.KXHIGH_orders` o
-    LEFT JOIN `project.Kalshi.KXHIGH_fills` f ON o.client_order_id = f.order_id
-    LEFT JOIN `project.Kalshi.KXHIGH_settlements` s ON o.market_ticker = s.ticker
-    LEFT JOIN `project.Kalshi.KXHIGH_finalized_markets` fm ON o.market_ticker = fm.market_ticker
+LINEAGE (BigQuery join example):
+  SELECT o.city, o.market_ticker, o.no_price as order_price, o.contracts,
+         f.fill_price, f.filled_count, f.side,
+         f.spread_config, f.pricing_strategy,
+         s.result, s.pnl, s.total_cost, s.total_payout,
+         s.winning_temp, s.event_date, s.city_name
+  FROM `project.Kalshi.KXHIGH_orders` o
+  LEFT JOIN `project.Kalshi.KXHIGH_fills` f ON o.client_order_id = f.order_id
+  LEFT JOIN `project.Kalshi.KXHIGH_settlements` s ON f.market_ticker = s.market_ticker
 
-GitHub Actions: run this as a separate scheduled job (evening only)
-  or call it from the same workflow after the trading script.
-Colab: run interactively to inspect yesterday's results.
+Run daily via GitHub Actions or manually in Colab.
 
-Secrets: same as kalshi_weather_bot.py
+GitHub Actions secrets (same as trading script):
+  KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH,
+  GCP_PROJECT_ID, GCP_DATASET_ID, GOOGLE_APPLICATION_CREDENTIALS
 """
 
-# =====================================================================
-# IMPORTS
-# =====================================================================
+from __future__ import annotations
 import os
 import sys
+import time
 import base64
-import logging
-from datetime import datetime, timedelta
+from datetime import datetime, UTC
+from typing import Any, Dict, List
 
 IS_COLAB = "google.colab" in sys.modules or "COLAB_RELEASE_TAG" in os.environ
 if IS_COLAB:
@@ -43,389 +41,667 @@ if IS_COLAB:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
                            "google-cloud-bigquery", "db-dtypes", "pyarrow"])
 
-import pytz
 import pandas as pd
+import numpy as np
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
-from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
 # =====================================================================
-# LOGGING
+# CONFIG
 # =====================================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S")
-log = logging.getLogger("kalshi_high_temp_monitor")
+API_KEY_ID       = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
+PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "Lisa_Kalshi.txt")
+PRIVATE_KEY_B64  = os.environ.get("KALSHI_PRIVATE_KEY", "")
+API_BASE         = "https://api.elections.kalshi.com/trade-api/v2"
+SERIES_TICKER    = "KXHIGH"  # Prefix for all high temp markets
 
-# =====================================================================
-# CONFIGURATION (shared with trading script)
-# =====================================================================
-KALSHI_API_KEY_ID       = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
-KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "Lisa_Kalshi.txt")
-KALSHI_PRIVATE_KEY      = os.environ.get("KALSHI_PRIVATE_KEY", "")
-KALSHI_API_BASE         = "https://api.elections.kalshi.com/trade-api/v2"
-
-BQ_PROJECT = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
-BQ_DATASET = os.environ.get("GCP_DATASET_ID", "Kalshi")
+PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
+DATASET_ID = os.environ.get("GCP_DATASET_ID", "Kalshi")
 BQ_TABLE_PREFIX = "KXHIGH_"
 
-# Event ticker definitions (same as trading script — needed to build yesterday's tickers)
-EVENT_TICKER_DEFS = [
-    ("KXHIGHCHI",  "Chicago",       56), ("KXHIGHNY",   "New York City", 41),
-    ("KXHIGHDEN",  "Denver",        60), ("KXHIGHPHIL", "Philadelphia",  47),
-    ("KXHIGHAUS",  "Austin",        60), ("KXHIGHMIA",  "Miami",         46),
-    ("KXHIGHLAX",  "Los Angeles",   55), ("KXHIGHTATL", "Atlanta",       55),
-    ("KXHIGHTDC",  "Washington DC", 50), ("KXHIGHTPHX", "Phoenix",       55),
-    ("KXHIGHTDAL", "Dallas",        55), ("KXHIGHTLV",  "Las Vegas",     55),
-    ("KXHIGHTOKC", "Oklahoma City", 55), ("KXHIGHTSEA", "Seattle",       50),
-    ("KXHIGHTSFO", "San Francisco", 50), ("KXHIGHTHOU", "Houston",       59),
-    ("KXHIGHTSATX","San Antonio",   55), ("KXHIGHTMIN", "Minneapolis",   55),
-    ("KXHIGHTNOLA","New Orleans",   55),
-]
-
-# City abbreviations (same order as trading script)
-CITY_ABV_KEYS = ["THOU","SATX","TMIN","NOLA","CHI","AUS","DEN","NY-","PHI","MIA",
-                 "LAX","ATL","TDC","PHX","DAL","TLV","OKC","SEA","SFO","HOU"]
-
+SLEEP_BETWEEN_CALLS_SEC = 0.05
 
 # =====================================================================
-# HELPERS
+# AUTHENTICATION
 # =====================================================================
-
-def decode_private_key(b64_key="", file_path=""):
+def load_private_key(b64_key="", file_path=""):
+    """Load Kalshi RSA key from file or env var."""
     if file_path and os.path.exists(file_path):
         with open(file_path, "rb") as f: pem = f.read()
     elif b64_key:
         try: pem = base64.b64decode(b64_key)
         except Exception: pem = b64_key.encode()
     else:
-        raise FileNotFoundError(f"No private key found.")
+        raise FileNotFoundError(f"No private key. Set KALSHI_PRIVATE_KEY or place at '{file_path}'.")
     return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
 
-def resolve_gcp_credentials():
+PRIVATE_KEY = load_private_key(b64_key=PRIVATE_KEY_B64, file_path=PRIVATE_KEY_PATH)
+
+from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient
+
+exchange_client = ExchangeClient(
+    exchange_api_base=API_BASE,
+    key_id=API_KEY_ID,
+    private_key=PRIVATE_KEY
+)
+
+# GCP auth
+try:
+    from google.cloud import bigquery
+    import pyarrow  # noqa: F401
+
     if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         try:
-            from google.colab import auth; auth.authenticate_user()
-            log.info("Authenticated via Colab")
-        except ImportError: pass
+            from google.colab import auth
+            auth.authenticate_user()
+            print("Authenticated via Colab")
+        except ImportError:
+            print("No GOOGLE_APPLICATION_CREDENTIALS and not in Colab")
 
-def get_city_abv(ticker):
-    for key in CITY_ABV_KEYS:
-        if key in ticker: return key
-    return ""
+    bq_client = bigquery.Client(project=PROJECT_ID)
+    print(f"BigQuery client initialized (project: {PROJECT_ID})")
 
-def build_yesterday_tickers(central_time):
-    """Build event tickers for yesterday's markets."""
-    yesterday = central_time - timedelta(days=1)
-    m, d = yesterday.strftime("%b").upper(), yesterday.strftime("%d")
-    return [(f"{prefix}-26{m}{d}", get_city_abv(prefix)) for prefix, *_ in EVENT_TICKER_DEFS]
+except ImportError as e:
+    print(f"BigQuery libraries not available: {e}")
+    bq_client = None
+
+print("Testing Kalshi connection...")
+try:
+    status = exchange_client.get_exchange_status()
+    print(f"Kalshi connected! Trading active: {status['trading_active']}")
+except Exception as e:
+    print(f"Kalshi connection failed: {e}")
+    raise
 
 
 # =====================================================================
-# BIGQUERY — creates monitoring-specific tables
+# TICKER PARSING — adapted for KXHIGH format
+# Ticker format: KXHIGHCHI-26MAR10-B31
+#   Part 1: KXHIGHCHI      (series + city)
+#   Part 2: 26MAR10        (date code: YY + MON + DD)
+#   Part 3: B31 or T29.5   (market type: Between or Tail + temp)
 # =====================================================================
+# City abbreviation mapping for display
+CITY_ABV_TO_NAME = {
+    "CHI": "Chicago", "NY": "New York City", "DEN": "Denver",
+    "PHIL": "Philadelphia", "AUS": "Austin", "MIA": "Miami",
+    "LAX": "Los Angeles", "TATL": "Atlanta", "TDC": "Washington DC",
+    "TPHX": "Phoenix", "TDAL": "Dallas", "TLV": "Las Vegas",
+    "TOKC": "Oklahoma City", "TSEA": "Seattle", "TSFO": "San Francisco",
+    "THOU": "Houston", "TSATX": "San Antonio", "TMIN": "Minneapolis",
+    "TNOLA": "New Orleans",
+}
 
-def setup_bigquery():
-    from google.cloud import bigquery
-    client = bigquery.Client(project=BQ_PROJECT)
-    dataset_ref = bigquery.DatasetReference(BQ_PROJECT, BQ_DATASET)
-    try: client.get_dataset(dataset_ref)
-    except Exception:
-        ds = bigquery.Dataset(dataset_ref); ds.location = "US"
-        client.create_dataset(ds)
+def parse_kxhigh_ticker(ticker: str) -> Dict[str, str]:
+    """Parse a KXHIGH market ticker into components.
+    e.g. 'KXHIGHCHI-26MAR10-B31' → {series, city_code, date_code, event_date, market_type, temp_value, ...}
+    """
+    parts = (ticker or "").split("-")
+    series_city = parts[0] if len(parts) > 0 else ""
+    date_code = parts[1] if len(parts) > 1 else ""
+    market_code = parts[2] if len(parts) > 2 else ""
 
-    SF = bigquery.SchemaField
-    schemas = {
-        # fills: every execution — join to orders via order_id ↔ client_order_id
-        f"{BQ_TABLE_PREFIX}fills": [
-            SF("trade_id","STRING"),     # Kalshi's unique fill ID
-            SF("ticker","STRING"),       # Market ticker (e.g. KXHIGHCHI-26MAR10-B31)
-            SF("event_ticker","STRING"), # Event ticker (e.g. KXHIGHCHI-26MAR10)
-            SF("side","STRING"),         # "yes" or "no"
-            SF("action","STRING"),       # "buy" or "sell"
-            SF("count","INT64"),         # Contracts filled
-            SF("yes_price","INT64"),     # YES price in cents
-            SF("no_price","INT64"),      # NO price in cents
-            SF("taker_side","STRING"),   # Who crossed the spread
-            SF("created_time_utc","TIMESTAMP"),
-            SF("created_time_central","TIMESTAMP"),
-            SF("order_id","STRING"),     # ← JOIN KEY to KXHIGH_orders.client_order_id
-            SF("concat_key","STRING"),   # ticker + no_price (for dedup)
-        ],
-        # settlements: P&L per market — join to orders via ticker ↔ market_ticker
-        f"{BQ_TABLE_PREFIX}settlements": [
-            SF("ticker","STRING"),           # Market ticker ← JOIN KEY
-            SF("market_result","STRING"),     # "yes" or "no"
-            SF("city_abv","STRING"),
-            SF("trade_date","DATE"),
-            SF("settled_time","TIMESTAMP"),
-            SF("yes_count","INT64"),          # Contracts settled YES side
-            SF("no_count","INT64"),           # Contracts settled NO side
-            SF("yes_total_cost","FLOAT64"),   # Total $ spent on YES
-            SF("no_total_cost","FLOAT64"),    # Total $ spent on NO
-            SF("revenue","FLOAT64"),          # Payout received
-            SF("profit","FLOAT64"),           # revenue - costs
-        ],
-        # finalized_markets: post-settlement stats — join via market_ticker
-        f"{BQ_TABLE_PREFIX}finalized_markets": [
-            SF("event_ticker","STRING"),
-            SF("market_ticker","STRING"),     # ← JOIN KEY
-            SF("city_abv","STRING"),
-            SF("volume_traded","INT64"),      # Total contracts traded
-            SF("avg_trade_price_yes","FLOAT64"),
-            SF("avg_trade_price_no","FLOAT64"),
-            SF("pct_volume_yes_taker","FLOAT64"),  # % of volume where taker was YES
-            SF("pct_volume_no_taker","FLOAT64"),
-            SF("trade_date","DATE"),
-            SF("winning_temp","STRING"),      # Actual high temp that settled the market
-            SF("winner","STRING"),            # "yes" or "no"
-        ],
+    # Extract city code from series prefix
+    city_code = ""
+    if series_city.startswith("KXHIGH"):
+        city_code = series_city[6:]  # Everything after "KXHIGH"
+
+    # Parse date: "26MAR10" → 2026-03-10
+    event_date = ""
+    if len(date_code) >= 7:
+        yy = date_code[:2]
+        mmm = date_code[2:5]
+        dd = date_code[5:7]
+        try:
+            event_date = datetime.strptime(f"{dd}{mmm}{yy}", "%d%b%y").date().isoformat()
+        except ValueError:
+            event_date = ""
+
+    # Parse market type: B31 (between 30-32°F) or T29.5 (tail at 29.5°F)
+    market_type = ""
+    temp_value = ""
+    if market_code.startswith("B"):
+        market_type = "between"
+        temp_value = market_code[1:]
+    elif market_code.startswith("T"):
+        market_type = "tail"
+        temp_value = market_code[1:]
+
+    # City display name
+    city_name = CITY_ABV_TO_NAME.get(city_code, city_code)
+
+    # Event ticker (series+city + date)
+    event_ticker = f"{series_city}-{date_code}" if date_code else series_city
+
+    return {
+        "series_city": series_city,
+        "city_code": city_code,
+        "city_name": city_name,
+        "date_code": date_code,
+        "event_date": event_date,
+        "event_ticker": event_ticker,
+        "market_code": market_code,
+        "market_type": market_type,
+        "temp_value": temp_value,
     }
 
-    for name, schema in schemas.items():
-        ref = dataset_ref.table(name)
-        try: client.get_table(ref)
-        except Exception:
-            client.create_table(bigquery.Table(ref, schema=schema))
-            log.info("Created table %s", name)
-
-    return client, schemas
-
-
-def write_to_bq(bq_client, schemas, df, table_name):
-    from google.cloud import bigquery
-    full = f"{BQ_TABLE_PREFIX}{table_name}" if not table_name.startswith(BQ_TABLE_PREFIX) else table_name
-    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{full}"
-    cfg = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND", schema=schemas.get(full))
-    try:
-        job = bq_client.load_table_from_dataframe(df, table_id, job_config=cfg); job.result()
-        log.info("  -> %s: %s rows", full, job.output_rows); return True
-    except Exception as e:
-        log.error("  -> %s ERROR: %s", full, e); return False
-
 
 # =====================================================================
-# DATA COLLECTORS
+# LOAD ORDERS FROM BIGQUERY (deduplicated, for lineage)
 # =====================================================================
+def load_orders_from_bigquery() -> pd.DataFrame:
+    """Load deduplicated orders from KXHIGH_orders for fill→order lineage."""
+    if bq_client is None:
+        print("No BigQuery client — skipping order lineage")
+        return pd.DataFrame()
 
-def collect_settlements(exchange_client, central_time):
-    """Pull yesterday's settlement records from Kalshi API.
-    Filters to KXHIGH markets matching yesterday's date.
-    Computes profit = revenue - yes_cost - no_cost.
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{BQ_TABLE_PREFIX}orders"
+
+    # Deduplicate by client_order_id (WRITE_APPEND creates dupes across runs)
+    query = f"""
+        SELECT * FROM (
+            SELECT
+                client_order_id,
+                market_ticker,
+                city,
+                city_abv,
+                no_price,
+                contracts,
+                forecast_date,
+                run_date,
+                expiration_ts,
+                created_at,
+                ROW_NUMBER() OVER (PARTITION BY client_order_id ORDER BY created_at DESC) AS rn
+            FROM `{table_id}`
+            WHERE client_order_id IS NOT NULL
+        )
+        WHERE rn = 1
     """
-    date = central_time.date() - timedelta(days=1)
-    month, day = date.strftime("%b").upper(), date.strftime("%d")
 
     try:
-        resp = exchange_client.get_portfolio_settlements(limit=1000, cursor=None)
+        df = bq_client.query(query).to_dataframe()
+        print(f"Loaded {len(df)} deduplicated orders from BigQuery")
+        return df
     except Exception as e:
-        log.error("Settlement fetch error: %s", e)
-        return []
+        print(f"Could not load orders from BigQuery: {e}")
+        return pd.DataFrame()
 
-    rows = []
-    for s in resp.get("settlements", []):
-        # Skip zero-cost settlements (no position)
-        if s["yes_total_cost"] <= 0 and s["no_total_cost"] <= 0:
+
+# =====================================================================
+# PULL ALL FILLS FROM KALSHI API
+# Paginated, filters to KXHIGH series. Full pull every run.
+# =====================================================================
+def get_all_fills() -> List[Dict[str, Any]]:
+    """Pull ALL fills from Kalshi API, filtered to KXHIGH markets."""
+    fills = []
+    cursor = None
+    page = 0
+
+    try:
+        while True:
+            page += 1
+            params = {"limit": 500}
+            if cursor:
+                params["cursor"] = cursor
+
+            if page % 10 == 1:
+                print(f"  Fetching fills page {page}...")
+
+            response = exchange_client.get_fills(**params)
+            batch_fills = response.get('fills', [])
+
+            # Filter to KXHIGH markets only
+            for fill in batch_fills:
+                ticker = fill.get('ticker', '')
+                if ticker.startswith(SERIES_TICKER):
+                    fills.append(fill)
+
+            cursor = response.get('cursor')
+            if not cursor:
+                break
+
+            time.sleep(SLEEP_BETWEEN_CALLS_SEC)
+
+    except Exception as e:
+        print(f"Error fetching fills: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print(f"Retrieved {len(fills)} fills for {SERIES_TICKER}")
+    return fills
+
+
+# =====================================================================
+# PULL ALL SETTLEMENTS FROM KALSHI API
+# Gets settled/closed markets, extracts result + settlement info.
+# =====================================================================
+def get_all_settlements() -> List[Dict[str, Any]]:
+    """Pull ALL settled KXHIGH markets from Kalshi API."""
+    settlements = []
+
+    try:
+        # Try different status filters (API behavior varies)
+        statuses_to_try = ['settled', 'closed', None]
+
+        for status_filter in statuses_to_try:
+            cursor = None
+            page = 0
+            status_name = status_filter or 'all'
+            print(f"  Trying status='{status_name}'...")
+
+            while True:
+                page += 1
+                params = {
+                    "series_ticker": SERIES_TICKER,
+                    "limit": 200,
+                }
+                if status_filter:
+                    params["status"] = status_filter
+                if cursor:
+                    params["cursor"] = cursor
+
+                if page % 10 == 1:
+                    print(f"    Fetching page {page}...")
+
+                response = exchange_client.get_markets(**params)
+                markets = response.get('markets', [])
+
+                for market in markets:
+                    ticker = market.get('ticker')
+                    result = market.get('result')
+
+                    # Only include markets with a result (settled)
+                    if result and result not in ('', 'none', None):
+                        # Deduplicate by ticker
+                        if not any(s['market_ticker'] == ticker for s in settlements):
+                            settlements.append({
+                                'market_ticker': ticker,
+                                'event_ticker': market.get('event_ticker'),
+                                'market_status': market.get('status'),
+                                'result': result,
+                                'settlement_value_yes': 100 if result == 'yes' else 0,
+                                'settlement_value_no': 100 if result == 'no' else 0,
+                                'close_time': market.get('close_time'),
+                                'expiration_time': market.get('expiration_time'),
+                                'expiration_value': market.get('expiration_value'),
+                            })
+
+                cursor = response.get('cursor')
+                if not cursor:
+                    break
+                time.sleep(SLEEP_BETWEEN_CALLS_SEC)
+
+            # If we found settlements with this status filter, stop trying others
+            if len(settlements) > 0:
+                break
+
+    except Exception as e:
+        print(f"Error fetching settlements: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print(f"Retrieved {len(settlements)} settlements for {SERIES_TICKER}")
+    return settlements
+
+
+# =====================================================================
+# BUILD FILLS DATAFRAME WITH ORDER LINEAGE
+# Joins fills → orders via order_id ↔ client_order_id
+# =====================================================================
+def build_fills_dataframe(fills: List[Dict[str, Any]], df_orders: pd.DataFrame) -> pd.DataFrame:
+    """Build fills DataFrame with order metadata for strategy analysis."""
+    if len(fills) == 0:
+        return pd.DataFrame()
+
+    df_fills = pd.DataFrame(fills)
+    df_fills['pulled_at'] = datetime.now(UTC).isoformat()
+
+    # --- Normalize column names ---
+    # Kalshi API uses 'ticker', we want 'market_ticker'
+    if 'ticker' in df_fills.columns and 'market_ticker' not in df_fills.columns:
+        df_fills = df_fills.rename(columns={'ticker': 'market_ticker'})
+    elif 'ticker' in df_fills.columns and 'market_ticker' in df_fills.columns:
+        df_fills = df_fills.drop(columns=['ticker'])
+    elif 'market_ticker' not in df_fills.columns:
+        df_fills['market_ticker'] = None
+
+    # Kalshi API uses 'count', we want 'filled_count'
+    if 'count' in df_fills.columns and 'filled_count' not in df_fills.columns:
+        df_fills = df_fills.rename(columns={'count': 'filled_count'})
+    elif 'filled_count' not in df_fills.columns:
+        df_fills['filled_count'] = 0
+
+    if 'action' not in df_fills.columns:
+        df_fills['action'] = 'buy'
+
+    if 'order_id' not in df_fills.columns:
+        print("order_id not found in fills — lineage will be incomplete")
+        df_fills['order_id'] = None
+
+    # --- fill_price = the price paid for THAT SIDE ---
+    # Kalshi API returns yes_price for all fills.
+    # YES fill: cost = yes_price. NO fill: cost = 100 - yes_price.
+    df_fills['fill_price'] = df_fills.apply(
+        lambda row: row.get('yes_price') or row.get('no_price') or row.get('price', 0),
+        axis=1
+    )
+
+    # --- Join with deduplicated orders for strategy metadata ---
+    if len(df_orders) > 0:
+        df_orders['client_order_id'] = df_orders['client_order_id'].astype(str)
+        df_fills['order_id'] = df_fills['order_id'].astype(str)
+
+        # Join key: fills.order_id ↔ orders.client_order_id
+        df_fills = df_fills.merge(
+            df_orders[[
+                'client_order_id', 'city', 'city_abv', 'no_price',
+                'contracts', 'forecast_date',
+            ]].rename(columns={
+                'client_order_id': 'order_id',
+                'no_price': 'order_no_price',
+                'contracts': 'order_contracts',
+            }),
+            on='order_id',
+            how='left',
+            suffixes=('', '_order')
+        )
+        matched = df_fills['city'].notna().sum()
+        total = len(df_fills)
+        pct = matched / total * 100 if total > 0 else 0
+        print(f"Matched {matched}/{total} fills to orders ({pct:.1f}%)")
+    else:
+        print("No orders available for lineage matching")
+        for col in ['city', 'city_abv', 'order_no_price', 'order_contracts', 'forecast_date']:
+            if col not in df_fills.columns:
+                df_fills[col] = None
+
+    # --- Parse ticker for additional metadata ---
+    ticker_parts = df_fills['market_ticker'].apply(parse_kxhigh_ticker)
+    ticker_df = pd.DataFrame(ticker_parts.tolist())
+    df_fills = pd.concat([df_fills, ticker_df], axis=1)
+
+    return df_fills
+
+
+# =====================================================================
+# BUILD SETTLEMENTS DATAFRAME WITH P&L
+# Joins settlements → fills → computes per-market P&L
+# =====================================================================
+def build_settlements_dataframe(settlements, df_fills):
+    """Build settlements DataFrame with fill-based P&L per settled market."""
+    if len(settlements) == 0:
+        return pd.DataFrame()
+
+    df_settlements = pd.DataFrame(settlements)
+    df_settlements['pulled_at'] = datetime.now(UTC).isoformat()
+
+    # --- Deduplicate fills ---
+    print("Deduplicating fills...")
+    fills_before = len(df_fills)
+
+    if 'fill_id' in df_fills.columns:
+        df_fills_deduped = df_fills.drop_duplicates(subset=['fill_id'], keep='first')
+        print(f"  Using fill_id deduplication")
+    elif 'trade_id' in df_fills.columns:
+        df_fills_deduped = df_fills.drop_duplicates(subset=['trade_id'], keep='first')
+        print(f"  Using trade_id deduplication")
+    else:
+        # Composite key fallback
+        df_fills['dedup_key'] = (
+            df_fills['order_id'].astype(str) + '_' +
+            df_fills['market_ticker'].astype(str) + '_' +
+            df_fills['side'].astype(str) + '_' +
+            df_fills['fill_price'].astype(str) + '_' +
+            df_fills['filled_count'].astype(str)
+        )
+        df_fills_deduped = df_fills.drop_duplicates(subset=['dedup_key'], keep='first')
+        print(f"  Using composite key deduplication")
+
+    fills_after = len(df_fills_deduped)
+    print(f"  {fills_before} -> {fills_after} (removed {fills_before - fills_after} duplicates)")
+
+    # --- P&L per settled market ---
+    # fill_price = raw yes_price from Kalshi API for ALL fills.
+    #
+    # P&L formulas (cents per contract):
+    #   YES fill + YES wins:  +(100 - fill_price)   profit = payout - cost
+    #   YES fill + NO wins:   -(fill_price)          loss = cost
+    #   NO fill  + NO wins:   +(fill_price)           profit: we paid (100-fill_price), get 100
+    #   NO fill  + YES wins:  -(100 - fill_price)    loss = what we paid for NO
+
+    positions = []
+
+    for _, settlement in df_settlements.iterrows():
+        ticker = settlement['market_ticker']
+        result = settlement['result'].upper() if settlement['result'] else ''
+
+        market_fills = df_fills_deduped[df_fills_deduped['market_ticker'] == ticker]
+
+        if len(market_fills) == 0:
+            positions.append({
+                'market_ticker': ticker,
+                'position_yes': 0, 'position_no': 0, 'net_position': 0,
+                'total_cost': 0, 'total_payout': 0, 'pnl': 0, 'num_fills': 0,
+            })
             continue
-        # Filter to HIGH temp markets matching yesterday
-        if "HIGH" not in s["ticker"] or day not in s["ticker"] or month not in s["ticker"]:
-            continue
 
-        settled_dt = datetime.strptime(s["settled_time"], "%Y-%m-%dT%H:%M:%S.%fZ")
-        trade_dt = settled_dt - timedelta(days=1)
+        yes_fills = market_fills[market_fills['side'] == 'yes']
+        no_fills = market_fills[market_fills['side'] == 'no']
 
-        rows.append({
-            "ticker": s["ticker"],
-            "market_result": s.get("market_result", ""),
-            "city_abv": get_city_abv(s["ticker"]),
-            "trade_date": trade_dt.strftime("%Y-%m-%d"),
-            "settled_time": s["settled_time"],
-            "yes_count": s.get("yes_count", 0),
-            "no_count": s.get("no_count", 0),
-            "yes_total_cost": s["yes_total_cost"],
-            "no_total_cost": s["no_total_cost"],
-            "revenue": s["revenue"],
-            "profit": s["revenue"] - s["yes_total_cost"] - s["no_total_cost"],
+        position_yes = int(yes_fills['filled_count'].sum())
+        position_no = int(no_fills['filled_count'].sum())
+
+        # P&L in cents
+        pnl_cents = 0.0
+        for _, fill in market_fills.iterrows():
+            fp = float(fill['fill_price'])
+            cnt = float(fill['filled_count'])
+            side = fill['side']
+
+            if side == 'yes' and result == 'YES':
+                pnl_cents += cnt * (100 - fp)       # Bought YES, YES wins
+            elif side == 'yes' and result == 'NO':
+                pnl_cents -= cnt * fp                # Bought YES, NO wins
+            elif side == 'no' and result == 'NO':
+                pnl_cents += cnt * fp                # Bought NO, NO wins
+            elif side == 'no' and result == 'YES':
+                pnl_cents -= cnt * (100 - fp)        # Bought NO, YES wins
+
+        pnl_dollars = pnl_cents / 100.0
+
+        # Cost (what we actually paid)
+        yes_cost = (yes_fills['fill_price'] * yes_fills['filled_count']).sum() / 100.0
+        no_cost = 0.0
+        if len(no_fills) > 0:
+            no_cost = ((100 - no_fills['fill_price']) * no_fills['filled_count']).sum() / 100.0
+        total_cost = yes_cost + no_cost
+
+        # Payout
+        if result == 'YES':
+            total_payout = position_yes * 1.0   # $1 per YES contract
+        elif result == 'NO':
+            total_payout = position_no * 1.0    # $1 per NO contract
+        else:
+            total_payout = 0
+
+        positions.append({
+            'market_ticker': ticker,
+            'position_yes': position_yes,
+            'position_no': position_no,
+            'net_position': position_yes - position_no,
+            'total_cost': round(total_cost, 2),
+            'total_payout': round(total_payout, 2),
+            'pnl': round(pnl_dollars, 2),
+            'num_fills': len(market_fills),
         })
 
-    log.info("Found %d settlement records.", len(rows))
-    return rows
+    df_positions = pd.DataFrame(positions)
+    df_settlements = df_settlements.merge(df_positions, on='market_ticker', how='left')
+    df_settlements['result'] = df_settlements['result'].str.upper()
 
+    # --- Parse tickers for city/date/market type ---
+    print("Parsing market tickers...")
+    ticker_parts = df_settlements['market_ticker'].apply(parse_kxhigh_ticker)
+    ticker_df = pd.DataFrame(ticker_parts.tolist())
+    df_settlements = pd.concat([df_settlements, ticker_df], axis=1)
 
-def collect_finalized_markets(exchange_client, central_time):
-    """Pull post-settlement data for yesterday's markets.
-    For each market: total volume, VWAP, taker ratios, winning temp.
-    """
-    tickers = build_yesterday_tickers(central_time)
-    trade_date = (central_time - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    rows = []
-    for ticker, abv in tickers:
-        try:
-            resp = exchange_client.get_event(event_ticker=ticker)
-        except (HttpError, Exception) as e:
-            log.warning("Finalized event error %s: %s", ticker, e)
-            continue
-
-        for mkt in resp.get("markets", []):
-            # Check if this market was the winner
-            winning_temp, winner = None, None
-            if mkt.get("result") == "yes":
-                winning_temp = mkt.get("expiration_value")
-                winner = "yes"
-
-            # Pull all trades for volume/price stats
-            try:
-                tr = exchange_client.get_trades(limit=None, cursor=None, ticker=mkt["ticker"])
-            except (HttpError, Exception) as e:
-                log.warning("Trades error %s: %s", mkt["ticker"], e)
-                continue
-
-            vol = avg_yes = avg_no = pct_yes = pct_no = 0
-            for t in tr.get("trades", []):
-                vol += t["count"]
-                avg_yes += t["yes_price"] * t["count"]
-                avg_no += t["no_price"] * t["count"]
-                if t["taker_side"] == "yes": pct_yes += t["count"]
-                elif t["taker_side"] == "no": pct_no += t["count"]
-            if vol > 0:
-                avg_yes /= vol; avg_no /= vol
-                pct_yes /= vol; pct_no /= vol
-
-            rows.append({
-                "event_ticker": ticker,
-                "market_ticker": mkt["ticker"],
-                "city_abv": abv,
-                "volume_traded": vol,
-                "avg_trade_price_yes": avg_yes,
-                "avg_trade_price_no": avg_no,
-                "pct_volume_yes_taker": pct_yes,
-                "pct_volume_no_taker": pct_no,
-                "trade_date": trade_date,
-                "winning_temp": str(winning_temp) if winning_temp else None,
-                "winner": winner,
-            })
-
-    log.info("Collected %d finalized market records.", len(rows))
-    return rows
-
-
-def collect_fills(exchange_client, central_time):
-    """Pull fill records for yesterday's markets.
-    Each fill links back to your order via order_id → client_order_id.
-    """
-    tickers = build_yesterday_tickers(central_time)
-
-    rows = []
-    for ticker, _ in tickers:
-        try:
-            resp = exchange_client.get_event(event_ticker=ticker)
-        except (HttpError, Exception) as e:
-            log.warning("Fills event error %s: %s", ticker, e)
-            continue
-
-        for mkt in resp.get("markets", []):
-            try:
-                fr = exchange_client.get_fills(limit=1000, cursor=None, ticker=mkt["ticker"])
-            except Exception as e:
-                log.warning("Fills error %s: %s", mkt["ticker"], e)
-                continue
-
-            for f in fr.get("fills", []):
-                utc = pd.to_datetime(f.get("created_time"), utc=True)
-                rows.append({
-                    "trade_id": f.get("trade_id", ""),
-                    "ticker": f.get("ticker", ""),
-                    "event_ticker": ticker,
-                    "side": f.get("side", ""),
-                    "action": f.get("action", ""),
-                    "count": f.get("count", 0),
-                    "yes_price": f.get("yes_price", 0),
-                    "no_price": f.get("no_price", 0),
-                    "taker_side": f.get("taker_side", ""),
-                    "created_time_utc": utc,
-                    "created_time_central": utc.tz_convert("US/Central"),
-                    "order_id": f.get("order_id", ""),       # ← links to KXHIGH_orders.client_order_id
-                    "concat_key": f.get("ticker", "") + str(f.get("no_price", "")),
-                })
-
-    log.info("Collected %d fill records.", len(rows))
-    return rows
+    return df_settlements
 
 
 # =====================================================================
-# MAIN
+# BIGQUERY UPLOAD — WRITE_TRUNCATE (full refresh every run)
 # =====================================================================
+def df_to_bq(df, table_name, write_disposition="WRITE_TRUNCATE"):
+    """Upload DataFrame to BigQuery. Default WRITE_TRUNCATE = full replace."""
+    if bq_client is None:
+        print(f"Skipping {table_name} — no BigQuery client")
+        return
+    if len(df) == 0:
+        print(f"Skipping {table_name} — no data")
+        return
 
-def main():
-    log.info("=" * 60)
-    log.info("Kalshi High Temp Monitoring (%s)", "Colab" if IS_COLAB else "GitHub Actions / CLI")
-    log.info("=" * 60)
+    df_clean = df.copy()
+    # Remove duplicate columns
+    df_clean = df_clean.loc[:, ~df_clean.columns.duplicated()]
 
-    if not KALSHI_API_KEY_ID:
-        log.error("KALSHI_API_KEY_ID not set.")
-        sys.exit(1)
-    if not KALSHI_PRIVATE_KEY and not os.path.exists(KALSHI_PRIVATE_KEY_PATH):
-        log.error("No Kalshi private key found.")
-        sys.exit(1)
+    # Convert complex types (lists, dicts) to strings
+    for col in df_clean.columns:
+        if len(df_clean) > 0:
+            first_valid = df_clean[col].dropna().iloc[0] if len(df_clean[col].dropna()) > 0 else None
+            if first_valid is not None and isinstance(first_valid, (list, dict)):
+                df_clean[col] = df_clean[col].apply(lambda x: str(x) if x is not None else None)
 
-    central_time = datetime.now(pytz.timezone("US/Central"))
-    log.info("CT: %s", central_time.strftime("%Y-%m-%d %H:%M:%S"))
-    log.info("Collecting data for yesterday: %s",
-             (central_time - timedelta(days=1)).strftime("%Y-%m-%d"))
+    # Ensure object columns are clean strings
+    for col in df_clean.columns:
+        if pd.api.types.is_object_dtype(df_clean[col]):
+            df_clean[col] = df_clean[col].astype(str).replace('nan', None).replace('None', None)
 
-    # --- Connect to Kalshi ---
-    pk = decode_private_key(b64_key=KALSHI_PRIVATE_KEY, file_path=KALSHI_PRIVATE_KEY_PATH)
-    xc = ExchangeClient(exchange_api_base=KALSHI_API_BASE, key_id=KALSHI_API_KEY_ID, private_key=pk)
-    st = xc.get_exchange_status()
-    log.info("Exchange: %s", st)
+    df_clean = df_clean.where(pd.notna(df_clean), None)
 
-    # --- Connect to BigQuery ---
-    log.info("BigQuery: project=%s dataset=%s", BQ_PROJECT, BQ_DATASET)
-    resolve_gcp_credentials()
-    bq, schemas = setup_bigquery()
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=write_disposition,
+        autodetect=True,
+    )
 
-    # ===== Settlements =====
-    log.info("--- Collecting settlements ---")
-    settlements = collect_settlements(xc, central_time)
-    if settlements:
-        sdf = pd.DataFrame(settlements)
-        sdf["trade_date"] = pd.to_datetime(sdf["trade_date"])
-        sdf["settled_time"] = pd.to_datetime(sdf["settled_time"])
-        write_to_bq(bq, schemas, sdf, "settlements")
-
-        # Print P&L summary
-        total_profit = sdf["profit"].sum()
-        winners = sdf[sdf["profit"] > 0]
-        losers = sdf[sdf["profit"] < 0]
-        log.info("P&L: $%.2f (%d winners, %d losers)", total_profit, len(winners), len(losers))
-    else:
-        log.info("No settlements found for yesterday.")
-
-    # ===== Finalized Markets =====
-    log.info("--- Collecting finalized markets ---")
-    fin = collect_finalized_markets(xc, central_time)
-    if fin:
-        fdf = pd.DataFrame(fin)
-        fdf["trade_date"] = pd.to_datetime(fdf["trade_date"])
-        fdf["volume_traded"] = pd.to_numeric(fdf["volume_traded"], errors="coerce").fillna(0).astype("Int64")
-        for c in ["avg_trade_price_yes", "avg_trade_price_no", "pct_volume_yes_taker", "pct_volume_no_taker"]:
-            fdf[c] = pd.to_numeric(fdf[c], errors="coerce")
-        write_to_bq(bq, schemas, fdf, "finalized_markets")
-    else:
-        log.info("No finalized market data.")
-
-    # ===== Fills =====
-    log.info("--- Collecting fills ---")
-    fills = collect_fills(xc, central_time)
-    if fills:
-        write_to_bq(bq, schemas, pd.DataFrame(fills), "fills")
-    else:
-        log.info("No fills found.")
-
-    log.info("=" * 60)
-    log.info("Monitoring complete.")
-    log.info("=" * 60)
+    try:
+        job = bq_client.load_table_from_dataframe(df_clean, table_id, job_config=job_config)
+        job.result()
+        table = bq_client.get_table(table_id)
+        print(f"✓ Loaded {table_id}: {table.num_rows} rows")
+    except Exception as e:
+        print(f"Error loading {table_id}: {e}")
+        import traceback
+        traceback.print_exc()
 
 
-if __name__ == "__main__":
-    main()
+# =====================================================================
+# MAIN MONITORING FUNCTION
+# =====================================================================
+def run_monitoring(upload_to_bq=True):
+    print(f"\n{'='*70}")
+    print(f"MONITORING: {SERIES_TICKER} (High Temperature Markets)")
+    print(f"Time: {datetime.now(UTC).isoformat()}")
+    print(f"Mode: FULL REFRESH (WRITE_TRUNCATE)")
+    print(f"{'='*70}\n")
+
+    # Step 1: Load deduplicated orders from BQ for lineage
+    print("Step 1: Loading orders from BigQuery (for fill→order lineage)...")
+    df_orders = load_orders_from_bigquery()
+
+    # Step 2: Pull ALL fills from Kalshi API
+    print("\nStep 2: Pulling ALL fills from Kalshi API...")
+    fills = get_all_fills()
+
+    # Step 3: Pull ALL settlements from Kalshi API
+    print("\nStep 3: Pulling ALL settlements from Kalshi API...")
+    settlements = get_all_settlements()
+
+    # Step 4: Build df_fills with order lineage
+    print("\nStep 4: Building fills DataFrame with order lineage...")
+    df_fills = build_fills_dataframe(fills, df_orders)
+
+    # Step 5: Build df_settlements with P&L
+    print("\nStep 5: Building settlements DataFrame with P&L...")
+    df_settlements = build_settlements_dataframe(settlements, df_fills)
+
+    # Step 6: Upload to BigQuery (TRUNCATE = full refresh)
+    if upload_to_bq:
+        print("\nStep 6: Uploading to BigQuery (WRITE_TRUNCATE)...")
+        df_to_bq(df_fills, f"{BQ_TABLE_PREFIX}fills", write_disposition="WRITE_TRUNCATE")
+        df_to_bq(df_settlements, f"{BQ_TABLE_PREFIX}settlements", write_disposition="WRITE_TRUNCATE")
+
+    # ===== SUMMARY =====
+    print(f"\n{'='*70}")
+    print(f"MONITORING COMPLETE")
+    print(f"{'='*70}")
+    print(f"  {BQ_TABLE_PREFIX}fills: {len(df_fills)} rows")
+    print(f"  {BQ_TABLE_PREFIX}settlements: {len(df_settlements)} rows")
+
+    if len(df_fills) > 0:
+        print(f"\n  FILLS SUMMARY:")
+        print(f"    Total filled contracts: {df_fills['filled_count'].sum()}")
+        print(f"    Unique markets: {df_fills['market_ticker'].nunique()}")
+        if 'city' in df_fills.columns:
+            matched = df_fills['city'].notna().sum()
+            total = len(df_fills)
+            pct = matched / total * 100 if total > 0 else 0
+            print(f"    Fills with order lineage: {matched} ({pct:.1f}%)")
+
+        # Fills by side
+        side_summary = df_fills.groupby('side')['filled_count'].sum()
+        for side, cnt in side_summary.items():
+            print(f"    {side.upper()} fills: {int(cnt)} contracts")
+
+    if len(df_settlements) > 0:
+        total_pnl = df_settlements['pnl'].sum()
+        total_cost = df_settlements['total_cost'].sum()
+        total_payout = df_settlements['total_payout'].sum()
+        winners = (df_settlements['pnl'] > 0).sum()
+        losers = (df_settlements['pnl'] < 0).sum()
+        breakeven = (df_settlements['pnl'] == 0).sum()
+        with_fills = (df_settlements['num_fills'] > 0).sum()
+
+        print(f"\n  SETTLEMENTS SUMMARY:")
+        print(f"    Markets settled: {len(df_settlements)}")
+        print(f"    Markets with fills: {with_fills}")
+        print(f"    Total cost: ${total_cost:,.2f}")
+        print(f"    Total payout: ${total_payout:,.2f}")
+        print(f"    Total P&L: ${total_pnl:,.2f}")
+        print(f"    Winners: {winners} | Losers: {losers} | Break-even: {breakeven}")
+
+        if total_cost > 0:
+            roi = total_pnl / total_cost * 100
+            print(f"    ROI: {roi:.1f}%")
+
+        # P&L by city
+        if 'city_name' in df_settlements.columns:
+            city_pnl = (df_settlements[df_settlements['num_fills'] > 0]
+                        .groupby('city_name')['pnl'].sum()
+                        .sort_values(ascending=False))
+            if len(city_pnl) > 0:
+                print(f"\n  P&L BY CITY (top 10):")
+                for city, pnl in city_pnl.head(10).items():
+                    emoji = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+                    print(f"    {emoji} {city}: ${pnl:,.2f}")
+
+        # P&L by date
+        if 'event_date' in df_settlements.columns:
+            date_pnl = (df_settlements[df_settlements['num_fills'] > 0]
+                        .groupby('event_date')['pnl'].sum()
+                        .sort_index(ascending=False))
+            if len(date_pnl) > 0:
+                print(f"\n  P&L BY DATE (last 10):")
+                for date, pnl in date_pnl.head(10).items():
+                    emoji = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+                    print(f"    {emoji} {date}: ${pnl:,.2f}")
+
+    print(f"\n{'='*70}\n")
+    return df_fills, df_settlements
+
+
+# =====================================================================
+# RUN
+# =====================================================================
+df_fills, df_settlements = run_monitoring(upload_to_bq=True)
+print("Monitoring run complete")
