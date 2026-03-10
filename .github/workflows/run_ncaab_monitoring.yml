@@ -1,9 +1,10 @@
 name: NCAABMENTION Daily Monitoring
-# Runs once daily at 10:15 AM UTC (5:15 AM ET)
+# Runs once daily at 9:15 PM UTC (3:15 PM CST)
 # Offset by 15 min from NBA monitoring to avoid overlap
 on:
   schedule:
-    - cron: '15 10 * * *'
+    - cron: '15 21 * * *'
+    
   workflow_dispatch:  # Manual trigger
 jobs:
   run-monitoring:
