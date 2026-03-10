@@ -1,9 +1,9 @@
 name: NBAMENTION Daily Monitoring
 
-# Runs once daily at 10:00 AM UTC (5:00 AM ET)
+# Runs once daily at 9:00 PM UTC (3:00 PM CST)
 on:
   schedule:
-    - cron: '0 10 * * *'
+    - cron: '0 21 * * *'  
   workflow_dispatch:  # Manual trigger
 
 jobs:
