@@ -70,16 +70,16 @@ BQ_TABLE_PREFIX = "KXHIGH_"
 
 # Event ticker definitions (same as trading script — needed to build yesterday's tickers)
 EVENT_TICKER_DEFS = [
-    ("KXHIGHCHI",  "Chicago",       56, 1.7), ("KXHIGHNY",   "New York City", 41, 1.5),
-    ("KXHIGHDEN",  "Denver",        60, 2.4), ("KXHIGHPHIL", "Philadelphia",  47, 1.6),
-    ("KXHIGHAUS",  "Austin",        60, 1.7), ("KXHIGHMIA",  "Miami",         46, 1.1),
-    ("KXHIGHLAX",  "Los Angeles",   55, 2.0), ("KXHIGHTATL", "Atlanta",       55, 1.8),
-    ("KXHIGHTDC",  "Washington DC", 50, 1.6), ("KXHIGHTPHX", "Phoenix",       55, 1.5),
-    ("KXHIGHTDAL", "Dallas",        55, 1.8), ("KXHIGHTLV",  "Las Vegas",     55, 1.8),
-    ("KXHIGHTOKC", "Oklahoma City", 55, 2.0), ("KXHIGHTSEA", "Seattle",       50, 1.5),
-    ("KXHIGHTSFO", "San Francisco", 50, 1.5), ("KXHIGHTHOU", "Houston",       59, 2.0),
-    ("KXHIGHTSATX","San Antonio",   55, 1.8), ("KXHIGHTMIN", "Minneapolis",   55, 2.0),
-    ("KXHIGHTNOLA","New Orleans",   55, 1.8),
+    ("KXHIGHCHI",  "Chicago",       56), ("KXHIGHNY",   "New York City", 41),
+    ("KXHIGHDEN",  "Denver",        60), ("KXHIGHPHIL", "Philadelphia",  47),
+    ("KXHIGHAUS",  "Austin",        60), ("KXHIGHMIA",  "Miami",         46),
+    ("KXHIGHLAX",  "Los Angeles",   55), ("KXHIGHTATL", "Atlanta",       55),
+    ("KXHIGHTDC",  "Washington DC", 50), ("KXHIGHTPHX", "Phoenix",       55),
+    ("KXHIGHTDAL", "Dallas",        55), ("KXHIGHTLV",  "Las Vegas",     55),
+    ("KXHIGHTOKC", "Oklahoma City", 55), ("KXHIGHTSEA", "Seattle",       50),
+    ("KXHIGHTSFO", "San Francisco", 50), ("KXHIGHTHOU", "Houston",       59),
+    ("KXHIGHTSATX","San Antonio",   55), ("KXHIGHTMIN", "Minneapolis",   55),
+    ("KXHIGHTNOLA","New Orleans",   55),
 ]
 
 # City abbreviations (same order as trading script)
