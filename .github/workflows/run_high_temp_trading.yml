@@ -39,7 +39,7 @@ jobs:
           GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
           WEATHER_UNDERGROUND_KEY: ${{ secrets.WEATHER_UNDERGROUND_KEY }}
           ACCUWEATHER_KEY: ${{ secrets.ACCUWEATHER_KEY }}
-        run: python kalshi_weather_bot.py
+        run: python high_temp_trading.py
       - name: Cleanup secrets
         if: always()
         run: |
