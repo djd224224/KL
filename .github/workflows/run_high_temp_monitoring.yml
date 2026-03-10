@@ -1,0 +1,42 @@
+name: High Temp Monitoring
+on:
+  schedule:
+    # 3:00 PM CST = 9:00 PM UTC (during CDT this runs at 4:00 PM CT)
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+jobs:
+  run-monitoring:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests cryptography google-auth google-cloud-bigquery db-dtypes pyarrow scipy pytz
+      - name: Write Kalshi private key
+        run: |
+          echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+      - name: Write GCP service account key
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        run: |
+          printenv GCP_SA_KEY > gcp_sa_key.json
+      - name: Run monitoring script
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY_PATH: kalshi_private_key.pem
+          GOOGLE_APPLICATION_CREDENTIALS: gcp_sa_key.json
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
+        run: python high_temp_monitoring.py
+      - name: Cleanup secrets
+        if: always()
+        run: |
+          rm -f kalshi_private_key.pem gcp_sa_key.json
