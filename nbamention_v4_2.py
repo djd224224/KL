@@ -563,7 +563,7 @@ def get_scaled_limits(bankroll: float) -> dict:
     Reference point: $5,000 bankroll = scale 1.0x (original v4.3 limits).
     Max scale: 2.5x (at $12,500+). Min scale: 0.5x (at $2,500).
     """
-    scale = max(0.5, min(bankroll / 5000, 2.5))
+    scale = max(0.5, min(bankroll / 5000, 2.0))
     return {
         "MAX_NET_PER_MARKET": int(200 * scale),         # 200 at $5k → 400 at $10k
         "POSITION_MODERATE_THRESHOLD": int(67 * scale),  # ~1/3 of MAX_NET
