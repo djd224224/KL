@@ -86,12 +86,15 @@ NUM_PRICE_LEVELS         = 8    # Tiered orders per market (depth)
 INCREMENT                = 3    # Cents between each NO bid (regular markets)
 INCREMENT_TAIL           = 6    # Cents between each NO bid (tail markets)
 CONTRACTS_PER_TIER       = 25   # Fixed contract count per tier (no step-up)
+ADJACENT_MULTIPLIER      = 1.5  # Contract multiplier for markets 1-2°F from forecast center
+MAX_DISTANCE_FROM_FORECAST = 2.0 # Skip markets >2°F from forecast center (lost money historically)
 MAX_CONTRACTS            = 500  # Hard cap per market (was 1000, data shows 500+ is optimal)
 CUTOFF_PROBABILITY       = 0.20 # Only trade markets where P(yes) > 20%
 CEILING_PROBABILITY      = 0.75 # Skip markets where P(yes) > 75% (overconfident, -17.7% ROI historically)
-MIN_EDGE_CENTS           = 3    # Only trade if model NO price > market NO offer by this much
+MIN_EDGE_CENTS           = 2    # Only trade if model NO price > market NO offer by this much
 MAX_SPREAD_CENTS         = 15   # Skip markets with spread > 15¢ (>15¢ = -23% ROI historically)
 MAX_FORECAST_DISAGREEMENT = 5.0 # Skip city if sources disagree by >5°F (unreliable, -34% ROI)
+AUTO_CALIBRATE_MIN_OBS   = 30   # Min observations per city before using auto-calibrated floor std
 
 # =====================================================================
 # CITY COORDINATES — single source of truth
@@ -329,6 +332,7 @@ def setup_bigquery():
             SF("low_range","FLOAT64"),SF("high_range","FLOAT64"),SF("hi_no_price","FLOAT64"),
             SF("forecast_bias","FLOAT64"),SF("city_floor_std","FLOAT64"),SF("model_std","FLOAT64"),
             SF("yes_probability","FLOAT64"),SF("fair_no_price","FLOAT64"),
+            SF("distance_from_forecast","FLOAT64"),
             SF("no_highest_bid","FLOAT64"),SF("no_lowest_offer","FLOAT64"),
             SF("no_orderbook","STRING"),SF("yes_orderbook","STRING"),SF("position","INT64"),
         ],
@@ -347,6 +351,47 @@ def setup_bigquery():
             client.create_table(bigquery.Table(ref, schema=schema))
             log.info("Created table %s", name)
     return client, schemas
+
+def load_city_floor_std(bq_client):
+    """Auto-calibrate CITY_FLOOR_STD from settled market data.
+    Computes std dev of (forecast_avg - actual_temp) per city using:
+      - market_snapshot for forecast_avg
+      - settlements for actual temp (parsed from winning between-market ticker)
+    Falls back to hardcoded CITY_FLOOR_STD for cities with < AUTO_CALIBRATE_MIN_OBS observations.
+    """
+    query = f"""
+        WITH snapshots AS (
+            SELECT city, forecast_avg, market_ticker,
+                   ROW_NUMBER() OVER (PARTITION BY market_ticker ORDER BY run_date DESC) AS rn
+            FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}market_snapshot`
+            WHERE forecast_avg IS NOT NULL
+        ),
+        actuals AS (
+            SELECT market_ticker,
+                   SAFE_CAST(REGEXP_EXTRACT(market_ticker, r'-B(\\d+\\.?\\d*)') AS FLOAT64) AS actual_temp
+            FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}settlements`
+            WHERE UPPER(result) = 'YES' AND market_ticker LIKE '%-B%'
+        )
+        SELECT s.city, ROUND(STDDEV(s.forecast_avg - a.actual_temp), 1) AS floor_std, COUNT(*) AS n
+        FROM snapshots s
+        JOIN actuals a ON s.market_ticker = a.market_ticker
+        WHERE s.rn = 1
+        GROUP BY s.city
+        HAVING COUNT(*) >= {AUTO_CALIBRATE_MIN_OBS}
+    """
+    try:
+        df = bq_client.query(query).to_dataframe()
+        if len(df) > 0:
+            calibrated = dict(zip(df['city'], df['floor_std']))
+            merged = {**CITY_FLOOR_STD, **calibrated}
+            for _, row in df.iterrows():
+                old = CITY_FLOOR_STD.get(row['city'], '—')
+                log.info("  Auto-calibrated %s: %s → %.1f (n=%d)", row['city'], old, row['floor_std'], row['n'])
+            return merged
+    except Exception as e:
+        log.warning("Auto-calibration failed (using defaults): %s", e)
+    return CITY_FLOOR_STD
+
 
 def write_to_bq(bq_client, schemas, df, table_name):
     from google.cloud import bigquery
@@ -463,14 +508,18 @@ def add_nws_conditions(ft, variable, central_time):
              fetch_nws_conditions(c,variable,central_time)))} for city,c in CITIES.items()]
     return pd.merge(ft, pd.DataFrame(rows), on="City", how="inner")
 
-def apply_model_std(ft):
+def apply_model_std(ft, city_floor_std=None):
     """Compute Model Std Dev = max(inter_source_std, city_floor_std) + condition boost.
     This replaces raw Standard Deviation for all probability calculations.
+    city_floor_std: dict of city→floor values (auto-calibrated or hardcoded defaults).
     """
+    if city_floor_std is None:
+        city_floor_std = CITY_FLOOR_STD
+
     ft["Standard Deviation"] = pd.to_numeric(ft["Standard Deviation"], errors="coerce")
 
     # Step 1: Apply city floor — prevents 0 std when all sources agree
-    ft["City Floor Std"] = ft["City"].map(CITY_FLOOR_STD).fillna(1.2)
+    ft["City Floor Std"] = ft["City"].map(city_floor_std).fillna(1.2)
     ft["Model Std"] = ft[["Standard Deviation", "City Floor Std"]].max(axis=1)
 
     # Step 2: Boost for volatile weather conditions
@@ -540,6 +589,7 @@ def pull_markets(exchange_client, et_df):
 def calculate_probabilities(ft, mt):
     """Normal CDF: P(temp in bucket) using forecast avg ± model std.
     Model Std = max(inter_source_std, city_floor_std) + condition boost.
+    Also computes distance from forecast center for each market.
     """
     ct = pd.merge(ft, mt, on="City", how="inner")
     ct["Average"] = pd.to_numeric(ct["Average"], errors="coerce")
@@ -548,7 +598,16 @@ def calculate_probabilities(ft, mt):
     ct["low_range"] = pd.to_numeric(ct["low_range"], errors="coerce")
     ct["yes_probability"] = (norm.cdf(ct["high_range"],loc=ct["Average"],scale=ct["Model Std"])
                              - norm.cdf(ct["low_range"],loc=ct["Average"],scale=ct["Model Std"])).round(2)
-    ct["fair_no_price"] = 1 - ct["yes_probability"]; return ct
+    ct["fair_no_price"] = 1 - ct["yes_probability"]
+
+    # Distance from forecast center: bucket midpoint vs forecast average
+    # Between markets: midpoint = (low_range + high_range) / 2
+    # Tail markets: use low_range (the threshold) since there's no real midpoint
+    ct["bucket_mid"] = np.where(ct["high_range"] == 150, ct["low_range"],
+                                (ct["low_range"] + ct["high_range"]) / 2)
+    ct["distance_from_forecast"] = (ct["bucket_mid"] - ct["Average"]).abs()
+
+    return ct
 
 def pull_orderbooks(exchange_client, ct):
     """Fetch top-3 order book for every market."""
@@ -666,6 +725,10 @@ def print_market_diagnostic(row, market_orders, is_tail, starting, cutoff):
     if bias != 0:
         print(f"    Bias correction: {bias:+.1f}°F applied (raw avg was {row['Average']+bias:.1f}°F)")
     print(f"    Std Dev: raw={raw_std:.1f}  floor={floor_std:.1f}  → model={model_std:.1f}°F")
+    dist = row.get('distance_from_forecast', 0)
+    dist_label = "center" if dist <= 1 else "adjacent" if dist <= 2 else "far"
+    mult_label = f"  ×{ADJACENT_MULTIPLIER}" if 1.0 <= dist <= 2.0 else ""
+    print(f"    Distance from forecast: {dist:.1f}°F [{dist_label}]{mult_label}  |  contracts={starting}")
     strat = "Historical Tail" if is_tail else "Normal CDF"
     print(f"    Strategy [{strat}]: P(temp in range)={yes_prob*100:.1f}%  hi_no_price={hi_no:.0f}¢")
     print(f"    → Fair value: YES={fair_yes}¢, NO={fair_no_c}¢  |  Edge vs market: {edge_str}")
@@ -675,7 +738,8 @@ def print_market_diagnostic(row, market_orders, is_tail, starting, cutoff):
     if position > 0: print(f"    Position: {int(position)} contracts")
 
     if len(market_orders) == 0:
-        if yes_prob <= cutoff and not is_tail: print(f"    → SKIP: P(yes)={yes_prob*100:.1f}% ≤ {cutoff*100:.0f}% cutoff")
+        if dist > MAX_DISTANCE_FROM_FORECAST: print(f"    → SKIP: distance={dist:.1f}°F > {MAX_DISTANCE_FROM_FORECAST}°F max")
+        elif yes_prob <= cutoff and not is_tail: print(f"    → SKIP: P(yes)={yes_prob*100:.1f}% ≤ {cutoff*100:.0f}% cutoff")
         elif yes_prob >= CEILING_PROBABILITY and not is_tail: print(f"    → SKIP: P(yes)={yes_prob*100:.1f}% ≥ {CEILING_PROBABILITY*100:.0f}% ceiling")
         elif spread is not None and spread > MAX_SPREAD_CENTS: print(f"    → SKIP: spread={spread}¢ > {MAX_SPREAD_CENTS}¢ max")
         elif edge is not None and edge < MIN_EDGE_CENTS and not is_tail:
@@ -715,20 +779,31 @@ def place_orders(exchange_client, ct, variable, central_time):
         no_offer = row.get("no_lowest_offer", "")
         spread_cents = (int(no_offer) - int(no_bid)) if no_bid != "" and no_offer != "" else None
 
+        # Distance from forecast center
+        dist = row.get("distance_from_forecast", 0)
+
         qualifies = (
             row["yes_probability"] > CUTOFF_PROBABILITY                            # Min probability
             and row["yes_probability"] < CEILING_PROBABILITY                        # Max probability
             and ("-T" not in row["market_ticker"] or is_tail)                      # Skip low-end tails only
             and edge_cents >= MIN_EDGE_CENTS                                        # Min edge
             and (spread_cents is not None and spread_cents <= MAX_SPREAD_CENTS)     # Max spread
+            and dist <= MAX_DISTANCE_FROM_FORECAST                                  # Max distance from forecast
         )
+
+        # Contract sizing: 1.5x for adjacent buckets (1-2°F from center)
+        if 1.0 <= dist <= 2.0:
+            contracts = int(CONTRACTS_PER_TIER * ADJACENT_MULTIPLIER)
+        else:
+            contracts = CONTRACTS_PER_TIER
+
         if qualifies:
             for i in range(NUM_PRICE_LEVELS):
                 inc = INCREMENT_TAIL if is_tail else INCREMENT
                 bp = max(row["hi_no_price"]-i*inc, 1)
                 if (row["no_lowest_offer"]!="" and bp<int(row["no_lowest_offer"])
                     and bp<int(row["no_highest_bid"])-3
-                    and MAX_CONTRACTS>=row["position"]+row["resting_order_count"]+CONTRACTS_PER_TIER):
+                    and MAX_CONTRACTS>=row["position"]+row["resting_order_count"]+contracts):
                     abv = get_city_abv(row["market_ticker"])
                     ch,cm = get_cancel_time(abv)
                     oid = str(uuid.uuid4()); exp = get_unix_time_for_target(ch,cm,variable)
@@ -737,17 +812,17 @@ def place_orders(exchange_client, ct, variable, central_time):
                     if exp <= int(time.time()):
                         continue
                     params = {"ticker":row["market_ticker"],"client_order_id":oid,"type":"limit",
-                              "action":"buy","side":"no","count":CONTRACTS_PER_TIER,"yes_price":None,
+                              "action":"buy","side":"no","count":contracts,"yes_price":None,
                               "no_price":int(bp),"expiration_ts":exp,"sell_position_floor":None,"buy_max_cost":None}
                     try: exchange_client.create_order(**params)
                     except Exception as e: log.error("Order failed %s: %s", row["market_ticker"], e); continue
                     rec = {"city":row["City"],"forecast_date":row["Forecast Date"],"run_date":row["Run Date"],
-                           "market_ticker":row["market_ticker"],"contracts":CONTRACTS_PER_TIER,"no_price":int(bp),
+                           "market_ticker":row["market_ticker"],"contracts":contracts,"no_price":int(bp),
                            "city_abv":abv,"client_order_id":oid,"expiration_ts":exp,
                            "created_at":central_time.strftime("%Y-%m-%d %H:%M:%S")}
                     market_orders.append(rec); all_orders.append(rec)
-                    ct.loc[idx,"resting_order_count"] = row["resting_order_count"]+CONTRACTS_PER_TIER
-        print_market_diagnostic(row, market_orders, is_tail, CONTRACTS_PER_TIER, CUTOFF_PROBABILITY)
+                    ct.loc[idx,"resting_order_count"] = row["resting_order_count"]+contracts
+        print_market_diagnostic(row, market_orders, is_tail, contracts, CUTOFF_PROBABILITY)
 
     print(f"\n{'═'*80}")
     print(f"  SUMMARY: {len(all_orders)} orders placed across {len(ct)} markets")
@@ -781,11 +856,15 @@ def main():
     resolve_gcp_credentials()
     bq, schemas = setup_bigquery()
 
+    # Auto-calibrate CITY_FLOOR_STD from settlement data (if enough observations)
+    log.info("--- Auto-calibrating CITY_FLOOR_STD ---")
+    calibrated_floor_std = load_city_floor_std(bq)
+
     # Phase 1: Forecasts
     log.info("--- PHASE 1: Forecasts ---")
     ft = collect_forecasts(variable, central_time)
     ft = add_nws_conditions(ft, variable, central_time)
-    ft = apply_model_std(ft)  # Apply city floor + weather condition boost
+    ft = apply_model_std(ft, city_floor_std=calibrated_floor_std)
     ft = add_midnight_temps(ft, variable, central_time)
     ft = filter_night_session(ft, variable)
     if ft.empty: log.warning("No cities after filters."); sys.exit(0)
@@ -816,7 +895,7 @@ def main():
     snap["forecast_date"]=pd.to_datetime(snap["forecast_date"]); snap["run_date"]=pd.to_datetime(snap["run_date"])
     for c in ["weather_underground","accuweather","nws","forecast_avg","forecast_std","forecast_range",
               "midnight_temperature","low_range","high_range","hi_no_price","forecast_bias","city_floor_std","model_std",
-              "yes_probability","fair_no_price","no_highest_bid","no_lowest_offer"]:
+              "yes_probability","fair_no_price","distance_from_forecast","no_highest_bid","no_lowest_offer"]:
         if c in snap.columns: snap[c]=pd.to_numeric(snap[c],errors="coerce")
     if "position" in snap.columns: snap["position"]=pd.to_numeric(snap["position"],errors="coerce").fillna(0).astype("Int64")
     for c in ["no_orderbook","yes_orderbook","nws_detailed_conditions","nws_short_conditions"]:
