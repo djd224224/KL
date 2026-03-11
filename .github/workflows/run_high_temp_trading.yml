@@ -1,11 +1,9 @@
 name: High Temp Trading
 on:
   schedule:
-    # Every 2 hours from 7:08 PM to 9:08 AM Central Time (CDT=UTC-5)
-    # CDT: 7:08p, 9:08p, 11:08p, 1:08a, 3:08a, 5:08a, 7:08a, 9:08a
-    # CST: shifts 1hr earlier (6:08p–8:08a) — still within window
-    - cron: '8 0,2,4,6,8,10,12,14 * * *'
+    - cron: '2 0,5,12,13 * * *' 
   workflow_dispatch:
+
 jobs:
   run-kalshi-script:
     runs-on: ubuntu-latest
