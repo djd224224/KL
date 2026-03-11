@@ -715,20 +715,13 @@ def place_orders(exchange_client, ct, variable, central_time):
         no_offer = row.get("no_lowest_offer", "")
         spread_cents = (int(no_offer) - int(no_bid)) if no_bid != "" and no_offer != "" else None
 
-          # qualifies = (
-          #     (row["yes_probability"] > CUTOFF_PROBABILITY or is_tail)              # Min probability
-          #     and (row["yes_probability"] < CEILING_PROBABILITY or is_tail)          # Max probability
-          #     and ("-T" not in row["market_ticker"] or is_tail)                      # Skip low-end tails
-          #     and (edge_cents >= MIN_EDGE_CENTS or is_tail)                          # Min edge
-          #     and (spread_cents is not None and spread_cents <= MAX_SPREAD_CENTS)     # Max spread
-          # )
-            qualifies = (
-                row["yes_probability"] > CUTOFF_PROBABILITY
-                and row["yes_probability"] < CEILING_PROBABILITY
-                and "-T" not in row["market_ticker"] or is_tail)
-                and edge_cents >= MIN_EDGE_CENTS
-                and (spread_cents is not None and spread_cents <= MAX_SPREAD_CENTS)
-            )
+        qualifies = (
+            row["yes_probability"] > CUTOFF_PROBABILITY                            # Min probability
+            and row["yes_probability"] < CEILING_PROBABILITY                        # Max probability
+            and ("-T" not in row["market_ticker"] or is_tail)                      # Skip low-end tails only
+            and edge_cents >= MIN_EDGE_CENTS                                        # Min edge
+            and (spread_cents is not None and spread_cents <= MAX_SPREAD_CENTS)     # Max spread
+        )
         if qualifies:
             for i in range(NUM_PRICE_LEVELS):
                 inc = INCREMENT_TAIL if is_tail else INCREMENT
