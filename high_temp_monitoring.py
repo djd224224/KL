@@ -276,64 +276,68 @@ def get_all_fills() -> List[Dict[str, Any]]:
 # Gets settled/closed markets, extracts result + settlement info.
 # =====================================================================
 def get_all_settlements() -> List[Dict[str, Any]]:
-    """Pull ALL settled KXHIGH markets from Kalshi API."""
+    """Pull ALL settled KXHIGH markets from Kalshi portfolio settlements API.
+    Uses get_portfolio_settlements() and filters by KXHIGH prefix.
+    This returns markets where you had a position that settled.
+    """
     settlements = []
+    cursor = None
+    page = 0
+    seen_tickers = set()
 
     try:
-        # Try different status filters (API behavior varies)
-        statuses_to_try = ['settled', 'closed', None]
+        while True:
+            page += 1
+            params = {"limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
 
-        for status_filter in statuses_to_try:
-            cursor = None
-            page = 0
-            status_name = status_filter or 'all'
-            print(f"  Trying status='{status_name}'...")
+            if page % 10 == 1:
+                print(f"  Fetching portfolio settlements page {page}...")
 
-            while True:
-                page += 1
-                params = {
-                    "series_ticker": SERIES_TICKER,
-                    "limit": 200,
-                }
-                if status_filter:
-                    params["status"] = status_filter
-                if cursor:
-                    params["cursor"] = cursor
+            response = exchange_client.get_portfolio_settlements(**params)
+            batch = response.get('settlements', [])
 
-                if page % 10 == 1:
-                    print(f"    Fetching page {page}...")
-
-                response = exchange_client.get_markets(**params)
-                markets = response.get('markets', [])
-
-                for market in markets:
-                    ticker = market.get('ticker')
-                    result = market.get('result')
-
-                    # Only include markets with a result (settled)
-                    if result and result not in ('', 'none', None):
-                        # Deduplicate by ticker
-                        if not any(s['market_ticker'] == ticker for s in settlements):
-                            settlements.append({
-                                'market_ticker': ticker,
-                                'event_ticker': market.get('event_ticker'),
-                                'market_status': market.get('status'),
-                                'result': result,
-                                'settlement_value_yes': 100 if result == 'yes' else 0,
-                                'settlement_value_no': 100 if result == 'no' else 0,
-                                'close_time': market.get('close_time'),
-                                'expiration_time': market.get('expiration_time'),
-                                'expiration_value': market.get('expiration_value'),
-                            })
-
-                cursor = response.get('cursor')
-                if not cursor:
-                    break
-                time.sleep(SLEEP_BETWEEN_CALLS_SEC)
-
-            # If we found settlements with this status filter, stop trying others
-            if len(settlements) > 0:
+            if not batch:
                 break
+
+            for s in batch:
+                ticker = s.get('ticker', '')
+
+                # Filter to KXHIGH markets only
+                if not ticker.startswith(SERIES_TICKER):
+                    continue
+
+                # Skip zero-position settlements
+                yes_cost = s.get('yes_total_cost', 0) or 0
+                no_cost = s.get('no_total_cost', 0) or 0
+                if yes_cost <= 0 and no_cost <= 0:
+                    continue
+
+                # Deduplicate by ticker
+                if ticker in seen_tickers:
+                    continue
+                seen_tickers.add(ticker)
+
+                # Determine result from market_result field
+                result = s.get('market_result', '')
+
+                settlements.append({
+                    'market_ticker': ticker,
+                    'result': result,
+                    'revenue': s.get('revenue', 0),
+                    'yes_total_cost': yes_cost,
+                    'no_total_cost': no_cost,
+                    'settled_time': s.get('settled_time'),
+                    'yes_count': s.get('yes_count', 0),
+                    'no_count': s.get('no_count', 0),
+                })
+
+            cursor = response.get('cursor')
+            if not cursor:
+                break
+
+            time.sleep(SLEEP_BETWEEN_CALLS_SEC)
 
     except Exception as e:
         print(f"Error fetching settlements: {e}")
