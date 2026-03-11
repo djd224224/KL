@@ -88,8 +88,12 @@ INCREMENT_TAIL           = 6    # Cents between each NO bid (tail markets)
 STARTING_CONTRACTS_OFFPEAK = 75 # 1st tier contract count (evening/overnight)
 STARTING_CONTRACTS_PEAK    = 50 # 1st tier contract count (morning 6-10 AM CT)
 CONTRACTS_STEP           = 10   # Additional contracts per tier
-MAX_CONTRACTS            = 1000 # Hard cap per market
+MAX_CONTRACTS            = 500  # Hard cap per market (was 1000, data shows 500+ is optimal)
 CUTOFF_PROBABILITY       = 0.20 # Only trade markets where P(yes) > 20%
+CEILING_PROBABILITY      = 0.75 # Skip markets where P(yes) > 75% (overconfident, -17.7% ROI historically)
+MIN_EDGE_CENTS           = 2    # Only trade if model NO price > market NO offer by this much
+MAX_SPREAD_CENTS         = 15   # Skip markets with spread > 15¢ (>15¢ = -23% ROI historically)
+MAX_FORECAST_DISAGREEMENT = 5.0 # Skip city if sources disagree by >5°F (unreliable, -34% ROI)
 
 # =====================================================================
 # CITY COORDINATES — single source of truth
@@ -125,16 +129,27 @@ CITIES = {
 #   hi_no_price   → starting NO bid price (cents). Higher = more aggressive.
 # =====================================================================
 EVENT_TICKER_DEFS = [
-    ("KXHIGHCHI",  "Chicago",       56), ("KXHIGHNY",   "New York City", 41),
-    ("KXHIGHDEN",  "Denver",        60), ("KXHIGHPHIL", "Philadelphia",  47),
-    ("KXHIGHAUS",  "Austin",        60), ("KXHIGHMIA",  "Miami",         46),
-    ("KXHIGHLAX",  "Los Angeles",   55), ("KXHIGHTATL", "Atlanta",       55),
-    ("KXHIGHTDC",  "Washington DC", 50), ("KXHIGHTPHX", "Phoenix",       55),
-    ("KXHIGHTDAL", "Dallas",        55), ("KXHIGHTLV",  "Las Vegas",     55),
-    ("KXHIGHTOKC", "Oklahoma City", 55), ("KXHIGHTSEA", "Seattle",       50),
-    ("KXHIGHTSFO", "San Francisco", 50), ("KXHIGHTHOU", "Houston",       59),
-    ("KXHIGHTSATX","San Antonio",   55), ("KXHIGHTMIN", "Minneapolis",   55),
-    ("KXHIGHTNOLA","New Orleans",   55),
+    # (ticker_prefix, city, hi_no_price)
+    # hi_no_price calibrated from 9 months of historical P&L (Jan-Sep 2025)
+    ("KXHIGHCHI",  "Chicago",       56), # ROI +1.2% → OK
+    ("KXHIGHNY",   "New York City", 46), # ROI +58.4% → was 41, +5
+    ("KXHIGHDEN",  "Denver",        57), # ROI -4.2% → was 60, -3
+    ("KXHIGHPHIL", "Philadelphia",  52), # ROI +51.0% → was 47, +5
+    ("KXHIGHAUS",  "Austin",        63), # ROI +9.5% → was 60, +3
+    ("KXHIGHMIA",  "Miami",         43), # ROI -4.0% → was 46, -3
+    ("KXHIGHLAX",  "Los Angeles",   58), # ROI +6.6% → was 55, +3
+    ("KXHIGHTATL", "Atlanta",       55), # No historical data — keep default
+    ("KXHIGHTDC",  "Washington DC", 50), # No historical data — keep default
+    ("KXHIGHTPHX", "Phoenix",       55), # No historical data — keep default
+    ("KXHIGHTDAL", "Dallas",        55), # No historical data — keep default
+    ("KXHIGHTLV",  "Las Vegas",     55), # No historical data — keep default
+    ("KXHIGHTOKC", "Oklahoma City", 55), # No historical data — keep default
+    ("KXHIGHTSEA", "Seattle",       50), # No historical data — keep default
+    ("KXHIGHTSFO", "San Francisco", 50), # No historical data — keep default
+    ("KXHIGHTHOU", "Houston",       59), # ROI +108% but only n=3, keep ~same
+    ("KXHIGHTSATX","San Antonio",   55), # No historical data — keep default
+    ("KXHIGHTMIN", "Minneapolis",   55), # No historical data — keep default
+    ("KXHIGHTNOLA","New Orleans",   55), # No historical data — keep default
 ]
 
 # Cancel times: Eastern cities cancel at 9:05 CT, others at 10:05 CT
@@ -148,23 +163,98 @@ CITY_CANCEL_TIMES = {
 CITY_ABV_KEYS = ["THOU","SATX","TMIN","NOLA","CHI","AUS","DEN","NY-","PHI","MIA",
                  "LAX","ATL","TDC","PHX","DAL","TLV","OKC","SEA","SFO","HOU"]
 
+# =====================================================================
+# CITY_FLOOR_STD — minimum std dev (°F) per city for the probability model.
+# Calibrated from 1,816 forecast-vs-actual observations (Jan-Oct 2025).
+# Cities without historical data use 2.3 (overall average).
+# The model uses: max(inter_source_std, city_floor_std).
+# =====================================================================
+CITY_FLOOR_STD = {
+    "Austin": 2.6,          # n=263, MAE=1.7
+    "Miami": 1.6,           # n=258, MAE=1.3
+    "Houston": 2.6,         # n=12 (small sample), MAE=2.6
+    "Denver": 2.8,          # n=261, MAE=1.9 — most variable city
+    "New York City": 2.1,   # n=261, MAE=1.5
+    "Philadelphia": 2.2,    # n=261, MAE=1.7
+    "Chicago": 2.4,         # n=261, MAE=1.8
+    "Los Angeles": 1.8,     # n=239, MAE=1.6
+    "Atlanta": 2.3,         # No data — overall average
+    "Washington DC": 2.2,   # No data — similar to Philadelphia
+    "Phoenix": 2.0,         # No data — arid = more predictable
+    "Dallas": 2.3,          # No data — overall average
+    "Las Vegas": 2.0,       # No data — arid = more predictable
+    "Oklahoma City": 2.5,   # No data — Great Plains = variable
+    "Seattle": 2.0,         # No data — maritime = moderate
+    "San Francisco": 2.0,   # No data — maritime = moderate
+    "San Antonio": 2.3,     # No data — similar to Austin
+    "Minneapolis": 2.5,     # No data — continental = variable
+    "New Orleans": 2.0,     # No data — Gulf Coast = moderate
+}
+
+# =====================================================================
+# CITY_FORECAST_BIAS — systematic forecast bias per city (°F).
+# Positive = consensus over-forecasts (actual is lower than predicted).
+# Negative = consensus under-forecasts (actual is higher than predicted).
+# Applied as: corrected_avg = avg_forecast - bias
+# Calibrated from 1,816 observations (Jan-Oct 2025).
+# Cities without data default to 0 (no correction).
+# =====================================================================
+CITY_FORECAST_BIAS = {
+    "Chicago": -1.0,        # Under-forecasts by 1.0°F (actual runs hotter)
+    "Los Angeles": -0.9,    # Under-forecasts by 0.9°F
+    "Miami": -0.8,          # Under-forecasts by 0.8°F
+    "Philadelphia": -0.7,   # Under-forecasts by 0.7°F
+    "New York City": -0.3,  # Under-forecasts by 0.3°F
+    "Denver": -0.2,         # Under-forecasts by 0.2°F (near zero)
+    "Austin": 0.1,          # Over-forecasts by 0.1°F (near zero)
+    "Houston": -1.9,        # Under-forecasts by 1.9°F (small sample n=12)
+}
+
+# =====================================================================
+# WEATHER CONDITION BOOST — widen std dev when NWS forecasts mention
+# conditions that historically increase forecast error.
+# Calibrated from 1,816 observations:
+#   "rain"         → +0.39°F MAE, +0.44°F std (n=565)
+#   "shower"       → +0.30°F MAE, +0.32°F std (n=585)
+#   "snow"         → +0.24°F MAE, +0.22°F std (n=64)
+#   "thunderstorm" → +0.20°F MAE, +0.13°F std (n=416)
+#   "cloudy"       → +0.31°F MAE, +0.33°F std (n=592)
+# "front" and "wind advisory" never appeared in historical data.
+# CONDITION_BOOST_STD is conservative — set below avg Δstd to avoid over-correction.
+# =====================================================================
+CONDITION_BOOST_PATTERNS = ["rain", "shower", "snow", "thunderstorm", "cloudy"]
+CONDITION_BOOST_STD = 0.5  # °F added when any pattern matches (conservative)
+
 # Historical actuals-vs-forecast: used ONLY for tail markets
-# Rows = +5 to -5°F deviation, columns = cities
+# Calibrated from 1,816 forecast-vs-actual observations (Jan-Oct 2025).
+# Rows = +5 to -5°F deviation from consensus forecast.
+# Columns = cities. Cities without data use overall average distribution.
 ACTUALS_COLUMNS = ["Austin","Miami","Denver","Houston","Philadelphia","New York City",
     "Chicago","Los Angeles","Atlanta","Washington DC","Phoenix","Dallas","Las Vegas",
     "Oklahoma City","Seattle","San Francisco","San Antonio","Minneapolis","New Orleans"]
 ACTUALS_DATA = [
-    [.0270,.0256,.1290,.0000,.0000,.0270,.0333,.0667,.0300,.0270,.0300,.0270,.0300,.0400,.0300,.0300,.0270,.0400,.0300],
-    [.0270,.0000,.0000,.0000,.0263,.0000,.0333,.0000,.0300,.0263,.0300,.0270,.0300,.0300,.0300,.0300,.0270,.0300,.0300],
-    [.0811,.0000,.0645,.1613,.1579,.1081,.1333,.0000,.0800,.1081,.0600,.0811,.0600,.1000,.0600,.0600,.0811,.1000,.0800],
-    [.2432,.2308,.1290,.1935,.1053,.1622,.2333,.0000,.2000,.1622,.1500,.2432,.1500,.1800,.1500,.1500,.2432,.1800,.2000],
-    [.1892,.2051,.1935,.1935,.2895,.2162,.3333,.2667,.2200,.2162,.2500,.1892,.2500,.2200,.2500,.2500,.1892,.2200,.2200],
-    [.1351,.2821,.1935,.0645,.1053,.2162,.0667,.2667,.1800,.2162,.2200,.1351,.2200,.1500,.2200,.2200,.1351,.1500,.1800],
-    [.1892,.1282,.0645,.2258,.1053,.0811,.1000,.1333,.1200,.1053,.1200,.1892,.1200,.1000,.1200,.1200,.1892,.1000,.1200],
-    [.0270,.0769,.0645,.0968,.1053,.1622,.0000,.1333,.0600,.0800,.0600,.0270,.0600,.0500,.0600,.0600,.0270,.0500,.0600],
-    [.0541,.0256,.0968,.0323,.0526,.0000,.0000,.0667,.0400,.0300,.0400,.0541,.0400,.0300,.0400,.0400,.0541,.0300,.0400],
-    [.0000,.0000,.0323,.0000,.0263,.0000,.0333,.0000,.0100,.0263,.0100,.0000,.0100,.0200,.0100,.0100,.0000,.0200,.0100],
-    [.0270,.0256,.0323,.0323,.0263,.0270,.0333,.0667,.0300,.0263,.0300,.0270,.0300,.0300,.0300,.0300,.0270,.0300,.0300],
+    # +5°F above forecast
+    [.0228,.0194,.0536,.0402,.0498,.0383,.0536,.0418,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402],
+    # +4°F
+    [.0114,.0349,.0268,.0352,.0421,.0192,.0651,.0418,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352],
+    # +3°F
+    [.0532,.0659,.0651,.0672,.0805,.0536,.0843,.0669,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672],
+    # +2°F
+    [.1331,.1783,.1149,.1586,.1686,.1073,.1916,.2176,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586],
+    # +1°F
+    [.2053,.2093,.1456,.1845,.1571,.1762,.1724,.2259,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845],
+    # 0°F (forecast was exact)
+    [.2700,.3295,.2529,.2561,.2490,.2452,.2375,.2176,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561],
+    # -1°F
+    [.1217,.1163,.1456,.1322,.1303,.1839,.1111,.1172,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322],
+    # -2°F
+    [.0760,.0233,.0920,.0672,.0690,.1188,.0460,.0460,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672],
+    # -3°F
+    [.0342,.0116,.0230,.0231,.0230,.0345,.0192,.0167,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231],
+    # -4°F
+    [.0190,.0078,.0307,.0149,.0192,.0115,.0077,.0042,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149],
+    # -5°F below forecast
+    [.0532,.0039,.0498,.0209,.0115,.0115,.0115,.0042,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209],
 ]
 ACTUALS_ROWS = ["5","4","3","2","1","0","-1","-2","-3","-4","-5"]
 
@@ -236,6 +326,7 @@ def setup_bigquery():
             SF("nws_detailed_conditions","STRING"),SF("nws_short_conditions","STRING"),
             SF("midnight_temperature","FLOAT64"),SF("event_ticker","STRING"),SF("market_ticker","STRING"),
             SF("low_range","FLOAT64"),SF("high_range","FLOAT64"),SF("hi_no_price","FLOAT64"),
+            SF("forecast_bias","FLOAT64"),SF("city_floor_std","FLOAT64"),SF("model_std","FLOAT64"),
             SF("yes_probability","FLOAT64"),SF("fair_no_price","FLOAT64"),
             SF("no_highest_bid","FLOAT64"),SF("no_lowest_offer","FLOAT64"),
             SF("no_orderbook","STRING"),SF("yes_orderbook","STRING"),SF("position","INT64"),
@@ -350,12 +441,51 @@ def collect_forecasts(variable, central_time):
     df["Average"] = df[src].mean(axis=1)                # Consensus forecast
     df["Standard Deviation"] = df[src].std(axis=1)       # Inter-source disagreement
     df["Highest Minus Lowest"] = df[src].max(axis=1) - df[src].min(axis=1)
+
+    # Apply city-specific forecast bias correction
+    df["Bias"] = df["City"].map(CITY_FORECAST_BIAS).fillna(0)
+    df["Average"] = df["Average"] - df["Bias"]
+    biased = (df["Bias"] != 0).sum()
+    if biased > 0:
+        log.info("Bias correction applied to %d/%d cities", biased, len(df))
+
+    # Filter out cities with extreme forecast disagreement (unreliable)
+    before = len(df)
+    df = df[df["Highest Minus Lowest"] <= MAX_FORECAST_DISAGREEMENT]
+    dropped = before - len(df)
+    if dropped > 0:
+        log.info("Dropped %d cities: forecast disagreement > %.0f°F", dropped, MAX_FORECAST_DISAGREEMENT)
     return df
 
 def add_nws_conditions(ft, variable, central_time):
     rows = [{"City":city,**dict(zip(["NWS Detailed Conditions","NWS Short Conditions"],
              fetch_nws_conditions(c,variable,central_time)))} for city,c in CITIES.items()]
     return pd.merge(ft, pd.DataFrame(rows), on="City", how="inner")
+
+def apply_model_std(ft):
+    """Compute Model Std Dev = max(inter_source_std, city_floor_std) + condition boost.
+    This replaces raw Standard Deviation for all probability calculations.
+    """
+    ft["Standard Deviation"] = pd.to_numeric(ft["Standard Deviation"], errors="coerce")
+
+    # Step 1: Apply city floor — prevents 0 std when all sources agree
+    ft["City Floor Std"] = ft["City"].map(CITY_FLOOR_STD).fillna(2.3)
+    ft["Model Std"] = ft[["Standard Deviation", "City Floor Std"]].max(axis=1)
+
+    # Step 2: Boost for volatile weather conditions
+    def has_volatile_conditions(row):
+        conditions = str(row.get("NWS Detailed Conditions", "")).lower()
+        return any(p in conditions for p in CONDITION_BOOST_PATTERNS)
+
+    boost_mask = ft.apply(has_volatile_conditions, axis=1)
+    ft.loc[boost_mask, "Model Std"] = ft.loc[boost_mask, "Model Std"] + CONDITION_BOOST_STD
+
+    boosted = boost_mask.sum()
+    if boosted > 0:
+        log.info("Weather condition boost applied to %d/%d cities (+%.1f°F std)",
+                 boosted, len(ft), CONDITION_BOOST_STD)
+
+    return ft
 
 def add_midnight_temps(ft, variable, central_time):
     rows = [{"City":city,"Midnight Temperature":fetch_midnight_forecast(c,variable,central_time)}
@@ -407,14 +537,16 @@ def pull_markets(exchange_client, et_df):
     return df.drop(columns=["prev"])
 
 def calculate_probabilities(ft, mt):
-    """Normal CDF: P(temp in bucket) using forecast avg ± std."""
+    """Normal CDF: P(temp in bucket) using forecast avg ± model std.
+    Model Std = max(inter_source_std, city_floor_std) + condition boost.
+    """
     ct = pd.merge(ft, mt, on="City", how="inner")
     ct["Average"] = pd.to_numeric(ct["Average"], errors="coerce")
-    ct["Standard Deviation"] = pd.to_numeric(ct["Standard Deviation"], errors="coerce").replace({0:1e-6,np.nan:1e-6})
+    ct["Model Std"] = pd.to_numeric(ct["Model Std"], errors="coerce").replace({0:1e-6,np.nan:1e-6})
     ct["high_range"] = pd.to_numeric(ct["high_range"], errors="coerce")
     ct["low_range"] = pd.to_numeric(ct["low_range"], errors="coerce")
-    ct["yes_probability"] = (norm.cdf(ct["high_range"],loc=ct["Average"],scale=ct["Standard Deviation"])
-                             - norm.cdf(ct["low_range"],loc=ct["Average"],scale=ct["Standard Deviation"])).round(2)
+    ct["yes_probability"] = (norm.cdf(ct["high_range"],loc=ct["Average"],scale=ct["Model Std"])
+                             - norm.cdf(ct["low_range"],loc=ct["Average"],scale=ct["Model Std"])).round(2)
     ct["fair_no_price"] = 1 - ct["yes_probability"]; return ct
 
 def pull_orderbooks(exchange_client, ct):
@@ -507,18 +639,32 @@ def print_market_diagnostic(row, market_orders, is_tail, starting, cutoff):
         spread = int(no_offer) - int(no_bid)
         spread_str = f"{spread}¢ [{classify_spread(spread)}]"
     else:
-        mid_str = "insufficient book"; spread_str = "no book"
+        mid_str = "insufficient book"; spread_str = "no book"; spread = None
     fair_yes = int(round(yes_prob * 100))
     fair_no_c = int(round((1 - yes_prob) * 100))
+
+    # Edge calculation
+    market_no = int(no_offer) if no_offer != "" else None
+    edge = fair_no_c - market_no if market_no is not None else None
+    edge_str = f"{edge}¢" if edge is not None else "—"
+
+    # Model std breakdown
+    raw_std = row.get("Standard Deviation", 0)
+    floor_std = row.get("City Floor Std", 0)
+    model_std = row.get("Model Std", raw_std)
 
     print(f"\n{'─'*80}")
     print(f"  {ticker}:  {row['City']}  {rng}")
     print(f"    Forecast: WU={row.get('Weather Underground','—')}  AccuW={row.get('Accuweather','—')}  "
-          f"NWS={row.get('NWS','—')}  → Avg={row['Average']:.1f}°F ± {row['Standard Deviation']:.1f}°F")
+          f"NWS={row.get('NWS','—')}  → Avg={row['Average']:.1f}°F")
+    bias = row.get('Bias', 0)
+    if bias != 0:
+        print(f"    Bias correction: {bias:+.1f}°F applied (raw avg was {row['Average']+bias:.1f}°F)")
+    print(f"    Std Dev: raw={raw_std:.1f}  floor={floor_std:.1f}  → model={model_std:.1f}°F")
     strat = "Historical Tail" if is_tail else "Normal CDF"
     buf = " (incl 15¢ buffer)" if is_tail else ""
     print(f"    Strategy [{strat}]: P(temp in range)={yes_prob*100:.1f}%  hi_no_price={hi_no:.0f}¢{buf}")
-    print(f"    → Fair value: YES={fair_yes}¢, NO={fair_no_c}¢ (sum=100¢)")
+    print(f"    → Fair value: YES={fair_yes}¢, NO={fair_no_c}¢  |  Edge vs market: {edge_str}")
     print(f"    Orderbook: Yes={yes_bid_str}, No bid={no_bid_str}, No offer={no_offer_str}")
     print(f"    Mid-price: {mid_str}")
     print(f"    Spread: {spread_str}")
@@ -526,6 +672,10 @@ def print_market_diagnostic(row, market_orders, is_tail, starting, cutoff):
 
     if len(market_orders) == 0:
         if yes_prob <= cutoff and not is_tail: print(f"    → SKIP: P(yes)={yes_prob*100:.1f}% ≤ {cutoff*100:.0f}% cutoff")
+        elif yes_prob >= CEILING_PROBABILITY and not is_tail: print(f"    → SKIP: P(yes)={yes_prob*100:.1f}% ≥ {CEILING_PROBABILITY*100:.0f}% ceiling")
+        elif spread is not None and spread > MAX_SPREAD_CENTS: print(f"    → SKIP: spread={spread}¢ > {MAX_SPREAD_CENTS}¢ max")
+        elif edge is not None and edge < MIN_EDGE_CENTS and not is_tail:
+            print(f"    → SKIP: edge={edge}¢ < {MIN_EDGE_CENTS}¢ minimum")
         elif "-T" in ticker and not is_tail: print(f"    → SKIP: low-end tail (not traded)")
         elif no_offer == "" or no_bid == "": print(f"    → SKIP: no orderbook data")
         else: print(f"    → NO ORDERS: all bids failed price/position filters")
@@ -544,13 +694,31 @@ def place_orders(exchange_client, ct, variable, central_time):
     starting = STARTING_CONTRACTS_OFFPEAK if (central_time.hour > 10 or central_time.hour < 6) else STARTING_CONTRACTS_PEAK
     all_orders = []
     print(f"\n{'═'*80}")
-    print(f"  MARKET DIAGNOSTICS  |  {len(ct)} markets  |  starting={starting}c  |  levels={NUM_PRICE_LEVELS}  |  cutoff={CUTOFF_PROBABILITY*100:.0f}%")
+    print(f"  MARKET DIAGNOSTICS  |  {len(ct)} markets  |  starting={starting}c  |  levels={NUM_PRICE_LEVELS}")
+    print(f"  cutoff={CUTOFF_PROBABILITY*100:.0f}%  |  ceiling={CEILING_PROBABILITY*100:.0f}%  |  min_edge={MIN_EDGE_CENTS}¢  |  max_spread={MAX_SPREAD_CENTS}¢  |  max_contracts={MAX_CONTRACTS}")
     print(f"{'═'*80}")
 
     for idx, row in ct.iterrows():
         is_tail = "-T" in row["market_ticker"] and row["high_range"]==150
         market_orders = []
-        qualifies = (row["yes_probability"] > CUTOFF_PROBABILITY or is_tail) and ("-T" not in row["market_ticker"] or is_tail)
+
+        # Edge check: model fair NO (cents) vs market NO offer
+        fair_no_cents = (1 - row["yes_probability"]) * 100
+        market_no = int(row["no_lowest_offer"]) if row["no_lowest_offer"] != "" else None
+        edge_cents = (fair_no_cents - market_no) if market_no is not None else 0
+
+        # Spread check
+        no_bid = row.get("no_highest_bid", "")
+        no_offer = row.get("no_lowest_offer", "")
+        spread_cents = (int(no_offer) - int(no_bid)) if no_bid != "" and no_offer != "" else None
+
+        qualifies = (
+            (row["yes_probability"] > CUTOFF_PROBABILITY or is_tail)              # Min probability
+            and (row["yes_probability"] < CEILING_PROBABILITY or is_tail)          # Max probability
+            and ("-T" not in row["market_ticker"] or is_tail)                      # Skip low-end tails
+            and (edge_cents >= MIN_EDGE_CENTS or is_tail)                          # Min edge
+            and (spread_cents is not None and spread_cents <= MAX_SPREAD_CENTS)     # Max spread
+        )
         if qualifies:
             i1 = 0
             for i in range(NUM_PRICE_LEVELS):
@@ -616,6 +784,7 @@ def main():
     log.info("--- PHASE 1: Forecasts ---")
     ft = collect_forecasts(variable, central_time)
     ft = add_nws_conditions(ft, variable, central_time)
+    ft = apply_model_std(ft)  # Apply city floor + weather condition boost
     ft = add_midnight_temps(ft, variable, central_time)
     ft = filter_night_session(ft, variable)
     if ft.empty: log.warning("No cities after filters."); sys.exit(0)
@@ -639,12 +808,13 @@ def main():
         "Weather Underground":"weather_underground","Accuweather":"accuweather","NWS":"nws",
         "Average":"forecast_avg","Standard Deviation":"forecast_std","Highest Minus Lowest":"forecast_range",
         "NWS Detailed Conditions":"nws_detailed_conditions","NWS Short Conditions":"nws_short_conditions",
-        "Midnight Temperature":"midnight_temperature"}).copy()
+        "Midnight Temperature":"midnight_temperature","Bias":"forecast_bias",
+        "City Floor Std":"city_floor_std","Model Std":"model_std"}).copy()
     bq_cols = [f.name for f in schemas[f"{BQ_TABLE_PREFIX}market_snapshot"]]
     snap = snap[[c for c in bq_cols if c in snap.columns]]
     snap["forecast_date"]=pd.to_datetime(snap["forecast_date"]); snap["run_date"]=pd.to_datetime(snap["run_date"])
     for c in ["weather_underground","accuweather","nws","forecast_avg","forecast_std","forecast_range",
-              "midnight_temperature","low_range","high_range","hi_no_price",
+              "midnight_temperature","low_range","high_range","hi_no_price","forecast_bias","city_floor_std","model_std",
               "yes_probability","fair_no_price","no_highest_bid","no_lowest_offer"]:
         if c in snap.columns: snap[c]=pd.to_numeric(snap[c],errors="coerce")
     if "position" in snap.columns: snap["position"]=pd.to_numeric(snap["position"],errors="coerce").fillna(0).astype("Int64")
