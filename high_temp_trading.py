@@ -85,13 +85,11 @@ BQ_TABLE_PREFIX = "KXHIGH_"
 NUM_PRICE_LEVELS         = 8    # Tiered orders per market (depth)
 INCREMENT                = 3    # Cents between each NO bid (regular markets)
 INCREMENT_TAIL           = 6    # Cents between each NO bid (tail markets)
-STARTING_CONTRACTS_OFFPEAK = 75 # 1st tier contract count (evening/overnight)
-STARTING_CONTRACTS_PEAK    = 50 # 1st tier contract count (morning 6-10 AM CT)
-CONTRACTS_STEP           = 10   # Additional contracts per tier
+CONTRACTS_PER_TIER       = 25   # Fixed contract count per tier (no step-up)
 MAX_CONTRACTS            = 500  # Hard cap per market (was 1000, data shows 500+ is optimal)
 CUTOFF_PROBABILITY       = 0.20 # Only trade markets where P(yes) > 20%
 CEILING_PROBABILITY      = 0.75 # Skip markets where P(yes) > 75% (overconfident, -17.7% ROI historically)
-MIN_EDGE_CENTS           = 2    # Only trade if model NO price > market NO offer by this much
+MIN_EDGE_CENTS           = 3    # Only trade if model NO price > market NO offer by this much
 MAX_SPREAD_CENTS         = 15   # Skip markets with spread > 15¢ (>15¢ = -23% ROI historically)
 MAX_FORECAST_DISAGREEMENT = 5.0 # Skip city if sources disagree by >5°F (unreliable, -34% ROI)
 
@@ -225,38 +223,41 @@ CITY_FORECAST_BIAS = {
 CONDITION_BOOST_PATTERNS = ["rain", "shower", "snow", "thunderstorm", "cloudy"]
 CONDITION_BOOST_STD = 0.5  # °F added when any pattern matches (conservative)
 
-# Historical actuals-vs-forecast: used ONLY for tail markets
+# =====================================================================
+# HISTORICAL ACTUALS-VS-FORECAST DISTRIBUTION (currently unused)
 # Calibrated from 1,816 forecast-vs-actual observations (Jan-Oct 2025).
 # Rows = +5 to -5°F deviation from consensus forecast.
 # Columns = cities. Cities without data use overall average distribution.
-ACTUALS_COLUMNS = ["Austin","Miami","Denver","Houston","Philadelphia","New York City",
-    "Chicago","Los Angeles","Atlanta","Washington DC","Phoenix","Dallas","Las Vegas",
-    "Oklahoma City","Seattle","San Francisco","San Antonio","Minneapolis","New Orleans"]
-ACTUALS_DATA = [
-    # +5°F above forecast
-    [.0228,.0194,.0536,.0402,.0498,.0383,.0536,.0418,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402],
-    # +4°F
-    [.0114,.0349,.0268,.0352,.0421,.0192,.0651,.0418,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352],
-    # +3°F
-    [.0532,.0659,.0651,.0672,.0805,.0536,.0843,.0669,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672],
-    # +2°F
-    [.1331,.1783,.1149,.1586,.1686,.1073,.1916,.2176,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586],
-    # +1°F
-    [.2053,.2093,.1456,.1845,.1571,.1762,.1724,.2259,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845],
-    # 0°F (forecast was exact)
-    [.2700,.3295,.2529,.2561,.2490,.2452,.2375,.2176,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561],
-    # -1°F
-    [.1217,.1163,.1456,.1322,.1303,.1839,.1111,.1172,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322],
-    # -2°F
-    [.0760,.0233,.0920,.0672,.0690,.1188,.0460,.0460,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672],
-    # -3°F
-    [.0342,.0116,.0230,.0231,.0230,.0345,.0192,.0167,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231],
-    # -4°F
-    [.0190,.0078,.0307,.0149,.0192,.0115,.0077,.0042,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149],
-    # -5°F below forecast
-    [.0532,.0039,.0498,.0209,.0115,.0115,.0115,.0042,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209],
-]
-ACTUALS_ROWS = ["5","4","3","2","1","0","-1","-2","-3","-4","-5"]
+# Used by calculate_tail_bids() when enabled.
+# =====================================================================
+# ACTUALS_COLUMNS = ["Austin","Miami","Denver","Houston","Philadelphia","New York City",
+#     "Chicago","Los Angeles","Atlanta","Washington DC","Phoenix","Dallas","Las Vegas",
+#     "Oklahoma City","Seattle","San Francisco","San Antonio","Minneapolis","New Orleans"]
+# ACTUALS_DATA = [
+#     # +5°F above forecast
+#     [.0228,.0194,.0536,.0402,.0498,.0383,.0536,.0418,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402,.0402],
+#     # +4°F
+#     [.0114,.0349,.0268,.0352,.0421,.0192,.0651,.0418,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352,.0352],
+#     # +3°F
+#     [.0532,.0659,.0651,.0672,.0805,.0536,.0843,.0669,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672],
+#     # +2°F
+#     [.1331,.1783,.1149,.1586,.1686,.1073,.1916,.2176,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586,.1586],
+#     # +1°F
+#     [.2053,.2093,.1456,.1845,.1571,.1762,.1724,.2259,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845,.1845],
+#     # 0°F (forecast was exact)
+#     [.2700,.3295,.2529,.2561,.2490,.2452,.2375,.2176,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561,.2561],
+#     # -1°F
+#     [.1217,.1163,.1456,.1322,.1303,.1839,.1111,.1172,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322,.1322],
+#     # -2°F
+#     [.0760,.0233,.0920,.0672,.0690,.1188,.0460,.0460,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672,.0672],
+#     # -3°F
+#     [.0342,.0116,.0230,.0231,.0230,.0345,.0192,.0167,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231,.0231],
+#     # -4°F
+#     [.0190,.0078,.0307,.0149,.0192,.0115,.0077,.0042,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149,.0149],
+#     # -5°F below forecast
+#     [.0532,.0039,.0498,.0209,.0115,.0115,.0115,.0042,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209,.0209],
+# ]
+# ACTUALS_ROWS = ["5","4","3","2","1","0","-1","-2","-3","-4","-5"]
 
 
 # =====================================================================
@@ -562,24 +563,28 @@ def pull_orderbooks(exchange_client, ct):
         except Exception as e: log.warning("Orderbook error %s: %s", row["market_ticker"], e)
     return ct
 
-def calculate_tail_bids(ct):
-    """For high-end tails (≥X°F): historical distribution → bid price with 15¢ buffer."""
-    avf = pd.DataFrame(ACTUALS_DATA, columns=ACTUALS_COLUMNS, index=ACTUALS_ROWS).T
-    avf["City"] = avf.index
-    tails = ct[ct["high_range"]==150].copy()
-    if tails.empty: return ct
-    fd = (tails["low_range"]-tails["Average"]).round()
-    chart_idx = [int(v) for v in fd.tolist()]
-    y = pd.DataFrame({"City":tails["City"].values,"low_range":tails["low_range"].values,"Average":tails["Average"].values})
-    y = pd.merge(y, avf, on="City", how="inner")
-    filtered = [y[str(c)].tolist() for c in range(5,-6,-1)]
-    pct = [sum([x[i] for x in filtered][:5-max(-5,min(5,v))+1]) for i,v in enumerate(chart_idx)]
-    y["bid_price"] = [1-x for x in pct]
-    for idx, row in ct.iterrows():
-        if row["high_range"]==150:
-            m = y.loc[y["City"]==row["City"],"bid_price"]
-            if not m.empty: ct.loc[idx,"hi_no_price"] = m.iloc[0]*100-15
-    return ct
+# --- calculate_tail_bids (currently unused — tails use hi_no_price directly) ---
+# Uncomment to use historical distribution instead of hi_no_price for tail markets.
+# Requires uncommenting ACTUALS_DATA, ACTUALS_COLUMNS, ACTUALS_ROWS above.
+#
+# def calculate_tail_bids(ct):
+#     """For high-end tails (≥X°F): historical distribution → bid price with 15¢ buffer."""
+#     avf = pd.DataFrame(ACTUALS_DATA, columns=ACTUALS_COLUMNS, index=ACTUALS_ROWS).T
+#     avf["City"] = avf.index
+#     tails = ct[ct["high_range"]==150].copy()
+#     if tails.empty: return ct
+#     fd = (tails["low_range"]-tails["Average"]).round()
+#     chart_idx = [int(v) for v in fd.tolist()]
+#     y = pd.DataFrame({"City":tails["City"].values,"low_range":tails["low_range"].values,"Average":tails["Average"].values})
+#     y = pd.merge(y, avf, on="City", how="inner")
+#     filtered = [y[str(c)].tolist() for c in range(5,-6,-1)]
+#     pct = [sum([x[i] for x in filtered][:5-max(-5,min(5,v))+1]) for i,v in enumerate(chart_idx)]
+#     y["bid_price"] = [1-x for x in pct]
+#     for idx, row in ct.iterrows():
+#         if row["high_range"]==150:
+#             m = y.loc[y["City"]==row["City"],"bid_price"]
+#             if not m.empty: ct.loc[idx,"hi_no_price"] = m.iloc[0]*100-15
+#     return ct
 
 def cancel_orders_and_pull_positions(exchange_client, ct):
     """Cancel all resting orders (clean slate) then check current positions."""
@@ -662,8 +667,7 @@ def print_market_diagnostic(row, market_orders, is_tail, starting, cutoff):
         print(f"    Bias correction: {bias:+.1f}°F applied (raw avg was {row['Average']+bias:.1f}°F)")
     print(f"    Std Dev: raw={raw_std:.1f}  floor={floor_std:.1f}  → model={model_std:.1f}°F")
     strat = "Historical Tail" if is_tail else "Normal CDF"
-    buf = " (incl 15¢ buffer)" if is_tail else ""
-    print(f"    Strategy [{strat}]: P(temp in range)={yes_prob*100:.1f}%  hi_no_price={hi_no:.0f}¢{buf}")
+    print(f"    Strategy [{strat}]: P(temp in range)={yes_prob*100:.1f}%  hi_no_price={hi_no:.0f}¢")
     print(f"    → Fair value: YES={fair_yes}¢, NO={fair_no_c}¢  |  Edge vs market: {edge_str}")
     print(f"    Orderbook: Yes={yes_bid_str}, No bid={no_bid_str}, No offer={no_offer_str}")
     print(f"    Mid-price: {mid_str}")
@@ -691,10 +695,9 @@ def print_market_diagnostic(row, market_orders, is_tail, starting, cutoff):
 
 def place_orders(exchange_client, ct, variable, central_time):
     """Place up to NUM_PRICE_LEVELS tiered NO limit orders per qualifying market."""
-    starting = STARTING_CONTRACTS_OFFPEAK if (central_time.hour > 10 or central_time.hour < 6) else STARTING_CONTRACTS_PEAK
     all_orders = []
     print(f"\n{'═'*80}")
-    print(f"  MARKET DIAGNOSTICS  |  {len(ct)} markets  |  starting={starting}c  |  levels={NUM_PRICE_LEVELS}")
+    print(f"  MARKET DIAGNOSTICS  |  {len(ct)} markets  |  contracts={CONTRACTS_PER_TIER}c  |  levels={NUM_PRICE_LEVELS}")
     print(f"  cutoff={CUTOFF_PROBABILITY*100:.0f}%  |  ceiling={CEILING_PROBABILITY*100:.0f}%  |  min_edge={MIN_EDGE_CENTS}¢  |  max_spread={MAX_SPREAD_CENTS}¢  |  max_contracts={MAX_CONTRACTS}")
     print(f"{'═'*80}")
 
@@ -712,22 +715,27 @@ def place_orders(exchange_client, ct, variable, central_time):
         no_offer = row.get("no_lowest_offer", "")
         spread_cents = (int(no_offer) - int(no_bid)) if no_bid != "" and no_offer != "" else None
 
-        qualifies = (
-            (row["yes_probability"] > CUTOFF_PROBABILITY or is_tail)              # Min probability
-            and (row["yes_probability"] < CEILING_PROBABILITY or is_tail)          # Max probability
-            and ("-T" not in row["market_ticker"] or is_tail)                      # Skip low-end tails
-            and (edge_cents >= MIN_EDGE_CENTS or is_tail)                          # Min edge
-            and (spread_cents is not None and spread_cents <= MAX_SPREAD_CENTS)     # Max spread
-        )
+          # qualifies = (
+          #     (row["yes_probability"] > CUTOFF_PROBABILITY or is_tail)              # Min probability
+          #     and (row["yes_probability"] < CEILING_PROBABILITY or is_tail)          # Max probability
+          #     and ("-T" not in row["market_ticker"] or is_tail)                      # Skip low-end tails
+          #     and (edge_cents >= MIN_EDGE_CENTS or is_tail)                          # Min edge
+          #     and (spread_cents is not None and spread_cents <= MAX_SPREAD_CENTS)     # Max spread
+          # )
+            qualifies = (
+                row["yes_probability"] > CUTOFF_PROBABILITY
+                and row["yes_probability"] < CEILING_PROBABILITY
+                and "-T" not in row["market_ticker"] or is_tail)
+                and edge_cents >= MIN_EDGE_CENTS
+                and (spread_cents is not None and spread_cents <= MAX_SPREAD_CENTS)
+            )
         if qualifies:
-            i1 = 0
             for i in range(NUM_PRICE_LEVELS):
                 inc = INCREMENT_TAIL if is_tail else INCREMENT
                 bp = max(row["hi_no_price"]-i*inc, 1)
                 if (row["no_lowest_offer"]!="" and bp<int(row["no_lowest_offer"])
                     and bp<int(row["no_highest_bid"])-3
-                    and MAX_CONTRACTS>=row["position"]+row["resting_order_count"]+starting+i*CONTRACTS_STEP):
-                    contracts = starting+i1*CONTRACTS_STEP; i1+=1
+                    and MAX_CONTRACTS>=row["position"]+row["resting_order_count"]+CONTRACTS_PER_TIER):
                     abv = get_city_abv(row["market_ticker"])
                     ch,cm = get_cancel_time(abv)
                     oid = str(uuid.uuid4()); exp = get_unix_time_for_target(ch,cm,variable)
@@ -736,17 +744,17 @@ def place_orders(exchange_client, ct, variable, central_time):
                     if exp <= int(time.time()):
                         continue
                     params = {"ticker":row["market_ticker"],"client_order_id":oid,"type":"limit",
-                              "action":"buy","side":"no","count":contracts,"yes_price":None,
+                              "action":"buy","side":"no","count":CONTRACTS_PER_TIER,"yes_price":None,
                               "no_price":int(bp),"expiration_ts":exp,"sell_position_floor":None,"buy_max_cost":None}
                     try: exchange_client.create_order(**params)
                     except Exception as e: log.error("Order failed %s: %s", row["market_ticker"], e); continue
                     rec = {"city":row["City"],"forecast_date":row["Forecast Date"],"run_date":row["Run Date"],
-                           "market_ticker":row["market_ticker"],"contracts":contracts,"no_price":int(bp),
+                           "market_ticker":row["market_ticker"],"contracts":CONTRACTS_PER_TIER,"no_price":int(bp),
                            "city_abv":abv,"client_order_id":oid,"expiration_ts":exp,
                            "created_at":central_time.strftime("%Y-%m-%d %H:%M:%S")}
                     market_orders.append(rec); all_orders.append(rec)
-                    ct.loc[idx,"resting_order_count"] = row["resting_order_count"]+contracts
-        print_market_diagnostic(row, market_orders, is_tail, starting, CUTOFF_PROBABILITY)
+                    ct.loc[idx,"resting_order_count"] = row["resting_order_count"]+CONTRACTS_PER_TIER
+        print_market_diagnostic(row, market_orders, is_tail, CONTRACTS_PER_TIER, CUTOFF_PROBABILITY)
 
     print(f"\n{'═'*80}")
     print(f"  SUMMARY: {len(all_orders)} orders placed across {len(ct)} markets")
@@ -796,7 +804,7 @@ def main():
     if mt.empty: log.warning("No markets."); sys.exit(0)
     log.info("%d sub-markets found.", len(mt))
     ct = pull_orderbooks(xc, calculate_probabilities(ft, mt))
-    ct = calculate_tail_bids(ct)
+    # ct = calculate_tail_bids(ct)  # Uncomment to use historical distribution for tail pricing
 
     # Phase 3: Cancel + positions
     log.info("--- PHASE 3: Positions ---")
