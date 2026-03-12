@@ -9,6 +9,8 @@ jobs:
   run-kalshi-script:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,5 +35,3 @@ jobs:
         if: always()
         run: |
           rm -f kalshi_private_key.pem
-
-          
