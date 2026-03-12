@@ -11,6 +11,9 @@ as the NBA mention trading script).
 Environment variables (set as GitHub Actions secrets):
     KALSHI_API_KEY_ID           Your Kalshi API key ID
     KALSHI_PRIVATE_KEY_PATH     Path to your RSA private key PEM file
+    GOOGLE_APPLICATION_CREDENTIALS  Path to GCP service account JSON
+    GCP_PROJECT_ID              BigQuery project ID
+    GCP_DATASET_ID              BigQuery dataset ID
 
 Usage:
     python kalshi_longshot_bot.py
@@ -25,8 +28,11 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import pandas as pd
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from google.cloud import bigquery
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient
 
 # ════════════════════════════════════════════════════════════
@@ -36,6 +42,12 @@ from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
 PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+
+# BigQuery
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
+GCP_DATASET_ID = os.environ.get("GCP_DATASET_ID", "")
+BQ_ORDERS_TABLE = "KXLONGSHOT_orders"
+BQ_SNAPSHOTS_TABLE = "KXLONGSHOT_market_snapshots"
 
 # ── Strategy Parameters ──────────────────────────────────
 
@@ -47,32 +59,31 @@ FEE_RATE = 0.02
 MIN_VOLUME = 10
 
 # Order ladder: place sell orders at 5 price levels stepping up
-# from the current ask. Higher levels = more premium, less likely to fill.
-# Level 0 = yes_ask, Level 1 = yes_ask+1¢, Level 2 = yes_ask+2¢, etc.
 NUM_LEVELS = 5
-LEVEL_INCREMENT_CENTS = 1       # step size between levels
-CONTRACTS_PER_LEVEL = 10        # contracts at each level
+LEVEL_INCREMENT_CENTS = 1
+CONTRACTS_PER_LEVEL = 10
 
-# Hours before market close_time to stop placing / pull quotes
-# (matches NBA script's EXPIRATION_HOURS_BEFORE_CLOSE = 5)
 QUOTE_PULLBACK_HOURS = 5
 
 # ── Risk Management ──────────────────────────────────────
 
 MAX_RISK_PER_CONTRACT = 50
 MAX_TOTAL_RISK = 2000
-MAX_CONTRACTS_PER_EVENT = 25     # multiple markets × 5 levels each
-MAX_CONTRACTS_PER_ENTITY = 15    # multiple markets × 5 levels each
+MAX_CONTRACTS_PER_EVENT = 25
+MAX_CONTRACTS_PER_ENTITY = 15
 MAX_SAME_DAY_EXPIRY = 15
 DAILY_STOP_LOSS = -200
 PRICE_SPIKE_THRESHOLD = 0.10
-MAX_CONTRACTS_PER_MARKET = 50    # 5 levels × 10 contracts
+MAX_CONTRACTS_PER_MARKET = 50
 
 # ── Bot Behavior ─────────────────────────────────────────
 
 TRADE_LOG_PATH = "trades.jsonl"
 LOG_LEVEL = "INFO"
 SLEEP_BETWEEN_ORDERS = 0.05
+
+RUN_ID = str(uuid.uuid4())
+MODEL_VERSION = "longshot-v1"
 
 # ── Curated Series ───────────────────────────────────────
 
@@ -97,7 +108,7 @@ CURATED_SERIES = [
 
 
 # ────────────────────────────────────────────────────────────
-# Auth (same pattern as NBA script)
+# Auth
 # ────────────────────────────────────────────────────────────
 
 def load_private_key_from_file(file_path: str):
@@ -118,13 +129,133 @@ exchange_client = ExchangeClient(
     private_key=PRIVATE_KEY,
 )
 
-print("Testing connection...")
+print("Testing Kalshi connection...")
 try:
     status = exchange_client.get_exchange_status()
     print(f"✓ Connected! Trading active: {status['trading_active']}")
 except Exception as e:
     print(f"✗ Connection failed: {e}")
     raise
+
+# ────────────────────────────────────────────────────────────
+# BigQuery (same pattern as NBA script)
+# ────────────────────────────────────────────────────────────
+
+bq_client = None
+try:
+    bq_client = bigquery.Client(project=GCP_PROJECT_ID)
+    print(f"✓ BigQuery client initialized (project: {GCP_PROJECT_ID})")
+except Exception as e:
+    print(f"✗ BigQuery client FAILED: {e}")
+    print("  Orders will still be placed but NOT logged to BQ")
+
+
+def get_existing_table_schema(table_name: str) -> Optional[Dict[str, str]]:
+    try:
+        table_id = f"{GCP_PROJECT_ID}.{GCP_DATASET_ID}.{table_name}"
+        table = bq_client.get_table(table_id)
+        return {field.name: field.field_type for field in table.schema}
+    except Exception:
+        return None
+
+
+def pandas_dtype_to_bq_type(dtype):
+    if pd.api.types.is_integer_dtype(dtype):
+        return "INTEGER"
+    elif pd.api.types.is_float_dtype(dtype):
+        return "FLOAT"
+    elif pd.api.types.is_bool_dtype(dtype):
+        return "BOOLEAN"
+    elif pd.api.types.is_datetime64_any_dtype(dtype):
+        return "TIMESTAMP"
+    else:
+        return "STRING"
+
+
+def add_missing_columns_to_table(table_name: str, df: pd.DataFrame,
+                                  existing_schema: dict):
+    table_id = f"{GCP_PROJECT_ID}.{GCP_DATASET_ID}.{table_name}"
+    table = bq_client.get_table(table_id)
+    original_schema = table.schema
+    new_schema = original_schema[:]
+    for col_name in df.columns:
+        if col_name not in existing_schema:
+            bq_type = pandas_dtype_to_bq_type(df[col_name].dtype)
+            print(f"  Adding column: {col_name} ({bq_type})")
+            new_schema.append(
+                bigquery.SchemaField(col_name, bq_type, mode="NULLABLE")
+            )
+    if len(new_schema) > len(original_schema):
+        table.schema = new_schema
+        bq_client.update_table(table, ["schema"])
+        print(f"  ✓ Updated schema for {table_name}")
+
+
+def convert_df_to_match_schema(df: pd.DataFrame,
+                                schema_dict: dict) -> pd.DataFrame:
+    df_converted = df.copy()
+    for col_name, bq_type in schema_dict.items():
+        if col_name not in df_converted.columns:
+            continue
+        current_dtype = df_converted[col_name].dtype
+        if bq_type == "STRING" and not pd.api.types.is_string_dtype(current_dtype):
+            df_converted[col_name] = (
+                df_converted[col_name].astype(str)
+                .replace("nan", None).replace("None", None)
+            )
+        elif bq_type == "FLOAT" and not pd.api.types.is_float_dtype(current_dtype):
+            df_converted[col_name] = pd.to_numeric(
+                df_converted[col_name], errors="coerce"
+            )
+        elif bq_type == "INTEGER" and not pd.api.types.is_integer_dtype(current_dtype):
+            df_converted[col_name] = pd.to_numeric(
+                df_converted[col_name], errors="coerce"
+            ).astype("Int64")
+        elif bq_type == "BOOLEAN" and not pd.api.types.is_bool_dtype(current_dtype):
+            df_converted[col_name] = df_converted[col_name].astype(bool)
+    return df_converted
+
+
+def df_to_bq(df: pd.DataFrame, table_name: str,
+             write_disposition: str = "WRITE_APPEND"):
+    """Upload DataFrame to BigQuery (same as NBA script)."""
+    if bq_client is None:
+        print(f"  ⚠️ BQ client not initialized — skipping {table_name}")
+        return
+
+    if df is None or len(df) == 0:
+        print(f"  ⚠️ Empty DataFrame — skipping upload to {table_name}")
+        return
+
+    table_id = f"{GCP_PROJECT_ID}.{GCP_DATASET_ID}.{table_name}"
+    df_to_upload = df.copy()
+
+    if write_disposition == "WRITE_APPEND":
+        existing_schema = get_existing_table_schema(table_name)
+        if existing_schema is not None:
+            new_cols = set(df_to_upload.columns) - set(existing_schema.keys())
+            if new_cols:
+                print(f"  ⚠️ New columns: {new_cols}")
+                add_missing_columns_to_table(
+                    table_name, df_to_upload, existing_schema
+                )
+                existing_schema = get_existing_table_schema(table_name)
+            df_to_upload = convert_df_to_match_schema(
+                df_to_upload, existing_schema
+            )
+
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=write_disposition,
+        autodetect=True,
+    )
+    job = bq_client.load_table_from_dataframe(
+        df_to_upload, table_id, job_config=job_config
+    )
+    job.result()
+    print(
+        f"  ✓ Uploaded to {table_id}: "
+        f"{bq_client.get_table(table_id).num_rows} rows"
+    )
 
 
 # ────────────────────────────────────────────────────────────
@@ -151,15 +282,12 @@ def is_within_pullback(close_time: Optional[datetime]) -> bool:
 
 
 def get_all_markets_for_series(series_ticker: str) -> List[Dict[str, Any]]:
-    """Fetch all active markets for a series (same pattern as NBA script)."""
     all_markets = []
     cursor = None
-
     while True:
         params = {"series_ticker": series_ticker, "limit": 200}
         if cursor:
             params["cursor"] = cursor
-
         try:
             response = exchange_client.get_markets(**params)
             markets = response.get("markets", [])
@@ -171,21 +299,7 @@ def get_all_markets_for_series(series_ticker: str) -> List[Dict[str, Any]]:
         except Exception as e:
             logging.error(f"Error fetching markets for {series_ticker}: {e}")
             break
-
     return all_markets
-
-
-def log_trade(action: str, data: dict):
-    record = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "action": action,
-        **data,
-    }
-    try:
-        with open(TRADE_LOG_PATH, "a") as f:
-            f.write(json.dumps(record) + "\n")
-    except Exception as e:
-        logging.error(f"Failed to write trade log: {e}")
 
 
 # ────────────────────────────────────────────────────────────
@@ -197,6 +311,10 @@ def scan_and_trade():
 
     log.info("=" * 60)
     log.info("Starting scan cycle...")
+
+    # Collectors for BQ upload
+    order_results: List[Dict[str, Any]] = []
+    market_snapshots: List[Dict[str, Any]] = []
 
     # ── Step 1: Fetch markets for all curated series ─────
 
@@ -214,11 +332,9 @@ def scan_and_trade():
         active = [m for m in markets if m.get("status") in ("active", "open")]
         log.info(f"  Active: {len(active)}")
 
-        # Debug: show first 3 markets so we can see field format
         for i, dbg_mkt in enumerate(active[:3]):
             log.info(
                 f"  DEBUG mkt[{i}]: ticker={dbg_mkt.get('ticker')} "
-                f"yes_bid={dbg_mkt.get('yes_bid')} yes_ask={dbg_mkt.get('yes_ask')} "
                 f"yes_bid_dollars={dbg_mkt.get('yes_bid_dollars')} "
                 f"yes_ask_dollars={dbg_mkt.get('yes_ask_dollars')} "
                 f"close_time={dbg_mkt.get('close_time')}"
@@ -233,21 +349,11 @@ def scan_and_trade():
         for mkt in active:
             ticker = mkt.get("ticker", "")
 
-            # ── Pullback check using close_time from API ──
             close_dt = parse_close_time(mkt.get("close_time"))
             if close_dt and is_within_pullback(close_dt):
-                hours_left = (
-                    close_dt - datetime.now(timezone.utc)
-                ).total_seconds() / 3600
-                log.debug(
-                    f"  Skipping {ticker} — {hours_left:.1f}h to close"
-                )
                 skipped_pullback += 1
                 continue
 
-            # ── Get bid/ask from market listing ──
-            # API returns yes_bid_dollars / yes_ask_dollars in dollar format
-            # (e.g., 0.6600 = 66¢). yes_bid/yes_ask fields are None.
             yes_ask_raw = mkt.get("yes_ask_dollars")
             yes_bid_raw = mkt.get("yes_bid_dollars")
 
@@ -266,17 +372,14 @@ def scan_and_trade():
                 skipped_no_price += 1
                 continue
 
-            # Already in dollars
-            yes_ask = int(round(yes_ask_d * 100))  # cents for order placement
+            yes_ask = int(round(yes_ask_d * 100))
             yes_bid = int(round(yes_bid_d * 100))
             yes_mid = (yes_bid_d + yes_ask_d) / 2.0
 
-            # ── Price filter ──
             if not (MIN_YES_PRICE <= yes_mid <= MAX_YES_PRICE):
                 skipped_price_range += 1
                 continue
 
-            # ── EV calculation ──
             true_prob = yes_mid * BIAS_DISCOUNT
             sell_price = yes_ask_d
             profit_if_no = sell_price * (1 - FEE_RATE)
@@ -288,10 +391,8 @@ def scan_and_trade():
                 continue
 
             passed += 1
-
             risk_per = 1.0 - sell_price
 
-            # ── Composite score ──
             price_range = MAX_YES_PRICE - MIN_YES_PRICE
             price_score = (
                 (1.0 - (yes_mid - MIN_YES_PRICE) / price_range)
@@ -300,7 +401,7 @@ def scan_and_trade():
             ev_score = min(ev / 0.05, 1.0)
             score = 0.6 * ev_score + 0.4 * price_score
 
-            all_candidates.append({
+            candidate = {
                 "ticker": ticker,
                 "event_ticker": mkt.get("event_ticker", ""),
                 "title": mkt.get("title") or mkt.get("subtitle") or ticker,
@@ -319,6 +420,32 @@ def scan_and_trade():
                 "close_time_str": mkt.get("close_time"),
                 "volume": mkt.get("volume", 0) or 0,
                 "open_interest": mkt.get("open_interest", 0) or 0,
+            }
+            all_candidates.append(candidate)
+
+            # Save market snapshot for BQ
+            market_snapshots.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id": RUN_ID,
+                "model_version": MODEL_VERSION,
+                "ticker": ticker,
+                "event_ticker": mkt.get("event_ticker", ""),
+                "series_ticker": series_ticker,
+                "entity": entity,
+                "category": category,
+                "title": candidate["title"],
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "yes_mid": round(yes_mid, 4),
+                "ev": round(ev, 4),
+                "true_prob": round(true_prob, 4),
+                "bias_discount": BIAS_DISCOUNT,
+                "score": round(score, 3),
+                "risk_per_contract": round(risk_per, 4),
+                "volume": candidate["volume"],
+                "open_interest": candidate["open_interest"],
+                "close_time": mkt.get("close_time"),
+                "pullback_hours": QUOTE_PULLBACK_HOURS,
             })
 
         log.info(
@@ -336,6 +463,7 @@ def scan_and_trade():
 
     if not all_candidates:
         log.info("No candidates found. Done.")
+        _upload_to_bq(order_results, market_snapshots, log)
         return
 
     # ── Step 2: Apply risk limits and select ─────────────
@@ -360,7 +488,6 @@ def scan_and_trade():
             if day_counts.get(day_key, 0) >= MAX_SAME_DAY_EXPIRY:
                 continue
 
-        # Max contracts across all levels for this market
         max_total_contracts = NUM_LEVELS * CONTRACTS_PER_LEVEL
         contracts = min(
             int(MAX_RISK_PER_CONTRACT / c["risk_per"]),
@@ -393,21 +520,18 @@ def scan_and_trade():
 
     if not selected:
         log.info("Nothing selected. Done.")
+        _upload_to_bq(order_results, market_snapshots, log)
         return
 
-    # ── Step 3: Place orders via ExchangeClient ──────────
-    # For each candidate, place sell-Yes orders at NUM_LEVELS
-    # price levels stepping up from the current ask.
+    # ── Step 3: Place orders ─────────────────────────────
 
     success_count = 0
     fail_count = 0
 
     for c in selected:
         ticker = c["ticker"]
-        base_price = c["yes_ask"]  # cents
+        base_price = c["yes_ask"]
 
-        # Derive expiration_ts from close_time
-        # Orders auto-cancel 21 hours before market closes
         EXPIRATION_HOURS_BEFORE_CLOSE = 21
         expiration_ts = None
         if c["close_time"]:
@@ -422,11 +546,9 @@ def scan_and_trade():
         for level in range(NUM_LEVELS):
             yes_price_cents = base_price + (level * LEVEL_INCREMENT_CENTS)
 
-            # Don't exceed max price
             if yes_price_cents > max_yes_cents:
                 break
 
-            # Recalculate EV at this sell price
             sell_price_d = yes_price_cents / 100.0
             true_prob = c["true_prob"]
             profit_if_no = sell_price_d * (1 - FEE_RATE)
@@ -436,21 +558,7 @@ def scan_and_trade():
             if level_ev < MIN_EV_DOLLARS:
                 break
 
-            trade_data = {
-                "ticker": ticker,
-                "event_ticker": c["event_ticker"],
-                "entity": c["entity"],
-                "category": c["category"],
-                "yes_price_cents": yes_price_cents,
-                "count": CONTRACTS_PER_LEVEL,
-                "level": level,
-                "ev": round(level_ev, 4),
-                "true_prob": round(true_prob, 4),
-                "score": round(c["score"], 3),
-                "close_time": c["close_time_str"],
-                "expiration_ts": expiration_ts,
-                "risk_dollars": round(CONTRACTS_PER_LEVEL * (1.0 - sell_price_d), 2),
-            }
+            client_order_id = str(uuid.uuid4())
 
             order_params = {
                 "ticker": ticker,
@@ -459,27 +567,62 @@ def scan_and_trade():
                 "type": "limit",
                 "count": CONTRACTS_PER_LEVEL,
                 "yes_price": yes_price_cents,
-                "client_order_id": str(uuid.uuid4()),
+                "client_order_id": client_order_id,
             }
             if expiration_ts is not None:
                 order_params["expiration_ts"] = expiration_ts
+
+            order_record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id": RUN_ID,
+                "model_version": MODEL_VERSION,
+                "ticker": ticker,
+                "event_ticker": c["event_ticker"],
+                "series_ticker": c["series_ticker"],
+                "entity": c["entity"],
+                "category": c["category"],
+                "title": c["title"],
+                "side": "yes",
+                "action": "sell",
+                "yes_price_cents": yes_price_cents,
+                "count": CONTRACTS_PER_LEVEL,
+                "level": level,
+                "ev": round(level_ev, 4),
+                "true_prob": round(true_prob, 4),
+                "bias_discount": BIAS_DISCOUNT,
+                "score": round(c["score"], 3),
+                "close_time": c["close_time_str"],
+                "expiration_ts": expiration_ts,
+                "risk_dollars": round(
+                    CONTRACTS_PER_LEVEL * (1.0 - sell_price_d), 2
+                ),
+                "yes_bid": c["yes_bid"],
+                "yes_ask": c["yes_ask"],
+                "yes_mid": round(c["yes_mid"], 4),
+                "volume": c["volume"],
+                "open_interest": c["open_interest"],
+                "client_order_id": client_order_id,
+            }
 
             try:
                 response = exchange_client.create_order(**order_params)
                 order = response.get("order", {})
                 order_id = order.get("order_id", "")
 
-                trade_data["order_id"] = order_id
-                log_trade("order_placed", trade_data)
+                order_record["ok"] = True
+                order_record["order_id"] = order_id
+                order_record["error"] = None
                 levels_placed.append(f"{yes_price_cents}¢")
                 success_count += 1
 
             except Exception as e:
                 log.error(f"  ✗ Level {level} @ {yes_price_cents}¢: {e}")
-                trade_data["error"] = str(e)
-                log_trade("order_failed", trade_data)
+                order_record["ok"] = False
+                order_record["order_id"] = None
+                order_record["error"] = str(e)[:500]
                 fail_count += 1
 
+            order_results.append(order_record)
             time.sleep(SLEEP_BETWEEN_ORDERS)
 
         if levels_placed:
@@ -503,6 +646,52 @@ def scan_and_trade():
     )
     log.info("=" * 60)
 
+    # ── Upload to BigQuery ───────────────────────────────
+
+    try:
+        _upload_to_bq(order_results, market_snapshots, log)
+    except Exception as e:
+        print(f"\n✗ BIGQUERY UPLOAD CRASHED: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def _upload_to_bq(
+    order_results: List[Dict[str, Any]],
+    market_snapshots: List[Dict[str, Any]],
+    log,
+):
+    """Upload orders and market snapshots to BigQuery."""
+    print("\n" + "=" * 60)
+    print("UPLOADING TO BIGQUERY")
+    print("=" * 60)
+
+    if order_results:
+        df_orders = pd.DataFrame(order_results)
+        print(f"  Orders: {len(df_orders)} rows → {BQ_ORDERS_TABLE}")
+        try:
+            df_to_bq(df_orders, BQ_ORDERS_TABLE, "WRITE_APPEND")
+        except Exception as e:
+            print(f"  ✗ Orders upload failed: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("  Orders: 0 rows — skipping")
+
+    if market_snapshots:
+        df_snapshots = pd.DataFrame(market_snapshots)
+        print(f"  Snapshots: {len(df_snapshots)} rows → {BQ_SNAPSHOTS_TABLE}")
+        try:
+            df_to_bq(df_snapshots, BQ_SNAPSHOTS_TABLE, "WRITE_APPEND")
+        except Exception as e:
+            print(f"  ✗ Snapshots upload failed: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("  Snapshots: 0 rows — skipping")
+
+    print("✓ BigQuery upload complete")
+
 
 # ────────────────────────────────────────────────────────────
 # Main
@@ -514,16 +703,21 @@ def main():
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
     )
     log = logging.getLogger("longshot-bot")
 
     log.info("=" * 60)
     log.info("Kalshi Longshot Seller Bot")
+    log.info(f"  Run ID: {RUN_ID}")
+    log.info(f"  Model: {MODEL_VERSION}")
     log.info(f"  API: {API_BASE}")
+    log.info(f"  BQ: {GCP_PROJECT_ID}.{GCP_DATASET_ID}")
     log.info(f"  Series: {len(CURATED_SERIES)}")
     for s in CURATED_SERIES:
         log.info(f"    {s['series_ticker']} ({s['description']})")
     log.info(f"  Price: ${MIN_YES_PRICE}-${MAX_YES_PRICE}")
+    log.info(f"  Levels: {NUM_LEVELS} × {CONTRACTS_PER_LEVEL}c @ +{LEVEL_INCREMENT_CENTS}¢")
     log.info(f"  Bias discount: {BIAS_DISCOUNT}")
     log.info(f"  Pullback: {QUOTE_PULLBACK_HOURS}h before close_time")
     log.info(f"  Max risk: ${MAX_TOTAL_RISK}")
