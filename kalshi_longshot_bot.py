@@ -239,28 +239,29 @@ def scan_and_trade():
                 continue
 
             # ── Get bid/ask from market listing ──
-            # (always populated, unlike orderbook which can be empty)
-            yes_ask_raw = mkt.get("yes_ask")
-            yes_bid_raw = mkt.get("yes_bid")
+            # API returns yes_bid_dollars / yes_ask_dollars in dollar format
+            # (e.g., 0.6600 = 66¢). yes_bid/yes_ask fields are None.
+            yes_ask_raw = mkt.get("yes_ask_dollars")
+            yes_bid_raw = mkt.get("yes_bid_dollars")
 
             if yes_ask_raw is None or yes_bid_raw is None:
                 skipped_no_price += 1
                 continue
 
             try:
-                yes_ask = int(yes_ask_raw)
-                yes_bid = int(yes_bid_raw)
+                yes_ask_d = float(yes_ask_raw)
+                yes_bid_d = float(yes_bid_raw)
             except (ValueError, TypeError):
                 skipped_no_price += 1
                 continue
 
-            if yes_ask <= 0 or yes_bid < 0:
+            if yes_ask_d <= 0 or yes_bid_d < 0:
                 skipped_no_price += 1
                 continue
 
-            # API returns cents (1-99)
-            yes_bid_d = yes_bid / 100.0
-            yes_ask_d = yes_ask / 100.0
+            # Already in dollars
+            yes_ask = int(round(yes_ask_d * 100))  # cents for order placement
+            yes_bid = int(round(yes_bid_d * 100))
             yes_mid = (yes_bid_d + yes_ask_d) / 2.0
 
             # ── Price filter ──
