@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests cryptography
+          pip install requests cryptography python-dateutil
       - name: Write Kalshi private key
         run: |
           echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > kalshi_private_key.pem
@@ -33,3 +33,5 @@ jobs:
         if: always()
         run: |
           rm -f kalshi_private_key.pem
+
+          
