@@ -1,4 +1,4 @@
-name: NBAMENTION v4.2 Trading Bot
+name: NBAMENTION v4.4 Trading Bot
 # Runs every 2 hours (offset by 2 min to avoid top-of-hour congestion)
 # Times in UTC: 0:02, 2:02, 4:02, 6:02, 8:02, 10:02, 12:02, 14:02, 16:02, 18:02, 20:02, 22:02
 on:
@@ -45,7 +45,7 @@ jobs:
         GOOGLE_APPLICATION_CREDENTIALS: gcp_sa_key.json
         GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
-      run: python nbamention_v4_2.py
+      run: python nbamention_v4_4.py
     - name: Cleanup secrets
       if: always()
       run: |
