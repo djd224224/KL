@@ -395,6 +395,16 @@ def scan_and_trade():
         yes_price_cents = c["yes_ask"]
         count = c["contracts"]
 
+        # Derive expiration_ts from close_time (same as NBA script)
+        # Orders auto-cancel QUOTE_PULLBACK_HOURS before market closes
+        expiration_ts = None
+        if c["close_time"]:
+            close_unix = int(c["close_time"].timestamp())
+            expiration_ts = close_unix - (QUOTE_PULLBACK_HOURS * 3600)
+            # Don't set expiration in the past
+            if expiration_ts <= int(time.time()):
+                expiration_ts = None
+
         log.info(
             f"SELL YES {count}x {ticker} "
             f"@ {yes_price_cents}¢ | "
@@ -414,19 +424,25 @@ def scan_and_trade():
             "true_prob": round(c["true_prob"], 4),
             "score": round(c["score"], 3),
             "close_time": c["close_time_str"],
+            "expiration_ts": expiration_ts,
             "risk_dollars": round(count * c["risk_per"], 2),
         }
 
+        # Build order params
+        order_params = {
+            "ticker": ticker,
+            "action": "sell",
+            "side": "yes",
+            "type": "limit",
+            "count": count,
+            "yes_price": yes_price_cents,
+            "client_order_id": str(uuid.uuid4()),
+        }
+        if expiration_ts is not None:
+            order_params["expiration_ts"] = expiration_ts
+
         try:
-            response = exchange_client.create_order(
-                ticker=ticker,
-                action="sell",
-                side="yes",
-                type="limit",
-                count=count,
-                yes_price=yes_price_cents,
-                client_order_id=str(uuid.uuid4()),
-            )
+            response = exchange_client.create_order(**order_params)
             order = response.get("order", {})
             order_id = order.get("order_id", "")
 
