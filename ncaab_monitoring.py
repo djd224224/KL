@@ -305,11 +305,30 @@ def build_fills_dataframe(fills: List[Dict[str, Any]], df_orders: pd.DataFrame) 
         print("order_id not found in fills -- lineage will be incomplete")
         df_fills['order_id'] = None
 
+    # Normalize Kalshi API field names (API changes periodically)
+    # Old: yes_price, no_price, count
+    # New: yes_price_dollars, yes_price_fixed, no_price_dollars, no_price_fixed, count_fp
+    if 'yes_price' not in df_fills.columns:
+        if 'yes_price_dollars' in df_fills.columns:
+            df_fills['yes_price'] = pd.to_numeric(df_fills['yes_price_dollars'], errors='coerce')
+            print("  Mapped 'yes_price_dollars' → 'yes_price'")
+        elif 'yes_price_fixed' in df_fills.columns:
+            df_fills['yes_price'] = pd.to_numeric(df_fills['yes_price_fixed'], errors='coerce')
+            print("  Mapped 'yes_price_fixed' → 'yes_price'")
+
+    # fill_price = raw yes_price from API (for ALL fills, both YES and NO sides)
     df_fills['fill_price'] = df_fills.apply(
         lambda row: row.get('yes_price') or row.get('no_price') or row.get('price', 0),
         axis=1
     )
 
+    # Auto-detect decimal vs cents format and convert to cents
+    fill_prices = pd.to_numeric(df_fills['fill_price'], errors='coerce')
+    if fill_prices.max() <= 1.0:
+        df_fills['fill_price'] = fill_prices * 100
+        print(f"  fill_price converted from decimal to cents (max was {fill_prices.max():.4f})")
+
+    # Normalize ticker -> market_ticker
     if 'ticker' in df_fills.columns and 'market_ticker' not in df_fills.columns:
         df_fills = df_fills.rename(columns={'ticker': 'market_ticker'})
     elif 'ticker' in df_fills.columns and 'market_ticker' in df_fills.columns:
@@ -320,11 +339,16 @@ def build_fills_dataframe(fills: List[Dict[str, Any]], df_orders: pd.DataFrame) 
     if 'action' not in df_fills.columns:
         df_fills['action'] = 'buy'
 
-    if 'count' in df_fills.columns and 'filled_count' not in df_fills.columns:
+    # Normalize count -> filled_count
+    if 'count_fp' in df_fills.columns and 'filled_count' not in df_fills.columns:
+        df_fills['filled_count'] = pd.to_numeric(df_fills['count_fp'], errors='coerce').astype(int)
+        print("  Mapped 'count_fp' → 'filled_count'")
+    elif 'count' in df_fills.columns and 'filled_count' not in df_fills.columns:
         df_fills = df_fills.rename(columns={'count': 'filled_count'})
     elif 'filled_count' not in df_fills.columns:
         df_fills['filled_count'] = 0
 
+    # Join with deduplicated orders for strategy metadata
     if len(df_orders) > 0:
         df_orders['order_id'] = df_orders['order_id'].astype(str)
         df_fills['order_id'] = df_fills['order_id'].astype(str)
@@ -363,6 +387,7 @@ def build_settlements_dataframe(settlements, df_fills):
     df_settlements = pd.DataFrame(settlements)
     df_settlements['pulled_at'] = datetime.now(UTC).isoformat()
 
+    # ---- Deduplicate fills by fill_id ----
     print("Deduplicating fills...")
     fills_before = len(df_fills)
 
