@@ -3,14 +3,15 @@
 Kalshi Longshot Seller Bot
 ==========================
 Systematically sells overpriced Yes contracts on longshot outcomes
-for events with known, discrete start times.
+for curated series with discrete resolution events.
 
 Exploits two well-documented biases:
   1. Favorite-longshot bias (longshots win less often than price implies)
   2. Yes/affirmation bias (people prefer buying Yes over No)
 
-Safety mechanism: only trades events from a manually curated calendar
-of discrete events, and pulls all quotes before the event starts.
+Safety mechanism: pulls all quotes QUOTE_PULLBACK_HOURS before each
+market's close_time (fetched dynamically from Kalshi API, same approach
+as the NBA mention trading script).
 
 Environment variables (set as GitHub Actions secrets):
     KALSHI_API_KEY_ID           Your Kalshi API key ID
@@ -35,8 +36,6 @@ import requests
 # ════════════════════════════════════════════════════════════
 
 # Kalshi API base URL
-# Production: "https://api.elections.kalshi.com/trade-api/v2"
-# Demo/paper: "https://demo-api.kalshi.co/trade-api/v2"
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 # ── Strategy Parameters ──────────────────────────────────
@@ -59,84 +58,55 @@ FEE_RATE = 0.02
 # Minimum recent volume on a contract to consider it
 MIN_VOLUME = 10
 
-# Hours before event to pull all unfilled quotes
-QUOTE_PULLBACK_HOURS = 6
+# Hours before market close_time to pull all unfilled quotes
+# and stop placing new orders (matches NBA script's approach).
+# close_time is fetched dynamically from each market via the API.
+QUOTE_PULLBACK_HOURS = 5
 
 # ── Risk Management ──────────────────────────────────────
 
-# Max dollars at risk on any single contract
 MAX_RISK_PER_CONTRACT = 50
-
-# Max total dollars at risk across the entire portfolio
 MAX_TOTAL_RISK = 2000
-
-# Max contracts on a single Kalshi event
 MAX_CONTRACTS_PER_EVENT = 5
-
-# Max contracts sharing the same entity (e.g., same politician)
 MAX_CONTRACTS_PER_ENTITY = 3
-
-# Max contracts expiring on the same calendar day
 MAX_SAME_DAY_EXPIRY = 15
-
-# Halt bot if daily P&L drops below this
 DAILY_STOP_LOSS = -200
-
-# Cancel order if Yes price jumps by this much since entry
 PRICE_SPIKE_THRESHOLD = 0.10
-
-# Hard cap on contracts per individual market
 MAX_CONTRACTS_PER_MARKET = 10
 
 # ── Bot Behavior ─────────────────────────────────────────
 
-# Where to write the trade log
 TRADE_LOG_PATH = "trades.jsonl"
-
-# Log level
 LOG_LEVEL = "INFO"
 
-# ── Curated Discrete Events ─────────────────────────────
+# ── Curated Series ───────────────────────────────────────
 #
-# This is your manually maintained list. The bot ONLY trades
-# contracts associated with series/events listed here.
+# The bot ONLY trades contracts in these series.
+# No event_time needed — the bot pulls close_time dynamically
+# from each market via the Kalshi API and uses
+# (close_time - QUOTE_PULLBACK_HOURS) as the cutoff.
 #
 # Fields:
 #   series_ticker:  Kalshi series ticker (exact match)
-#   event_ticker:   Kalshi event ticker (optional — if omitted,
-#                   bot trades all active events in the series)
 #   category:       Your label for grouping/diversification
 #   entity:         Underlying entity for correlation tracking
-#   event_time:     When the real-world event starts (ISO 8601)
 #   description:    Human-readable note
-#
-# The bot will:
-#   1. Only consider contracts within these series/events
-#   2. Sell Yes on longshots priced in [MIN_YES_PRICE, MAX_YES_PRICE]
-#   3. Pull all quotes QUOTE_PULLBACK_HOURS before event_time
-#   4. Hold filled positions through event resolution
 
-CURATED_EVENTS = [
-
-    # ── Presidential Mentions ─────────────────────────
+CURATED_SERIES = [
     {
         "series_ticker": "KXPRESMENTION",
         "category": "political",
         "entity": "potus-mention",
-        "event_time": "REPLACE_WITH_EVENT_TIME",  # e.g. "2026-04-01T21:00:00-04:00"
-        "description": "Presidential mention — UPDATE event_time",
+        "description": "Presidential press conference mentions",
     },
-
-    # ── General Mentions ──────────────────────────────
     {
         "series_ticker": "KXMENTION",
         "category": "political",
         "entity": "mention",
-        "event_time": "REPLACE_WITH_EVENT_TIME",  # e.g. "2026-04-01T21:00:00-04:00"
-        "description": "Mention contract — UPDATE event_time",
+        "description": "General mention contracts",
     },
 
-    # Add your events here. The bot ignores everything not listed.
+    # Add your series here. The bot ignores everything not listed.
 ]
 
 # ════════════════════════════════════════════════════════════
@@ -172,7 +142,9 @@ class KalshiClient:
         if not self.api_key_id:
             logging.warning("KALSHI_API_KEY_ID not set. API calls will fail.")
         if not self._private_key_path:
-            logging.warning("KALSHI_PRIVATE_KEY_PATH not set. API calls will fail.")
+            logging.warning(
+                "KALSHI_PRIVATE_KEY_PATH not set. API calls will fail."
+            )
 
     def _ensure_auth(self):
         now = time.time()
@@ -329,28 +301,45 @@ class KalshiClient:
 
 
 # ────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────
+
+def parse_close_time(close_time_str: Optional[str]) -> Optional[datetime]:
+    """Parse Kalshi close_time string to timezone-aware datetime."""
+    if not close_time_str:
+        return None
+    try:
+        ts = close_time_str
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def is_within_pullback(close_time: Optional[datetime]) -> bool:
+    """Check if we're within QUOTE_PULLBACK_HOURS of close_time."""
+    if close_time is None:
+        return False
+    cutoff = close_time - timedelta(hours=QUOTE_PULLBACK_HOURS)
+    return datetime.now(timezone.utc) >= cutoff
+
+
+# ────────────────────────────────────────────────────────────
 # Data Models
 # ────────────────────────────────────────────────────────────
 
-class CuratedEvent:
-    """An event from the manually curated calendar."""
+class CuratedSeries:
+    """A series from the curated list."""
 
     def __init__(self, raw: dict):
         self.series_ticker: str = raw["series_ticker"]
-        self.event_ticker: Optional[str] = raw.get("event_ticker")
         self.category: str = raw.get("category", "unknown")
         self.entity: str = raw.get("entity", self.series_ticker)
-        self.event_time: datetime = datetime.fromisoformat(raw["event_time"])
         self.description: str = raw.get("description", "")
 
-        if self.event_time.tzinfo is None:
-            self.event_time = self.event_time.replace(tzinfo=timezone.utc)
-
     def __repr__(self):
-        return (
-            f"CuratedEvent({self.series_ticker}, "
-            f"{self.event_time.isoformat()})"
-        )
+        return f"CuratedSeries({self.series_ticker})"
 
 
 class Candidate:
@@ -359,7 +348,7 @@ class Candidate:
     def __init__(self):
         self.market_ticker: str = ""
         self.event_ticker: str = ""
-        self.curated_event: Optional[CuratedEvent] = None
+        self.curated_series: Optional[CuratedSeries] = None
         self.title: str = ""
         self.yes_price: float = 0.0
         self.yes_ask: float = 0.0
@@ -383,8 +372,8 @@ class LongshotBot:
         self._setup_logging()
 
         self.client = KalshiClient(api_base=API_BASE)
-        self.curated_events = [CuratedEvent(e) for e in CURATED_EVENTS]
-        self.log.info(f"Loaded {len(self.curated_events)} curated events.")
+        self.curated_series = [CuratedSeries(s) for s in CURATED_SERIES]
+        self.log.info(f"Loaded {len(self.curated_series)} curated series.")
 
         # In-memory state
         self.active_orders: dict[str, dict] = {}
@@ -414,55 +403,62 @@ class LongshotBot:
         except Exception as e:
             self.log.error(f"Failed to write trade log: {e}")
 
-    # ── Step 1: Find Markets for Curated Events ──────────
+    # ── Step 1: Find Markets for Curated Series ──────────
 
-    def _get_curated_markets(self) -> list[tuple[CuratedEvent, dict]]:
-        now = datetime.now(timezone.utc)
+    def _get_curated_markets(self) -> list[tuple[CuratedSeries, dict]]:
+        """
+        Fetch all active markets for curated series.
+        Skips individual markets whose close_time is within
+        the pullback window (like the NBA script's approach).
+        """
         results = []
 
-        for ce in self.curated_events:
-            pullback = ce.event_time - timedelta(hours=QUOTE_PULLBACK_HOURS)
-            if now >= pullback:
-                self.log.debug(
-                    f"Skipping {ce.series_ticker} — within pullback "
-                    f"(event {ce.event_time.isoformat()})"
-                )
-                continue
-
+        for cs in self.curated_series:
             try:
-                if ce.event_ticker:
-                    event = self.client.get_event(ce.event_ticker)
-                    events = [event] if event else []
-                else:
-                    events = self.client.get_events(
-                        series_ticker=ce.series_ticker
-                    )
+                events = self.client.get_events(
+                    series_ticker=cs.series_ticker
+                )
 
                 for event in events:
                     for mkt in event.get("markets", []):
-                        if mkt.get("status") == "active":
-                            results.append((ce, mkt))
+                        if mkt.get("status") != "active":
+                            continue
+
+                        # Check pullback per-market using close_time
+                        close_dt = parse_close_time(mkt.get("close_time"))
+                        if close_dt and is_within_pullback(close_dt):
+                            hours_left = (
+                                close_dt - datetime.now(timezone.utc)
+                            ).total_seconds() / 3600
+                            self.log.debug(
+                                f"Skipping {mkt.get('ticker')} — "
+                                f"{hours_left:.1f}h to close "
+                                f"(pullback={QUOTE_PULLBACK_HOURS}h)"
+                            )
+                            continue
+
+                        results.append((cs, mkt))
 
             except KalshiAPIError as e:
                 self.log.warning(
-                    f"API error fetching {ce.series_ticker}: {e}"
+                    f"API error fetching {cs.series_ticker}: {e}"
                 )
             except Exception as e:
-                self.log.error(f"Error fetching {ce.series_ticker}: {e}")
+                self.log.error(f"Error fetching {cs.series_ticker}: {e}")
 
         self.log.info(
-            f"Found {len(results)} active markets across curated events."
+            f"Found {len(results)} active markets across curated series."
         )
         return results
 
     # ── Step 2: Filter to Longshot Candidates ────────────
 
     def _filter_candidates(
-        self, markets: list[tuple[CuratedEvent, dict]]
+        self, markets: list[tuple[CuratedSeries, dict]]
     ) -> list[Candidate]:
         candidates = []
 
-        for ce, mkt in markets:
+        for cs, mkt in markets:
             ticker = mkt.get("ticker", "")
 
             yes_ask_raw = mkt.get("yes_ask_dollars") or mkt.get("yes_ask")
@@ -500,7 +496,7 @@ class LongshotBot:
             c = Candidate()
             c.market_ticker = ticker
             c.event_ticker = mkt.get("event_ticker", "")
-            c.curated_event = ce
+            c.curated_series = cs
             c.title = mkt.get("title", ticker)
             c.yes_price = yes_mid
             c.yes_ask = yes_ask
@@ -509,13 +505,7 @@ class LongshotBot:
             c.estimated_true_prob = true_prob
             c.expected_value = ev
             c.risk_per_contract = 1.0 - sell_price
-            c.close_time = (
-                datetime.fromisoformat(
-                    mkt["close_time"].replace("Z", "+00:00")
-                )
-                if mkt.get("close_time")
-                else None
-            )
+            c.close_time = parse_close_time(mkt.get("close_time"))
 
             price_range = MAX_YES_PRICE - MIN_YES_PRICE
             price_score = (
@@ -564,7 +554,7 @@ class LongshotBot:
             if event_counts.get(ek, 0) >= MAX_CONTRACTS_PER_EVENT:
                 continue
 
-            entity = c.curated_event.entity
+            entity = c.curated_series.entity
             if entity_counts.get(entity, 0) >= MAX_CONTRACTS_PER_ENTITY:
                 continue
 
@@ -611,6 +601,13 @@ class LongshotBot:
             count = c.contracts_to_trade
             yes_cents = int(round(c.yes_ask * 100))
 
+            # Derive pullback_time from market close_time
+            close_iso = c.close_time.isoformat() if c.close_time else None
+            pullback_iso = (
+                (c.close_time - timedelta(hours=QUOTE_PULLBACK_HOURS)).isoformat()
+                if c.close_time else None
+            )
+
             self.log.info(
                 f"SELL YES {count}x {c.market_ticker} "
                 f"@ ${c.yes_ask:.2f} ({yes_cents}¢) | "
@@ -622,14 +619,15 @@ class LongshotBot:
             trade_data = {
                 "market_ticker": c.market_ticker,
                 "event_ticker": c.event_ticker,
-                "entity": c.curated_event.entity,
-                "category": c.curated_event.category,
+                "entity": c.curated_series.entity,
+                "category": c.curated_series.category,
                 "yes_price_cents": yes_cents,
                 "count": count,
                 "ev": round(c.expected_value, 4),
                 "true_prob": round(c.estimated_true_prob, 4),
                 "score": round(c.composite_score, 3),
-                "event_time": c.curated_event.event_time.isoformat(),
+                "close_time": close_iso,
+                "pullback_time": pullback_iso,
                 "risk_dollars": round(count * c.risk_per_contract, 2),
             }
 
@@ -646,15 +644,12 @@ class LongshotBot:
                     "order_id": order_id,
                     "market_ticker": c.market_ticker,
                     "event_ticker": c.event_ticker,
-                    "entity": c.curated_event.entity,
+                    "entity": c.curated_series.entity,
                     "yes_price_cents": yes_cents,
                     "count": count,
                     "placed_at": datetime.now(timezone.utc).isoformat(),
-                    "event_time": c.curated_event.event_time.isoformat(),
-                    "pullback_time": (
-                        c.curated_event.event_time
-                        - timedelta(hours=QUOTE_PULLBACK_HOURS)
-                    ).isoformat(),
+                    "close_time": close_iso,
+                    "pullback_time": pullback_iso,
                 }
 
                 trade_data["order_id"] = order_id
@@ -686,7 +681,7 @@ class LongshotBot:
 
         self.log.warning(
             f"PULLBACK: Cancelling {len(to_cancel)} orders "
-            f"(events within {QUOTE_PULLBACK_HOURS}h)."
+            f"(markets within {QUOTE_PULLBACK_HOURS}h of close)."
         )
 
         for order_id in to_cancel:
@@ -822,10 +817,12 @@ class LongshotBot:
         self.log.info("=" * 60)
         self.log.info("Kalshi Longshot Seller Bot")
         self.log.info(f"  API: {API_BASE}")
-        self.log.info(f"  Events: {len(self.curated_events)}")
+        self.log.info(f"  Series: {len(self.curated_series)}")
+        for cs in self.curated_series:
+            self.log.info(f"    {cs.series_ticker} ({cs.description})")
         self.log.info(f"  Price: ${MIN_YES_PRICE}-${MAX_YES_PRICE}")
         self.log.info(f"  Bias discount: {BIAS_DISCOUNT}")
-        self.log.info(f"  Pullback: {QUOTE_PULLBACK_HOURS}h")
+        self.log.info(f"  Pullback: {QUOTE_PULLBACK_HOURS}h before close_time")
         self.log.info(f"  Max risk: ${MAX_TOTAL_RISK}")
         self.log.info("=" * 60)
 
