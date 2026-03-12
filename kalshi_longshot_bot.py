@@ -207,6 +207,22 @@ def scan_and_trade():
         active = [m for m in markets if m.get("status") in ("active", "open")]
         log.info(f"  Active: {len(active)}")
 
+        # Debug: show first 3 markets so we can see field format
+        for i, dbg_mkt in enumerate(active[:3]):
+            log.info(
+                f"  DEBUG mkt[{i}]: ticker={dbg_mkt.get('ticker')} "
+                f"yes_bid={dbg_mkt.get('yes_bid')} yes_ask={dbg_mkt.get('yes_ask')} "
+                f"yes_bid_dollars={dbg_mkt.get('yes_bid_dollars')} "
+                f"yes_ask_dollars={dbg_mkt.get('yes_ask_dollars')} "
+                f"close_time={dbg_mkt.get('close_time')}"
+            )
+
+        skipped_pullback = 0
+        skipped_no_price = 0
+        skipped_price_range = 0
+        skipped_ev = 0
+        passed = 0
+
         for mkt in active:
             ticker = mkt.get("ticker", "")
 
@@ -219,38 +235,37 @@ def scan_and_trade():
                 log.debug(
                     f"  Skipping {ticker} — {hours_left:.1f}h to close"
                 )
+                skipped_pullback += 1
                 continue
 
-            # ── Get orderbook for bid/ask ──
+            # ── Get bid/ask from market listing ──
+            # (always populated, unlike orderbook which can be empty)
+            yes_ask_raw = mkt.get("yes_ask")
+            yes_bid_raw = mkt.get("yes_bid")
+
+            if yes_ask_raw is None or yes_bid_raw is None:
+                skipped_no_price += 1
+                continue
+
             try:
-                ob_resp = exchange_client.get_orderbook(
-                    ticker=ticker, depth=5
-                )
-                ob = ob_resp.get("orderbook", ob_resp)
-                yes_data = ob.get("yes", [])
-                no_data = ob.get("no", [])
-
-                yes_bid = max(l[0] for l in yes_data) if yes_data else None
-                yes_ask = None
-                if no_data:
-                    best_no_bid = max(l[0] for l in no_data)
-                    yes_ask = 100 - best_no_bid
-                elif yes_bid is not None:
-                    yes_ask = yes_bid + 2  # rough fallback
-            except Exception:
-                yes_bid = None
-                yes_ask = None
-
-            if yes_bid is None or yes_ask is None:
+                yes_ask = int(yes_ask_raw)
+                yes_bid = int(yes_bid_raw)
+            except (ValueError, TypeError):
+                skipped_no_price += 1
                 continue
 
-            # Normalize to dollars
+            if yes_ask <= 0 or yes_bid < 0:
+                skipped_no_price += 1
+                continue
+
+            # API returns cents (1-99)
             yes_bid_d = yes_bid / 100.0
             yes_ask_d = yes_ask / 100.0
             yes_mid = (yes_bid_d + yes_ask_d) / 2.0
 
             # ── Price filter ──
             if not (MIN_YES_PRICE <= yes_mid <= MAX_YES_PRICE):
+                skipped_price_range += 1
                 continue
 
             # ── EV calculation ──
@@ -261,7 +276,10 @@ def scan_and_trade():
             ev = (1 - true_prob) * profit_if_no - true_prob * loss_if_yes
 
             if ev < MIN_EV_DOLLARS:
+                skipped_ev += 1
                 continue
+
+            passed += 1
 
             risk_per = 1.0 - sell_price
 
@@ -294,6 +312,12 @@ def scan_and_trade():
                 "volume": mkt.get("volume", 0) or 0,
                 "open_interest": mkt.get("open_interest", 0) or 0,
             })
+
+        log.info(
+            f"  Filter summary: pullback={skipped_pullback} "
+            f"no_price={skipped_no_price} price_range={skipped_price_range} "
+            f"ev={skipped_ev} passed={passed}"
+        )
 
     # Sort by score
     all_candidates.sort(key=lambda x: x["score"], reverse=True)
