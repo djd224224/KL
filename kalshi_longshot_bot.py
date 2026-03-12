@@ -46,6 +46,13 @@ MIN_EV_DOLLARS = 0.01
 FEE_RATE = 0.02
 MIN_VOLUME = 10
 
+# Order ladder: place sell orders at 5 price levels stepping up
+# from the current ask. Higher levels = more premium, less likely to fill.
+# Level 0 = yes_ask, Level 1 = yes_ask+1¢, Level 2 = yes_ask+2¢, etc.
+NUM_LEVELS = 5
+LEVEL_INCREMENT_CENTS = 1       # step size between levels
+CONTRACTS_PER_LEVEL = 10        # contracts at each level
+
 # Hours before market close_time to stop placing / pull quotes
 # (matches NBA script's EXPIRATION_HOURS_BEFORE_CLOSE = 5)
 QUOTE_PULLBACK_HOURS = 5
@@ -54,12 +61,12 @@ QUOTE_PULLBACK_HOURS = 5
 
 MAX_RISK_PER_CONTRACT = 50
 MAX_TOTAL_RISK = 2000
-MAX_CONTRACTS_PER_EVENT = 5
-MAX_CONTRACTS_PER_ENTITY = 3
+MAX_CONTRACTS_PER_EVENT = 25     # multiple markets × 5 levels each
+MAX_CONTRACTS_PER_ENTITY = 15    # multiple markets × 5 levels each
 MAX_SAME_DAY_EXPIRY = 15
 DAILY_STOP_LOSS = -200
 PRICE_SPIKE_THRESHOLD = 0.10
-MAX_CONTRACTS_PER_MARKET = 10
+MAX_CONTRACTS_PER_MARKET = 50    # 5 levels × 10 contracts
 
 # ── Bot Behavior ─────────────────────────────────────────
 
@@ -353,8 +360,11 @@ def scan_and_trade():
             if day_counts.get(day_key, 0) >= MAX_SAME_DAY_EXPIRY:
                 continue
 
+        # Max contracts across all levels for this market
+        max_total_contracts = NUM_LEVELS * CONTRACTS_PER_LEVEL
         contracts = min(
             int(MAX_RISK_PER_CONTRACT / c["risk_per"]),
+            max_total_contracts,
             MAX_CONTRACTS_PER_MARKET,
         )
         if contracts < 1:
@@ -386,76 +396,101 @@ def scan_and_trade():
         return
 
     # ── Step 3: Place orders via ExchangeClient ──────────
+    # For each candidate, place sell-Yes orders at NUM_LEVELS
+    # price levels stepping up from the current ask.
 
     success_count = 0
     fail_count = 0
 
     for c in selected:
         ticker = c["ticker"]
-        yes_price_cents = c["yes_ask"]
-        count = c["contracts"]
+        base_price = c["yes_ask"]  # cents
 
-        # Derive expiration_ts from close_time (same as NBA script)
-        # Orders auto-cancel QUOTE_PULLBACK_HOURS before market closes
+        # Derive expiration_ts from close_time
+        # Orders auto-cancel 21 hours before market closes
+        EXPIRATION_HOURS_BEFORE_CLOSE = 21
         expiration_ts = None
         if c["close_time"]:
             close_unix = int(c["close_time"].timestamp())
-            expiration_ts = close_unix - (QUOTE_PULLBACK_HOURS * 3600)
-            # Don't set expiration in the past
+            expiration_ts = close_unix - (EXPIRATION_HOURS_BEFORE_CLOSE * 3600)
             if expiration_ts <= int(time.time()):
                 expiration_ts = None
 
-        log.info(
-            f"SELL YES {count}x {ticker} "
-            f"@ {yes_price_cents}¢ | "
-            f"EV={c['ev']:.3f} | "
-            f"score={c['score']:.2f} | "
-            f"\"{c['title']}\""
-        )
+        max_yes_cents = int(MAX_YES_PRICE * 100)
+        levels_placed = []
 
-        trade_data = {
-            "ticker": ticker,
-            "event_ticker": c["event_ticker"],
-            "entity": c["entity"],
-            "category": c["category"],
-            "yes_price_cents": yes_price_cents,
-            "count": count,
-            "ev": round(c["ev"], 4),
-            "true_prob": round(c["true_prob"], 4),
-            "score": round(c["score"], 3),
-            "close_time": c["close_time_str"],
-            "expiration_ts": expiration_ts,
-            "risk_dollars": round(count * c["risk_per"], 2),
-        }
+        for level in range(NUM_LEVELS):
+            yes_price_cents = base_price + (level * LEVEL_INCREMENT_CENTS)
 
-        # Build order params
-        order_params = {
-            "ticker": ticker,
-            "action": "sell",
-            "side": "yes",
-            "type": "limit",
-            "count": count,
-            "yes_price": yes_price_cents,
-            "client_order_id": str(uuid.uuid4()),
-        }
-        if expiration_ts is not None:
-            order_params["expiration_ts"] = expiration_ts
+            # Don't exceed max price
+            if yes_price_cents > max_yes_cents:
+                break
 
-        try:
-            response = exchange_client.create_order(**order_params)
-            order = response.get("order", {})
-            order_id = order.get("order_id", "")
+            # Recalculate EV at this sell price
+            sell_price_d = yes_price_cents / 100.0
+            true_prob = c["true_prob"]
+            profit_if_no = sell_price_d * (1 - FEE_RATE)
+            loss_if_yes = (1.0 - sell_price_d) + (sell_price_d * FEE_RATE)
+            level_ev = (1 - true_prob) * profit_if_no - true_prob * loss_if_yes
 
-            trade_data["order_id"] = order_id
-            log_trade("order_placed", trade_data)
-            log.info(f"  ✓ Order placed: {order_id}")
-            success_count += 1
+            if level_ev < MIN_EV_DOLLARS:
+                break
 
-        except Exception as e:
-            log.error(f"  ✗ Failed: {e}")
-            trade_data["error"] = str(e)
-            log_trade("order_failed", trade_data)
-            fail_count += 1
+            trade_data = {
+                "ticker": ticker,
+                "event_ticker": c["event_ticker"],
+                "entity": c["entity"],
+                "category": c["category"],
+                "yes_price_cents": yes_price_cents,
+                "count": CONTRACTS_PER_LEVEL,
+                "level": level,
+                "ev": round(level_ev, 4),
+                "true_prob": round(true_prob, 4),
+                "score": round(c["score"], 3),
+                "close_time": c["close_time_str"],
+                "expiration_ts": expiration_ts,
+                "risk_dollars": round(CONTRACTS_PER_LEVEL * (1.0 - sell_price_d), 2),
+            }
+
+            order_params = {
+                "ticker": ticker,
+                "action": "sell",
+                "side": "yes",
+                "type": "limit",
+                "count": CONTRACTS_PER_LEVEL,
+                "yes_price": yes_price_cents,
+                "client_order_id": str(uuid.uuid4()),
+            }
+            if expiration_ts is not None:
+                order_params["expiration_ts"] = expiration_ts
+
+            try:
+                response = exchange_client.create_order(**order_params)
+                order = response.get("order", {})
+                order_id = order.get("order_id", "")
+
+                trade_data["order_id"] = order_id
+                log_trade("order_placed", trade_data)
+                levels_placed.append(f"{yes_price_cents}¢")
+                success_count += 1
+
+            except Exception as e:
+                log.error(f"  ✗ Level {level} @ {yes_price_cents}¢: {e}")
+                trade_data["error"] = str(e)
+                log_trade("order_failed", trade_data)
+                fail_count += 1
+
+            time.sleep(SLEEP_BETWEEN_ORDERS)
+
+        if levels_placed:
+            log.info(
+                f"  ✓ {ticker}: {len(levels_placed)} levels @ "
+                f"{', '.join(levels_placed)} "
+                f"({CONTRACTS_PER_LEVEL}c each) | "
+                f"\"{c['title']}\""
+            )
+        else:
+            log.info(f"  ✗ {ticker}: no levels placed")
 
         time.sleep(SLEEP_BETWEEN_ORDERS)
 
