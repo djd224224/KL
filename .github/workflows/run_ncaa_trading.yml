@@ -1,6 +1,5 @@
 name: NCAABMENTION v4.2-NCAAB Trading Bot
 # Runs every 2 hours (offset by 5 min to avoid overlap with NBA bot)
-# Times in UTC: 0:05, 2:05, 4:05, 6:05, 8:05, 10:05, 12:05, 14:05, 16:05, 18:05, 20:05, 22:05
 on:
   schedule:
     - cron: '5 */2 * * *'
@@ -38,7 +37,7 @@ jobs:
         GCP_SA_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
       run: |
         printenv GCP_SA_KEY > gcp_sa_key.json
-    - name: Run trading script
+    - name: Run trading notebook
       env:
         KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
         KALSHI_PRIVATE_KEY_PATH: kalshi_private_key.pem
