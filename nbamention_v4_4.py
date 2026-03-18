@@ -870,22 +870,40 @@ def fetch_fills_from_api(
     print(f"  ✓ Loaded {len(df)} fills across {df['ticker'].nunique()} markets from API")
     print(f"  API fill columns: {list(df.columns)}")
 
-    if 'count' in df.columns and 'contracts' not in df.columns:
-        df = df.rename(columns={'count': 'contracts'})
-        print(f"  Mapped 'count' → 'contracts'")
+    # --- Normalize column names (API fields change silently) ---
+    # contracts: 'count' (old) or 'count_fp' (new)
+    if 'contracts' not in df.columns:
+        if 'count' in df.columns:
+            df = df.rename(columns={'count': 'contracts'})
+            print(f"  Mapped 'count' → 'contracts'")
+        elif 'count_fp' in df.columns:
+            df['contracts'] = pd.to_numeric(df['count_fp'], errors='coerce')
+            print(f"  Mapped 'count_fp' → 'contracts'")
 
-    print(f"  Columns: {list(df.columns)}")
+    # yes_price: 'yes_price' (old) or 'yes_price_dollars'/'yes_price_fixed' (new)
+    if 'yes_price' not in df.columns:
+        if 'yes_price_dollars' in df.columns:
+            df['yes_price'] = pd.to_numeric(df['yes_price_dollars'], errors='coerce')
+            print(f"  Mapped 'yes_price_dollars' → 'yes_price'")
+        elif 'yes_price_fixed' in df.columns:
+            df['yes_price'] = pd.to_numeric(df['yes_price_fixed'], errors='coerce')
+            print(f"  Mapped 'yes_price_fixed' → 'yes_price'")
+
+    print(f"  Columns after normalization: {list(df.columns)}")
     sample = df.head(3)
     for _, row in sample.iterrows():
         print(f"    Sample fill: ticker={row.get('ticker')}, side={row.get('side')}, "
-              f"yes_price={row.get('yes_price')}, no_price={row.get('no_price', 'N/A')}, "
-              f"count/contracts={row.get('contracts', row.get('count', 'N/A'))}")
+              f"yes_price={row.get('yes_price')}, contracts={row.get('contracts')}")
 
+    # Build unified 'price' column = the price paid for THAT SIDE in cents
+    # YES fill: price = yes_price; NO fill: price = 100 - yes_price
     if 'yes_price' in df.columns:
         yes_prices = pd.to_numeric(df['yes_price'], errors='coerce')
         max_val = yes_prices.max()
 
-        if max_val <= 1.0:
+        if pd.isna(max_val) or max_val == 0:
+            print(f"  ⚠️ yes_price is all NaN/zero — cannot build price column")
+        elif max_val <= 1.0:
             df['price'] = df.apply(
                 lambda row: float(row['yes_price']) if row.get('side') == 'yes'
                             else (1.0 - float(row['yes_price'])),
@@ -900,11 +918,12 @@ def fetch_fills_from_api(
             )
             print(f"  Built 'price' from yes_price (cents, max={max_val:.1f}): YES=yes_price, NO=100-yes_price")
 
-        for side_check in ['yes', 'no']:
-            side_rows = df[df['side'] == side_check].head(2)
-            for _, row in side_rows.iterrows():
-                print(f"    Verify: {row.get('ticker')} side={side_check} "
-                      f"yes_price={row.get('yes_price')} → price={row['price']:.2f}")
+        if 'price' in df.columns:
+            for side_check in ['yes', 'no']:
+                side_rows = df[df['side'] == side_check].head(2)
+                for _, row in side_rows.iterrows():
+                    print(f"    Verify: {row.get('ticker')} side={side_check} "
+                          f"yes_price={row.get('yes_price')} → price={row['price']:.2f}")
     elif 'price' in df.columns:
         print(f"  Using existing 'price' column")
     else:
