@@ -572,7 +572,7 @@ SIDE_MULTIPLIERS = {
     "AIRB": {"yes": 1.5, "no": 0.0},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
     "MVP":  {"yes": 0.0, "no": 0.0},    # v4.4 was yes:0.5 -- net -$304, NO at -100% ROI
     "TRIP": {"yes": 0.0, "no": 0.0},    # keep killed
-    "TECH": {"yes": 1.3, "no": 0.0},    # keep -- YES is +$215 (17.9% ROI)
+    "TECH": {"yes": 1.5, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "INJU": {"yes": 0.5, "no": 0.0},    # keep -- marginal +$3
@@ -590,6 +590,13 @@ SIDE_MULTIPLIERS = {
     "XFIN": {"yes": 0.0, "no": 0.0},    # -$41 P&L, -100% ROI
     "CHAS": {"yes": 0.0, "no": 0.0},    # -$25 P&L, -16% ROI
     "KIA":  {"yes": 0.0, "no": 0.0},    # -$22 P&L, -13% ROI
+    # === [v4.6] New codes from live observation ===
+    "SPEC": {"yes": 0.5, "no": 0.5},    # NEW code — no historical data, half exposure
+    "CRYP": {"yes": 0.5, "no": 0.5},    # +$80, limited data (5 settlements)
+    "PAYC": {"yes": 0.5, "no": 0.5},    # +$125, limited data (5 settlements)
+    "INTU": {"yes": 0.0, "no": 0.0},    # -$12, block
+    "MSG":  {"yes": 0.0, "no": 0.0},    # -$8, block
+    "NQE":  {"yes": 0.0, "no": 0.0},    # 0% YES rate, no edge
 }
 
 # =====================================================================
@@ -605,9 +612,9 @@ TEAM_MULTIPLIERS = {
     "LAC": 1.1,   # +$239 P&L, 4.7% ROI
     # Penalize consistently unprofitable teams
     "WAS": 0.3,   # -$715 P&L, -95.2% ROI -- catastrophic
-    "HOU": 0.5,   # -$655 P&L, -12.2% ROI
+    "HOU": 0.7,   # [v4.6] relaxed 0.5→0.7 — profitable (+$113) on surviving markets
     "MIA": 0.5,   # -$241 P&L, -27.4% ROI
-    "ORL": 0.6,   # -$465 P&L, -12.5% ROI
+    "ORL": 0.8,   # [v4.6] relaxed 0.6→0.8 — profitable (+$127) on surviving markets
     "CLE": 0.7,   # -$480 P&L, -9.3% ROI
     "SAS": 0.7,   # -$409 P&L, -6.5% ROI
 }
@@ -1698,9 +1705,13 @@ def build_order_objects_for_market(
         return []
 
     # Get side multipliers (base values)
-    side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, {"yes": 1.0, "no": 1.0})
-    yes_side_mult_base = side_config.get("yes", 1.0)
-    no_side_mult_base = side_config.get("no", 1.0)
+    # [v4.6] Unknown codes default to 0.5/0.5 (was 1.0/1.0) to limit unreviewed exposure
+    _default_side = {"yes": 0.5, "no": 0.5}
+    side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, _default_side)
+    if ticker_part_3_market_code not in SIDE_MULTIPLIERS:
+        print(f"    ⚠️ UNKNOWN CODE {ticker_part_3_market_code} — using default 0.5/0.5")
+    yes_side_mult_base = side_config.get("yes", 0.5)
+    no_side_mult_base = side_config.get("no", 0.5)
 
     if yes_side_mult_base == 0.0 and no_side_mult_base == 0.0:
         print(f"    ⛔ BOTH SIDES 0x for {ticker_part_3_market_code} — skipping")
@@ -1859,6 +1870,11 @@ def build_order_objects_for_market(
 
     except Exception as e:
         print(f"    Orderbook: Yes=N/A, No=N/A")
+
+    # [v4.6] Guard: empty orderbook + zero OI + zero volume → market likely not tradeable
+    if orderbook_yes_bid is None and orderbook_no_bid is None and open_interest == 0 and volume == 0:
+        print(f"    ⚠️ Empty orderbook + zero OI + zero volume — market may not be open for trading, skipping")
+        return []
 
     # Mid-price anchor
     market_mid_yes = None
@@ -2327,13 +2343,22 @@ def submit_orders_sequential(orders: List[Dict[str, Any]]) -> List[Dict[str, Any
                 **metadata,
             })
         except Exception as e:
+            # [v4.6] Capture full error body for API debugging
+            error_detail = str(e)
+            if hasattr(e, 'response'):
+                try:
+                    error_detail = f"{str(e)} | body: {e.response.text[:200]}"
+                except:
+                    pass
+            elif hasattr(e, 'args') and len(e.args) > 1:
+                error_detail = f"{str(e)} | args: {e.args}"
             results.append({
                 "ok": False,
                 "ticker": order_params["ticker"],
                 "side": order_params["side"],
                 "price": order_params.get("yes_price") or order_params.get("no_price"),
                 "contracts": order_params["count"],
-                "error": str(e),
+                "error": error_detail,
                 "order_id": None,
                 "client_order_id": order_params.get("client_order_id"),
                 "post_only": True,
