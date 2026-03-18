@@ -633,11 +633,18 @@ CORRELATION_PENALTY = 0.75
 # =====================================================================
 MIN_PRICE_YES = 15
 MIN_PRICE_NO = 5
-MAX_PRICE = 75                  # NEVER relaxed, even in hedge mode
+MAX_PRICE = 75                  # default cap — NEVER relaxed, even in hedge mode
 YES_MIN_PRICE = 48              # [v4.6-3] raised from 45 — YES fills 45-47c are marginal
-NO_MAX_YES_PRICE = 80
-NO_MIN_YES_PRICE = 20
+NO_MAX_YES_PRICE = 88           # [v4.6] was 80 — CROW/ROOK NO blocked at 60% of games because implied YES > 80c
+NO_MIN_YES_PRICE = 15           # [v4.6] was 20 — RETI fair YES is ~20c, 20c floor blocks its tightest offsets
 YES_PROBABILITY_FLOOR = 40
+
+# [v4.6] Per-market MAX_PRICE overrides for high-NO-probability markets
+# RETI: 20% YES rate → fair NO ≈ 80c. MAX_PRICE=75 blocks 65% of games.
+# RETI is +$619 at 40% ROI, 46% Kelly — the most underweighted market.
+MAX_PRICE_OVERRIDES = {
+    "RETI": 90,  # fair NO ~80c, fills profitably at 48-90c (all buckets positive)
+}
 
 NO_SWEET_SPOT_MIN = 35
 NO_SWEET_SPOT_MAX = 65
@@ -2137,7 +2144,9 @@ def build_order_objects_for_market(
     # NO limit orders
     # ==========================================================
     no_prices_to_place = []
-    max_no_price_allowed = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else MAX_PRICE
+    # [v4.6] Per-market MAX_PRICE override (for high-NO-probability markets like RETI)
+    market_max_price = MAX_PRICE_OVERRIDES.get(ticker_part_3_market_code, MAX_PRICE)
+    max_no_price_allowed = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else market_max_price
     no_contracts_placed = 0
 
     if no_total_mult > 0:
@@ -2150,7 +2159,7 @@ def build_order_objects_for_market(
             if bid_price > max_no_price_allowed:
                 continue
 
-            if bid_price < active_min_price_no or bid_price > MAX_PRICE:
+            if bid_price < active_min_price_no or bid_price > market_max_price:
                 continue
 
             implied_yes_price = 100 - bid_price
