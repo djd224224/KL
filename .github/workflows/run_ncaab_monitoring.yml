@@ -1,10 +1,9 @@
 name: NCAABMENTION Daily Monitoring
-# Runs once daily at 9:15 PM UTC (3:15 PM CST)
+# Runs once daily at 10:15 AM UTC (5:15 AM ET)
 # Offset by 15 min from NBA monitoring to avoid overlap
 on:
   schedule:
-    - cron: '15 21 * * *'
-    
+    - cron: '15 10 * * *'
   workflow_dispatch:  # Manual trigger
 jobs:
   run-monitoring:
@@ -37,7 +36,7 @@ jobs:
         GCP_SA_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
       run: |
         printenv GCP_SA_KEY > gcp_sa_key.json
-    - name: Run monitoring script
+    - name: Run monitoring notebook
       env:
         KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
         KALSHI_PRIVATE_KEY_PATH: kalshi_private_key.pem
