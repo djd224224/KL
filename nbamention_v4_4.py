@@ -445,7 +445,7 @@ if len(df_summary_rolling_by_team) > 0:
 #   [v4.5-2] TEAM_MULTIPLIERS: added penalty teams
 #   [v4.5-3] TOP_NO_MARKETS: removed blocked markets
 #   [v4.5-4] ONE-OFF MARKETS: blocked 9 consistently unprofitable codes
-#   [v4.6-1] NO_MAX_PRICE = 50: NO fills >50c lose -$18,540
+#   [v4.6-1] REMOVED: NO_MAX_PRICE was based on incorrect trade calibration
 #   [v4.6-2] PAIRING OVERSHOOT CAP: hedge can only reduce net, never reverse
 #   [v4.6-3] YES_MIN_PRICE: 45 -> 48
 #   [v4.6-4] HEDGE_YES_MIN_PRICE: 25 -> 40
@@ -633,8 +633,7 @@ CORRELATION_PENALTY = 0.75
 # =====================================================================
 MIN_PRICE_YES = 15
 MIN_PRICE_NO = 5
-MAX_PRICE = 75                  # YES max price — NEVER relaxed, even in hedge mode
-NO_MAX_PRICE = 50               # [v4.6-1] NO fills >50c lose -$18,540 (-48% ROI). <=50c earns +$22,087 (88% ROI)
+MAX_PRICE = 75                  # NEVER relaxed, even in hedge mode
 YES_MIN_PRICE = 48              # [v4.6-3] raised from 45 — YES fills 45-47c are marginal
 NO_MAX_YES_PRICE = 80
 NO_MIN_YES_PRICE = 20
@@ -771,8 +770,7 @@ print(f"  Hedge price floors: YES>={HEDGE_MIN_PRICE_YES}c, NO>={HEDGE_MIN_PRICE_
 print(f"  [v4.6-2] Pairing overshoot cap: ENABLED (hedge can only reduce net, never reverse)")
 print(f"Price/edge filters (normal mode):")
 print(f"  YES range: {MIN_PRICE_YES}–{MAX_PRICE}c (floor: {YES_MIN_PRICE}c)")
-print(f"  NO range: {MIN_PRICE_NO}–{NO_MAX_PRICE}c (implied YES: {NO_MIN_YES_PRICE}–{NO_MAX_YES_PRICE}c)")
-print(f"  [v4.6-1] NO max price: {NO_MAX_PRICE}c (NO fills >50c are -48% ROI)")
+print(f"  NO range: {MIN_PRICE_NO}–{MAX_PRICE}c (implied YES: {NO_MIN_YES_PRICE}–{NO_MAX_YES_PRICE}c)")
 print(f"  YES probability floor: {YES_PROBABILITY_FLOOR}%")
 print(f"  [v4.1-1] Spread gate: DISABLED")
 print(f"  [v4-5] Min EV per order: {MIN_EV_PER_ORDER:.0%}")
@@ -2113,10 +2111,10 @@ def build_order_objects_for_market(
         print(f"    → YES: [no orders passed EV/price filters]")
 
     # ==========================================================
-    # NO limit orders — [v4.6-1] uses NO_MAX_PRICE
+    # NO limit orders
     # ==========================================================
     no_prices_to_place = []
-    max_no_price_allowed = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else NO_MAX_PRICE
+    max_no_price_allowed = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else MAX_PRICE
     no_contracts_placed = 0
 
     if no_total_mult > 0:
@@ -2128,8 +2126,8 @@ def build_order_objects_for_market(
 
             if bid_price > max_no_price_allowed:
                 continue
-            # [v4.6-1] NO_MAX_PRICE instead of MAX_PRICE
-            if bid_price < active_min_price_no or bid_price > NO_MAX_PRICE:
+
+            if bid_price < active_min_price_no or bid_price > MAX_PRICE:
                 continue
 
             implied_yes_price = 100 - bid_price
@@ -2448,8 +2446,7 @@ def place_orders_from_df(df_results: pd.DataFrame):
     print(f"  Safe mode: {'YES' if safe_mode else 'NO'}")
     print(f"  Ledger: {len(ledger)} markets with fill data")
     print(f"  Position caps: {MAX_NET_PER_MARKET}/market, {MAX_NET_PER_EVENT}/event")
-    print(f"  [v4.6-1] NO max price: {NO_MAX_PRICE}c")
-    print(f"  [v4.6-2] Pairing overshoot cap: ENABLED")
+        print(f"  [v4.6-2] Pairing overshoot cap: ENABLED")
     print(f"  Min EV: {MIN_EV_PER_ORDER:.0%} per order (hedge-adjusted)")
     print(f"  Price anchor: mid-price")
 
