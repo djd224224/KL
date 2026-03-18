@@ -342,7 +342,7 @@ PRICING_STRATEGY = 'hybrid'
 # =========================
 # [NCAAB-1] CONFIG
 # =========================
-SERIES_TICKER = "KXNCAABMENTION"  # [NCAAB-1]
+SERIES_TICKER = "KXNCAABMENTION"  # [NCAAB-1] Changed from KXNBAMENTION
 API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
 PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -437,7 +437,7 @@ TEAM_MARKET_OVERRIDES = {
     # DRAF — boost reliable No teams
     ("VAN", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.8},
     ("ILL", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.8},
-    ("NEB", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.8},
+    # NEB removed — never matches as parsed team code (IOWANEB→IOW+ANEB)
     ("PUR", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.5},
     ("ALA", "DRAF"): {"yes_mult": 0.0, "no_mult": 0.0},
     ("DUK", "DRAF"): {"yes_mult": 0.0, "no_mult": 0.0},
@@ -474,7 +474,7 @@ YES_PROBABILITY_FLOOR = 65        # [NCAAB-5] Was 40 — blocks most Yes bets (a
 # [NCAAB-4] NO SWEET SPOT — shifted to proven profitable range
 # =========================
 NO_SWEET_SPOT_MIN = 65            # [NCAAB-4b] Was 50 — 50-65¢ has -5pp edge in Mar. Only 65-80¢ works
-NO_SWEET_SPOT_MAX = 80            # [NCAAB-4b] Keep — 65-80¢ has +11pp edge and 81% WR
+NO_SWEET_SPOT_MAX = 75            # [NCAAB-4b] Aligned with MAX_PRICE — 65-80¢ has +11pp edge and 81% WR
 NO_SWEET_SPOT_MULTIPLIER = 1.5    # [NCAAB-4b] Was 1.8 — moderated, still capped by MAX_COMBINED
 MAX_COMBINED_SWEET_BOOST = 2.0    # [NCAAB-FIX] Cap side_mult × sweet_spot to prevent double-boost
 
@@ -1348,10 +1348,6 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             hedge_ev, is_pairing = calculate_hedge_ev("yes", bid, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
             if effective_ev < MIN_EV_PER_ORDER: continue
-            # [P0] Kelly gate: reject if implied Kelly < 2%
-            if bid < 100:
-                implied_kelly = ((1 - p_hat) - (bid / 100)) / (1 - bid / 100)
-                if implied_kelly < 0.02: continue
             base_c = BASE_YES_CONTRACTS[i]
             scaled = int(base_c * yes_total_mult)
             # [P0] Game-level dampener
