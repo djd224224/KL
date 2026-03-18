@@ -877,8 +877,8 @@ def fetch_fills_from_api(
             df = df.rename(columns={'count': 'contracts'})
             print(f"  Mapped 'count' → 'contracts'")
         elif 'count_fp' in df.columns:
-            df['contracts'] = pd.to_numeric(df['count_fp'], errors='coerce')
-            print(f"  Mapped 'count_fp' → 'contracts'")
+            df['contracts'] = pd.to_numeric(df['count_fp'], errors='coerce').fillna(0).astype(int)
+            print(f"  Mapped 'count_fp' → 'contracts' (cast to int)")
 
     # yes_price: 'yes_price' (old) or 'yes_price_dollars'/'yes_price_fixed' (new)
     if 'yes_price' not in df.columns:
@@ -1782,10 +1782,14 @@ def build_order_objects_for_market(
     base_mult = time_mult * volume_mult
 
     # Team multiplier
-    team_mult = max(
-        TEAM_MULTIPLIERS.get(team_1, 1.0),
-        TEAM_MULTIPLIERS.get(team_2, 1.0),
-    )
+    # Use min() when any team has a penalty (<1.0) so the penalty always applies
+    # Use max() when both are boosts so the best boost applies
+    team_1_mult = TEAM_MULTIPLIERS.get(team_1, 1.0)
+    team_2_mult = TEAM_MULTIPLIERS.get(team_2, 1.0)
+    if team_1_mult < 1.0 or team_2_mult < 1.0:
+        team_mult = min(team_1_mult, team_2_mult)
+    else:
+        team_mult = max(team_1_mult, team_2_mult)
     if team_mult != 1.0:
         base_mult *= team_mult
         print(f"    [v4.5] Team mult: {team_mult:.1f}x (teams: {team_1}, {team_2})")
