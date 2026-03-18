@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
 # KXNCAABMENTION Order Script v4.2b-NCAAB — March Madness Adapted
-# With P0 (game dampener + Kelly gate), P1 (ELBO/NIL), P2 (team risk)
 # =============================================================================
 # STEP 1: FETCH DATA
 # FIXED: Team-level historical rates now correct (no longer flipping based on team position)
@@ -669,8 +668,17 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
     df = pd.DataFrame(all_fills)
     print(f"  ✓ Loaded {len(df)} fills across {df['ticker'].nunique()} markets from API")
 
-    if 'count' in df.columns and 'contracts' not in df.columns:
-        df = df.rename(columns={'count': 'contracts'})
+    # Normalize count field — API uses count, count_fp, or contracts
+    if 'contracts' not in df.columns:
+        if 'count_fp' in df.columns:
+            df['contracts'] = pd.to_numeric(df['count_fp'], errors='coerce').astype(int)
+            print(f"  Mapped 'count_fp' -> 'contracts'")
+        elif 'count' in df.columns:
+            df = df.rename(columns={'count': 'contracts'})
+            print(f"  Mapped 'count' -> 'contracts'")
+        else:
+            print(f"  ⚠️ No count column found! Columns: {list(df.columns)}")
+            df['contracts'] = 0
 
     # Normalize API field names — Kalshi changes these periodically
     # Old: yes_price, no_price, count
@@ -739,6 +747,27 @@ def build_position_ledger(fills_df, price_col="price", contracts_col="contracts"
         return {}
     ledger = {}
     df = fills_df.copy()
+
+    # Normalize column names — API fields change periodically
+    if price_col not in df.columns:
+        for fallback in ['yes_price', 'yes_price_dollars', 'yes_price_fixed']:
+            if fallback in df.columns:
+                df[price_col] = pd.to_numeric(df[fallback], errors='coerce')
+                print(f"  Ledger: mapped '{fallback}' -> '{price_col}'")
+                break
+    if contracts_col not in df.columns:
+        for fallback in ['count_fp', 'count', 'filled_count']:
+            if fallback in df.columns:
+                df[contracts_col] = pd.to_numeric(df[fallback], errors='coerce').astype(int)
+                print(f"  Ledger: mapped '{fallback}' -> '{contracts_col}'")
+                break
+    if price_col not in df.columns:
+        print(f"  ⚠️ '{price_col}' not found. Columns: {list(df.columns)}")
+        return {}
+    if contracts_col not in df.columns:
+        print(f"  ⚠️ '{contracts_col}' not found. Columns: {list(df.columns)}")
+        return {}
+
     df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
     df[contracts_col] = pd.to_numeric(df[contracts_col], errors="coerce")
     df = df.dropna(subset=[price_col, contracts_col])
