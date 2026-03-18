@@ -672,6 +672,17 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
     if 'count' in df.columns and 'contracts' not in df.columns:
         df = df.rename(columns={'count': 'contracts'})
 
+    # Normalize API field names — Kalshi changes these periodically
+    # Old: yes_price, no_price, count
+    # New: yes_price_dollars, yes_price_fixed, no_price_dollars, count_fp
+    if 'yes_price' not in df.columns:
+        if 'yes_price_dollars' in df.columns:
+            df['yes_price'] = pd.to_numeric(df['yes_price_dollars'], errors='coerce')
+            print(f"  Mapped 'yes_price_dollars' -> 'yes_price'")
+        elif 'yes_price_fixed' in df.columns:
+            df['yes_price'] = pd.to_numeric(df['yes_price_fixed'], errors='coerce')
+            print(f"  Mapped 'yes_price_fixed' -> 'yes_price'")
+
     if 'yes_price' in df.columns:
         yes_prices = pd.to_numeric(df['yes_price'], errors='coerce')
         max_val = yes_prices.max()
@@ -683,6 +694,24 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
             df['price'] = df.apply(
                 lambda row: float(row['yes_price']) if row.get('side') == 'yes'
                             else (100.0 - float(row['yes_price'])), axis=1)
+    elif 'no_price' in df.columns or 'no_price_dollars' in df.columns:
+        # Fallback: derive from no_price
+        no_col = 'no_price' if 'no_price' in df.columns else 'no_price_dollars'
+        df['no_price_val'] = pd.to_numeric(df[no_col], errors='coerce')
+        max_val = df['no_price_val'].max()
+        if max_val <= 1.0:
+            df['price'] = df.apply(
+                lambda row: (1.0 - float(row['no_price_val'])) if row.get('side') == 'yes'
+                            else float(row['no_price_val']), axis=1)
+        else:
+            df['price'] = df.apply(
+                lambda row: (100.0 - float(row['no_price_val'])) if row.get('side') == 'yes'
+                            else float(row['no_price_val']), axis=1)
+        print(f"  Built 'price' from '{no_col}' (fallback)")
+    else:
+        print(f"  ⚠️ No price column found! Columns: {list(df.columns)}")
+        df['price'] = 0
+
     return df
 
 
