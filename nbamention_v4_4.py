@@ -2446,7 +2446,7 @@ def place_orders_from_df(df_results: pd.DataFrame):
     print(f"  Safe mode: {'YES' if safe_mode else 'NO'}")
     print(f"  Ledger: {len(ledger)} markets with fill data")
     print(f"  Position caps: {MAX_NET_PER_MARKET}/market, {MAX_NET_PER_EVENT}/event")
-        print(f"  [v4.6-2] Pairing overshoot cap: ENABLED")
+    print(f"  [v4.6-2] Pairing overshoot cap: ENABLED")
     print(f"  Min EV: {MIN_EV_PER_ORDER:.0%} per order (hedge-adjusted)")
     print(f"  Price anchor: mid-price")
 
