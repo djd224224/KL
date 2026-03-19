@@ -1871,10 +1871,17 @@ def build_order_objects_for_market(
     except Exception as e:
         print(f"    Orderbook: Yes=N/A, No=N/A")
 
-    # [v4.6] Guard: empty orderbook + zero OI + zero volume → market likely not tradeable
+    # [v4.6] Guard: empty orderbook + zero OI + zero volume
+    # Only hard-skip for far-out markets with no existing positions
+    # Close games or markets with ledger data proceed (may just be thin liquidity)
     if orderbook_yes_bid is None and orderbook_no_bid is None and open_interest == 0 and volume == 0:
-        print(f"    ⚠️ Empty orderbook + zero OI + zero volume — market may not be open for trading, skipping")
-        return []
+        has_ledger = ledger_data is not None and (ledger_data.get('yes_qty', 0) + ledger_data.get('no_qty', 0)) > 0
+        if hours_until_event > 24 and not has_ledger:
+            print(f"    ⚠️ Empty orderbook + zero OI + zero volume + >24h out + no positions — skipping")
+            return []
+        else:
+            reason = f"{'has positions' if has_ledger else ''}{' + ' if has_ledger and hours_until_event <= 24 else ''}{'<24h to event' if hours_until_event <= 24 else ''}"
+            print(f"    ⚠️ Empty orderbook + zero OI — proceeding anyway ({reason})")
 
     # Mid-price anchor
     market_mid_yes = None
@@ -2659,6 +2666,9 @@ def add_missing_columns_to_table(table_name: str, df: pd.DataFrame, existing_sch
         print(f"✓ No new columns to add to {table_name}")
 
 def df_to_bq(df, table_name: str, write_disposition="WRITE_TRUNCATE"):
+    if df is None or len(df) == 0:
+        print(f"⚠️ Skipping BQ upload for {table_name} — empty DataFrame")
+        return
     table_id = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
     df_to_upload = df.copy()
     if write_disposition == "WRITE_APPEND":
