@@ -1,49 +1,49 @@
 #!/usr/bin/env python3
 # =============================================================================
-# KXNCAABMENTION Monitoring Script — GitHub Actions Compatible
+# KXNCAABMENTION Order Script v4.3-NCAAB — March Madness Tournament Mode
 # =============================================================================
-# Pulls fills + settlements from Kalshi API, computes P&L, uploads to BigQuery.
-# Includes API field name fallback logic (yes_price_dollars, count_fp).
-# =============================================================================
+# STEP 1: FETCH DATA
+# FIXED: Team-level historical rates now correct (no longer flipping based on team position)
+# ADAPTED: Series ticker changed to KXNCAABMENTION for college basketball
+
 from __future__ import annotations
-import os
-import sys
 import time
-from datetime import datetime, UTC
-from typing import Any, Dict, List
 
 import pandas as pd
-import numpy as np
-
+from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+import os
+import uuid
+from datetime import datetime, UTC
+from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
+from google.cloud import bigquery
 
-# =============================================================================
+# =========================
 # CONFIG
-# =============================================================================
+# =========================
+
+SERIES_TICKER = "KXNCAABMENTION"  # [NCAAB-1]
 API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
 PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-SERIES_TICKER = "KXNCAABMENTION"
-
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
-DATASET_ID = os.environ.get("GCP_DATASET_ID", "Kalshi")
 
 SLEEP_BETWEEN_CALLS_SEC = 0.05
 
-# =============================================================================
+# =========================
 # AUTHENTICATION
-# =============================================================================
+# =========================
 def load_private_key_from_file(file_path: str):
     with open(file_path, "rb") as key_file:
         private_key = serialization.load_pem_private_key(
-            key_file.read(), password=None, backend=default_backend()
+            key_file.read(),
+            password=None,
+            backend=default_backend()
         )
     return private_key
 
 PRIVATE_KEY = load_private_key_from_file(PRIVATE_KEY_PATH)
-
-from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient
 
 exchange_client = ExchangeClient(
     exchange_api_base=API_BASE,
@@ -51,36 +51,53 @@ exchange_client = ExchangeClient(
     private_key=PRIVATE_KEY
 )
 
-# GCP auth
-try:
-    from google.cloud import bigquery
-    import pyarrow
-
-    if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-        try:
-            from google.colab import auth
-            auth.authenticate_user()
-            print("Authenticated via Colab")
-        except ImportError:
-            print("No GOOGLE_APPLICATION_CREDENTIALS and not in Colab")
-
-    bq_client = bigquery.Client(project=PROJECT_ID)
-    print(f"BigQuery client initialized (project: {PROJECT_ID})")
-except ImportError as e:
-    print(f"BigQuery libraries not available: {e}")
-    bq_client = None
-
-print("Testing Kalshi connection...")
+print("Testing connection...")
 try:
     status = exchange_client.get_exchange_status()
-    print(f"Kalshi connected! Trading active: {status['trading_active']}")
+    print(f"✓ Connected! Trading active: {status['trading_active']}")
 except Exception as e:
-    print(f"Kalshi connection failed: {e}")
+    print(f"✗ Connection failed: {e}")
     raise
 
-# =============================================================================
-# TICKER PARSING
-# =============================================================================
+# =========================
+# API CALLS
+# =========================
+def get_all_markets_for_series(series_ticker: str, status_filter: str = None) -> List[Dict[str, Any]]:
+    all_markets = []
+    cursor = None
+    page = 0
+    while True:
+        page += 1
+        print(f"  Fetching markets page {page}...")
+        params = {"series_ticker": series_ticker, "limit": 200}
+        if status_filter:
+            params["status"] = status_filter
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            response = exchange_client.get_markets(**params)
+            markets = response.get('markets', [])
+            all_markets.extend(markets)
+            print(f"    Retrieved {len(markets)} markets (total: {len(all_markets)})")
+            cursor = response.get('cursor')
+            if not cursor:
+                break
+            time.sleep(SLEEP_BETWEEN_CALLS_SEC)
+        except Exception as e:
+            print(f"Error fetching markets: {e}")
+            import traceback
+            traceback.print_exc()
+            break
+    return all_markets
+
+# =========================
+# PARSING
+# =========================
+def normalize_yes_no(result: Any) -> str:
+    if result in ("yes", "no"):
+        return str(result).upper()
+    return ""
+
 def parse_event_code(event_code: str) -> Dict[str, str]:
     event_code = event_code or ""
     date_code = event_code[:7] if len(event_code) >= 7 else ""
@@ -108,385 +125,1529 @@ def split_market_ticker(ticker: str) -> Dict[str, str]:
     event_code = parts[1] if len(parts) > 1 else ""
     market_code = parts[2] if len(parts) > 2 else ""
     parsed = parse_event_code(event_code)
-    return {
-        "ticker_part_1_series": series,
-        "ticker_part_2_event_code": event_code,
-        "ticker_part_3_market_code": market_code,
-        **parsed,
-    }
+    return {"ticker_part_1_series": series, "ticker_part_2_event_code": event_code,
+            "ticker_part_3_market_code": market_code, **parsed}
 
-# =============================================================================
-# LOAD ORDERS FROM BIGQUERY (deduplicated, for lineage)
-# =============================================================================
-def load_orders_from_bigquery(series_ticker: str) -> pd.DataFrame:
-    if bq_client is None:
-        print("No BigQuery client -- skipping order lineage")
+# =========================
+# MAIN DATA COLLECTION
+# =========================
+def main():
+    print(f"\n{'='*70}")
+    print(f"FETCHING DATA FOR {SERIES_TICKER}")
+    print(f"{'='*70}\n")
+
+    print("Fetching ALL markets...")
+    all_markets = get_all_markets_for_series(SERIES_TICKER, status_filter=None)
+    print(f"\n✓ Fetched {len(all_markets)} total markets")
+
+    if len(all_markets) == 0:
+        print("⚠️  No markets found - returning empty dataframes")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for m in all_markets:
+        market_ticker = m.get("ticker") or ""
+        split_cols = split_market_ticker(market_ticker)
+        row = {
+            "series_ticker": m.get("series_ticker"),
+            "event_ticker": m.get("event_ticker"),
+            "event_title": m.get("title") or m.get("subtitle") or "",
+            "market_ticker": market_ticker,
+            "market_status": m.get("status"),
+            "result_yes_no": normalize_yes_no(m.get("result")),
+        }
+        row.update(split_cols)
+        rows.append(row)
+
+    df_results = pd.DataFrame(rows)
+    print(f"\nBuilt df_results: {df_results.shape}")
+
+    status_counts = df_results['market_status'].value_counts()
+    print(f"\nMarket status breakdown:")
+    for status, count in status_counts.items():
+        print(f"  {status}: {count}")
+
+    active_statuses = ['open', 'active']
+    settled_statuses = ['settled', 'finalized', 'closed']
+    df_results['is_active'] = df_results['market_status'].isin(active_statuses)
+    df_results['is_settled'] = df_results['market_status'].isin(settled_statuses) & (df_results['result_yes_no'] != '')
+    print(f"\n  Active/tradeable markets: {df_results['is_active'].sum()}")
+    print(f"  Settled markets with results: {df_results['is_settled'].sum()}")
+
+    # BUILD ROLLING SUMMARY
+    print("\nBuilding rolling summary (from SETTLED markets only)...")
+    df_settled = df_results[df_results['is_settled']].copy()
+    print(f"  Using {len(df_settled)} settled markets with results")
+
+    if len(df_settled) == 0:
+        print("⚠️  No settled markets found")
+        return df_results, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df_by_date = (
+        df_settled.query("ticker_part_3_market_code != '' and event_date != ''")
+        .groupby(['ticker_part_3_market_code', 'event_date'], as_index=False)
+        .agg(count_occurrences=('market_ticker', 'size'),
+             count_yes=('result_yes_no', lambda s: (s == 'YES').sum()))
+        .sort_values(['ticker_part_3_market_code', 'event_date'])
+    )
+    if len(df_by_date) == 0:
+        return df_results, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df_summary_rolling = df_by_date.copy()
+    df_summary_rolling['count_occurrences_rolling'] = df_summary_rolling.groupby('ticker_part_3_market_code')['count_occurrences'].cumsum()
+    df_summary_rolling['count_yes_rolling'] = df_summary_rolling.groupby('ticker_part_3_market_code')['count_yes'].cumsum()
+    df_summary_rolling['yes_rate_rolling'] = df_summary_rolling['count_yes_rolling'] / df_summary_rolling['count_occurrences_rolling']
+
+    df_summary = (
+        df_summary_rolling
+        .sort_values(['ticker_part_3_market_code', 'event_date'], ascending=[True, False])
+        .groupby('ticker_part_3_market_code', as_index=False).first()
+        .drop(columns=['count_occurrences', 'count_yes'])
+        .rename(columns={'count_occurrences_rolling': 'count_occurrences',
+                         'count_yes_rolling': 'count_yes', 'yes_rate_rolling': 'yes_rate'})
+    )
+    print(f"  df_summary: {df_summary.shape}")
+
+    # TEAM-LEVEL ROLLING
+    print("\nBuilding team-level rolling summary...")
+    df_filtered = df_settled.query("ticker_part_3_market_code != '' and event_date != '' and team_1 != '' and team_2 != ''").copy()
+
+    if len(df_filtered) == 0:
+        df_summary_filtered = df_summary[df_summary['count_occurrences'] > 25][["ticker_part_3_market_code", "yes_rate"]].copy()
+        df_results = df_results.merge(df_summary_filtered, on="ticker_part_3_market_code", how="left")
+        df_results["yes_rate"] = df_results.apply(lambda row: row["yes_rate"] if row["is_active"] else "", axis=1)
+        return df_results, df_summary, df_summary_rolling, pd.DataFrame()
+
+    df_team1 = df_filtered.copy(); df_team1['team'] = df_team1['team_1']; df_team1['is_team_1'] = True
+    df_team2 = df_filtered.copy(); df_team2['team'] = df_team2['team_2']; df_team2['is_team_1'] = False
+    df_team_exploded = pd.concat([df_team1, df_team2], ignore_index=True)
+    df_team_exploded['team_result'] = df_team_exploded['result_yes_no']
+
+    df_team_by_date = (
+        df_team_exploded.groupby(['ticker_part_3_market_code', 'team', 'event_date'], as_index=False)
+        .agg(count_occurrences=('market_ticker', 'size'),
+             count_yes=('team_result', lambda s: (s == 'YES').sum()))
+        .sort_values(['ticker_part_3_market_code', 'team', 'event_date'])
+    )
+
+    df_summary_rolling_by_team = df_team_by_date.copy()
+    df_summary_rolling_by_team['count_occurrences_rolling'] = df_summary_rolling_by_team.groupby(['ticker_part_3_market_code', 'team'])['count_occurrences'].cumsum()
+    df_summary_rolling_by_team['count_yes_rolling'] = df_summary_rolling_by_team.groupby(['ticker_part_3_market_code', 'team'])['count_yes'].cumsum()
+    df_summary_rolling_by_team['yes_rate_rolling'] = df_summary_rolling_by_team['count_yes_rolling'] / df_summary_rolling_by_team['count_occurrences_rolling']
+    print(f"  df_summary_rolling_by_team: {df_summary_rolling_by_team.shape}")
+
+    # ADD yes_rate TO ACTIVE MARKETS
+    df_summary_filtered = df_summary[df_summary['count_occurrences'] > 25][["ticker_part_3_market_code", "yes_rate"]].copy()
+    df_results = df_results.merge(df_summary_filtered, on="ticker_part_3_market_code", how="left")
+    df_results["yes_rate"] = df_results.apply(lambda row: row["yes_rate"] if row["is_active"] else "", axis=1)
+    df_results.loc[df_results['is_active'], 'market_status'] = 'active'
+
+    print(f"\nDataframes created:")
+    print(f"  df_results: {df_results.shape}")
+    print(f"  df_summary: {df_summary.shape}")
+    print(f"  df_summary_rolling: {df_summary_rolling.shape}")
+    print(f"  df_summary_rolling_by_team: {df_summary_rolling_by_team.shape}")
+    return df_results, df_summary, df_summary_rolling, df_summary_rolling_by_team
+
+df_results, df_summary, df_summary_rolling, df_summary_rolling_by_team = main()
+print("\n✓ Data collection complete!")
+
+# NCAABMENTION ORDER SCRIPT v4.2-NCAAB — ADAPTED FROM NBA WITH ANALYSIS-DRIVEN CHANGES
+# ==============================================================
+# ADAPTED FOR: KXNCAABMENTION (college basketball)
+#
+# CHANGES FROM NBA v4.2 (based on NCAAB P&L analysis):
+#
+#   [NCAAB-1] SERIES_TICKER → "KXNCAABMENTION"
+#
+#   [NCAAB-2] SIDE_MULTIPLIERS completely rewritten:
+#     - DOUB: BLOCKED (0/0) — biggest $ loser (-$191), coin-flip market, high variance
+#     - TRAN: BLOCKED (0/0) — 79% yes rate, structurally unfavorable for No
+#     - AIRB: heavily reduced — -22.5% ROI
+#     - WALK: BLOCKED — tiny sample, -60% ROI
+#     - ALLE: strong No (0/2.0) — best market, +30% ROI, 21% base yes
+#     - MARC: strong No (0/1.8) — +6.5% ROI, 13% base yes
+#     - NIL: strong No (0/1.8) — +15.4% ROI, 18% base yes
+#     - RECO: No-favored (0/1.5) — +15.5% ROI
+#     - ALL: No-favored (0/1.5) — +13.2% ROI
+#     - ELBO: No-favored (0/1.3) — +15.6% ROI
+#     - DRAF: mild No (0/0.8) — -5.4% ROI, demoted from safe bundle
+#     - RECR: mild No (0/0.7) — -1.8% ROI, underperforming
+#     - ANKL: mild No (0/0.7) — +0.6% ROI, barely positive
+#     - SCHE: mild No (0/0.7) — -4.5% ROI, underperforming
+#     - OVER: No only (0/1.0) — +0.9% ROI, neutral but No-only was +ROI
+#
+#   [NCAAB-3] GAME EXPOSURE CAP:
+#     MAX_NET_PER_EVENT: 2000 → 800 (limits ~$150 per game exposure)
+#     MAX_ORDERS_PER_EVENT: 5000 → 2000
+#     MAX_NET_PER_MARKET: 300 → 150 (halved to limit single-position blowups)
+#
+#   [NCAAB-4] NO SWEET SPOT shifted to 50–80¢:
+#     Analysis showed 50-65¢ No = 61% win rate, 65-80¢ = 86% win rate
+#     Old: 35-65¢. New: 50-80¢ at 1.8x (up from 1.5x)
+#
+#   [NCAAB-5] YES_PROBABILITY_FLOOR: 40 → 65
+#     Blocks Yes bets on markets below 65¢ fair value
+#     Analysis: Yes positions ran -7.7% ROI across the board
+#
+#   [NCAAB-6] POSITION SIZING tightened:
+#     - MIN_PRICE_NO: 5 → 12 (eliminates sub-$10 positions that ran -11.7% ROI)
+#     - MIN_PRICE_YES: 15 → 25 (no cheap Yes fliers)
+#     - POSITION_STOP_THRESHOLD: 300 → 150 (matches new MAX_NET)
+#     - POSITION_MODERATE_THRESHOLD: 100 → 75
+#
+#   [NCAAB-7] TEAM-SPECIFIC BLOCKS:
+#     New TEAM_MARKET_OVERRIDES dict blocks/boosts specific team+market combos
+#     Based on team-level rate deviations >25pp from base rate
+#     E.g., DOUB blocked entirely but if re-enabled: block when FLA/MSU playing
+#     E.g., ALLE Yes allowed only when ALA/FLA playing (100%/75% vs 21% base)
+#     E.g., TRAN No allowed only when ALA/NEB playing (33%/40% vs 79% base)
+#
+#   [NCAAB-8] PAIRING MODE tightened:
+#     Since we're mostly No-only, reduce accidental hedging
+#     PAIRING_MODE_THRESHOLD: 0.40 → 0.60 (harder to trigger)
+#     PAIRING_MODE_AGGRESSIVE: 0.75 → 0.85
+#     HEDGE_MIN_PRICE_YES: 25 → 35 (don't chase cheap Yes hedges)
+#
+#   [NCAAB-9] BASE CONTRACT SIZES reduced:
+#     Old: 15/15/15/20/20/25/25/25/30/30
+#     New: 10/10/10/12/12/15/15/15/18/18
+#     Prevents oversized positions at high multipliers
+#
+#   [NCAAB-10] VALIDATION updated for NCAAB market codes
+#
+#   Carries all v4.2 structural features:
+#     Fills ledger, hedge-aware EV, pairing mode, conditional price floors,
+#     side mult overrides, ledger-aware sizing, Bayesian hybrid pricing
+# ==============================================================
+
+
+
+
+RUN_ID = str(uuid.uuid4())
+MODEL_VERSION = "v4.2-NCAAB"
+PRICING_STRATEGY = 'hybrid'
+
+# =========================
+# [NCAAB-1] CONFIG
+# =========================
+# SERIES_TICKER already defined in data fetch cell
+API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
+PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
+API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+SLEEP_BETWEEN_CALLS_SEC = 0.05
+
+# ---------- BAYESIAN HYBRID PRICING PARAMETERS ----------
+BAYESIAN_K = 25
+BAYESIAN_RECENCY_HALFLIFE_GAMES = 15    # [NCAAB-12] Was 50 — recent 20 games now get 62% weight (was 36%)
+BAYESIAN_MARKET_WEIGHT = 0.70    # [NCAAB-13] Was 0.6 — trust orderbook more during regime shifts
+BAYESIAN_HISTORICAL_WEIGHT = 0.30    # [NCAAB-13] Was 0.4 — reduce stale historical anchor
+
+# =========================
+# [NCAAB-3] POSITION MANAGEMENT — tightened caps
+# =========================
+MAX_NET_PER_MARKET = 150         # [v4.3] Tier 1 cap. Dampener is the real governor now.
+# Tier-specific caps applied in build_order_objects_for_market:
+#   Tier 1 (SCHE/ELBO/DRAF/MARC/NIL): 150
+#   Tier 2 (ANKL/AIRB/ALLE/RECO/ALL/RECR/OVER/DOUB): 100
+TIER1_MARKETS = {"SCHE", "ELBO", "DRAF", "MARC", "NIL"}
+TIER2_MAX_NET = 100
+POSITION_MODERATE_THRESHOLD = 75  # [v4.3] Raised to match new caps
+POSITION_STOP_THRESHOLD = 150     # [v4.3] Matches Tier 1 MAX_NET
+MAX_ORDERBOOK_LEVELS_ABOVE = 2
+
+MAX_NET_PER_EVENT = 800           # [v4.3] Dampener is real governor. Hard cap is circuit breaker only.
+MAX_ORDERS_PER_EVENT = 2000       # [NCAAB-3] Was 5000
+
+MIN_SPREAD_BOTH_SIDES = 0         # [v4.1-1] Spread gate still DISABLED
+MIN_EV_PER_ORDER = 0.02           # 2% minimum expected edge
+SAFE_MODE_MULTIPLIER = 0.10
+
+# =========================
+# [NCAAB-8] PAIRING MODE — tightened to reduce accidental hedging
+# =========================
+PAIRING_MODE_THRESHOLD = 0.60     # [NCAAB-8] Was 0.40 — harder to trigger
+PAIRING_MODE_AGGRESSIVE = 0.85    # [NCAAB-8] Was 0.75
+PAIRING_MODE_NET_FLOOR = 60   # [v4.3] Fixed value (was MAX_NET*0.6=90, too high)
+PAIRING_MODE_NET_AGGRESSIVE = 100  # [v4.3] Fixed value (was MAX_NET*0.85=127, too high)
+
+HEDGE_MIN_PRICE_YES = 35          # [NCAAB-8] Was 25 — don't chase cheap Yes hedges
+HEDGE_MIN_PRICE_NO = 5            # Was 3
+HEDGE_YES_MIN_PRICE = 40          # Was 25
+
+MAX_PAIRED_PER_MARKET = 300       # Was 500
+
+# =========================
+# [NCAAB-2b] SIDE MULTIPLIERS — updated for March Madness (v4.2b)
+# Reranked by: consistency (profitable in BOTH Feb and Mar), March edge
+# (fair_no - avg_price at March yes-rates), and contract-level P&L
+SIDE_MULTIPLIERS = {
+    # --- BLOCKED: proven losers or no edge at March rates ---
+    "DOUB": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets. Mar rate 0% yes.
+    "TRAN": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled deep offsets. Kelly+dampener protect.
+    "WALK": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled deep offsets.
+    "BUZZ": {"yes": 0.0, "no": 0.3},   # [v4.3] New code — conservative deep offsets.
+    "ALLA": {"yes": 0.0, "no": 0.3},   # [v4.3] New code — conservative deep offsets.
+    "OVER": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets only.
+    "RECR": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets only. Kelly+dampener protect.
+
+    # --- TIER 1: Consistent + strong March edge ---
+    "SCHE": {"yes": 0.0, "no": 1.8},   # +$50, +21% ROI. Both periods +. Mar edge +34c
+    "NIL":  {"yes": 0.0, "no": 1.5},   # [v4.3] +12.8c/contract, 88% WR, 2nd best PnL/Q. Restored.
+    "DRAF": {"yes": 0.0, "no": 1.3},   # +$51, +8%. Mar +40% ROI. Edge +20c
+
+    # --- TIER 2: Good March edge but inconsistent ---
+    "ELBO": {"yes": 0.0, "no": 1.8},   # [P1] Kelly=45%, 2nd best. Mar edge +32c. Was 0.8x
+    "ANKL": {"yes": 0.0, "no": 1.0},   # [v4.3] Dampener fixes adverse sizing. +$19 dampened P&L.
+    "AIRB": {"yes": 0.0, "no": 0.5},   # -$26 total, Mar edge = +12c. Speculative
+
+    # --- TIER 3: Demoted — lost edge in March ---
+    "MARC": {"yes": 0.0, "no": 1.5},   # +$194, +10% ROI, BOTH periods +. Price fix via recency halflife
+    "ALLE": {"yes": 0.0, "no": 0.3},   # -$34. Collapsed Mar (-$188). Blowup risk
+    "RECO": {"yes": 0.0, "no": 0.3},   # -$31. Flipped -37% in Mar
+    "ALL":  {"yes": 0.0, "no": 0.5},   # +$29 total but -$15 Mar. Edge +6c, thin
+}
+
+# =========================
+# [NCAAB-7] TEAM-SPECIFIC OVERRIDES
+# Based on team-level deviation analysis (>25pp from base rate)
+# Format: (team, market_code) → {"yes_mult": X, "no_mult": X}
+# These OVERRIDE the base SIDE_MULTIPLIERS for specific matchups
+# =========================
+# [NCAAB-7b] TEAM-SPECIFIC OVERRIDES — updated with March data
+# =========================
+TEAM_MARKET_OVERRIDES = {
+    # MARC (was 4% Feb → 44% Mar) — block teams where MARC settled Yes in March
+    ("UKF", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("AUB", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("ARK", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("VAN", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("ISU", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("PUR", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
+
+    # ALLE (33% Mar, collapsed) — block high-loss teams
+    ("UKF", "ALLE"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("TEN", "ALLE"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("UNC", "ALLE"): {"yes_mult": 0.0, "no_mult": 0.0},
+
+    # DRAF — boost reliable No teams
+    ("VAN", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.8},
+    ("ILL", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.8},
+    # NEB removed — never matches as parsed team code (IOWANEB→IOW+ANEB)
+    ("PUR", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.5},
+    ("ALA", "DRAF"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("DUK", "DRAF"): {"yes_mult": 0.0, "no_mult": 0.0},
+    ("FLA", "DRAF"): {"yes_mult": 0.0, "no_mult": 0.0},
+
+    # RECO — MIC still extreme outlier
+    ("MIC", "RECO"): {"yes_mult": 0.0, "no_mult": 1.5},
+}
+
+# [P2] GAME-LEVEL RISK MULTIPLIER — high-mention teams get reduced sizing
+# Applied to ALL markets when these teams play
+TEAM_RISK_MULTIPLIER = {
+    "ALA": 0.5, "ARK": 0.5, "FLA": 0.5, "BYU": 0.5,  # avg 7+ yes/game
+    "MIC": 1.3, "TTU": 1.3, "ISU": 1.2,                # avg 5 or fewer
+}
+
+
+# =========================
+# [NCAAB-6] PRICE FILTERS — tightened
+# =========================
+MIN_PRICE_YES = 25                # [NCAAB-6] Was 15 — no cheap Yes fliers
+MIN_PRICE_NO = 15                 # [NCAAB-6b] Was 12
+# [v4.3] Dead zone REMOVED — not statistically significant (p=0.687).
+# Kelly gate + dampener handle the real problems (adverse sizing + stale pricing).
+# NO_DEAD_ZONE_MIN = 35  # DISABLED
+# NO_DEAD_ZONE_MAX = 50  # DISABLED
+MAX_PRICE = 75                    # Unchanged — NEVER relaxed
+YES_MIN_PRICE = 50                # Was 45 — further restricts Yes
+NO_MAX_YES_PRICE = 80
+NO_MIN_YES_PRICE = 20
+YES_PROBABILITY_FLOOR = 65        # [NCAAB-5] Was 40 — blocks most Yes bets (analysis: Yes = -7.7% ROI)
+
+# =========================
+# [NCAAB-4] NO SWEET SPOT — shifted to proven profitable range
+# =========================
+NO_SWEET_SPOT_MIN = 65            # [NCAAB-4b] Was 50 — 50-65¢ has -5pp edge in Mar. Only 65-80¢ works
+NO_SWEET_SPOT_MAX = 75            # [NCAAB-4b] Aligned with MAX_PRICE — 65-80¢ has +11pp edge and 81% WR
+NO_SWEET_SPOT_MULTIPLIER = 1.5    # [NCAAB-4b] Was 1.8 — moderated, still capped by MAX_COMBINED
+MAX_COMBINED_SWEET_BOOST = 2.0    # [NCAAB-FIX] Cap side_mult × sweet_spot to prevent double-boost
+
+# =========================
+# [NCAAB-9] ORDER CONFIGURATION — reduced base sizes
+# =========================
+def generate_base_contracts(num_levels: int) -> List[int]:
+    """[v4.3] Tournament sizing: 10/12/15/18. Dampener controls game-level accumulation."""
+    contracts = []
+    for i in range(num_levels):
+        if i < 3:
+            contracts.append(10)
+        elif i < 5:
+            contracts.append(12)
+        elif i < 8:
+            contracts.append(15)
+        else:
+            contracts.append(18)
+    return contracts
+
+NUM_OFFSET_LEVELS = 12  # [v4.3] Match 12-level spread configs
+BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
+BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
+MAX_CONTRACTS_PER_ORDER = 300     # [v4.3] Raised for tournament volume
+
+# ---------- DYNAMIC SIZING MULTIPLIERS ----------
+TIME_MULTIPLIERS = [
+    (1, 1.8),
+    (3, 1.5),
+    (6, 1.3),
+    (12, 1.1),
+    (24, 1.0),
+    (48, 0.9),
+    (999999, 0.7),
+]
+
+VOLUME_MULTIPLIERS = [
+    (50000, 1.8),
+    (20000, 1.5),
+    (10000, 1.3),
+    (5000, 1.1),
+    (2000, 1.0),
+    (1000, 0.9),
+    (0, 0.8),
+]
+
+# ---------- SPREAD-BASED OFFSET CONFIGURATION ----------
+def generate_offsets(start: int, increment: int, count: int) -> List[int]:
+    return [start + i * increment for i in range(count)]
+
+SPREAD_CONFIGS = {
+    "tight":    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14],       # [v4.3] 12 levels, tighter top
+    "medium":   [2, 3, 5, 7, 9, 11, 13, 15, 17, 19, 22, 25],    # [v4.3] 12 levels, tighter top, deep bottom
+    "wide":     [3, 5, 8, 11, 14, 17, 20, 23, 26, 29, 33, 37],  # [v4.3] 12 levels, deeper bottom
+}
+
+# [v4.3] Tier 1 markets use tighter spreads (more fills, still 20+¢ edge buffer)
+TIER1_SPREAD_OVERRIDE = "tight"  # SCHE/ELBO/DRAF/MARC/NIL get tight spreads
+
+
+PAIRING_OFFSETS = {
+    'yes': generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
+    'no':  generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
+    'name': 'pairing'
+}
+
+EXPIRATION_HOURS_BEFORE_CLOSE = 5
+SLEEP_BETWEEN_ORDERS = 0.05
+FALLBACK_OFFSET = 15
+
+
+# =========================
+# [NCAAB-7] TEAM-SPECIFIC OVERRIDE APPLICATION
+# =========================
+
+def apply_team_overrides(market_code, team_1, team_2, base_yes_mult, base_no_mult):
+    """
+    [NCAAB-7] Check if either team triggers a market-specific override.
+    If both teams have overrides, use the more conservative multiplier.
+    Returns (yes_mult, no_mult, override_applied, reason)
+    """
+    override_1 = TEAM_MARKET_OVERRIDES.get((team_1, market_code))
+    override_2 = TEAM_MARKET_OVERRIDES.get((team_2, market_code))
+    if override_1 is None and override_2 is None:
+        return base_yes_mult, base_no_mult, False, "no_override"
+    yes_mult, no_mult = base_yes_mult, base_no_mult
+    reasons = []
+    if override_1 is not None:
+        yes_mult = override_1["yes_mult"]
+        no_mult = override_1["no_mult"]
+        reasons.append(f"{team_1}->Y={yes_mult}x,N={no_mult}x")
+    if override_2 is not None:
+        if override_1 is not None:
+            yes_mult = min(yes_mult, override_2["yes_mult"])
+            no_mult = min(no_mult, override_2["no_mult"])
+        else:
+            yes_mult = override_2["yes_mult"]
+            no_mult = override_2["no_mult"]
+        reasons.append(f"{team_2}->Y={yes_mult}x,N={no_mult}x")
+    return yes_mult, no_mult, True, "; ".join(reasons)
+
+# =========================
+# AUTHENTICATION (for order script)
+# =========================
+PRIVATE_KEY = load_private_key_from_file(PRIVATE_KEY_PATH)
+
+exchange_client = ExchangeClient(
+    exchange_api_base=API_BASE,
+    key_id=API_KEY_ID,
+    private_key=PRIVATE_KEY
+)
+
+print("Testing connection...")
+try:
+    status = exchange_client.get_exchange_status()
+    print(f"✓ Connected! Trading active: {status['trading_active']}")
+except Exception as e:
+    print(f"✗ Connection failed: {e}")
+    raise
+
+print(f"\n{'='*70}")
+print(f"CONFIGURATION — {MODEL_VERSION}")
+print(f"{'='*70}")
+print(f"Run ID: {RUN_ID}")
+print(f"Series: {SERIES_TICKER}")
+print(f"Pricing: {PRICING_STRATEGY} | Bayesian K={BAYESIAN_K}")
+print(f"Position caps: market={MAX_NET_PER_MARKET} [was300] event={MAX_NET_PER_EVENT} [was2000]")
+print(f"  Moderate at {POSITION_MODERATE_THRESHOLD} [was100], stop at {POSITION_STOP_THRESHOLD} [was300]")
+print(f"Pairing: threshold={PAIRING_MODE_NET_FLOOR} aggressive={PAIRING_MODE_NET_AGGRESSIVE}")
+print(f"Price filters:")
+print(f"  YES: {MIN_PRICE_YES}-{MAX_PRICE}c floor={YES_MIN_PRICE}c prob_floor={YES_PROBABILITY_FLOOR}%")
+print(f"  NO:  {MIN_PRICE_NO}-{MAX_PRICE}c sweet={NO_SWEET_SPOT_MIN}-{NO_SWEET_SPOT_MAX}c @{NO_SWEET_SPOT_MULTIPLIER}x")
+print(f"  EV gate: {MIN_EV_PER_ORDER:.0%}")
+blocked = [k for k, v in SIDE_MULTIPLIERS.items() if v['yes'] == 0 and v['no'] == 0]
+safe = [k for k, v in SIDE_MULTIPLIERS.items() if v['no'] >= 1.5]
+secondary = [k for k, v in SIDE_MULTIPLIERS.items() if 0 < v['no'] < 1.5]
+print(f"BLOCKED: {blocked}")
+print(f"SAFE BUNDLE (≥1.5x No): {safe}")
+print(f"SECONDARY: {secondary}")
+print(f"Team overrides: {len(TEAM_MARKET_OVERRIDES)} combos")
+print(f"Base contracts: {BASE_YES_CONTRACTS[:5]}... (was 15/15/15/20/20)")
+print(f"{'='*70}\n")
+
+# =====================================================================
+# FILLS-BASED POSITION LEDGER [v4.2-1]
+# =====================================================================
+
+def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
+    print(f"  Fetching fills from Kalshi API for {series_ticker}...")
+    all_fills = []
+    cursor = None
+    page = 0
+    while True:
+        page += 1
+        params = {"limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            response = exchange_client_ref.get_fills(**params)
+        except Exception as e:
+            print(f"  ✗ Error on page {page}: {e}")
+            break
+        batch = response.get("fills", [])
+        if not batch:
+            break
+        series_fills = [f for f in batch if f.get("ticker", "").startswith(series_ticker)]
+        all_fills.extend(series_fills)
+        cursor = response.get("cursor")
+        if not cursor:
+            break
+        if page % 10 == 0:
+            print(f"    Page {page}: {len(all_fills)} fills so far")
+
+    if not all_fills:
+        print(f"  No fills found for {series_ticker}")
         return pd.DataFrame()
 
-    table_id = f"{PROJECT_ID}.{DATASET_ID}.{series_ticker}_orders"
+    df = pd.DataFrame(all_fills)
+    print(f"  ✓ Loaded {len(df)} fills across {df['ticker'].nunique()} markets from API")
+
+    # Normalize count field — API uses count, count_fp, or contracts
+    if 'contracts' not in df.columns:
+        if 'count_fp' in df.columns:
+            df['contracts'] = pd.to_numeric(df['count_fp'], errors='coerce').astype(int)
+            print(f"  Mapped 'count_fp' -> 'contracts'")
+        elif 'count' in df.columns:
+            df = df.rename(columns={'count': 'contracts'})
+            print(f"  Mapped 'count' -> 'contracts'")
+        else:
+            print(f"  ⚠️ No count column found! Columns: {list(df.columns)}")
+            df['contracts'] = 0
+
+    # Normalize API field names — Kalshi changes these periodically
+    # Old: yes_price, no_price, count
+    # New: yes_price_dollars, yes_price_fixed, no_price_dollars, count_fp
+    if 'yes_price' not in df.columns:
+        if 'yes_price_dollars' in df.columns:
+            df['yes_price'] = pd.to_numeric(df['yes_price_dollars'], errors='coerce')
+            print(f"  Mapped 'yes_price_dollars' -> 'yes_price'")
+        elif 'yes_price_fixed' in df.columns:
+            df['yes_price'] = pd.to_numeric(df['yes_price_fixed'], errors='coerce')
+            print(f"  Mapped 'yes_price_fixed' -> 'yes_price'")
+
+    if 'yes_price' in df.columns:
+        yes_prices = pd.to_numeric(df['yes_price'], errors='coerce')
+        max_val = yes_prices.max()
+        if max_val <= 1.0:
+            df['price'] = df.apply(
+                lambda row: float(row['yes_price']) if row.get('side') == 'yes'
+                            else (1.0 - float(row['yes_price'])), axis=1)
+        else:
+            df['price'] = df.apply(
+                lambda row: float(row['yes_price']) if row.get('side') == 'yes'
+                            else (100.0 - float(row['yes_price'])), axis=1)
+    elif 'no_price' in df.columns or 'no_price_dollars' in df.columns:
+        # Fallback: derive from no_price
+        no_col = 'no_price' if 'no_price' in df.columns else 'no_price_dollars'
+        df['no_price_val'] = pd.to_numeric(df[no_col], errors='coerce')
+        max_val = df['no_price_val'].max()
+        if max_val <= 1.0:
+            df['price'] = df.apply(
+                lambda row: (1.0 - float(row['no_price_val'])) if row.get('side') == 'yes'
+                            else float(row['no_price_val']), axis=1)
+        else:
+            df['price'] = df.apply(
+                lambda row: (100.0 - float(row['no_price_val'])) if row.get('side') == 'yes'
+                            else float(row['no_price_val']), axis=1)
+        print(f"  Built 'price' from '{no_col}' (fallback)")
+    else:
+        print(f"  ⚠️ No price column found! Columns: {list(df.columns)}")
+        df['price'] = 0
+
+    return df
+
+
+def fetch_fills_from_bq(bq_client, project_id, dataset_id, series_ticker=SERIES_TICKER, lookback_days=30):
+    table_id = f"{project_id}.{dataset_id}.{series_ticker}_orders"
     query = f"""
-        SELECT * FROM (
-            SELECT
-                order_id, ticker, side, price, contracts,
-                spread_config, pricing_strategy,
-                time_multiplier, volume_multiplier, total_multiplier,
-                hours_until_event, open_interest, base_contracts, created_at,
-                ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY created_at DESC) AS rn
-            FROM `{table_id}`
-            WHERE order_id IS NOT NULL
-        )
-        WHERE rn = 1
+    SELECT ticker, side, price, contracts, order_id, client_order_id, created_at,
+           ev, p_hat, total_multiplier, spread_config, spread_cents,
+           sweet_spot_applied, pricing_strategy, model_version, run_id
+    FROM `{table_id}`
+    WHERE ok = TRUE AND created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {lookback_days} DAY)
+    ORDER BY ticker, created_at
     """
     try:
         df = bq_client.query(query).to_dataframe()
-        print(f"Loaded {len(df)} deduplicated orders from BigQuery")
+        print(f"  ✓ Loaded {len(df)} fills from BQ")
         return df
     except Exception as e:
-        print(f"Could not load orders from BigQuery: {e}")
+        print(f"  ✗ BQ error: {e}")
         return pd.DataFrame()
 
-# =============================================================================
-# PULL FILLS FROM KALSHI API
-# =============================================================================
-def get_all_fills(series_ticker: str) -> List[Dict[str, Any]]:
-    fills = []
-    cursor = None
-    page = 0
+
+def build_position_ledger(fills_df, price_col="price", contracts_col="contracts"):
+    if fills_df is None or len(fills_df) == 0:
+        return {}
+    ledger = {}
+    df = fills_df.copy()
+
+    # Normalize column names — API fields change periodically
+    if price_col not in df.columns:
+        for fallback in ['yes_price', 'yes_price_dollars', 'yes_price_fixed']:
+            if fallback in df.columns:
+                df[price_col] = pd.to_numeric(df[fallback], errors='coerce')
+                print(f"  Ledger: mapped '{fallback}' -> '{price_col}'")
+                break
+    if contracts_col not in df.columns:
+        for fallback in ['count_fp', 'count', 'filled_count']:
+            if fallback in df.columns:
+                df[contracts_col] = pd.to_numeric(df[fallback], errors='coerce').astype(int)
+                print(f"  Ledger: mapped '{fallback}' -> '{contracts_col}'")
+                break
+    if price_col not in df.columns:
+        print(f"  ⚠️ '{price_col}' not found. Columns: {list(df.columns)}")
+        return {}
+    if contracts_col not in df.columns:
+        print(f"  ⚠️ '{contracts_col}' not found. Columns: {list(df.columns)}")
+        return {}
+
+    df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
+    df[contracts_col] = pd.to_numeric(df[contracts_col], errors="coerce")
+    df = df.dropna(subset=[price_col, contracts_col])
+
+    max_price_val = df[price_col].max()
+    if max_price_val <= 1.0:
+        df[price_col] = df[price_col] * 100
+
+    for ticker, group in df.groupby("ticker"):
+        yes_fills = group[group["side"] == "yes"]
+        no_fills = group[group["side"] == "no"]
+        yes_qty = int(yes_fills[contracts_col].sum())
+        no_qty = int(no_fills[contracts_col].sum())
+        yes_avg = (yes_fills[price_col] * yes_fills[contracts_col]).sum() / yes_fills[contracts_col].sum() if yes_qty > 0 else 0.0
+        no_avg = (no_fills[price_col] * no_fills[contracts_col]).sum() / no_fills[contracts_col].sum() if no_qty > 0 else 0.0
+        paired_qty = min(yes_qty, no_qty)
+        net_qty = abs(yes_qty - no_qty)
+        net_side = "yes" if yes_qty > no_qty else ("no" if no_qty > yes_qty else "flat")
+        paired_cost = yes_avg + no_avg if paired_qty > 0 else 0.0
+        paired_edge = 100.0 - paired_cost if paired_qty > 0 else 0.0
+        yes_total_cost = yes_avg * yes_qty
+        no_total_cost = no_avg * no_qty
+        profit_if_yes = (yes_qty * 100) - yes_total_cost - no_total_cost
+        profit_if_no = (no_qty * 100) - yes_total_cost - no_total_cost
+        worst_case = min(profit_if_yes, profit_if_no)
+        ledger[ticker] = {
+            "yes_qty": yes_qty, "no_qty": no_qty,
+            "yes_avg_price": round(yes_avg, 2), "no_avg_price": round(no_avg, 2),
+            "paired_qty": paired_qty, "net_qty": net_qty, "net_side": net_side,
+            "paired_cost": round(paired_cost, 2), "paired_edge": round(paired_edge, 2),
+            "yes_total_cost": round(yes_total_cost, 2), "no_total_cost": round(no_total_cost, 2),
+            "profit_if_yes_cents": round(profit_if_yes, 2), "profit_if_no_cents": round(profit_if_no, 2),
+            "worst_case_cents": round(worst_case, 2),
+            "profit_if_yes": round(profit_if_yes / 100, 2),
+            "profit_if_no": round(profit_if_no / 100, 2),
+            "worst_case": round(worst_case / 100, 2),
+            "paired_profit": round(paired_edge * paired_qty / 100, 2),
+        }
+    print(f"  ✓ Built ledger for {len(ledger)} markets")
+    return ledger
+
+
+def print_ledger_summary(ledger):
+    if not ledger:
+        print("  Ledger is empty")
+        return
+    print(f"\n{'='*70}")
+    print("POSITION LEDGER SUMMARY")
+    print(f"{'='*70}")
+    total_paired = sum(v["paired_qty"] for v in ledger.values())
+    total_net = sum(v["net_qty"] for v in ledger.values())
+    total_paired_profit = sum(v["paired_profit"] for v in ledger.values())
+    total_worst_case = sum(v["worst_case"] for v in ledger.values())
+    print(f"  Markets: {len(ledger)} | Paired: {total_paired} | Net: {total_net}")
+    if (total_paired + total_net) > 0:
+        print(f"  Paired ratio: {total_paired/(total_paired+total_net)*100:.1f}%")
+    print(f"  Guaranteed paired profit: ${total_paired_profit:.2f}")
+    print(f"  Worst-case total P&L: ${total_worst_case:.2f}")
+    sorted_by_profit = sorted(ledger.items(), key=lambda x: x[1]["paired_profit"], reverse=True)
+    print(f"\n  TOP 5 BY PAIRED PROFIT:")
+    for ticker, data in sorted_by_profit[:5]:
+        short = ticker[-40:]
+        print(f"    {short:<45} paired={data['paired_qty']} edge={data['paired_edge']:.1f}¢ profit=${data['paired_profit']:.2f}")
+    print(f"{'='*70}\n")
+
+
+def ledger_to_dataframe(ledger):
+    if not ledger:
+        return pd.DataFrame()
+    rows = []
+    for ticker, data in ledger.items():
+        row = {"ticker": ticker, **data}
+        parts = ticker.split("-")
+        if len(parts) >= 3:
+            row["market_code"] = parts[-1]
+            row["event_ticker"] = "-".join(parts[:2])
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("paired_profit", ascending=False).reset_index(drop=True)
+
+
+def integrate_ledger_into_run(exchange_client_ref, bq_client=None, project_id=None,
+                               dataset_id=None, series_ticker=SERIES_TICKER,
+                               use_api=True, use_bq=True, lookback_days=30):
+    print(f"\n{'='*70}")
+    print("BUILDING FILLS-BASED POSITION LEDGER")
+    print(f"{'='*70}")
+    fills_df = pd.DataFrame()
+    if use_api:
+        try:
+            fills_df = fetch_fills_from_api(exchange_client_ref, series_ticker)
+        except Exception as e:
+            print(f"  ⚠️ API failed: {e}")
+    if len(fills_df) == 0 and use_bq and bq_client is not None:
+        try:
+            fills_df = fetch_fills_from_bq(bq_client, project_id, dataset_id, series_ticker, lookback_days)
+        except Exception as e:
+            print(f"  ⚠️ BQ failed: {e}")
+    if len(fills_df) == 0:
+        print("  ⚠️ No fills available")
+        return {}
+    ledger = build_position_ledger(fills_df)
+    print_ledger_summary(ledger)
+    return ledger
+
+# =====================================================================
+# HEDGE-ADJUSTED EV [v4.2-2]
+# =====================================================================
+def calculate_hedge_ev(side, bid_price, ledger_data):
+    if ledger_data is None:
+        return 0.0, False
+    net_side = ledger_data.get("net_side", "flat")
+    net_qty = ledger_data.get("net_qty", 0)
+    if net_qty == 0 or net_side == "flat" or net_side == side:
+        return 0.0, False
+    opposite_avg = ledger_data.get("yes_avg_price", 0.0) if side == "no" else ledger_data.get("no_avg_price", 0.0)
+    if opposite_avg <= 0:
+        return 0.0, False
+    hedge_ev = (100.0 - opposite_avg - bid_price) / 100.0
+    if hedge_ev <= 0:
+        return 0.0, True
+    return hedge_ev, True
+
+# =====================================================================
+# PAIRING MODE [v4.2-3]
+# =====================================================================
+def get_pairing_mode(ticker, ledger, net_position):
+    ledger_data = ledger.get(ticker)
+    net_qty = ledger_data.get("net_qty", 0) if ledger_data else abs(net_position)
+    imbalance_ratio = net_qty / MAX_NET_PER_MARKET if MAX_NET_PER_MARKET > 0 else 0.0
+    if net_qty >= PAIRING_MODE_NET_AGGRESSIVE:
+        return "aggressive_pairing", imbalance_ratio
+    elif net_qty >= PAIRING_MODE_NET_FLOOR:
+        return "pairing", imbalance_ratio
+    return "normal", imbalance_ratio
+
+# =====================================================================
+# SIDE MULTIPLIER OVERRIDE [v4.2-5]
+# =====================================================================
+def get_effective_side_multiplier(base_side_mult, side, pairing_mode, net_side):
+    if pairing_mode == "normal" or net_side == side or net_side == "flat":
+        return base_side_mult
+    if pairing_mode == "aggressive_pairing":
+        return max(base_side_mult, 1.5)
+    elif pairing_mode == "pairing":
+        return max(base_side_mult, 1.0)
+    return base_side_mult
+
+# =====================================================================
+# LEDGER-AWARE POSITION MULTIPLIER [v4.2-6]
+# =====================================================================
+def calculate_ledger_position_multiplier(ticker, side, ledger, fallback_net_position):
+    data = ledger.get(ticker)
+    if data is None:
+        return calculate_position_multiplier(fallback_net_position, side), "no_ledger_data", 0.0
+    paired_qty = data["paired_qty"]
+    net_qty = data["net_qty"]
+    net_side = data["net_side"]
+    side_qty = data["yes_qty"] if side == "yes" else data["no_qty"]
+    if side_qty >= MAX_PAIRED_PER_MARKET:
+        return 0.0, f"hard_cap_{side}_qty={side_qty}", 0.0
+    if net_side == side and net_qty > 0:
+        if net_qty >= MAX_NET_PER_MARKET:
+            return 0.0, f"net_cap_{side}={net_qty}", 0.0
+        elif net_qty >= MAX_NET_PER_MARKET * 0.7:
+            remaining_frac = (MAX_NET_PER_MARKET - net_qty) / (MAX_NET_PER_MARKET * 0.3)
+            return max(0.1, remaining_frac), f"net_rampdown_{side}={net_qty}", 0.0
+        return 1.0, f"net_ok_{side}={net_qty}", 0.0
+    elif net_side != side and net_side != "flat" and net_qty > 0:
+        if net_qty >= PAIRING_MODE_NET_AGGRESSIVE:
+            return 2.0, f"aggressive_pair_boost", 1.5
+        elif net_qty >= PAIRING_MODE_NET_FLOOR:
+            return 1.5, f"pair_boost", 1.0
+        elif net_qty >= int(MAX_NET_PER_MARKET * 0.25):
+            return 1.2, f"mild_pair_boost", 0.8
+        return 1.0, "net_balanced", 0.0
+    if paired_qty > MAX_PAIRED_PER_MARKET * 0.6 and data["paired_edge"] > 3:
+        return 0.6, f"diminishing_returns", 0.0
+    return 1.0, "default", 0.0
+
+def calculate_position_multiplier(net_position, side):
+    abs_pos = abs(net_position)
+    if net_position > 0:
+        if side == 'yes':
+            if abs_pos >= POSITION_STOP_THRESHOLD: return 0.0
+            elif abs_pos >= POSITION_MODERATE_THRESHOLD:
+                return 1.0 - (abs_pos - POSITION_MODERATE_THRESHOLD) / (POSITION_STOP_THRESHOLD - POSITION_MODERATE_THRESHOLD)
+            return 1.0
+        else:
+            if abs_pos >= POSITION_STOP_THRESHOLD: return 2.0
+            elif abs_pos >= POSITION_MODERATE_THRESHOLD:
+                return 1.0 + (abs_pos - POSITION_MODERATE_THRESHOLD) / (POSITION_STOP_THRESHOLD - POSITION_MODERATE_THRESHOLD)
+            return 1.0
+    elif net_position < 0:
+        if side == 'no':
+            if abs_pos >= POSITION_STOP_THRESHOLD: return 0.0
+            elif abs_pos >= POSITION_MODERATE_THRESHOLD:
+                return 1.0 - (abs_pos - POSITION_MODERATE_THRESHOLD) / (POSITION_STOP_THRESHOLD - POSITION_MODERATE_THRESHOLD)
+            return 1.0
+        else:
+            if abs_pos >= POSITION_STOP_THRESHOLD: return 2.0
+            elif abs_pos >= POSITION_MODERATE_THRESHOLD:
+                return 1.0 + (abs_pos - POSITION_MODERATE_THRESHOLD) / (POSITION_STOP_THRESHOLD - POSITION_MODERATE_THRESHOLD)
+            return 1.0
+    return 1.0
+
+# =====================================================================
+# CANCEL ORDERS + GET POSITIONS
+# =====================================================================
+def cancel_all_existing_orders_batch():
+    print(f"\n{'='*70}")
+    print(f"CANCELING ORDERS FOR {SERIES_TICKER}")
+    print(f"{'='*70}")
     try:
+        all_orders = []
+        cursor = None
+        page = 0
         while True:
             page += 1
             params = {"limit": 500}
-            if cursor:
-                params["cursor"] = cursor
-            if page % 10 == 1:
-                print(f"  Fetching fills page {page}...")
-            response = exchange_client.get_fills(**params)
-            batch_fills = response.get('fills', [])
-            for fill in batch_fills:
-                ticker = fill.get('ticker', '')
-                if ticker.startswith(series_ticker):
-                    fills.append(fill)
+            if cursor: params["cursor"] = cursor
+            response = exchange_client.get_orders(**params)
+            batch = response.get('orders', [])
+            all_orders.extend(batch)
             cursor = response.get('cursor')
-            if not cursor:
-                break
-            time.sleep(SLEEP_BETWEEN_CALLS_SEC)
+            if not cursor: break
+        series_orders = [o for o in all_orders if o.get('status') == 'resting' and o.get('ticker', '').startswith(SERIES_TICKER)]
+        print(f"Found {len(series_orders)} resting {SERIES_TICKER} orders to cancel")
+        if len(series_orders) == 0: return 0
+        order_ids = [o['order_id'] for o in series_orders]
+        canceled = 0
+        for i in range(0, len(order_ids), 100):
+            chunk = order_ids[i:i+100]
+            try:
+                if hasattr(exchange_client, 'cancel_orders'):
+                    exchange_client.cancel_orders(order_ids=chunk)
+                    canceled += len(chunk)
+                else:
+                    for oid in chunk:
+                        try: exchange_client.cancel_order(order_id=oid); canceled += 1
+                        except: pass
+                time.sleep(0.1)
+            except:
+                for oid in chunk:
+                    try: exchange_client.cancel_order(order_id=oid); canceled += 1
+                    except: pass
+        print(f"✓ Canceled {canceled}/{len(order_ids)} orders\n")
+        return canceled
     except Exception as e:
-        print(f"Error fetching fills: {e}")
-        import traceback
-        traceback.print_exc()
-    print(f"Retrieved {len(fills)} fills for {series_ticker}")
-    return fills
+        print(f"✗ Error: {e}\n")
+        return 0
 
-# =============================================================================
-# PULL SETTLEMENTS FROM KALSHI API
-# =============================================================================
-def get_all_settlements(series_ticker: str) -> List[Dict[str, Any]]:
-    settlements = []
-    try:
-        statuses_to_try = ['settled', 'closed', None]
-        for status_filter in statuses_to_try:
-            cursor = None
-            page = 0
-            status_name = status_filter or 'all'
-            print(f"  Trying status='{status_name}'...")
-            while True:
-                page += 1
-                params = {"series_ticker": series_ticker, "limit": 200}
-                if status_filter:
-                    params["status"] = status_filter
-                if cursor:
-                    params["cursor"] = cursor
-                if page % 10 == 1:
-                    print(f"    Fetching page {page}...")
-                response = exchange_client.get_markets(**params)
-                markets = response.get('markets', [])
-                for market in markets:
-                    ticker = market.get('ticker')
-                    mstatus = market.get('status')
-                    result = market.get('result')
-                    if result and result not in ('', 'none', None):
-                        if not any(s['market_ticker'] == ticker for s in settlements):
-                            settlements.append({
-                                'market_ticker': ticker,
-                                'event_ticker': market.get('event_ticker'),
-                                'market_status': mstatus,
-                                'result': result,
-                                'settlement_value_yes': 100 if result == 'yes' else 0,
-                                'settlement_value_no': 100 if result == 'no' else 0,
-                                'close_time': market.get('close_time'),
-                                'expiration_time': market.get('expiration_time'),
-                            })
-                cursor = response.get('cursor')
-                if not cursor:
-                    break
-                time.sleep(SLEEP_BETWEEN_CALLS_SEC)
-            if len(settlements) > 0:
-                break
-    except Exception as e:
-        print(f"Error fetching settlements: {e}")
-        import traceback
-        traceback.print_exc()
-    print(f"Retrieved {len(settlements)} settlements for {series_ticker}")
-    return settlements
 
-# =============================================================================
-# BUILD FILLS DATAFRAME WITH LINEAGE
-# =============================================================================
-def build_fills_dataframe(fills: List[Dict[str, Any]], df_orders: pd.DataFrame) -> pd.DataFrame:
-    if len(fills) == 0:
-        return pd.DataFrame()
-
-    df_fills = pd.DataFrame(fills)
-    df_fills['pulled_at'] = datetime.now(UTC).isoformat()
-
-    if 'fill_id' not in df_fills.columns:
-        print("fill_id not found in fills -- deduplication may be incomplete")
-    if 'order_id' not in df_fills.columns:
-        print("order_id not found in fills -- lineage will be incomplete")
-        df_fills['order_id'] = None
-
-    # Normalize Kalshi API field names (API changes periodically)
-    if 'yes_price' not in df_fills.columns:
-        if 'yes_price_dollars' in df_fills.columns:
-            df_fills['yes_price'] = pd.to_numeric(df_fills['yes_price_dollars'], errors='coerce')
-        elif 'yes_price_fixed' in df_fills.columns:
-            df_fills['yes_price'] = pd.to_numeric(df_fills['yes_price_fixed'], errors='coerce')
-
-    df_fills['fill_price'] = df_fills.apply(
-        lambda row: row.get('yes_price') or row.get('no_price') or row.get('price', 0), axis=1)
-
-    # Auto-detect decimal vs cents format
-    fill_prices = pd.to_numeric(df_fills['fill_price'], errors='coerce')
-    if fill_prices.max() <= 1.0:
-        df_fills['fill_price'] = fill_prices * 100
-        print(f"  fill_price converted from decimal to cents")
-
-    if 'ticker' in df_fills.columns and 'market_ticker' not in df_fills.columns:
-        df_fills = df_fills.rename(columns={'ticker': 'market_ticker'})
-    elif 'ticker' in df_fills.columns and 'market_ticker' in df_fills.columns:
-        df_fills = df_fills.drop(columns=['ticker'])
-    elif 'market_ticker' not in df_fills.columns:
-        df_fills['market_ticker'] = None
-
-    if 'action' not in df_fills.columns:
-        df_fills['action'] = 'buy'
-    if 'count_fp' in df_fills.columns and 'filled_count' not in df_fills.columns:
-        df_fills['filled_count'] = pd.to_numeric(df_fills['count_fp'], errors='coerce').astype(int)
-    elif 'count' in df_fills.columns and 'filled_count' not in df_fills.columns:
-        df_fills = df_fills.rename(columns={'count': 'filled_count'})
-    elif 'filled_count' not in df_fills.columns:
-        df_fills['filled_count'] = 0
-
-    if len(df_orders) > 0:
-        df_orders['order_id'] = df_orders['order_id'].astype(str)
-        df_fills['order_id'] = df_fills['order_id'].astype(str)
-        df_fills = df_fills.merge(
-            df_orders[['order_id', 'spread_config', 'pricing_strategy',
-                       'time_multiplier', 'volume_multiplier', 'total_multiplier',
-                       'hours_until_event', 'open_interest', 'base_contracts']],
-            on='order_id', how='left', suffixes=('', '_order'))
-        matched = df_fills['spread_config'].notna().sum()
-        total = len(df_fills)
-        pct = matched / total * 100 if total > 0 else 0
-        print(f"Matched {matched}/{total} fills to orders ({pct:.1f}%)")
-    else:
-        print("No orders available for lineage matching")
-
-    for col in ['spread_config', 'pricing_strategy', 'time_multiplier',
-                'volume_multiplier', 'total_multiplier', 'hours_until_event',
-                'open_interest', 'base_contracts']:
-        if col not in df_fills.columns:
-            df_fills[col] = None
-    return df_fills
-
-# =============================================================================
-# BUILD SETTLEMENTS DATAFRAME WITH P&L
-# =============================================================================
-def build_settlements_dataframe(settlements, df_fills):
-    if len(settlements) == 0:
-        return pd.DataFrame()
-
-    df_settlements = pd.DataFrame(settlements)
-    df_settlements['pulled_at'] = datetime.now(UTC).isoformat()
-
-    print("Deduplicating fills...")
-    fills_before = len(df_fills)
-    if 'fill_id' in df_fills.columns:
-        df_fills_deduped = df_fills.drop_duplicates(subset=['fill_id'], keep='first')
-        print(f"  Using fill_id deduplication")
-    else:
-        df_fills['dedup_key'] = (
-            df_fills['order_id'].astype(str) + '_' + df_fills['market_ticker'].astype(str) + '_' +
-            df_fills['side'].astype(str) + '_' + df_fills['fill_price'].astype(str) + '_' +
-            df_fills['filled_count'].astype(str))
-        df_fills_deduped = df_fills.drop_duplicates(subset=['dedup_key'], keep='first')
-        print(f"  fill_id not found, using composite key")
-    fills_after = len(df_fills_deduped)
-    print(f"  {fills_before} -> {fills_after} (removed {fills_before - fills_after} duplicates)")
-
-    positions = []
-    for _, settlement in df_settlements.iterrows():
-        ticker = settlement['market_ticker']
-        result = settlement['result'].upper() if settlement['result'] else ''
-        market_fills = df_fills_deduped[df_fills_deduped['market_ticker'] == ticker]
-
-        if len(market_fills) == 0:
-            positions.append({
-                'market_ticker': ticker,
-                'position_yes': 0, 'position_no': 0, 'net_position': 0,
-                'total_cost': 0, 'total_payout': 0, 'pnl': 0, 'num_fills': 0,
-            })
-            continue
-
-        yes_fills = market_fills[market_fills['side'] == 'yes']
-        no_fills = market_fills[market_fills['side'] == 'no']
-        position_yes = int(yes_fills['filled_count'].sum())
-        position_no = int(no_fills['filled_count'].sum())
-
-        pnl_cents = 0.0
-        for _, fill in market_fills.iterrows():
-            fp = float(fill['fill_price'])
-            cnt = float(fill['filled_count'])
-            side = fill['side']
-            if side == 'yes' and result == 'YES':
-                pnl_cents += cnt * (100 - fp)
-            elif side == 'yes' and result == 'NO':
-                pnl_cents -= cnt * fp
-            elif side == 'no' and result == 'NO':
-                pnl_cents += cnt * fp
-            elif side == 'no' and result == 'YES':
-                pnl_cents -= cnt * (100 - fp)
-
-        pnl_dollars = pnl_cents / 100.0
-        yes_cost = (yes_fills['fill_price'] * yes_fills['filled_count']).sum() / 100.0
-        no_cost = 0.0
-        if len(no_fills) > 0:
-            no_cost = ((100 - no_fills['fill_price']) * no_fills['filled_count']).sum() / 100.0
-        total_cost = yes_cost + no_cost
-
-        if result == 'YES':
-            total_payout = position_yes * 1.0
-        elif result == 'NO':
-            total_payout = position_no * 1.0
-        else:
-            total_payout = 0
-
-        positions.append({
-            'market_ticker': ticker,
-            'position_yes': position_yes, 'position_no': position_no,
-            'net_position': position_yes - position_no,
-            'total_cost': round(total_cost, 2), 'total_payout': round(total_payout, 2),
-            'pnl': round(pnl_dollars, 2), 'num_fills': len(market_fills),
-        })
-
-    df_positions = pd.DataFrame(positions)
-    df_settlements = df_settlements.merge(df_positions, on='market_ticker', how='left')
-    df_settlements['result'] = df_settlements['result'].str.upper()
-
-    print("Parsing market tickers...")
-    ticker_parts = df_settlements['market_ticker'].apply(split_market_ticker)
-    ticker_df = pd.DataFrame(ticker_parts.tolist())
-    df_settlements = pd.concat([df_settlements, ticker_df], axis=1)
-    return df_settlements
-
-# =============================================================================
-# BIGQUERY UPLOAD
-# =============================================================================
-def df_to_bq(df, table_name, write_disposition="WRITE_TRUNCATE"):
-    if bq_client is None:
-        print(f"Skipping {table_name} -- no BigQuery client")
-        return
-    if len(df) == 0:
-        print(f"Skipping {table_name} -- no data")
-        return
-
-    df_clean = df.copy()
-    df_clean = df_clean.loc[:, ~df_clean.columns.duplicated()]
-
-    for col in df_clean.columns:
-        if len(df_clean) > 0:
-            first_valid = df_clean[col].dropna().iloc[0] if len(df_clean[col].dropna()) > 0 else None
-            if first_valid is not None and isinstance(first_valid, (list, dict)):
-                df_clean[col] = df_clean[col].apply(lambda x: str(x) if x is not None else None)
-
-    for col in df_clean.columns:
-        if pd.api.types.is_object_dtype(df_clean[col]):
-            df_clean[col] = df_clean[col].astype(str).replace('nan', None).replace('None', None)
-
-    df_clean = df_clean.where(pd.notna(df_clean), None)
-
-    table_id = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
-    job_config = bigquery.LoadJobConfig(write_disposition=write_disposition, autodetect=True)
-
-    try:
-        job = bq_client.load_table_from_dataframe(df_clean, table_id, job_config=job_config)
-        job.result()
-        table = bq_client.get_table(table_id)
-        print(f"Loaded {table_id}: {table.num_rows} rows")
-    except Exception as e:
-        print(f"Error loading {table_id}: {e}")
-        import traceback
-        traceback.print_exc()
-
-# =============================================================================
-# MAIN MONITORING FUNCTION
-# =============================================================================
-def run_monitoring(series_ticker, upload_to_bq=True):
+def get_existing_positions():
     print(f"\n{'='*70}")
-    print(f"MONITORING: {series_ticker}")
-    print(f"Time: {datetime.now(UTC).isoformat()}")
+    print(f"CHECKING EXISTING POSITIONS FOR {SERIES_TICKER}")
+    print(f"{'='*70}")
+    try:
+        all_positions_raw = []
+        cursor = None
+        page = 0
+        while True:
+            page += 1
+            params = {"limit": 1000}
+            if cursor: params["cursor"] = cursor
+            response = exchange_client.get_positions(**params)
+            batch = response.get('market_positions', [])
+            all_positions_raw.extend(batch)
+            cursor = response.get('cursor')
+            if not cursor: break
+            time.sleep(0.05)
+        positions = {}
+        for pos in all_positions_raw:
+            ticker = pos.get('ticker', '')
+            if not ticker.startswith(SERIES_TICKER): continue
+            net_position = pos.get('position', 0) or 0
+            if net_position == 0: continue
+            positions[ticker] = {'net_position': net_position}
+        if positions:
+            total_net = sum(abs(p['net_position']) for p in positions.values())
+            print(f"✓ {len(positions)} markets with positions, {total_net} total net exposure")
+        else:
+            print("  No non-zero positions found")
+        print()
+        return positions, True
+    except Exception as e:
+        print(f"⚠️  Error: {e}")
+        print(f"  ⚠️  SAFE MODE — {SAFE_MODE_MULTIPLIER:.0%} sizing\n")
+        return {}, False
+
+# =====================================================================
+# UTILITY HELPERS + PRICING
+# =====================================================================
+def cents_from_rate(rate):
+    if rate is None or pd.isna(rate): raise ValueError("rate is NaN")
+    return int(round(float(rate) * 100))
+
+def get_market_details(market_ticker):
+    try:
+        resp = exchange_client.get_market(ticker=market_ticker)
+        md = resp.get('market', {})
+        close_time = md.get('close_time')
+        expiration_ts = None
+        if close_time:
+            ts = close_time
+            if ts.endswith('Z'): ts = ts[:-1] + '+00:00'
+            dt = datetime.fromisoformat(ts)
+            close_unix = int(dt.timestamp())
+            expiration_ts = close_unix - (EXPIRATION_HOURS_BEFORE_CLOSE * 3600)
+            if expiration_ts <= time.time(): expiration_ts = None
+        return expiration_ts, md.get('open_interest', 0), md.get('volume', 0)
+    except: return None, None, None
+
+def get_time_multiplier(hours):
+    for threshold, mult in TIME_MULTIPLIERS:
+        if hours < threshold: return mult
+    return 0.5
+
+def get_volume_multiplier(oi):
+    for threshold, mult in VOLUME_MULTIPLIERS:
+        if oi >= threshold: return mult
+    return 0.4
+
+def get_offsets_for_spread(spread_cents):
+    """[v4.3] Select spread config based on spread width. Returns (yes_offsets, no_offsets, config_name)."""
+    if spread_cents < 5:
+        name = "tight"
+    elif spread_cents < 15:
+        name = "medium"
+    else:
+        name = "wide"
+    offsets = SPREAD_CONFIGS[name]
+    return offsets, offsets, name
+
+def calculate_spread(yes_bid, no_bid):
+    return 100 - (yes_bid + no_bid)
+
+def parse_orderbook(orderbook_data):
+    if not orderbook_data: return None, None
+    best_bid = max(level[0] for level in orderbook_data)
+    idx = next(i for i, level in enumerate(orderbook_data) if level[0] == best_bid)
+    return best_bid, orderbook_data[idx][1]
+
+# BAYESIAN HYBRID PRICING
+def calculate_hybrid_price_bayesian(market_mid, market_yes_rate, market_sample_size,
+                                     team_1_yes_rate, team_1_sample_size,
+                                     team_2_yes_rate, team_2_sample_size):
+    intermediates = {}
+    market_mid_rate = market_mid / 100
+    if market_yes_rate is None or pd.isna(market_yes_rate):
+        return market_mid_rate, {"fallback": "no_market_yes_rate"}
+    team_rates, team_weights = [], []
+    if team_1_sample_size > 0 and team_1_yes_rate is not None and not pd.isna(team_1_yes_rate):
+        team_rates.append(team_1_yes_rate); team_weights.append(team_1_sample_size)
+    if team_2_sample_size > 0 and team_2_yes_rate is not None and not pd.isna(team_2_yes_rate):
+        team_rates.append(team_2_yes_rate); team_weights.append(team_2_sample_size)
+    if team_rates:
+        ttw = sum(team_weights)
+        avg_team = sum(r*w for r,w in zip(team_rates, team_weights))/ttw
+        combined_n = ttw
+    else:
+        avg_team = market_yes_rate; combined_n = 0
+    cred = min(combined_n / BAYESIAN_K, 1.0) if combined_n > 0 else 0.0
+    posterior = (1-cred)*market_yes_rate + cred*avg_team if combined_n > 0 else market_yes_rate
+    n = max(market_sample_size, 0)
+    recency = 2 ** (-n / BAYESIAN_RECENCY_HALFLIFE_GAMES)
+    hw = BAYESIAN_HISTORICAL_WEIGHT * (1.0 - 0.5*(1.0-recency))
+    mw = BAYESIAN_MARKET_WEIGHT
+    tw = mw + hw; mw /= tw; hw /= tw
+    hybrid_yes = mw * market_mid_rate + hw * posterior
+    return hybrid_yes, intermediates
+
+def calculate_bid_price(market_mid_yes, market_yes_rate, team_1_yes_rate, team_1_sample_size,
+                        team_2_yes_rate, team_2_sample_size, market_sample_size, strategy):
+    if strategy == 'hybrid':
+        if market_mid_yes is None:
+            if market_yes_rate is None or pd.isna(market_yes_rate): return None, None, {}
+            yp = cents_from_rate(market_yes_rate)
+            return yp, 100-yp, {"fallback": "no_orderbook"}
+        hyb, inter = calculate_hybrid_price_bayesian(
+            market_mid_yes, market_yes_rate, market_sample_size,
+            team_1_yes_rate, team_1_sample_size, team_2_yes_rate, team_2_sample_size)
+        yp = int(hyb * 100)
+        return yp, 100-yp, inter
+    elif strategy == 'market':
+        if market_mid_yes is not None:
+            yp = int(round(market_mid_yes))
+            return yp, 100-yp, {}
+        return None, None, {}
+    elif strategy == 'historical':
+        if market_yes_rate is None or pd.isna(market_yes_rate): return None, None, {}
+        yp = cents_from_rate(market_yes_rate)
+        return yp, 100-yp, {}
+    raise ValueError(f"Unknown strategy: {strategy}")
+
+market_snapshots = []
+
+# =====================================================================
+# BUILD ORDERS — v4.2-NCAAB with team overrides [NCAAB-7]
+# =====================================================================
+
+def build_order_objects_for_market(market_row, existing_positions, event_net_exposure,
+                                    event_orders_placed, safe_mode, ledger):
+    ticker = market_row.get("market_ticker")
+    market_status = market_row.get("market_status")
+    market_yes_rate = market_row.get("market_yes_rate")
+    market_sample_size = market_row.get("market_sample_size", 0)
+    team_1_yes_rate = market_row.get("team_1_yes_rate")
+    team_1_sample_size = market_row.get("team_1_sample_size", 0)
+    team_2_yes_rate = market_row.get("team_2_yes_rate")
+    team_2_sample_size = market_row.get("team_2_sample_size", 0)
+    event_ticker = market_row.get("event_ticker")
+    ticker_part_3_market_code = market_row.get("ticker_part_3_market_code")
+    team_1 = market_row.get("team_1")
+    team_2 = market_row.get("team_2")
+
+    # [v4.3] Tier-specific market cap
+    effective_max_net = MAX_NET_PER_MARKET if ticker_part_3_market_code in TIER1_MARKETS else TIER2_MAX_NET
+
+    if market_status != "active":
+        return []
+
+    # [v4-3] Base side multipliers
+    side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, {"yes": 1.0, "no": 1.0})
+    yes_side_mult_base = side_config.get("yes", 1.0)
+    no_side_mult_base = side_config.get("no", 1.0)
+
+    # ================================================================
+    # [NCAAB-7] TEAM-SPECIFIC OVERRIDES — applied BEFORE blocking check
+    # ================================================================
+    team_yes, team_no, override_applied, override_reason = apply_team_overrides(
+        market_code=ticker_part_3_market_code,
+        team_1=team_1 or "", team_2=team_2 or "",
+        base_yes_mult=yes_side_mult_base, base_no_mult=no_side_mult_base,
+    )
+    if override_applied:
+        print(f"    🏀 [NCAAB-7] Team override: {override_reason}")
+        print(f"       Base: Y={yes_side_mult_base}x N={no_side_mult_base}x → Override: Y={team_yes}x N={team_no}x")
+        yes_side_mult_base = team_yes
+        no_side_mult_base = team_no
+
+    # [P2] Game-level risk multiplier based on teams playing
+    game_risk = 1.0
+    for team in [team_1 or "", team_2 or ""]:
+        if team in TEAM_RISK_MULTIPLIER:
+            game_risk = min(game_risk, TEAM_RISK_MULTIPLIER[team])
+    if game_risk != 1.0:
+        yes_side_mult_base *= game_risk
+        no_side_mult_base *= game_risk
+        print(f"    🎯 [P2] Game risk multiplier: {game_risk:.1f}x (teams: {team_1}, {team_2})")
+
+    if yes_side_mult_base == 0.0 and no_side_mult_base == 0.0:
+        reason = f"team override ({override_reason})" if override_applied else "config"
+        print(f"    ⛔ BOTH SIDES 0x for {ticker_part_3_market_code} — skipping ({reason})")
+        return []
+
+    # Pairing mode
+    position_data = existing_positions.get(ticker, {'net_position': 0})
+    net_position = position_data['net_position']
+    ledger_data = ledger.get(ticker)
+    pairing_mode_str, imbalance_ratio = get_pairing_mode(ticker, ledger, net_position)
+    net_side = ledger_data.get("net_side", "flat") if ledger_data else ("yes" if net_position > 0 else ("no" if net_position < 0 else "flat"))
+
+    if pairing_mode_str != "normal":
+        print(f"    🔄 PAIRING: {pairing_mode_str.upper()} (imbalance: {imbalance_ratio:.0%}, net: {net_side})")
+
+    # Side multiplier overrides
+    yes_side_mult = yes_side_mult_base
+    no_side_mult = no_side_mult_base
+
+    # Market details
+    expiration_ts, open_interest, volume = get_market_details(ticker)
+    if expiration_ts is None:
+        print(f"    ✗ No expiration — skipping")
+        return []
+    hours_until_event = (expiration_ts - time.time()) / 3600.0
+
+    if open_interest is None: open_interest = 0
+    if volume is None: volume = 0
+
+    # Ledger position multipliers
+    yes_side_mult_floor, no_side_mult_floor = 0.0, 0.0
+    if ledger:
+        yes_position_mult, yes_pos_reason, yes_side_mult_floor = calculate_ledger_position_multiplier(ticker, 'yes', ledger, net_position)
+        no_position_mult, no_pos_reason, no_side_mult_floor = calculate_ledger_position_multiplier(ticker, 'no', ledger, net_position)
+    else:
+        yes_position_mult = calculate_position_multiplier(net_position, 'yes')
+        no_position_mult = calculate_position_multiplier(net_position, 'no')
+
+    # Apply floors
+    if yes_side_mult_floor > 0 and yes_side_mult < yes_side_mult_floor:
+        yes_side_mult = yes_side_mult_floor
+    if no_side_mult_floor > 0 and no_side_mult < no_side_mult_floor:
+        no_side_mult = no_side_mult_floor
+    yes_side_mult = get_effective_side_multiplier(yes_side_mult, "yes", pairing_mode_str, net_side)
+    no_side_mult = get_effective_side_multiplier(no_side_mult, "no", pairing_mode_str, net_side)
+
+    net_room_yes = effective_max_net - net_position
+    net_room_no = effective_max_net + net_position
+    time_mult = get_time_multiplier(hours_until_event)
+    volume_mult = get_volume_multiplier(open_interest)
+    base_mult = time_mult * volume_mult
+    safe_mult = SAFE_MODE_MULTIPLIER if safe_mode else 1.0
+    yes_total_mult = base_mult * yes_position_mult * yes_side_mult * safe_mult
+    no_total_mult = base_mult * no_position_mult * no_side_mult * safe_mult
+
+    print(f"    Time: {hours_until_event:.1f}h ({time_mult:.2f}x) | OI: {open_interest} ({volume_mult:.2f}x)")
+
+    # Orderbook
+    orderbook_yes_bid, yes_bid_size, orderbook_no_bid, no_bid_size = None, None, None, None
+    try:
+        ob_resp = exchange_client.get_orderbook(ticker=ticker, depth=10)
+        ob = ob_resp.get('orderbook', ob_resp)
+        yes_data, no_data = ob.get('yes', []), ob.get('no', [])
+        if yes_data: orderbook_yes_bid, yes_bid_size = parse_orderbook(yes_data)
+        if no_data: orderbook_no_bid, no_bid_size = parse_orderbook(no_data)
+    except: pass
+
+    # Mid-price anchor
+    market_mid_yes = None
+    if orderbook_yes_bid is not None and orderbook_no_bid is not None:
+        market_mid_yes = (orderbook_yes_bid + (100 - orderbook_no_bid)) / 2.0
+    elif orderbook_yes_bid is not None: market_mid_yes = float(orderbook_yes_bid)
+    elif orderbook_no_bid is not None: market_mid_yes = 100.0 - orderbook_no_bid
+
+    # Fair value
+    yes_fair, no_fair, bayesian_inter = calculate_bid_price(
+        market_mid_yes, market_yes_rate, team_1_yes_rate, team_1_sample_size,
+        team_2_yes_rate, team_2_sample_size, market_sample_size, PRICING_STRATEGY)
+
+    if yes_fair is None and market_yes_rate is not None and not pd.isna(market_yes_rate):
+        yes_fair = cents_from_rate(market_yes_rate)
+        no_fair = 100 - yes_fair
+    if yes_fair is None or no_fair is None:
+        print(f"    ✗ No data — skipping")
+        return []
+    p_hat = yes_fair / 100.0
+
+    print(f"    Fair: YES={yes_fair}¢ NO={no_fair}¢ | Mults: YES={yes_total_mult:.2f}x NO={no_total_mult:.2f}x")
+
+    # Price floors (pairing mode conditional)
+    if pairing_mode_str == "aggressive_pairing":
+        act_min_yes, act_min_no, act_yes_min = HEDGE_MIN_PRICE_YES, HEDGE_MIN_PRICE_NO, HEDGE_YES_MIN_PRICE
+    elif pairing_mode_str == "pairing":
+        act_min_yes = (MIN_PRICE_YES + HEDGE_MIN_PRICE_YES) // 2
+        act_min_no = (MIN_PRICE_NO + HEDGE_MIN_PRICE_NO) // 2
+        act_yes_min = (YES_MIN_PRICE + HEDGE_YES_MIN_PRICE) // 2
+    else:
+        act_min_yes, act_min_no, act_yes_min = MIN_PRICE_YES, MIN_PRICE_NO, YES_MIN_PRICE
+
+    # Probability floor
+    if yes_fair < YES_PROBABILITY_FLOOR and yes_side_mult > 0:
+        if pairing_mode_str != "normal" and net_side == "no":
+            pass  # bypass for hedge
+        else:
+            yes_side_mult = 0.0; yes_total_mult = 0.0
+
+    # Spread + offsets
+    spread_cents = calculate_spread(orderbook_yes_bid or yes_fair, orderbook_no_bid or no_fair)
+    yes_offsets, no_offsets, spread_config_name = get_offsets_for_spread(spread_cents)
+    # [v4.3] Tier 1 markets get tight spreads (more fills, 20+¢ edge buffer)
+    if ticker_part_3_market_code in TIER1_MARKETS:
+        if TIER1_SPREAD_OVERRIDE in SPREAD_CONFIGS:
+            offsets = SPREAD_CONFIGS[TIER1_SPREAD_OVERRIDE]
+            yes_offsets = offsets
+            no_offsets = offsets
+            spread_config_name = TIER1_SPREAD_OVERRIDE + "_tier1"
+    if pairing_mode_str != "normal" and net_side != "flat":
+        if net_side == "yes": no_offsets = PAIRING_OFFSETS['no']; spread_config_name += "+pair_no"
+        elif net_side == "no": yes_offsets = PAIRING_OFFSETS['yes']; spread_config_name += "+pair_yes"
+
+    # Event caps
+    evt = event_ticker or ""
+    current_event_orders = event_orders_placed.get(evt, 0)
+    event_orders_remaining = MAX_ORDERS_PER_EVENT - current_event_orders
+    if event_orders_remaining <= 0:
+        print(f"    ⛔ Event cap reached — skipping")
+        return []
+
+    market_snapshots.append({"market_ticker": ticker, "run_id": RUN_ID, "model_version": MODEL_VERSION,
+        "yes_fair": yes_fair, "no_fair": no_fair, "pairing_mode": pairing_mode_str})
+
+    orders = []
+
+    # === YES LIMIT ORDERS ===
+    max_yes_price = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else MAX_PRICE
+    yes_placed = 0
+    if yes_total_mult > 0:
+        for i, offset in enumerate(yes_offsets):
+            if i >= len(BASE_YES_CONTRACTS): break
+            bid = yes_fair - offset
+            if bid > max_yes_price or bid < act_min_yes or bid > MAX_PRICE or bid < act_yes_min: continue
+            standalone_ev = p_hat - (bid / 100.0)
+            hedge_ev, is_pairing = calculate_hedge_ev("yes", bid, ledger_data)
+            effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
+            if effective_ev < MIN_EV_PER_ORDER: continue
+            base_c = BASE_YES_CONTRACTS[i]
+            scaled = int(base_c * yes_total_mult)
+            # [P0] Game-level dampener
+            game_contracts_so_far = event_orders_placed.get(evt, 0)
+            dampener = 1.0 / (1 + game_contracts_so_far / 200)
+            scaled = int(scaled * dampener)
+            max_here = min(scaled, MAX_CONTRACTS_PER_ORDER, max(0, net_room_yes - yes_placed), max(0, event_orders_remaining - yes_placed))
+            if max_here < 1: continue
+            yes_placed += max_here
+            orders.append({
+                "ticker": ticker, "action": "buy", "side": "yes", "count": max_here,
+                "type": "limit", "yes_price": bid, "no_price": None,
+                "expiration_ts": expiration_ts, "post_only": True,
+                "client_order_id": str(uuid.uuid4()),
+                "run_id": RUN_ID, "model_version": MODEL_VERSION,
+                "spread_config": spread_config_name, "spread_cents": spread_cents,
+                "time_multiplier": time_mult, "volume_multiplier": volume_mult,
+                "position_multiplier": yes_position_mult, "side_multiplier": yes_side_mult,
+                "boost_multiplier": yes_side_mult, "total_multiplier": yes_total_mult,
+                "base_contracts": base_c, "hours_until_event": hours_until_event,
+                "open_interest": open_interest, "net_position": net_position,
+                "ev": round(effective_ev, 4), "standalone_ev": round(standalone_ev, 4),
+                "hedge_ev": round(hedge_ev, 4) if is_pairing else None,
+                "is_pairing_order": is_pairing, "pairing_mode": pairing_mode_str,
+                "p_hat": round(p_hat, 4), "pricing_strategy": PRICING_STRATEGY,
+                "safe_mode": safe_mode, "event_ticker": event_ticker,
+            })
+
+    # === NO LIMIT ORDERS ===
+    max_no_price = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else MAX_PRICE
+    no_placed = 0
+    if no_total_mult > 0:
+        for i, offset in enumerate(no_offsets):
+            if i >= len(BASE_NO_CONTRACTS): break
+            bid = no_fair - offset
+            if bid > max_no_price or bid < act_min_no or bid > MAX_PRICE: continue
+            implied_yes = 100 - bid
+            if implied_yes < NO_MIN_YES_PRICE or implied_yes > NO_MAX_YES_PRICE: continue
+            # [v4.3] Dead zone REMOVED — not stat sig (p=0.687). Kelly+dampener protect.
+            standalone_ev = (1.0 - p_hat) - (bid / 100.0)
+            hedge_ev, is_pairing = calculate_hedge_ev("no", bid, ledger_data)
+            effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
+            if effective_ev < MIN_EV_PER_ORDER: continue
+            # [P0] Kelly gate: reject if implied Kelly < 2%
+            if bid < 100:
+                implied_kelly = ((1 - p_hat) - (bid / 100)) / (1 - bid / 100)
+                if implied_kelly < 0.02: continue
+            base_c = BASE_NO_CONTRACTS[i]
+            scaled = int(base_c * no_total_mult)
+            # [P0] Game-level dampener: reduce fills as game exposure grows
+            game_contracts_so_far = event_orders_placed.get(evt, 0)
+            dampener = 1.0 / (1 + game_contracts_so_far / 200)
+            scaled = int(scaled * dampener)
+            sweet_applied = False
+            if NO_SWEET_SPOT_MIN <= bid <= NO_SWEET_SPOT_MAX:
+                # [NCAAB-FIX] Cap so side_mult × sweet doesn't exceed MAX_COMBINED_SWEET_BOOST
+                effective_sweet = min(NO_SWEET_SPOT_MULTIPLIER, MAX_COMBINED_SWEET_BOOST / max(no_side_mult, 0.1))
+                scaled = int(scaled * effective_sweet); sweet_applied = True
+            max_here = min(scaled, MAX_CONTRACTS_PER_ORDER, max(0, net_room_no - no_placed),
+                          max(0, event_orders_remaining - yes_placed - no_placed))
+            if max_here < 1: continue
+            no_placed += max_here
+            orders.append({
+                "ticker": ticker, "action": "buy", "side": "no", "count": max_here,
+                "type": "limit", "yes_price": None, "no_price": bid,
+                "expiration_ts": expiration_ts, "post_only": True,
+                "client_order_id": str(uuid.uuid4()),
+                "run_id": RUN_ID, "model_version": MODEL_VERSION,
+                "spread_config": spread_config_name, "spread_cents": spread_cents,
+                "time_multiplier": time_mult, "volume_multiplier": volume_mult,
+                "position_multiplier": no_position_mult, "side_multiplier": no_side_mult,
+                "boost_multiplier": no_side_mult, "total_multiplier": no_total_mult,
+                "sweet_spot_applied": sweet_applied, "base_contracts": base_c,
+                "hours_until_event": hours_until_event, "open_interest": open_interest,
+                "net_position": net_position,
+                "ev": round(effective_ev, 4), "standalone_ev": round(standalone_ev, 4),
+                "hedge_ev": round(hedge_ev, 4) if is_pairing else None,
+                "is_pairing_order": is_pairing, "pairing_mode": pairing_mode_str,
+                "p_hat": round(p_hat, 4), "pricing_strategy": PRICING_STRATEGY,
+                "safe_mode": safe_mode, "event_ticker": event_ticker,
+            })
+
+    if yes_placed > 0: print(f"    → YES: {yes_placed} contracts")
+    if no_placed > 0: print(f"    → NO:  {no_placed} contracts")
+    if yes_placed == 0 and no_placed == 0: print(f"    → No orders passed filters")
+
+    evt = event_ticker or ""
+    event_orders_placed[evt] = event_orders_placed.get(evt, 0) + yes_placed + no_placed
+    event_net_exposure[evt] = event_net_exposure.get(evt, 0) + abs(yes_placed - no_placed)
+    return orders
+
+# =====================================================================
+# SUBMIT ORDERS + MAIN RUNNER
+# =====================================================================
+def submit_orders_sequential(orders):
+    results = []
+    total = len(orders)
+    print(f"Submitting {total} orders...")
+    start = time.time()
+    for i, op in enumerate(orders):
+        if i % 50 == 0 and i > 0:
+            elapsed = time.time() - start
+            print(f"  Progress: {i}/{total} ({i*100//total}%)")
+        metadata = {k: op.pop(k) for k in [
+            "run_id","model_version","spread_config","spread_cents","time_multiplier",
+            "volume_multiplier","position_multiplier","side_multiplier","boost_multiplier",
+            "total_multiplier","base_contracts","hours_until_event","open_interest",
+            "net_position","ev","standalone_ev","hedge_ev","is_pairing_order","pairing_mode",
+            "p_hat","pricing_strategy","safe_mode","event_ticker",
+        ] if k in op}
+        metadata["sweet_spot_applied"] = op.pop("sweet_spot_applied", False)
+        ts = datetime.now(UTC).isoformat()
+        try:
+            response = exchange_client.create_order(**op)
+            results.append({"ok": True, "ticker": op["ticker"], "side": op["side"],
+                "price": op.get("yes_price") or op.get("no_price"), "contracts": op["count"],
+                "order_id": response.get("order",{}).get("order_id"),
+                "error": None, "created_at": ts, **metadata})
+        except Exception as e:
+            results.append({"ok": False, "ticker": op["ticker"], "side": op["side"],
+                "price": op.get("yes_price") or op.get("no_price"), "contracts": op["count"],
+                "error": str(e), "order_id": None, "created_at": ts, **metadata})
+        time.sleep(SLEEP_BETWEEN_ORDERS)
+    elapsed = time.time() - start
+    print(f"✓ Completed in {elapsed:.1f}s\n")
+    return results
+
+
+def place_orders_from_df(df_results):
+    cancel_all_existing_orders_batch()
+    existing_positions, positions_reliable = get_existing_positions()
+    safe_mode = not positions_reliable
+
+    # Build ledger
+    try:
+        bq_ref = client if 'client' in dir() else None
+        proj_ref = PROJECT_ID if 'PROJECT_ID' in dir() else None
+        ds_ref = DATASET_ID if 'DATASET_ID' in dir() else None
+    except:
+        bq_ref, proj_ref, ds_ref = None, None, None
+
+    ledger = integrate_ledger_into_run(
+        exchange_client, bq_ref, proj_ref, ds_ref, SERIES_TICKER, True, bq_ref is not None, 30)
+
+    all_orders = []
+    event_net_exposure = {}
+    for ticker, pos_data in existing_positions.items():
+        parts = ticker.split("-")
+        evt = "-".join(parts[:2]) if len(parts) >= 2 else ticker
+        event_net_exposure[evt] = event_net_exposure.get(evt, 0) + abs(pos_data['net_position'])
+    event_orders_placed = {}
+
+    # Merge with historical data
+    if 'df_summary' in globals() and len(df_summary) > 0:
+        summary_data = df_summary[['ticker_part_3_market_code','yes_rate','count_occurrences']].copy()
+        summary_data = summary_data.rename(columns={'yes_rate':'market_yes_rate','count_occurrences':'market_sample_size'})
+        df_merged = df_results.merge(summary_data, on='ticker_part_3_market_code', how='left')
+    else:
+        df_merged = df_results.copy()
+        df_merged['market_yes_rate'] = None; df_merged['market_sample_size'] = 0
+
+    if 'df_summary_rolling_by_team' in globals() and len(df_summary_rolling_by_team) > 0:
+        team_latest = (
+            df_summary_rolling_by_team
+            .sort_values(['ticker_part_3_market_code','team','event_date'], ascending=[True,True,False])
+            .groupby(['ticker_part_3_market_code','team'], as_index=False).first()
+            [['ticker_part_3_market_code','team','yes_rate_rolling','count_occurrences_rolling']]
+        )
+        t1 = team_latest.copy().rename(columns={'team':'team_1','yes_rate_rolling':'team_1_yes_rate','count_occurrences_rolling':'team_1_sample_size'})
+        t2 = team_latest.copy().rename(columns={'team':'team_2','yes_rate_rolling':'team_2_yes_rate','count_occurrences_rolling':'team_2_sample_size'})
+        df_merged = df_merged.merge(t1, on=['ticker_part_3_market_code','team_1'], how='left')
+        df_merged = df_merged.merge(t2, on=['ticker_part_3_market_code','team_2'], how='left')
+    else:
+        df_merged['team_1_yes_rate'] = None; df_merged['team_1_sample_size'] = 0
+        df_merged['team_2_yes_rate'] = None; df_merged['team_2_sample_size'] = 0
+
+    for _, row in df_merged.iterrows():
+        if row.get("market_status") != "active": continue
+        print(f"\n{row.get('market_ticker')}:")
+        orders = build_order_objects_for_market(row.to_dict(), existing_positions,
+            event_net_exposure, event_orders_placed, safe_mode, ledger)
+        all_orders.extend(orders)
+
+    print(f"\n{'='*70}")
+    print(f"PREPARED {len(all_orders)} POST-ONLY LIMIT ORDERS ({MODEL_VERSION})")
     print(f"{'='*70}\n")
 
-    print("Step 1: Loading orders from BigQuery...")
-    df_orders = load_orders_from_bigquery(series_ticker)
+    if len(all_orders) == 0:
+        print("No orders to place.")
+        return pd.DataFrame(), pd.DataFrame(), ledger
 
-    print("\nStep 2: Pulling fills from Kalshi API...")
-    fills = get_all_fills(series_ticker)
+    results = submit_orders_sequential(all_orders)
+    global df_orders, df_market_snapshot_signals
+    df_orders = pd.DataFrame(results)
+    df_market_snapshot_signals = pd.DataFrame(market_snapshots)
 
-    print("\nStep 3: Pulling settlements from Kalshi API...")
-    settlements = get_all_settlements(series_ticker)
+    success = sum(1 for r in results if r["ok"])
+    failed = len(results) - success
+    print(f"RESULTS: {success} successful, {failed} failed")
 
-    print("\nStep 4: Building df_fills with lineage...")
-    df_fills = build_fills_dataframe(fills, df_orders)
+    if success > 0:
+        ok = df_orders[df_orders['ok']==True]
+        print(f"  Total contracts: {ok['contracts'].sum()}")
+        for side, grp in ok.groupby('side'):
+            print(f"  {side.upper()}: {len(grp)} orders, {grp['contracts'].sum()} contracts, avg {grp['price'].mean():.0f}¢")
 
-    print("\nStep 5: Building df_settlements with P&L...")
-    df_settlements = build_settlements_dataframe(settlements, df_fills)
+    return df_orders, df_market_snapshot_signals, ledger
 
-    if upload_to_bq:
-        print("\nStep 6: Uploading to BigQuery...")
-        df_to_bq(df_fills, f"{series_ticker}_fills", write_disposition="WRITE_TRUNCATE")
-        df_to_bq(df_settlements, f"{series_ticker}_settlements", write_disposition="WRITE_TRUNCATE")
-
-    print(f"\n{'='*70}")
-    print(f"MONITORING COMPLETE")
-    print(f"{'='*70}")
-    print(f"df_fills: {len(df_fills)} rows")
-    print(f"df_settlements: {len(df_settlements)} rows")
-
-    if len(df_fills) > 0:
-        print(f"\nFills summary:")
-        print(f"  Total filled contracts: {df_fills['filled_count'].sum()}")
-        print(f"  Unique markets: {df_fills['market_ticker'].nunique()}")
-        if 'spread_config' in df_fills.columns:
-            matched = df_fills['spread_config'].notna().sum()
-            total = len(df_fills)
-            pct = matched / total * 100 if total > 0 else 0
-            print(f"  Fills with lineage: {matched} ({pct:.1f}%)")
-
-    if len(df_settlements) > 0:
-        total_pnl = df_settlements['pnl'].sum()
-        winners = (df_settlements['pnl'] > 0).sum()
-        losers = (df_settlements['pnl'] < 0).sum()
-        breakeven = (df_settlements['pnl'] == 0).sum()
-        print(f"\nSettlements summary:")
-        print(f"  Total P&L: ${total_pnl:,.2f}")
-        print(f"  Winners: {winners} | Losers: {losers} | Break-even: {breakeven}")
-
-    print(f"\n{'='*70}\n")
-    return df_fills, df_settlements
-
-# =============================================================================
+# =====================================================================
 # RUN
-# =============================================================================
-df_fills, df_settlements = run_monitoring(SERIES_TICKER, upload_to_bq=True)
-print("Monitoring run complete")
+# =====================================================================
+print("\nValidating df_results...")
+to_trade = df_results[df_results["market_status"] == "active"]
+print(f"Active markets: {len(to_trade)}")
+
+if len(to_trade) == 0:
+    df_orders = pd.DataFrame()
+    df_market_snapshot_signals = pd.DataFrame()
+    position_ledger = {}
+else:
+    df_orders, df_market_snapshot_signals, position_ledger = place_orders_from_df(df_results)
+
+# =====================================================================
+# UPLOAD TO BIGQUERY
+# =====================================================================
+if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+    try:
+        from google.colab import auth
+        auth.authenticate_user()
+    except ImportError:
+        pass
+
+PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
+DATASET_ID = os.environ.get("GCP_DATASET_ID", "Kalshi")
+client = bigquery.Client(project=PROJECT_ID)
+
+df_results["yes_rate"] = pd.to_numeric(df_results["yes_rate"].replace("", np.nan), errors="coerce").infer_objects(copy=False)
+for c in df_results.columns:
+    if c != "yes_rate": df_results[c] = df_results[c].astype("string")
+for col in ["event_date"]:
+    if col in df_results.columns:
+        df_results[col] = pd.to_datetime(df_results[col], errors="coerce").dt.date
+
+def get_existing_table_schema(table_name):
+    try:
+        table = client.get_table(f"{PROJECT_ID}.{DATASET_ID}.{table_name}")
+        return {f.name: f.field_type for f in table.schema}
+    except: return None
+
+def pandas_dtype_to_bq_type(dtype):
+    s = str(dtype)
+    if pd.api.types.is_integer_dtype(dtype): return "INTEGER"
+    elif pd.api.types.is_float_dtype(dtype): return "FLOAT"
+    elif pd.api.types.is_bool_dtype(dtype): return "BOOLEAN"
+    elif pd.api.types.is_datetime64_any_dtype(dtype): return "TIMESTAMP"
+    return "STRING"
+
+def convert_df_to_match_schema(df, schema_dict):
+    df_c = df.copy()
+    for col, bq_type in schema_dict.items():
+        if col not in df_c.columns: continue
+        if bq_type == "STRING" and not pd.api.types.is_string_dtype(df_c[col].dtype):
+            df_c[col] = df_c[col].astype(str).replace('nan', None).replace('None', None)
+        elif bq_type == "FLOAT": df_c[col] = pd.to_numeric(df_c[col], errors='coerce')
+        elif bq_type == "INTEGER": df_c[col] = pd.to_numeric(df_c[col], errors='coerce').astype('Int64')
+        elif bq_type == "BOOLEAN": df_c[col] = df_c[col].astype(bool)
+    return df_c
+
+def add_missing_columns_to_table(table_name, df, existing_schema):
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
+    table = client.get_table(table_id)
+    new_schema = list(table.schema)
+    for col in df.columns:
+        if col not in existing_schema:
+            new_schema.append(bigquery.SchemaField(col, pandas_dtype_to_bq_type(df[col].dtype), mode="NULLABLE"))
+    if len(new_schema) > len(table.schema):
+        table.schema = new_schema
+        client.update_table(table, ["schema"])
+
+def df_to_bq(df, table_name, write_disposition="WRITE_TRUNCATE"):
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
+    df_up = df.copy()
+    if write_disposition == "WRITE_APPEND":
+        existing = get_existing_table_schema(table_name)
+        if existing:
+            new_cols = set(df_up.columns) - set(existing.keys())
+            if new_cols: add_missing_columns_to_table(table_name, df_up, existing); existing = get_existing_table_schema(table_name)
+            df_up = convert_df_to_match_schema(df_up, existing)
+    job_config = bigquery.LoadJobConfig(write_disposition=write_disposition, autodetect=True)
+    job = client.load_table_from_dataframe(df_up, table_id, job_config=job_config)
+    job.result()
+    print(f"✓ Loaded: {table_id} rows: {client.get_table(table_id).num_rows}")
+
+df_to_bq(df_results, f"{SERIES_TICKER}_market_results", "WRITE_TRUNCATE")
+df_to_bq(df_summary, f"{SERIES_TICKER}_market_results_summary", "WRITE_TRUNCATE")
+if 'df_orders' in dir() and len(df_orders) > 0:
+    df_to_bq(df_orders, f"{SERIES_TICKER}_orders", "WRITE_APPEND")
+if 'df_market_snapshot_signals' in dir() and len(df_market_snapshot_signals) > 0:
+    df_to_bq(df_market_snapshot_signals, f"{SERIES_TICKER}_market_snapshot_signals", "WRITE_APPEND")
+if 'position_ledger' in dir() and position_ledger:
+    df_ledger = ledger_to_dataframe(position_ledger)
+    if len(df_ledger) > 0:
+        df_to_bq(df_ledger, f"{SERIES_TICKER}_position_ledger", "WRITE_TRUNCATE")
+
+print("\n✓ All tables uploaded successfully!")
