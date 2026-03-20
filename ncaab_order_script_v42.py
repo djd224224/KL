@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# KXNCAABMENTION Order Script v4.2b-NCAAB — March Madness Adapted
+# KXNCAABMENTION Order Script v4.3-NCAAB — March Madness Tournament Mode
 # =============================================================================
 # STEP 1: FETCH DATA
 # FIXED: Team-level historical rates now correct (no longer flipping based on team position)
@@ -321,18 +321,7 @@ print("\n✓ Data collection complete!")
 #     side mult overrides, ledger-aware sizing, Bayesian hybrid pricing
 # ==============================================================
 
-import time
-import uuid
-from datetime import datetime, UTC
-from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
-from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.backends import default_backend
-import os
-from google.cloud import bigquery
 
 
 RUN_ID = str(uuid.uuid4())
@@ -342,7 +331,7 @@ PRICING_STRATEGY = 'hybrid'
 # =========================
 # [NCAAB-1] CONFIG
 # =========================
-SERIES_TICKER = "KXNCAABMENTION"  # [NCAAB-1] Changed from KXNBAMENTION
+# SERIES_TICKER already defined in data fetch cell
 API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
 PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -357,12 +346,17 @@ BAYESIAN_HISTORICAL_WEIGHT = 0.30    # [NCAAB-13] Was 0.4 — reduce stale histo
 # =========================
 # [NCAAB-3] POSITION MANAGEMENT — tightened caps
 # =========================
-MAX_NET_PER_MARKET = 75          # [NCAAB-3b] Was 150 — halved again. 100+ contract positions losing -$146 each
-POSITION_MODERATE_THRESHOLD = 40  # [NCAAB-6b] Start throttling at 40 (was 75)
-POSITION_STOP_THRESHOLD = 75      # [NCAAB-6b] Hard stop at 75 (matches MAX_NET)
+MAX_NET_PER_MARKET = 150         # [v4.3] Tier 1 cap. Dampener is the real governor now.
+# Tier-specific caps applied in build_order_objects_for_market:
+#   Tier 1 (SCHE/ELBO/DRAF/MARC/NIL): 150
+#   Tier 2 (ANKL/AIRB/ALLE/RECO/ALL/RECR/OVER/DOUB): 100
+TIER1_MARKETS = {"SCHE", "ELBO", "DRAF", "MARC", "NIL"}
+TIER2_MAX_NET = 100
+POSITION_MODERATE_THRESHOLD = 75  # [v4.3] Raised to match new caps
+POSITION_STOP_THRESHOLD = 150     # [v4.3] Matches Tier 1 MAX_NET
 MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
-MAX_NET_PER_EVENT = 400           # [NCAAB-3b] Was 800 — $100-200 games = +15.3% ROI, $400+ = -15.9%
+MAX_NET_PER_EVENT = 800           # [v4.3] Dampener is real governor. Hard cap is circuit breaker only.
 MAX_ORDERS_PER_EVENT = 2000       # [NCAAB-3] Was 5000
 
 MIN_SPREAD_BOTH_SIDES = 0         # [v4.1-1] Spread gate still DISABLED
@@ -374,8 +368,8 @@ SAFE_MODE_MULTIPLIER = 0.10
 # =========================
 PAIRING_MODE_THRESHOLD = 0.60     # [NCAAB-8] Was 0.40 — harder to trigger
 PAIRING_MODE_AGGRESSIVE = 0.85    # [NCAAB-8] Was 0.75
-PAIRING_MODE_NET_FLOOR = int(MAX_NET_PER_MARKET * PAIRING_MODE_THRESHOLD)   # 90
-PAIRING_MODE_NET_AGGRESSIVE = int(MAX_NET_PER_MARKET * PAIRING_MODE_AGGRESSIVE)  # 127
+PAIRING_MODE_NET_FLOOR = 60   # [v4.3] Fixed value (was MAX_NET*0.6=90, too high)
+PAIRING_MODE_NET_AGGRESSIVE = 100  # [v4.3] Fixed value (was MAX_NET*0.85=127, too high)
 
 HEDGE_MIN_PRICE_YES = 35          # [NCAAB-8] Was 25 — don't chase cheap Yes hedges
 HEDGE_MIN_PRICE_NO = 5            # Was 3
@@ -389,20 +383,20 @@ MAX_PAIRED_PER_MARKET = 300       # Was 500
 # (fair_no - avg_price at March yes-rates), and contract-level P&L
 SIDE_MULTIPLIERS = {
     # --- BLOCKED: proven losers or no edge at March rates ---
-    "DOUB": {"yes": 0.0, "no": 0.0},   # -$132 total. Erratic
+    "DOUB": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets. Mar rate 0% yes.
     "TRAN": {"yes": 0.0, "no": 0.0},   # -$64 total. Unstable rate
     "WALK": {"yes": 0.0, "no": 0.0},   # -$3, tiny sample
-    "OVER": {"yes": 0.0, "no": 0.0},   # -$96, -23% ROI. Mar edge = -2c OVERPAY
-    "RECR": {"yes": 0.0, "no": 0.0},   # -$122, -16% ROI. Both periods negative
+    "OVER": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets only.
+    "RECR": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets only. Kelly+dampener protect.
 
     # --- TIER 1: Consistent + strong March edge ---
     "SCHE": {"yes": 0.0, "no": 1.8},   # +$50, +21% ROI. Both periods +. Mar edge +34c
-    "NIL":  {"yes": 0.0, "no": 0.7},   # [P1] Kelly=16%, thin +4c edge. Overbet at 1.5x. Was 1.5x
+    "NIL":  {"yes": 0.0, "no": 1.5},   # [v4.3] +12.8c/contract, 88% WR, 2nd best PnL/Q. Restored.
     "DRAF": {"yes": 0.0, "no": 1.3},   # +$51, +8%. Mar +40% ROI. Edge +20c
 
     # --- TIER 2: Good March edge but inconsistent ---
     "ELBO": {"yes": 0.0, "no": 1.8},   # [P1] Kelly=45%, 2nd best. Mar edge +32c. Was 0.8x
-    "ANKL": {"yes": 0.0, "no": 0.7},   # -$32 total, Mar edge = +11c. Small only
+    "ANKL": {"yes": 0.0, "no": 1.0},   # [v4.3] Dampener fixes adverse sizing. +$19 dampened P&L.
     "AIRB": {"yes": 0.0, "no": 0.5},   # -$26 total, Mar edge = +12c. Speculative
 
     # --- TIER 3: Demoted — lost edge in March ---
@@ -460,10 +454,10 @@ TEAM_RISK_MULTIPLIER = {
 # =========================
 MIN_PRICE_YES = 25                # [NCAAB-6] Was 15 — no cheap Yes fliers
 MIN_PRICE_NO = 15                 # [NCAAB-6b] Was 12
-# [NCAAB-11] DEAD ZONE: 35-50¢ No is the worst price range
-# -$269 P&L overall, -$253 in March, -2pp edge. Skip it entirely.
-NO_DEAD_ZONE_MIN = 35
-NO_DEAD_ZONE_MAX = 50
+# [v4.3] Dead zone REMOVED — not statistically significant (p=0.687).
+# Kelly gate + dampener handle the real problems (adverse sizing + stale pricing).
+# NO_DEAD_ZONE_MIN = 35  # DISABLED
+# NO_DEAD_ZONE_MAX = 50  # DISABLED
 MAX_PRICE = 75                    # Unchanged — NEVER relaxed
 YES_MIN_PRICE = 50                # Was 45 — further restricts Yes
 NO_MAX_YES_PRICE = 80
@@ -482,23 +476,23 @@ MAX_COMBINED_SWEET_BOOST = 2.0    # [NCAAB-FIX] Cap side_mult × sweet_spot to p
 # [NCAAB-9] ORDER CONFIGURATION — reduced base sizes
 # =========================
 def generate_base_contracts(num_levels: int) -> List[int]:
-    """[NCAAB-9b] Further reduced: 7/8/10/12. March showed 100+ contract positions = blowup."""
+    """[v4.3] Tournament sizing: 10/12/15/18. Dampener controls game-level accumulation."""
     contracts = []
     for i in range(num_levels):
         if i < 3:
-            contracts.append(7)      # Was 10
+            contracts.append(10)
         elif i < 5:
-            contracts.append(8)      # Was 12
+            contracts.append(12)
         elif i < 8:
-            contracts.append(10)     # Was 15
+            contracts.append(15)
         else:
-            contracts.append(12)     # Was 18
+            contracts.append(18)
     return contracts
 
-NUM_OFFSET_LEVELS = 10
+NUM_OFFSET_LEVELS = 12  # [v4.3] Match 12-level spread configs
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
-MAX_CONTRACTS_PER_ORDER = 200     # [NCAAB-9b] Was 500. Prevent 145-206 contract positions
+MAX_CONTRACTS_PER_ORDER = 300     # [v4.3] Raised for tournament volume
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
 TIME_MULTIPLIERS = [
@@ -526,27 +520,14 @@ def generate_offsets(start: int, increment: int, count: int) -> List[int]:
     return [start + i * increment for i in range(count)]
 
 SPREAD_CONFIGS = {
-    (0, 2): {
-        'yes': generate_offsets(start=4, increment=3, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=3, increment=2, count=NUM_OFFSET_LEVELS),
-        'name': 'very_tight'
-    },
-    (2, 5): {
-        'yes': generate_offsets(start=3, increment=3, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=2, increment=2, count=NUM_OFFSET_LEVELS),
-        'name': 'tight'
-    },
-    (5, 15): {
-        'yes': generate_offsets(start=2, increment=2, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=1, increment=2, count=NUM_OFFSET_LEVELS),
-        'name': 'medium'
-    },
-    (15, 100): {
-        'yes': generate_offsets(start=1, increment=2, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
-        'name': 'wide'
-    },
+    "tight":    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14],       # [v4.3] 12 levels, tighter top
+    "medium":   [2, 3, 5, 7, 9, 11, 13, 15, 17, 19, 22, 25],    # [v4.3] 12 levels, tighter top, deep bottom
+    "wide":     [3, 5, 8, 11, 14, 17, 20, 23, 26, 29, 33, 37],  # [v4.3] 12 levels, deeper bottom
 }
+
+# [v4.3] Tier 1 markets use tighter spreads (more fills, still 20+¢ edge buffer)
+TIER1_SPREAD_OVERRIDE = "tight"  # SCHE/ELBO/DRAF/MARC/NIL get tight spreads
+
 
 PAIRING_OFFSETS = {
     'yes': generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
@@ -1091,10 +1072,15 @@ def get_volume_multiplier(oi):
     return 0.4
 
 def get_offsets_for_spread(spread_cents):
-    for (mn, mx), config in SPREAD_CONFIGS.items():
-        if mn <= spread_cents < mx: return config['yes'], config['no'], config['name']
-    wc = SPREAD_CONFIGS[(15, 100)]
-    return wc['yes'], wc['no'], wc['name']
+    """[v4.3] Select spread config based on spread width. Returns (yes_offsets, no_offsets, config_name)."""
+    if spread_cents < 5:
+        name = "tight"
+    elif spread_cents < 15:
+        name = "medium"
+    else:
+        name = "wide"
+    offsets = SPREAD_CONFIGS[name]
+    return offsets, offsets, name
 
 def calculate_spread(yes_bid, no_bid):
     return 100 - (yes_bid + no_bid)
@@ -1178,6 +1164,9 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     team_1 = market_row.get("team_1")
     team_2 = market_row.get("team_2")
 
+    # [v4.3] Tier-specific market cap
+    effective_max_net = MAX_NET_PER_MARKET if ticker_part_3_market_code in TIER1_MARKETS else TIER2_MAX_NET
+
     if market_status != "active":
         return []
 
@@ -1256,8 +1245,8 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     yes_side_mult = get_effective_side_multiplier(yes_side_mult, "yes", pairing_mode_str, net_side)
     no_side_mult = get_effective_side_multiplier(no_side_mult, "no", pairing_mode_str, net_side)
 
-    net_room_yes = MAX_NET_PER_MARKET - net_position
-    net_room_no = MAX_NET_PER_MARKET + net_position
+    net_room_yes = effective_max_net - net_position
+    net_room_no = effective_max_net + net_position
     time_mult = get_time_multiplier(hours_until_event)
     volume_mult = get_volume_multiplier(open_interest)
     base_mult = time_mult * volume_mult
@@ -1319,6 +1308,13 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     # Spread + offsets
     spread_cents = calculate_spread(orderbook_yes_bid or yes_fair, orderbook_no_bid or no_fair)
     yes_offsets, no_offsets, spread_config_name = get_offsets_for_spread(spread_cents)
+    # [v4.3] Tier 1 markets get tight spreads (more fills, 20+¢ edge buffer)
+    if ticker_part_3_market_code in TIER1_MARKETS:
+        if TIER1_SPREAD_OVERRIDE in SPREAD_CONFIGS:
+            offsets = SPREAD_CONFIGS[TIER1_SPREAD_OVERRIDE]
+            yes_offsets = offsets
+            no_offsets = offsets
+            spread_config_name = TIER1_SPREAD_OVERRIDE + "_tier1"
     if pairing_mode_str != "normal" and net_side != "flat":
         if net_side == "yes": no_offsets = PAIRING_OFFSETS['no']; spread_config_name += "+pair_no"
         elif net_side == "no": yes_offsets = PAIRING_OFFSETS['yes']; spread_config_name += "+pair_yes"
@@ -1386,8 +1382,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             if bid > max_no_price or bid < act_min_no or bid > MAX_PRICE: continue
             implied_yes = 100 - bid
             if implied_yes < NO_MIN_YES_PRICE or implied_yes > NO_MAX_YES_PRICE: continue
-            # [NCAAB-11] Skip the 35-50¢ dead zone (worst price range: -$269 P&L, -2pp edge)
-            if NO_DEAD_ZONE_MIN <= bid <= NO_DEAD_ZONE_MAX: continue
+            # [v4.3] Dead zone REMOVED — not stat sig (p=0.687). Kelly+dampener protect.
             standalone_ev = (1.0 - p_hat) - (bid / 100.0)
             hedge_ev, is_pairing = calculate_hedge_ev("no", bid, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
