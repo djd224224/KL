@@ -211,7 +211,7 @@ def main():
     df_filtered = df_settled.query("ticker_part_3_market_code != '' and event_date != '' and team_1 != '' and team_2 != ''").copy()
 
     if len(df_filtered) == 0:
-        df_summary_filtered = df_summary[df_summary['count_occurrences'] > 25][["ticker_part_3_market_code", "yes_rate"]].copy()
+        df_summary_filtered = df_summary[df_summary['count_occurrences'] > 3][["ticker_part_3_market_code", "yes_rate"]].copy()
         df_results = df_results.merge(df_summary_filtered, on="ticker_part_3_market_code", how="left")
         df_results["yes_rate"] = df_results.apply(lambda row: row["yes_rate"] if row["is_active"] else "", axis=1)
         return df_results, df_summary, df_summary_rolling, pd.DataFrame()
@@ -235,7 +235,7 @@ def main():
     print(f"  df_summary_rolling_by_team: {df_summary_rolling_by_team.shape}")
 
     # ADD yes_rate TO ACTIVE MARKETS
-    df_summary_filtered = df_summary[df_summary['count_occurrences'] > 25][["ticker_part_3_market_code", "yes_rate"]].copy()
+    df_summary_filtered = df_summary[df_summary['count_occurrences'] > 3][["ticker_part_3_market_code", "yes_rate"]].copy()
     df_results = df_results.merge(df_summary_filtered, on="ticker_part_3_market_code", how="left")
     df_results["yes_rate"] = df_results.apply(lambda row: row["yes_rate"] if row["is_active"] else "", axis=1)
     df_results.loc[df_results['is_active'], 'market_status'] = 'active'
@@ -1283,8 +1283,15 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         yes_fair = cents_from_rate(market_yes_rate)
         no_fair = 100 - yes_fair
     if yes_fair is None or no_fair is None:
-        print(f"    ✗ No data — skipping")
-        return []
+        # [v4.3] Default to 50% prior for new/unknown markets — Kelly gate protects
+        if market_mid_yes is not None:
+            yes_fair = int(round(market_mid_yes))
+            no_fair = 100 - yes_fair
+            print(f"    ⚠️ No historical rate — using orderbook mid: YES={yes_fair}¢ NO={no_fair}¢")
+        else:
+            yes_fair = 50
+            no_fair = 50
+            print(f"    ⚠️ No data at all — using 50/50 prior. Kelly gate will filter.")
     p_hat = yes_fair / 100.0
 
     print(f"    Fair: YES={yes_fair}¢ NO={no_fair}¢ | Mults: YES={yes_total_mult:.2f}x NO={no_total_mult:.2f}x")
