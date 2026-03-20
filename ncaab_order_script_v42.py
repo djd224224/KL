@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# =============================================================================
-# KXNCAABMENTION Order Script v4.3-NCAAB — March Madness Tournament Mode
-# =============================================================================
+# KXNCAABMENTION v4.3-NCAAB
 # STEP 1: FETCH DATA
 # FIXED: Team-level historical rates now correct (no longer flipping based on team position)
 # ADAPTED: Series ticker changed to KXNCAABMENTION for college basketball
@@ -371,11 +369,11 @@ PAIRING_MODE_AGGRESSIVE = 0.85    # [NCAAB-8] Was 0.75
 PAIRING_MODE_NET_FLOOR = 60   # [v4.3] Fixed value (was MAX_NET*0.6=90, too high)
 PAIRING_MODE_NET_AGGRESSIVE = 100  # [v4.3] Fixed value (was MAX_NET*0.85=127, too high)
 
-HEDGE_MIN_PRICE_YES = 35          # [NCAAB-8] Was 25 — don't chase cheap Yes hedges
+HEDGE_MIN_PRICE_YES = 15          # [v4.3] Fixed: pairing should be MORE aggressive, not less
 HEDGE_MIN_PRICE_NO = 5            # Was 3
-HEDGE_YES_MIN_PRICE = 40          # Was 25
+HEDGE_YES_MIN_PRICE = 15          # [v4.3] Fixed: pairing allows cheaper Yes bids for hedging
 
-MAX_PAIRED_PER_MARKET = 300       # Was 500
+MAX_PAIRED_PER_MARKET = 150       # [v4.3] Matches MAX_NET_PER_MARKET
 
 # =========================
 # [NCAAB-2b] SIDE MULTIPLIERS — updated for March Madness (v4.2b)
@@ -383,27 +381,29 @@ MAX_PAIRED_PER_MARKET = 300       # Was 500
 # (fair_no - avg_price at March yes-rates), and contract-level P&L
 SIDE_MULTIPLIERS = {
     # --- BLOCKED: proven losers or no edge at March rates ---
-    "DOUB": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets. Mar rate 0% yes.
-    "TRAN": {"yes": 0.0, "no": 0.0},   # -$64 total. Unstable rate
-    "WALK": {"yes": 0.0, "no": 0.0},   # -$3, tiny sample
-    "OVER": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets only.
-    "RECR": {"yes": 0.0, "no": 0.3},   # [v4.3] Re-enabled at deep offsets only. Kelly+dampener protect.
+    "DOUB": {"yes": 0.2, "no": 0.3},   # [v4.3] 48% yes (0% Mar — risky). Tiny Yes, deep only.
+    "TRAN": {"yes": 0.5, "no": 0.3},   # [v4.3] 77% yes. Best Yes market. Deep offsets both sides.
+    "WALK": {"yes": 0.1, "no": 0.3},   # [v4.3] 12% yes. Tiny speculative Yes.
+    "BUZZ": {"yes": 0.1, "no": 0.3},   # [v4.3] New code. Tiny Yes, deep offsets.
+    "ALLA": {"yes": 0.1, "no": 0.3},   # [v4.3] New code. Tiny Yes, deep offsets.
+    "OVER": {"yes": 0.2, "no": 0.3},   # [v4.3] 50% yes (56% Mar). Small Yes hedge.
+    "RECR": {"yes": 0.2, "no": 0.3},   # [v4.3] 45% yes (56% Mar). Small Yes hedge.
 
     # --- TIER 1: Consistent + strong March edge ---
-    "SCHE": {"yes": 0.0, "no": 1.8},   # +$50, +21% ROI. Both periods +. Mar edge +34c
-    "NIL":  {"yes": 0.0, "no": 1.5},   # [v4.3] +12.8c/contract, 88% WR, 2nd best PnL/Q. Restored.
-    "DRAF": {"yes": 0.0, "no": 1.3},   # +$51, +8%. Mar +40% ROI. Edge +20c
+    "SCHE": {"yes": 0.2, "no": 1.8},   # [v4.3] 53% yes (38% Mar, dropping). Small Yes. No side dominant.
+    "NIL":  {"yes": 0.1, "no": 1.5},   # [v4.3] 22% yes. Tiny Yes — deep only. No side dominant.
+    "DRAF": {"yes": 0.4, "no": 1.3},   # [v4.3] 64% yes. Strong Yes hedge. Deep Yes offsets.
 
     # --- TIER 2: Good March edge but inconsistent ---
-    "ELBO": {"yes": 0.0, "no": 1.8},   # [P1] Kelly=45%, 2nd best. Mar edge +32c. Was 0.8x
-    "ANKL": {"yes": 0.0, "no": 1.0},   # [v4.3] Dampener fixes adverse sizing. +$19 dampened P&L.
-    "AIRB": {"yes": 0.0, "no": 0.5},   # -$26 total, Mar edge = +12c. Speculative
+    "ELBO": {"yes": 0.3, "no": 1.8},   # [v4.3] 55% yes. Moderate Yes hedge. No side dominant.
+    "ANKL": {"yes": 0.2, "no": 1.0},   # [v4.3] 50% yes. Coin-flip — small Yes hedge.
+    "AIRB": {"yes": 0.4, "no": 0.5},   # [v4.3] 62% yes. Good Yes hedge.
 
     # --- TIER 3: Demoted — lost edge in March ---
-    "MARC": {"yes": 0.0, "no": 1.5},   # +$194, +10% ROI, BOTH periods +. Price fix via recency halflife
-    "ALLE": {"yes": 0.0, "no": 0.3},   # -$34. Collapsed Mar (-$188). Blowup risk
-    "RECO": {"yes": 0.0, "no": 0.3},   # -$31. Flipped -37% in Mar
-    "ALL":  {"yes": 0.0, "no": 0.5},   # +$29 total but -$15 Mar. Edge +6c, thin
+    "MARC": {"yes": 0.1, "no": 1.5},   # [v4.3] 20% yes (44% Mar!). Tiny Yes — Mar regime makes this interesting.
+    "ALLE": {"yes": 0.1, "no": 0.3},   # [v4.3] 32% yes (46% Mar). Tiny Yes. Deep only.
+    "RECO": {"yes": 0.4, "no": 0.3},   # [v4.3] 61% yes (62% Mar). Strong Yes hedge.
+    "ALL":  {"yes": 0.3, "no": 0.5},   # [v4.3] 58% yes (62% Mar). Moderate Yes hedge.
 }
 
 # =========================
@@ -452,17 +452,17 @@ TEAM_RISK_MULTIPLIER = {
 # =========================
 # [NCAAB-6] PRICE FILTERS — tightened
 # =========================
-MIN_PRICE_YES = 25                # [NCAAB-6] Was 15 — no cheap Yes fliers
+MIN_PRICE_YES = 20                # [v4.3] Consolidated with YES_MIN_PRICE (was two separate vars)
 MIN_PRICE_NO = 15                 # [NCAAB-6b] Was 12
 # [v4.3] Dead zone REMOVED — not statistically significant (p=0.687).
 # Kelly gate + dampener handle the real problems (adverse sizing + stale pricing).
 # NO_DEAD_ZONE_MIN = 35  # DISABLED
 # NO_DEAD_ZONE_MAX = 50  # DISABLED
 MAX_PRICE = 75                    # Unchanged — NEVER relaxed
-YES_MIN_PRICE = 50                # Was 45 — further restricts Yes
+YES_MIN_PRICE = 20                # [v4.3] Same as MIN_PRICE_YES — single Yes floor
 NO_MAX_YES_PRICE = 80
 NO_MIN_YES_PRICE = 20
-YES_PROBABILITY_FLOOR = 65        # [NCAAB-5] Was 40 — blocks most Yes bets (analysis: Yes = -7.7% ROI)
+# YES_PROBABILITY_FLOOR REMOVED [v4.3] — redundant with Kelly gate which is strictly smarter (per-order vs per-market)
 
 # =========================
 # [NCAAB-4] NO SWEET SPOT — shifted to proven profitable range
@@ -535,7 +535,7 @@ PAIRING_OFFSETS = {
     'name': 'pairing'
 }
 
-EXPIRATION_HOURS_BEFORE_CLOSE = 5
+EXPIRATION_HOURS_BEFORE_CLOSE = 4  # [v4.3] Was 5, 5h blocked live games
 SLEEP_BETWEEN_ORDERS = 0.05
 FALLBACK_OFFSET = 15
 
@@ -899,7 +899,8 @@ def get_effective_side_multiplier(base_side_mult, side, pairing_mode, net_side):
 # =====================================================================
 # LEDGER-AWARE POSITION MULTIPLIER [v4.2-6]
 # =====================================================================
-def calculate_ledger_position_multiplier(ticker, side, ledger, fallback_net_position):
+def calculate_ledger_position_multiplier(ticker, side, ledger, fallback_net_position, market_net_cap=None):
+    cap = market_net_cap if market_net_cap is not None else MAX_NET_PER_MARKET
     data = ledger.get(ticker)
     if data is None:
         return calculate_position_multiplier(fallback_net_position, side), "no_ledger_data", 0.0
@@ -907,13 +908,13 @@ def calculate_ledger_position_multiplier(ticker, side, ledger, fallback_net_posi
     net_qty = data["net_qty"]
     net_side = data["net_side"]
     side_qty = data["yes_qty"] if side == "yes" else data["no_qty"]
-    if side_qty >= MAX_PAIRED_PER_MARKET:
+    if side_qty >= cap:
         return 0.0, f"hard_cap_{side}_qty={side_qty}", 0.0
     if net_side == side and net_qty > 0:
-        if net_qty >= MAX_NET_PER_MARKET:
+        if net_qty >= cap:
             return 0.0, f"net_cap_{side}={net_qty}", 0.0
-        elif net_qty >= MAX_NET_PER_MARKET * 0.7:
-            remaining_frac = (MAX_NET_PER_MARKET - net_qty) / (MAX_NET_PER_MARKET * 0.3)
+        elif net_qty >= cap * 0.7:
+            remaining_frac = (cap - net_qty) / (cap * 0.3)
             return max(0.1, remaining_frac), f"net_rampdown_{side}={net_qty}", 0.0
         return 1.0, f"net_ok_{side}={net_qty}", 0.0
     elif net_side != side and net_side != "flat" and net_qty > 0:
@@ -921,10 +922,10 @@ def calculate_ledger_position_multiplier(ticker, side, ledger, fallback_net_posi
             return 2.0, f"aggressive_pair_boost", 1.5
         elif net_qty >= PAIRING_MODE_NET_FLOOR:
             return 1.5, f"pair_boost", 1.0
-        elif net_qty >= int(MAX_NET_PER_MARKET * 0.25):
+        elif net_qty >= int(cap * 0.25):
             return 1.2, f"mild_pair_boost", 0.8
         return 1.0, "net_balanced", 0.0
-    if paired_qty > MAX_PAIRED_PER_MARKET * 0.6 and data["paired_edge"] > 3:
+    if paired_qty > cap * 0.6 and data["paired_edge"] > 3:
         return 0.6, f"diminishing_returns", 0.0
     return 1.0, "default", 0.0
 
@@ -1231,8 +1232,8 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     # Ledger position multipliers
     yes_side_mult_floor, no_side_mult_floor = 0.0, 0.0
     if ledger:
-        yes_position_mult, yes_pos_reason, yes_side_mult_floor = calculate_ledger_position_multiplier(ticker, 'yes', ledger, net_position)
-        no_position_mult, no_pos_reason, no_side_mult_floor = calculate_ledger_position_multiplier(ticker, 'no', ledger, net_position)
+        yes_position_mult, yes_pos_reason, yes_side_mult_floor = calculate_ledger_position_multiplier(ticker, 'yes', ledger, net_position, effective_max_net)
+        no_position_mult, no_pos_reason, no_side_mult_floor = calculate_ledger_position_multiplier(ticker, 'no', ledger, net_position, effective_max_net)
     else:
         yes_position_mult = calculate_position_multiplier(net_position, 'yes')
         no_position_mult = calculate_position_multiplier(net_position, 'no')
@@ -1298,23 +1299,19 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     else:
         act_min_yes, act_min_no, act_yes_min = MIN_PRICE_YES, MIN_PRICE_NO, YES_MIN_PRICE
 
-    # Probability floor
-    if yes_fair < YES_PROBABILITY_FLOOR and yes_side_mult > 0:
-        if pairing_mode_str != "normal" and net_side == "no":
-            pass  # bypass for hedge
-        else:
-            yes_side_mult = 0.0; yes_total_mult = 0.0
+    # [v4.3] YES_PROBABILITY_FLOOR removed — Kelly gate handles per-order filtering
 
     # Spread + offsets
     spread_cents = calculate_spread(orderbook_yes_bid or yes_fair, orderbook_no_bid or no_fair)
     yes_offsets, no_offsets, spread_config_name = get_offsets_for_spread(spread_cents)
-    # [v4.3] Tier 1 markets get tight spreads (more fills, 20+¢ edge buffer)
+    # [v4.3] Tier 1: tight No offsets (more fills, 20+¢ edge buffer)
+    # Yes always gets wide offsets (conservative, deep discount only)
     if ticker_part_3_market_code in TIER1_MARKETS:
         if TIER1_SPREAD_OVERRIDE in SPREAD_CONFIGS:
-            offsets = SPREAD_CONFIGS[TIER1_SPREAD_OVERRIDE]
-            yes_offsets = offsets
-            no_offsets = offsets
-            spread_config_name = TIER1_SPREAD_OVERRIDE + "_tier1"
+            no_offsets = SPREAD_CONFIGS[TIER1_SPREAD_OVERRIDE]
+            spread_config_name = TIER1_SPREAD_OVERRIDE + "_tier1_no"
+    # [v4.3] All Yes orders use wide offsets — conservative, fills only at deep discounts
+    yes_offsets = SPREAD_CONFIGS["wide"]
     if pairing_mode_str != "normal" and net_side != "flat":
         if net_side == "yes": no_offsets = PAIRING_OFFSETS['no']; spread_config_name += "+pair_no"
         elif net_side == "no": yes_offsets = PAIRING_OFFSETS['yes']; spread_config_name += "+pair_yes"
@@ -1344,11 +1341,17 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             hedge_ev, is_pairing = calculate_hedge_ev("yes", bid, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
             if effective_ev < MIN_EV_PER_ORDER: continue
+            # [v4.3] Yes Kelly gate: reject if implied Kelly < 2%
+            if bid < 100:
+                implied_kelly_yes = (p_hat - (bid / 100)) / (1 - bid / 100)
+                if implied_kelly_yes < 0.02:
+                    if i == 0: print(f"      Kelly blocked YES @{bid}¢ (kelly={implied_kelly_yes:.3f})")
+                    continue
             base_c = BASE_YES_CONTRACTS[i]
             scaled = int(base_c * yes_total_mult)
-            # [P0] Game-level dampener
-            game_contracts_so_far = event_orders_placed.get(evt, 0)
-            dampener = 1.0 / (1 + game_contracts_so_far / 200)
+            # [v4.3] Yes uses lighter dampener — Yes is a hedge, not primary strategy
+            game_no_so_far = event_orders_placed.get(evt + "_no", 0)
+            dampener = 1.0 / (1 + game_no_so_far / 400)  # softer curve for Yes (400 vs 200)
             scaled = int(scaled * dampener)
             max_here = min(scaled, MAX_CONTRACTS_PER_ORDER, max(0, net_room_yes - yes_placed), max(0, event_orders_remaining - yes_placed))
             if max_here < 1: continue
@@ -1390,12 +1393,14 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             # [P0] Kelly gate: reject if implied Kelly < 2%
             if bid < 100:
                 implied_kelly = ((1 - p_hat) - (bid / 100)) / (1 - bid / 100)
-                if implied_kelly < 0.02: continue
+                if implied_kelly < 0.02:
+                    if i == 0: print(f"      Kelly blocked NO @{bid}¢ (kelly={implied_kelly:.3f})")
+                    continue
             base_c = BASE_NO_CONTRACTS[i]
             scaled = int(base_c * no_total_mult)
-            # [P0] Game-level dampener: reduce fills as game exposure grows
-            game_contracts_so_far = event_orders_placed.get(evt, 0)
-            dampener = 1.0 / (1 + game_contracts_so_far / 200)
+            # [v4.3] Dampener uses No-only counter — Yes hedge doesn't eat No capacity
+            game_no_so_far = event_orders_placed.get(evt + "_no", 0)
+            dampener = 1.0 / (1 + game_no_so_far / 200)
             scaled = int(scaled * dampener)
             sweet_applied = False
             if NO_SWEET_SPOT_MIN <= bid <= NO_SWEET_SPOT_MAX:
@@ -1432,8 +1437,10 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
 
     evt = event_ticker or ""
     event_orders_placed[evt] = event_orders_placed.get(evt, 0) + yes_placed + no_placed
+    event_orders_placed[evt + "_no"] = event_orders_placed.get(evt + "_no", 0) + no_placed
     event_net_exposure[evt] = event_net_exposure.get(evt, 0) + abs(yes_placed - no_placed)
-    return orders
+    return order
+
 
 # =====================================================================
 # SUBMIT ORDERS + MAIN RUNNER
