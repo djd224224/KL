@@ -1,8 +1,9 @@
-name: NCAABMENTION v4.2-NCAAB Trading Bot
-# Runs every 2 hours (offset by 5 min to avoid overlap with NBA bot)
+name: NCAABMENTION v4.3-NCAAB Trading Bot
+# [v4.3] Runs every 90 minutes during tournament
 on:
   schedule:
-    - cron: '5 */2 * * *'
+    - cron: '5 0,3,6,9,12,15,18,21 * * *'
+    - cron: '35 1,4,7,10,13,16,19,22 * * *'
   workflow_dispatch:  # Manual trigger
 jobs:
   run-trading-script:
