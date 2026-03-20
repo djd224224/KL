@@ -599,7 +599,7 @@ print(f"Position caps: market={MAX_NET_PER_MARKET} [was300] event={MAX_NET_PER_E
 print(f"  Moderate at {POSITION_MODERATE_THRESHOLD} [was100], stop at {POSITION_STOP_THRESHOLD} [was300]")
 print(f"Pairing: threshold={PAIRING_MODE_NET_FLOOR} aggressive={PAIRING_MODE_NET_AGGRESSIVE}")
 print(f"Price filters:")
-print(f"  YES: {MIN_PRICE_YES}-{MAX_PRICE}c floor={YES_MIN_PRICE}c prob_floor={YES_PROBABILITY_FLOOR}%")
+print(f"  YES: {MIN_PRICE_YES}-{MAX_PRICE}c floor={YES_MIN_PRICE}c (Kelly gate replaces prob_floor)")
 print(f"  NO:  {MIN_PRICE_NO}-{MAX_PRICE}c sweet={NO_SWEET_SPOT_MIN}-{NO_SWEET_SPOT_MAX}c @{NO_SWEET_SPOT_MULTIPLIER}x")
 print(f"  EV gate: {MIN_EV_PER_ORDER:.0%}")
 blocked = [k for k, v in SIDE_MULTIPLIERS.items() if v['yes'] == 0 and v['no'] == 0]
