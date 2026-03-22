@@ -1358,6 +1358,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     # === YES LIMIT ORDERS ===
     max_yes_price = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else MAX_PRICE
     yes_placed = 0
+    no_placed = 0  # [v4.5] Initialize before YES loop for per-market run cap
     if yes_total_mult > 0:
         for i, offset in enumerate(yes_offsets):
             if i >= len(BASE_YES_CONTRACTS): break
@@ -1403,7 +1404,6 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
 
     # === NO LIMIT ORDERS ===
     max_no_price = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else MAX_PRICE
-    no_placed = 0
     if no_total_mult > 0:
         for i, offset in enumerate(no_offsets):
             if i >= len(BASE_NO_CONTRACTS): break
