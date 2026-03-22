@@ -323,7 +323,7 @@ print("\n✓ Data collection complete!")
 
 
 RUN_ID = str(uuid.uuid4())
-MODEL_VERSION = "v4.2-NCAAB"
+MODEL_VERSION = "v4.4-NCAAB"
 PRICING_STRATEGY = 'hybrid'
 
 # =========================
@@ -344,14 +344,14 @@ BAYESIAN_HISTORICAL_WEIGHT = 0.30    # [NCAAB-13] Was 0.4 — reduce stale histo
 # =========================
 # [NCAAB-3] POSITION MANAGEMENT — tightened caps
 # =========================
-MAX_NET_PER_MARKET = 150         # [v4.3] Tier 1 cap. Dampener is the real governor now.
+MAX_NET_PER_MARKET = 250         # [v4.4] Tier 1 cap raised. Dampener is real governor.
 # Tier-specific caps applied in build_order_objects_for_market:
 #   Tier 1 (SCHE/ELBO/DRAF/MARC/NIL): 150
 #   Tier 2 (ANKL/AIRB/ALLE/RECO/ALL/RECR/OVER/DOUB): 100
 TIER1_MARKETS = {"SCHE", "ELBO", "DRAF", "MARC", "NIL"}
 TIER2_MAX_NET = 100
-POSITION_MODERATE_THRESHOLD = 75  # [v4.3] Raised to match new caps
-POSITION_STOP_THRESHOLD = 150     # [v4.3] Matches Tier 1 MAX_NET
+POSITION_MODERATE_THRESHOLD = 125 # [v4.4] ~50% of Tier 1 cap
+POSITION_STOP_THRESHOLD = 250     # [v4.4] Matches Tier 1 MAX_NET
 MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
 MAX_NET_PER_EVENT = 800           # [v4.3] Dampener is real governor. Hard cap is circuit breaker only.
@@ -373,7 +373,7 @@ HEDGE_MIN_PRICE_YES = 15          # [v4.3] Fixed: pairing should be MORE aggress
 HEDGE_MIN_PRICE_NO = 5            # Was 3
 HEDGE_YES_MIN_PRICE = 15          # [v4.3] Fixed: pairing allows cheaper Yes bids for hedging
 
-MAX_PAIRED_PER_MARKET = 150       # [v4.3] Matches MAX_NET_PER_MARKET
+MAX_PAIRED_PER_MARKET = 250       # [v4.4] Matches MAX_NET_PER_MARKET
 
 # =========================
 # [NCAAB-2b] SIDE MULTIPLIERS — updated for March Madness (v4.2b)
@@ -381,8 +381,8 @@ MAX_PAIRED_PER_MARKET = 150       # [v4.3] Matches MAX_NET_PER_MARKET
 # (fair_no - avg_price at March yes-rates), and contract-level P&L
 SIDE_MULTIPLIERS = {
     # --- BLOCKED: proven losers or no edge at March rates ---
-    "DOUB": {"yes": 0.2, "no": 0.3},   # [v4.3] 48% yes (0% Mar — risky). Tiny Yes, deep only.
-    "TRAN": {"yes": 0.5, "no": 0.3},   # [v4.3] 77% yes. Best Yes market. Deep offsets both sides.
+    "DOUB": {"yes": 0.2, "no": 0.8},   # [v4.4] +52.1¢/Q, 100% WR in tournament. Promoted.
+    "TRAN": {"yes": 0.8, "no": 0.3},   # [v4.4] $41 tourn Yes P&L, 100% WR. Scaled up.
     "WALK": {"yes": 0.1, "no": 0.3},   # [v4.3] 12% yes. Tiny speculative Yes.
     "BUZZ": {"yes": 0.1, "no": 0.3},   # [v4.3] New code. Tiny Yes, deep offsets.
     "ALLA": {"yes": 0.1, "no": 0.3},   # [v4.3] New code. Tiny Yes, deep offsets.
@@ -390,14 +390,14 @@ SIDE_MULTIPLIERS = {
     "RECR": {"yes": 0.2, "no": 0.3},   # [v4.3] 45% yes (56% Mar). Small Yes hedge.
 
     # --- TIER 1: Consistent + strong March edge ---
-    "SCHE": {"yes": 0.2, "no": 1.8},   # [v4.3] 53% yes (38% Mar, dropping). Small Yes. No side dominant.
-    "NIL":  {"yes": 0.1, "no": 1.5},   # [v4.3] 22% yes. Tiny Yes — deep only. No side dominant.
-    "DRAF": {"yes": 0.4, "no": 1.3},   # [v4.3] 64% yes. Strong Yes hedge. Deep Yes offsets.
+    "SCHE": {"yes": 0.1, "no": 2.0},   # [v4.4] +12.6¢/Q. Scaled up. Yes reduced (-$57 Yes P&L).
+    "NIL":  {"yes": 0.1, "no": 2.0},   # [v4.4] +23.6¢/Q, 86% WR. Scaled up.
+    "DRAF": {"yes": 0.2, "no": 2.0},   # [v4.4] +25.9¢/Q, best edge. Yes reduced (-$56 Yes P&L).
 
     # --- TIER 2: Good March edge but inconsistent ---
-    "ELBO": {"yes": 0.3, "no": 1.8},   # [v4.3] 55% yes. Moderate Yes hedge. No side dominant.
-    "ANKL": {"yes": 0.2, "no": 1.0},   # [v4.3] 50% yes. Coin-flip — small Yes hedge.
-    "AIRB": {"yes": 0.4, "no": 0.5},   # [v4.3] 62% yes. Good Yes hedge.
+    "ELBO": {"yes": 0.5, "no": 1.8},   # [v4.4] $47 tourn Yes P&L. Yes scaled up.
+    "ANKL": {"yes": 0.5, "no": 1.0},   # [v4.4] $59 tourn Yes P&L. Yes scaled up.
+    "AIRB": {"yes": 0.4, "no": 1.0},   # [v4.4] +27.5¢/Q, 62% WR. Promoted from 0.5x.
 
     # --- TIER 3: Demoted — lost edge in March ---
     "MARC": {"yes": 0.1, "no": 1.5},   # [v4.3] 20% yes (44% Mar!). Tiny Yes — Mar regime makes this interesting.
@@ -476,23 +476,24 @@ MAX_COMBINED_SWEET_BOOST = 2.0    # [NCAAB-FIX] Cap side_mult × sweet_spot to p
 # [NCAAB-9] ORDER CONFIGURATION — reduced base sizes
 # =========================
 def generate_base_contracts(num_levels: int) -> List[int]:
-    """[v4.3] Tournament sizing: 10/12/15/18. Dampener controls game-level accumulation."""
+    """[v4.4] Scaled up: 15/18/22/25. Dampener + Kelly control risk."""
     contracts = []
     for i in range(num_levels):
         if i < 3:
-            contracts.append(10)
-        elif i < 5:
-            contracts.append(12)
-        elif i < 8:
             contracts.append(15)
-        else:
+        elif i < 5:
             contracts.append(18)
+        elif i < 8:
+            contracts.append(22)
+        else:
+            contracts.append(25)
     return contracts
 
 NUM_OFFSET_LEVELS = 12  # [v4.3] Match 12-level spread configs
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 MAX_CONTRACTS_PER_ORDER = 300     # [v4.3] Raised for tournament volume
+MAX_CONTRACTS_PER_MARKET_PER_RUN = 75  # [v4.5] Prevents adverse sizing on single market in one cycle
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
 TIME_MULTIPLIERS = [
@@ -1246,8 +1247,26 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     yes_side_mult = get_effective_side_multiplier(yes_side_mult, "yes", pairing_mode_str, net_side)
     no_side_mult = get_effective_side_multiplier(no_side_mult, "no", pairing_mode_str, net_side)
 
-    net_room_yes = effective_max_net - net_position
-    net_room_no = effective_max_net + net_position
+    # [v4.4] Use ledger data for cap enforcement (survives across runs)
+    ledger_net_qty = 0
+    ledger_net_side_str = "flat"
+    if ledger_data:
+        ledger_net_qty = ledger_data.get("net_qty", 0)
+        ledger_net_side_str = ledger_data.get("net_side", "flat")
+        ledger_yes_qty = ledger_data.get("yes_qty", 0)
+        ledger_no_qty = ledger_data.get("no_qty", 0)
+    else:
+        ledger_yes_qty = max(0, net_position) if net_position > 0 else 0
+        ledger_no_qty = max(0, -net_position) if net_position < 0 else 0
+
+    # Net room = cap minus whichever is larger: live position or ledger position
+    effective_yes_pos = max(net_position, 0) if net_position > 0 else 0
+    effective_no_pos = max(-net_position, 0) if net_position < 0 else 0
+    # Ledger tracks total fills (not net). Use side qty for hard cap.
+    net_room_yes = max(0, effective_max_net - max(effective_yes_pos, ledger_yes_qty))
+    net_room_no = max(0, effective_max_net - max(effective_no_pos, ledger_no_qty))
+    if ledger_data and (ledger_yes_qty > effective_max_net * 0.8 or ledger_no_qty > effective_max_net * 0.8):
+        print(f"    📊 Ledger: Yes={ledger_yes_qty} No={ledger_no_qty} cap={effective_max_net} room_y={net_room_yes} room_n={net_room_no}")
     time_mult = get_time_multiplier(hours_until_event)
     volume_mult = get_volume_multiplier(open_interest)
     base_mult = time_mult * volume_mult
@@ -1360,7 +1379,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             game_no_so_far = event_orders_placed.get(evt + "_no", 0)
             dampener = 1.0 / (1 + game_no_so_far / 400)  # softer curve for Yes (400 vs 200)
             scaled = int(scaled * dampener)
-            max_here = min(scaled, MAX_CONTRACTS_PER_ORDER, max(0, net_room_yes - yes_placed), max(0, event_orders_remaining - yes_placed))
+            max_here = min(scaled, MAX_CONTRACTS_PER_ORDER, max(0, net_room_yes - yes_placed), max(0, event_orders_remaining - yes_placed), max(0, MAX_CONTRACTS_PER_MARKET_PER_RUN - yes_placed - no_placed))
             if max_here < 1: continue
             yes_placed += max_here
             orders.append({
@@ -1407,7 +1426,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             scaled = int(base_c * no_total_mult)
             # [v4.3] Dampener uses No-only counter — Yes hedge doesn't eat No capacity
             game_no_so_far = event_orders_placed.get(evt + "_no", 0)
-            dampener = 1.0 / (1 + game_no_so_far / 200)
+            dampener = 1.0 / (1 + game_no_so_far / 300)  # [v4.4] Softened from /200
             scaled = int(scaled * dampener)
             sweet_applied = False
             if NO_SWEET_SPOT_MIN <= bid <= NO_SWEET_SPOT_MAX:
@@ -1415,7 +1434,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
                 effective_sweet = min(NO_SWEET_SPOT_MULTIPLIER, MAX_COMBINED_SWEET_BOOST / max(no_side_mult, 0.1))
                 scaled = int(scaled * effective_sweet); sweet_applied = True
             max_here = min(scaled, MAX_CONTRACTS_PER_ORDER, max(0, net_room_no - no_placed),
-                          max(0, event_orders_remaining - yes_placed - no_placed))
+                          max(0, event_orders_remaining - yes_placed - no_placed), max(0, MAX_CONTRACTS_PER_MARKET_PER_RUN - yes_placed - no_placed))
             if max_here < 1: continue
             no_placed += max_here
             orders.append({
