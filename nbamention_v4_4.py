@@ -669,10 +669,11 @@ NUM_OFFSET_LEVELS = 10
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 MAX_CONTRACTS_PER_ORDER = 1000
+MAX_CONTRACTS_PER_MARKET_PER_RUN = 150  # [v4.6] Limits single-run exposure per market
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
 TIME_MULTIPLIERS = [
-    (1, 1.8),
+    (1, 1.5),     # [v4.6] was 1.8 — cap reduces exposure to bad game-time snapshots
     (3, 1.5),
     (6, 0.7),
     (12, 1.1),
@@ -1705,13 +1706,14 @@ def build_order_objects_for_market(
         return []
 
     # Get side multipliers (base values)
-    # [v4.6] Unknown codes default to 0.5/0.5 (was 1.0/1.0) to limit unreviewed exposure
-    _default_side = {"yes": 0.5, "no": 0.5}
+    # [v4.6] Unknown codes default to 0.0/0.0 — do not trade markets with no historical data
+    _default_side = {"yes": 0.0, "no": 0.0}
     side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, _default_side)
     if ticker_part_3_market_code not in SIDE_MULTIPLIERS:
-        print(f"    ⚠️ UNKNOWN CODE {ticker_part_3_market_code} — using default 0.5/0.5")
-    yes_side_mult_base = side_config.get("yes", 0.5)
-    no_side_mult_base = side_config.get("no", 0.5)
+        print(f"    ⛔ UNKNOWN CODE {ticker_part_3_market_code} — not in SIDE_MULTIPLIERS, skipping")
+        return []
+    yes_side_mult_base = side_config.get("yes", 0.0)
+    no_side_mult_base = side_config.get("no", 0.0)
 
     if yes_side_mult_base == 0.0 and no_side_mult_base == 0.0:
         print(f"    ⛔ BOTH SIDES 0x for {ticker_part_3_market_code} — skipping")
@@ -2100,6 +2102,7 @@ def build_order_objects_for_market(
                 MAX_CONTRACTS_PER_ORDER,
                 max(0, net_room_yes - yes_contracts_placed),
                 max(0, event_orders_remaining - yes_contracts_placed),
+                max(0, MAX_CONTRACTS_PER_MARKET_PER_RUN - yes_contracts_placed),  # [v4.6] per-run YES cap (independent)
             )
 
             # [v4.6-2] Pairing overshoot cap: hedge can only REDUCE net, never REVERSE
@@ -2211,6 +2214,7 @@ def build_order_objects_for_market(
                 MAX_CONTRACTS_PER_ORDER,
                 max(0, net_room_no - no_contracts_placed),
                 max(0, event_orders_remaining - yes_contracts_placed - no_contracts_placed),
+                max(0, MAX_CONTRACTS_PER_MARKET_PER_RUN - no_contracts_placed),  # [v4.6] per-run NO cap (independent)
             )
 
             # [v4.6-2] Pairing overshoot cap: hedge can only REDUCE net, never REVERSE
