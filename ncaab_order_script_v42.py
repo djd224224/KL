@@ -1173,7 +1173,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         return []
 
     # [v4-3] Base side multipliers
-    side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, {"yes": 1.0, "no": 1.0})
+    side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, {"yes": 0.0, "no": 0.0})
     yes_side_mult_base = side_config.get("yes", 1.0)
     no_side_mult_base = side_config.get("no", 1.0)
 
