@@ -39,8 +39,8 @@ def load_private_key_from_file(file_path):
 # To start off, you need to have created an account at https://kalshi.com (Production)
 # or an account on the Demo https://demo.kalshi.co/
 
-prod_key_id = "e55e8ada-c606-4cfe-b991-7d9a19b3332f" # change these to be your personal credentials
-prod_private_key = load_private_key_from_file('Jane Kalshi.txt')
+prod_key_id = "c3204983-77fc-491b-99f7-136600698178" # Lisa credentials
+prod_private_key = load_private_key_from_file('Lisa_Kalshi.txt')
 
 demo_key_id = "" # change these to be your personal credentials
 # demo_private_key = load_private_key_from_file('kalshi-key.key')
