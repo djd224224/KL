@@ -691,7 +691,7 @@ combined_table
 ######### BETTING INPUTS
 increment = 3
 increment1 = 6
-price_count = list(range(0, 25))
+price_count = list(range(0, 8))
 starting_contracts = 1
 
 max_contracts = 500
@@ -822,10 +822,13 @@ for index, row in combined_table.iterrows():
                       'no_price':int(bid_price),
                       'expiration_ts':get_unix_time_for_tomorrow(cancel_hour, cancel_minute)}
     exchange_client.create_order(**order_params)
+    time.sleep(0.1)  # Rate limit protection
     success = append_to_gsheet(trades, spreadsheet_id, range_name)
     row['resting_order_count'] = row['resting_order_count'] + contracts
     orders_placed += 1
     level_orders += 1
+    if bid_price <= 1:
+      break  # Don't place more orders at the 1¢ floor
   if level_orders > 0:
     print(f"    ✓ Placed {level_orders} orders")
 
