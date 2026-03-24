@@ -577,15 +577,16 @@ x = combined_table[combined_table['high_range'] == 150]
 
 y = pd.DataFrame(columns=['City', 'low_range', 'Average', 'forecast_variation_vs_high_end', 'bid_price'])
 forcast_data = round(x['low_range'] - x['Average'])
-chart_end_index = [int(chart_index) for chart_index in forcast_data.tolist()]
 y['forecast_variation_vs_high_end'] = forcast_data
 y['City'] = x['City']
 y['low_range'] = x['low_range']
 y['Average'] = x['Average']
 y = pd.merge(y, actuals_vs_forecast_variation, on='City', how='inner')
+# Rebuild chart_end_index from merged y (only cities with historical data)
+chart_end_index = [int(v) for v in y['forecast_variation_vs_high_end'].tolist()]
 filtered_data = [y[str(col)].tolist() for col in range(5, -6, -1)]
 
-# calculate bid_price for each city
+# calculate bid_price for each city (only cities in actuals table)
 percentage_data = list()
 for index, value in enumerate(chart_end_index):
   if value > 5:
