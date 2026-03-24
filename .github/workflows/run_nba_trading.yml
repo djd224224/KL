@@ -1,9 +1,9 @@
-name: NBAMENTION v4.4 Trading Bot
-# Runs every 2 hours (offset by 2 min to avoid top-of-hour congestion)
-# Times in UTC: 0:02, 2:02, 4:02, 6:02, 8:02, 10:02, 12:02, 14:02, 16:02, 18:02, 20:02, 22:02
+name: NBAMENTION v4.6 Trading Bot
+# Runs every hour (offset by 2 min to avoid top-of-hour congestion)
+# 24 runs/day
 on:
   schedule:
-    - cron: '2 */2 * * *'
+    - cron: '2 * * * *'
   workflow_dispatch:  # Manual trigger
 jobs:
   run-trading-script:
