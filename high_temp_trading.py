@@ -66,28 +66,23 @@ import pytz
 
 def append_to_gsheet(df, spreadsheet_id, range_name):
     """
-    Append a DataFrame to a Google Sheet
+    Append a DataFrame to a Google Sheet. Non-fatal if credentials are missing.
     """
-    # Set up credentials
-    SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-    SERVICE_ACCOUNT_FILE = 'google_credentials.json'
-
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-
-    # Build the Sheets API service
-    service = build('sheets', 'v4', credentials=creds)
-
-    # Convert DataFrame to list of lists
-    values = df.values.tolist()
-
-    # Create the request body
-    body = {
-        'values': values
-    }
-
     try:
-        # Execute the append
+        SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+        SERVICE_ACCOUNT_FILE = 'google_credentials.json'
+
+        if not os.path.exists(SERVICE_ACCOUNT_FILE) or os.path.getsize(SERVICE_ACCOUNT_FILE) < 10:
+            print(f"GSheet skipped: {SERVICE_ACCOUNT_FILE} missing or empty")
+            return False
+
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+
+        service = build('sheets', 'v4', credentials=creds)
+        values = df.values.tolist()
+        body = {'values': values}
+
         result = service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
             range=range_name,
@@ -99,7 +94,7 @@ def append_to_gsheet(df, spreadsheet_id, range_name):
         print(f"{result.get('updates').get('updatedRows')} rows added")
         return True
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"GSheet error (non-fatal): {e}")
         return False
 
 # Determine if current time in Central Time is after 2 PM
