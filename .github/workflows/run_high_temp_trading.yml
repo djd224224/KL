@@ -1,28 +1,29 @@
 name: High temp trading
-
-  #To run the job at 7:02 PM, 11:02 PM, 6:02 AM, and 7:02 AM CT Time every day, you need to adjust the cron expression accordingly:
 on:
   schedule:
     - cron: '2 0,5,12,13 * * *'
   workflow_dispatch:
-
 jobs:
   run-kalshi-script:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout repository
       uses: actions/checkout@v2
-
     - name: Set up Python
       uses: actions/setup-python@v2
       with:
         python-version: '3.x'
-
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pandas requests cryptography google-auth google-api-python-client scipy pytz
-
+    - name: Write secrets to disk
+      run: |
+        echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > Lisa_Kalshi.txt
+        echo "${{ secrets.GOOGLE_CREDENTIALS }}" > google_credentials.json
     - name: Run Kalshi script
       run: python high_temp_trading.py
+    - name: Cleanup secrets
+      if: always()
+      run: |
+        rm -f Lisa_Kalshi.txt google_credentials.json
