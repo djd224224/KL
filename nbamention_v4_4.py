@@ -1485,13 +1485,15 @@ def cents_from_rate(rate: float) -> int:
         raise ValueError("rate is NaN/None")
     return int(round(float(rate) * 100))
 
-def get_market_details(market_ticker: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+def get_market_details(market_ticker: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """Returns (expiration_ts, open_interest, volume, game_start_ts)."""
     try:
         market_response = exchange_client.get_market(ticker=market_ticker)
         market_data = market_response.get('market', {})
 
         close_time = market_data.get('close_time')
         expiration_ts = None
+        game_start_ts = None
 
         if close_time:
             time_str = close_time
@@ -1499,16 +1501,17 @@ def get_market_details(market_ticker: str) -> Tuple[Optional[int], Optional[int]
                 time_str = time_str[:-1] + '+00:00'
             dt = datetime.fromisoformat(time_str)
             close_unix = int(dt.timestamp())
+            game_start_ts = close_unix  # actual game start / market close time
             expiration_ts = close_unix - (EXPIRATION_HOURS_BEFORE_CLOSE * 3600)
             if expiration_ts <= time.time():
                 expiration_ts = None
 
         open_interest = market_data.get('open_interest', 0)
         volume = market_data.get('volume', 0)
-        return expiration_ts, open_interest, volume
+        return expiration_ts, open_interest, volume, game_start_ts
 
     except Exception as e:
-        return None, None, None
+        return None, None, None, None
 
 def get_time_multiplier(hours_until_event: float) -> float:
     for threshold, multiplier in TIME_MULTIPLIERS:
@@ -1709,14 +1712,73 @@ def build_order_objects_for_market(
     # [v4.6] Unknown codes default to 0.0/0.0 — do not trade markets with no historical data
     _default_side = {"yes": 0.0, "no": 0.0}
     side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, _default_side)
+    orders_blocked = False
+    blocked_reason = None
     if ticker_part_3_market_code not in SIDE_MULTIPLIERS:
-        print(f"    ⛔ UNKNOWN CODE {ticker_part_3_market_code} — not in SIDE_MULTIPLIERS, skipping")
-        return []
+        print(f"    ⛔ UNKNOWN CODE {ticker_part_3_market_code} — not in SIDE_MULTIPLIERS, data-only")
+        orders_blocked = True
+        blocked_reason = "unknown_code"
     yes_side_mult_base = side_config.get("yes", 0.0)
     no_side_mult_base = side_config.get("no", 0.0)
 
     if yes_side_mult_base == 0.0 and no_side_mult_base == 0.0:
-        print(f"    ⛔ BOTH SIDES 0x for {ticker_part_3_market_code} — skipping")
+        if not orders_blocked:
+            print(f"    ⛔ BOTH SIDES 0x for {ticker_part_3_market_code} — data-only")
+        orders_blocked = True
+        blocked_reason = blocked_reason or "both_sides_0x"
+
+    # [v4.6] For blocked markets: still collect orderbook/market data for analytics, then skip orders
+    if orders_blocked:
+        expiration_ts, open_interest, volume, game_start_ts = get_market_details(ticker)
+        hours_until_event = (expiration_ts - time.time()) / 3600.0 if expiration_ts else 0
+
+        orderbook_yes_bid, orderbook_no_bid = None, None
+        try:
+            orderbook_response = exchange_client.get_orderbook(ticker=ticker, depth=10)
+            orderbook = orderbook_response.get('orderbook', orderbook_response)
+            yes_data = orderbook.get('yes', [])
+            no_data = orderbook.get('no', [])
+            if yes_data and len(yes_data) > 0:
+                orderbook_yes_bid, _ = parse_orderbook(yes_data)
+            if no_data and len(no_data) > 0:
+                orderbook_no_bid, _ = parse_orderbook(no_data)
+        except:
+            pass
+
+        market_mid_yes = None
+        if orderbook_yes_bid is not None and orderbook_no_bid is not None:
+            market_mid_yes = (orderbook_yes_bid + (100 - orderbook_no_bid)) / 2.0
+        elif orderbook_yes_bid is not None:
+            market_mid_yes = float(orderbook_yes_bid)
+        elif orderbook_no_bid is not None:
+            market_mid_yes = 100.0 - orderbook_no_bid
+
+        market_snapshots.append({
+            "pulled_at": datetime.now(UTC).isoformat(),
+            "run_id": RUN_ID,
+            "model_version": MODEL_VERSION,
+            "market_ticker": ticker,
+            "event_ticker": event_ticker,
+            "market_status": market_status,
+            "event_start_ts": expiration_ts,
+            "game_start_ts": game_start_ts,
+            "ticker_part_3_market_code": ticker_part_3_market_code,
+            "team_1": team_1,
+            "team_2": team_2,
+            "yes_best_bid": orderbook_yes_bid,
+            "no_best_bid": orderbook_no_bid,
+            "market_mid_yes": round(market_mid_yes, 1) if market_mid_yes else None,
+            "volume": volume or 0,
+            "open_interest": open_interest or 0,
+            "minutes_to_event_start": hours_until_event * 60 if hours_until_event else None,
+            "strategy_name": PRICING_STRATEGY,
+            "market_yes_rate": market_yes_rate,
+            "market_sample_size": market_sample_size,
+            "orders_blocked": True,
+            "blocked_reason": blocked_reason,
+            "yes_total_mult": 0.0,
+            "no_total_mult": 0.0,
+        })
         return []
 
     # Detect pairing mode
@@ -1749,7 +1811,7 @@ def build_order_objects_for_market(
         label = "⛔ BLOCKED" if no_side_mult == 0.0 else f"📉 {no_side_mult:.1f}x" if no_side_mult < 1.0 else f"🚀 {no_side_mult:.1f}x"
         print(f"    {label} NO for {ticker_part_3_market_code}")
 
-    expiration_ts, open_interest, volume = get_market_details(ticker)
+    expiration_ts, open_interest, volume, game_start_ts = get_market_details(ticker)
 
     if expiration_ts is None:
         print(f"    ✗ No valid expiration time — skipping")
@@ -2003,6 +2065,7 @@ def build_order_objects_for_market(
         "event_ticker": event_ticker,
         "market_status": market_status,
         "event_start_ts": expiration_ts,
+        "game_start_ts": game_start_ts,
         "ticker_part_3_market_code": ticker_part_3_market_code,
         "team_1": team_1,
         "team_2": team_2,
@@ -2047,6 +2110,8 @@ def build_order_objects_for_market(
         "ledger_paired_qty": ledger_data["paired_qty"] if ledger_data else None,
         "ledger_paired_edge": ledger_data["paired_edge"] if ledger_data else None,
         "ledger_net_side": ledger_data["net_side"] if ledger_data else None,
+        "orders_blocked": False,
+        "blocked_reason": None,
     }
     snapshot.update(bayesian_intermediates)
     market_snapshots.append(snapshot)
