@@ -810,17 +810,21 @@ for index, row in combined_table.iterrows():
                       'count':contracts,
                       'no_price':int(bid_price),
                       'expiration_ts':exp_ts}
-    exchange_client.create_order(**order_params)
-    time.sleep(0.1)  # Rate limit protection
-    all_order_records.append({
-        'city': row['City'], 'forecast_date': row['Forecast Date'], 'run_date': row['Run Date'],
-        'market_ticker': row['market_ticker'], 'contracts': contracts, 'no_price': int(bid_price),
-        'city_abv': abv, 'client_order_id': client_oid, 'expiration_ts': exp_ts,
-        'created_at': central_time.strftime('%Y-%m-%d %H:%M:%S'),
-    })
-    row['resting_order_count'] = row['resting_order_count'] + contracts
-    orders_placed += 1
-    level_orders += 1
+    try:
+      exchange_client.create_order(**order_params)
+      time.sleep(0.1)  # Rate limit protection
+      all_order_records.append({
+          'city': row['City'], 'forecast_date': row['Forecast Date'], 'run_date': row['Run Date'],
+          'market_ticker': row['market_ticker'], 'contracts': contracts, 'no_price': int(bid_price),
+          'city_abv': abv, 'client_order_id': client_oid, 'expiration_ts': exp_ts,
+          'created_at': central_time.strftime('%Y-%m-%d %H:%M:%S'),
+      })
+      row['resting_order_count'] = row['resting_order_count'] + contracts
+      orders_placed += 1
+      level_orders += 1
+    except Exception as e:
+      print(f"    ✗ Order failed {row['market_ticker']} @{int(bid_price)}¢: {e}")
+      time.sleep(0.2)  # Extra pause after error
     if bid_price <= 1:
       break  # Don't place more orders at the 1¢ floor
   if level_orders > 0:
