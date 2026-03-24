@@ -27,29 +27,28 @@ from datetime import datetime, timedelta
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
-def load_private_key_from_file(file_path):
-    with open(file_path, "rb") as key_file:
-        private_key = serialization.load_pem_private_key(
-            key_file.read(),
-            password=None,  # or provide a password if your key is encrypted
-            backend=default_backend()
-        )
-    return private_key
+import os
+import base64
 
-# To start off, you need to have created an account at https://kalshi.com (Production)
-# or an account on the Demo https://demo.kalshi.co/
+def load_private_key(b64_key="", file_path=""):
+    """Load Kalshi RSA key from file or env var (same as monitoring script)."""
+    if file_path and os.path.exists(file_path):
+        with open(file_path, "rb") as f: pem = f.read()
+    elif b64_key:
+        try: pem = base64.b64decode(b64_key)
+        except Exception: pem = b64_key.encode()
+    else:
+        raise FileNotFoundError(f"No private key. Set KALSHI_PRIVATE_KEY or place at '{file_path}'.")
+    return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
 
-prod_key_id = "c3204983-77fc-491b-99f7-136600698178" # Lisa credentials
-prod_private_key = load_private_key_from_file('Lisa_Kalshi.txt')
-
-demo_key_id = "" # change these to be your personal credentials
-# demo_private_key = load_private_key_from_file('kalshi-key.key')
+prod_key_id = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
+prod_private_key = load_private_key(
+    b64_key=os.environ.get("KALSHI_PRIVATE_KEY", ""),
+    file_path=os.environ.get("KALSHI_PRIVATE_KEY_PATH", "Lisa_Kalshi.txt")
+)
 
 # for prod
 prod_api_base = "https://api.elections.kalshi.com/trade-api/v2"
-
-# for demo
-demo_api_base = "https://demo-api.kalshi.co/trade-api/v2"
 
 ## if wanting to test in prod:
 exchange_client = ExchangeClient(exchange_api_base=prod_api_base, key_id = prod_key_id, private_key = prod_private_key)
