@@ -697,113 +697,110 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
     return int(target_time.timestamp())
 
 ########## BUY CALCULATIONS
+orders_placed = 0
 for index, row in combined_table.iterrows():
-  # print('hi')
-  if row['yes_probability'] > market_cutoff_probability or ("-T" in row['market_ticker'] and row['high_range'] == 150): #only place trades where the Yes on Kalshi is greater than market cutoff probability
-    if "-T" not in row['market_ticker'] or ("-T" in row['market_ticker'] and row['high_range'] == 150):
-      i1 = 0
-      for i in price_count:
-        if "-T" not in row['market_ticker']:
-          bid_price = max(row['hi_no_price'] - i * increment,1)
+  ticker = row['market_ticker']
+  is_tail = "-T" in ticker and row['high_range'] == 150
+  yes_prob = row['yes_probability']
+  no_offer = row['no_lowest_offer']
+  no_bid = row['no_highest_bid']
+  hi_no = row['hi_no_price']
 
-        if "-T" in row['market_ticker'] and row['high_range'] == 150:
-          bid_price = max(row['hi_no_price'] - i * increment1,1)
-        # print('hi')
-        if row['no_lowest_offer'] != '' and bid_price < int(row['no_lowest_offer']) and bid_price < int(row['no_highest_bid']) - 3 and (max_contracts >= row['position'] + row['resting_order_count'] + starting_contracts + i * 10):  #only place trades where the bid is below the best No offer price
-          trades = []
-          trades = pd.DataFrame(trades, columns=['City', 'Forecast Date', 'Run Date', 'Market', 'Contracts', 'Price', 'abv'])
+  # Diagnostic: show every market's state
+  print(f"\n  {ticker}: P(yes)={yes_prob:.2f} hi_no={hi_no} no_bid={no_bid} no_offer={no_offer} tail={is_tail}")
 
-          contracts = starting_contracts
-          i1 = i1 + 1
+  # Filter 1: probability cutoff
+  if not (yes_prob > market_cutoff_probability or is_tail):
+    print(f"    SKIP: P(yes)={yes_prob:.2f} <= {market_cutoff_probability} cutoff")
+    continue
 
-          # Detect city abbreviation and cancel time — check longer abbreviations first
-          abv = ''
-          cancel_hour = 10
-          cancel_minute = 5
-          ticker_str = row['market_ticker']
-          if 'THOU' in ticker_str:
-            abv = 'THOU'
-            cancel_hour = 10
-          elif 'SATX' in ticker_str:
-            abv = 'SATX'
-            cancel_hour = 10
-          elif 'TMIN' in ticker_str:
-            abv = 'TMIN'
-            cancel_hour = 10
-          elif 'NOLA' in ticker_str:
-            abv = 'NOLA'
-            cancel_hour = 10
-          elif 'CHI' in ticker_str:
-            abv = 'CHI'
-            cancel_hour = 10
-          elif 'AUS' in ticker_str:
-            abv = 'AUS'
-            cancel_hour = 10
-          elif 'HOU' in ticker_str:
-            abv = 'HOU'
-            cancel_hour = 10
-          elif 'DEN' in ticker_str:
-            abv = 'DEN'
-            cancel_hour = 10
-          elif 'NY-' in ticker_str:
-            abv = 'NY-'
-            cancel_hour = 9
-          elif 'PHI' in ticker_str:
-            abv = 'PHI'
-            cancel_hour = 9
-          elif 'MIA' in ticker_str:
-            abv = 'MIA'
-            cancel_hour = 9
-          elif 'LAX' in ticker_str:
-            abv = 'LAX'
-            cancel_hour = 10
-          elif 'ATL' in ticker_str:
-            abv = 'ATL'
-            cancel_hour = 9
-          elif 'TDC' in ticker_str:
-            abv = 'TDC'
-            cancel_hour = 9
-          elif 'PHX' in ticker_str:
-            abv = 'PHX'
-            cancel_hour = 10
-          elif 'DAL' in ticker_str:
-            abv = 'DAL'
-            cancel_hour = 10
-          elif 'TLV' in ticker_str:
-            abv = 'TLV'
-            cancel_hour = 10
-          elif 'OKC' in ticker_str:
-            abv = 'OKC'
-            cancel_hour = 10
-          elif 'SEA' in ticker_str:
-            abv = 'SEA'
-            cancel_hour = 10
-          elif 'SFO' in ticker_str:
-            abv = 'SFO'
-            cancel_hour = 10
+  # Filter 2: skip low-end tails
+  if "-T" in ticker and not is_tail:
+    print(f"    SKIP: low-end tail (not traded)")
+    continue
 
-          central_time = datetime.now(pytz.timezone('US/Central'))
-          if central_time.hour > 10 or central_time.hour < 6:
-            cancel_hour = 1
-            cancel_minute = 59
+  # Filter 3: need orderbook data
+  if no_offer == '' or no_bid == '':
+    print(f"    SKIP: no orderbook data")
+    continue
 
-          trades = pd.concat([trades, pd.DataFrame([[row['City'], row['Forecast Date'], row['Run Date'], row['market_ticker'], contracts, bid_price, abv]], columns=['City', 'Forecast Date', 'Run Date', 'Market', 'Contracts', 'Price', 'abv'])], ignore_index=True)
-          # print(trades)
-          order_params = {'ticker':row['market_ticker'],
-                            'client_order_id':str(uuid.uuid4()),
-                            'type':'limit',
-                            'action':'buy',
-                            'side':'no',
-                            'count':contracts,
-                            'yes_price':None, # yes_price = 100 - no_price
-                            'no_price':int(bid_price), # no_price = 100 - yes_price
-                            # 'post_only':True,
-                            'expiration_ts':get_unix_time_for_tomorrow(cancel_hour, cancel_minute),
-                            'sell_position_floor':None,
-                            'buy_max_cost':None}
-          exchange_client.create_order(**order_params)
-          success = append_to_gsheet(trades, spreadsheet_id, range_name)
-          row['resting_order_count'] = row['resting_order_count'] + contracts
+  i1 = 0
+  level_orders = 0
+  for i in price_count:
+    if "-T" not in ticker:
+      bid_price = max(hi_no - i * increment, 1)
+    if is_tail:
+      bid_price = max(hi_no - i * increment1, 1)
+
+    # Show first level diagnostics
+    if i == 0:
+      print(f"    Level 0: bid={bid_price:.0f} vs no_offer={int(no_offer)} no_bid={int(no_bid)} (need bid<offer AND bid<bid-3)")
+
+    if not (bid_price < int(no_offer)):
+      if i == 0: print(f"    SKIP level 0: bid {bid_price:.0f} >= no_offer {int(no_offer)}")
+      continue
+    if not (bid_price < int(no_bid) - 3):
+      if i == 0: print(f"    SKIP level 0: bid {bid_price:.0f} >= no_bid-3 ({int(no_bid)-3})")
+      continue
+    if not (max_contracts >= row['position'] + row['resting_order_count'] + starting_contracts + i * 10):
+      if i == 0: print(f"    SKIP level 0: position cap")
+      continue
+
+    trades = pd.DataFrame(columns=['City', 'Forecast Date', 'Run Date', 'Market', 'Contracts', 'Price', 'abv'])
+    contracts = starting_contracts
+    i1 = i1 + 1
+
+    # Detect city abbreviation and cancel time — check longer abbreviations first
+    abv = ''
+    cancel_hour = 10
+    cancel_minute = 5
+    ticker_str = row['market_ticker']
+    if 'THOU' in ticker_str: abv = 'THOU'; cancel_hour = 10
+    elif 'SATX' in ticker_str: abv = 'SATX'; cancel_hour = 10
+    elif 'TMIN' in ticker_str: abv = 'TMIN'; cancel_hour = 10
+    elif 'NOLA' in ticker_str: abv = 'NOLA'; cancel_hour = 10
+    elif 'CHI' in ticker_str: abv = 'CHI'; cancel_hour = 10
+    elif 'AUS' in ticker_str: abv = 'AUS'; cancel_hour = 10
+    elif 'HOU' in ticker_str: abv = 'HOU'; cancel_hour = 10
+    elif 'DEN' in ticker_str: abv = 'DEN'; cancel_hour = 10
+    elif 'NY-' in ticker_str: abv = 'NY-'; cancel_hour = 9
+    elif 'PHI' in ticker_str: abv = 'PHI'; cancel_hour = 9
+    elif 'MIA' in ticker_str: abv = 'MIA'; cancel_hour = 9
+    elif 'LAX' in ticker_str: abv = 'LAX'; cancel_hour = 10
+    elif 'ATL' in ticker_str: abv = 'ATL'; cancel_hour = 9
+    elif 'TDC' in ticker_str: abv = 'TDC'; cancel_hour = 9
+    elif 'PHX' in ticker_str: abv = 'PHX'; cancel_hour = 10
+    elif 'DAL' in ticker_str: abv = 'DAL'; cancel_hour = 10
+    elif 'TLV' in ticker_str: abv = 'TLV'; cancel_hour = 10
+    elif 'OKC' in ticker_str: abv = 'OKC'; cancel_hour = 10
+    elif 'SEA' in ticker_str: abv = 'SEA'; cancel_hour = 10
+    elif 'SFO' in ticker_str: abv = 'SFO'; cancel_hour = 10
+
+    central_time = datetime.now(pytz.timezone('US/Central'))
+    if central_time.hour > 10 or central_time.hour < 6:
+      cancel_hour = 1
+      cancel_minute = 59
+
+    trades = pd.concat([trades, pd.DataFrame([[row['City'], row['Forecast Date'], row['Run Date'], row['market_ticker'], contracts, bid_price, abv]], columns=['City', 'Forecast Date', 'Run Date', 'Market', 'Contracts', 'Price', 'abv'])], ignore_index=True)
+    order_params = {'ticker':row['market_ticker'],
+                      'client_order_id':str(uuid.uuid4()),
+                      'type':'limit',
+                      'action':'buy',
+                      'side':'no',
+                      'count':contracts,
+                      'no_price':int(bid_price),
+                      'expiration_ts':get_unix_time_for_tomorrow(cancel_hour, cancel_minute)}
+    exchange_client.create_order(**order_params)
+    success = append_to_gsheet(trades, spreadsheet_id, range_name)
+    row['resting_order_count'] = row['resting_order_count'] + contracts
+    orders_placed += 1
+    level_orders += 1
+  if level_orders > 0:
+    print(f"    ✓ Placed {level_orders} orders")
+
+print(f"\n{'='*60}")
+print(f"TOTAL ORDERS PLACED: {orders_placed}")
+print(f"{'='*60}")
 
 # PASTE YESTERDAY'S P&L INTO GSHEET
 # variable = 1
