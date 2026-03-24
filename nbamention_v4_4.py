@@ -1873,18 +1873,6 @@ def build_order_objects_for_market(
     except Exception as e:
         print(f"    Orderbook: Yes=N/A, No=N/A")
 
-    # [v4.6] Guard: empty orderbook + zero OI + zero volume
-    # Only hard-skip for far-out markets with no existing positions
-    # Close games or markets with ledger data proceed (may just be thin liquidity)
-    if orderbook_yes_bid is None and orderbook_no_bid is None and open_interest == 0 and volume == 0:
-        has_ledger = ledger_data is not None and (ledger_data.get('yes_qty', 0) + ledger_data.get('no_qty', 0)) > 0
-        if hours_until_event > 24 and not has_ledger:
-            print(f"    ⚠️ Empty orderbook + zero OI + zero volume + >24h out + no positions — skipping")
-            return []
-        else:
-            reason = f"{'has positions' if has_ledger else ''}{' + ' if has_ledger and hours_until_event <= 24 else ''}{'<24h to event' if hours_until_event <= 24 else ''}"
-            print(f"    ⚠️ Empty orderbook + zero OI — proceeding anyway ({reason})")
-
     # Mid-price anchor
     market_mid_yes = None
     if orderbook_yes_bid is not None and orderbook_no_bid is not None:
