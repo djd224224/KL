@@ -499,8 +499,19 @@ combined_table = pd.merge(forecast_table, markets_table, on='City', how='inner')
 combined_table['Average'] = pd.to_numeric(combined_table['Average'], errors='coerce')
 combined_table['Standard Deviation'] = pd.to_numeric(combined_table['Standard Deviation'], errors='coerce')
 
-# Replace zeros and NaNs in 'Standard Deviation' with a small positive value
-combined_table['Standard Deviation'] = combined_table['Standard Deviation'].replace({0: 1e-6, np.nan: 1e-6})
+# City-specific floor std dev (from v1 bot calibration, 1816 observations)
+# Model uses: max(inter_source_std, city_floor_std)
+# This prevents 0 std when all sources agree (which gives 100%/0% extremes)
+CITY_FLOOR_STD = {
+    "Austin": 1.2, "Miami": 1.0, "Houston": 1.9, "Denver": 1.4,
+    "New York City": 1.2, "Philadelphia": 1.3, "Chicago": 1.3, "Los Angeles": 1.2,
+    "Atlanta": 1.2, "Washington DC": 1.3, "Phoenix": 1.1, "Dallas": 1.2,
+    "Las Vegas": 1.1, "Oklahoma City": 1.4, "Seattle": 1.2, "San Francisco": 1.2,
+    "San Antonio": 1.2, "Minneapolis": 1.4, "New Orleans": 1.2,
+}
+combined_table['City Floor Std'] = combined_table['City'].map(CITY_FLOOR_STD).fillna(1.2)
+combined_table['Standard Deviation'] = combined_table[['Standard Deviation', 'City Floor Std']].max(axis=1)
+combined_table['Standard Deviation'] = combined_table['Standard Deviation'].replace({0: 1.2, np.nan: 1.2})
 
 # Ensure 'high_range' and 'low_range' are numeric
 combined_table['high_range'] = pd.to_numeric(combined_table['high_range'], errors='coerce')
@@ -524,6 +535,11 @@ for index, row in combined_table.iterrows():
                             'depth': 3
                                 }
   orderbook_response = exchange_client.get_orderbook(**market_history_params)
+
+  # Debug: print raw response for first 3 markets
+  if index < 3:
+    print(f"  DEBUG orderbook {market_ticker}: keys={list(orderbook_response.keys())} raw={str(orderbook_response)[:300]}")
+
   ob = orderbook_response.get('orderbook', orderbook_response)  # handles both nested and flat response shapes
 
   if ob.get('no') and len(ob['no']) > 0:
