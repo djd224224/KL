@@ -56,46 +56,45 @@ exchange_client = ExchangeClient(exchange_api_base=prod_api_base, key_id = prod_
 # first we will check on the exchange status to confirm you are properly connected...
 print(exchange_client.get_exchange_status())
 
-###### PASTE FORECAST_TABLE INTO GSHEET
+###### BIGQUERY SETUP
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 import pandas as pd
 from datetime import datetime
 import pytz
+from google.cloud import bigquery
 
-def append_to_gsheet(df, spreadsheet_id, range_name):
-    """
-    Append a DataFrame to a Google Sheet. Non-fatal if credentials are missing.
-    """
+BQ_PROJECT = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
+BQ_DATASET = os.environ.get("GCP_DATASET_ID", "Kalshi")
+BQ_TABLE_PREFIX = "KXHIGH_"
+
+# Authenticate
+if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+    # Check for google_credentials.json written by GitHub Actions
+    if os.path.exists("google_credentials.json") and os.path.getsize("google_credentials.json") > 10:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google_credentials.json"
+
+try:
+    bq_client = bigquery.Client(project=BQ_PROJECT)
+    print(f"BigQuery connected: {BQ_PROJECT}.{BQ_DATASET}")
+except Exception as e:
+    print(f"BigQuery init failed (non-fatal): {e}")
+    bq_client = None
+
+def write_to_bq(df, table_name, write_disposition="WRITE_APPEND"):
+    """Upload DataFrame to BigQuery. Non-fatal on failure."""
+    if bq_client is None or df is None or len(df) == 0:
+        return
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}{table_name}"
     try:
-        SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-        SERVICE_ACCOUNT_FILE = 'google_credentials.json'
-
-        if not os.path.exists(SERVICE_ACCOUNT_FILE) or os.path.getsize(SERVICE_ACCOUNT_FILE) < 10:
-            print(f"GSheet skipped: {SERVICE_ACCOUNT_FILE} missing or empty")
-            return False
-
-        creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-
-        service = build('sheets', 'v4', credentials=creds)
-        values = df.values.tolist()
-        body = {'values': values}
-
-        result = service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range=range_name,
-            valueInputOption='RAW',
-            insertDataOption='INSERT_ROWS',
-            body=body).execute()
-
-        print(f"Append successful")
-        print(f"{result.get('updates').get('updatedRows')} rows added")
-        return True
+        job_config = bigquery.LoadJobConfig(write_disposition=write_disposition, autodetect=True)
+        job = bq_client.load_table_from_dataframe(df, table_id, job_config=job_config)
+        job.result()
+        print(f"  BQ: {table_id} → {bq_client.get_table(table_id).num_rows} rows")
     except Exception as e:
-        print(f"GSheet error (non-fatal): {e}")
-        return False
+        print(f"  BQ error (non-fatal): {e}")
+
+# Collector for orders placed during this run
+all_order_records = []
 
 # Determine if current time in Central Time is after 2 PM
 central_time = datetime.now(pytz.timezone('US/Central'))
@@ -395,13 +394,7 @@ if variable == 1:
 
 forecast_table
 
-# Example usage:
-spreadsheet_id = '1SDwPpdK6H-78sWY5YYlToi043fYjlc2w2TuBvxUKs3Y'  # Get this from the URL
-range_name = 'City Summary!A2'  # If this is your first time, include headers in the sheet
-
-# Append your forecast_table
 forecast_table = forecast_table.fillna("")
-success = append_to_gsheet(forecast_table, spreadsheet_id, range_name)
 
 ########## DROP ANY WHERE MIDNIGHT TEMP IS WITHIN 5 DEGREES OF TOMORROW'S HIGH
 
@@ -644,14 +637,12 @@ for index, row in combined_table.iterrows():
 
 combined_table
 
-####### PASTE COMBINED_TABLE INTO GSHEET
+####### WRITE MARKET SNAPSHOT TO BIGQUERY
 
-spreadsheet_id = '1SDwPpdK6H-78sWY5YYlToi043fYjlc2w2TuBvxUKs3Y'
-range_name = 'Orderbook'
+print("\nWriting market snapshot to BigQuery...")
+write_to_bq(combined_table, "market_snapshot", "WRITE_APPEND")
 
-# Append your forecast_table
 combined_table = combined_table.fillna("")
-success = append_to_gsheet(combined_table, spreadsheet_id, range_name)
 
 ####### DELETE EXISTING ORDERS
 
@@ -697,8 +688,6 @@ starting_contracts = 1
 max_contracts = 500
 max_contracts1 = 500
 market_cutoff_probability = .2
-spreadsheet_id = '1SDwPpdK6H-78sWY5YYlToi043fYjlc2w2TuBvxUKs3Y'
-range_name = 'Trades Placed'
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
 from datetime import datetime, timedelta
@@ -777,7 +766,6 @@ for index, row in combined_table.iterrows():
       if i == 0: print(f"    SKIP level 0: position cap")
       continue
 
-    trades = pd.DataFrame(columns=['City', 'Forecast Date', 'Run Date', 'Market', 'Contracts', 'Price', 'abv'])
     contracts = starting_contracts
     i1 = i1 + 1
 
@@ -812,18 +800,24 @@ for index, row in combined_table.iterrows():
       cancel_hour = 1
       cancel_minute = 59
 
-    trades = pd.concat([trades, pd.DataFrame([[row['City'], row['Forecast Date'], row['Run Date'], row['market_ticker'], contracts, bid_price, abv]], columns=['City', 'Forecast Date', 'Run Date', 'Market', 'Contracts', 'Price', 'abv'])], ignore_index=True)
+    client_oid = str(uuid.uuid4())
+    exp_ts = get_unix_time_for_tomorrow(cancel_hour, cancel_minute)
     order_params = {'ticker':row['market_ticker'],
-                      'client_order_id':str(uuid.uuid4()),
+                      'client_order_id':client_oid,
                       'type':'limit',
                       'action':'buy',
                       'side':'no',
                       'count':contracts,
                       'no_price':int(bid_price),
-                      'expiration_ts':get_unix_time_for_tomorrow(cancel_hour, cancel_minute)}
+                      'expiration_ts':exp_ts}
     exchange_client.create_order(**order_params)
     time.sleep(0.1)  # Rate limit protection
-    success = append_to_gsheet(trades, spreadsheet_id, range_name)
+    all_order_records.append({
+        'city': row['City'], 'forecast_date': row['Forecast Date'], 'run_date': row['Run Date'],
+        'market_ticker': row['market_ticker'], 'contracts': contracts, 'no_price': int(bid_price),
+        'city_abv': abv, 'client_order_id': client_oid, 'expiration_ts': exp_ts,
+        'created_at': central_time.strftime('%Y-%m-%d %H:%M:%S'),
+    })
     row['resting_order_count'] = row['resting_order_count'] + contracts
     orders_placed += 1
     level_orders += 1
@@ -836,173 +830,12 @@ print(f"\n{'='*60}")
 print(f"TOTAL ORDERS PLACED: {orders_placed}")
 print(f"{'='*60}")
 
-# PASTE YESTERDAY'S P&L INTO GSHEET
-# variable = 1
-central_tz = pytz.timezone("America/Chicago")
-central_now = datetime.now(central_tz)
-central_date = central_now.date()
+# Write all orders to BigQuery
+if all_order_records:
+    df_orders = pd.DataFrame(all_order_records)
+    df_orders['forecast_date'] = pd.to_datetime(df_orders['forecast_date'])
+    df_orders['run_date'] = pd.to_datetime(df_orders['run_date'])
+    df_orders['created_at'] = pd.to_datetime(df_orders['created_at'])
+    write_to_bq(df_orders, "orders", "WRITE_APPEND")
 
-date = central_date - timedelta(days=variable)
-month = date.strftime("%b").upper()
-day = date.strftime("%d")
-# print(date)
-# print(month)
-# print(day)
-settlement_params = {'limit': 1000}
-
-settlements = exchange_client.get_portfolio_settlements(**settlement_params)
-# print(settlements)
-spreadsheet_id = '1SDwPpdK6H-78sWY5YYlToi043fYjlc2w2TuBvxUKs3Y'  # Get this from the URL
-range_name = 'PnL'  # If this is your first time, include headers in the sheet
-# settlement_table = []
-
-for settlement in settlements['settlements']:
-  if variable == 1:
-    if settlement['yes_total_cost'] > 0 or settlement['no_total_cost'] > 0:
-      settled_time_dt = datetime.strptime(settlement['settled_time'], '%Y-%m-%dT%H:%M:%S.%fZ')
-      trade_date_dt = settled_time_dt - timedelta(days=variable)
-      today_date = datetime.now(pytz.timezone('US/Central'))
-      # print(settled_time_dt.strftime('%Y-%m-%d'))
-      # if settled_time_dt.strftime('%Y-%m-%d') == '2025-02-19':
-        # print('hi')
-      if 'HIGH' in settlement['ticker'] and day in settlement['ticker'] and month in settlement['ticker']:
-        # Detect city abbreviation — longer prefixes first to avoid partial matches
-        stk = settlement['ticker']
-        if 'THOU' in stk: settlement['abv'] = 'THOU'
-        elif 'SATX' in stk: settlement['abv'] = 'SATX'
-        elif 'TMIN' in stk: settlement['abv'] = 'TMIN'
-        elif 'NOLA' in stk: settlement['abv'] = 'NOLA'
-        elif 'CHI' in stk: settlement['abv'] = 'CHI'
-        elif 'AUS' in stk: settlement['abv'] = 'AUS'
-        elif 'HOU' in stk: settlement['abv'] = 'HOU'
-        elif 'DEN' in stk: settlement['abv'] = 'DEN'
-        elif 'NY-' in stk: settlement['abv'] = 'NY-'
-        elif 'PHI' in stk: settlement['abv'] = 'PHI'
-        elif 'MIA' in stk: settlement['abv'] = 'MIA'
-        elif 'LAX' in stk: settlement['abv'] = 'LAX'
-        elif 'ATL' in stk: settlement['abv'] = 'ATL'
-        elif 'TDC' in stk: settlement['abv'] = 'TDC'
-        elif 'PHX' in stk: settlement['abv'] = 'PHX'
-        elif 'DAL' in stk: settlement['abv'] = 'DAL'
-        elif 'TLV' in stk: settlement['abv'] = 'TLV'
-        elif 'OKC' in stk: settlement['abv'] = 'OKC'
-        elif 'SEA' in stk: settlement['abv'] = 'SEA'
-        elif 'SFO' in stk: settlement['abv'] = 'SFO'
-        settlement['trade_date'] = trade_date_dt.strftime('%Y-%m-%d')
-        settlement['profit'] = settlement['revenue'] - settlement['yes_total_cost'] - settlement['no_total_cost']
-        settlement_table = pd.DataFrame(settlement, index=[0])
-        print(settlement_table)
-        settlement_table = settlement_table.fillna("")
-        success = append_to_gsheet(settlement_table, spreadsheet_id, range_name)
-
-# GET FINALIZED MARKET DATA
-# variable = 1
-central_tz = pytz.timezone("America/Chicago")
-central_now = datetime.now(central_tz)
-central_date = central_now.date()
-
-date = central_date - timedelta(days=variable)
-# date = datetime.strptime('2025-02-18', '%Y-%m-%d') #if you need to fix historicals
-month = date.strftime("%b").upper()
-day = date.strftime("%d")
-
-event_ticker1 = ['KXHIGHCHI-26' + month + day, 'CHI']
-event_ticker2 = ['KXHIGHNY-26' + month + day, 'NY-']
-event_ticker3 = ['KXHIGHDEN-26' + month + day, 'DEN']
-event_ticker4 = ['KXHIGHPHIL-26' + month + day, 'PHI']
-event_ticker5 = ['KXHIGHAUS-26' + month + day, 'AUS']
-event_ticker6 = ['KXHIGHMIA-26' + month + day, 'MIA']
-event_ticker7 = ['KXHIGHTHOU-26' + month + day, 'THOU']
-event_ticker8 = ['KXHIGHLAX-26' + month + day, 'LAX']
-event_ticker9 = ['KXHIGHTATL-26' + month + day, 'ATL']
-event_ticker10 = ['KXHIGHTDC-26' + month + day, 'TDC']
-event_ticker11 = ['KXHIGHTPHX-26' + month + day, 'PHX']
-event_ticker12 = ['KXHIGHTDAL-26' + month + day, 'DAL']
-event_ticker13 = ['KXHIGHTLV-26' + month + day, 'TLV']
-event_ticker14 = ['KXHIGHTOKC-26' + month + day, 'OKC']
-event_ticker15 = ['KXHIGHTSEA-26' + month + day, 'SEA']
-event_ticker16 = ['KXHIGHTSFO-26' + month + day, 'SFO']
-event_ticker17 = ['KXHIGHTSATX-26' + month + day, 'SATX']
-event_ticker18 = ['KXHIGHTMIN-26' + month + day, 'TMIN']
-event_ticker19 = ['KXHIGHTNOLA-26' + month + day, 'NOLA']
-all_event_tickers = [event_ticker1, event_ticker2, event_ticker3, event_ticker4, event_ticker5, event_ticker6, event_ticker7, event_ticker8, event_ticker9, event_ticker10, event_ticker11, event_ticker12, event_ticker13, event_ticker14, event_ticker15, event_ticker16, event_ticker17, event_ticker18, event_ticker19]
-event_tickers = pd.DataFrame(all_event_tickers, columns=['Ticker', 'ABV'])
-markets_table = pd.DataFrame(columns=['event_ticker', 'market_ticker', 'ABV', 'volume_traded', 'avg_trade_price_yes', 'avg_trade_price_no', 'pct_volume_traded_yes_taker', 'pct_volume_traded_no_taker', 'trade_date', 'winning_temp', 'winner', 'concat'])
-
-if variable == 1:
-  trade_date = datetime.now(pytz.timezone('US/Central')) - timedelta(days=variable)
-  trade_date = trade_date.strftime('%Y-%m-%d')
-  # trade_date = '2025-02-18' #if you need to fix historicals
-  for event_ticker in event_tickers['Ticker']:
-    event_params = {'event_ticker': event_ticker}
-    event_response = exchange_client.get_event(**event_params)
-    abv = event_tickers.loc[event_tickers['Ticker'] == event_ticker, 'ABV'].iloc[0]
-    for market in event_response['markets']:
-      winning_temp = None
-      winning_ticker = None
-      winner = None
-      concat = abv + trade_date
-      if market['result'] == 'yes':
-        winning_temp = market['expiration_value']
-        winner = 'yes'
-        concat = abv + trade_date + winner
-      volume_traded = 0
-      pct_volume_traded_yes_taker = 0
-      pct_volume_traded_no_taker = 0
-      avg_trade_price_yes = 0
-      avg_trade_price_no = 0
-
-      try:
-        market_params = {'limit':1000,
-                            'ticker':market['ticker']}
-        trade_response = exchange_client.get_trades(**market_params)
-
-        for trade in trade_response['trades']:
-          volume_traded = volume_traded + trade['count']
-          avg_trade_price_yes = avg_trade_price_yes + (trade['yes_price'] * trade['count'])
-          avg_trade_price_no = avg_trade_price_no + (trade['no_price'] * trade['count'])
-          if trade['taker_side'] == 'yes':
-            pct_volume_traded_yes_taker = pct_volume_traded_yes_taker + trade['count']
-          if trade['taker_side'] == 'no':
-            pct_volume_traded_no_taker = pct_volume_traded_no_taker + trade['count']
-
-        # Check if volume_traded is zero before performing division
-        if volume_traded != 0:
-          avg_trade_price_yes = avg_trade_price_yes / volume_traded
-          avg_trade_price_no = avg_trade_price_no / volume_traded
-          pct_volume_traded_yes_taker = pct_volume_traded_yes_taker / volume_traded
-          pct_volume_traded_no_taker = pct_volume_traded_no_taker / volume_traded
-      except Exception as e:
-        print(f"Error fetching trades for {market['ticker']}: {e}")
-
-      markets_table = pd.concat([markets_table, pd.DataFrame([[event_ticker, market['ticker'], abv, volume_traded, avg_trade_price_yes, avg_trade_price_no, pct_volume_traded_yes_taker, pct_volume_traded_no_taker, trade_date, winning_temp, winner, concat]], columns=['event_ticker', 'market_ticker', 'ABV', 'volume_traded', 'avg_trade_price_yes', 'avg_trade_price_no', 'pct_volume_traded_yes_taker', 'pct_volume_traded_no_taker','trade_date','winning_temp', 'winner', 'concat'])], ignore_index=True)
-
-  markets_table
-
-  spreadsheet_id = '1SDwPpdK6H-78sWY5YYlToi043fYjlc2w2TuBvxUKs3Y'
-  range_name = 'Finalized Market Data'
-  append_to_gsheet(markets_table, spreadsheet_id, range_name)
-
-### GET FILLS
-# variable = 1
-if variable == 1:
-  for event_ticker in event_tickers['Ticker']:
-    event_params = {'event_ticker': event_ticker}
-    event_response = exchange_client.get_event(**event_params)
-    for market in event_response['markets']:
-
-      fill_params = {'limit': 1000,
-                    'ticker': market['ticker']
-                    }
-      fill_response = exchange_client.get_fills(**fill_params) # assign the response to fill_response
-      #Check if there are any fills in the response
-      if fill_response and fill_response.get('fills'):
-          fill_params_df = pd.DataFrame(fill_response['fills'])
-          # Check if 'ticker' and 'no_price' columns exist before accessing them
-          if 'ticker' in fill_params_df.columns and 'no_price' in fill_params_df.columns:
-              fill_params_df['concat'] = fill_params_df['ticker'] + fill_params_df['no_price'].astype(str) # Convert no_price to string before concatenation
-              # print(fill_params_df)
-          fill_params_df['created_time_central'] = pd.to_datetime(fill_params_df['created_time'], utc=True).dt.tz_convert('US/Central').dt.strftime('%Y-%m-%d %H:%M:%S')
-          spreadsheet_id = '1SDwPpdK6H-78sWY5YYlToi043fYjlc2w2TuBvxUKs3Y'
-          range_name = 'Fills'
-          append_to_gsheet(fill_params_df, spreadsheet_id, range_name)
+print("\nTrading run complete.")
