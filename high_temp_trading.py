@@ -536,20 +536,35 @@ for index, row in combined_table.iterrows():
                                 }
   orderbook_response = exchange_client.get_orderbook(**market_history_params)
 
-  # Debug: print raw response for first 3 markets
-  if index < 3:
-    print(f"  DEBUG orderbook {market_ticker}: keys={list(orderbook_response.keys())} raw={str(orderbook_response)[:300]}")
+  # Parse orderbook — handle both old format (orderbook.no/yes in cents)
+  # and new format (orderbook_fp.no_dollars/yes_dollars in dollar strings)
+  no_levels = []  # list of [price_cents, quantity]
+  yes_levels = []
 
-  ob = orderbook_response.get('orderbook', orderbook_response)  # handles both nested and flat response shapes
+  if 'orderbook_fp' in orderbook_response:
+    ob_fp = orderbook_response['orderbook_fp']
+    # no_dollars: [['0.8200', '300.00'], ...] → price in dollars, convert to cents
+    for level in ob_fp.get('no_dollars', []):
+      no_levels.append([int(round(float(level[0]) * 100)), int(float(level[1]))])
+    for level in ob_fp.get('yes_dollars', []):
+      yes_levels.append([int(round(float(level[0]) * 100)), int(float(level[1]))])
+  elif 'orderbook' in orderbook_response:
+    ob = orderbook_response['orderbook']
+    no_levels = ob.get('no', [])
+    yes_levels = ob.get('yes', [])
+  else:
+    # Response itself might be the orderbook
+    no_levels = orderbook_response.get('no', [])
+    yes_levels = orderbook_response.get('yes', [])
 
-  if ob.get('no') and len(ob['no']) > 0:
-    combined_table.loc[index, 'no_highest_bid'] = str(ob['no'][-1][0])
+  if no_levels and len(no_levels) > 0:
+    combined_table.loc[index, 'no_highest_bid'] = str(no_levels[-1][0])
 
-  if ob.get('yes') and len(ob['yes']) > 0:
-    combined_table.loc[index, 'no_lowest_offer'] = str(100 - ob['yes'][-1][0])
+  if yes_levels and len(yes_levels) > 0:
+    combined_table.loc[index, 'no_lowest_offer'] = str(100 - yes_levels[-1][0])
 
-  combined_table.loc[index, 'no_orderbook'] = str(ob.get('no', []))
-  combined_table.loc[index, 'yes_orderbook'] = str(ob.get('yes', []))
+  combined_table.loc[index, 'no_orderbook'] = str(no_levels)
+  combined_table.loc[index, 'yes_orderbook'] = str(yes_levels)
 
 combined_table
 
