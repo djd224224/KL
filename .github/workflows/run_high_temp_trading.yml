@@ -1,44 +1,28 @@
-# name: High Temp Trading
-# on:
-#   schedule:
-#     - cron: '2 0,5,12,13 * * *' 
-#   workflow_dispatch:
+name: High temp trading
 
-# jobs:
-#   run-kalshi-script:
-#     runs-on: ubuntu-latest
-#     timeout-minutes: 30
-#     steps:
-#       - name: Checkout repository
-#         uses: actions/checkout@v4
-#       - name: Set up Python
-#         uses: actions/setup-python@v5
-#         with:
-#           python-version: '3.12'
-#       - name: Install dependencies
-#         run: |
-#           python -m pip install --upgrade pip
-#           pip install pandas numpy requests cryptography google-auth google-cloud-bigquery db-dtypes pyarrow scipy pytz
-#       - name: Write Kalshi private key
-#         run: |
-#           echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > kalshi_private_key.pem
-#           chmod 600 kalshi_private_key.pem
-#       - name: Write GCP service account key
-#         env:
-#           GCP_SA_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-#         run: |
-#           printenv GCP_SA_KEY > gcp_sa_key.json
-#       - name: Run Kalshi script
-#         env:
-#           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
-#           KALSHI_PRIVATE_KEY_PATH: kalshi_private_key.pem
-#           GOOGLE_APPLICATION_CREDENTIALS: gcp_sa_key.json
-#           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-#           GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
-#           WEATHER_UNDERGROUND_KEY: ${{ secrets.WEATHER_UNDERGROUND_KEY }}
-#           ACCUWEATHER_KEY: ${{ secrets.ACCUWEATHER_KEY }}
-#         run: python high_temp_trading.py
-#       - name: Cleanup secrets
-#         if: always()
-#         run: |
-#           rm -f kalshi_private_key.pem gcp_sa_key.json
+  #To run the job at 7:02 PM, 11:02 PM, 6:02 AM, and 7:02 AM CT Time every day, you need to adjust the cron expression accordingly:
+on:
+  schedule:
+    - cron: '2 0,5,12,13 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-kalshi-script:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas requests cryptography google-auth google-api-python-client scipy pytz
+
+    - name: Run Kalshi script
+      run: python high_temp_trading.py
