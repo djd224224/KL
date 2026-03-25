@@ -13,8 +13,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 import os
 import uuid
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import json
+from urllib.request import urlopen, Request
 import numpy as np
 from google.cloud import bigquery
 
@@ -266,7 +268,6 @@ print("\n✓ Data collection complete!")
 #
 #   TIER1_MARKETS: Added DOUB (tournament regime shift)
 #   TEAM_MARKET_OVERRIDES: Flipped MIC/RECO to match new Yes-favored RECO
-#   MODEL_VERSION: v4.4 → v4.5
 # ==============================================================
 
 
@@ -386,6 +387,235 @@ TEAM_RISK_MULTIPLIER = {
     "MIC": 1.3, "TTU": 1.3, "ISU": 1.2,
 }
 
+# =========================
+# [v4.5] THE ODDS API — GAME START TIME SOURCE
+# =========================
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "e2d4375f44ff9cc272da93bee587a46a")
+ODDS_API_NCAAB_SPORT_KEY = "basketball_ncaab"
+ODDS_API_EXPIRATION_BUFFER_SEC = 0
+
+NCAAB_TEAM_NAME_TO_CODE = [
+    ("north carolina state", "NCS"), ("nc state", "NCS"),
+    ("north carolina", "UNC"),
+    ("south carolina", "SCA"),
+    ("michigan state", "MSU"), ("michigan", "MIC"),
+    ("mississippi state", "MSS"), ("ole miss", "MIS"), ("mississippi", "MIS"),
+    ("iowa state", "ISU"), ("iowa", "IOW"),
+    ("arkansas", "ARK"),
+    ("kansas state", "KSU"), ("kansas", "KAN"),
+    ("florida state", "FSU"), ("florida", "FLA"),
+    ("arizona state", "ASU"), ("arizona", "ARI"),
+    ("colorado state", "CSU"), ("colorado", "COL"),
+    ("ohio state", "OHS"), ("ohio", "OHI"),
+    ("oklahoma state", "OKS"), ("oklahoma", "OKL"),
+    ("oregon state", "ORS"), ("oregon", "ORE"),
+    ("penn state", "PEN"),
+    ("virginia tech", "VIT"), ("west virginia", "WVU"), ("virginia", "VIR"),
+    ("texas a&m", "TAM"), ("texas tech", "TTU"), ("texas", "TEX"),
+    ("georgia tech", "GAT"), ("georgetown", "GEO"), ("georgia", "UGA"),
+    ("washington state", "WSU"), ("washington", "WAS"),
+    ("saint joseph", "JOES"), ("st. joseph", "JOES"),
+    ("saint john", "STJ"), ("st. john", "STJ"),
+    ("saint mary", "SMC"), ("st. mary", "SMC"),
+    ("san diego state", "SDS"),
+    ("southern california", "USC"), ("usc trojans", "USC"),
+    ("grand canyon", "GCU"),
+    ("boise state", "BOI"),
+    ("wake forest", "WAK"),
+    ("seton hall", "SET"),
+    ("notre dame", "NOT"),
+    ("alabama", "ALA"), ("auburn", "AUB"),
+    ("baylor", "BAY"), ("brigham young", "BYU"), ("byu", "BYU"),
+    ("butler", "BUT"), ("cincinnati", "CIN"), ("clemson", "CLE"),
+    ("connecticut", "CON"), ("uconn", "CON"),
+    ("creighton", "CRE"), ("dayton", "DAY"), ("drake", "DRA"),
+    ("duke", "DUK"), ("gonzaga", "GON"), ("houston", "HOU"),
+    ("illinois", "ILL"), ("indiana", "IND"),
+    ("kentucky", "UKF"),
+    ("louisville", "LOU"), ("lsu", "LSU"),
+    ("marquette", "MRQ"), ("maryland", "MAR"),
+    ("memphis", "MEM"), ("miami", "MIA"), ("minnesota", "MIN"),
+    ("missouri", "MIZ"), ("nebraska", "NEB"), ("nevada", "NEV"),
+    ("new mexico state", "NMSU"), ("new mexico", "UNM"),
+    ("middle tennessee", "MTSU"), ("east tennessee", "ETSU"),
+    ("northwestern", "NOR"),
+    ("pittsburgh", "PIT"), ("providence", "PRO"), ("purdue", "PUR"),
+    ("rutgers", "RUT"), ("stanford", "STA"), ("syracuse", "SYR"),
+    ("tcu", "TCU"), ("tennessee", "TEN"), ("tulane", "TUL"),
+    ("ucla", "UCL"), ("utah", "UTA"), ("vanderbilt", "VAN"),
+    ("villanova", "VIL"), ("wisconsin", "WIS"), ("xavier", "XAV"),
+]
+
+ncaab_schedule_cache = {}
+ncaab_schedule_events = {}
+
+
+def ncaab_team_to_code(full_name):
+    """Convert Odds API full team name to Kalshi 3-letter code."""
+    name_lower = full_name.lower().strip()
+    for key, code in NCAAB_TEAM_NAME_TO_CODE:
+        if key in name_lower:
+            return code
+    parts = full_name.strip().split()
+    if parts:
+        return parts[0][:3].upper()
+    return None
+
+
+KALSHI_CODE_ALIASES = {
+    "SJU":  "john",
+    "ILST": "illinois",
+    "UKF":  "kentucky",
+    "NCS":  "nc state",
+    "MSU":  "michigan state",
+    "ISU":  "iowa state",
+    "KSU":  "kansas state",
+    "FSU":  "florida state",
+    "ASU":  "arizona state",
+    "CSU":  "colorado state",
+    "OHS":  "ohio state",
+    "OKS":  "oklahoma state",
+    "ORS":  "oregon state",
+    "VIT":  "virginia tech",
+    "WVU":  "west virginia",
+    "TAM":  "texas a",
+    "GAT":  "georgia tech",
+    "GEO":  "georgetown",
+    "UGA":  "georgia",
+    "SDS":  "san diego state",
+    "USC":  "southern california",
+    "GCU":  "grand canyon",
+    "BOI":  "boise state",
+    "MRQ":  "marquette",
+    "STJ":  "john",
+    "SMC":  "mary",
+    "WSU":  "washington state",
+    "SCA":  "south carolina",
+    "CON":  "connecticut",
+    "NOT":  "notre dame",
+    "UNM":  "new mexico",
+    "NMSU": "new mexico state",
+    "SDSU": "san diego state",
+    "ETSU": "east tennessee",
+    "MTSU": "middle tennessee",
+    "JOES": "joseph",
+}
+
+
+def _code_matches_team(code, full_name):
+    """Check if a Kalshi ticker code segment plausibly matches an Odds API team name."""
+    code_upper = code.upper()
+    name_clean = full_name.upper().replace("'", "").replace(".", " ").replace("-", " ")
+    words = name_clean.split()
+
+    if any(w.startswith(code_upper) for w in words):
+        return True
+
+    alias = KALSHI_CODE_ALIASES.get(code_upper)
+    if alias and alias.upper() in full_name.upper():
+        return True
+
+    name_compressed = "".join(words)
+    if len(code_upper) >= 3 and code_upper in name_compressed:
+        return True
+
+    return False
+
+
+def _match_teams_code_to_event(teams_code, home_full, away_full):
+    """Try ALL possible split points of the raw Kalshi teams_code string."""
+    tc = teams_code.upper()
+    for k in range(2, len(tc) - 1):
+        left, right = tc[:k], tc[k:]
+        if (_code_matches_team(left, home_full) and _code_matches_team(right, away_full)):
+            return True
+        if (_code_matches_team(left, away_full) and _code_matches_team(right, home_full)):
+            return True
+    return False
+
+
+def fetch_ncaab_schedule():
+    """Fetch NCAAB events from The Odds API. Populates global caches."""
+    global ncaab_schedule_cache, ncaab_schedule_events
+    ncaab_schedule_cache = {}
+    ncaab_schedule_events = {}
+
+    url = f"https://api.the-odds-api.com/v4/sports/{ODDS_API_NCAAB_SPORT_KEY}/events?apiKey={ODDS_API_KEY}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        print(f"  ✓ Fetched {len(data)} NCAAB events from Odds API")
+
+        matched = 0
+        for event in data:
+            commence = event.get("commence_time")
+            home = event.get("home_team", "")
+            away = event.get("away_team", "")
+            if not commence or not home or not away:
+                continue
+
+            ct = commence
+            if ct.endswith("Z"):
+                ct = ct[:-1] + "+00:00"
+            game_dt = datetime.fromisoformat(ct)
+            game_unix = int(game_dt.timestamp())
+            game_date = game_dt.strftime("%Y%m%d")
+
+            ncaab_schedule_events.setdefault(game_date, []).append({
+                "home": home, "away": away, "ts": game_unix
+            })
+
+            home_code = ncaab_team_to_code(home)
+            away_code = ncaab_team_to_code(away)
+            if home_code and away_code:
+                teams_sorted = sorted([home_code, away_code])
+                cache_key = f"{game_date}-{teams_sorted[0]}-{teams_sorted[1]}"
+                ncaab_schedule_cache[cache_key] = game_unix
+                matched += 1
+
+        print(f"  ✓ Code-matched {matched}/{len(data)} events")
+        print(f"  ✓ Schedule cache: {len(ncaab_schedule_cache)} code entries, {len(ncaab_schedule_events)} date buckets")
+    except Exception as e:
+        print(f"  ⚠️ Odds API fetch failed: {e}")
+        print(f"  ⚠️ Falling back to ticker-estimated game times (~7pm ET)")
+
+
+def get_game_start_ts(team_1, team_2, event_date_str):
+    """Look up game start time from Odds API schedule cache."""
+    if not ncaab_schedule_cache and not ncaab_schedule_events:
+        return None, "ticker_estimate"
+    if not team_1 or not team_2 or not event_date_str:
+        return None, "ticker_estimate"
+
+    try:
+        dt = datetime.strptime(str(event_date_str), "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None, "ticker_estimate"
+
+    teams_code = (team_1 + team_2).upper()
+
+    dates_to_check = [
+        dt.strftime("%Y%m%d"),
+        (dt + timedelta(days=1)).strftime("%Y%m%d"),
+        (dt + timedelta(days=2)).strftime("%Y%m%d"),
+    ]
+
+    for date_key in dates_to_check:
+        teams_sorted = sorted([team_1.upper(), team_2.upper()])
+        cache_key = f"{date_key}-{teams_sorted[0]}-{teams_sorted[1]}"
+        if cache_key in ncaab_schedule_cache:
+            return ncaab_schedule_cache[cache_key], "odds_api"
+
+        events_on_date = ncaab_schedule_events.get(date_key, [])
+        for evt in events_on_date:
+            if _match_teams_code_to_event(teams_code, evt["home"], evt["away"]):
+                primary_cache_key = f"{dates_to_check[0]}-{teams_sorted[0]}-{teams_sorted[1]}"
+                ncaab_schedule_cache[primary_cache_key] = evt["ts"]
+                return evt["ts"], "odds_api"
+
+    return None, "ticker_estimate"
+
 
 # =========================
 # PRICE FILTERS
@@ -409,7 +639,6 @@ MAX_COMBINED_SWEET_BOOST = 2.0
 # ORDER CONFIGURATION
 # =========================
 def generate_base_contracts(num_levels: int) -> List[int]:
-    """[v4.4] Scaled up: 15/18/22/25. Dampener + Kelly control risk."""
     contracts = []
     for i in range(num_levels):
         if i < 3:
@@ -426,30 +655,18 @@ NUM_OFFSET_LEVELS = 12
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 MAX_CONTRACTS_PER_ORDER = 300
-MAX_CONTRACTS_PER_MARKET_PER_RUN = 100
+MAX_CONTRACTS_PER_MARKET_PER_RUN = 75
 
-# ---------- DYNAMIC SIZING MULTIPLIERS ----------
 TIME_MULTIPLIERS = [
-    (1, 1.8),
-    (3, 1.5),
-    (6, 1.3),
-    (12, 1.1),
-    (24, 1.0),
-    (48, 0.9),
-    (999999, 0.7),
+    (1, 1.8), (3, 1.5), (6, 1.3), (12, 1.1),
+    (24, 1.0), (48, 0.9), (999999, 0.7),
 ]
 
 VOLUME_MULTIPLIERS = [
-    (50000, 1.8),
-    (20000, 1.5),
-    (10000, 1.3),
-    (5000, 1.1),
-    (2000, 1.0),
-    (1000, 0.9),
-    (0, 0.8),
+    (50000, 1.8), (20000, 1.5), (10000, 1.3), (5000, 1.1),
+    (2000, 1.0), (1000, 0.9), (0, 0.8),
 ]
 
-# ---------- SPREAD-BASED OFFSET CONFIGURATION ----------
 def generate_offsets(start: int, increment: int, count: int) -> List[int]:
     return [start + i * increment for i in range(count)]
 
@@ -477,11 +694,6 @@ FALLBACK_OFFSET = 15
 # =========================
 
 def apply_team_overrides(market_code, team_1, team_2, base_yes_mult, base_no_mult):
-    """
-    Check if either team triggers a market-specific override.
-    If both teams have overrides, use the more conservative multiplier.
-    Returns (yes_mult, no_mult, override_applied, reason)
-    """
     override_1 = TEAM_MARKET_OVERRIDES.get((team_1, market_code))
     override_2 = TEAM_MARKET_OVERRIDES.get((team_2, market_code))
     if override_1 is None and override_2 is None:
@@ -545,7 +757,16 @@ print(f"Base contracts: {BASE_YES_CONTRACTS[:5]}...")
 print(f"{'='*70}\n")
 
 # =====================================================================
-# FILLS-BASED POSITION LEDGER [v4.2-1]
+# [v4.5] FETCH NCAAB GAME SCHEDULE FROM ODDS API
+# =====================================================================
+print(f"{'='*70}")
+print("FETCHING NCAAB SCHEDULE (The Odds API)")
+print(f"{'='*70}")
+fetch_ncaab_schedule()
+print()
+
+# =====================================================================
+# FILLS-BASED POSITION LEDGER
 # =====================================================================
 
 def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
@@ -581,7 +802,6 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
     df = pd.DataFrame(all_fills)
     print(f"  ✓ Loaded {len(df)} fills across {df['ticker'].nunique()} markets from API")
 
-    # Normalize count field
     if 'contracts' not in df.columns:
         if 'count_fp' in df.columns:
             df['contracts'] = pd.to_numeric(df['count_fp'], errors='coerce').astype(int)
@@ -593,7 +813,6 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
             print(f"  ⚠️ No count column found! Columns: {list(df.columns)}")
             df['contracts'] = 0
 
-    # Normalize price fields
     if 'yes_price' not in df.columns:
         if 'yes_price_dollars' in df.columns:
             df['yes_price'] = pd.to_numeric(df['yes_price_dollars'], errors='coerce')
@@ -782,7 +1001,7 @@ def integrate_ledger_into_run(exchange_client_ref, bq_client=None, project_id=No
     return ledger
 
 # =====================================================================
-# HEDGE-ADJUSTED EV [v4.2-2]
+# HEDGE-ADJUSTED EV
 # =====================================================================
 def calculate_hedge_ev(side, bid_price, ledger_data):
     if ledger_data is None:
@@ -800,7 +1019,7 @@ def calculate_hedge_ev(side, bid_price, ledger_data):
     return hedge_ev, True
 
 # =====================================================================
-# PAIRING MODE [v4.2-3]
+# PAIRING MODE
 # =====================================================================
 def get_pairing_mode(ticker, ledger, net_position):
     ledger_data = ledger.get(ticker)
@@ -813,7 +1032,7 @@ def get_pairing_mode(ticker, ledger, net_position):
     return "normal", imbalance_ratio
 
 # =====================================================================
-# SIDE MULTIPLIER OVERRIDE [v4.2-5]
+# SIDE MULTIPLIER OVERRIDE
 # =====================================================================
 def get_effective_side_multiplier(base_side_mult, side, pairing_mode, net_side):
     if pairing_mode == "normal" or net_side == side or net_side == "flat":
@@ -825,7 +1044,7 @@ def get_effective_side_multiplier(base_side_mult, side, pairing_mode, net_side):
     return base_side_mult
 
 # =====================================================================
-# LEDGER-AWARE POSITION MULTIPLIER [v4.2-6]
+# LEDGER-AWARE POSITION MULTIPLIER
 # =====================================================================
 def calculate_ledger_position_multiplier(ticker, side, ledger, fallback_net_position, market_net_cap=None):
     cap = market_net_cap if market_net_cap is not None else MAX_NET_PER_MARKET
@@ -974,21 +1193,67 @@ def cents_from_rate(rate):
     if rate is None or pd.isna(rate): raise ValueError("rate is NaN")
     return int(round(float(rate) * 100))
 
-def get_market_details(market_ticker):
+
+def estimate_game_start_from_ticker(event_date_str):
+    """Fallback: derive estimated game start from the event date in the ticker."""
+    if not event_date_str:
+        return None
+    try:
+        dt = datetime.strptime(str(event_date_str), "%Y-%m-%d")
+        game_start = dt + timedelta(days=1, hours=0)
+        return int(game_start.timestamp())
+    except (ValueError, TypeError):
+        return None
+
+def get_market_details(market_ticker, team_1=None, team_2=None, event_date=None):
+    """Fetch market details from Kalshi, then look up actual game start from Odds API.
+    Returns 5-tuple: (expiration_ts, open_interest, volume, game_start_ts, time_source)
+    """
     try:
         resp = exchange_client.get_market(ticker=market_ticker)
         md = resp.get('market', {})
-        close_time = md.get('close_time')
+
+        oi = md.get('open_interest')
+        if oi is None or oi == 0:
+            oi_fp = md.get('open_interest_fp')
+            if oi_fp is not None:
+                try:
+                    oi = int(float(oi_fp))
+                except (ValueError, TypeError):
+                    oi = 0
+        if oi is None:
+            oi = 0
+
+        vol = md.get('volume')
+        if vol is None or vol == 0:
+            vol_fp = md.get('volume_fp')
+            if vol_fp is not None:
+                try:
+                    vol = int(float(vol_fp))
+                except (ValueError, TypeError):
+                    vol = 0
+        if vol is None:
+            vol = 0
+
+        game_start_ts, time_source = get_game_start_ts(team_1, team_2, event_date)
+
+        if game_start_ts is None:
+            game_start_ts = estimate_game_start_from_ticker(event_date)
+            if game_start_ts is not None:
+                time_source = "ticker_estimate"
+
         expiration_ts = None
-        if close_time:
-            ts = close_time
-            if ts.endswith('Z'): ts = ts[:-1] + '+00:00'
-            dt = datetime.fromisoformat(ts)
-            close_unix = int(dt.timestamp())
-            expiration_ts = close_unix - (EXPIRATION_HOURS_BEFORE_CLOSE * 3600)
-            if expiration_ts <= time.time(): expiration_ts = None
-        return expiration_ts, md.get('open_interest', 0), md.get('volume', 0)
-    except: return None, None, None
+        if game_start_ts:
+            if time_source == "odds_api":
+                expiration_ts = game_start_ts - ODDS_API_EXPIRATION_BUFFER_SEC
+            else:
+                expiration_ts = game_start_ts - (EXPIRATION_HOURS_BEFORE_CLOSE * 3600)
+            if expiration_ts <= time.time():
+                expiration_ts = None
+
+        return expiration_ts, oi, vol, game_start_ts, time_source
+    except Exception as e:
+        return None, None, None, None, "error"
 
 def get_time_multiplier(hours):
     for threshold, mult in TIME_MULTIPLIERS:
@@ -1092,13 +1357,11 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     team_1 = market_row.get("team_1")
     team_2 = market_row.get("team_2")
 
-    # Tier-specific market cap
     effective_max_net = MAX_NET_PER_MARKET if ticker_part_3_market_code in TIER1_MARKETS else TIER2_MAX_NET
 
     if market_status != "active":
         return []
 
-    # Base side multipliers
     side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, {"yes": 0.0, "no": 0.0})
     yes_side_mult_base = side_config.get("yes", 1.0)
     no_side_mult_base = side_config.get("no", 1.0)
@@ -1110,7 +1373,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         base_yes_mult=yes_side_mult_base, base_no_mult=no_side_mult_base,
     )
     if override_applied:
-        print(f"    🏀 Team override: {override_reason}")
+        print(f"    🏀 [NCAAB-7] Team override: {override_reason}")
         print(f"       Base: Y={yes_side_mult_base}x N={no_side_mult_base}x → Override: Y={team_yes}x N={team_no}x")
         yes_side_mult_base = team_yes
         no_side_mult_base = team_no
@@ -1123,7 +1386,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     if game_risk != 1.0:
         yes_side_mult_base *= game_risk
         no_side_mult_base *= game_risk
-        print(f"    🎯 Game risk multiplier: {game_risk:.1f}x (teams: {team_1}, {team_2})")
+        print(f"    🎯 [P2] Game risk multiplier: {game_risk:.1f}x (teams: {team_1}, {team_2})")
 
     if yes_side_mult_base == 0.0 and no_side_mult_base == 0.0:
         reason = f"team override ({override_reason})" if override_applied else "config"
@@ -1140,16 +1403,25 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     if pairing_mode_str != "normal":
         print(f"    🔄 PAIRING: {pairing_mode_str.upper()} (imbalance: {imbalance_ratio:.0%}, net: {net_side})")
 
-    # Side multiplier overrides
     yes_side_mult = yes_side_mult_base
     no_side_mult = no_side_mult_base
 
-    # Market details
-    expiration_ts, open_interest, volume = get_market_details(ticker)
+    # Market details — [v4.5] returns game start time from Odds API
+    expiration_ts, open_interest, volume, game_start_ts, time_source = get_market_details(
+        ticker, team_1, team_2, market_row.get("event_date"))
     if expiration_ts is None:
         print(f"    ✗ No expiration — skipping")
         return []
-    hours_until_event = (expiration_ts - time.time()) / 3600.0
+    if game_start_ts:
+        hours_until_event = (game_start_ts - time.time()) / 3600.0
+    else:
+        hours_until_event = (expiration_ts - time.time()) / 3600.0
+    if game_start_ts:
+        game_time_str = datetime.fromtimestamp(game_start_ts, tz=UTC).strftime('%H:%M UTC')
+    else:
+        game_time_str = "unknown"
+    exp_time_str = datetime.fromtimestamp(expiration_ts, tz=UTC).strftime('%H:%M UTC')
+    print(f"    ⏰ [{time_source}] Game: {game_time_str} | Exp: {exp_time_str}")
 
     if open_interest is None: open_interest = 0
     if volume is None: volume = 0
@@ -1163,7 +1435,6 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         yes_position_mult = calculate_position_multiplier(net_position, 'yes')
         no_position_mult = calculate_position_multiplier(net_position, 'no')
 
-    # Apply floors
     if yes_side_mult_floor > 0 and yes_side_mult < yes_side_mult_floor:
         yes_side_mult = yes_side_mult_floor
     if no_side_mult_floor > 0 and no_side_mult < no_side_mult_floor:
@@ -1171,7 +1442,6 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     yes_side_mult = get_effective_side_multiplier(yes_side_mult, "yes", pairing_mode_str, net_side)
     no_side_mult = get_effective_side_multiplier(no_side_mult, "no", pairing_mode_str, net_side)
 
-    # Use ledger data for cap enforcement
     ledger_net_qty = 0
     ledger_net_side_str = "flat"
     if ledger_data:
@@ -1208,14 +1478,12 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         if no_data: orderbook_no_bid, no_bid_size = parse_orderbook(no_data)
     except: pass
 
-    # Mid-price anchor
     market_mid_yes = None
     if orderbook_yes_bid is not None and orderbook_no_bid is not None:
         market_mid_yes = (orderbook_yes_bid + (100 - orderbook_no_bid)) / 2.0
     elif orderbook_yes_bid is not None: market_mid_yes = float(orderbook_yes_bid)
     elif orderbook_no_bid is not None: market_mid_yes = 100.0 - orderbook_no_bid
 
-    # Fair value
     yes_fair, no_fair, bayesian_inter = calculate_bid_price(
         market_mid_yes, market_yes_rate, team_1_yes_rate, team_1_sample_size,
         team_2_yes_rate, team_2_sample_size, market_sample_size, PRICING_STRATEGY)
@@ -1236,7 +1504,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
 
     print(f"    Fair: YES={yes_fair}¢ NO={no_fair}¢ | Mults: YES={yes_total_mult:.2f}x NO={no_total_mult:.2f}x")
 
-    # Price floors (pairing mode conditional)
+    # Price floors
     if pairing_mode_str == "aggressive_pairing":
         act_min_yes, act_min_no, act_yes_min = HEDGE_MIN_PRICE_YES, HEDGE_MIN_PRICE_NO, HEDGE_YES_MIN_PRICE
     elif pairing_mode_str == "pairing":
@@ -1258,7 +1526,6 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         if net_side == "yes": no_offsets = PAIRING_OFFSETS['no']; spread_config_name += "+pair_no"
         elif net_side == "no": yes_offsets = PAIRING_OFFSETS['yes']; spread_config_name += "+pair_yes"
 
-    # Event caps
     evt = event_ticker or ""
     current_event_orders = event_orders_placed.get(evt, 0)
     event_orders_remaining = MAX_ORDERS_PER_EVENT - current_event_orders
@@ -1267,7 +1534,8 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         return []
 
     market_snapshots.append({"market_ticker": ticker, "run_id": RUN_ID, "model_version": MODEL_VERSION,
-        "yes_fair": yes_fair, "no_fair": no_fair, "pairing_mode": pairing_mode_str})
+        "yes_fair": yes_fair, "no_fair": no_fair, "pairing_mode": pairing_mode_str,
+        "time_source": time_source})
 
     orders = []
 
@@ -1420,7 +1688,6 @@ def place_orders_from_df(df_results):
     existing_positions, positions_reliable = get_existing_positions()
     safe_mode = not positions_reliable
 
-    # Build ledger
     try:
         bq_ref = client if 'client' in dir() else None
         proj_ref = PROJECT_ID if 'PROJECT_ID' in dir() else None
@@ -1439,7 +1706,6 @@ def place_orders_from_df(df_results):
         event_net_exposure[evt] = event_net_exposure.get(evt, 0) + abs(pos_data['net_position'])
     event_orders_placed = {}
 
-    # Merge with historical data
     if 'df_summary' in globals() and len(df_summary) > 0:
         summary_data = df_summary[['ticker_part_3_market_code','yes_rate','count_occurrences']].copy()
         summary_data = summary_data.rename(columns={'yes_rate':'market_yes_rate','count_occurrences':'market_sample_size'})
