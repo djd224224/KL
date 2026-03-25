@@ -1687,7 +1687,7 @@ def get_market_details(market_ticker: str) -> Tuple[Optional[int], Optional[int]
         # Order expiration: cancel unfilled orders before the game starts
         # [v4.6] NBA API gives exact tip-off → expire 10 min before tip-off
         # Ticker estimate is ~9pm ET guess → expire 5h before to be safe
-        SAFETY_BUFFER_SECONDS = 600  # 10 minutes before tip-off
+        SAFETY_BUFFER_SECONDS = 0  # 0 minutes before tip-off
         expiration_ts = None
         if game_start_ts:
             if time_source == "nba_api":
