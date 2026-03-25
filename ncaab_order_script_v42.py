@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KXNCAABMENTION v4.3-NCAAB
+# KXNCAABMENTION v4.5-NCAAB
 # STEP 1: FETCH DATA
 # FIXED: Team-level historical rates now correct (no longer flipping based on team position)
 # ADAPTED: Series ticker changed to KXNCAABMENTION for college basketball
@@ -250,80 +250,28 @@ def main():
 df_results, df_summary, df_summary_rolling, df_summary_rolling_by_team = main()
 print("\n✓ Data collection complete!")
 
-# NCAABMENTION ORDER SCRIPT v4.2-NCAAB — ADAPTED FROM NBA WITH ANALYSIS-DRIVEN CHANGES
+# NCAABMENTION ORDER SCRIPT v4.5-NCAAB
 # ==============================================================
-# ADAPTED FOR: KXNCAABMENTION (college basketball)
+# [v4.5] Changes from v4.4 (driven by code×direction P&L analysis):
 #
-# CHANGES FROM NBA v4.2 (based on NCAAB P&L analysis):
+#   SIDE_MULTIPLIERS rewritten based on directional edge analysis:
+#     - SCHE/DRAF/NIL/MARC: Block Yes entirely (combined Yes drain: -$592)
+#     - ANKL/RECO/ALL/ALLA: Flipped to Yes-favored (No was losing)
+#     - TRAN: Yes promoted to 1.0x (5/5 in tournament)
+#     - DOUB: No promoted to 1.2x (+$174/+81% in 7d tournament data)
+#     - BUZZ No blocked (-$113/-55%/-16pp edge, worst in dataset)
+#     - WALK fully blocked (catastrophic variance at 75¢ avg No price)
+#     - AIRB Yes reduced 0.4→0.1 (-$65/-26% all-time)
+#     - ELBO Yes reduced 0.5→0.2 (deteriorated to -$77/-26% in 7d)
 #
-#   [NCAAB-1] SERIES_TICKER → "KXNCAABMENTION"
-#
-#   [NCAAB-2] SIDE_MULTIPLIERS completely rewritten:
-#     - DOUB: BLOCKED (0/0) — biggest $ loser (-$191), coin-flip market, high variance
-#     - TRAN: BLOCKED (0/0) — 79% yes rate, structurally unfavorable for No
-#     - AIRB: heavily reduced — -22.5% ROI
-#     - WALK: BLOCKED — tiny sample, -60% ROI
-#     - ALLE: strong No (0/2.0) — best market, +30% ROI, 21% base yes
-#     - MARC: strong No (0/1.8) — +6.5% ROI, 13% base yes
-#     - NIL: strong No (0/1.8) — +15.4% ROI, 18% base yes
-#     - RECO: No-favored (0/1.5) — +15.5% ROI
-#     - ALL: No-favored (0/1.5) — +13.2% ROI
-#     - ELBO: No-favored (0/1.3) — +15.6% ROI
-#     - DRAF: mild No (0/0.8) — -5.4% ROI, demoted from safe bundle
-#     - RECR: mild No (0/0.7) — -1.8% ROI, underperforming
-#     - ANKL: mild No (0/0.7) — +0.6% ROI, barely positive
-#     - SCHE: mild No (0/0.7) — -4.5% ROI, underperforming
-#     - OVER: No only (0/1.0) — +0.9% ROI, neutral but No-only was +ROI
-#
-#   [NCAAB-3] GAME EXPOSURE CAP:
-#     MAX_NET_PER_EVENT: 2000 → 800 (limits ~$150 per game exposure)
-#     MAX_ORDERS_PER_EVENT: 5000 → 2000
-#     MAX_NET_PER_MARKET: 300 → 150 (halved to limit single-position blowups)
-#
-#   [NCAAB-4] NO SWEET SPOT shifted to 50–80¢:
-#     Analysis showed 50-65¢ No = 61% win rate, 65-80¢ = 86% win rate
-#     Old: 35-65¢. New: 50-80¢ at 1.8x (up from 1.5x)
-#
-#   [NCAAB-5] YES_PROBABILITY_FLOOR: 40 → 65
-#     Blocks Yes bets on markets below 65¢ fair value
-#     Analysis: Yes positions ran -7.7% ROI across the board
-#
-#   [NCAAB-6] POSITION SIZING tightened:
-#     - MIN_PRICE_NO: 5 → 12 (eliminates sub-$10 positions that ran -11.7% ROI)
-#     - MIN_PRICE_YES: 15 → 25 (no cheap Yes fliers)
-#     - POSITION_STOP_THRESHOLD: 300 → 150 (matches new MAX_NET)
-#     - POSITION_MODERATE_THRESHOLD: 100 → 75
-#
-#   [NCAAB-7] TEAM-SPECIFIC BLOCKS:
-#     New TEAM_MARKET_OVERRIDES dict blocks/boosts specific team+market combos
-#     Based on team-level rate deviations >25pp from base rate
-#     E.g., DOUB blocked entirely but if re-enabled: block when FLA/MSU playing
-#     E.g., ALLE Yes allowed only when ALA/FLA playing (100%/75% vs 21% base)
-#     E.g., TRAN No allowed only when ALA/NEB playing (33%/40% vs 79% base)
-#
-#   [NCAAB-8] PAIRING MODE tightened:
-#     Since we're mostly No-only, reduce accidental hedging
-#     PAIRING_MODE_THRESHOLD: 0.40 → 0.60 (harder to trigger)
-#     PAIRING_MODE_AGGRESSIVE: 0.75 → 0.85
-#     HEDGE_MIN_PRICE_YES: 25 → 35 (don't chase cheap Yes hedges)
-#
-#   [NCAAB-9] BASE CONTRACT SIZES reduced:
-#     Old: 15/15/15/20/20/25/25/25/30/30
-#     New: 10/10/10/12/12/15/15/15/18/18
-#     Prevents oversized positions at high multipliers
-#
-#   [NCAAB-10] VALIDATION updated for NCAAB market codes
-#
-#   Carries all v4.2 structural features:
-#     Fills ledger, hedge-aware EV, pairing mode, conditional price floors,
-#     side mult overrides, ledger-aware sizing, Bayesian hybrid pricing
+#   TIER1_MARKETS: Added DOUB (tournament regime shift)
+#   TEAM_MARKET_OVERRIDES: Flipped MIC/RECO to match new Yes-favored RECO
+#   MODEL_VERSION: v4.4 → v4.5
 # ==============================================================
-
-
 
 
 RUN_ID = str(uuid.uuid4())
-MODEL_VERSION = "v4.4-NCAAB"
+MODEL_VERSION = "v4.5-NCAAB"
 PRICING_STRATEGY = 'hybrid'
 
 # =========================
@@ -337,85 +285,77 @@ SLEEP_BETWEEN_CALLS_SEC = 0.05
 
 # ---------- BAYESIAN HYBRID PRICING PARAMETERS ----------
 BAYESIAN_K = 25
-BAYESIAN_RECENCY_HALFLIFE_GAMES = 15    # [NCAAB-12] Was 50 — recent 20 games now get 62% weight (was 36%)
-BAYESIAN_MARKET_WEIGHT = 0.70    # [NCAAB-13] Was 0.6 — trust orderbook more during regime shifts
-BAYESIAN_HISTORICAL_WEIGHT = 0.30    # [NCAAB-13] Was 0.4 — reduce stale historical anchor
+BAYESIAN_RECENCY_HALFLIFE_GAMES = 15
+BAYESIAN_MARKET_WEIGHT = 0.70
+BAYESIAN_HISTORICAL_WEIGHT = 0.30
 
 # =========================
-# [NCAAB-3] POSITION MANAGEMENT — tightened caps
+# POSITION MANAGEMENT
 # =========================
-MAX_NET_PER_MARKET = 250         # [v4.4] Tier 1 cap raised. Dampener is real governor.
-# Tier-specific caps applied in build_order_objects_for_market:
-#   Tier 1 (SCHE/ELBO/DRAF/MARC/NIL): 150
-#   Tier 2 (ANKL/AIRB/ALLE/RECO/ALL/RECR/OVER/DOUB): 100
-TIER1_MARKETS = {"SCHE", "ELBO", "DRAF", "MARC", "NIL"}
+MAX_NET_PER_MARKET = 250
+# [v4.5] DOUB added to Tier 1 — tournament regime shift (+$174/+81%/+42pp in 7d)
+TIER1_MARKETS = {"SCHE", "ELBO", "DRAF", "MARC", "NIL", "DOUB"}
 TIER2_MAX_NET = 100
-POSITION_MODERATE_THRESHOLD = 125 # [v4.4] ~50% of Tier 1 cap
-POSITION_STOP_THRESHOLD = 250     # [v4.4] Matches Tier 1 MAX_NET
+POSITION_MODERATE_THRESHOLD = 125
+POSITION_STOP_THRESHOLD = 250
 MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
-MAX_NET_PER_EVENT = 800           # [v4.3] Dampener is real governor. Hard cap is circuit breaker only.
-MAX_ORDERS_PER_EVENT = 2000       # [NCAAB-3] Was 5000
+MAX_NET_PER_EVENT = 800
+MAX_ORDERS_PER_EVENT = 2000
 
-MIN_SPREAD_BOTH_SIDES = 0         # [v4.1-1] Spread gate still DISABLED
-MIN_EV_PER_ORDER = 0.02           # 2% minimum expected edge
+MIN_SPREAD_BOTH_SIDES = 0
+MIN_EV_PER_ORDER = 0.02
 SAFE_MODE_MULTIPLIER = 0.10
 
 # =========================
-# [NCAAB-8] PAIRING MODE — tightened to reduce accidental hedging
+# PAIRING MODE
 # =========================
-PAIRING_MODE_THRESHOLD = 0.60     # [NCAAB-8] Was 0.40 — harder to trigger
-PAIRING_MODE_AGGRESSIVE = 0.85    # [NCAAB-8] Was 0.75
-PAIRING_MODE_NET_FLOOR = 60   # [v4.3] Fixed value (was MAX_NET*0.6=90, too high)
-PAIRING_MODE_NET_AGGRESSIVE = 100  # [v4.3] Fixed value (was MAX_NET*0.85=127, too high)
+PAIRING_MODE_THRESHOLD = 0.60
+PAIRING_MODE_AGGRESSIVE = 0.85
+PAIRING_MODE_NET_FLOOR = 60
+PAIRING_MODE_NET_AGGRESSIVE = 100
 
-HEDGE_MIN_PRICE_YES = 15          # [v4.3] Fixed: pairing should be MORE aggressive, not less
-HEDGE_MIN_PRICE_NO = 5            # Was 3
-HEDGE_YES_MIN_PRICE = 15          # [v4.3] Fixed: pairing allows cheaper Yes bids for hedging
+HEDGE_MIN_PRICE_YES = 15
+HEDGE_MIN_PRICE_NO = 5
+HEDGE_YES_MIN_PRICE = 15
 
-MAX_PAIRED_PER_MARKET = 250       # [v4.4] Matches MAX_NET_PER_MARKET
+MAX_PAIRED_PER_MARKET = 250
 
 # =========================
-# [NCAAB-2b] SIDE MULTIPLIERS — updated for March Madness (v4.2b)
-# Reranked by: consistency (profitable in BOTH Feb and Mar), March edge
-# (fair_no - avg_price at March yes-rates), and contract-level P&L
+# [v4.5] SIDE MULTIPLIERS — rewritten from code×direction P&L analysis
+# =========================
 SIDE_MULTIPLIERS = {
-    # --- BLOCKED: proven losers or no edge at March rates ---
-    "DOUB": {"yes": 0.2, "no": 0.8},   # [v4.4] +52.1¢/Q, 100% WR in tournament. Promoted.
-    "TRAN": {"yes": 0.8, "no": 0.3},   # [v4.4] $41 tourn Yes P&L, 100% WR. Scaled up.
-    "WALK": {"yes": 0.1, "no": 0.3},   # [v4.3] 12% yes. Tiny speculative Yes.
-    "BUZZ": {"yes": 0.1, "no": 0.3},   # [v4.3] New code. Tiny Yes, deep offsets.
-    "ALLA": {"yes": 0.1, "no": 0.3},   # [v4.3] New code. Tiny Yes, deep offsets.
-    "OVER": {"yes": 0.2, "no": 0.3},   # [v4.3] 50% yes (56% Mar). Small Yes hedge.
-    "RECR": {"yes": 0.2, "no": 0.3},   # [v4.3] 45% yes (56% Mar). Small Yes hedge.
+    # --- BLOCKED: proven losers or catastrophic variance ---
+    "WALK": {"yes": 0.0, "no": 0.0},   # [v4.5] 5/6 WR but -$54/-45% ROI. 1 loss at 75¢ wipes 3 wins.
+    "BUZZ": {"yes": 0.1, "no": 0.0},   # [v4.5] No: -$113/-55%/-16pp edge (5/17). Worst edge in dataset.
 
-    # --- TIER 1: Consistent + strong March edge ---
-    "SCHE": {"yes": 0.1, "no": 2.0},   # [v4.4] +12.6¢/Q. Scaled up. Yes reduced (-$57 Yes P&L).
-    "NIL":  {"yes": 0.1, "no": 2.0},   # [v4.4] +23.6¢/Q, 86% WR. Scaled up.
-    "DRAF": {"yes": 0.2, "no": 2.0},   # [v4.4] +25.9¢/Q, best edge. Yes reduced (-$56 Yes P&L).
+    # --- TIER 1: Strong No edge, block Yes ---
+    "SCHE": {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: -$204/-49%/-11.7pp. No: +$649/+67%/+23.3pp. Block Yes.
+    "NIL":  {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: 0/7 all-time. No: +$382/+25%/+15.3pp. Block Yes.
+    "DRAF": {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: -$293/-65%/-21.9pp. No: +$752/+92%/+17pp. Block Yes.
+    "MARC": {"yes": 0.0, "no": 1.5},   # [v4.5] Yes: 0/6 all-time. No: +$205/+12%/+6.4pp. Block Yes.
+    "ELBO": {"yes": 0.2, "no": 1.8},   # [v4.5] Yes deteriorated: -$77/-26% in 7d. Reduced from 0.5.
+    "DOUB": {"yes": 0.1, "no": 1.2},   # [v4.5] 7d No: +$174/+81%/+42pp. Tournament regime. Promoted.
 
-    # --- TIER 2: Good March edge but inconsistent ---
-    "ELBO": {"yes": 0.5, "no": 1.8},   # [v4.4] $47 tourn Yes P&L. Yes scaled up.
-    "ANKL": {"yes": 0.5, "no": 1.0},   # [v4.4] $59 tourn Yes P&L. Yes scaled up.
-    "AIRB": {"yes": 0.4, "no": 1.0},   # [v4.4] +27.5¢/Q, 62% WR. Promoted from 0.5x.
+    # --- YES-FAVORED: Flipped from directional analysis ---
+    "ANKL": {"yes": 1.2, "no": 0.1},   # [v4.5] Yes: +$177/+102%/+24.7pp. No: -$242/-30%/-5.2pp. Flipped.
+    "RECO": {"yes": 1.0, "no": 0.0},   # [v4.5] Yes: +$128/+36%/+21.2pp. No: -$190/-29%. Block No.
+    "ALL":  {"yes": 0.8, "no": 0.1},   # [v4.5] Yes: +$63/+48%/+13.1pp. No: -$34/-8%. Flipped.
+    "ALLA": {"yes": 0.8, "no": 0.0},   # [v4.5] Yes: +$47/+93%/+33.9pp. No: -$17/-22%. Block No.
+    "TRAN": {"yes": 1.0, "no": 0.1},   # [v4.5] 7d Yes: 5/5, +$60/+55%. Tournament-driven. Boost Yes.
 
-    # --- TIER 3: Demoted — lost edge in March ---
-    "MARC": {"yes": 0.1, "no": 1.5},   # [v4.3] 20% yes (44% Mar!). Tiny Yes — Mar regime makes this interesting.
-    "ALLE": {"yes": 0.1, "no": 0.3},   # [v4.3] 32% yes (46% Mar). Tiny Yes. Deep only.
-    "RECO": {"yes": 0.4, "no": 0.3},   # [v4.3] 61% yes (62% Mar). Strong Yes hedge.
-    "ALL":  {"yes": 0.3, "no": 0.5},   # [v4.3] 58% yes (62% Mar). Moderate Yes hedge.
+    # --- REDUCED/CONSERVATIVE ---
+    "AIRB": {"yes": 0.1, "no": 1.0},   # [v4.5] Yes: -$65/-26% AT, -$57/-32% 7d. Reduced from 0.4.
+    "OVER": {"yes": 0.1, "no": 0.5},   # [v4.5] No edge real but inconsistent. Yes: -$59/-39% 7d.
+    "RECR": {"yes": 0.2, "no": 0.3},   # Neither side has clear edge. Keep minimal.
+    "ALLE": {"yes": 0.1, "no": 0.5},   # [v4.5] No edge +6.3pp but ROI flat. Yes 0/4 in 7d. Conservative.
 }
 
 # =========================
-# [NCAAB-7] TEAM-SPECIFIC OVERRIDES
-# Based on team-level deviation analysis (>25pp from base rate)
-# Format: (team, market_code) → {"yes_mult": X, "no_mult": X}
-# These OVERRIDE the base SIDE_MULTIPLIERS for specific matchups
-# =========================
-# [NCAAB-7b] TEAM-SPECIFIC OVERRIDES — updated with March data
+# [v4.5] TEAM-SPECIFIC OVERRIDES — updated
 # =========================
 TEAM_MARKET_OVERRIDES = {
-    # MARC (was 4% Feb → 44% Mar) — block teams where MARC settled Yes in March
+    # MARC — block teams where MARC settled Yes in March
     ("UKF", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
     ("AUB", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
     ("ARK", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
@@ -423,7 +363,7 @@ TEAM_MARKET_OVERRIDES = {
     ("ISU", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
     ("PUR", "MARC"): {"yes_mult": 0.0, "no_mult": 0.0},
 
-    # ALLE (33% Mar, collapsed) — block high-loss teams
+    # ALLE — block high-loss teams
     ("UKF", "ALLE"): {"yes_mult": 0.0, "no_mult": 0.0},
     ("TEN", "ALLE"): {"yes_mult": 0.0, "no_mult": 0.0},
     ("UNC", "ALLE"): {"yes_mult": 0.0, "no_mult": 0.0},
@@ -431,49 +371,42 @@ TEAM_MARKET_OVERRIDES = {
     # DRAF — boost reliable No teams
     ("VAN", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.8},
     ("ILL", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.8},
-    # NEB removed — never matches as parsed team code (IOWANEB→IOW+ANEB)
     ("PUR", "DRAF"): {"yes_mult": 0.0, "no_mult": 1.5},
     ("ALA", "DRAF"): {"yes_mult": 0.0, "no_mult": 0.0},
     ("DUK", "DRAF"): {"yes_mult": 0.0, "no_mult": 0.0},
     ("FLA", "DRAF"): {"yes_mult": 0.0, "no_mult": 0.0},
 
-    # RECO — MIC still extreme outlier
-    ("MIC", "RECO"): {"yes_mult": 0.0, "no_mult": 1.5},
+    # [v4.5] RECO flipped to Yes-favored — MIC override now boosts Yes
+    ("MIC", "RECO"): {"yes_mult": 1.5, "no_mult": 0.0},
 }
 
-# [P2] GAME-LEVEL RISK MULTIPLIER — high-mention teams get reduced sizing
-# Applied to ALL markets when these teams play
+# [P2] GAME-LEVEL RISK MULTIPLIER
 TEAM_RISK_MULTIPLIER = {
-    "ALA": 0.5, "ARK": 0.5, "FLA": 0.5, "BYU": 0.5,  # avg 7+ yes/game
-    "MIC": 1.3, "TTU": 1.3, "ISU": 1.2,                # avg 5 or fewer
+    "ALA": 0.5, "ARK": 0.5, "FLA": 0.5, "BYU": 0.5,
+    "MIC": 1.3, "TTU": 1.3, "ISU": 1.2,
 }
 
 
 # =========================
-# [NCAAB-6] PRICE FILTERS — tightened
+# PRICE FILTERS
 # =========================
-MIN_PRICE_YES = 20                # [v4.3] Consolidated with YES_MIN_PRICE (was two separate vars)
-MIN_PRICE_NO = 15                 # [NCAAB-6b] Was 12
-# [v4.3] Dead zone REMOVED — not statistically significant (p=0.687).
-# Kelly gate + dampener handle the real problems (adverse sizing + stale pricing).
-# NO_DEAD_ZONE_MIN = 35  # DISABLED
-# NO_DEAD_ZONE_MAX = 50  # DISABLED
-MAX_PRICE = 75                    # Unchanged — NEVER relaxed
-YES_MIN_PRICE = 20                # [v4.3] Same as MIN_PRICE_YES — single Yes floor
+MIN_PRICE_YES = 20
+MIN_PRICE_NO = 15
+MAX_PRICE = 75
+YES_MIN_PRICE = 20
 NO_MAX_YES_PRICE = 80
 NO_MIN_YES_PRICE = 20
-# YES_PROBABILITY_FLOOR REMOVED [v4.3] — redundant with Kelly gate which is strictly smarter (per-order vs per-market)
 
 # =========================
-# [NCAAB-4] NO SWEET SPOT — shifted to proven profitable range
+# NO SWEET SPOT
 # =========================
-NO_SWEET_SPOT_MIN = 65            # [NCAAB-4b] Was 50 — 50-65¢ has -5pp edge in Mar. Only 65-80¢ works
-NO_SWEET_SPOT_MAX = 75            # [NCAAB-4b] Aligned with MAX_PRICE — 65-80¢ has +11pp edge and 81% WR
-NO_SWEET_SPOT_MULTIPLIER = 1.5    # [NCAAB-4b] Was 1.8 — moderated, still capped by MAX_COMBINED
-MAX_COMBINED_SWEET_BOOST = 2.0    # [NCAAB-FIX] Cap side_mult × sweet_spot to prevent double-boost
+NO_SWEET_SPOT_MIN = 65
+NO_SWEET_SPOT_MAX = 75
+NO_SWEET_SPOT_MULTIPLIER = 1.5
+MAX_COMBINED_SWEET_BOOST = 2.0
 
 # =========================
-# [NCAAB-9] ORDER CONFIGURATION — reduced base sizes
+# ORDER CONFIGURATION
 # =========================
 def generate_base_contracts(num_levels: int) -> List[int]:
     """[v4.4] Scaled up: 15/18/22/25. Dampener + Kelly control risk."""
@@ -489,11 +422,11 @@ def generate_base_contracts(num_levels: int) -> List[int]:
             contracts.append(25)
     return contracts
 
-NUM_OFFSET_LEVELS = 12  # [v4.3] Match 12-level spread configs
+NUM_OFFSET_LEVELS = 12
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
-MAX_CONTRACTS_PER_ORDER = 300     # [v4.3] Raised for tournament volume
-MAX_CONTRACTS_PER_MARKET_PER_RUN = 75  # [v4.5] Prevents adverse sizing on single market in one cycle
+MAX_CONTRACTS_PER_ORDER = 300
+MAX_CONTRACTS_PER_MARKET_PER_RUN = 100
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
 TIME_MULTIPLIERS = [
@@ -521,14 +454,12 @@ def generate_offsets(start: int, increment: int, count: int) -> List[int]:
     return [start + i * increment for i in range(count)]
 
 SPREAD_CONFIGS = {
-    "tight":    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14],       # [v4.3] 12 levels, tighter top
-    "medium":   [2, 3, 5, 7, 9, 11, 13, 15, 17, 19, 22, 25],    # [v4.3] 12 levels, tighter top, deep bottom
-    "wide":     [3, 5, 8, 11, 14, 17, 20, 23, 26, 29, 33, 37],  # [v4.3] 12 levels, deeper bottom
+    "tight":    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14],
+    "medium":   [2, 3, 5, 7, 9, 11, 13, 15, 17, 19, 22, 25],
+    "wide":     [3, 5, 8, 11, 14, 17, 20, 23, 26, 29, 33, 37],
 }
 
-# [v4.3] Tier 1 markets use tighter spreads (more fills, still 20+¢ edge buffer)
-TIER1_SPREAD_OVERRIDE = "tight"  # SCHE/ELBO/DRAF/MARC/NIL get tight spreads
-
+TIER1_SPREAD_OVERRIDE = "tight"
 
 PAIRING_OFFSETS = {
     'yes': generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
@@ -536,18 +467,18 @@ PAIRING_OFFSETS = {
     'name': 'pairing'
 }
 
-EXPIRATION_HOURS_BEFORE_CLOSE = 4  # [v4.3] Was 5, 5h blocked live games
+EXPIRATION_HOURS_BEFORE_CLOSE = 4
 SLEEP_BETWEEN_ORDERS = 0.05
 FALLBACK_OFFSET = 15
 
 
 # =========================
-# [NCAAB-7] TEAM-SPECIFIC OVERRIDE APPLICATION
+# TEAM-SPECIFIC OVERRIDE APPLICATION
 # =========================
 
 def apply_team_overrides(market_code, team_1, team_2, base_yes_mult, base_no_mult):
     """
-    [NCAAB-7] Check if either team triggers a market-specific override.
+    Check if either team triggers a market-specific override.
     If both teams have overrides, use the more conservative multiplier.
     Returns (yes_mult, no_mult, override_applied, reason)
     """
@@ -596,8 +527,8 @@ print(f"{'='*70}")
 print(f"Run ID: {RUN_ID}")
 print(f"Series: {SERIES_TICKER}")
 print(f"Pricing: {PRICING_STRATEGY} | Bayesian K={BAYESIAN_K}")
-print(f"Position caps: market={MAX_NET_PER_MARKET} [was300] event={MAX_NET_PER_EVENT} [was2000]")
-print(f"  Moderate at {POSITION_MODERATE_THRESHOLD} [was100], stop at {POSITION_STOP_THRESHOLD} [was300]")
+print(f"Position caps: market={MAX_NET_PER_MARKET} event={MAX_NET_PER_EVENT}")
+print(f"  Moderate at {POSITION_MODERATE_THRESHOLD}, stop at {POSITION_STOP_THRESHOLD}")
 print(f"Pairing: threshold={PAIRING_MODE_NET_FLOOR} aggressive={PAIRING_MODE_NET_AGGRESSIVE}")
 print(f"Price filters:")
 print(f"  YES: {MIN_PRICE_YES}-{MAX_PRICE}c floor={YES_MIN_PRICE}c (Kelly gate replaces prob_floor)")
@@ -605,12 +536,12 @@ print(f"  NO:  {MIN_PRICE_NO}-{MAX_PRICE}c sweet={NO_SWEET_SPOT_MIN}-{NO_SWEET_S
 print(f"  EV gate: {MIN_EV_PER_ORDER:.0%}")
 blocked = [k for k, v in SIDE_MULTIPLIERS.items() if v['yes'] == 0 and v['no'] == 0]
 safe = [k for k, v in SIDE_MULTIPLIERS.items() if v['no'] >= 1.5]
-secondary = [k for k, v in SIDE_MULTIPLIERS.items() if 0 < v['no'] < 1.5]
+yes_favored = [k for k, v in SIDE_MULTIPLIERS.items() if v['yes'] >= 0.8]
 print(f"BLOCKED: {blocked}")
 print(f"SAFE BUNDLE (≥1.5x No): {safe}")
-print(f"SECONDARY: {secondary}")
+print(f"YES-FAVORED (≥0.8x Yes): {yes_favored}")
 print(f"Team overrides: {len(TEAM_MARKET_OVERRIDES)} combos")
-print(f"Base contracts: {BASE_YES_CONTRACTS[:5]}... (was 15/15/15/20/20)")
+print(f"Base contracts: {BASE_YES_CONTRACTS[:5]}...")
 print(f"{'='*70}\n")
 
 # =====================================================================
@@ -650,7 +581,7 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
     df = pd.DataFrame(all_fills)
     print(f"  ✓ Loaded {len(df)} fills across {df['ticker'].nunique()} markets from API")
 
-    # Normalize count field — API uses count, count_fp, or contracts
+    # Normalize count field
     if 'contracts' not in df.columns:
         if 'count_fp' in df.columns:
             df['contracts'] = pd.to_numeric(df['count_fp'], errors='coerce').astype(int)
@@ -662,9 +593,7 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
             print(f"  ⚠️ No count column found! Columns: {list(df.columns)}")
             df['contracts'] = 0
 
-    # Normalize API field names — Kalshi changes these periodically
-    # Old: yes_price, no_price, count
-    # New: yes_price_dollars, yes_price_fixed, no_price_dollars, count_fp
+    # Normalize price fields
     if 'yes_price' not in df.columns:
         if 'yes_price_dollars' in df.columns:
             df['yes_price'] = pd.to_numeric(df['yes_price_dollars'], errors='coerce')
@@ -685,7 +614,6 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
                 lambda row: float(row['yes_price']) if row.get('side') == 'yes'
                             else (100.0 - float(row['yes_price'])), axis=1)
     elif 'no_price' in df.columns or 'no_price_dollars' in df.columns:
-        # Fallback: derive from no_price
         no_col = 'no_price' if 'no_price' in df.columns else 'no_price_dollars'
         df['no_price_val'] = pd.to_numeric(df[no_col], errors='coerce')
         max_val = df['no_price_val'].max()
@@ -730,7 +658,6 @@ def build_position_ledger(fills_df, price_col="price", contracts_col="contracts"
     ledger = {}
     df = fills_df.copy()
 
-    # Normalize column names — API fields change periodically
     if price_col not in df.columns:
         for fallback in ['yes_price', 'yes_price_dollars', 'yes_price_fixed']:
             if fallback in df.columns:
@@ -1074,7 +1001,6 @@ def get_volume_multiplier(oi):
     return 0.4
 
 def get_offsets_for_spread(spread_cents):
-    """[v4.3] Select spread config based on spread width. Returns (yes_offsets, no_offsets, config_name)."""
     if spread_cents < 5:
         name = "tight"
     elif spread_cents < 15:
@@ -1148,7 +1074,7 @@ def calculate_bid_price(market_mid_yes, market_yes_rate, team_1_yes_rate, team_1
 market_snapshots = []
 
 # =====================================================================
-# BUILD ORDERS — v4.2-NCAAB with team overrides [NCAAB-7]
+# BUILD ORDERS
 # =====================================================================
 
 def build_order_objects_for_market(market_row, existing_positions, event_net_exposure,
@@ -1166,32 +1092,30 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     team_1 = market_row.get("team_1")
     team_2 = market_row.get("team_2")
 
-    # [v4.3] Tier-specific market cap
+    # Tier-specific market cap
     effective_max_net = MAX_NET_PER_MARKET if ticker_part_3_market_code in TIER1_MARKETS else TIER2_MAX_NET
 
     if market_status != "active":
         return []
 
-    # [v4-3] Base side multipliers
+    # Base side multipliers
     side_config = SIDE_MULTIPLIERS.get(ticker_part_3_market_code, {"yes": 0.0, "no": 0.0})
     yes_side_mult_base = side_config.get("yes", 1.0)
     no_side_mult_base = side_config.get("no", 1.0)
 
-    # ================================================================
-    # [NCAAB-7] TEAM-SPECIFIC OVERRIDES — applied BEFORE blocking check
-    # ================================================================
+    # TEAM-SPECIFIC OVERRIDES
     team_yes, team_no, override_applied, override_reason = apply_team_overrides(
         market_code=ticker_part_3_market_code,
         team_1=team_1 or "", team_2=team_2 or "",
         base_yes_mult=yes_side_mult_base, base_no_mult=no_side_mult_base,
     )
     if override_applied:
-        print(f"    🏀 [NCAAB-7] Team override: {override_reason}")
+        print(f"    🏀 Team override: {override_reason}")
         print(f"       Base: Y={yes_side_mult_base}x N={no_side_mult_base}x → Override: Y={team_yes}x N={team_no}x")
         yes_side_mult_base = team_yes
         no_side_mult_base = team_no
 
-    # [P2] Game-level risk multiplier based on teams playing
+    # [P2] Game-level risk multiplier
     game_risk = 1.0
     for team in [team_1 or "", team_2 or ""]:
         if team in TEAM_RISK_MULTIPLIER:
@@ -1199,7 +1123,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     if game_risk != 1.0:
         yes_side_mult_base *= game_risk
         no_side_mult_base *= game_risk
-        print(f"    🎯 [P2] Game risk multiplier: {game_risk:.1f}x (teams: {team_1}, {team_2})")
+        print(f"    🎯 Game risk multiplier: {game_risk:.1f}x (teams: {team_1}, {team_2})")
 
     if yes_side_mult_base == 0.0 and no_side_mult_base == 0.0:
         reason = f"team override ({override_reason})" if override_applied else "config"
@@ -1247,7 +1171,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     yes_side_mult = get_effective_side_multiplier(yes_side_mult, "yes", pairing_mode_str, net_side)
     no_side_mult = get_effective_side_multiplier(no_side_mult, "no", pairing_mode_str, net_side)
 
-    # [v4.4] Use ledger data for cap enforcement (survives across runs)
+    # Use ledger data for cap enforcement
     ledger_net_qty = 0
     ledger_net_side_str = "flat"
     if ledger_data:
@@ -1259,10 +1183,8 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         ledger_yes_qty = max(0, net_position) if net_position > 0 else 0
         ledger_no_qty = max(0, -net_position) if net_position < 0 else 0
 
-    # Net room = cap minus whichever is larger: live position or ledger position
     effective_yes_pos = max(net_position, 0) if net_position > 0 else 0
     effective_no_pos = max(-net_position, 0) if net_position < 0 else 0
-    # Ledger tracks total fills (not net). Use side qty for hard cap.
     net_room_yes = max(0, effective_max_net - max(effective_yes_pos, ledger_yes_qty))
     net_room_no = max(0, effective_max_net - max(effective_no_pos, ledger_no_qty))
     if ledger_data and (ledger_yes_qty > effective_max_net * 0.8 or ledger_no_qty > effective_max_net * 0.8):
@@ -1302,7 +1224,6 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         yes_fair = cents_from_rate(market_yes_rate)
         no_fair = 100 - yes_fair
     if yes_fair is None or no_fair is None:
-        # [v4.3] Default to 50% prior for new/unknown markets — Kelly gate protects
         if market_mid_yes is not None:
             yes_fair = int(round(market_mid_yes))
             no_fair = 100 - yes_fair
@@ -1325,18 +1246,13 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     else:
         act_min_yes, act_min_no, act_yes_min = MIN_PRICE_YES, MIN_PRICE_NO, YES_MIN_PRICE
 
-    # [v4.3] YES_PROBABILITY_FLOOR removed — Kelly gate handles per-order filtering
-
     # Spread + offsets
     spread_cents = calculate_spread(orderbook_yes_bid or yes_fair, orderbook_no_bid or no_fair)
     yes_offsets, no_offsets, spread_config_name = get_offsets_for_spread(spread_cents)
-    # [v4.3] Tier 1: tight No offsets (more fills, 20+¢ edge buffer)
-    # Yes always gets wide offsets (conservative, deep discount only)
     if ticker_part_3_market_code in TIER1_MARKETS:
         if TIER1_SPREAD_OVERRIDE in SPREAD_CONFIGS:
             no_offsets = SPREAD_CONFIGS[TIER1_SPREAD_OVERRIDE]
             spread_config_name = TIER1_SPREAD_OVERRIDE + "_tier1_no"
-    # [v4.3] All Yes orders use wide offsets — conservative, fills only at deep discounts
     yes_offsets = SPREAD_CONFIGS["wide"]
     if pairing_mode_str != "normal" and net_side != "flat":
         if net_side == "yes": no_offsets = PAIRING_OFFSETS['no']; spread_config_name += "+pair_no"
@@ -1358,7 +1274,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     # === YES LIMIT ORDERS ===
     max_yes_price = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else MAX_PRICE
     yes_placed = 0
-    no_placed = 0  # [v4.5] Initialize before YES loop for per-market run cap
+    no_placed = 0
     if yes_total_mult > 0:
         for i, offset in enumerate(yes_offsets):
             if i >= len(BASE_YES_CONTRACTS): break
@@ -1368,7 +1284,6 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             hedge_ev, is_pairing = calculate_hedge_ev("yes", bid, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
             if effective_ev < MIN_EV_PER_ORDER: continue
-            # [v4.3] Yes Kelly gate: reject if implied Kelly < 2%
             if bid < 100:
                 implied_kelly_yes = (p_hat - (bid / 100)) / (1 - bid / 100)
                 if implied_kelly_yes < 0.02:
@@ -1376,9 +1291,8 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
                     continue
             base_c = BASE_YES_CONTRACTS[i]
             scaled = int(base_c * yes_total_mult)
-            # [v4.3] Yes uses lighter dampener — Yes is a hedge, not primary strategy
             game_no_so_far = event_orders_placed.get(evt + "_no", 0)
-            dampener = 1.0 / (1 + game_no_so_far / 400)  # softer curve for Yes (400 vs 200)
+            dampener = 1.0 / (1 + game_no_so_far / 400)
             scaled = int(scaled * dampener)
             max_here = min(scaled, MAX_CONTRACTS_PER_ORDER, max(0, net_room_yes - yes_placed), max(0, event_orders_remaining - yes_placed), max(0, MAX_CONTRACTS_PER_MARKET_PER_RUN - yes_placed - no_placed))
             if max_here < 1: continue
@@ -1411,12 +1325,10 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             if bid > max_no_price or bid < act_min_no or bid > MAX_PRICE: continue
             implied_yes = 100 - bid
             if implied_yes < NO_MIN_YES_PRICE or implied_yes > NO_MAX_YES_PRICE: continue
-            # [v4.3] Dead zone REMOVED — not stat sig (p=0.687). Kelly+dampener protect.
             standalone_ev = (1.0 - p_hat) - (bid / 100.0)
             hedge_ev, is_pairing = calculate_hedge_ev("no", bid, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
             if effective_ev < MIN_EV_PER_ORDER: continue
-            # [P0] Kelly gate: reject if implied Kelly < 2%
             if bid < 100:
                 implied_kelly = ((1 - p_hat) - (bid / 100)) / (1 - bid / 100)
                 if implied_kelly < 0.02:
@@ -1424,13 +1336,11 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
                     continue
             base_c = BASE_NO_CONTRACTS[i]
             scaled = int(base_c * no_total_mult)
-            # [v4.3] Dampener uses No-only counter — Yes hedge doesn't eat No capacity
             game_no_so_far = event_orders_placed.get(evt + "_no", 0)
-            dampener = 1.0 / (1 + game_no_so_far / 300)  # [v4.4] Softened from /200
+            dampener = 1.0 / (1 + game_no_so_far / 300)
             scaled = int(scaled * dampener)
             sweet_applied = False
             if NO_SWEET_SPOT_MIN <= bid <= NO_SWEET_SPOT_MAX:
-                # [NCAAB-FIX] Cap so side_mult × sweet doesn't exceed MAX_COMBINED_SWEET_BOOST
                 effective_sweet = min(NO_SWEET_SPOT_MULTIPLIER, MAX_COMBINED_SWEET_BOOST / max(no_side_mult, 0.1))
                 scaled = int(scaled * effective_sweet); sweet_applied = True
             max_here = min(scaled, MAX_CONTRACTS_PER_ORDER, max(0, net_room_no - no_placed),
