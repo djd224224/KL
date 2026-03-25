@@ -21,7 +21,7 @@ import os
 
 # === BEGIN SCRIPT ===
 import uuid
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import os
@@ -591,9 +591,9 @@ SIDE_MULTIPLIERS = {
     "CHAS": {"yes": 0.0, "no": 0.0},    # -$25 P&L, -16% ROI
     "KIA":  {"yes": 0.0, "no": 0.0},    # -$22 P&L, -13% ROI
     # === [v4.6] New codes from live observation ===
-    "SPEC": {"yes": 0.5, "no": 0.5},    # NEW code — no historical data, half exposure
-    "CRYP": {"yes": 0.5, "no": 0.5},    # +$80, limited data (5 settlements)
-    "PAYC": {"yes": 0.5, "no": 0.5},    # +$125, limited data (5 settlements)
+    "SPEC": {"yes": 0.0, "no": 0.0},    # blocked — no historical data
+    "CRYP": {"yes": 0.0, "no": 0.0},    # blocked — insufficient data
+    "PAYC": {"yes": 0.0, "no": 0.0},    # blocked — insufficient data
     "INTU": {"yes": 0.0, "no": 0.0},    # -$12, block
     "MSG":  {"yes": 0.0, "no": 0.0},    # -$8, block
     "NQE":  {"yes": 0.0, "no": 0.0},    # 0% YES rate, no edge
@@ -1485,33 +1485,237 @@ def cents_from_rate(rate: float) -> int:
         raise ValueError("rate is NaN/None")
     return int(round(float(rate) * 100))
 
-def get_market_details(market_ticker: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
-    """Returns (expiration_ts, open_interest, volume, game_start_ts)."""
+# =====================================================================
+# [v4.6] NBA SCHEDULE — Fetch exact game start times
+# =====================================================================
+# cdn.nba.com must be in GitHub Actions network allowlist.
+# Falls back to ticker-derived estimate (~9pm ET) if API unreachable.
+
+_NBA_SCHEDULE_CACHE: Dict[str, int] = {}  # key: "YYYYMMDD-ABC-XYZ" → game_start_unix
+
+def fetch_nba_schedule() -> Dict[str, int]:
+    """Fetch NBA schedule and build lookup: (date, teams) → game_start_utc_ts.
+    
+    Called once per run. Returns dict keyed by "YYYYMMDD-{sorted_teams}"
+    e.g. "20260326-CHA-NYK" → 1743033600
+    """
+    import urllib.request
+    import json as _json
+    
+    url = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
+    schedule = {}
+    
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'application/json',
+        })
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = _json.loads(resp.read())
+        
+        game_dates = data.get('leagueSchedule', {}).get('gameDates', [])
+        total_games = 0
+        
+        for gd in game_dates:
+            for game in gd.get('games', []):
+                home_code = game.get('homeTeam', {}).get('teamTricode', '')
+                away_code = game.get('awayTeam', {}).get('teamTricode', '')
+                game_time_utc = game.get('gameDateTimeUTC', '')
+                
+                if not home_code or not away_code or not game_time_utc:
+                    continue
+                
+                # Parse game time
+                try:
+                    ts = game_time_utc
+                    if ts.endswith('Z'):
+                        ts = ts[:-1] + '+00:00'
+                    dt = datetime.fromisoformat(ts)
+                    game_ts = int(dt.timestamp())
+                except:
+                    continue
+                
+                # Build key: date + sorted team codes (order-independent)
+                game_date_str = dt.strftime('%Y%m%d')
+                # Also store by the actual game date (ET), not UTC date
+                # NBA lists games by their ET date, but gameDateTimeUTC may be next day
+                teams_sorted = sorted([home_code, away_code])
+                key = f"{game_date_str}-{teams_sorted[0]}-{teams_sorted[1]}"
+                schedule[key] = game_ts
+                
+                # Also store by the previous day (ET games after midnight UTC)
+                prev_date_str = (dt - timedelta(days=1)).strftime('%Y%m%d')
+                key_prev = f"{prev_date_str}-{teams_sorted[0]}-{teams_sorted[1]}"
+                if key_prev not in schedule:
+                    schedule[key_prev] = game_ts
+                
+                total_games += 1
+        
+        print(f"  [NBA] ✓ Loaded {total_games} games from NBA schedule API")
+        return schedule
+        
+    except Exception as e:
+        print(f"  [NBA] ⚠️ Could not fetch NBA schedule: {e}")
+        print(f"  [NBA]   → Falling back to ticker-derived game times (~9pm ET)")
+        print(f"  [NBA]   → Add cdn.nba.com to GitHub Actions network allowlist for exact times")
+        return {}
+
+
+def lookup_game_start(market_ticker: str, schedule: Dict[str, int]) -> Optional[int]:
+    """Look up exact game start from NBA schedule cache.
+    
+    Ticker: KXNBAMENTION-26MAR26NYKCHA-BUZZ
+    → date=2026-03-26, teams={NYK, CHA}
+    → key="20260326-CHA-NYK" or "20260327-CHA-NYK"
+    """
+    if not schedule:
+        return None
+    
+    try:
+        parts = market_ticker.split("-")
+        if len(parts) < 2:
+            return None
+        event_code = parts[1]
+        if len(event_code) < 13:  # need date + 2 teams
+            return None
+        
+        yy = event_code[:2]
+        mmm = event_code[2:5]
+        dd = event_code[5:7]
+        team_1 = event_code[7:10]
+        team_2 = event_code[10:13]
+        
+        date_str = f"{dd}{mmm.title()}{yy}"
+        game_date = datetime.strptime(date_str, "%d%b%y")
+        date_key = game_date.strftime('%Y%m%d')
+        
+        teams_sorted = sorted([team_1, team_2])
+        key = f"{date_key}-{teams_sorted[0]}-{teams_sorted[1]}"
+        
+        if key in schedule:
+            return schedule[key]
+        
+        # Try next day (evening ET games have UTC date = next day)
+        next_date_key = (game_date + timedelta(days=1)).strftime('%Y%m%d')
+        key_next = f"{next_date_key}-{teams_sorted[0]}-{teams_sorted[1]}"
+        if key_next in schedule:
+            return schedule[key_next]
+        
+        return None
+    except:
+        return None
+
+
+def estimate_game_start_from_ticker(market_ticker: str) -> Optional[int]:
+    """Fallback: derive estimated game start time from the event date in the ticker.
+    
+    Ticker format: KXNBAMENTION-26MAR26NYKCHA-BUZZ
+    Event code: 26MAR26 → year=2026, month=MAR, day=26
+    NBA games tip off 7-10:30pm ET = 00:00-03:30 UTC next day.
+    We use 02:00 UTC (9pm ET) as the midpoint estimate.
+    """
+    try:
+        parts = market_ticker.split("-")
+        if len(parts) < 2:
+            return None
+        event_code = parts[1]
+        if len(event_code) < 7:
+            return None
+        
+        yy = event_code[:2]
+        mmm = event_code[2:5]
+        dd = event_code[5:7]
+        date_str = f"{dd}{mmm.title()}{yy}"
+        game_date = datetime.strptime(date_str, "%d%b%y")
+        
+        # NBA games on date X tip off in the evening ET = early morning UTC of date X+1
+        # Estimate: game_date + 1 day at 02:00 UTC (~9pm ET)
+        game_start = game_date + timedelta(days=1, hours=2)
+        return int(game_start.timestamp())
+    except Exception:
+        return None
+
+
+# Fetch NBA schedule once at startup
+print("Fetching NBA schedule for exact game times...")
+_NBA_SCHEDULE_CACHE = fetch_nba_schedule()
+
+
+def get_game_start_ts(market_ticker: str) -> Tuple[Optional[int], str]:
+    """Get game start time. NBA API first, ticker estimate as fallback.
+    
+    Returns (timestamp, source) where source is 'nba_api' or 'ticker_estimate'.
+    """
+    # Try NBA schedule first
+    ts = lookup_game_start(market_ticker, _NBA_SCHEDULE_CACHE)
+    if ts is not None:
+        return ts, "nba_api"
+    
+    # Fallback to ticker estimate
+    ts = estimate_game_start_from_ticker(market_ticker)
+    if ts is not None:
+        return ts, "ticker_estimate"
+    
+    return None, "none"
+
+
+def get_market_details(market_ticker: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], str]:
+    """Returns (expiration_ts, open_interest, volume, game_start_ts, time_source).
+    
+    [v4.6] Game time from NBA schedule API (exact) or ticker (estimate).
+    close_time is now 14 days after game (early-close markets), not usable.
+    open_interest/volume fields changed to open_interest_fp/volume_fp.
+    """
     try:
         market_response = exchange_client.get_market(ticker=market_ticker)
         market_data = market_response.get('market', {})
 
-        close_time = market_data.get('close_time')
+        # [v4.6] Get game start from NBA API or ticker fallback
+        game_start_ts, time_source = get_game_start_ts(market_ticker)
+        
+        if game_start_ts is None:
+            # Last resort: use close_time (will be wrong for new early-close markets)
+            close_time = market_data.get('close_time')
+            if close_time:
+                ts = close_time
+                if ts.endswith('Z'):
+                    ts = ts[:-1] + '+00:00'
+                dt = datetime.fromisoformat(ts)
+                game_start_ts = int(dt.timestamp())
+                time_source = "close_time_fallback"
+        
+        # Order expiration: cancel unfilled orders before the game starts
+        # [v4.6] NBA API gives exact tip-off → expire 10 min before tip-off
+        # Ticker estimate is ~9pm ET guess → expire 5h before to be safe
+        SAFETY_BUFFER_SECONDS = 600  # 10 minutes before tip-off
         expiration_ts = None
-        game_start_ts = None
-
-        if close_time:
-            time_str = close_time
-            if time_str.endswith('Z'):
-                time_str = time_str[:-1] + '+00:00'
-            dt = datetime.fromisoformat(time_str)
-            close_unix = int(dt.timestamp())
-            game_start_ts = close_unix  # actual game start / market close time
-            expiration_ts = close_unix - (EXPIRATION_HOURS_BEFORE_CLOSE * 3600)
+        if game_start_ts:
+            if time_source == "nba_api":
+                expiration_ts = game_start_ts - SAFETY_BUFFER_SECONDS
+            else:
+                expiration_ts = game_start_ts - (EXPIRATION_HOURS_BEFORE_CLOSE * 3600)
             if expiration_ts <= time.time():
                 expiration_ts = None
 
-        open_interest = market_data.get('open_interest', 0)
-        volume = market_data.get('volume', 0)
-        return expiration_ts, open_interest, volume, game_start_ts
+        # [v4.6] Handle renamed API fields: open_interest → open_interest_fp, volume → volume_fp
+        open_interest = market_data.get('open_interest', None)
+        if open_interest is None or open_interest == '':
+            oi_fp = market_data.get('open_interest_fp', '0')
+            open_interest = int(float(oi_fp)) if oi_fp else 0
+        else:
+            open_interest = int(float(open_interest))
+
+        volume = market_data.get('volume', None)
+        if volume is None or volume == '':
+            vol_fp = market_data.get('volume_fp', '0')
+            volume = int(float(vol_fp)) if vol_fp else 0
+        else:
+            volume = int(float(volume))
+
+        return expiration_ts, open_interest, volume, game_start_ts, time_source
 
     except Exception as e:
-        return None, None, None, None
+        return None, None, None, None, "error"
 
 def get_time_multiplier(hours_until_event: float) -> float:
     for threshold, multiplier in TIME_MULTIPLIERS:
@@ -1729,8 +1933,8 @@ def build_order_objects_for_market(
 
     # [v4.6] For blocked markets: still collect orderbook/market data for analytics, then skip orders
     if orders_blocked:
-        expiration_ts, open_interest, volume, game_start_ts = get_market_details(ticker)
-        hours_until_event = (expiration_ts - time.time()) / 3600.0 if expiration_ts else 0
+        expiration_ts, open_interest, volume, game_start_ts, _time_src = get_market_details(ticker)
+        hours_until_event = (game_start_ts - time.time()) / 3600.0 if game_start_ts else 0
 
         orderbook_yes_bid, orderbook_no_bid = None, None
         try:
@@ -1811,13 +2015,13 @@ def build_order_objects_for_market(
         label = "⛔ BLOCKED" if no_side_mult == 0.0 else f"📉 {no_side_mult:.1f}x" if no_side_mult < 1.0 else f"🚀 {no_side_mult:.1f}x"
         print(f"    {label} NO for {ticker_part_3_market_code}")
 
-    expiration_ts, open_interest, volume, game_start_ts = get_market_details(ticker)
+    expiration_ts, open_interest, volume, game_start_ts, time_source = get_market_details(ticker)
 
     if expiration_ts is None:
         print(f"    ✗ No valid expiration time — skipping")
         return []
 
-    hours_until_event = (expiration_ts - time.time()) / 3600.0
+    hours_until_event = (game_start_ts - time.time()) / 3600.0 if game_start_ts else 0
     minutes_to_event_start = hours_until_event * 60
 
     if open_interest is None:
@@ -1905,7 +2109,7 @@ def build_order_objects_for_market(
 
     safe_tag = " [SAFE MODE]" if safe_mode else ""
     position_status = f" | Pos: {abs(net_position)} net {'YES' if net_position > 0 else 'NO'}" if net_position != 0 else ""
-    print(f"    Time: {hours_until_event:.1f}h ({time_mult:.2f}x) | OI: {open_interest} ({volume_mult:.2f}x) | Base: {base_mult:.2f}x{position_status}{safe_tag}")
+    print(f"    Time: {hours_until_event:.1f}h ({time_mult:.2f}x) [{time_source}] | OI: {open_interest} ({volume_mult:.2f}x) | Base: {base_mult:.2f}x{position_status}{safe_tag}")
 
     # Get orderbook
     orderbook_yes_bid = None
@@ -2066,6 +2270,7 @@ def build_order_objects_for_market(
         "market_status": market_status,
         "event_start_ts": expiration_ts,
         "game_start_ts": game_start_ts,
+        "time_source": time_source,
         "ticker_part_3_market_code": ticker_part_3_market_code,
         "team_1": team_1,
         "team_2": team_2,
