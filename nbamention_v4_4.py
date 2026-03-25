@@ -567,8 +567,8 @@ SIDE_MULTIPLIERS = {
     "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
     "ANKL": {"yes": 1.0, "no": 2.0},    # keep -- both profitable, +$890 total
-    "BUZZ": {"yes": 0.0, "no": 1.5},    # keep -- NO is +$1,092 (13.4% ROI)
-    "ALLE": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
+    "BUZZ": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$1,092 (13.4% ROI)
+    "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
     "AIRB": {"yes": 1.5, "no": 0.0},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
     "MVP":  {"yes": 0.0, "no": 0.0},    # v4.4 was yes:0.5 -- net -$304, NO at -100% ROI
     "TRIP": {"yes": 0.0, "no": 0.0},    # keep killed
