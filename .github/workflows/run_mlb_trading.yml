@@ -1,9 +1,9 @@
 name: MLBMENTION Trading Bot
-# Runs every hour (offset by 2 min to avoid top-of-hour congestion)
-# 24 runs/day
+# Runs every 3 hours (offset by 2 min to avoid top-of-hour congestion)
+# 8 runs/day
 on:
   schedule:
-    - cron: '2 * * * *'
+    - cron: '2 */3 * * *'
   workflow_dispatch:  # Manual trigger
 jobs:
   run-trading-script:
