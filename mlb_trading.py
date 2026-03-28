@@ -405,7 +405,7 @@ else:
 ###################################################################################
 
 RUN_ID = str(uuid.uuid4())
-MODEL_VERSION = "mlb_v1.0"
+MODEL_VERSION = "mlb_v1.1"
 PRICING_STRATEGY = 'hybrid'
 
 # ---------- DISCOVERY MODE ----------
@@ -418,8 +418,9 @@ DISCOVERY_SIDE_MULT = 1.0  # base=1 contract already limits risk; 0.5x caused ro
 # ---------- BAYESIAN HYBRID PRICING PARAMETERS ----------
 BAYESIAN_K = 25
 BAYESIAN_RECENCY_HALFLIFE_GAMES = 50
-BAYESIAN_MARKET_WEIGHT = 0.6
-BAYESIAN_HISTORICAL_WEIGHT = 0.4
+# [v1.1] 90/10 market/historical — historical is noise at n≤4 per code
+BAYESIAN_MARKET_WEIGHT = 0.90
+BAYESIAN_HISTORICAL_WEIGHT = 0.10
 
 # =====================================================================
 # BANKROLL-SCALED POSITION MANAGEMENT
@@ -468,7 +469,7 @@ df_bankroll_log = pd.DataFrame([{
 MAX_NET_PER_MARKET = _limits["MAX_NET_PER_MARKET"]
 POSITION_MODERATE_THRESHOLD = _limits["POSITION_MODERATE_THRESHOLD"]
 POSITION_STOP_THRESHOLD = _limits["POSITION_STOP_THRESHOLD"]
-MAX_ORDERBOOK_LEVELS_ABOVE = 2
+MAX_ORDERBOOK_LEVELS_ABOVE = -1  # [v1.0] Never at top of book: orders must be below best bid
 
 MAX_NET_PER_EVENT = _limits["MAX_NET_PER_EVENT"]
 MAX_ORDERS_PER_EVENT = 5000
@@ -547,90 +548,82 @@ CORRELATED_PAIRS = {}
 CORRELATION_PENALTY = 0.75
 
 # =====================================================================
-# Price filters
+# Price filters — [v1.1] updated from 3-event audit
 # =====================================================================
 MIN_PRICE_YES = 15
 MIN_PRICE_NO = 5
-MAX_PRICE = 75
+MAX_PRICE = 65              # [v1.1] was 75 — YES 60-75c bucket lost $6 at -50pp edge
 YES_MIN_PRICE = 48
-NO_MAX_YES_PRICE = 88
+NO_MAX_YES_PRICE = 85       # [v1.1] was 88 — NO fills at implied YES >85c are death
 NO_MIN_YES_PRICE = 15
 YES_PROBABILITY_FLOOR = 40
 
-MAX_PRICE_OVERRIDES = {}  # Add per-market overrides as needed
+MAX_PRICE_OVERRIDES = {}
 
 NO_SWEET_SPOT_MIN = 35
 NO_SWEET_SPOT_MAX = 65
 NO_SWEET_SPOT_MULTIPLIER = 1.0
 
 # ---------- ORDER CONFIGURATION ----------
-# [v1.0] BASE_CONTRACTS = 1 — conservative sizing for new series with no historical data.
-# Raise to 5-10 after first week of profitable settlements, 15+ after 200+ settlements.
+# [v1.1] Asymmetric YES/NO offset levels based on 3-event audit:
+#   YES 45-60c: +35pp edge (88% WR on 16 fills) → 7 levels, tight offsets
+#   NO all buckets: -23pp adverse selection (p=0.019) → 5 levels, wide offsets
+#   This concentrates YES near mid-price and pushes NO to deep discounts only.
+
+NUM_YES_OFFSET_LEVELS = 7   # [v1.1] YES gets more levels (edge is real at 45-60c)
+NUM_NO_OFFSET_LEVELS = 5    # [v1.1] NO gets fewer levels (adversely selected everywhere)
 
 def generate_base_contracts(num_levels: int) -> List[int]:
-    contracts = []
-    for i in range(num_levels):
-        contracts.append(1)  # MLB v1.0: 1 contract per level (was 15 for NBA)
-    return contracts
+    return [1] * num_levels  # 1 contract per level
 
-NUM_OFFSET_LEVELS = 10
-BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
-BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
+BASE_YES_CONTRACTS = generate_base_contracts(NUM_YES_OFFSET_LEVELS)
+BASE_NO_CONTRACTS = generate_base_contracts(NUM_NO_OFFSET_LEVELS)
 MAX_CONTRACTS_PER_ORDER = 1000
-MAX_CONTRACTS_PER_MARKET_PER_RUN = 50  # Lower cap for new series
+MAX_CONTRACTS_PER_MARKET_PER_RUN = 10  # [v1.1] was 50 — PITC had 20 fills in one market
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
+# [v1.0] All multipliers flat 1.0 — no scaling until we have data to tune
 TIME_MULTIPLIERS = [
-    (1, 1.5),
-    (3, 1.5),
-    (6, 0.7),
-    (12, 1.1),
-    (24, 1.0),
-    (48, 0.7),
-    (999999, 0.5),
+    (999999, 1.0),
 ]
 
 VOLUME_MULTIPLIERS = [
-    (50000, 1.5),
-    (20000, 1.3),
-    (10000, 1.1),
-    (5000, 1.0),
-    (2000, 1.3),
-    (1000, 1.5),
-    (500, 1.3),
-    (0, 0.7),
+    (0, 1.0),
 ]
 
 # ---------- SPREAD-BASED OFFSET CONFIGURATION ----------
 def generate_offsets(start: int, increment: int, count: int) -> List[int]:
     return [start + i * increment for i in range(count)]
 
+# [v1.1] Asymmetric offsets: YES tight (cluster near mid), NO wide (deep discounts only)
+# YES edge is at 45-60c → tighter offsets keep orders in the profitable zone
+# NO is adversely selected → wider offsets mean we only fill at big discounts
 SPREAD_CONFIGS = {
     (0, 2): {
-        'yes': generate_offsets(start=4, increment=3, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=3, increment=2, count=NUM_OFFSET_LEVELS),
+        'yes': generate_offsets(start=2, increment=2, count=NUM_YES_OFFSET_LEVELS),  # [2,4,6,8,10,12,14]
+        'no':  generate_offsets(start=4, increment=3, count=NUM_NO_OFFSET_LEVELS),   # [4,7,10,13,16]
         'name': 'very_tight'
     },
     (2, 5): {
-        'yes': generate_offsets(start=3, increment=3, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=2, increment=2, count=NUM_OFFSET_LEVELS),
+        'yes': generate_offsets(start=2, increment=2, count=NUM_YES_OFFSET_LEVELS),  # [2,4,6,8,10,12,14]
+        'no':  generate_offsets(start=3, increment=3, count=NUM_NO_OFFSET_LEVELS),   # [3,6,9,12,15]
         'name': 'tight'
     },
     (5, 15): {
-        'yes': generate_offsets(start=2, increment=2, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=1, increment=2, count=NUM_OFFSET_LEVELS),
+        'yes': generate_offsets(start=1, increment=2, count=NUM_YES_OFFSET_LEVELS),  # [1,3,5,7,9,11,13]
+        'no':  generate_offsets(start=3, increment=3, count=NUM_NO_OFFSET_LEVELS),   # [3,6,9,12,15]
         'name': 'medium'
     },
     (15, 100): {
-        'yes': generate_offsets(start=1, increment=2, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
+        'yes': generate_offsets(start=1, increment=2, count=NUM_YES_OFFSET_LEVELS),  # [1,3,5,7,9,11,13]
+        'no':  generate_offsets(start=2, increment=3, count=NUM_NO_OFFSET_LEVELS),   # [2,5,8,11,14]
         'name': 'wide'
     },
 }
 
 PAIRING_OFFSETS = {
-    'yes': generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
-    'no':  generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
+    'yes': generate_offsets(start=1, increment=1, count=NUM_YES_OFFSET_LEVELS),
+    'no':  generate_offsets(start=1, increment=2, count=NUM_NO_OFFSET_LEVELS),  # wider even in hedge mode
     'name': 'pairing'
 }
 
@@ -656,7 +649,7 @@ except Exception as e:
     raise
 
 print(f"\n{'='*70}")
-print(f"CONFIGURATION — MLB v1.0 (DISCOVERY MODE)")
+print(f"CONFIGURATION — MLB v1.1 (DISCOVERY + 3-EVENT TUNING)")
 print(f"{'='*70}")
 print(f"Run ID: {RUN_ID}")
 print(f"Model version: {MODEL_VERSION}")
@@ -664,31 +657,18 @@ print(f"Bankroll: ${BANKROLL:,.2f} (scale: {_limits['scale']:.2f}x)")
 print(f"Discovery mode: {'ON' if DISCOVERY_MODE else 'OFF'} (unknown codes trade at {DISCOVERY_SIDE_MULT:.1f}x)")
 print(f"Pricing strategy: {PRICING_STRATEGY}")
 if PRICING_STRATEGY == 'hybrid':
-    print(f"  Bayesian K (credibility): {BAYESIAN_K}")
-    print(f"  Recency half-life: {BAYESIAN_RECENCY_HALFLIFE_GAMES} games")
-    print(f"  Market weight: {BAYESIAN_MARKET_WEIGHT}")
-    print(f"  Historical weight: {BAYESIAN_HISTORICAL_WEIGHT}")
-    print(f"  Using MID-PRICE anchor (not best-bid)")
-print(f"Position management:")
-print(f"  Max net per market: {MAX_NET_PER_MARKET} contracts")
-print(f"  Max paired per market: {MAX_PAIRED_PER_MARKET} contracts")
-print(f"  Max net per event: {MAX_NET_PER_EVENT} contracts")
-print(f"  Max contracts per market per run: {MAX_CONTRACTS_PER_MARKET_PER_RUN}")
-print(f"Pairing mode:")
-print(f"  Threshold: {PAIRING_MODE_THRESHOLD:.0%} of max = {PAIRING_MODE_NET_FLOOR} contracts")
-print(f"  Aggressive: {PAIRING_MODE_AGGRESSIVE:.0%} of max = {PAIRING_MODE_NET_AGGRESSIVE} contracts")
-print(f"  Pairing overshoot cap: ENABLED")
-print(f"Price/edge filters:")
-print(f"  YES range: {MIN_PRICE_YES}–{MAX_PRICE}c (floor: {YES_MIN_PRICE}c)")
-print(f"  NO range: {MIN_PRICE_NO}–{MAX_PRICE}c (implied YES: {NO_MIN_YES_PRICE}–{NO_MAX_YES_PRICE}c)")
-print(f"  Min EV per order: {MIN_EV_PER_ORDER:.0%}")
-print(f"Base contracts: YES={BASE_YES_CONTRACTS[:3]}... NO={BASE_NO_CONTRACTS[:3]}...")
-print(f"Side multipliers: {len(SIDE_MULTIPLIERS)} configured codes")
-for mkt, mults in SIDE_MULTIPLIERS.items():
-    print(f"  {mkt}: YES={mults['yes']}x NO={mults['no']}x")
-print(f"Team multipliers: {len(TEAM_MULTIPLIERS)} teams")
-for team, mult in TEAM_MULTIPLIERS.items():
-    print(f"  {team}: {mult:.1f}x")
+    print(f"  Market weight: {BAYESIAN_MARKET_WEIGHT} (was 0.6)")
+    print(f"  Historical weight: {BAYESIAN_HISTORICAL_WEIGHT} (was 0.4)")
+    print(f"  → 90/10 split: lean on orderbook, not noisy n≤4 historical")
+print(f"Price filters:")
+print(f"  YES: {MIN_PRICE_YES}–{MAX_PRICE}c (floor: {YES_MIN_PRICE}c)")
+print(f"  NO: {MIN_PRICE_NO}–{MAX_PRICE}c (implied YES: {NO_MIN_YES_PRICE}–{NO_MAX_YES_PRICE}c)")
+print(f"  Max price: {MAX_PRICE}c (was 75c — 60-75c bucket lost on both sides)")
+print(f"Order structure:")
+print(f"  YES: {NUM_YES_OFFSET_LEVELS} levels, tight offsets (edge at 45-60c)")
+print(f"  NO: {NUM_NO_OFFSET_LEVELS} levels, wide offsets (adverse selection protection)")
+print(f"  Per-market per-run cap: {MAX_CONTRACTS_PER_MARKET_PER_RUN} (was 50)")
+print(f"  Never top of book: MAX_ORDERBOOK_LEVELS_ABOVE={MAX_ORDERBOOK_LEVELS_ABOVE}")
 print(f"{'='*70}\n")
 
 # =====================================================================
@@ -1971,13 +1951,14 @@ def build_order_objects_for_market(
 
     safe_mult = SAFE_MODE_MULTIPLIER if safe_mode else 1.0
 
-    yes_total_mult = base_mult * yes_position_mult * yes_side_mult * safe_mult * corr_penalty_yes
-    no_total_mult = base_mult * no_position_mult * no_side_mult * safe_mult * corr_penalty_no
+    # [v1.0] Flat sizing — no dynamic multipliers. Only 0x side blocks apply.
+    yes_total_mult = (1.0 if yes_side_mult > 0 else 0.0) * safe_mult
+    no_total_mult = (1.0 if no_side_mult > 0 else 0.0) * safe_mult
 
     safe_tag = " [SAFE MODE]" if safe_mode else ""
     disc_tag = " [DISCOVERY]" if is_discovery else ""
     position_status = f" | Pos: {abs(net_position)} net {'YES' if net_position > 0 else 'NO'}" if net_position != 0 else ""
-    print(f"    Time: {hours_until_event:.1f}h ({time_mult:.2f}x) [{time_source}] | OI: {open_interest} ({volume_mult:.2f}x) | Base: {base_mult:.2f}x{position_status}{safe_tag}{disc_tag}")
+    print(f"    Time: {hours_until_event:.1f}h [{time_source}] | OI: {open_interest} | Mult: YES={yes_total_mult:.1f}x NO={no_total_mult:.1f}x{position_status}{safe_tag}{disc_tag}")
 
     # Get orderbook
     orderbook_yes_bid = None
@@ -2109,7 +2090,7 @@ def build_order_objects_for_market(
     yes_offsets, no_offsets, spread_config_name = get_offsets_for_spread(spread_cents)
 
     if ticker_part_3_market_code in TOP_NO_MARKETS:
-        no_offsets = generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS)
+        no_offsets = generate_offsets(start=1, increment=1, count=NUM_NO_OFFSET_LEVELS)
         if spread_config_name not in ('very_tight', 'tight'):
             spread_config_name = f"{spread_config_name}+top_no"
 
