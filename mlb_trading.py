@@ -22,6 +22,106 @@ from datetime import datetime, UTC, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from google.cloud import bigquery
+import json as _json
+import urllib.request
+
+# =========================
+# ALERTING
+# =========================
+# Collects all fallback/warning events during the run.
+# At end of run: uploads to BQ + sends Slack summary (if webhook configured).
+
+_ALERTS: List[Dict[str, Any]] = []
+
+# Notification config — set in GitHub Secrets
+# ALERT_EMAIL_TO can be a regular email OR a carrier SMS gateway:
+#   Verizon:  1234567890@vtext.com
+#   AT&T:     1234567890@txt.att.net
+#   T-Mobile: 1234567890@tmomail.net
+#   Sprint:   1234567890@messaging.sprintpcs.com
+ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")      # e.g. yourname@gmail.com
+ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "") # Gmail app password
+ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "")           # email or SMS gateway
+
+
+def alert(category: str, message: str, context: Dict[str, Any] = None):
+    """Record a fallback/warning event. Always prints; collected for end-of-run summary."""
+    ts = datetime.now(UTC).isoformat()
+    entry = {
+        "timestamp": ts,
+        "category": category,
+        "message": message,
+        **(context or {}),
+    }
+    _ALERTS.append(entry)
+    ctx_str = f" | {context}" if context else ""
+    print(f"  ⚡ ALERT [{category}]: {message}{ctx_str}")
+
+
+def send_alert_notification():
+    """Send alert summary via email/text if configured."""
+    import smtplib
+    from email.mime.text import MIMEText
+
+    if not ALERT_EMAIL_FROM or not ALERT_EMAIL_PASSWORD or not ALERT_EMAIL_TO:
+        return
+    if len(_ALERTS) == 0:
+        return
+
+    # Group by category
+    cats = {}
+    for a in _ALERTS:
+        c = a['category']
+        cats[c] = cats.get(c, 0) + 1
+
+    # Build message body
+    lines = [f"KXMLBMENTION Alerts: {len(_ALERTS)} total"]
+    for cat, count in sorted(cats.items(), key=lambda x: -x[1]):
+        lines.append(f"  {cat}: {count}")
+    lines.append("")
+    for a in _ALERTS[:8]:
+        lines.append(f"[{a['category']}] {a['message']}")
+    if len(_ALERTS) > 8:
+        lines.append(f"... +{len(_ALERTS) - 8} more")
+
+    body = "\n".join(lines)
+
+    # Send to each recipient (comma-separated)
+    recipients = [r.strip() for r in ALERT_EMAIL_TO.split(",") if r.strip()]
+
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = f"MLB Bot: {len(_ALERTS)} alerts"
+        msg["From"] = ALERT_EMAIL_FROM
+        msg["To"] = ", ".join(recipients)
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
+            server.sendmail(ALERT_EMAIL_FROM, recipients, msg.as_string())
+
+        print(f"  ✓ Alert notification sent to {len(recipients)} recipient(s)")
+    except Exception as e:
+        print(f"  ⚠️ Alert notification failed: {e}")
+
+
+def upload_alerts_to_bq(bq_client, project_id: str, dataset_id: str, series_ticker: str):
+    """Upload alerts to BQ for historical tracking."""
+    if bq_client is None or len(_ALERTS) == 0:
+        return
+    try:
+        df_alerts = pd.DataFrame(_ALERTS)
+        df_alerts['run_id'] = RUN_ID
+        df_alerts['model_version'] = MODEL_VERSION
+        table_id = f"{project_id}.{dataset_id}.{series_ticker}_alerts"
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_APPEND",
+            autodetect=True,
+        )
+        job = bq_client.load_table_from_dataframe(df_alerts, table_id, job_config=job_config)
+        job.result()
+        print(f"  ✓ Uploaded {len(df_alerts)} alerts to {table_id}")
+    except Exception as e:
+        print(f"  ⚠️ Alert upload failed: {e}")
 
 # =========================
 # CONFIG
@@ -405,7 +505,7 @@ else:
 ###################################################################################
 
 RUN_ID = str(uuid.uuid4())
-MODEL_VERSION = "mlb_v1.1"
+MODEL_VERSION = "mlb_v1.2"
 PRICING_STRATEGY = 'hybrid'
 
 # ---------- DISCOVERY MODE ----------
@@ -419,8 +519,10 @@ DISCOVERY_SIDE_MULT = 1.0  # base=1 contract already limits risk; 0.5x caused ro
 BAYESIAN_K = 25
 BAYESIAN_RECENCY_HALFLIFE_GAMES = 50
 # [v1.1] 90/10 market/historical — historical is noise at n≤4 per code
+# These are DEFAULTS — overridden by adaptive calibration if BQ data is available
 BAYESIAN_MARKET_WEIGHT = 0.90
 BAYESIAN_HISTORICAL_WEIGHT = 0.10
+_BAYESIAN_WEIGHTS_PER_CODE: Dict[str, tuple] = {}  # populated by calibration
 
 # =====================================================================
 # BANKROLL-SCALED POSITION MANAGEMENT
@@ -436,7 +538,7 @@ def fetch_bankroll(client) -> Tuple[float, int, int]:
         print(f"  Kalshi bankroll: ${bankroll:,.2f} (cash: ${balance_cents/100:.2f}, positions: ${portfolio_cents/100:.2f})")
         return bankroll, balance_cents, portfolio_cents
     except Exception as e:
-        print(f"  ⚠️ Could not fetch bankroll: {e} — using fallback ${BANKROLL_FALLBACK:,}")
+        alert("BANKROLL_FAILED", f"Using fallback ${BANKROLL_FALLBACK:,}: {e}")
         return BANKROLL_FALLBACK, 0, 0
 
 def get_scaled_limits(bankroll: float) -> dict:
@@ -649,7 +751,7 @@ except Exception as e:
     raise
 
 print(f"\n{'='*70}")
-print(f"CONFIGURATION — MLB v1.1 (DISCOVERY + 3-EVENT TUNING)")
+print(f"CONFIGURATION — MLB v1.2 (ADAPTIVE CALIBRATION)")
 print(f"{'='*70}")
 print(f"Run ID: {RUN_ID}")
 print(f"Model version: {MODEL_VERSION}")
@@ -1190,8 +1292,7 @@ def get_existing_positions() -> Tuple[Dict[str, Dict[str, int]], bool]:
         return positions, True
 
     except Exception as e:
-        print(f"⚠️  Error fetching positions: {e}")
-        print(f"  ⚠️  SAFE MODE ACTIVE ({SAFE_MODE_MULTIPLIER:.0%} sizing)\n")
+        alert("SAFE_MODE", f"Position fetch failed, sizing at {SAFE_MODE_MULTIPLIER:.0%}: {e}")
         return {}, False
 
 
@@ -1355,9 +1456,9 @@ def fetch_mlb_schedule() -> Dict[str, int]:
         return schedule
         
     except Exception as e:
-        print(f"  [MLB] ⚠️ Could not fetch MLB schedule: {e}")
-        print(f"  [MLB]   → Falling back to ticker-derived game times (~midnight ET)")
-        print(f"  [MLB]   → Add statsapi.mlb.com to GitHub Actions network allowlist")
+        alert("SCHEDULE_FETCH_FAILED", f"MLB Stats API unreachable: {e}",
+              {"fallback": "ticker_estimate"})
+        print(f"  [MLB]   → Falling back to ticker-derived game times")
         return {}
 
 
@@ -1462,8 +1563,12 @@ def get_game_start_ts(market_ticker: str) -> Tuple[Optional[int], str]:
     
     ts = estimate_game_start_from_ticker(market_ticker)
     if ts is not None:
+        alert("GAME_TIME_FALLBACK", f"MLB API miss, using ticker estimate",
+              {"ticker": market_ticker, "fallback": "ticker_estimate"})
         return ts, "ticker_estimate"
     
+    alert("GAME_TIME_MISSING", f"No game time found at all",
+          {"ticker": market_ticker, "fallback": "none"})
     return None, "none"
 
 
@@ -1484,6 +1589,8 @@ def get_market_details(market_ticker: str) -> Tuple[Optional[int], Optional[int]
                 dt = datetime.fromisoformat(ts)
                 game_start_ts = int(dt.timestamp())
                 time_source = "close_time_fallback"
+                alert("GAME_TIME_CLOSE_TIME", f"Using close_time (14-day offset, unreliable)",
+                      {"ticker": market_ticker})
         
         # Order expiration timing
         SAFETY_BUFFER_SECONDS = 0
@@ -1549,12 +1656,20 @@ def calculate_hybrid_price_bayesian(
     team_1_sample_size: int,
     team_2_yes_rate: Optional[float],
     team_2_sample_size: int,
+    market_code: str = "",  # [v1.2] adaptive per-code weights
 ) -> Tuple[float, Dict[str, Any]]:
     intermediates: Dict[str, Any] = {}
     market_mid_rate = market_mid / 100
 
     if market_yes_rate is None or pd.isna(market_yes_rate):
         return market_mid_rate, {"fallback": "no_market_yes_rate"}
+
+    # [v1.2] Use per-code adaptive weights if available, else global defaults
+    if market_code and market_code in _BAYESIAN_WEIGHTS_PER_CODE:
+        base_market_weight, base_historical_weight = _BAYESIAN_WEIGHTS_PER_CODE[market_code]
+    else:
+        base_market_weight = BAYESIAN_MARKET_WEIGHT
+        base_historical_weight = BAYESIAN_HISTORICAL_WEIGHT
 
     team_rates = []
     team_weights = []
@@ -1587,8 +1702,8 @@ def calculate_hybrid_price_bayesian(
 
     n = max(market_sample_size, 0)
     recency_discount = 2 ** (-n / BAYESIAN_RECENCY_HALFLIFE_GAMES)
-    historical_weight = BAYESIAN_HISTORICAL_WEIGHT * (1.0 - 0.5 * (1.0 - recency_discount))
-    market_weight = BAYESIAN_MARKET_WEIGHT
+    historical_weight = base_historical_weight * (1.0 - 0.5 * (1.0 - recency_discount))
+    market_weight = base_market_weight
 
     total_weight = market_weight + historical_weight
     market_weight /= total_weight
@@ -1608,6 +1723,7 @@ def calculate_hybrid_price_bayesian(
         "bayesian_recency_discount": round(recency_discount, 4),
         "bayesian_final_market_weight": round(market_weight, 4),
         "bayesian_final_historical_weight": round(historical_weight, 4),
+        "bayesian_adaptive_code": market_code,
     })
 
     return hybrid_yes_rate, intermediates
@@ -1621,7 +1737,8 @@ def calculate_bid_price(
     team_2_yes_rate: Optional[float],
     team_2_sample_size: int,
     market_sample_size: int,
-    strategy: str
+    strategy: str,
+    market_code: str = "",  # [v1.2] for adaptive per-code weights
 ) -> Tuple[Optional[int], Optional[int], Dict[str, Any]]:
     empty_intermediates: Dict[str, Any] = {}
 
@@ -1657,6 +1774,7 @@ def calculate_bid_price(
             team_1_sample_size=team_1_sample_size,
             team_2_yes_rate=team_2_yes_rate,
             team_2_sample_size=team_2_sample_size,
+            market_code=market_code,
         )
 
         yes_price = int(hybrid_yes_rate * 100)
@@ -1992,10 +2110,14 @@ def build_order_objects_for_market(
         if no_data and len(no_data) > 0:
             orderbook_no_bid, no_bid_size = parse_orderbook(no_data, is_dollars=ob_is_dollars)
 
+        if orderbook_yes_bid is None and orderbook_no_bid is None:
+            alert("ORDERBOOK_EMPTY", f"No bids on either side",
+                  {"ticker": ticker})
         print(f"    Orderbook: Yes={orderbook_yes_bid if orderbook_yes_bid else 'N/A'}c, No={orderbook_no_bid if orderbook_no_bid else 'N/A'}c")
 
     except Exception as e:
-        print(f"    Orderbook ERROR: {e}")
+        alert("ORDERBOOK_ERROR", f"Orderbook fetch failed: {e}",
+              {"ticker": ticker})
         import traceback
         traceback.print_exc()
 
@@ -2019,7 +2141,8 @@ def build_order_objects_for_market(
         team_2_yes_rate=team_2_yes_rate,
         team_2_sample_size=team_2_sample_size,
         market_sample_size=market_sample_size,
-        strategy=PRICING_STRATEGY
+        strategy=PRICING_STRATEGY,
+        market_code=ticker_part_3_market_code,  # [v1.2] adaptive per-code weights
     )
 
     if PRICING_STRATEGY == 'hybrid':
@@ -2507,6 +2630,14 @@ def submit_orders_sequential(orders: List[Dict[str, Any]]) -> List[Dict[str, Any
                 except Exception as e2:
                     error_detail = f"429 retry failed: {e2}"
 
+            # Alert on order failures
+            if '400' in str(e) or status_code == 400:
+                alert("ORDER_400", f"{order_params.get('ticker')} {order_params.get('side')}@{order_params.get('yes_price') or order_params.get('no_price')}c",
+                      {"error": error_detail[:200]})
+            elif '429' in str(e) or status_code == 429:
+                alert("ORDER_429", f"Rate limited on {order_params.get('ticker')}",
+                      {"error": error_detail[:200]})
+
             results.append({
                 "ok": False,
                 "ticker": order_params["ticker"],
@@ -2684,6 +2815,257 @@ def place_orders_from_df(df_results: pd.DataFrame):
     return df_orders, df_market_snapshot_signals, ledger
 
 
+# =====================================================================
+# ADAPTIVE CALIBRATION — inlined from mlb_calibration.py
+# =====================================================================
+# Queries BQ for settlement + fill history, computes dynamic parameters.
+# If BQ unavailable or tables don't exist, falls back to static defaults.
+
+# Calibration thresholds
+_CAL_MIN_HIST_WEIGHT = 0.05
+_CAL_MAX_HIST_WEIGHT = 0.40
+_CAL_FULL_CREDIBILITY_N = 100
+_CAL_MIN_SAMPLES_FOR_KELLY = 15
+_CAL_KELLY_ENABLE = 0.03
+_CAL_KELLY_BLOCK = -0.03
+_CAL_KELLY_STRONG = 0.10
+_CAL_MAX_SIDE_MULT = 2.0
+_CAL_DISCOVERY_MULT = 1.0
+_CAL_MIN_FILLS_PER_BUCKET = 20
+_CAL_BUCKET_BLOCK_EDGE = -0.15
+_CAL_PRICE_BUCKETS = [(0, 20), (20, 35), (35, 50), (50, 65), (65, 80), (80, 100)]
+
+
+def _cal_bayesian_weights(settlement_counts: Dict[str, int]) -> Dict[str, tuple]:
+    weights = {}
+    for code, n in settlement_counts.items():
+        cred = min(n / _CAL_FULL_CREDIBILITY_N, 1.0)
+        hw = _CAL_MIN_HIST_WEIGHT + cred * (_CAL_MAX_HIST_WEIGHT - _CAL_MIN_HIST_WEIGHT)
+        weights[code] = (round(1.0 - hw, 4), round(hw, 4))
+    return weights
+
+
+def _cal_kelly(wins: int, n: int, avg_price_cents: float) -> float:
+    if n == 0 or avg_price_cents <= 0 or avg_price_cents >= 100:
+        return 0.0
+    p = wins / n
+    b = (100 - avg_price_cents) / avg_price_cents
+    return (p * b - (1 - p)) / b if b > 0 else 0.0
+
+
+def _cal_side_multipliers(fills_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    mults = {}
+    if fills_df is None or len(fills_df) == 0:
+        return mults
+    for code, cg in fills_df.groupby('market_code'):
+        cm = {}
+        for side in ['yes', 'no']:
+            sf = cg[cg['side'] == side]
+            n = len(sf)
+            if n < _CAL_MIN_SAMPLES_FOR_KELLY:
+                cm[side] = _CAL_DISCOVERY_MULT
+                continue
+            kelly = _cal_kelly(int(sf['won'].sum()), n, sf['fill_price'].mean())
+            if kelly >= _CAL_KELLY_STRONG:
+                cm[side] = min(kelly / _CAL_KELLY_ENABLE, _CAL_MAX_SIDE_MULT)
+            elif kelly >= _CAL_KELLY_ENABLE:
+                cm[side] = max(1.0, kelly / _CAL_KELLY_ENABLE)
+            elif kelly <= _CAL_KELLY_BLOCK:
+                cm[side] = 0.0
+            else:
+                cm[side] = 0.5
+        mults[code] = cm
+    return mults
+
+
+def _cal_price_caps(fills_df: pd.DataFrame) -> Tuple[int, int]:
+    max_yes, max_no = 75, 75
+    if fills_df is None or len(fills_df) == 0:
+        return 65, 65
+    for side, cap_ref in [('yes', 'max_yes'), ('no', 'max_no')]:
+        sf = fills_df[fills_df['side'] == side]
+        for lo, hi in _CAL_PRICE_BUCKETS:
+            bucket = sf[(sf['fill_price'] >= lo) & (sf['fill_price'] < hi)]
+            if len(bucket) < _CAL_MIN_FILLS_PER_BUCKET:
+                continue
+            wr = bucket['won'].mean()
+            edge = wr - bucket['fill_price'].mean() / 100.0
+            if edge < _CAL_BUCKET_BLOCK_EDGE:
+                if side == 'yes':
+                    max_yes = min(max_yes, lo)
+                else:
+                    max_no = min(max_no, lo)
+    return max_yes, max_no
+
+
+def run_calibration(bq_client, project_id: str, dataset_id: str,
+                    series_ticker: str = "KXMLBMENTION") -> Dict[str, Any]:
+    """Run adaptive calibration from BQ data. Returns dict of overrides."""
+    print(f"\n{'='*70}")
+    print(f"ADAPTIVE CALIBRATION — {series_ticker}")
+    print(f"{'='*70}")
+
+    result = {
+        'market_weight': 0.90, 'historical_weight': 0.10,
+        'weights_per_code': {}, 'side_multipliers': {},
+        'max_price': 65, 'total_settlements': 0, 'codes_with_kelly': 0,
+    }
+
+    if bq_client is None:
+        print("  No BQ client — using static defaults")
+        return result
+
+    # Load settlement counts
+    settlement_counts = {}
+    try:
+        sc_query = f"""
+        SELECT
+            SPLIT(market_ticker, '-')[SAFE_OFFSET(2)] AS market_code,
+            COUNT(*) AS n
+        FROM `{project_id}.{dataset_id}.{series_ticker}_settlements`
+        WHERE result IS NOT NULL AND result != ''
+        GROUP BY 1
+        """
+        sc_df = bq_client.query(sc_query).to_dataframe()
+        settlement_counts = dict(zip(sc_df['market_code'], sc_df['n']))
+        result['total_settlements'] = sum(settlement_counts.values())
+        print(f"  Loaded settlement counts for {len(settlement_counts)} codes ({result['total_settlements']} total)")
+    except Exception as e:
+        print(f"  ⚠️ Could not load settlements: {e}")
+        return result
+
+    if result['total_settlements'] == 0:
+        print("  No settlements — using static defaults")
+        return result
+
+    # Tier 1: Bayesian weights
+    result['weights_per_code'] = _cal_bayesian_weights(settlement_counts)
+    median_n = int(np.median(list(settlement_counts.values())))
+    cred = min(median_n / _CAL_FULL_CREDIBILITY_N, 1.0)
+    result['historical_weight'] = round(_CAL_MIN_HIST_WEIGHT + cred * (_CAL_MAX_HIST_WEIGHT - _CAL_MIN_HIST_WEIGHT), 4)
+    result['market_weight'] = round(1.0 - result['historical_weight'], 4)
+
+    print(f"\n  TIER 1: Bayesian weights (median n={median_n})")
+    for code, (mw, hw) in sorted(result['weights_per_code'].items()):
+        n = settlement_counts.get(code, 0)
+        print(f"    {code:<8}: n={n:>4} → market={mw:.0%}, hist={hw:.0%}")
+
+    # Load fills matched to settlements
+    fills_df = pd.DataFrame()
+    try:
+        fills_query = f"""
+        SELECT
+            f.market_ticker,
+            f.side,
+            f.fill_price,
+            f.filled_count,
+            SPLIT(f.market_ticker, '-')[SAFE_OFFSET(2)] AS market_code,
+            CASE
+                WHEN f.side = 'yes' AND UPPER(s.result) = 'YES' THEN TRUE
+                WHEN f.side = 'no' AND UPPER(s.result) = 'NO' THEN TRUE
+                ELSE FALSE
+            END AS won
+        FROM `{project_id}.{dataset_id}.{series_ticker}_fills` f
+        JOIN `{project_id}.{dataset_id}.{series_ticker}_settlements` s
+            ON f.market_ticker = s.market_ticker
+        WHERE s.result IS NOT NULL AND s.result != ''
+          AND f.fill_price > 0 AND f.filled_count > 0
+        """
+        fills_df = bq_client.query(fills_query).to_dataframe()
+        fills_df['fill_price'] = pd.to_numeric(fills_df['fill_price'], errors='coerce')
+        fills_df['won'] = fills_df['won'].astype(bool)
+        print(f"  Loaded {len(fills_df)} fills matched to settlements")
+    except Exception as e:
+        print(f"  ⚠️ Could not load fills: {e}")
+
+    # Tier 2: Side multipliers
+    if len(fills_df) > 0:
+        result['side_multipliers'] = _cal_side_multipliers(fills_df)
+        result['codes_with_kelly'] = len(result['side_multipliers'])
+        print(f"\n  TIER 2: Side multipliers ({result['codes_with_kelly']} codes)")
+        for code, m in sorted(result['side_multipliers'].items()):
+            yt = "BLOCK" if m['yes'] == 0 else f"{m['yes']:.1f}x"
+            nt = "BLOCK" if m['no'] == 0 else f"{m['no']:.1f}x"
+            # Show Kelly for codes with enough data
+            cf = fills_df[fills_df['market_code'] == code]
+            details = []
+            for side_label, side_key in [('Y', 'yes'), ('N', 'no')]:
+                sf = cf[cf['side'] == side_key]
+                if len(sf) >= _CAL_MIN_SAMPLES_FOR_KELLY:
+                    k = _cal_kelly(int(sf['won'].sum()), len(sf), sf['fill_price'].mean())
+                    details.append(f"{side_label}:K={k*100:+.0f}%,n={len(sf)}")
+            detail_str = f" ({', '.join(details)})" if details else ""
+            print(f"    {code:<8}: YES={yt}, NO={nt}{detail_str}")
+    else:
+        print(f"\n  TIER 2: No fills — all codes at discovery default")
+
+    # Tier 3: Price caps
+    if len(fills_df) > 0:
+        max_yes, max_no = _cal_price_caps(fills_df)
+        result['max_price'] = min(max_yes, max_no)
+        print(f"\n  TIER 3: Price caps → YES≤{max_yes}c, NO≤{max_no}c → MAX_PRICE={result['max_price']}c")
+    else:
+        print(f"\n  TIER 3: No fills — conservative cap (65c)")
+
+    print(f"{'='*70}\n")
+    return result
+
+
+# ---------- Run Calibration ----------
+_early_bq_client = None
+try:
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        _early_bq_client = bigquery.Client(
+            project=os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
+        )
+    else:
+        try:
+            from google.colab import auth
+            auth.authenticate_user()
+            _early_bq_client = bigquery.Client(
+                project=os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
+            )
+        except ImportError:
+            pass
+except Exception as e:
+    print(f"  ⚠️ Early BQ init failed: {e}")
+
+if _early_bq_client is not None:
+    try:
+        _cal = run_calibration(
+            bq_client=_early_bq_client,
+            project_id=os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7"),
+            dataset_id=os.environ.get("GCP_DATASET_ID", "Kalshi"),
+            series_ticker=SERIES_TICKER,
+        )
+
+        # Tier 1: Override Bayesian weights
+        BAYESIAN_MARKET_WEIGHT = _cal['market_weight']
+        BAYESIAN_HISTORICAL_WEIGHT = _cal['historical_weight']
+        _BAYESIAN_WEIGHTS_PER_CODE = _cal['weights_per_code']
+
+        # Tier 2: Merge calibrated side multipliers (manual blocks take priority)
+        for code, mults in _cal['side_multipliers'].items():
+            if code not in SIDE_MULTIPLIERS:
+                SIDE_MULTIPLIERS[code] = mults
+
+        # Tier 3: Override price caps
+        MAX_PRICE = _cal['max_price']
+
+        print(f"✓ Calibration applied: {_cal['total_settlements']} settlements, "
+              f"{_cal['codes_with_kelly']} codes with Kelly, "
+              f"weights={BAYESIAN_MARKET_WEIGHT:.0%}/{BAYESIAN_HISTORICAL_WEIGHT:.0%}, "
+              f"max_price={MAX_PRICE}c, "
+              f"side_mults={len(SIDE_MULTIPLIERS)} codes")
+
+    except Exception as e:
+        alert("CALIBRATION_FAILED", f"Using static defaults: {e}")
+        import traceback
+        traceback.print_exc()
+else:
+    alert("CALIBRATION_NO_BQ", "No BQ client for calibration — using static defaults")
+
+
 # ---------- Run ----------
 print("\nValidating df_results...")
 
@@ -2820,3 +3202,30 @@ if position_ledger:
 df_to_bq(df_bankroll_log, f"{SERIES_TICKER}_bankroll_log", write_disposition="WRITE_APPEND")
 
 print("\n✓ All tables uploaded successfully!")
+
+# =====================================================================
+# END-OF-RUN ALERT SUMMARY
+# =====================================================================
+if _ALERTS:
+    print(f"\n{'='*70}")
+    print(f"⚡ ALERT SUMMARY: {len(_ALERTS)} alerts")
+    print(f"{'='*70}")
+
+    # Group by category
+    cats: Dict[str, int] = {}
+    for a in _ALERTS:
+        c = a['category']
+        cats[c] = cats.get(c, 0) + 1
+
+    for cat, count in sorted(cats.items(), key=lambda x: -x[1]):
+        print(f"  {cat}: {count}")
+
+    # Upload alerts to BQ
+    upload_alerts_to_bq(client, PROJECT_ID, DATASET_ID, SERIES_TICKER)
+
+    # Send email/text notification
+    send_alert_notification()
+
+    print(f"{'='*70}\n")
+else:
+    print("\n✓ No alerts — clean run")
