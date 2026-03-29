@@ -1944,13 +1944,27 @@ def calculate_bid_price(
         raise ValueError(f"Unknown pricing strategy: {strategy}")
 
 
-def parse_orderbook(orderbook_data: List[List[int]]) -> Tuple[Optional[int], Optional[int]]:
+def parse_orderbook(orderbook_data):
+    """Parse orderbook data. Handles both formats:
+    - Legacy: [[42, 13], [40, 5]]  (int cents, int contracts)
+    - New fp: [["0.4200", "13.00"], ["0.4000", "5.00"]]  (dollar strings)
+    Returns (best_bid_cents, best_bid_size) or (None, None).
+    """
     if not orderbook_data or len(orderbook_data) == 0:
         return None, None
-    best_bid = max(level[0] for level in orderbook_data)
-    best_bid_idx = next(i for i, level in enumerate(orderbook_data) if level[0] == best_bid)
-    bid_size = orderbook_data[best_bid_idx][1]
-    return best_bid, bid_size
+    # Detect format from first element
+    sample = orderbook_data[0][0]
+    if isinstance(sample, str):
+        # New fp format: dollar strings → convert to cents
+        parsed = [(int(round(float(level[0]) * 100)), int(float(level[1]))) for level in orderbook_data]
+    else:
+        # Legacy int format
+        parsed = [(int(level[0]), int(level[1])) for level in orderbook_data]
+    if not parsed:
+        return None, None
+    best_bid = max(p[0] for p in parsed)
+    best_size = next(p[1] for p in parsed if p[0] == best_bid)
+    return best_bid, best_size
 
 
 market_snapshots = []
@@ -2015,9 +2029,11 @@ def build_order_objects_for_market(
         orderbook_yes_bid, orderbook_no_bid = None, None
         try:
             orderbook_response = exchange_client.get_orderbook(ticker=ticker, depth=10)
-            orderbook = orderbook_response.get('orderbook', orderbook_response)
-            yes_data = orderbook.get('yes', [])
-            no_data = orderbook.get('no', [])
+            # New format: orderbook_fp.yes_dollars/no_dollars (March 2026 migration)
+            ob_fp = orderbook_response.get('orderbook_fp', {})
+            ob_legacy = orderbook_response.get('orderbook', orderbook_response)
+            yes_data = ob_fp.get('yes_dollars', []) or ob_legacy.get('yes', [])
+            no_data = ob_fp.get('no_dollars', []) or ob_legacy.get('no', [])
             if yes_data and len(yes_data) > 0:
                 orderbook_yes_bid, _ = parse_orderbook(yes_data)
             if no_data and len(no_data) > 0:
@@ -2196,13 +2212,11 @@ def build_order_objects_for_market(
     try:
         orderbook_response = exchange_client.get_orderbook(ticker=ticker, depth=10)
 
-        if 'orderbook' in orderbook_response:
-            orderbook = orderbook_response['orderbook']
-        else:
-            orderbook = orderbook_response
-
-        yes_data = orderbook.get('yes', [])
-        no_data = orderbook.get('no', [])
+        # New format: orderbook_fp.yes_dollars/no_dollars (March 2026 migration)
+        ob_fp = orderbook_response.get('orderbook_fp', {})
+        ob_legacy = orderbook_response.get('orderbook', orderbook_response)
+        yes_data = ob_fp.get('yes_dollars', []) or ob_legacy.get('yes', [])
+        no_data = ob_fp.get('no_dollars', []) or ob_legacy.get('no', [])
 
         if yes_data and len(yes_data) > 0:
             orderbook_yes_bid, yes_bid_size = parse_orderbook(yes_data)
@@ -2211,6 +2225,7 @@ def build_order_objects_for_market(
             orderbook_no_bid, no_bid_size = parse_orderbook(no_data)
 
         print(f"    Orderbook: Yes={orderbook_yes_bid if orderbook_yes_bid else 'N/A'}c, No={orderbook_no_bid if orderbook_no_bid else 'N/A'}c")
+        # Empty orderbook = no liquidity, worth knowing about
         if orderbook_yes_bid is None and orderbook_no_bid is None:
             alert("ORDERBOOK_EMPTY", f"No bids on either side", {"ticker": ticker})
 
