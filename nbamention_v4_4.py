@@ -26,6 +26,76 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import os
 from google.cloud import bigquery
+import smtplib
+from email.mime.text import MIMEText
+
+# =========================
+# ALERTING
+# =========================
+_ALERTS = []
+ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")
+ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
+ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "")
+
+
+def alert(category: str, message: str, context: dict = None):
+    entry = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "category": category,
+        "message": message,
+        **(context or {}),
+    }
+    _ALERTS.append(entry)
+    ctx_str = f" | {context}" if context else ""
+    print(f"  ⚡ ALERT [{category}]: {message}{ctx_str}")
+
+
+def send_alert_notification():
+    if not ALERT_EMAIL_FROM or not ALERT_EMAIL_PASSWORD or not ALERT_EMAIL_TO:
+        return
+    if len(_ALERTS) == 0:
+        return
+    cats = {}
+    for a in _ALERTS:
+        c = a["category"]
+        cats[c] = cats.get(c, 0) + 1
+    lines = [f"KXNBAMENTION Alerts: {len(_ALERTS)} total"]
+    for cat, count in sorted(cats.items(), key=lambda x: -x[1]):
+        lines.append(f"  {cat}: {count}")
+    lines.append("")
+    for a in _ALERTS[:8]:
+        lines.append(f"[{a['category']}] {a['message']}")
+    if len(_ALERTS) > 8:
+        lines.append(f"... +{len(_ALERTS) - 8} more")
+    body = "\n".join(lines)
+    recipients = [r.strip() for r in ALERT_EMAIL_TO.split(",") if r.strip()]
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = f"NBA Bot: {len(_ALERTS)} alerts"
+        msg["From"] = ALERT_EMAIL_FROM
+        msg["To"] = ", ".join(recipients)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
+            server.sendmail(ALERT_EMAIL_FROM, recipients, msg.as_string())
+        print(f"  ✓ Alert notification sent to {len(recipients)} recipient(s)")
+    except Exception as e:
+        print(f"  ⚠️ Alert notification failed: {e}")
+
+
+def upload_alerts_to_bq(bq_client_ref, project_id, dataset_id, series_ticker):
+    if bq_client_ref is None or len(_ALERTS) == 0:
+        return
+    try:
+        df_alerts = pd.DataFrame(_ALERTS)
+        df_alerts["run_id"] = RUN_ID
+        df_alerts["model_version"] = MODEL_VERSION
+        table_id = f"{project_id}.{dataset_id}.{series_ticker}_alerts"
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND", autodetect=True)
+        job = bq_client_ref.load_table_from_dataframe(df_alerts, table_id, job_config=job_config)
+        job.result()
+        print(f"  ✓ Uploaded {len(df_alerts)} alerts to {table_id}")
+    except Exception as e:
+        print(f"  ⚠️ Alert upload failed: {e}")
 
 # =========================
 # CONFIG
@@ -1430,6 +1500,7 @@ def get_existing_positions() -> Tuple[Dict[str, Dict[str, int]], bool]:
         return positions, True
 
     except Exception as e:
+        alert("SAFE_MODE", f"Position fetch failed: {e}")
         print(f"⚠️  Error fetching positions: {e}")
         import traceback
         traceback.print_exc()
@@ -1555,6 +1626,7 @@ def fetch_nba_schedule() -> Dict[str, int]:
         return schedule
         
     except Exception as e:
+        alert("SCHEDULE_FETCH_FAILED", f"NBA CDN unreachable: {e}")
         print(f"  [NBA] ⚠️ Could not fetch NBA schedule: {e}")
         print(f"  [NBA]   → Falling back to ticker-derived game times (~9pm ET)")
         print(f"  [NBA]   → Add cdn.nba.com to GitHub Actions network allowlist for exact times")
@@ -1654,8 +1726,12 @@ def get_game_start_ts(market_ticker: str) -> Tuple[Optional[int], str]:
     # Fallback to ticker estimate
     ts = estimate_game_start_from_ticker(market_ticker)
     if ts is not None:
+        alert("GAME_TIME_FALLBACK", f"NBA API miss, using ticker estimate",
+              {"ticker": market_ticker})
         return ts, "ticker_estimate"
     
+    alert("GAME_TIME_MISSING", f"No game time found at all",
+          {"ticker": market_ticker})
     return None, "none"
 
 
@@ -1946,8 +2022,8 @@ def build_order_objects_for_market(
                 orderbook_yes_bid, _ = parse_orderbook(yes_data)
             if no_data and len(no_data) > 0:
                 orderbook_no_bid, _ = parse_orderbook(no_data)
-        except:
-            pass
+        except Exception as e:
+            alert("ORDERBOOK_ERROR", f"Two-pass orderbook fetch failed: {e}", {"ticker": ticker})
 
         market_mid_yes = None
         if orderbook_yes_bid is not None and orderbook_no_bid is not None:
@@ -2135,8 +2211,11 @@ def build_order_objects_for_market(
             orderbook_no_bid, no_bid_size = parse_orderbook(no_data)
 
         print(f"    Orderbook: Yes={orderbook_yes_bid if orderbook_yes_bid else 'N/A'}c, No={orderbook_no_bid if orderbook_no_bid else 'N/A'}c")
+        if orderbook_yes_bid is None and orderbook_no_bid is None:
+            alert("ORDERBOOK_EMPTY", f"No bids on either side", {"ticker": ticker})
 
     except Exception as e:
+        alert("ORDERBOOK_ERROR", f"Orderbook fetch failed: {e}", {"ticker": ticker})
         print(f"    Orderbook: Yes=N/A, No=N/A")
 
     # Mid-price anchor
@@ -2621,6 +2700,13 @@ def submit_orders_sequential(orders: List[Dict[str, Any]]) -> List[Dict[str, Any
                     pass
             elif hasattr(e, 'args') and len(e.args) > 1:
                 error_detail = f"{str(e)} | args: {e.args}"
+            # Alert on order failures
+            if '400' in str(e):
+                alert("ORDER_400", f"{order_params.get('ticker')} {order_params.get('side')}@{order_params.get('yes_price') or order_params.get('no_price')}c",
+                      {"error": error_detail[:200]})
+            elif '429' in str(e):
+                alert("ORDER_429", f"Rate limited on {order_params.get('ticker')}",
+                      {"error": error_detail[:200]})
             results.append({
                 "ok": False,
                 "ticker": order_params["ticker"],
@@ -2971,3 +3057,22 @@ if position_ledger:
 df_to_bq(df_bankroll_log, f"{SERIES_TICKER}_bankroll_log", write_disposition="WRITE_APPEND")
 
 print("\n✓ All tables uploaded successfully!")
+
+# =====================================================================
+# END-OF-RUN ALERT SUMMARY
+# =====================================================================
+if _ALERTS:
+    print(f"\n{'='*70}")
+    print(f"⚡ ALERT SUMMARY: {len(_ALERTS)} alerts")
+    print(f"{'='*70}")
+    _cats = {}
+    for _a in _ALERTS:
+        _c = _a['category']
+        _cats[_c] = _cats.get(_c, 0) + 1
+    for _cat, _count in sorted(_cats.items(), key=lambda x: -x[1]):
+        print(f"  {_cat}: {_count}")
+    upload_alerts_to_bq(client, PROJECT_ID, DATASET_ID, SERIES_TICKER)
+    send_alert_notification()
+    print(f"{'='*70}\n")
+else:
+    print("\n✓ No alerts — clean run")
