@@ -1439,6 +1439,13 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     yes_side_mult_base = side_config.get("yes", 1.0)
     no_side_mult_base = side_config.get("no", 1.0)
 
+    # Log side multipliers
+    mult_flags = []
+    if yes_side_mult_base > 0: mult_flags.append(f"{yes_side_mult_base:.1f}x YES")
+    if no_side_mult_base > 0: mult_flags.append(f"{no_side_mult_base:.1f}x NO")
+    if mult_flags:
+        print(f"    📉 {' | '.join(mult_flags)} for {ticker_part_3_market_code}")
+
     # TEAM-SPECIFIC OVERRIDES
     team_yes, team_no, override_applied, override_reason = apply_team_overrides(
         market_code=ticker_part_3_market_code,
@@ -1508,6 +1515,12 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         yes_position_mult = calculate_position_multiplier(net_position, 'yes')
         no_position_mult = calculate_position_multiplier(net_position, 'no')
 
+    # Log ledger sizing
+    if ledger:
+        print(f"    Ledger sizing: YES={yes_position_mult:.2f}x ({yes_pos_reason}) NO={no_position_mult:.2f}x ({no_pos_reason})")
+    else:
+        print(f"    Ledger sizing: YES={yes_position_mult:.2f}x (no_ledger_data) NO={no_position_mult:.2f}x (no_ledger_data)")
+
     if yes_side_mult_floor > 0 and yes_side_mult < yes_side_mult_floor:
         yes_side_mult = yes_side_mult_floor
     if no_side_mult_floor > 0 and no_side_mult < no_side_mult_floor:
@@ -1539,7 +1552,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     yes_total_mult = base_mult * yes_position_mult * yes_side_mult * safe_mult
     no_total_mult = base_mult * no_position_mult * no_side_mult * safe_mult
 
-    print(f"    Time: {hours_until_event:.1f}h ({time_mult:.2f}x) | OI: {open_interest} ({volume_mult:.2f}x)")
+    print(f"    Time: {hours_until_event:.1f}h ({time_mult:.2f}x) | OI: {open_interest} ({volume_mult:.2f}x) | Base: {base_mult:.2f}x")
 
     # Orderbook
     orderbook_yes_bid, yes_bid_size, orderbook_no_bid, no_bid_size = None, None, None, None
@@ -1552,15 +1565,31 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     except Exception as e:
         alert("ORDERBOOK_ERROR", f"Orderbook fetch failed: {e}", {"ticker": ticker})
 
+    # Log orderbook
+    ob_yes_str = f"{orderbook_yes_bid}¢" if orderbook_yes_bid is not None else "N/A"
+    ob_no_str = f"{orderbook_no_bid}¢" if orderbook_no_bid is not None else "N/A"
+    print(f"    Orderbook: Yes={ob_yes_str}, No={ob_no_str}")
+
     market_mid_yes = None
     if orderbook_yes_bid is not None and orderbook_no_bid is not None:
         market_mid_yes = (orderbook_yes_bid + (100 - orderbook_no_bid)) / 2.0
+        print(f"    Mid-price: ({orderbook_yes_bid} + {100 - orderbook_no_bid}) / 2 = {market_mid_yes:.1f}¢")
     elif orderbook_yes_bid is not None: market_mid_yes = float(orderbook_yes_bid)
     elif orderbook_no_bid is not None: market_mid_yes = 100.0 - orderbook_no_bid
 
     yes_fair, no_fair, bayesian_inter = calculate_bid_price(
         market_mid_yes, market_yes_rate, team_1_yes_rate, team_1_sample_size,
         team_2_yes_rate, team_2_sample_size, market_sample_size, PRICING_STRATEGY)
+
+    # Log pricing strategy
+    myr_str = f"{market_yes_rate*100:.1f}%" if market_yes_rate is not None and not pd.isna(market_yes_rate) else "N/A"
+    ms_str = f"n={market_sample_size}" if market_sample_size else ""
+    t1_str = f"{team_1}={team_1_yes_rate*100:.1f}%(n={team_1_sample_size:.0f})" if team_1_yes_rate is not None and not pd.isna(team_1_yes_rate) and team_1_sample_size > 0 else ""
+    t2_str = f"{team_2}={team_2_yes_rate*100:.1f}%(n={team_2_sample_size:.0f})" if team_2_yes_rate is not None and not pd.isna(team_2_yes_rate) and team_2_sample_size > 0 else ""
+    teams_str = ", ".join(filter(None, [t1_str, t2_str]))
+    print(f"    Strategy [{PRICING_STRATEGY}]: Market={myr_str} ({ms_str}) Teams: {teams_str or 'none'}")
+    if yes_fair is not None and no_fair is not None:
+        print(f"    → Fair value YES={yes_fair}¢, NO={no_fair}¢ (sum={yes_fair+no_fair}¢)")
 
     if yes_fair is None and market_yes_rate is not None and not pd.isna(market_yes_rate):
         yes_fair = cents_from_rate(market_yes_rate)
@@ -1576,7 +1605,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             print(f"    ⚠️ No data at all — using 50/50 prior. Kelly gate will filter.")
     p_hat = yes_fair / 100.0
 
-    print(f"    Fair: YES={yes_fair}¢ NO={no_fair}¢ | Mults: YES={yes_total_mult:.2f}x NO={no_total_mult:.2f}x")
+    print(f"    Mults: YES={yes_total_mult:.2f}x NO={no_total_mult:.2f}x")
 
     # Price floors
     if pairing_mode_str == "aggressive_pairing":
@@ -1591,6 +1620,8 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     # Spread + offsets
     spread_cents = calculate_spread(orderbook_yes_bid or yes_fair, orderbook_no_bid or no_fair)
     yes_offsets, no_offsets, spread_config_name = get_offsets_for_spread(spread_cents)
+    ob_sum = (orderbook_yes_bid or yes_fair) + (orderbook_no_bid or no_fair)
+    print(f"    Spread: {spread_cents}¢ (yes={orderbook_yes_bid or yes_fair} + no={orderbook_no_bid or no_fair} = {ob_sum})")
     if ticker_part_3_market_code in TIER1_MARKETS:
         if TIER1_SPREAD_OVERRIDE in SPREAD_CONFIGS:
             no_offsets = SPREAD_CONFIGS[TIER1_SPREAD_OVERRIDE]
@@ -1709,9 +1740,20 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
                 "safe_mode": safe_mode, "event_ticker": event_ticker,
             })
 
-    if yes_placed > 0: print(f"    → YES: {yes_placed} contracts")
-    if no_placed > 0: print(f"    → NO:  {no_placed} contracts")
-    if yes_placed == 0 and no_placed == 0: print(f"    → No orders passed filters")
+    # Per-order detail summary
+    yes_orders = [o for o in orders if o['side'] == 'yes']
+    no_orders = [o for o in orders if o['side'] == 'no']
+    if yes_orders:
+        details = [f"{o['yes_price']}¢({o['count']}c,ev={o.get('ev',0)*100:.0f}%)" for o in yes_orders[:6]]
+        more = f", ... +{len(yes_orders)-6} more" if len(yes_orders) > 6 else ""
+        print(f"    Spread config: [{spread_config_name}]")
+        print(f"    → YES: [{', '.join(details)}{more}] (mult: {yes_total_mult:.2f}x, placed: {yes_placed})")
+    if no_orders:
+        details = [f"{o['no_price']}¢({o['count']}c,ev={o.get('ev',0)*100:.0f}%)" for o in no_orders[:6]]
+        more = f", ... +{len(no_orders)-6} more" if len(no_orders) > 6 else ""
+        print(f"    → NO:  [{', '.join(details)}{more}] (mult: {no_total_mult:.2f}x, placed: {no_placed})")
+    if not yes_orders and not no_orders:
+        print(f"    → No orders passed filters")
 
     evt = event_ticker or ""
     event_orders_placed[evt] = event_orders_placed.get(evt, 0) + yes_placed + no_placed
