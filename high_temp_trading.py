@@ -801,6 +801,7 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
 
 ########## BUY CALCULATIONS
 orders_placed = 0
+_diag_printed = False
 for index, row in combined_table.iterrows():
   ticker = row['market_ticker']
   is_tail = "-T" in ticker and row['high_range'] == 150
@@ -811,6 +812,16 @@ for index, row in combined_table.iterrows():
 
   # Diagnostic: show every market's state
   print(f"\n  {ticker}: P(yes)={yes_prob:.2f} hi_no={hi_no} no_bid={no_bid} no_offer={no_offer} tail={is_tail}")
+
+  # Filter 0: check if market is still open for trading
+  try:
+    _mkt_resp = exchange_client.get_market(ticker=ticker)
+    _mkt_status = _mkt_resp.get('market', {}).get('status', '')
+    if _mkt_status not in ('open', 'active', ''):
+      print(f"    SKIP: market status '{_mkt_status}' (closed/settled)")
+      continue
+  except:
+    pass  # If check fails, try to place orders anyway
 
   # Filter 1: probability cutoff
   if not (yes_prob > market_cutoff_probability or is_tail):
@@ -907,15 +918,35 @@ for index, row in combined_table.iterrows():
       orders_placed += 1
       level_orders += 1
     except Exception as e:
-      # Capture full error body from Kalshi API response
+      # Capture full error body — try multiple approaches for different exception types
       resp_body = ""
+      # Approach 1: requests-style .response attribute
       if hasattr(e, 'response') and e.response is not None:
           try: resp_body = e.response.text[:300]
           except: pass
+      # Approach 2: Kalshi client may store body in .args
+      if not resp_body and hasattr(e, 'args') and len(e.args) > 1:
+          resp_body = str(e.args[1])[:300] if e.args[1] else ""
+      # Approach 3: some clients store as .body or .detail
+      if not resp_body:
+          for attr in ('body', 'detail', 'message', 'reason'):
+              val = getattr(e, attr, None)
+              if val:
+                  resp_body = str(val)[:300]
+                  break
+      # Approach 4: repr() often shows more than str()
+      if not resp_body and repr(e) != str(e):
+          resp_body = repr(e)[:300]
       _err_str = f"{e} | {resp_body}" if resp_body else str(e)
+      # Log exception type + all attributes on FIRST 400 error only (diagnostic)
+      if '400' in str(e) and not _diag_printed:
+          _diag_printed = True
+          print(f"    [DIAG] Exception type: {type(e).__name__}, attrs: {[a for a in dir(e) if not a.startswith('_')]}")
+          print(f"    [DIAG] args: {e.args}")
+          print(f"    [DIAG] repr: {repr(e)[:500]}")
       if '400' in str(e):
-          alert("ORDER_400", f"{row['market_ticker']} no@{int(bid_price)}c",
-                {"error": _err_str[:300]})
+          # Expected for closed/settled markets — log but don't alert (no text)
+          print(f"    ⚠️ ORDER_400: {row['market_ticker']} no@{int(bid_price)}c ({_err_str[:150]})")
       elif '429' in str(e):
           alert("ORDER_429", f"Rate limited on {row['market_ticker']}",
                 {"error": _err_str[:300]})
