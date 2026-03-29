@@ -26,6 +26,7 @@ jobs:
         ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
         ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
         ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        GOOGLE_APPLICATION_CREDENTIALS: google_credentials.json
       run: python high_temp_trading.py
     - name: Cleanup secrets
       if: always()
