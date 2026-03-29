@@ -45,6 +45,9 @@ jobs:
         GOOGLE_APPLICATION_CREDENTIALS: gcp_sa_key.json
         GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
+        ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+        ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
+        ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
       run: python mlb_trading.py
     - name: Cleanup secrets
       if: always()
