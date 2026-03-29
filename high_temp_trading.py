@@ -62,6 +62,74 @@ import pandas as pd
 from datetime import datetime
 import pytz
 from google.cloud import bigquery
+import smtplib
+from email.mime.text import MIMEText
+
+# =========================
+# ALERTING
+# =========================
+_ALERTS = []
+ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")
+ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
+ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "")
+
+
+def alert(category: str, message: str, context: dict = None):
+    entry = {
+        "timestamp": datetime.now(pytz.timezone('US/Central')).strftime('%Y-%m-%d %H:%M:%S'),
+        "category": category,
+        "message": message,
+        **(context or {}),
+    }
+    _ALERTS.append(entry)
+    ctx_str = f" | {context}" if context else ""
+    print(f"  ⚡ ALERT [{category}]: {message}{ctx_str}")
+
+
+def send_alert_notification():
+    if not ALERT_EMAIL_FROM or not ALERT_EMAIL_PASSWORD or not ALERT_EMAIL_TO:
+        return
+    if len(_ALERTS) == 0:
+        return
+    cats = {}
+    for a in _ALERTS:
+        c = a["category"]
+        cats[c] = cats.get(c, 0) + 1
+    lines = [f"KXHIGH Alerts: {len(_ALERTS)} total"]
+    for cat, count in sorted(cats.items(), key=lambda x: -x[1]):
+        lines.append(f"  {cat}: {count}")
+    lines.append("")
+    for a in _ALERTS[:8]:
+        lines.append(f"[{a['category']}] {a['message']}")
+    if len(_ALERTS) > 8:
+        lines.append(f"... +{len(_ALERTS) - 8} more")
+    body = "\n".join(lines)
+    recipients = [r.strip() for r in ALERT_EMAIL_TO.split(",") if r.strip()]
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = f"HIGH TEMP Bot: {len(_ALERTS)} alerts"
+        msg["From"] = ALERT_EMAIL_FROM
+        msg["To"] = ", ".join(recipients)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
+            server.sendmail(ALERT_EMAIL_FROM, recipients, msg.as_string())
+        print(f"  ✓ Alert notification sent to {len(recipients)} recipient(s)")
+    except Exception as e:
+        print(f"  ⚠️ Alert notification failed: {e}")
+
+
+def upload_alerts_to_bq():
+    if bq_client is None or len(_ALERTS) == 0:
+        return
+    try:
+        df_alerts = pd.DataFrame(_ALERTS)
+        table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}alerts"
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND", autodetect=True)
+        job = bq_client.load_table_from_dataframe(df_alerts, table_id, job_config=job_config)
+        job.result()
+        print(f"  ✓ Uploaded {len(df_alerts)} alerts to {table_id}")
+    except Exception as e:
+        print(f"  ⚠️ Alert upload failed: {e}")
 
 BQ_PROJECT = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
 BQ_DATASET = os.environ.get("GCP_DATASET_ID", "Kalshi")
@@ -77,6 +145,7 @@ try:
     bq_client = bigquery.Client(project=BQ_PROJECT)
     print(f"BigQuery connected: {BQ_PROJECT}.{BQ_DATASET}")
 except Exception as e:
+    alert("BIGQUERY_INIT_FAILED", f"BQ init failed (non-fatal): {e}")
     print(f"BigQuery init failed (non-fatal): {e}")
     bq_client = None
 
@@ -157,6 +226,8 @@ def get_accuweather_forecast(coords):
         return int(high_temp)
 
     except Exception as e:
+        alert("FORECAST_FAILED", f"AccuWeather failed for {coords}: {e}",
+              {"source": "accuweather"})
         print(f"Error fetching AccuWeather forecast for {coords}: {e}")
         return "N/A"
 
@@ -183,6 +254,8 @@ def get_nws_forecast(lat, lon):
 
         return "N/A"
     except Exception as e:
+        alert("FORECAST_FAILED", f"NWS failed for {lat},{lon}: {e}",
+              {"source": "nws"})
         print(f"Error fetching NWS forecast for {lat}, {lon}: {e}")
         return "N/A"
 
@@ -206,9 +279,13 @@ def get_weatherunderground_forecast(city, coords):
             today_high = data["temperatureMax"][variable]
             return today_high
         else:
+            alert("FORECAST_FAILED", f"WU missing temperatureMax for {city}",
+                  {"source": "weather_underground"})
             print(f"Error: 'temperatureMax' field not found in API response for {city}.")
             return "N/A"  # Return "N/A" if temperature data is not found
     else:
+        alert("FORECAST_FAILED", f"WU HTTP {response.status_code} for {city}",
+              {"source": "weather_underground", "status_code": response.status_code})
         print(f"Failed to fetch data for {city}. Status code: {response.status_code}, Message: {response.text}")
         return "N/A"  # Return "N/A" if request fails
 
@@ -347,6 +424,8 @@ def fetch_midnight_forecast(coords):
                   break
         return midnight_temp
     else:
+        alert("FORECAST_MIDNIGHT_FAILED", f"NWS grid fetch failed: HTTP {response.status_code}",
+              {"url": url})
         print(f"Failed to fetch grid data. Status code: {response.status_code}, URL: {url}")
     return None
 
@@ -527,7 +606,12 @@ for index, row in combined_table.iterrows():
   market_history_params = {'ticker':market_ticker,
                             'depth': 3
                                 }
-  orderbook_response = exchange_client.get_orderbook(**market_history_params)
+  try:
+    orderbook_response = exchange_client.get_orderbook(**market_history_params)
+  except Exception as e:
+    alert("ORDERBOOK_ERROR", f"Fetch failed for {market_ticker}: {e}",
+          {"ticker": market_ticker})
+    continue
 
   # Parse orderbook — handle both old format (orderbook.no/yes in cents)
   # and new format (orderbook_fp.no_dollars/yes_dollars in dollar strings)
@@ -718,13 +802,6 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
 
 ########## BUY CALCULATIONS
 orders_placed = 0
-total_markets_scanned = 0
-markets_traded = 0
-markets_skipped_prob = 0
-markets_skipped_tail = 0
-markets_skipped_ob = 0
-markets_skipped_price = 0
-
 for index, row in combined_table.iterrows():
   ticker = row['market_ticker']
   is_tail = "-T" in ticker and row['high_range'] == 150
@@ -732,132 +809,51 @@ for index, row in combined_table.iterrows():
   no_offer = row['no_lowest_offer']
   no_bid = row['no_highest_bid']
   hi_no = row['hi_no_price']
-  city = row['City']
-  avg_temp = row['Average'] if row['Average'] != '' else 'N/A'
-  std_dev = row['Standard Deviation'] if row['Standard Deviation'] != '' else 'N/A'
-  floor_std = row.get('City Floor Std', 'N/A')
-  position = row.get('position', 0)
-  total_markets_scanned += 1
 
-  # --- Market type label ---
-  if is_tail:
-    bucket_label = f"above {row['low_range']:.0f}\u00b0F"
-  elif "-T" in ticker:
-    bucket_label = f"below {row['high_range']:.0f}\u00b0F (low tail)"
-  else:
-    bucket_label = f"{row['low_range']:.0f}\u2013{row['high_range']:.0f}\u00b0F"
+  # Diagnostic: show every market's state
+  print(f"\n  {ticker}: P(yes)={yes_prob:.2f} hi_no={hi_no} no_bid={no_bid} no_offer={no_offer} tail={is_tail}")
 
-  # --- Forecast sources ---
-  wu = row.get('Weather Underground', 'N/A')
-  aw = row.get('Accuweather', 'N/A')
-  nws = row.get('NWS', 'N/A')
-
-  # --- Orderbook context ---
-  spread_str = ''
-  if no_offer != '' and no_bid != '':
-    try:
-      spread = int(float(no_offer)) - int(float(no_bid))
-      spread_str = f" | spread={spread}c"
-    except Exception:
-      pass
-
-  # --- Header ---
-  mode_tag = 'TAIL' if is_tail else 'BETWEEN'
-  incr_tag = '6c' if is_tail else '3c'
-  print(f"\n{'='*70}")
-  print(f"  {ticker} ({city} | {bucket_label})")
-
-  # --- Forecast line ---
-  print(f"    Forecast: NWS={nws} WU={wu} AW={aw} -> Avg={avg_temp}F +/-{std_dev}F (floor={floor_std})")
-
-  # --- Probability + fair value ---
-  fair_no = row.get('fair_no_price', '')
-  try:
-    fair_no_str = f"{float(fair_no)*100:.0f}c"
-  except Exception:
-    fair_no_str = 'N/A'
-  print(f"    P(yes)={yes_prob:.2f} | P(no)={1-yes_prob:.2f} | Fair NO={fair_no_str}")
-
-  # --- Orderbook ---
-  try:
-    ob_no_bid = f"{int(float(no_bid))}c" if no_bid != '' else 'empty'
-  except Exception:
-    ob_no_bid = 'empty'
-  try:
-    ob_no_offer = f"{int(float(no_offer))}c" if no_offer != '' else 'empty'
-  except Exception:
-    ob_no_offer = 'empty'
-  print(f"    Orderbook: NO bid={ob_no_bid} | NO offer={ob_no_offer}{spread_str}")
-
-  # --- Strategy params ---
-  print(f"    Hi NO price={hi_no} | Position={position} | {mode_tag} mode (incr={incr_tag})")
-
-  # --- Filter 1: probability cutoff ---
+  # Filter 1: probability cutoff
   if not (yes_prob > market_cutoff_probability or is_tail):
     print(f"    SKIP: P(yes)={yes_prob:.2f} <= {market_cutoff_probability} cutoff")
-    markets_skipped_prob += 1
     continue
 
-  # --- Filter 2: skip low-end tails ---
+  # Filter 2: skip low-end tails
   if "-T" in ticker and not is_tail:
     print(f"    SKIP: low-end tail (not traded)")
-    markets_skipped_tail += 1
     continue
 
-  # --- Filter 3: need orderbook data ---
+  # Filter 3: need orderbook data
   if no_offer == '' or no_bid == '':
-    print(f"    SKIP: no orderbook data (need both NO bid and YES bid)")
-    markets_skipped_ob += 1
+    print(f"    SKIP: no orderbook data")
     continue
 
-  # --- Build all order levels before placing ---
-  order_levels = []
+  i1 = 0
+  level_orders = 0
   for i in price_count:
     if "-T" not in ticker:
       bid_price = max(hi_no - i * increment, 1)
     if is_tail:
       bid_price = max(hi_no - i * increment1, 1)
 
-    try:
-      passes_offer = bid_price < int(float(no_offer))
-      passes_bid = bid_price < int(float(no_bid)) - 3
-    except Exception:
-      passes_offer = False
-      passes_bid = False
-    passes_cap = max_contracts >= row['position'] + row['resting_order_count'] + starting_contracts + i * 10
+    # Show first level diagnostics
+    if i == 0:
+      print(f"    Level 0: bid={bid_price:.0f} vs no_offer={int(no_offer)} no_bid={int(no_bid)} (need bid<offer AND bid<bid-3)")
 
-    if passes_offer and passes_bid and passes_cap:
-      contracts = starting_contracts
-      ev = (1.0 - yes_prob) - (bid_price / 100.0)
-      order_levels.append((bid_price, contracts, ev))
+    if not (bid_price < int(no_offer)):
+      if i == 0: print(f"    SKIP level 0: bid {bid_price:.0f} >= no_offer {int(no_offer)}")
+      continue
+    if not (bid_price < int(no_bid) - 3):
+      if i == 0: print(f"    SKIP level 0: bid {bid_price:.0f} >= no_bid-3 ({int(no_bid)-3})")
+      continue
+    if not (max_contracts >= row['position'] + row['resting_order_count'] + starting_contracts + i * 10):
+      if i == 0: print(f"    SKIP level 0: position cap")
+      continue
 
-  if len(order_levels) == 0:
-    first_bid = hi_no
-    try:
-      no_offer_int = int(float(no_offer))
-      no_bid_int = int(float(no_bid))
-      if not (first_bid < no_offer_int):
-        print(f"    SKIP: best bid {first_bid:.0f}c >= NO offer {no_offer_int}c (would cross spread)")
-      elif not (first_bid < no_bid_int - 3):
-        print(f"    SKIP: best bid {first_bid:.0f}c >= NO bid-3 ({no_bid_int-3}c) (too close to book)")
-      else:
-        print(f"    SKIP: position cap reached")
-    except Exception:
-      print(f"    SKIP: no valid price levels")
-    markets_skipped_price += 1
-    continue
+    contracts = starting_contracts
+    i1 = i1 + 1
 
-  # --- Print order plan ---
-  level_strs = [f"{int(bp)}c({c}c,ev={ev:.0%})" for bp, c, ev in order_levels]
-  if len(level_strs) > 6:
-    display_str = ', '.join(level_strs[:5]) + f", ... +{len(level_strs)-5} more"
-  else:
-    display_str = ', '.join(level_strs)
-  print(f"    -> NO: [{display_str}]")
-
-  # --- Place orders ---
-  level_orders = 0
-  for bid_price, contracts, ev in order_levels:
+    # Detect city abbreviation and cancel time — check longer abbreviations first
     abv = ''
     cancel_hour = 10
     cancel_minute = 5
@@ -900,7 +896,7 @@ for index, row in combined_table.iterrows():
                       'expiration_ts':exp_ts}
     try:
       exchange_client.create_order(**order_params)
-      time.sleep(0.1)
+      time.sleep(0.1)  # Rate limit protection
       all_order_records.append({
           'city': row['City'], 'forecast_date': row['Forecast Date'], 'run_date': row['Run Date'],
           'market_ticker': row['market_ticker'], 'contracts': contracts, 'no_price': int(bid_price),
@@ -913,31 +909,23 @@ for index, row in combined_table.iterrows():
     except Exception as e:
       _err_str = str(e)
       if '400' in _err_str:
-          print(f"    ALERT: ORDER_400 {row['market_ticker']} no@{int(bid_price)}c: {_err_str[:200]}")
+          alert("ORDER_400", f"{row['market_ticker']} no@{int(bid_price)}c",
+                {"error": _err_str[:200]})
       elif '429' in _err_str:
-          print(f"    ALERT: ORDER_429 rate limited on {row['market_ticker']}: {_err_str[:200]}")
+          alert("ORDER_429", f"Rate limited on {row['market_ticker']}",
+                {"error": _err_str[:200]})
       else:
-          print(f"    ALERT: ORDER_FAILED {row['market_ticker']} @{int(bid_price)}c: {_err_str[:100]}")
-      print(f"    x Order failed {row['market_ticker']} @{int(bid_price)}c: {e}")
-      time.sleep(0.2)
+          alert("ORDER_FAILED", f"{row['market_ticker']} @{int(bid_price)}c: {_err_str[:100]}")
+      print(f"    ✗ Order failed {row['market_ticker']} @{int(bid_price)}¢: {e}")
+      time.sleep(0.2)  # Extra pause after error
     if bid_price <= 1:
-      break
+      break  # Don't place more orders at the 1¢ floor
   if level_orders > 0:
-    markets_traded += 1
-    print(f"    Placed {level_orders} orders ({level_orders * starting_contracts} contracts)")
+    print(f"    ✓ Placed {level_orders} orders")
 
-print(f"\n{'='*70}")
-print(f"RUN SUMMARY")
-print(f"{'='*70}")
-print(f"  Markets scanned:        {total_markets_scanned}")
-print(f"  Markets traded:         {markets_traded}")
-print(f"  Orders placed:          {orders_placed}")
-print(f"  Skipped (low prob):     {markets_skipped_prob}")
-print(f"  Skipped (low tail):     {markets_skipped_tail}")
-print(f"  Skipped (no orderbook): {markets_skipped_ob}")
-print(f"  Skipped (price/cap):    {markets_skipped_price}")
-print(f"{'='*70}")
-
+print(f"\n{'='*60}")
+print(f"TOTAL ORDERS PLACED: {orders_placed}")
+print(f"{'='*60}")
 
 # Write all orders to BigQuery
 if all_order_records:
@@ -948,3 +936,22 @@ if all_order_records:
     write_to_bq(df_orders, "orders", "WRITE_APPEND")
 
 print("\nTrading run complete.")
+
+# =====================================================================
+# END-OF-RUN ALERT SUMMARY
+# =====================================================================
+if _ALERTS:
+    print(f"\n{'='*60}")
+    print(f"⚡ ALERT SUMMARY: {len(_ALERTS)} alerts")
+    print(f"{'='*60}")
+    _cats = {}
+    for _a in _ALERTS:
+        _c = _a['category']
+        _cats[_c] = _cats.get(_c, 0) + 1
+    for _cat, _count in sorted(_cats.items(), key=lambda x: -x[1]):
+        print(f"  {_cat}: {_count}")
+    upload_alerts_to_bq()
+    send_alert_notification()
+    print(f"{'='*60}\n")
+else:
+    print("\n✓ No alerts — clean run")
