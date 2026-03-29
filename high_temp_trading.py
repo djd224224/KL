@@ -298,7 +298,7 @@ forecast_data = []
 
 for city, coords in cities.items():
     nws_temp = get_nws_forecast(*coords)
-    accuweather_temp = get_accuweather_forecast(coords)
+    # AccuWeather removed — API key expired (401 on all cities since March 2026)
     weatherundergroud_temp = get_weatherunderground_forecast(city, coords)
 
     forecast_data.append({
@@ -306,17 +306,16 @@ for city, coords in cities.items():
         "Forecast Date": (datetime.now(pytz.timezone('US/Central')) + timedelta(days=variable)).strftime('%Y-%m-%d'),
         "Run Date": run_date,
         "Weather Underground": weatherundergroud_temp,
-        "Accuweather": accuweather_temp,
         "NWS": nws_temp
     })
 
 forecast_table = pd.DataFrame(forecast_data)
 
-# Calculate standard deviation and range for each city
-forecast_table[[ "Weather Underground","Accuweather", "NWS"]] = forecast_table[["Weather Underground","Accuweather", "NWS"]].apply(pd.to_numeric, errors='coerce')
-forecast_table["Average"] = forecast_table[["Weather Underground", "Accuweather", "NWS"]].mean(axis=1)
-forecast_table["Standard Deviation"] = forecast_table[["Weather Underground","Accuweather", "NWS"]].std(axis=1)
-forecast_table["Highest Minus Lowest"] = forecast_table[["Weather Underground", "Accuweather", "NWS"]].max(axis=1) - forecast_table[["Weather Underground","Accuweather", "NWS"]].min(axis=1)
+# Calculate standard deviation and range for each city (2 sources: NWS + Weather Underground)
+forecast_table[["Weather Underground", "NWS"]] = forecast_table[["Weather Underground", "NWS"]].apply(pd.to_numeric, errors='coerce')
+forecast_table["Average"] = forecast_table[["Weather Underground", "NWS"]].mean(axis=1)
+forecast_table["Standard Deviation"] = forecast_table[["Weather Underground", "NWS"]].std(axis=1)
+forecast_table["Highest Minus Lowest"] = forecast_table[["Weather Underground", "NWS"]].max(axis=1) - forecast_table[["Weather Underground", "NWS"]].min(axis=1)
 
 # Display the DataFrame
 forecast_table
@@ -893,7 +892,8 @@ for index, row in combined_table.iterrows():
                       'side':'no',
                       'count':contracts,
                       'no_price':int(bid_price),
-                      'expiration_ts':exp_ts}
+                      'expiration_ts':exp_ts,
+                      'post_only': True}
     try:
       exchange_client.create_order(**order_params)
       time.sleep(0.1)  # Rate limit protection
@@ -907,16 +907,21 @@ for index, row in combined_table.iterrows():
       orders_placed += 1
       level_orders += 1
     except Exception as e:
-      _err_str = str(e)
-      if '400' in _err_str:
+      # Capture full error body from Kalshi API response
+      resp_body = ""
+      if hasattr(e, 'response') and e.response is not None:
+          try: resp_body = e.response.text[:300]
+          except: pass
+      _err_str = f"{e} | {resp_body}" if resp_body else str(e)
+      if '400' in str(e):
           alert("ORDER_400", f"{row['market_ticker']} no@{int(bid_price)}c",
-                {"error": _err_str[:200]})
-      elif '429' in _err_str:
+                {"error": _err_str[:300]})
+      elif '429' in str(e):
           alert("ORDER_429", f"Rate limited on {row['market_ticker']}",
-                {"error": _err_str[:200]})
+                {"error": _err_str[:300]})
       else:
-          alert("ORDER_FAILED", f"{row['market_ticker']} @{int(bid_price)}c: {_err_str[:100]}")
-      print(f"    ✗ Order failed {row['market_ticker']} @{int(bid_price)}¢: {e}")
+          alert("ORDER_FAILED", f"{row['market_ticker']} @{int(bid_price)}c: {_err_str[:200]}")
+      print(f"    ✗ Order failed {row['market_ticker']} @{int(bid_price)}¢: {_err_str}")
       time.sleep(0.2)  # Extra pause after error
     if bid_price <= 1:
       break  # Don't place more orders at the 1¢ floor
