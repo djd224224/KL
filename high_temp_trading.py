@@ -680,10 +680,10 @@ combined_table
 ##### PLACE ORDERS
 
 ######### BETTING INPUTS
-increment = 3
-increment1 = 6
+increment = 2
+increment1 = 5
 price_count = list(range(0, 8))
-starting_contracts = 1
+starting_contracts = 4
 
 max_contracts = 500
 max_contracts1 = 500
