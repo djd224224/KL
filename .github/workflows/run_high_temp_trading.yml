@@ -18,9 +18,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install pandas requests cryptography google-cloud-bigquery db-dtypes pyarrow scipy pytz
     - name: Write secrets to disk
+      env:
+        GCP_SA_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
       run: |
         echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > Lisa_Kalshi.txt
-        echo "${{ secrets.GOOGLE_CREDENTIALS }}" > google_credentials.json
+        printenv GCP_SA_KEY > google_credentials.json
     - name: Run Kalshi script
       env:
         ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
