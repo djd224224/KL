@@ -62,6 +62,74 @@ import pandas as pd
 from datetime import datetime
 import pytz
 from google.cloud import bigquery
+import smtplib
+from email.mime.text import MIMEText
+
+# =========================
+# ALERTING
+# =========================
+_ALERTS = []
+ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")
+ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
+ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "")
+
+
+def alert(category: str, message: str, context: dict = None):
+    entry = {
+        "timestamp": datetime.now(pytz.timezone('US/Central')).strftime('%Y-%m-%d %H:%M:%S'),
+        "category": category,
+        "message": message,
+        **(context or {}),
+    }
+    _ALERTS.append(entry)
+    ctx_str = f" | {context}" if context else ""
+    print(f"  ⚡ ALERT [{category}]: {message}{ctx_str}")
+
+
+def send_alert_notification():
+    if not ALERT_EMAIL_FROM or not ALERT_EMAIL_PASSWORD or not ALERT_EMAIL_TO:
+        return
+    if len(_ALERTS) == 0:
+        return
+    cats = {}
+    for a in _ALERTS:
+        c = a["category"]
+        cats[c] = cats.get(c, 0) + 1
+    lines = [f"KXHIGH Alerts: {len(_ALERTS)} total"]
+    for cat, count in sorted(cats.items(), key=lambda x: -x[1]):
+        lines.append(f"  {cat}: {count}")
+    lines.append("")
+    for a in _ALERTS[:8]:
+        lines.append(f"[{a['category']}] {a['message']}")
+    if len(_ALERTS) > 8:
+        lines.append(f"... +{len(_ALERTS) - 8} more")
+    body = "\n".join(lines)
+    recipients = [r.strip() for r in ALERT_EMAIL_TO.split(",") if r.strip()]
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = f"HIGH TEMP Bot: {len(_ALERTS)} alerts"
+        msg["From"] = ALERT_EMAIL_FROM
+        msg["To"] = ", ".join(recipients)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
+            server.sendmail(ALERT_EMAIL_FROM, recipients, msg.as_string())
+        print(f"  ✓ Alert notification sent to {len(recipients)} recipient(s)")
+    except Exception as e:
+        print(f"  ⚠️ Alert notification failed: {e}")
+
+
+def upload_alerts_to_bq():
+    if bq_client is None or len(_ALERTS) == 0:
+        return
+    try:
+        df_alerts = pd.DataFrame(_ALERTS)
+        table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}alerts"
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND", autodetect=True)
+        job = bq_client.load_table_from_dataframe(df_alerts, table_id, job_config=job_config)
+        job.result()
+        print(f"  ✓ Uploaded {len(df_alerts)} alerts to {table_id}")
+    except Exception as e:
+        print(f"  ⚠️ Alert upload failed: {e}")
 
 BQ_PROJECT = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
 BQ_DATASET = os.environ.get("GCP_DATASET_ID", "Kalshi")
@@ -77,6 +145,7 @@ try:
     bq_client = bigquery.Client(project=BQ_PROJECT)
     print(f"BigQuery connected: {BQ_PROJECT}.{BQ_DATASET}")
 except Exception as e:
+    alert("BIGQUERY_INIT_FAILED", f"BQ init failed (non-fatal): {e}")
     print(f"BigQuery init failed (non-fatal): {e}")
     bq_client = None
 
@@ -157,6 +226,8 @@ def get_accuweather_forecast(coords):
         return int(high_temp)
 
     except Exception as e:
+        alert("FORECAST_FAILED", f"AccuWeather failed for {coords}: {e}",
+              {"source": "accuweather"})
         print(f"Error fetching AccuWeather forecast for {coords}: {e}")
         return "N/A"
 
@@ -183,6 +254,8 @@ def get_nws_forecast(lat, lon):
 
         return "N/A"
     except Exception as e:
+        alert("FORECAST_FAILED", f"NWS failed for {lat},{lon}: {e}",
+              {"source": "nws"})
         print(f"Error fetching NWS forecast for {lat}, {lon}: {e}")
         return "N/A"
 
@@ -206,9 +279,13 @@ def get_weatherunderground_forecast(city, coords):
             today_high = data["temperatureMax"][variable]
             return today_high
         else:
+            alert("FORECAST_FAILED", f"WU missing temperatureMax for {city}",
+                  {"source": "weather_underground"})
             print(f"Error: 'temperatureMax' field not found in API response for {city}.")
             return "N/A"  # Return "N/A" if temperature data is not found
     else:
+        alert("FORECAST_FAILED", f"WU HTTP {response.status_code} for {city}",
+              {"source": "weather_underground", "status_code": response.status_code})
         print(f"Failed to fetch data for {city}. Status code: {response.status_code}, Message: {response.text}")
         return "N/A"  # Return "N/A" if request fails
 
@@ -347,6 +424,8 @@ def fetch_midnight_forecast(coords):
                   break
         return midnight_temp
     else:
+        alert("FORECAST_MIDNIGHT_FAILED", f"NWS grid fetch failed: HTTP {response.status_code}",
+              {"url": url})
         print(f"Failed to fetch grid data. Status code: {response.status_code}, URL: {url}")
     return None
 
@@ -527,7 +606,12 @@ for index, row in combined_table.iterrows():
   market_history_params = {'ticker':market_ticker,
                             'depth': 3
                                 }
-  orderbook_response = exchange_client.get_orderbook(**market_history_params)
+  try:
+    orderbook_response = exchange_client.get_orderbook(**market_history_params)
+  except Exception as e:
+    alert("ORDERBOOK_ERROR", f"Fetch failed for {market_ticker}: {e}",
+          {"ticker": market_ticker})
+    continue
 
   # Parse orderbook — handle both old format (orderbook.no/yes in cents)
   # and new format (orderbook_fp.no_dollars/yes_dollars in dollar strings)
@@ -823,6 +907,15 @@ for index, row in combined_table.iterrows():
       orders_placed += 1
       level_orders += 1
     except Exception as e:
+      _err_str = str(e)
+      if '400' in _err_str:
+          alert("ORDER_400", f"{row['market_ticker']} no@{int(bid_price)}c",
+                {"error": _err_str[:200]})
+      elif '429' in _err_str:
+          alert("ORDER_429", f"Rate limited on {row['market_ticker']}",
+                {"error": _err_str[:200]})
+      else:
+          alert("ORDER_FAILED", f"{row['market_ticker']} @{int(bid_price)}c: {_err_str[:100]}")
       print(f"    ✗ Order failed {row['market_ticker']} @{int(bid_price)}¢: {e}")
       time.sleep(0.2)  # Extra pause after error
     if bid_price <= 1:
@@ -843,3 +936,22 @@ if all_order_records:
     write_to_bq(df_orders, "orders", "WRITE_APPEND")
 
 print("\nTrading run complete.")
+
+# =====================================================================
+# END-OF-RUN ALERT SUMMARY
+# =====================================================================
+if _ALERTS:
+    print(f"\n{'='*60}")
+    print(f"⚡ ALERT SUMMARY: {len(_ALERTS)} alerts")
+    print(f"{'='*60}")
+    _cats = {}
+    for _a in _ALERTS:
+        _c = _a['category']
+        _cats[_c] = _cats.get(_c, 0) + 1
+    for _cat, _count in sorted(_cats.items(), key=lambda x: -x[1]):
+        print(f"  {_cat}: {_count}")
+    upload_alerts_to_bq()
+    send_alert_notification()
+    print(f"{'='*60}\n")
+else:
+    print("\n✓ No alerts — clean run")
