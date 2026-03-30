@@ -86,22 +86,30 @@ def send_alert_notification():
 
     body = "\n".join(lines)
 
+    # Carrier SMS gateways (tmomail.net, vtext.com, etc.) silently drop long messages.
+    # Truncate body for SMS recipients to ~300 chars.
+    SMS_GATEWAYS = ("tmomail.net", "vtext.com", "txt.att.net", "messaging.sprintpcs.com", "msg.fi.google.com")
+
     # Send to each recipient (comma-separated)
     recipients = [r.strip() for r in ALERT_EMAIL_TO.split(",") if r.strip()]
 
-    try:
-        msg = MIMEText(body)
-        msg["Subject"] = f"MLB Bot: {len(_ALERTS)} alerts"
-        msg["From"] = ALERT_EMAIL_FROM
-        msg["To"] = ", ".join(recipients)
+    for recipient in recipients:
+        try:
+            is_sms = any(gw in recipient.lower() for gw in SMS_GATEWAYS)
+            send_body = body[:300] if is_sms else body
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
-            server.sendmail(ALERT_EMAIL_FROM, recipients, msg.as_string())
+            msg = MIMEText(send_body)
+            msg["Subject"] = f"MLB Bot: {len(_ALERTS)} alerts" if not is_sms else ""
+            msg["From"] = ALERT_EMAIL_FROM
+            msg["To"] = recipient
 
-        print(f"  ✓ Alert notification sent to {len(recipients)} recipient(s)")
-    except Exception as e:
-        print(f"  ⚠️ Alert notification failed: {e}")
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+                server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
+                server.sendmail(ALERT_EMAIL_FROM, [recipient], msg.as_string())
+        except Exception as e:
+            print(f"  ⚠️ Alert to {recipient} failed: {e}")
+
+    print(f"  ✓ Alert notification sent to {len(recipients)} recipient(s)")
 
 
 def upload_alerts_to_bq(bq_client, project_id: str, dataset_id: str, series_ticker: str):
@@ -2395,7 +2403,11 @@ def build_order_objects_for_market(
         disc_tag = " [DISC]" if is_discovery else ""
         print(f"    → YES: {formatted} (mult: {yes_total_mult:.2f}x, placed: {yes_contracts_placed}){hedge_tag}{disc_tag}")
     elif yes_total_mult == 0:
-        print(f"    → YES: [0x multiplier]")
+        # Show why blocked
+        if ticker_part_3_market_code in SIDE_MULTIPLIERS and SIDE_MULTIPLIERS[ticker_part_3_market_code].get('yes', 0) == 0:
+            print(f"    → YES: [0x multiplier — blocked by calibration/config]")
+        else:
+            print(f"    → YES: [0x multiplier]")
     else:
         print(f"    → YES: [no orders passed EV/price filters]")
 
@@ -2505,7 +2517,10 @@ def build_order_objects_for_market(
         disc_tag = " [DISC]" if is_discovery else ""
         print(f"    → NO:  {formatted} (mult: {no_total_mult:.2f}x, placed: {no_contracts_placed}){hedge_tag}{disc_tag}")
     elif no_total_mult == 0:
-        print(f"    → NO:  [0x multiplier]")
+        if ticker_part_3_market_code in SIDE_MULTIPLIERS and SIDE_MULTIPLIERS[ticker_part_3_market_code].get('no', 0) == 0:
+            print(f"    → NO:  [0x multiplier — blocked by calibration/config]")
+        else:
+            print(f"    → NO:  [0x multiplier]")
     else:
         print(f"    → NO:  [no orders passed EV/price filters]")
 
@@ -2917,17 +2932,20 @@ def run_calibration(bq_client, project_id: str, dataset_id: str,
 
     # Load settlement counts
     settlement_counts = {}
+    settlement_yes_rates = {}
     try:
         sc_query = f"""
         SELECT
             SPLIT(market_ticker, '-')[SAFE_OFFSET(2)] AS market_code,
-            COUNT(*) AS n
+            COUNT(*) AS n,
+            COUNTIF(result = 'yes') AS n_yes
         FROM `{project_id}.{dataset_id}.{series_ticker}_settlements`
         WHERE result IS NOT NULL AND result != ''
         GROUP BY 1
         """
         sc_df = bq_client.query(sc_query).to_dataframe()
         settlement_counts = dict(zip(sc_df['market_code'], sc_df['n']))
+        settlement_yes_rates = dict(zip(sc_df['market_code'], (sc_df['n_yes'] / sc_df['n']).round(3)))
         result['total_settlements'] = sum(settlement_counts.values())
         print(f"  Loaded settlement counts for {len(settlement_counts)} codes ({result['total_settlements']} total)")
     except Exception as e:
@@ -2948,7 +2966,8 @@ def run_calibration(bq_client, project_id: str, dataset_id: str,
     print(f"\n  TIER 1: Bayesian weights (median n={median_n})")
     for code, (mw, hw) in sorted(result['weights_per_code'].items()):
         n = settlement_counts.get(code, 0)
-        print(f"    {code:<8}: n={n:>4} → market={mw:.0%}, hist={hw:.0%}")
+        yr = settlement_yes_rates.get(code, 0)
+        print(f"    {code:<8}: n={n:>4}, yes_rate={yr:>5.0%} → market={mw:.0%}, hist={hw:.0%}")
 
     # Load fills matched to settlements
     fills_df = pd.DataFrame()
