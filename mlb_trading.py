@@ -2938,7 +2938,7 @@ def run_calibration(bq_client, project_id: str, dataset_id: str,
         SELECT
             SPLIT(market_ticker, '-')[SAFE_OFFSET(2)] AS market_code,
             COUNT(*) AS n,
-            COUNTIF(result = 'yes') AS n_yes
+            COUNTIF(LOWER(result) = 'yes') AS n_yes
         FROM `{project_id}.{dataset_id}.{series_ticker}_settlements`
         WHERE result IS NOT NULL AND result != ''
         GROUP BY 1
@@ -3001,20 +3001,28 @@ def run_calibration(bq_client, project_id: str, dataset_id: str,
     if len(fills_df) > 0:
         result['side_multipliers'] = _cal_side_multipliers(fills_df)
         result['codes_with_kelly'] = len(result['side_multipliers'])
-        print(f"\n  TIER 2: Side multipliers ({result['codes_with_kelly']} codes)")
+        print(f"\n  TIER 2: Side multipliers ({result['codes_with_kelly']} codes, min_n={_CAL_MIN_SAMPLES_FOR_KELLY})")
+        print(f"    Thresholds: block≤{_CAL_KELLY_BLOCK*100:.0f}% | neutral | enable≥{_CAL_KELLY_ENABLE*100:.0f}% | strong≥{_CAL_KELLY_STRONG*100:.0f}%")
         for code, m in sorted(result['side_multipliers'].items()):
-            yt = "BLOCK" if m['yes'] == 0 else f"{m['yes']:.1f}x"
-            nt = "BLOCK" if m['no'] == 0 else f"{m['no']:.1f}x"
-            # Show Kelly for codes with enough data
             cf = fills_df[fills_df['market_code'] == code]
-            details = []
-            for side_label, side_key in [('Y', 'yes'), ('N', 'no')]:
+            lines = []
+            for side_label, side_key in [('YES', 'yes'), ('NO ', 'no')]:
                 sf = cf[cf['side'] == side_key]
-                if len(sf) >= _CAL_MIN_SAMPLES_FOR_KELLY:
-                    k = _cal_kelly(int(sf['won'].sum()), len(sf), sf['fill_price'].mean())
-                    details.append(f"{side_label}:K={k*100:+.0f}%,n={len(sf)}")
-            detail_str = f" ({', '.join(details)})" if details else ""
-            print(f"    {code:<8}: YES={yt}, NO={nt}{detail_str}")
+                n = len(sf)
+                mult_val = m[side_key]
+                mult_str = "BLOCK" if mult_val == 0 else f"{mult_val:.1f}x"
+                if n >= _CAL_MIN_SAMPLES_FOR_KELLY:
+                    wins = int(sf['won'].sum())
+                    avg_p = sf['fill_price'].mean()
+                    k = _cal_kelly(wins, n, avg_p)
+                    wr = wins / n * 100
+                    lines.append(f"{side_label}: n={n}, W={wins}, avg={avg_p:.0f}c, WR={wr:.0f}%, K={k*100:+.0f}% → {mult_str}")
+                elif n > 0:
+                    lines.append(f"{side_label}: n={n} (< {_CAL_MIN_SAMPLES_FOR_KELLY} min) → {mult_str} (default)")
+                else:
+                    lines.append(f"{side_label}: n=0 → {mult_str} (default)")
+            print(f"    {code:<8}: {lines[0]}")
+            print(f"    {'':8}  {lines[1]}")
     else:
         print(f"\n  TIER 2: No fills — all codes at discovery default")
 
