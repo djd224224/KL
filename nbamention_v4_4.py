@@ -68,18 +68,28 @@ def send_alert_notification():
     if len(_ALERTS) > 8:
         lines.append(f"... +{len(_ALERTS) - 8} more")
     body = "\n".join(lines)
+
+    # Carrier SMS gateways silently drop long messages — truncate for SMS recipients
+    SMS_GATEWAYS = ("tmomail.net", "vtext.com", "txt.att.net", "messaging.sprintpcs.com", "msg.fi.google.com")
     recipients = [r.strip() for r in ALERT_EMAIL_TO.split(",") if r.strip()]
-    try:
-        msg = MIMEText(body)
-        msg["Subject"] = f"NBA Bot: {len(_ALERTS)} alerts"
-        msg["From"] = ALERT_EMAIL_FROM
-        msg["To"] = ", ".join(recipients)
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
-            server.sendmail(ALERT_EMAIL_FROM, recipients, msg.as_string())
-        print(f"  ✓ Alert notification sent to {len(recipients)} recipient(s)")
-    except Exception as e:
-        print(f"  ⚠️ Alert notification failed: {e}")
+
+    for recipient in recipients:
+        try:
+            is_sms = any(gw in recipient.lower() for gw in SMS_GATEWAYS)
+            send_body = body[:300] if is_sms else body
+
+            msg = MIMEText(send_body)
+            msg["Subject"] = f"NBA Bot: {len(_ALERTS)} alerts" if not is_sms else ""
+            msg["From"] = ALERT_EMAIL_FROM
+            msg["To"] = recipient
+
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+                server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
+                server.sendmail(ALERT_EMAIL_FROM, [recipient], msg.as_string())
+        except Exception as e:
+            print(f"  ⚠️ Alert to {recipient} failed: {e}")
+
+    print(f"  ✓ Alert notification sent to {len(recipients)} recipient(s)")
 
 
 def upload_alerts_to_bq(bq_client_ref, project_id, dataset_id, series_ticker):
