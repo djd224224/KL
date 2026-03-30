@@ -663,10 +663,10 @@ CORRELATION_PENALTY = 0.75
 MIN_PRICE_YES = 15
 MIN_PRICE_NO = 5
 MAX_PRICE = 65              # [v1.1] was 75 — YES 60-75c bucket lost $6 at -50pp edge
-YES_MIN_PRICE = 48
-NO_MAX_YES_PRICE = 85       # [v1.1] was 88 — NO fills at implied YES >85c are death
+YES_MIN_PRICE = 25
+NO_MAX_YES_PRICE = 80       # [v1.1] was 88 — NO fills at implied YES >85c are death
 NO_MIN_YES_PRICE = 15
-YES_PROBABILITY_FLOOR = 40
+YES_PROBABILITY_FLOOR = 30
 
 MAX_PRICE_OVERRIDES = {}
 
@@ -2196,6 +2196,7 @@ def build_order_objects_for_market(
         if pairing_mode_str != "normal" and net_side == "no":
             pass  # Bypass for hedge
         else:
+            print(f"    ⛔ YES blocked: fair={yes_fair}c < prob_floor={YES_PROBABILITY_FLOOR}c")
             yes_side_mult = 0.0
             yes_total_mult = 0.0
             yes_prob_blocked = True
@@ -2403,9 +2404,10 @@ def build_order_objects_for_market(
         disc_tag = " [DISC]" if is_discovery else ""
         print(f"    → YES: {formatted} (mult: {yes_total_mult:.2f}x, placed: {yes_contracts_placed}){hedge_tag}{disc_tag}")
     elif yes_total_mult == 0:
-        # Show why blocked
-        if ticker_part_3_market_code in SIDE_MULTIPLIERS and SIDE_MULTIPLIERS[ticker_part_3_market_code].get('yes', 0) == 0:
-            print(f"    → YES: [0x multiplier — blocked by calibration/config]")
+        if yes_prob_blocked:
+            print(f"    → YES: [0x — prob floor: fair={yes_fair}c < {YES_PROBABILITY_FLOOR}c]")
+        elif ticker_part_3_market_code in SIDE_MULTIPLIERS and SIDE_MULTIPLIERS[ticker_part_3_market_code].get('yes', 0) == 0:
+            print(f"    → YES: [0x — blocked by calibration/config]")
         else:
             print(f"    → YES: [0x multiplier]")
     else:
@@ -2838,8 +2840,17 @@ def place_orders_from_df(df_results: pd.DataFrame):
 
 # Calibration thresholds
 _CAL_MIN_HIST_WEIGHT = 0.05
-_CAL_MAX_HIST_WEIGHT = 0.40
-_CAL_FULL_CREDIBILITY_N = 100
+_CAL_MAX_HIST_WEIGHT = 0.50
+_CAL_FULL_CREDIBILITY_N = 100  # Legacy — step schedule below overrides
+# Step schedule: (min_n, historical_weight)
+# n < 10 → 5% (base), n ≥ 10 → 20%, n ≥ 20 → 30%, n ≥ 30 → 40%, n ≥ 40 → 50% (cap)
+_CAL_HIST_WEIGHT_STEPS = [
+    (40, 0.50),
+    (30, 0.40),
+    (20, 0.30),
+    (10, 0.20),
+]
+_CAL_HIST_WEIGHT_BASE = 0.05  # n < 10
 _CAL_MIN_SAMPLES_FOR_KELLY = 15
 _CAL_KELLY_ENABLE = 0.03
 _CAL_KELLY_BLOCK = -0.03
@@ -2852,10 +2863,16 @@ _CAL_PRICE_BUCKETS = [(0, 20), (20, 35), (35, 50), (50, 65), (65, 80), (80, 100)
 
 
 def _cal_bayesian_weights(settlement_counts: Dict[str, int]) -> Dict[str, tuple]:
+    """Compute per-code (market_weight, hist_weight) using step schedule.
+    n < 10 → 5% hist, n ≥ 10 → 20%, n ≥ 20 → 30%, n ≥ 30 → 40%, n ≥ 40 → 50% cap.
+    """
     weights = {}
     for code, n in settlement_counts.items():
-        cred = min(n / _CAL_FULL_CREDIBILITY_N, 1.0)
-        hw = _CAL_MIN_HIST_WEIGHT + cred * (_CAL_MAX_HIST_WEIGHT - _CAL_MIN_HIST_WEIGHT)
+        hw = _CAL_HIST_WEIGHT_BASE
+        for min_n, weight in _CAL_HIST_WEIGHT_STEPS:
+            if n >= min_n:
+                hw = weight
+                break
         weights[code] = (round(1.0 - hw, 4), round(hw, 4))
     return weights
 
@@ -2959,9 +2976,14 @@ def run_calibration(bq_client, project_id: str, dataset_id: str,
     # Tier 1: Bayesian weights
     result['weights_per_code'] = _cal_bayesian_weights(settlement_counts)
     median_n = int(np.median(list(settlement_counts.values())))
-    cred = min(median_n / _CAL_FULL_CREDIBILITY_N, 1.0)
-    result['historical_weight'] = round(_CAL_MIN_HIST_WEIGHT + cred * (_CAL_MAX_HIST_WEIGHT - _CAL_MIN_HIST_WEIGHT), 4)
-    result['market_weight'] = round(1.0 - result['historical_weight'], 4)
+    # Global weight uses median n with same step schedule
+    _global_hw = _CAL_HIST_WEIGHT_BASE
+    for min_n, weight in _CAL_HIST_WEIGHT_STEPS:
+        if median_n >= min_n:
+            _global_hw = weight
+            break
+    result['historical_weight'] = round(_global_hw, 4)
+    result['market_weight'] = round(1.0 - _global_hw, 4)
 
     print(f"\n  TIER 1: Bayesian weights (median n={median_n})")
     for code, (mw, hw) in sorted(result['weights_per_code'].items()):
