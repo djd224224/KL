@@ -109,7 +109,7 @@ API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600
 PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/content/Lisa_Kalshi.txt")
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
-SLEEP_BETWEEN_CALLS_SEC = 0.05
+SLEEP_BETWEEN_CALLS_SEC = 0.15 
 
 # =========================
 # AUTHENTICATION
