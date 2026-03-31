@@ -3,7 +3,7 @@ name: MLBMENTION Trading Bot
 # 8 runs/day
 on:
   schedule:
-    - cron: '2 */3 * * *'
+    - cron: '2 */2 * * *'
   workflow_dispatch:  # Manual trigger
 jobs:
   run-trading-script:
