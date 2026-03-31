@@ -503,7 +503,7 @@ else:
 # ==============================================================
 # Based on NBAMENTION v4.6 with MLB-specific adaptations:
 #   - MLB Stats API for exact game start times (statsapi.mlb.com)
-#   - BASE_CONTRACTS = 1 (conservative sizing, no historical data)
+#   - BASE_CONTRACTS = 3 (conservative sizing, no historical data)
 #   - DISCOVERY_MODE = True (trades unknown codes at 0.5x for data collection)
 #   - Empty SIDE_MULTIPLIERS / TEAM_MULTIPLIERS (to be tuned from settlements)
 #   - All v4.6 structural features: ledger, pairing, overshoot cap, hedge EV
