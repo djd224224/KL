@@ -650,8 +650,8 @@ SIDE_MULTIPLIERS = {
     "BUZZ": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$1,092 (13.4% ROI)
     "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
     "AIRB": {"yes": 1.5, "no": 0.0},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
-    "MVP":  {"yes": 0.0, "no": 0.0},    # v4.4 was yes:0.5 -- net -$304, NO at -100% ROI
-    "TRIP": {"yes": 0.0, "no": 0.0},    # keep killed
+    "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
+    "TRIP": {"yes": 0.5, "no": 0.5},    # [v4.7] re-enabled both sides at 0.5x
     "TECH": {"yes": 1.5, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
@@ -730,7 +730,13 @@ YES_PROBABILITY_FLOOR = 40
 # RETI: 20% YES rate → fair NO ≈ 80c. MAX_PRICE=75 blocks 65% of games.
 # RETI is +$619 at 40% ROI, 46% Kelly — the most underweighted market.
 MAX_PRICE_OVERRIDES = {
-    "RETI": 90,  # fair NO ~80c, fills profitably at 48-90c (all buckets positive)
+    "RETI": 84,  # [v4.7] was 90 — capped at 84¢ per manual review
+    "BUZZ": 70,  # [v4.7] max NO bid 70¢
+}
+
+# [v4.7] Per-market YES MAX_PRICE overrides
+YES_MAX_PRICE_OVERRIDES = {
+    "TECH": 70,  # [v4.7] max YES bid 70¢
 }
 
 NO_SWEET_SPOT_MIN = 35
@@ -2431,7 +2437,9 @@ def build_order_objects_for_market(
     # YES limit orders
     # ==========================================================
     yes_prices_to_place = []
-    max_yes_price_allowed = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else MAX_PRICE
+    # [v4.7] Per-market YES MAX_PRICE override
+    yes_market_max_price = YES_MAX_PRICE_OVERRIDES.get(ticker_part_3_market_code, MAX_PRICE)
+    max_yes_price_allowed = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else yes_market_max_price
     yes_contracts_placed = 0
 
     if yes_total_mult > 0:
@@ -2443,7 +2451,7 @@ def build_order_objects_for_market(
 
             if bid_price > max_yes_price_allowed:
                 continue
-            if bid_price < active_min_price_yes or bid_price > MAX_PRICE:
+            if bid_price < active_min_price_yes or bid_price > yes_market_max_price:
                 continue
             if bid_price < active_yes_min_price:
                 continue
