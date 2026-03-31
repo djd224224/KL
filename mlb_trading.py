@@ -2647,13 +2647,11 @@ def submit_orders_sequential(orders: List[Dict[str, Any]]) -> List[Dict[str, Any
                 except Exception as e2:
                     error_detail = f"429 retry failed: {e2}"
 
-            # Alert on order failures
+            # Log order failures (no alert/text — expected for closed markets and rate limits)
             if '400' in str(e) or status_code == 400:
-                alert("ORDER_400", f"{order_params.get('ticker')} {order_params.get('side')}@{order_params.get('yes_price') or order_params.get('no_price')}c",
-                      {"error": error_detail[:200]})
+                print(f"    ⚠️ ORDER_400: {order_params.get('ticker')} {order_params.get('side')}@{order_params.get('yes_price') or order_params.get('no_price')}c ({error_detail[:150]})")
             elif '429' in str(e) or status_code == 429:
-                alert("ORDER_429", f"Rate limited on {order_params.get('ticker')}",
-                      {"error": error_detail[:200]})
+                print(f"    ⚠️ ORDER_429: Rate limited on {order_params.get('ticker')} ({error_detail[:150]})")
 
             results.append({
                 "ok": False,
