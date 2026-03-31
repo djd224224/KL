@@ -2725,13 +2725,11 @@ def submit_orders_sequential(orders: List[Dict[str, Any]]) -> List[Dict[str, Any
                     pass
             elif hasattr(e, 'args') and len(e.args) > 1:
                 error_detail = f"{str(e)} | args: {e.args}"
-            # Alert on order failures
+            # Log order failures (no alert/text — expected for closed markets and rate limits)
             if '400' in str(e):
-                alert("ORDER_400", f"{order_params.get('ticker')} {order_params.get('side')}@{order_params.get('yes_price') or order_params.get('no_price')}c",
-                      {"error": error_detail[:200]})
+                print(f"    ⚠️ ORDER_400: {order_params.get('ticker')} {order_params.get('side')}@{order_params.get('yes_price') or order_params.get('no_price')}c ({error_detail[:150]})")
             elif '429' in str(e):
-                alert("ORDER_429", f"Rate limited on {order_params.get('ticker')}",
-                      {"error": error_detail[:200]})
+                print(f"    ⚠️ ORDER_429: Rate limited on {order_params.get('ticker')} ({error_detail[:150]})")
             results.append({
                 "ok": False,
                 "ticker": order_params["ticker"],
