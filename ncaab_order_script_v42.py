@@ -1817,12 +1817,11 @@ def submit_orders_sequential(orders):
                 "error": None, "created_at": ts, **metadata})
         except Exception as e:
             _err_str = str(e)
+            # Log order failures (no alert/text — expected for closed markets and rate limits)
             if '400' in _err_str:
-                alert("ORDER_400", f"{op['ticker']} {op['side']}@{op.get('yes_price') or op.get('no_price')}c",
-                      {"error": _err_str[:200]})
+                print(f"    ⚠️ ORDER_400: {op['ticker']} {op['side']}@{op.get('yes_price') or op.get('no_price')}c ({_err_str[:150]})")
             elif '429' in _err_str:
-                alert("ORDER_429", f"Rate limited on {op['ticker']}",
-                      {"error": _err_str[:200]})
+                print(f"    ⚠️ ORDER_429: Rate limited on {op['ticker']} ({_err_str[:150]})")
             results.append({"ok": False, "ticker": op["ticker"], "side": op["side"],
                 "price": op.get("yes_price") or op.get("no_price"), "contracts": op["count"],
                 "error": _err_str, "order_id": None, "created_at": ts, **metadata})
