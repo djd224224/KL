@@ -1,7 +1,7 @@
 name: High temp trading
 on:
   schedule:
-    - cron: '2 0,5,12,13 * * *'
+    - cron: '2 4,11,12,23 * * *'
   workflow_dispatch:
 jobs:
   run-kalshi-script:
