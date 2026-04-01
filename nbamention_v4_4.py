@@ -721,10 +721,10 @@ CORRELATION_PENALTY = 0.75
 MIN_PRICE_YES = 15
 MIN_PRICE_NO = 5
 MAX_PRICE = 75                  # default cap — NEVER relaxed, even in hedge mode
-YES_MIN_PRICE = 45              # [v4.6-3] raised from 45 — YES fills 45-47c are marginal
+YES_MIN_PRICE = 45              # [v4.7] lowered from 48
 NO_MAX_YES_PRICE = 88           # [v4.6] was 80 — CROW/ROOK NO blocked at 60% of games because implied YES > 80c
 NO_MIN_YES_PRICE = 15           # [v4.6] was 20 — RETI fair YES is ~20c, 20c floor blocks its tightest offsets
-YES_PROBABILITY_FLOOR = 30
+YES_PROBABILITY_FLOOR = 30      # [v4.7] lowered from 40
 
 # [v4.6] Per-market MAX_PRICE overrides for high-NO-probability markets
 # RETI: 20% YES rate → fair NO ≈ 80c. MAX_PRICE=75 blocks 65% of games.
@@ -2180,13 +2180,10 @@ def build_order_objects_for_market(
     # Use max() when both are boosts so the best boost applies
     team_1_mult = TEAM_MULTIPLIERS.get(team_1, 1.0)
     team_2_mult = TEAM_MULTIPLIERS.get(team_2, 1.0)
-    if team_1_mult < 1.0 or team_2_mult < 1.0:
-        team_mult = min(team_1_mult, team_2_mult)
-    else:
-        team_mult = max(team_1_mult, team_2_mult)
+    team_mult = team_1_mult * team_2_mult  # [v4.7] multiplicative — boosts and penalties compound
     if team_mult != 1.0:
         base_mult *= team_mult
-        print(f"    [v4.5] Team mult: {team_mult:.1f}x (teams: {team_1}, {team_2})")
+        print(f"    [v4.7] Team mult: {team_mult:.2f}x ({team_1}={team_1_mult}x × {team_2}={team_2_mult}x)")
 
     # Correlation penalty
     corr_penalty_yes = 1.0
@@ -2461,7 +2458,7 @@ def build_order_objects_for_market(
             hedge_ev, is_pairing = calculate_hedge_ev("yes", bid_price, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
 
-            if effective_ev < MIN_EV_PER_ORDER:
+            if effective_ev < MIN_EV_PER_ORDER - 1e-9:  # [v4.7] float-safe
                 continue
 
             base_contracts = BASE_YES_CONTRACTS[i]
@@ -2567,7 +2564,7 @@ def build_order_objects_for_market(
             hedge_ev, is_pairing = calculate_hedge_ev("no", bid_price, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
 
-            if effective_ev < MIN_EV_PER_ORDER:
+            if effective_ev < MIN_EV_PER_ORDER - 1e-9:  # [v4.7] float-safe
                 continue
 
             base_contracts = BASE_NO_CONTRACTS[i]
