@@ -614,7 +614,7 @@ POSITION_STOP_THRESHOLD = _limits["POSITION_STOP_THRESHOLD"]
 MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
 MAX_NET_PER_EVENT = _limits["MAX_NET_PER_EVENT"]
-MAX_ORDERS_PER_EVENT = 10000
+MAX_ORDERS_PER_EVENT = 5000
 
 MIN_SPREAD_BOTH_SIDES = 0
 
@@ -754,7 +754,7 @@ def generate_base_contracts(num_levels: int) -> List[int]:
 NUM_OFFSET_LEVELS = 10
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
-MAX_CONTRACTS_PER_ORDER = 10000
+MAX_CONTRACTS_PER_ORDER = 1000
 MAX_CONTRACTS_PER_MARKET_PER_RUN = 150  # [v4.6] Limits single-run exposure per market
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
@@ -2472,11 +2472,12 @@ def build_order_objects_for_market(
                 max(0, MAX_CONTRACTS_PER_MARKET_PER_RUN - yes_contracts_placed),  # [v4.6] per-run YES cap (independent)
             )
 
-            # [v4.6-2] Pairing overshoot cap: hedge can only REDUCE net, never REVERSE
+            # [v4.7] Pairing overshoot cap: only when order DEPENDS on hedge EV
             if is_pairing and ledger_data and net_side == "no":
-                # We're net NO and buying YES to hedge — cap at current imbalance
-                remaining_hedge_room = ledger_data['no_qty'] - ledger_data['yes_qty'] - yes_contracts_placed
-                max_here = min(max_here, max(0, remaining_hedge_room))
+                needs_hedge = standalone_ev < MIN_EV_PER_ORDER - 1e-9
+                if needs_hedge:
+                    remaining_hedge_room = ledger_data['no_qty'] - ledger_data['yes_qty'] - yes_contracts_placed
+                    max_here = min(max_here, max(0, remaining_hedge_room))
 
             if max_here < 1:
                 continue
@@ -2584,11 +2585,13 @@ def build_order_objects_for_market(
                 max(0, MAX_CONTRACTS_PER_MARKET_PER_RUN - no_contracts_placed),  # [v4.6] per-run NO cap (independent)
             )
 
-            # [v4.6-2] Pairing overshoot cap: hedge can only REDUCE net, never REVERSE
+            # [v4.7] Pairing overshoot cap: only when order DEPENDS on hedge EV
+            # If standalone EV passes on its own, this is a profitable trade, not just a hedge
             if is_pairing and ledger_data and net_side == "yes":
-                # We're net YES and buying NO to hedge — cap at current imbalance
-                remaining_hedge_room = ledger_data['yes_qty'] - ledger_data['no_qty'] - no_contracts_placed
-                max_here = min(max_here, max(0, remaining_hedge_room))
+                needs_hedge = standalone_ev < MIN_EV_PER_ORDER - 1e-9
+                if needs_hedge:
+                    remaining_hedge_room = ledger_data['yes_qty'] - ledger_data['no_qty'] - no_contracts_placed
+                    max_here = min(max_here, max(0, remaining_hedge_room))
 
             if max_here < 1:
                 continue
