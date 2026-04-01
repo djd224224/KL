@@ -83,10 +83,29 @@ ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")
 ALERT_SMS_GATEWAY = os.getenv("ALERT_SMS_GATEWAY", "9729713381@tmomail.net")
 ALERT_COOLDOWN_MINUTES = 15
 
+# --- Category-based exclusion (primary filter, from Kalshi event.category) ---
+EXCLUDED_CATEGORIES = {"Sports", "Elections", "Crypto"}
+
+# --- Series prefix exclusion (backup for markets missing category metadata) ---
 EXCLUDED_SERIES_PREFIXES = [
-    "KXNBAMENTION", "KXNCAABMENTION", "KXMLBMENTION", "KXFIGHTMENTION",
-    "KXUFCFIGHT", "KXUFCDISTANCE", "KXUFCMOV", "KXNFLMENTION",
-    "KXHIGH", "KXPERFORM",
+    # Sports
+    "KXNBA", "KXNBAMENTION", "KXNBAMVP", "KXNBAWEST", "KXNBAEAST",
+    "KXNCAA", "KXNCAAB", "KXNCAABMENTION", "KXMARMAD",
+    "KXNFL", "KXNFLMENTION", "KXNFLGAME",
+    "KXMLB", "KXMLBMENTION",
+    "KXWNBA",
+    "KXUFCFIGHT", "KXUFCDISTANCE", "KXUFCMOV", "KXFIGHTMENTION",
+    "KXPREMIERLEAGUE", "KXPGATOUR", "KXF1RACE",
+    "KXPERFORM",
+    # Elections
+    "KXPRESNOMD", "KXPRESNOMR", "KXPRESPERSON",
+    "KXSENATE", "KXGOV",
+    "KXTRUMPOUT", "KXCITRINI",
+    "CONTROLH", "CONTROLS",
+    # Crypto
+    "KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP",
+    # Weather (public forecast data)
+    "KXHIGH",
 ]
 
 # Signal thresholds (run --calibrate to tune from real data)
@@ -395,9 +414,18 @@ def discover_monitored_markets(client: KalshiClient) -> list:
 
     for m in all_markets:
         ticker = m.get("ticker", "")
+        category = m.get("_event_category", "")
+
+        # Primary filter: exclude by Kalshi event category
+        if category in EXCLUDED_CATEGORIES:
+            excluded_count += 1
+            continue
+
+        # Backup filter: exclude by series prefix (for markets missing category)
         if is_excluded_series(ticker):
             excluded_count += 1
             continue
+
         volume = _extract_volume(m)
         oi = _extract_oi(m)
         if volume == 0 and oi == 0:
@@ -410,7 +438,7 @@ def discover_monitored_markets(client: KalshiClient) -> list:
 
     monitored.sort(key=lambda x: x["_volume"], reverse=True)
     log.info(f"  Monitoring {len(monitored)} markets "
-             f"(excluded {excluded_count} sports/weather, {dead_count} dead)")
+             f"(excluded {excluded_count} sports/elections/crypto, {dead_count} dead)")
     return monitored
 
 
