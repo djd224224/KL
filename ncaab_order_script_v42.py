@@ -378,6 +378,14 @@ MAX_NET_PER_MARKET = 250
 TIER1_MARKETS = {"SCHE", "ELBO", "DRAF", "MARC", "NIL", "DOUB"}
 # [v4.5] Top NO markets get tightest offsets (1¢ increments) — most profitable NO codes
 TOP_NO_MARKETS = {"SCHE", "DRAF", "NIL"}
+
+# =====================================================================
+# [v4.5] AGGRESSIVE MARKET PRICING — easy on/off toggle
+# Markets here use 100% orderbook mid (no historical blend) and
+# NO offsets start at 0 (bid AT fair value on first level).
+# To disable: set to empty set  →  AGGRESSIVE_MARKET_PRICING = set()
+# =====================================================================
+AGGRESSIVE_MARKET_PRICING = {"SCHE", "DRAF", "NIL"}   # ← toggle here
 TIER2_MAX_NET = 100
 POSITION_MODERATE_THRESHOLD = 125
 POSITION_STOP_THRESHOLD = 250
@@ -1606,9 +1614,12 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     elif orderbook_yes_bid is not None: market_mid_yes = float(orderbook_yes_bid)
     elif orderbook_no_bid is not None: market_mid_yes = 100.0 - orderbook_no_bid
 
+    # [v4.5] Aggressive markets use pure orderbook mid (no historical blend)
+    effective_strategy = 'market' if ticker_part_3_market_code in AGGRESSIVE_MARKET_PRICING else PRICING_STRATEGY
+
     yes_fair, no_fair, bayesian_inter = calculate_bid_price(
         market_mid_yes, market_yes_rate, team_1_yes_rate, team_1_sample_size,
-        team_2_yes_rate, team_2_sample_size, market_sample_size, PRICING_STRATEGY)
+        team_2_yes_rate, team_2_sample_size, market_sample_size, effective_strategy)
 
     # Log pricing strategy
     myr_str = f"{market_yes_rate*100:.1f}%" if market_yes_rate is not None and not pd.isna(market_yes_rate) else "N/A"
@@ -1616,7 +1627,8 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     t1_str = f"{team_1}={team_1_yes_rate*100:.1f}%(n={team_1_sample_size:.0f})" if team_1_yes_rate is not None and not pd.isna(team_1_yes_rate) and team_1_sample_size > 0 else ""
     t2_str = f"{team_2}={team_2_yes_rate*100:.1f}%(n={team_2_sample_size:.0f})" if team_2_yes_rate is not None and not pd.isna(team_2_yes_rate) and team_2_sample_size > 0 else ""
     teams_str = ", ".join(filter(None, [t1_str, t2_str]))
-    print(f"    Strategy [{PRICING_STRATEGY}]: Market={myr_str} ({ms_str}) Teams: {teams_str or 'none'}")
+    strategy_label = f"{effective_strategy}" + (" ⚡AGGRESSIVE" if effective_strategy == 'market' and PRICING_STRATEGY != 'market' else "")
+    print(f"    Strategy [{strategy_label}]: Market={myr_str} ({ms_str}) Teams: {teams_str or 'none'}")
 
     if yes_fair is not None and no_fair is not None:
         print(f"    → Fair value YES={yes_fair}¢, NO={no_fair}¢ (sum={yes_fair+no_fair}¢)")
@@ -1658,8 +1670,13 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             spread_config_name = TIER1_SPREAD_OVERRIDE + "_tier1_no"
     # [v4.5] Top NO markets: pure 1¢ increments for maximum fill rate
     if ticker_part_3_market_code in TOP_NO_MARKETS:
-        no_offsets = generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS)
-        spread_config_name = "top_no_1c"
+        # [v4.5] Aggressive pricing: start at 0 (bid AT fair value)
+        if ticker_part_3_market_code in AGGRESSIVE_MARKET_PRICING:
+            no_offsets = generate_offsets(start=0, increment=1, count=NUM_OFFSET_LEVELS)
+            spread_config_name = "aggressive_0c"
+        else:
+            no_offsets = generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS)
+            spread_config_name = "top_no_1c"
     yes_offsets = SPREAD_CONFIGS["wide"]
     if pairing_mode_str != "normal" and net_side != "flat":
         if net_side == "yes": no_offsets = PAIRING_OFFSETS['no']; spread_config_name += "+pair_no"
@@ -1719,7 +1736,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
                 "ev": round(effective_ev, 4), "standalone_ev": round(standalone_ev, 4),
                 "hedge_ev": round(hedge_ev, 4) if is_pairing else None,
                 "is_pairing_order": is_pairing, "pairing_mode": pairing_mode_str,
-                "p_hat": round(p_hat, 4), "pricing_strategy": PRICING_STRATEGY,
+                "p_hat": round(p_hat, 4), "pricing_strategy": effective_strategy,
                 "safe_mode": safe_mode, "event_ticker": event_ticker,
             })
 
@@ -1772,7 +1789,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
                 "ev": round(effective_ev, 4), "standalone_ev": round(standalone_ev, 4),
                 "hedge_ev": round(hedge_ev, 4) if is_pairing else None,
                 "is_pairing_order": is_pairing, "pairing_mode": pairing_mode_str,
-                "p_hat": round(p_hat, 4), "pricing_strategy": PRICING_STRATEGY,
+                "p_hat": round(p_hat, 4), "pricing_strategy": effective_strategy,
                 "safe_mode": safe_mode, "event_ticker": event_ticker,
             })
 
