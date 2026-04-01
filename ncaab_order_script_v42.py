@@ -376,13 +376,15 @@ BAYESIAN_HISTORICAL_WEIGHT = 0.30
 MAX_NET_PER_MARKET = 250
 # [v4.5] DOUB added to Tier 1 — tournament regime shift (+$174/+81%/+42pp in 7d)
 TIER1_MARKETS = {"SCHE", "ELBO", "DRAF", "MARC", "NIL", "DOUB"}
+# [v4.5] Top NO markets get tightest offsets (1¢ increments) — most profitable NO codes
+TOP_NO_MARKETS = {"SCHE", "DRAF", "NIL"}
 TIER2_MAX_NET = 100
 POSITION_MODERATE_THRESHOLD = 125
 POSITION_STOP_THRESHOLD = 250
 MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
 MAX_NET_PER_EVENT = 800
-MAX_ORDERS_PER_EVENT = 5000
+MAX_ORDERS_PER_EVENT = 2000
 
 MIN_SPREAD_BOTH_SIDES = 0
 MIN_EV_PER_ORDER = 0.02
@@ -393,8 +395,8 @@ SAFE_MODE_MULTIPLIER = 0.10
 # =========================
 PAIRING_MODE_THRESHOLD = 0.60
 PAIRING_MODE_AGGRESSIVE = 0.85
-PAIRING_MODE_NET_FLOOR = 60
-PAIRING_MODE_NET_AGGRESSIVE = 100
+PAIRING_MODE_NET_FLOOR = 150      # [v4.5] was 60 — 63 net No shouldn't trigger pairing
+PAIRING_MODE_NET_AGGRESSIVE = 200  # [v4.5] was 100 — scaled up with floor
 
 HEDGE_MIN_PRICE_YES = 15
 HEDGE_MIN_PRICE_NO = 5
@@ -703,6 +705,10 @@ def get_game_start_ts(team_1, team_2, event_date_str):
 MIN_PRICE_YES = 20
 MIN_PRICE_NO = 15
 MAX_PRICE = 75
+# [v4.5] Per-market NO MAX_PRICE overrides (same pattern as NBA)
+MAX_PRICE_OVERRIDES = {
+    "NIL": 80,   # [v4.5] fair NO ~82c, default 75 blocks profitable fills
+}
 YES_MIN_PRICE = 20
 NO_MAX_YES_PRICE = 80
 NO_MIN_YES_PRICE = 20
@@ -734,8 +740,8 @@ def generate_base_contracts(num_levels: int) -> List[int]:
 NUM_OFFSET_LEVELS = 12
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
-MAX_CONTRACTS_PER_ORDER = 5000
-MAX_CONTRACTS_PER_MARKET_PER_RUN = 100
+MAX_CONTRACTS_PER_ORDER = 300
+MAX_CONTRACTS_PER_MARKET_PER_RUN = 75
 
 TIME_MULTIPLIERS = [
     (1, 1.8), (3, 1.5), (6, 1.3), (12, 1.1),
@@ -1650,6 +1656,10 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
         if TIER1_SPREAD_OVERRIDE in SPREAD_CONFIGS:
             no_offsets = SPREAD_CONFIGS[TIER1_SPREAD_OVERRIDE]
             spread_config_name = TIER1_SPREAD_OVERRIDE + "_tier1_no"
+    # [v4.5] Top NO markets: pure 1¢ increments for maximum fill rate
+    if ticker_part_3_market_code in TOP_NO_MARKETS:
+        no_offsets = generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS)
+        spread_config_name = "top_no_1c"
     yes_offsets = SPREAD_CONFIGS["wide"]
     if pairing_mode_str != "normal" and net_side != "flat":
         if net_side == "yes": no_offsets = PAIRING_OFFSETS['no']; spread_config_name += "+pair_no"
@@ -1680,7 +1690,7 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             standalone_ev = p_hat - (bid / 100.0)
             hedge_ev, is_pairing = calculate_hedge_ev("yes", bid, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
-            if effective_ev < MIN_EV_PER_ORDER: continue
+            if effective_ev < MIN_EV_PER_ORDER - 1e-9: continue  # [v4.5] float-safe
             if bid < 100:
                 implied_kelly_yes = (p_hat - (bid / 100)) / (1 - bid / 100)
                 if implied_kelly_yes < 0.02:
@@ -1714,18 +1724,20 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
             })
 
     # === NO LIMIT ORDERS ===
-    max_no_price = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else MAX_PRICE
+    # [v4.5] Per-market MAX_PRICE override
+    market_max_price = MAX_PRICE_OVERRIDES.get(ticker_part_3_market_code, MAX_PRICE)
+    max_no_price = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else market_max_price
     if no_total_mult > 0:
         for i, offset in enumerate(no_offsets):
             if i >= len(BASE_NO_CONTRACTS): break
             bid = no_fair - offset
-            if bid > max_no_price or bid < act_min_no or bid > MAX_PRICE: continue
+            if bid > max_no_price or bid < act_min_no or bid > market_max_price: continue
             implied_yes = 100 - bid
             if implied_yes < NO_MIN_YES_PRICE or implied_yes > NO_MAX_YES_PRICE: continue
             standalone_ev = (1.0 - p_hat) - (bid / 100.0)
             hedge_ev, is_pairing = calculate_hedge_ev("no", bid, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
-            if effective_ev < MIN_EV_PER_ORDER: continue
+            if effective_ev < MIN_EV_PER_ORDER - 1e-9: continue  # [v4.5] float-safe
             if bid < 100:
                 implied_kelly = ((1 - p_hat) - (bid / 100)) / (1 - bid / 100)
                 if implied_kelly < 0.02:
