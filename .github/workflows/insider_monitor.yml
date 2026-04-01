@@ -1,0 +1,72 @@
+name: Kalshi Insider Monitor
+
+on:
+  schedule:
+    # Run every 3 minutes during active hours (6am-2am ET = 10:00-06:00 UTC)
+    - cron: '*/3 10-23 * * *'   # UTC 10:00-23:59 (6am-8pm ET)
+    - cron: '*/3 0-6 * * *'     # UTC 00:00-06:00 (8pm-2am ET)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: false
+        default: 'monitor'
+        type: choice
+        options:
+          - monitor
+          - calibrate
+          - dry-run
+          - list-markets
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests cryptography google-cloud-bigquery
+
+      - name: Write GCP credentials
+        run: |
+          printenv GCP_CREDENTIALS_JSON > /tmp/gcp_creds.json
+        env:
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+
+      - name: Write Kalshi private key
+        run: |
+          printenv KALSHI_PRIVATE_KEY > kalshi_private_key.pem
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+
+      - name: Run insider monitor
+        run: |
+          MODE="${{ github.event.inputs.mode || 'monitor' }}"
+          case "$MODE" in
+            calibrate)   python kalshi_insider_monitor.py --calibrate ;;
+            dry-run)     python kalshi_insider_monitor.py --dry-run ;;
+            list-markets) python kalshi_insider_monitor.py --list-markets ;;
+            *)           python kalshi_insider_monitor.py ;;
+          esac
+        env:
+          KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
+          KALSHI_PRIVATE_KEY_PATH: kalshi_private_key.pem
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_creds.json
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+          ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ALERT_SMS_GATEWAY: ${{ secrets.ALERT_SMS_GATEWAY }}
+
+      - name: Cleanup secrets
+        if: always()
+        run: |
+          rm -f /tmp/gcp_creds.json kalshi_private_key.pem
