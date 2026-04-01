@@ -4,7 +4,7 @@
    MLB version of NBAMENTIONS_TRADING v4.6.
    Mirrors NBA script structure with:
      - MLB Stats API for exact game start times
-     - BASE_CONTRACTS = 1 (no historical data yet)
+     - BASE_CONTRACTS = 3 (no historical data yet)
      - DISCOVERY_MODE = True (trades unknown codes at reduced size)
      - Empty SIDE_MULTIPLIERS / TEAM_MULTIPLIERS (to be tuned from data)
 """
@@ -684,7 +684,7 @@ NUM_YES_OFFSET_LEVELS = 7   # [v1.1] YES gets more levels (edge is real at 45-60
 NUM_NO_OFFSET_LEVELS = 5    # [v1.1] NO gets fewer levels (adversely selected everywhere)
 
 def generate_base_contracts(num_levels: int) -> List[int]:
-    return [1] * num_levels  # 1 contract per level
+    return [3] * num_levels  # 3 contract per level
 
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_YES_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_NO_OFFSET_LEVELS)
