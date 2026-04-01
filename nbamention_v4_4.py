@@ -721,10 +721,10 @@ CORRELATION_PENALTY = 0.75
 MIN_PRICE_YES = 15
 MIN_PRICE_NO = 5
 MAX_PRICE = 75                  # default cap — NEVER relaxed, even in hedge mode
-YES_MIN_PRICE = 48              # [v4.6-3] raised from 45 — YES fills 45-47c are marginal
+YES_MIN_PRICE = 45              # [v4.6-3] raised from 45 — YES fills 45-47c are marginal
 NO_MAX_YES_PRICE = 88           # [v4.6] was 80 — CROW/ROOK NO blocked at 60% of games because implied YES > 80c
 NO_MIN_YES_PRICE = 15           # [v4.6] was 20 — RETI fair YES is ~20c, 20c floor blocks its tightest offsets
-YES_PROBABILITY_FLOOR = 40
+YES_PROBABILITY_FLOOR = 30
 
 # [v4.6] Per-market MAX_PRICE overrides for high-NO-probability markets
 # RETI: 20% YES rate → fair NO ≈ 80c. MAX_PRICE=75 blocks 65% of games.
@@ -1324,8 +1324,8 @@ def calculate_ledger_position_multiplier(
     if net_side == side and net_qty > 0:
         if net_qty >= MAX_NET_PER_MARKET:
             return 0.0, f"net_cap_{side}={net_qty}", 0.0
-        elif net_qty >= MAX_NET_PER_MARKET * 0.7:
-            remaining_frac = (MAX_NET_PER_MARKET - net_qty) / (MAX_NET_PER_MARKET * 0.3)
+        elif net_qty >= MAX_NET_PER_MARKET * 0.5:
+            remaining_frac = (MAX_NET_PER_MARKET - net_qty) / (MAX_NET_PER_MARKET * 0.5)
             mult = max(0.1, remaining_frac)
             return mult, f"net_rampdown_{side}={net_qty}", 0.0
         else:
@@ -2302,10 +2302,10 @@ def build_order_objects_for_market(
         active_yes_min_price = HEDGE_YES_MIN_PRICE
         print(f"    🔄 Price floors RELAXED (aggressive): YES>={active_min_price_yes}c NO>={active_min_price_no}c YES_MIN={active_yes_min_price}c")
     elif pairing_mode_str == "pairing":
-        active_min_price_yes = (MIN_PRICE_YES + HEDGE_MIN_PRICE_YES) // 2
-        active_min_price_no = (MIN_PRICE_NO + HEDGE_MIN_PRICE_NO) // 2
-        active_yes_min_price = (YES_MIN_PRICE + HEDGE_YES_MIN_PRICE) // 2
-        print(f"    🔄 Price floors PARTIALLY RELAXED: YES>={active_min_price_yes}c NO>={active_min_price_no}c YES_MIN={active_yes_min_price}c")
+        active_min_price_yes = HEDGE_MIN_PRICE_YES
+        active_min_price_no = HEDGE_MIN_PRICE_NO
+        active_yes_min_price = HEDGE_YES_MIN_PRICE
+        print(f"    🔄 Price floors RELAXED (pairing): YES>={active_min_price_yes}c NO>={active_min_price_no}c YES_MIN={active_yes_min_price}c")
     else:
         active_min_price_yes = MIN_PRICE_YES
         active_min_price_no = MIN_PRICE_NO
