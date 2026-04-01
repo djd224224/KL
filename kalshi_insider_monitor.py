@@ -12,9 +12,8 @@ Alerts: SMS via T-Mobile gateway + email.
 
 Usage:
     python kalshi_insider_monitor.py                 # Normal monitoring run
-    python kalshi_insider_monitor.py --calibrate     # Calibration mode
-    python kalshi_insider_monitor.py --dry-run       # Detect but don't alert
-    python kalshi_insider_monitor.py --list-markets  # Show market universe
+    python kalshi_insider_monitor.py --calibrate     # Diagnostic: show threshold distributions
+    python kalshi_insider_monitor.py --list-markets  # Diagnostic: show market universe
 
 Environment Variables (secrets):
     KALSHI_API_KEY          — Kalshi API key
@@ -131,6 +130,11 @@ W_TIME_OF_DAY = 0.05
 COMPOSITE_ALERT_THRESHOLD = 0.50
 MAX_ORDERBOOK_FETCHES = 80
 POLL_INTERVAL_SECONDS = 120
+
+# Warm-up: a market must have this many snapshots before alerts fire.
+# At 3-min polling, 6 snapshots ≈ 18 min of baseline collection.
+# Data is still collected during warm-up; only alerting is suppressed.
+WARMUP_SNAPSHOTS = 6
 
 
 # ===========================================================================
@@ -971,7 +975,7 @@ def run_calibration(client: KalshiClient, bq_client):
 #  MAIN MONITORING LOOP
 # ===========================================================================
 
-def run_monitor(client: KalshiClient, bq_client, dry_run: bool = False):
+def run_monitor(client: KalshiClient, bq_client):
     state_store = MonitorStateStore()
     state_store.load_from_bigquery(bq_client)
 
@@ -985,6 +989,7 @@ def run_monitor(client: KalshiClient, bq_client, dry_run: bool = False):
     # Pass 1: Bulk data from market objects
     flagged_for_orderbook = []
     alerts_triggered = []
+    warming_up = 0
 
     for m in markets:
         ticker = m.get("ticker", "")
@@ -1018,6 +1023,12 @@ def run_monitor(client: KalshiClient, bq_client, dry_run: bool = False):
         m["_last_price_cents"] = state.snapshots[-1]["last_price_cents"] if state.snapshots else 0
 
         if score_result["triggered"]:
+            # Warm-up gate: suppress alerts until we have enough baseline data.
+            # Data collection continues normally; only alerting is gated.
+            if len(state.snapshots) < WARMUP_SNAPSHOTS:
+                warming_up += 1
+                continue
+
             if state.can_alert():
                 ratio_str = f"{book_signal['ratio']:.2f}" if book_signal['ratio'] != float("inf") else "inf"
                 log.info(f"\n{'!'*60}")
@@ -1029,11 +1040,8 @@ def run_monitor(client: KalshiClient, bq_client, dry_run: bool = False):
                 log.info(f"  {m.get('_event_title', 'N/A')}")
                 log.info(f"{'!'*60}")
 
-                if not dry_run:
-                    send_alert(ticker, score_result["score"], score_result, m)
-                    state.mark_alerted()
-                else:
-                    log.info("  (dry-run — alert suppressed)")
+                send_alert(ticker, score_result["score"], score_result, m)
+                state.mark_alerted()
 
                 log_alert_to_bq(bq_client, ticker, score_result, vol_signal,
                                 price_signal, book_signal, m)
@@ -1045,9 +1053,8 @@ def run_monitor(client: KalshiClient, bq_client, dry_run: bool = False):
 
     log.info(f"\nPoll complete: {len(markets)} scanned, "
              f"{len(flagged_for_orderbook)} orderbooks, "
-             f"{len(alerts_triggered)} alerts")
-    if alerts_triggered:
-        log.info(f"  Alerted: {', '.join(alerts_triggered)}")
+             f"{len(alerts_triggered)} alerts"
+             + (f", {warming_up} warming up" if warming_up else ""))
 
 
 def list_markets(client: KalshiClient):
@@ -1071,10 +1078,12 @@ def list_markets(client: KalshiClient):
 
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Insider Activity Monitor")
-    parser.add_argument("--calibrate", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--list-markets", action="store_true")
-    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Diagnostic: show threshold distributions from historical data")
+    parser.add_argument("--list-markets", action="store_true",
+                        help="Diagnostic: print monitored market universe and exit")
+    parser.add_argument("--loop", action="store_true",
+                        help="Run continuously (for VM deployment, not GH Actions)")
     parser.add_argument("--interval", type=int, default=POLL_INTERVAL_SECONDS)
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
@@ -1094,13 +1103,13 @@ def main():
         log.info(f"Continuous loop mode (interval={args.interval}s)")
         while True:
             try:
-                run_monitor(client, bq_client, dry_run=args.dry_run)
+                run_monitor(client, bq_client)
             except Exception as e:
                 log.error(f"Error in monitoring loop: {e}", exc_info=True)
             log.info(f"Sleeping {args.interval}s...")
             time.sleep(args.interval)
     else:
-        run_monitor(client, bq_client, dry_run=args.dry_run)
+        run_monitor(client, bq_client)
 
 
 if __name__ == "__main__":
