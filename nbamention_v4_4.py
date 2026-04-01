@@ -754,7 +754,7 @@ def generate_base_contracts(num_levels: int) -> List[int]:
 NUM_OFFSET_LEVELS = 10
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
-MAX_CONTRACTS_PER_ORDER = 1000
+MAX_CONTRACTS_PER_ORDER = 10000
 MAX_CONTRACTS_PER_MARKET_PER_RUN = 150  # [v4.6] Limits single-run exposure per market
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
