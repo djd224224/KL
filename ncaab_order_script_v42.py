@@ -871,7 +871,7 @@ def fetch_fills_from_api(exchange_client_ref, series_ticker=SERIES_TICKER):
     page = 0
     while True:
         page += 1
-        params = {"limit": 1000}
+        params = {"limit": 200}
         if cursor:
             params["cursor"] = cursor
         try:
@@ -1210,7 +1210,7 @@ def cancel_all_existing_orders_batch():
         page = 0
         while True:
             page += 1
-            params = {"limit": 500}
+            params = {"limit": 100}
             if cursor: params["cursor"] = cursor
             response = exchange_client.get_orders(**params)
             batch = response.get('orders', [])
