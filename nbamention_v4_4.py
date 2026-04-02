@@ -1367,24 +1367,17 @@ def cancel_all_existing_orders_batch():
 
         while True:
             page += 1
-            params = {"limit": 100, "status": "resting"}  # [v4.7] server-side filter — was fetching 65k+ orders
+            params = {"limit": 100}
             if cursor:
                 params["cursor"] = cursor
 
-            if page <= 3 or page % 10 == 0:
-                print(f"  Fetching resting orders page {page}...")
+            if page <= 3 or page % 20 == 0:
+                resting_so_far = sum(1 for o in all_orders if o.get('status') == 'resting' and o.get('ticker', '').startswith(SERIES_TICKER))
+                print(f"  Fetching orders page {page}... ({resting_so_far} resting found)")
             try:
                 response = exchange_client.get_orders(**params)
             except Exception as e:
-                # [v4.7] Capture response body for API debugging
-                err_body = ""
-                if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                    err_body = e.response.text[:500]
-                elif hasattr(e, 'args') and len(e.args) > 1:
-                    err_body = str(e.args)
                 print(f"  ✗ get_orders failed: {e}")
-                if err_body:
-                    print(f"    Response body: {err_body}")
                 break
             batch = response.get('orders', [])
             all_orders.extend(batch)
@@ -1393,10 +1386,6 @@ def cancel_all_existing_orders_batch():
             if not cursor:
                 print(f"  ✓ Reached end of orders at page {page}")
                 break
-
-            if page % 10 == 0:
-                resting_so_far = sum(1 for o in all_orders if o.get('status') == 'resting' and o.get('ticker', '').startswith(SERIES_TICKER))
-                print(f"    ({resting_so_far} {SERIES_TICKER} resting orders found so far)")
 
         print(f"  Fetched {len(all_orders)} total orders")
 
