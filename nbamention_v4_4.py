@@ -756,6 +756,8 @@ BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 MAX_CONTRACTS_PER_ORDER = 1000
 MAX_CONTRACTS_PER_MARKET_PER_RUN = 150  # [v4.6] Limits single-run exposure per market
+MAX_TOTAL_MULTIPLIER = 3.0              # [v4.7] Hard cap on combined multiplier
+MAX_CONTRACTS_PER_LEVEL = 50            # [v4.7] Hard cap on contracts per price level
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
 TIME_MULTIPLIERS = [
@@ -2221,6 +2223,14 @@ def build_order_objects_for_market(
     yes_total_mult = base_mult * yes_position_mult * yes_side_mult * safe_mult * corr_penalty_yes
     no_total_mult = base_mult * no_position_mult * no_side_mult * safe_mult * corr_penalty_no
 
+    # [v4.7] Hard cap on combined multiplier
+    if yes_total_mult > MAX_TOTAL_MULTIPLIER:
+        print(f"    ⚠️ YES mult {yes_total_mult:.2f}x capped to {MAX_TOTAL_MULTIPLIER}x")
+        yes_total_mult = MAX_TOTAL_MULTIPLIER
+    if no_total_mult > MAX_TOTAL_MULTIPLIER:
+        print(f"    ⚠️ NO mult {no_total_mult:.2f}x capped to {MAX_TOTAL_MULTIPLIER}x")
+        no_total_mult = MAX_TOTAL_MULTIPLIER
+
     safe_tag = " [SAFE MODE]" if safe_mode else ""
     position_status = f" | Pos: {abs(net_position)} net {'YES' if net_position > 0 else 'NO'}" if net_position != 0 else ""
     print(f"    Time: {hours_until_event:.1f}h ({time_mult:.2f}x) [{time_source}] | OI: {open_interest} ({volume_mult:.2f}x) | Base: {base_mult:.2f}x{position_status}{safe_tag}")
@@ -2471,7 +2481,7 @@ def build_order_objects_for_market(
                 continue
 
             base_contracts = BASE_YES_CONTRACTS[i]
-            scaled_contracts = int(base_contracts * yes_total_mult)
+            scaled_contracts = min(int(base_contracts * yes_total_mult), MAX_CONTRACTS_PER_LEVEL)
 
             max_here = min(
                 scaled_contracts,
@@ -2578,7 +2588,7 @@ def build_order_objects_for_market(
                 continue
 
             base_contracts = BASE_NO_CONTRACTS[i]
-            scaled_contracts = int(base_contracts * no_total_mult)
+            scaled_contracts = min(int(base_contracts * no_total_mult), MAX_CONTRACTS_PER_LEVEL)
 
             # NO sweet-spot boost
             sweet_spot_applied = False
