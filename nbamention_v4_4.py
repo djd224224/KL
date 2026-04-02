@@ -936,7 +936,7 @@ def fetch_fills_from_api(
 
     while True:
         page += 1
-        params = {"limit": 100}  # [v4.7] was 1000
+        params = {"limit": 200}  # [v4.7] was 1000 (400 error), 100 works but slow
         if cursor:
             params["cursor"] = cursor
 
@@ -1367,11 +1367,12 @@ def cancel_all_existing_orders_batch():
 
         while True:
             page += 1
-            params = {"limit": 100}
+            params = {"limit": 100, "status": "resting"}  # [v4.7] server-side filter — was fetching 65k+ orders
             if cursor:
                 params["cursor"] = cursor
 
-            print(f"  Fetching orders page {page}...")
+            if page <= 3 or page % 10 == 0:
+                print(f"  Fetching resting orders page {page}...")
             try:
                 response = exchange_client.get_orders(**params)
             except Exception as e:
