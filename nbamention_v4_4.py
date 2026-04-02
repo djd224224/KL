@@ -647,11 +647,11 @@ SIDE_MULTIPLIERS = {
     "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
     "ANKL": {"yes": 1.0, "no": 2.0},    # keep -- both profitable, +$890 total
-    "BUZZ": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$1,092 (13.4% ROI)
+    "BUZZ": {"yes": 0.0, "no": 1.5},    # keep -- NO is +$1,092 (13.4% ROI)
     "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
     "AIRB": {"yes": 1.5, "no": 0.0},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
     "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
-    "TRIP": {"yes": 0.5, "no": 0.5},    # [v4.7] re-enabled both sides at 0.5x
+    "TRIP": {"yes": 0.3, "no": 0.3},    # [v4.7] re-enabled both sides at 0.5x
     "TECH": {"yes": 1.5, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
@@ -2180,7 +2180,7 @@ def build_order_objects_for_market(
     # Use max() when both are boosts so the best boost applies
     team_1_mult = TEAM_MULTIPLIERS.get(team_1, 1.0)
     team_2_mult = TEAM_MULTIPLIERS.get(team_2, 1.0)
-    team_mult = team_1_mult * team_2_mult  # [v4.7] multiplicative — boosts and penalties compound
+    team_mult = min(team_1_mult * team_2_mult, 1.5)  # [v4.7] multiplicative, capped at 1.5x
     if team_mult != 1.0:
         base_mult *= team_mult
         print(f"    [v4.7] Team mult: {team_mult:.2f}x ({team_1}={team_1_mult}x × {team_2}={team_2_mult}x)")
