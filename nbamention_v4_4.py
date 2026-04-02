@@ -647,11 +647,11 @@ SIDE_MULTIPLIERS = {
     "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
     "ANKL": {"yes": 1.0, "no": 2.0},    # keep -- both profitable, +$890 total
-    "BUZZ": {"yes": 0.0, "no": 1.5},    # keep -- NO is +$1,092 (13.4% ROI)
+    "BUZZ": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$1,092 (13.4% ROI)
     "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
     "AIRB": {"yes": 1.5, "no": 0.0},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
     "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
-    "TRIP": {"yes": 0.3, "no": 0.3},    # [v4.7] re-enabled both sides at 0.5x
+    "TRIP": {"yes": 0.5, "no": 0.5},    # [v4.7] re-enabled both sides at 0.5x
     "TECH": {"yes": 1.5, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
@@ -936,14 +936,21 @@ def fetch_fills_from_api(
 
     while True:
         page += 1
-        params = {"limit": 1000}
+        params = {"limit": 100}  # [v4.7] was 1000
         if cursor:
             params["cursor"] = cursor
 
         try:
             response = exchange_client_ref.get_fills(**params)
         except Exception as e:
+            err_body = ""
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                err_body = e.response.text[:500]
+            elif hasattr(e, 'args') and len(e.args) > 1:
+                err_body = str(e.args)
             print(f"  ✗ Error on page {page}: {e}")
+            if err_body:
+                print(f"    Response body: {err_body}")
             break
 
         batch = response.get("fills", [])
@@ -1360,12 +1367,24 @@ def cancel_all_existing_orders_batch():
 
         while True:
             page += 1
-            params = {"limit": 500}
+            params = {"limit": 100}
             if cursor:
                 params["cursor"] = cursor
 
             print(f"  Fetching orders page {page}...")
-            response = exchange_client.get_orders(**params)
+            try:
+                response = exchange_client.get_orders(**params)
+            except Exception as e:
+                # [v4.7] Capture response body for API debugging
+                err_body = ""
+                if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                    err_body = e.response.text[:500]
+                elif hasattr(e, 'args') and len(e.args) > 1:
+                    err_body = str(e.args)
+                print(f"  ✗ get_orders failed: {e}")
+                if err_body:
+                    print(f"    Response body: {err_body}")
+                break
             batch = response.get('orders', [])
             all_orders.extend(batch)
 
