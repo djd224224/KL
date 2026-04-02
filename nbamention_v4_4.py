@@ -2179,8 +2179,20 @@ def build_order_objects_for_market(
     yes_side_mult = get_effective_side_multiplier(yes_side_mult, "yes", pairing_mode_str, net_side)
     no_side_mult = get_effective_side_multiplier(no_side_mult, "no", pairing_mode_str, net_side)
 
-    net_room_yes = MAX_NET_PER_MARKET - net_position
-    net_room_no = MAX_NET_PER_MARKET + net_position
+    # [v4.7] net_room: use LARGER of positions API or ledger (positions API can return 0)
+    if ledger_data:
+        ledger_yes_qty = ledger_data.get("yes_qty", 0)
+        ledger_no_qty = ledger_data.get("no_qty", 0)
+        ledger_net = ledger_yes_qty - ledger_no_qty  # positive = net yes, negative = net no
+        # Use whichever shows more exposure
+        effective_net = ledger_net if abs(ledger_net) > abs(net_position) else net_position
+        net_room_yes = max(0, MAX_NET_PER_MARKET - max(ledger_yes_qty, max(0, net_position)))
+        net_room_no = max(0, MAX_NET_PER_MARKET - max(ledger_no_qty, max(0, -net_position)))
+        if abs(ledger_net) > abs(net_position) and net_position == 0:
+            print(f"    ⚠️ Positions API=0 but ledger={ledger_yes_qty}Y/{ledger_no_qty}N — using ledger for caps")
+    else:
+        net_room_yes = MAX_NET_PER_MARKET - net_position
+        net_room_no = MAX_NET_PER_MARKET + net_position
 
     time_mult = get_time_multiplier(hours_until_event)
     volume_mult = get_volume_multiplier(open_interest)
@@ -2811,6 +2823,13 @@ def place_orders_from_df(df_results: pd.DataFrame):
         use_bq=(bq_client_ref is not None),
         lookback_days=30,
     )
+
+    # [v4.7] Safety guard: if fills API failed (empty ledger), force safe mode
+    # Without the ledger, the bot can't enforce caps or trigger pairing
+    if not ledger:
+        print(f"\n  ⚠️⚠️⚠️ LEDGER IS EMPTY — fills API likely failed")
+        print(f"  ⚠️ Forcing SAFE MODE (10% sizing) to prevent blind accumulation")
+        safe_mode = True
 
     required_cols = ["market_ticker", "market_status"]
     for col in required_cols:
