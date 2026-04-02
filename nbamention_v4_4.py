@@ -634,6 +634,7 @@ PAIRING_MODE_NET_AGGRESSIVE = _limits["PAIRING_MODE_NET_AGGRESSIVE"]
 HEDGE_MIN_PRICE_YES = 8         # Normal: 15
 HEDGE_MIN_PRICE_NO = 3          # Normal: 5
 HEDGE_YES_MIN_PRICE = 40        # [v4.6-4] was 25 — every YES fill below 40c loses money
+AGGRESSIVE_HEDGE_YES_MIN_PRICE = 20  # [v4.7] aggressive pairing needs lower floor (BUZZ fair YES ~32c)
 
 MAX_PAIRED_PER_MARKET = _limits["MAX_PAIRED_PER_MARKET"]
 
@@ -647,7 +648,7 @@ SIDE_MULTIPLIERS = {
     "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
     "ANKL": {"yes": 1.0, "no": 2.0},    # keep -- both profitable, +$890 total
-    "BUZZ": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$1,092 (13.4% ROI)
+    "BUZZ": {"yes": 0.0, "no": 1.5},    # keep -- NO is +$1,092 (13.4% ROI)
     "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
     "AIRB": {"yes": 1.5, "no": 0.0},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
     "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
@@ -2327,7 +2328,7 @@ def build_order_objects_for_market(
     if pairing_mode_str == "aggressive_pairing":
         active_min_price_yes = HEDGE_MIN_PRICE_YES
         active_min_price_no = HEDGE_MIN_PRICE_NO
-        active_yes_min_price = HEDGE_YES_MIN_PRICE
+        active_yes_min_price = AGGRESSIVE_HEDGE_YES_MIN_PRICE  # [v4.7] 20c, not 40c
         print(f"    🔄 Price floors RELAXED (aggressive): YES>={active_min_price_yes}c NO>={active_min_price_no}c YES_MIN={active_yes_min_price}c")
     elif pairing_mode_str == "pairing":
         active_min_price_yes = HEDGE_MIN_PRICE_YES
