@@ -385,7 +385,7 @@ TOP_NO_MARKETS = {"SCHE", "DRAF", "NIL"}
 # NO offsets start at 0 (bid AT fair value on first level).
 # To disable: set to empty set  →  AGGRESSIVE_MARKET_PRICING = set()
 # =====================================================================
-AGGRESSIVE_MARKET_PRICING = {"SCHE", "DRAF", "NIL"}   # ← toggle here
+# AGGRESSIVE_MARKET_PRICING = {"SCHE", "DRAF", "NIL"}   # ← toggle here
 TIER2_MAX_NET = 100
 POSITION_MODERATE_THRESHOLD = 125
 POSITION_STOP_THRESHOLD = 250
