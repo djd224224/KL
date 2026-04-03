@@ -609,14 +609,10 @@ MAX_PAIRED_PER_MARKET = _limits["MAX_PAIRED_PER_MARKET"]
 # In DISCOVERY_MODE, unknown codes trade at DISCOVERY_SIDE_MULT on both sides.
 # Set a code to 0.0/0.0 to block it after seeing bad results.
 SIDE_MULTIPLIERS = {
-    # === INITIAL MLB CODES — add as you observe them ===
-    # Format: "CODE": {"yes": mult, "no": mult}
-    # Example after ~100 settlements:
-    #   "HOMER": {"yes": 0.0, "no": 1.5},
-    #   "STEAL": {"yes": 1.0, "no": 0.0},
-    # 
-    # Blocked codes (add here as you identify losers):
-    # "BADCODE": {"yes": 0.0, "no": 0.0},
+    # === MLB CODES — tuned from settlement data ===
+    "GRAN": {"yes": 0.0, "no": 0.0},   # [v1.2] blocked both sides
+    "EXTR": {"yes": 1.0, "no": 0.0},   # [v1.2] block NO
+    "OHTA": {"yes": 0.0, "no": 1.0},   # [v1.2] block YES
 }
 
 # =====================================================================
@@ -668,7 +664,14 @@ NO_MAX_YES_PRICE = 80       # [v1.1] was 88 — NO fills at implied YES >85c are
 NO_MIN_YES_PRICE = 15
 YES_PROBABILITY_FLOOR = 30
 
-MAX_PRICE_OVERRIDES = {}
+MAX_PRICE_OVERRIDES = {
+    "PITC": 60,   # [v1.2] cap NO bids
+    "WILD": 65,   # [v1.2] cap NO bids
+}
+# [v1.2] Per-market YES MAX_PRICE overrides
+YES_MAX_PRICE_OVERRIDES = {
+    "ERRO": 65,   # [v1.2] cap YES bids
+}
 
 NO_SWEET_SPOT_MIN = 35
 NO_SWEET_SPOT_MAX = 65
@@ -684,7 +687,7 @@ NUM_YES_OFFSET_LEVELS = 7   # [v1.1] YES gets more levels (edge is real at 45-60
 NUM_NO_OFFSET_LEVELS = 5    # [v1.1] NO gets fewer levels (adversely selected everywhere)
 
 def generate_base_contracts(num_levels: int) -> List[int]:
-    return [3] * num_levels  # 3 contract per level
+    return [5] * num_levels  # [v1.2] was 3 — raised after initial data collection
 
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_YES_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_NO_OFFSET_LEVELS)
@@ -2311,7 +2314,9 @@ def build_order_objects_for_market(
     # YES limit orders
     # ==========================================================
     yes_prices_to_place = []
-    max_yes_price_allowed = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else MAX_PRICE
+    # [v1.2] Per-market YES MAX_PRICE override
+    yes_market_max_price = YES_MAX_PRICE_OVERRIDES.get(ticker_part_3_market_code, MAX_PRICE)
+    max_yes_price_allowed = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else yes_market_max_price
     yes_contracts_placed = 0
 
     if yes_total_mult > 0:
@@ -2323,7 +2328,7 @@ def build_order_objects_for_market(
 
             if bid_price > max_yes_price_allowed:
                 continue
-            if bid_price < active_min_price_yes or bid_price > MAX_PRICE:
+            if bid_price < active_min_price_yes or bid_price > yes_market_max_price:
                 continue
             if bid_price < active_yes_min_price:
                 continue
