@@ -426,7 +426,7 @@ SIDE_MULTIPLIERS = {
     "NIL":  {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: 0/7 all-time. No: +$382/+25%/+15.3pp. Block Yes.
     "DRAF": {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: -$293/-65%/-21.9pp. No: +$752/+92%/+17pp. Block Yes.
     "MARC": {"yes": 0.0, "no": 1.5},   # [v4.5] Yes: 0/6 all-time. No: +$205/+12%/+6.4pp. Block Yes.
-    "ELBO": {"yes": 0.2, "no": 1.8},   # [v4.5] Yes deteriorated: -$77/-26% in 7d. Reduced from 0.5.
+    "ELBO": {"yes": 0.2, "no": 1.0},   # [v4.5] Yes deteriorated: -$77/-26% in 7d. Reduced from 0.5.
     "DOUB": {"yes": 0.1, "no": 1.2},   # [v4.5] 7d No: +$174/+81%/+42pp. Tournament regime. Promoted.
 
     # --- YES-FAVORED: Flipped from directional analysis ---
