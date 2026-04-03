@@ -419,7 +419,7 @@ MAX_PAIRED_PER_MARKET = 250
 SIDE_MULTIPLIERS = {
     # --- BLOCKED: proven losers or catastrophic variance ---
     "WALK": {"yes": 0.0, "no": 0.0},   # [v4.5] 5/6 WR but -$54/-45% ROI. 1 loss at 75¢ wipes 3 wins.
-    "BUZZ": {"yes": 0.1, "no": 0.0},   # [v4.5] No: -$113/-55%/-16pp edge (5/17). Worst edge in dataset.
+    "BUZZ": {"yes": 0.0, "no": 0.0},   # [v4.5b] Blocked both sides
 
     # --- TIER 1: Strong No edge, block Yes ---
     "SCHE": {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: -$204/-49%/-11.7pp. No: +$649/+67%/+23.3pp. Block Yes.
@@ -437,8 +437,8 @@ SIDE_MULTIPLIERS = {
     "TRAN": {"yes": 1.0, "no": 0.1},   # [v4.5] 7d Yes: 5/5, +$60/+55%. Tournament-driven. Boost Yes.
 
     # --- REDUCED/CONSERVATIVE ---
-    "AIRB": {"yes": 0.1, "no": 1.0},   # [v4.5] Yes: -$65/-26% AT, -$57/-32% 7d. Reduced from 0.4.
-    "OVER": {"yes": 0.1, "no": 0.5},   # [v4.5] No edge real but inconsistent. Yes: -$59/-39% 7d.
+    "AIRB": {"yes": 0.0, "no": 0.0},   # [v4.5b] Blocked both sides
+    "OVER": {"yes": 0.0, "no": 0.0},   # [v4.5b] Blocked both sides
     "RECR": {"yes": 0.2, "no": 0.3},   # Neither side has clear edge. Keep minimal.
     "ALLE": {"yes": 0.1, "no": 0.5},   # [v4.5] No edge +6.3pp but ROI flat. Yes 0/4 in 7d. Conservative.
 }
@@ -714,9 +714,18 @@ def get_game_start_ts(team_1, team_2, event_date_str):
 MIN_PRICE_YES = 20
 MIN_PRICE_NO = 15
 MAX_PRICE = 75
-# [v4.5] Per-market NO MAX_PRICE overrides (same pattern as NBA)
+# [v4.5] Per-market NO MAX_PRICE overrides
 MAX_PRICE_OVERRIDES = {
-    "NIL": 80,   # [v4.5] fair NO ~82c, default 75 blocks profitable fills
+    "NIL": 80,    # [v4.5] fair NO ~82c, default 75 blocks profitable fills
+    "ELBO": 45,   # [v4.5b] cap NO bids
+    "RECR": 45,   # [v4.5b] cap NO bids
+    "ANKL": 40,   # [v4.5b] cap NO bids
+}
+# [v4.5b] Per-market YES MAX_PRICE overrides
+YES_MAX_PRICE_OVERRIDES = {
+    "RECR": 60,   # [v4.5b] cap YES bids
+    "RECO": 60,   # [v4.5b] cap YES bids
+    "ANKL": 55,   # [v4.5b] cap YES bids
 }
 YES_MIN_PRICE = 20
 NO_MAX_YES_PRICE = 80
@@ -1697,14 +1706,16 @@ def build_order_objects_for_market(market_row, existing_positions, event_net_exp
     orders = []
 
     # === YES LIMIT ORDERS ===
-    max_yes_price = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else MAX_PRICE
+    # [v4.5b] Per-market YES MAX_PRICE override
+    yes_market_max_price = YES_MAX_PRICE_OVERRIDES.get(ticker_part_3_market_code, MAX_PRICE)
+    max_yes_price = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else yes_market_max_price
     yes_placed = 0
     no_placed = 0
     if yes_total_mult > 0:
         for i, offset in enumerate(yes_offsets):
             if i >= len(BASE_YES_CONTRACTS): break
             bid = yes_fair - offset
-            if bid > max_yes_price or bid < act_min_yes or bid > MAX_PRICE or bid < act_yes_min: continue
+            if bid > max_yes_price or bid < act_min_yes or bid > yes_market_max_price or bid < act_yes_min: continue
             standalone_ev = p_hat - (bid / 100.0)
             hedge_ev, is_pairing = calculate_hedge_ev("yes", bid, ledger_data)
             effective_ev = max(standalone_ev, hedge_ev) if is_pairing else standalone_ev
