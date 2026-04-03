@@ -644,13 +644,13 @@ MAX_PAIRED_PER_MARKET = _limits["MAX_PAIRED_PER_MARKET"]
 SIDE_MULTIPLIERS = {
     # === v4.5 SIDE MULTIPLIER UPDATE (Mar 18 2026) ===
     # Based on 1,149 settlements from Feb 19 - Mar 17
-    "JORD": {"yes": 1.0, "no": 0.0},    # v4.4 was yes:0.3 -- YES is +$248 (9.7% ROI), boosted
+    "JORD": {"yes": 0.5, "no": 0.0},    # v4.4 was yes:0.3 -- YES is +$248 (9.7% ROI), boosted
     "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
     "ANKL": {"yes": 1.0, "no": 2.0},    # keep -- both profitable, +$890 total
     "BUZZ": {"yes": 0.0, "no": 1.5},    # keep -- NO is +$1,092 (13.4% ROI)
     "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
-    "AIRB": {"yes": 1.5, "no": 0.0},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
+    "AIRB": {"yes": 0.0, "no": 0.0},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
     "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
     "TRIP": {"yes": 0.5, "no": 0.5},    # [v4.7] re-enabled both sides at 0.5x
     "TECH": {"yes": 1.5, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
