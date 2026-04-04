@@ -554,7 +554,7 @@ if len(df_summary_rolling_by_team) > 0:
 
 
 RUN_ID = str(uuid.uuid4())
-MODEL_VERSION = "v4.6"
+MODEL_VERSION = "v4.8"
 PRICING_STRATEGY = 'hybrid'
 
 # ---------- BAYESIAN HYBRID PRICING PARAMETERS ----------
@@ -584,13 +584,13 @@ def fetch_bankroll(client) -> Tuple[float, int, int]:
 def get_scaled_limits(bankroll: float) -> dict:
     scale = max(0.5, min(bankroll / 5000, 2.0))
     return {
-        "MAX_NET_PER_MARKET": int(200 * scale),
+        "MAX_NET_PER_MARKET": int(150 * scale),           # [v4.8] was 200
         "POSITION_MODERATE_THRESHOLD": int(67 * scale),
-        "POSITION_STOP_THRESHOLD": int(200 * scale),
+        "POSITION_STOP_THRESHOLD": int(150 * scale),      # [v4.8] was 200
         "MAX_NET_PER_EVENT": int(1000 * scale),
         "MAX_PAIRED_PER_MARKET": int(350 * scale),
-        "PAIRING_MODE_NET_FLOOR": int(80 * scale),
-        "PAIRING_MODE_NET_AGGRESSIVE": int(150 * scale),
+        "PAIRING_MODE_NET_FLOOR": int(60 * scale),        # [v4.8] was 80
+        "PAIRING_MODE_NET_AGGRESSIVE": int(113 * scale),   # [v4.8] was 150
         "scale": scale,
     }
 
@@ -647,7 +647,7 @@ SIDE_MULTIPLIERS = {
     "JORD": {"yes": 0.3, "no": 0.0},    # v4.4 was yes:0.3 -- YES is +$248 (9.7% ROI), boosted
     "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
-    "ANKL": {"yes": 1.0, "no": 2.0},    # keep -- both profitable, +$890 total
+    "ANKL": {"yes": 1.0, "no": 2.5},    # [v4.8] NO raised 2.0→2.5 — NO +$1185 (+23.1%)
     "BUZZ": {"yes": 0.0, "no": 1.3},    # keep -- NO is +$1,092 (13.4% ROI)
     "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
     "AIRB": {"yes": 0.3, "no": 0.3},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
@@ -657,9 +657,9 @@ SIDE_MULTIPLIERS = {
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "INJU": {"yes": 0.5, "no": 0.0},    # keep -- marginal +$3
-    "DRAF": {"yes": 1.5, "no": 2.0},    # keep -- both profitable, +$410 total
+    "DRAF": {"yes": 0.5, "no": 2.0},    # [v4.8] YES 1.5→0.5 — YES only +$14 (+1.7%), NO +$683 (+20.3%)
     "CROW": {"yes": 0.0, "no": 1.3},    # keep -- NO +$24 (50% ROI)
-    "ROOK": {"yes": 0.0, "no": 1.5},    # keep -- NO +$80 (199% ROI)
+    "ROOK": {"yes": 0.0, "no": 0.5},    # [v4.8] NO 1.5→0.5 — NO is -$6 (-4.6%)
     "PLAY": {"yes": 1.3, "no": 0.0},    # keep -- YES +$54 (28% ROI)
     # === ONE-OFF MARKETS: block consistently unprofitable codes ===
     "BALL": {"yes": 0.0, "no": 0.0},    # -$142 P&L, -84% ROI
@@ -685,19 +685,22 @@ SIDE_MULTIPLIERS = {
 # =====================================================================
 TEAM_MULTIPLIERS = {
     # Boost profitable teams
-    "GSW": 1.4,   # +$924 P&L, 20.6% ROI
-    "LAL": 1.3,   # +$740 P&L, 11.5% ROI
-    "BOS": 1.3,   # +$177 P&L, 2.9% ROI (reduced edge, monitor)
-    "DEN": 1.2,   # +$1,318 P&L, 21.3% ROI -- top performer this period
-    "MIN": 1.2,   # +$287 P&L, 6.3% ROI
-    "LAC": 1.1,   # +$239 P&L, 4.7% ROI
+    "DEN": 1.4,   # [v4.8] raised 1.2→1.4 — +$1,397 P&L, +17.6% ROI
+    "GSW": 1.4,   # +$740 P&L, +11.4% ROI
+    "LAL": 1.3,   # +$1,322 P&L, +15.8% ROI
+    "DET": 1.2,   # [v4.8] NEW — +$686 P&L, +12.9% ROI
+    "PHX": 1.2,   # [v4.8] NEW — +$487 P&L, +20.0% ROI
+    "LAC": 1.1,   # +$322 P&L, +5.9% ROI
     # Penalize consistently unprofitable teams
-    "WAS": 0.3,   # -$715 P&L, -95.2% ROI -- catastrophic
-    "HOU": 0.7,   # [v4.6] relaxed 0.5→0.7 — profitable (+$113) on surviving markets
-    "MIA": 0.5,   # -$241 P&L, -27.4% ROI
-    "ORL": 0.8,   # [v4.6] relaxed 0.6→0.8 — profitable (+$127) on surviving markets
-    "CLE": 0.7,   # -$480 P&L, -9.3% ROI
-    "SAS": 0.7,   # -$409 P&L, -6.5% ROI
+    "WAS": 0.3,   # -$715 P&L, -95.2% ROI
+    "MIA": 0.5,   # -$749 P&L, -38.0% ROI
+    "CHI": 0.5,   # [v4.8] NEW — -$235 P&L, -26.5% ROI
+    "SAS": 0.5,   # [v4.8] was 0.7 — -$893 P&L, -11.9% ROI
+    "ORL": 0.5,   # [v4.8] was 0.8 — -$521 P&L, -11.9% ROI
+    "CLE": 0.7,   # -$545 P&L, -9.8% ROI
+    "NYK": 0.7,   # [v4.8] NEW — -$393 P&L, -5.7% ROI
+    "HOU": 0.7,   # -$20 P&L, -0.3% ROI
+    "OKC": 0.8,   # [v4.8] NEW — -$276 P&L, -3.6% ROI
 }
 
 # [v4.5] Top-performing NO markets get tighter offsets
@@ -764,8 +767,8 @@ MAX_CONTRACTS_PER_LEVEL = 50            # [v4.7] Hard cap on contracts per price
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
 TIME_MULTIPLIERS = [
-    (1, 1.5),     # [v4.6] was 1.8 — cap reduces exposure to bad game-time snapshots
-    (3, 1.5),
+    (1, 1.3),     # [v4.8] was 1.5
+    (3, 1.3),     # [v4.8] was 1.5
     (6, 0.7),
     (12, 1.1),
     (24, 1.0),
@@ -849,7 +852,7 @@ except Exception as e:
     raise
 
 print(f"\n{'='*70}")
-print(f"CONFIGURATION — v4.6")
+print(f"CONFIGURATION — v4.8")
 print(f"{'='*70}")
 print(f"Run ID: {RUN_ID}")
 print(f"Model version: {MODEL_VERSION}")
