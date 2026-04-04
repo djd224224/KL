@@ -613,6 +613,7 @@ SIDE_MULTIPLIERS = {
     "GRAN": {"yes": 0.0, "no": 0.0},   # [v1.2] blocked both sides
     "EXTR": {"yes": 1.0, "no": 0.0},   # [v1.2] block NO
     "OHTA": {"yes": 0.0, "no": 1.0},   # [v1.2] block YES
+    "ERRO": {"yes": 1.5, "no": 1.5},   # [v1.3] boost both sides
 }
 
 # =====================================================================
@@ -2012,6 +2013,10 @@ def build_order_objects_for_market(
         open_interest = 0
     if volume is None:
         volume = 0
+
+    if volume == 0:
+        print(f"    ✗ Zero volume — skipping")
+        return []
 
     # Ledger-aware position multipliers
     yes_side_mult_floor = 0.0
