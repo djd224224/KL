@@ -648,7 +648,7 @@ SIDE_MULTIPLIERS = {
     "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
     "ANKL": {"yes": 1.0, "no": 2.0},    # keep -- both profitable, +$890 total
-    "BUZZ": {"yes": 0.0, "no": 1.5},    # keep -- NO is +$1,092 (13.4% ROI)
+    "BUZZ": {"yes": 0.0, "no": 1.3},    # keep -- NO is +$1,092 (13.4% ROI)
     "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
     "AIRB": {"yes": 0.3, "no": 0.3},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
     "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
@@ -731,7 +731,7 @@ YES_PROBABILITY_FLOOR = 30      # [v4.7] lowered from 40
 # RETI: 20% YES rate → fair NO ≈ 80c. MAX_PRICE=75 blocks 65% of games.
 # RETI is +$619 at 40% ROI, 46% Kelly — the most underweighted market.
 MAX_PRICE_OVERRIDES = {
-    "RETI": 84,  # [v4.7] was 90 — capped at 84¢ per manual review
+    "RETI": 83,  # [v4.7] was 90 — capped at 84¢ per manual review
     "BUZZ": 70,  # [v4.7] max NO bid 70¢
     "TRIP": 55,  # [v4.7] max NO bid 70¢
 }
@@ -739,6 +739,7 @@ MAX_PRICE_OVERRIDES = {
 # [v4.7] Per-market YES MAX_PRICE overrides
 YES_MAX_PRICE_OVERRIDES = {
     "TECH": 70,  # [v4.7] max YES bid 70¢
+    "DRAF": 65
 }
 
 NO_SWEET_SPOT_MIN = 35
