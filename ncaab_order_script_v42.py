@@ -422,12 +422,12 @@ SIDE_MULTIPLIERS = {
     "BUZZ": {"yes": 0.0, "no": 0.0},   # [v4.5b] Blocked both sides
 
     # --- TIER 1: Strong No edge, block Yes ---
-    "SCHE": {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: -$204/-49%/-11.7pp. No: +$649/+67%/+23.3pp. Block Yes.
+    "SCHE": {"yes": 0.0, "no": 2.5},   # [v4.5] Yes: -$204/-49%/-11.7pp. No: +$649/+67%/+23.3pp. Block Yes.
     "NIL":  {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: 0/7 all-time. No: +$382/+25%/+15.3pp. Block Yes.
-    "DRAF": {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: -$293/-65%/-21.9pp. No: +$752/+92%/+17pp. Block Yes.
+    "DRAF": {"yes": 0.0, "no": 2.5},   # [v4.5] Yes: -$293/-65%/-21.9pp. No: +$752/+92%/+17pp. Block Yes.
     "MARC": {"yes": 0.0, "no": 1.5},   # [v4.5] Yes: 0/6 all-time. No: +$205/+12%/+6.4pp. Block Yes.
-    "ELBO": {"yes": 0.2, "no": 1.0},   # [v4.5] Yes deteriorated: -$77/-26% in 7d. Reduced from 0.5.
-    "DOUB": {"yes": 0.1, "no": 1.2},   # [v4.5] 7d No: +$174/+81%/+42pp. Tournament regime. Promoted.
+    "ELBO": {"yes": 0.2, "no": 0.5},   # [v4.5] Yes deteriorated: -$77/-26% in 7d. Reduced from 0.5.
+    "DOUB": {"yes": 0.0, "no": 0.0},   # [v4.5] 7d No: +$174/+81%/+42pp. Tournament regime. Promoted.
 
     # --- YES-FAVORED: Flipped from directional analysis ---
     "ANKL": {"yes": 1.2, "no": 0.1},   # [v4.5] Yes: +$177/+102%/+24.7pp. No: -$242/-30%/-5.2pp. Flipped.
@@ -437,7 +437,7 @@ SIDE_MULTIPLIERS = {
     "TRAN": {"yes": 1.0, "no": 0.1},   # [v4.5] 7d Yes: 5/5, +$60/+55%. Tournament-driven. Boost Yes.
 
     # --- REDUCED/CONSERVATIVE ---
-    "AIRB": {"yes": 0.0, "no": 0.0},   # [v4.5b] Blocked both sides
+    "AIRB": {"yes": 0.3, "no": 0.3},   # [v4.5b] Blocked both sides
     "OVER": {"yes": 0.0, "no": 0.0},   # [v4.5b] Blocked both sides
     "RECR": {"yes": 0.2, "no": 0.3},   # Neither side has clear edge. Keep minimal.
     "ALLE": {"yes": 0.1, "no": 0.5},   # [v4.5] No edge +6.3pp but ROI flat. Yes 0/4 in 7d. Conservative.
