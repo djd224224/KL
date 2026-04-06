@@ -1372,7 +1372,7 @@ def get_market_details(market_ticker, team_1=None, team_2=None, event_date=None)
 
         expiration_ts = None
         if game_start_ts:
-            if time_source == "odds_api":
+            if time_source in ("odds_api", "manual_override"):
                 expiration_ts = game_start_ts - ODDS_API_EXPIRATION_BUFFER_SEC
             else:
                 expiration_ts = game_start_ts - (EXPIRATION_HOURS_BEFORE_CLOSE * 3600)
