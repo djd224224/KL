@@ -776,7 +776,7 @@ combined_table
 increment = 2
 increment1 = 5
 price_count = list(range(0, 8))
-starting_contracts = 8
+starting_contracts = 10
 
 max_contracts = 500
 max_contracts1 = 500
