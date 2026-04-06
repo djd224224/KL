@@ -672,8 +672,29 @@ def fetch_ncaab_schedule():
         print(f"  ⚠️ Falling back to ticker-estimated game times (~7pm ET)")
 
 
+# =====================================================================
+# MANUAL GAME START OVERRIDES — DELETE THIS BLOCK WHEN NO LONGER NEEDED
+# =====================================================================
+# Format: (team_1, team_2) → unix timestamp
+# MARMAD = Michigan vs UConn, 8:50pm EDT Apr 6 2026
+MANUAL_GAME_START_OVERRIDES = {
+    ("MAR", "MAD"): int(datetime(2026, 4, 7, 0, 50, tzinfo=UTC).timestamp()),
+}
+# =====================================================================
+# END MANUAL OVERRIDES
+# =====================================================================
+
+
 def get_game_start_ts(team_1, team_2, event_date_str):
     """Look up game start time from Odds API schedule cache."""
+    # Check manual overrides first
+    manual_key = (team_1.upper(), team_2.upper()) if team_1 and team_2 else None
+    manual_key_rev = (team_2.upper(), team_1.upper()) if team_1 and team_2 else None
+    if manual_key and manual_key in MANUAL_GAME_START_OVERRIDES:
+        return MANUAL_GAME_START_OVERRIDES[manual_key], "manual_override"
+    if manual_key_rev and manual_key_rev in MANUAL_GAME_START_OVERRIDES:
+        return MANUAL_GAME_START_OVERRIDES[manual_key_rev], "manual_override"
+
     if not ncaab_schedule_cache and not ncaab_schedule_events:
         return None, "ticker_estimate"
     if not team_1 or not team_2 or not event_date_str:
