@@ -375,7 +375,7 @@ BAYESIAN_HISTORICAL_WEIGHT = 0.30
 # =========================
 MAX_NET_PER_MARKET = 250
 # [v4.5] DOUB added to Tier 1 — tournament regime shift (+$174/+81%/+42pp in 7d)
-TIER1_MARKETS = {"SCHE", "ELBO", "DRAF", "MARC", "NIL", "DOUB"}
+TIER1_MARKETS = {"SCHE", "DRAF", "MARC", "NIL"}
 # [v4.5] Top NO markets get tightest offsets (1¢ increments) — most profitable NO codes
 TOP_NO_MARKETS = {"SCHE", "DRAF", "NIL"}
 
@@ -392,7 +392,7 @@ POSITION_MODERATE_THRESHOLD = 125
 POSITION_STOP_THRESHOLD = 250
 MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
-MAX_NET_PER_EVENT = 800
+MAX_NET_PER_EVENT = 1000
 MAX_ORDERS_PER_EVENT = 2000
 
 MIN_SPREAD_BOTH_SIDES = 0
@@ -426,7 +426,7 @@ SIDE_MULTIPLIERS = {
     "NIL":  {"yes": 0.0, "no": 2.0},   # [v4.5] Yes: 0/7 all-time. No: +$382/+25%/+15.3pp. Block Yes.
     "DRAF": {"yes": 0.0, "no": 2.5},   # [v4.5] Yes: -$293/-65%/-21.9pp. No: +$752/+92%/+17pp. Block Yes.
     "MARC": {"yes": 0.0, "no": 1.5},   # [v4.5] Yes: 0/6 all-time. No: +$205/+12%/+6.4pp. Block Yes.
-    "ELBO": {"yes": 0.2, "no": 0.5},   # [v4.5] Yes deteriorated: -$77/-26% in 7d. Reduced from 0.5.
+    "ELBO": {"yes": 0.2, "no": 0.2},   # [v4.5] Yes deteriorated: -$77/-26% in 7d. Reduced from 0.5.
     "DOUB": {"yes": 0.0, "no": 0.0},   # [v4.5] 7d No: +$174/+81%/+42pp. Tournament regime. Promoted.
 
     # --- YES-FAVORED: Flipped from directional analysis ---
