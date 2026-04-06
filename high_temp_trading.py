@@ -778,8 +778,8 @@ increment1 = 5
 price_count = list(range(0, 8))
 starting_contracts = 10
 
-max_contracts = 500
-max_contracts1 = 500
+max_contracts = 200
+max_contracts1 = 200
 market_cutoff_probability = .2
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
