@@ -675,10 +675,10 @@ def fetch_ncaab_schedule():
 # =====================================================================
 # MANUAL GAME START OVERRIDES — DELETE THIS BLOCK WHEN NO LONGER NEEDED
 # =====================================================================
-# Format: (team_1, team_2) → unix timestamp
+# Keyed by event_code (2nd segment of ticker, e.g. "MARMAD" from KXNCAABMENTION-MARMAD-SCHE)
 # MARMAD = Michigan vs UConn, 8:50pm EDT Apr 6 2026
 MANUAL_GAME_START_OVERRIDES = {
-    ("MAR", "MAD"): int(datetime(2026, 4, 7, 0, 50, tzinfo=UTC).timestamp()),
+    "MARMAD": int(datetime(2026, 4, 7, 0, 50, tzinfo=UTC).timestamp()),
 }
 # =====================================================================
 # END MANUAL OVERRIDES
@@ -687,14 +687,6 @@ MANUAL_GAME_START_OVERRIDES = {
 
 def get_game_start_ts(team_1, team_2, event_date_str):
     """Look up game start time from Odds API schedule cache."""
-    # Check manual overrides first
-    manual_key = (team_1.upper(), team_2.upper()) if team_1 and team_2 else None
-    manual_key_rev = (team_2.upper(), team_1.upper()) if team_1 and team_2 else None
-    if manual_key and manual_key in MANUAL_GAME_START_OVERRIDES:
-        return MANUAL_GAME_START_OVERRIDES[manual_key], "manual_override"
-    if manual_key_rev and manual_key_rev in MANUAL_GAME_START_OVERRIDES:
-        return MANUAL_GAME_START_OVERRIDES[manual_key_rev], "manual_override"
-
     if not ncaab_schedule_cache and not ncaab_schedule_events:
         return None, "ticker_estimate"
     if not team_1 or not team_2 or not event_date_str:
@@ -1361,7 +1353,13 @@ def get_market_details(market_ticker, team_1=None, team_2=None, event_date=None)
         if vol is None:
             vol = 0
 
-        game_start_ts, time_source = get_game_start_ts(team_1, team_2, event_date)
+        # Check manual game start overrides first (keyed by event_code)
+        event_code = market_ticker.split("-")[1] if len(market_ticker.split("-")) > 1 else ""
+        if event_code in MANUAL_GAME_START_OVERRIDES:
+            game_start_ts = MANUAL_GAME_START_OVERRIDES[event_code]
+            time_source = "manual_override"
+        else:
+            game_start_ts, time_source = get_game_start_ts(team_1, team_2, event_date)
 
         if game_start_ts is None:
             game_start_ts = estimate_game_start_from_ticker(event_date)
