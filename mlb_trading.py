@@ -19,6 +19,9 @@ from cryptography.hazmat.backends import default_backend
 import os
 import uuid
 from datetime import datetime, UTC, timedelta
+from zoneinfo import ZoneInfo
+
+ET_TZ = ZoneInfo("America/New_York")
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from google.cloud import bigquery
@@ -1431,27 +1434,23 @@ def fetch_mlb_schedule() -> Dict[str, int]:
                 except:
                     continue
                 
-                # Build key: date + sorted team codes (order-independent)
-                game_date_key = dt.strftime('%Y%m%d')
+                # Build key using ET date (matches Kalshi ticker date convention).
+                # CRITICAL: only store under the single ET-date key — no UTC date,
+                # no prev/next day fallback. Otherwise back-to-back series against
+                # the same opponent collide (Game 1 and Game 2 are 1 day apart and
+                # would both match either ticker).
+                game_date_key = dt.astimezone(ET_TZ).strftime('%Y%m%d')
                 teams_sorted = sorted([away_code, home_code])
                 key = f"{game_date_key}-{teams_sorted[0]}-{teams_sorted[1]}"
                 schedule[key] = game_ts
                 
-                # Also store by previous day (games after midnight UTC)
-                prev_date_key = (dt - timedelta(days=1)).strftime('%Y%m%d')
-                key_prev = f"{prev_date_key}-{teams_sorted[0]}-{teams_sorted[1]}"
-                if key_prev not in schedule:
-                    schedule[key_prev] = game_ts
-                
                 # Also store with the original MLB API abbreviations as fallback
+                # (still scoped to the same single ET date).
                 if away_code != away_abbr or home_code != home_abbr:
                     orig_sorted = sorted([away_abbr, home_abbr])
                     orig_key = f"{game_date_key}-{orig_sorted[0]}-{orig_sorted[1]}"
                     if orig_key not in schedule:
                         schedule[orig_key] = game_ts
-                    orig_key_prev = f"{prev_date_key}-{orig_sorted[0]}-{orig_sorted[1]}"
-                    if orig_key_prev not in schedule:
-                        schedule[orig_key_prev] = game_ts
                 
                 total_games += 1
         
@@ -1480,7 +1479,8 @@ def lookup_game_start(market_ticker: str, schedule: Dict[str, int]) -> Optional[
     Uses parse_event_code() to correctly handle HHMM and 2-3 char teams.
     Ticker: KXMLBMENTION-26MAR252005NYYSF-JETE
     → date=2026-03-25, time=2005 ET, teams=NYY+SF
-    → try keys: "20260325-NYY-SF", "20260326-NYY-SF", mapped variants
+    → only matches games on 2026-03-25 ET (no adjacent-day fallback,
+      so back-to-back series against the same opponent don't collide).
     """
     if not schedule:
         return None
@@ -1503,21 +1503,14 @@ def lookup_game_start(market_ticker: str, schedule: Dict[str, int]) -> Optional[
         if key in schedule:
             return schedule[key]
         
-        # Try next day (evening ET games have UTC date = next day)
-        next_date_key = (game_date + timedelta(days=1)).strftime('%Y%m%d')
-        key_next = f"{next_date_key}-{teams_sorted[0]}-{teams_sorted[1]}"
-        if key_next in schedule:
-            return schedule[key_next]
-        
-        # Try with MLB_TEAM_CODE_MAP (Kalshi→MLB API) and reverse
+        # Try with MLB_TEAM_CODE_MAP (Kalshi→MLB API) and reverse — same date only
         mapped_1 = MLB_TEAM_CODE_MAP.get(team_1, MLB_TEAM_CODE_MAP_REVERSE.get(team_1, team_1))
         mapped_2 = MLB_TEAM_CODE_MAP.get(team_2, MLB_TEAM_CODE_MAP_REVERSE.get(team_2, team_2))
         if mapped_1 != team_1 or mapped_2 != team_2:
             mapped_sorted = sorted([mapped_1, mapped_2])
-            for dk in (date_key, next_date_key):
-                mapped_key = f"{dk}-{mapped_sorted[0]}-{mapped_sorted[1]}"
-                if mapped_key in schedule:
-                    return schedule[mapped_key]
+            mapped_key = f"{date_key}-{mapped_sorted[0]}-{mapped_sorted[1]}"
+            if mapped_key in schedule:
+                return schedule[mapped_key]
         
         return None
     except:
