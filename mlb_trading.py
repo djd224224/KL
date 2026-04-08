@@ -617,6 +617,8 @@ SIDE_MULTIPLIERS = {
     "EXTR": {"yes": 1.0, "no": 0.0},   # [v1.2] block NO
     "OHTA": {"yes": 0.0, "no": 1.0},   # [v1.2] block YES
     "ERRO": {"yes": 1.5, "no": 1.5},   # [v1.3] boost both sides
+    "PITC": {"yes": 0.0, "no": 1.5},   # [v1.3] boost both sides
+    "WILD": {"yes": 1.5, "no": 1.5},   # [v1.3] boost both sides
 }
 
 # =====================================================================
