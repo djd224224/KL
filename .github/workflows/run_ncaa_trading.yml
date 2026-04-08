@@ -1,8 +1,8 @@
 name: NCAABMENTION v4.4-NCAAB Trading Bot
 # [v4.4] Runs hourly
 on:
-  schedule:
-    - cron: '5 * * * *'
+  # schedule:
+  #   - cron: '5 * * * *'
   workflow_dispatch:  # Manual trigger
 jobs:
   run-trading-script:
