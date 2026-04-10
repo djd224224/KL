@@ -916,12 +916,18 @@ for index, row in combined_table.iterrows():
                       'expiration_ts':exp_ts,
                       'post_only': True}
     try:
-      exchange_client.create_order(**order_params)
+      _create_resp = exchange_client.create_order(**order_params)
+      # Extract Kalshi's exchange-assigned order_id (needed for fills lineage)
+      _kalshi_oid = ''
+      if isinstance(_create_resp, dict):
+          _kalshi_oid = (_create_resp.get('order') or {}).get('order_id', '') or ''
       time.sleep(0.1)  # Rate limit protection
       all_order_records.append({
           'city': row['City'], 'forecast_date': row['Forecast Date'], 'run_date': row['Run Date'],
           'market_ticker': row['market_ticker'], 'contracts': contracts, 'no_price': int(bid_price),
-          'city_abv': abv, 'client_order_id': client_oid, 'expiration_ts': exp_ts,
+          'city_abv': abv, 'client_order_id': client_oid,
+          'kalshi_order_id': _kalshi_oid,
+          'expiration_ts': exp_ts,
           'created_at': central_time.strftime('%Y-%m-%d %H:%M:%S'),
       })
       row['resting_order_count'] = row['resting_order_count'] + contracts
