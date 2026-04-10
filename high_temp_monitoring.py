@@ -202,6 +202,7 @@ def load_orders_from_bigquery() -> pd.DataFrame:
         SELECT * FROM (
             SELECT
                 client_order_id,
+                kalshi_order_id,
                 market_ticker,
                 city,
                 city_abv,
@@ -223,8 +224,28 @@ def load_orders_from_bigquery() -> pd.DataFrame:
         print(f"Loaded {len(df)} deduplicated orders from BigQuery")
         return df
     except Exception as e:
-        print(f"Could not load orders from BigQuery: {e}")
-        return pd.DataFrame()
+        print(f"Could not load orders with kalshi_order_id (column may not exist yet): {e}")
+        # Fallback: load without kalshi_order_id column — lineage won't work for old rows
+        fallback_query = f"""
+            SELECT * FROM (
+                SELECT
+                    client_order_id, market_ticker, city, city_abv,
+                    no_price, contracts, forecast_date, run_date,
+                    expiration_ts, created_at,
+                    ROW_NUMBER() OVER (PARTITION BY client_order_id ORDER BY created_at DESC) AS rn
+                FROM `{table_id}`
+                WHERE client_order_id IS NOT NULL
+            )
+            WHERE rn = 1
+        """
+        try:
+            df = bq_client.query(fallback_query).to_dataframe()
+            df['kalshi_order_id'] = None
+            print(f"Loaded {len(df)} orders (fallback, no kalshi_order_id)")
+            return df
+        except Exception as e2:
+            print(f"Fallback also failed: {e2}")
+            return pd.DataFrame()
 
 
 # =====================================================================
@@ -308,9 +329,9 @@ def get_all_settlements() -> List[Dict[str, Any]]:
                 if not ticker.startswith(SERIES_TICKER):
                     continue
 
-                # Skip zero-position settlements
-                yes_cost = s.get('yes_total_cost', 0) or 0
-                no_cost = s.get('no_total_cost', 0) or 0
+                # NEW API: *_total_cost_dollars are string dollars
+                yes_cost = float(s.get('yes_total_cost_dollars', 0) or 0)
+                no_cost = float(s.get('no_total_cost_dollars', 0) or 0)
                 if yes_cost <= 0 and no_cost <= 0:
                     continue
 
@@ -319,18 +340,18 @@ def get_all_settlements() -> List[Dict[str, Any]]:
                     continue
                 seen_tickers.add(ticker)
 
-                # Determine result from market_result field
-                result = s.get('market_result', '')
-
+                # NEW API: market_result (stayed), *_count_fp are string fractional contracts
                 settlements.append({
                     'market_ticker': ticker,
-                    'result': result,
-                    'revenue': s.get('revenue', 0),
-                    'yes_total_cost': yes_cost,
-                    'no_total_cost': no_cost,
+                    'result': s.get('market_result', ''),
+                    'revenue': s.get('revenue', 0),  # cents, int
+                    'value': s.get('value', 0),  # cents, int (residual position value)
+                    'yes_total_cost': yes_cost,  # dollars, float
+                    'no_total_cost': no_cost,  # dollars, float
                     'settled_time': s.get('settled_time'),
-                    'yes_count': s.get('yes_count', 0),
-                    'no_count': s.get('no_count', 0),
+                    'yes_count': float(s.get('yes_count_fp', 0) or 0),
+                    'no_count': float(s.get('no_count_fp', 0) or 0),
+                    'fee_cost': float(s.get('fee_cost', 0) or 0),
                 })
 
             cursor = response.get('cursor')
@@ -369,11 +390,24 @@ def build_fills_dataframe(fills: List[Dict[str, Any]], df_orders: pd.DataFrame) 
     elif 'market_ticker' not in df_fills.columns:
         df_fills['market_ticker'] = None
 
-    # Kalshi API uses 'count', we want 'filled_count'
-    if 'count' in df_fills.columns and 'filled_count' not in df_fills.columns:
-        df_fills = df_fills.rename(columns={'count': 'filled_count'})
+    # NEW API: count_fp is fractional contracts as string (e.g. '25.00' or '0.37')
+    if 'count_fp' in df_fills.columns:
+        df_fills['filled_count'] = pd.to_numeric(df_fills['count_fp'], errors='coerce').fillna(0)
+    elif 'count' in df_fills.columns:
+        df_fills['filled_count'] = pd.to_numeric(df_fills['count'], errors='coerce').fillna(0)
     elif 'filled_count' not in df_fills.columns:
         df_fills['filled_count'] = 0
+
+    # NEW API: prices are yes_price_dollars / no_price_dollars as strings in dollars
+    # Convert to cents int for compatibility with existing P&L formulas
+    if 'yes_price_dollars' in df_fills.columns:
+        df_fills['yes_price'] = (
+            pd.to_numeric(df_fills['yes_price_dollars'], errors='coerce') * 100
+        ).round().astype('Int64')
+    if 'no_price_dollars' in df_fills.columns:
+        df_fills['no_price'] = (
+            pd.to_numeric(df_fills['no_price_dollars'], errors='coerce') * 100
+        ).round().astype('Int64')
 
     if 'action' not in df_fills.columns:
         df_fills['action'] = 'buy'
@@ -383,25 +417,31 @@ def build_fills_dataframe(fills: List[Dict[str, Any]], df_orders: pd.DataFrame) 
         df_fills['order_id'] = None
 
     # --- fill_price = the price paid for THAT SIDE ---
-    # Kalshi API returns yes_price for all fills.
-    # YES fill: cost = yes_price. NO fill: cost = 100 - yes_price.
-    df_fills['fill_price'] = df_fills.apply(
-        lambda row: row.get('yes_price') or row.get('no_price') or row.get('price', 0),
-        axis=1
-    )
+    # YES fill: fill_price = yes_price. NO fill: fill_price = no_price.
+    def _calc_fill_price(row):
+        side = row.get('side', '')
+        if side == 'yes':
+            return row.get('yes_price') if pd.notna(row.get('yes_price')) else 0
+        elif side == 'no':
+            return row.get('no_price') if pd.notna(row.get('no_price')) else 0
+        return row.get('price', 0)
+    df_fills['fill_price'] = df_fills.apply(_calc_fill_price, axis=1)
+    df_fills['fill_price'] = pd.to_numeric(df_fills['fill_price'], errors='coerce').fillna(0)
 
     # --- Join with deduplicated orders for strategy metadata ---
-    if len(df_orders) > 0:
-        df_orders['client_order_id'] = df_orders['client_order_id'].astype(str)
+    # fills.order_id (Kalshi exchange ID) ↔ orders.kalshi_order_id
+    if len(df_orders) > 0 and 'kalshi_order_id' in df_orders.columns:
+        df_orders_for_join = df_orders[df_orders['kalshi_order_id'].notna()
+                                         & (df_orders['kalshi_order_id'].astype(str) != '')].copy()
+        df_orders_for_join['kalshi_order_id'] = df_orders_for_join['kalshi_order_id'].astype(str)
         df_fills['order_id'] = df_fills['order_id'].astype(str)
 
-        # Join key: fills.order_id ↔ orders.client_order_id
         df_fills = df_fills.merge(
-            df_orders[[
-                'client_order_id', 'city', 'city_abv', 'no_price',
-                'contracts', 'forecast_date',
+            df_orders_for_join[[
+                'kalshi_order_id', 'client_order_id', 'city', 'city_abv',
+                'no_price', 'contracts', 'forecast_date',
             ]].rename(columns={
-                'client_order_id': 'order_id',
+                'kalshi_order_id': 'order_id',
                 'no_price': 'order_no_price',
                 'contracts': 'order_contracts',
             }),
@@ -413,9 +453,12 @@ def build_fills_dataframe(fills: List[Dict[str, Any]], df_orders: pd.DataFrame) 
         total = len(df_fills)
         pct = matched / total * 100 if total > 0 else 0
         print(f"Matched {matched}/{total} fills to orders ({pct:.1f}%)")
+        if matched == 0 and total > 0:
+            print("  NOTE: 0 matches is expected if no orders have kalshi_order_id yet.")
+            print("  The trading script must write kalshi_order_id before lineage will work.")
     else:
-        print("No orders available for lineage matching")
-        for col in ['city', 'city_abv', 'order_no_price', 'order_contracts', 'forecast_date']:
+        print("No orders available for lineage matching (or kalshi_order_id column missing)")
+        for col in ['city', 'city_abv', 'order_no_price', 'order_contracts', 'forecast_date', 'client_order_id']:
             if col not in df_fills.columns:
                 df_fills[col] = None
 
@@ -629,11 +672,73 @@ def run_monitoring(upload_to_bq=True):
     print("\nStep 5: Building settlements DataFrame with P&L...")
     df_settlements = build_settlements_dataframe(settlements, df_fills)
 
-    # Step 6: Upload to BigQuery (TRUNCATE = full refresh)
+    # Step 6: Upload to BigQuery
+    # Fills: WRITE_TRUNCATE (full history pulled every run, safe to replace)
+    # Settlements: MERGE (preserves rows outside Kalshi's rolling ~5-day API window)
     if upload_to_bq:
-        print("\nStep 6: Uploading to BigQuery (WRITE_TRUNCATE)...")
+        print("\nStep 6: Uploading to BigQuery...")
         df_to_bq(df_fills, f"{BQ_TABLE_PREFIX}fills", write_disposition="WRITE_TRUNCATE")
-        df_to_bq(df_settlements, f"{BQ_TABLE_PREFIX}settlements", write_disposition="WRITE_TRUNCATE")
+
+        # Settlements: upload to staging, then MERGE into main table
+        if len(df_settlements) > 0 and bq_client is not None:
+            staging_table = f"{BQ_TABLE_PREFIX}settlements_staging"
+            main_table = f"{BQ_TABLE_PREFIX}settlements"
+            main_table_id = f"{PROJECT_ID}.{DATASET_ID}.{main_table}"
+
+            df_to_bq(df_settlements, staging_table, write_disposition="WRITE_TRUNCATE")
+
+            # If main table doesn't exist, create it from staging and we're done
+            try:
+                bq_client.get_table(main_table_id)
+                table_exists = True
+            except Exception:
+                table_exists = False
+
+            if not table_exists:
+                print(f"  {main_table} does not exist — creating from staging")
+                create_sql = f"""
+                CREATE TABLE `{main_table_id}` AS
+                SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{staging_table}`
+                """
+                bq_client.query(create_sql).result()
+                print(f"  ✓ Created {main_table_id}")
+            else:
+                # MERGE: update existing rows, insert new ones, keep old ones untouched
+                merge_sql = f"""
+                MERGE `{main_table_id}` T
+                USING `{PROJECT_ID}.{DATASET_ID}.{staging_table}` S
+                ON T.market_ticker = S.market_ticker
+                WHEN MATCHED THEN UPDATE SET
+                    result = S.result,
+                    revenue = S.revenue,
+                    value = S.value,
+                    yes_total_cost = S.yes_total_cost,
+                    no_total_cost = S.no_total_cost,
+                    yes_count = S.yes_count,
+                    no_count = S.no_count,
+                    fee_cost = S.fee_cost,
+                    settled_time = S.settled_time,
+                    pulled_at = S.pulled_at,
+                    position_yes = S.position_yes,
+                    position_no = S.position_no,
+                    net_position = S.net_position,
+                    total_cost = S.total_cost,
+                    total_payout = S.total_payout,
+                    pnl = S.pnl,
+                    num_fills = S.num_fills
+                WHEN NOT MATCHED THEN INSERT ROW
+                """
+                try:
+                    job = bq_client.query(merge_sql)
+                    job.result()
+                    print(f"  ✓ Merged {len(df_settlements)} settlements into {main_table_id}")
+                    print(f"    (DML stats: {job.num_dml_affected_rows} rows affected)")
+                except Exception as e:
+                    print(f"  ⚠ MERGE failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+        else:
+            print("  Skipping settlements upload — no data")
 
     # ===== SUMMARY =====
     print(f"\n{'='*70}")
