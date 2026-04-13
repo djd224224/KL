@@ -620,7 +620,9 @@ SIDE_MULTIPLIERS = {
     "PITC": {"yes": 0.0, "no": 1.5},   # [v1.3] boost both sides
     "WILD": {"yes": 1.5, "no": 1.5},   # [v1.3] boost both sides
     "ROGE": {"yes": 0.0, "no": 0.0},   # [v1.4] confirmed block
+    "NQE": {"yes": 0.0, "no": 0.0},   # [v1.4] confirmed block
     "ORIO": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
+    "BUSC": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
     "CITI": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
     "JETE": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
     "COVE": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
