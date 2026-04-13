@@ -554,7 +554,7 @@ if len(df_summary_rolling_by_team) > 0:
 
 
 RUN_ID = str(uuid.uuid4())
-MODEL_VERSION = "v4.8"
+MODEL_VERSION = "v4.9"
 PRICING_STRATEGY = 'hybrid'
 
 # ---------- BAYESIAN HYBRID PRICING PARAMETERS ----------
@@ -613,6 +613,17 @@ POSITION_MODERATE_THRESHOLD = _limits["POSITION_MODERATE_THRESHOLD"]
 POSITION_STOP_THRESHOLD = _limits["POSITION_STOP_THRESHOLD"]
 MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
+# [v4.9] Per-market net cap overrides — strongest-edge markets get larger limits
+MARKET_NET_OVERRIDES = {
+    "ANKL": 350,
+    "RETI": 350,
+    "DRAF": 350,
+}
+
+def get_market_net_cap(market_code: str) -> int:
+    """Return per-market net cap, with overrides for high-conviction markets."""
+    return MARKET_NET_OVERRIDES.get(market_code, MAX_NET_PER_MARKET)
+
 MAX_NET_PER_EVENT = _limits["MAX_NET_PER_EVENT"]
 MAX_ORDERS_PER_EVENT = 5000
 
@@ -647,17 +658,17 @@ SIDE_MULTIPLIERS = {
     "JORD": {"yes": 0.3, "no": 0.0},    # v4.4 was yes:0.3 -- YES is +$248 (9.7% ROI), boosted
     "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
-    "ANKL": {"yes": 1.0, "no": 2.5},    # [v4.8] NO raised 2.0→2.5 — NO +$1185 (+23.1%)
-    "BUZZ": {"yes": 0.0, "no": 1.3},    # keep -- NO is +$1,092 (13.4% ROI)
-    "ALLE": {"yes": 0.0, "no": 0.5},    # v4.4 was no:2.0 -- YES -$271, NO -$71, both sides losing
-    "AIRB": {"yes": 0.3, "no": 0.3},    # v4.4 was yes:1.3 no:1.5 -- YES +$640 (27% ROI), NO -$481
+    "ANKL": {"yes": 1.0, "no": 3.0},    # [v4.9] NO 2.5→3.0 — sustained edge
+    "BUZZ": {"yes": 0.5, "no": 1.3},    # [v4.9] enabled YES 0.0→0.5 — buy YES per directive
+    "ALLE": {"yes": 0.0, "no": 0.0},    # [v4.9] killed both sides — sustained losses
+    "AIRB": {"yes": 0.3, "no": 0.0},    # [v4.9] killed NO — YES +$640 retained, NO consistent loser
     "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
     "TRIP": {"yes": 0.5, "no": 0.5},    # [v4.7] re-enabled both sides at 0.5x
     "TECH": {"yes": 1.5, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "INJU": {"yes": 0.5, "no": 0.0},    # keep -- marginal +$3
-    "DRAF": {"yes": 0.5, "no": 2.0},    # [v4.8] YES 1.5→0.5 — YES only +$14 (+1.7%), NO +$683 (+20.3%)
+    "DRAF": {"yes": 0.5, "no": 2.5},    # [v4.9] NO 2.0→2.5 — sustained edge
     "CROW": {"yes": 0.0, "no": 1.3},    # keep -- NO +$24 (50% ROI)
     "ROOK": {"yes": 0.0, "no": 0.5},    # [v4.8] NO 1.5→0.5 — NO is -$6 (-4.6%)
     "PLAY": {"yes": 1.3, "no": 0.0},    # keep -- YES +$54 (28% ROI)
@@ -737,6 +748,7 @@ MAX_PRICE_OVERRIDES = {
     "RETI": 83,  # [v4.7] was 90 — capped at 84¢ per manual review
     "BUZZ": 70,  # [v4.7] max NO bid 70¢
     "TRIP": 55,  # [v4.7] max NO bid 70¢
+    "CROW": 14,  # [v4.9] block CROW NO above 14¢
 }
 
 # [v4.7] Per-market YES MAX_PRICE overrides
@@ -1286,7 +1298,10 @@ def get_pairing_mode(
     else:
         net_qty = abs(net_position)
 
-    imbalance_ratio = net_qty / MAX_NET_PER_MARKET if MAX_NET_PER_MARKET > 0 else 0.0
+    # [v4.9] use per-market cap for imbalance ratio
+    market_code = ticker.split("-")[-1] if ticker else ""
+    market_cap = get_market_net_cap(market_code)
+    imbalance_ratio = net_qty / market_cap if market_cap > 0 else 0.0
 
     if net_qty >= PAIRING_MODE_NET_AGGRESSIVE:
         return "aggressive_pairing", imbalance_ratio
@@ -1336,11 +1351,15 @@ def calculate_ledger_position_multiplier(
     if side_qty >= MAX_PAIRED_PER_MARKET:
         return 0.0, f"hard_cap_{side}_qty={side_qty}", 0.0
 
+    # [v4.9] use per-market net cap (ANKL/RETI/DRAF get 350)
+    market_code = ticker.split("-")[-1] if ticker else ""
+    market_cap = get_market_net_cap(market_code)
+
     if net_side == side and net_qty > 0:
-        if net_qty >= MAX_NET_PER_MARKET:
+        if net_qty >= market_cap:
             return 0.0, f"net_cap_{side}={net_qty}", 0.0
-        elif net_qty >= MAX_NET_PER_MARKET * 0.5:
-            remaining_frac = (MAX_NET_PER_MARKET - net_qty) / (MAX_NET_PER_MARKET * 0.5)
+        elif net_qty >= market_cap * 0.5:
+            remaining_frac = (market_cap - net_qty) / (market_cap * 0.5)
             mult = max(0.1, remaining_frac)
             return mult, f"net_rampdown_{side}={net_qty}", 0.0
         else:
@@ -1351,7 +1370,7 @@ def calculate_ledger_position_multiplier(
             return 2.0, f"aggressive_pair_boost_net_{net_side}={net_qty}", 1.5
         elif net_qty >= PAIRING_MODE_NET_FLOOR:
             return 1.5, f"pair_boost_net_{net_side}={net_qty}", 1.0
-        elif net_qty >= int(MAX_NET_PER_MARKET * 0.25):
+        elif net_qty >= int(market_cap * 0.25):
             return 1.2, f"mild_pair_boost_net_{net_side}={net_qty}", 0.8
         else:
             return 1.0, f"net_balanced", 0.0
@@ -2186,19 +2205,21 @@ def build_order_objects_for_market(
     no_side_mult = get_effective_side_multiplier(no_side_mult, "no", pairing_mode_str, net_side)
 
     # [v4.7] net_room: use LARGER of positions API or ledger (positions API can return 0)
+    # [v4.9] use per-market net cap (ANKL/RETI/DRAF get 350)
+    market_net_cap = get_market_net_cap(ticker_part_3_market_code)
     if ledger_data:
         ledger_yes_qty = ledger_data.get("yes_qty", 0)
         ledger_no_qty = ledger_data.get("no_qty", 0)
         ledger_net = ledger_yes_qty - ledger_no_qty  # positive = net yes, negative = net no
         # Use whichever shows more exposure
         effective_net = ledger_net if abs(ledger_net) > abs(net_position) else net_position
-        net_room_yes = max(0, MAX_NET_PER_MARKET - max(ledger_yes_qty, max(0, net_position)))
-        net_room_no = max(0, MAX_NET_PER_MARKET - max(ledger_no_qty, max(0, -net_position)))
+        net_room_yes = max(0, market_net_cap - max(ledger_yes_qty, max(0, net_position)))
+        net_room_no = max(0, market_net_cap - max(ledger_no_qty, max(0, -net_position)))
         if abs(ledger_net) > abs(net_position) and net_position == 0:
             print(f"    ⚠️ Positions API=0 but ledger={ledger_yes_qty}Y/{ledger_no_qty}N — using ledger for caps")
     else:
-        net_room_yes = MAX_NET_PER_MARKET - net_position
-        net_room_no = MAX_NET_PER_MARKET + net_position
+        net_room_yes = market_net_cap - net_position
+        net_room_no = market_net_cap + net_position
 
     time_mult = get_time_multiplier(hours_until_event)
     volume_mult = get_volume_multiplier(open_interest)
