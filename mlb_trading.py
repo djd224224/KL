@@ -614,12 +614,19 @@ MAX_PAIRED_PER_MARKET = _limits["MAX_PAIRED_PER_MARKET"]
 SIDE_MULTIPLIERS = {
     # === MLB CODES — tuned from settlement data ===
     "GRAN": {"yes": 0.0, "no": 0.0},   # [v1.2] blocked both sides
-    "EXTR": {"yes": 1.0, "no": 0.0},   # [v1.2] block NO
+    "EXTR": {"yes": 0.0, "no": 0.0},   # [v1.4] blocked both sides — sustained losses
     "OHTA": {"yes": 0.0, "no": 1.0},   # [v1.2] block YES
     "ERRO": {"yes": 1.5, "no": 1.5},   # [v1.3] boost both sides
     "PITC": {"yes": 0.0, "no": 1.5},   # [v1.3] boost both sides
     "WILD": {"yes": 1.5, "no": 1.5},   # [v1.3] boost both sides
-    "ROGE": {"yes": 0.0, "no": 0.0},   # [v1.3] boost both sides
+    "ROGE": {"yes": 0.0, "no": 0.0},   # [v1.4] confirmed block
+    "ORIO": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
+    "CITI": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
+    "JETE": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
+    "COVE": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
+    "BUNT": {"yes": 2.0, "no": 1.0},   # [v1.4] 2x YES — strong edge
+    "WALK": {"yes": 1.5, "no": 1.5},   # [v1.4] 1.5x both sides
+    "BASE": {"yes": 0.0, "no": 1.0},   # [v1.4] block YES
 
 }
 
@@ -674,7 +681,7 @@ YES_PROBABILITY_FLOOR = 30
 
 MAX_PRICE_OVERRIDES = {
     "PITC": 60,   # [v1.2] cap NO bids
-    "WILD": 65,   # [v1.2] cap NO bids
+    "WILD": 64,   # [v1.4] block WILD NO above 64¢
 }
 # [v1.2] Per-market YES MAX_PRICE overrides
 YES_MAX_PRICE_OVERRIDES = {
@@ -695,7 +702,7 @@ NUM_YES_OFFSET_LEVELS = 7   # [v1.1] YES gets more levels (edge is real at 45-60
 NUM_NO_OFFSET_LEVELS = 5    # [v1.1] NO gets fewer levels (adversely selected everywhere)
 
 def generate_base_contracts(num_levels: int) -> List[int]:
-    return [5] * num_levels  # [v1.2] was 3 — raised after initial data collection
+    return [7] * num_levels  # [v1.4] was 5 — raised after sustained data collection
 
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_YES_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_NO_OFFSET_LEVELS)
