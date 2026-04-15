@@ -348,7 +348,7 @@ def get_all_settlements() -> List[Dict[str, Any]]:
                     'value': s.get('value', 0),  # cents, int (residual position value)
                     'yes_total_cost': yes_cost,  # dollars, float
                     'no_total_cost': no_cost,  # dollars, float
-                    'settled_time': s.get('settled_time'),
+                    'settled_time': str(s.get('settled_time', '')) if s.get('settled_time') is not None else None,
                     'yes_count': float(s.get('yes_count_fp', 0) or 0),
                     'no_count': float(s.get('no_count_fp', 0) or 0),
                     'fee_cost': float(s.get('fee_cost', 0) or 0),
