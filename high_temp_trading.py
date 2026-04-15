@@ -778,8 +778,11 @@ increment1 = 5
 price_count = list(range(0, 8))
 starting_contracts = 15
 
-max_contracts = 200
-max_contracts1 = 200
+# Night-run size multiplier (variable==1 means trading tomorrow, i.e. afternoon/evening runs)
+night_size_mult = 1.5 if variable == 1 else 1.0
+
+max_contracts = 300
+max_contracts1 = 300
 market_cutoff_probability = .2
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
@@ -850,15 +853,21 @@ for index, row in combined_table.iterrows():
 
   i1 = 0
   level_orders = 0
+  n_levels = len(price_count)
   for i in price_count:
     if "-T" not in ticker:
       bid_price = max(hi_no - i * increment, 1)
     if is_tail:
       bid_price = max(hi_no - i * increment1, 1)
 
+    # Compute size for THIS level: scales linearly from 1.0x → 2.0x of base across the ladder,
+    # then multiplied by the night-run multiplier (1.5x if variable==1, else 1.0x).
+    ladder_mult = 1.0 + (i / (n_levels - 1)) if n_levels > 1 else 1.0
+    contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult)))
+
     # Show first level diagnostics
     if i == 0:
-      print(f"    Level 0: bid={bid_price:.0f} vs no_offer={int(no_offer)} no_bid={int(no_bid)} (need bid<offer AND bid<bid-3)")
+      print(f"    Level 0: bid={bid_price:.0f} contracts={contracts} vs no_offer={int(no_offer)} no_bid={int(no_bid)} (need bid<offer AND bid<bid-3)")
 
     if not (bid_price < int(no_offer)):
       if i == 0: print(f"    SKIP level 0: bid {bid_price:.0f} >= no_offer {int(no_offer)}")
@@ -866,11 +875,11 @@ for index, row in combined_table.iterrows():
     if not (bid_price < int(no_bid) - 3):
       if i == 0: print(f"    SKIP level 0: bid {bid_price:.0f} >= no_bid-3 ({int(no_bid)-3})")
       continue
-    if not (max_contracts >= row['position'] + row['resting_order_count'] + starting_contracts + i * 10):
-      if i == 0: print(f"    SKIP level 0: position cap")
+    # Position cap check now uses the actual contracts size for THIS level
+    if not (max_contracts >= row['position'] + row['resting_order_count'] + contracts):
+      if i == 0: print(f"    SKIP level 0: position cap (would exceed {max_contracts})")
       continue
 
-    contracts = starting_contracts
     i1 = i1 + 1
 
     # Detect city abbreviation and cancel time — check longer abbreviations first
