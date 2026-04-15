@@ -704,9 +704,16 @@ def run_monitoring(upload_to_bq=True):
                 print(f"  ✓ Created {main_table_id}")
             else:
                 # MERGE: update existing rows, insert new ones, keep old ones untouched
+                # Wrap source in subquery to cast settled_time to STRING
+                # (existing main table column is STRING; new API may return numeric ts)
                 merge_sql = f"""
                 MERGE `{main_table_id}` T
-                USING `{PROJECT_ID}.{DATASET_ID}.{staging_table}` S
+                USING (
+                    SELECT
+                        * EXCEPT(settled_time),
+                        CAST(settled_time AS STRING) AS settled_time
+                    FROM `{PROJECT_ID}.{DATASET_ID}.{staging_table}`
+                ) S
                 ON T.market_ticker = S.market_ticker
                 WHEN MATCHED THEN UPDATE SET
                     result = S.result,
@@ -726,7 +733,19 @@ def run_monitoring(upload_to_bq=True):
                     total_payout = S.total_payout,
                     pnl = S.pnl,
                     num_fills = S.num_fills
-                WHEN NOT MATCHED THEN INSERT ROW
+                WHEN NOT MATCHED THEN INSERT (
+                    market_ticker, result, revenue, value,
+                    yes_total_cost, no_total_cost, yes_count, no_count,
+                    fee_cost, settled_time, pulled_at,
+                    position_yes, position_no, net_position,
+                    total_cost, total_payout, pnl, num_fills
+                ) VALUES (
+                    S.market_ticker, S.result, S.revenue, S.value,
+                    S.yes_total_cost, S.no_total_cost, S.yes_count, S.no_count,
+                    S.fee_cost, S.settled_time, S.pulled_at,
+                    S.position_yes, S.position_no, S.net_position,
+                    S.total_cost, S.total_payout, S.pnl, S.num_fills
+                )
                 """
                 try:
                     job = bq_client.query(merge_sql)
