@@ -781,8 +781,17 @@ starting_contracts = 15
 # Night-run size multiplier (variable==1 means trading tomorrow, i.e. afternoon/evening runs)
 night_size_mult = 1.5 if variable == 1 else 1.0
 
-max_contracts = 300
-max_contracts1 = 300
+# Per-city size multipliers — tilt size toward better-edge cities, shrink for worse ones.
+# Cities not listed default to 1.0x.
+CITY_SIZE_MULT = {
+    "New York City": 1.5,
+    "Austin": 1.5,
+    "Dallas": 0.75,
+    "Atlanta": 0.75,
+}
+
+max_contracts = 500
+max_contracts1 = 500
 market_cutoff_probability = .2
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
@@ -861,9 +870,11 @@ for index, row in combined_table.iterrows():
       bid_price = max(hi_no - i * increment1, 1)
 
     # Compute size for THIS level: scales linearly from 1.0x → 2.0x of base across the ladder,
-    # then multiplied by the night-run multiplier (1.5x if variable==1, else 1.0x).
+    # then multiplied by the night-run multiplier (1.5x if variable==1, else 1.0x)
+    # and the per-city multiplier (default 1.0x).
     ladder_mult = 1.0 + (i / (n_levels - 1)) if n_levels > 1 else 1.0
-    contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult)))
+    city_mult = CITY_SIZE_MULT.get(row['City'], 1.0)
+    contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult * city_mult)))
 
     # Show first level diagnostics
     if i == 0:
