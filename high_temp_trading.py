@@ -776,7 +776,7 @@ combined_table
 increment = 2
 increment1 = 5
 price_count = list(range(0, 8))
-starting_contracts = 25
+starting_contracts = 30
 
 # Night-run size multiplier (variable==1 means trading tomorrow, i.e. afternoon/evening runs)
 night_size_mult = 2 if variable == 1 else 1.0
