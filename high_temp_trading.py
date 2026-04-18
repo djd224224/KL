@@ -779,7 +779,7 @@ price_count = list(range(0, 8))
 starting_contracts = 25
 
 # Night-run size multiplier (variable==1 means trading tomorrow, i.e. afternoon/evening runs)
-night_size_mult = 1.5 if variable == 1 else 1.0
+night_size_mult = 2 if variable == 1 else 1.0
 
 # Per-city size multipliers — tilt size toward better-edge cities, shrink for worse ones.
 # Cities not listed default to 1.0x.
