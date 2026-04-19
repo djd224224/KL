@@ -769,6 +769,32 @@ def run_monitoring(upload_to_bq=True):
         else:
             print("  Skipping settlements upload — no data")
 
+    # Step 7: Fetch real NWS CLI high temperatures for the current year.
+    # Safe to run every time — MERGE upsert in fetch_cli.py is idempotent.
+    # Keeps KXHIGH_cli_readings current so settlements_clean.winning_high_temp
+    # stays populated for every settled market.
+    if upload_to_bq and bq_client is not None:
+        print("\nStep 7: Fetching NWS CLI high temperatures (Iowa State IEM)...")
+        try:
+            _repo_root = os.path.dirname(os.path.abspath(__file__))
+            _cli_path = os.path.join(_repo_root, "analysis", "kxhigh", "python")
+            if _cli_path not in sys.path:
+                sys.path.insert(0, _cli_path)
+            import fetch_cli as _cli  # noqa: WPS433
+            _cli_year = datetime.now(UTC).year
+            _cli.ensure_table(bq_client)
+            _cli_df = _cli.backfill_iem(_cli_year)
+            if not _cli_df.empty:
+                _cli.upsert(bq_client, _cli_df)
+                print(f"  ✓ Upserted {len(_cli_df)} CLI rows for {_cli_year}")
+            else:
+                print("  (no CLI rows returned — check IEM API availability)")
+        except Exception as _cli_e:
+            # Non-fatal: monitoring should succeed even if CLI fetch fails
+            print(f"  ⚠ CLI fetch failed (non-fatal): {_cli_e}")
+            import traceback
+            traceback.print_exc()
+
     # ===== SUMMARY =====
     print(f"\n{'='*70}")
     print(f"MONITORING COMPLETE")
