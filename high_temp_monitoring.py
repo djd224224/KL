@@ -399,6 +399,16 @@ def build_fills_dataframe(fills: List[Dict[str, Any]], df_orders: pd.DataFrame) 
         df_fills['filled_count'] = 0
 
     # NEW API: prices are yes_price_dollars / no_price_dollars as strings in dollars
+    #
+    # ⚠ DATA-ORIENTATION NOTE (discovered Apr 2026 via settlement reconciliation):
+    # For side=no fills, Kalshi's `yes_price_dollars` field contains the actual
+    # NO-side execution price (what the bot paid per contract). The `no_price`
+    # field contains the complementary YES market price. Using no_price as "cost
+    # of NO" leaves a ~$66 gap across the dataset; using yes_price reconciles
+    # exactly with settlements.total_cost. See analysis/kxhigh/sql/06_fills_clean.sql
+    # for the authoritative view that swaps them. Not fixing here to avoid mixing
+    # old and new rows in the raw table; downstream queries should use the _clean
+    # views or swap the columns explicitly.
     # Convert to cents int for compatibility with existing P&L formulas
     if 'yes_price_dollars' in df_fills.columns:
         df_fills['yes_price'] = (

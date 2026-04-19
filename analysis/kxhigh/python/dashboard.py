@@ -64,7 +64,9 @@ def build_sanity(data: dict) -> str:
          f"YES: {(settle['result']=='YES').sum()}, NO: {(settle['result']=='NO').sum()}"),
         ("Resolved-with-snapshot", f"{len(resolved):,}",
          f"⚠ limited by snapshot gap"),
-        ("Total P&L (settled)", f"${settle['pnl'].sum():,.2f}", ""),
+        ("Total P&L (settled)", f"${settle['pnl_dollars'].sum():,.2f}", ""),
+        ("Winning temp available", f"{settle['winning_high_temp'].notna().sum()}/{len(settle)}",
+         "from between-bucket midpoints"),
     ]
     card_html = "".join(
         f'<div class="card"><div class="k">{k}</div>'
@@ -208,7 +210,7 @@ def build_edge_capture(fills: pd.DataFrame) -> str:
     if len(df) == 0:
         return '<p class="muted">No fills have snapshot context (limited snapshot coverage).</p>'
     fig = px.scatter(df, x="model_edge_at_fill", y="realized_pnl_per_fill",
-                     color="city", hover_data=["market_ticker", "fill_price"],
+                     color="city_abv", hover_data=["market_ticker", "price_paid_dollars"],
                      title=f"Model edge at fill vs realized P&L (n={len(df)})")
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.add_vline(x=0, line_dash="dash", line_color="gray")
@@ -231,10 +233,10 @@ def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
                   title="Fill rate (contracts) by city")
     fig1.update_layout(height=400)
 
-    # Fill rate by price bucket
+    # Fill rate by price bucket (dollars)
     o = orders.copy()
-    o["price_bucket"] = pd.cut(o["ordered_no_price_cents"],
-                               bins=[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+    o["price_bucket"] = pd.cut(o["ordered_no_price_dollars"],
+                               bins=[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
     pb = (o.groupby("price_bucket", observed=True)
            .agg(n_orders=("client_order_id", "size"),
                 n_filled=("any_fill", "sum"),
@@ -244,7 +246,7 @@ def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
     pb["fill_rate"] = pb["total_filled"] / pb["total_ordered"].where(pb["total_ordered"] > 0, np.nan)
     pb["price_bucket"] = pb["price_bucket"].astype(str)
     fig2 = px.bar(pb, x="price_bucket", y="fill_rate",
-                  title="Fill rate by limit NO-price bucket (cents)")
+                  title="Fill rate by limit NO-price bucket (dollars)")
     fig2.update_layout(height=400)
 
     # Taker/maker + fee drag (from fills)
@@ -267,9 +269,9 @@ def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
 
 
 def build_pnl_attribution(settle: pd.DataFrame) -> str:
-    df = settle.copy()
-    # Parse settled_time
-    df["settled_ts"] = pd.to_datetime(df["settled_time"], errors="coerce", utc=True)
+    # settle is now KXHIGH_settlements_clean — pnl_dollars, settled_ts, city_abv
+    df = settle.copy().rename(columns={"pnl_dollars": "pnl", "total_cost_dollars": "total_cost"})
+    df["settled_ts"] = pd.to_datetime(df["settled_ts"], utc=True)
     df = df.dropna(subset=["settled_ts"]).sort_values("settled_ts")
     df["cum_pnl"] = df["pnl"].cumsum()
     df["peak"] = df["cum_pnl"].cummax()
@@ -286,8 +288,8 @@ def build_pnl_attribution(settle: pd.DataFrame) -> str:
     fig.update_layout(height=600, showlegend=False)
 
     # Per-city attribution
-    df["city_code"] = df["city_code"].fillna("?")
-    by_city = df.groupby("city_code").agg(
+    df["city_abv"] = df["city_abv"].fillna("?")
+    by_city = df.groupby("city_abv").agg(
         n=("pnl", "size"), total_pnl=("pnl", "sum"),
         mean_pnl=("pnl", "mean"),
         win_rate=("pnl", lambda x: (x > 0).mean()),
@@ -295,7 +297,7 @@ def build_pnl_attribution(settle: pd.DataFrame) -> str:
     ).reset_index()
     by_city["roi"] = by_city["total_pnl"] / by_city["total_cost"].where(by_city["total_cost"] > 0, np.nan)
     by_city = by_city.sort_values("total_pnl", ascending=False)
-    fig2 = px.bar(by_city, x="city_code", y="total_pnl",
+    fig2 = px.bar(by_city, x="city_abv", y="total_pnl",
                   color="roi", color_continuous_scale="RdYlGn",
                   hover_data=["n", "win_rate"], title="Total P&L by city")
     fig2.update_layout(height=450)

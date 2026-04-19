@@ -39,7 +39,7 @@ def model_call_snapshots():
 
 
 def settlements():
-    return _q(f"SELECT * FROM `{PROJECT}.{DATASET}.KXHIGH_settlements`")
+    return _q(f"SELECT * FROM `{PROJECT}.{DATASET}.KXHIGH_settlements_clean`")
 
 
 def load_all() -> dict:
