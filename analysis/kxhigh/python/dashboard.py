@@ -25,6 +25,11 @@ def section(title: str, subtitle: str = "") -> str:
     return f'<div class="section"><h2>{title}</h2>{sub}'
 
 
+def exec_summary(text: str) -> str:
+    """Executive summary block at the top of each section."""
+    return f'<div class="exec">{text}</div>'
+
+
 def section_end() -> str:
     return "</div>"
 
@@ -53,6 +58,22 @@ def build_sanity(data: dict) -> str:
     snap_dates = pd.to_datetime(snap["run_date"], errors="coerce", utc=True).dt.date
     fill_dates = pd.to_datetime(fills["fill_ts"], errors="coerce", utc=True).dt.date
 
+    total_pnl = settle["pnl_dollars"].sum()
+    n_days = fill_dates.nunique()
+    win_rate = (settle["pnl_dollars"] > 0).mean()
+    summary = (
+        '<span class="tl">What this dashboard answers</span>'
+        f'Our bot places bets on daily high-temperature markets across 19 US cities. '
+        f'Over {n_days} trading days we settled {len(settle)} markets for '
+        f'<b>${total_pnl:,.0f} total P&L</b> ({win_rate:.0%} of markets profitable). '
+        f'Below, six sections grade (1) how well we forecast the weather, '
+        f'(2) how well that forecast translates into accurate probability calls, '
+        f'(3) whether we make money when forecasts disagree, '
+        f'(4) whether the model&rsquo;s perceived "edge" at each trade turns into real profit, '
+        f'(5) whether our order execution is efficient, and '
+        f'(6) where the money is actually coming from (which cities, which days).'
+    )
+
     cards = [
         ("Snapshots (rows)", f"{len(snap):,}", f"days: {snap_dates.nunique()}, "
          f"{snap_dates.min()} → {snap_dates.max()}"),
@@ -79,12 +100,21 @@ def build_sanity(data: dict) -> str:
               'Model-validation sections below are thin — extend snapshot logging '
               'to run every cycle for more robust analysis. '
               '<br>AccuWeather source is 100% NULL (API key expired Mar 2026).</div>')
-    return f'<div class="cards">{card_html}</div>{caveat}'
+    return exec_summary(summary) + f'<div class="cards">{card_html}</div>{caveat}'
 
 
 def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
+    summary = (
+        '<span class="tl">What this section measures</span>'
+        'How close our weather forecasts came to the actual high temperature in each city. '
+        'We aggregate forecasts from the National Weather Service (NWS) and Weather Underground '
+        '(AccuWeather is dead — API key expired). '
+        '<b>MAE</b> (mean absolute error) = typical miss in &deg;F. '
+        '<b>Bias</b> = systematic over/under forecast (near zero is ideal). '
+        'Cities where our forecast is consistently off are cities where betting is riskier.'
+    )
     if len(resolved) == 0:
-        return '<p class="muted">No resolved-with-snapshot rows.</p>'
+        return exec_summary(summary) + '<p class="muted">No resolved-with-snapshot rows.</p>'
     df = resolved.dropna(subset=["actual_high_estimate"]).copy()
     if len(df) == 0:
         return '<p class="muted">No markets with an inferred actual_high.</p>'
@@ -124,16 +154,29 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
     if fig2 is not None:
         html += fig_to_html(fig2)
     html += fig_to_html(fig3)
-    return html
+    return exec_summary(summary) + html
 
 
 def build_calibration(resolved: pd.DataFrame) -> str:
+    summary = (
+        '<span class="tl">What this section measures</span>'
+        'When the model says "70% chance YES," does YES actually happen 70% of the time? '
+        '<b>Brier score</b> is the report card (lower = better; 0.25 = coin flip; '
+        '0.0 = perfect). '
+        'The <b>reliability diagram</b> plots predicted probability vs. actual outcome rate — '
+        'points on the dashed diagonal mean the model is well-calibrated. '
+        'Below the line = overconfident; above = underconfident. '
+        'We also compare our model&rsquo;s Brier to what the market itself was implying, '
+        'to see if we have genuine edge or we&rsquo;re just agreeing with the crowd.'
+    )
     if len(resolved) == 0:
-        return '<p class="muted">No resolved-with-snapshot rows.</p>'
+        return exec_summary(summary) + '<p class="muted">No resolved-with-snapshot rows.</p>'
     df = resolved.dropna(subset=["yes_probability", "outcome_yes"]).copy()
     if len(df) < 5:
-        return '<p class="muted">Insufficient resolved markets for calibration '
-        f'(need ≥5, have {len(df)}).</p>'
+        return exec_summary(summary) + (
+            f'<p class="muted">Insufficient resolved markets for calibration '
+            f'(need ≥5, have {len(df)}).</p>'
+        )
 
     # Model metrics
     b_model = M.brier_score(df["yes_probability"], df["outcome_yes"])
@@ -176,14 +219,25 @@ def build_calibration(resolved: pd.DataFrame) -> str:
                       xaxis_title="Predicted P(YES)", yaxis_title="Observed YES rate",
                       height=500)
 
-    return metrics_html + fig_to_html(fig) + "<h3>Bin breakdown</h3>" + table_html(rel)
+    return exec_summary(summary) + metrics_html + fig_to_html(fig) + "<h3>Bin breakdown</h3>" + table_html(rel)
 
 
 def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
+    summary = (
+        '<span class="tl">What this section measures</span>'
+        'When our weather sources disagree (high spread), is the bot <b>more</b> or '
+        '<b>less</b> profitable? '
+        'If P&L grows with spread, the bot is <i>exploiting</i> market uncertainty — '
+        'when others are unsure, we have edge. '
+        'If P&L shrinks with spread, the bot is <i>hurt by</i> uncertainty — '
+        'we\'re taking positions on days we shouldn\'t. '
+        'Buckets split by forecast standard deviation (disagreement between sources) '
+        'and range (max − min).'
+    )
     if len(resolved) == 0 or resolved["pnl"].isna().all():
-        return '<p class="muted">No data.</p>'
+        return exec_summary(summary) + '<p class="muted">No data.</p>'
 
-    html_parts = []
+    html_parts = [exec_summary(summary)]
     for col, label in [("forecast_std", "forecast_std"),
                        ("forecast_std_recomputed", "forecast_std (recomputed, NWS+WU)"),
                        ("forecast_range", "forecast_range")]:
@@ -206,9 +260,21 @@ def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
 
 
 def build_edge_capture(fills: pd.DataFrame) -> str:
+    summary = (
+        '<span class="tl">What this section measures</span>'
+        'For every single trade, "edge" is the gap between what the model thought was '
+        'fair and what we actually paid. A +10% edge means the model thought we were '
+        'getting a 10 percentage point discount relative to fair odds. '
+        'The question: <b>do higher-edge trades actually pay better?</b> '
+        'If the scatter trends up-right and the quintile table shows higher P&L in '
+        'high-edge buckets, the model&rsquo;s edge signal is <i>real</i>. If not, the '
+        'edge is mostly noise.'
+    )
     df = fills.dropna(subset=["model_edge_at_fill", "realized_pnl_per_fill"]).copy()
     if len(df) == 0:
-        return '<p class="muted">No fills have snapshot context (limited snapshot coverage).</p>'
+        return exec_summary(summary) + (
+            '<p class="muted">No fills have snapshot context (limited snapshot coverage).</p>'
+        )
     fig = px.scatter(df, x="model_edge_at_fill", y="realized_pnl_per_fill",
                      color="city_abv", hover_data=["market_ticker", "price_paid_dollars"],
                      title=f"Model edge at fill vs realized P&L (n={len(df)})")
@@ -224,10 +290,21 @@ def build_edge_capture(fills: pd.DataFrame) -> str:
                        win_rate=("realized_pnl_per_fill", lambda x: (x > 0).mean()))
                   .reset_index())
     edge_tbl["edge_bin"] = edge_tbl["edge_bin"].astype(str)
-    return fig_to_html(fig) + "<h3>P&L by edge quintile</h3>" + table_html(edge_tbl)
+    return (exec_summary(summary) + fig_to_html(fig)
+            + "<h3>P&L by edge quintile</h3>" + table_html(edge_tbl))
 
 
 def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
+    summary = (
+        '<span class="tl">What this section measures</span>'
+        'Even a great model can be ruined by bad execution. This section grades <b>how '
+        'the bot places and fills orders</b>, not its forecasting. '
+        'The bot posts limit orders and waits (never pays the spread), so <b>fill rate '
+        'is low by design</b> (~3%) — the tradeoff is better prices. '
+        'Key checks: Are we getting filled disproportionately on bad prices? Are fees '
+        'eating returns? Are maker fills (we posted) more profitable than taker fills '
+        '(we chased)?'
+    )
     by_city = M.fill_rate_by(orders, "city_abv").head(25)
     fig1 = px.bar(by_city, x="city_abv", y="fill_rate_contracts",
                   title="Fill rate (contracts) by city")
@@ -263,12 +340,22 @@ def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
         f'<div class="card"><div class="k">Taker fills</div><div class="v">{len(taker):,}</div><div class="d">P&L ${taker["realized_pnl_per_fill"].sum():,.2f}</div></div>',
         f'<div class="card"><div class="k">Maker fills</div><div class="v">{len(maker):,}</div><div class="d">P&L ${maker["realized_pnl_per_fill"].sum():,.2f}</div></div>',
     ])
-    return (fig_to_html(fig1) + fig_to_html(fig2)
+    return (exec_summary(summary) + fig_to_html(fig1) + fig_to_html(fig2)
             + f'<div class="cards">{exec_cards}</div>'
             + "<h3>By city (top 25)</h3>" + table_html(by_city))
 
 
 def build_pnl_attribution(settle: pd.DataFrame) -> str:
+    summary = (
+        '<span class="tl">What this section measures</span>'
+        'The money story: where P&L came from, and where it didn&rsquo;t. '
+        'The <b>cumulative P&L curve</b> shows whether we made money steadily or in '
+        'big jumps. <b>Drawdown</b> shows the worst peak-to-trough pain along the way. '
+        'The city breakdown tells us which markets are profitable and which to cut. '
+        'The weekday pattern can reveal regime effects (e.g., forecasts less accurate '
+        'on weekends). Red cities in the bar chart are losing money despite our bets — '
+        'candidates for either size reduction or blocking.'
+    )
     # settle is now KXHIGH_settlements_clean — pnl_dollars, settled_ts, city_abv
     df = settle.copy().rename(columns={"pnl_dollars": "pnl", "total_cost_dollars": "total_cost"})
     df["settled_ts"] = pd.to_datetime(df["settled_ts"], utc=True)
@@ -317,7 +404,8 @@ def build_pnl_attribution(settle: pd.DataFrame) -> str:
                   title="P&L by weekday")
     fig4.update_layout(height=350)
 
-    return (fig_to_html(fig) + fig_to_html(fig2) + fig_to_html(fig3) + fig_to_html(fig4)
+    return (exec_summary(summary) + fig_to_html(fig) + fig_to_html(fig2)
+            + fig_to_html(fig3) + fig_to_html(fig4)
             + "<h3>Per-city table</h3>" + table_html(by_city))
 
 
@@ -334,6 +422,12 @@ h3 { margin-top: 24px; color: #444; font-size: 15px; }
 .muted { color: #888; font-style: italic; }
 .caveat { background: #fffaf0; border-left: 4px solid #ff9800; padding: 12px 16px;
           margin: 16px 0; border-radius: 4px; font-size: 13px; }
+.exec { background: #f0f4f8; border-left: 4px solid #4a90b8; padding: 14px 18px;
+        margin: 0 0 20px 0; border-radius: 4px; font-size: 14px; line-height: 1.55;
+        color: #1a2a3a; }
+.exec b { color: #0d2840; }
+.exec .tl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
+           color: #4a90b8; font-weight: 600; margin-bottom: 6px; display: block; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
          gap: 12px; margin: 16px 0; }
 .card { background: white; border: 1px solid #e0e0e0; border-radius: 6px; padding: 12px; }
