@@ -187,27 +187,31 @@ all_order_records = []
 central_time = datetime.now(pytz.timezone('US/Central'))
 variable = 1 if central_time.hour >= 14 and central_time.hour < 23 else 0
 
-# Define the cities and their coordinates for NWS
+# Coordinates are the EXACT lat/lon of each city's Kalshi settlement station
+# (Central Park for NYC, Midway for Chicago, Hobby for Houston, etc.) as
+# reported by api.weather.gov/stations/{icao}. Using station-exact coords
+# ensures forecast grid lookups and Open-Meteo backfill sample the same point
+# Kalshi settles on, rather than a generic city-center coordinate.
 cities = {
-    "Austin": (30.18304, -97.67987),
-    "Miami": (25.79056, -80.31639),
-    "Houston": (29.64542, -95.27889),
-    "Denver": (39.84658, -104.65622),
-    "New York City": (40.78333, -73.96667),
-    "Philadelphia": (39.87327, -75.22678),
-    "Chicago": (41.78417, -87.75528),
-    "Los Angeles": (33.94250, -118.40806),
-    "Atlanta": (33.64068, -84.42694),
-    "Washington DC": (38.85208, -77.03772),
-    "Phoenix": (33.43722, -112.00778),
-    "Dallas": (32.89681, -97.03781),
-    "Las Vegas": (36.08000, -115.15222),
-    "Oklahoma City": (35.39306, -97.60056),
-    "Seattle": (47.44889, -122.30917),
-    "San Francisco": (37.61961, -122.36558),
-    "San Antonio": (29.53389, -98.46917),
-    "Minneapolis": (44.88306, -93.22889),
-    "New Orleans": (29.99333, -90.25806),
+    "Austin":         (30.18304, -97.67987),   # KAUS
+    "Miami":          (25.79056, -80.31639),   # KMIA
+    "Houston":        (29.63750, -95.28250),   # KHOU Hobby
+    "Denver":         (39.84658, -104.65622),  # KDEN
+    "New York City":  (40.78333, -73.96667),   # KNYC Central Park
+    "Philadelphia":   (39.87327, -75.22678),   # KPHL
+    "Chicago":        (41.78417, -87.75528),   # KMDW Midway
+    "Los Angeles":    (33.93806, -118.38889),  # KLAX
+    "Atlanta":        (33.64028, -84.42694),   # KATL
+    "Washington DC":  (38.84833, -77.03417),   # KDCA Reagan
+    "Phoenix":        (33.42780, -112.00347),  # KPHX Sky Harbor
+    "Dallas":         (32.89743, -97.02196),   # KDFW
+    "Las Vegas":      (36.07188, -115.16340),  # KLAS Harry Reid
+    "Oklahoma City":  (35.38861, -97.60028),   # KOKC
+    "Seattle":        (47.44472, -122.31361),  # KSEA Sea-Tac
+    "San Francisco":  (37.61961, -122.36558),  # KSFO
+    "San Antonio":    (29.53278, -98.46361),   # KSAT
+    "Minneapolis":    (44.88306, -93.22889),   # KMSP
+    "New Orleans":    (29.99278, -90.25083),   # KMSY
 }
 
 def get_accuweather_forecast(coords):
@@ -456,27 +460,29 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 
-# City data with their corresponding location information for NWS API
+# City data with their corresponding location information for NWS API.
+# Coordinates match each city's exact Kalshi settlement station (see comment
+# on the first `cities` dict above for the mapping).
 cities = {
-    "Austin": {"lat": 30.18304, "lon": -97.67987},
-    "Miami": {"lat": 25.79056, "lon": -80.31639},
-    "Houston": {"lat": 29.64542, "lon": -95.27889},
-    "Denver": {"lat": 39.84658, "lon": -104.65622},
-    "New York City": {"lat": 40.78333, "lon": -73.96667},
-    "Philadelphia": {"lat": 39.87327, "lon": -75.22678},
-    "Chicago": {"lat": 41.78417, "lon": -87.75528},
-    "Los Angeles": {"lat": 33.94250, "lon": -118.40806},
-    "Atlanta": {"lat": 33.64068, "lon": -84.42694},
-    "Washington DC": {"lat": 38.85208, "lon": -77.03772},
-    "Phoenix": {"lat": 33.43722, "lon": -112.00778},
-    "Dallas": {"lat": 32.89681, "lon": -97.03781},
-    "Las Vegas": {"lat": 36.08000, "lon": -115.15222},
-    "Oklahoma City": {"lat": 35.39306, "lon": -97.60056},
-    "Seattle": {"lat": 47.44889, "lon": -122.30917},
-    "San Francisco": {"lat": 37.61961, "lon": -122.36558},
-    "San Antonio": {"lat": 29.53389, "lon": -98.46917},
-    "Minneapolis": {"lat": 44.88306, "lon": -93.22889},
-    "New Orleans": {"lat": 29.99333, "lon": -90.25806},
+    "Austin":         {"lat": 30.18304, "lon":  -97.67987},
+    "Miami":          {"lat": 25.79056, "lon":  -80.31639},
+    "Houston":        {"lat": 29.63750, "lon":  -95.28250},
+    "Denver":         {"lat": 39.84658, "lon": -104.65622},
+    "New York City":  {"lat": 40.78333, "lon":  -73.96667},
+    "Philadelphia":   {"lat": 39.87327, "lon":  -75.22678},
+    "Chicago":        {"lat": 41.78417, "lon":  -87.75528},
+    "Los Angeles":    {"lat": 33.93806, "lon": -118.38889},
+    "Atlanta":        {"lat": 33.64028, "lon":  -84.42694},
+    "Washington DC":  {"lat": 38.84833, "lon":  -77.03417},
+    "Phoenix":        {"lat": 33.42780, "lon": -112.00347},
+    "Dallas":         {"lat": 32.89743, "lon":  -97.02196},
+    "Las Vegas":      {"lat": 36.07188, "lon": -115.16340},
+    "Oklahoma City":  {"lat": 35.38861, "lon":  -97.60028},
+    "Seattle":        {"lat": 47.44472, "lon": -122.31361},
+    "San Francisco":  {"lat": 37.61961, "lon": -122.36558},
+    "San Antonio":    {"lat": 29.53278, "lon":  -98.46361},
+    "Minneapolis":    {"lat": 44.88306, "lon":  -93.22889},
+    "New Orleans":    {"lat": 29.99278, "lon":  -90.25083},
 }
 
 # Prepare the date for today
@@ -558,27 +564,27 @@ def fetch_midnight_forecast(coords):
         print(f"Failed to fetch grid data. Status code: {response.status_code}, URL: {url}")
     return None
 
-# Coordinates for cities
+# Coordinates for cities (station-exact, same as first cities dict)
 cities = {
-    "Austin": {"lat": 30.18304, "lon": -97.67987},
-    "Miami": {"lat": 25.79056, "lon": -80.31639},
-    "Houston": {"lat": 29.64542, "lon": -95.27889},
-    "Denver": {"lat": 39.84658, "lon": -104.65622},
-    "New York City": {"lat": 40.78333, "lon": -73.96667},
-    "Philadelphia": {"lat": 39.87327, "lon": -75.22678},
-    "Chicago": {"lat": 41.78417, "lon": -87.75528},
-    "Los Angeles": {"lat": 33.94250, "lon": -118.40806},
-    "Atlanta": {"lat": 33.64068, "lon": -84.42694},
-    "Washington DC": {"lat": 38.85208, "lon": -77.03772},
-    "Phoenix": {"lat": 33.43722, "lon": -112.00778},
-    "Dallas": {"lat": 32.89681, "lon": -97.03781},
-    "Las Vegas": {"lat": 36.08000, "lon": -115.15222},
-    "Oklahoma City": {"lat": 35.39306, "lon": -97.60056},
-    "Seattle": {"lat": 47.44889, "lon": -122.30917},
-    "San Francisco": {"lat": 37.61961, "lon": -122.36558},
-    "San Antonio": {"lat": 29.53389, "lon": -98.46917},
-    "Minneapolis": {"lat": 44.88306, "lon": -93.22889},
-    "New Orleans": {"lat": 29.99333, "lon": -90.25806},
+    "Austin":         {"lat": 30.18304, "lon":  -97.67987},
+    "Miami":          {"lat": 25.79056, "lon":  -80.31639},
+    "Houston":        {"lat": 29.63750, "lon":  -95.28250},
+    "Denver":         {"lat": 39.84658, "lon": -104.65622},
+    "New York City":  {"lat": 40.78333, "lon":  -73.96667},
+    "Philadelphia":   {"lat": 39.87327, "lon":  -75.22678},
+    "Chicago":        {"lat": 41.78417, "lon":  -87.75528},
+    "Los Angeles":    {"lat": 33.93806, "lon": -118.38889},
+    "Atlanta":        {"lat": 33.64028, "lon":  -84.42694},
+    "Washington DC":  {"lat": 38.84833, "lon":  -77.03417},
+    "Phoenix":        {"lat": 33.42780, "lon": -112.00347},
+    "Dallas":         {"lat": 32.89743, "lon":  -97.02196},
+    "Las Vegas":      {"lat": 36.07188, "lon": -115.16340},
+    "Oklahoma City":  {"lat": 35.38861, "lon":  -97.60028},
+    "Seattle":        {"lat": 47.44472, "lon": -122.31361},
+    "San Francisco":  {"lat": 37.61961, "lon": -122.36558},
+    "San Antonio":    {"lat": 29.53278, "lon":  -98.46361},
+    "Minneapolis":    {"lat": 44.88306, "lon":  -93.22889},
+    "New Orleans":    {"lat": 29.99278, "lon":  -90.25083},
 }
 
 # Fetch forecasts for all cities
