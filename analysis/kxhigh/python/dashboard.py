@@ -26,8 +26,19 @@ def section(title: str, subtitle: str = "") -> str:
 
 
 def exec_summary(text: str) -> str:
-    """Executive summary block at the top of each section."""
+    """Static 'what this section measures' block at the top."""
     return f'<div class="exec">{text}</div>'
+
+
+def commentary(bullets: list[str], headline: str = "") -> str:
+    """Data-driven takeaways block at the bottom of each section.
+    Rendered with a distinct style so the reader knows it's auto-generated
+    from this run's numbers (not boilerplate). Pass a list of 3-5 short
+    plain-English findings."""
+    head = f'<div class="ctl">Takeaways</div>'
+    items = "".join(f"<li>{b}</li>" for b in bullets if b)
+    headline_html = f'<div class="chd">{headline}</div>' if headline else ""
+    return f'<div class="cmt">{head}{headline_html}<ul>{items}</ul></div>'
 
 
 def section_end() -> str:
@@ -100,7 +111,36 @@ def build_sanity(data: dict) -> str:
               'Model-validation sections below are thin — extend snapshot logging '
               'to run every cycle for more robust analysis. '
               '<br>AccuWeather source is 100% NULL (API key expired Mar 2026).</div>')
-    return exec_summary(summary) + f'<div class="cards">{card_html}</div>{caveat}'
+
+    # Dynamic commentary based on this run
+    settle_pnl = settle["pnl_dollars"].sum()
+    n_win = (settle["pnl_dollars"] > 0).sum()
+    n_loss = (settle["pnl_dollars"] < 0).sum()
+    win_rate = n_win / len(settle) if len(settle) else 0
+    roi = settle_pnl / settle["total_cost_dollars"].sum() if settle["total_cost_dollars"].sum() > 0 else 0
+    n_days = fill_dates.nunique()
+    daily_pnl = settle_pnl / n_days if n_days else 0
+    avg_markets_per_day = len(settle) / n_days if n_days else 0
+    fill_rate = orders["any_fill"].mean()
+
+    verdict = "profitable" if settle_pnl > 0 else ("break-even" if abs(settle_pnl) < 50 else "losing money")
+    win_comment = "robust" if win_rate > 0.6 else ("marginal" if win_rate > 0.5 else "poor")
+
+    takeaways = [
+        f"Over {n_days} trading days the bot is <b>{verdict}</b>: "
+        f"<b>${settle_pnl:,.0f}</b> net P&L on <b>${settle['total_cost_dollars'].sum():,.0f}</b> "
+        f"deployed capital (<b>{roi:.1%}</b> ROI).",
+        f"Win rate is {win_comment}: <b>{win_rate:.0%}</b> of {len(settle)} settled markets "
+        f"profitable ({n_win} winners vs {n_loss} losers). Averaging {avg_markets_per_day:.0f} "
+        f"markets settled per trading day.",
+        f"Daily P&L averages <b>${daily_pnl:+,.0f}/day</b>. Fill rate on placed orders is "
+        f"<b>{fill_rate:.1%}</b> (low by design — bot is post-only).",
+        "⚠ <b>Model-validation sections (2, 3, 4) are limited to 19 settled markets</b> "
+        "with bot snapshots due to the Mar 11–Apr 18 snapshot logging outage. The silent "
+        "failure is fixed going forward; give it ~2 weeks of runs before revisiting.",
+    ]
+
+    return exec_summary(summary) + f'<div class="cards">{card_html}</div>{caveat}' + commentary(takeaways)
 
 
 def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
@@ -201,7 +241,53 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
     html += "<h3>Overall accuracy (°F)</h3>" + table_html(acc_all)
     html += fig_to_html(fig2)
     html += fig_to_html(fig3)
-    return exec_summary(summary) + html
+
+    # Dynamic commentary
+    takeaways = []
+    if not acc_all.empty:
+        ens = acc_all[acc_all["source"] == "ensemble"].iloc[0] if (acc_all["source"] == "ensemble").any() else None
+        gfs = acc_all[acc_all["source"] == "GFS"].iloc[0] if (acc_all["source"] == "GFS").any() else None
+        ecm = acc_all[acc_all["source"] == "ECMWF"].iloc[0] if (acc_all["source"] == "ECMWF").any() else None
+        if ens is not None:
+            bias_dir = "cold (under-predicts)" if ens["bias"] < -0.2 else ("hot (over-predicts)" if ens["bias"] > 0.2 else "essentially unbiased")
+            takeaways.append(
+                f"Overall forecast MAE is <b>{ens['mae']:.2f}°F</b> — typical for next-day max "
+                f"forecasts. The ensemble runs <b>{bias_dir}</b> (bias {ens['bias']:+.2f}°F)."
+            )
+        if gfs is not None and ecm is not None:
+            better = "GFS" if gfs["mae"] < ecm["mae"] else "ECMWF"
+            diff = abs(gfs["mae"] - ecm["mae"])
+            takeaways.append(
+                f"GFS MAE {gfs['mae']:.2f}°F vs ECMWF MAE {ecm['mae']:.2f}°F — "
+                f"<b>{better}</b> edges out by {diff:.2f}°F. When they disagree, that spread is usable signal."
+            )
+
+    if not acc_city.empty:
+        ens_city = acc_city[acc_city["source"] == "ensemble"].copy()
+        if len(ens_city) >= 3:
+            worst = ens_city.nlargest(2, "mae")
+            best = ens_city.nsmallest(2, "mae")
+            worst_str = ", ".join(f"<b>{r['city_abv']}</b> ({r['mae']:.1f}°F)" for _, r in worst.iterrows())
+            best_str = ", ".join(f"<b>{r['city_abv']}</b> ({r['mae']:.1f}°F)" for _, r in best.iterrows())
+            takeaways.append(f"Hardest to forecast (largest MAE): {worst_str}. Easiest: {best_str}.")
+
+            biased = ens_city.reindex(ens_city["bias"].abs().sort_values(ascending=False).index).head(2)
+            if len(biased) and biased["bias"].abs().max() > 1.0:
+                bias_notes = []
+                for _, r in biased.iterrows():
+                    d = "too cold" if r["bias"] < 0 else "too hot"
+                    bias_notes.append(f"<b>{r['city_abv']}</b> ({r['bias']:+.1f}°F, forecasts {d})")
+                takeaways.append(f"Cities with material systematic bias: {', '.join(bias_notes)}. Worth a regime-specific correction.")
+
+    n_snap = (unique_days["forecast_source"] == "snapshot").sum()
+    n_back = (unique_days["forecast_source"] == "backfill_open_meteo").sum()
+    if n_back > n_snap * 5:
+        takeaways.append(
+            f"<b>{n_back} of {n_snap + n_back}</b> event-days used the Open-Meteo backfill rather "
+            f"than a real bot snapshot — this is an approximation until snapshot logging fills in."
+        )
+
+    return exec_summary(summary) + html + commentary(takeaways)
 
 
 def build_calibration(resolved: pd.DataFrame) -> str:
@@ -266,7 +352,59 @@ def build_calibration(resolved: pd.DataFrame) -> str:
                       xaxis_title="Predicted P(YES)", yaxis_title="Observed YES rate",
                       height=500)
 
-    return exec_summary(summary) + metrics_html + fig_to_html(fig) + "<h3>Bin breakdown</h3>" + table_html(rel)
+    # Dynamic commentary
+    takeaways = []
+    grade = "excellent" if b_model < 0.10 else ("strong" if b_model < 0.18 else ("fair" if b_model < 0.22 else "poor"))
+    takeaways.append(
+        f"Model Brier score: <b>{b_model:.3f}</b> ({grade}). Baseline is 0.25 (coin flip); "
+        f"perfect is 0.000. Log loss: {ll_model:.3f}. "
+        f"Sample size: <b>n={decomp['n']}</b> — {'thin' if decomp['n'] < 50 else 'reasonable'}."
+    )
+    if not np.isnan(b_mkt):
+        diff = b_mkt - b_model
+        if diff > 0.01:
+            takeaways.append(
+                f"Model beats market-implied probability: <b>{b_model:.3f} vs {b_mkt:.3f}</b> "
+                f"({diff:+.3f}). Our forecast is more accurate than the market consensus — "
+                f"that's the edge we're trading on."
+            )
+        elif diff < -0.01:
+            takeaways.append(
+                f"⚠ Market beats the model: {b_model:.3f} vs {b_mkt:.3f} ({diff:+.3f}). "
+                f"The bot's probability estimates are less accurate than what the market already "
+                f"prices in — edge is unclear."
+            )
+        else:
+            takeaways.append(
+                f"Model roughly tied with market: {b_model:.3f} vs {b_mkt:.3f}. "
+                f"Edge is marginal, mostly execution-driven."
+            )
+    # Calibration direction
+    if decomp['reliability'] > 0.02:
+        # Check if model is systematically over- or under-confident
+        with_pred = rel.dropna(subset=["mean_predicted", "actual_yes_rate"])
+        if len(with_pred):
+            overconf = (with_pred["mean_predicted"] > with_pred["actual_yes_rate"]).mean()
+            if overconf > 0.6:
+                takeaways.append(
+                    f"<b>Model is overconfident</b>: reliability {decomp['reliability']:.3f} "
+                    f"and predicted probabilities run higher than actual outcomes. Likely tail "
+                    f"mispricing — markets in the 0.7–0.9 predicted range resolve YES less often "
+                    f"than the model thinks."
+                )
+            elif overconf < 0.4:
+                takeaways.append(
+                    f"<b>Model is underconfident</b>: actual outcomes more extreme than predictions. "
+                    f"Could be leaving edge on the table by sizing too conservatively."
+                )
+    if decomp['n'] < 50:
+        takeaways.append(
+            "⚠ With only 19 markets, these numbers have wide confidence intervals. "
+            "Give it 2 weeks of snapshot data before drawing conclusions."
+        )
+
+    return (exec_summary(summary) + metrics_html + fig_to_html(fig)
+            + "<h3>Bin breakdown</h3>" + table_html(rel) + commentary(takeaways))
 
 
 def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
@@ -285,6 +423,7 @@ def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
         return exec_summary(summary) + '<p class="muted">No data.</p>'
 
     html_parts = [exec_summary(summary)]
+    takeaway_lines = []
     for col, label in [("forecast_std", "forecast_std"),
                        ("backfill_forecast_std", "backfill_forecast_std (GFS vs ECMWF)"),
                        ("forecast_range", "forecast_range")]:
@@ -303,7 +442,30 @@ def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
         fig.update_layout(title=f"{label}: spread vs P&L", height=400, showlegend=False)
         html_parts.append(f'<h3>{label}</h3>' + fig_to_html(fig))
         html_parts.append(table_html(binned.drop(columns=["bin"])))
-    return "".join(html_parts) or '<p class="muted">No usable spread columns.</p>'
+
+        # Analyze trend across bins
+        if len(binned) >= 3:
+            low_bin = binned.iloc[0]
+            high_bin = binned.iloc[-1]
+            trend = high_bin["mean_pnl"] - low_bin["mean_pnl"]
+            direction = "grows with" if trend > 0.5 else ("shrinks with" if trend < -0.5 else "flat across")
+            narrative = ""
+            if trend > 1.0:
+                narrative = "The bot <b>earns more</b> when sources disagree — exploiting uncertainty is working."
+            elif trend < -1.0:
+                narrative = "The bot <b>loses money</b> in high-spread conditions — model is mispricing when uncertainty is high. Candidate for a spread-based size reduction."
+            else:
+                narrative = "Spread doesn't cleanly correlate with P&L — model handles high and low uncertainty similarly."
+            takeaway_lines.append(
+                f"<b>{label}</b>: mean P&L {direction} spread (${low_bin['mean_pnl']:+.1f} in lowest "
+                f"quartile → ${high_bin['mean_pnl']:+.1f} in highest, n={int(low_bin['n'])}+{int(high_bin['n'])}). "
+                f"{narrative}"
+            )
+
+    html = "".join(html_parts) or '<p class="muted">No usable spread columns.</p>'
+    if takeaway_lines:
+        html += commentary(takeaway_lines)
+    return html
 
 
 def build_edge_capture(fills: pd.DataFrame) -> str:
@@ -337,8 +499,36 @@ def build_edge_capture(fills: pd.DataFrame) -> str:
                        win_rate=("realized_pnl_per_fill", lambda x: (x > 0).mean()))
                   .reset_index())
     edge_tbl["edge_bin"] = edge_tbl["edge_bin"].astype(str)
+
+    takeaways = []
+    if len(edge_tbl) >= 3:
+        lo = edge_tbl.iloc[0]
+        hi = edge_tbl.iloc[-1]
+        trend = hi["mean_pnl"] - lo["mean_pnl"]
+        if trend > 0.3:
+            verdict = "<b>The edge signal is real</b> — higher-edge fills are materially more profitable."
+        elif trend < -0.3:
+            verdict = "⚠ <b>Edge signal is inverted</b> — fills the model thought were best edge actually lose more. Suggests the model's fair-price calculation is biased in the direction it thinks is profitable."
+        else:
+            verdict = "Edge signal is weak — no clear relationship between perceived edge and realized P&L."
+        takeaways.append(
+            f"Mean P&L per fill: lowest-edge quintile <b>${lo['mean_pnl']:+.2f}</b>, "
+            f"highest-edge <b>${hi['mean_pnl']:+.2f}</b>. "
+            + verdict
+        )
+        best_bin = edge_tbl.loc[edge_tbl["mean_pnl"].idxmax()]
+        takeaways.append(
+            f"Best edge bin: {best_bin['edge_bin']} → "
+            f"<b>${best_bin['mean_pnl']:+.2f}/fill</b> avg P&L, "
+            f"<b>{best_bin['win_rate']:.0%}</b> win rate on {int(best_bin['n'])} fills."
+        )
+    takeaways.append(
+        f"⚠ Only <b>{len(df)} fills</b> have snapshot context (the rest fall in the Mar 11 → "
+        "Apr 18 logging gap). This analysis is preliminary until snapshot data accumulates."
+    )
+
     return (exec_summary(summary) + fig_to_html(fig)
-            + "<h3>P&L by edge quintile</h3>" + table_html(edge_tbl))
+            + "<h3>P&L by edge quintile</h3>" + table_html(edge_tbl) + commentary(takeaways))
 
 
 def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
@@ -387,9 +577,50 @@ def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
         f'<div class="card"><div class="k">Taker fills</div><div class="v">{len(taker):,}</div><div class="d">P&L ${taker["realized_pnl_per_fill"].sum():,.2f}</div></div>',
         f'<div class="card"><div class="k">Maker fills</div><div class="v">{len(maker):,}</div><div class="d">P&L ${maker["realized_pnl_per_fill"].sum():,.2f}</div></div>',
     ])
+    # Dynamic commentary
+    takeaways = []
+    overall_fill_rate_orders = orders["any_fill"].mean()
+    overall_fill_rate_contracts = orders["filled_contracts"].sum() / orders["ordered_contracts"].sum() if orders["ordered_contracts"].sum() else 0
+    takeaways.append(
+        f"Fill rate: <b>{overall_fill_rate_orders:.1%} of orders</b> and "
+        f"<b>{overall_fill_rate_contracts:.1%} of contracts</b> across "
+        f"{len(orders):,} placed orders. Low is expected for a post-only bot."
+    )
+    if total_fees > 0 and total_gross > 0:
+        fee_pct = total_fees / total_gross * 100
+        fee_verdict = "negligible" if fee_pct < 2 else ("moderate" if fee_pct < 10 else "<b>material</b>")
+        takeaways.append(
+            f"Fees: <b>${total_fees:,.2f}</b> ({fee_pct:.1f}% of gross) — {fee_verdict}. "
+            f"Net P&L ${total_net:,.2f} vs gross ${total_gross:,.2f}."
+        )
+    if len(taker) > 0 and len(maker) > 0:
+        taker_avg = taker["realized_pnl_per_fill"].mean()
+        maker_avg = maker["realized_pnl_per_fill"].mean()
+        takeaways.append(
+            f"Maker vs taker: <b>{len(maker):,} maker fills</b> (avg ${maker_avg:+.2f}/fill) "
+            f"vs <b>{len(taker):,} taker fills</b> (avg ${taker_avg:+.2f}/fill). "
+            f"{'Makers more profitable — post-only strategy paying off.' if maker_avg > taker_avg else 'Takers more profitable — but bot is post-only by design; check why this category exists.'}"
+        )
+    elif len(taker) == 0:
+        takeaways.append(
+            "All fills are <b>maker</b> (post-only). No takers — as designed."
+        )
+    # Look at city-level fill rate patterns
+    if len(by_city) >= 3:
+        top = by_city.nlargest(2, "fill_rate_contracts")
+        bot = by_city.nsmallest(2, "fill_rate_contracts")
+        takeaways.append(
+            f"Highest fill rate cities: "
+            f"{', '.join(f'<b>{r.city_abv}</b> ({r.fill_rate_contracts:.1%})' for _, r in top.iterrows())}. "
+            f"Lowest: "
+            f"{', '.join(f'<b>{r.city_abv}</b> ({r.fill_rate_contracts:.1%})' for _, r in bot.iterrows())}. "
+            "Low fill rate ≠ bad — often means our limit prices are conservative."
+        )
+
     return (exec_summary(summary) + fig_to_html(fig1) + fig_to_html(fig2)
             + f'<div class="cards">{exec_cards}</div>'
-            + "<h3>By city (top 25)</h3>" + table_html(by_city))
+            + "<h3>By city (top 25)</h3>" + table_html(by_city)
+            + commentary(takeaways))
 
 
 def build_pnl_attribution(settle: pd.DataFrame) -> str:
@@ -451,9 +682,61 @@ def build_pnl_attribution(settle: pd.DataFrame) -> str:
                   title="P&L by weekday")
     fig4.update_layout(height=350)
 
+    # Dynamic commentary
+    takeaways = []
+    total = df["pnl"].sum()
+    total_cost = df["total_cost"].sum()
+    overall_roi = total / total_cost if total_cost else 0
+    max_dd = df["drawdown"].min()
+    max_dd_date = df.loc[df["drawdown"].idxmin(), "settled_ts"].date() if len(df) else None
+    takeaways.append(
+        f"Total P&L: <b>${total:,.2f}</b> on <b>${total_cost:,.0f}</b> of cost basis → "
+        f"<b>{overall_roi:.1%} ROI</b>. Worst drawdown: <b>${abs(max_dd):,.0f}</b> "
+        f"(trough around {max_dd_date})."
+    )
+    # Top/bottom cities
+    if len(by_city) >= 2:
+        winners = by_city.head(3)
+        losers = by_city.tail(3)
+        w_str = ", ".join(f"<b>{r.city_abv}</b> (${r.total_pnl:+,.0f}, ROI {r.roi:.0%})" for _, r in winners.iterrows())
+        l_str = ", ".join(f"<b>{r.city_abv}</b> (${r.total_pnl:+,.0f}, ROI {r.roi:.0%})" for _, r in losers.iterrows())
+        takeaways.append(f"Best cities: {w_str}.")
+        takeaways.append(f"Worst cities: {l_str}. Candidates for size reduction or blocking.")
+        # Cities losing money
+        losing_cities = by_city[by_city["total_pnl"] < 0]
+        if len(losing_cities) > 0:
+            losing_total = losing_cities["total_pnl"].sum()
+            takeaways.append(
+                f"<b>{len(losing_cities)} of {len(by_city)}</b> cities lost money "
+                f"(combined ${losing_total:,.0f}). Cutting these would boost net P&L to "
+                f"<b>${total - losing_total:,.0f}</b>."
+            )
+    # Weekday patterns
+    wd_nonzero = wd.dropna(subset=["total_pnl"]) if "total_pnl" in wd.columns else pd.DataFrame()
+    if len(wd_nonzero) >= 3:
+        best_wd = wd_nonzero.loc[wd_nonzero["total_pnl"].idxmax()]
+        worst_wd = wd_nonzero.loc[wd_nonzero["total_pnl"].idxmin()]
+        if best_wd["total_pnl"] - worst_wd["total_pnl"] > 30:
+            takeaways.append(
+                f"Weekday pattern: <b>{best_wd['weekday']}</b> is the best day "
+                f"(${best_wd['total_pnl']:+,.0f} on {int(best_wd['n'])} markets), "
+                f"<b>{worst_wd['weekday']}</b> the worst (${worst_wd['total_pnl']:+,.0f}). "
+                f"Could reflect forecast accuracy variation (weekends use older NWS packages)."
+            )
+    # Daily volatility
+    if len(daily) >= 5:
+        daily_std = daily["pnl"].std()
+        pos_days = (daily["pnl"] > 0).sum()
+        takeaways.append(
+            f"Daily P&L volatility: std <b>${daily_std:,.0f}/day</b>. "
+            f"<b>{pos_days} of {len(daily)}</b> settlement-days were net positive "
+            f"({pos_days/len(daily):.0%})."
+        )
+
     return (exec_summary(summary) + fig_to_html(fig) + fig_to_html(fig2)
             + fig_to_html(fig3) + fig_to_html(fig4)
-            + "<h3>Per-city table</h3>" + table_html(by_city))
+            + "<h3>Per-city table</h3>" + table_html(by_city)
+            + commentary(takeaways))
 
 
 CSS = """
@@ -475,6 +758,15 @@ h3 { margin-top: 24px; color: #444; font-size: 15px; }
 .exec b { color: #0d2840; }
 .exec .tl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
            color: #4a90b8; font-weight: 600; margin-bottom: 6px; display: block; }
+.cmt { background: #f9f7f1; border-left: 4px solid #c79a5c; padding: 14px 18px;
+       margin: 24px 0 0 0; border-radius: 4px; font-size: 14px; line-height: 1.6;
+       color: #3a2f1a; }
+.cmt .ctl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
+            color: #9a6b2d; font-weight: 600; margin-bottom: 6px; }
+.cmt .chd { font-weight: 600; font-size: 15px; color: #2a2010; margin-bottom: 8px; }
+.cmt ul { margin: 0; padding-left: 22px; }
+.cmt li { margin-bottom: 4px; }
+.cmt b { color: #5a3f10; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
          gap: 12px; margin: 16px 0; }
 .card { background: white; border: 1px solid #e0e0e0; border-radius: 6px; padding: 12px; }
