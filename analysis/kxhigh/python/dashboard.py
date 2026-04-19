@@ -114,45 +114,92 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
         'Cities where our forecast is consistently off are cities where betting is riskier.'
     )
     if len(resolved) == 0:
-        return exec_summary(summary) + '<p class="muted">No resolved-with-snapshot rows.</p>'
-    df = resolved.dropna(subset=["actual_high_estimate"]).copy()
+        return exec_summary(summary) + '<p class="muted">No resolved markets.</p>'
+    df = resolved.dropna(subset=["actual_high_estimate", "forecast_avg"]).copy()
     if len(df) == 0:
-        return '<p class="muted">No markets with an inferred actual_high.</p>'
+        return exec_summary(summary) + '<p class="muted">No markets with both forecast and actual.</p>'
 
-    # Scatter forecast_avg vs actual_high
-    fig1 = px.scatter(
-        df, x="forecast_avg", y="actual_high_estimate",
-        color="city", hover_data=["market_ticker", "forecast_error"],
-        title="Forecast avg vs actual high estimate",
+    # Aggregate to unique (city, event_date) pairs so we don't over-weight events
+    # with many buckets (each event has ~18 markets sharing the same forecast/actual).
+    unique_days = (
+        df.groupby(["city_abv", "forecast_date"], as_index=False)
+          .agg(
+              forecast_avg=("forecast_avg", "mean"),
+              actual_high=("actual_high_estimate", "mean"),
+              forecast_source=("forecast_source", "first"),
+              backfill_forecast_gfs=("backfill_forecast_gfs", "mean"),
+              backfill_forecast_ecmwf=("backfill_forecast_ecmwf", "mean"),
+          )
     )
-    lo = min(df["forecast_avg"].min(), df["actual_high_estimate"].min()) - 2
-    hi = max(df["forecast_avg"].max(), df["actual_high_estimate"].max()) + 2
+    unique_days["residual"] = unique_days["forecast_avg"] - unique_days["actual_high"]
+
+    # Scatter
+    fig1 = px.scatter(
+        unique_days, x="forecast_avg", y="actual_high",
+        color="city_abv", symbol="forecast_source",
+        hover_data=["forecast_date", "residual"],
+        title=f"Forecast avg vs actual high — per event-day (n={len(unique_days)})",
+    )
+    lo = min(unique_days["forecast_avg"].min(), unique_days["actual_high"].min()) - 2
+    hi = max(unique_days["forecast_avg"].max(), unique_days["actual_high"].max()) + 2
     fig1.add_shape(type="line", x0=lo, y0=lo, x1=hi, y1=hi,
                    line=dict(dash="dash", color="gray"))
     fig1.update_layout(height=500)
 
-    # Per-source accuracy
-    acc = M.forecast_accuracy(df)
-    acc_all = acc[acc["city"] == "__all__"].copy()
-    acc_city = acc[acc["city"] != "__all__"].copy()
+    # MAE/bias per city using ensemble forecast_avg + each model individually
+    rows = []
+    for (city, g) in unique_days.groupby("city_abv"):
+        for src_col, src_label in [
+            ("forecast_avg", "ensemble"),
+            ("backfill_forecast_gfs", "GFS"),
+            ("backfill_forecast_ecmwf", "ECMWF"),
+        ]:
+            s = g[[src_col, "actual_high"]].dropna()
+            if len(s) == 0:
+                continue
+            err = s[src_col] - s["actual_high"]
+            rows.append({
+                "city_abv": city, "source": src_label, "n": len(s),
+                "mae": err.abs().mean(), "bias": err.mean(),
+                "rmse": float(np.sqrt((err ** 2).mean())),
+            })
+    acc_city = pd.DataFrame(rows)
 
-    fig2 = None
-    if len(acc_city) > 0:
-        fig2 = px.bar(acc_city, x="city", y="mae", color="source", barmode="group",
-                      title="MAE per source × city")
-        fig2.update_layout(height=450)
+    # Overall across all cities
+    all_rows = []
+    for src_col, src_label in [
+        ("forecast_avg", "ensemble"),
+        ("backfill_forecast_gfs", "GFS"),
+        ("backfill_forecast_ecmwf", "ECMWF"),
+    ]:
+        s = unique_days[[src_col, "actual_high"]].dropna()
+        if len(s) == 0:
+            continue
+        err = s[src_col] - s["actual_high"]
+        all_rows.append({
+            "source": src_label, "n": len(s),
+            "mae": err.abs().mean(), "bias": err.mean(),
+            "rmse": float(np.sqrt((err ** 2).mean())),
+        })
+    acc_all = pd.DataFrame(all_rows)
 
-    # Residual per city
-    df["residual"] = df["forecast_avg"] - df["actual_high_estimate"]
-    fig3 = px.box(df, x="city", y="residual",
-                  title="Forecast residuals (forecast_avg − actual) by city")
+    fig2 = px.bar(acc_city, x="city_abv", y="mae", color="source", barmode="group",
+                  title="MAE by city (°F)")
+    fig2.update_layout(height=450)
+
+    fig3 = px.box(unique_days, x="city_abv", y="residual",
+                  title="Forecast residuals by city (forecast − actual, °F)")
     fig3.add_hline(y=0, line_dash="dash", line_color="gray")
     fig3.update_layout(height=450)
 
-    html = fig_to_html(fig1)
-    html += "<h3>Source accuracy (overall)</h3>" + table_html(acc_all)
-    if fig2 is not None:
-        html += fig_to_html(fig2)
+    source_note = (
+        f'<p class="muted">Forecast source: {(unique_days["forecast_source"]=="snapshot").sum()} from '
+        f'bot snapshots, {(unique_days["forecast_source"]=="backfill_open_meteo").sum()} from '
+        f'Open-Meteo historical backfill (GFS + ECMWF ensemble).</p>'
+    )
+    html = source_note + fig_to_html(fig1)
+    html += "<h3>Overall accuracy (°F)</h3>" + table_html(acc_all)
+    html += fig_to_html(fig2)
     html += fig_to_html(fig3)
     return exec_summary(summary) + html
 
@@ -239,7 +286,7 @@ def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
 
     html_parts = [exec_summary(summary)]
     for col, label in [("forecast_std", "forecast_std"),
-                       ("forecast_std_recomputed", "forecast_std (recomputed, NWS+WU)"),
+                       ("backfill_forecast_std", "backfill_forecast_std (GFS vs ECMWF)"),
                        ("forecast_range", "forecast_range")]:
         if col not in resolved.columns:
             continue
