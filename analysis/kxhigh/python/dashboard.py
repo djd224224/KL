@@ -140,7 +140,7 @@ def build_sanity(data: dict) -> str:
         "failure is fixed going forward; give it ~2 weeks of runs before revisiting.",
     ]
 
-    return exec_summary(summary) + f'<div class="cards">{card_html}</div>{caveat}' + commentary(takeaways)
+    return exec_summary(summary) + commentary(takeaways) + f'<div class="cards">{card_html}</div>{caveat}'
 
 
 def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
@@ -287,7 +287,7 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
             f"than a real bot snapshot — this is an approximation until snapshot logging fills in."
         )
 
-    return exec_summary(summary) + html + commentary(takeaways)
+    return exec_summary(summary) + commentary(takeaways) + html
 
 
 def build_calibration(resolved: pd.DataFrame) -> str:
@@ -403,8 +403,8 @@ def build_calibration(resolved: pd.DataFrame) -> str:
             "Give it 2 weeks of snapshot data before drawing conclusions."
         )
 
-    return (exec_summary(summary) + metrics_html + fig_to_html(fig)
-            + "<h3>Bin breakdown</h3>" + table_html(rel) + commentary(takeaways))
+    return (exec_summary(summary) + commentary(takeaways) + metrics_html + fig_to_html(fig)
+            + "<h3>Bin breakdown</h3>" + table_html(rel))
 
 
 def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
@@ -422,7 +422,8 @@ def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
     if len(resolved) == 0 or resolved["pnl"].isna().all():
         return exec_summary(summary) + '<p class="muted">No data.</p>'
 
-    html_parts = [exec_summary(summary)]
+    # Will prepend commentary once we've computed the takeaways
+    html_parts = []
     takeaway_lines = []
     for col, label in [("forecast_std", "forecast_std"),
                        ("backfill_forecast_std", "backfill_forecast_std (GFS vs ECMWF)"),
@@ -462,10 +463,13 @@ def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
                 f"{narrative}"
             )
 
-    html = "".join(html_parts) or '<p class="muted">No usable spread columns.</p>'
+    charts_html = "".join(html_parts)
+    if not charts_html:
+        return exec_summary(summary) + '<p class="muted">No usable spread columns.</p>'
+    header = exec_summary(summary)
     if takeaway_lines:
-        html += commentary(takeaway_lines)
-    return html
+        header += commentary(takeaway_lines)
+    return header + charts_html
 
 
 def build_edge_capture(fills: pd.DataFrame) -> str:
@@ -527,8 +531,8 @@ def build_edge_capture(fills: pd.DataFrame) -> str:
         "Apr 18 logging gap). This analysis is preliminary until snapshot data accumulates."
     )
 
-    return (exec_summary(summary) + fig_to_html(fig)
-            + "<h3>P&L by edge quintile</h3>" + table_html(edge_tbl) + commentary(takeaways))
+    return (exec_summary(summary) + commentary(takeaways) + fig_to_html(fig)
+            + "<h3>P&L by edge quintile</h3>" + table_html(edge_tbl))
 
 
 def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
@@ -617,10 +621,10 @@ def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
             "Low fill rate ≠ bad — often means our limit prices are conservative."
         )
 
-    return (exec_summary(summary) + fig_to_html(fig1) + fig_to_html(fig2)
+    return (exec_summary(summary) + commentary(takeaways)
+            + fig_to_html(fig1) + fig_to_html(fig2)
             + f'<div class="cards">{exec_cards}</div>'
-            + "<h3>By city (top 25)</h3>" + table_html(by_city)
-            + commentary(takeaways))
+            + "<h3>By city (top 25)</h3>" + table_html(by_city))
 
 
 def build_pnl_attribution(settle: pd.DataFrame) -> str:
@@ -733,10 +737,10 @@ def build_pnl_attribution(settle: pd.DataFrame) -> str:
             f"({pos_days/len(daily):.0%})."
         )
 
-    return (exec_summary(summary) + fig_to_html(fig) + fig_to_html(fig2)
+    return (exec_summary(summary) + commentary(takeaways)
+            + fig_to_html(fig) + fig_to_html(fig2)
             + fig_to_html(fig3) + fig_to_html(fig4)
-            + "<h3>Per-city table</h3>" + table_html(by_city)
-            + commentary(takeaways))
+            + "<h3>Per-city table</h3>" + table_html(by_city))
 
 
 CSS = """
