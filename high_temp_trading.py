@@ -351,27 +351,46 @@ def get_nws_meta(lat, lon):
         return None
 
 
-def get_nws_hourly_peak(meta, target_date):
-    """Return (peak_hour_central, peak_temp_f) for target_date (US/Central)."""
+def get_nws_hourly_peak(meta, target_date, now_ct=None):
+    """Return hourly-forecast summary for target_date (US/Central):
+      - peak_hour_ct, peak_temp_f  (hour/temp of expected max)
+      - forecast_update_ts         (when NWS issued this forecast; ISO8601 str)
+      - forecast_temp_at_run_f     (temp NWS says the station should be at the
+                                    hour containing `now_ct`; used to record
+                                    observed-vs-forecast drift without adjusting
+                                    the model's forecast_avg)
+    Returns dict with all fields (any may be None on failure)."""
+    result = {"peak_hour_ct": None, "peak_temp_f": None,
+              "forecast_update_ts": None, "forecast_temp_at_run_f": None}
     if meta is None:
-        return None, None
+        return result
     try:
         data = _nws_get(meta['hourly_url'])
-        periods = data['properties']['periods']
+        props = data.get('properties', {})
+        result["forecast_update_ts"] = props.get('updateTime')
+        periods = props.get('periods', [])
         central_tz = pytz.timezone('US/Central')
         peak = None
+        # Hour matching "now" — used for the obs-minus-forecast delta
+        now_hr = None
+        if now_ct is not None:
+            if now_ct.tzinfo is None:
+                now_ct = central_tz.localize(now_ct)
+            now_hr = (now_ct.date(), now_ct.hour)
         for p in periods:
             st = datetime.fromisoformat(p['startTime']).astimezone(central_tz)
-            if st.date() != target_date:
-                continue
-            if peak is None or p['temperature'] > peak[1]:
-                peak = (st.hour, p['temperature'])
-        if peak is None:
-            return None, None
-        return peak[0], peak[1]
+            if st.date() == target_date:
+                if peak is None or p['temperature'] > peak[1]:
+                    peak = (st.hour, p['temperature'])
+            if now_hr is not None and (st.date(), st.hour) == now_hr:
+                result["forecast_temp_at_run_f"] = p['temperature']
+        if peak is not None:
+            result["peak_hour_ct"] = peak[0]
+            result["peak_temp_f"] = peak[1]
+        return result
     except Exception as e:
         alert("NWS_HOURLY_FAILED", f"NWS hourly failed: {e}", {"source": "nws_hourly"})
-        return None, None
+        return result
 
 
 def get_nws_current_observation(city_name):
@@ -875,14 +894,24 @@ _CITY_CUTOFF_HOUR = {
 
 if variable == 0:
     print("\n========== PRE-TRADE RISK CHECKS (day run) ==========")
-    _today_ct = datetime.now(pytz.timezone('US/Central')).date()
+    _now_ct = datetime.now(pytz.timezone('US/Central'))
+    _today_ct = _now_ct.date()
     _forecast_max_by_city = dict(zip(combined_table['City'], combined_table['Average']))
     for _city, _coords in cities.items():
         _cutoff = _CITY_CUTOFF_HOUR.get(_city, 10)
         _meta = get_nws_meta(*_coords)
-        _peak_hr, _peak_temp = get_nws_hourly_peak(_meta, _today_ct) if _meta else (None, None)
+        _hourly = get_nws_hourly_peak(_meta, _today_ct, now_ct=_now_ct) if _meta else {
+            "peak_hour_ct": None, "peak_temp_f": None,
+            "forecast_update_ts": None, "forecast_temp_at_run_f": None,
+        }
+        _peak_hr, _peak_temp = _hourly["peak_hour_ct"], _hourly["peak_temp_f"]
+        _update_ts = _hourly["forecast_update_ts"]
+        _f_at_run = _hourly["forecast_temp_at_run_f"]
         _station, _obs = get_nws_current_observation(_city)
         _fmax = _forecast_max_by_city.get(_city)
+        # Observed minus forecasted for the current hour — recorded for later
+        # analysis, NOT used to adjust forecast_avg (per directive).
+        _obs_minus_forecast = (_obs - _f_at_run) if (_obs is not None and _f_at_run is not None) else None
         _skip_reason = None
 
         if _peak_hr is not None and _peak_hr < _cutoff:
@@ -902,8 +931,10 @@ if variable == 0:
             if _obs is not None:
                 PRE_TRADE_OBSERVED[_city] = _obs
             if _peak_hr is not None and _obs is not None:
+                _drift_str = (f"drift {_obs_minus_forecast:+.1f}F"
+                              if _obs_minus_forecast is not None else "drift n/a")
                 print(f"  OK  {_city}: peak {_peak_hr:02d}:00 CT / {_peak_temp}F, "
-                      f"obs ({_station}) {_obs:.0f}F, forecast_max {_fmax:.0f}F")
+                      f"obs ({_station}) {_obs:.0f}F, forecast_max {_fmax:.0f}F, {_drift_str}")
             elif _meta is None:
                 print(f"  {_city}: NWS meta unavailable, no filter applied")
 
@@ -913,6 +944,9 @@ if variable == 0:
             "observed_temp_f": _obs,
             "observed_station": _station,
             "pre_trade_skip_reason": _skip_reason,
+            "nws_forecast_update_ts": _update_ts,
+            "forecast_temp_at_run_hour_f": _f_at_run,
+            "obs_minus_forecast_at_run_f": _obs_minus_forecast,
         }
         time.sleep(0.1)
     print(f"==========> {len(PRE_TRADE_SKIP_CITIES)} city/cities skipped; "
@@ -921,7 +955,8 @@ if variable == 0:
 # Stamp per-city pre-trade state onto combined_table so it persists to the
 # snapshot table. Per-market rows in the same city share the same value.
 for _col in ["peak_hour_ct", "peak_temp_f", "observed_temp_f", "observed_station",
-             "pre_trade_skip_reason"]:
+             "pre_trade_skip_reason", "nws_forecast_update_ts",
+             "forecast_temp_at_run_hour_f", "obs_minus_forecast_at_run_f"]:
     combined_table[_col] = combined_table['City'].map(
         lambda c, col=_col: (PRE_TRADE_STATE.get(c) or {}).get(col)
     )
@@ -966,6 +1001,10 @@ _SNAPSHOT_BQ_COLS = [
     # Populated by the PRE-TRADE RISK CHECKS block that must run before this write.
     "peak_hour_ct", "peak_temp_f", "observed_temp_f", "observed_station",
     "pre_trade_skip_reason",
+    # Forecast freshness + live-obs drift (for analysis; not used to adjust prices).
+    "nws_forecast_update_ts",       # when NWS issued the hourly forecast we used
+    "forecast_temp_at_run_hour_f",  # what NWS said the temp should be at run hour
+    "obs_minus_forecast_at_run_f",  # observed − forecast (+: forecast running cold)
 ]
 _SNAPSHOT_NUMERIC_COLS = [
     "weather_underground", "accuweather", "nws",
@@ -975,6 +1014,7 @@ _SNAPSHOT_NUMERIC_COLS = [
     "yes_probability", "fair_no_price",
     "no_highest_bid", "no_lowest_offer",
     "peak_temp_f", "observed_temp_f",
+    "forecast_temp_at_run_hour_f", "obs_minus_forecast_at_run_f",
 ]
 
 snapshot_df = combined_table.rename(columns=_SNAPSHOT_COL_MAP).copy()
@@ -988,6 +1028,9 @@ snapshot_df["forecast_date"] = pd.to_datetime(snapshot_df["forecast_date"], erro
 snapshot_df["run_date"] = pd.to_datetime(snapshot_df["run_date"], errors="coerce")
 snapshot_df["position"] = pd.to_numeric(snapshot_df["position"], errors="coerce").astype("Int64")
 snapshot_df["peak_hour_ct"] = pd.to_numeric(snapshot_df["peak_hour_ct"], errors="coerce").astype("Int64")
+snapshot_df["nws_forecast_update_ts"] = pd.to_datetime(
+    snapshot_df["nws_forecast_update_ts"], errors="coerce", utc=True
+)
 
 write_to_bq(snapshot_df, "market_snapshot", "WRITE_APPEND")
 
