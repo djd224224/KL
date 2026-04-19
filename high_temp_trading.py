@@ -277,6 +277,87 @@ def get_nws_forecast(lat, lon):
         print(f"Error fetching NWS forecast for {lat}, {lon}: {e}")
         return "N/A"
 
+# =====================================================================
+# NWS hourly forecast + current observation (pre-trade risk filters)
+# =====================================================================
+# Used to detect three adverse-selection scenarios at run time:
+#   (1) expected peak temp is BEFORE our order-cancel cutoff — high is
+#       effectively set before we can react → skip the city
+#   (2) the observed temp at run time is already at/above a bucket's
+#       lower bound — the bot's yes_probability didn't price in temps
+#       this high yet → skip that bucket
+#   (3) the observed temp exceeds the forecast's daily max — the whole
+#       forecast is busted → skip the city
+NWS_HEADERS = {"User-Agent": "KXHIGH-bot/1.0 (contact: jack)"}
+
+def get_nws_meta(lat, lon):
+    """One-time fetch of NWS grid + stations URL for a coordinate. Cached per city."""
+    try:
+        r = requests.get(f"https://api.weather.gov/points/{lat},{lon}",
+                         headers=NWS_HEADERS, timeout=10)
+        r.raise_for_status()
+        props = r.json()['properties']
+        return {
+            'hourly_url': props['forecastHourly'],
+            'stations_url': props['observationStations'],
+        }
+    except Exception as e:
+        alert("NWS_META_FAILED", f"NWS points failed for {lat},{lon}: {e}",
+              {"source": "nws_meta"})
+        return None
+
+
+def get_nws_hourly_peak(meta, target_date):
+    """Fetch hourly forecast and return (peak_hour_central, peak_temp_f) for
+    target_date (US/Central date). Returns (None, None) on failure."""
+    if meta is None:
+        return None, None
+    try:
+        r = requests.get(meta['hourly_url'], headers=NWS_HEADERS, timeout=10)
+        r.raise_for_status()
+        periods = r.json()['properties']['periods']
+        central_tz = pytz.timezone('US/Central')
+        peak = None
+        for p in periods:
+            st = datetime.fromisoformat(p['startTime']).astimezone(central_tz)
+            if st.date() != target_date:
+                continue
+            if peak is None or p['temperature'] > peak[1]:
+                peak = (st.hour, p['temperature'])
+        if peak is None:
+            return None, None
+        return peak[0], peak[1]
+    except Exception as e:
+        alert("NWS_HOURLY_FAILED", f"NWS hourly failed: {e}", {"source": "nws_hourly"})
+        return None, None
+
+
+def get_nws_current_observation(meta):
+    """Fetch the latest METAR observation from the closest NWS station.
+    Returns observed_temp_f or None."""
+    if meta is None:
+        return None
+    try:
+        r = requests.get(meta['stations_url'], headers=NWS_HEADERS, timeout=10)
+        r.raise_for_status()
+        features = r.json().get('features', [])
+        if not features:
+            return None
+        station_id = features[0]['properties']['stationIdentifier']
+        r2 = requests.get(
+            f"https://api.weather.gov/stations/{station_id}/observations/latest",
+            headers=NWS_HEADERS, timeout=10,
+        )
+        r2.raise_for_status()
+        temp_c = r2.json().get('properties', {}).get('temperature', {}).get('value')
+        if temp_c is None:
+            return None
+        return temp_c * 9 / 5 + 32
+    except Exception as e:
+        alert("NWS_OBS_FAILED", f"NWS observation failed: {e}", {"source": "nws_obs"})
+        return None
+
+
 # Iterate through cities and fetch data
 # def get_weatherunderground_forecast(lat, lon):
 def get_weatherunderground_forecast(city, coords):
@@ -882,6 +963,66 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
     # Convert to Unix time
     return int(target_time.timestamp())
 
+# =====================================================================
+# PRE-TRADE RISK FILTERS — fetch NWS hourly + observations per city and
+# decide whether to skip (or partially skip) each city BEFORE order placement.
+# Only applies to DAY runs (variable=0, trading today). Night runs (variable=1,
+# trading tomorrow) don't have meaningful intra-day observations yet.
+# =====================================================================
+PRE_TRADE_SKIP_CITIES = set()       # cities to skip entirely
+PRE_TRADE_OBSERVED = {}             # city -> observed_temp_f (for per-bucket filter)
+
+# City -> cutoff hour (CT) for order cancels; must stay in sync with the per-
+# city mapping at the order-placement site below.
+_CITY_CUTOFF_HOUR = {
+    "New York City": 9, "Philadelphia": 9, "Miami": 9, "Atlanta": 9,
+    "Washington DC": 9,
+}  # everything else defaults to 10
+
+if variable == 0:
+    print("\n========== PRE-TRADE RISK CHECKS (day run) ==========")
+    _today_ct = datetime.now(pytz.timezone('US/Central')).date()
+    # forecast max per city, from the forecast_table we already built
+    _forecast_max_by_city = dict(zip(combined_table['City'], combined_table['Average']))
+    for _city, _coords in cities.items():
+        _cutoff = _CITY_CUTOFF_HOUR.get(_city, 10)
+        _meta = get_nws_meta(*_coords)
+        if _meta is None:
+            print(f"  {_city}: NWS meta unavailable, no filter applied")
+            continue
+        _peak_hr, _peak_temp = get_nws_hourly_peak(_meta, _today_ct)
+        _obs = get_nws_current_observation(_meta)
+
+        # Filter 1: peak hour before cutoff → high already set, skip
+        if _peak_hr is not None and _peak_hr < _cutoff:
+            print(f"  SKIP {_city}: peak {_peak_hr:02d}:00 CT < cutoff {_cutoff:02d}:00 "
+                  f"(high effectively set — pickoff risk)")
+            alert("PRE_TRADE_SKIP_PEAK", f"{_city}: peak hr {_peak_hr} < cutoff {_cutoff}",
+                  {"city": _city, "peak_hour_ct": _peak_hr, "cutoff_hour_ct": _cutoff})
+            PRE_TRADE_SKIP_CITIES.add(_city)
+            continue
+
+        # Filter 3: observed already > forecast_max + 2°F → forecast busted
+        _fmax = _forecast_max_by_city.get(_city)
+        if _obs is not None and _fmax is not None and _obs > _fmax + 2:
+            print(f"  SKIP {_city}: obs {_obs:.0f}F > forecast_max {_fmax:.0f}F + 2F (busted)")
+            alert("PRE_TRADE_SKIP_BUSTED",
+                  f"{_city}: obs {_obs:.1f} > forecast {_fmax:.1f} + 2",
+                  {"city": _city, "observed_f": _obs, "forecast_max_f": _fmax})
+            PRE_TRADE_SKIP_CITIES.add(_city)
+            continue
+
+        # Stash obs for per-bucket check in the trading loop
+        if _obs is not None:
+            PRE_TRADE_OBSERVED[_city] = _obs
+        if _peak_hr is not None and _obs is not None:
+            print(f"  OK  {_city}: peak {_peak_hr:02d}:00 CT, obs {_obs:.0f}F, "
+                  f"forecast_max {_fmax:.0f}F")
+        time.sleep(0.1)  # polite NWS rate limit
+    print(f"==========> {len(PRE_TRADE_SKIP_CITIES)} city/cities skipped; "
+          f"{len(PRE_TRADE_OBSERVED)} have observations for per-bucket check\n")
+
+
 ########## BUY CALCULATIONS
 orders_placed = 0
 _diag_printed = False
@@ -905,6 +1046,22 @@ for index, row in combined_table.iterrows():
       continue
   except:
     pass  # If check fails, try to place orders anyway
+
+  # Filter 0b: city-level pre-trade skip (peak hour or forecast busted)
+  if row['City'] in PRE_TRADE_SKIP_CITIES:
+    print(f"    SKIP: city-level pre-trade filter active for {row['City']}")
+    continue
+
+  # Filter 0c: observed temp already at/above bucket's lower bound.
+  # The bot's yes_probability (computed from normal CDF on forecast_avg) didn't
+  # condition on today's observations. If obs >= low_range already, either the
+  # bucket is active RIGHT NOW or the high will likely exceed it — buying NO
+  # at the bot's computed price is adversely selected.
+  _obs_now = PRE_TRADE_OBSERVED.get(row['City'])
+  if _obs_now is not None and _obs_now >= row['low_range']:
+    print(f"    SKIP: obs {_obs_now:.0f}F >= bucket low_range {row['low_range']:.0f}F "
+          f"(bucket active or already cleared)")
+    continue
 
   # Filter 1: probability cutoff
   if not (yes_prob > market_cutoff_probability or is_tail):
