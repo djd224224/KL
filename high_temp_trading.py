@@ -160,17 +160,25 @@ except Exception as e:
     bq_client = None
 
 def write_to_bq(df, table_name, write_disposition="WRITE_APPEND"):
-    """Upload DataFrame to BigQuery. Non-fatal on failure."""
-    if bq_client is None or df is None or len(df) == 0:
+    """Upload DataFrame to BigQuery. Non-fatal on failure (alerts on error)."""
+    if bq_client is None:
+        print(f"  BQ SKIP: {table_name} — bq_client is None")
+        return
+    if df is None or len(df) == 0:
+        print(f"  BQ SKIP: {table_name} — df empty (rows=0)")
         return
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}{table_name}"
     try:
         job_config = bigquery.LoadJobConfig(write_disposition=write_disposition, autodetect=True)
         job = bq_client.load_table_from_dataframe(df, table_id, job_config=job_config)
         job.result()
-        print(f"  BQ: {table_id} → {bq_client.get_table(table_id).num_rows} rows")
+        print(f"  BQ: {table_id} ← {len(df)} rows (table total: {bq_client.get_table(table_id).num_rows})")
     except Exception as e:
-        print(f"  BQ error (non-fatal): {e}")
+        print(f"  BQ ERROR: {table_id} write failed: {e}")
+        try:
+            alert("BQ_WRITE_FAIL", f"{table_id}: {e}", {"table": table_name, "rows": len(df)})
+        except Exception:
+            pass
 
 # Collector for orders placed during this run
 all_order_records = []
@@ -733,7 +741,60 @@ combined_table
 ####### WRITE MARKET SNAPSHOT TO BIGQUERY
 
 print("\nWriting market snapshot to BigQuery...")
-write_to_bq(combined_table, "market_snapshot", "WRITE_APPEND")
+
+# Map DataFrame's Title-Case columns to BQ's snake_case schema for KXHIGH_market_snapshot.
+# Without this, load_table_from_dataframe fails silently on schema mismatch (the
+# cause of the Mar 11 2026 → present snapshot logging gap).
+_SNAPSHOT_COL_MAP = {
+    "City": "city",
+    "Forecast Date": "forecast_date",
+    "Run Date": "run_date",
+    "Weather Underground": "weather_underground",
+    "NWS": "nws",
+    "Average": "forecast_avg",
+    "Standard Deviation": "forecast_std",
+    "Highest Minus Lowest": "forecast_range",
+    "NWS Detailed Conditions": "nws_detailed_conditions",
+    "NWS Short Conditions": "nws_short_conditions",
+    "Midnight Temperature": "midnight_temperature",
+    "var": "historical_var",
+    "var_sqrt": "historical_var_sqrt",
+}
+_SNAPSHOT_BQ_COLS = [
+    "city", "forecast_date", "run_date",
+    "weather_underground", "accuweather", "nws",
+    "forecast_avg", "forecast_std", "forecast_range",
+    "nws_detailed_conditions", "nws_short_conditions",
+    "midnight_temperature",
+    "event_ticker", "market_ticker",
+    "low_range", "high_range", "hi_no_price",
+    "historical_var", "historical_var_sqrt",
+    "yes_probability", "fair_no_price",
+    "no_highest_bid", "no_lowest_offer",
+    "no_orderbook", "yes_orderbook",
+    "position",
+]
+_SNAPSHOT_NUMERIC_COLS = [
+    "weather_underground", "accuweather", "nws",
+    "forecast_avg", "forecast_std", "forecast_range",
+    "midnight_temperature", "low_range", "high_range", "hi_no_price",
+    "historical_var", "historical_var_sqrt",
+    "yes_probability", "fair_no_price",
+    "no_highest_bid", "no_lowest_offer",
+]
+
+snapshot_df = combined_table.rename(columns=_SNAPSHOT_COL_MAP).copy()
+for col in _SNAPSHOT_BQ_COLS:
+    if col not in snapshot_df.columns:
+        snapshot_df[col] = None
+snapshot_df = snapshot_df[_SNAPSHOT_BQ_COLS]
+for col in _SNAPSHOT_NUMERIC_COLS:
+    snapshot_df[col] = pd.to_numeric(snapshot_df[col], errors="coerce")
+snapshot_df["forecast_date"] = pd.to_datetime(snapshot_df["forecast_date"], errors="coerce").dt.date
+snapshot_df["run_date"] = pd.to_datetime(snapshot_df["run_date"], errors="coerce")
+snapshot_df["position"] = pd.to_numeric(snapshot_df["position"], errors="coerce").astype("Int64")
+
+write_to_bq(snapshot_df, "market_snapshot", "WRITE_APPEND")
 
 combined_table = combined_table.fillna("")
 
