@@ -44,7 +44,20 @@ SELECT
   p.parsed_strike       AS market_strike,
   UPPER(p.result) AS result,
   CASE WHEN UPPER(p.result) = "YES" THEN 1 ELSE 0 END AS outcome_yes,
-  w.winning_high_temp,
+  -- Prefer real NWS CLI reading; fall back to between-bucket midpoint
+  COALESCE(
+    CAST(cli.high_temp_f AS FLOAT64),
+    w.winning_high_temp
+  ) AS winning_high_temp,
+  CAST(cli.high_temp_f AS FLOAT64) AS cli_high_temp_f,
+  w.winning_high_temp AS bucket_midpoint_temp,
+  cli.high_time AS cli_high_time,
+  cli.icao AS cli_station,
+  CASE
+    WHEN cli.high_temp_f IS NOT NULL THEN "nws_cli"
+    WHEN w.winning_high_temp IS NOT NULL THEN "bucket_midpoint"
+    ELSE NULL
+  END AS winning_temp_source,
   -- Money — all in dollars
   p.revenue / 100.0        AS revenue_dollars,
   p.value   / 100.0        AS residual_value_dollars,
@@ -65,4 +78,7 @@ SELECT
   SAFE.PARSE_TIMESTAMP("%Y-%m-%dT%H:%M:%E*SZ", p.settled_time) AS settled_ts,
   SAFE.PARSE_TIMESTAMP("%Y-%m-%dT%H:%M:%E*S%Ez", p.pulled_at)  AS pulled_ts
 FROM parsed p
-LEFT JOIN event_winners w ON p.parsed_event_ticker = w.parsed_event_ticker;
+LEFT JOIN event_winners w ON p.parsed_event_ticker = w.parsed_event_ticker
+LEFT JOIN `elite-contact-446323-q7.Kalshi.KXHIGH_cli_readings` cli
+  ON p.parsed_city_abv = cli.city_abv
+  AND SAFE.PARSE_DATE("%y%b%d", p.parsed_date_code) = cli.event_date;
