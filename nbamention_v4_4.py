@@ -560,8 +560,8 @@ PRICING_STRATEGY = 'hybrid'
 # ---------- BAYESIAN HYBRID PRICING PARAMETERS ----------
 BAYESIAN_K = 25
 BAYESIAN_RECENCY_HALFLIFE_GAMES = 50
-BAYESIAN_MARKET_WEIGHT = 0.6
-BAYESIAN_HISTORICAL_WEIGHT = 0.4
+BAYESIAN_MARKET_WEIGHT = 0.75
+BAYESIAN_HISTORICAL_WEIGHT = 0.25
 
 # =====================================================================
 # [v4.4] BANKROLL-SCALED POSITION MANAGEMENT
@@ -582,7 +582,7 @@ def fetch_bankroll(client) -> Tuple[float, int, int]:
         return BANKROLL_FALLBACK, 0, 0
 
 def get_scaled_limits(bankroll: float) -> dict:
-    scale = max(0.5, min(bankroll / 5000, 2.0))
+    scale = max(0.5, min(bankroll / 5000, 1.5))
     return {
         "MAX_NET_PER_MARKET": int(150 * scale),           # [v4.8] was 200
         "POSITION_MODERATE_THRESHOLD": int(67 * scale),
@@ -615,9 +615,8 @@ MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
 # [v4.9] Per-market net cap overrides — strongest-edge markets get larger limits
 MARKET_NET_OVERRIDES = {
-    "ANKL": 350,
-    "RETI": 350,
-    "DRAF": 350,
+    "RETI": 300,
+    "DRAF": 300,
 }
 
 def get_market_net_cap(market_code: str) -> int:
@@ -656,10 +655,10 @@ SIDE_MULTIPLIERS = {
     # === v4.5 SIDE MULTIPLIER UPDATE (Mar 18 2026) ===
     # Based on 1,149 settlements from Feb 19 - Mar 17
     "JORD": {"yes": 0.3, "no": 0.0},    # v4.4 was yes:0.3 -- YES is +$248 (9.7% ROI), boosted
-    "RETI": {"yes": 0.0, "no": 2.0},    # keep -- NO is +$621 (39.9% ROI)
+    "RETI": {"yes": 0.0, "no": 2.25},   # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
-    "ANKL": {"yes": 1.0, "no": 3.0},    # [v4.9] NO 2.5→3.0 — sustained edge
-    "BUZZ": {"yes": 0.5, "no": 1.3},    # [v4.9] enabled YES 0.0→0.5 — buy YES per directive
+    "ANKL": {"yes": 1.0, "no": 2.0},    # [v4.9] NO 2.5→3.0 — sustained edge
+    "BUZZ": {"yes": 1.5, "no": 1.0},    # [v4.9] enabled YES 0.0→0.5 — buy YES per directive
     "ALLE": {"yes": 0.0, "no": 0.0},    # [v4.9] killed both sides — sustained losses
     "AIRB": {"yes": 0.3, "no": 0.0},    # [v4.9] killed NO — YES +$640 retained, NO consistent loser
     "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
@@ -668,8 +667,8 @@ SIDE_MULTIPLIERS = {
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "INJU": {"yes": 0.5, "no": 0.0},    # keep -- marginal +$3
-    "DRAF": {"yes": 0.5, "no": 2.5},    # [v4.9] NO 2.0→2.5 — sustained edge
-    "CROW": {"yes": 0.0, "no": 1.3},    # keep -- NO +$24 (50% ROI)
+    "DRAF": {"yes": 0.5, "no": 2.25},   # [v4.9] NO 2.0→2.5 — sustained edge
+    "CROW": {"yes": 0.0, "no": 0.0},    # keep -- NO +$24 (50% ROI)
     "ROOK": {"yes": 0.0, "no": 0.5},    # [v4.8] NO 1.5→0.5 — NO is -$6 (-4.6%)
     "PLAY": {"yes": 1.3, "no": 0.0},    # keep -- YES +$54 (28% ROI)
     # === ONE-OFF MARKETS: block consistently unprofitable codes ===
@@ -695,27 +694,25 @@ SIDE_MULTIPLIERS = {
 # [v4.5] TEAM MULTIPLIERS — with penalty teams
 # =====================================================================
 TEAM_MULTIPLIERS = {
-    # Boost profitable teams
-    "DEN": 1.4,   # [v4.8] raised 1.2→1.4 — +$1,397 P&L, +17.6% ROI
-    "GSW": 1.4,   # +$740 P&L, +11.4% ROI
-    "LAL": 1.3,   # +$1,322 P&L, +15.8% ROI
-    "DET": 1.2,   # [v4.8] NEW — +$686 P&L, +12.9% ROI
-    "PHX": 1.2,   # [v4.8] NEW — +$487 P&L, +20.0% ROI
-    "LAC": 1.1,   # +$322 P&L, +5.9% ROI
-    # Penalize consistently unprofitable teams
-    "WAS": 0.3,   # -$715 P&L, -95.2% ROI
-    "MIA": 0.5,   # -$749 P&L, -38.0% ROI
-    "CHI": 0.5,   # [v4.8] NEW — -$235 P&L, -26.5% ROI
-    "SAS": 0.5,   # [v4.8] was 0.7 — -$893 P&L, -11.9% ROI
-    "ORL": 0.5,   # [v4.8] was 0.8 — -$521 P&L, -11.9% ROI
-    "CLE": 0.7,   # -$545 P&L, -9.8% ROI
-    "NYK": 0.7,   # [v4.8] NEW — -$393 P&L, -5.7% ROI
-    "HOU": 0.7,   # -$20 P&L, -0.3% ROI
-    "OKC": 0.8,   # [v4.8] NEW — -$276 P&L, -3.6% ROI
+    "DEN": 1.0,
+    "GSW": 1.0,
+    "LAL": 1.0,
+    "DET": 1.0,
+    "PHX": 1.0,
+    "LAC": 1.0,
+    "WAS": 1.0,
+    "MIA": 1.0,
+    "CHI": 1.0,
+    "SAS": 1.0,
+    "ORL": 1.0,
+    "CLE": 1.0,
+    "NYK": 1.0,
+    "HOU": 1.0,
+    "OKC": 1.0,
 }
 
 # [v4.5] Top-performing NO markets get tighter offsets
-TOP_NO_MARKETS = {"ANKL", "BUZZ", "RETI", "DRAF", "ROOK", "CROW"}  # v4.5: removed OVER, ALLE, AIRB
+TOP_NO_MARKETS = {"ANKL", "RETI", "DRAF", "ROOK", "CROW"}  # v4.5: removed OVER, ALLE, AIRB
 
 # =====================================================================
 # [v4.6-5] CORRELATION PENALTY — rebuilt from actual settlement data
@@ -746,7 +743,7 @@ YES_PROBABILITY_FLOOR = 30      # [v4.7] lowered from 40
 # RETI is +$619 at 40% ROI, 46% Kelly — the most underweighted market.
 MAX_PRICE_OVERRIDES = {
     "RETI": 83,  # [v4.7] was 90 — capped at 84¢ per manual review
-    "BUZZ": 70,  # [v4.7] max NO bid 70¢
+    "BUZZ": 66,  # [v4.7] max NO bid 70¢
     "TRIP": 55,  # [v4.7] max NO bid 70¢
     "CROW": 14,  # [v4.9] block CROW NO above 14¢
 }
