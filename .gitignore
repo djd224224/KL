@@ -1,3 +1,5 @@
 Lisa_Kalshi.txt
 *.pem
 gcp_sa_key.json
+__pycache__/
+*.pyc
