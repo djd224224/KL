@@ -290,13 +290,53 @@ def get_nws_forecast(lat, lon):
 #       forecast is busted → skip the city
 NWS_HEADERS = {"User-Agent": "KXHIGH-bot/1.0 (contact: jack)"}
 
+# Kalshi settlement station per city. Verified matches /points top-station
+# for every city (within 0-2 km) via analysis/kxhigh/python/verify_stations.py.
+# Source: Kalshi contract-terms PDFs (NHIGH, CHIHIGH, MIAHIGH, LAXHIGH,
+# AUSHIGH, HOUHIGH, DENHIGH, PHILHIGH) + NWS CLI product conventions.
+CITY_TO_KALSHI_STATION = {
+    "New York City":  "KNYC",  # Central Park
+    "Chicago":        "KMDW",  # Midway
+    "Miami":          "KMIA",
+    "Los Angeles":    "KLAX",
+    "Denver":         "KDEN",
+    "Philadelphia":   "KPHL",
+    "Austin":         "KAUS",  # Bergstrom
+    "Houston":        "KHOU",  # Hobby (NOT IAH)
+    "Atlanta":        "KATL",
+    "Washington DC":  "KDCA",  # Reagan National
+    "Phoenix":        "KPHX",
+    "Dallas":         "KDFW",
+    "Las Vegas":      "KLAS",  # Harry Reid
+    "Oklahoma City":  "KOKC",
+    "Seattle":        "KSEA",
+    "San Francisco":  "KSFO",
+    "San Antonio":    "KSAT",
+    "Minneapolis":    "KMSP",
+    "New Orleans":    "KMSY",
+}
+
+
+def _nws_get(url, retries=3, timeout=10):
+    """GET with retry — NWS API is flaky about timeouts."""
+    last = None
+    for _ in range(retries):
+        try:
+            r = requests.get(url, headers=NWS_HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    raise last
+
+
 def get_nws_meta(lat, lon):
-    """One-time fetch of NWS grid + stations URL for a coordinate. Cached per city."""
+    """Fetch hourly-forecast + station-list URLs for a coordinate. Used only
+    for hourly forecast (grid-cell based). Observations go via explicit ICAO."""
     try:
-        r = requests.get(f"https://api.weather.gov/points/{lat},{lon}",
-                         headers=NWS_HEADERS, timeout=10)
-        r.raise_for_status()
-        props = r.json()['properties']
+        data = _nws_get(f"https://api.weather.gov/points/{lat},{lon}")
+        props = data['properties']
         return {
             'hourly_url': props['forecastHourly'],
             'stations_url': props['observationStations'],
@@ -308,14 +348,12 @@ def get_nws_meta(lat, lon):
 
 
 def get_nws_hourly_peak(meta, target_date):
-    """Fetch hourly forecast and return (peak_hour_central, peak_temp_f) for
-    target_date (US/Central date). Returns (None, None) on failure."""
+    """Return (peak_hour_central, peak_temp_f) for target_date (US/Central)."""
     if meta is None:
         return None, None
     try:
-        r = requests.get(meta['hourly_url'], headers=NWS_HEADERS, timeout=10)
-        r.raise_for_status()
-        periods = r.json()['properties']['periods']
+        data = _nws_get(meta['hourly_url'])
+        periods = data['properties']['periods']
         central_tz = pytz.timezone('US/Central')
         peak = None
         for p in periods:
@@ -332,30 +370,23 @@ def get_nws_hourly_peak(meta, target_date):
         return None, None
 
 
-def get_nws_current_observation(meta):
-    """Fetch the latest METAR observation from the closest NWS station.
-    Returns observed_temp_f or None."""
-    if meta is None:
-        return None
+def get_nws_current_observation(city_name):
+    """Fetch latest METAR observation from the EXACT Kalshi settlement station
+    for this city (not 'nearest to bot coords' — that could pick a different
+    station under NWS API flakiness). Returns (station_id, temp_f) or (None, None)."""
+    station_id = CITY_TO_KALSHI_STATION.get(city_name)
+    if not station_id:
+        return None, None
     try:
-        r = requests.get(meta['stations_url'], headers=NWS_HEADERS, timeout=10)
-        r.raise_for_status()
-        features = r.json().get('features', [])
-        if not features:
-            return None
-        station_id = features[0]['properties']['stationIdentifier']
-        r2 = requests.get(
-            f"https://api.weather.gov/stations/{station_id}/observations/latest",
-            headers=NWS_HEADERS, timeout=10,
-        )
-        r2.raise_for_status()
-        temp_c = r2.json().get('properties', {}).get('temperature', {}).get('value')
+        data = _nws_get(f"https://api.weather.gov/stations/{station_id}/observations/latest")
+        temp_c = data.get('properties', {}).get('temperature', {}).get('value')
         if temp_c is None:
-            return None
-        return temp_c * 9 / 5 + 32
+            return station_id, None
+        return station_id, temp_c * 9 / 5 + 32
     except Exception as e:
-        alert("NWS_OBS_FAILED", f"NWS observation failed: {e}", {"source": "nws_obs"})
-        return None
+        alert("NWS_OBS_FAILED", f"NWS observation failed for {station_id}: {e}",
+              {"source": "nws_obs", "station": station_id})
+        return station_id, None
 
 
 # Iterate through cities and fetch data
@@ -819,6 +850,77 @@ for index, row in combined_table.iterrows():
 
 combined_table
 
+# =====================================================================
+# PRE-TRADE RISK FILTERS — fetch NWS hourly forecast + current obs per city
+# BEFORE the snapshot write so the values persist to KXHIGH_market_snapshot.
+# Only applies to DAY runs (variable=0, trading today). Night runs don't have
+# meaningful intra-day observations yet.
+# =====================================================================
+PRE_TRADE_SKIP_CITIES = set()
+PRE_TRADE_OBSERVED = {}
+PRE_TRADE_STATE = {}
+
+# Per-city cutoff hour (CT) for order cancels. Must stay in sync with the
+# mapping at the order-placement site below.
+_CITY_CUTOFF_HOUR = {
+    "New York City": 9, "Philadelphia": 9, "Miami": 9, "Atlanta": 9,
+    "Washington DC": 9,
+}  # everything else defaults to 10
+
+if variable == 0:
+    print("\n========== PRE-TRADE RISK CHECKS (day run) ==========")
+    _today_ct = datetime.now(pytz.timezone('US/Central')).date()
+    _forecast_max_by_city = dict(zip(combined_table['City'], combined_table['Average']))
+    for _city, _coords in cities.items():
+        _cutoff = _CITY_CUTOFF_HOUR.get(_city, 10)
+        _meta = get_nws_meta(*_coords)
+        _peak_hr, _peak_temp = get_nws_hourly_peak(_meta, _today_ct) if _meta else (None, None)
+        _station, _obs = get_nws_current_observation(_city)
+        _fmax = _forecast_max_by_city.get(_city)
+        _skip_reason = None
+
+        if _peak_hr is not None and _peak_hr < _cutoff:
+            _skip_reason = f"peak_before_cutoff (peak {_peak_hr:02d}:00 < {_cutoff:02d}:00 CT)"
+            print(f"  SKIP {_city}: {_skip_reason}")
+            alert("PRE_TRADE_SKIP_PEAK", f"{_city}: peak hr {_peak_hr} < cutoff {_cutoff}",
+                  {"city": _city, "peak_hour_ct": _peak_hr, "cutoff_hour_ct": _cutoff})
+            PRE_TRADE_SKIP_CITIES.add(_city)
+        elif _obs is not None and _fmax is not None and _obs > _fmax + 2:
+            _skip_reason = f"forecast_busted (obs {_obs:.0f}F > forecast {_fmax:.0f}F + 2F)"
+            print(f"  SKIP {_city}: {_skip_reason}")
+            alert("PRE_TRADE_SKIP_BUSTED",
+                  f"{_city}: obs {_obs:.1f} > forecast {_fmax:.1f} + 2",
+                  {"city": _city, "observed_f": _obs, "forecast_max_f": _fmax})
+            PRE_TRADE_SKIP_CITIES.add(_city)
+        else:
+            if _obs is not None:
+                PRE_TRADE_OBSERVED[_city] = _obs
+            if _peak_hr is not None and _obs is not None:
+                print(f"  OK  {_city}: peak {_peak_hr:02d}:00 CT / {_peak_temp}F, "
+                      f"obs ({_station}) {_obs:.0f}F, forecast_max {_fmax:.0f}F")
+            elif _meta is None:
+                print(f"  {_city}: NWS meta unavailable, no filter applied")
+
+        PRE_TRADE_STATE[_city] = {
+            "peak_hour_ct": _peak_hr,
+            "peak_temp_f": _peak_temp,
+            "observed_temp_f": _obs,
+            "observed_station": _station,
+            "pre_trade_skip_reason": _skip_reason,
+        }
+        time.sleep(0.1)
+    print(f"==========> {len(PRE_TRADE_SKIP_CITIES)} city/cities skipped; "
+          f"{len(PRE_TRADE_OBSERVED)} have observations for per-bucket check\n")
+
+# Stamp per-city pre-trade state onto combined_table so it persists to the
+# snapshot table. Per-market rows in the same city share the same value.
+for _col in ["peak_hour_ct", "peak_temp_f", "observed_temp_f", "observed_station",
+             "pre_trade_skip_reason"]:
+    combined_table[_col] = combined_table['City'].map(
+        lambda c, col=_col: (PRE_TRADE_STATE.get(c) or {}).get(col)
+    )
+
+
 ####### WRITE MARKET SNAPSHOT TO BIGQUERY
 
 print("\nWriting market snapshot to BigQuery...")
@@ -854,6 +956,10 @@ _SNAPSHOT_BQ_COLS = [
     "no_highest_bid", "no_lowest_offer",
     "no_orderbook", "yes_orderbook",
     "position",
+    # Added Apr 2026 — pre-trade risk state (NWS hourly forecast + current obs).
+    # Populated by the PRE-TRADE RISK CHECKS block that must run before this write.
+    "peak_hour_ct", "peak_temp_f", "observed_temp_f", "observed_station",
+    "pre_trade_skip_reason",
 ]
 _SNAPSHOT_NUMERIC_COLS = [
     "weather_underground", "accuweather", "nws",
@@ -862,6 +968,7 @@ _SNAPSHOT_NUMERIC_COLS = [
     "historical_var", "historical_var_sqrt",
     "yes_probability", "fair_no_price",
     "no_highest_bid", "no_lowest_offer",
+    "peak_temp_f", "observed_temp_f",
 ]
 
 snapshot_df = combined_table.rename(columns=_SNAPSHOT_COL_MAP).copy()
@@ -874,6 +981,7 @@ for col in _SNAPSHOT_NUMERIC_COLS:
 snapshot_df["forecast_date"] = pd.to_datetime(snapshot_df["forecast_date"], errors="coerce").dt.date
 snapshot_df["run_date"] = pd.to_datetime(snapshot_df["run_date"], errors="coerce")
 snapshot_df["position"] = pd.to_numeric(snapshot_df["position"], errors="coerce").astype("Int64")
+snapshot_df["peak_hour_ct"] = pd.to_numeric(snapshot_df["peak_hour_ct"], errors="coerce").astype("Int64")
 
 write_to_bq(snapshot_df, "market_snapshot", "WRITE_APPEND")
 
@@ -962,66 +1070,6 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
 
     # Convert to Unix time
     return int(target_time.timestamp())
-
-# =====================================================================
-# PRE-TRADE RISK FILTERS — fetch NWS hourly + observations per city and
-# decide whether to skip (or partially skip) each city BEFORE order placement.
-# Only applies to DAY runs (variable=0, trading today). Night runs (variable=1,
-# trading tomorrow) don't have meaningful intra-day observations yet.
-# =====================================================================
-PRE_TRADE_SKIP_CITIES = set()       # cities to skip entirely
-PRE_TRADE_OBSERVED = {}             # city -> observed_temp_f (for per-bucket filter)
-
-# City -> cutoff hour (CT) for order cancels; must stay in sync with the per-
-# city mapping at the order-placement site below.
-_CITY_CUTOFF_HOUR = {
-    "New York City": 9, "Philadelphia": 9, "Miami": 9, "Atlanta": 9,
-    "Washington DC": 9,
-}  # everything else defaults to 10
-
-if variable == 0:
-    print("\n========== PRE-TRADE RISK CHECKS (day run) ==========")
-    _today_ct = datetime.now(pytz.timezone('US/Central')).date()
-    # forecast max per city, from the forecast_table we already built
-    _forecast_max_by_city = dict(zip(combined_table['City'], combined_table['Average']))
-    for _city, _coords in cities.items():
-        _cutoff = _CITY_CUTOFF_HOUR.get(_city, 10)
-        _meta = get_nws_meta(*_coords)
-        if _meta is None:
-            print(f"  {_city}: NWS meta unavailable, no filter applied")
-            continue
-        _peak_hr, _peak_temp = get_nws_hourly_peak(_meta, _today_ct)
-        _obs = get_nws_current_observation(_meta)
-
-        # Filter 1: peak hour before cutoff → high already set, skip
-        if _peak_hr is not None and _peak_hr < _cutoff:
-            print(f"  SKIP {_city}: peak {_peak_hr:02d}:00 CT < cutoff {_cutoff:02d}:00 "
-                  f"(high effectively set — pickoff risk)")
-            alert("PRE_TRADE_SKIP_PEAK", f"{_city}: peak hr {_peak_hr} < cutoff {_cutoff}",
-                  {"city": _city, "peak_hour_ct": _peak_hr, "cutoff_hour_ct": _cutoff})
-            PRE_TRADE_SKIP_CITIES.add(_city)
-            continue
-
-        # Filter 3: observed already > forecast_max + 2°F → forecast busted
-        _fmax = _forecast_max_by_city.get(_city)
-        if _obs is not None and _fmax is not None and _obs > _fmax + 2:
-            print(f"  SKIP {_city}: obs {_obs:.0f}F > forecast_max {_fmax:.0f}F + 2F (busted)")
-            alert("PRE_TRADE_SKIP_BUSTED",
-                  f"{_city}: obs {_obs:.1f} > forecast {_fmax:.1f} + 2",
-                  {"city": _city, "observed_f": _obs, "forecast_max_f": _fmax})
-            PRE_TRADE_SKIP_CITIES.add(_city)
-            continue
-
-        # Stash obs for per-bucket check in the trading loop
-        if _obs is not None:
-            PRE_TRADE_OBSERVED[_city] = _obs
-        if _peak_hr is not None and _obs is not None:
-            print(f"  OK  {_city}: peak {_peak_hr:02d}:00 CT, obs {_obs:.0f}F, "
-                  f"forecast_max {_fmax:.0f}F")
-        time.sleep(0.1)  # polite NWS rate limit
-    print(f"==========> {len(PRE_TRADE_SKIP_CITIES)} city/cities skipped; "
-          f"{len(PRE_TRADE_OBSERVED)} have observations for per-bucket check\n")
-
 
 ########## BUY CALCULATIONS
 orders_placed = 0
