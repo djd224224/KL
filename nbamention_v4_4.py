@@ -799,30 +799,30 @@ def generate_offsets(start: int, increment: int, count: int) -> List[int]:
 
 SPREAD_CONFIGS = {
     (0, 2): {
-        'yes': generate_offsets(start=4, increment=3, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=3, increment=2, count=NUM_OFFSET_LEVELS),
+        'yes': generate_offsets(start=5, increment=3, count=NUM_OFFSET_LEVELS),
+        'no':  generate_offsets(start=4, increment=2, count=NUM_OFFSET_LEVELS),
         'name': 'very_tight'
     },
     (2, 5): {
-        'yes': generate_offsets(start=3, increment=3, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=2, increment=2, count=NUM_OFFSET_LEVELS),
+        'yes': generate_offsets(start=4, increment=3, count=NUM_OFFSET_LEVELS),
+        'no':  generate_offsets(start=3, increment=2, count=NUM_OFFSET_LEVELS),
         'name': 'tight'
     },
     (5, 15): {
-        'yes': generate_offsets(start=2, increment=2, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=1, increment=2, count=NUM_OFFSET_LEVELS),
+        'yes': generate_offsets(start=3, increment=2, count=NUM_OFFSET_LEVELS),
+        'no':  generate_offsets(start=2, increment=2, count=NUM_OFFSET_LEVELS),
         'name': 'medium'
     },
     (15, 100): {
-        'yes': generate_offsets(start=1, increment=2, count=NUM_OFFSET_LEVELS),
-        'no':  generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
+        'yes': generate_offsets(start=2, increment=2, count=NUM_OFFSET_LEVELS),
+        'no':  generate_offsets(start=2, increment=1, count=NUM_OFFSET_LEVELS),
         'name': 'wide'
     },
 }
 
 PAIRING_OFFSETS = {
-    'yes': generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
-    'no':  generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS),
+    'yes': generate_offsets(start=2, increment=1, count=NUM_OFFSET_LEVELS),
+    'no':  generate_offsets(start=2, increment=1, count=NUM_OFFSET_LEVELS),
     'name': 'pairing'
 }
 
@@ -2394,7 +2394,7 @@ def build_order_objects_for_market(
     yes_offsets, no_offsets, spread_config_name = get_offsets_for_spread(spread_cents)
 
     if ticker_part_3_market_code in TOP_NO_MARKETS:
-        no_offsets = generate_offsets(start=1, increment=1, count=NUM_OFFSET_LEVELS)
+        no_offsets = generate_offsets(start=2, increment=1, count=NUM_OFFSET_LEVELS)
         if spread_config_name not in ('very_tight', 'tight'):
             spread_config_name = f"{spread_config_name}+top_no"
 
