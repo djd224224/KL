@@ -614,10 +614,7 @@ POSITION_STOP_THRESHOLD = _limits["POSITION_STOP_THRESHOLD"]
 MAX_ORDERBOOK_LEVELS_ABOVE = 2
 
 # [v4.9] Per-market net cap overrides — strongest-edge markets get larger limits
-MARKET_NET_OVERRIDES = {
-    "RETI": 300,
-    "DRAF": 300,
-}
+MARKET_NET_OVERRIDES = {}
 
 def get_market_net_cap(market_code: str) -> int:
     """Return per-market net cap, with overrides for high-conviction markets."""
@@ -655,9 +652,9 @@ SIDE_MULTIPLIERS = {
     # === v4.5 SIDE MULTIPLIER UPDATE (Mar 18 2026) ===
     # Based on 1,149 settlements from Feb 19 - Mar 17
     "JORD": {"yes": 0.3, "no": 0.0},    # v4.4 was yes:0.3 -- YES is +$248 (9.7% ROI), boosted
-    "RETI": {"yes": 0.0, "no": 2.25},   # keep -- NO is +$621 (39.9% ROI)
+    "RETI": {"yes": 0.0, "no": 1.5},    # keep -- NO is +$621 (39.9% ROI)
     "OVER": {"yes": 0.0, "no": 0.0},    # v4.4 was no:2.0 -- NO lost $542, adverse selection on large fills
-    "ANKL": {"yes": 1.0, "no": 2.0},    # [v4.9] NO 2.5→3.0 — sustained edge
+    "ANKL": {"yes": 1.0, "no": 1.5},    # [v4.9] NO 2.5→3.0 — sustained edge
     "BUZZ": {"yes": 1.5, "no": 1.0},    # [v4.9] enabled YES 0.0→0.5 — buy YES per directive
     "ALLE": {"yes": 0.0, "no": 0.0},    # [v4.9] killed both sides — sustained losses
     "AIRB": {"yes": 0.3, "no": 0.0},    # [v4.9] killed NO — YES +$640 retained, NO consistent loser
@@ -667,7 +664,7 @@ SIDE_MULTIPLIERS = {
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "INJU": {"yes": 0.5, "no": 0.0},    # keep -- marginal +$3
-    "DRAF": {"yes": 0.5, "no": 2.25},   # [v4.9] NO 2.0→2.5 — sustained edge
+    "DRAF": {"yes": 0.5, "no": 1.5},    # [v4.9] NO 2.0→2.5 — sustained edge
     "CROW": {"yes": 0.0, "no": 0.0},    # keep -- NO +$24 (50% ROI)
     "ROOK": {"yes": 0.0, "no": 0.5},    # [v4.8] NO 1.5→0.5 — NO is -$6 (-4.6%)
     "PLAY": {"yes": 1.3, "no": 0.0},    # keep -- YES +$54 (28% ROI)
@@ -712,7 +709,7 @@ TEAM_MULTIPLIERS = {
 }
 
 # [v4.5] Top-performing NO markets get tighter offsets
-TOP_NO_MARKETS = {"ANKL", "RETI", "DRAF", "ROOK", "CROW"}  # v4.5: removed OVER, ALLE, AIRB
+TOP_NO_MARKETS = set()  # v4.5: removed OVER, ALLE, AIRB
 
 # =====================================================================
 # [v4.6-5] CORRELATION PENALTY — rebuilt from actual settlement data
@@ -743,7 +740,7 @@ YES_PROBABILITY_FLOOR = 30      # [v4.7] lowered from 40
 # RETI is +$619 at 40% ROI, 46% Kelly — the most underweighted market.
 MAX_PRICE_OVERRIDES = {
     "RETI": 83,  # [v4.7] was 90 — capped at 84¢ per manual review
-    "BUZZ": 66,  # [v4.7] max NO bid 70¢
+    "BUZZ": 55,  # [v4.7] max NO bid 70¢
     "TRIP": 55,  # [v4.7] max NO bid 70¢
     "CROW": 14,  # [v4.9] block CROW NO above 14¢
 }
