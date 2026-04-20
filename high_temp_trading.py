@@ -141,6 +141,19 @@ def upload_alerts_to_bq():
     except Exception as e:
         print(f"  ⚠️ Alert upload failed: {e}")
 
+
+def flush_alerts(checkpoint: str = ""):
+    """Upload accumulated _ALERTS to BQ and CLEAR the list. Safe to call at
+    checkpoints during a run so diagnostics survive a later crash/hang. The
+    final end-of-run upload_alerts_to_bq() will only see alerts that fired
+    after the last flush."""
+    if not _ALERTS:
+        return
+    tag = f" @ {checkpoint}" if checkpoint else ""
+    print(f"  ⚡ Flushing {len(_ALERTS)} alerts to BigQuery{tag}")
+    upload_alerts_to_bq()
+    _ALERTS.clear()
+
 BQ_PROJECT = os.environ.get("GCP_PROJECT_ID", "elite-contact-446323-q7")
 BQ_DATASET = os.environ.get("GCP_DATASET_ID", "Kalshi")
 BQ_TABLE_PREFIX = "KXHIGH_"
@@ -900,6 +913,7 @@ if variable == 0:
     for _city, _coords in cities.items():
         _cutoff = _CITY_CUTOFF_HOUR.get(_city, 10)
         _meta = get_nws_meta(*_coords)
+        _meta_status = "ok" if _meta else "FAIL"
         _hourly = get_nws_hourly_peak(_meta, _today_ct, now_ct=_now_ct) if _meta else {
             "peak_hour_ct": None, "peak_temp_f": None,
             "forecast_update_ts": None, "forecast_temp_at_run_f": None,
@@ -909,6 +923,11 @@ if variable == 0:
         _f_at_run = _hourly["forecast_temp_at_run_f"]
         _station, _obs = get_nws_current_observation(_city)
         _fmax = _forecast_max_by_city.get(_city)
+        # Diagnostic stdout trail — guaranteed even if alerts don't flush later
+        _hourly_status = (f"peak {_peak_hr:02d}:00/{_peak_temp}F update={_update_ts}"
+                          if _peak_hr is not None else "FAIL")
+        _obs_status = f"{_obs:.1f}F@{_station}" if _obs is not None else f"FAIL@{_station}"
+        print(f"  NWS {_city}: meta={_meta_status}, hourly={_hourly_status}, obs={_obs_status}")
         # Observed minus forecasted for the current hour — recorded for later
         # analysis, NOT used to adjust forecast_avg (per directive).
         _obs_minus_forecast = (_obs - _f_at_run) if (_obs is not None and _f_at_run is not None) else None
@@ -951,6 +970,7 @@ if variable == 0:
         time.sleep(0.1)
     print(f"==========> {len(PRE_TRADE_SKIP_CITIES)} city/cities skipped; "
           f"{len(PRE_TRADE_OBSERVED)} have observations for per-bucket check\n")
+    flush_alerts("after pre-trade filters")
 
 # Stamp per-city pre-trade state onto combined_table so it persists to the
 # snapshot table. Per-market rows in the same city share the same value.
@@ -1033,6 +1053,9 @@ snapshot_df["nws_forecast_update_ts"] = pd.to_datetime(
 )
 
 write_to_bq(snapshot_df, "market_snapshot", "WRITE_APPEND")
+
+# Flush alerts NOW so diagnostics survive if the trading loop below crashes
+flush_alerts("after snapshot write")
 
 combined_table = combined_table.fillna("")
 
