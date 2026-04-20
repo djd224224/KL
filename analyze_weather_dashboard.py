@@ -306,6 +306,7 @@ def run_analysis(settlement_file, trade_file=None):
         trades = []
         for row in trade_rows:
             if row.get('type')!='Trade': continue
+            if row.get('Direction') != 'No': continue
             tk = row.get('Market_Ticker','')
             if not tk.startswith('KXHIGH'): continue
             dt = parse_date(row.get('Original_Date'))
@@ -330,17 +331,16 @@ def run_analysis(settlement_file, trade_file=None):
                 'n':d['n'],'amount':round(d['amount'],0)})
 
         # Fill time ROI — match trades to settlements, bucket by ET hour
-        # Edge formula: Price_In_Cents is always YES price in Kalshi trade CSV.
-        # NO price paid = 100 - Price_In_Cents.
-        # Win (settles NO):  edge = +YES_price (paid NO_price, got 100 back, profit = YES_price)
-        # Loss (settles YES): edge = YES_price - 100 = -NO_price (paid NO_price, got 0)
+        # For Direction=No trades, Price_In_Cents IS the NO price paid per contract.
+        # Win (settles NO):  edge per contract = 100 - NO_price (payout $1 - cost)
+        # Loss (settles YES): edge per contract = -NO_price
         hour_pnl = defaultdict(lambda:{'n':0,'edge':0,'wins':0,'amount':0})
         for t in trades:
             s = sett_by_ticker.get(t['ticker'])
             if not s: continue
             et_h = (t['hour'] - 4) % 24  # UTC to ET
             won = s['result'] == 'no'
-            edge = t['price'] if won else (t['price'] - 100)
+            edge = (100 - t['price']) if won else -t['price']
             hp = hour_pnl[et_h]
             hp['n']+=1; hp['edge']+=edge; hp['amount']+=t['amount']
             if won: hp['wins']+=1
@@ -354,16 +354,16 @@ def run_analysis(settlement_file, trade_file=None):
                 'total_edge':round(hp['edge'],0),'roi':round(roi,1)})
 
         # Fill price vs settlement outcome
-        # Bucket by ACTUAL NO price (100 - Price_In_Cents), same edge formula as above.
+        # Bucket by NO price paid (t['price'] for Direction=No trades).
         # avg_edge = mean edge across all trades in bucket = realized cents profit per contract.
         fp_buckets = defaultdict(lambda:{'n':0,'wins':0,'edge':0})
         for t in trades:
             s = sett_by_ticker.get(t['ticker'])
             if not s: continue
-            no_price = 100 - t['price']  # actual NO price paid
+            no_price = t['price']
             buc = (no_price//5)*5
             won = s['result'] == 'no'
-            edge = t['price'] if won else (t['price'] - 100)
+            edge = (100 - t['price']) if won else -t['price']
             b = fp_buckets[buc]
             b['n']+=1; b['edge']+=edge
             if won: b['wins']+=1
