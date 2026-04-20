@@ -743,6 +743,7 @@ MAX_PRICE_OVERRIDES = {
     "BUZZ": 55,  # [v4.7] max NO bid 70¢
     "TRIP": 55,  # [v4.7] max NO bid 70¢
     "CROW": 14,  # [v4.9] block CROW NO above 14¢
+    "ANKL": 44,
 }
 
 # [v4.7] Per-market YES MAX_PRICE overrides
