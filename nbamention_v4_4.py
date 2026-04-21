@@ -739,11 +739,12 @@ YES_PROBABILITY_FLOOR = 30      # [v4.7] lowered from 40
 # RETI: 20% YES rate → fair NO ≈ 80c. MAX_PRICE=75 blocks 65% of games.
 # RETI is +$619 at 40% ROI, 46% Kelly — the most underweighted market.
 MAX_PRICE_OVERRIDES = {
-    "RETI": 83,  # [v4.7] was 90 — capped at 84¢ per manual review
+    "RETI": 75,  # [v4.7] was 90 — capped at 84¢ per manual review
     "BUZZ": 55,  # [v4.7] max NO bid 70¢
     "TRIP": 55,  # [v4.7] max NO bid 70¢
     "CROW": 14,  # [v4.9] block CROW NO above 14¢
     "ANKL": 44,
+    "DRAF": 50,
 }
 
 # [v4.7] Per-market YES MAX_PRICE overrides
@@ -769,7 +770,7 @@ BASE_YES_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 MAX_CONTRACTS_PER_ORDER = 1000
 MAX_CONTRACTS_PER_MARKET_PER_RUN = 150  # [v4.6] Limits single-run exposure per market
-MAX_TOTAL_MULTIPLIER = 3.0              # [v4.7] Hard cap on combined multiplier
+MAX_TOTAL_MULTIPLIER = 2.0              # [v4.7] Hard cap on combined multiplier
 MAX_CONTRACTS_PER_LEVEL = 50            # [v4.7] Hard cap on contracts per price level
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
