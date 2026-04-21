@@ -582,7 +582,7 @@ def fetch_bankroll(client) -> Tuple[float, int, int]:
         return BANKROLL_FALLBACK, 0, 0
 
 def get_scaled_limits(bankroll: float) -> dict:
-    scale = max(0.5, min(bankroll / 5000, 1.5))
+    scale = max(0.5, min(bankroll / 5000, 1.0))
     return {
         "MAX_NET_PER_MARKET": int(150 * scale),           # [v4.8] was 200
         "POSITION_MODERATE_THRESHOLD": int(67 * scale),
@@ -762,7 +762,7 @@ NO_SWEET_SPOT_MULTIPLIER = 1.0
 def generate_base_contracts(num_levels: int) -> List[int]:
     contracts = []
     for i in range(num_levels):
-        contracts.append(15)
+        contracts.append(5)
     return contracts
 
 NUM_OFFSET_LEVELS = 10
