@@ -625,7 +625,7 @@ MAX_ORDERS_PER_EVENT = 5000
 
 MIN_SPREAD_BOTH_SIDES = 0
 
-MIN_EV_PER_ORDER = 0.02
+MIN_EV_PER_ORDER = 0.03
 
 SAFE_MODE_MULTIPLIER = 0.10
 
@@ -749,7 +749,7 @@ MAX_PRICE_OVERRIDES = {
 
 # [v4.7] Per-market YES MAX_PRICE overrides
 YES_MAX_PRICE_OVERRIDES = {
-    "TECH": 70,  # [v4.7] max YES bid 70¢
+    "TECH": 60,  # [v4.7] max YES bid 70¢
     "DRAF": 65
 }
 
