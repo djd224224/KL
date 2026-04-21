@@ -243,6 +243,7 @@ cities = {
     "San Antonio":    (29.53278, -98.46361),   # KSAT
     "Minneapolis":    (44.88306, -93.22889),   # KMSP
     "New Orleans":    (29.99278, -90.25083),   # KMSY
+    "Boston":         (42.36056, -71.01056),   # KBOS Logan
 }
 
 def get_accuweather_forecast(coords):
@@ -349,6 +350,7 @@ CITY_TO_KALSHI_STATION = {
     "San Antonio":    "KSAT",
     "Minneapolis":    "KMSP",
     "New Orleans":    "KMSY",
+    "Boston":         "KBOS",  # Logan (Kalshi rules: "Boston (Logan Airport), MA")
 }
 
 
@@ -533,6 +535,7 @@ cities = {
     "San Antonio":    {"lat": 29.53278, "lon":  -98.46361},
     "Minneapolis":    {"lat": 44.88306, "lon":  -93.22889},
     "New Orleans":    {"lat": 29.99278, "lon":  -90.25083},
+    "Boston":         {"lat": 42.36056, "lon":  -71.01056},
 }
 
 # Prepare the date for today
@@ -635,6 +638,7 @@ cities = {
     "San Antonio":    {"lat": 29.53278, "lon":  -98.46361},
     "Minneapolis":    {"lat": 44.88306, "lon":  -93.22889},
     "New Orleans":    {"lat": 29.99278, "lon":  -90.25083},
+    "Boston":         {"lat": 42.36056, "lon":  -71.01056},
 }
 
 # Fetch forecasts for all cities
@@ -700,9 +704,10 @@ event_ticker16 = ['KXHIGHTSFO-26' + month + day, 'San Francisco', 50, 1.5]
 event_ticker17 = ['KXHIGHTSATX-26' + month + day, 'San Antonio', 55, 1.5]
 event_ticker18 = ['KXHIGHTMIN-26' + month + day, 'Minneapolis', 55, 1.5]
 event_ticker19 = ['KXHIGHTNOLA-26' + month + day, 'New Orleans', 55, 1.5]
+event_ticker20 = ['KXHIGHTBOS-26' + month + day, 'Boston', 50, 1.5]
 
 ############ PULL MARKETS
-all_event_tickers = [event_ticker1, event_ticker2, event_ticker3, event_ticker4, event_ticker5, event_ticker6, event_ticker7, event_ticker8, event_ticker9, event_ticker10, event_ticker11, event_ticker12, event_ticker13, event_ticker14, event_ticker15, event_ticker16, event_ticker17, event_ticker18, event_ticker19]
+all_event_tickers = [event_ticker1, event_ticker2, event_ticker3, event_ticker4, event_ticker5, event_ticker6, event_ticker7, event_ticker8, event_ticker9, event_ticker10, event_ticker11, event_ticker12, event_ticker13, event_ticker14, event_ticker15, event_ticker16, event_ticker17, event_ticker18, event_ticker19, event_ticker20]
 event_tickers = pd.DataFrame(all_event_tickers, columns=['Ticker', 'City', 'hi_no_price', 'var'])
 event_tickers['var_sqrt'] = np.sqrt(event_tickers['var'])
 markets_table = pd.DataFrame(columns=['event_ticker', 'market_ticker', 'market_ticker_prev', 'City', 'low_range', 'high_range', 'hi_no_price'])
@@ -920,7 +925,7 @@ PRE_TRADE_STATE = {}
 # mapping at the order-placement site below.
 _CITY_CUTOFF_HOUR = {
     "New York City": 9, "Philadelphia": 9, "Miami": 9, "Atlanta": 9,
-    "Washington DC": 9,
+    "Washington DC": 9, "Boston": 9,
 }  # everything else defaults to 10
 
 if variable == 0:
@@ -1277,6 +1282,7 @@ for index, row in combined_table.iterrows():
     elif 'LAX' in ticker_str: abv = 'LAX'; cancel_hour = 10
     elif 'ATL' in ticker_str: abv = 'ATL'; cancel_hour = 9
     elif 'TDC' in ticker_str: abv = 'TDC'; cancel_hour = 9
+    elif 'TBOS' in ticker_str: abv = 'TBOS'; cancel_hour = 9
     elif 'PHX' in ticker_str: abv = 'PHX'; cancel_hour = 10
     elif 'DAL' in ticker_str: abv = 'DAL'; cancel_hour = 10
     elif 'TLV' in ticker_str: abv = 'TLV'; cancel_hour = 10

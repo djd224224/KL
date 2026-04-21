@@ -43,6 +43,7 @@ CITIES: dict[str, dict] = {
     "TSATX": {"city": "San Antonio",    "icao": "KSAT", "cli_code": "SAT", "wfo": "EWX", "lat": 29.53278, "lon":  -98.46361},
     "TMIN":  {"city": "Minneapolis",    "icao": "KMSP", "cli_code": "MSP", "wfo": "MPX", "lat": 44.88306, "lon":  -93.22889},
     "TNOLA": {"city": "New Orleans",    "icao": "KMSY", "cli_code": "MSY", "wfo": "LIX", "lat": 29.99278, "lon":  -90.25083},
+    "TBOS":  {"city": "Boston",         "icao": "KBOS", "cli_code": "BOS", "wfo": "BOX", "lat": 42.36056, "lon":  -71.01056},
 }
 
 CITY_NAME_TO_KEY = {v["city"]: k for k, v in CITIES.items()}
