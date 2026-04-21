@@ -660,11 +660,11 @@ SIDE_MULTIPLIERS = {
     "AIRB": {"yes": 0.3, "no": 0.0},    # [v4.9] killed NO — YES +$640 retained, NO consistent loser
     "MVP":  {"yes": 0.0, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
     "TRIP": {"yes": 0.5, "no": 0.5},    # [v4.7] re-enabled both sides at 0.5x
-    "TECH": {"yes": 1.5, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
+    "TECH": {"yes": 1.0, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "ELBO": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
     "INJU": {"yes": 0.5, "no": 0.0},    # keep -- marginal +$3
-    "DRAF": {"yes": 0.5, "no": 1.5},    # [v4.9] NO 2.0→2.5 — sustained edge
+    "DRAF": {"yes": 1.0, "no": 1.0},    # [v4.9] NO 2.0→2.5 — sustained edge
     "CROW": {"yes": 0.0, "no": 0.0},    # keep -- NO +$24 (50% ROI)
     "ROOK": {"yes": 0.0, "no": 0.5},    # [v4.8] NO 1.5→0.5 — NO is -$6 (-4.6%)
     "PLAY": {"yes": 1.3, "no": 0.0},    # keep -- YES +$54 (28% ROI)
