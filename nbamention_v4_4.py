@@ -658,7 +658,7 @@ SIDE_MULTIPLIERS = {
     "BUZZ": {"yes": 1.5, "no": 1.0},    # [v4.9] enabled YES 0.0→0.5 — buy YES per directive
     "ALLE": {"yes": 0.0, "no": 0.0},    # [v4.9] killed both sides — sustained losses
     "AIRB": {"yes": 0.3, "no": 0.0},    # [v4.9] killed NO — YES +$640 retained, NO consistent loser
-    "MVP":  {"yes": 0.5, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
+    "MVP":  {"yes": 0.0, "no": 0.0},    # [v4.7] re-enabled YES at 0.5x
     "TRIP": {"yes": 0.5, "no": 0.5},    # [v4.7] re-enabled both sides at 0.5x
     "TECH": {"yes": 1.5, "no": 0.0},    # [v4.6] raised 1.3→1.5 — Kelly=15.3%, was undersized
     "TRAD": {"yes": 0.0, "no": 0.0},    # keep killed -- both sides negative
