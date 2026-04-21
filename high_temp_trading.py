@@ -131,8 +131,26 @@ def send_alert_notification():
 def upload_alerts_to_bq():
     if bq_client is None or len(_ALERTS) == 0:
         return
+    # Flatten context keys into `error` — the KXHIGH_alerts table schema is
+    # fixed (timestamp/category/message/error). Extra context keys (city,
+    # source, peak_hour_ct, etc.) caused load_table_from_dataframe to fail
+    # silently with schema mismatch, so text alerts fired but BQ stayed empty.
+    _CORE = {"timestamp", "category", "message", "error"}
+    flat = []
+    for a in _ALERTS:
+        extras = {k: v for k, v in a.items() if k not in _CORE}
+        error_str = str(a.get("error", "") or "")
+        if extras:
+            extra_str = ", ".join(f"{k}={v}" for k, v in extras.items())
+            error_str = f"{error_str} | {extra_str}" if error_str else extra_str
+        flat.append({
+            "timestamp": a.get("timestamp"),
+            "category":  a.get("category"),
+            "message":   a.get("message"),
+            "error":     error_str,
+        })
     try:
-        df_alerts = pd.DataFrame(_ALERTS)
+        df_alerts = pd.DataFrame(flat)
         table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}alerts"
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND", autodetect=True)
         job = bq_client.load_table_from_dataframe(df_alerts, table_id, job_config=job_config)
