@@ -912,7 +912,15 @@ if variable == 0:
     _forecast_max_by_city = dict(zip(combined_table['City'], combined_table['Average']))
     for _city, _coords in cities.items():
         _cutoff = _CITY_CUTOFF_HOUR.get(_city, 10)
-        _meta = get_nws_meta(*_coords)
+        # cities dict gets redefined 3x in this file. By the time we reach
+        # here, _coords can be either a tuple (lat, lon) or a dict
+        # {"lat": x, "lon": y}. Unpacking the dict with * gives the string
+        # keys ("lat", "lon") instead of the values — broke NWS calls.
+        if isinstance(_coords, dict):
+            _lat, _lon = _coords["lat"], _coords["lon"]
+        else:
+            _lat, _lon = _coords[0], _coords[1]
+        _meta = get_nws_meta(_lat, _lon)
         _meta_status = "ok" if _meta else "FAIL"
         _hourly = get_nws_hourly_peak(_meta, _today_ct, now_ct=_now_ct) if _meta else {
             "peak_hour_ct": None, "peak_temp_f": None,
