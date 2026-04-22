@@ -51,10 +51,10 @@
   .pnl.neg { color: #f87171; font-weight: 700; }
 
   .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
-  .pill.win     { background: #064e3b; color: #34d399; }
-  .pill.loss    { background: #450a0a; color: #f87171; }
-  .pill.none    { background: #1a2030; color: #475569; }
-  .pill.pending { background: #1a2a3a; color: #60a5fa; }
+  .pill.win  { background: #064e3b; color: #34d399; }
+  .pill.loss { background: #450a0a; color: #f87171; }
+  .pill.split { background: #451a03; color: #fbbf24; }
+  .pill.none { background: #1a2030; color: #475569; }
 
   /* Commentary box */
   .commentary { background: #191f2e; border-left: 3px solid #3b82f6; border-radius: 0 8px 8px 0; padding: 13px 17px; margin-top: 16px; font-size: 0.845rem; color: #cbd5e1; line-height: 1.75; }
@@ -64,6 +64,10 @@
   .warn-banner { background: #2d1f00; border: 1px solid #92400e; border-radius: 8px; padding: 12px 16px; color: #fcd34d; font-size: 0.845rem; }
   .warn-banner strong { color: #fde68a; }
 
+  /* Info banner */
+  .info-banner { background: #0c1f0f; border: 1px solid #166534; border-radius: 8px; padding: 12px 16px; color: #86efac; font-size: 0.845rem; }
+  .info-banner strong { color: #bbf7d0; }
+
   .no-alerts { color: #475569; font-style: italic; font-size: 0.845rem; }
   .footnote { font-size: 0.75rem; color: #475569; margin-top: 10px; }
 </style>
@@ -72,32 +76,37 @@
 <div class="container">
 
   <h1>High-Temp Digest</h1>
-  <div class="subtitle">2026-04-19 &nbsp;·&nbsp; KXHIGH series &nbsp;·&nbsp; Settlements pending (BQ last settled: 2026-04-18) &nbsp;·&nbsp; P&amp;L estimated from IEM readings (6 of 17 fills resolved)</div>
+  <div class="subtitle">2026-04-19 &nbsp;·&nbsp; KXHIGH series &nbsp;·&nbsp; Fully settled &nbsp;·&nbsp; P&L from official Kalshi settlements</div>
 
   <!-- KPI bar -->
   <div class="kpi-bar">
-    <div class="kpi"><div class="kpi-label">Est. P&amp;L (partial)</div><div class="kpi-value win">+$253</div></div>
-    <div class="kpi"><div class="kpi-label">Return on deployed</div><div class="kpi-value win">+28.5%</div></div>
-    <div class="kpi"><div class="kpi-label">Win / Loss</div><div class="kpi-value neutral">5W / 1L · 11 pend.</div></div>
-    <div class="kpi"><div class="kpi-label">Capital deployed</div><div class="kpi-value neutral">$887</div></div>
+    <div class="kpi"><div class="kpi-label">P&L</div><div class="kpi-value win">+$72.64</div></div>
+    <div class="kpi"><div class="kpi-label">Return on deployed</div><div class="kpi-value win">+8.2%</div></div>
+    <div class="kpi"><div class="kpi-label">Win / Loss</div><div class="kpi-value neutral">11W / 6L</div></div>
+    <div class="kpi"><div class="kpi-label">Capital deployed</div><div class="kpi-value neutral">$887.32</div></div>
     <div class="kpi"><div class="kpi-label">Contracts filled</div><div class="kpi-value neutral">1,779</div></div>
-    <div class="kpi"><div class="kpi-label">Markets ordered</div><div class="kpi-value neutral">55 across 17 cities</div></div>
+    <div class="kpi"><div class="kpi-label">Markets ordered</div><div class="kpi-value neutral">54 across 17 cities</div></div>
   </div>
 
   <!-- OVERALL SUMMARY -->
   <h2>Overall Summary</h2>
   <div class="summary-box">
-    April 19 shows a partial known gain of <strong class="win">+$252.79</strong> on $887.31 deployed (<strong class="win">+28.5%</strong>), with 5 wins and 1 loss from the 6 fills where IEM actuals are available — 11 fills totaling <strong>$679</strong> remain pending as CLI data has not yet populated for Chicago, Dallas, Los Angeles, Philadelphia, Phoenix, San Francisco, Seattle, and Minneapolis. A deep cold front defined the day: every city with an IEM reading except Miami posted temperatures dramatically below its ordered bands, with several peaks occurring in the pre-dawn hours between 2:12 AM and 5:59 AM — the signature of overnight cold-air advection with no daytime recovery. Austin reached only <strong>52°F</strong> against 73–76°F ordered bands (+$208.59 across two fills, 348 contracts), Denver hit <strong>42°F</strong> against a 72–73°F band (+$14.25), and San Antonio hit <strong>52°F</strong> against a 69–70°F band (+$2.75). Oklahoma City was the tightest resolved call: 71°F actual cleared the 72°F NO-band floor by a single degree (+$42.91 on 83 contracts). Miami was the sole confirmed loss: 88°F landed squarely inside the {87,88}°F window, producing a <strong class="loss">−$15.71</strong> full loss on 23.5 contracts. The three largest pending positions — Phoenix B96.5 ($156), Philadelphia B56.5 ($141), and Los Angeles B70.5 ($84) — account for 57% of outstanding capital and will determine whether April 19 closes as a strong gain day. <strong>The forecast pipeline produced no snapshot data for April 19, leaving model_edge_at_fill null across all 17 positions.</strong>
+    April 19 settled in the green — <strong class="win">+$72.64</strong> on $887.32 deployed (<strong class="win">+8.2%</strong>), 11W/6L across 17 filled markets and 1,779 contracts. Austin's B73.5 NO was the session anchor: 344 contracts at $0.40 average captured <strong>+$205.94</strong> as the actual high of 72°F came in exactly one degree below the {73,74}°F band floor — the cleanest possible outcome for a NO bet. Philadelphia and Phoenix together absorbed −$297.49, the two largest single-market losses: Philadelphia's 57°F early-morning high (8:01 AM, an overnight warmth carry-over before cold air arrived) landed squarely in {56,57}°F for <strong class="loss">−$141.46</strong>, and Phoenix's 97°F afternoon peak hit {96,97}°F for <strong class="loss">−$156.03</strong>. The three split cities (Chicago, Dallas, Minneapolis) each had one band catch the actual and one miss: Chicago netted <strong>+$15.51</strong>, Dallas <strong>+$13.78</strong>, and Minneapolis <strong class="loss">−$23.14</strong> where the larger position landed in-band. Los Angeles (72°F clearing the {70,71}°F window above) returned <strong>+$66.00</strong> on 150 contracts. On the operational front, the forecast snapshot pipeline appears to have been restored — MAX(forecast_date) now reads 2026-04-20 — but no snapshot rows exist for 4/19 markets, indicating the pipeline came back online today rather than in time to provide a live signal for yesterday's trades.
   </div>
 
   <!-- FORECASTS -->
   <h2>Forecasts</h2>
   <div class="section">
     <div class="warn-banner">
-      ⚠️ <strong>No snapshot data for 2026-04-19.</strong> <code>KXHIGH_market_snapshot</code> recorded no rows with <code>forecast_date = '2026-04-19'</code> and <code>DATE(run_date) = '2026-04-19'</code>. Last available forecast date in the table: <strong>2026-04-20</strong>. NWS and Weather Underground forecasts, model_edge_at_fill, and nws_short_conditions are unavailable for all cities on this date.
+      ⚠️ <strong>No snapshot data for 2026-04-19.</strong> <code>KXHIGH_market_snapshot</code> returned no rows for <code>forecast_date='2026-04-19'</code> AND <code>run_date='2026-04-19'</code>. NWS forecasts, WU forecasts, forecast_avg, and weather conditions unavailable for all cities.
+    </div>
+    <div style="margin-top:12px;">
+      <div class="info-banner">
+        ✅ <strong>Pipeline restored.</strong> MAX(forecast_date) = <strong>2026-04-20</strong> — the KXHIGH snapshot system is running again after an extended outage. Starting 4/20, live forecast and model_edge_at_fill data should be available.
+      </div>
     </div>
     <div class="commentary">
-      <strong>Forecast pipeline gap on the highest-capital day in recent history.</strong> No KXHIGH_market_snapshot rows exist for April 19's forecast window, meaning every fill was entered without a live model edge signal. On a day when temperatures fell 17–30°F below ordered bands in multiple cities, forecast coverage would have provided actionable signals — NWS condition strings flagging the cold front, a sharp negative forecast_avg vs. band spread, and non-zero model_edge_at_fill values to gate position sizing. Instead, 1,779 contracts across $887 were deployed blind on signal. The snapshot ingest script needs to be restored and verified before any further capital scale-up.
+      <strong>The pipeline is back online but arrived one day too late for 4/19.</strong> MAX(forecast_date) = 2026-04-20 confirms the snapshot system has been restored after weeks of downtime (prior confirmed data was 2026-03-11). All 17 fills on 4/19 were executed without live NWS forecasts or model_edge_at_fill values — there is no way to verify whether any entry had positive expected edge at trade time. The restoration is a meaningful operational recovery. Watch the 4/20 fills_enriched rows to confirm model_edge_at_fill is populating with live signal values and that nws_short_conditions appears in the next digest.
     </div>
   </div>
 
@@ -117,13 +126,11 @@
           <th>Contracts</th>
           <th>Avg price</th>
           <th>Cost</th>
-          <th>Est. P&amp;L</th>
+          <th>P&L</th>
           <th class="left">Outcome</th>
         </tr>
       </thead>
       <tbody>
-
-        <!-- Atlanta — CLI only, no orders -->
         <tr>
           <td class="left"><span class="city-name unfilled">Atlanta</span></td>
           <td>69°F</td><td>2:12 AM †</td>
@@ -132,115 +139,75 @@
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No orders</span></td>
         </tr>
-
-        <!-- Austin — 2 fills, both WIN -->
         <tr class="divider">
           <td class="left"><span class="city-name">Austin</span></td>
-          <td><strong>52°F</strong></td><td>5:59 AM †</td>
+          <td><strong>72°F</strong></td><td>1:56 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B73.5, B75.5, T78</span></td>
-          <td class="left"><span class="band-mono">B73.5</span></td>
-          <td>73–74°F</td><td>344.0</td><td>$0.401</td><td>$138.06</td>
-          <td class="pnl pos">+$205.94</td>
-          <td class="left"><span class="pill win">WIN — below</span></td>
+          <td class="left"><span class="band-mono">B73.5, B75.5</span></td>
+          <td>73–74, 75–76°F</td><td>348.2</td><td>$0.401</td><td>$139.61</td>
+          <td class="pnl pos">+$208.59</td>
+          <td class="left"><span class="pill win">2 WIN — below</span></td>
         </tr>
         <tr>
-          <td class="left"><span style="color:#475569;font-size:0.78rem">↳ Austin</span></td>
-          <td></td><td></td><td></td><td></td>
-          <td class="left"><span class="band-mono">B75.5</span></td>
-          <td>75–76°F</td><td>4.2</td><td>$0.370</td><td>$1.55</td>
-          <td class="pnl pos">+$2.65</td>
-          <td class="left"><span class="pill win">WIN — below</span></td>
-        </tr>
-
-        <!-- Chicago — 2 fills, pending -->
-        <tr class="divider">
           <td class="left"><span class="city-name">Chicago</span></td>
-          <td>—</td><td>—</td>
+          <td><strong>51°F</strong></td><td>12:27 PM</td>
           <td class="left conditions na">—</td>
-          <td class="left"><span class="band-mono">B48.5–T55 (4)</span></td>
-          <td class="left"><span class="band-mono">B48.5</span></td>
-          <td>48–49°F</td><td>111.0</td><td>$0.456</td><td>$50.56</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
+          <td class="left"><span class="band-mono">B48.5, B50.5, B52.5, T55</span></td>
+          <td class="left"><span class="band-mono">B48.5, B50.5</span></td>
+          <td>48–49, 50–51°F</td><td>208.4</td><td>$0.458</td><td>$95.49</td>
+          <td class="pnl pos">+$15.51</td>
+          <td class="left"><span class="pill split">SPLIT 1W/1L</span></td>
         </tr>
         <tr>
-          <td class="left"><span style="color:#475569;font-size:0.78rem">↳ Chicago</span></td>
-          <td></td><td></td><td></td><td></td>
-          <td class="left"><span class="band-mono">B50.5</span></td>
-          <td>50–51°F</td><td>97.4</td><td>$0.461</td><td>$44.93</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
-        </tr>
-
-        <!-- Dallas — 2 fills, pending -->
-        <tr class="divider">
           <td class="left"><span class="city-name">Dallas</span></td>
-          <td>—</td><td>—</td>
+          <td><strong>72°F</strong></td><td>4:23 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B72.5, B74.5, T79</span></td>
-          <td class="left"><span class="band-mono">B72.5</span></td>
-          <td>72–73°F</td><td>99.3</td><td>$0.484</td><td>$48.09</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
+          <td class="left"><span class="band-mono">B72.5, B74.5</span></td>
+          <td>72–73, 74–75°F</td><td>215.9</td><td>$0.476</td><td>$102.81</td>
+          <td class="pnl pos">+$13.78</td>
+          <td class="left"><span class="pill split">SPLIT 1W/1L</span></td>
         </tr>
         <tr>
-          <td class="left"><span style="color:#475569;font-size:0.78rem">↳ Dallas</span></td>
-          <td></td><td></td><td></td><td></td>
-          <td class="left"><span class="band-mono">B74.5</span></td>
-          <td>74–75°F</td><td>116.6</td><td>$0.469</td><td>$54.72</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
-        </tr>
-
-        <!-- Denver — 1 fill, WIN -->
-        <tr class="divider">
           <td class="left"><span class="city-name">Denver</span></td>
-          <td><strong>42°F</strong></td><td>3:24 AM †</td>
+          <td><strong>71°F</strong></td><td>3:04 PM</td>
           <td class="left conditions na">—</td>
-          <td class="left"><span class="band-mono">B70.5–T75 (4)</span></td>
+          <td class="left"><span class="band-mono">B70.5, B72.5, B74.5, T75</span></td>
           <td class="left"><span class="band-mono">B72.5</span></td>
           <td>72–73°F</td><td>25.0</td><td>$0.430</td><td>$10.75</td>
           <td class="pnl pos">+$14.25</td>
           <td class="left"><span class="pill win">WIN — below</span></td>
         </tr>
-
-        <!-- Houston — no fills -->
         <tr>
           <td class="left"><span class="city-name unfilled">Houston</span></td>
-          <td>—</td><td>—</td>
+          <td>70°F</td><td>4:16 PM</td>
           <td class="left conditions na">—</td>
-          <td class="left"><span class="band-mono">B70.5–T77 (4)</span></td>
+          <td class="left"><span class="band-mono">B70.5, B72.5, B74.5, T77</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
-
-        <!-- Las Vegas — no fills -->
         <tr>
           <td class="left"><span class="city-name unfilled">Las Vegas</span></td>
-          <td>—</td><td>—</td>
+          <td>84°F</td><td>5:28 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B85.5, B87.5, T90</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
-
-        <!-- Los Angeles — 1 fill, pending -->
         <tr class="divider">
           <td class="left"><span class="city-name">Los Angeles</span></td>
-          <td>—</td><td>—</td>
+          <td><strong>72°F</strong></td><td>11:00 AM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B68.5, B70.5, T75</span></td>
           <td class="left"><span class="band-mono">B70.5</span></td>
           <td>70–71°F</td><td>150.0</td><td>$0.560</td><td>$84.00</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
+          <td class="pnl pos">+$66.00</td>
+          <td class="left"><span class="pill win">WIN — above</span></td>
         </tr>
-
-        <!-- Miami — 1 fill, LOSS -->
-        <tr class="divider">
+        <tr>
           <td class="left"><span class="city-name">Miami</span></td>
-          <td><strong>88°F</strong></td><td>2:00 PM</td>
+          <td><strong>88°F</strong></td><td>2:13 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B85.5, B87.5, T88</span></td>
           <td class="left"><span class="band-mono">B87.5</span></td>
@@ -248,38 +215,24 @@
           <td class="pnl neg">−$15.71</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
-
-        <!-- Minneapolis — 2 fills, pending -->
-        <tr class="divider">
+        <tr>
           <td class="left"><span class="city-name">Minneapolis</span></td>
-          <td>—</td><td>—</td>
+          <td><strong>47°F</strong></td><td>4:35 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B45.5, B47.5, T52</span></td>
-          <td class="left"><span class="band-mono">B45.5</span></td>
-          <td>45–46°F</td><td>29.6</td><td>$0.453</td><td>$13.43</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
+          <td class="left"><span class="band-mono">B45.5, B47.5</span></td>
+          <td>45–46, 47–48°F</td><td>107.6</td><td>$0.490</td><td>$52.77</td>
+          <td class="pnl neg">−$23.14</td>
+          <td class="left"><span class="pill split">SPLIT 1W/1L</span></td>
         </tr>
-        <tr>
-          <td class="left"><span style="color:#475569;font-size:0.78rem">↳ Minneapolis</span></td>
-          <td></td><td></td><td></td><td></td>
-          <td class="left"><span class="band-mono">B47.5</span></td>
-          <td>47–48°F</td><td>78.0</td><td>$0.504</td><td>$39.34</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
-        </tr>
-
-        <!-- New Orleans — no fills -->
         <tr>
           <td class="left"><span class="city-name unfilled">New Orleans</span></td>
-          <td>—</td><td>—</td>
+          <td>74°F</td><td>12:30 AM †</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B71.5, T78</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
-
-        <!-- New York City — no fills, has CLI -->
         <tr>
           <td class="left"><span class="city-name unfilled">New York City</span></td>
           <td>53°F</td><td>10:06 AM</td>
@@ -288,11 +241,9 @@
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
-
-        <!-- Oklahoma City — 1 fill, WIN -->
         <tr class="divider">
           <td class="left"><span class="city-name">Oklahoma City</span></td>
-          <td><strong>71°F</strong></td><td>—</td>
+          <td><strong>71°F</strong></td><td>3:44 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B72.5, B74.5, T77</span></td>
           <td class="left"><span class="band-mono">B72.5</span></td>
@@ -300,35 +251,29 @@
           <td class="pnl pos">+$42.91</td>
           <td class="left"><span class="pill win">WIN — below</span></td>
         </tr>
-
-        <!-- Philadelphia — 1 fill, pending -->
-        <tr class="divider">
+        <tr>
           <td class="left"><span class="city-name">Philadelphia</span></td>
-          <td>—</td><td>—</td>
+          <td><strong>57°F</strong></td><td>8:01 AM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B56.5, B58.5, T63</span></td>
           <td class="left"><span class="band-mono">B56.5</span></td>
           <td>56–57°F</td><td>246.0</td><td>$0.575</td><td>$141.46</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
+          <td class="pnl neg">−$141.46</td>
+          <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
-
-        <!-- Phoenix — 1 fill, pending -->
-        <tr class="divider">
+        <tr>
           <td class="left"><span class="city-name">Phoenix</span></td>
-          <td>—</td><td>—</td>
+          <td><strong>97°F</strong></td><td>3:20 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B94.5, B96.5, T99</span></td>
           <td class="left"><span class="band-mono">B96.5</span></td>
           <td>96–97°F</td><td>275.0</td><td>$0.567</td><td>$156.03</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
+          <td class="pnl neg">−$156.03</td>
+          <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
-
-        <!-- San Antonio — 1 fill, WIN -->
-        <tr class="divider">
+        <tr>
           <td class="left"><span class="city-name">San Antonio</span></td>
-          <td><strong>52°F</strong></td><td>5:58 AM †</td>
+          <td><strong>65°F</strong></td><td>12:32 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B69.5, B71.5, T74</span></td>
           <td class="left"><span class="band-mono">B69.5</span></td>
@@ -336,43 +281,45 @@
           <td class="pnl pos">+$2.75</td>
           <td class="left"><span class="pill win">WIN — below</span></td>
         </tr>
-
-        <!-- San Francisco — 1 fill, pending -->
-        <tr class="divider">
+        <tr>
           <td class="left"><span class="city-name">San Francisco</span></td>
-          <td>—</td><td>—</td>
+          <td><strong>73°F</strong></td><td>2:18 PM</td>
           <td class="left conditions na">—</td>
           <td class="left"><span class="band-mono">B66.5, B68.5, T71</span></td>
           <td class="left"><span class="band-mono">B66.5</span></td>
           <td>66–67°F</td><td>37.5</td><td>$0.500</td><td>$18.77</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
+          <td class="pnl pos">+$18.77</td>
+          <td class="left"><span class="pill win">WIN — above</span></td>
         </tr>
-
-        <!-- Seattle — 1 fill, pending -->
-        <tr class="divider">
+        <tr>
           <td class="left"><span class="city-name">Seattle</span></td>
-          <td>—</td><td>—</td>
+          <td><strong>74°F</strong></td><td>4:05 PM</td>
           <td class="left conditions na">—</td>
-          <td class="left"><span class="band-mono">B69.5–T76 (4)</span></td>
+          <td class="left"><span class="band-mono">B69.5, B71.5, B73.5, T76</span></td>
           <td class="left"><span class="band-mono">B71.5</span></td>
           <td>71–72°F</td><td>54.0</td><td>$0.511</td><td>$27.58</td>
-          <td class="na">—</td>
-          <td class="left"><span class="pill pending">Pending</span></td>
+          <td class="pnl pos">+$26.42</td>
+          <td class="left"><span class="pill win">WIN — above</span></td>
         </tr>
-
-        <!-- TOTAL ROW -->
+        <tr>
+          <td class="left"><span class="city-name unfilled">Washington DC</span></td>
+          <td>66°F</td><td>12:15 AM †</td>
+          <td class="left conditions na">—</td>
+          <td class="left na">—</td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No orders</span></td>
+        </tr>
         <tr class="total-row">
           <td class="left" colspan="7">TOTAL — filled cities only</td>
-          <td>1,779</td><td></td><td>$887.31</td>
-          <td class="pnl pos">+$252.79 (est.)</td>
-          <td class="left">5W / 1L / 11 pend.</td>
+          <td>1,779</td><td></td><td>$887.32</td>
+          <td class="pnl pos">+$72.64</td>
+          <td class="left">11W / 6L (65%)</td>
         </tr>
       </tbody>
     </table>
-    <div class="footnote">† Pre-dawn or overnight high — cold front swept through the South, Plains, and Rockies overnight Apr 18→19. Conditions column (NWS short conditions) unavailable while snapshot pipeline is offline.</div>
+    <div class="footnote">† Overnight high — peak recorded in early-morning hours before temperature dropped for the day. Conditions column (NWS short conditions) unavailable; snapshot pipeline had no 4/19 rows. Atlanta and Washington DC had no orders placed for this date.</div>
     <div class="commentary">
-      <strong>A deep cold intrusion produced the most dramatic below-band performance in recent weeks.</strong> Austin, Denver, and San Antonio all peaked in the pre-dawn hours (3–6 AM local) with actuals 17–30°F below their lowest ordered bands — these were not near-misses but categorical misses, consistent with a cold air mass arriving overnight and suppressing any daytime recovery. New York City's 53°F actual (10:06 AM peak, no fill) would have cleared all three of its NO bands cleanly, reinforcing how cold the day was across the board. Oklahoma City at 71°F was the white-knuckle trade of the day: a single degree below the 72°F band floor, but the NO held for +$42.91 on 83 contracts. Miami is the counter-story — the one city where warmth persisted and the exact-band scenario materialized, producing the day's only confirmed loss (−$15.71 on 23.5 contracts at $0.670, a high-confidence NO entry that simply lost). <strong>The 11 pending fills carry $679 in capital: Phoenix B96.5 ($156), Philadelphia B56.5 ($141), and Los Angeles B70.5 ($84) are the three to watch. Phoenix — insulated from cold fronts by desert terrain — is the highest-risk pending position at $0.567 entry. Chicago B48.5/B50.5, Dallas B72.5/B74.5, and Minneapolis B45.5/B47.5 (combined $198) will likely resolve favorably if the same cold-air pattern held across the upper Midwest and northern Plains, which the overnight temperature signature strongly implies.</strong>
+      <strong>Austin's B73.5 was the trade of the day.</strong> At $0.40 average on 344 contracts, 72°F actual came in one degree below the {73,74}°F floor — a clean NO win returning +$205.94, which funded two-thirds of the session's losses by itself. <strong>Philadelphia and Phoenix together cost −$297.49</strong> and represent the session's two largest single-market positions — both entered at ~57¢/contract, implying the model expected those temperatures to move outside the windows. Philadelphia's 57°F peak at 8:01 AM is the starkest case: overnight warmth carried over into early morning before cold air moved in, and the high happened to settle exactly at the top of the {56,57}°F window. Phoenix was a straightforward band hit — 97°F on a clear spring afternoon, right in {96,97}°F. The three split cities tell the adjacent-band story clearly: Dallas actual 72°F landed in B72.5's exact window ({72,73}°F, −$48.09) while clearing B74.5 cleanly (+$61.87) — two degrees of difference separating a loss from a win. Los Angeles and Seattle both won via temperature running <em>above</em> their filled bands (72°F above {70,71}°F and 74°F above {71,72}°F respectively), confirming that NO bets win on both sides of the window, not just below.
     </div>
   </div>
 
@@ -381,7 +328,7 @@
   <div class="section">
     <div class="no-alerts">No alerts on 2026-04-19.</div>
     <div class="commentary">
-      <strong>No operational errors or anomalies on April 19.</strong> The pipeline executed 17 fills across 13 cities and $887 in capital — the highest single-day deployment in recent history — without triggering any system alerts. The absence of alerts confirms the execution layer is functioning correctly at scale. The only outstanding operational concern remains the snapshot pipeline outage, which produced no forecast data for April 19 and leaves model_edge_at_fill null on every position. That is a signal quality gap, not a system failure, but it needs to be resolved before further scale-up.
+      <strong>Clean operational day — no system errors or anomalies logged.</strong> 1,779 contracts filled across 17 markets with no execution failures recorded in KXHIGH_alerts. The absence of alerts on the same day the forecast pipeline appears to have been restored is a positive signal. Watch the 4/20 run for model_edge_at_fill population and confirm the snapshot is writing correctly for the new trading day.
     </div>
   </div>
 
