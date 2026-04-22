@@ -1154,25 +1154,23 @@ import pytz
 
 def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Central') -> int:
     """
-    Calculate the Unix time for a specific hour and minute tomorrow in the given timezone.
+    Calculate a Unix timestamp for (hour, minute) on today+variable days.
 
-    :param hour: Hour of the time (24-hour format).
-    :param minute: Minute of the time.
-    :param timezone: Timezone (default is 'US/Central').
-    :return: Unix timestamp for the specified time tomorrow.
+    Safety: if the resulting target is already in the past (or within 5
+    minutes of now), roll forward by an additional day. Previously, running
+    the bot between 9-10 AM CT for a 9 AM-cutoff city (NY/PHI/MIA/ATL/DC/
+    BOS) produced an exp_ts slightly in the past, causing Kalshi to reject
+    or immediately expire the orders.
     """
-    # Define the timezone
     tz = pytz.timezone(timezone)
-
-    # Get the current date and time in the specified timezone
     now = datetime.now(tz)
-
-    # Calculate tomorrow's date at the specified time
     target_time = tz.localize(
         datetime(year=now.year, month=now.month, day=now.day, hour=hour, minute=minute) + timedelta(days=variable)
     )
-
-    # Convert to Unix time
+    # If target is in the past or within a 5-minute buffer, push to the next day
+    if (target_time - now).total_seconds() < 300:
+        target_time += timedelta(days=1)
+        print(f"  ⏰ exp_ts target ({hour:02d}:{minute:02d} CT) was <=5min away; rolled to next day")
     return int(target_time.timestamp())
 
 ########## BUY CALCULATIONS
@@ -1198,6 +1196,21 @@ for index, row in combined_table.iterrows():
       continue
   except:
     pass  # If check fails, try to place orders anyway
+
+  # Refresh position for THIS ticker right before its ladder — the bulk fetch
+  # happened at pre-loop time; prior-run resting orders may have filled since
+  # then. Without this, row['position'] is stale and the cap check at
+  # `max_contracts >= position + resting + new` can pass when it shouldn't.
+  try:
+    _pos_resp = exchange_client.get_positions(ticker=ticker)
+    _mps = _pos_resp.get('market_positions', []) if isinstance(_pos_resp, dict) else []
+    _live = [p for p in _mps if p.get('ticker') == ticker and p.get('position', 0) != 0]
+    _fresh_pos = abs(_live[0].get('position', 0)) if _live else 0
+    if _fresh_pos != row['position']:
+      print(f"    📊 position refresh {row['position']} → {_fresh_pos}")
+      row['position'] = _fresh_pos
+  except Exception as _pe:
+    pass  # fall back to pre-loop snapshot position if refresh fails
 
   # Filter 0b: city-level pre-trade skip (peak hour or forecast busted)
   if row['City'] in PRE_TRADE_SKIP_CITIES:
