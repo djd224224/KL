@@ -1133,11 +1133,11 @@ starting_contracts = 35
 
 # Night-run size multiplier: double size when orders rest overnight.
 # - variable==1: afternoon/evening run placing orders on tomorrow's market.
-# - variable==0 with early-morning hour (<6 CT): same-day market but still
+# - variable==0 with early-morning hour (<5 CT): same-day market but still
 #   hours before the 9 AM CT close, so orders rest overnight-ish. Previously
 #   these runs used 1.0x and produced a smaller, asymmetric size vs. the
 #   evening run on the same market.
-is_night_run = variable == 1 or central_time.hour < 6
+is_night_run = variable == 1 or central_time.hour < 5
 night_size_mult = 2 if is_night_run else 1.0
 
 # Per-city size multipliers — tilt size toward better-edge cities, shrink for worse ones.
