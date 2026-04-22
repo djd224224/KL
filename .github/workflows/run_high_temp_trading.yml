@@ -24,13 +24,37 @@ jobs:
         echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > Lisa_Kalshi.txt
         printenv GCP_SA_KEY > google_credentials.json
     - name: Run Kalshi script
+      id: run_script
       env:
         ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
         ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
         ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         GOOGLE_APPLICATION_CREDENTIALS: google_credentials.json
-      run: python high_temp_trading.py
+      run: |
+        set -o pipefail
+        python high_temp_trading.py 2>&1 | tee run.log
+    - name: Publish run summary
+      if: always()
+      env:
+        JOB_STATUS: ${{ steps.run_script.outcome }}
+      run: |
+        {
+          echo "*Outcome: \`$JOB_STATUS\`*"
+          echo ""
+          if [ -f run_summary.md ]; then
+            cat run_summary.md
+          else
+            echo "_run_summary.md not produced — script may have failed early. See logs._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload run summary artifact
+      if: always() && hashFiles('run_summary.md') != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: high-temp-run-summary-${{ github.run_id }}
+        path: run_summary.md
+        retention-days: 30
     - name: Cleanup secrets
       if: always()
       run: |
-        rm -f Lisa_Kalshi.txt google_credentials.json
+        rm -f Lisa_Kalshi.txt google_credentials.json run.log run_summary.md

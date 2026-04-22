@@ -39,6 +39,7 @@ jobs:
       run: |
         printenv GCP_SA_KEY > gcp_sa_key.json
     - name: Run trading script
+      id: run_script
       env:
         KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
         KALSHI_PRIVATE_KEY_PATH: kalshi_private_key.pem
@@ -48,8 +49,31 @@ jobs:
         ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
         ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
         ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
-      run: python mlb_trading.py
+      run: |
+        set -o pipefail
+        python mlb_trading.py 2>&1 | tee run.log
+    - name: Publish run summary
+      if: always()
+      env:
+        JOB_STATUS: ${{ steps.run_script.outcome }}
+      run: |
+        {
+          echo "*Outcome: \`$JOB_STATUS\`*"
+          echo ""
+          if [ -f run_summary.md ]; then
+            cat run_summary.md
+          else
+            echo "_run_summary.md not produced — script may have failed early. See logs._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload run summary artifact
+      if: always() && hashFiles('run_summary.md') != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: mlb-run-summary-${{ github.run_id }}
+        path: run_summary.md
+        retention-days: 30
     - name: Cleanup secrets
       if: always()
       run: |
-        rm -f kalshi_private_key.pem gcp_sa_key.json
+        rm -f kalshi_private_key.pem gcp_sa_key.json run.log run_summary.md

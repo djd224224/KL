@@ -1412,3 +1412,38 @@ if _ALERTS:
     print(f"{'='*60}\n")
 else:
     print("\n✓ No alerts — clean run")
+
+# =====================================================================
+# RUN SUMMARY (markdown, for GitHub Actions step summary)
+# =====================================================================
+try:
+    import datetime as _dt
+    _lines = ["# High-Temp Trading Run", ""]
+    _lines.append(f"- Finished: `{_dt.datetime.utcnow().isoformat(timespec='seconds')}Z`")
+    _lines.append(f"- Orders placed: **{orders_placed}**")
+    _order_recs = locals().get('all_order_records') or []
+    if _order_recs:
+        _by_city = {}
+        for _r in _order_recs:
+            _k = _r.get('city') or _r.get('market_ticker', '?').split('-')[1:2] or ['?']
+            _k = _k if isinstance(_k, str) else (_k[0] if _k else '?')
+            _by_city[_k] = _by_city.get(_k, 0) + 1
+        _lines.append("")
+        _lines.append("## Orders by city")
+        for _c, _n in sorted(_by_city.items(), key=lambda x: -x[1]):
+            _lines.append(f"- {_c}: {_n}")
+    _lines.append("")
+    _lines.append("## Alerts")
+    if _ALERTS:
+        _cats2 = {}
+        for _a in _ALERTS:
+            _cats2[_a['category']] = _cats2.get(_a['category'], 0) + 1
+        for _cat, _count in sorted(_cats2.items(), key=lambda x: -x[1]):
+            _lines.append(f"- `{_cat}`: {_count}")
+    else:
+        _lines.append("- None — clean run")
+    with open("run_summary.md", "w", encoding="utf-8") as _f:
+        _f.write("\n".join(_lines) + "\n")
+    print("\n[SUMMARY] Wrote run_summary.md")
+except Exception as _e:
+    print(f"[SUMMARY] Failed to write run_summary.md: {_e}")

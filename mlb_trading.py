@@ -3292,3 +3292,39 @@ if _ALERTS:
     print(f"{'='*70}\n")
 else:
     print("\n✓ No alerts — clean run")
+
+# =====================================================================
+# RUN SUMMARY (markdown, for GitHub Actions step summary)
+# =====================================================================
+try:
+    import datetime as _dt
+    _series = locals().get('SERIES_TICKER', 'MLB')
+    _lines = [f"# {_series} Trading Run", ""]
+    _lines.append(f"- Finished: `{_dt.datetime.utcnow().isoformat(timespec='seconds')}Z`")
+    _ledger = locals().get('position_ledger') or {}
+    if isinstance(_ledger, dict):
+        _lines.append(f"- Markets in ledger: **{len(_ledger)}**")
+    _bankroll = locals().get('df_bankroll_log')
+    try:
+        if _bankroll is not None and len(_bankroll) > 0:
+            _row = _bankroll.iloc[-1].to_dict()
+            _bal = _row.get('bankroll') or _row.get('balance')
+            if _bal is not None:
+                _lines.append(f"- Latest bankroll: **{_bal}**")
+    except Exception:
+        pass
+    _lines.append("")
+    _lines.append("## Alerts")
+    if _ALERTS:
+        _cats2 = {}
+        for _a in _ALERTS:
+            _cats2[_a['category']] = _cats2.get(_a['category'], 0) + 1
+        for _cat, _count in sorted(_cats2.items(), key=lambda x: -x[1]):
+            _lines.append(f"- `{_cat}`: {_count}")
+    else:
+        _lines.append("- None — clean run")
+    with open("run_summary.md", "w", encoding="utf-8") as _f:
+        _f.write("\n".join(_lines) + "\n")
+    print("\n[SUMMARY] Wrote run_summary.md")
+except Exception as _e:
+    print(f"[SUMMARY] Failed to write run_summary.md: {_e}")
