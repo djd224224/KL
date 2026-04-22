@@ -1145,6 +1145,7 @@ night_size_mult = 2 if is_night_run else 1.0
 CITY_SIZE_MULT = {
     "New York City": 1.5,
     "Austin": 1.5,
+    "Los Angeles": 1.25,
     "Dallas": 0.75,
     "Atlanta": 0.75,
     "Philadelphia": 0.75,
