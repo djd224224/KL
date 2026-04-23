@@ -1192,8 +1192,9 @@ for index, row in combined_table.iterrows():
   no_bid = row['no_highest_bid']
   hi_no = row['hi_no_price']
 
-  # Diagnostic: show every market's state
-  print(f"\n  {ticker}: P(yes)={yes_prob:.2f} hi_no={hi_no} no_bid={no_bid} no_offer={no_offer} tail={is_tail}")
+  # Per-market header — brief line that always prints; the rich detail block
+  # prints after all pre-filters pass (so we don't bury skipped markets in log).
+  print(f"\n  {ticker} [{row['City']}]:")
 
   # Filter 0: check if market is still open for trading
   try:
@@ -1251,35 +1252,188 @@ for index, row in combined_table.iterrows():
     print(f"    SKIP: no orderbook data")
     continue
 
+  # ==================================================================
+  # Rich per-market detail block — prints only for markets that passed
+  # all pre-filters above. Shows: forecasts, σ decomposition, conditions,
+  # peak time, band + P(yes) formula, model, orderbook, sizing, position.
+  # ==================================================================
+  def _fmt(v, unit='', prec=1, none_str='N/A'):
+    """Tolerantly format a numeric field (handles None, '', NaN, strings)."""
+    try:
+      import math as _math
+      if v is None: return none_str
+      if isinstance(v, str) and v.strip() == '': return none_str
+      f = float(v)
+      if _math.isnan(f): return none_str
+      return f"{f:.{prec}f}{unit}"
+    except Exception:
+      return none_str
+
+  _nws_f = row.get('NWS')
+  _wu_f = row.get('Weather Underground')
+  _avg_f = row.get('Average')
+  _eff_sigma = row.get('Standard Deviation')
+  _city_floor = row.get('City Floor Std')
+  _hist_sigma = row.get('var_sqrt')
+  _hi_lo = row.get('Highest Minus Lowest')
+
+  # Inter-source σ = raw std of NWS+WU BEFORE the city-floor is applied.
+  try:
+    _raw_vals = []
+    for _v in [_nws_f, _wu_f]:
+      try:
+        _vf = float(_v)
+        if not np.isnan(_vf): _raw_vals.append(_vf)
+      except Exception:
+        pass
+    _iss = float(np.std(_raw_vals, ddof=1)) if len(_raw_vals) >= 2 else None
+  except Exception:
+    _iss = None
+
+  print(f"    Forecasts:  NWS={_fmt(_nws_f, '°F', 0)} | WU={_fmt(_wu_f, '°F', 0)} | "
+        f"μ={_fmt(_avg_f, '°F', 1)} | spread={_fmt(_hi_lo, '°F', 1)}")
+  _floor_tag = ''
+  try:
+    if _eff_sigma is not None and _city_floor is not None:
+      _ef = float(_eff_sigma); _cf = float(_city_floor)
+      _is_v = _iss if _iss is not None else 0.0
+      if _ef >= _cf - 1e-9 and _ef > _is_v + 1e-9:
+        _floor_tag = ' (FLOOR ACTIVE — sources agree / too close)'
+  except Exception:
+    pass
+  print(f"    σ:          inter-source={_fmt(_iss, '°F', 2)} | "
+        f"city_floor={_fmt(_city_floor, '°F', 2)} ({row['City']}) | "
+        f"effective={_fmt(_eff_sigma, '°F', 2)}{_floor_tag}")
+  if _hist_sigma is not None:
+    print(f"                historical σ (analytics only, not used in model): "
+          f"{_fmt(_hist_sigma, '°F', 2)}")
+
+  _short = row.get('NWS Short Conditions') or 'N/A'
+  _det = row.get('NWS Detailed Conditions') or ''
+  if isinstance(_det, str) and len(_det) > 80:
+    _det = _det[:77] + '...'
+  _cond_line = f"    Conditions: {_short}"
+  if _det and _det != _short:
+    _cond_line += f' — "{_det}"'
+  print(_cond_line)
+
+  _peak_hr = row.get('peak_hour_ct')
+  _peak_temp = row.get('peak_temp_f')
+  _obs_st = row.get('observed_station')
+  _obs_t = row.get('observed_temp_f')
+  _midn = row.get('Midnight Temperature')
+  _upd = row.get('nws_forecast_update_ts')
+  _drift = row.get('obs_minus_forecast_at_run_f')
+  _has_peak = any(v is not None for v in [_peak_hr, _peak_temp, _obs_t])
+  if _has_peak:
+    _peak_part = (f"peak {int(_peak_hr):02d}:00 CT @ {_fmt(_peak_temp, '°F', 0)}"
+                  if _peak_hr is not None else "peak N/A")
+    _obs_part = (f"obs {_obs_st}={_fmt(_obs_t, '°F', 0)} at run"
+                 if _obs_t is not None else "obs N/A")
+    print(f"    Peak:       {_peak_part} | {_obs_part} | midnight={_fmt(_midn, '°F', 0)}")
+    _sub = []
+    if _upd: _sub.append(f"forecast update: {_upd}")
+    if _drift is not None:
+      try: _sub.append(f"obs-forecast drift: {float(_drift):+.1f}°F")
+      except Exception: pass
+    if _sub:
+      print(f"                {' | '.join(_sub)}")
+  else:
+    print(f"    Peak:       N/A (night run — pre-trade obs block not run) | "
+          f"midnight={_fmt(_midn, '°F', 0)}")
+
+  _lo_r = float(row['low_range']); _hi_r = float(row['high_range'])
+  _suf = ticker.split('-')[-1]
+  _band_str = f"[{_lo_r:g}, {_hi_r:g}]°F" if _hi_r < 150 else f"[≥{_lo_r:g}]°F (tail)"
+  print(f"    Band:       {_suf} = {_band_str}")
+  try:
+    _mu = float(_avg_f); _s = float(_eff_sigma)
+    if _s > 0:
+      _z_hi = (_hi_r - _mu) / _s; _z_lo = (_lo_r - _mu) / _s
+      _p_hi = float(norm.cdf(_z_hi)); _p_lo = float(norm.cdf(_z_lo))
+      if _hi_r < 150:
+        print(f"                P(yes) = Φ(({_hi_r:g}−{_mu:.1f})/{_s:.2f}) − "
+              f"Φ(({_lo_r:g}−{_mu:.1f})/{_s:.2f})")
+        print(f"                       = Φ({_z_hi:+.2f}) − Φ({_z_lo:+.2f})")
+        print(f"                       = {_p_hi:.3f} − {_p_lo:.3f} = {yes_prob:.2f}")
+      else:
+        print(f"                P(yes) = 1 − Φ(({_lo_r:g}−{_mu:.1f})/{_s:.2f}) "
+              f"= 1 − Φ({_z_lo:+.2f}) = {yes_prob:.2f}")
+  except Exception:
+    pass
+
+  try: _hi_no_c = int(hi_no)
+  except Exception: _hi_no_c = hi_no
+  _fair_no_c = round(100 * (1 - yes_prob))
+  print(f"    Model:      hi_no cap = {_hi_no_c}c (config, top of ladder) | "
+        f"fair NO ≈ {_fair_no_c}c (=100·P(no)) | P(no)={1-yes_prob:.2f}")
+
+  try:
+    _nb_i = int(no_bid); _no_i = int(no_offer)
+    print(f"    Orderbook:  no_bid={_nb_i}c, no_offer={_no_i}c | spread={_no_i - _nb_i}c")
+  except Exception:
+    _nb_i = None; _no_i = None
+    print(f"    Orderbook:  no_bid={no_bid}, no_offer={no_offer} (parse issue)")
+
+  _city_mult = CITY_SIZE_MULT.get(row['City'], 1.0)
+  _n_levels = len(price_count)
+  _base_size = max(1, int(round(starting_contracts * night_size_mult * 1.0 * _city_mult)))
+  _top_size = max(1, int(round(starting_contracts * night_size_mult * 2.0 * _city_mult)))
+  _inc_show = increment1 if is_tail else increment
+  _nm_reason = ("variable=1" if variable == 1 else
+                ("hour<5 CT" if central_time.hour < 5 else "daytime"))
+  print(f"    Sizing:     base={starting_contracts} × night={night_size_mult:g}x "
+        f"({_nm_reason}) × city={_city_mult:g}x ({row['City']})")
+  print(f"                ladder_mult 1.0→2.0x → {_base_size} → {_top_size} "
+        f"contracts across i=0..{_n_levels-1} (increment={_inc_show}c)")
+
+  _headroom = max_contracts - int(row['position']) - int(row['resting_order_count'])
+  print(f"    Position:   held={row['position']}, resting={row['resting_order_count']}, "
+        f"cap={max_contracts} (headroom={_headroom})")
+
+  print(f"    Ladder (maker-only post_only; filters: bid<no_offer AND bid<no_bid−3):")
+
+  # ==================================================================
+  # Ladder loop — collect per-rung records, render as a block after.
+  # ==================================================================
   i1 = 0
   level_orders = 0
   n_levels = len(price_count)
+  _rungs = []           # list of (i, bid, contracts, edge, status, reason)
+  _placed_rungs = []    # list of (bid, contracts, edge) for placed orders
+  _skip_cnt = {"bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "order_failed": 0}
+
   for i in price_count:
     if "-T" not in ticker:
       bid_price = max(hi_no - i * increment, 1)
     if is_tail:
       bid_price = max(hi_no - i * increment1, 1)
 
-    # Compute size for THIS level: scales linearly from 1.0x → 2.0x of base across the ladder,
-    # then multiplied by the night-run multiplier (1.5x if variable==1, else 1.0x)
-    # and the per-city multiplier (default 1.0x).
+    # Size for THIS level: ladder_mult scales 1.0→2.0 across rungs,
+    # multiplied by night_size_mult and the per-city multiplier.
     ladder_mult = 1.0 + (i / (n_levels - 1)) if n_levels > 1 else 1.0
     city_mult = CITY_SIZE_MULT.get(row['City'], 1.0)
     contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult * city_mult)))
+    # Edge = NO-side EV per $1 staked = (1 − P(yes)) − bid/100
+    edge = (1.0 - yes_prob) - (bid_price / 100.0)
 
-    # Show first level diagnostics
-    if i == 0:
-      print(f"    Level 0: bid={bid_price:.0f} contracts={contracts} vs no_offer={int(no_offer)} no_bid={int(no_bid)} (need bid<offer AND bid<bid-3)")
-
+    # Filter A: bid must not cross the offer (post_only would reject)
     if not (bid_price < int(no_offer)):
-      if i == 0: print(f"    SKIP level 0: bid {bid_price:.0f} >= no_offer {int(no_offer)}")
+      _rungs.append((i, bid_price, contracts, edge, 'SKIP',
+                     f'bid≥no_offer({int(no_offer)})'))
+      _skip_cnt["bid>=no_offer"] += 1
       continue
+    # Filter B: bid must be ≥4c below current best NO bid (maker buffer)
     if not (bid_price < int(no_bid) - 3):
-      if i == 0: print(f"    SKIP level 0: bid {bid_price:.0f} >= no_bid-3 ({int(no_bid)-3})")
+      _rungs.append((i, bid_price, contracts, edge, 'SKIP',
+                     f'bid≥no_bid−3({int(no_bid) - 3})'))
+      _skip_cnt["bid>=no_bid-3"] += 1
       continue
-    # Position cap check now uses the actual contracts size for THIS level
+    # Filter C: position cap
     if not (max_contracts >= row['position'] + row['resting_order_count'] + contracts):
-      if i == 0: print(f"    SKIP level 0: position cap (would exceed {max_contracts})")
+      _rungs.append((i, bid_price, contracts, edge, 'SKIP',
+                     f'position cap (would exceed {max_contracts})'))
+      _skip_cnt["position_cap"] += 1
       continue
 
     i1 = i1 + 1
@@ -1345,47 +1499,83 @@ for index, row in combined_table.iterrows():
       row['resting_order_count'] = row['resting_order_count'] + contracts
       orders_placed += 1
       level_orders += 1
+      _rungs.append((i, bid_price, contracts, edge, '✓', 'placed'))
+      _placed_rungs.append((int(bid_price), contracts, edge))
     except Exception as e:
       # Capture full error body — try multiple approaches for different exception types
       resp_body = ""
-      # Approach 1: requests-style .response attribute
       if hasattr(e, 'response') and e.response is not None:
           try: resp_body = e.response.text[:300]
           except: pass
-      # Approach 2: Kalshi client may store body in .args
       if not resp_body and hasattr(e, 'args') and len(e.args) > 1:
           resp_body = str(e.args[1])[:300] if e.args[1] else ""
-      # Approach 3: some clients store as .body or .detail
       if not resp_body:
           for attr in ('body', 'detail', 'message', 'reason'):
               val = getattr(e, attr, None)
               if val:
                   resp_body = str(val)[:300]
                   break
-      # Approach 4: repr() often shows more than str()
       if not resp_body and repr(e) != str(e):
           resp_body = repr(e)[:300]
       _err_str = f"{e} | {resp_body}" if resp_body else str(e)
-      # Log exception type + all attributes on FIRST 400 error only (diagnostic)
       if '400' in str(e) and not _diag_printed:
           _diag_printed = True
           print(f"    [DIAG] Exception type: {type(e).__name__}, attrs: {[a for a in dir(e) if not a.startswith('_')]}")
           print(f"    [DIAG] args: {e.args}")
           print(f"    [DIAG] repr: {repr(e)[:500]}")
       if '400' in str(e):
-          # Expected for closed/settled markets — log but don't alert (no text)
-          print(f"    ⚠️ ORDER_400: {row['market_ticker']} no@{int(bid_price)}c ({_err_str[:150]})")
+          _fail_tag = f'ORDER_400: {_err_str[:80]}'
       elif '429' in str(e):
           alert("ORDER_429", f"Rate limited on {row['market_ticker']}",
                 {"error": _err_str[:300]})
+          _fail_tag = 'ORDER_429: rate limited'
       else:
           alert("ORDER_FAILED", f"{row['market_ticker']} @{int(bid_price)}c: {_err_str[:200]}")
-      print(f"    ✗ Order failed {row['market_ticker']} @{int(bid_price)}¢: {_err_str}")
+          _fail_tag = f'ORDER_FAILED: {_err_str[:60]}'
+      _rungs.append((i, bid_price, contracts, edge, '✗', _fail_tag))
+      _skip_cnt["order_failed"] += 1
       time.sleep(0.2)  # Extra pause after error
     if bid_price <= 1:
       break  # Don't place more orders at the 1¢ floor
-  if level_orders > 0:
-    print(f"    ✓ Placed {level_orders} orders")
+
+  # Render ladder rows (aligned columns)
+  for _r_i, _r_bid, _r_c, _r_edge, _r_st, _r_rs in _rungs:
+    if _r_st == '✓':
+      _status_fmt = '✓ placed'
+    elif _r_st == '✗':
+      _status_fmt = f'✗ {_r_rs}'
+    else:
+      _status_fmt = f'SKIP {_r_rs}'
+    print(f"      i={_r_i}  {int(_r_bid):>3d}c × {_r_c:>4d}  "
+          f"edge={_r_edge*100:+5.1f}%  — {_status_fmt}")
+
+  # Final → NO summary
+  if _placed_rungs:
+    _top5 = _placed_rungs[:5]
+    _formatted = [f"{p}c({c},ev={e*100:+.0f}%)" for p, c, e in _top5]
+    if len(_placed_rungs) > 5:
+      _formatted.append(f"... +{len(_placed_rungs)-5} more")
+    _sum_placed = sum(c for _, c, _ in _placed_rungs)
+    _n_skipped = len(_rungs) - len(_placed_rungs)
+    print(f"    → NO: {_formatted} (placed: {len(_placed_rungs)} rungs / "
+          f"{_sum_placed} contracts, skipped: {_n_skipped})")
+  else:
+    # No rungs placed — root-cause the whole ladder
+    if len(_rungs) == 0:
+      _reason = "ladder never entered (unexpected)"
+    elif _skip_cnt["bid>=no_offer"] == len(_rungs):
+      _reason = "entire ladder crosses the offer (book entirely above ladder top)"
+    elif _skip_cnt["bid>=no_bid-3"] == len(_rungs):
+      _reason = "no rung is ≥4c below current NO bid (market too tight for maker)"
+    elif _skip_cnt["bid>=no_offer"] + _skip_cnt["bid>=no_bid-3"] == len(_rungs):
+      _reason = "every rung either crosses offer or fails the 4c maker buffer"
+    elif _skip_cnt["position_cap"] > 0 and _skip_cnt["order_failed"] == 0:
+      _reason = "position cap reached"
+    elif _skip_cnt["order_failed"] > 0:
+      _reason = f"all attempts failed ({_skip_cnt})"
+    else:
+      _reason = f"mixed skips: {_skip_cnt}"
+    print(f"    → NO: [no orders placed — {_reason}]")
 
 print(f"\n{'='*60}")
 print(f"TOTAL ORDERS PLACED: {orders_placed}")
