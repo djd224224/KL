@@ -448,32 +448,72 @@ def get_nws_current_observation(city_name):
 # Iterate through cities and fetch data
 # def get_weatherunderground_forecast(lat, lon):
 def get_weatherunderground_forecast(city, coords):
+    """Fetch WU 5-day forecast for (lat, lon). Returns float (today/tomorrow
+    high) or 'N/A' after exhausting retries. Has 10s timeout and 3 retries
+    with exponential backoff to tolerate the ~01 CT WU maintenance window
+    that was causing 100% of those runs' WU fields to be NaN."""
     API_KEY = "a828c2a178844147a8c2a17884a147a5"  # Weather Underground API Key
-    lat, lon = coords  # Extract latitude and longitude from coords
-    URL = f"https://api.weather.com/v3/wx/forecast/daily/5day?apiKey={API_KEY}&geocode={lat},{lon}&format=json&units=e&language=en-US"
+    lat, lon = coords
+    URL = (f"https://api.weather.com/v3/wx/forecast/daily/5day"
+           f"?apiKey={API_KEY}&geocode={lat},{lon}&format=json&units=e&language=en-US")
 
-    # Send request
-    response = requests.get(URL)
+    _last_err = None
+    _last_status = None
+    _last_body = None
+    for _attempt in range(3):
+        try:
+            response = requests.get(URL, timeout=10)
+            _last_status = response.status_code
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                except Exception as _je:
+                    _last_err = f"json parse: {_je}"
+                    _last_body = response.text[:200] if response.text else ""
+                    time.sleep(1.5 * (_attempt + 1))
+                    continue
+                if "temperatureMax" in data and isinstance(data["temperatureMax"], list):
+                    try:
+                        today_high = data["temperatureMax"][variable]
+                        if today_high is not None:
+                            return today_high
+                        _last_err = "temperatureMax[variable] is null"
+                    except IndexError:
+                        _last_err = f"temperatureMax array too short (len={len(data['temperatureMax'])}, want idx={variable})"
+                    _last_body = str(data.get("temperatureMax"))[:200]
+                else:
+                    _last_err = "temperatureMax missing from response"
+                    _last_body = str(list(data.keys()))[:200]
+                # Data-shape failures don't benefit from retry — break out
+                break
+            elif response.status_code in (429, 500, 502, 503, 504):
+                # Retry transient errors — WU ~01 CT maintenance window produces these
+                _last_err = f"HTTP {response.status_code}"
+                _last_body = response.text[:200] if response.text else ""
+                time.sleep(1.5 * (_attempt + 1))
+                continue
+            else:
+                # 4xx (auth/quota/bad key) — don't retry
+                _last_err = f"HTTP {response.status_code}"
+                _last_body = response.text[:200] if response.text else ""
+                break
+        except requests.exceptions.Timeout as _te:
+            _last_err = f"timeout: {_te}"
+            time.sleep(1.5 * (_attempt + 1))
+            continue
+        except requests.exceptions.RequestException as _re:
+            _last_err = f"request exc: {_re}"
+            time.sleep(1.5 * (_attempt + 1))
+            continue
 
-    # Check if the request was successful
-    if response.status_code == 200:
-        data = response.json()
-
-        # Try extracting the correct temperature field
-        if "temperatureMax" in data:
-            # Use variable to get today or tomorrow's forecast
-            today_high = data["temperatureMax"][variable]
-            return today_high
-        else:
-            alert("FORECAST_FAILED", f"WU missing temperatureMax for {city}",
-                  {"source": "weather_underground"})
-            print(f"Error: 'temperatureMax' field not found in API response for {city}.")
-            return "N/A"  # Return "N/A" if temperature data is not found
-    else:
-        alert("FORECAST_FAILED", f"WU HTTP {response.status_code} for {city}",
-              {"source": "weather_underground", "status_code": response.status_code})
-        print(f"Failed to fetch data for {city}. Status code: {response.status_code}, Message: {response.text}")
-        return "N/A"  # Return "N/A" if request fails
+    alert("FORECAST_FAILED",
+          f"WU {_last_err} for {city}" + (f" (status={_last_status})" if _last_status else ""),
+          {"source": "weather_underground", "status_code": _last_status,
+           "err": _last_err, "body": _last_body})
+    print(f"  ⚠️ WU FAIL {city} after 3 attempts: {_last_err}"
+          + (f" | status={_last_status}" if _last_status else "")
+          + (f" | body={_last_body}" if _last_body else ""))
+    return "N/A"
 
 # Get current run date in Central Time
 central_tz = pytz.timezone("US/Central")
