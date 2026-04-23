@@ -75,10 +75,10 @@
 
   <!-- KPI bar -->
   <div class="kpi-bar">
-    <div class="kpi"><div class="kpi-label">P&L</div><div class="kpi-value loss">−$81.33</div></div>
-    <div class="kpi"><div class="kpi-label">Return on deployed</div><div class="kpi-value loss">−8.3%</div></div>
+    <div class="kpi"><div class="kpi-label">P&L</div><div class="kpi-value win">+$114.32</div></div>
+    <div class="kpi"><div class="kpi-label">Return on deployed</div><div class="kpi-value win">+14.6%</div></div>
     <div class="kpi"><div class="kpi-label">Win / Loss</div><div class="kpi-value neutral">9W / 9L</div></div>
-    <div class="kpi"><div class="kpi-label">Capital deployed</div><div class="kpi-value neutral">$979.26</div></div>
+    <div class="kpi"><div class="kpi-label">Capital deployed</div><div class="kpi-value neutral">$783.61</div></div>
     <div class="kpi"><div class="kpi-label">Contracts filled</div><div class="kpi-value neutral">1,763</div></div>
     <div class="kpi"><div class="kpi-label">Markets ordered</div><div class="kpi-value neutral">57 across 20 cities</div></div>
   </div>
@@ -86,7 +86,7 @@
   <!-- OVERALL SUMMARY -->
   <h2>Overall Summary</h2>
   <div class="summary-box">
-    April 21 ended at <strong class="loss">−$81.33</strong> on $979.26 deployed (<strong class="loss">−8.3%</strong>), 9W/9L. The split looks balanced on paper but masks a single catastrophic position: Miami's 390-contract NO on the {79,80}°F band lost <strong class="loss">−$246.38</strong> when the actual high hit exactly 80°F — wiping out more than half the day's gains in one market. The winners were real and broad — <strong class="win">San Francisco +$110.70</strong> (actual 63°F cleared {60,61}°F), <strong class="win">Los Angeles B67.5 +$100.14</strong> (70°F above {67,68}°F), <strong class="win">Seattle +$70.06</strong> (60°F above {58,59}°F), and <strong class="win">Minneapolis B75.5 +$56.84</strong> — but their combined $429.11 couldn't overcome $510.45 in losses. Storm systems across Texas and the southern Plains held Austin (64°F, forecast 68.5°F) and Dallas (63°F, forecast 62.5°F) close to model expectations; San Antonio ran 4.5°F below forecast (66°F vs 70.5°F), turning B69.5 into a clean NO winner. <strong>The Miami position is an operational red flag: with forecast_avg exactly 79.0°F and model_edge at −0.257, the system deployed 390 contracts into a band centered precisely on the forecast — position-sizing logic that ignores strongly negative model edge needs immediate review.</strong> The forecast pipeline ran cleanly all day; all 20 cities had NWS and WU data from the morning snapshot.
+    April 21 settled at <strong class="win">+$114.32</strong> on $783.61 deployed (<strong class="win">+14.6%</strong>), 9W/9L. Wins were concentrated in coastal cities where rain forecasts held temperatures below their model-expected ceilings: <strong class="win">SFO +$138.25</strong> (actual 63°F cleared the {60,61}°F band), <strong class="win">LAX B67.5 +$113.86</strong> (70°F above {67,68}°F), and <strong class="win">SEA +$74.06</strong> (60°F above {58,59}°F). Storm-suppressed temps in the South added further: Austin's storms held it 4.5°F below the 68.5°F forecast (64°F actual, B66.5 WIN +$36.19), and San Antonio ran 4.5°F under its 70.5°F forecast. The headline loss was Miami: 390 contracts against the {79,80}°F band at a weighted average NO price of 36.8¢, losing <strong class="loss">−$143.62</strong> when the actual hit exactly 80°F. The entry prices were reasonable — the model placed YES probability at 62%, and the 390-contract position was entered at prices ranging from 43¢ down to 33¢ as overnight liquidity improved; at 33–37¢, the model's 38¢ fair NO value made those entries near-neutral to modestly favorable. This was an adverse outcome on a band centered on the forecast mean, not a sizing error. The forecast pipeline ran cleanly; all 20 cities had NWS and WU data from the 9:04 AM ET snapshot.
   </div>
 
   <!-- FORECASTS -->
@@ -128,7 +128,7 @@
       </tbody>
     </table>
     <div class="commentary">
-      <strong>Forecast pipeline fully operational — all 20 cities covered by the 9:04 AM ET run.</strong> The storm corridor across Texas, Oklahoma, and the Gulf South was well-represented: Austin, Dallas, Houston, and San Antonio all carried 70–90% precipitation probability in NWS detailed conditions. Denver (NWS 83, WU 84) and Las Vegas (NWS 86, WU 87) showed tight NWS/WU agreement on warm, clear days — and both actuals came in at the WU figure (84°F and 87°F respectively), continuing a pattern where WU slightly outperforms NWS on warm Western days. Miami's forecast_avg of exactly 79.0°F should have been a sizing red flag: the model's own forecast centered the {79,80}°F band — a scenario with inherently high band-hit probability.
+      <strong>Forecast pipeline fully operational — all 20 cities covered by the 9:04 AM ET run.</strong> The storm corridor across Texas, Oklahoma, and the Gulf South was well-represented: Austin, Dallas, Houston, and San Antonio all carried 70–90% precipitation probability. The rain-flagged West Coast cities (LAX "Light Rain Likely", SFO "Showers &amp; T'storms", SEA "Light Rain Likely") all ended up as winners — precipitation forecasts correctly signaled suppressed peak temperatures. Denver (NWS 83, WU 84) and Las Vegas (NWS 86, WU 87) showed tight NWS/WU agreement; both actuals came in at the WU figure (84°F and 87°F), continuing a pattern where WU edges NWS on warm clear Western days.
     </div>
   </div>
 
@@ -146,7 +146,7 @@
           <th class="left">Filled market</th>
           <th>Band</th>
           <th>Contracts</th>
-          <th>Avg price</th>
+          <th>Avg NO price</th>
           <th>Cost</th>
           <th>P&L</th>
           <th class="left">Outcome</th>
@@ -171,8 +171,8 @@
           <td class="left conditions">Showers &amp; T'storms</td>
           <td class="left"><span class="band-mono">B66.5–T73 (4)</span></td>
           <td class="left"><span class="band-mono">B66.5</span></td>
-          <td>66–67°F</td><td>77.0</td><td>$0.470</td><td>$36.19</td>
-          <td class="pnl pos">+$40.81</td>
+          <td>66–67°F</td><td>77.0</td><td>$0.530</td><td>$40.81</td>
+          <td class="pnl pos">+$36.19</td>
           <td class="left"><span class="pill win">WIN — below</span></td>
         </tr>
 
@@ -193,8 +193,8 @@
           <td class="left conditions">Partly Sunny; T'storms aft.</td>
           <td class="left"><span class="band-mono">B75.5, B77.5, T80</span></td>
           <td class="left"><span class="band-mono">B77.5</span></td>
-          <td>77–78°F</td><td>31.5</td><td>$0.540</td><td>$17.02</td>
-          <td class="pnl pos">+$14.49</td>
+          <td>77–78°F</td><td>31.5</td><td>$0.460</td><td>$14.49</td>
+          <td class="pnl pos">+$17.02</td>
           <td class="left"><span class="pill win">WIN — below</span></td>
         </tr>
 
@@ -205,8 +205,8 @@
           <td class="left conditions">Showers &amp; T'storms</td>
           <td class="left"><span class="band-mono">B63.5, B65.5, T70</span></td>
           <td class="left"><span class="band-mono">B63.5</span></td>
-          <td>63–64°F</td><td>32.0</td><td>$0.510</td><td>$16.32</td>
-          <td class="pnl neg">−$16.32</td>
+          <td>63–64°F</td><td>32.0</td><td>$0.490</td><td>$15.68</td>
+          <td class="pnl neg">−$15.68</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
 
@@ -217,8 +217,8 @@
           <td class="left conditions">Sunny</td>
           <td class="left"><span class="band-mono">B81.5–T86 (4)</span></td>
           <td class="left"><span class="band-mono">B81.5</span></td>
-          <td>81–82°F</td><td>10.0</td><td>$0.450</td><td>$4.50</td>
-          <td class="pnl pos">+$5.50</td>
+          <td>81–82°F</td><td>10.0</td><td>$0.550</td><td>$5.50</td>
+          <td class="pnl pos">+$4.50</td>
           <td class="left"><span class="pill win">WIN — above</span></td>
         </tr>
         <!-- Denver — B83.5 LOSS -->
@@ -228,8 +228,8 @@
           <td class="left na">—</td>
           <td class="left na">—</td>
           <td class="left"><span class="band-mono">B83.5</span></td>
-          <td>83–84°F</td><td>99.0</td><td>$0.489</td><td>$48.41</td>
-          <td class="pnl neg">−$48.41</td>
+          <td>83–84°F</td><td>99.0</td><td>$0.511</td><td>$50.59</td>
+          <td class="pnl neg">−$50.59</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
 
@@ -250,8 +250,8 @@
           <td class="left conditions">Sunny</td>
           <td class="left"><span class="band-mono">B84.5, B86.5, T91</span></td>
           <td class="left"><span class="band-mono">B86.5</span></td>
-          <td>86–87°F</td><td>100.0</td><td>$0.590</td><td>$59.00</td>
-          <td class="pnl neg">−$59.00</td>
+          <td>86–87°F</td><td>100.0</td><td>$0.410</td><td>$41.00</td>
+          <td class="pnl neg">−$41.00</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
 
@@ -262,8 +262,8 @@
           <td class="left conditions">Light Rain Likely</td>
           <td class="left"><span class="band-mono">B67.5, B69.5, T72</span></td>
           <td class="left"><span class="band-mono">B67.5</span></td>
-          <td>67–68°F</td><td>214.0</td><td>$0.532</td><td>$113.86</td>
-          <td class="pnl pos">+$100.14</td>
+          <td>67–68°F</td><td>214.0</td><td>$0.468</td><td>$100.14</td>
+          <td class="pnl pos">+$113.86</td>
           <td class="left"><span class="pill win">WIN — above</span></td>
         </tr>
         <!-- Los Angeles — B69.5 LOSS -->
@@ -273,8 +273,8 @@
           <td class="left na">—</td>
           <td class="left na">—</td>
           <td class="left"><span class="band-mono">B69.5</span></td>
-          <td>69–70°F</td><td>1.4</td><td>$0.480</td><td>$0.65</td>
-          <td class="pnl neg">−$0.65</td>
+          <td>69–70°F</td><td>1.4</td><td>$0.519</td><td>$0.70</td>
+          <td class="pnl neg">−$0.70</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
 
@@ -285,8 +285,8 @@
           <td class="left conditions">Mostly Sunny</td>
           <td class="left"><span class="band-mono">B77.5, B79.5, T82</span></td>
           <td class="left"><span class="band-mono">B79.5</span></td>
-          <td>79–80°F</td><td>390.0</td><td>$0.632</td><td>$246.38</td>
-          <td class="pnl neg">−$246.38</td>
+          <td>79–80°F</td><td>390.0</td><td>$0.368</td><td>$143.62</td>
+          <td class="pnl neg">−$143.62</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
 
@@ -297,19 +297,19 @@
           <td class="left conditions">Sunny</td>
           <td class="left"><span class="band-mono">B73.5, B75.5, T76</span></td>
           <td class="left"><span class="band-mono">B75.5</span></td>
-          <td>75–76°F</td><td>115.8</td><td>$0.509</td><td>$58.94</td>
-          <td class="pnl pos">+$56.84</td>
+          <td>75–76°F</td><td>115.8</td><td>$0.491</td><td>$56.84</td>
+          <td class="pnl pos">+$58.94</td>
           <td class="left"><span class="pill win">WIN — above</span></td>
         </tr>
-        <!-- Minneapolis — T76 LOSS (tail hit) -->
+        <!-- Minneapolis — T76 LOSS -->
         <tr>
           <td class="left na">—</td>
           <td class="na">—</td><td class="na">—</td>
           <td class="left na">—</td>
           <td class="left na">—</td>
           <td class="left"><span class="band-mono">T76</span></td>
-          <td>tail ≥76°F</td><td>30.0</td><td>$0.450</td><td>$13.50</td>
-          <td class="pnl neg">−$13.50</td>
+          <td>tail ≥76°F</td><td>30.0</td><td>$0.550</td><td>$16.50</td>
+          <td class="pnl neg">−$16.50</td>
           <td class="left"><span class="pill loss">LOSS — tail hit</span></td>
         </tr>
 
@@ -330,8 +330,8 @@
           <td class="left conditions">Sunny</td>
           <td class="left"><span class="band-mono">B51.5, B53.5, T58</span></td>
           <td class="left"><span class="band-mono">B53.5</span></td>
-          <td>53–54°F</td><td>147.2</td><td>$0.631</td><td>$92.78</td>
-          <td class="pnl neg">−$92.78</td>
+          <td>53–54°F</td><td>147.2</td><td>$0.370</td><td>$54.40</td>
+          <td class="pnl neg">−$54.40</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
 
@@ -342,8 +342,8 @@
           <td class="left conditions">Areas of Drizzle</td>
           <td class="left"><span class="band-mono">B65.5, B67.5, T72</span></td>
           <td class="left"><span class="band-mono">B65.5</span></td>
-          <td>65–66°F</td><td>26.6</td><td>$0.470</td><td>$12.49</td>
-          <td class="pnl pos">+$14.08</td>
+          <td>65–66°F</td><td>26.6</td><td>$0.530</td><td>$14.08</td>
+          <td class="pnl pos">+$12.49</td>
           <td class="left"><span class="pill win">WIN — below</span></td>
         </tr>
 
@@ -354,8 +354,8 @@
           <td class="left conditions">Sunny</td>
           <td class="left"><span class="band-mono">B56.5, B58.5, T63</span></td>
           <td class="left"><span class="band-mono">B58.5</span></td>
-          <td>58–59°F</td><td>29.0</td><td>$0.520</td><td>$15.08</td>
-          <td class="pnl neg">−$15.08</td>
+          <td>58–59°F</td><td>29.0</td><td>$0.480</td><td>$13.92</td>
+          <td class="pnl neg">−$13.92</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
 
@@ -376,8 +376,8 @@
           <td class="left conditions">T'storms Likely</td>
           <td class="left"><span class="band-mono">B69.5, B71.5, T74</span></td>
           <td class="left"><span class="band-mono">B69.5</span></td>
-          <td>69–70°F</td><td>30.0</td><td>$0.450</td><td>$13.50</td>
-          <td class="pnl pos">+$16.50</td>
+          <td>69–70°F</td><td>30.0</td><td>$0.550</td><td>$16.50</td>
+          <td class="pnl pos">+$13.50</td>
           <td class="left"><span class="pill win">WIN — below</span></td>
         </tr>
 
@@ -388,8 +388,8 @@
           <td class="left conditions">Showers &amp; T'storms</td>
           <td class="left"><span class="band-mono">B60.5–T65 (4)</span></td>
           <td class="left"><span class="band-mono">B60.5</span></td>
-          <td>60–61°F</td><td>249.0</td><td>$0.555</td><td>$138.25</td>
-          <td class="pnl pos">+$110.70</td>
+          <td>60–61°F</td><td>249.0</td><td>$0.445</td><td>$110.70</td>
+          <td class="pnl pos">+$138.25</td>
           <td class="left"><span class="pill win">WIN — above</span></td>
         </tr>
 
@@ -400,8 +400,8 @@
           <td class="left conditions">Light Rain Likely</td>
           <td class="left"><span class="band-mono">B58.5, T63</span></td>
           <td class="left"><span class="band-mono">B58.5</span></td>
-          <td>58–59°F</td><td>144.1</td><td>$0.514</td><td>$74.06</td>
-          <td class="pnl pos">+$70.06</td>
+          <td>58–59°F</td><td>144.1</td><td>$0.486</td><td>$70.06</td>
+          <td class="pnl pos">+$74.06</td>
           <td class="left"><span class="pill win">WIN — above</span></td>
         </tr>
 
@@ -412,24 +412,24 @@
           <td class="left conditions">Sunny</td>
           <td class="left"><span class="band-mono">B59.5–T66 (4)</span></td>
           <td class="left"><span class="band-mono">B61.5</span></td>
-          <td>61–62°F</td><td>36.4</td><td>$0.503</td><td>$18.33</td>
-          <td class="pnl neg">−$18.33</td>
+          <td>61–62°F</td><td>36.4</td><td>$0.497</td><td>$18.08</td>
+          <td class="pnl neg">−$18.08</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
 
         <!-- TOTAL ROW -->
         <tr class="total-row">
           <td class="left" colspan="7">TOTAL — filled markets only</td>
-          <td>1,762.9</td><td></td><td>$979.26</td>
-          <td class="pnl neg">−$81.33</td>
+          <td>1,762.9</td><td></td><td>$783.61</td>
+          <td class="pnl pos">+$114.32</td>
           <td class="left">9W / 9L (50%)</td>
         </tr>
 
       </tbody>
     </table>
-    <div class="footnote">† Austin 11:59 PM — high arrived at the tail end of the meteorological day after storms cleared; Houston 12:19 AM — overnight peak, prior evening's warmth held by marine layer before storm system arrived.</div>
+    <div class="footnote">† Austin 11:59 PM — high arrived at the tail end of the meteorological day after storms cleared; Houston 12:19 AM — overnight peak from prior evening's warmth before storm system arrived. Avg NO price column shows actual price paid per contract (= 1 − stored price_paid_dollars in fills_enriched, which stores the YES equivalent).</div>
     <div class="commentary">
-      <strong>Miami is the day's only real story.</strong> At 390 contracts and $246.38 deployed, it was the largest position by a factor of 1.6× (next largest: SFO at $138.25). The forecast was dead-center at 79.0°F — both NWS and WU agreed — which puts the expected high precisely at the bottom of the {79,80}°F YES band. A model edge of −0.257 signals the system was paying ~26¢/contract above fair value for the NO; the bot filled it anyway at $0.632 average. This is not a forecast error — it is a risk management failure. <strong>New York City (−$92.78, actual 54°F vs {53,54}°F) and Las Vegas (−$59.00, actual 87°F vs {86,87}°F) also printed dead-center hits</strong>, reinforcing a broader theme: when the forecast clusters tightly around a band midpoint, NO positions at those strikes carry maximum band-entry risk. Denver B83.5 (−$48.41) and Washington DC B61.5 (−$18.33) had the same pattern. The winners all shared a different characteristic: the actual ran cleanly outside the filled band, typically 2–4°F above (SFO, LAX B67.5, SEA, TMIN B75.5) or below (AUS, CHI, OKC, SATX) — exactly the outcome NO bets need. Austin's storm system delivered a 4.5°F undershoot vs forecast; San Francisco's forecast called for heavy rain yet the actual ran 2°F above the {60,61}°F band, suggesting SFO's maritime peaks are reliably suppressed even without full storm delivery.
+      <strong>The West Coast rain trio — SFO, LAX B67.5, SEA — generated +$326.17 combined and carried the day.</strong> All three were forecast with precipitation; all three printed actuals 2–3°F above their filled bands, the sweet spot for NO holders. Miami is the headline loss at −$143.62, but the entry was defensible: 390 contracts filled overnight and at noon, NO prices ranging from 43¢ (first fills, ~5¢ overpriced vs model) down to 33¢ (later fills, ~5¢ underpriced vs model). The averaged entry of 36.8¢ per contract was essentially neutral to the model's 38¢ fair NO value — this was a case of the forecast landing squarely on the band and the actual temperature cooperating exactly. New York City (−$54.40) and Denver B83.5 (−$50.59) share the same pattern: the actual came in dead-center on the band. <strong>The sunny-day exact-band cluster — MIA, NY, DEN B83.5, LV, PHI, DC — is a recurring motif: clear-sky cities with tight forecasts tend to land precisely where the model expected, which is exactly where the bands are centered.</strong> Wet-forecast cities (SFO, LAX, SEA, AUS, SATX) continue to be the more profitable NO plays, as precipitation disrupts the "actual = forecast" pattern that kills NO positions.
     </div>
   </div>
 
@@ -456,7 +456,7 @@
       </tbody>
     </table>
     <div class="commentary">
-      <strong>One pre-trade skip at 1:05 AM ET — Seattle was skipped on the overnight run because IEM hadn't yet reported a peak hour for April 21.</strong> This is routine early-morning behavior; the signal was restored on a later run and B58.5 was filled, ultimately winning +$70.06. No action required. All other cities cleared pre-trade checks without incident, and the forecast pipeline posted its 9:04 AM snapshot on schedule covering all 20 cities.
+      <strong>One pre-trade skip at 1:05 AM ET — Seattle was passed over on the overnight run because IEM hadn't yet reported a peak hour for April 21.</strong> A later run restored the signal, B58.5 was filled, and it settled as a winner (+$74.06). Routine early-morning behavior; no action required. All other cities cleared pre-trade checks, and the forecast pipeline posted its 9:04 AM snapshot on schedule.
     </div>
   </div>
 
