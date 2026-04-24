@@ -42,7 +42,7 @@ jobs:
         # ================================================================
         AB_TEST_ENABLED: "true"
         AB_TREATMENT_PROPORTION: "0.0"
-        AB_SAFETY_MARGIN_CENTS: "5"
+        AB_SAFETY_MARGIN_CENTS: "3"
       run: |
         set -o pipefail
         python high_temp_trading.py 2>&1 | tee run.log
