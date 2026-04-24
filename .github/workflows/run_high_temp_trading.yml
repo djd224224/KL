@@ -30,6 +30,19 @@ jobs:
         ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
         ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         GOOGLE_APPLICATION_CREDENTIALS: google_credentials.json
+        # ================================================================
+        # A/B test: hi_no tied to fair NO (see d80fd4e, analysis/kxhigh/sql/90_ab_hi_no_report.sql)
+        # Ramp knobs — change values here to advance through the rollout:
+        #   Phase 1 (shadow, current):  ENABLED=true, PROPORTION=0.0
+        #     100% control, but arm assignment is logged to BQ orders for
+        #     infra validation. No actual trading change.
+        #   Phase 2 (20%): PROPORTION=0.2
+        #   Phase 3 (50%): PROPORTION=0.5
+        #   Kill switch:   ENABLED=false (reverts instantly, no redeploy)
+        # ================================================================
+        AB_TEST_ENABLED: "true"
+        AB_TREATMENT_PROPORTION: "0.0"
+        AB_SAFETY_MARGIN_CENTS: "5"
       run: |
         set -o pipefail
         python high_temp_trading.py 2>&1 | tee run.log
