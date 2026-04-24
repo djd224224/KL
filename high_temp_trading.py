@@ -1357,6 +1357,27 @@ for index, row in combined_table.iterrows():
     _cond_line += f' — "{_det}"'
   print(_cond_line)
 
+  # NOTE: combined_table.fillna("") was called at line ~1131, so "missing"
+  # values here are the empty string "", not None or NaN. Treat all three
+  # as absent via the _missing() helper below.
+  def _missing(v):
+    if v is None: return True
+    if isinstance(v, str) and v.strip() == '': return True
+    try:
+      import math as _math
+      if isinstance(v, float) and _math.isnan(v): return True
+    except Exception:
+      pass
+    return False
+
+  def _safe_int(v):
+    """Convert to int; return None on any failure (empty string, NaN, etc.)."""
+    try:
+      if _missing(v): return None
+      return int(float(v))  # float() lets us accept '14' or 14.0 or np.int64
+    except Exception:
+      return None
+
   _peak_hr = row.get('peak_hour_ct')
   _peak_temp = row.get('peak_temp_f')
   _obs_st = row.get('observed_station')
@@ -1364,16 +1385,17 @@ for index, row in combined_table.iterrows():
   _midn = row.get('Midnight Temperature')
   _upd = row.get('nws_forecast_update_ts')
   _drift = row.get('obs_minus_forecast_at_run_f')
-  _has_peak = any(v is not None for v in [_peak_hr, _peak_temp, _obs_t])
+  _has_peak = any(not _missing(v) for v in [_peak_hr, _peak_temp, _obs_t])
   if _has_peak:
-    _peak_part = (f"peak {int(_peak_hr):02d}:00 CT @ {_fmt(_peak_temp, '°F', 0)}"
-                  if _peak_hr is not None else "peak N/A")
+    _peak_hr_int = _safe_int(_peak_hr)
+    _peak_part = (f"peak {_peak_hr_int:02d}:00 CT @ {_fmt(_peak_temp, '°F', 0)}"
+                  if _peak_hr_int is not None else "peak N/A")
     _obs_part = (f"obs {_obs_st}={_fmt(_obs_t, '°F', 0)} at run"
-                 if _obs_t is not None else "obs N/A")
+                 if not _missing(_obs_t) else "obs N/A")
     print(f"    Peak:       {_peak_part} | {_obs_part} | midnight={_fmt(_midn, '°F', 0)}")
     _sub = []
-    if _upd: _sub.append(f"forecast update: {_upd}")
-    if _drift is not None:
+    if not _missing(_upd): _sub.append(f"forecast update: {_upd}")
+    if not _missing(_drift):
       try: _sub.append(f"obs-forecast drift: {float(_drift):+.1f}°F")
       except Exception: pass
     if _sub:
