@@ -28,6 +28,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
 import os
+import hashlib
 import base64
 
 def load_private_key(b64_key="", file_path=""):
@@ -1242,6 +1243,39 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
     return int(target_time.timestamp())
 
 ########## BUY CALCULATIONS
+
+# ====================================================================
+# A/B test: hi_no cap tied to fair NO
+# --------------------------------------------------------------------
+# Hypothesis: capping top-of-ladder at min(hi_no_config, 100·P(no) −
+# safety_margin) reduces adverse selection on high-P(yes) buckets where
+# the static hi_no_config overbids relative to the model's own fair NO.
+# See the 2026-04-23 post-mortem for the motivating loss pattern.
+#
+# Unit of split: (market_ticker, run_date) — deterministic SHA256 hash.
+# Each bucket × each run is assigned independently to control or
+# treatment. All 20 cities are included automatically. Enable via
+# env var AB_TEST_ENABLED=true.
+# ====================================================================
+AB_TEST_NAME = "hi_no_tied_to_fair_no_v1"
+AB_TEST_ENABLED = os.environ.get("AB_TEST_ENABLED", "false").lower() == "true"
+AB_SAFETY_MARGIN_CENTS = int(os.environ.get("AB_SAFETY_MARGIN_CENTS", "5"))
+AB_TREATMENT_PROPORTION = float(os.environ.get("AB_TREATMENT_PROPORTION", "0.5"))
+
+def _ab_assign_arm(market_ticker, run_date_str):
+    """Deterministic 50/50 (by default) hash split. Same (market, run)
+    always gets same arm → reproducible for analysis. Returns 'control'
+    when the test is disabled so all behavior goes through the legacy
+    path untouched."""
+    if not AB_TEST_ENABLED:
+        return "control"
+    key = f"{AB_TEST_NAME}|{market_ticker}|{run_date_str}"
+    u = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / (16**8)
+    return "treatment" if u < AB_TREATMENT_PROPORTION else "control"
+
+print(f"\n[AB] test={AB_TEST_NAME} enabled={AB_TEST_ENABLED} "
+      f"margin={AB_SAFETY_MARGIN_CENTS}c proportion={AB_TREATMENT_PROPORTION:.0%}")
+
 orders_placed = 0
 _diag_printed = False
 for index, row in combined_table.iterrows():
@@ -1311,6 +1345,26 @@ for index, row in combined_table.iterrows():
   if no_offer == '' or no_bid == '':
     print(f"    SKIP: no orderbook data")
     continue
+
+  # ==================================================================
+  # A/B assignment for this (market_ticker, run_date).
+  # Computes _effective_hi_no used by the ladder loop below.
+  # ==================================================================
+  _ab_arm = _ab_assign_arm(ticker, str(row['Run Date']))
+  _fair_no_cents = 100.0 * (1.0 - float(yes_prob))
+  _hi_no_config = float(hi_no)
+  if _ab_arm == "treatment":
+    _effective_hi_no = min(_hi_no_config, _fair_no_cents - AB_SAFETY_MARGIN_CENTS)
+    # If the cap collapses below ~2c, the ladder can't produce any valid
+    # rung (1c is Kalshi's min price). Skip the whole market so we don't
+    # spam junk orders at the floor.
+    if _effective_hi_no < 2:
+      print(f"    [AB:{_ab_arm}] SKIP: effective_hi_no={_effective_hi_no:.1f}c "
+            f"(fair_NO={_fair_no_cents:.1f}c, margin={AB_SAFETY_MARGIN_CENTS}c, "
+            f"hi_no_config={_hi_no_config:.0f}c)")
+      continue
+  else:
+    _effective_hi_no = _hi_no_config
 
   # ==================================================================
   # Rich per-market detail block — prints only for markets that passed
@@ -1449,6 +1503,11 @@ for index, row in combined_table.iterrows():
   _fair_no_c = round(100 * (1 - yes_prob))
   print(f"    Model:      hi_no cap = {_hi_no_c}c (config, top of ladder) | "
         f"fair NO ≈ {_fair_no_c}c (=100·P(no)) | P(no)={1-yes_prob:.2f}")
+  if AB_TEST_ENABLED:
+    _ab_delta = _effective_hi_no - _hi_no_config
+    _ab_tag = f" (Δ={_ab_delta:+.0f}c)" if abs(_ab_delta) >= 0.5 else " (no change)"
+    print(f"    AB:         arm={_ab_arm} | effective_hi_no={_effective_hi_no:.0f}c{_ab_tag}"
+          f" | margin={AB_SAFETY_MARGIN_CENTS}c")
 
   try:
     _nb_i = int(no_bid); _no_i = int(no_offer)
@@ -1487,9 +1546,9 @@ for index, row in combined_table.iterrows():
 
   for i in price_count:
     if "-T" not in ticker:
-      bid_price = max(hi_no - i * increment, 1)
+      bid_price = max(_effective_hi_no - i * increment, 1)
     if is_tail:
-      bid_price = max(hi_no - i * increment1, 1)
+      bid_price = max(_effective_hi_no - i * increment1, 1)
 
     # Size for THIS level: ladder_mult scales 1.0→2.0 across rungs,
     # multiplied by night_size_mult and the per-city multiplier.
@@ -1577,6 +1636,15 @@ for index, row in combined_table.iterrows():
           'kalshi_order_id': _kalshi_oid,
           'expiration_ts': exp_ts,
           'created_at': central_time.strftime('%Y-%m-%d %H:%M:%S'),
+          # A/B test metadata — lets us query per-arm P&L / fill rate from BQ
+          'ab_test_name': AB_TEST_NAME,
+          'ab_test_enabled': AB_TEST_ENABLED,
+          'ab_arm': _ab_arm,
+          'ab_safety_margin_cents': AB_SAFETY_MARGIN_CENTS,
+          'effective_hi_no': float(_effective_hi_no),
+          'hi_no_config': float(_hi_no_config),
+          'fair_no_cents': round(float(_fair_no_cents), 2),
+          'yes_prob': round(float(yes_prob), 4),
       })
       row['resting_order_count'] = row['resting_order_count'] + contracts
       orders_placed += 1
