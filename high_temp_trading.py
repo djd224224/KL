@@ -711,7 +711,27 @@ if variable == 1:
   forecast_table['Average'] = pd.to_numeric(forecast_table['Average'], errors='coerce')
   forecast_table['Midnight Temperature'] = pd.to_numeric(forecast_table['Midnight Temperature'], errors='coerce')
 
-  forecast_table = forecast_table[abs(forecast_table['Average'] - forecast_table['Midnight Temperature']) >= 4.5]
+  # Log which cities get dropped by the |tomorrow_high − midnight| ≥ 4.5°F filter.
+  # Previously this was silent, which made "NYC has no orders" debugging painful.
+  _deltas = (forecast_table['Average'] - forecast_table['Midnight Temperature']).abs()
+  _drop_mask = _deltas < 4.5
+  _dropped = forecast_table.loc[_drop_mask, ['City', 'Average', 'Midnight Temperature']].copy()
+  _dropped['delta'] = _deltas[_drop_mask]
+  if len(_dropped) > 0:
+    print(f"\n  🔽 Midnight-delta filter dropped {len(_dropped)}/{len(forecast_table)} cities "
+          f"(threshold: |tomorrow_high − midnight| ≥ 4.5°F):")
+    for _, _r in _dropped.sort_values('delta').iterrows():
+      try:
+        _avg = float(_r['Average']); _midn = float(_r['Midnight Temperature']); _d = float(_r['delta'])
+        print(f"     - {_r['City']}: tomorrow_high={_avg:.1f}°F, midnight={_midn:.1f}°F, Δ={_d:.1f}°F")
+      except Exception:
+        print(f"     - {_r['City']}: Δ uncomputable "
+              f"(avg={_r['Average']!r}, midn={_r['Midnight Temperature']!r})")
+  else:
+    print(f"\n  ✓ Midnight-delta filter passed all {len(forecast_table)} cities "
+          f"(all have |tomorrow_high − midnight| ≥ 4.5°F)")
+
+  forecast_table = forecast_table[~_drop_mask]
 forecast_table
 
 ########### INPUT EVENT TICKERS, CITIES, HIGHEST NO PRICES, HISTORICAL VARIANCE
