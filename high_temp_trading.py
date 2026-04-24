@@ -902,25 +902,66 @@ combined_table
 
 ######### ACTUALS VS FORECAST, FOR BETTING THE HIGH END
 
-# Define column names
-columns = ["Austin", "Miami", "Denver", "Houston", "Philadelphia", "New York City", "Chicago", "Los Angeles"]
+# Actual-minus-forecast distribution used to price HIGH tail markets.
+#
+# First 8 columns: hand-calibrated historical data (~37 samples/city,
+# presumed NWS+WU-sourced). Left untouched as authoritative.
+#
+# Next 9 columns: backfilled 2026-04-24 from GFS+ECMWF via Open-Meteo
+# (KXHIGH_historical_forecasts), rolling 90-day window. Each has n=85
+# samples. Laplace-smoothed (+1 per bin) so no cell is 0 — prevents the
+# bot from setting hi_no based on "never observed" as if it were
+# "impossible".
+#
+# Cities deliberately EXCLUDED from the dynamic path (keep static hi_no
+# config): San Francisco, Washington DC, Boston. Reason: their measured
+# GFS-vs-NWS+WU bias points in the dangerous direction (GFS overforecasts)
+# or we have no bias measurement. They'll onboard when ≥60 paired NWS+WU
+# samples accumulate (see analysis/kxhigh/python/build_forecast_error_dist.py).
+columns = [
+    "Austin", "Miami", "Denver", "Houston", "Philadelphia", "New York City", "Chicago", "Los Angeles",
+    "Atlanta", "Dallas", "Las Vegas", "Minneapolis", "New Orleans", "Oklahoma City", "Phoenix", "San Antonio", "Seattle",
+]
 
 # Define row indices
 rows = ["5", "4", "3", "2", "1", "0", "-1", "-2", "-3", "-4", "-5"]
 
 # Define data values (converted from percentages to decimals)
+# Columns (17): first 8 = hardcoded/authoritative, last 9 = GFS-smoothed.
 data = [
-    [0.0270, 0.0256, 0.1290, 0.0000, 0.0000, 0.0270, 0.0333, 0.0667],
-    [0.0270, 0.0000, 0.0000, 0.0000, 0.0263, 0.0000, 0.0333, 0.0000],
-    [0.0811, 0.0000, 0.0645, 0.1613, 0.1579, 0.1081, 0.1333, 0.0000],
-    [0.2432, 0.2308, 0.1290, 0.1935, 0.1053, 0.1622, 0.2333, 0.0000],
-    [0.1892, 0.2051, 0.1935, 0.1935, 0.2895, 0.2162, 0.3333, 0.2667],
-    [0.1351, 0.2821, 0.1935, 0.0645, 0.1053, 0.2162, 0.0667, 0.2667],
-    [0.1892, 0.1282, 0.0645, 0.2258, 0.1053, 0.0811, 0.1000, 0.1333],
-    [0.0270, 0.0769, 0.0645, 0.0968, 0.1053, 0.1622, 0.0000, 0.1333],
-    [0.0541, 0.0256, 0.0968, 0.0323, 0.0526, 0.0000, 0.0000, 0.0667],
-    [0.0000, 0.0000, 0.0323, 0.0000, 0.0263, 0.0000, 0.0333, 0.0000],
-    [0.0270, 0.0256, 0.0323, 0.0323, 0.0263, 0.0270, 0.0333, 0.0667]
+    # row "5": actual 5°F above forecast
+    [0.0270, 0.0256, 0.1290, 0.0000, 0.0000, 0.0270, 0.0333, 0.0667,
+     0.0104, 0.0417, 0.0104, 0.0312, 0.0417, 0.0312, 0.0208, 0.0208, 0.0208],
+    # row "4"
+    [0.0270, 0.0000, 0.0000, 0.0000, 0.0263, 0.0000, 0.0333, 0.0000,
+     0.0938, 0.1042, 0.0104, 0.0521, 0.0208, 0.0521, 0.0208, 0.0729, 0.0625],
+    # row "3"
+    [0.0811, 0.0000, 0.0645, 0.1613, 0.1579, 0.1081, 0.1333, 0.0000,
+     0.2917, 0.2708, 0.0312, 0.1354, 0.1146, 0.0833, 0.1250, 0.1771, 0.2083],
+    # row "2"
+    [0.2432, 0.2308, 0.1290, 0.1935, 0.1053, 0.1622, 0.2333, 0.0000,
+     0.3021, 0.3229, 0.1250, 0.2917, 0.2500, 0.1667, 0.3750, 0.3229, 0.2917],
+    # row "1"
+    [0.1892, 0.2051, 0.1935, 0.1935, 0.2895, 0.2162, 0.3333, 0.2667,
+     0.1979, 0.1354, 0.4792, 0.2396, 0.3125, 0.3438, 0.2812, 0.2396, 0.2188],
+    # row "0": actual == forecast
+    [0.1351, 0.2821, 0.1935, 0.0645, 0.1053, 0.2162, 0.0667, 0.2667,
+     0.0312, 0.0208, 0.2396, 0.1250, 0.1458, 0.1354, 0.1250, 0.0625, 0.1146],
+    # row "-1"
+    [0.1892, 0.1282, 0.0645, 0.2258, 0.1053, 0.0811, 0.1000, 0.1333,
+     0.0312, 0.0208, 0.0625, 0.0312, 0.0521, 0.0938, 0.0104, 0.0521, 0.0312],
+    # row "-2"
+    [0.0270, 0.0769, 0.0645, 0.0968, 0.1053, 0.1622, 0.0000, 0.1333,
+     0.0104, 0.0417, 0.0104, 0.0104, 0.0104, 0.0312, 0.0104, 0.0104, 0.0104],
+    # row "-3"
+    [0.0541, 0.0256, 0.0968, 0.0323, 0.0526, 0.0000, 0.0000, 0.0667,
+     0.0104, 0.0208, 0.0104, 0.0312, 0.0208, 0.0312, 0.0104, 0.0104, 0.0104],
+    # row "-4"
+    [0.0000, 0.0000, 0.0323, 0.0000, 0.0263, 0.0000, 0.0333, 0.0000,
+     0.0104, 0.0104, 0.0104, 0.0417, 0.0104, 0.0104, 0.0104, 0.0104, 0.0208],
+    # row "-5": actual 5°F below forecast
+    [0.0270, 0.0256, 0.0323, 0.0323, 0.0263, 0.0270, 0.0333, 0.0667,
+     0.0104, 0.0104, 0.0104, 0.0104, 0.0208, 0.0208, 0.0104, 0.0208, 0.0104],
 ]
 
 # Create DataFrame
