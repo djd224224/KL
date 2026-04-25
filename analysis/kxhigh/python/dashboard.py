@@ -787,6 +787,187 @@ h3 { margin-top: 24px; color: #444; font-size: 15px; }
 """
 
 
+def build_filter_sensitivity(resolved: pd.DataFrame) -> str:
+    """Two structural filter analyses: bucket-distance and source-agreement.
+    Tests whether removing certain markets *would have* improved P&L.
+
+    Filter 1 — Bucket distance: skip markets where |bucket center − forecast μ|
+               is small (i.e., centered buckets where model is most confident).
+    Filter 2 — Source agreement: skip markets where |NWS − WU| is small (i.e.,
+               sources agree, model is confident this is the right call).
+
+    Both target the same structural failure mode (high-P(yes) buckets where
+    fair_NO < hi_no_config → bot overpays).
+    """
+    summary = (
+        '<span class="tl">What this section measures</span>'
+        'Two filter ideas tested as counterfactuals: would P&L improve if we '
+        '<b>skipped</b> certain markets at the time of trade? '
+        '<b>Distance</b> filter targets bucket centers very close to the forecast μ '
+        '— markets where the model is confident, fair NO is low, and the bot tends '
+        'to overpay relative to fair (the 4/23 loss pattern). '
+        '<b>Source agreement</b> filter targets markets where NWS and WU agree '
+        'tightly — same signal from a different angle. '
+        'For each threshold, we compute the P&L of the markets that <i>survive</i> '
+        'the filter (= markets we would have traded). Higher than control = filter helps; '
+        'lower = filter cuts profitable markets too.'
+    )
+    if resolved.empty or "pnl" not in resolved.columns:
+        return exec_summary(summary) + '<p class="muted">No data.</p>'
+
+    df = resolved.copy()
+    # Restrict to settled "between" markets where μ + bucket midpoint exist
+    df = df[(df["market_kind"] == "between") & df["pnl"].notna()
+            & df["bucket_midpoint"].notna() & df["forecast_avg"].notna()].copy()
+    if df.empty:
+        return exec_summary(summary) + '<p class="muted">No settled B markets with required fields.</p>'
+
+    df["distance_from_mu"] = (df["bucket_midpoint"] - df["forecast_avg"]).abs()
+    df["nws_wu_diff"] = (df["nws"] - df["weather_underground"]).abs()
+    control_pnl = df["pnl"].sum()
+    n_total = len(df)
+
+    # ---- Filter 1: distance ----
+    dist_rows = []
+    for thresh in [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0]:
+        keep = df["distance_from_mu"] >= thresh
+        kept_pnl = float(df.loc[keep, "pnl"].sum())
+        dist_rows.append({
+            "min_distance_F": thresh,
+            "markets_kept": int(keep.sum()),
+            "kept_share": f"{100*keep.mean():.0f}%",
+            "kept_pnl": round(kept_pnl, 2),
+            "delta_vs_control": round(kept_pnl - control_pnl, 2),
+        })
+    dist_df = pd.DataFrame(dist_rows)
+    best_dist = dist_df.loc[dist_df["delta_vs_control"].idxmax()]
+
+    fig_d = go.Figure()
+    fig_d.add_trace(go.Bar(
+        x=dist_df["min_distance_F"], y=dist_df["delta_vs_control"],
+        marker_color=["seagreen" if v > 0 else "indianred" for v in dist_df["delta_vs_control"]],
+        text=dist_df["markets_kept"], texttemplate="n=%{text}",
+        textposition="outside",
+    ))
+    fig_d.update_layout(
+        title="Distance filter — Δ P&L vs control by minimum |bucket center − μ| threshold",
+        xaxis_title="Minimum distance threshold (°F)",
+        yaxis_title="Δ P&L vs no filter ($)",
+        height=400, showlegend=False,
+    )
+    fig_d.add_hline(y=0, line_dash="dash", line_color="gray")
+
+    # Distance distribution (informational)
+    fig_d_hist = go.Figure()
+    fig_d_hist.add_trace(go.Histogram(x=df["distance_from_mu"], nbinsx=30, marker_color="steelblue"))
+    fig_d_hist.update_layout(
+        title=f"Distribution of |bucket center − μ| across {n_total} settled markets",
+        xaxis_title="|bucket center − μ| (°F)", yaxis_title="markets", height=280,
+    )
+
+    # ---- Filter 2: source agreement (only on markets where both NWS+WU present) ----
+    sa_df = df[df["nws"].notna() & df["weather_underground"].notna()].copy()
+    agreement_html = ""
+    if len(sa_df) > 0:
+        sa_control = sa_df["pnl"].sum()
+        sa_rows = []
+        for thresh in [0.5, 1.0, 1.5, 2.0, 3.0, 5.0]:
+            keep = sa_df["nws_wu_diff"] <= thresh
+            kept_pnl = float(sa_df.loc[keep, "pnl"].sum())
+            sa_rows.append({
+                "max_NWS_WU_diff_F": thresh,
+                "markets_kept": int(keep.sum()),
+                "kept_share": f"{100*keep.mean():.0f}%",
+                "kept_pnl": round(kept_pnl, 2),
+                "delta_vs_control": round(kept_pnl - sa_control, 2),
+            })
+        sa_table = pd.DataFrame(sa_rows)
+        best_sa = sa_table.loc[sa_table["delta_vs_control"].idxmax()]
+
+        fig_a = go.Figure()
+        fig_a.add_trace(go.Bar(
+            x=sa_table["max_NWS_WU_diff_F"], y=sa_table["delta_vs_control"],
+            marker_color=["seagreen" if v > 0 else "indianred" for v in sa_table["delta_vs_control"]],
+            text=sa_table["markets_kept"], texttemplate="n=%{text}",
+            textposition="outside",
+        ))
+        fig_a.update_layout(
+            title="Source-agreement filter — Δ P&L vs control by maximum |NWS − WU| threshold",
+            xaxis_title="Maximum |NWS − WU| threshold (°F)",
+            yaxis_title="Δ P&L vs no filter ($)",
+            height=400, showlegend=False,
+        )
+        fig_a.add_hline(y=0, line_dash="dash", line_color="gray")
+        agreement_html = (
+            f'<h3>Source-agreement filter</h3>'
+            f'<p class="muted">Sample: {len(sa_df)} settled markets where both NWS and WU '
+            f'were captured. Subset control P&L: ${sa_control:.2f}.</p>'
+            + fig_to_html(fig_a) + table_html(sa_table)
+        )
+
+    # ---- Per-city impact at distance >= 1°F ----
+    keep_1f = df["distance_from_mu"] >= 1.0
+    df["_pnl_filt"] = np.where(keep_1f, df["pnl"], 0.0)
+    per_city = df.groupby("city").agg(
+        n=("market_ticker", "count"),
+        ctrl_pnl=("pnl", "sum"),
+        filt_pnl=("_pnl_filt", "sum"),
+    ).round(2)
+    per_city["delta"] = per_city["filt_pnl"] - per_city["ctrl_pnl"]
+    per_city = per_city.sort_values("delta", ascending=False).reset_index()
+    fig_city = go.Figure()
+    fig_city.add_trace(go.Bar(
+        x=per_city["city"], y=per_city["delta"],
+        marker_color=["seagreen" if v > 0 else "indianred" for v in per_city["delta"]],
+    ))
+    fig_city.update_layout(
+        title="Distance ≥ 1°F filter — per-city Δ vs control",
+        xaxis_title="city", yaxis_title="Δ P&L ($)", height=420, showlegend=False,
+    )
+    fig_city.add_hline(y=0, line_dash="dash", line_color="gray")
+
+    # ---- Takeaways ----
+    bullets = []
+    bullets.append(
+        f"<b>Distance filter best:</b> threshold = "
+        f"<b>{float(best_dist['min_distance_F'])}°F</b> "
+        f"(keeps {best_dist['markets_kept']} of {n_total} markets, "
+        f"Δ = <b>${float(best_dist['delta_vs_control']):+.2f}</b> vs control ${control_pnl:.2f})."
+    )
+    if len(sa_df) > 0:
+        bullets.append(
+            f"<b>Agreement filter best:</b> threshold = "
+            f"<b>≤{float(best_sa['max_NWS_WU_diff_F'])}°F</b> "
+            f"(keeps {best_sa['markets_kept']} of {len(sa_df)} markets, "
+            f"Δ = <b>${float(best_sa['delta_vs_control']):+.2f}</b> vs subset control ${sa_df['pnl'].sum():.2f})."
+        )
+    bullets.append(
+        "<b>Per-city pattern:</b> distance filter helps the loss-prone cities "
+        "(Miami, Phoenix, Houston, NOLA, Philadelphia) and hurts the win-prone ones "
+        "(Austin, LA, Seattle). Same structural trade-off as the A/B treatment cap."
+    )
+    bullets.append(
+        "<b>Caution:</b> these are in-sample optima on a still-small dataset. "
+        "Bootstrap CIs (computed in <code>analysis/kxhigh/python/backtest_filters.py</code>) "
+        "are wide enough that none of these filter levels reach statistical "
+        "significance yet. Re-evaluate after 4-6 weeks of accumulated fills."
+    )
+
+    parts = [
+        exec_summary(summary),
+        commentary(bullets),
+        '<h3>Distance filter — sensitivity to threshold</h3>',
+        fig_to_html(fig_d),
+        table_html(dist_df),
+        fig_to_html(fig_d_hist),
+        agreement_html,
+        '<h3>Per-city impact (distance ≥ 1°F filter)</h3>',
+        fig_to_html(fig_city),
+        table_html(per_city),
+    ]
+    return "".join(parts)
+
+
 def main():
     print("Loading data from BigQuery...")
     data = loader.load_all()
@@ -806,6 +987,8 @@ def main():
          build_execution(data["orders"], data["fills"])),
         ("pnl", "6 · P&L attribution",
          build_pnl_attribution(data["settlements"])),
+        ("filters", "7 · Filter sensitivity (distance + source agreement)",
+         build_filter_sensitivity(data["resolved"])),
     ]
 
     toc = '<div class="toc"><b>Jump to:</b> ' + " · ".join(

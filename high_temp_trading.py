@@ -1618,6 +1618,34 @@ for index, row in combined_table.iterrows():
     print(f"    AB:         arm={_ab_arm} | effective_hi_no={_effective_hi_no:.0f}c{_ab_tag}"
           f" | margin={AB_SAFETY_MARGIN_CENTS}c")
 
+  # Risk signals — see analysis/kxhigh/python/backtest_filters.py.
+  # Two structural signals that flag "model is confident" markets where the
+  # bot historically over-pays:
+  #   distance: |bucket_ref − μ|. ref = bucket center for B markets,
+  #             threshold for T high-tails. Smaller = more centered = riskier.
+  #   src_agree: |NWS − WU|. Smaller = sources strongly agree = model is
+  #             confident this bucket is the right call.
+  # Currently observability-only; soft warnings flag high-risk markets but
+  # don't change trading behavior.
+  try:
+    _bucket_ref = (_lo_r + _hi_r) / 2.0 if _hi_r < 150 else _lo_r
+    _mu_for_dist = float(_avg_f) if not _missing(_avg_f) else None
+    _dist = abs(_bucket_ref - _mu_for_dist) if _mu_for_dist is not None else None
+  except Exception:
+    _dist = None
+  try:
+    _src_agree = abs(float(_nws_f) - float(_wu_f)) if (not _missing(_nws_f) and not _missing(_wu_f)) else None
+  except Exception:
+    _src_agree = None
+  _risk_flags = []
+  if _dist is not None and _dist < 1.0:
+    _risk_flags.append("CENTERED")
+  if _src_agree is not None and _src_agree < 1.0:
+    _risk_flags.append("SOURCES_AGREE")
+  _risk_tag = (" ⚠ " + "+".join(_risk_flags)) if _risk_flags else ""
+  print(f"    Risk:       distance |bucket−μ|={_fmt(_dist, '°F', 2)} | "
+        f"src_agree |NWS−WU|={_fmt(_src_agree, '°F', 1)}{_risk_tag}")
+
   try:
     _nb_i = int(no_bid); _no_i = int(no_offer)
     print(f"    Orderbook:  no_bid={_nb_i}c, no_offer={_no_i}c | spread={_no_i - _nb_i}c")
