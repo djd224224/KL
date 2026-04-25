@@ -1259,6 +1259,9 @@ CITY_SIZE_MULT = {
     "Dallas": 0.75,
     "Philadelphia": 0.75,
     "Washington DC": 0.75,
+    "Miami": 0.75,
+    "Las Vegas": 0.75,
+    "Houston": 0.75,
 }
 
 max_contracts = 500
