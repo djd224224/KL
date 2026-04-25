@@ -1580,8 +1580,8 @@ for index, row in combined_table.iterrows():
                 ("hour<5 CT" if central_time.hour < 5 else "daytime"))
   print(f"    Sizing:     base={starting_contracts} × night={night_size_mult:g}x "
         f"({_nm_reason}) × city={_city_mult:g}x ({row['City']})")
-  print(f"                ladder_mult 1.0→2.0x → {_base_size} → {_top_size} "
-        f"contracts across i=0..{_n_levels-1} (increment={_inc_show}c)")
+  print(f"                ladder size: {_base_size} (1st placed) → {_top_size} (8th placed) "
+        f"contracts (scales by placement order, not loop index; increment={_inc_show}c)")
 
   _headroom = max_contracts - int(row['position']) - int(row['resting_order_count'])
   print(f"    Position:   held={row['position']}, resting={row['resting_order_count']}, "
@@ -1598,6 +1598,11 @@ for index, row in combined_table.iterrows():
   _rungs = []           # list of (i, bid, contracts, edge, status, reason)
   _placed_rungs = []    # list of (bid, contracts, edge) for placed orders
   _skip_cnt = {"bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "order_failed": 0}
+  # Re-indexed sizing: ladder_mult scales by PLACEMENT order, not loop
+  # index. Prevents the "ladder collapses to a single max-size deep
+  # rung" pathology — when only deep rungs survive filters, they're
+  # treated as the start of a fresh ladder rather than the tail of one.
+  _placed_rung_idx = 0
 
   for i in price_count:
     if "-T" not in ticker:
@@ -1605,10 +1610,11 @@ for index, row in combined_table.iterrows():
     if is_tail:
       bid_price = max(_effective_hi_no - i * increment1, 1)
 
-    # Size for THIS level: ladder_mult scales 1.0→2.0 across rungs,
-    # multiplied by night_size_mult and the per-city multiplier.
-    ladder_mult = 1.0 + (i / (n_levels - 1)) if n_levels > 1 else 1.0
+    # Size depends on PLACEMENT order (_placed_rung_idx), not loop index.
+    # Computed at current _placed_rung_idx; if this rung passes filters
+    # and gets placed, _placed_rung_idx increments after for next rung.
     city_mult = CITY_SIZE_MULT.get(row['City'], 1.0)
+    ladder_mult = 1.0 + (_placed_rung_idx / (n_levels - 1)) if n_levels > 1 else 1.0
     contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult * city_mult)))
     # Edge = NO-side EV per $1 staked = (1 − P(yes)) − bid/100
     edge = (1.0 - yes_prob) - (bid_price / 100.0)
@@ -1704,6 +1710,7 @@ for index, row in combined_table.iterrows():
       row['resting_order_count'] = row['resting_order_count'] + contracts
       orders_placed += 1
       level_orders += 1
+      _placed_rung_idx += 1  # Bump only on successful place — failed orders don't advance the size ladder
       _rungs.append((i, bid_price, contracts, edge, '✓', 'placed'))
       _placed_rungs.append((int(bid_price), contracts, edge))
     except Exception as e:
