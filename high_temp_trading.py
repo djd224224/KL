@@ -515,11 +515,26 @@ def get_weatherunderground_forecast(city, coords):
             time.sleep(1.5 * (_attempt + 1))
             continue
 
+    # All retries exhausted. Try prior-run fallback before giving up.
+    # PRIOR_RUN_WU is populated below from the most recent prior snapshot for
+    # this (city, target_forecast_date) where weather_underground was non-null.
+    # Avoids the recurring "WU failed → city_floor σ kicks in" pattern that
+    # bites the ~01 CT maintenance-window run.
+    _prior = PRIOR_RUN_WU.get(city) if 'PRIOR_RUN_WU' in globals() else None
+    if _prior is not None:
+        print(f"  ↪ WU FALLBACK {city}: API failed ({_last_err}), using prior-run WU = {_prior:.1f}°F")
+        # Still alert so we know API is broken, but at lower severity
+        alert("FORECAST_FALLBACK",
+              f"WU {city}: API failed ({_last_err}), used prior run value {_prior:.1f}°F",
+              {"source": "weather_underground", "status_code": _last_status,
+               "err": _last_err, "fallback_value": _prior})
+        return _prior
+
     alert("FORECAST_FAILED",
           f"WU {_last_err} for {city}" + (f" (status={_last_status})" if _last_status else ""),
           {"source": "weather_underground", "status_code": _last_status,
            "err": _last_err, "body": _last_body})
-    print(f"  ⚠️ WU FAIL {city} after 3 attempts: {_last_err}"
+    print(f"  ⚠️ WU FAIL {city} after 3 attempts (no prior-run fallback): {_last_err}"
           + (f" | status={_last_status}" if _last_status else "")
           + (f" | body={_last_body}" if _last_body else ""))
     return "N/A"
@@ -527,6 +542,35 @@ def get_weatherunderground_forecast(city, coords):
 # Get current run date in Central Time
 central_tz = pytz.timezone("US/Central")
 run_date = datetime.now(central_tz).strftime('%Y-%m-%d %H:%M:%S')
+
+# ====================================================================
+# Prefetch prior-run WU values for the forecast target date.
+# Used as fallback when WU API fails on the current run (the ~01 CT
+# maintenance window pattern). Single BQ query, cached in dict.
+# Empty/failed prefetch falls through gracefully.
+# ====================================================================
+_target_forecast_date = (
+    datetime.now(central_tz) + timedelta(days=variable)
+).strftime("%Y-%m-%d")
+PRIOR_RUN_WU = {}
+try:
+    if bq_client is not None:
+        _q = f"""
+        WITH ranked AS (
+          SELECT city, weather_underground, run_date,
+            ROW_NUMBER() OVER (PARTITION BY city ORDER BY run_date DESC) AS rn
+          FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}market_snapshot`
+          WHERE DATE(forecast_date) = '{_target_forecast_date}'
+            AND weather_underground IS NOT NULL
+            AND run_date < TIMESTAMP('{run_date}')
+        )
+        SELECT city, weather_underground FROM ranked WHERE rn = 1
+        """
+        for _row in bq_client.query(_q).result():
+            PRIOR_RUN_WU[_row.city] = float(_row.weather_underground)
+        print(f"  Prior-run WU cache: {len(PRIOR_RUN_WU)}/{20} cities for forecast_date={_target_forecast_date}")
+except Exception as _e:
+    print(f"  Prior-run WU prefetch failed (non-fatal): {_e}")
 
 # Create the DataFrame
 forecast_data = []
