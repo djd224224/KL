@@ -1,10 +1,11 @@
 name: KXHIGH orderbook logger
 on:
   schedule:
-    # Every 15 minutes — captures price-path granularity needed for the
-    # increment-tuning and cancel-time analyses (see kxhigh_orderbook_logger.py
-    # docstring). 96 polls/day × ~240 markets ≈ 23k rows/day.
-    - cron: '*/15 * * * *'
+    # Every 30 min (2 runs/hr at :00 and :30 UTC) — captures price-path
+    # granularity needed for increment-tuning and cancel-time analyses.
+    # 48 polls/day × ~240 markets ≈ 11.5k rows/day. ~36 CI min/day,
+    # comfortably under the 2000-min/month free-tier private-repo budget.
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 jobs:
   log-orderbook:
