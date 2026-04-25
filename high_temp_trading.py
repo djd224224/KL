@@ -1261,7 +1261,7 @@ CITY_SIZE_MULT = {
     "Boston": 1.25,
     "Chicago": 1.25,
     "Dallas": 0.75,
-    "Philadelphia": 0.75,
+    "Philadelphia": 0.5,
     "Washington DC": 0.75,
     "Miami": 0.75,
     "Las Vegas": 0.75,
