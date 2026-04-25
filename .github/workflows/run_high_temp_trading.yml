@@ -41,7 +41,7 @@ jobs:
         #   Kill switch:   ENABLED=false (reverts instantly, no redeploy)
         # ================================================================
         AB_TEST_ENABLED: "true"
-        AB_TREATMENT_PROPORTION: "0.0"
+        AB_TREATMENT_PROPORTION: "0.5"
         AB_SAFETY_MARGIN_CENTS: "3"
       run: |
         set -o pipefail

@@ -201,7 +201,15 @@ def write_to_bq(df, table_name, write_disposition="WRITE_APPEND"):
         return
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}{table_name}"
     try:
-        job_config = bigquery.LoadJobConfig(write_disposition=write_disposition, autodetect=True)
+        # autodetect=True alone doesn't evolve schemas on WRITE_APPEND — it just
+        # rejects any DataFrame whose columns differ from the existing table.
+        # ALLOW_FIELD_ADDITION lets the load job add new nullable columns
+        # automatically. Required for the A/B test fields added to orders rows.
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=write_disposition,
+            autodetect=True,
+            schema_update_options=["ALLOW_FIELD_ADDITION"] if write_disposition == "WRITE_APPEND" else None,
+        )
         job = bq_client.load_table_from_dataframe(df, table_id, job_config=job_config)
         job.result()
         print(f"  BQ: {table_id} ← {len(df)} rows (table total: {bq_client.get_table(table_id).num_rows})")
