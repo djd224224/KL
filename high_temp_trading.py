@@ -223,6 +223,44 @@ def write_to_bq(df, table_name, write_disposition="WRITE_APPEND"):
 # Collector for orders placed during this run
 all_order_records = []
 
+# ====================================================================
+# Per-run identity + tracking
+# --------------------------------------------------------------------
+# Every invocation writes ≥1 row to KXHIGH_runs:
+#   • Row at startup (event='start') with config + GitHub Actions metadata
+#   • Row at end (event='end') with finished_at + n_orders + duration
+# A run with a 'start' row but no 'end' row = crashed mid-run.
+# Every order record gets RUN_ID stamped so we can attribute fills
+# back to specific runs even when timestamps overlap or drift.
+# ====================================================================
+RUN_ID = str(uuid.uuid4())
+RUN_STARTED_AT = datetime.now(pytz.UTC)
+
+def write_run_row(event, **fields):
+    """Append one row to KXHIGH_runs. Non-fatal on failure (alerts on error)."""
+    if bq_client is None:
+        print(f"  RUNS SKIP ({event}): bq_client is None")
+        return
+    base = {
+        "run_id": RUN_ID,
+        "event": event,             # 'start' or 'end'
+        "event_at": datetime.now(pytz.UTC),
+        "started_at": RUN_STARTED_AT,
+        "script_name": os.path.basename(sys.argv[0]) if sys.argv else "high_temp_trading.py",
+        "workflow_name": os.environ.get("GITHUB_WORKFLOW"),
+        "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "runner_os": os.environ.get("RUNNER_OS"),
+    }
+    base.update(fields)
+    try:
+        df = pd.DataFrame([base])
+        write_to_bq(df, "runs", "WRITE_APPEND")
+    except Exception as e:
+        print(f"  RUNS WRITE FAIL ({event}): {e}")
+
+import sys
+
 # Determine if current time in Central Time is after 2 PM
 central_time = datetime.now(pytz.timezone('US/Central'))
 variable = 1 if central_time.hour >= 14 and central_time.hour < 23 else 0
@@ -1331,6 +1369,22 @@ def _ab_assign_arm(market_ticker, run_date_str):
 print(f"\n[AB] test={AB_TEST_NAME} enabled={AB_TEST_ENABLED} "
       f"margin={AB_SAFETY_MARGIN_CENTS}c proportion={AB_TREATMENT_PROPORTION:.0%}")
 
+# Write the run-start marker now that all config is known. If anything below
+# crashes (BQ errors, Kalshi outages, etc.), this row remains as a "started_at
+# but no finished_at" indicator that something went wrong.
+write_run_row(
+    "start",
+    variable=int(variable),
+    night_size_mult=float(night_size_mult),
+    central_time_hour=int(central_time.hour),
+    starting_contracts=int(starting_contracts),
+    ab_test_name=AB_TEST_NAME,
+    ab_test_enabled=bool(AB_TEST_ENABLED),
+    ab_treatment_proportion=float(AB_TREATMENT_PROPORTION),
+    ab_safety_margin_cents=int(AB_SAFETY_MARGIN_CENTS),
+    n_markets_in_table=int(len(combined_table)),
+)
+
 orders_placed = 0
 _diag_printed = False
 for index, row in combined_table.iterrows():
@@ -1697,6 +1751,8 @@ for index, row in combined_table.iterrows():
           'kalshi_order_id': _kalshi_oid,
           'expiration_ts': exp_ts,
           'created_at': central_time.strftime('%Y-%m-%d %H:%M:%S'),
+          # Run attribution — links this order back to the runs table
+          'run_id': RUN_ID,
           # A/B test metadata — lets us query per-arm P&L / fill rate from BQ
           'ab_test_name': AB_TEST_NAME,
           'ab_test_enabled': AB_TEST_ENABLED,
@@ -1821,6 +1877,26 @@ if _ALERTS:
     print(f"{'='*60}\n")
 else:
     print("\n✓ No alerts — clean run")
+
+# =====================================================================
+# RUN-END marker for KXHIGH_runs. Pairs with the 'start' row written
+# earlier; downstream queries can join by run_id and detect crashes
+# (start row exists, end row doesn't) or count clean runs.
+# =====================================================================
+try:
+    _finished_at = datetime.now(pytz.UTC)
+    _duration_s = (_finished_at - RUN_STARTED_AT).total_seconds()
+    write_run_row(
+        "end",
+        finished_at=_finished_at,
+        duration_seconds=float(_duration_s),
+        n_orders_placed=int(orders_placed),
+        n_orders_in_records=int(len(all_order_records)),
+        n_alerts_emitted=int(len(_ALERTS)),
+        exit_status="success",
+    )
+except Exception as _re:
+    print(f"  RUNS end-row write failed: {_re}")
 
 # =====================================================================
 # RUN SUMMARY (markdown, for GitHub Actions step summary)

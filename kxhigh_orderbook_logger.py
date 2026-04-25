@@ -200,21 +200,57 @@ def ensure_table(client: bigquery.Client) -> None:
         pass  # already exists
 
 
+def write_run_marker(bq_client, event, run_id, started_at, **fields):
+    """Append one row to KXHIGH_runs (shared with high_temp_trading)."""
+    import uuid as _uuid
+    table_id = f"{PROJECT}.{DATASET}.KXHIGH_runs"
+    row = {
+        "run_id": run_id,
+        "event": event,
+        "event_at": datetime.now(timezone.utc),
+        "started_at": started_at,
+        "script_name": "kxhigh_orderbook_logger.py",
+        "workflow_name": os.environ.get("GITHUB_WORKFLOW"),
+        "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "runner_os": os.environ.get("RUNNER_OS"),
+    }
+    row.update(fields)
+    try:
+        df = pd.DataFrame([row])
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_APPEND",
+            schema_update_options=["ALLOW_FIELD_ADDITION"],
+        )
+        bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
+    except Exception as e:
+        print(f"  RUNS marker fail ({event}): {e}")
+
+
 def main():
+    import uuid
+    run_id = str(uuid.uuid4())
     poll_ts = datetime.now(timezone.utc)
-    print(f"[{poll_ts.isoformat()}] KXHIGH orderbook poll starting")
+    print(f"[{poll_ts.isoformat()}] KXHIGH orderbook poll starting (run_id={run_id})")
 
     private_key = _load_private_key()
     ex = ExchangeClient(exchange_api_base=KALSHI_API_BASE, key_id=KEY_ID, private_key=private_key)
+
+    bq_client = bigquery.Client(project=PROJECT)
+    write_run_marker(bq_client, "start", run_id, poll_ts)
 
     # 1. List open KXHIGH markets
     markets = list_open_kxhigh_markets(ex)
     print(f"  found {len(markets)} open KXHIGH markets")
     if not markets:
         print("  nothing to log; exiting")
+        write_run_marker(bq_client, "end", run_id, poll_ts,
+                         finished_at=datetime.now(timezone.utc),
+                         n_markets_seen=0, n_orderbook_rows=0,
+                         duration_seconds=(datetime.now(timezone.utc)-poll_ts).total_seconds(),
+                         exit_status="empty_market_list")
         return
 
-    bq_client = bigquery.Client(project=PROJECT)
     ensure_table(bq_client)
 
     # 2. Poll orderbook per market and build rows
@@ -267,6 +303,12 @@ def main():
 
     print(f"  collected {len(rows)} orderbook rows ({fails} failures)")
     if not rows:
+        write_run_marker(bq_client, "end", run_id, poll_ts,
+                         finished_at=datetime.now(timezone.utc),
+                         n_markets_seen=len(markets), n_orderbook_rows=0,
+                         n_fails=fails,
+                         duration_seconds=(datetime.now(timezone.utc)-poll_ts).total_seconds(),
+                         exit_status="no_rows_collected")
         return
 
     # 3. Append to BQ
@@ -280,6 +322,12 @@ def main():
     job = bq_client.load_table_from_dataframe(df, TABLE, job_config=job_config)
     job.result()
     print(f"  wrote {len(df)} rows -> {TABLE}")
+    write_run_marker(bq_client, "end", run_id, poll_ts,
+                     finished_at=datetime.now(timezone.utc),
+                     n_markets_seen=len(markets), n_orderbook_rows=len(df),
+                     n_fails=fails,
+                     duration_seconds=(datetime.now(timezone.utc)-poll_ts).total_seconds(),
+                     exit_status="success")
 
 
 if __name__ == "__main__":
