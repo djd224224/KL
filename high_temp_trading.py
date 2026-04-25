@@ -1257,7 +1257,6 @@ CITY_SIZE_MULT = {
     "Austin": 1.5,
     "Los Angeles": 1.25,
     "Dallas": 0.75,
-    "Atlanta": 0.75,
     "Philadelphia": 0.75,
     "Washington DC": 0.75,
 }
