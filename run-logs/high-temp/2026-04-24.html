@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>High-Temp Digest — 2026-04-24</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f1117; color: #e2e8f0; line-height: 1.6; padding: 32px; }
@@ -95,6 +96,68 @@
   <h2>Overall Summary</h2>
   <div class="summary-box">
     April 24 is <strong>unsettled</strong> — no rows in <code>KXHIGH_settlements_clean</code> — so all figures are estimates from IEM CLI readings. Of 11 filled markets across 9 cities, actuals are available for 4: <strong class="win">Atlanta, New York City, and Minneapolis are confirmed wins</strong>, all with actuals landing above or below their respective bands. <strong>Austin's estimated win (+$48.02 on B89.5 NO) is flagged:</strong> the IEM reading shows 74°F at 5:59 AM against a 89.5°F forecast — an anomalous 15.5°F miss consistent with a severe cold front, but should be verified against official settlement. <strong>Seven markets remain fully pending</strong> with $370.65 deployed: Chicago B72.5 ($89.60), Philadelphia T74 ($114.81), and Las Vegas B81.5 ($57.40) are the three largest unknowns. The day's biggest operational issue is a <strong class="loss">BQ write failure</strong> at 6:39 PM that dropped 189 order rows due to an A/B test schema conflict — the <code>ab_test_name</code> field cannot be added to <code>KXHIGH_orders</code> without a table migration, corrupting the audit trail. A separate <strong class="warn-color">WU API outage</strong> at 1:06 AM hit all 20 cities but was resolved by the 6:04 AM run, which successfully populated WU values used for trading.
+  </div>
+
+  <!-- VOLUME CHART -->
+  <h2>Kalshi Platform Volume by City — Apr 10–24</h2>
+  <div class="section">
+    <canvas id="volumeChart" style="max-height:360px;"></canvas>
+    <script>
+    (function(){
+      const labels=['Apr 10','Apr 11','Apr 12','Apr 13','Apr 14','Apr 15','Apr 16','Apr 17','Apr 18','Apr 19','Apr 20','Apr 21','Apr 22','Apr 23','Apr 24'];
+      const cities=[
+        {label:'Atlanta',       color:'#ef4444', data:[61229,63502,48747,65833,84138,82233,81789,88114,67109,86144,82916,85481,75293,74835,172326]},
+        {label:'Austin',        color:'#f97316', data:[106044,70123,79711,793751,102184,117153,83858,116120,463171,89671,66603,77014,140215,127340,106233]},
+        {label:'Boston',        color:'#fbbf24', data:[94259,47497,53031,88994,138303,91331,96778,25948,51288,31092,1217378,28867,44156,57657,53098]},
+        {label:'Chicago',       color:'#22c55e', data:[237112,285254,164753,304372,218390,170677,145222,168325,95011,189581,181976,210112,314203,212518,173168]},
+        {label:'Dallas',        color:'#14b8a6', data:[30144,42563,60407,57183,42800,36570,33999,54618,305564,69883,38905,34944,84308,55486,52618]},
+        {label:'Denver',        color:'#3b82f6', data:[81329,54856,58390,77742,58712,47765,66037,187359,72574,51850,69149,62087,44645,87923,65999]},
+        {label:'Houston',       color:'#8b5cf6', data:[35114,27321,30836,33637,32162,21748,21704,26178,44705,64423,42860,22053,64820,32406,40558]},
+        {label:'Las Vegas',     color:'#ec4899', data:[33103,38707,45538,65006,35320,45042,38652,59521,54881,91414,67357,56799,53636,39982,66552]},
+        {label:'Los Angeles',   color:'#06b6d4', data:[272932,235185,255861,189941,216599,330984,279534,355634,251997,385364,311890,349854,303650,457453,524750]},
+        {label:'Miami',         color:'#f59e0b', data:[136228,141275,111797,104618,177134,135015,82221,141618,87119,148257,228054,155457,421262,202558,303090]},
+        {label:'Minneapolis',   color:'#84cc16', data:[30366,63022,40358,78672,50666,44393,62355,63706,37219,40055,50270,34798,42276,87527,44695]},
+        {label:'New Orleans',   color:'#10b981', data:[22098,27130,21791,22331,19708,19616,41361,23753,33702,37127,16099,21126,17639,13914,27822]},
+        {label:'New York',      color:'#6366f1', data:[247473,181850,184615,442288,474855,370043,364482,457905,241703,135745,286786,283349,152562,242434,401705]},
+        {label:'Oklahoma City', color:'#d946ef', data:[34564,51110,42333,37634,24123,31789,31193,23900,62451,53786,36916,37358,47775,34186,66308]},
+        {label:'Philadelphia',  color:'#0ea5e9', data:[44791,44968,37853,234972,87348,47184,39458,53959,52309,37573,75439,78275,72166,69722,40208]},
+        {label:'Phoenix',       color:'#f43f5e', data:[55234,81123,61327,103847,80945,50922,66156,65186,47891,58051,70572,44615,63833,42680,55112]},
+        {label:'San Antonio',   color:'#a855f7', data:[23530,26221,30439,39114,25108,26117,44716,44801,59481,51141,32742,38910,50057,32158,35940]},
+        {label:'San Francisco', color:'#78716c', data:[63014,52762,64671,76494,31743,46832,57062,52524,62995,76703,60482,34032,38026,41048,76246]},
+        {label:'Seattle',       color:'#64748b', data:[82812,80256,63330,107968,66543,62614,48575,36580,43549,52634,50106,38144,51034,50055,54889]},
+        {label:'Washington DC', color:'#d97706', data:[55282,47091,31572,36723,69618,80035,89944,36596,34270,73866,41956,37866,47868,33630,33161]},
+      ];
+      new Chart(document.getElementById('volumeChart'),{
+        type:'bar',
+        data:{
+          labels,
+          datasets:cities.map(c=>({label:c.label,data:c.data,backgroundColor:c.color,borderWidth:0,stack:'vol'})),
+        },
+        options:{
+          responsive:true,
+          maintainAspectRatio:true,
+          interaction:{mode:'index'},
+          plugins:{
+            legend:{position:'bottom',labels:{color:'#94a3b8',font:{size:10},boxWidth:10,padding:8}},
+            tooltip:{callbacks:{
+              label:ctx=>`${ctx.dataset.label}: ${(ctx.parsed.y/1000).toFixed(1)}K`,
+              footer:items=>`Total: ${(items.reduce((s,i)=>s+i.parsed.y,0)/1000).toFixed(0)}K contracts`,
+            }},
+          },
+          scales:{
+            x:{stacked:true,ticks:{color:'#64748b',font:{size:11}},grid:{color:'#1a2030'}},
+            y:{stacked:true,
+               ticks:{color:'#64748b',font:{size:11},callback:v=>v>=1000?(v/1000).toFixed(0)+'K':v},
+               grid:{color:'#1e2a3a'},
+               title:{display:true,text:'Platform Contracts Traded (all participants)',color:'#475569',font:{size:11}}},
+          },
+        },
+      });
+    })();
+    </script>
+    <div class="commentary">
+      <strong>Los Angeles leads all cities in platform-wide volume at 250K–525K contracts/day, followed by New York (136K–475K) and Chicago (95K–314K).</strong> Two extraordinary spikes dominate the period: Boston hit 1.22M contracts on Apr 20 (likely tied to a sharp spring cold-front event driving speculative traffic) and Austin reached 794K on Apr 13 and 463K on Apr 18 — days where NWS forecast uncertainty was highest. The daily platform total (all 20 cities combined) typically runs 1.5M–2.5M contracts; the Apr 13 day crossed 4M driven by Austin and New York. New Orleans (14K–41K), Houston (22K–65K), and San Antonio (24K–60K) remain low-volume markets where our fills represent a non-trivial fraction of platform activity — a liquidity risk worth monitoring as we size up.
+    </div>
   </div>
 
   <!-- FORECASTS -->
