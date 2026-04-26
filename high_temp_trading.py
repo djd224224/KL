@@ -1350,19 +1350,26 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
 # treatment. All 20 cities are included automatically. Enable via
 # env var AB_TEST_ENABLED=true.
 # ====================================================================
-AB_TEST_NAME = "hi_no_tied_to_fair_no_v1"
+AB_TEST_NAME = "hi_no_tied_to_fair_no_v2"   # v2: per-market sticky (was per-market-run)
 AB_TEST_ENABLED = os.environ.get("AB_TEST_ENABLED", "false").lower() == "true"
 AB_SAFETY_MARGIN_CENTS = int(os.environ.get("AB_SAFETY_MARGIN_CENTS", "5"))
 AB_TREATMENT_PROPORTION = float(os.environ.get("AB_TREATMENT_PROPORTION", "0.5"))
 
-def _ab_assign_arm(market_ticker, run_date_str):
-    """Deterministic 50/50 (by default) hash split. Same (market, run)
-    always gets same arm → reproducible for analysis. Returns 'control'
-    when the test is disabled so all behavior goes through the legacy
-    path untouched."""
+def _ab_assign_arm(market_ticker):
+    """Deterministic per-market 50/50 (by default) hash split.
+
+    v2 (this version): hash key includes ONLY market_ticker — a market is
+    sticky-assigned to one arm for its entire lifetime. Every run that
+    touches the same market sees the same arm assignment. Cleaner causal
+    interpretation than v1 (which mixed treatment + control orders on the
+    same market across runs).
+
+    Returns 'control' when AB_TEST_ENABLED is false so all behavior goes
+    through the legacy path untouched.
+    """
     if not AB_TEST_ENABLED:
         return "control"
-    key = f"{AB_TEST_NAME}|{market_ticker}|{run_date_str}"
+    key = f"{AB_TEST_NAME}|{market_ticker}"
     u = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / (16**8)
     return "treatment" if u < AB_TREATMENT_PROPORTION else "control"
 
@@ -1459,7 +1466,7 @@ for index, row in combined_table.iterrows():
   # A/B assignment for this (market_ticker, run_date).
   # Computes _effective_hi_no used by the ladder loop below.
   # ==================================================================
-  _ab_arm = _ab_assign_arm(ticker, str(row['Run Date']))
+  _ab_arm = _ab_assign_arm(ticker)
   _fair_no_cents = 100.0 * (1.0 - float(yes_prob))
   _hi_no_config = float(hi_no)
   if _ab_arm == "treatment":
