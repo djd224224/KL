@@ -80,13 +80,13 @@
 <div class="container">
 
   <h1>High-Temp Digest</h1>
-  <div class="subtitle">2026-04-26 &nbsp;·&nbsp; KXHIGH series &nbsp;·&nbsp; Pending settlement &nbsp;·&nbsp; P&amp;L estimated from <code>KXHIGH_cli_readings</code> (11/20 cities reported)</div>
+  <div class="subtitle">2026-04-26 &nbsp;·&nbsp; KXHIGH series &nbsp;·&nbsp; Pending settlement &nbsp;·&nbsp; P&amp;L estimated from <code>KXHIGH_cli_readings</code> (afternoon-high cities only — 3 readings flagged preliminary)</div>
 
   <!-- KPI bar -->
   <div class="kpi-bar">
-    <div class="kpi"><div class="kpi-label">Est. P&amp;L</div><div class="kpi-value win">+$464.56</div></div>
-    <div class="kpi"><div class="kpi-label">Return on settled cost</div><div class="kpi-value win">+91.8%</div></div>
-    <div class="kpi"><div class="kpi-label">Win / Loss / Pend</div><div class="kpi-value neutral">7W / 0L / 5P</div></div>
+    <div class="kpi"><div class="kpi-label">Est. P&amp;L</div><div class="kpi-value win">+$246.14</div></div>
+    <div class="kpi"><div class="kpi-label">Return on settled cost</div><div class="kpi-value win">+121.1%</div></div>
+    <div class="kpi"><div class="kpi-label">Win / Loss / Pend</div><div class="kpi-value neutral">4W / 0L / 8P</div></div>
     <div class="kpi"><div class="kpi-label">Capital deployed</div><div class="kpi-value neutral">$814.31</div></div>
     <div class="kpi"><div class="kpi-label">Contracts filled</div><div class="kpi-value neutral">1,645</div></div>
     <div class="kpi"><div class="kpi-label">Markets ordered</div><div class="kpi-value neutral">68 across 20 cities</div></div>
@@ -95,7 +95,7 @@
   <!-- OVERALL SUMMARY -->
   <h2>Overall Summary</h2>
   <div class="summary-box">
-    April 26 is shaping up as the model's best day of the month. Of 12 fills across 10 cities, <strong>seven are confirmed winners and zero losers</strong> on the 11 cities IEM CLI has so far reported, locking in <strong class="win">+$464.56</strong> on $506.06 of settled cost — a <strong class="win">+91.8%</strong> return on confirmed deployed capital. The day's story is a <strong>massive overnight cold front</strong> that swept the southern Plains and Mountain West before dawn: Austin printed its high of <strong>75°F at 4:05 AM</strong> (vs 91.5°F forecast — a 16°F bust), San Antonio peaked at <strong>75°F at 1:30 AM</strong> (vs 90.5°F forecast), and Denver maxed at <strong>39°F at 3:41 AM</strong> (vs 55.5°F). The model had blanketed both Texas cities with NO bets just below forecast — Austin B89.5 NO and B91.5 NO, San Antonio B91.5 NO — and the cold front turned every one into a runaway winner: Austin alone netted <strong class="win">+$183.87</strong> across the two strikes. Miami was the cleanest YES-band miss in the opposite direction: 88°F vs 85.5°F forecast, sending the B86.5 NO above the band for <strong class="win">+$107.70</strong>. Houston, Washington DC, and the smaller San Antonio fill rounded out the slate. Five fills in cities where IEM has not yet posted a reading — Las Vegas, LA, Phoenix, San Francisco, Seattle — totaling $308.25 deployed remain pending. Settlement will overwrite these estimates when <code>KXHIGH_settlements_clean</code> rows arrive. The Weather Underground null cluster recurred at 00:18 AM (all 20 cities) but recovered by the 06:45 AM forecast run, so today's snapshot blends NWS+WU normally.
+    <strong>Data caveat first:</strong> three IEM CLI rows for 04-26 are clearly preliminary, not finals — Austin (75°F at 4:05 AM, low 73°F, range 2°F), San Antonio (75°F at 1:30 AM, low 72°F, range 3°F), and Denver (39°F at 3:41 AM, low 35°F, range 4°F). These are pre-dawn snapshots captured before the actual daytime high, not cold-front busts. By contrast 04-25 readings were all afternoon-timed with normal 15–25°F diurnal ranges. The three Texas/Mountain fills sized against those ranges (Austin B89.5 NO, Austin B91.5 NO, San Antonio B91.5 NO — $302.78 deployed) are now correctly classified <strong>pending</strong>, not confirmed; they likely landed at or near the 91°F forecast, which would turn those NO bets into losses. <strong>What is confirmed:</strong> four fills against well-formed afternoon-high readings in three cities. Miami's B86.5 NO was the cleanest signal of the day — actual 88°F printed above the {86,87}°F band for <strong class="win">+$107.70</strong>. Houston's two NO bets both cleared (actual 85°F under both the {86,87} and {88,89} band floors) for a combined <strong class="win">+$61.93</strong>. Washington DC's B58.5 NO at 44.7¢ won when 57°F came in under the 58°F floor: <strong class="win">+$76.51</strong>. <strong>Total confirmed P&amp;L: +$246.14 on $203.28 settled cost (+121%)</strong>. Eight fills remain pending: the three flagged Texas/Mountain bets above plus the original five with no CLI reading at all (LV, LAX, PHX, SFO, SEA — $308.25 deployed). True P&amp;L will resolve when <code>KXHIGH_settlements_clean</code> populates. The midnight Weather Underground null cluster at 00:18 AM recovered before the 06:45 AM forecast run, so positioning was unaffected.
   </div>
 
   <!-- FORECASTS -->
@@ -137,7 +137,7 @@
       </tbody>
     </table>
     <div class="commentary">
-      <strong>The forecast pipeline ran cleanly with NWS+WU blending intact, but the Texas-to-Plains forecasts proved catastrophically wrong.</strong> Austin and San Antonio both averaged 90–92°F with both sources in tight agreement (NWS 93°F, WU 88–90°F), giving the model high confidence — yet a fast-moving Pacific cold front pushed in overnight and pinned daytime highs to the early-morning hours, with both cities maxing at 75°F before dawn. Denver's 55.5°F average against a 39°F early-morning peak was a similar pattern. <strong>Spread of standard deviations gives a clue:</strong> San Antonio's std was 3.5 (largest of the day), Austin's 2.1, Denver's 3.5 — the model knew uncertainty was elevated, and the wider tails meant smaller (or no) bets on the inner bands. That risk-management caught the day's biggest miss in San Antonio (only one fill on B91.5 NO, 75 contracts) and contained Denver to no fills at all. Atlanta nailed it perfectly (forecast 83°F, actual 83°F) — but no fills there either. NYC matched within 0.5°F with the same outcome. The cleanest forecast wins were operationally invisible because the model didn't position into them.
+      <strong>Forecast pipeline ran cleanly — NWS+WU blending intact across all 20 cities at the 06:45 AM run.</strong> The bigger story isn't the forecasts themselves; it's that the verification data is partial. Of 20 expected IEM CLI readings, 11 have arrived and 3 of those are clearly preliminary (early-AM "highs" with 2–4°F diurnal ranges that contradict the actual day). Where finals are in, the model called it cleanly: Atlanta nailed it (forecast 83°F, actual 83°F), NYC matched within 0.5°F (forecast 57.5°F, actual 57°F), Boston and DC within 1°F. The biggest verifiable miss was Miami: forecast 85.5°F, actual 88°F — a 2.5°F warm bust that the B86.5 NO was actually positioned for (priced 39¢ for NO = 61% YES band probability). <strong>What we don't know yet:</strong> whether the southern Texas forecasts (Austin 91.5°F, San Antonio 90.5°F) were right or wrong. The CLI rows for both cities are pre-dawn placeholders, not finals. Those are the day's largest open positions and the most consequential unknowns.
     </div>
   </div>
 
@@ -171,16 +171,16 @@
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
-        <!-- Austin — 2 fills (BOTH WIN) -->
+        <!-- Austin — 2 fills (BOTH PENDING — preliminary CLI) -->
         <tr class="divider">
           <td class="left"><span class="city-name">Austin</span></td>
-          <td><strong>75°F</strong></td><td>4:05 AM</td>
+          <td class="warn-color">75°F*</td><td>4:05 AM*</td>
           <td class="left conditions">Cloudy</td>
           <td class="left"><span class="band-mono">B89.5, B91.5, B93.5, T96</span></td>
           <td class="left"><span class="band-mono">B89.5</span></td>
           <td>89–90°F</td><td>364</td><td>$0.587</td><td>$213.96</td>
-          <td class="pnl pos">+$150.26</td>
-          <td class="left"><span class="pill win">WIN — below</span></td>
+          <td class="pnl pend">TBD</td>
+          <td class="left"><span class="pill pend">CLI prelim</span></td>
         </tr>
         <tr>
           <td class="left"><span class="city-name" style="color:#7dd3fc;font-size:0.78rem;">↳ Austin</span></td>
@@ -189,8 +189,8 @@
           <td class="left na">—</td>
           <td class="left"><span class="band-mono">B91.5</span></td>
           <td>91–92°F</td><td>82</td><td>$0.590</td><td>$48.37</td>
-          <td class="pnl pos">+$33.61</td>
-          <td class="left"><span class="pill win">WIN — below</span></td>
+          <td class="pnl pend">TBD</td>
+          <td class="left"><span class="pill pend">CLI prelim</span></td>
         </tr>
         <!-- Boston — no fill -->
         <tr>
@@ -219,10 +219,10 @@
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
-        <!-- Denver — no fill -->
+        <!-- Denver — no fill, CLI prelim -->
         <tr>
           <td class="left"><span class="city-name unfilled">Denver</span></td>
-          <td>39°F</td><td>3:41 AM</td>
+          <td class="warn-color">39°F*</td><td>3:41 AM*</td>
           <td class="left conditions">Cloudy</td>
           <td class="left"><span class="band-mono">B56.5, B60.5, B62.5, T63</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
@@ -338,16 +338,16 @@
           <td class="pnl pend">TBD</td>
           <td class="left"><span class="pill pend">Pending CLI</span></td>
         </tr>
-        <!-- San Antonio — FILL (WIN) -->
+        <!-- San Antonio — FILL (PENDING — preliminary CLI) -->
         <tr class="divider">
           <td class="left"><span class="city-name">San Antonio</span></td>
-          <td><strong>75°F</strong></td><td>1:30 AM</td>
+          <td class="warn-color">75°F*</td><td>1:30 AM*</td>
           <td class="left conditions">Patchy Fog then Mostly Cloudy</td>
           <td class="left"><span class="band-mono">B89.5, B91.5, B93.5, T96</span></td>
           <td class="left"><span class="band-mono">B91.5</span></td>
           <td>91–92°F</td><td>75</td><td>$0.539</td><td>$40.45</td>
-          <td class="pnl pos">+$34.55</td>
-          <td class="left"><span class="pill win">WIN — below</span></td>
+          <td class="pnl pend">TBD</td>
+          <td class="left"><span class="pill pend">CLI prelim</span></td>
         </tr>
         <!-- San Francisco — FILL (PENDING) -->
         <tr class="divider">
@@ -384,15 +384,16 @@
         </tr>
         <!-- TOTAL ROW -->
         <tr class="total-row">
-          <td class="left" colspan="7">TOTAL — settled fills only (7 positions, 5 cities)</td>
-          <td>971</td><td></td><td>$506.06</td>
-          <td class="pnl pos">+$464.56</td>
-          <td class="left">7W / 0L / 5 pending</td>
+          <td class="left" colspan="7">TOTAL — settled fills only (4 positions, 3 cities)</td>
+          <td>449</td><td></td><td>$203.28</td>
+          <td class="pnl pos">+$246.14</td>
+          <td class="left">4W / 0L / 8 pending</td>
         </tr>
       </tbody>
     </table>
+    <div class="footnote">* CLI reading is preliminary — pre-dawn "high" with a 2–4°F diurnal range (vs ~15–25°F for true daily finals on 04-25). Treat as unverified until IEM publishes the day's final report.</div>
     <div class="commentary">
-      <strong>Texas was the day's killing field — for the model's bets, in the right direction.</strong> Austin produced the largest single-city win at <strong class="win">+$183.87</strong> across two strikes (B89.5 NO 364 contracts at 58.7¢, B91.5 NO 82 contracts at 59¢) when the actual high of 75°F printed pre-dawn at 4:05 AM and the afternoon collapsed under the cold front. The pricing tells the bet story: 58.7¢ for B89.5 NO means the market priced YES (the band) at ~41% — the model's edge was +29 cents, the largest fill-weighted edge of the day, and it cashed in full. San Antonio's lone B91.5 NO fill (75 contracts at 53.9¢, +25¢ model edge) returned <strong class="win">+$34.55</strong>; the smaller size relative to Austin reflects the wider 3.5°F std the model carried into the position. <strong>Miami was the crispest opposite-direction win:</strong> B86.5 NO at 38.9¢ (priced 61% YES the actual lands in {86,87}°F) — the model knew Miami was running hot, took NO at a discount, and the actual 88°F cleared above the band cleanly for <strong class="win">+$107.70</strong>. Houston's two NOs both cleared below the band (actual 85°F under the {86,87} and {88,89} floors) for a combined <strong class="win">+$61.93</strong>. Washington DC's B58.5 NO at 44.7¢ hit when 57°F landed below the band's 58°F floor — <strong class="win">+$76.51</strong>. Among unsettled positions, <strong>Phoenix B78.5 NO ($111.20)</strong> is the largest open exposure, with NWS forecasting 80°F and WU 78°F — likely landing inside or just above the {78,79} band, so the bet skews toward a small loss or break-even. <strong>Las Vegas B70.5 NO ($103.38) at 40.7¢</strong> with both sources at 71–72°F is the most uncertain — actual landing on 71 would be a full loss, on 72+ a full win.
+      <strong>Confirmed wins are clustered in three coastal/eastern cities, all positioned correctly against the model edge.</strong> Miami was the day's standout: B86.5 NO at 38.9¢ (priced 61% YES the actual lands in {86,87}°F) — the model knew Miami was running hot, took NO at a discount, and the actual 88°F cleared above the band cleanly for <strong class="win">+$107.70</strong>. Houston's two NOs both cleared below the band (actual 85°F under the {86,87} and {88,89} floors) for a combined <strong class="win">+$61.93</strong>. Washington DC's B58.5 NO at 44.7¢ hit when 57°F landed below the 58°F floor — <strong class="win">+$76.51</strong>. <strong>The day's largest open exposure is Austin B89.5 NO at $213.96</strong>, priced with +29¢ model edge against a 91.5°F forecast. If the actual lands at or above 91°F (most likely given the morning observed temp of 73°F was already trending toward the forecast), this position pays; if it comes in 89–90°F it loses fully. Austin B91.5 NO ($48.37) needs the actual to clear 92°F or fall below 91°F to win — landing on 91 or 92 is a full loss. San Antonio B91.5 NO ($40.45) needs the same above-92°F or below-91°F resolution. Among the no-CLI cities, <strong>Phoenix B78.5 NO ($111.20)</strong> with NWS 80°F and WU 78°F skews toward a small loss if the actual lands in {78,79}; <strong>Las Vegas B70.5 NO ($103.38)</strong> at 40.7¢ with both sources at 71–72°F is the most binary — full win above 71, full loss on 70 or 71. <strong>True P&amp;L for the day will not be knowable until <code>KXHIGH_settlements_clean</code> populates.</strong>
     </div>
   </div>
 
