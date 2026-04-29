@@ -8,7 +8,9 @@ on:
     #     ~06 UTC (= 01 CDT) which hit WU's pre-refresh window where
     #     temperatureMax[0] is null.
     #   other slots drift ~30-60 min and remain near their target hours.
-    - cron: '2 2,10,11,23 * * *'
+    #   morning slots spread to 9 and 11 (was 10 and 11) to avoid GH
+    #   Actions concurrency-skipping back-to-back hours under load.
+    - cron: '2 2,9,11,23 * * *'
   workflow_dispatch:
 jobs:
   run-kalshi-script:
