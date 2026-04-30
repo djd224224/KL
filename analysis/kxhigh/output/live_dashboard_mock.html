@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>KXHIGH Live — Mockup</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b1020;
+    --panel: #131a2e;
+    --panel-2: #182040;
+    --line: #243056;
+    --ink: #e6ecff;
+    --ink-dim: #93a2c8;
+    --green: #2ecc71;
+    --red: #ff5b6e;
+    --amber: #ffb94a;
+    --blue: #4aa3ff;
+    --violet: #b18cff;
+    --chip: #1f2950;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", Segoe UI, sans-serif; }
+  a { color: var(--blue); }
+
+  /* ───────────────────────── Top strip ──────────────────────────── */
+  header.top {
+    display: grid;
+    grid-template-columns: 1.6fr repeat(6, 1fr);
+    gap: 1px;
+    background: var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  header.top .cell {
+    background: var(--panel);
+    padding: 10px 14px;
+  }
+  header.top .label { color: var(--ink-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  header.top .value { font-size: 18px; font-weight: 600; margin-top: 2px; }
+  header.top .brand .value { font-size: 16px; color: var(--blue); }
+  header.top .brand .sub { color: var(--ink-dim); font-size: 11px; margin-top: 2px; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .warn { color: var(--amber); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: 1px; margin-right: 6px; }
+  .dot.green { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.amber { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+  .dot.red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+  main {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    gap: 16px;
+    padding: 16px;
+  }
+  @media (max-width: 1200px) { main { grid-template-columns: 1fr; } }
+
+  /* ───────────────────────── City card grid ──────────────────────── */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px;
+    position: relative;
+    overflow: hidden;
+  }
+  .card .stripe {
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: var(--ink-dim);
+  }
+  .card.edge-pos .stripe { background: var(--green); }
+  .card.edge-neg .stripe { background: var(--red); }
+  .card.edge-flat .stripe { background: var(--ink-dim); }
+  .card-head { display: flex; justify-content: space-between; align-items: baseline; }
+  .city { font-size: 16px; font-weight: 700; letter-spacing: .04em; }
+  .ticker { color: var(--ink-dim); font-size: 11px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; }
+  .stat { font-size: 11px; color: var(--ink-dim); text-transform: uppercase; letter-spacing: .05em; }
+  .stat-val { font-size: 14px; font-weight: 600; color: var(--ink); }
+  .spark { height: 56px; margin: 8px -4px 4px; }
+
+  /* Bucket distribution: stacked bars showing market vs model side-by-side */
+  .buckets { margin-top: 8px; }
+  .bucket-row {
+    display: grid;
+    grid-template-columns: 56px 1fr 56px;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 3px;
+    font-variant-numeric: tabular-nums;
+  }
+  .bucket-label { font-size: 11px; color: var(--ink-dim); text-align: right; }
+  .bars {
+    height: 14px;
+    background: var(--panel-2);
+    border-radius: 3px;
+    position: relative;
+    overflow: hidden;
+  }
+  .bar-mkt, .bar-mdl {
+    position: absolute; left: 0; top: 0; height: 50%;
+  }
+  .bar-mkt { top: 0; background: linear-gradient(90deg, #4aa3ff88, #4aa3ff); }
+  .bar-mdl { top: 50%; background: linear-gradient(90deg, #b18cff88, #b18cff); }
+  .bucket-edge { font-size: 11px; text-align: right; }
+
+  .pos-chip {
+    display: flex; flex-wrap: wrap; gap: 4px;
+    margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid var(--line);
+  }
+  .chip {
+    background: var(--chip);
+    color: var(--ink);
+    padding: 3px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .chip .b { color: var(--ink-dim); margin-right: 4px; }
+  .chip .pnl-pos { color: var(--green); }
+  .chip .pnl-neg { color: var(--red); }
+
+  .legend { display: flex; gap: 10px; margin-left: auto; font-size: 10px; color: var(--ink-dim); }
+  .legend i { display: inline-block; width: 8px; height: 8px; vertical-align: 1px; margin-right: 3px; border-radius: 1px; }
+  .legend .mkt i { background: var(--blue); }
+  .legend .mdl i { background: var(--violet); }
+
+  /* ───────────────────────── Right column ──────────────────────── */
+  aside { display: flex; flex-direction: column; gap: 12px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .panel h3 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    letter-spacing: .08em;
+    color: var(--ink-dim);
+    text-transform: uppercase;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .panel h3 .count { color: var(--ink); background: var(--chip); padding: 1px 6px; border-radius: 10px; font-size: 11px; }
+
+  /* Heatmap */
+  .heat {
+    display: grid;
+    grid-template-columns: 64px repeat(6, 1fr);
+    gap: 2px;
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+  }
+  .heat .h-h { color: var(--ink-dim); text-align: center; padding: 4px 0; }
+  .heat .h-c { padding: 4px 6px; color: var(--ink-dim); }
+  .heat .h-cell {
+    text-align: center;
+    padding: 4px 0;
+    border-radius: 3px;
+    color: #0b1020;
+    font-weight: 600;
+  }
+
+  /* Alerts list */
+  .alert {
+    display: flex; gap: 8px; align-items: flex-start;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+  }
+  .alert:last-child { border-bottom: none; }
+  .alert .when { color: var(--ink-dim); font-size: 11px; min-width: 38px; }
+  .alert .what { flex: 1; }
+  .alert .what b { color: var(--ink); }
+
+  /* Run-status table */
+  table.runs { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+  table.runs td { padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  table.runs td:last-child { text-align: right; color: var(--ink-dim); }
+
+  footer.note {
+    color: var(--ink-dim);
+    text-align: center;
+    padding: 16px;
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="cell brand">
+    <div class="value">KXHIGH · Live</div>
+    <div class="sub">Mockup · all numbers fabricated</div>
+  </div>
+  <div class="cell">
+    <div class="label">Last NWS pull</div>
+    <div class="value"><span class="dot green"></span>14:00 ET <span class="ticker">· 6m ago</span></div>
+  </div>
+  <div class="cell">
+    <div class="label">Realized P&amp;L</div>
+    <div class="value pos">+$182.40</div>
+  </div>
+  <div class="cell">
+    <div class="label">Unrealized</div>
+    <div class="value neg">−$41.10</div>
+  </div>
+  <div class="cell">
+    <div class="label">Open exposure</div>
+    <div class="value">$1,840</div>
+  </div>
+  <div class="cell">
+    <div class="label">Active cities</div>
+    <div class="value">10 / 12</div>
+  </div>
+  <div class="cell">
+    <div class="label">A/B variants</div>
+    <div class="value">v1: 6 &nbsp; v2: 4</div>
+  </div>
+</header>
+
+<main>
+  <section class="grid" id="grid"></section>
+
+  <aside>
+    <div class="panel">
+      <h3>Edge heatmap (city × bucket) <span class="legend"><span class="mkt"><i></i>mkt</span><span class="mdl"><i></i>model</span></span></h3>
+      <div class="heat" id="heat"></div>
+      <div style="font-size:10px;color:var(--ink-dim);margin-top:6px">Cell = model_p − market_p · green &gt; 0 · red &lt; 0</div>
+    </div>
+
+    <div class="panel">
+      <h3>Bucket-distance alerts <span class="count" id="alert-count">4</span></h3>
+      <div id="alerts"></div>
+    </div>
+
+    <div class="panel">
+      <h3>Run / freshness <span class="count">12</span></h3>
+      <table class="runs" id="runs"></table>
+    </div>
+  </aside>
+</main>
+
+<footer class="note">
+  Mockup only · cards click into a per-city detail (hourly chart, bucket-prob evolution, fill log) — not implemented in scaffold.
+</footer>
+
+<script>
+/* ───── mock data ─────────────────────────────────────────────────── */
+const cities = [
+  { code: "NYC", name: "New York",     hi: 71, fcst: 73, hrs: 8, edge:  0.06, exposure: 220, pos: [["68-71","Y","12@.41","+$3"], ["72-75","N","8@.55","−$1"]],   variant: "v2" },
+  { code: "LAX", name: "Los Angeles",  hi: 76, fcst: 75, hrs: 11, edge: -0.02, exposure: 110, pos: [["75-78","Y","6@.62","+$0"]],                                  variant: "v1" },
+  { code: "CHI", name: "Chicago",      hi: 58, fcst: 62, hrs: 9,  edge:  0.11, exposure: 320, pos: [["59-62","Y","20@.34","+$8"], ["63-66","N","10@.71","−$2"]],   variant: "v2" },
+  { code: "MIA", name: "Miami",        hi: 84, fcst: 84, hrs: 7,  edge:  0.01, exposure:  60, pos: [["83-86","Y","4@.58","+$0"]],                                  variant: "v1" },
+  { code: "DEN", name: "Denver",       hi: 53, fcst: 60, hrs: 10, edge:  0.14, exposure: 410, pos: [["57-60","Y","30@.29","+$14"]],                                variant: "v2" },
+  { code: "PHX", name: "Phoenix",      hi: 92, fcst: 91, hrs: 12, edge: -0.04, exposure: 140, pos: [["89-92","N","12@.48","−$4"]],                                 variant: "v1" },
+  { code: "SEA", name: "Seattle",      hi: 55, fcst: 58, hrs: 13, edge:  0.03, exposure:  90, pos: [["57-60","Y","6@.44","+$1"]],                                  variant: "v2" },
+  { code: "BOS", name: "Boston",       hi: 64, fcst: 65, hrs: 8,  edge:  0.00, exposure:   0, pos: [],                                                              variant: "v1" },
+  { code: "ATL", name: "Atlanta",      hi: 73, fcst: 76, hrs: 9,  edge:  0.07, exposure: 180, pos: [["75-78","Y","10@.39","+$5"]],                                 variant: "v2" },
+  { code: "DAL", name: "Dallas",       hi: 81, fcst: 82, hrs: 10, edge: -0.05, exposure:  70, pos: [["80-83","N","6@.51","−$3"]],                                  variant: "v1" },
+];
+
+/* hourly observed temp series + forecast envelope per city (mock) */
+function tempSeries(base, now){
+  const hours = 24;
+  const obs = []; const fHi = []; const fLo = [];
+  for (let h = 0; h < hours; h++){
+    const dayCurve = Math.sin((h - 6) / 24 * Math.PI * 2) * 8;
+    const t = base - 6 + dayCurve + (Math.random() - 0.5) * 1.2;
+    obs.push(h <= now ? t.toFixed(1) : null);
+    fHi.push((t + 2 + Math.random()).toFixed(1));
+    fLo.push((t - 2 - Math.random()).toFixed(1));
+  }
+  return { hours: [...Array(hours).keys()].map(h => h+":00"), obs, fHi, fLo };
+}
+
+/* model + market bucket distribution — buckets are cents-style ranges */
+function buckets(c){
+  const bs = ["≤67","68-71","72-75","76-79","≥80"];
+  const mkt = [0.05, 0.18, 0.40, 0.27, 0.10];
+  const mdl = [0.04, 0.12, 0.34, 0.36, 0.14];
+  return bs.map((b,i)=>({ b, mkt: mkt[i], mdl: mdl[i], edge: mdl[i]-mkt[i] }));
+}
+
+/* ───── render city cards ─────────────────────────────────────────── */
+const grid = document.getElementById("grid");
+const nowHour = 14;
+
+cities.forEach((c, idx) => {
+  const card = document.createElement("div");
+  const edgeClass = c.edge > 0.02 ? "edge-pos" : c.edge < -0.02 ? "edge-neg" : "edge-flat";
+  card.className = "card " + edgeClass;
+
+  const sparkId = "spark-" + c.code;
+  const bs = buckets(c);
+
+  card.innerHTML = `
+    <div class="stripe"></div>
+    <div class="card-head">
+      <div>
+        <div class="city">${c.code} <span class="ticker">${c.name}</span></div>
+        <div class="ticker">KXHIGH-${c.code} · ${c.variant}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="stat-val ${c.edge>0?'pos':c.edge<0?'neg':''}">${c.edge>=0?'+':''}${(c.edge*100).toFixed(0)}¢ edge</div>
+        <div class="ticker">$${c.exposure} exp</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div><div class="stat">High so far</div><div class="stat-val">${c.hi}°</div></div>
+      <div><div class="stat">Forecast</div><div class="stat-val">${c.fcst}°</div></div>
+      <div><div class="stat">Hrs left</div><div class="stat-val">${c.hrs}h</div></div>
+    </div>
+
+    <div class="spark"><canvas id="${sparkId}"></canvas></div>
+
+    <div class="buckets">
+      ${bs.map(x => `
+        <div class="bucket-row">
+          <div class="bucket-label">${x.b}</div>
+          <div class="bars">
+            <div class="bar-mkt" style="width:${(x.mkt*100).toFixed(0)}%"></div>
+            <div class="bar-mdl" style="width:${(x.mdl*100).toFixed(0)}%"></div>
+          </div>
+          <div class="bucket-edge ${x.edge>0.02?'pos':x.edge<-0.02?'neg':''}">${x.edge>=0?'+':''}${(x.edge*100).toFixed(0)}</div>
+        </div>
+      `).join("")}
+    </div>
+
+    ${c.pos.length ? `<div class="pos-chip">${
+      c.pos.map(p => `<span class="chip"><span class="b">${p[0]} ${p[1]}</span>${p[2]} <span class="${p[3].startsWith('+')?'pnl-pos':p[3].startsWith('−')?'pnl-neg':''}">${p[3]}</span></span>`).join("")
+    }</div>` : `<div class="pos-chip"><span class="chip" style="color:var(--ink-dim)">flat</span></div>`}
+  `;
+  grid.appendChild(card);
+
+  /* sparkline */
+  const ts = tempSeries(c.fcst, nowHour);
+  new Chart(document.getElementById(sparkId), {
+    type: "line",
+    data: {
+      labels: ts.hours,
+      datasets: [
+        { label: "obs",   data: ts.obs, borderColor: "#4aa3ff", borderWidth: 2, tension: .35, pointRadius: 0, fill: false },
+        { label: "fHi",   data: ts.fHi, borderColor: "#b18cff55", borderWidth: 1, borderDash: [3,3], tension: .35, pointRadius: 0, fill: false },
+        { label: "fLo",   data: ts.fLo, borderColor: "#b18cff55", borderWidth: 1, borderDash: [3,3], tension: .35, pointRadius: 0, fill: false },
+      ],
+    },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: {
+        x: { display: false },
+        y: { display: false },
+      },
+    },
+  });
+});
+
+/* ───── heatmap ───────────────────────────────────────────────────── */
+const heat = document.getElementById("heat");
+const buckHeaders = ["≤67","68-71","72-75","76-79","≥80","Σ"];
+heat.innerHTML = `<div></div>` + buckHeaders.map(h => `<div class="h-h">${h}</div>`).join("");
+function heatColor(v){
+  // v in roughly [-0.15, +0.15]
+  const x = Math.max(-0.15, Math.min(0.15, v)) / 0.15;
+  if (x >= 0) {
+    const a = Math.round(40 + x*180);
+    return `rgba(46, 204, 113, ${0.15 + x*0.7})`;
+  } else {
+    return `rgba(255, 91, 110, ${0.15 + (-x)*0.7})`;
+  }
+}
+cities.forEach(c => {
+  heat.innerHTML += `<div class="h-c">${c.code}</div>`;
+  const vals = [
+    -0.04+Math.random()*0.04,
+     c.edge*0.3,
+     c.edge,
+     c.edge*0.6,
+    -0.02+Math.random()*0.04,
+  ];
+  const sum = vals.reduce((a,b)=>a+b, 0);
+  vals.forEach(v => {
+    heat.innerHTML += `<div class="h-cell" style="background:${heatColor(v)}">${v>=0?'+':''}${(v*100).toFixed(0)}</div>`;
+  });
+  heat.innerHTML += `<div class="h-cell" style="background:${heatColor(sum/5)};opacity:.6">${sum>=0?'+':''}${(sum*100).toFixed(0)}</div>`;
+});
+
+/* ───── alerts ────────────────────────────────────────────────────── */
+const alerts = [
+  { dot:"amber", when:"2m", what:"<b>DEN</b> bucket shifted: 53-56 → 57-60 after 14:00 reading (+0.07 model edge)" },
+  { dot:"green", when:"6m", what:"<b>CHI</b> NWS reading 58° → high-of-day candidate moved to 59-62 bucket" },
+  { dot:"red",   when:"11m", what:"<b>PHX</b> source disagreement: NWS 92, OpenMeteo 89, ECMWF 90 — divergence 3°" },
+  { dot:"amber", when:"22m", what:"<b>SEA</b> 1h reading missed (NWS API 503) — last good 13:00" },
+];
+document.getElementById("alerts").innerHTML = alerts.map(a => `
+  <div class="alert"><span class="dot ${a.dot}"></span><div class="when">${a.when}</div><div class="what">${a.what}</div></div>
+`).join("");
+document.getElementById("alert-count").textContent = alerts.length;
+
+/* ───── run status ────────────────────────────────────────────────── */
+const runs = [
+  ["NYC","ok","14:00:12"],["LAX","ok","14:00:09"],["CHI","ok","14:00:14"],["MIA","ok","14:00:11"],
+  ["DEN","ok","14:00:08"],["PHX","ok","14:00:13"],["SEA","late","13:00:07"],["BOS","ok","14:00:10"],
+  ["ATL","ok","14:00:11"],["DAL","ok","14:00:09"],["MSP","crash","12:00:42"],["DTW","ok","14:00:10"],
+];
+const dotFor = s => s==="ok"?"green":s==="late"?"amber":"red";
+document.getElementById("runs").innerHTML = runs.map(r => `
+  <tr><td><span class="dot ${dotFor(r[1])}"></span>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td></tr>
+`).join("");
+</script>
+</body>
+</html>

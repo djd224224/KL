@@ -258,6 +258,18 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY script_name ORDER BY event_at DESC) <= 5
 ORDER BY script_name, event_at DESC
 """
 
+SQL_RUNS_RAW_28H = f"""
+-- Unfiltered run-end events for the last 28h, used by the missed-run
+-- detector to compare scheduled cron slots vs actual completions. The
+-- main SQL_RUN_HEALTH query caps at 5 rows per script which isn't
+-- enough to evaluate four expected daily trading-bot slots.
+SELECT script_name, event_at, exit_status
+FROM `{PROJECT}.{DATASET}.KXHIGH_runs`
+WHERE event = 'end'
+  AND event_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 28 HOUR)
+ORDER BY event_at DESC
+"""
+
 SQL_HOURLY_FCST_DRIFT = f"""
 -- Predicted-peak-of-today per (city, polled_at) for the last 12h. Each
 -- cron tick stores the full hourly NWS forecast; taking MAX temp over
@@ -503,6 +515,10 @@ def load() -> dict:
     except Exception as e:
         print(f"  KXHIGH_nws_hourly_forecast (trajectory) unavailable ({type(e).__name__}); skipping per-city trajectory chart")
         out["nws_fcst_full"] = pd.DataFrame()
+    try:
+        out["runs_raw"] = _q(SQL_RUNS_RAW_28H)
+    except Exception:
+        out["runs_raw"] = pd.DataFrame()
     return out
 
 
@@ -1716,6 +1732,107 @@ def render(data: dict) -> str:
             )
         runs_html = "<table class='runs'>" + "".join(rows) + "</table>"
 
+    # ── missed-run detector ──
+    # Trading-bot cron is `2 2,9,11,23 * * *` UTC; each slot should produce
+    # one successful end event. GH Actions cron drift can be substantial
+    # (up to ~3.5h on the 02:02 slot historically) and runs occasionally
+    # get skipped, so we compare each scheduled slot in the last 24h
+    # against actual ends and flag the missing ones. A slot at HH:02 UTC
+    # is "satisfied" by any successful end between HH:02 and HH:02+4h.
+    # For the orderbook-logger we flag when the most recent end is older
+    # than 60 min (its cron is */20, two skipped ticks).
+    # Next-slot-bounded windows: slot at time t is "covered" by any run
+    # in [t, next_scheduled_slot). This avoids the overlap problem where
+    # two adjacent slots both claim the same run as coverage.
+    EXPECTED_TRADING_SLOTS_UTC = (2, 9, 11, 23)
+    missed_runs: list[dict] = []
+    runs_raw_df = data.get("runs_raw", pd.DataFrame())
+    if not runs_raw_df.empty:
+        all_ends = runs_raw_df.copy()
+        all_ends["event_at"] = pd.to_datetime(all_ends["event_at"], utc=True)
+        trading_ends = all_ends[
+            (all_ends["script_name"] == "high_temp_trading.py")
+            & (all_ends["exit_status"] == "success")
+        ]
+        # Build the past 28h of scheduled slot times, sorted chronologically.
+        slot_times: list[pd.Timestamp] = []
+        for hours_back in range(28, -2, -1):
+            slot_dt = (now_utc - pd.Timedelta(hours=hours_back)).replace(minute=2, second=0, microsecond=0)
+            if slot_dt.hour in EXPECTED_TRADING_SLOTS_UTC and slot_dt <= now_utc:
+                slot_times.append(slot_dt)
+        slot_times.sort()
+        # For each slot, the window is [slot, next_slot). The most recent
+        # slot's window extends to "now" — but we only flag it as missed
+        # once the next scheduled slot has been reached (otherwise we'd
+        # cry wolf on slots whose drift is still in progress).
+        for i, slot in enumerate(slot_times):
+            next_slot = slot_times[i + 1] if i + 1 < len(slot_times) else None
+            if next_slot is None:
+                # The next scheduled slot is in the future — find the next
+                # slot AFTER `now`. Window for the current "last" slot
+                # closes when that next slot starts.
+                future_slot = None
+                for h in range(0, 13):
+                    candidate = (now_utc + pd.Timedelta(hours=h)).replace(minute=2, second=0, microsecond=0)
+                    if candidate.hour in EXPECTED_TRADING_SLOTS_UTC and candidate > now_utc:
+                        future_slot = candidate
+                        break
+                if future_slot is None:
+                    continue  # shouldn't happen
+                window_end = future_slot
+                # Don't flag yet if the window hasn't closed.
+                if window_end > now_utc:
+                    continue
+            else:
+                window_end = next_slot
+            covered = trading_ends[
+                (trading_ends["event_at"] >= slot)
+                & (trading_ends["event_at"] < window_end)
+            ]
+            if len(covered) == 0:
+                missed_runs.append({
+                    "kind": "trading",
+                    "slot_et": _fmt_et(slot, fmt="%m-%d %H:%M"),
+                })
+        ob_ends = all_ends[
+            (all_ends["script_name"] == "kxhigh_orderbook_logger.py")
+            & (all_ends["exit_status"] == "success")
+        ]
+        if not ob_ends.empty:
+            last_ob = ob_ends["event_at"].max()
+            stale_min = (now_utc - last_ob.to_pydatetime()).total_seconds() / 60.0
+            if stale_min > 60:
+                missed_runs.append({
+                    "kind": "orderbook",
+                    "stale_min": stale_min,
+                    "last_seen": _fmt_et(last_ob, fmt="%m-%d %H:%M"),
+                })
+
+    if missed_runs:
+        miss_rows = []
+        for m in missed_runs:
+            if m["kind"] == "trading":
+                miss_rows.append(
+                    f'<div style="font-size:11px;color:var(--red);padding:2px 0">'
+                    f'<span class="dot red"></span>'
+                    f'missed trading slot · scheduled {m["slot_et"]} ET</div>'
+                )
+            else:
+                miss_rows.append(
+                    f'<div style="font-size:11px;color:var(--red);padding:2px 0">'
+                    f'<span class="dot red"></span>'
+                    f'orderbook poll stale · last seen {m["last_seen"]} ET '
+                    f'({m["stale_min"]:.0f}m ago)</div>'
+                )
+        missed_html = (
+            f'<div style="border-top:1px solid var(--line);margin-top:6px;padding-top:6px">'
+            f'<div style="font-size:10px;color:var(--ink-dim);margin-bottom:2px;'
+            f'text-transform:uppercase;letter-spacing:.06em">missed</div>'
+            + "".join(miss_rows) + "</div>"
+        )
+    else:
+        missed_html = ""
+
     # ── recent activity panel ──
     rf_df = data.get("recent_fills", pd.DataFrame())
     if rf_df is None or rf_df.empty:
@@ -1929,7 +2046,9 @@ def render(data: dict) -> str:
           f"<span class='mdl'><i></i>model</span></span></h3>"
           f"{heat_html}<div style='font-size:10px;color:var(--ink-dim);margin-top:6px'>"
           f"Cell = model_p − market_mid · green&nbsp;&gt;&nbsp;0 · red&nbsp;&lt;&nbsp;0</div></div>"
-        + f"<div class='panel'><h3>Run health <span class='count'>{len(runs_df)}</span></h3>{runs_html}</div>"
+        + f"<div class='panel'><h3>Run health <span class='count'>{len(runs_df)}</span>"
+          f"{(' <span style=\"color:var(--red);font-size:10px;margin-left:6px\">' + str(len(missed_runs)) + ' missed</span>') if missed_runs else ''}"
+          f"</h3>{runs_html}{missed_html}</div>"
         + "</aside>"
         + "</main>"
         + modals_html
@@ -2201,6 +2320,43 @@ def _render_modals(
     modal_blocks: list[str] = []
     modal_js_parts: list[str] = []
 
+    # Global helpers for the hourly-trajectory chart's legend hover-to-
+    # highlight behavior. Stash original color/width once on the dataset
+    # so we can restore on leave; on hover, dim every other line to a
+    # faint gray so the focused issue pops. Defined once at the top of
+    # the modal JS block; per-chart options reference window.kxTrajLegendHover
+    # / kxTrajLegendLeave.
+    modal_js_parts.append(
+        "window.kxTrajLegendHover = function(event, legendItem, legend) {"
+        "  var ci = legend.chart;"
+        "  var idx = legendItem.datasetIndex;"
+        "  ci.data.datasets.forEach(function(ds, i) {"
+        "    if (ds._origColor === undefined) {"
+        "      ds._origColor = ds.borderColor;"
+        "      ds._origWidth = ds.borderWidth;"
+        "    }"
+        "    if (i === idx) {"
+        "      ds.borderColor = ds._origColor;"
+        "      ds.borderWidth = (ds._origWidth || 1.5) + 1.5;"
+        "    } else {"
+        "      ds.borderColor = 'rgba(120,120,120,0.10)';"
+        "      ds.borderWidth = 1;"
+        "    }"
+        "  });"
+        "  ci.update('none');"
+        "};"
+        "window.kxTrajLegendLeave = function(event, legendItem, legend) {"
+        "  var ci = legend.chart;"
+        "  ci.data.datasets.forEach(function(ds) {"
+        "    if (ds._origColor !== undefined) {"
+        "      ds.borderColor = ds._origColor;"
+        "      ds.borderWidth = ds._origWidth;"
+        "    }"
+        "  });"
+        "  ci.update('none');"
+        "};"
+    )
+
     for c in cards:
         city = c["city_key"]
         meta = CITIES.get(city, {})
@@ -2328,12 +2484,11 @@ def _render_modals(
                         color = f"rgba(74,163,255,{alpha:.2f})"
                         width = 1.5
                     traj_issues.append({
-                        "label": (
-                            "issued " + _fmt_et(ut, fmt="%m-%d %H:%M")
-                            + (f" (first seen {_fmt_et(first_seen, fmt='%H:%M')})"
-                               if pd.notna(first_seen) and first_seen != ut else "")
-                            + (" · latest" if is_latest else "")
-                        ),
+                        # Compact label — NWS's forecast_update_ts in ET
+                        # (when NWS refreshed this grid's forecast, NOT our
+                        # poll time). Bold green color signals the latest
+                        # issue without needing extra text.
+                        "label": _fmt_et(ut, fmt="%m-%d %H:%M") + " ET",
                         "values": aligned,
                         "color": color,
                         "width": width,
@@ -2342,9 +2497,11 @@ def _render_modals(
                     f'<h4>Hourly forecast trajectory · {c["forecast_date"]} '
                     f'({len(traj_issues)} NWS issues, last 24h)</h4>'
                     f'<div style="font-size:10px;color:var(--ink-dim);margin-bottom:4px">'
-                    f'One line per distinct NWS forecast update '
-                    f'(<code>forecast_update_ts</code>). We poll every ~20 min but NWS '
-                    f'refreshes only ~every 6h, so most polls return identical curves. '
+                    f'One line per distinct NWS forecast update; '
+                    f'<b>legend timestamps are when NWS refreshed the forecast</b> '
+                    f'(<code>forecast_update_ts</code>, ET) — not when we polled. '
+                    f'We poll every ~20 min but NWS refreshes only ~every 6h, so '
+                    f'most polls return identical curves and collapse into one line. '
                     f'Newest issue = bold green; older issues fade. Divergence between '
                     f'the newest line and older ones = a late-breaking forecast revision.</div>'
                     f'<div class="chart-wrap"><canvas id="ch-traj-{city}"></canvas></div>'
@@ -2551,7 +2708,11 @@ def _render_modals(
                 f"charts.push(new Chart(document.getElementById('ch-traj-{city}'), {{"
                 f"type:'line',data:{{labels:{json.dumps(x_labels)},datasets:[{','.join(datasets_js)}]}},"
                 f"options:{{animation:false,responsive:true,maintainAspectRatio:false,"
-                f"plugins:{{legend:{{display:true,labels:{{color:'#93a2c8',font:{{size:10}},boxWidth:10}}}},"
+                f"plugins:{{legend:{{display:true,"
+                f"labels:{{color:'#93a2c8',font:{{size:10}},boxWidth:10}},"
+                # Hover-to-highlight: dim non-hovered datasets, bump the
+                # hovered one's width. Helpers are defined globally below.
+                f"onHover:window.kxTrajLegendHover,onLeave:window.kxTrajLegendLeave}},"
                 f"tooltip:{{mode:'nearest',intersect:false,callbacks:{{title:function(ctx){{return ctx[0].label+' ET';}}}}}}}},"
                 f"scales:{{x:{{ticks:{{color:'#93a2c8',maxTicksLimit:8,font:{{size:9}}}}}},"
                 f"y:{{ticks:{{color:'#93a2c8',font:{{size:9}}}},title:{{display:true,text:'°F',color:'#93a2c8',font:{{size:9}}}}}}}}}}}}));"
