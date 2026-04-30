@@ -628,7 +628,7 @@ SIDE_MULTIPLIERS = {
     "JETE": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
     "COVE": {"yes": 0.0, "no": 0.0},   # [v1.4] block both sides
     "BUNT": {"yes": 2.0, "no": 1.0},   # [v1.4] 2x YES — strong edge
-    "WALK": {"yes": 1.5, "no": 1.5},   # [v1.4] 1.5x both sides
+    "WALK": {"yes": 1.5, "no": 0.0},   # [v1.5] block NO; keep YES at 1.5x
     "BASE": {"yes": 0.0, "no": 1.0},   # [v1.4] block YES
 
 }
