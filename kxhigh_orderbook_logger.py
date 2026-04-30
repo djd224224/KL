@@ -44,7 +44,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.hazmat.primitives import serialization
@@ -240,60 +240,141 @@ def ensure_nws_obs_table(client: bigquery.Client) -> None:
         pass  # already exists
 
 
-def _nws_get_latest_obs(station: str, timeout: int = 8) -> Dict[str, Any]:
-    """Return latest NWS observation for a station ICAO (KNYC, KMIA, …).
+def _nws_get_recent_obs(station: str, since: datetime, timeout: int = 12) -> List[Dict[str, Any]]:
+    """Return NWS observations for a station ICAO since the given UTC datetime.
 
-    Mirrors the pattern in high_temp_trading.py:_nws_get/_get_obs without the
-    full retry harness — we run on a 30-min cron so a single attempt is fine
-    and a transient miss recovers next tick.
+    Calling `/observations?start=…` instead of `/observations/latest` makes
+    each poll self-healing against GitHub-Actions cron flakiness: a single
+    successful poll after a gap backfills every observation in the window.
+    Critical for catching pre-dawn daily highs (e.g. CHI 04-29 peaked at
+    2:18 AM but our previous polling window started at 03 ET — and even
+    that single poll only saw `/observations/latest`, not the 2:18 AM
+    reading itself, so we missed the daily max entirely and the dashboard's
+    "high so far" was 2°F under Kalshi's settlement value).
+
+    Returns a list of obs dicts (newest first). Empty list on error or no
+    data.
     """
     import urllib.request
-    url = f"https://api.weather.gov/stations/{station}/observations/latest"
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    start = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (
+        f"https://api.weather.gov/stations/{station}/observations"
+        f"?start={start}"
+    )
     req = urllib.request.Request(url, headers={"Accept": "application/geo+json",
                                                "User-Agent": "kxhigh-bot (kxhigh@local)"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = json.loads(r.read())
-    props = body.get("properties", {}) or {}
-    temp_c = (props.get("temperature") or {}).get("value")
-    temp_f = (temp_c * 9.0 / 5.0 + 32.0) if temp_c is not None else None
-    return {
-        "observation_time": props.get("timestamp"),  # ISO string
-        "temperature_f": temp_f,
-        "text_description": props.get("textDescription"),
-    }
+    obs_list: List[Dict[str, Any]] = []
+    for feat in body.get("features", []) or []:
+        props = feat.get("properties", {}) or {}
+        temp_c = (props.get("temperature") or {}).get("value")
+        temp_f = (temp_c * 9.0 / 5.0 + 32.0) if temp_c is not None else None
+        obs_list.append({
+            "observation_time": props.get("timestamp"),  # ISO string
+            "temperature_f": temp_f,
+            "text_description": props.get("textDescription"),
+        })
+    return obs_list
 
 
-def poll_and_write_nws_obs(bq_client: bigquery.Client, poll_ts: datetime) -> int:
-    """Poll the NWS station for each city in CITIES and append rows.
+def poll_and_write_nws_obs(bq_client: bigquery.Client, poll_ts: datetime,
+                           max_lookback_hours: int = 8) -> int:
+    """Poll the NWS station for each city in CITIES and append every
+    observation we don't already have.
 
-    Returns the number of rows written. Failures per-city become rows with the
-    `error` column populated so we can inspect coverage gaps later.
+    Two self-healing properties:
+      1. Each tick fetches obs since `max(observation_time) we have for
+         this station` — so a missed cron tick is recovered next tick
+         without burning storage on duplicates.
+      2. Cold start (no rows yet) or BQ lookup failure falls back to
+         pulling the last `max_lookback_hours` of obs.
+
+    Pre-dawn highs (CHI 04-29 peaked at 2:18 AM, only obs every 5 min,
+    `/observations/latest` returned only the most-recent reading) are
+    captured because each cron pulls the full incremental window since
+    the last successful obs, not just the single latest.
+
+    Returns the number of rows written. Failures per-city become a single
+    row with `error` populated so we can inspect coverage gaps later.
     """
     if not _CITIES:
         return 0
     ensure_nws_obs_table(bq_client)
+
+    # Per-station "latest observation_time we already have" so we only
+    # fetch new data. Falls back to (poll_ts − max_lookback_hours) on cold
+    # start or query failure.
+    fallback_since = poll_ts - timedelta(hours=max_lookback_hours)
+    latest_by_station: Dict[str, datetime] = {}
+    try:
+        sql = (
+            f"SELECT station, MAX(observation_time) AS max_t "
+            f"FROM `{NWS_OBS_TABLE}` "
+            f"WHERE observation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), "
+            f"      INTERVAL {max_lookback_hours} HOUR) "
+            f"GROUP BY station"
+        )
+        for row in bq_client.query(sql).result():
+            if row.max_t is not None:
+                latest_by_station[row.station] = row.max_t
+    except Exception as e:
+        print(f"  WARN: latest-obs lookup failed ({type(e).__name__}: {e}); "
+              f"using full {max_lookback_hours}h backfill for every station")
+
     rows: List[Dict[str, Any]] = []
+    n_stations_ok = 0
     for city_abv, meta in _CITIES.items():
         station = meta.get("icao")
         if not station:
             continue
-        row: Dict[str, Any] = {
-            "polled_at": poll_ts,
-            "city_abv": city_abv,
-            "station": station,
-            "observation_time": None,
-            "temperature_f": None,
-            "text_description": None,
-            "error": None,
-        }
+        # Fetch overlap by 30 min to avoid edge-of-window misses if the
+        # NWS API rounds timestamps. Dedup happens downstream via
+        # QUALIFY/MAX in the dashboard SQL, so a few overlapping rows
+        # are harmless.
+        latest = latest_by_station.get(station)
+        if latest is not None:
+            since = max(latest - timedelta(minutes=30), fallback_since)
+        else:
+            since = fallback_since
         try:
-            obs = _nws_get_latest_obs(station)
-            row["observation_time"] = obs["observation_time"]
-            row["temperature_f"] = obs["temperature_f"]
-            row["text_description"] = obs["text_description"]
+            obs_list = _nws_get_recent_obs(station, since=since)
         except Exception as e:
-            row["error"] = str(e)[:200]
-        rows.append(row)
+            # One sentinel row marks the failure so the coverage gap is
+            # visible in BQ; otherwise a silent error would just look like
+            # the station went quiet.
+            rows.append({
+                "polled_at": poll_ts, "city_abv": city_abv, "station": station,
+                "observation_time": None, "temperature_f": None,
+                "text_description": None, "error": str(e)[:200],
+            })
+            time.sleep(0.05)
+            continue
+        if not obs_list:
+            # No new obs since last fetch — common during normal cadence
+            # since stations report every 5-15 min and our cron is 20 min.
+            # Still write a sentinel so the polled_at series stays
+            # contiguous (gap detection downstream).
+            rows.append({
+                "polled_at": poll_ts, "city_abv": city_abv, "station": station,
+                "observation_time": None, "temperature_f": None,
+                "text_description": None, "error": "no_new_obs",
+            })
+            time.sleep(0.05)
+            continue
+        for obs in obs_list:
+            rows.append({
+                "polled_at": poll_ts,
+                "city_abv": city_abv,
+                "station": station,
+                "observation_time": obs["observation_time"],
+                "temperature_f": obs["temperature_f"],
+                "text_description": obs["text_description"],
+                "error": None,
+            })
+        n_stations_ok += 1
         time.sleep(0.05)  # polite pacing — same convention as the orderbook poll
     if not rows:
         return 0
@@ -305,8 +386,9 @@ def poll_and_write_nws_obs(bq_client: bigquery.Client, poll_ts: datetime) -> int
         schema_update_options=["ALLOW_FIELD_ADDITION"],
     )
     bq_client.load_table_from_dataframe(df, NWS_OBS_TABLE, job_config=job_config).result()
-    n_ok = int(df["temperature_f"].notna().sum())
-    print(f"  NWS obs: {n_ok}/{len(df)} stations returned a temperature")
+    n_with_temp = int(df["temperature_f"].notna().sum())
+    print(f"  NWS obs: {n_with_temp} new obs rows from {n_stations_ok}/{len(_CITIES)} "
+          f"stations (incremental since last poll, capped at {max_lookback_hours}h)")
     return len(df)
 
 
