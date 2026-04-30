@@ -1247,9 +1247,20 @@ for market_ticker in combined_table['market_ticker']:
   for i in range(len(order_response['orders'])):
     order_id = order_response['orders'][i]['order_id']
     status = order_response['orders'][i]['status']
+    # Cancel anything that's still open: 'resting' (untouched), 'partial_filled'
+    # / 'partially_filled' (some contracts filled, remainder still in book),
+    # and 'pending' (briefly-queued state). Without partials in this list,
+    # the remaining quantity on a partial-filled order keeps accruing fills
+    # past the position cap.
     order_id = {'order_id':order_id}
-    if order_id is not None and status == 'resting':
-      exchange_client.cancel_order(**order_id)
+    if order_id is not None and status in ('resting', 'partial_filled', 'partially_filled', 'pending'):
+      try:
+        exchange_client.cancel_order(**order_id)
+      except Exception as _ce:
+        # A partial that completes between the get_orders snapshot and the
+        # cancel call returns a 4xx — log and continue. The per-market
+        # resting refresh below catches anything that slipped through.
+        print(f"  cancel failed for {order_id}: {_ce}")
 
 ############## PULL CURRENT POSITIONS
 for market_ticker in combined_table['market_ticker']:
@@ -1430,6 +1441,41 @@ for index, row in combined_table.iterrows():
       row['position'] = _fresh_pos
   except Exception as _pe:
     pass  # fall back to pre-loop snapshot position if refresh fails
+
+  # Refresh resting-order count from Kalshi right before the ladder. The
+  # pre-loop `resting_order_count = 0` reset assumes the cancel sweep
+  # cleared everything from the prior run, but two failure modes survive:
+  #   1. Kalshi's cancel_order is async — between the cancel call and the
+  #      first new ladder placement, fills can land on still-resting orders.
+  #   2. The cancel sweep only catches status=='resting'; partially-filled
+  #      orders (remaining_count > 0 but status='partial_filled') slip
+  #      through and continue accruing fills.
+  # Without this refresh, two closely-spaced runs can stack ladders past
+  # max_contracts. Smoking gun: KXHIGHCHI-26APR30-B53.5 — two evening runs
+  # each placed 425 contracts, cap missed the duplication, ~600 NO filled
+  # against a 500-contract cap.
+  try:
+    _ord_resp = exchange_client.get_orders(ticker=ticker)
+    _orders = _ord_resp.get('orders', []) if isinstance(_ord_resp, dict) else []
+    _live_resting = 0
+    for _o in _orders:
+      _status = _o.get('status', '')
+      if _status not in ('resting', 'partial_filled', 'partially_filled', 'pending'):
+        continue
+      # Remaining contracts on this order. Kalshi exposes `remaining_count`
+      # on some endpoints; fall back to count − filled_count when absent.
+      _rem = _o.get('remaining_count')
+      if _rem is None:
+        try:
+          _rem = max(0, int(_o.get('count', 0)) - int(_o.get('filled_count', 0)))
+        except (TypeError, ValueError):
+          _rem = 0
+      _live_resting += int(_rem)
+    if _live_resting != int(row['resting_order_count']):
+      print(f"    📊 resting refresh {int(row['resting_order_count'])} → {_live_resting}")
+      row['resting_order_count'] = _live_resting
+  except Exception as _re:
+    pass  # fall back to whatever resting_order_count we have if refresh fails
 
   # Filter 0b: city-level pre-trade skip (peak hour or forecast busted)
   if row['City'] in PRE_TRADE_SKIP_CITIES:
