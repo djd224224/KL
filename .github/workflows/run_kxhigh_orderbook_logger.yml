@@ -1,11 +1,12 @@
 name: KXHIGH orderbook logger
 on:
   schedule:
-    # Every 30 min (2 runs/hr at :00 and :30 UTC) — captures price-path
-    # granularity needed for increment-tuning and cancel-time analyses.
-    # 48 polls/day × ~240 markets ≈ 11.5k rows/day. ~36 CI min/day,
-    # comfortably under the 2000-min/month free-tier private-repo budget.
-    - cron: '*/30 * * * *'
+    # Every 20 min (3 runs/hr at :00, :20, :40 UTC) — tighter cadence
+    # cuts dashboard staleness so the bucket-bar tick markers stay close
+    # to the live Kalshi orderbook.
+    # 72 polls/day × ~240 markets ≈ 17.3k rows/day. ~54 CI min/day,
+    # under the 2000-min/month free-tier private-repo budget.
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 jobs:
   log-orderbook:
@@ -21,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests cryptography google-auth google-cloud-bigquery db-dtypes pyarrow pytz
+          pip install pandas numpy requests cryptography google-auth google-cloud-bigquery google-cloud-storage db-dtypes pyarrow pytz
       - name: Write Kalshi private key
         run: |
           echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > kalshi_private_key.pem
@@ -39,6 +40,20 @@ jobs:
           BQ_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
           BQ_DATASET: ${{ secrets.GCP_DATASET_ID }}
         run: python kxhigh_orderbook_logger.py
+      # Re-render the live dashboard right after the orderbook poll so the
+      # HTML reflects the freshest state. Reads only — same SA, same auth.
+      - name: Build live dashboard
+        if: always()
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: gcp_sa_key.json
+        run: python analysis/kxhigh/python/live_dashboard.py
+      - name: Upload dashboard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kxhigh-live-dashboard
+          path: analysis/kxhigh/output/live_dashboard.html
+          retention-days: 7
       - name: Cleanup secrets
         if: always()
         run: |
