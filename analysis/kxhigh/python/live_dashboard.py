@@ -1169,6 +1169,14 @@ def obs_sparklines(nws_obs: pd.DataFrame) -> dict[tuple[str, str], list[dict]]:
     local-day boundaries align with the station's clock — same convention
     Kalshi uses for settlement.
 
+    Obs are downsampled to one point per HOUR (max temp in that hour) so
+    the green line cadence matches the blue forecast line's hourly
+    cadence. Without this, raw 5-min obs (~96 points/day) outweighed
+    forecast hours (~12 points) on the categorical x-axis, eating ~89%
+    of the chart width and squeezing the forecast curve into the right
+    sliver. Hourly-max preserves the day's peak trajectory, which is
+    what matters for tracking "high so far".
+
     Cards with fewer than 2 obs points fall back to the forecast sparkline.
     """
     out: dict[tuple[str, str], list[dict]] = {}
@@ -1187,15 +1195,27 @@ def obs_sparklines(nws_obs: pd.DataFrame) -> dict[tuple[str, str], list[dict]]:
         except Exception:
             tz = None
         if tz is None:
-            local_dates = g["observation_time"].dt.tz_convert("America/New_York").dt.date
+            local_times = g["observation_time"].dt.tz_convert("America/New_York")
         else:
-            local_dates = g["observation_time"].dt.tz_convert(tz).dt.date
-        g = g.assign(local_date=local_dates).sort_values("observation_time")
-        for local_date, sub in g.groupby("local_date"):
+            local_times = g["observation_time"].dt.tz_convert(tz)
+        # `hour_bucket`: floor each obs to its containing hour in local
+        # time. Two obs at 14:05 and 14:55 land in the same 14:00 bucket.
+        g = g.assign(
+            local_date=local_times.dt.date,
+            hour_bucket=local_times.dt.floor("h"),
+        ).sort_values("observation_time")
+        for local_date, day_obs in g.groupby("local_date"):
+            # Pick the hottest reading per hour. For each hour-bucket,
+            # also keep the obs_time and polled_at of THAT max reading
+            # so the tooltip remains accurate ("75°F at 13:25 ET, added
+            # at 13:30 ET").
+            day_obs_clean = day_obs[day_obs["temperature_f"].notna()]
+            if day_obs_clean.empty:
+                continue
+            idx = day_obs_clean.groupby("hour_bucket")["temperature_f"].idxmax()
+            hourly_peaks = day_obs_clean.loc[idx].sort_values("hour_bucket")
             pts = []
-            for _, r in sub.iterrows():
-                if pd.isna(r["temperature_f"]):
-                    continue
+            for _, r in hourly_peaks.iterrows():
                 label = _to_et_label(r["observation_time"])
                 if label is None:
                     continue
