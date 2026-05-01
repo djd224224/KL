@@ -82,11 +82,17 @@ ORDER BY city, forecast_date, run_date
 """
 
 SQL_NWS_OBS_24H = f"""
--- NWS observations from the last 12h. Pairs with the forecast SQL below
--- to give a 24h-centered sparkline (12h obs back, 12h forecast forward).
+-- NWS observations from the last 48h. Pairs with the forecast SQL below
+-- to give a 24h-centered sparkline per (city, local-date). 48h covers:
+--   - Yesterday's full local day (for archive page rendering of 04-29's
+--     card on the 04-30 build that still overwrites yesterday's archive)
+--   - Today's full local day so far (for live cards)
+-- per_city_view groups by (city, local_date_in_city_tz) so each card
+-- shows its own day's data — yesterday's archive doesn't bleed today's
+-- obs into yesterday's sparkline once the rolling window slides.
 SELECT city_abv, station, polled_at, observation_time, temperature_f
 FROM `{PROJECT}.{DATASET}.KXHIGH_nws_obs_log`
-WHERE observation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 12 HOUR)
+WHERE observation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
   AND temperature_f IS NOT NULL
 QUALIFY ROW_NUMBER() OVER (PARTITION BY city_abv, observation_time ORDER BY polled_at DESC) = 1
 ORDER BY city_abv, observation_time
@@ -1145,30 +1151,53 @@ def fcst_sparklines(nws_fcst: pd.DataFrame) -> dict[str, list[dict]]:
     return out
 
 
-def obs_sparklines(nws_obs: pd.DataFrame) -> dict[str, list[dict]]:
-    """Per-city series of (observation_time_ET, temperature_f, polled_at_ET).
+def obs_sparklines(nws_obs: pd.DataFrame) -> dict[tuple[str, str], list[dict]]:
+    """Per-(city_abv, local_date_str) series of (obs_time_ET, temp_f, polled_at_ET).
+
+    Each card on the dashboard renders a sparkline for ITS forecast_date,
+    not "the last 12h rolling". Yesterday's archive shows yesterday's
+    full local day in green; today's live card shows today-so-far. The
+    grouping uses each city's tz (from CITIES[k]["tz"]) so Pacific cards'
+    local-day boundaries align with the station's clock — same convention
+    Kalshi uses for settlement.
 
     Cards with fewer than 2 obs points fall back to the forecast sparkline.
     """
-    out: dict[str, list[dict]] = {}
+    out: dict[tuple[str, str], list[dict]] = {}
     if nws_obs is None or nws_obs.empty:
         return out
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        ZoneInfo = None  # type: ignore
+    nws_obs = nws_obs.copy()
+    nws_obs["observation_time"] = pd.to_datetime(nws_obs["observation_time"], utc=True)
     for city_abv, g in nws_obs.groupby("city_abv"):
-        g_sorted = g.sort_values("observation_time")
-        pts = []
-        for _, r in g_sorted.iterrows():
-            if pd.isna(r["temperature_f"]):
-                continue
-            label = _to_et_label(r["observation_time"])
-            if label is None:
-                continue
-            pts.append({
-                "t": label,
-                "v": float(r["temperature_f"]),
-                "added": _to_et_short(r.get("polled_at")),
-            })
-        if pts:
-            out[city_abv] = pts
+        tz_name = CITIES.get(city_abv, {}).get("tz", "America/New_York")
+        try:
+            tz = ZoneInfo(tz_name) if ZoneInfo else None
+        except Exception:
+            tz = None
+        if tz is None:
+            local_dates = g["observation_time"].dt.tz_convert("America/New_York").dt.date
+        else:
+            local_dates = g["observation_time"].dt.tz_convert(tz).dt.date
+        g = g.assign(local_date=local_dates).sort_values("observation_time")
+        for local_date, sub in g.groupby("local_date"):
+            pts = []
+            for _, r in sub.iterrows():
+                if pd.isna(r["temperature_f"]):
+                    continue
+                label = _to_et_label(r["observation_time"])
+                if label is None:
+                    continue
+                pts.append({
+                    "t": label,
+                    "v": float(r["temperature_f"]),
+                    "added": _to_et_short(r.get("polled_at")),
+                })
+            if pts:
+                out[(city_abv, str(local_date))] = pts
     return out
 
 
@@ -2164,7 +2193,7 @@ def render(data: dict) -> str:
     # back to the forecast-avg-over-runs sparkline so the card isn't blank.
     spark_js_lines = []
     for c in cards:
-        obs = obs_spark.get(c["city_key"], [])
+        obs = obs_spark.get((c["city_key"], c["forecast_date"]), [])
         fcst_h = fcst_spark.get(c["city_key"], [])
         fcst_runs = forecast_spark.get(c["city_name"], [])
 
