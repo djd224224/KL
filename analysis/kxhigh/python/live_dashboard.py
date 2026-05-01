@@ -2178,7 +2178,13 @@ def render(data: dict) -> str:
                 f"{{label:'obs',data:{json.dumps(obs_vals)},"
                 f"polledAt:{json.dumps(obs_added)},"
                 f"borderColor:'#2ecc71',"
-                f"borderWidth:2.5,tension:.25,pointRadius:2.5,fill:false,spanGaps:true}}"
+                # pointRadius was 2.5 — looked clean when each cron tick
+                # wrote one obs (~12 points/chart over 12h). Now that the
+                # poller does a full 8h re-pull at the station's native
+                # 5-min cadence, charts have ~96 points and the dots merge
+                # into a fat line. Hide them by default; reveal on hover.
+                f"borderWidth:2,tension:.25,pointRadius:0,pointHoverRadius:4,"
+                f"pointHitRadius:8,fill:false,spanGaps:true}}"
                 f"]"
             )
         elif len(fcst_runs) >= 2:
