@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 """Weather trading analysis — generates interactive HTML dashboard from Kalshi KXHIGH settlement CSV."""
-import sys, csv, json, math, os
+import sys, csv, json, math, os, re
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+
+_MONTHS = {m: i + 1 for i, m in enumerate(['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'])}
+_TICKER_DATE_RE = re.compile(r'(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})')
+
+def event_date_from_ticker(ticker):
+    m = _TICKER_DATE_RE.search(ticker or '')
+    if not m: return None
+    yy, mon, dd = m.groups()
+    try: return f'20{yy}-{_MONTHS[mon]:02d}-{int(dd):02d}'
+    except (KeyError, ValueError): return None
 
 def load_csv(fp):
     if not fp or fp == 'none' or not os.path.exists(fp): return []
     with open(fp, encoding='utf-8-sig') as f: return list(csv.DictReader(f))
+
+def load_volume_cache(path='kxhigh_volume_cache.json'):
+    if not os.path.exists(path): return {}
+    with open(path) as f: return json.load(f).get('by_city_date', {})
 
 def parse_date(s):
     if not s: return None
@@ -37,7 +51,7 @@ def compute_pnl(row):
     return {'pnl': pay - cost, 'cost': cost, 'yes_c': yc, 'no_c': nc,
             'yes_avg': ya, 'no_avg': na, 'result': res, 'total_c': yc + nc}
 
-def run_analysis(settlement_file, trade_file=None):
+def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_volume_cache.json'):
     raw = load_csv(settlement_file)
     settlements = []
     for row in raw:
@@ -46,8 +60,10 @@ def run_analysis(settlement_file, trade_file=None):
         pnl = compute_pnl(row)
         dt = parse_date(row.get('Original_Date'))
         day = (dt - timedelta(hours=6)).date() if dt else None
+        event_str = event_date_from_ticker(row.get('Market_Ticker',''))
         settlements.append({**tk, **pnl, 'date': dt, 'day': day,
             'day_str': day.isoformat() if day else None,
+            'event_str': event_str,
             'dow': day.weekday() if day else None})
 
     active = [s for s in settlements if s['total_c'] > 0 and s['series'].startswith('KXHIGH')]
@@ -76,6 +92,13 @@ def run_analysis(settlement_file, trade_file=None):
     std_d = math.sqrt(sum((p-avg_d)**2 for p in daily_pnls)/(n_days-1)) if n_days>1 else 0
     ann = math.sqrt(365)
     sharpe = (avg_d/std_d*ann) if std_d>0 else None
+    if n_days>1 and std_d>0:
+        s_d = sharpe/ann
+        se_annual = ann*math.sqrt((1+s_d**2/2)/n_days)
+        sharpe_lo = round(sharpe-1.96*se_annual,2)
+        sharpe_hi = round(sharpe+1.96*se_annual,2)
+    else:
+        sharpe_lo = sharpe_hi = sharpe
     down = [p for p in daily_pnls if p<0]
     ds = math.sqrt(sum(p**2 for p in down)/len(down)) if down else 0
     sortino = (avg_d/ds*ann) if ds>0 else None
@@ -121,7 +144,7 @@ def run_analysis(settlement_file, trade_file=None):
     overview = {
         'total_pnl':round(tp,2),'total_cost':round(tc,2),'roi':round(roi,1),
         'n_settlements':len(active_cities),'n_days':n_days,
-        'sharpe':round(sharpe,2) if sharpe else None,'sortino':round(sortino,2) if sortino else None,
+        'sharpe':round(sharpe,2) if sharpe else None,'sharpe_lo':sharpe_lo,'sharpe_hi':sharpe_hi,'sortino':round(sortino,2) if sortino else None,
         'max_dd':round(mdd,2),
         'daily_wr':round(up_days/n_days*100,1) if n_days else 0,
         'weekly_wr':round(wk_win/len(weekly_vals)*100,1) if weekly_vals else 0,
@@ -138,10 +161,15 @@ def run_analysis(settlement_file, trade_file=None):
     labels = [k for k,_ in daily_sorted]
     city_day_pnl = {c: defaultdict(float) for c in cities}
     city_day_cost = {c: defaultdict(float) for c in cities}
+    city_event_cost = {c: defaultdict(float) for c in cities}
     for s in active_cities:
         if s['day_str'] and s['city'] in cities:
             city_day_pnl[s['city']][s['day_str']] += s['pnl']
             city_day_cost[s['city']][s['day_str']] += s['cost']
+        # Event-date-keyed cost (fallback to settlement day_str when ticker has no date)
+        es = s.get('event_str') or s['day_str']
+        if es and s['city'] in cities:
+            city_event_cost[s['city']][es] += s['cost']
 
     def period_key(day_str, gran):
         d = datetime.fromisoformat(day_str).date()
@@ -187,8 +215,21 @@ def run_analysis(settlement_file, trade_file=None):
                 min_cost={'D':500,'W':1000,'M':2000}[gran]
                 rl.append(round(sp2/sc2*100,1) if sc2>=min_cost else None)
             c_daily[c]=dl; c_cum[c]=cl; c_roi[c]=rl
+        c_cost_list={c:[round(city_cost_p[c].get(k,0),2) for k in plabels] for c in cities}
+        # Event-date-based cost: separate label axis so cost bars line up with the event date
+        # encoded in each ticker (e.g. KXHIGHTHOU-26APR29-B88.5 → 2026-04-29) rather than the
+        # settlement timestamp. Other charts continue using settlement-date `plabels`.
+        city_event_cost_p={c:{} for c in cities}
+        event_keys_set=set()
+        for c in cities:
+            for ds2,cv in city_event_cost[c].items():
+                k=period_key(ds2,gran); city_event_cost_p[c][k]=city_event_cost_p[c].get(k,0)+cv
+                event_keys_set.add(k)
+        event_labels=sorted(event_keys_set)
+        c_event_cost_list={c:[round(city_event_cost_p[c].get(k,0),2) for k in event_labels] for c in cities}
         return {'labels':plabels,'pnl':pnls,'cost':costs,'roi':rois,'cum_total':cum_total,
-                'roi_roll':roi_roll,'cost_roll':cost_roll,'city_pnl':c_daily,'city_cum':c_cum,'city_roi':c_roi}
+                'roi_roll':roi_roll,'cost_roll':cost_roll,'city_pnl':c_daily,'city_cum':c_cum,'city_roi':c_roi,'city_cost':c_cost_list,
+                'cost_labels':event_labels,'city_cost_event':c_event_cost_list}
 
     periods = {g: make_period_data(g) for g in ['D','W','M']}
 
@@ -247,6 +288,27 @@ def run_analysis(settlement_file, trade_file=None):
         'all_win_pct':round(n_aw/n_dd*100,1) if n_dd else 0,
         'majority_lose_pct':round(n_ml/n_dd*100,1) if n_dd else 0}
 
+    # Regional correlation — group cities into U.S. regions, aggregate daily P&L per region, correlate
+    CITY_REGIONS = {
+        'NY':'Northeast','PHIL':'Northeast','TDC':'Northeast','TBOS':'Northeast',
+        'MIA':'Southeast','TATL':'Southeast','TNOLA':'Southeast','TCHAR':'Southeast','TNASH':'Southeast','TTAMPA':'Southeast',
+        'CHI':'Midwest','TMIN':'Midwest',
+        'AUS':'South Central','HOU':'South Central','THOU':'South Central','TDAL':'South Central','TSATX':'South Central','TOKC':'South Central',
+        'DEN':'Mountain','TDEN':'Mountain','TPHX':'Mountain','TLV':'Mountain',
+        'LAX':'West Coast','TSEA':'West Coast','TSFO':'West Coast'}
+    region_of={c:CITY_REGIONS.get(c,'Other') for c in cities}
+    regions=sorted({region_of[c] for c in cities})
+    region_daily={r:{} for r in regions}
+    for c in cities:
+        r=region_of[c]
+        for d,v in city_pivot[c].items():
+            region_daily[r][d]=region_daily[r].get(d,0)+v
+    region_members={r:[c for c in cities if region_of[c]==r] for r in regions}
+    region_corr={r1:{r2:pearson(region_daily[r1],region_daily[r2]) if r1!=r2 else 1.0 for r2 in regions} for r1 in regions}
+    n_rpairs=len(regions)*(len(regions)-1)//2
+    region_corr_stats={'avg_r':round(sum(region_corr[r1][r2] for r1 in regions for r2 in regions if r1<r2)/max(n_rpairs,1),3),
+        'n_regions':len(regions)}
+
     # Day of week
     dow_names=['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
     dow_agg={i:{'pnl':0,'cost':0,'n':0} for i in range(7)}
@@ -300,7 +362,7 @@ def run_analysis(settlement_file, trade_file=None):
             'threshold':s['threshold'],'side':side,'cost':round(s['cost'],2),'pnl':round(s['pnl'],2)})
 
     # ── Trade-based analyses (if trade CSV provided) ──
-    trade_data = {'fill_timing':[],'fill_time_roi':[],'size_buckets':[],'fill_price':[]}
+    trade_data = {'fill_timing':[],'fill_time_roi':[],'size_buckets':[],'fill_price':[],'fill_session':[]}
     if trade_file:
         trade_rows = load_csv(trade_file)
         trades = []
@@ -311,10 +373,14 @@ def run_analysis(settlement_file, trade_file=None):
             if not tk.startswith('KXHIGH'): continue
             dt = parse_date(row.get('Original_Date'))
             if not dt: continue
-            trades.append({'ticker':tk, 'date':dt,
-                'price':int(row.get('Price_In_Cents') or 0),
-                'amount':float(row.get('Amount_In_Dollars') or 0),
-                'hour':dt.hour, 'order_type':row.get('Order_Type',''),
+            price = int(row.get('Price_In_Cents') or 0)
+            amount = float(row.get('Amount_In_Dollars') or 0)
+            # Inferred contracts — Filled column is empty in trade rows; reconstruct
+            # from amount and NO price (amount = contracts * price/100, with rounding).
+            contracts = round(amount * 100 / price) if price > 0 else 0
+            trades.append({'ticker':tk, 'date':dt, 'price':price, 'amount':amount,
+                'contracts':contracts, 'hour':dt.hour,
+                'order_type':row.get('Order_Type',''),
                 'city':tk.split('-')[0].replace('KXHIGH','')})
 
         sett_by_ticker = {s['ticker']:s for s in active_cities}
@@ -330,50 +396,92 @@ def run_analysis(settlement_file, trade_file=None):
             trade_data['fill_timing'].append({'hour':h,'label':f"{h:02d}:00",
                 'n':d['n'],'amount':round(d['amount'],0)})
 
-        # Fill time ROI — match trades to settlements, bucket by ET hour
-        # For Direction=No trades, Price_In_Cents IS the NO price paid per contract.
-        # Win (settles NO):  edge per contract = 100 - NO_price (payout $1 - cost)
-        # Loss (settles YES): edge per contract = -NO_price
-        hour_pnl = defaultdict(lambda:{'n':0,'edge':0,'wins':0,'amount':0})
+        # ── Pro-rate each settlement's true P&L across its fills ──
+        # Each fill gets a share of settlement.pnl proportional to its contract weight.
+        # Sum across all fills equals total settled P&L (for trade-matched markets).
+        # Bucketed by ET fill hour and by night/day session.
+        fills_by_ticker = defaultdict(list)
         for t in trades:
-            s = sett_by_ticker.get(t['ticker'])
-            if not s: continue
-            et_h = (t['hour'] - 4) % 24  # UTC to ET
-            won = s['result'] == 'no'
-            edge = (100 - t['price']) if won else -t['price']
-            hp = hour_pnl[et_h]
-            hp['n']+=1; hp['edge']+=edge; hp['amount']+=t['amount']
-            if won: hp['wins']+=1
-        for h in range(24):
-            hp = hour_pnl.get(h)
-            if not hp or hp['n'] < 5: continue
-            roi = (hp['edge']/100) / hp['amount'] * 100 if hp['amount'] > 0 else 0
-            trade_data['fill_time_roi'].append({'hour':h,'label':f"{h:02d}:00",
-                'n':hp['n'],'wr':round(hp['wins']/hp['n']*100,1),
-                'avg_edge':round(hp['edge']/hp['n'],2),
-                'total_edge':round(hp['edge'],0),'roi':round(roi,1)})
+            fills_by_ticker[t['ticker']].append(t)
 
-        # Fill price vs settlement outcome
-        # Bucket by NO price paid (t['price'] for Direction=No trades).
-        # avg_edge = mean edge across all trades in bucket = realized cents profit per contract.
-        fp_buckets = defaultdict(lambda:{'n':0,'wins':0,'edge':0})
-        for t in trades:
-            s = sett_by_ticker.get(t['ticker'])
+        # Night session: ET hour ∈ [18,23] ∪ [0,5] (evening + overnight runs).
+        # Day session:   ET hour ∈ [6,17] (morning/midday runs).
+        def is_night(et_h): return et_h >= 18 or et_h < 6
+
+        hour_agg = defaultdict(lambda:{'n':0,'pnl':0.0,'cost':0.0,'wins':0,'edge':0,'amount':0.0})
+        fp_agg   = defaultdict(lambda:{'n':0,'pnl':0.0,'cost':0.0,'wins':0,'edge':0})
+        sess_agg = {'night':{'n':0,'pnl':0.0,'cost':0.0,'wins':0,'amount':0.0},
+                    'day':  {'n':0,'pnl':0.0,'cost':0.0,'wins':0,'amount':0.0}}
+
+        for tk, fills in fills_by_ticker.items():
+            s = sett_by_ticker.get(tk)
             if not s: continue
-            no_price = t['price']
-            buc = (no_price//5)*5
+            total_w = sum(f['contracts'] for f in fills)
+            if total_w <= 0: continue
             won = s['result'] == 'no'
-            edge = (100 - t['price']) if won else -t['price']
-            b = fp_buckets[buc]
-            b['n']+=1; b['edge']+=edge
-            if won: b['wins']+=1
-        for buc in sorted(fp_buckets.keys()):
-            b = fp_buckets[buc]
+            for f in fills:
+                share = f['contracts'] / total_w
+                pnl_share = s['pnl'] * share
+                cost_share = s['cost'] * share
+                et_h = (f['hour'] - 4) % 24
+                edge = (100 - f['price']) if won else -f['price']
+
+                ha = hour_agg[et_h]
+                ha['n'] += 1; ha['pnl'] += pnl_share; ha['cost'] += cost_share
+                ha['edge'] += edge * f['contracts']; ha['amount'] += f['amount']
+                if won: ha['wins'] += 1
+
+                buc = (f['price']//5)*5
+                fb = fp_agg[buc]
+                fb['n'] += 1; fb['pnl'] += pnl_share; fb['cost'] += cost_share
+                fb['edge'] += edge * f['contracts']
+                if won: fb['wins'] += 1
+
+                ss = sess_agg['night' if is_night(et_h) else 'day']
+                ss['n'] += 1; ss['pnl'] += pnl_share; ss['cost'] += cost_share
+                ss['amount'] += f['amount']
+                if won: ss['wins'] += 1
+
+        # Total contracts per hour and per price bucket — for avg_edge denominator
+        hr_contracts = defaultdict(int); pr_contracts = defaultdict(int)
+        for f in trades:
+            hr_contracts[(f['hour']-4)%24] += f['contracts']
+            pr_contracts[(f['price']//5)*5] += f['contracts']
+
+        for h in range(24):
+            ha = hour_agg.get(h)
+            if not ha or ha['n'] == 0: continue
+            roi = ha['pnl']/ha['cost']*100 if ha['cost'] > 0 else 0
+            avg_edge = ha['edge']/hr_contracts[h] if hr_contracts[h] else 0
+            trade_data['fill_time_roi'].append({'hour':h,'label':f"{h:02d}:00",
+                'n':ha['n'],'wr':round(ha['wins']/ha['n']*100,1),
+                'avg_edge':round(avg_edge,2),
+                'roi':round(roi,1),
+                'profit':round(ha['pnl'],2),
+                'cost':round(ha['cost'],2)})
+
+        for buc in sorted(fp_agg.keys()):
+            b = fp_agg[buc]
             if b['n'] < 5: continue
+            roi = b['pnl']/b['cost']*100 if b['cost'] > 0 else 0
+            avg_edge = b['edge']/pr_contracts[buc] if pr_contracts[buc] else 0
             trade_data['fill_price'].append({'price':f"{buc}-{buc+4}",
                 'n':b['n'],'wr':round(b['wins']/b['n']*100,1),
-                'avg_edge':round(b['edge']/b['n'],2),
-                'total_edge':round(b['edge'],0)})
+                'avg_edge':round(avg_edge,2),
+                'profit':round(b['pnl'],2),
+                'cost':round(b['cost'],2),
+                'roi':round(roi,1)})
+
+        for label in ('night','day'):
+            ss = sess_agg[label]
+            if ss['n'] == 0: continue
+            roi = ss['pnl']/ss['cost']*100 if ss['cost'] > 0 else 0
+            trade_data['fill_session'].append({'label':label.capitalize(),
+                'n':ss['n'],'wr':round(ss['wins']/ss['n']*100,1),
+                'profit':round(ss['pnl'],2),
+                'cost':round(ss['cost'],2),
+                'roi':round(roi,1),
+                'amount':round(ss['amount'],0)})
 
     # Win rate / ROI by position size (from settlements, no trade CSV needed)
     sz_buckets = defaultdict(lambda:{'n':0,'pnl':0,'cost':0,'wins':0,'contracts':0,'avg_price':0})
@@ -391,11 +499,37 @@ def run_analysis(settlement_file, trade_file=None):
             'wr':round(b['wins']/b['n']*100,1),'avg_price':round(b['avg_price']/b['n'],1),
             'avg_pnl':round(b['pnl']/b['n'],2)})
 
+    # Platform-wide volume cache (from fetch_kxhigh_volume.py)
+    raw_vol = load_volume_cache(volume_cache_path)
+    if raw_vol:
+        def _vol_period_key(date_str, gran):
+            d2 = datetime.fromisoformat(date_str).date()
+            if gran == 'D': return date_str
+            if gran == 'W': return (d2 - timedelta(days=d2.weekday())).strftime('%Y-%m-%d')
+            if gran == 'M': return d2.strftime('%Y-%m')
+            return date_str
+        def _agg_vol(gran):
+            agg = defaultdict(lambda: defaultdict(float))
+            for city, dates in raw_vol.items():
+                if city not in cities: continue
+                for ds, vol in dates.items():
+                    agg[city][_vol_period_key(ds, gran)] += vol
+            lbls = sorted({k for ca in agg.values() for k in ca})
+            return {'labels': lbls, 'by_city': {c: [round(agg[c].get(k, 0)) for k in lbls] for c in cities}}
+        platform_volume = {
+            'D': _agg_vol('D'), 'W': _agg_vol('W'), 'M': _agg_vol('M'),
+            'totals': {c: round(sum(raw_vol.get(c, {}).values())) for c in cities},
+            'grand_total': round(sum(v for cd in raw_vol.values() for v in cd.values())),
+        }
+    else:
+        platform_volume = {}
+
     return {'overview':overview,'periods':periods,'cities':cities,'sharpe_ts':{'labels':sharpe_labels,'data':sharpe_data},
         'dist':{'outlay':{'labels':outlay_l,'data':outlay_d},'up':{'labels':up_l,'data':up_d},'down':{'labels':dn_l,'data':dn_d}},
-        'corr':{'matrix':corr_matrix,'stats':corr_stats},'dow':dow_data,
+        'corr':{'matrix':corr_matrix,'stats':corr_stats},
+        'region_corr':{'matrix':region_corr,'stats':region_corr_stats,'regions':regions,'members':region_members},'dow':dow_data,
         'price_levels':price_level_data,'city_summary':city_summary,'recent':recent_out,
-        'trade':trade_data}
+        'trade':trade_data,'platform_volume':platform_volume}
 
 
 def generate_html(data, out_path):
@@ -440,6 +574,21 @@ def generate_html(data, out_path):
                 tc2='#1D9E75' if r>0.05 else ('#E24B4A' if r<-0.05 else '#94a3b8')
                 corr_rows+=f'<td style="background:{bg};color:{tc2}">{r:+.3f}</td>'
         corr_rows+='</tr>\n'
+
+    # Regional correlation table
+    rc=data['region_corr']; rcm=rc['matrix']; regions=rc['regions']; rmem=rc['members']
+    rcorr_rows='<tr><th></th>'+''.join(f'<th>{r}</th>' for r in regions)+'</tr>\n'
+    for r1 in regions:
+        rcorr_rows+=f'<tr><th>{r1}</th>'
+        for r2 in regions:
+            rv=rcm.get(r1,{}).get(r2,0)
+            if r1==r2: rcorr_rows+='<td style="background:rgba(55,138,221,0.15);color:#378ADD">1.00</td>'
+            else:
+                bg='rgba(29,158,117,0.2)' if rv>0.05 else ('rgba(226,75,74,0.2)' if rv<-0.05 else 'rgba(148,163,184,0.08)')
+                tc='#1D9E75' if rv>0.05 else ('#E24B4A' if rv<-0.05 else '#94a3b8')
+                rcorr_rows+=f'<td style="background:{bg};color:{tc}">{rv:+.3f}</td>'
+        rcorr_rows+='</tr>\n'
+    region_members_rows=''.join(f'<tr><td><strong>{r}</strong></td><td>{", ".join(CN.get(c,c) for c in rmem[r])}</td></tr>\n' for r in regions)
 
     # City summary table
     cs_rows=''
@@ -541,7 +690,7 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
 
         f.write('<div class="nav">')
         for sid,lbl in [('summary','Summary'),('overview','Overview'),('timeseries','Time series'),('distributions','Distributions'),
-                        ('correlation','Correlation'),('sharpe','Rolling Sharpe'),('dow','Day of week'),
+                        ('correlation','Correlation'),('region-correlation','Regional corr'),('sharpe','Rolling Sharpe'),('dow','Day of week'),
                         ('possize','Position size'),('filltime','Fill timing'),('fillprice','Fill price'),
                         ('pricelevels','Price levels'),('citysummary','City summary'),('recent','Recent')]:
             f.write(f'<a onclick="document.getElementById(\'{sid}\').scrollIntoView({{behavior:\'smooth\'}})">{lbl}</a>')
@@ -562,7 +711,7 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
         f.write(f'''<div id="overview"><h2>Overview</h2>
 <div class="cards">
 <div class="card"><div class="l">Net P&L</div><div class="v {'green' if o['total_pnl']>0 else 'red'}">${o['total_pnl']:+,.0f}</div><div class="s">ROI: {o['roi']:+.1f}%</div></div>
-<div class="card"><div class="l">Sharpe</div><div class="v">{sh}</div><div class="s">Sortino: {so}</div></div>
+<div class="card"><div class="l">Sharpe</div><div class="v">{sh}</div><div class="s">95% CI [{o['sharpe_lo']:.2f}, {o['sharpe_hi']:.2f}] · Sortino: {so}</div></div>
 <div class="card"><div class="l">Max DD</div><div class="v red">${o['max_dd']:,.0f}</div></div>
 <div class="card"><div class="l">Avg outlay/day</div><div class="v">${o['avg_daily_cost']:,.0f}</div><div class="s">p25 ${o['outlay_p25']:,.0f} &bull; p50 ${o['outlay_p50']:,.0f} &bull; p75 ${o['outlay_p75']:,.0f}</div></div>
 <div class="card"><div class="l">Avg profit/day</div><div class="v {'green' if o['avg_daily_pnl']>0 else 'red'}">${o['avg_daily_pnl']:+,.2f}</div><div class="s"><span class="green">win ${o['avg_win']:+,.0f}</span> &bull; <span class="red">loss ${o['avg_loss']:+,.0f}</span></div></div>
@@ -600,7 +749,21 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
         for i,c in enumerate(cities):
             f.write(f'<span class="legend-item" data-chart="stack" data-idx="{i}"><span class="dot" style="background:{CC[c]}"></span>{CN[c]}</span>\n')
         f.write('</div>\n<div class="cc tall"><canvas id="stackChart"></canvas></div>\n')
-        f.write('<h3>Capital outlay</h3>\n<div class="cc"><canvas id="costChart"></canvas></div>\n</div>\n')
+        f.write('<h3>Capital outlay by city (event date) <span class="sub muted">— cost basis of positions, dated by the event date encoded in the ticker, stacked by city</span></h3>\n<div class="legend">\n')
+        for i, c in enumerate(cities):
+            f.write(f'<span class="legend-item" data-chart="cost" data-idx="{i}"><span class="dot" style="background:{CC[c]}"></span>{CN[c]}</span>\n')
+        f.write('</div>\n<div class="cc"><canvas id="costChart"></canvas></div>\n')
+        pv = data.get('platform_volume', {})
+        if pv:
+            gt = pv['grand_total']
+            n_days = len(pv.get('D', {}).get('labels', []))
+            f.write(f'<h3>Platform-wide volume by city <span class="sub">— {gt:,.0f} total contracts across {n_days} days (all Kalshi participants)</span></h3>\n<div class="legend">\n')
+            for i, c in enumerate(cities):
+                ctot = pv['totals'].get(c, 0)
+                if ctot > 0:
+                    f.write(f'<span class="legend-item" data-chart="platVol" data-idx="{i}"><span class="dot" style="background:{CC[c]}"></span>{CN[c]} {ctot:,.0f}</span>\n')
+            f.write('</div>\n<div class="cc tall"><canvas id="platVolChart"></canvas></div>\n')
+        f.write('</div>\n')
 
         # Distributions
         f.write('''<div id="distributions"><h2>Distributions</h2>
@@ -618,6 +781,19 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
 <div class="card"><div class="l">&gt;50% lose</div><div class="v muted">{cst['majority_lose_pct']:.1f}%</div></div>
 </div><div style="overflow-x:auto"><table class="corr">{corr_rows}</table></div></div>\n''')
 
+        # Regional correlation
+        rcs=data['region_corr']['stats']
+        f.write(f'''<div id="region-correlation"><h2>Cross-region correlation</h2>
+<p class="sub">Daily P&amp;L within each region is summed across its cities, then correlated across regions. Shows whether whole climatic zones move together.</p>
+<div class="cards">
+<div class="card"><div class="l">Regions</div><div class="v muted">{rcs['n_regions']}</div></div>
+<div class="card"><div class="l">Avg pairwise r</div><div class="v muted">{rcs['avg_r']:+.3f}</div></div>
+</div>
+<div style="overflow-x:auto"><table class="corr">{rcorr_rows}</table></div>
+<h3 style="margin-top:1rem">Region membership</h3>
+<table><thead><tr><th>Region</th><th>Cities</th></tr></thead><tbody>{region_members_rows}</tbody></table>
+</div>\n''')
+
         # Rolling Sharpe
         f.write('<div id="sharpe"><h2>Rolling 30-day Sharpe</h2>\n<div class="cc"><canvas id="sharpeChart"></canvas></div></div>\n')
 
@@ -630,22 +806,28 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
 
         # Position size (always available — from settlements)
         f.write('''<div id="possize"><h2>Position size analysis</h2>
-<p class="sub">Win rate and ROI by number of NO contracts held at settlement. Lower win rate at larger sizes is expected — wins are bigger to compensate.</p>
-<div class="g"><div><h3>ROI by position size</h3><div class="cc"><canvas id="sizeROI"></canvas></div></div>
-<div><h3>Win rate by position size</h3><div class="cc"><canvas id="sizeWR"></canvas></div></div></div></div>\n''')
+<p class="sub">Win rate, ROI, and total profit by number of NO contracts held at settlement. Lower win rate at larger sizes is expected — wins are bigger to compensate.</p>
+<div class="g3"><div><h3>ROI by position size</h3><div class="cc"><canvas id="sizeROI"></canvas></div></div>
+<div><h3>Win rate by position size</h3><div class="cc"><canvas id="sizeWR"></canvas></div></div>
+<div><h3>Profit by position size ($)</h3><div class="cc"><canvas id="sizePnL"></canvas></div></div></div></div>\n''')
 
         if has_trades:
             # Fill timing
             f.write('''<div id="filltime"><h2>Fill time analysis (ET)</h2>
-<p class="sub">When do your NO orders get filled? Evening/overnight fills tend to have better edge than morning fills.</p>
-<div class="g"><div><h3>Fills per hour</h3><div class="cc tall"><canvas id="hourFills"></canvas></div></div>
-<div><h3>Edge per contract by hour (cents)</h3><div class="cc tall"><canvas id="hourEdge"></canvas></div></div></div></div>\n''')
+<p class="sub">When do your NO orders get filled? Profit by hour pro-rates each settlement's realized P&L across its constituent fills, so summing all hours equals total settled P&L.</p>
+<div class="g3"><div><h3>Fills per hour</h3><div class="cc tall"><canvas id="hourFills"></canvas></div></div>
+<div><h3>Edge per contract by hour (cents)</h3><div class="cc tall"><canvas id="hourEdge"></canvas></div></div>
+<div><h3>Profit by fill hour ($)</h3><div class="cc tall"><canvas id="hourProfit"></canvas></div></div></div>
+<div class="g"><div><h3>Profit by session ($)</h3><div class="cc"><canvas id="sessionPnL"></canvas></div></div>
+<div><h3>ROI by session</h3><div class="cc"><canvas id="sessionROI"></canvas></div></div></div>
+<p class="sub">Night session = ET 18:00-05:59 (evening + overnight runs). Day session = ET 06:00-17:59 (morning/midday runs).</p></div>\n''')
 
             # Fill price vs outcome
             f.write('''<div id="fillprice"><h2>Fill price vs settlement outcome</h2>
-<p class="sub">At each NO price level, what's the realized edge per contract? Positive = buying NO below fair value. The critical cutoff is where edge turns negative.</p>
-<div class="g"><div><h3>Edge per contract (cents) by NO fill price</h3><div class="cc"><canvas id="fpEdge"></canvas></div></div>
-<div><h3>Win rate by NO fill price</h3><div class="cc"><canvas id="fpWR"></canvas></div></div></div></div>\n''')
+<p class="sub">At each NO price level, edge per contract = realized cents/contract. Profit = total realized $ pro-rated across this bucket's fills. The critical cutoff is where edge turns negative.</p>
+<div class="g3"><div><h3>Edge per contract (cents) by NO fill price</h3><div class="cc"><canvas id="fpEdge"></canvas></div></div>
+<div><h3>Win rate by NO fill price</h3><div class="cc"><canvas id="fpWR"></canvas></div></div>
+<div><h3>Profit by NO fill price ($)</h3><div class="cc"><canvas id="fpProfit"></canvas></div></div></div></div>\n''')
 
         # Add nav items for new sections
         # (already handled below when we update the nav)
@@ -674,6 +856,7 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
         f.write('var CN='); json.dump(CN, f); f.write(';\n')
         f.write('var CC='); json.dump(CC, f); f.write(';\n')
         f.write('var TD='); json.dump(data['trade'], f); f.write(';\n')
+        f.write('var PV='); json.dump(data.get('platform_volume', {}), f); f.write(';\n')
         f.write(r'''
 var G='rgba(255,255,255,0.06)',TK='#888';
 var CHARTS={},currentGran='D';
@@ -717,12 +900,26 @@ CHARTS.stack=new Chart(document.getElementById('stackChart'),{type:'bar',
   options:{...base,interaction:{mode:'index',intersect:false},plugins:{...base.plugins,tooltip:{mode:'index',intersect:false,callbacks:{label:function(c){var v=Math.round(c.raw);if(v===0)return null;return c.dataset.label+': '+(v>=0?'+':'')+'$'+v.toLocaleString()}}}},
     scales:{x:{stacked:true,grid:{display:false},ticks:{color:TK,font:{size:10},maxTicksLimit:16,maxRotation:45}},y:{stacked:true,grid:{color:G},ticks:{color:TK,font:{size:10},callback:function(v){return '$'+v.toLocaleString()}}}}}});
 
-CHARTS.cost=new Chart(document.getElementById('costChart'),{
-  data:{labels:d.labels,datasets:[
-    {type:'bar',data:d.cost,backgroundColor:bgP(d.pnl,'0.5'),borderWidth:0,barPercentage:1,categoryPercentage:1,order:2,label:'Outlay'},
-    {type:'line',data:d.cost_roll,borderColor:'#378ADD',borderWidth:2,pointRadius:0,pointHoverRadius:4,tension:0.3,fill:false,order:1,label:'Rolling avg'}
-  ]},options:{...base,interaction:{mode:'index',intersect:false},scales:mkScales(function(v){return '$'+v.toLocaleString()}),
-    plugins:{...base.plugins,tooltip:{mode:'index',intersect:false,callbacks:{label:function(c){return c.dataset.label+': $'+Math.round(c.raw).toLocaleString()}}}}}});
+var costDs=CITIES.map(function(c){return {label:CN[c]||c,data:(d.city_cost_event||d.city_cost)[c]||[],backgroundColor:CC[c],borderWidth:0,barPercentage:1,categoryPercentage:1};});
+var costTotalsPlugin={id:'costTotals',afterDatasetsDraw:function(chart){
+  var meta0=chart.getDatasetMeta(0);if(!meta0||!meta0.data||!meta0.data.length)return;
+  var bw=meta0.data[0].width||0;if(bw<18)return;
+  var ds=chart.data.datasets,n=meta0.data.length;
+  var topMeta=chart.getDatasetMeta(ds.length-1);
+  var ctx=chart.ctx;ctx.save();ctx.fillStyle='#ccc';ctx.font='10px sans-serif';ctx.textAlign='center';ctx.textBaseline='bottom';
+  for(var i=0;i<n;i++){var t=0;for(var j=0;j<ds.length;j++){var v=ds[j].data[i];if(typeof v==='number')t+=v;}if(t===0)continue;
+    ctx.fillText('$'+Math.round(t).toLocaleString(),meta0.data[i].x,topMeta.data[i].y-2);}
+  ctx.restore();
+}};
+CHARTS.cost=new Chart(document.getElementById('costChart'),{type:'bar',
+  data:{labels:d.cost_labels||d.labels,datasets:costDs},plugins:[costTotalsPlugin],
+  options:{...base,interaction:{mode:'index',intersect:false},layout:{padding:{top:14}},
+    plugins:{...base.plugins,tooltip:{mode:'index',intersect:false,callbacks:{
+      label:function(c){var v=Math.round(c.raw);if(v===0)return null;return c.dataset.label+': $'+v.toLocaleString();},
+      footer:function(items){var t=items.reduce(function(s,i){return s+i.parsed.y;},0);return 'Total: $'+Math.round(t).toLocaleString();}
+    }}},
+    scales:{x:{stacked:true,grid:{display:false},ticks:{color:TK,font:{size:10},maxTicksLimit:16,maxRotation:45}},y:{stacked:true,grid:{color:G},ticks:{color:TK,font:{size:10},callback:function(v){return '$'+v.toLocaleString()}}}}}});
+
 
 function setGran(g){
   currentGran=g;var d=PERIODS[g];
@@ -733,13 +930,14 @@ function setGran(g){
   CHARTS.pnl.data.labels=d.labels;CHARTS.pnl.data.datasets[0].data=d.pnl;CHARTS.pnl.data.datasets[0].backgroundColor=bgP(d.pnl,'0.6');CHARTS.pnl.data.datasets[0].borderColor=bdP(d.pnl);CHARTS.pnl.update();
   CHARTS.cum.data.labels=d.labels;CITIES.forEach(function(c,i){var a=d.city_cum[c]||[];var fl=a.length?a[a.length-1]:0;CHARTS.cum.data.datasets[i].data=a;CHARTS.cum.data.datasets[i].label=CN[c]+' $'+(fl>=0?'+':'')+Math.round(fl).toLocaleString();});CHARTS.cum.update();
   CHARTS.stack.data.labels=d.labels;CITIES.forEach(function(c,i){CHARTS.stack.data.datasets[i].data=d.city_pnl[c]||[];});CHARTS.stack.update();
-  CHARTS.cost.data.labels=d.labels;CHARTS.cost.data.datasets[0].data=d.cost;CHARTS.cost.data.datasets[0].backgroundColor=bgP(d.pnl,'0.5');CHARTS.cost.data.datasets[1].data=d.cost_roll;CHARTS.cost.update();
+  CHARTS.cost.data.labels=d.cost_labels||d.labels;CITIES.forEach(function(c,i){CHARTS.cost.data.datasets[i].data=(d.city_cost_event||d.city_cost)[c]||[];});CHARTS.cost.update();
+  if(CHARTS.platVol&&PV[g]){CHARTS.platVol.data.labels=PV[g].labels;CITIES.forEach(function(c,i){CHARTS.platVol.data.datasets[i].data=PV[g].by_city[c]||[];});CHARTS.platVol.update();}
   document.querySelectorAll('.gran-btn').forEach(function(b){b.classList.toggle('active',b.dataset.gran===g);});
 }
 document.querySelectorAll('.gran-btn').forEach(function(b){b.addEventListener('click',function(){setGran(b.dataset.gran);});});
 
 function fadeColor(c,a){if(!c||typeof c!=='string')return c;if(c[0]==='#'){var r=parseInt(c.slice(1,3),16),g=parseInt(c.slice(3,5),16),b=parseInt(c.slice(5,7),16);return 'rgba('+r+','+g+','+b+','+a+')';}if(c.indexOf('rgba')===0)return c.replace(/[\d.]+\)$/,a+')');return c;}
-function highlightDataset(cn,ti){var ch=CHARTS[cn];if(!ch)return;ch.data.datasets.forEach(function(ds,i){if(!('_ob' in ds)){ds._ob=ds.borderColor;ds._og=ds.backgroundColor;ds._ow=ds.borderWidth;}if(ti===null){ds.borderColor=ds._ob;ds.backgroundColor=ds._og;ds.borderWidth=ds._ow;}else if(i===ti){ds.borderColor=ds._ob;ds.backgroundColor=ds._og;ds.borderWidth=(ds._ow||2)+1.5;}else{ds.borderColor=fadeColor(ds._ob,0.12);if(typeof ds._og==='string')ds.backgroundColor=fadeColor(ds._og,0.12);ds.borderWidth=1;}});ch.update('none');}
+function highlightDataset(cn,ti){var ch=CHARTS[cn];if(!ch)return;ch.data.datasets.forEach(function(ds,i){if(!ds._origColors){ds._origColors={bg:ds.backgroundColor,bc:ds.borderColor,bw:ds.borderWidth};}var o=ds._origColors;if(ti===null){ds.backgroundColor=o.bg;ds.borderColor=o.bc;ds.borderWidth=o.bw;}else if(i===ti){ds.backgroundColor=o.bg;ds.borderColor=o.bc;ds.borderWidth=o.bw;}else{ds.backgroundColor=fadeColor(o.bg,0.12);ds.borderColor=fadeColor(o.bc,0.12);ds.borderWidth=o.bw;}});ch.update();}
 document.querySelectorAll('.legend-item').forEach(function(el){el.addEventListener('mouseenter',function(){highlightDataset(el.dataset.chart,parseInt(el.dataset.idx));});el.addEventListener('mouseleave',function(){highlightDataset(el.dataset.chart,null);});});
 
 function mkHist(id,d,color){new Chart(document.getElementById(id),{type:'bar',data:{labels:d.labels,datasets:[{data:d.data,backgroundColor:color+'99',borderColor:color,borderWidth:1,borderRadius:2,barPercentage:1,categoryPercentage:.92}]},options:{...base,scales:mkScales(function(v){return v})}});}
@@ -749,6 +947,9 @@ new Chart(document.getElementById('sharpeChart'),{type:'line',data:{labels:SHARP
 
 var dowL=DOW.map(function(d){return d.day}),dowP=DOW.map(function(d){return d.pnl});
 new Chart(document.getElementById('dowChart'),{type:'bar',data:{labels:dowL,datasets:[{data:dowP,backgroundColor:bgP(dowP,'0.6'),borderRadius:4}]},options:{...base,scales:mkScales(function(v){return (v>=0?'':'-')+'$'+Math.abs(v).toLocaleString()}),plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=DOW[c.dataIndex];return ['$'+Math.round(d.pnl).toLocaleString(),'ROI: '+d.roi+'%','WR: '+d.wr+'%','n='+d.n]}}}}}});
+
+function fmtDollars(v){return (v>=0?'':'-')+'$'+Math.abs(v).toLocaleString()}
+function fmtSigned(v){return (v>=0?'+':'-')+'$'+Math.abs(v).toLocaleString()}
 
 // Position size
 if(TD.size_buckets&&TD.size_buckets.length){
@@ -763,6 +964,11 @@ if(TD.size_buckets&&TD.size_buckets.length){
       backgroundColor:'#378ADD99',borderColor:'#378ADD',borderWidth:1,borderRadius:3}]},
     options:{...base,scales:mkScales(function(v){return v+'%'}),
       plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=sz[c.dataIndex];return ['WR: '+d.wr+'%','Avg P&L/settle: $'+d.avg_pnl,'n='+d.n]}}}}}});
+  new Chart(document.getElementById('sizePnL'),{type:'bar',
+    data:{labels:sz.map(function(d){return d.size}),datasets:[{data:sz.map(function(d){return d.pnl}),
+      backgroundColor:bgP(sz.map(function(d){return d.pnl}),'0.6'),borderColor:bdP(sz.map(function(d){return d.pnl})),borderWidth:1,borderRadius:3}]},
+    options:{...base,scales:mkScales(fmtDollars),
+      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=sz[c.dataIndex];return [fmtSigned(d.pnl),'ROI: '+d.roi+'%','WR: '+d.wr+'%','n='+d.n]}}}}}});
 }
 
 // Fill timing
@@ -780,7 +986,30 @@ if(TD.fill_time_roi&&TD.fill_time_roi.length){
       backgroundColor:bgP(ftr.map(function(d){return d.avg_edge}),'0.6'),
       borderColor:bdP(ftr.map(function(d){return d.avg_edge})),borderWidth:1,borderRadius:3}]},
     options:{...base,scales:mkScales(function(v){return v.toFixed(1)+'c'}),
-      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ftr[c.dataIndex];return [d.avg_edge.toFixed(1)+'c/contract','WR: '+d.wr+'%','ROI: '+d.roi+'%','Total: '+d.total_edge+'c','n='+d.n]}}}}}});
+      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ftr[c.dataIndex];return [d.avg_edge.toFixed(1)+'c/contract','WR: '+d.wr+'%','ROI: '+d.roi+'%','n='+d.n]}}}}}});
+  new Chart(document.getElementById('hourProfit'),{type:'bar',
+    data:{labels:ftr.map(function(d){return d.label}),datasets:[{data:ftr.map(function(d){return d.profit}),
+      backgroundColor:bgP(ftr.map(function(d){return d.profit}),'0.6'),
+      borderColor:bdP(ftr.map(function(d){return d.profit})),borderWidth:1,borderRadius:3}]},
+    options:{...base,scales:mkScales(fmtDollars),
+      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ftr[c.dataIndex];return [fmtSigned(d.profit),'WR: '+d.wr+'%','ROI: '+d.roi+'%','Cost: $'+d.cost.toLocaleString(),'n='+d.n]}}}}}});
+}
+
+// Night vs day session
+if(TD.fill_session&&TD.fill_session.length){
+  var ses=TD.fill_session;
+  new Chart(document.getElementById('sessionPnL'),{type:'bar',
+    data:{labels:ses.map(function(d){return d.label}),datasets:[{data:ses.map(function(d){return d.profit}),
+      backgroundColor:bgP(ses.map(function(d){return d.profit}),'0.6'),
+      borderColor:bdP(ses.map(function(d){return d.profit})),borderWidth:1,borderRadius:3}]},
+    options:{...base,scales:mkScales(fmtDollars),
+      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ses[c.dataIndex];return [fmtSigned(d.profit),'WR: '+d.wr+'%','ROI: '+d.roi+'%','Cost: $'+d.cost.toLocaleString(),'n='+d.n+' fills']}}}}}});
+  new Chart(document.getElementById('sessionROI'),{type:'bar',
+    data:{labels:ses.map(function(d){return d.label}),datasets:[{data:ses.map(function(d){return d.roi}),
+      backgroundColor:bgP(ses.map(function(d){return d.roi}),'0.6'),
+      borderColor:bdP(ses.map(function(d){return d.roi})),borderWidth:1,borderRadius:3}]},
+    options:{...base,scales:mkScales(function(v){return v+'%'}),
+      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ses[c.dataIndex];return [d.roi+'% ROI','WR: '+d.wr+'%','Profit: '+fmtSigned(d.profit),'n='+d.n+' fills']}}}}}});
 }
 
 // Fill price vs outcome
@@ -791,12 +1020,31 @@ if(TD.fill_price&&TD.fill_price.length){
       backgroundColor:bgP(fp.map(function(d){return d.avg_edge}),'0.6'),
       borderColor:bdP(fp.map(function(d){return d.avg_edge})),borderWidth:1,borderRadius:3}]},
     options:{...base,scales:mkScales(function(v){return v.toFixed(1)+'c'}),
-      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=fp[c.dataIndex];return [d.avg_edge.toFixed(1)+'c edge/contract','Total: '+d.total_edge+'c','WR: '+d.wr+'%','n='+d.n]}}}}}});
+      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=fp[c.dataIndex];return [d.avg_edge.toFixed(1)+'c edge/contract','ROI: '+d.roi+'%','WR: '+d.wr+'%','n='+d.n]}}}}}});
   new Chart(document.getElementById('fpWR'),{type:'bar',
     data:{labels:fp.map(function(d){return d.price+'c'}),datasets:[{data:fp.map(function(d){return d.wr}),
       backgroundColor:'#378ADD99',borderColor:'#378ADD',borderWidth:1,borderRadius:3}]},
     options:{...base,scales:mkScales(function(v){return v+'%'}),
       plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=fp[c.dataIndex];return ['WR: '+d.wr+'%','n='+d.n]}}}}}});
+  new Chart(document.getElementById('fpProfit'),{type:'bar',
+    data:{labels:fp.map(function(d){return d.price+'c'}),datasets:[{data:fp.map(function(d){return d.profit}),
+      backgroundColor:bgP(fp.map(function(d){return d.profit}),'0.6'),
+      borderColor:bdP(fp.map(function(d){return d.profit})),borderWidth:1,borderRadius:3}]},
+    options:{...base,scales:mkScales(fmtDollars),
+      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=fp[c.dataIndex];return [fmtSigned(d.profit),'ROI: '+d.roi+'%','WR: '+d.wr+'%','Cost: $'+d.cost.toLocaleString(),'n='+d.n]}}}}}});
+}
+
+if(document.getElementById('platVolChart') && PV && PV.D && PV.D.labels.length){
+  var pvDs=CITIES.map(function(c){return {label:CN[c]||c,data:PV.D.by_city[c]||[],backgroundColor:CC[c],borderWidth:0,barPercentage:1,categoryPercentage:1};});
+  CHARTS.platVol=new Chart(document.getElementById('platVolChart'),{type:'bar',
+    data:{labels:PV.D.labels,datasets:pvDs},
+    options:{...base,interaction:{mode:'index',intersect:false},
+      plugins:{...base.plugins,tooltip:{mode:'index',intersect:false,callbacks:{
+        label:function(c){var v=Math.round(c.raw);if(v===0)return null;return c.dataset.label+': '+(v>=1000?(v/1000).toFixed(1)+'K':v)+' contracts';},
+        footer:function(items){var t=items.reduce(function(s,i){return s+i.parsed.y;},0);return 'Total: '+(t>=1000?(t/1000).toFixed(0)+'K':t)+' contracts';}
+      }}},
+      scales:{x:{stacked:true,grid:{display:false},ticks:{color:TK,font:{size:10},maxTicksLimit:16,maxRotation:45}},
+              y:{stacked:true,grid:{color:G},ticks:{color:TK,font:{size:10},callback:function(v){return v>=1000?(v/1000).toFixed(0)+'K':v;}}}}}});
 }
 
 CITIES.forEach(function(city){
