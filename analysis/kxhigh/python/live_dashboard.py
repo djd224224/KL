@@ -17,7 +17,7 @@ import sys
 import json
 import re
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault(
     "CLOUDSDK_PYTHON",
@@ -389,6 +389,26 @@ GROUP BY event_date
 ORDER BY event_date DESC
 """
 
+SQL_SETTLED_PNL_PER_MARKET = f"""
+-- Per-market realized P&L for markets that settled in the last 2 ET
+-- days. Drives the per_city_view fallback for closed markets: once
+-- Kalshi processes settlement, the position drops out of
+-- KXHIGH_positions_log, so the dashboard's `realized_pnl_dollars` for
+-- those buckets goes null. settlements_clean.pnl_dollars is the
+-- canonical realized value; we merge it in as a fallback so yesterday's
+-- archive shows accurate P&L instead of $0.
+SELECT
+  market_ticker,
+  pnl_dollars                  AS settled_pnl_dollars,
+  total_cost_dollars           AS settled_cost_dollars,
+  fee_cost_dollars             AS settled_fees_dollars,
+  total_payout_dollars         AS settled_payout_dollars,
+  result                       AS settled_result,
+  net_position                 AS settled_net_position
+FROM `{PROJECT}.{DATASET}.KXHIGH_settlements_clean`
+WHERE event_date >= DATE_SUB(CURRENT_DATE("America/New_York"), INTERVAL 2 DAY)
+"""
+
 SQL_TODAY_ORDERS = f"""
 SELECT
   COALESCE(ab_arm, 'none') AS ab_arm,
@@ -520,6 +540,11 @@ def load() -> dict:
     except Exception:
         out["daily_pnl"] = pd.DataFrame()
     try:
+        out["settled_pnl"] = _q(SQL_SETTLED_PNL_PER_MARKET)
+    except Exception as e:
+        print(f"  KXHIGH_settlements_clean (per-market) unavailable ({type(e).__name__}); skipping settled-P&L fallback")
+        out["settled_pnl"] = pd.DataFrame()
+    try:
         out["forecast_peak"] = _q(SQL_FORECAST_PEAK)
     except Exception:
         out["forecast_peak"] = pd.DataFrame()
@@ -623,6 +648,7 @@ def per_city_view(
     market_arm: pd.DataFrame | None = None,
     orders_detail: pd.DataFrame | None = None,
     cli: pd.DataFrame | None = None,
+    settled_pnl: pd.DataFrame | None = None,
 ) -> list[dict]:
     """Collapse per-market rows into per-(city, forecast_date) cards.
 
@@ -660,6 +686,25 @@ def per_city_view(
         for col in ("market_exposure_dollars", "realized_pnl_dollars",
                     "total_traded_dollars", "fees_paid_dollars",
                     "resting_orders_count"):
+            snap[col] = None
+
+    # Settlements fallback: once Kalshi processes settlement (~hours after
+    # market close), the position drops out of /portfolio and so the
+    # `realized_pnl_dollars` field in positions_log goes null. The
+    # canonical realized P&L lives in settlements_clean. Merge it in so
+    # yesterday's archive (rendered the day after) reflects realized P&L
+    # for closed markets instead of $0.
+    if settled_pnl is not None and not settled_pnl.empty:
+        sp = settled_pnl[[
+            "market_ticker", "settled_pnl_dollars", "settled_cost_dollars",
+            "settled_fees_dollars", "settled_payout_dollars", "settled_result",
+            "settled_net_position",
+        ]].copy()
+        snap = snap.merge(sp, on="market_ticker", how="left")
+    else:
+        for col in ("settled_pnl_dollars", "settled_cost_dollars",
+                    "settled_fees_dollars", "settled_payout_dollars",
+                    "settled_result", "settled_net_position"):
             snap[col] = None
 
     # Both tables carry no_highest_bid / no_lowest_offer / yes_*; rename the
@@ -783,6 +828,36 @@ def per_city_view(
         buckets = []
         for _, r in grp_sorted.iterrows():
             pos_val = r.get("position")
+            # Realized P&L source priority:
+            #   1. positions_log.realized_pnl_dollars (live, while still in
+            #      portfolio — usually $0 because positions clear at close)
+            #   2. settlements_clean.pnl_dollars (canonical post-settlement
+            #      value — covers closed markets that have been settled)
+            # Same for cost_basis: prefer live exposure for open positions,
+            # fall back to settlement's total_cost for closed ones so the
+            # archive page shows real cost+P&L on yesterday's settled markets.
+            live_realized = r.get("realized_pnl_dollars")
+            settled_pnl_val = r.get("settled_pnl_dollars")
+            realized_pnl = (
+                float(live_realized) if pd.notna(live_realized) and float(live_realized) != 0
+                else float(settled_pnl_val) if pd.notna(settled_pnl_val)
+                else None
+            )
+            live_exposure = r.get("market_exposure_dollars")
+            settled_cost = r.get("settled_cost_dollars")
+            exposure_dollars = (
+                float(live_exposure) if pd.notna(live_exposure)
+                else float(settled_cost) if pd.notna(settled_cost)
+                else None
+            )
+            live_fees = r.get("fees_paid_dollars")
+            settled_fees = r.get("settled_fees_dollars")
+            fees_paid_dollars = (
+                float(live_fees) if pd.notna(live_fees)
+                else float(settled_fees) if pd.notna(settled_fees)
+                else None
+            )
+            settled_result_val = r.get("settled_result")
             buckets.append({
                 "label": r["bucket_label"],
                 "ticker": r["market_ticker"],
@@ -792,13 +867,16 @@ def per_city_view(
                 "yes_bid": int(r["ob_yes_bid"]) if pd.notna(r.get("ob_yes_bid")) else None,
                 "yes_offer": int(r["ob_yes_offer"]) if pd.notna(r.get("ob_yes_offer")) else None,
                 "position": int(pos_val) if pd.notna(pos_val) else 0,
-                "exposure_dollars": float(r["market_exposure_dollars"]) if pd.notna(r.get("market_exposure_dollars")) else None,
-                "realized_pnl": float(r["realized_pnl_dollars"]) if pd.notna(r.get("realized_pnl_dollars")) else None,
+                "exposure_dollars": exposure_dollars,
+                "realized_pnl": realized_pnl,
                 "total_traded_dollars": float(r["total_traded_dollars"]) if pd.notna(r.get("total_traded_dollars")) else None,
-                "fees_paid_dollars": float(r["fees_paid_dollars"]) if pd.notna(r.get("fees_paid_dollars")) else None,
+                "fees_paid_dollars": fees_paid_dollars,
                 "resting_orders": int(r["resting_orders_count"]) if pd.notna(r.get("resting_orders_count")) else 0,
                 "arm": arm_by_ticker.get(r["market_ticker"]),
                 "open_no_bid": open_bid_by_ticker.get(r["market_ticker"]),
+                # `settled_result` ('YES'/'NO') is set once Kalshi settles —
+                # downstream renderers can show a "settled" tag in archive views.
+                "settled_result": str(settled_result_val) if pd.notna(settled_result_val) else None,
             })
 
         # best |edge| with two-sided market (otherwise meaningless)
@@ -806,7 +884,12 @@ def per_city_view(
         best_edge = max(cardable, key=lambda b: abs(b["edge"]), default=None)
 
         head = grp_sorted.iloc[0]
-        positions = [b for b in buckets if b["position"]]
+        # `positions` drives cost/P&L/per-arm aggregations. Include both:
+        #   - buckets with a LIVE position (open inventory in Kalshi portfolio)
+        #   - buckets that have SETTLED (closed positions, no longer in
+        #     portfolio but their cost+P&L should still tally toward the
+        #     day's totals on yesterday's archive view).
+        positions = [b for b in buckets if b["position"] or b.get("settled_result")]
 
         # Mark-to-market current value per bucket.
         #
@@ -1490,6 +1573,7 @@ def render(data: dict) -> str:
         data.get("market_arm"),
         data.get("orders_detail"),
         cli=data.get("cli"),
+        settled_pnl=data.get("settled_pnl"),
     )
     forecast_spark = forecast_sparklines(data["forecast_history"])
     obs_spark = obs_sparklines(data.get("nws_obs", pd.DataFrame()))
@@ -2848,13 +2932,24 @@ PUBLISH_DEFAULT = os.environ.get("KXHIGH_DASHBOARD_PUBLISH", "1") not in ("0", "
 
 
 def _publish_to_gcs(html: str) -> str | None:
-    """Upload the rendered HTML to the public GCS bucket — both as the
-    live `index.html` and as `archive/{ET_date}.html` (overwritten through
-    the day → final write at end-of-ET-day is the historical record).
+    """Upload the rendered HTML to the public GCS bucket — as the live
+    `index.html` AND as TWO archive copies: today's and yesterday's.
 
-    The archive copy gets a longer cache (5 min during the day, "frozen"
-    after the date rolls), and the dashboard's history modal lists existing
-    archive objects so the user can scrub back to past days.
+    Why both archive dates: settlements + final CLI for ET-day D land
+    several hours AFTER the date rolls to D+1 (Kalshi processes ~7-8 AM
+    ET, sometimes later). If we only overwrite archive/{today}.html, the
+    archive file for D freezes at midnight ET — *before* the day's
+    realized P&L exists. By also overwriting archive/{yesterday}.html on
+    every publish, yesterday's archive keeps refreshing for ~24h after
+    rollover; settlement lands, the next publish picks it up, the archive
+    becomes accurate. Once "yesterday" becomes 2-days-ago it naturally
+    stops being touched and freezes for good.
+
+    The dashboard's queries already span [yesterday, today, tomorrow], so
+    yesterday's cards still render correctly the day after — paired with
+    the per_city_view fallback to settlements_clean for realized P&L on
+    settled markets, this delivers an accurate post-settlement archive
+    without re-rendering with date-scoped queries.
     """
     if not PUBLISH_DEFAULT:
         return None
@@ -2865,9 +2960,13 @@ def _publish_to_gcs(html: str) -> str | None:
         return None
     try:
         from zoneinfo import ZoneInfo
-        et_today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        et_today = now_et.strftime("%Y-%m-%d")
+        et_yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
     except Exception:
-        et_today = datetime.utcnow().strftime("%Y-%m-%d")
+        now_et = datetime.utcnow()
+        et_today = now_et.strftime("%Y-%m-%d")
+        et_yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
     try:
         client = storage.Client(project=PROJECT)
         bucket = client.bucket(PUBLIC_BUCKET)
@@ -2875,14 +2974,15 @@ def _publish_to_gcs(html: str) -> str | None:
         blob_live = bucket.blob(PUBLIC_OBJECT)
         blob_live.cache_control = "public,max-age=60"
         blob_live.upload_from_string(html, content_type="text/html; charset=utf-8")
-        # Archive copy: 5 min cache while still being written to today, but
-        # since the file gets overwritten through the day we need it short
-        # too — old days won't change so browsers cache them naturally.
-        blob_arch = bucket.blob(f"archive/{et_today}.html")
-        blob_arch.cache_control = "public,max-age=300"
-        blob_arch.upload_from_string(html, content_type="text/html; charset=utf-8")
+        # Archive copies: short cache so post-settlement updates land in
+        # browsers quickly. Once yesterday becomes 2-days-ago, no more
+        # writes happen and the file freezes for good.
+        for et_date in (et_today, et_yesterday):
+            blob_arch = bucket.blob(f"archive/{et_date}.html")
+            blob_arch.cache_control = "public,max-age=300"
+            blob_arch.upload_from_string(html, content_type="text/html; charset=utf-8")
         url = f"https://storage.googleapis.com/{PUBLIC_BUCKET}/{PUBLIC_OBJECT}"
-        print(f"  published -> {url} (+ archive/{et_today}.html)", flush=True)
+        print(f"  published -> {url} (+ archive/{et_today}.html, archive/{et_yesterday}.html)", flush=True)
         return url
     except Exception as e:
         print(f"  publish failed (non-fatal): {e}", flush=True)
