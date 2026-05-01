@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python fetch_settlements_csv.py *)",
+      "Bash(python fetch_trades_csv.py *)",
+      "Bash(python day_summary.py *)",
+      "Bash(python analyze_kalshi_dashboard.py *)",
+      "Bash(python analyze_weather_dashboard.py *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(cmd.exe /c start *)",
+      "Bash(start *)",
+      "Bash(bq query --use_legacy_sql=false *)",
+      "Bash(bq show *)",
+      "Bash(bq ls *)",
+      "mcp__scheduled-tasks__list_scheduled_tasks"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "git status --porcelain 2>/dev/null | grep -v '^??' | python -c \"import sys,json; f=[l[3:].rstrip() for l in sys.stdin if l.strip()]; print(json.dumps({'systemMessage':'⚠ Uncommitted changes from prior session: ' + ' '.join(f[:10]) + (f' (+{len(f)-10} more)' if len(f)>10 else '')})) if f else None\""
+          }
+        ]
+      }
+    ]
+  }
+}
