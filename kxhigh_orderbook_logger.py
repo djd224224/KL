@@ -283,19 +283,17 @@ def _nws_get_recent_obs(station: str, since: datetime, timeout: int = 12) -> Lis
 def poll_and_write_nws_obs(bq_client: bigquery.Client, poll_ts: datetime,
                            max_lookback_hours: int = 8) -> int:
     """Poll the NWS station for each city in CITIES and append every
-    observation we don't already have.
+    observation in the last `max_lookback_hours`.
 
-    Two self-healing properties:
-      1. Each tick fetches obs since `max(observation_time) we have for
-         this station` — so a missed cron tick is recovered next tick
-         without burning storage on duplicates.
-      2. Cold start (no rows yet) or BQ lookup failure falls back to
-         pulling the last `max_lookback_hours` of obs.
-
-    Pre-dawn highs (CHI 04-29 peaked at 2:18 AM, only obs every 5 min,
-    `/observations/latest` returned only the most-recent reading) are
-    captured because each cron pulls the full incremental window since
-    the last successful obs, not just the single latest.
+    Always re-fetches the full lookback window — earlier versions tried to
+    optimize by fetching only since `latest observation_time we have`, but
+    that meant any obs OLDER than our latest_seen never got recovered. If
+    a previous run captured only sparse data (stale code, cron misfire,
+    transient API hiccup), the gap was permanent. Now every successful
+    tick re-pulls the full window, so any gap in the last 8h auto-heals
+    on the next tick. Storage cost is small relative to value: downstream
+    queries already dedupe via QUALIFY/MAX, so duplicate rows are
+    harmless and total volume scales linearly with cron frequency.
 
     Returns the number of rows written. Failures per-city become a single
     row with `error` populated so we can inspect coverage gaps later.
@@ -304,25 +302,9 @@ def poll_and_write_nws_obs(bq_client: bigquery.Client, poll_ts: datetime,
         return 0
     ensure_nws_obs_table(bq_client)
 
-    # Per-station "latest observation_time we already have" so we only
-    # fetch new data. Falls back to (poll_ts − max_lookback_hours) on cold
-    # start or query failure.
-    fallback_since = poll_ts - timedelta(hours=max_lookback_hours)
-    latest_by_station: Dict[str, datetime] = {}
-    try:
-        sql = (
-            f"SELECT station, MAX(observation_time) AS max_t "
-            f"FROM `{NWS_OBS_TABLE}` "
-            f"WHERE observation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), "
-            f"      INTERVAL {max_lookback_hours} HOUR) "
-            f"GROUP BY station"
-        )
-        for row in bq_client.query(sql).result():
-            if row.max_t is not None:
-                latest_by_station[row.station] = row.max_t
-    except Exception as e:
-        print(f"  WARN: latest-obs lookup failed ({type(e).__name__}: {e}); "
-              f"using full {max_lookback_hours}h backfill for every station")
+    # Always pull the full lookback window. Don't try to be clever about
+    # "since latest seen" — that approach can't recover older gaps.
+    since = poll_ts - timedelta(hours=max_lookback_hours)
 
     rows: List[Dict[str, Any]] = []
     n_stations_ok = 0
@@ -330,15 +312,6 @@ def poll_and_write_nws_obs(bq_client: bigquery.Client, poll_ts: datetime,
         station = meta.get("icao")
         if not station:
             continue
-        # Fetch overlap by 30 min to avoid edge-of-window misses if the
-        # NWS API rounds timestamps. Dedup happens downstream via
-        # QUALIFY/MAX in the dashboard SQL, so a few overlapping rows
-        # are harmless.
-        latest = latest_by_station.get(station)
-        if latest is not None:
-            since = max(latest - timedelta(minutes=30), fallback_since)
-        else:
-            since = fallback_since
         try:
             obs_list = _nws_get_recent_obs(station, since=since)
         except Exception as e:
@@ -387,8 +360,8 @@ def poll_and_write_nws_obs(bq_client: bigquery.Client, poll_ts: datetime,
     )
     bq_client.load_table_from_dataframe(df, NWS_OBS_TABLE, job_config=job_config).result()
     n_with_temp = int(df["temperature_f"].notna().sum())
-    print(f"  NWS obs: {n_with_temp} new obs rows from {n_stations_ok}/{len(_CITIES)} "
-          f"stations (incremental since last poll, capped at {max_lookback_hours}h)")
+    print(f"  NWS obs: {n_with_temp} obs rows from {n_stations_ok}/{len(_CITIES)} "
+          f"stations (full {max_lookback_hours}h re-pull each tick — dedupe downstream)")
     return len(df)
 
 
