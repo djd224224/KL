@@ -275,18 +275,26 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
     cdp=defaultdict(lambda:defaultdict(float))
     for s in active_cities:
         if s['day_str']: cdp[s['day_str']][s['city']]+=s['pnl']
-    n_al=n_aw=n_ml=n_dd=0
+    n_al=n_aw=n_ml=n_mw=n_sw=n_es=n_dd=0
     for d2,cp in cdp.items():
         if len(cp)<2: continue
         n_dd+=1; lo=sum(1 for v in cp.values() if v<0); wi=sum(1 for v in cp.values() if v>0)
         if lo==len(cp): n_al+=1
         if wi==len(cp): n_aw+=1
-        if lo>len(cp)/2: n_ml+=1
+        in_ml = lo>len(cp)/2
+        in_mw = wi>len(cp)/2
+        if in_ml: n_ml+=1
+        if in_mw: n_mw+=1
+        if wi>len(cp)*0.75: n_sw+=1
+        if not in_ml and not in_mw: n_es+=1
     n_pairs = len(cities)*(len(cities)-1)//2
     corr_stats={'avg_r':round(sum(corr_matrix[c1][c2] for c1 in cities for c2 in cities if c1<c2)/max(n_pairs,1),3),
         'all_lose_pct':round(n_al/n_dd*100,1) if n_dd else 0,
         'all_win_pct':round(n_aw/n_dd*100,1) if n_dd else 0,
-        'majority_lose_pct':round(n_ml/n_dd*100,1) if n_dd else 0}
+        'majority_lose_pct':round(n_ml/n_dd*100,1) if n_dd else 0,
+        'majority_win_pct':round(n_mw/n_dd*100,1) if n_dd else 0,
+        'supermajority_win_pct':round(n_sw/n_dd*100,1) if n_dd else 0,
+        'even_split_pct':round(n_es/n_dd*100,1) if n_dd else 0}
 
     # Regional correlation — group cities into U.S. regions, aggregate daily P&L per region, correlate
     CITY_REGIONS = {
@@ -486,14 +494,14 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
     # Win rate / ROI by position size (from settlements, no trade CSV needed)
     sz_buckets = defaultdict(lambda:{'n':0,'pnl':0,'cost':0,'wins':0,'contracts':0,'avg_price':0})
     for s in [x for x in active_cities if x['no_c']>0]:
-        buc = min((s['no_c']//100)*100, 900)
+        buc = (s['no_c']//100)*100
         b = sz_buckets[buc]
         b['n']+=1; b['pnl']+=s['pnl']; b['cost']+=s['cost']; b['contracts']+=s['no_c']
         b['avg_price']+=s['no_avg']*100
         if s['pnl']>0: b['wins']+=1
     for buc in sorted(sz_buckets.keys()):
         b = sz_buckets[buc]
-        if b['n'] < 5: continue
+        if b['n'] < 1: continue
         trade_data['size_buckets'].append({'size':f"{buc}-{buc+99}",'n':b['n'],
             'pnl':round(b['pnl'],0),'roi':round(b['pnl']/b['cost']*100,1) if b['cost']>0 else 0,
             'wr':round(b['wins']/b['n']*100,1),'avg_price':round(b['avg_price']/b['n'],1),
@@ -779,6 +787,9 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
 <div class="card"><div class="l">All cities lose</div><div class="v green">{cst['all_lose_pct']:.1f}%</div><div class="s">of trading days</div></div>
 <div class="card"><div class="l">All cities win</div><div class="v blue">{cst['all_win_pct']:.1f}%</div><div class="s">of trading days</div></div>
 <div class="card"><div class="l">&gt;50% lose</div><div class="v muted">{cst['majority_lose_pct']:.1f}%</div></div>
+<div class="card"><div class="l">&gt;50% win</div><div class="v muted">{cst['majority_win_pct']:.1f}%</div></div>
+<div class="card"><div class="l">&gt;75% win</div><div class="v muted">{cst['supermajority_win_pct']:.1f}%</div></div>
+<div class="card"><div class="l">Even split</div><div class="v muted">{cst['even_split_pct']:.1f}%</div><div class="s">tied win/lose count</div></div>
 </div><div style="overflow-x:auto"><table class="corr">{corr_rows}</table></div></div>\n''')
 
         # Regional correlation
