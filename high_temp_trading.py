@@ -1362,8 +1362,14 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
 # env var AB_TEST_ENABLED=true.
 # ====================================================================
 AB_TEST_NAME = "hi_no_tied_to_fair_no_v2"   # v2: per-market sticky (was per-market-run)
-AB_TEST_ENABLED = os.environ.get("AB_TEST_ENABLED", "false").lower() == "true"
-AB_SAFETY_MARGIN_CENTS = int(os.environ.get("AB_SAFETY_MARGIN_CENTS", "5"))
+# Defaults match the production workflow's env block. They were previously
+# the OLD ("false"/"5") values, which meant a manual local invocation of
+# this script with no env block silently disabled the test and tagged
+# every order as `control` — see the 2026-04-30 12:42 UTC contamination
+# that broke sticky assignment on 16 markets. Aligning defaults with the
+# workflow makes a missing env block keep the test running, not opt out.
+AB_TEST_ENABLED = os.environ.get("AB_TEST_ENABLED", "true").lower() == "true"
+AB_SAFETY_MARGIN_CENTS = int(os.environ.get("AB_SAFETY_MARGIN_CENTS", "3"))
 AB_TREATMENT_PROPORTION = float(os.environ.get("AB_TREATMENT_PROPORTION", "0.5"))
 
 def _ab_assign_arm(market_ticker):
