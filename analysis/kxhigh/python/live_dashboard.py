@@ -887,6 +887,14 @@ def per_city_view(
             buckets.append({
                 "label": r["bucket_label"],
                 "ticker": r["market_ticker"],
+                # Plumb actual numeric range (not label-parsed) so the
+                # impossible-bucket alert and any future bucket-geometry
+                # logic compares against Kalshi's true settlement
+                # boundaries. Stored as `lo=N-1.5, hi=N+0.5` for B-markets
+                # and `lo=0, hi=N.5` for T-markets — labels round these
+                # to integers for display, which loses 0.5°F of precision.
+                "low_range": float(r["low_range"]) if pd.notna(r.get("low_range")) else None,
+                "high_range": float(r["high_range"]) if pd.notna(r.get("high_range")) else None,
                 "model_p": float(r["model_yes_p"]) if pd.notna(r["model_yes_p"]) else None,
                 "market_p": float(r["market_yes_p"]) if pd.notna(r["market_yes_p"]) else None,
                 "edge": float(r["edge"]) if pd.notna(r["edge"]) else None,
@@ -1245,16 +1253,18 @@ def compute_alerts(cards: list[dict], forecast_history: pd.DataFrame) -> list[di
         snap_when = _fmt_et(c.get("run_date"), fmt="%I:%M%p ET").lstrip("0")
 
         # ── (0) impossible buckets still priced ──────────────────────
-        # Daily highs only go up. Any bucket whose entire range is below the
-        # current peak is mathematically dead (0% YES probability) — but
-        # illiquid Kalshi bucket markets sometimes don't reprice fast. Flag
-        # them so the user can spot stale orderbooks (and the NO trade).
+        # Daily highs only go up. A bucket is mathematically dead (0% YES)
+        # only when the current peak EXCEEDS its actual `high_range`
+        # (Kalshi's settlement upper bound — typically N.5°F for B-markets
+        # like "53-54" → high_range=54.5; T-markets "≤64" → high_range=64.5).
+        # Earlier this was parsing the integer from the LABEL (54, 64),
+        # which fired false alarms when the peak rounded to that integer
+        # but was still below the real .5 cutoff (e.g., AUS ≤64 with peak
+        # 64.04 isn't dead — it pays YES if final high ≤ 64.5).
         peak = c.get("peak_temp")
         if peak is not None:
             for b in c["buckets"]:
-                # Recover the upper bound of the bucket from its label so we
-                # don't have to plumb low/high_range through the bucket dict.
-                hi = _bucket_upper_bound(b["label"])
+                hi = b.get("high_range")
                 if hi is None or hi >= peak:
                     continue
                 m_yes = b.get("market_p")
@@ -1265,7 +1275,8 @@ def compute_alerts(cards: list[dict], forecast_history: pd.DataFrame) -> list[di
                     "city": city,
                     "when": ob_when,
                     "what": (f"<b>{city}</b> {b['label']} priced YES {m_yes*100:.0f}% "
-                             f"but high already {peak:.0f}° — bucket is dead, market is stale"),
+                             f"but high already {peak:.1f}° — bucket is dead "
+                             f"(closes ≤{hi:.1f}°), market is stale"),
                     "rank": 100 + m_yes * 100,  # always near top
                 })
 
