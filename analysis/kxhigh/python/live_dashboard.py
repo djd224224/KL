@@ -145,19 +145,17 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY market_ticker ORDER BY created_at DESC) 
 """
 
 SQL_TODAY_PEAK_OBS = f"""
--- Today's peak observation per city, computed from the live obs log. Beats
--- the snapshot's peak_temp_f because that field only updates when the
--- trading bot runs (~2x/day) — by mid-afternoon it's stale by hours.
--- Today is defined in UTC (we don't try to resolve per-city local time —
--- the orderbook logger polls every 30 min so within ~30 min of local
--- midnight we'll see today's obs anyway).
-SELECT city_abv,
-       MAX(temperature_f) AS peak_today_f,
-       MAX(observation_time) AS latest_obs_time
+-- Raw obs from the last 48h, used by per_city_view to compute peak per
+-- (city, local_date). We fetch the raw rows (not a SQL aggregate) because
+-- Kalshi settles each market on the local 24h window of that station's
+-- timezone — Pacific cities' local-day spans roughly the back half of one
+-- ET day plus the front quarter of the next, so any single ET-aligned
+-- aggregate misattributes obs across forecast_dates. Python groups by
+-- city's tz (from cities.py) into a (city_abv, local_date) → peak map.
+SELECT city_abv, observation_time, temperature_f
 FROM `{PROJECT}.{DATASET}.KXHIGH_nws_obs_log`
-WHERE DATE(observation_time, "America/New_York") = CURRENT_DATE("America/New_York")
+WHERE observation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
   AND temperature_f IS NOT NULL
-GROUP BY city_abv
 """
 
 SQL_CLI_RECENT = f"""
@@ -786,16 +784,38 @@ def per_city_view(
             if pd.notna(r.get("ab_arm")):
                 arm_by_ticker[r["market_ticker"]] = r["ab_arm"]
 
-    # Peak today per city — recomputed from the live obs log so it stays
-    # fresh between trading-bot runs. We index by city_key (not city_abv) so
-    # the lookup is direct against `CITIES` keys.
-    peak_by_city: dict[str, dict] = {}
+    # Peak per (city, LOCAL date). Kalshi settles each market on the
+    # local 24h window of the station — e.g., LAX's "April 30" market
+    # covers 00:00-23:59 PT April 30 (which spans 03:00 UTC April 30
+    # → 03:00 UTC May 1). Aggregating obs by ET-day misattributes 3-7h
+    # of every Pacific/Mountain city's data to the wrong forecast_date.
+    # We group raw obs by each city's local tz (from CITIES[k]["tz"])
+    # and key the result by (city_abv, local_date_str) so the per-card
+    # lookup matches the card's forecast_date directly.
+    peak_by_city: dict[tuple[str, str], dict] = {}
     if peak_obs is not None and not peak_obs.empty:
-        for _, r in peak_obs.iterrows():
-            peak_by_city[r["city_abv"]] = {
-                "peak": float(r["peak_today_f"]) if pd.notna(r["peak_today_f"]) else None,
-                "latest_obs_time": str(r["latest_obs_time"]) if pd.notna(r["latest_obs_time"]) else None,
-            }
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            ZoneInfo = None  # type: ignore
+        po = peak_obs.copy()
+        po["observation_time"] = pd.to_datetime(po["observation_time"], utc=True)
+        for city_abv, grp in po.groupby("city_abv"):
+            tz_name = CITIES.get(city_abv, {}).get("tz", "America/New_York")
+            try:
+                tz = ZoneInfo(tz_name) if ZoneInfo else None
+            except Exception:
+                tz = None
+            if tz is None:
+                # Fallback: use ET (legacy behavior). Better than crashing.
+                local_dates = grp["observation_time"].dt.tz_convert("America/New_York").dt.date
+            else:
+                local_dates = grp["observation_time"].dt.tz_convert(tz).dt.date
+            for local_date, sub in grp.groupby(local_dates):
+                peak_by_city[(city_abv, str(local_date))] = {
+                    "peak": float(sub["temperature_f"].max()),
+                    "latest_obs_time": str(sub["observation_time"].max()),
+                }
 
     # CLI override: once the WFO publishes the daily climate report, that's
     # the value Kalshi settles on. Beats peak_obs because CLI uses 1-min
@@ -943,8 +963,10 @@ def per_city_view(
         # source) → live obs max → snapshot peak_temp_f. CLI beats live obs
         # by ~1°F when a brief intra-METAR-cycle peak is in the daily-high
         # 1-min sensor record but not in the 5-min /observations stream.
+        # Both lookups are keyed by (city, forecast_date) so they match
+        # the card's local-day exactly — see peak_by_city build above.
         _cli_entry = cli_by_city.get((city_key, str(forecast_date)))
-        _live_entry = peak_by_city.get(city_key, {})
+        _live_entry = peak_by_city.get((city_key, str(forecast_date)), {})
         _snap_peak = float(head["peak_temp_f"]) if pd.notna(head.get("peak_temp_f")) else None
         if _cli_entry is not None:
             _peak_resolution = {
