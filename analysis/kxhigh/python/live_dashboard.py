@@ -160,6 +160,23 @@ WHERE DATE(observation_time, "America/New_York") = CURRENT_DATE("America/New_Yor
 GROUP BY city_abv
 """
 
+SQL_CLI_RECENT = f"""
+-- Latest CLI reading per (city, event_date) for today + yesterday (ET).
+-- The CLI ("CLImate") is the WFO's official daily summary that Kalshi
+-- settles on. Once published (typically late afternoon / early evening)
+-- it's the authoritative daily-high source — beats the 5-min METAR max
+-- by ~1°F because CLI uses 1-min sensor data + SPECIs that don't appear
+-- in /observations. We override the dashboard's "high so far" with this
+-- value once the CLI looks final (see _cli_is_preliminary).
+SELECT city_abv, event_date, high_temp_f, low_temp_f, high_time, fetched_at
+FROM `{PROJECT}.{DATASET}.KXHIGH_cli_readings`
+WHERE event_date >= DATE_SUB(CURRENT_DATE("America/New_York"), INTERVAL 1 DAY)
+  AND event_date <= CURRENT_DATE("America/New_York")
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY city_abv, event_date ORDER BY fetched_at DESC
+) = 1
+"""
+
 SQL_LATEST_POSITIONS = f"""
 -- Take ONLY the most recent poll batch — Kalshi's /portfolio/positions
 -- returns the current open inventory in one call, so all rows from a
@@ -486,6 +503,11 @@ def load() -> dict:
     except Exception:
         out["peak_obs"] = pd.DataFrame()
     try:
+        out["cli"] = _q(SQL_CLI_RECENT)
+    except Exception as e:
+        print(f"  KXHIGH_cli_readings unavailable ({type(e).__name__}); skipping CLI override")
+        out["cli"] = pd.DataFrame()
+    try:
         out["market_arm"] = _q(SQL_MARKET_ARM)
     except Exception:
         out["market_arm"] = pd.DataFrame()
@@ -533,6 +555,46 @@ def _city_key_for_ticker(t: str) -> str | None:
     return None
 
 
+def _cli_is_preliminary(high_time_str: object, high_f: object, low_f: object) -> bool:
+    """Detect a stale-partial CLI report.
+
+    Some WFOs issue a CLI overnight before the day's actual high happens.
+    Such reports show a "high" time in the early-morning hours and a tiny
+    diurnal range (because no daytime data is in yet). Treating them as
+    final causes the dashboard to display e.g. "high 49°" when the day's
+    real peak will be 70+ in the afternoon. The heuristic combines two
+    signals — pre-dawn high_time AND tiny diurnal range — because either
+    alone is fine on its own (frontal-passage days legitimately have
+    pre-dawn highs with normal diurnal range, and small ranges happen on
+    overcast days that don't warm up).
+    """
+    try:
+        h = float(high_f) if high_f is not None and not pd.isna(high_f) else None
+        l = float(low_f) if low_f is not None and not pd.isna(low_f) else None
+    except (TypeError, ValueError):
+        return False
+    if h is None or l is None:
+        return False  # missing data — defer to upstream defaults, treat as final
+    if (h - l) >= 5:
+        return False  # normal/large diurnal range — looks like a complete day
+    # Range is small (<5°F). Now check the high_time.
+    if not isinstance(high_time_str, str):
+        return False
+    s = high_time_str.strip().upper()
+    if not (s.endswith(" AM") or s.endswith(" PM")):
+        return False
+    is_am = s.endswith(" AM")
+    digits = s[:-3].strip()
+    if not digits.isdigit() or len(digits) < 3 or len(digits) > 4:
+        return False
+    try:
+        hour = int(digits[:-2])  # strip last 2 chars (minutes)
+    except ValueError:
+        return False
+    # Pre-dawn = AM hours <= 5 (i.e., 12:00 AM through 5:59 AM).
+    return is_am and hour <= 5
+
+
 def _bucket_label(low: float | None, high: float | None) -> str:
     """Mirror the trading-bot bucket convention.
 
@@ -560,6 +622,7 @@ def per_city_view(
     peak_obs: pd.DataFrame | None = None,
     market_arm: pd.DataFrame | None = None,
     orders_detail: pd.DataFrame | None = None,
+    cli: pd.DataFrame | None = None,
 ) -> list[dict]:
     """Collapse per-market rows into per-(city, forecast_date) cards.
 
@@ -689,6 +752,27 @@ def per_city_view(
                 "latest_obs_time": str(r["latest_obs_time"]) if pd.notna(r["latest_obs_time"]) else None,
             }
 
+    # CLI override: once the WFO publishes the daily climate report, that's
+    # the value Kalshi settles on. Beats peak_obs because CLI uses 1-min
+    # sensor data + SPECIs (typically ~1°F higher than the 5-min METAR max
+    # we get from /observations). Keyed by (city_abv, event_date_str) so
+    # both today's and yesterday's cards can pick up their own CLI rows
+    # if both are still on the dashboard. Skips preliminary reports per
+    # the heuristic in `_cli_is_preliminary`.
+    cli_by_city: dict[tuple[str, str], dict] = {}
+    if cli is not None and not cli.empty:
+        for _, r in cli.iterrows():
+            if _cli_is_preliminary(r.get("high_time"), r.get("high_temp_f"), r.get("low_temp_f")):
+                continue
+            high_f = r.get("high_temp_f")
+            if high_f is None or pd.isna(high_f):
+                continue
+            cli_by_city[(r["city_abv"], str(r["event_date"]))] = {
+                "high": float(high_f),
+                "high_time": r.get("high_time") if pd.notna(r.get("high_time")) else None,
+                "fetched_at": str(r["fetched_at"]) if pd.notna(r.get("fetched_at")) else None,
+            }
+
     cards = []
     for (city_key, forecast_date), grp in snap.groupby(["city_key", "forecast_date"]):
         if city_key is None or city_key not in CITIES:
@@ -772,6 +856,38 @@ def per_city_view(
             slot["now"] += b.get("current_value") or 0
             slot["n"] += 1
 
+        # Resolve "high so far" with priority: CLI (Kalshi's settlement
+        # source) → live obs max → snapshot peak_temp_f. CLI beats live obs
+        # by ~1°F when a brief intra-METAR-cycle peak is in the daily-high
+        # 1-min sensor record but not in the 5-min /observations stream.
+        _cli_entry = cli_by_city.get((city_key, str(forecast_date)))
+        _live_entry = peak_by_city.get(city_key, {})
+        _snap_peak = float(head["peak_temp_f"]) if pd.notna(head.get("peak_temp_f")) else None
+        if _cli_entry is not None:
+            _peak_resolution = {
+                "temp": _cli_entry["high"],
+                "source": "cli",
+                "label": _cli_entry.get("high_time"),  # e.g. "1052 AM"
+                "latest_obs_time": _cli_entry.get("fetched_at"),
+            }
+        elif _live_entry.get("peak") is not None:
+            _peak_resolution = {
+                "temp": _live_entry["peak"],
+                "source": "live",
+                "label": None,
+                "latest_obs_time": _live_entry.get("latest_obs_time"),
+            }
+        elif _snap_peak is not None:
+            _peak_resolution = {
+                "temp": _snap_peak, "source": "snapshot",
+                "label": None, "latest_obs_time": None,
+            }
+        else:
+            _peak_resolution = {
+                "temp": None, "source": None,
+                "label": None, "latest_obs_time": None,
+            }
+
         cards.append({
             "city_key": city_key,
             "city_name": meta["city"],
@@ -784,13 +900,10 @@ def per_city_view(
             "wu": float(head["weather_underground"]) if pd.notna(head["weather_underground"]) else None,
             "nws_short": head.get("nws_short_conditions") if pd.notna(head.get("nws_short_conditions")) else None,
             "observed_temp": float(head["observed_temp_f"]) if pd.notna(head.get("observed_temp_f")) else None,
-            "peak_temp": (
-                peak_by_city.get(city_key, {}).get("peak")
-                if peak_by_city.get(city_key, {}).get("peak") is not None
-                else (float(head["peak_temp_f"]) if pd.notna(head.get("peak_temp_f")) else None)
-            ),
-            "peak_temp_source": "live" if peak_by_city.get(city_key, {}).get("peak") is not None else "snapshot",
-            "latest_obs_time": peak_by_city.get(city_key, {}).get("latest_obs_time"),
+            "peak_temp": _peak_resolution["temp"],
+            "peak_temp_source": _peak_resolution["source"],
+            "peak_temp_label": _peak_resolution["label"],
+            "latest_obs_time": _peak_resolution["latest_obs_time"],
             "buckets": buckets,
             "best_edge": best_edge,
             "positions": positions,
@@ -1376,6 +1489,7 @@ def render(data: dict) -> str:
         data.get("positions"), data.get("peak_obs"),
         data.get("market_arm"),
         data.get("orders_detail"),
+        cli=data.get("cli"),
     )
     forecast_spark = forecast_sparklines(data["forecast_history"])
     obs_spark = obs_sparklines(data.get("nws_obs", pd.DataFrame()))
