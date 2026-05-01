@@ -1230,7 +1230,8 @@ def obs_sparklines(nws_obs: pd.DataFrame) -> dict[tuple[str, str], list[dict]]:
 
 
 # ───────────────────────── alert signals ────────────────────────────
-def compute_alerts(cards: list[dict], forecast_history: pd.DataFrame) -> list[dict]:
+def compute_alerts(cards: list[dict], forecast_history: pd.DataFrame,
+                   forecast_peak: pd.DataFrame | None = None) -> list[dict]:
     """Derive bucket-distance + source-agreement alerts from the latest snapshot.
 
     Three alert flavors:
@@ -1250,6 +1251,18 @@ def compute_alerts(cards: list[dict], forecast_history: pd.DataFrame) -> list[di
     Returns a list of dicts {severity, when, city, what} sorted newest-first.
     """
     alerts: list[dict] = []
+    # Per-city lookup for the NWS hourly-grid peak temperature today,
+    # used by alert (5) to flag NWS daily-vs-hourly disagreement. Source:
+    # SQL_FORECAST_PEAK aggregates max temp from KXHIGH_nws_hourly_forecast.
+    hourly_peak_by_city: dict[str, float] = {}
+    if forecast_peak is not None and not forecast_peak.empty:
+        for _, r in forecast_peak.iterrows():
+            try:
+                if pd.notna(r.get("peak_temp")):
+                    hourly_peak_by_city[r["city_abv"]] = float(r["peak_temp"])
+            except (TypeError, ValueError):
+                pass
+
     # Build city → (forecast_date → ordered runs) of (run_date, argmax_label).
     # Argmax label requires snapshot rows but we have it via cards' buckets for
     # the *latest* run. For the prior-run comparison we approximate using the
@@ -1420,6 +1433,32 @@ def compute_alerts(cards: list[dict], forecast_history: pd.DataFrame) -> list[di
                 # dead alerts (which use rank=100+).
                 "rank": 50 + abs(edge_pp),
             })
+
+        # ── (5) NWS daily-vs-hourly grid disagreement ────────────────
+        # NWS publishes two forecasts: the human-curated daily ("today's
+        # high near X°") via /forecast, and the auto-derived hourly grid
+        # via /forecast/hourly. They don't auto-reconcile — forecasters
+        # often update the daily without redoing the hourly grid. Gaps
+        # ≥1.5°F suggest the WFO doesn't have a clean view of the day,
+        # or one product is stale.
+        nws_daily = c.get("nws")
+        nws_hourly_peak = hourly_peak_by_city.get(city)
+        if nws_daily is not None and nws_hourly_peak is not None:
+            gap = abs(nws_daily - nws_hourly_peak)
+            if gap >= 1.5:
+                direction = "↓" if nws_hourly_peak < nws_daily else "↑"
+                alerts.append({
+                    "severity": "amber",
+                    "city": city,
+                    "when": snap_when,
+                    "what": (f"<b>{city}</b> NWS daily forecast {nws_daily:.0f}° "
+                             f"vs hourly grid peak {nws_hourly_peak:.0f}° "
+                             f"(Δ {direction}{gap:.1f}°) — forecaster intuition "
+                             f"and gridded model disagree"),
+                    # Rank below disagreement alerts (50+) but above
+                    # garden-variety source-disagreement alerts (~2-3).
+                    "rank": 30 + gap,
+                })
 
     alerts.sort(key=lambda a: -a["rank"])
     return alerts[:8]
@@ -2251,7 +2290,8 @@ def render(data: dict) -> str:
         )
 
     # ── alerts panel ──
-    alerts = compute_alerts(cards, data.get("forecast_history", pd.DataFrame()))
+    alerts = compute_alerts(cards, data.get("forecast_history", pd.DataFrame()),
+                            forecast_peak=data.get("forecast_peak", pd.DataFrame()))
     if not alerts:
         alerts_html = '<div class="muted" style="font-size:11px">no alerts</div>'
     else:
@@ -2722,7 +2762,12 @@ def _render_modals(
             f'<div><div class="k">Last snapshot (ET)</div><div class="v" style="font-size:12px">{_fmt_et(c["run_date"])}</div></div>'
             f'<div><div class="k">Last orderbook (ET)</div><div class="v" style="font-size:12px">{_fmt_et(c["polled_at"])}</div></div>'
             f'<div><div class="k">Forecast μ ± σ</div><div class="v">{(f"{c['forecast_avg']:.1f}° ±{c['forecast_std'] or 0:.1f}" if c["forecast_avg"] is not None else "—")}</div></div>'
-            f'<div><div class="k">Forecast peak (ET)</div><div class="v" style="font-size:13px">{peak_str}</div></div>'
+            # Two distinct NWS products — daily forecast (curated by WFO,
+            # shown as "NWS X" in card header + folded into forecast_avg)
+            # vs the hourly grid peak (auto-derived from NDFD model). Label
+            # explicitly so a 2°F divergence between them doesn't look
+            # like a bug. See alert (5) which flags large gaps.
+            f'<div><div class="k">NWS hourly grid peak (ET)</div><div class="v" style="font-size:13px">{peak_str}</div></div>'
             f'<div><div class="k">High so far</div><div class="v">{(f"{c['peak_temp']:.0f}°" if c["peak_temp"] is not None else (f"{c['observed_temp']:.0f}°" if c["observed_temp"] is not None else "—"))}</div></div>'
             f'<div><div class="k">Cost · now</div><div class="v">${c["cost_basis"]:,.0f} · ${c["exposure"]:,.0f}</div></div>'
             f'<div><div class="k">Positions</div><div class="v">{n_pos}</div></div>'
