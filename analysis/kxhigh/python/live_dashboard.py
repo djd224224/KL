@@ -1346,6 +1346,61 @@ def compute_alerts(cards: list[dict], forecast_history: pd.DataFrame) -> list[di
                         "rank": abs(f_avg - float(prev)),
                     })
 
+        # ── (4) model vs market YES disagreement ─────────────────────
+        # Card bars are model_p (blue) vs market_p (purple). When they
+        # diverge by ≥20pp, that's either a trading opportunity or a
+        # signal one of the two is wrong. Skip buckets already flagged
+        # as "dead" by alert (0) — those are guaranteed disagreements
+        # but the (0) alert already explains them. Cap each city to its
+        # single largest disagreement so one outlier city can't crowd
+        # out other cities in the top-8 list.
+        # Direction interpretation (in Kalshi prediction-market terms,
+        # contract price = implied probability × $1):
+        #   model > market: market is UNDERPRICING YES → YES is cheap
+        #     relative to fair → buy YES.
+        #   model < market: market is OVERPRICING YES → YES is expensive,
+        #     NO is correspondingly cheap → buy NO.
+        DISAGREE_THRESHOLD_PP = 20  # percentage points
+        candidates = []
+        for b in c["buckets"]:
+            mdl = b.get("model_p")
+            mkt = b.get("market_p")
+            if mdl is None or mkt is None:
+                continue
+            edge_pp = (mdl - mkt) * 100
+            if abs(edge_pp) < DISAGREE_THRESHOLD_PP:
+                continue
+            # De-dup: the impossible-bucket alert already covers cases
+            # where the bucket's high_range is below the day's peak.
+            hi = b.get("high_range")
+            if peak is not None and hi is not None and hi < peak and mkt >= 0.05:
+                continue
+            candidates.append((b, edge_pp))
+        if candidates:
+            # Pick the single biggest disagreement per city.
+            b, edge_pp = max(candidates, key=lambda x: abs(x[1]))
+            mdl_pct = b["model_p"] * 100
+            mkt_pct = b["market_p"] * 100
+            if edge_pp > 0:
+                # Model thinks YES more likely than market — YES is cheap.
+                direction = "buy YES"
+                arrow = "↑"
+            else:
+                # Model thinks YES less likely than market — NO is cheap.
+                direction = "buy NO"
+                arrow = "↓"
+            alerts.append({
+                "severity": "amber",
+                "city": city,
+                "when": snap_when,
+                "what": (f"<b>{city}</b> {b['label']} model YES {mdl_pct:.0f}% "
+                         f"vs market YES {mkt_pct:.0f}% (Δ {edge_pp:+.0f}pp · {arrow} {direction})"),
+                # Rank: bigger gap = higher up. Add small offset so these
+                # tend to surface above the noise but below true bucket-
+                # dead alerts (which use rank=100+).
+                "rank": 50 + abs(edge_pp),
+            })
+
     alerts.sort(key=lambda a: -a["rank"])
     return alerts[:8]
 
