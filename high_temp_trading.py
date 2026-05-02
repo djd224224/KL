@@ -261,9 +261,19 @@ def write_run_row(event, **fields):
 
 import sys
 
-# Determine if current time in Central Time is after 2 PM
-central_time = datetime.now(pytz.timezone('US/Central'))
-variable = 1 if central_time.hour >= 14 and central_time.hour < 23 else 0
+# Determine if current time in Central Time is after 2 PM. variable=1
+# means "look up tomorrow's forecast" (index 1 in NWS/WU response arrays);
+# variable=0 means "today's forecast" (index 0).
+#
+# The earlier upper bound (`and central_time.hour < 23`) was an off-by-one
+# that broke when the GH-Actions 02:02 UTC cron drifted past midnight UTC
+# and fired at e.g. 04:56 UTC (hour=23 CT). At that hour WU has already
+# retired today's index-0 slot (returns None) and tomorrow lives at index
+# 1, so variable=0 made every WU pull fail. Drop the upper bound to match
+# the duplicate definition at line 788 — both should read identically so
+# the WU helper and the downstream bid-ladder logic agree on which day
+# we're trading.
+variable = 1 if central_time.hour >= 14 else 0
 
 # Coordinates are the EXACT lat/lon of each city's Kalshi settlement station
 # (Central Park for NYC, Midway for Chicago, Hobby for Houston, etc.) as
@@ -1028,7 +1038,21 @@ y['City'] = x['City']
 y['low_range'] = x['low_range']
 y['Average'] = x['Average']
 y = pd.merge(y, actuals_vs_forecast_variation, on='City', how='inner')
-# Rebuild chart_end_index from merged y (only cities with historical data)
+# Drop cities whose forecast variation is NaN before the int() coercion.
+# This used to crash the whole run on any day where every forecast
+# source NaN'd out (e.g., 2026-05-02: WU's pre-midnight refresh window
+# returned None for all 20 cities + the variable=0/1 mismatch ate the
+# fallback). Skipping those rows lets the rest of the run continue —
+# the bot just won't trade tail markets for those cities this run, but
+# regular B-markets still get orders.
+_pre_drop_n = len(y)
+y = y[y['forecast_variation_vs_high_end'].notna()].reset_index(drop=True)
+if len(y) < _pre_drop_n:
+    _dropped = _pre_drop_n - len(y)
+    print(f"  ⚠ Tail bid_price calc: dropped {_dropped}/{_pre_drop_n} cities "
+          f"with NaN forecast variation (forecast pull failed for those cities)")
+    alert("FORECAST_NAN_TAIL", f"{_dropped} cities NaN in forecast_variation; tail markets skipped",
+          {"source": "high_temp_trading", "n_dropped": _dropped, "n_total": _pre_drop_n})
 chart_end_index = [int(v) for v in y['forecast_variation_vs_high_end'].tolist()]
 filtered_data = [y[str(col)].tolist() for col in range(5, -6, -1)]
 
