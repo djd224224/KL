@@ -1039,18 +1039,13 @@ def per_city_view(
 
     # Show only today/tomorrow ET cards — drop past dates entirely, even
     # when residual positions remain on yesterday's market_tickers.
-    # (Those positions still flow through the BQ data but won't render
-    # as their own card; if they materially affect aggregated totals the
-    # top strip will still pick them up via the positions_log read.)
-    try:
-        from zoneinfo import ZoneInfo
-        today_et = datetime.now(ZoneInfo("America/New_York")).date()
-    except Exception:
-        today_et = datetime.now(timezone.utc).date()
-    cards = [
-        c for c in cards
-        if pd.Timestamp(c["forecast_date"]).date() >= today_et
-    ]
+    # NOTE: yesterday's cards (forecast_date < today_et) used to be
+    # filtered out HERE so the live page didn't show settled markets.
+    # That made the per-day archive workflow (render(forecast_date_filter
+    # =yesterday) → archive/{yesterday}.html) impossible because
+    # per_city_view never produced yesterday's cards. The filter has
+    # moved to render() — render() applies the today-or-later cut for
+    # live builds but skips it when forecast_date_filter is set.
 
     # Sort: positioned cities first by live P&L descending (biggest winners
     # at top, biggest losers at bottom of the positioned block); flat cities
@@ -1759,7 +1754,22 @@ def render(data: dict, forecast_date_filter: str | None = None) -> str:
         settled_pnl=data.get("settled_pnl"),
     )
     if forecast_date_filter is not None:
+        # Archive build: keep ONLY the requested date.
         cards = [c for c in cards if c.get("forecast_date") == forecast_date_filter]
+    else:
+        # Live build: drop pre-today cards (settled yesterday markets that
+        # are still in the snapshot's [yesterday, tomorrow] window). This
+        # is the filter that used to live in per_city_view; lifted here so
+        # archive builds can opt out by passing forecast_date_filter.
+        try:
+            from zoneinfo import ZoneInfo
+            today_et = datetime.now(ZoneInfo("America/New_York")).date()
+        except Exception:
+            today_et = datetime.now(timezone.utc).date()
+        cards = [
+            c for c in cards
+            if pd.Timestamp(c["forecast_date"]).date() >= today_et
+        ]
     forecast_spark = forecast_sparklines(data["forecast_history"])
     obs_spark = obs_sparklines(data.get("nws_obs", pd.DataFrame()))
     fcst_spark = fcst_sparklines(data.get("nws_fcst", pd.DataFrame()))
