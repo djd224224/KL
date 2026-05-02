@@ -705,12 +705,12 @@ NUM_YES_OFFSET_LEVELS = 7   # [v1.1] YES gets more levels (edge is real at 45-60
 NUM_NO_OFFSET_LEVELS = 5    # [v1.1] NO gets fewer levels (adversely selected everywhere)
 
 def generate_base_contracts(num_levels: int) -> List[int]:
-    return [7] * num_levels  # [v1.4] was 5 — raised after sustained data collection
+    return [8] * num_levels
 
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_YES_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_NO_OFFSET_LEVELS)
 MAX_CONTRACTS_PER_ORDER = 1000
-MAX_CONTRACTS_PER_MARKET_PER_RUN = 10  # [v1.1] was 50 — PITC had 20 fills in one market
+MAX_CONTRACTS_PER_MARKET_PER_RUN = 25
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
 # [v1.0] All multipliers flat 1.0 — no scaling until we have data to tune
@@ -798,7 +798,7 @@ print(f"  Max price: {MAX_PRICE}c (was 75c — 60-75c bucket lost on both sides)
 print(f"Order structure:")
 print(f"  YES: {NUM_YES_OFFSET_LEVELS} levels, tight offsets (edge at 45-60c)")
 print(f"  NO: {NUM_NO_OFFSET_LEVELS} levels, wide offsets (adverse selection protection)")
-print(f"  Per-market per-run cap: {MAX_CONTRACTS_PER_MARKET_PER_RUN} (was 50)")
+print(f"  Per-market per-run cap: {MAX_CONTRACTS_PER_MARKET_PER_RUN}")
 print(f"  Never top of book: MAX_ORDERBOOK_LEVELS_ABOVE={MAX_ORDERBOOK_LEVELS_ABOVE}")
 print(f"{'='*70}\n")
 
