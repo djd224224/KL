@@ -1741,7 +1741,14 @@ def _fmt_age(ts_str: str | None, now_utc: datetime) -> tuple[str, str]:
     return label, cls
 
 
-def render(data: dict) -> str:
+def render(data: dict, forecast_date_filter: str | None = None) -> str:
+    """Render the dashboard HTML.
+
+    `forecast_date_filter`: if set (e.g., "2026-05-01"), keep only cards
+    for that forecast_date. Used to produce archive pages that show ONLY
+    one day's data instead of the live "yesterday + today + tomorrow"
+    spread. Live builds (index.html) pass None to keep all cards.
+    """
     now_utc = datetime.now(timezone.utc)
     cards = per_city_view(
         data["snapshot"], data["orderbook"],
@@ -1751,6 +1758,8 @@ def render(data: dict) -> str:
         cli=data.get("cli"),
         settled_pnl=data.get("settled_pnl"),
     )
+    if forecast_date_filter is not None:
+        cards = [c for c in cards if c.get("forecast_date") == forecast_date_filter]
     forecast_spark = forecast_sparklines(data["forecast_history"])
     obs_spark = obs_sparklines(data.get("nws_obs", pd.DataFrame()))
     fcst_spark = fcst_sparklines(data.get("nws_fcst", pd.DataFrame()))
@@ -3119,62 +3128,65 @@ PUBLIC_OBJECT = os.environ.get("KXHIGH_DASHBOARD_OBJECT", "index.html")
 PUBLISH_DEFAULT = os.environ.get("KXHIGH_DASHBOARD_PUBLISH", "1") not in ("0", "", "false", "False")
 
 
-def _publish_to_gcs(html: str) -> str | None:
-    """Upload the rendered HTML to the public GCS bucket — as the live
-    `index.html` AND as TWO archive copies: today's and yesterday's.
+def _et_today_yesterday() -> tuple[str, str]:
+    """ET today and yesterday as YYYY-MM-DD strings. Falls back to UTC
+    if zoneinfo isn't available (shouldn't happen on supported pythons,
+    but kept defensive — historically there were Windows-tz quirks)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now_et = datetime.utcnow()
+    return now_et.strftime("%Y-%m-%d"), (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    Why both archive dates: settlements + final CLI for ET-day D land
-    several hours AFTER the date rolls to D+1 (Kalshi processes ~7-8 AM
-    ET, sometimes later). If we only overwrite archive/{today}.html, the
-    archive file for D freezes at midnight ET — *before* the day's
-    realized P&L exists. By also overwriting archive/{yesterday}.html on
-    every publish, yesterday's archive keeps refreshing for ~24h after
-    rollover; settlement lands, the next publish picks it up, the archive
-    becomes accurate. Once "yesterday" becomes 2-days-ago it naturally
-    stops being touched and freezes for good.
 
-    The dashboard's queries already span [yesterday, today, tomorrow], so
-    yesterday's cards still render correctly the day after — paired with
-    the per_city_view fallback to settlements_clean for realized P&L on
-    settled markets, this delivers an accurate post-settlement archive
-    without re-rendering with date-scoped queries.
-    """
-    if not PUBLISH_DEFAULT:
-        return None
+def _publish_html_to_gcs(html: str, object_path: str, cache_seconds: int) -> bool:
+    """Single GCS upload helper. Returns True on success."""
     try:
         from google.cloud import storage
     except ImportError:
         print("  google-cloud-storage not installed; skipping publish", flush=True)
-        return None
-    try:
-        from zoneinfo import ZoneInfo
-        now_et = datetime.now(ZoneInfo("America/New_York"))
-        et_today = now_et.strftime("%Y-%m-%d")
-        et_yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
-    except Exception:
-        now_et = datetime.utcnow()
-        et_today = now_et.strftime("%Y-%m-%d")
-        et_yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        return False
     try:
         client = storage.Client(project=PROJECT)
         bucket = client.bucket(PUBLIC_BUCKET)
-        # Live copy: short cache so changes show up within ~1 min.
-        blob_live = bucket.blob(PUBLIC_OBJECT)
-        blob_live.cache_control = "public,max-age=60"
-        blob_live.upload_from_string(html, content_type="text/html; charset=utf-8")
-        # Archive copies: short cache so post-settlement updates land in
-        # browsers quickly. Once yesterday becomes 2-days-ago, no more
-        # writes happen and the file freezes for good.
-        for et_date in (et_today, et_yesterday):
-            blob_arch = bucket.blob(f"archive/{et_date}.html")
-            blob_arch.cache_control = "public,max-age=300"
-            blob_arch.upload_from_string(html, content_type="text/html; charset=utf-8")
-        url = f"https://storage.googleapis.com/{PUBLIC_BUCKET}/{PUBLIC_OBJECT}"
-        print(f"  published -> {url} (+ archive/{et_today}.html, archive/{et_yesterday}.html)", flush=True)
-        return url
+        blob = bucket.blob(object_path)
+        blob.cache_control = f"public,max-age={cache_seconds}"
+        blob.upload_from_string(html, content_type="text/html; charset=utf-8")
+        return True
     except Exception as e:
-        print(f"  publish failed (non-fatal): {e}", flush=True)
+        print(f"  publish {object_path} failed (non-fatal): {e}", flush=True)
+        return False
+
+
+def _publish_to_gcs(html: str) -> str | None:
+    """Compatibility wrapper for the old signature. Publishes only the
+    live `index.html`. Archive writes are now done separately by main()
+    with date-filtered HTML so each archive page shows ONLY its day's
+    cards rather than the live "yesterday + today + tomorrow" spread.
+    """
+    if not PUBLISH_DEFAULT:
         return None
+    if not _publish_html_to_gcs(html, PUBLIC_OBJECT, cache_seconds=60):
+        return None
+    url = f"https://storage.googleapis.com/{PUBLIC_BUCKET}/{PUBLIC_OBJECT}"
+    print(f"  published -> {url}", flush=True)
+    return url
+
+
+def _publish_archive_to_gcs(html: str, et_date: str) -> bool:
+    """Publish a date-filtered archive page to archive/{et_date}.html.
+
+    Each archive page is rendered with `forecast_date_filter=et_date` so
+    only that day's cards appear — earlier the same html as the live
+    page was uploaded to both today's and yesterday's archive paths,
+    which made yesterday's archive show today's live cards mixed in
+    alongside yesterday's settled ones. Per-day filtering was the actual
+    fix the "extend write window" approach was meant to deliver.
+    """
+    if not PUBLISH_DEFAULT:
+        return False
+    return _publish_html_to_gcs(html, f"archive/{et_date}.html", cache_seconds=300)
 
 
 def _list_archive_dates() -> list[str]:
@@ -3207,11 +3219,27 @@ def main() -> Path:
     data = load()
     for k, df in data.items():
         print(f"  {k}: {len(df)} rows", flush=True)
-    html = render(data)
+
+    # Live page: all cards (today + tomorrow + any not-yet-settled
+    # yesterday). This is what the GCS index.html serves.
+    html_live = render(data)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT.write_text(html, encoding="utf-8")
+    OUTPUT.write_text(html_live, encoding="utf-8")
     print(f"wrote {OUTPUT}", flush=True)
-    _publish_to_gcs(html)
+    _publish_to_gcs(html_live)
+
+    # Archive pages: one per ET-day, each rendered with cards filtered
+    # to that day only. Re-publishes today + yesterday on every tick so
+    # post-settlement realized P&L lands in yesterday's archive once
+    # Kalshi processes (typically ~7-12h after midnight ET). Once
+    # yesterday becomes 2-days-ago it stops being touched and the file
+    # freezes. The renders cost ~300ms each — minor on a 20-min cron.
+    et_today, et_yesterday = _et_today_yesterday()
+    for et_date in (et_today, et_yesterday):
+        html_arch = render(data, forecast_date_filter=et_date)
+        ok = _publish_archive_to_gcs(html_arch, et_date)
+        if ok:
+            print(f"  published -> archive/{et_date}.html (filtered to {et_date} cards)", flush=True)
     return OUTPUT
 
 
