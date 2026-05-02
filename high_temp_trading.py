@@ -273,6 +273,7 @@ import sys
 # the duplicate definition at line 788 — both should read identically so
 # the WU helper and the downstream bid-ladder logic agree on which day
 # we're trading.
+central_time = datetime.now(pytz.timezone('US/Central'))
 variable = 1 if central_time.hour >= 14 else 0
 
 # Coordinates are the EXACT lat/lon of each city's Kalshi settlement station
