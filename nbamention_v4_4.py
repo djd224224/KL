@@ -584,13 +584,13 @@ def fetch_bankroll(client) -> Tuple[float, int, int]:
 def get_scaled_limits(bankroll: float) -> dict:
     scale = max(0.5, min(bankroll / 5000, 1.0))
     return {
-        "MAX_NET_PER_MARKET": int(150 * scale),           # [v4.8] was 200
+        "MAX_NET_PER_MARKET": int(200 * scale),
         "POSITION_MODERATE_THRESHOLD": int(67 * scale),
-        "POSITION_STOP_THRESHOLD": int(150 * scale),      # [v4.8] was 200
+        "POSITION_STOP_THRESHOLD": int(200 * scale),
         "MAX_NET_PER_EVENT": int(1000 * scale),
         "MAX_PAIRED_PER_MARKET": int(350 * scale),
-        "PAIRING_MODE_NET_FLOOR": int(60 * scale),        # [v4.8] was 80
-        "PAIRING_MODE_NET_AGGRESSIVE": int(113 * scale),   # [v4.8] was 150
+        "PAIRING_MODE_NET_FLOOR": int(90 * scale),
+        "PAIRING_MODE_NET_AGGRESSIVE": int(150 * scale),
         "scale": scale,
     }
 
@@ -762,7 +762,7 @@ NO_SWEET_SPOT_MULTIPLIER = 1.0
 def generate_base_contracts(num_levels: int) -> List[int]:
     contracts = []
     for i in range(num_levels):
-        contracts.append(5)
+        contracts.append(8)
     return contracts
 
 NUM_OFFSET_LEVELS = 10
@@ -771,7 +771,7 @@ BASE_NO_CONTRACTS = generate_base_contracts(NUM_OFFSET_LEVELS)
 MAX_CONTRACTS_PER_ORDER = 1000
 MAX_CONTRACTS_PER_MARKET_PER_RUN = 150  # [v4.6] Limits single-run exposure per market
 MAX_TOTAL_MULTIPLIER = 2.0              # [v4.7] Hard cap on combined multiplier
-MAX_CONTRACTS_PER_LEVEL = 50            # [v4.7] Hard cap on contracts per price level
+MAX_CONTRACTS_PER_LEVEL = 100           # [v4.7] Hard cap on contracts per price level
 
 # ---------- DYNAMIC SIZING MULTIPLIERS ----------
 TIME_MULTIPLIERS = [
