@@ -2331,8 +2331,13 @@ def build_order_objects_for_market(
     yes_prices_to_place = []
     # [v1.2] Per-market YES MAX_PRICE override
     yes_market_max_price = YES_MAX_PRICE_OVERRIDES.get(ticker_part_3_market_code, MAX_PRICE)
-    max_yes_price_allowed = (orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_yes_bid else yes_market_max_price
     yes_contracts_placed = 0
+    # Require a non-empty same-side book. Without a YES bid we have no anchor
+    # for "below top of book" — skipping avoids posting at MAX_PRICE into thin air.
+    if not orderbook_yes_bid:
+        print(f"    → YES: [skipped — no YES bid in book]")
+        yes_total_mult = 0
+    max_yes_price_allowed = orderbook_yes_bid + MAX_ORDERBOOK_LEVELS_ABOVE if orderbook_yes_bid else yes_market_max_price
 
     if yes_total_mult > 0:
         for i, offset in enumerate(yes_offsets):
@@ -2438,8 +2443,11 @@ def build_order_objects_for_market(
     # ==========================================================
     no_prices_to_place = []
     market_max_price = MAX_PRICE_OVERRIDES.get(ticker_part_3_market_code, MAX_PRICE)
-    max_no_price_allowed = (orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE) if orderbook_no_bid else market_max_price
     no_contracts_placed = 0
+    if not orderbook_no_bid:
+        print(f"    → NO: [skipped — no NO bid in book]")
+        no_total_mult = 0
+    max_no_price_allowed = orderbook_no_bid + MAX_ORDERBOOK_LEVELS_ABOVE if orderbook_no_bid else market_max_price
 
     if no_total_mult > 0:
         for i, offset in enumerate(no_offsets):
