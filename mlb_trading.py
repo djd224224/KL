@@ -1395,9 +1395,12 @@ def fetch_mlb_schedule() -> Dict[str, int]:
     
     schedule = {}
     
-    # Fetch today through 7 days out
+    # Fetch yesterday through 7 days out. Kalshi tickers use ET dates,
+    # but late ET games run past midnight UTC — at UTC 00:00–05:00 ET-date X
+    # is still in progress while UTC date is already X+1. Starting from
+    # today UTC would miss those games and trigger GAME_TIME_FALLBACK.
     today = datetime.now(UTC).date()
-    start_date = today.isoformat()
+    start_date = (today - timedelta(days=1)).isoformat()
     end_date = (today + timedelta(days=7)).isoformat()
     
     url = (
