@@ -623,9 +623,17 @@ def _cli_is_preliminary(high_time_str: object, high_f: object, low_f: object) ->
     if not digits.isdigit() or len(digits) < 3 or len(digits) > 4:
         return False
     try:
-        hour = int(digits[:-2])  # strip last 2 chars (minutes)
+        raw_hour = int(digits[:-2])  # strip last 2 chars (minutes)
     except ValueError:
         return False
+    # Convert 12-hour clock to 24-hour. "12 AM" = 00 (midnight), "12 PM"
+    # = 12 (noon). Without this, "1215 AM" was reading as hour=12 and
+    # failing the `<= 5` pre-dawn check, so DEN 2026-05-03's preliminary
+    # CLI (high=53 at 12:15 AM, range=5) wasn't getting flagged.
+    if raw_hour == 12:
+        hour = 0 if is_am else 12
+    else:
+        hour = raw_hour
     # Pre-dawn = AM hours <= 5 (i.e., 12:00 AM through 5:59 AM).
     return is_am and hour <= 5
 
