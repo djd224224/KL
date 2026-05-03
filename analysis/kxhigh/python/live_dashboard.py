@@ -604,7 +604,13 @@ def _cli_is_preliminary(high_time_str: object, high_f: object, low_f: object) ->
         return False
     if h is None or l is None:
         return False  # missing data — defer to upstream defaults, treat as final
-    if (h - l) >= 5:
+    # Threshold tightened from >=5 to >=7. DEN 2026-05-03's preliminary
+    # CLI had high=53/low=48 (range exactly 5) with high_time 12:15 AM,
+    # which slipped through the >=5 check and the dashboard displayed 53°
+    # when actual obs max for the day was 75.2°. CHI 2026-04-29 was a
+    # real frontal-passage day (high=57/low=49, range 8, high_time 2:18
+    # AM); range 8 still passes >=7 so it's correctly treated as final.
+    if (h - l) >= 7:
         return False  # normal/large diurnal range — looks like a complete day
     # Range is small (<5°F). Now check the high_time.
     if not isinstance(high_time_str, str):
