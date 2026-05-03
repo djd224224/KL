@@ -1313,7 +1313,7 @@ combined_table
 increment = 2
 increment1 = 5
 price_count = list(range(0, 8))
-starting_contracts = 45
+starting_contracts = 50
 
 # Night-run size multiplier: double size when orders rest overnight.
 # - variable==1: afternoon/evening run placing orders on tomorrow's market.
