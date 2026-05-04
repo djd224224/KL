@@ -46,6 +46,15 @@ PALETTE=['#60a5fa','#c084fc','#4ade80','#f87171','#fbbf24','#22d3ee','#2dd4bf','
     '#818cf8','#a78bfa','#34d399','#fb7185','#fcd34d','#67e8f9','#5eead4','#f9a8d4','#fdba74','#cbd5e1',
     '#6366f1','#8b5cf6','#10b981','#ef4444','#f59e0b','#06b6d4','#14b8a6','#ec4899','#f97316','#64748b']
 
+_MONTHS={m:i+1 for i,m in enumerate(['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'])}
+_TICKER_DATE_RE=re.compile(r'(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})')
+def event_date_from_ticker(ticker):
+    m=_TICKER_DATE_RE.search(ticker or '')
+    if not m: return None
+    yy,mon,dd=m.groups()
+    try: return f'20{yy}-{_MONTHS[mon]:02d}-{int(dd):02d}'
+    except (KeyError,ValueError): return None
+
 def extract_series(ticker):
     m=re.match(r'^(KX[A-Z]+)',ticker or '')
     return m.group(1) if m else 'UNKNOWN'
@@ -90,10 +99,12 @@ def process_settlements(raw):
         else: price_c=0
         bucket=(price_c//5)*5
         subgroup=extract_subgroup(ticker, family)
+        event_str=event_date_from_ticker(ticker)
         out.append({'ticker':ticker,'series':series,'family':family,'subgroup':subgroup,
             'code':code,'pnl':pnl,'cost':cost,'payout':pay,'yc':yc,'nc':nc,'ya':ya,'na':na,
             'result':res,'total_c':total_c,'direction':direction,'bucket':bucket,
-            'date':dt,'day':day,'day_str':day.isoformat() if day else None})
+            'date':dt,'day':day,'day_str':day.isoformat() if day else None,
+            'event_str':event_str})
     return out
 
 def process_trades(raw):
@@ -247,16 +258,19 @@ def analyze_group(settlements, trades=None, orders=None, label='All'):
 
     # Trade stats
     t_n=0;t_contracts=0;t_notional=0;t_maker_pct=0
-    daily_vol=[]
     if trades:
         t_n=len(trades); t_contracts=int(sum(t['contracts'] for t in trades))
         t_notional=round(sum(t['notional'] for t in trades),2)
         t_maker=sum(1 for t in trades if 'maker' in t['maker_taker'].lower())
         t_maker_pct=round(t_maker/t_n*100,0) if t_n else 0
-        tvd=defaultdict(float)
-        for t in trades:
-            if t['day_str']: tvd[t['day_str']]+=t['notional']
-        daily_vol=[[k,round(v,2)] for k,v in sorted(tvd.items())]
+
+    # Daily capital outlay = settlement cost basis grouped by event date (ticker-encoded),
+    # falling back to the settlement day for tickers without an embedded date.
+    eod=defaultdict(float)
+    for s in settlements:
+        k=s.get('event_str') or s.get('day_str')
+        if k: eod[k]+=s['cost']
+    daily_event_cost=[[k,round(v,2)] for k,v in sorted(eod.items())]
 
     # Price distribution (from trades)
     price_dist=[]
@@ -329,7 +343,7 @@ def analyze_group(settlements, trades=None, orders=None, label='All'):
         'dir_stats':dir_stats,'sg_dir_stats':{f"{k[0]}|{k[1]}":v for k,v in sg_dir_stats.items()},
         'pb_all':pb_all,'pb_groups':pb_groups,
         't_n':t_n,'t_contracts':t_contracts,'t_notional':t_notional,'t_maker_pct':t_maker_pct,
-        'daily_vol':daily_vol,'price_dist':price_dist,
+        'daily_event_cost':daily_event_cost,'price_dist':price_dist,
         'o_n':o_n,'o_fill_rate':o_fill_rate,'o_contract_fr':o_contract_fr,'o_cancel_rate':o_cancel_rate,
         'o_status':o_status,'o_total_placed':o_total_placed,'o_total_filled':o_total_filled,
         'daily_fr':daily_fr,
@@ -537,14 +551,14 @@ def build_section(section_id, title, s, warn='', is_consolidated=False, is_famil
 <h3>Cumulative P&L by {"Strategy Family" if is_consolidated else "City" if s.get('subgroups') else "Sub-group"}</h3><div class="cc tall"><canvas id="{sid_v}_gc"></canvas></div>
 <div class="g2">
 <div><h3>Daily P&L</h3><div class="cc"><canvas id="{sid_v}_dp"></canvas></div></div>
-<div><h3>{"Exposure by Family" if is_consolidated else "Daily Dollar Volume"}</h3><div class="cc"><canvas id="{sid_v}_{'pie' if is_consolidated else 'dv'}"></canvas></div></div></div>'''
+<div><h3>{"Exposure by Family" if is_consolidated else "Daily Capital Outlay (event date)"}</h3><div class="cc"><canvas id="{sid_v}_{'pie' if is_consolidated else 'dv'}"></canvas></div></div></div>'''
     if not is_consolidated:
         charts+=f'''<div class="g2">
 <div><h3>Daily P&L by {"City" if is_family else "Sub-group"}</h3><div class="cc"><canvas id="{sid_v}_gd"></canvas></div></div>
-<div><h3>Cumulative Dollar Volume</h3><div class="cc"><canvas id="{sid_v}_cdv"></canvas></div></div></div>'''
+<div><h3>Cumulative Capital Outlay</h3><div class="cc"><canvas id="{sid_v}_cdv"></canvas></div></div></div>'''
     else:
         charts+=f'''<div class="g2">
-<div><h3>Daily Trade Volume ($)</h3><div class="cc"><canvas id="{sid_v}_vol"></canvas></div></div>
+<div><h3>Daily Capital Outlay (event date)</h3><div class="cc"><canvas id="{sid_v}_vol"></canvas></div></div>
 <div><h3>Price Distribution</h3><div class="cc"><canvas id="{sid_v}_pd"></canvas></div></div></div>'''
 
     # Price bucket dropdown
@@ -637,20 +651,20 @@ def build_js(consolidated, family_data, families, fill_data):
             # Exposure pie
             exp_data=[[fam, round(family_data[fam]['cost'],2)] for fam in families]
             js_parts.append(f"var exp={json.dumps(exp_data)};if(exp.length)new Chart(document.getElementById('{sid_v}_pie'),{{type:'doughnut',data:{{labels:exp.map(d=>d[0]),datasets:[{{data:exp.map(d=>d[1]),backgroundColor:exp.map(d=>FC[d[0]]||'#6b7280'),borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{boxWidth:10,padding:6}}}}}}}}}});")
-            # Trade volume
-            if s.get('daily_vol'):
-                js_parts.append(f"var vol={json.dumps(s['daily_vol'])};if(vol.length){{MB('{sid_v}_vol',vol.map(d=>d[0]),vol.map(d=>d[1]));var vc=Chart.getChart('{sid_v}_vol');vc.data.datasets[0].backgroundColor=C.teal+'77';vc.data.datasets[0].borderColor=C.teal;vc.update();}}")
+            # Daily capital outlay (event-date cost basis)
+            if s.get('daily_event_cost'):
+                js_parts.append(f"var vol={json.dumps(s['daily_event_cost'])};if(vol.length){{MB('{sid_v}_vol',vol.map(d=>d[0]),vol.map(d=>d[1]));var vc=Chart.getChart('{sid_v}_vol');vc.data.datasets[0].backgroundColor=C.teal+'77';vc.data.datasets[0].borderColor=C.teal;vc.update();}}")
             # Price dist
             if s.get('price_dist'):
                 pd=[[b,c] for b,c in s['price_dist']]
                 js_parts.append(f"var pd={json.dumps(pd)};if(pd.length)new Chart(document.getElementById('{sid_v}_pd'),{{type:'bar',data:{{labels:pd.map(d=>d[0]+'-'+(d[0]+4)+'¢'),datasets:[{{data:pd.map(d=>d[1]),backgroundColor:C.purple+'88',borderColor:C.purple,borderWidth:1}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:false}}}}}}}});")
         else:
-            # Daily volume
-            if s.get('daily_vol'):
-                js_parts.append(f"var {sid_v}_dv={json.dumps(s['daily_vol'])};if({sid_v}_dv.length){{MB('{sid_v}_dv',{sid_v}_dv.map(d=>d[0]),{sid_v}_dv.map(d=>d[1]));var dvc=Chart.getChart('{sid_v}_dv');dvc.data.datasets[0].backgroundColor=C.teal+'77';dvc.data.datasets[0].borderColor=C.teal;dvc.update();}}")
-            # Cum volume
-            if s.get('daily_vol'):
-                js_parts.append(f"if({sid_v}_dv.length){{var cv=0,cvd={sid_v}_dv.map(d=>{{cv+=d[1];return[d[0],Math.round(cv*100)/100];}});ML('{sid_v}_cdv',cvd.map(d=>d[0]),[{{label:'Cum $Vol',data:cvd.map(d=>d[1]),borderColor:C.teal,backgroundColor:C.teal+'22',fill:true,borderWidth:2}}]);}}")
+            # Daily capital outlay (event-date cost basis)
+            if s.get('daily_event_cost'):
+                js_parts.append(f"var {sid_v}_dv={json.dumps(s['daily_event_cost'])};if({sid_v}_dv.length){{MB('{sid_v}_dv',{sid_v}_dv.map(d=>d[0]),{sid_v}_dv.map(d=>d[1]));var dvc=Chart.getChart('{sid_v}_dv');dvc.data.datasets[0].backgroundColor=C.teal+'77';dvc.data.datasets[0].borderColor=C.teal;dvc.update();}}")
+            # Cumulative capital outlay
+            if s.get('daily_event_cost'):
+                js_parts.append(f"if({sid_v}_dv.length){{var cv=0,cvd={sid_v}_dv.map(d=>{{cv+=d[1];return[d[0],Math.round(cv*100)/100];}});ML('{sid_v}_cdv',cvd.map(d=>d[0]),[{{label:'Cum Outlay',data:cvd.map(d=>d[1]),borderColor:C.teal,backgroundColor:C.teal+'22',fill:true,borderWidth:2}}]);}}")
             # Daily by subgroup (stacked)
             gd_data=json.dumps(s['sg_daily'])
             js_parts.append(f"var {sid_v}_gd2={gd_data};var add=[...new Set(Object.values({sid_v}_gd2).flatMap(s=>s.map(d=>d[0])))].sort();if(add.length){{var ds2=Object.entries({sid_v}_gd2).map(([k,s],i)=>{{var lu=Object.fromEntries(s);return{{label:k,data:add.map(d=>lu[d]||0),backgroundColor:P[i%P.length]+'88',borderColor:P[i%P.length],borderWidth:1}}}});new Chart(document.getElementById('{sid_v}_gd'),{{type:'bar',data:{{labels:add,datasets:ds2}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:true,position:'top',labels:{{boxWidth:8,padding:4,font:{{size:9}}}}}}}},scales:{{x:{{stacked:true,ticks:{{maxTicksLimit:12,maxRotation:45}}}},y:{{stacked:true}}}}}}}});}}")
