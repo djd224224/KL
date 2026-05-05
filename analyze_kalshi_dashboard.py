@@ -173,6 +173,8 @@ def analyze_group(settlements, trades=None, orders=None, label='All'):
     down=[p for p in dpnls if p<0]
     dstd=math.sqrt(sum(p**2 for p in down)/len(down)) if down else 0
     sortino_v=(avg_d/dstd*ann) if dstd>0 else 0
+    up_sum=sum(p for p in dpnls if p>0); dn_sum=-sum(p for p in down)
+    omega=(up_sum/dn_sum) if dn_sum>0 else 0
 
     # Drawdown with date range
     cum=0;peak=0;mdd=0;dd_series=[];cum_series=[]
@@ -335,7 +337,7 @@ def analyze_group(settlements, trades=None, orders=None, label='All'):
         'label':label,'n':n,'pnl':round(tp,2),'cost':round(tc,2),'roi':round(roi,1),
         'nw':nw,'nl':nl,'wr':round(wr,1),'aw':round(aw,2),'al':round(al,2),'pf':pf,'ev':round(ev,2),
         'nd':nd,'avg_d':round(avg_d,2),'std_d':round(std_d,2),
-        'sharpe':round(sharpe,3),'sortino':round(sortino_v,3),'mdd':round(mdd,2),
+        'sharpe':round(sharpe,3),'sortino':round(sortino_v,3),'omega':round(omega,3),'mdd':round(mdd,2),
         'mdd_start':mdd_start,'mdd_end':mdd_end,
         'var95':var95,'best_day':round(best_day,2),'worst_day':round(worst_day,2),
         'cum_series':cum_series,'dd_series':dd_series,'daily_pnl':daily_pnl_series,
@@ -531,7 +533,7 @@ def build_section(section_id, title, s, warn='', is_consolidated=False, is_famil
     kpis=f'''<div class="g4">
 <div class="card"><div class="l">Net P&L</div><div class="v">{money_h(s['pnl'])}</div><div class="s">ROI: {pct_h(s['roi'])}</div></div>
 <div class="card"><div class="l">Win Rate</div><div class="v">{s['wr']:.1f}%</div><div class="s">{s['nw']}W/{s['nl']}L</div></div>
-<div class="card"><div class="l">Sharpe</div><div class="v">{s['sharpe']:.3f}</div><div class="s">Sortino: {s['sortino']:.3f}</div></div>
+<div class="card"><div class="l">Sharpe</div><div class="v">{s['sharpe']:.3f}</div><div class="s">Sortino: {s['sortino']:.3f} &middot; &Omega;: {s['omega']:.3f}</div></div>
 <div class="card"><div class="l">Max DD</div><div class="v" style="color:#f87171">${s['mdd']:,.2f}</div><div class="s">{s.get('mdd_start','?')}→{s.get('mdd_end','?')}</div></div>
 <div class="card"><div class="l">Profit Factor</div><div class="v">{s['pf']}</div><div class="s">W:{money_h(s['aw'])} L:{money_h(s['al'])}</div></div>
 <div class="card"><div class="l">EV/Settlement</div><div class="v">{money_h(s['ev'])}</div><div class="s">n={s['n']}</div></div>

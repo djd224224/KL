@@ -102,6 +102,8 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
     down = [p for p in daily_pnls if p<0]
     ds = math.sqrt(sum(p**2 for p in down)/len(down)) if down else 0
     sortino = (avg_d/ds*ann) if ds>0 else None
+    up_sum = sum(p for p in daily_pnls if p>0); dn_sum = -sum(down)
+    omega = (up_sum/dn_sum) if dn_sum>0 else None
     cum=0; peak=0; mdd=0
     for p in daily_pnls:
         cum+=p; peak=max(peak,cum); mdd=max(mdd,peak-cum)
@@ -144,7 +146,7 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
     overview = {
         'total_pnl':round(tp,2),'total_cost':round(tc,2),'roi':round(roi,1),
         'n_settlements':len(active_cities),'n_days':n_days,
-        'sharpe':round(sharpe,2) if sharpe else None,'sharpe_lo':sharpe_lo,'sharpe_hi':sharpe_hi,'sortino':round(sortino,2) if sortino else None,
+        'sharpe':round(sharpe,2) if sharpe else None,'sharpe_lo':sharpe_lo,'sharpe_hi':sharpe_hi,'sortino':round(sortino,2) if sortino else None,'omega':round(omega,2) if omega else None,
         'max_dd':round(mdd,2),
         'daily_wr':round(up_days/n_days*100,1) if n_days else 0,
         'weekly_wr':round(wk_win/len(weekly_vals)*100,1) if weekly_vals else 0,
@@ -566,6 +568,7 @@ def generate_html(data, out_path):
 
     sh = f'{o["sharpe"]:.2f}' if o['sharpe'] else '—'
     so = f'{o["sortino"]:.2f}' if o['sortino'] else '—'
+    om = f'{o["omega"]:.2f}' if o['omega'] else '—'
 
     def money(v):
         c='#1D9E75' if v>0 else ('#E24B4A' if v<0 else '#94a3b8')
@@ -721,7 +724,7 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
         f.write(f'''<div id="overview"><h2>Overview</h2>
 <div class="cards">
 <div class="card"><div class="l">Net P&L</div><div class="v {'green' if o['total_pnl']>0 else 'red'}">${o['total_pnl']:+,.0f}</div><div class="s">ROI: {o['roi']:+.1f}%</div></div>
-<div class="card"><div class="l">Sharpe</div><div class="v">{sh}</div><div class="s">95% CI [{o['sharpe_lo']:.2f}, {o['sharpe_hi']:.2f}] · Sortino: {so}</div></div>
+<div class="card"><div class="l">Sharpe</div><div class="v">{sh}</div><div class="s">95% CI [{o['sharpe_lo']:.2f}, {o['sharpe_hi']:.2f}] · Sortino: {so} · &Omega;: {om}</div></div>
 <div class="card"><div class="l">Max DD</div><div class="v red">${o['max_dd']:,.0f}</div></div>
 <div class="card"><div class="l">Avg outlay/day</div><div class="v">${o['avg_daily_cost']:,.0f}</div><div class="s">p25 ${o['outlay_p25']:,.0f} &bull; p50 ${o['outlay_p50']:,.0f} &bull; p75 ${o['outlay_p75']:,.0f}</div></div>
 <div class="card"><div class="l">Avg profit/day</div><div class="v {'green' if o['avg_daily_pnl']>0 else 'red'}">${o['avg_daily_pnl']:+,.2f}</div><div class="s"><span class="green">win ${o['avg_win']:+,.0f}</span> &bull; <span class="red">loss ${o['avg_loss']:+,.0f}</span></div></div>
