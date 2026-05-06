@@ -1849,6 +1849,49 @@ for index, row in combined_table.iterrows():
                       'no_price':int(bid_price),
                       'expiration_ts':exp_ts,
                       'post_only': True}
+
+    # Server-side cap check: re-query Kalshi for live position + open orders
+    # right before placement. The per-ticker refresh at the top of this loop
+    # catches cross-run drift, but rungs within the same ladder can still
+    # leak if a prior-run resting order fills mid-ladder. Fail closed: on
+    # API error, alert and skip this rung — the cron continues.
+    try:
+      _live_pos_resp = exchange_client.get_positions(ticker=row['market_ticker'])
+      _live_mps = _live_pos_resp.get('market_positions', []) if isinstance(_live_pos_resp, dict) else []
+      _live_active = [p for p in _live_mps if p.get('ticker') == row['market_ticker'] and p.get('position', 0) != 0]
+      _live_pos = abs(_live_active[0].get('position', 0)) if _live_active else 0
+
+      _live_ord_resp = exchange_client.get_orders(ticker=row['market_ticker'])
+      _live_orders = _live_ord_resp.get('orders', []) if isinstance(_live_ord_resp, dict) else []
+      _live_resting = 0
+      for _lo in _live_orders:
+        if _lo.get('status', '') not in ('resting', 'partial_filled', 'partially_filled', 'pending'):
+          continue
+        _rem = _lo.get('remaining_count')
+        if _rem is None:
+          try:
+            _rem = max(0, int(_lo.get('count', 0)) - int(_lo.get('filled_count', 0)))
+          except (TypeError, ValueError):
+            _rem = 0
+        _live_resting += int(_rem)
+
+      # Sync the local snapshot so subsequent rungs see the truth
+      row['position'] = _live_pos
+      row['resting_order_count'] = _live_resting
+
+      if _live_pos + _live_resting + contracts > max_contracts:
+        _rungs.append((i, bid_price, contracts, edge, 'SKIP',
+                       f'live cap (pos={_live_pos}+resting={_live_resting}+new={contracts}>{max_contracts})'))
+        _skip_cnt["position_cap"] += 1
+        continue
+    except Exception as _ce:
+      alert("CAP_CHECK_FAILED",
+            f"Pre-placement cap check failed on {row['market_ticker']}; skipping rung to avoid leak",
+            {"error": str(_ce)[:200], "rung_contracts": int(contracts), "rung_price": int(bid_price)})
+      _rungs.append((i, bid_price, contracts, edge, 'SKIP', 'cap check API error (skipped)'))
+      _skip_cnt["position_cap"] += 1
+      continue
+
     try:
       _create_resp = exchange_client.create_order(**order_params)
       # Extract Kalshi's exchange-assigned order_id (needed for fills lineage)
