@@ -424,6 +424,9 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
         fp_agg   = defaultdict(lambda:{'n':0,'pnl':0.0,'cost':0.0,'wins':0,'edge':0})
         sess_agg = {'night':{'n':0,'pnl':0.0,'cost':0.0,'wins':0,'amount':0.0},
                     'day':  {'n':0,'pnl':0.0,'cost':0.0,'wins':0,'amount':0.0}}
+        # Per-city fill-time aggregation (mirrors hour_agg structure)
+        hour_agg_by_city = defaultdict(lambda: defaultdict(lambda:{'n':0,'pnl':0.0,'cost':0.0,'wins':0,'edge':0,'amount':0.0}))
+        fill_timing_by_city = defaultdict(lambda: defaultdict(lambda:{'n':0,'amount':0.0}))
 
         for tk, fills in fills_by_ticker.items():
             s = sett_by_ticker.get(tk)
@@ -431,6 +434,7 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
             total_w = sum(f['contracts'] for f in fills)
             if total_w <= 0: continue
             won = s['result'] == 'no'
+            city = s['city']
             for f in fills:
                 share = f['contracts'] / total_w
                 pnl_share = s['pnl'] * share
@@ -442,6 +446,13 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
                 ha['n'] += 1; ha['pnl'] += pnl_share; ha['cost'] += cost_share
                 ha['edge'] += edge * f['contracts']; ha['amount'] += f['amount']
                 if won: ha['wins'] += 1
+
+                hac = hour_agg_by_city[city][et_h]
+                hac['n'] += 1; hac['pnl'] += pnl_share; hac['cost'] += cost_share
+                hac['edge'] += edge * f['contracts']; hac['amount'] += f['amount']
+                if won: hac['wins'] += 1
+                ftc = fill_timing_by_city[city][et_h]
+                ftc['n'] += 1; ftc['amount'] += f['amount']
 
                 buc = (f['price']//5)*5
                 fb = fp_agg[buc]
@@ -456,9 +467,12 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
 
         # Total contracts per hour and per price bucket — for avg_edge denominator
         hr_contracts = defaultdict(int); pr_contracts = defaultdict(int)
+        hr_contracts_by_city = defaultdict(lambda: defaultdict(int))
         for f in trades:
-            hr_contracts[(f['hour']-4)%24] += f['contracts']
+            et_h = (f['hour']-4)%24
+            hr_contracts[et_h] += f['contracts']
             pr_contracts[(f['price']//5)*5] += f['contracts']
+            hr_contracts_by_city[f['city']][et_h] += f['contracts']
 
         for h in range(24):
             ha = hour_agg.get(h)
@@ -471,6 +485,33 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
                 'roi':round(roi,1),
                 'profit':round(ha['pnl'],2),
                 'cost':round(ha['cost'],2)})
+
+        # Per-city fill_time_roi and fill_timing
+        trade_data['fill_time_roi_by_city'] = {}
+        trade_data['fill_timing_by_city'] = {}
+        for city in cities:
+            ftr_out = []
+            ft_out = []
+            cd = hour_agg_by_city.get(city, {})
+            cf = fill_timing_by_city.get(city, {})
+            for h in range(24):
+                ha = cd.get(h)
+                if ha and ha['n'] > 0:
+                    roi = ha['pnl']/ha['cost']*100 if ha['cost'] > 0 else 0
+                    denom = hr_contracts_by_city[city].get(h, 0)
+                    avg_edge = ha['edge']/denom if denom else 0
+                    ftr_out.append({'hour':h,'label':f"{h:02d}:00",
+                        'n':ha['n'],'wr':round(ha['wins']/ha['n']*100,1),
+                        'avg_edge':round(avg_edge,2),'roi':round(roi,1),
+                        'profit':round(ha['pnl'],2),'cost':round(ha['cost'],2)})
+                d = cf.get(h)
+                if d and d['n'] > 0:
+                    ft_out.append({'hour':h,'label':f"{h:02d}:00",
+                        'n':d['n'],'amount':round(d['amount'],0)})
+            if ftr_out:
+                trade_data['fill_time_roi_by_city'][city] = ftr_out
+            if ft_out:
+                trade_data['fill_timing_by_city'][city] = ft_out
 
         for buc in sorted(fp_agg.keys()):
             b = fp_agg[buc]
@@ -497,12 +538,17 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
 
     # Win rate / ROI by position size (from settlements, no trade CSV needed)
     sz_buckets = defaultdict(lambda:{'n':0,'pnl':0,'cost':0,'wins':0,'contracts':0,'avg_price':0})
+    sz_by_city = defaultdict(lambda: defaultdict(lambda:{'n':0,'pnl':0,'cost':0,'wins':0,'contracts':0,'avg_price':0}))
     for s in [x for x in active_cities if x['no_c']>0]:
         buc = (s['no_c']//100)*100
         b = sz_buckets[buc]
         b['n']+=1; b['pnl']+=s['pnl']; b['cost']+=s['cost']; b['contracts']+=s['no_c']
         b['avg_price']+=s['no_avg']*100
         if s['pnl']>0: b['wins']+=1
+        bc = sz_by_city[s['city']][buc]
+        bc['n']+=1; bc['pnl']+=s['pnl']; bc['cost']+=s['cost']; bc['contracts']+=s['no_c']
+        bc['avg_price']+=s['no_avg']*100
+        if s['pnl']>0: bc['wins']+=1
     for buc in sorted(sz_buckets.keys()):
         b = sz_buckets[buc]
         if b['n'] < 1: continue
@@ -510,6 +556,18 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
             'pnl':round(b['pnl'],0),'roi':round(b['pnl']/b['cost']*100,1) if b['cost']>0 else 0,
             'wr':round(b['wins']/b['n']*100,1),'avg_price':round(b['avg_price']/b['n'],1),
             'avg_pnl':round(b['pnl']/b['n'],2)})
+    trade_data['size_buckets_by_city'] = {}
+    for city in cities:
+        out = []
+        for buc in sorted(sz_by_city[city].keys()):
+            b = sz_by_city[city][buc]
+            if b['n'] < 1: continue
+            out.append({'size':f"{buc}-{buc+99}",'n':b['n'],
+                'pnl':round(b['pnl'],0),'roi':round(b['pnl']/b['cost']*100,1) if b['cost']>0 else 0,
+                'wr':round(b['wins']/b['n']*100,1),'avg_price':round(b['avg_price']/b['n'],1),
+                'avg_pnl':round(b['pnl']/b['n'],2)})
+        if out:
+            trade_data['size_buckets_by_city'][city] = out
 
     # Platform-wide volume cache (from fetch_kxhigh_volume.py)
     raw_vol = load_volume_cache(volume_cache_path)
@@ -822,16 +880,30 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
         has_trades = bool(td['fill_timing'])
 
         # Position size (always available — from settlements)
-        f.write('''<div id="possize"><h2>Position size analysis</h2>
+        possize_city_opts = ''.join(
+            f'<option value="{c}">{CN[c]}</option>'
+            for c in cities if c in td.get('size_buckets_by_city', {})
+        )
+        f.write(f'''<div id="possize"><h2>Position size analysis</h2>
 <p class="sub">Win rate, ROI, and total profit by number of NO contracts held at settlement. Lower win rate at larger sizes is expected — wins are bigger to compensate.</p>
+<div style="margin:0.5rem 0"><label style="color:#94a3b8;font-size:0.85rem;margin-right:0.5rem">City:</label>
+<select id="possizeCity" style="background:var(--bg2);color:#e8eef7;border:1px solid #334155;border-radius:6px;padding:0.3rem 0.6rem;font-size:0.9rem">
+<option value="__ALL__">All cities</option>{possize_city_opts}</select></div>
 <div class="g3"><div><h3>ROI by position size</h3><div class="cc"><canvas id="sizeROI"></canvas></div></div>
 <div><h3>Win rate by position size</h3><div class="cc"><canvas id="sizeWR"></canvas></div></div>
 <div><h3>Profit by position size ($)</h3><div class="cc"><canvas id="sizePnL"></canvas></div></div></div></div>\n''')
 
         if has_trades:
             # Fill timing
-            f.write('''<div id="filltime"><h2>Fill time analysis (ET)</h2>
+            ft_city_opts = ''.join(
+                f'<option value="{c}">{CN[c]}</option>'
+                for c in cities if c in td.get('fill_time_roi_by_city', {})
+            )
+            f.write(f'''<div id="filltime"><h2>Fill time analysis (ET)</h2>
 <p class="sub">When do your NO orders get filled? Profit by hour pro-rates each settlement's realized P&L across its constituent fills, so summing all hours equals total settled P&L.</p>
+<div style="margin:0.5rem 0"><label style="color:#94a3b8;font-size:0.85rem;margin-right:0.5rem">City:</label>
+<select id="filltimeCity" style="background:var(--bg2);color:#e8eef7;border:1px solid #334155;border-radius:6px;padding:0.3rem 0.6rem;font-size:0.9rem">
+<option value="__ALL__">All cities</option>{ft_city_opts}</select></div>
 <div class="g3"><div><h3>Fills per hour</h3><div class="cc tall"><canvas id="hourFills"></canvas></div></div>
 <div><h3>Edge per contract by hour (cents)</h3><div class="cc tall"><canvas id="hourEdge"></canvas></div></div>
 <div><h3>Profit by fill hour ($)</h3><div class="cc tall"><canvas id="hourProfit"></canvas></div></div></div>
@@ -968,48 +1040,84 @@ new Chart(document.getElementById('dowChart'),{type:'bar',data:{labels:dowL,data
 function fmtDollars(v){return (v>=0?'':'-')+'$'+Math.abs(v).toLocaleString()}
 function fmtSigned(v){return (v>=0?'+':'-')+'$'+Math.abs(v).toLocaleString()}
 
-// Position size
-if(TD.size_buckets&&TD.size_buckets.length){
-  var sz=TD.size_buckets;
-  new Chart(document.getElementById('sizeROI'),{type:'bar',
+// Position size (with per-city dropdown)
+function renderPosSize(sz){
+  ['sizeROI','sizeWR','sizePnL'].forEach(function(id){if(CHARTS[id]){CHARTS[id].destroy();delete CHARTS[id];}});
+  if(!sz||!sz.length){
+    ['sizeROI','sizeWR','sizePnL'].forEach(function(id){
+      var el=document.getElementById(id);if(!el)return;
+      var ctx=el.getContext('2d');ctx.clearRect(0,0,el.width,el.height);
+      ctx.fillStyle='#94a3b8';ctx.font='12px sans-serif';ctx.textAlign='center';
+      ctx.fillText('No data for selected city',el.width/2,el.height/2);
+    });
+    return;
+  }
+  CHARTS.sizeROI=new Chart(document.getElementById('sizeROI'),{type:'bar',
     data:{labels:sz.map(function(d){return d.size}),datasets:[{data:sz.map(function(d){return d.roi}),
       backgroundColor:bgP(sz.map(function(d){return d.roi}),'0.6'),borderColor:bdP(sz.map(function(d){return d.roi})),borderWidth:1,borderRadius:3}]},
     options:{...base,scales:mkScales(function(v){return v+'%'}),
       plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=sz[c.dataIndex];return ['ROI: '+d.roi+'%','P&L: $'+d.pnl,'Avg price: '+d.avg_price+'c','n='+d.n]}}}}}});
-  new Chart(document.getElementById('sizeWR'),{type:'bar',
+  CHARTS.sizeWR=new Chart(document.getElementById('sizeWR'),{type:'bar',
     data:{labels:sz.map(function(d){return d.size}),datasets:[{data:sz.map(function(d){return d.wr}),
       backgroundColor:'#378ADD99',borderColor:'#378ADD',borderWidth:1,borderRadius:3}]},
     options:{...base,scales:mkScales(function(v){return v+'%'}),
       plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=sz[c.dataIndex];return ['WR: '+d.wr+'%','Avg P&L/settle: $'+d.avg_pnl,'n='+d.n]}}}}}});
-  new Chart(document.getElementById('sizePnL'),{type:'bar',
+  CHARTS.sizePnL=new Chart(document.getElementById('sizePnL'),{type:'bar',
     data:{labels:sz.map(function(d){return d.size}),datasets:[{data:sz.map(function(d){return d.pnl}),
       backgroundColor:bgP(sz.map(function(d){return d.pnl}),'0.6'),borderColor:bdP(sz.map(function(d){return d.pnl})),borderWidth:1,borderRadius:3}]},
     options:{...base,scales:mkScales(fmtDollars),
       plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=sz[c.dataIndex];return [fmtSigned(d.pnl),'ROI: '+d.roi+'%','WR: '+d.wr+'%','n='+d.n]}}}}}});
 }
-
-// Fill timing
-if(TD.fill_timing&&TD.fill_timing.length){
-  new Chart(document.getElementById('hourFills'),{type:'bar',
-    data:{labels:TD.fill_timing.map(function(d){return d.label}),datasets:[{data:TD.fill_timing.map(function(d){return d.n}),
-      backgroundColor:'#378ADD99',borderColor:'#378ADD',borderWidth:1,borderRadius:3}]},
-    options:{...base,scales:mkScales(function(v){return v}),
-      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=TD.fill_timing[c.dataIndex];return [d.n+' fills','$'+d.amount+' deployed']}}}}}});
+if(TD.size_buckets&&TD.size_buckets.length){
+  renderPosSize(TD.size_buckets);
+  var psSel=document.getElementById('possizeCity');
+  if(psSel){psSel.addEventListener('change',function(){
+    var v=psSel.value;
+    var data=(v==='__ALL__')?TD.size_buckets:((TD.size_buckets_by_city||{})[v]||[]);
+    renderPosSize(data);
+  });}
 }
-if(TD.fill_time_roi&&TD.fill_time_roi.length){
-  var ftr=TD.fill_time_roi;
-  new Chart(document.getElementById('hourEdge'),{type:'bar',
-    data:{labels:ftr.map(function(d){return d.label}),datasets:[{data:ftr.map(function(d){return d.avg_edge}),
-      backgroundColor:bgP(ftr.map(function(d){return d.avg_edge}),'0.6'),
-      borderColor:bdP(ftr.map(function(d){return d.avg_edge})),borderWidth:1,borderRadius:3}]},
-    options:{...base,scales:mkScales(function(v){return v.toFixed(1)+'c'}),
-      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ftr[c.dataIndex];return [d.avg_edge.toFixed(1)+'c/contract','WR: '+d.wr+'%','ROI: '+d.roi+'%','n='+d.n]}}}}}});
-  new Chart(document.getElementById('hourProfit'),{type:'bar',
-    data:{labels:ftr.map(function(d){return d.label}),datasets:[{data:ftr.map(function(d){return d.profit}),
-      backgroundColor:bgP(ftr.map(function(d){return d.profit}),'0.6'),
-      borderColor:bdP(ftr.map(function(d){return d.profit})),borderWidth:1,borderRadius:3}]},
-    options:{...base,scales:mkScales(fmtDollars),
-      plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ftr[c.dataIndex];return [fmtSigned(d.profit),'WR: '+d.wr+'%','ROI: '+d.roi+'%','Cost: $'+d.cost.toLocaleString(),'n='+d.n]}}}}}});
+
+// Fill timing (with per-city dropdown)
+function renderFillTime(timing,ftr){
+  ['hourFills','hourEdge','hourProfit'].forEach(function(id){if(CHARTS[id]){CHARTS[id].destroy();delete CHARTS[id];}});
+  function noData(id){
+    var el=document.getElementById(id);if(!el)return;
+    var ctx=el.getContext('2d');ctx.clearRect(0,0,el.width,el.height);
+    ctx.fillStyle='#94a3b8';ctx.font='12px sans-serif';ctx.textAlign='center';
+    ctx.fillText('No data for selected city',el.width/2,el.height/2);
+  }
+  if(timing&&timing.length){
+    CHARTS.hourFills=new Chart(document.getElementById('hourFills'),{type:'bar',
+      data:{labels:timing.map(function(d){return d.label}),datasets:[{data:timing.map(function(d){return d.n}),
+        backgroundColor:'#378ADD99',borderColor:'#378ADD',borderWidth:1,borderRadius:3}]},
+      options:{...base,scales:mkScales(function(v){return v}),
+        plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=timing[c.dataIndex];return [d.n+' fills','$'+d.amount+' deployed']}}}}}});
+  } else { noData('hourFills'); }
+  if(ftr&&ftr.length){
+    CHARTS.hourEdge=new Chart(document.getElementById('hourEdge'),{type:'bar',
+      data:{labels:ftr.map(function(d){return d.label}),datasets:[{data:ftr.map(function(d){return d.avg_edge}),
+        backgroundColor:bgP(ftr.map(function(d){return d.avg_edge}),'0.6'),
+        borderColor:bdP(ftr.map(function(d){return d.avg_edge})),borderWidth:1,borderRadius:3}]},
+      options:{...base,scales:mkScales(function(v){return v.toFixed(1)+'c'}),
+        plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ftr[c.dataIndex];return [d.avg_edge.toFixed(1)+'c/contract','WR: '+d.wr+'%','ROI: '+d.roi+'%','n='+d.n]}}}}}});
+    CHARTS.hourProfit=new Chart(document.getElementById('hourProfit'),{type:'bar',
+      data:{labels:ftr.map(function(d){return d.label}),datasets:[{data:ftr.map(function(d){return d.profit}),
+        backgroundColor:bgP(ftr.map(function(d){return d.profit}),'0.6'),
+        borderColor:bdP(ftr.map(function(d){return d.profit})),borderWidth:1,borderRadius:3}]},
+      options:{...base,scales:mkScales(fmtDollars),
+        plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){var d=ftr[c.dataIndex];return [fmtSigned(d.profit),'WR: '+d.wr+'%','ROI: '+d.roi+'%','Cost: $'+d.cost.toLocaleString(),'n='+d.n]}}}}}});
+  } else { noData('hourEdge'); noData('hourProfit'); }
+}
+if(TD.fill_timing&&TD.fill_timing.length){
+  renderFillTime(TD.fill_timing, TD.fill_time_roi);
+  var ftSel=document.getElementById('filltimeCity');
+  if(ftSel){ftSel.addEventListener('change',function(){
+    var v=ftSel.value;
+    var t=(v==='__ALL__')?TD.fill_timing:((TD.fill_timing_by_city||{})[v]||[]);
+    var r=(v==='__ALL__')?TD.fill_time_roi:((TD.fill_time_roi_by_city||{})[v]||[]);
+    renderFillTime(t, r);
+  });}
 }
 
 // Night vs day session
