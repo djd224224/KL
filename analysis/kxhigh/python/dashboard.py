@@ -143,7 +143,7 @@ def build_sanity(data: dict) -> str:
     return exec_summary(summary) + commentary(takeaways) + f'<div class="cards">{card_html}</div>{caveat}'
 
 
-def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
+def build_forecast_accuracy(resolved: pd.DataFrame, event_accuracy: pd.DataFrame) -> str:
     summary = (
         '<span class="tl">What this section measures</span>'
         'How close our weather forecasts came to the actual high temperature in each city. '
@@ -151,32 +151,24 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
         '(AccuWeather is dead — API key expired). '
         '<b>MAE</b> (mean absolute error) = typical miss in &deg;F. '
         '<b>Bias</b> = systematic over/under forecast (near zero is ideal). '
-        'Cities where our forecast is consistently off are cities where betting is riskier.'
+        'Cities where our forecast is consistently off are cities where betting is riskier. '
+        '<br><br>This section uses <b>every event-day where the bot recorded a forecast snapshot</b> '
+        'and we have an NWS CLI reading — including days the bot didn&rsquo;t place a bet. '
+        'That decouples forecast quality from trading decisions.'
     )
-    if len(resolved) == 0:
-        return exec_summary(summary) + '<p class="muted">No resolved markets.</p>'
-    df = resolved.dropna(subset=["actual_high_estimate", "forecast_avg"]).copy()
-    if len(df) == 0:
-        return exec_summary(summary) + '<p class="muted">No markets with both forecast and actual.</p>'
+    if event_accuracy is None or len(event_accuracy) == 0:
+        return exec_summary(summary) + '<p class="muted">No event-days with both forecast and actual.</p>'
 
-    # Aggregate to unique (city, event_date) pairs so we don't over-weight events
-    # with many buckets (each event has ~18 markets sharing the same forecast/actual).
-    unique_days = (
-        df.groupby(["city_abv", "forecast_date"], as_index=False)
-          .agg(
-              forecast_avg=("forecast_avg", "mean"),
-              actual_high=("actual_high_estimate", "mean"),
-              forecast_source=("forecast_source", "first"),
-              nws=("nws", "mean"),
-              weather_underground=("weather_underground", "mean"),
-          )
-    )
+    unique_days = event_accuracy.copy()
+    unique_days = unique_days.rename(columns={"actual_high_f": "actual_high"})
     unique_days["residual"] = unique_days["forecast_avg"] - unique_days["actual_high"]
+    # Marker shape: distinguishes traded days vs untraded
+    unique_days["traded_label"] = unique_days["was_traded"].map({True: "traded", False: "untraded"})
 
     # Scatter
     fig1 = px.scatter(
         unique_days, x="forecast_avg", y="actual_high",
-        color="city_abv", symbol="forecast_source",
+        color="city_abv", symbol="traded_label",
         hover_data=["forecast_date", "residual"],
         title=f"Forecast avg vs actual high — per event-day (n={len(unique_days)})",
     )
@@ -242,12 +234,12 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
         fig_roll.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
         fig_roll.update_layout(height=500, showlegend=False)
 
-    # Tail (T) vs between (B) bucket accuracy. Dedupe by (city, event_date, kind)
-    # — the raw rows have multiple buckets per event sharing the same forecast/actual,
-    # which would inflate `n` without changing MAE.
+    # Tail (T) vs between (B) bucket accuracy. Pulls from settled markets
+    # (resolved) since market_kind is per-bucket. Dedupe by (city, event_date, kind).
     fig_kind = None
     kind_rows = []
-    by_kind = (df.dropna(subset=["forecast_avg", "actual_high_estimate"])
+    resolved_with_fc = resolved.dropna(subset=["forecast_avg", "actual_high_estimate"])
+    by_kind = (resolved_with_fc
                  .groupby(["city_abv", "forecast_date", "market_kind"], as_index=False)
                  .agg(forecast_avg=("forecast_avg", "mean"),
                       actual=("actual_high_estimate", "mean")))
@@ -289,10 +281,12 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
     else:
         temp_df = pd.DataFrame()
 
-    n_snap_evt = int((unique_days["forecast_source"] == "snapshot").sum())
+    n_snap_evt = int(len(unique_days))
+    n_traded = int(unique_days["was_traded"].sum())
     source_note = (
-        f'<p class="muted">Forecast source: {n_snap_evt} event-days from real bot snapshots '
-        f'(NWS + Weather Underground at decision time). Markets without snapshots are excluded.</p>'
+        f'<p class="muted">{n_snap_evt} event-days with both a bot forecast snapshot '
+        f'(NWS + WU) and an NWS CLI reading. {n_traded} were traded by the bot, '
+        f'{n_snap_evt - n_traded} were not — accuracy is computed across all of them.</p>'
     )
     html = source_note + fig_to_html(fig1)
     html += "<h3>Overall accuracy (°F) — by source</h3>" + table_html(acc_all)
@@ -1333,7 +1327,8 @@ def main():
 
     modules = [
         ("overview", "Overview & Sanity", build_sanity(data)),
-        ("forecast_accuracy", "1 · Forecast accuracy", build_forecast_accuracy(data["resolved"])),
+        ("forecast_accuracy", "1 · Forecast accuracy",
+         build_forecast_accuracy(data["resolved"], data.get("event_accuracy", pd.DataFrame()))),
         ("calibration", "2 · Prediction calibration",
          build_calibration(data["resolved"])),
         ("spread_pnl", "3 · Forecast spread ↔ P&L",
