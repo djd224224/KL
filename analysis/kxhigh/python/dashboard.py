@@ -106,11 +106,11 @@ def build_sanity(data: dict) -> str:
         for k, v, d in cards
     )
 
-    caveat = ('<div class="caveat">⚠️ <b>Snapshot coverage limited to Mar 9–10, 2026</b> '
-              '(864 rows; only 19 markets have both snapshot + settlement). '
-              'Model-validation sections below are thin — extend snapshot logging '
-              'to run every cycle for more robust analysis. '
-              '<br>AccuWeather source is 100% NULL (API key expired Mar 2026).</div>')
+    n_resolved_with_snap = int(resolved["forecast_avg"].notna().sum())
+    caveat = (f'<div class="caveat">⚠️ <b>{n_resolved_with_snap} of {len(settle)} settled markets '
+              f'have a bot snapshot</b> — Mar 11 → Apr 18 had a silent snapshot-logging '
+              f'outage (fixed). Model-validation sections below are limited to those rows. '
+              f'<br>AccuWeather source is 100% NULL (API key expired Mar 2026).</div>')
 
     # Dynamic commentary based on this run
     settle_pnl = settle["pnl_dollars"].sum()
@@ -135,9 +135,9 @@ def build_sanity(data: dict) -> str:
         f"markets settled per trading day.",
         f"Daily P&L averages <b>${daily_pnl:+,.0f}/day</b>. Fill rate on placed orders is "
         f"<b>{fill_rate:.1%}</b> (low by design — bot is post-only).",
-        "⚠ <b>Model-validation sections (2, 3, 4) are limited to 19 settled markets</b> "
-        "with bot snapshots due to the Mar 11–Apr 18 snapshot logging outage. The silent "
-        "failure is fixed going forward; give it ~2 weeks of runs before revisiting.",
+        f"⚠ <b>Model-validation sections (2, 3, 4) are limited to {n_resolved_with_snap} settled markets</b> "
+        f"with bot snapshots due to the Mar 11–Apr 18 snapshot logging outage. The silent "
+        f"failure is fixed going forward; give it ~2 more weeks of runs before revisiting.",
     ]
 
     return exec_summary(summary) + commentary(takeaways) + f'<div class="cards">{card_html}</div>{caveat}'
@@ -167,8 +167,6 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
               forecast_avg=("forecast_avg", "mean"),
               actual_high=("actual_high_estimate", "mean"),
               forecast_source=("forecast_source", "first"),
-              backfill_forecast_gfs=("backfill_forecast_gfs", "mean"),
-              backfill_forecast_ecmwf=("backfill_forecast_ecmwf", "mean"),
           )
     )
     unique_days["residual"] = unique_days["forecast_avg"] - unique_days["actual_high"]
@@ -186,38 +184,27 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
                    line=dict(dash="dash", color="gray"))
     fig1.update_layout(height=500)
 
-    # MAE/bias per city using ensemble forecast_avg + each model individually
+    # MAE/bias per city using the bot's ensemble forecast (NWS + WU snapshot)
     rows = []
     for (city, g) in unique_days.groupby("city_abv"):
-        for src_col, src_label in [
-            ("forecast_avg", "ensemble"),
-            ("backfill_forecast_gfs", "GFS"),
-            ("backfill_forecast_ecmwf", "ECMWF"),
-        ]:
-            s = g[[src_col, "actual_high"]].dropna()
-            if len(s) == 0:
-                continue
-            err = s[src_col] - s["actual_high"]
-            rows.append({
-                "city_abv": city, "source": src_label, "n": len(s),
-                "mae": err.abs().mean(), "bias": err.mean(),
-                "rmse": float(np.sqrt((err ** 2).mean())),
-            })
+        s = g[["forecast_avg", "actual_high"]].dropna()
+        if len(s) == 0:
+            continue
+        err = s["forecast_avg"] - s["actual_high"]
+        rows.append({
+            "city_abv": city, "source": "ensemble", "n": len(s),
+            "mae": err.abs().mean(), "bias": err.mean(),
+            "rmse": float(np.sqrt((err ** 2).mean())),
+        })
     acc_city = pd.DataFrame(rows)
 
     # Overall across all cities
     all_rows = []
-    for src_col, src_label in [
-        ("forecast_avg", "ensemble"),
-        ("backfill_forecast_gfs", "GFS"),
-        ("backfill_forecast_ecmwf", "ECMWF"),
-    ]:
-        s = unique_days[[src_col, "actual_high"]].dropna()
-        if len(s) == 0:
-            continue
-        err = s[src_col] - s["actual_high"]
+    s = unique_days[["forecast_avg", "actual_high"]].dropna()
+    if len(s) > 0:
+        err = s["forecast_avg"] - s["actual_high"]
         all_rows.append({
-            "source": src_label, "n": len(s),
+            "source": "ensemble", "n": len(s),
             "mae": err.abs().mean(), "bias": err.mean(),
             "rmse": float(np.sqrt((err ** 2).mean())),
         })
@@ -232,10 +219,10 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
     fig3.add_hline(y=0, line_dash="dash", line_color="gray")
     fig3.update_layout(height=450)
 
+    n_snap_evt = int((unique_days["forecast_source"] == "snapshot").sum())
     source_note = (
-        f'<p class="muted">Forecast source: {(unique_days["forecast_source"]=="snapshot").sum()} from '
-        f'bot snapshots, {(unique_days["forecast_source"]=="backfill_open_meteo").sum()} from '
-        f'Open-Meteo historical backfill (GFS + ECMWF ensemble).</p>'
+        f'<p class="muted">Forecast source: {n_snap_evt} event-days from real bot snapshots '
+        f'(NWS + Weather Underground at decision time). Markets without snapshots are excluded.</p>'
     )
     html = source_note + fig_to_html(fig1)
     html += "<h3>Overall accuracy (°F)</h3>" + table_html(acc_all)
@@ -246,20 +233,12 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
     takeaways = []
     if not acc_all.empty:
         ens = acc_all[acc_all["source"] == "ensemble"].iloc[0] if (acc_all["source"] == "ensemble").any() else None
-        gfs = acc_all[acc_all["source"] == "GFS"].iloc[0] if (acc_all["source"] == "GFS").any() else None
-        ecm = acc_all[acc_all["source"] == "ECMWF"].iloc[0] if (acc_all["source"] == "ECMWF").any() else None
         if ens is not None:
             bias_dir = "cold (under-predicts)" if ens["bias"] < -0.2 else ("hot (over-predicts)" if ens["bias"] > 0.2 else "essentially unbiased")
             takeaways.append(
-                f"Overall forecast MAE is <b>{ens['mae']:.2f}°F</b> — typical for next-day max "
-                f"forecasts. The ensemble runs <b>{bias_dir}</b> (bias {ens['bias']:+.2f}°F)."
-            )
-        if gfs is not None and ecm is not None:
-            better = "GFS" if gfs["mae"] < ecm["mae"] else "ECMWF"
-            diff = abs(gfs["mae"] - ecm["mae"])
-            takeaways.append(
-                f"GFS MAE {gfs['mae']:.2f}°F vs ECMWF MAE {ecm['mae']:.2f}°F — "
-                f"<b>{better}</b> edges out by {diff:.2f}°F. When they disagree, that spread is usable signal."
+                f"Bot's ensemble (NWS + WU) forecast MAE is <b>{ens['mae']:.2f}°F</b> on "
+                f"<b>n={ens['n']}</b> event-days with snapshots. The ensemble runs "
+                f"<b>{bias_dir}</b> (bias {ens['bias']:+.2f}°F)."
             )
 
     if not acc_city.empty:
@@ -279,12 +258,10 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
                     bias_notes.append(f"<b>{r['city_abv']}</b> ({r['bias']:+.1f}°F, forecasts {d})")
                 takeaways.append(f"Cities with material systematic bias: {', '.join(bias_notes)}. Worth a regime-specific correction.")
 
-    n_snap = (unique_days["forecast_source"] == "snapshot").sum()
-    n_back = (unique_days["forecast_source"] == "backfill_open_meteo").sum()
-    if n_back > n_snap * 5:
+    if n_snap_evt < 50:
         takeaways.append(
-            f"<b>{n_back} of {n_snap + n_back}</b> event-days used the Open-Meteo backfill rather "
-            f"than a real bot snapshot — this is an approximation until snapshot logging fills in."
+            f"⚠ Only <b>{n_snap_evt}</b> event-days have real bot snapshots — this section is "
+            f"thin until the post-Apr 18 snapshot logging fix accumulates more data."
         )
 
     return exec_summary(summary) + commentary(takeaways) + html
@@ -399,8 +376,8 @@ def build_calibration(resolved: pd.DataFrame) -> str:
                 )
     if decomp['n'] < 50:
         takeaways.append(
-            "⚠ With only 19 markets, these numbers have wide confidence intervals. "
-            "Give it 2 weeks of snapshot data before drawing conclusions."
+            f"⚠ With only {decomp['n']} markets, these numbers have wide confidence intervals. "
+            "Give it 2 more weeks of snapshot data before drawing conclusions."
         )
 
     return (exec_summary(summary) + commentary(takeaways) + metrics_html + fig_to_html(fig)
@@ -426,7 +403,6 @@ def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
     html_parts = []
     takeaway_lines = []
     for col, label in [("forecast_std", "forecast_std"),
-                       ("backfill_forecast_std", "backfill_forecast_std (GFS vs ECMWF)"),
                        ("forecast_range", "forecast_range")]:
         if col not in resolved.columns:
             continue
