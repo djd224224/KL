@@ -141,3 +141,55 @@ def cumulative_pnl_series(df_settle: pd.DataFrame) -> pd.DataFrame:
     s["peak"] = s["cum_pnl"].cummax()
     s["drawdown"] = s["cum_pnl"] - s["peak"]
     return s
+
+
+def per_city_calibration(df: pd.DataFrame, n_bins: int = 10) -> pd.DataFrame:
+    """Brier + log loss + n per city. Uses model yes_probability vs outcome_yes."""
+    out = []
+    for city, g in df.dropna(subset=["yes_probability", "outcome_yes"]).groupby("city_abv"):
+        if len(g) < 5:
+            continue
+        b = brier_score(g["yes_probability"], g["outcome_yes"])
+        ll = log_loss(g["yes_probability"], g["outcome_yes"])
+        d = brier_decomposition(g["yes_probability"].values, g["outcome_yes"].values, n_bins=n_bins)
+        out.append({
+            "city_abv": city, "n": int(len(g)),
+            "brier": b, "log_loss": ll,
+            "reliability": d["reliability"], "resolution": d["resolution"],
+        })
+    return pd.DataFrame(out).sort_values("brier")
+
+
+def rolling_forecast_accuracy(df: pd.DataFrame, window_days: int = 7) -> pd.DataFrame:
+    """7-day rolling MAE and bias on event-day forecasts.
+
+    Input: per-(city, event_date) forecast_avg + actual_high. Aggregated into
+    daily MAE/bias across all cities, then rolled window_days."""
+    s = df.dropna(subset=["forecast_avg", "actual_high"]).copy()
+    if len(s) == 0:
+        return pd.DataFrame()
+    s["event_date"] = pd.to_datetime(s["forecast_date"]).dt.date
+    s["err"] = s["forecast_avg"] - s["actual_high"]
+    s["abs_err"] = s["err"].abs()
+    daily = (s.groupby("event_date")
+              .agg(n=("err", "size"), mae=("abs_err", "mean"), bias=("err", "mean"))
+              .reset_index().sort_values("event_date"))
+    daily["mae_rolling"] = daily["mae"].rolling(window_days, min_periods=3).mean()
+    daily["bias_rolling"] = daily["bias"].rolling(window_days, min_periods=3).mean()
+    return daily
+
+
+def position_cap_utilization(orders: pd.DataFrame, settlements: pd.DataFrame, cap: int = 500) -> pd.DataFrame:
+    """Per-market cap utilization. Counts how often the bot's filled position
+    approaches or exceeds the configured max_contracts cap. Useful to detect
+    leaks (>cap) and slack (<<cap)."""
+    if "position_no" not in settlements.columns:
+        return pd.DataFrame()
+    s = settlements[["market_ticker", "city_abv", "position_no"]].copy()
+    s["position_no"] = s["position_no"].fillna(0).astype(int)
+    s["util"] = s["position_no"] / float(cap)
+    s["bucket"] = pd.cut(s["util"],
+                        bins=[-0.001, 0.0, 0.25, 0.50, 0.80, 0.95, 1.00, 10.0],
+                        labels=["0% (no fills)", "0-25%", "25-50%", "50-80%",
+                                "80-95%", "95-100% (at cap)", ">100% (LEAK)"])
+    return s

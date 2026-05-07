@@ -167,6 +167,8 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
               forecast_avg=("forecast_avg", "mean"),
               actual_high=("actual_high_estimate", "mean"),
               forecast_source=("forecast_source", "first"),
+              nws=("nws", "mean"),
+              weather_underground=("weather_underground", "mean"),
           )
     )
     unique_days["residual"] = unique_days["forecast_avg"] - unique_days["actual_high"]
@@ -184,34 +186,40 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
                    line=dict(dash="dash", color="gray"))
     fig1.update_layout(height=500)
 
-    # MAE/bias per city using the bot's ensemble forecast (NWS + WU snapshot)
+    # MAE/bias per (city × source). NWS-only and WU-only individually + ensemble.
     rows = []
-    for (city, g) in unique_days.groupby("city_abv"):
-        s = g[["forecast_avg", "actual_high"]].dropna()
-        if len(s) == 0:
-            continue
-        err = s["forecast_avg"] - s["actual_high"]
-        rows.append({
-            "city_abv": city, "source": "ensemble", "n": len(s),
-            "mae": err.abs().mean(), "bias": err.mean(),
-            "rmse": float(np.sqrt((err ** 2).mean())),
-        })
+    for src_col, src_label in [("forecast_avg", "ensemble"),
+                               ("nws", "NWS"),
+                               ("weather_underground", "WU")]:
+        for (city, g) in unique_days.groupby("city_abv"):
+            s = g[[src_col, "actual_high"]].dropna()
+            if len(s) == 0:
+                continue
+            err = s[src_col] - s["actual_high"]
+            rows.append({
+                "city_abv": city, "source": src_label, "n": len(s),
+                "mae": err.abs().mean(), "bias": err.mean(),
+                "rmse": float(np.sqrt((err ** 2).mean())),
+            })
     acc_city = pd.DataFrame(rows)
 
-    # Overall across all cities
+    # Overall across all cities, per source
     all_rows = []
-    s = unique_days[["forecast_avg", "actual_high"]].dropna()
-    if len(s) > 0:
-        err = s["forecast_avg"] - s["actual_high"]
-        all_rows.append({
-            "source": "ensemble", "n": len(s),
-            "mae": err.abs().mean(), "bias": err.mean(),
-            "rmse": float(np.sqrt((err ** 2).mean())),
-        })
+    for src_col, src_label in [("forecast_avg", "ensemble"),
+                               ("nws", "NWS"),
+                               ("weather_underground", "WU")]:
+        s = unique_days[[src_col, "actual_high"]].dropna()
+        if len(s) > 0:
+            err = s[src_col] - s["actual_high"]
+            all_rows.append({
+                "source": src_label, "n": len(s),
+                "mae": err.abs().mean(), "bias": err.mean(),
+                "rmse": float(np.sqrt((err ** 2).mean())),
+            })
     acc_all = pd.DataFrame(all_rows)
 
     fig2 = px.bar(acc_city, x="city_abv", y="mae", color="source", barmode="group",
-                  title="MAE by city (°F)")
+                  title="MAE by city × source (°F) — NWS vs WU vs ensemble")
     fig2.update_layout(height=450)
 
     fig3 = px.box(unique_days, x="city_abv", y="residual",
@@ -219,26 +227,105 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
     fig3.add_hline(y=0, line_dash="dash", line_color="gray")
     fig3.update_layout(height=450)
 
+    # Rolling 7-day MAE / bias
+    roll = M.rolling_forecast_accuracy(unique_days, window_days=7)
+    fig_roll = None
+    if not roll.empty and roll["mae_rolling"].notna().any():
+        fig_roll = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                 subplot_titles=("Rolling 7-day MAE (°F)", "Rolling 7-day bias (°F)"))
+        fig_roll.add_trace(go.Scatter(x=roll["event_date"], y=roll["mae_rolling"],
+                                       mode="lines+markers", line=dict(color="steelblue"),
+                                       name="MAE 7d"), row=1, col=1)
+        fig_roll.add_trace(go.Scatter(x=roll["event_date"], y=roll["bias_rolling"],
+                                       mode="lines+markers", line=dict(color="seagreen"),
+                                       name="Bias 7d"), row=2, col=1)
+        fig_roll.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
+        fig_roll.update_layout(height=500, showlegend=False)
+
+    # Tail (T) vs between (B) bucket accuracy
+    fig_kind = None
+    kind_rows = []
+    for kind in ("between", "tail"):
+        s = df[(df["market_kind"] == kind) & df["forecast_avg"].notna()
+               & df["actual_high_estimate"].notna()]
+        if len(s) == 0:
+            continue
+        err = s["forecast_avg"] - s["actual_high_estimate"]
+        kind_rows.append({
+            "market_kind": kind, "n": len(s),
+            "mae": err.abs().mean(), "bias": err.mean(),
+            "rmse": float(np.sqrt((err ** 2).mean())),
+        })
+    kind_df = pd.DataFrame(kind_rows)
+
+    # Bias by temperature regime (cold quartile vs hot quartile of actual highs)
+    fig_temp = None
+    temp_rows = []
+    if len(unique_days) >= 12:
+        ud = unique_days.dropna(subset=["forecast_avg", "actual_high"]).copy()
+        ud["temp_q"] = pd.qcut(ud["actual_high"], q=4, labels=["Q1 cold", "Q2", "Q3", "Q4 hot"])
+        for q, g in ud.groupby("temp_q", observed=True):
+            err = g["forecast_avg"] - g["actual_high"]
+            temp_rows.append({
+                "temp_quartile": str(q), "n": len(g),
+                "median_high_F": float(g["actual_high"].median()),
+                "mae": err.abs().mean(), "bias": err.mean(),
+            })
+        temp_df = pd.DataFrame(temp_rows)
+        fig_temp = make_subplots(rows=1, cols=2,
+                                 subplot_titles=("MAE by temperature regime", "Bias by temperature regime"))
+        fig_temp.add_trace(go.Bar(x=temp_df["temp_quartile"], y=temp_df["mae"],
+                                   marker_color="steelblue", text=temp_df["n"],
+                                   texttemplate="n=%{text}"), row=1, col=1)
+        fig_temp.add_trace(go.Bar(x=temp_df["temp_quartile"], y=temp_df["bias"],
+                                   marker_color=["crimson" if v < 0 else "seagreen" for v in temp_df["bias"]]),
+                            row=1, col=2)
+        fig_temp.update_layout(height=380, showlegend=False)
+    else:
+        temp_df = pd.DataFrame()
+
     n_snap_evt = int((unique_days["forecast_source"] == "snapshot").sum())
     source_note = (
         f'<p class="muted">Forecast source: {n_snap_evt} event-days from real bot snapshots '
         f'(NWS + Weather Underground at decision time). Markets without snapshots are excluded.</p>'
     )
     html = source_note + fig_to_html(fig1)
-    html += "<h3>Overall accuracy (°F)</h3>" + table_html(acc_all)
+    html += "<h3>Overall accuracy (°F) — by source</h3>" + table_html(acc_all)
     html += fig_to_html(fig2)
     html += fig_to_html(fig3)
+    if fig_roll is not None:
+        html += "<h3>Rolling 7-day accuracy (drift detection)</h3>" + fig_to_html(fig_roll)
+    if not kind_df.empty:
+        html += "<h3>Tail (T) vs between (B) bucket accuracy</h3>" + table_html(kind_df)
+    if fig_temp is not None:
+        html += "<h3>Forecast accuracy by temperature regime</h3>" + fig_to_html(fig_temp) + table_html(temp_df)
 
     # Dynamic commentary
     takeaways = []
     if not acc_all.empty:
         ens = acc_all[acc_all["source"] == "ensemble"].iloc[0] if (acc_all["source"] == "ensemble").any() else None
+        nws = acc_all[acc_all["source"] == "NWS"].iloc[0] if (acc_all["source"] == "NWS").any() else None
+        wu = acc_all[acc_all["source"] == "WU"].iloc[0] if (acc_all["source"] == "WU").any() else None
         if ens is not None:
             bias_dir = "cold (under-predicts)" if ens["bias"] < -0.2 else ("hot (over-predicts)" if ens["bias"] > 0.2 else "essentially unbiased")
             takeaways.append(
                 f"Bot's ensemble (NWS + WU) forecast MAE is <b>{ens['mae']:.2f}°F</b> on "
                 f"<b>n={ens['n']}</b> event-days with snapshots. The ensemble runs "
                 f"<b>{bias_dir}</b> (bias {ens['bias']:+.2f}°F)."
+            )
+        if nws is not None and wu is not None and nws["n"] > 10 and wu["n"] > 10:
+            better = "NWS" if nws["mae"] < wu["mae"] else "WU"
+            diff = abs(nws["mae"] - wu["mae"])
+            ens_bonus = "" if ens is None else (
+                f" The blend's MAE ({ens['mae']:.2f}°F) "
+                + ("matches the better source" if abs(ens['mae'] - min(nws['mae'], wu['mae'])) < 0.1
+                   else f"sits between them ({min(nws['mae'], wu['mae']):.2f}-{max(nws['mae'], wu['mae']):.2f}°F)")
+                + "."
+            )
+            takeaways.append(
+                f"Per-source: NWS MAE {nws['mae']:.2f}°F (bias {nws['bias']:+.2f}) vs "
+                f"WU MAE {wu['mae']:.2f}°F (bias {wu['bias']:+.2f}). "
+                f"<b>{better}</b> is more accurate by {diff:.2f}°F.{ens_bonus}"
             )
 
     if not acc_city.empty:
@@ -258,6 +345,25 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
                     bias_notes.append(f"<b>{r['city_abv']}</b> ({r['bias']:+.1f}°F, forecasts {d})")
                 takeaways.append(f"Cities with material systematic bias: {', '.join(bias_notes)}. Worth a regime-specific correction.")
 
+    if not kind_df.empty and len(kind_df) == 2:
+        b = kind_df[kind_df["market_kind"] == "between"].iloc[0]
+        t = kind_df[kind_df["market_kind"] == "tail"].iloc[0]
+        worse = "tail" if t["mae"] > b["mae"] else "between"
+        takeaways.append(
+            f"Between-bucket MAE {b['mae']:.2f}°F (n={int(b['n'])}) vs tail-bucket MAE "
+            f"{t['mae']:.2f}°F (n={int(t['n'])}). <b>{worse}</b> buckets are harder — "
+            f"matters more for tail bets where the model claims highest edge."
+        )
+    if not temp_df.empty and len(temp_df) == 4:
+        cold = temp_df.iloc[0]
+        hot = temp_df.iloc[-1]
+        if abs(cold["bias"] - hot["bias"]) > 0.5:
+            cold_dir = "too cold" if cold["bias"] < 0 else "too hot"
+            hot_dir = "too cold" if hot["bias"] < 0 else "too hot"
+            takeaways.append(
+                f"Bias by regime: coldest 25% of days runs {cold['bias']:+.2f}°F ({cold_dir}), "
+                f"hottest 25% runs {hot['bias']:+.2f}°F ({hot_dir}). Suggests a regime-conditioned correction."
+            )
     if n_snap_evt < 50:
         takeaways.append(
             f"⚠ Only <b>{n_snap_evt}</b> event-days have real bot snapshots — this section is "
@@ -380,8 +486,71 @@ def build_calibration(resolved: pd.DataFrame) -> str:
             "Give it 2 more weeks of snapshot data before drawing conclusions."
         )
 
+    # Per-city calibration breakdown
+    per_city = M.per_city_calibration(df, n_bins=10)
+    per_city_html = ""
+    if not per_city.empty:
+        fig_pc = go.Figure()
+        fig_pc.add_trace(go.Bar(
+            x=per_city["city_abv"], y=per_city["brier"],
+            marker_color=["seagreen" if v < b_mkt else "indianred" for v in per_city["brier"]],
+            text=per_city["n"], texttemplate="n=%{text}",
+        ))
+        fig_pc.add_hline(y=b_mkt, line_dash="dash", line_color="gray",
+                         annotation_text=f"market Brier {b_mkt:.3f}",
+                         annotation_position="top right")
+        fig_pc.update_layout(title="Per-city Brier (green = beats market, red = loses to market)",
+                             xaxis_title="city", yaxis_title="Brier score (lower is better)",
+                             height=420, showlegend=False)
+        per_city_html = "<h3>Per-city calibration</h3>" + fig_to_html(fig_pc) + table_html(per_city)
+
+        # Add to takeaways
+        beats_mkt = per_city[per_city["brier"] < b_mkt]
+        loses_mkt = per_city[per_city["brier"] >= b_mkt]
+        if len(beats_mkt) > 0 and len(loses_mkt) > 0:
+            best_city = beats_mkt.iloc[0]
+            worst_city = per_city.iloc[-1]
+            takeaways.append(
+                f"Per-city Brier: <b>{best_city['city_abv']}</b> best at {best_city['brier']:.3f} "
+                f"(n={int(best_city['n'])}); <b>{worst_city['city_abv']}</b> worst at "
+                f"{worst_city['brier']:.3f} (n={int(worst_city['n'])}). "
+                f"<b>{len(beats_mkt)} of {len(per_city)}</b> cities beat the market-implied probability "
+                f"({b_mkt:.3f})."
+            )
+
+    # Model − market probability disagreement distribution
+    disagree_html = ""
+    md = df.dropna(subset=["yes_probability", "market_implied_yes_prob_snap"]).copy()
+    if len(md) >= 20:
+        md["model_minus_market"] = md["yes_probability"] - md["market_implied_yes_prob_snap"]
+        fig_dis = go.Figure()
+        fig_dis.add_trace(go.Histogram(x=md["model_minus_market"], nbinsx=30, marker_color="steelblue"))
+        fig_dis.add_vline(x=0, line_dash="dash", line_color="gray")
+        fig_dis.add_vline(x=md["model_minus_market"].mean(), line_dash="dot", line_color="crimson",
+                          annotation_text=f"mean {md['model_minus_market'].mean():+.3f}")
+        fig_dis.update_layout(title="Model P(YES) − market-implied P(YES) — disagreement distribution",
+                              xaxis_title="model − market", yaxis_title="markets", height=380)
+        skew = float(md["model_minus_market"].mean())
+        skew_dir = "above" if skew > 0.01 else ("below" if skew < -0.01 else "centered on")
+        disagree_html = (
+            "<h3>Model vs market disagreement</h3>"
+            + fig_to_html(fig_dis)
+            + f'<p class="muted">Mean: {skew:+.3f}, std: {md["model_minus_market"].std():.3f}, '
+              f'n={len(md)}. Distribution {skew_dir} the market — '
+              f'{"systematically more bullish on YES than market." if skew > 0.01 else ("systematically more bearish than market." if skew < -0.01 else "roughly aligned with market consensus.")}'
+              "</p>"
+        )
+        if abs(skew) > 0.02:
+            direction = "more confident in YES" if skew > 0 else "more confident in NO"
+            takeaways.append(
+                f"Model probabilities are systematically <b>{direction}</b> than the market "
+                f"(mean disagreement {skew:+.3f}, n={len(md)}). Worth checking whether the bias "
+                f"is concentrated in specific cities or temperature regimes."
+            )
+
     return (exec_summary(summary) + commentary(takeaways) + metrics_html + fig_to_html(fig)
-            + "<h3>Bin breakdown</h3>" + table_html(rel))
+            + "<h3>Bin breakdown</h3>" + table_html(rel)
+            + per_city_html + disagree_html)
 
 
 def build_spread_vs_pnl(resolved: pd.DataFrame) -> str:
@@ -464,21 +633,30 @@ def build_edge_capture(fills: pd.DataFrame) -> str:
         return exec_summary(summary) + (
             '<p class="muted">No fills have snapshot context (limited snapshot coverage).</p>'
         )
+    # Compute net-of-fees P&L per fill (gross P&L was already net via realized_pnl_per_fill,
+    # but we also want explicit fee-stripped attribution)
+    df["fee_cost_dollars"] = df["fee_cost_dollars"].fillna(0)
+    df["net_pnl_per_fill"] = df["realized_pnl_per_fill"]  # already net of fees per upstream view
+    df["gross_pnl_per_fill"] = df["realized_pnl_per_fill"] + df["fee_cost_dollars"]
     fig = px.scatter(df, x="model_edge_at_fill", y="realized_pnl_per_fill",
                      color="city_abv", hover_data=["market_ticker", "price_paid_dollars"],
                      title=f"Model edge at fill vs realized P&L (n={len(df)})")
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.add_vline(x=0, line_dash="dash", line_color="gray")
     fig.update_layout(height=500)
-    # Edge-binned P&L
+    # Edge-binned P&L (gross + net of fees side-by-side)
     df["edge_bin"] = pd.qcut(df["model_edge_at_fill"], q=5, duplicates="drop")
     edge_tbl = (df.groupby("edge_bin", observed=True)
                   .agg(n=("realized_pnl_per_fill", "size"),
-                       mean_pnl=("realized_pnl_per_fill", "mean"),
+                       mean_gross=("gross_pnl_per_fill", "mean"),
+                       mean_net=("net_pnl_per_fill", "mean"),
                        total_pnl=("realized_pnl_per_fill", "sum"),
+                       fees=("fee_cost_dollars", "sum"),
                        win_rate=("realized_pnl_per_fill", lambda x: (x > 0).mean()))
                   .reset_index())
     edge_tbl["edge_bin"] = edge_tbl["edge_bin"].astype(str)
+    edge_tbl["fee_drag_per_fill"] = edge_tbl["fees"] / edge_tbl["n"]
+    edge_tbl["mean_pnl"] = edge_tbl["mean_net"]  # keep legacy column name for downstream
 
     takeaways = []
     if len(edge_tbl) >= 3:
@@ -502,16 +680,95 @@ def build_edge_capture(fills: pd.DataFrame) -> str:
             f"<b>${best_bin['mean_pnl']:+.2f}/fill</b> avg P&L, "
             f"<b>{best_bin['win_rate']:.0%}</b> win rate on {int(best_bin['n'])} fills."
         )
+    # Min-edge break-even: smallest edge bin with mean_net > 0
+    breakeven_bin = None
+    for _, r in edge_tbl.iterrows():
+        if r["mean_net"] > 0:
+            breakeven_bin = r
+            break
+    if breakeven_bin is not None:
+        takeaways.append(
+            f"<b>Min-edge break-even</b>: profitable starting at edge bin {breakeven_bin['edge_bin']} "
+            f"(${breakeven_bin['mean_net']:+.2f}/fill net of fees). Lower-edge bins lose money — "
+            f"a min-edge filter could trim noise."
+        )
+
+    # ---- Edge by bucket distance (|market_strike - forecast_avg_at_fill|) ----
+    bucket_html = ""
+    bd = df.dropna(subset=["market_strike", "forecast_avg_at_fill"]).copy()
+    if len(bd) >= 50:
+        bd["bucket_distance_F"] = (bd["market_strike"] - bd["forecast_avg_at_fill"]).abs()
+        bd["dist_bin"] = pd.qcut(bd["bucket_distance_F"], q=4, duplicates="drop")
+        dist_tbl = (bd.groupby("dist_bin", observed=True)
+                     .agg(n=("realized_pnl_per_fill", "size"),
+                          mean_pnl=("realized_pnl_per_fill", "mean"),
+                          total_pnl=("realized_pnl_per_fill", "sum"),
+                          win_rate=("realized_pnl_per_fill", lambda x: (x > 0).mean()),
+                          median_distance_F=("bucket_distance_F", "median"))
+                     .reset_index())
+        dist_tbl["dist_bin"] = dist_tbl["dist_bin"].astype(str)
+        fig_bd = go.Figure()
+        fig_bd.add_trace(go.Bar(x=dist_tbl["dist_bin"], y=dist_tbl["mean_pnl"],
+                                marker_color="steelblue", text=dist_tbl["n"],
+                                texttemplate="n=%{text}"))
+        fig_bd.update_layout(title="Mean P&L per fill by |bucket strike − forecast μ| (°F)",
+                             xaxis_title="bucket distance bin", yaxis_title="mean P&L per fill ($)",
+                             height=380, showlegend=False)
+        bucket_html = "<h3>Edge by bucket distance</h3>" + fig_to_html(fig_bd) + table_html(dist_tbl)
+        if len(dist_tbl) >= 3:
+            lo, hi = dist_tbl.iloc[0], dist_tbl.iloc[-1]
+            takeaways.append(
+                f"Bucket distance: closest-to-strike fills earn <b>${lo['mean_pnl']:+.2f}/fill</b>, "
+                f"farthest <b>${hi['mean_pnl']:+.2f}/fill</b>. "
+                + ("Closer-to-strike (high uncertainty) markets pay better — bot exploits indecision."
+                   if lo['mean_pnl'] > hi['mean_pnl'] else
+                   "Farther-from-strike (sleepy) markets pay better — bot picks off mispriced edges.")
+            )
+
+    # ---- Cumulative edge decay (rolling 14-day mean P&L per fill) ----
+    decay_html = ""
+    if "fill_ts" in df.columns:
+        td = df.dropna(subset=["fill_ts", "realized_pnl_per_fill"]).copy()
+        td["fill_date"] = pd.to_datetime(td["fill_ts"], utc=True, errors="coerce").dt.date
+        daily = (td.dropna(subset=["fill_date"])
+                  .groupby("fill_date").agg(n=("realized_pnl_per_fill", "size"),
+                                             mean_pnl=("realized_pnl_per_fill", "mean"))
+                  .reset_index().sort_values("fill_date"))
+        if len(daily) >= 5:
+            daily["mean_pnl_14d"] = daily["mean_pnl"].rolling(14, min_periods=5).mean()
+            fig_decay = go.Figure()
+            fig_decay.add_trace(go.Scatter(x=daily["fill_date"], y=daily["mean_pnl_14d"],
+                                            mode="lines+markers", line=dict(color="steelblue"),
+                                            name="14-day rolling mean P&L per fill"))
+            fig_decay.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig_decay.update_layout(title="Edge decay: 14-day rolling mean P&L per fill",
+                                    xaxis_title="fill date", yaxis_title="mean P&L per fill ($)",
+                                    height=380)
+            decay_html = "<h3>Edge decay over time</h3>" + fig_to_html(fig_decay)
+            recent = daily["mean_pnl_14d"].dropna()
+            if len(recent) >= 5:
+                first_half = recent.iloc[:len(recent)//2].mean()
+                second_half = recent.iloc[len(recent)//2:].mean()
+                if abs(second_half - first_half) > 0.3:
+                    direction = "shrinking" if second_half < first_half else "growing"
+                    takeaways.append(
+                        f"14-day rolling mean P&L per fill is <b>{direction}</b>: "
+                        f"${first_half:+.2f} (early period) → ${second_half:+.2f} (recent). "
+                        + ("Watch for further compression — may need to size down or sharpen the model."
+                           if direction == "shrinking" else "Edge is improving — model or market is shifting.")
+                    )
+
     takeaways.append(
         f"⚠ Only <b>{len(df)} fills</b> have snapshot context (the rest fall in the Mar 11 → "
         "Apr 18 logging gap). This analysis is preliminary until snapshot data accumulates."
     )
 
     return (exec_summary(summary) + commentary(takeaways) + fig_to_html(fig)
-            + "<h3>P&L by edge quintile</h3>" + table_html(edge_tbl))
+            + "<h3>P&L by edge quintile (gross + net of fees)</h3>" + table_html(edge_tbl)
+            + bucket_html + decay_html)
 
 
-def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
+def build_execution(orders: pd.DataFrame, fills: pd.DataFrame, settlements: pd.DataFrame) -> str:
     summary = (
         '<span class="tl">What this section measures</span>'
         'Even a great model can be ruined by bad execution. This section grades <b>how '
@@ -597,10 +854,61 @@ def build_execution(orders: pd.DataFrame, fills: pd.DataFrame) -> str:
             "Low fill rate ≠ bad — often means our limit prices are conservative."
         )
 
+    # ---- Position-cap utilization ----
+    cap_html = ""
+    cap = 500  # high_temp_trading.py:1345 max_contracts
+    cu = M.position_cap_utilization(orders, settlements, cap=cap)
+    if not cu.empty:
+        cu_dist = cu["bucket"].value_counts().reindex(
+            ["0% (no fills)", "0-25%", "25-50%", "50-80%", "80-95%",
+             "95-100% (at cap)", ">100% (LEAK)"], fill_value=0).reset_index()
+        cu_dist.columns = ["utilization", "n_markets"]
+        cu_dist["share"] = cu_dist["n_markets"] / cu_dist["n_markets"].sum()
+        leaks = int((cu["util"] > 1.0).sum())
+        at_cap = int(((cu["util"] >= 0.95) & (cu["util"] <= 1.0)).sum())
+        avg_util = float(cu["util"].mean())
+
+        fig_cu = go.Figure()
+        colors = ["#e0e0e0", "#cce5ff", "#99ccff", "#66b3ff", "#3399ff",
+                  "#0066cc", "#cc0033"]
+        fig_cu.add_trace(go.Bar(x=cu_dist["utilization"], y=cu_dist["n_markets"],
+                                marker_color=colors[:len(cu_dist)],
+                                text=cu_dist["n_markets"], textposition="outside"))
+        fig_cu.update_layout(title=f"Position-cap utilization (cap = {cap} contracts)",
+                             xaxis_title="utilization bucket", yaxis_title="markets",
+                             height=380, showlegend=False)
+        cap_cards = "".join([
+            f'<div class="card"><div class="k">Avg cap utilization</div><div class="v">{avg_util:.0%}</div><div class="d">across {len(cu)} markets</div></div>',
+            f'<div class="card"><div class="k">At cap (95-100%)</div><div class="v">{at_cap}</div><div class="d">{at_cap/len(cu):.1%} of markets</div></div>',
+            f'<div class="card"><div class="k">Cap leaks (&gt;100%)</div><div class="v">{leaks}</div><div class="d">{leaks/len(cu):.1%} of markets — should be 0</div></div>',
+        ])
+        cap_html = ("<h3>Position-cap utilization</h3>"
+                    + f'<div class="cards">{cap_cards}</div>'
+                    + fig_to_html(fig_cu) + table_html(cu_dist))
+
+        # Add to takeaways
+        if leaks > 0:
+            takeaways.append(
+                f"⚠ <b>{leaks} markets</b> exceeded the {cap}-contract cap (cap leak). "
+                f"See [high_temp_trading.py:1853-1893](high_temp_trading.py:1853) — server-side "
+                f"check should prevent further leaks; flag any new ones immediately."
+            )
+        elif at_cap / max(len(cu), 1) > 0.20:
+            takeaways.append(
+                f"<b>{at_cap} of {len(cu)} markets</b> ({at_cap/len(cu):.0%}) hit ≥95% of cap. "
+                f"The cap is binding frequently — consider raising max_contracts to size up high-conviction trades."
+            )
+        else:
+            takeaways.append(
+                f"Position-cap utilization averages <b>{avg_util:.0%}</b> across {len(cu)} markets. "
+                f"Cap rarely binds ({at_cap} markets at 95%+); plenty of headroom on size."
+            )
+
     return (exec_summary(summary) + commentary(takeaways)
             + fig_to_html(fig1) + fig_to_html(fig2)
             + f'<div class="cards">{exec_cards}</div>'
-            + "<h3>By city (top 25)</h3>" + table_html(by_city))
+            + "<h3>By city (top 25)</h3>" + table_html(by_city)
+            + cap_html)
 
 
 def build_pnl_attribution(settle: pd.DataFrame) -> str:
@@ -713,10 +1021,49 @@ def build_pnl_attribution(settle: pd.DataFrame) -> str:
             f"({pos_days/len(daily):.0%})."
         )
 
+    # Daily P&L distribution + 1-day VaR
+    var_html = ""
+    if len(daily) >= 10:
+        d_pnl = daily["pnl"].values
+        var_5 = float(np.percentile(d_pnl, 5))
+        var_1 = float(np.percentile(d_pnl, 1))
+        es_5 = float(np.mean([x for x in d_pnl if x <= var_5])) if any(x <= var_5 for x in d_pnl) else float("nan")
+        median_d = float(np.median(d_pnl))
+        worst = float(np.min(d_pnl))
+        best = float(np.max(d_pnl))
+
+        fig_var = go.Figure()
+        fig_var.add_trace(go.Histogram(x=d_pnl, nbinsx=20, marker_color="steelblue",
+                                        name="daily P&L"))
+        fig_var.add_vline(x=0, line_dash="dash", line_color="gray")
+        fig_var.add_vline(x=var_5, line_dash="dot", line_color="orange",
+                          annotation_text=f"5% VaR: ${var_5:.0f}", annotation_position="top")
+        fig_var.add_vline(x=var_1, line_dash="dot", line_color="crimson",
+                          annotation_text=f"1% VaR: ${var_1:.0f}", annotation_position="top")
+        fig_var.update_layout(title="Daily P&L distribution",
+                              xaxis_title="daily P&L ($)", yaxis_title="days",
+                              height=380, showlegend=False)
+        var_cards = "".join([
+            f'<div class="card"><div class="k">Median day</div><div class="v">${median_d:+,.0f}</div><div class="d"></div></div>',
+            f'<div class="card"><div class="k">5% VaR (1d)</div><div class="v">${var_5:+,.0f}</div><div class="d">5% of days lose this or more</div></div>',
+            f'<div class="card"><div class="k">1% VaR (1d)</div><div class="v">${var_1:+,.0f}</div><div class="d">tail-risk threshold</div></div>',
+            f'<div class="card"><div class="k">Expected shortfall (5%)</div><div class="v">${es_5:+,.0f}</div><div class="d">avg of worst-5% days</div></div>',
+            f'<div class="card"><div class="k">Worst day</div><div class="v">${worst:+,.0f}</div><div class="d"></div></div>',
+            f'<div class="card"><div class="k">Best day</div><div class="v">${best:+,.0f}</div><div class="d"></div></div>',
+        ])
+        var_html = ("<h3>Daily P&L distribution &amp; 1-day VaR</h3>"
+                    + f'<div class="cards">{var_cards}</div>'
+                    + fig_to_html(fig_var))
+        takeaways.append(
+            f"Tail risk: <b>5% VaR</b> = ${var_5:+,.0f}/day, <b>1% VaR</b> = ${var_1:+,.0f}/day. "
+            f"Worst observed day was ${worst:+,.0f}. Useful as a stop-loss / sizing reference."
+        )
+
     return (exec_summary(summary) + commentary(takeaways)
             + fig_to_html(fig) + fig_to_html(fig2)
             + fig_to_html(fig3) + fig_to_html(fig4)
-            + "<h3>Per-city table</h3>" + table_html(by_city))
+            + "<h3>Per-city table</h3>" + table_html(by_city)
+            + var_html)
 
 
 CSS = """
@@ -960,7 +1307,7 @@ def main():
         ("edge_capture", "4 · Edge capture (per fill)",
          build_edge_capture(data["fills"])),
         ("execution", "5 · Execution quality",
-         build_execution(data["orders"], data["fills"])),
+         build_execution(data["orders"], data["fills"], data["settlements"])),
         ("pnl", "6 · P&L attribution",
          build_pnl_attribution(data["settlements"])),
         ("filters", "7 · Filter sensitivity (distance + source agreement)",
