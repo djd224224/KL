@@ -142,6 +142,11 @@ _SCHEMA_ORDER = [
     "low_f_gfs_seamless", "low_f_ecmwf_ifs025",
     "forecast_elevation_m", "forecast_lat", "forecast_lon",
     "source", "fetched_at",
+    # Legacy NBM columns from an abandoned experiment (claude/amazing-wilbur-ba89b8,
+    # commit 72861ad — never merged). The BQ table still has them with 260 rows of
+    # historical data we don't want to drop. We write NULL so MERGE INSERT ROW
+    # matches the table shape; UPDATE clause omits these so existing NBM stays intact.
+    "high_f_ncep_nbm_conus", "low_f_ncep_nbm_conus",
 ]
 
 
@@ -179,6 +184,8 @@ def upsert(client: bigquery.Client, df: pd.DataFrame) -> None:
                 bigquery.SchemaField("forecast_lon",         "FLOAT"),
                 bigquery.SchemaField("source",               "STRING"),
                 bigquery.SchemaField("fetched_at",           "TIMESTAMP"),
+                bigquery.SchemaField("high_f_ncep_nbm_conus", "FLOAT"),
+                bigquery.SchemaField("low_f_ncep_nbm_conus",  "FLOAT"),
             ],
         ),
     )
