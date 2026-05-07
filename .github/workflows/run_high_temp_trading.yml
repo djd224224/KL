@@ -1,16 +1,11 @@
 name: High temp trading
+# Triggered externally by cron-job.org hitting workflow_dispatch.
+# Effective firing times (UTC): 01:02, 04:02, 10:02, 12:02 — these match
+# what the bot actually saw under GH cron drift, NOT the previous in-repo
+# cron values. The 04:02 UTC slot is the 23 CDT evening run; firing earlier
+# (e.g. 02:02 UTC = 21 CDT) hits WU's pre-refresh window where
+# temperatureMax[0] is null.
 on:
-  schedule:
-    # Cron is UTC. Pre-compensated for GitHub Actions cron drift:
-    #   slot at 02:02 UTC — historically drifts +2h to fire at ~04 UTC
-    #     (= ~23:02 CDT, the originally-intended evening run for next-day
-    #     markets). Was 04:02 UTC scheduled, but consistently drifted to
-    #     ~06 UTC (= 01 CDT) which hit WU's pre-refresh window where
-    #     temperatureMax[0] is null.
-    #   other slots drift ~30-60 min and remain near their target hours.
-    #   morning slots spread to 9 and 11 (was 10 and 11) to avoid GH
-    #   Actions concurrency-skipping back-to-back hours under load.
-    - cron: '2 2,9,11,23 * * *'
   workflow_dispatch:
 jobs:
   run-kalshi-script:
