@@ -1,12 +1,9 @@
 name: KXHIGH orderbook logger
+# Triggered externally by cron-job.org (see notes/CRON_EXTERNAL.md if it exists)
+# hitting the workflow_dispatch endpoint every 15 min. The previous in-repo
+# `schedule:` cron drifted to ~1 run/2h under load; an external scheduler
+# fires reliably while still using GitHub-hosted runners.
 on:
-  schedule:
-    # Every 20 min (3 runs/hr at :00, :20, :40 UTC) — tighter cadence
-    # cuts dashboard staleness so the bucket-bar tick markers stay close
-    # to the live Kalshi orderbook.
-    # 72 polls/day × ~240 markets ≈ 17.3k rows/day. ~54 CI min/day,
-    # under the 2000-min/month free-tier private-repo budget.
-    - cron: '*/20 * * * *'
   workflow_dispatch:
 jobs:
   log-orderbook:
