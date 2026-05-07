@@ -242,15 +242,20 @@ def build_forecast_accuracy(resolved: pd.DataFrame) -> str:
         fig_roll.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
         fig_roll.update_layout(height=500, showlegend=False)
 
-    # Tail (T) vs between (B) bucket accuracy
+    # Tail (T) vs between (B) bucket accuracy. Dedupe by (city, event_date, kind)
+    # — the raw rows have multiple buckets per event sharing the same forecast/actual,
+    # which would inflate `n` without changing MAE.
     fig_kind = None
     kind_rows = []
+    by_kind = (df.dropna(subset=["forecast_avg", "actual_high_estimate"])
+                 .groupby(["city_abv", "forecast_date", "market_kind"], as_index=False)
+                 .agg(forecast_avg=("forecast_avg", "mean"),
+                      actual=("actual_high_estimate", "mean")))
     for kind in ("between", "tail"):
-        s = df[(df["market_kind"] == kind) & df["forecast_avg"].notna()
-               & df["actual_high_estimate"].notna()]
+        s = by_kind[by_kind["market_kind"] == kind]
         if len(s) == 0:
             continue
-        err = s["forecast_avg"] - s["actual_high_estimate"]
+        err = s["forecast_avg"] - s["actual"]
         kind_rows.append({
             "market_kind": kind, "n": len(s),
             "mae": err.abs().mean(), "bias": err.mean(),
@@ -680,17 +685,35 @@ def build_edge_capture(fills: pd.DataFrame) -> str:
             f"<b>${best_bin['mean_pnl']:+.2f}/fill</b> avg P&L, "
             f"<b>{best_bin['win_rate']:.0%}</b> win rate on {int(best_bin['n'])} fills."
         )
-    # Min-edge break-even: smallest edge bin with mean_net > 0
-    breakeven_bin = None
+    # Min-edge break-even: lowest *positive-edge* bin that's profitable.
+    # Need to parse the bin's left edge (Interval) to know if edges are positive.
+    pos_edge_bins = []
     for _, r in edge_tbl.iterrows():
-        if r["mean_net"] > 0:
-            breakeven_bin = r
-            break
+        # edge_bin is a string like "(0.04, 0.13]"; extract left edge
+        try:
+            left = float(r["edge_bin"].split(",")[0].strip("([ "))
+        except Exception:
+            continue
+        if left >= 0:
+            pos_edge_bins.append(r)
+    breakeven_bin = next((r for r in pos_edge_bins if r["mean_net"] > 0), None)
     if breakeven_bin is not None:
         takeaways.append(
             f"<b>Min-edge break-even</b>: profitable starting at edge bin {breakeven_bin['edge_bin']} "
-            f"(${breakeven_bin['mean_net']:+.2f}/fill net of fees). Lower-edge bins lose money — "
-            f"a min-edge filter could trim noise."
+            f"(${breakeven_bin['mean_net']:+.2f}/fill net of fees) — model edges this small "
+            f"already pay; a min-edge filter below this threshold could trim noise."
+        )
+    # Note negative-edge bin behavior separately (it's a curiosity, not a threshold)
+    neg_edge_rows = edge_tbl[edge_tbl["edge_bin"].str.startswith("(-")]
+    if len(neg_edge_rows) > 0:
+        ne = neg_edge_rows.iloc[0]
+        verdict = "still profitable" if ne["mean_net"] > 0 else "unprofitable as expected"
+        takeaways.append(
+            f"Negative-edge bin {ne['edge_bin']} is {verdict} "
+            f"(${ne['mean_net']:+.2f}/fill, n={int(ne['n'])}). "
+            + ("Selection on cheap maker fills can produce positive P&L even when the model "
+               "would not normally trade — an execution-driven win, not a forecast-driven one."
+               if ne["mean_net"] > 0 else "")
         )
 
     # ---- Edge by bucket distance (|market_strike - forecast_avg_at_fill|) ----
@@ -716,14 +739,25 @@ def build_edge_capture(fills: pd.DataFrame) -> str:
                              height=380, showlegend=False)
         bucket_html = "<h3>Edge by bucket distance</h3>" + fig_to_html(fig_bd) + table_html(dist_tbl)
         if len(dist_tbl) >= 3:
-            lo, hi = dist_tbl.iloc[0], dist_tbl.iloc[-1]
-            takeaways.append(
-                f"Bucket distance: closest-to-strike fills earn <b>${lo['mean_pnl']:+.2f}/fill</b>, "
-                f"farthest <b>${hi['mean_pnl']:+.2f}/fill</b>. "
-                + ("Closer-to-strike (high uncertainty) markets pay better — bot exploits indecision."
-                   if lo['mean_pnl'] > hi['mean_pnl'] else
-                   "Farther-from-strike (sleepy) markets pay better — bot picks off mispriced edges.")
+            best = dist_tbl.loc[dist_tbl["mean_pnl"].idxmax()]
+            worst = dist_tbl.loc[dist_tbl["mean_pnl"].idxmin()]
+            monotonic = (dist_tbl["mean_pnl"].diff().dropna() > 0).all() or \
+                        (dist_tbl["mean_pnl"].diff().dropna() < 0).all()
+            shape_note = (
+                f"Best bin <b>{best['dist_bin']}</b> (median {best['median_distance_F']:.1f}°F) "
+                f"earns <b>${best['mean_pnl']:+.2f}/fill</b>; worst bin {worst['dist_bin']} "
+                f"earns ${worst['mean_pnl']:+.2f}/fill. "
             )
+            if not monotonic:
+                shape_note += (
+                    "Pattern is non-monotonic — peak P&L in the middle distances. "
+                    "Markets too close to the strike are coin flips; markets too far are sleepy."
+                )
+            elif best["mean_pnl"] > worst["mean_pnl"] and best.name == dist_tbl.index[-1]:
+                shape_note += "Farther-from-strike (sleepy) markets pay better — bot picks off mispriced edges."
+            else:
+                shape_note += "Closer-to-strike (high-uncertainty) markets pay better — bot exploits indecision."
+            takeaways.append(shape_note)
 
     # ---- Cumulative edge decay (rolling 14-day mean P&L per fill) ----
     decay_html = ""
