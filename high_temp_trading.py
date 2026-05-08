@@ -191,8 +191,15 @@ except Exception as e:
     print(f"BigQuery init failed (non-fatal): {e}")
     bq_client = None
 
-def write_to_bq(df, table_name, write_disposition="WRITE_APPEND"):
-    """Upload DataFrame to BigQuery. Non-fatal on failure (alerts on error)."""
+def write_to_bq(df, table_name, write_disposition="WRITE_APPEND", schema=None):
+    """Upload DataFrame to BigQuery. Non-fatal on failure (alerts on error).
+
+    When `schema` is provided, it pins types on table creation (and is
+    required when the table doesn't yet exist and the autodetected types
+    would be wrong — e.g. pandas datetime64[ns] auto-inferring to INT64
+    nanoseconds, which broke market_snapshot when the table was dropped
+    and recreated on 2026-05-08).
+    """
     if bq_client is None:
         print(f"  BQ SKIP: {table_name} — bq_client is None")
         return
@@ -207,7 +214,8 @@ def write_to_bq(df, table_name, write_disposition="WRITE_APPEND"):
         # automatically. Required for the A/B test fields added to orders rows.
         job_config = bigquery.LoadJobConfig(
             write_disposition=write_disposition,
-            autodetect=True,
+            autodetect=schema is None,
+            schema=schema,
             schema_update_options=["ALLOW_FIELD_ADDITION"] if write_disposition == "WRITE_APPEND" else None,
         )
         job = bq_client.load_table_from_dataframe(df, table_id, job_config=job_config)
@@ -1240,6 +1248,45 @@ _SNAPSHOT_NUMERIC_COLS = [
     "peak_temp_f", "observed_temp_f",
     "forecast_temp_at_run_hour_f", "obs_minus_forecast_at_run_f",
 ]
+# Explicit schema. Without this, autodetect mis-infers pandas datetime64[ns]
+# columns as INT64 nanoseconds when the table is created from scratch — broke
+# the live dashboard on 2026-05-08 after the table was dropped and recreated.
+_SNAPSHOT_SCHEMA = [
+    bigquery.SchemaField("city", "STRING"),
+    bigquery.SchemaField("forecast_date", "DATE"),
+    bigquery.SchemaField("run_date", "TIMESTAMP"),
+    bigquery.SchemaField("weather_underground", "FLOAT"),
+    bigquery.SchemaField("accuweather", "FLOAT"),
+    bigquery.SchemaField("nws", "FLOAT"),
+    bigquery.SchemaField("forecast_avg", "FLOAT"),
+    bigquery.SchemaField("forecast_std", "FLOAT"),
+    bigquery.SchemaField("forecast_range", "FLOAT"),
+    bigquery.SchemaField("nws_detailed_conditions", "STRING"),
+    bigquery.SchemaField("nws_short_conditions", "STRING"),
+    bigquery.SchemaField("midnight_temperature", "FLOAT"),
+    bigquery.SchemaField("event_ticker", "STRING"),
+    bigquery.SchemaField("market_ticker", "STRING"),
+    bigquery.SchemaField("low_range", "FLOAT"),
+    bigquery.SchemaField("high_range", "FLOAT"),
+    bigquery.SchemaField("hi_no_price", "FLOAT"),
+    bigquery.SchemaField("historical_var", "FLOAT"),
+    bigquery.SchemaField("historical_var_sqrt", "FLOAT"),
+    bigquery.SchemaField("yes_probability", "FLOAT"),
+    bigquery.SchemaField("fair_no_price", "FLOAT"),
+    bigquery.SchemaField("no_highest_bid", "INTEGER"),
+    bigquery.SchemaField("no_lowest_offer", "FLOAT"),
+    bigquery.SchemaField("no_orderbook", "STRING"),
+    bigquery.SchemaField("yes_orderbook", "STRING"),
+    bigquery.SchemaField("position", "INTEGER"),
+    bigquery.SchemaField("peak_hour_ct", "INTEGER"),
+    bigquery.SchemaField("peak_temp_f", "FLOAT"),
+    bigquery.SchemaField("observed_temp_f", "FLOAT"),
+    bigquery.SchemaField("observed_station", "STRING"),
+    bigquery.SchemaField("pre_trade_skip_reason", "STRING"),
+    bigquery.SchemaField("nws_forecast_update_ts", "TIMESTAMP"),
+    bigquery.SchemaField("forecast_temp_at_run_hour_f", "FLOAT"),
+    bigquery.SchemaField("obs_minus_forecast_at_run_f", "FLOAT"),
+]
 
 snapshot_df = combined_table.rename(columns=_SNAPSHOT_COL_MAP).copy()
 for col in _SNAPSHOT_BQ_COLS:
@@ -1256,7 +1303,7 @@ snapshot_df["nws_forecast_update_ts"] = pd.to_datetime(
     snapshot_df["nws_forecast_update_ts"], errors="coerce", utc=True
 )
 
-write_to_bq(snapshot_df, "market_snapshot", "WRITE_APPEND")
+write_to_bq(snapshot_df, "market_snapshot", "WRITE_APPEND", schema=_SNAPSHOT_SCHEMA)
 
 # Flush alerts NOW so diagnostics survive if the trading loop below crashes
 flush_alerts("after snapshot write")
