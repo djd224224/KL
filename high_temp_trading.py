@@ -1389,8 +1389,8 @@ CITY_SIZE_MULT = {
     "Houston": 0.75,
 }
 
-max_contracts = 500
-max_contracts1 = 500
+max_contracts = 600
+max_contracts1 = 600
 market_cutoff_probability = .2
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
