@@ -1811,6 +1811,20 @@ for index, row in combined_table.iterrows():
   _rungs = []           # list of (i, bid, contracts, edge, status, reason)
   _placed_rungs = []    # list of (bid, contracts, edge) for placed orders
   _skip_cnt = {"bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "order_failed": 0}
+  # Within-run cap accounting. Kalshi's get_orders is eventually consistent —
+  # a freshly created order can take >100ms to appear in the resting list.
+  # Without local tracking, the per-rung live cap check below sees stale
+  # `_live_resting=0` even after we've placed N rungs in this run, and every
+  # rung's check trivially passes. Smoking gun: KXHIGHAUS-26MAY12-B84.5 —
+  # 8 rungs × 90→180 contracts = 1,080 placed against a 500 cap, no SKIPs
+  # logged. We compute exposure as the max of two estimators:
+  #   live  = _live_pos + _live_resting (catches cross-run drift; lags us)
+  #   local = initial state + contracts we know we placed in this run
+  # Both are floors on true exposure in their respective failure modes, so
+  # max() is the safe choice.
+  _initial_position = int(row['position'])
+  _initial_resting = int(row['resting_order_count'])
+  _run_placed_contracts = 0
   # Re-indexed sizing: ladder_mult scales by PLACEMENT order, not loop
   # index. Prevents the "ladder collapses to a single max-size deep
   # rung" pathology — when only deep rungs survive filters, they're
@@ -1922,13 +1936,32 @@ for index, row in combined_table.iterrows():
             _rem = 0
         _live_resting += int(_rem)
 
-      # Sync the local snapshot so subsequent rungs see the truth
-      row['position'] = _live_pos
-      row['resting_order_count'] = _live_resting
+      # Two estimators of current exposure (pos + resting) on this ticker:
+      #   live  = Kalshi's right-now view; catches cross-run drift and
+      #           pre-existing orders filling mid-loop, but lags within-run
+      #           placements by ~100ms+ due to API eventual consistency.
+      #   local = initial state at loop start + contracts we know we placed
+      #           in this run; never lags us, but goes stale if pre-existing
+      #           orders cancel/fill mid-loop (over-counts → safe).
+      # Use max(): each is a floor in its own failure mode.
+      _signal_live = _live_pos + _live_resting
+      _signal_local = _initial_position + _initial_resting + _run_placed_contracts
+      _effective_total = max(_signal_live, _signal_local)
 
-      if _live_pos + _live_resting + contracts > max_contracts:
+      # Sync row so the static-check fallback at :1857 sees the same exposure
+      # estimate on the next iteration. Attribute the floor to resting since
+      # _live_pos is the more reliable position signal.
+      row['position'] = _live_pos
+      row['resting_order_count'] = max(_effective_total - _live_pos, 0)
+
+      if _effective_total + contracts > max_contracts:
         _rungs.append((i, bid_price, contracts, edge, 'SKIP',
-                       f'live cap (pos={_live_pos}+resting={_live_resting}+new={contracts}>{max_contracts})'))
+                       f'live cap (live={_signal_live}'
+                       f' [pos={_live_pos}+resting={_live_resting}],'
+                       f' local={_signal_local}'
+                       f' [init_pos={_initial_position}+init_rest={_initial_resting}'
+                       f'+run={_run_placed_contracts}],'
+                       f' eff={_effective_total}+new={contracts}>{max_contracts})'))
         _skip_cnt["position_cap"] += 1
         continue
     except Exception as _ce:
@@ -1966,6 +1999,7 @@ for index, row in combined_table.iterrows():
           'yes_prob': round(float(yes_prob), 4),
       })
       row['resting_order_count'] = row['resting_order_count'] + contracts
+      _run_placed_contracts += contracts
       orders_placed += 1
       level_orders += 1
       _placed_rung_idx += 1  # Bump only on successful place — failed orders don't advance the size ladder
