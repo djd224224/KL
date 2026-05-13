@@ -1811,6 +1811,15 @@ for index, row in combined_table.iterrows():
   _rungs = []           # list of (i, bid, contracts, edge, status, reason)
   _placed_rungs = []    # list of (bid, contracts, edge) for placed orders
   _skip_cnt = {"bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "order_failed": 0}
+  # Within-run cumulative contracts placed on THIS ticker. Kalshi's get_orders
+  # has eventual consistency — a freshly created order can take >100ms to
+  # appear in the resting list. Without this counter, the live cap check at
+  # :1929 sees stale `_live_resting=0` even after we've placed N rungs in
+  # this run, and every rung's check trivially passes. Smoking gun:
+  # KXHIGHAUS-26MAY12-B84.5 — 8 rungs × 90→180 contracts = 1,080 placed
+  # against a 500 cap, no SKIPs logged. Floor the live count with this
+  # local tally so stale API reads can't reset what we know we placed.
+  _run_placed_contracts = 0
   # Re-indexed sizing: ladder_mult scales by PLACEMENT order, not loop
   # index. Prevents the "ladder collapses to a single max-size deep
   # rung" pathology — when only deep rungs survive filters, they're
@@ -1922,13 +1931,20 @@ for index, row in combined_table.iterrows():
             _rem = 0
         _live_resting += int(_rem)
 
-      # Sync the local snapshot so subsequent rungs see the truth
+      # Sync the local snapshot so subsequent rungs see the truth.
+      # Floor with our within-run placement tally — Kalshi's get_orders is
+      # eventually consistent, so _live_resting can lag behind reality and
+      # a blind overwrite would erase the cumulative count of rungs already
+      # placed in this very ladder.
+      _effective_resting = max(_live_resting, _run_placed_contracts)
       row['position'] = _live_pos
-      row['resting_order_count'] = _live_resting
+      row['resting_order_count'] = _effective_resting
 
-      if _live_pos + _live_resting + contracts > max_contracts:
+      if _live_pos + _effective_resting + contracts > max_contracts:
         _rungs.append((i, bid_price, contracts, edge, 'SKIP',
-                       f'live cap (pos={_live_pos}+resting={_live_resting}+new={contracts}>{max_contracts})'))
+                       f'live cap (pos={_live_pos}+resting={_effective_resting}'
+                       f' [api={_live_resting},run={_run_placed_contracts}]'
+                       f'+new={contracts}>{max_contracts})'))
         _skip_cnt["position_cap"] += 1
         continue
     except Exception as _ce:
@@ -1966,6 +1982,7 @@ for index, row in combined_table.iterrows():
           'yes_prob': round(float(yes_prob), 4),
       })
       row['resting_order_count'] = row['resting_order_count'] + contracts
+      _run_placed_contracts += contracts
       orders_placed += 1
       level_orders += 1
       _placed_rung_idx += 1  # Bump only on successful place — failed orders don't advance the size ladder
