@@ -1360,7 +1360,7 @@ combined_table
 increment = 2
 increment1 = 5
 price_count = list(range(0, 8))
-starting_contracts = 70
+starting_contracts = 30
 
 # Night-run size multiplier: double size when orders rest overnight.
 # - variable==1: afternoon/evening run placing orders on tomorrow's market.
@@ -1389,8 +1389,8 @@ CITY_SIZE_MULT = {
     "Houston": 0.75,
 }
 
-max_contracts = 600
-max_contracts1 = 600
+max_contracts = 300
+max_contracts1 = 300
 market_cutoff_probability = .2
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
