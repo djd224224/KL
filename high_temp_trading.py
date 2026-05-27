@@ -1380,13 +1380,15 @@ CITY_SIZE_MULT = {
     "Seattle": 1.25,
     "San Francisco": 1.25,
     "Boston": 1.25,
-    "Chicago": 1.25,
+    "Chicago": 0.75,
     "Dallas": 0.75,
-    "Philadelphia": 0.5,
     "Washington DC": 0.75,
     "Miami": 0.75,
     "Las Vegas": 0.75,
     "Houston": 0.75,
+    "Philadelphia": 0.5,
+    "Denver": 0.5,
+    "Minneapolis": 0.5,
 }
 
 max_contracts = 300
