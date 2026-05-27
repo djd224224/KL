@@ -762,7 +762,7 @@ NO_SWEET_SPOT_MULTIPLIER = 1.0
 def generate_base_contracts(num_levels: int) -> List[int]:
     contracts = []
     for i in range(num_levels):
-        contracts.append(10)
+        contracts.append(12)
     return contracts
 
 NUM_OFFSET_LEVELS = 10

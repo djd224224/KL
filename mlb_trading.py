@@ -705,7 +705,7 @@ NUM_YES_OFFSET_LEVELS = 7   # [v1.1] YES gets more levels (edge is real at 45-60
 NUM_NO_OFFSET_LEVELS = 5    # [v1.1] NO gets fewer levels (adversely selected everywhere)
 
 def generate_base_contracts(num_levels: int) -> List[int]:
-    return [8] * num_levels
+    return [10] * num_levels
 
 BASE_YES_CONTRACTS = generate_base_contracts(NUM_YES_OFFSET_LEVELS)
 BASE_NO_CONTRACTS = generate_base_contracts(NUM_NO_OFFSET_LEVELS)
