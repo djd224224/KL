@@ -22,6 +22,27 @@ def load_volume_cache(path='kxhigh_volume_cache.json'):
     if not os.path.exists(path): return {}
     with open(path) as f: return json.load(f).get('by_city_date', {})
 
+def load_resolved_markets():
+    """Pull strike, low_range, actual_high_estimate from BQ KXHIGH_resolved_markets.
+    Returns {ticker: {strike, low_range, high_range, actual_high, kind}} or {} on failure."""
+    try:
+        from google.cloud import bigquery
+        client = bigquery.Client(project='elite-contact-446323-q7')
+        sql = """SELECT market_ticker, market_strike, low_range, high_range,
+                        actual_high_estimate, market_kind
+                 FROM `elite-contact-446323-q7.Kalshi.KXHIGH_resolved_markets`
+                 WHERE actual_high_estimate IS NOT NULL AND market_strike IS NOT NULL"""
+        rows = client.query(sql).result()
+        return {r.market_ticker: {
+            'strike': float(r.market_strike),
+            'low_range': float(r.low_range) if r.low_range is not None else None,
+            'high_range': float(r.high_range) if r.high_range is not None else None,
+            'actual_high': float(r.actual_high_estimate),
+            'kind': r.market_kind or ''} for r in rows}
+    except Exception as e:
+        print(f"[warn] resolved markets BQ fetch failed: {e}")
+        return {}
+
 def parse_date(s):
     if not s: return None
     for fmt in ('%Y-%m-%dT%H:%M:%S.%fZ','%Y-%m-%dT%H:%M:%SZ','%Y-%m-%d'):
@@ -53,18 +74,36 @@ def compute_pnl(row):
 
 def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_volume_cache.json'):
     raw = load_csv(settlement_file)
+    resolved = load_resolved_markets()
     settlements = []
     for row in raw:
         if row.get('type') != 'Settlement': continue
-        tk = parse_ticker(row.get('Market_Ticker',''))
+        ticker_str = row.get('Market_Ticker','')
+        tk = parse_ticker(ticker_str)
         pnl = compute_pnl(row)
         dt = parse_date(row.get('Original_Date'))
         day = (dt - timedelta(hours=6)).date() if dt else None
-        event_str = event_date_from_ticker(row.get('Market_Ticker',''))
+        event_str = event_date_from_ticker(ticker_str)
+        rm = resolved.get(ticker_str)
+        if rm:
+            # Reference point: for "tail" markets, use low_range (real YES cutoff);
+            # for "between" markets, use market_strike (midpoint of the 2°F window).
+            # This gives a consistent "actual_high − boundary" interpretation across both kinds:
+            # tail YES iff actual ≥ low_range (distance ≥ 0); between YES iff |distance| < 1.
+            if rm['kind'] == 'tail' and rm.get('low_range') is not None:
+                ref = rm['low_range']
+            else:
+                ref = rm['strike']
+            distance = rm['actual_high'] - ref
+            strike_val = rm['strike']; actual_high = rm['actual_high']; mkt_kind = rm['kind']
+        else:
+            distance = None; strike_val = None; actual_high = None; mkt_kind = ''
         settlements.append({**tk, **pnl, 'date': dt, 'day': day,
             'day_str': day.isoformat() if day else None,
             'event_str': event_str,
-            'dow': day.weekday() if day else None})
+            'dow': day.weekday() if day else None,
+            'distance': distance, 'strike_val': strike_val,
+            'actual_high': actual_high, 'mkt_kind': mkt_kind})
 
     active = [s for s in settlements if s['total_c'] > 0 and s['series'].startswith('KXHIGH')]
     if not active:
@@ -143,9 +182,22 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
         wp=sum(x['pnl'] for x in w); wc=sum(x['cost'] for x in w); ww=sum(1 for x in w if x['pnl']>0)
         return {'pnl':round(wp,2),'cost':round(wc,2),'roi':round(wp/wc*100,1) if wc>0 else 0,'n':len(w),'wr':round(ww/len(w)*100,1)}
 
+    # B vs T aggregate (all cities combined) — settlement-level
+    b_all=[s for s in active_cities if s['is_B']]
+    t_all=[s for s in active_cities if s['is_T']]
+    def _agg(rows):
+        n=len(rows)
+        if not n: return {'n':0,'pnl':0,'cost':0,'roi':0,'wr':0}
+        p=sum(s['pnl'] for s in rows); c=sum(s['cost'] for s in rows)
+        w=sum(1 for s in rows if s['pnl']>0)
+        return {'n':n,'pnl':round(p,2),'cost':round(c,2),
+                'roi':round(p/c*100,1) if c>0 else 0,'wr':round(w/n*100,1)}
+    kind_overall={'B':_agg(b_all),'T':_agg(t_all)}
+
     overview = {
         'total_pnl':round(tp,2),'total_cost':round(tc,2),'roi':round(roi,1),
         'n_settlements':len(active_cities),'n_days':n_days,
+        'kind_b':kind_overall['B'],'kind_t':kind_overall['T'],
         'sharpe':round(sharpe,2) if sharpe else None,'sharpe_lo':sharpe_lo,'sharpe_hi':sharpe_hi,'sortino':round(sortino,2) if sortino else None,'omega':round(omega,2) if omega else None,
         'max_dd':round(mdd,2),
         'daily_wr':round(up_days/n_days*100,1) if n_days else 0,
@@ -364,6 +416,100 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
         city_summary[city]={'n':len(cs),'pnl':round(tpc,2),'cost':round(tcc,0),'roi':round(tpc/tcc*100,1) if tcc>0 else 0,
             't_n':len(tm),'t_pnl':round(sum(s['pnl'] for s in tm),2),'b_n':len(bm),'b_pnl':round(sum(s['pnl'] for s in bm),2),
             'r90_n':len(rec),'r90_pnl':round(rp,2),'r90_roi':round(rp/rc*100,1) if rc>0 else 0}
+
+    # Per-city win rates at D/W/M granularity (based on net daily/weekly/monthly P&L per city)
+    city_wr={}
+    for city in cities:
+        cdays = city_pivot[city]  # {day_str: pnl}
+        if not cdays: continue
+        d_n = len(cdays); d_w = sum(1 for v in cdays.values() if v > 0)
+        wk_pnl=defaultdict(float); mo_pnl=defaultdict(float)
+        for ds_key, v in cdays.items():
+            d = datetime.fromisoformat(ds_key)
+            wk_pnl[d.isocalendar()[:2]] += v
+            mo_pnl[ds_key[:7]] += v
+        w_n=len(wk_pnl); w_w=sum(1 for v in wk_pnl.values() if v>0)
+        m_n=len(mo_pnl); m_w=sum(1 for v in mo_pnl.values() if v>0)
+        # Gross $ won vs $ lost — settlement-level (most granular) plus per-granularity totals
+        css=[s for s in active_cities if s['city']==city]
+        gw_set=sum(s['pnl'] for s in css if s['pnl']>0)
+        gl_set=-sum(s['pnl'] for s in css if s['pnl']<0)
+        gw_d=sum(v for v in cdays.values() if v>0); gl_d=-sum(v for v in cdays.values() if v<0)
+        gw_w=sum(v for v in wk_pnl.values() if v>0); gl_w=-sum(v for v in wk_pnl.values() if v<0)
+        gw_m=sum(v for v in mo_pnl.values() if v>0); gl_m=-sum(v for v in mo_pnl.values() if v<0)
+        # Per-market-kind (B vs T) breakdown at settlement level
+        def _kind_stats(rows):
+            n=len(rows)
+            if n==0: return {'n':0,'gross_win':0,'gross_loss':0,'net':0,'cost':0,
+                             'roi':0,'wr':0,'pf':None,'wins':0,'losses':0}
+            gw=sum(s['pnl'] for s in rows if s['pnl']>0)
+            gl=-sum(s['pnl'] for s in rows if s['pnl']<0)
+            cost=sum(s['cost'] for s in rows)
+            wins=sum(1 for s in rows if s['pnl']>0)
+            return {'n':n,'gross_win':round(gw,2),'gross_loss':round(gl,2),
+                    'net':round(gw-gl,2),'cost':round(cost,2),
+                    'roi':round((gw-gl)/cost*100,1) if cost>0 else 0,
+                    'wr':round(wins/n*100,1),
+                    'pf':round(gw/gl,2) if gl>0 else None,
+                    'wins':wins,'losses':n-wins}
+        b_rows=[s for s in css if s['is_B']]
+        t_rows=[s for s in css if s['is_T']]
+        city_wr[city]={
+            'd_n':d_n,'d_w':d_w,'d_l':d_n-d_w,'d_wr':round(d_w/d_n*100,1) if d_n else 0,
+            'w_n':w_n,'w_w':w_w,'w_l':w_n-w_w,'w_wr':round(w_w/w_n*100,1) if w_n else 0,
+            'm_n':m_n,'m_w':m_w,'m_l':m_n-m_w,'m_wr':round(m_w/m_n*100,1) if m_n else 0,
+            'gross_win':round(gw_set,2),'gross_loss':round(gl_set,2),
+            'net':round(gw_set-gl_set,2),'pf':round(gw_set/gl_set,2) if gl_set>0 else None,
+            'd_gw':round(gw_d,2),'d_gl':round(gl_d,2),
+            'w_gw':round(gw_w,2),'w_gl':round(gl_w,2),
+            'm_gw':round(gw_m,2),'m_gl':round(gl_m,2),
+            'kind_b':_kind_stats(b_rows),'kind_t':_kind_stats(t_rows)}
+
+    # Bet accuracy — distance of actual settled high temp vs market strike (signed degrees F)
+    with_dist=[s for s in active_cities if s.get('distance') is not None]
+    bet_accuracy={}
+    if with_dist:
+        all_dist=[s['distance'] for s in with_dist]
+        def dist_stats(arr):
+            if not arr: return None
+            arr_sorted=sorted(arr); n=len(arr_sorted)
+            mean_signed=sum(arr)/n; mean_abs=sum(abs(x) for x in arr)/n
+            med=arr_sorted[n//2] if n%2 else (arr_sorted[n//2-1]+arr_sorted[n//2])/2
+            within_1=sum(1 for x in arr if abs(x)<=1)/n*100
+            within_2=sum(1 for x in arr if abs(x)<=2)/n*100
+            within_5=sum(1 for x in arr if abs(x)<=5)/n*100
+            return {'n':n,'mean_signed':round(mean_signed,2),'mean_abs':round(mean_abs,2),
+                    'median':round(med,2),'within_1':round(within_1,1),
+                    'within_2':round(within_2,1),'within_5':round(within_5,1)}
+        # Overall + split by win/loss + per-city
+        bet_accuracy['overall']=dist_stats(all_dist)
+        bet_accuracy['wins']=dist_stats([s['distance'] for s in with_dist if s['pnl']>0])
+        bet_accuracy['losses']=dist_stats([s['distance'] for s in with_dist if s['pnl']<0])
+        bet_accuracy['by_city']={}
+        for city in cities:
+            cd=[s['distance'] for s in with_dist if s['city']==city]
+            cw=[s['distance'] for s in with_dist if s['city']==city and s['pnl']>0]
+            cl=[s['distance'] for s in with_dist if s['city']==city and s['pnl']<0]
+            if cd:
+                bet_accuracy['by_city'][city]={
+                    'all':dist_stats(cd),'wins':dist_stats(cw),'losses':dist_stats(cl)}
+        # Histogram of signed distance (bin = 1°F)
+        def hist_signed(vals, bin_size=1, mn=-15, mx=15):
+            bins=list(range(mn, mx+bin_size, bin_size))
+            counts=[0]*(len(bins)-1)
+            for v in vals:
+                idx=int((v-mn)//bin_size)
+                if 0<=idx<len(counts): counts[idx]+=1
+                elif v<mn: counts[0]+=1
+                elif v>=mx: counts[-1]+=1
+            labels=[f"{b:+d}" for b in bins[:-1]]
+            return {'labels':labels,'data':counts}
+        bet_accuracy['hist_overall']=hist_signed(all_dist)
+        bet_accuracy['hist_wins']=hist_signed([s['distance'] for s in with_dist if s['pnl']>0])
+        bet_accuracy['hist_losses']=hist_signed([s['distance'] for s in with_dist if s['pnl']<0])
+        bet_accuracy['hist_by_city']={
+            c: hist_signed([s['distance'] for s in with_dist if s['city']==c])
+            for c in cities if any(s['city']==c for s in with_dist)}
 
     # Recent settlements
     rec_sett=sorted(active_cities,key=lambda s:s['day_str'] or '',reverse=True)[:50]
@@ -599,7 +745,8 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
         'corr':{'matrix':corr_matrix,'stats':corr_stats},
         'region_corr':{'matrix':region_corr,'stats':region_corr_stats,'regions':regions,'members':region_members},'dow':dow_data,
         'price_levels':price_level_data,'city_summary':city_summary,'recent':recent_out,
-        'trade':trade_data,'platform_volume':platform_volume}
+        'trade':trade_data,'platform_volume':platform_volume,
+        'city_wr':city_wr,'bet_accuracy':bet_accuracy}
 
 
 def generate_html(data, out_path):
@@ -672,6 +819,62 @@ def generate_html(data, out_path):
         cs_rows+=f'<td>{s["b_n"]}</td><td>${s["b_pnl"]:+,.0f}</td><td>{s["t_n"]}</td><td>${s["t_pnl"]:+,.0f}</td>'
         cs_rows+=f'<td style="color:{r90c}">${s["r90_pnl"]:+,.0f} ({s["r90_roi"]:+.1f}%)</td></tr>\n'
 
+    # B vs T market-kind breakdown per city
+    def _kind_cell(k):
+        if not k or k['n']==0: return '<td class="muted">—</td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td>'
+        nc='#1D9E75' if k['net']>0 else ('#E24B4A' if k['net']<0 else '#94a3b8')
+        rc='#1D9E75' if k['roi']>0 else ('#E24B4A' if k['roi']<0 else '#94a3b8')
+        wrc='#1D9E75' if k['wr']>=55 else ('#E24B4A' if k['wr']<=45 else '#94a3b8')
+        return (f'<td>{k["n"]} ({k["wins"]}-{k["losses"]})</td>'
+                f'<td style="color:{wrc}">{k["wr"]:.1f}%</td>'
+                f'<td class="green">${k["gross_win"]:,.0f}</td>'
+                f'<td class="red">${k["gross_loss"]:,.0f}</td>'
+                f'<td style="color:{nc}">${k["net"]:+,.0f}</td>'
+                f'<td style="color:{rc}">{k["roi"]:+.1f}%</td>')
+
+    kind_rows=''
+    kind_sorted=sorted([(c,data['city_wr'][c]) for c in cities if c in data.get('city_wr',{})],
+                       key=lambda x:-(x[1]['kind_b']['net']+x[1]['kind_t']['net']))
+    for c,w in kind_sorted:
+        kind_rows+=f'<tr><td>{CN[c]}</td>{_kind_cell(w["kind_b"])}{_kind_cell(w["kind_t"])}</tr>\n'
+
+    # City win-rate table (D/W/M, sorted by daily WR desc)
+    def _wr_color(v):
+        return '#1D9E75' if v>=55 else ('#E24B4A' if v<=45 else '#94a3b8')
+    cwr_data=data.get('city_wr',{})
+    cwr_sorted=sorted([(c,cwr_data[c]) for c in cities if c in cwr_data],
+                      key=lambda x:-x[1]['d_wr'])
+    cwr_rows=''
+    for c,w in cwr_sorted:
+        netc='#1D9E75' if w['net']>0 else ('#E24B4A' if w['net']<0 else '#94a3b8')
+        pf_str=f'{w["pf"]:.2f}' if w['pf'] is not None else '∞'
+        pf_color='#1D9E75' if w['pf'] and w['pf']>=1 else '#E24B4A'
+        cwr_rows+=(f'<tr><td>{CN[c]}</td>'
+                   f'<td style="color:{_wr_color(w["d_wr"])}">{w["d_wr"]:.1f}%</td><td>{w["d_w"]}-{w["d_l"]}</td><td>{w["d_n"]}</td>'
+                   f'<td style="color:{_wr_color(w["w_wr"])}">{w["w_wr"]:.1f}%</td><td>{w["w_w"]}-{w["w_l"]}</td><td>{w["w_n"]}</td>'
+                   f'<td style="color:{_wr_color(w["m_wr"])}">{w["m_wr"]:.1f}%</td><td>{w["m_w"]}-{w["m_l"]}</td><td>{w["m_n"]}</td>'
+                   f'<td class="green">${w["gross_win"]:,.0f}</td>'
+                   f'<td class="red">${w["gross_loss"]:,.0f}</td>'
+                   f'<td style="color:{netc}">${w["net"]:+,.0f}</td>'
+                   f'<td style="color:{pf_color}">{pf_str}</td></tr>\n')
+
+    # Bet-accuracy table (per-city) — distance of actual high vs market strike
+    ba=data.get('bet_accuracy') or {}
+    ba_rows=''
+    if ba and ba.get('by_city'):
+        # Sort by mean_abs ascending (most accurate first)
+        ba_sorted=sorted([(c,ba['by_city'][c]) for c in cities if c in ba['by_city']],
+                        key=lambda x:x[1]['all']['mean_abs'])
+        for c,b in ba_sorted:
+            a=b['all']; w=b.get('wins') or {'n':0,'mean_signed':0,'mean_abs':0}
+            l=b.get('losses') or {'n':0,'mean_signed':0,'mean_abs':0}
+            sc='#1D9E75' if a['mean_signed']>0 else '#E24B4A'
+            ba_rows+=(f'<tr><td>{CN[c]}</td><td>{a["n"]}</td>'
+                      f'<td style="color:{sc}">{a["mean_signed"]:+.2f}</td><td>{a["mean_abs"]:.2f}</td>'
+                      f'<td>{a["within_1"]:.0f}%</td><td>{a["within_2"]:.0f}%</td><td>{a["within_5"]:.0f}%</td>'
+                      f'<td class="green">{w["n"]} · {w["mean_signed"]:+.2f}°F</td>'
+                      f'<td class="red">{l["n"]} · {l["mean_signed"]:+.2f}°F</td></tr>\n')
+
     # Recent table
     rec_rows=''
     for r in data['recent']:
@@ -707,7 +910,7 @@ def generate_html(data, out_path):
     dow_s=sorted(data['dow'],key=lambda d:-d['pnl'])
     best_d=dow_s[0] if dow_s else None; worst_d=dow_s[-1] if dow_s else None
 
-    with open(out_path, 'w') as f:
+    with open(out_path, 'w', encoding='utf-8') as f:
         f.write(f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Weather Trading Dashboard</title>
 <style>
@@ -760,10 +963,13 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
         f.write(f'<p class="sub">Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} &bull; {o["n_settlements"]:,} settlements &bull; {o["n_days"]} trading days</p>\n')
 
         f.write('<div class="nav">')
-        for sid,lbl in [('summary','Summary'),('overview','Overview'),('timeseries','Time series'),('distributions','Distributions'),
-                        ('correlation','Correlation'),('region-correlation','Regional corr'),('sharpe','Rolling Sharpe'),('dow','Day of week'),
-                        ('possize','Position size'),('filltime','Fill timing'),('fillprice','Fill price'),
-                        ('pricelevels','Price levels'),('citysummary','City summary'),('recent','Recent')]:
+        nav_items=[('summary','Summary'),('overview','Overview'),('timeseries','Time series'),('distributions','Distributions'),
+                    ('correlation','Correlation'),('region-correlation','Regional corr'),('sharpe','Rolling Sharpe'),('dow','Day of week'),
+                    ('possize','Position size'),('filltime','Fill timing'),('fillprice','Fill price'),
+                    ('pricelevels','Price levels'),('citywr','City WR'),('citysummary','City summary')]
+        if data.get('bet_accuracy'): nav_items.append(('betaccuracy','Bet accuracy'))
+        nav_items.append(('recent','Recent'))
+        for sid,lbl in nav_items:
             f.write(f'<a onclick="document.getElementById(\'{sid}\').scrollIntoView({{behavior:\'smooth\'}})">{lbl}</a>')
         f.write('</div>\n')
 
@@ -774,6 +980,7 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
 <p><strong>Last 7 days ({r7['n']} trading days):</strong> P&L {money(r7['pnl'])} on ${r7['cost']:,.0f} outlay ({r7['roi']:+.1f}% ROI), win rate {r7['wr']:.0f}%. Vs prior 7d ({money(p7['pnl'])}): {d7_vs}.</p>
 <p><strong>Last 30 days ({r30['n']} trading days):</strong> P&L {money(r30['pnl'])} on ${r30['cost']:,.0f} outlay ({r30['roi']:+.1f}% ROI), win rate {r30['wr']:.0f}%. Vs prior 30d ({money(p30['pnl'])} at {p30['roi']:+.1f}%): {d30_dir}.</p>
 <p><strong>City leaderboard (90d):</strong> {CN.get(top_c[0],top_c[0]) if top_c else "—"} leads at {money(top_c[1]['r90_pnl']) if top_c else "—"} ({top_c[1]['r90_roi']:+.1f}% ROI), {CN.get(bot_c[0],bot_c[0]) if bot_c else "—"} trails at {money(bot_c[1]['r90_pnl']) if bot_c else "—"} ({bot_c[1]['r90_roi']:+.1f}% ROI).</p>
+<p><strong>Market kind:</strong> Between (B) {money(o['kind_b']['pnl'])} on {o['kind_b']['n']} bets at {o['kind_b']['roi']:+.1f}% ROI (WR {o['kind_b']['wr']:.0f}%) &middot; Tail (T) {money(o['kind_t']['pnl'])} on {o['kind_t']['n']} bets at {o['kind_t']['roi']:+.1f}% ROI (WR {o['kind_t']['wr']:.0f}%).</p>
 <p><strong>Timing:</strong> {best_d['day'] if best_d else "—"} is strongest ({money(best_d['pnl']) if best_d else "—"}, {best_d['roi']:+.1f}% ROI), {worst_d['day'] if worst_d else "—"} is weakest ({money(worst_d['pnl']) if worst_d else "—"}, {worst_d['roi']:+.1f}% ROI).</p>
 </div></div>
 ''')
@@ -789,6 +996,8 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
 <div class="card"><div class="l">Daily WR</div><div class="v">{o['daily_wr']:.1f}%</div><div class="s">{o['n_days']} days</div></div>
 <div class="card"><div class="l">Weekly WR</div><div class="v">{o['weekly_wr']:.1f}%</div><div class="s">{o['n_weeks']} weeks</div></div>
 <div class="card"><div class="l">Monthly WR</div><div class="v">{o['monthly_wr']:.1f}%</div><div class="s">{o['n_months']} months</div></div>
+<div class="card"><div class="l">Between (B) P&L</div><div class="v {'green' if o['kind_b']['pnl']>0 else 'red'}">${o['kind_b']['pnl']:+,.0f}</div><div class="s">{o['kind_b']['n']} bets &bull; ROI {o['kind_b']['roi']:+.1f}% &bull; WR {o['kind_b']['wr']:.0f}%</div></div>
+<div class="card"><div class="l">Tail (T) P&L</div><div class="v {'green' if o['kind_t']['pnl']>0 else 'red'}">${o['kind_t']['pnl']:+,.0f}</div><div class="s">{o['kind_t']['n']} bets &bull; ROI {o['kind_t']['roi']:+.1f}% &bull; WR {o['kind_t']['wr']:.0f}%</div></div>
 </div></div>\n''')
 
         # Time Series
@@ -924,10 +1133,77 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
         # Price levels
         f.write(f'<div id="pricelevels"><h2>Edge per dollar by price level</h2>\n{pl_html}</div>\n')
 
+        # City win-rate (D/W/M) + gross $ won vs lost
+        f.write(f'''<div id="citywr"><h2>Win/loss rate by city (D/W/M)</h2>
+<p class="sub">A "win" at each granularity is a positive net P&amp;L over that period for that city. Daily = settle-day net P&amp;L &gt; 0; Weekly = ISO-week sum &gt; 0; Monthly = calendar-month sum &gt; 0. $ won / $ lost are gross settlement-level totals (sum of positive P&amp;L vs absolute sum of negative P&amp;L across every settlement for that city). PF = profit factor = $ won / $ lost.</p>
+<table><thead><tr><th rowspan="2">City</th><th colspan="3">Daily</th><th colspan="3">Weekly</th><th colspan="3">Monthly</th><th colspan="4">Gross P&amp;L</th></tr>
+<tr><th>WR</th><th>W-L</th><th>n</th><th>WR</th><th>W-L</th><th>n</th><th>WR</th><th>W-L</th><th>n</th><th>$ won</th><th>$ lost</th><th>Net</th><th>PF</th></tr></thead>
+<tbody>{cwr_rows}</tbody></table>
+<h3 style="margin-top:1.5rem">Gross $ won vs $ lost by city <span class="sub muted">— settlement-level totals, sorted by net P&amp;L</span></h3>
+<div class="legend">
+<span><span class="dot" style="background:rgba(29,158,117,0.7)"></span>$ won</span>
+<span><span class="dot" style="background:rgba(226,75,74,0.7)"></span>$ lost</span>
+</div>
+<div class="cc tall"><canvas id="cityGrossDollars"></canvas></div>
+<h3>Daily WR by city</h3>
+<div class="cc"><canvas id="cityWRdaily"></canvas></div>
+<h3>Weekly WR by city</h3>
+<div class="cc"><canvas id="cityWRweekly"></canvas></div>
+<h3>Monthly WR by city</h3>
+<div class="cc"><canvas id="cityWRmonthly"></canvas></div>
+
+<h3 style="margin-top:1.5rem">Between (B) vs Tail (T) market performance by city</h3>
+<p class="sub">"Between" markets bet on a 2&deg;F window (e.g. B89.5 = high in [88.5, 90.5]). "Tail" markets bet on the high being above a cutoff (e.g. T69 = high &ge; 69.5). Sorted by combined net P&amp;L desc.</p>
+<table><thead><tr><th rowspan="2">City</th><th colspan="6">Between (B)</th><th colspan="6">Tail (T)</th></tr>
+<tr><th>n (W-L)</th><th>WR</th><th>$ won</th><th>$ lost</th><th>Net</th><th>ROI</th>
+<th>n (W-L)</th><th>WR</th><th>$ won</th><th>$ lost</th><th>Net</th><th>ROI</th></tr></thead>
+<tbody>{kind_rows}</tbody></table>
+<h3>Net P&amp;L by market kind (B vs T)</h3>
+<div class="legend">
+<span><span class="dot" style="background:#378ADD"></span>Between (B)</span>
+<span><span class="dot" style="background:#BA7517"></span>Tail (T)</span>
+</div>
+<div class="cc tall"><canvas id="cityKindNet"></canvas></div>
+</div>\n''')
+
         # City summary
         f.write(f'''<div id="citysummary"><h2>City summary</h2>
 <table><thead><tr><th>City</th><th>n</th><th>P&L</th><th>ROI</th><th>B n</th><th>B P&L</th><th>T n</th><th>T P&L</th><th>Last 90d</th></tr></thead>
 <tbody>{cs_rows}</tbody></table></div>\n''')
+
+        # Bet accuracy (distance from actual settled high)
+        if ba and ba.get('overall'):
+            ov=ba['overall']; bw=ba.get('wins') or {}; bl=ba.get('losses') or {}
+            sc_color='#1D9E75' if ov['mean_signed']>0 else '#E24B4A'
+            f.write(f'''<div id="betaccuracy"><h2>Bet accuracy: distance vs actual settled high</h2>
+<p class="sub">Distance = actual settled high &minus; reference point (°F, signed). Reference is the <strong>midpoint</strong> for "between" (B) markets and the <strong>low_range cutoff</strong> for "tail" (T) markets — so the meaning is uniform: |d|&lt;1 indicates YES for between markets, d&ge;0 indicates YES for tail markets. Positive = actual came in above the reference, negative = below. Source: BigQuery KXHIGH_resolved_markets.</p>
+<div class="cards">
+<div class="card"><div class="l">Settlements w/ distance</div><div class="v">{ov['n']:,}</div></div>
+<div class="card"><div class="l">Mean signed</div><div class="v" style="color:{sc_color}">{ov['mean_signed']:+.2f}°F</div><div class="s">positive = hotter than strike</div></div>
+<div class="card"><div class="l">Mean |distance|</div><div class="v">{ov['mean_abs']:.2f}°F</div></div>
+<div class="card"><div class="l">Median signed</div><div class="v">{ov['median']:+.2f}°F</div></div>
+<div class="card"><div class="l">|d|&le;1°F</div><div class="v">{ov['within_1']:.0f}%</div></div>
+<div class="card"><div class="l">|d|&le;2°F</div><div class="v">{ov['within_2']:.0f}%</div></div>
+<div class="card"><div class="l">|d|&le;5°F</div><div class="v">{ov['within_5']:.0f}%</div></div>
+</div>
+<div class="g">
+<div><h3>Distance distribution (signed °F)</h3>
+<div class="legend">
+<span><span class="dot" style="background:rgba(148,163,184,0.6)"></span>All</span>
+<span><span class="dot" style="background:#1D9E75"></span>Wins</span>
+<span><span class="dot" style="background:#E24B4A"></span>Losses</span>
+</div>
+<div class="cc tall"><canvas id="distHist"></canvas></div></div>
+<div><h3>Mean |distance| by city</h3>
+<div class="cc tall"><canvas id="distByCity"></canvas></div></div>
+</div>
+<h3 style="margin-top:1.5rem">Per-city distance stats</h3>
+<table><thead><tr><th>City</th><th>n</th><th>Mean signed</th><th>Mean |d|</th><th>|d|&le;1°F</th><th>|d|&le;2°F</th><th>|d|&le;5°F</th><th>Wins (n · μ°F)</th><th>Losses (n · μ°F)</th></tr></thead>
+<tbody>{ba_rows}</tbody></table>
+<p class="sub" style="margin-top:.5rem">Wins/losses split shows the average signed distance among winning vs losing settlements. A winning <em>between</em> bet on B89.5 means the actual high was inside [88.5, 90.5] so |d| &lt; 1; a winning <em>tail</em> bet on T87.0 means actual &gt;= 87.0.</p>
+</div>\n''')
+        else:
+            f.write('<div id="betaccuracy"><h2>Bet accuracy</h2><p class="sub">No resolved-market data available — BQ fetch from KXHIGH_resolved_markets failed or returned empty. Ensure gcloud auth is set up and the table has data.</p></div>\n')
 
         # Recent
         f.write(f'''<div id="recent"><h2>Recent settlements (last 50)</h2>
@@ -946,6 +1222,8 @@ table.corr td,table.corr th{{text-align:center;padding:6px 10px}}
         f.write('var CC='); json.dump(CC, f); f.write(';\n')
         f.write('var TD='); json.dump(data['trade'], f); f.write(';\n')
         f.write('var PV='); json.dump(data.get('platform_volume', {}), f); f.write(';\n')
+        f.write('var CWR='); json.dump(data.get('city_wr', {}), f); f.write(';\n')
+        f.write('var BA='); json.dump(data.get('bet_accuracy', {}), f); f.write(';\n')
         f.write(r'''
 var G='rgba(255,255,255,0.06)',TK='#888';
 var CHARTS={},currentGran='D';
@@ -1170,6 +1448,117 @@ if(document.getElementById('platVolChart') && PV && PV.D && PV.D.labels.length){
       }}},
       scales:{x:{stacked:true,grid:{display:false},ticks:{color:TK,font:{size:10},maxTicksLimit:16,maxRotation:45}},
               y:{stacked:true,grid:{color:G},ticks:{color:TK,font:{size:10},callback:function(v){return v>=1000?(v/1000).toFixed(0)+'K':v;}}}}}});
+}
+
+// City win-rate bar charts (D/W/M)
+function renderCityWR(){
+  var cityList=CITIES.filter(function(c){return CWR[c];});
+  cityList.sort(function(a,b){return (CWR[b].d_wr||0)-(CWR[a].d_wr||0);});
+  function mk(canvasId, key){
+    var el=document.getElementById(canvasId);if(!el)return;
+    var labels=cityList.map(function(c){return CN[c]||c;});
+    var vals=cityList.map(function(c){return CWR[c][key];});
+    var ns=cityList.map(function(c){return CWR[c][key.replace('_wr','_n')];});
+    var ws=cityList.map(function(c){return CWR[c][key.replace('_wr','_w')];});
+    var ls=cityList.map(function(c){return CWR[c][key.replace('_wr','_l')];});
+    new Chart(el,{type:'bar',
+      data:{labels:labels,datasets:[{data:vals,
+        backgroundColor:vals.map(function(v){return v>=55?'rgba(29,158,117,0.6)':(v<=45?'rgba(226,75,74,0.6)':'rgba(148,163,184,0.4)');}),
+        borderColor:vals.map(function(v){return v>=55?'#1D9E75':(v<=45?'#E24B4A':'#94a3b8');}),
+        borderWidth:1,borderRadius:3}]},
+      options:{...base,scales:mkScales(function(v){return v+'%'}),
+        plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){
+          var i=c.dataIndex;return [c.raw+'%','W-L: '+ws[i]+'-'+ls[i],'n='+ns[i]];
+        }}}}}});
+  }
+  mk('cityWRdaily','d_wr');
+  mk('cityWRweekly','w_wr');
+  mk('cityWRmonthly','m_wr');
+
+  // B vs T net P&L per city — grouped bar chart sorted by combined net desc
+  var kel=document.getElementById('cityKindNet');
+  if(kel){
+    var ks=cityList.slice().sort(function(a,b){
+      return ((CWR[b].kind_b.net||0)+(CWR[b].kind_t.net||0))-((CWR[a].kind_b.net||0)+(CWR[a].kind_t.net||0));
+    });
+    var lbls=ks.map(function(c){return CN[c]||c;});
+    var bNet=ks.map(function(c){return CWR[c].kind_b.net||0;});
+    var tNet=ks.map(function(c){return CWR[c].kind_t.net||0;});
+    var bN=ks.map(function(c){return CWR[c].kind_b.n||0;});
+    var tN=ks.map(function(c){return CWR[c].kind_t.n||0;});
+    new Chart(kel,{type:'bar',
+      data:{labels:lbls,datasets:[
+        {label:'Between',data:bNet,backgroundColor:'rgba(55,138,221,0.7)',borderColor:'#378ADD',borderWidth:1,borderRadius:2},
+        {label:'Tail',data:tNet,backgroundColor:'rgba(186,117,23,0.7)',borderColor:'#BA7517',borderWidth:1,borderRadius:2}
+      ]},
+      options:{...base,interaction:{mode:'index',intersect:false},
+        plugins:{...base.plugins,tooltip:{mode:'index',intersect:false,callbacks:{
+          label:function(c){var n=(c.datasetIndex===0?bN:tN)[c.dataIndex];
+            return c.dataset.label+': $'+(c.raw>=0?'+':'')+c.raw.toLocaleString()+' (n='+n+')';}
+        }}},
+        scales:mkScales(function(v){return (v>=0?'':'-')+'$'+Math.abs(v).toLocaleString();})}});
+  }
+
+  // Gross $ won vs $ lost — grouped bar chart, sorted by net desc
+  var gel=document.getElementById('cityGrossDollars');
+  if(gel){
+    var sorted=cityList.slice().sort(function(a,b){return (CWR[b].net||0)-(CWR[a].net||0);});
+    var labels=sorted.map(function(c){return CN[c]||c;});
+    var won=sorted.map(function(c){return CWR[c].gross_win;});
+    var lost=sorted.map(function(c){return -CWR[c].gross_loss;});  // negative so it plots below axis
+    var nets=sorted.map(function(c){return CWR[c].net;});
+    var pfs=sorted.map(function(c){return CWR[c].pf;});
+    new Chart(gel,{type:'bar',
+      data:{labels:labels,datasets:[
+        {label:'$ won',data:won,backgroundColor:'rgba(29,158,117,0.7)',borderColor:'#1D9E75',borderWidth:1,borderRadius:2},
+        {label:'$ lost',data:lost,backgroundColor:'rgba(226,75,74,0.7)',borderColor:'#E24B4A',borderWidth:1,borderRadius:2}
+      ]},
+      options:{...base,interaction:{mode:'index',intersect:false},
+        plugins:{...base.plugins,tooltip:{mode:'index',intersect:false,callbacks:{
+          label:function(c){var v=Math.abs(c.raw);return c.dataset.label+': $'+v.toLocaleString();},
+          footer:function(items){var i=items[0].dataIndex;var pf=pfs[i];
+            return ['Net: '+(nets[i]>=0?'+':'')+'$'+nets[i].toLocaleString(),
+                    'PF: '+(pf==null?'∞':pf.toFixed(2))];
+          }
+        }}},
+        scales:mkScales(function(v){return (v>=0?'':'-')+'$'+Math.abs(v).toLocaleString();})}});
+  }
+}
+if(Object.keys(CWR).length) renderCityWR();
+
+// Bet accuracy charts
+if(BA && BA.hist_overall){
+  // Signed-distance histogram: stacked bars showing wins vs losses
+  var hist=BA.hist_overall;
+  var hw=BA.hist_wins||{data:[]}; var hl=BA.hist_losses||{data:[]};
+  new Chart(document.getElementById('distHist'),{type:'bar',
+    data:{labels:hist.labels,datasets:[
+      {label:'Wins',data:hw.data,backgroundColor:'rgba(29,158,117,0.7)',borderColor:'#1D9E75',borderWidth:1,stack:'s'},
+      {label:'Losses',data:hl.data,backgroundColor:'rgba(226,75,74,0.7)',borderColor:'#E24B4A',borderWidth:1,stack:'s'}
+    ]},
+    options:{...base,interaction:{mode:'index',intersect:false},
+      plugins:{...base.plugins,tooltip:{mode:'index',intersect:false,callbacks:{
+        label:function(c){return c.dataset.label+': '+c.raw;},
+        title:function(items){return items[0].label+'°F (actual - strike)';}
+      }}},
+      scales:{x:{stacked:true,grid:{display:false},ticks:{color:TK,font:{size:9}},title:{display:true,text:'Distance (°F)',color:TK,font:{size:10}}},
+        y:{stacked:true,grid:{color:G},ticks:{color:TK,font:{size:10}},title:{display:true,text:'Settlements',color:TK,font:{size:10}}}}}});
+
+  // Mean |distance| by city, sorted asc (most accurate first)
+  if(BA.by_city){
+    var byCity=Object.keys(BA.by_city).map(function(c){return {c:c,n:BA.by_city[c].all.n,abs:BA.by_city[c].all.mean_abs,signed:BA.by_city[c].all.mean_signed};});
+    byCity.sort(function(a,b){return a.abs-b.abs;});
+    new Chart(document.getElementById('distByCity'),{type:'bar',
+      data:{labels:byCity.map(function(x){return CN[x.c]||x.c;}),
+        datasets:[{data:byCity.map(function(x){return x.abs;}),
+          backgroundColor:byCity.map(function(x){return CC[x.c]+'99';}),
+          borderColor:byCity.map(function(x){return CC[x.c];}),borderWidth:1,borderRadius:3}]},
+      options:{...base,scales:mkScales(function(v){return v.toFixed(1)+'°F'}),
+        plugins:{...base.plugins,tooltip:{callbacks:{label:function(c){
+          var x=byCity[c.dataIndex];
+          return [c.raw.toFixed(2)+'°F mean |d|','Signed mean: '+x.signed.toFixed(2)+'°F','n='+x.n];
+        }}}}}});
+  }
 }
 
 CITIES.forEach(function(city){

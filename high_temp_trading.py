@@ -267,6 +267,169 @@ def write_run_row(event, **fields):
     except Exception as e:
         print(f"  RUNS WRITE FAIL ({event}): {e}")
 
+# ====================================================================
+# Rolling forecast-bias correction
+# --------------------------------------------------------------------
+# Vendor MOS post-processors (WU, NWS) lag during regime transitions:
+# they bias-correct using a trailing verification window, so when the
+# climatology shifts faster than the window (e.g. first hot week of
+# spring→summer), forecasts run systematically cool by 0.3–0.7°F for
+# 1–3 weeks until MOS catches up.
+#
+# Fix: compute mean (actual − vendor_forecast) per city over a short
+# trailing window, shrink toward the global mean, cap at ±2°F, and add
+# to `combined_table['Average']` before yes_probability is computed.
+#
+# Toggle with BIAS_CORRECTION_ENABLED=false (default true) if needed.
+# ====================================================================
+BIAS_CORRECTION_ENABLED = os.environ.get("BIAS_CORRECTION_ENABLED", "true").lower() == "true"
+BIAS_LOOKBACK_DAYS      = int(os.environ.get("BIAS_LOOKBACK_DAYS", "14"))
+BIAS_MIN_SAMPLE         = int(os.environ.get("BIAS_MIN_SAMPLE", "5"))   # per-city min days to trust own bias
+BIAS_SHRINKAGE_N        = int(os.environ.get("BIAS_SHRINKAGE_N", "10")) # James–Stein-ish prior strength
+BIAS_MAX_CORRECTION_F   = float(os.environ.get("BIAS_MAX_CORRECTION_F", "2.0"))
+
+# Stamped at module load; the same correction map is used for every market
+# in this run. None until compute_rolling_bias() is called.
+ROLLING_BIAS_BY_CITY = None
+ROLLING_BIAS_GLOBAL  = 0.0
+
+def compute_rolling_bias():
+    """Compute per-city mean(actual − forecast) over the last
+    BIAS_LOOKBACK_DAYS days. Returns ({city: bias_F}, global_bias_F).
+
+    Sources:
+      - forecasts: KXHIGH_model_call_snapshots (earliest run per city/day)
+      - actuals  : KXHIGH_cli_readings.high_temp_f (NWS CLI daily climate
+        product). Uses CLI rather than KXHIGH_settlements_clean so coverage
+        is one-row-per-(city, day) regardless of whether the bot traded
+        that city's markets — yields n ≈ BIAS_LOOKBACK_DAYS for every city
+        instead of just the days with settled markets.
+
+    Preliminary CLI filter: per the daily-digest skill's heuristic, rows
+    whose high_time is pre-dawn (h24 < 6) AND whose diurnal range
+    (high − low) ≤ 7°F are partial early-morning reports filed before the
+    day's actual high occurred. Those are excluded so the bias estimate
+    isn't contaminated by stale partial readings.
+
+    Shrinkage: per-city bias is shrunk toward the volume-weighted global
+    bias with weight = n / (n + BIAS_SHRINKAGE_N). Cities below
+    BIAS_MIN_SAMPLE samples fall back to the global bias. The applied
+    correction is clipped to ±BIAS_MAX_CORRECTION_F.
+
+    Returns ({}, 0.0) on any failure — the bot then proceeds with raw
+    vendor forecasts (current behavior).
+    """
+    if not BIAS_CORRECTION_ENABLED:
+        print("  BIAS: BIAS_CORRECTION_ENABLED=false, skipping")
+        return {}, 0.0
+    if bq_client is None:
+        print("  BIAS: bq_client None, skipping correction")
+        return {}, 0.0
+
+    sql = f"""
+    WITH city_map AS (
+      SELECT 'NY' AS abv, 'New York City' AS name UNION ALL
+      SELECT 'CHI', 'Chicago' UNION ALL SELECT 'MIA', 'Miami' UNION ALL
+      SELECT 'LAX', 'Los Angeles' UNION ALL SELECT 'DEN', 'Denver' UNION ALL
+      SELECT 'PHIL', 'Philadelphia' UNION ALL SELECT 'AUS', 'Austin' UNION ALL
+      SELECT 'THOU', 'Houston' UNION ALL SELECT 'TATL', 'Atlanta' UNION ALL
+      SELECT 'TDC', 'Washington DC' UNION ALL SELECT 'TPHX', 'Phoenix' UNION ALL
+      SELECT 'TDAL', 'Dallas' UNION ALL SELECT 'TLV', 'Las Vegas' UNION ALL
+      SELECT 'TOKC', 'Oklahoma City' UNION ALL SELECT 'TSEA', 'Seattle' UNION ALL
+      SELECT 'TSFO', 'San Francisco' UNION ALL SELECT 'TSATX', 'San Antonio' UNION ALL
+      SELECT 'TMIN', 'Minneapolis' UNION ALL SELECT 'TNOLA', 'New Orleans' UNION ALL
+      SELECT 'TBOS', 'Boston'
+    ),
+    first_snap AS (
+      SELECT city, forecast_date, forecast_avg,
+        ROW_NUMBER() OVER (PARTITION BY city, forecast_date ORDER BY run_date) AS rn
+      FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}model_call_snapshots`
+      WHERE forecast_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL {BIAS_LOOKBACK_DAYS + 1} DAY)
+                              AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+        AND forecast_avg IS NOT NULL
+    ),
+    fcst AS (
+      SELECT city, forecast_date, AVG(forecast_avg) AS forecast_avg
+      FROM first_snap WHERE rn = 1
+      GROUP BY city, forecast_date
+    ),
+    cli_parsed AS (
+      -- Parse CLI high_time "HHMM AM/PM" → 24h. Used to detect preliminary
+      -- (pre-dawn) reports that were filed before the day's actual high
+      -- occurred. The 12 AM = midnight (h24=0) / 12 PM = noon (h24=12)
+      -- handling matters: a naive cast would put 12 AM at h24=12.
+      SELECT city_abv, event_date, high_temp_f, low_temp_f,
+        CASE
+          WHEN ENDS_WITH(high_time, 'AM') AND SAFE_CAST(REGEXP_EXTRACT(high_time, r'^(\\d{{1,2}})') AS INT64) = 12 THEN 0
+          WHEN ENDS_WITH(high_time, 'AM') THEN SAFE_CAST(REGEXP_EXTRACT(high_time, r'^(\\d{{1,2}})') AS INT64)
+          WHEN SAFE_CAST(REGEXP_EXTRACT(high_time, r'^(\\d{{1,2}})') AS INT64) = 12 THEN 12
+          ELSE SAFE_CAST(REGEXP_EXTRACT(high_time, r'^(\\d{{1,2}})') AS INT64) + 12
+        END AS h24
+      FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}cli_readings`
+      WHERE event_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL {BIAS_LOOKBACK_DAYS + 1} DAY)
+                           AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+        AND high_temp_f IS NOT NULL
+    ),
+    actuals AS (
+      -- Exclude preliminary partial reports (pre-dawn high_time + tiny
+      -- diurnal range ≤ 7°F = the day's afternoon high hadn't happened
+      -- yet when this CLI snapshot was filed).
+      SELECT city_abv, event_date, high_temp_f AS actual_high
+      FROM cli_parsed
+      WHERE NOT (h24 < 6 AND (high_temp_f - low_temp_f) <= 7)
+    )
+    SELECT cm.name AS city, COUNT(*) AS n,
+           AVG(a.actual_high - f.forecast_avg) AS bias
+    FROM actuals a
+    JOIN city_map cm ON a.city_abv = cm.abv
+    JOIN fcst f ON f.city = cm.name AND f.forecast_date = a.event_date
+    GROUP BY cm.name
+    """
+
+    try:
+        df = bq_client.query(sql).to_dataframe()
+    except Exception as e:
+        alert("BIAS_QUERY_FAILED", f"Rolling-bias query failed: {e}")
+        print(f"  BIAS: query failed ({e}); skipping correction")
+        return {}, 0.0
+
+    if df.empty:
+        print("  BIAS: no rows returned; skipping correction")
+        return {}, 0.0
+
+    total_n = float(df["n"].sum())
+    global_bias = float((df["bias"] * df["n"]).sum() / total_n) if total_n > 0 else 0.0
+
+    out = {}
+    for _, row in df.iterrows():
+        city, n, bias = row["city"], int(row["n"]), float(row["bias"])
+        if n < BIAS_MIN_SAMPLE:
+            corr = global_bias
+        else:
+            w = n / (n + BIAS_SHRINKAGE_N)
+            corr = w * bias + (1.0 - w) * global_bias
+        corr = max(-BIAS_MAX_CORRECTION_F, min(BIAS_MAX_CORRECTION_F, corr))
+        out[city] = corr
+
+    capped_global = max(-BIAS_MAX_CORRECTION_F, min(BIAS_MAX_CORRECTION_F, global_bias))
+
+    print(f"  BIAS: window={BIAS_LOOKBACK_DAYS}d, global={global_bias:+.2f}°F "
+          f"(capped {capped_global:+.2f}, n={int(total_n)} city-days):")
+    for city, b in sorted(out.items()):
+        raw_row = df[df["city"] == city]
+        raw = float(raw_row["bias"].iloc[0]) if not raw_row.empty else 0.0
+        n_c = int(raw_row["n"].iloc[0]) if not raw_row.empty else 0
+        print(f"    {city:<16} raw={raw:+.2f} n={n_c:>2} applied={b:+.2f}°F")
+
+    if abs(capped_global) >= 0.5:
+        alert("BIAS_LARGE_GLOBAL",
+              f"Rolling forecast bias is {capped_global:+.2f}°F over {BIAS_LOOKBACK_DAYS}d "
+              f"(n={int(total_n)}). Vendor MOS may be lagging the regime.",
+              {"global_bias_F": round(capped_global, 2), "n_city_days": int(total_n),
+               "lookback_days": BIAS_LOOKBACK_DAYS})
+
+    return out, capped_global
+
 import sys
 
 # Determine if current time in Central Time is after 2 PM. variable=1
@@ -887,6 +1050,23 @@ combined_table = pd.merge(forecast_table, markets_table, on='City', how='inner')
 combined_table['Average'] = pd.to_numeric(combined_table['Average'], errors='coerce')
 combined_table['Standard Deviation'] = pd.to_numeric(combined_table['Standard Deviation'], errors='coerce')
 
+# ---- Rolling forecast-bias correction (per-city, shrunken, capped) -----------
+# Compute the per-city bias correction; produce a SEPARATE 'Average_corrected'
+# column used downstream for yes_probability/fair_no_price. 'Average' itself
+# stays equal to the raw vendor mean so KXHIGH_market_snapshot.forecast_avg
+# (and the forecast-accuracy dashboards that read it) continue to track vendor
+# skill, not corrected output.
+print("\n========== ROLLING BIAS CORRECTION ==========")
+ROLLING_BIAS_BY_CITY, ROLLING_BIAS_GLOBAL = compute_rolling_bias()
+combined_table['bias_correction_F'] = combined_table['City'].map(
+    lambda c: ROLLING_BIAS_BY_CITY.get(c, ROLLING_BIAS_GLOBAL)
+).fillna(0.0).astype(float)
+combined_table['Average_corrected'] = combined_table['Average'] + combined_table['bias_correction_F']
+_n_corr = (combined_table['bias_correction_F'].abs() > 0.01).sum()
+print(f"  applied to {_n_corr}/{len(combined_table)} rows; "
+      f"max |correction|={combined_table['bias_correction_F'].abs().max():.2f}°F")
+# -----------------------------------------------------------------------------
+
 # City-specific floor std dev (from v1 bot calibration, 1816 observations)
 # Model uses: max(inter_source_std, city_floor_std)
 # This prevents 0 std when all sources agree (which gives 100%/0% extremes)
@@ -905,7 +1085,11 @@ combined_table['Standard Deviation'] = combined_table['Standard Deviation'].repl
 combined_table['high_range'] = pd.to_numeric(combined_table['high_range'], errors='coerce')
 combined_table['low_range'] = pd.to_numeric(combined_table['low_range'], errors='coerce')
 
-combined_table['yes_probability'] = norm.cdf(combined_table['high_range'], loc=combined_table['Average'], scale=combined_table['Standard Deviation']) - norm.cdf(combined_table['low_range'], loc=combined_table['Average'], scale=combined_table['Standard Deviation'])
+# yes_probability uses the BIAS-CORRECTED mean (Average_corrected) so the
+# bot's pricing reflects the rolling-bias adjustment. The raw 'Average' is
+# still what gets written to KXHIGH_market_snapshot.forecast_avg, so the
+# forecast-accuracy dashboards continue to evaluate vendor skill directly.
+combined_table['yes_probability'] = norm.cdf(combined_table['high_range'], loc=combined_table['Average_corrected'], scale=combined_table['Standard Deviation']) - norm.cdf(combined_table['low_range'], loc=combined_table['Average_corrected'], scale=combined_table['Standard Deviation'])
 combined_table['yes_probability'] = combined_table['yes_probability'].round(2)
 combined_table['fair_no_price'] = 1 - combined_table['yes_probability']
 combined_table
@@ -1359,6 +1543,16 @@ combined_table
 ######### BETTING INPUTS
 increment = 2
 increment1 = 5
+# Per-city tail ladder increment overrides. Wider increment effectively prunes
+# the ladder (rungs below hi_no − N·inc clamp to 1c and fail the maker-buffer
+# filter), shrinking total tail exposure without disabling the city entirely.
+# Set for cities where mid-band (40-60c) tail fills have been the primary loss
+# driver — see dashboard "Between (B) vs Tail (T) market performance by city".
+TAIL_INCREMENT_BY_CITY = {
+    "Los Angeles": 15,
+    "Philadelphia": 15,
+    "Washington DC": 15,
+}
 price_count = list(range(0, 8))
 starting_contracts = 30
 
@@ -1790,7 +1984,8 @@ for index, row in combined_table.iterrows():
   _n_levels = len(price_count)
   _base_size = max(1, int(round(starting_contracts * night_size_mult * 1.0 * _city_mult)))
   _top_size = max(1, int(round(starting_contracts * night_size_mult * 2.0 * _city_mult)))
-  _inc_show = increment1 if is_tail else increment
+  _tail_inc = TAIL_INCREMENT_BY_CITY.get(row['City'], increment1)
+  _inc_show = _tail_inc if is_tail else increment
   _nm_reason = ("variable=1" if variable == 1 else
                 ("hour<5 CT" if central_time.hour < 5 else "daytime"))
   print(f"    Sizing:     base={starting_contracts} × night={night_size_mult:g}x "
@@ -1837,7 +2032,8 @@ for index, row in combined_table.iterrows():
     if "-T" not in ticker:
       bid_price = max(_effective_hi_no - i * increment, 1)
     if is_tail:
-      bid_price = max(_effective_hi_no - i * increment1, 1)
+      _inc_used = TAIL_INCREMENT_BY_CITY.get(row['City'], increment1)
+      bid_price = max(_effective_hi_no - i * _inc_used, 1)
 
     # Size depends on PLACEMENT order (_placed_rung_idx), not loop index.
     # Computed at current _placed_rung_idx; if this rung passes filters
