@@ -1542,19 +1542,17 @@ combined_table
 
 ######### BETTING INPUTS
 increment = 2
-increment1 = 5
-# Per-city tail ladder increment overrides. Wider increment effectively prunes
-# the ladder (rungs below hi_no − N·inc clamp to 1c and fail the maker-buffer
-# filter), shrinking total tail exposure without disabling the city entirely.
-# Set for cities where mid-band (40-60c) tail fills have been the primary loss
-# driver — see dashboard "Between (B) vs Tail (T) market performance by city".
-TAIL_INCREMENT_BY_CITY = {
-    "Los Angeles": 15,
-    "Philadelphia": 15,
-    "Washington DC": 15,
-}
+# Tail ladder uses wider spacing than between markets. Rungs below
+# hi_no − N·increment1 clamp to 1c and typically fail the maker-buffer
+# filter, which prunes total tail exposure to the high-confidence rungs.
+# Raised 5 → 15 after dashboard B-vs-T analysis showed mid-band (40-60c)
+# tail fills as the dominant loss driver across all cities.
+increment1 = 15
+# Optional per-city overrides if specific cities need different tail spacing.
+# Empty by default — all cities use increment1.
+TAIL_INCREMENT_BY_CITY = {}
 price_count = list(range(0, 8))
-starting_contracts = 30
+starting_contracts = 20
 
 # Night-run size multiplier: double size when orders rest overnight.
 # - variable==1: afternoon/evening run placing orders on tomorrow's market.
