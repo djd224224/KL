@@ -1583,6 +1583,13 @@ CITY_SIZE_MULT = {
     "Minneapolis": 0.5,
 }
 
+# Per-city minimum NO bid price (cents). Don't place any rung whose NO bid is
+# below this floor for the given city. Cities not listed have no floor.
+CITY_MIN_NO_PRICE = {
+    "Chicago": 50,
+    "Denver": 55,
+}
+
 max_contracts = 300
 max_contracts1 = 300
 market_cutoff_probability = .2
@@ -2005,7 +2012,7 @@ for index, row in combined_table.iterrows():
   n_levels = len(price_count)
   _rungs = []           # list of (i, bid, contracts, edge, status, reason)
   _placed_rungs = []    # list of (bid, contracts, edge) for placed orders
-  _skip_cnt = {"bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "order_failed": 0}
+  _skip_cnt = {"below_city_min": 0, "bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "order_failed": 0}
   # Within-run cap accounting. Kalshi's get_orders is eventually consistent —
   # a freshly created order can take >100ms to appear in the resting list.
   # Without local tracking, the per-rung live cap check below sees stale
@@ -2042,6 +2049,13 @@ for index, row in combined_table.iterrows():
     # Edge = NO-side EV per $1 staked = (1 − P(yes)) − bid/100
     edge = (1.0 - yes_prob) - (bid_price / 100.0)
 
+    # Filter 0: per-city minimum NO bid price floor
+    _city_min = CITY_MIN_NO_PRICE.get(row['City'])
+    if _city_min is not None and bid_price < _city_min:
+      _rungs.append((i, bid_price, contracts, edge, 'SKIP',
+                     f'bid<city_min({_city_min}c, {row["City"]})'))
+      _skip_cnt["below_city_min"] += 1
+      continue
     # Filter A: bid must not cross the offer (post_only would reject)
     if not (bid_price < int(no_offer)):
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
