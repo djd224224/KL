@@ -1552,7 +1552,7 @@ increment1 = 15
 # Empty by default — all cities use increment1.
 TAIL_INCREMENT_BY_CITY = {}
 price_count = list(range(0, 8))
-starting_contracts = 20
+starting_contracts = 15
 
 # Night-run size multiplier: double size when orders rest overnight.
 # - variable==1: afternoon/evening run placing orders on tomorrow's market.
@@ -1988,15 +1988,15 @@ for index, row in combined_table.iterrows():
   _city_mult = CITY_SIZE_MULT.get(row['City'], 1.0)
   _n_levels = len(price_count)
   _base_size = max(1, int(round(starting_contracts * night_size_mult * 1.0 * _city_mult)))
-  _top_size = max(1, int(round(starting_contracts * night_size_mult * 2.0 * _city_mult)))
+  _top_size = max(1, int(round(starting_contracts * night_size_mult * 1.0 * _city_mult)))
   _tail_inc = TAIL_INCREMENT_BY_CITY.get(row['City'], increment1)
   _inc_show = _tail_inc if is_tail else increment
   _nm_reason = ("variable=1" if variable == 1 else
                 ("hour<5 CT" if central_time.hour < 5 else "daytime"))
   print(f"    Sizing:     base={starting_contracts} × night={night_size_mult:g}x "
         f"({_nm_reason}) × city={_city_mult:g}x ({row['City']})")
-  print(f"                ladder size: {_base_size} (1st placed) → {_top_size} (8th placed) "
-        f"contracts (scales by placement order, not loop index; increment={_inc_show}c)")
+  print(f"                ladder size: {_base_size} contracts (flat across all rungs; "
+        f"increment={_inc_show}c)")
 
   _headroom = max_contracts - int(row['position']) - int(row['resting_order_count'])
   print(f"    Position:   held={row['position']}, resting={row['resting_order_count']}, "
@@ -2044,7 +2044,7 @@ for index, row in combined_table.iterrows():
     # Computed at current _placed_rung_idx; if this rung passes filters
     # and gets placed, _placed_rung_idx increments after for next rung.
     city_mult = CITY_SIZE_MULT.get(row['City'], 1.0)
-    ladder_mult = 1.0 + (_placed_rung_idx / (n_levels - 1)) if n_levels > 1 else 1.0
+    ladder_mult = 1.0  # flat sizing: deeper rungs no longer get larger size
     contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult * city_mult)))
     # Edge = NO-side EV per $1 staked = (1 − P(yes)) − bid/100
     edge = (1.0 - yes_prob) - (bid_price / 100.0)
