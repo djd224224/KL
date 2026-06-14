@@ -1590,8 +1590,8 @@ CITY_MIN_NO_PRICE = {
     "Denver": 55,
 }
 
-max_contracts = 300
-max_contracts1 = 300
+max_contracts = 150
+max_contracts1 = 150
 market_cutoff_probability = .2
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
