@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.exceptions import InvalidSignature
 import time 
 import base64
+import os
 
 
 class KalshiClient:
@@ -128,7 +129,12 @@ class KalshiClient:
 
     def raise_if_bad_response(self, response: requests.Response) -> None:
         if response.status_code not in range(200, 299):
-            raise HttpError(response.reason, response.status_code)
+            err = HttpError(response.reason, response.status_code)
+            try:
+                err.body = response.text[:500]
+            except Exception:
+                err.body = ""
+            raise err
     
     def query_generation(self, params:dict) -> str:
         relevant_params = {k:v for k,v in params.items() if v != None}
@@ -165,6 +171,7 @@ class ExchangeClient(KalshiClient):
         self.events_url = "/events"
         self.series_url = "/series"
         self.portfolio_url = "/portfolio"
+        self.events_orders_url = self.portfolio_url + "/events/orders"
 
     def logout(self,):
         result = self.post("/logout")
@@ -258,59 +265,159 @@ class ExchangeClient(KalshiClient):
         dictr = self.get(self.portfolio_url+'/balance')
         return dictr
 
+    # ==================================================================
+    # V2 order endpoints (migrated 2026-06). Kalshi retired the legacy
+    # POST/DELETE /portfolio/orders* mutation endpoints (now HTTP 410 Gone)
+    # in favor of /portfolio/events/orders*. See docs.kalshi.com/changelog
+    # (2026-04-22 new V2 endpoints; 2026-06-18 legacy deprecation).
+    #
+    # These methods keep the LEGACY call signatures (side=yes/no,
+    # action=buy/sell, yes_price/no_price in integer cents, integer count,
+    # type=limit/market, post_only, expiration_ts) so the trading bots'
+    # call sites are unchanged. Legacy params are translated here to the V2
+    # single-YES-book shape: side=bid/ask, one dollar-string `price` quoted
+    # on the YES leg, string `count`, and the now-required `time_in_force`
+    # and `self_trade_prevention_type`.
+    #
+    # YES-book mapping (Kalshi: bid=buy YES, ask=sell YES; selling YES is
+    # economically buying NO at 1-price):
+    #     buy  YES -> side=bid, price = yes_price
+    #     sell YES -> side=ask, price = yes_price
+    #     buy  NO  -> side=ask, price = 100 - no_price   (cents)
+    #     sell NO  -> side=bid, price = 100 - no_price   (cents)
+    # ==================================================================
+
+    @staticmethod
+    def _cents_to_dollar_str(cents) -> str:
+        """Integer cents -> exact dollar string: 45 -> '0.45', 5 -> '0.05',
+        99 -> '0.99'. Integer math (no float) so prices land on the penny tick."""
+        c = int(round(float(cents)))
+        sign = '-' if c < 0 else ''
+        c = abs(c)
+        return f"{sign}{c // 100}.{c % 100:02d}"
+
+    def _build_v2_order_body(self,
+                             ticker, side, action='buy', count=None,
+                             type='limit', yes_price=None, no_price=None,
+                             post_only=None, expiration_ts=None,
+                             client_order_id=None, time_in_force=None,
+                             self_trade_prevention_type=None,
+                             **_ignored):
+        """Translate legacy create_order kwargs into a V2 events/orders body.
+        `_ignored` absorbs legacy-only params (buy_max_cost, sell_position_floor)
+        that V2 does not support and the bots no longer pass."""
+        s = (side or '').strip().lower()
+        a = (action or 'buy').strip().lower()
+        if s == 'yes':
+            if yes_price is None:
+                raise ValueError("create_order: yes_price required for side='yes'")
+            cents = int(yes_price)
+            book_side = 'bid' if a == 'buy' else 'ask'
+        elif s == 'no':
+            if no_price is None:
+                raise ValueError("create_order: no_price required for side='no'")
+            cents = 100 - int(no_price)      # buy NO == sell YES at (1 - price)
+            book_side = 'ask' if a == 'buy' else 'bid'
+        else:
+            raise ValueError(f"create_order: unknown side {side!r} (expected 'yes'/'no')")
+        if count is None:
+            raise ValueError("create_order: count required")
+
+        stp = (self_trade_prevention_type
+               or os.environ.get('KALSHI_STP_TYPE', 'taker_at_cross'))
+
+        body = {
+            'ticker': ticker,
+            'side': book_side,
+            'count': f"{float(count):.2f}",            # V2 count is a string
+            'self_trade_prevention_type': stp,
+        }
+
+        if (type or 'limit').strip().lower() == 'market':
+            # V2 has no market-order type. A crossing-IOC emulation would sweep
+            # the book with NO slippage cap (legacy buy_max_cost/
+            # sell_position_floor have no equivalent here), risking a
+            # catastrophic fill. No bot places market orders, so fail loudly
+            # rather than silently ship an unprotected sweep.
+            raise NotImplementedError(
+                "create_order(type='market') is not supported on the V2 endpoint; "
+                "use a limit price with time_in_force='immediate_or_cancel' plus an "
+                "explicit slippage cap instead.")
+        body['price'] = self._cents_to_dollar_str(cents)
+        tif = time_in_force or 'good_till_canceled'
+        body['time_in_force'] = tif
+        # expiration_time (unix SECONDS) is only valid with good_till_canceled
+        if expiration_ts is not None and tif == 'good_till_canceled':
+            body['expiration_time'] = int(expiration_ts)
+
+        if client_order_id is not None:
+            body['client_order_id'] = client_order_id
+        if post_only:
+            body['post_only'] = True
+        return body
+
+    @staticmethod
+    def _wrap_v2_order_response(v2):
+        """Reshape the flat V2 create response (order_id, fill_count, ...) into
+        the legacy {'order': {...}} envelope the bots read, while also exposing
+        the flat keys at top level for any caller that reads them directly."""
+        if not isinstance(v2, dict):
+            return {'order': {}, 'raw': v2}
+        return {'order': dict(v2), **v2}
+
     def create_order(self,
                         ticker:str,
-                        client_order_id:str,
-                        side:str,
-                        action:str,
-                        count:int,
-                        type:str,
+                        client_order_id:str=None,
+                        side:str=None,
+                        action:str='buy',
+                        count:int=None,
+                        type:str='limit',
                         yes_price:Optional[int]=None,
                         no_price:Optional[int]=None,
                         post_only:Optional[bool]=None,
                         expiration_ts:Optional[int]=None,
                         sell_position_floor:Optional[int]=None,
                         buy_max_cost:Optional[int]=None,
+                        time_in_force:Optional[str]=None,
+                        self_trade_prevention_type:Optional[str]=None,
                         ):
-        
-        relevant_params = {k: v for k,v in locals().items() if k != 'self' and v != None}   
+        body = self._build_v2_order_body(
+            ticker=ticker, side=side, action=action, count=count, type=type,
+            yes_price=yes_price, no_price=no_price, post_only=post_only,
+            expiration_ts=expiration_ts, client_order_id=client_order_id,
+            time_in_force=time_in_force,
+            self_trade_prevention_type=self_trade_prevention_type)
+        print(f"[create_order->V2] {body}")
+        order_json = json.dumps(body)
+        result = self.post(path=self.events_orders_url, body=order_json)
+        return self._wrap_v2_order_response(result)
 
-        print(relevant_params)                         
-        order_json = json.dumps(relevant_params)
-        orders_url = self.portfolio_url + '/orders'
-        result = self.post(path = orders_url, body = order_json)
+    def batch_create_orders(self, orders:list):
+        """V2 batch create. Each item is a legacy-style order dict (same kwargs
+        as create_order); translated to the V2 shape. Unused by the bots today;
+        migrated for correctness."""
+        v2_orders = [self._build_v2_order_body(**o) for o in orders]
+        orders_json = json.dumps({'orders': v2_orders})
+        result = self.post(path=self.events_orders_url + '/batched', body=orders_json)
         return result
 
-    def batch_create_orders(self, 
-                                orders:list
-        ):
-        orders_json = json.dumps({'orders': orders})
-        batched_orders_url = self.portfolio_url + '/orders/batched'
-        result = self.post(path = batched_orders_url, body = orders_json)
-        return result
-
-    def decrease_order(self, 
-                        order_id:str,
-                        reduce_by:int,
-                        ):
-        order_url = self.portfolio_url + '/orders/' + order_id
+    def decrease_order(self, order_id:str, reduce_by:int):
         decrease_json = json.dumps({'reduce_by': reduce_by})
-        result = self.post(path = order_url + '/decrease', body = decrease_json)
+        result = self.post(path=self.events_orders_url + '/' + order_id + '/decrease',
+                           body=decrease_json)
         return result
 
-    def cancel_order(self,
-                        order_id:str):
-        order_url = self.portfolio_url + '/orders/' + order_id
-        result = self.delete(path = order_url)
+    def cancel_order(self, order_id:str):
+        result = self.delete(path=self.events_orders_url + '/' + order_id)
         return result
 
-    def batch_cancel_orders(self, 
-                                order_ids:list
-        ):
-        order_ids_json = json.dumps({"ids":order_ids})
-        batched_orders_url = self.portfolio_url + '/orders/batched'
-        result = self.delete(path = batched_orders_url, body = order_ids_json)
-        return result
+    def batch_cancel_orders(self, order_ids:list):
+        """Cancel multiple orders. The V2 batch-cancel endpoint requires a
+        request body, which the base delete() cannot send; since no bot uses
+        this path (they hasattr-gate on `cancel_orders`, which this client does
+        not define, and fall back to per-id cancel), loop per-id cancel_order —
+        always correct, no body needed."""
+        return [self.cancel_order(oid) for oid in order_ids]
 
     def get_fills(self,
                         ticker:Optional[str]=None,
