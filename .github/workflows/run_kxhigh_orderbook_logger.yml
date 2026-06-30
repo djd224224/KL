@@ -37,6 +37,17 @@ jobs:
           BQ_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
           BQ_DATASET: ${{ secrets.GCP_DATASET_ID }}
         run: python kxhigh_orderbook_logger.py
+      # Keep the analysis views in sync BEFORE rendering. They are
+      # CREATE OR REPLACE VIEW DDLs (settlements_clean, model_call_snapshots,
+      # resolved_markets, fills/orders_clean, fills_enriched, orders_fills)
+      # that nothing else maintains; a base-table drop/recreate leaves them
+      # broken, which silently breaks the dashboard ("unsettled") and the
+      # bias correction. Idempotent, ~1s metadata ops — safe every tick.
+      - name: Build analysis views
+        if: always()
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: gcp_sa_key.json
+        run: python analysis/kxhigh/python/build_views.py
       # Re-render the live dashboard right after the orderbook poll so the
       # HTML reflects the freshest state. Reads only — same SA, same auth.
       - name: Build live dashboard
