@@ -1590,8 +1590,23 @@ CITY_MIN_NO_PRICE = {
     "Denver": 55,
 }
 
-max_contracts = 150
-max_contracts1 = 150
+max_contracts = 100
+max_contracts1 = 100
+
+# Per-city max contracts override — cities listed here can carry a larger cap
+# than the global max_contracts. Cities not listed default to max_contracts.
+CITY_MAX_CONTRACTS = {
+    "Austin": 150,
+    "Los Angeles": 150,
+    "San Francisco": 150,
+    "San Antonio": 150,
+    "Seattle": 150,
+    "New York City": 150,
+    "Chicago": 150,
+    "Houston": 150,
+    "Philadelphia": 150,
+    "Minneapolis": 150,
+}
 market_cutoff_probability = .2
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
@@ -1998,9 +2013,10 @@ for index, row in combined_table.iterrows():
   print(f"                ladder size: {_base_size} contracts (flat across all rungs; "
         f"increment={_inc_show}c)")
 
-  _headroom = max_contracts - int(row['position']) - int(row['resting_order_count'])
+  _cap = CITY_MAX_CONTRACTS.get(row['City'], max_contracts)
+  _headroom = _cap - int(row['position']) - int(row['resting_order_count'])
   print(f"    Position:   held={row['position']}, resting={row['resting_order_count']}, "
-        f"cap={max_contracts} (headroom={_headroom})")
+        f"cap={_cap} (headroom={_headroom})")
 
   print(f"    Ladder (maker-only post_only; filters: bid<no_offer AND bid<no_bid−3):")
 
@@ -2069,9 +2085,9 @@ for index, row in combined_table.iterrows():
       _skip_cnt["bid>=no_bid-3"] += 1
       continue
     # Filter C: position cap
-    if not (max_contracts >= row['position'] + row['resting_order_count'] + contracts):
+    if not (_cap >= row['position'] + row['resting_order_count'] + contracts):
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
-                     f'position cap (would exceed {max_contracts})'))
+                     f'position cap (would exceed {_cap})'))
       _skip_cnt["position_cap"] += 1
       continue
 
@@ -2164,14 +2180,14 @@ for index, row in combined_table.iterrows():
       row['position'] = _live_pos
       row['resting_order_count'] = max(_effective_total - _live_pos, 0)
 
-      if _effective_total + contracts > max_contracts:
+      if _effective_total + contracts > _cap:
         _rungs.append((i, bid_price, contracts, edge, 'SKIP',
                        f'live cap (live={_signal_live}'
                        f' [pos={_live_pos}+resting={_live_resting}],'
                        f' local={_signal_local}'
                        f' [init_pos={_initial_position}+init_rest={_initial_resting}'
                        f'+run={_run_placed_contracts}],'
-                       f' eff={_effective_total}+new={contracts}>{max_contracts})'))
+                       f' eff={_effective_total}+new={contracts}>{_cap})'))
         _skip_cnt["position_cap"] += 1
         continue
     except Exception as _ce:
