@@ -2025,7 +2025,7 @@ def convert_df_to_match_schema(df, schema_dict):
         if bq_type == "STRING" and not pd.api.types.is_string_dtype(df_c[col].dtype):
             df_c[col] = df_c[col].astype(str).replace('nan', None).replace('None', None)
         elif bq_type == "FLOAT": df_c[col] = pd.to_numeric(df_c[col], errors='coerce')
-        elif bq_type == "INTEGER": df_c[col] = pd.to_numeric(df_c[col], errors='coerce').astype('Int64')
+        elif bq_type == "INTEGER": df_c[col] = pd.to_numeric(df_c[col], errors='coerce').round().astype('Int64')  # round(): fractional V2 counts
         elif bq_type == "BOOLEAN": df_c[col] = df_c[col].astype(bool)
     return df_c
 

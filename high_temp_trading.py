@@ -1503,13 +1503,15 @@ for market_ticker in combined_table['market_ticker']:
   for i in range(len(order_response['orders'])):
     order_id = order_response['orders'][i]['order_id']
     status = order_response['orders'][i]['status']
-    # Cancel anything that's still open: 'resting' (untouched), 'partial_filled'
-    # / 'partially_filled' (some contracts filled, remainder still in book),
-    # and 'pending' (briefly-queued state). Without partials in this list,
-    # the remaining quantity on a partial-filled order keeps accruing fills
-    # past the position cap.
+    # Cancel anything that's still open. Primary signal: remaining_count > 0
+    # (normalized from V2 remaining_count_fp; Kalshi zeroes it on cancel/
+    # execution/expiry, so >0 means the order can still accrue fills). The
+    # status whitelist stays as a fallback for orders reported without count
+    # fields — a partial-fill status the list doesn't know would otherwise
+    # keep accruing fills past the position cap.
+    _rem = order_response['orders'][i].get('remaining_count') or 0
     order_id = {'order_id':order_id}
-    if order_id is not None and status in ('resting', 'partial_filled', 'partially_filled', 'pending'):
+    if _rem > 0 or status in ('resting', 'partial_filled', 'partially_filled', 'pending'):
       try:
         exchange_client.cancel_order(**order_id)
       except Exception as _ce:
@@ -1533,7 +1535,8 @@ for market_ticker in combined_table['market_ticker']:
         combined_table.loc[row_index, 'position'] = abs(live_positions['position'].iloc[0])
   if 'position' not in combined_table.columns:
     combined_table['position'] = 0
-  combined_table['position'] = combined_table['position'].fillna(0).astype(int)
+  # float, not int: V2 contract quantities are fractional (e.g. 196.74)
+  combined_table['position'] = combined_table['position'].fillna(0).astype(float)
   combined_table['resting_order_count'] = 0
 
 combined_table
@@ -1751,22 +1754,25 @@ for index, row in combined_table.iterrows():
   try:
     _ord_resp = exchange_client.get_orders(ticker=ticker)
     _orders = _ord_resp.get('orders', []) if isinstance(_ord_resp, dict) else []
-    _live_resting = 0
+    _live_resting = 0.0
     for _o in _orders:
-      _status = _o.get('status', '')
-      if _status not in ('resting', 'partial_filled', 'partially_filled', 'pending'):
-        continue
-      # Remaining contracts on this order. Kalshi exposes `remaining_count`
-      # on some endpoints; fall back to count − filled_count when absent.
+      # Remaining contracts on this order (normalized from V2
+      # remaining_count_fp; zeroed by Kalshi on cancel/execution/expiry, so
+      # summing across ALL orders is safe and immune to status renames).
+      # Fall back to count − filled_count when absent — that difference is
+      # NOT zeroed on cancel, so the fallback keeps the status whitelist.
       _rem = _o.get('remaining_count')
       if _rem is None:
+        _status = _o.get('status', '')
+        if _status not in ('resting', 'partial_filled', 'partially_filled', 'pending'):
+          continue
         try:
-          _rem = max(0, int(_o.get('count', 0)) - int(_o.get('filled_count', 0)))
+          _rem = max(0.0, float(_o.get('count', 0)) - float(_o.get('filled_count', 0)))
         except (TypeError, ValueError):
-          _rem = 0
-      _live_resting += int(_rem)
-    if _live_resting != int(row['resting_order_count']):
-      print(f"    📊 resting refresh {int(row['resting_order_count'])} → {_live_resting}")
+          _rem = 0.0
+      _live_resting += float(_rem)
+    if _live_resting != float(row['resting_order_count']):
+      print(f"    📊 resting refresh {row['resting_order_count']} → {_live_resting:g}")
       row['resting_order_count'] = _live_resting
   except Exception as _re:
     pass  # fall back to whatever resting_order_count we have if refresh fails
@@ -2014,9 +2020,9 @@ for index, row in combined_table.iterrows():
         f"increment={_inc_show}c)")
 
   _cap = CITY_MAX_CONTRACTS.get(row['City'], max_contracts)
-  _headroom = _cap - int(row['position']) - int(row['resting_order_count'])
+  _headroom = _cap - float(row['position']) - float(row['resting_order_count'])
   print(f"    Position:   held={row['position']}, resting={row['resting_order_count']}, "
-        f"cap={_cap} (headroom={_headroom})")
+        f"cap={_cap} (headroom={_headroom:g})")
 
   print(f"    Ladder (maker-only post_only; filters: bid<no_offer AND bid<no_bid−3):")
 
@@ -2040,8 +2046,8 @@ for index, row in combined_table.iterrows():
   #   local = initial state + contracts we know we placed in this run
   # Both are floors on true exposure in their respective failure modes, so
   # max() is the safe choice.
-  _initial_position = int(row['position'])
-  _initial_resting = int(row['resting_order_count'])
+  _initial_position = float(row['position'])
+  _initial_resting = float(row['resting_order_count'])
   _run_placed_contracts = 0
   # Re-indexed sizing: ladder_mult scales by PLACEMENT order, not loop
   # index. Prevents the "ladder collapses to a single max-size deep
@@ -2150,17 +2156,20 @@ for index, row in combined_table.iterrows():
 
       _live_ord_resp = exchange_client.get_orders(ticker=row['market_ticker'])
       _live_orders = _live_ord_resp.get('orders', []) if isinstance(_live_ord_resp, dict) else []
-      _live_resting = 0
+      _live_resting = 0.0
       for _lo in _live_orders:
-        if _lo.get('status', '') not in ('resting', 'partial_filled', 'partially_filled', 'pending'):
-          continue
+        # Same logic as the per-ticker refresh above: remaining_count is
+        # zeroed on cancel/execution/expiry, so sum it across all orders;
+        # the count − filled_count fallback needs the status whitelist.
         _rem = _lo.get('remaining_count')
         if _rem is None:
+          if _lo.get('status', '') not in ('resting', 'partial_filled', 'partially_filled', 'pending'):
+            continue
           try:
-            _rem = max(0, int(_lo.get('count', 0)) - int(_lo.get('filled_count', 0)))
+            _rem = max(0.0, float(_lo.get('count', 0)) - float(_lo.get('filled_count', 0)))
           except (TypeError, ValueError):
-            _rem = 0
-        _live_resting += int(_rem)
+            _rem = 0.0
+        _live_resting += float(_rem)
 
       # Two estimators of current exposure (pos + resting) on this ticker:
       #   live  = Kalshi's right-now view; catches cross-run drift and

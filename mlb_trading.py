@@ -3216,7 +3216,9 @@ def convert_df_to_match_schema(df: pd.DataFrame, schema_dict: dict) -> pd.DataFr
             elif bq_type == "FLOAT" and not pd.api.types.is_float_dtype(current_dtype):
                 df_converted[col_name] = pd.to_numeric(df_converted[col_name], errors='coerce')
             elif bq_type == "INTEGER" and not pd.api.types.is_integer_dtype(current_dtype):
-                df_converted[col_name] = pd.to_numeric(df_converted[col_name], errors='coerce').astype('Int64')
+                # round() first: V2 positions/counts are fractional floats
+                # (e.g. -196.74) and astype('Int64') raises on non-integral values
+                df_converted[col_name] = pd.to_numeric(df_converted[col_name], errors='coerce').round().astype('Int64')
             elif bq_type == "BOOLEAN" and not pd.api.types.is_bool_dtype(current_dtype):
                 df_converted[col_name] = df_converted[col_name].astype(bool)
     return df_converted

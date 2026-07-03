@@ -914,7 +914,9 @@ def per_city_view(
                 "edge": float(r["edge"]) if pd.notna(r["edge"]) else None,
                 "yes_bid": int(r["ob_yes_bid"]) if pd.notna(r.get("ob_yes_bid")) else None,
                 "yes_offer": int(r["ob_yes_offer"]) if pd.notna(r.get("ob_yes_offer")) else None,
-                "position": int(pos_val) if pd.notna(pos_val) else 0,
+                # float, not int: fractional positions are real (e.g. -196.74)
+                # and int() truncation dropped |position|<1 buckets entirely
+                "position": float(pos_val) if pd.notna(pos_val) else 0.0,
                 "exposure_dollars": exposure_dollars,
                 "realized_pnl": realized_pnl,
                 "total_traded_dollars": float(r["total_traded_dollars"]) if pd.notna(r.get("total_traded_dollars")) else None,

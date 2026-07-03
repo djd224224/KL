@@ -419,6 +419,88 @@ class ExchangeClient(KalshiClient):
         always correct, no body needed."""
         return [self.cancel_order(oid) for oid in order_ids]
 
+    # ==================================================================
+    # V2 read-side normalization (migrated 2026-07-02). The same V2
+    # migration wave that retired the legacy order-mutation endpoints
+    # (410 Gone, see create_order above) also renamed the READ fields:
+    #   positions: position -> position_fp (signed fixed-point string)
+    #   orders:    count / filled_count / remaining_count ->
+    #              initial_count_fp / fill_count_fp / remaining_count_fp;
+    #              side/action now report the YES-book leg (a buy-NO order
+    #              reads side=yes, action=sell) with the outcome side moved
+    #              to `outcome_side`
+    #   fills:     count -> count_fp; same YES-book side/action semantics
+    # Legacy reads like p.get('position', 0) silently defaulted to zero,
+    # which disabled every position-cap layer in the bots (2026-07-02 LAX
+    # post-mortem: 196 contracts filled against a 150 cap).
+    #
+    # These helpers restore the legacy view ADDITIVELY: V2 keys are never
+    # removed or renamed (several scripts read *_fp / *_dollars natively),
+    # envelope keys (cursor, ...) are preserved, and synthesized counts are
+    # NUMERIC floats — contract quantities are fractional post-migration.
+    # One deliberate overwrite: orders'/fills' `side` and `action` are
+    # rewritten to the legacy customer view ('buy' means we bought the
+    # `side` outcome). Downstream P&L SQL (analysis/kxhigh/sql/
+    # 90_ab_hi_no_report.sql) computes cash flow from fills.action and was
+    # sign-flipped by the V2 semantics; KXHIGH_fills is truncate-rebuilt
+    # nightly so it self-heals from this rewrite. The raw V2 view stays
+    # available in book_side/outcome_side. KXHIGH_fills_live.action holds
+    # mixed semantics across the 2026-07-02 cutover (not computed on).
+    # ==================================================================
+
+    @staticmethod
+    def _fp_float(v):
+        """Fixed-point string -> float ('-196.74' -> -196.74); None if absent/bad."""
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _customer_side_action(item):
+        """(side, action) in legacy customer view, derived from the V2
+        YES-book fields: we bought the outcome iff we were on the book side
+        that acquires it (yes<->bid, no<->ask). Returns (None, None) when
+        the V2 fields are missing so callers leave the item untouched."""
+        outcome = item.get('outcome_side')
+        book = item.get('book_side')
+        if outcome in ('yes', 'no') and book in ('bid', 'ask'):
+            action = 'buy' if (outcome == 'yes') == (book == 'bid') else 'sell'
+            return outcome, action
+        return None, None
+
+    @classmethod
+    def _normalize_position(cls, p):
+        if isinstance(p, dict) and 'position' not in p:
+            f = cls._fp_float(p.get('position_fp'))
+            if f is not None:
+                p['position'] = f
+        return p
+
+    @classmethod
+    def _normalize_order(cls, o):
+        if not isinstance(o, dict):
+            return o
+        for legacy, fp in (('count', 'initial_count_fp'),
+                           ('filled_count', 'fill_count_fp'),
+                           ('remaining_count', 'remaining_count_fp')):
+            if legacy not in o:
+                f = cls._fp_float(o.get(fp))
+                if f is not None:
+                    o[legacy] = f
+        side, action = cls._customer_side_action(o)
+        if side is not None:
+            o['side'], o['action'] = side, action
+        return o
+
+    @classmethod
+    def _normalize_fill(cls, f):
+        if isinstance(f, dict):
+            side, action = cls._customer_side_action(f)
+            if side is not None:
+                f['side'], f['action'] = side, action
+        return f
+
     def get_fills(self,
                         ticker:Optional[str]=None,
                         order_id:Optional[str]=None,
@@ -430,8 +512,11 @@ class ExchangeClient(KalshiClient):
         fills_url = self.portfolio_url + '/fills'
         query_string = self.query_generation(params={k: v for k,v in locals().items()})
         dictr = self.get(fills_url + query_string)
+        if isinstance(dictr, dict):
+            for f in dictr.get('fills') or []:
+                self._normalize_fill(f)
         return dictr
-    
+
     def get_orders(self,
                         ticker:Optional[str]=None,
                         event_ticker:Optional[str]=None,
@@ -443,14 +528,19 @@ class ExchangeClient(KalshiClient):
         orders_url = self.portfolio_url + '/orders'
         query_string = self.query_generation(params={k: v for k,v in locals().items()})
         dictr = self.get(orders_url + query_string)
+        if isinstance(dictr, dict):
+            for o in dictr.get('orders') or []:
+                self._normalize_order(o)
         return dictr
-    
+
     def get_order(self,
                     order_id:str):
         orders_url = self.portfolio_url + '/orders'
         dictr = self.get(orders_url + '/' +  order_id)
+        if isinstance(dictr, dict):
+            self._normalize_order(dictr.get('order'))
         return dictr
-    
+
     def get_positions(self,
                         limit:Optional[int]=None,
                         cursor:Optional[str]=None,
@@ -461,6 +551,9 @@ class ExchangeClient(KalshiClient):
         positions_url = self.portfolio_url + '/positions'
         query_string = self.query_generation(params={k: v for k,v in locals().items()})
         dictr = self.get(positions_url + query_string)
+        if isinstance(dictr, dict):
+            for p in dictr.get('market_positions') or []:
+                self._normalize_position(p)
         return dictr
 
     def get_portfolio_settlements(self,

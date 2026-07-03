@@ -664,11 +664,18 @@ def poll_and_write_fills(
                 "fill_id":           f.get("trade_id") or f.get("fill_id"),
                 "order_id":          f.get("order_id"),
                 "market_ticker":     ticker,
-                "count_fp":          _to_float(f.get("count")) if f.get("count") is not None else _to_float(f.get("count_fp")),
+                # V2-native fields only. Do NOT prefer legacy `count`/`no_price`/
+                # `yes_price` here: the client's read normalization synthesizes
+                # legacy names with legacy UNITS (cents), which would land 100x
+                # off in these *_dollars FLOAT columns.
+                # NOTE: `action` is the client-normalized customer view as of
+                # 2026-07-02; earlier rows in this append-only table carry raw
+                # V2 YES-book semantics. Nothing computes on this column.
+                "count_fp":          _to_float(f.get("count_fp")),
                 "side":              f.get("side"),
                 "action":            f.get("action"),
-                "no_price_dollars":  _to_float(f.get("no_price")) if f.get("no_price") is not None else _to_float(f.get("no_price_dollars")),
-                "yes_price_dollars": _to_float(f.get("yes_price")) if f.get("yes_price") is not None else _to_float(f.get("yes_price_dollars")),
+                "no_price_dollars":  _to_float(f.get("no_price_dollars")),
+                "yes_price_dollars": _to_float(f.get("yes_price_dollars")),
                 "is_taker":          bool(f.get("is_taker")) if f.get("is_taker") is not None else None,
                 "created_time":      f.get("created_time"),
             })
