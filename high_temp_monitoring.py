@@ -253,7 +253,12 @@ def load_orders_from_bigquery() -> pd.DataFrame:
 # Paginated, filters to KXHIGH series. Full pull every run.
 # =====================================================================
 def get_all_fills() -> List[Dict[str, Any]]:
-    """Pull ALL fills from Kalshi API, filtered to KXHIGH markets."""
+    """Pull ALL fills from Kalshi API, filtered to KXHIGH markets.
+
+    Raises on any mid-pagination failure instead of returning a partial
+    list: the caller WRITE_TRUNCATEs KXHIGH_fills, so partial data would
+    silently shrink the table. Failing keeps the old table intact.
+    """
     fills = []
     cursor = None
     page = 0
@@ -280,6 +285,11 @@ def get_all_fills() -> List[Dict[str, Any]]:
             cursor = response.get('cursor')
             if not cursor:
                 break
+            if page >= 500:
+                raise RuntimeError(
+                    f"fills pagination still had a cursor after {page} pages "
+                    f"({len(fills)} {SERIES_TICKER} fills so far)"
+                )
 
             time.sleep(SLEEP_BETWEEN_CALLS_SEC)
 
@@ -287,6 +297,7 @@ def get_all_fills() -> List[Dict[str, Any]]:
         print(f"Error fetching fills: {e}")
         import traceback
         traceback.print_exc()
+        raise  # partial fills must not reach the WRITE_TRUNCATE below
 
     print(f"Retrieved {len(fills)} fills for {SERIES_TICKER}")
     return fills
@@ -318,9 +329,6 @@ def get_all_settlements() -> List[Dict[str, Any]]:
 
             response = exchange_client.get_portfolio_settlements(**params)
             batch = response.get('settlements', [])
-
-            if not batch:
-                break
 
             for s in batch:
                 ticker = s.get('ticker', '')
@@ -354,8 +362,12 @@ def get_all_settlements() -> List[Dict[str, Any]]:
                     'fee_cost': float(s.get('fee_cost', 0) or 0),
                 })
 
+            # An empty batch can arrive mid-stream; only a missing cursor ends the data.
             cursor = response.get('cursor')
             if not cursor:
+                break
+            if page >= 500:
+                print(f"  ⚠️ settlements pagination hit {page}-page cap; older settlements not fetched")
                 break
 
             time.sleep(SLEEP_BETWEEN_CALLS_SEC)

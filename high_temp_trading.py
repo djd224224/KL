@@ -1494,22 +1494,41 @@ flush_alerts("after snapshot write")
 
 combined_table = combined_table.fillna("")
 
+def fetch_all_orders(ticker, max_pages=10):
+    """Every order on a ticker, following the pagination cursor. A single
+    get_orders call returns only the first page, so a resting backlog beyond
+    one page would undercount the resting exposure feeding the cap checks
+    below (and leave orders uncancelled in the sweep)."""
+    orders = []
+    cursor = None
+    for _ in range(max_pages):
+        resp = exchange_client.get_orders(ticker=ticker, limit=200, cursor=cursor)
+        if not isinstance(resp, dict):
+            break
+        orders.extend(resp.get('orders') or [])
+        cursor = resp.get('cursor') or None
+        if not cursor:
+            break
+    if cursor:
+        print(f"  ⚠️ get_orders page cap ({max_pages} pages) hit for {ticker}; "
+              f"resting exposure may be undercounted")
+    return orders
+
 ####### DELETE EXISTING ORDERS
 
 for market_ticker in combined_table['market_ticker']:
-  order_params = {'ticker':market_ticker}
-  order_response = exchange_client.get_orders(**order_params)
+  open_orders = fetch_all_orders(market_ticker)
 
-  for i in range(len(order_response['orders'])):
-    order_id = order_response['orders'][i]['order_id']
-    status = order_response['orders'][i]['status']
+  for i in range(len(open_orders)):
+    order_id = open_orders[i]['order_id']
+    status = open_orders[i]['status']
     # Cancel anything that's still open. Primary signal: remaining_count > 0
     # (normalized from V2 remaining_count_fp; Kalshi zeroes it on cancel/
     # execution/expiry, so >0 means the order can still accrue fills). The
     # status whitelist stays as a fallback for orders reported without count
     # fields — a partial-fill status the list doesn't know would otherwise
     # keep accruing fills past the position cap.
-    _rem = order_response['orders'][i].get('remaining_count') or 0
+    _rem = open_orders[i].get('remaining_count') or 0
     order_id = {'order_id':order_id}
     if _rem > 0 or status in ('resting', 'partial_filled', 'partially_filled', 'pending'):
       try:
@@ -1752,8 +1771,7 @@ for index, row in combined_table.iterrows():
   # each placed 425 contracts, cap missed the duplication, ~600 NO filled
   # against a 500-contract cap.
   try:
-    _ord_resp = exchange_client.get_orders(ticker=ticker)
-    _orders = _ord_resp.get('orders', []) if isinstance(_ord_resp, dict) else []
+    _orders = fetch_all_orders(ticker)
     _live_resting = 0.0
     for _o in _orders:
       # Remaining contracts on this order (normalized from V2
@@ -2154,8 +2172,7 @@ for index, row in combined_table.iterrows():
       _live_active = [p for p in _live_mps if p.get('ticker') == row['market_ticker'] and p.get('position', 0) != 0]
       _live_pos = abs(_live_active[0].get('position', 0)) if _live_active else 0
 
-      _live_ord_resp = exchange_client.get_orders(ticker=row['market_ticker'])
-      _live_orders = _live_ord_resp.get('orders', []) if isinstance(_live_ord_resp, dict) else []
+      _live_orders = fetch_all_orders(row['market_ticker'])
       _live_resting = 0.0
       for _lo in _live_orders:
         # Same logic as the per-ticker refresh above: remaining_count is

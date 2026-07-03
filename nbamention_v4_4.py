@@ -970,17 +970,18 @@ def fetch_fills_from_api(
             break
 
         batch = response.get("fills", [])
-        if not batch:
-            break
-
         series_fills = [
             f for f in batch
             if f.get("ticker", "").startswith(series_ticker)
         ]
         all_fills.extend(series_fills)
 
+        # An empty batch can arrive mid-stream; only a missing cursor ends the data.
         cursor = response.get("cursor")
         if not cursor:
+            break
+        if page >= 500:
+            print(f"  ⚠️ fills pagination hit {page}-page cap; older fills not fetched")
             break
 
         if page % 10 == 0:

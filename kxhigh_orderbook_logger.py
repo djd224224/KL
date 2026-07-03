@@ -575,7 +575,11 @@ def poll_and_write_positions(
             })
         cursor = resp.get("cursor") or None
         pages += 1
-        if not cursor or pages >= 10:
+        if not cursor:
+            break
+        if pages >= 50:
+            print(f"  ⚠️ positions poll hit {pages}-page cap with cursor still live — "
+                  f"snapshot may be missing positions ({len(rows)} KXHIGH rows kept)")
             break
     if not rows:
         print("  no KXHIGH positions to log")
@@ -681,7 +685,11 @@ def poll_and_write_fills(
             })
         cursor = resp.get("cursor") or None
         pages += 1
-        if not cursor or pages >= 20:
+        if not cursor:
+            break
+        if pages >= 20:
+            print(f"  ⚠️ fills poll hit {pages}-page cap with cursor still live — "
+                  f"some fills in the lookback window may be missing")
             break
     # Drop rows missing fill_id (required column).
     rows = [r for r in rows if r.get("fill_id")]
