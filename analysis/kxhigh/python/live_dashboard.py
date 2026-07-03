@@ -2968,7 +2968,9 @@ def _render_modals(
             edge = "—" if b["edge"] is None else f'{b["edge"]*100:+.0f}'
             edge_cls = "" if b["edge"] is None else ("pos" if b["edge"] > 0.02 else "neg" if b["edge"] < -0.02 else "")
             pos = b["position"]
-            pos_str = "—" if pos == 0 else f'{pos:+d}'
+            # +g not +d: V2 positions are fractional floats (position_fp,
+            # e.g. -196.74); :+d raises ValueError and kills the render.
+            pos_str = "—" if pos == 0 else f'{pos:+g}'
             fair_no = "—"
             if snap_row is not None and pd.notna(snap_row.get("fair_no_price")):
                 fair_no = f'{float(snap_row["fair_no_price"]):.0f}'
