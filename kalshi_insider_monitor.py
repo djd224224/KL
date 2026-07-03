@@ -22,7 +22,8 @@ Environment Variables (secrets):
     ALERT_EMAIL_FROM        — Gmail sender address
     ALERT_EMAIL_PASSWORD    — Gmail app password
     ALERT_EMAIL_TO          — Recipient email (optional)
-    ALERT_SMS_GATEWAY       — T-Mobile gateway (default: 9729713381@tmomail.net)
+    ALERT_SMS_GATEWAY       — carrier SMS gateway (default: disabled; T-Mobile's
+                              tmomail.net has bounced everything since 2026-06-29)
 """
 
 import argparse
@@ -79,7 +80,10 @@ BQ_ALERTS_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.insider_monitor_alerts"
 ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM", "")
 ALERT_EMAIL_PASSWORD = os.getenv("ALERT_EMAIL_PASSWORD", "")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")
-ALERT_SMS_GATEWAY = os.getenv("ALERT_SMS_GATEWAY", "9729713381@tmomail.net")
+# Default was 9729713381@tmomail.net, but T-Mobile's email-to-SMS gateway has
+# refused all mail since ~2026-06-29 (452 then permanent bounce). Empty
+# disables the SMS leg; alerts deliver via ALERT_EMAIL_TO instead.
+ALERT_SMS_GATEWAY = os.getenv("ALERT_SMS_GATEWAY", "")
 ALERT_COOLDOWN_MINUTES = 15
 
 # --- Category-based exclusion (primary filter, from Kalshi event.category) ---
@@ -747,7 +751,7 @@ def send_alert(ticker: str, score: float, signals: dict, market_info: dict):
         f"  Signals firing: {signals.get('signals_firing', 0)}/4\n"
         f"\nTimestamp: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
 
-    if ALERT_EMAIL_FROM and ALERT_EMAIL_PASSWORD:
+    if ALERT_EMAIL_FROM and ALERT_EMAIL_PASSWORD and ALERT_SMS_GATEWAY:
         try:
             msg = MIMEText(sms_body)
             msg["Subject"] = ""

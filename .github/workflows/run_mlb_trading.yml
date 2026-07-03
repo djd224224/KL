@@ -48,7 +48,7 @@ jobs:
         GCP_DATASET_ID: ${{ secrets.GCP_DATASET_ID }}
         ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
         ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
-        ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        ALERT_EMAIL_TO: jackdu224@gmail.com  # tmomail SMS gateway dead since 2026-06-29 -> deliver to inbox (Gmail push)
       run: |
         set -o pipefail
         python mlb_trading.py 2>&1 | tee run.log

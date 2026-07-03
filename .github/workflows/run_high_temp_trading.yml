@@ -32,7 +32,7 @@ jobs:
       env:
         ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
         ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
-        ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        ALERT_EMAIL_TO: jackdu224@gmail.com  # tmomail SMS gateway dead since 2026-06-29 -> deliver to inbox (Gmail push)
         GOOGLE_APPLICATION_CREDENTIALS: google_credentials.json
         # ================================================================
         # A/B test: hi_no tied to fair NO (see d80fd4e, analysis/kxhigh/sql/90_ab_hi_no_report.sql)
