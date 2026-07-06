@@ -1589,8 +1589,8 @@ night_size_mult = 2 if is_night_run else 1.0
 # Cities not listed default to 1.0x.
 CITY_SIZE_MULT = {
     "New York City": 1.0,
-    "Austin": 1.5,
-    "Los Angeles": 1.25,
+    "Austin": 1.0,
+    "Los Angeles": 1.0,
     "Seattle": 1.0,
     "San Francisco": 1.25,
     "Boston": 1.25,
