@@ -1,0 +1,44 @@
+name: BQ retention guard
+# Daily archive of Kalshi fills (API only retains ~65 days) + audit that no
+# BigQuery table carries an undeclared expiration or was silently dropped and
+# recreated. See bq_retention_guard.py header for the 2026-07-07 incident that
+# motivated this. In-repo cron drift (minutes to ~an hour) is fine for a daily
+# job — unlike the 15-min logger, this does not need an external scheduler.
+# A failing run = violation report in the logs + GitHub failure email.
+on:
+  schedule:
+    - cron: '47 12 * * *'
+  workflow_dispatch:
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-cloud-bigquery
+      - name: Write GCP service account key
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        run: |
+          printenv GCP_SA_KEY > gcp_sa_key.json
+      - name: Run retention guard
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: gcp_sa_key.json
+          BQ_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
+          BQ_DATASET: ${{ secrets.GCP_DATASET_ID }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+          ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
+          ALERT_EMAIL_TO: jackdu224@gmail.com  # tmomail SMS gateway dead since 2026-06-29 -> deliver to inbox
+        run: python bq_retention_guard.py
+      - name: Cleanup secrets
+        if: always()
+        run: |
+          rm -f gcp_sa_key.json
