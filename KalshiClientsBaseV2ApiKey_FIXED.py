@@ -17,6 +17,14 @@ import base64
 import os
 
 
+# Connect/read timeouts for every HTTP call. Without these, requests can hang
+# forever on a dead connection and stall a bot's whole loop with quotes resting.
+HTTP_TIMEOUT_SECONDS = (
+    float(os.environ.get("KALSHI_HTTP_CONNECT_TIMEOUT", 5)),
+    float(os.environ.get("KALSHI_HTTP_READ_TIMEOUT", 20)),
+)
+
+
 class KalshiClient:
     """A simple client that allows utils to call authenticated Kalshi API endpoints."""
     def __init__(
@@ -57,7 +65,8 @@ class KalshiClient:
         self.rate_limit()
 
         response = requests.post(
-            self.host + path, data=body, headers=self.request_headers("POST", path)
+            self.host + path, data=body, headers=self.request_headers("POST", path),
+            timeout=HTTP_TIMEOUT_SECONDS,
         )
         self.raise_if_bad_response(response)
         return response.json()
@@ -68,7 +77,8 @@ class KalshiClient:
         self.rate_limit()
         
         response = requests.get(
-            self.host + path, headers=self.request_headers("GET", path), params=params
+            self.host + path, headers=self.request_headers("GET", path), params=params,
+            timeout=HTTP_TIMEOUT_SECONDS,
         )
         self.raise_if_bad_response(response)
         return response.json()
@@ -79,7 +89,8 @@ class KalshiClient:
         self.rate_limit()
         
         response = requests.delete(
-            self.host + path, headers=self.request_headers("DELETE", path), params=params
+            self.host + path, headers=self.request_headers("DELETE", path), params=params,
+            timeout=HTTP_TIMEOUT_SECONDS,
         )
         self.raise_if_bad_response(response)
         return response.json()
@@ -137,7 +148,9 @@ class KalshiClient:
             raise err
     
     def query_generation(self, params:dict) -> str:
-        relevant_params = {k:v for k,v in params.items() if v != None}
+        # 'self' sneaks in when callers pass locals(); it must not become a
+        # query param (harmless to Kalshi, but garbage in the URL).
+        relevant_params = {k:v for k,v in params.items() if v != None and k != 'self'}
         if len(relevant_params):
             query = '?'+''.join("&"+str(k)+"="+str(v) for k,v in relevant_params.items())[1:]
         else:
@@ -522,6 +535,7 @@ class ExchangeClient(KalshiClient):
                         event_ticker:Optional[str]=None,
                         min_ts:Optional[int]=None,
                         max_ts:Optional[int]=None,
+                        status:Optional[str]=None,
                         limit:Optional[int]=None,
                         cursor:Optional[str]=None
                         ):

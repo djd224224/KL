@@ -20,3 +20,6 @@ kalshi_report.html
 
 # Local user settings (not repo-shared)
 .claude/settings.local.json
+
+# Crypto MM bot runtime logs (written by run_crypto_touch_mm.ps1)
+run-logs/crypto-touch/
