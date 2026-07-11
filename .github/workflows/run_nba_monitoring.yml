@@ -1,10 +1,12 @@
 name: NBAMENTION Daily Monitoring
 
-# Runs once daily at 9:00 PM UTC (3:00 PM CST)
+# OFF-SEASON: schedule disabled 2026-07-11 — NBA season over, nothing to monitor.
+# Re-awaken for next season by uncommenting:
+# on:
+#   schedule:
+#     - cron: '0 21 * * *'  # once daily at 9:00 PM UTC (3:00 PM CST)
 on:
-  schedule:
-    - cron: '0 21 * * *'  
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:  # Manual trigger only while off-season
 
 jobs:
   run-monitoring:
