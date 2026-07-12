@@ -77,7 +77,7 @@ from cryptography.hazmat.primitives import serialization
 
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
-MODEL_VERSION = "crypto_touch_mm_v1.7"
+MODEL_VERSION = "crypto_touch_mm_v1.8"
 RUN_ID = uuid.uuid4().hex[:8]
 CLIENT_ORDER_PREFIX = "cmm"  # all client_order_ids look like cmm-<run>-<uuid>
 
@@ -128,16 +128,16 @@ MARKETS: Dict[str, MarketConfig] = {m.key: m for m in [
 QUOTE_OFFSET_CENTS = int(os.environ.get("CMM_QUOTE_OFFSET_CENTS", 5))
 LEVEL_SPACING_CENTS = int(os.environ.get("CMM_LEVEL_SPACING_CENTS", 2))
 NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 3))
-CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 5))
+CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 8))
 
 # Risk / hygiene parameters
-MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 80))   # per market, either sign
+MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 128))  # per market, either sign
 # Net cap across all strikes of one event (they are one correlated bet on the
 # same spot). 500 comfortably exceeds 8 full 3x10 ladders (480): non-binding
 # at rest so every bucket gets the full spec ladder; binds as fills
 # accumulate. The event budget is split evenly across quotable markets each
 # cycle.
-MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 500))
+MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 800))
 SKIP_FAIR_ABOVE_CENTS = 97       # near-certain touch: model risk dominates, stand down
 BOOK_DIVERGENCE_BID = 85         # best bid >= this while our fair is 20c+ lower ->
 BOOK_DIVERGENCE_GAP = 20         # ... suspected touch we can't see; stand down

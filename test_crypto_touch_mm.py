@@ -157,9 +157,10 @@ class TestBuildQuotes(unittest.TestCase):
         return sorted((x.price_cents, x.count) for x in quotes if x.book_side == "ask")
 
     def test_standard_ladder(self):
+        C = mm.CONTRACTS_PER_LEVEL
         quotes = self.q(50, bb=46, ba=54)
-        self.assertEqual(self.bids(quotes), [(45, 5), (43, 5), (41, 5)])
-        self.assertEqual(self.asks(quotes), [(55, 5), (57, 5), (59, 5)])
+        self.assertEqual(self.bids(quotes), [(45, C), (43, C), (41, C)])
+        self.assertEqual(self.asks(quotes), [(55, C), (57, C), (59, C)])
 
     def test_never_lead_bid_joins_external_best(self):
         # fair 50 but the best external bid is only 40: join it, never improve;
@@ -182,12 +183,14 @@ class TestBuildQuotes(unittest.TestCase):
     def test_low_fair_drops_negative_bids(self):
         quotes = self.q(3, bb=2, ba=4)
         self.assertEqual(self.bids(quotes), [])   # ladder wants -2,-4,-6: dropped
-        self.assertEqual(self.asks(quotes), [(8, 5), (10, 5), (12, 5)])
+        C = mm.CONTRACTS_PER_LEVEL
+        self.assertEqual(self.asks(quotes), [(8, C), (10, C), (12, C)])
 
     def test_high_fair_drops_over_99_asks(self):
         quotes = self.q(96, bb=92, ba=99)
         self.assertEqual(self.asks(quotes), [])   # ladder wants 101+: dropped
-        self.assertEqual(self.bids(quotes), [(91, 5), (89, 5), (87, 5)])
+        C = mm.CONTRACTS_PER_LEVEL
+        self.assertEqual(self.bids(quotes), [(91, C), (89, C), (87, C)])
 
     def test_cross_clamp_bid_never_crosses_ask(self):
         quotes = self.q(60, bb=48, ba=50)
@@ -200,8 +203,9 @@ class TestBuildQuotes(unittest.TestCase):
         self.assertTrue(all(p > 52 for p, _c in self.asks(quotes)))
 
     def test_room_shaves_ladder(self):
-        quotes = self.q(50, bb=46, ba=54, room_buy=12, room_sell=0)
-        self.assertEqual(self.bids(quotes), [(45, 5), (43, 5), (41, 2)])
+        C = mm.CONTRACTS_PER_LEVEL
+        quotes = self.q(50, bb=46, ba=54, room_buy=2 * C + 2, room_sell=0)
+        self.assertEqual(self.bids(quotes), [(45, C), (43, C), (41, 2)])
         self.assertEqual(self.asks(quotes), [])
         quotes = self.q(50, bb=46, ba=54, room_buy=0, room_sell=3)
         self.assertEqual(self.asks(quotes), [(55, 3)])
@@ -595,36 +599,43 @@ class TestSideCap(unittest.TestCase):
         return b
 
     def resting(self, n, side="bid", ticker="T1"):
+        C = mm.CONTRACTS_PER_LEVEL
         return [{"order_id": f"r{i}", "ticker": ticker, "book_side": side,
-                 "yes_price": 45 - 2 * i, "remaining_count": 5.0, "status": "resting"}
+                 "yes_price": 45 - 2 * i, "remaining_count": float(C),
+                 "status": "resting"}
                 for i in range(n)]
 
     def test_blocks_beyond_side_cap(self):
         bot = self.bot()
-        to_place = [mm.Quote("T1", "bid", 39, 5)]
-        placed = bot.place_with_side_cap(to_place, self.resting(3), set(), 0.0)
-        self.assertEqual(placed, 0, "3x5 already resting: must refuse a 4th bid")
+        C = mm.CONTRACTS_PER_LEVEL
+        to_place = [mm.Quote("T1", "bid", 39, C)]
+        placed = bot.place_with_side_cap(to_place, self.resting(mm.NUM_LEVELS),
+                                         set(), 0.0)
+        self.assertEqual(placed, 0, "full ladder resting: must refuse another level")
         self.assertEqual(bot.state.ledger, {})
 
     def test_allows_up_to_cap_and_counts_own_placements(self):
         bot = self.bot()
-        to_place = [mm.Quote("T1", "bid", 45, 5), mm.Quote("T1", "bid", 43, 5),
-                    mm.Quote("T1", "bid", 41, 5), mm.Quote("T1", "bid", 39, 5)]
+        C = mm.CONTRACTS_PER_LEVEL
+        to_place = [mm.Quote("T1", "bid", 45 - 2 * i, C)
+                    for i in range(mm.NUM_LEVELS + 1)]
         placed = bot.place_with_side_cap(to_place, [], set(), 0.0)
-        self.assertEqual(placed, 3, "4th level would breach the 15-contract side cap")
+        self.assertEqual(placed, mm.NUM_LEVELS,
+                         "one level beyond the side cap must be refused")
 
     def test_cancelled_orders_free_room_and_sides_independent(self):
         bot = self.bot()
-        resting = self.resting(3) + self.resting(3, side="ask")
+        C = mm.CONTRACTS_PER_LEVEL
+        resting = self.resting(mm.NUM_LEVELS) + self.resting(mm.NUM_LEVELS, side="ask")
         cancelled = {"r0"}   # one bid cancelled this cycle -> room for one new bid
-        to_place = [mm.Quote("T1", "bid", 39, 5), mm.Quote("T1", "bid", 37, 5)]
+        to_place = [mm.Quote("T1", "bid", 39, C), mm.Quote("T1", "bid", 37, C)]
         placed = bot.place_with_side_cap(to_place, resting, cancelled, 0.0)
         self.assertEqual(placed, 1)
 
     def test_other_market_not_affected(self):
         bot = self.bot()
-        placed = bot.place_with_side_cap([mm.Quote("T2", "bid", 40, 5)],
-                                         self.resting(3, ticker="T1"), set(), 0.0)
+        placed = bot.place_with_side_cap([mm.Quote("T2", "bid", 40, mm.CONTRACTS_PER_LEVEL)],
+                                         self.resting(mm.NUM_LEVELS, ticker="T1"), set(), 0.0)
         self.assertEqual(placed, 1)
 
 
@@ -643,32 +654,32 @@ class TestLevelCap(unittest.TestCase):
 
     def test_full_level_blocks_same_price(self):
         bot = self.bot()
-        placed = bot.place_with_side_cap([mm.Quote("T1", "bid", 45, 5)],
-                                         [self.rest_at(45, 5)], set(), 0.0)
+        placed = bot.place_with_side_cap([mm.Quote("T1", "bid", 45, mm.CONTRACTS_PER_LEVEL)],
+                                         [self.rest_at(45, mm.CONTRACTS_PER_LEVEL)], set(), 0.0)
         self.assertEqual(placed, 0)
 
     def test_partial_level_blocks_overfill(self):
         bot = self.bot()
-        placed = bot.place_with_side_cap([mm.Quote("T1", "bid", 45, 5)],
+        placed = bot.place_with_side_cap([mm.Quote("T1", "bid", 45, mm.CONTRACTS_PER_LEVEL)],
                                          [self.rest_at(45, 2)], set(), 0.0)
         self.assertEqual(placed, 0)
 
     def test_other_price_unaffected(self):
         bot = self.bot()
-        placed = bot.place_with_side_cap([mm.Quote("T1", "bid", 43, 5)],
-                                         [self.rest_at(45, 5)], set(), 0.0)
+        placed = bot.place_with_side_cap([mm.Quote("T1", "bid", 43, mm.CONTRACTS_PER_LEVEL)],
+                                         [self.rest_at(45, mm.CONTRACTS_PER_LEVEL)], set(), 0.0)
         self.assertEqual(placed, 1)
 
     def test_own_wave_cannot_stack_a_level(self):
         bot = self.bot()
-        to_place = [mm.Quote("T1", "bid", 45, 5), mm.Quote("T1", "bid", 45, 5)]
+        to_place = [mm.Quote("T1", "bid", 45, mm.CONTRACTS_PER_LEVEL), mm.Quote("T1", "bid", 45, mm.CONTRACTS_PER_LEVEL)]
         placed = bot.place_with_side_cap(to_place, [], set(), 0.0)
         self.assertEqual(placed, 1)
 
     def test_cancelled_level_frees_it(self):
         bot = self.bot()
-        placed = bot.place_with_side_cap([mm.Quote("T1", "bid", 45, 5)],
-                                         [self.rest_at(45, 5)], {"r0"}, 0.0)
+        placed = bot.place_with_side_cap([mm.Quote("T1", "bid", 45, mm.CONTRACTS_PER_LEVEL)],
+                                         [self.rest_at(45, mm.CONTRACTS_PER_LEVEL)], {"r0"}, 0.0)
         self.assertEqual(placed, 1)
 
 
