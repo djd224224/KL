@@ -20,6 +20,10 @@ param(
 $Python = "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe"
 $Repo = "C:\Users\jackd\Documents\KL"
 
+# Transcript: Task Scheduler swallows console errors; this file is the only
+# way to see why the launcher died before its first loop iteration.
+try { Start-Transcript -Path (Join-Path $Repo "run-logs\incentive-mm\launcher-transcript.log") -Append | Out-Null } catch {}
+
 Set-Location $Repo
 New-Item -ItemType Directory -Force (Join-Path $Repo "run-logs\incentive-mm") | Out-Null
 
@@ -39,7 +43,12 @@ Start-Sleep -Seconds (Get-Random -Maximum 45)
 
 $ProbeEnv = ""
 if ($Probe) {
-    $ProbeEnv = "set IMM_LEVELS=0:1,1:2,2:4&& set IMM_MAX_MARKETS=10&& set IMM_COLLATERAL_BUDGET=200&& "
+    # TTL/refresh raised vs defaults: with the crypto fleet sharing the
+    # account's API throughput, order writes run ~5s each — a 60-order book
+    # takes ~5 min to rewrite, so a 420s refresh would full-churn forever
+    # (the fleet's hard-learned lesson). 1800/1500 = ~28% rewrite duty cycle;
+    # cutoff-capped expirations still bound event risk exactly.
+    $ProbeEnv = "set IMM_LEVELS=0:1,1:2,2:4&& set IMM_MAX_MARKETS=10&& set IMM_COLLATERAL_BUDGET=200&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& "
 }
 
 while ($true) {

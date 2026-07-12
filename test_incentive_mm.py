@@ -1116,21 +1116,69 @@ class TestEventBudgetSplit(unittest.TestCase):
              imm.MAX_POSITION_CONTRACTS) = old
 
 
-class TestManualPositionsExemptFromEventCap(unittest.TestCase):
-    def test_manual_sibling_position_does_not_shrink_event_room(self):
-        """User holds 480 manually on market B of an event; the bot quoting
-        market A of the same event keeps its full event budget."""
+class TestEventLevelStandoff(unittest.TestCase):
+    def test_manual_sibling_position_yields_whole_event(self):
+        """User holds a manual position on market B; the bot must avoid EVERY
+        market of that event, including market A it would otherwise quote."""
         _clean_persist()
         client = FakeClient()
         b = "KXGOOD-99DEC31-B"
         client.markets[b] = dict(client.markets["KXGOOD-99DEC31-A"], ticker=b)
-        client.positions[b] = imm.MAX_EVENT_CONTRACTS - 20   # manual: not in own book
+        client.positions[b] = 50   # manual (not in bot's own book)
         bot = IncentiveMarketMaker(client=client, live=False)
         bot.run_cycle()
+        self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
+        self.assertEqual(bot.state.sim_orders, {})
+
+    def test_bot_own_positions_do_not_self_yield(self):
+        """The bot's OWN positions across an event must not trigger the
+        event-level standoff against itself."""
+        _clean_persist()
+        client = FakeClient()
+        t = "KXGOOD-99DEC31-A"
+        client.positions[t] = 20
+        bot = IncentiveMarketMaker(client=client, live=False)
+        bot.pnl.pos[t] = 20   # ours
+        self.assertEqual(bot.manual_events(client.positions), set())
+        bot.run_cycle()
+        self.assertIn(t, bot.state.selected)
+
+    def test_event_standoff_releases_when_manual_gone(self):
+        _clean_persist()
+        client = FakeClient()
+        b = "KXGOOD-99DEC31-B"
+        client.markets[b] = dict(client.markets["KXGOOD-99DEC31-A"], ticker=b)
+        client.positions[b] = 50
+        bot = IncentiveMarketMaker(client=client, live=False)
+        bot.run_cycle()
+        self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
+        client.positions.pop(b)          # user exits the event
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
         self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
-        bids = sum(o["remaining_count"] for o in bot.state.sim_orders.values()
-                   if o["book_side"] == "bid")
-        self.assertEqual(bids, 35)   # full ladder, not shaved to 20
+
+    def test_can_disable(self):
+        old = imm.EVENT_LEVEL_STANDOFF
+        imm.EVENT_LEVEL_STANDOFF = False
+        try:
+            bot = IncentiveMarketMaker(client=None, live=False)
+            self.assertEqual(bot.manual_events({"KXX-1-A": 50}), set())
+        finally:
+            imm.EVENT_LEVEL_STANDOFF = old
+
+
+class TestStpProtectsUser(unittest.TestCase):
+    def test_orders_placed_with_maker_stp(self):
+        """Bot orders (always post-only makers) must carry STP that yields the
+        bot's resting order on a self-cross, so the user's crossing manual
+        order survives."""
+        _clean_persist()
+        client = FakeClient()
+        bot = IncentiveMarketMaker(client=client, live=True)
+        bot.place_order(Quote("KXGOOD-99DEC31-A", "bid", 49, 5), time.time())
+        self.assertTrue(client.created)
+        self.assertEqual(client.created[0]["self_trade_prevention_type"], "maker")
+        self.assertEqual(imm.STP_TYPE, "maker")
 
 
 class TestDeselectionSweep(unittest.TestCase):

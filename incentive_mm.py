@@ -212,6 +212,21 @@ MIN_EST_DOLLARS_PER_DAY = _env_float("IMM_MIN_EST_PER_DAY", 0.75)  # ~min-payout
 # fills would pollute the loss halt, and STP would eat his crossing orders.
 MANUAL_STANDOFF_CONTRACTS = _env_float("IMM_MANUAL_STANDOFF", 5)
 
+# Self-trade prevention. The bot's orders are ALWAYS post-only (resting
+# makers), so the only self-cross possible is the USER aggressing into a bot
+# quote. 'maker' => the bot's resting order is the one cancelled on that
+# cross, so the user's incoming manual order survives. 'taker_at_cross' (the
+# other bots' default) only protects a resting order when OUR order is the
+# taker — which post-only orders never are — so it left the user's crossing
+# orders exposed. Set per-order here; the shared client default is untouched
+# (the crypto fleet keeps its own).
+STP_TYPE = os.environ.get("IMM_STP_TYPE", "maker")
+# Yield at the EVENT level, not just the market: the user trades whole games /
+# episodes by hand (positions or orders across several strikes of one event),
+# so a manual footprint on ANY market of an event makes the bot avoid EVERY
+# market of that event. Eliminates the self-cross surface at its source.
+EVENT_LEVEL_STANDOFF = os.environ.get("IMM_EVENT_STANDOFF", "1") == "1"
+
 STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
 HALT_FILE = os.path.join(STATUS_DIR, "HALT")
@@ -986,6 +1001,7 @@ class IncentiveMarketMaker:
             kwargs = dict(side="yes", action="buy", yes_price=q.price_cents)
         else:
             kwargs = dict(side="no", action="buy", no_price=100 - q.price_cents)
+        kwargs["self_trade_prevention_type"] = STP_TYPE   # user's order wins a self-cross
         label = (f"{q.ticker} {q.book_side.upper():4s} {q.count}x @ {q.price_cents}c")
         if not self.live:
             oid = f"sim-{uuid.uuid4().hex[:12]}"
@@ -1344,7 +1360,9 @@ class IncentiveMarketMaker:
 
         # Pass 1: hard screens (+ yield-to-human: never select a market the
         # user is trading manually — divergence vs our own book, a foreign
-        # resting order seen last cycle, or an active standoff).
+        # resting order, an active standoff, OR any manual footprint elsewhere
+        # in the same EVENT).
+        manual_evts = self.manual_events(positions)
         screened: List[MarketMeta] = []
         skipped: Dict[str, int] = {}
         for meta in metas:
@@ -1352,7 +1370,8 @@ class IncentiveMarketMaker:
             manual = abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
             foreign_n = self._foreign_resting.get(t, 0) if self.live else 0
             if (t in self.state.manual_standoff or foreign_n
-                    or manual >= MANUAL_STANDOFF_CONTRACTS):
+                    or manual >= MANUAL_STANDOFF_CONTRACTS
+                    or meta.event_ticker in manual_evts):
                 skipped["manual"] = skipped.get("manual", 0) + 1
                 continue
             reason = self._screen(meta, now_utc)
@@ -1543,6 +1562,29 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} restored orphan position market {t} "
                     f"(pos {positions.get(t, 0):+.0f}, reduce-only)")
 
+    @staticmethod
+    def _event_of(ticker: str) -> str:
+        return ticker.rsplit("-", 1)[0]
+
+    def manual_events(self, positions: Dict[str, float]) -> Set[str]:
+        """Events the user is trading by hand, from LIVE SIGNALS ONLY: any
+        market of the event with a manual position (|account − own book| ≥
+        threshold) or a foreign (non-imm) resting order. The bot avoids EVERY
+        market of these events, so it never rests where the user's crossing
+        order could hit it. Deliberately excludes the standoff set itself
+        (downstream state) so a market releases once the real signal clears."""
+        events: Set[str] = set()
+        if not EVENT_LEVEL_STANDOFF:
+            return events
+        for t, v in positions.items():
+            if abs(v - self.pnl.pos.get(t, 0.0)) >= MANUAL_STANDOFF_CONTRACTS:
+                events.add(self._event_of(t))
+        if self.live:
+            for t, n in self._foreign_resting.items():
+                if n:
+                    events.add(self._event_of(t))
+        return events
+
     def _screen(self, meta: MarketMeta, now_utc: datetime) -> Optional[str]:
         """Hard screens; returns a skip-reason or None if quotable."""
         now_ts = now_utc.timestamp()
@@ -1599,12 +1641,16 @@ class IncentiveMarketMaker:
             return
 
         positions = self.fetch_positions()
-        # Release standoffs whose manual activity is gone (the yielded market
-        # never re-enters the managed loop, so it must be released here).
+        # Release standoffs whose manual activity is gone — the market's own
+        # divergence/foreign-order must be clear AND no sibling market of its
+        # event is still manual (event-level yield). The yielded market never
+        # re-enters the managed loop, so it must be released here.
+        manual_evts = self.manual_events(positions)
         for st in list(self.state.manual_standoff):
             manual = abs(positions.get(st, 0.0) - self.pnl.pos.get(st, 0.0))
             foreign_n = self._foreign_resting.get(st, 0) if self.live else 0
-            if manual < MANUAL_STANDOFF_CONTRACTS and not foreign_n:
+            if (manual < MANUAL_STANDOFF_CONTRACTS and not foreign_n
+                    and self._event_of(st) not in manual_evts):
                 self.state.manual_standoff.pop(st, None)
                 log(f"{self.tag} {st}: manual activity cleared; market eligible again")
         self.refresh_universe(now_utc, positions)
@@ -1653,13 +1699,16 @@ class IncentiveMarketMaker:
         # inventory riding to settlement (review-confirmed P0).
         realized = self.pnl.total_realized() - self.state.realized_baseline
 
-        resting = self.fetch_resting_orders(now_ts)
+        resting = self.fetch_resting_orders(now_ts)   # populates _foreign_resting
         own_by_ticker: Dict[str, List[Tuple[str, int, float]]] = {}
         for o in resting:
             parsed = order_yes_book_cents(o)
             if parsed is not None:
                 own_by_ticker.setdefault(o.get("ticker", ""), []).append(
                     (parsed[0], parsed[1], order_remaining(o)))
+        # Events the user is trading by hand THIS cycle (foreign orders now
+        # fresh). The per-market loop below yields every market of these.
+        manual_evts = self.manual_events(positions)
 
         # Cancel resting orders on markets we no longer manage at all.
         managed_set = set(managed)
@@ -1735,13 +1784,17 @@ class IncentiveMarketMaker:
             own_pos = self.pnl.pos.get(t, 0.0)
             manual_pos = pos - own_pos
             foreign_n = self._foreign_resting.get(t, 0) if self.live else 0
-            if foreign_n or abs(manual_pos) >= MANUAL_STANDOFF_CONTRACTS:
+            event_manual = meta.event_ticker in manual_evts
+            if foreign_n or abs(manual_pos) >= MANUAL_STANDOFF_CONTRACTS or event_manual:
                 if t not in self.state.manual_standoff:
                     self.state.manual_standoff[t] = now_ts
+                    why = ("elsewhere in event " + meta.event_ticker) if event_manual \
+                        and not (foreign_n or abs(manual_pos) >= MANUAL_STANDOFF_CONTRACTS) \
+                        else f"foreign orders={foreign_n}, manual pos {manual_pos:+.0f}"
                     self.alerter.alert(
                         "manual_standoff",
-                        f"{t}: manual activity detected (foreign orders={foreign_n}, "
-                        f"manual pos {manual_pos:+.0f}); yielding", key=t, urgent=False)
+                        f"{t}: manual activity detected ({why}); yielding",
+                        key=t, urgent=False)
                 n = self.cancel_market_orders(t, resting)
                 if n:
                     log(f"{self.tag} {t}: cancelled {n} quotes, yielding to manual")

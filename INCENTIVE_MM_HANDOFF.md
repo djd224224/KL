@@ -100,11 +100,33 @@ bot get out of his way, everywhere:
   computed from the bot's own book, so the user's manual positions (on quoted or
   sibling markets of an event) never consume the bot's capacity (user decision
   2026-07-11).
-- STP note: with standoff, the user's crossing orders no longer meet bot quotes on
-  markets he trades. On first contact (before a divergence exists) a manual taker
-  order crossing a bot quote can still trigger a same-member STP cancel once —
-  unavoidable without pre-reading his intent; the resting-order detection catches
-  passive manual orders before any cross.
+## v1.2 fix (2026-07-12): don't wipe the user's manual orders
+
+Symptom: during the first probe, some of the user's manual limit orders were wiped.
+Root cause: the bot's orders are post-only (always resting MAKERS), so the only
+self-cross is the USER aggressing into a bot quote. The client default STP
+`taker_at_cross` only cancels OUR order when OUR order is the taker — which
+post-only orders never are — so it gave the user's crossing order no protection
+(self-match / cancel). Two-layer fix:
+
+1. **STP = `maker`** for imm orders (`IMM_STP_TYPE`, set per-order; the shared
+   client default and the crypto fleet are untouched). On any self-cross the
+   BOT's resting order is the one cancelled, so the user's incoming manual order
+   survives. (Per Kalshi: `maker` = "your resting maker order is cancelled if a
+   taker side of yours crosses it".)
+2. **Event-level standoff** (`IMM_EVENT_STANDOFF=1`): a manual footprint —
+   position ≥5 vs the bot's own book, or ANY non-imm resting order — on ANY market
+   of an event makes the bot avoid EVERY market of that event, not just that
+   strike. The user trades whole games/episodes, so this removes the collision
+   surface at its source. Verified live 2026-07-12: MILPIT (his MLB positions)
+   and MENWORLDCUP (his big manual book) fully excluded; `manual` skips 32→54.
+
+Residual: a ~1-cycle (90s) race if the user opens a brand-new order on an event the
+bot is already quoting — but STP=`maker` protects his order even in that window,
+and the next cycle yields the whole event. The bulletproof elimination is a
+**separate Kalshi subaccount** for the bot (no self-trade between subaccounts at
+all) — recommended if manual + bot activity stays heavy on the same series; needs
+confirming reward eligibility is per-subaccount first.
 
 ## Market selection (every 10 min)
 
