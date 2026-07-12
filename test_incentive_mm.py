@@ -960,7 +960,7 @@ class TestSeriesOverrides(unittest.TestCase):
 
 class TestLoveIslandCycle(unittest.TestCase):
     def _client(self, n_markets=4, mid_bid="0.48", mid_ask="0.49",
-                no_bid="0.49"):
+                no_bid="0.49", yes_depth="1200", no_depth="1200"):
         _clean_persist()
         client = FakeClient()
         client.programs = []
@@ -982,7 +982,8 @@ class TestLoveIslandCycle(unittest.TestCase):
                 "yes_bid_dollars": "0.48", "yes_ask_dollars": "0.50",
                 "volume_fp": "500.00"}
             client.books[t] = {"orderbook_fp": {
-                "yes_dollars": [[mid_bid, "600"]], "no_dollars": [[no_bid, "1200"]]}}
+                "yes_dollars": [[mid_bid, yes_depth]],
+                "no_dollars": [[no_bid, no_depth]]}}
         return client, ev
 
     def _resolver_830(self, bot):
@@ -1067,6 +1068,89 @@ class TestLoveIslandCycle(unittest.TestCase):
         self.assertNotIn(blocked, bot.state.selected)
         self.assertIn(f"{ev}-M0", bot.state.selected)
         self.assertIn(f"{ev}-M2", bot.state.selected)
+
+    # ---- depth padding (pad_to_target) ----
+
+    def test_deep_book_no_pad(self):
+        client, ev = self._client(n_markets=1)          # 1200/1200 both sides
+        bot = IncentiveMarketMaker(client=client, live=False)
+        self._resolver_830(bot)
+        bot.run_cycle()
+        pads = [o for o in bot.state.sim_orders.values()
+                if o["yes_price"] in (imm.PAD_BID_CENTS, imm.PAD_ASK_CENTS)]
+        self.assertEqual(pads, [])
+
+    def test_thin_bid_side_padded_at_1c(self):
+        client, ev = self._client(n_markets=1, yes_depth="300", no_depth="1200")
+        bot = IncentiveMarketMaker(client=client, live=False)
+        self._resolver_830(bot)
+        bot.run_cycle()
+        t = f"{ev}-M0"
+        bid_pad = [o for o in bot.state.sim_orders.values()
+                   if o["ticker"] == t and o["yes_price"] == imm.PAD_BID_CENTS]
+        self.assertEqual(len(bid_pad), 1)
+        # basis 300 + 15 near-touch -> pad up to 1000, rounded to 100s
+        self.assertEqual(bid_pad[0]["remaining_count"], 700)
+        # deep NO side gets no pad
+        ask_pad = [o for o in bot.state.sim_orders.values()
+                   if o["ticker"] == t and o["yes_price"] == imm.PAD_ASK_CENTS]
+        self.assertEqual(ask_pad, [])
+        # near-touch ladder still present alongside the pad
+        near = [o for o in bot.state.sim_orders.values()
+                if o["ticker"] == t and o["book_side"] == "bid"
+                and o["yes_price"] != imm.PAD_BID_CENTS]
+        self.assertEqual(sorted(o["remaining_count"] for o in near), [5, 5, 5])
+
+    def test_both_sides_thin_padded(self):
+        client, ev = self._client(n_markets=1, yes_depth="200", no_depth="200")
+        bot = IncentiveMarketMaker(client=client, live=False)
+        self._resolver_830(bot)
+        bot.run_cycle()
+        t = f"{ev}-M0"
+        bid_pad = [o for o in bot.state.sim_orders.values()
+                   if o["ticker"] == t and o["yes_price"] == imm.PAD_BID_CENTS]
+        ask_pad = [o for o in bot.state.sim_orders.values()
+                   if o["ticker"] == t and o["yes_price"] == imm.PAD_ASK_CENTS]
+        self.assertEqual(bid_pad[0]["remaining_count"], 800)   # (1000-215)->800
+        self.assertEqual(ask_pad[0]["remaining_count"], 800)
+
+    def test_pad_nets_out_own_pad_live_stable(self):
+        """With our 700 pad already resting inside the book, the desired pad
+        stays 700 (not 0) — no self-referential churn."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=True)
+        yes_levels = [[48, 300.0], [1, 700.0]]   # 300 external + our 700 pad
+        no_levels = [[49, 1200.0]]
+        near_touch = [imm.Quote("T", "bid", 48, 5)]
+        own = [("bid", imm.PAD_BID_CENTS, 700.0)]
+        pads = bot._pad_quotes("T", near_touch, yes_levels, no_levels, own, 1000)
+        bid_pad = [p for p in pads if p.book_side == "bid"]
+        self.assertEqual(len(bid_pad), 1)
+        self.assertEqual(bid_pad[0].count, 700)
+        self.assertTrue(bid_pad[0].is_pad)
+
+    def test_pad_only_on_quoted_side(self):
+        """No near-touch on a side (bot not quoting it) -> no pad there."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        pads = bot._pad_quotes("T", [imm.Quote("T", "bid", 48, 5)],
+                               [[48, 100.0]], [[49, 100.0]], [], 1000)
+        self.assertEqual({p.book_side for p in pads}, {"bid"})   # no ask pad
+
+
+class TestPadQuantity(unittest.TestCase):
+    def test_rounds_up_to_100(self):
+        self.assertEqual(imm.pad_quantity(315, 1000), 700)
+        self.assertEqual(imm.pad_quantity(300, 1000), 700)
+        self.assertEqual(imm.pad_quantity(901, 1000), 100)
+        self.assertEqual(imm.pad_quantity(900, 1000), 100)
+
+    def test_at_or_over_target_no_pad(self):
+        self.assertEqual(imm.pad_quantity(1000, 1000), 0)
+        self.assertEqual(imm.pad_quantity(1500, 1000), 0)
+
+    def test_capped(self):
+        self.assertEqual(imm.pad_quantity(0, 10 ** 9), imm.PAD_MAX_CONTRACTS)
 
 
 class TestCutoffEnforcement(unittest.TestCase):

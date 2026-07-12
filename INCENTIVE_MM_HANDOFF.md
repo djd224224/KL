@@ -144,6 +144,19 @@ confirming reward eligibility is per-subaccount first.
   independent of the resolver, so no quote rests past the episode. `place_order`
   caps each order's exchange-side expiration at it. (The KXLOVEISLMENTION fixed
   9pm ET start − 30min buffer independently also yields 8:30pm ET.)
+- **Depth padding** (`pad_to_target`): a reward side pays no one unless its total
+  resting depth reaches the target size (usually 1000). When a side the bot is
+  quoting falls short, it adds throwaway contracts at the **1c mark** (bid) /
+  **99c mark** (ask = NO bid at 1c), rounded up to the nearest 100
+  (`IMM_PAD_ROUND`), to reach target — so the near-touch ladder qualifies. The
+  pad earns ~0 itself (weight 0.5^~47 ≈ 0), costs ~1c collateral + ~1c max loss
+  per contract, is exempt from the ladder side/level caps, and is netted out of
+  the depth calc so it doesn't churn against itself. Only pads a side it already
+  has near-touch quotes on (join-don't-lead preserved). `IMM_PAD_TO_TARGET=1`
+  enables it for all series; `IMM_PAD_MAX` caps per-side pad (default 5000).
+  Fill note: at 1c/99c the pad almost never fills — near-touch fills first on any
+  move and trips the fill-burst breaker (cancel + stand down) long before price
+  reaches the pad. A pad fill would count toward P&L/breakers normally.
 
 Reconciliation with the yield-to-human rule: for quote_all series the bot ignores
 the user's POSITIONS (he wants full coverage) and its caps/skew track the bot's OWN

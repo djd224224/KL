@@ -126,6 +126,20 @@ class SeriesOverride:
     #   event, exempt from yield ranking / MAX_MARKETS / collateral budget
     hard_expiry_et: Optional[Tuple[int, int]] = None    # (hour, minute) ET on the
     #   event date — a floor on the cutoff so nothing rests past it
+    pad_to_target: bool = False                         # when a quoted side's total
+    #   depth is below the reward target size, add throwaway contracts at the 1c
+    #   mark (bid) / 99c mark (ask) to reach it, so the near-touch ladder qualifies
+
+
+# Depth-padding (pad_to_target): fill a thin side up to the reward target with
+# cheap far-from-touch contracts, rounded up to the nearest PAD_ROUND. 1c bids /
+# 99c asks cost ~1c collateral and ~1c max loss each; they earn ~0 (weight
+# 0.5^(~47 ticks) ≈ 0) but unlock the near-touch ladder's rewards.
+PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 1)
+PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 99)
+PAD_ROUND = _env_int("IMM_PAD_ROUND", 100)
+PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 5000)   # safety ceiling per side
+PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "0") == "1"
 
 
 # User decision 2026-07-12: Love Island mention pools are high incentive-per-minute
@@ -137,8 +151,26 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
         max_position=_env_float("IMM_LOVEISL_MAX_POSITION", 50),
         quote_all=True,
         hard_expiry_et=(20, 30),   # 8:30pm ET
+        pad_to_target=True,
     ),
 }
+
+
+def series_pad_to_target(series: str) -> bool:
+    if PAD_TO_TARGET_GLOBAL:
+        return True
+    ov = SERIES_OVERRIDES.get(series)
+    return bool(ov and ov.pad_to_target)
+
+
+def pad_quantity(external_and_touch_depth: float, target: float) -> int:
+    """Contracts to add at the pad price so the side's total depth reaches the
+    reward target, rounded UP to the nearest PAD_ROUND. 0 if already at target."""
+    gap = target - external_and_touch_depth
+    if gap <= 0:
+        return 0
+    n = int(math.ceil(gap / PAD_ROUND) * PAD_ROUND)
+    return min(n, PAD_MAX_CONTRACTS)
 
 
 def series_override(series: str) -> Optional[SeriesOverride]:
@@ -646,6 +678,9 @@ class Quote:
     book_side: str      # 'bid' (buy YES) or 'ask' (sell YES == buy NO)
     price_cents: int
     count: int
+    is_pad: bool = False   # deep 1c/99c depth-padding order (see pad_to_target):
+    #   fills the side to the reward target so the near-touch ladder qualifies;
+    #   earns ~0 itself, exempt from the per-market ladder/position caps.
 
 
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
@@ -2065,6 +2100,14 @@ class IncentiveMarketMaker:
                 if px_ok:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
                                                 levels=lv))
+
+            # Depth padding: on a side we're actually quoting whose total depth
+            # is below the reward target, add throwaway contracts at the 1c/99c
+            # mark so the whole side (and thus our near-touch ladder) qualifies.
+            if series_pad_to_target(meta.series) and meta.target_size > 0:
+                mq.extend(self._pad_quotes(t, mq, yes_levels, no_levels,
+                                           own, meta.target_size))
+
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -2195,11 +2238,48 @@ class IncentiveMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! cycle log write failed: {e}")
 
+    @staticmethod
+    def _is_pad_price(book_side: str, px: int) -> bool:
+        return (book_side == "bid" and px == PAD_BID_CENTS) or \
+               (book_side == "ask" and px == PAD_ASK_CENTS)
+
+    def _pad_quotes(self, ticker: str, near_touch: List[Quote],
+                    yes_levels: List[List[float]], no_levels: List[List[float]],
+                    own: List[Tuple[str, int, float]], target: float) -> List[Quote]:
+        """Throwaway depth-padding at the 1c/99c mark so each side we quote
+        reaches the reward target size. Computed on depth EXCLUDING our own pad
+        (netted out / not-yet-in-book) to avoid a self-referential churn loop.
+        Only pads a side we actually have near-touch quotes on (join-don't-lead
+        preserved; leading the book alone at 1c is never useful)."""
+        pads: List[Quote] = []
+        nt_bid = sum(q.count for q in near_touch if q.book_side == "bid")
+        nt_ask = sum(q.count for q in near_touch if q.book_side == "ask")
+        own_pad_bid = sum(r for bs, px, r in own if self._is_pad_price(bs, px)
+                          and bs == "bid")
+        own_pad_ask = sum(r for bs, px, r in own if self._is_pad_price(bs, px)
+                          and bs == "ask")
+        yes_depth = sum(sz for _px, sz in yes_levels)
+        no_depth = sum(sz for _px, sz in no_levels)
+        if nt_bid > 0:
+            # live: book already holds our near-touch, subtract only our pad;
+            # dry: sim orders aren't in the book, add this cycle's near-touch.
+            basis = (yes_depth - own_pad_bid) if self.live else (yes_depth + nt_bid)
+            n = pad_quantity(basis, target)
+            if n > 0:
+                pads.append(Quote(ticker, "bid", PAD_BID_CENTS, n, is_pad=True))
+        if nt_ask > 0:
+            basis = (no_depth - own_pad_ask) if self.live else (no_depth + nt_ask)
+            n = pad_quantity(basis, target)
+            if n > 0:
+                pads.append(Quote(ticker, "ask", PAD_ASK_CENTS, n, is_pad=True))
+        return pads
+
     def place_with_caps(self, to_place: List[Quote], resting: List[dict],
                         cancelled_ids: Set[str], now_ts: float) -> int:
         """Unconditional backstops: per-(market,side) resting cap, per-level
         cap, global resting-order cap, per-cycle placement cap. Side/level
-        caps are per the quote's SERIES ladder (Love Island is bigger)."""
+        caps are per the quote's SERIES ladder (Love Island is bigger). Pad
+        orders (1c/99c depth fillers) are exempt from the ladder caps."""
         side_totals: Dict[Tuple[str, str], float] = {}
         level_totals: Dict[Tuple[str, str, int], float] = {}
         total_resting = 0
@@ -2211,6 +2291,8 @@ class IncentiveMarketMaker:
                 continue
             rem = order_remaining(o)
             total_resting += 1
+            if self._is_pad_price(parsed[0], parsed[1]):
+                continue   # pad orders don't count against the ladder caps
             skey = (o.get("ticker", ""), parsed[0])
             side_totals[skey] = side_totals.get(skey, 0.0) + rem
             lkey = (o.get("ticker", ""), parsed[0], parsed[1])
@@ -2232,6 +2314,14 @@ class IncentiveMarketMaker:
                                    f"{MAX_TOTAL_RESTING_ORDERS} reached", key="order_cap",
                                    urgent=False)
                 break
+            if q.is_pad:
+                # Depth filler: exempt from the ladder side/level caps (that's
+                # its whole purpose), but still counts toward the global
+                # resting-order and per-cycle placement caps above.
+                if self.place_order(q, now_ts):
+                    total_resting += 1
+                    placed += 1
+                continue
             series = series_of(q.ticker)
             side_cap = series_side_max(series)
             max_level_size = max(s for _t, s in series_levels(series))
