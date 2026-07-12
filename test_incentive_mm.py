@@ -931,6 +931,144 @@ class TestResolverCutoffWiring(unittest.TestCase):
                          - timedelta(minutes=imm.EVENT_START_BUFFER_MIN))
 
 
+class TestSeriesOverrides(unittest.TestCase):
+    def test_helpers(self):
+        self.assertEqual(imm.series_levels("KXLOVEISLMENTION"),
+                         [(0, 5), (1, 5), (2, 5)])
+        self.assertEqual(imm.series_side_max("KXLOVEISLMENTION"), 15)
+        self.assertEqual(imm.series_max_position("KXLOVEISLMENTION"), 50)
+        # non-override series fall back to globals
+        self.assertEqual(imm.series_levels("KXWCMENTION"), imm.LEVELS)
+        self.assertEqual(imm.series_max_position("KXWCMENTION"),
+                         imm.MAX_POSITION_CONTRACTS)
+
+    def test_loveisl_ladder_555(self):
+        qs = imm.build_side_ladder("X", "bid", 49, 51, room=15,
+                                   levels=imm.series_levels("KXLOVEISLMENTION"))
+        self.assertEqual([(q.price_cents, q.count) for q in qs],
+                         [(49, 5), (48, 5), (47, 5)])
+
+    def test_hard_expiry_830_et(self):
+        exp = imm.series_hard_expiry_utc("KXLOVEISLMENTION", "KXLOVEISLMENTION-26JUL12")
+        et = exp.astimezone(imm.ET)
+        self.assertEqual((et.hour, et.minute, et.month, et.day), (20, 30, 7, 12))
+
+    def test_hard_expiry_none_for_other_series(self):
+        self.assertIsNone(imm.series_hard_expiry_utc("KXWCMENTION",
+                                                     "KXWCMENTION-26JUL12ABCDEF"))
+
+
+class TestLoveIslandCycle(unittest.TestCase):
+    def _client(self, n_markets=4, mid_bid="0.48", mid_ask="0.49",
+                no_bid="0.49"):
+        _clean_persist()
+        client = FakeClient()
+        client.programs = []
+        client.markets = {}
+        client.books = {}
+        ev = "KXLOVEISLMENTION-26JUL12"
+        far = "2099-01-01T00:00:00Z"
+        for i in range(n_markets):
+            t = f"{ev}-M{i}"
+            client.programs.append({
+                "market_ticker": t, "incentive_type": "liquidity",
+                "period_reward": 3000000, "target_size_fp": "1000.00",
+                "discount_factor_bps": 5000, "paid_out": False,
+                "start_date": "2026-07-12T12:00:00Z",
+                "end_date": "2026-07-13T03:59:00Z"})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": ev, "status": "active",
+                "close_time": far, "open_time": "2026-07-12T12:00:00Z",
+                "yes_bid_dollars": "0.48", "yes_ask_dollars": "0.50",
+                "volume_fp": "500.00"}
+            client.books[t] = {"orderbook_fp": {
+                "yes_dollars": [[mid_bid, "600"]], "no_dollars": [[no_bid, "1200"]]}}
+        return client, ev
+
+    def _resolver_830(self, bot):
+        # Fixed 9pm ET start via SERIES_START_ET -> cutoff 8:30pm ET; use the
+        # real resolver (no HTTP needed for the fixed-hour path).
+        bot.resolver = imm.EventStartResolver(http_get_json=lambda url: {})
+
+    def test_quotes_all_markets_555(self):
+        client, ev = self._client(n_markets=6)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        self._resolver_830(bot)
+        bot.run_cycle()
+        # every market selected (quote_all), each with a 5/5/5 x2 ladder
+        self.assertEqual(len(bot.state.selected), 6)
+        per_market = {}
+        for o in bot.state.sim_orders.values():
+            per_market.setdefault(o["ticker"], []).append(o["remaining_count"])
+        for t, sizes in per_market.items():
+            self.assertEqual(sorted(sizes), [5, 5, 5, 5, 5, 5])   # 3 bids + 3 asks
+
+    def test_bypasses_max_markets(self):
+        client, ev = self._client(n_markets=12)
+        old = imm.MAX_MARKETS
+        imm.MAX_MARKETS = 3
+        try:
+            bot = IncentiveMarketMaker(client=client, live=False)
+            self._resolver_830(bot)
+            bot.run_cycle()
+            self.assertEqual(len(bot.state.selected), 12)   # all, despite cap 3
+        finally:
+            imm.MAX_MARKETS = old
+
+    def test_max_position_50(self):
+        client, ev = self._client(n_markets=1)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        self._resolver_830(bot)
+        t = f"{ev}-M0"
+        bot.pnl.pos[t] = 47          # near the 50 cap on the long side
+        bot.run_cycle()
+        bids = sum(o["remaining_count"] for o in bot.state.sim_orders.values()
+                   if o["ticker"] == t and o["book_side"] == "bid")
+        self.assertLessEqual(bids, 3)    # only 3 more before hitting 50
+
+    def test_orders_expire_by_830_et(self):
+        client, ev = self._client(n_markets=1)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        self._resolver_830(bot)
+        bot.run_cycle()
+        cutoff = imm.series_hard_expiry_utc("KXLOVEISLMENTION", ev).timestamp()
+        for o in bot.state.sim_orders.values():
+            self.assertLessEqual(o["expire_at"], cutoff + 0.001)
+
+    def test_user_position_does_not_yield_loveisl(self):
+        """The user holding a manual Love Island position must NOT stop the bot
+        — it quotes the whole event anyway (unlike non-quote_all series)."""
+        client, ev = self._client(n_markets=3)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        self._resolver_830(bot)
+        client.positions[f"{ev}-M0"] = 80    # big manual position, not bot's book
+        bot.run_cycle()
+        self.assertEqual(len(bot.state.selected), 3)   # all still quoted
+        self.assertEqual(bot.manual_events(client.positions), set())
+
+    def test_user_order_yields_only_that_market(self):
+        """A live foreign order on ONE Love Island market yields just that
+        market; the rest of the event keeps quoting."""
+        _clean_persist()
+        client, ev = self._client(n_markets=3)
+        blocked = f"{ev}-M1"
+        base_get = client.get_orders
+
+        def get_orders(**kw):
+            return {"orders": [
+                {"order_id": "jack1", "ticker": blocked, "status": "resting",
+                 "client_order_id": "", "book_side": "bid", "yes_price": 40,
+                 "remaining_count": 100}], "cursor": None}
+        client.get_orders = get_orders
+        bot = IncentiveMarketMaker(client=client, live=True)
+        self._resolver_830(bot)
+        bot.run_cycle()
+        self.assertIn(blocked, bot.state.manual_standoff)
+        self.assertNotIn(blocked, bot.state.selected)
+        self.assertIn(f"{ev}-M0", bot.state.selected)
+        self.assertIn(f"{ev}-M2", bot.state.selected)
+
+
 class TestCutoffEnforcement(unittest.TestCase):
     def _bot(self):
         _clean_persist()

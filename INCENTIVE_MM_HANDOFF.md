@@ -128,6 +128,34 @@ and the next cycle yields the whole event. The bulletproof elimination is a
 all) — recommended if manual + bot activity stays heavy on the same series; needs
 confirming reward eligibility is per-subaccount first.
 
+## Per-series overrides (v1.2, 2026-07-12) — Love Island
+
+`SERIES_OVERRIDES` lets a series depart from the global spec. Currently
+**KXLOVEISLMENTION** (user decision — high incentive/minute, one-day pools):
+
+- **Ladder 5/5/5** (`IMM_LOVEISL_LEVELS`, flat 5 at 0/1/2 ticks = 15/side) instead
+  of the global 1/2/4 probe ladder.
+- **Max net 50/market** (`IMM_LOVEISL_MAX_POSITION`) — tighter than the global 100.
+- **quote_all**: EVERY market of the event is force-selected, exempt from the yield
+  ranking, MAX_MARKETS, the collateral budget, and the payout-floor/zero-yield
+  filters (still subject to safety screens: one-sided, wide, cutoff, breakers, and
+  the foreign-order yield). Live 2026-07-12: 17 markets, ~$247 collateral.
+- **Hard expiry 8:30pm ET** (`hard_expiry_et=(20,30)`) — a floor on the cutoff,
+  independent of the resolver, so no quote rests past the episode. `place_order`
+  caps each order's exchange-side expiration at it. (The KXLOVEISLMENTION fixed
+  9pm ET start − 30min buffer independently also yields 8:30pm ET.)
+
+Reconciliation with the yield-to-human rule: for quote_all series the bot ignores
+the user's POSITIONS (he wants full coverage) and its caps/skew track the bot's OWN
+book, but STILL yields any single market where the user has a live resting ORDER
+(direct collision) — matching his stated model ("yield while I have live orders,
+resume when they're gone"). STP=maker protects the race. Non-quote_all series keep
+the full event-level position standoff.
+
+NOTE: quote_all bypasses the probe's $200 budget, so the live footprint during the
+Love Island window is ~$247 collateral + inventory reserve (~$320 total at rest),
+not $200. Deliberate.
+
 ## Market selection (every 10 min)
 
 1. Pull all `active` liquidity programs; aggregate per market → $/day; drop paid-out,

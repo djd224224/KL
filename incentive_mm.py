@@ -116,6 +116,54 @@ def _parse_levels(spec: str) -> List[Tuple[int, int]]:
 LEVELS = _parse_levels(os.environ.get("IMM_LEVELS", "0:5,1:10,2:20"))
 SIDE_MAX_CONTRACTS = sum(s for _t, s in LEVELS)      # 35 with the default spec
 
+
+@dataclass(frozen=True)
+class SeriesOverride:
+    """Per-series overrides of the global quoting spec (user-directed)."""
+    levels: Optional[List[Tuple[int, int]]] = None      # ladder shape
+    max_position: Optional[float] = None                # net cap per market
+    quote_all: bool = False                             # quote EVERY market of the
+    #   event, exempt from yield ranking / MAX_MARKETS / collateral budget
+    hard_expiry_et: Optional[Tuple[int, int]] = None    # (hour, minute) ET on the
+    #   event date — a floor on the cutoff so nothing rests past it
+
+
+# User decision 2026-07-12: Love Island mention pools are high incentive-per-minute
+# (live only ~1 day), so go bigger and quote the whole event, but with a hard 8:30pm
+# ET episode expiry and a tighter 50-contract per-market net cap.
+SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
+    "KXLOVEISLMENTION": SeriesOverride(
+        levels=_parse_levels(os.environ.get("IMM_LOVEISL_LEVELS", "0:5,1:5,2:5")),
+        max_position=_env_float("IMM_LOVEISL_MAX_POSITION", 50),
+        quote_all=True,
+        hard_expiry_et=(20, 30),   # 8:30pm ET
+    ),
+}
+
+
+def series_override(series: str) -> Optional[SeriesOverride]:
+    return SERIES_OVERRIDES.get(series)
+
+
+def series_levels(series: str) -> List[Tuple[int, int]]:
+    ov = SERIES_OVERRIDES.get(series)
+    return ov.levels if (ov and ov.levels) else LEVELS
+
+
+def series_side_max(series: str) -> int:
+    return sum(s for _t, s in series_levels(series))
+
+
+def series_max_position(series: str) -> float:
+    ov = SERIES_OVERRIDES.get(series)
+    return ov.max_position if (ov and ov.max_position is not None) \
+        else MAX_POSITION_CONTRACTS
+
+
+def series_of(ticker: str) -> str:
+    return ticker.split("-")[0]
+
+
 MAX_POSITION_CONTRACTS = _env_float("IMM_MAX_POSITION", 100)   # per market (user spec)
 MAX_EVENT_CONTRACTS = _env_float("IMM_MAX_EVENT", 500)         # net per event (user spec)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
@@ -385,6 +433,22 @@ class EventStartResolver:
         return None
 
 
+def series_hard_expiry_utc(series: str, event_ticker: str) -> Optional[datetime]:
+    """A per-series hard expiry (hour, minute ET on the event date), converted
+    to UTC — a floor on the trade cutoff so nothing rests past it. None if the
+    series has no override or the event date can't be parsed."""
+    ov = SERIES_OVERRIDES.get(series)
+    if not ov or ov.hard_expiry_et is None:
+        return None
+    d = parse_event_date(event_ticker)
+    if d is None:
+        return None
+    et_day = d.astimezone(ET)
+    h, m = ov.hard_expiry_et
+    return ET.localize(datetime(et_day.year, et_day.month, et_day.day, h, m)) \
+        .astimezone(timezone.utc)
+
+
 def trade_cutoff_utc(event_ticker: str, occurrence: Optional[datetime],
                      expected_expiration: Optional[datetime]) -> Optional[datetime]:
     """When we must be OUT of this market. Ticker-embedded event dates cut off
@@ -585,11 +649,15 @@ class Quote:
 
 
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
-                      opposite_best: Optional[int], room: float) -> List[Quote]:
+                      opposite_best: Optional[int], room: float,
+                      levels: Optional[List[Tuple[int, int]]] = None) -> List[Quote]:
     """Ladder behind (never improving) the join anchor. `anchor` is the best
     EXTERNAL price on our side; `opposite_best` the best external price on the
-    other side (post-only: never cross it). Sizes come from LEVELS, shaved to
-    `room` (contracts we may still acquire on this side if everything fills)."""
+    other side (post-only: never cross it). Sizes come from `levels` (the
+    market's series ladder; global LEVELS if omitted), shaved to `room`
+    (contracts we may still acquire on this side if everything fills)."""
+    if levels is None:
+        levels = LEVELS
     quotes: List[Quote] = []
     room = int(room)
     if room <= 0:
@@ -599,7 +667,7 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
             anchor = opposite_best - 1
         elif book_side == "ask" and anchor <= opposite_best:
             anchor = opposite_best + 1
-    for ticks, size in LEVELS:
+    for ticks, size in levels:
         px = anchor - ticks if book_side == "bid" else anchor + ticks
         if book_side == "bid" and px < PRICE_MIN_CENTS:
             continue
@@ -615,16 +683,19 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
     return quotes
 
 
-def skewed_side_room(base_room: float, pos: float, accumulating: bool) -> float:
+def skewed_side_room(base_room: float, pos: float, accumulating: bool,
+                     side_max: Optional[int] = None) -> float:
     """Inventory skew on top of hard caps: past SKEW_SOFT net contracts the
     accumulating side is halved, past SKEW_HARD it is pulled entirely."""
     if not accumulating:
         return base_room
+    if side_max is None:
+        side_max = SIDE_MAX_CONTRACTS
     a = abs(pos)
     if a >= SKEW_HARD_CONTRACTS:
         return 0.0
     if a >= SKEW_SOFT_CONTRACTS:
-        return min(base_room, SIDE_MAX_CONTRACTS / 2.0)
+        return min(base_room, side_max / 2.0)
     return base_room
 
 
@@ -664,15 +735,18 @@ def diff_orders(desired: List[Quote], resting: List[dict],
     return to_place, to_cancel
 
 
-def ladder_collateral_dollars(bid_anchor: Optional[int], ask_anchor: Optional[int]) -> float:
+def ladder_collateral_dollars(bid_anchor: Optional[int], ask_anchor: Optional[int],
+                              levels: Optional[List[Tuple[int, int]]] = None) -> float:
     """Worst-case collateral if the full two-sided ladder rests: YES bids
     reserve px, NO bids (our asks) reserve 100-px, per contract."""
+    if levels is None:
+        levels = LEVELS
     total = 0.0
     if bid_anchor is not None:
-        for ticks, size in LEVELS:
+        for ticks, size in levels:
             total += max(bid_anchor - ticks, 1) * size
     if ask_anchor is not None:
-        for ticks, size in LEVELS:
+        for ticks, size in levels:
             total += max(100 - (ask_anchor + ticks), 1) * size
     return total / 100.0
 
@@ -1341,6 +1415,11 @@ class IncentiveMarketMaker:
                 cutoff = trade_cutoff_utc(
                     event_ticker, parse_iso_utc(m.get("occurrence_datetime", "")),
                     parse_iso_utc(m.get("expected_expiration_time", "")))
+            # Hard per-series expiry floor (Love Island: 8:30pm ET on event day).
+            # Independent of the resolver so nothing can rest past it.
+            hard = series_hard_expiry_utc(series, event_ticker)
+            if hard is not None:
+                cutoff = hard if cutoff is None else min(cutoff, hard)
             bid = market_cents(m, "yes_bid")
             ask = market_cents(m, "yes_ask")
             try:
@@ -1367,11 +1446,19 @@ class IncentiveMarketMaker:
         skipped: Dict[str, int] = {}
         for meta in metas:
             t = meta.ticker
+            quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
             manual = abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
             foreign_n = self._foreign_resting.get(t, 0) if self.live else 0
-            if (t in self.state.manual_standoff or foreign_n
-                    or manual >= MANUAL_STANDOFF_CONTRACTS
-                    or meta.event_ticker in manual_evts):
+            # quote_all markets yield ONLY on a live foreign order here (or an
+            # active standoff from one); positions and sibling activity don't
+            # stop the bot — the user wants full event coverage.
+            if quote_all:
+                manual_skip = bool(foreign_n) or t in self.state.manual_standoff
+            else:
+                manual_skip = (t in self.state.manual_standoff or foreign_n
+                               or manual >= MANUAL_STANDOFF_CONTRACTS
+                               or meta.event_ticker in manual_evts)
+            if manual_skip:
                 skipped["manual"] = skipped.get("manual", 0) + 1
                 continue
             reason = self._screen(meta, now_utc)
@@ -1392,8 +1479,13 @@ class IncentiveMarketMaker:
                      float(o.get("remaining_count", 0))))
         ranked: List[MarketMeta] = []
         for meta in screened:
+            quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
             if not self._estimate_candidate_yield(meta, own_by_ticker.get(meta.ticker, [])):
                 skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
+            elif quote_all:
+                # user wants EVERY market of the event: skip the incentive-
+                # optimization filters (still passed the safety screens above).
+                ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
             elif meta.est_dollars_per_day < MIN_EST_DOLLARS_PER_DAY:
@@ -1411,12 +1503,28 @@ class IncentiveMarketMaker:
         # the fleet's and the user's manual inventory must not starve this
         # bot's budget.
         inv_reserve = sum(abs(v) for v in self.pnl.pos.values()) * 0.50
-        for meta in ranked:
-            if len(selected) >= MAX_MARKETS:
-                break
+
+        def market_cost(meta: MarketMeta) -> float:
             bid = int(meta.mid_cents - meta.spread_cents / 2)
             ask = int(meta.mid_cents + meta.spread_cents / 2)
-            cost = ladder_collateral_dollars(bid, ask)
+            return ladder_collateral_dollars(bid, ask, series_levels(meta.series))
+
+        # quote_all series (e.g. Love Island) are force-included: EVERY market
+        # of the event, exempt from the yield ranking, MAX_MARKETS, and the
+        # collateral budget (user decision 2026-07-12 — high incentive/minute,
+        # one-day pools). They're taken first so they always fit.
+        forced = [m for m in ranked
+                  if (series_override(m.series) or SeriesOverride()).quote_all]
+        for meta in forced:
+            collateral += market_cost(meta)
+            selected[meta.ticker] = meta
+        forced_collateral = collateral
+        for meta in ranked:
+            if meta.ticker in selected:
+                continue
+            if len(selected) - len(forced) >= MAX_MARKETS:
+                break
+            cost = market_cost(meta)
             if collateral + cost + inv_reserve > COLLATERAL_BUDGET:
                 skipped["budget"] = skipped.get("budget", 0) + 1
                 continue
@@ -1430,7 +1538,8 @@ class IncentiveMarketMaker:
         est_total = sum(m.est_dollars_per_day for m in selected.values())
         log(f"{self.tag} universe: {self.state.programs_count} program markets -> "
             f"{len(metas)} candidates -> {len(selected)} selected "
-            f"(est ${est_total:.0f}/day share, ~${collateral:.0f} ladder collateral, "
+            f"({len(forced)} forced quote-all @ ~${forced_collateral:.0f}, "
+            f"total ~${collateral:.0f} ladder collateral, "
             f"${inv_reserve:.0f} inventory reserve); skips {skipped}")
         if added:
             log(f"{self.tag} + selected: {', '.join(sorted(added)[:8])}"
@@ -1457,14 +1566,16 @@ class IncentiveMarketMaker:
                 meta.target_size, meta.discount_factor, own_in_book=True)
             n_contracts = sum(r for _s, _p, r in own_live)
         else:
+            lv = series_levels(meta.series)
+            side_max = series_side_max(meta.series)
             ext_bid, ext_ask = external_best(yes_levels, no_levels)
             quotes: List[Quote] = []
             if ext_bid is not None and ext_bid >= PRICE_MIN_CENTS:
                 quotes += build_side_ladder(meta.ticker, "bid", ext_bid, ext_ask,
-                                            SIDE_MAX_CONTRACTS)
+                                            side_max, levels=lv)
             if ext_ask is not None and ext_ask <= PRICE_MAX_CENTS:
                 quotes += build_side_ladder(meta.ticker, "ask", ext_ask, ext_bid,
-                                            SIDE_MAX_CONTRACTS)
+                                            side_max, levels=lv)
             if not quotes:
                 meta.est_frac = meta.est_dollars_per_day = meta.yield_per_contract = 0.0
                 return True
@@ -1576,12 +1687,21 @@ class IncentiveMarketMaker:
         events: Set[str] = set()
         if not EVENT_LEVEL_STANDOFF:
             return events
+
+        def quote_all(t: str) -> bool:
+            return (series_override(series_of(t)) or SeriesOverride()).quote_all
+
         for t, v in positions.items():
+            # quote_all series (Love Island): the user explicitly wants the bot
+            # in these events, so his POSITIONS there don't yield — only a live
+            # order on a specific market does (handled per-market below).
+            if quote_all(t):
+                continue
             if abs(v - self.pnl.pos.get(t, 0.0)) >= MANUAL_STANDOFF_CONTRACTS:
                 events.add(self._event_of(t))
         if self.live:
             for t, n in self._foreign_resting.items():
-                if n:
+                if n and not quote_all(t):
                     events.add(self._event_of(t))
         return events
 
@@ -1781,15 +1901,20 @@ class IncentiveMarketMaker:
             # trading this market by hand — cancel our quotes and stand off
             # until the manual activity is gone. Without this, skew logic
             # would passively unwind his bets and STP would eat his orders.
+            quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
             own_pos = self.pnl.pos.get(t, 0.0)
             manual_pos = pos - own_pos
             foreign_n = self._foreign_resting.get(t, 0) if self.live else 0
-            event_manual = meta.event_ticker in manual_evts
-            if foreign_n or abs(manual_pos) >= MANUAL_STANDOFF_CONTRACTS or event_manual:
+            event_manual = (meta.event_ticker in manual_evts) and not quote_all
+            pos_manual = (abs(manual_pos) >= MANUAL_STANDOFF_CONTRACTS) and not quote_all
+            # quote_all (Love Island): yield a market ONLY when the user has a
+            # live order resting on it (direct order-collision risk); his
+            # positions and sibling markets never stop the bot there.
+            if foreign_n or pos_manual or event_manual:
                 if t not in self.state.manual_standoff:
                     self.state.manual_standoff[t] = now_ts
                     why = ("elsewhere in event " + meta.event_ticker) if event_manual \
-                        and not (foreign_n or abs(manual_pos) >= MANUAL_STANDOFF_CONTRACTS) \
+                        and not (foreign_n or pos_manual) \
                         else f"foreign orders={foreign_n}, manual pos {manual_pos:+.0f}"
                     self.alerter.alert(
                         "manual_standoff",
@@ -1902,20 +2027,30 @@ class IncentiveMarketMaker:
                     self.cancel_market_orders(t, resting)
                     continue
 
-            # Rooms: hard per-market cap, event share, then skew.
-            room_buy = min(MAX_POSITION_CONTRACTS - pos, share_buy, SIDE_MAX_CONTRACTS)
-            room_sell = min(MAX_POSITION_CONTRACTS + pos, share_sell, SIDE_MAX_CONTRACTS)
-            room_buy = skewed_side_room(room_buy, pos, accumulating=pos > 0)
-            room_sell = skewed_side_room(room_sell, pos, accumulating=pos < 0)
+            # Rooms: hard per-market cap, event share, then skew — all using
+            # this market's SERIES ladder/cap (Love Island runs a bigger flat
+            # 5/5/5 ladder with a tighter 50-contract net cap). For quote_all
+            # series the cap/skew track the bot's OWN book, so the user's
+            # coexisting manual position doesn't shrink the bot's room.
+            lv = series_levels(meta.series)
+            side_max = series_side_max(meta.series)
+            maxpos = series_max_position(meta.series)
+            cap_pos = own_pos if quote_all else pos
+            room_buy = min(maxpos - cap_pos, share_buy, side_max)
+            room_sell = min(maxpos + cap_pos, share_sell, side_max)
+            room_buy = skewed_side_room(room_buy, cap_pos, accumulating=cap_pos > 0,
+                                        side_max=side_max)
+            room_sell = skewed_side_room(room_sell, cap_pos, accumulating=cap_pos < 0,
+                                         side_max=side_max)
             if reduce_only:
-                # Only the reducing side, and never more than would flatten us
-                # (a +5 position must not sell 35 and flip short 30).
-                if pos > 0:
+                # Only the reducing side, and never more than would flatten our
+                # OWN book (a +5 position must not sell 35 and flip short 30).
+                if own_pos > 0:
                     room_buy = 0.0
-                    room_sell = min(room_sell, pos)
-                elif pos < 0:
+                    room_sell = min(room_sell, own_pos)
+                elif own_pos < 0:
                     room_sell = 0.0
-                    room_buy = min(room_buy, -pos)
+                    room_buy = min(room_buy, -own_pos)
                 else:
                     room_buy = room_sell = 0.0
 
@@ -1923,11 +2058,13 @@ class IncentiveMarketMaker:
             if ext_bid is not None and room_buy > 0:
                 px_ok = ext_bid >= PRICE_MIN_CENTS
                 if px_ok:
-                    mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy))
+                    mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
+                                                levels=lv))
             if ext_ask is not None and room_sell > 0:
                 px_ok = ext_ask <= PRICE_MAX_CENTS
                 if px_ok:
-                    mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell))
+                    mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
+                                                levels=lv))
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -2061,9 +2198,8 @@ class IncentiveMarketMaker:
     def place_with_caps(self, to_place: List[Quote], resting: List[dict],
                         cancelled_ids: Set[str], now_ts: float) -> int:
         """Unconditional backstops: per-(market,side) resting cap, per-level
-        cap, global resting-order cap, per-cycle placement cap."""
-        level_size = {ticks: size for ticks, size in LEVELS}
-        max_level_size = max(level_size.values())
+        cap, global resting-order cap, per-cycle placement cap. Side/level
+        caps are per the quote's SERIES ladder (Love Island is bigger)."""
         side_totals: Dict[Tuple[str, str], float] = {}
         level_totals: Dict[Tuple[str, str, int], float] = {}
         total_resting = 0
@@ -2096,13 +2232,16 @@ class IncentiveMarketMaker:
                                    f"{MAX_TOTAL_RESTING_ORDERS} reached", key="order_cap",
                                    urgent=False)
                 break
+            series = series_of(q.ticker)
+            side_cap = series_side_max(series)
+            max_level_size = max(s for _t, s in series_levels(series))
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)
             have_level = level_totals.get(lkey, 0.0)
-            if have_side + q.count > SIDE_MAX_CONTRACTS + 0.01:
+            if have_side + q.count > side_cap + 0.01:
                 self.alerter.alert("side_cap", f"{q.ticker} {q.book_side}: blocked at "
-                                   f"{have_side:.0f}/{SIDE_MAX_CONTRACTS}",
+                                   f"{have_side:.0f}/{side_cap}",
                                    key=f"{q.ticker}-{q.book_side}", urgent=False)
                 continue
             if have_level + q.count > max_level_size + 0.01:
