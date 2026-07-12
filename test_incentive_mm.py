@@ -948,10 +948,10 @@ class TestSeriesOverrides(unittest.TestCase):
         self.assertEqual([(q.price_cents, q.count) for q in qs],
                          [(49, 5), (48, 5), (47, 5)])
 
-    def test_hard_expiry_830_et(self):
+    def test_hard_expiry_9pm_et(self):
         exp = imm.series_hard_expiry_utc("KXLOVEISLMENTION", "KXLOVEISLMENTION-26JUL12")
         et = exp.astimezone(imm.ET)
-        self.assertEqual((et.hour, et.minute, et.month, et.day), (20, 30, 7, 12))
+        self.assertEqual((et.hour, et.minute, et.month, et.day), (21, 0, 7, 12))
 
     def test_hard_expiry_none_for_other_series(self):
         self.assertIsNone(imm.series_hard_expiry_utc("KXWCMENTION",
@@ -986,15 +986,15 @@ class TestLoveIslandCycle(unittest.TestCase):
                 "no_dollars": [[no_bid, no_depth]]}}
         return client, ev
 
-    def _resolver_830(self, bot):
-        # Fixed 9pm ET start via SERIES_START_ET -> cutoff 8:30pm ET; use the
-        # real resolver (no HTTP needed for the fixed-hour path).
+    def _use_resolver(self, bot):
+        # Fixed 9pm ET start via SERIES_START_ET; Love Island buffer=0 -> cutoff
+        # 9:00pm ET. Real resolver (no HTTP needed for the fixed-hour path).
         bot.resolver = imm.EventStartResolver(http_get_json=lambda url: {})
 
     def test_quotes_all_markets_555(self):
         client, ev = self._client(n_markets=6)
         bot = IncentiveMarketMaker(client=client, live=False)
-        self._resolver_830(bot)
+        self._use_resolver(bot)
         bot.run_cycle()
         # every market selected (quote_all), each with a 5/5/5 x2 ladder
         self.assertEqual(len(bot.state.selected), 6)
@@ -1010,7 +1010,7 @@ class TestLoveIslandCycle(unittest.TestCase):
         imm.MAX_MARKETS = 3
         try:
             bot = IncentiveMarketMaker(client=client, live=False)
-            self._resolver_830(bot)
+            self._use_resolver(bot)
             bot.run_cycle()
             self.assertEqual(len(bot.state.selected), 12)   # all, despite cap 3
         finally:
@@ -1019,7 +1019,7 @@ class TestLoveIslandCycle(unittest.TestCase):
     def test_max_position_50(self):
         client, ev = self._client(n_markets=1)
         bot = IncentiveMarketMaker(client=client, live=False)
-        self._resolver_830(bot)
+        self._use_resolver(bot)
         t = f"{ev}-M0"
         bot.pnl.pos[t] = 47          # near the 50 cap on the long side
         bot.run_cycle()
@@ -1027,21 +1027,32 @@ class TestLoveIslandCycle(unittest.TestCase):
                    if o["ticker"] == t and o["book_side"] == "bid")
         self.assertLessEqual(bids, 3)    # only 3 more before hitting 50
 
-    def test_orders_expire_by_830_et(self):
+    def test_orders_expire_by_cutoff(self):
         client, ev = self._client(n_markets=1)
         bot = IncentiveMarketMaker(client=client, live=False)
-        self._resolver_830(bot)
+        self._use_resolver(bot)
         bot.run_cycle()
         cutoff = imm.series_hard_expiry_utc("KXLOVEISLMENTION", ev).timestamp()
         for o in bot.state.sim_orders.values():
             self.assertLessEqual(o["expire_at"], cutoff + 0.001)
+
+    def test_effective_cutoff_is_9pm_no_buffer(self):
+        """The selected meta's cutoff (what actually stops quoting) is 9:00pm ET
+        — the 30-min pre-broadcast buffer is zeroed for Love Island."""
+        client, ev = self._client(n_markets=1)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        self._use_resolver(bot)
+        bot.run_cycle()
+        meta = bot.state.selected[f"{ev}-M0"]
+        et = meta.cutoff.astimezone(imm.ET)
+        self.assertEqual((et.hour, et.minute), (21, 0))
 
     def test_user_position_does_not_yield_loveisl(self):
         """The user holding a manual Love Island position must NOT stop the bot
         — it quotes the whole event anyway (unlike non-quote_all series)."""
         client, ev = self._client(n_markets=3)
         bot = IncentiveMarketMaker(client=client, live=False)
-        self._resolver_830(bot)
+        self._use_resolver(bot)
         client.positions[f"{ev}-M0"] = 80    # big manual position, not bot's book
         bot.run_cycle()
         self.assertEqual(len(bot.state.selected), 3)   # all still quoted
@@ -1062,7 +1073,7 @@ class TestLoveIslandCycle(unittest.TestCase):
                  "remaining_count": 100}], "cursor": None}
         client.get_orders = get_orders
         bot = IncentiveMarketMaker(client=client, live=True)
-        self._resolver_830(bot)
+        self._use_resolver(bot)
         bot.run_cycle()
         self.assertIn(blocked, bot.state.manual_standoff)
         self.assertNotIn(blocked, bot.state.selected)
@@ -1074,7 +1085,7 @@ class TestLoveIslandCycle(unittest.TestCase):
     def test_deep_book_no_pad(self):
         client, ev = self._client(n_markets=1)          # 1200/1200 both sides
         bot = IncentiveMarketMaker(client=client, live=False)
-        self._resolver_830(bot)
+        self._use_resolver(bot)
         bot.run_cycle()
         pads = [o for o in bot.state.sim_orders.values()
                 if o["yes_price"] in (imm.PAD_BID_CENTS, imm.PAD_ASK_CENTS)]
@@ -1083,7 +1094,7 @@ class TestLoveIslandCycle(unittest.TestCase):
     def test_thin_bid_side_padded_at_1c(self):
         client, ev = self._client(n_markets=1, yes_depth="300", no_depth="1200")
         bot = IncentiveMarketMaker(client=client, live=False)
-        self._resolver_830(bot)
+        self._use_resolver(bot)
         bot.run_cycle()
         t = f"{ev}-M0"
         bid_pad = [o for o in bot.state.sim_orders.values()
@@ -1104,7 +1115,7 @@ class TestLoveIslandCycle(unittest.TestCase):
     def test_both_sides_thin_padded(self):
         client, ev = self._client(n_markets=1, yes_depth="200", no_depth="200")
         bot = IncentiveMarketMaker(client=client, live=False)
-        self._resolver_830(bot)
+        self._use_resolver(bot)
         bot.run_cycle()
         t = f"{ev}-M0"
         bid_pad = [o for o in bot.state.sim_orders.values()

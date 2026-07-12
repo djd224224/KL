@@ -126,6 +126,8 @@ class SeriesOverride:
     #   event, exempt from yield ranking / MAX_MARKETS / collateral budget
     hard_expiry_et: Optional[Tuple[int, int]] = None    # (hour, minute) ET on the
     #   event date — a floor on the cutoff so nothing rests past it
+    start_buffer_min: Optional[int] = None              # override the global
+    #   EVENT_START_BUFFER_MIN for this series (0 = quote right up to the start)
     pad_to_target: bool = False                         # when a quoted side's total
     #   depth is below the reward target size, add throwaway contracts at the 1c
     #   mark (bid) / 99c mark (ask) to reach it, so the near-touch ladder qualifies
@@ -150,7 +152,8 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
         levels=_parse_levels(os.environ.get("IMM_LOVEISL_LEVELS", "0:5,1:5,2:5")),
         max_position=_env_float("IMM_LOVEISL_MAX_POSITION", 50),
         quote_all=True,
-        hard_expiry_et=(20, 30),   # 8:30pm ET
+        hard_expiry_et=(21, 0),    # 9:00pm ET (episode start; user: quote until 9p)
+        start_buffer_min=0,        # no pre-broadcast buffer — quote right up to 9pm
         pad_to_target=True,
     ),
 }
@@ -1445,7 +1448,10 @@ class IncentiveMarketMaker:
             # through game day, and the pre-broadcast daytime is safe rent.
             resolved = self.resolver.resolve(series, event_ticker)
             if resolved is not None:
-                cutoff = resolved - timedelta(minutes=EVENT_START_BUFFER_MIN)
+                ov = series_override(series)
+                buffer_min = (ov.start_buffer_min if ov and ov.start_buffer_min is not None
+                              else EVENT_START_BUFFER_MIN)
+                cutoff = resolved - timedelta(minutes=buffer_min)
             else:
                 cutoff = trade_cutoff_utc(
                     event_ticker, parse_iso_utc(m.get("occurrence_datetime", "")),

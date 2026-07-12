@@ -140,10 +140,12 @@ confirming reward eligibility is per-subaccount first.
   ranking, MAX_MARKETS, the collateral budget, and the payout-floor/zero-yield
   filters (still subject to safety screens: one-sided, wide, cutoff, breakers, and
   the foreign-order yield). Live 2026-07-12: 17 markets, ~$247 collateral.
-- **Hard expiry 8:30pm ET** (`hard_expiry_et=(20,30)`) — a floor on the cutoff,
-  independent of the resolver, so no quote rests past the episode. `place_order`
-  caps each order's exchange-side expiration at it. (The KXLOVEISLMENTION fixed
-  9pm ET start − 30min buffer independently also yields 8:30pm ET.)
+- **Hard expiry 9:00pm ET** (`hard_expiry_et=(21,0)`) + **start_buffer_min=0** —
+  the cutoff is exactly the 9pm episode start with NO pre-broadcast buffer (user
+  2026-07-12: "quote until 9p not 8:30"). Both the hard-expiry floor and the
+  resolver path (fixed 9pm start − 0 buffer) yield 9:00pm ET; `place_order` caps
+  each order's exchange-side expiration at it, so nothing rests past 9pm.
+  (Other mention series keep the global 30-min `EVENT_START_BUFFER_MIN`.)
 - **Depth padding** (`pad_to_target`): a reward side pays no one unless its total
   resting depth reaches the target size (usually 1000). When a side the bot is
   quoting falls short, it adds throwaway contracts at the **1c mark** (bid) /
