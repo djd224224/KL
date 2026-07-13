@@ -957,9 +957,14 @@ class TestSeriesOverrides(unittest.TestCase):
         et = exp.astimezone(imm.ET)
         self.assertEqual((et.hour, et.minute, et.month, et.day), (21, 0, 7, 12))
 
-    def test_mlbmention_blocklisted_for_mlb_bot(self):
-        # mlb_trading.py (GitHub Actions) owns this series; suffix must not win
-        self.assertFalse(IncentiveMarketMaker._allowed("KXMLBMENTION-26JUL14ALNL-GRAN"))
+    def test_cloud_bot_mention_series_blocklisted(self):
+        # cloud trading bots (GitHub Actions) own these MENTION series; the
+        # allowlist suffix must not override the blocklist
+        a = IncentiveMarketMaker._allowed
+        self.assertFalse(a("KXMLBMENTION-26JUL14ALNL-GRAN"))    # mlb_trading
+        self.assertFalse(a("KXNBAMENTION-26JUL14-XYZ"))        # nbamention_v4_4
+        self.assertFalse(a("KXNCAABMENTION-26JUL14-XYZ"))      # ncaab_order_script
+        self.assertFalse(a("KXHIGHNY-26JUL14-B90"))            # high_temp_trading
 
     def test_hard_expiry_none_for_other_series(self):
         self.assertIsNone(imm.series_hard_expiry_utc("KXWCMENTION",
