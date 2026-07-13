@@ -511,7 +511,6 @@ class TestAllowlist(unittest.TestCase):
     def test_mention_suffix_allowed(self):
         a = IncentiveMarketMaker._allowed
         self.assertTrue(a("KXWCMENTION-26JUL11ARGSUI-VAR"))
-        self.assertTrue(a("KXMLBMENTION-26JUL12MILPIT-WALK"))
         self.assertTrue(a("KXLOVEISLMENTION-26JUL10-LOYA"))
 
     def test_crypto_series_exact(self):
@@ -530,6 +529,9 @@ class TestAllowlist(unittest.TestCase):
         # fleet series stay excluded even though programs now exist on them
         self.assertFalse(IncentiveMarketMaker._allowed("KXXRPMAXMON-XRP-26JUL31-140"))
         self.assertFalse(IncentiveMarketMaker._allowed("KXDOGEMINMON-DOGE-26JUL31-006"))
+        # mlb_trading.py's series (GitHub Actions bot) — MENTION suffix would
+        # allow it, blocklist must win
+        self.assertFalse(IncentiveMarketMaker._allowed("KXMLBMENTION-26JUL14ALNL-GRAN"))
 
     def test_allowlist_off_admits_everything_unblocked(self):
         imm.ALLOWLIST_ONLY = False
@@ -885,22 +887,23 @@ class TestMentionWindowPolicy(unittest.TestCase):
         _clean_persist()
         now = datetime.now(timezone.utc)
         et_now = now.astimezone(imm.ET)
-        seg = et_now.strftime("%y%b%d").upper() + "MILPIT"
-        t = f"KXMLBMENTION-{seg}-WALK"
+        seg = et_now.strftime("%y%b%d").upper() + "ARGSUI"
+        t = f"KXWCMENTION-{seg}-WALK"
         kickoff = now + timedelta(hours=3)
         client = FakeClient()
         client.programs = [dict(client.programs[0], market_ticker=t)]
         client.markets = {t: dict(client.markets["KXGOOD-99DEC31-A"], ticker=t,
-                                  event_ticker=f"KXMLBMENTION-{seg}")}
+                                  event_ticker=f"KXWCMENTION-{seg}")}
         client.books = {t: {"orderbook_fp": {
             "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
             "no_dollars": [["0.49", "1200"]]}}}
         bot = IncentiveMarketMaker(client=client, live=False)
         bot.resolver = imm.EventStartResolver(http_get_json=lambda url: {
-            "dates": [{"games": [{
-                "gameDate": kickoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "teams": {"away": {"team": {"abbreviation": "MIL"}},
-                          "home": {"team": {"abbreviation": "PIT"}}}}]}]})
+            "events": [{
+                "date": kickoff.strftime("%Y-%m-%dT%H:%MZ"),
+                "competitions": [{"competitors": [
+                    {"team": {"abbreviation": "ARG"}},
+                    {"team": {"abbreviation": "SUI"}}]}]}]})
         bot.run_cycle()
         self.assertIn(t, bot.state.selected)
         self.assertTrue(bot.state.sim_orders)
@@ -910,23 +913,24 @@ class TestResolverCutoffWiring(unittest.TestCase):
     def test_mention_market_cutoff_from_schedule(self):
         _clean_persist()
         client = FakeClient()
-        t = "KXMLBMENTION-99JUL12MILPIT-WALK"
+        t = "KXWCMENTION-99JUL12ARGSUI-WALK"
         client.programs = [dict(client.programs[0], market_ticker=t)]
         client.markets = {t: dict(client.markets["KXGOOD-99DEC31-A"], ticker=t,
-                                  event_ticker="KXMLBMENTION-99JUL12MILPIT")}
+                                  event_ticker="KXWCMENTION-99JUL12ARGSUI")}
         client.books = {t: {"orderbook_fp": {
             "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
             "no_dollars": [["0.49", "1200"]]}}}
         bot = IncentiveMarketMaker(client=client, live=False)
         bot.resolver = imm.EventStartResolver(http_get_json=lambda url: {
-            "dates": [{"games": [{
-                "gameDate": "2099-07-12T22:40:00Z",
-                "teams": {"away": {"team": {"abbreviation": "MIL"}},
-                          "home": {"team": {"abbreviation": "PIT"}}}}]}]})
+            "events": [{
+                "date": "2099-07-12T22:40Z",
+                "competitions": [{"competitors": [
+                    {"team": {"abbreviation": "ARG"}},
+                    {"team": {"abbreviation": "SUI"}}]}]}]})
         bot.run_cycle()
         self.assertIn(t, bot.state.selected)
         cutoff = bot.state.selected[t].cutoff
-        # game time minus the 30-min buffer — NOT midnight-ET day-of
+        # kickoff minus the 30-min buffer — NOT midnight-ET day-of
         self.assertEqual(cutoff, utc(2099, 7, 12, 22, 40)
                          - timedelta(minutes=imm.EVENT_START_BUFFER_MIN))
 
@@ -953,6 +957,10 @@ class TestSeriesOverrides(unittest.TestCase):
         et = exp.astimezone(imm.ET)
         self.assertEqual((et.hour, et.minute, et.month, et.day), (21, 0, 7, 12))
 
+    def test_mlbmention_blocklisted_for_mlb_bot(self):
+        # mlb_trading.py (GitHub Actions) owns this series; suffix must not win
+        self.assertFalse(IncentiveMarketMaker._allowed("KXMLBMENTION-26JUL14ALNL-GRAN"))
+
     def test_hard_expiry_none_for_other_series(self):
         self.assertIsNone(imm.series_hard_expiry_utc("KXWCMENTION",
                                                      "KXWCMENTION-26JUL12ABCDEF"))
@@ -966,7 +974,16 @@ class TestLoveIslandCycle(unittest.TestCase):
         client.programs = []
         client.markets = {}
         client.books = {}
-        ev = "KXLOVEISLMENTION-26JUL12"
+        # TODAY's episode (dynamic — a hardcoded date breaks the moment that
+        # ET day ends: the pre-filter drops date-expired tickers). Past ~8pm
+        # ET, today's 9pm cutoff is imminent, so use tomorrow's episode.
+        now = datetime.now(timezone.utc)
+        et_now = now.astimezone(imm.ET)
+        day = et_now if et_now.hour < 20 else et_now + timedelta(days=1)
+        seg = day.strftime("%y%b%d").upper()
+        ev = f"KXLOVEISLMENTION-{seg}"
+        start = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (now + timedelta(hours=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
         far = "2099-01-01T00:00:00Z"
         for i in range(n_markets):
             t = f"{ev}-M{i}"
@@ -974,11 +991,10 @@ class TestLoveIslandCycle(unittest.TestCase):
                 "market_ticker": t, "incentive_type": "liquidity",
                 "period_reward": 3000000, "target_size_fp": "1000.00",
                 "discount_factor_bps": 5000, "paid_out": False,
-                "start_date": "2026-07-12T12:00:00Z",
-                "end_date": "2026-07-13T03:59:00Z"})
+                "start_date": start, "end_date": end})
             client.markets[t] = {
                 "ticker": t, "event_ticker": ev, "status": "active",
-                "close_time": far, "open_time": "2026-07-12T12:00:00Z",
+                "close_time": far, "open_time": start,
                 "yes_bid_dollars": "0.48", "yes_ask_dollars": "0.50",
                 "volume_fp": "500.00"}
             client.books[t] = {"orderbook_fp": {

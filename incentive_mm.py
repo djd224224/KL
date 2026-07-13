@@ -242,10 +242,15 @@ BLIND_PRESERVE_CYCLES = 3
 # (KXXRPMAXMON, KXDOGEMINMON) — the fleet's own resting ladders already earn
 # those passively; this bot must never quote the same books (join-don't-lead
 # would anchor two of our bots to each other's quotes).
+# NOTE 2026-07-13: KXMLBMENTION belongs to mlb_trading.py (runs on GitHub
+# Actions, bare-UUID client ids — looks "manual" to the standoff). Blocklisted
+# per user decision: crossing it would trip same-account STP and cancel the
+# MLB bot's incoming orders.
 _CRYPTO_ASSETS = ("SOL", "ETH", "BTC", "XRP", "ZEC", "HYPE", "DOGE", "BNB")
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
     + ["KXHIGH"]                                    # weather bot's series
+    + ["KXMLBMENTION"]                              # mlb_trading.py's series
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 
