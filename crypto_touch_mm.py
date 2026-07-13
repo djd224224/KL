@@ -77,7 +77,7 @@ from cryptography.hazmat.primitives import serialization
 
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
-MODEL_VERSION = "crypto_touch_mm_v1.8"
+MODEL_VERSION = "crypto_touch_mm_v1.9"
 RUN_ID = uuid.uuid4().hex[:8]
 CLIENT_ORDER_PREFIX = "cmm"  # all client_order_ids look like cmm-<run>-<uuid>
 
@@ -1262,6 +1262,7 @@ class TouchMarketMaker:
         status = {
             "market": self.cfg.key,
             "mode": "LIVE" if self.live else "DRY",
+            "pid": os.getpid(),   # restart tooling kills by PID, not cmdline match
             "updated_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "event": s.event_ticker,
             "price": s.live_price,
@@ -1441,10 +1442,14 @@ class TouchMarketMaker:
                         except Exception as e2:
                             log(f"{self.tag} ! fail-safe cancel failed: {e2} "
                                 f"(orders TTL-expire within {ORDER_TTL_SECS}s)")
+                        # Digest-only: standby-wake windows fire these across all
+                        # 16 bots at once (an email storm); the digest error
+                        # counts + STALE line carry the signal instead.
                         self.alerter.alert(
                             "failsafe",
                             f"{self.state.consecutive_errors} consecutive cycle errors "
                             f"(last: {e!r:.120}); cancelled all resting orders",
+                            urgent=False,
                             key="failsafe")
                 now_utc = datetime.now(timezone.utc)
                 self.alerter.maybe_daily_summary(now_utc, self.build_daily_summary)
@@ -1456,10 +1461,13 @@ class TouchMarketMaker:
         finally:
             self.shutdown_cancel()
             if not once:
+                # Digest-only: routine restarts (config rollouts, watchdog) fired
+                # 16 urgent emails per fleet restart — pure noise. Real fleet
+                # death shows as STALE heartbeats in the digest.
                 self.alerter.alert("shutdown",
                                    f"bot stopped (run {RUN_ID}); resting orders "
                                    f"{'cancelled' if self.live else 'were simulated'}",
-                                   key="shutdown")
+                                   key="shutdown", urgent=False)
         log("=== done ===")
 
 
