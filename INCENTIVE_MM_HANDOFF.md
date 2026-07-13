@@ -260,6 +260,25 @@ Scale-up levers (env vars, set in launcher or HKCU): `IMM_COLLATERAL_BUDGET`,
 `IMM_MAX_MARKETS`, `IMM_LEVELS`, `IMM_POLL_SECS`. Emergency: create the `HALT` file,
 or `python incentive_mm.py --cancel-all`.
 
+## Daily email digest (2026-07-13)
+
+`send_imm_digest.py` — one HTML morning email, structured like the crypto fleet's
+`send_daily_digest.py`: headline **estimated reward** (contract-minutes + c/1k-
+contract-min efficiency), P&L breakdown, per-EVENT table sorted best→worst
+(P&L$/REAL$/UNREAL$/NET/EXPO$/Q-markets-quoted), TOTAL row, balance, capital-at-work,
+one-line health check. **All figures are the bot's OWN book** (own_pos/own_avg from
+`imm_state.json` + realized replayed from fills matched by order id) — the user's
+manual trades and the other cloud bots are excluded. Reward figures parsed from the
+bot's last stored daily summary (`status_incentive_mm.json` `summary_body`).
+
+- Task **`KL incentive_mm DIGEST`**, daily **7:10 AM ET** (staggered after the crypto
+  DIGEST's 7:00), cmd.exe wrapper → `run-logs\incentive-mm\digest-task.log`. Idempotent
+  marker (`imm_digest_sent_<date>.marker`), Modern-Standby retries (8×5min), registry
+  cred fallback. `python send_imm_digest.py --test` sends immediately.
+- The bot's own one-liner email is suppressed (`IMM_SUMMARY_EMAIL=0` in the launcher);
+  it still STORES the daily summary in status for the digest to read.
+- Verified sending unattended under Task Scheduler 2026-07-13.
+
 ## Strategy layer
 
 `INCENTIVE_MM_STRATEGY.md` (v1.1, red-teamed 2026-07-11) is the quant strategy on top
