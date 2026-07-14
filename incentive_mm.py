@@ -217,6 +217,12 @@ def series_max_position(series: str) -> float:
         else MAX_POSITION_CONTRACTS
 
 
+def series_min_hours_to_close(series: str) -> float:
+    ov = SERIES_OVERRIDES.get(series)
+    return ov.min_hours_to_close if (ov and ov.min_hours_to_close is not None) \
+        else MIN_HOURS_TO_CLOSE
+
+
 def series_of(ticker: str) -> str:
     return ticker.split("-")[0]
 
@@ -1894,6 +1900,27 @@ class IncentiveMarketMaker:
                 f"{datetime.fromtimestamp(self.state.halted_until, timezone.utc)}; idle")
             return
 
+        # Fills -> own book FIRST, before the positions read. Matched by ORDER
+        # OWNERSHIP (our persisted order ids): the other bots AND the user's
+        # manual trades share this account and must not pollute our P&L.
+        # Ordering is load-bearing: booking fills AFTER fetch_positions left a
+        # window where the account showed a fresh fill our own book didn't
+        # know yet — the manual-divergence check then mistook the bot's OWN
+        # fill for the user trading and dumped the whole event's quotes
+        # (observed live 2026-07-14: a 5-lot TRUM fill deselected all 14
+        # LATENIGHT markets and stray-cancelled 59 resting orders).
+        for f in self.fetch_new_fills():
+            try:
+                side, action = f.get("side"), f.get("action")
+                count = float(f.get("count_fp") or f.get("count") or 0)
+                px = f.get("yes_price_dollars")
+                px_cents = float(px) * 100 if px is not None else float(f.get("yes_price") or 0)
+                if side in ("yes", "no") and action in ("buy", "sell") and count > 0:
+                    self.pnl.on_fill(f.get("ticker", "?"), side, action, count, px_cents)
+                    self.state.fills_today += count
+            except Exception as e:
+                log(f"{self.tag} ! unparseable fill skipped: {e}")
+
         positions = self.fetch_positions()
         # Post-wake grace: reads right after a sleep can SUCCEED with garbage
         # (network up, DNS not yet — partial positions/orders), which once
@@ -1942,21 +1969,8 @@ class IncentiveMarketMaker:
         for pt in list(self.pnl.pos):
             if abs(self.pnl.pos[pt]) > 1e-9 and pt not in positions and pt not in managed:
                 self._settle_or_drop(pt)
-        # Fills -> realized P&L + daily loss halt. Matched by ORDER OWNERSHIP
-        # (our persisted order ids): the other bots AND the user's manual
-        # trades share this account and must not pollute our P&L.
-        fills = self.fetch_new_fills()
-        for f in fills:
-            try:
-                side, action = f.get("side"), f.get("action")
-                count = float(f.get("count_fp") or f.get("count") or 0)
-                px = f.get("yes_price_dollars")
-                px_cents = float(px) * 100 if px is not None else float(f.get("yes_price") or 0)
-                if side in ("yes", "no") and action in ("buy", "sell") and count > 0:
-                    self.pnl.on_fill(f.get("ticker", "?"), side, action, count, px_cents)
-                    self.state.fills_today += count
-            except Exception as e:
-                log(f"{self.tag} ! unparseable fill skipped: {e}")
+        # (Fills were booked at the top of the cycle, before the positions
+        # read — see the ordering note there.)
         # TODAY's realized P&L (lifetime minus the daily-roll baseline). The
         # LOSS HALT itself runs after the quoting loop, where fresh marks make
         # unrealized losses visible too — realized-only was blind to gapped
@@ -2099,7 +2113,10 @@ class IncentiveMarketMaker:
                 if (meta.cutoff - now_utc).total_seconds() < PRE_CUTOFF_REDUCE_ONLY_SECS:
                     reduce_only = True
             if meta.close_time is not None and \
-                    (meta.close_time - now_utc).total_seconds() < MIN_HOURS_TO_CLOSE * 3600:
+                    (meta.close_time - now_utc).total_seconds() \
+                    < series_min_hours_to_close(meta.series) * 3600:
+                # Series-aware (hourly weather lives <1h; global default would
+                # silently drop every KXTEMP market right after selection).
                 self.cancel_market_orders(t, resting)
                 self.state.selected.pop(t, None)
                 self.state.managed_extra.pop(t, None)
