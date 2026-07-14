@@ -202,6 +202,32 @@ def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} {msg}", flush=True)
 
 
+# Same shield as incentive_mm.py: resting quotes earn nothing while the
+# machine sleeps, and this laptop (Modern Standby) has slept mid-session even
+# with idle timeouts at "never". SetThreadExecutionState(ES_SYSTEM_REQUIRED)
+# vetoes S0/idle sleep while any fleet task lives (lid-close policy still
+# wins; the OS clears the flag when the process exits). Every task asserts it
+# so the fleet doesn't depend on the incentive bot running.
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_keep_awake_state = {"ok": None}
+
+
+def _keep_awake() -> None:
+    if sys.platform != "win32" or os.environ.get("CMM_KEEP_AWAKE", "1") != "1":
+        return
+    try:
+        import ctypes
+        r = ctypes.windll.kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+        ok = bool(r)
+    except Exception:
+        ok = False
+    if ok != _keep_awake_state["ok"]:   # log transitions only, not every cycle
+        _keep_awake_state["ok"] = ok
+        log(f"keep-awake (block idle sleep): {'ON' if ok else 'FAILED'}")
+
+
 # ----------------------------------------------------------------------------
 # Event ticker / calendar logic (pure functions; ET drives the month boundary)
 # ----------------------------------------------------------------------------
@@ -1412,6 +1438,7 @@ class TouchMarketMaker:
         try:
             while True:
                 top = time.time()
+                _keep_awake()   # re-assert every cycle (wakes can clear it)
                 if prev_top is not None and top - prev_top > WAKE_GAP_SECS:
                     grace_until = top + WAKE_GRACE_SECS
                     log(f"{self.tag} resume detected ({top - prev_top:.0f}s gap); "
