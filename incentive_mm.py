@@ -336,6 +336,31 @@ def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} {msg}", flush=True)
 
 
+# Rewards accrue only while orders REST — every sleep is lost rent plus a
+# degraded post-wake cycle (DNS not back yet -> books/positions read as junk).
+# SetThreadExecutionState(ES_SYSTEM_REQUIRED) vetoes S0/idle sleep while the
+# process lives (display may still turn off; lid-close policy still wins).
+# Cleared by the OS automatically when the process exits.
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_keep_awake_state = {"ok": None}
+
+
+def _keep_awake() -> None:
+    if sys.platform != "win32" or os.environ.get("IMM_KEEP_AWAKE", "1") != "1":
+        return
+    try:
+        import ctypes
+        r = ctypes.windll.kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+        ok = bool(r)
+    except Exception:
+        ok = False
+    if ok != _keep_awake_state["ok"]:   # log transitions only, not every cycle
+        _keep_awake_state["ok"] = ok
+        log(f"[IMM] keep-awake (block idle sleep): {'ON' if ok else 'FAILED'}")
+
+
 def parse_iso_utc(s) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -1048,6 +1073,8 @@ class IncentiveMarketMaker:
         self.resolver = EventStartResolver()
         self._foreign_resting: Dict[str, int] = {}
         self._shutdown_done = False
+        self.wake_grace_until = 0.0   # epoch; cycles before this ran on a
+        #   possibly half-connected post-sleep network (see run())
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -1822,19 +1849,29 @@ class IncentiveMarketMaker:
             return
 
         positions = self.fetch_positions()
+        # Post-wake grace: reads right after a sleep can SUCCEED with garbage
+        # (network up, DNS not yet — partial positions/orders), which once
+        # standoff-flagged 113/114 candidates as "manual". Freeze standoff
+        # state changes and the universe selection until reads are trusted;
+        # existing quotes keep being managed against the current selection.
+        in_grace = now_ts < self.wake_grace_until
+        if in_grace:
+            log(f"{self.tag} wake grace: standoffs + universe frozen "
+                f"({self.wake_grace_until - now_ts:.0f}s left)")
         # Release standoffs whose manual activity is gone — the market's own
         # divergence/foreign-order must be clear AND no sibling market of its
         # event is still manual (event-level yield). The yielded market never
         # re-enters the managed loop, so it must be released here.
         manual_evts = self.manual_events(positions)
-        for st in list(self.state.manual_standoff):
-            manual = abs(positions.get(st, 0.0) - self.pnl.pos.get(st, 0.0))
-            foreign_n = self._foreign_resting.get(st, 0) if self.live else 0
-            if (manual < MANUAL_STANDOFF_CONTRACTS and not foreign_n
-                    and self._event_of(st) not in manual_evts):
-                self.state.manual_standoff.pop(st, None)
-                log(f"{self.tag} {st}: manual activity cleared; market eligible again")
-        self.refresh_universe(now_utc, positions)
+        if not in_grace:
+            for st in list(self.state.manual_standoff):
+                manual = abs(positions.get(st, 0.0) - self.pnl.pos.get(st, 0.0))
+                foreign_n = self._foreign_resting.get(st, 0) if self.live else 0
+                if (manual < MANUAL_STANDOFF_CONTRACTS and not foreign_n
+                        and self._event_of(st) not in manual_evts):
+                    self.state.manual_standoff.pop(st, None)
+                    log(f"{self.tag} {st}: manual activity cleared; market eligible again")
+            self.refresh_universe(now_utc, positions)
         self.restore_orphan_metas(positions)
 
         # Managed set = selected + any market we still hold inventory in.
@@ -1973,6 +2010,15 @@ class IncentiveMarketMaker:
             # positions and sibling markets never stop the bot there.
             if foreign_n or pos_manual or event_manual:
                 if t not in self.state.manual_standoff:
+                    if in_grace:
+                        # Suspect post-wake read: don't record the standoff or
+                        # cancel anything off it — skip this market this cycle
+                        # and re-evaluate on trusted data. A REAL new manual
+                        # conflict yields at most WAKE_GRACE_SECS later.
+                        log(f"{self.tag} {t}: manual signal during wake grace "
+                            f"(foreign={foreign_n}, manual pos {manual_pos:+.0f}); "
+                            f"deferring judgement")
+                        continue
                     self.state.manual_standoff[t] = now_ts
                     why = ("elsewhere in event " + meta.event_ticker) if event_manual \
                         and not (foreign_n or pos_manual) \
@@ -2484,7 +2530,6 @@ class IncentiveMarketMaker:
 
         stopping = {"flag": False}
         prev_top: Optional[float] = None
-        grace_until = 0.0
 
         def _stop(signame):
             def handler(_sig, _frm):
@@ -2504,8 +2549,9 @@ class IncentiveMarketMaker:
         try:
             while True:
                 top = time.time()
+                _keep_awake()   # re-assert every cycle (wakes can clear it)
                 if prev_top is not None and top - prev_top > WAKE_GAP_SECS:
-                    grace_until = top + WAKE_GRACE_SECS
+                    self.wake_grace_until = top + WAKE_GRACE_SECS
                     log(f"{self.tag} resume detected ({top - prev_top:.0f}s gap); "
                         f"wake grace {WAKE_GRACE_SECS}s")
                 prev_top = top
@@ -2515,9 +2561,9 @@ class IncentiveMarketMaker:
                 except Exception as e:
                     now = time.time()
                     if now - top > WAKE_GAP_SECS:
-                        grace_until = now + WAKE_GRACE_SECS
+                        self.wake_grace_until = now + WAKE_GRACE_SECS
                     self.state.errors_today += 1
-                    if now < grace_until:
+                    if now < self.wake_grace_until:
                         log(f"{self.tag} ! cycle error during wake grace: {e!r}")
                     else:
                         self.state.consecutive_errors += 1
