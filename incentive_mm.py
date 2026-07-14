@@ -202,16 +202,17 @@ def series_of(ticker: str) -> str:
 MAX_POSITION_CONTRACTS = _env_float("IMM_MAX_POSITION", 100)   # per market (user spec)
 MAX_EVENT_CONTRACTS = _env_float("IMM_MAX_EVENT", 500)         # net per event (user spec)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
-MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)
+MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
+#   once (all markets within an opened event are eligible — budget-bounded)
 
 POLL_SECS = _env_int("IMM_POLL_SECS", 90)
 UNIVERSE_REFRESH_SECS = _env_int("IMM_UNIVERSE_REFRESH_SECS", 600)
 ORDER_TTL_SECS = _env_int("IMM_ORDER_TTL_SECS", 600)
 ORDER_REFRESH_SECS = _env_int("IMM_ORDER_REFRESH_SECS", 420)
 
-PRICE_MIN_CENTS = _env_int("IMM_PRICE_MIN_CENTS", 3)    # never quote below (bid side)
-PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 97)   # never quote above (ask side)
-MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 5)            # skip markets with mid outside
+PRICE_MIN_CENTS = _env_int("IMM_PRICE_MIN_CENTS", 1)    # never quote below (bid side)
+PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 95)   # never quote above (ask side)
+MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 1)            # skip markets with mid outside
 MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 95)
 MAX_JOIN_SPREAD_CENTS = _env_int("IMM_MAX_JOIN_SPREAD", 25)
 MIN_VOLUME_CONTRACTS = _env_float("IMM_MIN_VOLUME", 25)   # lifetime volume: some price discovery
@@ -1568,17 +1569,27 @@ class IncentiveMarketMaker:
             collateral += market_cost(meta)
             selected[meta.ticker] = meta
         forced_collateral = collateral
+        # MAX_MARKETS bounds the number of distinct EVENTS, not markets: once an
+        # event is opened (its best-yielding market clears the budget), EVERY
+        # other screened market of that event is eligible too — no per-event
+        # market cap (user rule 2026-07-13). The collateral budget is then the
+        # only governor on how many of an event's markets actually rest.
+        # Iterate ALL ranked (no break): a sibling of an already-open event must
+        # stay reachable even after the event cap is hit.
+        selected_events: Set[str] = set()
         for meta in ranked:
             if meta.ticker in selected:
                 continue
-            if len(selected) - len(forced) >= MAX_MARKETS:
-                break
+            new_event = meta.event_ticker not in selected_events
+            if new_event and len(selected_events) >= MAX_MARKETS:
+                continue
             cost = market_cost(meta)
             if collateral + cost + inv_reserve > COLLATERAL_BUDGET:
                 skipped["budget"] = skipped.get("budget", 0) + 1
                 continue
             collateral += cost
             selected[meta.ticker] = meta
+            selected_events.add(meta.event_ticker)
 
         dropped = [t for t in self.state.selected if t not in selected]
         added = [t for t in selected if t not in self.state.selected]
@@ -1587,6 +1598,7 @@ class IncentiveMarketMaker:
         est_total = sum(m.est_dollars_per_day for m in selected.values())
         log(f"{self.tag} universe: {self.state.programs_count} program markets -> "
             f"{len(metas)} candidates -> {len(selected)} selected "
+            f"across {len(selected_events)}/{MAX_MARKETS} events "
             f"({len(forced)} forced quote-all @ ~${forced_collateral:.0f}, "
             f"total ~${collateral:.0f} ladder collateral, "
             f"${inv_reserve:.0f} inventory reserve); skips {skipped}")

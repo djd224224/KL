@@ -53,7 +53,7 @@ if ($Probe) {
     # takes ~5 min to rewrite, so a 420s refresh would full-churn forever
     # (the fleet's hard-learned lesson). 1800/1500 = ~28% rewrite duty cycle;
     # cutoff-capped expirations still bound event risk exactly.
-    $ProbeEnv = "set IMM_LEVELS=0:5,1:5,2:5&& set IMM_MAX_MARKETS=10&& set IMM_COLLATERAL_BUDGET=200&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& "
+    $ProbeEnv = "set IMM_LEVELS=0:5,1:5,2:5&& set IMM_MAX_MARKETS=10&& set IMM_COLLATERAL_BUDGET=500&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& "
 }
 
 while ($true) {
