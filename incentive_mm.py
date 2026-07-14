@@ -131,6 +131,12 @@ class SeriesOverride:
     pad_to_target: bool = False                         # when a quoted side's total
     #   depth is below the reward target size, add throwaway contracts at the 1c
     #   mark (bid) / 99c mark (ask) to reach it, so the near-touch ladder qualifies
+    cutoff_from_close_min: Optional[int] = None         # cutoff = close_time minus
+    #   this many minutes, REPLACING the ticker-date/occurrence rules — for series
+    #   whose whole life IS the event (hourly weather markets) and which the
+    #   midnight-ET rule would otherwise kill on sight
+    min_hours_to_close: Optional[float] = None          # override the global
+    #   MIN_HOURS_TO_CLOSE screen (hourly markets live less than the 1h default)
 
 
 # Depth-padding (pad_to_target): fill a thin side up to the reward target with
@@ -157,6 +163,22 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
         pad_to_target=True,
     ),
 }
+
+# Hourly temperature markets (user decision 2026-07-14): 5 cities x 10 strikes,
+# the richest pools in the feed (~$100/market-hour). No pre-event window exists —
+# the observation hour IS the market's life (opens 1h before close, settles ~5min
+# after) — so the midnight-ET ticker-date rule and the 1h closing screen are
+# replaced with: quote until IMM_TEMP_CUTOFF_FROM_CLOSE_MIN before close. The
+# final minutes are the most informed (live METAR watchers), hence the buffer;
+# mid-move/fill-burst breakers and inventory skew are the rest of the protection.
+# Only mid-band strikes ever quote (far strikes are one_sided/extreme_mid).
+for _s in os.environ.get(
+        "IMM_TEMP_SERIES",
+        "KXTEMPAUSH,KXTEMPCHIH,KXTEMPDCH,KXTEMPLAXH,KXTEMPNYCH").split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            cutoff_from_close_min=_env_int("IMM_TEMP_CUTOFF_FROM_CLOSE_MIN", 5),
+            min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05))
 
 
 def series_pad_to_target(series: str) -> bool:
@@ -267,6 +289,11 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
 ALLOWLIST_ONLY = os.environ.get("IMM_ALLOWLIST_ONLY", "1") == "1"
 ALLOW_SERIES_SUFFIXES = tuple(
     s for s in os.environ.get("IMM_ALLOW_SUFFIXES", "MENTION").split(",") if s)
+# Series-name PREFIXES (weather temp family; covers new cities automatically —
+# a new city without a SERIES_OVERRIDES entry still dies safely on the
+# midnight-ET cutoff screen until it's added to IMM_TEMP_SERIES).
+ALLOW_SERIES_PREFIXES = tuple(
+    p for p in os.environ.get("IMM_ALLOW_PREFIXES", "KXTEMP").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
     "KXCHINAUNBANBTC,KXETHMINY,KXETHMAXY,KXBTCMINY,KXBTCMAXY,KXSOLMINY,KXSOLMAXY,"
     "KXDOGEMINY,KXDOGEMAXY,KXXRPMINY,KXXRPMAXY,KXCRYPTORETURNY,KXBTCRESERVE,"
@@ -1438,7 +1465,8 @@ class IncentiveMarketMaker:
             return True
         series = ticker.split("-")[0]
         return series in ALLOW_SERIES or \
-            any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES)
+            any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
+            any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
         now_ts = now_utc.timestamp()
@@ -1451,6 +1479,11 @@ class IncentiveMarketMaker:
             # fully over. Same-day markets stay in — the schedule resolver may
             # grant them an intraday cutoff (quote until kickoff - buffer),
             # and the fallback midnight rule still kills them in _screen.
+            # close-anchored series (hourly weather) ignore the ticker date
+            # entirely; the closing/cutoff screens govern them instead.
+            ov = series_override(series_of(t))
+            if ov and ov.cutoff_from_close_min is not None:
+                return False
             td = parse_event_date(t)
             return td is not None and now_utc >= td + timedelta(hours=24)
 
@@ -1479,19 +1512,27 @@ class IncentiveMarketMaker:
             event_ticker = m.get("event_ticker") or t.rsplit("-", 1)[0]
             series = t.split("-")[0]
             close_time = parse_iso_utc(m.get("close_time", ""))
-            # Real event start (statsapi / ESPN / fixed broadcast hour) beats
-            # the midnight-ET ticker-date fallback: mention programs run
-            # through game day, and the pre-broadcast daytime is safe rent.
-            resolved = self.resolver.resolve(series, event_ticker)
-            if resolved is not None:
-                ov = series_override(series)
-                buffer_min = (ov.start_buffer_min if ov and ov.start_buffer_min is not None
-                              else EVENT_START_BUFFER_MIN)
-                cutoff = resolved - timedelta(minutes=buffer_min)
+            # Close-anchored series (hourly weather): the whole life is the
+            # event, so the cutoff is close_time minus a toxicity buffer and
+            # the event-start machinery below doesn't apply.
+            ov_close = series_override(series)
+            if ov_close and ov_close.cutoff_from_close_min is not None:
+                cutoff = (close_time - timedelta(minutes=ov_close.cutoff_from_close_min)
+                          if close_time is not None else None)
             else:
-                cutoff = trade_cutoff_utc(
-                    event_ticker, parse_iso_utc(m.get("occurrence_datetime", "")),
-                    parse_iso_utc(m.get("expected_expiration_time", "")))
+                # Real event start (statsapi / ESPN / fixed broadcast hour) beats
+                # the midnight-ET ticker-date fallback: mention programs run
+                # through game day, and the pre-broadcast daytime is safe rent.
+                resolved = self.resolver.resolve(series, event_ticker)
+                if resolved is not None:
+                    ov = series_override(series)
+                    buffer_min = (ov.start_buffer_min if ov and ov.start_buffer_min is not None
+                                  else EVENT_START_BUFFER_MIN)
+                    cutoff = resolved - timedelta(minutes=buffer_min)
+                else:
+                    cutoff = trade_cutoff_utc(
+                        event_ticker, parse_iso_utc(m.get("occurrence_datetime", "")),
+                        parse_iso_utc(m.get("expected_expiration_time", "")))
             # Hard per-series expiry floor (Love Island: 8:30pm ET on event day).
             # Independent of the resolver so nothing can rest past it.
             hard = series_hard_expiry_utc(series, event_ticker)
@@ -1805,8 +1846,13 @@ class IncentiveMarketMaker:
         if meta.cutoff is None and \
                 any(meta.series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES):
             return "no_event_window"
+        ov = series_override(meta.series)
+        if ov and ov.cutoff_from_close_min is not None and meta.close_time is None:
+            return "no_event_window"   # close-anchored series with no close time
+        min_hours = (ov.min_hours_to_close if ov and ov.min_hours_to_close is not None
+                     else MIN_HOURS_TO_CLOSE)
         if meta.close_time is not None and \
-                (meta.close_time - now_utc).total_seconds() < MIN_HOURS_TO_CLOSE * 3600:
+                (meta.close_time - now_utc).total_seconds() < min_hours * 3600:
             return "closing"
         if meta.program_end is not None and now_utc >= meta.program_end:
             return "program_over"
