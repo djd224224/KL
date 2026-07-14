@@ -137,6 +137,9 @@ class SeriesOverride:
     #   midnight-ET rule would otherwise kill on sight
     min_hours_to_close: Optional[float] = None          # override the global
     #   MIN_HOURS_TO_CLOSE screen (hourly markets live less than the 1h default)
+    pre_cutoff_reduce_only_secs: Optional[int] = None   # override the global
+    #   PRE_CUTOFF_REDUCE_ONLY_SECS (1h) — hourly markets are BORN closer to
+    #   their cutoff than that, so the default makes them reduce-only for life
 
 
 # Depth-padding (pad_to_target): fill a thin side up to the reward target with
@@ -178,7 +181,8 @@ for _s in os.environ.get(
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             cutoff_from_close_min=_env_int("IMM_TEMP_CUTOFF_FROM_CLOSE_MIN", 5),
-            min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05))
+            min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05),
+            pre_cutoff_reduce_only_secs=_env_int("IMM_TEMP_PRE_CUTOFF_RO", 300))
 
 
 def series_pad_to_target(series: str) -> bool:
@@ -221,6 +225,13 @@ def series_min_hours_to_close(series: str) -> float:
     ov = SERIES_OVERRIDES.get(series)
     return ov.min_hours_to_close if (ov and ov.min_hours_to_close is not None) \
         else MIN_HOURS_TO_CLOSE
+
+
+def series_pre_cutoff_reduce_only_secs(series: str) -> int:
+    ov = SERIES_OVERRIDES.get(series)
+    return ov.pre_cutoff_reduce_only_secs \
+        if (ov and ov.pre_cutoff_reduce_only_secs is not None) \
+        else PRE_CUTOFF_REDUCE_ONLY_SECS
 
 
 def series_of(ticker: str) -> str:
@@ -2110,7 +2121,8 @@ class IncentiveMarketMaker:
                     self.state.selected.pop(t, None)
                     self.state.managed_extra.pop(t, None)
                     continue
-                if (meta.cutoff - now_utc).total_seconds() < PRE_CUTOFF_REDUCE_ONLY_SECS:
+                if (meta.cutoff - now_utc).total_seconds() \
+                        < series_pre_cutoff_reduce_only_secs(meta.series):
                     reduce_only = True
             if meta.close_time is not None and \
                     (meta.close_time - now_utc).total_seconds() \
