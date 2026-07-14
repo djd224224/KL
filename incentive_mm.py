@@ -242,7 +242,9 @@ MAX_POSITION_CONTRACTS = _env_float("IMM_MAX_POSITION", 100)   # per market (use
 MAX_EVENT_CONTRACTS = _env_float("IMM_MAX_EVENT", 500)         # net per event (user spec)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
-#   once (all markets within an opened event are eligible — budget-bounded)
+#   once; <=0 = UNLIMITED (collateral budget becomes the sole breadth governor,
+#   user decision 2026-07-14). All markets within an opened event are eligible
+#   regardless — budget-bounded.
 
 POLL_SECS = _env_int("IMM_POLL_SECS", 90)
 UNIVERSE_REFRESH_SECS = _env_int("IMM_UNIVERSE_REFRESH_SECS", 600)
@@ -1666,7 +1668,7 @@ class IncentiveMarketMaker:
             if meta.ticker in selected:
                 continue
             new_event = meta.event_ticker not in selected_events
-            if new_event and len(selected_events) >= MAX_MARKETS:
+            if MAX_MARKETS > 0 and new_event and len(selected_events) >= MAX_MARKETS:
                 continue
             cost = market_cost(meta)
             if collateral + cost + inv_reserve > COLLATERAL_BUDGET:
@@ -1683,7 +1685,8 @@ class IncentiveMarketMaker:
         est_total = sum(m.est_dollars_per_day for m in selected.values())
         log(f"{self.tag} universe: {self.state.programs_count} program markets -> "
             f"{len(metas)} candidates -> {len(selected)} selected "
-            f"across {len(selected_events)}/{MAX_MARKETS} events "
+            f"across {len(selected_events)}"
+            f"{('/' + str(MAX_MARKETS)) if MAX_MARKETS > 0 else ''} events "
             f"({len(forced)} forced quote-all @ ~${forced_collateral:.0f}, "
             f"total ~${collateral:.0f} ladder collateral, "
             f"${inv_reserve:.0f} inventory reserve); skips {skipped}")
@@ -2596,7 +2599,8 @@ class IncentiveMarketMaker:
         log(f"=== {MODEL_VERSION} run={RUN_ID} mode={mode} ===")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side), "
             f"caps: market ±{MAX_POSITION_CONTRACTS:g}, event ±{MAX_EVENT_CONTRACTS:g}, "
-            f"budget ${COLLATERAL_BUDGET:g}, max {MAX_MARKETS} markets, "
+            f"budget ${COLLATERAL_BUDGET:g}, "
+            f"{('max ' + str(MAX_MARKETS) + ' events') if MAX_MARKETS > 0 else 'events uncapped'}, "
             f"TTL {ORDER_TTL_SECS}s, poll {POLL_SECS}s")
 
         if self.live:
