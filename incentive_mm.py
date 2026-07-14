@@ -339,7 +339,7 @@ for _pair in os.environ.get(
             pass
 
 MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 250)
-MIN_EST_DOLLARS_PER_DAY = _env_float("IMM_MIN_EST_PER_DAY", 0.75)  # ~min-payout floor
+MIN_EST_DOLLARS_PER_DAY = _env_float("IMM_MIN_EST_PER_DAY", 0.50)  # ~min-payout floor (user 2026-07-14: 0.75->0.50, keep marginal strikes like LATENIGHT-VIKI in)
 
 # THE BOT YIELDS TO THE HUMAN (user decision 2026-07-11). Jack trades some
 # mention markets by hand on the same account. If the account's position on a
