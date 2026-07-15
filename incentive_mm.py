@@ -1121,6 +1121,7 @@ class IncentiveMarketMaker:
         self._shutdown_done = False
         self.wake_grace_until = 0.0   # epoch; cycles before this ran on a
         #   possibly half-connected post-sleep network (see run())
+        self._reconciled = False      # one-time orphaned-own-fill cleanup pending
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -1901,6 +1902,54 @@ class IncentiveMarketMaker:
 
     # ---- one polling cycle ---------------------------------------------------
 
+    def _reconcile_orphaned_fills(self, positions: Dict[str, float]) -> None:
+        """One-time post-restart cleanup for fills orphaned by an unclean
+        shutdown: the bot placed an order, the process was hard-killed before
+        the order_id/fill was persisted, so on restart the account holds a
+        position the bot's own-book doesn't know — which then reads as "manual"
+        and yields the whole event forever (observed 2026-07-14: an orphaned
+        +5 LENO fill kept the entire ENGARG event yielded).
+
+        Adopt those positions as the bot's own, scoped HARD so it can NEVER
+        claim the user's manual book: (1) only markets the bot actually quotes
+        (known_tickers) — the user trades MENWORLDCUP (tournament-wide, no
+        window) and big crypto by hand, none of which are quoted; (2) only
+        within the per-market position cap — a >cap position can't be ours.
+        Runs once, on the first trusted (non-grace) cycle; afterwards the normal
+        yield-to-human standoff handles genuinely NEW manual activity."""
+        adopted = []
+        for t in sorted(self.state.known_tickers):
+            acct = positions.get(t, 0.0)
+            own = self.pnl.pos.get(t, 0.0)
+            if abs(acct - own) < MANUAL_STANDOFF_CONTRACTS:
+                continue                      # below standoff threshold: harmless
+            if abs(acct) > series_max_position(series_of(t)):
+                continue                      # too big to be ours -> it's manual
+            # Entry cost of the orphaned delta is unrecoverable, so mark the
+            # whole adopted position at the current YES mid: ~0 unrealized now,
+            # clean forward P&L. Skips (leaves as-is) if the book can't be read.
+            try:
+                m = (self.client.get_market(t) or {}).get("market") or {}
+                bid = market_cents(m, "yes_bid")
+                ask = market_cents(m, "yes_ask")
+                mid = (bid + ask) / 2.0 if (bid and ask) else None
+            except Exception:
+                mid = None
+            if mid is None:
+                mid = self.pnl.avg.get(t) or 50.0
+            adopted.append(f"{t} {own:+.1f}->{acct:+.0f}@{mid:.0f}c")
+            self.pnl.pos[t] = acct
+            self.pnl.avg[t] = mid
+        if adopted:
+            log(f"{self.tag} startup reconcile: adopted {len(adopted)} orphaned "
+                f"own-fill position(s) (unclean-shutdown cleanup): "
+                f"{', '.join(adopted[:8])}" + (" ..." if len(adopted) > 8 else ""))
+            self.alerter.alert(
+                "reconcile", f"adopted {len(adopted)} orphaned own-fill "
+                f"position(s) on restart: {', '.join(adopted[:6])}",
+                key="reconcile", urgent=False)
+            self._save_persist()
+
     def run_cycle(self) -> None:
         now_utc = datetime.now(timezone.utc)
         now_ts = now_utc.timestamp()
@@ -1945,6 +1994,12 @@ class IncentiveMarketMaker:
         if in_grace:
             log(f"{self.tag} wake grace: standoffs + universe frozen "
                 f"({self.wake_grace_until - now_ts:.0f}s left)")
+        # One-time orphaned-own-fill cleanup, BEFORE manual_events reads the
+        # own-book — so an orphaned fill can't spend even one cycle masquerading
+        # as manual. Deferred out of wake grace (positions must be trusted).
+        if not self._reconciled and not in_grace and self.live:
+            self._reconcile_orphaned_fills(positions)
+            self._reconciled = True
         # Release standoffs whose manual activity is gone — the market's own
         # divergence/foreign-order must be clear AND no sibling market of its
         # event is still manual (event-level yield). The yielded market never
@@ -2359,6 +2414,13 @@ class IncentiveMarketMaker:
             raise RuntimeError(f"{cancel_failures} cancel(s) failed")
 
         placed = self.place_with_caps(to_place, resting, cancelled_ids, now_ts)
+        if placed:
+            # Persist order-ids NOW, right after placing — not at end-of-cycle.
+            # A hard-kill in the window between placement and the end-of-cycle
+            # save orphaned the fills (the order_id never hit disk, so the
+            # fill read back as "manual"). Saving here shrinks that window to
+            # near zero; the startup reconcile mops up anything still missed.
+            self._save_persist()
         self.state.placed_today += placed
         self.state.cycles_today += 1
         self.state.last_markets_line = (
