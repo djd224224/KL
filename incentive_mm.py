@@ -419,6 +419,26 @@ def parse_iso_utc(s) -> Optional[datetime]:
         return None
 
 
+# Manual EVENT-start overrides (highest priority in the resolver) — an escape
+# hatch for when BOTH the ticker string AND Kalshi's occurrence/expiration
+# fields are wrong (e.g. KXEARNINGSMENTIONNFLX-26JUL02: ticker + occurrence both
+# say Jul 2, but the real Netflix Q2 call is Jul 16 4:40pm ET). The earnings
+# resolver (Nasdaq) handles this generally; this map is for exceptions the feed
+# also gets wrong. Format env "EVENT_TICKER=ISO8601;...".
+EVENT_START_OVERRIDES: Dict[str, datetime] = {}
+for _pair in os.environ.get(
+        "IMM_EVENT_START_OVERRIDE",
+        "KXEARNINGSMENTIONNFLX-26JUL02=2026-07-16T16:40:00-04:00").split(";"):
+    if "=" in _pair:
+        _ev, _iso = _pair.split("=", 1)
+        _dt = parse_iso_utc(_iso.strip())
+        if _dt is not None:
+            EVENT_START_OVERRIDES[_ev.strip()] = _dt
+
+# Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
+_EARNINGS_PREFIX = "KXEARNINGSMENTION"
+
+
 # ----------------------------------------------------------------------------
 # Event-start cutoff (user rule: never trade beyond the event start)
 # ----------------------------------------------------------------------------
@@ -490,7 +510,13 @@ class EventStartResolver:
 
     @staticmethod
     def _default_get(url: str):
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        # Full browser UA: Nasdaq's earnings API 403s minimal UAs; harmless for
+        # statsapi/ESPN.
+        r = requests.get(url, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0 Safari/537.36",
+            "Accept": "application/json"})
         r.raise_for_status()
         return r.json()
 
@@ -509,6 +535,17 @@ class EventStartResolver:
         return start
 
     def _resolve_uncached(self, series: str, event_ticker: str) -> Optional[datetime]:
+        # 0. Manual override wins over everything (the ticker AND the API fields
+        #    can both be wrong — see EVENT_START_OVERRIDES).
+        if event_ticker in EVENT_START_OVERRIDES:
+            return EVENT_START_OVERRIDES[event_ticker]
+        # 1. Per-company earnings calls: the ticker date is unreliable (Kalshi
+        #    stamps an estimate and doesn't always update it), so look up the
+        #    REAL next-earnings datetime from Nasdaq keyed on the company symbol
+        #    embedded in the series name (KXEARNINGSMENTION<SYMBOL>).
+        if series.startswith(_EARNINGS_PREFIX):
+            symbol = series[len(_EARNINGS_PREFIX):]
+            return self._earnings_start(symbol) if symbol else None
         if series in SERIES_START_ET:
             d = parse_event_date(event_ticker)
             if d is None:
@@ -551,6 +588,32 @@ class EventStartResolver:
             if teams <= abbrs:
                 return parse_iso_utc(ev.get("date", ""))
         return None
+
+    _EARNINGS_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
+
+    def _earnings_start(self, symbol: str) -> Optional[datetime]:
+        """Real next-earnings datetime for a company symbol, from Nasdaq's free
+        (no-auth) analyst endpoint. reportText e.g. '...report earnings on
+        07/16/2026 after market close...'. AMC -> 4:00pm ET (releases hit right
+        after the close, so the safe window ends at the close); BMO -> 7:00am ET
+        (before the 9:30 open). The 30-min EVENT_START_BUFFER trims a bit more.
+        Only markets with a LIVE program reach here, and Kalshi runs the program
+        for the UPCOMING report, so Nasdaq's next date is the right one."""
+        data = self._get(f"https://api.nasdaq.com/api/analyst/{symbol}/earnings-date")
+        text = ((data.get("data") or {}).get("reportText") or "") if isinstance(data, dict) else ""
+        m = self._EARNINGS_DATE_RE.search(text)
+        if not m:
+            return None
+        mm, dd, yyyy = (int(x) for x in m.groups())
+        low = text.lower()
+        if "before market open" in low or "pre-market" in low or "pre market" in low:
+            h, minute = 7, 0
+        else:                                   # after market close / unspecified
+            h, minute = 16, 0
+        try:
+            return ET.localize(datetime(yyyy, mm, dd, h, minute)).astimezone(timezone.utc)
+        except ValueError:
+            return None
 
 
 def series_hard_expiry_utc(series: str, event_ticker: str) -> Optional[datetime]:
@@ -1512,6 +1575,13 @@ class IncentiveMarketMaker:
             # entirely; the closing/cutoff screens govern them instead.
             ov = series_override(series_of(t))
             if ov and ov.cutoff_from_close_min is not None:
+                return False
+            # Series whose ticker date is unreliable must reach the resolver
+            # instead of being pre-dropped on the string: earnings-mention (the
+            # ticker date is a Kalshi estimate, often stale) and any event with
+            # a manual override. The resolver + _screen enforce the real cutoff.
+            if series_of(t).startswith(_EARNINGS_PREFIX) \
+                    or t.rsplit("-", 1)[0] in EVENT_START_OVERRIDES:
                 return False
             td = parse_event_date(t)
             return td is not None and now_utc >= td + timedelta(hours=24)
