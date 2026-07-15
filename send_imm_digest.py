@@ -233,6 +233,7 @@ def status_summary(status: dict) -> dict:
     return {
         "reward": grab(r"est reward today \$([\-\d.,]+)",
                        _f(status.get("reward_est_today"))),
+        "reward_lifetime": _f(status.get("reward_est_lifetime")),
         "contract_min": grab(r"\(([\d,]+) contract-min",
                              _f(status.get("contract_minutes_today"))),
         "efficiency": grab(r"([\d.]+)c/1k-contract-min",
@@ -293,9 +294,11 @@ def build_digest(now_utc: datetime):
 
     health = health_line(status, ss)
     reward, cmin, eff = ss["reward"], ss["contract_min"], ss["efficiency"]
+    reward_lifetime = ss["reward_lifetime"]
 
     # ---- plain text (fallback part) ----------------------------------------
     lines = [f"Kalshi incentive MM — {today_ct}", ""]
+    lines.append(f"TOTAL EST REWARD (cumulative): ${reward_lifetime:,.2f}")
     lines.append(f"EST REWARD (last full day): ${reward:,.2f}  "
                  f"({cmin:,.0f} contract-min, {eff:.1f}c/1k-contract-min)")
     lines.append(f"P&L: {total_pnl:+,.2f}  (realized {tot['realized']:+,.2f}, "
@@ -324,8 +327,12 @@ def build_digest(now_utc: datetime):
     h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">']
     h.append(f'<div style="font-size:17px;font-weight:600">Kalshi incentive MM'
              f' <span style="color:#888;font-weight:400">— {today_ct}</span></div>')
-    h.append(f'<div style="font-size:21px;font-weight:700;margin:8px 0 2px">'
-             f'Est reward (last full day): '
+    h.append(f'<div style="font-size:24px;font-weight:800;margin:8px 0 2px">'
+             f'Total est reward: '
+             f'<span style="color:#0a7a2f">${reward_lifetime:,.2f}</span>'
+             f'<span style="font-size:13px;font-weight:400;color:#999"> cumulative</span></div>')
+    h.append(f'<div style="font-size:16px;font-weight:600;margin:2px 0 2px">'
+             f'Last full day: '
              f'<span style="color:#0a7a2f">${reward:,.2f}</span></div>')
     h.append(f'<div style="color:#555;margin-bottom:10px">'
              f'{cmin:,.0f} contract-min &nbsp;·&nbsp; {eff:.1f}c / 1k contract-min '

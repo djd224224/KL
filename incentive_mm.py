@@ -1097,6 +1097,8 @@ class BotState:
     errors_today: int = 0
     fills_today: float = 0.0
     reward_est_today: float = 0.0
+    reward_est_lifetime: float = 0.0      # cumulative est reward (NOT reset at the
+    #   daily roll; persisted so it survives restarts) — the digest's running total
     contract_minutes_today: float = 0.0   # resting contracts x minutes quoted
     reward_accrue_at: float = 0.0
     last_markets_line: str = ""
@@ -1149,6 +1151,7 @@ class IncentiveMarketMaker:
                 self.pnl.pos[str(t)] = float(p)
             for t, a in (data.get("own_avg") or {}).items():
                 self.pnl.avg[str(t)] = float(a)
+            self.state.reward_est_lifetime = float(data.get("reward_est_lifetime") or 0.0)
             if self.state.known_tickers:
                 log(f"{self.tag} restored {len(self.state.known_tickers)} known tickers")
         except FileNotFoundError:
@@ -1174,7 +1177,8 @@ class IncentiveMarketMaker:
                                        if abs(p) > 1e-9},
                            "own_avg": {t: self.pnl.avg.get(t, 0.0)
                                        for t, p in self.pnl.pos.items()
-                                       if abs(p) > 1e-9}}, f)
+                                       if abs(p) > 1e-9},
+                           "reward_est_lifetime": self.state.reward_est_lifetime}, f)
             os.replace(tmp, self.PERSIST_PATH)
         except Exception as e:
             log(f"{self.tag} ! state save failed: {e}")
@@ -2205,7 +2209,7 @@ class IncentiveMarketMaker:
                 self.alerter.alert(
                     "fill_burst", f"{t}: our book moved {own_pos - prev:+.0f} in one "
                     f"cycle; cancelled {n} orders, standing down "
-                    f"{FILL_BURST_COOLDOWN_SECS // 60}min", key=t)
+                    f"{FILL_BURST_COOLDOWN_SECS // 60}min", key=t, urgent=False)
                 self.state.prev_pos[t] = own_pos
                 continue
             self.state.prev_pos[t] = own_pos
@@ -2362,7 +2366,9 @@ class IncentiveMarketMaker:
         resting_contracts = sum(order_remaining(o) for o in resting)
         if self.state.reward_accrue_at:
             dt_days = (now_ts - self.state.reward_accrue_at) / 86400.0
-            self.state.reward_est_today += reward_frac_sum * dt_days
+            accrued = reward_frac_sum * dt_days
+            self.state.reward_est_today += accrued
+            self.state.reward_est_lifetime += accrued
             self.state.contract_minutes_today += \
                 resting_contracts * (now_ts - self.state.reward_accrue_at) / 60.0
         self.state.reward_accrue_at = now_ts
@@ -2575,6 +2581,7 @@ class IncentiveMarketMaker:
             "programs_seen": s.programs_count,
             "markets_line": s.last_markets_line,
             "reward_est_today": round(s.reward_est_today, 2),
+            "reward_est_lifetime": round(s.reward_est_lifetime, 2),
             "contract_minutes_today": round(s.contract_minutes_today),
             "cents_per_1k_contract_min": round(
                 100000 * s.reward_est_today / s.contract_minutes_today, 2)
