@@ -308,11 +308,16 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
 ALLOWLIST_ONLY = os.environ.get("IMM_ALLOWLIST_ONLY", "1") == "1"
 ALLOW_SERIES_SUFFIXES = tuple(
     s for s in os.environ.get("IMM_ALLOW_SUFFIXES", "MENTION").split(",") if s)
-# Series-name PREFIXES (weather temp family; covers new cities automatically —
-# a new city without a SERIES_OVERRIDES entry still dies safely on the
-# midnight-ET cutoff screen until it's added to IMM_TEMP_SERIES).
+# Series-name PREFIXES — for mention/incentive families that append a variable
+# tail so the "MENTION" suffix match misses:
+#   KXTEMP<CITY>            weather temp (covers new cities automatically)
+#   KXEARNINGSMENTION<TKR>  per-company earnings-call mention markets, e.g.
+#     KXEARNINGSMENTIONUAL (United). Same low-adverse-selection structure as the
+#     other MENTIONs — nothing knowable before the call — and the midnight-ET
+#     ticker-date cutoff keeps the bot out on report day (user decision 2026-07-15).
 ALLOW_SERIES_PREFIXES = tuple(
-    p for p in os.environ.get("IMM_ALLOW_PREFIXES", "KXTEMP").split(",") if p)
+    p for p in os.environ.get(
+        "IMM_ALLOW_PREFIXES", "KXTEMP,KXEARNINGSMENTION").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
     "KXCHINAUNBANBTC,KXETHMINY,KXETHMAXY,KXBTCMINY,KXBTCMAXY,KXSOLMINY,KXSOLMAXY,"
     "KXDOGEMINY,KXDOGEMAXY,KXXRPMINY,KXXRPMAXY,KXCRYPTORETURNY,KXBTCRESERVE,"
