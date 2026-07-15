@@ -241,6 +241,15 @@ def series_of(ticker: str) -> str:
 MAX_POSITION_CONTRACTS = _env_float("IMM_MAX_POSITION", 100)   # per market (user spec)
 MAX_EVENT_CONTRACTS = _env_float("IMM_MAX_EVENT", 500)         # net per event (user spec)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
+# Selection reserves worst-case (full two-sided ladder at the touch) collateral
+# per market, but skew / one-sided books / churn / partial fills mean only a
+# fraction actually rests (observed ~0.62 with two rich earnings events live),
+# so worst-case reservation under-funds the budget and skips markets that would
+# comfortably fit. Reserve REALIZATION x worst-case instead (user 2026-07-15),
+# so the budget funds ~1/REALIZATION more markets and actual deployment tracks
+# the cap. Kept slightly above the observed ratio for margin; the account
+# balance (not this soft cap) is the real backstop if realization spikes.
+COLLATERAL_REALIZATION = _env_float("IMM_COLLATERAL_REALIZATION", 0.65)
 MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 #   once; <=0 = UNLIMITED (collateral budget becomes the sole breadth governor,
 #   user decision 2026-07-14). All markets within an opened event are eligible
@@ -1700,7 +1709,8 @@ class IncentiveMarketMaker:
         def market_cost(meta: MarketMeta) -> float:
             bid = int(meta.mid_cents - meta.spread_cents / 2)
             ask = int(meta.mid_cents + meta.spread_cents / 2)
-            return ladder_collateral_dollars(bid, ask, series_levels(meta.series))
+            worst = ladder_collateral_dollars(bid, ask, series_levels(meta.series))
+            return worst * COLLATERAL_REALIZATION   # realistic, not worst-case
 
         # quote_all series (e.g. Love Island) are force-included: EVERY market
         # of the event, exempt from the yield ranking, MAX_MARKETS, and the
