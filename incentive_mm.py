@@ -2190,8 +2190,27 @@ class IncentiveMarketMaker:
         cycle_rows: List[str] = []        # cycle-logger panel (η/J calibration data)
         reward_frac_sum = 0.0
         quoted = 0
-        # Iterate best-paying first so event/collateral budgets favor them.
-        order_of_play = sorted(managed.values(), key=lambda m: -m.dollars_per_day)
+        # Round-robin across events (best-paying event first), NOT a flat
+        # $/day sort: with many events managed, MAX_PLACEMENTS_PER_CYCLE would
+        # be fully consumed by the top events every cycle and the tail (a
+        # selected low-$/day event like AQI) never got reached — it stayed
+        # selected but placed zero orders and earned nothing. Interleaving
+        # guarantees every event's best markets are placed before any event's
+        # deeper markets, so the per-cycle cap is shared fairly. Per-event
+        # budget/share logic below is unchanged (it decrements per event).
+        by_event: Dict[str, List[MarketMeta]] = {}
+        for _m in managed.values():
+            by_event.setdefault(_m.event_ticker, []).append(_m)
+        for _grp in by_event.values():
+            _grp.sort(key=lambda m: -m.dollars_per_day)
+        _event_order = sorted(by_event, key=lambda e: -by_event[e][0].dollars_per_day)
+        order_of_play: List[MarketMeta] = []
+        _depth = 0
+        while any(_depth < len(by_event[e]) for e in _event_order):
+            for e in _event_order:
+                if _depth < len(by_event[e]):
+                    order_of_play.append(by_event[e][_depth])
+            _depth += 1
         for meta in order_of_play:
             t = meta.ticker
             ev = meta.event_ticker
