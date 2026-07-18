@@ -184,6 +184,19 @@ for _s in os.environ.get(
             min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05),
             pre_cutoff_reduce_only_secs=_env_int("IMM_TEMP_PRE_CUTOFF_RO", 300))
 
+# Air-quality-index markets (user decision 2026-07-15). Series is KXAQICITY; the
+# CITY lives in the event segment (KXAQICITY-NYC26JUL19), so one override covers
+# every city. Each market is a POINT AQI reading at a fixed time ("AQI above 130
+# in NYC Jul 19 3pm ET"); it opens ~2 days early and close_time IS the reading
+# time. The city-prefixed ticker date is unparseable, so anchor the cutoff to
+# close_time like weather — but with a bigger pre-reading buffer (30 min) since a
+# point reading is highly autocorrelated in its final minutes. Multi-day market,
+# so the default 1h reduce-only + 1h closing screen stand (no override needed).
+for _s in os.environ.get("IMM_AQI_SERIES", "KXAQICITY").split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            cutoff_from_close_min=_env_int("IMM_AQI_CUTOFF_FROM_CLOSE_MIN", 30))
+
 
 def series_pad_to_target(series: str) -> bool:
     if PAD_TO_TARGET_GLOBAL:
@@ -326,7 +339,7 @@ ALLOW_SERIES_SUFFIXES = tuple(
 #     ticker-date cutoff keeps the bot out on report day (user decision 2026-07-15).
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
-        "IMM_ALLOW_PREFIXES", "KXTEMP,KXEARNINGSMENTION").split(",") if p)
+        "IMM_ALLOW_PREFIXES", "KXTEMP,KXEARNINGSMENTION,KXAQICITY").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
     "KXCHINAUNBANBTC,KXETHMINY,KXETHMAXY,KXBTCMINY,KXBTCMAXY,KXSOLMINY,KXSOLMAXY,"
     "KXDOGEMINY,KXDOGEMAXY,KXXRPMINY,KXXRPMAXY,KXCRYPTORETURNY,KXBTCRESERVE,"
