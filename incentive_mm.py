@@ -290,7 +290,7 @@ SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
 PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 3600)
 
-DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 150.0)   # realized+unrealized $, halts to next ET day (user 2026-07-14: 50->150 for weather-farming headroom)
+DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 500.0)   # realized+unrealized $, halts to next ET day (user 2026-07-14: 50->150 for weather-farming headroom; 2026-07-19: 150->500)
 MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 450)
 MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-reward markets
@@ -352,11 +352,24 @@ ALLOW_SERIES = frozenset(
 # day — resolve real start times where a reliable source exists, cut off
 # EVENT_START_BUFFER_MIN before it, fall back to midnight ET.
 EVENT_START_BUFFER_MIN = _env_int("IMM_EVENT_START_BUFFER_MIN", 30)
+# Series with a real schedule API. Their games can be POSTPONED past the
+# ticker date (NYDAL 7/16 -> makeup 7/20 while 18 program markets kept paying
+# $100/day each), so the cheap 24h ticker-date pre-drop must not apply — the
+# resolver + _screen decide from the live schedule instead.
+SCHEDULE_RESOLVED_SERIES = frozenset(
+    s for s in os.environ.get(
+        "IMM_SCHEDULE_RESOLVED_SERIES",
+        "KXWNBAMENTION,KXMLBMENTION,KXWCMENTION").split(",") if s)
 # Fixed broadcast hours (ET) for series with no schedule API. Conservative early.
 SERIES_START_ET = {}
 for _pair in os.environ.get(
         "IMM_SERIES_START_ET",
-        "KXLOVEISLMENTION=21:00,KXBIGBROTHERMENTION=20:00,KXFIGHTMENTION=17:00").split(","):
+        # LATENIGHT: generic "late night TV" series — currently Corden's WC
+        # After Hours (nightly 11pm ET per Fox listings); 22:00 stays safe even
+        # if a future episode is a 10pm-ET show (Gutfeld class). Without an
+        # entry the midnight-ET fallback forfeits the whole day-of (2026-07-19).
+        "KXLOVEISLMENTION=21:00,KXBIGBROTHERMENTION=20:00,KXFIGHTMENTION=17:00,"
+        "KXLATENIGHTMENTION=22:00").split(","):
     if "=" in _pair:
         _s, _hm = _pair.split("=")
         try:
@@ -578,6 +591,12 @@ class EventStartResolver:
             et_day = d.astimezone(ET)
             return ET.localize(datetime(et_day.year, et_day.month, et_day.day, h, m)) \
                 .astimezone(timezone.utc)
+        # WNBA team codes are variable length (NYIND = NY+IND, LADAL = LA+DAL),
+        # so the 3+3 parse below never matches them — without this branch WNBA
+        # events silently fell to the midnight-ET rule and forfeited game day
+        # (observed 2026-07-19: LADAL, a 1pm-ET tip, skipped all morning).
+        if series == "KXWNBAMENTION":
+            return self._espn_wnba_start(event_ticker)
         game = parse_mention_game(event_ticker)
         if game is None:
             return None
@@ -612,6 +631,54 @@ class EventStartResolver:
             if teams <= abbrs:
                 return parse_iso_utc(ev.get("date", ""))
         return None
+
+    def _espn_wnba_start(self, event_ticker: str) -> Optional[datetime]:
+        # Variable-length team codes, and Kalshi's don't always equal ESPN's
+        # (Kalshi CONN vs ESPN CON — cost the whole CONNPHX game day when the
+        # exact-concat match failed, 2026-07-19). Try every split of the blob;
+        # a part matches a team when it prefix-matches the abbreviation in
+        # either direction, or the uppercased location (WAS vs WSH/WASHINGTON).
+        d = parse_event_date(event_ticker)
+        seg = event_ticker.split("-")[1] if "-" in event_ticker else ""
+        m = re.match(r"^\d{2}[A-Z]{3}\d{2}([A-Z]{4,8})$", seg)
+        if d is None or not m:
+            return None
+        blob = m.group(1)
+        et_date = d.astimezone(ET).date()
+        # Range query (ticker date + Kalshi's 14-day postponement window):
+        # a postponed game (NYDAL 7/16 -> makeup 7/20) keeps its markets open,
+        # so the start we want is the pair's earliest NON-postponed meeting in
+        # the window. Makeup not scheduled yet -> None -> midnight fallback
+        # (no quotes, safe direction); the 30-min negative cache re-checks.
+        data = self._get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/"
+            f"scoreboard?dates={et_date.strftime('%Y%m%d')}"
+            f"-{(et_date + timedelta(days=14)).strftime('%Y%m%d')}")
+
+        def team_hit(part: str, team: dict) -> bool:
+            ab = (team.get("abbreviation") or "").upper()
+            loc = (team.get("location") or "").upper()
+            return bool(ab) and (ab.startswith(part) or part.startswith(ab)
+                                 or bool(loc and loc.startswith(part)))
+
+        starts = []
+        for ev in data.get("events", []):
+            status = ((ev.get("status") or {}).get("type") or {}).get("name", "")
+            if status in ("STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_CANCELLED"):
+                continue
+            comps = (ev.get("competitions") or [{}])[0].get("competitors") or []
+            teams = [(c.get("team") or {}) for c in comps]
+            if len(teams) != 2:
+                continue
+            for i in range(2, len(blob) - 1):
+                x, y = blob[:i], blob[i:]
+                if (team_hit(x, teams[0]) and team_hit(y, teams[1])) \
+                        or (team_hit(x, teams[1]) and team_hit(y, teams[0])):
+                    s = parse_iso_utc(ev.get("date", ""))
+                    if s is not None:
+                        starts.append(s)
+                    break
+        return min(starts) if starts else None
 
 
 def series_hard_expiry_utc(series: str, event_ticker: str) -> Optional[datetime]:
@@ -1190,6 +1257,7 @@ class IncentiveMarketMaker:
         self.wake_grace_until = 0.0   # epoch; cycles before this ran on a
         #   possibly half-connected post-sleep network (see run())
         self._reconciled = False      # one-time orphaned-own-fill cleanup pending
+        self._reconcile_recheck_at = 0.0   # two-shot: second pass after sweep window
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -1294,6 +1362,12 @@ class IncentiveMarketMaker:
                 "_placed_at": now_ts, "_confirmed": False,
             }
             log(f"{self.tag} placed {label} -> {oid}")
+            # Persist PER ORDER, not just after the wave: a hard-kill mid-wave
+            # orphaned 3 fills on unsaved ids (2026-07-19, ~19:22Z restart) and
+            # the false "manual" standoffs cost CONNPHX its evening. ~ms per
+            # 2s-throttled order.
+            if self.live:
+                self._save_persist()
             return True
         except HttpError as e:
             # A definitive rejection (post-only would cross, etc.) — no order exists.
@@ -1560,7 +1634,12 @@ class IncentiveMarketMaker:
 
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
         now_ts = now_utc.timestamp()
-        if now_ts - self.state.universe_at < UNIVERSE_REFRESH_SECS:
+        # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR; the
+        # plain elapsed gate left a fresh hour's 50 markets invisible for up to
+        # 10 min of their 60-min life (observed 2026-07-19: DCH hour-16 dark 12+
+        # min). Crossing an hour boundary since the last refresh forces one now.
+        hour_crossed = int(now_ts // 3600) != int(self.state.universe_at // 3600)
+        if now_ts - self.state.universe_at < UNIVERSE_REFRESH_SECS and not hour_crossed:
             return
         by_market = self.fetch_programs()
 
@@ -1580,6 +1659,11 @@ class IncentiveMarketMaker:
             # a manual override. The resolver + _screen enforce the real cutoff.
             if series_of(t).startswith(_EARNINGS_PREFIX) \
                     or t.rsplit("-", 1)[0] in EVENT_START_OVERRIDES:
+                return False
+            # Schedule-API series: a postponed game moves past the ticker
+            # date while its programs keep paying — never pre-drop on the
+            # string; the resolver's live schedule + _screen govern.
+            if series_of(t) in SCHEDULE_RESOLVED_SERIES:
                 return False
             td = parse_event_date(t)
             return td is not None and now_utc >= td + timedelta(hours=24)
@@ -2075,9 +2159,19 @@ class IncentiveMarketMaker:
         # One-time orphaned-own-fill cleanup, BEFORE manual_events reads the
         # own-book — so an orphaned fill can't spend even one cycle masquerading
         # as manual. Deferred out of wake grace (positions must be trusted).
+        # TWO-SHOT: fills can land on a killed run's not-yet-swept orders AFTER
+        # the first pass reads positions (observed 2026-07-19: 3 orphans missed
+        # because the kill hit mid-placement-wave), so re-run once ~4 min later;
+        # the known_tickers + cap scoping makes the repeat adoption safe.
         if not self._reconciled and not in_grace and self.live:
             self._reconcile_orphaned_fills(positions)
             self._reconciled = True
+            self._reconcile_recheck_at = now_ts + 240
+        elif (self._reconciled and self._reconcile_recheck_at
+                and now_ts >= self._reconcile_recheck_at
+                and not in_grace and self.live):
+            self._reconcile_recheck_at = 0.0
+            self._reconcile_orphaned_fills(positions)
         # Release standoffs whose manual activity is gone — the market's own
         # divergence/foreign-order must be clear AND no sibling market of its
         # event is still manual (event-level yield). The yielded market never

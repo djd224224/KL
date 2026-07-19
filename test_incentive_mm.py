@@ -474,8 +474,13 @@ class TestScreen(unittest.TestCase):
             _meta(spread_cents=imm.MAX_JOIN_SPREAD_CENTS + 1), self.now), "wide")
 
     def test_extreme_mid(self):
-        self.assertEqual(self.bot._screen(_meta(mid_cents=97.0), self.now), "extreme_mid")
-        self.assertEqual(self.bot._screen(_meta(mid_cents=3.0), self.now), "extreme_mid")
+        # Track the configured band (1..95 since the 2026-07-13 widening).
+        self.assertEqual(self.bot._screen(
+            _meta(mid_cents=imm.MID_BAND_HI + 1.0), self.now), "extreme_mid")
+        self.assertEqual(self.bot._screen(
+            _meta(mid_cents=imm.MID_BAND_LO - 0.5), self.now), "extreme_mid")
+        self.assertIsNone(self.bot._screen(
+            _meta(mid_cents=float(imm.MID_BAND_LO)), self.now))
 
     def test_no_volume(self):
         self.assertEqual(self.bot._screen(_meta(volume=1.0), self.now), "no_volume")
@@ -580,6 +585,87 @@ class TestEventStartResolver(unittest.TestCase):
         start = r.resolve("KXLOVEISLMENTION", "KXLOVEISLMENTION-26JUL10")
         et = start.astimezone(imm.ET)
         self.assertEqual((et.hour, et.minute, et.day), (21, 0, 10))
+
+    def test_latenight_fixed_hour(self):
+        r = imm.EventStartResolver(http_get_json=lambda url: {})
+        start = r.resolve("KXLATENIGHTMENTION", "KXLATENIGHTMENTION-26JUL19")
+        et = start.astimezone(imm.ET)
+        self.assertEqual((et.hour, et.minute, et.day), (22, 0, 19))
+
+    WNBA_JSON = {"events": [{
+        "date": "2026-07-19T17:00Z",
+        "competitions": [{"competitors": [
+            {"team": {"abbreviation": "DAL"}}, {"team": {"abbreviation": "LA"}}]}]}]}
+
+    def test_wnba_resolves_tip_either_order(self):
+        # Ticker blob LADAL = away+home; ESPN lists home (DAL) first — the
+        # variable-length codes can't be split, so both concat orders match.
+        r = imm.EventStartResolver(http_get_json=lambda url: self.WNBA_JSON)
+        start = r.resolve("KXWNBAMENTION", "KXWNBAMENTION-26JUL19LADAL")
+        self.assertEqual(start, utc(2026, 7, 19, 17, 0))
+
+    def test_wnba_no_game_match_returns_none(self):
+        r = imm.EventStartResolver(http_get_json=lambda url: self.WNBA_JSON)
+        self.assertIsNone(r.resolve("KXWNBAMENTION", "KXWNBAMENTION-26JUL19NYIND"))
+
+    def test_wnba_kalshi_code_longer_than_espn(self):
+        # Kalshi CONN vs ESPN CON (live miss 2026-07-19): prefix match must
+        # recover the game.
+        j = {"events": [{
+            "date": "2026-07-19T23:00Z",
+            "competitions": [{"competitors": [
+                {"team": {"abbreviation": "PHX", "location": "Phoenix"}},
+                {"team": {"abbreviation": "CON", "location": "Connecticut"}}]}]}]}
+        r = imm.EventStartResolver(http_get_json=lambda url: j)
+        start = r.resolve("KXWNBAMENTION", "KXWNBAMENTION-26JUL19CONNPHX")
+        self.assertEqual(start, utc(2026, 7, 19, 23, 0))
+
+    def test_wnba_location_prefix_match(self):
+        # Kalshi WAS vs ESPN WSH: neither is a prefix of the other, but the
+        # location (WASHINGTON) rescues it.
+        j = {"events": [{
+            "date": "2026-07-20T00:00Z",
+            "competitions": [{"competitors": [
+                {"team": {"abbreviation": "WSH", "location": "Washington"}},
+                {"team": {"abbreviation": "LV", "location": "Las Vegas"}}]}]}]}
+        r = imm.EventStartResolver(http_get_json=lambda url: j)
+        start = r.resolve("KXWNBAMENTION", "KXWNBAMENTION-26JUL19WASLV")
+        self.assertEqual(start, utc(2026, 7, 20, 0, 0))
+
+    NYDAL_POSTPONED = {"events": [
+        {"date": "2026-07-17T01:00Z",
+         "status": {"type": {"name": "STATUS_POSTPONED"}},
+         "competitions": [{"competitors": [
+             {"team": {"abbreviation": "DAL"}}, {"team": {"abbreviation": "NY"}}]}]},
+        {"date": "2026-07-21T00:00Z",
+         "status": {"type": {"name": "STATUS_SCHEDULED"}},
+         "competitions": [{"competitors": [
+             {"team": {"abbreviation": "DAL"}}, {"team": {"abbreviation": "NY"}}]}]}]}
+
+    def test_wnba_postponed_uses_makeup_start(self):
+        # NYDAL 7/16: original postponed, makeup 7/20 8pm ET — the cutoff must
+        # come from the makeup, not the (past) original.
+        r = imm.EventStartResolver(http_get_json=lambda url: self.NYDAL_POSTPONED)
+        start = r.resolve("KXWNBAMENTION", "KXWNBAMENTION-26JUL16NYDAL")
+        self.assertEqual(start, utc(2026, 7, 21, 0, 0))
+
+    def test_wnba_postponed_unscheduled_returns_none(self):
+        j = {"events": [self.NYDAL_POSTPONED["events"][0]]}
+        r = imm.EventStartResolver(http_get_json=lambda url: j)
+        self.assertIsNone(r.resolve("KXWNBAMENTION", "KXWNBAMENTION-26JUL16NYDAL"))
+
+    def test_wnba_final_game_not_resurrected_by_next_meeting(self):
+        # A FINISHED game must keep anchoring its past start even when the
+        # same pair meets again inside the 14-day range window.
+        j = {"events": [
+            {"date": "2026-07-17T01:00Z",
+             "status": {"type": {"name": "STATUS_FINAL"}},
+             "competitions": [{"competitors": [
+                 {"team": {"abbreviation": "DAL"}}, {"team": {"abbreviation": "NY"}}]}]},
+            self.NYDAL_POSTPONED["events"][1]]}
+        r = imm.EventStartResolver(http_get_json=lambda url: j)
+        start = r.resolve("KXWNBAMENTION", "KXWNBAMENTION-26JUL16NYDAL")
+        self.assertEqual(start, utc(2026, 7, 17, 1, 0))
 
     def test_api_failure_returns_none_and_caches(self):
         calls = {"n": 0}
@@ -907,6 +993,68 @@ class TestMentionWindowPolicy(unittest.TestCase):
         bot.run_cycle()
         self.assertIn(t, bot.state.selected)
         self.assertTrue(bot.state.sim_orders)
+
+    def test_postponed_game_quotable_until_makeup(self):
+        """A WNBA game postponed past its ticker date (NYDAL 7/16 -> makeup
+        7/20 while programs kept paying) must survive the 24h ticker pre-drop
+        and quote until the makeup start."""
+        _clean_persist()
+        now = datetime.now(timezone.utc)
+        et_stale = (now - timedelta(days=3)).astimezone(imm.ET)
+        seg = et_stale.strftime("%y%b%d").upper() + "NYDAL"
+        t = f"KXWNBAMENTION-{seg}-ROOK"
+        makeup = now + timedelta(hours=30)
+        client = FakeClient()
+        client.programs = [dict(client.programs[0], market_ticker=t)]
+        client.markets = {t: dict(client.markets["KXGOOD-99DEC31-A"], ticker=t,
+                                  event_ticker=f"KXWNBAMENTION-{seg}")}
+        client.books = {t: {"orderbook_fp": {
+            "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+            "no_dollars": [["0.49", "1200"]]}}}
+        bot = IncentiveMarketMaker(client=client, live=False)
+        bot.resolver = imm.EventStartResolver(http_get_json=lambda url: {
+            "events": [
+                {"date": (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%MZ"),
+                 "status": {"type": {"name": "STATUS_POSTPONED"}},
+                 "competitions": [{"competitors": [
+                     {"team": {"abbreviation": "DAL"}},
+                     {"team": {"abbreviation": "NY"}}]}]},
+                {"date": makeup.strftime("%Y-%m-%dT%H:%MZ"),
+                 "status": {"type": {"name": "STATUS_SCHEDULED"}},
+                 "competitions": [{"competitors": [
+                     {"team": {"abbreviation": "DAL"}},
+                     {"team": {"abbreviation": "NY"}}]}]}]})
+        bot.run_cycle()
+        self.assertIn(t, bot.state.selected)
+        self.assertTrue(bot.state.sim_orders)
+        cutoff = bot.state.selected[t].cutoff
+        self.assertIsNotNone(cutoff)
+        self.assertGreater(cutoff, now)   # quoting NOW, not killed by ticker date
+
+
+class TestHourBoundaryRefresh(unittest.TestCase):
+    """Hourly programs (KXTEMP) activate at hh:00 — crossing an hour boundary
+    must force a universe refresh even inside the 600s elapsed gate."""
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def test_hour_cross_forces_refresh(self):
+        bot = self._bot()
+        now = datetime(2099, 1, 1, 5, 2, 0, tzinfo=timezone.utc)
+        bot.state.universe_at = datetime(
+            2099, 1, 1, 4, 58, 0, tzinfo=timezone.utc).timestamp()  # 240s ago
+        bot.refresh_universe(now, {})
+        self.assertEqual(bot.state.universe_at, now.timestamp())
+
+    def test_same_hour_inside_gate_no_refresh(self):
+        bot = self._bot()
+        now = datetime(2099, 1, 1, 5, 32, 0, tzinfo=timezone.utc)
+        prev = datetime(2099, 1, 1, 5, 28, 0, tzinfo=timezone.utc).timestamp()
+        bot.state.universe_at = prev
+        bot.refresh_universe(now, {})
+        self.assertEqual(bot.state.universe_at, prev)   # gate held
 
 
 class TestResolverCutoffWiring(unittest.TestCase):
@@ -1307,12 +1455,16 @@ class TestMtmAndSettlement(unittest.TestCase):
         self.assertAlmostEqual(bot.pnl.total_realized(), 0.0)
 
     def test_mtm_loss_trips_halt(self):
-        """A gapped position that has NOT settled must still trip the halt."""
+        """A gapped position that has NOT settled must still trip the halt.
+        Position sized off DAILY_LOSS_LIMIT so the 40c gap always clears the
+        configured limit (was hardcoded 150 lots = -$60, stale once the limit
+        passed $60)."""
         bot = self._bot()
         t = "KXGOOD-99DEC31-A"
+        n = float(int(imm.DAILY_LOSS_LIMIT * 4))   # 40c gap -> 1.6x the limit
         bot.state.universe_at = time.time()
-        bot.client.positions[t] = 150
-        bot.pnl.pos[t], bot.pnl.avg[t] = 150.0, 50.0
+        bot.client.positions[t] = n
+        bot.pnl.pos[t], bot.pnl.avg[t] = n, 50.0
         bot.run_cycle()                        # mark ~50 -> baseline ~0
         self.assertEqual(bot.state.halted_until, 0.0)
         bot.client.markets[t]["yes_bid_dollars"] = "0.0900"   # gap to mid 10
