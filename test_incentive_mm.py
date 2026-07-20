@@ -24,10 +24,12 @@ def setUpModule():
 
 
 def _clean_persist():
-    try:
-        os.remove(imm.IncentiveMarketMaker.PERSIST_PATH)
-    except FileNotFoundError:
-        pass
+    for p in (imm.IncentiveMarketMaker.PERSIST_PATH,
+              imm.IncentiveMarketMaker.ORDER_JOURNAL_PATH):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
 from incentive_mm import (
     Quote, MarketMeta, PnlTracker, IncentiveMarketMaker,
     parse_event_date, trade_cutoff_utc, dollars_to_cents, market_cents,
@@ -1030,6 +1032,43 @@ class TestMentionWindowPolicy(unittest.TestCase):
         cutoff = bot.state.selected[t].cutoff
         self.assertIsNotNone(cutoff)
         self.assertGreater(cutoff, now)   # quoting NOW, not killed by ticker date
+
+
+class TestOrderJournal(unittest.TestCase):
+    """Per-order crash journal: ids appended at placement must survive a
+    hard-kill (merge on load) and be folded/truncated by _save_persist."""
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def test_journaled_ids_survive_crash(self):
+        bot = self._bot()
+        bot._journal_order_id("oid-crash-1", 111.0)
+        bot._journal_order_id("oid-crash-2", 222.0)
+        # simulate hard-kill: no _save_persist; fresh process loads
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertIn("oid-crash-1", bot2.state.our_order_ids)
+        self.assertEqual(bot2.state.our_order_ids["oid-crash-2"], 222.0)
+
+    def test_save_folds_and_truncates_journal(self):
+        bot = self._bot()
+        now = time.time()
+        bot._journal_order_id("oid-fold", now)
+        bot.state.our_order_ids["oid-fold"] = now
+        bot._save_persist()
+        self.assertEqual(os.path.getsize(bot.ORDER_JOURNAL_PATH), 0)
+        bot3 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertIn("oid-fold", bot3.state.our_order_ids)   # via main file
+
+    def test_journal_merge_does_not_clobber_main(self):
+        bot = self._bot()
+        now = time.time()
+        bot.state.our_order_ids["oid-a"] = now
+        bot._save_persist()
+        bot._journal_order_id("oid-a", 1.0)    # stale duplicate line
+        bot4 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot4.state.our_order_ids["oid-a"], now)   # main wins
 
 
 class TestHourBoundaryRefresh(unittest.TestCase):

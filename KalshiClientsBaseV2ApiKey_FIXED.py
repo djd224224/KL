@@ -43,6 +43,26 @@ class KalshiClient:
         self.private_key: private_key
         self.user_id = user_id
         self.last_api_call = datetime.now()
+        # Opt-in HTTP keep-alive (KALSHI_HTTP_KEEPALIVE=1): reuse one pooled
+        # TLS connection instead of paying a fresh ~1s handshake on EVERY call
+        # (measured 2026-07-19: ~1070ms/call cold vs ~30ms pooled). Default OFF
+        # so existing bots are untouched until each opts in. Retries are
+        # CONNECT-ONLY: a connect failure means the request never reached
+        # Kalshi, so a retry cannot double-place an order; read/status errors
+        # still surface to the caller unchanged.
+        self._session = None
+        if os.environ.get("KALSHI_HTTP_KEEPALIVE", "0") == "1":
+            try:
+                from requests.adapters import HTTPAdapter
+                from urllib3.util.retry import Retry
+                self._session = requests.Session()
+                self._session.mount("https://", HTTPAdapter(max_retries=Retry(
+                    connect=2, read=0, redirect=0, status=0, other=0)))
+            except Exception:
+                self._session = None   # fall back to per-call connections
+
+    def _http(self):
+        return self._session if self._session is not None else requests
 
     """Built in rate-limiter. We STRONGLY encourage you to keep 
     some sort of rate limiting, just in case there is a bug in your 
@@ -64,7 +84,7 @@ class KalshiClient:
         """
         self.rate_limit()
 
-        response = requests.post(
+        response = self._http().post(
             self.host + path, data=body, headers=self.request_headers("POST", path),
             timeout=HTTP_TIMEOUT_SECONDS,
         )
@@ -75,8 +95,8 @@ class KalshiClient:
         """GETs from an authenticated Kalshi HTTP endpoint.
         Returns the response body. Raises an HttpError on non-2XX results."""
         self.rate_limit()
-        
-        response = requests.get(
+
+        response = self._http().get(
             self.host + path, headers=self.request_headers("GET", path), params=params,
             timeout=HTTP_TIMEOUT_SECONDS,
         )
@@ -87,8 +107,8 @@ class KalshiClient:
         """Posts from an authenticated Kalshi HTTP endpoint.
         Returns the response body. Raises an HttpError on non-2XX results."""
         self.rate_limit()
-        
-        response = requests.delete(
+
+        response = self._http().delete(
             self.host + path, headers=self.request_headers("DELETE", path), params=params,
             timeout=HTTP_TIMEOUT_SECONDS,
         )

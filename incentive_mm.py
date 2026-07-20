@@ -1268,6 +1268,41 @@ class IncentiveMarketMaker:
 
     PERSIST_PATH = os.path.join(STATUS_DIR, "imm_state.json")
 
+    ORDER_JOURNAL_PATH = os.path.join(STATUS_DIR, "imm_order_journal.jsonl")
+
+    def _journal_order_id(self, oid: str, ts: float) -> None:
+        """Append-only crash journal for order ownership: one line per placed
+        order so a hard-kill can never orphan a fill, without paying the full
+        state dump per order. Folded into the main file (and truncated) by
+        _save_persist."""
+        try:
+            with open(self.ORDER_JOURNAL_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"oid": oid, "ts": ts}) + "\n")
+        except OSError as e:
+            log(f"{self.tag} ! order journal write failed: {e}")
+
+    def _load_journal(self) -> None:
+        """Merge journaled order ids the last run placed but never folded into
+        the main state file (i.e. it was killed mid-wave)."""
+        try:
+            with open(self.ORDER_JOURNAL_PATH, encoding="utf-8") as f:
+                n = 0
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        oid = str(rec["oid"])
+                        if oid not in self.state.our_order_ids:
+                            self.state.our_order_ids[oid] = float(rec["ts"])
+                            n += 1
+                    except (ValueError, KeyError, TypeError):
+                        continue
+            if n:
+                log(f"{self.tag} recovered {n} journaled order id(s) from an unclean shutdown")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log(f"{self.tag} ! order journal read failed: {e}")
+
     def _load_persist(self) -> None:
         try:
             with open(self.PERSIST_PATH, encoding="utf-8") as f:
@@ -1292,6 +1327,9 @@ class IncentiveMarketMaker:
             pass
         except Exception as e:
             log(f"{self.tag} ! state restore failed ({e}); starting fresh")
+        # After the main file (or its absence): fold in ids the previous run
+        # journaled but never got to fold in itself.
+        self._load_journal()
 
     def _save_persist(self) -> None:
         try:
@@ -1314,6 +1352,12 @@ class IncentiveMarketMaker:
                                        if abs(p) > 1e-9},
                            "reward_est_lifetime": self.state.reward_est_lifetime}, f)
             os.replace(tmp, self.PERSIST_PATH)
+            # Journal contents are now in the main file; truncate so a later
+            # crash-load doesn't re-merge stale (already-pruned) ids.
+            try:
+                open(self.ORDER_JOURNAL_PATH, "w", encoding="utf-8").close()
+            except OSError:
+                pass
         except Exception as e:
             log(f"{self.tag} ! state save failed: {e}")
 
@@ -1362,12 +1406,13 @@ class IncentiveMarketMaker:
                 "_placed_at": now_ts, "_confirmed": False,
             }
             log(f"{self.tag} placed {label} -> {oid}")
-            # Persist PER ORDER, not just after the wave: a hard-kill mid-wave
-            # orphaned 3 fills on unsaved ids (2026-07-19, ~19:22Z restart) and
-            # the false "manual" standoffs cost CONNPHX its evening. ~ms per
-            # 2s-throttled order.
+            # Durable PER ORDER, but cheap: append the id to a journal (<1ms)
+            # instead of dumping the full ~3.4MB state (~450ms) — a hard-kill
+            # mid-wave orphaned 3 fills on unsaved ids (2026-07-19, ~19:22Z
+            # restart) and the false "manual" standoffs cost CONNPHX its
+            # evening. _save_persist folds the journal in and truncates it.
             if self.live:
-                self._save_persist()
+                self._journal_order_id(oid, now_ts)
             return True
         except HttpError as e:
             # A definitive rejection (post-only would cross, etc.) — no order exists.
@@ -2954,6 +2999,10 @@ class IncentiveMarketMaker:
 # ----------------------------------------------------------------------------
 
 def build_client() -> ExchangeClient:
+    # Keep-alive for this process only (fleet/cloud bots opt in separately):
+    # order waves ran ~2.5s/order, ~1s of which was a fresh TLS handshake per
+    # call (measured 2026-07-19). Explicit env still wins.
+    os.environ.setdefault("KALSHI_HTTP_KEEPALIVE", "1")
     private_key = load_private_key()
     client = ExchangeClient(exchange_api_base=KALSHI_API_BASE,
                             key_id=KEY_ID, private_key=private_key)
