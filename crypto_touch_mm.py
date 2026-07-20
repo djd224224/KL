@@ -1503,6 +1503,10 @@ class TouchMarketMaker:
 # ----------------------------------------------------------------------------
 
 def build_client() -> ExchangeClient:
+    # HTTP keep-alive (Jack 2026-07-20, following incentive_mm): a pooled TLS
+    # connection is ~30ms/call vs ~1070ms for a fresh handshake every call.
+    # Explicit env still wins; connect-only retries, no double-place risk.
+    os.environ.setdefault("KALSHI_HTTP_KEEPALIVE", "1")
     private_key = load_private_key()
     client = ExchangeClient(exchange_api_base=KALSHI_API_BASE,
                             key_id=KEY_ID, private_key=private_key)
