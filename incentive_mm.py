@@ -2598,6 +2598,18 @@ class IncentiveMarketMaker:
                 if ext_ask - ext_bid > MAX_JOIN_SPREAD_CENTS:
                     self.cancel_market_orders(t, resting)
                     continue
+            # TOP-IN-BAND (Jack 2026-07-21): if the top of book itself sits
+            # outside the series price band, stand aside ENTIRELY — an in-band
+            # rung under an out-of-band top (a 90c bid below a 92c touch) is
+            # the same knife the band exists to dodge. Sticky keeps such a
+            # market SELECTED (costless), so quoting resumes if the book
+            # returns to the band.
+            pmin_s = series_price_min(series_of(t))
+            pmax_s = series_price_max(series_of(t))
+            if ((ext_bid is not None and not pmin_s <= ext_bid <= pmax_s)
+                    or (ext_ask is not None and not pmin_s <= ext_ask <= pmax_s)):
+                self.cancel_market_orders(t, resting)
+                continue
 
             # Rooms: hard per-market cap, event share, then skew — all using
             # this market's SERIES ladder/cap (Love Island runs a bigger flat

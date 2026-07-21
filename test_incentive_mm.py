@@ -1093,6 +1093,24 @@ class TestTempSeriesTuning(unittest.TestCase):
         bids2 = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 6, 10, 100)
         self.assertEqual([q.price_cents for q in bids2], [6, 5, 4])
 
+    def test_out_of_band_top_stands_aside_entirely(self):
+        # Jack 2026-07-21: if the TOP of book is outside the band, no quotes
+        # at all — not even the in-band side. (Global band 1-95 here: top at
+        # 96x98 is out; the sticky selection keeps the market, orders don't.)
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        t = "KXGOOD-99DEC31-A"
+        self.assertTrue(bot.state.sim_orders)
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.96", "500"]], "no_dollars": [["0.02", "1200"]]}}
+        bot.client.markets[t]["yes_bid_dollars"] = "0.9600"
+        bot.client.markets[t]["yes_ask_dollars"] = "0.9800"
+        bot.state.universe_at = time.time()      # no refresh: quote loop only
+        bot.run_cycle()
+        self.assertEqual(bot.state.sim_orders, {})   # cancelled, standing aside
+        self.assertIn(t, bot.state.selected)         # but still selected (sticky)
+
     def test_band_is_two_sided(self):
         # Live incident 2026-07-21: a BID at 97c filled on a likely-YES temp
         # strike — the band only floored bids and capped asks. Both bounds
