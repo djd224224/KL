@@ -140,6 +140,8 @@ class SeriesOverride:
     pre_cutoff_reduce_only_secs: Optional[int] = None   # override the global
     #   PRE_CUTOFF_REDUCE_ONLY_SECS (1h) — hourly markets are BORN closer to
     #   their cutoff than that, so the default makes them reduce-only for life
+    price_min_cents: Optional[int] = None               # per-series order price
+    price_max_cents: Optional[int] = None               #   band (else global)
 
 
 # Depth-padding (pad_to_target): fill a thin side up to the reward target with
@@ -175,12 +177,20 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
 # final minutes are the most informed (live METAR watchers), hence the buffer;
 # mid-move/fill-burst breakers and inventory skew are the rest of the protection.
 # Only mid-band strikes ever quote (far strikes are one_sided/extreme_mid).
+# Temp tuning (Jack 2026-07-21): tighter, earlier-exiting, shallower —
+# 5/2/2 ladders (9/side vs global 15), net cap 40/market (global was 100),
+# quotes only in the 5..90c band (no 1c-scrap quoting on pinned strikes),
+# out 15 min before the reading (was 5; reduce-only starts 5 min before that).
 for _s in os.environ.get(
         "IMM_TEMP_SERIES",
         "KXTEMPAUSH,KXTEMPCHIH,KXTEMPDCH,KXTEMPLAXH,KXTEMPNYCH").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
-            cutoff_from_close_min=_env_int("IMM_TEMP_CUTOFF_FROM_CLOSE_MIN", 5),
+            levels=_parse_levels(os.environ.get("IMM_TEMP_LEVELS", "0:5,1:2,2:2")),
+            max_position=_env_float("IMM_TEMP_MAX_POSITION", 40),
+            price_min_cents=_env_int("IMM_TEMP_PRICE_MIN", 5),
+            price_max_cents=_env_int("IMM_TEMP_PRICE_MAX", 90),
+            cutoff_from_close_min=_env_int("IMM_TEMP_CUTOFF_FROM_CLOSE_MIN", 15),
             min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05),
             pre_cutoff_reduce_only_secs=_env_int("IMM_TEMP_PRE_CUTOFF_RO", 300))
 
@@ -232,6 +242,18 @@ def series_max_position(series: str) -> float:
     ov = SERIES_OVERRIDES.get(series)
     return ov.max_position if (ov and ov.max_position is not None) \
         else MAX_POSITION_CONTRACTS
+
+
+def series_price_min(series: str) -> int:
+    ov = SERIES_OVERRIDES.get(series)
+    return ov.price_min_cents if (ov and ov.price_min_cents is not None) \
+        else PRICE_MIN_CENTS
+
+
+def series_price_max(series: str) -> int:
+    ov = SERIES_OVERRIDES.get(series)
+    return ov.price_max_cents if (ov and ov.price_max_cents is not None) \
+        else PRICE_MAX_CENTS
 
 
 def series_min_hours_to_close(series: str) -> float:
@@ -305,7 +327,7 @@ SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
 PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 3600)
 
-DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 800.0)   # realized+unrealized $, halts to next ET day (user 2026-07-14: 50->150 for weather-farming headroom; 2026-07-19: 150->500; 2026-07-20: 500->800)
+DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 1200.0)  # realized+unrealized $, halts to next ET day (user raises: 50->150 7/14; ->500 7/19; ->800 7/20; ->1200 7/21)
 MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 450)
 MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-reward markets
@@ -941,11 +963,12 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
             anchor = opposite_best - 1
         elif book_side == "ask" and anchor <= opposite_best:
             anchor = opposite_best + 1
+    pmin, pmax = series_price_min(series_of(ticker)), series_price_max(series_of(ticker))
     for ticks, size in levels:
         px = anchor - ticks if book_side == "bid" else anchor + ticks
-        if book_side == "bid" and px < PRICE_MIN_CENTS:
+        if book_side == "bid" and px < pmin:
             continue
-        if book_side == "ask" and px > PRICE_MAX_CENTS:
+        if book_side == "ask" and px > pmax:
             continue
         if px < 1 or px > 99:
             continue
@@ -1995,10 +2018,10 @@ class IncentiveMarketMaker:
             side_max = series_side_max(meta.series)
             ext_bid, ext_ask = external_best(yes_levels, no_levels)
             quotes: List[Quote] = []
-            if ext_bid is not None and ext_bid >= PRICE_MIN_CENTS:
+            if ext_bid is not None and ext_bid >= series_price_min(meta.series):
                 quotes += build_side_ladder(meta.ticker, "bid", ext_bid, ext_ask,
                                             side_max, levels=lv)
-            if ext_ask is not None and ext_ask <= PRICE_MAX_CENTS:
+            if ext_ask is not None and ext_ask <= series_price_max(meta.series):
                 quotes += build_side_ladder(meta.ticker, "ask", ext_ask, ext_bid,
                                             side_max, levels=lv)
             if not quotes:
@@ -2602,12 +2625,12 @@ class IncentiveMarketMaker:
 
             mq: List[Quote] = []
             if ext_bid is not None and room_buy > 0:
-                px_ok = ext_bid >= PRICE_MIN_CENTS
+                px_ok = ext_bid >= series_price_min(meta.series)
                 if px_ok:
                     mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
                                                 levels=lv))
             if ext_ask is not None and room_sell > 0:
-                px_ok = ext_ask <= PRICE_MAX_CENTS
+                px_ok = ext_ask <= series_price_max(meta.series)
                 if px_ok:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
                                                 levels=lv))

@@ -10,7 +10,9 @@
 # user-level environment (HKCU\Environment).
 
 param(
-    [string]$PollSecs = "90",
+    # 90 -> 60 (Jack 2026-07-21): reprice temp ladders every minute; cycles
+    # are cheap since the HTTP keep-alive change.
+    [string]$PollSecs = "60",
     # Micro-probe mode (go-live phase 1): 1/5-size ladders on ~10 markets,
     # ~$200 collateral. Run one full PAID period this way and reconcile
     # Kalshi's actual credits against the estimator before scaling up.

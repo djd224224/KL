@@ -1064,6 +1064,36 @@ class TestMentionWindowPolicy(unittest.TestCase):
         self.assertGreater(cutoff, now)   # quoting NOW, not killed by ticker date
 
 
+class TestTempSeriesTuning(unittest.TestCase):
+    """Jack 2026-07-21: KXTEMP = 5/2/2 ladder, net cap 40, quotes only 5..90c,
+    out 15 min before the reading."""
+
+    def test_temp_ladder_and_caps(self):
+        self.assertEqual(imm.series_levels("KXTEMPDCH"), [(0, 5), (1, 2), (2, 2)])
+        self.assertEqual(imm.series_side_max("KXTEMPDCH"), 9)
+        self.assertEqual(imm.series_max_position("KXTEMPDCH"), 40)
+        self.assertEqual(imm.series_price_min("KXTEMPDCH"), 5)
+        self.assertEqual(imm.series_price_max("KXTEMPDCH"), 90)
+        ov = imm.series_override("KXTEMPDCH")
+        self.assertEqual(ov.cutoff_from_close_min, 15)
+        # non-temp series keep the globals
+        self.assertEqual(imm.series_price_min("KXGOOD"), imm.PRICE_MIN_CENTS)
+        self.assertEqual(imm.series_price_max("KXGOOD"), imm.PRICE_MAX_CENTS)
+
+    def test_temp_band_trims_ladder(self):
+        # bid anchor at 6c: levels at 6/5/4 -> the 4c rung is below the 5c
+        # floor and must be dropped; ask anchor 89: rungs 89/90/91 -> 91 over.
+        bids = imm.build_side_ladder("KXTEMPDCH-26JUL2112-T80.99", "bid",
+                                     6, 10, 100)
+        self.assertEqual([q.price_cents for q in bids], [6, 5])
+        asks = imm.build_side_ladder("KXTEMPDCH-26JUL2112-T80.99", "ask",
+                                     89, 80, 100)
+        self.assertEqual([q.price_cents for q in asks], [89, 90])
+        # a non-temp ticker keeps the full ladder at the same anchors
+        bids2 = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 6, 10, 100)
+        self.assertEqual([q.price_cents for q in bids2], [6, 5, 4])
+
+
 class TestStickySelection(unittest.TestCase):
     """Jack 2026-07-21: Kalshi pays a market's daily accrual only above ~$1 —
     a quoted market must not be deselected by QUALITY screens mid-life, only
