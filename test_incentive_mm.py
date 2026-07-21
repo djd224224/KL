@@ -1071,7 +1071,7 @@ class TestTempSeriesTuning(unittest.TestCase):
     def test_temp_ladder_and_caps(self):
         self.assertEqual(imm.series_levels("KXTEMPDCH"), [(0, 5), (1, 2), (2, 2)])
         self.assertEqual(imm.series_side_max("KXTEMPDCH"), 9)
-        self.assertEqual(imm.series_max_position("KXTEMPDCH"), 40)
+        self.assertEqual(imm.series_max_position("KXTEMPDCH"), 50)
         self.assertEqual(imm.series_price_min("KXTEMPDCH"), 5)
         self.assertEqual(imm.series_price_max("KXTEMPDCH"), 90)
         ov = imm.series_override("KXTEMPDCH")

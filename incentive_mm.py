@@ -178,7 +178,7 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
 # mid-move/fill-burst breakers and inventory skew are the rest of the protection.
 # Only mid-band strikes ever quote (far strikes are one_sided/extreme_mid).
 # Temp tuning (Jack 2026-07-21): tighter, earlier-exiting, shallower —
-# 5/2/2 ladders (9/side vs global 15), net cap 40/market (global was 100),
+# 5/2/2 ladders (9/side vs global 15), net cap 50/market (global was 100),
 # quotes only in the 5..90c band (no 1c-scrap quoting on pinned strikes),
 # out 15 min before the reading (was 5; reduce-only starts 5 min before that).
 for _s in os.environ.get(
@@ -187,7 +187,7 @@ for _s in os.environ.get(
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             levels=_parse_levels(os.environ.get("IMM_TEMP_LEVELS", "0:5,1:2,2:2")),
-            max_position=_env_float("IMM_TEMP_MAX_POSITION", 40),
+            max_position=_env_float("IMM_TEMP_MAX_POSITION", 50),
             price_min_cents=_env_int("IMM_TEMP_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_TEMP_PRICE_MAX", 90),
             cutoff_from_close_min=_env_int("IMM_TEMP_CUTOFF_FROM_CLOSE_MIN", 15),
