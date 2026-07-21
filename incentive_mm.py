@@ -290,7 +290,7 @@ SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
 PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 3600)
 
-DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 500.0)   # realized+unrealized $, halts to next ET day (user 2026-07-14: 50->150 for weather-farming headroom; 2026-07-19: 150->500)
+DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 800.0)   # realized+unrealized $, halts to next ET day (user 2026-07-14: 50->150 for weather-farming headroom; 2026-07-19: 150->500; 2026-07-20: 500->800)
 MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 450)
 MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-reward markets
