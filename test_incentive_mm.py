@@ -9,6 +9,13 @@ from datetime import datetime, timedelta, timezone
 
 import incentive_mm as imm
 
+# Wall-clock hazard: during the first HOURLY_ACTIVATION_WINDOW_SECS of every
+# real hour the universe-refresh gate is bypassed, so tests that rely on
+# `universe_at = time.time()` to suppress a refresh go flaky for 12 minutes
+# each hour (observed 2026-07-21: 4 failures at 12:10Z, green at 11:59Z).
+# Neutralize globally; the activation-window tests re-enable it locally.
+imm.HOURLY_ACTIVATION_WINDOW_SECS = 0
+
 
 def setUpModule():
     """Sandbox all file side effects (HALT file, persisted state, status
@@ -1100,6 +1107,46 @@ class TestStickySelection(unittest.TestCase):
         bot.run_cycle()
         self.assertNotIn(self.T, bot.state.selected)
 
+    def test_payout_floor_does_not_drop_quoted_market(self):
+        # Live bug 2026-07-21 (CHIH-2109-T75.99): a market passing the quality
+        # screens cleanly still fell to the pass-2 payout floor / budget race.
+        bot = self._quoting_bot()
+        old_floor = imm.MIN_EST_DOLLARS_PER_DAY
+        imm.MIN_EST_DOLLARS_PER_DAY = 1e9        # everything is below floor now
+        try:
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_DOLLARS_PER_DAY = old_floor
+
+    def test_budget_race_does_not_drop_quoted_market(self):
+        bot = self._quoting_bot()
+        old_budget = imm.COLLATERAL_BUDGET
+        imm.COLLATERAL_BUDGET = 0.0              # nothing NEW can fit
+        try:
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            imm.COLLATERAL_BUDGET = old_budget
+
+    def test_sticky_survives_restart(self):
+        # state.selected is rebuilt live; without the persisted sticky set a
+        # restart stranded every in-flight accrual (observed 2026-07-21).
+        bot = self._quoting_bot()
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertIn(self.T, bot2.state.sticky_prev)
+        old_floor = imm.MIN_EST_DOLLARS_PER_DAY
+        imm.MIN_EST_DOLLARS_PER_DAY = 1e9        # would exclude it as a NEW pick
+        try:
+            bot2.run_cycle()
+            self.assertIn(self.T, bot2.state.selected)     # retained via persist
+            self.assertEqual(bot2.state.sticky_prev, set())  # consumed
+        finally:
+            imm.MIN_EST_DOLLARS_PER_DAY = old_floor
+
 
 class TestOrderJournal(unittest.TestCase):
     """Per-order crash journal: ids appended at placement must survive a
@@ -1167,19 +1214,27 @@ class TestHourBoundaryRefresh(unittest.TestCase):
         # first HOURLY_ACTIVATION_WINDOW_SECS the 600s gate must not hold,
         # even same-hour and seconds after the last refresh.
         bot = self._bot()
-        now = datetime(2099, 1, 1, 5, 5, 0, tzinfo=timezone.utc)
-        bot.state.universe_at = datetime(
-            2099, 1, 1, 5, 3, 30, tzinfo=timezone.utc).timestamp()  # 90s ago
-        bot.refresh_universe(now, {})
-        self.assertEqual(bot.state.universe_at, now.timestamp())
+        imm.HOURLY_ACTIVATION_WINDOW_SECS = 720
+        try:
+            now = datetime(2099, 1, 1, 5, 5, 0, tzinfo=timezone.utc)
+            bot.state.universe_at = datetime(
+                2099, 1, 1, 5, 3, 30, tzinfo=timezone.utc).timestamp()  # 90s ago
+            bot.refresh_universe(now, {})
+            self.assertEqual(bot.state.universe_at, now.timestamp())
+        finally:
+            imm.HOURLY_ACTIVATION_WINDOW_SECS = 0
 
     def test_after_activation_window_gate_holds(self):
         bot = self._bot()
-        now = datetime(2099, 1, 1, 5, 13, 0, tzinfo=timezone.utc)  # 780s in
-        prev = datetime(2099, 1, 1, 5, 11, 0, tzinfo=timezone.utc).timestamp()
-        bot.state.universe_at = prev
-        bot.refresh_universe(now, {})
-        self.assertEqual(bot.state.universe_at, prev)
+        imm.HOURLY_ACTIVATION_WINDOW_SECS = 720
+        try:
+            now = datetime(2099, 1, 1, 5, 13, 0, tzinfo=timezone.utc)  # 780s in
+            prev = datetime(2099, 1, 1, 5, 11, 0, tzinfo=timezone.utc).timestamp()
+            bot.state.universe_at = prev
+            bot.refresh_universe(now, {})
+            self.assertEqual(bot.state.universe_at, prev)
+        finally:
+            imm.HOURLY_ACTIVATION_WINDOW_SECS = 0
 
 
 class TestResolverCutoffWiring(unittest.TestCase):

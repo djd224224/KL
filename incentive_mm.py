@@ -1238,6 +1238,8 @@ class BotState:
     seen_fill_ids: Dict[str, int] = field(default_factory=dict)   # fill_id -> ts (dedupe)
     our_order_ids: Dict[str, float] = field(default_factory=dict)  # order_id -> placed ts
     known_tickers: Set[str] = field(default_factory=set)   # every market we ever quoted
+    sticky_prev: Set[str] = field(default_factory=set)     # selected at last save — makes
+    #   sticky selection survive a restart (state.selected itself is rebuilt live)
     manual_standoff: Dict[str, float] = field(default_factory=dict)  # ticker -> since ts
     cutoff_ts: Dict[str, float] = field(default_factory=dict)     # ticker -> cutoff epoch
     place_uncertain: Dict[Tuple[str, str, int], float] = field(default_factory=dict)
@@ -1344,6 +1346,7 @@ class IncentiveMarketMaker:
             for t, a in (data.get("own_avg") or {}).items():
                 self.pnl.avg[str(t)] = float(a)
             self.state.reward_est_lifetime = float(data.get("reward_est_lifetime") or 0.0)
+            self.state.sticky_prev = set(data.get("selected_tickers") or [])
             if self.state.known_tickers:
                 log(f"{self.tag} restored {len(self.state.known_tickers)} known tickers")
         except FileNotFoundError:
@@ -1365,6 +1368,8 @@ class IncentiveMarketMaker:
                                         if v >= horizon}
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"known_tickers": sorted(self.state.known_tickers),
+                           "selected_tickers": sorted(set(self.state.selected)
+                                                      | self.state.sticky_prev),
                            "last_fill_ts": self.state.last_fill_ts,
                            "seen_fill_ids": self.state.seen_fill_ids,
                            "our_order_ids": self.state.our_order_ids,
@@ -1814,8 +1819,12 @@ class IncentiveMarketMaker:
         # resting order, an active standoff, OR any manual footprint elsewhere
         # in the same EVENT).
         manual_evts = self.manual_events(positions)
+        # Sticky membership = the live selection PLUS the persisted one (a
+        # restart wipes state.selected — without the persisted set, every
+        # restart stranded all in-flight accruals; observed 2026-07-21:
+        # CHIH-2109-T75.99 quoted 12:04, dropped 12:06 after the task restart).
+        prev_selected = set(self.state.selected) | self.state.sticky_prev
         screened: List[MarketMeta] = []
-        retained_now: Set[str] = set()
         skipped: Dict[str, int] = {}
         for meta in metas:
             t = meta.ticker
@@ -1835,11 +1844,10 @@ class IncentiveMarketMaker:
                 skipped["manual"] = skipped.get("manual", 0) + 1
                 continue
             reason = self._screen(meta, now_utc)
-            if (reason and t in self.state.selected
+            if (reason and t in prev_selected
                     and reason not in STICKY_DEATH_REASONS):
                 # Sticky: ride out transient quality states on a market we
                 # already started quoting (see STICKY_DEATH_REASONS note).
-                retained_now.add(t)
                 screened.append(meta)
             elif reason:
                 skipped[reason] = skipped.get(reason, 0) + 1
@@ -1860,14 +1868,17 @@ class IncentiveMarketMaker:
         for meta in screened:
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
             if not self._estimate_candidate_yield(meta, own_by_ticker.get(meta.ticker, [])):
-                if meta.ticker in retained_now:
+                if meta.ticker in prev_selected:
                     ranked.append(meta)   # sticky: transient book-read failure
                 else:
                     skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
-            elif quote_all or meta.ticker in retained_now:
-                # quote_all: user wants EVERY market of the event. Retained:
-                # sticky selection also bypasses the optimization filters —
-                # a below-floor estimate mid-life must not strand the accrual.
+            elif quote_all or meta.ticker in prev_selected:
+                # quote_all: user wants EVERY market of the event. Sticky:
+                # ALL previously-quoted markets bypass the optimization
+                # filters — a below-floor estimate or lost budget race
+                # mid-life must not strand the accrual (the original sticky
+                # patch only rescued pass-1 screen failures; markets passing
+                # screens cleanly still fell to payout_floor/budget here).
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
@@ -1907,7 +1918,7 @@ class IncentiveMarketMaker:
         # event cap — they are genuinely open.
         selected_events: Set[str] = set()
         for meta in ranked:
-            if meta.ticker in retained_now:
+            if meta.ticker in prev_selected:
                 collateral += market_cost(meta)
                 selected[meta.ticker] = meta
                 selected_events.add(meta.event_ticker)
@@ -1942,6 +1953,10 @@ class IncentiveMarketMaker:
         dropped = [t for t in self.state.selected if t not in selected]
         added = [t for t in selected if t not in self.state.selected]
         self.state.selected = selected
+        # The persisted sticky set is consumed by this refresh: survivors are
+        # in state.selected now; the rest died a natural death and must not be
+        # resurrected by later refreshes (or grow the persist unboundedly).
+        self.state.sticky_prev = set()
         self.state.universe_at = now_ts
         est_total = sum(m.est_dollars_per_day for m in selected.values())
         log(f"{self.tag} universe: {self.state.programs_count} program markets -> "
