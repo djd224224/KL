@@ -270,6 +270,14 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 
 POLL_SECS = _env_int("IMM_POLL_SECS", 90)
 UNIVERSE_REFRESH_SECS = _env_int("IMM_UNIVERSE_REFRESH_SECS", 600)
+# Kalshi publishes each hour's hourly-series (KXTEMP) programs LATE — absent
+# when the hour-crossed refresh fires at ~hh:01, present by ~hh:11 (observed
+# at the 01:00Z and 02:00Z boundaries, 2026-07-21) — so for the first N
+# seconds of each hour the refresh gate drops to per-cycle: pickup lands
+# within ~2 min of whenever Kalshi actually publishes, no race, no assumption
+# about their timing. A refresh costs a few seconds under keep-alive, so the
+# worst case is ~7 cheap extra refreshes/hour.
+HOURLY_ACTIVATION_WINDOW_SECS = _env_int("IMM_HOURLY_ACTIVATION_WINDOW", 720)
 ORDER_TTL_SECS = _env_int("IMM_ORDER_TTL_SECS", 600)
 ORDER_REFRESH_SECS = _env_int("IMM_ORDER_REFRESH_SECS", 420)
 
@@ -1679,12 +1687,17 @@ class IncentiveMarketMaker:
 
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
         now_ts = now_utc.timestamp()
-        # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR; the
-        # plain elapsed gate left a fresh hour's 50 markets invisible for up to
-        # 10 min of their 60-min life (observed 2026-07-19: DCH hour-16 dark 12+
-        # min). Crossing an hour boundary since the last refresh forces one now.
+        # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
+        # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
+        # refresh reliably fires before Kalshi publishes now that keep-alive
+        # keeps cycles short, and the 600s gate then sat blind to ~hh:11
+        # (observed 2026-07-21: AUSH-2023 dark 12 min). So inside the
+        # activation window the gate drops to per-cycle; hour_crossed still
+        # covers long gaps (sleep/wake) that skip the window entirely.
         hour_crossed = int(now_ts // 3600) != int(self.state.universe_at // 3600)
-        if now_ts - self.state.universe_at < UNIVERSE_REFRESH_SECS and not hour_crossed:
+        in_activation_window = (now_ts % 3600) < HOURLY_ACTIVATION_WINDOW_SECS
+        if (now_ts - self.state.universe_at < UNIVERSE_REFRESH_SECS
+                and not hour_crossed and not in_activation_window):
             return
         by_market = self.fetch_programs()
 

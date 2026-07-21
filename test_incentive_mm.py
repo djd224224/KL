@@ -1095,6 +1095,25 @@ class TestHourBoundaryRefresh(unittest.TestCase):
         bot.refresh_universe(now, {})
         self.assertEqual(bot.state.universe_at, prev)   # gate held
 
+    def test_activation_window_refreshes_every_cycle(self):
+        # Kalshi publishes hourly programs minutes AFTER hh:00: inside the
+        # first HOURLY_ACTIVATION_WINDOW_SECS the 600s gate must not hold,
+        # even same-hour and seconds after the last refresh.
+        bot = self._bot()
+        now = datetime(2099, 1, 1, 5, 5, 0, tzinfo=timezone.utc)
+        bot.state.universe_at = datetime(
+            2099, 1, 1, 5, 3, 30, tzinfo=timezone.utc).timestamp()  # 90s ago
+        bot.refresh_universe(now, {})
+        self.assertEqual(bot.state.universe_at, now.timestamp())
+
+    def test_after_activation_window_gate_holds(self):
+        bot = self._bot()
+        now = datetime(2099, 1, 1, 5, 13, 0, tzinfo=timezone.utc)  # 780s in
+        prev = datetime(2099, 1, 1, 5, 11, 0, tzinfo=timezone.utc).timestamp()
+        bot.state.universe_at = prev
+        bot.refresh_universe(now, {})
+        self.assertEqual(bot.state.universe_at, prev)
+
 
 class TestResolverCutoffWiring(unittest.TestCase):
     def test_mention_market_cutoff_from_schedule(self):
