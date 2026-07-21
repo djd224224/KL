@@ -55,44 +55,12 @@ STALE_AFTER_MINUTES = 30
 STATE_PATH = os.path.join(STATUS_DIR, "imm_state.json")
 STATUS_PATH = os.path.join(STATUS_DIR, "status_incentive_mm.json")
 FILL_LOOKBACK_HOURS = int(os.environ.get("IMM_DIGEST_FILL_HOURS", 96))
-# Estimate -> actually-paid calibration. Kalshi pays the incentive as a silent
-# daily balance credit (no API line item), so realized amounts are hand-entered:
-# append "date,est,paid" to reward_ledger.csv when a credit is identified.
-# First reconciled day (2026-07-18, Jack): est $536 vs paid $300 -> r ~ 0.56.
-# The paid figure is ACCOUNT-wide (includes the crypto fleet's passive program
-# earnings), and Kalshi's program day is midnight ET vs the bot's 6am roll, so
-# treat r as a planning haircut, not gospel.
-LEDGER_PATH = os.path.join(STATUS_DIR, "reward_ledger.csv")
-
-
-def reward_realization():
-    """(realization ratio, n reconciled days) from the ledger; env override
-    IMM_REWARD_REALIZATION wins. (None, 0) when there is no data."""
-    env = os.environ.get("IMM_REWARD_REALIZATION")
-    if env:
-        try:
-            return float(env), -1          # -1 = forced, not measured
-        except ValueError:
-            pass
-    est_sum = paid_sum = 0.0
-    n = 0
-    try:
-        with open(LEDGER_PATH, encoding="utf-8") as f:
-            for line in f.readlines()[1:]:
-                parts = line.strip().split(",")
-                if len(parts) < 3:
-                    continue
-                try:
-                    e, p = float(parts[1]), float(parts[2])
-                except ValueError:
-                    continue
-                if e > 0:
-                    est_sum += e
-                    paid_sum += p
-                    n += 1
-    except OSError:
-        return None, 0
-    return (paid_sum / est_sum, n) if est_sum > 0 else (None, 0)
+# NOTE on reconciling estimates vs Kalshi credits (Jack 2026-07-21): a naive
+# same-day comparison is WRONG — programs run multiple days and a day's
+# accrual can pay out across the program's life, so an "est $536 vs paid $300"
+# single-day ratio understates realization. A short-lived 0.56 "expected paid"
+# haircut was removed for exactly that reason; the digest reports the raw
+# estimate only.
 
 
 def _f(v) -> float:
@@ -333,18 +301,12 @@ def build_digest(now_utc: datetime):
     health = health_line(status, ss)
     reward, cmin, eff = ss["reward"], ss["contract_min"], ss["efficiency"]
     reward_lifetime = ss["reward_lifetime"]
-    r, r_n = reward_realization()
-    r_note = (f"realization {r:.0%} "
-              + (f"({r_n} reconciled day{'s' if r_n != 1 else ''})"
-                 if r_n > 0 else "(env override)")) if r else ""
 
     # ---- plain text (fallback part) ----------------------------------------
     lines = [f"Kalshi incentive MM — {today_ct}", ""]
-    lines.append(f"TOTAL EST REWARD (cumulative): ${reward_lifetime:,.2f}"
-                 + (f"  (~${reward_lifetime * r:,.2f} expected paid)" if r else ""))
-    lines.append(f"EST REWARD (last full day): ${reward:,.2f}"
-                 + (f"  -> ~${reward * r:,.2f} expected paid, {r_note}" if r else "")
-                 + f"  ({cmin:,.0f} contract-min, {eff:.1f}c/1k-contract-min)")
+    lines.append(f"TOTAL EST REWARD (cumulative): ${reward_lifetime:,.2f}")
+    lines.append(f"EST REWARD (last full day): ${reward:,.2f}  "
+                 f"({cmin:,.0f} contract-min, {eff:.1f}c/1k-contract-min)")
     lines.append(f"P&L: {total_pnl:+,.2f}  (realized {tot['realized']:+,.2f}, "
                  f"unrealized {tot['unrealized']:+,.2f})")
     lines.append(f"Net position {tot['net_pos']:+,.0f} contracts | "
@@ -364,8 +326,7 @@ def build_digest(now_utc: datetime):
         lines.append("No open inventory and no resting quotes.")
     lines.append("")
     lines.append(health)
-    lines.append("(reward is the bot's own estimate; when a Kalshi credit lands, append "
-                 "date,est,paid to run-logs\\incentive-mm\\reward_ledger.csv to recalibrate.)")
+    lines.append("(reward is the bot's own estimate.)")
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
@@ -375,19 +336,13 @@ def build_digest(now_utc: datetime):
     h.append(f'<div style="font-size:24px;font-weight:800;margin:8px 0 2px">'
              f'Total est reward: '
              f'<span style="color:#0a7a2f">${reward_lifetime:,.2f}</span>'
-             f'<span style="font-size:13px;font-weight:400;color:#999"> cumulative'
-             + (f' &nbsp;·&nbsp; ~${reward_lifetime * r:,.0f} expected paid' if r else '')
-             + '</span></div>')
+             f'<span style="font-size:13px;font-weight:400;color:#999"> cumulative</span></div>')
     h.append(f'<div style="font-size:16px;font-weight:600;margin:2px 0 2px">'
              f'Last full day: '
-             f'<span style="color:#0a7a2f">${reward:,.2f}</span>'
-             + (f' <span style="font-size:13px;font-weight:400;color:#999">'
-                f'&rarr; ~${reward * r:,.0f} expected paid ({r_note})</span>' if r else '')
-             + '</div>')
+             f'<span style="color:#0a7a2f">${reward:,.2f}</span></div>')
     h.append(f'<div style="color:#555;margin-bottom:10px">'
              f'{cmin:,.0f} contract-min &nbsp;·&nbsp; {eff:.1f}c / 1k contract-min '
-             f'&nbsp;·&nbsp; <span style="color:#999">estimate; log Kalshi credits in '
-             f'reward_ledger.csv</span></div>')
+             f'&nbsp;·&nbsp; <span style="color:#999">estimate</span></div>')
     h.append(f'<div style="font-size:15px;font-weight:600;margin:4px 0 2px">'
              f'P&amp;L: {_pnl_span(total_pnl)}</div>')
     h.append(f'<div style="color:#555;margin-bottom:12px">'
