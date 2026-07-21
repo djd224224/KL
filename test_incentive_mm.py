@@ -838,26 +838,49 @@ class TestDryRunCycle(unittest.TestCase):
 
     def test_mid_move_breaker(self):
         bot = self._bot()
+        old = imm.BREAKERS_ENABLED
+        imm.BREAKERS_ENABLED = True
+        try:
+            bot.run_cycle()
+            self.assertTrue(bot.state.sim_orders)
+            bot.client.books["KXGOOD-99DEC31-A"] = {"orderbook_fp": {
+                "yes_dollars": [["0.68", "500"], ["0.69", "600"]],
+                "no_dollars": [["0.29", "1200"]]}}      # mid 50 -> 70
+            bot.run_cycle()
+            self.assertEqual(bot.state.sim_orders, {})
+            self.assertGreater(bot.state.breaker_until.get("KXGOOD-99DEC31-A", 0),
+                               time.time())
+        finally:
+            imm.BREAKERS_ENABLED = old
+
+    def test_mid_move_no_stand_down_when_breakers_removed(self):
+        # Jack 2026-07-21: breakers removed by default — a mid gap must NOT
+        # stand the market down; the ladder just reprices to the new mid.
+        bot = self._bot()
         bot.run_cycle()
         self.assertTrue(bot.state.sim_orders)
         bot.client.books["KXGOOD-99DEC31-A"] = {"orderbook_fp": {
             "yes_dollars": [["0.68", "500"], ["0.69", "600"]],
             "no_dollars": [["0.29", "1200"]]}}      # mid 50 -> 70
         bot.run_cycle()
-        self.assertEqual(bot.state.sim_orders, {})
-        self.assertGreater(bot.state.breaker_until.get("KXGOOD-99DEC31-A", 0),
-                           time.time())
+        self.assertTrue(bot.state.sim_orders)       # still quoting (repriced)
+        self.assertEqual(bot.state.breaker_until, {})
 
     def test_fill_burst_breaker(self):
         bot = self._bot()
-        bot.run_cycle()
-        # a sweep of OUR ladder: own book and account move together
-        bot.client.positions["KXGOOD-99DEC31-A"] = imm.FILL_BURST_CONTRACTS + 5
-        bot.pnl.pos["KXGOOD-99DEC31-A"] = imm.FILL_BURST_CONTRACTS + 5
-        bot.run_cycle()
-        self.assertEqual(bot.state.sim_orders, {})
-        self.assertGreater(bot.state.breaker_until.get("KXGOOD-99DEC31-A", 0),
-                           time.time())
+        old = imm.BREAKERS_ENABLED
+        imm.BREAKERS_ENABLED = True
+        try:
+            bot.run_cycle()
+            # a sweep of OUR ladder: own book and account move together
+            bot.client.positions["KXGOOD-99DEC31-A"] = imm.FILL_BURST_CONTRACTS + 5
+            bot.pnl.pos["KXGOOD-99DEC31-A"] = imm.FILL_BURST_CONTRACTS + 5
+            bot.run_cycle()
+            self.assertEqual(bot.state.sim_orders, {})
+            self.assertGreater(bot.state.breaker_until.get("KXGOOD-99DEC31-A", 0),
+                               time.time())
+        finally:
+            imm.BREAKERS_ENABLED = old
 
     def test_position_skew_hard_pulls_bids(self):
         bot = self._bot()
@@ -1664,15 +1687,20 @@ class TestOneSidedBreaker(unittest.TestCase):
         _clean_persist()
         client = FakeClient()
         bot = IncentiveMarketMaker(client=client, live=False)
-        bot.run_cycle()
-        self.assertTrue(bot.state.sim_orders)
-        client.books["KXGOOD-99DEC31-A"] = {"orderbook_fp": {
-            "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
-            "no_dollars": []}}          # everyone pulled the asks
-        bot.run_cycle()
-        self.assertEqual(bot.state.sim_orders, {})
-        self.assertGreater(bot.state.breaker_until.get("KXGOOD-99DEC31-A", 0),
-                           time.time())
+        old = imm.BREAKERS_ENABLED
+        imm.BREAKERS_ENABLED = True
+        try:
+            bot.run_cycle()
+            self.assertTrue(bot.state.sim_orders)
+            client.books["KXGOOD-99DEC31-A"] = {"orderbook_fp": {
+                "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+                "no_dollars": []}}          # everyone pulled the asks
+            bot.run_cycle()
+            self.assertEqual(bot.state.sim_orders, {})
+            self.assertGreater(bot.state.breaker_until.get("KXGOOD-99DEC31-A", 0),
+                               time.time())
+        finally:
+            imm.BREAKERS_ENABLED = old
 
 
 class TestFillsPipeline(unittest.TestCase):

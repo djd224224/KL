@@ -293,6 +293,13 @@ MID_MOVE_BREAKER_CENTS = _env_int("IMM_MID_MOVE_BREAKER", 15)
 BREAKER_COOLDOWN_SECS = _env_int("IMM_BREAKER_COOLDOWN", 1800)
 FILL_BURST_CONTRACTS = _env_float("IMM_FILL_BURST", 15)
 FILL_BURST_COOLDOWN_SECS = _env_int("IMM_FILL_BURST_COOLDOWN", 3600)
+# Stand-down breakers REMOVED (Jack 2026-07-21): on hourly temp markets the
+# mid-move breaker fires AFTER the move (damage done) and its 30-min cooldown
+# forfeits the rest of the hour's rent, every hour. IMM_BREAKERS=1 restores
+# all three (mid-move, fill-burst, one-sided-transition). Still active with
+# breakers off: skew caps, per-market/event position caps, reduce-only
+# windows, crossed/wide-book cancels, the daily loss halt, and marks/MTM.
+BREAKERS_ENABLED = os.environ.get("IMM_BREAKERS", "0") == "1"
 SKEW_SOFT_CONTRACTS = _env_float("IMM_SKEW_SOFT", 30)   # halve accumulating side
 SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
@@ -2448,7 +2455,8 @@ class IncentiveMarketMaker:
             # Own-book delta, not account delta — the user's manual trades on a
             # nearby market must not false-alarm this.
             prev = self.state.prev_pos.get(t)
-            if prev is not None and abs(own_pos - prev) >= FILL_BURST_CONTRACTS:
+            if (BREAKERS_ENABLED and prev is not None
+                    and abs(own_pos - prev) >= FILL_BURST_CONTRACTS):
                 self.state.breaker_until[t] = now_ts + FILL_BURST_COOLDOWN_SECS
                 n = self.cancel_market_orders(t, resting)
                 self.alerter.alert(
@@ -2484,7 +2492,7 @@ class IncentiveMarketMaker:
             # A book that WAS two-sided and just lost a side is the classic
             # news signature (everyone pulled their quotes) — the mid-move
             # breaker can't see it because there is no mid anymore. Stand down.
-            if ext_bid is None or ext_ask is None:
+            if BREAKERS_ENABLED and (ext_bid is None or ext_ask is None):
                 pm = self.state.prev_mid.pop(t, None)
                 if pm is not None:
                     self.state.breaker_until[t] = now_ts + BREAKER_COOLDOWN_SECS
@@ -2502,7 +2510,8 @@ class IncentiveMarketMaker:
                 self.state.prev_mid[t] = mid
                 self.state.last_mark[t] = mid
                 marked.add(t)
-                if pm is not None and abs(mid - pm) >= MID_MOVE_BREAKER_CENTS:
+                if (BREAKERS_ENABLED and pm is not None
+                        and abs(mid - pm) >= MID_MOVE_BREAKER_CENTS):
                     self.state.breaker_until[t] = now_ts + BREAKER_COOLDOWN_SECS
                     n = self.cancel_market_orders(t, resting)
                     self.alerter.alert(
