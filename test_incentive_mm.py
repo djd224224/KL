@@ -1093,6 +1093,20 @@ class TestTempSeriesTuning(unittest.TestCase):
         bids2 = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 6, 10, 100)
         self.assertEqual([q.price_cents for q in bids2], [6, 5, 4])
 
+    def test_band_is_two_sided(self):
+        # Live incident 2026-07-21: a BID at 97c filled on a likely-YES temp
+        # strike — the band only floored bids and capped asks. Both bounds
+        # must apply to both sides.
+        bids = imm.build_side_ladder("KXTEMPDCH-26JUL2112-T80.99", "bid",
+                                     97, 99, 100)     # rungs 97/96/95: all > 90
+        self.assertEqual(bids, [])
+        asks = imm.build_side_ladder("KXTEMPDCH-26JUL2112-T80.99", "ask",
+                                     3, 1, 100)       # rungs 3/4/5: 3,4 < 5
+        self.assertEqual([q.price_cents for q in asks], [5])
+        # global band caps bids at 95 the same way
+        bids2 = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 97, 99, 100)
+        self.assertEqual([q.price_cents for q in bids2], [95])
+
 
 class TestStickySelection(unittest.TestCase):
     """Jack 2026-07-21: Kalshi pays a market's daily accrual only above ~$1 —

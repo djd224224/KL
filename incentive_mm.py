@@ -966,9 +966,12 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
     pmin, pmax = series_price_min(series_of(ticker)), series_price_max(series_of(ticker))
     for ticks, size in levels:
         px = anchor - ticks if book_side == "bid" else anchor + ticks
-        if book_side == "bid" and px < pmin:
-            continue
-        if book_side == "ask" and px > pmax:
+        # BOTH sides, BOTH bounds: the band was originally bid-min/ask-max
+        # only, which let a BID rest at 97c on a likely-YES temp strike
+        # (filled live 2026-07-21, AUSH-2118-T96.99) and would let asks rest
+        # below the floor (= buying NO above the cap). No order may price
+        # outside the series band, period.
+        if px < pmin or px > pmax:
             continue
         if px < 1 or px > 99:
             continue
