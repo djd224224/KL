@@ -395,6 +395,14 @@ for _pair in os.environ.get(
 
 MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 250)
 MIN_EST_DOLLARS_PER_DAY = _env_float("IMM_MIN_EST_PER_DAY", 0.50)  # ~min-payout floor (user 2026-07-14: 0.75->0.50, keep marginal strikes like LATENIGHT-VIKI in)
+# STICKY SELECTION (Jack 2026-07-21): Kalshi pays a market's daily accrual
+# only above a ~$1 minimum — deselecting a quoted market mid-life on a QUALITY
+# screen (pinned book, spread jitter, estimator churn) strands that accrual
+# below the threshold, pure waste. Once quoting starts, only a natural end
+# (cutoff / closing / program_over / no_event_window) or a safety stop
+# (manual standoff, halt) stops it.
+STICKY_DEATH_REASONS = frozenset(
+    {"cutoff", "no_event_window", "closing", "program_over"})
 
 # THE BOT YIELDS TO THE HUMAN (user decision 2026-07-11). Jack trades some
 # mention markets by hand on the same account. If the account's position on a
@@ -1807,6 +1815,7 @@ class IncentiveMarketMaker:
         # in the same EVENT).
         manual_evts = self.manual_events(positions)
         screened: List[MarketMeta] = []
+        retained_now: Set[str] = set()
         skipped: Dict[str, int] = {}
         for meta in metas:
             t = meta.ticker
@@ -1826,7 +1835,13 @@ class IncentiveMarketMaker:
                 skipped["manual"] = skipped.get("manual", 0) + 1
                 continue
             reason = self._screen(meta, now_utc)
-            if reason:
+            if (reason and t in self.state.selected
+                    and reason not in STICKY_DEATH_REASONS):
+                # Sticky: ride out transient quality states on a market we
+                # already started quoting (see STICKY_DEATH_REASONS note).
+                retained_now.add(t)
+                screened.append(meta)
+            elif reason:
                 skipped[reason] = skipped.get(reason, 0) + 1
             else:
                 screened.append(meta)
@@ -1845,10 +1860,14 @@ class IncentiveMarketMaker:
         for meta in screened:
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
             if not self._estimate_candidate_yield(meta, own_by_ticker.get(meta.ticker, [])):
-                skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
-            elif quote_all:
-                # user wants EVERY market of the event: skip the incentive-
-                # optimization filters (still passed the safety screens above).
+                if meta.ticker in retained_now:
+                    ranked.append(meta)   # sticky: transient book-read failure
+                else:
+                    skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
+            elif quote_all or meta.ticker in retained_now:
+                # quote_all: user wants EVERY market of the event. Retained:
+                # sticky selection also bypasses the optimization filters —
+                # a below-floor estimate mid-life must not strand the accrual.
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
@@ -1869,6 +1888,10 @@ class IncentiveMarketMaker:
         inv_reserve = sum(abs(v) for v in self.pnl.pos.values()) * 0.50
 
         def market_cost(meta: MarketMeta) -> float:
+            if meta.mid_cents is None or meta.spread_cents is None:
+                # Retained one-sided/pinned market: no readable mid; actual
+                # resting there is ~1c-side scraps, so don't charge the budget.
+                return 0.0
             bid = int(meta.mid_cents - meta.spread_cents / 2)
             ask = int(meta.mid_cents + meta.spread_cents / 2)
             worst = ladder_collateral_dollars(bid, ask, series_levels(meta.series))
@@ -1878,8 +1901,19 @@ class IncentiveMarketMaker:
         # of the event, exempt from the yield ranking, MAX_MARKETS, and the
         # collateral budget (user decision 2026-07-12 — high incentive/minute,
         # one-day pools). They're taken first so they always fit.
+        # Sticky retention is seeded FIRST: the budget and the event cap can
+        # never evict a market the bot already started quoting (its accrual
+        # rides to the market's natural end). Their events count toward the
+        # event cap — they are genuinely open.
+        selected_events: Set[str] = set()
+        for meta in ranked:
+            if meta.ticker in retained_now:
+                collateral += market_cost(meta)
+                selected[meta.ticker] = meta
+                selected_events.add(meta.event_ticker)
         forced = [m for m in ranked
-                  if (series_override(m.series) or SeriesOverride()).quote_all]
+                  if m.ticker not in selected
+                  and (series_override(m.series) or SeriesOverride()).quote_all]
         for meta in forced:
             collateral += market_cost(meta)
             selected[meta.ticker] = meta
@@ -1891,7 +1925,6 @@ class IncentiveMarketMaker:
         # only governor on how many of an event's markets actually rest.
         # Iterate ALL ranked (no break): a sibling of an already-open event must
         # stay reachable even after the event cap is hit.
-        selected_events: Set[str] = set()
         for meta in ranked:
             if meta.ticker in selected:
                 continue

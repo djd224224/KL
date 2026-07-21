@@ -1057,6 +1057,50 @@ class TestMentionWindowPolicy(unittest.TestCase):
         self.assertGreater(cutoff, now)   # quoting NOW, not killed by ticker date
 
 
+class TestStickySelection(unittest.TestCase):
+    """Jack 2026-07-21: Kalshi pays a market's daily accrual only above ~$1 —
+    a quoted market must not be deselected by QUALITY screens mid-life, only
+    by its natural end (cutoff/closing/program_over) or a safety stop."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def _quoting_bot(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        assert self.T in bot.state.selected
+        return bot
+
+    def test_quality_screen_does_not_drop_quoted_market(self):
+        bot = self._quoting_bot()
+        # book pins outside the mid band (mid 97 > MID_BAND_HI): a NEW market
+        # would be screened extreme_mid, but a quoted one must be retained.
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.96", "500"]], "no_dollars": [["0.02", "1200"]]}}
+        bot.client.markets[self.T]["yes_bid_dollars"] = "0.9600"
+        bot.client.markets[self.T]["yes_ask_dollars"] = "0.9800"
+        bot.state.universe_at = 0.0          # force refresh deterministically
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+
+    def test_one_sided_book_does_not_drop_quoted_market(self):
+        bot = self._quoting_bot()
+        bot.client.markets[self.T]["yes_bid_dollars"] = "0.0000"   # bid side gone
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+
+    def test_natural_end_still_drops(self):
+        bot = self._quoting_bot()
+        # close_time now inside MIN_HOURS_TO_CLOSE -> 'closing' is a death
+        # reason; sticky must NOT override it.
+        soon = (datetime.now(timezone.utc) + timedelta(minutes=20))
+        bot.client.markets[self.T]["close_time"] = soon.strftime("%Y-%m-%dT%H:%M:%SZ")
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+
+
 class TestOrderJournal(unittest.TestCase):
     """Per-order crash journal: ids appended at placement must survive a
     hard-kill (merge on load) and be folded/truncated by _save_persist."""
