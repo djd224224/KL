@@ -10,9 +10,11 @@
 # user-level environment (HKCU\Environment).
 
 param(
-    # 90 -> 60 (Jack 2026-07-21): reprice temp ladders every minute; cycles
-    # are cheap since the HTTP keep-alive change.
-    [string]$PollSecs = "60",
+    # 90 -> 60 -> 30 (Jack 2026-07-21): fastest endorsed cadence — cycle WORK
+    # is ~12-15s (client 100ms/call floor x ~70-120 reads), so effective
+    # cadence ~45s; below ~15s poll the shared-account rate budget (16 crypto
+    # bots + cloud fleet) starts contending again.
+    [string]$PollSecs = "30",
     # Micro-probe mode (go-live phase 1): 1/5-size ladders on ~10 markets,
     # ~$200 collateral. Run one full PAID period this way and reconcile
     # Kalshi's actual credits against the estimator before scaling up.
