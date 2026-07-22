@@ -374,9 +374,13 @@ ALLOW_SERIES_SUFFIXES = tuple(
 #     KXEARNINGSMENTIONUAL (United). Same low-adverse-selection structure as the
 #     other MENTIONs — nothing knowable before the call — and the midnight-ET
 #     ticker-date cutoff keeps the bot out on report day (user decision 2026-07-15).
+# KXTEMP removed (Jack 2026-07-21 evening): temp events retired from the
+# universe after the 01:45Z hour-21 cutoff — re-add "KXTEMP" here (or via
+# IMM_ALLOW_PREFIXES) to resume; the KXTEMP SeriesOverride tuning below is
+# kept intact for that day.
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
-        "IMM_ALLOW_PREFIXES", "KXTEMP,KXEARNINGSMENTION,KXAQICITY").split(",") if p)
+        "IMM_ALLOW_PREFIXES", "KXEARNINGSMENTION,KXAQICITY").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
     "KXCHINAUNBANBTC,KXETHMINY,KXETHMAXY,KXBTCMINY,KXBTCMAXY,KXSOLMINY,KXSOLMAXY,"
     "KXDOGEMINY,KXDOGEMAXY,KXXRPMINY,KXXRPMAXY,KXCRYPTORETURNY,KXBTCRESERVE,"
