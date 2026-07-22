@@ -374,13 +374,12 @@ ALLOW_SERIES_SUFFIXES = tuple(
 #     KXEARNINGSMENTIONUAL (United). Same low-adverse-selection structure as the
 #     other MENTIONs — nothing knowable before the call — and the midnight-ET
 #     ticker-date cutoff keeps the bot out on report day (user decision 2026-07-15).
-# KXTEMP removed (Jack 2026-07-21 evening): temp events retired from the
-# universe after the 01:45Z hour-21 cutoff — re-add "KXTEMP" here (or via
-# IMM_ALLOW_PREFIXES) to resume; the KXTEMP SeriesOverride tuning below is
-# kept intact for that day.
+# KXTEMP re-enabled (Jack 2026-07-22 morning; was retired 7/21 evening after
+# the adverse-selection post-mortem — see analysis: -6c/contract uniform).
+# The 7/21 SeriesOverride tuning (5/2/2, cap 50, 5-90c, close-15min) applies.
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
-        "IMM_ALLOW_PREFIXES", "KXEARNINGSMENTION,KXAQICITY").split(",") if p)
+        "IMM_ALLOW_PREFIXES", "KXTEMP,KXEARNINGSMENTION,KXAQICITY").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
     "KXCHINAUNBANBTC,KXETHMINY,KXETHMAXY,KXBTCMINY,KXBTCMAXY,KXSOLMINY,KXSOLMAXY,"
     "KXDOGEMINY,KXDOGEMAXY,KXXRPMINY,KXXRPMAXY,KXCRYPTORETURNY,KXBTCRESERVE,"
@@ -518,6 +517,11 @@ for _pair in os.environ.get(
         "IMM_EVENT_START_OVERRIDE",
         "KXEARNINGSMENTIONNFLX-26JUL02=2026-07-16T16:40:00-04:00"      # NFLX call 4:40pm ET
         ";KXEARNINGSMENTIONUAL-26JUL16=2026-07-16T10:30:00-04:00"      # UAL call 10:30am ET
+        # Jul 22 calls (looked up 2026-07-22; GEV omitted — its 7:30am ET call
+        # already passed, midnight fallback correctly keeps it dead):
+        ";KXEARNINGSMENTIONTSLA-26JUL22=2026-07-22T17:30:00-04:00"     # TSLA call 5:30pm ET
+        ";KXEARNINGSMENTIONGOOGL-26JUL22=2026-07-22T16:30:00-04:00"    # GOOGL call 4:30pm ET
+        ";KXEARNINGSMENTIONALK-26JUL22=2026-07-22T11:30:00-04:00"      # ALK call 11:30am ET
         ).split(";"):
     if "=" in _pair:
         _ev, _iso = _pair.split("=", 1)
