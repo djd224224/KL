@@ -529,6 +529,56 @@ for _pair in os.environ.get(
         if _dt is not None:
             EVENT_START_OVERRIDES[_ev.strip()] = _dt
 
+# File-based event-start overrides, written by imm_earnings_overrides.py (the
+# daily call-time task) and hand-edits: {event_ticker: ISO8601}. Merged into
+# EVENT_START_OVERRIDES at each universe refresh, hot-reloaded by mtime so a
+# daytime write needs NO bot restart. Precedence: explicit env/code entries
+# win; file entries may be updated/removed by later file writes.
+EVENT_OVERRIDES_FILE = os.path.join(STATUS_DIR, "event_start_overrides.json")
+_file_override_state = {"mtime": 0.0, "keys": set()}
+
+
+def load_file_event_overrides() -> int:
+    """Merge the overrides file into EVENT_START_OVERRIDES. Returns the
+    number of entries added/changed; 0 when the file is unchanged/absent."""
+    try:
+        mtime = os.path.getmtime(EVENT_OVERRIDES_FILE)
+    except OSError:
+        return 0
+    if mtime == _file_override_state["mtime"]:
+        return 0
+    _file_override_state["mtime"] = mtime
+    changed = 0
+    try:
+        with open(EVENT_OVERRIDES_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! event overrides file unreadable: {e}")
+        return 0
+    file_keys = set()
+    for ev, iso in data.items():
+        ev = str(ev).strip()
+        dt_ = parse_iso_utc(str(iso).strip())
+        if not ev or dt_ is None:
+            log(f"[IMM] ! bad override entry ignored: {ev}={iso}")
+            continue
+        file_keys.add(ev)
+        owned_by_env = (ev in EVENT_START_OVERRIDES
+                        and ev not in _file_override_state["keys"])
+        if owned_by_env:
+            continue                      # env/code entry wins
+        if EVENT_START_OVERRIDES.get(ev) != dt_:
+            EVENT_START_OVERRIDES[ev] = dt_
+            changed += 1
+    for ev in _file_override_state["keys"] - file_keys:
+        EVENT_START_OVERRIDES.pop(ev, None)   # removed from file -> forget
+        changed += 1
+    _file_override_state["keys"] = file_keys
+    if changed:
+        log(f"[IMM] event-start overrides file: {changed} entr(y/ies) merged")
+    return changed
+
+
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
 _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 
@@ -1741,6 +1791,9 @@ class IncentiveMarketMaker:
 
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
         now_ts = now_utc.timestamp()
+        # Pick up call-time overrides written since the last refresh (daily
+        # earnings task / hand edits) — cheap mtime check, no restart needed.
+        load_file_event_overrides()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
         # refresh reliably fires before Kalshi publishes now that keep-alive

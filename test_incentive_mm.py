@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for incentive_mm.py — run: python -m unittest test_incentive_mm"""
 
+import json
 import os
 import tempfile
 import time
@@ -1062,6 +1063,100 @@ class TestMentionWindowPolicy(unittest.TestCase):
         cutoff = bot.state.selected[t].cutoff
         self.assertIsNotNone(cutoff)
         self.assertGreater(cutoff, now)   # quoting NOW, not killed by ticker date
+
+
+class TestEarningsCallTimeParse(unittest.TestCase):
+    """parse_call_time against the real IR phrasings that motivated the tool
+    (Alphabet / Tesla / Alaska, Jul 2026)."""
+
+    def _parse(self, text):
+        import imm_earnings_overrides as ieo
+        return ieo.parse_call_time(text)
+
+    def test_alphabet_phrasing(self):
+        hit = self._parse(
+            "Alphabet Inc. will hold its quarterly conference call to discuss "
+            "second quarter 2026 financial results on Wednesday, July 22, at "
+            "1:30pm Pacific Time (4:30pm Eastern Time).")
+        self.assertIsNotNone(hit)
+        dt_et, _ = hit
+        self.assertEqual((dt_et.month, dt_et.day, dt_et.hour, dt_et.minute),
+                         (7, 22, 16, 30))
+
+    def test_tesla_phrasing_skips_central(self):
+        hit = self._parse(
+            "Tesla will host a live question and answer webcast at 4:30 p.m. "
+            "Central Time / 5:30 p.m. Eastern Time on Wednesday, July 22, 2026 "
+            "to discuss the results.")
+        self.assertIsNotNone(hit)
+        dt_et, _ = hit
+        self.assertEqual((dt_et.day, dt_et.hour, dt_et.minute), (22, 17, 30))
+
+    def test_alaska_phrasing(self):
+        hit = self._parse(
+            "Alaska Air Group will hold its quarterly conference call July 22, "
+            "2026 to review second-quarter financial results at 11:30 a.m. EDT "
+            "/ 8:30 a.m. PDT.")
+        self.assertIsNotNone(hit)
+        dt_et, _ = hit
+        self.assertEqual((dt_et.day, dt_et.hour, dt_et.minute), (22, 11, 30))
+
+    def test_no_false_positive_without_call_context(self):
+        self.assertIsNone(self._parse(
+            "The company estimated revenue of $4.30 per share for July 22."))
+
+
+class TestFileEventOverrides(unittest.TestCase):
+    """Hot-reloaded call-time overrides file (imm_earnings_overrides.py)."""
+
+    def setUp(self):
+        self.old_path = imm.EVENT_OVERRIDES_FILE
+        self.tmp = os.path.join(os.path.dirname(imm.EVENT_OVERRIDES_FILE),
+                                "test_event_overrides.json")
+        imm.EVENT_OVERRIDES_FILE = self.tmp
+        imm._file_override_state["mtime"] = 0.0
+        imm._file_override_state["keys"] = set()
+        self.snapshot = dict(imm.EVENT_START_OVERRIDES)
+
+    def tearDown(self):
+        imm.EVENT_OVERRIDES_FILE = self.old_path
+        imm._file_override_state["mtime"] = 0.0
+        imm._file_override_state["keys"] = set()
+        imm.EVENT_START_OVERRIDES.clear()
+        imm.EVENT_START_OVERRIDES.update(self.snapshot)
+        try:
+            os.remove(self.tmp)
+        except FileNotFoundError:
+            pass
+
+    def _write(self, data):
+        with open(self.tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.utime(self.tmp, (time.time(), time.time() + len(json.dumps(data))))
+
+    def test_merge_update_and_remove(self):
+        self._write({"KXEARNINGSMENTIONFOO-26AUG01": "2026-08-01T16:30:00-04:00"})
+        self.assertEqual(imm.load_file_event_overrides(), 1)
+        self.assertIn("KXEARNINGSMENTIONFOO-26AUG01", imm.EVENT_START_OVERRIDES)
+        # unchanged file -> no work
+        self.assertEqual(imm.load_file_event_overrides(), 0)
+        # update wins over previous FILE value
+        self._write({"KXEARNINGSMENTIONFOO-26AUG01": "2026-08-01T17:00:00-04:00"})
+        self.assertEqual(imm.load_file_event_overrides(), 1)
+        et = imm.EVENT_START_OVERRIDES["KXEARNINGSMENTIONFOO-26AUG01"].astimezone(imm.ET)
+        self.assertEqual(et.hour, 17)
+        # removal from file -> forgotten
+        self._write({})
+        imm.load_file_event_overrides()
+        self.assertNotIn("KXEARNINGSMENTIONFOO-26AUG01", imm.EVENT_START_OVERRIDES)
+
+    def test_env_code_entry_wins(self):
+        ev = "KXEARNINGSMENTIONBAR-26AUG02"
+        code_dt = imm.parse_iso_utc("2026-08-02T10:00:00-04:00")
+        imm.EVENT_START_OVERRIDES[ev] = code_dt
+        self._write({ev: "2026-08-02T23:00:00-04:00"})
+        imm.load_file_event_overrides()
+        self.assertEqual(imm.EVENT_START_OVERRIDES[ev], code_dt)   # untouched
 
 
 class TestTempSeriesTuning(unittest.TestCase):
