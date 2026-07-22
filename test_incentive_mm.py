@@ -540,6 +540,17 @@ class TestAllowlist(unittest.TestCase):
         self.assertFalse(a("KXBNBMAXMON-BNB-26JUL31-64000"))
         self.assertFalse(a("KXHYPEMINMON-HYPE-26JUL31-5250"))
 
+    def test_company_metric_series(self):
+        a = IncentiveMarketMaker._allowed
+        self.assertTrue(a("KXBA-26JULDELIV-130"))
+        self.assertTrue(a("KXHOOD-26JULFUNDED-28300000"))
+        self.assertTrue(a("KXCOINBASE-26JULVOL-240000000000"))
+        self.assertTrue(a("KXWINGA-27FEBREST-3400"))
+        # lookalike consumer-price / non-ticker series stay excluded
+        self.assertFalse(a("KXSBUXSAR-26AUG02-T5.09"))
+        self.assertFalse(a("KXCHIPBURRITO-26AUG02-T9.77"))
+        self.assertFalse(a("KXMUSKNW-26JUL31-T950"))
+
     def test_substring_trap_rejected(self):
         # 'HEGSETH' contains 'ETH' — exact series matching must reject it
         self.assertFalse(IncentiveMarketMaker._allowed("KXHEGSETHOUT-26APR-SEP01"))

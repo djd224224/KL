@@ -389,8 +389,22 @@ _DEFAULT_CRYPTO_SERIES = (
     # series stay excluded (crypto fleet's book; crossing trips same-account
     # STP and cancels its orders).
     "KXBNBMINY,KXBNBMAXY,KXHYPEMINY,KXHYPEMAXY,KXZECMINY,KXZECMAXY")
+# Company operating-metric series (Jack 2026-07-22): KX<stock ticker> with a
+# <YY><MON><METRIC> event segment (KXBA-26JULDELIV = Boeing July deliveries,
+# KXHOOD-26JULFUNDED = Robinhood funded accounts, ...). Exact series only —
+# lookalike consumer-price series (KXSBUXSAR, KXCHIPBURRITO) stay excluded.
+# A-suffixed entries are the longer-horizon variants of the same metric.
+# Month-granular ticker dates don't parse -> no midnight rule; cutoff comes
+# from Kalshi's occurrence_datetime when meaningful, else these quote
+# continuously like the crypto structural series.
+_DEFAULT_COMPANY_SERIES = (
+    "KXBA,KXPM,KXHOOD,KXHOODA,KXWING,KXWINGA,KXMETA,KXRDDT,KXINTC,KXGOOG,"
+    "KXSCHW,KXCMG,KXAMZN,KXCOINBASE,KXCVNA,KXDPZ,KXFSLR,KXFSLRA,KXLUV,"
+    "KXNCLH,KXRBLX,KXSBUX,KXTLN,KXTLNA,KXWH,KXYOU,KXRACE")
 ALLOW_SERIES = frozenset(
-    s for s in os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES).split(",") if s)
+    s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
+                + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
+                ).split(",") if s)
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
 # cutoff forfeits game-day daytime, but programs run ~1-2 days INCLUDING game
