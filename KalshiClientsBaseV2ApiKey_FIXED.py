@@ -24,6 +24,16 @@ HTTP_TIMEOUT_SECONDS = (
     float(os.environ.get("KALSHI_HTTP_READ_TIMEOUT", 20)),
 )
 
+# Retry policy for GETs only. Reads (orders/positions/markets/fills) are
+# idempotent, so reissuing one is always safe — while a single transient
+# connection reset surfacing to the caller can kill an entire scheduled
+# trading run. POST/DELETE stay single-shot in this client: a dropped
+# response leaves it unknown whether the order/cancel actually landed, and
+# blind resends could double-place.
+GET_RETRY_ATTEMPTS = max(1, int(os.environ.get("KALSHI_GET_RETRY_ATTEMPTS", "3")))
+GET_RETRY_BACKOFF_SECONDS = (1.0, 3.0)   # sleep before 2nd, 3rd attempt
+GET_RETRYABLE_STATUSES = (429, 502, 503, 504)
+
 
 class KalshiClient:
     """A simple client that allows utils to call authenticated Kalshi API endpoints."""
@@ -46,10 +56,11 @@ class KalshiClient:
         # Opt-in HTTP keep-alive (KALSHI_HTTP_KEEPALIVE=1): reuse one pooled
         # TLS connection instead of paying a fresh ~1s handshake on EVERY call
         # (measured 2026-07-19: ~1070ms/call cold vs ~30ms pooled). Default OFF
-        # so existing bots are untouched until each opts in. Retries are
-        # CONNECT-ONLY: a connect failure means the request never reached
-        # Kalshi, so a retry cannot double-place an order; read/status errors
-        # still surface to the caller unchanged.
+        # so existing bots are untouched until each opts in. Session-level
+        # retries are CONNECT-ONLY: a connect failure means the request never
+        # reached Kalshi, so a retry cannot double-place an order. (Transient
+        # failures on GETs are additionally retried in get() itself, session
+        # or not; POST/DELETE errors surface to the caller unchanged.)
         self._session = None
         if os.environ.get("KALSHI_HTTP_KEEPALIVE", "0") == "1":
             try:
@@ -93,15 +104,33 @@ class KalshiClient:
 
     def get(self, path: str, params: Dict[str, Any] = {}) -> Any:
         """GETs from an authenticated Kalshi HTTP endpoint.
-        Returns the response body. Raises an HttpError on non-2XX results."""
-        self.rate_limit()
-
-        response = self._http().get(
-            self.host + path, headers=self.request_headers("GET", path), params=params,
-            timeout=HTTP_TIMEOUT_SECONDS,
-        )
-        self.raise_if_bad_response(response)
-        return response.json()
+        Returns the response body. Raises an HttpError on non-2XX results.
+        Transient failures (connection reset/timeout, 429/5xx) are retried up
+        to GET_RETRY_ATTEMPTS times — safe because GETs are idempotent."""
+        last_error = None
+        for attempt in range(GET_RETRY_ATTEMPTS):
+            if attempt:
+                time.sleep(GET_RETRY_BACKOFF_SECONDS[
+                    min(attempt - 1, len(GET_RETRY_BACKOFF_SECONDS) - 1)])
+            self.rate_limit()
+            try:
+                # Headers rebuilt on every attempt: the auth signature embeds
+                # a timestamp Kalshi rejects once it drifts stale.
+                response = self._http().get(
+                    self.host + path, headers=self.request_headers("GET", path), params=params,
+                    timeout=HTTP_TIMEOUT_SECONDS,
+                )
+                self.raise_if_bad_response(response)
+                return response.json()
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as err:
+                last_error = err
+            except HttpError as err:
+                if err.status not in GET_RETRYABLE_STATUSES:
+                    raise
+                last_error = err
+        raise last_error
 
     def delete(self, path: str, params: Dict[str, Any] = {}) -> Any:
         """Posts from an authenticated Kalshi HTTP endpoint.
