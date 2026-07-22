@@ -1,7 +1,7 @@
 # KXLOW Low-Temperature Trading Bot — Handoff
 
 **Script:** `low_temp_trading.py` · **Workflow:** `.github/workflows/run_low_temp_trading.yml`
-**Status:** built 2026-07-20, adapted from `high_temp_trading.py` (KXHIGH bot). Not yet scheduled.
+**Status:** built 2026-07-20, adapted from `high_temp_trading.py` (KXHIGH bot). LIVE since 2026-07-22 on GH Actions native cron (see Schedule).
 
 ## What it trades
 
