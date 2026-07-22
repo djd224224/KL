@@ -532,6 +532,13 @@ class TestAllowlist(unittest.TestCase):
         a = IncentiveMarketMaker._allowed
         self.assertTrue(a("KXBTCMAXY-26-T150"))
         self.assertTrue(a("KXCHINAUNBANBTC-26JUL08-30JAN01"))
+        # yearly pairs for the newer fleet assets (2026-07-22)
+        self.assertTrue(a("KXBNBMAXY-BNB-26DEC31"))
+        self.assertTrue(a("KXHYPEMINY-HYPE-26DEC31"))
+        self.assertTrue(a("KXZECMAXY-ZEC-26DEC31"))
+        # the fleet's MONTHLY series must stay excluded (same-account STP)
+        self.assertFalse(a("KXBNBMAXMON-BNB-26JUL31-64000"))
+        self.assertFalse(a("KXHYPEMINMON-HYPE-26JUL31-5250"))
 
     def test_substring_trap_rejected(self):
         # 'HEGSETH' contains 'ETH' — exact series matching must reject it
