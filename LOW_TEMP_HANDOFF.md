@@ -47,7 +47,7 @@ Windows runs.
 `LOW_STARTING_CONTRACTS=8` per rung (×2 on evening runs), `LOW_MAX_CONTRACTS=50` per
 market, ladder = 8 rungs × 2c, per-city mults all 1.0. Bump only after real KXLOW P&L.
 
-## Schedule (GH Actions native cron — LIVE since 2026-07-20)
+## Schedule (GH Actions native cron — LIVE since 2026-07-22)
 
 `schedule:` crons in the workflow file (UTC): **00:17** (~19:17 CDT evening, main),
 **03:17** (~22:17 CDT refresh), **07:17** (~02:17 CDT day-of, CT/MT/PT), **08:47**
