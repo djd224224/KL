@@ -391,16 +391,21 @@ _DEFAULT_CRYPTO_SERIES = (
     "KXBNBMINY,KXBNBMAXY,KXHYPEMINY,KXHYPEMAXY,KXZECMINY,KXZECMAXY")
 # Company operating-metric series (Jack 2026-07-22): KX<stock ticker> with a
 # <YY><MON><METRIC> event segment (KXBA-26JULDELIV = Boeing July deliveries,
-# KXHOOD-26JULFUNDED = Robinhood funded accounts, ...). Exact series only —
-# lookalike consumer-price series (KXSBUXSAR, KXCHIPBURRITO) stay excluded.
+# KXHOOD-26JULFUNDED = Robinhood funded accounts, ...), plus the branded
+# consumer-price trackers (Jack same day: KXSBUXSAR / KXCFACHICKSAND /
+# KXCHIPBURRITO etc. — menu/product prices measured on a dated observation).
 # A-suffixed entries are the longer-horizon variants of the same metric.
 # Month-granular ticker dates don't parse -> no midnight rule; cutoff comes
 # from Kalshi's occurrence_datetime when meaningful, else these quote
-# continuously like the crypto structural series.
+# continuously like the crypto structural series. Day-dated consumer-price
+# tickers (26AUG02) DO parse -> midnight-ET rule stops quoting before the
+# observation day, the safe direction.
 _DEFAULT_COMPANY_SERIES = (
     "KXBA,KXPM,KXHOOD,KXHOODA,KXWING,KXWINGA,KXMETA,KXRDDT,KXINTC,KXGOOG,"
     "KXSCHW,KXCMG,KXAMZN,KXCOINBASE,KXCVNA,KXDPZ,KXFSLR,KXFSLRA,KXLUV,"
-    "KXNCLH,KXRBLX,KXSBUX,KXTLN,KXTLNA,KXWH,KXYOU,KXRACE")
+    "KXNCLH,KXRBLX,KXSBUX,KXTLN,KXTLNA,KXWH,KXYOU,KXRACE,"
+    "KXSBUXSAR,KXCFACHICKSAND,KXPOPCHICKSAND,KXCHIPBURRITO,KXDDCOLDBREW,"
+    "KXBKNUGGETS,KXAMSAVO")
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)

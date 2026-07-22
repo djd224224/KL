@@ -546,10 +546,13 @@ class TestAllowlist(unittest.TestCase):
         self.assertTrue(a("KXHOOD-26JULFUNDED-28300000"))
         self.assertTrue(a("KXCOINBASE-26JULVOL-240000000000"))
         self.assertTrue(a("KXWINGA-27FEBREST-3400"))
-        # lookalike consumer-price / non-ticker series stay excluded
-        self.assertFalse(a("KXSBUXSAR-26AUG02-T5.09"))
-        self.assertFalse(a("KXCHIPBURRITO-26AUG02-T9.77"))
+        # consumer-price trackers included too (Jack 2026-07-22, second pass)
+        self.assertTrue(a("KXSBUXSAR-26AUG02-T5.09"))
+        self.assertTrue(a("KXCHIPBURRITO-26AUG02-T9.77"))
+        self.assertTrue(a("KXBKNUGGETS-26AUG02-T3.54"))
+        # non-ticker lookalikes still excluded
         self.assertFalse(a("KXMUSKNW-26JUL31-T950"))
+        self.assertFalse(a("KXTRUTHSOCIAL-26JUL25-T240"))
 
     def test_substring_trap_rejected(self):
         # 'HEGSETH' contains 'ETH' — exact series matching must reject it
