@@ -43,6 +43,15 @@ def main() -> int:
     res = imm.EventStartResolver()
     bot = imm.IncentiveMarketMaker(client=None, live=False)  # _allowed only
 
+    # The candidate cap is ANOTHER silent exclusion (sorted by pool $/day,
+    # truncated, no skip count): warn when the allowed universe exceeds it.
+    n_allowed = sum(1 for t in progs if bot._allowed(t))
+    if n_allowed > imm.MAX_CANDIDATE_BOOKS:
+        print(f"\n!! WARNING: {n_allowed} allowed program markets > "
+              f"MAX_CANDIDATE_BOOKS={imm.MAX_CANDIDATE_BOOKS} — the lowest-"
+              f"$/day {n_allowed - imm.MAX_CANDIDATE_BOOKS} are being "
+              f"silently truncated (bit the company-metric class 2026-07-22)")
+
     print("\nevents with programs the bot excludes (blank = no misses):")
     misses = 0
     for ev_t in sorted(by_event):

@@ -437,7 +437,14 @@ for _pair in os.environ.get(
         except ValueError:
             pass
 
-MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 250)
+# Candidate cap: the pre-meta list is sorted by raw pool $/day and truncated
+# here — a SILENT exclusion (no skip count) that also fights the pass-2
+# objective (small pools with empty books can out-yield big farmed pools).
+# 250 was already binding on 2026-07-22 and swallowed the entire new
+# company-metric class (~$19/day markets); 450 covers the allowed universe
+# with headroom. Refresh cost scales with this (book reads), fine under
+# keep-alive.
+MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 450)
 MIN_EST_DOLLARS_PER_DAY = _env_float("IMM_MIN_EST_PER_DAY", 0.50)  # ~min-payout floor (user 2026-07-14: 0.75->0.50, keep marginal strikes like LATENIGHT-VIKI in)
 # STICKY SELECTION (Jack 2026-07-21): Kalshi pays a market's daily accrual
 # only above a ~$1 minimum — deselecting a quoted market mid-life on a QUALITY
