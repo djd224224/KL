@@ -47,12 +47,16 @@ Windows runs.
 `LOW_STARTING_CONTRACTS=8` per rung (×2 on evening runs), `LOW_MAX_CONTRACTS=50` per
 market, ladder = 8 rungs × 2c, per-city mults all 1.0. Bump only after real KXLOW P&L.
 
-## Schedule (cron-job.org → GH Actions `workflow_dispatch`, like the high bot)
+## Schedule (GH Actions native cron — LIVE since 2026-07-20)
 
-Recommended UTC triggers (CDT): **00:02** (19:02 CT evening, main), **03:02** (22:02 CT
-refresh), **07:02** (02:02 CT day-of, CT/MT/PT cities), **09:02** (04:02 CT day-of,
-PT cities). Runs at other hours are safe — cities past their quote stop are skipped
-up front (a late-morning run does nothing but sweep cancels).
+`schedule:` crons in the workflow file (UTC): **00:17** (~19:17 CDT evening, main),
+**03:17** (~22:17 CDT refresh), **07:17** (~02:17 CDT day-of, CT/MT/PT), **08:47**
+(~03:47 CDT day-of, MT/PT). Native cron is fine here (unlike the high bot, which needs
+cron-job.org precision): expiries are fixed local-clock stops computed in-script, so GH
+cron drift only shortens the quoting window, and runs firing past a city's stop skip it.
+Runs at any other hour are safe — cities past their quote stop are skipped up front (a
+late-morning run does nothing but sweep cancels). Note GH pauses scheduled workflows
+after 60 days without repo activity (this repo commits near-daily, so moot).
 
 ## BigQuery
 

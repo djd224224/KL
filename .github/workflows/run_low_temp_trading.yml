@@ -1,23 +1,30 @@
 name: Low temp trading
-# Triggered externally by cron-job.org hitting workflow_dispatch (same
-# pattern as "High temp trading" — GH cron drift is too sloppy for the
-# timing-sensitive slots).
+# Scheduled via GH Actions native cron (unlike "High temp trading", which
+# is fired by cron-job.org because its morning slots are timing-sensitive
+# and GH cron drifts). This bot tolerates GH cron drift by design: order
+# expiries are fixed local-clock stops computed in-script (local midnight
+# of the target day for evening runs, 02:59 local for day-of runs), so a
+# late-firing run just quotes a shorter window, and a run firing past a
+# city's stop skips that city outright (never rolls forward).
 #
-# Recommended trigger times (UTC, CDT = UTC−5):
-#   00:02 — 19:02 CT evening run     → trades TOMORROW's lows (main run)
-#   03:02 — 22:02 CT late refresh    → trades TOMORROW's lows
-#   07:02 — 02:02 CT day-of run      → trades TODAY's lows for CT/MT/PT
-#            cities (ET already past its 02:59-local quote stop; 07:02
-#            also avoids WU's ~01 CT maintenance window)
-#   09:02 — 04:02 CT day-of run      → PT cities only (their 02:59-local
-#            stop is 04:59 CT)
+# Slots (UTC; CT = UTC−5 in summer, −6 in winter). Minutes chosen
+# off-peak — :00/:02 is GH's most congested and most-drifted window.
+#   00:17 — ~19:17 CDT evening run  → trades TOMORROW's lows (main run)
+#   03:17 — ~22:17 CDT late refresh → trades TOMORROW's lows
+#   07:17 — ~02:17 CDT day-of run   → TODAY's lows, CT/MT/PT cities
+#            (ET already past its 02:59-local stop; also avoids WU's
+#            ~01 CT maintenance window)
+#   08:47 — ~03:47 CDT day-of run   → MT (briefly) + PT cities
 #
 # Run-mode boundary lives in low_temp_trading.py: runs at/after 08:00 CT
 # trade tomorrow's event; 00:00–07:59 CT runs are day-of with obs filters.
-# Orders expire at LOCAL midnight of the target day (evening runs) or
-# 02:59 local (day-of runs) — never rolled forward.
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 0 * * *'
+    - cron: '17 3 * * *'
+    - cron: '17 7 * * *'
+    - cron: '47 8 * * *'
 jobs:
   run-kalshi-script:
     runs-on: ubuntu-latest
