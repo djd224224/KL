@@ -458,6 +458,13 @@ ALLOW_SERIES = frozenset(
 # day — resolve real start times where a reliable source exists, cut off
 # EVENT_START_BUFFER_MIN before it, fall back to midnight ET.
 EVENT_START_BUFFER_MIN = _env_int("IMM_EVENT_START_BUFFER_MIN", 30)
+# Tighter buffer for FILE/CODE event-start OVERRIDES (earnings CALL times and
+# company-disclosure RELEASE times): be fully OUT — every order expired
+# exchange-side — this many minutes before the scheduled call/release. 10 min
+# (Jack 2026-07-23: "all orders expire 10min before the release, 3:50pm for
+# Intel"). Distinct from the 30-min game buffer because a hard scheduled
+# disclosure is a precise instant, not an approximate kickoff.
+OVERRIDE_BUFFER_MIN = _env_int("IMM_OVERRIDE_BUFFER_MIN", 10)
 # Series with a real schedule API. Their games can be POSTPONED past the
 # ticker date (NYDAL 7/16 -> makeup 7/20 while 18 program markets kept paying
 # $100/day each), so the cheap 24h ticker-date pre-drop must not apply — the
@@ -2078,8 +2085,14 @@ class IncentiveMarketMaker:
                 resolved = self.resolver.resolve(series, event_ticker)
                 if resolved is not None:
                     ov = series_override(series)
-                    buffer_min = (ov.start_buffer_min if ov and ov.start_buffer_min is not None
-                                  else EVENT_START_BUFFER_MIN)
+                    if event_ticker in EVENT_START_OVERRIDES:
+                        # earnings call / disclosure release: tight, precise
+                        # buffer — all orders expire OVERRIDE_BUFFER_MIN before.
+                        buffer_min = OVERRIDE_BUFFER_MIN
+                    elif ov and ov.start_buffer_min is not None:
+                        buffer_min = ov.start_buffer_min
+                    else:
+                        buffer_min = EVENT_START_BUFFER_MIN
                     cutoff = resolved - timedelta(minutes=buffer_min)
                 else:
                     cutoff = trade_cutoff_utc(

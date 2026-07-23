@@ -1139,6 +1139,44 @@ class TestMentionWindowPolicy(unittest.TestCase):
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
 
+class TestOverrideBuffer(unittest.TestCase):
+    """Earnings call / disclosure-release overrides cut off OVERRIDE_BUFFER_MIN
+    before the event (Jack: all orders expire 10 min before the release), vs
+    the 30-min game buffer; and orders are expiration-capped at that cutoff."""
+
+    def test_disclosure_release_cutoff_and_order_expiry(self):
+        _clean_persist()
+        now = datetime.now(timezone.utc)
+        release = now + timedelta(hours=3)          # e.g. today's 4pm release
+        ev = "KXINTC-26JULHEAD"
+        t = f"{ev}-82000"
+        client = FakeClient()
+        client.programs = [dict(client.programs[0], market_ticker=t)]
+        client.markets = {t: dict(client.markets["KXGOOD-99DEC31-A"], ticker=t,
+                                  event_ticker=ev)}
+        client.books = {t: {"orderbook_fp": {
+            "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+            "no_dollars": [["0.49", "1200"]]}}}
+        imm.EVENT_START_OVERRIDES[ev] = release
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 0.0
+        try:
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.run_cycle()
+            self.assertIn(t, bot.state.selected)
+            cutoff = bot.state.selected[t].cutoff
+            # cutoff = release - OVERRIDE_BUFFER_MIN (10), NOT the 30-min game buffer
+            self.assertAlmostEqual(
+                (release - cutoff).total_seconds() / 60.0,
+                imm.OVERRIDE_BUFFER_MIN, delta=0.5)
+            # every order is expiration-capped at that cutoff (exchange-side)
+            for o in bot.state.sim_orders.values():
+                self.assertLessEqual(o["expire_at"], cutoff.timestamp() + 1)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.EVENT_START_OVERRIDES.pop(ev, None)
+
+
 class TestHaltRestartContinuity(unittest.TestCase):
     """Restarts must not reset the loss clock or clear an active halt."""
 
