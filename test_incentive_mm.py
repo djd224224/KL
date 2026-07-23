@@ -1122,6 +1122,59 @@ class TestMentionWindowPolicy(unittest.TestCase):
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
 
+class TestSeriesAutoEnroll(unittest.TestCase):
+    """Daily series classifier + the bot's hot-reloaded extra-allow file."""
+
+    def _classify(self, series, sample):
+        import imm_earnings_overrides as ieo
+        return ieo.classify_series(series, sample)
+
+    def test_classifier(self):
+        self.assertEqual(self._classify("KXTVMENTION", "KXTVMENTION-26AUG01-FOO")[0],
+                         "enroll")
+        self.assertEqual(self._classify("KXLTCMAXY", "KXLTCMAXY-LTC-26DEC31")[0],
+                         "enroll")
+        self.assertEqual(self._classify("KXTSLA", "KXTSLA-26AUGDELIV-450000")[0],
+                         "enroll")
+        # fleet monthly / blocklist / ambiguous stay out
+        self.assertEqual(self._classify("KXLTCMAXMON", "KXLTCMAXMON-LTC-26JUL31")[0],
+                         "skip")
+        self.assertEqual(self._classify("KXHURCAT", "KXHURCAT-26FAUSTO-T1")[0],
+                         "review")
+        self.assertEqual(self._classify("KXJOINCLUB",
+                                        "KXJOINCLUB-26OCT02JALVAREZ-RMA")[0],
+                         "review")   # day+name tail = person/event, not a metric
+        self.assertEqual(self._classify("KXCEARAGOV", "KXCEARAGOV-26OCT04-EFRE")[0],
+                         "review")
+        self.assertEqual(self._classify("KXTEMPMIAH", "KXTEMPMIAH-26JUL2312-T88.99")[0],
+                         "review")
+
+    def test_extra_allow_file_reload_and_safety(self):
+        old_path = imm.EXTRA_ALLOW_FILE
+        tmp = os.path.join(os.path.dirname(imm.EXTRA_ALLOW_FILE),
+                           "test_extra_allow.json")
+        imm.EXTRA_ALLOW_FILE = tmp
+        imm._extra_allow_state["mtime"] = 0.0
+        snapshot = set(imm.EXTRA_ALLOW_SERIES)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"series": ["KXNEWCO", "KXBTCMAXMON", "KXHIGHNY"]}, f)
+            imm.load_extra_allow_series()
+            self.assertIn("KXNEWCO", imm.EXTRA_ALLOW_SERIES)
+            self.assertNotIn("KXBTCMAXMON", imm.EXTRA_ALLOW_SERIES)  # fleet refused
+            self.assertNotIn("KXHIGHNY", imm.EXTRA_ALLOW_SERIES)     # blocklisted
+            self.assertTrue(IncentiveMarketMaker._allowed("KXNEWCO-26AUGDELIV-5"))
+        finally:
+            imm.EXTRA_ALLOW_FILE = old_path
+            imm._extra_allow_state["mtime"] = 0.0
+            imm.EXTRA_ALLOW_SERIES.clear()
+            imm.EXTRA_ALLOW_SERIES.update(snapshot)
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+
+
 class TestEarningsCallTimeParse(unittest.TestCase):
     """parse_call_time against the real IR phrasings that motivated the tool
     (Alphabet / Tesla / Alaska, Jul 2026)."""

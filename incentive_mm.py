@@ -632,6 +632,50 @@ def load_file_event_overrides() -> int:
     return changed
 
 
+# Auto-enrolled series (written by the daily imm_earnings_overrides.py run,
+# which classifies newly-programmed series against Jack's strategy families):
+# {"series": [...]}. Hot-reloaded by mtime, merged into the allow check.
+# SAFETY: the blocklist always wins regardless, and the loader itself refuses
+# fleet monthly (*MAXMON/*MINMON) entries even if hand-added.
+EXTRA_ALLOW_FILE = os.path.join(STATUS_DIR, "extra_allow_series.json")
+EXTRA_ALLOW_SERIES: Set[str] = set()
+_extra_allow_state = {"mtime": 0.0}
+
+
+def load_extra_allow_series() -> int:
+    try:
+        mtime = os.path.getmtime(EXTRA_ALLOW_FILE)
+    except OSError:
+        return 0
+    if mtime == _extra_allow_state["mtime"]:
+        return 0
+    _extra_allow_state["mtime"] = mtime
+    try:
+        with open(EXTRA_ALLOW_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! extra allow file unreadable: {e}")
+        return 0
+    fresh: Set[str] = set()
+    for s in data.get("series") or []:
+        s = str(s).strip()
+        if not s or not s.startswith("KX"):
+            continue
+        if s.endswith("MAXMON") or s.endswith("MINMON"):
+            log(f"[IMM] ! refused fleet monthly series in extra allow: {s}")
+            continue
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
+            log(f"[IMM] ! refused blocklisted series in extra allow: {s}")
+            continue
+        fresh.add(s)
+    changed = len(fresh ^ EXTRA_ALLOW_SERIES)
+    EXTRA_ALLOW_SERIES.clear()
+    EXTRA_ALLOW_SERIES.update(fresh)
+    if changed:
+        log(f"[IMM] extra allow series: {len(fresh)} enrolled ({changed} changed)")
+    return changed
+
+
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
 _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 
@@ -1838,15 +1882,17 @@ class IncentiveMarketMaker:
         if not ALLOWLIST_ONLY:
             return True
         series = ticker.split("-")[0]
-        return series in ALLOW_SERIES or \
+        return series in ALLOW_SERIES or series in EXTRA_ALLOW_SERIES or \
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
         now_ts = now_utc.timestamp()
-        # Pick up call-time overrides written since the last refresh (daily
-        # earnings task / hand edits) — cheap mtime check, no restart needed.
+        # Pick up call-time overrides and auto-enrolled series written since
+        # the last refresh (daily task / hand edits) — cheap mtime checks,
+        # no restart needed.
         load_file_event_overrides()
+        load_extra_allow_series()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
         # refresh reliably fires before Kalshi publishes now that keep-alive

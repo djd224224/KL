@@ -50,10 +50,12 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
         if _val:
             os.environ[_v] = _val
 
+import incentive_mm as imm  # noqa: E402
 from incentive_mm import (Alerter, ET, EVENT_OVERRIDES_FILE,  # noqa: E402
-                          EVENT_START_OVERRIDES, _EARNINGS_PREFIX,
-                          build_client, load_file_event_overrides, log,
-                          parse_event_date, parse_iso_utc)
+                          EVENT_START_OVERRIDES, EXTRA_ALLOW_FILE,
+                          _EARNINGS_PREFIX, build_client,
+                          load_extra_allow_series, load_file_event_overrides,
+                          log, parse_event_date, parse_iso_utc)
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -133,6 +135,85 @@ def source_urls(client, event: str):
     return urls[:3]
 
 
+# ---- daily series auto-enrollment (Jack 2026-07-22) -------------------------
+# Classify newly-programmed series against the strategy families and enroll
+# matches into EXTRA_ALLOW_FILE (hot-reloaded by the bot). Never touches the
+# fleet's monthly crypto or anything blocklisted; leftovers go to the email
+# as a REVIEW list.
+# month must be a real month token ("26FAUSTO" is a hurricane, not a metric);
+# requires a letter metric tail directly after the month (26JULDELIV) with NO
+# day — real company metrics are month-scoped, while day+tail is the person/
+# event pattern (26OCT02JALVAREZ, a boxer — caught as a false positive in the
+# first dry run). Bare day-dated events land in the review email instead.
+COMPANY_EVENT_RE = re.compile(
+    r"^\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]{2,10}$")
+CRYPTO_YEARLY_RE = re.compile(r"^KX[A-Z0-9]{2,8}(MINY|MAXY)$")
+
+
+def classify_series(series: str, sample_ticker: str):
+    """-> ('enroll', reason) | ('review', hint) | ('skip', reason)."""
+    if series.endswith("MAXMON") or series.endswith("MINMON"):
+        return "skip", "fleet monthly crypto"
+    if any(series.startswith(p) for p in imm.SERIES_BLOCKLIST_PREFIXES):
+        return "skip", "blocklisted (cloud fleet / manual)"
+    if "MENTION" in series:
+        return "enroll", "mention family (tailed variant)"
+    if CRYPTO_YEARLY_RE.match(series):
+        return "enroll", "crypto yearly min/max"
+    if series.startswith("KXTEMP"):
+        return "review", "new temp city — needs IMM_TEMP_SERIES override"
+    parts = sample_ticker.split("-")
+    if len(parts) >= 2 and COMPANY_EVENT_RE.match(parts[1]) and len(series) <= 14:
+        return "enroll", "company/consumer metric shape"
+    return "review", "unclassified"
+
+
+def enroll_new_series(client, dry: bool):
+    """Returns (enrolled, review) lists for the email."""
+    load_extra_allow_series()
+    seen: dict = {}
+    cursor = None
+    while True:
+        params = {"status": "active", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        resp = client.get("/incentive_programs", params=params)
+        for p in resp.get("incentive_programs") or []:
+            t = p.get("market_ticker", "")
+            s = t.split("-")[0]
+            if s and s not in seen:
+                seen[s] = t
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+    enrolled, review = [], []
+    additions = []
+    for s, sample in sorted(seen.items()):
+        if imm.IncentiveMarketMaker._allowed(sample):
+            continue                      # already covered somewhere
+        verdict, why = classify_series(s, sample)
+        if verdict == "enroll":
+            additions.append(s)
+            enrolled.append((s, why, sample))
+        elif verdict == "review":
+            review.append((s, why, sample))
+    if additions and not dry:
+        try:
+            with open(EXTRA_ALLOW_FILE, encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except (OSError, ValueError):
+            data = {}
+        cur = set(data.get("series") or [])
+        cur.update(additions)
+        os.makedirs(os.path.dirname(EXTRA_ALLOW_FILE), exist_ok=True)
+        tmp = EXTRA_ALLOW_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"series": sorted(cur)}, f, indent=1)
+        os.replace(tmp, EXTRA_ALLOW_FILE)
+        log(f"enrolled {len(additions)} new series -> {EXTRA_ALLOW_FILE}")
+    return enrolled, review
+
+
 def load_file() -> dict:
     try:
         with open(EVENT_OVERRIDES_FILE, encoding="utf-8") as f:
@@ -171,6 +252,15 @@ def main(argv=None) -> int:
     client = build_client()
     load_file_event_overrides()          # bring file entries into the dict
     file_data = load_file()
+
+    # Phase 1: enroll newly-programmed series that fit the strategy families.
+    enrolled, review = enroll_new_series(client, dry=args.dry)
+    for s, why, sample in enrolled:
+        log(f"ENROLLED {s} ({why}) e.g. {sample}")
+    for s, why, sample in review:
+        log(f"review: {s} ({why}) e.g. {sample}")
+
+    # Phase 2: earnings call-time overrides.
     events = discover_events(client)
     log(f"active earnings events: {len(events)}")
 
@@ -205,8 +295,19 @@ def main(argv=None) -> int:
             write_file(file_data)
 
     # email a summary whenever there is anything actionable
-    if not args.dry and (resolved or unresolved):
+    if not args.dry and (resolved or unresolved or enrolled or review):
         lines = ["Earnings call-time override run", ""]
+        if enrolled:
+            lines.append("NEW SERIES AUTO-ENROLLED (bot hot-reloads; remove "
+                         "from extra_allow_series.json to veto):")
+            for s, why, sample in enrolled:
+                lines.append(f"  {s}  [{why}]  e.g. {sample}")
+            lines.append("")
+        if review:
+            lines.append("NEW SERIES NEEDING REVIEW (not enrolled):")
+            for s, why, sample in review:
+                lines.append(f"  {s}  [{why}]  e.g. {sample}")
+            lines.append("")
         if resolved:
             lines.append("RESOLVED (written to overrides file; bot hot-reloads):")
             for ev, iso, url, evidence in resolved:
