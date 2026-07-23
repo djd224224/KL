@@ -587,6 +587,8 @@ class TestAllowlist(unittest.TestCase):
         # GPU rental family deliberately excluded pending capacity decision
         self.assertFalse(a("KXH100MS-26JUL-2.750"))
         self.assertFalse(a("KXA100MAX-26DEC31-1.990"))
+        # Rotten Tomatoes scores (undated tickers)
+        self.assertTrue(a("KXRT-DOG-45"))
 
     def test_substring_trap_rejected(self):
         # 'HEGSETH' contains 'ETH' — exact series matching must reject it

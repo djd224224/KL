@@ -427,7 +427,11 @@ _DEFAULT_COMPANY_SERIES = (
 # same structural class but deliberately NOT included pending a capacity
 # decision — it alone would triple the candidate universe.
 _DEFAULT_ECON_SERIES = (
-    "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI")
+    "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI,"
+    # Rotten Tomatoes score markets (Jack 2026-07-23): undated tickers
+    # (KXRT-<MOVIE>-<score>) -> occurrence-based cutoff when Kalshi provides
+    # one, else continuous quoting; bands/floor gate as usual.
+    "KXRT")
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
