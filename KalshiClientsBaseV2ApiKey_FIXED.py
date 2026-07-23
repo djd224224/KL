@@ -34,6 +34,13 @@ GET_RETRY_ATTEMPTS = max(1, int(os.environ.get("KALSHI_GET_RETRY_ATTEMPTS", "3")
 GET_RETRY_BACKOFF_SECONDS = (1.0, 3.0)   # sleep before 2nd, 3rd attempt
 GET_RETRYABLE_STATUSES = (429, 502, 503, 504)
 
+# Per-process min gap between API calls (self-imposed throttle, distinct from
+# the account-wide token bucket). Default 100ms = 10 calls/s. Set
+# KALSHI_RATE_LIMIT_MS lower for a single bot that needs more throughput once
+# the account tier allows it (IMM on Advanced: 300/s write budget) — env-
+# scoped so the shared crypto fleet keeps the conservative default.
+RATE_LIMIT_MS = max(0.0, float(os.environ.get("KALSHI_RATE_LIMIT_MS", "100")))
+
 
 class KalshiClient:
     """A simple client that allows utils to call authenticated Kalshi API endpoints."""
@@ -79,13 +86,15 @@ class KalshiClient:
     some sort of rate limiting, just in case there is a bug in your 
     code. Feel free to adjust the threshold"""
     def rate_limit(self) -> None:
-        # Adjust time between each api call
-        THRESHOLD_IN_MILLISECONDS = 100
-
+        # Min gap between API calls (env-tunable, see RATE_LIMIT_MS).
+        threshold_ms = RATE_LIMIT_MS
+        if threshold_ms <= 0:
+            self.last_api_call = datetime.now()
+            return
         now = datetime.now()
-        threshold_in_microseconds = 1000 * THRESHOLD_IN_MILLISECONDS
-        threshold_in_seconds = THRESHOLD_IN_MILLISECONDS / 1000
-        if now - self.last_api_call < timedelta(microseconds=threshold_in_microseconds): 
+        threshold_in_microseconds = 1000 * threshold_ms
+        threshold_in_seconds = threshold_ms / 1000
+        if now - self.last_api_call < timedelta(microseconds=threshold_in_microseconds):
             time.sleep(threshold_in_seconds)
         self.last_api_call = datetime.now()
 
