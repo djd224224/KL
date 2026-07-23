@@ -62,6 +62,25 @@ skipped up front. Gotcha from the first TS run: TS sessions lack user-site packa
 main site-packages now has google-auth installed directly, and the launcher also passes
 PYTHONPATH inside the cmd line (the IMM launcher pattern).
 
+## Exchange pause / Kalshi maintenance window
+
+Kalshi runs a **weekly maintenance pause every Thursday 3:00–5:00 AM ET**
+([docs](https://docs.kalshi.com/getting_started/maintenance_and_pauses)) — no order
+placement/amend (cancels still work). The two day-of triggers (03:17 ET + 04:47 ET) fall
+inside it, so **on Thursdays only** both day-of runs hit `409 trading_is_paused` /
+`503 service_unavailable` across every open market (first observed 2026-07-23: 101 + 40
+alerts, 0 orders). The other six days are unaffected, and the valuable evening quoting
+(20:17 + 23:17 ET) is always clear of the window.
+
+The bot handles this gracefully (commit after 2026-07-23): a pause/unavailable error
+short-circuits that market's ladder (one `EXCHANGE_PAUSED` alert, not per-rung), and once
+≥`LOW_PAUSE_ABORT_THRESHOLD` (default 3) distinct markets pause it aborts the run — so a
+Thursday day-of run now cleanly no-ops in seconds with ~4 alerts instead of storming for
+17 min and burning the shared rate budget into a 429 cascade. A genuine 1–2 market pause
+still just skips those and quotes the rest. No schedule change needed; Thursday's lows are
+already covered by Wednesday evening's runs. (If Thursday day-of coverage is ever wanted,
+shift those two triggers off the 3–5 AM ET window.)
+
 ## BigQuery
 
 Prefix `KXLOW_`: `market_snapshot`, `orders`, `runs`, `alerts` in
