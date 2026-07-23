@@ -758,6 +758,22 @@ class TestEventStartResolver(unittest.TestCase):
         r = imm.EventStartResolver(http_get_json=lambda url: {})
         self.assertIsNone(r.resolve("KXBTCMAXY", "KXBTCMAXY-26"))
 
+    def test_override_change_is_live_not_cached(self):
+        # A hot-reloaded override CHANGE must take effect immediately, not sit
+        # behind the resolver's 6h cache (live bug 2026-07-23: INTC 5pm->4pm
+        # ignored while the bot kept quoting past the new cutoff).
+        ev = "KXEARNINGSMENTIONZZZ-26JUL23"
+        r = imm.EventStartResolver(http_get_json=lambda url: {})
+        t1 = imm.parse_iso_utc("2026-07-23T17:00:00-04:00")
+        t2 = imm.parse_iso_utc("2026-07-23T16:00:00-04:00")
+        imm.EVENT_START_OVERRIDES[ev] = t1
+        try:
+            self.assertEqual(r.resolve("KXEARNINGSMENTIONZZZ", ev), t1)
+            imm.EVENT_START_OVERRIDES[ev] = t2          # changed mid-run
+            self.assertEqual(r.resolve("KXEARNINGSMENTIONZZZ", ev), t2)
+        finally:
+            imm.EVENT_START_OVERRIDES.pop(ev, None)
+
 
 class TestPlaceWithCaps(unittest.TestCase):
     def setUp(self):

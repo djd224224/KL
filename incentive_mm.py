@@ -835,6 +835,13 @@ class EventStartResolver:
         return r.json()
 
     def resolve(self, series: str, event_ticker: str) -> Optional[datetime]:
+        # Manual/file overrides are HOT-RELOADABLE (the daily task and --set
+        # rewrite them mid-run) and cheap (dict lookup), so honor them live —
+        # never serve a stale cached value. Caching one caused a changed INTC
+        # override (5pm call -> 4pm release) to be ignored for the resolver's
+        # 6h TTL while the bot kept quoting past the new cutoff (2026-07-23).
+        if event_ticker in EVENT_START_OVERRIDES:
+            return EVENT_START_OVERRIDES[event_ticker]
         now = time.time()
         hit = self.cache.get(event_ticker)
         if hit and now < hit[0]:
