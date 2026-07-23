@@ -1416,7 +1416,9 @@ combined_table['resting_order_count'] = 0.0
 
 ######### BETTING INPUTS
 increment = 2
-starting_contracts = int(os.environ.get("LOW_STARTING_CONTRACTS", "8"))
+# Testing size (Jack 2026-07-22): 1/rung day, 2/rung evening — vs the high
+# bot's 15/30. Bump via LOW_STARTING_CONTRACTS after real KXLOW P&L.
+starting_contracts = int(os.environ.get("LOW_STARTING_CONTRACTS", "1"))
 price_count = list(range(0, 8))
 
 # Tail markets are OFF in v1 — no low-temp actual-vs-forecast error

@@ -1,30 +1,21 @@
 name: Low temp trading
-# Scheduled via GH Actions native cron (unlike "High temp trading", which
-# is fired by cron-job.org because its morning slots are timing-sensitive
-# and GH cron drifts). This bot tolerates GH cron drift by design: order
-# expiries are fixed local-clock stops computed in-script (local midnight
-# of the target day for evening runs, 02:59 local for day-of runs), so a
-# late-firing run just quotes a shorter window, and a run firing past a
-# city's stop skips that city outright (never rolls forward).
+# MANUAL BACKUP ONLY since 2026-07-22: the schedule moved to the local
+# Windows Task Scheduler task 'KL low-temp-trading' (run_low_temp.ps1;
+# laptop stays plugged in overnight). The GH cron block was removed so the
+# two schedulers can never double-run a slot — re-add `schedule:` triggers
+# here ONLY if the local task is disabled first.
 #
-# Slots (UTC; CT = UTC−5 in summer, −6 in winter). Minutes chosen
-# off-peak — :00/:02 is GH's most congested and most-drifted window.
-#   00:17 — ~19:17 CDT evening run  → trades TOMORROW's lows (main run)
-#   03:17 — ~22:17 CDT late refresh → trades TOMORROW's lows
-#   07:17 — ~02:17 CDT day-of run   → TODAY's lows, CT/MT/PT cities
-#            (ET already past its 02:59-local stop; also avoids WU's
-#            ~01 CT maintenance window)
-#   08:47 — ~03:47 CDT day-of run   → MT (briefly) + PT cities
+# Slot design (CT; implemented as ET triggers in the local task):
+#   19:17 evening run  → trades TOMORROW's lows (main run)
+#   22:17 late refresh → trades TOMORROW's lows
+#   02:17 day-of run   → TODAY's lows, CT/MT/PT cities
+#   03:47 day-of run   → MT (briefly) + PT cities
 #
 # Run-mode boundary lives in low_temp_trading.py: runs at/after 08:00 CT
 # trade tomorrow's event; 00:00–07:59 CT runs are day-of with obs filters.
+# Safe at any hour: cities past their quote stop are skipped in-script.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '17 0 * * *'
-    - cron: '17 3 * * *'
-    - cron: '17 7 * * *'
-    - cron: '47 8 * * *'
 jobs:
   run-kalshi-script:
     runs-on: ubuntu-latest
@@ -52,8 +43,9 @@ jobs:
         ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
         ALERT_EMAIL_TO: jackdu224@gmail.com  # tmomail SMS gateway dead since 2026-06-29 -> deliver to inbox (Gmail push)
         GOOGLE_APPLICATION_CREDENTIALS: google_credentials.json
-        # Probe-phase sizing — bump after the first weeks of KXLOW data.
-        LOW_STARTING_CONTRACTS: "8"
+        # Testing sizing (Jack 2026-07-22): 1/rung, x2 evenings — keep in
+        # sync with run_low_temp.ps1. Bump after real KXLOW P&L.
+        LOW_STARTING_CONTRACTS: "1"
         LOW_MAX_CONTRACTS: "50"
         # Tails stay off until a low-temp actual-vs-forecast error
         # distribution is built (cold busts are the fat tail for minima).
