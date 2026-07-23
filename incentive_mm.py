@@ -1595,6 +1595,14 @@ class IncentiveMarketMaker:
                 self.pnl.avg[str(t)] = float(a)
             self.state.reward_est_lifetime = float(data.get("reward_est_lifetime") or 0.0)
             self.state.sticky_prev = set(data.get("selected_tickers") or [])
+            # Peak-entry memory survives restarts: it's in-memory otherwise, and
+            # this bot restarts often (launcher-env changes, hang-watchdog), so
+            # every restart used to wipe the 1h peak and make borderline markets
+            # re-clear the floor from scratch for an hour. The read is already
+            # TTL-guarded, so stale entries are harmless.
+            self._est_peak = {str(t): (float(v[0]), float(v[1]))
+                              for t, v in (data.get("est_peak") or {}).items()
+                              if isinstance(v, (list, tuple)) and len(v) == 2}
             # Halt continuity (same roll-day only): a restart must NOT hand
             # the bot a fresh loss budget or clear an active halt. Use
             # --clear-halt (bot stopped) for a deliberate un-halt.
@@ -1643,7 +1651,11 @@ class IncentiveMarketMaker:
                            "halt_day_key": _halt_day_key(datetime.now(timezone.utc)),
                            "pnl_today_carry": round(self.state.pnl_today_last, 2),
                            "halted_until": self.state.halted_until,
-                           "balance_day_start": round(self.state.balance_day_start, 2)}, f)
+                           "balance_day_start": round(self.state.balance_day_start, 2),
+                           # peak-entry memory, pruned to TTL so it stays bounded
+                           "est_peak": {t: [round(v[0], 4), round(v[1], 1)]
+                                        for t, v in self._est_peak.items()
+                                        if time.time() - v[1] <= EST_PEAK_TTL_SECS}}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.

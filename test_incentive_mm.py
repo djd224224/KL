@@ -1522,6 +1522,26 @@ class TestStickySelection(unittest.TestCase):
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
+    def test_est_peak_survives_restart(self):
+        # The 1h peak-entry memory must persist so restarts (frequent) don't
+        # wipe it and force borderline markets to re-clear the floor.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot._est_peak["KXGOOD-99DEC31-A"] = (2.5, time.time())
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertIn("KXGOOD-99DEC31-A", bot2._est_peak)
+        self.assertAlmostEqual(bot2._est_peak["KXGOOD-99DEC31-A"][0], 2.5, places=3)
+        # and it actually carries a below-floor sample over the floor
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot2._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
+            bot2.run_cycle()
+            self.assertIn("KXGOOD-99DEC31-A", bot2.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
     def test_stale_peak_does_not_carry(self):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
