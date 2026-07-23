@@ -30,7 +30,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -214,6 +214,58 @@ def enroll_new_series(client, dry: bool):
     return enrolled, review
 
 
+# ---- company-disclosure release-time cutoffs (Jack 2026-07-23) --------------
+# Company operating-metric markets (headcount, DAU, funded accounts, comps...)
+# resolve on numbers disclosed in the earnings PRESS RELEASE — earlier than the
+# call, and Kalshi's occurrence_datetime does NOT reliably give it (INTC was
+# stamped Jul 25 but Intel released Jul 23; others are midnight-ET placeholders
+# hours after a real ~4pm release). So these need an explicit release-time
+# override in the SAME file the bot hot-reloads. The consumer-price trackers
+# are excluded — their menu-price observation is a fixed dated event handled by
+# the ticker/occurrence already.
+_CONSUMER_PRICE_SERIES = {
+    "KXSBUXSAR", "KXCFACHICKSAND", "KXPOPCHICKSAND", "KXCHIPBURRITO",
+    "KXDDCOLDBREW", "KXBKNUGGETS", "KXAMSAVO"}
+COMPANY_DISCLOSURE_SERIES = {
+    s for s in imm._DEFAULT_COMPANY_SERIES.split(",")
+    if s and s not in _CONSUMER_PRICE_SERIES}
+# Only surface events whose (unreliable) occurrence is within this many days,
+# so the daily email flags them a bit ahead without spamming months-out ones.
+DISCLOSURE_LEAD_DAYS = int(os.environ.get("IMM_DISCLOSURE_LEAD_DAYS", "12"))
+
+
+def discover_company_disclosure(client, now):
+    """Active company-disclosure events lacking a release override, whose
+    Kalshi occurrence is within DISCLOSURE_LEAD_DAYS. -> [(event, occ_iso)]."""
+    from datetime import timedelta
+    seen = {}
+    cursor = None
+    while True:
+        params = {"status": "active", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        resp = client.get("/incentive_programs", params=params)
+        for p in resp.get("incentive_programs") or []:
+            t = p.get("market_ticker", "")
+            if t.split("-")[0] in COMPANY_DISCLOSURE_SERIES:
+                seen.setdefault(t.rsplit("-", 1)[0], t)
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+    horizon = now + timedelta(days=DISCLOSURE_LEAD_DAYS)
+    out = []
+    for ev, sample in sorted(seen.items()):
+        if ev in EVENT_START_OVERRIDES:
+            continue
+        m = (client.get_market(sample) or {}).get("market") or {}
+        occ_iso = m.get("occurrence_datetime")
+        occ = parse_iso_utc(occ_iso or "")
+        # imminent (or undated -> surface it, cutoff source is unknown)
+        if occ is None or occ <= horizon:
+            out.append((ev, occ_iso))
+    return out
+
+
 def load_file() -> dict:
     try:
         with open(EVENT_OVERRIDES_FILE, encoding="utf-8") as f:
@@ -260,6 +312,13 @@ def main(argv=None) -> int:
     for s, why, sample in review:
         log(f"review: {s} ({why}) e.g. {sample}")
 
+    # Phase 3: company-disclosure events cut off at the earnings RELEASE, which
+    # Kalshi's occurrence doesn't reliably give -> flag imminent ones for --set.
+    now = datetime.now(timezone.utc)
+    disclosure = discover_company_disclosure(client, now)
+    for ev, occ in disclosure:
+        log(f"disclosure NEEDS RELEASE cutoff: {ev} (kalshi occ={occ})")
+
     # Phase 2: earnings call-time overrides.
     events = discover_events(client)
     log(f"active earnings events: {len(events)}")
@@ -295,8 +354,22 @@ def main(argv=None) -> int:
             write_file(file_data)
 
     # email a summary whenever there is anything actionable
-    if not args.dry and (resolved or unresolved or enrolled or review):
+    if not args.dry and (resolved or unresolved or enrolled or review or disclosure):
         lines = ["Earnings call-time override run", ""]
+        if disclosure:
+            lines.append("COMPANY-DISCLOSURE events need a RELEASE-time cutoff "
+                         "(numbers drop in the earnings PRESS RELEASE, not the "
+                         "call). Verify each company's release datetime and run "
+                         "(after-close reporters ~4pm ET, BMO ~before open):")
+            for ev, occ in disclosure:
+                d = parse_event_date(ev)
+                # placeholder date = the event's own month token if parseable,
+                # else today; user MUST verify (Kalshi occ is unreliable)
+                hint = d.strftime("%Y-%m-%d") if d else \
+                    (parse_iso_utc(occ or "") or now).strftime("%Y-%m-%d")
+                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
+                             f'"{hint}T16:00:00-04:00"   # kalshi occ={occ} VERIFY')
+            lines.append("")
         if enrolled:
             lines.append("NEW SERIES AUTO-ENROLLED (bot hot-reloads; remove "
                          "from extra_allow_series.json to veto):")
