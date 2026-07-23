@@ -419,9 +419,19 @@ _DEFAULT_COMPANY_SERIES = (
     "KXNCLH,KXRBLX,KXSBUX,KXTLN,KXTLNA,KXWH,KXYOU,KXRACE,"
     "KXSBUXSAR,KXCFACHICKSAND,KXPOPCHICKSAND,KXCHIPBURRITO,KXDDCOLDBREW,"
     "KXBKNUGGETS,KXAMSAVO")
+# Economic-data / price-index prints (Jack 2026-07-23): recurring published
+# statistics — AAA gas price (daily/weekly/monthly), new-home sales, gas CPI,
+# the Shanghai freight index. Day-dated tickers -> the midnight-ET rule stops
+# quoting before each observation/release day, the safe direction. The GPU
+# rental-price family (KXA100*/B200*/H100*/H200*/RTX5090*, ~600 mkts) is the
+# same structural class but deliberately NOT included pending a capacity
+# decision — it alone would triple the candidate universe.
+_DEFAULT_ECON_SERIES = (
+    "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI")
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
+                + "," + os.environ.get("IMM_ALLOW_ECON_SERIES", _DEFAULT_ECON_SERIES)
                 ).split(",") if s)
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
@@ -459,10 +469,10 @@ for _pair in os.environ.get(
 # here — a SILENT exclusion (no skip count) that also fights the pass-2
 # objective (small pools with empty books can out-yield big farmed pools).
 # 250 was already binding on 2026-07-22 and swallowed the entire new
-# company-metric class (~$19/day markets); 450 covers the allowed universe
-# with headroom. Refresh cost scales with this (book reads), fine under
-# keep-alive.
-MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 450)
+# company-metric class (~$19/day markets); the econ-series addition on 7/23
+# pushed the allowed universe past 450 too. 700 covers ~544 with headroom.
+# Refresh cost scales with this (book reads), fine under keep-alive.
+MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 700)
 # Payout floor is the $1/market MINIMUM PAYOUT itself, tested against the
 # bot's expected TOTAL accrual over the market's remaining quotable life
 # (est $/day x days to program end, capped by cutoff/close) — NOT a per-day

@@ -578,6 +578,16 @@ class TestAllowlist(unittest.TestCase):
         self.assertFalse(a("KXMUSKNW-26JUL31-T950"))
         self.assertFalse(a("KXTRUTHSOCIAL-26JUL25-T240"))
 
+    def test_econ_series(self):
+        a = IncentiveMarketMaker._allowed
+        for t in ("KXAAAGASD-26JUL23-4.150", "KXAAAGASW-26JUL27-4.040",
+                  "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
+                  "KXUSGASCPI-26AUG12-T320", "KXSCFI-26DEC25-T1500"):
+            self.assertTrue(a(t), t)
+        # GPU rental family deliberately excluded pending capacity decision
+        self.assertFalse(a("KXH100MS-26JUL-2.750"))
+        self.assertFalse(a("KXA100MAX-26DEC31-1.990"))
+
     def test_substring_trap_rejected(self):
         # 'HEGSETH' contains 'ETH' — exact series matching must reject it
         self.assertFalse(IncentiveMarketMaker._allowed("KXHEGSETHOUT-26APR-SEP01"))
