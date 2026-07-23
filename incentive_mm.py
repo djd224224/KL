@@ -332,7 +332,9 @@ REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
 PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 3600)
 
 DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 1200.0)  # realized+unrealized $, halts to next ET day (user raises: 50->150 7/14; ->500 7/19; ->800 7/20; ->1200 7/21)
-MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 450)
+MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 1000)  # 450->1000
+#   (Jack 2026-07-23: the 40-event/company-era book wants ~800 orders; 450
+#   was crowding out the selection tail)
 MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-reward markets
 BENCH_COOLDOWN_SECS = _env_int("IMM_BENCH_COOLDOWN", 4 * 3600)
@@ -1633,6 +1635,7 @@ class IncentiveMarketMaker:
     # ---- exchange wrappers (writes gated on self.live) ----------------------
 
     def place_order(self, q: Quote, now_ts: float) -> bool:
+        self._heartbeat = time.time()      # see cancel_order heartbeat note
         client_order_id = f"{CLIENT_ORDER_PREFIX}-{RUN_ID}-{uuid.uuid4().hex[:12]}"
         expiration_ts = int(time.time() + ORDER_TTL_SECS)   # stamped per-send
         # Never let an order outlive the market's event-start cutoff: the
@@ -1698,6 +1701,9 @@ class IncentiveMarketMaker:
             return False
 
     def cancel_order(self, order_id: str) -> bool:
+        # Heartbeat per order: a 1000-order sweep/wave legitimately outlasts
+        # the hang-watchdog window; a WEDGED call still freezes these touches.
+        self._heartbeat = time.time()
         if not self.live:
             self.state.sim_orders.pop(order_id, None)
             self.state.order_ages.pop(order_id, None)
