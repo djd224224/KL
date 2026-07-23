@@ -308,7 +308,10 @@ PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 95)   # never quote above (ask
 MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 1)            # skip markets with mid outside
 MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 95)
 MAX_JOIN_SPREAD_CENTS = _env_int("IMM_MAX_JOIN_SPREAD", 25)
-MIN_VOLUME_CONTRACTS = _env_float("IMM_MIN_VOLUME", 25)   # lifetime volume: some price discovery
+# Volume screen REMOVED (Jack 2026-07-22): a book with no volume can't fill
+# you — resting there is incentive rent with ~zero P&L risk, which is the
+# whole point. Set IMM_MIN_VOLUME > 0 to restore the old anti-junk screen.
+MIN_VOLUME_CONTRACTS = _env_float("IMM_MIN_VOLUME", 0)
 MIN_HOURS_TO_CLOSE = _env_float("IMM_MIN_HOURS_TO_CLOSE", 1.0)
 
 MID_MOVE_BREAKER_CENTS = _env_int("IMM_MID_MOVE_BREAKER", 15)
@@ -450,7 +453,26 @@ for _pair in os.environ.get(
 # with headroom. Refresh cost scales with this (book reads), fine under
 # keep-alive.
 MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 450)
-MIN_EST_DOLLARS_PER_DAY = _env_float("IMM_MIN_EST_PER_DAY", 0.50)  # ~min-payout floor (user 2026-07-14: 0.75->0.50, keep marginal strikes like LATENIGHT-VIKI in)
+# Payout floor is the $1/market MINIMUM PAYOUT itself, tested against the
+# bot's expected TOTAL accrual over the market's remaining quotable life
+# (est $/day x days to program end, capped by cutoff/close) — NOT a per-day
+# rate (Jack 2026-07-22): a $0.40/day estimate on a 5-day program clears the
+# $1 minimum comfortably; the old per-day floor only existed to catch 1-2-day
+# programs that couldn't. Margin above $1 via the env knob if wanted.
+MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.0)
+
+
+def _quotable_days(meta, now_utc: datetime) -> float:
+    """Remaining accrual window in days: to the program end, capped by the
+    market's cutoff/close — quoting (and thus accrual) stops at whichever
+    comes first."""
+    end = meta.program_end
+    for cap in (meta.cutoff, meta.close_time):
+        if cap is not None and (end is None or cap < end):
+            end = cap
+    if end is None:
+        return 1.0          # undated: fall back to one day of rate
+    return max((end - now_utc).total_seconds() / 86400.0, 0.0)
 # STICKY SELECTION (Jack 2026-07-21): Kalshi pays a market's daily accrual
 # only above a ~$1 minimum — deselecting a quoted market mid-life on a QUALITY
 # screen (pinned book, spread jitter, estimator churn) strands that accrual
@@ -2000,7 +2022,8 @@ class IncentiveMarketMaker:
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
-            elif meta.est_dollars_per_day < MIN_EST_DOLLARS_PER_DAY:
+            elif meta.est_dollars_per_day * _quotable_days(meta, now_utc) \
+                    < MIN_EST_TOTAL_DOLLARS:
                 skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
             else:
                 ranked.append(meta)
@@ -2276,7 +2299,7 @@ class IncentiveMarketMaker:
             return "wide"
         if not (MID_BAND_LO <= meta.mid_cents <= MID_BAND_HI):
             return "extreme_mid"
-        if meta.volume < MIN_VOLUME_CONTRACTS:
+        if MIN_VOLUME_CONTRACTS > 0 and meta.volume < MIN_VOLUME_CONTRACTS:
             # Fresh listings get a pass: mention markets list the day before
             # the game with zero volume, and that pre-event window is exactly
             # the rent we're here for. The anti-junk intent of the volume

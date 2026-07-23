@@ -492,8 +492,32 @@ class TestScreen(unittest.TestCase):
         self.assertIsNone(self.bot._screen(
             _meta(mid_cents=float(imm.MID_BAND_LO)), self.now))
 
-    def test_no_volume(self):
-        self.assertEqual(self.bot._screen(_meta(volume=1.0), self.now), "no_volume")
+    def test_no_volume_screen_removed_by_default(self):
+        # Jack 2026-07-22: dead books can't fill you — rewards without P&L
+        # risk. Screen inert at the default (IMM_MIN_VOLUME=0)...
+        self.assertIsNone(self.bot._screen(_meta(volume=0.0), self.now))
+        # ...but the env knob restores it.
+        old = imm.MIN_VOLUME_CONTRACTS
+        imm.MIN_VOLUME_CONTRACTS = 25
+        try:
+            self.assertEqual(self.bot._screen(_meta(volume=1.0), self.now),
+                             "no_volume")
+        finally:
+            imm.MIN_VOLUME_CONTRACTS = old
+
+    def test_payout_floor_is_total_accrual(self):
+        # $0.40/day on a 5-day program clears the $1 minimum; the same rate
+        # on a 1-day program does not (the old per-day floor got this wrong
+        # in both directions).
+        now = datetime.now(timezone.utc)
+        long_meta = _meta(program_end=now + timedelta(days=5))
+        short_meta = _meta(program_end=now + timedelta(days=1))
+        self.assertGreaterEqual(0.40 * imm._quotable_days(long_meta, now), 1.0)
+        self.assertLess(0.40 * imm._quotable_days(short_meta, now), 1.0)
+        # cutoff caps the window even when the program runs longer
+        capped = _meta(program_end=now + timedelta(days=5),
+                       cutoff=now + timedelta(days=1))
+        self.assertLess(imm._quotable_days(capped, now), 1.01)
 
     def test_breaker(self):
         self.bot.state.breaker_until["KXFOO-99DEC31-X"] = time.time() + 100
@@ -1044,9 +1068,16 @@ class TestMentionWindowPolicy(unittest.TestCase):
                 "competitions": [{"competitors": [
                     {"team": {"abbreviation": "ARG"}},
                     {"team": {"abbreviation": "SUI"}}]}]}]})
-        bot.run_cycle()
-        self.assertIn(t, bot.state.selected)
-        self.assertTrue(bot.state.sim_orders)
+        # subject under test is the CUTOFF wiring; the fixture pool is tiny and
+        # would legitimately fall below the $1 total-accrual floor in a 3h window
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 0.0
+        try:
+            bot.run_cycle()
+            self.assertIn(t, bot.state.selected)
+            self.assertTrue(bot.state.sim_orders)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
     def test_postponed_game_quotable_until_makeup(self):
         """A WNBA game postponed past its ticker date (NYDAL 7/16 -> makeup
@@ -1078,12 +1109,17 @@ class TestMentionWindowPolicy(unittest.TestCase):
                  "competitions": [{"competitors": [
                      {"team": {"abbreviation": "DAL"}},
                      {"team": {"abbreviation": "NY"}}]}]}]})
-        bot.run_cycle()
-        self.assertIn(t, bot.state.selected)
-        self.assertTrue(bot.state.sim_orders)
-        cutoff = bot.state.selected[t].cutoff
-        self.assertIsNotNone(cutoff)
-        self.assertGreater(cutoff, now)   # quoting NOW, not killed by ticker date
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 0.0   # cutoff wiring is the subject here
+        try:
+            bot.run_cycle()
+            self.assertIn(t, bot.state.selected)
+            self.assertTrue(bot.state.sim_orders)
+            cutoff = bot.state.selected[t].cutoff
+            self.assertIsNotNone(cutoff)
+            self.assertGreater(cutoff, now)   # quoting NOW, not killed by ticker date
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
 
 class TestEarningsCallTimeParse(unittest.TestCase):
@@ -1150,10 +1186,15 @@ class TestFileEventOverrides(unittest.TestCase):
         except FileNotFoundError:
             pass
 
+    _mtime_seq = 0
+
     def _write(self, data):
         with open(self.tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
-        os.utime(self.tmp, (time.time(), time.time() + len(json.dumps(data))))
+        # Windows time.time() ticks ~15.6ms — consecutive writes in one tick
+        # got identical mtimes and read as "unchanged". Force distinct mtimes.
+        TestFileEventOverrides._mtime_seq += 60
+        os.utime(self.tmp, (time.time(), 1_700_000_000 + self._mtime_seq))
 
     def test_merge_update_and_remove(self):
         self._write({"KXEARNINGSMENTIONFOO-26AUG01": "2026-08-01T16:30:00-04:00"})
@@ -1289,14 +1330,14 @@ class TestStickySelection(unittest.TestCase):
         # Live bug 2026-07-21 (CHIH-2109-T75.99): a market passing the quality
         # screens cleanly still fell to the pass-2 payout floor / budget race.
         bot = self._quoting_bot()
-        old_floor = imm.MIN_EST_DOLLARS_PER_DAY
-        imm.MIN_EST_DOLLARS_PER_DAY = 1e9        # everything is below floor now
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9        # everything is below floor now
         try:
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertIn(self.T, bot.state.selected)
         finally:
-            imm.MIN_EST_DOLLARS_PER_DAY = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
     def test_budget_race_does_not_drop_quoted_market(self):
         bot = self._quoting_bot()
@@ -1316,14 +1357,14 @@ class TestStickySelection(unittest.TestCase):
         bot._save_persist()
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertIn(self.T, bot2.state.sticky_prev)
-        old_floor = imm.MIN_EST_DOLLARS_PER_DAY
-        imm.MIN_EST_DOLLARS_PER_DAY = 1e9        # would exclude it as a NEW pick
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9        # would exclude it as a NEW pick
         try:
             bot2.run_cycle()
             self.assertIn(self.T, bot2.state.selected)     # retained via persist
             self.assertEqual(bot2.state.sticky_prev, set())  # consumed
         finally:
-            imm.MIN_EST_DOLLARS_PER_DAY = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
 
 class TestOrderJournal(unittest.TestCase):
