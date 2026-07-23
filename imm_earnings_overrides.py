@@ -116,6 +116,65 @@ BMO_RE = re.compile(
 REPORT_RE = re.compile(r"report|announce|release|publish", re.I)
 
 
+# Direct earnings-date lookup by stock ticker, to OVERRIDE Kalshi's often-
+# useless settlement source (e.g. fiscal.ai, a data-aggregator homepage). The
+# Nasdaq earnings calendar gives the report date + an after-hours/pre-market
+# flag == the RELEASE timing (after-hours -> 4pm ET, pre-market -> ~7am ET).
+# (A prior Nasdaq resolver was removed for CALL times, where AMC/BMO is the
+# release not the call — but for RELEASE cutoffs that is exactly right.)
+COMPANY_TICKERS = {
+    "KXINTC": "INTC", "KXAMZN": "AMZN", "KXMETA": "META", "KXHOOD": "HOOD",
+    "KXHOODA": "HOOD", "KXGOOG": "GOOGL", "KXSCHW": "SCHW", "KXCMG": "CMG",
+    "KXCVNA": "CVNA", "KXDPZ": "DPZ", "KXSBUX": "SBUX", "KXRBLX": "RBLX",
+    "KXNCLH": "NCLH", "KXLUV": "LUV", "KXWH": "WH", "KXPM": "PM",
+    "KXRACE": "RACE", "KXTLN": "TLN", "KXTLNA": "TLN", "KXWING": "WING",
+    "KXWINGA": "WING", "KXFSLR": "FSLR", "KXFSLRA": "FSLR", "KXYOU": "YOU",
+    "KXBA": "BA", "KXRDDT": "RDDT", "KXCOINBASE": "COIN",
+}
+_nasdaq_cache: dict = {}
+
+
+def nasdaq_earnings_for_date(date_iso: str) -> dict:
+    """{ticker: time_flag} for a Nasdaq calendar date (cached per run)."""
+    if date_iso in _nasdaq_cache:
+        return _nasdaq_cache[date_iso]
+    out = {}
+    try:
+        r = requests.get(
+            f"https://api.nasdaq.com/api/calendar/earnings?date={date_iso}",
+            headers=UA, timeout=15)
+        for row in ((r.json() or {}).get("data") or {}).get("rows") or []:
+            sym = (row.get("symbol") or "").upper()
+            if sym:
+                out[sym] = row.get("time") or ""
+    except Exception as e:
+        log(f"! nasdaq fetch {date_iso} failed: {e}")
+    _nasdaq_cache[date_iso] = out
+    return out
+
+
+def nasdaq_release_datetime(ticker: str, now, days: int):
+    """Scan the Nasdaq calendar forward `days` days for `ticker`'s next
+    earnings -> (datetime_ET, label) with after-hours->4pm ET / pre-market->
+    7am ET, or None. Scans from NOW so it's robust to Kalshi's wrong
+    occurrence (INTC occ Jul 25 but the real report is Jul 23)."""
+    from datetime import timedelta
+    tkr = ticker.upper()
+    for i in range(days + 1):
+        d = (now + timedelta(days=i)).astimezone(ET).date()
+        flag = nasdaq_earnings_for_date(d.isoformat()).get(tkr)
+        if flag is None:
+            continue
+        if "after" in flag:
+            hour, label = 16, "after close (4pm ET, Nasdaq)"
+        elif "pre" in flag or "before" in flag:
+            hour, label = 7, "before open (~7am ET, Nasdaq)"
+        else:
+            hour, label = 16, "time n/a->4pm ET (Nasdaq)"
+        return ET.localize(datetime(d.year, d.month, d.day, hour, 0)), label
+    return None
+
+
 def parse_release_time(page_text: str, year: int = 2026):
     """(datetime_ET, label, evidence) for the earnings RELEASE, or None. A
     report+results context with a date, plus after-close (->4pm ET) /
@@ -379,6 +438,7 @@ def main(argv=None) -> int:
         occ = parse_iso_utc(occ_iso or "")
         yr = occ.year if occ else now.year
         found = None
+        # (a) precise IR/press page, if Kalshi's settlement source is a real one
         for url in source_urls(client, ev):
             try:
                 page = requests.get(url, headers=UA, timeout=15).text
@@ -389,6 +449,16 @@ def main(argv=None) -> int:
             if hit:
                 found = (url, *hit)
                 break
+        # (b) fall back to the Nasdaq earnings calendar by ticker (overrides a
+        # useless fiscal.ai-style settlement source with the real report date)
+        if not found:
+            ticker = COMPANY_TICKERS.get(ev.split("-")[0])
+            if ticker:
+                hit = nasdaq_release_datetime(ticker, now, DISCLOSURE_LEAD_DAYS + 3)
+                if hit:
+                    dt_et, label = hit
+                    found = (f"nasdaq:{ticker}", dt_et, label,
+                             f"Nasdaq earnings calendar ({ticker})")
         if found:
             url, dt_et, label, evidence = found
             iso = dt_et.isoformat()

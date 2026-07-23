@@ -1400,6 +1400,31 @@ class TestReleaseTimeParse(unittest.TestCase):
             "Shares closed after the market close up 3% on Tuesday."))
 
 
+class TestNasdaqRelease(unittest.TestCase):
+    """Nasdaq-calendar release resolver: after-hours->4pm ET, pre-market->7am,
+    scanning forward from now (robust to Kalshi's wrong occurrence)."""
+
+    def test_amc_and_bmo_from_calendar(self):
+        import imm_earnings_overrides as ieo
+        now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+        ieo._nasdaq_cache.clear()
+        for i in range(6):
+            di = (now + timedelta(days=i)).astimezone(ieo.ET).date().isoformat()
+            ieo._nasdaq_cache[di] = {}
+        hit_date = (now + timedelta(days=2)).astimezone(ieo.ET).date().isoformat()
+        ieo._nasdaq_cache[hit_date] = {"FOO": "time-after-hours",
+                                       "BAR": "time-pre-market"}
+        try:
+            amc = ieo.nasdaq_release_datetime("FOO", now, 5)
+            self.assertIsNotNone(amc)
+            self.assertEqual(amc[0].astimezone(ieo.ET).hour, 16)   # 4pm ET
+            bmo = ieo.nasdaq_release_datetime("BAR", now, 5)
+            self.assertEqual(bmo[0].astimezone(ieo.ET).hour, 7)    # 7am ET
+            self.assertIsNone(ieo.nasdaq_release_datetime("NOPE", now, 5))
+        finally:
+            ieo._nasdaq_cache.clear()
+
+
 class TestFileEventOverrides(unittest.TestCase):
     """Hot-reloaded call-time overrides file (imm_earnings_overrides.py)."""
 
