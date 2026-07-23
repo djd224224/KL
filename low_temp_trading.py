@@ -1492,6 +1492,41 @@ def _missing(v):
     return False
 
 
+# ====================================================================
+# Exchange-pause handling. Kalshi pauses trading during its overnight
+# maintenance/settlement window: observed 2026-07-23 ~02:17–03:47 CT, when
+# every still-open market returned 409 trading_is_paused / 503
+# service_unavailable. The bot placed 0 orders but hammered all 8 rungs of
+# every market and burned the shared rate budget into a 429 cascade (one
+# run: 25 trading_is_paused + 3 service_unavailable + 19 too_many_requests
+# = ~40–101 alerts). The SAME markets placed cleanly in the evening runs,
+# so this is purely a time-window state, not a per-market condition.
+#
+# Two responses:
+#   1. Per-market short-circuit: on a pause/unavailable error (placement OR
+#      cap-check), stop laddering THIS market immediately — the remaining
+#      rungs would all fail the same way.
+#   2. Global early-out: once EXCHANGE_PAUSE_ABORT_THRESHOLD distinct
+#      markets have paused, the whole exchange is down for the window —
+#      abort the run (the next scheduled run re-quotes once it clears). A
+#      genuine single-market pause (1–2 markets) still just skips those and
+#      continues.
+# One EXCHANGE_PAUSED alert per market replaces the per-rung storm.
+# ====================================================================
+EXCHANGE_PAUSE_ABORT_THRESHOLD = int(os.environ.get("LOW_PAUSE_ABORT_THRESHOLD", "3"))
+_PAUSED_MARKETS = set()
+
+
+def _is_pause_error(s):
+    """True if an error string is an exchange pause / unavailability, not a
+    per-order rejection. Matches the Kalshi error codes and the HttpError
+    status prefixes precisely (not a bare '409'/'503' substring, which
+    could appear in a price or ticker)."""
+    s = str(s).lower()
+    return ("trading_is_paused" in s or "service_unavailable" in s
+            or "httperror(409" in s or "httperror(503" in s)
+
+
 orders_placed = 0
 _diag_printed = False
 for index, row in combined_table.iterrows():
@@ -1501,6 +1536,17 @@ for index, row in combined_table.iterrows():
   no_offer = row['no_lowest_offer']
   no_bid = row['no_highest_bid']
   hi_no = row['hi_no_price']
+
+  # Global early-out: exchange is in its pause window (many markets down).
+  if len(_PAUSED_MARKETS) >= EXCHANGE_PAUSE_ABORT_THRESHOLD:
+    print(f"\n  ⏸ EXCHANGE PAUSED across {len(_PAUSED_MARKETS)} markets "
+          f"(≥{EXCHANGE_PAUSE_ABORT_THRESHOLD}) — aborting remaining markets; "
+          f"the next scheduled run will re-quote once trading resumes.")
+    alert("EXCHANGE_PAUSE_ABORT",
+          f"Aborted run: {len(_PAUSED_MARKETS)} markets paused "
+          f"(likely Kalshi maintenance window). {orders_placed} orders placed before abort.",
+          {"paused_markets": len(_PAUSED_MARKETS), "orders_before_abort": orders_placed})
+    break
 
   print(f"\n  {ticker} [{row['City']}] ({row['strike_kind']}):")
 
@@ -1804,6 +1850,19 @@ for index, row in combined_table.iterrows():
         _skip_cnt["position_cap"] += 1
         continue
     except Exception as _ce:
+      # If the cap-check reads fail because the exchange is paused/
+      # unavailable (the same maintenance window that blocks placement),
+      # short-circuit this market instead of failing the check 8× per
+      # market (94 CAP_CHECK_FAILED alerts in the 2026-07-23 02:17 run).
+      if _is_pause_error(str(_ce)):
+          if row['market_ticker'] not in _PAUSED_MARKETS:
+              alert("EXCHANGE_PAUSED",
+                    f"{row['market_ticker']}: cap-check reads paused/unavailable — market skipped",
+                    {"market": row['market_ticker'], "detail": str(_ce)[:160]})
+          _PAUSED_MARKETS.add(row['market_ticker'])
+          _rungs.append((i, bid_price, contracts, edge, 'SKIP', 'EXCHANGE_PAUSED (cap-check reads down)'))
+          _skip_cnt["position_cap"] += 1
+          break
       alert("CAP_CHECK_FAILED",
             f"Pre-placement cap check failed on {row['market_ticker']}; skipping rung to avoid leak",
             {"error": str(_ce)[:200], "rung_contracts": int(contracts), "rung_price": int(bid_price)})
@@ -1854,6 +1913,17 @@ for index, row in combined_table.iterrows():
       if not resp_body and repr(e) != str(e):
           resp_body = repr(e)[:300]
       _err_str = f"{e} | {resp_body}" if resp_body else str(e)
+      # Exchange pause / unavailable — stop laddering this market (every
+      # remaining rung fails identically). One alert per market, not per rung.
+      if _is_pause_error(_err_str):
+          if row['market_ticker'] not in _PAUSED_MARKETS:
+              alert("EXCHANGE_PAUSED",
+                    f"{row['market_ticker']}: trading paused/unavailable — ladder short-circuited",
+                    {"market": row['market_ticker'], "detail": _err_str[:160]})
+          _PAUSED_MARKETS.add(row['market_ticker'])
+          _rungs.append((i, bid_price, contracts, edge, '✗', 'EXCHANGE_PAUSED (ladder short-circuited)'))
+          _skip_cnt["order_failed"] += 1
+          break
       if '400' in str(e) and not _diag_printed:
           _diag_printed = True
           print(f"    [DIAG] Exception type: {type(e).__name__}, attrs: {[a for a in dir(e) if not a.startswith('_')]}")
@@ -1862,9 +1932,14 @@ for index, row in combined_table.iterrows():
       if '400' in str(e):
           _fail_tag = f'ORDER_400: {_err_str[:80]}'
       elif '429' in str(e):
-          alert("ORDER_429", f"Rate limited on {row['market_ticker']}",
+          # Rate limited — usually downstream of a pause-driven retry storm.
+          # Back off THIS market's ladder too rather than deepening it.
+          alert("ORDER_429", f"Rate limited on {row['market_ticker']} — ladder backed off",
                 {"error": _err_str[:300]})
-          _fail_tag = 'ORDER_429: rate limited'
+          _rungs.append((i, bid_price, contracts, edge, '✗', 'ORDER_429: rate limited (ladder backed off)'))
+          _skip_cnt["order_failed"] += 1
+          time.sleep(0.5)
+          break
       else:
           alert("ORDER_FAILED", f"{row['market_ticker']} @{int(bid_price)}c: {_err_str[:200]}")
           _fail_tag = f'ORDER_FAILED: {_err_str[:60]}'
@@ -1913,6 +1988,11 @@ for index, row in combined_table.iterrows():
 
 print(f"\n{'='*60}")
 print(f"TOTAL ORDERS PLACED: {orders_placed}" + (" (DRY RUN — none sent)" if DRY_RUN else ""))
+if _PAUSED_MARKETS:
+    _aborted = len(_PAUSED_MARKETS) >= EXCHANGE_PAUSE_ABORT_THRESHOLD
+    print(f"⏸ EXCHANGE PAUSE: {len(_PAUSED_MARKETS)} market(s) paused/unavailable"
+          + (" — run ABORTED (likely Kalshi maintenance window)" if _aborted
+             else " — those markets skipped, rest quoted normally"))
 print(f"{'='*60}")
 
 # Write all orders to BigQuery. Explicit schema for the same reason as
@@ -2012,6 +2092,14 @@ try:
             _lines.append(f"- {_c}: quote stop already passed")
         for _c in sorted(PRE_TRADE_SKIP_CITIES):
             _lines.append(f"- {_c}: {FORECAST_SHAPE_SKIP.get(_c, 'obs filter')}")
+    if _PAUSED_MARKETS:
+        _lines.append("")
+        _aborted = len(_PAUSED_MARKETS) >= EXCHANGE_PAUSE_ABORT_THRESHOLD
+        _lines.append(f"## Exchange pause — {len(_PAUSED_MARKETS)} market(s)"
+                      + (" (run ABORTED)" if _aborted else ""))
+        _lines.append("Likely Kalshi overnight maintenance window; the next scheduled run re-quotes.")
+        for _m in sorted(_PAUSED_MARKETS):
+            _lines.append(f"- {_m}")
     _lines.append("")
     _lines.append("## Alerts")
     if _ALERTS:
