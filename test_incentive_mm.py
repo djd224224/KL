@@ -1486,6 +1486,33 @@ class TestStickySelection(unittest.TestCase):
         finally:
             imm.COLLATERAL_BUDGET = old_budget
 
+    def test_peak_entry_carries_flapping_market_over_floor(self):
+        # A noisy estimate that cleared the floor within the last hour keeps
+        # the market entry-eligible even if THIS refresh's sample is below.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9        # today's sample is always below
+        try:
+            bot._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())  # recent peak
+            bot.run_cycle()
+            self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_stale_peak_does_not_carry(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot._est_peak["KXGOOD-99DEC31-A"] = (
+                2e9, time.time() - imm.EST_PEAK_TTL_SECS - 60)   # expired
+            bot.run_cycle()
+            self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
     def test_sticky_survives_restart(self):
         # state.selected is rebuilt live; without the persisted sticky set a
         # restart stranded every in-flight accrual (observed 2026-07-21).

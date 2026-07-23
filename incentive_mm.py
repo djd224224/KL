@@ -460,6 +460,13 @@ MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 450)
 # $1 minimum comfortably; the old per-day floor only existed to catch 1-2-day
 # programs that couldn't. Margin above $1 via the env knob if wanted.
 MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.0)
+# The floor is a hard threshold on a NOISY estimate (thin books swing the
+# share estimate ±50% between refreshes), so borderline markets could flap
+# just under $1 at every sampling instant and never enter (observed
+# 2026-07-23: 28 company markets measuring $1-2.6 in a spot check, all
+# floored at the live refreshes). Entry therefore uses the market's PEAK
+# estimate over the last hour; sticky selection holds it once in.
+EST_PEAK_TTL_SECS = _env_int("IMM_EST_PEAK_TTL", 3600)
 
 
 def _quotable_days(meta, now_utc: datetime) -> float:
@@ -1490,6 +1497,7 @@ class IncentiveMarketMaker:
         #   possibly half-connected post-sleep network (see run())
         self._reconciled = False      # one-time orphaned-own-fill cleanup pending
         self._reconcile_recheck_at = 0.0   # two-shot: second pass after sweep window
+        self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -2111,11 +2119,18 @@ class IncentiveMarketMaker:
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
-            elif meta.est_dollars_per_day * _quotable_days(meta, now_utc) \
-                    < MIN_EST_TOTAL_DOLLARS:
-                skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
             else:
-                ranked.append(meta)
+                est_total = meta.est_dollars_per_day * _quotable_days(meta, now_utc)
+                peak, pts = self._est_peak.get(meta.ticker, (0.0, 0.0))
+                if now_ts - pts > EST_PEAK_TTL_SECS:
+                    peak = 0.0
+                if est_total > peak:
+                    self._est_peak[meta.ticker] = (est_total, now_ts)
+                    peak = est_total
+                if peak < MIN_EST_TOTAL_DOLLARS:
+                    skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
+                else:
+                    ranked.append(meta)
         # Mild stickiness so estimator jitter doesn't churn the selection.
         ranked.sort(key=lambda m: -m.yield_per_contract
                     * (1.15 if m.ticker in self.state.selected else 1.0))
@@ -2187,6 +2202,8 @@ class IncentiveMarketMaker:
         # in state.selected now; the rest died a natural death and must not be
         # resurrected by later refreshes (or grow the persist unboundedly).
         self.state.sticky_prev = set()
+        self._est_peak = {t: v for t, v in self._est_peak.items()
+                          if now_ts - v[1] <= EST_PEAK_TTL_SECS}
         self.state.universe_at = now_ts
         est_total = sum(m.est_dollars_per_day for m in selected.values())
         log(f"{self.tag} universe: {self.state.programs_count} program markets -> "
