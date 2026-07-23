@@ -61,6 +61,7 @@ import os
 import re
 import signal
 import smtplib
+import threading
 import sys
 import time
 import uuid
@@ -337,6 +338,13 @@ QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-rew
 BENCH_COOLDOWN_SECS = _env_int("IMM_BENCH_COOLDOWN", 4 * 3600)
 FAILSAFE_CANCEL_AFTER = _env_int("IMM_FAILSAFE_AFTER", 4)
 WAKE_GAP_SECS = 600
+# Hang watchdog: the bot is single-threaded, so one wedged syscall = silent
+# death (observed 2026-07-23: an SSL read inside cancel_order blocked ~50 min
+# with 0 CPU — likely a socket frozen across a lid-close sleep, read timeout
+# never firing). A daemon thread hard-exits the process when no cycle
+# heartbeat lands for this long; the launcher relaunches within 30s, and the
+# per-placement journal + persisted halt/carry make a hard exit safe.
+CYCLE_HANG_EXIT_SECS = _env_int("IMM_CYCLE_HANG_EXIT", 600)
 WAKE_GRACE_SECS = 120
 BLIND_PRESERVE_CYCLES = 3
 
@@ -1498,6 +1506,7 @@ class IncentiveMarketMaker:
         self._reconciled = False      # one-time orphaned-own-fill cleanup pending
         self._reconcile_recheck_at = 0.0   # two-shot: second pass after sweep window
         self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
+        self._heartbeat = time.time()      # hang-watchdog liveness marker
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -2505,6 +2514,7 @@ class IncentiveMarketMaker:
     def run_cycle(self) -> None:
         now_utc = datetime.now(timezone.utc)
         now_ts = now_utc.timestamp()
+        self._heartbeat = now_ts
 
         if os.path.exists(HALT_FILE):
             n = self.cancel_all_bot_orders()
@@ -3284,6 +3294,18 @@ class IncentiveMarketMaker:
     def run(self, once: bool = False) -> None:
         mode = "LIVE" if self.live else "DRY RUN (no orders placed; --live to trade)"
         log(f"=== {MODEL_VERSION} run={RUN_ID} mode={mode} ===")
+        if not once:
+            def _hang_watchdog():
+                while True:
+                    time.sleep(30)
+                    wedge = time.time() - self._heartbeat
+                    if wedge > CYCLE_HANG_EXIT_SECS:
+                        log(f"{self.tag} !! no cycle heartbeat for {wedge:.0f}s "
+                            f"— wedged syscall? hard-exiting for launcher "
+                            f"relaunch (state is journaled)")
+                        os._exit(86)
+            threading.Thread(target=_hang_watchdog, daemon=True,
+                             name="hang-watchdog").start()
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side), "
             f"caps: market ±{MAX_POSITION_CONTRACTS:g}, event ±{MAX_EVENT_CONTRACTS:g}, "
             f"budget ${COLLATERAL_BUDGET:g}, "
