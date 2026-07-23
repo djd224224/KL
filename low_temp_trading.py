@@ -125,6 +125,16 @@ prod_private_key = load_private_key(
     file_path=os.environ.get("KALSHI_PRIVATE_KEY_PATH", "Lisa_Kalshi.txt")
 )
 
+# Same per-process HTTP keep-alive opt-in as incentive_mm (client commit
+# 1037903): one pooled TLS connection (~30ms/call warm) instead of a fresh
+# ~1s handshake on every call. Retries on the pooled session are
+# CONNECT-ONLY, so a retry can never double-place an order. This run makes
+# hundreds of GETs (orderbooks, per-rung cap checks), so it shortens the
+# cancel-sweep → re-quote gap materially. setdefault: an explicit
+# KALSHI_HTTP_KEEPALIVE=0 in the environment still wins. Must be set
+# BEFORE ExchangeClient is constructed (the session is built in __init__).
+os.environ.setdefault("KALSHI_HTTP_KEEPALIVE", "1")
+
 prod_api_base = "https://api.elections.kalshi.com/trade-api/v2"
 exchange_client = ExchangeClient(exchange_api_base=prod_api_base, key_id=prod_key_id, private_key=prod_private_key)
 print(exchange_client.get_exchange_status())
