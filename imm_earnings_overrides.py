@@ -101,6 +101,63 @@ def parse_call_time(page_text: str, year: int = 2026):
     return None
 
 
+# Earnings RELEASE (the press release / 8-K where a disclosed metric lands) —
+# distinct from the CALL. Usually "report ... results ... after market close"
+# (-> 4pm ET) or "before market open" (-> ~7am ET), occasionally a stated ET
+# time. This is what company-disclosure cutoffs anchor to.
+AMC_RE = re.compile(
+    r"after\s+(?:the\s+)?(?:market|markets)\s+close|"
+    r"after\s+(?:the\s+)?close\s+of\s+(?:the\s+)?markets?|"
+    r"after\s+(?:the\s+)?closing\s+bell|post[-\s]?market|after[-\s]?hours", re.I)
+BMO_RE = re.compile(
+    r"before\s+(?:the\s+)?(?:market|markets)\s+open|"
+    r"before\s+(?:the\s+)?(?:market\s+)?opens|"
+    r"before\s+(?:the\s+)?opening\s+bell|pre[-\s]?market|premarket", re.I)
+REPORT_RE = re.compile(r"report|announce|release|publish", re.I)
+
+
+def parse_release_time(page_text: str, year: int = 2026):
+    """(datetime_ET, label, evidence) for the earnings RELEASE, or None. A
+    report+results context with a date, plus after-close (->4pm ET) /
+    before-open (->7am ET) / a stated ET time not next to 'call'/'webcast'."""
+    text = re.sub(r"\s+", " ", page_text)
+    for kw in REPORT_RE.finditer(text):
+        window = text[max(0, kw.start() - 60):kw.end() + 320]
+        if not re.search(r"result|earnings|quarter|financial", window, re.I):
+            continue                              # not an earnings-report context
+        dm = DATE_RE.search(window)
+        if not dm:
+            continue
+        month = MONTHS[dm.group(1).lower()]
+        day = int(dm.group(2))
+        amc, bmo = AMC_RE.search(window), BMO_RE.search(window)
+        tm = TIME_RE.search(window)
+        near_call = bool(tm) and bool(re.search(
+            r"call|webcast", window[max(0, tm.start() - 45):tm.end() + 45], re.I))
+        if tm and not near_call:
+            hour = int(tm.group(1))
+            minute = int(tm.group(2) or 0)
+            if "p" in tm.group(3).lower() and hour != 12:
+                hour += 12
+            if "a" in tm.group(3).lower() and hour == 12:
+                hour = 0
+            label = "stated ET time"
+        elif amc:
+            hour, minute, label = 16, 0, "after close (4pm ET)"
+        elif bmo:
+            hour, minute, label = 7, 0, "before open (~7am ET)"
+        else:
+            continue
+        try:
+            dt_et = ET.localize(datetime(year, month, day, hour, minute))
+        except ValueError:
+            continue
+        span = amc or bmo or tm
+        evidence = window[max(0, span.start() - 55):span.end() + 40].strip()
+        return dt_et, label, evidence
+    return None
+
+
 def discover_events(client):
     """Active KXEARNINGSMENTION events from the incentive program feed."""
     events = set()
@@ -312,12 +369,35 @@ def main(argv=None) -> int:
     for s, why, sample in review:
         log(f"review: {s} ({why}) e.g. {sample}")
 
-    # Phase 3: company-disclosure events cut off at the earnings RELEASE, which
-    # Kalshi's occurrence doesn't reliably give -> flag imminent ones for --set.
+    # Phase 3: company-disclosure RELEASE-time cutoffs. Parity with the call
+    # check — scrape the settlement-source pages for the report date + after-
+    # close/before-open timing, write the release override, flag the rest.
     now = datetime.now(timezone.utc)
     disclosure = discover_company_disclosure(client, now)
-    for ev, occ in disclosure:
-        log(f"disclosure NEEDS RELEASE cutoff: {ev} (kalshi occ={occ})")
+    rel_resolved, rel_unresolved = [], []
+    for ev, occ_iso in disclosure:
+        occ = parse_iso_utc(occ_iso or "")
+        yr = occ.year if occ else now.year
+        found = None
+        for url in source_urls(client, ev):
+            try:
+                page = requests.get(url, headers=UA, timeout=15).text
+            except Exception as e:
+                log(f"! fetch failed {url}: {e}")
+                continue
+            hit = parse_release_time(page, year=yr)
+            if hit:
+                found = (url, *hit)
+                break
+        if found:
+            url, dt_et, label, evidence = found
+            iso = dt_et.isoformat()
+            file_data[ev] = iso
+            rel_resolved.append((ev, iso, label, url, evidence))
+            log(f"RELEASE resolved {ev} = {iso} [{label}]  [{url}]")
+        else:
+            rel_unresolved.append((ev, occ_iso))
+            log(f"RELEASE UNRESOLVED: {ev} (kalshi occ={occ_iso})")
 
     # Phase 2: earnings call-time overrides.
     events = discover_events(client)
@@ -349,24 +429,27 @@ def main(argv=None) -> int:
             unresolved.append(ev)
             log(f"UNRESOLVED: {ev}")
 
-    if not args.dry and (resolved or True):
-        if resolved:
-            write_file(file_data)
+    if not args.dry and (resolved or rel_resolved):
+        write_file(file_data)
 
     # email a summary whenever there is anything actionable
-    if not args.dry and (resolved or unresolved or enrolled or review or disclosure):
-        lines = ["Earnings call-time override run", ""]
-        if disclosure:
-            lines.append("COMPANY-DISCLOSURE events need a RELEASE-time cutoff "
-                         "(numbers drop in the earnings PRESS RELEASE, not the "
-                         "call). Verify each company's release datetime and run "
-                         "(after-close reporters ~4pm ET, BMO ~before open):")
-            for ev, occ in disclosure:
-                d = parse_event_date(ev)
-                # placeholder date = the event's own month token if parseable,
-                # else today; user MUST verify (Kalshi occ is unreliable)
-                hint = d.strftime("%Y-%m-%d") if d else \
-                    (parse_iso_utc(occ or "") or now).strftime("%Y-%m-%d")
+    if not args.dry and (resolved or unresolved or enrolled or review
+                         or rel_resolved or rel_unresolved):
+        lines = ["Earnings call + release override run", ""]
+        if rel_resolved:
+            lines.append("RELEASE cutoffs AUTO-RESOLVED (written; bot hot-reloads; "
+                         "orders expire 10min before these):")
+            for ev, iso, label, url, evidence in rel_resolved:
+                lines.append(f"  {ev} = {iso}   [{label}]")
+                lines.append(f"    source: {url}")
+                lines.append(f"    \"{evidence[:150]}\"")
+            lines.append("")
+        if rel_unresolved:
+            lines.append("RELEASE cutoffs UNRESOLVED — verify the earnings press-"
+                         "release datetime and run (after-close ~4pm ET, BMO "
+                         "~before open):")
+            for ev, occ in rel_unresolved:
+                hint = (parse_iso_utc(occ or "") or now).strftime("%Y-%m-%d")
                 lines.append(f'  python imm_earnings_overrides.py --set {ev} '
                              f'"{hint}T16:00:00-04:00"   # kalshi occ={occ} VERIFY')
             lines.append("")
@@ -404,8 +487,8 @@ def main(argv=None) -> int:
         if alerter.enabled:
             ok = alerter.send_message(
                 "\n".join(lines),
-                subject=f"IMM earnings overrides: {len(resolved)} resolved, "
-                        f"{len(unresolved)} need input")
+                subject=f"IMM overrides: calls {len(resolved)}+/{len(unresolved)}?, "
+                        f"releases {len(rel_resolved)}+/{len(rel_unresolved)}?")
             log(f"summary email: {'sent' if ok else 'FAILED'}")
         else:
             log("alert credentials not configured; summary not emailed")

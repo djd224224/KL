@@ -1359,6 +1359,47 @@ class TestEarningsCallTimeParse(unittest.TestCase):
             "The company estimated revenue of $4.30 per share for July 22."))
 
 
+class TestReleaseTimeParse(unittest.TestCase):
+    """parse_release_time — the earnings PRESS-RELEASE resolver for company-
+    disclosure cutoffs (after-close -> 4pm ET, before-open -> 7am ET)."""
+
+    def _parse(self, text, year=2026):
+        import imm_earnings_overrides as ieo
+        return ieo.parse_release_time(text, year)
+
+    def test_intel_after_close(self):
+        hit = self._parse(
+            "Intel will report second-quarter financial results on Thursday, "
+            "July 23, 2026, promptly after close of market. Following the "
+            "report, Intel will hold a conference call at 2 p.m. PDT.")
+        self.assertIsNotNone(hit)
+        dt, label, _ = hit
+        self.assertEqual((dt.month, dt.day, dt.hour, dt.minute), (7, 23, 16, 0))
+        self.assertIn("close", label)
+
+    def test_before_market_open(self):
+        hit = self._parse(
+            "Boeing will report second-quarter 2026 financial results before "
+            "the market opens on July 29, 2026.")
+        self.assertIsNotNone(hit)
+        dt, label, _ = hit
+        self.assertEqual((dt.month, dt.day, dt.hour), (7, 29, 7))
+        self.assertIn("open", label)
+
+    def test_stated_release_time_not_the_call(self):
+        # a specific RELEASE time is used; the later call time is NOT picked
+        hit = self._parse(
+            "The company will release its quarterly results at 6:00 a.m. ET on "
+            "August 5, 2026, and host a conference call at 8:30 a.m. ET.")
+        self.assertIsNotNone(hit)
+        dt, _, _ = hit
+        self.assertEqual((dt.month, dt.day, dt.hour, dt.minute), (8, 5, 6, 0))
+
+    def test_no_report_context_returns_none(self):
+        self.assertIsNone(self._parse(
+            "Shares closed after the market close up 3% on Tuesday."))
+
+
 class TestFileEventOverrides(unittest.TestCase):
     """Hot-reloaded call-time overrides file (imm_earnings_overrides.py)."""
 
