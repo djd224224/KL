@@ -364,10 +364,18 @@ BLIND_PRESERVE_CYCLES = 3
 #   mlb_trading.py -> KXMLBMENTION ; nbamention_v4_4.py -> KXNBAMENTION
 #   ncaab_order_script_v42.py -> KXNCAABMENTION ; high_temp_trading.py -> KXHIGH*
 _CRYPTO_ASSETS = ("SOL", "ETH", "BTC", "XRP", "ZEC", "HYPE", "DOGE", "BNB")
+# GPU rental-price family (Jack 2026-07-23: explicitly EXCLUDED — same
+# structural class as the econ/company series but ~600 markets that would
+# triple the candidate universe and refresh cost). Blocklisted (not merely
+# absent from the allowlist) so the daily auto-enroll can NEVER pull them in;
+# the prefixes cover every variant (MAX/MON/MS/WS). Re-include by removing
+# these from the blocklist AND raising MAX_CANDIDATE_BOOKS.
+_GPU_RENTAL_PREFIXES = ["KXA100", "KXB200", "KXH100", "KXH200", "KXRTX5090"]
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
     + ["KXHIGH"]                                    # high_temp_trading.py (cloud)
     + ["KXMLBMENTION", "KXNBAMENTION", "KXNCAABMENTION"]   # mlb/nba/ncaa (cloud)
+    + _GPU_RENTAL_PREFIXES                           # GPU rental price (excluded)
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 

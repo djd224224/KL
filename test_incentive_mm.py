@@ -584,9 +584,14 @@ class TestAllowlist(unittest.TestCase):
                   "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
                   "KXUSGASCPI-26AUG12-T320", "KXSCFI-26DEC25-T1500"):
             self.assertTrue(a(t), t)
-        # GPU rental family deliberately excluded pending capacity decision
-        self.assertFalse(a("KXH100MS-26JUL-2.750"))
-        self.assertFalse(a("KXA100MAX-26DEC31-1.990"))
+        # GPU rental family HARD-EXCLUDED (blocklisted, not merely absent) so
+        # the daily auto-enroll can never pull it in
+        b = IncentiveMarketMaker._blocked
+        for t in ("KXH100MS-26JUL-2.750", "KXA100MAX-26DEC31-1.990",
+                  "KXB200MON-26JUL31-4.360", "KXH200WS-26JUL24-6.500",
+                  "KXRTX5090MS-26JUL-0.250"):
+            self.assertTrue(b(t), t)
+            self.assertFalse(a(t), t)
         # Rotten Tomatoes scores (undated tickers)
         self.assertTrue(a("KXRT-DOG-45"))
 
@@ -1243,6 +1248,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                          "review")
         self.assertEqual(self._classify("KXTEMPMIAH", "KXTEMPMIAH-26JUL2312-T88.99")[0],
                          "review")
+        # GPU rental family is blocklisted -> classifier skips (never enrolls)
+        self.assertEqual(self._classify("KXH100MS", "KXH100MS-26JUL-2.750")[0],
+                         "skip")
+        self.assertEqual(self._classify("KXA100MAX", "KXA100MAX-26DEC31-1.990")[0],
+                         "skip")
 
     def test_extra_allow_file_reload_and_safety(self):
         old_path = imm.EXTRA_ALLOW_FILE
