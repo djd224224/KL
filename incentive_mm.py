@@ -518,6 +518,26 @@ ALERT_DEDUPE_SECS = 6 * 3600
 SMS_MAX_CHARS = 300
 SUMMARY_HOUR_CT = _env_int("IMM_SUMMARY_HOUR_CT", 5)   # counters roll 6am ET
 
+# Watchdog: N selected markets with almost nothing resting for several cycles
+# is the signature of every silent-death class seen so far (midnight-ET
+# earnings cutoff, program races, override gaps) — page instead of waiting
+# for someone to look at the book.
+WATCHDOG_MIN_SELECTED = _env_int("IMM_WATCHDOG_MIN_SELECTED", 10)
+WATCHDOG_MIN_RESTING = _env_int("IMM_WATCHDOG_MIN_RESTING", 5)
+WATCHDOG_CYCLES = _env_int("IMM_WATCHDOG_CYCLES", 3)
+
+# Account-balance hard floor: the bot's risk math sees only its OWN book, but
+# the account is shared (crypto fleet, cloud bots, manual). If the balance
+# drops this much below the daily anchor — whatever the source — halt and
+# page. Deposits/withdrawals move the balance too; the alert says so. 0 = off.
+BALANCE_DROP_HALT = _env_float("IMM_BALANCE_DROP_HALT", 2500.0)
+
+
+def _halt_day_key(now_utc: datetime) -> str:
+    """The 5am-CT roll day the halt/carry/balance anchors belong to."""
+    return (now_utc.astimezone(CT)
+            - timedelta(hours=SUMMARY_HOUR_CT)).date().isoformat()
+
 
 def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} {msg}", flush=True)
@@ -1427,7 +1447,13 @@ class BotState:
     realized_baseline: float = 0.0       # lifetime realized at last daily roll
     last_mark: Dict[str, float] = field(default_factory=dict)   # ticker -> YES mid cents
     day_baseline: Optional[float] = None  # realized+unrealized at last daily roll
-    halted_until: float = 0.0            # daily-loss halt (epoch)
+    halted_until: float = 0.0            # daily-loss halt (epoch); persisted
+    pnl_carry: float = 0.0               # pnl_today carried across restarts (same
+    #   roll-day only) — realized resets on restart, so baselines alone can't
+    #   survive one; the halt used to hand every restart a fresh loss budget
+    pnl_today_last: float = 0.0          # last measured pnl_today (for persist)
+    balance_day_start: float = 0.0       # account balance at the daily anchor
+    watchdog_streak: int = 0             # consecutive selected-but-not-resting cycles
     consecutive_errors: int = 0
     # daily counters (reset when the summary sends)
     cycles_today: int = 0
@@ -1528,6 +1554,19 @@ class IncentiveMarketMaker:
                 self.pnl.avg[str(t)] = float(a)
             self.state.reward_est_lifetime = float(data.get("reward_est_lifetime") or 0.0)
             self.state.sticky_prev = set(data.get("selected_tickers") or [])
+            # Halt continuity (same roll-day only): a restart must NOT hand
+            # the bot a fresh loss budget or clear an active halt. Use
+            # --clear-halt (bot stopped) for a deliberate un-halt.
+            if data.get("halt_day_key") == _halt_day_key(datetime.now(timezone.utc)):
+                self.state.pnl_carry = float(data.get("pnl_today_carry") or 0.0)
+                self.state.halted_until = float(data.get("halted_until") or 0.0)
+                self.state.balance_day_start = float(data.get("balance_day_start") or 0.0)
+                if self.state.halted_until > time.time():
+                    log(f"{self.tag} restored ACTIVE daily-loss halt "
+                        f"(pnl carry ${self.state.pnl_carry:+.2f})")
+                elif abs(self.state.pnl_carry) > 0.005:
+                    log(f"{self.tag} restored pnl_today carry "
+                        f"${self.state.pnl_carry:+.2f} (same roll-day restart)")
             if self.state.known_tickers:
                 log(f"{self.tag} restored {len(self.state.known_tickers)} known tickers")
         except FileNotFoundError:
@@ -1559,7 +1598,11 @@ class IncentiveMarketMaker:
                            "own_avg": {t: self.pnl.avg.get(t, 0.0)
                                        for t, p in self.pnl.pos.items()
                                        if abs(p) > 1e-9},
-                           "reward_est_lifetime": self.state.reward_est_lifetime}, f)
+                           "reward_est_lifetime": self.state.reward_est_lifetime,
+                           "halt_day_key": _halt_day_key(datetime.now(timezone.utc)),
+                           "pnl_today_carry": round(self.state.pnl_today_last, 2),
+                           "halted_until": self.state.halted_until,
+                           "balance_day_start": round(self.state.balance_day_start, 2)}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.
@@ -2412,6 +2455,36 @@ class IncentiveMarketMaker:
                 key="reconcile", urgent=False)
             self._save_persist()
 
+    def _check_balance_floor(self, now_utc: datetime) -> bool:
+        """True = floor breached and the bot halted. Anchors the day's
+        starting balance on first sight; failure to read = no action."""
+        try:
+            bal = float(self.client.get_balance().get("balance_dollars") or 0.0)
+        except Exception as e:
+            log(f"{self.tag} ! balance read failed ({e}); floor check skipped")
+            return False
+        if bal <= 0:
+            return False
+        if self.state.balance_day_start <= 0:
+            self.state.balance_day_start = bal
+            return False
+        drop = self.state.balance_day_start - bal
+        if drop < BALANCE_DROP_HALT:
+            return False
+        next_day_et = (now_utc.astimezone(ET) + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        self.state.halted_until = next_day_et.astimezone(timezone.utc).timestamp()
+        n = self.cancel_all_bot_orders()
+        self._save_persist()
+        self.alerter.alert(
+            "balance_floor", f"ACCOUNT balance dropped ${drop:.0f} since the "
+            f"daily anchor (${self.state.balance_day_start:.0f} -> ${bal:.0f}) "
+            f">= ${BALANCE_DROP_HALT:.0f}; cancelled {n} IMM orders and halted "
+            f"to next ET day. NOTE: the account is shared — the cause may be "
+            f"another bot, manual trading, or a withdrawal. --clear-halt to "
+            f"resume deliberately.", key="balance_floor")
+        return True
+
     def run_cycle(self) -> None:
         now_utc = datetime.now(timezone.utc)
         now_ts = now_utc.timestamp()
@@ -2423,6 +2496,11 @@ class IncentiveMarketMaker:
         if self.state.halted_until > now_ts:
             log(f"{self.tag} daily-loss halt active until "
                 f"{datetime.fromtimestamp(self.state.halted_until, timezone.utc)}; idle")
+            return
+        # Account-balance hard floor: shared-account backstop against ANY
+        # bot's malfunction (or this one's blind spots). Anchored at the
+        # daily roll; deposits/withdrawals also move it — the alert says so.
+        if BALANCE_DROP_HALT > 0 and self.live and self._check_balance_floor(now_utc):
             return
 
         # Fills -> own book FIRST, before the positions read. Matched by ORDER
@@ -2886,7 +2964,11 @@ class IncentiveMarketMaker:
         total_pnl = self.pnl.total_realized() + unrealized
         if self.state.day_baseline is None:
             self.state.day_baseline = total_pnl
-        pnl_today = total_pnl - self.state.day_baseline
+        # pnl_carry composes the halt across restarts: realized resets with
+        # the process, so the persisted carry (last measured pnl_today, same
+        # roll-day) is added to the fresh measurement.
+        pnl_today = total_pnl - self.state.day_baseline + self.state.pnl_carry
+        self.state.pnl_today_last = pnl_today
         if pnl_today <= -DAILY_LOSS_LIMIT:
             next_day_et = (now_utc.astimezone(ET) + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0)
@@ -2908,6 +2990,21 @@ class IncentiveMarketMaker:
             f"est ${reward_frac_sum:.2f}/day reward share, P&L today ${pnl_today:+.2f} "
             f"(real {realized:+.2f}/unreal {unrealized:+.2f}) "
             f"{'' if self.live else '[DRY RUN]'}")
+
+        # Watchdog: markets selected but the book nearly empty for several
+        # consecutive cycles — the silent-death signature (dead cutoffs,
+        # missing overrides, API trouble). Page, don't wait to be noticed.
+        if (len(self.state.selected) >= WATCHDOG_MIN_SELECTED
+                and len(resting) < WATCHDOG_MIN_RESTING):
+            self.state.watchdog_streak += 1
+            if self.state.watchdog_streak == WATCHDOG_CYCLES:
+                self.alerter.alert(
+                    "watchdog", f"{len(self.state.selected)} markets selected but "
+                    f"only {len(resting)} orders resting for {WATCHDOG_CYCLES} "
+                    f"cycles — quoting looks silently dead (cutoffs? overrides? "
+                    f"API?)", key="watchdog")
+        else:
+            self.state.watchdog_streak = 0
 
         cancel_failures = 0
         cancelled_ids: Set[str] = set()
@@ -3146,9 +3243,12 @@ class IncentiveMarketMaker:
         s.fills_today = 0.0
         s.reward_est_today = 0.0
         s.contract_minutes_today = 0.0
-        # roll both loss-halt windows
+        # roll both loss-halt windows + the restart-carry and balance anchor
         s.realized_baseline = self.pnl.total_realized()
         s.day_baseline = self.pnl.total_realized() + unrealized
+        s.pnl_carry = 0.0
+        s.pnl_today_last = 0.0
+        s.balance_day_start = 0.0          # re-anchors on the next cycle
         return body
 
     # ---- main loop -----------------------------------------------------------
@@ -3292,7 +3392,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="cancel ALL resting imm- orders (always real), then exit")
     ap.add_argument("--test-alert", action="store_true",
                     help="send a test alert via the configured route, then exit")
+    ap.add_argument("--clear-halt", action="store_true",
+                    help="deliberately clear a persisted daily-loss/balance halt "
+                         "and the pnl carry (run with the bot STOPPED)")
     args = ap.parse_args(argv)
+
+    if args.clear_halt:
+        path = IncentiveMarketMaker.PERSIST_PATH
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            log(f"cannot read state file ({e}); nothing to clear")
+            return 1
+        log(f"clearing halt (was halted_until={data.get('halted_until')}, "
+            f"pnl carry={data.get('pnl_today_carry')})")
+        data["halted_until"] = 0.0
+        data["pnl_today_carry"] = 0.0
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(path + ".tmp", path)
+        log("halt cleared — the bot starts with a FRESH loss budget on its "
+            "next start; run this only while the bot is stopped")
+        return 0
 
     if args.test_alert:
         alerter = Alerter("IMM", live=False)

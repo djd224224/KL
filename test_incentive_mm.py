@@ -1122,6 +1122,89 @@ class TestMentionWindowPolicy(unittest.TestCase):
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
 
+class TestHaltRestartContinuity(unittest.TestCase):
+    """Restarts must not reset the loss clock or clear an active halt."""
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def test_pnl_carry_and_halt_survive_restart(self):
+        bot = self._bot()
+        bot.state.pnl_today_last = -700.0
+        bot.state.halted_until = time.time() + 3600
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertAlmostEqual(bot2.state.pnl_carry, -700.0)
+        self.assertGreater(bot2.state.halted_until, time.time())
+
+    def test_carry_discarded_on_new_roll_day(self):
+        bot = self._bot()
+        bot.state.pnl_today_last = -700.0
+        bot.state.halted_until = time.time() + 3600
+        bot._save_persist()
+        with open(bot.PERSIST_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        data["halt_day_key"] = "1999-01-01"      # stale day
+        with open(bot.PERSIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        bot3 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot3.state.pnl_carry, 0.0)
+        self.assertEqual(bot3.state.halted_until, 0.0)
+
+    def test_carry_feeds_the_halt(self):
+        bot = self._bot()
+        bot.state.pnl_carry = -(imm.DAILY_LOSS_LIMIT + 5)   # carried loss
+        bot.state.universe_at = time.time()
+        bot.run_cycle()                       # fresh measurement ~0 + carry
+        self.assertGreater(bot.state.halted_until, time.time())
+
+
+class TestBalanceFloor(unittest.TestCase):
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def test_anchor_then_halt_on_drop(self):
+        bot = self._bot()
+        now = datetime.now(timezone.utc)
+        bot.client.get_balance = lambda: {"balance_dollars": "6000.00"}
+        self.assertFalse(bot._check_balance_floor(now))       # anchors
+        self.assertEqual(bot.state.balance_day_start, 6000.0)
+        bot.client.get_balance = lambda: {"balance_dollars":
+                                          str(6000.0 - imm.BALANCE_DROP_HALT)}
+        self.assertTrue(bot._check_balance_floor(now))        # halts
+        self.assertGreater(bot.state.halted_until, time.time())
+        self.assertTrue(any(c == "balance_floor" for c, _m in bot.alerter.today))
+
+    def test_small_drop_and_read_failure_are_fine(self):
+        bot = self._bot()
+        now = datetime.now(timezone.utc)
+        bot.client.get_balance = lambda: {"balance_dollars": "6000.00"}
+        bot._check_balance_floor(now)
+        bot.client.get_balance = lambda: {"balance_dollars": "5500.00"}
+        self.assertFalse(bot._check_balance_floor(now))
+        def boom():
+            raise RuntimeError("api down")
+        bot.client.get_balance = boom
+        self.assertFalse(bot._check_balance_floor(now))
+        self.assertEqual(bot.state.halted_until, 0.0)
+
+
+class TestWatchdog(unittest.TestCase):
+    def test_selected_but_not_resting_pages(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.state.universe_at = time.time()          # freeze selection
+        # 12 selected markets whose books are unquotable -> nothing rests
+        for i in range(12):
+            t = f"KXGHOST-99DEC31-S{i}"
+            bot.state.selected[t] = _meta(ticker=t, event_ticker="KXGHOST-99DEC31")
+        for _ in range(imm.WATCHDOG_CYCLES):
+            bot.run_cycle()
+        self.assertTrue(any(c == "watchdog" for c, _m in bot.alerter.today))
+
+
 class TestSeriesAutoEnroll(unittest.TestCase):
     """Daily series classifier + the bot's hot-reloaded extra-allow file."""
 
