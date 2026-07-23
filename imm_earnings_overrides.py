@@ -30,7 +30,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -542,12 +542,36 @@ def main(argv=None) -> int:
                 lines.append(f"    \"{evidence[:160]}\"")
         if unresolved:
             lines.append("")
-            lines.append("UNRESOLVED — verify the call time and run:")
+            lines.append("UNRESOLVED calls — verify the call date AND time, then "
+                         "--set. The Nasdaq line is the RELEASE (anchor only): "
+                         "the call is usually the same day shortly after, but "
+                         "split reporters (e.g. airlines) call the next morning "
+                         "— so confirm the date, don't assume it:")
             for ev in unresolved:
-                d = parse_event_date(ev)
-                hint = d.strftime("%Y-%m-%d") if d else "2026-MM-DD"
+                series = ev.split("-")[0]
+                tkr = (series[len(_EARNINGS_PREFIX):]
+                       if series.startswith(_EARNINGS_PREFIX) else "")
+                rel = (nasdaq_release_datetime(tkr, now, DISCLOSURE_LEAD_DAYS + 3)
+                       if tkr else None)
+                if rel:
+                    rel_et = rel[0].astimezone(ET)
+                    # context anchor only — NOT the --set value
+                    lines.append(f"    # Nasdaq: {tkr} releases {rel_et:%a %b %d} "
+                                 f"[{rel[1]}] — call same-day shortly after OR "
+                                 f"next AM; VERIFY the date")
+                    # runnable template: same-day call guess (5pm ET after a
+                    # close release, 8:30am after a pre-market one), clearly to
+                    # be edited if it's a split reporter
+                    guess = (rel_et.replace(hour=8, minute=30)
+                             if "before open" in rel[1]
+                             else rel_et.replace(hour=17, minute=0))
+                    hint_iso = guess.isoformat()
+                else:
+                    d = parse_event_date(ev)
+                    hint_iso = ((d.strftime("%Y-%m-%d") if d else "2026-MM-DD")
+                                + "T16:30:00-04:00")
                 lines.append(f'  python imm_earnings_overrides.py --set {ev} '
-                             f'"{hint}T16:30:00-04:00"')
+                             f'"{hint_iso}"')
             lines.append("(unresolved events fall back to the conservative "
                          "midnight-ET rule and stop quoting the night before)")
         if covered:
