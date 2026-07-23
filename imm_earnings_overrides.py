@@ -469,7 +469,15 @@ def main(argv=None) -> int:
             rel_unresolved.append((ev, occ_iso))
             log(f"RELEASE UNRESOLVED: {ev} (kalshi occ={occ_iso})")
 
-    # Phase 2: earnings call-time overrides.
+    # Phase 2: earnings-CALL cutoffs. Jack 2026-07-23: set the call cutoff to
+    # the earnings RELEASE time (Nasdaq-resolved), not the call itself. Safe by
+    # construction — the call is always at/after the release, so being out
+    # before the release is out before the call — and actually BETTER, because
+    # the release can pre-move the mention market (a "10k layoffs" release makes
+    # the layoffs-mention market gap before the call). Also makes calls fully
+    # automated: the exact call time has no reliable machine source (Kalshi
+    # points these series at bloomberg.com, not the IR page), but Nasdaq gives
+    # the release. Falls back to the IR call-time scrape then --set on a miss.
     events = discover_events(client)
     log(f"active earnings events: {len(events)}")
 
@@ -478,6 +486,21 @@ def main(argv=None) -> int:
         if ev in EVENT_START_OVERRIDES:
             covered.append(ev)
             continue
+        series = ev.split("-")[0]
+        tkr = (series[len(_EARNINGS_PREFIX):]
+               if series.startswith(_EARNINGS_PREFIX) else "")
+        rel = (nasdaq_release_datetime(tkr, now, DISCLOSURE_LEAD_DAYS + 3)
+               if tkr else None)
+        if rel:
+            dt_et, label = rel
+            iso = dt_et.isoformat()
+            file_data[ev] = iso
+            resolved.append((ev, iso, f"nasdaq:{tkr}",
+                             f"call cutoff = earnings RELEASE [{label}] "
+                             f"(safe: call is at/after the release)"))
+            log(f"call {ev} = {iso}  (release proxy [{label}])")
+            continue
+        # Nasdaq had nothing -> try the IR page for the exact call time, else flag
         found = None
         for url in source_urls(client, ev):
             try:
