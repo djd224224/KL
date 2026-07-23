@@ -42,21 +42,25 @@ outcome window); the cancel sweep covers **all** discovered markets, not just tr
 rows; the fair-NO cap is always on (no A/B machinery); UTF-8 stdout reconfigure for
 Windows runs.
 
-## Sizing / limits (probe phase)
+## Sizing / limits (testing phase, Jack 2026-07-22)
 
-`LOW_STARTING_CONTRACTS=8` per rung (×2 on evening runs), `LOW_MAX_CONTRACTS=50` per
-market, ladder = 8 rungs × 2c, per-city mults all 1.0. Bump only after real KXLOW P&L.
+`LOW_STARTING_CONTRACTS=1` per rung (×2 on evening runs → 2/rung) — vs 15/30 on the high
+bot. Set in both `run_low_temp.ps1` and the script default; keep them in sync when
+bumping. `LOW_MAX_CONTRACTS=50` per market, ladder = 8 rungs × 2c, per-city mults 1.0.
 
-## Schedule (GH Actions native cron — LIVE since 2026-07-22)
+## Schedule (LOCAL Task Scheduler — since 2026-07-22 evening)
 
-`schedule:` crons in the workflow file (UTC): **00:17** (~19:17 CDT evening, main),
-**03:17** (~22:17 CDT refresh), **07:17** (~02:17 CDT day-of, CT/MT/PT), **08:47**
-(~03:47 CDT day-of, MT/PT). Native cron is fine here (unlike the high bot, which needs
-cron-job.org precision): expiries are fixed local-clock stops computed in-script, so GH
-cron drift only shortens the quoting window, and runs firing past a city's stop skip it.
-Runs at any other hour are safe — cities past their quote stop are skipped up front (a
-late-morning run does nothing but sweep cancels). Note GH pauses scheduled workflows
-after 60 days without repo activity (this repo commits near-daily, so moot).
+Task **`KL low-temp-trading`** → `run_low_temp.ps1`, 4 daily triggers in ET (machine
+local): **20:17** (19:17 CT evening, main), **23:17** (22:17 CT refresh), **03:17**
+(02:17 CT day-of, CT/MT/PT), **04:47** (03:47 CT day-of, MT/PT). WakeToRun + battery-
+tolerant + StartWhenAvailable; laptop stays plugged in overnight. Logs:
+`run-logs\low-temp\low-temp-YYYY-MM-DD.log`; nonzero exit emails the log tail.
+The GH workflow keeps `workflow_dispatch` as a MANUAL backup only — its cron was removed
+so the two schedulers can never double-run a slot; re-add GH crons only after disabling
+the local task. Runs at any other hour are safe — cities past their quote stop are
+skipped up front. Gotcha from the first TS run: TS sessions lack user-site packages —
+main site-packages now has google-auth installed directly, and the launcher also passes
+PYTHONPATH inside the cmd line (the IMM launcher pattern).
 
 ## BigQuery
 
