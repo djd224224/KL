@@ -308,7 +308,12 @@ PRICE_MIN_CENTS = _env_int("IMM_PRICE_MIN_CENTS", 1)    # never quote below (bid
 PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 95)   # never quote above (ask side)
 MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 1)            # skip markets with mid outside
 MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 95)
-MAX_JOIN_SPREAD_CENTS = _env_int("IMM_MAX_JOIN_SPREAD", 25)
+# Wide screen effectively OFF (Jack 2026-07-23: 25->99): incentives are earned
+# for RESTING regardless of spread, and a wide book means LESS competition ->
+# HIGHER pool share, so wider is better, not worse. 99 lets every real book
+# through; the separate crossed/locked check (ext_bid >= ext_ask) and the
+# top-in-band price-bound check still stand. IMM_MAX_JOIN_SPREAD to restore.
+MAX_JOIN_SPREAD_CENTS = _env_int("IMM_MAX_JOIN_SPREAD", 99)
 # Volume screen REMOVED (Jack 2026-07-22): a book with no volume can't fill
 # you — resting there is incentive rent with ~zero P&L risk, which is the
 # whole point. Set IMM_MIN_VOLUME > 0 to restore the old anti-junk screen.
@@ -332,9 +337,11 @@ REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
 PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 3600)
 
 DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 1200.0)  # realized+unrealized $, halts to next ET day (user raises: 50->150 7/14; ->500 7/19; ->800 7/20; ->1200 7/21)
-MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 1000)  # 450->1000
-#   (Jack 2026-07-23: the 40-event/company-era book wants ~800 orders; 450
-#   was crowding out the selection tail)
+MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 2000)  # 450->1000->2000
+#   (Jack 2026-07-23: universe grew to ~263 mkts/50 events wanting >1300 orders;
+#   1000 pinned + order_cap alerts every cycle starved the low-yield tail like
+#   KXRT-BRIN-45/50. Advanced tier + 24/s throughput handle 2000 fine. NOTE:
+#   the $4000 collateral budget may become the next binding constraint.)
 MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-reward markets
 BENCH_COOLDOWN_SECS = _env_int("IMM_BENCH_COOLDOWN", 4 * 3600)
