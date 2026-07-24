@@ -2185,13 +2185,23 @@ class IncentiveMarketMaker:
                     ranked.append(meta)   # sticky: transient book-read failure
                 else:
                     skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
-            elif quote_all or meta.ticker in prev_selected:
+            elif quote_all or meta.ticker in prev_selected \
+                    or meta.event_ticker in EVENT_START_OVERRIDES:
                 # quote_all: user wants EVERY market of the event. Sticky:
                 # ALL previously-quoted markets bypass the optimization
                 # filters — a below-floor estimate or lost budget race
                 # mid-life must not strand the accrual (the original sticky
                 # patch only rescued pass-1 screen failures; markets passing
                 # screens cleanly still fell to payout_floor/budget here).
+                # Event-start OVERRIDE events bypass them too: an override is
+                # a curated "quote this event until X", so the floor (built
+                # for anonymous 1-2 day programs) must not veto it. Observed
+                # 2026-07-24: TRUMPMENTION's cutoff was extended to 7pm ET
+                # mid-day, but the phantom-midnight sticky death had already
+                # wiped membership and the shrunken remaining window couldn't
+                # clear $1 — all 34 markets moved cutoff->payout_floor and
+                # the event stayed dark despite the override. Budget, pass-1
+                # screens and yield-to-human still govern these.
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
