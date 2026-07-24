@@ -63,7 +63,7 @@ if ($Probe) {
     # (not the throttle) becomes the real floor = quote as fast as the wire
     # allows. Env-scoped: the 16 crypto bots keep 100ms and don't starve the
     # shared write budget.
-    $ProbeEnv = "set IMM_LEVELS=0:5,1:5,2:5&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=4000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& "
+    $ProbeEnv = "set IMM_LEVELS=0:5,1:5,2:5&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=5000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& "
 }
 
 while ($true) {
