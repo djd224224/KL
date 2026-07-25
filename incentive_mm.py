@@ -2504,6 +2504,12 @@ class IncentiveMarketMaker:
                    if abs(positions.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS
                    and t not in self.state.selected
                    and t not in self.state.managed_extra
+                   # BLOCKLISTED = frozen entirely — not even reduce-only
+                   # wind-down (Jack 2026-07-25: the gas retirement's
+                   # wind-down joined pinned books, fire-selling +55/+31
+                   # longs at 1-8c asks and covering shorts he wanted left
+                   # alone). Positions ride to settlement; flatten by hand.
+                   and not self._blocked(t)
                    # only restore inventory that is genuinely OURS — a manual
                    # position on a once-quoted market is the user's business
                    and abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
@@ -2773,7 +2779,11 @@ class IncentiveMarketMaker:
         # Managed set = selected + any market we still hold inventory in.
         managed: Dict[str, MarketMeta] = dict(self.state.selected)
         for t, meta in list(self.state.managed_extra.items()):
-            if abs(positions.get(t, 0.0)) < REDUCE_ONLY_MIN_CONTRACTS:
+            if self._blocked(t):
+                # frozen series (see restore_orphan_metas): flush any entry
+                # that predates the blocklisting so no wind-down orders rest
+                self.state.managed_extra.pop(t, None)
+            elif abs(positions.get(t, 0.0)) < REDUCE_ONLY_MIN_CONTRACTS:
                 self.state.managed_extra.pop(t, None)
             elif t not in managed:
                 managed[t] = meta

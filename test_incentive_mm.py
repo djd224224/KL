@@ -1671,6 +1671,33 @@ class TestStickySelection(unittest.TestCase):
         bot.run_cycle()                    # cycle 2 integrates
         self.assertGreater(bot.state.accrued_est.get(self.T, 0.0), 0.0)
 
+    def test_blocklisted_positions_are_frozen(self):
+        # Jack 2026-07-25: blocklist = ZERO orders, not even reduce-only
+        # wind-down (the gas retirement's wind-down fire-sold longs at 1-8c
+        # into pinned books). Neither restore path may create a meta.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        t = "KXGOOD-99DEC31-A"
+        old = imm.SERIES_BLOCKLIST_PREFIXES
+        imm.SERIES_BLOCKLIST_PREFIXES = tuple(old) + ("KXGOOD",)
+        try:
+            bot.state.known_tickers.add(t)
+            bot.pnl.pos[t] = -40.0
+            bot.restore_orphan_metas({t: -40.0})
+            self.assertNotIn(t, bot.state.managed_extra)   # not restored
+            # a pre-existing entry (blocklisted after the fact) is flushed
+            bot.state.managed_extra[t] = MarketMeta(
+                ticker=t, event_ticker="KXGOOD-99DEC31", series="KXGOOD",
+                dollars_per_day=0.0, program_end=None, target_size=0.0,
+                discount_factor=0.5, cutoff=None, close_time=None)
+            bot.run_cycle()
+            self.assertNotIn(t, bot.state.managed_extra)
+            self.assertNotIn(t, bot.state.selected)
+            self.assertFalse([o for o in bot.state.sim_orders.values()
+                              if o.get("ticker") == t])
+        finally:
+            imm.SERIES_BLOCKLIST_PREFIXES = old
+
     def test_accrued_est_survives_restart(self):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
