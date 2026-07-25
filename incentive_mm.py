@@ -569,6 +569,15 @@ MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.0)
 # floored at the live refreshes). Entry therefore uses the market's PEAK
 # estimate over the last hour; sticky selection holds it once in.
 EST_PEAK_TTL_SECS = _env_int("IMM_EST_PEAK_TTL", 3600)
+# STICKY EXIT for hopeless markets (Jack 2026-07-25: "quoting markets that
+# don't hit $1 is a big drain" — if there's <5% chance of reaching the $1 min
+# payout before the incentive expires, stop quoting EVEN IF already started).
+# The one deliberate exception to sticky retention: sub-$1 accrual pays
+# NOTHING, so riding a hopeless market to its natural end is pure fill risk
+# for zero reward. "<5%" is encoded structurally, not statistically: even the
+# OPTIMISTIC projection (accrued-so-far + the better of the current and
+# 1h-peak remaining estimate) stays under the bar. quote_all series exempt.
+HOPELESS_EXIT = os.environ.get("IMM_HOPELESS_EXIT", "1") == "1"
 
 
 def _quotable_days(meta, now_utc: datetime) -> float:
@@ -1559,6 +1568,9 @@ class BotState:
     #   sticky selection survive a restart (state.selected itself is rebuilt live)
     manual_standoff: Dict[str, float] = field(default_factory=dict)  # ticker -> since ts
     cutoff_ts: Dict[str, float] = field(default_factory=dict)     # ticker -> cutoff epoch
+    accrued_est: Dict[str, float] = field(default_factory=dict)   # ticker -> lifetime est
+    #   reward accrued ($; live share x $/day integrated per cycle). Feeds the
+    #   hopeless-exit / entry-floor credit: accrued + projection vs the $1 bar.
     place_uncertain: Dict[Tuple[str, str, int], float] = field(default_factory=dict)
     realized_baseline: float = 0.0       # lifetime realized at last daily roll
     last_mark: Dict[str, float] = field(default_factory=dict)   # ticker -> YES mid cents
@@ -1680,6 +1692,11 @@ class IncentiveMarketMaker:
             self._est_peak = {str(t): (float(v[0]), float(v[1]))
                               for t, v in (data.get("est_peak") or {}).items()
                               if isinstance(v, (list, tuple)) and len(v) == 2}
+            # Per-market accrued reward estimate: the hopeless-exit / entry
+            # credit must survive restarts or every restart would re-evict
+            # (or re-floor) markets that already banked most of their $1.
+            self.state.accrued_est = {str(t): float(v) for t, v in
+                                      (data.get("accrued_est") or {}).items()}
             # Halt continuity (same roll-day only): a restart must NOT hand
             # the bot a fresh loss budget or clear an active halt. Use
             # --clear-halt (bot stopped) for a deliberate un-halt.
@@ -1732,7 +1749,13 @@ class IncentiveMarketMaker:
                            # peak-entry memory, pruned to TTL so it stays bounded
                            "est_peak": {t: [round(v[0], 4), round(v[1], 1)]
                                         for t, v in self._est_peak.items()
-                                        if time.time() - v[1] <= EST_PEAK_TTL_SECS}}, f)
+                                        if time.time() - v[1] <= EST_PEAK_TTL_SECS},
+                           # accrued-est credit, pruned with known_tickers so
+                           # settled markets don't grow it unboundedly
+                           "accrued_est": {t: round(v, 4)
+                                           for t, v in self.state.accrued_est.items()
+                                           if v >= 1e-4
+                                           and t in self.state.known_tickers}}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.
@@ -2241,38 +2264,58 @@ class IncentiveMarketMaker:
                     ranked.append(meta)   # sticky: transient book-read failure
                 else:
                     skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
-            elif quote_all or meta.ticker in prev_selected \
+                continue
+            # Shared $1-min-payout projection for the entry floor AND the
+            # hopeless exit: optimistic = accrued-so-far + max(current,
+            # 1h-peak) remaining. Peak now updates for MEMBERS too, so a
+            # single noisy dip can't evict — eviction needs a full peak-TTL
+            # hour of sustained sub-$1 projection.
+            est_total = meta.est_dollars_per_day * _quotable_days(meta, now_utc)
+            peak, pts = self._est_peak.get(meta.ticker, (0.0, 0.0))
+            if now_ts - pts > EST_PEAK_TTL_SECS:
+                peak = 0.0
+            if est_total > peak:
+                self._est_peak[meta.ticker] = (est_total, now_ts)
+                peak = est_total
+            accrued = self.state.accrued_est.get(meta.ticker, 0.0)
+            reaches_min = accrued + max(est_total, peak) >= MIN_EST_TOTAL_DOLLARS
+            if quote_all:
+                # user wants EVERY market of the event (2026-07-12): exempt
+                # from floors, the hopeless exit and the yield ranking.
+                ranked.append(meta)
+            elif HOPELESS_EXIT and not reaches_min \
+                    and (meta.ticker in prev_selected
+                         or meta.event_ticker in EVENT_START_OVERRIDES):
+                # STICKY EXIT (Jack 2026-07-25): "<5% chance to reach $1 by
+                # program end -> stop quoting, even if already started". The
+                # deliberate exception to sticky retention — sub-$1 accrual
+                # pays NOTHING, so riding a hopeless market to its natural
+                # end is pure fill risk for zero reward. Applies to
+                # override-event markets too (both states, so no
+                # admit/evict flapping); the accrued credit keeps every
+                # market that's genuinely close to $1 (the 7/24 TRUMPMENTION
+                # rule: protect earned-but-below-$1 accruals whenever
+                # finishing the job is still plausible). Wind-down of any
+                # position continues reduce-only via managed_extra.
+                skipped["hopeless"] = skipped.get("hopeless", 0) + 1
+            elif meta.ticker in prev_selected \
                     or meta.event_ticker in EVENT_START_OVERRIDES:
-                # quote_all: user wants EVERY market of the event. Sticky:
-                # ALL previously-quoted markets bypass the optimization
-                # filters — a below-floor estimate or lost budget race
-                # mid-life must not strand the accrual (the original sticky
-                # patch only rescued pass-1 screen failures; markets passing
-                # screens cleanly still fell to payout_floor/budget here).
-                # Event-start OVERRIDE events bypass them too: an override is
-                # a curated "quote this event until X", so the floor (built
-                # for anonymous 1-2 day programs) must not veto it. Observed
-                # 2026-07-24: TRUMPMENTION's cutoff was extended to 7pm ET
-                # mid-day, but the phantom-midnight sticky death had already
-                # wiped membership and the shrunken remaining window couldn't
-                # clear $1 — all 34 markets moved cutoff->payout_floor and
-                # the event stayed dark despite the override. Budget, pass-1
-                # screens and yield-to-human still govern these.
+                # Sticky members and event-start-override events bypass the
+                # entry floor / zero-yield / budget-race filters (original
+                # sticky patch, commit 6f1e3d2 + the 2026-07-24 TRUMPMENTION
+                # revival: a curated override window must not be vetoed by
+                # the floor). Budget, pass-1 screens and yield-to-human
+                # still govern.
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
+            elif not reaches_min:
+                # entry floor, now with the accrued credit: a re-admitted
+                # market that already banked most of its $1 re-enters even
+                # when the remaining window alone couldn't clear the bar.
+                skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
             else:
-                est_total = meta.est_dollars_per_day * _quotable_days(meta, now_utc)
-                peak, pts = self._est_peak.get(meta.ticker, (0.0, 0.0))
-                if now_ts - pts > EST_PEAK_TTL_SECS:
-                    peak = 0.0
-                if est_total > peak:
-                    self._est_peak[meta.ticker] = (est_total, now_ts)
-                    peak = est_total
-                if peak < MIN_EST_TOTAL_DOLLARS:
-                    skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
-                else:
-                    ranked.append(meta)
+                ranked.append(meta)
         # Mild stickiness so estimator jitter doesn't churn the selection.
         ranked.sort(key=lambda m: -m.yield_per_contract
                     * (1.15 if m.ticker in self.state.selected else 1.0))
@@ -2822,6 +2865,7 @@ class IncentiveMarketMaker:
         marked: Set[str] = set()          # tickers marked from live books this cycle
         cycle_rows: List[str] = []        # cycle-logger panel (η/J calibration data)
         reward_frac_sum = 0.0
+        cycle_rate: Dict[str, float] = {}   # ticker -> live est $/day this cycle
         quoted = 0
         # Round-robin across events (best-paying event first), NOT a flat
         # $/day sort: with many events managed, MAX_PLACEMENTS_PER_CYCLE would
@@ -3075,6 +3119,7 @@ class IncentiveMarketMaker:
                 yes_levels, no_levels, est_own,
                 meta.target_size, meta.discount_factor, own_in_book=self.live)
             reward_frac_sum += frac * meta.dollars_per_day
+            cycle_rate[t] = frac * meta.dollars_per_day
             cycle_rows.append(
                 f"{now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')},{t},"
                 f"{ext_bid if ext_bid is not None else ''},"
@@ -3109,6 +3154,12 @@ class IncentiveMarketMaker:
             accrued = reward_frac_sum * dt_days
             self.state.reward_est_today += accrued
             self.state.reward_est_lifetime += accrued
+            # Per-market accrual (same integral, split by ticker) — the
+            # hopeless-exit / floor credit: accrued + projection vs $1.
+            for t_, rate in cycle_rate.items():
+                if rate > 0:
+                    self.state.accrued_est[t_] = \
+                        self.state.accrued_est.get(t_, 0.0) + rate * dt_days
             self.state.contract_minutes_today += \
                 resting_contracts * (now_ts - self.state.reward_accrue_at) / 60.0
         self.state.reward_accrue_at = now_ts

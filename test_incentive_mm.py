@@ -1604,18 +1604,82 @@ class TestStickySelection(unittest.TestCase):
         bot.run_cycle()
         self.assertNotIn(self.T, bot.state.selected)
 
-    def test_payout_floor_does_not_drop_quoted_market(self):
-        # Live bug 2026-07-21 (CHIH-2109-T75.99): a market passing the quality
-        # screens cleanly still fell to the pass-2 payout floor / budget race.
+    def test_hopeless_member_is_evicted(self):
+        # Jack 2026-07-25 (REVERSES the 7/21 unconditional retention for this
+        # one case): a member whose accrued + optimistic projection can't
+        # reach the $1 min payout stops quoting mid-life — sub-$1 accrual
+        # pays nothing, so riding it out is pure fill risk for zero reward.
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9        # everything is below floor now
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9        # projection can never reach
         try:
+            bot._est_peak.clear()              # no stale peak credit
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_accrued_credit_retains_member(self):
+        # ...but a member that already banked (most of) the $1 keeps quoting:
+        # accrued + projection clears the bar even when the remaining window
+        # alone can't (the 7/24 TRUMPMENTION rule — protect earned accruals
+        # whenever finishing the job is plausible).
+        bot = self._quoting_bot()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot.state.accrued_est[self.T] = 2e9
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertIn(self.T, bot.state.selected)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_hopeless_exit_kill_switch(self):
+        # IMM_HOPELESS_EXIT=0 restores the unconditional 7/21 retention.
+        bot = self._quoting_bot()
+        old_floor, old_flag = imm.MIN_EST_TOTAL_DOLLARS, imm.HOPELESS_EXIT
+        imm.MIN_EST_TOTAL_DOLLARS, imm.HOPELESS_EXIT = 1e9, False
+        try:
+            bot._est_peak.clear()
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS, imm.HOPELESS_EXIT = old_floor, old_flag
+
+    def test_accrued_credit_admits_returning_market(self):
+        # ENTRY floor credit: a NON-member with banked accrual re-enters even
+        # when the remaining window alone is below the bar (the re-admitted
+        # TRUMPMENTION class).
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot.state.accrued_est[self.T] = 2e9
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_accrual_integrates_per_market(self):
+        bot = self._quoting_bot()          # cycle 1 stamps reward_accrue_at
+        bot.state.reward_accrue_at -= 60   # pretend a minute passed
+        bot.state.universe_at = time.time()   # quote loop only, no refresh
+        bot.run_cycle()                    # cycle 2 integrates
+        self.assertGreater(bot.state.accrued_est.get(self.T, 0.0), 0.0)
+
+    def test_accrued_est_survives_restart(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.state.known_tickers.add(self.T)
+        bot.state.accrued_est[self.T] = 0.4321
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertAlmostEqual(bot2.state.accrued_est.get(self.T, 0.0),
+                               0.4321, places=3)
 
     def test_budget_race_does_not_drop_quoted_market(self):
         bot = self._quoting_bot()
@@ -1678,7 +1742,11 @@ class TestStickySelection(unittest.TestCase):
     def test_sticky_survives_restart(self):
         # state.selected is rebuilt live; without the persisted sticky set a
         # restart stranded every in-flight accrual (observed 2026-07-21).
+        # Since the 2026-07-25 hopeless exit, restart retention additionally
+        # requires the market NOT be hopeless — the persisted accrued credit
+        # (also restored here) is what carries a mid-accrual market across.
         bot = self._quoting_bot()
+        bot.state.accrued_est[self.T] = 2e9    # banked accrual, persists too
         bot._save_persist()
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertIn(self.T, bot2.state.sticky_prev)
