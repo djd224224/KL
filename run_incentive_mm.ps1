@@ -71,7 +71,10 @@ if ($Probe) {
     # walk-truncate deeper rungs to ZERO score, while touch fills are the
     # cheapest per contract (-0.9c vs -5.3c at depth 2) — all-at-the-touch
     # dominates; total 15 -> 8 was Jack's exposure trim.
-    $ProbeEnv = "set IMM_LEVELS=0:8&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=5000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& "
+    # 0:8 -> 0:10 (Jack 2026-07-25 pm). Gas trackers blocklisted same day
+    # (Jack: stop quoting KXAAAGASW/M/D + KXUSGASCPI); blocklist beats every
+    # allowlist and the auto-enroll loader, positions wind down reduce-only.
+    $ProbeEnv = "set IMM_BLOCKLIST=KXAAAGASW,KXAAAGASM,KXAAAGASD,KXUSGASCPI&& set IMM_LEVELS=0:10&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=5000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& "
 }
 
 while ($true) {
