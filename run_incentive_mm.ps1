@@ -66,7 +66,12 @@ if ($Probe) {
     # Quiet-hours ladder boost (Jack 2026-07-25): non-KXTEMP rungs x2 during
     # ET 3-7am — 1/3.3 the traded flow, half the fill turnover, ~breakeven
     # non-temp fill P&L (KXTEMP excluded in code: IMM_HOUR_MULT_EXCLUDE).
-    $ProbeEnv = "set IMM_LEVELS=0:5,1:5,2:5&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=5000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& "
+    # Ladder 5/5/5 -> 8/0/0 (Jack 2026-07-25, from the shape sim on 198 live
+    # books): reward weight halves per tick behind the touch and 55/198 books
+    # walk-truncate deeper rungs to ZERO score, while touch fills are the
+    # cheapest per contract (-0.9c vs -5.3c at depth 2) — all-at-the-touch
+    # dominates; total 15 -> 8 was Jack's exposure trim.
+    $ProbeEnv = "set IMM_LEVELS=0:8&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=5000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& "
 }
 
 while ($true) {
