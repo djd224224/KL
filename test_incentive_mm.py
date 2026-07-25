@@ -2599,5 +2599,73 @@ class TestManualStandoff(unittest.TestCase):
         self.assertEqual(getattr(client, "created", []), [])
 
 
+class TestHourSizeMult(unittest.TestCase):
+    """Quiet-hours ladder multiplier (IMM_HOUR_SIZE_MULT): parsing, ET window
+    membership, series exclusion, rounding. July dates => EDT (UTC-4)."""
+
+    def setUp(self):
+        self._mults = imm.HOUR_SIZE_MULTS
+        self._excl = imm.HOUR_MULT_EXCLUDE
+
+    def tearDown(self):
+        imm.HOUR_SIZE_MULTS = self._mults
+        imm.HOUR_MULT_EXCLUDE = self._excl
+
+    def test_parse_range_inclusive_both_ends(self):
+        self.assertEqual(imm._parse_hour_mults("3-7:2.0"),
+                         {3: 2.0, 4: 2.0, 5: 2.0, 6: 2.0, 7: 2.0})
+
+    def test_parse_wrap_and_single_hour(self):
+        self.assertEqual(imm._parse_hour_mults("22-1:0.5,13:1.5"),
+                         {22: 0.5, 23: 0.5, 0: 0.5, 1: 0.5, 13: 1.5})
+
+    def test_parse_rejects_garbage(self):
+        for bad in ("3-25:2.0", "x-7:2", "3-7:0", "3-7:-1", "3-7"):
+            with self.assertRaises(ValueError):
+                imm._parse_hour_mults(bad)
+
+    def test_empty_spec_is_off(self):
+        self.assertEqual(imm._parse_hour_mults(""), {})
+        imm.HOUR_SIZE_MULTS = {}
+        base = imm.series_levels("KXFOO")
+        self.assertIs(imm.hour_scaled_levels("KXFOO", utc(2026, 7, 25, 7, 30)),
+                      base)
+
+    def test_window_membership_et(self):
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("3-7:2.0")
+        imm.HOUR_MULT_EXCLUDE = ("KXTEMP",)
+        base = imm.series_levels("KXFOO")
+        doubled = [(t, s * 2) for t, s in base]
+        # 07:30Z = 3:30am EDT -> in; 11:59Z = 7:59am EDT -> still in
+        # (hour 7 inclusive); 12:00Z = 8:00am EDT -> out.
+        self.assertEqual(
+            imm.hour_scaled_levels("KXFOO", utc(2026, 7, 25, 7, 30)), doubled)
+        self.assertEqual(
+            imm.hour_scaled_levels("KXFOO", utc(2026, 7, 25, 11, 59)), doubled)
+        self.assertEqual(
+            imm.hour_scaled_levels("KXFOO", utc(2026, 7, 25, 12, 0)), base)
+        # 06:59Z = 2:59am EDT -> out (window starts at 3).
+        self.assertEqual(
+            imm.hour_scaled_levels("KXFOO", utc(2026, 7, 25, 6, 59)), base)
+
+    def test_excluded_prefix_never_scales(self):
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("3-7:2.0")
+        imm.HOUR_MULT_EXCLUDE = ("KXTEMP",)
+        inside = utc(2026, 7, 25, 7, 30)
+        self.assertEqual(imm.hour_scaled_levels("KXTEMPAUSH", inside),
+                         imm.series_levels("KXTEMPAUSH"))
+        self.assertEqual(imm.hour_size_mult("KXTEMPNYCH", inside), 1.0)
+
+    def test_rounding_half_up_floor_one(self):
+        imm.HOUR_SIZE_MULTS = {3: 0.5}
+        imm.HOUR_MULT_EXCLUDE = ()
+        inside = utc(2026, 7, 25, 7, 30)          # 3:30am EDT
+        base = imm.series_levels("KXFOO")
+        got = imm.hour_scaled_levels("KXFOO", inside)
+        self.assertEqual(got, [(t, max(1, int(s * 0.5 + 0.5)))
+                               for t, s in base])
+        self.assertTrue(all(s >= 1 for _t, s in got))
+
+
 if __name__ == "__main__":
     unittest.main()

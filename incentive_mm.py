@@ -239,6 +239,62 @@ def series_side_max(series: str) -> int:
     return sum(s for _t, s in series_levels(series))
 
 
+# Hour-of-day ladder size multipliers (Jack 2026-07-25, from the 8-day
+# hour-of-day study): ET hours 3-7 carry ~1/3.3 the traded flow of the
+# 9a-1p block, HALF the fill turnover per resting contract, and ~breakeven
+# non-temp fill P&L — resting bigger ladders there is near-free rent.
+# Spec "3-7:2.0,21-23:0.5": ET hour ranges (INCLUSIVE both ends, wrapping
+# midnight allowed) -> multiplier on every rung of the series ladder.
+# hour_scaled_levels() is the single source of ladder truth for the quote
+# loop, the placement side/level caps, the collateral estimate and the
+# candidate yield overlay — the 2026-07-14 lesson: EVERY consumer must see
+# the same shape, or the placement guard blocks the boosted rungs.
+# KXTEMP is excluded by default: its fill adverse selection is flat
+# ~-6c/contract around the clock (measured on 7/17-7/25 settled fills), so
+# more overnight temp size scales the bleed 1:1 with the rent.
+def _parse_hour_mults(spec: str) -> Dict[int, float]:
+    out: Dict[int, float] = {}
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        rng, _, mult = part.partition(":")
+        a, _, b = rng.partition("-")
+        try:
+            lo, hi, m = int(a), int(b or a), float(mult)
+        except ValueError:
+            raise ValueError(f"bad IMM_HOUR_SIZE_MULT part: {part!r}")
+        if not (0 <= lo <= 23 and 0 <= hi <= 23 and m > 0):
+            raise ValueError(f"bad IMM_HOUR_SIZE_MULT part: {part!r}")
+        hours = list(range(lo, hi + 1)) if lo <= hi \
+            else list(range(lo, 24)) + list(range(0, hi + 1))
+        for h in hours:
+            out[h] = m
+    return out
+
+
+HOUR_SIZE_MULTS = _parse_hour_mults(os.environ.get("IMM_HOUR_SIZE_MULT", ""))
+HOUR_MULT_EXCLUDE = tuple(
+    p for p in os.environ.get("IMM_HOUR_MULT_EXCLUDE", "KXTEMP").split(",") if p)
+
+
+def hour_size_mult(series: str, now_utc: datetime) -> float:
+    """Active ladder multiplier for this series at this instant (1.0 outside
+    configured windows and for excluded series prefixes)."""
+    if not HOUR_SIZE_MULTS:
+        return 1.0
+    if any(series.startswith(p) for p in HOUR_MULT_EXCLUDE):
+        return 1.0
+    return HOUR_SIZE_MULTS.get(now_utc.astimezone(ET).hour, 1.0)
+
+
+def hour_scaled_levels(series: str, now_utc: datetime) -> List[Tuple[int, int]]:
+    """series_levels() with the hour multiplier applied to every rung size
+    (half-up rounding, floor 1)."""
+    lv = series_levels(series)
+    m = hour_size_mult(series, now_utc)
+    if m == 1.0:
+        return lv
+    return [(t, max(1, int(s * m + 0.5))) for t, s in lv]
+
+
 def series_max_position(series: str) -> float:
     ov = SERIES_OVERRIDES.get(series)
     return ov.max_position if (ov and ov.max_position is not None) \
@@ -2236,7 +2292,8 @@ class IncentiveMarketMaker:
                 return 0.0
             bid = int(meta.mid_cents - meta.spread_cents / 2)
             ask = int(meta.mid_cents + meta.spread_cents / 2)
-            worst = ladder_collateral_dollars(bid, ask, series_levels(meta.series))
+            worst = ladder_collateral_dollars(
+                bid, ask, hour_scaled_levels(meta.series, now_utc))
             return worst * COLLATERAL_REALIZATION   # realistic, not worst-case
 
         # quote_all series (e.g. Love Island) are force-included: EVERY market
@@ -2324,8 +2381,8 @@ class IncentiveMarketMaker:
                 meta.target_size, meta.discount_factor, own_in_book=True)
             n_contracts = sum(r for _s, _p, r in own_live)
         else:
-            lv = series_levels(meta.series)
-            side_max = series_side_max(meta.series)
+            lv = hour_scaled_levels(meta.series, datetime.now(timezone.utc))
+            side_max = sum(s for _t, s in lv)
             ext_bid, ext_ask = external_best(yes_levels, no_levels)
             quotes: List[Quote] = []
             if ext_bid is not None and ext_bid >= series_price_min(meta.series):
@@ -2959,8 +3016,8 @@ class IncentiveMarketMaker:
             # 5/5/5 ladder with a tighter 50-contract net cap). For quote_all
             # series the cap/skew track the bot's OWN book, so the user's
             # coexisting manual position doesn't shrink the bot's room.
-            lv = series_levels(meta.series)
-            side_max = series_side_max(meta.series)
+            lv = hour_scaled_levels(meta.series, now_utc)
+            side_max = sum(s for _t, s in lv)
             maxpos = series_max_position(meta.series)
             cap_pos = own_pos if quote_all else pos
             room_buy = min(maxpos - cap_pos, share_buy, side_max)
@@ -3243,8 +3300,13 @@ class IncentiveMarketMaker:
                     placed += 1
                 continue
             series = series_of(q.ticker)
-            side_cap = series_side_max(series)
-            max_level_size = max(s for _t, s in series_levels(series))
+            # Same hour-scaled shape as the quote loop that built q — an
+            # unscaled cap here would block every boosted rung with
+            # side_cap/level_cap alerts (the duplicated-threshold class).
+            lv_now = hour_scaled_levels(
+                series, datetime.fromtimestamp(now_ts, tz=timezone.utc))
+            side_cap = sum(s for _t, s in lv_now)
+            max_level_size = max(s for _t, s in lv_now)
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)
@@ -3543,6 +3605,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if ok else 1
 
     client = build_client()
+
+    if HOUR_SIZE_MULTS:
+        log(f"[IMM] hour-size multipliers (ET hour -> x): "
+            f"{dict(sorted(HOUR_SIZE_MULTS.items()))}; excluded prefixes: "
+            f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'}")
 
     if args.cancel_all:
         bot = IncentiveMarketMaker(client, live=True)
