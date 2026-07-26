@@ -1524,9 +1524,10 @@ class TestTempSeriesTuning(unittest.TestCase):
         asks = imm.build_side_ladder("KXTEMPDCH-26JUL2112-T80.99", "ask",
                                      89, 80, 100)
         self.assertEqual([q.price_cents for q in asks], [89, 90])
-        # a non-temp ticker keeps the full ladder at the same anchors
+        # non-temp tickers now share the same 5..90 global band (2026-07-26):
+        # the 4c rung dies for them too
         bids2 = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 6, 10, 100)
-        self.assertEqual([q.price_cents for q in bids2], [6, 5, 4])
+        self.assertEqual([q.price_cents for q in bids2], [6, 5])
 
     def test_rain_series_share_the_weather_band(self):
         # Jack 2026-07-26: rain (daily + monthly city series) uses the same
@@ -1571,9 +1572,11 @@ class TestTempSeriesTuning(unittest.TestCase):
         asks = imm.build_side_ladder("KXTEMPDCH-26JUL2112-T80.99", "ask",
                                      3, 1, 100)       # rungs 3/4/5: 3,4 < 5
         self.assertEqual([q.price_cents for q in asks], [5])
-        # global band caps bids at 95 the same way
+        # global band is 5..90 too (Jack 2026-07-26): rungs 97/96/95 all die
         bids2 = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 97, 99, 100)
-        self.assertEqual([q.price_cents for q in bids2], [95])
+        self.assertEqual(bids2, [])
+        bids3 = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 91, 99, 100)
+        self.assertEqual([q.price_cents for q in bids3], [90, 89])
 
 
 class TestStickySelection(unittest.TestCase):

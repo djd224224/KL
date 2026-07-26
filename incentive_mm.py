@@ -378,10 +378,16 @@ HOURLY_ACTIVATION_WINDOW_SECS = _env_int("IMM_HOURLY_ACTIVATION_WINDOW", 720)
 ORDER_TTL_SECS = _env_int("IMM_ORDER_TTL_SECS", 600)
 ORDER_REFRESH_SECS = _env_int("IMM_ORDER_REFRESH_SECS", 420)
 
-PRICE_MIN_CENTS = _env_int("IMM_PRICE_MIN_CENTS", 1)    # never quote below (bid side)
-PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 95)   # never quote above (ask side)
-MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 1)            # skip markets with mid outside
-MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 95)
+# GLOBAL band 5..90 (Jack 2026-07-26: "i want 5-90 to be global not just
+# weather" — supersedes the 7/13 widening to 1/95). Applies BOTH sides BOTH
+# bounds via build_side_ladder, and the top-in-band rule stands a market
+# down entirely when its book top is outside — extreme-priced books are
+# scraps with tail risk, not rent. The mid-band selection screen aligns so
+# the bot doesn't select markets it would never quote.
+PRICE_MIN_CENTS = _env_int("IMM_PRICE_MIN_CENTS", 5)    # never quote below (bid side)
+PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 90)   # never quote above (ask side)
+MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 5)            # skip markets with mid outside
+MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 90)
 # Wide screen effectively OFF (Jack 2026-07-23: 25->99): incentives are earned
 # for RESTING regardless of spread, and a wide book means LESS competition ->
 # HIGHER pool share, so wider is better, not worse. 99 lets every real book
