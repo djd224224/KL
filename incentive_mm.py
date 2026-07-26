@@ -208,6 +208,24 @@ for _s in os.environ.get("IMM_AQI_SERIES", "KXAQICITY").split(","):
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             cutoff_from_close_min=_env_int("IMM_AQI_CUTOFF_FROM_CLOSE_MIN", 30))
 
+# Rain markets (enrolled 2026-07-26): daily city binaries (KXRAIN) + monthly
+# rain-day-count series (KXRAIN<CITY>M). Same 5..90c band as KXTEMP, BOTH
+# sides BOTH bounds (Jack 2026-07-26, caught the bot at 2cx3c on a dead
+# KXRAINHOUM strike: "i thought the range was 5-90c" — the 1..95 global band
+# is for non-weather). A band also activates the top-in-band rule: an
+# out-of-band book top stands the market down entirely, killing 1c-scrap
+# quoting on dead strikes. Ladder/caps/cutoffs stay global (daily = midnight
+# rule; monthly = continuous to close). NOTE: new rain cities must be added
+# here (or via IMM_RAIN_SERIES) as well as the allowlist, like IMM_TEMP_SERIES.
+for _s in os.environ.get(
+        "IMM_RAIN_SERIES",
+        "KXRAIN,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,"
+        "KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM").split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
+            price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90))
+
 
 def series_pad_to_target(series: str) -> bool:
     if PAD_TO_TARGET_GLOBAL:

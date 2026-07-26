@@ -1528,6 +1528,21 @@ class TestTempSeriesTuning(unittest.TestCase):
         bids2 = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 6, 10, 100)
         self.assertEqual([q.price_cents for q in bids2], [6, 5, 4])
 
+    def test_rain_series_share_the_weather_band(self):
+        # Jack 2026-07-26: rain (daily + monthly city series) uses the same
+        # 5..90c band as KXTEMP — caught the bot at 2cx3c on a dead
+        # KXRAINHOUM strike under the 1..95 global band.
+        for s in ("KXRAIN", "KXRAINHOUM", "KXRAINSTPM"):
+            self.assertEqual(imm.series_price_min(s), 5, s)
+            self.assertEqual(imm.series_price_max(s), 90, s)
+        # band trims the ladder exactly like temp
+        bids = imm.build_side_ladder("KXRAINHOUM-26JUL-6", "bid", 6, 10, 100)
+        self.assertEqual([q.price_cents for q in bids], [6, 5])
+        # cutoffs/ladder stay global (band-only override)
+        ov = imm.series_override("KXRAINHOUM")
+        self.assertIsNone(ov.cutoff_from_close_min)
+        self.assertIsNone(ov.levels)
+
     def test_out_of_band_top_stands_aside_entirely(self):
         # Jack 2026-07-21: if the TOP of book is outside the band, no quotes
         # at all — not even the in-band side. (Global band 1-95 here: top at
