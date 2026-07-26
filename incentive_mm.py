@@ -1595,6 +1595,9 @@ class BotState:
     accrued_est: Dict[str, float] = field(default_factory=dict)   # ticker -> lifetime est
     #   reward accrued ($; live share x $/day integrated per cycle). Feeds the
     #   hopeless-exit / entry-floor credit: accrued + projection vs the $1 bar.
+    programmed: Set[str] = field(default_factory=set)   # markets with a LIVE incentive
+    #   program at the last universe refresh — the no-rent freeze (Jack 2026-07-26,
+    #   KXRT: "why still quoting when the rewards have expired") keys off this
     place_uncertain: Dict[Tuple[str, str, int], float] = field(default_factory=dict)
     realized_baseline: float = 0.0       # lifetime realized at last daily roll
     last_mark: Dict[str, float] = field(default_factory=dict)   # ticker -> YES mid cents
@@ -2130,6 +2133,11 @@ class IncentiveMarketMaker:
                 and not hour_crossed and not in_activation_window):
             return
         by_market = self.fetch_programs()
+        # Live-program set for the no-rent freeze (empty on a failed/empty
+        # read keeps the failsafe in the consumers: never mass-freeze on a
+        # transient feed outage).
+        if by_market:
+            self.state.programmed = set(by_market)
 
         def ticker_cutoff_passed(t: str) -> bool:
             # Cheap pre-filter: drop only when the ticker-embedded event DAY is
@@ -2534,6 +2542,11 @@ class IncentiveMarketMaker:
                    # longs at 1-8c asks and covering shorts he wanted left
                    # alone). Positions ride to settlement; flatten by hand.
                    and not self._blocked(t)
+                   # NO-RENT FREEZE (Jack 2026-07-26, KXRT after its movie
+                   # programs expired): a market with no LIVE incentive
+                   # program gets no orders either — quotes exist only where
+                   # rent exists. Empty programmed set = failsafe open.
+                   and (not self.state.programmed or t in self.state.programmed)
                    # only restore inventory that is genuinely OURS — a manual
                    # position on a once-quoted market is the user's business
                    and abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
@@ -2806,6 +2819,11 @@ class IncentiveMarketMaker:
             if self._blocked(t):
                 # frozen series (see restore_orphan_metas): flush any entry
                 # that predates the blocklisting so no wind-down orders rest
+                self.state.managed_extra.pop(t, None)
+            elif self.state.programmed and t not in self.state.programmed:
+                # NO-RENT FREEZE: the market's incentive program ended, so
+                # wind-down quoting ends with it (Jack 2026-07-26, KXRT).
+                # Re-programming re-admits it through normal selection.
                 self.state.managed_extra.pop(t, None)
             elif abs(positions.get(t, 0.0)) < REDUCE_ONLY_MIN_CONTRACTS:
                 self.state.managed_extra.pop(t, None)

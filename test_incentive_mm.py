@@ -1716,6 +1716,37 @@ class TestStickySelection(unittest.TestCase):
         finally:
             imm.SERIES_BLOCKLIST_PREFIXES = old
 
+    def test_no_rent_freeze(self):
+        # Jack 2026-07-26 (KXRT after its movie programs expired): a market
+        # with no LIVE incentive program gets no orders — not even reduce-only
+        # wind-down. Empty programmed set = failsafe open (a transient feed
+        # outage must not mass-freeze the book).
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        t = "KXDEAD-99DEC31-A"
+        meta = MarketMeta(
+            ticker=t, event_ticker="KXDEAD-99DEC31", series="KXDEAD",
+            dollars_per_day=0.0, program_end=None, target_size=0.0,
+            discount_factor=0.5, cutoff=None, close_time=None)
+        # programmed set known and t NOT in it -> flushed from managed_extra
+        bot.state.programmed = {"KXGOOD-99DEC31-A"}
+        bot.state.managed_extra[t] = meta
+        bot.run_cycle()
+        self.assertNotIn(t, bot.state.managed_extra)
+        # ...and restore_orphan_metas refuses to recreate it
+        bot.state.known_tickers.add(t)
+        bot.pnl.pos[t] = -40.0
+        bot.restore_orphan_metas({t: -40.0})
+        self.assertNotIn(t, bot.state.managed_extra)
+        # failsafe: with an EMPTY programmed set the entry survives
+        # (register the market so the fixture's get_markets can serve it)
+        bot.client.markets[t] = dict(
+            bot.client.markets["KXGOOD-99DEC31-A"],
+            ticker=t, event_ticker="KXDEAD-99DEC31")
+        bot.state.programmed = set()
+        bot.restore_orphan_metas({t: -40.0})
+        self.assertIn(t, bot.state.managed_extra)
+
     def test_accrued_est_survives_restart(self):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
