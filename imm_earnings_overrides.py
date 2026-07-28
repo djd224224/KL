@@ -280,7 +280,12 @@ def classify_series(series: str, sample_ticker: str):
         return "review", "new temp city — needs IMM_TEMP_SERIES override"
     parts = sample_ticker.split("-")
     if len(parts) >= 2 and COMPANY_EVENT_RE.match(parts[1]) and len(series) <= 14:
-        return "enroll", "company/consumer metric shape"
+        # NO-NEW company rule (Jack 2026-07-28): the bot no longer admits
+        # fresh company markets, so the classifier must not ALLOW new company
+        # series either — surface in REVIEW for visibility instead. (The
+        # bot-side NO_NEW_SERIES gate covers already-allowed series; this
+        # closes the front door for brand-new tickers.)
+        return "review", "company/consumer shape — NOT enrolled (no-new company rule 7/28)"
     return "review", "unclassified"
 
 
