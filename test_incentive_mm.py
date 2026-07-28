@@ -1310,8 +1310,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                          "enroll")
         self.assertEqual(self._classify("KXLTCMAXY", "KXLTCMAXY-LTC-26DEC31")[0],
                          "enroll")
+        # company shapes: REVIEW since the 7/28 no-new company rule (they
+        # were "enroll" until then — the classifier is the front door the
+        # NO_NEW_SERIES gate can't see)
         self.assertEqual(self._classify("KXTSLA", "KXTSLA-26AUGDELIV-450000")[0],
-                         "enroll")
+                         "review")
         # fleet monthly / blocklist / ambiguous stay out
         self.assertEqual(self._classify("KXLTCMAXMON", "KXLTCMAXMON-LTC-26JUL31")[0],
                          "skip")

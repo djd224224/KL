@@ -918,6 +918,13 @@ def load_extra_allow_series() -> int:
 # ticker-date rule means dailies only ever quote the day BEFORE the
 # measurement day (Jack 2026-07-28: tomorrow-only, never the radar-flow day).
 RAIN_FAIR_ENABLE = os.environ.get("IMM_RAIN_FAIR_ENABLE", "1") == "1"
+# Hand-exempt events (Jack 2026-07-28 ~8pm ET: "on KXRAIN-26JUL29, override
+# and quote all the markets within 5-90 until midnight"): these events skip
+# the fair gate entirely — the 5-90 band, cutoff and every other screen
+# still govern. Stale entries are inert once the event settles.
+RAIN_FAIR_EXEMPT_EVENTS = frozenset(
+    s for s in os.environ.get(
+        "IMM_RAIN_FAIR_EXEMPT", "KXRAIN-26JUL29").split(",") if s)
 RAIN_FAIR_TOL_CENTS = _env_int("IMM_RAIN_FAIR_TOL_CENTS", 10)
 RAIN_FAIR_TTL_MIN = _env_int("IMM_RAIN_FAIR_TTL_MIN", 240)
 RAIN_FAIR_REFRESH_MIN = _env_int("IMM_RAIN_FAIR_REFRESH_MIN", 30)
@@ -3371,7 +3378,8 @@ class IncentiveMarketMaker:
             # market, so quoting auto-resumes when book and forecast agree
             # again. Missing/stale fair (TTL in rain_fair_p) -> gate open ->
             # plain band behavior.
-            if RAIN_FAIR_ENABLE and meta.series == RAIN_FAIR_SERIES:
+            if RAIN_FAIR_ENABLE and meta.series == RAIN_FAIR_SERIES \
+                    and meta.event_ticker not in RAIN_FAIR_EXEMPT_EVENTS:
                 p_fair = rain_fair_p(t, now_ts)
                 if p_fair is not None:
                     fair_c = p_fair * 100.0
