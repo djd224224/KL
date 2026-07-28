@@ -303,11 +303,41 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     return HOUR_SIZE_MULTS.get(now_utc.astimezone(ET).hour, 1.0)
 
 
+# Mention-family ladder multiplier (Jack 2026-07-28: x1.5 -> 15/0/0 base,
+# "raise any caps commensurately" — the per-market/per-event net caps and
+# skew thresholds scale by the same factor so the risk geometry keeps its
+# proportions). "Mention" = the allowlist's own semantics: MENTION-suffix
+# series plus the KXEARNINGSMENTION<SYM> tailed family. Composes with the
+# quiet-hours multiplier (3-7am ET: 15 -> 30 at the touch).
+MENTION_SIZE_MULT = _env_float("IMM_MENTION_SIZE_MULT", 1.5)
+
+
+def mention_size_mult(series: str) -> float:
+    if series.endswith("MENTION") or series.startswith("KXEARNINGSMENTION"):
+        return MENTION_SIZE_MULT
+    return 1.0
+
+
+def applied_mention_mult(series: str) -> float:
+    """The mention multiplier ACTUALLY applied to this series' geometry:
+    1.0 for series with a hand-tuned SeriesOverride ladder/cap (Love Island
+    5/5/5 net-50 stays literal — Jack's 2026-07-12 spec, not an accident of
+    the family test); MENTION_SIZE_MULT for mention series riding the
+    global geometry. Every consumer (ladder, per-market/event caps, skew)
+    uses THIS, so the scaled pieces stay proportional to each other."""
+    ov = SERIES_OVERRIDES.get(series)
+    if ov and (ov.levels or ov.max_position is not None):
+        return 1.0
+    return mention_size_mult(series)
+
+
 def hour_scaled_levels(series: str, now_utc: datetime) -> List[Tuple[int, int]]:
-    """series_levels() with the hour multiplier applied to every rung size
-    (half-up rounding, floor 1)."""
+    """series_levels() with the family (mention) and hour multipliers applied
+    to every rung size (half-up rounding, floor 1). The single ladder-shape
+    source for the quote loop, the placement caps, the collateral estimate
+    and the yield overlay."""
     lv = series_levels(series)
-    m = hour_size_mult(series, now_utc)
+    m = hour_size_mult(series, now_utc) * applied_mention_mult(series)
     if m == 1.0:
         return lv
     return [(t, max(1, int(s * m + 0.5))) for t, s in lv]
@@ -315,8 +345,11 @@ def hour_scaled_levels(series: str, now_utc: datetime) -> List[Tuple[int, int]]:
 
 def series_max_position(series: str) -> float:
     ov = SERIES_OVERRIDES.get(series)
-    return ov.max_position if (ov and ov.max_position is not None) \
+    base = ov.max_position if (ov and ov.max_position is not None) \
         else MAX_POSITION_CONTRACTS
+    # commensurate with the mention ladder multiplier (Jack 2026-07-28);
+    # 1.0 for hand-tuned override series via applied_mention_mult
+    return base * applied_mention_mult(series)
 
 
 def series_price_min(series: str) -> int:
@@ -350,6 +383,12 @@ def series_of(ticker: str) -> str:
 
 MAX_POSITION_CONTRACTS = _env_float("IMM_MAX_POSITION", 100)   # per market (user spec)
 MAX_EVENT_CONTRACTS = _env_float("IMM_MAX_EVENT", 500)         # net per event (user spec)
+
+
+def event_cap_contracts(event_ticker: str) -> float:
+    """Per-event net cap, scaled commensurately with the family ladder
+    multiplier (mention x1.5 -> event cap 750; Jack 2026-07-28)."""
+    return MAX_EVENT_CONTRACTS * applied_mention_mult(series_of(event_ticker))
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
 # per market, but skew / one-sided books / churn / partial fills mean only a
@@ -1308,17 +1347,25 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
 
 
 def skewed_side_room(base_room: float, pos: float, accumulating: bool,
-                     side_max: Optional[int] = None) -> float:
-    """Inventory skew on top of hard caps: past SKEW_SOFT net contracts the
-    accumulating side is halved, past SKEW_HARD it is pulled entirely."""
+                     side_max: Optional[int] = None,
+                     soft: Optional[float] = None,
+                     hard: Optional[float] = None) -> float:
+    """Inventory skew on top of hard caps: past `soft` net contracts the
+    accumulating side is halved, past `hard` it is pulled entirely
+    (defaults SKEW_SOFT/HARD; callers scale them for bigger family
+    ladders so the skew geometry stays proportional)."""
     if not accumulating:
         return base_room
     if side_max is None:
         side_max = SIDE_MAX_CONTRACTS
+    if soft is None:
+        soft = SKEW_SOFT_CONTRACTS
+    if hard is None:
+        hard = SKEW_HARD_CONTRACTS
     a = abs(pos)
-    if a >= SKEW_HARD_CONTRACTS:
+    if a >= hard:
         return 0.0
-    if a >= SKEW_SOFT_CONTRACTS:
+    if a >= soft:
         return min(base_room, side_max / 2.0)
     return base_room
 
@@ -2886,8 +2933,8 @@ class IncentiveMarketMaker:
         for t, meta in managed.items():
             event_net[meta.event_ticker] = event_net.get(meta.event_ticker, 0.0) \
                 + self.pnl.pos.get(t, 0.0)
-        event_room_buy = {e: MAX_EVENT_CONTRACTS - n for e, n in event_net.items()}
-        event_room_sell = {e: MAX_EVENT_CONTRACTS + n for e, n in event_net.items()}
+        event_room_buy = {e: event_cap_contracts(e) - n for e, n in event_net.items()}
+        event_room_sell = {e: event_cap_contracts(e) + n for e, n in event_net.items()}
         # Orders preserved on blind markets never enter `desired`, so charge
         # their resting size against the event budget up front — otherwise
         # sibling markets would hand out the room those orders may consume.
@@ -2900,10 +2947,10 @@ class IncentiveMarketMaker:
                     continue
                 ev = managed[t].event_ticker
                 if parsed[0] == "bid":
-                    event_room_buy[ev] = event_room_buy.get(ev, MAX_EVENT_CONTRACTS) \
+                    event_room_buy[ev] = event_room_buy.get(ev, event_cap_contracts(ev)) \
                         - order_remaining(o)
                 else:
-                    event_room_sell[ev] = event_room_sell.get(ev, MAX_EVENT_CONTRACTS) \
+                    event_room_sell[ev] = event_room_sell.get(ev, event_cap_contracts(ev)) \
                         - order_remaining(o)
         # Per-event share: split remaining room across that event's quoted
         # markets, best-paying first (computed as we iterate).
@@ -2946,8 +2993,8 @@ class IncentiveMarketMaker:
             pos = positions.get(t, 0.0)
             n_left = max(event_markets_left.get(ev, 1), 1)
             event_markets_left[ev] = n_left - 1
-            share_buy = max(event_room_buy.get(ev, MAX_EVENT_CONTRACTS), 0.0) / n_left
-            share_sell = max(event_room_sell.get(ev, MAX_EVENT_CONTRACTS), 0.0) / n_left
+            share_buy = max(event_room_buy.get(ev, event_cap_contracts(ev)), 0.0) / n_left
+            share_sell = max(event_room_sell.get(ev, event_cap_contracts(ev)), 0.0) / n_left
 
             # YIELD TO THE HUMAN: account position diverging from the bot's
             # own book, or a non-imm resting order here, means the user is
@@ -3118,10 +3165,15 @@ class IncentiveMarketMaker:
             cap_pos = own_pos if quote_all else pos
             room_buy = min(maxpos - cap_pos, share_buy, side_max)
             room_sell = min(maxpos + cap_pos, share_sell, side_max)
+            fam_m = applied_mention_mult(meta.series)
             room_buy = skewed_side_room(room_buy, cap_pos, accumulating=cap_pos > 0,
-                                        side_max=side_max)
+                                        side_max=side_max,
+                                        soft=SKEW_SOFT_CONTRACTS * fam_m,
+                                        hard=SKEW_HARD_CONTRACTS * fam_m)
             room_sell = skewed_side_room(room_sell, cap_pos, accumulating=cap_pos < 0,
-                                         side_max=side_max)
+                                         side_max=side_max,
+                                         soft=SKEW_SOFT_CONTRACTS * fam_m,
+                                         hard=SKEW_HARD_CONTRACTS * fam_m)
             if reduce_only:
                 # Only the reducing side, and never more than would flatten our
                 # OWN book (a +5 position must not sell 35 and flip short 30).
@@ -3158,8 +3210,8 @@ class IncentiveMarketMaker:
                 quoted += 1
                 bought = sum(q.count for q in mq if q.book_side == "bid")
                 sold = sum(q.count for q in mq if q.book_side == "ask")
-                event_room_buy[ev] = event_room_buy.get(ev, MAX_EVENT_CONTRACTS) - bought
-                event_room_sell[ev] = event_room_sell.get(ev, MAX_EVENT_CONTRACTS) - sold
+                event_room_buy[ev] = event_room_buy.get(ev, event_cap_contracts(ev)) - bought
+                event_room_sell[ev] = event_room_sell.get(ev, event_cap_contracts(ev)) - sold
 
             # Reward-share estimate for status/summary + zero-share benching.
             # Live: our resting orders are already inside the fetched book.
@@ -3548,8 +3600,10 @@ class IncentiveMarketMaker:
                         os._exit(86)
             threading.Thread(target=_hang_watchdog, daemon=True,
                              name="hang-watchdog").start()
-        log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side), "
-            f"caps: market ±{MAX_POSITION_CONTRACTS:g}, event ±{MAX_EVENT_CONTRACTS:g}, "
+        log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
+            f"mention x{MENTION_SIZE_MULT:g}), "
+            f"caps: market ±{MAX_POSITION_CONTRACTS:g}, event ±{MAX_EVENT_CONTRACTS:g} "
+            f"(mention-scaled), "
             f"budget ${COLLATERAL_BUDGET:g}, "
             f"{('max ' + str(MAX_MARKETS) + ' events') if MAX_MARKETS > 0 else 'events uncapped'}, "
             f"TTL {ORDER_TTL_SECS}s, poll {POLL_SECS}s")

@@ -1957,10 +1957,11 @@ class TestSeriesOverrides(unittest.TestCase):
                          [(0, 5), (1, 5), (2, 5)])
         self.assertEqual(imm.series_side_max("KXLOVEISLMENTION"), 15)
         self.assertEqual(imm.series_max_position("KXLOVEISLMENTION"), 50)
-        # non-override series fall back to globals
+        # non-override series fall back to globals — mention-scaled since
+        # 2026-07-28 (x1.5 ladder -> commensurate net cap)
         self.assertEqual(imm.series_levels("KXWCMENTION"), imm.LEVELS)
         self.assertEqual(imm.series_max_position("KXWCMENTION"),
-                         imm.MAX_POSITION_CONTRACTS)
+                         imm.MAX_POSITION_CONTRACTS * imm.MENTION_SIZE_MULT)
 
     def test_loveisl_ladder_555(self):
         qs = imm.build_side_ladder("X", "bid", 49, 51, room=15,
@@ -2799,6 +2800,48 @@ class TestHourSizeMult(unittest.TestCase):
         self.assertEqual(imm.hour_scaled_levels("KXTEMPAUSH", inside),
                          imm.series_levels("KXTEMPAUSH"))
         self.assertEqual(imm.hour_size_mult("KXTEMPNYCH", inside), 1.0)
+
+    def test_mention_family_multiplier(self):
+        # Jack 2026-07-28: mention series x1.5 (15/0/0 on the 10-base),
+        # caps commensurate. "Mention" = MENTION suffix + KXEARNINGSMENTION*.
+        imm.HOUR_SIZE_MULTS = {}
+        outside = utc(2026, 7, 28, 13, 0)      # 9am ET, no hour mult
+        base = imm.series_levels("KXTRUMPMENTION")
+        self.assertEqual(imm.hour_scaled_levels("KXTRUMPMENTION", outside),
+                         [(t, int(s * 1.5 + 0.5)) for t, s in base])
+        self.assertEqual(imm.hour_scaled_levels("KXEARNINGSMENTIONF", outside),
+                         [(t, int(s * 1.5 + 0.5)) for t, s in base])
+        # non-mention untouched
+        self.assertIs(imm.hour_scaled_levels("KXGOOD", outside),
+                      imm.series_levels("KXGOOD"))
+        # composes with the quiet-hours window: x1.5 x2
+        imm.HOUR_SIZE_MULTS = {3: 2.0}
+        inside = utc(2026, 7, 28, 7, 30)       # 3:30am ET
+        self.assertEqual(imm.hour_scaled_levels("KXTRUMPMENTION", inside),
+                         [(t, int(s * 3.0 + 0.5)) for t, s in base])
+
+    def test_mention_caps_scale_commensurately(self):
+        self.assertAlmostEqual(imm.series_max_position("KXTRUMPMENTION"),
+                               imm.MAX_POSITION_CONTRACTS * 1.5)
+        self.assertAlmostEqual(imm.series_max_position("KXGOOD"),
+                               imm.MAX_POSITION_CONTRACTS)
+        # temp override cap unaffected (not mention)
+        self.assertEqual(imm.series_max_position("KXTEMPDCH"), 50)
+        # hand-tuned override series exempt even though it IS mention:
+        # Love Island keeps its literal 7/12 spec (5/5/5, net 50)
+        self.assertEqual(imm.series_max_position("KXLOVEISLMENTION"), 50)
+        self.assertEqual(imm.applied_mention_mult("KXLOVEISLMENTION"), 1.0)
+        self.assertAlmostEqual(
+            imm.event_cap_contracts("KXTRUMPMENTION-26JUL24"),
+            imm.MAX_EVENT_CONTRACTS * 1.5)
+        self.assertAlmostEqual(imm.event_cap_contracts("KXGOOD-99DEC31"),
+                               imm.MAX_EVENT_CONTRACTS)
+        # skew thresholds scale via the explicit params
+        room = imm.skewed_side_room(100, 40, accumulating=True,
+                                    side_max=100, soft=45, hard=90)
+        self.assertGreater(room, 0)            # 40 < scaled soft 45: no clamp
+        room2 = imm.skewed_side_room(100, 40, accumulating=True, side_max=100)
+        self.assertLess(room2, 100)            # default soft 30: halved
 
     def test_rounding_half_up_floor_one(self):
         imm.HOUR_SIZE_MULTS = {3: 0.5}
