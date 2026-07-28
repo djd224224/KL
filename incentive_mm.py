@@ -217,12 +217,18 @@ for _s in os.environ.get("IMM_AQI_SERIES", "KXAQICITY").split(","):
 # quoting on dead strikes. Ladder/caps/cutoffs stay global (daily = midnight
 # rule; monthly = continuous to close). NOTE: new rain cities must be added
 # here (or via IMM_RAIN_SERIES) as well as the allowlist, like IMM_TEMP_SERIES.
+_RAIN_LEVELS_SPEC = os.environ.get("IMM_RAIN_LEVELS", "").strip()
 for _s in os.environ.get(
         "IMM_RAIN_SERIES",
         "KXRAIN,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,"
         "KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            # IMM_RAIN_LEVELS (e.g. "0:3", Jack 2026-07-28: rain re-entry at
+            # 3/0/0) — empty = global ladder. A hand-tuned ladder here also
+            # exempts rain from family multipliers via applied_mention_mult
+            # (moot today: rain isn't mention).
+            levels=_parse_levels(_RAIN_LEVELS_SPEC) if _RAIN_LEVELS_SPEC else None,
             price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90))
 
