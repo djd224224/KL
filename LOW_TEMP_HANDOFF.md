@@ -42,10 +42,11 @@ outcome window); the cancel sweep covers **all** discovered markets, not just tr
 rows; the fair-NO cap is always on (no A/B machinery); UTF-8 stdout reconfigure for
 Windows runs.
 
-## Sizing / limits (testing phase, Jack 2026-07-22)
+## Sizing / limits (testing phase, Jack 2026-07-24)
 
-`LOW_STARTING_CONTRACTS=1` per rung (×2 on evening runs → 2/rung) — vs 15/30 on the high
-bot. Set in both `run_low_temp.ps1` and the script default; keep them in sync when
+`LOW_STARTING_CONTRACTS=2` per rung → **2/rung day-of, 4/rung evening** (×2 night
+multiplier); raised from 1/2 on 2026-07-24. Vs 15/30 on the high bot. Set in
+`run_low_temp.ps1`, the script default, AND the workflow env; keep all three in sync when
 bumping. `LOW_MAX_CONTRACTS=50` per market, ladder = 8 rungs × 2c, per-city mults 1.0.
 
 ## Schedule (LOCAL Task Scheduler — since 2026-07-22 evening)

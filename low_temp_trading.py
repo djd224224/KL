@@ -72,7 +72,8 @@ BQ tables: KXLOW_market_snapshot / KXLOW_orders / KXLOW_runs /
 KXLOW_alerts in the same dataset as the KXHIGH tables.
 
 Env knobs: LOW_DRY_RUN (default false) — full run but no order
-cancels/creates and no BQ writes; LOW_STARTING_CONTRACTS (default 8);
+cancels/creates and no BQ writes; LOW_STARTING_CONTRACTS (default 2 →
+2/rung day-of, 4/rung evening via the x2 night multiplier);
 LOW_MAX_CONTRACTS (default 50); TRADE_TAILS (default false);
 BIAS_CORRECTION_ENABLED and the BIAS_* knobs (same as the high bot).
 """
@@ -1416,9 +1417,10 @@ combined_table['resting_order_count'] = 0.0
 
 ######### BETTING INPUTS
 increment = 2
-# Testing size (Jack 2026-07-22): 1/rung day, 2/rung evening — vs the high
-# bot's 15/30. Bump via LOW_STARTING_CONTRACTS after real KXLOW P&L.
-starting_contracts = int(os.environ.get("LOW_STARTING_CONTRACTS", "1"))
+# Testing size (Jack 2026-07-24): 2/rung day-of, 4/rung evening (x2 night)
+# — raised from 1/2, vs the high bot's 15/30. Bump via LOW_STARTING_CONTRACTS
+# after real KXLOW P&L.
+starting_contracts = int(os.environ.get("LOW_STARTING_CONTRACTS", "2"))
 price_count = list(range(0, 8))
 
 # Tail markets are OFF in v1 — no low-temp actual-vs-forecast error

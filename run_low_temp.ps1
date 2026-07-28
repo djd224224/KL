@@ -34,9 +34,10 @@ $env:PYTHONIOENCODING = "utf-8"
 # made self-sufficient (google-auth installed 2026-07-22), so this is
 # belt-and-suspenders.
 $UserSite = "C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages"
-# Testing size (Jack 2026-07-22): 1/rung, x2 on evening runs (vs 15/30 on
-# the high bot). Raise here after real KXLOW P&L accumulates.
-$env:LOW_STARTING_CONTRACTS = "1"
+# Testing size (Jack 2026-07-24): 2/rung day-of, 4/rung evening (x2 night)
+# — raised from 1/2 (vs 15/30 on the high bot). Keep in sync with the
+# script default + workflow. Raise further after real KXLOW P&L.
+$env:LOW_STARTING_CONTRACTS = "2"
 $env:LOW_MAX_CONTRACTS = "50"
 $env:TRADE_TAILS = "false"
 
