@@ -909,6 +909,24 @@ RAIN_FAIR_FILE = os.environ.get(
     "IMM_RAIN_FAIR_FILE", os.path.join(STATUS_DIR, "rain_fair_values.json"))
 _rain_fair_state: dict = {"mtime": 0.0, "fair": {}}   # (date_iso, city) -> (p, fetched_ts)
 
+# RAIN DIRECTIONAL (Jack 2026-07-28: "if its misquoted, just take the
+# directional bet... make it systematic with the normal 3/0/0 size"): when
+# the fair gate finds the touch divergent (same TOL), TAKE the NWS side —
+# RAIN_DIR_SIZE taker contracts at the touch, once per market per day,
+# position rides to settlement (size < REDUCE_ONLY_MIN so no wind-down
+# machinery touches it; the MM side is stood aside on these books by the
+# gate, so there is nothing of ours to self-cross). Every entry appends to
+# RAIN_DIR_LEDGER for the performance review (rain_dir_report.py joins
+# settlements; the digest shows the running score). Manually-traded markets
+# never reach the gate (the yield-to-human standoff exits the loop first).
+RAIN_DIR_ENABLE = os.environ.get("IMM_RAIN_DIR_ENABLE", "1") == "1"
+RAIN_DIR_SIZE = _env_int("IMM_RAIN_DIR_SIZE", 3)
+RAIN_DIR_MAX_PER_DAY = _env_int("IMM_RAIN_DIR_MAX_PER_DAY", 30)  # contracts/24h
+RAIN_DIR_LEDGER = os.environ.get(
+    "IMM_RAIN_DIR_LEDGER", os.path.join(STATUS_DIR, "rain_directional_ledger.csv"))
+RAIN_DIR_LEDGER_HEADER = ("ts,ticker,take_side,contracts,price_cents,fair_cents,"
+                          "ext_bid,ext_ask,edge_cents,order_id\n")
+
 
 def load_rain_fair() -> int:
     """Hot-reload RAIN_FAIR_FILE by mtime into _rain_fair_state. Returns the
@@ -1725,6 +1743,8 @@ class BotState:
     accrued_est: Dict[str, float] = field(default_factory=dict)   # ticker -> lifetime est
     #   reward accrued ($; live share x $/day integrated per cycle). Feeds the
     #   hopeless-exit / entry-floor credit: accrued + projection vs the $1 bar.
+    rain_dir_done: Dict[str, float] = field(default_factory=dict)  # ticker -> entry ts
+    #   (rain-directional once-per-market dedupe; persisted, pruned at 7d)
     programmed: Set[str] = field(default_factory=set)   # markets with a LIVE incentive
     #   program at the last universe refresh — the no-rent freeze (Jack 2026-07-26,
     #   KXRT: "why still quoting when the rewards have expired") keys off this
@@ -1855,6 +1875,11 @@ class IncentiveMarketMaker:
             # (or re-floor) markets that already banked most of their $1.
             self.state.accrued_est = {str(t): float(v) for t, v in
                                       (data.get("accrued_est") or {}).items()}
+            # rain-directional once-per-market dedupe must survive restarts
+            # (this bot restarts often) or every restart would re-take the
+            # same divergent books.
+            self.state.rain_dir_done = {str(t): float(v) for t, v in
+                                        (data.get("rain_dir_done") or {}).items()}
             # Halt continuity (same roll-day only): a restart must NOT hand
             # the bot a fresh loss budget or clear an active halt. Use
             # --clear-halt (bot stopped) for a deliberate un-halt.
@@ -1913,7 +1938,10 @@ class IncentiveMarketMaker:
                            "accrued_est": {t: round(v, 4)
                                            for t, v in self.state.accrued_est.items()
                                            if v >= 1e-4
-                                           and t in self.state.known_tickers}}, f)
+                                           and t in self.state.known_tickers},
+                           "rain_dir_done": {t: round(v, 1)
+                                             for t, v in self.state.rain_dir_done.items()
+                                             if time.time() - v < 7 * 86400}}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.
@@ -2108,6 +2136,71 @@ class IncentiveMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! cancel-all sweep failed: {e}")
         return n
+
+    def rain_directional_take(self, t: str, ext_bid, ext_ask, fair_c: float,
+                              bid_bad: bool, ask_bad: bool, now_ts: float) -> None:
+        """Take the NWS side of a divergent rain book (see RAIN_DIR_ENABLE
+        block). ask_bad: touch ask under fair-TOL -> buy YES at the ask.
+        bid_bad: touch bid over fair+TOL -> buy NO at (100 - bid). Taker
+        (post_only=False), once per market, capped per 24h, ledgered."""
+        if not (RAIN_DIR_ENABLE and RAIN_DIR_SIZE > 0):
+            return
+        if t in self.state.rain_dir_done:
+            return
+        taken_24h = sum(1 for ts_ in self.state.rain_dir_done.values()
+                        if now_ts - ts_ < 86400) * RAIN_DIR_SIZE
+        if taken_24h + RAIN_DIR_SIZE > RAIN_DIR_MAX_PER_DAY:
+            log(f"{self.tag} rain-DIR skip {t}: 24h cap "
+                f"({taken_24h}/{RAIN_DIR_MAX_PER_DAY} contracts)")
+            return
+        if ask_bad and ext_ask is not None:
+            take_side, px, kwargs = "yes", int(ext_ask), dict(
+                side="yes", action="buy", yes_price=int(ext_ask))
+            edge = fair_c - ext_ask
+        elif bid_bad and ext_bid is not None:
+            no_px = 100 - int(ext_bid)
+            take_side, px, kwargs = "no", no_px, dict(
+                side="no", action="buy", no_price=no_px)
+            edge = ext_bid - fair_c
+        else:
+            return
+        expiration_ts = int(now_ts + 600)
+        cutoff_ts = self.state.cutoff_ts.get(t)
+        if cutoff_ts is not None:
+            expiration_ts = min(expiration_ts, int(cutoff_ts))
+            if expiration_ts <= now_ts + 1:
+                return
+        client_order_id = f"{CLIENT_ORDER_PREFIX}-{RUN_ID}-{uuid.uuid4().hex[:12]}"
+        oid = f"dry-{uuid.uuid4().hex[:8]}"
+        if self.live:
+            try:
+                resp = self.client.create_order(
+                    ticker=t, client_order_id=client_order_id,
+                    count=RAIN_DIR_SIZE, type="limit", post_only=False,
+                    expiration_ts=expiration_ts,
+                    self_trade_prevention_type=STP_TYPE, **kwargs)
+                oid = ((resp.get("order") or {}).get("order_id")
+                       or resp.get("order_id", "?"))
+                self.state.our_order_ids[oid] = now_ts
+            except Exception as e:
+                log(f"{self.tag} ! rain-DIR order failed {t}: {e}")
+                return
+        self.state.rain_dir_done[t] = now_ts
+        try:
+            new = not os.path.exists(RAIN_DIR_LEDGER)
+            with open(RAIN_DIR_LEDGER, "a", encoding="utf-8") as f:
+                if new:
+                    f.write(RAIN_DIR_LEDGER_HEADER)
+                f.write(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')},"
+                        f"{t},{take_side},{RAIN_DIR_SIZE},{px},{fair_c:.0f},"
+                        f"{ext_bid if ext_bid is not None else ''},"
+                        f"{ext_ask if ext_ask is not None else ''},"
+                        f"{edge:.0f},{oid}\n")
+        except OSError as e:
+            log(f"{self.tag} ! rain-DIR ledger write failed: {e}")
+        log(f"{self.tag} rain-DIR TAKE {t}: {take_side.upper()} {RAIN_DIR_SIZE}x @ "
+            f"{px}c vs fair {fair_c:.0f}c (edge {edge:+.0f}c)"
+            f"{'' if self.live else ' [DRY]'}")
 
     def cancel_market_orders(self, ticker: str, resting: List[dict]) -> int:
         n = 0
@@ -3270,6 +3363,11 @@ class IncentiveMarketMaker:
                                 f"{ext_bid}x{ext_ask} vs fair {fair_c:.0f}c "
                                 f"(tol {RAIN_FAIR_TOL_CENTS}c)")
                         self.cancel_market_orders(t, resting)
+                        # divergent book = the systematic directional entry
+                        # (Jack 2026-07-28); manual-standoff markets never
+                        # reach here, so his own bets are never crossed.
+                        self.rain_directional_take(
+                            t, ext_bid, ext_ask, fair_c, bid_bad, ask_bad, now_ts)
                         continue
             if t in self._rain_fair_stood:
                 self._rain_fair_stood.discard(t)

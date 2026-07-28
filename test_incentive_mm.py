@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for incentive_mm.py — run: python -m unittest test_incentive_mm"""
 
+import csv
 import json
 import os
 import tempfile
@@ -26,6 +27,10 @@ def setUpModule():
     imm.STATUS_DIR = tmp
     imm.HALT_FILE = os.path.join(tmp, "HALT")
     imm.IncentiveMarketMaker.PERSIST_PATH = os.path.join(tmp, "imm_state.json")
+    # baked-at-import file paths must ALL be redirected or run_cycle-driven
+    # tests write into production run-logs (bit us 2026-07-28: gate-test dry
+    # takes landed in the LIVE rain_directional_ledger.csv)
+    imm.RAIN_DIR_LEDGER = os.path.join(tmp, "rain_directional_ledger.csv")
     # These paths were ALSO resolved from the live status dir at import time.
     # ORDER_JOURNAL_PATH is the dangerous one — _clean_persist() DELETES it, so
     # before 2026-07-28 every test run removed the LIVE bot's crash journal
@@ -1774,6 +1779,62 @@ class TestStickySelection(unittest.TestCase):
         bot.state.programmed = set()
         bot.restore_orphan_metas({t: -40.0})
         self.assertIn(t, bot.state.managed_extra)
+
+    def test_rain_directional_take(self):
+        # Jack 2026-07-28: divergent rain book -> take the NWS side, 3x,
+        # once per market, ledgered. Dry mode writes the ledger + dedupe
+        # without an exchange call.
+        _clean_persist()
+        import incentive_mm as _imm
+        old_ledger = _imm.RAIN_DIR_LEDGER
+        _imm.RAIN_DIR_LEDGER = os.path.join(_imm.STATUS_DIR, "test_rain_dir.csv")
+        try:
+            try:
+                os.remove(_imm.RAIN_DIR_LEDGER)
+            except FileNotFoundError:
+                pass
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            now_ts = time.time()
+            t = "KXRAIN-26JUL29-MIN"
+            # ask 33 < fair 60 - tol -> buy YES at the ask
+            bot.rain_directional_take(t, 32, 33, 60.0, False, True, now_ts)
+            self.assertIn(t, bot.state.rain_dir_done)
+            with open(_imm.RAIN_DIR_LEDGER, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["take_side"], "yes")
+            self.assertEqual(rows[0]["price_cents"], "33")
+            self.assertEqual(rows[0]["contracts"], str(_imm.RAIN_DIR_SIZE))
+            # dedupe: second call is a no-op
+            bot.rain_directional_take(t, 32, 33, 60.0, False, True, now_ts)
+            with open(_imm.RAIN_DIR_LEDGER, newline="", encoding="utf-8") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 1)
+            # bid_bad direction: bid 14 > fair 2 + tol -> buy NO at 100-14
+            t2 = "KXRAIN-26JUL29-AUS"
+            bot.rain_directional_take(t2, 14, 16, 2.0, True, False, now_ts)
+            with open(_imm.RAIN_DIR_LEDGER, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[1]["take_side"], "no")
+            self.assertEqual(rows[1]["price_cents"], "86")
+            # dedupe survives restart
+            bot._save_persist()
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self.assertIn(t, bot2.state.rain_dir_done)
+            # 24h cap blocks further takes
+            old_cap = _imm.RAIN_DIR_MAX_PER_DAY
+            _imm.RAIN_DIR_MAX_PER_DAY = 2 * _imm.RAIN_DIR_SIZE
+            try:
+                bot.rain_directional_take("KXRAIN-26JUL29-DC", 18, 19, 29.0,
+                                          False, True, now_ts)
+                self.assertNotIn("KXRAIN-26JUL29-DC", bot.state.rain_dir_done)
+            finally:
+                _imm.RAIN_DIR_MAX_PER_DAY = old_cap
+        finally:
+            try:
+                os.remove(_imm.RAIN_DIR_LEDGER)
+            except FileNotFoundError:
+                pass
+            _imm.RAIN_DIR_LEDGER = old_ledger
 
     def test_accrued_est_survives_restart(self):
         _clean_persist()

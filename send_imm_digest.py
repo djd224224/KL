@@ -282,6 +282,68 @@ TD = 'padding:5px 12px;border:1px solid #ddd;text-align:right;'
 TDL = 'padding:5px 12px;border:1px solid #ddd;text-align:left;'
 
 
+def rain_dir_section(client):
+    """(text_lines, html) for the rain-directional ledger — settled P&L,
+    open MTM, hit rate (Jack 2026-07-28: 'make sure we can see how it
+    performs'). None when no ledger exists yet."""
+    import csv as _csv
+    ledger = os.path.join(os.path.dirname(STATUS_PATH), "rain_directional_ledger.csv")
+    if not os.path.exists(ledger):
+        return None
+    try:
+        with open(ledger, newline="", encoding="utf-8") as f:
+            rows = list(_csv.DictReader(f))
+    except OSError:
+        return None
+    if not rows:
+        return None
+    tickers = sorted({r["ticker"] for r in rows})
+    markets = {}
+    try:
+        for i in range(0, len(tickers), 50):
+            chunk = tickers[i:i + 50]
+            resp = client.get_markets(tickers=",".join(chunk), limit=len(chunk))
+            for m in resp.get("markets") or []:
+                markets[m.get("ticker", "")] = m
+    except Exception:
+        pass
+    settled = wins = 0
+    pnl_settled = mtm_open = 0.0
+    open_n = 0
+    for r in rows:
+        n = _f(r["contracts"]); px = _f(r["price_cents"]); side = r["take_side"]
+        m = markets.get(r["ticker"], {})
+        result = m.get("result") or ""
+        if result in ("yes", "no"):
+            settled += 1
+            win = result == side
+            wins += 1 if win else 0
+            pnl_settled += ((100 - px) if win else -px) / 100.0 * n
+        else:
+            open_n += 1
+            try:
+                bid = _f(m.get("yes_bid_dollars")) * 100
+                ask = _f(m.get("yes_ask_dollars")) * 100
+                if bid and ask:
+                    mid = (bid + ask) / 2
+                    mark = mid if side == "yes" else 100 - mid
+                    mtm_open += (mark - px) / 100.0 * n
+            except Exception:
+                pass
+    hit = f"{100 * wins / settled:.0f}%" if settled else "—"
+    text = [f"RAIN DIRECTIONAL: {len(rows)} bets ({settled} settled, hit {hit}) | "
+            f"settled P&L {pnl_settled:+.2f} | open {open_n} MTM {mtm_open:+.2f} | "
+            f"total {pnl_settled + mtm_open:+.2f}"]
+    html = (f'<div style="font-size:15px;font-weight:600;margin:10px 0 2px">'
+            f'Rain directional (NWS-vs-book)</div>'
+            f'<div style="color:#555;margin-bottom:10px">'
+            f'{len(rows)} bets &nbsp;·&nbsp; {settled} settled, hit <b>{hit}</b>'
+            f' &nbsp;·&nbsp; settled {_pnl_span(pnl_settled)}'
+            f' &nbsp;·&nbsp; {open_n} open, MTM {_pnl_span(mtm_open)}'
+            f' &nbsp;·&nbsp; total {_pnl_span(pnl_settled + mtm_open)}</div>')
+    return text, html
+
+
 def build_digest(now_utc: datetime):
     """Returns (plain_text, html)."""
     today_ct = now_utc.astimezone(CT).date()
@@ -324,6 +386,10 @@ def build_digest(now_utc: datetime):
                          f"{d['net_pos']:>+6.0f} {d['exposure']:>8.2f} {d['quoted']:>3d}")
     else:
         lines.append("No open inventory and no resting quotes.")
+    rd = rain_dir_section(client)
+    if rd:
+        lines.append("")
+        lines.extend(rd[0])
     lines.append("")
     lines.append(health)
     lines.append("(reward is the bot's own estimate.)")
@@ -384,6 +450,8 @@ def build_digest(now_utc: datetime):
                  'cost basis. Own-book only (excludes manual + other bots).</div>')
     else:
         h.append('<div>No open inventory and no resting quotes.</div>')
+    if rd:
+        h.append(rd[1])
     h.append(f'<div style="color:#777;font-size:12px;margin-top:12px;'
              f'border-top:1px solid #eee;padding-top:8px">{health}</div>')
     h.append('</div>')
