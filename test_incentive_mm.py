@@ -1192,6 +1192,11 @@ class TestOverrideBuffer(unittest.TestCase):
         imm.EVENT_START_OVERRIDES[ev] = release
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = 0.0
+        # KXINTC is company family — since the 7/28 no-new gate a FRESH
+        # company market can't admit; this test is about cutoff mechanics,
+        # so exempt the fixture.
+        old_no_new = imm.NO_NEW_SERIES
+        imm.NO_NEW_SERIES = frozenset()
         try:
             bot = IncentiveMarketMaker(client=client, live=False)
             bot.run_cycle()
@@ -1206,6 +1211,7 @@ class TestOverrideBuffer(unittest.TestCase):
                 self.assertLessEqual(o["expire_at"], cutoff.timestamp() + 1)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.NO_NEW_SERIES = old_no_new
             imm.EVENT_START_OVERRIDES.pop(ev, None)
 
 
@@ -1779,6 +1785,36 @@ class TestStickySelection(unittest.TestCase):
         bot.state.programmed = set()
         bot.restore_orphan_metas({t: -40.0})
         self.assertIn(t, bot.state.managed_extra)
+
+    def test_no_new_series_gate(self):
+        # Jack 2026-07-28: company family admits no FRESH markets; existing
+        # members keep quoting (grandfathered), including across restarts.
+        import incentive_mm as _imm
+        old = _imm.NO_NEW_SERIES
+        try:
+            # fresh candidate of a gated series: not selected
+            _clean_persist()
+            _imm.NO_NEW_SERIES = frozenset({"KXGOOD"})
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.run_cycle()
+            self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
+            # member grandfathered: select first with gate off, then gate on
+            _clean_persist()
+            _imm.NO_NEW_SERIES = frozenset()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.run_cycle()
+            self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
+            _imm.NO_NEW_SERIES = frozenset({"KXGOOD"})
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)   # stays
+            # ...and across a restart (sticky_prev grandfathers too)
+            bot._save_persist()
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot2.run_cycle()
+            self.assertIn("KXGOOD-99DEC31-A", bot2.state.selected)
+        finally:
+            _imm.NO_NEW_SERIES = old
 
     def test_rain_directional_take(self):
         # Jack 2026-07-28: divergent rain book -> take the NWS side, 3x,

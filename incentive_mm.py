@@ -578,6 +578,23 @@ ALLOW_SERIES = frozenset(
                 + "," + os.environ.get("IMM_ALLOW_ECON_SERIES", _DEFAULT_ECON_SERIES)
                 ).split(",") if s)
 
+# NO-NEW gate (Jack 2026-07-28 pm: "dont quote any new COMPANY markets —
+# keep quoting what you're currently quoting"): series listed here admit NO
+# fresh candidates; existing members ride their sticky life to its natural
+# end (cutoff/close/program end) and cannot re-enter afterward. Beats the
+# override-event bypass on purpose — a curated cutoff window on a company
+# event no longer implies admission. Default = the company operating-metric
+# + consumer-price set plus the company variants the auto-enroll task had
+# already added to extra_allow; the classifier keeps enrolling new company
+# series into the ALLOWLIST but this gate stops them at selection, so no
+# task change is needed. Env IMM_NO_NEW_SERIES overrides (empty = gate off).
+NO_NEW_SERIES = frozenset(
+    s for s in os.environ.get(
+        "IMM_NO_NEW_SERIES",
+        _DEFAULT_COMPANY_SERIES + ",KXAAL,KXAALA,KXALK,KXALKA,KXAXP,KXAXPA,"
+        "KXGOOGA,KXLUVA,KXSBUXA"
+    ).split(",") if s)
+
 # Event-start resolution for mention markets: the ticker date's midnight-ET
 # cutoff forfeits game-day daytime, but programs run ~1-2 days INCLUDING game
 # day — resolve real start times where a reliable source exists, cut off
@@ -2540,6 +2557,12 @@ class IncentiveMarketMaker:
                 # user wants EVERY market of the event (2026-07-12): exempt
                 # from floors, the hopeless exit and the yield ranking.
                 ranked.append(meta)
+            elif meta.series in NO_NEW_SERIES \
+                    and meta.ticker not in prev_selected:
+                # no-new gate (Jack 2026-07-28): company family admits no
+                # fresh markets; members above keep quoting via the branch
+                # below until natural death.
+                skipped["no_new"] = skipped.get("no_new", 0) + 1
             elif HOPELESS_EXIT and not reaches_min \
                     and meta.ticker in prev_selected \
                     and meta.event_ticker not in EVENT_START_OVERRIDES:
