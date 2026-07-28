@@ -213,7 +213,7 @@ not $200. Deliberate.
 | Zero-reward bench | est. reward share 0 for 30 cycles (book below target size) | bench 4h |
 | **Daily loss halt** | realized P&L **today** ≤ −$50 (this bot's fills only; baseline rolls at the 6 AM ET summary, so banked profit can't mask a bad day and yesterday's breach can't re-halt today) | cancel everything, idle until next ET day, urgent email |
 | `HALT` file | `run-logs\incentive-mm\HALT` exists | cancel everything, idle until removed |
-| **Rain-fair stand-aside** (2026-07-28) | KXRAIN daily whose NWS fair ±8c exits the 5..90 band (fair <13c or >82c) | cancel market, sticky-selected, auto-resumes when fair returns |
+| **Rain-fair gate** (2026-07-28) | KXRAIN daily whose touch fights the NWS fair: bid touch > fair+10c or ask touch < fair−10c | cancel market both sides, sticky-selected, auto-resumes when book and forecast re-agree; quotes are never re-priced (at-touch or nothing) |
 | Fail-safe | 4 consecutive cycle errors | cancel all resting, exponential backoff; wake-grace 120s after suspend/resume |
 | Shutdown | SIGINT/SIGTERM/SIGBREAK/atexit/finally | cancel all imm- orders; startup sweeps orphans by prefix |
 
@@ -222,34 +222,41 @@ real book. `--status` prints the live selection table without trading (verified
 2026-07-10: 29 markets, ~$975 ladder collateral, sensible universe of political/
 entertainment/long-dated markets, all pre-event).
 
-## Rain daily fair-value anchor (2026-07-28, "strategy 5")
+## Rain daily fair-value gate (2026-07-28, "strategy 5")
 
 KXRAIN dailies resolve on something PUBLICLY FORECAST at the exact settlement
 station (NWS hourly PoP ≈ P(measurable rain on the local calendar day) — the
-contract definition), so quoting them blind at the touch is voluntarily
-adversely selected. `rain_fair.py` computes per-station day probabilities
-(remaining hours only for today; exponent-haircut complement product,
-`RAIN_FAIR_HOURLY_EXP=0.5`) and the quote loop clamps the join anchors:
+contract definition), so joining a touch that fights the forecast is
+voluntarily adverse. `rain_fair.py` computes per-station day probabilities
+(exponent-haircut complement product, `RAIN_FAIR_HOURLY_EXP=0.5`).
 
-- **bid ≤ fair − 8c, ask ≥ fair + 8c** (`IMM_RAIN_FAIR_EDGE_CENTS`) — anchors
-  only ever move AWAY from the touch, never improve it.
-- fair ±8c outside the 5..90 band → **stand aside entirely** (one-sided
-  quoting earns nothing and eats pickoff risk); logged once per transition
-  (`rain-fair stand-aside` / `rain-fair resume`).
-- missing/stale fair (per-entry TTL `IMM_RAIN_FAIR_TTL_MIN=240`) → **plain
-  band behavior**, so every failure mode degrades to the pre-feature bot.
-- fair is FORECAST-ONLY: it cannot see rain that already fell today. That end
-  state is covered by top-in-band (book reprices ≥91c → stand-down). The
-  transition minutes (rain starting, book racing up) remain the residual
-  exposure — 3-contract ladders bound it to pocket change.
+Jack's constraint (same day, replacing the first-cut ±8c quote clamp):
+**rewards need the top of book** — credit halves per tick behind the touch,
+so fair must never re-price a quote. The fair is therefore a **gate**, not
+an anchor:
+
+- When quoting, quotes join the touch UNCHANGED (full reward credit).
+- **Stand aside entirely** when the touch fights fair on the adverse side:
+  bid touch > fair + 10c (paying over fair) or ask touch < fair − 10c
+  (selling under fair). `IMM_RAIN_FAIR_TOL_CENTS`, strict inequality.
+  One-side breach parks both sides; logged once per transition
+  (`rain-fair stand-aside` / `rain-fair resume`); sticky selection keeps the
+  market so quoting auto-resumes when book and forecast re-agree.
+- missing/stale fair (per-entry TTL `IMM_RAIN_FAIR_TTL_MIN=240`) → gate open
+  → **plain band behavior**; every failure mode degrades to the pre-feature bot.
+- TOMORROW-ONLY (Jack 2026-07-28): dailies quote only the day BEFORE the
+  measurement day — already enforced by the midnight-ET ticker-date rule
+  (verified live: all resting rain orders on the next-day event; PT cities
+  stop at 9pm local). The fair used is therefore the full-day probability;
+  the today/remaining-hours entries in the JSON are monitoring-only.
 - Kill switch: `IMM_RAIN_FAIR_ENABLE=0` (launcher env) restores 7/26 behavior.
 - Data path: daemon thread `rain-fair` (started in `run()`, never on the
   trading thread) → `run-logs\incentive-mm\rain_fair_values.json` →
   mtime hot-reload at universe refresh, like every other override file.
-- Calibration eyeball at ship time (2026-07-28): fair within 1-2c of the book
-  on ATL/MIA/NYC/SEA/OKC/DAL same-day; big divergences were the *intended*
-  protections (PHX already-rained 97c book vs 34c remaining-hours fair =
-  top-in-band's job; MIN next-day 67c fair vs 28c book = don't sell that ask).
+- Behavior at ship time (JUL29 books vs fair): quotes at touch on
+  ATL/AUS/DC/NYC/SEA/PHX/... (book within tol of fair); stands aside on
+  BOS(85 vs 98)/DEN(71 vs 93)/MIA(20 vs 33)/MIN(29 vs 67)/PHIL(51 vs 92) —
+  exactly the books where the forecast says the ask is donating YES.
 
 ## P&L & attribution
 

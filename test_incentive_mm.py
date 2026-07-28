@@ -2870,9 +2870,11 @@ class TestHourSizeMult(unittest.TestCase):
 # ----------------------------------------------------------------------------
 
 class TestRainFairAnchor(unittest.TestCase):
-    """rain_fair_values.json -> load_rain_fair/rain_fair_p -> clamped anchors
-    and band stand-asides in the quote loop. Fixture ticker KXRAIN-68DEC31-SEA
-    (date parses via %y%b%d like production dailies)."""
+    """rain_fair_values.json -> load_rain_fair/rain_fair_p -> at-touch GATE
+    in the quote loop: quotes always join the touch (rewards need the top of
+    book); fair only decides WHETHER to quote (stand aside when the touch
+    fights the forecast beyond TOL). Fixture ticker KXRAIN-68DEC31-SEA
+    (date parses via %y%b%d like production dailies; %y maps 99->1999)."""
 
     T = "KXRAIN-68DEC31-SEA"
 
@@ -2943,56 +2945,55 @@ class TestRainFairAnchor(unittest.TestCase):
             ("bid", 49, 5.0), ("bid", 48, 10.0), ("bid", 47, 20.0),
             ("ask", 51, 5.0), ("ask", 52, 10.0), ("ask", 53, 20.0)]))
 
-    def test_fair_clamps_anchors(self):
-        self._write_fair(0.30)     # fair 30c, edge 8: bid<=22; ask floor 38
-        bot = self._bot()          # is BELOW the 51c external ask -> join stands
+    PLAIN_JOIN = sorted([
+        ("bid", 49, 5.0), ("bid", 48, 10.0), ("bid", 47, 20.0),
+        ("ask", 51, 5.0), ("ask", 52, 10.0), ("ask", 53, 20.0)])
+
+    def test_agreeing_fair_quotes_at_touch(self):
+        self._write_fair(0.45)     # |touch - fair| within tol 10 -> AT TOUCH,
+        bot = self._bot()          # never re-priced (rewards need the join)
         bot.run_cycle()
-        self.assertEqual(self._rain_quotes(bot), sorted([
-            ("bid", 22, 5.0), ("bid", 21, 10.0), ("bid", 20, 20.0),
-            ("ask", 51, 5.0), ("ask", 52, 10.0), ("ask", 53, 20.0)]))
+        self.assertEqual(self._rain_quotes(bot), self.PLAIN_JOIN)
+
+    def test_tol_boundary_inclusive(self):
+        self._write_fair(0.39)     # bid touch 49 == fair 39 + tol 10: NOT a
+        bot = self._bot()          # breach (strict >), still quotes at touch
+        bot.run_cycle()
+        self.assertEqual(self._rain_quotes(bot), self.PLAIN_JOIN)
+
+    def test_bid_touch_over_fair_stands_aside_then_resumes(self):
+        self._write_fair(0.30)     # bid touch 49 > 30+10 -> paying over fair
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._rain_quotes(bot), [])
+        self.assertIn(self.T, bot._rain_fair_stood)
+        self.assertIn(self.T, bot.state.selected)     # sticky: still selected
         # non-rain market in the same cycle keeps its plain join
         good = sorted((o["book_side"], o["yes_price"]) for o in
                       bot.state.sim_orders.values()
                       if o["ticker"] == "KXGOOD-99DEC31-A")
         self.assertIn(("bid", 49), good)
         self.assertIn(("ask", 51), good)
-
-    def test_touch_kept_when_safe_side_of_fair(self):
-        self._write_fair(0.80)     # bid cap 72 > touch 49: join stands; ask floor 88
-        bot = self._bot()
+        self._write_fair(0.50)     # forecast agrees again -> resume AT TOUCH
         bot.run_cycle()
-        quotes = self._rain_quotes(bot)
-        self.assertIn(("bid", 49, 5.0), quotes)
-        self.assertIn(("ask", 88, 5.0), quotes)
+        self.assertNotIn(self.T, bot._rain_fair_stood)
+        self.assertEqual(self._rain_quotes(bot), self.PLAIN_JOIN)
 
-    def test_extreme_fair_stands_aside_then_resumes(self):
-        self._write_fair(0.02)     # bid cap -6 < band min 5 -> stand aside
+    def test_ask_touch_under_fair_stands_aside(self):
+        self._write_fair(0.70)     # ask touch 51 < 70-10 -> selling under fair
         bot = self._bot()
         bot.run_cycle()
         self.assertEqual(self._rain_quotes(bot), [])
         self.assertIn(self.T, bot._rain_fair_stood)
-        self.assertIn(self.T, bot.state.selected)     # sticky: still selected
-        self._write_fair(0.50)     # fair recovers -> quoting resumes clamped
-        bot.run_cycle()
-        self.assertNotIn(self.T, bot._rain_fair_stood)
-        quotes = self._rain_quotes(bot)
-        self.assertIn(("bid", 42, 5.0), quotes)
-        self.assertIn(("ask", 58, 5.0), quotes)
-
-    def test_high_fair_stands_aside(self):
-        self._write_fair(0.90)     # ask floor 98 > band max 90 -> stand aside
-        bot = self._bot()
-        bot.run_cycle()
-        self.assertEqual(self._rain_quotes(bot), [])
 
     def test_disabled_flag_restores_plain_join(self):
-        self._write_fair(0.30)
+        self._write_fair(0.30)     # would gate if enabled
         old = imm.RAIN_FAIR_ENABLE
         imm.RAIN_FAIR_ENABLE = False
         try:
             bot = self._bot()
             bot.run_cycle()
-            self.assertIn(("bid", 49, 5.0), self._rain_quotes(bot))
+            self.assertEqual(self._rain_quotes(bot), self.PLAIN_JOIN)
         finally:
             imm.RAIN_FAIR_ENABLE = old
 

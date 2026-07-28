@@ -884,20 +884,24 @@ def load_extra_allow_series() -> int:
 
 
 # ----------------------------------------------------------------------------
-# Rain daily fair-value anchor (Jack 2026-07-28, "do 5" — model-anchored
-# quoting for KXRAIN dailies). rain_fair.py computes P(measurable rain on the
-# local calendar day) per settlement station from the NWS hourly forecast and
-# writes RAIN_FAIR_FILE (a daemon thread started in run() refreshes it every
-# RAIN_FAIR_REFRESH_MIN minutes; the file is hot-reloaded by mtime like the
-# other override files). The quote loop then clamps the KXRAIN join anchors:
-# never bid above fair-edge, never ask below fair+edge, and stands the market
-# down entirely when fair±edge exits the series band. Anchors only ever move
-# AWAY from the touch, so a missing/stale file (per-entry TTL) degrades to
-# exactly today's plain band-quoting behavior. Fair CANNOT see rain that
-# already fell (it is forecast-only) — the top-in-band rule covers that end
-# state (the book reprices to 95+ and the market stands down on its own).
+# Rain daily fair-value GATE (Jack 2026-07-28, "do 5"; reworked same day from
+# a quote-anchor to a gate — Jack: "my primary goal is to stay near the top
+# of the orderbooks to get incentive rewards", and reward credit halves per
+# tick behind the touch, so fair must never move quotes off the join).
+# rain_fair.py computes P(measurable rain on the local calendar day) per
+# settlement station from the NWS hourly forecast and writes RAIN_FAIR_FILE
+# (a daemon thread started in run() refreshes it every RAIN_FAIR_REFRESH_MIN
+# minutes; the file is hot-reloaded by mtime like the other override files).
+# The quote loop joins the touch UNCHANGED whenever it quotes; the gate only
+# decides WHETHER: it stands the market down when the touch itself fights
+# the forecast on the adverse side (bid touch > fair+TOL / ask touch <
+# fair-TOL). Missing/stale entries (per-entry TTL) open the gate — every
+# failure mode degrades to plain band-quoting. Fair CANNOT see rain that
+# already fell (forecast-only) — moot for quoting since the midnight-ET
+# ticker-date rule means dailies only ever quote the day BEFORE the
+# measurement day (Jack 2026-07-28: tomorrow-only, never the radar-flow day).
 RAIN_FAIR_ENABLE = os.environ.get("IMM_RAIN_FAIR_ENABLE", "1") == "1"
-RAIN_FAIR_EDGE_CENTS = _env_int("IMM_RAIN_FAIR_EDGE_CENTS", 8)
+RAIN_FAIR_TOL_CENTS = _env_int("IMM_RAIN_FAIR_TOL_CENTS", 10)
 RAIN_FAIR_TTL_MIN = _env_int("IMM_RAIN_FAIR_TTL_MIN", 240)
 RAIN_FAIR_REFRESH_MIN = _env_int("IMM_RAIN_FAIR_REFRESH_MIN", 30)
 RAIN_FAIR_SERIES = os.environ.get("IMM_RAIN_FAIR_SERIES", "KXRAIN")
@@ -3235,30 +3239,34 @@ class IncentiveMarketMaker:
                 self.cancel_market_orders(t, resting)
                 continue
 
-            # RAIN FAIR-VALUE ANCHOR (Jack 2026-07-28): clamp KXRAIN daily
-            # anchors to the NWS-forecast fair — bid never above fair-edge,
-            # ask never below fair+edge (applied at the build calls below).
-            # Fair too close to a band edge means one clamped side could not
-            # rest in band at all; a one-sided book earns nothing and eats
-            # pickoff risk, so stand the market down entirely (same knife as
-            # top-in-band; sticky selection keeps it, quoting auto-resumes).
-            # Missing/stale fair (TTL in rain_fair_p) -> both caps None ->
-            # plain band behavior, so this can only make quoting SAFER.
-            rf_bid_cap: Optional[int] = None
-            rf_ask_floor: Optional[int] = None
+            # RAIN FAIR-VALUE GATE (Jack 2026-07-28; reworked same day —
+            # "my primary goal is to stay near the top of the orderbooks
+            # to get incentive rewards"): reward credit halves per tick
+            # behind the touch, so the NWS fair must never re-price quotes
+            # off the join. It is a SANITY SCREEN only: quotes always join
+            # the touch unchanged; the gate stands the market down entirely
+            # when the touch itself fights the forecast on the side that
+            # would fill us badly — bid touch above fair+TOL (paying over
+            # fair) or ask touch below fair-TOL (selling under fair). A
+            # one-side breach parks BOTH sides (one-sided quoting earns no
+            # reward and eats pickoff risk); sticky selection keeps the
+            # market, so quoting auto-resumes when book and forecast agree
+            # again. Missing/stale fair (TTL in rain_fair_p) -> gate open ->
+            # plain band behavior.
             if RAIN_FAIR_ENABLE and meta.series == RAIN_FAIR_SERIES:
                 p_fair = rain_fair_p(t, now_ts)
                 if p_fair is not None:
                     fair_c = p_fair * 100.0
-                    rf_bid_cap = math.floor(fair_c) - RAIN_FAIR_EDGE_CENTS
-                    rf_ask_floor = math.ceil(fair_c) + RAIN_FAIR_EDGE_CENTS
-                    if rf_bid_cap < pmin_s or rf_ask_floor > pmax_s:
+                    bid_bad = (ext_bid is not None
+                               and ext_bid > fair_c + RAIN_FAIR_TOL_CENTS)
+                    ask_bad = (ext_ask is not None
+                               and ext_ask < fair_c - RAIN_FAIR_TOL_CENTS)
+                    if bid_bad or ask_bad:
                         if t not in self._rain_fair_stood:
                             self._rain_fair_stood.add(t)
-                            log(f"{self.tag} rain-fair stand-aside {t}: fair "
-                                f"{fair_c:.0f}c ±{RAIN_FAIR_EDGE_CENTS}c exits "
-                                f"band {pmin_s}..{pmax_s} (book "
-                                f"{ext_bid}x{ext_ask})")
+                            log(f"{self.tag} rain-fair stand-aside {t}: book "
+                                f"{ext_bid}x{ext_ask} vs fair {fair_c:.0f}c "
+                                f"(tol {RAIN_FAIR_TOL_CENTS}c)")
                         self.cancel_market_orders(t, resting)
                         continue
             if t in self._rain_fair_stood:
@@ -3301,19 +3309,13 @@ class IncentiveMarketMaker:
             if ext_bid is not None and room_buy > 0:
                 px_ok = ext_bid >= series_price_min(meta.series)
                 if px_ok:
-                    # rain-fair clamp: join the touch OR rest at fair-edge,
-                    # whichever is LOWER (post-only vs the real ext_ask stands)
-                    bid_anchor = ext_bid if rf_bid_cap is None \
-                        else min(ext_bid, rf_bid_cap)
-                    mq.extend(build_side_ladder(t, "bid", bid_anchor, ext_ask,
-                                                room_buy, levels=lv))
+                    mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
+                                                levels=lv))
             if ext_ask is not None and room_sell > 0:
                 px_ok = ext_ask <= series_price_max(meta.series)
                 if px_ok:
-                    ask_anchor = ext_ask if rf_ask_floor is None \
-                        else max(ext_ask, rf_ask_floor)
-                    mq.extend(build_side_ladder(t, "ask", ask_anchor, ext_bid,
-                                                room_sell, levels=lv))
+                    mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
+                                                levels=lv))
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
@@ -3740,9 +3742,9 @@ class IncentiveMarketMaker:
             threading.Thread(target=_rain_fair_refresh, daemon=True,
                              name="rain-fair").start()
         if RAIN_FAIR_ENABLE:
-            log(f"rain-fair anchor: {RAIN_FAIR_SERIES} edge ±{RAIN_FAIR_EDGE_CENTS}c, "
-                f"ttl {RAIN_FAIR_TTL_MIN}m, refresh {RAIN_FAIR_REFRESH_MIN}m, "
-                f"file {RAIN_FAIR_FILE}")
+            log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
+                f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
+                f"refresh {RAIN_FAIR_REFRESH_MIN}m, file {RAIN_FAIR_FILE}")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}), "
             f"caps: market ±{MAX_POSITION_CONTRACTS:g}, event ±{MAX_EVENT_CONTRACTS:g} "
