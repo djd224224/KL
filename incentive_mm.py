@@ -883,6 +883,79 @@ def load_extra_allow_series() -> int:
     return changed
 
 
+# ----------------------------------------------------------------------------
+# Rain daily fair-value anchor (Jack 2026-07-28, "do 5" — model-anchored
+# quoting for KXRAIN dailies). rain_fair.py computes P(measurable rain on the
+# local calendar day) per settlement station from the NWS hourly forecast and
+# writes RAIN_FAIR_FILE (a daemon thread started in run() refreshes it every
+# RAIN_FAIR_REFRESH_MIN minutes; the file is hot-reloaded by mtime like the
+# other override files). The quote loop then clamps the KXRAIN join anchors:
+# never bid above fair-edge, never ask below fair+edge, and stands the market
+# down entirely when fair±edge exits the series band. Anchors only ever move
+# AWAY from the touch, so a missing/stale file (per-entry TTL) degrades to
+# exactly today's plain band-quoting behavior. Fair CANNOT see rain that
+# already fell (it is forecast-only) — the top-in-band rule covers that end
+# state (the book reprices to 95+ and the market stands down on its own).
+RAIN_FAIR_ENABLE = os.environ.get("IMM_RAIN_FAIR_ENABLE", "1") == "1"
+RAIN_FAIR_EDGE_CENTS = _env_int("IMM_RAIN_FAIR_EDGE_CENTS", 8)
+RAIN_FAIR_TTL_MIN = _env_int("IMM_RAIN_FAIR_TTL_MIN", 240)
+RAIN_FAIR_REFRESH_MIN = _env_int("IMM_RAIN_FAIR_REFRESH_MIN", 30)
+RAIN_FAIR_SERIES = os.environ.get("IMM_RAIN_FAIR_SERIES", "KXRAIN")
+RAIN_FAIR_FILE = os.environ.get(
+    "IMM_RAIN_FAIR_FILE", os.path.join(STATUS_DIR, "rain_fair_values.json"))
+_rain_fair_state: dict = {"mtime": 0.0, "fair": {}}   # (date_iso, city) -> (p, fetched_ts)
+
+
+def load_rain_fair() -> int:
+    """Hot-reload RAIN_FAIR_FILE by mtime into _rain_fair_state. Returns the
+    number of (date, city) entries loaded on a reload, else 0."""
+    try:
+        mtime = os.path.getmtime(RAIN_FAIR_FILE)
+    except OSError:
+        return 0
+    if mtime == _rain_fair_state["mtime"]:
+        return 0
+    _rain_fair_state["mtime"] = mtime
+    try:
+        with open(RAIN_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! rain fair file unreadable: {e}")
+        return 0
+    fresh: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    for date_iso, cities in (data.get("fair") or {}).items():
+        for city, entry in (cities or {}).items():
+            try:
+                p = float(entry["p"])
+                ts = parse_iso_utc(str(entry["fetched_at"]))
+                if ts is not None and 0.0 <= p <= 1.0:
+                    fresh[(str(date_iso), str(city))] = (p, ts.timestamp())
+            except (KeyError, TypeError, ValueError):
+                continue
+    _rain_fair_state["fair"] = fresh
+    log(f"[IMM] rain fair values reloaded: {len(fresh)} station-days")
+    return len(fresh)
+
+
+def rain_fair_p(ticker: str, now_ts: float) -> Optional[float]:
+    """Fair P(YES) for a KXRAIN daily ticker (KXRAIN-26JUL29-SEA), or None
+    when unavailable/stale — None must degrade to plain band quoting."""
+    parts = ticker.split("-")
+    if len(parts) != 3 or parts[0] != RAIN_FAIR_SERIES:
+        return None
+    try:
+        date_iso = datetime.strptime(parts[1], "%y%b%d").date().isoformat()
+    except ValueError:
+        return None
+    entry = _rain_fair_state["fair"].get((date_iso, parts[2]))
+    if entry is None:
+        return None
+    p, fetched_ts = entry
+    if now_ts - fetched_ts > RAIN_FAIR_TTL_MIN * 60:
+        return None
+    return p
+
+
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
 _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 
@@ -1699,6 +1772,7 @@ class IncentiveMarketMaker:
         self._reconciled = False      # one-time orphaned-own-fill cleanup pending
         self._reconcile_recheck_at = 0.0   # two-shot: second pass after sweep window
         self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
+        self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         self._load_persist()
 
@@ -2173,6 +2247,7 @@ class IncentiveMarketMaker:
         # no restart needed.
         load_file_event_overrides()
         load_extra_allow_series()
+        load_rain_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
         # refresh reliably fires before Kalshi publishes now that keep-alive
@@ -3160,6 +3235,36 @@ class IncentiveMarketMaker:
                 self.cancel_market_orders(t, resting)
                 continue
 
+            # RAIN FAIR-VALUE ANCHOR (Jack 2026-07-28): clamp KXRAIN daily
+            # anchors to the NWS-forecast fair — bid never above fair-edge,
+            # ask never below fair+edge (applied at the build calls below).
+            # Fair too close to a band edge means one clamped side could not
+            # rest in band at all; a one-sided book earns nothing and eats
+            # pickoff risk, so stand the market down entirely (same knife as
+            # top-in-band; sticky selection keeps it, quoting auto-resumes).
+            # Missing/stale fair (TTL in rain_fair_p) -> both caps None ->
+            # plain band behavior, so this can only make quoting SAFER.
+            rf_bid_cap: Optional[int] = None
+            rf_ask_floor: Optional[int] = None
+            if RAIN_FAIR_ENABLE and meta.series == RAIN_FAIR_SERIES:
+                p_fair = rain_fair_p(t, now_ts)
+                if p_fair is not None:
+                    fair_c = p_fair * 100.0
+                    rf_bid_cap = math.floor(fair_c) - RAIN_FAIR_EDGE_CENTS
+                    rf_ask_floor = math.ceil(fair_c) + RAIN_FAIR_EDGE_CENTS
+                    if rf_bid_cap < pmin_s or rf_ask_floor > pmax_s:
+                        if t not in self._rain_fair_stood:
+                            self._rain_fair_stood.add(t)
+                            log(f"{self.tag} rain-fair stand-aside {t}: fair "
+                                f"{fair_c:.0f}c ±{RAIN_FAIR_EDGE_CENTS}c exits "
+                                f"band {pmin_s}..{pmax_s} (book "
+                                f"{ext_bid}x{ext_ask})")
+                        self.cancel_market_orders(t, resting)
+                        continue
+            if t in self._rain_fair_stood:
+                self._rain_fair_stood.discard(t)
+                log(f"{self.tag} rain-fair resume {t}")
+
             # Rooms: hard per-market cap, event share, then skew — all using
             # this market's SERIES ladder/cap (Love Island runs a bigger flat
             # 5/5/5 ladder with a tighter 50-contract net cap). For quote_all
@@ -3196,13 +3301,19 @@ class IncentiveMarketMaker:
             if ext_bid is not None and room_buy > 0:
                 px_ok = ext_bid >= series_price_min(meta.series)
                 if px_ok:
-                    mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
-                                                levels=lv))
+                    # rain-fair clamp: join the touch OR rest at fair-edge,
+                    # whichever is LOWER (post-only vs the real ext_ask stands)
+                    bid_anchor = ext_bid if rf_bid_cap is None \
+                        else min(ext_bid, rf_bid_cap)
+                    mq.extend(build_side_ladder(t, "bid", bid_anchor, ext_ask,
+                                                room_buy, levels=lv))
             if ext_ask is not None and room_sell > 0:
                 px_ok = ext_ask <= series_price_max(meta.series)
                 if px_ok:
-                    mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
-                                                levels=lv))
+                    ask_anchor = ext_ask if rf_ask_floor is None \
+                        else max(ext_ask, rf_ask_floor)
+                    mq.extend(build_side_ladder(t, "ask", ask_anchor, ext_bid,
+                                                room_sell, levels=lv))
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
@@ -3606,6 +3717,32 @@ class IncentiveMarketMaker:
                         os._exit(86)
             threading.Thread(target=_hang_watchdog, daemon=True,
                              name="hang-watchdog").start()
+        if RAIN_FAIR_ENABLE and not once:
+            # Fair-value refresher: fetch NWS forecasts OFF the trading thread
+            # (a wedged 20s HTTP call must never stall a cycle / trip the hang
+            # watchdog) and talk to the quote loop only through the JSON file,
+            # like every other external writer. Import failure just means rain
+            # quotes anchor to the book, as before this feature.
+            def _rain_fair_refresh():
+                try:
+                    import rain_fair
+                except Exception as e:
+                    log(f"{self.tag} ! rain-fair refresher disabled: {e}")
+                    return
+                while True:
+                    try:
+                        ok, fail = rain_fair.write_fair_file(RAIN_FAIR_FILE)
+                        log(f"{self.tag} rain-fair refresh: {ok} stations ok"
+                            + (f", {fail} FAILED" if fail else ""))
+                    except Exception as e:
+                        log(f"{self.tag} ! rain-fair refresh failed: {e}")
+                    time.sleep(max(300, RAIN_FAIR_REFRESH_MIN * 60))
+            threading.Thread(target=_rain_fair_refresh, daemon=True,
+                             name="rain-fair").start()
+        if RAIN_FAIR_ENABLE:
+            log(f"rain-fair anchor: {RAIN_FAIR_SERIES} edge ±{RAIN_FAIR_EDGE_CENTS}c, "
+                f"ttl {RAIN_FAIR_TTL_MIN}m, refresh {RAIN_FAIR_REFRESH_MIN}m, "
+                f"file {RAIN_FAIR_FILE}")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}), "
             f"caps: market ±{MAX_POSITION_CONTRACTS:g}, event ±{MAX_EVENT_CONTRACTS:g} "

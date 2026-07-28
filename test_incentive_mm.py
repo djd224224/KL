@@ -26,6 +26,17 @@ def setUpModule():
     imm.STATUS_DIR = tmp
     imm.HALT_FILE = os.path.join(tmp, "HALT")
     imm.IncentiveMarketMaker.PERSIST_PATH = os.path.join(tmp, "imm_state.json")
+    # These paths were ALSO resolved from the live status dir at import time.
+    # ORDER_JOURNAL_PATH is the dangerous one — _clean_persist() DELETES it, so
+    # before 2026-07-28 every test run removed the LIVE bot's crash journal
+    # (self-healing within one _save_persist fold, but a hard-kill in that
+    # window would have orphaned the current wave's order ids). The other two
+    # made tests READ live override/allowlist state — hermeticity, not safety.
+    imm.IncentiveMarketMaker.ORDER_JOURNAL_PATH = os.path.join(
+        tmp, "imm_order_journal.jsonl")
+    imm.EVENT_OVERRIDES_FILE = os.path.join(tmp, "event_start_overrides.json")
+    imm.EXTRA_ALLOW_FILE = os.path.join(tmp, "extra_allow_series.json")
+    imm.RAIN_FAIR_FILE = os.path.join(tmp, "rain_fair_values.json")
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -2852,6 +2863,138 @@ class TestHourSizeMult(unittest.TestCase):
         self.assertEqual(got, [(t, max(1, int(s * 0.5 + 0.5)))
                                for t, s in base])
         self.assertTrue(all(s >= 1 for _t, s in got))
+
+
+# ----------------------------------------------------------------------------
+# Rain daily fair-value anchor (2026-07-28)
+# ----------------------------------------------------------------------------
+
+class TestRainFairAnchor(unittest.TestCase):
+    """rain_fair_values.json -> load_rain_fair/rain_fair_p -> clamped anchors
+    and band stand-asides in the quote loop. Fixture ticker KXRAIN-68DEC31-SEA
+    (date parses via %y%b%d like production dailies)."""
+
+    T = "KXRAIN-68DEC31-SEA"
+
+    def setUp(self):
+        _clean_persist()
+        imm._rain_fair_state["mtime"] = 0.0
+        imm._rain_fair_state["fair"] = {}
+        try:
+            os.remove(imm.RAIN_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def _write_fair(self, p, age_secs=0.0):
+        fetched = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
+        with open(imm.RAIN_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"fair": {"2068-12-31": {
+                "SEA": {"p": p, "fetched_at": fetched.isoformat()}}}}, f)
+        # mtime-gated reload: a rewrite inside the same mtime tick must not
+        # be silently skipped
+        os.utime(imm.RAIN_FAIR_FILE,
+                 (time.time(), time.time() + self._bump))
+        self._bump += 1
+        self.assertEqual(imm.load_rain_fair(), 1)
+
+    _bump = 1
+
+    def _bot(self):
+        client = FakeClient()
+        now = datetime.now(timezone.utc)
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": "KXRAIN-68DEC31",
+            "status": "active", "close_time": far,
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+            "no_dollars": [["0.49", "1200"]]}}          # 49 x 51
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _rain_quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_lookup_parsing_and_ttl(self):
+        self._write_fair(0.30)
+        now_ts = time.time()
+        self.assertAlmostEqual(imm.rain_fair_p(self.T, now_ts), 0.30)
+        self.assertIsNone(imm.rain_fair_p("KXRAIN-68DEC31-NYC", now_ts))   # absent city
+        self.assertIsNone(imm.rain_fair_p("KXRAINMIAM-99DEC-5", now_ts))   # monthly series
+        self.assertIsNone(imm.rain_fair_p("KXGOOD-99DEC31-A", now_ts))     # other series
+        self.assertIsNone(imm.rain_fair_p("KXRAIN-BADDATE-SEA", now_ts))   # unparseable
+        self.assertIsNone(                                                  # TTL expiry
+            imm.rain_fair_p(self.T, now_ts + imm.RAIN_FAIR_TTL_MIN * 60 + 5))
+
+    def test_stale_entry_degrades_to_plain_join(self):
+        self._write_fair(0.30, age_secs=imm.RAIN_FAIR_TTL_MIN * 60 + 60)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._rain_quotes(bot), sorted([
+            ("bid", 49, 5.0), ("bid", 48, 10.0), ("bid", 47, 20.0),
+            ("ask", 51, 5.0), ("ask", 52, 10.0), ("ask", 53, 20.0)]))
+
+    def test_fair_clamps_anchors(self):
+        self._write_fair(0.30)     # fair 30c, edge 8: bid<=22; ask floor 38
+        bot = self._bot()          # is BELOW the 51c external ask -> join stands
+        bot.run_cycle()
+        self.assertEqual(self._rain_quotes(bot), sorted([
+            ("bid", 22, 5.0), ("bid", 21, 10.0), ("bid", 20, 20.0),
+            ("ask", 51, 5.0), ("ask", 52, 10.0), ("ask", 53, 20.0)]))
+        # non-rain market in the same cycle keeps its plain join
+        good = sorted((o["book_side"], o["yes_price"]) for o in
+                      bot.state.sim_orders.values()
+                      if o["ticker"] == "KXGOOD-99DEC31-A")
+        self.assertIn(("bid", 49), good)
+        self.assertIn(("ask", 51), good)
+
+    def test_touch_kept_when_safe_side_of_fair(self):
+        self._write_fair(0.80)     # bid cap 72 > touch 49: join stands; ask floor 88
+        bot = self._bot()
+        bot.run_cycle()
+        quotes = self._rain_quotes(bot)
+        self.assertIn(("bid", 49, 5.0), quotes)
+        self.assertIn(("ask", 88, 5.0), quotes)
+
+    def test_extreme_fair_stands_aside_then_resumes(self):
+        self._write_fair(0.02)     # bid cap -6 < band min 5 -> stand aside
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._rain_quotes(bot), [])
+        self.assertIn(self.T, bot._rain_fair_stood)
+        self.assertIn(self.T, bot.state.selected)     # sticky: still selected
+        self._write_fair(0.50)     # fair recovers -> quoting resumes clamped
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._rain_fair_stood)
+        quotes = self._rain_quotes(bot)
+        self.assertIn(("bid", 42, 5.0), quotes)
+        self.assertIn(("ask", 58, 5.0), quotes)
+
+    def test_high_fair_stands_aside(self):
+        self._write_fair(0.90)     # ask floor 98 > band max 90 -> stand aside
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._rain_quotes(bot), [])
+
+    def test_disabled_flag_restores_plain_join(self):
+        self._write_fair(0.30)
+        old = imm.RAIN_FAIR_ENABLE
+        imm.RAIN_FAIR_ENABLE = False
+        try:
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertIn(("bid", 49, 5.0), self._rain_quotes(bot))
+        finally:
+            imm.RAIN_FAIR_ENABLE = old
 
 
 if __name__ == "__main__":
