@@ -2448,19 +2448,21 @@ class IncentiveMarketMaker:
                 # from floors, the hopeless exit and the yield ranking.
                 ranked.append(meta)
             elif HOPELESS_EXIT and not reaches_min \
-                    and (meta.ticker in prev_selected
-                         or meta.event_ticker in EVENT_START_OVERRIDES):
+                    and meta.ticker in prev_selected \
+                    and meta.event_ticker not in EVENT_START_OVERRIDES:
                 # STICKY EXIT (Jack 2026-07-25): "<5% chance to reach $1 by
                 # program end -> stop quoting, even if already started". The
                 # deliberate exception to sticky retention — sub-$1 accrual
                 # pays NOTHING, so riding a hopeless market to its natural
-                # end is pure fill risk for zero reward. Applies to
-                # override-event markets too (both states, so no
-                # admit/evict flapping); the accrued credit keeps every
-                # market that's genuinely close to $1 (the 7/24 TRUMPMENTION
-                # rule: protect earned-but-below-$1 accruals whenever
-                # finishing the job is still plausible). Wind-down of any
-                # position continues reduce-only via managed_extra.
+                # end is pure fill risk for zero reward. The accrued credit
+                # keeps every market that's genuinely close to $1 (the 7/24
+                # TRUMPMENTION rule). Wind-down continues reduce-only via
+                # managed_extra. OVERRIDE-listed events are EXEMPT (both
+                # states, so no flapping — Jack 2026-07-28, tele-rally 8/22
+                # quoted: the drain rule targets the anonymous scrap tail,
+                # not hand-curated event windows, and the estimator's
+                # absolute $1 verdicts are least trustworthy on the short
+                # windows overrides create).
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
             elif meta.ticker in prev_selected \
                     or meta.event_ticker in EVENT_START_OVERRIDES:

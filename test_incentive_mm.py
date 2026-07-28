@@ -1678,6 +1678,23 @@ class TestStickySelection(unittest.TestCase):
         finally:
             imm.MIN_EST_TOTAL_DOLLARS, imm.HOPELESS_EXIT = old_floor, old_flag
 
+    def test_override_event_exempt_from_hopeless(self):
+        # Jack 2026-07-28 (tele-rally, 8/22 quoted): hand-curated override
+        # windows bypass the hopeless/floor veto in BOTH membership states;
+        # ordinary members keep the 7/25 eviction.
+        bot = self._quoting_bot()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.EVENT_START_OVERRIDES["KXGOOD-99DEC31"] = utc(2099, 1, 1)
+        try:
+            bot._est_peak.clear()
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)   # exempt, stays
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.EVENT_START_OVERRIDES.pop("KXGOOD-99DEC31", None)
+
     def test_accrued_credit_admits_returning_market(self):
         # ENTRY floor credit: a NON-member with banked accrual re-enters even
         # when the remaining window alone is below the bar (the re-admitted
