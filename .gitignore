@@ -23,3 +23,8 @@ kalshi_report.html
 
 # Crypto MM bot runtime logs (written by run_crypto_touch_mm.ps1)
 run-logs/crypto-touch/
+
+# Gas bot runtime state + logs (aaa_history.csv IS tracked — model input)
+gas_data/status_gas_bot.json
+gas_data/HALT
+run-logs/gas-bot/
