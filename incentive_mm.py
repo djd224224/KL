@@ -629,7 +629,13 @@ FREEZE_SERIES = frozenset(
         # runs had enrolled these company variants; the class = ANY company
         # base ticker can sprout an A-variant or bare sibling)
         "KXGOOGA,KXLUVA,KXSBUXA,KXTRUMPMENTION,"
-        "KXCMGA,KXMETAA,KXVZ,KXVZA,KXWHA,KXYUM,KXYUMA"
+        "KXCMGA,KXMETAA,KXVZ,KXVZA,KXWHA,KXYUM,KXYUMA,"
+        # KXAC = AIR CANADA passenger load factor (Jack caught it 7/29 pm) —
+        # a company metric behind an unrecognizable name; auto-enrolled
+        # pre-classifier-fix and twice deliberately kept in allow-file
+        # cleanups because nobody identified it. Lesson: an allow entry you
+        # can't ATTRIBUTE is a finding, not a keeper.
+        "KXAC"
     ).split(",") if s)
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
