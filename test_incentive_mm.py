@@ -1803,6 +1803,28 @@ class TestStickySelection(unittest.TestCase):
         bot.restore_orphan_metas({t: -40.0})
         self.assertIn(t, bot.state.managed_extra)
 
+    def test_global_pad_qualifies_thin_side_in_estimator(self):
+        # Jack 2026-07-29: pads are global — the ESTIMATOR must model them
+        # on thin sides or the market reads est=0 and dies at the floor
+        # before the quote loop pads it.
+        import incentive_mm as _imm
+        self.assertTrue(_imm.PAD_TO_TARGET_GLOBAL)   # global default ON
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        t = "KXGOOD-99DEC31-A"
+        # thin both sides: 300 yes / 200 no vs target 1000 — without pads
+        # nobody qualifies and est would be 0
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", "300"]], "no_dollars": [["0.49", "200"]]}}
+        bot.run_cycle()
+        self.assertIn(t, bot.state.selected)
+        meta = bot.state.selected[t]
+        self.assertGreater(meta.est_frac, 0.0)       # padded sides qualify
+        # and the quote loop actually rests the pads
+        pads = [o for o in bot.state.sim_orders.values()
+                if o["yes_price"] in (_imm.PAD_BID_CENTS, _imm.PAD_ASK_CENTS)]
+        self.assertTrue(pads, "expected 1c/99c pad orders resting")
+
     def test_freeze_series_exact_match(self):
         # Jack 2026-07-29: company freeze is EXACT-series, not prefix — no
         # KXHEGSETHOUT-via-'ETH' style swallowing of future tickers.

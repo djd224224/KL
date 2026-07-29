@@ -153,7 +153,16 @@ PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 1)
 PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 99)
 PAD_ROUND = _env_int("IMM_PAD_ROUND", 100)
 PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 5000)   # safety ceiling per side
-PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "0") == "1"
+# GLOBAL since 2026-07-29 (Jack: "some quotes are not earning because there
+# are not 1000 orders on that side... fix this systematically — quote how
+# many orders are necessary at the very bottom of the orderbook"): every
+# quoted market pads its thin sides to the reward target. Pads price at
+# 1c/99c deliberately OUTSIDE the 5-90 band — they are qualification depth,
+# not quotes; built in _pad_quotes (never through build_side_ladder), so
+# the band never clips them, and stood-down markets never reach the pad
+# site. The candidate estimator models them too, else thin markets read
+# est=0 and die at the floor before a pad could ever rest.
+PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 
 
 # User decision 2026-07-12: Love Island mention pools are high incentive-per-minute
@@ -2761,6 +2770,25 @@ class IncentiveMarketMaker:
                 meta.est_frac = meta.est_dollars_per_day = meta.yield_per_contract = 0.0
                 return True
             overlay = [(q.book_side, q.price_cents, float(q.count)) for q in quotes]
+            # Model the depth pads on thin sides (global pad_to_target,
+            # 2026-07-29): without them a side under the reward target reads
+            # qualifies=False -> est 0 -> the market dies at the floor before
+            # the quote loop could ever pad it. Pads stay OUT of n_contracts:
+            # yield ranks incentive per near-touch contract; a 1c filler is
+            # overhead, not deployed size.
+            if series_pad_to_target(meta.series) and meta.target_size > 0:
+                nt_bid = sum(q.count for q in quotes if q.book_side == "bid")
+                nt_ask = sum(q.count for q in quotes if q.book_side == "ask")
+                if nt_bid > 0:
+                    n = pad_quantity(sum(sz for _px, sz in yes_levels) + nt_bid,
+                                     meta.target_size)
+                    if n > 0:
+                        overlay.append(("bid", PAD_BID_CENTS, float(n)))
+                if nt_ask > 0:
+                    n = pad_quantity(sum(sz for _px, sz in no_levels) + nt_ask,
+                                     meta.target_size)
+                    if n > 0:
+                        overlay.append(("ask", PAD_ASK_CENTS, float(n)))
             frac, _sides = estimate_reward_share(
                 yes_levels, no_levels, overlay,
                 meta.target_size, meta.discount_factor, own_in_book=False)
