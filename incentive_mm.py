@@ -918,13 +918,23 @@ def load_extra_allow_series() -> int:
 # ticker-date rule means dailies only ever quote the day BEFORE the
 # measurement day (Jack 2026-07-28: tomorrow-only, never the radar-flow day).
 RAIN_FAIR_ENABLE = os.environ.get("IMM_RAIN_FAIR_ENABLE", "1") == "1"
-# Hand-exempt events (Jack 2026-07-28 ~8pm ET: "on KXRAIN-26JUL29, override
-# and quote all the markets within 5-90 until midnight"): these events skip
-# the fair gate entirely — the 5-90 band, cutoff and every other screen
-# still govern. Stale entries are inert once the event settles.
+# Fair-gate exemption (Jack 2026-07-28, made ROLLING same night: "allowlist
+# KXRAIN-26JUL30 and the NEXT DAY rain market (never the current day)"):
+# the NEXT-ET-day daily event always quotes every in-band market — the NWS
+# stand-aside never applies to it. The current-day event is already dead
+# via the midnight rule (never quoted), and events further out keep the
+# gate until they roll into next-day. IMM_RAIN_FAIR_EXEMPT adds hand-named
+# extras. Band/cutoff/screens govern as usual.
 RAIN_FAIR_EXEMPT_EVENTS = frozenset(
-    s for s in os.environ.get(
-        "IMM_RAIN_FAIR_EXEMPT", "KXRAIN-26JUL29").split(",") if s)
+    s for s in os.environ.get("IMM_RAIN_FAIR_EXEMPT", "").split(",") if s)
+
+
+def rain_fair_exempt(event_ticker: str, now_utc: datetime) -> bool:
+    if event_ticker in RAIN_FAIR_EXEMPT_EVENTS:
+        return True
+    nxt = now_utc.astimezone(ET) + timedelta(days=1)
+    return event_ticker == \
+        f"{RAIN_FAIR_SERIES}-{nxt.strftime('%y%b%d').upper()}"
 RAIN_FAIR_TOL_CENTS = _env_int("IMM_RAIN_FAIR_TOL_CENTS", 10)
 RAIN_FAIR_TTL_MIN = _env_int("IMM_RAIN_FAIR_TTL_MIN", 240)
 RAIN_FAIR_REFRESH_MIN = _env_int("IMM_RAIN_FAIR_REFRESH_MIN", 30)
@@ -3379,7 +3389,7 @@ class IncentiveMarketMaker:
             # again. Missing/stale fair (TTL in rain_fair_p) -> gate open ->
             # plain band behavior.
             if RAIN_FAIR_ENABLE and meta.series == RAIN_FAIR_SERIES \
-                    and meta.event_ticker not in RAIN_FAIR_EXEMPT_EVENTS:
+                    and not rain_fair_exempt(meta.event_ticker, now_utc):
                 p_fair = rain_fair_p(t, now_ts)
                 if p_fair is not None:
                     fair_c = p_fair * 100.0

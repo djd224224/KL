@@ -1789,6 +1789,24 @@ class TestStickySelection(unittest.TestCase):
         bot.restore_orphan_metas({t: -40.0})
         self.assertIn(t, bot.state.managed_extra)
 
+    def test_rain_fair_exempt_rolls_to_next_day(self):
+        # Jack 2026-07-28: the NEXT-ET-day rain daily always bypasses the
+        # NWS gate; further-out events keep it; env extras honored.
+        et_evening = utc(2026, 7, 29, 0, 30)   # 8:30pm ET Jul 28
+        self.assertTrue(imm.rain_fair_exempt("KXRAIN-26JUL29", et_evening))
+        self.assertFalse(imm.rain_fair_exempt("KXRAIN-26JUL30", et_evening))
+        after_midnight = utc(2026, 7, 29, 4, 30)   # 12:30am ET Jul 29
+        self.assertTrue(imm.rain_fair_exempt("KXRAIN-26JUL30", after_midnight))
+        self.assertFalse(imm.rain_fair_exempt("KXRAIN-26JUL29", after_midnight))
+        self.assertFalse(imm.rain_fair_exempt("KXOTHER-26JUL29", et_evening))
+        import incentive_mm as _imm
+        old = _imm.RAIN_FAIR_EXEMPT_EVENTS
+        _imm.RAIN_FAIR_EXEMPT_EVENTS = frozenset({"KXRAIN-26AUG05"})
+        try:
+            self.assertTrue(imm.rain_fair_exempt("KXRAIN-26AUG05", et_evening))
+        finally:
+            _imm.RAIN_FAIR_EXEMPT_EVENTS = old
+
     def test_no_new_series_gate(self):
         # Jack 2026-07-28: company family admits no FRESH markets; existing
         # members keep quoting (grandfathered), including across restarts.
