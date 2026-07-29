@@ -595,6 +595,21 @@ NO_NEW_SERIES = frozenset(
         "KXGOOGA,KXLUVA,KXSBUXA"
     ).split(",") if s)
 
+# FULL FREEZE by EXACT series (Jack 2026-07-29 am: "stop quoting COMPANY
+# events" — escalates the 7/28 run-off to zero orders; positions ride to
+# settlement per the standing freeze rule). EXACT matching, not prefix:
+# 43 short company tickers as prefixes would repeat the KXHEGSETHOUT-via-
+# 'ETH' substring trap (KXWH would swallow any future KXWH*). Wired into
+# _blocked(), so every freeze path (candidates, orphan-restore, managed
+# flush) inherits. Earnings-MENTION (KXEARNINGSMENTION*) is NOT company —
+# it stays live. Default = the NO_NEW company set; env IMM_FREEZE_SERIES.
+FREEZE_SERIES = frozenset(
+    s for s in os.environ.get(
+        "IMM_FREEZE_SERIES",
+        _DEFAULT_COMPANY_SERIES + ",KXAAL,KXAALA,KXALK,KXALKA,KXAXP,KXAXPA,"
+        "KXGOOGA,KXLUVA,KXSBUXA"
+    ).split(",") if s)
+
 # Event-start resolution for mention markets: the ticker date's midnight-ET
 # cutoff forfeits game-day daytime, but programs run ~1-2 days INCLUDING game
 # day — resolve real start times where a reliable source exists, cut off
@@ -2356,7 +2371,8 @@ class IncentiveMarketMaker:
 
     @staticmethod
     def _blocked(ticker: str) -> bool:
-        return any(ticker.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES)
+        return (any(ticker.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES)
+                or series_of(ticker) in FREEZE_SERIES)
 
     @classmethod
     def _allowed(cls, ticker: str) -> bool:

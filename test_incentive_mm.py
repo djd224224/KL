@@ -581,15 +581,26 @@ class TestAllowlist(unittest.TestCase):
         self.assertFalse(a("KXHYPEMINMON-HYPE-26JUL31-5250"))
 
     def test_company_metric_series(self):
+        # 2026-07-29: the whole company family is FROZEN (Jack: "stop
+        # quoting COMPANY events") — _allowed now refuses what the 7/22
+        # enrollment admitted. The allowlist entries remain underneath;
+        # clearing IMM_FREEZE_SERIES restores them.
         a = IncentiveMarketMaker._allowed
-        self.assertTrue(a("KXBA-26JULDELIV-130"))
-        self.assertTrue(a("KXHOOD-26JULFUNDED-28300000"))
-        self.assertTrue(a("KXCOINBASE-26JULVOL-240000000000"))
-        self.assertTrue(a("KXWINGA-27FEBREST-3400"))
-        # consumer-price trackers included too (Jack 2026-07-22, second pass)
-        self.assertTrue(a("KXSBUXSAR-26AUG02-T5.09"))
-        self.assertTrue(a("KXCHIPBURRITO-26AUG02-T9.77"))
-        self.assertTrue(a("KXBKNUGGETS-26AUG02-T3.54"))
+        self.assertFalse(a("KXBA-26JULDELIV-130"))
+        self.assertFalse(a("KXHOOD-26JULFUNDED-28300000"))
+        self.assertFalse(a("KXCOINBASE-26JULVOL-240000000000"))
+        self.assertFalse(a("KXWINGA-27FEBREST-3400"))
+        self.assertFalse(a("KXSBUXSAR-26AUG02-T5.09"))
+        import incentive_mm as _imm
+        old = _imm.FREEZE_SERIES
+        _imm.FREEZE_SERIES = frozenset()
+        try:
+            # un-frozen, the 7/22 allowlist contract still holds
+            self.assertTrue(a("KXBA-26JULDELIV-130"))
+            self.assertTrue(a("KXCHIPBURRITO-26AUG02-T9.77"))
+            self.assertTrue(a("KXBKNUGGETS-26AUG02-T3.54"))
+        finally:
+            _imm.FREEZE_SERIES = old
         # non-ticker lookalikes still excluded
         self.assertFalse(a("KXMUSKNW-26JUL31-T950"))
         self.assertFalse(a("KXTRUTHSOCIAL-26JUL25-T240"))
@@ -1192,11 +1203,13 @@ class TestOverrideBuffer(unittest.TestCase):
         imm.EVENT_START_OVERRIDES[ev] = release
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = 0.0
-        # KXINTC is company family — since the 7/28 no-new gate a FRESH
-        # company market can't admit; this test is about cutoff mechanics,
-        # so exempt the fixture.
+        # KXINTC is company family — since the 7/28 no-new gate and the
+        # 7/29 freeze a FRESH company market can't admit; this test is
+        # about cutoff mechanics, so exempt the fixture from both.
         old_no_new = imm.NO_NEW_SERIES
         imm.NO_NEW_SERIES = frozenset()
+        old_freeze = imm.FREEZE_SERIES
+        imm.FREEZE_SERIES = frozenset()
         try:
             bot = IncentiveMarketMaker(client=client, live=False)
             bot.run_cycle()
@@ -1212,6 +1225,7 @@ class TestOverrideBuffer(unittest.TestCase):
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
             imm.NO_NEW_SERIES = old_no_new
+            imm.FREEZE_SERIES = old_freeze
             imm.EVENT_START_OVERRIDES.pop(ev, None)
 
 
@@ -1788,6 +1802,19 @@ class TestStickySelection(unittest.TestCase):
         bot.state.programmed = set()
         bot.restore_orphan_metas({t: -40.0})
         self.assertIn(t, bot.state.managed_extra)
+
+    def test_freeze_series_exact_match(self):
+        # Jack 2026-07-29: company freeze is EXACT-series, not prefix — no
+        # KXHEGSETHOUT-via-'ETH' style swallowing of future tickers.
+        import incentive_mm as _imm
+        old = _imm.FREEZE_SERIES
+        _imm.FREEZE_SERIES = frozenset({"KXWH"})
+        try:
+            self.assertTrue(IncentiveMarketMaker._blocked("KXWH-26AUGCOMP-5"))
+            self.assertFalse(IncentiveMarketMaker._blocked("KXWHX-26AUGFOO-1"))
+            self.assertFalse(IncentiveMarketMaker._blocked("KXGOOD-99DEC31-A"))
+        finally:
+            _imm.FREEZE_SERIES = old
 
     def test_rain_fair_exempt_rolls_to_next_day(self):
         # Jack 2026-07-28: the NEXT-ET-day rain daily always bypasses the
