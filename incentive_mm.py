@@ -607,7 +607,15 @@ FREEZE_SERIES = frozenset(
     s for s in os.environ.get(
         "IMM_FREEZE_SERIES",
         _DEFAULT_COMPANY_SERIES + ",KXAAL,KXAALA,KXALK,KXALKA,KXAXP,KXAXPA,"
-        "KXGOOGA,KXLUVA,KXSBUXA"
+        # KXTRUMPMENTION moved here from the launcher prefix blocklist
+        # (Jack 2026-07-29: quote KXTRUMPMENTIONB — the prefix was
+        # swallowing the B-variant; exact freeze keeps only the main
+        # series dark)
+        # + the variant sweep, round 3 (2026-07-29: pre-classifier-fix task
+        # runs had enrolled these company variants; the class = ANY company
+        # base ticker can sprout an A-variant or bare sibling)
+        "KXGOOGA,KXLUVA,KXSBUXA,KXTRUMPMENTION,"
+        "KXCMGA,KXMETAA,KXVZ,KXVZA,KXWHA,KXYUM,KXYUMA"
     ).split(",") if s)
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
