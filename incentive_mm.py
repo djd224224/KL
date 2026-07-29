@@ -601,7 +601,12 @@ NO_NEW_SERIES = frozenset(
     s for s in os.environ.get(
         "IMM_NO_NEW_SERIES",
         _DEFAULT_COMPANY_SERIES + ",KXAAL,KXAALA,KXALK,KXALKA,KXAXP,KXAXPA,"
-        "KXGOOGA,KXLUVA,KXSBUXA"
+        "KXGOOGA,KXLUVA,KXSBUXA,"
+        # ECON run-off (Jack 2026-07-29 pm: "block ECON events going
+        # forward, fine to keep this one") — current members (SCFI-26EOY)
+        # ride to natural death; fresh econ events/markets stop admitting.
+        # Gas/USGASCPI here are already blocklisted (harmless overlap).
+        + _DEFAULT_ECON_SERIES
     ).split(",") if s)
 
 # FULL FREEZE by EXACT series (Jack 2026-07-29 am: "stop quoting COMPANY
@@ -967,6 +972,19 @@ def rain_fair_exempt(event_ticker: str, now_utc: datetime) -> bool:
     nxt = now_utc.astimezone(ET) + timedelta(days=1)
     return event_ticker == \
         f"{RAIN_FAIR_SERIES}-{nxt.strftime('%y%b%d').upper()}"
+
+
+def curated_event(event_ticker: str, series: str, now_utc: datetime) -> bool:
+    """The hand-curated admission tier (bypasses payout floor + hopeless
+    exit): explicit event-start overrides, PLUS the rolling next-day rain
+    event. The rolling rule originally carried only the fair-gate exemption
+    — 2026-07-29 pm, JUL30-NYC (in-band, quoting all day) was hopeless-
+    evicted mid-afternoon as the shrinking window pushed its projection
+    under $1; Jack's 'quote all in-band next-day rain until midnight'
+    implies the whole curated tier rolls, not just the gate."""
+    return (event_ticker in EVENT_START_OVERRIDES
+            or (series == RAIN_FAIR_SERIES
+                and rain_fair_exempt(event_ticker, now_utc)))
 RAIN_FAIR_TOL_CENTS = _env_int("IMM_RAIN_FAIR_TOL_CENTS", 10)
 RAIN_FAIR_TTL_MIN = _env_int("IMM_RAIN_FAIR_TTL_MIN", 240)
 RAIN_FAIR_REFRESH_MIN = _env_int("IMM_RAIN_FAIR_REFRESH_MIN", 30)
@@ -2615,7 +2633,7 @@ class IncentiveMarketMaker:
                 skipped["no_new"] = skipped.get("no_new", 0) + 1
             elif HOPELESS_EXIT and not reaches_min \
                     and meta.ticker in prev_selected \
-                    and meta.event_ticker not in EVENT_START_OVERRIDES:
+                    and not curated_event(meta.event_ticker, meta.series, now_utc):
                 # STICKY EXIT (Jack 2026-07-25): "<5% chance to reach $1 by
                 # program end -> stop quoting, even if already started". The
                 # deliberate exception to sticky retention — sub-$1 accrual
@@ -2631,7 +2649,7 @@ class IncentiveMarketMaker:
                 # windows overrides create).
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
             elif meta.ticker in prev_selected \
-                    or meta.event_ticker in EVENT_START_OVERRIDES:
+                    or curated_event(meta.event_ticker, meta.series, now_utc):
                 # Sticky members and event-start-override events bypass the
                 # entry floor / zero-yield / budget-race filters (original
                 # sticky patch, commit 6f1e3d2 + the 2026-07-24 TRUMPMENTION

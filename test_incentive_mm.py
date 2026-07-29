@@ -1881,6 +1881,23 @@ class TestStickySelection(unittest.TestCase):
         finally:
             _imm.RAIN_FAIR_EXEMPT_EVENTS = old
 
+    def test_curated_tier_and_econ_runoff(self):
+        # 2026-07-29 pm: (a) the rolling next-day rain event is CURATED —
+        # floor/hopeless bypass rolls with the gate exemption (JUL30-NYC
+        # was hopeless-evicted when only the gate rolled); (b) econ series
+        # join the no-new run-off (SCFI-26EOY grandfathered).
+        now = utc(2026, 7, 29, 18, 0)      # 2pm ET Jul 29 -> next day is JUL30
+        self.assertTrue(imm.curated_event("KXRAIN-26JUL30", "KXRAIN", now))
+        self.assertFalse(imm.curated_event("KXRAIN-26JUL31", "KXRAIN", now))
+        self.assertFalse(imm.curated_event("KXOTHER-26JUL30", "KXOTHER", now))
+        imm.EVENT_START_OVERRIDES["KXFOO-26AUG01"] = now
+        try:
+            self.assertTrue(imm.curated_event("KXFOO-26AUG01", "KXFOO", now))
+        finally:
+            imm.EVENT_START_OVERRIDES.pop("KXFOO-26AUG01", None)
+        for s in ("KXSCFI", "KXNHSALES", "KXRT"):
+            self.assertIn(s, imm.NO_NEW_SERIES)
+
     def test_no_new_series_gate(self):
         # Jack 2026-07-28: company family admits no FRESH markets; existing
         # members keep quoting (grandfathered), including across restarts.
