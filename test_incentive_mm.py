@@ -1825,6 +1825,31 @@ class TestStickySelection(unittest.TestCase):
                 if o["yes_price"] in (_imm.PAD_BID_CENTS, _imm.PAD_ASK_CENTS)]
         self.assertTrue(pads, "expected 1c/99c pad orders resting")
 
+    def test_pads_do_not_drain_event_room(self):
+        # Live bug 2026-07-29 (TRUMPMENTIONB ask-only): bid-side pads on
+        # thin strikes consumed event_room_buy, zeroing room for every
+        # later sibling. Two thin markets, one event: BOTH must carry bids.
+        _clean_persist()
+        client = FakeClient()
+        base = client.markets["KXGOOD-99DEC31-A"]
+        ev = "KXGOOD-99DEC31"
+        t2 = f"{ev}-B"
+        client.markets[t2] = dict(base, ticker=t2)
+        client.programs = [dict(client.programs[0], market_ticker=t)
+                           for t in (f"{ev}-A", t2)]
+        thin = {"orderbook_fp": {"yes_dollars": [["0.49", "300"]],
+                                 "no_dollars": [["0.49", "1200"]]}}
+        client.books = {f"{ev}-A": json.loads(json.dumps(thin)),
+                        t2: json.loads(json.dumps(thin))}
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client = client
+        bot.run_cycle()
+        for t in (f"{ev}-A", t2):
+            bids = [o for o in bot.state.sim_orders.values()
+                    if o["ticker"] == t and o["yes_price"] > 1
+                    and o.get("book_side") == "bid"]
+            self.assertTrue(bids, f"{t} lost its YES side to pad room-drain")
+
     def test_freeze_series_exact_match(self):
         # Jack 2026-07-29: company freeze is EXACT-series, not prefix — no
         # KXHEGSETHOUT-via-'ETH' style swallowing of future tickers.

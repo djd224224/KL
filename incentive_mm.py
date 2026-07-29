@@ -3217,6 +3217,8 @@ class IncentiveMarketMaker:
                 parsed = order_yes_book_cents(o)
                 if parsed is None:
                     continue
+                if self._is_pad_price(parsed[0], parsed[1]):
+                    continue      # pads don't charge event room (see below)
                 ev = managed[t].event_ticker
                 if parsed[0] == "bid":
                     event_room_buy[ev] = event_room_buy.get(ev, event_cap_contracts(ev)) \
@@ -3520,8 +3522,16 @@ class IncentiveMarketMaker:
             desired.extend(mq)
             if mq:
                 quoted += 1
-                bought = sum(q.count for q in mq if q.book_side == "bid")
-                sold = sum(q.count for q in mq if q.book_side == "ask")
+                # pads excluded: the event cap bounds NET INVENTORY risk, and
+                # a 1c/99c pad's worst case is ~1c/contract. Counting them
+                # burned the whole event's buy room after a few padded thin
+                # strikes and silently killed every later sibling's YES side
+                # (live bug 2026-07-29, TRUMPMENTIONB: ask-only on ~20
+                # strikes the morning pads went global).
+                bought = sum(q.count for q in mq
+                             if q.book_side == "bid" and not q.is_pad)
+                sold = sum(q.count for q in mq
+                           if q.book_side == "ask" and not q.is_pad)
                 event_room_buy[ev] = event_room_buy.get(ev, event_cap_contracts(ev)) - bought
                 event_room_sell[ev] = event_room_sell.get(ev, event_cap_contracts(ev)) - sold
 
