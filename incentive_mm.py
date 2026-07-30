@@ -216,6 +216,15 @@ for _s in os.environ.get(
 # close_time like weather — but with a bigger pre-reading buffer (30 min) since a
 # point reading is highly autocorrelated in its final minutes. Multi-day market,
 # so the default 1h reduce-only + 1h closing screen stand (no override needed).
+# Main Trump-mention series (Jack 2026-07-30: re-enabled at a LITERAL 10
+# contracts — a hand-tuned override ladder, so applied_mention_mult exempts
+# it from the x1.5 that would otherwise make it 15). Quiet-hours mult still
+# applies (3-7am ET doubles, like every non-TEMP ladder).
+_TRUMP_LEVELS_SPEC = os.environ.get("IMM_TRUMPMENTION_LEVELS", "0:10").strip()
+if _TRUMP_LEVELS_SPEC:
+    SERIES_OVERRIDES["KXTRUMPMENTION"] = SeriesOverride(
+        levels=_parse_levels(_TRUMP_LEVELS_SPEC))
+
 for _s in os.environ.get("IMM_AQI_SERIES", "KXAQICITY").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
@@ -636,7 +645,10 @@ FREEZE_SERIES = frozenset(
         # + the variant sweep, round 3 (2026-07-29: pre-classifier-fix task
         # runs had enrolled these company variants; the class = ANY company
         # base ticker can sprout an A-variant or bare sibling)
-        "KXGOOGA,KXLUVA,KXSBUXA,KXTRUMPMENTION,"
+        # KXTRUMPMENTION un-frozen 2026-07-30 (Jack: "quote TRUMPMENTIONS
+        # like KXTRUMPMENTION-26JUL30 but at 10 contracts") — main-series
+        # events quote again with the hand-tuned 0:10 ladder below.
+        "KXGOOGA,KXLUVA,KXSBUXA,"
         "KXCMGA,KXMETAA,KXVZ,KXVZA,KXWHA,KXYUM,KXYUMA,"
         # KXAC = AIR CANADA passenger load factor (Jack caught it 7/29 pm) —
         # a company metric behind an unrecognizable name; auto-enrolled

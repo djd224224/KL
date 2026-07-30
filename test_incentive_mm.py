@@ -3100,8 +3100,8 @@ class TestHourSizeMult(unittest.TestCase):
         # caps commensurate. "Mention" = MENTION suffix + KXEARNINGSMENTION*.
         imm.HOUR_SIZE_MULTS = {}
         outside = utc(2026, 7, 28, 13, 0)      # 9am ET, no hour mult
-        base = imm.series_levels("KXTRUMPMENTION")
-        self.assertEqual(imm.hour_scaled_levels("KXTRUMPMENTION", outside),
+        base = imm.series_levels("KXWCMENTION")
+        self.assertEqual(imm.hour_scaled_levels("KXWCMENTION", outside),
                          [(t, int(s * 1.5 + 0.5)) for t, s in base])
         self.assertEqual(imm.hour_scaled_levels("KXEARNINGSMENTIONF", outside),
                          [(t, int(s * 1.5 + 0.5)) for t, s in base])
@@ -3111,12 +3111,16 @@ class TestHourSizeMult(unittest.TestCase):
         # composes with the quiet-hours window: x1.5 x2
         imm.HOUR_SIZE_MULTS = {3: 2.0}
         inside = utc(2026, 7, 28, 7, 30)       # 3:30am ET
-        self.assertEqual(imm.hour_scaled_levels("KXTRUMPMENTION", inside),
+        self.assertEqual(imm.hour_scaled_levels("KXWCMENTION", inside),
                          [(t, int(s * 3.0 + 0.5)) for t, s in base])
 
     def test_mention_caps_scale_commensurately(self):
-        self.assertAlmostEqual(imm.series_max_position("KXTRUMPMENTION"),
+        self.assertAlmostEqual(imm.series_max_position("KXWCMENTION"),
                                imm.MAX_POSITION_CONTRACTS * 1.5)
+        # main TRUMPMENTION: hand-tuned 0:10 (Jack 2026-07-30) -> literal,
+        # mult-exempt like Love Island
+        self.assertEqual(imm.series_levels("KXTRUMPMENTION"), [(0, 10)])
+        self.assertEqual(imm.applied_mention_mult("KXTRUMPMENTION"), 1.0)
         self.assertAlmostEqual(imm.series_max_position("KXGOOD"),
                                imm.MAX_POSITION_CONTRACTS)
         # temp override cap unaffected (not mention)
@@ -3126,7 +3130,7 @@ class TestHourSizeMult(unittest.TestCase):
         self.assertEqual(imm.series_max_position("KXLOVEISLMENTION"), 50)
         self.assertEqual(imm.applied_mention_mult("KXLOVEISLMENTION"), 1.0)
         self.assertAlmostEqual(
-            imm.event_cap_contracts("KXTRUMPMENTION-26JUL24"),
+            imm.event_cap_contracts("KXWCMENTION-26JUL24ARGSUI"),
             imm.MAX_EVENT_CONTRACTS * 1.5)
         self.assertAlmostEqual(imm.event_cap_contracts("KXGOOD-99DEC31"),
                                imm.MAX_EVENT_CONTRACTS)
