@@ -335,13 +335,13 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     return HOUR_SIZE_MULTS.get(now_utc.astimezone(ET).hour, 1.0)
 
 
-# Mention-family ladder multiplier (Jack 2026-07-28: x1.5 -> 15/0/0 base,
-# "raise any caps commensurately" — the per-market/per-event net caps and
-# skew thresholds scale by the same factor so the risk geometry keeps its
-# proportions). "Mention" = the allowlist's own semantics: MENTION-suffix
-# series plus the KXEARNINGSMENTION<SYM> tailed family. Composes with the
-# quiet-hours multiplier (3-7am ET: 15 -> 30 at the touch).
-MENTION_SIZE_MULT = _env_float("IMM_MENTION_SIZE_MULT", 1.5)
+# Mention-family ladder multiplier. Jack 2026-07-28: x1.5 ("raise any caps
+# commensurately") -> REMOVED 2026-07-30 ("remove 1.5x multiplier on
+# MENTION, so that they are at 10 contracts"): default 1.0 = whole family
+# on the global ladder, and the commensurate caps (150/750, skew 45/90)
+# revert to 100/500/30-60 through applied_mention_mult automatically. The
+# machinery stays env-tunable (IMM_MENTION_SIZE_MULT) if he wants it back.
+MENTION_SIZE_MULT = _env_float("IMM_MENTION_SIZE_MULT", 1.0)
 
 
 def mention_size_mult(series: str) -> float:

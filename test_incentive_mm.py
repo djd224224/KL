@@ -3096,8 +3096,12 @@ class TestHourSizeMult(unittest.TestCase):
         self.assertEqual(imm.hour_size_mult("KXTEMPNYCH", inside), 1.0)
 
     def test_mention_family_multiplier(self):
-        # Jack 2026-07-28: mention series x1.5 (15/0/0 on the 10-base),
-        # caps commensurate. "Mention" = MENTION suffix + KXEARNINGSMENTION*.
+        # Mechanism test with a PATCHED mult — the default is 1.0 since
+        # 2026-07-30 (Jack removed the 7/28 x1.5; family runs the global 10s).
+        self.assertEqual(imm.MENTION_SIZE_MULT, 1.0)
+        self._old_mult = imm.MENTION_SIZE_MULT
+        imm.MENTION_SIZE_MULT = 1.5
+        self.addCleanup(lambda: setattr(imm, "MENTION_SIZE_MULT", self._old_mult))
         imm.HOUR_SIZE_MULTS = {}
         outside = utc(2026, 7, 28, 13, 0)      # 9am ET, no hour mult
         base = imm.series_levels("KXWCMENTION")
@@ -3115,6 +3119,10 @@ class TestHourSizeMult(unittest.TestCase):
                          [(t, int(s * 3.0 + 0.5)) for t, s in base])
 
     def test_mention_caps_scale_commensurately(self):
+        self.assertEqual(imm.MENTION_SIZE_MULT, 1.0)   # default off since 7/30
+        self._old_mult = imm.MENTION_SIZE_MULT
+        imm.MENTION_SIZE_MULT = 1.5
+        self.addCleanup(lambda: setattr(imm, "MENTION_SIZE_MULT", self._old_mult))
         self.assertAlmostEqual(imm.series_max_position("KXWCMENTION"),
                                imm.MAX_POSITION_CONTRACTS * 1.5)
         # main TRUMPMENTION: hand-tuned 0:10 (Jack 2026-07-30) -> literal,
