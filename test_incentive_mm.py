@@ -609,8 +609,18 @@ class TestAllowlist(unittest.TestCase):
         a = IncentiveMarketMaker._allowed
         for t in ("KXAAAGASD-26JUL23-4.150", "KXAAAGASW-26JUL27-4.040",
                   "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
-                  "KXUSGASCPI-26AUG12-T320", "KXSCFI-26DEC25-T1500"):
+                  "KXUSGASCPI-26AUG12-T320"):
             self.assertTrue(a(t), t)
+        # KXSCFI frozen 2026-07-29 night (Jack: "turn off KXSCFI-26EOY" —
+        # the econ grandfather lasted ~6h); allow contract returns if thawed
+        self.assertFalse(a("KXSCFI-26DEC25-T1500"))
+        import incentive_mm as _imm
+        old = _imm.FREEZE_SERIES
+        _imm.FREEZE_SERIES = frozenset()
+        try:
+            self.assertTrue(a("KXSCFI-26DEC25-T1500"))
+        finally:
+            _imm.FREEZE_SERIES = old
         # GPU rental family HARD-EXCLUDED (blocklisted, not merely absent) so
         # the daily auto-enroll can never pull it in
         b = IncentiveMarketMaker._blocked

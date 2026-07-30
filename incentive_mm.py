@@ -643,7 +643,12 @@ FREEZE_SERIES = frozenset(
         # pre-classifier-fix and twice deliberately kept in allow-file
         # cleanups because nobody identified it. Lesson: an allow entry you
         # can't ATTRIBUTE is a finding, not a keeper.
-        "KXAC"
+        "KXAC,"
+        # KXSCFI grandfather ended (Jack 2026-07-29 night: "turn off
+        # KXSCFI-26EOY" — the run-off lasted ~6h). Positions ride; NOTE the
+        # 26EOY event settles Dec 31, so that inventory sits for months
+        # unless flattened by hand.
+        "KXSCFI"
     ).split(",") if s)
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
