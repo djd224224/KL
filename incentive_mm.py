@@ -1304,6 +1304,27 @@ def series_hard_expiry_utc(series: str, event_ticker: str) -> Optional[datetime]
         .astimezone(timezone.utc)
 
 
+def apply_series_cutoff_adjustments(series: str, event_ticker: str,
+                                    cutoff: Optional[datetime]) -> Optional[datetime]:
+    """Series-level tighteners every cutoff PRODUCER must run: the
+    early-stop (cutoff_before_event_min, e.g. rain 6pm-day-before) and the
+    hard-expiry floor (Love Island 8:30pm). Exists because the 2026-07-29
+    rain early-stop was applied only in refresh_universe — orphan-restored
+    positions rebuilt their own cutoff via raw trade_cutoff_utc and kept
+    reduce-only quoting past 6pm (the 7/14 duplicated-threshold class, in
+    cutoff form)."""
+    ov = SERIES_OVERRIDES.get(series)
+    if ov and ov.cutoff_before_event_min is not None:
+        td = parse_event_date(event_ticker)
+        if td is not None:
+            early = td - timedelta(minutes=ov.cutoff_before_event_min)
+            cutoff = early if cutoff is None else min(cutoff, early)
+    hard = series_hard_expiry_utc(series, event_ticker)
+    if hard is not None:
+        cutoff = hard if cutoff is None else min(cutoff, hard)
+    return cutoff
+
+
 def trade_cutoff_utc(event_ticker: str, occurrence: Optional[datetime],
                      expected_expiration: Optional[datetime]) -> Optional[datetime]:
     """When we must be OUT of this market. Ticker-embedded event dates cut off
@@ -2540,20 +2561,9 @@ class IncentiveMarketMaker:
                     cutoff = trade_cutoff_utc(
                         event_ticker, parse_iso_utc(m.get("occurrence_datetime", "")),
                         parse_iso_utc(m.get("expected_expiration_time", "")))
-            # Early stop N minutes before the ticker-date midnight (rain: 6pm
-            # ET the day before, Jack 2026-07-29). min() so a tighter
-            # resolver/override cutoff still wins.
-            ov_early = series_override(series)
-            if ov_early and ov_early.cutoff_before_event_min is not None:
-                td_ = parse_event_date(event_ticker)
-                if td_ is not None:
-                    early = td_ - timedelta(minutes=ov_early.cutoff_before_event_min)
-                    cutoff = early if cutoff is None else min(cutoff, early)
-            # Hard per-series expiry floor (Love Island: 8:30pm ET on event day).
-            # Independent of the resolver so nothing can rest past it.
-            hard = series_hard_expiry_utc(series, event_ticker)
-            if hard is not None:
-                cutoff = hard if cutoff is None else min(cutoff, hard)
+            # Series tighteners (early-stop + hard floor) — shared with the
+            # orphan-restore path via apply_series_cutoff_adjustments.
+            cutoff = apply_series_cutoff_adjustments(series, event_ticker, cutoff)
             bid = market_cents(m, "yes_bid")
             ask = market_cents(m, "yes_ask")
             try:
@@ -2927,9 +2937,12 @@ class IncentiveMarketMaker:
                     ticker=t, event_ticker=event_ticker, series=t.split("-")[0],
                     dollars_per_day=0.0, program_end=None, target_size=0.0,
                     discount_factor=0.5,
-                    cutoff=trade_cutoff_utc(
-                        event_ticker, parse_iso_utc(m.get("occurrence_datetime", "")),
-                        parse_iso_utc(m.get("expected_expiration_time", ""))),
+                    cutoff=apply_series_cutoff_adjustments(
+                        t.split("-")[0], event_ticker,
+                        trade_cutoff_utc(
+                            event_ticker,
+                            parse_iso_utc(m.get("occurrence_datetime", "")),
+                            parse_iso_utc(m.get("expected_expiration_time", "")))),
                     close_time=parse_iso_utc(m.get("close_time", "")))
                 log(f"{self.tag} restored orphan position market {t} "
                     f"(pos {positions.get(t, 0):+.0f}, reduce-only)")
@@ -3509,6 +3522,13 @@ class IncentiveMarketMaker:
                 self._rain_fair_stood.discard(t)
                 log(f"{self.tag} rain-fair resume {t}")
 
+            # Past-cutoff managed markets (only reduce-only EXTRAS can reach
+            # here — selected members die at the _screen): cancel and go
+            # silent. Without this, a restored rain position kept reduce-only
+            # churn running past the 6pm early stop (2026-07-29, NYC).
+            if meta.cutoff is not None and now_utc >= meta.cutoff:
+                self.cancel_market_orders(t, resting)
+                continue
             # Rooms: hard per-market cap, event share, then skew — all using
             # this market's SERIES ladder/cap (Love Island runs a bigger flat
             # 5/5/5 ladder with a tighter 50-contract net cap). For quote_all

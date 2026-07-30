@@ -1881,6 +1881,41 @@ class TestStickySelection(unittest.TestCase):
         finally:
             _imm.RAIN_FAIR_EXEMPT_EVENTS = old
 
+    def test_cutoff_adjustments_shared_by_both_producers(self):
+        # 2026-07-29 night: the early stop must bind in EVERY cutoff
+        # producer — refresh AND orphan-restore (NYC kept reduce-only
+        # quoting past 6pm because restore built a raw midnight cutoff).
+        c = imm.apply_series_cutoff_adjustments(
+            "KXRAIN", "KXRAIN-26JUL30", imm.parse_event_date("KXRAIN-26JUL30"))
+        self.assertEqual(c, utc(2026, 7, 29, 22, 0))    # 6pm ET day before
+        # hard-expiry floor rides along (Love Island 8:30pm ET event day)
+        c2 = imm.apply_series_cutoff_adjustments(
+            "KXLOVEISLMENTION", "KXLOVEISLMENTION-26AUG02", None)
+        self.assertIsNotNone(c2)
+        # None stays None for plain series
+        self.assertIsNone(imm.apply_series_cutoff_adjustments(
+            "KXGOOD", "KXGOOD-99DEC31", None))
+
+    def test_past_cutoff_extra_goes_silent(self):
+        # a reduce-only extra whose cutoff passed must cancel, not churn
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        t = "KXGOOD-99DEC31-A"
+        meta = bot.state.selected[t]
+        from dataclasses import replace as _replace
+        past = datetime.now(timezone.utc) - timedelta(minutes=5)
+        bot.state.selected = {}
+        bot.state.sticky_prev = set()
+        bot.state.managed_extra[t] = _replace(meta, cutoff=past)
+        bot.pnl.pos[t] = -10.0
+        bot.state.universe_at = time.time()      # no refresh, quote loop only
+        bot.run_cycle()
+        live_orders = [o for o in bot.state.sim_orders.values()
+                       if o["ticker"] == t and o.get("status") == "resting"
+                       and o.get("expire_at", 0) > time.time()]
+        self.assertFalse([o for o in live_orders])
+
     def test_rain_cutoff_6pm_day_before(self):
         # Jack 2026-07-29: rain dailies stop at 6pm ET the day BEFORE the
         # rain day (ticker-date midnight minus 360 min).
