@@ -132,6 +132,10 @@ class SeriesOverride:
     pad_to_target: bool = False                         # when a quoted side's total
     #   depth is below the reward target size, add throwaway contracts at the 1c
     #   mark (bid) / 99c mark (ask) to reach it, so the near-touch ladder qualifies
+    cutoff_before_event_min: Optional[int] = None       # stop this many minutes
+    #   BEFORE the ticker-date midnight (Jack 2026-07-29: rain dailies stop
+    #   quoting 6pm ET the day before -> 360). Applied as a min() on top of
+    #   whatever the resolver/ticker rule produced.
     cutoff_from_close_min: Optional[int] = None         # cutoff = close_time minus
     #   this many minutes, REPLACING the ticker-date/occurrence rules — for series
     #   whose whole life IS the event (hourly weather markets) and which the
@@ -239,7 +243,11 @@ for _s in os.environ.get(
             # (moot today: rain isn't mention).
             levels=_parse_levels(_RAIN_LEVELS_SPEC) if _RAIN_LEVELS_SPEC else None,
             price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
-            price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90))
+            price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
+            # Jack 2026-07-29: stop quoting 6pm ET the day before the rain
+            # day (was midnight). Also gates the directional module's entry
+            # window (its orders respect cutoff_ts).
+            cutoff_before_event_min=_env_int("IMM_RAIN_CUTOFF_BEFORE_MIN", 360))
 
 
 def series_pad_to_target(series: str) -> bool:
@@ -2532,6 +2540,15 @@ class IncentiveMarketMaker:
                     cutoff = trade_cutoff_utc(
                         event_ticker, parse_iso_utc(m.get("occurrence_datetime", "")),
                         parse_iso_utc(m.get("expected_expiration_time", "")))
+            # Early stop N minutes before the ticker-date midnight (rain: 6pm
+            # ET the day before, Jack 2026-07-29). min() so a tighter
+            # resolver/override cutoff still wins.
+            ov_early = series_override(series)
+            if ov_early and ov_early.cutoff_before_event_min is not None:
+                td_ = parse_event_date(event_ticker)
+                if td_ is not None:
+                    early = td_ - timedelta(minutes=ov_early.cutoff_before_event_min)
+                    cutoff = early if cutoff is None else min(cutoff, early)
             # Hard per-series expiry floor (Love Island: 8:30pm ET on event day).
             # Independent of the resolver so nothing can rest past it.
             hard = series_hard_expiry_utc(series, event_ticker)

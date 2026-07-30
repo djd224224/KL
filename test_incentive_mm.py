@@ -1881,6 +1881,18 @@ class TestStickySelection(unittest.TestCase):
         finally:
             _imm.RAIN_FAIR_EXEMPT_EVENTS = old
 
+    def test_rain_cutoff_6pm_day_before(self):
+        # Jack 2026-07-29: rain dailies stop at 6pm ET the day BEFORE the
+        # rain day (ticker-date midnight minus 360 min).
+        ov = imm.series_override("KXRAIN")
+        self.assertEqual(ov.cutoff_before_event_min, 360)
+        td = imm.parse_event_date("KXRAIN-26JUL30")     # Jul 30 00:00 ET
+        early = td - timedelta(minutes=360)             # Jul 29 18:00 ET
+        self.assertEqual(early, utc(2026, 7, 29, 22, 0))
+        # non-rain series unaffected
+        self.assertIsNone((imm.series_override("KXLOVEISLMENTION")
+                           or imm.SeriesOverride()).cutoff_before_event_min)
+
     def test_curated_tier_and_econ_runoff(self):
         # 2026-07-29 pm: (a) the rolling next-day rain event is CURATED —
         # floor/hopeless bypass rolls with the gate exemption (JUL30-NYC
