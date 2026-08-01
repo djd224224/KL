@@ -35,15 +35,15 @@ within a few cents on majors; meme coins diverge (see guards).
 
 ## Quoting rules (accumulated user spec — all are hard requirements)
 
-- **3 levels × 10 contracts**, first level **5c off fair**, levels **exactly 2c apart**
+- **5 levels × 10 contracts**, first level **5c off fair**, levels **exactly 2c apart**
   (invariant: clamps move the ladder's *anchor*, never squeeze gaps). Post-only, GTC + TTL.
 - **Join, don't lead**: a quote may at most *match* the best **external** level (book net of our
   own orders — `external_best()`); a side with no external quotes gets nothing. Never alone at
   the top of the book.
-- **Caps** (all enforced, level size 10 as of 2026-08-01): ≤10 contracts per price level per market (hard
-  invariant, `level_cap` alert if ever hit); ≤30 contracts (3×10) resting
-  per (market, side) — unconditional backstop in `place_with_side_cap()`; **net ±128 per market
-  per direction** (`CMM_MAX_POSITION`, position + full ladder ≤ cap); **±800 net per event**
+- **Caps** (all enforced, 5×10 as of 2026-08-01): ≤10 contracts per price level per market (hard
+  invariant, `level_cap` alert if ever hit); ≤50 contracts (5×10) resting
+  per (market, side) — unconditional backstop in `place_with_side_cap()`; **net ±267 per market
+  per direction** (`CMM_MAX_POSITION`, position + full ladder ≤ cap); **±1667 net per event**
   (`CMM_MAX_EVENT`, budget split across strikes near-money-first). No other directional stop.
 - **Stand-down guards** (skip market, log, digest-note): month-to-date extreme crossed the
   strike (Kraken hourly+daily candles + session, accumulated); fair ≥97c (near touch);

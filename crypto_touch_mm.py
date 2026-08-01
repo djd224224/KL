@@ -77,7 +77,7 @@ from cryptography.hazmat.primitives import serialization
 
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
-MODEL_VERSION = "crypto_touch_mm_v2.0"
+MODEL_VERSION = "crypto_touch_mm_v2.1"
 RUN_ID = uuid.uuid4().hex[:8]
 CLIENT_ORDER_PREFIX = "cmm"  # all client_order_ids look like cmm-<run>-<uuid>
 
@@ -127,17 +127,20 @@ MARKETS: Dict[str, MarketConfig] = {m.key: m for m in [
 # Quoting parameters (user spec: post-only, 5c off fair, 3 levels 2c apart, 10 lots)
 QUOTE_OFFSET_CENTS = int(os.environ.get("CMM_QUOTE_OFFSET_CENTS", 5))
 LEVEL_SPACING_CENTS = int(os.environ.get("CMM_LEVEL_SPACING_CENTS", 2))
-NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 3))
+NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 5))
 CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 10))
 
 # Risk / hygiene parameters
-MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 128))  # per market, either sign
+# Caps scaled proportionally with ladder growth: the 3x8 config carried
+# 128/800; 5x10 is 50/24 of that ladder -> 128*50/24 = 266.7 -> 267,
+# 800*50/24 = 1666.7 -> 1667 (2026-08-01).
+MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 267))  # per market, either sign
 # Net cap across all strikes of one event (they are one correlated bet on the
 # same spot). 500 comfortably exceeds 8 full 3x10 ladders (480): non-binding
 # at rest so every bucket gets the full spec ladder; binds as fills
 # accumulate. The event budget is split evenly across quotable markets each
 # cycle.
-MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 800))
+MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 1667))
 SKIP_FAIR_ABOVE_CENTS = 97       # near-certain touch: model risk dominates, stand down
 BOOK_DIVERGENCE_BID = 85         # best bid >= this while our fair is 20c+ lower ->
 BOOK_DIVERGENCE_GAP = 20         # ... suspected touch we can't see; stand down

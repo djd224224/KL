@@ -157,49 +157,55 @@ class TestBuildQuotes(unittest.TestCase):
         return sorted((x.price_cents, x.count) for x in quotes if x.book_side == "ask")
 
     def test_standard_ladder(self):
-        C = mm.CONTRACTS_PER_LEVEL
+        C, N, S = mm.CONTRACTS_PER_LEVEL, mm.NUM_LEVELS, mm.LEVEL_SPACING_CENTS
         quotes = self.q(50, bb=46, ba=54)
-        self.assertEqual(self.bids(quotes), [(45, C), (43, C), (41, C)])
-        self.assertEqual(self.asks(quotes), [(55, C), (57, C), (59, C)])
+        self.assertEqual(self.bids(quotes), [(45 - S * i, C) for i in range(N)])
+        self.assertEqual(self.asks(quotes), [(55 + S * i, C) for i in range(N)])
 
     def test_never_lead_bid_joins_external_best(self):
         # fair 50 but the best external bid is only 40: join it, never improve;
         # deeper levels keep the exact 2c spacing off the clamped anchor
         quotes = self.q(50, bb=40, ba=54)
-        self.assertEqual([p for p, _c in self.bids(quotes)], [40, 38, 36])
+        self.assertEqual([p for p, _c in self.bids(quotes)],
+                         [40 - mm.LEVEL_SPACING_CENTS * i for i in range(mm.NUM_LEVELS)])
 
     def test_never_lead_ask_joins_external_best(self):
         # fair 50 but the best external ask is 60: join it, never undercut
         quotes = self.q(50, bb=46, ba=60)
-        self.assertEqual([p for p, _c in self.asks(quotes)], [60, 62, 64])
+        self.assertEqual([p for p, _c in self.asks(quotes)],
+                         [60 + mm.LEVEL_SPACING_CENTS * i for i in range(mm.NUM_LEVELS)])
 
     def test_empty_side_never_quoted_alone(self):
         self.assertEqual(self.bids(self.q(50, bb=None, ba=54)), [])
-        self.assertEqual(len(self.asks(self.q(50, bb=None, ba=54))), 3)
+        self.assertEqual(len(self.asks(self.q(50, bb=None, ba=54))), mm.NUM_LEVELS)
         self.assertEqual(self.asks(self.q(50, bb=46, ba=None)), [])
-        self.assertEqual(len(self.bids(self.q(50, bb=46, ba=None))), 3)
+        self.assertEqual(len(self.bids(self.q(50, bb=46, ba=None))), mm.NUM_LEVELS)
         self.assertEqual(self.q(50, bb=None, ba=None), [])
 
     def test_low_fair_drops_negative_bids(self):
         quotes = self.q(3, bb=2, ba=4)
         self.assertEqual(self.bids(quotes), [])   # ladder wants -2,-4,-6: dropped
         C = mm.CONTRACTS_PER_LEVEL
-        self.assertEqual(self.asks(quotes), [(8, C), (10, C), (12, C)])
+        self.assertEqual(self.asks(quotes),
+                         [(8 + mm.LEVEL_SPACING_CENTS * i, C) for i in range(mm.NUM_LEVELS)])
 
     def test_high_fair_drops_over_99_asks(self):
         quotes = self.q(96, bb=92, ba=99)
         self.assertEqual(self.asks(quotes), [])   # ladder wants 101+: dropped
         C = mm.CONTRACTS_PER_LEVEL
-        self.assertEqual(self.bids(quotes), [(91, C), (89, C), (87, C)])
+        self.assertEqual(self.bids(quotes),
+                         [(91 - mm.LEVEL_SPACING_CENTS * i, C) for i in range(mm.NUM_LEVELS)])
 
     def test_cross_clamp_bid_never_crosses_ask(self):
         quotes = self.q(60, bb=48, ba=50)
-        self.assertEqual([p for p, _c in self.bids(quotes)], [48, 46, 44])
+        self.assertEqual([p for p, _c in self.bids(quotes)],
+                         [48 - mm.LEVEL_SPACING_CENTS * i for i in range(mm.NUM_LEVELS)])
         self.assertTrue(all(p < 50 for p, _c in self.bids(quotes)))
 
     def test_cross_clamp_ask_never_crosses_bid(self):
         quotes = self.q(40, bb=52, ba=55)
-        self.assertEqual([p for p, _c in self.asks(quotes)], [55, 57, 59])
+        self.assertEqual([p for p, _c in self.asks(quotes)],
+                         [55 + mm.LEVEL_SPACING_CENTS * i for i in range(mm.NUM_LEVELS)])
         self.assertTrue(all(p > 52 for p, _c in self.asks(quotes)))
 
     def test_room_shaves_ladder(self):
@@ -636,7 +642,9 @@ class TestSideCap(unittest.TestCase):
         C = mm.CONTRACTS_PER_LEVEL
         resting = self.resting(mm.NUM_LEVELS) + self.resting(mm.NUM_LEVELS, side="ask")
         cancelled = {"r0"}   # one bid cancelled this cycle -> room for one new bid
-        to_place = [mm.Quote("T1", "bid", 39, C), mm.Quote("T1", "bid", 37, C)]
+        # probe prices BELOW the resting ladder so only the side cap governs
+        lo = 45 - 2 * mm.NUM_LEVELS
+        to_place = [mm.Quote("T1", "bid", lo, C), mm.Quote("T1", "bid", lo - 2, C)]
         placed = bot.place_with_side_cap(to_place, resting, cancelled, 0.0)
         self.assertEqual(placed, 1)
 
