@@ -508,8 +508,16 @@ class TestFetchRestingOrders(unittest.TestCase):
         n = bot.cancel_all_bot_orders(include_prev_month=True)
         self.assertEqual(n, 1)
         events = [c.get("event_ticker") for c in client.get_orders_calls]
-        self.assertIn("KXSOLMAXMON-SOL-26JUL31", events)
-        self.assertTrue(any(e and e.startswith("KXSOLMAXMON-SOL-26JUN") for e in events))
+        self.assertIn("KXSOLMAXMON-SOL-26JUL31", events)   # the bot's own event
+        # The prev-month sweep uses the real clock: compute the expectation
+        # with independent date math instead of a hardcoded month.
+        import calendar as _cal
+        from datetime import datetime as _dt, timezone as _tz
+        now_et = _dt.now(_tz.utc).astimezone(mm.ET)
+        y, m = (now_et.year - 1, 12) if now_et.month == 1 else (now_et.year, now_et.month - 1)
+        exp = (f"KXSOLMAXMON-SOL-{y % 100:02d}"
+               f"{_dt(y, m, 1).strftime('%b').upper()}{_cal.monthrange(y, m)[1]:02d}")
+        self.assertIn(exp, events)
 
 
 class TestLedgerMerge(unittest.TestCase):

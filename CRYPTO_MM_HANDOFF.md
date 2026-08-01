@@ -35,13 +35,13 @@ within a few cents on majors; meme coins diverge (see guards).
 
 ## Quoting rules (accumulated user spec — all are hard requirements)
 
-- **3 levels × 8 contracts**, first level **5c off fair**, levels **exactly 2c apart**
+- **3 levels × 10 contracts**, first level **5c off fair**, levels **exactly 2c apart**
   (invariant: clamps move the ladder's *anchor*, never squeeze gaps). Post-only, GTC + TTL.
 - **Join, don't lead**: a quote may at most *match* the best **external** level (book net of our
   own orders — `external_best()`); a side with no external quotes gets nothing. Never alone at
   the top of the book.
-- **Caps** (all enforced, scaled 2026-07-12): ≤8 contracts per price level per market (hard
-  invariant, `level_cap` alert if ever hit); ≤24 contracts (3×8) resting
+- **Caps** (all enforced, level size 10 as of 2026-08-01): ≤10 contracts per price level per market (hard
+  invariant, `level_cap` alert if ever hit); ≤30 contracts (3×10) resting
   per (market, side) — unconditional backstop in `place_with_side_cap()`; **net ±128 per market
   per direction** (`CMM_MAX_POSITION`, position + full ladder ≤ cap); **±800 net per event**
   (`CMM_MAX_EVENT`, budget split across strikes near-money-first). No other directional stop.

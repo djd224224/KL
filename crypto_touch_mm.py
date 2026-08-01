@@ -77,7 +77,7 @@ from cryptography.hazmat.primitives import serialization
 
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
-MODEL_VERSION = "crypto_touch_mm_v1.9"
+MODEL_VERSION = "crypto_touch_mm_v2.0"
 RUN_ID = uuid.uuid4().hex[:8]
 CLIENT_ORDER_PREFIX = "cmm"  # all client_order_ids look like cmm-<run>-<uuid>
 
@@ -128,7 +128,7 @@ MARKETS: Dict[str, MarketConfig] = {m.key: m for m in [
 QUOTE_OFFSET_CENTS = int(os.environ.get("CMM_QUOTE_OFFSET_CENTS", 5))
 LEVEL_SPACING_CENTS = int(os.environ.get("CMM_LEVEL_SPACING_CENTS", 2))
 NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 3))
-CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 8))
+CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 10))
 
 # Risk / hygiene parameters
 MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 128))  # per market, either sign
