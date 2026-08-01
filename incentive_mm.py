@@ -8,16 +8,22 @@ GET /trade-api/v2/incentive_programs (period_reward is in CENTI-CENTS:
 two-sided post-only ladders on the best-paying ones, subject to a collateral
 budget and a stack of adverse-selection guards.
 
-Reward mechanics (Kalshi Volume & Liquidity Incentive Program, CFTC filing
-Aug 2025): once per second a random-time book snapshot is scored. On each
-side (YES bids and NO bids — a YES ask IS a NO bid), levels are walked from
-the best price until cumulative size reaches the program's target size
-(usually 1000); if the side's whole book is thinner than target, NOBODY
-scores that side. Each qualifying order scores
-    DiscountFactor^(ticks behind best) x size          (factor 0.5 today)
-and the period reward is split pro-rata by total score share. Therefore:
-join the best (never improve it) with a small lot and stack more size 1-2
-ticks behind — exactly a conservative ladder.
+Reward mechanics (Kalshi Liquidity Incentive Program as AMENDED effective
+2026-07-30; CFTC filing 2026-07-15): once per second a random-time book
+snapshot is scored. On each side (YES bids and NO bids — a YES ask IS a NO
+bid), levels are walked from the best price; the REFERENCE price is the
+level where cumulative size first reaches target/5, and the walk continues
+until cumulative size reaches the target (usually 1000). A snapshot is
+EXCLUDED entirely unless BOTH sides reach target, and the period's payout
+is scaled by (non-excluded / total snapshots). Each qualifying order scores
+    DiscountFactor^max(ticks below REFERENCE, 0) x size    (factor 0.5)
+so everything at or above the reference — typically the top ~target/5 of
+the book, not just the touch — earns FULL weight pro-rata by size, and the
+period reward is split by total score share. Strategic consequences vs the
+pre-7/30 rules: tiny at-touch lots no longer out-score size resting in the
+band; depth pads that lift a thin side to target also un-exclude the whole
+snapshot; and being 1-2 ticks behind the touch but at/above the reference
+costs nothing in weight (see shape sim v2).
 
 Quoting per selected market (post-only, YES-book cents):
   per side: 5 contracts AT the external best (join, never lead, never alone),
@@ -116,6 +122,38 @@ def _parse_levels(spec: str) -> List[Tuple[int, int]]:
 
 LEVELS = _parse_levels(os.environ.get("IMM_LEVELS", "0:5,1:10,2:20"))
 SIDE_MAX_CONTRACTS = sum(s for _t, s in LEVELS)      # 35 with the default spec
+# Ladder placement mode (2026-08-01, post-amendment shape sim v2):
+#   offsets — legacy: rungs at fixed tick offsets behind the join anchor.
+#   atref   — collapse the side's total size to ONE rung at the book's
+#             REFERENCE level (cumulative depth >= target/5): the deepest
+#             price that still scores FULL weight under the amended program
+#             rules. Same estimated reward as all-at-touch (+/-1% on 90
+#             live books), ~half the fill exposure, ~2/3 the collateral.
+#             Falls back to the offsets ladder when the book has no
+#             reference (too thin) — there, position IS the touch anyway.
+LADDER_MODE = os.environ.get("IMM_LADDER_MODE", "offsets").strip().lower()
+# Deep-reference size multiplier (Jack 2026-08-01: "the deeper the reference
+# point, the larger contract size can be placed, up to 2x — it's much
+# safer"): an at-ref rung N ticks behind the touch only fills after the
+# market eats the whole band above it, so it carries more size for the same
+# fill risk. 1.0 at the touch, +SLOPE per tick of depth, capped at MAX_MULT
+# (defaults: 2.0x reached 10 ticks back). Scales the atref rung AND the
+# side_max room component; position/event caps and skew still bind on top.
+REF_DEPTH_SLOPE = _env_float("IMM_REF_DEPTH_SLOPE", 0.1)
+REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 2.0)
+
+
+def ref_depth_mult(anchor: Optional[int], ref_px: Optional[int],
+                   book_side: str) -> float:
+    """Size multiplier for an at-ref rung by its depth behind the touch.
+    1.0 whenever atref is off, inputs are missing, or the reference is at/
+    above the anchor (tight book: placement IS the touch)."""
+    if LADDER_MODE != "atref" or anchor is None or ref_px is None:
+        return 1.0
+    depth = (anchor - ref_px) if book_side == "bid" else (ref_px - anchor)
+    if depth <= 0:
+        return 1.0
+    return min(REF_DEPTH_MAX_MULT, 1.0 + REF_DEPTH_SLOPE * depth)
 
 
 @dataclass(frozen=True)
@@ -157,6 +195,13 @@ PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 1)
 PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 99)
 PAD_ROUND = _env_int("IMM_PAD_ROUND", 100)
 PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 5000)   # safety ceiling per side
+# Headroom added on top of the exact gap whenever a pad is needed (Jack
+# 2026-08-01: AUG0110-T82.99 yes side padded to exactly ~1000, then external
+# retail depth withdrew and the side sat below target — disqualified — until
+# the next requote resized. Slack keeps the side qualified through external
+# churn between requotes, and damps pad resize churn (hysteresis via
+# rounding). ~$3 collateral per pad at 1c/99c.
+PAD_SLACK_CONTRACTS = _env_int("IMM_PAD_SLACK", 300)
 # GLOBAL since 2026-07-29 (Jack: "some quotes are not earning because there
 # are not 1000 orders on that side... fix this systematically — quote how
 # many orders are necessary at the very bottom of the orderbook"): every
@@ -253,10 +298,11 @@ for _s in os.environ.get(
             levels=_parse_levels(_RAIN_LEVELS_SPEC) if _RAIN_LEVELS_SPEC else None,
             price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
-            # Jack 2026-07-29: stop quoting 6pm ET the day before the rain
-            # day (was midnight). Also gates the directional module's entry
-            # window (its orders respect cutoff_ts).
-            cutoff_before_event_min=_env_int("IMM_RAIN_CUTOFF_BEFORE_MIN", 360))
+            # Jack 2026-08-01: run until 9pm ET the day before the rain day
+            # (was 6pm since 7/29, midnight before that). Also gates the
+            # directional module's entry window (its orders respect
+            # cutoff_ts).
+            cutoff_before_event_min=_env_int("IMM_RAIN_CUTOFF_BEFORE_MIN", 180))
 
 
 def series_pad_to_target(series: str) -> bool:
@@ -268,11 +314,12 @@ def series_pad_to_target(series: str) -> bool:
 
 def pad_quantity(external_and_touch_depth: float, target: float) -> int:
     """Contracts to add at the pad price so the side's total depth reaches the
-    reward target, rounded UP to the nearest PAD_ROUND. 0 if already at target."""
+    reward target PLUS slack headroom (survives external withdrawal between
+    requotes), rounded UP to the nearest PAD_ROUND. 0 if already at target."""
     gap = target - external_and_touch_depth
     if gap <= 0:
         return 0
-    n = int(math.ceil(gap / PAD_ROUND) * PAD_ROUND)
+    n = int(math.ceil((gap + PAD_SLACK_CONTRACTS) / PAD_ROUND) * PAD_ROUND)
     return min(n, PAD_MAX_CONTRACTS)
 
 
@@ -496,6 +543,11 @@ MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 2000)  # 450->1000-
 MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-reward markets
 BENCH_COOLDOWN_SECS = _env_int("IMM_BENCH_COOLDOWN", 4 * 3600)
+# Post-2026-07-30 payouts scale by the ratio of non-excluded snapshots (a
+# snapshot is excluded unless BOTH sides reach target size). Per-market EMA of
+# our observed counted/excluded state approximates that ratio over the hours
+# the bot runs; ~0.02/cycle at 30-45s cycles = ~half-hour memory.
+COVERAGE_EMA_ALPHA = _env_float("IMM_COVERAGE_EMA_ALPHA", 0.02)
 FAILSAFE_CANCEL_AFTER = _env_int("IMM_FAILSAFE_AFTER", 4)
 WAKE_GAP_SECS = 600
 # Hang watchdog: the bot is single-threaded, so one wedged syscall = silent
@@ -1466,32 +1518,80 @@ def order_remaining(order: dict) -> float:
 # Reward-share estimator (implements the program's snapshot scoring)
 # ----------------------------------------------------------------------------
 
+def levels_desc(levels: List[List[float]]) -> List[Tuple[int, float]]:
+    """Orderbook side -> (price_cents, size) best price first (highest first;
+    both YES-bid and NO-bid books quote their own price space)."""
+    by: Dict[int, float] = {}
+    for px, q in levels:
+        by[int(px)] = by.get(int(px), 0.0) + float(q)
+    return sorted(by.items(), key=lambda kv: -kv[0])
+
+
+def side_reference_level(levels_best_first: List[Tuple[int, float]],
+                         target: float) -> Optional[int]:
+    """Post-2026-07-30 reference price for one side: the first level, best
+    price first, where cumulative size reaches target/5. None if the walk
+    never gets there (side can't qualify without more depth). Placing our
+    own size AT the returned level cannot move the reference (levels above
+    it are untouched), so it is a stable full-weight placement."""
+    if target <= 0:
+        return None
+    cum = 0.0
+    for px, size in levels_best_first:
+        cum += size
+        if cum >= target / 5.0:
+            return px
+    return None
+
+
+def ladder_reference_prices(yes_levels: List[List[float]],
+                            no_levels: List[List[float]],
+                            target: float) -> Tuple[Optional[int], Optional[int]]:
+    """(bid ref in YES cents, ask ref in YES-ASK cents) for atref placement;
+    (None, None) when the mode is off or a side has no reference."""
+    if LADDER_MODE != "atref" or target <= 0:
+        return None, None
+    rb = side_reference_level(levels_desc(yes_levels), target)
+    rn = side_reference_level(levels_desc(no_levels), target)
+    return rb, (100 - rn) if rn is not None else None
+
+
 def _side_share(levels_best_first: List[Tuple[int, float]], own: Dict[int, float],
                 target: float, df: float) -> Tuple[float, bool]:
     """Our expected score share for one side of the book.
 
     levels_best_first: (price_cents, total_size) best price first, sizes
     INCLUDING our own resting size. own: price -> our size. Returns
-    (our_share, side_qualifies). Mirrors the program rules: reference = best
-    price (must exist and improve on 99); walk levels accumulating size until
-    target reached; if the book runs out first, nobody scores."""
+    (our_share, side_qualifies).
+
+    Post-2026-07-30 program rules (CFTC amendment filed 2026-07-15): walk
+    levels from the best price accumulating size; the REFERENCE price is the
+    level where cumulative size first reaches target/5 (no longer simply the
+    touch); every bid at or ABOVE the reference scores at full weight
+    (N clamped to 0), bids below decay df^(ticks below reference); the
+    qualifying walk continues until cumulative >= target and the side
+    qualifies nobody if the book runs out first. The old touch>=99
+    disqualifier is gone (only a missing best bid disqualifies)."""
     if not levels_best_first or target <= 0:
         return 0.0, False
-    ref = levels_best_first[0][0]
-    if ref >= 99:
-        return 0.0, False
-    total_score = 0.0
-    our_score = 0.0
+    ref: Optional[int] = None
     accumulated = 0.0
+    qualifying: List[Tuple[int, float]] = []
     for px, size in levels_best_first:
-        w = df ** (ref - px)
-        total_score += w * size
-        our_score += w * min(own.get(px, 0.0), size)
+        qualifying.append((px, size))
         accumulated += size
+        if ref is None and accumulated >= target / 5.0:
+            ref = px
         if accumulated >= target:
             break
     else:
         return 0.0, False   # book thinner than target: side doesn't qualify
+    total_score = 0.0
+    our_score = 0.0
+    for px, size in qualifying:
+        w = df ** max(ref - px, 0)
+        total_score += w * size
+        our_score += w * min(own.get(px, 0.0), size)
     if total_score <= 0:
         return 0.0, False
     return our_score / total_score, True
@@ -1503,9 +1603,15 @@ def estimate_reward_share(yes_levels: List[List[float]], no_levels: List[List[fl
                           own_in_book: bool) -> Tuple[float, int]:
     """(our_fraction_of_pool, qualifying_sides). own_in_book=True when the
     orderbook read already contains our resting orders (live mode); False
-    overlays them (dry run). Pool fraction per program rules: each qualifying
-    side normalizes to 1.0 of score share per snapshot, so our fraction is
-    (our_yes_share + our_no_share) / qualifying_sides."""
+    overlays them (dry run).
+
+    Post-2026-07-30 rules: a snapshot only COUNTS when BOTH sides reach the
+    target size ("two-sided liquidity" exclusion); a counted snapshot's total
+    score is 2.0 (each side normalizes to 1.0), so our fraction is
+    (our_yes_share + our_no_share) / 2 — and 0.0 whenever either side fails,
+    because that snapshot is excluded outright (it also shrinks the paid pool
+    via the non-excluded ratio; see coverage EMA at the call sites).
+    `qualifying_sides` still reports 0/1/2 for observability."""
     own_yes: Dict[int, float] = {}
     own_no: Dict[int, float] = {}
     for book_side, yes_px, remaining in own_orders:
@@ -1524,9 +1630,9 @@ def estimate_reward_share(yes_levels: List[List[float]], no_levels: List[List[fl
     share_yes, q_yes = _side_share(prep(yes_levels, own_yes), own_yes, target, df)
     share_no, q_no = _side_share(prep(no_levels, own_no), own_no, target, df)
     sides = int(q_yes) + int(q_no)
-    if sides == 0:
-        return 0.0, 0
-    return (share_yes + share_no) / sides, sides
+    if sides < 2:
+        return 0.0, sides   # snapshot excluded: one qualifying side pays nobody
+    return (share_yes + share_no) / 2.0, sides
 
 
 # ----------------------------------------------------------------------------
@@ -1546,12 +1652,18 @@ class Quote:
 
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
                       opposite_best: Optional[int], room: float,
-                      levels: Optional[List[Tuple[int, int]]] = None) -> List[Quote]:
+                      levels: Optional[List[Tuple[int, int]]] = None,
+                      ref_px: Optional[int] = None) -> List[Quote]:
     """Ladder behind (never improving) the join anchor. `anchor` is the best
     EXTERNAL price on our side; `opposite_best` the best external price on the
     other side (post-only: never cross it). Sizes come from `levels` (the
     market's series ladder; global LEVELS if omitted), shaved to `room`
-    (contracts we may still acquire on this side if everything fills)."""
+    (contracts we may still acquire on this side if everything fills).
+
+    `ref_px` (side's own price space: YES cents for bids, YES-ask cents for
+    asks): the amended-rules reference level. In LADDER_MODE 'atref' the whole
+    side collapses to one rung at that level — deepest full-weight price —
+    clamped inside the series band and never improving the anchor."""
     if levels is None:
         levels = LEVELS
     quotes: List[Quote] = []
@@ -1564,6 +1676,26 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
         elif book_side == "ask" and anchor <= opposite_best:
             anchor = opposite_best + 1
     pmin, pmax = series_price_min(series_of(ticker)), series_price_max(series_of(ticker))
+    if LADDER_MODE == "atref" and ref_px is not None:
+        # Reference placement is EXEMPT from the series price band (Jack
+        # 2026-08-01: "don't arbitrarily constrain to 5c... when it makes
+        # sense to go lower", both sides). Safe by construction: bids only
+        # ever rest AT/BELOW the touch and asks AT/ABOVE it, so the fill
+        # the band guards against (touch-anchored quotes at extreme prices,
+        # the 7/21 97c-bid incident) cannot occur here — deeper = cheaper
+        # collateral and a smaller worst-case fill at identical full
+        # weight. Pads (1c/99c) already price outside the band.
+        total = sum(s for _t, s in levels)
+        total = int(round(total * ref_depth_mult(anchor, ref_px, book_side)))
+        count = min(total, int(room))
+        if count <= 0:
+            return quotes
+        if book_side == "bid":
+            px = min(anchor, max(ref_px, 1))
+        else:
+            px = max(anchor, min(ref_px, 99))
+        quotes.append(Quote(ticker, book_side, px, count))
+        return quotes
     for ticks, size in levels:
         px = anchor - ticks if book_side == "bid" else anchor + ticks
         # BOTH sides, BOTH bounds: the band was originally bid-min/ask-max
@@ -1924,6 +2056,9 @@ class IncentiveMarketMaker:
         self.pnl = PnlTracker()
         self.tag = f"[{self.TAG}]"
         self.alerter = Alerter(self.TAG, live)
+        # ticker -> EMA of "snapshot would count" (both sides >= target).
+        # Deliberately NOT persisted: warms up within ~an hour of cycles.
+        self._coverage_ema: Dict[str, float] = {}
         self.resolver = EventStartResolver()
         self._foreign_resting: Dict[str, int] = {}
         self._shutdown_done = False
@@ -2806,6 +2941,16 @@ class IncentiveMarketMaker:
             log(f"{self.tag} - deselected: {', '.join(sorted(dropped)[:8])}"
                 + (" ..." if len(dropped) > 8 else ""))
 
+    def _coverage(self, ticker: str, counted: bool) -> float:
+        """Update + return the per-market counted-snapshot EMA (the payout's
+        non-excluded-ratio proxy). Only covers hours the bot observes; hours
+        we don't run aren't in it — an estimate, reconciled against credits."""
+        prev = self._coverage_ema.get(ticker)
+        cur = 1.0 if counted else 0.0
+        ema = cur if prev is None else prev + COVERAGE_EMA_ALPHA * (cur - prev)
+        self._coverage_ema[ticker] = ema
+        return ema
+
     def _estimate_candidate_yield(self, meta: MarketMeta,
                                   own_live: List[Tuple[str, int, float]]) -> bool:
         """Fill meta.est_frac / est_dollars_per_day / yield_per_contract from
@@ -2819,21 +2964,34 @@ class IncentiveMarketMaker:
             return False
         yes_levels, no_levels = orderbook_levels(ob)
         if self.live and own_live:
-            frac, _sides = estimate_reward_share(
+            frac, sides = estimate_reward_share(
                 yes_levels, no_levels, own_live,
                 meta.target_size, meta.discount_factor, own_in_book=True)
             n_contracts = sum(r for _s, _p, r in own_live)
         else:
             lv = hour_scaled_levels(meta.series, datetime.now(timezone.utc))
-            side_max = sum(s for _t, s in lv)
             ext_bid, ext_ask = external_best(yes_levels, no_levels)
+            ref_bid_px, ref_ask_px = ladder_reference_prices(
+                yes_levels, no_levels, meta.target_size)
+            base_side_max = sum(s for _t, s in lv)
+            side_max_bid = int(round(base_side_max *
+                                     ref_depth_mult(ext_bid, ref_bid_px, "bid")))
+            side_max_ask = int(round(base_side_max *
+                                     ref_depth_mult(ext_ask, ref_ask_px, "ask")))
             quotes: List[Quote] = []
-            if ext_bid is not None and ext_bid >= series_price_min(meta.series):
+            # atref: the band gates PLACEMENT no longer follows the touch, so
+            # a touch outside the band must not kill the side (rain books
+            # trade whole cities under 5c).
+            if ext_bid is not None and (
+                    (LADDER_MODE == "atref" and ref_bid_px is not None)
+                    or ext_bid >= series_price_min(meta.series)):
                 quotes += build_side_ladder(meta.ticker, "bid", ext_bid, ext_ask,
-                                            side_max, levels=lv)
-            if ext_ask is not None and ext_ask <= series_price_max(meta.series):
+                                            side_max_bid, levels=lv, ref_px=ref_bid_px)
+            if ext_ask is not None and (
+                    (LADDER_MODE == "atref" and ref_ask_px is not None)
+                    or ext_ask <= series_price_max(meta.series)):
                 quotes += build_side_ladder(meta.ticker, "ask", ext_ask, ext_bid,
-                                            side_max, levels=lv)
+                                            side_max_ask, levels=lv, ref_px=ref_ask_px)
             if not quotes:
                 meta.est_frac = meta.est_dollars_per_day = meta.yield_per_contract = 0.0
                 return True
@@ -2857,12 +3015,13 @@ class IncentiveMarketMaker:
                                      meta.target_size)
                     if n > 0:
                         overlay.append(("ask", PAD_ASK_CENTS, float(n)))
-            frac, _sides = estimate_reward_share(
+            frac, sides = estimate_reward_share(
                 yes_levels, no_levels, overlay,
                 meta.target_size, meta.discount_factor, own_in_book=False)
             n_contracts = sum(q.count for q in quotes)
+        cov = self._coverage(meta.ticker, sides == 2)
         meta.est_frac = frac
-        meta.est_dollars_per_day = frac * meta.dollars_per_day
+        meta.est_dollars_per_day = frac * meta.dollars_per_day * cov
         meta.yield_per_contract = \
             (meta.est_dollars_per_day / n_contracts) if n_contracts else 0.0
         return True
@@ -3552,18 +3711,26 @@ class IncentiveMarketMaker:
             # series the cap/skew track the bot's OWN book, so the user's
             # coexisting manual position doesn't shrink the bot's room.
             lv = hour_scaled_levels(meta.series, now_utc)
-            side_max = sum(s for _t, s in lv)
+            # deep-reference size multiplier feeds the side_max component of
+            # room (position/event caps and skew still bind unscaled)
+            ref_bid_px, ref_ask_px = ladder_reference_prices(
+                yes_levels, no_levels, meta.target_size)
+            base_side_max = sum(s for _t, s in lv)
+            side_max_bid = int(round(base_side_max *
+                                     ref_depth_mult(ext_bid, ref_bid_px, "bid")))
+            side_max_ask = int(round(base_side_max *
+                                     ref_depth_mult(ext_ask, ref_ask_px, "ask")))
             maxpos = series_max_position(meta.series)
             cap_pos = own_pos if quote_all else pos
-            room_buy = min(maxpos - cap_pos, share_buy, side_max)
-            room_sell = min(maxpos + cap_pos, share_sell, side_max)
+            room_buy = min(maxpos - cap_pos, share_buy, side_max_bid)
+            room_sell = min(maxpos + cap_pos, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
             room_buy = skewed_side_room(room_buy, cap_pos, accumulating=cap_pos > 0,
-                                        side_max=side_max,
+                                        side_max=side_max_bid,
                                         soft=SKEW_SOFT_CONTRACTS * fam_m,
                                         hard=SKEW_HARD_CONTRACTS * fam_m)
             room_sell = skewed_side_room(room_sell, cap_pos, accumulating=cap_pos < 0,
-                                         side_max=side_max,
+                                         side_max=side_max_ask,
                                          soft=SKEW_SOFT_CONTRACTS * fam_m,
                                          hard=SKEW_HARD_CONTRACTS * fam_m)
             if reduce_only:
@@ -3579,16 +3746,20 @@ class IncentiveMarketMaker:
                     room_buy = room_sell = 0.0
 
             mq: List[Quote] = []
+            # atref: placement no longer follows the touch, so a touch
+            # outside the band must not kill the side (see build_side_ladder)
             if ext_bid is not None and room_buy > 0:
-                px_ok = ext_bid >= series_price_min(meta.series)
+                px_ok = (LADDER_MODE == "atref" and ref_bid_px is not None) \
+                    or ext_bid >= series_price_min(meta.series)
                 if px_ok:
                     mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
-                                                levels=lv))
+                                                levels=lv, ref_px=ref_bid_px))
             if ext_ask is not None and room_sell > 0:
-                px_ok = ext_ask <= series_price_max(meta.series)
+                px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
+                    or ext_ask <= series_price_max(meta.series)
                 if px_ok:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
-                                                levels=lv))
+                                                levels=lv, ref_px=ref_ask_px))
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
@@ -3622,8 +3793,9 @@ class IncentiveMarketMaker:
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, est_own,
                 meta.target_size, meta.discount_factor, own_in_book=self.live)
-            reward_frac_sum += frac * meta.dollars_per_day
-            cycle_rate[t] = frac * meta.dollars_per_day
+            cov = self._coverage(t, sides == 2)
+            reward_frac_sum += frac * meta.dollars_per_day * cov
+            cycle_rate[t] = frac * meta.dollars_per_day * cov
             cycle_rows.append(
                 f"{now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')},{t},"
                 f"{ext_bid if ext_bid is not None else ''},"
@@ -3858,10 +4030,17 @@ class IncentiveMarketMaker:
             # Same hour-scaled shape as the quote loop that built q — an
             # unscaled cap here would block every boosted rung with
             # side_cap/level_cap alerts (the duplicated-threshold class).
+            # In atref mode the construction layer may further scale a rung
+            # by up to REF_DEPTH_MAX_MULT (deep-reference sizing, 2026-08-01
+            # — this gate blocked every scaled rung for ~an hour, pads-only
+            # books on fresh events); bracket by the max legitimate
+            # multiplier — the precise per-book cap already ran in the
+            # room/ladder layer, this is the runaway backstop.
             lv_now = hour_scaled_levels(
                 series, datetime.fromtimestamp(now_ts, tz=timezone.utc))
-            side_cap = sum(s for _t, s in lv_now)
-            max_level_size = max(s for _t, s in lv_now)
+            cap_mult = REF_DEPTH_MAX_MULT if LADDER_MODE == "atref" else 1.0
+            side_cap = sum(s for _t, s in lv_now) * cap_mult
+            max_level_size = max(s for _t, s in lv_now) * cap_mult
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)

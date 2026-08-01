@@ -387,6 +387,90 @@ def discover_company_disclosure(client, now):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: scheduled-broadcast mention events (Jack 2026-08-01, after the
+# KXFOXNEWSMENTION-26AUG01 miss: a NEW mention series has no resolver source,
+# so its same-day event dies at the midnight-of-ticker-date fallback silently
+# — the programs went live at 16:19Z for a 9pm show and the bot never looked).
+# Sweep: every active-program non-earnings MENTION event with a near ticker
+# date that the bot's own EventStartResolver cannot place. Best-effort air
+# time from the TVmaze US schedule (exact show-name match only); email a
+# paste-ready --set for the rest. Same safe direction as everything here: no
+# override -> the bot just keeps NOT quoting.
+# ---------------------------------------------------------------------------
+
+BROADCAST_LOOKAHEAD_DAYS = int(os.environ.get("IMM_BCAST_LOOKAHEAD_DAYS", "3"))
+TVMAZE_SCHED = "https://api.tvmaze.com/schedule?country=US&date={date}"
+SHOW_TITLE_RE = re.compile(r"during\s+(?:fox news:\s*)?([^?]+?)\s*\??\s*$", re.I)
+
+
+def _norm_show(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def discover_broadcast_mention_events(client, now):
+    """[(event, series)] for active-program non-earnings MENTION events with
+    a parseable ticker date within the lookahead that the bot's resolver
+    cannot place — the population that silently dies at the midnight rule."""
+    events = {}
+    cursor = None
+    for _page in range(20):
+        params = {"limit": 1000, "status": "active"}
+        if cursor:
+            params["cursor"] = cursor
+        resp = client.get("/incentive_programs", params=params)
+        batch = resp.get("incentive_programs") or []
+        for p in batch:
+            t = p.get("market_ticker") or ""
+            series = t.split("-")[0]
+            if not series.endswith("MENTION") or series.startswith(_EARNINGS_PREFIX):
+                continue
+            events.setdefault("-".join(t.split("-")[:2]), series)
+        cursor = resp.get("next_cursor")
+        if not cursor or not batch:
+            break
+    out = []
+    resolver = imm.EventStartResolver()
+    today_et = now.astimezone(ET).date()
+    for ev, series in sorted(events.items()):
+        d = parse_event_date(ev)
+        if d is None:
+            continue                      # no ticker date -> midnight rule N/A
+        days_out = (d.astimezone(ET).date() - today_et).days
+        if not (0 <= days_out <= BROADCAST_LOOKAHEAD_DAYS):
+            continue
+        if resolver.resolve(series, ev) is not None:
+            continue                      # bot already derives a real start
+        out.append((ev, series))
+    return out
+
+
+def tvmaze_airtime(show_title: str, date_et):
+    """(datetime ET, network) for an exact normalized show-name match on the
+    US schedule that day, else None. Exact match only — a wrong air time is
+    worse than an email."""
+    try:
+        r = requests.get(TVMAZE_SCHED.format(date=date_et.isoformat()),
+                         headers=UA, timeout=15)
+        r.raise_for_status()
+        entries = r.json()
+    except Exception as e:
+        log(f"! tvmaze fetch failed: {e}")
+        return None
+    want = _norm_show(show_title)
+    if not want:
+        return None
+    for e in entries:
+        show = ((e.get("show") or {}).get("name")) or ""
+        if _norm_show(show) == want and e.get("airstamp"):
+            dt = parse_iso_utc(e["airstamp"])
+            if dt:
+                net = (((e.get("show") or {}).get("network") or {})
+                       .get("name")) or "?"
+                return dt.astimezone(ET), net
+    return None
+
+
 def load_file() -> dict:
     try:
         with open(EVENT_OVERRIDES_FILE, encoding="utf-8") as f:
@@ -527,13 +611,56 @@ def main(argv=None) -> int:
             unresolved.append(ev)
             log(f"UNRESOLVED: {ev}")
 
-    if not args.dry and (resolved or rel_resolved):
+    # Phase 4: scheduled-broadcast mention events the bot cannot window.
+    bc_resolved, bc_unresolved = [], []
+    for ev, series in discover_broadcast_mention_events(client, now):
+        if ev in EVENT_START_OVERRIDES or ev in file_data:
+            continue
+        title = ""
+        try:
+            title = (((client.get_event(ev) or {}).get("event") or {})
+                     .get("title")) or ""
+        except Exception as e:
+            log(f"! event fetch failed {ev}: {e}")
+        m = SHOW_TITLE_RE.search(title)
+        d_et = parse_event_date(ev).astimezone(ET).date()
+        hit = tvmaze_airtime(m.group(1), d_et) if m else None
+        if hit:
+            dt_et, net = hit
+            iso = dt_et.isoformat()
+            file_data[ev] = iso
+            bc_resolved.append((ev, iso, net, title[:90]))
+            log(f"broadcast {ev} = {iso}  [tvmaze {net}]  {title[:70]}")
+        else:
+            bc_unresolved.append((ev, title))
+            log(f"BROADCAST UNRESOLVED: {ev}  {title[:90]}")
+
+    if not args.dry and (resolved or rel_resolved or bc_resolved):
         write_file(file_data)
 
     # email a summary whenever there is anything actionable
     if not args.dry and (resolved or unresolved or enrolled or review
-                         or rel_resolved or rel_unresolved):
+                         or rel_resolved or rel_unresolved
+                         or bc_resolved or bc_unresolved):
         lines = ["Earnings call + release override run", ""]
+        if bc_resolved:
+            lines.append("BROADCAST mention cutoffs AUTO-RESOLVED (TVmaze; "
+                         "written, bot hot-reloads):")
+            for ev, iso, net, title in bc_resolved:
+                lines.append(f"  {ev} = {iso}   [{net}]")
+                lines.append(f"    \"{title}\"")
+            lines.append("")
+        if bc_unresolved:
+            lines.append("BROADCAST mention events UNRESOLVED — the bot will "
+                         "NOT quote these until --set (find the air time):")
+            for ev, title in bc_unresolved:
+                d = parse_event_date(ev)
+                hint = (d.astimezone(ET).strftime("%Y-%m-%d")
+                        if d else now.astimezone(ET).strftime("%Y-%m-%d"))
+                lines.append(f"    # \"{title[:110]}\"")
+                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
+                             f'"{hint}T20:00:00-04:00"   # VERIFY air time')
+            lines.append("")
         if rel_resolved:
             lines.append("RELEASE cutoffs AUTO-RESOLVED (written; bot hot-reloads; "
                          "orders expire 10min before these):")

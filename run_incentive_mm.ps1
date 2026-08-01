@@ -71,12 +71,29 @@ if ($Probe) {
     # walk-truncate deeper rungs to ZERO score, while touch fills are the
     # cheapest per contract (-0.9c vs -5.3c at depth 2) — all-at-the-touch
     # dominates; total 15 -> 8 was Jack's exposure trim.
+    # 0:30 -> 0:20 global (Jack 2026-08-01 night: "move down everything to 20");
+    # IMM_TEMP_LEVELS=0:20 dropped as redundant at the new global. Mention
+    # x1.5 off (code default 1.0). Caps pinned EXPLICITLY (Jack same night):
+    # IMM_MAX_POSITION=150 + IMM_MAX_EVENT=1000 for ALL series -- replaces the
+    # old mult-derived mention-only 150/1000; base was 100/500, then /667.
+    # KXTEMP re-allowed + IMM_TEMP_LEVELS=0:20 (Jack 2026-08-01 pm: "reallow the
+    # hourly temp markets... contract size 20 instead of 30"). IMM_MAX_EVENT
+    # 500 -> 667 => mention-family event cap 750 -> ~1000 (Jack: "increase caps
+    # to 150/1000"; per-market mention cap already 150). At-ref rungs are BAND-
+    # EXEMPT both sides (Jack: no arbitrary 5c/90c pin when the reference is
+    # deeper) — safe: at-ref bids only rest at/below touch, asks at/above.
+    # 0:10 -> 0:30 + IMM_LADDER_MODE=atref (Jack 2026-08-01): amended program
+    # rules (eff 7/30) score the whole top-of-book band at full weight, so
+    # per-contract share is ~size/band (~/200) not touch-multiplied; shape sim
+    # v2 (imm_shape_sim_v2.py): at-ref = same est reward as all-at-touch at
+    # ~half the fill exposure and ~2/3 collateral. 30/side rebuilds the share
+    # the band dilution took. Rain override removed (Jack 2026-08-01 pm): rain runs the global 30/side at-ref.
     # 0:8 -> 0:10 (Jack 2026-07-25 pm). Gas trackers blocklisted same day
     # (Jack: stop quoting KXAAAGASW/M/D + KXUSGASCPI). KXRAIN prefix added
     # 2026-07-26 pm (Jack: "remove all rain markets from the allowlist" —
     # covers the daily KXRAIN + all KXRAIN<CITY>M monthlies). Blocklist =
     # FROZEN: no orders at all, positions ride to settlement.
-    $ProbeEnv = "set IMM_BLOCKLIST=KXAAAGASW,KXAAAGASM,KXAAAGASD,KXUSGASCPI,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXTEMP&& set IMM_RAIN_LEVELS=0:3&& set IMM_LEVELS=0:10&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=13000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
+    $ProbeEnv = "set IMM_BLOCKLIST=KXAAAGASW,KXAAAGASM,KXAAAGASD,KXUSGASCPI,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=13000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
 }
 
 while ($true) {

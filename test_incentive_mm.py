@@ -204,32 +204,58 @@ class TestOrderParse(unittest.TestCase):
 # ----------------------------------------------------------------------------
 
 class TestSideShare(unittest.TestCase):
+    """Post-2026-07-30 rules: reference = level where cumulative >= target/5;
+    full weight at/above reference; decay below it; walk to target."""
+
     def test_all_ours_at_best(self):
         share, q = _side_share([(50, 100.0)], {50: 100.0}, target=100, df=0.5)
         self.assertTrue(q)
         self.assertAlmostEqual(share, 1.0)
 
-    def test_discount_per_tick(self):
-        # 100 external at 50 (w=1), our 100 at 49 (w=0.5): share = 50/150
+    def test_reference_at_touch_when_touch_is_deep(self):
+        # touch has 100 >= target/5 (40) -> ref=50; our 100 at 49 decays 0.5:
+        # share = 50/150 (same as the old rules for a deep touch)
         share, q = _side_share([(50, 100.0), (49, 100.0)], {49: 100.0},
                                target=200, df=0.5)
         self.assertTrue(q)
         self.assertAlmostEqual(share, 50.0 / 150.0)
+
+    def test_reference_below_thin_touch_full_weight_band(self):
+        # target 500 -> ref needs cum >= 100: 10@50 (no), +100@49 -> ref=49.
+        # Walk to >= 500: +400@48 stops. Weights: 50 -> max(49-50,0)=0 -> 1.0
+        # (above ref, N clamped), 49 -> 1.0, 48 -> 0.5.
+        # Ours 10@50 + 100@49: share = 110 / (10 + 100 + 200) = 110/310.
+        share, q = _side_share([(50, 10.0), (49, 100.0), (48, 400.0)],
+                               {50: 10.0, 49: 100.0}, target=500, df=0.5)
+        self.assertTrue(q)
+        self.assertAlmostEqual(share, 110.0 / 310.0)
+
+    def test_tiny_touch_no_longer_dominates(self):
+        # Old rules: our 5 at the touch out-scored 995 one tick behind
+        # (5 vs 497.5). New rules: ref lands on the size level; both full
+        # weight -> we are 5/1000.
+        share, q = _side_share([(50, 5.0), (49, 995.0)], {50: 5.0},
+                               target=1000, df=0.5)
+        self.assertTrue(q)
+        self.assertAlmostEqual(share, 5.0 / 1000.0)
 
     def test_thin_book_no_qualify(self):
         share, q = _side_share([(50, 100.0)], {50: 100.0}, target=1000, df=0.5)
         self.assertEqual((share, q), (0.0, False))
 
     def test_walk_stops_at_target(self):
-        # target reached at the second level; third level does not score
+        # ref at 50 (600 >= 200); target reached at the second level; third
+        # level does not score
         share, q = _side_share([(50, 600.0), (49, 500.0), (48, 500.0)],
                                {48: 500.0}, target=1000, df=0.5)
         self.assertTrue(q)
         self.assertAlmostEqual(share, 0.0)
 
-    def test_best_at_99_disqualifies(self):
-        share, q = _side_share([(99, 5000.0)], {}, target=100, df=0.5)
-        self.assertEqual((share, q), (0.0, False))
+    def test_best_at_99_now_qualifies(self):
+        # The old "touch must improve on 99" disqualifier is gone.
+        share, q = _side_share([(99, 5000.0)], {99: 100.0}, target=100, df=0.5)
+        self.assertTrue(q)
+        self.assertAlmostEqual(share, 100.0 / 5000.0)
 
     def test_empty(self):
         self.assertEqual(_side_share([], {}, 100, 0.5), (0.0, False))
@@ -260,13 +286,14 @@ class TestEstimateRewardShare(unittest.TestCase):
             target=1000, df=0.5, own_in_book=True)
         self.assertAlmostEqual(frac, (100.0 / 950.0) / 2)
 
-    def test_one_side_qualifies(self):
+    def test_one_side_qualifies_pays_nothing(self):
+        # Post-7/30: a snapshot without two-sided-to-target liquidity is
+        # EXCLUDED — one good side earns zero (it used to earn share/1).
         frac, sides = estimate_reward_share(
             [[49, 50.0]], self.BOOK_NO, [("ask", 50, 100.0)],
             target=1000, df=0.5, own_in_book=False)
         self.assertEqual(sides, 1)   # yes side too thin
-        # no side: 1200 ext + our 100 overlay at no-price 50
-        self.assertAlmostEqual(frac, 100.0 / 1300.0)
+        self.assertEqual(frac, 0.0)
 
     def test_nothing_qualifies(self):
         frac, sides = estimate_reward_share([[49, 5.0]], [[50, 5.0]], [],
@@ -312,6 +339,136 @@ class TestBuildSideLadder(unittest.TestCase):
     def test_price_ceiling(self):
         qs = build_side_ladder("T", "ask", imm.PRICE_MAX_CENTS, None, room=35)
         self.assertEqual([q.price_cents for q in qs], [imm.PRICE_MAX_CENTS])
+
+
+class TestAtRefLadder(unittest.TestCase):
+    """LADDER_MODE=atref: whole side collapses to one rung at the amended
+    rules' reference level (deepest full-weight price)."""
+
+    def setUp(self):
+        self._mode = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"
+
+    def tearDown(self):
+        imm.LADDER_MODE = self._mode
+
+    def test_bid_collapses_to_ref(self):
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 30)], ref_px=45)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(45, 45)])  # depth 5 -> 1.5x
+
+    def test_bid_ref_below_band_allowed(self):
+        # at-ref rungs are band-exempt (Jack 2026-08-01): a 2c reference
+        # rests at 2c, not pinned to the 5c series floor
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 30)], ref_px=2)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(2, 60)])   # 2x cap
+
+    def test_ask_ref_above_band_allowed(self):
+        qs = build_side_ladder("T", "ask", 50, 45, room=99,
+                               levels=[(0, 30)], ref_px=95)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(95, 60)])  # 2x cap
+
+    def test_ref_absolute_bounds(self):
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 30)], ref_px=0)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(1, 60)])   # 2x cap
+
+    def test_ask_collapses_to_ref(self):
+        # ask side price space = YES-ask cents; deeper = higher
+        qs = build_side_ladder("T", "ask", 50, 45, room=99,
+                               levels=[(0, 30)], ref_px=58)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(58, 54)])  # depth 8 -> 1.8x
+
+    def test_ref_never_improves_anchor(self):
+        # reference above the anchor (tight book): stay at the anchor join
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 30)], ref_px=52)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(50, 30)])
+
+    def test_multi_rung_levels_sum(self):
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 5), (1, 10), (2, 20)], ref_px=47)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(47, 46)])  # 35 x 1.3
+
+    def test_room_still_shaves(self):
+        qs = build_side_ladder("T", "bid", 50, 55, room=12,
+                               levels=[(0, 30)], ref_px=45)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(45, 12)])
+
+    def test_no_ref_falls_back_to_offsets(self):
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 5), (1, 10)], ref_px=None)
+        self.assertEqual([(q.price_cents, q.count) for q in qs],
+                         [(50, 5), (49, 10)])
+
+    def test_offsets_mode_ignores_ref(self):
+        imm.LADDER_MODE = "offsets"
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 5)], ref_px=45)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(50, 5)])
+
+    def test_deep_ref_scales_size(self):
+        # Jack 2026-08-01: +10%/tick of reference depth, capped 2x.
+        # depth 5 -> 1.5x: 30 -> 45
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 30)], ref_px=45)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(45, 45)])
+        # depth 10 -> capped 2.0x: 30 -> 60
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 30)], ref_px=40)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(40, 60)])
+        # depth 20 -> still 2.0x
+        qs = build_side_ladder("T", "bid", 50, 55, room=200,
+                               levels=[(0, 30)], ref_px=30)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(30, 60)])
+        # at the touch (ref >= anchor): 1.0x
+        qs = build_side_ladder("T", "bid", 50, 55, room=99,
+                               levels=[(0, 30)], ref_px=50)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(50, 30)])
+        # ask side: depth = ref above anchor; depth 5 -> 45
+        qs = build_side_ladder("T", "ask", 50, 45, room=99,
+                               levels=[(0, 30)], ref_px=55)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(55, 45)])
+        # room still caps the scaled size
+        qs = build_side_ladder("T", "bid", 50, 55, room=50,
+                               levels=[(0, 30)], ref_px=40)
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(40, 50)])
+
+    def test_ref_depth_mult_direct(self):
+        imm.LADDER_MODE = "atref"
+        self.assertEqual(imm.ref_depth_mult(50, 45, "bid"), 1.5)
+        self.assertEqual(imm.ref_depth_mult(50, 40, "bid"), 2.0)
+        self.assertEqual(imm.ref_depth_mult(50, 50, "bid"), 1.0)
+        self.assertEqual(imm.ref_depth_mult(50, 55, "ask"), 1.5)
+        self.assertEqual(imm.ref_depth_mult(None, 45, "bid"), 1.0)
+        self.assertEqual(imm.ref_depth_mult(50, None, "bid"), 1.0)
+        imm.LADDER_MODE = "offsets"
+        self.assertEqual(imm.ref_depth_mult(50, 40, "bid"), 1.0)
+
+
+class TestLadderReferencePrices(unittest.TestCase):
+    YES = [[48, 150.0], [49, 100.0]]     # desc: 100@49, 150@48
+    NO = [[50, 400.0]]
+
+    def test_mode_off(self):
+        self.assertEqual(imm.ladder_reference_prices(self.YES, self.NO, 1000),
+                         (None, None))
+
+    def test_refs_computed(self):
+        old = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"
+        try:
+            # target/5 = 200: yes walk 100@49 -> 250@48 => ref 48;
+            # no walk 400@50 => ref 50 -> yes-ask space 100-50 = 50
+            self.assertEqual(
+                imm.ladder_reference_prices(self.YES, self.NO, 1000), (48, 50))
+        finally:
+            imm.LADDER_MODE = old
+
+    def test_side_reference_level_thin(self):
+        self.assertIsNone(imm.side_reference_level([(50, 10.0)], 1000))
+        self.assertIsNone(imm.side_reference_level([], 1000))
 
 
 class TestSkew(unittest.TestCase):
@@ -1897,7 +2054,7 @@ class TestStickySelection(unittest.TestCase):
         # quoting past 6pm because restore built a raw midnight cutoff).
         c = imm.apply_series_cutoff_adjustments(
             "KXRAIN", "KXRAIN-26JUL30", imm.parse_event_date("KXRAIN-26JUL30"))
-        self.assertEqual(c, utc(2026, 7, 29, 22, 0))    # 6pm ET day before
+        self.assertEqual(c, utc(2026, 7, 30, 1, 0))     # 9pm ET day before (Jack 8/1)
         # hard-expiry floor rides along (Love Island 8:30pm ET event day)
         c2 = imm.apply_series_cutoff_adjustments(
             "KXLOVEISLMENTION", "KXLOVEISLMENTION-26AUG02", None)
@@ -1926,14 +2083,14 @@ class TestStickySelection(unittest.TestCase):
                        and o.get("expire_at", 0) > time.time()]
         self.assertFalse([o for o in live_orders])
 
-    def test_rain_cutoff_6pm_day_before(self):
-        # Jack 2026-07-29: rain dailies stop at 6pm ET the day BEFORE the
-        # rain day (ticker-date midnight minus 360 min).
+    def test_rain_cutoff_9pm_day_before(self):
+        # Jack 2026-08-01: rain dailies run until 9pm ET the day BEFORE the
+        # rain day (ticker-date midnight minus 180 min; was 6pm since 7/29).
         ov = imm.series_override("KXRAIN")
-        self.assertEqual(ov.cutoff_before_event_min, 360)
+        self.assertEqual(ov.cutoff_before_event_min, 180)
         td = imm.parse_event_date("KXRAIN-26JUL30")     # Jul 30 00:00 ET
-        early = td - timedelta(minutes=360)             # Jul 29 18:00 ET
-        self.assertEqual(early, utc(2026, 7, 29, 22, 0))
+        early = td - timedelta(minutes=180)             # Jul 29 21:00 ET
+        self.assertEqual(early, utc(2026, 7, 30, 1, 0))
         # non-rain series unaffected
         self.assertIsNone((imm.series_override("KXLOVEISLMENTION")
                            or imm.SeriesOverride()).cutoff_before_event_min)
@@ -2433,7 +2590,7 @@ class TestLoveIslandCycle(unittest.TestCase):
                    if o["ticker"] == t and o["yes_price"] == imm.PAD_BID_CENTS]
         self.assertEqual(len(bid_pad), 1)
         # basis 300 + 15 near-touch -> pad up to 1000, rounded to 100s
-        self.assertEqual(bid_pad[0]["remaining_count"], 700)
+        self.assertEqual(bid_pad[0]["remaining_count"], 1000)   # gap 685 + 300 slack
         # deep NO side gets no pad
         ask_pad = [o for o in bot.state.sim_orders.values()
                    if o["ticker"] == t and o["yes_price"] == imm.PAD_ASK_CENTS]
@@ -2454,15 +2611,15 @@ class TestLoveIslandCycle(unittest.TestCase):
                    if o["ticker"] == t and o["yes_price"] == imm.PAD_BID_CENTS]
         ask_pad = [o for o in bot.state.sim_orders.values()
                    if o["ticker"] == t and o["yes_price"] == imm.PAD_ASK_CENTS]
-        self.assertEqual(bid_pad[0]["remaining_count"], 800)   # (1000-215)->800
-        self.assertEqual(ask_pad[0]["remaining_count"], 800)
+        self.assertEqual(bid_pad[0]["remaining_count"], 1100)  # (1000-215)+300 slack -> 1100
+        self.assertEqual(ask_pad[0]["remaining_count"], 1100)
 
     def test_pad_nets_out_own_pad_live_stable(self):
-        """With our 700 pad already resting inside the book, the desired pad
-        stays 700 (not 0) — no self-referential churn."""
+        """With our 1000 pad already resting inside the book, the desired pad
+        stays 1000 (not 0) — no self-referential churn."""
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=True)
-        yes_levels = [[48, 300.0], [1, 700.0]]   # 300 external + our 700 pad
+        yes_levels = [[48, 300.0], [1, 1000.0]]  # 300 external + our 1000 pad
         no_levels = [[49, 1200.0]]
         near_touch = [imm.Quote("T", "bid", 48, 5)]
         own = [("bid", imm.PAD_BID_CENTS, 700.0)]
@@ -2482,13 +2639,16 @@ class TestLoveIslandCycle(unittest.TestCase):
 
 
 class TestPadQuantity(unittest.TestCase):
-    def test_rounds_up_to_100(self):
-        self.assertEqual(imm.pad_quantity(315, 1000), 700)
-        self.assertEqual(imm.pad_quantity(300, 1000), 700)
-        self.assertEqual(imm.pad_quantity(901, 1000), 100)
-        self.assertEqual(imm.pad_quantity(900, 1000), 100)
+    def test_rounds_up_with_slack(self):
+        # gap + 300 slack, rounded up to 100 (slack survives external
+        # withdrawal between requotes — the AUG0110-T82.99 lesson)
+        self.assertEqual(imm.pad_quantity(315, 1000), 1000)   # gap 685 + 300
+        self.assertEqual(imm.pad_quantity(300, 1000), 1000)   # gap 700 + 300
+        self.assertEqual(imm.pad_quantity(901, 1000), 400)    # gap 99 + 300
+        self.assertEqual(imm.pad_quantity(900, 1000), 400)    # gap 100 + 300
 
     def test_at_or_over_target_no_pad(self):
+        # no slack when the side already reaches target on its own
         self.assertEqual(imm.pad_quantity(1000, 1000), 0)
         self.assertEqual(imm.pad_quantity(1500, 1000), 0)
 

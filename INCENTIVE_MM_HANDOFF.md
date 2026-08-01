@@ -272,6 +272,34 @@ an anchor:
   live implementation of the snapshot-scoring formula against the fetched book
   (`estimate_reward_share`), integrated over time — an *estimate*; actual payouts
   land as Kalshi account credits (not modeled, check the app).
+  **2026-08-01: estimator rewritten to the AMENDED program rules (effective
+  7/30, CFTC filing 7/15):** reference price = level where cumulative depth
+  reaches target/5 (full weight for everything at/above it, pro-rata by size
+  — tiny at-touch lots lost their multiplier edge); snapshots excluded unless
+  BOTH sides reach target; est $/day scaled by a per-market counted-snapshot
+  EMA (`IMM_COVERAGE_EMA_ALPHA`, proxy for the filing's non-excluded ratio).
+  Old-math estimates from 7/30-8/01 were systematically inflated — that was
+  the rain "underearning" mystery. Reconcile credits vs estimator over the
+  next paid period; ladder SHAPE re-derivation lives in imm_shape_sim_v2.py.
+  **Kalshi support confirmed (via Jack, 8/1): the engine runs the amended
+  REFERENCE scoring; the site's per-order efficiency tooltip is WRONG (still
+  touch-based) — ignore it for at-ref orders.** Same evening: deep-reference
+  size multiplier (`ref_depth_mult`, IMM_REF_DEPTH_SLOPE=0.1/tick capped at
+  IMM_REF_DEPTH_MAX_MULT=2.0) scales at-ref rungs and their side_max room —
+  deeper reference = safer rung = more size (30 -> up to 60/side).
+  **Same day: ladder switched to IMM_LADDER_MODE=atref at IMM_LEVELS=0:30**
+  (Jack sign-off): each side rests as ONE rung at the book's reference level
+  (deepest full-weight price; falls back to touch when the book is too thin
+  for a reference). Sim v2 on 90 live books: same est reward as all-at-touch
+  within ~1%, ~half the fill exposure, ~2/3 the collateral. 30/side (was 10)
+  rebuilds per-market share against band dilution (~size/200 within the
+  qualifying band). Mention x1.5 and quiet-hours x2 multiply the 30. Rain
+  keeps 3/side via IMM_RAIN_LEVELS, also at-ref. Collateral estimator still
+  prices rungs at the anchor (conservative: at-ref rests deeper = cheaper).
+  Applied via full task restart 2026-08-01 (the $ProbeEnv gotcha — a
+  bot-process restart alone would keep the stale env; one orphaned python
+  from Stop-ScheduledTask was killed by hand, check for doubles after any
+  task-level restart).
 - Daily summary email 7:00 AM ET-ish (counters roll 6 AM ET): markets quoted,
   est. reward/day captured, realized P&L, fills, top inventory, alert counts.
 
