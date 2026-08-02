@@ -141,6 +141,10 @@ LADDER_MODE = os.environ.get("IMM_LADDER_MODE", "offsets").strip().lower()
 # side_max room component; position/event caps and skew still bind on top.
 REF_DEPTH_SLOPE = _env_float("IMM_REF_DEPTH_SLOPE", 0.1)
 REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 2.0)
+# Requote hysteresis for atref rungs (2026-08-02 audit): full weight is flat
+# across the band, so churn on 1-tick touch/ref wiggles buys nothing.
+ATREF_PRICE_TOL_TICKS = _env_int("IMM_ATREF_PRICE_TOL", 1)
+ATREF_COUNT_TOL_FRAC = _env_float("IMM_ATREF_COUNT_TOL", 0.2)
 
 
 def ref_depth_mult(anchor: Optional[int], ref_px: Optional[int],
@@ -645,15 +649,22 @@ _DEFAULT_COMPANY_SERIES = (
 # same structural class but deliberately NOT included pending a capacity
 # decision — it alone would triple the candidate universe.
 _DEFAULT_ECON_SERIES = (
-    "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI,"
-    # Rotten Tomatoes score markets (Jack 2026-07-23): undated tickers
-    # (KXRT-<MOVIE>-<score>) -> occurrence-based cutoff when Kalshi provides
-    # one, else continuous quoting; bands/floor gate as usual.
-    "KXRT")
+    "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI")
+# Rotten Tomatoes score markets (Jack 2026-07-23): undated tickers
+# (KXRT-<MOVIE>-<score>) -> occurrence-based cutoff when Kalshi provides
+# one, else continuous quoting; bands/floor gate as usual.
+# 2026-08-02 (Jack): pulled OUT of the econ set onto its own track — the
+# 7/29 "block ECON going forward" no-new run-off had swept KXRT along by
+# config placement, silently barring fresh RT events (SPI-89 est $7/day was
+# no_new'd while its screens passed). Entertainment reveals are not macro
+# prints; keep this list OUT of NO_NEW_SERIES.
+_DEFAULT_ENTERTAINMENT_SERIES = "KXRT"
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_ECON_SERIES", _DEFAULT_ECON_SERIES)
+                + "," + os.environ.get("IMM_ALLOW_ENTERTAINMENT_SERIES",
+                                       _DEFAULT_ENTERTAINMENT_SERIES)
                 ).split(",") if s)
 
 # NO-NEW gate (Jack 2026-07-28 pm: "dont quote any new COMPANY markets —
@@ -1742,13 +1753,38 @@ def skewed_side_room(base_room: float, pos: float, accumulating: bool,
 def diff_orders(desired: List[Quote], resting: List[dict],
                 order_ages: Dict[str, float], now_ts: float,
                 preserve_tickers: Set[str] = frozenset()) -> Tuple[List[Quote], List[str]]:
-    """Match desired quotes to resting orders EXACTLY (price and remaining
-    size) — reward credit halves per tick, and a stale at-best order whose
-    anchor faded would be leading the book. Stale-by-TTL orders are replaced.
-    Orders on preserve_tickers (blind markets) are left untouched."""
+    """Match desired quotes to resting orders — exact (price and remaining
+    size) in offsets mode: reward credit halves per tick behind the touch
+    there, and a stale at-best order whose anchor faded would be leading the
+    book. In atref mode (2026-08-02) matching gets HYSTERESIS: everything at
+    or above the reference earns identical full weight, so a rung within
+    ATREF_PRICE_TOL ticks of desired (never IMPROVING the desired price —
+    the rung must stay at/behind it, at/above the ref) and within
+    ATREF_COUNT_TOL_FRAC of desired size is kept instead of churned — touch
+    and reference wiggles were cancel+replacing whole 20-40 lot rungs every
+    cycle. TTL/refresh still rewrites everything periodically, bounding
+    drift. Stale-by-TTL orders are replaced. Orders on preserve_tickers
+    (blind markets) are left untouched."""
     to_place: List[Quote] = []
     to_cancel: List[str] = []
     unmatched = list(desired)
+
+    def matches(q: Quote, ticker: str, book_side: str, px: int,
+                remaining: float) -> bool:
+        if q.ticker != ticker or q.book_side != book_side:
+            return False
+        if LADDER_MODE == "atref" and not getattr(q, "is_pad", False):
+            if abs(px - q.price_cents) > ATREF_PRICE_TOL_TICKS:
+                return False
+            # never keep a rung MORE aggressive than desired: for bids that
+            # is a higher price, for asks a lower one (crossing/fill risk)
+            if q.book_side == "bid" and px > q.price_cents:
+                return False
+            if q.book_side == "ask" and px < q.price_cents:
+                return False
+            tol = max(1.0, ATREF_COUNT_TOL_FRAC * q.count)
+            return abs(remaining - q.count) <= tol
+        return q.price_cents == px and round(remaining) == q.count
 
     for o in resting:
         oid = o.get("order_id", "")
@@ -1764,8 +1800,8 @@ def diff_orders(desired: List[Quote], resting: List[dict],
         age = now_ts - order_ages.get(oid, now_ts)
         stale = age > ORDER_REFRESH_SECS
         match = next((q for q in unmatched
-                      if q.ticker == o.get("ticker") and q.book_side == book_side
-                      and q.price_cents == px and round(remaining) == q.count), None)
+                      if matches(q, o.get("ticker"), book_side, px, remaining)),
+                     None)
         if match is not None and not stale:
             unmatched.remove(match)
         else:
@@ -1983,6 +2019,11 @@ class MarketMeta:
     est_frac: float = 0.0               # estimated pool share with our ladder resting
     est_dollars_per_day: float = 0.0    # est_frac x pool rate
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
+    # observed deep-reference size multipliers (atref mode), set by the
+    # candidate estimator — the collateral reservation must scale rung sizes
+    # by these or the budget under-reserves up to 2x (2026-08-02 audit)
+    ref_mult_bid: float = 1.0
+    ref_mult_ask: float = 1.0
 
 
 @dataclass
@@ -2870,8 +2911,13 @@ class IncentiveMarketMaker:
                 return 0.0
             bid = int(meta.mid_cents - meta.spread_cents / 2)
             ask = int(meta.mid_cents + meta.spread_cents / 2)
-            worst = ladder_collateral_dollars(
-                bid, ask, hour_scaled_levels(meta.series, now_utc))
+            lv = hour_scaled_levels(meta.series, now_utc)
+            # per-side deep-reference size multipliers (2026-08-02 audit):
+            # atref rests up to 2x the spec size, so an unscaled reservation
+            # under-charged the budget up to ~2x on mid-priced deep-ref books
+            # (anchor pricing stays — actual rests at/below the anchor cost).
+            worst = (ladder_collateral_dollars(bid, None, lv) * meta.ref_mult_bid
+                     + ladder_collateral_dollars(None, ask, lv) * meta.ref_mult_ask)
             return worst * COLLATERAL_REALIZATION   # realistic, not worst-case
 
         # quote_all series (e.g. Love Island) are force-included: EVERY market
@@ -2963,6 +3009,10 @@ class IncentiveMarketMaker:
         except Exception:
             return False
         yes_levels, no_levels = orderbook_levels(ob)
+        ext_b, ext_a = external_best(yes_levels, no_levels)
+        rb, ra = ladder_reference_prices(yes_levels, no_levels, meta.target_size)
+        meta.ref_mult_bid = ref_depth_mult(ext_b, rb, "bid")
+        meta.ref_mult_ask = ref_depth_mult(ext_a, ra, "ask")
         if self.live and own_live:
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, own_live,
@@ -2970,14 +3020,10 @@ class IncentiveMarketMaker:
             n_contracts = sum(r for _s, _p, r in own_live)
         else:
             lv = hour_scaled_levels(meta.series, datetime.now(timezone.utc))
-            ext_bid, ext_ask = external_best(yes_levels, no_levels)
-            ref_bid_px, ref_ask_px = ladder_reference_prices(
-                yes_levels, no_levels, meta.target_size)
+            ext_bid, ext_ask, ref_bid_px, ref_ask_px = ext_b, ext_a, rb, ra
             base_side_max = sum(s for _t, s in lv)
-            side_max_bid = int(round(base_side_max *
-                                     ref_depth_mult(ext_bid, ref_bid_px, "bid")))
-            side_max_ask = int(round(base_side_max *
-                                     ref_depth_mult(ext_ask, ref_ask_px, "ask")))
+            side_max_bid = int(round(base_side_max * meta.ref_mult_bid))
+            side_max_ask = int(round(base_side_max * meta.ref_mult_ask))
             quotes: List[Quote] = []
             # atref: the band gates PLACEMENT no longer follows the touch, so
             # a touch outside the band must not kill the side (rain books
@@ -4040,7 +4086,14 @@ class IncentiveMarketMaker:
                 series, datetime.fromtimestamp(now_ts, tz=timezone.utc))
             cap_mult = REF_DEPTH_MAX_MULT if LADDER_MODE == "atref" else 1.0
             side_cap = sum(s for _t, s in lv_now) * cap_mult
-            max_level_size = max(s for _t, s in lv_now) * cap_mult
+            # atref collapses the side's WHOLE ladder to one price level by
+            # design, so the per-level bracket is the side bracket — the
+            # per-rung max only applies to offsets-shaped ladders. (2026-08-02:
+            # temp's multi-rung 5/2/2 override default collapsed to a 14-18
+            # lot single rung > max-level 10 and every temp strike was
+            # level_cap-blocked overnight.)
+            max_level_size = side_cap if LADDER_MODE == "atref" \
+                else max(s for _t, s in lv_now)
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)

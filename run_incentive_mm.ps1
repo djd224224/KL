@@ -72,10 +72,14 @@ if ($Probe) {
     # cheapest per contract (-0.9c vs -5.3c at depth 2) — all-at-the-touch
     # dominates; total 15 -> 8 was Jack's exposure trim.
     # 0:30 -> 0:20 global (Jack 2026-08-01 night: "move down everything to 20");
-    # IMM_TEMP_LEVELS=0:20 dropped as redundant at the new global. Mention
+    # IMM_TEMP_LEVELS=0:20 RESTORED 8/2: dropping it fell back to the temp override's 5/2/2 code default (NOT the global), whose multi-rung shape + atref collapse tripped level_cap and killed all temp quoting overnight. Mention
     # x1.5 off (code default 1.0). Caps pinned EXPLICITLY (Jack same night):
     # IMM_MAX_POSITION=150 + IMM_MAX_EVENT=1000 for ALL series -- replaces the
     # old mult-derived mention-only 150/1000; base was 100/500, then /667.
+    # IMM_MAX_TOTAL_RESTING 2000 -> 4000 (Jack 2026-08-02): the 2000 cap was
+    # sized for the ~263-market universe; post-explosion (~360 quoted, pads
+    # included) peak books approached it and the cap silently blocks
+    # placements when hit. 610 resting at raise time; alerts still fire.
     # KXTEMP re-allowed + IMM_TEMP_LEVELS=0:20 (Jack 2026-08-01 pm: "reallow the
     # hourly temp markets... contract size 20 instead of 30"). IMM_MAX_EVENT
     # 500 -> 667 => mention-family event cap 750 -> ~1000 (Jack: "increase caps
@@ -93,7 +97,7 @@ if ($Probe) {
     # 2026-07-26 pm (Jack: "remove all rain markets from the allowlist" —
     # covers the daily KXRAIN + all KXRAIN<CITY>M monthlies). Blocklist =
     # FROZEN: no orders at all, positions ride to settlement.
-    $ProbeEnv = "set IMM_BLOCKLIST=KXAAAGASW,KXAAAGASM,KXAAAGASD,KXUSGASCPI,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=13000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
+    $ProbeEnv = "set IMM_BLOCKLIST=KXAAAGASW,KXAAAGASM,KXAAAGASD,KXUSGASCPI,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=50&& set IMM_COLLATERAL_BUDGET=13000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
 }
 
 while ($true) {

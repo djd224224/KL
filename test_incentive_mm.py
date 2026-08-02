@@ -495,6 +495,54 @@ def _resting(oid, ticker, book_side, px, remaining):
             "yes_price": px, "remaining_count": remaining, "status": "resting"}
 
 
+class TestAtRefDiffHysteresis(unittest.TestCase):
+    """atref requote hysteresis (2026-08-02): rungs within 1 tick BEHIND
+    desired and 20% of size are kept; aggressive-side drift is churned."""
+
+    def setUp(self):
+        self._mode = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"
+
+    def tearDown(self):
+        imm.LADDER_MODE = self._mode
+
+    def _diff(self, desired, resting):
+        return imm.diff_orders(desired, resting, {}, 0.0)
+
+    def test_one_tick_behind_kept(self):
+        d = [imm.Quote("T", "bid", 45, 30)]
+        r = [_resting("o1", "T", "bid", 44, 30)]     # 1 behind desired: keep
+        place, cancel = self._diff(d, r)
+        self.assertEqual((place, cancel), ([], []))
+
+    def test_aggressive_side_churned(self):
+        d = [imm.Quote("T", "bid", 45, 30)]
+        r = [_resting("o1", "T", "bid", 46, 30)]     # above desired bid: cancel
+        place, cancel = self._diff(d, r)
+        self.assertEqual(cancel, ["o1"])
+        self.assertEqual([(q.price_cents, q.count) for q in place], [(45, 30)])
+
+    def test_count_within_tolerance_kept(self):
+        d = [imm.Quote("T", "bid", 45, 30)]
+        r = [_resting("o1", "T", "bid", 45, 25)]     # |25-30|=5 <= 6: keep
+        place, cancel = self._diff(d, r)
+        self.assertEqual((place, cancel), ([], []))
+
+    def test_count_beyond_tolerance_churned(self):
+        d = [imm.Quote("T", "bid", 45, 30)]
+        r = [_resting("o1", "T", "bid", 45, 20)]     # |20-30|=10 > 6: churn
+        place, cancel = self._diff(d, r)
+        self.assertEqual(cancel, ["o1"])
+
+    def test_ask_side_direction(self):
+        d = [imm.Quote("T", "ask", 55, 30)]
+        r_ok = [_resting("o1", "T", "ask", 56, 30)]   # behind (higher): keep
+        self.assertEqual(self._diff(d, r_ok), ([], []))
+        r_bad = [_resting("o2", "T", "ask", 54, 30)]  # aggressive: churn
+        place, cancel = self._diff(d, r_bad)
+        self.assertEqual(cancel, ["o2"])
+
+
 class TestDiffOrders(unittest.TestCase):
     def test_exact_match_kept(self):
         now = time.time()
@@ -2109,8 +2157,13 @@ class TestStickySelection(unittest.TestCase):
             self.assertTrue(imm.curated_event("KXFOO-26AUG01", "KXFOO", now))
         finally:
             imm.EVENT_START_OVERRIDES.pop("KXFOO-26AUG01", None)
-        for s in ("KXSCFI", "KXNHSALES", "KXRT"):
+        for s in ("KXSCFI", "KXNHSALES"):
             self.assertIn(s, imm.NO_NEW_SERIES)
+        # 2026-08-02 (Jack): KXRT pulled out of the econ set — entertainment
+        # reveals are not macro prints; the 7/29 econ run-off had swept it
+        # by config placement. Still allowed, no longer no_new'd.
+        self.assertNotIn("KXRT", imm.NO_NEW_SERIES)
+        self.assertTrue(imm.IncentiveMarketMaker._allowed("KXRT-X"))
 
     def test_no_new_series_gate(self):
         # Jack 2026-07-28: company family admits no FRESH markets; existing

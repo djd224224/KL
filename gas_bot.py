@@ -96,6 +96,14 @@ SERIES = [s.strip() for s in os.environ.get(
 POLL_SECS = _env_i("GAS_POLL_SECS", 300)
 SNIPE_POLL_SECS = _env_i("GAS_SNIPE_POLL_SECS", 20)
 SNIPE_WINDOW = os.environ.get("GAS_SNIPE_WINDOW", "02:45-07:30")   # ET
+# Speed upgrade (Jack 2026-08-01, after the 3 missed IOCs on the first real
+# surprise): poll fast inside the hot window where every observed print has
+# landed (3:18/3:20/3:24/3:36 ET), and keep a prefetched universe+book cache
+# so the post-print critical path is just fair math + IOC sends (~200ms),
+# followed by a fresh-fetch second wave sharing the envelope.
+SNIPE_HOT_WINDOW = os.environ.get("GAS_SNIPE_HOT_WINDOW", "03:10-03:45")  # ET
+SNIPE_HOT_POLL_SECS = _env_i("GAS_SNIPE_HOT_POLL_SECS", 5)
+SNIPE_PREFETCH_SECS = _env_i("GAS_SNIPE_PREFETCH_SECS", 60)
 
 EDGE_MAKE_CENTS = _env_f("GAS_EDGE_MAKE_CENTS", 4.0)
 EDGE_TAKE_CENTS = _env_f("GAS_EDGE_TAKE_CENTS", 6.0)   # net of taker fee
@@ -121,6 +129,15 @@ PRICE_MAX = _env_i("GAS_PRICE_MAX", 98)
 DRIFT_MAX_CPD = _env_f("GAS_DRIFT_MAX_CENTS_PER_DAY", 1.5)
 MODEL_WEIGHT = _env_f("GAS_MODEL_WEIGHT", 0.5)       # carry: model vs market mid
 MAX_DISAGREE_CENTS = _env_f("GAS_MAX_DISAGREE_CENTS", 25.0)
+# Day-of-week drift (2026-08-01, after the Friday-print overreach: the model
+# projected +0.64c/d Friday momentum straight through the weekend while the
+# market correctly priced weekend station-discounting softness). Per-weekday
+# delta adjustments, shrunk toward 0 (n/(n+K), ~12 samples/weekday) and
+# clamped; the EWMA runs on DOW-demeaned deltas (pure trend) and projections
+# add the adjustment back along the actual calendar path.
+DOW_ENABLE = os.environ.get("GAS_DOW_ENABLE", "1") == "1"
+DOW_SHRINK_K = _env_f("GAS_DOW_SHRINK_K", 8.0)
+DOW_CLAMP_CENTS = _env_f("GAS_DOW_CLAMP_CENTS", 0.75)
 SIGMA_MIN_CENTS = _env_f("GAS_SIGMA_MIN_CENTS", 0.25)
 SIGMA_PAD = _env_f("GAS_SIGMA_PAD", 1.15)  # multiply calibrated sigma (fat tails)
 MAX_HORIZON_DAYS = _env_i("GAS_MAX_HORIZON_DAYS", 8)
@@ -201,10 +218,48 @@ class Calibration:
     n_days: int
     drift: DriftParams
     table: List[Tuple[int, float, int]]    # (h, sigma_cents, n)
+    dow_adj: Tuple[float, ...] = (0.0,) * 7   # cents, Mon=0 .. Sun=6
 
     def sigma_cents(self, h: float) -> float:
         s = self.sigma1_cents * (max(h, 1.0) ** self.power) * SIGMA_PAD
         return max(s, SIGMA_MIN_CENTS)
+
+
+def dow_adjustments(deltas: List[Tuple[date, float]]) -> Tuple[float, ...]:
+    """Per-weekday mean-delta deviation from the overall mean, shrunk by
+    n/(n+K) and clamped. Keyed by the weekday of the PRINT day (the later
+    day of the pair): Saturday's entry describes how Saturday prints move."""
+    if not DOW_ENABLE or len(deltas) < 28:
+        return (0.0,) * 7
+    overall = sum(dc for _d, dc in deltas) / len(deltas)
+    by_w: Dict[int, List[float]] = {}
+    for d, dc in deltas:
+        by_w.setdefault(d.weekday(), []).append(dc)
+    adj = []
+    for w in range(7):
+        xs = by_w.get(w, [])
+        if not xs:
+            adj.append(0.0)
+            continue
+        raw = sum(xs) / len(xs) - overall
+        shrunk = raw * len(xs) / (len(xs) + DOW_SHRINK_K)
+        adj.append(max(-DOW_CLAMP_CENTS, min(DOW_CLAMP_CENTS, shrunk)))
+    return tuple(adj)
+
+
+def demean_dow(deltas: List[Tuple[date, float]],
+               dow: Tuple[float, ...]) -> List[Tuple[date, float]]:
+    return [(d, dc - dow[d.weekday()]) for d, dc in deltas]
+
+
+def path_drift_cents(mu_cpd: float, asof: date, h: int, rho: float,
+                     dow: Tuple[float, ...]) -> float:
+    """Cumulative expected move over h calendar days from `asof`: decaying
+    trend plus each crossed day's weekday adjustment."""
+    cum = 0.0
+    for i in range(1, h + 1):
+        cum += mu_cpd * (rho ** (i - 1)) + dow[(asof + timedelta(days=i)).weekday()]
+    return cum
 
 
 def _drift_cpd(deltas: List[Tuple[date, float]], asof: date,
@@ -260,16 +315,18 @@ DRIFT_GRID = [DriftParams(hl, lam, rho)
               for rho in (0.6, 0.8, 1.0)]
 
 
-def _residuals(values, by_date, deltas, p: DriftParams,
-               horizons) -> Dict[int, List[float]]:
+def _residuals(values, by_date, adj_deltas, p: DriftParams,
+               horizons, dow: Tuple[float, ...]) -> Dict[int, List[float]]:
+    """Walk-forward residuals: EWMA drift on DOW-demeaned deltas, projection
+    re-adds each crossed day's weekday adjustment."""
     resid: Dict[int, List[float]] = {h: [] for h in horizons}
     for d, v in values:
-        mu = _drift_cpd(deltas, d, p)
+        mu = _drift_cpd(adj_deltas, d, p)
         for h in horizons:
             tgt = by_date.get(d + timedelta(days=h))
             if tgt is None:
                 continue
-            pred = v + _cum_drift(mu, h, p.rho) / 100.0
+            pred = v + path_drift_cents(mu, d, h, p.rho, dow) / 100.0
             resid[h].append((tgt - pred) * 100.0)
     return resid
 
@@ -288,6 +345,9 @@ def calibrate(values: List[Tuple[date, float]],
             f"only {len(deltas)} consecutive-day deltas in history; need >= 20 "
             "(run gas_data.py backfill-wayback first)")
 
+    dow = dow_adjustments(deltas)
+    adj_deltas = demean_dow(deltas, dow)
+
     env_hl = os.environ.get("GAS_DRIFT_HALFLIFE_DAYS")
     env_lam = os.environ.get("GAS_DRIFT_LAM_LAST")
     env_rho = os.environ.get("GAS_DRIFT_RHO")
@@ -297,7 +357,7 @@ def calibrate(values: List[Tuple[date, float]],
     else:
         best, best_score = None, None
         for p in DRIFT_GRID:
-            resid = _residuals(values, by_date, deltas, p, (1, 2, 3))
+            resid = _residuals(values, by_date, adj_deltas, p, (1, 2, 3), dow)
             n = sum(len(r) for r in resid.values())
             if n < 30:
                 continue
@@ -307,7 +367,7 @@ def calibrate(values: List[Tuple[date, float]],
         if best is None:
             raise RuntimeError("not enough overlapping history to fit drift model")
 
-    resid = _residuals(values, by_date, deltas, best, range(1, max_h + 1))
+    resid = _residuals(values, by_date, adj_deltas, best, range(1, max_h + 1), dow)
     table = []
     xs, ys, ws = [], [], []
     for h in range(1, max_h + 1):
@@ -333,7 +393,8 @@ def calibrate(values: List[Tuple[date, float]],
     power = max(0.3, min(1.2, power))
     sigma1 = math.exp(my - power * mx)
     return Calibration(sigma1_cents=sigma1, power=power,
-                       n_days=len(values), drift=best, table=table)
+                       n_days=len(values), drift=best, table=table,
+                       dow_adj=dow)
 
 
 @dataclass
@@ -351,7 +412,9 @@ class Snapshot:
         if h == 0:
             # settlement print already published: deterministic
             return 100.0 if self.value > strike else 0.0
-        vhat = self.value + _cum_drift(self.drift_cpd, h, self.calib.drift.rho) / 100.0
+        vhat = self.value + path_drift_cents(
+            self.drift_cpd, self.asof, h, self.calib.drift.rho,
+            self.calib.dow_adj) / 100.0
         sig = self.calib.sigma_cents(h) / 100.0
         p = 1.0 - _norm_cdf((strike - vhat) / sig)
         return 100.0 * p
@@ -371,7 +434,7 @@ def load_snapshot(require_fresh: bool) -> Snapshot:
         raise RuntimeError(
             f"newest AAA print {asof} is ~{age_h:.0f}h old (> "
             f"{STALE_PRINT_MAX_AGE_HOURS}h) — refusing to trade on stale data")
-    deltas = build_deltas(values)
+    deltas = demean_dow(build_deltas(values), calib.dow_adj)
     drift = _drift_cpd(deltas, asof, calib.drift)
     return Snapshot(asof=asof, value=value, drift_cpd=drift, calib=calib)
 
@@ -837,47 +900,76 @@ class GasBot:
 
     # ---- snipe mode ----
 
-    def snipe_window(self) -> None:
-        """Poll AAA inside the ET window; on a new print, take stale quotes."""
-        w_from, w_to = SNIPE_WINDOW.split("-")
+    @staticmethod
+    def _parse_et_window(spec: str) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        w_from, w_to = spec.split("-")
         fh, fm = (int(x) for x in w_from.split(":"))
         th, tm = (int(x) for x in w_to.split(":"))
+        return (fh, fm), (th, tm)
+
+    def snipe_window(self) -> None:
+        """Poll AAA inside the ET window; on a new print, take stale quotes.
+
+        Speed path (2026-08-01): poll every SNIPE_HOT_POLL_SECS inside the
+        hot sub-window, and refresh a universe+book cache every
+        SNIPE_PREFETCH_SECS while waiting — on the print flip, wave 1 fires
+        IOCs against the cache immediately (limit prices bound staleness
+        risk), then wave 2 re-fetches fresh and sweeps what remains of the
+        envelope."""
+        (fh, fm), (th, tm) = self._parse_et_window(SNIPE_WINDOW)
+        hot_from, hot_to = self._parse_et_window(SNIPE_HOT_WINDOW)
         rows = gas_data.load_history()
         prev = gas_data.series_values(rows)
         prev_asof = prev[-1][0] if prev else None
-        log(f"snipe: window {SNIPE_WINDOW} ET, poll {SNIPE_POLL_SECS}s, "
-            f"last known print {prev_asof}")
+        log(f"snipe: window {SNIPE_WINDOW} ET (hot {SNIPE_HOT_WINDOW} @ "
+            f"{SNIPE_HOT_POLL_SECS}s), poll {SNIPE_POLL_SECS}s, prefetch "
+            f"{SNIPE_PREFETCH_SECS}s, last known print {prev_asof}")
         fired = False
+        snap_pre: Optional[Snapshot] = None
+        cache_u: Optional[List[GasMarket]] = None
+        cache_b: Optional[Book] = None
+        cache_ts = 0.0
         while True:
             now_et = datetime.now(ET)
-            after_start = (now_et.hour, now_et.minute) >= (fh, fm)
-            before_end = (now_et.hour, now_et.minute) <= (th, tm)
-            if not before_end:
+            hm = (now_et.hour, now_et.minute)
+            if not (hm <= (th, tm)):
                 log("snipe: window over" + (" (no new print seen!)" if not fired else ""))
                 if not fired:
                     self.alerter.send("snipe no-print",
                                       f"window {SNIPE_WINDOW} ET ended without a "
                                       f"new AAA print (last {prev_asof})")
                 return
-            if not after_start:
+            if not (hm >= (fh, fm)):
                 time.sleep(30)
                 continue
+            # keep the pre-print model + market cache warm while waiting
+            if time.time() - cache_ts >= SNIPE_PREFETCH_SECS:
+                try:
+                    if snap_pre is None:
+                        snap_pre = load_snapshot(require_fresh=False)
+                    cache_u = fetch_universe(self.client, snap_pre)
+                    cache_b = read_book(self.client, [g.ticker for g in cache_u])
+                    cache_ts = time.time()
+                except Exception as e:
+                    log(f"snipe: prefetch failed ({e})")
             try:
                 value, asof = gas_data.fetch_live()
             except Exception as e:
                 log(f"snipe: AAA fetch failed ({e})")
-                time.sleep(SNIPE_POLL_SECS)
-                continue
-            if prev_asof is not None and asof <= prev_asof:
-                time.sleep(SNIPE_POLL_SECS)
+                value, asof = None, None
+            if value is None or (prev_asof is not None and asof <= prev_asof):
+                in_hot = hot_from <= hm <= hot_to
+                time.sleep(SNIPE_HOT_POLL_SECS if in_hot else SNIPE_POLL_SECS)
                 continue
             # NEW PRINT
-            log(f"snipe: NEW PRINT {asof} = {value:.4f}")
-            try:
-                snap_old = load_snapshot(require_fresh=False)
-            except RuntimeError as e:
-                log(f"snipe: no pre-print model ({e})")
-                snap_old = None
+            log(f"snipe: NEW PRINT {asof} = {value:.4f} "
+                f"(cache age {time.time() - cache_ts:.0f}s)")
+            snap_old = snap_pre
+            if snap_old is None:
+                try:
+                    snap_old = load_snapshot(require_fresh=False)
+                except RuntimeError as e:
+                    log(f"snipe: no pre-print model ({e})")
             rows = gas_data.load_history()
             gas_data.upsert(rows, asof, value, None, None, "live")
             gas_data.save_history(rows)
@@ -887,25 +979,58 @@ class GasBot:
             except RuntimeError as e:
                 log(f"snipe: model refused: {e}")
                 return
-            self.snipe_once(snap, snap_old)
+            taken_keys: set = set()
+            lines1, t1 = [], 0
+            if cache_u is not None and cache_b is not None:
+                lines1, t1 = self.snipe_once(snap, snap_old,
+                                             universe=cache_u, book=cache_b,
+                                             skip=taken_keys, send_alert=False)
+                log(f"snipe wave 1 (cache): {t1} takes")
+            lines2, t2 = self.snipe_once(snap, snap_old, taken_before=t1,
+                                         skip=taken_keys, send_alert=False)
+            log(f"snipe wave 2 (fresh): {t2} takes")
+            body = (f"print {asof} = {value:.4f}, drift {snap.drift_cpd:+.2f}c/d\n"
+                    f"envelope {t1 + t2}/{SNIPE_MORNING_CAP} used "
+                    f"(wave1 cache {t1}, wave2 fresh {t2}), "
+                    f"{SNIPE_UNIT_CONTRACTS}/strike units\n"
+                    + ("\n".join(lines1 + lines2)
+                       if (lines1 or lines2) else "no quotes worth taking"))
+            self.alerter.send(f"snipe {asof}: {t1 + t2} takes", body)
             return
 
-    def snipe_once(self, snap: Snapshot, snap_old: Optional[Snapshot] = None) -> None:
-        """Take stale quotes right after a new print.
+    def snipe_once(self, snap: Snapshot, snap_old: Optional[Snapshot] = None,
+                   universe: Optional[List[GasMarket]] = None,
+                   book: Optional[Book] = None,
+                   taken_before: int = 0,
+                   skip: Optional[set] = None,
+                   send_alert: bool = True) -> Tuple[List[str], int]:
+        """Take stale quotes right after a new print. Returns (log lines,
+        contracts placed this pass).
 
         Effective fair per market = the PRE-print market mid shifted by the
         model's mechanical repricing (fair_new - fair_old), capped by the
         model's absolute fair on the aggressive side. This only harvests the
         repricing the fresh print justifies — it does not bet the model's
         absolute disagreement with the market (that disagreement usually
-        means the market knows something, e.g. wholesale prices)."""
+        means the market knows something, e.g. wholesale prices).
+
+        `universe`/`book`: prefetched state for the zero-latency cache wave
+        (quotes may be up to SNIPE_PREFETCH_SECS old — safe: the IOC limit
+        price bounds what we pay regardless of where the book moved).
+        `taken_before` consumes the shared morning envelope; `skip` is the
+        caller-owned {(ticker, side)} set of already-placed takes (mutated)."""
         halted = self._halted()
         if halted:
             log(f"HALTED ({halted}) — no snipe")
-            return
-        universe = fetch_universe(self.client, snap)
-        tickers = [g.ticker for g in universe]
-        book = read_book(self.client, tickers)
+            return [], 0
+        if universe is None:
+            universe = fetch_universe(self.client, snap)
+        else:
+            # cached universe was faired against the OLD print — recompute
+            for gm in universe:
+                gm.fair = snap.fair_cents(gm.strike, gm.settle_day)
+        if book is None:
+            book = read_book(self.client, [g.ticker for g in universe])
         event_costs: Dict[str, float] = {}
         by_ticker = {g.ticker: g for g in universe}
         for t, exp in book.exposure_dollars.items():
@@ -944,12 +1069,14 @@ class GasBot:
         # strike (at most one side of a strike can ever qualify: both would
         # need bid > ask).
         acted = []
-        taken_total = 0
+        taken_total = taken_before
         taken_by_ticker: Dict[str, int] = {}
         for net_edge, gm, side, px, room in sorted(candidates, key=lambda c: -c[0]):
             if taken_total >= SNIPE_MORNING_CAP:
                 log(f"morning envelope {SNIPE_MORNING_CAP} used; done")
                 break
+            if skip is not None and (gm.ticker, side) in skip:
+                continue
             unit_left = SNIPE_UNIT_CONTRACTS - taken_by_ticker.get(gm.ticker, 0)
             cnt = min(room, unit_left, SNIPE_MORNING_CAP - taken_total)
             if cnt <= 0:
@@ -968,12 +1095,18 @@ class GasBot:
                 taken_total += cnt
                 taken_by_ticker[gm.ticker] = \
                     taken_by_ticker.get(gm.ticker, 0) + cnt
+                if skip is not None:
+                    skip.add((gm.ticker, side))
                 acted.append(f"{gm.ticker} buy {side} {cnt}x<= {px}c ({why})")
-        body = (f"print {snap.asof} = {snap.value:.4f}, drift {snap.drift_cpd:+.2f}c/d\n"
-                f"envelope {taken_total}/{SNIPE_MORNING_CAP} used, "
-                f"{SNIPE_UNIT_CONTRACTS}/strike units\n"
-                + ("\n".join(acted) if acted else "no quotes worth taking"))
-        self.alerter.send(f"snipe {snap.asof}: {len(acted)} takes", body)
+        placed_this_pass = taken_total - taken_before
+        if send_alert:
+            body = (f"print {snap.asof} = {snap.value:.4f}, "
+                    f"drift {snap.drift_cpd:+.2f}c/d\n"
+                    f"envelope {taken_total}/{SNIPE_MORNING_CAP} used, "
+                    f"{SNIPE_UNIT_CONTRACTS}/strike units\n"
+                    + ("\n".join(acted) if acted else "no quotes worth taking"))
+            self.alerter.send(f"snipe {snap.asof}: {len(acted)} takes", body)
+        return acted, placed_this_pass
 
     # ---- status table ----
 
@@ -1063,7 +1196,7 @@ def main(argv=None) -> int:
     if args.calibrate:
         values = gas_data.series_values(gas_data.load_history())
         calib = calibrate(values)
-        deltas = build_deltas(values)
+        deltas = demean_dow(build_deltas(values), calib.dow_adj)
         drift = _drift_cpd(deltas, values[-1][0], calib.drift) if values else 0.0
         exact = sum(1 for r in gas_data.load_history().values()
                     if r["value"] is not None)
@@ -1074,8 +1207,11 @@ def main(argv=None) -> int:
         print(f"drift params (walk-forward selected): halflife "
               f"{calib.drift.halflife}d, last-delta weight {calib.drift.lam_last}, "
               f"decay rho {calib.drift.rho}")
-        print(f"drift now: {drift:+.3f} c/day "
-              f"(3-day cum {_cum_drift(drift, 3, calib.drift.rho):+.2f}c)")
+        print(f"drift now (dow-demeaned): {drift:+.3f} c/day "
+              f"(3-day path {path_drift_cents(drift, values[-1][0], 3, calib.drift.rho, calib.dow_adj):+.2f}c)")
+        names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        print("day-of-week adj (c, shrunk+clamped): "
+              + "  ".join(f"{n} {a:+.2f}" for n, a in zip(names, calib.dow_adj)))
         print(f"sigma fit: sigma_h = {calib.sigma1_cents:.3f} * h^{calib.power:.3f} "
               f"cents (x{SIGMA_PAD} pad at runtime)")
         for h, s, n in calib.table:

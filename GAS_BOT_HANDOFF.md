@@ -34,6 +34,28 @@ Strategies implemented (Jack picked 1 + 2 from the proposal):
 - `gas_data/status_gas_bot.json` — day-spend ledger. `gas_data/HALT` — touch
   to stop placements + cancel resting (checked every cycle).
 
+## Speed upgrade (2026-08-01, after 3 missed IOCs on the first surprise)
+
+The 8/1 print (+0.8c, first real surprise) was caught at 3:20:27 but all
+three IOCs missed — the stale asks vanished in the ~2s between detection
+and order arrival. v1.1: hot-window fast polling (GAS_SNIPE_HOT_WINDOW
+03:10-03:45 ET @ GAS_SNIPE_HOT_POLL_SECS 5s — every observed print: 3:18,
+3:20, 3:24, 3:36), a universe+book cache refreshed every
+GAS_SNIPE_PREFETCH_SECS (60s) during the wait, and two-wave firing: wave 1
+sends IOCs against the cache instantly on the print flip (limit prices
+bound staleness), wave 2 re-fetches fresh and sweeps the remaining
+envelope. Detection latency ~2.5s expected (was ~10s), post-detection
+~200ms (was ~2s).
+
+Day-of-week drift (built same evening): per-weekday delta adjustments
+(shrunk n/(n+GAS_DOW_SHRINK_K), clamped GAS_DOW_CLAMP_CENTS, off via
+GAS_DOW_ENABLE=0); EWMA runs on demeaned deltas, projections re-add the
+adjustment along the calendar path. Learned 8/1: Sat -0.41 / Sun -0.37 /
+Mon -0.13 vs Wed/Thu +0.65; h1-3 RMS -7-10%. Caveat: on demeaned deltas
+the walk-forward grid re-picked last-delta weight 0.6, so the model still
+runs hot after surprise prints — the sniper's eff_fair = min(model,
+pre-print mid + model shift) anchor stays the real guard on live takes.
+
 ## Data integrity (verified 2026-07-28)
 
 - `python gas_data.py validate` → 13 overlapping days, **0 violations**
