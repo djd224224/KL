@@ -146,6 +146,12 @@ LADDER_MODE = os.environ.get("IMM_LADDER_MODE", "offsets").strip().lower()
 # — step there via env after a day of live fill data.
 REF_DEPTH_SLOPE = _env_float("IMM_REF_DEPTH_SLOPE", 0.25)
 REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 3.0)
+# Total-multiplier cap (Jack 2026-08-02): hour mult x ref mult <= this — the
+# quiet-hours 2x and deep-ref 3x each claim an independent risk discount and
+# their product claimed both at once (worst rung 20x2x3=120). The cap trims
+# the REF contribution only (never below 1.0), via capped_ref_mult at every
+# sizing site (ladder total, estimator meta, live side rooms). 0 = off.
+TOTAL_SIZE_MULT_CAP = _env_float("IMM_TOTAL_SIZE_MULT_CAP", 5.0)
 # Requote hysteresis for atref rungs (2026-08-02 audit): full weight is flat
 # across the band, so churn on 1-tick touch/ref wiggles buys nothing.
 ATREF_PRICE_TOL_TICKS = _env_int("IMM_ATREF_PRICE_TOL", 1)
@@ -179,6 +185,19 @@ def ref_depth_mult(anchor: Optional[int], ref_px: Optional[int],
     if depth <= 0:
         return 1.0
     return min(REF_DEPTH_MAX_MULT, 1.0 + REF_DEPTH_SLOPE * depth)
+
+
+def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
+                    book_side: str, hour_mult: float = 1.0) -> float:
+    """ref_depth_mult with the TOTAL-multiplier cap applied: hour_mult (the
+    factor already baked into the hour-scaled ladder) x the returned ref
+    mult never exceeds TOTAL_SIZE_MULT_CAP. Trims the ref contribution only
+    — never below 1.0, so an hour mult alone can still exceed the cap by
+    deliberate env choice. THE single accessor for every sizing site."""
+    m = ref_depth_mult(anchor, ref_px, book_side)
+    if TOTAL_SIZE_MULT_CAP > 0 and hour_mult > 0:
+        m = min(m, max(1.0, TOTAL_SIZE_MULT_CAP / hour_mult))
+    return m
 
 
 @dataclass(frozen=True)
@@ -1769,7 +1788,8 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
                       opposite_best: Optional[int], room: float,
                       levels: Optional[List[Tuple[int, int]]] = None,
                       ref_px: Optional[int] = None,
-                      band: Optional[Tuple[int, int]] = None) -> List[Quote]:
+                      band: Optional[Tuple[int, int]] = None,
+                      hour_mult: float = 1.0) -> List[Quote]:
     """Ladder behind (never improving) the join anchor. `anchor` is the best
     EXTERNAL price on our side; `opposite_best` the best external price on the
     other side (post-only: never cross it). Sizes come from `levels` (the
@@ -1816,7 +1836,10 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
         # collateral and a smaller worst-case fill at identical full
         # weight. Pads (1c/99c) already price outside the band.
         total = sum(s for _t, s in levels)
-        total = int(round(total * ref_depth_mult(anchor, ref_px, book_side)))
+        # hour_mult = the factor already inside `levels`; the cap bounds the
+        # PRODUCT of the two size levers at TOTAL_SIZE_MULT_CAP
+        total = int(round(total * capped_ref_mult(anchor, ref_px, book_side,
+                                                  hour_mult=hour_mult)))
         count = min(total, int(room))
         if count <= 0:
             return quotes
@@ -3260,8 +3283,11 @@ class IncentiveMarketMaker:
         yes_levels, no_levels = orderbook_levels(ob)
         ext_b, ext_a = external_best(yes_levels, no_levels)
         rb, ra = ladder_reference_prices(yes_levels, no_levels, meta.target_size)
-        meta.ref_mult_bid = ref_depth_mult(ext_b, rb, "bid")
-        meta.ref_mult_ask = ref_depth_mult(ext_a, ra, "ask")
+        # capped so hour x ref <= TOTAL_SIZE_MULT_CAP; consumers (side rooms,
+        # collateral reservation) inherit the cap through these meta fields
+        _hm = hour_size_mult(meta.series, datetime.now(timezone.utc))
+        meta.ref_mult_bid = capped_ref_mult(ext_b, rb, "bid", hour_mult=_hm)
+        meta.ref_mult_ask = capped_ref_mult(ext_a, ra, "ask", hour_mult=_hm)
         if self.live and own_live:
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, own_live,
@@ -3281,12 +3307,14 @@ class IncentiveMarketMaker:
                     (LADDER_MODE == "atref" and ref_bid_px is not None)
                     or ext_bid >= series_price_min(meta.series)):
                 quotes += build_side_ladder(meta.ticker, "bid", ext_bid, ext_ask,
-                                            side_max_bid, levels=lv, ref_px=ref_bid_px)
+                                            side_max_bid, levels=lv, ref_px=ref_bid_px,
+                                            hour_mult=_hm)
             if ext_ask is not None and (
                     (LADDER_MODE == "atref" and ref_ask_px is not None)
                     or ext_ask <= series_price_max(meta.series)):
                 quotes += build_side_ladder(meta.ticker, "ask", ext_ask, ext_bid,
-                                            side_max_ask, levels=lv, ref_px=ref_ask_px)
+                                            side_max_ask, levels=lv, ref_px=ref_ask_px,
+                                            hour_mult=_hm)
             if not quotes:
                 meta.est_frac = meta.est_dollars_per_day = meta.yield_per_contract = 0.0
                 return True
@@ -4023,15 +4051,19 @@ class IncentiveMarketMaker:
             # series the cap/skew track the bot's OWN book, so the user's
             # coexisting manual position doesn't shrink the bot's room.
             lv = hour_scaled_levels(meta.series, now_utc)
+            hm = hour_size_mult(meta.series, now_utc)
             # deep-reference size multiplier feeds the side_max component of
-            # room (position/event caps and skew still bind unscaled)
+            # room (position/event caps and skew still bind unscaled);
+            # capped so hour x ref <= TOTAL_SIZE_MULT_CAP
             ref_bid_px, ref_ask_px = ladder_reference_prices(
                 yes_levels, no_levels, meta.target_size)
             base_side_max = sum(s for _t, s in lv)
             side_max_bid = int(round(base_side_max *
-                                     ref_depth_mult(ext_bid, ref_bid_px, "bid")))
+                                     capped_ref_mult(ext_bid, ref_bid_px, "bid",
+                                                     hour_mult=hm)))
             side_max_ask = int(round(base_side_max *
-                                     ref_depth_mult(ext_ask, ref_ask_px, "ask")))
+                                     capped_ref_mult(ext_ask, ref_ask_px, "ask",
+                                                     hour_mult=hm)))
             maxpos = series_max_position(meta.series)
             cap_pos = own_pos if quote_all else pos
             room_buy = min(maxpos - cap_pos, share_buy, side_max_bid)
@@ -4067,14 +4099,16 @@ class IncentiveMarketMaker:
                 if px_ok:
                     mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
                                                 levels=lv, ref_px=ref_bid_px,
-                                                band=(pmin_s, pmax_s)))
+                                                band=(pmin_s, pmax_s),
+                                                hour_mult=hm))
             if ext_ask is not None and room_sell > 0:
                 px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
                     or ext_ask <= pmax_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
                                                 levels=lv, ref_px=ref_ask_px,
-                                                band=(pmin_s, pmax_s)))
+                                                band=(pmin_s, pmax_s),
+                                                hour_mult=hm))
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c

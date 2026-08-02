@@ -1262,6 +1262,21 @@ class TestDryRunCycle(unittest.TestCase):
         self.assertTrue(imm.series_fast_lane("KXTEMPDCH"))
         self.assertFalse(imm.series_fast_lane("KXGOOD"))
 
+    def test_total_size_mult_cap(self):
+        # Jack 2026-08-02: hour x ref <= 5. Deep ref (cap 3) with overnight
+        # 2x -> ref trimmed to 2.5; daytime (hour 1) keeps the full 3; an
+        # extreme hour mult floors the ref contribution at 1.0.
+        old = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"
+        try:
+            self.assertEqual(imm.capped_ref_mult(50, 30, "bid", hour_mult=1.0), 3.0)
+            self.assertEqual(imm.capped_ref_mult(50, 30, "bid", hour_mult=2.0), 2.5)
+            self.assertEqual(imm.capped_ref_mult(50, 30, "bid", hour_mult=6.0), 1.0)
+            # cap trims only when the ref mult would exceed the headroom
+            self.assertEqual(imm.capped_ref_mult(50, 48, "bid", hour_mult=2.0), 1.5)
+        finally:
+            imm.LADDER_MODE = old
+
     def test_member_price_band(self):
         # Jack 2026-08-02: sticky members quote to 2-98; fresh keeps series.
         self.assertEqual(imm.member_price_band("KXGOOD", False), (5, 90))
