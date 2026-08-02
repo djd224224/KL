@@ -1754,8 +1754,9 @@ class TestFileEventOverrides(unittest.TestCase):
 
 
 class TestTempSeriesTuning(unittest.TestCase):
-    """Jack 2026-07-21: KXTEMP = 5/2/2 ladder, net cap 40, quotes only 5..90c,
-    out 15 min before the reading."""
+    """Jack 2026-07-21: KXTEMP = 5/2/2 ladder, net cap 40, quotes only 5..90c.
+    2026-08-02: out 10 min before the reading (was 15) + $0.70 min-payout
+    floor (sub-hour windows made the $1 global bar unreachable for flanks)."""
 
     def test_temp_ladder_and_caps(self):
         self.assertEqual(imm.series_levels("KXTEMPDCH"), [(0, 5), (1, 2), (2, 2)])
@@ -1764,10 +1765,22 @@ class TestTempSeriesTuning(unittest.TestCase):
         self.assertEqual(imm.series_price_min("KXTEMPDCH"), 5)
         self.assertEqual(imm.series_price_max("KXTEMPDCH"), 90)
         ov = imm.series_override("KXTEMPDCH")
-        self.assertEqual(ov.cutoff_from_close_min, 15)
+        self.assertEqual(ov.cutoff_from_close_min, 10)
         # non-temp series keep the globals
         self.assertEqual(imm.series_price_min("KXGOOD"), imm.PRICE_MIN_CENTS)
         self.assertEqual(imm.series_price_max("KXGOOD"), imm.PRICE_MAX_CENTS)
+
+    def test_temp_min_payout_floor(self):
+        # Temp-only $0.70 floor; everything else follows the (patchable)
+        # global — the override must win in both directions.
+        self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 0.70)
+        old = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 123.0
+        try:
+            self.assertEqual(imm.series_min_est_total("KXGOOD"), 123.0)
+            self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 0.70)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old
 
     def test_temp_band_trims_ladder(self):
         # bid anchor at 6c: levels at 6/5/4 -> the 4c rung is below the 5c

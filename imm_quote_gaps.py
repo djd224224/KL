@@ -28,8 +28,9 @@ Reason labels (why a paying market isn't quoted):
   yielded to manual           manual standoff / manual footprint in the event
   screened: <reason>          _screen() verdict (wide, extreme_mid, one_sided,
                               no_volume, ...)
-  under $1 payout floor       est total accrual (with accrued + 1h-peak
-                              credit) can't reach MIN_EST_TOTAL_DOLLARS
+  under payout floor          est total accrual (with accrued + 1h-peak
+                              credit) can't reach the series' min-payout
+                              floor (global $1; per-series overrides apply)
   zero est yield              estimator sees no earnable share
   capacity (cap/budget)       eligible, positive — lost to the event cap /
                               collateral budget / candidate-cap truncation
@@ -395,8 +396,8 @@ def classify_and_estimate(client, bot, now_utc: datetime):
         elif meta.yield_per_contract <= 0:
             r["reason"] = "zero est yield"
         elif not curated and accrued + max(est_total, peak) \
-                < imm.MIN_EST_TOTAL_DOLLARS:
-            r["reason"] = "under $1 payout floor"
+                < imm.series_min_est_total(meta.series):
+            r["reason"] = "under payout floor"
         else:
             r["reason"] = "capacity (cap/budget)"
 

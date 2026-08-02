@@ -184,6 +184,9 @@ class SeriesOverride:
     #   midnight-ET rule would otherwise kill on sight
     min_hours_to_close: Optional[float] = None          # override the global
     #   MIN_HOURS_TO_CLOSE screen (hourly markets live less than the 1h default)
+    min_est_total: Optional[float] = None               # override the global
+    #   MIN_EST_TOTAL_DOLLARS entry/hopeless floor — sub-hour temp windows make
+    #   $1 a high bar (Jack 2026-08-02: flanking strikes measured $0.6-0.8)
     pre_cutoff_reduce_only_secs: Optional[int] = None   # override the global
     #   PRE_CUTOFF_REDUCE_ONLY_SECS (1h) — hourly markets are BORN closer to
     #   their cutoff than that, so the default makes them reduce-only for life
@@ -242,8 +245,12 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
 # Only mid-band strikes ever quote (far strikes are one_sided/extreme_mid).
 # Temp tuning (Jack 2026-07-21): tighter, earlier-exiting, shallower —
 # 5/2/2 ladders (9/side vs global 15), net cap 50/market (global was 100),
-# quotes only in the 5..90c band (no 1c-scrap quoting on pinned strikes),
-# out 15 min before the reading (was 5; reduce-only starts 5 min before that).
+# quotes only in the 5..90c band (no 1c-scrap quoting on pinned strikes).
+# Cutoff close-15min -> close-10min + per-series $0.70 floor (Jack 2026-08-02:
+# hourly programs activate ~hh:11 and the old cutoff left ~34 quotable
+# minutes — flanking strikes projected $0.6-0.8 vs the $1 global floor and
+# never entered; DCH 9am hour: T78.99 $0.81 / T80.99 $0.64 floored while
+# T79.99/T81.99 quoted).
 for _s in os.environ.get(
         "IMM_TEMP_SERIES",
         "KXTEMPAUSH,KXTEMPCHIH,KXTEMPDCH,KXTEMPLAXH,KXTEMPNYCH").split(","):
@@ -253,9 +260,10 @@ for _s in os.environ.get(
             max_position=_env_float("IMM_TEMP_MAX_POSITION", 50),
             price_min_cents=_env_int("IMM_TEMP_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_TEMP_PRICE_MAX", 90),
-            cutoff_from_close_min=_env_int("IMM_TEMP_CUTOFF_FROM_CLOSE_MIN", 15),
+            cutoff_from_close_min=_env_int("IMM_TEMP_CUTOFF_FROM_CLOSE_MIN", 10),
             min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05),
-            pre_cutoff_reduce_only_secs=_env_int("IMM_TEMP_PRE_CUTOFF_RO", 300))
+            pre_cutoff_reduce_only_secs=_env_int("IMM_TEMP_PRE_CUTOFF_RO", 300),
+            min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 0.70))
 
 # Air-quality-index markets (user decision 2026-07-15). Series is KXAQICITY; the
 # CITY lives in the event segment (KXAQICITY-NYC26JUL19), so one override covers
@@ -451,6 +459,15 @@ def series_min_hours_to_close(series: str) -> float:
     ov = SERIES_OVERRIDES.get(series)
     return ov.min_hours_to_close if (ov and ov.min_hours_to_close is not None) \
         else MIN_HOURS_TO_CLOSE
+
+
+def series_min_est_total(series: str) -> float:
+    """Per-series min-payout entry/hopeless floor, else the global
+    MIN_EST_TOTAL_DOLLARS (read at call time so env/test patches apply)."""
+    ov = SERIES_OVERRIDES.get(series)
+    if ov and ov.min_est_total is not None:
+        return ov.min_est_total
+    return MIN_EST_TOTAL_DOLLARS
 
 
 def series_pre_cutoff_reduce_only_secs(series: str) -> int:
@@ -778,6 +795,8 @@ MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 700)
 # rate (Jack 2026-07-22): a $0.40/day estimate on a 5-day program clears the
 # $1 minimum comfortably; the old per-day floor only existed to catch 1-2-day
 # programs that couldn't. Margin above $1 via the env knob if wanted.
+# Per-series override: SeriesOverride.min_est_total via series_min_est_total()
+# (KXTEMP runs $0.70 — Jack 2026-08-02).
 MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.0)
 # The floor is a hard threshold on a NOISY estimate (thin books swing the
 # share estimate ±50% between refreshes), so borderline markets could flap
@@ -2848,7 +2867,8 @@ class IncentiveMarketMaker:
                 self._est_peak[meta.ticker] = (est_total, now_ts)
                 peak = est_total
             accrued = self.state.accrued_est.get(meta.ticker, 0.0)
-            reaches_min = accrued + max(est_total, peak) >= MIN_EST_TOTAL_DOLLARS
+            reaches_min = accrued + max(est_total, peak) \
+                >= series_min_est_total(meta.series)
             if quote_all:
                 # user wants EVERY market of the event (2026-07-12): exempt
                 # from floors, the hopeless exit and the yield ranking.
