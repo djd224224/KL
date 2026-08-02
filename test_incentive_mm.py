@@ -542,6 +542,28 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
         place, cancel = self._diff(d, r_bad)
         self.assertEqual(cancel, ["o2"])
 
+    def test_temp_zero_tol_reprices_on_any_drift(self):
+        # Jack 2026-08-02: KXTEMP hysteresis is 0 — a rung even 1 tick behind
+        # desired is churned to the new reference (hourly books gap on METAR
+        # updates and a tick behind ref earns half weight); other series keep
+        # the global 1-tick tolerance (test_one_tick_behind_kept above).
+        t = "KXTEMPDCH-26AUG0210-T80.99"
+        d = [imm.Quote(t, "bid", 45, 30)]
+        r = [_resting("o1", t, "bid", 44, 30)]
+        place, cancel = self._diff(d, r)
+        self.assertEqual(cancel, ["o1"])
+        self.assertEqual([(q.price_cents, q.count) for q in place], [(45, 30)])
+
+    def test_series_atref_tol_helper(self):
+        self.assertEqual(imm.series_atref_price_tol("KXTEMPDCH"), 0)
+        old = imm.ATREF_PRICE_TOL_TICKS
+        imm.ATREF_PRICE_TOL_TICKS = 3
+        try:
+            self.assertEqual(imm.series_atref_price_tol("KXGOOD"), 3)
+            self.assertEqual(imm.series_atref_price_tol("KXTEMPDCH"), 0)
+        finally:
+            imm.ATREF_PRICE_TOL_TICKS = old
+
 
 class TestDiffOrders(unittest.TestCase):
     def test_exact_match_kept(self):

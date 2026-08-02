@@ -187,6 +187,10 @@ class SeriesOverride:
     min_est_total: Optional[float] = None               # override the global
     #   MIN_EST_TOTAL_DOLLARS entry/hopeless floor — sub-hour temp windows make
     #   $1 a high bar (Jack 2026-08-02: flanking strikes measured $0.6-0.8)
+    atref_price_tol_ticks: Optional[int] = None         # override the global
+    #   ATREF_PRICE_TOL_TICKS requote hysteresis. 0 = reprice on ANY reference
+    #   move (Jack 2026-08-02 for KXTEMP: hourly books gap on METAR updates and
+    #   a 1-tick-behind rung earns half weight; temp is ~24 orders, churn cheap)
     pre_cutoff_reduce_only_secs: Optional[int] = None   # override the global
     #   PRE_CUTOFF_REDUCE_ONLY_SECS (default 0 since 2026-08-02 — the window
     #   is removed bot-wide; set >0 here or via env to restore per-series)
@@ -264,7 +268,8 @@ for _s in os.environ.get(
             min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05),
             # pre-cutoff reduce-only removed bot-wide 2026-08-02 (was 300s
             # here via IMM_TEMP_PRE_CUTOFF_RO) — temp follows the global 0.
-            min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 0.70))
+            min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 0.70),
+            atref_price_tol_ticks=_env_int("IMM_TEMP_ATREF_PRICE_TOL", 0))
 
 # Air-quality-index markets (user decision 2026-07-15). Series is KXAQICITY; the
 # CITY lives in the event segment (KXAQICITY-NYC26JUL19), so one override covers
@@ -469,6 +474,15 @@ def series_min_est_total(series: str) -> float:
     if ov and ov.min_est_total is not None:
         return ov.min_est_total
     return MIN_EST_TOTAL_DOLLARS
+
+
+def series_atref_price_tol(series: str) -> int:
+    """Per-series at-ref requote hysteresis (ticks), else the global
+    ATREF_PRICE_TOL_TICKS (read at call time so env/test patches apply)."""
+    ov = SERIES_OVERRIDES.get(series)
+    if ov and ov.atref_price_tol_ticks is not None:
+        return ov.atref_price_tol_ticks
+    return ATREF_PRICE_TOL_TICKS
 
 
 def series_pre_cutoff_reduce_only_secs(series: str) -> int:
@@ -1799,7 +1813,8 @@ def diff_orders(desired: List[Quote], resting: List[dict],
         if q.ticker != ticker or q.book_side != book_side:
             return False
         if LADDER_MODE == "atref" and not getattr(q, "is_pad", False):
-            if abs(px - q.price_cents) > ATREF_PRICE_TOL_TICKS:
+            # per-series hysteresis (KXTEMP runs 0 — reprice on any ref move)
+            if abs(px - q.price_cents) > series_atref_price_tol(series_of(q.ticker)):
                 return False
             # never keep a rung MORE aggressive than desired: for bids that
             # is a higher price, for asks a lower one (crossing/fill risk)
