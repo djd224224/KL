@@ -345,6 +345,42 @@ bot's last stored daily summary (`status_incentive_mm.json` `summary_body`).
   it still STORES the daily summary in status for the digest to read.
 - Verified sending unattended under Task Scheduler 2026-07-13.
 
+## Daily quote-gaps email (2026-08-02)
+
+`imm_quote_gaps.py` — second morning email (Jack 2026-08-02: "every AM send
+email on which markets should be quoted that aren't, based on expected
+earnings per minute"): every live-incentive market the bot is NOT quoting,
+rolled up by event, ranked by est $/day (+ c/min), each with Kalshi's event
+title as a plain-English "what is this" snippet and a WHY-NOT-QUOTED reason
+(blocklisted/frozen, not in allowlist, no-new gate, yielded to manual,
+screened:<reason>, under $1 payout floor, zero yield, capacity, candidate
+cap). Second table: deliberately-off blocklist/freeze families with their
+pools, so a deliberate block that starts leaving real money shows up.
+
+- Numbers come from the bot's OWN machinery imported from `incentive_mm.py`
+  (`fetch_programs`/`_allowed`/`_screen`/`_estimate_candidate_yield` — the
+  amended-rules estimator with the standard at-ref ladder overlaid on each
+  live book). **Config parity**: the launcher's `$ProbeEnv` block is parsed
+  from `run_incentive_mm.ps1` and applied BEFORE import (logs "mirrored N
+  launcher env vars" — if that line says 0, the report ran on defaults and
+  is wrong). "Currently quoted" = `selected_tickers` from `imm_state.json`.
+  Strictly read-only: never cycles, never orders, never `_save_persist`.
+- Estimation is bounded: `IMM_GAPS_MAX_BOOKS` (250) book reads, biggest
+  pools first, `IMM_GAPS_MAX_PER_EV` (12) per event (partial events shown
+  as ">="), ~40 reads reserved for the deliberately-off table; unreached
+  events are listed with pool only — never silently dropped. Headline is a
+  sum of independent per-market estimates, not a feasible portfolio.
+- Task **`KL imm quote-gaps`**, daily **7:20 AM ET** (after the 6:45
+  overrides/auto-enroll + 7:10 digest), cmd.exe wrapper →
+  `run-logs\incentive-mm\quote-gaps-task.log`. Idempotent marker
+  (`imm_quote_gaps_sent_<date>.marker`), Modern-Standby retries (8×5min),
+  registry cred fallback. `--test` sends now (no marker); `--dry` prints
+  only. Mirrored blocks in `incentive_mm.py` (`ticker_cutoff_passed`, meta
+  construction) carry keep-in-sync comments.
+- First real send + unattended TS launch verified 2026-08-02. Same-day
+  finding: KXDDR5* programs GONE from `/incentive_programs` (0 markets,
+  $0 pool) — the DDR5 open item resolved itself.
+
 ## Strategy layer
 
 `INCENTIVE_MM_STRATEGY.md` (v1.1, red-teamed 2026-07-11) is the quant strategy on top

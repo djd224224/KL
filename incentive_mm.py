@@ -2678,6 +2678,7 @@ class IncentiveMarketMaker:
             self.state.programmed = set(by_market)
 
         def ticker_cutoff_passed(t: str) -> bool:
+            # (imm_quote_gaps.py mirrors this pre-filter — keep in sync.)
             # Cheap pre-filter: drop only when the ticker-embedded event DAY is
             # fully over. Same-day markets stay in — the schedule resolver may
             # grant them an intraday cutoff (quote until kickoff - buffer),
@@ -2720,6 +2721,7 @@ class IncentiveMarketMaker:
             except Exception as e:
                 log(f"{self.tag} ! bulk market read failed ({e}); chunk skipped")
 
+        # (imm_quote_gaps.py mirrors this meta construction — keep in sync.)
         for t, info in candidates:
             m = markets.get(t)
             if not m or m.get("status") not in ("active", "open"):
