@@ -2227,7 +2227,8 @@ class TestStickySelection(unittest.TestCase):
             imm.EVENT_START_OVERRIDES.pop("KXFOO-26AUG01", None)
         # 2026-08-02 (Jack) RE-ENTRY: company/econ freeze + no-new lifted;
         # they quote again behind the $2/day rate floor + safe-join rule.
-        for s in ("KXSCFI", "KXNHSALES", "KXBA", "KXHOOD"):
+        for s in ("KXSCFI", "KXNHSALES", "KXBA", "KXHOOD", "KXAAAGASD",
+                  "KXUSGASCPI"):
             self.assertNotIn(s, imm.NO_NEW_SERIES)
             self.assertNotIn(s, imm.FREEZE_SERIES)
             self.assertEqual(imm.series_min_est_rate(s), 2.0)

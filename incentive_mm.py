@@ -785,7 +785,10 @@ FREEZE_SERIES = frozenset(
 _REENTRY_SERIES = (
     _DEFAULT_COMPANY_SERIES + ",KXAAL,KXAALA,KXALK,KXALKA,KXAXP,KXAXPA,"
     "KXGOOGA,KXLUVA,KXSBUXA,KXCMGA,KXMETAA,KXVZ,KXVZA,KXWHA,KXYUM,KXYUMA,"
-    "KXAC,KXNHSALES,KXSCFI")
+    # gas trackers back too (Jack 2026-08-02 "reconsider gas trackers";
+    # launcher blocklist entry removed same day). Midnight-ET ticker rule
+    # keeps IMM out of print-day books, so no 3:20am sniper collision.
+    "KXAC,KXNHSALES,KXSCFI,KXAAAGASD,KXAAAGASW,KXAAAGASM,KXUSGASCPI")
 for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
     if _s.strip() and _s.strip() not in SERIES_OVERRIDES:
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
