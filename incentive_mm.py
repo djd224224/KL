@@ -145,6 +145,15 @@ REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 2.0)
 # across the band, so churn on 1-tick touch/ref wiggles buys nothing.
 ATREF_PRICE_TOL_TICKS = _env_int("IMM_ATREF_PRICE_TOL", 1)
 ATREF_COUNT_TOL_FRAC = _env_float("IMM_ATREF_COUNT_TOL", 0.2)
+# Fast-lane (Jack 2026-08-02): between full cycles, re-quote ONLY fast-lane
+# series (KXTEMP — hourly books gap on METAR updates and the ~50s full-cycle
+# cadence left rungs ticks behind the reference) every FAST_LANE_SECS of the
+# main sleep window. A fast tick is a FILTERED run_cycle: full managed set +
+# full resting read (stray-cancel, caps and the diff stay correct), non-fast
+# markets skipped at the quote-loop head with their resting orders preserved
+# through the diff; universe refresh, accrual integration, bench streaks,
+# watchdog, cycle log and counters run on FULL cycles only. 0 = off.
+FAST_LANE_SECS = _env_int("IMM_FAST_LANE_SECS", 5)
 
 
 def ref_depth_mult(anchor: Optional[int], ref_px: Optional[int],
@@ -191,6 +200,8 @@ class SeriesOverride:
     #   ATREF_PRICE_TOL_TICKS requote hysteresis. 0 = reprice on ANY reference
     #   move (Jack 2026-08-02 for KXTEMP: hourly books gap on METAR updates and
     #   a 1-tick-behind rung earns half weight; temp is ~24 orders, churn cheap)
+    fast_lane: bool = False                             # requote this series on
+    #   the FAST_LANE_SECS mini-cycles between full cycles (KXTEMP)
     pre_cutoff_reduce_only_secs: Optional[int] = None   # override the global
     #   PRE_CUTOFF_REDUCE_ONLY_SECS (default 0 since 2026-08-02 — the window
     #   is removed bot-wide; set >0 here or via env to restore per-series)
@@ -269,7 +280,8 @@ for _s in os.environ.get(
             # pre-cutoff reduce-only removed bot-wide 2026-08-02 (was 300s
             # here via IMM_TEMP_PRE_CUTOFF_RO) — temp follows the global 0.
             min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 0.70),
-            atref_price_tol_ticks=_env_int("IMM_TEMP_ATREF_PRICE_TOL", 0))
+            atref_price_tol_ticks=_env_int("IMM_TEMP_ATREF_PRICE_TOL", 0),
+            fast_lane=os.environ.get("IMM_TEMP_FAST_LANE", "1") == "1")
 
 # Air-quality-index markets (user decision 2026-07-15). Series is KXAQICITY; the
 # CITY lives in the event segment (KXAQICITY-NYC26JUL19), so one override covers
@@ -483,6 +495,12 @@ def series_atref_price_tol(series: str) -> int:
     if ov and ov.atref_price_tol_ticks is not None:
         return ov.atref_price_tol_ticks
     return ATREF_PRICE_TOL_TICKS
+
+
+def series_fast_lane(series: str) -> bool:
+    """Membership in the FAST_LANE_SECS mini-cycle set (KXTEMP by default)."""
+    ov = SERIES_OVERRIDES.get(series)
+    return bool(ov and ov.fast_lane)
 
 
 def series_pre_cutoff_reduce_only_secs(series: str) -> int:
@@ -3369,7 +3387,11 @@ class IncentiveMarketMaker:
             f"resume deliberately.", key="balance_floor")
         return True
 
-    def run_cycle(self) -> None:
+    def run_cycle(self, fast_only: bool = False) -> None:
+        # fast_only = a FAST-LANE mini-cycle (see FAST_LANE_SECS): same managed
+        # set, same resting read, but only fast-lane series are (re)quoted and
+        # everything periodic (universe refresh, accrual, bench, watchdog,
+        # cycle log, counters) is deferred to the next full cycle.
         now_utc = datetime.now(timezone.utc)
         now_ts = now_utc.timestamp()
         self._heartbeat = now_ts
@@ -3426,13 +3448,13 @@ class IncentiveMarketMaker:
         # the first pass reads positions (observed 2026-07-19: 3 orphans missed
         # because the kill hit mid-placement-wave), so re-run once ~4 min later;
         # the known_tickers + cap scoping makes the repeat adoption safe.
-        if not self._reconciled and not in_grace and self.live:
+        if not self._reconciled and not in_grace and self.live and not fast_only:
             self._reconcile_orphaned_fills(positions)
             self._reconciled = True
             self._reconcile_recheck_at = now_ts + 240
         elif (self._reconciled and self._reconcile_recheck_at
                 and now_ts >= self._reconcile_recheck_at
-                and not in_grace and self.live):
+                and not in_grace and self.live and not fast_only):
             self._reconcile_recheck_at = 0.0
             self._reconcile_orphaned_fills(positions)
         # Release standoffs whose manual activity is gone — the market's own
@@ -3440,7 +3462,7 @@ class IncentiveMarketMaker:
         # event is still manual (event-level yield). The yielded market never
         # re-enters the managed loop, so it must be released here.
         manual_evts = self.manual_events(positions)
-        if not in_grace:
+        if not in_grace and not fast_only:
             for st in list(self.state.manual_standoff):
                 manual = abs(positions.get(st, 0.0) - self.pnl.pos.get(st, 0.0))
                 foreign_n = self._foreign_resting.get(st, 0) if self.live else 0
@@ -3449,7 +3471,8 @@ class IncentiveMarketMaker:
                     self.state.manual_standoff.pop(st, None)
                     log(f"{self.tag} {st}: manual activity cleared; market eligible again")
             self.refresh_universe(now_utc, positions)
-        self.restore_orphan_metas(positions)
+        if not fast_only:
+            self.restore_orphan_metas(positions)
 
         # Managed set = selected + any market we still hold inventory in.
         managed: Dict[str, MarketMeta] = dict(self.state.selected)
@@ -3581,6 +3604,11 @@ class IncentiveMarketMaker:
                     order_of_play.append(by_event[e][_depth])
             _depth += 1
         for meta in order_of_play:
+            # Fast tick: only fast-lane series are (re)quoted; everything else
+            # is untouched this tick (its resting orders are preserved through
+            # the diff below — see `preserve`).
+            if fast_only and not series_fast_lane(meta.series):
+                continue
             t = meta.ticker
             ev = meta.event_ticker
             pos = positions.get(t, 0.0)
@@ -3894,7 +3922,7 @@ class IncentiveMarketMaker:
                 f"{meta.target_size:.0f},{frac:.5f},{sides},"
                 f"{pos:.1f},{own_pos:.1f},{meta.dollars_per_day:.2f},"
                 f"{sum(q.count for q in mq)}\n")
-            if t in self.state.selected and not reduce_only:
+            if t in self.state.selected and not reduce_only and not fast_only:
                 if frac <= 0.0 and mq:
                     streak = self.state.zero_share_streak.get(t, 0) + 1
                     self.state.zero_share_streak[t] = streak
@@ -3914,20 +3942,25 @@ class IncentiveMarketMaker:
         # Reward accrual estimate between cycles (share x $/day x dt), plus the
         # objective's denominator: contract-minutes actually resting.
         resting_contracts = sum(order_remaining(o) for o in resting)
-        if self.state.reward_accrue_at:
-            dt_days = (now_ts - self.state.reward_accrue_at) / 86400.0
-            accrued = reward_frac_sum * dt_days
-            self.state.reward_est_today += accrued
-            self.state.reward_est_lifetime += accrued
-            # Per-market accrual (same integral, split by ticker) — the
-            # hopeless-exit / floor credit: accrued + projection vs $1.
-            for t_, rate in cycle_rate.items():
-                if rate > 0:
-                    self.state.accrued_est[t_] = \
-                        self.state.accrued_est.get(t_, 0.0) + rate * dt_days
-            self.state.contract_minutes_today += \
-                resting_contracts * (now_ts - self.state.reward_accrue_at) / 60.0
-        self.state.reward_accrue_at = now_ts
+        # Accrual integrates on FULL cycles only: a fast tick computes rates
+        # for the fast-lane subset alone, and advancing the shared accrue
+        # stamp on it would steal that interval from every other market's
+        # integral (hopeless-exit credit corruption).
+        if not fast_only:
+            if self.state.reward_accrue_at:
+                dt_days = (now_ts - self.state.reward_accrue_at) / 86400.0
+                accrued = reward_frac_sum * dt_days
+                self.state.reward_est_today += accrued
+                self.state.reward_est_lifetime += accrued
+                # Per-market accrual (same integral, split by ticker) — the
+                # hopeless-exit / floor credit: accrued + projection vs $1.
+                for t_, rate in cycle_rate.items():
+                    if rate > 0:
+                        self.state.accrued_est[t_] = \
+                            self.state.accrued_est.get(t_, 0.0) + rate * dt_days
+                self.state.contract_minutes_today += \
+                    resting_contracts * (now_ts - self.state.reward_accrue_at) / 60.0
+            self.state.reward_accrue_at = now_ts
 
         # LOSS HALT on TOTAL P&L today (realized + mark-to-market), so gapped
         # inventory counts even before it settles. Runs before any placement.
@@ -3957,21 +3990,30 @@ class IncentiveMarketMaker:
                 f"{self.pnl.inventory_contracts():.0f} carried) <= "
                 f"-${DAILY_LOSS_LIMIT:.0f}; cancelled {n} orders, halted until "
                 f"next ET day", key="loss_halt")
-            self._write_cycle_log(cycle_rows)
+            if not fast_only:
+                self._write_cycle_log(cycle_rows)
             return
 
+        # Fast tick: non-fast managed markets built no `desired` this tick —
+        # preserve their resting orders through the diff or it would cancel
+        # every one of them as unmatched.
+        preserve = blind if not fast_only else \
+            blind | {mt for mt, mm in managed.items()
+                     if not series_fast_lane(mm.series)}
         to_place, to_cancel = diff_orders(desired, resting, self.state.order_ages,
-                                          now_ts, preserve_tickers=blind)
+                                          now_ts, preserve_tickers=preserve)
         log(f"{self.tag} {quoted}/{len(managed)} mkts quoted, {len(resting)} resting, "
             f"{len(to_cancel)} cancel, {len(to_place)} place, "
             f"est ${reward_frac_sum:.2f}/day reward share, P&L today ${pnl_today:+.2f} "
             f"(real {realized:+.2f}/unreal {unrealized:+.2f}) "
-            f"{'' if self.live else '[DRY RUN]'}")
+            f"{'[fast] ' if fast_only else ''}{'' if self.live else '[DRY RUN]'}")
 
         # Watchdog: markets selected but the book nearly empty for several
         # consecutive cycles — the silent-death signature (dead cutoffs,
         # missing overrides, API trouble). Page, don't wait to be noticed.
-        if (len(self.state.selected) >= WATCHDOG_MIN_SELECTED
+        if fast_only:
+            pass   # watchdog streaks count FULL cycles only (stable semantics)
+        elif (len(self.state.selected) >= WATCHDOG_MIN_SELECTED
                 and len(resting) < WATCHDOG_MIN_RESTING):
             self.state.watchdog_streak += 1
             if self.state.watchdog_streak == WATCHDOG_CYCLES:
@@ -4003,11 +4045,12 @@ class IncentiveMarketMaker:
             # near zero; the startup reconcile mops up anything still missed.
             self._save_persist()
         self.state.placed_today += placed
-        self.state.cycles_today += 1
-        self.state.last_markets_line = (
-            f"{quoted}/{len(managed)} mkts quoted ({len(desired)} quotes), "
-            f"est ${reward_frac_sum:.2f}/day")
-        self._write_cycle_log(cycle_rows)
+        if not fast_only:
+            self.state.cycles_today += 1
+            self.state.last_markets_line = (
+                f"{quoted}/{len(managed)} mkts quoted ({len(desired)} quotes), "
+                f"est ${reward_frac_sum:.2f}/day")
+            self._write_cycle_log(cycle_rows)
 
     CYCLE_LOG_HEADER = ("ts,ticker,ext_bid,ext_ask,yes_depth,no_depth,target,"
                         "est_frac,qual_sides,acct_pos,own_pos,pool_per_day,quoted\n")
@@ -4369,7 +4412,31 @@ class IncentiveMarketMaker:
                 if once or stopping["flag"]:
                     break
                 backoff = min(2 ** max(0, self.state.consecutive_errors - 1), 8)
-                time.sleep(POLL_SECS * backoff if self.state.consecutive_errors else POLL_SECS)
+                sleep_total = POLL_SECS * backoff if self.state.consecutive_errors else POLL_SECS
+                # Fast-lane: chunk the sleep window and re-quote ONLY fast-lane
+                # series (KXTEMP) between chunks — see FAST_LANE_SECS. Skipped
+                # during error backoff; fast-tick errors log without touching
+                # the consecutive-error failsafe (full cycles own that).
+                deadline = time.time() + sleep_total
+                while True:
+                    remain = deadline - time.time()
+                    if remain <= 0:
+                        break
+                    fast_ok = (FAST_LANE_SECS > 0
+                               and not self.state.consecutive_errors
+                               and not stopping["flag"]
+                               and any(series_fast_lane(m.series)
+                                       for m in self.state.selected.values()))
+                    if not fast_ok:
+                        time.sleep(remain)
+                        break
+                    time.sleep(min(FAST_LANE_SECS, remain))
+                    if stopping["flag"] or time.time() >= deadline:
+                        break
+                    try:
+                        self.run_cycle(fast_only=True)
+                    except Exception as e:
+                        log(f"{self.tag} ! fast-lane cycle error: {e!r}")
         finally:
             self.shutdown_cancel()
             if not once:

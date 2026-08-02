@@ -1168,6 +1168,27 @@ class TestDryRunCycle(unittest.TestCase):
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         return bot
 
+    def test_fast_tick_touches_nothing_without_fast_series(self):
+        # Fast-lane mini-cycle (Jack 2026-08-02) on a universe with no
+        # fast-lane series: every order the full cycle placed must survive
+        # untouched (preserved through the diff, NOT cancelled as unmatched),
+        # and the shared accrual stamp / cycle counter must not move (fast
+        # ticks defer accrual so other markets' integrals aren't robbed).
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(bot.state.sim_orders)
+        before = dict(bot.state.sim_orders)
+        stamp = bot.state.reward_accrue_at
+        cycles = bot.state.cycles_today
+        bot.run_cycle(fast_only=True)
+        self.assertEqual(bot.state.sim_orders, before)
+        self.assertEqual(bot.state.reward_accrue_at, stamp)
+        self.assertEqual(bot.state.cycles_today, cycles)
+
+    def test_fast_lane_membership(self):
+        self.assertTrue(imm.series_fast_lane("KXTEMPDCH"))
+        self.assertFalse(imm.series_fast_lane("KXGOOD"))
+
     def test_selection_and_quotes(self):
         bot = self._bot()
         bot.run_cycle()

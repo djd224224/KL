@@ -10,11 +10,14 @@
 # user-level environment (HKCU\Environment).
 
 param(
-    # 90 -> 60 -> 30 (Jack 2026-07-21): fastest endorsed cadence — cycle WORK
-    # is ~12-15s (client 100ms/call floor x ~70-120 reads), so effective
-    # cadence ~45s; below ~15s poll the shared-account rate budget (16 crypto
-    # bots + cloud fleet) starts contending again.
-    [string]$PollSecs = "30",
+    # 90 -> 60 -> 30 (Jack 2026-07-21) -> 10 (Jack 2026-08-02 "do A"): the old
+    # <15s contention warning predates the Advanced API tier (read 300/s
+    # sustained) + the 25ms client throttle; measured cycle WORK is ~22s at
+    # the ~360-market universe, so poll 10 = ~32s effective cadence at ~12
+    # req/s (~4% of the shared read budget). Watch for 429s in the log after
+    # any further cut. The KXTEMP fast-lane (IMM_FAST_LANE_SECS, in-code)
+    # additionally re-quotes temp books between full cycles.
+    [string]$PollSecs = "10",
     # Micro-probe mode (go-live phase 1): 1/5-size ladders on ~10 markets,
     # ~$200 collateral. Run one full PAID period this way and reconcile
     # Kalshi's actual credits against the estimator before scaling up.
