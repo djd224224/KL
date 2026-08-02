@@ -733,7 +733,11 @@ _DEFAULT_COMPANY_SERIES = (
 # same structural class but deliberately NOT included pending a capacity
 # decision — it alone would triple the candidate universe.
 _DEFAULT_ECON_SERIES = (
-    "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI")
+    # KXDIESELD/W added 2026-08-02 (Jack "why did KXDIESELD not make it?" —
+    # the series was never enrolled; $222/day/mkt x 21 strikes live). Same
+    # day-dated midnight-ET safety as the gas trackers; re-entry guards apply.
+    "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI,"
+    "KXDIESELD,KXDIESELW")
 # Rotten Tomatoes score markets (Jack 2026-07-23): undated tickers
 # (KXRT-<MOVIE>-<score>) -> occurrence-based cutoff when Kalshi provides
 # one, else continuous quoting; bands/floor gate as usual.
@@ -793,7 +797,9 @@ _REENTRY_SERIES = (
     # gas trackers back too (Jack 2026-08-02 "reconsider gas trackers";
     # launcher blocklist entry removed same day). Midnight-ET ticker rule
     # keeps IMM out of print-day books, so no 3:20am sniper collision.
-    "KXAC,KXNHSALES,KXSCFI,KXAAAGASD,KXAAAGASW,KXAAAGASM,KXUSGASCPI")
+    # Diesel enrolled 2026-08-02 evening (same class, never allowed before).
+    "KXAC,KXNHSALES,KXSCFI,KXAAAGASD,KXAAAGASW,KXAAAGASM,KXUSGASCPI,"
+    "KXDIESELD,KXDIESELW")
 for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
     if _s.strip() and _s.strip() not in SERIES_OVERRIDES:
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
@@ -3086,6 +3092,15 @@ class IncentiveMarketMaker:
                 # absolute $1 verdicts are least trustworthy on the short
                 # windows overrides create).
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
+            elif meta.ticker not in prev_selected \
+                    and meta.est_dollars_per_day < series_min_est_rate(meta.series):
+                # Re-entry rate floor OUTRANKS event curation (Jack 2026-08-02
+                # TLN audit: the auto-written company-disclosure override
+                # curated KXTLN-26AUGGEN past the $2 bar at ~$0.45/day est).
+                # The curated bypass below exists because SHORT windows sink
+                # est_TOTAL — a per-day RATE has no such excuse. Members stay
+                # sticky (rate dips never evict; hopeless owns exits).
+                skipped["rate_floor"] = skipped.get("rate_floor", 0) + 1
             elif meta.ticker in prev_selected \
                     or curated_event(meta.event_ticker, meta.series, now_utc):
                 # Sticky members and event-start-override events bypass the
@@ -3097,11 +3112,6 @@ class IncentiveMarketMaker:
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
-            elif meta.est_dollars_per_day < series_min_est_rate(meta.series):
-                # Re-entry quality bar (Jack 2026-08-02): fresh company/econ
-                # candidates must clear $2/day est — net of the safe-join
-                # weight penalty, which the estimator already models.
-                skipped["rate_floor"] = skipped.get("rate_floor", 0) + 1
             elif not reaches_min:
                 # entry floor, now with the accrued credit: a re-admitted
                 # market that already banked most of its $1 re-enters even

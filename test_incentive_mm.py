@@ -911,8 +911,12 @@ class TestAllowlist(unittest.TestCase):
         a = IncentiveMarketMaker._allowed
         for t in ("KXAAAGASD-26JUL23-4.150", "KXAAAGASW-26JUL27-4.040",
                   "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
-                  "KXUSGASCPI-26AUG12-T320"):
+                  "KXUSGASCPI-26AUG12-T320",
+                  # diesel enrolled 2026-08-02 evening under re-entry guards
+                  "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30"):
             self.assertTrue(a(t), t)
+        self.assertEqual(imm.series_min_est_rate("KXDIESELD"), 2.0)
+        self.assertTrue(imm.series_safe_join("KXDIESELD"))
         # KXSCFI: frozen 7/29, RE-ALLOWED 2026-08-02 with the re-entry
         # guards ($2/day rate floor + safe-join).
         self.assertTrue(a("KXSCFI-26DEC25-T1500"))
@@ -1558,13 +1562,15 @@ class TestOverrideBuffer(unittest.TestCase):
         imm.EVENT_START_OVERRIDES[ev] = release
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = 0.0
-        # KXINTC is company family — since the 7/28 no-new gate and the
-        # 7/29 freeze a FRESH company market can't admit; this test is
-        # about cutoff mechanics, so exempt the fixture from both.
+        # KXINTC is company family — this test is about cutoff mechanics, so
+        # exempt the fixture from the (env-restorable) gates and from the
+        # 2026-08-02 re-entry $2/day rate floor (which outranks curation).
         old_no_new = imm.NO_NEW_SERIES
         imm.NO_NEW_SERIES = frozenset()
         old_freeze = imm.FREEZE_SERIES
         imm.FREEZE_SERIES = frozenset()
+        old_ov = imm.SERIES_OVERRIDES.get("KXINTC")
+        imm.SERIES_OVERRIDES["KXINTC"] = imm.SeriesOverride()
         try:
             bot = IncentiveMarketMaker(client=client, live=False)
             bot.run_cycle()
@@ -1582,6 +1588,10 @@ class TestOverrideBuffer(unittest.TestCase):
             imm.NO_NEW_SERIES = old_no_new
             imm.FREEZE_SERIES = old_freeze
             imm.EVENT_START_OVERRIDES.pop(ev, None)
+            if old_ov is None:
+                imm.SERIES_OVERRIDES.pop("KXINTC", None)
+            else:
+                imm.SERIES_OVERRIDES["KXINTC"] = old_ov
 
 
 class TestHaltRestartContinuity(unittest.TestCase):
@@ -2073,6 +2083,30 @@ class TestStickySelection(unittest.TestCase):
             self.assertIn(self.T, bot.state.selected)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS, imm.HOPELESS_EXIT = old_floor, old_flag
+
+    def test_rate_floor_beats_curated_override(self):
+        # Jack 2026-08-02 TLN audit: an auto-written disclosure override
+        # curated KXTLN-26AUGGEN past the $2 bar at ~$0.45/day est. The
+        # re-entry RATE floor must gate FRESH candidates even on curated
+        # events (members stay sticky; the est_TOTAL bypass rationale does
+        # not apply to a per-day rate).
+        bot = self._quoting_bot()
+        old_ov = imm.SERIES_OVERRIDES.get("KXGOOD")
+        imm.SERIES_OVERRIDES["KXGOOD"] = imm.SeriesOverride(min_est_per_day=1e9)
+        imm.EVENT_START_OVERRIDES["KXGOOD-99DEC31"] = utc(2099, 1, 1)
+        try:
+            bot.state.selected.pop(self.T, None)      # make it FRESH
+            bot.state.sticky_prev.discard(self.T)
+            bot._est_peak.clear()
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)   # rate-floored
+        finally:
+            imm.EVENT_START_OVERRIDES.pop("KXGOOD-99DEC31", None)
+            if old_ov is None:
+                imm.SERIES_OVERRIDES.pop("KXGOOD", None)
+            else:
+                imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
 
     def test_override_event_exempt_from_hopeless(self):
         # Jack 2026-07-28 (tele-rally, 8/22 quoted): hand-curated override
