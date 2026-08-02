@@ -1241,6 +1241,20 @@ class TestDryRunCycle(unittest.TestCase):
         self.assertTrue(imm.series_fast_lane("KXTEMPDCH"))
         self.assertFalse(imm.series_fast_lane("KXGOOD"))
 
+    def test_pad_missing_side_for_members(self):
+        # Coverage-leak fix (2026-08-02): quoting only an ask rung still pads
+        # the BID side to target for members — a one-sided-qualified snapshot
+        # pays nobody, so the ask rung was pure fill risk. Flag off = old
+        # single-side behavior (reduce-only tails).
+        bot = self._bot()
+        nt = [imm.Quote("T", "ask", 55, 20)]
+        yes_lv, no_lv = [[40, 100]], [[45, 1500]]   # yes thin, no deep
+        on = bot._pad_quotes("T", nt, yes_lv, no_lv, [], 1000.0,
+                             pad_missing_side=True)
+        self.assertTrue(any(q.book_side == "bid" and q.is_pad for q in on))
+        off = bot._pad_quotes("T", nt, yes_lv, no_lv, [], 1000.0)
+        self.assertFalse(any(q.book_side == "bid" for q in off))
+
     def test_dry_amend_updates_sim_order(self):
         # amend executor (2026-08-02): dry mode mutates the sim order in
         # place — same id, new price/size — mirroring the live V2 amend.

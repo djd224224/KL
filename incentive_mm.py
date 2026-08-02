@@ -931,6 +931,10 @@ SUMMARY_HOUR_CT = _env_int("IMM_SUMMARY_HOUR_CT", 5)   # counters roll 6am ET
 WATCHDOG_MIN_SELECTED = _env_int("IMM_WATCHDOG_MIN_SELECTED", 10)
 WATCHDOG_MIN_RESTING = _env_int("IMM_WATCHDOG_MIN_RESTING", 5)
 WATCHDOG_CYCLES = _env_int("IMM_WATCHDOG_CYCLES", 3)
+# Coverage alert (Jack 2026-08-02, the sides==1 leak): a SELECTED market
+# quoted while only one side qualifies accrues ZERO with full fill risk.
+# pad_missing_side should make this ~impossible; page if it persists anyway.
+COVERAGE_ALERT_CYCLES = _env_int("IMM_COVERAGE_ALERT_CYCLES", 5)
 
 # Account-balance hard floor: the bot's risk math sees only its OWN book, but
 # the account is shared (crypto fleet, cloud bots, manual). If the balance
@@ -2169,6 +2173,7 @@ class MarketMeta:
 class BotState:
     selected: Dict[str, MarketMeta] = field(default_factory=dict)
     managed_extra: Dict[str, MarketMeta] = field(default_factory=dict)  # reduce-only tail
+    coverage_zero_streak: Dict[str, int] = field(default_factory=dict)  # sides<2 alert
     universe_at: float = 0.0
     programs_count: int = 0
     prev_mid: Dict[str, float] = field(default_factory=dict)
@@ -3249,12 +3254,13 @@ class IncentiveMarketMaker:
             if series_pad_to_target(meta.series) and meta.target_size > 0:
                 nt_bid = sum(q.count for q in quotes if q.book_side == "bid")
                 nt_ask = sum(q.count for q in quotes if q.book_side == "ask")
-                if nt_bid > 0:
+                # mirror the quote loop's pad_missing_side (coverage-leak
+                # fix): any quoting at all pads BOTH sides for members
+                if nt_bid > 0 or nt_ask > 0:
                     n = pad_quantity(sum(sz for _px, sz in yes_levels) + nt_bid,
                                      meta.target_size)
                     if n > 0:
                         overlay.append(("bid", PAD_BID_CENTS, float(n)))
-                if nt_ask > 0:
                     n = pad_quantity(sum(sz for _px, sz in no_levels) + nt_ask,
                                      meta.target_size)
                     if n > 0:
@@ -4023,8 +4029,13 @@ class IncentiveMarketMaker:
             # is below the reward target, add throwaway contracts at the 1c/99c
             # mark so the whole side (and thus our near-touch ladder) qualifies.
             if series_pad_to_target(meta.series) and meta.target_size > 0:
-                mq.extend(self._pad_quotes(t, mq, yes_levels, no_levels,
-                                           own, meta.target_size))
+                mq.extend(self._pad_quotes(
+                    t, mq, yes_levels, no_levels, own, meta.target_size,
+                    # coverage-leak fix: rent-earning members pad the rungless
+                    # side too (one-sided snapshots pay nobody); reduce-only
+                    # tails keep the old single-side behavior
+                    pad_missing_side=(t in self.state.selected
+                                      and not reduce_only)))
 
             desired.extend(mq)
             if mq:
@@ -4052,6 +4063,21 @@ class IncentiveMarketMaker:
                 yes_levels, no_levels, est_own,
                 meta.target_size, meta.discount_factor, own_in_book=self.live)
             cov = self._coverage(t, sides == 2)
+            # Coverage alert (2026-08-02): a member quoting into a snapshot
+            # that can't count is the worst rent-per-risk state — page after
+            # N consecutive FULL cycles (pads should make this ~impossible).
+            if not fast_only and t in self.state.selected and mq:
+                if sides < 2:
+                    streak = self.state.coverage_zero_streak.get(t, 0) + 1
+                    self.state.coverage_zero_streak[t] = streak
+                    if streak == COVERAGE_ALERT_CYCLES:
+                        self.alerter.alert(
+                            "coverage", f"{t}: quoted but only {sides} side(s) "
+                            f"qualify for {streak} cycles (side under target "
+                            f"{meta.target_size:.0f} despite pads?) — accruing "
+                            f"ZERO while carrying fill risk", key=t)
+                else:
+                    self.state.coverage_zero_streak.pop(t, None)
             reward_frac_sum += frac * meta.dollars_per_day * cov
             cycle_rate[t] = frac * meta.dollars_per_day * cov
             cycle_rows.append(
@@ -4231,12 +4257,19 @@ class IncentiveMarketMaker:
 
     def _pad_quotes(self, ticker: str, near_touch: List[Quote],
                     yes_levels: List[List[float]], no_levels: List[List[float]],
-                    own: List[Tuple[str, int, float]], target: float) -> List[Quote]:
+                    own: List[Tuple[str, int, float]], target: float,
+                    pad_missing_side: bool = False) -> List[Quote]:
         """Throwaway depth-padding at the 1c/99c mark so each side we quote
         reaches the reward target size. Computed on depth EXCLUDING our own pad
         (netted out / not-yet-in-book) to avoid a self-referential churn loop.
-        Only pads a side we actually have near-touch quotes on (join-don't-lead
-        preserved; leading the book alone at 1c is never useful)."""
+        By default only pads a side we have near-touch quotes on.
+        pad_missing_side (2026-08-02 coverage-leak fix, SELECTED markets):
+        also pad a side with NO rung whenever the OTHER side is quoted — a
+        one-sided-qualified snapshot pays NOBODY, so the quoted side was
+        carrying full fill risk for zero rent (the sides==1 class: 29 mkts
+        in today's cycle log). A lone 1c/99c pad "leads" nothing worth
+        leading and un-excludes the snapshot; if it ever fills it does so at
+        the best possible price."""
         pads: List[Quote] = []
         nt_bid = sum(q.count for q in near_touch if q.book_side == "bid")
         nt_ask = sum(q.count for q in near_touch if q.book_side == "ask")
@@ -4246,14 +4279,14 @@ class IncentiveMarketMaker:
                           and bs == "ask")
         yes_depth = sum(sz for _px, sz in yes_levels)
         no_depth = sum(sz for _px, sz in no_levels)
-        if nt_bid > 0:
+        if nt_bid > 0 or (pad_missing_side and nt_ask > 0):
             # live: book already holds our near-touch, subtract only our pad;
             # dry: sim orders aren't in the book, add this cycle's near-touch.
             basis = (yes_depth - own_pad_bid) if self.live else (yes_depth + nt_bid)
             n = pad_quantity(basis, target)
             if n > 0:
                 pads.append(Quote(ticker, "bid", PAD_BID_CENTS, n, is_pad=True))
-        if nt_ask > 0:
+        if nt_ask > 0 or (pad_missing_side and nt_bid > 0):
             basis = (no_depth - own_pad_ask) if self.live else (no_depth + nt_ask)
             n = pad_quantity(basis, target)
             if n > 0:
