@@ -2738,14 +2738,34 @@ class TestCutoffEnforcement(unittest.TestCase):
         self.assertEqual(bot.state.sim_orders, {})
         self.assertNotIn(t, bot.state.selected)
 
-    def test_pre_cutoff_reduce_only_flat_means_no_quotes(self):
+    def test_no_pre_cutoff_reduce_only_by_default(self):
+        # Jack 2026-08-02: the pre-cutoff reduce-only window is OFF bot-wide
+        # (default 0) — both sides keep quoting up to the cutoff; the
+        # exchange-side expiration cap at the cutoff is the remaining guard.
         bot = self._bot()
         t = "KXGOOD-99DEC31-A"
         bot.run_cycle()
         bot.state.selected[t].cutoff = datetime.now(timezone.utc) + timedelta(minutes=30)
         bot.state.universe_at = time.time()
         bot.run_cycle()
-        self.assertEqual(bot.state.sim_orders, {})   # flat + reduce-only = nothing
+        self.assertTrue(bot.state.sim_orders)   # still quoting inside 30min
+
+    def test_pre_cutoff_reduce_only_env_restorable(self):
+        # IMM_PRE_CUTOFF_REDUCE_ONLY > 0 restores the old behavior: inside
+        # the window and flat -> nothing rests.
+        bot = self._bot()
+        t = "KXGOOD-99DEC31-A"
+        bot.run_cycle()
+        old = imm.PRE_CUTOFF_REDUCE_ONLY_SECS
+        imm.PRE_CUTOFF_REDUCE_ONLY_SECS = 3600
+        try:
+            bot.state.selected[t].cutoff = \
+                datetime.now(timezone.utc) + timedelta(minutes=30)
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            self.assertEqual(bot.state.sim_orders, {})
+        finally:
+            imm.PRE_CUTOFF_REDUCE_ONLY_SECS = old
 
     def test_order_expiration_capped_at_cutoff(self):
         bot = self._bot()

@@ -188,8 +188,8 @@ class SeriesOverride:
     #   MIN_EST_TOTAL_DOLLARS entry/hopeless floor — sub-hour temp windows make
     #   $1 a high bar (Jack 2026-08-02: flanking strikes measured $0.6-0.8)
     pre_cutoff_reduce_only_secs: Optional[int] = None   # override the global
-    #   PRE_CUTOFF_REDUCE_ONLY_SECS (1h) — hourly markets are BORN closer to
-    #   their cutoff than that, so the default makes them reduce-only for life
+    #   PRE_CUTOFF_REDUCE_ONLY_SECS (default 0 since 2026-08-02 — the window
+    #   is removed bot-wide; set >0 here or via env to restore per-series)
     price_min_cents: Optional[int] = None               # per-series order price
     price_max_cents: Optional[int] = None               #   band (else global)
 
@@ -262,7 +262,8 @@ for _s in os.environ.get(
             price_max_cents=_env_int("IMM_TEMP_PRICE_MAX", 90),
             cutoff_from_close_min=_env_int("IMM_TEMP_CUTOFF_FROM_CLOSE_MIN", 10),
             min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05),
-            pre_cutoff_reduce_only_secs=_env_int("IMM_TEMP_PRE_CUTOFF_RO", 300),
+            # pre-cutoff reduce-only removed bot-wide 2026-08-02 (was 300s
+            # here via IMM_TEMP_PRE_CUTOFF_RO) — temp follows the global 0.
             min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 0.70))
 
 # Air-quality-index markets (user decision 2026-07-15). Series is KXAQICITY; the
@@ -553,7 +554,12 @@ BREAKERS_ENABLED = os.environ.get("IMM_BREAKERS", "0") == "1"
 SKEW_SOFT_CONTRACTS = _env_float("IMM_SKEW_SOFT", 30)   # halve accumulating side
 SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
-PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 3600)
+# REMOVED across the bot (Jack 2026-08-02: "remove reduce-only X minutes
+# ahead"): default 0 = both sides quote right up to the cutoff; the exchange-
+# side order-expiration cap at the cutoff (place_order) is the guard, and the
+# _screen cutoff-5min rule still stops FRESH selection. >0 restores the old
+# window (per-series via SeriesOverride.pre_cutoff_reduce_only_secs).
+PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 0)
 
 DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 1200.0)  # realized+unrealized $, halts to next ET day (user raises: 50->150 7/14; ->500 7/19; ->800 7/20; ->1200 7/21)
 MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 2000)  # 450->1000->2000
