@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 
@@ -265,15 +266,35 @@ def main(argv=None) -> int:
         log(f"digest already sent for {today_ct}; exiting")
         return 0
 
-    body, html = build_digest(now_utc)
+    # The 7am trigger can fire while the laptop is in Modern Standby with the
+    # network radio off (observed 2026-07-12: task ran at 7:00:01 mid-standby,
+    # exit 1, no email). Retry for up to ~40 minutes so the digest goes out
+    # shortly after the machine wakes.
+    body = html = None
+    for attempt in range(1, 9):
+        try:
+            body, html = build_digest(now_utc)
+            break
+        except Exception as e:
+            log(f"digest build attempt {attempt}/8 failed: {e!r}; retrying in 5min")
+            if attempt == 8:
+                log("giving up for today")
+                return 1
+            time.sleep(300)
     log("digest body:\n" + body)
 
     alerter = Alerter("FLEET", live=True)
     if not alerter.enabled:
         log("cannot send digest: alert credentials not configured")
         return 1
-    ok = alerter.send_message(body, subject=f"Kalshi crypto MM digest {today_ct}",
-                              html=html)
+    ok = False
+    for attempt in range(1, 9):
+        ok = alerter.send_message(body, subject=f"Kalshi crypto MM digest {today_ct}",
+                                  html=html)
+        if ok:
+            break
+        log(f"digest send attempt {attempt}/8 failed; retrying in 5min")
+        time.sleep(300)
     log(f"digest send: {'ok' if ok else 'FAILED'}")
     if ok and not args.test:
         with open(marker, "w") as f:

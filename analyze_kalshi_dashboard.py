@@ -41,7 +41,8 @@ CITY_NAMES={'NY':'New York','AUS':'Austin','PHIL':'Philadelphia','MIA':'Miami',
     'TDEN':'Denver','TBOS':'Boston','TCHAR':'Charlotte','TNASH':'Nashville','TTAMPA':'Tampa'}
 FC_COLORS={'NBA':'#60a5fa','NCAAB':'#c084fc','MLB':'#4ade80','Fight':'#f87171',
     'UFC Props':'#f472b6','Weather':'#22d3ee','NFL':'#fb923c','Politics':'#fbbf24',
-    'Performance':'#2dd4bf','Entertainment':'#94a3b8','Other':'#6b7280'}
+    'Performance':'#2dd4bf','Entertainment':'#94a3b8','Crypto':'#e879f9','Other':'#6b7280'}
+CRYPTO_RE=re.compile(r'^KX(BTC|ETH|SOL|XRP|DOGE|BNB|HYPE|ZEC|LTC|ADA|AVAX|LINK|SUI|TON|TRX|SHIB|PEPE|WLD)')
 PALETTE=['#60a5fa','#c084fc','#4ade80','#f87171','#fbbf24','#22d3ee','#2dd4bf','#f472b6','#fb923c','#94a3b8',
     '#818cf8','#a78bfa','#34d399','#fb7185','#fcd34d','#67e8f9','#5eead4','#f9a8d4','#fdba74','#cbd5e1',
     '#6366f1','#8b5cf6','#10b981','#ef4444','#f59e0b','#06b6d4','#14b8a6','#ec4899','#f97316','#64748b']
@@ -62,7 +63,12 @@ def extract_series(ticker):
 def series_to_family(series):
     if series in SERIES_MAP: return SERIES_MAP[series]
     if series.startswith('KXHIGH'): return 'Weather'
+    if CRYPTO_RE.match(series): return 'Crypto'
     return 'Other'
+
+def crypto_asset(ticker):
+    m=CRYPTO_RE.match(ticker or '')
+    return m.group(1) if m else 'UNKNOWN'
 
 def extract_subgroup(ticker, family):
     """Extract city/team/code for sub-group breakdown within a family."""
@@ -70,6 +76,8 @@ def extract_subgroup(ticker, family):
         series=extract_series(ticker)
         code=series.replace('KXHIGH','')
         return CITY_NAMES.get(code, code)
+    if family=='Crypto':
+        return crypto_asset(ticker)
     parts=ticker.split('-')
     return parts[-1] if len(parts)>=3 else ticker
 
@@ -123,7 +131,7 @@ def process_trades(raw):
         out.append({'ticker':ticker,'family':family,'date':dt,'day':day,
             'day_str':day.isoformat() if day else None,
             'contracts':contracts,'price_c':price_c,'notional':notional,
-            'direction':direction,'maker_taker':mt})
+            'direction':direction,'maker_taker':mt,'fee':sf(r.get('Fee_In_Dollars'))})
     return out
 
 def process_orders(raw):
@@ -354,6 +362,100 @@ def analyze_group(settlements, trades=None, orders=None, label='All'):
         'recent':recent,
     }
 
+def analyze_crypto_mm(trades, settlements):
+    """Fills-based book for the crypto one-touch MM: avg-cost netting in Yes-space.
+    A No fill at p is a Yes sale at 100-p, so round-trips realize P&L before
+    settlement (the settlement CSV alone misses maker round-trip profit).
+    Settled markets close any residual position at 0/100 on the settlement day."""
+    ct=sorted([t for t in trades if t['family']=='Crypto' and t['contracts']>0],
+        key=lambda t:t['date'] or datetime.min.replace(tzinfo=timezone.utc))
+    if not ct: return None
+    setl={}
+    for s in settlements:
+        if s['family']=='Crypto' and s['result'] in ('yes','no'):
+            setl[s['ticker']]=(100.0 if s['result']=='yes' else 0.0, s['day_str'])
+    books={}
+    realized_events=[]  # (day_str, delta_dollars)
+    for t in ct:
+        tk=t['ticker']; q=t['contracts']
+        yes_px=t['price_c'] if t['direction']=='Yes' else 100.0-t['price_c']
+        delta=q if t['direction']=='Yes' else -q
+        b=books.setdefault(tk,{'pos':0.0,'avg':0.0,'realized_c':0.0,'fills':0,
+            'contracts':0,'notional':0.0,'fees':0.0,'last_day':None,'settled':False})
+        b['fills']+=1; b['contracts']+=int(q); b['notional']+=t['notional']
+        b['fees']+=t.get('fee',0.0); b['last_day']=t['day_str'] or b['last_day']
+        pos,avg=b['pos'],b['avg']
+        if pos==0 or (pos>0)==(delta>0):
+            b['avg']=(abs(pos)*avg+abs(delta)*yes_px)/(abs(pos)+abs(delta))
+            b['pos']=pos+delta
+        else:
+            closing=min(abs(delta),abs(pos))
+            r=closing*(yes_px-avg)*(1 if pos>0 else -1)
+            b['realized_c']+=r
+            if t['day_str']: realized_events.append((t['day_str'],r/100.0))
+            rem=abs(delta)-closing
+            if rem>0: b['pos']=rem*(1 if delta>0 else -1); b['avg']=yes_px
+            else:
+                b['pos']=pos+delta
+                if b['pos']==0: b['avg']=0.0
+    for tk,b in books.items():
+        if tk in setl and b['pos']!=0:
+            spx,sday=setl[tk]
+            r=b['pos']*(spx-b['avg'])
+            b['realized_c']+=r
+            realized_events.append((sday or b['last_day'],r/100.0))
+            b['pos']=0.0; b['avg']=0.0
+        if tk in setl: b['settled']=True
+
+    total_fees=round(sum(b['fees'] for b in books.values()),2)
+    realized=round(sum(b['realized_c'] for b in books.values())/100.0-total_fees,2)
+    # open positions (side-space price for display)
+    open_pos=[]
+    for tk,b in sorted(books.items()):
+        if abs(b['pos'])<1e-9: continue
+        side='Yes' if b['pos']>0 else 'No'
+        qty=int(round(abs(b['pos'])))
+        px=b['avg'] if b['pos']>0 else 100.0-b['avg']
+        open_pos.append({'ticker':tk,'asset':crypto_asset(tk),'side':side,'qty':qty,
+            'avg_c':round(px,1),'cost':round(qty*px/100.0,2)})
+    open_cost=round(sum(p['cost'] for p in open_pos),2)
+    # per-asset rollup
+    assets={}
+    for tk,b in books.items():
+        a=crypto_asset(tk)
+        d=assets.setdefault(a,{'fills':0,'contracts':0,'notional':0.0,'realized':0.0,
+            'open_qty':0,'open_cost':0.0,'markets':0})
+        d['fills']+=b['fills']; d['contracts']+=b['contracts']; d['notional']+=b['notional']
+        d['realized']+=b['realized_c']/100.0-b['fees']; d['markets']+=1
+    for p in open_pos:
+        assets[p['asset']]['open_qty']+=p['qty']; assets[p['asset']]['open_cost']+=p['cost']
+    for a in assets.values():
+        a['notional']=round(a['notional'],2); a['realized']=round(a['realized'],2)
+        a['open_cost']=round(a['open_cost'],2)
+    # daily notional stacked by asset
+    dv=defaultdict(lambda:defaultdict(float))
+    for t in ct:
+        if t['day_str']: dv[crypto_asset(t['ticker'])][t['day_str']]+=t['notional']
+    daily_vol={a:[[k,round(v,2)] for k,v in sorted(d.items())] for a,d in dv.items()}
+    # cumulative realized
+    rd=defaultdict(float)
+    for day,r in realized_events:
+        if day: rd[day]+=r
+    c=0.0; cum_realized=[]
+    for day in sorted(rd):
+        c+=rd[day]; cum_realized.append([day,round(c,2)])
+    recent=[{'day':t['day_str'],'ticker':t['ticker'],'dir':t['direction'],
+        'qty':int(t['contracts']),'price_c':int(t['price_c']),'notional':round(t['notional'],2)}
+        for t in ct[-30:]][::-1]
+    maker=sum(1 for t in ct if 'maker' in t['maker_taker'].lower())
+    return {'n_fills':len(ct),'contracts':int(sum(t['contracts'] for t in ct)),
+        'notional':round(sum(t['notional'] for t in ct),2),
+        'maker_pct':round(maker/len(ct)*100),'fees':total_fees,'realized':realized,
+        'open_pos':open_pos,'open_cost':open_cost,'n_open':len(open_pos),
+        'n_markets':len(books),'n_settled':sum(1 for b in books.values() if b['settled']),
+        'assets':assets,'daily_vol':daily_vol,'cum_realized':cum_realized,'recent':recent,
+        'first_day':ct[0]['day_str'],'last_day':ct[-1]['day_str']}
+
 # ── Takeaway generation ──
 def gen_takeaway(stats, sg_stats=None, is_family=False):
     s=stats; parts=[]
@@ -392,8 +494,13 @@ def pct_h(v):
     return f'<span style="color:{c}">{v:+.1f}%</span>'
 
 # ── HTML generation ──
-def generate_html(consolidated, family_data, families, fill_data, all_settlements, all_trades, all_orders, out_path, label='Kalshi'):
-    nav_items=['Consolidated']+families+['Fill Rates']
+def generate_html(consolidated, family_data, families, fill_data, all_settlements, all_trades, all_orders, out_path, label='Kalshi', crypto=None):
+    # Crypto MM (fills-based) supersedes the standard settlement-based Crypto
+    # family section: settlement-only stats can't see maker round-trips, and
+    # settle-outs are already folded into the MM realized P&L. Crypto
+    # settlements still count in the Consolidated section.
+    sec_families=[f for f in families if f!='Crypto' or not crypto]
+    nav_items=['Consolidated']+sec_families+(['Crypto MM'] if crypto else [])+['Fill Rates']
     nav_html=''.join(f"<a onclick=\"document.getElementById('section-{sid(f)}').scrollIntoView({{behavior:'smooth',block:'start'}})\">{f}</a>" for f in nav_items)
 
     # Build sections
@@ -404,16 +511,20 @@ def generate_html(consolidated, family_data, families, fill_data, all_settlement
     sections.append(build_section('consolidated','Consolidated',c,is_consolidated=True,families=families,family_data=family_data))
 
     # ── Per-family ──
-    for fam in families:
+    for fam in sec_families:
         fd=family_data[fam]
         warn=f'<div class="wb">n={fd["nd"]} days — {"high estimation error" if fd["nd"]<30 else "moderate sample"}</div>' if fd['nd']<50 else ''
         sections.append(build_section(sid(fam),fam,fd,warn=warn,is_family=True))
 
-    # ── Fill rates ──
-    sections.append(build_fill_section(fill_data, families, family_data))
+    # ── Crypto MM (fills-based; settlements alone miss maker round-trips) ──
+    if crypto:
+        sections.append(build_crypto_section(crypto))
 
-    # JS charts
-    js=build_js(consolidated, family_data, families, fill_data)
+    # ── Fill rates ──
+    sections.append(build_fill_section(fill_data, sec_families, family_data))
+
+    # JS charts (consolidated pie still spans ALL families incl. Crypto)
+    js=build_js(consolidated, family_data, families, fill_data, crypto=crypto, sec_families=sec_families)
 
     with open(out_path,'w',encoding='utf-8') as f:
         f.write(f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -630,8 +741,44 @@ def build_fill_section(fill_data, families, family_data):
 <div class="st"><table><thead><tr><th>Family</th><th>Fill Rate (Orders)</th><th>Fill Rate (Contracts)</th><th>Total Orders</th><th>Filled Orders</th><th>Filled/Ordered Contracts</th></tr></thead><tbody>{fam_rows}</tbody></table></div>
 </div>'''
 
-def build_js(consolidated, family_data, families, fill_data):
+def build_crypto_section(cr):
+    """Crypto one-touch MM section — fills-based (settlement CSV misses round-trips)."""
+    open_note=f"{cr['n_open']} open" + (f", {cr['n_settled']} settled" if cr['n_settled'] else '')
+    kpis=f'''<div class="g4">
+<div class="card"><div class="l">Realized P&L (fills)</div><div class="v">{money_h(cr['realized'])}</div><div class="s">round-trips + settle-outs, net of fees</div></div>
+<div class="card"><div class="l">Open Exposure</div><div class="v">${cr['open_cost']:,.2f}</div><div class="s">at cost &middot; {cr['n_open']} positions</div></div>
+<div class="card"><div class="l">Dollar Volume</div><div class="v">${cr['notional']:,.0f}</div><div class="s">{cr['contracts']:,} contracts | {cr['n_fills']:,} fills ({cr['maker_pct']}% mkr)</div></div>
+<div class="card"><div class="l">Markets</div><div class="v">{cr['n_markets']}</div><div class="s">{open_note}</div></div>
+<div class="card"><div class="l">Fees</div><div class="v">${cr['fees']:,.2f}</div><div class="s">{cr['first_day']} → {cr['last_day']}</div></div>
+</div>'''
+    charts='''<div class="g2" style="margin-top:1rem">
+<div><h3>Daily $ Volume by Asset</h3><div class="cc"><canvas id="cryptomm_vol"></canvas></div></div>
+<div><h3>Cumulative Realized P&L</h3><div class="cc"><canvas id="cryptomm_cum"></canvas></div></div></div>
+<h3>Realized P&L by Asset</h3><div class="cc"><canvas id="cryptomm_ra"></canvas></div>'''
+    asset_rows=''.join(f'<tr><td><code>{a}</code></td><td>{money_h(v["realized"])}</td><td>{v["fills"]:,}</td><td>{v["contracts"]:,}</td><td>${v["notional"]:,.2f}</td><td>{v["markets"]}</td><td>{v["open_qty"]:,}</td><td>${v["open_cost"]:,.2f}</td></tr>'
+        for a,v in sorted(cr['assets'].items(),key=lambda x:-x[1]['realized']))
+    tables=f'''<h3>By Asset</h3><div class="st"><table><thead><tr><th>Asset</th><th>Realized P&L</th><th>Fills</th><th>Contracts</th><th>Volume</th><th>Markets</th><th>Open Qty</th><th>Open Cost</th></tr></thead><tbody>{asset_rows}</tbody></table></div>'''
+    op_rows=''.join(f'<tr><td><code>{p["ticker"]}</code></td><td>{p["asset"]}</td><td>{p["side"]}</td><td>{p["qty"]:,}</td><td>{p["avg_c"]:.1f}&cent;</td><td>${p["cost"]:,.2f}</td></tr>'
+        for p in sorted(cr['open_pos'],key=lambda x:-x['cost']))
+    tables+=f'''<h3>Open Positions ({cr['n_open']}) — at cost, no mark</h3><div class="st"><table><thead><tr><th>Ticker</th><th>Asset</th><th>Side</th><th>Qty</th><th>Avg Price</th><th>Cost</th></tr></thead><tbody>{op_rows}</tbody></table></div>'''
+    rec_rows=''.join(f'<tr><td>{r["day"]}</td><td><code>{r["ticker"]}</code></td><td>{r["dir"]}</td><td>{r["qty"]:,}</td><td>{r["price_c"]}&cent;</td><td>${r["notional"]:,.2f}</td></tr>'
+        for r in cr['recent'])
+    tables+=f'''<h3>Recent Fills (last 30)</h3><div class="st"><table><thead><tr><th>Date</th><th>Ticker</th><th>Dir</th><th>Qty</th><th>Price</th><th>Notional</th></tr></thead><tbody>{rec_rows}</tbody></table></div>'''
+    takeaway=(f"<strong>{'Profitable' if cr['realized']>=0 else 'Unprofitable'} so far: {money_s(cr['realized'])} realized</strong> from fills "
+        f"across {cr['n_markets']} markets ({cr['n_fills']} fills, ${cr['notional']:,.0f} volume). "
+        f"${cr['open_cost']:,.2f} still at risk in {cr['n_open']} open positions — monthly one-touch markets settle at month-end, "
+        f"so realized P&L here comes from maker round-trips{' and settled markets' if cr['n_settled'] else ' only'}.")
+    return f'''<div class="section" id="section-cryptomm">
+<h2 class="sh">Crypto MM</h2>
+<div class="takeaway">{takeaway}</div>
+{kpis}
+{charts}
+{tables}
+</div>'''
+
+def build_js(consolidated, family_data, families, fill_data, crypto=None, sec_families=None):
     """Build all chart initialization JS."""
+    if sec_families is None: sec_families=families
     js_parts=[]
 
     def add_charts(sid_v, s, is_consolidated=False):
@@ -679,9 +826,16 @@ def build_js(consolidated, family_data, families, fill_data):
     add_charts('consolidated', consolidated, is_consolidated=True)
 
     # Per-family
-    for fam in families:
+    for fam in sec_families:
         fid=sid(fam)
         add_charts(fid, family_data[fam])
+
+    # Crypto MM charts
+    if crypto:
+        js_parts.append(f"var cr_dv={json.dumps(crypto['daily_vol'])};var crd=[...new Set(Object.values(cr_dv).flatMap(s=>s.map(d=>d[0])))].sort();if(crd.length){{var crds=Object.entries(cr_dv).map(([k,s],i)=>{{var lu=Object.fromEntries(s);return{{label:k,data:crd.map(d=>lu[d]||0),backgroundColor:P[i%P.length]+'88',borderColor:P[i%P.length],borderWidth:1}}}});new Chart(document.getElementById('cryptomm_vol'),{{type:'bar',data:{{labels:crd,datasets:crds}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:true,position:'top',labels:{{boxWidth:8,padding:4,font:{{size:9}}}}}}}},scales:{{x:{{stacked:true,ticks:{{maxTicksLimit:12,maxRotation:45}}}},y:{{stacked:true}}}}}}}});}}")
+        js_parts.append(f"var cr_cum={json.dumps(crypto['cum_realized'])};if(cr_cum.length)ML('cryptomm_cum',cr_cum.map(d=>d[0]),[{{label:'Realized P&L',data:cr_cum.map(d=>d[1]),borderColor:FC['Crypto'],backgroundColor:FC['Crypto']+'22',fill:true,borderWidth:2}}]);")
+        ra=[[a,v['realized']] for a,v in sorted(crypto['assets'].items(),key=lambda x:-x[1]['realized'])]
+        js_parts.append(f"var cr_ra={json.dumps(ra)};if(cr_ra.length)MB('cryptomm_ra',cr_ra.map(d=>d[0]),cr_ra.map(d=>d[1]));")
 
     # Fill rate daily chart
     if fill_data.get('daily_fr'):
@@ -750,7 +904,10 @@ def main():
             if o['day_str']: od[o['day_str']]['n']+=1; od[o['day_str']]['f']+=(1 if o['filled']>0 else 0)
         fill_data['daily_fr']=[[k,round(v['f']/v['n']*100,1) if v['n'] else 0] for k,v in sorted(od.items())]
 
-    generate_html(consolidated, family_data, families_set, fill_data, settlements, trades, orders, out, label)
+    # Crypto MM view (fills-based; independent of settlements)
+    crypto=analyze_crypto_mm(trades, settlements)
+
+    generate_html(consolidated, family_data, families_set, fill_data, settlements, trades, orders, out, label, crypto=crypto)
 
     # Summary
     print(f"\n=== {label} SUMMARY ===")
@@ -759,6 +916,8 @@ def main():
     for fam in families_set:
         f2=family_data[fam]
         print(f"  {fam}: {money_s(f2['pnl'])} | ROI: {f2['roi']}% | n={f2['n']}")
+    if crypto:
+        print(f"  Crypto MM (fills): {money_s(crypto['realized'])} realized | ${crypto['open_cost']:,.2f} open | {crypto['n_fills']} fills")
 
 if __name__=='__main__':
     main()

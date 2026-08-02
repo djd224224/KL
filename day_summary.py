@@ -41,6 +41,9 @@ def family(ticker):
     if ticker.startswith(("KXTRUMP", "KXPRES", "KXFED")): return "Politics"
     # Generic mentions bucket
     if ticker.startswith("KXMENTION"): return "Mentions"
+    # Crypto (one-touch monthlies etc.)
+    if re.match(r"KX(BTC|ETH|SOL|XRP|DOGE|BNB|HYPE|ZEC|LTC|ADA|AVAX|LINK|SUI|TON|TRX|SHIB|PEPE|WLD)", ticker):
+        return "Crypto"
     return "Other"
 
 
