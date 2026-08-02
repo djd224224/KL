@@ -395,6 +395,9 @@ def classify_and_estimate(client, bot, now_utc: datetime):
             r["reason"] = "no-new gate"
         elif meta.yield_per_contract <= 0:
             r["reason"] = "zero est yield"
+        elif not curated and meta.est_dollars_per_day \
+                < imm.series_min_est_rate(meta.series):
+            r["reason"] = "under rate floor"
         elif not curated and accrued + max(est_total, peak) \
                 < imm.series_min_est_total(meta.series):
             r["reason"] = "under payout floor"

@@ -564,6 +564,27 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
         finally:
             imm.ATREF_PRICE_TOL_TICKS = old
 
+    def test_safe_join_clamps_tight_books(self):
+        # Re-entry safety net (Jack 2026-08-02): tight spread -> rest >= 2
+        # ticks behind the touch even when the reference is AT the touch;
+        # 5+ tick spread is its own safety net -> normal at-ref placement.
+        t = "KXBA-26AUGDELIV-T30"          # KXBA carries the re-entry override
+        # tight book: bid 50 / ask 53 (spread 3 < 5); ref at the touch
+        (q,) = imm.build_side_ladder(t, "bid", 50, 53, 100, ref_px=50)
+        self.assertEqual(q.price_cents, 48)
+        (q,) = imm.build_side_ladder(t, "ask", 53, 50, 100, ref_px=53)
+        self.assertEqual(q.price_cents, 55)
+        # wide book: bid 40 / ask 60 (spread 20 >= 5) -> at-ref untouched
+        (q,) = imm.build_side_ladder(t, "bid", 40, 60, 100, ref_px=40)
+        self.assertEqual(q.price_cents, 40)
+        # deep reference already past the net -> unchanged by the clamp
+        (q,) = imm.build_side_ladder(t, "bid", 50, 53, 100, ref_px=45)
+        self.assertEqual(q.price_cents, 45)
+        # non-safe series: tight book still joins at the reference
+        (q,) = imm.build_side_ladder("KXGOOD-99DEC31-A", "bid", 50, 53, 100,
+                                     ref_px=50)
+        self.assertEqual(q.price_cents, 50)
+
 
 class TestDiffOrders(unittest.TestCase):
     def test_exact_match_kept(self):
@@ -808,24 +829,21 @@ class TestAllowlist(unittest.TestCase):
         self.assertFalse(a("KXHYPEMINMON-HYPE-26JUL31-5250"))
 
     def test_company_metric_series(self):
-        # 2026-07-29: the whole company family is FROZEN (Jack: "stop
-        # quoting COMPANY events") — _allowed now refuses what the 7/22
-        # enrollment admitted. The allowlist entries remain underneath;
-        # clearing IMM_FREEZE_SERIES restores them.
+        # 2026-08-02 RE-ENTRY (Jack): company family quotes again (freeze
+        # default emptied) behind the $2/day rate floor + safe-join rule.
         a = IncentiveMarketMaker._allowed
-        self.assertFalse(a("KXBA-26JULDELIV-130"))
-        self.assertFalse(a("KXHOOD-26JULFUNDED-28300000"))
-        self.assertFalse(a("KXCOINBASE-26JULVOL-240000000000"))
-        self.assertFalse(a("KXWINGA-27FEBREST-3400"))
-        self.assertFalse(a("KXSBUXSAR-26AUG02-T5.09"))
+        self.assertTrue(a("KXBA-26JULDELIV-130"))
+        self.assertTrue(a("KXHOOD-26JULFUNDED-28300000"))
+        self.assertTrue(a("KXCOINBASE-26JULVOL-240000000000"))
+        self.assertTrue(a("KXWINGA-27FEBREST-3400"))
+        self.assertTrue(a("KXSBUXSAR-26AUG02-T5.09"))
+        self.assertTrue(a("KXCHIPBURRITO-26AUG02-T9.77"))
         import incentive_mm as _imm
         old = _imm.FREEZE_SERIES
-        _imm.FREEZE_SERIES = frozenset()
+        _imm.FREEZE_SERIES = frozenset({"KXBA"})
         try:
-            # un-frozen, the 7/22 allowlist contract still holds
-            self.assertTrue(a("KXBA-26JULDELIV-130"))
-            self.assertTrue(a("KXCHIPBURRITO-26AUG02-T9.77"))
-            self.assertTrue(a("KXBKNUGGETS-26AUG02-T3.54"))
+            # IMM_FREEZE_SERIES still refreezes on demand
+            self.assertFalse(a("KXBA-26JULDELIV-130"))
         finally:
             _imm.FREEZE_SERIES = old
         # non-ticker lookalikes still excluded
@@ -838,16 +856,10 @@ class TestAllowlist(unittest.TestCase):
                   "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
                   "KXUSGASCPI-26AUG12-T320"):
             self.assertTrue(a(t), t)
-        # KXSCFI frozen 2026-07-29 night (Jack: "turn off KXSCFI-26EOY" —
-        # the econ grandfather lasted ~6h); allow contract returns if thawed
-        self.assertFalse(a("KXSCFI-26DEC25-T1500"))
-        import incentive_mm as _imm
-        old = _imm.FREEZE_SERIES
-        _imm.FREEZE_SERIES = frozenset()
-        try:
-            self.assertTrue(a("KXSCFI-26DEC25-T1500"))
-        finally:
-            _imm.FREEZE_SERIES = old
+        # KXSCFI: frozen 7/29, RE-ALLOWED 2026-08-02 with the re-entry
+        # guards ($2/day rate floor + safe-join).
+        self.assertTrue(a("KXSCFI-26DEC25-T1500"))
+        self.assertEqual(imm.series_min_est_rate("KXSCFI"), 2.0)
         # GPU rental family HARD-EXCLUDED (blocklisted, not merely absent) so
         # the daily auto-enroll can never pull it in
         b = IncentiveMarketMaker._blocked
@@ -2213,8 +2225,15 @@ class TestStickySelection(unittest.TestCase):
             self.assertTrue(imm.curated_event("KXFOO-26AUG01", "KXFOO", now))
         finally:
             imm.EVENT_START_OVERRIDES.pop("KXFOO-26AUG01", None)
-        for s in ("KXSCFI", "KXNHSALES"):
-            self.assertIn(s, imm.NO_NEW_SERIES)
+        # 2026-08-02 (Jack) RE-ENTRY: company/econ freeze + no-new lifted;
+        # they quote again behind the $2/day rate floor + safe-join rule.
+        for s in ("KXSCFI", "KXNHSALES", "KXBA", "KXHOOD"):
+            self.assertNotIn(s, imm.NO_NEW_SERIES)
+            self.assertNotIn(s, imm.FREEZE_SERIES)
+            self.assertEqual(imm.series_min_est_rate(s), 2.0)
+            self.assertTrue(imm.series_safe_join(s))
+        self.assertEqual(imm.series_min_est_rate("KXGOOD"), 0.0)
+        self.assertFalse(imm.series_safe_join("KXTEMPDCH"))
         # 2026-08-02 (Jack): KXRT pulled out of the econ set — entertainment
         # reveals are not macro prints; the 7/29 econ run-off had swept it
         # by config placement. Still allowed, no longer no_new'd.

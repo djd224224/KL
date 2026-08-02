@@ -145,6 +145,13 @@ REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 2.0)
 # across the band, so churn on 1-tick touch/ref wiggles buys nothing.
 ATREF_PRICE_TOL_TICKS = _env_int("IMM_ATREF_PRICE_TOL", 1)
 ATREF_COUNT_TOL_FRAC = _env_float("IMM_ATREF_COUNT_TOL", 0.2)
+# Safe-join placement (Jack 2026-08-02, company/econ re-entry): on a tight
+# book (spread < MIN_SPREAD ticks) quotes rest at least OFFSET ticks behind
+# the touch — an "ample safety net" against informed flow; a wide spread is
+# its own net, so >= MIN_SPREAD books join normally. Applied inside
+# build_side_ladder (single site: live loop AND estimator inherit).
+SAFE_JOIN_OFFSET_TICKS = _env_int("IMM_SAFE_JOIN_OFFSET", 2)
+SAFE_JOIN_MIN_SPREAD = _env_int("IMM_SAFE_JOIN_MIN_SPREAD", 5)
 # Fast-lane (Jack 2026-08-02): between full cycles, re-quote ONLY fast-lane
 # series (KXTEMP — hourly books gap on METAR updates and the ~50s full-cycle
 # cadence left rungs ticks behind the reference) every FAST_LANE_SECS of the
@@ -202,6 +209,12 @@ class SeriesOverride:
     #   a 1-tick-behind rung earns half weight; temp is ~24 orders, churn cheap)
     fast_lane: bool = False                             # requote this series on
     #   the FAST_LANE_SECS mini-cycles between full cycles (KXTEMP)
+    min_est_per_day: Optional[float] = None             # RATE floor: skip fresh
+    #   candidates whose est $/day is below this (re-entry quality bar; on TOP
+    #   of the total-accrual payout floor). None/0 = off.
+    safe_join: bool = False                             # safety-net placement:
+    #   rest >= SAFE_JOIN_OFFSET_TICKS behind the touch unless the bid/ask
+    #   spread is >= SAFE_JOIN_MIN_SPREAD ticks (re-entry company/econ)
     pre_cutoff_reduce_only_secs: Optional[int] = None   # override the global
     #   PRE_CUTOFF_REDUCE_ONLY_SECS (default 0 since 2026-08-02 — the window
     #   is removed bot-wide; set >0 here or via env to restore per-series)
@@ -503,6 +516,17 @@ def series_fast_lane(series: str) -> bool:
     return bool(ov and ov.fast_lane)
 
 
+def series_min_est_rate(series: str) -> float:
+    """Per-series est-$/day RATE floor for fresh candidates (0 = off)."""
+    ov = SERIES_OVERRIDES.get(series)
+    return ov.min_est_per_day if (ov and ov.min_est_per_day) else 0.0
+
+
+def series_safe_join(series: str) -> bool:
+    ov = SERIES_OVERRIDES.get(series)
+    return bool(ov and ov.safe_join)
+
+
 def series_pre_cutoff_reduce_only_secs(series: str) -> int:
     ov = SERIES_OVERRIDES.get(series)
     return ov.pre_cutoff_reduce_only_secs \
@@ -722,27 +746,15 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_ENTERTAINMENT_SERIES)
                 ).split(",") if s)
 
-# NO-NEW gate (Jack 2026-07-28 pm: "dont quote any new COMPANY markets —
-# keep quoting what you're currently quoting"): series listed here admit NO
-# fresh candidates; existing members ride their sticky life to its natural
-# end (cutoff/close/program end) and cannot re-enter afterward. Beats the
-# override-event bypass on purpose — a curated cutoff window on a company
-# event no longer implies admission. Default = the company operating-metric
-# + consumer-price set plus the company variants the auto-enroll task had
-# already added to extra_allow; the classifier keeps enrolling new company
-# series into the ALLOWLIST but this gate stops them at selection, so no
-# task change is needed. Env IMM_NO_NEW_SERIES overrides (empty = gate off).
+# NO-NEW gate (Jack 2026-07-28 pm): series listed here admit NO fresh
+# candidates; members ride sticky to natural death. History: company set
+# gated 7/28, econ 7/29, then company FROZEN 7/29. RE-ENTRY (Jack 2026-08-02
+# "Re allowlist company and econ markets... wade back safely"): default now
+# EMPTY — admission reopened under the guarded re-entry overrides below
+# ($2/day rate floor + safe-join placement). Env IMM_NO_NEW_SERIES restores
+# a gate.
 NO_NEW_SERIES = frozenset(
-    s for s in os.environ.get(
-        "IMM_NO_NEW_SERIES",
-        _DEFAULT_COMPANY_SERIES + ",KXAAL,KXAALA,KXALK,KXALKA,KXAXP,KXAXPA,"
-        "KXGOOGA,KXLUVA,KXSBUXA,"
-        # ECON run-off (Jack 2026-07-29 pm: "block ECON events going
-        # forward, fine to keep this one") — current members (SCFI-26EOY)
-        # ride to natural death; fresh econ events/markets stop admitting.
-        # Gas/USGASCPI here are already blocklisted (harmless overlap).
-        + _DEFAULT_ECON_SERIES
-    ).split(",") if s)
+    s for s in os.environ.get("IMM_NO_NEW_SERIES", "").split(",") if s)
 
 # FULL FREEZE by EXACT series (Jack 2026-07-29 am: "stop quoting COMPANY
 # events" — escalates the 7/28 run-off to zero orders; positions ride to
@@ -752,34 +764,33 @@ NO_NEW_SERIES = frozenset(
 # _blocked(), so every freeze path (candidates, orphan-restore, managed
 # flush) inherits. Earnings-MENTION (KXEARNINGSMENTION*) is NOT company —
 # it stays live. Default = the NO_NEW company set; env IMM_FREEZE_SERIES.
+# History: company set frozen 7/29 am (43 names + variant sweeps + KXAC +
+# KXSCFI); KXTRUMPMENTION passed through 7/29-7/30. RE-ENTRY (Jack
+# 2026-08-02): default now EMPTY — company/econ quote again under the
+# guarded re-entry overrides below ($2/day rate floor + safe-join
+# placement). Gas trackers stay dark via the LAUNCHER blocklist (the gas
+# sniper's book, a different mechanism/decision). Env IMM_FREEZE_SERIES
+# restores a freeze.
 FREEZE_SERIES = frozenset(
-    s for s in os.environ.get(
-        "IMM_FREEZE_SERIES",
-        _DEFAULT_COMPANY_SERIES + ",KXAAL,KXAALA,KXALK,KXALKA,KXAXP,KXAXPA,"
-        # KXTRUMPMENTION moved here from the launcher prefix blocklist
-        # (Jack 2026-07-29: quote KXTRUMPMENTIONB — the prefix was
-        # swallowing the B-variant; exact freeze keeps only the main
-        # series dark)
-        # + the variant sweep, round 3 (2026-07-29: pre-classifier-fix task
-        # runs had enrolled these company variants; the class = ANY company
-        # base ticker can sprout an A-variant or bare sibling)
-        # KXTRUMPMENTION un-frozen 2026-07-30 (Jack: "quote TRUMPMENTIONS
-        # like KXTRUMPMENTION-26JUL30 but at 10 contracts") — main-series
-        # events quote again with the hand-tuned 0:10 ladder below.
-        "KXGOOGA,KXLUVA,KXSBUXA,"
-        "KXCMGA,KXMETAA,KXVZ,KXVZA,KXWHA,KXYUM,KXYUMA,"
-        # KXAC = AIR CANADA passenger load factor (Jack caught it 7/29 pm) —
-        # a company metric behind an unrecognizable name; auto-enrolled
-        # pre-classifier-fix and twice deliberately kept in allow-file
-        # cleanups because nobody identified it. Lesson: an allow entry you
-        # can't ATTRIBUTE is a finding, not a keeper.
-        "KXAC,"
-        # KXSCFI grandfather ended (Jack 2026-07-29 night: "turn off
-        # KXSCFI-26EOY" — the run-off lasted ~6h). Positions ride; NOTE the
-        # 26EOY event settles Dec 31, so that inventory sits for months
-        # unless flattened by hand.
-        "KXSCFI"
-    ).split(",") if s)
+    s for s in os.environ.get("IMM_FREEZE_SERIES", "").split(",") if s)
+
+# Guarded RE-ENTRY set (Jack 2026-08-02: "wade back safely into these
+# markets and see if they are profitable"): every re-allowed company/econ
+# series quotes only when the estimator clears IMM_REENTRY_MIN_RATE $/day
+# (rate floor, ON TOP of the $1 total-payout floor) and places with the
+# safe-join rule — quotes rest >= SAFE_JOIN_OFFSET_TICKS behind the touch
+# unless the bid/ask spread is >= SAFE_JOIN_MIN_SPREAD ticks (a wide spread
+# IS the safety net). The estimator overlays the same clamped ladder, so
+# the rate floor is tested net of the safety penalty.
+_REENTRY_SERIES = (
+    _DEFAULT_COMPANY_SERIES + ",KXAAL,KXAALA,KXALK,KXALKA,KXAXP,KXAXPA,"
+    "KXGOOGA,KXLUVA,KXSBUXA,KXCMGA,KXMETAA,KXVZ,KXVZA,KXWHA,KXYUM,KXYUMA,"
+    "KXAC,KXNHSALES,KXSCFI")
+for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
+    if _s.strip() and _s.strip() not in SERIES_OVERRIDES:
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
+            safe_join=True)
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
 # cutoff forfeits game-day daytime, but programs run ~1-2 days INCLUDING game
@@ -1743,6 +1754,17 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
             anchor = opposite_best - 1
         elif book_side == "ask" and anchor <= opposite_best:
             anchor = opposite_best + 1
+    # Safe-join (re-entry company/econ): on a tight book, never rest inside
+    # the top SAFE_JOIN_OFFSET_TICKS of our side — the estimator overlays
+    # this same clamp, so entry floors are tested net of the weight penalty.
+    # An unreadable opposite side counts as tight (conservative).
+    safe_cap: Optional[int] = None
+    if series_safe_join(series_of(ticker)):
+        spread = (opposite_best - anchor if book_side == "bid"
+                  else anchor - opposite_best) if opposite_best is not None else None
+        if spread is None or spread < SAFE_JOIN_MIN_SPREAD:
+            safe_cap = (max(anchor - SAFE_JOIN_OFFSET_TICKS, 1) if book_side == "bid"
+                        else min(anchor + SAFE_JOIN_OFFSET_TICKS, 99))
     pmin, pmax = series_price_min(series_of(ticker)), series_price_max(series_of(ticker))
     if LADDER_MODE == "atref" and ref_px is not None:
         # Reference placement is EXEMPT from the series price band (Jack
@@ -1760,12 +1782,18 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
             return quotes
         if book_side == "bid":
             px = min(anchor, max(ref_px, 1))
+            if safe_cap is not None:
+                px = min(px, safe_cap)
         else:
             px = max(anchor, min(ref_px, 99))
+            if safe_cap is not None:
+                px = max(px, safe_cap)
         quotes.append(Quote(ticker, book_side, px, count))
         return quotes
     for ticks, size in levels:
         px = anchor - ticks if book_side == "bid" else anchor + ticks
+        if safe_cap is not None:
+            px = min(px, safe_cap) if book_side == "bid" else max(px, safe_cap)
         # BOTH sides, BOTH bounds: the band was originally bid-min/ask-max
         # only, which let a BID rest at 97c on a likely-YES temp strike
         # (filled live 2026-07-21, AUSH-2118-T96.99) and would let asks rest
@@ -2946,6 +2974,11 @@ class IncentiveMarketMaker:
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
+            elif meta.est_dollars_per_day < series_min_est_rate(meta.series):
+                # Re-entry quality bar (Jack 2026-08-02): fresh company/econ
+                # candidates must clear $2/day est — net of the safe-join
+                # weight penalty, which the estimator already models.
+                skipped["rate_floor"] = skipped.get("rate_floor", 0) + 1
             elif not reaches_min:
                 # entry floor, now with the accrued credit: a re-admitted
                 # market that already banked most of its $1 re-enters even
