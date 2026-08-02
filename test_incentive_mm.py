@@ -506,53 +506,93 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
     def tearDown(self):
         imm.LADDER_MODE = self._mode
 
-    def _diff(self, desired, resting):
-        return imm.diff_orders(desired, resting, {}, 0.0)
+    def _diff(self, desired, resting, touch=None):
+        return imm.diff_orders(desired, resting, {}, 0.0,
+                               touch_by_ticker=touch)
 
     def test_one_tick_behind_kept(self):
         d = [imm.Quote("T", "bid", 45, 30)]
         r = [_resting("o1", "T", "bid", 44, 30)]     # 1 behind desired: keep
-        place, cancel = self._diff(d, r)
-        self.assertEqual((place, cancel), ([], []))
+        place, cancel, amend = self._diff(d, r)
+        self.assertEqual((place, cancel, amend), ([], [], []))
 
-    def test_aggressive_side_churned(self):
+    def test_aggressive_drift_amended_without_touch(self):
+        # No touch data -> the aggressive-drift keep is disabled; the rung is
+        # AMENDED back to desired in place (2026-08-02: no cancel+place gap).
         d = [imm.Quote("T", "bid", 45, 30)]
-        r = [_resting("o1", "T", "bid", 46, 30)]     # above desired bid: cancel
-        place, cancel = self._diff(d, r)
-        self.assertEqual(cancel, ["o1"])
-        self.assertEqual([(q.price_cents, q.count) for q in place], [(45, 30)])
+        r = [_resting("o1", "T", "bid", 46, 30)]
+        place, cancel, amend = self._diff(d, r)
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
+                         [("o1", 45)])
+
+    def test_aggressive_drift_kept_inside_touch(self):
+        # Asymmetric chase (2026-08-02): the reference moved DEEPER, so the
+        # rung above desired still earns full weight — keep it while it is
+        # not leading the current touch.
+        d = [imm.Quote("T", "bid", 45, 30)]
+        r = [_resting("o1", "T", "bid", 46, 30)]
+        out = self._diff(d, r, touch={"T": (47, 53)})
+        self.assertEqual(out, ([], [], []))
+
+    def test_aggressive_leading_book_amended(self):
+        # ...but a rung ABOVE the current touch is leading the book: fix it.
+        d = [imm.Quote("T", "bid", 45, 30)]
+        r = [_resting("o1", "T", "bid", 46, 30)]
+        place, cancel, amend = self._diff(d, r, touch={"T": (44, 53)})
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
+                         [("o1", 45)])
 
     def test_count_within_tolerance_kept(self):
         d = [imm.Quote("T", "bid", 45, 30)]
         r = [_resting("o1", "T", "bid", 45, 25)]     # |25-30|=5 <= 6: keep
-        place, cancel = self._diff(d, r)
-        self.assertEqual((place, cancel), ([], []))
+        place, cancel, amend = self._diff(d, r)
+        self.assertEqual((place, cancel, amend), ([], [], []))
 
-    def test_count_beyond_tolerance_churned(self):
+    def test_count_beyond_tolerance_amended(self):
         d = [imm.Quote("T", "bid", 45, 30)]
-        r = [_resting("o1", "T", "bid", 45, 20)]     # |20-30|=10 > 6: churn
-        place, cancel = self._diff(d, r)
-        self.assertEqual(cancel, ["o1"])
+        r = [_resting("o1", "T", "bid", 45, 20)]     # |20-30|=10 > 6: amend
+        place, cancel, amend = self._diff(d, r)
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([(o["order_id"], q.count) for o, q in amend],
+                         [("o1", 30)])
 
     def test_ask_side_direction(self):
         d = [imm.Quote("T", "ask", 55, 30)]
         r_ok = [_resting("o1", "T", "ask", 56, 30)]   # behind (higher): keep
-        self.assertEqual(self._diff(d, r_ok), ([], []))
-        r_bad = [_resting("o2", "T", "ask", 54, 30)]  # aggressive: churn
-        place, cancel = self._diff(d, r_bad)
-        self.assertEqual(cancel, ["o2"])
+        self.assertEqual(self._diff(d, r_ok), ([], [], []))
+        r_ag = [_resting("o2", "T", "ask", 54, 30)]   # aggressive, no touch
+        place, cancel, amend = self._diff(d, r_ag)
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([o["order_id"] for o, _q in amend], ["o2"])
+        # aggressive ask still at/above the touch: keep
+        self.assertEqual(self._diff(d, r_ag, touch={"T": (50, 54)}),
+                         ([], [], []))
 
-    def test_temp_zero_tol_reprices_on_any_drift(self):
+    def test_stale_ttl_still_cancel_places(self):
+        # amend cannot extend the exchange-side expiration -> TTL-stale
+        # orders keep the cancel + fresh-place path.
+        now = time.time()
+        d = [imm.Quote("T", "bid", 45, 30)]
+        r = [_resting("o1", "T", "bid", 44, 30)]      # would otherwise keep
+        place, cancel, amend = imm.diff_orders(
+            d, r, {"o1": now - imm.ORDER_REFRESH_SECS - 1}, now)
+        self.assertEqual(cancel, ["o1"])
+        self.assertEqual(amend, [])
+        self.assertEqual([(q.price_cents, q.count) for q in place], [(45, 30)])
+
+    def test_temp_zero_tol_amends_on_any_drift(self):
         # Jack 2026-08-02: KXTEMP hysteresis is 0 — a rung even 1 tick behind
-        # desired is churned to the new reference (hourly books gap on METAR
-        # updates and a tick behind ref earns half weight); other series keep
-        # the global 1-tick tolerance (test_one_tick_behind_kept above).
+        # desired reprices on the next tick; with the amend path that is an
+        # in-place amend, not a cancel+place gap.
         t = "KXTEMPDCH-26AUG0210-T80.99"
         d = [imm.Quote(t, "bid", 45, 30)]
         r = [_resting("o1", t, "bid", 44, 30)]
-        place, cancel = self._diff(d, r)
-        self.assertEqual(cancel, ["o1"])
-        self.assertEqual([(q.price_cents, q.count) for q in place], [(45, 30)])
+        place, cancel, amend = self._diff(d, r)
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
+                         [("o1", 45)])
 
     def test_series_atref_tol_helper(self):
         self.assertEqual(imm.series_atref_price_tol("KXTEMPDCH"), 0)
@@ -590,14 +630,14 @@ class TestDiffOrders(unittest.TestCase):
     def test_exact_match_kept(self):
         now = time.time()
         resting = [_resting("a", "T", "bid", 49, 5.0)]
-        place, cancel = diff_orders([Quote("T", "bid", 49, 5)], resting,
+        place, cancel, _ = diff_orders([Quote("T", "bid", 49, 5)], resting,
                                     {"a": now - 60}, now)
         self.assertEqual((place, cancel), ([], []))
 
     def test_price_drift_replaced(self):
         now = time.time()
         resting = [_resting("a", "T", "bid", 48, 5.0)]
-        place, cancel = diff_orders([Quote("T", "bid", 49, 5)], resting,
+        place, cancel, _ = diff_orders([Quote("T", "bid", 49, 5)], resting,
                                     {"a": now - 60}, now)
         self.assertEqual(cancel, ["a"])
         self.assertEqual(place, [Quote("T", "bid", 49, 5)])
@@ -605,14 +645,14 @@ class TestDiffOrders(unittest.TestCase):
     def test_partial_fill_replaced(self):
         now = time.time()
         resting = [_resting("a", "T", "bid", 49, 3.0)]   # was 5, partially filled
-        place, cancel = diff_orders([Quote("T", "bid", 49, 5)], resting,
+        place, cancel, _ = diff_orders([Quote("T", "bid", 49, 5)], resting,
                                     {"a": now - 60}, now)
         self.assertEqual(cancel, ["a"])
 
     def test_ttl_stale_replaced(self):
         now = time.time()
         resting = [_resting("a", "T", "bid", 49, 5.0)]
-        place, cancel = diff_orders([Quote("T", "bid", 49, 5)], resting,
+        place, cancel, _ = diff_orders([Quote("T", "bid", 49, 5)], resting,
                                     {"a": now - imm.ORDER_REFRESH_SECS - 1}, now)
         self.assertEqual(cancel, ["a"])
         self.assertEqual(len(place), 1)
@@ -620,19 +660,19 @@ class TestDiffOrders(unittest.TestCase):
     def test_undesired_cancelled(self):
         now = time.time()
         resting = [_resting("a", "T", "bid", 49, 5.0)]
-        place, cancel = diff_orders([], resting, {"a": now}, now)
+        place, cancel, _ = diff_orders([], resting, {"a": now}, now)
         self.assertEqual(cancel, ["a"])
 
     def test_blind_preserved(self):
         now = time.time()
         resting = [_resting("a", "T", "bid", 40, 5.0)]
-        place, cancel = diff_orders([Quote("T", "bid", 49, 5)], resting,
+        place, cancel, _ = diff_orders([Quote("T", "bid", 49, 5)], resting,
                                     {"a": now}, now, preserve_tickers={"T"})
         self.assertEqual((place, cancel), ([], []))
 
     def test_unparseable_cancelled(self):
         now = time.time()
-        place, cancel = diff_orders([], [{"order_id": "x", "ticker": "T"}], {}, now)
+        place, cancel, _ = diff_orders([], [{"order_id": "x", "ticker": "T"}], {}, now)
         self.assertEqual(cancel, ["x"])
 
 
@@ -1200,6 +1240,20 @@ class TestDryRunCycle(unittest.TestCase):
     def test_fast_lane_membership(self):
         self.assertTrue(imm.series_fast_lane("KXTEMPDCH"))
         self.assertFalse(imm.series_fast_lane("KXGOOD"))
+
+    def test_dry_amend_updates_sim_order(self):
+        # amend executor (2026-08-02): dry mode mutates the sim order in
+        # place — same id, new price/size — mirroring the live V2 amend.
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(bot.state.sim_orders)
+        oid, so = next(iter(bot.state.sim_orders.items()))
+        q = imm.Quote(so["ticker"], so["book_side"], 33, 7)
+        self.assertTrue(bot.amend_order_inplace(
+            dict(so, order_id=oid), q, time.time()))
+        self.assertEqual(bot.state.sim_orders[oid]["yes_price"], 33)
+        self.assertEqual(bot.state.sim_orders[oid]["remaining_count"], 7.0)
+        self.assertIn(oid, bot.state.sim_orders)      # same id survives
 
     def test_selection_and_quotes(self):
         bot = self._bot()

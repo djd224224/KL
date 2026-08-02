@@ -1840,21 +1840,32 @@ def skewed_side_room(base_room: float, pos: float, accumulating: bool,
 
 def diff_orders(desired: List[Quote], resting: List[dict],
                 order_ages: Dict[str, float], now_ts: float,
-                preserve_tickers: Set[str] = frozenset()) -> Tuple[List[Quote], List[str]]:
-    """Match desired quotes to resting orders — exact (price and remaining
-    size) in offsets mode: reward credit halves per tick behind the touch
-    there, and a stale at-best order whose anchor faded would be leading the
-    book. In atref mode (2026-08-02) matching gets HYSTERESIS: everything at
-    or above the reference earns identical full weight, so a rung within
-    ATREF_PRICE_TOL ticks of desired (never IMPROVING the desired price —
-    the rung must stay at/behind it, at/above the ref) and within
-    ATREF_COUNT_TOL_FRAC of desired size is kept instead of churned — touch
-    and reference wiggles were cancel+replacing whole 20-40 lot rungs every
-    cycle. TTL/refresh still rewrites everything periodically, bounding
-    drift. Stale-by-TTL orders are replaced. Orders on preserve_tickers
-    (blind markets) are left untouched."""
+                preserve_tickers: Set[str] = frozenset(),
+                touch_by_ticker: Optional[Dict[str, Tuple[Optional[int],
+                                                          Optional[int]]]] = None,
+                ) -> Tuple[List[Quote], List[str], List[Tuple[dict, Quote]]]:
+    """Match desired quotes to resting orders. Three-way result
+    (to_place, to_cancel, to_amend) since 2026-08-02:
+
+    - exact/tolerance match (offsets: exact; atref: per-series hysteresis,
+      never MORE aggressive than desired) -> keep untouched.
+    - ASYMMETRIC CHASE (atref): a rung MORE aggressive than desired means
+      the reference moved DEEPER — under amended-rules scoring everything
+      at/above the reference earns identical full weight, so repricing buys
+      zero reward and costs a book gap. Keep it while it is not leading the
+      current touch (touch_by_ticker); without touch data fall through
+      (strict behavior). TTL refresh still rewrites it eventually.
+    - AMEND (atref rungs + pad resizes): a fresh rung on the right
+      ticker+side whose price/size drifted the wrong way is amended IN
+      PLACE (V2 endpoint, same order_id) instead of cancel+placed — the
+      requote-downtime fix: the rung never leaves the book.
+    - stale-by-TTL (ORDER_REFRESH_SECS) -> cancel + fresh place (amend
+      cannot extend the exchange-side expiration).
+    Orders on preserve_tickers (blind/fast-lane-skipped markets) are left
+    untouched."""
     to_place: List[Quote] = []
     to_cancel: List[str] = []
+    to_amend: List[Tuple[dict, Quote]] = []
     unmatched = list(desired)
 
     def matches(q: Quote, ticker: str, book_side: str, px: int,
@@ -1865,8 +1876,8 @@ def diff_orders(desired: List[Quote], resting: List[dict],
             # per-series hysteresis (KXTEMP runs 0 — reprice on any ref move)
             if abs(px - q.price_cents) > series_atref_price_tol(series_of(q.ticker)):
                 return False
-            # never keep a rung MORE aggressive than desired: for bids that
-            # is a higher price, for asks a lower one (crossing/fill risk)
+            # never keep a rung MORE aggressive than desired via the plain
+            # match — the asymmetric-chase check below owns that case
             if q.book_side == "bid" and px > q.price_cents:
                 return False
             if q.book_side == "ask" and px < q.price_cents:
@@ -1874,6 +1885,30 @@ def diff_orders(desired: List[Quote], resting: List[dict],
             tol = max(1.0, ATREF_COUNT_TOL_FRAC * q.count)
             return abs(remaining - q.count) <= tol
         return q.price_cents == px and round(remaining) == q.count
+
+    def aggressive_keep(q: Quote, ticker: str, book_side: str, px: int,
+                        remaining: float) -> bool:
+        if q.ticker != ticker or q.book_side != book_side:
+            return False
+        if LADDER_MODE != "atref" or getattr(q, "is_pad", False):
+            return False
+        if touch_by_ticker is None:
+            return False
+        tol = max(1.0, ATREF_COUNT_TOL_FRAC * q.count)
+        if abs(remaining - q.count) > tol:
+            return False               # size drifted too: reprice properly
+        tb, ta = touch_by_ticker.get(ticker, (None, None))
+        if book_side == "bid":
+            return px > q.price_cents and tb is not None and px <= tb
+        return px < q.price_cents and ta is not None and px >= ta
+
+    def amendable(q: Quote, ticker: str, book_side: str,
+                  rest_is_pad: bool) -> bool:
+        if q.ticker != ticker or q.book_side != book_side:
+            return False
+        if getattr(q, "is_pad", False) != rest_is_pad:
+            return False               # rungs amend rungs; pads amend pads
+        return LADDER_MODE == "atref" or rest_is_pad
 
     for o in resting:
         oid = o.get("order_id", "")
@@ -1888,16 +1923,31 @@ def diff_orders(desired: List[Quote], resting: List[dict],
         remaining = order_remaining(o)
         age = now_ts - order_ages.get(oid, now_ts)
         stale = age > ORDER_REFRESH_SECS
+        tk = o.get("ticker")
         match = next((q for q in unmatched
-                      if matches(q, o.get("ticker"), book_side, px, remaining)),
-                     None)
+                      if matches(q, tk, book_side, px, remaining)), None)
         if match is not None and not stale:
             unmatched.remove(match)
-        else:
-            to_cancel.append(oid)
+            continue
+        if not stale:
+            keep = next((q for q in unmatched
+                         if aggressive_keep(q, tk, book_side, px, remaining)),
+                        None)
+            if keep is not None:
+                unmatched.remove(keep)
+                continue
+            rest_is_pad = (book_side == "bid" and px <= PAD_BID_CENTS) or \
+                          (book_side == "ask" and px >= PAD_ASK_CENTS)
+            am = next((q for q in unmatched
+                       if amendable(q, tk, book_side, rest_is_pad)), None)
+            if am is not None:
+                unmatched.remove(am)
+                to_amend.append((o, am))
+                continue
+        to_cancel.append(oid)
 
     to_place.extend(q for q in unmatched if q.ticker not in preserve_tickers)
-    return to_place, to_cancel
+    return to_place, to_cancel, to_amend
 
 
 def ladder_collateral_dollars(bid_anchor: Optional[int], ask_anchor: Optional[int],
@@ -2444,6 +2494,57 @@ class IncentiveMarketMaker:
             return False
         except Exception as e:
             log(f"{self.tag} ! cancel failed {order_id}: {e}")
+            return False
+
+    def amend_order_inplace(self, o: dict, q: Quote, now_ts: float) -> bool:
+        """Reprice/resize a resting order IN PLACE (V2 amend, 2026-08-02
+        requote-downtime fix): the rung never leaves the book — no
+        cancel->place gap — and the order_id survives, so ownership/fill
+        matching and the crash journal need nothing new. V2 count semantics:
+        total max-fillable = already-filled + desired remainder. Amend has
+        no post_only; desired prices are already clamped to the last-read
+        opposite touch upstream (a fast race can still take; accepted).
+        order_ages is deliberately NOT touched: amend cannot extend the
+        exchange-side expiration, so the 25-min TTL refresh must still
+        rewrite the order for real."""
+        self._heartbeat = time.time()
+        oid = o.get("order_id", "")
+        try:
+            filled = float(o.get("fill_count_fp") or o.get("fill_count") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        total = float(q.count) + max(0.0, filled)
+        label = (f"{q.ticker} {q.book_side.upper():4s} -> {q.count}x @ "
+                 f"{q.price_cents}c (amend {oid[:8]})")
+        if not self.live:
+            so = self.state.sim_orders.get(oid)
+            if so is None:
+                return False
+            so["yes_price"] = q.price_cents
+            so["remaining_count"] = float(q.count)
+            log(f"{self.tag} [DRY] amend {label}")
+            return True
+        try:
+            self.client.amend_order(
+                order_id=oid, ticker=q.ticker, book_side=q.book_side,
+                yes_price_cents=q.price_cents, total_count=total)
+            led = self.state.ledger.get(oid)
+            if led is not None:
+                led["yes_price"] = q.price_cents
+                led["remaining_count"] = float(q.count)
+            log(f"{self.tag} amended {label}")
+            return True
+        except HttpError as e:
+            if e.status in (404, 409):
+                # Order died mid-flight (filled/expired/cancelled): forget it;
+                # the next cycle's diff places fresh.
+                self.state.order_ages.pop(oid, None)
+                self.state.ledger.pop(oid, None)
+                return False
+            log(f"{self.tag} ! amend failed {label}: {e}")
+            return False
+        except Exception as e:
+            log(f"{self.tag} ! amend failed {label}: {e}")
             return False
 
     def _get_resting_orders_global(self) -> List[dict]:
@@ -3614,6 +3715,9 @@ class IncentiveMarketMaker:
         desired: List[Quote] = []
         blind: Set[str] = set()
         marked: Set[str] = set()          # tickers marked from live books this cycle
+        # per-market external touch this cycle — the asymmetric-chase bound
+        # in diff_orders (keep aggressive-drifted rungs while not leading)
+        touch_map: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
         cycle_rows: List[str] = []        # cycle-logger panel (η/J calibration data)
         reward_frac_sum = 0.0
         cycle_rate: Dict[str, float] = {}   # ticker -> live est $/day this cycle
@@ -3762,6 +3866,7 @@ class IncentiveMarketMaker:
             # anchor away from the true external best cycle after cycle.
             own_in_book = own if self.live else []
             ext_bid, ext_ask = external_best(yes_levels, no_levels, own_in_book)
+            touch_map[t] = (ext_bid, ext_ask)
 
             # A book that WAS two-sided and just lost a side is the classic
             # news signature (everyone pulled their quotes) — the mid-move
@@ -4036,10 +4141,11 @@ class IncentiveMarketMaker:
         preserve = blind if not fast_only else \
             blind | {mt for mt, mm in managed.items()
                      if not series_fast_lane(mm.series)}
-        to_place, to_cancel = diff_orders(desired, resting, self.state.order_ages,
-                                          now_ts, preserve_tickers=preserve)
+        to_place, to_cancel, to_amend = diff_orders(
+            desired, resting, self.state.order_ages, now_ts,
+            preserve_tickers=preserve, touch_by_ticker=touch_map)
         log(f"{self.tag} {quoted}/{len(managed)} mkts quoted, {len(resting)} resting, "
-            f"{len(to_cancel)} cancel, {len(to_place)} place, "
+            f"{len(to_amend)} amend, {len(to_cancel)} cancel, {len(to_place)} place, "
             f"est ${reward_frac_sum:.2f}/day reward share, P&L today ${pnl_today:+.2f} "
             f"(real {realized:+.2f}/unreal {unrealized:+.2f}) "
             f"{'[fast] ' if fast_only else ''}{'' if self.live else '[DRY RUN]'}")
@@ -4060,6 +4166,14 @@ class IncentiveMarketMaker:
                     f"API?)", key="watchdog")
         else:
             self.state.watchdog_streak = 0
+
+        # Amends FIRST (they're the urgent repricing and never free/consume
+        # cap room), then cancels, then fresh placements.
+        for o_am, q_am in to_amend[:MAX_PLACEMENTS_PER_CYCLE]:
+            self.amend_order_inplace(o_am, q_am, now_ts)
+        if len(to_amend) > MAX_PLACEMENTS_PER_CYCLE:
+            log(f"{self.tag} amend cap: {len(to_amend) - MAX_PLACEMENTS_PER_CYCLE} "
+                f"deferred to next cycle")
 
         cancel_failures = 0
         cancelled_ids: Set[str] = set()

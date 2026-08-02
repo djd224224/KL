@@ -482,6 +482,35 @@ class ExchangeClient(KalshiClient):
         result = self.delete(path=self.events_orders_url + '/' + order_id)
         return result
 
+    def amend_order(self, order_id:str, ticker:str, book_side:str,
+                    yes_price_cents:int, total_count:float,
+                    client_order_id:Optional[str]=None,
+                    updated_client_order_id:Optional[str]=None):
+        """V2 amend (docs: POST /portfolio/events/orders/{id}/amend, added
+        for the 2026-08-02 requote-downtime fix): update a resting order's
+        price and/or max-fillable count IN PLACE. The order KEEPS its
+        order_id (ownership/fill matching unaffected). V2 count semantics:
+        `total_count` = already-filled + desired resting remainder. Side and
+        ticker cannot change; expiration_time cannot be extended; there is
+        NO post_only on amend, so callers must never price through the
+        opposite touch (a fast race can still take — bounded upstream by
+        the join clamp). Queue position is forfeited on price changes
+        (irrelevant for pro-rata reward scoring)."""
+        body = {
+            'ticker': ticker,
+            'side': book_side,                        # 'bid' / 'ask'
+            'price': self._cents_to_dollar_str(yes_price_cents),
+            'count': f"{float(total_count):.2f}",
+        }
+        if client_order_id is not None:
+            body['client_order_id'] = client_order_id
+        if updated_client_order_id is not None:
+            body['updated_client_order_id'] = updated_client_order_id
+        print(f"[amend_order->V2] {order_id} {body}")
+        result = self.post(path=self.events_orders_url + '/' + order_id + '/amend',
+                           body=json.dumps(body))
+        return self._wrap_v2_order_response(result)
+
     def batch_cancel_orders(self, order_ids:list):
         """Cancel multiple orders. The V2 batch-cancel endpoint requires a
         request body, which the base delete() cannot send; since no bot uses
