@@ -355,30 +355,30 @@ class TestAtRefLadder(unittest.TestCase):
     def test_bid_collapses_to_ref(self):
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=45)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(45, 45)])  # depth 5 -> 1.5x
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(45, 68)])  # depth 5 -> 2.25x
 
     def test_bid_ref_below_band_allowed(self):
         # at-ref rungs are band-exempt (Jack 2026-08-01): a 2c reference
         # rests at 2c, not pinned to the 5c series floor
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=2)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(2, 60)])   # 2x cap
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(2, 90)])   # 3x cap
 
     def test_ask_ref_above_band_allowed(self):
         qs = build_side_ladder("T", "ask", 50, 45, room=99,
                                levels=[(0, 30)], ref_px=95)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(95, 60)])  # 2x cap
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(95, 90)])  # 3x cap
 
     def test_ref_absolute_bounds(self):
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=0)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(1, 60)])   # 2x cap
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(1, 90)])   # 3x cap
 
     def test_ask_collapses_to_ref(self):
         # ask side price space = YES-ask cents; deeper = higher
         qs = build_side_ladder("T", "ask", 50, 45, room=99,
                                levels=[(0, 30)], ref_px=58)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(58, 54)])  # depth 8 -> 1.8x
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(58, 90)])  # depth 8 -> 3x cap
 
     def test_ref_never_improves_anchor(self):
         # reference above the anchor (tight book): stay at the anchor join
@@ -389,7 +389,7 @@ class TestAtRefLadder(unittest.TestCase):
     def test_multi_rung_levels_sum(self):
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 5), (1, 10), (2, 20)], ref_px=47)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(47, 46)])  # 35 x 1.3
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(47, 61)])  # 35 x 1.75
 
     def test_room_still_shaves(self):
         qs = build_side_ladder("T", "bid", 50, 55, room=12,
@@ -409,38 +409,39 @@ class TestAtRefLadder(unittest.TestCase):
         self.assertEqual([(q.price_cents, q.count) for q in qs], [(50, 5)])
 
     def test_deep_ref_scales_size(self):
-        # Jack 2026-08-01: +10%/tick of reference depth, capped 2x.
-        # depth 5 -> 1.5x: 30 -> 45
+        # 2026-08-02 sim-confirmed curve: +25%/tick, capped 3x.
+        # depth 5 -> 2.25x: 30 -> 68
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=45)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(45, 45)])
-        # depth 10 -> capped 2.0x: 30 -> 60
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(45, 68)])
+        # depth 10 -> capped 3.0x: 30 -> 90
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=40)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(40, 60)])
-        # depth 20 -> still 2.0x
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(40, 90)])
+        # depth 20 -> still 3.0x
         qs = build_side_ladder("T", "bid", 50, 55, room=200,
                                levels=[(0, 30)], ref_px=30)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(30, 60)])
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(30, 90)])
         # at the touch (ref >= anchor): 1.0x
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=50)
         self.assertEqual([(q.price_cents, q.count) for q in qs], [(50, 30)])
-        # ask side: depth = ref above anchor; depth 5 -> 45
+        # ask side: depth = ref above anchor; depth 5 -> 2.25x -> 68
         qs = build_side_ladder("T", "ask", 50, 45, room=99,
                                levels=[(0, 30)], ref_px=55)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(55, 45)])
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(55, 68)])
         # room still caps the scaled size
         qs = build_side_ladder("T", "bid", 50, 55, room=50,
                                levels=[(0, 30)], ref_px=40)
         self.assertEqual([(q.price_cents, q.count) for q in qs], [(40, 50)])
 
     def test_ref_depth_mult_direct(self):
+        # 2026-08-02 sim-confirmed curve: 0.25/tick, cap 3.0 (was 0.1/2.0)
         imm.LADDER_MODE = "atref"
-        self.assertEqual(imm.ref_depth_mult(50, 45, "bid"), 1.5)
-        self.assertEqual(imm.ref_depth_mult(50, 40, "bid"), 2.0)
+        self.assertEqual(imm.ref_depth_mult(50, 45, "bid"), 2.25)
+        self.assertEqual(imm.ref_depth_mult(50, 40, "bid"), 3.0)
         self.assertEqual(imm.ref_depth_mult(50, 50, "bid"), 1.0)
-        self.assertEqual(imm.ref_depth_mult(50, 55, "ask"), 1.5)
+        self.assertEqual(imm.ref_depth_mult(50, 55, "ask"), 2.25)
         self.assertEqual(imm.ref_depth_mult(None, 45, "bid"), 1.0)
         self.assertEqual(imm.ref_depth_mult(50, None, "bid"), 1.0)
         imm.LADDER_MODE = "offsets"
@@ -533,6 +534,22 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
         d = [imm.Quote("T", "bid", 45, 30)]
         r = [_resting("o1", "T", "bid", 46, 30)]
         out = self._diff(d, r, touch={"T": (47, 53)})
+        self.assertEqual(out, ([], [], []))
+
+    def test_aggressive_keep_respects_safe_join_net(self):
+        # Safe-join series: the kept rung must stay >= 2 ticks off a tight
+        # touch (live audit: a gas bid ended 1 tick off after the book
+        # drifted). Inside the net -> amend back to desired.
+        t = "KXAAAGASD-26AUG03-4.090"       # safe-join series
+        d = [imm.Quote(t, "bid", 68, 30)]
+        r = [_resting("o1", t, "bid", 69, 30)]
+        # tight spread (70/74): 69 is only 1 off the 70 touch -> amend
+        place, cancel, amend = self._diff(d, r, touch={t: (70, 74)})
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
+                         [("o1", 68)])
+        # wide spread (70/76): the spread IS the net -> keep
+        out = self._diff(d, r, touch={t: (70, 76)})
         self.assertEqual(out, ([], [], []))
 
     def test_aggressive_leading_book_amended(self):

@@ -133,14 +133,19 @@ SIDE_MAX_CONTRACTS = sum(s for _t, s in LEVELS)      # 35 with the default spec
 #             reference (too thin) — there, position IS the touch anyway.
 LADDER_MODE = os.environ.get("IMM_LADDER_MODE", "offsets").strip().lower()
 # Deep-reference size multiplier (Jack 2026-08-01: "the deeper the reference
-# point, the larger contract size can be placed, up to 2x — it's much
-# safer"): an at-ref rung N ticks behind the touch only fills after the
-# market eats the whole band above it, so it carries more size for the same
-# fill risk. 1.0 at the touch, +SLOPE per tick of depth, capped at MAX_MULT
-# (defaults: 2.0x reached 10 ticks back). Scales the atref rung AND the
-# side_max room component; position/event caps and skew still bind on top.
-REF_DEPTH_SLOPE = _env_float("IMM_REF_DEPTH_SLOPE", 0.1)
-REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 2.0)
+# point, the larger contract size can be placed — it's much safer"): an
+# at-ref rung N ticks behind the touch only fills after the market eats the
+# whole band above it, so it carries more size for the same fill risk.
+# 1.0 at the touch, +SLOPE per tick of depth, capped at MAX_MULT. Scales the
+# atref rung AND the side_max room component; position/event caps and skew
+# still bind on top. 0.1/2.0 -> 0.25/3.0 (Jack 2026-08-02 "raise the cap...
+# run it through the sim first"): ref_cap_sim on 120 live books — deeper
+# curves IMPROVE est-per-unit-fill-risk in every engaged bucket (4-5 ticks:
+# 0.104 -> 0.124; 6+ ticks: 1.62 -> 2.21, est $223 -> $318/day on 13 books
+# at +4% risk-load). The 0.40/4.0 curve tested even better (2.70, $406/day)
+# — step there via env after a day of live fill data.
+REF_DEPTH_SLOPE = _env_float("IMM_REF_DEPTH_SLOPE", 0.25)
+REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 3.0)
 # Requote hysteresis for atref rungs (2026-08-02 audit): full weight is flat
 # across the band, so churn on 1-tick touch/ref wiggles buys nothing.
 ATREF_PRICE_TOL_TICKS = _env_int("IMM_ATREF_PRICE_TOL", 1)
@@ -1902,9 +1907,18 @@ def diff_orders(desired: List[Quote], resting: List[dict],
         if abs(remaining - q.count) > tol:
             return False               # size drifted too: reprice properly
         tb, ta = touch_by_ticker.get(ticker, (None, None))
+        # safe-join series keep their safety net CONTINUOUSLY: when the book
+        # drifts toward a kept rung on a tight spread, the rung must stay
+        # >= OFFSET ticks off the touch or be repriced (live audit 2026-08-02:
+        # a gas bid ended 1 tick off after the touch dropped).
+        bound_b, bound_a = tb, ta
+        if series_safe_join(series_of(ticker)) and tb is not None and ta is not None \
+                and (ta - tb) < SAFE_JOIN_MIN_SPREAD:
+            bound_b = tb - SAFE_JOIN_OFFSET_TICKS
+            bound_a = ta + SAFE_JOIN_OFFSET_TICKS
         if book_side == "bid":
-            return px > q.price_cents and tb is not None and px <= tb
-        return px < q.price_cents and ta is not None and px >= ta
+            return px > q.price_cents and bound_b is not None and px <= bound_b
+        return px < q.price_cents and bound_a is not None and px >= bound_a
 
     def amendable(q: Quote, ticker: str, book_side: str,
                   rest_is_pad: bool) -> bool:
