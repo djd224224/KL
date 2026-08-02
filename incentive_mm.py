@@ -497,6 +497,16 @@ def series_min_hours_to_close(series: str) -> float:
         else MIN_HOURS_TO_CLOSE
 
 
+def member_price_band(series: str, is_member: bool) -> Tuple[int, int]:
+    """Effective quoting band: the series band for fresh placement, widened
+    to STICKY_PRICE_MIN/MAX (2-98) for markets already quoting — sticky
+    accrual rides to the extremes instead of standing down at 5/90."""
+    lo, hi = series_price_min(series), series_price_max(series)
+    if is_member:
+        lo, hi = min(lo, STICKY_PRICE_MIN), max(hi, STICKY_PRICE_MAX)
+    return lo, hi
+
+
 def series_min_est_total(series: str) -> float:
     """Per-series min-payout entry/hopeless floor, else the global
     MIN_EST_TOTAL_DOLLARS (read at call time so env/test patches apply)."""
@@ -587,6 +597,14 @@ ORDER_REFRESH_SECS = _env_int("IMM_ORDER_REFRESH_SECS", 420)
 # the bot doesn't select markets it would never quote.
 PRICE_MIN_CENTS = _env_int("IMM_PRICE_MIN_CENTS", 5)    # never quote below (bid side)
 PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 90)   # never quote above (ask side)
+# Sticky-member band (Jack 2026-08-02 "when sticky quoting, allow quotes to
+# go up to 2-98"): a market ALREADY quoting rides its accrual toward the
+# extremes instead of standing down at the series band — entry screens
+# (extreme_mid 5-90) and fresh placement keep the tight band; only members
+# widen. Top-in-band, the side gates and the rung clamps all consume this
+# via member_price_band().
+STICKY_PRICE_MIN = _env_int("IMM_STICKY_PRICE_MIN", 2)
+STICKY_PRICE_MAX = _env_int("IMM_STICKY_PRICE_MAX", 98)
 MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 5)            # skip markets with mid outside
 MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 90)
 # Wide screen effectively OFF (Jack 2026-07-23: 25->99): incentives are earned
@@ -1750,7 +1768,8 @@ class Quote:
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
                       opposite_best: Optional[int], room: float,
                       levels: Optional[List[Tuple[int, int]]] = None,
-                      ref_px: Optional[int] = None) -> List[Quote]:
+                      ref_px: Optional[int] = None,
+                      band: Optional[Tuple[int, int]] = None) -> List[Quote]:
     """Ladder behind (never improving) the join anchor. `anchor` is the best
     EXTERNAL price on our side; `opposite_best` the best external price on the
     other side (post-only: never cross it). Sizes come from `levels` (the
@@ -1783,7 +1802,10 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
         if spread is None or spread < SAFE_JOIN_MIN_SPREAD:
             safe_cap = (max(anchor - SAFE_JOIN_OFFSET_TICKS, 1) if book_side == "bid"
                         else min(anchor + SAFE_JOIN_OFFSET_TICKS, 99))
-    pmin, pmax = series_price_min(series_of(ticker)), series_price_max(series_of(ticker))
+    # `band` (2026-08-02): caller-supplied effective band — the quote loop
+    # passes the member-widened 2-98 for sticky markets; default = series.
+    pmin, pmax = band if band is not None else (
+        series_price_min(series_of(ticker)), series_price_max(series_of(ticker)))
     if LADDER_MODE == "atref" and ref_px is not None:
         # Reference placement is EXEMPT from the series price band (Jack
         # 2026-08-01: "don't arbitrarily constrain to 5c... when it makes
@@ -3939,8 +3961,10 @@ class IncentiveMarketMaker:
             # the same knife the band exists to dodge. Sticky keeps such a
             # market SELECTED (costless), so quoting resumes if the book
             # returns to the band.
-            pmin_s = series_price_min(series_of(t))
-            pmax_s = series_price_max(series_of(t))
+            # Members ride to 2-98 (Jack 2026-08-02); fresh keeps the series
+            # band. member_price_band widens only for markets already quoting.
+            pmin_s, pmax_s = member_price_band(
+                series_of(t), t in self.state.selected)
             if ((ext_bid is not None and not pmin_s <= ext_bid <= pmax_s)
                     or (ext_ask is not None and not pmin_s <= ext_ask <= pmax_s)):
                 self.cancel_market_orders(t, resting)
@@ -4035,19 +4059,22 @@ class IncentiveMarketMaker:
 
             mq: List[Quote] = []
             # atref: placement no longer follows the touch, so a touch
-            # outside the band must not kill the side (see build_side_ladder)
+            # outside the band must not kill the side (see build_side_ladder).
+            # pmin_s/pmax_s carry the member-widened band (2-98 for sticky).
             if ext_bid is not None and room_buy > 0:
                 px_ok = (LADDER_MODE == "atref" and ref_bid_px is not None) \
-                    or ext_bid >= series_price_min(meta.series)
+                    or ext_bid >= pmin_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
-                                                levels=lv, ref_px=ref_bid_px))
+                                                levels=lv, ref_px=ref_bid_px,
+                                                band=(pmin_s, pmax_s)))
             if ext_ask is not None and room_sell > 0:
                 px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
-                    or ext_ask <= series_price_max(meta.series)
+                    or ext_ask <= pmax_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
-                                                levels=lv, ref_px=ref_ask_px))
+                                                levels=lv, ref_px=ref_ask_px,
+                                                band=(pmin_s, pmax_s)))
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c

@@ -1262,6 +1262,27 @@ class TestDryRunCycle(unittest.TestCase):
         self.assertTrue(imm.series_fast_lane("KXTEMPDCH"))
         self.assertFalse(imm.series_fast_lane("KXGOOD"))
 
+    def test_member_price_band(self):
+        # Jack 2026-08-02: sticky members quote to 2-98; fresh keeps series.
+        self.assertEqual(imm.member_price_band("KXGOOD", False), (5, 90))
+        self.assertEqual(imm.member_price_band("KXGOOD", True), (2, 98))
+        self.assertEqual(imm.member_price_band("KXTEMPDCH", True), (2, 98))
+
+    def test_sticky_member_rides_to_extreme_band(self):
+        # Select at a normal book, then gap it to 3c/4c: the member keeps
+        # quoting (band 2-98) where the old top-in-band rule stood it down.
+        bot = self._bot()
+        t = "KXGOOD-99DEC31-A"
+        bot.run_cycle()
+        self.assertIn(t, bot.state.selected)
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.03", "500"]],
+            "no_dollars": [["0.96", "500"]]}}       # touch 3c / 4c
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertTrue(any(o["ticker"] == t
+                            for o in bot.state.sim_orders.values()))
+
     def test_pad_missing_side_for_members(self):
         # Coverage-leak fix (2026-08-02): quoting only an ask rung still pads
         # the BID side to target for members — a one-sided-qualified snapshot
@@ -1963,8 +1984,10 @@ class TestTempSeriesTuning(unittest.TestCase):
 
     def test_out_of_band_top_stands_aside_entirely(self):
         # Jack 2026-07-21: if the TOP of book is outside the band, no quotes
-        # at all — not even the in-band side. (Global band 1-95 here: top at
-        # 96x98 is out; the sticky selection keeps the market, orders don't.)
+        # at all — not even the in-band side. 2026-08-02: MEMBERS ride to the
+        # sticky 2-98 band, so the stand-down boundary for a selected market
+        # moved from 90 to 98 — a 96x98 top now keeps quoting; a 99c top
+        # (beyond even the sticky band) still stands the market down.
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         bot.run_cycle()
@@ -1976,7 +1999,15 @@ class TestTempSeriesTuning(unittest.TestCase):
         bot.client.markets[t]["yes_ask_dollars"] = "0.9800"
         bot.state.universe_at = time.time()      # no refresh: quote loop only
         bot.run_cycle()
-        self.assertEqual(bot.state.sim_orders, {})   # cancelled, standing aside
+        self.assertTrue(any(o["ticker"] == t                 # member: rides
+                            for o in bot.state.sim_orders.values()))
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.99", "500"]], "no_dollars": [["0.005", "1200"]]}}
+        bot.client.markets[t]["yes_bid_dollars"] = "0.9900"
+        bot.client.markets[t]["yes_ask_dollars"] = "0.9950"
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertEqual(bot.state.sim_orders, {})   # beyond 98: stands aside
         self.assertIn(t, bot.state.selected)         # but still selected (sticky)
 
     def test_band_is_two_sided(self):
