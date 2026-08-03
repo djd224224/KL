@@ -1299,6 +1299,16 @@ class TestDryRunCycle(unittest.TestCase):
         self.assertTrue(any(o["ticker"] == t
                             for o in bot.state.sim_orders.values()))
 
+    def test_pad_band_gate(self):
+        # Jack 2026-08-02: no pads on markets outside the 5-90 series band —
+        # extreme-mid and one-sided books get no qualification depth.
+        self.assertTrue(imm.pad_band_ok("KXGOOD", 40, 60))     # mid 50
+        self.assertTrue(imm.pad_band_ok("KXGOOD", 5, 9))       # mid 7
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 2, 4))      # mid 3 < 5
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 93, 97))    # mid 95 > 90
+        self.assertFalse(imm.pad_band_ok("KXGOOD", None, 50))  # one-sided
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 50, None))
+
     def test_pad_missing_side_for_members(self):
         # Coverage-leak fix (2026-08-02): quoting only an ask rung still pads
         # the BID side to target for members — a one-sided-qualified snapshot

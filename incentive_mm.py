@@ -381,6 +381,21 @@ def series_pad_to_target(series: str) -> bool:
     return bool(ov and ov.pad_to_target)
 
 
+def pad_band_ok(series: str, ext_bid: Optional[int],
+                ext_ask: Optional[int]) -> bool:
+    """Pads only on markets whose EXTERNAL mid sits inside the SERIES band
+    (5-90) — Jack 2026-08-02 "Do not pad on markets outside of 5-90 range":
+    a 1000+-contract pad on a near-settled extreme is the closest thing to a
+    standing pickoff (98c asks under near-certain YES). One-sided books
+    count as outside. Shared by the quote loop AND the estimator overlay so
+    floors/selection stay honest; the coverage alert exempts markets this
+    gate leaves unpadded."""
+    if ext_bid is None or ext_ask is None:
+        return False
+    mid = (ext_bid + ext_ask) / 2.0
+    return series_price_min(series) <= mid <= series_price_max(series)
+
+
 def pad_quantity(external_and_touch_depth: float, target: float) -> int:
     """Contracts to add at the pad price so the side's total depth reaches the
     reward target PLUS slack headroom (survives external withdrawal between
@@ -3331,7 +3346,8 @@ class IncentiveMarketMaker:
             # the quote loop could ever pad it. Pads stay OUT of n_contracts:
             # yield ranks incentive per near-touch contract; a 1c filler is
             # overhead, not deployed size.
-            if series_pad_to_target(meta.series) and meta.target_size > 0:
+            if series_pad_to_target(meta.series) and meta.target_size > 0 \
+                    and pad_band_ok(meta.series, ext_bid, ext_ask):
                 nt_bid = sum(q.count for q in quotes if q.book_side == "bid")
                 nt_ask = sum(q.count for q in quotes if q.book_side == "ask")
                 # mirror the quote loop's pad_missing_side (coverage-leak
@@ -4119,7 +4135,8 @@ class IncentiveMarketMaker:
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
             # mark so the whole side (and thus our near-touch ladder) qualifies.
-            if series_pad_to_target(meta.series) and meta.target_size > 0:
+            if series_pad_to_target(meta.series) and meta.target_size > 0 \
+                    and pad_band_ok(meta.series, ext_bid, ext_ask):
                 mq.extend(self._pad_quotes(
                     t, mq, yes_levels, no_levels, own, meta.target_size,
                     # coverage-leak fix: rent-earning members pad the rungless
@@ -4157,7 +4174,8 @@ class IncentiveMarketMaker:
             # Coverage alert (2026-08-02): a member quoting into a snapshot
             # that can't count is the worst rent-per-risk state — page after
             # N consecutive FULL cycles (pads should make this ~impossible).
-            if not fast_only and t in self.state.selected and mq:
+            if not fast_only and t in self.state.selected and mq \
+                    and pad_band_ok(meta.series, ext_bid, ext_ask):
                 if sides < 2:
                     streak = self.state.coverage_zero_streak.get(t, 0) + 1
                     self.state.coverage_zero_streak[t] = streak
