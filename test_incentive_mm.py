@@ -2253,10 +2253,11 @@ class TestStickySelection(unittest.TestCase):
             else:
                 imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
 
-    def test_override_event_exempt_from_hopeless(self):
-        # Jack 2026-07-28 (tele-rally, 8/22 quoted): hand-curated override
-        # windows bypass the hopeless/floor veto in BOTH membership states;
-        # ordinary members keep the 7/25 eviction.
+    def test_override_event_no_longer_exempt_from_hopeless(self):
+        # 2026-08-03 (Jack "same rules as other markets", supersedes the
+        # 7/28 tele-rally exemption): an event-start override no longer
+        # shields a member from the hopeless exit — the override is a
+        # cutoff source only.
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = 1e9
@@ -2265,7 +2266,7 @@ class TestStickySelection(unittest.TestCase):
             bot._est_peak.clear()
             bot.state.universe_at = 0.0
             bot.run_cycle()
-            self.assertIn(self.T, bot.state.selected)   # exempt, stays
+            self.assertNotIn(self.T, bot.state.selected)   # evicted like any
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
             imm.EVENT_START_OVERRIDES.pop("KXGOOD-99DEC31", None)
@@ -2484,9 +2485,12 @@ class TestStickySelection(unittest.TestCase):
         self.assertTrue(imm.curated_event("KXRAIN-26JUL30", "KXRAIN", now))
         self.assertFalse(imm.curated_event("KXRAIN-26JUL31", "KXRAIN", now))
         self.assertFalse(imm.curated_event("KXOTHER-26JUL30", "KXOTHER", now))
+        # 2026-08-03 (Jack, TRUMPMENTION AUG03 "same rules as other
+        # markets"): an event-start override supplies the CUTOFF only — it
+        # no longer curates past the floors/hopeless.
         imm.EVENT_START_OVERRIDES["KXFOO-26AUG01"] = now
         try:
-            self.assertTrue(imm.curated_event("KXFOO-26AUG01", "KXFOO", now))
+            self.assertFalse(imm.curated_event("KXFOO-26AUG01", "KXFOO", now))
         finally:
             imm.EVENT_START_OVERRIDES.pop("KXFOO-26AUG01", None)
         # 2026-08-02 (Jack) RE-ENTRY: company/econ freeze + no-new lifted;
@@ -3700,10 +3704,10 @@ class TestHourSizeMult(unittest.TestCase):
         self.addCleanup(lambda: setattr(imm, "MENTION_SIZE_MULT", self._old_mult))
         self.assertAlmostEqual(imm.series_max_position("KXWCMENTION"),
                                imm.MAX_POSITION_CONTRACTS * 1.5)
-        # main TRUMPMENTION: hand-tuned 0:10 (Jack 2026-07-30) -> literal,
-        # mult-exempt like Love Island
-        self.assertEqual(imm.series_levels("KXTRUMPMENTION"), [(0, 10)])
-        self.assertEqual(imm.applied_mention_mult("KXTRUMPMENTION"), 1.0)
+        # main TRUMPMENTION: hand-tuned 0:10 RETIRED 2026-08-03 (Jack "same
+        # rules as other markets") -> global ladder, family mult applies
+        self.assertEqual(imm.series_levels("KXTRUMPMENTION"), imm.LEVELS)
+        self.assertEqual(imm.applied_mention_mult("KXTRUMPMENTION"), 1.5)
         self.assertAlmostEqual(imm.series_max_position("KXGOOD"),
                                imm.MAX_POSITION_CONTRACTS)
         # temp override cap unaffected (not mention)

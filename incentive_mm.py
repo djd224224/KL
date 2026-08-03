@@ -346,7 +346,10 @@ for _s in os.environ.get(
 # contracts — a hand-tuned override ladder, so applied_mention_mult exempts
 # it from the x1.5 that would otherwise make it 15). Quiet-hours mult still
 # applies (3-7am ET doubles, like every non-TEMP ladder).
-_TRUMP_LEVELS_SPEC = os.environ.get("IMM_TRUMPMENTION_LEVELS", "0:10").strip()
+# Hand-tuned 0:10 RETIRED 2026-08-03 (Jack: "it should follow same rules as
+# other markets") — KXTRUMPMENTION runs the global ladder/caps; set
+# IMM_TRUMPMENTION_LEVELS to restore a literal ladder.
+_TRUMP_LEVELS_SPEC = os.environ.get("IMM_TRUMPMENTION_LEVELS", "").strip()
 if _TRUMP_LEVELS_SPEC:
     SERIES_OVERRIDES["KXTRUMPMENTION"] = SeriesOverride(
         levels=_parse_levels(_TRUMP_LEVELS_SPEC))
@@ -1244,16 +1247,15 @@ def rain_fair_exempt(event_ticker: str, now_utc: datetime) -> bool:
 
 
 def curated_event(event_ticker: str, series: str, now_utc: datetime) -> bool:
-    """The hand-curated admission tier (bypasses payout floor + hopeless
-    exit): explicit event-start overrides, PLUS the rolling next-day rain
-    event. The rolling rule originally carried only the fair-gate exemption
-    — 2026-07-29 pm, JUL30-NYC (in-band, quoting all day) was hopeless-
-    evicted mid-afternoon as the shrinking window pushed its projection
-    under $1; Jack's 'quote all in-band next-day rain until midnight'
-    implies the whole curated tier rolls, not just the gate."""
-    return (event_ticker in EVENT_START_OVERRIDES
-            or (series == RAIN_FAIR_SERIES
-                and rain_fair_exempt(event_ticker, now_utc)))
+    """The floor/hopeless-bypass tier. SINCE 2026-08-03 (Jack, TRUMPMENTION
+    AUG03: "it should follow same rules as other markets") this is the
+    rolling next-day rain event ONLY — an event_start_overrides entry now
+    supplies the CUTOFF and nothing else; override events face the same
+    floors, ladders and exits as everything else. (Supersedes the 7/24
+    floor bypass and the 7/28 hopeless exemption for override events; the
+    rain half keeps the 7/29 JUL30-NYC lesson.)"""
+    return (series == RAIN_FAIR_SERIES
+            and rain_fair_exempt(event_ticker, now_utc))
 RAIN_FAIR_TOL_CENTS = _env_int("IMM_RAIN_FAIR_TOL_CENTS", 10)
 RAIN_FAIR_TTL_MIN = _env_int("IMM_RAIN_FAIR_TTL_MIN", 240)
 RAIN_FAIR_REFRESH_MIN = _env_int("IMM_RAIN_FAIR_REFRESH_MIN", 30)
