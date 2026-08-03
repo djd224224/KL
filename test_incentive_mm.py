@@ -2253,6 +2253,24 @@ class TestStickySelection(unittest.TestCase):
             else:
                 imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
 
+    def test_force_event_bypasses_floors_and_hopeless(self):
+        # Jack 2026-08-03 (TRUMPMENTION AUG18-date bug): IMM_FORCE_EVENTS
+        # entries are a deliberate per-event bypass of the floors and the
+        # hopeless exit — screens/caps still apply.
+        bot = self._quoting_bot()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        old_force = imm.FORCE_EVENTS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.FORCE_EVENTS = frozenset({"KXGOOD-99DEC31"})
+        try:
+            bot._est_peak.clear()
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)   # forced: stays
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.FORCE_EVENTS = old_force
+
     def test_override_event_no_longer_exempt_from_hopeless(self):
         # 2026-08-03 (Jack "same rules as other markets", supersedes the
         # 7/28 tele-rally exemption): an event-start override no longer

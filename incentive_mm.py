@@ -842,6 +842,16 @@ ALLOW_SERIES = frozenset(
 NO_NEW_SERIES = frozenset(
     s for s in os.environ.get("IMM_NO_NEW_SERIES", "").split(",") if s)
 
+# Hand-FORCED events (Jack 2026-08-03, KXTRUMPMENTION-26AUG03: Kalshi
+# stamped the program period to Aug 18 on a same-day event, diluting the
+# $100/market period_reward to a phantom $6.46/day that no floor can pass):
+# events listed here bypass the rate/total floors and the hopeless exit —
+# a DELIBERATE per-event data-bug override, unlike the retired automatic
+# curation. Screens, bands, caps, budget and manual-yield still apply.
+FORCE_EVENTS = frozenset(
+    e.strip() for e in os.environ.get("IMM_FORCE_EVENTS", "").split(",")
+    if e.strip())
+
 # FULL FREEZE by EXACT series (Jack 2026-07-29 am: "stop quoting COMPANY
 # events" — escalates the 7/28 run-off to zero orders; positions ride to
 # settlement per the standing freeze rule). EXACT matching, not prefix:
@@ -3190,6 +3200,7 @@ class IncentiveMarketMaker:
                 skipped["no_new"] = skipped.get("no_new", 0) + 1
             elif HOPELESS_EXIT and not reaches_min \
                     and meta.ticker in prev_selected \
+                    and meta.event_ticker not in FORCE_EVENTS \
                     and not curated_event(meta.event_ticker, meta.series, now_utc):
                 # STICKY EXIT (Jack 2026-07-25): "<5% chance to reach $1 by
                 # program end -> stop quoting, even if already started". The
@@ -3206,6 +3217,7 @@ class IncentiveMarketMaker:
                 # windows overrides create).
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
             elif meta.ticker not in prev_selected \
+                    and meta.event_ticker not in FORCE_EVENTS \
                     and meta.est_dollars_per_day < series_min_est_rate(meta.series):
                 # Re-entry rate floor OUTRANKS event curation (Jack 2026-08-02
                 # TLN audit: the auto-written company-disclosure override
@@ -3215,6 +3227,7 @@ class IncentiveMarketMaker:
                 # sticky (rate dips never evict; hopeless owns exits).
                 skipped["rate_floor"] = skipped.get("rate_floor", 0) + 1
             elif meta.ticker in prev_selected \
+                    or meta.event_ticker in FORCE_EVENTS \
                     or curated_event(meta.event_ticker, meta.series, now_utc):
                 # Sticky members and event-start-override events bypass the
                 # entry floor / zero-yield / budget-race filters (original
