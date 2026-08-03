@@ -914,7 +914,12 @@ for _pair in os.environ.get(
 # company-metric class (~$19/day markets); the econ-series addition on 7/23
 # pushed the allowed universe past 450 too. 700 covers ~544 with headroom.
 # Refresh cost scales with this (book reads), fine under keep-alive.
-MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 700)
+# 700 -> 5000 (Jack 2026-08-03 "i dont want this to be a limiter"): the cap
+# first BOUND at 700 on 8/3 02:38Z (diesel + re-entry + earnings-week
+# listings). At 5000 every allowed program market becomes a candidate;
+# refresh cost now scales with the allowed universe (~800-1000 book reads),
+# lengthening hh:00-hh:11 activation-window cycles — accepted trade.
+MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 5000)
 # Payout floor is the $1/market MINIMUM PAYOUT itself, tested against the
 # bot's expected TOTAL accrual over the market's remaining quotable life
 # (est $/day x days to program end, capped by cutoff/close) — NOT a per-day
@@ -1981,6 +1986,13 @@ def diff_orders(desired: List[Quote], resting: List[dict],
         if q.ticker != ticker or q.book_side != book_side:
             return False
         if LADDER_MODE != "atref" or getattr(q, "is_pad", False):
+            return False
+        # Zero-tolerance series (KXTEMP) re-pin at the reference in BOTH
+        # directions (Jack 2026-08-03, DCH T75.99: a kept 62c ask sat 30+
+        # ticks toward the touch of an emptied book — reward-equivalent to
+        # the deep reference but far more fill-exposed, which on temp is
+        # the whole game). Amend-in-place makes the re-pin gapless.
+        if series_atref_price_tol(series_of(ticker)) == 0:
             return False
         if touch_by_ticker is None:
             return False

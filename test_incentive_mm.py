@@ -600,6 +600,18 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
         self.assertEqual(amend, [])
         self.assertEqual([(q.price_cents, q.count) for q in place], [(45, 30)])
 
+    def test_temp_repins_both_directions(self):
+        # Jack 2026-08-03: zero-tol series never use the aggressive-keep —
+        # a temp rung closer to the touch than desired amends back to the
+        # protected reference even when touch data would otherwise keep it.
+        t = "KXTEMPDCH-26AUG0223-T75.99"
+        d = [imm.Quote(t, "ask", 93, 40)]
+        r = [_resting("o1", t, "ask", 62, 40)]      # aggressive vs desired
+        place, cancel, amend = self._diff(d, r, touch={t: (7, 50)})
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
+                         [("o1", 93)])
+
     def test_temp_zero_tol_amends_on_any_drift(self):
         # Jack 2026-08-02: KXTEMP hysteresis is 0 — a rung even 1 tick behind
         # desired reprices on the next tick; with the amend path that is an
