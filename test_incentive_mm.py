@@ -2895,7 +2895,7 @@ class TestLoveIslandCycle(unittest.TestCase):
                    if o["ticker"] == t and o["yes_price"] == imm.PAD_BID_CENTS]
         self.assertEqual(len(bid_pad), 1)
         # basis 300 + 15 near-touch -> pad up to 1000, rounded to 100s
-        self.assertEqual(bid_pad[0]["remaining_count"], 1000)   # gap 685 + 300 slack
+        self.assertEqual(bid_pad[0]["remaining_count"], 800)    # gap 685+300 -> capped at PAD_MAX 800
         # deep NO side gets no pad
         ask_pad = [o for o in bot.state.sim_orders.values()
                    if o["ticker"] == t and o["yes_price"] == imm.PAD_ASK_CENTS]
@@ -2916,8 +2916,8 @@ class TestLoveIslandCycle(unittest.TestCase):
                    if o["ticker"] == t and o["yes_price"] == imm.PAD_BID_CENTS]
         ask_pad = [o for o in bot.state.sim_orders.values()
                    if o["ticker"] == t and o["yes_price"] == imm.PAD_ASK_CENTS]
-        self.assertEqual(bid_pad[0]["remaining_count"], 1100)  # (1000-215)+300 slack -> 1100
-        self.assertEqual(ask_pad[0]["remaining_count"], 1100)
+        self.assertEqual(bid_pad[0]["remaining_count"], 800)   # (1000-215)+300 -> capped at PAD_MAX 800
+        self.assertEqual(ask_pad[0]["remaining_count"], 800)
 
     def test_pad_nets_out_own_pad_live_stable(self):
         """With our 1000 pad already resting inside the book, the desired pad
@@ -2947,8 +2947,8 @@ class TestPadQuantity(unittest.TestCase):
     def test_rounds_up_with_slack(self):
         # gap + 300 slack, rounded up to 100 (slack survives external
         # withdrawal between requotes — the AUG0110-T82.99 lesson)
-        self.assertEqual(imm.pad_quantity(315, 1000), 1000)   # gap 685 + 300
-        self.assertEqual(imm.pad_quantity(300, 1000), 1000)   # gap 700 + 300
+        self.assertEqual(imm.pad_quantity(315, 1000), 800)    # gap 685+300 -> PAD_MAX cap (2026-08-03)
+        self.assertEqual(imm.pad_quantity(300, 1000), 800)    # gap 700+300 -> PAD_MAX cap
         self.assertEqual(imm.pad_quantity(901, 1000), 400)    # gap 99 + 300
         self.assertEqual(imm.pad_quantity(900, 1000), 400)    # gap 100 + 300
 

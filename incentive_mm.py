@@ -250,12 +250,18 @@ class SeriesOverride:
 # cheap far-from-touch contracts, rounded up to the nearest PAD_ROUND. 1c bids /
 # 99c asks cost ~1c collateral and ~1c max loss each; they earn ~0 (weight
 # 0.5^(~47 ticks) ≈ 0) but unlock the near-touch ladder's rewards.
-# 1/99 -> 2/98 (Jack 2026-08-02 "Don't place trades at 1c or 99c"): pads
-# move to the sticky-band edge — same ~zero weight, ~2c collateral each.
-PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 2)
-PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 98)
+# Pad price history 2026-08-02/03: 1/99 -> 2/98 ("don't place at 1c/99c")
+# -> BACK to 1/99 same night (Jack "Set pads back to 1/99"). At 1/99 pads
+# sit outside the 2-98 RUNG envelope, so pad-vs-rung price classification
+# is unambiguous again; the 5-90 pad_band_ok mid gate still applies.
+PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 1)
+PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 99)
 PAD_ROUND = _env_int("IMM_PAD_ROUND", 100)
-PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 5000)   # safety ceiling per side
+# 5000 -> 800 (Jack 2026-08-03 "Max do 800 orders on a pad"): bounds each
+# pad order's contracts — worst-case pickoff/collateral ~$8/side at 1c. A
+# side needing more than 800 filler stays under target (snapshot excluded
+# there); the coverage alert + est decay surface those honestly.
+PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 800)
 # Headroom added on top of the exact gap whenever a pad is needed (Jack
 # 2026-08-01: AUG0110-T82.99 yes side padded to exactly ~1000, then external
 # retail depth withdrew and the side sat below target — disqualified — until
