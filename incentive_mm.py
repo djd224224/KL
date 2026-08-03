@@ -651,6 +651,11 @@ PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 90)   # never quote above (ask
 # clamps); pads (1c/99c, capped 800, 5-90-mid gate) are deliberately outside.
 STICKY_PRICE_MIN = _env_int("IMM_STICKY_PRICE_MIN", 5)
 STICKY_PRICE_MAX = _env_int("IMM_STICKY_PRICE_MAX", 93)
+# Deep-rung floor (Jack 2026-08-03 "allow quoting below 5 cents if the
+# market is within 5-93 ... because the reference point is lower"): on a
+# HEALTHY book (both touches in-band) an at-ref rung may follow the
+# reference down to this hard floor. 1c stays reserved for pads.
+RUNG_DEEP_FLOOR = _env_int("IMM_RUNG_DEEP_FLOOR", 2)
 MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 5)            # skip markets with mid outside
 MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 90)
 # Wide screen effectively OFF (Jack 2026-07-23: 25->99): incentives are earned
@@ -1882,15 +1887,17 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
         count = min(total, int(room))
         if count <= 0:
             return quotes
-        # Absolute quoting envelope = the sticky band (Jack 2026-08-02:
-        # "Don't place trades at 1c or 99c") — even band-exempt at-ref rungs
-        # never price outside 2-98.
+        # Envelope for at-ref rungs = the caller band (member-widened and/or
+        # deep-floor-relaxed), hard-bounded so 1c/99c stay pad-only and
+        # nothing ever rests above the sticky cap.
+        lo_env = max(pmin, RUNG_DEEP_FLOOR)
+        hi_env = min(pmax, STICKY_PRICE_MAX)
         if book_side == "bid":
-            px = min(anchor, max(ref_px, STICKY_PRICE_MIN))
+            px = min(anchor, max(ref_px, lo_env))
             if safe_cap is not None:
                 px = min(px, safe_cap)
         else:
-            px = max(anchor, min(ref_px, STICKY_PRICE_MAX))
+            px = max(anchor, min(ref_px, hi_env))
             if safe_cap is not None:
                 px = max(px, safe_cap)
         quotes.append(Quote(ticker, book_side, px, count))
@@ -4039,14 +4046,27 @@ class IncentiveMarketMaker:
             # the same knife the band exists to dodge. Sticky keeps such a
             # market SELECTED (costless), so quoting resumes if the book
             # returns to the band.
-            # Members ride to 2-98 (Jack 2026-08-02); fresh keeps the series
-            # band. member_price_band widens only for markets already quoting.
+            # Member band (5-93 since 8/3); fresh keeps the series band.
             pmin_s, pmax_s = member_price_band(
                 series_of(t), t in self.state.selected)
-            if ((ext_bid is not None and not pmin_s <= ext_bid <= pmax_s)
-                    or (ext_ask is not None and not pmin_s <= ext_ask <= pmax_s)):
+            # PER-SIDE top-in-band (Jack 2026-08-03 "Do 1", CHIH T69.99: a
+            # live 3x29 book was fully stood down because its wide spread
+            # put the bid touch under 5c): a side whose OWN touch is outside
+            # the band stands down alone — its rungs die as diff-unmatched,
+            # its pad stays to qualify the snapshot — while the healthy side
+            # keeps earning. BOTH sides out (the Austin 96x98 case) still
+            # stands the whole market down.
+            bid_in_band = ext_bid is None or pmin_s <= ext_bid <= pmax_s
+            ask_in_band = ext_ask is None or pmin_s <= ext_ask <= pmax_s
+            if not bid_in_band and not ask_in_band:
                 self.cancel_market_orders(t, resting)
                 continue
+            # Deep-rung floor: on a HEALTHY book (both touches present and
+            # in-band) rungs may follow the reference below 5c, down to
+            # RUNG_DEEP_FLOOR (Jack 2026-08-03).
+            healthy = (ext_bid is not None and ext_ask is not None
+                       and bid_in_band and ask_in_band)
+            rung_lo = RUNG_DEEP_FLOOR if healthy else pmin_s
 
             # RAIN FAIR-VALUE GATE (Jack 2026-07-28; reworked same day —
             # "my primary goal is to stay near the top of the orderbooks
@@ -4143,21 +4163,21 @@ class IncentiveMarketMaker:
             # atref: placement no longer follows the touch, so a touch
             # outside the band must not kill the side (see build_side_ladder).
             # pmin_s/pmax_s carry the member-widened band (2-98 for sticky).
-            if ext_bid is not None and room_buy > 0:
+            if ext_bid is not None and room_buy > 0 and bid_in_band:
                 px_ok = (LADDER_MODE == "atref" and ref_bid_px is not None) \
                     or ext_bid >= pmin_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
                                                 levels=lv, ref_px=ref_bid_px,
-                                                band=(pmin_s, pmax_s),
+                                                band=(rung_lo, pmax_s),
                                                 hour_mult=hm))
-            if ext_ask is not None and room_sell > 0:
+            if ext_ask is not None and room_sell > 0 and ask_in_band:
                 px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
                     or ext_ask <= pmax_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
                                                 levels=lv, ref_px=ref_ask_px,
-                                                band=(pmin_s, pmax_s),
+                                                band=(rung_lo, pmax_s),
                                                 hour_mult=hm))
 
             # Depth padding: on a side we're actually quoting whose total depth

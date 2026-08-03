@@ -365,9 +365,52 @@ class TestAtRefLadder(unittest.TestCase):
         self.assertEqual([(q.price_cents, q.count) for q in qs], [(5, 90)])   # envelope floor 5
 
     def test_ask_ref_above_band_allowed(self):
+        # default (fresh) callers cap at the SERIES band; members pass their
+        # widened band and cap at the sticky 93
         qs = build_side_ladder("T", "ask", 50, 45, room=99,
                                levels=[(0, 30)], ref_px=95)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(93, 90)])  # envelope cap 93
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(90, 90)])
+        qs = build_side_ladder("T", "ask", 50, 45, room=99,
+                               levels=[(0, 30)], ref_px=95, band=(5, 93))
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(93, 90)])
+
+    def test_deep_rung_floor_follows_ref_on_healthy_books(self):
+        # Jack 2026-08-03: in-band markets may rest below 5c when the
+        # reference is lower (caller passes the relaxed band); default
+        # callers keep the 5c floor; 1c stays pad-only.
+        qs = build_side_ladder("T", "bid", 7, 29, room=99,
+                               levels=[(0, 30)], ref_px=3, band=(2, 93))
+        self.assertEqual(qs[0].price_cents, 3)
+        qs = build_side_ladder("T", "bid", 7, 29, room=99,
+                               levels=[(0, 30)], ref_px=3)
+        self.assertEqual(qs[0].price_cents, 5)
+        qs = build_side_ladder("T", "bid", 7, 29, room=99,
+                               levels=[(0, 30)], ref_px=0, band=(2, 93))
+        self.assertEqual(qs[0].price_cents, 2)      # hard floor: never 1c
+
+    def test_per_side_top_in_band(self):
+        # Jack 2026-08-03 "Do 1": a wide live book (3c x 29c) stands down
+        # only its out-of-band BID side; the ask keeps quoting and the bid
+        # pad still qualifies the snapshot.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        t = "KXGOOD-99DEC31-A"
+        self.assertIn(t, bot.state.selected)
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.03", "400"]], "no_dollars": [["0.71", "400"]]}}
+        bot.client.markets[t]["yes_bid_dollars"] = "0.0300"
+        bot.client.markets[t]["yes_ask_dollars"] = "0.2900"
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        orders = list(bot.state.sim_orders.values())
+        asks = [o for o in orders if o["ticker"] == t and o["book_side"] == "ask"
+                and o["yes_price"] < imm.PAD_ASK_CENTS]
+        bad_bids = [o for o in orders if o["ticker"] == t
+                    and o["book_side"] == "bid"
+                    and o["yes_price"] > imm.PAD_BID_CENTS]
+        self.assertTrue(asks)                 # healthy side quotes
+        self.assertEqual(bad_bids, [])        # stood-down side: no rungs
 
     def test_ref_absolute_bounds(self):
         # Absolute envelope = the sticky band (5-93 since 2026-08-03)
