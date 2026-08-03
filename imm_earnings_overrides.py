@@ -471,6 +471,69 @@ def tvmaze_airtime(show_title: str, date_et):
     return None
 
 
+# White-House schedule auto-resolve (Jack 2026-08-03, KXTRUMPMENTION-26AUG03
+# "add to the auto-resolver to find a start time": an Executive Order signing
+# has no TVmaze entry; Roll Call Factbase publishes the WH daily schedule as
+# JSON). Validated live 2026-08-03: the feed carried "13:30:00 / The President
+# signs an Executive Order" matching the hand-set override exactly. Anything
+# ambiguous stays UNRESOLVED — a wrong start time is worse than the email.
+WH_SCHEDULE_JSON = os.environ.get(
+    "IMM_WH_SCHEDULE_JSON",
+    "https://media-cdn.factba.se/rss/json/trump/calendar-full.json")
+WH_SCHEDULE_SERIES = tuple(s for s in os.environ.get(
+    "IMM_WH_SCHEDULE_SERIES", "KXTRUMPMENTION").split(",") if s)
+_WH_STOP = frozenset(
+    "what will trump say during the a an of at in on to his her president "
+    "participates and or".split())
+_wh_cache: dict = {}
+
+
+def _wh_words(s: str) -> set:
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", s.lower()):
+        if w in _WH_STOP:
+            continue
+        out.add(w[:-3] if w.endswith("ing") else (w[:-1] if w.endswith("s") else w))
+    return out
+
+
+def wh_schedule_start(title: str, date_et):
+    """(datetime ET, matched schedule details) from the Factbase WH calendar:
+    the UNIQUE best keyword match on that date with >=2 shared content words
+    and a concrete time, else None."""
+    if "entries" not in _wh_cache:
+        try:
+            r = requests.get(WH_SCHEDULE_JSON, headers=UA, timeout=20)
+            r.raise_for_status()
+            d = r.json()
+            _wh_cache["entries"] = d if isinstance(d, list) else (
+                d.get("data") or d.get("items") or [])
+        except Exception as e:
+            log(f"! WH schedule fetch failed: {e}")
+            _wh_cache["entries"] = []
+    want = _wh_words(title)
+    scored = []
+    for it in _wh_cache["entries"]:
+        if str(it.get("date")) != date_et.isoformat() or not it.get("time"):
+            continue
+        sc = len(want & _wh_words(str(it.get("details") or "")))
+        if sc >= 2:
+            scored.append((sc, it))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None                              # ambiguous match
+    it = scored[0][1]
+    try:
+        hh, mm = str(it["time"]).split(":")[:2]
+        dt = ET.localize(datetime(date_et.year, date_et.month, date_et.day,
+                                  int(hh), int(mm)))
+    except (ValueError, KeyError):
+        return None
+    return dt, str(it.get("details") or "")
+
+
 def load_file() -> dict:
     try:
         with open(EVENT_OVERRIDES_FILE, encoding="utf-8") as f:
@@ -622,8 +685,20 @@ def main(argv=None) -> int:
                      .get("title")) or ""
         except Exception as e:
             log(f"! event fetch failed {ev}: {e}")
-        m = SHOW_TITLE_RE.search(title)
         d_et = parse_event_date(ev).astimezone(ET).date()
+        # WH-schedule series (KXTRUMPMENTION*): try the Factbase calendar
+        # before TVmaze — these events are appearances, not shows.
+        if series.startswith(WH_SCHEDULE_SERIES):
+            wh = wh_schedule_start(title, d_et)
+            if wh:
+                dt_et, det = wh
+                iso = dt_et.isoformat()
+                file_data[ev] = iso
+                bc_resolved.append((ev, iso, "WH schedule",
+                                    f"{title[:60]} => {det[:60]}"))
+                log(f"broadcast {ev} = {iso}  [WH schedule]  {det[:70]}")
+                continue
+        m = SHOW_TITLE_RE.search(title)
         hit = tvmaze_airtime(m.group(1), d_et) if m else None
         if hit:
             dt_et, net = hit
@@ -644,8 +719,8 @@ def main(argv=None) -> int:
                          or bc_resolved or bc_unresolved):
         lines = ["Earnings call + release override run", ""]
         if bc_resolved:
-            lines.append("BROADCAST mention cutoffs AUTO-RESOLVED (TVmaze; "
-                         "written, bot hot-reloads):")
+            lines.append("BROADCAST mention cutoffs AUTO-RESOLVED (TVmaze / "
+                         "WH schedule; written, bot hot-reloads):")
             for ev, iso, net, title in bc_resolved:
                 lines.append(f"  {ev} = {iso}   [{net}]")
                 lines.append(f"    \"{title}\"")
