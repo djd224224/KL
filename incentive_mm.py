@@ -869,6 +869,12 @@ for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
             safe_join=True)
+# KXDIESELW quoted as an OVERRIDE (Jack 2026-08-03): exempt from the $2/day
+# re-entry rate bar — its $18.58/day pools est $0.8-1.4/mkt, all floored.
+# The $1 TOTAL payout floor still applies (~6 quotable days -> any material
+# est passes) and safe-join placement is kept. Replaces the loop's entry.
+SERIES_OVERRIDES["KXDIESELW"] = SeriesOverride(
+    min_est_per_day=_env_float("IMM_DIESELW_MIN_RATE", 0.0), safe_join=True)
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
 # cutoff forfeits game-day daytime, but programs run ~1-2 days INCLUDING game

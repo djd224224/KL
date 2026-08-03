@@ -930,6 +930,9 @@ class TestAllowlist(unittest.TestCase):
             self.assertTrue(a(t), t)
         self.assertEqual(imm.series_min_est_rate("KXDIESELD"), 2.0)
         self.assertTrue(imm.series_safe_join("KXDIESELD"))
+        # KXDIESELW override (Jack 2026-08-03): rate bar off, safe-join kept
+        self.assertEqual(imm.series_min_est_rate("KXDIESELW"), 0.0)
+        self.assertTrue(imm.series_safe_join("KXDIESELW"))
         # KXSCFI: frozen 7/29, RE-ALLOWED 2026-08-02 with the re-entry
         # guards ($2/day rate floor + safe-join).
         self.assertTrue(a("KXSCFI-26DEC25-T1500"))
