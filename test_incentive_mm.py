@@ -2048,6 +2048,22 @@ class TestTempSeriesTuning(unittest.TestCase):
         self.assertEqual(imm.series_price_min("KXGOOD"), imm.PRICE_MIN_CENTS)
         self.assertEqual(imm.series_price_max("KXGOOD"), imm.PRICE_MAX_CENTS)
 
+    def test_member_quotes_to_true_cutoff(self):
+        # Jack 2026-08-03: the 5-min fresh-entry buffer must not kill
+        # members early — a member 3 min from cutoff still screens clean;
+        # a fresh candidate inside the buffer is refused.
+        bot = imm.IncentiveMarketMaker(client=None, live=False)
+        meta = imm.MarketMeta(
+            ticker="KXGOOD-99DEC31-A", event_ticker="KXGOOD-99DEC31",
+            series="KXGOOD", dollars_per_day=10.0, program_end=None,
+            target_size=1000.0, discount_factor=0.5,
+            cutoff=datetime.now(timezone.utc) + timedelta(minutes=3),
+            close_time=datetime.now(timezone.utc) + timedelta(hours=2),
+            mid_cents=50.0, spread_cents=2, volume=100.0)
+        now = datetime.now(timezone.utc)
+        self.assertEqual(bot._screen(meta, now, member=False), "cutoff")
+        self.assertIsNone(bot._screen(meta, now, member=True))
+
     def test_temp_min_payout_floor(self):
         # Temp-only $0.70 floor; everything else follows the (patchable)
         # global — the override must win in both directions.

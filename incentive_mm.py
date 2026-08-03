@@ -898,6 +898,10 @@ EVENT_START_BUFFER_MIN = _env_int("IMM_EVENT_START_BUFFER_MIN", 30)
 # Intel"). Distinct from the 30-min game buffer because a hard scheduled
 # disclosure is a precise instant, not an approximate kickoff.
 OVERRIDE_BUFFER_MIN = _env_int("IMM_OVERRIDE_BUFFER_MIN", 10)
+# Fresh candidates aren't admitted inside this many minutes of a cutoff
+# (pointless entry + placement race); MEMBERS are exempt and quote to the
+# true cutoff — the exchange-side order expiration is the hard stop there.
+CUTOFF_SCREEN_BUFFER_MIN = _env_int("IMM_CUTOFF_SCREEN_BUFFER", 5)
 # Series with a real schedule API. Their games can be POSTPONED past the
 # ticker date (NYDAL 7/16 -> makeup 7/20 while 18 program markets kept paying
 # $100/day each), so the cheap 24h ticker-date pre-drop must not apply — the
@@ -3126,7 +3130,8 @@ class IncentiveMarketMaker:
             if manual_skip:
                 skipped["manual"] = skipped.get("manual", 0) + 1
                 continue
-            reason = self._screen(meta, now_utc)
+            reason = self._screen(meta, now_utc,
+                                  member=t in prev_selected)
             if (reason and t in prev_selected
                     and reason not in STICKY_DEATH_REASONS):
                 # Sticky: ride out transient quality states on a market we
@@ -3547,11 +3552,18 @@ class IncentiveMarketMaker:
                     events.add(self._event_of(t))
         return events
 
-    def _screen(self, meta: MarketMeta, now_utc: datetime) -> Optional[str]:
-        """Hard screens; returns a skip-reason or None if quotable."""
+    def _screen(self, meta: MarketMeta, now_utc: datetime,
+                member: bool = False) -> Optional[str]:
+        """Hard screens; returns a skip-reason or None if quotable.
+        `member`: the 5-min cutoff pre-buffer exists to stop FRESH entry
+        seconds before the end — members quote to the true cutoff (Jack
+        2026-08-03: "bot stopped quoting 15min before"; the buffer was
+        compounding with the 10-min cutoff into an effective 15)."""
         now_ts = now_utc.timestamp()
-        if meta.cutoff is not None and now_utc >= meta.cutoff - timedelta(minutes=5):
-            return "cutoff"
+        if meta.cutoff is not None:
+            buf = timedelta(minutes=0 if member else CUTOFF_SCREEN_BUFFER_MIN)
+            if now_utc >= meta.cutoff - buf:
+                return "cutoff"
         # A mention/broadcast market with NO derivable event window is either
         # tournament-wide (e.g. KXWCMENTION-MENWORLDCUP: broadcasts already
         # running daily — quoting it is quoting through live events) or
