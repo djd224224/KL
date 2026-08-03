@@ -639,14 +639,17 @@ ORDER_REFRESH_SECS = _env_int("IMM_ORDER_REFRESH_SECS", 420)
 # the bot doesn't select markets it would never quote.
 PRICE_MIN_CENTS = _env_int("IMM_PRICE_MIN_CENTS", 5)    # never quote below (bid side)
 PRICE_MAX_CENTS = _env_int("IMM_PRICE_MAX_CENTS", 90)   # never quote above (ask side)
-# Sticky-member band (Jack 2026-08-02 "when sticky quoting, allow quotes to
-# go up to 2-98"): a market ALREADY quoting rides its accrual toward the
-# extremes instead of standing down at the series band — entry screens
-# (extreme_mid 5-90) and fresh placement keep the tight band; only members
-# widen. Top-in-band, the side gates and the rung clamps all consume this
-# via member_price_band().
-STICKY_PRICE_MIN = _env_int("IMM_STICKY_PRICE_MIN", 2)
-STICKY_PRICE_MAX = _env_int("IMM_STICKY_PRICE_MAX", 98)
+# Sticky-member band: a market ALREADY quoting rides its accrual past the
+# series band before standing down — entry screens (extreme_mid 5-90) and
+# fresh placement keep the tight band; only members widen. Top-in-band, the
+# side gates and the rung clamps all consume this via member_price_band().
+# 2-98 (Jack 2026-08-02) -> 5-93 (Jack 2026-08-03, after the Austin 10pm
+# pickoff: the bot's 96c member ask sold 60 into near-certain YES in the
+# final minutes — 93 keeps modest extreme-riding without the deep-ITM tail).
+# This is also the ABSOLUTE rung envelope (at-ref px bounds + safe-join
+# clamps); pads (1c/99c, capped 800, 5-90-mid gate) are deliberately outside.
+STICKY_PRICE_MIN = _env_int("IMM_STICKY_PRICE_MIN", 5)
+STICKY_PRICE_MAX = _env_int("IMM_STICKY_PRICE_MAX", 93)
 MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 5)            # skip markets with mid outside
 MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 90)
 # Wide screen effectively OFF (Jack 2026-07-23: 25->99): incentives are earned

@@ -362,18 +362,18 @@ class TestAtRefLadder(unittest.TestCase):
         # rests at 2c, not pinned to the 5c series floor
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=2)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(2, 90)])   # 3x cap
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(5, 90)])   # envelope floor 5
 
     def test_ask_ref_above_band_allowed(self):
         qs = build_side_ladder("T", "ask", 50, 45, room=99,
                                levels=[(0, 30)], ref_px=95)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(95, 90)])  # 3x cap
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(93, 90)])  # envelope cap 93
 
     def test_ref_absolute_bounds(self):
-        # 2026-08-02: absolute envelope is the sticky band (2-98) — never 1c/99c
+        # Absolute envelope = the sticky band (5-93 since 2026-08-03)
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=0)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(2, 90)])   # 3x cap
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(5, 90)])   # 3x cap
 
     def test_ask_collapses_to_ref(self):
         # ask side price space = YES-ask cents; deeper = higher
@@ -1279,21 +1279,23 @@ class TestDryRunCycle(unittest.TestCase):
             imm.LADDER_MODE = old
 
     def test_member_price_band(self):
-        # Jack 2026-08-02: sticky members quote to 2-98; fresh keeps series.
+        # 2-98 (8/2) -> 5-93 (Jack 2026-08-03 after the Austin 96c pickoff):
+        # members ride modestly past the series top; fresh keeps series.
         self.assertEqual(imm.member_price_band("KXGOOD", False), (5, 90))
-        self.assertEqual(imm.member_price_band("KXGOOD", True), (2, 98))
-        self.assertEqual(imm.member_price_band("KXTEMPDCH", True), (2, 98))
+        self.assertEqual(imm.member_price_band("KXGOOD", True), (5, 93))
+        self.assertEqual(imm.member_price_band("KXTEMPDCH", True), (5, 93))
 
     def test_sticky_member_rides_to_extreme_band(self):
-        # Select at a normal book, then gap it to 3c/4c: the member keeps
-        # quoting (band 2-98) where the old top-in-band rule stood it down.
+        # Select at a normal book, then drift the top to 91x92 (over the
+        # series 90 but inside the member 93): the member keeps quoting
+        # where the fresh-band rule would stand it down.
         bot = self._bot()
         t = "KXGOOD-99DEC31-A"
         bot.run_cycle()
         self.assertIn(t, bot.state.selected)
         bot.client.books[t] = {"orderbook_fp": {
-            "yes_dollars": [["0.03", "500"]],
-            "no_dollars": [["0.96", "500"]]}}       # touch 3c / 4c
+            "yes_dollars": [["0.91", "500"]],
+            "no_dollars": [["0.08", "500"]]}}       # touch 91c / 92c
         bot.state.universe_at = time.time()
         bot.run_cycle()
         self.assertTrue(any(o["ticker"] == t
@@ -2010,10 +2012,9 @@ class TestTempSeriesTuning(unittest.TestCase):
 
     def test_out_of_band_top_stands_aside_entirely(self):
         # Jack 2026-07-21: if the TOP of book is outside the band, no quotes
-        # at all — not even the in-band side. 2026-08-02: MEMBERS ride to the
-        # sticky 2-98 band, so the stand-down boundary for a selected market
-        # moved from 90 to 98 — a 96x98 top now keeps quoting; a 99c top
-        # (beyond even the sticky band) still stands the market down.
+        # at all — not even the in-band side. Member boundary is the sticky
+        # band (93 since 2026-08-03, was 98): a 96x98 top stands a member
+        # down again — the Austin 96c pickoff class.
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         bot.run_cycle()
@@ -2025,15 +2026,7 @@ class TestTempSeriesTuning(unittest.TestCase):
         bot.client.markets[t]["yes_ask_dollars"] = "0.9800"
         bot.state.universe_at = time.time()      # no refresh: quote loop only
         bot.run_cycle()
-        self.assertTrue(any(o["ticker"] == t                 # member: rides
-                            for o in bot.state.sim_orders.values()))
-        bot.client.books[t] = {"orderbook_fp": {
-            "yes_dollars": [["0.99", "500"]], "no_dollars": [["0.005", "1200"]]}}
-        bot.client.markets[t]["yes_bid_dollars"] = "0.9900"
-        bot.client.markets[t]["yes_ask_dollars"] = "0.9950"
-        bot.state.universe_at = time.time()
-        bot.run_cycle()
-        self.assertEqual(bot.state.sim_orders, {})   # beyond 98: stands aside
+        self.assertEqual(bot.state.sim_orders, {})   # beyond 93: stands aside
         self.assertIn(t, bot.state.selected)         # but still selected (sticky)
 
     def test_band_is_two_sided(self):
