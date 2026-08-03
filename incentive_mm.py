@@ -250,8 +250,10 @@ class SeriesOverride:
 # cheap far-from-touch contracts, rounded up to the nearest PAD_ROUND. 1c bids /
 # 99c asks cost ~1c collateral and ~1c max loss each; they earn ~0 (weight
 # 0.5^(~47 ticks) ≈ 0) but unlock the near-touch ladder's rewards.
-PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 1)
-PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 99)
+# 1/99 -> 2/98 (Jack 2026-08-02 "Don't place trades at 1c or 99c"): pads
+# move to the sticky-band edge — same ~zero weight, ~2c collateral each.
+PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 2)
+PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 98)
 PAD_ROUND = _env_int("IMM_PAD_ROUND", 100)
 PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 5000)   # safety ceiling per side
 # Headroom added on top of the exact gap whenever a pad is needed (Jack
@@ -1820,8 +1822,9 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
         spread = (opposite_best - anchor if book_side == "bid"
                   else anchor - opposite_best) if opposite_best is not None else None
         if spread is None or spread < SAFE_JOIN_MIN_SPREAD:
-            safe_cap = (max(anchor - SAFE_JOIN_OFFSET_TICKS, 1) if book_side == "bid"
-                        else min(anchor + SAFE_JOIN_OFFSET_TICKS, 99))
+            safe_cap = (max(anchor - SAFE_JOIN_OFFSET_TICKS, STICKY_PRICE_MIN)
+                        if book_side == "bid"
+                        else min(anchor + SAFE_JOIN_OFFSET_TICKS, STICKY_PRICE_MAX))
     # `band` (2026-08-02): caller-supplied effective band — the quote loop
     # passes the member-widened 2-98 for sticky markets; default = series.
     pmin, pmax = band if band is not None else (
@@ -1843,12 +1846,15 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
         count = min(total, int(room))
         if count <= 0:
             return quotes
+        # Absolute quoting envelope = the sticky band (Jack 2026-08-02:
+        # "Don't place trades at 1c or 99c") — even band-exempt at-ref rungs
+        # never price outside 2-98.
         if book_side == "bid":
-            px = min(anchor, max(ref_px, 1))
+            px = min(anchor, max(ref_px, STICKY_PRICE_MIN))
             if safe_cap is not None:
                 px = min(px, safe_cap)
         else:
-            px = max(anchor, min(ref_px, 99))
+            px = max(anchor, min(ref_px, STICKY_PRICE_MAX))
             if safe_cap is not None:
                 px = max(px, safe_cap)
         quotes.append(Quote(ticker, book_side, px, count))

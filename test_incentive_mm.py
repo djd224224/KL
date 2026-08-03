@@ -370,9 +370,10 @@ class TestAtRefLadder(unittest.TestCase):
         self.assertEqual([(q.price_cents, q.count) for q in qs], [(95, 90)])  # 3x cap
 
     def test_ref_absolute_bounds(self):
+        # 2026-08-02: absolute envelope is the sticky band (2-98) — never 1c/99c
         qs = build_side_ladder("T", "bid", 50, 55, room=99,
                                levels=[(0, 30)], ref_px=0)
-        self.assertEqual([(q.price_cents, q.count) for q in qs], [(1, 90)])   # 3x cap
+        self.assertEqual([(q.price_cents, q.count) for q in qs], [(2, 90)])   # 3x cap
 
     def test_ask_collapses_to_ref(self):
         # ask side price space = YES-ask cents; deeper = higher
