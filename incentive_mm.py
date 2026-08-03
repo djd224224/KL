@@ -2362,6 +2362,12 @@ class BotState:
     errors_today: int = 0
     fills_today: float = 0.0
     reward_est_today: float = 0.0
+    # Completed roll-days -> that day's total est reward (last 7). The digest
+    # reads "last full day" from HERE (2026-08-03): reward_est_today is an
+    # in-process counter and this bot restarts many times a day, so the
+    # digest's old live-counter/summary-body sources reported a fraction of
+    # the truth ($45.81 vs $959.47 measured on 8/3).
+    reward_history: Dict[str, float] = field(default_factory=dict)
     reward_est_lifetime: float = 0.0      # cumulative est reward (NOT reset at the
     #   daily roll; persisted so it survives restarts) — the digest's running total
     contract_minutes_today: float = 0.0   # resting contracts x minutes quoted
@@ -2459,6 +2465,18 @@ class IncentiveMarketMaker:
             for t, a in (data.get("own_avg") or {}).items():
                 self.pnl.avg[str(t)] = float(a)
             self.state.reward_est_lifetime = float(data.get("reward_est_lifetime") or 0.0)
+            self.state.reward_history = {str(k): float(v) for k, v in
+                                         (data.get("reward_history") or {}).items()}
+            # Daily reward/contract-minutes survive restarts within the SAME
+            # roll day (2026-08-03 fix): without this every restart zeroed the
+            # counter the digest reports.
+            if data.get("reward_day_key") == _halt_day_key(datetime.now(timezone.utc)):
+                self.state.reward_est_today = float(data.get("reward_est_today") or 0.0)
+                self.state.contract_minutes_today = float(
+                    data.get("contract_minutes_today") or 0.0)
+                if self.state.reward_est_today:
+                    log(f"{self.tag} restored est reward today "
+                        f"${self.state.reward_est_today:.2f} (same roll-day restart)")
             self.state.sticky_prev = set(data.get("selected_tickers") or [])
             # Peak-entry memory survives restarts: it's in-memory otherwise, and
             # this bot restarts often (launcher-env changes, hang-watchdog), so
@@ -2523,6 +2541,14 @@ class IncentiveMarketMaker:
                                        for t, p in self.pnl.pos.items()
                                        if abs(p) > 1e-9},
                            "reward_est_lifetime": self.state.reward_est_lifetime,
+                           # daily reward must survive restarts (see BotState):
+                           # anchored to the roll day so a NEW day starts clean
+                           "reward_day_key": _halt_day_key(datetime.now(timezone.utc)),
+                           "reward_est_today": round(self.state.reward_est_today, 4),
+                           "contract_minutes_today": round(
+                               self.state.contract_minutes_today, 1),
+                           "reward_history": {k: round(v, 2) for k, v in sorted(
+                               self.state.reward_history.items())[-7:]},
                            "halt_day_key": _halt_day_key(datetime.now(timezone.utc)),
                            "pnl_today_carry": round(self.state.pnl_today_last, 2),
                            "halted_until": self.state.halted_until,
@@ -4668,6 +4694,14 @@ class IncentiveMarketMaker:
                 f"cxl {s.cancelled_today}, errs {s.errors_today} | alerts: {alert_str}")
         s.cycles_today = s.placed_today = s.cancelled_today = s.errors_today = 0
         s.fills_today = 0.0
+        # Record the COMPLETED day before zeroing — this is what the digest
+        # reports as "last full day" (restart-proof, unlike the live counter).
+        # The roll fires ~5am CT on day D covering ~5am D-1 -> 5am D, so the
+        # period is labelled D-1.
+        completed = (datetime.now(timezone.utc).astimezone(CT).date()
+                     - timedelta(days=1)).isoformat()
+        s.reward_history[completed] = round(s.reward_est_today, 2)
+        s.reward_history = dict(sorted(s.reward_history.items())[-7:])
         s.reward_est_today = 0.0
         s.contract_minutes_today = 0.0
         # roll both loss-halt windows + the restart-carry and balance anchor

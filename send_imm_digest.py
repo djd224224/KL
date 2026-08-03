@@ -94,9 +94,11 @@ def own_book(state: dict):
     return pos, avg
 
 
-def current_mids(client, tickers) -> dict:
-    """ticker -> mid YES price in CENTS (bid/ask mid, else last), bulk-read."""
-    mids = {}
+def current_mids(client, tickers):
+    """(mids, results): ticker -> mid YES price in CENTS (bid/ask mid, else
+    last), and ticker -> settlement result ('yes'/'no') for settled markets
+    so the caller can book settlement P&L."""
+    mids, results = {}, {}
     tickers = list(tickers)
     for i in range(0, len(tickers), 50):
         chunk = tickers[i:i + 50]
@@ -107,6 +109,9 @@ def current_mids(client, tickers) -> dict:
             continue
         for m in (resp.get("markets") or []):
             t = m.get("ticker", "")
+            res = str(m.get("result") or "").lower()
+            if res in ("yes", "no"):
+                results[t] = res
             bid, ask = market_cents(m, "yes_bid"), market_cents(m, "yes_ask")
             if bid and ask:
                 mids[t] = (bid + ask) / 2.0
@@ -114,13 +119,17 @@ def current_mids(client, tickers) -> dict:
                 lp = market_cents(m, "last_price")
                 if lp:
                     mids[t] = float(lp)
-    return mids
+    return mids, results
 
 
-def replay_realized(client, our_ids: set) -> dict:
-    """ticker -> the bot's realized P&L ($), replayed from its OWN fills only
+def replay_realized(client, our_ids: set):
+    """(realized, positions, avg_cost) replayed from the bot's OWN fills only
     (matched by order id). Isolated from the user's manual fills and the other
-    cloud bots. Best-effort — returns {} on read failure."""
+    cloud bots. Positions/avg are returned so the caller can book SETTLEMENT
+    P&L: a position that settled is gone from the persisted own-book, so
+    realized-from-fills alone silently dropped the entire settlement result
+    (audit finding 2026-07-23, fixed 2026-08-03 — it hid $920 of temp
+    settlement losses on 8/3). Best-effort — returns empties on read failure."""
     pnl = PnlTracker()
     cursor = None
     min_ts = int(time.time()) - FILL_LOOKBACK_HOURS * 3600
@@ -145,8 +154,8 @@ def replay_realized(client, our_ids: set) -> dict:
                 break
     except Exception as e:
         log(f"! fill replay failed ({e}); realized shown as 0")
-        return {}
-    return dict(pnl.realized)
+        return {}, {}, {}
+    return dict(pnl.realized), dict(pnl.pos), dict(pnl.avg)
 
 
 def event_rows(client):
@@ -190,8 +199,27 @@ def event_rows(client):
     except Exception as e:
         log(f"! resting-order read failed: {e}")
 
-    realized = replay_realized(client, our_ids)
-    mids = current_mids(client, set(pos) | {t for t in realized if abs(pos.get(t, 0)) > 0.01})
+    realized, rep_pos, rep_avg = replay_realized(client, our_ids)
+    # Settlement P&L (2026-08-03 fix): a position the bot held into settlement
+    # is dropped from the persisted own-book, so it appears in NEITHER
+    # realized-from-fills NOR unrealized — the loss (or gain) vanished from
+    # the digest entirely. Book it here from the replayed position whenever
+    # the market has settled and the own-book no longer carries it.
+    mids, results = current_mids(
+        client, set(pos) | set(rep_pos) | {t for t in realized})
+    settled_pnl = {}
+    for t, rp in rep_pos.items():
+        if abs(rp) < 0.01 or t not in results:
+            continue
+        if abs(pos.get(t, 0.0)) >= 0.01:
+            continue                    # still open in the own-book: not settled out
+        val = 100.0 if results[t] == "yes" else 0.0
+        settled_pnl[t] = rp * (val - rep_avg.get(t, 0.0)) / 100.0
+    for t, v in settled_pnl.items():
+        realized[t] = realized.get(t, 0.0) + v
+    if settled_pnl:
+        log(f"booked settlement P&L on {len(settled_pnl)} market(s): "
+            f"${sum(settled_pnl.values()):+,.2f}")
 
     events = {}
     for t, p in pos.items():
@@ -227,9 +255,33 @@ def event_rows(client):
                        "events": len(resting_by_event)}
 
 
+def last_full_day_reward(state: dict, status: dict, today_ct):
+    """(amount, label) for the headline. Source of truth is the persisted
+    reward_history written at each 5am-CT roll (2026-08-03): the previous
+    sources — the in-process reward_est_today counter and the summary_body
+    text — both reset on every restart, and this bot restarts many times a
+    day, so the digest was reporting a small fraction of reality ($45.81
+    against a measured $959.47 on 8/3). Falls back to the old sources only
+    when no history exists (first run after this fix)."""
+    hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
+    for back in (1, 2):
+        key = (today_ct - timedelta(days=back)).isoformat()
+        if key in hist:
+            return hist[key], key
+    if hist:
+        key = sorted(hist)[-1]
+        return hist[key], key
+    body = status.get("summary_body") or ""
+    m = re.search(r"est reward today \$([\-\d.,]+)", body)
+    if m:
+        return _f(m.group(1).replace(",", "")), "last summary"
+    return _f(status.get("reward_est_today")), "today so far (partial)"
+
+
 def status_summary(status: dict) -> dict:
-    """Reward + activity figures from the last stored daily summary (yesterday's
-    completed roll), falling back to the live heartbeat counters."""
+    """Activity figures from the last stored daily summary (yesterday's
+    completed roll), falling back to the live heartbeat counters. Reward is
+    supplied separately by last_full_day_reward()."""
     body = status.get("summary_body") or ""
 
     def grab(pat, default=0.0):
@@ -350,6 +402,10 @@ def build_digest(now_utc: datetime):
     client = build_client()
     status = load_json(STATUS_PATH)
     ss = status_summary(status)
+    reward_amt, reward_label = last_full_day_reward(
+        load_json(STATE_PATH), status, today_ct)
+    ss["reward"] = reward_amt
+    ss["reward_label"] = reward_label
 
     rows, tot, resting = event_rows(client)
     total_pnl = tot["realized"] + tot["unrealized"]
@@ -367,7 +423,7 @@ def build_digest(now_utc: datetime):
     # ---- plain text (fallback part) ----------------------------------------
     lines = [f"Kalshi incentive MM — {today_ct}", ""]
     lines.append(f"TOTAL EST REWARD (cumulative): ${reward_lifetime:,.2f}")
-    lines.append(f"EST REWARD (last full day): ${reward:,.2f}  "
+    lines.append(f"EST REWARD ({ss['reward_label']}): ${reward:,.2f}  "
                  f"({cmin:,.0f} contract-min, {eff:.1f}c/1k-contract-min)")
     lines.append(f"P&L: {total_pnl:+,.2f}  (realized {tot['realized']:+,.2f}, "
                  f"unrealized {tot['unrealized']:+,.2f})")
@@ -404,7 +460,7 @@ def build_digest(now_utc: datetime):
              f'<span style="color:#0a7a2f">${reward_lifetime:,.2f}</span>'
              f'<span style="font-size:13px;font-weight:400;color:#999"> cumulative</span></div>')
     h.append(f'<div style="font-size:16px;font-weight:600;margin:2px 0 2px">'
-             f'Last full day: '
+             f'{ss["reward_label"]}: '
              f'<span style="color:#0a7a2f">${reward:,.2f}</span></div>')
     h.append(f'<div style="color:#555;margin-bottom:10px">'
              f'{cmin:,.0f} contract-min &nbsp;·&nbsp; {eff:.1f}c / 1k contract-min '
