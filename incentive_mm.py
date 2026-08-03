@@ -263,6 +263,11 @@ PAD_ROUND = _env_int("IMM_PAD_ROUND", 100)
 # side is completely empty (the 800 cap left near-empty sides unable to
 # qualify at all).
 PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 1000)
+# A pad must rest AT LEAST this many ticks behind its side's external touch
+# (Jack 2026-08-03 "dont pad if 1c is the top of the book, i dont want pads
+# to get bought up easily"): a 1c pad under a 1-2c best bid IS the market —
+# first in line for any seller. Per-side; mirrored in the estimator.
+PAD_MIN_TICKS_BEHIND = _env_int("IMM_PAD_MIN_BEHIND", 2)
 # Headroom added on top of the exact gap whenever a pad is needed (Jack
 # 2026-08-01: AUG0110-T82.99 yes side padded to exactly ~1000, then external
 # retail depth withdrew and the side sat below target — disqualified — until
@@ -3386,16 +3391,22 @@ class IncentiveMarketMaker:
                 nt_bid = sum(q.count for q in quotes if q.book_side == "bid")
                 nt_ask = sum(q.count for q in quotes if q.book_side == "ask")
                 # mirror the quote loop's pad_missing_side (coverage-leak
-                # fix): any quoting at all pads BOTH sides for members
+                # fix) AND the pad distance gates: any quoting at all pads
+                # BOTH sides for members, but only >= PAD_MIN_TICKS_BEHIND
+                # the external touch
                 if nt_bid > 0 or nt_ask > 0:
-                    n = pad_quantity(sum(sz for _px, sz in yes_levels) + nt_bid,
-                                     meta.target_size)
-                    if n > 0:
-                        overlay.append(("bid", PAD_BID_CENTS, float(n)))
-                    n = pad_quantity(sum(sz for _px, sz in no_levels) + nt_ask,
-                                     meta.target_size)
-                    if n > 0:
-                        overlay.append(("ask", PAD_ASK_CENTS, float(n)))
+                    if ext_bid is not None \
+                            and ext_bid - PAD_BID_CENTS >= PAD_MIN_TICKS_BEHIND:
+                        n = pad_quantity(sum(sz for _px, sz in yes_levels) + nt_bid,
+                                         meta.target_size)
+                        if n > 0:
+                            overlay.append(("bid", PAD_BID_CENTS, float(n)))
+                    if ext_ask is not None \
+                            and PAD_ASK_CENTS - ext_ask >= PAD_MIN_TICKS_BEHIND:
+                        n = pad_quantity(sum(sz for _px, sz in no_levels) + nt_ask,
+                                         meta.target_size)
+                        if n > 0:
+                            overlay.append(("ask", PAD_ASK_CENTS, float(n)))
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, overlay,
                 meta.target_size, meta.discount_factor, own_in_book=False)
@@ -4191,7 +4202,8 @@ class IncentiveMarketMaker:
                     # side too (one-sided snapshots pay nobody); reduce-only
                     # tails keep the old single-side behavior
                     pad_missing_side=(t in self.state.selected
-                                      and not reduce_only)))
+                                      and not reduce_only),
+                    ext_bid=ext_bid, ext_ask=ext_ask))
 
             desired.extend(mq)
             if mq:
@@ -4415,7 +4427,9 @@ class IncentiveMarketMaker:
     def _pad_quotes(self, ticker: str, near_touch: List[Quote],
                     yes_levels: List[List[float]], no_levels: List[List[float]],
                     own: List[Tuple[str, int, float]], target: float,
-                    pad_missing_side: bool = False) -> List[Quote]:
+                    pad_missing_side: bool = False,
+                    ext_bid: Optional[int] = None,
+                    ext_ask: Optional[int] = None) -> List[Quote]:
         """Throwaway depth-padding at the 1c/99c mark so each side we quote
         reaches the reward target size. Computed on depth EXCLUDING our own pad
         (netted out / not-yet-in-book) to avoid a self-referential churn loop.
@@ -4436,14 +4450,21 @@ class IncentiveMarketMaker:
                           and bs == "ask")
         yes_depth = sum(sz for _px, sz in yes_levels)
         no_depth = sum(sz for _px, sz in no_levels)
-        if nt_bid > 0 or (pad_missing_side and nt_ask > 0):
+        # Distance gates (Jack 2026-08-03): a pad only rests when it sits
+        # >= PAD_MIN_TICKS_BEHIND behind its side's EXTERNAL touch — a 1c pad
+        # under a 1-2c best bid is the market itself, bought up easily.
+        bid_pad_safe = (ext_bid is not None
+                        and ext_bid - PAD_BID_CENTS >= PAD_MIN_TICKS_BEHIND)
+        ask_pad_safe = (ext_ask is not None
+                        and PAD_ASK_CENTS - ext_ask >= PAD_MIN_TICKS_BEHIND)
+        if bid_pad_safe and (nt_bid > 0 or (pad_missing_side and nt_ask > 0)):
             # live: book already holds our near-touch, subtract only our pad;
             # dry: sim orders aren't in the book, add this cycle's near-touch.
             basis = (yes_depth - own_pad_bid) if self.live else (yes_depth + nt_bid)
             n = pad_quantity(basis, target)
             if n > 0:
                 pads.append(Quote(ticker, "bid", PAD_BID_CENTS, n, is_pad=True))
-        if nt_ask > 0 or (pad_missing_side and nt_bid > 0):
+        if ask_pad_safe and (nt_ask > 0 or (pad_missing_side and nt_bid > 0)):
             basis = (no_depth - own_pad_ask) if self.live else (no_depth + nt_ask)
             n = pad_quantity(basis, target)
             if n > 0:

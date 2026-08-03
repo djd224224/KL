@@ -1378,10 +1378,31 @@ class TestDryRunCycle(unittest.TestCase):
         nt = [imm.Quote("T", "ask", 55, 20)]
         yes_lv, no_lv = [[40, 100]], [[45, 1500]]   # yes thin, no deep
         on = bot._pad_quotes("T", nt, yes_lv, no_lv, [], 1000.0,
-                             pad_missing_side=True)
+                             pad_missing_side=True, ext_bid=40, ext_ask=55)
         self.assertTrue(any(q.book_side == "bid" and q.is_pad for q in on))
-        off = bot._pad_quotes("T", nt, yes_lv, no_lv, [], 1000.0)
+        off = bot._pad_quotes("T", nt, yes_lv, no_lv, [], 1000.0,
+                              ext_bid=40, ext_ask=55)
         self.assertFalse(any(q.book_side == "bid" for q in off))
+
+    def test_pad_distance_gates(self):
+        # Jack 2026-08-03 "dont pad if 1c is the top of the book": a pad
+        # must rest >= 2 ticks behind its side's external touch, per side.
+        bot = self._bot()
+        nt = [imm.Quote("T", "bid", 2, 20), imm.Quote("T", "ask", 97, 20)]
+        yes_lv, no_lv = [[2, 50]], [[2, 50]]        # both sides thin
+        # bid touch 2c: 1c pad would sit 1 tick behind -> no bid pad;
+        # ask touch 98c: 99c pad 1 behind -> no ask pad
+        pads = bot._pad_quotes("T", nt, yes_lv, no_lv, [], 1000.0,
+                               pad_missing_side=True, ext_bid=2, ext_ask=98)
+        self.assertEqual(pads, [])
+        # healthy distances: both pads allowed
+        pads = bot._pad_quotes("T", nt, yes_lv, no_lv, [], 1000.0,
+                               pad_missing_side=True, ext_bid=10, ext_ask=90)
+        self.assertEqual({q.book_side for q in pads}, {"bid", "ask"})
+        # unknown touch = no pad on that side
+        pads = bot._pad_quotes("T", nt, yes_lv, no_lv, [], 1000.0,
+                               pad_missing_side=True, ext_bid=None, ext_ask=90)
+        self.assertEqual({q.book_side for q in pads}, {"ask"})
 
     def test_dry_amend_updates_sim_order(self):
         # amend executor (2026-08-02): dry mode mutates the sim order in
@@ -2979,7 +3000,8 @@ class TestLoveIslandCycle(unittest.TestCase):
         no_levels = [[49, 1200.0]]
         near_touch = [imm.Quote("T", "bid", 48, 5)]
         own = [("bid", imm.PAD_BID_CENTS, 700.0)]
-        pads = bot._pad_quotes("T", near_touch, yes_levels, no_levels, own, 1000)
+        pads = bot._pad_quotes("T", near_touch, yes_levels, no_levels, own, 1000,
+                               ext_bid=48, ext_ask=51)
         bid_pad = [p for p in pads if p.book_side == "bid"]
         self.assertEqual(len(bid_pad), 1)
         self.assertEqual(bid_pad[0].count, 700)
@@ -2990,7 +3012,8 @@ class TestLoveIslandCycle(unittest.TestCase):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         pads = bot._pad_quotes("T", [imm.Quote("T", "bid", 48, 5)],
-                               [[48, 100.0]], [[49, 100.0]], [], 1000)
+                               [[48, 100.0]], [[49, 100.0]], [], 1000,
+                               ext_bid=48, ext_ask=51)
         self.assertEqual({p.book_side for p in pads}, {"bid"})   # no ask pad
 
 
