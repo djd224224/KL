@@ -257,11 +257,12 @@ class SeriesOverride:
 PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 1)
 PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 99)
 PAD_ROUND = _env_int("IMM_PAD_ROUND", 100)
-# 5000 -> 800 (Jack 2026-08-03 "Max do 800 orders on a pad"): bounds each
-# pad order's contracts — worst-case pickoff/collateral ~$8/side at 1c. A
-# side needing more than 800 filler stays under target (snapshot excluded
-# there); the coverage alert + est decay surface those honestly.
-PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 800)
+# 5000 -> 800 ("Max do 800") -> 1000 (Jack 2026-08-03 "allow pads to go up
+# to 1k"): bounds each pad order's contracts — worst-case ~$10/side at 1c.
+# At 1000 a pad can single-handedly satisfy the standard 1000 target when a
+# side is completely empty (the 800 cap left near-empty sides unable to
+# qualify at all).
+PAD_MAX_CONTRACTS = _env_int("IMM_PAD_MAX", 1000)
 # Headroom added on top of the exact gap whenever a pad is needed (Jack
 # 2026-08-01: AUG0110-T82.99 yes side padded to exactly ~1000, then external
 # retail depth withdrew and the side sat below target — disqualified — until
