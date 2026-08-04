@@ -2290,6 +2290,61 @@ class TestStickySelection(unittest.TestCase):
             else:
                 imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
 
+    def test_rate_floor_horizon_escape(self):
+        # Jack 2026-08-03: a fresh candidate admits on est_rate >= the series
+        # bar OR a projected TOTAL >= RATE_FLOOR_TOTAL_ALT. The projection is
+        # bounded by the PROGRAM end, not the market close — the foot-traffic
+        # case that prompted this closes in September but its programs end
+        # 8/9, so a 5-day window keeps most of them out.
+        bot = self._quoting_bot()
+        old_ov = imm.SERIES_OVERRIDES.get("KXGOOD")
+        old_alt = imm.RATE_FLOOR_TOTAL_ALT
+        # rate bar the fixture's est cannot clear
+        imm.SERIES_OVERRIDES["KXGOOD"] = imm.SeriesOverride(min_est_per_day=1e9)
+        try:
+            # alt threshold unreachable -> still rate-floored
+            imm.RATE_FLOOR_TOTAL_ALT = 1e9
+            bot.state.selected.pop(self.T, None)
+            bot.state.sticky_prev.discard(self.T)
+            bot._est_peak.clear()
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)
+            # alt threshold trivially reachable -> horizon escape admits it
+            imm.RATE_FLOOR_TOTAL_ALT = 0.0
+            bot.state.selected.pop(self.T, None)
+            bot.state.sticky_prev.discard(self.T)
+            bot._est_peak.clear()
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            imm.RATE_FLOOR_TOTAL_ALT = old_alt
+            if old_ov is None:
+                imm.SERIES_OVERRIDES.pop("KXGOOD", None)
+            else:
+                imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
+
+    def test_quotable_days_bounded_by_program_end(self):
+        # The horizon escape is only safe because _quotable_days caps at the
+        # PROGRAM end when it precedes the market close (the 8/8-vs-September
+        # trap Jack flagged). Pin that.
+        now = utc(2026, 8, 4, 0, 0)
+        meta = imm.MarketMeta(
+            ticker="KXBKFT-26SEP07-T100", event_ticker="KXBKFT-26SEP07",
+            series="KXBKFT", dollars_per_day=19.05,
+            program_end=utc(2026, 8, 9, 3, 59), target_size=1000.0,
+            discount_factor=0.5, cutoff=None,
+            close_time=utc(2026, 9, 7, 2, 29))
+        self.assertAlmostEqual(imm._quotable_days(meta, now), 5.166, places=2)
+        # and the market close wins when IT is the earlier bound
+        meta2 = imm.MarketMeta(
+            ticker="X-1", event_ticker="X", series="X", dollars_per_day=1.0,
+            program_end=utc(2026, 9, 1, 0, 0), target_size=1000.0,
+            discount_factor=0.5, cutoff=None,
+            close_time=utc(2026, 8, 6, 0, 0))
+        self.assertAlmostEqual(imm._quotable_days(meta2, now), 2.0, places=2)
+
     def test_force_event_bypasses_floors_and_hopeless(self):
         # Jack 2026-08-03 (TRUMPMENTION AUG18-date bug): IMM_FORCE_EVENTS
         # entries are a deliberate per-event bypass of the floors and the

@@ -973,6 +973,15 @@ MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 5000)
 # Per-series override: SeriesOverride.min_est_total via series_min_est_total()
 # (KXTEMP runs $0.70 — Jack 2026-08-02).
 MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.0)
+# Horizon escape from the per-series RATE floor (Jack 2026-08-03): a fresh
+# candidate admits on EITHER est_rate >= the series bar OR a projected TOTAL
+# >= this. The rate bar alone is horizon-blind — it rejects a slow market that
+# would still earn well over its life exactly as hard as one that never pays.
+# CAREFUL: the projection is bounded by the PROGRAM end, not the market close.
+# The foot-traffic markets that prompted this close 2026-09-07 but their
+# incentive programs end 2026-08-09, so the window is 5 days and only 1 of 22
+# clears $5 — the rule is deliberately not a blanket admission.
+RATE_FLOOR_TOTAL_ALT = _env_float("IMM_RATE_FLOOR_TOTAL_ALT", 5.0)
 # The floor is a hard threshold on a NOISY estimate (thin books swing the
 # share estimate ±50% between refreshes), so borderline markets could flap
 # just under $1 at every sampling instant and never enter (observed
@@ -3281,7 +3290,12 @@ class IncentiveMarketMaker:
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
             elif meta.ticker not in prev_selected \
                     and meta.event_ticker not in FORCE_EVENTS \
-                    and meta.est_dollars_per_day < series_min_est_rate(meta.series):
+                    and meta.est_dollars_per_day < series_min_est_rate(meta.series) \
+                    and (accrued + max(est_total, peak)) < RATE_FLOOR_TOTAL_ALT:
+                # Rate-floored only when the market ALSO fails the horizon
+                # escape. The projected total uses the same quantity as the
+                # payout floor below (accrued + best of current/1h-peak) so the
+                # two gates cannot disagree about what a market will earn.
                 # Re-entry rate floor OUTRANKS event curation (Jack 2026-08-02
                 # TLN audit: the auto-written company-disclosure override
                 # curated KXTLN-26AUGGEN past the $2 bar at ~$0.45/day est).
