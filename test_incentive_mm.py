@@ -2290,6 +2290,30 @@ class TestStickySelection(unittest.TestCase):
             else:
                 imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
 
+    def test_close_anchored_cutoff_applies_to_both_producers(self):
+        # LIVE BUG 2026-08-04: refresh_universe applied the temp close-10 rule
+        # but restore_orphan_metas did not, so orphan-restored temp markets
+        # quoted to the CLOSE — 7 fills landed as late as 6.7 min to close.
+        # The shared tightener must produce close-10 from a raw close-time
+        # cutoff, which is exactly what the restore path feeds it.
+        close = utc(2026, 8, 4, 4, 0)
+        got = imm.apply_series_cutoff_adjustments(
+            "KXTEMPAUSH", "KXTEMPAUSH-26AUG0400", close, close_time=close)
+        self.assertEqual(got, utc(2026, 8, 4, 3, 50))
+        # with no cutoff at all it still anchors off the close
+        got = imm.apply_series_cutoff_adjustments(
+            "KXTEMPAUSH", "KXTEMPAUSH-26AUG0400", None, close_time=close)
+        self.assertEqual(got, utc(2026, 8, 4, 3, 50))
+        # never LOOSENS an already-tighter cutoff
+        tight = utc(2026, 8, 4, 3, 30)
+        got = imm.apply_series_cutoff_adjustments(
+            "KXTEMPAUSH", "KXTEMPAUSH-26AUG0400", tight, close_time=close)
+        self.assertEqual(got, tight)
+        # non-close-anchored series unaffected
+        got = imm.apply_series_cutoff_adjustments(
+            "KXGOOD", "KXGOOD-99DEC31", close, close_time=close)
+        self.assertEqual(got, close)
+
     def test_rate_floor_horizon_escape(self):
         # Jack 2026-08-03: a fresh candidate admits on est_rate >= the series
         # bar OR a projected TOTAL >= RATE_FLOOR_TOTAL_ALT. The projection is

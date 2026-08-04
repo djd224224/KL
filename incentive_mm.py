@@ -1591,15 +1591,28 @@ def series_hard_expiry_utc(series: str, event_ticker: str) -> Optional[datetime]
 
 
 def apply_series_cutoff_adjustments(series: str, event_ticker: str,
-                                    cutoff: Optional[datetime]) -> Optional[datetime]:
+                                    cutoff: Optional[datetime],
+                                    close_time: Optional[datetime] = None,
+                                    ) -> Optional[datetime]:
     """Series-level tighteners every cutoff PRODUCER must run: the
-    early-stop (cutoff_before_event_min, e.g. rain 6pm-day-before) and the
-    hard-expiry floor (Love Island 8:30pm). Exists because the 2026-07-29
+    CLOSE-ANCHORED rule (cutoff_from_close_min, e.g. hourly temp close-10),
+    the early-stop (cutoff_before_event_min, e.g. rain 6pm-day-before) and
+    the hard-expiry floor (Love Island 8:30pm). Exists because the 2026-07-29
     rain early-stop was applied only in refresh_universe — orphan-restored
     positions rebuilt their own cutoff via raw trade_cutoff_utc and kept
     reduce-only quoting past 6pm (the 7/14 duplicated-threshold class, in
-    cutoff form)."""
+    cutoff form).
+
+    2026-08-04: the close-anchored rule was STILL missing here, so the same
+    bug recurred one layer down — orphan-restored TEMP markets got cutoff =
+    close instead of close-10 and quoted into the final ten minutes, the most
+    informed window of the hour (7 fills observed as late as 6.7 min to
+    close, on a -18c/contract-at-4am book). Pass close_time and the tightener
+    is applied for BOTH producers."""
     ov = SERIES_OVERRIDES.get(series)
+    if ov and ov.cutoff_from_close_min is not None and close_time is not None:
+        anchored = close_time - timedelta(minutes=ov.cutoff_from_close_min)
+        cutoff = anchored if cutoff is None else min(cutoff, anchored)
     if ov and ov.cutoff_before_event_min is not None:
         td = parse_event_date(event_ticker)
         if td is not None:
@@ -3167,7 +3180,8 @@ class IncentiveMarketMaker:
                         parse_iso_utc(m.get("expected_expiration_time", "")))
             # Series tighteners (early-stop + hard floor) — shared with the
             # orphan-restore path via apply_series_cutoff_adjustments.
-            cutoff = apply_series_cutoff_adjustments(series, event_ticker, cutoff)
+            cutoff = apply_series_cutoff_adjustments(series, event_ticker, cutoff,
+                                                     close_time=close_time)
             bid = market_cents(m, "yes_bid")
             ask = market_cents(m, "yes_ask")
             try:
@@ -3607,7 +3621,10 @@ class IncentiveMarketMaker:
                         trade_cutoff_utc(
                             event_ticker,
                             parse_iso_utc(m.get("occurrence_datetime", "")),
-                            parse_iso_utc(m.get("expected_expiration_time", "")))),
+                            parse_iso_utc(m.get("expected_expiration_time", ""))),
+                        # close_time is what makes the close-anchored rule
+                        # (temp close-10) work on THIS producer too
+                        close_time=parse_iso_utc(m.get("close_time", ""))),
                     close_time=parse_iso_utc(m.get("close_time", "")))
                 log(f"{self.tag} restored orphan position market {t} "
                     f"(pos {positions.get(t, 0):+.0f}, reduce-only)")

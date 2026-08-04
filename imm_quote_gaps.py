@@ -186,7 +186,8 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
             cutoff = imm.trade_cutoff_utc(
                 event_ticker, imm.parse_iso_utc(m.get("occurrence_datetime", "")),
                 imm.parse_iso_utc(m.get("expected_expiration_time", "")))
-    cutoff = imm.apply_series_cutoff_adjustments(series, event_ticker, cutoff)
+    cutoff = imm.apply_series_cutoff_adjustments(series, event_ticker, cutoff,
+                                                 close_time=close_time)
     bid = imm.market_cents(m, "yes_bid")
     ask = imm.market_cents(m, "yes_ask")
     try:
