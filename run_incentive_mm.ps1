@@ -107,7 +107,19 @@ if ($Probe) {
     # IMM_FORCE_EVENTS: per-event floor/hopeless bypass for Kalshi data-bug
     # events (2026-08-03 TRUMPMENTION: program period stamped to Aug 18 on a
     # same-day event). REMOVE entries once the event settles.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=KXTRUMPMENTION-26AUG05&& set IMM_BLOCKLIST=KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=75&& set IMM_COLLATERAL_BUDGET=20000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
+    # IMM_COLLATERAL_BUDGET 20000 -> 50000 (Jack 2026-08-04). At 20k the budget
+    # was over-subscribed ($16,325 ladder + $5,866 inventory reserve = $22,191)
+    # and, because sticky retention is seeded BEFORE the yield ranking, the
+    # incumbent earnings-mention book (450 markets / 36 events) held all of it.
+    # Hourly KXTEMP relists every hour and can never be an incumbent, so all 50
+    # temp markets were rejected at 11:02Z — 28 extreme_mid, 4 one_sided and 18
+    # on budget alone — despite temp being 67% of lifetime credited reward.
+    # KXRAIN-26AUG05 (the top-ranked unquoted event, ~$143/day) was blocked the
+    # same way. NOTE the budget is a MODELLED reservation (x0.65 realization),
+    # not cash: account cash was $9,470 when this was raised, so past ~$10k the
+    # real governor is Kalshi rejecting orders for insufficient balance, with
+    # IMM_BALANCE_DROP_HALT=5000 and the daily-loss halt underneath.
+    $ProbeEnv = "set IMM_FORCE_EVENTS=KXTRUMPMENTION-26AUG05&& set IMM_BLOCKLIST=KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=75&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
 }
 
 while ($true) {
