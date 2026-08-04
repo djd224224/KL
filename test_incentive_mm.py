@@ -4190,6 +4190,55 @@ class TestPayoutFloorAccounting(unittest.TestCase):
             _clean_persist()
 
 
+class TestSideMaxClampedToPositionCap(unittest.TestCase):
+    """A single side may not rest more than the market's whole net position
+    cap. Live breach 2026-08-04 (KXTEMPAUSH-26AUG0409-T79.99, cap 50): long
+    +25 -> sell room 50+25=75 trimmed to a 60-contract ladder -> 35 filled ->
+    a full 60 re-placed 28s later off the stale +25 -> position -70."""
+
+    def test_temp_ladder_cannot_exceed_its_own_position_cap(self):
+        # 20/side x the 3.0 deep-reference multiplier = 60, cap is 50
+        b, a = imm.clamp_side_max_to_position_cap(60, 60, 50.0)
+        self.assertEqual((b, a), (50, 50))
+
+    def test_sides_are_clamped_independently(self):
+        b, a = imm.clamp_side_max_to_position_cap(60, 20, 50.0)
+        self.assertEqual((b, a), (50, 20))
+
+    def test_no_effect_when_the_ladder_already_fits(self):
+        # non-temp: 20/side x 3.0 = 60 against a 150 cap — untouched
+        self.assertEqual(imm.clamp_side_max_to_position_cap(60, 60, 150.0),
+                         (60, 60))
+
+    def test_zero_or_absent_cap_is_a_no_op(self):
+        self.assertEqual(imm.clamp_side_max_to_position_cap(60, 60, 0.0),
+                         (60, 60))
+        self.assertEqual(imm.clamp_side_max_to_position_cap(60, 60, -1.0),
+                         (60, 60))
+
+    def test_live_regression_temp_ladder_of_twenty_per_side(self):
+        """The PRODUCTION shape, pinned: the launcher runs IMM_TEMP_LEVELS=0:20
+        (not the in-code default), which is what made 20 x 3.0 = 60 exceed the
+        50 cap. Set it explicitly so this asserts the live config rather than
+        whatever env the suite happens to run under."""
+        import dataclasses
+        ov = imm.SERIES_OVERRIDES["KXTEMPAUSH"]
+        try:
+            imm.SERIES_OVERRIDES["KXTEMPAUSH"] = dataclasses.replace(
+                ov, levels=[(0, 20)])
+            lv = imm.hour_scaled_levels(
+                "KXTEMPAUSH", datetime(2026, 8, 4, 12, tzinfo=timezone.utc))
+            base = sum(s for _t, s in lv)
+            side_max = int(round(base * imm.REF_DEPTH_MAX_MULT))
+            maxpos = imm.series_max_position("KXTEMPAUSH")
+            self.assertEqual(side_max, 60)        # the live 2026-08-04 number
+            self.assertGreater(side_max, maxpos)  # the hole, unclamped
+            b, a = imm.clamp_side_max_to_position_cap(side_max, side_max, maxpos)
+            self.assertEqual((b, a), (50, 50))
+        finally:
+            imm.SERIES_OVERRIDES["KXTEMPAUSH"] = ov
+
+
 class TestCoverageIsNotAnEstimateFactor(unittest.TestCase):
     """The exclusion rule is already inside estimate_reward_share (an excluded
     snapshot returns frac 0.0), so multiplying the rate by the coverage EMA

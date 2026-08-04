@@ -205,6 +205,40 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     return m
 
 
+def clamp_side_max_to_position_cap(side_max_bid: int, side_max_ask: int,
+                                   maxpos: float) -> Tuple[int, int]:
+    """No ONE side may rest more contracts than the market's whole net
+    position cap.
+
+    The cap is enforced when orders are SIZED, against the position as read at
+    the start of the cycle — it is not a hard limit at fill time. So the real
+    bound is (position last seen) + (whatever a single re-place can carry),
+    and when a side ladder is bigger than the cap itself that second term
+    dominates.
+
+    Live 2026-08-04, KXTEMPAUSH-26AUG0409-T79.99, cap 50: the bot was long
+    +25, so sell room was 50+25=75, trimmed to the ladder's side max of 60
+    (20/side x the 3.0 deep-reference multiplier) and it rested 60. 35 filled,
+    taking the position to -10, and 28 seconds later — before that fill was
+    observed — it re-placed a full 60 sized off the stale +25. That filled
+    too: 25 - 35 - 60 = -70 against a 50 cap. The fill-burst breaker would
+    have caught the 35-lot move, but IMM_BREAKERS defaults to 0.
+
+    Clamping here does not make the cap hard (only a pre-place position
+    re-read would), but it removes the case where ONE order exceeds the whole
+    cap, which is what turned a 35-contract surprise into a 20-contract
+    breach. Non-temp series are unaffected: 20/side x 3.0 = 60 sits well under
+    their 150 cap.
+
+    NOTE the collateral reservation (market_cost) still charges the unclamped
+    ref multiplier, so it now over-reserves slightly on clamped markets. That
+    is the safe direction and is left alone deliberately."""
+    if maxpos <= 0:
+        return side_max_bid, side_max_ask
+    cap = int(maxpos)
+    return min(side_max_bid, cap), min(side_max_ask, cap)
+
+
 @dataclass(frozen=True)
 class SeriesOverride:
     """Per-series overrides of the global quoting spec (user-directed)."""
@@ -3617,6 +3651,10 @@ class IncentiveMarketMaker:
             base_side_max = sum(s for _t, s in lv)
             side_max_bid = int(round(base_side_max * meta.ref_mult_bid))
             side_max_ask = int(round(base_side_max * meta.ref_mult_ask))
+            # same clamp the quote loop applies, or the estimate models a
+            # ladder bigger than the bot will ever rest and overstates share
+            side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
+                side_max_bid, side_max_ask, series_max_position(meta.series))
             quotes: List[Quote] = []
             # atref: the band gates PLACEMENT no longer follows the touch, so
             # a touch outside the band must not kill the side (rain books
@@ -4422,6 +4460,8 @@ class IncentiveMarketMaker:
                                      capped_ref_mult(ext_ask, ref_ask_px, "ask",
                                                      hour_mult=hm)))
             maxpos = series_max_position(meta.series)
+            side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
+                side_max_bid, side_max_ask, maxpos)
             cap_pos = own_pos if quote_all else pos
             room_buy = min(maxpos - cap_pos, share_buy, side_max_bid)
             room_sell = min(maxpos + cap_pos, share_sell, side_max_ask)
