@@ -582,7 +582,8 @@ def series_min_est_total(series: str) -> float:
     the floor is compared against an OPTIMISTIC projection (accrued + best of
     current/1h-peak), so a series bar below the exchange's own $1 minimum
     admits markets whose very best case is a payout of zero. KXTEMP's $0.70
-    was exactly that (~40 such markets per clean-window day). The GLOBAL knob
+    was exactly that (40 markets landed in the dead $0.70-$1.00 band over the
+    2026-08-02..04 window, ~20/day, earning $0). The GLOBAL knob
     is left alone so setting it to 0 still disables floors wholesale, which is
     how the cutoff/mention-window tests isolate their subject."""
     ov = SERIES_OVERRIDES.get(series)
