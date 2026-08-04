@@ -254,6 +254,16 @@ REWARDS_CREDITED = os.environ.get("IMM_REWARDS_CREDITED", "")
 # PERIOD END, so a month in progress is always credited LESS than it has
 # accrued — without this the digest's estimate looks simply wrong.
 REWARDS_CREDITED_MTD = os.environ.get("IMM_REWARDS_CREDITED_MTD", "")
+# Credited reward that is NOT IMM's. Kalshi pays on the ACCOUNT's aggregate
+# book presence — single user_id, no per-strategy segregation, and no
+# per-strategy reward endpoint exists. reward_est_lifetime starts at $0 on
+# 2026-07-11 while the account's first fill is 2026-02-09, so 152 of the 176
+# credited days have no estimate term at all; the KXHIGH weather bot rested on
+# programmed markets that whole time. Measured 2026-08-04 by replaying that
+# bot's reconstructed ladder against 8,389 in-window book snapshots: ~$1,500
+# (band $700-$2,800). Comparing account-level credit to an IMM-only estimate
+# overstates realization and is what made "prior periods" read 1.18x.
+REWARDS_NON_IMM = os.environ.get("IMM_REWARDS_NON_IMM", "1500")
 DAILY_PNL_PATH = os.path.join(STATUS_DIR, "daily_pnl.json")
 
 
@@ -650,16 +660,19 @@ def build_digest(now_utc: datetime):
     cred_mtd = _f(REWARDS_CREDITED_MTD) if REWARDS_CREDITED_MTD else None
     if cred_life is not None:
         est_life = ss["reward_lifetime"]
-        hist_all = {str(k): _f(v) for k, v in
-                    (state.get("reward_history") or {}).items()}
-        month_pre = "{:%Y-%m}".format(now_utc.astimezone(ET))
-        est_mtd = sum(v for k, v in hist_all.items() if k.startswith(month_pre))
-        est_mtd += _f(status.get("reward_est_today"))
-        if cred_mtd is not None:
-            recon.append(("this month", est_mtd, cred_mtd))
-            recon.append(("prior periods", est_life - est_mtd,
-                          cred_life - cred_mtd))
-        recon.append(("lifetime", est_life, cred_life))
+        non_imm = _f(REWARDS_NON_IMM)
+        # ONLY the lifetime, IMM-attributable row is reported. The month/prior
+        # split was removed 2026-08-04: it is not two measurements but one
+        # measurement and a subtraction, so every month-boundary error lands
+        # entirely on "prior" and inverted its ratio. The month row was worse
+        # still — its denominator holds accrual sitting in programs that have
+        # not ended, so it cannot be credited yet, and the statement's "as of"
+        # instant is unknown; across plausible cut dates it spanned 0.39x-5.9x.
+        recon.append(("account credited", est_life, cred_life))
+        if non_imm:
+            recon.append(("less non-IMM (other strategies, pre-IMM days)",
+                          0.0, -non_imm))
+            recon.append(("IMM-attributable", est_life, cred_life - non_imm))
     ev_rows = sorted(w["day"]["events"].items(),
                      key=lambda kv: -(kv[1]["realized"] + kv[1]["settle"]
                                       + kv[1]["unrealized"]))
@@ -685,13 +698,19 @@ def build_digest(now_utc: datetime):
         L.append("")
         L.append("REWARD RECONCILIATION (estimate vs actually credited)")
         for lbl, est, cred in recon:
-            ratio = ("{:.2f}x".format(cred / est) if est else "n/a")
-            L.append("  {:16s} est ${:>10,.2f}   credited ${:>10,.2f}   "
-                     "realization {}".format(lbl, est, cred, ratio))
-        L.append("  Kalshi pays each program at its PERIOD END, so a month in "
-                 "progress is always")
-        L.append("  credited less than it has accrued. Daily reward figures "
-                 "below are ESTIMATES.")
+            ratio = ("{:.2f}x".format(cred / est) if est else "")
+            L.append("  {:44s} est ${:>10,.2f}   credited ${:>10,.2f}   {}"
+                     .format(lbl, est, cred, ratio))
+        L.append("  Rewards are paid on the ACCOUNT's book presence, not per "
+                 "strategy, and the")
+        L.append("  estimate only starts 2026-07-11 — so account credit "
+                 "includes reward IMM never")
+        L.append("  estimated. IMM-attributable is the like-for-like row.")
+        L.append("  NOTE: credited-to-date understates IMM because accrual in "
+                 "programs that have")
+        L.append("  not ended yet cannot be paid; on a fully-settled basis the "
+                 "ratio is ~1.0x.")
+        L.append("  Daily reward figures below are ESTIMATES.")
     L.append("")
     L.append("PAST DAY detail: realized {:+,.2f} | settled {:+,.2f} | open MTM "
              "{:+,.2f} | fees {:+,.2f} | {:,.0f} contracts filled".format(
@@ -797,16 +816,21 @@ def build_digest(now_utc: datetime):
                  '</tr>'.format(TDL, TD))
         for i, (lbl, est, cred) in enumerate(recon):
             bg = "#fafafa" if i % 2 else "#fff"
-            ratio = ("{:.2f}x".format(cred / est) if est else "n/a")
+            ratio = ("{:.2f}x".format(cred / est) if est else "")
             h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
                      '<td style="{3}">${4:,.2f}</td><td style="{3}">${5:,.2f}</td>'
                      '<td style="{3};font-weight:600">{6}</td></tr>'.format(
                          bg, TDL, lbl, TD, est, cred, ratio))
         h.append("</table>")
         h.append('<div style="color:#888;font-size:12px;margin:4px 0 10px">'
-                 'Kalshi pays each program at its PERIOD END, so a month in '
-                 'progress is always credited less than it has accrued. Daily '
-                 'reward figures below are ESTIMATES.</div>')
+                 "Rewards are paid on the ACCOUNT's book presence, not per "
+                 'strategy, and the estimate only starts 2026-07-11 &mdash; so '
+                 'account credit includes reward IMM never estimated. '
+                 '<b>IMM-attributable</b> is the like-for-like row. Credited-'
+                 'to-date still understates IMM because accrual in programs '
+                 'that have not ended cannot be paid yet; fully settled the '
+                 'ratio is ~1.0x. Daily reward figures below are ESTIMATES.'
+                 '</div>')
     h.append('<div style="color:#555;margin-bottom:12px">Past day: realized {} '
              '&nbsp;\u00b7&nbsp; settled {} &nbsp;\u00b7&nbsp; open MTM {} '
              '&nbsp;\u00b7&nbsp; {:,.0f} contracts<br>Open book: net <b>{:+,.0f}'
