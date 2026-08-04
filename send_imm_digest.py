@@ -250,6 +250,11 @@ def event_rows(client):
 # exposes no credits endpoint — verified 2026-08-03 across 8 paths). Update
 # from the statement; falls back to the bot's estimate when unset.
 REWARDS_CREDITED = os.environ.get("IMM_REWARDS_CREDITED", "")
+# Current-month credited, also from the statement. Kalshi pays a program at its
+# PERIOD END, so a month in progress is always credited LESS than it has
+# accrued — without this the digest's estimate looks simply wrong.
+REWARDS_CREDITED_MTD = os.environ.get("IMM_REWARDS_CREDITED_MTD", "")
+DAILY_PNL_PATH = os.path.join(STATUS_DIR, "daily_pnl.json")
 
 
 def fetch_own_fills(client, our_ids: set, hours: int) -> list:
@@ -365,6 +370,10 @@ def daily_series(client, fills, mids, results, state, days=60):
         day = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET).date()
         by_day[day].append(f)
     hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
+    # Backfilled per-day RAW P&L (imm_backfill_daily_pnl.py) reaches back to
+    # the bot's first fill, well past the fill-attribution window available
+    # live. Prefer it for any day it covers.
+    backfill = load_json(DAILY_PNL_PATH)
     out = []
     today = datetime.now(timezone.utc).astimezone(ET).date()
     # Every prior day that EARNED rewards (Jack 2026-08-03) — union of the
@@ -383,16 +392,30 @@ def daily_series(client, fills, mids, results, state, days=60):
             continue                       # only PRIOR days
         reward = hist.get(key)
         dfills = by_day.get(day, [])
-        if dfills:
+        bf = backfill.get(key)
+        if bf:                              # authoritative: full-history rebuild
+            raw = _f(bf.get("raw"))
+            contracts, nf = _f(bf.get("contracts")), int(bf.get("fills") or 0)
+        elif dfills:
             tot, _ev, _p = raw_pnl_for_fills(client, dfills, mids, results)
             raw, contracts, nf = tot["raw"], tot["contracts"], len(dfills)
         elif reward is not None:
-            raw, contracts, nf = None, 0.0, 0   # outside fill attribution
+            raw, contracts, nf = None, 0.0, 0
         else:
             continue
-        if reward is None and not dfills:
-            continue
         out.append((day, raw, reward, contracts, nf))
+    for key, bf in backfill.items():        # days with P&L but no reward record
+        if key in hist:
+            continue
+        try:
+            day = datetime.strptime(key, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if day >= today or any(r[0] == day for r in out):
+            continue
+        out.append((day, _f(bf.get("raw")), None, _f(bf.get("contracts")),
+                    int(bf.get("fills") or 0)))
+    out.sort(key=lambda r: r[0])
     return out
 
 
@@ -610,7 +633,6 @@ def build_digest(now_utc: datetime):
     except Exception:
         bal_str = "?"
     health = health_line(status, ss)
-    rd = rain_dir_section(client)
 
     def net_of(k):
         r = w[k]["reward"]
@@ -620,6 +642,24 @@ def build_digest(now_utc: datetime):
         return "{:+,.2f}".format(v) if v is not None else dash
 
     d = w["day"]["detail"]
+    # est-vs-credited, split at the month boundary: the completed prior period
+    # is the only fair test of the estimator; the current month is dominated by
+    # unpaid in-flight programs.
+    recon = []
+    cred_life = _f(REWARDS_CREDITED) if REWARDS_CREDITED else None
+    cred_mtd = _f(REWARDS_CREDITED_MTD) if REWARDS_CREDITED_MTD else None
+    if cred_life is not None:
+        est_life = ss["reward_lifetime"]
+        hist_all = {str(k): _f(v) for k, v in
+                    (state.get("reward_history") or {}).items()}
+        month_pre = "{:%Y-%m}".format(now_utc.astimezone(ET))
+        est_mtd = sum(v for k, v in hist_all.items() if k.startswith(month_pre))
+        est_mtd += _f(status.get("reward_est_today"))
+        if cred_mtd is not None:
+            recon.append(("this month", est_mtd, cred_mtd))
+            recon.append(("prior periods", est_life - est_mtd,
+                          cred_life - cred_mtd))
+        recon.append(("lifetime", est_life, cred_life))
     ev_rows = sorted(w["day"]["events"].items(),
                      key=lambda kv: -(kv[1]["realized"] + kv[1]["settle"]
                                       + kv[1]["unrealized"]))
@@ -641,6 +681,17 @@ def build_digest(now_utc: datetime):
         L.append("  (past-day reward pending the next 5am-CT roll)")
     L.append("  lifetime reward basis: {}; bot estimate ${:,.2f}".format(
         w["life"]["basis"], ss["reward_lifetime"]))
+    if recon:
+        L.append("")
+        L.append("REWARD RECONCILIATION (estimate vs actually credited)")
+        for lbl, est, cred in recon:
+            ratio = ("{:.2f}x".format(cred / est) if est else "n/a")
+            L.append("  {:16s} est ${:>10,.2f}   credited ${:>10,.2f}   "
+                     "realization {}".format(lbl, est, cred, ratio))
+        L.append("  Kalshi pays each program at its PERIOD END, so a month in "
+                 "progress is always")
+        L.append("  credited less than it has accrued. Daily reward figures "
+                 "below are ESTIMATES.")
     L.append("")
     L.append("PAST DAY detail: realized {:+,.2f} | settled {:+,.2f} | open MTM "
              "{:+,.2f} | fees {:+,.2f} | {:,.0f} contracts filled".format(
@@ -696,9 +747,6 @@ def build_digest(now_utc: datetime):
                      e_tot["unrealized"], e_tot["contracts"], e_tot["mkts"]))
     else:
         L.append("  (no fills in the past 24h)")
-    if rd:
-        L.append("")
-        L.extend(rd[0])
     L.append("")
     L.append(health)
     text = "\n".join(L)
@@ -739,6 +787,26 @@ def build_digest(now_utc: datetime):
         notes.append("past-day reward pending the next 5am-CT roll")
     h.append('<div style="color:#888;font-size:12px;margin-bottom:10px">{}</div>'
              .format(" &nbsp;\u00b7&nbsp; ".join(notes)))
+    if recon:
+        h.append('<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
+                 'Reward reconciliation (estimate vs credited)</div>')
+        h.append('<table style="border-collapse:collapse">')
+        h.append('<tr style="background:#f0f0f0;font-weight:600">'
+                 '<td style="{0}">PERIOD</td><td style="{1}">ESTIMATE</td>'
+                 '<td style="{1}">CREDITED</td><td style="{1}">REALIZATION</td>'
+                 '</tr>'.format(TDL, TD))
+        for i, (lbl, est, cred) in enumerate(recon):
+            bg = "#fafafa" if i % 2 else "#fff"
+            ratio = ("{:.2f}x".format(cred / est) if est else "n/a")
+            h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
+                     '<td style="{3}">${4:,.2f}</td><td style="{3}">${5:,.2f}</td>'
+                     '<td style="{3};font-weight:600">{6}</td></tr>'.format(
+                         bg, TDL, lbl, TD, est, cred, ratio))
+        h.append("</table>")
+        h.append('<div style="color:#888;font-size:12px;margin:4px 0 10px">'
+                 'Kalshi pays each program at its PERIOD END, so a month in '
+                 'progress is always credited less than it has accrued. Daily '
+                 'reward figures below are ESTIMATES.</div>')
     h.append('<div style="color:#555;margin-bottom:12px">Past day: realized {} '
              '&nbsp;\u00b7&nbsp; settled {} &nbsp;\u00b7&nbsp; open MTM {} '
              '&nbsp;\u00b7&nbsp; {:,.0f} contracts<br>Open book: net <b>{:+,.0f}'
@@ -820,8 +888,6 @@ def build_digest(now_utc: datetime):
         h.append("</table>")
     else:
         h.append("<div>No fills in the past 24h.</div>")
-    if rd:
-        h.append(rd[1])
     h.append('<div style="color:#777;font-size:12px;margin-top:12px;'
              'border-top:1px solid #eee;padding-top:8px">{}</div>'.format(health))
     h.append("</div>")

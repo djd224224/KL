@@ -806,7 +806,12 @@ _DEFAULT_COMPANY_SERIES = (
     "KXSCHW,KXCMG,KXAMZN,KXCOINBASE,KXCVNA,KXDPZ,KXFSLR,KXFSLRA,KXLUV,"
     "KXNCLH,KXRBLX,KXSBUX,KXTLN,KXTLNA,KXWH,KXYOU,KXRACE,"
     "KXSBUXSAR,KXCFACHICKSAND,KXPOPCHICKSAND,KXCHIPBURRITO,KXDDCOLDBREW,"
-    "KXBKNUGGETS,KXAMSAVO")
+    "KXBKNUGGETS,KXAMSAVO,"
+    # Monthly FOOT TRAFFIC (Jack 2026-08-03 "why do KXBKFT and KXYUMTBFT not
+    # get quoted"): never enrolled — the auto-classifier files day-dated
+    # T-threshold shapes (26SEP07-T100) as REVIEW, not enroll. Same consumer-
+    # metric class as the price trackers; re-entry guards apply.
+    "KXBKFT,KXYUMTBFT")
 # Economic-data / price-index prints (Jack 2026-07-23): recurring published
 # statistics — AAA gas price (daily/weekly/monthly), new-home sales, gas CPI,
 # the Shanghai freight index. Day-dated tickers -> the midnight-ET rule stops
@@ -891,7 +896,7 @@ _REENTRY_SERIES = (
     # keeps IMM out of print-day books, so no 3:20am sniper collision.
     # Diesel enrolled 2026-08-02 evening (same class, never allowed before).
     "KXAC,KXNHSALES,KXSCFI,KXAAAGASD,KXAAAGASW,KXAAAGASM,KXUSGASCPI,"
-    "KXDIESELD,KXDIESELW")
+    "KXDIESELD,KXDIESELW,KXBKFT,KXYUMTBFT")
 for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
     if _s.strip() and _s.strip() not in SERIES_OVERRIDES:
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
