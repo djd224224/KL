@@ -4190,6 +4190,57 @@ class TestPayoutFloorAccounting(unittest.TestCase):
             _clean_persist()
 
 
+class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
+    """Jack 2026-08-04: allowlist the five daily Treasury-yield tenors."""
+
+    TENORS = ("KXUST2AD", "KXUST5AD", "KXUST7AD", "KXUST10AD", "KXUST30AD")
+
+    def setUp(self):
+        # Other suites toggle these and don't always restore them; pin them so
+        # this asserts enrolment rather than whatever ran before it.
+        self._saved = (imm.ALLOWLIST_ONLY, set(imm.EXTRA_ALLOW_SERIES))
+        imm.ALLOWLIST_ONLY = True
+        imm.EXTRA_ALLOW_SERIES.clear()
+
+    def tearDown(self):
+        imm.ALLOWLIST_ONLY = self._saved[0]
+        imm.EXTRA_ALLOW_SERIES.clear()
+        imm.EXTRA_ALLOW_SERIES.update(self._saved[1])
+
+    def test_all_five_tenors_are_allowed(self):
+        for s in self.TENORS:
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(
+                imm.IncentiveMarketMaker._allowed(f"{s}-26AUG05-T4.25"), s)
+
+    def test_they_carry_the_guarded_re_entry_treatment(self):
+        """A rate print sits tight and two-sided until the number lands, so
+        joining the touch is the expensive way to be there."""
+        for s in self.TENORS:
+            self.assertTrue(imm.series_safe_join(s), s)
+            self.assertGreater(imm.series_min_est_rate(s), 0.0, s)
+
+    def test_monthly_variants_are_not_swept_in(self):
+        # Jack named the AD (daily) tickers; KXUST*AM monthlies stay out, and
+        # exact-series matching means no prefix bleed.
+        for s in ("KXUST2AM", "KXUST10AM", "KXUST30AM"):
+            self.assertNotIn(s, imm.ALLOW_SERIES, s)
+            self.assertFalse(
+                imm.IncentiveMarketMaker._allowed(f"{s}-26AUG31-T4.25"), s)
+
+    def test_day_dated_tickers_still_stop_before_the_print(self):
+        """The midnight-ET rule must keep applying: the market closes at
+        15:30 ET on the print day, and the bot must be out before that day
+        starts. This is what bounds the enrolment to the evening before."""
+        close = imm.ET.localize(datetime(2026, 8, 5, 15, 30)).astimezone(timezone.utc)
+        cut = imm.trade_cutoff_utc("KXUST10AD-26AUG05", None, close)
+        cut = imm.apply_series_cutoff_adjustments("KXUST10AD", "KXUST10AD-26AUG05",
+                                                  cut, close)
+        self.assertIsNotNone(cut)
+        self.assertEqual(cut.astimezone(imm.ET).strftime("%Y-%m-%d %H:%M"),
+                         "2026-08-05 00:00")
+
+
 class TestPerSeriesHourMultiplier(unittest.TestCase):
     """Jack 2026-08-04: halve the ladder on KXDIESELD / KXAAAGASD / KXRAIN
     from 4pm ET. Window runs to 01:59 ET because the gas/diesel dailies trade

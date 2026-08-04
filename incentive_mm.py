@@ -951,10 +951,24 @@ _DEFAULT_ECON_SERIES = (
 # no_new'd while its screens passed). Entertainment reveals are not macro
 # prints; keep this list OUT of NO_NEW_SERIES.
 _DEFAULT_ENTERTAINMENT_SERIES = "KXRT"
+# US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
+# KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
+# quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
+# strikes each, roughly half the whole unquoted estimate — held out only by
+# never having been enrolled. Structurally the same as the gas/CPI prints: a
+# published number on a known day, day-dated tickers (KXUST10AD-26AUG04) that
+# PARSE, so the midnight-ET rule stops quoting before each print day, which
+# is the safe direction. Enrolled through the guarded re-entry set below
+# (safe-join placement + the $2/day rate bar; their ~$102/day/market pools
+# clear that bar by two orders of magnitude, so it guards a dead book rather
+# than gating these).
+_DEFAULT_RATES_SERIES = "KXUST2AD,KXUST5AD,KXUST7AD,KXUST10AD,KXUST30AD"
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_ECON_SERIES", _DEFAULT_ECON_SERIES)
+                + "," + os.environ.get("IMM_ALLOW_RATES_SERIES",
+                                       _DEFAULT_RATES_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_ENTERTAINMENT_SERIES",
                                        _DEFAULT_ENTERTAINMENT_SERIES)
                 ).split(",") if s)
@@ -1013,7 +1027,11 @@ _REENTRY_SERIES = (
     # keeps IMM out of print-day books, so no 3:20am sniper collision.
     # Diesel enrolled 2026-08-02 evening (same class, never allowed before).
     "KXAC,KXNHSALES,KXSCFI,KXAAAGASD,KXAAAGASW,KXAAAGASM,KXUSGASCPI,"
-    "KXDIESELD,KXDIESELW,KXBKFT,KXYUMTBFT")
+    "KXDIESELD,KXDIESELW,KXBKFT,KXYUMTBFT,"
+    # Treasury yields enrolled 2026-08-04 — a rate print is exactly the book
+    # safe-join exists for: it sits tight and two-sided until the number
+    # lands, so joining the touch is the expensive way to be there.
+    + _DEFAULT_RATES_SERIES)
 for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
     if _s.strip() and _s.strip() not in SERIES_OVERRIDES:
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
