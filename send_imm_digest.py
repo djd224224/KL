@@ -23,6 +23,7 @@ back to HKCU\Environment (works under Task Scheduler's stripped env).
 """
 
 import argparse
+import collections
 import glob
 import json
 import os
@@ -54,7 +55,13 @@ from incentive_mm import (CT, ET, STATUS_DIR, Alerter, PnlTracker,  # noqa: E402
 STALE_AFTER_MINUTES = 30
 STATE_PATH = os.path.join(STATUS_DIR, "imm_state.json")
 STATUS_PATH = os.path.join(STATUS_DIR, "status_incentive_mm.json")
-FILL_LOOKBACK_HOURS = int(os.environ.get("IMM_DIGEST_FILL_HOURS", 96))
+# 96 -> 168 (Jack 2026-08-03: "i do hold multi-week inventory"). 168h is the
+# HARD ceiling for fill-based attribution: fills carry no client_order_id and
+# the bot's our_order_ids map prunes at 7 days, so nothing older can be
+# attributed to the bot at all. Multi-week positions are therefore handled by
+# the bot's PERSISTED realized_lifetime counter (which captures settlements of
+# arbitrarily old holds) plus own-book MTM — not by this window.
+FILL_LOOKBACK_HOURS = int(os.environ.get("IMM_DIGEST_FILL_HOURS", 168))
 # NOTE on reconciling estimates vs Kalshi credits (Jack 2026-07-21): a naive
 # same-day comparison is WRONG — programs run multiple days and a day's
 # accrual can pay out across the program's life, so an "est $536 vs paid $300"
@@ -199,27 +206,11 @@ def event_rows(client):
     except Exception as e:
         log(f"! resting-order read failed: {e}")
 
-    realized, rep_pos, rep_avg = replay_realized(client, our_ids)
-    # Settlement P&L (2026-08-03 fix): a position the bot held into settlement
-    # is dropped from the persisted own-book, so it appears in NEITHER
-    # realized-from-fills NOR unrealized — the loss (or gain) vanished from
-    # the digest entirely. Book it here from the replayed position whenever
-    # the market has settled and the own-book no longer carries it.
-    mids, results = current_mids(
-        client, set(pos) | set(rep_pos) | {t for t in realized})
-    settled_pnl = {}
-    for t, rp in rep_pos.items():
-        if abs(rp) < 0.01 or t not in results:
-            continue
-        if abs(pos.get(t, 0.0)) >= 0.01:
-            continue                    # still open in the own-book: not settled out
-        val = 100.0 if results[t] == "yes" else 0.0
-        settled_pnl[t] = rp * (val - rep_avg.get(t, 0.0)) / 100.0
-    for t, v in settled_pnl.items():
-        realized[t] = realized.get(t, 0.0) + v
-    if settled_pnl:
-        log(f"booked settlement P&L on {len(settled_pnl)} market(s): "
-            f"${sum(settled_pnl.values()):+,.2f}")
+    # P&L now comes from pnl_windows() (raw_pnl_for_fills handles settlement
+    # booking per window); this function only reports the CURRENT open book
+    # and resting quotes, so it no longer replays fills.
+    realized = {}
+    mids, _results = current_mids(client, set(pos))
 
     events = {}
     for t, p in pos.items():
@@ -253,6 +244,183 @@ def event_rows(client):
     return rows, tot, {"collateral": resting_collateral,
                        "orders": sum(resting_by_event.values()),
                        "events": len(resting_by_event)}
+
+
+# Rewards actually CREDITED by Kalshi, from the account statement (Kalshi
+# exposes no credits endpoint — verified 2026-08-03 across 8 paths). Update
+# from the statement; falls back to the bot's estimate when unset.
+REWARDS_CREDITED = os.environ.get("IMM_REWARDS_CREDITED", "")
+
+
+def fetch_own_fills(client, our_ids: set, hours: int) -> list:
+    """The bot's own fills over `hours`, newest-first pagination exhausted.
+    Attribution is by order id — the account is shared with the crypto fleet,
+    the cloud bots and Jack's manual trading."""
+    out, cursor, seen = [], None, set()
+    min_ts = int(time.time()) - hours * 3600
+    try:
+        for _page in range(600):
+            resp = client.get_fills(min_ts=min_ts, limit=200, cursor=cursor)
+            batch = resp.get("fills") or []
+            for f in batch:
+                fid = f.get("fill_id") or f.get("trade_id") or ""
+                if f.get("order_id") not in our_ids or fid in seen:
+                    continue
+                seen.add(fid)
+                out.append(f)
+            cursor = resp.get("cursor")
+            if not cursor or not batch:
+                break
+    except Exception as e:
+        log(f"! fill fetch failed ({e})")
+    return out
+
+
+def _yes_delta_and_price(f):
+    """(yes_delta_contracts, price_in_yes_cents, fee). A NO buy is a SHORT
+    yes position priced at yes_price_dollars — the sign trap in this data."""
+    cnt = _f(f.get("count_fp") or f.get("count"))
+    px = f.get("yes_price_dollars")
+    pxc = _f(px) * 100 if px is not None else _f(f.get("yes_price"))
+    side, action = f.get("side"), f.get("action")
+    if (side, action) == ("yes", "buy"):
+        yd = cnt
+    elif (side, action) == ("yes", "sell"):
+        yd = -cnt
+    elif (side, action) == ("no", "buy"):
+        yd = -cnt
+    else:
+        yd = cnt
+    return yd, pxc, _f(f.get("fee_cost"))
+
+
+def raw_pnl_for_fills(client, fills, mids=None, results=None):
+    """RAW (trading-only) P&L for a set of fills: realized from offsetting
+    fills + settlement on the residual position + MTM on what is still open,
+    minus fees. Returns (totals, per_event, per_ticker_positions)."""
+    pnl = PnlTracker()
+    fees = 0.0
+    for f in sorted(fills, key=lambda x: x.get("ts") or 0):
+        cnt = _f(f.get("count_fp") or f.get("count"))
+        side, action = f.get("side"), f.get("action")
+        px = f.get("yes_price_dollars")
+        pxc = _f(px) * 100 if px is not None else _f(f.get("yes_price"))
+        if side in ("yes", "no") and action in ("buy", "sell") and cnt > 0:
+            pnl.on_fill(f.get("ticker", "?"), side, action, cnt, pxc)
+        fees += _f(f.get("fee_cost"))
+    tickers = set(pnl.pos) | set(pnl.realized)
+    if mids is None or results is None:
+        mids, results = current_mids(client, tickers)
+    settle, unreal = {}, {}
+    for t, p in pnl.pos.items():
+        if abs(p) < 0.01:
+            continue
+        a = pnl.avg.get(t, 0.0)
+        if t in results:                       # settled: book the real outcome
+            val = 100.0 if results[t] == "yes" else 0.0
+            settle[t] = p * (val - a) / 100.0
+        elif mids.get(t) is not None:          # still open: mark to mid
+            unreal[t] = p * (mids[t] - a) / 100.0
+    per_event = collections.defaultdict(
+        lambda: {"realized": 0.0, "settle": 0.0, "unrealized": 0.0,
+                 "net_pos": 0.0, "mkts": set(), "contracts": 0.0})
+    for t, v in pnl.realized.items():
+        per_event[_event_of(t)]["realized"] += v
+        per_event[_event_of(t)]["mkts"].add(t)
+    for t, v in settle.items():
+        per_event[_event_of(t)]["settle"] += v
+        per_event[_event_of(t)]["mkts"].add(t)
+    for t, v in unreal.items():
+        per_event[_event_of(t)]["unrealized"] += v
+        per_event[_event_of(t)]["mkts"].add(t)
+    for t, p in pnl.pos.items():
+        per_event[_event_of(t)]["net_pos"] += p
+    for f in fills:
+        per_event[_event_of(f.get("ticker", "?"))]["contracts"] += \
+            _f(f.get("count_fp") or f.get("count"))
+    totals = {
+        "realized": sum(pnl.realized.values()),
+        "settle": sum(settle.values()),
+        "unrealized": sum(unreal.values()),
+        "fees": fees,
+        "contracts": sum(_f(f.get("count_fp") or f.get("count")) for f in fills),
+        "open_markets": sum(1 for t, p in pnl.pos.items()
+                            if abs(p) >= 0.01 and t not in results),
+    }
+    totals["raw"] = (totals["realized"] + totals["settle"]
+                     + totals["unrealized"] - fees)
+    return totals, per_event, pnl
+
+
+def daily_series(client, fills, mids, results, days=7):
+    """[(date_et, raw, contracts, fills_n)] for the last `days` ET days.
+    A fill is attributed to the ET day it occurred; the P&L of the position
+    it leaves behind is evaluated at settlement/mark. This is a per-day
+    TRADING result, so a day's number can move until its positions settle."""
+    by_day = collections.defaultdict(list)
+    for f in fills:
+        ts = f.get("ts")
+        if not ts:
+            continue
+        day = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET).date()
+        by_day[day].append(f)
+    out = []
+    today = datetime.now(timezone.utc).astimezone(ET).date()
+    for i in range(days, 0, -1):
+        day = today - timedelta(days=i - 1)
+        dfills = by_day.get(day, [])
+        if not dfills:
+            out.append((day, 0.0, 0.0, 0))
+            continue
+        tot, _ev, _p = raw_pnl_for_fills(client, dfills, mids, results)
+        out.append((day, tot["raw"], tot["contracts"], len(dfills)))
+    return out
+
+
+def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime):
+    """RAW (trading-only) and NET (raw + rewards) for past day / past week /
+    lifetime. Lifetime RAW comes from the bot's PERSISTED realized_lifetime
+    (the only source that survives restarts AND captures settlements of
+    multi-week holds) plus current own-book MTM."""
+    now = time.time()
+    day_fills = [f for f in fills if _f(f.get("ts")) >= now - 86400]
+    week_fills = fills
+    day_tot, day_ev, _ = raw_pnl_for_fills(client, day_fills, mids, results)
+    week_tot, _, _ = raw_pnl_for_fills(client, week_fills, mids, results)
+
+    # lifetime: persisted realized + MTM on the persisted own-book
+    pos, avg = own_book(state)
+    life_realized = _f(state.get("realized_lifetime"))
+    life_unreal = 0.0
+    for t, p in pos.items():
+        m = mids.get(t)
+        if m is not None:
+            life_unreal += p * (m - avg.get(t, 0.0)) / 100.0
+    life_raw = life_realized + life_unreal
+
+    credited = _f(REWARDS_CREDITED) if REWARDS_CREDITED else None
+    rew_life = credited if credited else reward_lifetime
+    rew_basis = "credited (statement)" if credited else "bot estimate"
+    # Sub-window rewards come from the persisted per-day history; days before
+    # the 2026-08-03 fix are missing and are reported as such rather than
+    # silently summed to a wrong number.
+    hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
+    today_et = datetime.now(timezone.utc).astimezone(ET).date()
+    day_key = (today_et - timedelta(days=1)).isoformat()
+    rew_day = hist.get(day_key)
+    week_keys = [(today_et - timedelta(days=i)).isoformat() for i in range(1, 8)]
+    have = [hist[k] for k in week_keys if k in hist]
+    rew_week = sum(have) if have else None
+    return {
+        "day": {"raw": day_tot["raw"], "reward": rew_day, "detail": day_tot,
+                "events": day_ev, "have_reward": rew_day is not None,
+                "reward_days": 1 if rew_day is not None else 0},
+        "week": {"raw": week_tot["raw"], "reward": rew_week, "detail": week_tot,
+                 "have_reward": rew_week is not None, "reward_days": len(have)},
+        "life": {"raw": life_raw, "reward": rew_life, "have_reward": True,
+                 "realized": life_realized, "unrealized": life_unreal,
+                 "basis": rew_basis},
+    }
 
 
 def last_full_day_reward(state: dict, status: dict, today_ct):
@@ -401,116 +569,184 @@ def build_digest(now_utc: datetime):
     today_ct = now_utc.astimezone(CT).date()
     client = build_client()
     status = load_json(STATUS_PATH)
+    state = load_json(STATE_PATH)
     ss = status_summary(status)
-    reward_amt, reward_label = last_full_day_reward(
-        load_json(STATE_PATH), status, today_ct)
+    reward_amt, reward_label = last_full_day_reward(state, status, today_ct)
     ss["reward"] = reward_amt
     ss["reward_label"] = reward_label
+    our_ids = set(state.get("our_order_ids") or {})
 
-    rows, tot, resting = event_rows(client)
-    total_pnl = tot["realized"] + tot["unrealized"]
+    # One fill pull + one market read drives every window below.
+    fills = fetch_own_fills(client, our_ids, FILL_LOOKBACK_HOURS)
+    pos, avg = own_book(state)
+    touched = {f.get("ticker", "") for f in fills} | set(pos)
+    mids, results = current_mids(client, touched)
+    w = pnl_windows(client, state, our_ids, fills, mids, results,
+                    ss["reward_lifetime"])
+    series = daily_series(client, fills, mids, results, days=7)
+    rows, tot, resting = event_rows(client)     # open book + resting quotes
 
     try:
-        balance = _f(client.get_balance().get("balance_dollars"))
-        bal_str = f"${balance:,.2f}"
+        bal_str = "${:,.2f}".format(_f(client.get_balance().get("balance_dollars")))
     except Exception:
         bal_str = "?"
-
     health = health_line(status, ss)
-    reward, cmin, eff = ss["reward"], ss["contract_min"], ss["efficiency"]
-    reward_lifetime = ss["reward_lifetime"]
-
-    # ---- plain text (fallback part) ----------------------------------------
-    lines = [f"Kalshi incentive MM — {today_ct}", ""]
-    lines.append(f"TOTAL EST REWARD (cumulative): ${reward_lifetime:,.2f}")
-    lines.append(f"EST REWARD ({ss['reward_label']}): ${reward:,.2f}  "
-                 f"({cmin:,.0f} contract-min, {eff:.1f}c/1k-contract-min)")
-    lines.append(f"P&L: {total_pnl:+,.2f}  (realized {tot['realized']:+,.2f}, "
-                 f"unrealized {tot['unrealized']:+,.2f})")
-    lines.append(f"Net position {tot['net_pos']:+,.0f} contracts | "
-                 f"inventory exposure ${tot['exposure']:,.2f} | "
-                 f"resting quotes ${resting['collateral']:,.2f} "
-                 f"({resting['orders']} orders / {resting['events']} events) | "
-                 f"balance {bal_str}")
-    lines.append("")
-    if rows:
-        lines.append(f"{'EVENT':26s} {'P&L$':>8s} {'REAL$':>8s} {'UNREAL$':>8s} "
-                     f"{'NET':>6s} {'EXPO$':>8s} {'Q':>3s}")
-        for ev, d in rows:
-            lines.append(f"{_short_event(ev)[:26]:26s} {d['pnl']:>+8.2f} "
-                         f"{d['realized']:>+8.2f} {d['unrealized']:>+8.2f} "
-                         f"{d['net_pos']:>+6.0f} {d['exposure']:>8.2f} {d['quoted']:>3d}")
-    else:
-        lines.append("No open inventory and no resting quotes.")
     rd = rain_dir_section(client)
+
+    def net_of(k):
+        r = w[k]["reward"]
+        return (w[k]["raw"] + r) if r is not None else None
+
+    def money(v, dash="n/a"):
+        return "{:+,.2f}".format(v) if v is not None else dash
+
+    d = w["day"]["detail"]
+    ev_rows = sorted(w["day"]["events"].items(),
+                     key=lambda kv: -(kv[1]["realized"] + kv[1]["settle"]
+                                      + kv[1]["unrealized"]))
+
+    # ---- plain text ---------------------------------------------------------
+    L = ["Kalshi incentive MM \u2014 {}".format(today_ct), ""]
+    L.append("P&L  (RAW = trading only; NET = RAW + incentive rewards)")
+    L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
+        "WINDOW", "RAW$", "REWARD$", "NET$"))
+    for key, lbl in (("day", "past day"), ("week", "past week"),
+                     ("life", "lifetime")):
+        L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
+            lbl, money(w[key]["raw"]), money(w[key]["reward"]),
+            money(net_of(key))))
+    if w["week"]["reward"] is not None and w["week"]["reward_days"] < 7:
+        L.append("  (week reward covers {}/7 days \u2014 daily reward history "
+                 "began 2026-08-03)".format(w["week"]["reward_days"]))
+    if w["day"]["reward"] is None:
+        L.append("  (past-day reward pending the next 5am-CT roll)")
+    L.append("  lifetime reward basis: {}; bot estimate ${:,.2f}".format(
+        w["life"]["basis"], ss["reward_lifetime"]))
+    L.append("")
+    L.append("PAST DAY detail: realized {:+,.2f} | settled {:+,.2f} | open MTM "
+             "{:+,.2f} | fees {:+,.2f} | {:,.0f} contracts filled".format(
+                 d["realized"], d["settle"], d["unrealized"], -d["fees"],
+                 d["contracts"]))
+    L.append("Open book: net {:+,.0f} contracts, exposure ${:,.2f} | resting "
+             "${:,.2f} ({} orders / {} events) | balance {}".format(
+                 tot["net_pos"], tot["exposure"], resting["collateral"],
+                 resting["orders"], resting["events"], bal_str))
+    L.append("")
+    L.append("DAILY P&L (raw; a day moves until its positions settle)")
+    L.append("{:12s} {:>10s} {:>10s} {:>7s}".format(
+        "DATE", "RAW$", "CONTRACTS", "FILLS"))
+    for day, raw, contracts, nf in series:
+        L.append("{:12s} {:>+10,.2f} {:>10,.0f} {:>7d}".format(
+            day.isoformat(), raw, contracts, nf))
+    L.append("")
+    L.append("EVENTS TRADED IN THE PAST DAY ({})".format(len(ev_rows)))
+    if ev_rows:
+        L.append("{:28s} {:>9s} {:>9s} {:>9s} {:>9s} {:>7s} {:>5s}".format(
+            "EVENT", "P&L$", "REAL$", "SETTLE$", "MTM$", "CTS", "MKTS"))
+        for ev, e in ev_rows:
+            tot_e = e["realized"] + e["settle"] + e["unrealized"]
+            L.append("{:28s} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>7,.0f} "
+                     "{:>5d}".format(_short_event(ev)[:28], tot_e, e["realized"],
+                                     e["settle"], e["unrealized"],
+                                     e["contracts"], len(e["mkts"])))
+    else:
+        L.append("  (no fills in the past 24h)")
     if rd:
-        lines.append("")
-        lines.extend(rd[0])
-    lines.append("")
-    lines.append(health)
-    lines.append("(reward is the bot's own estimate.)")
-    text = "\n".join(lines)
+        L.append("")
+        L.extend(rd[0])
+    L.append("")
+    L.append(health)
+    text = "\n".join(L)
 
     # ---- html ---------------------------------------------------------------
     h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">']
-    h.append(f'<div style="font-size:17px;font-weight:600">Kalshi incentive MM'
-             f' <span style="color:#888;font-weight:400">— {today_ct}</span></div>')
-    h.append(f'<div style="font-size:24px;font-weight:800;margin:8px 0 2px">'
-             f'Total est reward: '
-             f'<span style="color:#0a7a2f">${reward_lifetime:,.2f}</span>'
-             f'<span style="font-size:13px;font-weight:400;color:#999"> cumulative</span></div>')
-    h.append(f'<div style="font-size:16px;font-weight:600;margin:2px 0 2px">'
-             f'{ss["reward_label"]}: '
-             f'<span style="color:#0a7a2f">${reward:,.2f}</span></div>')
-    h.append(f'<div style="color:#555;margin-bottom:10px">'
-             f'{cmin:,.0f} contract-min &nbsp;·&nbsp; {eff:.1f}c / 1k contract-min '
-             f'&nbsp;·&nbsp; <span style="color:#999">estimate</span></div>')
-    h.append(f'<div style="font-size:15px;font-weight:600;margin:4px 0 2px">'
-             f'P&amp;L: {_pnl_span(total_pnl)}</div>')
-    h.append(f'<div style="color:#555;margin-bottom:12px">'
-             f'realized {_pnl_span(tot["realized"])} &nbsp;·&nbsp; '
-             f'unrealized {_pnl_span(tot["unrealized"])}<br>'
-             f'net position <b>{tot["net_pos"]:+,.0f}</b> contracts &nbsp;·&nbsp; '
-             f'inventory exposure <b>${tot["exposure"]:,.2f}</b> &nbsp;·&nbsp; '
-             f'resting quotes <b>${resting["collateral"]:,.2f}</b> '
-             f'({resting["orders"]} orders) &nbsp;·&nbsp; '
-             f'balance <b>{bal_str}</b></div>')
-    if rows:
+    h.append('<div style="font-size:17px;font-weight:600">Kalshi incentive MM'
+             ' <span style="color:#888;font-weight:400">\u2014 {}</span></div>'
+             .format(today_ct))
+    nl = net_of("life")
+    h.append('<div style="font-size:24px;font-weight:800;margin:8px 0 2px">'
+             'Lifetime net: {}<span style="font-size:13px;font-weight:400;'
+             'color:#999"> &nbsp;= trading {:+,.2f} + rewards {:,.2f}</span>'
+             '</div>'.format(_pnl_span(nl) if nl is not None else "n/a",
+                             w["life"]["raw"], w["life"]["reward"]))
+    h.append('<table style="border-collapse:collapse;margin:10px 0">')
+    h.append('<tr style="background:#f0f0f0;font-weight:600">'
+             '<td style="{0}">WINDOW</td><td style="{1}">RAW (trading)</td>'
+             '<td style="{1}">REWARD</td><td style="{1}">NET</td></tr>'
+             .format(TDL, TD))
+    for i, (key, lbl) in enumerate((("day", "Past day"), ("week", "Past week"),
+                                    ("life", "Lifetime"))):
+        bg = "#fafafa" if i % 2 else "#fff"
+        r = w[key]["reward"]
+        n = net_of(key)
+        h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
+                 '<td style="{3}">{4}</td><td style="{3}">{5}</td>'
+                 '<td style="{3};font-weight:700">{6}</td></tr>'.format(
+                     bg, TDL, lbl, TD, _pnl_span(w[key]["raw"]),
+                     money(r), _pnl_span(n) if n is not None else "n/a"))
+    h.append("</table>")
+    notes = ["lifetime reward basis: <b>{}</b> (bot estimate ${:,.2f})".format(
+        w["life"]["basis"], ss["reward_lifetime"])]
+    if w["week"]["reward"] is not None and w["week"]["reward_days"] < 7:
+        notes.append("week reward covers {}/7 days (daily history began "
+                     "2026-08-03)".format(w["week"]["reward_days"]))
+    if w["day"]["reward"] is None:
+        notes.append("past-day reward pending the next 5am-CT roll")
+    h.append('<div style="color:#888;font-size:12px;margin-bottom:10px">{}</div>'
+             .format(" &nbsp;\u00b7&nbsp; ".join(notes)))
+    h.append('<div style="color:#555;margin-bottom:12px">Past day: realized {} '
+             '&nbsp;\u00b7&nbsp; settled {} &nbsp;\u00b7&nbsp; open MTM {} '
+             '&nbsp;\u00b7&nbsp; {:,.0f} contracts<br>Open book: net <b>{:+,.0f}'
+             '</b> &nbsp;\u00b7&nbsp; exposure <b>${:,.2f}</b> &nbsp;\u00b7&nbsp; '
+             'resting <b>${:,.2f}</b> ({} orders) &nbsp;\u00b7&nbsp; balance '
+             '<b>{}</b></div>'.format(
+                 _pnl_span(d["realized"]), _pnl_span(d["settle"]),
+                 _pnl_span(d["unrealized"]), d["contracts"], tot["net_pos"],
+                 tot["exposure"], resting["collateral"], resting["orders"],
+                 bal_str))
+    h.append('<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
+             'Daily P&amp;L (raw)</div>')
+    h.append('<table style="border-collapse:collapse">')
+    h.append('<tr style="background:#f0f0f0;font-weight:600">'
+             '<td style="{0}">DATE</td><td style="{1}">RAW$</td>'
+             '<td style="{1}">CONTRACTS</td><td style="{1}">FILLS</td></tr>'
+             .format(TDL, TD))
+    for i, (day, raw, contracts, nf) in enumerate(series):
+        bg = "#fafafa" if i % 2 else "#fff"
+        h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
+                 '<td style="{3}">{4}</td><td style="{3}">{5:,.0f}</td>'
+                 '<td style="{3}">{6}</td></tr>'.format(
+                     bg, TDL, day, TD, _pnl_span(raw), contracts, nf))
+    h.append("</table>")
+    h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
+             'Events traded in the past day ({})</div>'.format(len(ev_rows)))
+    if ev_rows:
         h.append('<table style="border-collapse:collapse">')
-        h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
-                 f'<td style="{TDL}">EVENT</td><td style="{TD}">P&amp;L$</td>'
-                 f'<td style="{TD}">REAL$</td><td style="{TD}">UNREAL$</td>'
-                 f'<td style="{TD}">NET</td><td style="{TD}">EXPO$</td>'
-                 f'<td style="{TD}">Q</td></tr>')
-        for i, (ev, d) in enumerate(rows):
+        h.append('<tr style="background:#f0f0f0;font-weight:600">'
+                 '<td style="{0}">EVENT</td><td style="{1}">P&amp;L$</td>'
+                 '<td style="{1}">REAL$</td><td style="{1}">SETTLE$</td>'
+                 '<td style="{1}">MTM$</td><td style="{1}">CTS</td>'
+                 '<td style="{1}">MKTS</td></tr>'.format(TDL, TD))
+        for i, (ev, e) in enumerate(ev_rows):
             bg = "#fafafa" if i % 2 else "#fff"
-            h.append(f'<tr style="background:{bg}">'
-                     f'<td style="{TDL}">{_short_event(ev)}</td>'
-                     f'<td style="{TD};font-weight:600">{_pnl_span(d["pnl"])}</td>'
-                     f'<td style="{TD}">{_pnl_span(d["realized"])}</td>'
-                     f'<td style="{TD}">{_pnl_span(d["unrealized"])}</td>'
-                     f'<td style="{TD}">{d["net_pos"]:+,.0f}</td>'
-                     f'<td style="{TD}">{d["exposure"]:,.2f}</td>'
-                     f'<td style="{TD}">{d["quoted"]}</td></tr>')
-        h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
-                 f'<td style="{TDL}">TOTAL</td>'
-                 f'<td style="{TD}">{_pnl_span(total_pnl)}</td>'
-                 f'<td style="{TD}">{_pnl_span(tot["realized"])}</td>'
-                 f'<td style="{TD}">{_pnl_span(tot["unrealized"])}</td>'
-                 f'<td style="{TD}">{tot["net_pos"]:+,.0f}</td>'
-                 f'<td style="{TD}">{tot["exposure"]:,.2f}</td>'
-                 f'<td style="{TD}"></td></tr>')
-        h.append('</table>')
-        h.append('<div style="color:#888;font-size:12px;margin-top:6px">'
-                 'Q = markets currently quoted in the event. EXPO$ = inventory '
-                 'cost basis. Own-book only (excludes manual + other bots).</div>')
+            tot_e = e["realized"] + e["settle"] + e["unrealized"]
+            h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
+                     '<td style="{3};font-weight:600">{4}</td>'
+                     '<td style="{3}">{5}</td><td style="{3}">{6}</td>'
+                     '<td style="{3}">{7}</td><td style="{3}">{8:,.0f}</td>'
+                     '<td style="{3}">{9}</td></tr>'.format(
+                         bg, TDL, _short_event(ev), TD, _pnl_span(tot_e),
+                         _pnl_span(e["realized"]), _pnl_span(e["settle"]),
+                         _pnl_span(e["unrealized"]), e["contracts"],
+                         len(e["mkts"])))
+        h.append("</table>")
     else:
-        h.append('<div>No open inventory and no resting quotes.</div>')
+        h.append("<div>No fills in the past 24h.</div>")
     if rd:
         h.append(rd[1])
-    h.append(f'<div style="color:#777;font-size:12px;margin-top:12px;'
-             f'border-top:1px solid #eee;padding-top:8px">{health}</div>')
-    h.append('</div>')
+    h.append('<div style="color:#777;font-size:12px;margin-top:12px;'
+             'border-top:1px solid #eee;padding-top:8px">{}</div>'.format(health))
+    h.append("</div>")
     return text, "".join(h)
 
 

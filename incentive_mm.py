@@ -2368,6 +2368,16 @@ class BotState:
     # digest's old live-counter/summary-body sources reported a fraction of
     # the truth ($45.81 vs $959.47 measured on 8/3).
     reward_history: Dict[str, float] = field(default_factory=dict)
+    # Cumulative REALIZED trading P&L across restarts (2026-08-03, Jack: "i do
+    # hold multi-week inventory"). PnlTracker.realized resets with the process
+    # while own_pos/own_avg persist, so nothing tracked lifetime realized —
+    # and a multi-week position that SETTLES cannot be reconstructed from
+    # fills either (fills carry no client_order_id and our_order_ids prunes at
+    # 7 days). This counter folds in the tracker's delta each save, so
+    # settlements booked by _settle_or_drop are captured permanently.
+    realized_lifetime: float = 0.0
+    realized_seen: float = 0.0            # tracker total already folded in
+    #   (NOT persisted: the tracker starts empty each process)
     reward_est_lifetime: float = 0.0      # cumulative est reward (NOT reset at the
     #   daily roll; persisted so it survives restarts) — the digest's running total
     contract_minutes_today: float = 0.0   # resting contracts x minutes quoted
@@ -2465,6 +2475,8 @@ class IncentiveMarketMaker:
             for t, a in (data.get("own_avg") or {}).items():
                 self.pnl.avg[str(t)] = float(a)
             self.state.reward_est_lifetime = float(data.get("reward_est_lifetime") or 0.0)
+            # realized_seen deliberately NOT restored: the tracker starts empty
+            self.state.realized_lifetime = float(data.get("realized_lifetime") or 0.0)
             self.state.reward_history = {str(k): float(v) for k, v in
                                          (data.get("reward_history") or {}).items()}
             # Daily reward/contract-minutes survive restarts within the SAME
@@ -2519,8 +2531,19 @@ class IncentiveMarketMaker:
         # journaled but never got to fold in itself.
         self._load_journal()
 
+    def _fold_realized(self) -> None:
+        """Accumulate the tracker's realized delta into the persistent
+        lifetime counter (see BotState.realized_lifetime). Called on every
+        save so a hard kill loses at most one cycle of realizations."""
+        total = self.pnl.total_realized()
+        delta = total - self.state.realized_seen
+        if abs(delta) > 1e-9:
+            self.state.realized_lifetime += delta
+            self.state.realized_seen = total
+
     def _save_persist(self) -> None:
         try:
+            self._fold_realized()
             os.makedirs(STATUS_DIR, exist_ok=True)
             tmp = self.PERSIST_PATH + ".tmp"
             # Bound our_order_ids: fills for week-old orders can't arrive
@@ -2541,6 +2564,8 @@ class IncentiveMarketMaker:
                                        for t, p in self.pnl.pos.items()
                                        if abs(p) > 1e-9},
                            "reward_est_lifetime": self.state.reward_est_lifetime,
+                           # lifetime realized trading P&L incl. settlements
+                           "realized_lifetime": round(self.state.realized_lifetime, 4),
                            # daily reward must survive restarts (see BotState):
                            # anchored to the roll day so a NEW day starts clean
                            "reward_day_key": _halt_day_key(datetime.now(timezone.utc)),
