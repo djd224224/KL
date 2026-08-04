@@ -4190,6 +4190,100 @@ class TestPayoutFloorAccounting(unittest.TestCase):
             _clean_persist()
 
 
+class TestPerSeriesHourMultiplier(unittest.TestCase):
+    """Jack 2026-08-04: halve the ladder on KXDIESELD / KXAAAGASD / KXRAIN
+    from 4pm ET. Window runs to 01:59 ET because the gas/diesel dailies trade
+    until then — stopping at midnight would restore full size for their last
+    two hours."""
+
+    def _at(self, et_hour):
+        return imm.ET.localize(
+            datetime(2026, 8, 4, et_hour, 30)).astimezone(timezone.utc)
+
+    def test_halved_from_4pm_et(self):
+        for s in ("KXDIESELD-26AUG05-T5.315", "KXAAAGASD-26AUG05-3.10",
+                  "KXRAIN-26AUG05-DEN"):
+            for h in (16, 20, 23):
+                self.assertEqual(
+                    imm.hour_size_mult(s.split("-")[0], self._at(h)), 0.5,
+                    f"{s} at ET {h}")
+
+    def test_window_runs_past_midnight_to_the_daily_close(self):
+        # gas/diesel dailies close 01:59 ET
+        for h in (0, 1):
+            self.assertEqual(
+                imm.hour_size_mult("KXDIESELD", self._at(h)), 0.5, f"ET {h}")
+        self.assertEqual(imm.hour_size_mult("KXDIESELD", self._at(2)), 1.0)
+
+    def test_full_size_before_4pm(self):
+        for h in (9, 12, 15):
+            self.assertEqual(
+                imm.hour_size_mult("KXRAIN", self._at(h)), 1.0, f"ET {h}")
+
+    def test_weeklies_and_monthlies_keep_full_size(self):
+        # the prefixes are the DAILY tickers on purpose
+        for s in ("KXAAAGASW", "KXAAAGASM", "KXDIESELW"):
+            self.assertEqual(imm.hour_size_mult(s, self._at(20)), 1.0, s)
+
+    def test_ladder_actually_halves_on_the_production_shape(self):
+        """The launcher runs IMM_LEVELS=0:20 (one rung of 20), so pin that
+        rather than the 3-rung in-code default, whose per-rung half-up
+        rounding makes 35 -> 18 rather than 17.5."""
+        old = imm.LEVELS
+        try:
+            imm.LEVELS = [(0, 20)]
+            self.assertEqual(imm.hour_scaled_levels("KXDIESELD", self._at(12)),
+                             [(0, 20)])
+            self.assertEqual(imm.hour_scaled_levels("KXDIESELD", self._at(20)),
+                             [(0, 10)])
+        finally:
+            imm.LEVELS = old
+
+    def test_ladder_never_rounds_a_rung_away(self):
+        """Halving must not silently delete a rung — floor is 1 contract."""
+        old = imm.LEVELS
+        try:
+            imm.LEVELS = [(0, 1)]
+            self.assertEqual(imm.hour_scaled_levels("KXRAIN", self._at(20)),
+                             [(0, 1)])
+        finally:
+            imm.LEVELS = old
+
+    def test_per_series_rule_beats_the_global_window_and_exclude(self):
+        old_g, old_x = imm.HOUR_SIZE_MULTS, imm.HOUR_MULT_EXCLUDE
+        try:
+            imm.HOUR_SIZE_MULTS = {20: 2.0}          # global says double
+            imm.HOUR_MULT_EXCLUDE = ("KXRAIN",)      # and excludes rain
+            # the explicit per-series rule still wins in both directions
+            self.assertEqual(imm.hour_size_mult("KXRAIN", self._at(20)), 0.5)
+            self.assertEqual(imm.hour_size_mult("KXOTHER", self._at(20)), 2.0)
+        finally:
+            imm.HOUR_SIZE_MULTS, imm.HOUR_MULT_EXCLUDE = old_g, old_x
+
+    def test_global_window_survives_outside_the_per_series_hours(self):
+        """Adding a 4pm rule must not cancel the quiet-hours 3-7am x2 these
+        families already had — a per-series rule owns only its own hours."""
+        old_g = imm.HOUR_SIZE_MULTS
+        try:
+            imm.HOUR_SIZE_MULTS = {3: 2.0, 4: 2.0, 5: 2.0, 6: 2.0, 7: 2.0}
+            for s in ("KXDIESELD", "KXAAAGASD", "KXRAIN"):
+                self.assertEqual(imm.hour_size_mult(s, self._at(5)), 2.0, s)
+                self.assertEqual(imm.hour_size_mult(s, self._at(20)), 0.5, s)
+                self.assertEqual(imm.hour_size_mult(s, self._at(12)), 1.0, s)
+        finally:
+            imm.HOUR_SIZE_MULTS = old_g
+
+    def test_longest_prefix_wins(self):
+        spec = imm._parse_series_hour_mults("KXA:0-23:2.0,KXAAAGASD:0-23:0.5")
+        prefixes = [p for p, _h in spec]
+        self.assertEqual(prefixes[0], "KXAAAGASD")   # most specific first
+
+    def test_bad_spec_raises(self):
+        for bad in ("KXA", "KXA:", ":1-2:0.5", "KXA:99-1:0.5", "KXA:1-2:x"):
+            with self.assertRaises(ValueError, msg=bad):
+                imm._parse_series_hour_mults(bad)
+
+
 class TestSideMaxClampedToPositionCap(unittest.TestCase):
     """A single side may not rest more than the market's whole net position
     cap. Live breach 2026-08-04 (KXTEMPAUSH-26AUG0409-T79.99, cap 50): long

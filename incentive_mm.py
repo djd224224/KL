@@ -521,14 +521,55 @@ HOUR_MULT_EXCLUDE = tuple(
     p for p in os.environ.get("IMM_HOUR_MULT_EXCLUDE", "KXTEMP").split(",") if p)
 
 
+def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
+    """'PREFIX:LO-HI:MULT,...' -> [(prefix, {hour: mult})], longest prefix
+    first so the most specific rule wins. LO-HI carries the same semantics as
+    IMM_HOUR_SIZE_MULT, wrap included (16-1 == 16:00 through 01:59 ET)."""
+    out: List[Tuple[str, Dict[int, float]]] = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        prefix, _, rest = part.partition(":")
+        if not prefix or not rest:
+            raise ValueError(f"bad IMM_SERIES_HOUR_MULT part: {part!r}")
+        try:
+            hours = _parse_hour_mults(rest)
+        except ValueError:
+            raise ValueError(f"bad IMM_SERIES_HOUR_MULT part: {part!r}")
+        out.append((prefix, hours))
+    out.sort(key=lambda kv: -len(kv[0]))
+    return out
+
+
+# PER-SERIES hour windows, which beat the global window AND the global
+# exclude list — an explicit rule for a named family is never overridden by a
+# blanket one. Jack 2026-08-04: "on KXDIESELD and KXAAAGASD events, cut the
+# contract size in half starting at 4pm EST", extended to KXRAIN in the same
+# breath. Window runs 16:00 ET to 01:59 ET rather than stopping at midnight:
+# the gas/diesel DAILIES trade until 01:59 ET, so ending at midnight would
+# hand back full size for the last two hours of their life. Prefixes are
+# deliberately the DAILY tickers — KXAAAGASW/M weeklies and monthlies keep
+# full size. Times are America/New_York (so EDT in summer), the convention
+# every other window in this file uses.
+SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
+    "IMM_SERIES_HOUR_MULT",
+    "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5"))
+
+
 def hour_size_mult(series: str, now_utc: datetime) -> float:
     """Active ladder multiplier for this series at this instant (1.0 outside
     configured windows and for excluded series prefixes)."""
+    hour = now_utc.astimezone(ET).hour
+    # A per-series rule wins ONLY for the hours it actually names. Returning
+    # its default for every other hour would silently cancel the global
+    # window: adding the 4pm halving to KXDIESELD/KXAAAGASD would have taken
+    # away their quiet-hours 3-7am x2 as a side effect, which nobody asked for.
+    for prefix, hours in SERIES_HOUR_MULTS:
+        if series.startswith(prefix) and hour in hours:
+            return hours[hour]
     if not HOUR_SIZE_MULTS:
         return 1.0
     if any(series.startswith(p) for p in HOUR_MULT_EXCLUDE):
         return 1.0
-    return HOUR_SIZE_MULTS.get(now_utc.astimezone(ET).hour, 1.0)
+    return HOUR_SIZE_MULTS.get(hour, 1.0)
 
 
 # Mention-family ladder multiplier. Jack 2026-07-28: x1.5 ("raise any caps
@@ -5240,6 +5281,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"[IMM] hour-size multipliers (ET hour -> x): "
             f"{dict(sorted(HOUR_SIZE_MULTS.items()))}; excluded prefixes: "
             f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'}")
+    for _pfx, _hrs in SERIES_HOUR_MULTS:
+        _by_mult: Dict[float, List[int]] = {}
+        for _h, _m in sorted(_hrs.items()):
+            _by_mult.setdefault(_m, []).append(_h)
+        log(f"[IMM] per-series hour multipliers {_pfx}*: "
+            + "; ".join(f"x{m} at ET {','.join(str(h) for h in hs)}"
+                        for m, hs in sorted(_by_mult.items())))
 
     if args.cancel_all:
         bot = IncentiveMarketMaker(client, live=True)
