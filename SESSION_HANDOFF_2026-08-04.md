@@ -18,7 +18,31 @@ committed. 309 tests green (`python -m unittest test_incentive_mm`).*
 
 ---
 
-## THE BIG FINDING: reward estimate vs credited
+> ## ⚠️ SUPERSEDED 2026-08-04 (later the same day)
+>
+> The section immediately below is **wrong** and is kept only so the mistake
+> is traceable. Jack pasted the **complete** rewards statement and it
+> reconciles to the penny (2,721 credits = $11,564.87 lifetime, $1,368.50
+> August). Against the real per-credit ledger:
+>
+> - The "**~$1,500** of credited reward IMM never estimated" is **fiction**.
+>   Total credit dated before IMM's 2026-07-12 go-live is **$112.85**, and the
+>   KXHIGH weather bot earned **$5.80 of liquidity incentive in its entire
+>   life** (KXHIGHTNOLA $2.47 + KXHIGHTOKC $2.11 + KXHIGHTSFO $1.22). The
+>   8,389-snapshot replay was a *model*, presented as a measurement, and it
+>   was off by more than 10x. Non-IMM credit is ~**$780**, and it is
+>   identifiable event by event — no offset knob needed.
+> - `IMM_REWARDS_NON_IMM` is **deleted**, not re-tuned.
+> - The "estimator runs 18-30% low on temp" conclusion is an **artifact of
+>   comparing across the 2026-08-01 15:13 ET estimator rewrite**: pre-rewrite
+>   estimates model the PRE-7/30 program rules against post-7/30 payouts. On
+>   events priced by the current estimator the ratio is **1.016x** (n=118
+>   settled events, $966.02 credited vs $951.09 estimated).
+>
+> The real errors, and the fixes, are in **`imm_reward_recon.py`** — run
+> `python imm_reward_recon.py --statement <paste> --refresh-programs`.
+
+## THE BIG FINDING: reward estimate vs credited *(SUPERSEDED — see above)*
 
 Jack challenged a digest table showing `prior periods 1.18x` alongside
 `lifetime 0.95x` — arithmetically impossible as two independent measurements.

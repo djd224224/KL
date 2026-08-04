@@ -2102,16 +2102,35 @@ class TestTempSeriesTuning(unittest.TestCase):
         self.assertIsNone(bot._screen(meta, now, member=True))
 
     def test_temp_min_payout_floor(self):
-        # Temp-only $0.70 floor; everything else follows the (patchable)
-        # global — the override must win in both directions.
-        self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 0.70)
+        # The temp override may still win DOWNWARD against a raised global,
+        # but never below PAYOUT_FLOOR_DOLLARS — the exchange pays nothing
+        # under $1.00 per market per program period (2026-08-04 statement).
+        self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 1.00)
         old = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = 123.0
         try:
             self.assertEqual(imm.series_min_est_total("KXGOOD"), 123.0)
-            self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 0.70)
+            self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 1.00)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old
+
+    def test_series_override_cannot_sit_below_the_payout_floor(self):
+        # A sub-$1 series bar admits markets whose OPTIMISTIC projection still
+        # pays zero. Guard the class, not just the KXTEMP instance.
+        import dataclasses
+        ov = imm.SERIES_OVERRIDES["KXTEMPDCH"]
+        try:
+            imm.SERIES_OVERRIDES["KXTEMPDCH"] = dataclasses.replace(
+                ov, min_est_total=0.10)
+            self.assertEqual(imm.series_min_est_total("KXTEMPDCH"),
+                             imm.PAYOUT_FLOOR_DOLLARS)
+        finally:
+            imm.SERIES_OVERRIDES["KXTEMPDCH"] = ov
+        for s, o in imm.SERIES_OVERRIDES.items():
+            if o.min_est_total is not None:
+                self.assertGreaterEqual(
+                    imm.series_min_est_total(s), imm.PAYOUT_FLOOR_DOLLARS,
+                    f"{s} entry floor sits under the exchange payout minimum")
 
     def test_temp_band_trims_ladder(self):
         # bid anchor at 6c: levels at 6/5/4 -> the 4c rung is below the 5c
@@ -4025,6 +4044,180 @@ class TestRainFairAnchor(unittest.TestCase):
             self.assertEqual(self._rain_quotes(bot), self.PLAIN_JOIN)
         finally:
             imm.RAIN_FAIR_ENABLE = old
+
+
+class TestPayoutFloorAccounting(unittest.TestCase):
+    """The exchange pays NOTHING for a market whose program-period payout
+    lands under $1.00 (2026-08-04 statement: 2,720 LIQUIDITY credits, minimum
+    exactly $1.00, none below). The raw integral therefore books revenue on markets
+    that pay zero; the paid-basis counters apply that floor."""
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def _accrue(self, bot, rates, dt_days):
+        """Drive the accrual arithmetic directly (run_cycle's inner block)."""
+        paid_delta = 0.0
+        for t, rate in rates.items():
+            prev = bot.state.accrued_est.get(t, 0.0)
+            new = prev + rate * dt_days
+            bot.state.accrued_est[t] = new
+            if t in bot.state.paid_crossed:
+                paid_delta += new - prev
+            elif new >= imm.PAYOUT_FLOOR_DOLLARS:
+                bot.state.paid_crossed.add(t)
+                paid_delta += new
+        bot.state.reward_paid_today += paid_delta
+        bot.state.reward_paid_lifetime += paid_delta
+
+    def test_market_under_the_floor_never_counts(self):
+        bot = self._bot()
+        try:
+            self._accrue(bot, {"A": 0.90}, 1.0)     # $0.90 -> pays zero
+            self.assertAlmostEqual(bot.state.accrued_est["A"], 0.90)
+            self.assertEqual(bot.state.reward_paid_today, 0.0)
+            self.assertEqual(bot.state.reward_paid_lifetime, 0.0)
+        finally:
+            _clean_persist()
+
+    def test_whole_backlog_lands_on_the_crossing_cycle(self):
+        bot = self._bot()
+        try:
+            self._accrue(bot, {"A": 0.60}, 1.0)     # 0.60, still nothing
+            self.assertEqual(bot.state.reward_paid_today, 0.0)
+            self._accrue(bot, {"A": 0.60}, 1.0)     # 1.20 -> crosses
+            self.assertAlmostEqual(bot.state.reward_paid_today, 1.20)
+            self._accrue(bot, {"A": 0.50}, 1.0)     # already paid: increment
+            self.assertAlmostEqual(bot.state.reward_paid_today, 1.70)
+            self.assertAlmostEqual(bot.state.reward_paid_lifetime, 1.70)
+            self.assertAlmostEqual(bot.state.accrued_est["A"], 1.70)
+        finally:
+            _clean_persist()
+
+    def test_paid_basis_is_never_above_the_raw_integral(self):
+        bot = self._bot()
+        try:
+            rates = {"A": 3.0, "B": 0.4, "C": 1.0, "D": 0.05}
+            self._accrue(bot, rates, 1.0)
+            raw = sum(bot.state.accrued_est.values())
+            self.assertLessEqual(bot.state.reward_paid_lifetime, raw + 1e-9)
+            # only A and C cleared $1
+            self.assertAlmostEqual(bot.state.reward_paid_lifetime, 4.0)
+        finally:
+            _clean_persist()
+
+    def test_crossed_set_persists_so_restarts_do_not_recredit(self):
+        """paid_crossed MUST round-trip with accrued_est: without it the first
+        cycle after a restart re-credits every carried market's whole
+        backlog — one full book of phantom reward per restart, and this bot
+        restarts many times a day."""
+        _clean_persist()
+        try:
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.known_tickers = {"A"}
+            self._accrue(bot, {"A": 2.0}, 1.0)
+            self.assertAlmostEqual(bot.state.reward_paid_lifetime, 2.0)
+            bot._save_persist()
+
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self.assertIn("A", bot2.state.paid_crossed)
+            self.assertAlmostEqual(bot2.state.accrued_est["A"], 2.0)
+            self.assertAlmostEqual(bot2.state.reward_paid_lifetime, 2.0)
+            self._accrue(bot2, {"A": 0.25}, 1.0)     # increment only
+            self.assertAlmostEqual(bot2.state.reward_paid_lifetime, 2.25)
+        finally:
+            _clean_persist()
+
+    def test_crossed_set_pruned_with_accrued_est(self):
+        """A ticker dropped from known_tickers leaves BOTH maps, so a re-listed
+        ticker cannot resume in the already-paid state."""
+        _clean_persist()
+        try:
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.known_tickers = {"A"}
+            self._accrue(bot, {"A": 2.0, "GONE": 2.0}, 1.0)
+            bot._save_persist()
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self.assertIn("A", bot2.state.paid_crossed)
+            self.assertNotIn("GONE", bot2.state.paid_crossed)
+            self.assertNotIn("GONE", bot2.state.accrued_est)
+        finally:
+            _clean_persist()
+
+    def test_migration_adopts_carried_markets_without_back_crediting(self):
+        """First load after this shipped: the old state file has accrued_est
+        and no paid_crossed. Those markets accrued over days that the raw
+        counters already booked, so crossing them now would dump the whole
+        backlog into TODAY."""
+        _clean_persist()
+        try:
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.known_tickers = {"BIG", "SMALL"}
+            bot.state.accrued_est = {"BIG": 40.0, "SMALL": 0.4}
+            bot._save_persist()
+            # simulate the pre-change file: drop the new key
+            with open(bot.PERSIST_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            data.pop("paid_crossed", None)
+            with open(bot.PERSIST_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self.assertEqual(bot2.state.paid_crossed, {"BIG"})
+            self.assertEqual(bot2.state.reward_paid_today, 0.0)
+            self.assertEqual(bot2.state.reward_paid_lifetime, 0.0)
+            self._accrue(bot2, {"BIG": 2.0}, 1.0)      # forward accrual only
+            self.assertAlmostEqual(bot2.state.reward_paid_lifetime, 2.0)
+        finally:
+            _clean_persist()
+
+    def test_daily_roll_records_both_bases(self):
+        _clean_persist()
+        try:
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.reward_est_today = 12.34
+            bot.state.reward_paid_today = 9.99
+            bot.state.last_markets_line = "x"
+            bot.build_daily_summary()
+            key = (datetime.now(timezone.utc).astimezone(imm.CT).date()
+                   - timedelta(days=1)).isoformat()
+            self.assertAlmostEqual(bot.state.reward_history[key], 12.34)
+            self.assertAlmostEqual(bot.state.reward_paid_history[key], 9.99)
+            self.assertEqual(bot.state.reward_est_today, 0.0)
+            self.assertEqual(bot.state.reward_paid_today, 0.0)
+        finally:
+            _clean_persist()
+
+
+class TestCoverageIsNotAnEstimateFactor(unittest.TestCase):
+    """The exclusion rule is already inside estimate_reward_share (an excluded
+    snapshot returns frac 0.0), so multiplying the rate by the coverage EMA
+    applied it twice. Measured on the clean post-amendment window: raw 0.982x
+    credited, coverage-multiplied 1.057x."""
+
+    def test_excluded_snapshot_contributes_nothing(self):
+        thin = [[50, 10.0]]                      # far below target
+        deep = [[50, 5000.0]]
+        frac, sides = imm.estimate_reward_share(
+            deep, thin, [("bid", 50, 100.0)], 1000.0, 0.5, own_in_book=True)
+        self.assertEqual(frac, 0.0)
+        self.assertLess(sides, 2)
+
+    def test_estimate_rate_has_no_coverage_term(self):
+        """est_dollars_per_day must equal frac x pool exactly — a market whose
+        book has been one-sided in the past must not be discounted twice."""
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot._coverage_ema["KXGOOD-99DEC31-A"] = 0.25   # ugly history
+        meta = imm.MarketMeta(
+            ticker="KXGOOD-99DEC31-A", event_ticker="KXGOOD-99DEC31",
+            series="KXGOOD", dollars_per_day=100.0, program_end=None,
+            target_size=1000.0, discount_factor=0.5, cutoff=None,
+            close_time=datetime.now(timezone.utc) + timedelta(hours=2),
+            mid_cents=50.0, spread_cents=2, volume=100.0)
+        self.assertTrue(bot._estimate_candidate_yield(meta, []))
+        self.assertAlmostEqual(meta.est_dollars_per_day,
+                               meta.est_frac * meta.dollars_per_day, places=9)
 
 
 if __name__ == "__main__":

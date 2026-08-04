@@ -24,6 +24,7 @@ back to HKCU\Environment (works under Task Scheduler's stripped env).
 
 import argparse
 import collections
+import csv
 import glob
 import json
 import os
@@ -246,25 +247,81 @@ def event_rows(client):
                        "events": len(resting_by_event)}
 
 
-# Rewards actually CREDITED by Kalshi, from the account statement (Kalshi
-# exposes no credits endpoint — verified 2026-08-03 across 8 paths). Update
-# from the statement; falls back to the bot's estimate when unset.
+# Rewards actually CREDITED by Kalshi. There is no credits endpoint (verified
+# 2026-08-03 across 8 paths), so the numbers come from the account statement
+# via `imm_reward_recon.py --statement <paste>`, which keeps a permanent
+# per-credit ledger and writes reward_calibration.json. The env vars below are
+# a manual fallback for when the ledger has not been refreshed.
+#
+# 2026-08-04: the first COMPLETE statement was reconciled and it retired a
+# large piece of folklore. Every credit this account has ever received is in
+# the ledger (2,721 rows summing to the statement's own lifetime total to the
+# penny), and it shows:
+#   * only $112.85 of credit predates IMM's 2026-07-12 go-live, not ~$1,500;
+#   * the KXHIGH weather bot earned $5.80 of liquidity incentive in its LIFE,
+#     so the "~$1,500 of non-IMM reward from 152 pre-IMM days" figure — a
+#     modelled replay, never a measurement — was wrong by more than 10x and
+#     is deleted rather than re-tuned;
+#   * non-IMM credit is ~$780, and it is identifiable event by event (MLB /
+#     fight / mention markets belong to the other bots on this key).
+# Attribution is now per-event against the events IMM actually quoted, so no
+# hand-set offset is needed at all.
+CALIB_PATH = os.path.join(STATUS_DIR, "reward_calibration.json")
+CREDITS_PATH = os.path.join(STATUS_DIR, "reward_credits.csv")
+# IMM went live on this date; the digest reports NO credit dated before it
+# (Jack 2026-08-04) — earlier credit belongs to other strategies by definition.
+IMM_INCEPTION = "2026-07-12"
+# Credits arrive 1-2 days after the liquidity that earned them (measured lag:
+# median 1.3d, p90 1.7d, max 3.0d), so a ledger more than this many days
+# behind is genuinely missing money rather than merely waiting on settlement.
+LEDGER_STALE_DAYS = int(os.environ.get("IMM_LEDGER_STALE_DAYS", "4"))
 REWARDS_CREDITED = os.environ.get("IMM_REWARDS_CREDITED", "")
-# Current-month credited, also from the statement. Kalshi pays a program at its
-# PERIOD END, so a month in progress is always credited LESS than it has
-# accrued — without this the digest's estimate looks simply wrong.
 REWARDS_CREDITED_MTD = os.environ.get("IMM_REWARDS_CREDITED_MTD", "")
-# Credited reward that is NOT IMM's. Kalshi pays on the ACCOUNT's aggregate
-# book presence — single user_id, no per-strategy segregation, and no
-# per-strategy reward endpoint exists. reward_est_lifetime starts at $0 on
-# 2026-07-11 while the account's first fill is 2026-02-09, so 152 of the 176
-# credited days have no estimate term at all; the KXHIGH weather bot rested on
-# programmed markets that whole time. Measured 2026-08-04 by replaying that
-# bot's reconstructed ladder against 8,389 in-window book snapshots: ~$1,500
-# (band $700-$2,800). Comparing account-level credit to an IMM-only estimate
-# overstates realization and is what made "prior periods" read 1.18x.
-REWARDS_NON_IMM = os.environ.get("IMM_REWARDS_NON_IMM", "1500")
 DAILY_PNL_PATH = os.path.join(STATUS_DIR, "daily_pnl.json")
+
+
+def load_credit_ledger():
+    """(rows, calibration) — the per-credit ledger and the summary written by
+    imm_reward_recon.py. Empty/absent is fine: the digest falls back to the
+    bot's own estimate and says so."""
+    rows = []
+    try:
+        with open(CREDITS_PATH, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                rows.append((r["credit_date"], r["event_ticker"],
+                             _f(r["amount"])))
+    except (OSError, KeyError, ValueError):
+        rows = []
+    calib = load_json(CALIB_PATH) or {}
+    return rows, calib
+
+
+def credited_windows(rows, calib, today_et):
+    """Credited reward by window, IMM-attributable and inception-filtered.
+
+    Kalshi credits a program at its PERIOD END, so these windows are NOT
+    comparable to an accrual over the same dates — a day's credits pay for
+    liquidity resting over the preceding day or two (measured lag: median
+    1.3d, p90 1.7d). They are reported as a settlement fact, not as "what the
+    bot earned that day"; the daily table keeps using the accrual for that."""
+    if not rows:
+        return None
+    imm_only = bool(calib.get("credited_imm_attributable"))
+    life = calib.get("credited_imm_attributable") if imm_only else sum(
+        a for d, _e, a in rows if d >= IMM_INCEPTION)
+    d1 = (today_et - timedelta(days=1)).isoformat()
+    week = {(today_et - timedelta(days=i)).isoformat() for i in range(1, 8)}
+    month = today_et.strftime("%Y-%m")
+    return {
+        "lifetime": life,
+        "day": sum(a for d, _e, a in rows if d == d1 and d >= IMM_INCEPTION),
+        "week": sum(a for d, _e, a in rows if d in week and d >= IMM_INCEPTION),
+        "mtd": sum(a for d, _e, a in rows if d[:7] == month and d >= IMM_INCEPTION),
+        "latest": max((d for d, _e, _a in rows), default=""),
+        "account_lifetime": calib.get("credited_lifetime_account"),
+        "non_imm": calib.get("credited_non_imm"),
+        "attributed": imm_only,
+    }
 
 
 def fetch_own_fills(client, our_ids: set, hours: int) -> list:
@@ -380,6 +437,13 @@ def daily_series(client, fills, mids, results, state, days=60):
         day = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET).date()
         by_day[day].append(f)
     hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
+    # PAID basis where available: the raw accrual bills for markets that never
+    # clear the exchange's $1-per-market program floor and are paid nothing.
+    paid_hist = {str(k): _f(v) for k, v
+                 in (state.get("reward_paid_history") or {}).items()}
+    # Rewards before IMM's go-live are not IMM's (Jack 2026-08-04); the table
+    # starts at inception regardless of what history happens to be persisted.
+    hist = {k: v for k, v in hist.items() if k >= IMM_INCEPTION}
     # Backfilled per-day RAW P&L (imm_backfill_daily_pnl.py) reaches back to
     # the bot's first fill, well past the fill-attribution window available
     # live. Prefer it for any day it covers.
@@ -398,9 +462,9 @@ def daily_series(client, fills, mids, results, state, days=60):
             day = datetime.strptime(key, "%Y-%m-%d").date()
         except ValueError:
             continue
-        if day >= today:
-            continue                       # only PRIOR days
-        reward = hist.get(key)
+        if day >= today or key < IMM_INCEPTION:
+            continue                       # only PRIOR days, only since go-live
+        reward = paid_hist.get(key, hist.get(key))
         dfills = by_day.get(day, [])
         bf = backfill.get(key)
         if bf:                              # authoritative: full-history rebuild
@@ -450,18 +514,41 @@ def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime):
             life_unreal += p * (m - avg.get(t, 0.0)) / 100.0
     life_raw = life_realized + life_unreal
 
-    credited = _f(REWARDS_CREDITED) if REWARDS_CREDITED else None
-    rew_life = credited if credited else reward_lifetime
-    rew_basis = "credited (statement)" if credited else "bot estimate"
+    today_et = datetime.now(timezone.utc).astimezone(ET).date()
+    ledger, calib = load_credit_ledger()
+    cred = credited_windows(ledger, calib, today_et)
+    # LIFETIME reward is the credit ledger when we have one: it is the only
+    # figure that is a fact rather than a model, and it is now restricted to
+    # credits dated on/after IMM's go-live AND landing on an event IMM quoted.
+    # The env var stays as a manual override, but note it is ACCOUNT-level, so
+    # it double-counts the other bots on this key.
+    if cred:
+        rew_life = cred["lifetime"]
+        rew_basis = ("credited (ledger, IMM-attributable since "
+                     f"{IMM_INCEPTION})" if cred["attributed"]
+                     else f"credited (ledger, since {IMM_INCEPTION})")
+    elif REWARDS_CREDITED:
+        rew_life = _f(REWARDS_CREDITED)
+        rew_basis = "credited (statement env, ACCOUNT-level)"
+    else:
+        rew_life = reward_lifetime
+        rew_basis = "bot estimate"
     # Sub-window rewards come from the persisted per-day history; days before
     # the 2026-08-03 fix are missing and are reported as such rather than
-    # silently summed to a wrong number.
+    # silently summed to a wrong number. These stay on the ACCRUAL basis on
+    # purpose — credits land 1-2 days after the liquidity that earned them, so
+    # a credited "yesterday" would not line up with yesterday's RAW P&L.
     hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
-    today_et = datetime.now(timezone.utc).astimezone(ET).date()
+    paid_hist = {str(k): _f(v) for k, v
+                 in (state.get("reward_paid_history") or {}).items()}
     day_key = (today_et - timedelta(days=1)).isoformat()
-    rew_day = hist.get(day_key)
+    # Prefer the PAID basis (the raw integral with the exchange's $1-per-market
+    # floor applied) — the raw one bills for the ~30% of quoted markets that
+    # provably pay nothing. Falls back to raw for days recorded before the
+    # 2026-08-04 change.
+    rew_day = paid_hist.get(day_key, hist.get(day_key))
     week_keys = [(today_et - timedelta(days=i)).isoformat() for i in range(1, 8)]
-    have = [hist[k] for k in week_keys if k in hist]
+    have = [paid_hist.get(k, hist[k]) for k in week_keys if k in hist]
     rew_week = sum(have) if have else None
     return {
         "day": {"raw": day_tot["raw"], "reward": rew_day, "detail": day_tot,
@@ -472,6 +559,7 @@ def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime):
         "life": {"raw": life_raw, "reward": rew_life, "have_reward": True,
                  "realized": life_realized, "unrealized": life_unreal,
                  "basis": rew_basis},
+        "credited": cred,
     }
 
 
@@ -536,6 +624,23 @@ def health_line(status: dict, ss: dict) -> str:
     if _f(status.get("halted_until")) > time.time():
         problems.append("DAILY-LOSS HALT active")
     standoff = status.get("manual_standoff") or []
+    # A credit ledger that stops being refreshed reports a shrinking fraction
+    # of reality while still LOOKING authoritative — the one failure mode of
+    # moving lifetime reward onto the statement. Say so out loud.
+    rows, _cal = load_credit_ledger()
+    if rows:
+        latest = max(d for d, _e, _a in rows)
+        try:
+            lag = (now.astimezone(ET).date()
+                   - datetime.strptime(latest, "%Y-%m-%d").date()).days
+        except ValueError:
+            lag = 0
+        if lag > LEDGER_STALE_DAYS:
+            problems.append(
+                f"REWARD LEDGER STALE ({lag}d; last credit {latest}) — paste a "
+                f"fresh statement through imm_reward_recon.py --statement")
+    else:
+        problems.append("NO REWARD LEDGER — lifetime reward is the bot estimate")
     line = f"Bot: {'alive' if alive else 'DOWN'}, mode {status.get('mode', '?')}, " \
            f"{int(ss['errors'])} errors in last summary"
     if standoff:
@@ -666,6 +771,21 @@ def build_digest(now_utc: datetime):
         L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
             lbl, money(w[key]["raw"]), money(w[key]["reward"]),
             money(net_of(key))))
+    L.append("  reward basis: {}".format(w["life"]["basis"]))
+    cw = w.get("credited")
+    if cw:
+        L.append("")
+        L.append("REWARDS CREDITED by Kalshi (settlement fact; programs pay at "
+                 "period end, 1-2 days after the liquidity that earned them)")
+        L.append("  IMM-attributable, since {}   ${:>10,.2f}".format(
+            IMM_INCEPTION, cw["lifetime"]))
+        L.append("  month to date                 ${:>10,.2f}".format(cw["mtd"]))
+        L.append("  credited on {}          ${:>10,.2f}".format(
+            (today_ct - timedelta(days=1)).isoformat(), cw["day"]))
+        if cw.get("account_lifetime") is not None:
+            L.append("  (whole account, all strategies ${:>10,.2f}; not IMM's "
+                     "${:,.2f})".format(cw["account_lifetime"], cw["non_imm"] or 0.0))
+        L.append("  ledger current through {}".format(cw["latest"] or "?"))
     L.append("")
     L.append("")
     L.append("DAILY P&L — every prior day that earned (raw; a day moves until "
@@ -691,6 +811,14 @@ def build_digest(now_utc: datetime):
         "{:+,.2f}".format(d_raw + d_rew)))
     L.append("  (RAW shows n/a for days older than the {}h fill-attribution "
              "window)".format(FILL_LOOKBACK_HOURS))
+    _cal0 = load_json(CALIB_PATH) or {}
+    _pa0 = _cal0.get("post_amendment") or {}
+    if _pa0.get("realization_factor"):
+        L.append("  (REWARD is the accrual estimate with the $1.00/market payout "
+                 "floor; {:.3f}x vs credits on {} settled events since the {} "
+                 "estimator rewrite)".format(
+                     _pa0["realization_factor"], _pa0.get("events", 0),
+                     _pa0.get("cutover", "?")))
     L.append("")
     L.append("EVENTS TRADED IN THE PAST DAY ({})".format(len(ev_rows)))
     if ev_rows:
@@ -745,6 +873,34 @@ def build_digest(now_utc: datetime):
                      bg, TDL, lbl, TD, _pnl_span(w[key]["raw"]),
                      money(r), _pnl_span(n) if n is not None else "n/a"))
     h.append("</table>")
+    h.append('<div style="color:#888;font-size:12px;margin:-6px 0 10px">'
+             'reward basis: {}</div>'.format(w["life"]["basis"]))
+    cw = w.get("credited")
+    if cw:
+        h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
+                 'Rewards credited by Kalshi</div>')
+        h.append('<table style="border-collapse:collapse">')
+        h.append('<tr style="background:#f0f0f0;font-weight:600">'
+                 '<td style="{0}">WINDOW</td><td style="{1}">CREDITED$</td>'
+                 '</tr>'.format(TDL, TD))
+        _cr = [("IMM-attributable, since " + IMM_INCEPTION, cw["lifetime"]),
+               ("Month to date", cw["mtd"]),
+               ("Credited " + (today_ct - timedelta(days=1)).isoformat(), cw["day"])]
+        if cw.get("account_lifetime") is not None:
+            _cr.append(("Whole account (all strategies)", cw["account_lifetime"]))
+            _cr.append(("...of which NOT IMM's", cw.get("non_imm") or 0.0))
+        for i, (lbl, v) in enumerate(_cr):
+            h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
+                     '<td style="{3}">{4:,.2f}</td></tr>'.format(
+                         "#fafafa" if i % 2 else "#fff", TDL, lbl, TD, v))
+        h.append("</table>")
+        h.append('<div style="color:#888;font-size:12px;margin-top:4px">'
+                 'A settlement fact, not an accrual: Kalshi pays a program at '
+                 'its PERIOD END, so these windows lag the liquidity that '
+                 'earned them by 1-2 days and a month in progress always shows '
+                 'less than it has accrued. Ledger current through {}; refresh '
+                 'with <code>imm_reward_recon.py --statement</code>.'
+                 '</div>'.format(cw["latest"] or "?"))
     h.append('<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
              'Daily P&amp;L (raw)</div>')
     h.append('<table style="border-collapse:collapse">')
@@ -774,10 +930,18 @@ def build_digest(now_utc: datetime):
              '<td style="{1}"></td></tr>'.format(
                  TDL, TD, _pnl_span(h_raw), h_rew, _pnl_span(h_raw + h_rew)))
     h.append("</table>")
+    _cal = load_json(CALIB_PATH) or {}
+    _pa = _cal.get("post_amendment") or {}
+    _fac = _pa.get("realization_factor")
+    _note = ("estimate carries the $1.00/market payout floor; measured against "
+             "credits on {} settled events since the {} estimator rewrite it "
+             "runs {:.3f}x".format(_pa.get("events", 0), _pa.get("cutover", "?"), _fac)
+             if _fac else "bot estimate (no credit ledger yet — run "
+                          "imm_reward_recon.py --statement)")
     h.append('<div style="color:#888;font-size:12px;margin-top:4px">RAW is n/a '
-             'for days older than the {}h fill-attribution window; rewards are '
-             'the bot estimate (lifetime realization 0.975x vs credited).'
-             '</div>'.format(FILL_LOOKBACK_HOURS))
+             'for days older than the {}h fill-attribution window. Rewards are '
+             'accrual-dated (Kalshi credits 1-2 days later); {}.'
+             '</div>'.format(FILL_LOOKBACK_HOURS, _note))
     h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
              'Events traded in the past day ({})</div>'.format(len(ev_rows)))
     if ev_rows:
@@ -826,7 +990,19 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--test", action="store_true",
                     help="send now regardless of the sent-marker; do not write it")
+    ap.add_argument("--print", dest="print_only", action="store_true",
+                    help="build and print the digest; send nothing, write no marker")
+    ap.add_argument("--html-out", help="with --print, also write the HTML here")
     args = ap.parse_args(argv)
+
+    if args.print_only:
+        body, html = build_digest(datetime.now(timezone.utc))
+        print(body)
+        if args.html_out:
+            with open(args.html_out, "w", encoding="utf-8") as f:
+                f.write(html)
+            log(f"wrote {args.html_out}")
+        return 0
 
     now_utc = datetime.now(timezone.utc)
     today_ct = now_utc.astimezone(CT).date()

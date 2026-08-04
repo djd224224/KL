@@ -341,7 +341,12 @@ for _s in os.environ.get(
             min_hours_to_close=_env_float("IMM_TEMP_MIN_HOURS_TO_CLOSE", 0.05),
             # pre-cutoff reduce-only removed bot-wide 2026-08-02 (was 300s
             # here via IMM_TEMP_PRE_CUTOFF_RO) — temp follows the global 0.
-            min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 0.70),
+            # 0.70 until 2026-08-04. The statement proved the exchange pays
+            # NOTHING under $1.00 per market per program period, so the sub-$1
+            # band this bought was quoted for exactly zero reward — it is
+            # clamped back to PAYOUT_FLOOR_DOLLARS by series_min_est_total()
+            # regardless, and the default now says so.
+            min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 1.00),
             atref_price_tol_ticks=_env_int("IMM_TEMP_ATREF_PRICE_TOL", 0),
             fast_lane=os.environ.get("IMM_TEMP_FAST_LANE", "1") == "1")
 
@@ -571,10 +576,18 @@ def member_price_band(series: str, is_member: bool) -> Tuple[int, int]:
 
 def series_min_est_total(series: str) -> float:
     """Per-series min-payout entry/hopeless floor, else the global
-    MIN_EST_TOTAL_DOLLARS (read at call time so env/test patches apply)."""
+    MIN_EST_TOTAL_DOLLARS (read at call time so env/test patches apply).
+
+    A per-series OVERRIDE is clamped up to PAYOUT_FLOOR_DOLLARS (2026-08-04):
+    the floor is compared against an OPTIMISTIC projection (accrued + best of
+    current/1h-peak), so a series bar below the exchange's own $1 minimum
+    admits markets whose very best case is a payout of zero. KXTEMP's $0.70
+    was exactly that (~40 such markets per clean-window day). The GLOBAL knob
+    is left alone so setting it to 0 still disables floors wholesale, which is
+    how the cutoff/mention-window tests isolate their subject."""
     ov = SERIES_OVERRIDES.get(series)
     if ov and ov.min_est_total is not None:
-        return ov.min_est_total
+        return max(ov.min_est_total, PAYOUT_FLOOR_DOLLARS)
     return MIN_EST_TOTAL_DOLLARS
 
 
@@ -1017,9 +1030,20 @@ MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 5000)
 # rate (Jack 2026-07-22): a $0.40/day estimate on a 5-day program clears the
 # $1 minimum comfortably; the old per-day floor only existed to catch 1-2-day
 # programs that couldn't. Margin above $1 via the env knob if wanted.
-# Per-series override: SeriesOverride.min_est_total via series_min_est_total()
-# (KXTEMP runs $0.70 — Jack 2026-08-02).
+# Per-series override: SeriesOverride.min_est_total via series_min_est_total(),
+# but NOTHING may sit below PAYOUT_FLOOR_DOLLARS — see series_min_est_total().
 MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.0)
+# The exchange's own minimum: a market whose payout for a program period comes
+# to less than this is paid NOTHING. Measured, not assumed — across all 2,720
+# LIQUIDITY credits on Jack's 2026-08-04 statement the smallest is exactly
+# $1.00 and none is below it (the floor is a liquidity-program rule: the one
+# VOLUME incentive on the statement is $0.31), and "one credit per market clearing $1" predicts
+# the actual per-event credit count exactly on 94 of 99 clean-window events
+# (272 predicted vs 273 actual). This is a hard threshold, so a per-series
+# entry floor UNDER it can only admit markets that provably pay zero: they are
+# pure fill risk. KXTEMP's $0.70 (Jack 2026-08-02) was exactly that and is now
+# clamped away.
+PAYOUT_FLOOR_DOLLARS = _env_float("IMM_PAYOUT_FLOOR", 1.0)
 # Horizon escape from the per-series RATE floor (Jack 2026-08-03): a fresh
 # candidate admits on EITHER est_rate >= the series bar OR a projected TOTAL
 # >= this. The rate bar alone is horizon-blind — it rejects a slow market that
@@ -2459,6 +2483,22 @@ class BotState:
     #   (NOT persisted: the tracker starts empty each process)
     reward_est_lifetime: float = 0.0      # cumulative est reward (NOT reset at the
     #   daily roll; persisted so it survives restarts) — the digest's running total
+    # PAID-BASIS twins of the three counters above. Kalshi does not pay a
+    # market whose whole-program payout lands under $1.00 — proven against
+    # Jack's 2026-08-04 statement: of 2,720 LIQUIDITY credits the minimum is
+    # exactly $1.00 and NOT ONE falls below it, and predicting "one credit per market
+    # whose estimate clears $1" reproduced the actual credit count exactly on
+    # 94 of 99 events (272 predicted vs 273 actual rows). The raw counters
+    # therefore book revenue on the ~30% of quoted markets that pay nothing.
+    # A market is credited here only once its accrual crosses PAYOUT_FLOOR
+    # (carrying its whole accrued-so-far across at that moment), which is the
+    # floor applied exactly rather than approximated.
+    reward_paid_today: float = 0.0
+    reward_paid_lifetime: float = 0.0
+    reward_paid_history: Dict[str, float] = field(default_factory=dict)
+    # markets whose accrual has already crossed the floor (pruned with
+    # accrued_est, so a settled market stops being carried)
+    paid_crossed: Set[str] = field(default_factory=set)
     contract_minutes_today: float = 0.0   # resting contracts x minutes quoted
     reward_accrue_at: float = 0.0
     last_markets_line: str = ""
@@ -2558,16 +2598,28 @@ class IncentiveMarketMaker:
             self.state.realized_lifetime = float(data.get("realized_lifetime") or 0.0)
             self.state.reward_history = {str(k): float(v) for k, v in
                                          (data.get("reward_history") or {}).items()}
+            self.state.reward_paid_lifetime = float(
+                data.get("reward_paid_lifetime") or 0.0)
+            self.state.reward_paid_history = {str(k): float(v) for k, v in
+                                              (data.get("reward_paid_history") or {}).items()}
+            # Which markets already cleared the $1 floor MUST persist with
+            # accrued_est: restoring the accrual without it would re-credit
+            # every carried market's whole backlog on the first cycle after a
+            # restart, inflating the paid basis by ~one full book per restart.
+            self.state.paid_crossed = set(data.get("paid_crossed") or [])
             # Daily reward/contract-minutes survive restarts within the SAME
             # roll day (2026-08-03 fix): without this every restart zeroed the
             # counter the digest reports.
             if data.get("reward_day_key") == _halt_day_key(datetime.now(timezone.utc)):
                 self.state.reward_est_today = float(data.get("reward_est_today") or 0.0)
+                self.state.reward_paid_today = float(data.get("reward_paid_today") or 0.0)
                 self.state.contract_minutes_today = float(
                     data.get("contract_minutes_today") or 0.0)
                 if self.state.reward_est_today:
                     log(f"{self.tag} restored est reward today "
-                        f"${self.state.reward_est_today:.2f} (same roll-day restart)")
+                        f"${self.state.reward_est_today:.2f} raw / "
+                        f"${self.state.reward_paid_today:.2f} paid-basis "
+                        f"(same roll-day restart)")
             self.state.sticky_prev = set(data.get("selected_tickers") or [])
             # Peak-entry memory survives restarts: it's in-memory otherwise, and
             # this bot restarts often (launcher-env changes, hang-watchdog), so
@@ -2582,6 +2634,21 @@ class IncentiveMarketMaker:
             # (or re-floor) markets that already banked most of their $1.
             self.state.accrued_est = {str(t): float(v) for t, v in
                                       (data.get("accrued_est") or {}).items()}
+            # MIGRATION (2026-08-04, first load after the paid-basis counters
+            # shipped): a state file written by the old code has accrued_est
+            # but no paid_crossed, so every carried market sitting above the
+            # floor would "cross" on the first cycle and dump its entire
+            # backlog — accrued over days, already counted in the raw
+            # counters — into TODAY's paid figure. Adopt their crossed status
+            # silently instead; only accrual from here forward counts.
+            if "paid_crossed" not in data:
+                self.state.paid_crossed = {
+                    t for t, v in self.state.accrued_est.items()
+                    if v >= PAYOUT_FLOOR_DOLLARS}
+                if self.state.paid_crossed:
+                    log(f"{self.tag} paid-basis migration: adopted "
+                        f"{len(self.state.paid_crossed)} market(s) already over "
+                        f"${PAYOUT_FLOOR_DOLLARS:.2f} without back-crediting")
             # rain-directional once-per-market dedupe must survive restarts
             # (this bot restarts often) or every restart would re-take the
             # same divergent books.
@@ -2649,12 +2716,17 @@ class IncentiveMarketMaker:
                            # anchored to the roll day so a NEW day starts clean
                            "reward_day_key": _halt_day_key(datetime.now(timezone.utc)),
                            "reward_est_today": round(self.state.reward_est_today, 4),
+                           "reward_paid_today": round(self.state.reward_paid_today, 4),
+                           "reward_paid_lifetime": round(
+                               self.state.reward_paid_lifetime, 4),
                            "contract_minutes_today": round(
                                self.state.contract_minutes_today, 1),
                            # 60 days kept: the digest's daily table shows every
                            # prior day that earned (Jack 2026-08-03)
                            "reward_history": {k: round(v, 2) for k, v in sorted(
                                self.state.reward_history.items())[-60:]},
+                           "reward_paid_history": {k: round(v, 2) for k, v in sorted(
+                               self.state.reward_paid_history.items())[-60:]},
                            "halt_day_key": _halt_day_key(datetime.now(timezone.utc)),
                            "pnl_today_carry": round(self.state.pnl_today_last, 2),
                            "halted_until": self.state.halted_until,
@@ -2669,6 +2741,12 @@ class IncentiveMarketMaker:
                                            for t, v in self.state.accrued_est.items()
                                            if v >= 1e-4
                                            and t in self.state.known_tickers},
+                           # pruned on the SAME rule as accrued_est: a ticker
+                           # that drops out of one must drop out of the other,
+                           # or a re-listed ticker resumes "already paid"
+                           "paid_crossed": sorted(
+                               t for t in self.state.paid_crossed
+                               if t in self.state.known_tickers),
                            "rain_dir_done": {t: round(v, 1)
                                              for t, v in self.state.rain_dir_done.items()
                                              if time.time() - v < 7 * 86400}}, f)
@@ -3479,9 +3557,29 @@ class IncentiveMarketMaker:
                 + (" ..." if len(dropped) > 8 else ""))
 
     def _coverage(self, ticker: str, counted: bool) -> float:
-        """Update + return the per-market counted-snapshot EMA (the payout's
-        non-excluded-ratio proxy). Only covers hours the bot observes; hours
-        we don't run aren't in it — an estimate, reconciled against credits."""
+        """Update + return the per-market counted-snapshot EMA.
+
+        OBSERVABILITY ONLY since 2026-08-04 — it is NOT a factor in any reward
+        estimate any more. It used to multiply the accrual rate as a proxy for
+        the payout's non-excluded ratio, which double-counted the exclusion:
+        `estimate_reward_share` already returns 0.0 for a snapshot that fails
+        the two-sided target test, so an excluded snapshot contributes nothing
+        to the integral before any EMA is applied. Writing out the program's
+        arithmetic makes the double-count obvious — with C counted snapshots
+        out of S, pool P, and per-snapshot share frac_i:
+
+            payout = P x (C/S) x (sum_{i in C} frac_i)/C = (P/S) x sum_i frac_i
+
+        i.e. exactly `sum(frac x dollars_per_day x dt)`, the raw integral. The
+        (C/S) scaling cancels against the per-snapshot normalisation; applying
+        an EMA of the same indicator on top is a second, unjustified haircut.
+
+        Measured against Jack's 2026-08-04 statement on the only clean window
+        (events that started after the post-amendment rewrite shipped
+        2026-08-01 19:13Z, n=99 credited events, $960.96): the raw integral
+        came in at 0.982x credited, the coverage-multiplied one at 1.057x.
+        Applying the $1 payout floor as well lands the raw integral at 1.016x.
+        """
         prev = self._coverage_ema.get(ticker)
         cur = 1.0 if counted else 0.0
         ema = cur if prev is None else prev + COVERAGE_EMA_ALPHA * (cur - prev)
@@ -3569,9 +3667,9 @@ class IncentiveMarketMaker:
                 yes_levels, no_levels, overlay,
                 meta.target_size, meta.discount_factor, own_in_book=False)
             n_contracts = sum(q.count for q in quotes)
-        cov = self._coverage(meta.ticker, sides == 2)
+        self._coverage(meta.ticker, sides == 2)   # observability only (see _coverage)
         meta.est_frac = frac
-        meta.est_dollars_per_day = frac * meta.dollars_per_day * cov
+        meta.est_dollars_per_day = frac * meta.dollars_per_day
         meta.yield_per_contract = \
             (meta.est_dollars_per_day / n_contracts) if n_contracts else 0.0
         return True
@@ -4407,7 +4505,7 @@ class IncentiveMarketMaker:
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, est_own,
                 meta.target_size, meta.discount_factor, own_in_book=self.live)
-            cov = self._coverage(t, sides == 2)
+            self._coverage(t, sides == 2)   # observability only (see _coverage)
             # Coverage alert (2026-08-02): a member quoting into a snapshot
             # that can't count is the worst rent-per-risk state — page after
             # N consecutive FULL cycles (pads should make this ~impossible).
@@ -4424,8 +4522,8 @@ class IncentiveMarketMaker:
                             f"ZERO while carrying fill risk", key=t)
                 else:
                     self.state.coverage_zero_streak.pop(t, None)
-            reward_frac_sum += frac * meta.dollars_per_day * cov
-            cycle_rate[t] = frac * meta.dollars_per_day * cov
+            reward_frac_sum += frac * meta.dollars_per_day
+            cycle_rate[t] = frac * meta.dollars_per_day
             cycle_rows.append(
                 f"{now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')},{t},"
                 f"{ext_bid if ext_bid is not None else ''},"
@@ -4467,10 +4565,22 @@ class IncentiveMarketMaker:
                 self.state.reward_est_lifetime += accrued
                 # Per-market accrual (same integral, split by ticker) — the
                 # hopeless-exit / floor credit: accrued + projection vs $1.
+                paid_delta = 0.0
                 for t_, rate in cycle_rate.items():
                     if rate > 0:
-                        self.state.accrued_est[t_] = \
-                            self.state.accrued_est.get(t_, 0.0) + rate * dt_days
+                        prev_acc = self.state.accrued_est.get(t_, 0.0)
+                        new_acc = prev_acc + rate * dt_days
+                        self.state.accrued_est[t_] = new_acc
+                        # PAID basis: nothing counts until this market's own
+                        # accrual clears the $1 program floor, and the whole
+                        # backlog lands in the cycle that crosses it.
+                        if t_ in self.state.paid_crossed:
+                            paid_delta += new_acc - prev_acc
+                        elif new_acc >= PAYOUT_FLOOR_DOLLARS:
+                            self.state.paid_crossed.add(t_)
+                            paid_delta += new_acc
+                self.state.reward_paid_today += paid_delta
+                self.state.reward_paid_lifetime += paid_delta
                 self.state.contract_minutes_today += \
                     resting_contracts * (now_ts - self.state.reward_accrue_at) / 60.0
             self.state.reward_accrue_at = now_ts
@@ -4757,6 +4867,10 @@ class IncentiveMarketMaker:
             "markets_line": s.last_markets_line,
             "reward_est_today": round(s.reward_est_today, 2),
             "reward_est_lifetime": round(s.reward_est_lifetime, 2),
+            # paid basis = the raw integral with the exchange's $1-per-market
+            # program floor applied; this is what Kalshi actually credits
+            "reward_paid_today": round(s.reward_paid_today, 2),
+            "reward_paid_lifetime": round(s.reward_paid_lifetime, 2),
             "contract_minutes_today": round(s.contract_minutes_today),
             "cents_per_1k_contract_min": round(
                 100000 * s.reward_est_today / s.contract_minutes_today, 2)
@@ -4810,6 +4924,7 @@ class IncentiveMarketMaker:
         eff = f", {100000 * s.reward_est_today / cm:.1f}c/1k-contract-min" if cm else ""
         body = (f"incentive_mm daily ({'LIVE' if self.live else 'DRY'}): "
                 f"{s.last_markets_line} | est reward today ${s.reward_est_today:.2f} "
+                f"(${s.reward_paid_today:.2f} paid basis) "
                 f"({cm:,.0f} contract-min{eff}) | "
                 f"realized today ${realized_today:+.2f} (lifetime "
                 f"${self.pnl.total_realized():+.2f}), unrealized ${unrealized:+.2f} "
@@ -4826,7 +4941,10 @@ class IncentiveMarketMaker:
                      - timedelta(days=1)).isoformat()
         s.reward_history[completed] = round(s.reward_est_today, 2)
         s.reward_history = dict(sorted(s.reward_history.items())[-60:])
+        s.reward_paid_history[completed] = round(s.reward_paid_today, 2)
+        s.reward_paid_history = dict(sorted(s.reward_paid_history.items())[-60:])
         s.reward_est_today = 0.0
+        s.reward_paid_today = 0.0
         s.contract_minutes_today = 0.0
         # roll both loss-halt windows + the restart-carry and balance anchor
         s.realized_baseline = self.pnl.total_realized()
