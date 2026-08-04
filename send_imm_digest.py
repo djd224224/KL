@@ -275,8 +275,11 @@ IMM_INCEPTION = "2026-07-12"
 # median 1.3d, p90 1.7d, max 3.0d), so a ledger more than this many days
 # behind is genuinely missing money rather than merely waiting on settlement.
 LEDGER_STALE_DAYS = int(os.environ.get("IMM_LEDGER_STALE_DAYS", "4"))
-REWARDS_CREDITED = os.environ.get("IMM_REWARDS_CREDITED", "")
-REWARDS_CREDITED_MTD = os.environ.get("IMM_REWARDS_CREDITED_MTD", "")
+# IMM_REWARDS_CREDITED / IMM_REWARDS_CREDITED_MTD are GONE (2026-08-04). They
+# were hand-set account-level statement totals; nothing reads them now that the
+# reported reward is the bot estimate and the ledger is per-event. The digest
+# scheduled task still exports them — harmless, but delete them from the task
+# when convenient so a stale value can never look meaningful again.
 DAILY_PNL_PATH = os.path.join(STATUS_DIR, "daily_pnl.json")
 
 
@@ -527,22 +530,22 @@ def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime):
     today_et = datetime.now(timezone.utc).astimezone(ET).date()
     ledger, calib = load_credit_ledger()
     cred = credited_windows(ledger, calib, today_et)
-    # LIFETIME reward is the credit ledger when we have one: it is the only
-    # figure that is a fact rather than a model, and it is now restricted to
-    # credits dated on/after IMM's go-live AND landing on an event IMM quoted.
-    # The env var stays as a manual override, but note it is ACCOUNT-level, so
-    # it double-counts the other bots on this key.
-    if cred:
-        rew_life = cred["lifetime"]
-        rew_basis = ("credited (ledger, IMM-attributable since "
-                     f"{IMM_INCEPTION})" if cred["attributed"]
-                     else f"credited (ledger, since {IMM_INCEPTION})")
-    elif REWARDS_CREDITED:
-        rew_life = _f(REWARDS_CREDITED)
-        rew_basis = "credited (statement env, ACCOUNT-level)"
-    else:
-        rew_life = reward_lifetime
-        rew_basis = "bot estimate"
+    # LIFETIME reward is the BOT ESTIMATE (Jack 2026-08-04). It briefly read
+    # off the credit ledger, which is the only figure that is a fact rather
+    # than a model — but it is a fact about a DIFFERENT quantity: credits are
+    # paid at each program's period end, so the ledger always trails what the
+    # book has earned and never includes the in-flight programs. Sitting in a
+    # column next to same-instant RAW P&L, that lag reads as underperformance
+    # rather than as settlement timing.
+    #
+    # The raw counter is used rather than reward_paid_lifetime because the
+    # paid-basis counter only started accumulating 2026-08-04 and was migrated
+    # WITHOUT back-crediting, so it is near zero and cannot represent lifetime
+    # yet. Once it has real history it is the better source here (it applies
+    # the exchange's $1/market floor); the sub-windows below already prefer it
+    # per day wherever it exists.
+    rew_life = reward_lifetime
+    rew_basis = "bot estimate"
     # Sub-window rewards come from the persisted per-day history; days before
     # the 2026-08-03 fix are missing and are reported as such rather than
     # silently summed to a wrong number. These stay on the ACCRUAL basis on
