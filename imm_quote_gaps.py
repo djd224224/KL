@@ -221,6 +221,73 @@ def bulk_market_details(client, tickers) -> dict:
 _TITLE_CACHE: dict = {}
 
 
+# Plain-English descriptions (Jack 2026-08-04: "provide plain explanation of
+# what each event is"). Kalshi's own event title is used when it already reads
+# like a sentence; these patterns cover the families whose titles are terse or
+# absent, and add the concrete subject (which city, which movie, which company).
+_CITY = {
+    "AUS": "Austin", "CHI": "Chicago", "DC": "Washington DC", "LAX": "Los Angeles",
+    "NYC": "New York", "MIA": "Miami", "DEN": "Denver", "HOU": "Houston",
+    "DAL": "Dallas", "SEA": "Seattle", "PHIL": "Philadelphia", "PHX": "Phoenix",
+    "STP": "St Paul", "OKC": "Oklahoma City", "MIN": "Minneapolis",
+    "BOS": "Boston", "ATL": "Atlanta", "LV": "Las Vegas", "SATX": "San Antonio",
+    "NOLA": "New Orleans",
+}
+_FAMILY = {
+    "KXDIESELD": "US diesel price, daily AAA print",
+    "KXDIESELW": "US diesel price, weekly AAA print",
+    "KXAAAGASD": "US gas price, daily AAA print",
+    "KXAAAGASW": "US gas price, weekly AAA print",
+    "KXAAAGASM": "US gas price, monthly AAA print",
+    "KXUSGASCPI": "US gasoline CPI print",
+    "KXNHSALES": "US new-home sales print",
+    "KXSCFI": "Shanghai container freight index",
+    "KXRT": "Rotten Tomatoes critic score",
+    "KXBKFT": "Burger King monthly foot traffic",
+    "KXYUMTBFT": "Taco Bell monthly foot traffic",
+    "KXAQICITY": "Air-quality index reading",
+    "KXRAIN": "Whether it rains in a city that day",
+    "KXTRUMPMENTION": "Words Trump says during an appearance",
+    "KXTRUMPSAY": "Words Trump says this week",
+    "KXTRUMPSAYMONTH": "Words Trump says this month",
+    "KXTRUMPSAYCOMPANY": "Companies Trump names",
+}
+
+
+def describe_event(event_ticker: str, title: str = "") -> str:
+    """One clause a human can read without knowing the ticker scheme."""
+    series = event_ticker.split("-")[0]
+    t = (title or "").strip()
+    # hourly temperature: KXTEMP<CITY>H-26AUG0209 -> city + the hour it settles
+    if series.startswith("KXTEMP") and series.endswith("H"):
+        city = _CITY.get(series[6:-1], series[6:-1])
+        tail = event_ticker.split("-")[-1]
+        hour = ""
+        if len(tail) >= 2 and tail[-2:].isdigit():
+            h = int(tail[-2:])
+            ampm = "am" if h < 12 else "pm"
+            h12 = h if 1 <= h <= 12 else (12 if h % 12 == 0 else h % 12)
+            hour = f", {h12}{ampm} hour"
+        return f"Hourly high temperature in {city}{hour}"
+    if series.startswith("KXRAIN") and series.endswith("M"):
+        city = _CITY.get(series[6:-1], series[6:-1])
+        return f"Number of rainy days this month in {city}"
+    if series.startswith("KXEARNINGSMENTION"):
+        co = series[len("KXEARNINGSMENTION"):]
+        return f"Words said on {co}'s earnings call"
+    if series.startswith("KXYTVIEWSW"):
+        return "Highest daily YouTube view count this week"
+    if series.startswith("KXJOINCLUB"):
+        return "Which club a footballer signs for next"
+    for pref, desc in _FAMILY.items():
+        if series == pref or series.startswith(pref):
+            return desc
+    # Kalshi's own title is often already a plain question — prefer it.
+    if t:
+        return t if len(t) <= 70 else t[:67] + "..."
+    return series
+
+
 def event_title(client, ev: str, fallback: str = "") -> str:
     if ev in _TITLE_CACHE:
         return _TITLE_CACHE[ev]
@@ -432,8 +499,12 @@ def classify_and_estimate(client, bot, now_utc: datetime):
             "reason": reason,
             "fallback_title": str(sample.get("title") or ""),
         })
-    event_rows.sort(key=lambda d: (-(d["est"] if d["est"] is not None else -1),
-                                   -d["pool"]))
+    # Jack 2026-08-04: rank by PROFIT PER MINUTE. est is a $/day rate, so
+    # per-minute is est/1440 — a monotonic transform, but sorting on the
+    # displayed quantity keeps the table honest if the units ever change.
+    # Unestimated rows fall to the bottom, ordered by pool.
+    event_rows.sort(key=lambda d: (
+        -((d["est"] / 1440.0) if d["est"] is not None else -1), -d["pool"]))
 
     ctx = {
         "programs": len(programs),
@@ -481,8 +552,9 @@ def build_report(now_utc: datetime):
     deliberate_show = sorted(deliberate,
                              key=lambda d: (-(d["est"] or 0), -d["pool"]))[:10]
 
-    for d in show + deliberate_show:
-        d["title"] = event_title(client, d["event"], d["fallback_title"])
+    for d in show + deliberate_show:   # descriptions for both tables
+        d["title"] = describe_event(
+            d["event"], event_title(client, d["event"], d["fallback_title"]))
 
     today_et = now_utc.astimezone(imm.ET).date()
     headline = ctx["est_missed_total"]
@@ -512,13 +584,15 @@ def build_report(now_utc: datetime):
                      f"{ctx['updated_at']}) — 'quoted' set may be old.")
     lines.append("")
     if show:
-        lines.append(f"{'EVENT':<28} {'WHAT IT IS':<44} {'MKTS':>4} "
-                     f"{'POOL$/D':>8} {'EST$/D':>8} {'C/MIN':>6}  WHY NOT QUOTED")
+        lines.append("ranked by profit per minute")
+        lines.append(f"{'C/MIN':>6} {'EST$/D':>8} {'EVENT':<28} "
+                     f"{'WHAT IT IS':<46} {'MKTS':>4} {'POOL$/D':>8}  "
+                     f"WHY NOT QUOTED")
         for d in show:
             lines.append(
-                f"{d['event'][:28]:<28} {(d['title'] or '?')[:44]:<44} "
-                f"{d['n']:>4} {d['pool']:>8,.0f} {est_str(d):>8} "
-                f"{permin(d):>6}  {d['reason']} ({fmt_window(d['end'], now_utc)})")
+                f"{permin(d):>6} {est_str(d):>8} {d['event'][:28]:<28} "
+                f"{(d['title'] or '?')[:46]:<46} {d['n']:>4} {d['pool']:>8,.0f}  "
+                f"{d['reason']} ({fmt_window(d['end'], now_utc)})")
     else:
         lines.append("No unquoted opportunities above the display floor.")
     if hidden:
@@ -561,22 +635,24 @@ def build_report(now_utc: datetime):
                  f'Bot heartbeat stale (updated_at {ctx["updated_at"]}) — '
                  f'"quoted" set may be old.</div>')
     if show:
+        h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
+                 'ranked by profit per minute</div>')
         h.append('<table style="border-collapse:collapse">')
         h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
+                 f'<td style="{TD}">C/MIN</td><td style="{TD}">EST $/D</td>'
                  f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
                  f'<td style="{TD}">MKTS</td><td style="{TD}">POOL $/D</td>'
-                 f'<td style="{TD}">EST $/D</td><td style="{TD}">C/MIN</td>'
                  f'<td style="{TDL}">WHY NOT QUOTED</td></tr>')
         for i, d in enumerate(show):
             bg = "#fafafa" if i % 2 else "#fff"
             h.append(
                 f'<tr style="background:{bg}">'
+                f'<td style="{TD};font-weight:700;color:#b45309">{permin(d)}</td>'
+                f'<td style="{TD};font-weight:600">{est_str(d)}</td>'
                 f'<td style="{TDL}"><b>{d["event"]}</b></td>'
                 f'<td style="{TDL}">{d["title"] or "?"}</td>'
                 f'<td style="{TD}">{d["n"]}</td>'
                 f'<td style="{TD}">{d["pool"]:,.0f}</td>'
-                f'<td style="{TD};font-weight:600;color:#b45309">{est_str(d)}</td>'
-                f'<td style="{TD}">{permin(d)}</td>'
                 f'<td style="{TDL}">{d["reason"]}'
                 f'<span style="color:#999"> · {fmt_window(d["end"], now_utc)}</span>'
                 f'</td></tr>')
