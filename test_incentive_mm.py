@@ -541,8 +541,11 @@ def _resting(oid, ticker, book_side, px, remaining):
 
 
 class TestAtRefDiffHysteresis(unittest.TestCase):
-    """atref requote hysteresis (2026-08-02): rungs within 1 tick BEHIND
-    desired and 20% of size are kept; aggressive-side drift is churned."""
+    """atref requote matching. 2026-08-03: the global price tolerance is 0
+    (amend-in-place made repricing free, and a rung 1 tick below the
+    reference earns HALF weight), so every series re-pins in BOTH
+    directions. Tests that exercise the tolerant regime patch
+    ATREF_PRICE_TOL_TICKS explicitly."""
 
     def setUp(self):
         self._mode = imm.LADDER_MODE
@@ -555,11 +558,25 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
         return imm.diff_orders(desired, resting, {}, 0.0,
                                touch_by_ticker=touch)
 
-    def test_one_tick_behind_kept(self):
+    def test_one_tick_behind_amended_at_zero_tol(self):
+        # default tol 0: a rung 1 tick below the reference is half weight,
+        # so it is amended back (gapless) rather than left to its TTL.
         d = [imm.Quote("T", "bid", 45, 30)]
-        r = [_resting("o1", "T", "bid", 44, 30)]     # 1 behind desired: keep
+        r = [_resting("o1", "T", "bid", 44, 30)]
         place, cancel, amend = self._diff(d, r)
-        self.assertEqual((place, cancel, amend), ([], [], []))
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
+                         [("o1", 45)])
+
+    def test_one_tick_behind_kept_when_tolerant(self):
+        old = imm.ATREF_PRICE_TOL_TICKS
+        imm.ATREF_PRICE_TOL_TICKS = 1
+        try:
+            d = [imm.Quote("T", "bid", 45, 30)]
+            r = [_resting("o1", "T", "bid", 44, 30)]
+            self.assertEqual(self._diff(d, r), ([], [], []))
+        finally:
+            imm.ATREF_PRICE_TOL_TICKS = old
 
     def test_aggressive_drift_amended_without_touch(self):
         # No touch data -> the aggressive-drift keep is disabled; the rung is
@@ -577,8 +594,17 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
         # not leading the current touch.
         d = [imm.Quote("T", "bid", 45, 30)]
         r = [_resting("o1", "T", "bid", 46, 30)]
-        out = self._diff(d, r, touch={"T": (47, 53)})
-        self.assertEqual(out, ([], [], []))
+        old = imm.ATREF_PRICE_TOL_TICKS
+        imm.ATREF_PRICE_TOL_TICKS = 1          # keep path needs a tolerant series
+        try:
+            self.assertEqual(self._diff(d, r, touch={"T": (47, 53)}), ([], [], []))
+        finally:
+            imm.ATREF_PRICE_TOL_TICKS = old
+        # at the default tol 0 the same rung re-pins to the deeper reference
+        # (same full weight, further from the touch = less fill risk)
+        place, cancel, amend = self._diff(d, r, touch={"T": (47, 53)})
+        self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
+                         [("o1", 45)])
 
     def test_aggressive_keep_respects_safe_join_net(self):
         # Safe-join series: the kept rung must stay >= 2 ticks off a tight
@@ -587,14 +613,18 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
         t = "KXAAAGASD-26AUG03-4.090"       # safe-join series
         d = [imm.Quote(t, "bid", 68, 30)]
         r = [_resting("o1", t, "bid", 69, 30)]
-        # tight spread (70/74): 69 is only 1 off the 70 touch -> amend
-        place, cancel, amend = self._diff(d, r, touch={t: (70, 74)})
-        self.assertEqual((place, cancel), ([], []))
-        self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
-                         [("o1", 68)])
-        # wide spread (70/76): the spread IS the net -> keep
-        out = self._diff(d, r, touch={t: (70, 76)})
-        self.assertEqual(out, ([], [], []))
+        old = imm.ATREF_PRICE_TOL_TICKS
+        imm.ATREF_PRICE_TOL_TICKS = 1          # keep path needs a tolerant series
+        try:
+            # tight spread (70/74): 69 is only 1 off the 70 touch -> amend
+            place, cancel, amend = self._diff(d, r, touch={t: (70, 74)})
+            self.assertEqual((place, cancel), ([], []))
+            self.assertEqual([(o["order_id"], q.price_cents) for o, q in amend],
+                             [("o1", 68)])
+            # wide spread (70/76): the spread IS the net -> keep
+            self.assertEqual(self._diff(d, r, touch={t: (70, 76)}), ([], [], []))
+        finally:
+            imm.ATREF_PRICE_TOL_TICKS = old
 
     def test_aggressive_leading_book_amended(self):
         # ...but a rung ABOVE the current touch is leading the book: fix it.
@@ -621,15 +651,22 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
 
     def test_ask_side_direction(self):
         d = [imm.Quote("T", "ask", 55, 30)]
-        r_ok = [_resting("o1", "T", "ask", 56, 30)]   # behind (higher): keep
-        self.assertEqual(self._diff(d, r_ok), ([], [], []))
+        r_ok = [_resting("o1", "T", "ask", 56, 30)]   # 1 behind: re-pinned at tol 0
+        place, cancel, amend = self._diff(d, r_ok)
+        self.assertEqual((place, cancel), ([], []))
+        self.assertEqual([o["order_id"] for o, _q in amend], ["o1"])
         r_ag = [_resting("o2", "T", "ask", 54, 30)]   # aggressive, no touch
         place, cancel, amend = self._diff(d, r_ag)
         self.assertEqual((place, cancel), ([], []))
         self.assertEqual([o["order_id"] for o, _q in amend], ["o2"])
-        # aggressive ask still at/above the touch: keep
-        self.assertEqual(self._diff(d, r_ag, touch={"T": (50, 54)}),
-                         ([], [], []))
+        # aggressive ask at/above the touch is kept only in the tolerant regime
+        old = imm.ATREF_PRICE_TOL_TICKS
+        imm.ATREF_PRICE_TOL_TICKS = 1
+        try:
+            self.assertEqual(self._diff(d, r_ag, touch={"T": (50, 54)}),
+                             ([], [], []))
+        finally:
+            imm.ATREF_PRICE_TOL_TICKS = old
 
     def test_stale_ttl_still_cancel_places(self):
         # amend cannot extend the exchange-side expiration -> TTL-stale

@@ -154,7 +154,12 @@ REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 3.0)
 TOTAL_SIZE_MULT_CAP = _env_float("IMM_TOTAL_SIZE_MULT_CAP", 5.0)
 # Requote hysteresis for atref rungs (2026-08-02 audit): full weight is flat
 # across the band, so churn on 1-tick touch/ref wiggles buys nothing.
-ATREF_PRICE_TOL_TICKS = _env_int("IMM_ATREF_PRICE_TOL", 1)
+# 1 -> 0 (Jack 2026-08-03: "sticky quotes that dont adjust the quote by 1c is
+# making markets like this not earn rewards"). The 1-tick tolerance existed to
+# avoid cancel+place churn, but amend-in-place (same day) reprices in ONE call
+# with no book gap, so the churn argument is gone — while a rung left 1 tick
+# below the reference earns HALF weight until its TTL. Temp already ran 0.
+ATREF_PRICE_TOL_TICKS = _env_int("IMM_ATREF_PRICE_TOL", 0)
 ATREF_COUNT_TOL_FRAC = _env_float("IMM_ATREF_COUNT_TOL", 0.2)
 # Safe-join placement (Jack 2026-08-02, company/econ re-entry): on a tight
 # book (spread < MIN_SPREAD ticks) quotes rest at least OFFSET ticks behind
