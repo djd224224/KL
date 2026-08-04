@@ -844,21 +844,10 @@ def build_digest(now_utc: datetime):
         L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
             lbl, money(w[key]["raw"]), money(w[key]["reward"]),
             money(net_of(key))))
-    L.append("  reward basis: {}".format(w["life"]["basis"]))
-    cw = w.get("credited")
-    if cw:
-        L.append("")
-        L.append("REWARDS CREDITED by Kalshi (settlement fact; programs pay at "
-                 "period end, 1-2 days after the liquidity that earned them)")
-        L.append("  IMM-attributable, since {}   ${:>10,.2f}".format(
-            IMM_INCEPTION, cw["lifetime"]))
-        L.append("  month to date                 ${:>10,.2f}".format(cw["mtd"]))
-        L.append("  credited on {}          ${:>10,.2f}".format(
-            (today_ct - timedelta(days=1)).isoformat(), cw["day"]))
-        if cw.get("account_lifetime") is not None:
-            L.append("  (whole account, all strategies ${:>10,.2f}; not IMM's "
-                     "${:,.2f})".format(cw["account_lifetime"], cw["non_imm"] or 0.0))
-        L.append("  ledger current through {}".format(cw["latest"] or "?"))
+    # The credited-rewards block that used to sit here was removed at Jack's
+    # request 2026-08-04. The ledger still BACKS the lifetime REWARD figure
+    # above (see pnl_windows) and the health line still warns when it goes
+    # stale — only the standalone breakdown is gone.
     L.append("")
     L.append("")
     L.append("DAILY P&L — every prior day that earned (raw; a day moves until "
@@ -941,34 +930,11 @@ def build_digest(now_utc: datetime):
                      bg, TDL, lbl, TD, _pnl_span(w[key]["raw"]),
                      money(r), _pnl_span(n) if n is not None else "n/a"))
     h.append("</table>")
-    h.append('<div style="color:#888;font-size:12px;margin:-6px 0 10px">'
-             'reward basis: {}</div>'.format(w["life"]["basis"]))
-    cw = w.get("credited")
-    if cw:
-        h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
-                 'Rewards credited by Kalshi</div>')
-        h.append('<table style="border-collapse:collapse">')
-        h.append('<tr style="background:#f0f0f0;font-weight:600">'
-                 '<td style="{0}">WINDOW</td><td style="{1}">CREDITED$</td>'
-                 '</tr>'.format(TDL, TD))
-        _cr = [("IMM-attributable, since " + IMM_INCEPTION, cw["lifetime"]),
-               ("Month to date", cw["mtd"]),
-               ("Credited " + (today_ct - timedelta(days=1)).isoformat(), cw["day"])]
-        if cw.get("account_lifetime") is not None:
-            _cr.append(("Whole account (all strategies)", cw["account_lifetime"]))
-            _cr.append(("...of which NOT IMM's", cw.get("non_imm") or 0.0))
-        for i, (lbl, v) in enumerate(_cr):
-            h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
-                     '<td style="{3}">{4:,.2f}</td></tr>'.format(
-                         "#fafafa" if i % 2 else "#fff", TDL, lbl, TD, v))
-        h.append("</table>")
-        h.append('<div style="color:#888;font-size:12px;margin-top:4px">'
-                 'A settlement fact, not an accrual: Kalshi pays a program at '
-                 'its PERIOD END, so these windows lag the liquidity that '
-                 'earned them by 1-2 days and a month in progress always shows '
-                 'less than it has accrued. Ledger current through {}; refresh '
-                 'with <code>imm_reward_recon.py --statement</code>.'
-                 '</div>'.format(cw["latest"] or "?"))
+    # The "Rewards credited by Kalshi" table and the "reward basis" line that
+    # used to sit here were removed at Jack's request 2026-08-04. The ledger
+    # still BACKS the lifetime REWARD figure in the table above (pnl_windows
+    # prefers it over the bot estimate) and health_line still warns when it
+    # goes stale — only the standalone breakdown is gone.
     h.append('<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
              'Daily P&amp;L (raw)</div>')
     h.append('<table style="border-collapse:collapse">')
