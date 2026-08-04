@@ -652,27 +652,6 @@ def build_digest(now_utc: datetime):
         return "{:+,.2f}".format(v) if v is not None else dash
 
     d = w["day"]["detail"]
-    # est-vs-credited, split at the month boundary: the completed prior period
-    # is the only fair test of the estimator; the current month is dominated by
-    # unpaid in-flight programs.
-    recon = []
-    cred_life = _f(REWARDS_CREDITED) if REWARDS_CREDITED else None
-    cred_mtd = _f(REWARDS_CREDITED_MTD) if REWARDS_CREDITED_MTD else None
-    if cred_life is not None:
-        est_life = ss["reward_lifetime"]
-        non_imm = _f(REWARDS_NON_IMM)
-        # ONLY the lifetime, IMM-attributable row is reported. The month/prior
-        # split was removed 2026-08-04: it is not two measurements but one
-        # measurement and a subtraction, so every month-boundary error lands
-        # entirely on "prior" and inverted its ratio. The month row was worse
-        # still — its denominator holds accrual sitting in programs that have
-        # not ended, so it cannot be credited yet, and the statement's "as of"
-        # instant is unknown; across plausible cut dates it spanned 0.39x-5.9x.
-        recon.append(("account credited", est_life, cred_life))
-        if non_imm:
-            recon.append(("less non-IMM (other strategies, pre-IMM days)",
-                          0.0, -non_imm))
-            recon.append(("IMM-attributable", est_life, cred_life - non_imm))
     ev_rows = sorted(w["day"]["events"].items(),
                      key=lambda kv: -(kv[1]["realized"] + kv[1]["settle"]
                                       + kv[1]["unrealized"]))
@@ -687,46 +666,15 @@ def build_digest(now_utc: datetime):
         L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
             lbl, money(w[key]["raw"]), money(w[key]["reward"]),
             money(net_of(key))))
-    if w["week"]["reward"] is not None and w["week"]["reward_days"] < 7:
-        L.append("  (week reward covers {}/7 days \u2014 daily reward history "
-                 "began 2026-08-03)".format(w["week"]["reward_days"]))
-    if w["day"]["reward"] is None:
-        L.append("  (past-day reward pending the next 5am-CT roll)")
-    L.append("  lifetime reward basis: {}; bot estimate ${:,.2f}".format(
-        w["life"]["basis"], ss["reward_lifetime"]))
-    if recon:
-        L.append("")
-        L.append("REWARD RECONCILIATION (estimate vs actually credited)")
-        for lbl, est, cred in recon:
-            ratio = ("{:.2f}x".format(cred / est) if est else "")
-            L.append("  {:44s} est ${:>10,.2f}   credited ${:>10,.2f}   {}"
-                     .format(lbl, est, cred, ratio))
-        L.append("  Rewards are paid on the ACCOUNT's book presence, not per "
-                 "strategy, and the")
-        L.append("  estimate only starts 2026-07-11 — so account credit "
-                 "includes reward IMM never")
-        L.append("  estimated. IMM-attributable is the like-for-like row.")
-        L.append("  NOTE: credited-to-date understates IMM because accrual in "
-                 "programs that have")
-        L.append("  not ended yet cannot be paid; on a fully-settled basis the "
-                 "ratio is ~1.0x.")
-        L.append("  Daily reward figures below are ESTIMATES.")
     L.append("")
-    L.append("PAST DAY detail: realized {:+,.2f} | settled {:+,.2f} | open MTM "
-             "{:+,.2f} | fees {:+,.2f} | {:,.0f} contracts filled".format(
-                 d["realized"], d["settle"], d["unrealized"], -d["fees"],
-                 d["contracts"]))
-    L.append("Open book: net {:+,.0f} contracts, exposure ${:,.2f} | resting "
-             "${:,.2f} ({} orders / {} events) | balance {}".format(
-                 tot["net_pos"], tot["exposure"], resting["collateral"],
-                 resting["orders"], resting["events"], bal_str))
     L.append("")
     L.append("DAILY P&L — every prior day that earned (raw; a day moves until "
              "its positions settle)")
     L.append("{:12s} {:>11s} {:>11s} {:>11s} {:>10s}".format(
         "DATE", "RAW$", "REWARD$", "NET$", "CONTRACTS"))
     d_raw = d_rew = 0.0
-    for day, raw, reward, contracts, nf in series:
+    # most recent first (Jack 2026-08-04)
+    for day, raw, reward, contracts, nf in reversed(series):
         net = (raw + reward) if (raw is not None and reward is not None) else None
         if raw is not None:
             d_raw += raw
@@ -797,50 +745,6 @@ def build_digest(now_utc: datetime):
                      bg, TDL, lbl, TD, _pnl_span(w[key]["raw"]),
                      money(r), _pnl_span(n) if n is not None else "n/a"))
     h.append("</table>")
-    notes = ["lifetime reward basis: <b>{}</b> (bot estimate ${:,.2f})".format(
-        w["life"]["basis"], ss["reward_lifetime"])]
-    if w["week"]["reward"] is not None and w["week"]["reward_days"] < 7:
-        notes.append("week reward covers {}/7 days (daily history began "
-                     "2026-08-03)".format(w["week"]["reward_days"]))
-    if w["day"]["reward"] is None:
-        notes.append("past-day reward pending the next 5am-CT roll")
-    h.append('<div style="color:#888;font-size:12px;margin-bottom:10px">{}</div>'
-             .format(" &nbsp;\u00b7&nbsp; ".join(notes)))
-    if recon:
-        h.append('<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
-                 'Reward reconciliation (estimate vs credited)</div>')
-        h.append('<table style="border-collapse:collapse">')
-        h.append('<tr style="background:#f0f0f0;font-weight:600">'
-                 '<td style="{0}">PERIOD</td><td style="{1}">ESTIMATE</td>'
-                 '<td style="{1}">CREDITED</td><td style="{1}">REALIZATION</td>'
-                 '</tr>'.format(TDL, TD))
-        for i, (lbl, est, cred) in enumerate(recon):
-            bg = "#fafafa" if i % 2 else "#fff"
-            ratio = ("{:.2f}x".format(cred / est) if est else "")
-            h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
-                     '<td style="{3}">${4:,.2f}</td><td style="{3}">${5:,.2f}</td>'
-                     '<td style="{3};font-weight:600">{6}</td></tr>'.format(
-                         bg, TDL, lbl, TD, est, cred, ratio))
-        h.append("</table>")
-        h.append('<div style="color:#888;font-size:12px;margin:4px 0 10px">'
-                 "Rewards are paid on the ACCOUNT's book presence, not per "
-                 'strategy, and the estimate only starts 2026-07-11 &mdash; so '
-                 'account credit includes reward IMM never estimated. '
-                 '<b>IMM-attributable</b> is the like-for-like row. Credited-'
-                 'to-date still understates IMM because accrual in programs '
-                 'that have not ended cannot be paid yet; fully settled the '
-                 'ratio is ~1.0x. Daily reward figures below are ESTIMATES.'
-                 '</div>')
-    h.append('<div style="color:#555;margin-bottom:12px">Past day: realized {} '
-             '&nbsp;\u00b7&nbsp; settled {} &nbsp;\u00b7&nbsp; open MTM {} '
-             '&nbsp;\u00b7&nbsp; {:,.0f} contracts<br>Open book: net <b>{:+,.0f}'
-             '</b> &nbsp;\u00b7&nbsp; exposure <b>${:,.2f}</b> &nbsp;\u00b7&nbsp; '
-             'resting <b>${:,.2f}</b> ({} orders) &nbsp;\u00b7&nbsp; balance '
-             '<b>{}</b></div>'.format(
-                 _pnl_span(d["realized"]), _pnl_span(d["settle"]),
-                 _pnl_span(d["unrealized"]), d["contracts"], tot["net_pos"],
-                 tot["exposure"], resting["collateral"], resting["orders"],
-                 bal_str))
     h.append('<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
              'Daily P&amp;L (raw)</div>')
     h.append('<table style="border-collapse:collapse">')
@@ -849,7 +753,7 @@ def build_digest(now_utc: datetime):
              '<td style="{1}">REWARD$</td><td style="{1}">NET$</td>'
              '<td style="{1}">CONTRACTS</td></tr>'.format(TDL, TD))
     h_raw = h_rew = 0.0
-    for i, (day, raw, reward, contracts, nf) in enumerate(series):
+    for i, (day, raw, reward, contracts, nf) in enumerate(reversed(series)):
         bg = "#fafafa" if i % 2 else "#fff"
         net = (raw + reward) if (raw is not None and reward is not None) else None
         if raw is not None:
