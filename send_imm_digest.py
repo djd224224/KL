@@ -352,7 +352,7 @@ def raw_pnl_for_fills(client, fills, mids=None, results=None):
     return totals, per_event, pnl
 
 
-def daily_series(client, fills, mids, results, days=7):
+def daily_series(client, fills, mids, results, state, days=60):
     """[(date_et, raw, contracts, fills_n)] for the last `days` ET days.
     A fill is attributed to the ET day it occurred; the P&L of the position
     it leaves behind is evaluated at settlement/mark. This is a per-day
@@ -364,16 +364,35 @@ def daily_series(client, fills, mids, results, days=7):
             continue
         day = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET).date()
         by_day[day].append(f)
+    hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
     out = []
     today = datetime.now(timezone.utc).astimezone(ET).date()
-    for i in range(days, 0, -1):
-        day = today - timedelta(days=i - 1)
-        dfills = by_day.get(day, [])
-        if not dfills:
-            out.append((day, 0.0, 0.0, 0))
+    # Every prior day that EARNED rewards (Jack 2026-08-03) — union of the
+    # reward-history days and the days we have attributable fills for. Fill
+    # attribution only reaches back FILL_LOOKBACK_HOURS, so older days show
+    # their reward with raw P&L marked unavailable rather than a false 0.
+    days_set = set(hist)
+    for day in by_day:
+        days_set.add(day.isoformat())
+    for key in sorted(days_set):
+        try:
+            day = datetime.strptime(key, "%Y-%m-%d").date()
+        except ValueError:
             continue
-        tot, _ev, _p = raw_pnl_for_fills(client, dfills, mids, results)
-        out.append((day, tot["raw"], tot["contracts"], len(dfills)))
+        if day >= today:
+            continue                       # only PRIOR days
+        reward = hist.get(key)
+        dfills = by_day.get(day, [])
+        if dfills:
+            tot, _ev, _p = raw_pnl_for_fills(client, dfills, mids, results)
+            raw, contracts, nf = tot["raw"], tot["contracts"], len(dfills)
+        elif reward is not None:
+            raw, contracts, nf = None, 0.0, 0   # outside fill attribution
+        else:
+            continue
+        if reward is None and not dfills:
+            continue
+        out.append((day, raw, reward, contracts, nf))
     return out
 
 
@@ -583,7 +602,7 @@ def build_digest(now_utc: datetime):
     mids, results = current_mids(client, touched)
     w = pnl_windows(client, state, our_ids, fills, mids, results,
                     ss["reward_lifetime"])
-    series = daily_series(client, fills, mids, results, days=7)
+    series = daily_series(client, fills, mids, results, state)
     rows, tot, resting = event_rows(client)     # open book + resting quotes
 
     try:
@@ -632,23 +651,49 @@ def build_digest(now_utc: datetime):
                  tot["net_pos"], tot["exposure"], resting["collateral"],
                  resting["orders"], resting["events"], bal_str))
     L.append("")
-    L.append("DAILY P&L (raw; a day moves until its positions settle)")
-    L.append("{:12s} {:>10s} {:>10s} {:>7s}".format(
-        "DATE", "RAW$", "CONTRACTS", "FILLS"))
-    for day, raw, contracts, nf in series:
-        L.append("{:12s} {:>+10,.2f} {:>10,.0f} {:>7d}".format(
-            day.isoformat(), raw, contracts, nf))
+    L.append("DAILY P&L — every prior day that earned (raw; a day moves until "
+             "its positions settle)")
+    L.append("{:12s} {:>11s} {:>11s} {:>11s} {:>10s}".format(
+        "DATE", "RAW$", "REWARD$", "NET$", "CONTRACTS"))
+    d_raw = d_rew = 0.0
+    for day, raw, reward, contracts, nf in series:
+        net = (raw + reward) if (raw is not None and reward is not None) else None
+        if raw is not None:
+            d_raw += raw
+        if reward is not None:
+            d_rew += reward
+        L.append("{:12s} {:>11s} {:>11s} {:>11s} {:>10,.0f}".format(
+            day.isoformat(),
+            "{:+,.2f}".format(raw) if raw is not None else "n/a",
+            "{:+,.2f}".format(reward) if reward is not None else "n/a",
+            "{:+,.2f}".format(net) if net is not None else "n/a",
+            contracts))
+    L.append("{:12s} {:>11s} {:>11s} {:>11s}".format(
+        "TOTAL", "{:+,.2f}".format(d_raw), "{:+,.2f}".format(d_rew),
+        "{:+,.2f}".format(d_raw + d_rew)))
+    L.append("  (RAW shows n/a for days older than the {}h fill-attribution "
+             "window)".format(FILL_LOOKBACK_HOURS))
     L.append("")
     L.append("EVENTS TRADED IN THE PAST DAY ({})".format(len(ev_rows)))
     if ev_rows:
         L.append("{:28s} {:>9s} {:>9s} {:>9s} {:>9s} {:>7s} {:>5s}".format(
             "EVENT", "P&L$", "REAL$", "SETTLE$", "MTM$", "CTS", "MKTS"))
+        e_tot = {"realized": 0.0, "settle": 0.0, "unrealized": 0.0,
+                 "contracts": 0.0, "mkts": 0}
         for ev, e in ev_rows:
             tot_e = e["realized"] + e["settle"] + e["unrealized"]
+            for k in ("realized", "settle", "unrealized", "contracts"):
+                e_tot[k] += e[k]
+            e_tot["mkts"] += len(e["mkts"])
             L.append("{:28s} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>7,.0f} "
                      "{:>5d}".format(_short_event(ev)[:28], tot_e, e["realized"],
                                      e["settle"], e["unrealized"],
                                      e["contracts"], len(e["mkts"])))
+        L.append("{:28s} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>7,.0f} "
+                 "{:>5d}".format(
+                     "TOTAL", e_tot["realized"] + e_tot["settle"]
+                     + e_tot["unrealized"], e_tot["realized"], e_tot["settle"],
+                     e_tot["unrealized"], e_tot["contracts"], e_tot["mkts"]))
     else:
         L.append("  (no fills in the past 24h)")
     if rd:
@@ -709,15 +754,34 @@ def build_digest(now_utc: datetime):
     h.append('<table style="border-collapse:collapse">')
     h.append('<tr style="background:#f0f0f0;font-weight:600">'
              '<td style="{0}">DATE</td><td style="{1}">RAW$</td>'
-             '<td style="{1}">CONTRACTS</td><td style="{1}">FILLS</td></tr>'
-             .format(TDL, TD))
-    for i, (day, raw, contracts, nf) in enumerate(series):
+             '<td style="{1}">REWARD$</td><td style="{1}">NET$</td>'
+             '<td style="{1}">CONTRACTS</td></tr>'.format(TDL, TD))
+    h_raw = h_rew = 0.0
+    for i, (day, raw, reward, contracts, nf) in enumerate(series):
         bg = "#fafafa" if i % 2 else "#fff"
+        net = (raw + reward) if (raw is not None and reward is not None) else None
+        if raw is not None:
+            h_raw += raw
+        if reward is not None:
+            h_rew += reward
         h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
-                 '<td style="{3}">{4}</td><td style="{3}">{5:,.0f}</td>'
-                 '<td style="{3}">{6}</td></tr>'.format(
-                     bg, TDL, day, TD, _pnl_span(raw), contracts, nf))
+                 '<td style="{3}">{4}</td><td style="{3}">{5}</td>'
+                 '<td style="{3};font-weight:600">{6}</td>'
+                 '<td style="{3}">{7:,.0f}</td></tr>'.format(
+                     bg, TDL, day, TD,
+                     _pnl_span(raw) if raw is not None else "n/a",
+                     "{:+,.2f}".format(reward) if reward is not None else "n/a",
+                     _pnl_span(net) if net is not None else "n/a", contracts))
+    h.append('<tr style="background:#f0f0f0;font-weight:700">'
+             '<td style="{0}">TOTAL</td><td style="{1}">{2}</td>'
+             '<td style="{1}">{3:+,.2f}</td><td style="{1}">{4}</td>'
+             '<td style="{1}"></td></tr>'.format(
+                 TDL, TD, _pnl_span(h_raw), h_rew, _pnl_span(h_raw + h_rew)))
     h.append("</table>")
+    h.append('<div style="color:#888;font-size:12px;margin-top:4px">RAW is n/a '
+             'for days older than the {}h fill-attribution window; rewards are '
+             'the bot estimate (lifetime realization 0.975x vs credited).'
+             '</div>'.format(FILL_LOOKBACK_HOURS))
     h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
              'Events traded in the past day ({})</div>'.format(len(ev_rows)))
     if ev_rows:
@@ -727,9 +791,14 @@ def build_digest(now_utc: datetime):
                  '<td style="{1}">REAL$</td><td style="{1}">SETTLE$</td>'
                  '<td style="{1}">MTM$</td><td style="{1}">CTS</td>'
                  '<td style="{1}">MKTS</td></tr>'.format(TDL, TD))
+        et = {"realized": 0.0, "settle": 0.0, "unrealized": 0.0,
+              "contracts": 0.0, "mkts": 0}
         for i, (ev, e) in enumerate(ev_rows):
             bg = "#fafafa" if i % 2 else "#fff"
             tot_e = e["realized"] + e["settle"] + e["unrealized"]
+            for k in ("realized", "settle", "unrealized", "contracts"):
+                et[k] += e[k]
+            et["mkts"] += len(e["mkts"])
             h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
                      '<td style="{3};font-weight:600">{4}</td>'
                      '<td style="{3}">{5}</td><td style="{3}">{6}</td>'
@@ -739,6 +808,15 @@ def build_digest(now_utc: datetime):
                          _pnl_span(e["realized"]), _pnl_span(e["settle"]),
                          _pnl_span(e["unrealized"]), e["contracts"],
                          len(e["mkts"])))
+        h.append('<tr style="background:#f0f0f0;font-weight:700">'
+                 '<td style="{0}">TOTAL</td><td style="{1}">{2}</td>'
+                 '<td style="{1}">{3}</td><td style="{1}">{4}</td>'
+                 '<td style="{1}">{5}</td><td style="{1}">{6:,.0f}</td>'
+                 '<td style="{1}">{7}</td></tr>'.format(
+                     TDL, TD,
+                     _pnl_span(et["realized"] + et["settle"] + et["unrealized"]),
+                     _pnl_span(et["realized"]), _pnl_span(et["settle"]),
+                     _pnl_span(et["unrealized"]), et["contracts"], et["mkts"]))
         h.append("</table>")
     else:
         h.append("<div>No fills in the past 24h.</div>")

@@ -2577,8 +2577,10 @@ class IncentiveMarketMaker:
                            "reward_est_today": round(self.state.reward_est_today, 4),
                            "contract_minutes_today": round(
                                self.state.contract_minutes_today, 1),
+                           # 60 days kept: the digest's daily table shows every
+                           # prior day that earned (Jack 2026-08-03)
                            "reward_history": {k: round(v, 2) for k, v in sorted(
-                               self.state.reward_history.items())[-7:]},
+                               self.state.reward_history.items())[-60:]},
                            "halt_day_key": _halt_day_key(datetime.now(timezone.utc)),
                            "pnl_today_carry": round(self.state.pnl_today_last, 2),
                            "halted_until": self.state.halted_until,
@@ -4731,7 +4733,7 @@ class IncentiveMarketMaker:
         completed = (datetime.now(timezone.utc).astimezone(CT).date()
                      - timedelta(days=1)).isoformat()
         s.reward_history[completed] = round(s.reward_est_today, 2)
-        s.reward_history = dict(sorted(s.reward_history.items())[-7:])
+        s.reward_history = dict(sorted(s.reward_history.items())[-60:])
         s.reward_est_today = 0.0
         s.contract_minutes_today = 0.0
         # roll both loss-halt windows + the restart-carry and balance anchor

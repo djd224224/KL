@@ -236,6 +236,74 @@ def discover_events(client):
     return sorted(events)
 
 
+# ---------------------------------------------------------------------------
+# STALE-TICKER TRAP autofix (Jack 2026-08-03, after KXEARNINGSMENTIONPGR-26JUL15
+# sat dead with 12 markets x $28.67/day of pool). Kalshi stamps "next earnings
+# call" events with a ticker date that goes STALE once the quarter moves on: the
+# ticker says 26JUL15, the market closes Dec 31, and the bot's midnight-ET
+# ticker-date rule therefore sets a cutoff three weeks in the PAST -> _screen
+# returns 'cutoff' forever and the event silently never quotes.
+#
+# Signature: earnings-mention event + ticker date passed + market still OPEN +
+# live incentive programs + no override. Those cannot coexist legitimately.
+# Nasdaq is retried with a much longer horizon than the normal path (a stale
+# event's real call can be a full quarter out), and whatever is left is
+# reported with its POOL COST so it cannot be lost in the noise.
+STALE_LOOKAHEAD_DAYS = int(os.environ.get("IMM_STALE_LOOKAHEAD_DAYS", "120"))
+
+
+def discover_stale_ticker_events(client, now):
+    """[(event, n_markets, pool_per_day, close_time)] for earnings-mention
+    events whose ticker date has passed while the market is still open and
+    paying — the trap class that never self-heals."""
+    pools, samples = {}, {}
+    cursor = None
+    while True:
+        params = {"status": "active", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        resp = client.get("/incentive_programs", params=params)
+        batch = resp.get("incentive_programs") or []
+        for p in batch:
+            t = p.get("market_ticker", "")
+            if not t.startswith(_EARNINGS_PREFIX) or p.get("paid_out"):
+                continue
+            ev = t.rsplit("-", 1)[0]
+            start = imm.parse_iso_utc(p.get("start_date", ""))
+            end = imm.parse_iso_utc(p.get("end_date", ""))
+            if not start or not end or not (start <= now < end):
+                continue
+            days = max((end - start).total_seconds() / 86400.0, 1.0 / 24)
+            dpd = (p.get("period_reward") or 0) / 10000.0 / days
+            cur = pools.setdefault(ev, [0, 0.0])
+            cur[0] += 1
+            cur[1] += dpd
+            samples.setdefault(ev, t)
+        cursor = resp.get("next_cursor")
+        if not cursor or not batch:
+            break
+
+    out = []
+    for ev, (n, dpd) in sorted(pools.items()):
+        if ev in EVENT_START_OVERRIDES:
+            continue
+        d = parse_event_date(ev)
+        if d is None or d > now:
+            continue                       # ticker date still ahead: normal path
+        try:
+            m = ((client.get_market(samples[ev]) or {}).get("market")) or {}
+        except Exception as e:
+            log(f"! stale-check market read failed {ev}: {e}")
+            continue
+        if m.get("status") not in ("active", "open"):
+            continue                       # genuinely over, not a trap
+        close = imm.parse_iso_utc(m.get("close_time", ""))
+        if close is None or close <= now:
+            continue
+        out.append((ev, n, dpd, close))
+    return out
+
+
 def source_urls(client, event: str):
     """Candidate pages: the series' settlement sources (usually the IR page)."""
     series = event.split("-")[0]
@@ -674,6 +742,31 @@ def main(argv=None) -> int:
             unresolved.append(ev)
             log(f"UNRESOLVED: {ev}")
 
+    # Phase 2b: STALE-TICKER TRAP autofix. These are already dead to the bot
+    # (cutoff in the past) and will never self-heal, so they get a longer
+    # Nasdaq horizon than the normal path and are reported with their cost.
+    stale_fixed, stale_open = [], []
+    for ev, n_mkts, dpd, close in discover_stale_ticker_events(client, now):
+        if ev in file_data:
+            continue
+        series = ev.split("-")[0]
+        tkr = (series[len(_EARNINGS_PREFIX):]
+               if series.startswith(_EARNINGS_PREFIX) else "")
+        rel = (nasdaq_release_datetime(tkr, now, STALE_LOOKAHEAD_DAYS)
+               if tkr else None)
+        if rel:
+            dt_et, label = rel
+            iso = dt_et.isoformat()
+            file_data[ev] = iso
+            stale_fixed.append((ev, iso, n_mkts, dpd, f"nasdaq:{tkr} [{label}]"))
+            log(f"STALE-TICKER FIXED {ev} = {iso}  ({n_mkts} mkts, "
+                f"${dpd:,.0f}/day pool)  [nasdaq {tkr} {label}]")
+        else:
+            stale_open.append((ev, n_mkts, dpd, close))
+            log(f"STALE-TICKER UNRESOLVED {ev}: {n_mkts} mkts, ${dpd:,.0f}/day "
+                f"pool earning $0 (ticker date passed, market open until "
+                f"{close:%Y-%m-%d})")
+
     # Phase 4: scheduled-broadcast mention events the bot cannot window.
     bc_resolved, bc_unresolved = [], []
     for ev, series in discover_broadcast_mention_events(client, now):
@@ -710,14 +803,34 @@ def main(argv=None) -> int:
             bc_unresolved.append((ev, title))
             log(f"BROADCAST UNRESOLVED: {ev}  {title[:90]}")
 
-    if not args.dry and (resolved or rel_resolved or bc_resolved):
+    if not args.dry and (resolved or rel_resolved or bc_resolved or stale_fixed):
         write_file(file_data)
 
     # email a summary whenever there is anything actionable
     if not args.dry and (resolved or unresolved or enrolled or review
                          or rel_resolved or rel_unresolved
-                         or bc_resolved or bc_unresolved):
+                         or bc_resolved or bc_unresolved
+                         or stale_fixed or stale_open):
         lines = ["Earnings call + release override run", ""]
+        if stale_open:
+            lost = sum(d for _e, _n, d, _c in stale_open)
+            lines.append(f"!! STALE-TICKER TRAP — {len(stale_open)} event(s) "
+                         f"earning $0 on ${lost:,.0f}/day of live pool. Kalshi's "
+                         f"ticker date has passed but the market is still open, "
+                         f"so the bot's cutoff sits in the PAST and it will "
+                         f"NEVER quote these without an override:")
+            for ev, n, dpd, close in stale_open:
+                lines.append(f"  {ev}  —  {n} markets, ${dpd:,.0f}/day pool, "
+                             f"open until {close:%Y-%m-%d}")
+                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
+                             f'"YYYY-MM-DDTHH:MM:00-04:00"   # the REAL call time')
+            lines.append("")
+        if stale_fixed:
+            lines.append("STALE-TICKER TRAP auto-fixed (written, bot "
+                         "hot-reloads):")
+            for ev, iso, n, dpd, src in stale_fixed:
+                lines.append(f"  {ev} = {iso}  ({n} mkts, ${dpd:,.0f}/day) [{src}]")
+            lines.append("")
         if bc_resolved:
             lines.append("BROADCAST mention cutoffs AUTO-RESOLVED (TVmaze / "
                          "WH schedule; written, bot hot-reloads):")
