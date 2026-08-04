@@ -94,6 +94,25 @@ def series_of(ticker):
     return ticker.split("-")[0]
 
 
+def reward_family(series):
+    """Coarse family for calibration. Deliberately groups by PROGRAM SHAPE
+    rather than subject: what determines whether a family can be calibrated at
+    all is how fast its programs end and pay. Hourly temp settles inside the
+    hour and is measurable the next day; a 5-day earnings-mention program is
+    unmeasurable until it ends."""
+    if series.startswith("KXTEMP"):
+        return "TEMP (hourly)"
+    if series.startswith("KXEARNINGSMENTION"):
+        return "EARNINGS-MENTION"
+    if series.startswith("KXRAIN"):
+        return "RAIN"
+    if series.startswith("KXDIESEL") or series.startswith("KXAAAGAS"):
+        return "GAS/DIESEL"
+    if "MENTION" in series:
+        return "OTHER MENTION"
+    return "OTHER (company/econ/crypto)"
+
+
 # ----------------------------------------------------------------------------
 # Statement parsing + the permanent credit ledger
 # ----------------------------------------------------------------------------
@@ -529,6 +548,19 @@ def write_calibration(summary, rows, ledger):
     post = [r for r in rows if r["settled_any"] and r["first"] and r["first"] >= cut]
     pc = sum(r["credited"] for r in post)
     pe = sum(r["est_floor"] for r in post)
+    # BY FAMILY, because the headline ratio is not a property of "the
+    # estimator" — it is a property of the families that happen to have
+    # settled AND been paid. Hourly temp settles within the hour, so it
+    # dominates the evidence base; a 5-day earnings-mention program that has
+    # not paid yet contributes to the digest's reward column while
+    # contributing NOTHING to this ratio. Reporting one blended number let a
+    # temp-only measurement read as a whole-book accuracy claim.
+    fam_agg = defaultdict(lambda: [0.0, 0.0, 0])
+    for r in post:
+        a = fam_agg[reward_family(r["series"])]
+        a[0] += r["credited"]
+        a[1] += r["est_floor"]
+        a[2] += 1
     payload = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "imm_inception": IMM_INCEPTION,
@@ -556,6 +588,11 @@ def write_calibration(summary, rows, ledger):
             "credited": round(pc, 2),
             "estimate_floored": round(pe, 2),
             "realization_factor": round(pc / pe, 4) if pe > 0.01 else None,
+            "by_family": {
+                k: {"events": v[2], "credited": round(v[0], 2),
+                    "estimate_floored": round(v[1], 2),
+                    "realization_factor": round(v[0] / v[1], 4) if v[1] > 0.01 else None}
+                for k, v in sorted(fam_agg.items())},
         },
     }
     os.makedirs(STATUS_DIR, exist_ok=True)

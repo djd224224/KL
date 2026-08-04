@@ -660,6 +660,69 @@ def health_line(status: dict, ss: dict) -> str:
     return line
 
 
+def calibration_status():
+    """(validated, unvalidated) family lists from reward_calibration.json.
+
+    A family is VALIDATED only where settled, paid-out programs exist to
+    compare against. That is not a detail: hourly temp settles inside the hour
+    and is measurable the next day, while a 5-day earnings-mention program
+    contributes to the reward column for days before it can be checked at all.
+    Reporting one blended realization factor let a temp-only measurement read
+    as a whole-book accuracy claim (Jack caught this 2026-08-04: the 8/1 and
+    8/2 rows are 67% and 27% families with NO settled credit evidence)."""
+    cal = load_json(CALIB_PATH) or {}
+    pa = cal.get("post_amendment") or {}
+    by_fam = pa.get("by_family") or {}
+    validated, unvalidated = [], []
+    for name, v in sorted(by_fam.items()):
+        if v.get("realization_factor") and v.get("credited", 0) >= 1.0:
+            validated.append((name, v["realization_factor"], v["events"],
+                              v["credited"]))
+        else:
+            unvalidated.append(name)
+    return validated, unvalidated, pa
+
+
+def _calibration_caveat_text():
+    validated, _unval, pa = calibration_status()
+    if not validated:
+        return ["  (REWARD is the bot estimate — no credit ledger yet; run "
+                "imm_reward_recon.py --statement)"]
+    out = ["  REWARD accuracy — measured per family against real credits, not "
+           "assumed. Only families whose programs have SETTLED and PAID can be",
+           "  checked at all, so this is a statement about part of the column, "
+           "not all of it:"]
+    for name, fac, n, cred in validated:
+        out.append("    {:<28} {:.3f}x  ({} settled events, ${:,.2f} credited)"
+                   .format(name, fac, n, cred))
+    out.append("    every other family              UNVALIDATED — no settled "
+               "post-{} credit yet".format(pa.get("cutover", "?")[:10]))
+    return out
+
+
+def _calibration_caveat_html():
+    validated, _unval, pa = calibration_status()
+    if not validated:
+        return ('<div style="color:#b8860b;font-size:12px;margin-top:4px">'
+                'REWARD is the bot estimate — no credit ledger yet; run '
+                '<code>imm_reward_recon.py --statement</code>.</div>')
+    rows = "".join(
+        "<li><b>{}</b> — {:.3f}x ({} settled events, ${:,.2f} credited)</li>"
+        .format(n, f, e, c) for n, f, e, c in validated)
+    return ('<div style="color:#666;font-size:12px;margin-top:6px;'
+            'border-left:3px solid #d9a441;padding-left:8px">'
+            '<b>How much of this REWARD column is actually verified?</b> Only '
+            'families whose programs have settled AND paid can be compared to '
+            'credits at all — hourly temp settles inside the hour, a 5-day '
+            'earnings-mention program does not. Verified against real credits '
+            'since the {} estimator rewrite:<ul style="margin:4px 0">{}</ul>'
+            'Every other family — earnings-mention, rain, company/econ — is '
+            '<b>unvalidated</b>: it contributes to the numbers above with no '
+            'settled credit to check it against. Where pre-rewrite evidence '
+            'exists it ran 0.33–0.64x, i.e. those contributions may be '
+            'materially overstated.</div>'.format(pa.get("cutover", "?")[:10], rows))
+
+
 def _pnl_span(v: float, decimals: int = 2) -> str:
     color = "#0a7a2f" if v > 0.005 else ("#c0392b" if v < -0.005 else "#777")
     return f'<span style="color:{color}">{v:+,.{decimals}f}</span>'
@@ -821,14 +884,9 @@ def build_digest(now_utc: datetime):
         "{:+,.2f}".format(d_raw + d_rew)))
     L.append("  (RAW shows n/a for days older than the {}h fill-attribution "
              "window)".format(FILL_LOOKBACK_HOURS))
-    _cal0 = load_json(CALIB_PATH) or {}
-    _pa0 = _cal0.get("post_amendment") or {}
-    if _pa0.get("realization_factor"):
-        L.append("  (REWARD is the accrual estimate with the $1.00/market payout "
-                 "floor; {:.3f}x vs credits on {} settled events since the {} "
-                 "estimator rewrite)".format(
-                     _pa0["realization_factor"], _pa0.get("events", 0),
-                     _pa0.get("cutover", "?")))
+    L.append("  (REWARD is accrual-dated and does NOT line up with a credit "
+             "date — Kalshi pays at each program's period end, 1-2 days later)")
+    L.extend(_calibration_caveat_text())
     L.append("")
     L.append("EVENTS TRADED IN THE PAST DAY ({})".format(len(ev_rows)))
     if ev_rows:
@@ -940,18 +998,12 @@ def build_digest(now_utc: datetime):
              '<td style="{1}"></td></tr>'.format(
                  TDL, TD, _pnl_span(h_raw), h_rew, _pnl_span(h_raw + h_rew)))
     h.append("</table>")
-    _cal = load_json(CALIB_PATH) or {}
-    _pa = _cal.get("post_amendment") or {}
-    _fac = _pa.get("realization_factor")
-    _note = ("estimate carries the $1.00/market payout floor; measured against "
-             "credits on {} settled events since the {} estimator rewrite it "
-             "runs {:.3f}x".format(_pa.get("events", 0), _pa.get("cutover", "?"), _fac)
-             if _fac else "bot estimate (no credit ledger yet — run "
-                          "imm_reward_recon.py --statement)")
     h.append('<div style="color:#888;font-size:12px;margin-top:4px">RAW is n/a '
-             'for days older than the {}h fill-attribution window. Rewards are '
-             'accrual-dated (Kalshi credits 1-2 days later); {}.'
-             '</div>'.format(FILL_LOOKBACK_HOURS, _note))
+             'for days older than the {}h fill-attribution window. REWARD is '
+             'accrual-dated, so it does NOT line up with a credit date &mdash; '
+             'Kalshi pays at each program\'s period end, 1&ndash;2 days later.'
+             '</div>'.format(FILL_LOOKBACK_HOURS))
+    h.append(_calibration_caveat_html())
     h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
              'Events traded in the past day ({})</div>'.format(len(ev_rows)))
     if ev_rows:
