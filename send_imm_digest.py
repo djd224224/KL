@@ -307,16 +307,26 @@ def credited_windows(rows, calib, today_et):
     if not rows:
         return None
     imm_only = bool(calib.get("credited_imm_attributable"))
-    life = calib.get("credited_imm_attributable") if imm_only else sum(
-        a for d, _e, a in rows if d >= IMM_INCEPTION)
+    # Per-date IMM-attributable credit, so every window is filtered the same
+    # way. Without it "month to date" silently includes the MLB / fight-mention
+    # credits earned by the other bots sharing this API key.
+    by_date = calib.get("credited_by_date_imm") or {}
+    if not by_date:
+        by_date = {}
+        for d, _e, a in rows:
+            if d >= IMM_INCEPTION:
+                by_date[d] = by_date.get(d, 0.0) + a
+        imm_only = False
+    life = calib.get("credited_imm_attributable") if imm_only \
+        else sum(by_date.values())
     d1 = (today_et - timedelta(days=1)).isoformat()
     week = {(today_et - timedelta(days=i)).isoformat() for i in range(1, 8)}
     month = today_et.strftime("%Y-%m")
     return {
         "lifetime": life,
-        "day": sum(a for d, _e, a in rows if d == d1 and d >= IMM_INCEPTION),
-        "week": sum(a for d, _e, a in rows if d in week and d >= IMM_INCEPTION),
-        "mtd": sum(a for d, _e, a in rows if d[:7] == month and d >= IMM_INCEPTION),
+        "day": by_date.get(d1, 0.0),
+        "week": sum(a for d, a in by_date.items() if d in week),
+        "mtd": sum(a for d, a in by_date.items() if d[:7] == month),
         "latest": max((d for d, _e, _a in rows), default=""),
         "account_lifetime": calib.get("credited_lifetime_account"),
         "non_imm": calib.get("credited_non_imm"),

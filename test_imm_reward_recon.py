@@ -170,11 +170,24 @@ class TestDigestCreditWindows(unittest.TestCase):
         IMM-attributable total, which strips the other bots on this key."""
         calib = {"credited_imm_attributable": 20.43,
                  "credited_lifetime_account": 185.74,
-                 "credited_non_imm": 165.31}
+                 "credited_non_imm": 165.31,
+                 # the World Cup event is another bot's, so it is absent here
+                 "credited_by_date_imm": {"2026-08-03": 13.68, "2026-08-02": 6.75}}
         w = self.dg.credited_windows(self._rows(), calib, self.today)
         self.assertAlmostEqual(w["lifetime"], 20.43)
         self.assertTrue(w["attributed"])
         self.assertAlmostEqual(w["account_lifetime"], 185.74)
+        # every window is attribution-filtered, not just lifetime
+        self.assertAlmostEqual(w["mtd"], 20.43)
+        self.assertAlmostEqual(w["day"], 13.68)
+        self.assertAlmostEqual(w["week"], 20.43)
+
+    def test_windows_fall_back_to_raw_ledger_without_a_calibration(self):
+        """No calibration file: report the date-filtered ledger and say the
+        figure is NOT attribution-filtered rather than implying it is."""
+        w = self.dg.credited_windows(self._rows(), {}, self.today)
+        self.assertFalse(w["attributed"])
+        self.assertAlmostEqual(w["lifetime"], 173.37)   # includes the WC event
 
     def test_no_ledger_returns_none(self):
         self.assertIsNone(self.dg.credited_windows([], {}, self.today))

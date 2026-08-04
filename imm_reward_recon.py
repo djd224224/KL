@@ -426,6 +426,15 @@ def reconcile(since=None, floor=PAYOUT_FLOOR):
     return rows, ledger
 
 
+def _by_date_imm(ledger, imm_set):
+    """{credit_date: IMM-attributable $} from inception forward."""
+    out = defaultdict(float)
+    for d, ev, amt, _kind in ledger:
+        if d >= IMM_INCEPTION and ev in imm_set:
+            out[d] += amt
+    return out
+
+
 def _fmt_ratio(c, s):
     return f"{c / s:.3f}" if s > 0.01 else "   n/a"
 
@@ -507,10 +516,11 @@ def report(rows, ledger, floor=PAYOUT_FLOOR, verbose=False):
                        for k, v in agg.items()}}
 
 
-def write_calibration(summary, rows):
+def write_calibration(summary, rows, ledger):
     """The machine-readable half: the digest reads IMM-attributable credited
     totals from here instead of a hand-set env var that goes stale."""
-    imm_events = sorted({r["event"] for r in rows if r["imm"]})
+    imm_set = {r["event"] for r in rows if r["imm"]}
+    imm_events = sorted(imm_set)
     # The factor that matters is measured on events the CURRENT estimator
     # priced. Anything older is the pre-amendment model scored against
     # post-amendment payouts and calibrates nothing, so record it separately
@@ -534,6 +544,12 @@ def write_calibration(summary, rows):
                                if summary["settled_est_floor"] > 0.01 else None),
         "series": summary["series"],
         "imm_event_count": len(imm_events),
+        # IMM-attributable credit per credit-date. The digest's day/week/MTD
+        # windows read this so they are filtered the same way the lifetime
+        # figure is — otherwise "month to date" quietly includes the MLB and
+        # fight-mention credits that belong to the other bots on this key.
+        "credited_by_date_imm": {
+            d: round(v, 2) for d, v in sorted(_by_date_imm(ledger, imm_set).items())},
         "post_amendment": {
             "cutover": AMENDMENT_CUTOVER,
             "events": len(post),
@@ -603,7 +619,7 @@ def main(argv=None):
         rec, ledger = reconcile(since=args.since, floor=args.floor)
         summary = report(rec, ledger, floor=args.floor, verbose=args.verbose)
         if not args.no_write:
-            write_calibration(summary, rec)
+            write_calibration(summary, rec, ledger)
     return 0
 
 
