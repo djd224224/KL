@@ -71,7 +71,7 @@ import threading
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -238,6 +238,12 @@ class SeriesOverride:
     #   a 1-tick-behind rung earns half weight; temp is ~24 orders, churn cheap)
     fast_lane: bool = False                             # requote this series on
     #   the FAST_LANE_SECS mini-cycles between full cycles (KXTEMP)
+    blackout_et: Optional[Tuple[str, str]] = None       # ("HH:MM","HH:MM") ET
+    #   daily window in which the series is NOT quoted and resting orders are
+    #   cancelled — for a recurring scheduled data release that reprices the
+    #   book (AAA gas/diesel prints, observed 03:18-03:36 ET). Distinct from
+    #   `cutoff`, which is a one-time end; a blackout recurs every day and the
+    #   market resumes quoting afterwards.
     min_est_per_day: Optional[float] = None             # RATE floor: skip fresh
     #   candidates whose est $/day is below this (re-entry quality bar; on TOP
     #   of the total-accrual payout floor). None/0 = off.
@@ -581,6 +587,28 @@ def series_atref_price_tol(series: str) -> int:
     return ATREF_PRICE_TOL_TICKS
 
 
+def series_in_blackout(series: str, now_utc: datetime) -> bool:
+    """True while `series` sits inside its daily no-quote window (ET).
+    Jack 2026-08-04: AAA posts gas AND diesel between 03:18 and 03:36 ET
+    (observed 5 consecutive days by the gas sniper at 5s resolution). The
+    DAILY markets close 01:59 ET so they are safe, but the WEEKLY and
+    MONTHLY ones stay open straight through the print and were being picked
+    off — hour 3 measured -14.4c/contract against a -2.3c book average."""
+    ov = SERIES_OVERRIDES.get(series)
+    if not ov or not ov.blackout_et:
+        return False
+    try:
+        start_s, end_s = ov.blackout_et
+        sh, sm = (int(x) for x in start_s.split(":"))
+        eh, em = (int(x) for x in end_s.split(":"))
+    except (ValueError, AttributeError):
+        return False
+    et = now_utc.astimezone(ET)
+    cur = et.hour * 60 + et.minute
+    start, end = sh * 60 + sm, eh * 60 + em
+    return start <= cur < end if start <= end else (cur >= start or cur < end)
+
+
 def series_fast_lane(series: str) -> bool:
     """Membership in the FAST_LANE_SECS mini-cycle set (KXTEMP by default)."""
     ov = SERIES_OVERRIDES.get(series)
@@ -902,12 +930,31 @@ for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
             safe_join=True)
+
 # KXDIESELW quoted as an OVERRIDE (Jack 2026-08-03): exempt from the $2/day
 # re-entry rate bar — its $18.58/day pools est $0.8-1.4/mkt, all floored.
 # The $1 TOTAL payout floor still applies (~6 quotable days -> any material
 # est passes) and safe-join placement is kept. Replaces the loop's entry.
 SERIES_OVERRIDES["KXDIESELW"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_DIESELW_MIN_RATE", 0.0), safe_join=True)
+
+# AAA PRINT BLACKOUT (Jack 2026-08-04: "stop getting sniped ... ensure my
+# quotes expire beforehand"). Observed post times, from the gas sniper's own
+# 5s-resolution detection: 03:36:25, 03:18:25, 03:20:27, 03:22:53, 03:25:17 ET
+# on Jul 30 - Aug 3. The window below brackets that with ~13 min of margin on
+# the early side and ~24 on the late side. Applies to gas AND diesel, every
+# horizon: the DAILY markets close 01:59 ET and are structurally safe, but the
+# weekly/monthly ones stay open across the print and are what actually bleed.
+for _s in os.environ.get(
+        "IMM_AAA_PRINT_SERIES",
+        "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXDIESELD,KXDIESELW").split(","):
+    _s = _s.strip()
+    if _s and _s in SERIES_OVERRIDES:
+        SERIES_OVERRIDES[_s] = replace(
+            SERIES_OVERRIDES[_s],
+            blackout_et=tuple(os.environ.get(
+                "IMM_AAA_BLACKOUT_ET", "03:05-04:00").split("-")))
+
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
 # cutoff forfeits game-day daytime, but programs run ~1-2 days INCLUDING game
@@ -4085,6 +4132,15 @@ class IncentiveMarketMaker:
                 if (meta.cutoff - now_utc).total_seconds() \
                         < series_pre_cutoff_reduce_only_secs(meta.series):
                     reduce_only = True
+            # AAA PRINT BLACKOUT: a recurring scheduled release reprices this
+            # book, so stand fully aside across it and resume after. Unlike
+            # the cutoff this does NOT deselect — the market is still ours,
+            # it just holds no orders while the print lands.
+            if series_in_blackout(meta.series, now_utc):
+                n = self.cancel_market_orders(t, resting)
+                if n:
+                    log(f"{self.tag} {t}: AAA print blackout; cancelled {n}")
+                continue
             if meta.close_time is not None and \
                     (meta.close_time - now_utc).total_seconds() \
                     < series_min_hours_to_close(meta.series) * 3600:

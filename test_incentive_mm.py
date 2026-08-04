@@ -2290,6 +2290,27 @@ class TestStickySelection(unittest.TestCase):
             else:
                 imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
 
+    def test_aaa_print_blackout_window(self):
+        # Jack 2026-08-04: AAA posts gas AND diesel 03:18-03:36 ET (5 days
+        # observed at 5s resolution). Weekly/monthly markets stay open across
+        # the print and measured -14.4c/contract in hour 3.
+        def at(hh, mm):
+            return imm.ET.localize(
+                datetime(2026, 8, 5, hh, mm)).astimezone(timezone.utc)
+        for s in ("KXAAAGASD", "KXAAAGASW", "KXAAAGASM",
+                  "KXDIESELD", "KXDIESELW"):
+            self.assertEqual(imm.series_override(s).blackout_et,
+                             ("03:05", "04:00"), s)
+            self.assertFalse(imm.series_in_blackout(s, at(2, 50)), s)
+            self.assertTrue(imm.series_in_blackout(s, at(3, 18)), s)
+            self.assertTrue(imm.series_in_blackout(s, at(3, 36)), s)
+            self.assertFalse(imm.series_in_blackout(s, at(4, 5)), s)
+        # KXDIESELW keeps its $0 rate floor: the blackout must not have
+        # clobbered the series override it was merged into
+        self.assertEqual(imm.series_min_est_rate("KXDIESELW"), 0.0)
+        # non-AAA series unaffected at the same instant
+        self.assertFalse(imm.series_in_blackout("KXTEMPDCH", at(3, 20)))
+
     def test_close_anchored_cutoff_applies_to_both_producers(self):
         # LIVE BUG 2026-08-04: refresh_universe applied the temp close-10 rule
         # but restore_orphan_metas did not, so orphan-restored temp markets
