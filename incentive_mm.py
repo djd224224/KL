@@ -261,6 +261,11 @@ class SeriesOverride:
     #   this many minutes, REPLACING the ticker-date/occurrence rules — for series
     #   whose whole life IS the event (hourly weather markets) and which the
     #   midnight-ET rule would otherwise kill on sight
+    event_day_cutoff_et: Optional[Tuple[int, int]] = None  # (hour, minute) ET ON the
+    #   event date, replacing the ticker-date MIDNIGHT rule — the only lever here
+    #   that moves a cutoff LATER. For day-dated series with no scheduled release
+    #   to dodge, where midnight is arbitrary (Treasuries: 7:30am ET, ahead of the
+    #   8:30 data). Never overrides an occurrence-based cutoff; clamped to close.
     min_hours_to_close: Optional[float] = None          # override the global
     #   MIN_HOURS_TO_CLOSE screen (hourly markets live less than the 1h default)
     min_est_total: Optional[float] = None               # override the global
@@ -1045,6 +1050,23 @@ for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
 SERIES_OVERRIDES["KXDIESELW"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_DIESELW_MIN_RATE", 0.0), safe_join=True)
 
+# TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
+# Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
+# The default midnight-ET ticker rule cost the whole overnight half of each
+# program for no safety gain: these settle on a 3:30pm ET snapshot of a
+# continuously-traded rate, so there is no release to be out of the way of,
+# and 00:00-07:30 ET is no more informed than the evening before. 7:30am ET
+# puts the bot out ahead of the 08:30 releases that do move rates. Widens the
+# quotable window from ~8h to ~15.5h of each 23.5h program.
+for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
+            safe_join=True,
+            event_day_cutoff_et=(
+                _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
+                _env_int("IMM_RATES_CUTOFF_MIN_ET", 30)))
+
 # AAA PRINT BLACKOUT (Jack 2026-08-04: "stop getting sniped ... ensure my
 # quotes expire beforehand"). Observed post times, from the gas sniper's own
 # 5s-resolution detection: 03:36:25, 03:18:25, 03:20:27, 03:22:53, 03:25:17 ET
@@ -1775,6 +1797,11 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     close, on a -18c/contract-at-4am book). Pass close_time and the tightener
     is applied for BOTH producers."""
     ov = SERIES_OVERRIDES.get(series)
+    # NOTE the event-day EXTENDER (event_day_cutoff_et) deliberately does NOT
+    # live here — it shifts the ticker-date CANDIDATE inside trade_cutoff_utc,
+    # before min() runs, so an occurrence-based cutoff still wins. Applying it
+    # here could only ever compare against the already-minimised result and
+    # would have quoted straight through a real event start.
     if ov and ov.cutoff_from_close_min is not None and close_time is not None:
         anchored = close_time - timedelta(minutes=ov.cutoff_from_close_min)
         cutoff = anchored if cutoff is None else min(cutoff, anchored)
@@ -1799,6 +1826,25 @@ def trade_cutoff_utc(event_ticker: str, occurrence: Optional[datetime],
     candidates = []
     td = parse_event_date(event_ticker)
     if td is not None:
+        # EVENT-DAY EXTENDER (Jack 2026-08-04: "quote treasuries until 7:30am
+        # EST"). Midnight is the right default for a market with a scheduled
+        # RELEASE — be gone before the day the number drops. A Treasury yield
+        # is not that: the underlying is continuously priced in a deep market
+        # and the contract is a 3:30pm ET snapshot of it, so 00:00-07:30 ET is
+        # no more informed than the evening before, while 07:30 puts the bot
+        # out ahead of the 08:30 releases that DO move rates.
+        #
+        # It shifts the ticker-date CANDIDATE, deliberately, rather than the
+        # finished cutoff: min() below then still lets a real
+        # occurrence_datetime win, which a post-hoc adjustment could not do.
+        # A caller that skips this function keeps midnight — failing toward
+        # quoting LESS, which is the safe direction for a missed rule.
+        ov = SERIES_OVERRIDES.get(series_of(event_ticker))
+        if ov and ov.event_day_cutoff_et is not None:
+            hh, mm = ov.event_day_cutoff_et
+            td = td + timedelta(hours=hh, minutes=mm)
+            if expected_expiration is not None:
+                td = min(td, expected_expiration)
         candidates.append(td)
     if (occurrence is not None and expected_expiration is not None
             and occurrence < expected_expiration - timedelta(minutes=60)):

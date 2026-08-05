@@ -3930,10 +3930,19 @@ class TestRainFairAnchor(unittest.TestCase):
         _clean_persist()
         imm._rain_fair_state["mtime"] = 0.0
         imm._rain_fair_state["fair"] = {}
+        # KXRAIN halves its ladder 16:00-01:59 ET (Jack 2026-08-04), and these
+        # assertions are on literal rung sizes against the wall clock — so the
+        # whole class failed from 4pm ET onward. Neutralise the hour windows;
+        # their own coverage lives in TestPerSeriesHourMultiplier.
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
         try:
             os.remove(imm.RAIN_FAIR_FILE)
         except FileNotFoundError:
             pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
 
     def _write_fair(self, p, age_secs=0.0):
         fetched = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
@@ -4228,17 +4237,51 @@ class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
             self.assertFalse(
                 imm.IncentiveMarketMaker._allowed(f"{s}-26AUG31-T4.25"), s)
 
-    def test_day_dated_tickers_still_stop_before_the_print(self):
-        """The midnight-ET rule must keep applying: the market closes at
-        15:30 ET on the print day, and the bot must be out before that day
-        starts. This is what bounds the enrolment to the evening before."""
-        close = imm.ET.localize(datetime(2026, 8, 5, 15, 30)).astimezone(timezone.utc)
-        cut = imm.trade_cutoff_utc("KXUST10AD-26AUG05", None, close)
-        cut = imm.apply_series_cutoff_adjustments("KXUST10AD", "KXUST10AD-26AUG05",
-                                                  cut, close)
-        self.assertIsNotNone(cut)
-        self.assertEqual(cut.astimezone(imm.ET).strftime("%Y-%m-%d %H:%M"),
-                         "2026-08-05 00:00")
+    @staticmethod
+    def _et(day, hh, mm):
+        return imm.ET.localize(datetime(2026, 8, day, hh, mm)).astimezone(timezone.utc)
+
+    def _cutoff(self, series, event, occurrence=None, close=None):
+        close = close if close is not None else self._et(5, 15, 30)
+        c = imm.trade_cutoff_utc(event, occurrence, close)
+        c = imm.apply_series_cutoff_adjustments(series, event, c, close)
+        return c.astimezone(imm.ET).strftime("%Y-%m-%d %H:%M") if c else None
+
+    def test_quotes_until_730am_et_on_the_event_day(self):
+        """Jack 2026-08-04: 'quote treasuries until 7:30am EST'. Midnight is
+        the right default for a scheduled RELEASE; a Treasury yield settles on
+        a 3:30pm ET snapshot of a continuously-traded rate, so the overnight
+        hours are no more informed than the evening before. 7:30 puts the bot
+        out ahead of the 08:30 data."""
+        for s in self.TENORS:
+            self.assertEqual(self._cutoff(s, f"{s}-26AUG05"),
+                             "2026-08-05 07:30", s)
+
+    def test_other_day_dated_series_keep_the_midnight_rule(self):
+        for s in ("KXAAAGASD", "KXDIESELD", "KXUSGASCPI", "KXBKFT"):
+            self.assertEqual(self._cutoff(s, f"{s}-26AUG05"),
+                             "2026-08-05 00:00", s)
+
+    def test_a_real_event_start_still_beats_the_extension(self):
+        """The extender shifts the ticker-date CANDIDATE, so min() still lets
+        an occurrence_datetime win. An earlier draft applied it to the
+        finished cutoff and quoted straight through a 4am event start."""
+        self.assertEqual(
+            self._cutoff("KXUST10AD", "KXUST10AD-26AUG05",
+                         occurrence=self._et(5, 4, 0)),
+            "2026-08-05 04:00")
+
+    def test_a_later_event_start_does_not_extend_us_further(self):
+        self.assertEqual(
+            self._cutoff("KXUST10AD", "KXUST10AD-26AUG05",
+                         occurrence=self._et(5, 9, 0)),
+            "2026-08-05 07:30")
+
+    def test_extension_is_clamped_to_the_close(self):
+        self.assertEqual(
+            self._cutoff("KXUST10AD", "KXUST10AD-26AUG05",
+                         close=self._et(5, 3, 0)),
+            "2026-08-05 03:00")
 
 
 class TestPerSeriesHourMultiplier(unittest.TestCase):
@@ -4246,6 +4289,17 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
     from 4pm ET. Window runs to 01:59 ET because the gas/diesel dailies trade
     until then — stopping at midnight would restore full size for their last
     two hours."""
+
+    def setUp(self):
+        # Pin the config under test instead of reading whatever
+        # IMM_SERIES_HOUR_MULT happens to be, so this asserts the RULE and
+        # stays green under an env override.
+        self._saved = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = imm._parse_series_hour_mults(
+            "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5")
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved
 
     def _at(self, et_hour):
         return imm.ET.localize(
