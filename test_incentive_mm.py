@@ -4307,6 +4307,78 @@ class TestRateBarScopedToNewEvents(unittest.TestCase):
                                           est, proj))
 
 
+class TestMemberMidBand(unittest.TestCase):
+    """Jack 2026-08-05. member_price_band() widens a quoting market's
+    PLACEMENT to 5-93, but _screen kept testing the MID against 5-90 for
+    everyone — so a member whose mid drifted past 90 was dropped from
+    selection before the widened band could ever apply, and the widening was
+    partly dead. Members are now screened against the same band they may
+    quote in; FRESH entry is unchanged."""
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def _meta(self, mid):
+        return imm.MarketMeta(
+            ticker="KXHOOD-26NOVX-1", event_ticker="KXHOOD-26NOVX",
+            series="KXHOOD", dollars_per_day=25.0, program_end=None,
+            target_size=1000.0, discount_factor=0.5, cutoff=None,
+            close_time=datetime.now(timezone.utc) + timedelta(days=30),
+            mid_cents=mid, spread_cents=1, volume=100.0,
+            open_time=datetime.now(timezone.utc) - timedelta(days=1))
+
+    def test_the_two_bands_agree_by_construction(self):
+        """Defaults track STICKY_PRICE_MAX rather than restating 93 — two
+        copies of one number diverging is what stranded the Treasuries."""
+        self.assertEqual(imm.MID_BAND_MEMBER_HI, imm.STICKY_PRICE_MAX)
+        self.assertEqual(imm.member_price_band("KXHOOD", True),
+                         (imm.MID_BAND_MEMBER_LO, imm.MID_BAND_MEMBER_HI))
+
+    def test_member_survives_a_mid_between_90_and_93(self):
+        bot = self._bot()
+        try:
+            for mid in (90.5, 92.0, 93.0):
+                self.assertIsNone(bot._screen(self._meta(mid),
+                                              datetime.now(timezone.utc),
+                                              member=True), f"mid {mid}")
+        finally:
+            _clean_persist()
+
+    def test_fresh_entry_is_unchanged_in_that_range(self):
+        bot = self._bot()
+        try:
+            for mid in (90.5, 92.0, 93.0):
+                self.assertEqual(bot._screen(self._meta(mid),
+                                             datetime.now(timezone.utc),
+                                             member=False), "extreme_mid",
+                                 f"mid {mid}")
+        finally:
+            _clean_persist()
+
+    def test_beyond_the_member_band_still_screens_out(self):
+        bot = self._bot()
+        try:
+            for mid in (93.5, 96.0, 4.0):
+                self.assertEqual(bot._screen(self._meta(mid),
+                                             datetime.now(timezone.utc),
+                                             member=True), "extreme_mid",
+                                 f"mid {mid}")
+        finally:
+            _clean_persist()
+
+    def test_normal_mids_unaffected_either_way(self):
+        bot = self._bot()
+        try:
+            for mid in (5.0, 50.0, 90.0):
+                for mem in (True, False):
+                    self.assertIsNone(bot._screen(self._meta(mid),
+                                                  datetime.now(timezone.utc),
+                                                  member=mem), f"{mid} {mem}")
+        finally:
+            _clean_persist()
+
+
 class TestSafeJoinCappedAtReference(unittest.TestCase):
     """Jack 2026-08-05. Under the amended rules only orders at or above the
     REFERENCE score, so on a book whose touch level alone exceeds the target

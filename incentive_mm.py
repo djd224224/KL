@@ -793,6 +793,19 @@ STICKY_PRICE_MAX = _env_int("IMM_STICKY_PRICE_MAX", 93)
 RUNG_DEEP_FLOOR = _env_int("IMM_RUNG_DEEP_FLOOR", 2)
 MID_BAND_LO = _env_int("IMM_MID_BAND_LO", 5)            # skip markets with mid outside
 MID_BAND_HI = _env_int("IMM_MID_BAND_HI", 90)
+# MEMBER mid band (Jack 2026-08-05). member_price_band() already widens a
+# quoting market's PLACEMENT to STICKY_PRICE_MIN/MAX so "sticky accrual rides
+# to the extremes instead of standing down at 5/90" — but the screen above it
+# was never told, so a member whose MID left 5-90 was dropped from selection
+# before the widened placement band could ever apply. The widening was
+# therefore partly dead: a member could hold a touch out to 93 only while its
+# MID stayed inside 90, which on a tight book is nearly the same bound.
+# Defaults track STICKY_PRICE_MAX rather than restating 93, so the screen and
+# the placement band cannot drift apart (two copies of one number diverging is
+# exactly what stranded the Treasuries earlier today).
+# FRESH entry is deliberately unchanged: this widens the ride, not the door.
+MID_BAND_MEMBER_LO = _env_int("IMM_MID_BAND_MEMBER_LO", STICKY_PRICE_MIN)
+MID_BAND_MEMBER_HI = _env_int("IMM_MID_BAND_MEMBER_HI", STICKY_PRICE_MAX)
 # Wide screen effectively OFF (Jack 2026-07-23: 25->99): incentives are earned
 # for RESTING regardless of spread, and a wide book means LESS competition ->
 # HIGHER pool share, so wider is better, not worse. 99 lets every real book
@@ -4089,7 +4102,11 @@ class IncentiveMarketMaker:
             return "one_sided"
         if meta.spread_cents > MAX_JOIN_SPREAD_CENTS:
             return "wide"
-        if not (MID_BAND_LO <= meta.mid_cents <= MID_BAND_HI):
+        # Members are screened against the SAME band they are allowed to quote
+        # in (member_price_band); fresh entry keeps the tighter 5-90.
+        band_lo, band_hi = (MID_BAND_MEMBER_LO, MID_BAND_MEMBER_HI) if member \
+            else (MID_BAND_LO, MID_BAND_HI)
+        if not (band_lo <= meta.mid_cents <= band_hi):
             return "extreme_mid"
         if MIN_VOLUME_CONTRACTS > 0 and meta.volume < MIN_VOLUME_CONTRACTS:
             # Fresh listings get a pass: mention markets list the day before
