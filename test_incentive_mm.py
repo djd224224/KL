@@ -2250,9 +2250,28 @@ class TestStickySelection(unittest.TestCase):
         imm.MIN_EST_TOTAL_DOLLARS = 1e9        # projection can never reach
         try:
             bot._est_peak.clear()              # no stale peak credit
+            # SUSTAINED, not a dip (Jack 2026-08-05): backdate the sub-bar
+            # clock past the window, otherwise the dip guard rightly holds it.
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_hopeless_member_survives_a_dip(self):
+        # The same market, WITHOUT a sustained sub-bar history, must keep
+        # quoting — this is the regression that cost KXUST7AM 8 of 15 strikes.
+        bot = self._quoting_bot()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot._est_peak.clear()
+            bot.state.hopeless_since.clear()   # first cycle under the bar
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
@@ -2438,6 +2457,8 @@ class TestStickySelection(unittest.TestCase):
         imm.EVENT_START_OVERRIDES["KXGOOD-99DEC31"] = utc(2099, 1, 1)
         try:
             bot._est_peak.clear()
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertNotIn(self.T, bot.state.selected)   # evicted like any
@@ -4197,6 +4218,94 @@ class TestPayoutFloorAccounting(unittest.TestCase):
             self.assertEqual(bot.state.reward_paid_today, 0.0)
         finally:
             _clean_persist()
+
+
+class TestHopelessExitDipGuard(unittest.TestCase):
+    """Jack 2026-08-05: "dont evict on dips under $1".
+
+    The peak-TTL guard claimed to already do this and did not: `pts` only
+    refreshes on a new HIGH, so a DECLINING estimate lets the peak expire and
+    then one low reading evicts. Measured live: KXUST7AM-26AUG31 went 15
+    strikes -> 7 overnight, KXFSLR-26OCTMWSOLD and KXHOOD-26NOVECVOL 7 -> 5.
+    Eviction is near-permanent (re-entry must clear the fresh-candidate rate
+    bar these cannot meet), so the exit has to be sure, not fast."""
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def _step(self, bot, ticker, reaches_min, now_ts):
+        """The universe-refresh bookkeeping, in isolation."""
+        if reaches_min:
+            bot.state.hopeless_since.pop(ticker, None)
+        else:
+            bot.state.hopeless_since.setdefault(ticker, now_ts)
+        sub = now_ts - bot.state.hopeless_since.get(ticker, now_ts)
+        return (imm.HOPELESS_EXIT and not reaches_min
+                and sub >= imm.HOPELESS_SUSTAIN_SECS)
+
+    def test_a_single_dip_does_not_evict(self):
+        bot = self._bot()
+        try:
+            t0 = 1_000_000.0
+            self.assertFalse(self._step(bot, "A", True, t0))
+            self.assertFalse(self._step(bot, "A", False, t0 + 60))   # the dip
+            self.assertFalse(self._step(bot, "A", True, t0 + 120))   # recovers
+            self.assertNotIn("A", bot.state.hopeless_since)
+        finally:
+            _clean_persist()
+
+    def test_a_brief_run_of_dips_does_not_evict(self):
+        bot = self._bot()
+        try:
+            t0 = 1_000_000.0
+            for i in range(1, 30):        # ~29 minutes under the bar
+                self.assertFalse(self._step(bot, "A", False, t0 + 60 * i),
+                                 f"evicted after {i} min")
+        finally:
+            _clean_persist()
+
+    def test_sustained_sub_bar_still_evicts(self):
+        bot = self._bot()
+        try:
+            t0 = 1_000_000.0
+            self._step(bot, "A", False, t0)
+            self.assertFalse(self._step(bot, "A", False,
+                                        t0 + imm.HOPELESS_SUSTAIN_SECS - 1))
+            self.assertTrue(self._step(bot, "A", False,
+                                       t0 + imm.HOPELESS_SUSTAIN_SECS))
+        finally:
+            _clean_persist()
+
+    def test_one_recovery_resets_the_whole_clock(self):
+        """A market that recovers even briefly starts over — the point is that
+        only CONTINUOUS hopelessness counts."""
+        bot = self._bot()
+        try:
+            t0 = 1_000_000.0
+            self._step(bot, "A", False, t0)
+            self._step(bot, "A", True, t0 + imm.HOPELESS_SUSTAIN_SECS - 10)
+            self.assertFalse(self._step(bot, "A", False,
+                                        t0 + imm.HOPELESS_SUSTAIN_SECS + 10))
+        finally:
+            _clean_persist()
+
+    def test_clock_survives_a_restart(self):
+        """~20 deploys/day would otherwise keep resetting it and the exit
+        could never fire at all."""
+        _clean_persist()
+        try:
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.known_tickers = {"A"}
+            bot.state.hopeless_since["A"] = 1_000_000.0
+            bot._save_persist()
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self.assertAlmostEqual(bot2.state.hopeless_since.get("A"), 1_000_000.0)
+        finally:
+            _clean_persist()
+
+    def test_sustain_window_is_an_hour_by_default(self):
+        self.assertEqual(imm.HOPELESS_SUSTAIN_SECS, 3600)
 
 
 class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):

@@ -1195,6 +1195,25 @@ EST_PEAK_TTL_SECS = _env_int("IMM_EST_PEAK_TTL", 3600)
 # OPTIMISTIC projection (accrued-so-far + the better of the current and
 # 1h-peak remaining estimate) stays under the bar. quote_all series exempt.
 HOPELESS_EXIT = os.environ.get("IMM_HOPELESS_EXIT", "1") == "1"
+# ...but ONLY after the projection has been under the bar CONTINUOUSLY for
+# this long (Jack 2026-08-05: "dont evict on dips under $1").
+#
+# The peak-TTL guard above was supposed to already do this — its comment
+# claimed "eviction needs a full peak-TTL hour of sustained sub-$1 projection"
+# — and it does not. `pts` is only refreshed when a NEW HIGH is set, so a
+# market whose estimate DECLINES (the normal path: competitors arrive, our
+# share falls) never refreshes it, the peak silently expires an hour later,
+# and then a SINGLE low reading evicts. Measured on KXUST7AM-26AUG31: 15
+# strikes -> 7 overnight, and the same signature on KXFSLR-26OCTMWSOLD and
+# KXHOOD-26NOVECVOL (7 -> 5 each).
+#
+# Eviction is also effectively PERMANENT, which is what makes a false one
+# expensive: an evicted market re-enters as a FRESH candidate and must clear
+# the per-series rate bar, which these structurally cannot (est $0.37/day
+# against a $2/day bar). The `rate_floor` skip bucket climbs monotonically as
+# `hopeless` fires — 96 -> 106 over the same window. So the exit needs to be
+# sure, not fast.
+HOPELESS_SUSTAIN_SECS = _env_int("IMM_HOPELESS_SUSTAIN_SECS", 3600)
 
 
 def _quotable_days(meta, now_utc: datetime) -> float:
@@ -2589,6 +2608,10 @@ class BotState:
     manual_standoff: Dict[str, float] = field(default_factory=dict)  # ticker -> since ts
     cutoff_ts: Dict[str, float] = field(default_factory=dict)     # ticker -> cutoff epoch
     accrued_est: Dict[str, float] = field(default_factory=dict)   # ticker -> lifetime est
+    # ticker -> ts the projection first went under the payout bar (cleared the
+    # moment it recovers). The hopeless exit reads this so a DIP cannot evict —
+    # see HOPELESS_SUSTAIN_SECS.
+    hopeless_since: Dict[str, float] = field(default_factory=dict)
     #   reward accrued ($; live share x $/day integrated per cycle). Feeds the
     #   hopeless-exit / entry-floor credit: accrued + projection vs the $1 bar.
     rain_dir_done: Dict[str, float] = field(default_factory=dict)  # ticker -> entry ts
@@ -2784,6 +2807,8 @@ class IncentiveMarketMaker:
             # (or re-floor) markets that already banked most of their $1.
             self.state.accrued_est = {str(t): float(v) for t, v in
                                       (data.get("accrued_est") or {}).items()}
+            self.state.hopeless_since = {str(t): float(v) for t, v in
+                                         (data.get("hopeless_since") or {}).items()}
             # MIGRATION (2026-08-04, first load after the paid-basis counters
             # shipped): a state file written by the old code has accrued_est
             # but no paid_crossed, so every carried market sitting above the
@@ -2891,6 +2916,13 @@ class IncentiveMarketMaker:
                                            for t, v in self.state.accrued_est.items()
                                            if v >= 1e-4
                                            and t in self.state.known_tickers},
+                           # the sub-bar clock must survive restarts or this
+                           # bot's ~20 deploys/day would keep resetting it and
+                           # the hopeless exit could never fire at all
+                           "hopeless_since": {
+                               t: round(v, 1)
+                               for t, v in self.state.hopeless_since.items()
+                               if t in self.state.known_tickers},
                            # pruned on the SAME rule as accrued_est: a ticker
                            # that drops out of one must drop out of the other,
                            # or a re-listed ticker resumes "already paid"
@@ -3536,9 +3568,10 @@ class IncentiveMarketMaker:
                 continue
             # Shared $1-min-payout projection for the entry floor AND the
             # hopeless exit: optimistic = accrued-so-far + max(current,
-            # 1h-peak) remaining. Peak now updates for MEMBERS too, so a
-            # single noisy dip can't evict — eviction needs a full peak-TTL
-            # hour of sustained sub-$1 projection.
+            # 1h-peak) remaining. NOTE the peak alone does NOT stop a dip from
+            # evicting: `pts` only refreshes on a new HIGH, so a declining
+            # estimate lets the peak expire and then one low reading is
+            # enough. The explicit dip guard below is what actually holds.
             est_total = meta.est_dollars_per_day * _quotable_days(meta, now_utc)
             peak, pts = self._est_peak.get(meta.ticker, (0.0, 0.0))
             if now_ts - pts > EST_PEAK_TTL_SECS:
@@ -3549,6 +3582,15 @@ class IncentiveMarketMaker:
             accrued = self.state.accrued_est.get(meta.ticker, 0.0)
             reaches_min = accrued + max(est_total, peak) \
                 >= series_min_est_total(meta.series)
+            # DIP GUARD (Jack 2026-08-05). Track how long the projection has
+            # been continuously under the bar; the exit below refuses to fire
+            # until that exceeds HOPELESS_SUSTAIN_SECS. Any single reading at
+            # or above the bar resets the clock, so a dip cannot evict.
+            if reaches_min:
+                self.state.hopeless_since.pop(meta.ticker, None)
+            else:
+                self.state.hopeless_since.setdefault(meta.ticker, now_ts)
+            sub_bar_secs = now_ts - self.state.hopeless_since.get(meta.ticker, now_ts)
             if quote_all:
                 # user wants EVERY market of the event (2026-07-12): exempt
                 # from floors, the hopeless exit and the yield ranking.
@@ -3560,6 +3602,7 @@ class IncentiveMarketMaker:
                 # below until natural death.
                 skipped["no_new"] = skipped.get("no_new", 0) + 1
             elif HOPELESS_EXIT and not reaches_min \
+                    and sub_bar_secs >= HOPELESS_SUSTAIN_SECS \
                     and meta.ticker in prev_selected \
                     and meta.event_ticker not in FORCE_EVENTS \
                     and not curated_event(meta.event_ticker, meta.series, now_utc):
