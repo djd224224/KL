@@ -1047,10 +1047,30 @@ _REENTRY_SERIES = (
     # safe-join exists for: it sits tight and two-sided until the number
     # lands, so joining the touch is the expensive way to be there.
     + _DEFAULT_RATES_SERIES)
+# RATE BAR 2.0 -> 0.0 (Jack 2026-08-05: "recover the markets lost"). The
+# $2/day bar was a RISK gate for wading back into company/econ after the 7/29
+# freeze, not an economics one — and as a per-DAY test it is horizon-blind, so
+# it permanently locks out exactly the markets whose value comes from a long
+# window. Measured across the seven affected events, EVERY lost market failed
+# this one gate and nothing else: 53 markets, $55.13 of projected reward, all
+# of which clear the $1.00 payout floor that actually determines whether
+# Kalshi pays. It is also the far side of the eviction ratchet — a market that
+# dips out can never return through it.
+#
+# The economics gate is now MEASURED rather than assumed (the 2026-08-04
+# statement: nothing under $1.00 per market per program period is ever paid),
+# so MIN_EST_TOTAL_DOLLARS is the right test and this was a horizon-blind
+# proxy for it. Safe-join placement — the actual adverse-selection protection
+# — is unchanged. Same call Jack already made for KXDIESELW on 2026-08-03,
+# generalised.
+#
+# BLAST RADIUS: this admits every currently rate-floored market, not just the
+# 53 on the named events (~111 in the last universe line, ~22% more markets).
+# The collateral budget and the $1 payout floor are what bound it now.
 for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
     if _s.strip() and _s.strip() not in SERIES_OVERRIDES:
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
-            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
+            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 0.0),
             safe_join=True)
 
 # KXDIESELW quoted as an OVERRIDE (Jack 2026-08-03): exempt from the $2/day
@@ -1071,7 +1091,11 @@ SERIES_OVERRIDES["KXDIESELW"] = SeriesOverride(
 for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
-            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
+            # 0.0 since 2026-08-05 — see the re-entry block above. This loop
+            # had its own copy of the 2.0 default, so changing it there alone
+            # left the Treasuries (the family the complaint was about) still
+            # locked out. One default, read from the same env var.
+            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 0.0),
             safe_join=True,
             event_day_cutoff_et=(
                 _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
