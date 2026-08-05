@@ -745,6 +745,65 @@ class TestDryRunSafety(unittest.TestCase):
         self.assertEqual((place, cancel), ([], []))
 
 
+class TestSingletonLock(unittest.TestCase):
+    """One live bot per market: duplicates each keep their own ledger, so the
+    per-side/level caps would silently double."""
+
+    def test_acquire_release_and_takeover_of_stale_lock(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mm, "STATUS_DIR", d):
+                self.assertTrue(mm.acquire_singleton("SOL-MAX"))
+                path = os.path.join(d, "lock_SOL-MAX.pid")
+                self.assertEqual(open(path).read().strip(), str(os.getpid()))
+                # a dead owner's lock is taken over
+                with open(path, "w") as f:
+                    f.write("999999")
+                with mock.patch.object(mm, "_pid_alive", return_value=False):
+                    self.assertTrue(mm.acquire_singleton("SOL-MAX"))
+                self.assertEqual(open(path).read().strip(), str(os.getpid()))
+                # release only removes our own lock
+                mm._release_singleton(path)
+                self.assertFalse(os.path.exists(path))
+
+    def test_refuses_when_other_instance_alive(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mm, "STATUS_DIR", d):
+                with open(os.path.join(d, "lock_SOL-MAX.pid"), "w") as f:
+                    f.write("424242")
+                with mock.patch.object(mm, "_pid_alive", return_value=True),                         mock.patch.object(mm, "_heartbeat_fresh", return_value=True):
+                    self.assertFalse(mm.acquire_singleton("SOL-MAX"))
+
+    def test_live_pid_but_stale_heartbeat_is_taken_over(self):
+        # PID reuse must not park a market forever: without a fresh heartbeat
+        # the lock is treated as abandoned.
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mm, "STATUS_DIR", d):
+                with open(os.path.join(d, "lock_SOL-MAX.pid"), "w") as f:
+                    f.write("424242")
+                with mock.patch.object(mm, "_pid_alive", return_value=True),                         mock.patch.object(mm, "_heartbeat_fresh", return_value=False):
+                    self.assertTrue(mm.acquire_singleton("SOL-MAX"))
+
+    def test_heartbeat_fresh_reads_status_mtime(self):
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mm, "STATUS_DIR", d):
+                self.assertFalse(mm._heartbeat_fresh("SOL-MAX"))
+                p = os.path.join(d, "status_SOL-MAX.json")
+                with open(p, "w") as f:
+                    json.dump({"market": "SOL-MAX"}, f)
+                self.assertTrue(mm._heartbeat_fresh("SOL-MAX"))
+                old = __import__("time").time() - 9999
+                os.utime(p, (old, old))
+                self.assertFalse(mm._heartbeat_fresh("SOL-MAX"))
+
+    def test_unreadable_lock_dir_does_not_block_trading(self):
+        with mock.patch.object(mm, "STATUS_DIR", "\\\\?\\Z:\\nonexistent"):
+            self.assertTrue(mm.acquire_singleton("SOL-MAX"))
+
+
 class TestMarketDataCache(unittest.TestCase):
     def test_roundtrip_expiry_and_types(self):
         import os, tempfile, time as _time

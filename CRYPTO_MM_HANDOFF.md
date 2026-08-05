@@ -142,9 +142,130 @@ within a few cents on majors; meme coins diverge (see guards).
 6. Log filenames stamp the python **start** date; a bot running for days keeps appending to its
    start-date log. Check mtimes, not names.
 
+## Weekly variant (`crypto_touch_mm_weekly.py`, v1.0 — built 2026-08-05, NOT deployed)
+
+A weekly sibling of this bot exists. It **subclasses** `TouchMarketMaker` rather than forking
+it: pricing, the order ledger, the caps, the fail-safe loop, alerting and the daily summary are
+all this file's code. Only the measurement window differs, and that lives behind horizon hooks
+added to `TouchMarketMaker` for the purpose (`window_start_utc` / `window_end_utc` /
+`window_label` / `min_hours_left` / `skip_reason_for_fair` / `active_markets` /
+`maybe_rollover` / `poll_interval` / `startup_event_and_sweep` / `status_dir` / `status_extra`,
+plus the per-fleet class attributes `model_version` / `client_order_prefix` / `poll_secs` /
+`max_position` / `max_event`). **The monthly fleet's behaviour is unchanged** — all 96 existing
+tests pass untouched — but the extraction means a future fix to `run_cycle` benefits both.
+
+- **There is nothing to trade yet.** Exchange-wide, exactly two series match this family —
+  `KXBTCMAXW` and `KXDOGEMAXW` — and both have been dormant since **November 2024** (last
+  events `KXBTCMAXW-24-NOV22`, `KXDOGEMAXW-24`). No weekly MIN series exists for any asset. The
+  bot's normal state today is **idle**: it polls slowly, logs `no open weekly event`, places
+  nothing, and starts quoting on its own the day Kalshi relists. `--discover` reports live ones.
+- **Event tickers are DISCOVERED, not computed.** The two historical weeklies used two
+  different, non-monthly conventions, so a formula would be a guess. Each cycle asks
+  `get_markets(series_ticker=…, status=open)`, groups by event, and trades the **front week**
+  (soonest window end still in the future). The window comes from those markets' own
+  `open_time` / `expected_expiration_time`, so stub weeks and odd close hours just work.
+- **Calibration differences** (all `CTW_*`-tunable): `min_hours_left` 2.0 (vs 1.0); a NEW
+  deep-OTM stand-down at `fair <= 3c` (`CTW_SKIP_FAIR_BELOW_CENTS`) because driftless GBM
+  *understates* fat-tailed touch probability over 7 days and the ask side of a 2c market risks
+  ~98c to win 2c; caps 100/500 (vs 267/1667) as an unproven-market starting point — **raise
+  only against a ledger**. Ladder spec is unchanged (5×10, 5c off fair, 2c apart, post-only,
+  join-don't-lead).
+- **Isolation is enforced and tested**: own env namespace (`CTW_*`, never written back onto
+  `CMM_*` unless the operator sets one), own `client_order_id` prefix (`cmw-`, disjoint from
+  `cmm-`), own heartbeat dir (`run-logs\crypto-touch-weekly\` — keeping weekly bots out of
+  `send_daily_digest.py`'s `status_*.json` glob, which would otherwise price them with monthly
+  tickers). The Kraken/Coinbase **cache stays shared** with this fleet on purpose (per-IP rate
+  limits). `test_crypto_touch_mm_weekly.py` has 71 tests, including a `TestFleetIsolation` class
+  that fails if the weekly bot can retune or impersonate the monthly one.
+- Files: `crypto_touch_mm_weekly.py`, `test_crypto_touch_mm_weekly.py`,
+  `run_crypto_touch_mm_weekly.ps1`, `run_crypto_touch_mm_weekly_hidden.vbs`.
+  No scheduled tasks registered — deploy only once a weekly event actually lists.
+- Also added: `ExchangeClient.get_events()` (additive; the weekly orphan sweep needs to list a
+  series' recent events).
+
+## Above/below variant (`crypto_updown_mm.py`, v1.0 — built 2026-08-05)
+
+**LIVE PILOT (armed 2026-08-05, weekly tenor, all assets).** Settings per Jack: `--cadence
+weekly`, ladder **3 x 1**, **3c off fair**, 2c apart, band **10-90c**, **8 markets/event**.
+The offset went 5c -> 3c after the first live cycles showed us resting 5-6c behind a ~2c-wide
+book — at 5c we would essentially never have filled. That bounds
+resting size at 3 contracts per market per side — 48 contracts per asset if every level on both
+sides filled (~$25/side at mid). The 40/200/400 caps are non-binding backstops at this size;
+**the ladder is the pilot control — scale it and revisit the caps together.** Kill switch:
+`python crypto_updown_mm.py --asset BTC --cancel-all`.
+`test_crypto_updown_mm.py::test_ladder_is_the_live_pilot_shape` pins the deployed shape, so
+loosening size has to break a test first.
+
+Markets the one-touch fleet does **not** cover: `KX{ASSET}D`, "What will {ASSET}'s price be on
+{date} at {hour} ET?" — 21 open events across 7 assets right now, far better quoted than the
+monthlies.
+
+**These settle on the TERMINAL price, not on a touch — and that is easy to miss.** They carry
+`strike_type="greater"` and a `floor_strike`, *exactly* like the MAX one-touch markets, so
+`crypto_touch_mm.py` parses them without complaint. Measured, `touch_prob` is **2.0–2.1×** the
+true terminal probability at every tenor here: a market genuinely worth 31c prices at 62c under
+the one-touch model. That would systematically overpay for YES and undersell NO across the whole
+ladder with no existing guard catching it, because the numbers still look plausible. Hence a
+separate module, a separate `terminal_prob()` (Black-Scholes N(d2), r=0, MC-validated to
+<0.001), and a regression test pinning the two models apart.
+
+- **Three tenors trade under one series**, classified by the event's own window (exchange
+  metadata, not ticker convention): `hourly` ~1h (188 strikes on BTC), `daily` ~25h, and
+  **`weekly` ~169h** — so a 7-day crypto market does exist; it is above/below, not one-touch.
+  One bot quotes all selected tenors of one asset concurrently: `--cadence hourly|daily|weekly`
+  (comma list), `both` (default), or `all`.
+- **Live calibration, measured 2026-08-05** against real two-sided books (bid>0, ask<100,
+  spread≤10c) across 7 assets — model fair vs book mid: hourly `MAE 2.7c` (n=24), daily
+  `MAE 1.6c` (n=41), weekly `MAE 3.1c` (n=46). Mean error is −0.4 to −0.9c on every tenor, i.e.
+  a small consistent bias below the market — worth watching, plausibly the driftless assumption.
+  Thin books (a BNB hourly, MAE 13c) are caught by the 15c divergence stand-down.
+  *Beware when re-measuring:* Kalshi reports `yes_ask_dollars=1.00` when there is **no** offer,
+  so a naive "mid" of a one-sided book reads ~51c and fabricates huge errors. The bot is immune
+  (it uses `external_best()` on the real orderbook), but a diagnostic script is not.
+- **Volatility is horizon-matched**: 5m candles under 6h, 60m under 3d, daily beyond, each
+  scaled to a per-day sigma and blended 70/30 with the daily estimate. A 1h market priced off
+  90-day candles ignores the regime it expires into.
+- **Near-money band only** (`fair` strictly between 10c and 90c, then the 8 nearest to 50c).
+  Without it an hourly BTC event would need 188 orderbook calls per cycle.
+- Caps 40 / 200 / 400 (market / event / **asset**, the last spanning all tenors). Bug found and
+  fixed in dry run: draining the asset budget greedily in expiry order
+  let hourly+daily consume all of it and the weekly quoted **neither side**; each event now gets
+  an even share of the remaining budget with unused share rolling forward.
+- Own env namespace `CUD_*`, own prefix `cud-`, own heartbeat dir `run-logs\crypto-updown\`.
+  `test_crypto_updown_mm.py` has 58 tests; `TestFleetIsolation` asserts all three fleets'
+  prefixes and status dirs are pairwise disjoint. **223 tests pass across all three suites.**
+- **DOGE uses a different market shape.** Every DOGE rung across all three tenors (118 markets)
+  is `strike_type="custom"` with `floor_strike=None` — same "$0.18 or above" payoff as the
+  others, but the numeric strike exists only in the ticker suffix. Every other asset is
+  `greater` with a numeric strike. Unhandled, DOGE priced 0 strikes and quoted nothing while
+  reporting a healthy `36 strikes -> 0 quotable`. Now recovered from the ticker, but only when
+  `yes_sub_title` independently confirms both the direction ("or above") and the number to
+  within 1% — otherwise the market is skipped rather than traded on a guessed strike.
+- **BNB and HYPE weekly books are empty** (bid 1c / ask 99c, nothing between). Join-don't-lead
+  matches those extremes, so we rest one 1c bid and one 99c ask per market — free options
+  (max loss 1c, hugely +EV if ever hit) but not market making. Real two-sided quoting is
+  BTC / SOL / ETH / XRP.
+- ZEC lists no `KXZECD` events (configured anyway; it idles).
+- Files: `crypto_updown_mm.py`, `test_crypto_updown_mm.py`, `run_crypto_updown_mm.ps1`,
+  `run_crypto_updown_mm_hidden.vbs`. No scheduled tasks registered yet — the pilot is started
+  by hand (see Quick commands); register tasks once it has run clean for a session.
+
 ## Quick commands
 
 ```powershell
+# --- above/below variant ---
+python crypto_updown_mm.py --discover                       # all open events, all tenors
+python crypto_updown_mm.py --asset BTC --cadence all --once  # dry run, one cycle
+python crypto_updown_mm.py --asset BTC --cancel-all
+python -m unittest test_crypto_updown_mm
+
+# --- weekly variant ---
+# what weekly one-touch events are live right now (nothing, as of 2026-08-05)
+python crypto_touch_mm_weekly.py --discover
+python crypto_touch_mm_weekly.py --market BTC-MAX --once      # dry run, one cycle
+python crypto_touch_mm_weekly.py --market BTC-MAX --cancel-all
+python -m unittest test_crypto_touch_mm test_crypto_touch_mm_weekly
+
 # fleet status
 Get-ScheduledTask -TaskName "KL crypto_touch_mm *" | Select TaskName, State
 # deliberate pause / resume one market (watchdog-proof)

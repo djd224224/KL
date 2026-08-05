@@ -60,6 +60,7 @@ import json
 import math
 import os
 import signal
+import subprocess
 import smtplib
 import sys
 import time
@@ -77,7 +78,7 @@ from cryptography.hazmat.primitives import serialization
 
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
-MODEL_VERSION = "crypto_touch_mm_v2.1"
+MODEL_VERSION = "crypto_touch_mm_v2.5"
 RUN_ID = uuid.uuid4().hex[:8]
 CLIENT_ORDER_PREFIX = "cmm"  # all client_order_ids look like cmm-<run>-<uuid>
 
@@ -128,19 +129,18 @@ MARKETS: Dict[str, MarketConfig] = {m.key: m for m in [
 QUOTE_OFFSET_CENTS = int(os.environ.get("CMM_QUOTE_OFFSET_CENTS", 5))
 LEVEL_SPACING_CENTS = int(os.environ.get("CMM_LEVEL_SPACING_CENTS", 2))
 NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 5))
-CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 10))
+CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 12))
 
 # Risk / hygiene parameters
-# Caps scaled proportionally with ladder growth: the 3x8 config carried
-# 128/800; 5x10 is 50/24 of that ladder -> 128*50/24 = 266.7 -> 267,
-# 800*50/24 = 1666.7 -> 1667 (2026-08-01).
-MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 267))  # per market, either sign
+# Caps scale proportionally with ladder size. History: 3x8 -> 128/800;
+# 5x10 (x50/24) -> 267/1667 (2026-08-01); 5x12 (x1.2) -> 320/2000 (2026-08-05).
+MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 320))  # per market, either sign
 # Net cap across all strikes of one event (they are one correlated bet on the
 # same spot). 500 comfortably exceeds 8 full 3x10 ladders (480): non-binding
 # at rest so every bucket gets the full spec ladder; binds as fills
 # accumulate. The event budget is split evenly across quotable markets each
 # cycle.
-MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 1667))
+MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 2000))
 SKIP_FAIR_ABOVE_CENTS = 97       # near-certain touch: model risk dominates, stand down
 BOOK_DIVERGENCE_BID = 85         # best bid >= this while our fair is 20c+ lower ->
 BOOK_DIVERGENCE_GAP = 20         # ... suspected touch we can't see; stand down
@@ -494,9 +494,18 @@ class Quote:
 
 def build_quotes(ticker: str, fair: int,
                  ext_best_bid: Optional[int], ext_best_ask: Optional[int],
-                 room_buy: float, room_sell: float) -> List[Quote]:
+                 room_buy: float, room_sell: float,
+                 num_levels: Optional[int] = None,
+                 contracts_per_level: Optional[int] = None,
+                 offset_cents: Optional[int] = None,
+                 spacing_cents: Optional[int] = None) -> List[Quote]:
     """Ladder of post-only quotes around fair. `ext_best_bid`/`ext_best_ask`
     are the best EXTERNAL levels (book net of our own orders).
+
+    The ladder shape defaults to this module's constants (the monthly fleet's
+    5x10) and is overridable per-caller so a variant fleet can run a different
+    size WITHOUT rewriting these globals — two fleets in one interpreter must
+    not be able to resize each other's ladders.
 
     Join, don't lead: a bid may at most MATCH the external best bid (never
     improve it), an ask may at most match the external best ask, and a side
@@ -506,6 +515,12 @@ def build_quotes(ticker: str, fair: int,
     The ladder's total size is shaved to fit `room_buy`/`room_sell`
     (contracts we may still buy/sell before hitting the caps, assuming the
     whole ladder fills)."""
+    num_levels = NUM_LEVELS if num_levels is None else num_levels
+    contracts_per_level = (CONTRACTS_PER_LEVEL if contracts_per_level is None
+                           else contracts_per_level)
+    offset_cents = QUOTE_OFFSET_CENTS if offset_cents is None else offset_cents
+    spacing_cents = LEVEL_SPACING_CENTS if spacing_cents is None else spacing_cents
+
     quotes: List[Quote] = []
 
     # INVARIANT: consecutive levels on a side are always exactly
@@ -515,31 +530,31 @@ def build_quotes(ticker: str, fair: int,
 
     if ext_best_bid is not None:  # no external bids -> we never bid alone
         room = int(room_buy)
-        anchor = min(fair - QUOTE_OFFSET_CENTS, ext_best_bid)   # match, never lead
+        anchor = min(fair - offset_cents, ext_best_bid)         # match, never lead
         if ext_best_ask is not None:
             anchor = min(anchor, ext_best_ask - 1)              # post-only: never cross
-        for i in range(NUM_LEVELS):
+        for i in range(num_levels):
             if room <= 0:
                 break
-            px = anchor - i * LEVEL_SPACING_CENTS
+            px = anchor - i * spacing_cents
             if px < 1:
                 break
-            count = min(CONTRACTS_PER_LEVEL, room)
+            count = min(contracts_per_level, room)
             quotes.append(Quote(ticker, "bid", px, count))
             room -= count
 
     if ext_best_ask is not None:  # no external asks -> we never ask alone
         room = int(room_sell)
-        anchor = max(fair + QUOTE_OFFSET_CENTS, ext_best_ask)   # match, never lead
+        anchor = max(fair + offset_cents, ext_best_ask)         # match, never lead
         if ext_best_bid is not None:
             anchor = max(anchor, ext_best_bid + 1)              # post-only: never cross
-        for i in range(NUM_LEVELS):
+        for i in range(num_levels):
             if room <= 0:
                 break
-            px = anchor + i * LEVEL_SPACING_CENTS
+            px = anchor + i * spacing_cents
             if px > 99:
                 break
-            count = min(CONTRACTS_PER_LEVEL, room)
+            count = min(contracts_per_level, room)
             quotes.append(Quote(ticker, "ask", px, count))
             room -= count
 
@@ -847,6 +862,48 @@ class BotState:
 
 
 class TouchMarketMaker:
+    # ---- horizon parameters -------------------------------------------------
+    # The measurement window is the ONLY thing that differs between the monthly
+    # and weekly one-touch bots, so it lives behind the hooks below rather than
+    # in a forked copy of run_cycle(). Defaults ARE the monthly behaviour —
+    # every one of them resolves to what this file did before the split —
+    # and crypto_touch_mm_weekly.WeeklyTouchMarketMaker overrides them.
+    window_label = "MTD"                  # tag in log/summary lines
+    min_hours_left = MIN_HOURS_LEFT       # stop quoting this close to the end
+    # Heartbeat location. Variants MUST write elsewhere: send_daily_digest.py
+    # globs status_*.json here and would silently fold another fleet's bots
+    # into the monthly digest (and price their events with monthly tickers).
+    status_dir = STATUS_DIR
+    # Per-fleet identity and risk limits. These are class attributes rather
+    # than module globals so a variant can differ WITHOUT mutating this module
+    # — two fleets sharing one interpreter (tests, tooling) must not be able to
+    # retune each other's caps or hijack each other's order-id prefix.
+    model_version = MODEL_VERSION
+    client_order_prefix = CLIENT_ORDER_PREFIX
+    poll_secs = POLL_SECS
+    max_position = MAX_POSITION_CONTRACTS   # per market, either sign
+    max_event = MAX_EVENT_CONTRACTS         # net across one event's strikes
+    num_levels = NUM_LEVELS                 # ladder shape (see build_quotes)
+    contracts_per_level = CONTRACTS_PER_LEVEL
+    quote_offset_cents = QUOTE_OFFSET_CENTS
+    level_spacing_cents = LEVEL_SPACING_CENTS
+
+    def status_extra(self) -> Dict[str, object]:
+        """Extra fields merged into the heartbeat by variants."""
+        return {}
+
+    def window_start_utc(self, now_utc: datetime) -> datetime:
+        return month_start_utc(now_utc)
+
+    def window_end_utc(self, now_utc: datetime) -> datetime:
+        return month_end_utc(now_utc)
+
+    def skip_reason_for_fair(self, fair: int) -> Optional[str]:
+        """Why we won't quote a strike at this fair, or None to quote it."""
+        if fair >= SKIP_FAIR_ABOVE_CENTS:
+            return f"fair={fair}c >= {SKIP_FAIR_ABOVE_CENTS}c (near touch)"
+        return None
+
     def __init__(self, cfg: MarketConfig, client: Optional[ExchangeClient], live: bool):
         self.cfg = cfg
         self.client = client
@@ -859,7 +916,7 @@ class TouchMarketMaker:
     # ---- exchange wrappers (all writes gated on self.live) -----------------
 
     def place_order(self, q: Quote, now_ts: float) -> None:
-        client_order_id = f"{CLIENT_ORDER_PREFIX}-{RUN_ID}-{uuid.uuid4().hex[:12]}"
+        client_order_id = f"{self.client_order_prefix}-{RUN_ID}-{uuid.uuid4().hex[:12]}"
         # Stamp expiration at SEND time, not cycle start: a slow placement
         # wave (dozens of orders x ~2s) would otherwise burn minutes of TTL
         # before late orders even reach the exchange.
@@ -937,7 +994,8 @@ class TouchMarketMaker:
             batch = resp.get("orders") or []
             orders.extend(o for o in batch
                           if o.get("status") == "resting"
-                          and str(o.get("client_order_id", "")).startswith(CLIENT_ORDER_PREFIX + "-"))
+                          and str(o.get("client_order_id", "")).startswith(
+                              self.client_order_prefix + "-"))
             cursor = resp.get("cursor")
             if not cursor or not batch:
                 break
@@ -953,7 +1011,7 @@ class TouchMarketMaker:
         are done (filled/cancelled/expired) and dropped."""
         merged = list(exchange_orders)
         seen_ids = {o.get("order_id") for o in exchange_orders}
-        grace = 2 * POLL_SECS + 15
+        grace = 2 * self.poll_secs + 15
         for oid, entry in list(self.state.ledger.items()):
             if oid in seen_ids:
                 entry["_confirmed"] = True
@@ -1069,7 +1127,7 @@ class TouchMarketMaker:
         shares one), plus daily candles and the session extreme, accumulated
         in state so spikes seen once are never forgotten. Failures degrade
         gracefully — the accumulated value stands."""
-        start_ts = month_start_utc(now_utc).timestamp()
+        start_ts = self.window_start_utc(now_utc).timestamp()
         candidates = [self.state.mtd_extreme, self.state.session_extreme]
         now_ts = now_utc.timestamp()
         if now_ts - self.state.mtd_hourly_at >= MTD_REFRESH_SECS:
@@ -1126,10 +1184,10 @@ class TouchMarketMaker:
         sigma = self.state.sigma_daily
         mtd = self.state.mtd_extreme
 
-        end_utc = month_end_utc(now_utc)
+        end_utc = self.window_end_utc(now_utc)
         hours_left = (end_utc - now_utc).total_seconds() / 3600.0
-        if hours_left < MIN_HOURS_LEFT:
-            log(f"{self.tag} <{MIN_HOURS_LEFT}h left in measurement window; standing down")
+        if hours_left < self.min_hours_left:
+            log(f"{self.tag} <{self.min_hours_left}h left in measurement window; standing down")
             self.cancel_all_bot_orders()
             return
 
@@ -1148,8 +1206,8 @@ class TouchMarketMaker:
         event_net = sum(positions.values())
         self.state.last_event_net = event_net
         # Room left before the aggregate event cap, assuming every ladder fills.
-        event_room_buy = MAX_EVENT_CONTRACTS - event_net
-        event_room_sell = MAX_EVENT_CONTRACTS + event_net
+        event_room_buy = self.max_event - event_net
+        event_room_sell = self.max_event + event_net
 
         # Our resting orders, fetched up front so each market's book can be
         # netted of our own size (join-don't-lead needs the EXTERNAL best).
@@ -1163,12 +1221,13 @@ class TouchMarketMaker:
 
         # Price all markets first, then allocate the event budget near-money-first.
         priced = []
+        wl = self.window_label
         summary = [f"{self.tag} {self.cfg.asset}=${price:,.2f} dir={d} sigma={sigma:.4f} "
-                   f"T={hours_left / 24:.1f}d MTD{'high' if d == 'max' else 'low'}="
+                   f"T={hours_left / 24:.1f}d {wl}{'high' if d == 'max' else 'low'}="
                    f"${mtd:,.2f} event={self.state.event_ticker} "
                    f"net={event_net:+.0f}" if mtd is not None else
                    f"{self.tag} {self.cfg.asset}=${price:,.2f} dir={d} sigma={sigma:.4f} "
-                   f"T={hours_left / 24:.1f}d MTD=? event={self.state.event_ticker}"]
+                   f"T={hours_left / 24:.1f}d {wl}=? event={self.state.event_ticker}"]
         for m in markets:
             ticker = m["ticker"]
             strike = market_strike(m, d)
@@ -1179,14 +1238,14 @@ class TouchMarketMaker:
             t_days = max(0.0, (exp - now_utc).total_seconds() / 86400.0)
 
             if breached(strike, mtd, d):
-                summary.append(f"  {ticker} strike={strike:g}: MTD extreme {mtd:,.2f} crossed "
+                summary.append(f"  {ticker} strike={strike:g}: {wl} extreme {mtd:,.2f} crossed "
                                f"strike; likely touched -> not quoting")
                 continue
 
             fair = fair_value_cents(price, strike, sigma, t_days, d)
-            if fair >= SKIP_FAIR_ABOVE_CENTS:
-                summary.append(f"  {ticker} strike={strike:g}: fair={fair}c >= "
-                               f"{SKIP_FAIR_ABOVE_CENTS}c (near touch) -> not quoting")
+            skip = self.skip_reason_for_fair(fair)
+            if skip:
+                summary.append(f"  {ticker} strike={strike:g}: {skip} -> not quoting")
                 continue
             priced.append((abs(fair - 50), ticker, strike, fair))
 
@@ -1238,9 +1297,11 @@ class TouchMarketMaker:
                     continue
 
             pos = positions.get(ticker, 0.0)
-            room_buy = min(MAX_POSITION_CONTRACTS - pos, share_buy)
-            room_sell = min(MAX_POSITION_CONTRACTS + pos, share_sell)
-            quotes = build_quotes(ticker, fair, best_bid, best_ask, room_buy, room_sell)
+            room_buy = min(self.max_position - pos, share_buy)
+            room_sell = min(self.max_position + pos, share_sell)
+            quotes = build_quotes(ticker, fair, best_bid, best_ask, room_buy, room_sell,
+                                  self.num_levels, self.contracts_per_level,
+                                  self.quote_offset_cents, self.level_spacing_cents)
             desired.extend(quotes)
             event_room_buy -= sum(q.count for q in quotes if q.book_side == "bid")
             event_room_sell -= sum(q.count for q in quotes if q.book_side == "ask")
@@ -1307,10 +1368,11 @@ class TouchMarketMaker:
             "summary_date": str(self.alerter.last_summary_date or ""),
             "summary_body": self.alerter.last_summary_body or "",
         }
+        status.update(self.status_extra())
         try:
-            path = os.path.join(STATUS_DIR, f"status_{self.cfg.key}.json")
+            path = os.path.join(self.status_dir, f"status_{self.cfg.key}.json")
             tmp = path + ".tmp"
-            os.makedirs(STATUS_DIR, exist_ok=True)
+            os.makedirs(self.status_dir, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(status, f)
             os.replace(tmp, path)
@@ -1323,7 +1385,7 @@ class TouchMarketMaker:
         merge): a (market, side) never exceeds NUM_LEVELS x
         CONTRACTS_PER_LEVEL resting contracts, and a single price LEVEL on a
         market never exceeds CONTRACTS_PER_LEVEL. Returns orders placed."""
-        cap = NUM_LEVELS * CONTRACTS_PER_LEVEL
+        cap = self.num_levels * self.contracts_per_level
         side_totals: Dict[Tuple[str, str], float] = {}
         level_totals: Dict[Tuple[str, str, int], float] = {}
         for o in resting:
@@ -1351,13 +1413,13 @@ class TouchMarketMaker:
                                    f"blocked at {have_side:.0f}/{cap} contracts",
                                    key=f"{q.ticker}-{q.book_side}", urgent=False)
                 continue
-            if have_level + q.count > CONTRACTS_PER_LEVEL + 0.01:
+            if have_level + q.count > self.contracts_per_level + 0.01:
                 log(f"{self.tag} ! level cap: NOT placing {q.book_side} {q.count}x "
                     f"@ {q.price_cents}c on {q.ticker} ({have_level:.0f} already at that "
-                    f"level, cap {CONTRACTS_PER_LEVEL})")
+                    f"level, cap {self.contracts_per_level})")
                 self.alerter.alert("level_cap", f"{q.ticker} {q.book_side}@{q.price_cents}c: "
                                    f"placement blocked at {have_level:.0f}/"
-                                   f"{CONTRACTS_PER_LEVEL} contracts",
+                                   f"{self.contracts_per_level} contracts",
                                    key=f"{q.ticker}-{q.price_cents}", urgent=False)
                 continue
             self.place_order(q, now_ts)
@@ -1373,7 +1435,7 @@ class TouchMarketMaker:
         d = self.cfg.direction
         price = f"${s.live_price:,.2f}" if s.live_price is not None else "?"
         sigma = f"{s.sigma_daily * 100:.1f}%/d" if s.sigma_daily else "?"
-        mtd = (f" MTD{'hi' if d == 'max' else 'lo'} ${s.mtd_extreme:,.2f}"
+        mtd = (f" {self.window_label}{'hi' if d == 'max' else 'lo'} ${s.mtd_extreme:,.2f}"
                if s.mtd_extreme is not None else "")
         alerts = self.alerter.today
         if alerts:
@@ -1393,6 +1455,22 @@ class TouchMarketMaker:
 
     # ---- main loop ----------------------------------------------------------
 
+    def startup_event_and_sweep(self) -> None:
+        """Resolve the event we're trading and clear any leftovers from a prior
+        run. Split out of run() so horizon variants (e.g. the weekly bot, whose
+        event ticker is DISCOVERED rather than computed) can reuse this loop
+        and its fail-safe machinery instead of forking it."""
+        self.state.event_ticker = event_ticker_for(self.cfg, datetime.now(timezone.utc))
+        if self.live:
+            # Clean slate: remove our orders from any prior run, incl. across rollover.
+            n = self.cancel_all_bot_orders(include_prev_month=True)
+            log(f"{self.tag} startup: cancelled {n} leftover bot orders")
+
+    def poll_interval(self) -> float:
+        """Seconds to sleep between cycles (before error backoff). Overridable:
+        the weekly bot idles slowly while no event is listed."""
+        return self.poll_secs
+
     def shutdown_cancel(self) -> None:
         """Idempotent final cancel — called from finally, signals, and atexit."""
         if self._shutdown_done or not self.live:
@@ -1407,17 +1485,13 @@ class TouchMarketMaker:
 
     def run(self, once: bool = False) -> None:
         mode = "LIVE" if self.live else "DRY RUN (no orders will be placed; use --live to trade)"
-        log(f"=== {MODEL_VERSION} run={RUN_ID} market={self.cfg.key} mode={mode} ===")
-        log(f"quoting: {NUM_LEVELS} levels x {CONTRACTS_PER_LEVEL} contracts, "
-            f"{QUOTE_OFFSET_CENTS}c off fair, {LEVEL_SPACING_CENTS}c apart, post-only, "
-            f"TTL {ORDER_TTL_SECS}s, per-market cap {MAX_POSITION_CONTRACTS:g}, "
-            f"event cap {MAX_EVENT_CONTRACTS:g}")
+        log(f"=== {self.model_version} run={RUN_ID} market={self.cfg.key} mode={mode} ===")
+        log(f"quoting: {self.num_levels} levels x {self.contracts_per_level} contracts, "
+            f"{self.quote_offset_cents}c off fair, {self.level_spacing_cents}c apart, post-only, "
+            f"TTL {ORDER_TTL_SECS}s, per-market cap {self.max_position:g}, "
+            f"event cap {self.max_event:g}")
 
-        self.state.event_ticker = event_ticker_for(self.cfg, datetime.now(timezone.utc))
-        if self.live:
-            # Clean slate: remove our orders from any prior run, incl. across rollover.
-            n = self.cancel_all_bot_orders(include_prev_month=True)
-            log(f"{self.tag} startup: cancelled {n} leftover bot orders")
+        self.startup_event_and_sweep()
 
         stopping = {"flag": False}
         prev_top: Optional[float] = None
@@ -1486,8 +1560,9 @@ class TouchMarketMaker:
                 self.write_status(now_utc)
                 if once or stopping["flag"]:
                     break
+                interval = self.poll_interval()
                 backoff = min(2 ** max(0, self.state.consecutive_errors - 1), 8)
-                time.sleep(POLL_SECS * backoff if self.state.consecutive_errors else POLL_SECS)
+                time.sleep(interval * backoff if self.state.consecutive_errors else interval)
         finally:
             self.shutdown_cancel()
             if not once:
@@ -1504,6 +1579,75 @@ class TouchMarketMaker:
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
+
+def acquire_singleton(market_key: str) -> bool:
+    """Refuse to start if another live process is already trading this market.
+
+    Duplicates are a real money risk: two bots on one market each keep their
+    own order ledger, so each places a full ladder and the per-side/level caps
+    (which only count what one process knows about) are silently doubled.
+    They became possible once the tasks got windowless VBS shims: killing a
+    task's wscript leaves the PowerShell launcher orphaned, and its restart
+    loop respawns a bot alongside the freshly started one (observed
+    2026-08-05: 24 processes for 16 markets).
+
+    Lock = a file holding the owner PID. A stale lock (process gone) is taken
+    over. Best-effort: any error here must not stop trading.
+    """
+    path = os.path.join(STATUS_DIR, f"lock_{market_key}.pid")
+    try:
+        os.makedirs(STATUS_DIR, exist_ok=True)
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    other = int((f.read() or "0").strip())
+            except (ValueError, OSError):
+                other = 0
+            # Require BOTH a live PID and a fresh heartbeat before standing
+            # aside. PIDs get reused on Windows, and a stale lock pointing at
+            # an unrelated python would otherwise park this market forever
+            # (the launcher would retry, re-read the same lock, exit again).
+            if (other and other != os.getpid() and _pid_alive(other)
+                    and _heartbeat_fresh(market_key)):
+                log(f"[{market_key}] another instance is live (pid {other}); exiting")
+                return False
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        atexit.register(lambda: _release_singleton(path))
+    except Exception as e:
+        log(f"[{market_key}] ! singleton lock unavailable ({e}); continuing")
+    return True
+
+
+def _heartbeat_fresh(market_key: str, max_age_secs: float = 180) -> bool:
+    """True if this market's status file was written very recently, i.e. some
+    process really is trading it right now."""
+    try:
+        path = os.path.join(STATUS_DIR, f"status_{market_key}.json")
+        return time.time() - os.path.getmtime(path) <= max_age_secs
+    except OSError:
+        return False
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is a running python process (Windows: tasklist filter)."""
+    try:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return "python" in out.lower()
+    except Exception:
+        return True   # can't tell -> assume alive (safe: we exit rather than double up)
+
+
+def _release_singleton(path: str) -> None:
+    try:
+        with open(path, encoding="utf-8") as f:      # close BEFORE removing:
+            owner = int((f.read() or "0").strip())   # Windows refuses to
+        if owner == os.getpid():                     # delete an open file
+            os.remove(path)
+    except Exception:
+        pass
+
 
 def build_client() -> ExchangeClient:
     # HTTP keep-alive (Jack 2026-07-20, following incentive_mm): a pooled TLS
@@ -1556,6 +1700,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         n = bot.cancel_all_bot_orders(include_prev_month=True)
         log(f"cancelled {n} real resting orders for {cfg.key} "
             f"(current + previous month events)")
+        return 0
+
+    # Only one live looping bot per market (see acquire_singleton). --once and
+    # the read-only/cancel paths above are exempt: they don't rest quotes.
+    if args.live and not args.once and not acquire_singleton(cfg.key):
         return 0
 
     bot = TouchMarketMaker(cfg, client, live=args.live)
