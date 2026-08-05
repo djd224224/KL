@@ -804,13 +804,49 @@ def capacity_rows(state, status, resting, pnl_today):
     return rows
 
 
+# Caps whose live value we can check against the launcher string. Verifying the
+# OUTCOME rather than the attempt matters: if anything imports incentive_mm
+# before _apply_launcher_env runs (its config is read at import), the env is
+# set but the constants are already frozen at defaults — and a note that just
+# counted parsed vars would cheerfully report "mirrored" over a $1,000 budget.
+_CAP_CHECKS = (("IMM_COLLATERAL_BUDGET", lambda: imm.COLLATERAL_BUDGET),
+               ("IMM_MAX_MARKETS", lambda: imm.MAX_MARKETS),
+               ("IMM_MAX_TOTAL_RESTING", lambda: imm.MAX_TOTAL_RESTING_ORDERS),
+               ("IMM_MAX_POSITION", lambda: imm.MAX_POSITION_CONTRACTS),
+               ("IMM_MAX_EVENT", lambda: imm.MAX_EVENT_CONTRACTS))
+
+
+def capacity_config_mismatches():
+    """[(var, launcher_value, in_effect)] where the live constant does NOT
+    match what the launcher sets. Empty = the section's ceilings are real."""
+    out = []
+    for var, getter in _CAP_CHECKS:
+        want = LAUNCHER_ENV.get(var)
+        if want is None:
+            continue
+        try:
+            if abs(float(want) - float(getter())) > 1e-6:
+                out.append((var, want, getter()))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def capacity_note():
-    """Loud when the launcher parse failed — see _apply_launcher_env."""
-    if LAUNCHER_ENV:
-        return ("caps mirrored from the live launcher ({} vars)"
-                .format(len(LAUNCHER_ENV)))
-    return ("!! caps are incentive_mm DEFAULTS — the launcher $ProbeEnv could "
-            "not be parsed, so these ceilings are NOT what the bot is running")
+    """Loud when the ceilings are not the bot's — see _apply_launcher_env."""
+    if not LAUNCHER_ENV:
+        return ("!! caps are incentive_mm DEFAULTS — the launcher $ProbeEnv "
+                "could not be parsed, so these ceilings are NOT what the bot "
+                "is running")
+    bad = capacity_config_mismatches()
+    if bad:
+        return ("!! caps do NOT match the launcher ({}) — incentive_mm was "
+                "imported before the env was applied, so these ceilings are "
+                "NOT what the bot is running".format(
+                    ", ".join(f"{v}: launcher {w}, in effect {g:g}"
+                              for v, w, g in bad)))
+    return ("caps mirrored from the live launcher ({} vars, {} verified)"
+            .format(len(LAUNCHER_ENV), len(_CAP_CHECKS)))
 
 
 def calibration_status():

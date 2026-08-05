@@ -250,22 +250,47 @@ class TestDigestCapacity(unittest.TestCase):
         halt = {r["label"]: r for r in rows}["Daily loss vs halt"]
         self.assertEqual(halt["actual"], 0.0)
 
-    def test_caps_come_from_the_live_launcher_not_defaults(self):
-        """The whole section is misleading on defaults ($1,000 budget /
-        35 events vs the live $50,000 / 75), so the mirror must have run."""
+    def test_launcher_env_parses(self):
         self.assertTrue(self.dg.LAUNCHER_ENV,
                         "launcher $ProbeEnv did not parse — caps would be wrong")
-        self.assertGreaterEqual(self.dg.imm.COLLATERAL_BUDGET, 20000)
-        self.assertGreaterEqual(self.dg.imm.MAX_MARKETS, 50)
-        self.assertIn("mirrored", self.dg.capacity_note())
+        self.assertIn("IMM_COLLATERAL_BUDGET", self.dg.LAUNCHER_ENV)
+
+    def test_note_reports_whether_the_caps_ACTUALLY_took_effect(self):
+        """The section is misleading on defaults ($1,000 budget / 35 events vs
+        the live $50,000 / 75). Counting parsed env vars is not enough: if
+        anything imported incentive_mm before the env was applied, the vars
+        parse fine and the constants stay at defaults. So the note is driven by
+        comparing the live constants to the launcher values."""
+        note = self.dg.capacity_note()
+        mismatches = self.dg.capacity_config_mismatches()
+        if mismatches:
+            # e.g. running after test_incentive_mm has already imported the
+            # module — the note MUST say so rather than claim "mirrored"
+            self.assertIn("do NOT match", note)
+            self.assertNotIn("verified", note)
+        else:
+            self.assertIn("verified", note)
+            self.assertGreaterEqual(self.dg.imm.COLLATERAL_BUDGET, 20000)
+            self.assertGreaterEqual(self.dg.imm.MAX_MARKETS, 50)
+
+    def test_mismatch_is_detected_not_papered_over(self):
+        saved = dict(self.dg.LAUNCHER_ENV)
+        try:
+            self.dg.LAUNCHER_ENV["IMM_COLLATERAL_BUDGET"] = "999999"
+            bad = self.dg.capacity_config_mismatches()
+            self.assertTrue(any(v == "IMM_COLLATERAL_BUDGET" for v, _w, _g in bad))
+            self.assertIn("do NOT match", self.dg.capacity_note())
+        finally:
+            self.dg.LAUNCHER_ENV.clear()
+            self.dg.LAUNCHER_ENV.update(saved)
 
     def test_note_shouts_when_the_mirror_fails(self):
-        saved = self.dg.LAUNCHER_ENV
+        saved = dict(self.dg.LAUNCHER_ENV)
         try:
-            self.dg.LAUNCHER_ENV = {}
+            self.dg.LAUNCHER_ENV.clear()
             self.assertIn("DEFAULTS", self.dg.capacity_note())
         finally:
-            self.dg.LAUNCHER_ENV = saved
+            self.dg.LAUNCHER_ENV.update(saved)
 
 
 if __name__ == "__main__":
