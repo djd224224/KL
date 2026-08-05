@@ -334,7 +334,12 @@ PAD_SLACK_CONTRACTS = _env_int("IMM_PAD_SLACK", 300)
 # the band never clips them, and stood-down markets never reach the pad
 # site. The candidate estimator models them too, else thin markets read
 # est=0 and die at the floor before a pad could ever rest.
-PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
+# GLOBAL RETIRED 2026-08-05 (Jack: "only pad on hourly TEMP markets"). Pads
+# are qualification depth for a side that cannot otherwise reach target; on
+# everything except temp the answer is now to stand down instead (see the
+# two-sided depth gate in the quote loop). Set IMM_PAD_TO_TARGET=1 to restore
+# the blanket behaviour.
+PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "0") == "1"
 
 
 # User decision 2026-07-12: Love Island mention pools are high incentive-per-minute
@@ -347,7 +352,10 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
         quote_all=True,
         hard_expiry_et=(21, 0),    # 9:00pm ET (episode start; user: quote until 9p)
         start_buffer_min=0,        # no pre-broadcast buffer — quote right up to 9pm
-        pad_to_target=True,
+        # pad_to_target dropped 2026-08-05 (Jack: "only pad on hourly TEMP
+        # markets"). This was an explicit 2026-07-12 choice for the family, so
+        # say the word to put it back — no KXLOVEISL event is live today, so
+        # the change is inert right now either way.
     ),
 }
 
@@ -387,6 +395,10 @@ for _s in os.environ.get(
             # regardless, and the default now says so.
             min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 1.00),
             atref_price_tol_ticks=_env_int("IMM_TEMP_ATREF_PRICE_TOL", 0),
+            # the ONE family that still pads (Jack 2026-08-05): an hourly
+            # strike's book is thin by nature and lives <1h, so standing down
+            # on a thin side would forfeit the richest pools in the feed
+            pad_to_target=True,
             fast_lane=os.environ.get("IMM_TEMP_FAST_LANE", "1") == "1")
 
 # Air-quality-index markets (user decision 2026-07-15). Series is KXAQICITY; the
@@ -3857,6 +3869,16 @@ class IncentiveMarketMaker:
         except Exception:
             return False
         yes_levels, no_levels = orderbook_levels(ob)
+        # Same two-sided depth gate the quote loop applies (Jack 2026-08-05).
+        # It has to be here as well or selection keeps RANKING markets the
+        # loop then refuses to quote — they would hold budget and an event
+        # slot while resting nothing, and read as a silent capacity leak.
+        if not series_pad_to_target(meta.series) and meta.target_size > 0:
+            if (sum(q for _px, q in yes_levels) < meta.target_size
+                    or sum(q for _px, q in no_levels) < meta.target_size):
+                meta.est_frac = meta.est_dollars_per_day = 0.0
+                meta.yield_per_contract = 0.0
+                return True          # readable, just worth nothing
         ext_b, ext_a = external_best(yes_levels, no_levels)
         rb, ra = ladder_reference_prices(yes_levels, no_levels, meta.target_size)
         # capped so hour x ref <= TOTAL_SIZE_MULT_CAP; consumers (side rooms,
@@ -4614,6 +4636,30 @@ class IncentiveMarketMaker:
             if not bid_in_band and not ask_in_band:
                 self.cancel_market_orders(t, resting)
                 continue
+            # TWO-SIDED DEPTH GATE (Jack 2026-08-05: "dont quote, and remove
+            # existing quotes, if either side has <1000 contracts"). A
+            # snapshot is EXCLUDED unless BOTH sides reach the program's
+            # target, so a book that cannot get there pays nothing however
+            # well we quote it — resting there is fill risk for zero rent.
+            # Padding series (hourly temp only, since 2026-08-05) are exempt:
+            # their pads ARE the mechanism for reaching target on a thin side.
+            #
+            # Depth is measured on the book AS FETCHED, which in live mode
+            # already contains our own resting orders — deliberately, because
+            # the exchange counts them too: a side we personally lift over the
+            # target does qualify and does earn. The cancel path is stable
+            # rather than flapping, since once our orders are gone the side is
+            # further from target, not closer.
+            if not series_pad_to_target(meta.series) and meta.target_size > 0:
+                depth_yes = sum(q for _px, q in yes_levels)
+                depth_no = sum(q for _px, q in no_levels)
+                if depth_yes < meta.target_size or depth_no < meta.target_size:
+                    n_cx = self.cancel_market_orders(t, resting)
+                    if n_cx:
+                        log(f"{self.tag} thin book {t}: yes {depth_yes:.0f} / "
+                            f"no {depth_no:.0f} vs target {meta.target_size:.0f}"
+                            f" — cancelled {n_cx}, standing down")
+                    continue
             # Deep-rung floor: on a HEALTHY book (both touches present and
             # in-band) rungs may follow the reference below 5c, down to
             # RUNG_DEEP_FLOOR (Jack 2026-08-03).

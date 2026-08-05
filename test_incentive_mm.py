@@ -389,6 +389,12 @@ class TestAtRefLadder(unittest.TestCase):
         self.assertEqual(qs[0].price_cents, 2)      # hard floor: never 1c
 
     def test_per_side_top_in_band(self):
+        # Padding is hourly-TEMP-only since 2026-08-05; this test's
+        # SUBJECT is the pad machinery, so enable it explicitly rather
+        # than relying on a default that no longer holds.
+        _pad = imm.PAD_TO_TARGET_GLOBAL
+        imm.PAD_TO_TARGET_GLOBAL = True
+        self.addCleanup(setattr, imm, 'PAD_TO_TARGET_GLOBAL', _pad)
         # Jack 2026-08-03 "Do 1": a wide live book (3c x 29c) stands down
         # only its out-of-band BID side; the ask keeps quoting and the bid
         # pad still qualifies the snapshot.
@@ -1401,9 +1407,11 @@ class TestDryRunCycle(unittest.TestCase):
         t = "KXGOOD-99DEC31-A"
         bot.run_cycle()
         self.assertIn(t, bot.state.selected)
+        # >= target on both sides so the two-sided depth gate (2026-08-05)
+        # is not what this test measures
         bot.client.books[t] = {"orderbook_fp": {
-            "yes_dollars": [["0.91", "500"]],
-            "no_dollars": [["0.08", "500"]]}}       # touch 91c / 92c
+            "yes_dollars": [["0.91", "1200"]],
+            "no_dollars": [["0.08", "1200"]]}}      # touch 91c / 92c
         bot.state.universe_at = time.time()
         bot.run_cycle()
         self.assertTrue(any(o["ticker"] == t
@@ -2559,29 +2567,45 @@ class TestStickySelection(unittest.TestCase):
         bot.restore_orphan_metas({t: -40.0})
         self.assertIn(t, bot.state.managed_extra)
 
-    def test_global_pad_qualifies_thin_side_in_estimator(self):
-        # Jack 2026-07-29: pads are global — the ESTIMATOR must model them
-        # on thin sides or the market reads est=0 and dies at the floor
-        # before the quote loop pads it.
+    def test_pads_qualify_a_thin_side_only_where_padding_is_ON(self):
+        # Jack 2026-07-29 made pads global so the ESTIMATOR would model them
+        # on thin sides; Jack 2026-08-05 restricted padding to hourly TEMP and
+        # made every other thin book a stand-down. Both halves asserted.
         import incentive_mm as _imm
-        self.assertTrue(_imm.PAD_TO_TARGET_GLOBAL)   # global default ON
+        self.assertFalse(_imm.PAD_TO_TARGET_GLOBAL)      # temp-only now
+        self.assertTrue(_imm.series_pad_to_target("KXTEMPAUSH"))
+        self.assertFalse(_imm.series_pad_to_target("KXGOOD"))
+        thin = {"orderbook_fp": {"yes_dollars": [["0.49", "300"]],
+                                 "no_dollars": [["0.49", "200"]]}}
+        t = "KXGOOD-99DEC31-A"
+
+        # padding ON -> pads modelled, thin sides qualify, market is worth something
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
-        t = "KXGOOD-99DEC31-A"
-        # thin both sides: 300 yes / 200 no vs target 1000 — without pads
-        # nobody qualifies and est would be 0
-        bot.client.books[t] = {"orderbook_fp": {
-            "yes_dollars": [["0.49", "300"]], "no_dollars": [["0.49", "200"]]}}
-        bot.run_cycle()
-        self.assertIn(t, bot.state.selected)
-        meta = bot.state.selected[t]
-        self.assertGreater(meta.est_frac, 0.0)       # padded sides qualify
-        # and the quote loop actually rests the pads
-        pads = [o for o in bot.state.sim_orders.values()
-                if o["yes_price"] in (_imm.PAD_BID_CENTS, _imm.PAD_ASK_CENTS)]
-        self.assertTrue(pads, "expected 1c/99c pad orders resting")
+        _pad = _imm.PAD_TO_TARGET_GLOBAL
+        _imm.PAD_TO_TARGET_GLOBAL = True
+        try:
+            bot.client.books[t] = json.loads(json.dumps(thin))
+            bot.run_cycle()
+            self.assertIn(t, bot.state.selected)
+            self.assertGreater(bot.state.selected[t].est_frac, 0.0)
+        finally:
+            _imm.PAD_TO_TARGET_GLOBAL = _pad
+
+        # padding OFF (the default) -> the depth gate stands the market down
+        _clean_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot2.client.books[t] = json.loads(json.dumps(thin))
+        bot2.run_cycle()
+        self.assertNotIn(t, bot2.state.selected)
 
     def test_pads_do_not_drain_event_room(self):
+        # Padding is hourly-TEMP-only since 2026-08-05; this test's
+        # SUBJECT is the pad machinery, so enable it explicitly rather
+        # than relying on a default that no longer holds.
+        _pad = imm.PAD_TO_TARGET_GLOBAL
+        imm.PAD_TO_TARGET_GLOBAL = True
+        self.addCleanup(setattr, imm, 'PAD_TO_TARGET_GLOBAL', _pad)
         # Live bug 2026-07-29 (TRUMPMENTIONB ask-only): bid-side pads on
         # thin strikes consumed event_room_buy, zeroing room for every
         # later sibling. Two thin markets, one event: BOTH must carry bids.
@@ -3186,6 +3210,12 @@ class TestLoveIslandCycle(unittest.TestCase):
         self.assertEqual(pads, [])
 
     def test_thin_bid_side_padded_at_1c(self):
+        # Padding is hourly-TEMP-only since 2026-08-05; this test's
+        # SUBJECT is the pad machinery, so enable it explicitly rather
+        # than relying on a default that no longer holds.
+        _pad = imm.PAD_TO_TARGET_GLOBAL
+        imm.PAD_TO_TARGET_GLOBAL = True
+        self.addCleanup(setattr, imm, 'PAD_TO_TARGET_GLOBAL', _pad)
         client, ev = self._client(n_markets=1, yes_depth="300", no_depth="1200")
         bot = IncentiveMarketMaker(client=client, live=False)
         self._use_resolver(bot)
@@ -3207,6 +3237,12 @@ class TestLoveIslandCycle(unittest.TestCase):
         self.assertEqual(sorted(o["remaining_count"] for o in near), [5, 5, 5])
 
     def test_both_sides_thin_padded(self):
+        # Padding is hourly-TEMP-only since 2026-08-05; this test's
+        # SUBJECT is the pad machinery, so enable it explicitly rather
+        # than relying on a default that no longer holds.
+        _pad = imm.PAD_TO_TARGET_GLOBAL
+        imm.PAD_TO_TARGET_GLOBAL = True
+        self.addCleanup(setattr, imm, 'PAD_TO_TARGET_GLOBAL', _pad)
         client, ev = self._client(n_markets=1, yes_depth="200", no_depth="200")
         bot = IncentiveMarketMaker(client=client, live=False)
         self._use_resolver(bot)
@@ -4305,6 +4341,117 @@ class TestRateBarScopedToNewEvents(unittest.TestCase):
         for est, proj in ((0.83, 3.4), (0.1, 0.2), (1.99, 4.99)):
             self.assertTrue(self._blocked("KXA-26X-1", "KXA-26X", set(), set(),
                                           est, proj))
+
+
+class TestTwoSidedDepthGate(unittest.TestCase):
+    """Jack 2026-08-05: "dont quote, and remove existing quotes, if either
+    side has <1000 contracts. only pad on hourly TEMP markets."
+
+    A snapshot is EXCLUDED unless both sides reach the program target, so a
+    book that cannot get there pays nothing however well it is quoted. Hourly
+    temp is exempt because its pads ARE the mechanism for reaching target."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def _bot(self, yes, no):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", str(yes)]],
+            "no_dollars": [["0.49", str(no)]]}}
+        return bot
+
+    def test_only_hourly_temp_pads(self):
+        self.assertFalse(imm.PAD_TO_TARGET_GLOBAL)
+        for s in ("KXTEMPAUSH", "KXTEMPCHIH", "KXTEMPDCH", "KXTEMPLAXH",
+                  "KXTEMPNYCH"):
+            self.assertTrue(imm.series_pad_to_target(s), s)
+        for s in ("KXGOOD", "KXUST7AM", "KXFSLR", "KXRAIN", "KXDIESELD",
+                  "KXLOVEISLMENTION", "KXEARNINGSMENTIONUBER"):
+            self.assertFalse(imm.series_pad_to_target(s), s)
+
+    def test_both_sides_deep_quotes_normally(self):
+        bot = self._bot(1200, 1200)
+        try:
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+            self.assertTrue(bot.state.sim_orders)
+        finally:
+            _clean_persist()
+
+    def test_one_thin_side_stands_the_market_down(self):
+        for yes, no in ((300, 1200), (1200, 300)):
+            bot = self._bot(yes, no)
+            try:
+                bot.run_cycle()
+                self.assertNotIn(self.T, bot.state.selected,
+                                 f"yes {yes} / no {no}")
+                self.assertFalse([o for o in bot.state.sim_orders.values()
+                                  if o["ticker"] == self.T])
+            finally:
+                _clean_persist()
+
+    def test_exactly_at_target_still_quotes(self):
+        bot = self._bot(1000, 1000)
+        try:
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            _clean_persist()
+
+    def test_existing_quotes_are_REMOVED_when_a_side_goes_thin(self):
+        """'remove existing quotes' — a market already quoting must be
+        cancelled, not merely left alone."""
+        bot = self._bot(1200, 1200)
+        try:
+            bot.run_cycle()
+            self.assertTrue([o for o in bot.state.sim_orders.values()
+                             if o["ticker"] == self.T])
+            bot.client.books[self.T] = {"orderbook_fp": {
+                "yes_dollars": [["0.49", "200"]],
+                "no_dollars": [["0.49", "1200"]]}}
+            bot.state.universe_at = time.time()      # keep it a member
+            bot.run_cycle()
+            self.assertFalse([o for o in bot.state.sim_orders.values()
+                              if o["ticker"] == self.T],
+                             "thin side must cancel the resting quotes")
+        finally:
+            _clean_persist()
+
+    def test_temp_is_exempt_and_pads_instead(self):
+        """A thin hourly-temp book keeps quoting — the pad lifts it to
+        target rather than standing it down."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        t = self.T
+        try:
+            bot.client.books[t] = {"orderbook_fp": {
+                "yes_dollars": [["0.49", "200"]],
+                "no_dollars": [["0.49", "200"]]}}
+            _pad = imm.PAD_TO_TARGET_GLOBAL
+            imm.PAD_TO_TARGET_GLOBAL = True          # stand in for a temp series
+            try:
+                bot.run_cycle()
+                self.assertIn(t, bot.state.selected)
+                pads = [o for o in bot.state.sim_orders.values()
+                        if o["ticker"] == t and o["yes_price"] in
+                        (imm.PAD_BID_CENTS, imm.PAD_ASK_CENTS)]
+                self.assertTrue(pads, "expected pad orders on the thin sides")
+            finally:
+                imm.PAD_TO_TARGET_GLOBAL = _pad
+        finally:
+            _clean_persist()
+
+    def test_estimator_agrees_with_the_quote_loop(self):
+        """The gate lives in BOTH places on purpose: if selection still ranked
+        a market the loop refuses to quote, it would hold budget and an event
+        slot while resting nothing."""
+        bot = self._bot(300, 1200)
+        try:
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            _clean_persist()
 
 
 class TestMemberMidBand(unittest.TestCase):
