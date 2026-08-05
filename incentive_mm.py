@@ -495,6 +495,43 @@ def pad_quantity(external_and_touch_depth: float, target: float) -> int:
     return min(n, PAD_MAX_CONTRACTS)
 
 
+def sides_can_qualify(series: str, target: float, depth_yes: float,
+                      depth_no: float, ext_bid: Optional[int],
+                      ext_ask: Optional[int]) -> Tuple[bool, bool]:
+    """(bid_side_ok, ask_side_ok) — can each side reach the reward target,
+    counting a pad ONLY where one will actually be placed?
+
+    Jack 2026-08-05: the depth gate originally asked "is this a padding
+    series?", which is not the same question. A series can pad in principle
+    and still get no pad on this book — pad_band_ok excludes an external mid
+    outside 5-90, the pad price must sit PAD_MIN_TICKS_BEHIND the touch, and
+    pad_quantity caps at PAD_MAX_CONTRACTS so a gap wider than the cap cannot
+    be closed. In every one of those cases the old test waved the market
+    through to quote into a book that can never qualify.
+
+    Mirrors the pad site's conditions exactly and is shared by the quote loop
+    and the candidate estimator, so the two cannot drift — the failure mode
+    that stranded the Treasuries when one rate-bar default was changed and
+    its twin was not."""
+    if target <= 0:
+        return True, True
+    pads = series_pad_to_target(series) and pad_band_ok(series, ext_bid, ext_ask)
+
+    def _ok(depth: float, is_bid: bool) -> bool:
+        if depth >= target:
+            return True
+        if not pads:
+            return False
+        if is_bid:
+            if ext_bid is None or ext_bid - PAD_BID_CENTS < PAD_MIN_TICKS_BEHIND:
+                return False
+        elif ext_ask is None or PAD_ASK_CENTS - ext_ask < PAD_MIN_TICKS_BEHIND:
+            return False
+        return depth + pad_quantity(depth, target) >= target
+
+    return _ok(depth_yes, True), _ok(depth_no, False)
+
+
 def series_override(series: str) -> Optional[SeriesOverride]:
     return SERIES_OVERRIDES.get(series)
 
@@ -3875,17 +3912,20 @@ class IncentiveMarketMaker:
         except Exception:
             return False
         yes_levels, no_levels = orderbook_levels(ob)
-        # Same two-sided depth gate the quote loop applies (Jack 2026-08-05).
+        ext_b, ext_a = external_best(yes_levels, no_levels)
+        # Same qualification gate the quote loop applies (Jack 2026-08-05).
         # It has to be here as well or selection keeps RANKING markets the
         # loop then refuses to quote — they would hold budget and an event
         # slot while resting nothing, and read as a silent capacity leak.
-        if not series_pad_to_target(meta.series) and meta.target_size > 0:
-            if (sum(q for _px, q in yes_levels) < meta.target_size
-                    or sum(q for _px, q in no_levels) < meta.target_size):
-                meta.est_frac = meta.est_dollars_per_day = 0.0
-                meta.yield_per_contract = 0.0
-                return True          # readable, just worth nothing
-        ext_b, ext_a = external_best(yes_levels, no_levels)
+        # Runs AFTER external_best because the pad conditions need the touch.
+        _bid_ok, _ask_ok = sides_can_qualify(
+            meta.series, meta.target_size,
+            sum(q for _px, q in yes_levels), sum(q for _px, q in no_levels),
+            ext_b, ext_a)
+        if not (_bid_ok and _ask_ok):
+            meta.est_frac = meta.est_dollars_per_day = 0.0
+            meta.yield_per_contract = 0.0
+            return True              # readable, just worth nothing
         rb, ra = ladder_reference_prices(yes_levels, no_levels, meta.target_size)
         # capped so hour x ref <= TOTAL_SIZE_MULT_CAP; consumers (side rooms,
         # collateral reservation) inherit the cap through these meta fields
@@ -4656,16 +4696,19 @@ class IncentiveMarketMaker:
             # target does qualify and does earn. The cancel path is stable
             # rather than flapping, since once our orders are gone the side is
             # further from target, not closer.
-            if not series_pad_to_target(meta.series) and meta.target_size > 0:
-                depth_yes = sum(q for _px, q in yes_levels)
-                depth_no = sum(q for _px, q in no_levels)
-                if depth_yes < meta.target_size or depth_no < meta.target_size:
-                    n_cx = self.cancel_market_orders(t, resting)
-                    if n_cx:
-                        log(f"{self.tag} thin book {t}: yes {depth_yes:.0f} / "
-                            f"no {depth_no:.0f} vs target {meta.target_size:.0f}"
-                            f" — cancelled {n_cx}, standing down")
-                    continue
+            depth_yes = sum(q for _px, q in yes_levels)
+            depth_no = sum(q for _px, q in no_levels)
+            bid_ok, ask_ok = sides_can_qualify(
+                meta.series, meta.target_size, depth_yes, depth_no,
+                ext_bid, ext_ask)
+            if not (bid_ok and ask_ok):
+                n_cx = self.cancel_market_orders(t, resting)
+                if n_cx:
+                    log(f"{self.tag} cannot qualify {t}: yes {depth_yes:.0f} / "
+                        f"no {depth_no:.0f} vs target {meta.target_size:.0f} "
+                        f"(pad reaches: bid={bid_ok} ask={ask_ok}) "
+                        f"— cancelled {n_cx}, standing down")
+                continue
             # Deep-rung floor: on a HEALTHY book (both touches present and
             # in-band) rungs may follow the reference below 5c, down to
             # RUNG_DEEP_FLOOR (Jack 2026-08-03).

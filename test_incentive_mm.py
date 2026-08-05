@@ -4480,6 +4480,74 @@ class TestTwoSidedDepthGate(unittest.TestCase):
             _clean_persist()
 
 
+class TestSidesCanQualify(unittest.TestCase):
+    """Jack 2026-08-05: the gate must ask whether a pad WILL BE PLACED, not
+    whether the series is the padding kind. A padding series still gets no pad
+    when the mid is outside the band, when the pad price is not far enough
+    behind the touch, or when the gap exceeds PAD_MAX_CONTRACTS — and the old
+    test waved all three through to quote into a book that cannot qualify."""
+
+    S = "KXGOOD"          # padding series (padding is global again)
+    TGT = 1000.0
+
+    def setUp(self):
+        self.assertTrue(imm.series_pad_to_target(self.S))
+
+    def q(self, dy, dn, eb=40, ea=44):
+        return imm.sides_can_qualify(self.S, self.TGT, dy, dn, eb, ea)
+
+    def test_deep_book_qualifies_without_any_pad(self):
+        self.assertEqual(self.q(1200, 1200), (True, True))
+
+    def test_thin_side_qualifies_when_a_pad_will_be_placed(self):
+        self.assertEqual(self.q(300, 1200), (True, True))
+        self.assertEqual(self.q(1200, 300), (True, True))
+
+    def test_mid_outside_the_band_gets_NO_pad_so_cannot_qualify(self):
+        # mid 96.5 -> pad_band_ok False. The old check called this a padding
+        # series and let it quote anyway.
+        self.assertFalse(imm.pad_band_ok(self.S, 96, 97))
+        self.assertEqual(imm.sides_can_qualify(self.S, self.TGT, 300, 1200,
+                                               96, 97), (False, True))
+
+    def test_pad_too_close_to_the_touch_cannot_qualify(self):
+        # a 2c touch leaves the 1c pad only 1 tick behind (< PAD_MIN_TICKS_BEHIND)
+        self.assertLess(2 - imm.PAD_BID_CENTS, imm.PAD_MIN_TICKS_BEHIND)
+        bid_ok, _ = imm.sides_can_qualify(self.S, self.TGT, 300, 1200, 2, 40)
+        self.assertFalse(bid_ok)
+
+    def test_gap_wider_than_the_pad_cap_cannot_qualify(self):
+        big = imm.PAD_MAX_CONTRACTS + 500.0
+        bid_ok, _ = imm.sides_can_qualify(self.S, big, 0, big, 40, 44)
+        self.assertFalse(bid_ok)
+        # ...but a gap the cap CAN close still qualifies
+        ok, _ = imm.sides_can_qualify(self.S, float(imm.PAD_MAX_CONTRACTS),
+                                      0, float(imm.PAD_MAX_CONTRACTS), 40, 44)
+        self.assertTrue(ok)
+
+    def test_non_padding_series_needs_real_depth(self):
+        old = imm.PAD_TO_TARGET_GLOBAL
+        imm.PAD_TO_TARGET_GLOBAL = False
+        try:
+            self.assertEqual(imm.sides_can_qualify("KXNOPAD", self.TGT,
+                                                   300, 1200, 40, 44),
+                             (False, True))
+            self.assertEqual(imm.sides_can_qualify("KXNOPAD", self.TGT,
+                                                   1200, 1200, 40, 44),
+                             (True, True))
+        finally:
+            imm.PAD_TO_TARGET_GLOBAL = old
+
+    def test_no_target_is_never_gated(self):
+        self.assertEqual(imm.sides_can_qualify(self.S, 0.0, 0, 0, 40, 44),
+                         (True, True))
+
+    def test_one_sided_book_cannot_qualify(self):
+        # pad_band_ok treats a missing touch as outside the band
+        self.assertEqual(imm.sides_can_qualify(self.S, self.TGT, 300, 1200,
+                                               None, 44)[0], False)
+
+
 class TestMemberMidBand(unittest.TestCase):
     """Jack 2026-08-05. member_price_band() widens a quoting market's
     PLACEMENT to 5-93, but _screen kept testing the MID against 5-90 for
