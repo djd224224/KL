@@ -1,7 +1,7 @@
 # Kalshi Crypto One-Touch Market-Maker Fleet — Handoff
 
 *Current as of 2026-08-05. Self-contained context for a new session. Owner: Jack (jackdu224@gmail.com).*
-*Repo: `C:\Users\jackd\Documents\KL` (github.com/djd224224/KL). Bot version v2.1.*
+*Repo: `C:\Users\jackd\Documents\KL` (github.com/djd224224/KL). Bot version v2.5.*
 
 ## What this is
 
@@ -27,8 +27,8 @@ the August events overnight with zero manual action.
 
 | File | Role |
 |---|---|
-| `crypto_touch_mm.py` | The bot (v2.1). One file: pricing, quoting, risk, alerts, status. |
-| `test_crypto_touch_mm.py` | 96 unit tests (`python -m unittest test_crypto_touch_mm`). |
+| `crypto_touch_mm.py` | The bot (v2.5). One file: pricing, quoting, risk, alerts, status. |
+| `test_crypto_touch_mm.py` | 102 unit tests (`python -m unittest test_crypto_touch_mm`). |
 | `run_crypto_touch_mm.ps1` | Launcher: `-Market X -PollSecs N`; 0–45s jitter; restarts the bot forever; logs to `run-logs\crypto-touch\{market}-{date}.log`. |
 | `run_crypto_touch_mm_hidden.vbs` | Windowless wrapper the tasks actually invoke (see Fleet ops). |
 | `run_digest_hidden.vbs`, `run_watchdog_hidden.vbs` | Same for the digest + watchdog tasks. |
@@ -46,18 +46,18 @@ within a few cents on majors; meme coins diverge (see guards).
 
 ## Quoting rules (accumulated user spec — all are hard requirements)
 
-- **5 levels × 10 contracts** per side, first level **5c off fair**, levels **exactly 2c apart**
+- **5 levels × 12 contracts** per side, first level **5c off fair**, levels **exactly 2c apart**
   (invariant: clamps move the ladder's *anchor*, never squeeze gaps). So bids sit at fair−5,
   −7, −9, −11, −13. Post-only, GTC + TTL.
 - **Join, don't lead**: a quote may at most *match* the best **external** level (book net of our
   own orders — `external_best()`); a side with no external quotes gets nothing. Never alone at
   the top of the book.
-- **Caps** (all enforced): ≤10 contracts per price level per market (hard invariant, `level_cap`
-  alert if hit); ≤50 contracts (5×10) resting per (market, side) — unconditional backstop in
-  `place_with_side_cap()`; **net ±267 per market per direction** (`CMM_MAX_POSITION`, position +
-  full ladder ≤ cap); **±1667 net per event** (`CMM_MAX_EVENT`, split across strikes
-  near-money-first). Sizing history: 3×10 → 3×5 → 3×8 (caps 128/800) → 3×10 → **5×10 with caps
-  scaled 50/24 → 267/1667** (2026-08-01).
+- **Caps** (all enforced): ≤12 contracts per price level per market (hard invariant, `level_cap`
+  alert if hit); ≤60 contracts (5×12) resting per (market, side) — unconditional backstop in
+  `place_with_side_cap()`; **net ±320 per market per direction** (`CMM_MAX_POSITION`, position +
+  full ladder ≤ cap); **±2000 net per event** (`CMM_MAX_EVENT`, split across strikes
+  near-money-first). Caps scale with ladder size; history: 3×8 → 128/800; 5×10 → 267/1667
+  (8/1); **5×12 → 320/2000** (8/5).
 - **Stand-down guards** (skip market, log, digest-note): month-to-date extreme crossed the
   strike; fair ≥97c (near touch); book bid ≥85c while fair ≤ bid−20c (suspected unseen touch —
   the one urgent alert); |fair − book mid| >30c on a two-sided book (model/market disagreement).
@@ -74,6 +74,11 @@ within a few cents on majors; meme coins diverge (see guards).
 - Cancel-confirm before place; blind-orderbook markets keep quotes ≤3 cycles then pull;
   SIGINT/SIGTERM/atexit/finally all cancel; startup sweeps orphans by `client_order_id` prefix
   `cmm-` (current + previous month events).
+- **One bot per market, enforced** (`acquire_singleton`): a live bot writes `lock_{MARKET}.pid`
+  in STATUS_DIR; a second instance exits rather than double-quoting (duplicates keep separate
+  ledgers, so per-side/level caps would silently double). A lock is honored only when the PID is
+  alive **and** the market's heartbeat is fresh — a stale lock after PID reuse would otherwise
+  park that market forever. `--once` and `--cancel-all` are exempt.
 - `python crypto_touch_mm.py --market SOL-MAX --cancel-all` = emergency flatten (always real).
 - Dry-run is the default everywhere; `--live` is explicit.
 
@@ -88,12 +93,16 @@ within a few cents on majors; meme coins diverge (see guards).
   spawn duplicate fleets. Process chain: `wscript ← powershell ← cmd ← python`.
 - **Deliberate pause** = `Disable-ScheduledTask` (the watchdog skips Disabled). Killing
   processes or plain `Stop-ScheduledTask` gets auto-revived within 15 min.
-- **Restart procedure** (do it exactly this way): stop tasks → kill bots **by the PIDs in
-  `status_*.json`** plus a structural sweep (python whose parent is cmd) → verify the python
-  count actually dropped → delete `__pycache__` → start tasks → **verify 16 Running AND banners
-  show the new version**. Command-line matching does NOT work from the agent shell
-  (`Win32_Process.CommandLine` returns null) — a cmdline-based kill silently matches nothing and
-  leaves the old fleet trading. This has caused two stale-code incidents.
+- **Restart procedure** (do it exactly this way): stop tasks → kill the **whole chain**
+  (`wscript` shims, the PowerShell launchers, `cmd`, `python` — skipping anything with a
+  `claude.exe` ancestor), looping a few passes → delete stale `lock_*.pid` and `__pycache__` →
+  start tasks → **verify ~16 bot pythons, 16 locks, and banners showing the new version**.
+  Two traps, both hit for real: (1) command-line matching does NOT work from the agent shell
+  (`Win32_Process.CommandLine` returns null), so cmdline-based kills silently match nothing and
+  leave the old fleet trading — two stale-code incidents; (2) killing only `python` leaves the
+  launcher's `while` loop alive and it **respawns a duplicate** ~30s later — 24 processes for 16
+  markets on 8/5, which the singleton lock now prevents. A count of 15 right after start is
+  usually a launcher mid-respawn; confirm with heartbeats, not the raw count.
 - A task stuck `Ready` with LastResult `0xC000013A` = queued-stop race → Unregister + Register
   + Start.
 - **Shared data cache** (`cache_*.json`): price 10s, hourly candles 240s, daily 3600s. Kraken
