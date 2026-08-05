@@ -23,6 +23,7 @@ back to HKCU\Environment (works under Task Scheduler's stripped env).
 """
 
 import argparse
+import ast
 import collections
 import csv
 import glob
@@ -43,6 +44,36 @@ def _env_from_registry(name: str) -> str:
         return ""
 
 
+LAUNCHER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "run_incentive_mm.ps1")
+
+
+def _apply_launcher_env() -> dict:
+    """Mirror the LIVE bot's config by parsing `set NAME=VALUE&&` pairs out of
+    the launcher's $ProbeEnv string. Must run BEFORE incentive_mm is imported —
+    its config is read at import time.
+
+    Required for the capacity section to mean anything: on defaults this
+    process sees a $1,000 budget and a 35-event cap, where the live bot runs
+    $50,000 and 75. Reporting headroom against the wrong ceiling is worse than
+    reporting none, so the section says so loudly when the parse comes back
+    empty. Same helper (and same gotcha) as imm_quote_gaps.py."""
+    applied = {}
+    try:
+        with open(LAUNCHER_PATH, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return applied
+    for chunk in re.findall(r'\$ProbeEnv\s*=\s*"(set .*?)"', text, re.S):
+        for name, val in re.findall(
+                r"set ([A-Za-z_][A-Za-z0-9_]*)=([^&]*)&&", chunk):
+            os.environ[name] = val
+            applied[name] = val
+    return applied
+
+
+LAUNCHER_ENV = _apply_launcher_env()
+
 for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
     if not os.environ.get(_v):
         _val = _env_from_registry(_v)
@@ -50,6 +81,7 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
             os.environ[_v] = _val
 
 # Import AFTER the env fixup so the module-level cred constants pick them up.
+import incentive_mm as imm                                          # noqa: E402
 from incentive_mm import (CT, ET, STATUS_DIR, Alerter, PnlTracker,  # noqa: E402
                           build_client, log, market_cents)
 
@@ -663,6 +695,124 @@ def health_line(status: dict, ss: dict) -> str:
     return line
 
 
+_UNIVERSE_RE = re.compile(
+    r"universe: (\d+) program markets -> (\d+) candidates -> (\d+) selected "
+    r"across (\d+)/(\d+) events.*?~\$(\d+), total ~\$(\d+) ladder collateral, "
+    r"\$(\d+) inventory reserve\); skips (\{.*\})")
+
+
+def last_universe_line():
+    """The SELECTION GATE's own view, parsed from the newest bot log.
+
+    This matters because the gate does not compare against deployed capital:
+    market_cost() reserves worst-case-ladder x 0.65 for every selected market,
+    forward-looking, and THAT total is what gets tested against the budget.
+    The live resting book reads lower, so a digest showing only resting
+    collateral would report headroom the bot does not believe it has. The
+    'budget' skip count is the direct answer to 'am I capped' — non-zero means
+    markets were refused for capital this cycle."""
+    try:
+        logs = sorted(glob.glob(os.path.join(STATUS_DIR, "incentive-mm-*.log")))
+        if not logs:
+            return None
+        with open(logs[-1], encoding="utf-8", errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 4_000_000))
+            tail = f.read()
+    except OSError:
+        return None
+    m = None
+    for m in _UNIVERSE_RE.finditer(tail):
+        pass
+    if not m:
+        return None
+    try:
+        skips = ast.literal_eval(m.group(9))
+    except (ValueError, SyntaxError):
+        skips = {}
+    return {"programs": int(m.group(1)), "candidates": int(m.group(2)),
+            "markets": int(m.group(3)), "events": int(m.group(4)),
+            "event_cap": int(m.group(5)), "ladder": float(m.group(7)),
+            "reserve": float(m.group(8)), "skips": skips}
+
+
+def capacity_rows(state, status, resting, pnl_today):
+    """[(label, actual, cap, unit, note)] — every governor that can stop the
+    bot quoting, with what it is actually running at (Jack 2026-08-04: "so I
+    know how close I am to getting capped").
+
+    Actuals come from the LIVE resting book and own positions rather than the
+    bot's internal counters, so this stays honest across restarts. Caps come
+    from the mirrored launcher env — see _apply_launcher_env."""
+    rows = []
+
+    def add(label, actual, cap, unit="", note=""):
+        rows.append({"label": label, "actual": actual, "cap": cap,
+                     "unit": unit, "note": note,
+                     "pct": (100.0 * actual / cap) if cap else None})
+
+    # --- the SELECTION GATE's own numbers, when the log gives them up ----
+    u = last_universe_line()
+    if u:
+        add("Events selected", u["events"], u["event_cap"],
+            note="the gate's own count; new events refused at the cap, "
+                 "members keep quoting")
+        add("Collateral reserved (gate)", u["ladder"] + u["reserve"],
+            imm.COLLATERAL_BUDGET, "$",
+            note="ladder ${:,.0f} + inventory reserve ${:,.0f} — reserved "
+                 "worst-case, NOT capital deployed".format(u["ladder"], u["reserve"]))
+        add("Candidate books", u["candidates"], imm.MAX_CANDIDATE_BOOKS)
+        nb = int(u["skips"].get("budget", 0) or 0)
+        rows.append({"label": "Markets refused for CAPITAL last cycle",
+                     "actual": nb, "cap": 0, "unit": "", "pct": None,
+                     "note": ("none — the budget is not binding" if not nb else
+                              "budget IS binding: {} market(s) skipped".format(nb))})
+    else:
+        add("Events quoted (live book)", resting.get("events", 0),
+            imm.MAX_MARKETS, note="gate numbers unavailable — parsed from the "
+                                  "live resting book instead")
+
+    # --- what is actually deployed, as a cross-check ---------------------
+    collat = resting.get("collateral", 0.0)
+    add("Collateral deployed (resting)", collat, imm.COLLATERAL_BUDGET, "$",
+        note="actual collateral locked by resting orders")
+
+    # --- order-count / universe governors --------------------------------
+    add("Resting orders", resting.get("orders", 0), imm.MAX_TOTAL_RESTING_ORDERS)
+
+    # --- position caps: report the WORST market / event, not the total ----
+    pos = {t: float(p) for t, p in (state.get("own_pos") or {}).items()
+           if abs(float(p)) > 0.5}
+    if pos:
+        wt, wv = max(pos.items(), key=lambda kv: abs(kv[1]) / max(
+            imm.series_max_position(kv[0].split("-")[0]), 1))
+        cap = imm.series_max_position(wt.split("-")[0])
+        add("Per-market position (worst)", abs(wv), cap, "cts", note=wt)
+        by_ev = {}
+        for t, p in pos.items():
+            by_ev["-".join(t.split("-")[:2])] = by_ev.get("-".join(t.split("-")[:2]), 0.0) + p
+        we, wev = max(by_ev.items(), key=lambda kv: abs(kv[1]) / max(
+            imm.event_cap_contracts(kv[0]), 1))
+        add("Per-event net (worst)", abs(wev), imm.event_cap_contracts(we),
+            "cts", note=we)
+
+    # --- the halts -------------------------------------------------------
+    if pnl_today is not None and imm.DAILY_LOSS_LIMIT:
+        add("Daily loss vs halt", max(-pnl_today, 0.0), imm.DAILY_LOSS_LIMIT, "$",
+            note="halt cancels everything until the next roll")
+    return rows
+
+
+def capacity_note():
+    """Loud when the launcher parse failed — see _apply_launcher_env."""
+    if LAUNCHER_ENV:
+        return ("caps mirrored from the live launcher ({} vars)"
+                .format(len(LAUNCHER_ENV)))
+    return ("!! caps are incentive_mm DEFAULTS — the launcher $ProbeEnv could "
+            "not be parsed, so these ceilings are NOT what the bot is running")
+
+
 def calibration_status():
     """(validated, unvalidated) family lists from reward_calibration.json.
 
@@ -818,6 +968,8 @@ def build_digest(now_utc: datetime):
                     ss["reward_lifetime"])
     series = daily_series(client, fills, mids, results, state)
     rows, tot, resting = event_rows(client)     # open book + resting quotes
+    cap_rows = capacity_rows(state, status, resting,
+                             _f(status.get("pnl_today")) if status else None)
 
     try:
         bal_str = "${:,.2f}".format(_f(client.get_balance().get("balance_dollars")))
@@ -879,6 +1031,22 @@ def build_digest(now_utc: datetime):
     L.append("  (REWARD is accrual-dated and does NOT line up with a credit "
              "date — Kalshi pays at each program's period end, 1-2 days later)")
     L.extend(_calibration_caveat_text())
+    L.append("")
+    L.append("")
+    L.append("CAPACITY — how close the bot is to each ceiling ({})".format(
+        capacity_note()))
+    L.append("{:34s} {:>12s} {:>12s} {:>7s}".format(
+        "GOVERNOR", "ACTUAL", "CAP", "USED"))
+    for r in cap_rows:
+        u = "{:.0f}%".format(r["pct"]) if r["pct"] is not None else "-"
+        fmt = "{:,.0f}" if r["unit"] != "$" else "{:,.2f}"
+        cap = fmt.format(r["cap"]) if r["pct"] is not None else "-"
+        L.append("{:34s} {:>12s} {:>12s} {:>7s}{}".format(
+            r["label"], fmt.format(r["actual"]), cap, u,
+            "  <== AT CAP" if (r["pct"] or 0) >= 95 else
+            ("  <- close" if (r["pct"] or 0) >= 80 else "")))
+        if r["note"]:
+            L.append("{:34s} {}".format("", r["note"]))
     L.append("")
     L.append("EVENTS TRADED IN THE PAST DAY ({})".format(len(ev_rows)))
     if ev_rows:
@@ -973,6 +1141,42 @@ def build_digest(now_utc: datetime):
              'Kalshi pays at each program\'s period end, 1&ndash;2 days later.'
              '</div>'.format(FILL_LOOKBACK_HOURS))
     h.append(_calibration_caveat_html())
+
+    h.append('<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
+             'Capacity &mdash; how close to each ceiling</div>')
+    h.append('<table style="border-collapse:collapse">')
+    h.append('<tr style="background:#f0f0f0;font-weight:600">'
+             '<td style="{0}">GOVERNOR</td><td style="{1}">ACTUAL</td>'
+             '<td style="{1}">CAP</td><td style="{1}">USED</td>'
+             '<td style="{0}"></td></tr>'.format(TDL, TD))
+    for i, r in enumerate(cap_rows):
+        pct = r["pct"] or 0
+        colour = "#c0392b" if pct >= 95 else ("#d9821b" if pct >= 80 else "#0a7a2f")
+        if r["pct"] is None:
+            colour = "#c0392b" if r["actual"] else "#777"
+        bar = min(int(pct), 100)
+        fmt = "{:,.0f}" if r["unit"] != "$" else "{:,.2f}"
+        h.append(
+            '<tr style="background:{bg}"><td style="{tdl}">{label}'
+            '{note}</td>'
+            '<td style="{td}">{act}</td><td style="{td}">{cap}</td>'
+            '<td style="{td};color:{col};font-weight:700">{pct}</td>'
+            '<td style="{tdl};width:120px">'
+            '<div style="background:#eee;height:9px;width:110px">'
+            '<div style="background:{col};height:9px;width:{bar}px"></div>'
+            '</div></td></tr>'.format(
+                bg="#fafafa" if i % 2 else "#fff", tdl=TDL, td=TD, col=colour,
+                label=r["label"],
+                note=('<div style="color:#999;font-size:11px">{}</div>'.format(
+                    r["note"]) if r["note"] else ""),
+                act=fmt.format(r["actual"]),
+                cap=fmt.format(r["cap"]) if r["pct"] is not None else "&mdash;",
+                pct="{:.0f}%".format(pct) if r["pct"] is not None else "&mdash;",
+                bar=int(bar * 1.1)))
+    h.append("</table>")
+    h.append('<div style="color:#888;font-size:12px;margin-top:4px">{}</div>'
+             .format(capacity_note()))
+
     h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
              'Events traded in the past day ({})</div>'.format(len(ev_rows)))
     if ev_rows:

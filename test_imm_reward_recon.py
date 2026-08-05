@@ -199,5 +199,74 @@ class TestDigestCreditWindows(unittest.TestCase):
         self.assertAlmostEqual(w["week"], 7.0)   # days -1..-7, not today
 
 
+class TestDigestCapacity(unittest.TestCase):
+    """Jack 2026-08-04: "add quoted events / total cap, and actuals vs any
+    other caps. so i know how close i am to getting capped"."""
+
+    def setUp(self):
+        import send_imm_digest as dg
+        self.dg = dg
+
+    UNIVERSE = (
+        "2026-08-05 00:53:41Z [IMM] universe: 4232 program markets -> 847 "
+        "candidates -> 495 selected across 43/75 events (0 forced quote-all "
+        "@ ~$8321, total ~$9412 ladder collateral, $5177 inventory reserve); "
+        "skips {'one_sided': 43, 'cutoff': 60, 'budget': 12}")
+
+    def test_parses_the_selection_gate_line(self):
+        import re
+        m = None
+        for m in self.dg._UNIVERSE_RE.finditer(self.UNIVERSE):
+            pass
+        self.assertIsNotNone(m, "universe line must parse")
+        self.assertEqual(int(m.group(2)), 847)      # candidates
+        self.assertEqual(int(m.group(4)), 43)       # events used
+        self.assertEqual(int(m.group(5)), 75)       # event cap
+        self.assertEqual(float(m.group(7)), 9412)   # ladder collateral
+        self.assertEqual(float(m.group(8)), 5177)   # inventory reserve
+
+    def test_percentages_and_flags(self):
+        rows = self.dg.capacity_rows(
+            {"own_pos": {"KXTEMPAUSH-26AUG0409-T79.99": -70.0}},
+            {}, {"events": 40, "orders": 979, "collateral": 12435.0}, -8.88)
+        by = {r["label"]: r for r in rows}
+        # the worst per-market position is reported against ITS series cap
+        pm = by["Per-market position (worst)"]
+        self.assertEqual(pm["actual"], 70.0)
+        self.assertEqual(pm["cap"], 50.0)           # KXTEMP cap, not the global 150
+        self.assertGreater(pm["pct"], 100)          # over cap -> flagged
+        self.assertIn("KXTEMPAUSH", pm["note"])
+
+    def test_a_loss_is_reported_against_the_halt_not_a_gain(self):
+        rows = self.dg.capacity_rows({}, {}, {"events": 1, "orders": 1,
+                                              "collateral": 0.0}, -600.0)
+        halt = {r["label"]: r for r in rows}["Daily loss vs halt"]
+        self.assertEqual(halt["actual"], 600.0)
+        self.assertAlmostEqual(halt["pct"], 50.0)
+
+    def test_a_profitable_day_shows_zero_against_the_halt(self):
+        rows = self.dg.capacity_rows({}, {}, {"events": 1, "orders": 1,
+                                              "collateral": 0.0}, +900.0)
+        halt = {r["label"]: r for r in rows}["Daily loss vs halt"]
+        self.assertEqual(halt["actual"], 0.0)
+
+    def test_caps_come_from_the_live_launcher_not_defaults(self):
+        """The whole section is misleading on defaults ($1,000 budget /
+        35 events vs the live $50,000 / 75), so the mirror must have run."""
+        self.assertTrue(self.dg.LAUNCHER_ENV,
+                        "launcher $ProbeEnv did not parse — caps would be wrong")
+        self.assertGreaterEqual(self.dg.imm.COLLATERAL_BUDGET, 20000)
+        self.assertGreaterEqual(self.dg.imm.MAX_MARKETS, 50)
+        self.assertIn("mirrored", self.dg.capacity_note())
+
+    def test_note_shouts_when_the_mirror_fails(self):
+        saved = self.dg.LAUNCHER_ENV
+        try:
+            self.dg.LAUNCHER_ENV = {}
+            self.assertIn("DEFAULTS", self.dg.capacity_note())
+        finally:
+            self.dg.LAUNCHER_ENV = saved
+
+
 if __name__ == "__main__":
     unittest.main()
