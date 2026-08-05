@@ -716,14 +716,23 @@ class TestAtRefDiffHysteresis(unittest.TestCase):
 
     def test_safe_join_clamps_tight_books(self):
         # Re-entry safety net (Jack 2026-08-02): tight spread -> rest >= 2
-        # ticks behind the touch even when the reference is AT the touch;
-        # 5+ tick spread is its own safety net -> normal at-ref placement.
+        # ticks behind the touch, BUT never past the reference (Jack
+        # 2026-08-05) — behind the reference scores zero, so the old
+        # unconditional 2-tick step made such markets unquotable rather than
+        # safe. 5+ tick spread is its own safety net -> normal at-ref.
         t = "KXBA-26AUGDELIV-T30"          # KXBA carries the re-entry override
-        # tight book: bid 50 / ask 53 (spread 3 < 5); ref at the touch
+        # tight book, ref AT the touch: the net would earn nothing, so we
+        # rest at the reference and take the diluted share instead
         (q,) = imm.build_side_ladder(t, "bid", 50, 53, 100, ref_px=50)
-        self.assertEqual(q.price_cents, 48)
+        self.assertEqual(q.price_cents, 50)
         (q,) = imm.build_side_ladder(t, "ask", 53, 50, 100, ref_px=53)
-        self.assertEqual(q.price_cents, 55)
+        self.assertEqual(q.price_cents, 53)
+        # tight book, ref 1 tick back: land on the reference, not anchor-2
+        (q,) = imm.build_side_ladder(t, "bid", 50, 53, 100, ref_px=49)
+        self.assertEqual(q.price_cents, 49)
+        # tight book, ref 2+ ticks back: the net binds exactly as before
+        (q,) = imm.build_side_ladder(t, "bid", 50, 53, 100, ref_px=48)
+        self.assertEqual(q.price_cents, 48)
         # wide book: bid 40 / ask 60 (spread 20 >= 5) -> at-ref untouched
         (q,) = imm.build_side_ladder(t, "bid", 40, 60, 100, ref_px=40)
         self.assertEqual(q.price_cents, 40)
@@ -4296,6 +4305,70 @@ class TestRateBarScopedToNewEvents(unittest.TestCase):
         for est, proj in ((0.83, 3.4), (0.1, 0.2), (1.99, 4.99)):
             self.assertTrue(self._blocked("KXA-26X-1", "KXA-26X", set(), set(),
                                           est, proj))
+
+
+class TestSafeJoinCappedAtReference(unittest.TestCase):
+    """Jack 2026-08-05. Under the amended rules only orders at or above the
+    REFERENCE score, so on a book whose touch level alone exceeds the target
+    the qualifying walk ends at the touch and standing two ticks behind it
+    earns exactly zero — safe-join and getting paid become mutually exclusive.
+    Capping safe-join at the reference keeps its full effect wherever the
+    reference sits behind the touch (the thin-touch case it was written for)
+    and stops exactly where it would only cost reward.
+
+    Measured live: KXFSLR-26OCTMWSOLD-4200 frac 0.00000 -> 0.01392,
+    KXHOOD-26NOVECVOL-12000000000 0.00000 -> 0.01861."""
+
+    SERIES = "KXFSLR"          # safe-join is on for the re-entry set
+
+    def setUp(self):
+        self.assertTrue(imm.series_safe_join(self.SERIES),
+                        "test assumes a safe-join series")
+        self._mode = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"
+
+    def tearDown(self):
+        imm.LADDER_MODE = self._mode
+
+    def _px(self, side, anchor, opposite, ref):
+        q = imm.build_side_ladder(f"{self.SERIES}-26OCTX-1", side, anchor,
+                                  opposite, room=100, levels=[(0, 20)],
+                                  ref_px=ref)
+        return q[0].price_cents if q else None
+
+    def test_reference_at_the_touch_is_not_pushed_behind(self):
+        # tight book (spread 4 < SAFE_JOIN_MIN_SPREAD) whose touch already
+        # exceeds target -> reference IS the touch
+        self.assertEqual(self._px("bid", 48, 52, 48), 48)
+        self.assertEqual(self._px("ask", 52, 48, 52), 52)
+
+    def test_safe_join_still_applies_when_the_reference_is_deeper(self):
+        # thin touch: reference sits 5 ticks back, safe-join's 2-tick cap is
+        # not the binding constraint and placement lands on the reference
+        self.assertEqual(self._px("bid", 48, 52, 43), 43)
+        self.assertEqual(self._px("ask", 52, 48, 57), 57)
+
+    def test_reference_one_tick_back_beats_the_two_tick_offset(self):
+        # would previously have rested at 46 (anchor-2), scoring nothing
+        # below the 47 reference
+        self.assertEqual(self._px("bid", 48, 52, 47), 47)
+        self.assertEqual(self._px("ask", 52, 48, 53), 53)
+
+    def test_wide_book_never_engaged_safe_join_at_all(self):
+        # spread 10 >= SAFE_JOIN_MIN_SPREAD -> no cap either way
+        self.assertEqual(self._px("bid", 45, 55, 45), 45)
+
+    def test_non_safe_join_series_unaffected(self):
+        self.assertFalse(imm.series_safe_join("KXTEMPDCH"))
+        q = imm.build_side_ladder("KXTEMPDCH-26AUG0512-T80.99", "bid", 48, 52,
+                                  room=100, levels=[(0, 20)], ref_px=48)
+        self.assertEqual(q[0].price_cents, 48)
+
+    def test_cap_never_makes_us_cross_the_opposite_touch(self):
+        """Post-only safety: the reference cap must not push a bid to or past
+        the ask (build_side_ladder pulls the anchor inside first)."""
+        px = self._px("bid", 51, 52, 60)      # absurd ref beyond the ask
+        self.assertLess(px, 52)
 
 
 class TestHopelessExitDipGuard(unittest.TestCase):

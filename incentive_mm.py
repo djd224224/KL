@@ -2182,6 +2182,26 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
             safe_cap = (max(anchor - SAFE_JOIN_OFFSET_TICKS, STICKY_PRICE_MIN)
                         if book_side == "bid"
                         else min(anchor + SAFE_JOIN_OFFSET_TICKS, STICKY_PRICE_MAX))
+            # ...but NEVER past the reference (Jack 2026-08-05). Under the
+            # amended rules only orders at or above the reference score, so on
+            # a book whose TOUCH LEVEL alone already exceeds the target the
+            # qualifying walk terminates at the touch and standing two ticks
+            # behind it earns exactly zero — safe-join and getting paid become
+            # mutually exclusive, and the market is unquotable by construction.
+            # Measured on KXFSLR-26OCTMWSOLD-4200 (touch 48x52, 1861 contracts
+            # at 48) and KXHOOD-26NOVECVOL-12000000000 (81x82, 844 at 81):
+            # frac 0.00000 two ticks behind vs 0.02744 / 0.03121 at the
+            # reference. Resting AT the reference still pays — the level's
+            # weight is just shared across more contracts, which is what that
+            # frac is.
+            #
+            # So safe-join is capped at the reference rather than dropped: it
+            # keeps its full effect wherever the reference sits behind the
+            # touch (a thin touch, the case it was written for) and stops
+            # exactly where it would only cost reward.
+            if ref_px is not None:
+                safe_cap = (max(safe_cap, ref_px) if book_side == "bid"
+                            else min(safe_cap, ref_px))
     # `band` (2026-08-02): caller-supplied effective band — the quote loop
     # passes the member-widened 2-98 for sticky markets; default = series.
     pmin, pmax = band if band is not None else (
