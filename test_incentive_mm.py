@@ -2572,9 +2572,9 @@ class TestStickySelection(unittest.TestCase):
         # on thin sides; Jack 2026-08-05 restricted padding to hourly TEMP and
         # made every other thin book a stand-down. Both halves asserted.
         import incentive_mm as _imm
-        self.assertFalse(_imm.PAD_TO_TARGET_GLOBAL)      # temp-only now
+        self.assertTrue(_imm.PAD_TO_TARGET_GLOBAL)       # global again
         self.assertTrue(_imm.series_pad_to_target("KXTEMPAUSH"))
-        self.assertFalse(_imm.series_pad_to_target("KXGOOD"))
+        self.assertTrue(_imm.series_pad_to_target("KXGOOD"))
         thin = {"orderbook_fp": {"yes_dollars": [["0.49", "300"]],
                                  "no_dollars": [["0.49", "200"]]}}
         t = "KXGOOD-99DEC31-A"
@@ -2592,12 +2592,16 @@ class TestStickySelection(unittest.TestCase):
         finally:
             _imm.PAD_TO_TARGET_GLOBAL = _pad
 
-        # padding OFF (the default) -> the depth gate stands the market down
+        # padding OFF -> the depth gate stands the market down instead
         _clean_persist()
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
-        bot2.client.books[t] = json.loads(json.dumps(thin))
-        bot2.run_cycle()
-        self.assertNotIn(t, bot2.state.selected)
+        _imm.PAD_TO_TARGET_GLOBAL = False
+        try:
+            bot2.client.books[t] = json.loads(json.dumps(thin))
+            bot2.run_cycle()
+            self.assertNotIn(t, bot2.state.selected)
+        finally:
+            _imm.PAD_TO_TARGET_GLOBAL = _pad
 
     def test_pads_do_not_drain_event_room(self):
         # Padding is hourly-TEMP-only since 2026-08-05; this test's
@@ -4353,6 +4357,16 @@ class TestTwoSidedDepthGate(unittest.TestCase):
 
     T = "KXGOOD-99DEC31-A"
 
+    def setUp(self):
+        # Padding went back to GLOBAL on 2026-08-05 ("turn pads back on for
+        # everything"), which makes this gate inert almost everywhere — a thin
+        # side gets padded to target instead of standing the market down. The
+        # gate is still live code and re-arms the moment padding is narrowed,
+        # so exercise it with padding off.
+        self._pad_default = imm.PAD_TO_TARGET_GLOBAL
+        imm.PAD_TO_TARGET_GLOBAL = False
+        self.addCleanup(setattr, imm, "PAD_TO_TARGET_GLOBAL", self._pad_default)
+
     def _bot(self, yes, no):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
@@ -4361,14 +4375,26 @@ class TestTwoSidedDepthGate(unittest.TestCase):
             "no_dollars": [["0.49", str(no)]]}}
         return bot
 
-    def test_only_hourly_temp_pads(self):
-        self.assertFalse(imm.PAD_TO_TARGET_GLOBAL)
-        for s in ("KXTEMPAUSH", "KXTEMPCHIH", "KXTEMPDCH", "KXTEMPLAXH",
-                  "KXTEMPNYCH"):
+    def test_padding_is_global_again(self):
+        """2026-08-05: temp-only -> global. The temp-only spell cost the
+        near-miss tail (DUOL/MELI strikes at 584-981 vs a 1000 target stood
+        down where a 20-420 contract pad would have qualified them)."""
+        self.assertTrue(self._pad_default, "global padding expected by default")
+        imm.PAD_TO_TARGET_GLOBAL = self._pad_default
+        for s in ("KXTEMPAUSH", "KXGOOD", "KXUST7AM", "KXFSLR", "KXRAIN",
+                  "KXDIESELD", "KXLOVEISLMENTION", "KXEARNINGSMENTIONUBER"):
             self.assertTrue(imm.series_pad_to_target(s), s)
-        for s in ("KXGOOD", "KXUST7AM", "KXFSLR", "KXRAIN", "KXDIESELD",
-                  "KXLOVEISLMENTION", "KXEARNINGSMENTIONUBER"):
-            self.assertFalse(imm.series_pad_to_target(s), s)
+
+    def test_gate_is_inert_while_padding_is_global(self):
+        """The safety property of the revert: with pads on, a thin side is
+        padded rather than stood down, so nothing is dropped by the gate."""
+        imm.PAD_TO_TARGET_GLOBAL = True
+        bot = self._bot(300, 1200)
+        try:
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            _clean_persist()
 
     def test_both_sides_deep_quotes_normally(self):
         bot = self._bot(1200, 1200)

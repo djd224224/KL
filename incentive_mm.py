@@ -334,12 +334,18 @@ PAD_SLACK_CONTRACTS = _env_int("IMM_PAD_SLACK", 300)
 # the band never clips them, and stood-down markets never reach the pad
 # site. The candidate estimator models them too, else thin markets read
 # est=0 and die at the floor before a pad could ever rest.
-# GLOBAL RETIRED 2026-08-05 (Jack: "only pad on hourly TEMP markets"). Pads
-# are qualification depth for a side that cannot otherwise reach target; on
-# everything except temp the answer is now to stand down instead (see the
-# two-sided depth gate in the quote loop). Set IMM_PAD_TO_TARGET=1 to restore
-# the blanket behaviour.
-PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "0") == "1"
+# GLOBAL again (Jack 2026-08-05, same day: "only pad on hourly TEMP markets"
+# -> "actually turn pads back on for everything"). The temp-only spell cost the
+# NEAR-MISS tail: DUOL/MELI earnings strikes sitting at 584-981 contracts
+# against a 1000 target stood down when a 20-420 contract pad at 1c would have
+# qualified them.
+#
+# NOTE THE INTERACTION: the two-sided depth gate in the quote loop is skipped
+# for any series that pads, so turning this back on makes that gate inert
+# almost everywhere — pads lift a thin side to target instead of the market
+# standing down. The gate stays in the code and re-arms the moment padding is
+# narrowed again.
+PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 
 
 # User decision 2026-07-12: Love Island mention pools are high incentive-per-minute
@@ -352,10 +358,10 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
         quote_all=True,
         hard_expiry_et=(21, 0),    # 9:00pm ET (episode start; user: quote until 9p)
         start_buffer_min=0,        # no pre-broadcast buffer — quote right up to 9pm
-        # pad_to_target dropped 2026-08-05 (Jack: "only pad on hourly TEMP
-        # markets"). This was an explicit 2026-07-12 choice for the family, so
-        # say the word to put it back — no KXLOVEISL event is live today, so
-        # the change is inert right now either way.
+        # restored 2026-08-05 with the global ("turn pads back on for
+        # everything"); explicit so the family keeps padding even if the
+        # global is ever narrowed again
+        pad_to_target=True,
     ),
 }
 
