@@ -1008,20 +1008,19 @@ class TestAllowlist(unittest.TestCase):
                   # diesel enrolled 2026-08-02 evening under re-entry guards
                   "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30"):
             self.assertTrue(a(t), t)
-        # Rate bar OFF across the re-entry set (Jack 2026-08-05 "recover the
-        # markets lost"): it was a horizon-blind risk proxy that permanently
-        # locked out long-window markets. The $1 payout floor is the measured
-        # economics gate; safe-join is the protection that actually matters
-        # and is kept. Generalises the 2026-08-03 KXDIESELW override.
-        for _s in ("KXDIESELD", "KXDIESELW", "KXAAAGASD", "KXUSGASCPI"):
-            self.assertEqual(imm.series_min_est_rate(_s), 0.0, _s)
+        # Rate bar KEPT (Jack 2026-08-05) but scoped to the first strike of
+        # an event the bot is not already working — see
+        # TestRateBarScopedToNewEvents.
+        for _s in ("KXDIESELD", "KXAAAGASD", "KXUSGASCPI"):
+            self.assertEqual(imm.series_min_est_rate(_s), 2.0, _s)
             self.assertTrue(imm.series_safe_join(_s), _s)
-            self.assertGreaterEqual(imm.series_min_est_total(_s),
-                                    imm.PAYOUT_FLOOR_DOLLARS, _s)
+        # KXDIESELW override (Jack 2026-08-03): rate bar off, safe-join kept
+        self.assertEqual(imm.series_min_est_rate("KXDIESELW"), 0.0)
+        self.assertTrue(imm.series_safe_join("KXDIESELW"))
         # KXSCFI: frozen 7/29, RE-ALLOWED 2026-08-02 with the re-entry
         # guards ($2/day rate floor + safe-join).
         self.assertTrue(a("KXSCFI-26DEC25-T1500"))
-        self.assertEqual(imm.series_min_est_rate("KXSCFI"), 0.0)
+        self.assertEqual(imm.series_min_est_rate("KXSCFI"), 2.0)
         # GPU rental family HARD-EXCLUDED (blocklisted, not merely absent) so
         # the daily auto-enroll can never pull it in
         b = IncentiveMarketMaker._blocked
@@ -2695,13 +2694,11 @@ class TestStickySelection(unittest.TestCase):
             imm.EVENT_START_OVERRIDES.pop("KXFOO-26AUG01", None)
         # 2026-08-02 (Jack) RE-ENTRY: company/econ freeze + no-new lifted;
         # they quote again behind the $2/day rate floor + safe-join rule.
-        # rate bar removed 2026-08-05 (see TestReentryRateBarRemoved);
-        # safe-join is what carries the re-entry guarantee now.
         for s in ("KXSCFI", "KXNHSALES", "KXBA", "KXHOOD", "KXAAAGASD",
                   "KXUSGASCPI"):
             self.assertNotIn(s, imm.NO_NEW_SERIES)
             self.assertNotIn(s, imm.FREEZE_SERIES)
-            self.assertEqual(imm.series_min_est_rate(s), 0.0)
+            self.assertEqual(imm.series_min_est_rate(s), 2.0)
             self.assertTrue(imm.series_safe_join(s))
         self.assertEqual(imm.series_min_est_rate("KXGOOD"), 0.0)
         self.assertFalse(imm.series_safe_join("KXTEMPDCH"))
@@ -4227,41 +4224,78 @@ class TestPayoutFloorAccounting(unittest.TestCase):
             _clean_persist()
 
 
-class TestReentryRateBarRemoved(unittest.TestCase):
-    """Jack 2026-08-05: "recover the markets lost". Every one of the 53 lost
-    markets across the seven affected events failed the $2/day re-entry rate
-    bar and NOTHING else, while clearing the $1.00 payout floor that actually
-    determines whether Kalshi pays."""
+class TestRateBarScopedToNewEvents(unittest.TestCase):
+    """Jack 2026-08-05: "i want sticky quoting when a market is already
+    quoted, unless it is hopeless. i do not want to open up new events that
+    otherwise weren't being quoted."
+
+    The rate bar is kept, but only gates the FIRST strike of an event the bot
+    is not already working. A sibling on an event we already hold is depth on
+    an exposure already taken; the first strike of an untouched event is a new
+    exposure. Dropping the bar outright did both — measured +122 markets
+    across +9 previously-excluded events, which is not what was asked for."""
 
     AFFECTED = ("KXUST7AM", "KXUST2AM", "KXUST10AM", "KXUST5AM", "KXUST30AM",
                 "KXFSLR", "KXHOOD")
 
-    def test_rate_bar_is_off_for_the_re_entry_set(self):
+    def test_the_bar_is_still_in_force(self):
         for s in self.AFFECTED:
-            self.assertEqual(imm.series_min_est_rate(s), 0.0, s)
+            self.assertEqual(imm.series_min_est_rate(s), 2.0, s)
 
-    def test_safe_join_is_kept(self):
-        """The rate bar was a risk proxy; safe-join is the actual
-        adverse-selection protection and must survive."""
+    def test_safe_join_and_the_payout_floor_are_intact(self):
         for s in self.AFFECTED:
             self.assertTrue(imm.series_safe_join(s), s)
-
-    def test_the_payout_floor_still_gates_them(self):
-        """Removing the rate bar must NOT remove the economics gate — a market
-        that cannot reach $1.00 over its life is still refused."""
-        for s in self.AFFECTED:
             self.assertGreaterEqual(imm.series_min_est_total(s),
                                     imm.PAYOUT_FLOOR_DOLLARS, s)
 
-    def test_env_can_restore_a_bar(self):
-        import dataclasses
-        ov = imm.SERIES_OVERRIDES["KXFSLR"]
-        try:
-            imm.SERIES_OVERRIDES["KXFSLR"] = dataclasses.replace(
-                ov, min_est_per_day=2.0)
-            self.assertEqual(imm.series_min_est_rate("KXFSLR"), 2.0)
-        finally:
-            imm.SERIES_OVERRIDES["KXFSLR"] = ov
+    def test_both_rate_bar_defaults_agree(self):
+        """The re-entry loop and the rates loop each carry their own default.
+        They diverged once (2026-08-05) and the Treasuries silently kept the
+        old bar, so assert they cannot drift apart again."""
+        self.assertEqual(imm.series_min_est_rate("KXAAAGASD"),
+                         imm.series_min_est_rate("KXUST2AD"))
+
+    # --- the gate itself, exercised as the selection loop evaluates it ------
+    @staticmethod
+    def _blocked(ticker, event, prev_selected, prev_events, est_per_day,
+                 projected):
+        """Mirror of the rate_floor branch in refresh_universe."""
+        return (ticker not in prev_selected
+                and event not in prev_events
+                and event not in imm.FORCE_EVENTS
+                and est_per_day < 2.0
+                and projected < imm.RATE_FLOOR_TOTAL_ALT)
+
+    def test_first_strike_of_an_untouched_event_is_blocked(self):
+        self.assertTrue(self._blocked(
+            "KXFSLR-26OCTX-1", "KXFSLR-26OCTX", set(), set(), 0.83, 3.4))
+
+    def test_sibling_of_an_already_quoted_event_is_admitted(self):
+        self.assertFalse(self._blocked(
+            "KXFSLR-26OCTX-2", "KXFSLR-26OCTX",
+            {"KXFSLR-26OCTX-1"}, {"KXFSLR-26OCTX"}, 0.83, 3.4))
+
+    def test_a_sticky_event_does_not_unlock_a_DIFFERENT_event(self):
+        """The leak that made the blanket change wrong."""
+        self.assertTrue(self._blocked(
+            "KXHOOD-26NOVY-1", "KXHOOD-26NOVY",
+            {"KXFSLR-26OCTX-1"}, {"KXFSLR-26OCTX"}, 0.96, 3.9))
+
+    def test_a_market_clearing_the_bar_still_opens_its_event(self):
+        self.assertFalse(self._blocked(
+            "KXNEW-26OCTZ-1", "KXNEW-26OCTZ", set(), set(), 9.0, 40.0))
+
+    def test_horizon_escape_still_opens_an_event_on_total_value(self):
+        self.assertFalse(self._blocked(
+            "KXNEW-26OCTZ-1", "KXNEW-26OCTZ", set(), set(), 0.5,
+            imm.RATE_FLOOR_TOTAL_ALT))
+
+    def test_with_no_sticky_the_clause_is_inert(self):
+        """prev_events empty => the added condition is always True => the gate
+        is byte-for-byte the old behaviour on a cold start."""
+        for est, proj in ((0.83, 3.4), (0.1, 0.2), (1.99, 4.99)):
+            self.assertTrue(self._blocked("KXA-26X-1", "KXA-26X", set(), set(),
+                                          est, proj))
 
 
 class TestHopelessExitDipGuard(unittest.TestCase):
@@ -4382,9 +4416,7 @@ class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
         joining the touch is the expensive way to be there."""
         for s in self.TENORS:
             self.assertTrue(imm.series_safe_join(s), s)
-            # rate bar removed 2026-08-05; safe-join + the $1 payout floor
-            # are what guard these now (see TestReentryRateBarRemoved)
-            self.assertEqual(imm.series_min_est_rate(s), 0.0, s)
+            self.assertEqual(imm.series_min_est_rate(s), 2.0, s)
             self.assertGreaterEqual(imm.series_min_est_total(s),
                                     imm.PAYOUT_FLOOR_DOLLARS, s)
 

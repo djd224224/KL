@@ -1070,7 +1070,7 @@ _REENTRY_SERIES = (
 for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
     if _s.strip() and _s.strip() not in SERIES_OVERRIDES:
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
-            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 0.0),
+            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
             safe_join=True)
 
 # KXDIESELW quoted as an OVERRIDE (Jack 2026-08-03): exempt from the $2/day
@@ -1091,11 +1091,10 @@ SERIES_OVERRIDES["KXDIESELW"] = SeriesOverride(
 for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
-            # 0.0 since 2026-08-05 — see the re-entry block above. This loop
-            # had its own copy of the 2.0 default, so changing it there alone
-            # left the Treasuries (the family the complaint was about) still
-            # locked out. One default, read from the same env var.
-            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 0.0),
+            # NOTE this loop keeps its own copy of the default — keep it in
+            # step with the re-entry block above, or a change there silently
+            # misses the Treasuries (that happened on 2026-08-05).
+            min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
             safe_join=True,
             event_day_cutoff_et=(
                 _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
@@ -3540,6 +3539,15 @@ class IncentiveMarketMaker:
         # restart stranded all in-flight accruals; observed 2026-07-21:
         # CHIH-2109-T75.99 quoted 12:04, dropped 12:06 after the task restart).
         prev_selected = set(self.state.selected) | self.state.sticky_prev
+        # Events the bot is ALREADY working. The rate bar below is scoped to
+        # these (Jack 2026-08-05: "i want sticky quoting when a market is
+        # already quoted, unless it is hopeless. i do not want to open up new
+        # events that otherwise weren't being quoted"): a sibling strike on an
+        # event we already hold is depth on an exposure we already took, but
+        # the first strike of an untouched event is a NEW exposure and still
+        # has to clear the bar. Dropping the bar outright did both — measured
+        # +122 markets across +9 previously-excluded events.
+        prev_events = {"-".join(t.split("-")[:2]) for t in prev_selected}
         screened: List[MarketMeta] = []
         skipped: Dict[str, int] = {}
         for meta in metas:
@@ -3645,6 +3653,7 @@ class IncentiveMarketMaker:
                 # windows overrides create).
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
             elif meta.ticker not in prev_selected \
+                    and meta.event_ticker not in prev_events \
                     and meta.event_ticker not in FORCE_EVENTS \
                     and meta.est_dollars_per_day < series_min_est_rate(meta.series) \
                     and (accrued + max(est_total, peak)) < RATE_FLOOR_TOTAL_ALT:
