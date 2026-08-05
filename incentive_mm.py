@@ -967,7 +967,17 @@ _DEFAULT_ENTERTAINMENT_SERIES = "KXRT"
 # (safe-join placement + the $2/day rate bar; their ~$102/day/market pools
 # clear that bar by two orders of magnitude, so it guards a dead book rather
 # than gating these).
-_DEFAULT_RATES_SERIES = "KXUST2AD,KXUST5AD,KXUST7AD,KXUST10AD,KXUST30AD"
+# MONTHLIES added 2026-08-04 (Jack: "also allowlist the treasury monthlies
+# like KXUST2AM"). Identical contract — "par yield above X on <date>", 3:30pm
+# ET close, same Treasury source — just settled ~4 weeks out instead of
+# tomorrow, so every rule below reads across unchanged. They are the better
+# COVERAGE story of the two: a monthly's program (e.g. Aug 3 -> Aug 8) sits
+# entirely inside its quotable window, where a daily's midnight/7:30 cutoff
+# still cedes the print day. Smaller pools ($19/day/market vs $102) over
+# 15 strikes x 5 tenors. The trade-off is inventory: these can be held for
+# weeks, so the per-market cap is what bounds them, not the clock.
+_DEFAULT_RATES_SERIES = ("KXUST2AD,KXUST5AD,KXUST7AD,KXUST10AD,KXUST30AD,"
+                         "KXUST2AM,KXUST5AM,KXUST7AM,KXUST10AM,KXUST30AM")
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)

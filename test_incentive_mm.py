@@ -4202,7 +4202,9 @@ class TestPayoutFloorAccounting(unittest.TestCase):
 class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
     """Jack 2026-08-04: allowlist the five daily Treasury-yield tenors."""
 
-    TENORS = ("KXUST2AD", "KXUST5AD", "KXUST7AD", "KXUST10AD", "KXUST30AD")
+    DAILIES = ("KXUST2AD", "KXUST5AD", "KXUST7AD", "KXUST10AD", "KXUST30AD")
+    MONTHLIES = ("KXUST2AM", "KXUST5AM", "KXUST7AM", "KXUST10AM", "KXUST30AM")
+    TENORS = DAILIES + MONTHLIES
 
     def setUp(self):
         # Other suites toggle these and don't always restore them; pin them so
@@ -4229,10 +4231,28 @@ class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
             self.assertTrue(imm.series_safe_join(s), s)
             self.assertGreater(imm.series_min_est_rate(s), 0.0, s)
 
-    def test_monthly_variants_are_not_swept_in(self):
-        # Jack named the AD (daily) tickers; KXUST*AM monthlies stay out, and
-        # exact-series matching means no prefix bleed.
-        for s in ("KXUST2AM", "KXUST10AM", "KXUST30AM"):
+    def test_monthlies_enrolled_too(self):
+        """Jack 2026-08-04, second pass: 'also allowlist the treasury
+        monthlies like KXUST2AM'. Same contract, ~4 weeks out."""
+        for s in self.MONTHLIES:
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(
+                imm.IncentiveMarketMaker._allowed(f"{s}-26AUG31-T4.25"), s)
+
+    def test_monthlies_carry_the_same_cutoff_and_guards(self):
+        """The monthly settles on the same 3:30pm ET snapshot, so the 7:30am
+        event-day rule reads across — it just does not bite until month end."""
+        for s in self.MONTHLIES:
+            self.assertTrue(imm.series_safe_join(s), s)
+            self.assertEqual(
+                self._cutoff(s, f"{s}-26AUG31",
+                             close=self._et(31, 15, 30)),
+                "2026-08-31 07:30", s)
+
+    def test_no_prefix_bleed_onto_unenrolled_ust_shapes(self):
+        # exact-series matching: a hypothetical weekly must not ride in on the
+        # KXUST prefix just because the dailies and monthlies are enrolled
+        for s in ("KXUST2AW", "KXUST3AD", "KXUSTFOO"):
             self.assertNotIn(s, imm.ALLOW_SERIES, s)
             self.assertFalse(
                 imm.IncentiveMarketMaker._allowed(f"{s}-26AUG31-T4.25"), s)
