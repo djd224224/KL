@@ -119,7 +119,17 @@ if ($Probe) {
     # not cash: account cash was $9,470 when this was raised, so past ~$10k the
     # real governor is Kalshi rejecting orders for insufficient balance, with
     # IMM_BALANCE_DROP_HALT=5000 and the daily-loss halt underneath.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=KXTRUMPMENTION-26AUG05&& set IMM_BLOCKLIST=KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=75&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
+    # KXTRUMPMENTION BLOCKED 2026-08-05 (Jack "block KXTRUMPMENTION markets").
+    # Blocklist = FROZEN: zero new orders, existing resting quotes cancelled on
+    # the next cycle, positions ride to settlement. At the time of blocking the
+    # bot held 33 markets / 1,025 contracts (net -618 on KXTRUMPMENTION-26AUG05,
+    # which settles 4:30pm ET today) and had 49 resting orders / 848 contracts.
+    # PREFIX match, so KXTRUMPMENTIONB is caught too — narrow to an exact
+    # series list if only the base family is meant.
+    # IMM_FORCE_EVENTS emptied in the same edit: it held KXTRUMPMENTION-26AUG05
+    # (the Aug 18 program-period data bug), which the block makes moot — and a
+    # force entry for a blocked series reads like a contradiction later.
+    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXTRUMPMENTION,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=75&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
 }
 
 while ($true) {
