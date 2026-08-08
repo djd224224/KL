@@ -278,9 +278,24 @@ class ExchangeClient(KalshiClient):
         dictr = self.get(market_url)
         return dictr
 
-    def get_event(self, 
+    def get_event(self,
                     event_ticker:str):
         dictr = self.get(self.events_url+'/'+event_ticker)
+        return dictr
+
+    def get_events(self,
+                    limit:Optional[int]=None,
+                    cursor:Optional[str]=None,
+                    status:Optional[str]=None,
+                    series_ticker:Optional[str]=None,
+                    ):
+        # Returns a series' events newest-first. Used by the weekly one-touch
+        # bot, whose event tickers are DISCOVERED rather than computed, to
+        # sweep orphaned orders on recently-rolled events.
+        # (with_nested_markets is deliberately omitted: it is a lowercase-bool
+        # query param and query_generation would stringify Python's True.)
+        query_string = self.query_generation(params={k: v for k,v in locals().items()})
+        dictr = self.get(self.events_url+query_string)
         return dictr
 
     def get_series(self, 

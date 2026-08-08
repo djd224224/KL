@@ -1,10 +1,14 @@
 ' Fleet watchdog with NO console flash (runs every 15 min): starts any
-' "KL crypto_touch_mm *-M*" task sitting in Ready (= bot died / was closed).
+' crypto bot task sitting in Ready (= bot died / was closed). Covers the
+' monthly one-touch fleet ("KL crypto_touch_mm *-M*") AND the above/below
+' fleet ("KL crypto_updown_mm *") — the updown pilot died 2026-08-05 with no
+' watchdog coverage and stayed dead for 3 days. -ErrorAction keeps the
+' monthly sweep working even when no updown tasks are registered yet.
 ' Disabled tasks are untouched — Disable-ScheduledTask is the deliberate
 ' pause switch.
 Dim sh
 Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell.exe -NoProfile -Command ""Get-ScheduledTask -TaskName 'KL crypto_touch_mm *-M*' | Where-Object State -eq 'Ready' | Start-ScheduledTask""", 0, True
+sh.Run "powershell.exe -NoProfile -Command ""Get-ScheduledTask -TaskName 'KL crypto_touch_mm *-M*','KL crypto_updown_mm *' -ErrorAction SilentlyContinue | Where-Object State -eq 'Ready' | Start-ScheduledTask""", 0, True
 
 ' KL incentive_mm (added 2026-08-05, Jack "turn on automatic recovery for
 ' IMM"). It was NOT covered here, and that is what turned a python crash at

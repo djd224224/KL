@@ -197,7 +197,25 @@ tests pass untouched — but the extraction means a future fix to `run_cycle` be
 **LIVE PILOT (armed 2026-08-05, weekly tenor, all assets).** Settings per Jack: `--cadence
 weekly`, ladder **3 x 1**, **3c off fair**, 2c apart, band **10-90c**, **8 markets/event**.
 The offset went 5c -> 3c after the first live cycles showed us resting 5-6c behind a ~2c-wide
-book — at 5c we would essentially never have filled. That bounds
+book — at 5c we would essentially never have filled.
+
+**INCIDENT 2026-08-05 -> 08-08: the whole updown fleet died and stayed dead 3 days.** The seven
+bots were launched fire-and-forget (`Start-Process wscript`), NOT as scheduled tasks, and the
+watchdog filter only covered `KL crypto_touch_mm *-M*`. At 12:57:57Z on 8/5 all seven pythons
+exited code -1 simultaneously (launchers respawned them); ~2 min later the entire chains died
+mid-write — an external kill sweep, consistent with the monthly fleet's restart procedure,
+whose structural sweep kills ANY python whose parent is cmd (the updown bots match). Nothing
+restarted them, the 8/7 weekly settled unquoted, and the 8/14 weekly listed with nobody on it.
+TTL cleaned the book (0 orphans); the settled weekly had **zero fills** in ~14h of quoting, so
+nothing was lost — but auto-roll only works if the process is alive. Fixes: the watchdog now
+also sweeps `KL crypto_updown_mm *` (run_watchdog_hidden.vbs), and the fleet must be run as
+**registered scheduled tasks**, never bare Start-Process. Note for the restart procedure: the
+structural python sweep WILL kill updown bots too — with tasks + watchdog they come back
+within 15 min, but expect it. Registration is one elevated double-click:
+`register_updown_tasks.bat` (idempotent; UAC-elevates itself, registers all 7 at-logon tasks
+and starts them).
+
+The 3x1 ladder bounds
 resting size at 3 contracts per market per side — 48 contracts per asset if every level on both
 sides filled (~$25/side at mid). The 40/200/400 caps are non-binding backstops at this size;
 **the ladder is the pilot control — scale it and revisit the caps together.** Kill switch:
