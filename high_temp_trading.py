@@ -1656,10 +1656,12 @@ max_contracts1 = 100
 # Filled cash comes from the bot's OWN fills via the fills API — deliberately
 # independent of the get_positions/get_orders read path, which has silently
 # broken twice (6/18 legacy-endpoint 410, 6/18–7/2 _fp field rename). In the
-# healthy post-7/2 regime a $100 cap never bound (contract caps bind first at
-# typical 40–60c entries); it exists to stop the next June-style oversize
-# (28 markets >150ct = 64% of the June −$1,732). Set <= 0 to disable.
-MARKET_CASH_CAP_DOLLARS = float(os.environ.get("MARKET_CASH_CAP_DOLLARS", "100"))
+# healthy post-7/2 regime even a $100 cap never bound (contract caps bind
+# first at typical 40–60c entries); it exists to stop the next June-style
+# oversize (28 markets >150ct = 64% of the June −$1,732). Default raised
+# 100 → 125 on 2026-08-09 (Jack) for extra headroom on tilted/night
+# ladders in 150-cap cities. Set <= 0 to disable.
+MARKET_CASH_CAP_DOLLARS = float(os.environ.get("MARKET_CASH_CAP_DOLLARS", "125"))
 
 # 61–80c NO entry band size tilt. Aug 2026 fill-level analysis: entries in
 # this band earned +9.86c/contract (win 0.749 vs 0.650 breakeven, 15.2% ROI)
