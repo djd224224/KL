@@ -36,15 +36,15 @@ jobs:
         GOOGLE_APPLICATION_CREDENTIALS: google_credentials.json
         # ================================================================
         # A/B test: hi_no tied to fair NO (see d80fd4e, analysis/kxhigh/sql/90_ab_hi_no_report.sql)
-        # Ramp knobs — change values here to advance through the rollout:
-        #   Phase 1 (shadow, current):  ENABLED=true, PROPORTION=0.0
-        #     100% control, but arm assignment is logged to BQ orders for
-        #     infra validation. No actual trading change.
-        #   Phase 2 (20%): PROPORTION=0.2
-        #   Phase 3 (50%): PROPORTION=0.5
-        #   Kill switch:   ENABLED=false (reverts instantly, no redeploy)
+        # KILLED 2026-08-09 after 1,290 settled markets: no significant
+        # treatment edge in any window or robustness cut (headline p≈0.88),
+        # the designed bucket-4 mechanism never materialized, and the only
+        # significant arm effect was treatment CUTTING fill participation
+        # 30.7%→26.3% (p=0.001). 100% control = static per-city hi_no.
+        # Machinery kept — re-enable here only with a pre-registered MDE
+        # and stop date.
         # ================================================================
-        AB_TEST_ENABLED: "true"
+        AB_TEST_ENABLED: "false"
         AB_TREATMENT_PROPORTION: "0.5"
         AB_SAFETY_MARGIN_CENTS: "3"
       run: |

@@ -1514,6 +1514,41 @@ def fetch_all_orders(ticker, max_pages=10):
               f"resting exposure may be undercounted")
     return orders
 
+
+def fetch_market_filled_cash(ticker, max_pages=10):
+    """Net buy cost in dollars of this account's fills on `ticker`, straight
+    from the fills API (raw `count_fp` / `*_price_dollars` string fields, with
+    a fallback to the normalized integer-cent fields if those ever appear
+    here). Sells (which this bot never places) would net out. Returns
+    (cash_dollars, complete) — `complete` is False when pagination was cut
+    short, in which case the value is a floor and callers must fail closed."""
+    cash = 0.0
+    cursor = None
+    for _ in range(max_pages):
+        resp = exchange_client.get_fills(ticker=ticker, limit=200, cursor=cursor)
+        if not isinstance(resp, dict):
+            return cash, False
+        for f in resp.get('fills') or []:
+            try:
+                cnt = float(f.get('count_fp') or f.get('count') or 0)
+                side = (f.get('side') or '').lower()
+                px_key = 'no_price_dollars' if side == 'no' else 'yes_price_dollars'
+                px_raw = f.get(px_key)
+                if px_raw is not None and str(px_raw) != '':
+                    px = float(px_raw)
+                else:
+                    px = float(f.get('no_price' if side == 'no' else 'yes_price') or 0) / 100.0
+                cost = px * cnt
+                if (f.get('action') or '').lower() == 'sell':
+                    cost = -cost
+                cash += cost
+            except (TypeError, ValueError):
+                continue
+        cursor = resp.get('cursor') or None
+        if not cursor:
+            return cash, True
+    return cash, False  # page cap hit — undercounted
+
 ####### DELETE EXISTING ORDERS
 
 for market_ticker in combined_table['market_ticker']:
@@ -1615,6 +1650,27 @@ CITY_MIN_NO_PRICE = {
 max_contracts = 100
 max_contracts1 = 100
 
+# Per-market cash cap in dollars: cumulative buy cost (= max loss for this
+# NO-only hold-to-settlement book) on a market may never exceed this, counting
+# fills already landed PLUS the potential cost of orders placed this run.
+# Filled cash comes from the bot's OWN fills via the fills API — deliberately
+# independent of the get_positions/get_orders read path, which has silently
+# broken twice (6/18 legacy-endpoint 410, 6/18–7/2 _fp field rename). In the
+# healthy post-7/2 regime a $100 cap never bound (contract caps bind first at
+# typical 40–60c entries); it exists to stop the next June-style oversize
+# (28 markets >150ct = 64% of the June −$1,732). Set <= 0 to disable.
+MARKET_CASH_CAP_DOLLARS = float(os.environ.get("MARKET_CASH_CAP_DOLLARS", "100"))
+
+# 61–80c NO entry band size tilt. Aug 2026 fill-level analysis: entries in
+# this band earned +9.86c/contract (win 0.749 vs 0.650 breakeven, 15.2% ROI)
+# vs +0.45c/contract for the 41–60c workhorse that carries 82% of volume.
+# Rungs land here mainly on tail markets whose dynamic hi_no (prev-day bid
+# − 15c) sits above 61c. Capacity at these prices is unproven — scale the
+# multiplier gradually via env. 1.0 disables the tilt.
+BAND_TILT_LO_CENTS = int(os.environ.get("BAND_TILT_LO_CENTS", "61"))
+BAND_TILT_HI_CENTS = int(os.environ.get("BAND_TILT_HI_CENTS", "80"))
+BAND_TILT_MULT = float(os.environ.get("BAND_TILT_MULT", "1.5"))
+
 # Per-city max contracts override — cities listed here can carry a larger cap
 # than the global max_contracts. Cities not listed default to max_contracts.
 CITY_MAX_CONTRACTS = {
@@ -1672,13 +1728,14 @@ def get_unix_time_for_tomorrow(hour: int, minute: int, timezone: str = 'US/Centr
 # env var AB_TEST_ENABLED=true.
 # ====================================================================
 AB_TEST_NAME = "hi_no_tied_to_fair_no_v2"   # v2: per-market sticky (was per-market-run)
-# Defaults match the production workflow's env block. They were previously
-# the OLD ("false"/"5") values, which meant a manual local invocation of
-# this script with no env block silently disabled the test and tagged
-# every order as `control` — see the 2026-04-30 12:42 UTC contamination
-# that broke sticky assignment on 16 markets. Aligning defaults with the
-# workflow makes a missing env block keep the test running, not opt out.
-AB_TEST_ENABLED = os.environ.get("AB_TEST_ENABLED", "true").lower() == "true"
+# Defaults match the production workflow's env block (alignment principle
+# from the 2026-04-30 contamination: a missing env block must reproduce
+# production behavior, not silently flip the test). Test KILLED 2026-08-09
+# — no significant treatment edge after 1,290 settled markets and a
+# measured participation cost (30.7%→26.3% fill conversion, p=0.001) —
+# so production AND the default here are both "false" (100% control,
+# static per-city hi_no).
+AB_TEST_ENABLED = os.environ.get("AB_TEST_ENABLED", "false").lower() == "true"
 AB_SAFETY_MARGIN_CENTS = int(os.environ.get("AB_SAFETY_MARGIN_CENTS", "3"))
 AB_TREATMENT_PROPORTION = float(os.environ.get("AB_TREATMENT_PROPORTION", "0.5"))
 
@@ -1825,6 +1882,27 @@ for index, row in combined_table.iterrows():
   if no_offer == '' or no_bid == '':
     print(f"    SKIP: no orderbook data")
     continue
+
+  # Filter 4: per-market cash cap — fills-derived, independent of the
+  # position/order read path (see MARKET_CASH_CAP_DOLLARS above). Fail
+  # closed like the pre-placement cap check: an incomplete or failed fills
+  # read skips the market rather than risking an uncapped ladder.
+  _filled_cash = 0.0
+  if MARKET_CASH_CAP_DOLLARS > 0:
+    try:
+      _filled_cash, _fc_complete = fetch_market_filled_cash(ticker)
+      if not _fc_complete:
+        raise RuntimeError("fills pagination incomplete")
+    except Exception as _fe:
+      alert("CASH_CAP_CHECK_FAILED",
+            f"Fills read failed on {ticker}; skipping market (fail closed)",
+            {"error": str(_fe)[:200]})
+      print(f"    SKIP: cash-cap fills read failed (fail closed)")
+      continue
+    if _filled_cash >= MARKET_CASH_CAP_DOLLARS:
+      print(f"    SKIP: cash cap — ${_filled_cash:.2f} already filled >= "
+            f"${MARKET_CASH_CAP_DOLLARS:.0f}/market cap")
+      continue
 
   # ==================================================================
   # A/B assignment for this (market_ticker, run_date).
@@ -2034,13 +2112,17 @@ for index, row in combined_table.iterrows():
                 ("hour<5 CT" if central_time.hour < 5 else "daytime"))
   print(f"    Sizing:     base={starting_contracts} × night={night_size_mult:g}x "
         f"({_nm_reason}) × city={_city_mult:g}x ({row['City']})")
-  print(f"                ladder size: {_base_size} contracts (flat across all rungs; "
+  print(f"                ladder size: {_base_size} contracts (flat across rungs; "
+        f"×{BAND_TILT_MULT:g} on rungs in {BAND_TILT_LO_CENTS}-{BAND_TILT_HI_CENTS}c; "
         f"increment={_inc_show}c)")
 
   _cap = CITY_MAX_CONTRACTS.get(row['City'], max_contracts)
   _headroom = _cap - float(row['position']) - float(row['resting_order_count'])
   print(f"    Position:   held={row['position']}, resting={row['resting_order_count']}, "
         f"cap={_cap} (headroom={_headroom:g})")
+  if MARKET_CASH_CAP_DOLLARS > 0:
+    print(f"    Cash:       filled=${_filled_cash:.2f} / ${MARKET_CASH_CAP_DOLLARS:.0f} cap "
+          f"(headroom=${MARKET_CASH_CAP_DOLLARS - _filled_cash:.2f})")
 
   print(f"    Ladder (maker-only post_only; filters: bid<no_offer AND bid<no_bid−3):")
 
@@ -2052,7 +2134,7 @@ for index, row in combined_table.iterrows():
   n_levels = len(price_count)
   _rungs = []           # list of (i, bid, contracts, edge, status, reason)
   _placed_rungs = []    # list of (bid, contracts, edge) for placed orders
-  _skip_cnt = {"below_city_min": 0, "bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "order_failed": 0}
+  _skip_cnt = {"below_city_min": 0, "bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "cash_cap": 0, "order_failed": 0}
   # Within-run cap accounting. Kalshi's get_orders is eventually consistent —
   # a freshly created order can take >100ms to appear in the resting list.
   # Without local tracking, the per-rung live cap check below sees stale
@@ -2067,6 +2149,10 @@ for index, row in combined_table.iterrows():
   _initial_position = float(row['position'])
   _initial_resting = float(row['resting_order_count'])
   _run_placed_contracts = 0
+  # Cash-cap accounting: potential buy cost of rungs placed this run. Added
+  # to _filled_cash (fetched at Filter 4) so cumulative cost stays under
+  # MARKET_CASH_CAP_DOLLARS even if every order we place fills.
+  _run_placed_cash = 0.0
   # Re-indexed sizing: ladder_mult scales by PLACEMENT order, not loop
   # index. Prevents the "ladder collapses to a single max-size deep
   # rung" pathology — when only deep rungs survive filters, they're
@@ -2085,7 +2171,11 @@ for index, row in combined_table.iterrows():
     # and gets placed, _placed_rung_idx increments after for next rung.
     city_mult = CITY_SIZE_MULT.get(row['City'], 1.0)
     ladder_mult = 1.0  # flat sizing: deeper rungs no longer get larger size
-    contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult * city_mult)))
+    # 61–80c band tilt: upsize rungs priced in the proven-edge band
+    # (see BAND_TILT_* above). Price-conditional, so only the rungs that
+    # actually land in-band get the multiplier.
+    band_mult = BAND_TILT_MULT if BAND_TILT_LO_CENTS <= bid_price <= BAND_TILT_HI_CENTS else 1.0
+    contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult * city_mult * band_mult)))
     # Edge = NO-side EV per $1 staked = (1 − P(yes)) − bid/100
     edge = (1.0 - yes_prob) - (bid_price / 100.0)
 
@@ -2113,6 +2203,17 @@ for index, row in combined_table.iterrows():
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
                      f'position cap (would exceed {_cap})'))
       _skip_cnt["position_cap"] += 1
+      continue
+    # Filter C2: per-market cash cap — filled cash + this run's placed cost
+    # (local arithmetic only; no API dependency, so it survives the read-path
+    # failures that broke the contract caps twice).
+    _rung_cost = contracts * bid_price / 100.0
+    if MARKET_CASH_CAP_DOLLARS > 0 and \
+       _filled_cash + _run_placed_cash + _rung_cost > MARKET_CASH_CAP_DOLLARS:
+      _rungs.append((i, bid_price, contracts, edge, 'SKIP',
+                     f'cash cap (filled=${_filled_cash:.2f}+run=${_run_placed_cash:.2f}'
+                     f'+new=${_rung_cost:.2f}>${MARKET_CASH_CAP_DOLLARS:.0f})'))
+      _skip_cnt["cash_cap"] += 1
       continue
 
     i1 = i1 + 1
@@ -2252,6 +2353,7 @@ for index, row in combined_table.iterrows():
       })
       row['resting_order_count'] = row['resting_order_count'] + contracts
       _run_placed_contracts += contracts
+      _run_placed_cash += contracts * bid_price / 100.0
       orders_placed += 1
       level_orders += 1
       _placed_rung_idx += 1  # Bump only on successful place — failed orders don't advance the size ladder
@@ -2325,6 +2427,8 @@ for index, row in combined_table.iterrows():
       _reason = "no rung is ≥4c below current NO bid (market too tight for maker)"
     elif _skip_cnt["bid>=no_offer"] + _skip_cnt["bid>=no_bid-3"] == len(_rungs):
       _reason = "every rung either crosses offer or fails the 4c maker buffer"
+    elif _skip_cnt["cash_cap"] == len(_rungs):
+      _reason = f"cash cap reached (${MARKET_CASH_CAP_DOLLARS:.0f}/market)"
     elif _skip_cnt["position_cap"] > 0 and _skip_cnt["order_failed"] == 0:
       _reason = "position cap reached"
     elif _skip_cnt["order_failed"] > 0:
@@ -2346,6 +2450,41 @@ if all_order_records:
     write_to_bq(df_orders, "orders", "WRITE_APPEND")
 
 print("\nTrading run complete.")
+
+# =====================================================================
+# ZERO-ORDERS-DAY ALERT
+# ---------------------------------------------------------------------
+# The 6/18 legacy-endpoint retirement placed zero orders for 11 straight
+# days while every run exited green — nothing watched n_orders_placed.
+# At the 4-runs/day cadence, N consecutive completed runs with zero
+# orders ≈ a full silent day. Fires on this run only if THIS run also
+# placed nothing (so it self-silences on recovery) and keeps firing on
+# each further all-zero run while the condition persists. Rides the
+# normal alert email below. Set threshold <= 0 to disable.
+# =====================================================================
+ZERO_ORDER_RUN_THRESHOLD = int(os.environ.get("ZERO_ORDER_RUN_THRESHOLD", "4"))
+if orders_placed == 0 and ZERO_ORDER_RUN_THRESHOLD > 0:
+    if bq_client is None:
+        print("  ZERO-ORDERS check skipped: bq_client is None")
+    else:
+        try:
+            _zq = f"""
+                SELECT n_orders_placed
+                FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}runs`
+                WHERE event = 'end' AND script_name = 'high_temp_trading.py'
+                ORDER BY event_at DESC
+                LIMIT {ZERO_ORDER_RUN_THRESHOLD - 1}
+            """
+            _prev = [r.n_orders_placed for r in bq_client.query(_zq).result()]
+            if len(_prev) >= ZERO_ORDER_RUN_THRESHOLD - 1 and \
+               all((_p or 0) == 0 for _p in _prev):
+                alert("ZERO_ORDERS_DAY",
+                      f"Last {ZERO_ORDER_RUN_THRESHOLD} completed runs (incl. this one) "
+                      f"placed 0 orders — silent outage? Check Kalshi API changes "
+                      f"(cf. the 6/18 410 retirement) and run logs.",
+                      {"prev_runs_checked": len(_prev)})
+        except Exception as _zqe:
+            print(f"  ZERO-ORDERS check failed (non-fatal): {_zqe}")
 
 # =====================================================================
 # END-OF-RUN ALERT SUMMARY
