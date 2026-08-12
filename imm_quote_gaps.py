@@ -621,14 +621,16 @@ def build_report(now_utc: datetime):
                      f"{ctx['updated_at']}) — 'quoted' set may be old.")
     lines.append("")
     if show:
-        lines.append("ranked by est $/day per $ of exposure, then est $/day")
-        lines.append(f"{'YLD%/D':>7} {'C/MIN':>6} {'EST$/D':>8} {'EXPO$':>7} "
-                     f"{'EVENT':<28} {'WHAT IT IS':<40} {'MKTS':>4} "
-                     f"{'POOL$/D':>8}  WHY NOT QUOTED")
+        lines.append("ranked by ROI: est $ earned per day for each $ at risk "
+                     "(ties broken by est $/day)")
+        lines.append(f"{'ROI%/DAY':>8} {'EST$/DAY':>8} {'$AT RISK':>8} "
+                     f"{'c/MIN':>6} {'EVENT':<28} {'WHAT IT IS':<38} "
+                     f"{'MKTS':>4} {'POOL$/D':>8}  WHY NOT QUOTED")
         for d in show:
             lines.append(
-                f"{yld_str(d):>7} {permin(d):>6} {est_str(d):>8} {exp_str(d):>7} "
-                f"{d['event'][:28]:<28} {(d['title'] or '?')[:40]:<40} "
+                f"{yld_str(d):>8} {est_str(d):>8} {exp_str(d):>8} "
+                f"{permin(d):>6} {d['event'][:28]:<28} "
+                f"{(d['title'] or '?')[:38]:<38} "
                 f"{d['n']:>4} {d['pool']:>8,.0f}  "
                 f"{d['reason']} ({fmt_window(d['end'], now_utc)})")
     else:
@@ -652,8 +654,8 @@ def build_report(now_utc: datetime):
                  "two-sided coverage and no competitor response. Partial "
                  "event estimates are marked '>='. Rows are independent "
                  "per-market estimates — quoting them all at once would hit "
-                 "the event cap / collateral budget. YLD%/D = est $/day per "
-                 "$ of exposure. EXPO$ = the modeled ladder's collateral "
+                 "the event cap / collateral budget. ROI%/DAY = est $/day "
+                 "per $ at risk. $AT RISK = the modeled ladder's collateral "
                  "(incl. depth pads), each order weighted by fill "
                  "intensity x(1 + min(side flow / queue ahead of it, 3)), "
                  "side flow = 24h volume / 2: an at-touch lot on a "
@@ -681,12 +683,16 @@ def build_report(now_utc: datetime):
                  f'"quoted" set may be old.</div>')
     if show:
         h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
-                 'ranked by est $/day per $ of exposure, then est $/day</div>')
+                 'ranked by <b>ROI</b>: estimated $ earned per day for each $ '
+                 'at risk. "$ at risk" = the collateral the ladder would tie '
+                 'up, weighted by how likely each order is to be bought up. '
+                 'Ties broken by est $/day.</div>')
         h.append('<table style="border-collapse:collapse">')
         h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
-                 f'<td style="{TD}">YLD %/D</td>'
-                 f'<td style="{TD}">C/MIN</td><td style="{TD}">EST $/D</td>'
-                 f'<td style="{TD}">EXPO $</td>'
+                 f'<td style="{TD}">ROI %/DAY</td>'
+                 f'<td style="{TD}">EST $/DAY</td>'
+                 f'<td style="{TD}">$ AT RISK</td>'
+                 f'<td style="{TD}">&cent;/MIN</td>'
                  f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
                  f'<td style="{TD}">MKTS</td><td style="{TD}">POOL $/D</td>'
                  f'<td style="{TDL}">WHY NOT QUOTED</td></tr>')
@@ -695,9 +701,9 @@ def build_report(now_utc: datetime):
             h.append(
                 f'<tr style="background:{bg}">'
                 f'<td style="{TD};font-weight:700;color:#b45309">{yld_str(d)}</td>'
-                f'<td style="{TD}">{permin(d)}</td>'
                 f'<td style="{TD};font-weight:600">{est_str(d)}</td>'
                 f'<td style="{TD}">{exp_str(d)}</td>'
+                f'<td style="{TD}">{permin(d)}</td>'
                 f'<td style="{TDL}"><b>{d["event"]}</b></td>'
                 f'<td style="{TDL}">{d["title"] or "?"}</td>'
                 f'<td style="{TD}">{d["n"]}</td>'
@@ -742,8 +748,8 @@ def build_report(now_utc: datetime):
              'two-sided coverage, no competitor response. Partial event '
              'estimates are marked "&ge;". Rows are independent per-market '
              'estimates — quoting them all at once would hit the event cap / '
-             'collateral budget. YLD %/D = est $/day per $ of exposure. '
-             'EXPO $ = the modeled ladder' "'" 's collateral (incl. depth '
+             'collateral budget. ROI %/DAY = est $/day per $ at risk. '
+             '$ AT RISK = the modeled ladder' "'" 's collateral (incl. depth '
              'pads), each order weighted by fill intensity: &times;(1 + '
              'min(side flow / queue ahead of it, 3)), side flow = 24h '
              'volume / 2 — an at-touch lot on a churning book counts up '
