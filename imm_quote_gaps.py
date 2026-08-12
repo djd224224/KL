@@ -530,8 +530,9 @@ def classify_and_estimate(client, bot, now_utc: datetime):
     # Jack 2026-08-12: rank by EST EARNINGS PER $ OF EXPOSURE (the modeled
     # ladder's collateral incl. pads, scaled by book turnover = 24h volume /
     # book depth capped 3x), THEN by est $/day. Rows without a yield estimate
-    # fall below every yielded row (est, then pool, as before). The C/MIN
-    # column (Jack 2026-08-04) is still displayed, just no longer the sort.
+    # fall below every yielded row (est, then pool, as before). The old
+    # C/MIN column (Jack 2026-08-04) was DROPPED 2026-08-12 — it was
+    # est $/day / 1440 x 100, the same number in different units.
     event_rows.sort(key=lambda d: (
         -(d["yld"] if d.get("yld") is not None else -1),
         -(d["est"] if d["est"] is not None else -1),
@@ -591,9 +592,6 @@ def build_report(now_utc: datetime):
     headline = ctx["est_missed_total"]
     subject = f"IMM quote gaps {today_et} — est ${headline:,.0f}/day unquoted"
 
-    def permin(d):
-        return f"{d['est'] / 1440 * 100:.2f}" if d["est"] is not None else "—"
-
     def yld_str(d):
         return (f"{d['yld'] * 100:,.1f}%" if d.get("yld") is not None else "—")
 
@@ -624,13 +622,13 @@ def build_report(now_utc: datetime):
         lines.append("ranked by ROI: est $ earned per day for each $ at risk "
                      "(ties broken by est $/day)")
         lines.append(f"{'ROI%/DAY':>8} {'EST$/DAY':>8} {'$AT RISK':>8} "
-                     f"{'c/MIN':>6} {'EVENT':<28} {'WHAT IT IS':<38} "
+                     f"{'EVENT':<28} {'WHAT IT IS':<44} "
                      f"{'MKTS':>4} {'POOL$/D':>8}  WHY NOT QUOTED")
         for d in show:
             lines.append(
                 f"{yld_str(d):>8} {est_str(d):>8} {exp_str(d):>8} "
-                f"{permin(d):>6} {d['event'][:28]:<28} "
-                f"{(d['title'] or '?')[:38]:<38} "
+                f"{d['event'][:28]:<28} "
+                f"{(d['title'] or '?')[:44]:<44} "
                 f"{d['n']:>4} {d['pool']:>8,.0f}  "
                 f"{d['reason']} ({fmt_window(d['end'], now_utc)})")
     else:
@@ -692,7 +690,6 @@ def build_report(now_utc: datetime):
                  f'<td style="{TD}">ROI %/DAY</td>'
                  f'<td style="{TD}">EST $/DAY</td>'
                  f'<td style="{TD}">$ AT RISK</td>'
-                 f'<td style="{TD}">&cent;/MIN</td>'
                  f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
                  f'<td style="{TD}">MKTS</td><td style="{TD}">POOL $/D</td>'
                  f'<td style="{TDL}">WHY NOT QUOTED</td></tr>')
@@ -703,7 +700,6 @@ def build_report(now_utc: datetime):
                 f'<td style="{TD};font-weight:700;color:#b45309">{yld_str(d)}</td>'
                 f'<td style="{TD};font-weight:600">{est_str(d)}</td>'
                 f'<td style="{TD}">{exp_str(d)}</td>'
-                f'<td style="{TD}">{permin(d)}</td>'
                 f'<td style="{TDL}"><b>{d["event"]}</b></td>'
                 f'<td style="{TDL}">{d["title"] or "?"}</td>'
                 f'<td style="{TD}">{d["n"]}</td>'
