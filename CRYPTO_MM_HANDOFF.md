@@ -157,6 +157,10 @@ updown gen 2 was minted).
 - **Only `divergence` emails immediately.** Everything else is digest-only. Removed by request
   over time: fill, breach, near-touch (7/5), then failsafe + shutdown (7/13 — fleet restarts and
   standby wakes were firing 16 emails at once).
+- **Digest has TWO sections since 8/12** (same columns/format): "Monthly one-touch" and
+  "Weekly above/below (KX*D)" — the weekly rows come from the updown bots' heartbeats
+  (their events are discovered, not computed), the headline Fleet P&L is the grand total,
+  and each fleet gets its own health line.
 - **Daily digest, 7:00 AM ET** (bots roll counters 6 AM ET): HTML table sorted best→worst —
   **P&L$ (realized+unrealized), REAL$, UNREAL$, NET contracts, EXPO$** — plus fleet totals,
   balance, and a health line flagging any bot whose heartbeat is >30 min stale. Retries ~40 min

@@ -103,13 +103,17 @@ def event_pnl(client, event_ticker: str) -> dict:
     return out
 
 
-def fleet_health() -> str:
+WEEKLY_STATUS_DIR = os.environ.get(
+    "CUD_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\crypto-updown")
+
+
+def fleet_health(status_dir: str = STATUS_DIR, label: str = "Bots") -> str:
     """One line: only problems (stale bots, error counts from stored summaries)."""
     problems = []
     errs = 0
     seen = 0
     now = datetime.now(timezone.utc)
-    for path in sorted(glob.glob(os.path.join(STATUS_DIR, "status_*.json"))):
+    for path in sorted(glob.glob(os.path.join(status_dir, "status_*.json"))):
         try:
             with open(path, encoding="utf-8") as f:
                 st = json.load(f)
@@ -127,7 +131,7 @@ def fleet_health() -> str:
         m = re.search(r"errs (\d+)", st.get("summary_body") or "")
         if m:
             errs += int(m.group(1))
-    line = f"Bots: {seen - len([p for p in problems if 'STALE' in p])}/{seen} alive, " \
+    line = f"{label}: {seen - len([p for p in problems if 'STALE' in p])}/{seen} alive, " \
            f"{errs} errors in yesterday's summaries"
     if problems:
         line += " | " + "; ".join(problems)
@@ -143,47 +147,63 @@ TD = 'padding:5px 12px;border:1px solid #ddd;text-align:right;'
 TDL = 'padding:5px 12px;border:1px solid #ddd;text-align:left;'
 
 
-def build_digest(now_utc: datetime):
-    """Returns (plain_text, html)."""
-    today_ct = now_utc.astimezone(CT).date()
-    client = build_client()
+def weekly_entries() -> list:
+    """[(asset, [event_tickers])] for the updown weekly fleet, read from its
+    bots' own heartbeats (their events are DISCOVERED, not computed, so the
+    status files are the source of truth for what each bot is trading).
+    A stale heartbeat still names the right event most of the day; staleness
+    itself is flagged by the weekly health line, not here."""
+    entries = []
+    for path in sorted(glob.glob(os.path.join(WEEKLY_STATUS_DIR, "status_*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            continue
+        evs = [e.get("ticker") for e in (st.get("events") or []) if e.get("ticker")]
+        entries.append((st.get("market", os.path.basename(path)), evs))
+    return entries
 
+
+def collect_rows(client, entries):
+    """Shared row builder: entries = [(label, [event_tickers])]. Returns
+    (rows_sorted_best_to_worst, totals, failed_labels, quiet_count). A label
+    with several events (future multi-tenor) sums them."""
     rows = []
     tot = {"realized": 0.0, "fees": 0.0, "unrealized": 0.0, "net_pos": 0.0, "exposure": 0.0}
     failed = []
-    for key in sorted(MARKETS):
-        ev = event_ticker_for(MARKETS[key], now_utc)
-        pnl = event_pnl(client, ev)
-        if not pnl["ok"]:
-            failed.append(key)
+    quiet = 0
+    for label, evs in entries:
+        agg = {"realized": 0.0, "fees": 0.0, "unrealized": 0.0, "net_pos": 0.0, "exposure": 0.0}
+        ok = True
+        for ev in evs:
+            pnl = event_pnl(client, ev)
+            if not pnl["ok"]:
+                ok = False
+                break
+            for k in agg:
+                agg[k] += pnl[k]
+        if not ok:
+            failed.append(label)
             continue
         for k in tot:
-            tot[k] += pnl[k]
-        if (abs(pnl["realized"]) > 0.005 or abs(pnl["unrealized"]) > 0.005
-                or abs(pnl["net_pos"]) > 0.5 or pnl["exposure"] > 0.005):
-            rows.append((key, pnl))
-    for _key, p in rows:
-        p["pnl"] = p["realized"] + p["unrealized"]
+            tot[k] += agg[k]
+        if (abs(agg["realized"]) > 0.005 or abs(agg["unrealized"]) > 0.005
+                or abs(agg["net_pos"]) > 0.5 or agg["exposure"] > 0.005):
+            agg["pnl"] = agg["realized"] + agg["unrealized"]
+            rows.append((label, agg))
+        else:
+            quiet += 1
     rows.sort(key=lambda r: -r[1]["pnl"])   # best to worst
+    return rows, tot, failed, quiet
 
-    try:
-        balance = _f(client.get_balance().get("balance_dollars"))
-        bal_str = f"${balance:,.2f}"
-    except Exception:
-        bal_str = "?"
 
+def text_section(title, rows, tot, quiet, failed, health):
     total_pnl = tot["realized"] + tot["unrealized"]
-    quiet = len(MARKETS) - len(rows) - len(failed)
-    health = fleet_health()
-
-    # ---- plain text (fallback part) ----------------------------------------
-    lines = [f"Kalshi crypto MM — {today_ct}", ""]
-    lines.append(f"FLEET P&L: {total_pnl:+,.2f}  "
-                 f"(realized {tot['realized']:+,.2f}, unrealized {tot['unrealized']:+,.2f}, "
-                 f"fees {tot['fees']:,.2f})")
-    lines.append(f"Net position {tot['net_pos']:+,.0f} contracts | "
-                 f"$ exposure ${tot['exposure']:,.2f} | balance {bal_str}")
-    lines.append("")
+    lines = [f"== {title} ==",
+             f"P&L: {total_pnl:+,.2f}  (realized {tot['realized']:+,.2f}, "
+             f"unrealized {tot['unrealized']:+,.2f}, fees {tot['fees']:,.2f}) | "
+             f"net {tot['net_pos']:+,.0f} | expo ${tot['exposure']:,.2f}"]
     if rows:
         lines.append(f"{'MARKET':9s} {'P&L$':>8s} {'REAL$':>8s} {'UNREAL$':>8s} "
                      f"{'NET':>6s} {'EXPO$':>9s}")
@@ -197,23 +217,20 @@ def build_digest(now_utc: datetime):
         lines.append("All markets flat: no positions, no P&L yet.")
     if failed:
         lines.append(f"! could not read: {', '.join(failed)}")
-    lines.append("")
     lines.append(health)
-    text = "\n".join(lines)
+    return lines
 
-    # ---- html ---------------------------------------------------------------
-    h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">']
-    h.append(f'<div style="font-size:17px;font-weight:600">Kalshi crypto MM'
-             f' <span style="color:#888;font-weight:400">— {today_ct}</span></div>')
-    h.append(f'<div style="font-size:21px;font-weight:700;margin:8px 0 2px">'
-             f'Fleet P&amp;L: {_pnl_span(total_pnl)}</div>')
-    h.append(f'<div style="color:#555;margin-bottom:12px">'
-             f'realized {_pnl_span(tot["realized"])} &nbsp;·&nbsp; '
-             f'unrealized {_pnl_span(tot["unrealized"])} &nbsp;·&nbsp; '
-             f'fees {tot["fees"]:,.2f}<br>'
-             f'net position <b>{tot["net_pos"]:+,.0f}</b> contracts &nbsp;·&nbsp; '
-             f'exposure <b>${tot["exposure"]:,.2f}</b> &nbsp;·&nbsp; '
-             f'balance <b>{bal_str}</b></div>')
+
+def html_section(title, rows, tot, quiet, failed, health):
+    total_pnl = tot["realized"] + tot["unrealized"]
+    h = [f'<div style="font-size:15px;font-weight:600;margin:14px 0 2px">{title}</div>']
+    h.append(f'<div style="color:#555;margin-bottom:8px">'
+             f'P&amp;L {_pnl_span(total_pnl)} &nbsp;&middot;&nbsp; '
+             f'realized {_pnl_span(tot["realized"])} &nbsp;&middot;&nbsp; '
+             f'unrealized {_pnl_span(tot["unrealized"])} &nbsp;&middot;&nbsp; '
+             f'fees {tot["fees"]:,.2f} &nbsp;&middot;&nbsp; '
+             f'net <b>{tot["net_pos"]:+,.0f}</b> &nbsp;&middot;&nbsp; '
+             f'exposure <b>${tot["exposure"]:,.2f}</b></div>')
     if rows:
         h.append('<table style="border-collapse:collapse">')
         h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
@@ -246,8 +263,65 @@ def build_digest(now_utc: datetime):
     if failed:
         h.append(f'<div style="color:#c0392b;margin-top:6px">could not read: '
                  f'{", ".join(failed)}</div>')
-    h.append(f'<div style="color:#777;font-size:12px;margin-top:12px;'
-             f'border-top:1px solid #eee;padding-top:8px">{health}</div>')
+    h.append(f'<div style="color:#777;font-size:12px;margin-top:8px;'
+             f'border-top:1px solid #eee;padding-top:6px">{health}</div>')
+    return h
+
+
+def build_digest(now_utc: datetime):
+    """Returns (plain_text, html): monthly one-touch section + weekly
+    above/below section in the identical format (Jack 2026-08-12)."""
+    today_ct = now_utc.astimezone(CT).date()
+    client = build_client()
+
+    monthly_entries = [(key, [event_ticker_for(MARKETS[key], now_utc)])
+                       for key in sorted(MARKETS)]
+    m_rows, m_tot, m_failed, m_quiet = collect_rows(client, monthly_entries)
+    w_rows, w_tot, w_failed, w_quiet = collect_rows(client, weekly_entries())
+
+    try:
+        balance = _f(client.get_balance().get("balance_dollars"))
+        bal_str = f"${balance:,.2f}"
+    except Exception:
+        bal_str = "?"
+
+    grand = {k: m_tot[k] + w_tot[k] for k in m_tot}
+    grand_pnl = grand["realized"] + grand["unrealized"]
+    m_health = fleet_health(STATUS_DIR, "Monthly bots")
+    w_health = fleet_health(WEEKLY_STATUS_DIR, "Weekly bots")
+
+    # ---- plain text (fallback part) ----------------------------------------
+    lines = [f"Kalshi crypto MM - {today_ct}", ""]
+    lines.append(f"FLEET P&L: {grand_pnl:+,.2f}  "
+                 f"(realized {grand['realized']:+,.2f}, unrealized {grand['unrealized']:+,.2f}, "
+                 f"fees {grand['fees']:,.2f})")
+    lines.append(f"Net position {grand['net_pos']:+,.0f} contracts | "
+                 f"$ exposure ${grand['exposure']:,.2f} | balance {bal_str}")
+    lines.append("")
+    lines += text_section("MONTHLY one-touch (KX*MAXMON/*MINMON)",
+                          m_rows, m_tot, m_quiet, m_failed, m_health)
+    lines.append("")
+    lines += text_section("WEEKLY above/below (KX*D)",
+                          w_rows, w_tot, w_quiet, w_failed, w_health)
+    text = "\n".join(lines)
+
+    # ---- html ---------------------------------------------------------------
+    h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">']
+    h.append(f'<div style="font-size:17px;font-weight:600">Kalshi crypto MM'
+             f' <span style="color:#888;font-weight:400">- {today_ct}</span></div>')
+    h.append(f'<div style="font-size:21px;font-weight:700;margin:8px 0 2px">'
+             f'Fleet P&amp;L: {_pnl_span(grand_pnl)}</div>')
+    h.append(f'<div style="color:#555;margin-bottom:4px">'
+             f'realized {_pnl_span(grand["realized"])} &nbsp;&middot;&nbsp; '
+             f'unrealized {_pnl_span(grand["unrealized"])} &nbsp;&middot;&nbsp; '
+             f'fees {grand["fees"]:,.2f}<br>'
+             f'net position <b>{grand["net_pos"]:+,.0f}</b> contracts &nbsp;&middot;&nbsp; '
+             f'exposure <b>${grand["exposure"]:,.2f}</b> &nbsp;&middot;&nbsp; '
+             f'balance <b>{bal_str}</b></div>')
+    h += html_section("Monthly one-touch (KX*MAXMON / *MINMON)",
+                      m_rows, m_tot, m_quiet, m_failed, m_health)
+    h += html_section("Weekly above/below (KX*D)",
+                      w_rows, w_tot, w_quiet, w_failed, w_health)
     h.append('</div>')
     return text, "".join(h)
 
