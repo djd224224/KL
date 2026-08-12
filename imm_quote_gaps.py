@@ -194,6 +194,10 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
         volume = float(m.get("volume_fp") or m.get("volume") or 0)
     except (TypeError, ValueError):
         volume = 0.0
+    try:
+        volume_24h = float(m.get("volume_24h_fp") or m.get("volume_24h") or 0)
+    except (TypeError, ValueError):
+        volume_24h = 0.0
     return imm.MarketMeta(
         ticker=t, event_ticker=event_ticker, series=series,
         dollars_per_day=info["dollars_per_day"], program_end=info["end"],
@@ -201,7 +205,7 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
         cutoff=cutoff, close_time=close_time,
         mid_cents=((bid + ask) / 2.0 if bid and ask else None),
         spread_cents=((ask - bid) if bid and ask else None),
-        volume=volume, status=m.get("status", ""),
+        volume=volume, volume_24h=volume_24h, status=m.get("status", ""),
         open_time=imm.parse_iso_utc(m.get("open_time", "")))
 
 
@@ -442,23 +446,23 @@ def classify_and_estimate(client, bot, now_utc: datetime):
             books += 1
             if bot._estimate_candidate_yield(r["meta"], []):
                 r["est"] = r["meta"].est_dollars_per_day
-                # Effective $ exposure of the modeled ladder: collateral the
-                # ladder (incl. pads) ties up, scaled up by book ACTION —
-                # a book that turns over N times a day will fill resting
-                # size, so a dollar resting there is more exposed than one
-                # on a dead book. turns = 24h volume / total book depth,
-                # capped at 3x. getattr: degrade to no-estimate if the
-                # meta fields aren't present (older incentive_mm).
+                # Effective $ exposure of the modeled ladder, weighted by
+                # PER-ORDER fill intensity (incentive_mm's
+                # _fill_weighted_exposure): each order's collateral scaled
+                # by (1 + min(side flow / queue ahead of it, 3)) — an
+                # at-touch lot on a churning book counts ~4x (it WILL be
+                # bought up); a 1c pad with the whole book ahead of it
+                # counts ~1x. Falls back to book-wide turnover scaling,
+                # then plain collateral (older incentive_mm without the
+                # fields degrades to no yield estimate).
                 coll = getattr(r["meta"], "est_collateral_dollars", 0.0)
-                depth = getattr(r["meta"], "book_depth_contracts", 0.0)
-                md = details.get(r["ticker"], {})
-                try:
-                    v24 = float(md.get("volume_24h_fp")
-                                or md.get("volume_24h") or 0)
-                except (TypeError, ValueError):
-                    v24 = 0.0
-                turns = min(v24 / depth, 3.0) if depth > 0 else 0.0
-                r["exp"] = coll * (1.0 + turns) if coll > 0 else None
+                exp = getattr(r["meta"], "est_exposure_dollars", 0.0)
+                if exp <= 0 and coll > 0:
+                    depth = getattr(r["meta"], "book_depth_contracts", 0.0)
+                    v24 = getattr(r["meta"], "volume_24h", 0.0)
+                    turns = min(v24 / depth, 3.0) if depth > 0 else 0.0
+                    exp = coll * (1.0 + turns)
+                r["exp"] = exp if exp > 0 else None
             elif r["reason"] is None:
                 r["reason"] = "book unreadable"
 
@@ -649,10 +653,13 @@ def build_report(now_utc: datetime):
                  "event estimates are marked '>='. Rows are independent "
                  "per-market estimates — quoting them all at once would hit "
                  "the event cap / collateral budget. YLD%/D = est $/day per "
-                 "$ of exposure; EXPO$ = the modeled ladder's collateral "
-                 "(incl. depth pads) scaled by book action, x(1 + "
-                 "min(24h volume / book depth, 3)) — busy books fill resting "
-                 "size, so a dollar resting there is more exposed.")
+                 "$ of exposure. EXPO$ = the modeled ladder's collateral "
+                 "(incl. depth pads), each order weighted by fill "
+                 "intensity x(1 + min(side flow / queue ahead of it, 3)), "
+                 "side flow = 24h volume / 2: an at-touch lot on a "
+                 "churning book counts up to 4x its dollars (it WILL get "
+                 "bought up); a 1c pad with the whole book ahead counts "
+                 "~1x.")
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
@@ -735,12 +742,14 @@ def build_report(now_utc: datetime):
              'two-sided coverage, no competitor response. Partial event '
              'estimates are marked "&ge;". Rows are independent per-market '
              'estimates — quoting them all at once would hit the event cap / '
-             'collateral budget. YLD %/D = est $/day per $ of exposure; '
-             'EXPO $ = the modeled ladder\'s collateral (incl. depth pads) '
-             'scaled by book action, &times;(1 + min(24h volume / book '
-             'depth, 3)) — busy books fill resting size, so a dollar '
-             'resting there is more exposed. Config mirrored from the live '
-             'launcher env.</div>')
+             'collateral budget. YLD %/D = est $/day per $ of exposure. '
+             'EXPO $ = the modeled ladder' "'" 's collateral (incl. depth '
+             'pads), each order weighted by fill intensity: &times;(1 + '
+             'min(side flow / queue ahead of it, 3)), side flow = 24h '
+             'volume / 2 — an at-touch lot on a churning book counts up '
+             'to 4&times; its dollars (it will be bought up); a 1c pad '
+             'with the whole book ahead of it counts ~1&times;. Config '
+             'mirrored from the live launcher env.</div>')
     h.append('</div>')
     return text, "".join(h), subject
 
