@@ -119,6 +119,36 @@ within a few cents on majors; meme coins diverge (see guards).
   `C:\Users\jackd\Downloads\Lisa_Kalshi.txt`. Gmail app password in HKCU env
   `ALERT_EMAIL_FROM`/`ALERT_EMAIL_PASSWORD` (launcher reads the registry directly).
 
+## INCIDENT 2026-08-09: concurrent bot GENERATIONS (all crypto fleets)
+
+Standby wakes had been MINTING fleets: three generations of the monthly bots (spawned by
+wake-respawns on 8/5, 8/6, 8/7) and two of the updown fleet ran CONCURRENTLY - stacked ladders
+on the same markets for days. Root cause: **the v2.5 singleton stops a newcomer but never
+evicts an incumbent.** When standby makes the incumbent's heartbeat look stale, the newcomer
+takes over the lock and the incumbent keeps trading forever (it checks the lock only at
+startup). TODO: incumbent should re-verify it still holds its lock each cycle and exit if not.
+
+Detection recipe (how it was caught): status_*.json failing json.load with "Extra data"
+(two writers interleaving the SAME .tmp file - atomic replace still lands a complete-JSON-
+plus-garbage hybrid), status pid ALTERNATING between two live pids across reads, python count
+~2x expected, python StartTimes clustering in generations. NB: fleet_health() silently drops
+unparseable status files, so the digest UNDER-COUNTS bots during exactly this failure.
+
+Cleanup pattern (cleanup_duplicate_bots.ps1): kill every bot chain INCLUDING task-owned ones
+(python + cmd + powershell ancestors; spare IMM + shell ancestry), then let the watchdog
+revive one clean chain per market (<=15 min) and TTL flush the stacked book. Killing only
+pythons is NOT enough - orphan launchers respawn in 30s. Three orphan chains survived the
+first sweep (their pythons were mid-respawn during the survey; pid-reuse also forges PPID
+links, e.g. an orphan launcher appeared to be a child of the IMM bot) - verify afterward by
+checking lock/status pids against task-owned chains and re-sweep.
+
+Same day, unrelated: a brief AC unplug stopped ONLY the 7 updown tasks - they'd been
+registered with Task Scheduler defaults (start-only-on-AC + stop-on-battery) while every
+other KL task is battery-safe. Fixed via fix_updown_battery.bat (Set-ScheduledTask, safe on
+running tasks); register_updown_tasks.ps1 now sets battery-safe flags AND refuses to run
+while updown tasks are Running (re-registering live tasks orphans their chains - that is how
+updown gen 2 was minted).
+
 ## Alerts & digest
 
 - **Email only, to jackdu224@gmail.com** (Gmail push on phone). T-Mobile's email-to-SMS gateway
@@ -195,7 +225,8 @@ tests pass untouched — but the extraction means a future fix to `run_cycle` be
 ## Above/below variant (`crypto_updown_mm.py`, v1.0 — built 2026-08-05)
 
 **LIVE PILOT (armed 2026-08-05, weekly tenor, all assets).** Settings per Jack: `--cadence
-weekly`, ladder **3 x 1**, **3c off fair**, 2c apart, band **10-90c**, **8 markets/event**.
+weekly`, ladder **3 x 2** (doubled from 3x1 on 8/10, caps 2x'd 40/200/400 -> **80/400/800**),
+**3c off fair**, 2c apart, band **10-90c**, **8 markets/event**.
 The offset went 5c -> 3c after the first live cycles showed us resting 5-6c behind a ~2c-wide
 book — at 5c we would essentially never have filled.
 

@@ -464,9 +464,10 @@ class TestRunCycle(unittest.TestCase):
                             for o in b.state.sim_orders.values()))
 
     def test_ladder_is_the_live_pilot_shape(self):
-        """Pins the deployed config: 3 levels x 1 contract, 5c off fair, 2c
-        apart, joining and never leading. Loosening any of these is a size
-        change on a live bot and should have to break a test first."""
+        """Pins the deployed config: 3 levels x 2 contracts (doubled from 3x1
+        on 2026-08-10), 3c off fair, 2c apart, joining and never leading.
+        Changing any of these is a size change on a live bot and should have
+        to break a test first."""
         c = FakeClient(markets=hourly_event(n=1))
         b = bot(c, cadences=("hourly",))
         with priced():
@@ -477,7 +478,7 @@ class TestRunCycle(unittest.TestCase):
         asks = sorted(o["yes_price"] for o in placed if o["book_side"] == "ask")
         self.assertEqual(len(bids), 3)
         self.assertEqual(len(asks), 3)
-        self.assertTrue(all(o["remaining_count"] == 1 for o in placed))
+        self.assertTrue(all(o["remaining_count"] == 2 for o in placed))
         self.assertLessEqual(bids[0], 40)      # external bid; join, never lead
         self.assertGreaterEqual(asks[0], 55)   # external ask = 100-45
         self.assertEqual([b1 - b2 for b1, b2 in zip(bids, bids[1:])],
@@ -485,7 +486,7 @@ class TestRunCycle(unittest.TestCase):
         self.assertEqual([a2 - a1 for a1, a2 in zip(asks, asks[1:])],
                          [ud.LEVEL_SPACING_CENTS] * 2)
 
-    def test_at_most_three_contracts_rest_per_market_side(self):
+    def test_at_most_six_contracts_rest_per_market_side(self):
         c = FakeClient(markets=hourly_event(n=3))
         b = bot(c, cadences=("hourly",))
         with priced():
@@ -495,7 +496,7 @@ class TestRunCycle(unittest.TestCase):
             key = (o["ticker"], o["book_side"])
             totals[key] = totals.get(key, 0) + o["remaining_count"]
         self.assertTrue(totals)
-        self.assertLessEqual(max(totals.values()), 3)
+        self.assertLessEqual(max(totals.values()), 6)
 
     def test_band_is_ten_to_ninety(self):
         self.assertEqual((ud.SKIP_FAIR_BELOW_CENTS, ud.SKIP_FAIR_ABOVE_CENTS), (10, 90))
@@ -733,15 +734,15 @@ class TestFleetIsolation(unittest.TestCase):
         # The updown pilot's 3x1 IS pinned — that is this fleet's live risk
         # control. The one-touch fleets track whatever the monthly runs.
         self.assertEqual((ud.UpDownMarketMaker.num_levels,
-                          ud.UpDownMarketMaker.contracts_per_level), (3, 1))
+                          ud.UpDownMarketMaker.contracts_per_level), (3, 2))
         for other in (mm.TouchMarketMaker, wk.WeeklyTouchMarketMaker):
             self.assertEqual((other.num_levels, other.contracts_per_level),
                              (mm.NUM_LEVELS, mm.CONTRACTS_PER_LEVEL))
-        self.assertNotEqual((mm.NUM_LEVELS, mm.CONTRACTS_PER_LEVEL), (3, 1))
+        self.assertNotEqual((mm.NUM_LEVELS, mm.CONTRACTS_PER_LEVEL), (3, 2))
 
     def test_updown_caps_are_its_own(self):
         C = ud.UpDownMarketMaker
-        self.assertEqual((C.max_position, C.max_event), (40.0, 200.0))
+        self.assertEqual((C.max_position, C.max_event), (80.0, 400.0))
         self.assertNotEqual(C.max_position, mm.TouchMarketMaker.max_position)
 
     def test_data_cache_still_shared(self):

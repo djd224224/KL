@@ -34,9 +34,10 @@ from the exchange, not from ticker conventions):
     daily   ~25h   e.g. KXBTCD-26AUG0517    80 strikes   (the 5pm ET events)
     weekly  ~169h  e.g. KXBTCD-26AUG0717    80 strikes   (also 5pm ET)
 
-LIVE PILOT SETTINGS (2026-08-05): --cadence weekly, all assets, a 3 x 1
+LIVE PILOT SETTINGS (2026-08-10): --cadence weekly, all assets, a 3 x 2
 ladder 3c off fair and 2c apart, quoting only strikes fairing between 10c and
-90c, at most 8 markets per event. Max 3 contracts resting per market per side.
+90c, at most 8 markets per event. Max 6 contracts resting per market per side
+(pilot began 3x1 on 8/5; doubled + caps 2x'd to 80/400/800 on 8/10).
 
 One bot quotes ALL selected tenors of one asset concurrently (--cadence),
 because at any moment only ~3 events are open per asset and they are the same
@@ -134,11 +135,11 @@ SKIP_FAIR_ABOVE_CENTS = _env_i("CUD_SKIP_FAIR_ABOVE_CENTS", 90)
 SKIP_FAIR_BELOW_CENTS = _env_i("CUD_SKIP_FAIR_BELOW_CENTS", 10)
 MAX_MARKETS_PER_EVENT = _env_i("CUD_MAX_MARKETS_PER_EVENT", 8)
 
-# Ladder shape. 3 levels x 1 contract for the live pilot (Jack, 2026-08-05) —
-# the one-touch fleet's 5x10 is far too much size for an unproven model on a
-# new product. Bound per (market, side): num_levels * contracts_per_level = 3.
+# Ladder shape. Pilot started 3x1 (2026-08-05); doubled to 3x2 (Jack,
+# 2026-08-10 "double it") after two clean days. Bound per (market, side):
+# num_levels * contracts_per_level = 6.
 NUM_LEVELS = _env_i("CUD_NUM_LEVELS", 3)
-CONTRACTS_PER_LEVEL = _env_i("CUD_CONTRACTS_PER_LEVEL", 1)
+CONTRACTS_PER_LEVEL = _env_i("CUD_CONTRACTS_PER_LEVEL", 2)
 # 3c off fair, not the one-touch fleet's 5c (Jack, 2026-08-05). These books are
 # ~2c wide, so a 5c offset parked us 5-6c behind the touch on both sides and
 # would almost never have filled. Join-don't-lead still caps how aggressive
@@ -146,12 +147,12 @@ CONTRACTS_PER_LEVEL = _env_i("CUD_CONTRACTS_PER_LEVEL", 1)
 QUOTE_OFFSET_CENTS = _env_i("CUD_QUOTE_OFFSET_CENTS", 3)
 LEVEL_SPACING_CENTS = _env_i("CUD_LEVEL_SPACING_CENTS", 2)
 
-# Risk. Deliberately small: new product, new model, no P&L history. With a 3x1
-# ladder these are non-binding backstops (max 3 resting per market per side) —
-# the ladder size IS the pilot control. Revisit both together when scaling.
-MAX_POSITION_CONTRACTS = _env_f("CUD_MAX_POSITION", 40)    # per market
-MAX_EVENT_CONTRACTS = _env_f("CUD_MAX_EVENT", 200)         # per event
-MAX_ASSET_CONTRACTS = _env_f("CUD_MAX_ASSET", 400)         # across all tenors
+# Risk. Scaled 2x with the ladder (40/200/400 -> 80/400/800, 2026-08-10):
+# still non-binding backstops (max 6 resting per market per side) — the
+# ladder size IS the control. Revisit both together when scaling further.
+MAX_POSITION_CONTRACTS = _env_f("CUD_MAX_POSITION", 80)    # per market
+MAX_EVENT_CONTRACTS = _env_f("CUD_MAX_EVENT", 400)         # per event
+MAX_ASSET_CONTRACTS = _env_f("CUD_MAX_ASSET", 800)         # across all tenors
 
 # Model/market disagreement guard (same spirit as the one-touch bot).
 MAX_FAIR_DIVERGENCE_CENTS = _env_i("CUD_MAX_FAIR_DIVERGENCE_CENTS", 15)
