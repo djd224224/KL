@@ -442,6 +442,23 @@ def classify_and_estimate(client, bot, now_utc: datetime):
             books += 1
             if bot._estimate_candidate_yield(r["meta"], []):
                 r["est"] = r["meta"].est_dollars_per_day
+                # Effective $ exposure of the modeled ladder: collateral the
+                # ladder (incl. pads) ties up, scaled up by book ACTION —
+                # a book that turns over N times a day will fill resting
+                # size, so a dollar resting there is more exposed than one
+                # on a dead book. turns = 24h volume / total book depth,
+                # capped at 3x. getattr: degrade to no-estimate if the
+                # meta fields aren't present (older incentive_mm).
+                coll = getattr(r["meta"], "est_collateral_dollars", 0.0)
+                depth = getattr(r["meta"], "book_depth_contracts", 0.0)
+                md = details.get(r["ticker"], {})
+                try:
+                    v24 = float(md.get("volume_24h_fp")
+                                or md.get("volume_24h") or 0)
+                except (TypeError, ValueError):
+                    v24 = 0.0
+                turns = min(v24 / depth, 3.0) if depth > 0 else 0.0
+                r["exp"] = coll * (1.0 + turns) if coll > 0 else None
             elif r["reason"] is None:
                 r["reason"] = "book unreadable"
 
@@ -480,6 +497,10 @@ def classify_and_estimate(client, bot, now_utc: datetime):
             continue
         est_vals = [r["est"] for r in evr if r["est"] is not None]
         n_est = len(est_vals)
+        est_p = sum(r["est"] for r in evr
+                    if r["est"] is not None and r.get("exp"))
+        exp_p = sum(r["exp"] for r in evr
+                    if r["est"] is not None and r.get("exp"))
         ends = []
         for r in evr:
             if r["meta"] is None:
@@ -495,17 +516,22 @@ def classify_and_estimate(client, bot, now_utc: datetime):
             "event": ev, "series": evr[0]["series"], "n": len(evr),
             "n_est": n_est, "pool": sum(r["pool"] for r in evr),
             "est": sum(est_vals) if est_vals else None,
+            "exp": exp_p if exp_p > 0 else None,
+            "yld": (est_p / exp_p) if exp_p > 0 else None,
             "partial": 0 < n_est < len(evr),
             "end": min(ends) if ends else None,
             "reason": reason,
             "fallback_title": str(sample.get("title") or ""),
         })
-    # Jack 2026-08-04: rank by PROFIT PER MINUTE. est is a $/day rate, so
-    # per-minute is est/1440 — a monotonic transform, but sorting on the
-    # displayed quantity keeps the table honest if the units ever change.
-    # Unestimated rows fall to the bottom, ordered by pool.
+    # Jack 2026-08-12: rank by EST EARNINGS PER $ OF EXPOSURE (the modeled
+    # ladder's collateral incl. pads, scaled by book turnover = 24h volume /
+    # book depth capped 3x), THEN by est $/day. Rows without a yield estimate
+    # fall below every yielded row (est, then pool, as before). The C/MIN
+    # column (Jack 2026-08-04) is still displayed, just no longer the sort.
     event_rows.sort(key=lambda d: (
-        -((d["est"] / 1440.0) if d["est"] is not None else -1), -d["pool"]))
+        -(d["yld"] if d.get("yld") is not None else -1),
+        -(d["est"] if d["est"] is not None else -1),
+        -d["pool"]))
 
     ctx = {
         "programs": len(programs),
@@ -564,6 +590,12 @@ def build_report(now_utc: datetime):
     def permin(d):
         return f"{d['est'] / 1440 * 100:.2f}" if d["est"] is not None else "—"
 
+    def yld_str(d):
+        return (f"{d['yld'] * 100:,.1f}%" if d.get("yld") is not None else "—")
+
+    def exp_str(d):
+        return f"{d['exp']:,.0f}" if d.get("exp") else "—"
+
     def est_str(d):
         if d["est"] is None:
             return "—"
@@ -585,14 +617,15 @@ def build_report(now_utc: datetime):
                      f"{ctx['updated_at']}) — 'quoted' set may be old.")
     lines.append("")
     if show:
-        lines.append("ranked by profit per minute")
-        lines.append(f"{'C/MIN':>6} {'EST$/D':>8} {'EVENT':<28} "
-                     f"{'WHAT IT IS':<46} {'MKTS':>4} {'POOL$/D':>8}  "
-                     f"WHY NOT QUOTED")
+        lines.append("ranked by est $/day per $ of exposure, then est $/day")
+        lines.append(f"{'YLD%/D':>7} {'C/MIN':>6} {'EST$/D':>8} {'EXPO$':>7} "
+                     f"{'EVENT':<28} {'WHAT IT IS':<40} {'MKTS':>4} "
+                     f"{'POOL$/D':>8}  WHY NOT QUOTED")
         for d in show:
             lines.append(
-                f"{permin(d):>6} {est_str(d):>8} {d['event'][:28]:<28} "
-                f"{(d['title'] or '?')[:46]:<46} {d['n']:>4} {d['pool']:>8,.0f}  "
+                f"{yld_str(d):>7} {permin(d):>6} {est_str(d):>8} {exp_str(d):>7} "
+                f"{d['event'][:28]:<28} {(d['title'] or '?')[:40]:<40} "
+                f"{d['n']:>4} {d['pool']:>8,.0f}  "
                 f"{d['reason']} ({fmt_window(d['end'], now_utc)})")
     else:
         lines.append("No unquoted opportunities above the display floor.")
@@ -615,7 +648,11 @@ def build_report(now_utc: datetime):
                  "two-sided coverage and no competitor response. Partial "
                  "event estimates are marked '>='. Rows are independent "
                  "per-market estimates — quoting them all at once would hit "
-                 "the event cap / collateral budget.")
+                 "the event cap / collateral budget. YLD%/D = est $/day per "
+                 "$ of exposure; EXPO$ = the modeled ladder's collateral "
+                 "(incl. depth pads) scaled by book action, x(1 + "
+                 "min(24h volume / book depth, 3)) — busy books fill resting "
+                 "size, so a dollar resting there is more exposed.")
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
@@ -637,10 +674,12 @@ def build_report(now_utc: datetime):
                  f'"quoted" set may be old.</div>')
     if show:
         h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
-                 'ranked by profit per minute</div>')
+                 'ranked by est $/day per $ of exposure, then est $/day</div>')
         h.append('<table style="border-collapse:collapse">')
         h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
+                 f'<td style="{TD}">YLD %/D</td>'
                  f'<td style="{TD}">C/MIN</td><td style="{TD}">EST $/D</td>'
+                 f'<td style="{TD}">EXPO $</td>'
                  f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
                  f'<td style="{TD}">MKTS</td><td style="{TD}">POOL $/D</td>'
                  f'<td style="{TDL}">WHY NOT QUOTED</td></tr>')
@@ -648,8 +687,10 @@ def build_report(now_utc: datetime):
             bg = "#fafafa" if i % 2 else "#fff"
             h.append(
                 f'<tr style="background:{bg}">'
-                f'<td style="{TD};font-weight:700;color:#b45309">{permin(d)}</td>'
+                f'<td style="{TD};font-weight:700;color:#b45309">{yld_str(d)}</td>'
+                f'<td style="{TD}">{permin(d)}</td>'
                 f'<td style="{TD};font-weight:600">{est_str(d)}</td>'
+                f'<td style="{TD}">{exp_str(d)}</td>'
                 f'<td style="{TDL}"><b>{d["event"]}</b></td>'
                 f'<td style="{TDL}">{d["title"] or "?"}</td>'
                 f'<td style="{TD}">{d["n"]}</td>'
@@ -694,8 +735,12 @@ def build_report(now_utc: datetime):
              'two-sided coverage, no competitor response. Partial event '
              'estimates are marked "&ge;". Rows are independent per-market '
              'estimates — quoting them all at once would hit the event cap / '
-             'collateral budget. Config mirrored from the live launcher '
-             'env.</div>')
+             'collateral budget. YLD %/D = est $/day per $ of exposure; '
+             'EXPO $ = the modeled ladder\'s collateral (incl. depth pads) '
+             'scaled by book action, &times;(1 + min(24h volume / book '
+             'depth, 3)) — busy books fill resting size, so a dollar '
+             'resting there is more exposed. Config mirrored from the live '
+             'launcher env.</div>')
     h.append('</div>')
     return text, "".join(h), subject
 
