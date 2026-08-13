@@ -107,6 +107,19 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 DRY_RUN = os.environ.get("LOW_DRY_RUN", "false").lower() == "true"
+# Model-vs-market divergence gate (2026-08-12 settlement study, n=54 traded):
+# when fair_NO exceeded the market's NO mid by >12c, NO won only 28-40% —
+# the market was right and the model wrong (winner's curse). Retro: gating
+# fair-mid>12c kept 19/54 trades for +$21.89 vs -$27.89 ungated. 0 disables.
+MAX_DIVERGENCE_CENTS = float(os.environ.get("LOW_MAX_DIVERGENCE_CENTS", "12"))
+# Forecast-std multiplier, default OFF (1.0). The 960-market calibration
+# study found global widening improves unconditional log-loss (k~2-3) but
+# WORSENS the traded-set calibration: wider dist => lower P(band) => HIGHER
+# fair_NO on exactly the bets the bot loses, and every trade then trips the
+# divergence gate. Knob exists for experiments; do not enable without a new
+# study. (True error shape is a mixture — near-exact forecasts plus a fat
+# miss cluster — which no single scale factor fits.)
+STD_MULT = float(os.environ.get("LOW_STD_MULT", "1.0"))
 
 
 def load_private_key(b64_key="", file_path=""):
@@ -1127,6 +1140,9 @@ CITY_FLOOR_STD = {
 combined_table['City Floor Std'] = combined_table['City'].map(CITY_FLOOR_STD).fillna(1.5)
 combined_table['Standard Deviation'] = combined_table[['Standard Deviation', 'City Floor Std']].max(axis=1)
 combined_table['Standard Deviation'] = combined_table['Standard Deviation'].replace({0: 1.5, np.nan: 1.5})
+if STD_MULT != 1.0:
+    combined_table['Standard Deviation'] = combined_table['Standard Deviation'] * STD_MULT
+    print(f"  STD_MULT={STD_MULT:g}x applied to forecast std (calibration experiment)")
 
 combined_table['high_range'] = pd.to_numeric(combined_table['high_range'], errors='coerce')
 combined_table['low_range'] = pd.to_numeric(combined_table['low_range'], errors='coerce')
@@ -1455,6 +1471,7 @@ SAFETY_MARGIN_CENTS = int(os.environ.get("LOW_SAFETY_MARGIN_CENTS", "3"))
 
 print(f"\n[CONFIG] starting_contracts={starting_contracts} night_mult={night_size_mult:g} "
       f"max_contracts={max_contracts} trade_tails={TRADE_TAILS} "
+      f"divergence_gate={MAX_DIVERGENCE_CENTS:g}c std_mult={STD_MULT:g} "
       f"safety_margin={SAFETY_MARGIN_CENTS}c dry_run={DRY_RUN}")
 
 write_run_row(
@@ -1643,6 +1660,19 @@ for index, row in combined_table.iterrows():
 
   # Fair-NO cap (always on)
   _fair_no_cents = 100.0 * (1.0 - float(yes_prob))
+
+  # Filter 5 (2026-08-12): model-vs-market divergence gate. When our fair NO
+  # is far above what the market pays, history says the MARKET is right
+  # (fair-paid >15c: NO won 28%, -$32 of the bot's -$28 total). Same
+  # humility rule as the crypto MMs' MAX_FAIR_DIVERGENCE: big disagreement
+  # means we'd be taking a view, not providing liquidity.
+  _no_mid = (float(no_bid) + float(no_offer)) / 2.0
+  _div = _fair_no_cents - _no_mid
+  if MAX_DIVERGENCE_CENTS > 0 and _div > MAX_DIVERGENCE_CENTS:
+    print(f"    SKIP: divergence {_div:.0f}c (fair_NO {_fair_no_cents:.0f}c vs "
+          f"market NO mid {_no_mid:.0f}c) > {MAX_DIVERGENCE_CENTS:g}c gate")
+    continue
+
   _hi_no_config = float(hi_no)
   _effective_hi_no = min(_hi_no_config, _fair_no_cents - SAFETY_MARGIN_CENTS)
   if _effective_hi_no < 2:
