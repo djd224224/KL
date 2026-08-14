@@ -206,18 +206,43 @@ def _crypto_family(ticker: str):
     return "weekly" if close_day.weekday() == 4 else "daily"
 
 
+def _settlement_pnl(s: dict) -> float:
+    """Net P&L of one settlement record: payout on the WINNING side's traded
+    count minus ALL money spent on both sides.
+
+    NOT `revenue` — that field is the gross payout on the net held position
+    (never negative, never cost-adjusted; summing it inflated the first
+    version of this table ~4x, caught by Jack 2026-08-14). The payout-cost
+    form is validated against the KXHIGH ground-truth recipe: it reproduces
+    the independently-verified monthly sums (Mar -408 / Apr +1,124 / May
+    -634 / Jun -1,706 / Jul +1,944) from the same records. Results other
+    than yes/no (voids/refunds) fall back to revenue, which for a refund IS
+    the money returned."""
+    yes_n = _f(s.get("yes_count_fp") or s.get("yes_count"))
+    no_n = _f(s.get("no_count_fp") or s.get("no_count"))
+    res = s.get("market_result")
+    if res == "yes":
+        payout = yes_n
+    elif res == "no":
+        payout = no_n
+    else:
+        payout = _f(s.get("revenue")) / 100.0
+    return payout - _f(s.get("yes_total_cost_dollars")) - _f(s.get("no_total_cost_dollars"))
+
+
 def cumulative_family_realized(client) -> dict:
     """family -> all-time realized $ for the crypto fleets' tenor families.
 
     Settled history comes from the settlements API — the positions endpoint
     AGES OUT settled records (verified 2026-08-14: zero July monthlies remain
     there) while settlements reach back to account origin, the same source
-    the KXHIGH ground-truth recipe trusts. A settlement's `revenue` is net
-    profit in cents (negative on losses). Round-trip realized on STILL-OPEN
-    markets is added from unsettled positions. Round trips on markets that
-    later settled are the one blind spot (neither source keeps them); these
-    fleets are hold-to-settle-dominant, so the miss is small — but this is a
-    measured number with that stated edge, not a model."""
+    the KXHIGH ground-truth recipe trusts — scored per record by
+    _settlement_pnl (see its docstring for why NOT `revenue`). Round-trip
+    realized on STILL-OPEN markets is added from unsettled positions. Round
+    trips on markets that later settled are the one blind spot (neither
+    source keeps them); these fleets are hold-to-settle-dominant, so the
+    miss is small — but this is a measured number with that stated edge,
+    not a model."""
     fams = {}
     cursor = None
     for _page in range(500):
@@ -229,7 +254,7 @@ def cumulative_family_realized(client) -> dict:
         for s in batch:
             fam = _crypto_family(s.get("ticker") or "")
             if fam:
-                fams[fam] = fams.get(fam, 0.0) + _f(s.get("revenue")) / 100.0
+                fams[fam] = fams.get(fam, 0.0) + _settlement_pnl(s)
         cursor = resp.get("cursor")
         if not cursor or not batch:
             break
