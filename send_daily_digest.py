@@ -105,6 +105,8 @@ def event_pnl(client, event_ticker: str) -> dict:
 
 WEEKLY_STATUS_DIR = os.environ.get(
     "CUD_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\crypto-updown")
+ANNUAL_STATUS_DIR = os.environ.get(
+    "CAY_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\crypto-annual")
 
 
 def fleet_health(status_dir: str = STATUS_DIR, label: str = "Bots") -> str:
@@ -147,14 +149,14 @@ TD = 'padding:5px 12px;border:1px solid #ddd;text-align:right;'
 TDL = 'padding:5px 12px;border:1px solid #ddd;text-align:left;'
 
 
-def weekly_entries() -> list:
-    """[(asset, [event_tickers])] for the updown weekly fleet, read from its
-    bots' own heartbeats (their events are DISCOVERED, not computed, so the
-    status files are the source of truth for what each bot is trading).
-    A stale heartbeat still names the right event most of the day; staleness
-    itself is flagged by the weekly health line, not here."""
+def fleet_entries(status_dir: str) -> list:
+    """[(asset, [event_tickers])] for a discovery-based fleet (updown,
+    annual), read from its bots' own heartbeats (their events are DISCOVERED,
+    not computed, so the status files are the source of truth for what each
+    bot is trading). A stale heartbeat still names the right event most of the
+    day; staleness itself is flagged by that fleet's health line, not here."""
     entries = []
-    for path in sorted(glob.glob(os.path.join(WEEKLY_STATUS_DIR, "status_*.json"))):
+    for path in sorted(glob.glob(os.path.join(status_dir, "status_*.json"))):
         try:
             with open(path, encoding="utf-8") as f:
                 st = json.load(f)
@@ -163,6 +165,53 @@ def weekly_entries() -> list:
         evs = [e.get("ticker") for e in (st.get("events") or []) if e.get("ticker")]
         entries.append((st.get("market", os.path.basename(path)), evs))
     return entries
+
+
+def _event_exists(client, event_ticker: str) -> bool:
+    try:
+        client.get_event(event_ticker)
+        return True
+    except Exception:
+        return False
+
+
+def updown_tenor_entries(client, today_ct) -> tuple:
+    """(daily_entries, weekly_entries) for the updown fleet, split by each
+    heartbeat event's own cadence tag (the bots quote daily+weekly in one
+    process since 2026-08-14, so a single lumped section would hide which
+    tenor made the money).
+
+    Each asset's DAILY list also gets yesterday's settled 5pm-ET event
+    (ticker computed as {series}-{YY}{MON}{DD}17): a daily settles at 5pm
+    and leaves the heartbeat immediately, so the 7am digest would otherwise
+    never show a settled daily's realized P&L. When yesterday was Friday
+    that 5pm close IS the weekly event, so it lands in the WEEKLY list
+    instead. Events that never listed (e.g. KXZECD) are skipped after an
+    existence probe; assets with no fills there just count as flat."""
+    yday = today_ct - timedelta(days=1)
+    yday_ev_suffix = f"{yday:%y%b%d}".upper() + "17"
+    yday_was_friday = yday.weekday() == 4
+    daily, weekly = [], []
+    for path in sorted(glob.glob(os.path.join(WEEKLY_STATUS_DIR, "status_*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            continue
+        label = st.get("market", os.path.basename(path))
+        evs = st.get("events") or []
+        d_evs = [e["ticker"] for e in evs
+                 if e.get("ticker") and e.get("cadence") == "daily"]
+        w_evs = [e["ticker"] for e in evs
+                 if e.get("ticker") and e.get("cadence") == "weekly"]
+        series = st.get("series")
+        if isinstance(series, str) and series:
+            settled = f"{series}-{yday_ev_suffix}"
+            if settled not in d_evs + w_evs and _event_exists(client, settled):
+                (w_evs if yday_was_friday else d_evs).append(settled)
+        daily.append((label, d_evs))
+        weekly.append((label, w_evs))
+    return daily, weekly
 
 
 def collect_rows(client, entries):
@@ -270,14 +319,18 @@ def html_section(title, rows, tot, quiet, failed, health):
 
 def build_digest(now_utc: datetime):
     """Returns (plain_text, html): monthly one-touch section + weekly
-    above/below section in the identical format (Jack 2026-08-12)."""
+    above/below section in the identical format (Jack 2026-08-12), plus the
+    annual section (2026-08-13)."""
     today_ct = now_utc.astimezone(CT).date()
     client = build_client()
 
     monthly_entries = [(key, [event_ticker_for(MARKETS[key], now_utc)])
                        for key in sorted(MARKETS)]
     m_rows, m_tot, m_failed, m_quiet = collect_rows(client, monthly_entries)
-    w_rows, w_tot, w_failed, w_quiet = collect_rows(client, weekly_entries())
+    d_entries, w_entries = updown_tenor_entries(client, today_ct)
+    w_rows, w_tot, w_failed, w_quiet = collect_rows(client, w_entries)
+    d_rows, d_tot, d_failed, d_quiet = collect_rows(client, d_entries)
+    a_rows, a_tot, a_failed, a_quiet = collect_rows(client, fleet_entries(ANNUAL_STATUS_DIR))
 
     try:
         balance = _f(client.get_balance().get("balance_dollars"))
@@ -285,10 +338,13 @@ def build_digest(now_utc: datetime):
     except Exception:
         bal_str = "?"
 
-    grand = {k: m_tot[k] + w_tot[k] for k in m_tot}
+    grand = {k: m_tot[k] + w_tot[k] + d_tot[k] + a_tot[k] for k in m_tot}
     grand_pnl = grand["realized"] + grand["unrealized"]
     m_health = fleet_health(STATUS_DIR, "Monthly bots")
-    w_health = fleet_health(WEEKLY_STATUS_DIR, "Weekly bots")
+    w_health = fleet_health(WEEKLY_STATUS_DIR, "Updown bots")
+    # daily + weekly are the SAME 7 processes; health shown once under weekly
+    d_health = "(same bots as the weekly section)"
+    a_health = fleet_health(ANNUAL_STATUS_DIR, "Annual bots")
 
     # ---- plain text (fallback part) ----------------------------------------
     lines = [f"Kalshi crypto MM - {today_ct}", ""]
@@ -303,6 +359,12 @@ def build_digest(now_utc: datetime):
     lines.append("")
     lines += text_section("WEEKLY above/below (KX*D)",
                           w_rows, w_tot, w_quiet, w_failed, w_health)
+    lines.append("")
+    lines += text_section("DAILY above/below (KX*D, incl. yesterday's settle)",
+                          d_rows, d_tot, d_quiet, d_failed, d_health)
+    lines.append("")
+    lines += text_section("ANNUAL touch+terminal (KX*MAXY/*MINY/*Y)",
+                          a_rows, a_tot, a_quiet, a_failed, a_health)
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
@@ -322,6 +384,10 @@ def build_digest(now_utc: datetime):
                       m_rows, m_tot, m_quiet, m_failed, m_health)
     h += html_section("Weekly above/below (KX*D)",
                       w_rows, w_tot, w_quiet, w_failed, w_health)
+    h += html_section("Daily above/below (KX*D, incl. yesterday's settle)",
+                      d_rows, d_tot, d_quiet, d_failed, d_health)
+    h += html_section("Annual touch+terminal (KX*MAXY / *MINY / *Y)",
+                      a_rows, a_tot, a_quiet, a_failed, a_health)
     h.append('</div>')
     return text, "".join(h)
 

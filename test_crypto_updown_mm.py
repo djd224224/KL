@@ -50,11 +50,14 @@ def mkt(strike, event=EV_H, open_dt=None, end_dt=None, status="active",
         strike_type="greater", ticker=None):
     open_dt = open_dt or NOW - timedelta(hours=1)
     end_dt = end_dt or NOW + timedelta(hours=2)
+    # Kalshi listing reality (verified live 2026-08-14): expected_expiration
+    # runs 300s AFTER close on every KX*D market. Fixtures reproduce the skew
+    # so every gate in the suite is exercised on the same basis as production.
     return {"ticker": ticker or f"{event}-T{strike}", "event_ticker": event,
             "status": status, "market_type": "binary", "strike_type": strike_type,
             "floor_strike": strike, "cap_strike": None,
             "open_time": iso(open_dt), "close_time": iso(end_dt),
-            "expected_expiration_time": iso(end_dt)}
+            "expected_expiration_time": iso(end_dt + timedelta(seconds=300))}
 
 
 def hourly_event(n=6, base=100000.0, spacing=100.0, end_hours=2.0):
@@ -323,21 +326,26 @@ class TestStrikeExtraction(unittest.TestCase):
 
 class TestCadenceClassification(unittest.TestCase):
     def test_real_observed_windows(self):
-        # Measured from the live API on 2026-08-05.
+        # Measured from the live API on 2026-08-05; annual added 2026-08-13
+        # (KX{ASSET}Y end-of-year events run ~8700h from their January open).
         self.assertEqual(ud.classify_cadence(1.0), "hourly")
         self.assertEqual(ud.classify_cadence(25.0), "daily")
         self.assertEqual(ud.classify_cadence(169.0), "weekly")
+        self.assertEqual(ud.classify_cadence(8700.0), "annual")
 
     def test_boundaries(self):
         self.assertEqual(ud.classify_cadence(ud.HOURLY_MAX_HOURS), "hourly")
         self.assertEqual(ud.classify_cadence(ud.HOURLY_MAX_HOURS + 0.1), "daily")
         self.assertEqual(ud.classify_cadence(ud.DAILY_MAX_HOURS), "daily")
         self.assertEqual(ud.classify_cadence(ud.DAILY_MAX_HOURS + 0.1), "weekly")
+        self.assertEqual(ud.classify_cadence(ud.WEEKLY_MAX_HOURS), "weekly")
+        self.assertEqual(ud.classify_cadence(ud.WEEKLY_MAX_HOURS + 0.1), "annual")
 
     def test_parse_cadences(self):
         self.assertEqual(ud.parse_cadences("both"), ("hourly", "daily"))
         self.assertEqual(ud.parse_cadences(""), ("hourly", "daily"))
-        self.assertEqual(ud.parse_cadences("all"), ("hourly", "daily", "weekly"))
+        self.assertEqual(ud.parse_cadences("all"),
+                         ("hourly", "daily", "weekly", "annual"))
         self.assertEqual(ud.parse_cadences("weekly"), ("weekly",))
         self.assertEqual(ud.parse_cadences("daily, hourly"), ("daily", "hourly"))
         self.assertEqual(ud.parse_cadences("daily,daily"), ("daily",))
@@ -374,6 +382,75 @@ class TestEventViews(unittest.TestCase):
         self.assertEqual([v.ticker for v in ud.select_events(views, ("daily",), NOW)], [EV_D])
         self.assertEqual([v.ticker for v in ud.select_events(views, ud.CADENCES, NOW)],
                          [EV_H, EV_D, EV_W])
+
+    def test_end_is_the_settlement_print_not_expected_expiration(self):
+        """The print is the 60s average ending at close_time;
+        expected_expiration runs 300s later. Gating on the latter shifted
+        every stand-down 5 minutes late (adversarial review, 2026-08-14)."""
+        m = mkt(100000)
+        self.assertEqual(ud.market_end_utc(m), NOW + timedelta(hours=2))
+        no_close = dict(m)
+        del no_close["close_time"]
+        self.assertEqual(ud.market_end_utc(no_close),
+                         NOW + timedelta(hours=2, seconds=300))
+
+    def test_hourly_stand_down_fires_on_the_close_basis(self):
+        # On the expected_expiration basis secs_left never dropped below 300,
+        # so the 180s hourly gate was dead code.
+        soon = [mkt(100000, EV_H, NOW - timedelta(hours=1),
+                    NOW + timedelta(seconds=170))]
+        views = ud.build_event_views(soon, NOW)
+        self.assertEqual(views[0].cadence, "hourly")
+        self.assertEqual(ud.select_events(views, ("hourly",), NOW), [])
+
+    def test_daily_sharing_the_weekly_print_stands_down(self):
+        """Jack 2026-08-14: on Fridays the 5pm close IS the weekly event, and
+        a daily event ending on the same print would be the same bet quoted
+        twice — the shorter tenor stands down, the weekly keeps quoting."""
+        wk_end = NOW + timedelta(days=2)
+        weekly = [mkt(100000, EV_W, NOW - timedelta(days=5), wk_end)]
+        colliding_daily = [mkt(100000, EV_D, wk_end - timedelta(hours=25), wk_end,
+                               ticker=f"{EV_D}-T100000x")]
+        views = ud.build_event_views(weekly + colliding_daily, NOW)
+        selected = ud.select_events(views, ("daily", "weekly"), NOW)
+        self.assertEqual([v.ticker for v in selected], [EV_W])
+
+    def test_daily_on_its_own_print_is_kept(self):
+        # Saturday's daily ends 9h from now, the weekly 2d from now: no clash.
+        views = ud.build_event_views(daily_event() + weekly_event(), NOW)
+        selected = ud.select_events(views, ("daily", "weekly"), NOW)
+        self.assertEqual({v.cadence for v in selected}, {"daily", "weekly"})
+
+    def test_collision_rule_generalizes_to_hourly(self):
+        # The 5pm hourly ends on the daily/weekly print every day.
+        wk_end = NOW + timedelta(days=2)
+        weekly = [mkt(100000, EV_W, NOW - timedelta(days=5), wk_end)]
+        hourly = [mkt(100000, EV_H, wk_end - timedelta(hours=1), wk_end,
+                      ticker=f"{EV_H}-T100000x")]
+        views = ud.build_event_views(weekly + hourly, NOW)
+        selected = ud.select_events(views, ud.CADENCES, NOW)
+        self.assertEqual([v.cadence for v in selected], ["weekly"])
+
+    def test_collision_needs_the_longer_tenor_to_be_selected(self):
+        # A lone daily (weekly cadence not requested / weekly event absent)
+        # has nothing of ours to collide with.
+        wk_end = NOW + timedelta(days=2)
+        daily = [mkt(100000, EV_D, wk_end - timedelta(hours=25), wk_end)]
+        views = ud.build_event_views(daily, NOW)
+        self.assertEqual(len(ud.select_events(views, ("daily",), NOW)), 1)
+
+    def test_same_print_daily_stays_benched_through_weekly_stand_down(self):
+        """When the weekly enters its own final-hour stand-down it leaves the
+        expiry-filtered set — the shared print is at its most dangerous right
+        then, and a same-print daily must NOT wake up for the finale. The
+        collision check therefore runs against all cadence-matched views."""
+        wk_end = NOW + timedelta(minutes=30)
+        weekly = [mkt(100000, EV_W, wk_end - timedelta(days=7), wk_end)]
+        daily = [mkt(100000, EV_D, wk_end - timedelta(hours=25), wk_end,
+                     ticker=f"{EV_D}-T100000x")]
+        views = ud.build_event_views(weekly + daily, NOW)
+        self.assertEqual({v.cadence for v in views}, {"daily", "weekly"})
+        self.assertEqual(ud.select_events(views, ("daily", "weekly"), NOW), [])
 
     def test_selection_drops_events_near_expiry(self):
         # 1 minute left on an hourly event: inside the 3-minute stand-down.
@@ -497,6 +574,74 @@ class TestRunCycle(unittest.TestCase):
             totals[key] = totals.get(key, 0) + o["remaining_count"]
         self.assertTrue(totals)
         self.assertLessEqual(max(totals.values()), 6)
+
+    def test_daily_tenor_quotes_one_contract_rungs(self):
+        """Jack 2026-08-14: daily goes live at 1/1/1 (three 1-contract rungs)
+        while weekly keeps the doubled 2s. Changing either is a size change on
+        a live bot and should have to break a test first."""
+        self.assertEqual(ud.CONTRACTS_PER_LEVEL_BY_CADENCE, {"daily": 1})
+        c = FakeClient(markets=daily_event() + weekly_event())
+        b = bot(c, cadences=("daily", "weekly"))
+        with priced():
+            b.run_cycle()
+        by_cadence = {}
+        for o in b.state.sim_orders.values():
+            cad = "daily" if o["ticker"].startswith(EV_D) else "weekly"
+            by_cadence.setdefault(cad, set()).add(o["remaining_count"])
+        self.assertEqual(by_cadence["daily"], {1})
+        self.assertEqual(by_cadence["weekly"], {2})
+
+    def test_deselected_event_orders_are_cleared_not_left_to_ttl(self):
+        """An event that leaves selection (stand-down/collision/delisting)
+        must have its book actively cleared — leaving it to the exchange TTL
+        parks up to 600s of stale quotes in the final minutes before the
+        settlement print (adversarial review, 2026-08-14)."""
+        c = FakeClient(markets=daily_event() + weekly_event())
+        b = bot(c, cadences=("daily", "weekly"))
+        with priced():
+            b.run_cycle()
+        self.assertTrue(any(o["ticker"].startswith(EV_D)
+                            for o in b.state.sim_orders.values()))
+        # the daily event is now inside its 15-minute stand-down
+        dying = [dict(m, close_time=iso(NOW + timedelta(minutes=10)),
+                      expected_expiration_time=iso(NOW + timedelta(minutes=15)))
+                 for m in daily_event()]
+        c.markets = dying + weekly_event()
+        with priced():
+            b.run_cycle()
+        self.assertFalse(any(o["ticker"].startswith(EV_D)
+                             for o in b.state.sim_orders.values()))
+        self.assertTrue(any(o["ticker"].startswith(EV_W)
+                            for o in b.state.sim_orders.values()))
+
+    def test_live_deselect_sweep_cancels_on_the_exchange(self):
+        c = FakeClient()
+        b = bot(c, live=True, cadences=("daily", "weekly"))
+        c.orders_by_event[EV_D] = [
+            {"order_id": "o1", "client_order_id": "cud-x-1", "status": "resting"},
+            {"order_id": "o2", "client_order_id": "cud-x-2", "status": "resting"},
+        ]
+        b.u.sweep_pending = {EV_D: 0}
+        b.sweep_deselected()
+        self.assertEqual(sorted(c.cancelled), ["o1", "o2"])
+        self.assertIn(EV_D, b.u.sweep_pending)   # not proven clean yet
+        # two consecutive clean reads retire the sweep — an order in flight
+        # during the first sweep is caught by the second
+        c.orders_by_event[EV_D] = []
+        b.sweep_deselected()
+        self.assertEqual(b.u.sweep_pending, {EV_D: 1})
+        b.sweep_deselected()
+        self.assertEqual(b.u.sweep_pending, {})
+
+    def test_singleton_lock_lands_in_the_fleet_status_dir(self):
+        # The updown/annual fleets lock in their OWN heartbeat dirs — a lock
+        # in the touch fleet's dir would collide across fleets on cfg.key.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(mm.acquire_singleton("BTC", status_dir=td))
+            self.assertTrue(os.path.exists(os.path.join(td, "lock_BTC.pid")))
+            # same-pid re-acquire must not deadlock the restart loop
+            self.assertTrue(mm.acquire_singleton("BTC", status_dir=td))
 
     def test_band_is_ten_to_ninety(self):
         self.assertEqual((ud.SKIP_FAIR_BELOW_CENTS, ud.SKIP_FAIR_ABOVE_CENTS), (10, 90))
