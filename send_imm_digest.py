@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import textwrap
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -983,6 +984,732 @@ def rain_dir_section(client):
     return text, html
 
 
+# ---------------------------------------------------------------------------
+# CUTOFF AUDIT — our earnings call-time override vs Kalshi's own ticker date.
+#
+# Why this section exists (Jack 2026-08-05): KXEARNINGSMENTIONLLY-26AUG07 stopped
+# being quoted at 10:50Z. The override said the Eli Lilly call was 2026-08-05
+# 07:00 ET while the Kalshi TICKER (-26AUG07), the sub_title ("On Aug 7, 2026")
+# and the incentive program's end_date all said Aug 7. The first read was "our
+# override is wrong". It was not: Lilly reported the morning of Aug 5, Kalshi
+# closed and finalized the event at 2026-08-05T16:08Z, and standing down at
+# 10:50Z is exactly what kept the bot from quoting through a live print. Kalshi's
+# three "independent" signals are really one — ticker date, sub_title and program
+# end all derive from the same internal date (program end == ticker date 10 of 10
+# on live earnings events), so they corroborate each other for free and in this
+# case were wrong together.
+#
+# The two directions are NOT symmetric, which is the whole point of the section:
+#   * override EARLIER than the ticker date -> the bot stands down early. Costs
+#     reward accrual, carries NO adverse-selection risk, and on every conflict
+#     that has actually resolved the override was the right date and the ticker
+#     the wrong one (BA closed 7/28 vs ticker 7/21, HOOD 7/29 vs 7/17, PGR 8/4
+#     vs 7/15, LLY 8/5 vs 8/7 — override 4, Kalshi ticker 0). Show it, quietly.
+#   * override LATER than the ticker date -> the bot keeps quoting PAST Kalshi's
+#     date and can make markets straight through a real earnings call. Real
+#     money, real adverse selection. This direction shouts.
+#
+# Tolerance is EXACTLY ZERO, deliberately. The tempting carve-out is "a call
+# after the close on day N with a ticker dated N+1 is just Kalshi's encoding" —
+# but that shape occurs 1 time in 34 after-close overrides (33 of 34 AMC entries
+# sit on delta 0; ABNB and LYFT are both Aug-6 after-close carrying 26AUG06
+# tickers). Kalshi's convention IS ticker date = release date, so the lone -1
+# (DKNG-26AUG07, measured 2026-08-05) is a genuine date error and a tolerance
+# window would exist only to hide the very case Jack asked to see.
+#
+# SCOPE is every override with a parseable ticker date, NOT just earnings.
+# The first cut gated on KXEARNINGSMENTION and that was wrong: incentive_mm.py
+# (:1195) puts company-disclosure RELEASE times — KXINTC, KXFSLR, KXCOINBASE —
+# under the same tight OVERRIDE_BUFFER_MIN as earnings calls, i.e. the bot
+# already treats them as adverse-selection-critical, and a LATE override on a
+# political-mention series is the same class of bug. Measured 2026-08-05,
+# widening the gate adds 10 checked keys and ZERO extra rows, so the narrow
+# gate bought no quiet and cost coverage. The ONE exclusion that survives is
+# SCHEDULE_RESOLVED_SERIES (WNBA/MLB/WC), where a LATE override means a
+# POSTPONED GAME — legitimate, different remedy — and the excluded count is
+# printed so the exclusion is never silent.
+#
+# Kept here rather than in a shared module: only the digest reports it, and
+# imm_earnings_overrides.py already owns a different question (does an override
+# EXIST for every paying event) with its own stale-ticker autofix.
+# ---------------------------------------------------------------------------
+
+
+def _override_hour_label(ov_et: datetime, is_earnings: bool) -> str:
+    """What the override's TIME actually means. nasdaq_release_datetime()
+    (imm_earnings_overrides.py) SYNTHESIZES 16:00 from an after-close flag and
+    07:00 from a before-open flag — those are proxies for a date, not call
+    times. Anything else was scraped off the IR page and is a real time. The
+    email must not claim "the call is at 4:00pm ET" on a synthesized hour.
+
+    The proxy reading is only valid for earnings series, which is the only
+    place nasdaq_release_datetime() writes; a 16:00 on KXTRUMPMENTION is just
+    a start time somebody set."""
+    if not is_earnings:
+        return "hand-set start time"
+    if (ov_et.hour, ov_et.minute) == (16, 0):
+        return "after close (Nasdaq proxy 4pm ET)"
+    if (ov_et.hour, ov_et.minute) == (7, 0):
+        return "before open (Nasdaq proxy 7am ET)"
+    return "scraped call time"
+
+
+# ---------------------------------------------------------------------------
+# UNVERIFIED CALL TIMES — the hole this section plugs (Jack 2026-08-06).
+#
+# The audit above compares DATES. KXEARNINGSMENTIONCELH-26AUG06 had the right
+# date and the wrong HOUR: Nasdaq's calendar carried no time flag, the resolver
+# fell through to 16:00 ET, Celsius actually reported before the open with an
+# 8:00am call, and the bot quoted the event all morning with the results already
+# public. delta was 0, so the audit skipped it at the `if delta == 0: continue`
+# and tomorrow's 7:10am email would have said nothing.
+#
+# WHY NOT JUST FLAG EVERY 16:00: 29 of the 49 live earnings overrides sit at
+# 16:00 and 28 of them are a real Nasdaq after-close flag. A "16:00 is
+# suspicious" rule ships 29 rows every morning to catch one — a ratio that
+# guarantees the section gets skimmed, and a skimmed section is worth less than
+# no section because it also buries the date rows next to it. The distinguishing
+# fact is not the hour, it is whether anyone MEASURED the hour, and that fact
+# was thrown away at write time. imm_earnings_overrides.record_meta() now keeps
+# it in a sidecar; measured over the 43 Nasdaq resolutions in the task log
+# (2026-07-23..08-06) the "guess" class is 1. This section is empty on ~97% of
+# mornings BY CONSTRUCTION, which is the only reason it will still be read on
+# the morning it is not.
+#
+# Sidecar, not a shape change to event_start_overrides.json: incentive_mm's
+# load_file_event_overrides() (:1481) runs parse_iso_utc(str(iso).strip()) on
+# every value and DROPS entries it cannot parse, so a dict-valued override would
+# delete the live bot's cutoff outright. See the module comment in
+# imm_earnings_overrides.py. Absent sidecar => the check reports itself as not
+# yet effective rather than reporting "clean".
+OVERRIDE_META_PATH = os.path.join(STATUS_DIR, "event_start_overrides_meta.json")
+
+
+def _days_out_phrase(n: int) -> str:
+    """Imminence, in words. A +6d LATE row whose ticker date is three weeks
+    out needs nothing this morning; one whose ticker date is TODAY needs
+    action within the hour. An ISO date renders those identically at 7:10am,
+    so the reader has to do the subtraction — this does it for them."""
+    if n == 0:
+        return "TODAY"
+    if n == 1:
+        return "TOMORROW"
+    if n > 1:
+        return "in {}d".format(n)
+    if n == -1:
+        return "yesterday"
+    return "{}d ago".format(-n)
+
+
+def cutoff_audit(client, now_utc: datetime, own_pos: dict = None) -> dict:
+    """Start overrides whose ET DATE disagrees with their Kalshi ticker date.
+
+    Returns {"rows": [...], "checked", "total", "excluded", "no_day",
+    "dead": [event...], "error"}. NEVER raises — build_digest has no
+    per-section guard and main() would retry a raising build 8 times at 5-minute
+    intervals and then send nothing all day, so every failure comes back as
+    {"error": ...} for the renderers to print.
+
+    own_pos is build_digest's own_book() position map (market ticker -> signed
+    contracts). It costs no extra API call and it is the only number in the
+    section that is actual EXPOSURE; everything else is reward pool, i.e. what
+    standing down would forfeit.
+
+    Source of truth is imm.EVENT_START_OVERRIDES after load_file_event_overrides()
+    (in-process merge only, no writes), NOT the JSON file: five overrides are
+    hard-coded as the IMM_EVENT_START_OVERRIDE default in incentive_mm.py and
+    never appear in the file — one of them, KXEARNINGSMENTIONNFLX-26JUL02, is
+    itself +14d LATE.
+
+    Gates, in order:
+      1. never schedule-resolved series (WNBA/MLB/WC): a LATE override there is
+         a POSTPONED GAME, which is legitimate and has a different remedy. This
+         is the ONLY series exclusion — see the module comment on why the old
+         earnings-only gate was removed — and it is counted and printed.
+      2. parse_event_date() -> None means the ticker carries no calendar day at
+         all (KXTLN-26AUGGEN, KXCOINBASE-26JULVOL). That is "not comparable",
+         never "mismatch"; counted and reported, not flagged.
+      3. compare in ET on BOTH sides. parse_event_date returns midnight ET as
+         UTC and overrides are stored at -04:00, so a UTC-date comparison
+         invents a spurious +1d on any evening entry.
+      4. delta == 0 -> agree. See the module comment on why the tolerance is
+         exactly zero.
+
+    Then the money gate: an event with no LIVE incentive program is dead history.
+    The overrides file is never garbage-collected, so without this the section
+    would ship BA-26JUL21 and PGR-26JUL15 forever and grow by one row with every
+    stale-ticker autofix. The same sweep supplies the pool $/day, which sizes a
+    row but is NOT its risk."""
+    a = {"rows": [], "checked": 0, "total": 0, "excluded": 0, "no_day": 0,
+         "dead": [], "error": None, "unverified": [], "no_prov": 0}
+    try:
+        imm.load_file_event_overrides()          # in-process merge; no writes
+        meta = load_json(OVERRIDE_META_PATH)      # advisory; {} when absent
+
+        # Live liquidity pool per event, same accounting as the bot's own
+        # fetch_programs(): period_reward is CENTI-cents, spread over the
+        # program's own length.
+        pools, cursor = {}, None
+        for _page in range(20):
+            params = {"limit": 1000, "status": "active"}
+            if cursor:
+                params["cursor"] = cursor
+            resp = client.get("/incentive_programs", params=params)
+            batch = resp.get("incentive_programs") or []
+            for p in batch:
+                if p.get("incentive_type") != "liquidity" or p.get("paid_out"):
+                    continue
+                start = imm.parse_iso_utc(p.get("start_date", ""))
+                end = imm.parse_iso_utc(p.get("end_date", ""))
+                if not start or not end or not (start <= now_utc < end):
+                    continue
+                days = max((end - start).total_seconds() / 86400.0, 1.0 / 24)
+                t = p.get("market_ticker") or ""
+                cur = pools.setdefault(_event_of(t), {"mkts": set(), "dpd": 0.0})
+                cur["mkts"].add(t)
+                cur["dpd"] += (p.get("period_reward") or 0) / 10000.0 / days
+            cursor = resp.get("next_cursor")
+            if not cursor or not batch:
+                break
+
+        # Contracts on the book per event — the actual exposure. Costs nothing:
+        # build_digest already called own_book(state) before us.
+        book = {}
+        for t, v in (own_pos or {}).items():
+            try:
+                book[_event_of(t)] = book.get(_event_of(t), 0.0) + abs(_f(v))
+            except Exception:
+                continue
+
+        today_et = now_utc.astimezone(ET).date()
+        for ev, ov in sorted(imm.EVENT_START_OVERRIDES.items()):
+            a["total"] += 1
+            series = ev.split("-")[0]
+            if series in imm.SCHEDULE_RESOLVED_SERIES:
+                a["excluded"] += 1           # postponed game, not a date bug
+                continue
+            td = imm.parse_event_date(ev)
+            if td is None or ov is None:
+                a["no_day"] += 1
+                continue
+            a["checked"] += 1
+            t_et = td.astimezone(ET).date()
+            ov_et = ov.astimezone(ET)
+            delta = (ov_et.date() - t_et).days
+            cutoff_et = ov_et - timedelta(minutes=imm.OVERRIDE_BUFFER_MIN)
+
+            # --- unverified-HOUR check, deliberately BEFORE the delta gate ---
+            # CELH's delta was 0. Anything that runs after `if delta == 0:
+            # continue` cannot see this class at all.
+            rec = meta.get(ev) or {}
+            rec_dt = imm.parse_iso_utc(str(rec.get("iso") or ""))
+            if rec_dt is None or rec_dt != ov:
+                # No record, or the record describes a value that has since been
+                # superseded (a re-resolve, or Jack's --set). A superseded guess
+                # is a FIXED guess and must stop being flagged, or the section
+                # becomes a permanent red row nobody reads.
+                a["no_prov"] += 1
+            elif str(rec.get("confidence")) == "guess":
+                pool_u = pools.get(ev)
+                # Money gate + "is there still time to act": once the cutoff has
+                # passed the bot is already standing down and the row is history.
+                if pool_u and cutoff_et > now_utc:
+                    a["unverified"].append({
+                        "event": ev, "ticker_date": t_et, "override_et": ov_et,
+                        "cutoff_et": cutoff_et, "days_out": (t_et - today_et).days,
+                        "label": str(rec.get("label") or "unknown"),
+                        "contracts": book.get(ev, 0.0),
+                        "mkts": len(pool_u["mkts"]), "dpd": pool_u["dpd"],
+                        # A guess that landed AFTER midday is a guess on the
+                        # UNSAFE side: the bot keeps quoting through a morning
+                        # call. A guess that landed in the morning already fails
+                        # early and only forfeits accrual, so it is listed but
+                        # never shouted.
+                        "unsafe": ov_et.hour >= 12})
+
+            if delta == 0:
+                continue
+            pool = pools.get(ev)
+            if not pool:
+                a["dead"].append(ev)         # programs over: history, not risk
+                continue
+            # LATE splits in two and the split is the severity, not the size:
+            # BA/HOOD/PGR were LATE by 7-20 days and harmless because the ticker
+            # date had ALREADY ELAPSED (the stale-ticker trap — quoting on is how
+            # that pool gets earned). NBIS is LATE by 6 and dangerous because
+            # both dates are still ahead, so nothing is stale and one of the two
+            # sources is simply wrong about a call that has not happened yet.
+            #
+            # NOTE the copy for "warn" must stay conditional. t_et < today_et is
+            # a PROXY for "this was a stale-ticker autofix", not a measurement of
+            # it: a forward disagreement becomes an elapsed one purely by the
+            # passage of a day, so NBIS is risk on Aug 6 and warn on Aug 7 with
+            # no new information. Today that is masked because program end ==
+            # ticker date on live earnings events (so the row goes dead first),
+            # but that is a Kalshi convention, not a guarantee — Kalshi issues
+            # 16-24 day mention programs. Do not let this branch assert safety.
+            if delta > 0:
+                sev = "risk" if t_et >= today_et else "warn"
+            else:
+                sev = "info"
+            a["rows"].append({
+                "event": ev, "ticker_date": t_et, "override_et": ov_et,
+                "delta": delta, "severity": sev,
+                "days_out": (t_et - today_et).days,
+                "contracts": book.get(ev, 0.0),
+                "mkts": len(pool["mkts"]), "dpd": pool["dpd"],
+                "cutoff_et": cutoff_et,
+                "hour_label": _override_hour_label(
+                    ov_et, series.startswith(imm._EARNINGS_PREFIX))})
+        # risk rows are ranked by IMMINENCE, not by pool size: the thing that
+        # decides whether this needs action before the open is how soon Kalshi
+        # thinks the call is, and dpd is the reward forfeited by standing down,
+        # i.e. the argument for doing nothing.
+        order = {"risk": 0, "warn": 1, "info": 2}
+        a["rows"].sort(key=lambda r: (
+            order[r["severity"]],
+            r["days_out"] if r["severity"] == "risk" else 0,
+            -r["dpd"]))
+        # Same principle for the unverified list: soonest cutoff first. Pool is
+        # the tie-break only — it sizes the row, it is not the reason to act.
+        a["unverified"].sort(key=lambda r: (not r["unsafe"], r["cutoff_et"],
+                                            -r["dpd"]))
+    except Exception as e:
+        a["error"] = repr(e)
+    return a
+
+
+def _cutoff_meaning(r: dict):
+    """(what it means, what to DO) for one row.
+
+    Every branch carries an imperative. A flag that raises a question it cannot
+    help answer gets read once and then skimmed, and the EARLY branch in
+    particular has to lead with the PROHIBITION: a tired reader who sees "costs
+    accrual" next to a $310/day pool will reach for the obvious remedy — push
+    the override out to match Kalshi — which is exactly the edit that would have
+    had the bot quoting through Lilly's print on Aug 5."""
+    when = r["cutoff_et"].strftime("%b %d %H:%M")
+    if r["severity"] == "risk":
+        return ("Kalshi says the call is {} ({}); the bot keeps quoting until {} "
+                "ET, straight through the print if Kalshi is right".format(
+                    _days_out_phrase(r["days_out"]), r["ticker_date"], when),
+                "ACTION: confirm the date on the company IR page or a press "
+                "release before the open. If Kalshi is right, stand the event "
+                "down NOW (add it to IMM_BLOCKLIST in run_incentive_mm.ps1) — "
+                "do not wait for tomorrow's digest.")
+    if r["severity"] == "warn":
+        return ("Kalshi's ticker date passed {}; if that was a stale-ticker "
+                "autofix then quoting on is how this pool is earned".format(
+                    _days_out_phrase(r["days_out"])),
+                "ACTION: none IF the call has already happened — confirm that "
+                "before treating it as safe; an elapsed ticker date is a proxy "
+                "for 'stale', not proof of it. If the call is still ahead, this "
+                "is the risk case.")
+    return ("DO NOT push this out to match Kalshi without a primary source — "
+            "that is how the bot ends up quoting through a live print (LLY, "
+            "Aug 5). Standing down {}d early (cutoff {} ET) only forfeits "
+            "reward accrual; it risks nothing".format(-r["delta"], when),
+            "ACTION: none.")
+
+
+def _unverified_meaning(r: dict) -> tuple:
+    """(what it means, what to DO) for one unverified-hour row.
+
+    The action must name a PRIMARY source, not "check Nasdaq": Nasdaq is what
+    already failed here, and re-reading a blank field returns the same blank.
+
+    The SAFE branch leads with the PROHIBITION for the same reason the EARLY
+    branch of _cutoff_meaning does (:1308), and it matters MORE here: once the
+    resolver's fallback assumes before-open, every future guess lands on the safe
+    side, so this branch is the section's entire steady-state output. A row that
+    ends "confirm only if you want the $X/day back" is an invitation to push a
+    07:00 guess out to 16:00 — which is CELH, re-created by hand, by a tired
+    reader at 7:10am. The dollar figure is named only as what standing down
+    COSTS, never as a reason to move the cutoff."""
+    when = r["cutoff_et"].strftime("%b %d %H:%M")
+    if r["unsafe"]:
+        return ("nobody measured this hour — the resolver had no time from "
+                "Nasdaq and SYNTHESIZED {} ET, on the unsafe side. If the "
+                "company actually reports before the open, the bot quotes "
+                "through the call and the cutoff at {} ET never bites in time"
+                .format(r["override_et"].strftime("%H:%M"), when),
+                "ACTION: read the company IR page or the release wire and "
+                "confirm the call time, then `python imm_earnings_overrides.py "
+                "--set {} \"YYYY-MM-DDTHH:MM:00-04:00\"`. If you cannot confirm "
+                "it before the open, --set it to 07:00 ET — standing down early "
+                "forfeits ${:,.0f}/day and risks nothing.".format(
+                    r["event"], r["dpd"]))
+    return ("hour was synthesized, not measured, but it landed on the SAFE "
+            "(morning) side — the bot stands down at {} ET whether or not the "
+            "guess is right. DO NOT push this override later to recover the "
+            "${:,.0f}/day: moving a GUESSED cutoff into the afternoon on "
+            "anything short of a primary source is exactly the edit that had "
+            "the bot quoting through Celsius's 8am call (CELH, Aug 6)".format(
+                when, r["dpd"]),
+            "ACTION: none. The only thing that justifies a later cutoff here is "
+            "the company's own IR page or release wire stating an after-close "
+            "time — NOT Nasdaq, which is what returned nothing for this ticker "
+            "in the first place. Left alone this forfeits ${:,.0f}/day and "
+            "risks nothing.".format(r["dpd"]))
+
+
+def cutoff_banner(a: dict) -> str:
+    """One-line shout for the top of the digest, or "" when nothing is at risk.
+
+    RISK ONLY — deliberately. Two classes are excluded and each exclusion is
+    load-bearing:
+      * EARLY: standing down before Kalshi's date is the conservative direction.
+        Detail block only.
+      * WARN (LATE onto an ALREADY-ELAPSED ticker date): this is the exact shape
+        imm_earnings_overrides.discover_stale_ticker_events() (:255, added
+        2026-08-03 after PGR) is DESIGNED to create — it writes LATE overrides on
+        live paying events whose ticker date has passed. BA, HOOD and PGR all
+        passed through it while their programs were live, so a warn-triggered
+        banner would have been red on roughly one morning in four of earnings
+        season for the bot doing exactly the right thing, and the old copy then
+        ended the same red sentence with "no print risk". A red box that
+        disavows itself trains the reader to skip red boxes, which is precisely
+        what would kill the NBIS-class banner. Warn renders in #d9821b in the
+        detail table, where it reads as information rather than alarm.
+
+    Silent on failure rather than degraded-with-a-message: this is the one piece
+    called straight from build_digest, and an empty banner just falls back to the
+    normal headline while the detail block below still reports the problem."""
+    try:
+        risk = [r for r in a.get("rows") or [] if r["severity"] == "risk"]
+        # An unverified hour on the UNSAFE side is the CELH shape and belongs in
+        # the banner for the same reason a LATE date does: the bot is quoting on
+        # a time nobody checked. The SAFE-side guesses stay out — they fail early
+        # by construction, and once the resolver's fallback is fixed to assume
+        # before-open, every guess lands there and this banner goes quiet on its
+        # own instead of having to be muted by hand.
+        unsafe = [r for r in a.get("unverified") or [] if r["unsafe"]]
+        if not risk and not unsafe:
+            return ""
+        parts = []
+        if risk:
+            # LIVE EXPOSURE is contracts on the book. The pool $/day is named as
+            # what standing down COSTS, never as the exposure — it is the
+            # argument for the wrong action and must not be the number the
+            # reader triages on.
+            parts.append(
+                "{} override{} run PAST Kalshi's ticker date — the bot quotes "
+                "beyond the date Kalshi thinks the call is on. ".format(
+                    len(risk), "" if len(risk) == 1 else "s")
+                + " ".join(
+                    "LIVE EXPOSURE: Kalshi says the {ev} call is {when} ({date})"
+                    " — the bot has {cts:,.0f} contracts on the book and keeps "
+                    "quoting until {cut} ET. Standing down forfeits "
+                    "${dpd:,.0f}/day of reward pool.".format(
+                        ev=_short_event(r["event"]),
+                        when=_days_out_phrase(r["days_out"]),
+                        date=r["ticker_date"], cts=r["contracts"],
+                        cut=r["cutoff_et"].strftime("%b %d %H:%M"),
+                        dpd=r["dpd"]) for r in risk))
+        parts.extend(
+            "UNVERIFIED CALL TIME: nobody measured when {ev} reports — the "
+            "resolver had no time from Nasdaq and assumed {hh} ET ({lab}). The "
+            "bot has {cts:,.0f} contracts on the book and keeps quoting until "
+            "{cut} ET; if the call is before the open it quotes straight through "
+            "it (CELH, Aug 6). Confirm on the IR page, or --set 07:00 and "
+            "forfeit ${dpd:,.0f}/day.".format(
+                ev=_short_event(r["event"]),
+                hh=r["override_et"].strftime("%H:%M"), lab=r["label"],
+                cts=r["contracts"],
+                cut=r["cutoff_et"].strftime("%b %d %H:%M"), dpd=r["dpd"])
+            for r in unsafe)
+        return " ".join(parts)
+    except Exception:
+        return ""
+
+
+_CUTOFF_EXPLAINER = (
+    "Our override is the CALL / release time (Nasdaq calendar or IR page), held "
+    "in run-logs/incentive-mm/event_start_overrides.json and written by "
+    "imm_earnings_overrides.py; Kalshi's ticker date, sub_title and program end "
+    "are all one internal date, so they never disagree with each other and can "
+    "all be wrong together. LATE (override after the ticker date) = the bot "
+    "quotes past Kalshi's date and can make markets through a live print — money "
+    "at risk, verify against a primary source and blocklist the event if Kalshi "
+    "is right. EARLY = the bot stands down first, which forfeits reward accrual "
+    "and risks nothing; do NOT edit an override to chase that accrual. On every "
+    "conflict that has actually resolved the override was right and the ticker "
+    "wrong: KXEARNINGSMENTIONLLY-26AUG07 stood down 2026-08-05 10:50Z against an "
+    "Aug 7 ticker, Lilly reported that morning, and Kalshi closed and finalized "
+    "the event six hours later. The DATE agreeing is not the all-clear: CELH "
+    "matched on the date and was wrong by nine HOURS (Nasdaq had no time flag, "
+    "the resolver assumed 4pm, the call was at 8am and the bot quoted through "
+    "it), which is what the unverified-call-times block below covers.")
+
+
+def _prov_coverage_line(a: dict) -> str:
+    """How much of the population this check can actually see. "" only when
+    there is nothing checked at all.
+
+    ALWAYS printed, never gated on coverage being zero. The old version only
+    admitted "NOT yet effective" while coverage was exactly zero; one new
+    resolution flipped it to a sentence that listed "written before provenance
+    recording" alongside "hand-set" and "env-pinned" as though all three were
+    benign human-owned values and then closed on "the rest were measured, not
+    guessed". That is reassurance at ~3% coverage, and the unrecorded set is not
+    benign — it is precisely CELH's class: a pre-fix 16:00 written by the old
+    else-branch is byte-identical to a measured after-close reading.
+
+    It also states that coverage does NOT converge, because it does not:
+    imm_earnings_overrides.py's `covered` short-circuit never rewrites an
+    existing entry, record_meta only records what the resolver itself writes, and
+    the overrides file is never pruned. The old copy promised "it fills in as
+    imm_earnings_overrides.py rewrites each entry" — a promise the writer cannot
+    keep. Coverage clears only as events churn out of the file, or by seeding the
+    sidecar from the resolver's own task-log history."""
+    checked = a.get("checked", 0) or 0
+    no_prov = a.get("no_prov") or 0
+    if not checked:
+        return ""
+    recorded = max(checked - no_prov, 0)
+    if not no_prov:
+        return ("(call-time provenance recorded for all {} checked overrides — "
+                "every one was measured, not guessed)".format(checked))
+    return ("(call-time provenance recorded for {}/{} checked overrides — those "
+            "are the ONLY ones this check can see. The other {} were written "
+            "before provenance recording, hand-set or env-pinned; a pre-fix "
+            "16:00 entry is indistinguishable from a measured after-close "
+            "reading and is NOT covered by this check. This does not fill in on "
+            "its own — the resolver never rewrites an existing entry — so it "
+            "clears only as events churn out of the file.)"
+            .format(recorded, checked, no_prov))
+
+
+def _unverified_lines(a: dict) -> list:
+    """Plain-text UNVERIFIED CALL TIMES block.
+
+    Never returns [] while anything is checked: an empty section that looks
+    identical whether the check is clean or simply blind to 60 of 62 overrides
+    is how a silent regression hides for a month. The coverage line carries that
+    distinction and is emitted in BOTH branches."""
+    rows = a.get("unverified") or []
+    cov = textwrap.wrap(_prov_coverage_line(a), width=76,
+                        initial_indent="  ", subsequent_indent="  ")
+    if not rows:
+        return cov
+    out = ["UNVERIFIED CALL TIMES — {} live override(s) whose HOUR was "
+           "synthesized, not measured".format(len(rows))]
+    for r in rows:
+        why, action = _unverified_meaning(r)
+        out.append("  {:34s} ours {} ET  cutoff {} ET  ticker {} {}  "
+                   "{} mkts  {:,.0f} cts  ${:,.2f}/day{}".format(
+                       _short_event(r["event"])[:34],
+                       r["override_et"].strftime("%m-%d %H:%M"),
+                       r["cutoff_et"].strftime("%m-%d %H:%M"),
+                       r["ticker_date"].isoformat()[5:],
+                       _days_out_phrase(r["days_out"]), r["mkts"],
+                       r["contracts"], r["dpd"],
+                       "  <== UNSAFE SIDE" if r["unsafe"] else ""))
+        for para in (why, action):
+            out.extend(textwrap.wrap(para, width=76, initial_indent="      ",
+                                     subsequent_indent="      "))
+    out.extend(cov)
+    return out
+
+
+def _unverified_html(a: dict) -> str:
+    """HTML twin of _unverified_lines. Never raises (caller is guarded)."""
+    rows = a.get("unverified") or []
+    if not rows:
+        # the unwrapped sentence, not the 76-col text block re-joined
+        txt = _prov_coverage_line(a)
+        return ('<div style="color:#888;font-size:11px;margin-top:4px">{}</div>'
+                .format(txt)) if txt else ""
+    h = ['<div style="font-size:14px;font-weight:600;margin:12px 0 4px">'
+         'Unverified call times &mdash; {} override(s) whose HOUR was '
+         'synthesized, not measured</div>'.format(len(rows)),
+         '<table style="border-collapse:collapse">',
+         '<tr style="background:#f0f0f0;font-weight:600">'
+         '<td style="{0}">EVENT</td><td style="{1}">OUR CALL TIME (ET)</td>'
+         '<td style="{1}">CUTOFF (ET)</td><td style="{1}">KALSHI SAYS</td>'
+         '<td style="{1}">MKTS</td><td style="{1}">CTS ON BOOK</td>'
+         '<td style="{1}">POOL $/DAY</td></tr>'.format(TDL, TD)]
+    for i, r in enumerate(rows):
+        colour = "#c0392b" if r["unsafe"] else "#777"
+        # The action line is bold ONLY when there is an action. On a safe-side
+        # row the correct action is to do nothing, and rendering "ACTION: none"
+        # as the loudest text in the row is how a no-op becomes a to-do.
+        act_style = ("color:#333;font-weight:600" if r["unsafe"]
+                     else "color:#777;font-weight:400")
+        why, action = _unverified_meaning(r)
+        h.append(
+            '<tr style="background:{bg}"><td style="{tdl}">{ev}'
+            '<div style="color:{col};font-size:11px">{why}</div>'
+            '<div style="{acts};font-size:11px">{act}</div>'
+            '</td>'
+            '<td style="{td}">{ov}<div style="color:{col};font-size:11px">'
+            'guessed &mdash; {lab}</div></td>'
+            '<td style="{td}">{cut}</td>'
+            '<td style="{td}">{tick}<div style="color:#999;font-size:11px">'
+            '{when}</div></td>'
+            '<td style="{td}">{mkts}</td><td style="{td}">{cts:,.0f}</td>'
+            '<td style="{td}">{dpd:,.2f}</td></tr>'.format(
+                bg="#fafafa" if i % 2 else "#fff", tdl=TDL, td=TD, col=colour,
+                acts=act_style,
+                ev=_short_event(r["event"]), why=why, act=action,
+                ov=r["override_et"].strftime("%b %d %H:%M"), lab=r["label"],
+                cut=r["cutoff_et"].strftime("%b %d %H:%M"),
+                tick=r["ticker_date"].isoformat(),
+                when=_days_out_phrase(r["days_out"]), mkts=r["mkts"],
+                cts=r["contracts"], dpd=r["dpd"]))
+    h.append("</table>")
+    cov = _prov_coverage_line(a)
+    if cov:
+        h.append('<div style="color:#888;font-size:11px;margin-top:4px">{}</div>'
+                 .format(cov))
+    return "".join(h)
+
+
+def _cutoff_audit_text(a: dict):
+    """Plain-text CUTOFF AUDIT block. Returns a list of lines; never raises."""
+    try:
+        if a.get("error"):
+            return ["CUTOFF AUDIT — could not compute ({}); override-vs-Kalshi "
+                    "date checking did not run this morning".format(a["error"]), ""]
+        # Suppressed = HAD disagreed, but the programs have ended. Past tense
+        # and explicitly closed out, so it can never read as a live count: the
+        # old copy said "all agree" and then "5 disagree" two lines apart, which
+        # forces a re-read on the exact morning the section should cost zero
+        # attention. Reported at all (rather than dropped) because silence would
+        # be indistinguishable from a filter that had quietly eaten a live row.
+        supp = ("  ({} resolved event(s) HAD disagreed; their programs have "
+                "ended — history, no action: {})".format(
+                    len(a["dead"]),
+                    ", ".join(_short_event(e) for e in a["dead"][:6])
+                    + (", ..." if len(a["dead"]) > 6 else ""))
+                if a["dead"] else "")
+        skipped = ("  ({} override(s) not comparable: {} carry no calendar day "
+                   "in the ticker, {} are schedule-resolved series where a LATE "
+                   "override means a postponed game)".format(
+                       a["no_day"] + a["excluded"], a["no_day"], a["excluded"])
+                   if (a["no_day"] or a["excluded"]) else "")
+        if not a["rows"]:
+            out = ["CUTOFF AUDIT: {} live overrides checked, all agree with "
+                   "their Kalshi ticker date.".format(a["checked"])]
+            for extra in (supp, skipped):
+                if extra:
+                    out.append(extra)
+            # Date agreement is NOT the all-clear: CELH agreed on the date and
+            # was still wrong by nine hours. The hour block renders here too.
+            return out + _unverified_lines(a) + [""]
+        out = ["CUTOFF AUDIT — our call-time override vs Kalshi's ticker date "
+               "({} of {} checked disagree)".format(len(a["rows"]), a["checked"]),
+               # every header MUST fit its field — "OUR CALL (ET)" is 13 chars
+               # in a 12-wide column and silently shoved the whole header row
+               # one column right of its data.
+               "{:28s} {:>12s} {:>14s} {:>9s} {:>5s} {:>6s} {:>11s}".format(
+                   "EVENT", "OUR CALL ET", "KALSHI SAYS", "DELTA", "MKTS",
+                   "CTS", "POOL $/DAY")]
+        for r in a["rows"]:
+            why, action = _cutoff_meaning(r)
+            out.append("{:28s} {:>12s} {:>14s} {:>9s} {:>5d} {:>6,.0f} {:>11,.2f}"
+                       "{}".format(
+                           _short_event(r["event"])[:28],
+                           r["override_et"].strftime("%m-%d %H:%M"),
+                           "{} {}".format(r["ticker_date"].isoformat()[5:],
+                                          _days_out_phrase(r["days_out"]))[:14],
+                           "{:+d}d {}".format(
+                               r["delta"],
+                               "LATE" if r["delta"] > 0 else "EARLY"),
+                           r["mkts"], r["contracts"], r["dpd"],
+                           "  <== RISK" if r["severity"] == "risk" else ""))
+            for para in ("{} | {}".format(why, r["hour_label"]), action):
+                out.extend(textwrap.wrap(para, width=76,
+                                         initial_indent="      ",
+                                         subsequent_indent="      "))
+        out.append("  POOL $/DAY is the reward at stake if we stand down, NOT "
+                   "the exposure; CTS is contracts on the book.")
+        out.extend(_unverified_lines(a))
+        for extra in (supp, skipped):
+            if extra:
+                out.append(extra)
+        out.extend(textwrap.wrap(_CUTOFF_EXPLAINER, width=78,
+                                 initial_indent="  ", subsequent_indent="  "))
+        out.append("")
+        return out
+    except Exception as e:
+        return ["CUTOFF AUDIT — render failed ({})".format(repr(e)), ""]
+
+
+def _cutoff_audit_html(a: dict) -> str:
+    """HTML twin of _cutoff_audit_text. Never raises."""
+    try:
+        head = ('<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
+                'Cutoff audit &mdash; our call time vs Kalshi\'s ticker date</div>')
+        if a.get("error"):
+            return (head + '<div style="color:#c0392b;font-size:12px">Could not '
+                    'compute ({}) &mdash; override-vs-Kalshi date checking did '
+                    'not run this morning.</div>'.format(a["error"]))
+        supp = (' &nbsp;{} resolved event(s) HAD disagreed; their programs have '
+                'ended &mdash; history, no action ({}).'.format(
+                    len(a["dead"]),
+                    ", ".join(_short_event(e) for e in a["dead"][:6])
+                    + (", &hellip;" if len(a["dead"]) > 6 else ""))
+                if a["dead"] else "")
+        skipped = (' &nbsp;{} override(s) not comparable: {} carry no calendar '
+                   'day in the ticker, {} are schedule-resolved series where a '
+                   'LATE override means a postponed game.'.format(
+                       a["no_day"] + a["excluded"], a["no_day"], a["excluded"])
+                   if (a["no_day"] or a["excluded"]) else "")
+        if not a["rows"]:
+            return (head + '<div style="color:#0a7a2f;font-size:12px">{} live '
+                    'overrides checked &mdash; all agree with their Kalshi '
+                    'ticker date.{}{}</div>'.format(a["checked"], supp, skipped)
+                    + _unverified_html(a))
+        h = [head, '<table style="border-collapse:collapse">',
+             '<tr style="background:#f0f0f0;font-weight:600">'
+             '<td style="{0}">EVENT</td><td style="{1}">OUR CALL TIME (ET)</td>'
+             '<td style="{1}">KALSHI SAYS</td><td style="{1}">DELTA</td>'
+             '<td style="{1}">DIR</td><td style="{1}">MKTS</td>'
+             '<td style="{1}">CTS ON BOOK</td>'
+             '<td style="{1}">POOL $/DAY</td></tr>'.format(TDL, TD)]
+        for i, r in enumerate(a["rows"]):
+            colour = {"risk": "#c0392b", "warn": "#d9821b",
+                      "info": "#777"}[r["severity"]]
+            why, action = _cutoff_meaning(r)
+            h.append(
+                '<tr style="background:{bg}"><td style="{tdl}">{ev}'
+                '<div style="color:{col};font-size:11px">{why}</div>'
+                '<div style="color:#333;font-size:11px;font-weight:600">{act}'
+                '</div></td>'
+                '<td style="{td}">{ov}<div style="color:#999;font-size:11px">'
+                '{hour}</div></td>'
+                '<td style="{td}">{tick}<div style="color:{col};font-size:11px">'
+                '{when}</div></td>'
+                # TD already ends in ';' — no extra one, or the declaration
+                # renders as 'text-align:right;;color:...'
+                '<td style="{td}color:{col};font-weight:700">{d:+d}d</td>'
+                '<td style="{td}color:{col};font-weight:700">{dir}</td>'
+                '<td style="{td}">{mkts}</td><td style="{td}">{cts:,.0f}</td>'
+                '<td style="{td}">{dpd:,.2f}</td>'
+                '</tr>'.format(
+                    bg="#fafafa" if i % 2 else "#fff", tdl=TDL, td=TD,
+                    col=colour, ev=_short_event(r["event"]),
+                    why=why, act=action, hour=r["hour_label"],
+                    ov=r["override_et"].strftime("%b %d %H:%M"),
+                    tick=r["ticker_date"].isoformat(),
+                    when=_days_out_phrase(r["days_out"]), d=r["delta"],
+                    dir="LATE" if r["delta"] > 0 else "EARLY",
+                    mkts=r["mkts"], cts=r["contracts"], dpd=r["dpd"]))
+        h.append("</table>")
+        h.append('<div style="color:#888;font-size:11px;margin-top:4px">POOL '
+                 '$/DAY is the reward at stake if we stand down &mdash; not the '
+                 'exposure. CTS ON BOOK is the exposure.</div>')
+        h.append(_unverified_html(a))
+        h.append('<div style="color:#666;font-size:12px;margin-top:6px;'
+                 'border-left:3px solid #d9a441;padding-left:8px">{}{}{}</div>'
+                 .format(_CUTOFF_EXPLAINER, supp, skipped))
+        return "".join(h)
+    except Exception as e:
+        return ('<div style="color:#c0392b;font-size:12px">Cutoff audit render '
+                'failed ({}).</div>'.format(repr(e)))
+
+
 def build_digest(now_utc: datetime):
     """Returns (plain_text, html)."""
     today_ct = now_utc.astimezone(CT).date()
@@ -1006,6 +1733,9 @@ def build_digest(now_utc: datetime):
     rows, tot, resting = event_rows(client)     # open book + resting quotes
     cap_rows = capacity_rows(state, status, resting,
                              _f(status.get("pnl_today")) if status else None)
+    # pos (own_book, above) gives the audit its only real exposure number;
+    # everything else it reports is reward pool. never raises — see docstring.
+    audit = cutoff_audit(client, now_utc, pos)
 
     try:
         bal_str = "${:,.2f}".format(_f(client.get_balance().get("balance_dollars")))
@@ -1027,6 +1757,10 @@ def build_digest(now_utc: datetime):
 
     # ---- plain text ---------------------------------------------------------
     L = ["Kalshi incentive MM \u2014 {}".format(today_ct), ""]
+    _banner = cutoff_banner(audit)
+    if _banner:
+        L.append("!! " + _banner)
+        L.append("")
     L.append("P&L  (RAW = trading only; NET = RAW + incentive rewards)")
     L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
         "WINDOW", "RAW$", "REWARD$", "NET$"))
@@ -1068,6 +1802,8 @@ def build_digest(now_utc: datetime):
              "date — Kalshi pays at each program's period end, 1-2 days later)")
     L.extend(_calibration_caveat_text())
     L.append("")
+    L.append("")
+    L.extend(_cutoff_audit_text(audit))
     L.append("")
     L.append("CAPACITY — how close the bot is to each ceiling ({})".format(
         capacity_note()))
@@ -1121,6 +1857,10 @@ def build_digest(now_utc: datetime):
              'color:#999"> &nbsp;= trading {:+,.2f} + rewards {:,.2f}</span>'
              '</div>'.format(_pnl_span(nl) if nl is not None else "n/a",
                              w["life"]["raw"], w["life"]["reward"]))
+    if _banner:
+        h.append('<div style="background:#fdecea;border-left:4px solid #c0392b;'
+                 'color:#8e2b21;padding:8px 10px;margin:8px 0;font-weight:600">'
+                 '{}</div>'.format(_banner))
     h.append('<table style="border-collapse:collapse;margin:10px 0">')
     h.append('<tr style="background:#f0f0f0;font-weight:600">'
              '<td style="{0}">WINDOW</td><td style="{1}">RAW (trading)</td>'
@@ -1177,6 +1917,8 @@ def build_digest(now_utc: datetime):
              'Kalshi pays at each program\'s period end, 1&ndash;2 days later.'
              '</div>'.format(FILL_LOOKBACK_HOURS))
     h.append(_calibration_caveat_html())
+
+    h.append(_cutoff_audit_html(audit))
 
     h.append('<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
              'Capacity &mdash; how close to each ceiling</div>')

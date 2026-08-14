@@ -67,9 +67,15 @@ def main() -> int:
                             # from the program feed alone
         status = []
         # replicate refresh_universe's ticker pre-filter
+        mention_family = any(series.endswith(suf)
+                             for suf in imm.ALLOW_SERIES_SUFFIXES)
         pre_exempt = (series.startswith(imm._EARNINGS_PREFIX)
                       or ev_t in imm.EVENT_START_OVERRIDES
-                      or series in imm.SCHEDULE_RESOLVED_SERIES)
+                      or series in imm.SCHEDULE_RESOLVED_SERIES
+                      # 2026-08-14 listing-date fix: mention-family tickers
+                      # always hydrate; trade_cutoff_utc decides from the
+                      # market's expiration (not knowable from the feed here)
+                      or mention_family)
         td = imm.parse_event_date(t0)
         if not pre_exempt and td is not None and now >= td + timedelta(hours=24):
             status.append("PRE-DROPPED(24h ticker rule)")
@@ -77,8 +83,14 @@ def main() -> int:
         cutoff = (resolved - timedelta(minutes=imm.EVENT_START_BUFFER_MIN)
                   if resolved is not None else td)
         if cutoff is not None and cutoff <= now:
-            status.append(f"cutoff passed ({cutoff:%m-%d %H:%MZ} "
-                          f"{'resolved' if resolved else 'midnight-fallback'})")
+            if mention_family and resolved is None:
+                # a passed ticker date on a mention event may be a LISTING
+                # date; the bot's real cutoff needs expected_expiration
+                status.append("ticker date passed (mention window — "
+                              "expiration governs, see listing-date rule)")
+            else:
+                status.append(f"cutoff passed ({cutoff:%m-%d %H:%MZ} "
+                              f"{'resolved' if resolved else 'midnight-fallback'})")
         if status:
             misses += 1
             print(f"  {ev_t} ({len(tickers)} mkts, {series}): {'; '.join(status)}")

@@ -156,6 +156,11 @@ def ticker_day_over(t: str, now_utc: datetime) -> bool:
         return False
     if imm.series_of(t) in imm.SCHEDULE_RESOLVED_SERIES:
         return False
+    # Mention-family tickers may embed a LISTING date (2026-08-14 fix):
+    # never pre-drop on the string; trade_cutoff_utc decides from the
+    # market's expected_expiration. Mirrors incentive_mm.
+    if any(imm.series_of(t).endswith(suf) for suf in imm.ALLOW_SERIES_SUFFIXES):
+        return False
     td = imm.parse_event_date(t)
     return td is not None and now_utc >= td + timedelta(hours=24)
 

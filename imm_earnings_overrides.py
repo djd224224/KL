@@ -157,7 +157,12 @@ def nasdaq_release_datetime(ticker: str, now, days: int):
     """Scan the Nasdaq calendar forward `days` days for `ticker`'s next
     earnings -> (datetime_ET, label) with after-hours->4pm ET / pre-market->
     7am ET, or None. Scans from NOW so it's robust to Kalshi's wrong
-    occurrence (INTC occ Jul 25 but the real report is Jul 23)."""
+    occurrence (INTC occ Jul 25 but the real report is Jul 23).
+
+    When Nasdaq has the DATE but no time flag the fallback is 7am ET, NOT
+    4pm — see the comment on the else-branch. The label carries a
+    provenance_of() guess marker in that case so the sidecar and the digest
+    can tell a synthesized hour from a measured one."""
     from datetime import timedelta
     tkr = ticker.upper()
     for i in range(days + 1):
@@ -170,7 +175,40 @@ def nasdaq_release_datetime(ticker: str, now, days: int):
         elif "pre" in flag or "before" in flag:
             hour, label = 7, "before open (~7am ET, Nasdaq)"
         else:
-            hour, label = 16, "time n/a->4pm ET (Nasdaq)"
+            # FAIL SAFE = FAIL EARLY. Jack 2026-08-06, after
+            # KXEARNINGSMENTIONCELH-26AUG06. Nasdaq's calendar carried
+            # "time-not-supplied" for CELH on 2026-08-02, this branch read 16
+            # and wrote "2026-08-06T16:00:00-04:00", and Celsius in fact
+            # reported BEFORE the open with an 8:00am ET call — so the cutoff
+            # had not passed, the bot quoted 15 markets straight through a live
+            # call with the Q2 results already public, and Jack had to stop it
+            # by hand at 12:31Z.
+            #
+            # The two ways of being wrong are NOT symmetric and this branch is
+            # the only place that choice is made:
+            #   guess AMC, truth is BMO -> the bot market-makes through a
+            #       morning call against people who have read the print. LOSES
+            #       MONEY, and the loss scales with how good the pool is.
+            #   guess BMO, truth is AMC -> the bot stands down at 06:50 ET and
+            #       forfeits a day of reward accrual. RISKS NOTHING.
+            # Same asymmetry as the override-vs-ticker rule established
+            # 2026-08-05 on KXEARNINGSMENTIONLLY-26AUG07: EARLY is conservative,
+            # LATE is exposure. An unknown hour must therefore land EARLY.
+            #
+            # 7am (not 6am, not midnight) to stay on the same anchor the
+            # measured pre-market branch above already uses in production — a
+            # guess should not invent a new number, and going earlier would
+            # forfeit accrual on evidence nobody has.
+            #
+            # "time-not-supplied" is not rare: 106 of 550 rows (19%) on the
+            # 2026-08-06 calendar. It is also PROVISIONAL — Nasdaq filled CELH
+            # in as "time-pre-market" days later — which is what the
+            # provisional re-check in main() exists to pick up, since this
+            # value would otherwise be frozen forever by the `covered`
+            # short-circuit. Keep a _GUESS_MARKERS substring in the label
+            # (below: "time n/a", "fail-safe") or the provenance sidecar
+            # silently reclassifies these as measurements.
+            hour, label = 7, "time n/a->7am ET BMO assumed (Nasdaq, fail-safe)"
         return ET.localize(datetime(d.year, d.month, d.day, hour, 0)), label
     return None
 
@@ -618,6 +656,139 @@ def write_file(data: dict) -> None:
     os.replace(tmp, EVENT_OVERRIDES_FILE)
 
 
+# ---------------------------------------------------------------------------
+# PROVENANCE SIDECAR (Jack 2026-08-06, after KXEARNINGSMENTIONCELH-26AUG06).
+#
+# Nasdaq's calendar carried NO time flag for CELH, nasdaq_release_datetime()
+# fell through to its else-branch and wrote 16:00 ET, and the bot quoted the
+# event straight through an 8:00am call whose results were already public. The
+# written value is INDISTINGUISHABLE from a real after-close reading — both are
+# exactly "T16:00:00-04:00" — so nothing downstream could tell a measurement
+# from a guess, and the digest's cutoff audit (which compares DATES) saw a
+# perfect match and said nothing.
+#
+# This records HOW each value was obtained, next to the file rather than in it:
+# incentive_mm.load_file_event_overrides() (:1481) does
+# `parse_iso_utc(str(iso).strip())` on every value and DROPS the entry when that
+# returns None, so a richer value shape would silently delete the cutoff and
+# hand the event back to the midnight-ET ticker rule — the exact failure this is
+# meant to prevent. The overrides file keeps its {event: ISO8601} contract
+# untouched; this file is advisory and every reader must work without it.
+#
+# The recorded ISO is stored ALONGSIDE the confidence so a reader can tell
+# whether the provenance still describes the live value. Jack's --set of CELH to
+# 07:00 supersedes the guess; without that check the digest would keep flagging
+# a value a human had already fixed, which is how this kind of section turns
+# into noise and gets skipped.
+OVERRIDE_META_FILE = os.path.join(os.path.dirname(EVENT_OVERRIDES_FILE),
+                                  "event_start_overrides_meta.json")
+
+# Substrings that mark a resolver label as a GUESS rather than a reading. Kept
+# as a marker list, not an equality test on today's label text, so the fail-safe
+# default can be re-worded (or flipped from 4pm to 7am) without silently
+# reclassifying every guess as a measurement. Deliberately high-specificity:
+# these are matched against RESOLVER LABELS, but a mis-plumbed call site could
+# hand this scraped IR page text, and a generic marker like "assumed" or
+# "default" would then mark a real reading as a guess. One false "guess" a week
+# is what turns the digest section it feeds into something Jack skips.
+_GUESS_MARKERS = ("time n/a", "time unknown", "no time", "fail-safe")
+
+
+def provenance_of(label: str) -> str:
+    """"guess" when the resolver had no time and synthesized one, else "read"
+    (a Nasdaq AMC/BMO flag, a scraped IR time, a broadcast schedule time)."""
+    low = str(label or "").lower()
+    return "guess" if any(k in low for k in _GUESS_MARKERS) else "read"
+
+
+def provenance_batch(resolved, rel_resolved, stale_fixed, bc_resolved) -> list:
+    """[(event, iso, label)] from the phase result lists.
+
+    All four shapes are decoded HERE rather than by editing the phases, so the
+    phases keep their existing tuples and this stays a single-site change. Both
+    Nasdaq paths bracket their label into the evidence string; rel_resolved
+    carries it bare in position 2."""
+    out = []
+    for t in resolved:                    # (ev, iso, src, evidence["[label]"])
+        m = re.search(r"\[([^\]]{0,80})\]", str(t[3]) if len(t) > 3 else "")
+        out.append((t[0], t[1], m.group(1) if m else "IR page call time"))
+    for t in rel_resolved:                # (ev, iso, label, url, evidence)
+        out.append((t[0], t[1], str(t[2]) if len(t) > 2 else ""))
+    for t in stale_fixed:                 # (ev, iso, n, dpd, "nasdaq:X [label]")
+        m = re.search(r"\[([^\]]{0,80})\]", str(t[4]) if len(t) > 4 else "")
+        out.append((t[0], t[1], m.group(1) if m else "stale-ticker autofix"))
+    for t in bc_resolved:                 # (ev, iso, network, title)
+        out.append((t[0], t[1], "broadcast schedule"))
+    return out
+
+
+def record_meta(resolutions, file_data: dict) -> None:
+    """Merge {event: provenance} for this run into the sidecar and prune keys
+    the overrides file no longer has. `resolutions` is [(event, iso, label)].
+
+    Never raises: the sidecar is advisory and must never be able to take down
+    the scheduled task that writes the real overrides."""
+    try:
+        meta = load_meta()
+        stamp = datetime.now(timezone.utc).isoformat()
+        for t in resolutions:
+            try:
+                ev, iso, label = str(t[0]), str(t[1]), str(t[2])
+            except (IndexError, TypeError):
+                continue
+            meta[ev] = {"iso": iso, "confidence": provenance_of(label),
+                        "label": label, "asof": stamp}
+        for ev in [e for e in meta if e not in file_data]:
+            meta.pop(ev, None)
+        os.makedirs(os.path.dirname(OVERRIDE_META_FILE), exist_ok=True)
+        tmp = OVERRIDE_META_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=1, sort_keys=True)
+        os.replace(tmp, OVERRIDE_META_FILE)
+    except Exception as e:                       # advisory only — never fatal
+        log(f"! override provenance sidecar not written: {e}")
+
+
+def load_meta() -> dict:
+    try:
+        with open(OVERRIDE_META_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def provisional_events(file_data: dict) -> set:
+    """Events whose override is a FAIL-SAFE GUESS that is still standing.
+
+    The `covered` short-circuits (:288/:447/:706/:773) skip anything already in
+    the overrides file, so a value written once is never re-derived. That is
+    correct for a MEASURED time and wrong for a guessed one: on 2026-08-06
+    Nasdaq had already corrected CELH from "time-not-supplied" to
+    "time-pre-market", the right answer sat in the same endpoint for four days,
+    and the thirteen scheduled runs in between each skipped the event without
+    emitting a single log line (`covered` is emailed, never logged). Only a
+    guess is re-opened; a measurement, once taken, stays taken.
+
+    Two guards, both load-bearing:
+      * confidence must be "guess" — a hand `--set` records as "read" (see
+        main()), so a re-check can never overwrite a human's answer;
+      * the sidecar's recorded ISO must still equal the live file value — if
+        anything has changed the value since, the record no longer describes it
+        and the entry is somebody else's, not ours to move.
+    Together these mean the re-check can only ever move a value that this
+    resolver itself synthesized and that nobody has touched since."""
+    out = set()
+    for ev, rec in (load_meta() or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("confidence")) != "guess":
+            continue
+        if str(rec.get("iso") or "") != str(file_data.get(ev) or ""):
+            continue
+        out.add(ev)
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry", action="store_true", help="no write, no email")
@@ -633,6 +804,10 @@ def main(argv=None) -> int:
         data = load_file()
         data[ev] = iso
         write_file(data)
+        # A --set SUPERSEDES whatever the resolver guessed. Recording it is what
+        # stops the digest's unverified section from going on flagging a value a
+        # human has already checked (CELH was --set to 07:00 the same morning).
+        record_meta([(ev, iso, "hand-set by operator")], data)
         print(f"wrote {ev} = {iso} -> {EVENT_OVERRIDES_FILE} "
               f"(bot hot-reloads within a cycle)")
         return 0
@@ -702,8 +877,14 @@ def main(argv=None) -> int:
     log(f"active earnings events: {len(events)}")
 
     resolved, unresolved, covered = [], [], []
+    # PROVISIONAL RE-CHECK (Jack 2026-08-06, CELH). A fail-safe 7am guess is an
+    # ADMISSION that nobody knows the time, so it is the one class of override
+    # that must not be frozen by the `covered` short-circuit below. Everything
+    # else keeps the old write-once behaviour.
+    provisional = provisional_events(file_data)
+    upgraded, provisional_open = [], []
     for ev in events:
-        if ev in EVENT_START_OVERRIDES:
+        if ev in EVENT_START_OVERRIDES and ev not in provisional:
             covered.append(ev)
             continue
         series = ev.split("-")[0]
@@ -711,6 +892,29 @@ def main(argv=None) -> int:
                if series.startswith(_EARNINGS_PREFIX) else "")
         rel = (nasdaq_release_datetime(tkr, now, DISCLOSURE_LEAD_DAYS + 3)
                if tkr else None)
+        if ev in provisional:
+            # ONLY a measured flag may replace a fail-safe guess. Anything else
+            # (Nasdaq still has no time, or has dropped the row) leaves the
+            # early cutoff exactly where it is — a re-check may push the bot's
+            # stand-down LATER only on evidence, never on a second guess.
+            if rel and provenance_of(rel[1]) == "read":
+                was = file_data.get(ev)
+                iso = rel[0].isoformat()
+                file_data[ev] = iso
+                upgraded.append((ev, was, iso, rel[1]))
+                resolved.append((ev, iso, f"nasdaq:{tkr}",
+                                 f"fail-safe guess {was} REPLACED by a measured "
+                                 f"Nasdaq flag [{rel[1]}]"))
+                log(f"PROVISIONAL UPGRADED {ev}: {was} -> {iso}  [{rel[1]}]")
+            else:
+                provisional_open.append((ev, file_data.get(ev)))
+                # Logged on EVERY run, deliberately. The worst detail of the
+                # CELH post-mortem is not that the guess was wrong, it is that
+                # thirteen consecutive runs looked straight at it and said
+                # nothing, because `covered` is emailed and never logged.
+                log(f"provisional (still unmeasured) {ev} = {file_data.get(ev)}"
+                    f"  [Nasdaq has no time flag; fail-safe cutoff stands]")
+            continue
         if rel:
             dt_et, label = rel
             iso = dt_et.isoformat()
@@ -719,6 +923,11 @@ def main(argv=None) -> int:
                              f"call cutoff = earnings RELEASE [{label}] "
                              f"(safe: call is at/after the release)"))
             log(f"call {ev} = {iso}  (release proxy [{label}])")
+            # A brand-new guess belongs in the unverified section of TODAY's
+            # email, not only in tomorrow's digest: the morning it is written is
+            # the cheapest moment for a human to look the call time up.
+            if provenance_of(label) == "guess":
+                provisional_open.append((ev, iso))
             continue
         # Nasdaq had nothing -> try the IR page for the exact call time, else flag
         found = None
@@ -805,6 +1014,8 @@ def main(argv=None) -> int:
 
     if not args.dry and (resolved or rel_resolved or bc_resolved or stale_fixed):
         write_file(file_data)
+        record_meta(provenance_batch(resolved, rel_resolved, stale_fixed,
+                                     bc_resolved), file_data)
 
     # email a summary whenever there is anything actionable
     if not args.dry and (resolved or unresolved or enrolled or review
@@ -830,6 +1041,32 @@ def main(argv=None) -> int:
                          "hot-reloads):")
             for ev, iso, n, dpd, src in stale_fixed:
                 lines.append(f"  {ev} = {iso}  ({n} mkts, ${dpd:,.0f}/day) [{src}]")
+            lines.append("")
+        if upgraded:
+            lines.append("PROVISIONAL GUESS UPGRADED — Nasdaq has since "
+                         "supplied a real time flag and the fail-safe 7am ET "
+                         "guess has been replaced by the measurement (written, "
+                         "bot hot-reloads):")
+            for ev, was, iso, label in upgraded:
+                lines.append(f"  {ev}:  {was}  ->  {iso}   [{label}]")
+            lines.append("")
+        if provisional_open:
+            # Reported, never ESCALATED: this state is safe by construction
+            # (the bot stands down at 06:50 ET), so it must not be able to
+            # trigger an email on its own — see the send condition below. It
+            # only shows up when a run had something else to say.
+            lines.append("UNVERIFIED CALL TIMES on the fail-safe 7am ET "
+                         "guess — Nasdaq lists the date but no time. The bot "
+                         "stands down in the morning and forfeits that day's "
+                         "accrual; that is the SAFE direction and needs no "
+                         "action (CELH 2026-08-06 is why). Confirm on the IR "
+                         "page only if you want the accrual back — these are "
+                         "re-checked against Nasdaq on every run and upgrade "
+                         "themselves the moment it publishes a time:")
+            for ev, iso in provisional_open:
+                lines.append(f"  {ev} = {iso}   (guessed, not measured)")
+                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
+                             f'"YYYY-MM-DDTHH:MM:00-04:00"   # the REAL call time')
             lines.append("")
         if bc_resolved:
             lines.append("BROADCAST mention cutoffs AUTO-RESOLVED (TVmaze / "
@@ -860,11 +1097,19 @@ def main(argv=None) -> int:
         if rel_unresolved:
             lines.append("RELEASE cutoffs UNRESOLVED — verify the earnings press-"
                          "release datetime and run (after-close ~4pm ET, BMO "
-                         "~before open):")
+                         "~before open). The template below is the SAFE default, "
+                         "not a guess at the answer:")
             for ev, occ in rel_unresolved:
                 hint = (parse_iso_utc(occ or "") or now).strftime("%Y-%m-%d")
+                # 07:00, not 16:00. Jack 2026-08-06: a paste-ready template IS a
+                # default — pasted unedited it becomes the override. A 4pm
+                # template hands the operator the exact value that had the bot
+                # quoting through CELH's 8am call, and it is the one an
+                # interrupted human is most likely to run without checking.
+                # 7am only costs a day of accrual if it is wrong.
                 lines.append(f'  python imm_earnings_overrides.py --set {ev} '
-                             f'"{hint}T16:00:00-04:00"   # kalshi occ={occ} VERIFY')
+                             f'"{hint}T07:00:00-04:00"   # kalshi occ={occ} '
+                             f'VERIFY; 7am = stand-down default, edit if AMC')
             lines.append("")
         if enrolled:
             lines.append("NEW SERIES AUTO-ENROLLED (bot hot-reloads; remove "
@@ -896,23 +1141,29 @@ def main(argv=None) -> int:
                        if series.startswith(_EARNINGS_PREFIX) else "")
                 rel = (nasdaq_release_datetime(tkr, now, DISCLOSURE_LEAD_DAYS + 3)
                        if tkr else None)
-                if rel:
+                if rel and provenance_of(rel[1]) == "read":
                     rel_et = rel[0].astimezone(ET)
                     # context anchor only — NOT the --set value
                     lines.append(f"    # Nasdaq: {tkr} releases {rel_et:%a %b %d} "
                                  f"[{rel[1]}] — call same-day shortly after OR "
                                  f"next AM; VERIFY the date")
-                    # runnable template: same-day call guess (5pm ET after a
-                    # close release, 8:30am after a pre-market one), clearly to
-                    # be edited if it's a split reporter
-                    guess = (rel_et.replace(hour=8, minute=30)
-                             if "before open" in rel[1]
-                             else rel_et.replace(hour=17, minute=0))
-                    hint_iso = guess.isoformat()
+                    # The template is the RELEASE time itself, not release+1h.
+                    # Jack 2026-08-06: the old version offered 5:00pm after a
+                    # 4pm release and 8:30am after a 7am one — i.e. an hour of
+                    # quoting after the print is already public, which is the
+                    # CELH failure in miniature. Phase 2 above deliberately
+                    # cuts off at the RELEASE ("safe: call is at/after the
+                    # release"); the hint a human pastes has to agree with it.
+                    hint_iso = rel_et.isoformat()
                 else:
+                    # Nasdaq had nothing, or had only a guess. Unknown -> the
+                    # stand-down default, never 4:30pm (which is what this line
+                    # used to offer). Standing down early forfeits accrual;
+                    # standing down late is how the bot ends up making markets
+                    # into a print.
                     d = parse_event_date(ev)
                     hint_iso = ((d.strftime("%Y-%m-%d") if d else "2026-MM-DD")
-                                + "T16:30:00-04:00")
+                                + "T07:00:00-04:00")
                 lines.append(f'  python imm_earnings_overrides.py --set {ev} '
                              f'"{hint_iso}"')
             lines.append("(unresolved events fall back to the conservative "
@@ -931,7 +1182,9 @@ def main(argv=None) -> int:
             log("alert credentials not configured; summary not emailed")
             print("\n".join(lines))
     else:
-        log(f"nothing to do: {len(covered)} covered, dry={args.dry}")
+        log(f"nothing to do: {len(covered)} covered, "
+            f"{len(provisional_open)} provisional (re-checked, still "
+            f"unmeasured), dry={args.dry}")
 
     return 0
 
