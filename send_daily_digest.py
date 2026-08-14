@@ -167,6 +167,142 @@ def fleet_entries(status_dir: str) -> list:
     return entries
 
 
+# ---------------------------------------------------------------------------
+# Cumulative-by-tenor classification (the bottom table, Jack 2026-08-14)
+# ---------------------------------------------------------------------------
+from crypto_annual_mm import annual_series_for as _annual_series_for  # noqa: E402
+
+MONTHLY_SERIES = {cfg.series for cfg in MARKETS.values()}          # KX*MAXMON/MINMON
+UPDOWN_SERIES = {f"KX{cfg.asset}D" for cfg in MARKETS.values()}    # KX*D
+ANNUAL_SERIES = set()
+for _cfg in MARKETS.values():
+    if _cfg.direction == "max":
+        ANNUAL_SERIES.update(_annual_series_for(_cfg.asset))       # MAXY/MINY/Y
+
+
+def _crypto_family(ticker: str):
+    """'daily'/'weekly'/'monthly'/'annual'/'hourly' for a crypto-fleet market
+    ticker, else None. KX*D tenor is recovered from the EVENT segment: 5pm-ET
+    closes (hour field '17') are weekly on Fridays and daily otherwise; any
+    other hour is an hourly market (never quoted by the fleet — manual
+    trades land there). Unparseable segments classify as None, not guessed."""
+    series = (ticker or "").split("-", 1)[0]
+    if series in MONTHLY_SERIES:
+        return "monthly"
+    if series in ANNUAL_SERIES:
+        return "annual"
+    if series not in UPDOWN_SERIES:
+        return None
+    parts = ticker.split("-")
+    if len(parts) < 2 or len(parts[1]) < 9:
+        return None
+    date_part, hour = parts[1][:7], parts[1][7:9]
+    if hour != "17":
+        return "hourly"
+    try:
+        close_day = datetime.strptime(date_part, "%y%b%d")
+    except ValueError:
+        return None
+    return "weekly" if close_day.weekday() == 4 else "daily"
+
+
+def cumulative_family_realized(client) -> dict:
+    """family -> all-time realized $ for the crypto fleets' tenor families.
+
+    Settled history comes from the settlements API — the positions endpoint
+    AGES OUT settled records (verified 2026-08-14: zero July monthlies remain
+    there) while settlements reach back to account origin, the same source
+    the KXHIGH ground-truth recipe trusts. A settlement's `revenue` is net
+    profit in cents (negative on losses). Round-trip realized on STILL-OPEN
+    markets is added from unsettled positions. Round trips on markets that
+    later settled are the one blind spot (neither source keeps them); these
+    fleets are hold-to-settle-dominant, so the miss is small — but this is a
+    measured number with that stated edge, not a model."""
+    fams = {}
+    cursor = None
+    for _page in range(500):
+        kw = {"limit": 200}
+        if cursor:
+            kw["cursor"] = cursor
+        resp = client.get_portfolio_settlements(**kw)
+        batch = resp.get("settlements") or []
+        for s in batch:
+            fam = _crypto_family(s.get("ticker") or "")
+            if fam:
+                fams[fam] = fams.get(fam, 0.0) + _f(s.get("revenue")) / 100.0
+        cursor = resp.get("cursor")
+        if not cursor or not batch:
+            break
+    cursor = None
+    for _page in range(50):
+        kw = {"limit": 200, "settlement_status": "unsettled"}
+        if cursor:
+            kw["cursor"] = cursor
+        resp = client.get_positions(**kw)
+        batch = resp.get("market_positions") or []
+        for p in batch:
+            fam = _crypto_family(p.get("ticker") or "")
+            if fam:
+                fams[fam] = fams.get(fam, 0.0) + _f(p.get("realized_pnl_dollars"))
+        cursor = resp.get("cursor")
+        if not cursor or not batch:
+            break
+    return fams
+
+
+CUM_FOOTNOTE = ("realized = settled history + open-market round-trips, "
+                "account-level (manual fills on these series included); "
+                "unrealized = the sections above")
+
+
+def cumulative_text(cum, unreal_by) -> list:
+    lines = ["== CUMULATIVE P&L by tenor (all-time) ==",
+             f"{'TENOR':9s} {'REAL$':>9s} {'UNREAL$':>9s} {'TOTAL$':>9s}"]
+    tot_r = tot_u = 0.0
+    rows = ["daily", "weekly", "monthly", "annual"]
+    if abs(cum.get("hourly", 0.0)) > 0.005:
+        rows.append("hourly")
+    for fam in rows:
+        r = cum.get(fam, 0.0)
+        u = unreal_by.get(fam, 0.0)
+        tot_r += r
+        tot_u += u
+        lines.append(f"{fam:9s} {r:>+9.2f} {u:>+9.2f} {r + u:>+9.2f}")
+    lines.append(f"{'TOTAL':9s} {tot_r:>+9.2f} {tot_u:>+9.2f} {tot_r + tot_u:>+9.2f}")
+    lines.append(f"({CUM_FOOTNOTE})")
+    return lines
+
+
+def cumulative_html(cum, unreal_by) -> list:
+    h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
+         'Cumulative P&amp;L by tenor (all-time)</div>',
+         '<table style="border-collapse:collapse">',
+         f'<tr style="background:#f0f0f0;font-weight:600">'
+         f'<td style="{TDL}">TENOR</td><td style="{TD}">REAL$</td>'
+         f'<td style="{TD}">UNREAL$</td><td style="{TD}">TOTAL$</td></tr>']
+    tot_r = tot_u = 0.0
+    rows = ["daily", "weekly", "monthly", "annual"]
+    if abs(cum.get("hourly", 0.0)) > 0.005:
+        rows.append("hourly")
+    for i, fam in enumerate(rows):
+        r = cum.get(fam, 0.0)
+        u = unreal_by.get(fam, 0.0)
+        tot_r += r
+        tot_u += u
+        bg = "#fafafa" if i % 2 else "#fff"
+        h.append(f'<tr style="background:{bg}"><td style="{TDL}">{fam}</td>'
+                 f'<td style="{TD}">{_pnl_span(r)}</td>'
+                 f'<td style="{TD}">{_pnl_span(u)}</td>'
+                 f'<td style="{TD};font-weight:600">{_pnl_span(r + u)}</td></tr>')
+    h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
+             f'<td style="{TDL}">TOTAL</td><td style="{TD}">{_pnl_span(tot_r)}</td>'
+             f'<td style="{TD}">{_pnl_span(tot_u)}</td>'
+             f'<td style="{TD}">{_pnl_span(tot_r + tot_u)}</td></tr>')
+    h.append('</table>')
+    h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">{CUM_FOOTNOTE}</div>')
+    return h
+
+
 def _event_exists(client, event_ticker: str) -> bool:
     try:
         client.get_event(event_ticker)
@@ -338,6 +474,16 @@ def build_digest(now_utc: datetime):
     except Exception:
         bal_str = "?"
 
+    # Bottom table: all-time realized per tenor + the sections' current
+    # unrealized. A failed sweep degrades to a note — never kills the digest.
+    try:
+        cum = cumulative_family_realized(client)
+    except Exception as e:
+        log(f"! cumulative-by-tenor sweep failed: {e}")
+        cum = None
+    unreal_by = {"daily": d_tot["unrealized"], "weekly": w_tot["unrealized"],
+                 "monthly": m_tot["unrealized"], "annual": a_tot["unrealized"]}
+
     grand = {k: m_tot[k] + w_tot[k] + d_tot[k] + a_tot[k] for k in m_tot}
     grand_pnl = grand["realized"] + grand["unrealized"]
     m_health = fleet_health(STATUS_DIR, "Monthly bots")
@@ -365,6 +511,12 @@ def build_digest(now_utc: datetime):
     lines.append("")
     lines += text_section("ANNUAL touch+terminal (KX*MAXY/*MINY/*Y)",
                           a_rows, a_tot, a_quiet, a_failed, a_health)
+    lines.append("")
+    if cum is not None:
+        lines += cumulative_text(cum, unreal_by)
+    else:
+        lines.append("(cumulative-by-tenor table unavailable this morning: "
+                     "settlements sweep failed)")
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
@@ -388,6 +540,11 @@ def build_digest(now_utc: datetime):
                       d_rows, d_tot, d_quiet, d_failed, d_health)
     h += html_section("Annual touch+terminal (KX*MAXY / *MINY / *Y)",
                       a_rows, a_tot, a_quiet, a_failed, a_health)
+    if cum is not None:
+        h += cumulative_html(cum, unreal_by)
+    else:
+        h.append('<div style="color:#c0392b;margin-top:8px">cumulative-by-tenor '
+                 'table unavailable this morning: settlements sweep failed</div>')
     h.append('</div>')
     return text, "".join(h)
 
