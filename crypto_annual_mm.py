@@ -257,6 +257,9 @@ class AnnualMarketMaker(ud.UpDownMarketMaker):
     contracts_per_level_by_cadence = {}
     num_levels_by_cadence = {}
     quote_offset_by_cadence = {}
+    quote_offset_by_asset_cadence = {}
+    skew_by_cadence = {}
+    momo_cadences = ()
 
     def __init__(self, cfg: mm.MarketConfig, client, live: bool):
         super().__init__(cfg, client, live, cadences=("annual",))

@@ -142,12 +142,23 @@ def bot(client=None, live=False, cadences=("hourly", "daily")):
     return ud.UpDownMarketMaker(BTC, client or FakeClient(), live=live, cadences=cadences)
 
 
+def _candles_ending_at(n, interval_minutes, sigma_bar, spot):
+    """Synthetic candles rescaled so the final close equals `spot` — the
+    momentum guard compares live spot to hourly-candle closes, and fixtures
+    with inconsistent units would trip it in every run_cycle test (exactly
+    the data-inconsistency its |ret|>1.0 sanity bound exists for)."""
+    rows = candles(400 if n is None else n, interval_minutes, sigma_bar)
+    factor = spot / rows[-1][1]
+    return [(ts, c * factor, h * factor, lo * factor) for ts, c, h, lo in rows]
+
+
 @contextlib.contextmanager
 def priced(spot=100000.0, sigma_bar=0.01):
     with frozen(), \
          mock.patch.object(mm, "fetch_live_price", return_value=spot), \
          mock.patch.object(mm, "fetch_ohlc",
-                           side_effect=lambda cfg, iv: candles(400, iv, sigma_bar)):
+                           side_effect=lambda cfg, iv:
+                           _candles_ending_at(400, iv, sigma_bar, spot)):
         yield
 
 
@@ -676,6 +687,177 @@ class TestRunCycle(unittest.TestCase):
     def test_band_is_ten_to_ninety(self):
         self.assertEqual((ud.SKIP_FAIR_BELOW_CENTS, ud.SKIP_FAIR_ABOVE_CENTS), (10, 90))
         self.assertEqual(ud.MAX_MARKETS_PER_EVENT, 8)
+
+
+class TestDailyDefenses(unittest.TestCase):
+    """The 2026-08-17 daily-tenor defenses (fill autopsy: all-day bleed,
+    worst overnight, 3.3x on the NO side, all BTC): inventory skew,
+    momentum stand-down, per-asset offset. All daily-only — weekly's
+    warehousing made +252 its first settled week and stays untouched."""
+
+    def test_config_is_pinned(self):
+        self.assertEqual(ud.SKEW_BY_CADENCE, {"daily": (4.0, 25.0)})
+        self.assertEqual(ud.SKEW_EDGE_FLOOR_CENTS, 3.0)
+        self.assertEqual(ud.MOMO_CADENCES, ("daily",))
+        self.assertEqual(ud.MOMO_Z, 1.5)
+        self.assertEqual(ud.MOMO_HOLD_SECS, 1800)
+        self.assertEqual(ud.QUOTE_OFFSET_BY_ASSET_CADENCE, {("BTC", "daily"): 6})
+
+    def test_one_hour_ref_uses_candle_close_times(self):
+        """Kraken candle timestamps are OPEN times. The reference must be the
+        close of the latest bar that CLOSED >= 1h ago — an hourly-candle
+        filter on open times anchored the reference to the top of the
+        CURRENT hour (0-60min window, blind after each boundary; caught in
+        adversarial review 2026-08-17)."""
+        now = NOW.timestamp()
+        # 5m bars, open-stamped, close price encodes the bar's close time so
+        # the selection is self-evident in the assertion
+        rows = [(int(now - k * 300), float(now - (k - 1) * 300), 0.0, 0.0)
+                for k in range(30, 0, -1)]
+        b = bot()
+        with mock.patch.object(mm, "fetch_ohlc", return_value=rows):
+            ref = b.price_one_hour_ago(now)
+        # latest bar with close (open+300) <= now-3600 closed exactly at now-3600
+        self.assertEqual(ref, now - 3600)
+
+    def test_momentum_triggers_through_real_candles(self):
+        """End-to-end with NOTHING mocked below fetch_ohlc: flat until 1h
+        ago, then a +1% ramp — the trailing-1h window must see the full move
+        (the old top-of-hour anchoring saw only a fragment)."""
+        now = NOW.timestamp()
+        rows = []
+        for k in range(48, 0, -1):
+            open_ts = int(now - k * 300)
+            px = 100000.0 if open_ts + 300 <= now - 3600 else 101000.0
+            rows.append((open_ts, px, px, px))
+        b = bot()
+        b.state.sigma_daily = 0.024      # sigma_1h ~ 0.49% < 1% move
+        with mock.patch.object(mm, "fetch_ohlc", return_value=rows):
+            self.assertEqual(b.refresh_momentum_block(101000.0, now), "ask")
+            self.assertAlmostEqual(b.u.last_ret_1h, math.log(1.01), places=6)
+
+    def test_skew_thinned_edge_never_drops_below_the_floor(self):
+        """Account-level net can be someone else's position (manual trades
+        share the account), so the skew-thinned side keeps >= 3c of edge:
+        BTC daily (offset 6) allows +/-3c of effective skew, others (offset
+        4) +/-1c. Saturated short on BTC must shift quotes by exactly +3."""
+        def daily_bids(asset_key, positions):
+            cfg = ud.ASSETS[asset_key]
+            c = FakeClient(markets=daily_event() + weekly_event(),
+                           positions=positions)
+            b = ud.UpDownMarketMaker(cfg, c, live=False,
+                                     cadences=("daily", "weekly"))
+            with priced():
+                b.run_cycle()
+            return {(o["ticker"], o["book_side"]): o["yes_price"]
+                    for o in b.state.sim_orders.values()
+                    if o["ticker"].startswith(EV_D)}
+
+        for asset, max_shift in (("BTC", 3), ("ETH", 1)):
+            flat = daily_bids(asset, {})
+            short = daily_bids(asset, {EV_D: {f"{EV_D}-T100000.0": -25.0}})
+            diffs = [short[k] - flat[k] for k in short if k in flat]
+            self.assertTrue(diffs, asset)
+            self.assertLessEqual(max(diffs), max_shift, asset)
+            self.assertEqual(max(diffs), max_shift, asset)   # binds somewhere
+            self.assertGreaterEqual(min(diffs), 0, asset)    # never wrong way
+
+    def test_skew_sign_and_saturation(self):
+        # short YES (the BTC failure) -> POSITIVE skew: quote richer, buy back
+        self.assertGreater(ud.inventory_skew_cents(-10, 4, 25), 0)
+        # long YES -> negative skew: quote cheaper, shed
+        self.assertLess(ud.inventory_skew_cents(10, 4, 25), 0)
+        self.assertEqual(ud.inventory_skew_cents(0, 4, 25), 0.0)
+        self.assertEqual(ud.inventory_skew_cents(-25, 4, 25), 4.0)
+        self.assertEqual(ud.inventory_skew_cents(-250, 4, 25), 4.0)   # saturates
+        self.assertEqual(ud.inventory_skew_cents(25, 4, 25), -4.0)
+        self.assertAlmostEqual(ud.inventory_skew_cents(-10, 4, 25), 1.6)
+        self.assertEqual(ud.inventory_skew_cents(-10, 0, 25), 0.0)    # disabled
+        self.assertEqual(ud.inventory_skew_cents(-10, 4, 0), 0.0)
+
+    def test_momentum_block_side(self):
+        sigma_d = 0.024                      # sigma_1h ~ 0.49%
+        self.assertEqual(ud.momentum_block_side(+0.010, sigma_d), "ask")
+        self.assertEqual(ud.momentum_block_side(-0.010, sigma_d), "bid")
+        self.assertIsNone(ud.momentum_block_side(+0.004, sigma_d))    # < 1.5 sigma
+        self.assertIsNone(ud.momentum_block_side(+0.010, 0.0))        # no vol -> off
+
+    def test_short_inventory_lifts_daily_quotes(self):
+        """Same book, same fair; a short event position must move BOTH sides
+        of the daily ladder UP (stop re-offering cheap, bid closer to buying
+        back) and leave the weekly ladder alone."""
+        def quotes_with(positions):
+            c = FakeClient(markets=daily_event() + weekly_event(),
+                           positions=positions)
+            b = bot(c, cadences=("daily", "weekly"))
+            with priced():
+                b.run_cycle()
+            out = {"daily": [], "weekly": []}
+            for o in b.state.sim_orders.values():
+                cad = "daily" if o["ticker"].startswith(EV_D) else "weekly"
+                out[cad].append((o["ticker"], o["book_side"], o["yes_price"]))
+            return out
+
+        flat = quotes_with({})
+        # -25 on one daily market saturates the skew at +4c
+        short = quotes_with({EV_D: {f"{EV_D}-T100000.0": -25.0}})
+        flat_by_key = {(t, s): p for t, s, p in flat["daily"]}
+        moved = 0
+        for t, s, p in short["daily"]:
+            if (t, s) in flat_by_key and p > flat_by_key[(t, s)]:
+                moved += 1
+        self.assertGreater(moved, 0)   # daily quotes shifted up
+        self.assertEqual(sorted(flat["weekly"]), sorted(short["weekly"]))
+
+    def test_momentum_blocks_asks_on_daily_only(self):
+        c = FakeClient(markets=daily_event() + weekly_event())
+        b = bot(c, cadences=("daily", "weekly"))
+        with priced():
+            # trip the guard directly: strong up-move already observed
+            b.u.momo_side, b.u.momo_until = "ask", NOW.timestamp() + 900
+            with mock.patch.object(b, "refresh_momentum_block",
+                                   return_value="ask"):
+                b.run_cycle()
+        daily_sides = {o["book_side"] for o in b.state.sim_orders.values()
+                       if o["ticker"].startswith(EV_D)}
+        weekly_sides = {o["book_side"] for o in b.state.sim_orders.values()
+                        if o["ticker"].startswith(EV_W)}
+        self.assertEqual(daily_sides, {"bid"})          # asks suppressed
+        self.assertEqual(weekly_sides, {"bid", "ask"})  # weekly untouched
+
+    def test_momentum_hold_persists_after_trigger_clears(self):
+        b = bot()
+        b.state.sigma_daily = 0.024
+        now = NOW.timestamp()
+        with mock.patch.object(b, "price_one_hour_ago", return_value=100000.0):
+            # +1% in 1h vs sigma_1h 0.49% -> trigger
+            self.assertEqual(b.refresh_momentum_block(101000.0, now), "ask")
+            # move faded: still blocked inside the hold window...
+            self.assertEqual(b.refresh_momentum_block(100100.0, now + 600), "ask")
+            # ...and released after it
+            self.assertIsNone(
+                b.refresh_momentum_block(100100.0, now + ud.MOMO_HOLD_SECS + 601))
+
+    def test_momentum_failure_leaves_guard_inactive(self):
+        b = bot()
+        b.state.sigma_daily = 0.024
+        with mock.patch.object(b, "price_one_hour_ago",
+                               side_effect=RuntimeError("kraken down")):
+            self.assertIsNone(b.refresh_momentum_block(100000.0, NOW.timestamp()))
+
+    def test_btc_daily_offset_is_six_cents_others_four(self):
+        b = bot()   # BTC
+        self.assertEqual(
+            b.quote_offset_by_asset_cadence.get(("BTC", "daily")), 6)
+        self.assertIsNone(
+            b.quote_offset_by_asset_cadence.get(("ETH", "daily")))
+        # ETH daily falls through to the tenor offset
+        self.assertEqual(ud.QUOTE_OFFSET_BY_CADENCE["daily"], 4)
+
+
+class TestRunCycleBudgets(unittest.TestCase):
+    """Offset/band/cap behaviors of the cycle (split out of TestRunCycle when
+    TestDailyDefenses was inserted above them, 2026-08-17)."""
 
     def test_banner_offset_matches_the_ladder_actually_quoted(self):
         # The inherited startup banner read the module global and printed "5c"

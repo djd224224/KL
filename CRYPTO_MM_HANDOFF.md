@@ -324,6 +324,32 @@ separate module, a separate `terminal_prob()` (Black-Scholes N(d2), r=0, MC-vali
   ladder used to join in the pick-off zone. Rolled out by killing the 7 pythons
   only (launchers respawn with new code; tasks never leave Running — the clean
   path for code-only changes). Banner shows `ladder 3x2 (daily 2x1 @4c)`.
+- **Daily defenses 2026-08-17** (fill autopsy first: per-fill P&L by hours-to-close
+  showed the bleed spread across the WHOLE day — worst 12–18h out, the overnight
+  session — with the final hour actually positive, 3.3x heavier on the NO side,
+  all of it BTC; i.e. drift/momentum against the driftless fair, not
+  settlement-window gamma. All three daily-only; weekly/annual pinned untouched):
+  1. **Inventory skew** — the QUOTING fair (never the divergence-guard fair)
+     shifts against the event's net position, ±4c saturating at 25 contracts
+     (`SKEW_BY_CADENCE`, env `CUD_SKEW_*_DAILY`). Short YES ⇒ both sides lift:
+     stop re-offering cheap, bid toward buying back. **Event net is ACCOUNT
+     net** — a manual position could otherwise pin the skew and thin the bot's
+     edge to 0-2c while fading Jack's own bet (adversarial review), so the
+     thinned side keeps ≥ `CUD_SKEW_EDGE_FLOOR` (3c) of edge: effective skew
+     ±3c on BTC daily, ±1c elsewhere, plus a `skew_saturated` digest alert.
+  2. **Momentum stand-down** — 1h log-return beyond 1.5×σ₁ₕ (σ_d/√24) blocks the
+     FADING side (asks in an up-move) for 1800s past the last trigger
+     (`CUD_MOMO_*`; heartbeat shows `momo_blocked`/`last_ret_1h`). The 1h-ago
+     reference is the close of the latest **5m candle** that closed ≥1h ago:
+     Kraken stamps candles with OPEN times, and an hourly-candle filter
+     anchored the reference to the top of the CURRENT hour — a 0-60min window,
+     blind after every boundary (adversarial review caught it; test pins the
+     convention). |ret|>1.0 is treated as a data inconsistency (candle-vs-spot
+     source slip) and ignored — a guard must never act on broken data.
+  3. **Per-asset offset** — `KXBTCD` daily quotes 6c off fair
+     (`QUOTE_OFFSET_BY_ASSET_CADENCE`, env `CUD_QUOTE_OFFSET_DAILY_BTC`); the six
+     benign assets stay at 4c.
+  Startup logs a `=== defenses: ... ===` line after the banner.
 - **Tenor-collision guard** (Jack 2026-08-14 "do not let it collide with weekly"):
   `select_events` drops any event whose end is within `TENOR_COLLISION_SECS` (300s)
   of a LONGER-tenor selected event's end — same settlement print, same bet, quoted

@@ -174,6 +174,49 @@ NUM_LEVELS_BY_CADENCE = {
 QUOTE_OFFSET_BY_CADENCE = {
     "daily": _env_i("CUD_QUOTE_OFFSET_DAILY", 4),
 }
+# Per-(asset, tenor) offset override, looked up before the per-tenor table.
+# BTC carried -105 of the daily tenor's first -111 (its books are the most
+# competitive, so our fills there are the most informed); the six benign
+# assets stay at the tenor offset rather than being taxed for BTC's flow.
+QUOTE_OFFSET_BY_ASSET_CADENCE = {
+    ("BTC", "daily"): _env_i("CUD_QUOTE_OFFSET_DAILY_BTC", 6),
+}
+
+# ---- daily-tenor defenses (Jack 2026-08-17, after the fill autopsy) -------
+# The 8/14-8/16 daily losses were NOT settlement-window gamma: per-fill P&L
+# bucketed by hours-to-close showed the bleed spread across the whole day
+# (worst 12-18h out = the overnight session; the final hour was POSITIVE),
+# 3.3x heavier on the NO side, all of it BTC. Mechanism: driftless fair +
+# no inventory memory = the bot re-offered YES into a rising market all
+# night. Two defenses, both daily-only (weekly's warehousing made +252 its
+# first week — do not generalize):
+#
+# INVENTORY SKEW: the quoting fair (never the divergence-guard fair) shifts
+# against the EVENT's net position — long YES quotes cheaper, short YES
+# quotes richer — saturating at +/-SKEW cents once |net| reaches FULL_AT
+# contracts. cadence -> (max_cents, full_at_contracts).
+SKEW_BY_CADENCE = {
+    "daily": (_env_f("CUD_SKEW_CENTS_DAILY", 4.0),
+              _env_f("CUD_SKEW_FULL_AT_DAILY", 25.0)),
+}
+# The skew-THINNED side's edge never drops below this floor (adversarial
+# review 2026-08-17): event_net is ACCOUNT-level, so a manual position on the
+# same event could otherwise pin skew and thin the bot's edge to 0-2c —
+# recreating the original bleed while fading Jack's own deliberate bet. With
+# a 3c floor the effective skew is +/-3c on BTC daily (offset 6) and +/-1c
+# elsewhere (offset 4); the momentum guard carries sustained drift.
+SKEW_EDGE_FLOOR_CENTS = _env_f("CUD_SKEW_EDGE_FLOOR", 3.0)
+# MOMENTUM STAND-DOWN: when the 1h log-return exceeds MOMO_Z x sigma_1h
+# (sigma_daily/sqrt(24)), stop quoting the side that FADES the move (asks in
+# an up-move, bids in a down-move) on the listed cadences, and hold the
+# block MOMO_HOLD_SECS past the last trigger. Same philosophy as the book-
+# divergence guard, applied to the underlying: a moving market knows
+# something the driftless fair does not.
+MOMO_CADENCES = tuple(
+    c.strip() for c in os.environ.get("CUD_MOMO_CADENCES", "daily").split(",")
+    if c.strip() in CADENCES)
+MOMO_Z = _env_f("CUD_MOMO_Z", 1.5)
+MOMO_HOLD_SECS = _env_f("CUD_MOMO_HOLD_SECS", 1800)
 
 # Two tenors of one series can settle on the SAME print: on Fridays the 5pm
 # close IS the weekly event (no separate daily lists), and any daily/hourly
@@ -289,6 +332,32 @@ def vol_interval_for_horizon(t_days: float) -> int:
         if t_days <= max_days:
             return interval
     return 1440
+
+
+def inventory_skew_cents(event_net: float, max_cents: float,
+                         full_at: float) -> float:
+    """Cents to ADD to the quoting fair given the event's net YES position:
+    negative when long (quote cheaper, shed), positive when short (quote
+    richer, stop re-offering / buy back). Linear, saturating at +/-max_cents
+    once |net| reaches full_at contracts."""
+    if max_cents <= 0 or full_at <= 0:
+        return 0.0
+    frac = max(-1.0, min(1.0, event_net / full_at))
+    return -max_cents * frac
+
+
+def momentum_block_side(ret_1h: float, sigma_daily: float,
+                        z: float = MOMO_Z) -> Optional[str]:
+    """'ask' when the 1h up-move exceeds z x sigma_1h (do not sell YES into
+    strength), 'bid' on the mirror down-move, else None."""
+    if sigma_daily <= 0:
+        return None
+    sigma_1h = sigma_daily / math.sqrt(24.0)
+    if ret_1h > z * sigma_1h:
+        return "ask"
+    if ret_1h < -z * sigma_1h:
+        return "bid"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +520,10 @@ class UpDownState:
     # ticker -> consecutive clean (zero-order) sweeps. Removed at 2 so an
     # order in flight during the first sweep is caught by the second.
     sweep_pending: Dict[str, int] = field(default_factory=dict)
+    # Momentum stand-down: which book side is blocked and until when.
+    momo_side: Optional[str] = None
+    momo_until: float = 0.0
+    last_ret_1h: Optional[float] = None
 
 
 class UpDownMarketMaker(mm.TouchMarketMaker):
@@ -478,6 +551,12 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
     contracts_per_level_by_cadence = CONTRACTS_PER_LEVEL_BY_CADENCE
     num_levels_by_cadence = NUM_LEVELS_BY_CADENCE
     quote_offset_by_cadence = QUOTE_OFFSET_BY_CADENCE
+    quote_offset_by_asset_cadence = QUOTE_OFFSET_BY_ASSET_CADENCE
+    skew_by_cadence = SKEW_BY_CADENCE
+    skew_edge_floor_cents = SKEW_EDGE_FLOOR_CENTS
+    momo_cadences = MOMO_CADENCES
+    momo_z = MOMO_Z
+    momo_hold_secs = MOMO_HOLD_SECS
 
     def __init__(self, cfg: mm.MarketConfig, client, live: bool,
                  cadences: Sequence[str] = ("hourly", "daily")):
@@ -659,10 +738,67 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
             "series": self.cfg.series,
             "cadences": ",".join(self.cadences),
             "idle_reason": self.u.idle_reason,
+            "momo_blocked": self.u.momo_side or "",
+            "last_ret_1h": self.u.last_ret_1h,
             "events": [{"ticker": v.ticker, "cadence": v.cadence,
                         "end": v.end.strftime("%Y-%m-%dT%H:%M:%SZ")}
                        for v in self.u.events],
         }
+
+    # ---- momentum stand-down -----------------------------------------------
+
+    def price_one_hour_ago(self, now_ts: float) -> Optional[float]:
+        """Close of the latest 5m candle that CLOSED at least 1h ago.
+
+        Kraken stamps candles with their OPEN time (the ts+interval
+        convention candles_extreme also relies on). An hourly-candle version
+        of this filter therefore anchored the reference to the top of the
+        CURRENT hour — measuring a 0-60min return that left the guard blind
+        right after every hour boundary and ~sqrt(2) under-sensitive on
+        average (caught in adversarial review, 2026-08-17). 5m bars put the
+        reference 60-65 minutes back at any wall time; the shared fleet
+        cache makes this a file read most cycles."""
+        candles = mm.fetch_ohlc(self.cfg, 5)
+        past = [c for c in candles if c[0] + 300 <= now_ts - 3600]
+        return past[-1][1] if past else None
+
+    def refresh_momentum_block(self, spot: float, now_ts: float) -> Optional[str]:
+        """Evaluate the 1h-momentum trigger and return the blocked book side
+        (with MOMO_HOLD_SECS of hysteresis past the last trigger), or None.
+        Failures leave the guard inactive for the cycle — it is a defense,
+        not a dependency."""
+        try:
+            ref = self.price_one_hour_ago(now_ts)
+            if ref and ref > 0 and spot > 0:
+                ret_1h = math.log(spot / ref)
+                self.u.last_ret_1h = ret_1h
+                if abs(ret_1h) > 1.0:
+                    # |1h return| > 172% is not a market move, it is a data
+                    # inconsistency (e.g. candle source vs spot source after
+                    # a fallback, or a bad candle) — ln(10) unit slips land
+                    # here. A guard must never act on broken data.
+                    log(f"{self.tag} ! momentum ref implausible "
+                        f"(ret_1h={ret_1h:+.2f}); guard inactive this cycle")
+                    side = None
+                else:
+                    side = momentum_block_side(ret_1h, self.state.sigma_daily,
+                                               self.momo_z)
+                if side:
+                    if side != self.u.momo_side:
+                        log(f"{self.tag} momentum stand-down: 1h ret "
+                            f"{ret_1h:+.4f} > {self.momo_z:g} sigma_1h; "
+                            f"blocking {side}s on {'/'.join(self.momo_cadences)}")
+                        self.alerter.alert(
+                            "momentum", f"1h ret {ret_1h:+.4f}; blocking {side}s",
+                            key=side, urgent=False)
+                    self.u.momo_side = side
+                    self.u.momo_until = now_ts + self.momo_hold_secs
+        except Exception as e:
+            log(f"{self.tag} ! momentum check failed ({e}); guard inactive this cycle")
+        if self.u.momo_side and now_ts < self.u.momo_until:
+            return self.u.momo_side
+        self.u.momo_side = None
+        return None
 
     # ---- one cycle ----------------------------------------------------------
 
@@ -723,6 +859,10 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
         self.state.live_price = spot
         self.refresh_vol(now_ts, now_utc)
 
+        momo_block = None
+        if any(v.cadence in self.momo_cadences for v in selected):
+            momo_block = self.refresh_momentum_block(spot, now_ts)
+
         resting = self.fetch_resting_orders(now_ts)
         own_by_ticker: Dict[str, List[Tuple[str, int, float]]] = {}
         for o in resting:
@@ -743,7 +883,8 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
 
         summary = [f"{self.tag} {self.cfg.asset}=${spot:,.2f} "
                    f"sigma_d={self.state.sigma_daily:.4f} net={asset_net:+.0f} "
-                   f"events={len(selected)}"]
+                   f"events={len(selected)}"
+                   + (f" MOMO-BLOCK:{momo_block}s" if momo_block else "")]
         desired: List[mm.Quote] = []
         blind = set()
 
@@ -764,12 +905,31 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
             cpl = self.contracts_per_level_by_cadence.get(
                 v.cadence, self.contracts_per_level)
             n_levels = self.num_levels_by_cadence.get(v.cadence, self.num_levels)
-            offset = self.quote_offset_by_cadence.get(
-                v.cadence, self.quote_offset_cents)
+            offset = self.quote_offset_by_asset_cadence.get(
+                (self.cfg.asset, v.cadence))
+            if offset is None:
+                offset = self.quote_offset_by_cadence.get(
+                    v.cadence, self.quote_offset_cents)
+            skew_cfg = self.skew_by_cadence.get(v.cadence)
+            skew = (inventory_skew_cents(event_net, *skew_cfg)
+                    if skew_cfg else 0.0)
+            if skew:
+                # The thinned side's edge never drops below the floor — see
+                # SKEW_EDGE_FLOOR_CENTS (account-level net can be someone
+                # else's position).
+                max_shift = max(0.0, offset - self.skew_edge_floor_cents)
+                skew = max(-max_shift, min(max_shift, skew))
+                if abs(event_net) >= skew_cfg[1]:
+                    self.alerter.alert(
+                        "skew_saturated",
+                        f"{v.ticker} net {event_net:+.0f} saturates the "
+                        f"inventory skew (account-level: may include non-bot "
+                        f"positions)", key=v.ticker, urgent=False)
             band = self.quotable_markets(v, spot, now_utc, now_ts)
             summary.append(
                 f"  {v.ticker} [{v.cadence}] {v.secs_left(now_utc) / 3600:.2f}h left, "
-                f"{len(v.markets)} strikes -> {len(band)} quotable, net={event_net:+.0f}")
+                f"{len(v.markets)} strikes -> {len(band)} quotable, net={event_net:+.0f}"
+                + (f", skew={skew:+.1f}c" if skew else ""))
             remaining = len(band)
             for _moneyness, ticker, strike, fair in band:
                 share_buy = event_room_buy / remaining if remaining > 0 else 0.0
@@ -808,10 +968,15 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                 pos = positions.get(ticker, 0.0)
                 room_buy = min(self.max_position - pos, share_buy)
                 room_sell = min(self.max_position + pos, share_sell)
-                quotes = mm.build_quotes(ticker, fair, best_bid, best_ask,
+                # Inventory skew moves only the QUOTING fair — band selection
+                # and the divergence guard above judged the model fair.
+                q_fair = int(round(max(1, min(99, fair + skew))))
+                quotes = mm.build_quotes(ticker, q_fair, best_bid, best_ask,
                                          room_buy, room_sell,
                                          n_levels, cpl,
                                          offset, self.level_spacing_cents)
+                if momo_block and v.cadence in self.momo_cadences:
+                    quotes = [q for q in quotes if q.book_side != momo_block]
                 desired.extend(quotes)
                 bought = sum(q.count for q in quotes if q.book_side == "bid")
                 sold = sum(q.count for q in quotes if q.book_side == "ask")
@@ -955,6 +1120,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"{SKIP_FAIR_ABOVE_CENTS}c, <={MAX_MARKETS_PER_EVENT} mkts/event | "
         f"caps {MAX_POSITION_CONTRACTS:g}/{MAX_EVENT_CONTRACTS:g}/"
         f"{MAX_ASSET_CONTRACTS:g} (mkt/event/asset) ===")
+    defenses = []
+    for c, (mx, full) in sorted(SKEW_BY_CADENCE.items()):
+        if c in cadences:
+            defenses.append(f"{c} skew +/-{mx:g}c full@{full:g}cts")
+    if any(c in cadences for c in MOMO_CADENCES):
+        defenses.append(f"momo z={MOMO_Z:g} hold {MOMO_HOLD_SECS:g}s "
+                        f"on {'/'.join(MOMO_CADENCES)}")
+    for (a, c), off in sorted(QUOTE_OFFSET_BY_ASSET_CADENCE.items()):
+        if a == cfg.asset and c in cadences:
+            defenses.append(f"{a} {c} offset {off}c")
+    if defenses:
+        log(f"=== defenses: {'; '.join(defenses)} ===")
     bot.run(once=args.once)
     return 0
 

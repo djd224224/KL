@@ -475,6 +475,9 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertEqual(ann.AnnualMarketMaker.contracts_per_level_by_cadence, {})
         self.assertEqual(ann.AnnualMarketMaker.num_levels_by_cadence, {})
         self.assertEqual(ann.AnnualMarketMaker.quote_offset_by_cadence, {})
+        self.assertEqual(ann.AnnualMarketMaker.quote_offset_by_asset_cadence, {})
+        self.assertEqual(ann.AnnualMarketMaker.skew_by_cadence, {})
+        self.assertEqual(ann.AnnualMarketMaker.momo_cadences, ())
         self.assertEqual(ud.UpDownMarketMaker.contracts_per_level_by_cadence,
                          {"daily": 1})
         self.assertEqual(ud.UpDownMarketMaker.num_levels_by_cadence, {"daily": 2})
