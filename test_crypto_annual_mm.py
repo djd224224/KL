@@ -471,10 +471,14 @@ class TestFleetIsolation(unittest.TestCase):
     def test_annual_class_attrs_do_not_touch_the_updown_fleet(self):
         self.assertEqual(ann.AnnualMarketMaker.contracts_per_level, 1)
         self.assertEqual(ud.UpDownMarketMaker.contracts_per_level, 2)
-        # the updown fleet's per-tenor daily=1 table must not leak in here
+        # the updown fleet's per-tenor daily tables must not leak in here
         self.assertEqual(ann.AnnualMarketMaker.contracts_per_level_by_cadence, {})
+        self.assertEqual(ann.AnnualMarketMaker.num_levels_by_cadence, {})
+        self.assertEqual(ann.AnnualMarketMaker.quote_offset_by_cadence, {})
         self.assertEqual(ud.UpDownMarketMaker.contracts_per_level_by_cadence,
                          {"daily": 1})
+        self.assertEqual(ud.UpDownMarketMaker.num_levels_by_cadence, {"daily": 2})
+        self.assertEqual(ud.UpDownMarketMaker.quote_offset_by_cadence, {"daily": 4})
         self.assertEqual(ann.AnnualMarketMaker.max_asset, 400)
         self.assertEqual(ud.UpDownMarketMaker.max_asset, 800)
         self.assertEqual(ann.AnnualMarketMaker.poll_secs, 60)

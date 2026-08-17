@@ -252,9 +252,11 @@ class AnnualMarketMaker(ud.UpDownMarketMaker):
     level_spacing_cents = LEVEL_SPACING_CENTS
     status_dir = STATUS_DIR
     # No per-tenor overrides here: everything this bot quotes is "annual",
-    # and inheriting the updown fleet's {"daily": 1} table would be dead
-    # config at best and a surprise at worst.
+    # and inheriting the updown fleet's daily tables would be dead config at
+    # best and a surprise at worst.
     contracts_per_level_by_cadence = {}
+    num_levels_by_cadence = {}
+    quote_offset_by_cadence = {}
 
     def __init__(self, cfg: mm.MarketConfig, client, live: bool):
         super().__init__(cfg, client, live, cadences=("annual",))

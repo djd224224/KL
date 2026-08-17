@@ -154,14 +154,25 @@ CONTRACTS_PER_LEVEL = _env_i("CUD_CONTRACTS_PER_LEVEL", 2)
 QUOTE_OFFSET_CENTS = _env_i("CUD_QUOTE_OFFSET_CENTS", 3)
 LEVEL_SPACING_CENTS = _env_i("CUD_LEVEL_SPACING_CENTS", 2)
 
-# Per-TENOR rung size (Jack 2026-08-14: the daily tenor goes live at 1/1/1 —
-# three 1-contract rungs — while weekly keeps its doubled 2s). Cadences absent
-# from this table quote CONTRACTS_PER_LEVEL. The side/level-cap backstops in
-# place_with_side_cap stay derived from the LARGEST shape; they are upper
-# bounds, and the ladder actually built per event is what enforces the
-# per-tenor size.
+# Per-TENOR ladder overrides. Cadences absent from a table use the bot-wide
+# value. The side/level-cap backstops in place_with_side_cap stay derived
+# from the LARGEST shape; they are upper bounds, and the ladder actually
+# built per event is what enforces the per-tenor size.
+#
+# History: daily went live 2026-08-14 at 1/1/1 (three 1-contract rungs, 3c
+# off fair). First two settles lost -110.93, -105 of it KXBTCD near-money
+# strikes picked off from both sides at the print — 3c off a coin-flip fair
+# on $250-wide BTC strikes was not enough edge. Jack 2026-08-16 ("daily
+# crypto bot is losing"): daily is now a 1/1 ladder (TWO 1-contract rungs)
+# quoting 4c off fair. Weekly keeps 3x2 @3c (its first settled week: +252).
 CONTRACTS_PER_LEVEL_BY_CADENCE = {
     "daily": _env_i("CUD_CONTRACTS_PER_LEVEL_DAILY", 1),
+}
+NUM_LEVELS_BY_CADENCE = {
+    "daily": _env_i("CUD_NUM_LEVELS_DAILY", 2),
+}
+QUOTE_OFFSET_BY_CADENCE = {
+    "daily": _env_i("CUD_QUOTE_OFFSET_DAILY", 4),
 }
 
 # Two tenors of one series can settle on the SAME print: on Fridays the 5pm
@@ -465,6 +476,8 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
     max_fair_divergence_cents = MAX_FAIR_DIVERGENCE_CENTS
     idle_poll_secs = IDLE_POLL_SECS
     contracts_per_level_by_cadence = CONTRACTS_PER_LEVEL_BY_CADENCE
+    num_levels_by_cadence = NUM_LEVELS_BY_CADENCE
+    quote_offset_by_cadence = QUOTE_OFFSET_BY_CADENCE
 
     def __init__(self, cfg: mm.MarketConfig, client, live: bool,
                  cadences: Sequence[str] = ("hourly", "daily")):
@@ -750,6 +763,9 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
             event_room_sell = min(self.max_event + event_net, event_share_sell)
             cpl = self.contracts_per_level_by_cadence.get(
                 v.cadence, self.contracts_per_level)
+            n_levels = self.num_levels_by_cadence.get(v.cadence, self.num_levels)
+            offset = self.quote_offset_by_cadence.get(
+                v.cadence, self.quote_offset_cents)
             band = self.quotable_markets(v, spot, now_utc, now_ts)
             summary.append(
                 f"  {v.ticker} [{v.cadence}] {v.secs_left(now_utc) / 3600:.2f}h left, "
@@ -794,8 +810,8 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                 room_sell = min(self.max_position + pos, share_sell)
                 quotes = mm.build_quotes(ticker, fair, best_bid, best_ask,
                                          room_buy, room_sell,
-                                         self.num_levels, cpl,
-                                         self.quote_offset_cents, self.level_spacing_cents)
+                                         n_levels, cpl,
+                                         offset, self.level_spacing_cents)
                 desired.extend(quotes)
                 bought = sum(q.count for q in quotes if q.book_side == "bid")
                 sold = sum(q.count for q in quotes if q.book_side == "ask")
@@ -925,10 +941,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     bot = UpDownMarketMaker(cfg, client, live=args.live, cadences=cadences)
+    overridden = (set(CONTRACTS_PER_LEVEL_BY_CADENCE) | set(NUM_LEVELS_BY_CADENCE)
+                  | set(QUOTE_OFFSET_BY_CADENCE))
     per_tenor = "".join(
-        f" ({c} {NUM_LEVELS}x{n})"
-        for c, n in sorted(CONTRACTS_PER_LEVEL_BY_CADENCE.items())
-        if c in cadences and n != CONTRACTS_PER_LEVEL)
+        f" ({c} {NUM_LEVELS_BY_CADENCE.get(c, NUM_LEVELS)}x"
+        f"{CONTRACTS_PER_LEVEL_BY_CADENCE.get(c, CONTRACTS_PER_LEVEL)}"
+        f" @{QUOTE_OFFSET_BY_CADENCE.get(c, QUOTE_OFFSET_CENTS)}c)"
+        for c in sorted(overridden) if c in cadences)
     log(f"=== {MODEL_VERSION} asset={cfg.asset} series={cfg.series} "
         f"cadence={','.join(cadences)} prefix={CLIENT_ORDER_PREFIX}- "
         f"ladder {NUM_LEVELS}x{CONTRACTS_PER_LEVEL}{per_tenor} @{QUOTE_OFFSET_CENTS}c off fair "

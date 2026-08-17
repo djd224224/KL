@@ -575,21 +575,51 @@ class TestRunCycle(unittest.TestCase):
         self.assertTrue(totals)
         self.assertLessEqual(max(totals.values()), 6)
 
-    def test_daily_tenor_quotes_one_contract_rungs(self):
-        """Jack 2026-08-14: daily goes live at 1/1/1 (three 1-contract rungs)
-        while weekly keeps the doubled 2s. Changing either is a size change on
-        a live bot and should have to break a test first."""
+    def test_daily_tenor_ladder_is_the_live_shape(self):
+        """Jack 2026-08-16 ("daily crypto bot is losing" — first two settles
+        -110.93, -105 of it BTC near-money strikes picked off at 3c): daily
+        quotes a 1/1 ladder (TWO 1-contract rungs) 4c off fair, while weekly
+        keeps 3x2 @3c. Changing any of these is a size change on a live bot
+        and should have to break a test first."""
         self.assertEqual(ud.CONTRACTS_PER_LEVEL_BY_CADENCE, {"daily": 1})
+        self.assertEqual(ud.NUM_LEVELS_BY_CADENCE, {"daily": 2})
+        self.assertEqual(ud.QUOTE_OFFSET_BY_CADENCE, {"daily": 4})
         c = FakeClient(markets=daily_event() + weekly_event())
         b = bot(c, cadences=("daily", "weekly"))
         with priced():
             b.run_cycle()
-        by_cadence = {}
+        sizes, side_counts = {}, {}
         for o in b.state.sim_orders.values():
             cad = "daily" if o["ticker"].startswith(EV_D) else "weekly"
-            by_cadence.setdefault(cad, set()).add(o["remaining_count"])
-        self.assertEqual(by_cadence["daily"], {1})
-        self.assertEqual(by_cadence["weekly"], {2})
+            sizes.setdefault(cad, set()).add(o["remaining_count"])
+            key = (cad, o["ticker"], o["book_side"])
+            side_counts[key] = side_counts.get(key, 0) + 1
+        self.assertEqual(sizes["daily"], {1})
+        self.assertEqual(sizes["weekly"], {2})
+        daily_levels = {n for (cad, _t, _s), n in side_counts.items() if cad == "daily"}
+        weekly_levels = {n for (cad, _t, _s), n in side_counts.items() if cad == "weekly"}
+        self.assertLessEqual(max(daily_levels), 2)     # 1/1: two rungs per side
+        self.assertEqual(max(weekly_levels), 3)        # weekly unchanged
+
+    def test_daily_offset_is_four_cents_minimum_edge(self):
+        """Same args run_cycle passes for a daily event: 2 rungs x 1 @4c.
+        The offset is the MINIMUM edge vs fair — join-don't-lead still caps
+        the anchor at the external best, so it binds only when fair sits
+        within 4c of the touch (exactly the near-money pick-off zone that
+        lost the money)."""
+        # fair 43 on a 40/60 book: bid anchor min(43-4, 40) = 39 — the 4c
+        # edge holds us 1c BEHIND a touch the old 3c offset would have joined.
+        q = mm.build_quotes("T", 43, 40, 60, 99, 99, 2, 1, 4, 2)
+        self.assertEqual(sorted(x.price_cents for x in q if x.book_side == "bid"),
+                         [37, 39])
+        self.assertEqual(sorted(x.price_cents for x in q if x.book_side == "ask"),
+                         [60, 62])
+        # mirror image on the ask side: fair 57 -> ask anchor max(61, 60) = 61
+        q = mm.build_quotes("T", 57, 40, 60, 99, 99, 2, 1, 4, 2)
+        self.assertEqual(sorted(x.price_cents for x in q if x.book_side == "ask"),
+                         [61, 63])
+        self.assertEqual(sorted(x.price_cents for x in q if x.book_side == "bid"),
+                         [38, 40])
 
     def test_deselected_event_orders_are_cleared_not_left_to_ttl(self):
         """An event that leaves selection (stand-down/collision/delisting)
