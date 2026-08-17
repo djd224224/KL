@@ -312,11 +312,18 @@ separate module, a separate `terminal_prob()` (Black-Scholes N(d2), r=0, MC-vali
   `run_crypto_updown_mm_hidden.vbs`. Tasks `KL crypto_updown_mm {ASSET}` ×7 registered
   2026-08-08 (weekly cadence), watchdog-covered since 8/8, battery-safe since 8/9.
 - **Daily tenor live 2026-08-14** (Jack "turn daily on live at 1/1/1 ladder"):
-  cadence `daily,weekly`, with **per-tenor rung size** — daily quotes 1/1/1 (three
-  1-contract rungs, `CONTRACTS_PER_LEVEL_BY_CADENCE = {"daily": 1}`, env
-  `CUD_CONTRACTS_PER_LEVEL_DAILY`) while weekly keeps its doubled 2/2/2. The
+  cadence `daily,weekly`, with **per-tenor ladder overrides** (size + levels +
+  offset tables, env `CUD_*_DAILY`) while weekly keeps its doubled 2/2/2 @3c. The
   side/level backstops in `place_with_side_cap` stay derived from the largest shape
-  (6/side); the per-event ladder build enforces the tenor's size.
+  (6/side); the per-event ladder build enforces the tenor's shape.
+- **Daily resized 2026-08-16** (Jack "daily crypto bot is losing"): first two
+  settles −110.93, **−105 of it KXBTCD near-money strikes** picked off from both
+  sides at the print (other six assets ±$2). Daily is now a **1/1 ladder (two
+  1-contract rungs) 4c off fair** — the offset is the MINIMUM edge; join-don't-lead
+  still caps at the touch, so the extra cent holds us 1c behind touches the 3c
+  ladder used to join in the pick-off zone. Rolled out by killing the 7 pythons
+  only (launchers respawn with new code; tasks never leave Running — the clean
+  path for code-only changes). Banner shows `ladder 3x2 (daily 2x1 @4c)`.
 - **Tenor-collision guard** (Jack 2026-08-14 "do not let it collide with weekly"):
   `select_events` drops any event whose end is within `TENOR_COLLISION_SECS` (300s)
   of a LONGER-tenor selected event's end — same settlement print, same bet, quoted
