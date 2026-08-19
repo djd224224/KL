@@ -350,6 +350,11 @@ separate module, a separate `terminal_prob()` (Black-Scholes N(d2), r=0, MC-vali
      (`QUOTE_OFFSET_BY_ASSET_CADENCE`, env `CUD_QUOTE_OFFSET_DAILY_BTC`); the six
      benign assets stay at 4c.
   Startup logs a `=== defenses: ... ===` line after the banner.
+- **BTC daily to a SINGLE rung 2026-08-18** (Jack "do 1 only on BTC, keep 1/1 on
+  others"): `NUM_LEVELS_BY_ASSET_CADENCE {("BTC","daily"): 1}` (env
+  `CUD_NUM_LEVELS_DAILY_BTC`); daily default stays 2 rungs × 1. So BTC daily =
+  one 1-lot quote per side at 6c min-edge with ±3c skew and the momentum guard;
+  the other six = two 1-lot rungs at 4c with ±1c skew.
 - **Tenor-collision guard** (Jack 2026-08-14 "do not let it collide with weekly"):
   `select_events` drops any event whose end is within `TENOR_COLLISION_SECS` (300s)
   of a LONGER-tenor selected event's end — same settlement print, same bet, quoted
