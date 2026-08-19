@@ -587,13 +587,14 @@ class TestRunCycle(unittest.TestCase):
         self.assertLessEqual(max(totals.values()), 6)
 
     def test_daily_tenor_ladder_is_the_live_shape(self):
-        """Jack 2026-08-16 ("daily crypto bot is losing" — first two settles
-        -110.93, -105 of it BTC near-money strikes picked off at 3c): daily
-        quotes a 1/1 ladder (TWO 1-contract rungs) 4c off fair, while weekly
-        keeps 3x2 @3c. Changing any of these is a size change on a live bot
-        and should have to break a test first."""
+        """BTC daily quotes a SINGLE 1-contract rung per side; the six benign
+        assets keep 1/1 (two rungs) — Jack 2026-08-18 "do 1 only on BTC,
+        keep 1/1 on others". Weekly keeps 3x2 @3c everywhere. Changing any
+        of these is a size change on a live bot and should have to break a
+        test first."""
         self.assertEqual(ud.CONTRACTS_PER_LEVEL_BY_CADENCE, {"daily": 1})
         self.assertEqual(ud.NUM_LEVELS_BY_CADENCE, {"daily": 2})
+        self.assertEqual(ud.NUM_LEVELS_BY_ASSET_CADENCE, {("BTC", "daily"): 1})
         self.assertEqual(ud.QUOTE_OFFSET_BY_CADENCE, {"daily": 4})
         c = FakeClient(markets=daily_event() + weekly_event())
         b = bot(c, cadences=("daily", "weekly"))
@@ -609,8 +610,20 @@ class TestRunCycle(unittest.TestCase):
         self.assertEqual(sizes["weekly"], {2})
         daily_levels = {n for (cad, _t, _s), n in side_counts.items() if cad == "daily"}
         weekly_levels = {n for (cad, _t, _s), n in side_counts.items() if cad == "weekly"}
-        self.assertLessEqual(max(daily_levels), 2)     # 1/1: two rungs per side
+        self.assertEqual(max(daily_levels), 1)         # BTC: single rung per side
         self.assertEqual(max(weekly_levels), 3)        # weekly unchanged
+        # the six benign assets keep two daily rungs
+        eth = ud.UpDownMarketMaker(ud.ASSETS["ETH"],
+                                   FakeClient(markets=daily_event() + weekly_event()),
+                                   live=False, cadences=("daily", "weekly"))
+        with priced():
+            eth.run_cycle()
+        eth_counts = {}
+        for o in eth.state.sim_orders.values():
+            if o["ticker"].startswith(EV_D):
+                key = (o["ticker"], o["book_side"])
+                eth_counts[key] = eth_counts.get(key, 0) + 1
+        self.assertEqual(max(eth_counts.values()), 2)
 
     def test_daily_offset_is_four_cents_minimum_edge(self):
         """Same args run_cycle passes for a daily event: 2 rungs x 1 @4c.

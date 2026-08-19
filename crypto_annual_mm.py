@@ -256,6 +256,7 @@ class AnnualMarketMaker(ud.UpDownMarketMaker):
     # best and a surprise at worst.
     contracts_per_level_by_cadence = {}
     num_levels_by_cadence = {}
+    num_levels_by_asset_cadence = {}
     quote_offset_by_cadence = {}
     quote_offset_by_asset_cadence = {}
     skew_by_cadence = {}

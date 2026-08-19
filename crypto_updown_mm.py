@@ -171,6 +171,13 @@ CONTRACTS_PER_LEVEL_BY_CADENCE = {
 NUM_LEVELS_BY_CADENCE = {
     "daily": _env_i("CUD_NUM_LEVELS_DAILY", 2),
 }
+# Jack 2026-08-18 ("do 1 only on BTC, keep 1/1 on others"): BTC — where all
+# of the daily loss lived — quotes a SINGLE 1-contract rung per side; the six
+# benign assets keep two rungs. Looked up before the per-tenor table, like
+# the offset override.
+NUM_LEVELS_BY_ASSET_CADENCE = {
+    ("BTC", "daily"): _env_i("CUD_NUM_LEVELS_DAILY_BTC", 1),
+}
 QUOTE_OFFSET_BY_CADENCE = {
     "daily": _env_i("CUD_QUOTE_OFFSET_DAILY", 4),
 }
@@ -550,6 +557,7 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
     idle_poll_secs = IDLE_POLL_SECS
     contracts_per_level_by_cadence = CONTRACTS_PER_LEVEL_BY_CADENCE
     num_levels_by_cadence = NUM_LEVELS_BY_CADENCE
+    num_levels_by_asset_cadence = NUM_LEVELS_BY_ASSET_CADENCE
     quote_offset_by_cadence = QUOTE_OFFSET_BY_CADENCE
     quote_offset_by_asset_cadence = QUOTE_OFFSET_BY_ASSET_CADENCE
     skew_by_cadence = SKEW_BY_CADENCE
@@ -904,7 +912,11 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
             event_room_sell = min(self.max_event + event_net, event_share_sell)
             cpl = self.contracts_per_level_by_cadence.get(
                 v.cadence, self.contracts_per_level)
-            n_levels = self.num_levels_by_cadence.get(v.cadence, self.num_levels)
+            n_levels = self.num_levels_by_asset_cadence.get(
+                (self.cfg.asset, v.cadence))
+            if n_levels is None:
+                n_levels = self.num_levels_by_cadence.get(
+                    v.cadence, self.num_levels)
             offset = self.quote_offset_by_asset_cadence.get(
                 (self.cfg.asset, v.cadence))
             if offset is None:
@@ -1127,9 +1139,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if any(c in cadences for c in MOMO_CADENCES):
         defenses.append(f"momo z={MOMO_Z:g} hold {MOMO_HOLD_SECS:g}s "
                         f"on {'/'.join(MOMO_CADENCES)}")
-    for (a, c), off in sorted(QUOTE_OFFSET_BY_ASSET_CADENCE.items()):
-        if a == cfg.asset and c in cadences:
-            defenses.append(f"{a} {c} offset {off}c")
+    for (a, c) in sorted(set(QUOTE_OFFSET_BY_ASSET_CADENCE)
+                         | set(NUM_LEVELS_BY_ASSET_CADENCE)):
+        if a != cfg.asset or c not in cadences:
+            continue
+        parts = []
+        off = QUOTE_OFFSET_BY_ASSET_CADENCE.get((a, c))
+        if off is not None:
+            parts.append(f"offset {off}c")
+        n = NUM_LEVELS_BY_ASSET_CADENCE.get((a, c))
+        if n is not None:
+            parts.append(f"{n} rung{'s' if n != 1 else ''}")
+        defenses.append(f"{a} {c} {', '.join(parts)}")
     if defenses:
         log(f"=== defenses: {'; '.join(defenses)} ===")
     bot.run(once=args.once)
