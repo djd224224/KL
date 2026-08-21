@@ -179,6 +179,16 @@ for _cfg in MARKETS.values():
     if _cfg.direction == "max":
         ANNUAL_SERIES.update(_annual_series_for(_cfg.asset))       # MAXY/MINY/Y
 
+# series -> row label, matching what each section calls its rows: monthlies
+# are "BTC-MIN"/"BTC-MAX", updown and annual are just the asset.
+SERIES_LABEL = {}
+for _cfg in MARKETS.values():
+    SERIES_LABEL[_cfg.series] = _cfg.key
+    SERIES_LABEL[f"KX{_cfg.asset}D"] = _cfg.asset
+    if _cfg.direction == "max":
+        for _s in _annual_series_for(_cfg.asset):
+            SERIES_LABEL[_s] = _cfg.asset
+
 
 def _crypto_family(ticker: str):
     """'daily'/'weekly'/'monthly'/'annual'/'hourly' for a crypto-fleet market
@@ -230,8 +240,60 @@ def _settlement_pnl(s: dict) -> float:
     return payout - _f(s.get("yes_total_cost_dollars")) - _f(s.get("no_total_cost_dollars"))
 
 
-def cumulative_family_realized(client) -> dict:
-    """family -> all-time realized $ for the crypto fleets' tenor families.
+def _settle_dt(s: dict) -> datetime:
+    try:
+        return datetime.fromisoformat(
+            (s.get("settled_time") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _event_fully_settled(client, event_ticker: str) -> bool:
+    """True iff every market in the event has a result — the whole event is
+    done, not just early-touched strikes (verified 2026-08-21: a settled
+    monthly shows all markets finalized+result, a live one a mix of active
+    and finalized). A failed probe counts as NOT settled: the row appears a
+    day late rather than a live event slipping in."""
+    try:
+        e = client.get_event(event_ticker)
+        mkts = e.get("markets") or (e.get("event") or {}).get("markets") or []
+        return bool(mkts) and all(m.get("result") for m in mkts)
+    except Exception as ex:
+        log(f"! settled-probe for {event_ticker} failed: {ex}")
+        return False
+
+
+def recent_settlement_rows(client, recs: list, n: int = 20) -> list:
+    """Newest-first [(label, family, settle_date_ct, pnl$)], one row per
+    fully settled EVENT (Jack 2026-08-21: early-settled strikes inside a
+    still-live monthly/annual one-touch event must NOT make rows). KX*D
+    events settle all strikes at one close, so any record there means the
+    event is done; monthly/annual events are probed via _event_fully_settled.
+    A row carries the WHOLE event's P&L (early touches included) dated by
+    its final settle — summed over the records still inside the settlements
+    API retention window (~66d), so a far-back early touch (annual events
+    especially) can age out of the sum. recs items are
+    (dt, family, label, event, pnl)."""
+    groups = {}
+    for dt, fam, label, event, pnl in recs:
+        g = groups.setdefault(event, [label, fam, dt, 0.0])
+        g[3] += pnl
+        if dt > g[2]:
+            g[2] = dt
+    rows = []
+    for event, (label, fam, dt, pnl) in sorted(
+            groups.items(), key=lambda kv: kv[1][2], reverse=True):
+        if fam in ("monthly", "annual") and not _event_fully_settled(client, event):
+            continue
+        rows.append((label, fam, dt.astimezone(CT).date(), pnl))
+        if len(rows) >= n:
+            break
+    return rows
+
+
+def cumulative_family_realized(client) -> tuple:
+    """(family -> all-time realized $, newest-first settlement record tuples
+    for recent_settlement_rows) for the crypto fleets' tenor families.
 
     Settled history comes from the settlements API — the positions endpoint
     AGES OUT settled records (verified 2026-08-14: zero July monthlies remain
@@ -244,6 +306,7 @@ def cumulative_family_realized(client) -> dict:
     miss is small — but this is a measured number with that stated edge,
     not a model."""
     fams = {}
+    recs = []
     cursor = None
     for _page in range(500):
         kw = {"limit": 200}
@@ -252,9 +315,15 @@ def cumulative_family_realized(client) -> dict:
         resp = client.get_portfolio_settlements(**kw)
         batch = resp.get("settlements") or []
         for s in batch:
-            fam = _crypto_family(s.get("ticker") or "")
+            ticker = s.get("ticker") or ""
+            fam = _crypto_family(ticker)
             if fam:
-                fams[fam] = fams.get(fam, 0.0) + _settlement_pnl(s)
+                pnl = _settlement_pnl(s)
+                fams[fam] = fams.get(fam, 0.0) + pnl
+                label = SERIES_LABEL.get(ticker.split("-", 1)[0],
+                                         ticker.split("-", 1)[0])
+                recs.append((_settle_dt(s), fam, label,
+                             ticker.rsplit("-", 1)[0], pnl))
         cursor = resp.get("cursor")
         if not cursor or not batch:
             break
@@ -272,7 +341,7 @@ def cumulative_family_realized(client) -> dict:
         cursor = resp.get("cursor")
         if not cursor or not batch:
             break
-    return fams
+    return fams, recs
 
 
 CUM_FOOTNOTE = ("realized = settled history + open-market round-trips, "
@@ -325,6 +394,37 @@ def cumulative_html(cum, unreal_by) -> list:
              f'<td style="{TD}">{_pnl_span(tot_r + tot_u)}</td></tr>')
     h.append('</table>')
     h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">{CUM_FOOTNOTE}</div>')
+    return h
+
+
+RECENT_FOOTNOTE = ("one row = one fully settled event, whole-event P&L; "
+                   "still-live monthlies/annuals appear once they finish")
+
+
+def recent_settlements_text(recent) -> list:
+    lines = ["== RECENT SETTLEMENTS (last 20 events) ==",
+             f"{'MARKET':9s} {'TENOR':8s} {'SETTLED':10s} {'P&L$':>9s}"]
+    for label, fam, day, pnl in recent:
+        lines.append(f"{label:9s} {fam:8s} {day} {pnl:>+9.2f}")
+    lines.append(f"({RECENT_FOOTNOTE})")
+    return lines
+
+
+def recent_settlements_html(recent) -> list:
+    h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
+         'Recent settlements (last 20 events)</div>',
+         '<table style="border-collapse:collapse">',
+         f'<tr style="background:#f0f0f0;font-weight:600">'
+         f'<td style="{TDL}">MARKET</td><td style="{TDL}">TENOR</td>'
+         f'<td style="{TDL}">SETTLED</td><td style="{TD}">P&amp;L$</td></tr>']
+    for i, (label, fam, day, pnl) in enumerate(recent):
+        bg = "#fafafa" if i % 2 else "#fff"
+        h.append(f'<tr style="background:{bg}"><td style="{TDL}">{label}</td>'
+                 f'<td style="{TDL}">{fam}</td><td style="{TDL}">{day}</td>'
+                 f'<td style="{TD};font-weight:600">{_pnl_span(pnl)}</td></tr>')
+    h.append('</table>')
+    h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">'
+             f'{RECENT_FOOTNOTE.replace("&", "&amp;")}</div>')
     return h
 
 
@@ -481,7 +581,8 @@ def html_section(title, rows, tot, quiet, failed, health):
 def build_digest(now_utc: datetime):
     """Returns (plain_text, html): monthly one-touch section + weekly
     above/below section in the identical format (Jack 2026-08-12), plus the
-    annual section (2026-08-13)."""
+    annual section (2026-08-13) and, under the cumulative table, the last-20
+    settlements table (2026-08-21)."""
     today_ct = now_utc.astimezone(CT).date()
     client = build_client()
 
@@ -502,10 +603,11 @@ def build_digest(now_utc: datetime):
     # Bottom table: all-time realized per tenor + the sections' current
     # unrealized. A failed sweep degrades to a note — never kills the digest.
     try:
-        cum = cumulative_family_realized(client)
+        cum, settle_recs = cumulative_family_realized(client)
+        recent = recent_settlement_rows(client, settle_recs)
     except Exception as e:
         log(f"! cumulative-by-tenor sweep failed: {e}")
-        cum = None
+        cum, recent = None, []
     unreal_by = {"daily": d_tot["unrealized"], "weekly": w_tot["unrealized"],
                  "monthly": m_tot["unrealized"], "annual": a_tot["unrealized"]}
 
@@ -542,6 +644,9 @@ def build_digest(now_utc: datetime):
     else:
         lines.append("(cumulative-by-tenor table unavailable this morning: "
                      "settlements sweep failed)")
+    if recent:
+        lines.append("")
+        lines += recent_settlements_text(recent)
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
@@ -570,6 +675,8 @@ def build_digest(now_utc: datetime):
     else:
         h.append('<div style="color:#c0392b;margin-top:8px">cumulative-by-tenor '
                  'table unavailable this morning: settlements sweep failed</div>')
+    if recent:
+        h += recent_settlements_html(recent)
     h.append('</div>')
     return text, "".join(h)
 
