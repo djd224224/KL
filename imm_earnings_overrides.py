@@ -12,8 +12,10 @@ WHAT: for every ACTIVE KXEARNINGSMENTION event with no override yet,
 best-effort scrape the market's own settlement-source / IR pages for a
 "conference call ... <time> ET on <date>" pattern; write resolved times to
 run-logs/incentive-mm/event_start_overrides.json (which incentive_mm
-hot-reloads each cycle — no restart); email a summary with paste-ready
-`--set` commands for anything unresolved.
+hot-reloads each cycle — no restart). Emails on its own ONLY when something
+needs Jack (paste-ready `--set` commands); every run also appends a summary
+to overrides_last_runs.json, which the 7:20 combined "IMM quotes and
+overrides" email (imm_quote_gaps.py) folds in each morning.
 
 USAGE:
   python imm_earnings_overrides.py            # daily run (scheduled 6:45am)
@@ -56,6 +58,10 @@ from incentive_mm import (Alerter, ET, EVENT_OVERRIDES_FILE,  # noqa: E402
                           _EARNINGS_PREFIX, build_client,
                           load_extra_allow_series, load_file_event_overrides,
                           log, parse_event_date, parse_iso_utc)
+
+# Per-run summary consumed by the 7:20 combined email (imm_quote_gaps.py).
+SUMMARY_FILE = os.path.join(os.path.dirname(EVENT_OVERRIDES_FILE),
+                            "overrides_last_runs.json")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -1017,174 +1023,189 @@ def main(argv=None) -> int:
         record_meta(provenance_batch(resolved, rel_resolved, stale_fixed,
                                      bc_resolved), file_data)
 
-    # email a summary whenever there is anything actionable
-    if not args.dry and (resolved or unresolved or enrolled or review
-                         or rel_resolved or rel_unresolved
-                         or bc_resolved or bc_unresolved
-                         or stale_fixed or stale_open):
-        lines = ["Earnings call + release override run", ""]
-        if stale_open:
-            lost = sum(d for _e, _n, d, _c in stale_open)
-            lines.append(f"!! STALE-TICKER TRAP — {len(stale_open)} event(s) "
-                         f"earning $0 on ${lost:,.0f}/day of live pool. Kalshi's "
-                         f"ticker date has passed but the market is still open, "
-                         f"so the bot's cutoff sits in the PAST and it will "
-                         f"NEVER quote these without an override:")
-            for ev, n, dpd, close in stale_open:
-                lines.append(f"  {ev}  —  {n} markets, ${dpd:,.0f}/day pool, "
-                             f"open until {close:%Y-%m-%d}")
-                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
-                             f'"YYYY-MM-DDTHH:MM:00-04:00"   # the REAL call time')
-            lines.append("")
-        if stale_fixed:
-            lines.append("STALE-TICKER TRAP auto-fixed (written, bot "
-                         "hot-reloads):")
-            for ev, iso, n, dpd, src in stale_fixed:
-                lines.append(f"  {ev} = {iso}  ({n} mkts, ${dpd:,.0f}/day) [{src}]")
-            lines.append("")
-        if upgraded:
-            lines.append("PROVISIONAL GUESS UPGRADED — Nasdaq has since "
-                         "supplied a real time flag and the fail-safe 7am ET "
-                         "guess has been replaced by the measurement (written, "
-                         "bot hot-reloads):")
-            for ev, was, iso, label in upgraded:
-                lines.append(f"  {ev}:  {was}  ->  {iso}   [{label}]")
-            lines.append("")
-        if provisional_open:
-            # Reported, never ESCALATED: this state is safe by construction
-            # (the bot stands down at 06:50 ET), so it must not be able to
-            # trigger an email on its own — see the send condition below. It
-            # only shows up when a run had something else to say.
-            lines.append("UNVERIFIED CALL TIMES on the fail-safe 7am ET "
-                         "guess — Nasdaq lists the date but no time. The bot "
-                         "stands down in the morning and forfeits that day's "
-                         "accrual; that is the SAFE direction and needs no "
-                         "action (CELH 2026-08-06 is why). Confirm on the IR "
-                         "page only if you want the accrual back — these are "
-                         "re-checked against Nasdaq on every run and upgrade "
-                         "themselves the moment it publishes a time:")
-            for ev, iso in provisional_open:
-                lines.append(f"  {ev} = {iso}   (guessed, not measured)")
-                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
-                             f'"YYYY-MM-DDTHH:MM:00-04:00"   # the REAL call time')
-            lines.append("")
-        if bc_resolved:
-            lines.append("BROADCAST mention cutoffs AUTO-RESOLVED (TVmaze / "
-                         "WH schedule; written, bot hot-reloads):")
-            for ev, iso, net, title in bc_resolved:
-                lines.append(f"  {ev} = {iso}   [{net}]")
-                lines.append(f"    \"{title}\"")
-            lines.append("")
-        if bc_unresolved:
-            lines.append("BROADCAST mention events UNRESOLVED — the bot will "
-                         "NOT quote these until --set (find the air time):")
-            for ev, title in bc_unresolved:
+    # Split the run's findings into ACTION (needs Jack; the only thing that
+    # can trigger this task's own email) and INFO (auto-handled; carried to
+    # the 7:20 combined "IMM quotes and overrides" email via the run-summary
+    # file, never emailed alone).
+    act = []
+    inf = []
+    if stale_open:
+        lost = sum(d for _e, _n, d, _c in stale_open)
+        act.append(f"!! STALE-TICKER TRAP — {len(stale_open)} event(s) "
+                   f"earning $0 on ${lost:,.0f}/day of live pool. Kalshi's "
+                   f"ticker date has passed but the market is still open, "
+                   f"so the bot's cutoff sits in the PAST and it will "
+                   f"NEVER quote these without an override:")
+        for ev, n, dpd, close in stale_open:
+            act.append(f"  {ev}  —  {n} markets, ${dpd:,.0f}/day pool, "
+                       f"open until {close:%Y-%m-%d}")
+            act.append(f'  python imm_earnings_overrides.py --set {ev} '
+                       f'"YYYY-MM-DDTHH:MM:00-04:00"   # the REAL call time')
+        act.append("")
+    if bc_unresolved:
+        act.append("BROADCAST mention events UNRESOLVED — the bot will "
+                   "NOT quote these until --set (find the air time):")
+        for ev, title in bc_unresolved:
+            d = parse_event_date(ev)
+            hint = (d.astimezone(ET).strftime("%Y-%m-%d")
+                    if d else now.astimezone(ET).strftime("%Y-%m-%d"))
+            act.append(f"    # \"{title[:110]}\"")
+            act.append(f'  python imm_earnings_overrides.py --set {ev} '
+                       f'"{hint}T20:00:00-04:00"   # VERIFY air time')
+        act.append("")
+    if stale_fixed:
+        for ev, iso, n, dpd, src in stale_fixed:
+            inf.append(f"stale-ticker auto-fixed: {ev} = {iso}  "
+                       f"({n} mkts, ${dpd:,.0f}/day) [{src}]")
+    if upgraded:
+        for ev, was, iso, label in upgraded:
+            inf.append(f"7am guess -> measured: {ev} = {iso}  [{label}]")
+    if provisional_open:
+        # Safe by construction (the bot stands down at 06:50 ET) and
+        # auto-upgrades when Nasdaq publishes a time — info only, now
+        # structurally unable to trigger an email.
+        for ev, iso in provisional_open:
+            inf.append(f"on 7am fail-safe guess (safe, auto-upgrades): {ev}")
+    if bc_resolved:
+        for ev, iso, net, title in bc_resolved:
+            inf.append(f"broadcast resolved: {ev} = {iso}  [{net}]")
+    if rel_resolved:
+        for ev, iso, label, url, evidence in rel_resolved:
+            inf.append(f"release resolved: {ev} = {iso}  [{label}]")
+    if rel_unresolved:
+        act.append("RELEASE cutoffs UNRESOLVED — verify the earnings press-"
+                   "release datetime and run (after-close ~4pm ET, BMO "
+                   "~before open). The template below is the SAFE default, "
+                   "not a guess at the answer:")
+        for ev, occ in rel_unresolved:
+            hint = (parse_iso_utc(occ or "") or now).strftime("%Y-%m-%d")
+            # 07:00, not 16:00. Jack 2026-08-06: a paste-ready template IS a
+            # default — pasted unedited it becomes the override. A 4pm
+            # template hands the operator the exact value that had the bot
+            # quoting through CELH's 8am call, and it is the one an
+            # interrupted human is most likely to run without checking.
+            # 7am only costs a day of accrual if it is wrong.
+            act.append(f'  python imm_earnings_overrides.py --set {ev} '
+                       f'"{hint}T07:00:00-04:00"   # kalshi occ={occ} '
+                       f'VERIFY; 7am = stand-down default, edit if AMC')
+        act.append("")
+    if enrolled:
+        for s, why, sample in enrolled:
+            inf.append(f"series enrolled: {s}  [{why}]  e.g. {sample}")
+    # `review` (unclassified/blocked series, 242 as of 8/15) is deliberately
+    # NOT in the email at all (Jack 8/15): it is chronic, and any such series
+    # with real money on it already shows in the quote-gaps table as a
+    # "not in allowlist" row with its ROI. Log-only (see enroll_new_series).
+    if resolved:
+        for ev, iso, url, evidence in resolved:
+            inf.append(f"call resolved: {ev} = {iso}")
+    if unresolved:
+        act.append("UNRESOLVED calls — verify the call date AND time, then "
+                   "--set. The Nasdaq line is the RELEASE (anchor only): "
+                   "the call is usually the same day shortly after, but "
+                   "split reporters (e.g. airlines) call the next morning "
+                   "— so confirm the date, don't assume it:")
+        for ev in unresolved:
+            series = ev.split("-")[0]
+            tkr = (series[len(_EARNINGS_PREFIX):]
+                   if series.startswith(_EARNINGS_PREFIX) else "")
+            rel = (nasdaq_release_datetime(tkr, now, DISCLOSURE_LEAD_DAYS + 3)
+                   if tkr else None)
+            if rel and provenance_of(rel[1]) == "read":
+                rel_et = rel[0].astimezone(ET)
+                # context anchor only — NOT the --set value
+                act.append(f"    # Nasdaq: {tkr} releases {rel_et:%a %b %d} "
+                           f"[{rel[1]}] — call same-day shortly after OR "
+                           f"next AM; VERIFY the date")
+                # The template is the RELEASE time itself, not release+1h.
+                # Jack 2026-08-06: the old version offered 5:00pm after a
+                # 4pm release and 8:30am after a 7am one — i.e. an hour of
+                # quoting after the print is already public, which is the
+                # CELH failure in miniature. Phase 2 above deliberately
+                # cuts off at the RELEASE ("safe: call is at/after the
+                # release"); the hint a human pastes has to agree with it.
+                hint_iso = rel_et.isoformat()
+            else:
+                # Nasdaq had nothing, or had only a guess. Unknown -> the
+                # stand-down default, never 4:30pm (which is what this line
+                # used to offer). Standing down early forfeits accrual;
+                # standing down late is how the bot ends up making markets
+                # into a print.
                 d = parse_event_date(ev)
-                hint = (d.astimezone(ET).strftime("%Y-%m-%d")
-                        if d else now.astimezone(ET).strftime("%Y-%m-%d"))
-                lines.append(f"    # \"{title[:110]}\"")
-                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
-                             f'"{hint}T20:00:00-04:00"   # VERIFY air time')
+                hint_iso = ((d.strftime("%Y-%m-%d") if d else "2026-MM-DD")
+                            + "T07:00:00-04:00")
+            act.append(f'  python imm_earnings_overrides.py --set {ev} '
+                       f'"{hint_iso}"')
+        act.append("(unresolved events fall back to the conservative "
+                   "midnight-ET rule and stop quoting the night before)")
+
+    # Feed-audit fold (Jack 2026-08-22 "isnt there a daily sweeper? fold into
+    # that"): NEW findings — unearnable series (the KXTEMPMIAH class), an
+    # enrolled family's programs leaving the feed (the Aug-4 class), a new
+    # paying family outside the allowlist (the KXAVGT class) — ride this
+    # task's ACTION email; the one-line current state rides the run summary
+    # into the 7:20 combined email. Deltas come from feed_audit_state.json,
+    # so a standing finding pings once, not 3x/day. Never let an audit hiccup
+    # sink the overrides run — the failure surfaces in the morning email.
+    try:
+        import imm_feed_audit
+        fa_act, fa_inf = imm_feed_audit.delta_for_email(
+            client=client, save_state=not args.dry)
+    except Exception as e:               # noqa: BLE001 — task must not die
+        fa_act, fa_inf = [], [f"feed-audit FAILED this run: {e}"]
+        log(f"! feed audit failed: {e}")
+    act += fa_act
+    inf += fa_inf
+
+    tallies = (f"calls {len(resolved)}+/{len(unresolved)}?, "
+               f"releases {len(rel_resolved)}+/{len(rel_unresolved)}?, "
+               f"broadcast {len(bc_resolved)}+/{len(bc_unresolved)}?"
+               + (f", {len(enrolled)} enrolled" if enrolled else "")
+               + (f", {len(stale_fixed)} stale fixed" if stale_fixed else "")
+               + (f", {len(stale_open)} STALE OPEN" if stale_open else "")
+               + (f", audit {len(fa_act)} new" if fa_act else ""))
+
+    # Run summary for the 7:20 combined email (kept for the last 8 runs, so
+    # info from the midday/afternoon runs still reaches the next morning).
+    if not args.dry:
+        runs = []
+        try:
+            if os.path.exists(SUMMARY_FILE):
+                with open(SUMMARY_FILE, encoding="utf-8") as f:
+                    runs = json.load(f)
+                if not isinstance(runs, list):
+                    runs = []
+        except Exception:
+            runs = []
+        runs.append({"ts": now.isoformat(), "tallies": tallies,
+                     "action_lines": act, "info": inf,
+                     "covered": len(covered)})
+        with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(runs[-8:], f, indent=1)
+
+    # This task emails on its own ONLY when something needs Jack; routine
+    # auto-handled runs surface in the morning combined email instead.
+    if not args.dry and act:
+        lines = ["Earnings call + release override run — ACTION NEEDED", ""]
+        lines += act
+        if inf:
+            lines.append("auto-handled this run:")
+            lines += [f"  {s}" for s in inf]
             lines.append("")
-        if rel_resolved:
-            lines.append("RELEASE cutoffs AUTO-RESOLVED (written; bot hot-reloads; "
-                         "orders expire 10min before these):")
-            for ev, iso, label, url, evidence in rel_resolved:
-                lines.append(f"  {ev} = {iso}   [{label}]")
-                lines.append(f"    source: {url}")
-                lines.append(f"    \"{evidence[:150]}\"")
-            lines.append("")
-        if rel_unresolved:
-            lines.append("RELEASE cutoffs UNRESOLVED — verify the earnings press-"
-                         "release datetime and run (after-close ~4pm ET, BMO "
-                         "~before open). The template below is the SAFE default, "
-                         "not a guess at the answer:")
-            for ev, occ in rel_unresolved:
-                hint = (parse_iso_utc(occ or "") or now).strftime("%Y-%m-%d")
-                # 07:00, not 16:00. Jack 2026-08-06: a paste-ready template IS a
-                # default — pasted unedited it becomes the override. A 4pm
-                # template hands the operator the exact value that had the bot
-                # quoting through CELH's 8am call, and it is the one an
-                # interrupted human is most likely to run without checking.
-                # 7am only costs a day of accrual if it is wrong.
-                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
-                             f'"{hint}T07:00:00-04:00"   # kalshi occ={occ} '
-                             f'VERIFY; 7am = stand-down default, edit if AMC')
-            lines.append("")
-        if enrolled:
-            lines.append("NEW SERIES AUTO-ENROLLED (bot hot-reloads; remove "
-                         "from extra_allow_series.json to veto):")
-            for s, why, sample in enrolled:
-                lines.append(f"  {s}  [{why}]  e.g. {sample}")
-            lines.append("")
-        if review:
-            lines.append("NEW SERIES NEEDING REVIEW (not enrolled):")
-            for s, why, sample in review:
-                lines.append(f"  {s}  [{why}]  e.g. {sample}")
-            lines.append("")
-        if resolved:
-            lines.append("RESOLVED (written to overrides file; bot hot-reloads):")
-            for ev, iso, url, evidence in resolved:
-                lines.append(f"  {ev} = {iso}")
-                lines.append(f"    source: {url}")
-                lines.append(f"    \"{evidence[:160]}\"")
-        if unresolved:
-            lines.append("")
-            lines.append("UNRESOLVED calls — verify the call date AND time, then "
-                         "--set. The Nasdaq line is the RELEASE (anchor only): "
-                         "the call is usually the same day shortly after, but "
-                         "split reporters (e.g. airlines) call the next morning "
-                         "— so confirm the date, don't assume it:")
-            for ev in unresolved:
-                series = ev.split("-")[0]
-                tkr = (series[len(_EARNINGS_PREFIX):]
-                       if series.startswith(_EARNINGS_PREFIX) else "")
-                rel = (nasdaq_release_datetime(tkr, now, DISCLOSURE_LEAD_DAYS + 3)
-                       if tkr else None)
-                if rel and provenance_of(rel[1]) == "read":
-                    rel_et = rel[0].astimezone(ET)
-                    # context anchor only — NOT the --set value
-                    lines.append(f"    # Nasdaq: {tkr} releases {rel_et:%a %b %d} "
-                                 f"[{rel[1]}] — call same-day shortly after OR "
-                                 f"next AM; VERIFY the date")
-                    # The template is the RELEASE time itself, not release+1h.
-                    # Jack 2026-08-06: the old version offered 5:00pm after a
-                    # 4pm release and 8:30am after a 7am one — i.e. an hour of
-                    # quoting after the print is already public, which is the
-                    # CELH failure in miniature. Phase 2 above deliberately
-                    # cuts off at the RELEASE ("safe: call is at/after the
-                    # release"); the hint a human pastes has to agree with it.
-                    hint_iso = rel_et.isoformat()
-                else:
-                    # Nasdaq had nothing, or had only a guess. Unknown -> the
-                    # stand-down default, never 4:30pm (which is what this line
-                    # used to offer). Standing down early forfeits accrual;
-                    # standing down late is how the bot ends up making markets
-                    # into a print.
-                    d = parse_event_date(ev)
-                    hint_iso = ((d.strftime("%Y-%m-%d") if d else "2026-MM-DD")
-                                + "T07:00:00-04:00")
-                lines.append(f'  python imm_earnings_overrides.py --set {ev} '
-                             f'"{hint_iso}"')
-            lines.append("(unresolved events fall back to the conservative "
-                         "midnight-ET rule and stop quoting the night before)")
         if covered:
-            lines.append("")
             lines.append(f"already covered: {', '.join(covered)}")
         alerter = Alerter("IMM-EARNINGS", live=True)
         if alerter.enabled:
-            ok = alerter.send_message(
-                "\n".join(lines),
-                subject=f"IMM overrides: calls {len(resolved)}+/{len(unresolved)}?, "
-                        f"releases {len(rel_resolved)}+/{len(rel_unresolved)}?")
-            log(f"summary email: {'sent' if ok else 'FAILED'}")
+            ok = alerter.send_message("\n".join(lines),
+                                      subject=f"IMM overrides ACTION: {tallies}")
+            log(f"action email: {'sent' if ok else 'FAILED'}")
         else:
-            log("alert credentials not configured; summary not emailed")
+            log("alert credentials not configured; action summary not emailed")
             print("\n".join(lines))
     else:
-        log(f"nothing to do: {len(covered)} covered, "
-            f"{len(provisional_open)} provisional (re-checked, still "
-            f"unmeasured), dry={args.dry}")
+        log(f"no action needed ({tallies}); {len(covered)} covered, "
+            f"{len(provisional_open)} provisional, dry={args.dry}; "
+            f"summary saved for the morning combined email")
 
     return 0
 

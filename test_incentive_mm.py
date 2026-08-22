@@ -3138,7 +3138,7 @@ class TestStickySelection(unittest.TestCase):
         # quoting past 6pm because restore built a raw midnight cutoff).
         c = imm.apply_series_cutoff_adjustments(
             "KXRAIN", "KXRAIN-26JUL30", imm.parse_event_date("KXRAIN-26JUL30"))
-        self.assertEqual(c, utc(2026, 7, 30, 1, 0))     # 9pm ET day before (Jack 8/1)
+        self.assertEqual(c, utc(2026, 7, 30, 2, 0))     # 10pm ET day before (Jack 8/15)
         # hard-expiry floor rides along (Love Island 8:30pm ET event day)
         c2 = imm.apply_series_cutoff_adjustments(
             "KXLOVEISLMENTION", "KXLOVEISLMENTION-26AUG02", None)
@@ -3167,14 +3167,15 @@ class TestStickySelection(unittest.TestCase):
                        and o.get("expire_at", 0) > time.time()]
         self.assertFalse([o for o in live_orders])
 
-    def test_rain_cutoff_9pm_day_before(self):
-        # Jack 2026-08-01: rain dailies run until 9pm ET the day BEFORE the
-        # rain day (ticker-date midnight minus 180 min; was 6pm since 7/29).
+    def test_rain_cutoff_10pm_day_before(self):
+        # Jack 2026-08-15: rain dailies run until 10pm ET the day BEFORE the
+        # rain day (ticker-date midnight minus 120 min; was 9pm since 8/1,
+        # 6pm since 7/29 — paired with the 7pm size halving).
         ov = imm.series_override("KXRAIN")
-        self.assertEqual(ov.cutoff_before_event_min, 180)
+        self.assertEqual(ov.cutoff_before_event_min, 120)
         td = imm.parse_event_date("KXRAIN-26JUL30")     # Jul 30 00:00 ET
-        early = td - timedelta(minutes=180)             # Jul 29 21:00 ET
-        self.assertEqual(early, utc(2026, 7, 30, 1, 0))
+        early = td - timedelta(minutes=120)             # Jul 29 22:00 ET
+        self.assertEqual(early, utc(2026, 7, 30, 2, 0))
         # non-rain series unaffected
         self.assertIsNone((imm.series_override("KXLOVEISLMENTION")
                            or imm.SeriesOverride()).cutoff_before_event_min)

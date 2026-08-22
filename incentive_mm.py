@@ -381,9 +381,22 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
 # minutes — flanking strikes projected $0.6-0.8 vs the $1 global floor and
 # never entered; DCH 9am hour: T78.99 $0.81 / T80.99 $0.64 floored while
 # T79.99/T81.99 quoted).
+# PROGRAM MOVED TO MIAMI (diagnosed 2026-08-20): Kalshi ended the 5-city
+# hourly-temp programs after the Aug 4 hour-19 period — the bot went silently
+# dark on its top reward family for 16 days (selection is program-driven, so
+# a family leaving the feed logs nothing; imm_feed_audit.py now has an
+# UNEARNABLE check + absent-family footer for exactly this). 2026-08-15 01Z
+# the program relaunched as KXTEMPMIAH ONLY ($80/mkt/hour, 10 strikes). This
+# list is what grants the close-anchored cutoff — a KXTEMP city absent here
+# is admitted by the allow-prefix but killed on sight by the midnight-ET
+# ticker rule (its "26AUG2009" parses as Aug 20), so Miami never quoted.
+# KXTEMPMIAH added 2026-08-22 (Jack). The legacy five stay enrolled:
+# program-less series are never selected, and they auto-resume if Kalshi
+# flips back.
 for _s in os.environ.get(
         "IMM_TEMP_SERIES",
-        "KXTEMPAUSH,KXTEMPCHIH,KXTEMPDCH,KXTEMPLAXH,KXTEMPNYCH").split(","):
+        "KXTEMPAUSH,KXTEMPCHIH,KXTEMPDCH,KXTEMPLAXH,KXTEMPMIAH,"
+        "KXTEMPNYCH").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             levels=_parse_levels(os.environ.get("IMM_TEMP_LEVELS", "0:5,1:2,2:2")),
@@ -406,6 +419,32 @@ for _s in os.environ.get(
             # on a thin side would forfeit the richest pools in the feed
             pad_to_target=True,
             fast_lane=os.environ.get("IMM_TEMP_FAST_LANE", "1") == "1")
+
+# Weekly average-temperature markets (Jack 2026-08-22: "add KXAVGTKDFW and
+# similar cities"). Kalshi lit incentive programs on 11 stations 2026-08-20:
+# $500/market/week on the Texas stations (KDFW/KIAH/KSAT/KAUS/KSAN — SAN is
+# San Diego, the lone non-Texan in the $500 tier), $200/market/week on
+# KLAS/KMSY/KDEN/KOKC/KPHX/ATL. Week-long observation (The Weather Company
+# daily temps averaged), close Sunday ~midnight ET. Ticker dates are the
+# week-END Monday (26AUG24), so the default midnight-ET rule quotes ALL WEEK
+# and stands down ~1h before close — the right shape for a continuously-
+# observed average (the final hours are the most informed) with no override
+# needed. EXCEPTION: KXAVGTATL carries a SUNDAY ticker date (26AUG23), so the
+# midnight rule costs it its whole final day — accepted (failing toward
+# quoting less; an event_day_cutoff_et would win it back if ever wanted).
+# Weather-family 5..90c band both sides (the KXTEMP/rain convention: no
+# 1c-scrap quoting on dead strikes + the band activates top-in-band
+# stand-aside); ladder/caps stay global. NOTE: new stations must be added
+# here as well as being admitted by the KXAVGT allow-prefix, like
+# IMM_TEMP_SERIES.
+for _s in os.environ.get(
+        "IMM_AVGT_SERIES",
+        "KXAVGTATL,KXAVGTKAUS,KXAVGTKDEN,KXAVGTKDFW,KXAVGTKIAH,KXAVGTKLAS,"
+        "KXAVGTKMSY,KXAVGTKOKC,KXAVGTKPHX,KXAVGTKSAN,KXAVGTKSAT").split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            price_min_cents=_env_int("IMM_AVGT_PRICE_MIN", 5),
+            price_max_cents=_env_int("IMM_AVGT_PRICE_MAX", 90))
 
 # Air-quality-index markets (user decision 2026-07-15). Series is KXAQICITY; the
 # CITY lives in the event segment (KXAQICITY-NYC26JUL19), so one override covers
@@ -455,11 +494,12 @@ for _s in os.environ.get(
             levels=_parse_levels(_RAIN_LEVELS_SPEC) if _RAIN_LEVELS_SPEC else None,
             price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
-            # Jack 2026-08-01: run until 9pm ET the day before the rain day
-            # (was 6pm since 7/29, midnight before that). Also gates the
-            # directional module's entry window (its orders respect
-            # cutoff_ts).
-            cutoff_before_event_min=_env_int("IMM_RAIN_CUTOFF_BEFORE_MIN", 180))
+            # Jack 2026-08-15: run until 10pm ET the day before the rain day
+            # (was 9pm since 8/1, 6pm since 7/29, midnight before that;
+            # paired with the 7pm size halving in IMM_SERIES_HOUR_MULT).
+            # Also gates the directional module's entry window (its orders
+            # respect cutoff_ts).
+            cutoff_before_event_min=_env_int("IMM_RAIN_CUTOFF_BEFORE_MIN", 120))
 
 
 def series_pad_to_target(series: str) -> bool:
@@ -602,16 +642,18 @@ def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
 # PER-SERIES hour windows, which beat the global window AND the global
 # exclude list — an explicit rule for a named family is never overridden by a
 # blanket one. Jack 2026-08-04: "on KXDIESELD and KXAAAGASD events, cut the
-# contract size in half starting at 4pm EST", extended to KXRAIN in the same
-# breath. Window runs 16:00 ET to 01:59 ET rather than stopping at midnight:
-# the gas/diesel DAILIES trade until 01:59 ET, so ending at midnight would
-# hand back full size for the last two hours of their life. Prefixes are
-# deliberately the DAILY tickers — KXAAAGASW/M weeklies and monthlies keep
-# full size. Times are America/New_York (so EDT in summer), the convention
-# every other window in this file uses.
+# contract size in half starting at 4pm EST"; rain was extended in the same
+# breath but moved to 7pm on 2026-08-15 (Jack: "halve size at 7pm ET", paired
+# with the rain cutoff moving 9pm -> 10pm). Windows run to 01:59 ET rather
+# than stopping at midnight: the gas/diesel DAILIES trade until 01:59 ET, so
+# ending at midnight would hand back full size for the last two hours of
+# their life (rain dailies never get that far — their cutoff ends quoting at
+# 10pm). Prefixes are deliberately the DAILY tickers — KXAAAGASW/M weeklies
+# and monthlies keep full size. Times are America/New_York (so EDT in
+# summer), the convention every other window in this file uses.
 SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
     "IMM_SERIES_HOUR_MULT",
-    "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5"))
+    "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:19-1:0.5"))
 
 
 def hour_size_mult(series: str, now_utc: datetime) -> float:
@@ -973,6 +1015,12 @@ ALLOW_SERIES_SUFFIXES = tuple(
 # Series-name PREFIXES — for mention/incentive families that append a variable
 # tail so the "MENTION" suffix match misses:
 #   KXTEMP<CITY>            weather temp (covers new cities automatically)
+#   KXAVGT<STATION>         weekly average-temp, ICAO station in the SERIES
+#     ticker (KXAVGTKDFW = Dallas; KXAVGTATL lacks the ICAO K). Jack
+#     2026-08-22: "add KXAVGTKDFW and similar cities" — Kalshi lit programs
+#     on 11 stations 2026-08-20. Prefix covers future stations automatically;
+#     bands come from the IMM_AVGT_SERIES overrides (which DO need new
+#     stations added, like IMM_TEMP_SERIES).
 #   KXEARNINGSMENTION<TKR>  per-company earnings-call mention markets, e.g.
 #     KXEARNINGSMENTIONUAL (United). Same low-adverse-selection structure as the
 #     other MENTIONs — nothing knowable before the call — and the midnight-ET
@@ -982,7 +1030,8 @@ ALLOW_SERIES_SUFFIXES = tuple(
 # The 7/21 SeriesOverride tuning (5/2/2, cap 50, 5-90c, close-15min) applies.
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
-        "IMM_ALLOW_PREFIXES", "KXTEMP,KXEARNINGSMENTION,KXAQICITY").split(",") if p)
+        "IMM_ALLOW_PREFIXES",
+        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
     # The yearly touch pairs (KX*MINY/KX*MAXY, allowlisted 2026-07-22 when no
     # fleet bot quoted them) moved to SERIES_BLOCKLIST_PREFIXES on 2026-08-13:
