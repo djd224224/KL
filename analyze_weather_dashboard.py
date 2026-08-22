@@ -910,8 +910,10 @@ def generate_html(data, out_path):
     dow_s=sorted(data['dow'],key=lambda d:-d['pnl'])
     best_d=dow_s[0] if dow_s else None; worst_d=dow_s[-1] if dow_s else None
 
+    # 15-min meta refresh so a browser tab left open on the file picks up the
+    # daily 7 AM rebuild (run_dashboards.ps1) without a manual F5.
     with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        f.write(f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="900">
 <title>Weather Trading Dashboard</title>
 <style>
 :root{{--bg:#0f172a;--bg2:#1e293b;--tx:#e2e8f0;--tx2:#94a3b8;--tx3:#64748b;--bd:#334155}}

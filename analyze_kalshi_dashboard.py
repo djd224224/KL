@@ -526,8 +526,10 @@ def generate_html(consolidated, family_data, families, fill_data, all_settlement
     # JS charts (consolidated pie still spans ALL families incl. Crypto)
     js=build_js(consolidated, family_data, families, fill_data, crypto=crypto, sec_families=sec_families)
 
+    # 15-min meta refresh so a browser tab left open on the file picks up the
+    # daily 7 AM rebuild (run_dashboards.ps1) without a manual F5.
     with open(out_path,'w',encoding='utf-8') as f:
-        f.write(f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+        f.write(f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="900">
 <title>Kalshi Trading Analysis</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
