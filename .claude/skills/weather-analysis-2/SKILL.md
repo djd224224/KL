@@ -66,8 +66,9 @@ Confirm the HTML opened.
 
 ## Automated daily rebuild
 
-The Windows scheduled task `KL dashboards-daily` (register once with
-`register_dashboard_task.ps1`; runner: `run_dashboards.ps1`) executes these
+The Windows scheduled task `KL dashboards-daily` (self-registers via the
+`sync_kl_main.ps1` bootstrap, or manually via `register_dashboard_task.ps1`;
+runner: `run_dashboards.ps1`) executes these
 same steps every day at 7:00 AM and overwrites `weather_dashboard_latest.html`
 (plus the Kalshi dashboard). The generated HTML carries a 15-minute meta
 refresh, so a browser tab left open on the file picks up each rebuild by
