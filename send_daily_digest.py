@@ -229,30 +229,52 @@ for _cfg in MARKETS.values():
             SERIES_LABEL[_s] = _cfg.asset
 
 
-def _crypto_family(ticker: str):
-    """'daily'/'weekly'/'monthly'/'annual'/'hourly' for a crypto-fleet market
-    ticker, else None. KX*D tenor is recovered from the EVENT segment: 5pm-ET
-    closes (hour field '17') are weekly on Fridays and daily otherwise; any
-    other hour is an hourly market (never quoted by the fleet — manual
-    trades land there). Unparseable segments classify as None, not guessed."""
-    series = (ticker or "").split("-", 1)[0]
-    if series in MONTHLY_SERIES:
-        return "monthly"
-    if series in ANNUAL_SERIES:
-        return "annual"
-    if series not in UPDOWN_SERIES:
+# series -> (asset, family) for the by-token table (Jack 2026-08-22);
+# families: high/low (the monthly one-touch "how high"/"how low" split),
+# annual (MAXY+MINY+Y together), updown (KX*D — tenor resolved per ticker
+# into daily/weekly/hourly).
+SERIES_TOKEN_FAMILY = {}
+for _cfg in MARKETS.values():
+    SERIES_TOKEN_FAMILY[_cfg.series] = (
+        _cfg.asset, "high" if _cfg.direction == "max" else "low")
+    if _cfg.direction == "max":
+        SERIES_TOKEN_FAMILY[f"KX{_cfg.asset}D"] = (_cfg.asset, "updown")
+        for _s in _annual_series_for(_cfg.asset):
+            SERIES_TOKEN_FAMILY[_s] = (_cfg.asset, "annual")
+
+
+def _crypto_token_family(ticker: str):
+    """(asset, family) for a crypto-fleet market ticker, else None; family
+    is 'daily'/'weekly'/'hourly'/'annual'/'high'/'low'. KX*D tenor is
+    recovered from the EVENT segment: 5pm-ET closes (hour field '17') are
+    weekly on Fridays and daily otherwise; any other hour is an hourly
+    market (never quoted by the fleet — manual trades land there).
+    Unparseable segments classify as None, not guessed."""
+    hit = SERIES_TOKEN_FAMILY.get((ticker or "").split("-", 1)[0])
+    if hit is None:
         return None
+    asset, family = hit
+    if family != "updown":
+        return asset, family
     parts = ticker.split("-")
     if len(parts) < 2 or len(parts[1]) < 9:
         return None
     date_part, hour = parts[1][:7], parts[1][7:9]
     if hour != "17":
-        return "hourly"
+        return asset, "hourly"
     try:
         close_day = datetime.strptime(date_part, "%y%b%d")
     except ValueError:
         return None
-    return "weekly" if close_day.weekday() == 4 else "daily"
+    return asset, ("weekly" if close_day.weekday() == 4 else "daily")
+
+
+def _crypto_family(ticker: str):
+    """Tenor-table view of _crypto_token_family: high+low fold to 'monthly'."""
+    hit = _crypto_token_family(ticker)
+    if hit is None:
+        return None
+    return "monthly" if hit[1] in ("high", "low") else hit[1]
 
 
 def _settlement_pnl(s: dict) -> float:
@@ -331,8 +353,9 @@ def recent_settlement_rows(client, recs: list, n: int = 20) -> list:
 
 
 def cumulative_family_realized(client) -> tuple:
-    """(family -> all-time realized $, newest-first settlement record tuples
-    for recent_settlement_rows) for the crypto fleets' tenor families.
+    """(family -> all-time realized $, settlement record tuples for
+    recent_settlement_rows, (asset, family6) -> all-time realized $) for the
+    crypto fleets — family6 keeps high/low separate for the by-token table.
 
     Settled history comes from the settlements API — the positions endpoint
     AGES OUT settled records (verified 2026-08-14: zero July monthlies remain
@@ -345,7 +368,18 @@ def cumulative_family_realized(client) -> tuple:
     miss is small — but this is a measured number with that stated edge,
     not a model."""
     fams = {}
+    toks = {}
     recs = []
+
+    def _tally(ticker, pnl):
+        hit = _crypto_token_family(ticker)
+        if hit is None:
+            return None
+        fam = "monthly" if hit[1] in ("high", "low") else hit[1]
+        fams[fam] = fams.get(fam, 0.0) + pnl
+        toks[hit] = toks.get(hit, 0.0) + pnl
+        return fam
+
     cursor = None
     for _page in range(500):
         kw = {"limit": 200}
@@ -355,10 +389,9 @@ def cumulative_family_realized(client) -> tuple:
         batch = resp.get("settlements") or []
         for s in batch:
             ticker = s.get("ticker") or ""
-            fam = _crypto_family(ticker)
+            pnl = _settlement_pnl(s)
+            fam = _tally(ticker, pnl)
             if fam:
-                pnl = _settlement_pnl(s)
-                fams[fam] = fams.get(fam, 0.0) + pnl
                 label = SERIES_LABEL.get(ticker.split("-", 1)[0],
                                          ticker.split("-", 1)[0])
                 recs.append((_settle_dt(s), fam, label,
@@ -374,18 +407,89 @@ def cumulative_family_realized(client) -> tuple:
         resp = client.get_positions(**kw)
         batch = resp.get("market_positions") or []
         for p in batch:
-            fam = _crypto_family(p.get("ticker") or "")
-            if fam:
-                fams[fam] = fams.get(fam, 0.0) + _f(p.get("realized_pnl_dollars"))
+            _tally(p.get("ticker") or "", _f(p.get("realized_pnl_dollars")))
         cursor = resp.get("cursor")
         if not cursor or not batch:
             break
-    return fams, recs
+    return fams, recs, toks
 
 
 CUM_FOOTNOTE = ("realized = settled history + open-market round-trips, "
                 "account-level (manual fills on these series included); "
                 "unrealized = the sections above")
+
+# ---- cumulative P&L by TOKEN (Jack 2026-08-22) ----------------------------
+TOKEN_COLS = ("daily", "weekly", "annual", "high", "low")
+TOKEN_FOOTNOTE = ("cells = all-time realized + current unrealized; HIGH/LOW "
+                  "= the monthly one-touch families; a token's P&L column "
+                  "also counts hourly-close scraps that have no column of "
+                  "their own")
+
+
+def _token_matrix(cum_tok, unreal_tok):
+    """[(asset, row_total, {family: pnl})] sorted best row first. Cell =
+    all-time realized + current unrealized; the row total additionally
+    carries 'hourly' amounts (manual scraps) that get no column."""
+    keys = set(cum_tok) | set(unreal_tok)
+    assets = sorted({a for a, _fam in keys})
+    rows = []
+    for a in assets:
+        cells = {f: cum_tok.get((a, f), 0.0) + unreal_tok.get((a, f), 0.0)
+                 for f in TOKEN_COLS}
+        total = (sum(cells.values())
+                 + cum_tok.get((a, "hourly"), 0.0)
+                 + unreal_tok.get((a, "hourly"), 0.0))
+        rows.append((a, total, cells))
+    rows.sort(key=lambda r: -r[1])
+    return rows
+
+
+def cumulative_token_text(cum_tok, unreal_tok) -> list:
+    lines = ["== CUMULATIVE P&L by token (all-time) ==",
+             f"{'TOKEN':6s} {'P&L$':>9s} " + " ".join(
+                 f"{c.upper():>8s}" for c in TOKEN_COLS)]
+    col_tot = {f: 0.0 for f in TOKEN_COLS}
+    grand = 0.0
+    for a, total, cells in _token_matrix(cum_tok, unreal_tok):
+        grand += total
+        for f in TOKEN_COLS:
+            col_tot[f] += cells[f]
+        lines.append(f"{a:6s} {total:>+9.2f} " + " ".join(
+            f"{cells[f]:>+8.2f}" for f in TOKEN_COLS))
+    lines.append(f"{'TOTAL':6s} {grand:>+9.2f} " + " ".join(
+        f"{col_tot[f]:>+8.2f}" for f in TOKEN_COLS))
+    lines.append(f"({TOKEN_FOOTNOTE})")
+    return lines
+
+
+def cumulative_token_html(cum_tok, unreal_tok) -> list:
+    h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
+         'Cumulative P&amp;L by token (all-time)</div>',
+         '<table style="border-collapse:collapse">',
+         f'<tr style="background:#f0f0f0;font-weight:600">'
+         f'<td style="{TDL}">TOKEN</td><td style="{TD}">P&amp;L$</td>'
+         + "".join(f'<td style="{TD}">{c.upper()}</td>' for c in TOKEN_COLS)
+         + '</tr>']
+    col_tot = {f: 0.0 for f in TOKEN_COLS}
+    grand = 0.0
+    for i, (a, total, cells) in enumerate(_token_matrix(cum_tok, unreal_tok)):
+        grand += total
+        bg = "#fafafa" if i % 2 else "#fff"
+        row = [f'<tr style="background:{bg}"><td style="{TDL}">{a}</td>'
+               f'<td style="{TD};font-weight:600">{_pnl_span(total)}</td>']
+        for f in TOKEN_COLS:
+            col_tot[f] += cells[f]
+            row.append(f'<td style="{TD}">{_pnl_span(cells[f])}</td>')
+        h.append("".join(row) + '</tr>')
+    h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
+             f'<td style="{TDL}">TOTAL</td><td style="{TD}">{_pnl_span(grand)}</td>'
+             + "".join(f'<td style="{TD}">{_pnl_span(col_tot[f])}</td>'
+                       for f in TOKEN_COLS)
+             + '</tr>')
+    h.append('</table>')
+    h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">'
+             f'{TOKEN_FOOTNOTE}</div>')
+    return h
 
 
 def cumulative_text(cum, unreal_by) -> list:
@@ -522,6 +626,7 @@ def collect_rows(client, entries):
     tot = {"realized": 0.0, "fees": 0.0, "unrealized": 0.0, "net_pos": 0.0, "exposure": 0.0}
     failed = []
     quiet = 0
+    by_label = {}
     for label, evs in entries:
         agg = {"realized": 0.0, "fees": 0.0, "unrealized": 0.0, "net_pos": 0.0, "exposure": 0.0}
         ok = True
@@ -535,6 +640,7 @@ def collect_rows(client, entries):
         if not ok:
             failed.append(label)
             continue
+        by_label[label] = agg
         for k in tot:
             tot[k] += agg[k]
         if (abs(agg["realized"]) > 0.005 or abs(agg["unrealized"]) > 0.005
@@ -544,7 +650,7 @@ def collect_rows(client, entries):
         else:
             quiet += 1
     rows.sort(key=lambda r: -r[1]["pnl"])   # best to worst
-    return rows, tot, failed, quiet
+    return rows, tot, failed, quiet, by_label
 
 
 def text_section(title, rows, tot, quiet, failed, health, dd=None):
@@ -631,11 +737,12 @@ def build_digest(now_utc: datetime):
 
     monthly_entries = [(key, [event_ticker_for(MARKETS[key], now_utc)])
                        for key in sorted(MARKETS)]
-    m_rows, m_tot, m_failed, m_quiet = collect_rows(client, monthly_entries)
+    m_rows, m_tot, m_failed, m_quiet, m_by = collect_rows(client, monthly_entries)
     d_entries, w_entries = updown_tenor_entries(client, today_ct)
-    w_rows, w_tot, w_failed, w_quiet = collect_rows(client, w_entries)
-    d_rows, d_tot, d_failed, d_quiet = collect_rows(client, d_entries)
-    a_rows, a_tot, a_failed, a_quiet = collect_rows(client, fleet_entries(ANNUAL_STATUS_DIR))
+    w_rows, w_tot, w_failed, w_quiet, w_by = collect_rows(client, w_entries)
+    d_rows, d_tot, d_failed, d_quiet, d_by = collect_rows(client, d_entries)
+    a_rows, a_tot, a_failed, a_quiet, a_by = collect_rows(
+        client, fleet_entries(ANNUAL_STATUS_DIR))
 
     try:
         balance = _f(client.get_balance().get("balance_dollars"))
@@ -646,13 +753,24 @@ def build_digest(now_utc: datetime):
     # Bottom table: all-time realized per tenor + the sections' current
     # unrealized. A failed sweep degrades to a note — never kills the digest.
     try:
-        cum, settle_recs = cumulative_family_realized(client)
+        cum, settle_recs, cum_tok = cumulative_family_realized(client)
         recent = recent_settlement_rows(client, settle_recs)
     except Exception as e:
         log(f"! cumulative-by-tenor sweep failed: {e}")
-        cum, recent = None, []
+        cum, recent, cum_tok = None, [], {}
     unreal_by = {"daily": d_tot["unrealized"], "weekly": w_tot["unrealized"],
                  "monthly": m_tot["unrealized"], "annual": a_tot["unrealized"]}
+    # per-(token, family) unrealized for the by-token table: monthly labels
+    # are "BTC-MAX"/"BTC-MIN" (-> high/low), the rest are plain assets
+    unreal_tok = {}
+    for label, agg in m_by.items():
+        asset, direction = label.rsplit("-", 1)
+        unreal_tok[(asset, "high" if direction == "MAX" else "low")] = \
+            agg["unrealized"]
+    for src, fam in ((w_by, "weekly"), (d_by, "daily"), (a_by, "annual")):
+        for label, agg in src.items():
+            unreal_tok[(label, fam)] = (unreal_tok.get((label, fam), 0.0)
+                                        + agg["unrealized"])
 
     grand = {k: m_tot[k] + w_tot[k] + d_tot[k] + a_tot[k] for k in m_tot}
     grand_pnl = grand["realized"] + grand["unrealized"]
@@ -695,8 +813,10 @@ def build_digest(now_utc: datetime):
     lines.append("")
     if cum is not None:
         lines += cumulative_text(cum, unreal_by)
+        lines.append("")
+        lines += cumulative_token_text(cum_tok, unreal_tok)
     else:
-        lines.append("(cumulative-by-tenor table unavailable this morning: "
+        lines.append("(cumulative tables unavailable this morning: "
                      "settlements sweep failed)")
     if recent:
         lines.append("")
@@ -729,9 +849,10 @@ def build_digest(now_utc: datetime):
                       a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
     if cum is not None:
         h += cumulative_html(cum, unreal_by)
+        h += cumulative_token_html(cum_tok, unreal_tok)
     else:
-        h.append('<div style="color:#c0392b;margin-top:8px">cumulative-by-tenor '
-                 'table unavailable this morning: settlements sweep failed</div>')
+        h.append('<div style="color:#c0392b;margin-top:8px">cumulative '
+                 'tables unavailable this morning: settlements sweep failed</div>')
     if recent:
         h += recent_settlements_html(recent)
     h.append('</div>')
