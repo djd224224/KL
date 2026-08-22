@@ -152,7 +152,9 @@ MAX_MARKETS_PER_EVENT = _env_i("CUD_MAX_MARKETS_PER_EVENT", 8)
 # 2026-08-10 "double it") after two clean days. Bound per (market, side):
 # num_levels * contracts_per_level = 6.
 NUM_LEVELS = _env_i("CUD_NUM_LEVELS", 3)
-CONTRACTS_PER_LEVEL = _env_i("CUD_CONTRACTS_PER_LEVEL", 2)
+# Weekly's rung size: began 3x1 (8/5), doubled to 3x2 (Jack 8/10 "double
+# it"), returned to 1-lot rungs 2026-08-18 (Jack "return weekly to 1-lot").
+CONTRACTS_PER_LEVEL = _env_i("CUD_CONTRACTS_PER_LEVEL", 1)
 # 3c off fair, not the one-touch fleet's 5c (Jack, 2026-08-05). These books are
 # ~2c wide, so a 5c offset parked us 5-6c behind the touch on both sides and
 # would almost never have filled. Join-don't-lead still caps how aggressive
@@ -175,17 +177,24 @@ CONTRACTS_PER_LEVEL_BY_CADENCE = {
     "daily": _env_i("CUD_CONTRACTS_PER_LEVEL_DAILY", 1),
 }
 NUM_LEVELS_BY_CADENCE = {
-    "daily": _env_i("CUD_NUM_LEVELS_DAILY", 2),
+    # Every daily quotes a SINGLE 1-lot rung per side since 2026-08-18 pm
+    # (Jack "make other dailies have 1 rung / side"; BTC had led the way
+    # that morning).
+    "daily": _env_i("CUD_NUM_LEVELS_DAILY", 1),
 }
-# Jack 2026-08-18 ("do 1 only on BTC, keep 1/1 on others"): BTC — where all
-# of the daily loss lived — quotes a SINGLE 1-contract rung per side; the six
-# benign assets keep two rungs. Looked up before the per-tenor table, like
-# the offset override.
+# BTC's own pin predates the all-dailies cut and stays as a deliberate
+# floor: a future bump of the daily default must not silently resize BTC,
+# where all of the first week's daily loss lived.
 NUM_LEVELS_BY_ASSET_CADENCE = {
     ("BTC", "daily"): _env_i("CUD_NUM_LEVELS_DAILY_BTC", 1),
 }
 QUOTE_OFFSET_BY_CADENCE = {
-    "daily": _env_i("CUD_QUOTE_OFFSET_DAILY", 4),
+    # 4->5c (Jack 2026-08-18 "min edge 5c") after the 8/17 defenses; the
+    # skew floor (3c) leaves +/-2c of effective inventory skew here.
+    "daily": _env_i("CUD_QUOTE_OFFSET_DAILY", 5),
+    # Weekly quoted the base 3c from launch; 5c since 2026-08-18 (Jack
+    # "increase weekly edge to 5c").
+    "weekly": _env_i("CUD_QUOTE_OFFSET_WEEKLY", 5),
 }
 # Per-(asset, tenor) offset override, looked up before the per-tenor table.
 # BTC carried -105 of the daily tenor's first -111 (its books are the most

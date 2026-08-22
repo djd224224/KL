@@ -470,7 +470,7 @@ class TestFleetIsolation(unittest.TestCase):
 
     def test_annual_class_attrs_do_not_touch_the_updown_fleet(self):
         self.assertEqual(ann.AnnualMarketMaker.contracts_per_level, 1)
-        self.assertEqual(ud.UpDownMarketMaker.contracts_per_level, 2)
+        self.assertEqual(ud.UpDownMarketMaker.contracts_per_level, 1)
         # the updown fleet's per-tenor daily tables must not leak in here
         self.assertEqual(ann.AnnualMarketMaker.contracts_per_level_by_cadence, {})
         self.assertEqual(ann.AnnualMarketMaker.num_levels_by_cadence, {})
@@ -480,11 +480,12 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertEqual(ann.AnnualMarketMaker.momo_cadences, ())
         self.assertEqual(ud.UpDownMarketMaker.contracts_per_level_by_cadence,
                          {"daily": 1})
-        self.assertEqual(ud.UpDownMarketMaker.num_levels_by_cadence, {"daily": 2})
+        self.assertEqual(ud.UpDownMarketMaker.num_levels_by_cadence, {"daily": 1})
         self.assertEqual(ann.AnnualMarketMaker.num_levels_by_asset_cadence, {})
         self.assertEqual(ud.UpDownMarketMaker.num_levels_by_asset_cadence,
                          {("BTC", "daily"): 1})
-        self.assertEqual(ud.UpDownMarketMaker.quote_offset_by_cadence, {"daily": 4})
+        self.assertEqual(ud.UpDownMarketMaker.quote_offset_by_cadence,
+                         {"daily": 5, "weekly": 5})
         self.assertEqual(ann.AnnualMarketMaker.max_asset, 400)
         self.assertEqual(ud.UpDownMarketMaker.max_asset, 800)
         self.assertEqual(ann.AnnualMarketMaker.poll_secs, 60)

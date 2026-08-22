@@ -552,10 +552,12 @@ class TestRunCycle(unittest.TestCase):
                             for o in b.state.sim_orders.values()))
 
     def test_ladder_is_the_live_pilot_shape(self):
-        """Pins the deployed config: 3 levels x 2 contracts (doubled from 3x1
-        on 2026-08-10), 3c off fair, 2c apart, joining and never leading.
-        Changing any of these is a size change on a live bot and should have
-        to break a test first."""
+        """Pins the deployed config: 3 levels x 1 contract (3x1 at the 8/5
+        launch, doubled 8/10, returned to 1-lot 2026-08-18 Jack "return
+        weekly to 1-lot"), 2c apart, joining and never leading. Hourly (not
+        enabled) keeps the base 3c offset; weekly quotes 5c via the
+        per-tenor table. Changing any of these is a size change on a live
+        bot and should have to break a test first."""
         c = FakeClient(markets=hourly_event(n=1))
         b = bot(c, cadences=("hourly",))
         with priced():
@@ -566,7 +568,7 @@ class TestRunCycle(unittest.TestCase):
         asks = sorted(o["yes_price"] for o in placed if o["book_side"] == "ask")
         self.assertEqual(len(bids), 3)
         self.assertEqual(len(asks), 3)
-        self.assertTrue(all(o["remaining_count"] == 2 for o in placed))
+        self.assertTrue(all(o["remaining_count"] == 1 for o in placed))
         self.assertLessEqual(bids[0], 40)      # external bid; join, never lead
         self.assertGreaterEqual(asks[0], 55)   # external ask = 100-45
         self.assertEqual([b1 - b2 for b1, b2 in zip(bids, bids[1:])],
@@ -574,7 +576,7 @@ class TestRunCycle(unittest.TestCase):
         self.assertEqual([a2 - a1 for a1, a2 in zip(asks, asks[1:])],
                          [ud.LEVEL_SPACING_CENTS] * 2)
 
-    def test_at_most_six_contracts_rest_per_market_side(self):
+    def test_at_most_three_contracts_rest_per_market_side(self):
         c = FakeClient(markets=hourly_event(n=3))
         b = bot(c, cadences=("hourly",))
         with priced():
@@ -584,18 +586,19 @@ class TestRunCycle(unittest.TestCase):
             key = (o["ticker"], o["book_side"])
             totals[key] = totals.get(key, 0) + o["remaining_count"]
         self.assertTrue(totals)
-        self.assertLessEqual(max(totals.values()), 6)
+        self.assertLessEqual(max(totals.values()),
+                             ud.NUM_LEVELS * ud.CONTRACTS_PER_LEVEL)
+        self.assertEqual(ud.NUM_LEVELS * ud.CONTRACTS_PER_LEVEL, 3)
 
     def test_daily_tenor_ladder_is_the_live_shape(self):
-        """BTC daily quotes a SINGLE 1-contract rung per side; the six benign
-        assets keep 1/1 (two rungs) — Jack 2026-08-18 "do 1 only on BTC,
-        keep 1/1 on others". Weekly keeps 3x2 @3c everywhere. Changing any
-        of these is a size change on a live bot and should have to break a
-        test first."""
+        """Every daily quotes a SINGLE 1-lot rung per side at 5c min edge
+        (BTC at 6c); weekly quotes 3x1 at 5c (Jack 2026-08-18 pm). Changing
+        any of these is a size change on a live bot and should have to break
+        a test first."""
         self.assertEqual(ud.CONTRACTS_PER_LEVEL_BY_CADENCE, {"daily": 1})
-        self.assertEqual(ud.NUM_LEVELS_BY_CADENCE, {"daily": 2})
+        self.assertEqual(ud.NUM_LEVELS_BY_CADENCE, {"daily": 1})
         self.assertEqual(ud.NUM_LEVELS_BY_ASSET_CADENCE, {("BTC", "daily"): 1})
-        self.assertEqual(ud.QUOTE_OFFSET_BY_CADENCE, {"daily": 4})
+        self.assertEqual(ud.QUOTE_OFFSET_BY_CADENCE, {"daily": 5, "weekly": 5})
         c = FakeClient(markets=daily_event() + weekly_event())
         b = bot(c, cadences=("daily", "weekly"))
         with priced():
@@ -607,12 +610,12 @@ class TestRunCycle(unittest.TestCase):
             key = (cad, o["ticker"], o["book_side"])
             side_counts[key] = side_counts.get(key, 0) + 1
         self.assertEqual(sizes["daily"], {1})
-        self.assertEqual(sizes["weekly"], {2})
+        self.assertEqual(sizes["weekly"], {1})         # 1-lot rungs everywhere
         daily_levels = {n for (cad, _t, _s), n in side_counts.items() if cad == "daily"}
         weekly_levels = {n for (cad, _t, _s), n in side_counts.items() if cad == "weekly"}
-        self.assertEqual(max(daily_levels), 1)         # BTC: single rung per side
-        self.assertEqual(max(weekly_levels), 3)        # weekly unchanged
-        # the six benign assets keep two daily rungs
+        self.assertEqual(max(daily_levels), 1)         # single rung per side
+        self.assertEqual(max(weekly_levels), 3)        # weekly keeps 3 rungs
+        # the six benign assets are single-rung too now
         eth = ud.UpDownMarketMaker(ud.ASSETS["ETH"],
                                    FakeClient(markets=daily_event() + weekly_event()),
                                    live=False, cadences=("daily", "weekly"))
@@ -623,27 +626,26 @@ class TestRunCycle(unittest.TestCase):
             if o["ticker"].startswith(EV_D):
                 key = (o["ticker"], o["book_side"])
                 eth_counts[key] = eth_counts.get(key, 0) + 1
-        self.assertEqual(max(eth_counts.values()), 2)
+        self.assertEqual(max(eth_counts.values()), 1)
 
-    def test_daily_offset_is_four_cents_minimum_edge(self):
-        """Same args run_cycle passes for a daily event: 2 rungs x 1 @4c.
+    def test_daily_offset_is_five_cents_minimum_edge(self):
+        """Same args run_cycle passes for a daily event: 1 rung x 1 @5c.
         The offset is the MINIMUM edge vs fair — join-don't-lead still caps
         the anchor at the external best, so it binds only when fair sits
-        within 4c of the touch (exactly the near-money pick-off zone that
-        lost the money)."""
-        # fair 43 on a 40/60 book: bid anchor min(43-4, 40) = 39 — the 4c
-        # edge holds us 1c BEHIND a touch the old 3c offset would have joined.
-        q = mm.build_quotes("T", 43, 40, 60, 99, 99, 2, 1, 4, 2)
+        within 5c of the touch (the near-money pick-off zone that lost the
+        money)."""
+        # fair 43 on a 40/60 book: bid anchor min(43-5, 40) = 38
+        q = mm.build_quotes("T", 43, 40, 60, 99, 99, 1, 1, 5, 2)
         self.assertEqual(sorted(x.price_cents for x in q if x.book_side == "bid"),
-                         [37, 39])
+                         [38])
         self.assertEqual(sorted(x.price_cents for x in q if x.book_side == "ask"),
-                         [60, 62])
-        # mirror image on the ask side: fair 57 -> ask anchor max(61, 60) = 61
-        q = mm.build_quotes("T", 57, 40, 60, 99, 99, 2, 1, 4, 2)
+                         [60])
+        # mirror image on the ask side: fair 57 -> ask anchor max(62, 60) = 62
+        q = mm.build_quotes("T", 57, 40, 60, 99, 99, 1, 1, 5, 2)
         self.assertEqual(sorted(x.price_cents for x in q if x.book_side == "ask"),
-                         [61, 63])
+                         [62])
         self.assertEqual(sorted(x.price_cents for x in q if x.book_side == "bid"),
-                         [38, 40])
+                         [40])
 
     def test_deselected_event_orders_are_cleared_not_left_to_ttl(self):
         """An event that leaves selection (stand-down/collision/delisting)
@@ -810,7 +812,7 @@ class TestDailyDefenses(unittest.TestCase):
                     for o in b.state.sim_orders.values()
                     if o["ticker"].startswith(EV_D)}
 
-        for asset, max_shift in (("BTC", 3), ("ETH", 1)):
+        for asset, max_shift in (("BTC", 3), ("ETH", 2)):
             flat = daily_bids(asset, {})
             short = daily_bids(asset, {EV_D: {f"{EV_D}-T100000.0": -25.0}})
             diffs = [short[k] - flat[k] for k in short if k in flat]
@@ -902,14 +904,14 @@ class TestDailyDefenses(unittest.TestCase):
                                side_effect=RuntimeError("kraken down")):
             self.assertIsNone(b.refresh_momentum_block(100000.0, NOW.timestamp()))
 
-    def test_btc_daily_offset_is_six_cents_others_four(self):
+    def test_btc_daily_offset_is_six_cents_others_five(self):
         b = bot()   # BTC
         self.assertEqual(
             b.quote_offset_by_asset_cadence.get(("BTC", "daily")), 6)
         self.assertIsNone(
             b.quote_offset_by_asset_cadence.get(("ETH", "daily")))
         # ETH daily falls through to the tenor offset
-        self.assertEqual(ud.QUOTE_OFFSET_BY_CADENCE["daily"], 4)
+        self.assertEqual(ud.QUOTE_OFFSET_BY_CADENCE["daily"], 5)
 
 
 class TestRunCycleBudgets(unittest.TestCase):
@@ -1145,14 +1147,14 @@ class TestFleetIsolation(unittest.TestCase):
 
     def test_each_fleet_has_its_own_ladder_shape(self):
         import crypto_touch_mm_weekly as wk
-        # The updown pilot's 3x1 IS pinned — that is this fleet's live risk
+        # The updown fleet's 3x1 IS pinned — that is this fleet's live risk
         # control. The one-touch fleets track whatever the monthly runs.
         self.assertEqual((ud.UpDownMarketMaker.num_levels,
-                          ud.UpDownMarketMaker.contracts_per_level), (3, 2))
+                          ud.UpDownMarketMaker.contracts_per_level), (3, 1))
         for other in (mm.TouchMarketMaker, wk.WeeklyTouchMarketMaker):
             self.assertEqual((other.num_levels, other.contracts_per_level),
                              (mm.NUM_LEVELS, mm.CONTRACTS_PER_LEVEL))
-        self.assertNotEqual((mm.NUM_LEVELS, mm.CONTRACTS_PER_LEVEL), (3, 2))
+        self.assertNotEqual((mm.NUM_LEVELS, mm.CONTRACTS_PER_LEVEL), (3, 1))
 
     def test_updown_caps_are_its_own(self):
         C = ud.UpDownMarketMaker
