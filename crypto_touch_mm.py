@@ -129,22 +129,26 @@ MARKETS: Dict[str, MarketConfig] = {m.key: m for m in [
     for direction in ("max", "min")
 ]}
 
-# Quoting parameters (user spec: post-only, 5c off fair, 3 levels 2c apart, 10 lots)
+# Quoting parameters (user spec: post-only, 5c off fair, 2c apart)
 QUOTE_OFFSET_CENTS = int(os.environ.get("CMM_QUOTE_OFFSET_CENTS", 5))
 LEVEL_SPACING_CENTS = int(os.environ.get("CMM_LEVEL_SPACING_CENTS", 2))
-NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 5))
-CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 12))
+NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 3))
+CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 5))
 
 # Risk / hygiene parameters
 # Caps scale proportionally with ladder size. History: 3x8 -> 128/800;
-# 5x10 (x50/24) -> 267/1667 (2026-08-01); 5x12 (x1.2) -> 320/2000 (2026-08-05).
-MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 320))  # per market, either sign
+# 5x10 (x50/24) -> 267/1667 (2026-08-01); 5x12 (x1.2) -> 320/2000 (2026-08-05);
+# BACK to 3x5 -> 80/500 (Jack 2026-08-22 "return to 3x5" — the 7/3-era pairing;
+# the by-token table showed the monthly HIGH family carrying the account's
+# biggest cumulative losses at 5x12). Markets already holding more than the
+# 80 cap quote reduce-only until they shrink below it.
+MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 80))  # per market, either sign
 # Net cap across all strikes of one event (they are one correlated bet on the
 # same spot). 500 comfortably exceeds 8 full 3x10 ladders (480): non-binding
 # at rest so every bucket gets the full spec ladder; binds as fills
 # accumulate. The event budget is split evenly across quotable markets each
 # cycle.
-MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 2000))
+MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 500))
 SKIP_FAIR_ABOVE_CENTS = 97       # near-certain touch: model risk dominates, stand down
 BOOK_DIVERGENCE_BID = 85         # best bid >= this while our fair is 20c+ lower ->
 BOOK_DIVERGENCE_GAP = 20         # ... suspected touch we can't see; stand down

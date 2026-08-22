@@ -122,11 +122,14 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertEqual(mm.CLIENT_ORDER_PREFIX, "cmm")
         self.assertTrue(mm.MODEL_VERSION.startswith("crypto_touch_mm_v"))
         self.assertNotEqual(mm.MODEL_VERSION, wk.MODEL_VERSION)
-        # the weekly's env-shim leak would overwrite these with 100/500
+        # the weekly's env-shim leak would overwrite these with its 100/500;
+        # since the monthly's 8/22 return to 3x5 its event cap is 500 by its
+        # OWN config (coincidentally the weekly's number), so pin the monthly
+        # to its configured defaults instead of asserting inequality
+        self.assertEqual(mm.MAX_POSITION_CONTRACTS, 80.0)
+        self.assertEqual(mm.MAX_EVENT_CONTRACTS, 500.0)
         self.assertNotEqual(mm.MAX_POSITION_CONTRACTS,
                             wk.WeeklyTouchMarketMaker.max_position)
-        self.assertNotEqual(mm.MAX_EVENT_CONTRACTS,
-                            wk.WeeklyTouchMarketMaker.max_event)
 
     def test_monthly_class_defaults_intact(self):
         # The monthly class mirrors its module globals — a variant overriding
