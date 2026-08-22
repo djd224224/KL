@@ -4,10 +4,17 @@ gcp_sa_key.json
 __pycache__/
 *.pyc
 
-# Generated CSV exports from fetch_*_csv.py
+# Generated CSV exports from fetch_*_csv.py (the *-archive.csv files —
+# merged by merge_kalshi_archive.py — match these patterns too)
 Kalshi-Settlements-*.csv
 Kalshi-Trades-*.csv
 Kalshi-Orders-*.csv
+
+# Seed exports dropped in for the archive merge — personal trading data,
+# and this repo is public: never commit them
+seed_settlements_*.csv
+seed_trades_*.csv
+KalshiRecentActivitySettlement*.csv
 
 # Dashboard HTML outputs (regenerated every skill run)
 kalshi_dashboard_latest.html
