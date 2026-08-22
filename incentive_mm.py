@@ -381,9 +381,22 @@ SERIES_OVERRIDES: Dict[str, SeriesOverride] = {
 # minutes — flanking strikes projected $0.6-0.8 vs the $1 global floor and
 # never entered; DCH 9am hour: T78.99 $0.81 / T80.99 $0.64 floored while
 # T79.99/T81.99 quoted).
+# PROGRAM MOVED TO MIAMI (diagnosed 2026-08-20): Kalshi ended the 5-city
+# hourly-temp programs after the Aug 4 hour-19 period — the bot went silently
+# dark on its top reward family for 16 days (selection is program-driven, so
+# a family leaving the feed logs nothing; imm_feed_audit.py now has an
+# UNEARNABLE check + absent-family footer for exactly this). 2026-08-15 01Z
+# the program relaunched as KXTEMPMIAH ONLY ($80/mkt/hour, 10 strikes). This
+# list is what grants the close-anchored cutoff — a KXTEMP city absent here
+# is admitted by the allow-prefix but killed on sight by the midnight-ET
+# ticker rule (its "26AUG2009" parses as Aug 20), so Miami never quoted.
+# KXTEMPMIAH added 2026-08-22 (Jack). The legacy five stay enrolled:
+# program-less series are never selected, and they auto-resume if Kalshi
+# flips back.
 for _s in os.environ.get(
         "IMM_TEMP_SERIES",
-        "KXTEMPAUSH,KXTEMPCHIH,KXTEMPDCH,KXTEMPLAXH,KXTEMPNYCH").split(","):
+        "KXTEMPAUSH,KXTEMPCHIH,KXTEMPDCH,KXTEMPLAXH,KXTEMPMIAH,"
+        "KXTEMPNYCH").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             levels=_parse_levels(os.environ.get("IMM_TEMP_LEVELS", "0:5,1:2,2:2")),
@@ -406,6 +419,32 @@ for _s in os.environ.get(
             # on a thin side would forfeit the richest pools in the feed
             pad_to_target=True,
             fast_lane=os.environ.get("IMM_TEMP_FAST_LANE", "1") == "1")
+
+# Weekly average-temperature markets (Jack 2026-08-22: "add KXAVGTKDFW and
+# similar cities"). Kalshi lit incentive programs on 11 stations 2026-08-20:
+# $500/market/week on the Texas stations (KDFW/KIAH/KSAT/KAUS/KSAN — SAN is
+# San Diego, the lone non-Texan in the $500 tier), $200/market/week on
+# KLAS/KMSY/KDEN/KOKC/KPHX/ATL. Week-long observation (The Weather Company
+# daily temps averaged), close Sunday ~midnight ET. Ticker dates are the
+# week-END Monday (26AUG24), so the default midnight-ET rule quotes ALL WEEK
+# and stands down ~1h before close — the right shape for a continuously-
+# observed average (the final hours are the most informed) with no override
+# needed. EXCEPTION: KXAVGTATL carries a SUNDAY ticker date (26AUG23), so the
+# midnight rule costs it its whole final day — accepted (failing toward
+# quoting less; an event_day_cutoff_et would win it back if ever wanted).
+# Weather-family 5..90c band both sides (the KXTEMP/rain convention: no
+# 1c-scrap quoting on dead strikes + the band activates top-in-band
+# stand-aside); ladder/caps stay global. NOTE: new stations must be added
+# here as well as being admitted by the KXAVGT allow-prefix, like
+# IMM_TEMP_SERIES.
+for _s in os.environ.get(
+        "IMM_AVGT_SERIES",
+        "KXAVGTATL,KXAVGTKAUS,KXAVGTKDEN,KXAVGTKDFW,KXAVGTKIAH,KXAVGTKLAS,"
+        "KXAVGTKMSY,KXAVGTKOKC,KXAVGTKPHX,KXAVGTKSAN,KXAVGTKSAT").split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            price_min_cents=_env_int("IMM_AVGT_PRICE_MIN", 5),
+            price_max_cents=_env_int("IMM_AVGT_PRICE_MAX", 90))
 
 # Air-quality-index markets (user decision 2026-07-15). Series is KXAQICITY; the
 # CITY lives in the event segment (KXAQICITY-NYC26JUL19), so one override covers
@@ -455,11 +494,12 @@ for _s in os.environ.get(
             levels=_parse_levels(_RAIN_LEVELS_SPEC) if _RAIN_LEVELS_SPEC else None,
             price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
-            # Jack 2026-08-01: run until 9pm ET the day before the rain day
-            # (was 6pm since 7/29, midnight before that). Also gates the
-            # directional module's entry window (its orders respect
-            # cutoff_ts).
-            cutoff_before_event_min=_env_int("IMM_RAIN_CUTOFF_BEFORE_MIN", 180))
+            # Jack 2026-08-15: run until 10pm ET the day before the rain day
+            # (was 9pm since 8/1, 6pm since 7/29, midnight before that;
+            # paired with the 7pm size halving in IMM_SERIES_HOUR_MULT).
+            # Also gates the directional module's entry window (its orders
+            # respect cutoff_ts).
+            cutoff_before_event_min=_env_int("IMM_RAIN_CUTOFF_BEFORE_MIN", 120))
 
 
 def series_pad_to_target(series: str) -> bool:
@@ -602,16 +642,18 @@ def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
 # PER-SERIES hour windows, which beat the global window AND the global
 # exclude list — an explicit rule for a named family is never overridden by a
 # blanket one. Jack 2026-08-04: "on KXDIESELD and KXAAAGASD events, cut the
-# contract size in half starting at 4pm EST", extended to KXRAIN in the same
-# breath. Window runs 16:00 ET to 01:59 ET rather than stopping at midnight:
-# the gas/diesel DAILIES trade until 01:59 ET, so ending at midnight would
-# hand back full size for the last two hours of their life. Prefixes are
-# deliberately the DAILY tickers — KXAAAGASW/M weeklies and monthlies keep
-# full size. Times are America/New_York (so EDT in summer), the convention
-# every other window in this file uses.
+# contract size in half starting at 4pm EST"; rain was extended in the same
+# breath but moved to 7pm on 2026-08-15 (Jack: "halve size at 7pm ET", paired
+# with the rain cutoff moving 9pm -> 10pm). Windows run to 01:59 ET rather
+# than stopping at midnight: the gas/diesel DAILIES trade until 01:59 ET, so
+# ending at midnight would hand back full size for the last two hours of
+# their life (rain dailies never get that far — their cutoff ends quoting at
+# 10pm). Prefixes are deliberately the DAILY tickers — KXAAAGASW/M weeklies
+# and monthlies keep full size. Times are America/New_York (so EDT in
+# summer), the convention every other window in this file uses.
 SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
     "IMM_SERIES_HOUR_MULT",
-    "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5"))
+    "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:19-1:0.5"))
 
 
 def hour_size_mult(series: str, now_utc: datetime) -> float:
@@ -943,6 +985,18 @@ _CRYPTO_ASSETS = ("SOL", "ETH", "BTC", "XRP", "ZEC", "HYPE", "DOGE", "BNB")
 _GPU_RENTAL_PREFIXES = ["KXA100", "KXB200", "KXH100", "KXH200", "KXRTX5090"]
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
+    # ANNUAL crypto = crypto_annual_mm.py's book as of 2026-08-13 (same
+    # arrangement as MAXMON/MINMON above: crossing would trip same-account
+    # STP and cancel the fleet's orders). The yearly touch pairs had been
+    # ALLOWLISTED 2026-07-22, when no fleet bot quoted them — that entry is
+    # retired from _DEFAULT_CRYPTO_SERIES below. The last list is the
+    # terminal end-of-year series; SOL's is irregularly named KXSOLD26, and
+    # it must stay KXSOLD26 (a bare KXSOLD prefix would also freeze
+    # KXSOLDATHOLDINGS). Existing frozen annual positions (KXBNBMAXY x3)
+    # ride, per standard blocklist semantics.
+    + [f"KX{a}MAXY" for a in _CRYPTO_ASSETS] + [f"KX{a}MINY" for a in _CRYPTO_ASSETS]
+    + ["KXBTCY", "KXETHY", "KXSOLD26", "KXXRPY", "KXDOGEY", "KXBNBY",
+       "KXHYPEY", "KXZECY"]
     + ["KXHIGH"]                                    # high_temp_trading.py (cloud)
     + ["KXMLBMENTION", "KXNBAMENTION", "KXNCAABMENTION"]   # mlb/nba/ncaa (cloud)
     + _GPU_RENTAL_PREFIXES                           # GPU rental price (excluded)
@@ -961,6 +1015,12 @@ ALLOW_SERIES_SUFFIXES = tuple(
 # Series-name PREFIXES — for mention/incentive families that append a variable
 # tail so the "MENTION" suffix match misses:
 #   KXTEMP<CITY>            weather temp (covers new cities automatically)
+#   KXAVGT<STATION>         weekly average-temp, ICAO station in the SERIES
+#     ticker (KXAVGTKDFW = Dallas; KXAVGTATL lacks the ICAO K). Jack
+#     2026-08-22: "add KXAVGTKDFW and similar cities" — Kalshi lit programs
+#     on 11 stations 2026-08-20. Prefix covers future stations automatically;
+#     bands come from the IMM_AVGT_SERIES overrides (which DO need new
+#     stations added, like IMM_TEMP_SERIES).
 #   KXEARNINGSMENTION<TKR>  per-company earnings-call mention markets, e.g.
 #     KXEARNINGSMENTIONUAL (United). Same low-adverse-selection structure as the
 #     other MENTIONs — nothing knowable before the call — and the midnight-ET
@@ -970,16 +1030,14 @@ ALLOW_SERIES_SUFFIXES = tuple(
 # The 7/21 SeriesOverride tuning (5/2/2, cap 50, 5-90c, close-15min) applies.
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
-        "IMM_ALLOW_PREFIXES", "KXTEMP,KXEARNINGSMENTION,KXAQICITY").split(",") if p)
+        "IMM_ALLOW_PREFIXES",
+        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
-    "KXCHINAUNBANBTC,KXETHMINY,KXETHMAXY,KXBTCMINY,KXBTCMAXY,KXSOLMINY,KXSOLMAXY,"
-    "KXDOGEMINY,KXDOGEMAXY,KXXRPMINY,KXXRPMAXY,KXCRYPTORETURNY,KXBTCRESERVE,"
-    "KXCRYPTOSTRUCTURE,KXBTCVSGOLD,KXINXVSBTC,KXBTC50VS100,"
-    # Yearly pairs for the newer fleet assets (Jack 2026-07-22, KXBNBMAXY had
-    # 6 live program markets). YEARLY only — the monthly *MAXMON/*MINMON
-    # series stay excluded (crypto fleet's book; crossing trips same-account
-    # STP and cancels its orders).
-    "KXBNBMINY,KXBNBMAXY,KXHYPEMINY,KXHYPEMAXY,KXZECMINY,KXZECMAXY")
+    # The yearly touch pairs (KX*MINY/KX*MAXY, allowlisted 2026-07-22 when no
+    # fleet bot quoted them) moved to SERIES_BLOCKLIST_PREFIXES on 2026-08-13:
+    # they are crypto_annual_mm.py's book now, exactly like *MAXMON/*MINMON.
+    "KXCHINAUNBANBTC,KXCRYPTORETURNY,KXBTCRESERVE,"
+    "KXCRYPTOSTRUCTURE,KXBTCVSGOLD,KXINXVSBTC,KXBTC50VS100")
 # Company operating-metric series (Jack 2026-07-22): KX<stock ticker> with a
 # <YY><MON><METRIC> event segment (KXBA-26JULDELIV = Boeing July deliveries,
 # KXHOOD-26JULFUNDED = Robinhood funded accounts, ...), plus the branded
@@ -1270,6 +1328,26 @@ PAYOUT_FLOOR_DOLLARS = _env_float("IMM_PAYOUT_FLOOR", 1.0)
 # incentive programs end 2026-08-09, so the window is 5 days and only 1 of 22
 # clears $5 — the rule is deliberately not a blanket admission.
 RATE_FLOOR_TOTAL_ALT = _env_float("IMM_RATE_FLOOR_TOTAL_ALT", 5.0)
+# ...but the escape's TOTAL is only allowed to accumulate over this many days
+# of window. A total threshold dilutes with window length: KXCRYPTOSTRUCTURE
+# entered 2026-08-07 06:22Z at ~$0.36/day because its 13.9-day program window
+# stretched pennies-rate to a $5.04 total — an effective bar of $0.36/day,
+# 5.5x looser than the $2/day the rate bar demands. Capping the horizon at
+# ALT/bar days (5/2 = 2.5) makes the escape exactly bar-neutral: windows
+# shorter than 2.5d keep the full anti-flapping escape, longer windows face
+# the bar undiluted. (Jack 2026-08-07: "yes implement".)
+RATE_FLOOR_ESCAPE_DAYS = _env_float("IMM_RATE_FLOOR_ESCAPE_DAYS", 2.5)
+
+
+def rate_floor_projected(accrued: float, est_total: float, peak: float,
+                         quotable_days: float) -> float:
+    """The value the re-entry rate floor's horizon escape compares against
+    RATE_FLOOR_TOTAL_ALT. est_total/peak are whole-window projections; scale
+    them to the first RATE_FLOOR_ESCAPE_DAYS of window so long windows cannot
+    dilute the bar. Banked accrual counts in full — it is money, not a
+    projection."""
+    cap = min(1.0, RATE_FLOOR_ESCAPE_DAYS / max(quotable_days, 1.0 / 24))
+    return accrued + max(est_total, peak) * cap
 # The floor is a hard threshold on a NOISY estimate (thin books swing the
 # share estimate ±50% between refreshes), so borderline markets could flap
 # just under $1 at every sampling instant and never enter (observed
@@ -1936,15 +2014,59 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     return cutoff
 
 
+# Kalshi's long-window mention programs (KXMAMDANIMENTION-26AUG14,
+# KXTRUMPMENTION-26AUG05, KXTRUMPMENTIONB-26AUG04) embed the LISTING date in
+# the ticker; resolution is close_time, 2-4 weeks out. Reading that segment as
+# an event day truncated a 21.5d/$1,300 program to the 2h15m between its
+# 01:45Z listing and fake-midnight on 2026-08-14 — payout_floor ate the sliver
+# (est_total pennies vs the $1.00 exchange minimum), then `cutoff` locked the
+# remaining 21.5d. Third instance of the class; ~$5,800 of pool measured idle
+# 2026-08-06. The discriminator is the market's OWN expiration: a mention
+# market expiring >5d past its ticker date cannot be resolving on that date
+# (historical mention events: median 1.05d; settlement lag <=3d). Scoped to
+# MENTION-family series ON PURPOSE — everywhere else the ticker date IS the
+# event day (weather, gas, sports, treasuries), and a stray late expiration
+# placeholder there must keep failing toward quoting LESS, never through a
+# live event. Same-day mentions (KXWCMENTION match day, KXEARNINGSMENTION*
+# call day) sit far under the gap bar and keep the midnight rule; occurrence
+# and EVENT_START_OVERRIDES cutoffs still apply through min() regardless.
+MENTION_LISTING_GAP_DAYS = 5.0
+
+
+def ticker_date_is_listing_date(event_ticker: str, td: datetime,
+                                expected_expiration: Optional[datetime]) -> bool:
+    """True when a mention-family ticker's date segment is the day Kalshi
+    LISTED the event rather than the day it resolves — the signal that td
+    must not become a trade cutoff. No expiration to compare against means
+    no proof: keep the conservative reading."""
+    return ("MENTION" in series_of(event_ticker)
+            and expected_expiration is not None
+            and expected_expiration - td > timedelta(days=MENTION_LISTING_GAP_DAYS))
+
+
 def trade_cutoff_utc(event_ticker: str, occurrence: Optional[datetime],
                      expected_expiration: Optional[datetime]) -> Optional[datetime]:
     """When we must be OUT of this market. Ticker-embedded event dates cut off
     at ET midnight day-of (most conservative reading — kickoff hour isn't in
-    the API). An occurrence_datetime meaningfully before expiration marks a
-    scheduled underlying event (earnings report, game) — cut off there too.
+    the API), EXCEPT mention-family tickers whose expiration proves the date
+    is a listing date (see ticker_date_is_listing_date) — those quote the
+    whole listing window and cut off at expiration. An occurrence_datetime
+    meaningfully before expiration marks a scheduled underlying event
+    (earnings report, game) — cut off there too.
     None = no known event start; breakers are the only protection."""
     candidates = []
     td = parse_event_date(event_ticker)
+    if td is not None and ticker_date_is_listing_date(event_ticker, td,
+                                                      expected_expiration):
+        # The whole listing window is the quotable period: be out at
+        # expiration. NOT None — a cutoff-less mention-family market trips
+        # _screen()'s no_event_window stand-down (that rule targets
+        # tournament-wide tickers with no date segment at all), which is
+        # exactly where the 26AUG13/26AUG14 events landed on the first
+        # post-fix cycle. An occurrence, if Kalshi ever sets one, still
+        # wins the min() below.
+        candidates.append(expected_expiration)
+        td = None
     if td is not None:
         # EVENT-DAY EXTENDER (Jack 2026-08-04: "quote treasuries until 7:30am
         # EST"). Midnight is the right default for a market with a scheduled
@@ -2194,6 +2316,66 @@ def estimate_reward_share(yes_levels: List[List[float]], no_levels: List[List[fl
     if sides < 2:
         return 0.0, sides   # snapshot excluded: one qualifying side pays nobody
     return (share_yes + share_no) / 2.0, sides
+
+
+def zero_share_strike_counts(frac: float,
+                             est_own: List[Tuple[str, int, float]]) -> bool:
+    """Is a zero reward share a verdict on the MARKET, or only on us?
+
+    Only the first may score a zero-share strike. `estimate_reward_share`
+    scores OUR size against the book, so in live mode `frac` is 0.0 BY
+    CONSTRUCTION whenever our orders are absent — that measures our own
+    failure to have orders up, not the book.
+
+    2026-08-06, the incident this exists to prevent. Kalshi went down for
+    maintenance 07:16-09:00Z (19,949 x 503 in 07Z, 18,737 in 08Z, 13 in 09Z).
+    The failsafe cancelled every order at 07:18:44Z ("4 consecutive cycle
+    errors (last: HttpError('Service Unavailable')); cancelled all"); then
+    post-only 409s and our own 429 throttle kept us off the book — 36,321
+    rejections, ZERO successful placements, two hours — and the 08Z half had
+    no 503s at all, so an exchange-health guard would have stopped only half
+    of it. The strike guard scored `own` (our RESTING orders) but tested `mq`
+    (what we WANTED), so every selected market struck every cycle against
+    books that never stopped qualifying (both sides at or above target on
+    97-98% of cycle-log rows in every 10-minute bucket). Thirty cycles later
+    307 markets benched 07:45:59-08:13:29Z: 293 of 471 candidates, selected
+    390 -> 31, estimated reward ~$404/day -> ~$159/day for four hours. Not one
+    of those benches was a statement about any book.
+
+    A strike is scored only when real, non-pad size of ours is actually
+    resting on BOTH sides and still earns exactly nothing — i.e. our rungs sit
+    outside the qualifying walk, or the snapshot is excluded outright. That is
+    fill risk carried for zero rent, which is the only thing the bench is for.
+
+    Pads are excluded because a 1c/99c pad can never score: `_side_share`
+    breaks the qualifying walk once cumulative depth reaches target, thousands
+    of ticks above the pad. A pads-only market is therefore guaranteed
+    frac == 0.0 with a NON-EMPTY desired set, which is exactly the case the
+    old `and mq` test waved through.
+
+    `remaining > 0` is load-bearing on its own: if the count field is ever
+    renamed, `order_remaining` falls through to 0.0 (:2067-2075) and
+    own_by_ticker fills with all-zero entries that would otherwise read as
+    real resting size. That is the class of the `_fp` rename that silently
+    killed position reads for two weeks.
+
+    `est_own` MUST be the same list that produced `frac` at the call site —
+    our real resting orders when live, the desired ladder when dry — so the
+    predicate can never disagree with the number it judges. That mismatch WAS
+    the bug.
+
+    Pad classification is deliberately looser than
+    IncentiveMarketMaker._is_pad_price (a bound, not equality): if
+    IMM_PAD_BID_CENTS/IMM_PAD_ASK_CENTS are retuned while pads are resting,
+    stale pads must still read as pads. Every error in that direction fails
+    toward NOT striking, which is the safe side of this predicate."""
+    if frac > 0.0:
+        return False
+    real_bid = any(bs == "bid" and n > 0 and px > PAD_BID_CENTS
+                   for bs, px, n in est_own)
+    real_ask = any(bs == "ask" and n > 0 and px < PAD_ASK_CENTS
+                   for bs, px, n in est_own)
+    return real_bid and real_ask
 
 
 # ----------------------------------------------------------------------------
@@ -2668,6 +2850,47 @@ class Alerter:
 # Market metadata & bot state
 # ----------------------------------------------------------------------------
 
+def _fill_weighted_exposure(orders, yes_levels, no_levels,
+                            volume_24h: float, own_in_book: bool) -> float:
+    """$ exposure of resting orders weighted by how likely each is to be
+    BOUGHT UP: order dollars x (1 + min(side_flow / queue_ahead, 3)).
+
+    queue_ahead = book size at strictly better prices on the order's own
+    book, plus the size already resting AT its price (we join behind;
+    when the orders are already in the book, at-price size includes us,
+    so our own count is not double-added). side_flow = volume_24h / 2
+    (Kalshi volume counts contracts once per trade; flow splits across the
+    two books roughly evenly). A 1c pad has the whole book ahead of it ->
+    factor ~1x (collateral only); an at-touch lot on a book that churns
+    daily -> up to 4x. This is a fill-INTENSITY weighting, not a fill
+    probability: it still ignores adverse direction and intra-level queue
+    position beyond join-behind. Returns 0 when volume_24h is unknown so
+    callers can fall back to plain collateral."""
+    if volume_24h <= 0:
+        return 0.0
+    side_flow = volume_24h / 2.0
+    # cumulative size at price >= p per book (levels are [px, qty], ascending)
+    def ahead(levels, px, own_count):
+        at_or_better = sum(q for lp, q in levels if lp >= px)
+        at_price_incl_self = at_or_better  # joins behind everything resting
+        if not own_in_book:
+            at_price_incl_self += own_count   # overlay adds us to the queue
+        return max(at_price_incl_self, 1.0)
+    total = 0.0
+    for side, yes_px, count in orders:
+        if count <= 0:
+            continue
+        if side == "bid":
+            cost = yes_px / 100.0
+            q_ahead = ahead(yes_levels, yes_px, count)
+        else:                       # ask = NO buy at (100 - yes_px)
+            cost = (100 - yes_px) / 100.0
+            q_ahead = ahead(no_levels, 100 - yes_px, count)
+        fill_factor = min(side_flow / q_ahead, 3.0)
+        total += count * cost * (1.0 + fill_factor)
+    return total
+
+
 @dataclass
 class MarketMeta:
     ticker: str
@@ -2687,6 +2910,16 @@ class MarketMeta:
     est_frac: float = 0.0               # estimated pool share with our ladder resting
     est_dollars_per_day: float = 0.0    # est_frac x pool rate
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
+    # set by _estimate_candidate_yield alongside est_frac; consumed by the
+    # quote-gaps email's earnings-per-$-of-exposure ranking (Jack 2026-08-12)
+    est_collateral_dollars: float = 0.0  # $ the modeled ladder (incl. pads) ties up
+    book_depth_contracts: float = 0.0    # total resting contracts on both books
+    volume_24h: float = 0.0              # market's 24h volume (set by callers that know it)
+    # collateral weighted by per-order FILL INTENSITY: each order's $ scaled by
+    # (1 + min(side_vol24h / queue_ahead_incl_self, 3)). An at-touch lot on a
+    # busy book counts ~4x its collateral (it WILL be bought); a 1c pad counts
+    # ~1x (the whole book stands ahead of it). 0 when volume_24h unknown.
+    est_exposure_dollars: float = 0.0
     # observed deep-reference size multipliers (atref mode), set by the
     # candidate estimator — the collateral reservation must scale rung sizes
     # by these or the budget under-reserves up to 2x (2026-08-02 audit)
@@ -3540,6 +3773,16 @@ class IncentiveMarketMaker:
             # string; the resolver's live schedule + _screen govern.
             if series_of(t) in SCHEDULE_RESOLVED_SERIES:
                 return False
+            # Mention-family tickers may embed a LISTING date (26AUG13
+            # ran to Sep 4 — the 2026-08-14 listing-date fix): the string
+            # alone cannot tell, so they always hydrate and the real
+            # cutoff (trade_cutoff_utc, which sees expected_expiration)
+            # decides in _screen. Without this, the fixed cutoff never
+            # runs: this pre-filter dropped KXTRUMPMENTION-26AUG13 at
+            # td+24h before trade_cutoff_utc saw it — the same rule
+            # duplicated one layer up (the 7/14 class, again).
+            if any(series_of(t).endswith(suf) for suf in ALLOW_SERIES_SUFFIXES):
+                return False
             td = parse_event_date(t)
             return td is not None and now_utc >= td + timedelta(hours=24)
 
@@ -3692,7 +3935,8 @@ class IncentiveMarketMaker:
             # evicting: `pts` only refreshes on a new HIGH, so a declining
             # estimate lets the peak expire and then one low reading is
             # enough. The explicit dip guard below is what actually holds.
-            est_total = meta.est_dollars_per_day * _quotable_days(meta, now_utc)
+            qdays = _quotable_days(meta, now_utc)
+            est_total = meta.est_dollars_per_day * qdays
             peak, pts = self._est_peak.get(meta.ticker, (0.0, 0.0))
             if now_ts - pts > EST_PEAK_TTL_SECS:
                 peak = 0.0
@@ -3744,7 +3988,8 @@ class IncentiveMarketMaker:
                     and meta.event_ticker not in prev_events \
                     and meta.event_ticker not in FORCE_EVENTS \
                     and meta.est_dollars_per_day < series_min_est_rate(meta.series) \
-                    and (accrued + max(est_total, peak)) < RATE_FLOOR_TOTAL_ALT:
+                    and rate_floor_projected(accrued, est_total, peak, qdays) \
+                    < RATE_FLOOR_TOTAL_ALT:
                 # Rate-floored only when the market ALSO fails the horizon
                 # escape. The projected total uses the same quantity as the
                 # payout floor below (accrued + best of current/1h-peak) so the
@@ -3912,6 +4157,8 @@ class IncentiveMarketMaker:
         except Exception:
             return False
         yes_levels, no_levels = orderbook_levels(ob)
+        meta.book_depth_contracts = (sum(q for _px, q in yes_levels)
+                                     + sum(q for _px, q in no_levels))
         ext_b, ext_a = external_best(yes_levels, no_levels)
         # Same qualification gate the quote loop applies (Jack 2026-08-05).
         # It has to be here as well or selection keeps RANKING markets the
@@ -3937,6 +4184,12 @@ class IncentiveMarketMaker:
                 yes_levels, no_levels, own_live,
                 meta.target_size, meta.discount_factor, own_in_book=True)
             n_contracts = sum(r for _s, _p, r in own_live)
+            meta.est_collateral_dollars = sum(
+                r * ((px if s == "bid" else 100 - px) / 100.0)
+                for s, px, r in own_live)
+            meta.est_exposure_dollars = _fill_weighted_exposure(
+                own_live, yes_levels, no_levels, meta.volume_24h,
+                own_in_book=True)
         else:
             lv = hour_scaled_levels(meta.series, datetime.now(timezone.utc))
             ext_bid, ext_ask, ref_bid_px, ref_ask_px = ext_b, ext_a, rb, ra
@@ -3998,6 +4251,14 @@ class IncentiveMarketMaker:
                 yes_levels, no_levels, overlay,
                 meta.target_size, meta.discount_factor, own_in_book=False)
             n_contracts = sum(q.count for q in quotes)
+            # Pads INCLUDED here (unlike n_contracts): a 1c filler still ties
+            # up real collateral, and the $-of-exposure ranking must see it.
+            meta.est_collateral_dollars = sum(
+                c * ((px if s == "bid" else 100 - px) / 100.0)
+                for s, px, c in overlay)
+            meta.est_exposure_dollars = _fill_weighted_exposure(
+                overlay, yes_levels, no_levels, meta.volume_24h,
+                own_in_book=False)
         self._coverage(meta.ticker, sides == 2)   # observability only (see _coverage)
         meta.est_frac = frac
         meta.est_dollars_per_day = frac * meta.dollars_per_day
@@ -4072,6 +4333,10 @@ class IncentiveMarketMaker:
                    # program gets no orders either — quotes exist only where
                    # rent exists. Empty programmed set = failsafe open.
                    and (not self.state.programmed or t in self.state.programmed)
+                   # CALL-WINDOW FREEZE (Jack 2026-08-06: "sit out completely
+                   # during call windows"). Same treatment as blocklisted —
+                   # positions ride to settlement, flatten by hand.
+                   and not self._call_window_started(self._event_of(t))
                    # only restore inventory that is genuinely OURS — a manual
                    # position on a once-quoted market is the user's business
                    and abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
@@ -4104,6 +4369,34 @@ class IncentiveMarketMaker:
                     close_time=parse_iso_utc(m.get("close_time", "")))
                 log(f"{self.tag} restored orphan position market {t} "
                     f"(pos {positions.get(t, 0):+.0f}, reduce-only)")
+
+    @staticmethod
+    def _call_window_started(event_ticker: str,
+                            now_utc: Optional[datetime] = None) -> bool:
+        """True once a scheduled call/disclosure has begun for this event, so
+        the market must carry NO orders at all — not even reduce-only
+        wind-down (Jack 2026-08-06: "sit out completely during call windows").
+
+        This cannot be left to the cutoff. The selection path resolves a call
+        time via resolver.resolve(), but restore_orphan_metas builds its
+        cutoff from trade_cutoff_utc() alone, which knows nothing about
+        EVENT_START_OVERRIDES — so KXEARNINGSMENTIONDKNG-26AUG07, whose call
+        ran 16:00 ET on Aug 6, fell back to midnight-ET-of-Aug-7 and kept 7
+        reduce-only orders resting 1.2h into the live call.
+
+        Scoped to events with an EVENT_START_OVERRIDES entry (earnings calls
+        and disclosure releases) on purpose. Series with no scheduled start —
+        rates, gas, rain — keep their wind-down: freezing those would strand
+        inventory at settlement instead of working it out, which is a P&L
+        change nobody asked for.
+        """
+        start = EVENT_START_OVERRIDES.get(event_ticker)
+        if start is None:
+            return False
+        now = now_utc or datetime.now(timezone.utc)
+        # buffer included: orders are supposed to be GONE this many minutes
+        # before the call, so the freeze has to bite inside the buffer too
+        return now >= start - timedelta(minutes=OVERRIDE_BUFFER_MIN)
 
     @staticmethod
     def _event_of(ticker: str) -> str:
@@ -4371,6 +4664,11 @@ class IncentiveMarketMaker:
                 # NO-RENT FREEZE: the market's incentive program ended, so
                 # wind-down quoting ends with it (Jack 2026-07-26, KXRT).
                 # Re-programming re-admits it through normal selection.
+                self.state.managed_extra.pop(t, None)
+            elif self._call_window_started(meta.event_ticker, now_utc):
+                # CALL-WINDOW FREEZE: the scheduled call has begun. Drop the
+                # meta so the market goes unmanaged and the stray-order sweep
+                # cancels whatever is still resting on it.
                 self.state.managed_extra.pop(t, None)
             elif abs(positions.get(t, 0.0)) < REDUCE_ONLY_MIN_CONTRACTS:
                 self.state.managed_extra.pop(t, None)
@@ -4898,7 +5196,22 @@ class IncentiveMarketMaker:
                 f"{pos:.1f},{own_pos:.1f},{meta.dollars_per_day:.2f},"
                 f"{sum(q.count for q in mq)}\n")
             if t in self.state.selected and not reduce_only and not fast_only:
-                if frac <= 0.0 and mq:
+                # 2026-08-06: this read `frac <= 0.0 and mq`. `frac` is scored
+                # from est_own (our RESTING orders) but the guard tested `mq`
+                # (our DESIRED quotes), so an outage / failsafe cancel-all /
+                # rejected placement struck every selected market every cycle
+                # and benched 293 of 471 candidates against healthy books
+                # (Kalshi maintenance 07:16-09:00Z, cancel-all 07:18:44Z, 307
+                # benches 07:45:59-08:13:29Z, selected 390 -> 31, est reward
+                # ~$404/day -> ~$159/day). Judge the list that produced frac,
+                # and never during wake grace (post-sleep reads "can SUCCEED
+                # with garbage", see the grace comment above) — the one gate
+                # standoffs and universe selection already had and this counter
+                # never did. See zero_share_strike_counts.
+                # The `else` RESETS rather than pauses: the new condition is
+                # strictly narrower, so a flapping outage lands in it on every
+                # untrusted cycle and cannot bank strikes across good ones.
+                if mq and not in_grace and zero_share_strike_counts(frac, est_own):
                     streak = self.state.zero_share_streak.get(t, 0) + 1
                     self.state.zero_share_streak[t] = streak
                     if streak >= QUALIFY_PATIENCE_CYCLES:
@@ -4907,9 +5220,16 @@ class IncentiveMarketMaker:
                         self.cancel_market_orders(t, resting)
                         self.state.selected.pop(t, None)
                         desired = [q for q in desired if q.ticker != t]
+                        # "book below target size?" was dead code — that case
+                        # is cancelled and `continue`d by sides_can_qualify
+                        # long before it can reach the counter. State what the
+                        # condition now actually proves, with the numbers.
                         self.alerter.alert(
-                            "benched", f"{t}: zero reward share {QUALIFY_PATIENCE_CYCLES} "
-                            f"cycles (book below target size?); benched "
+                            "benched", f"{t}: our non-pad size RESTING on both "
+                            f"sides and still zero reward share for "
+                            f"{QUALIFY_PATIENCE_CYCLES} cycles ({sides} side(s) "
+                            f"qualify; yes {depth_yes:.0f} / no {depth_no:.0f} "
+                            f"vs target {meta.target_size:.0f}); benched "
                             f"{BENCH_COOLDOWN_SECS // 3600}h", key=t, urgent=False)
                 else:
                     self.state.zero_share_streak.pop(t, None)

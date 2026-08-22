@@ -309,12 +309,123 @@ separate module, a separate `terminal_prob()` (Black-Scholes N(d2), r=0, MC-vali
   BTC / SOL / ETH / XRP.
 - ZEC lists no `KXZECD` events (configured anyway; it idles).
 - Files: `crypto_updown_mm.py`, `test_crypto_updown_mm.py`, `run_crypto_updown_mm.ps1`,
-  `run_crypto_updown_mm_hidden.vbs`. No scheduled tasks registered yet — the pilot is started
-  by hand (see Quick commands); register tasks once it has run clean for a session.
+  `run_crypto_updown_mm_hidden.vbs`. Tasks `KL crypto_updown_mm {ASSET}` ×7 registered
+  2026-08-08 (weekly cadence), watchdog-covered since 8/8, battery-safe since 8/9.
+- **Daily tenor live 2026-08-14** (Jack "turn daily on live at 1/1/1 ladder"):
+  cadence `daily,weekly`, with **per-tenor ladder overrides** (size + levels +
+  offset tables, env `CUD_*_DAILY`) while weekly keeps its doubled 2/2/2 @3c. The
+  side/level backstops in `place_with_side_cap` stay derived from the largest shape
+  (6/side); the per-event ladder build enforces the tenor's shape.
+- **Daily resized 2026-08-16** (Jack "daily crypto bot is losing"): first two
+  settles −110.93, **−105 of it KXBTCD near-money strikes** picked off from both
+  sides at the print (other six assets ±$2). Daily is now a **1/1 ladder (two
+  1-contract rungs) 4c off fair** — the offset is the MINIMUM edge; join-don't-lead
+  still caps at the touch, so the extra cent holds us 1c behind touches the 3c
+  ladder used to join in the pick-off zone. Rolled out by killing the 7 pythons
+  only (launchers respawn with new code; tasks never leave Running — the clean
+  path for code-only changes). Banner shows `ladder 3x2 (daily 2x1 @4c)`.
+- **Daily defenses 2026-08-17** (fill autopsy first: per-fill P&L by hours-to-close
+  showed the bleed spread across the WHOLE day — worst 12–18h out, the overnight
+  session — with the final hour actually positive, 3.3x heavier on the NO side,
+  all of it BTC; i.e. drift/momentum against the driftless fair, not
+  settlement-window gamma. All three daily-only; weekly/annual pinned untouched):
+  1. **Inventory skew** — the QUOTING fair (never the divergence-guard fair)
+     shifts against the event's net position, ±4c saturating at 25 contracts
+     (`SKEW_BY_CADENCE`, env `CUD_SKEW_*_DAILY`). Short YES ⇒ both sides lift:
+     stop re-offering cheap, bid toward buying back. **Event net is ACCOUNT
+     net** — a manual position could otherwise pin the skew and thin the bot's
+     edge to 0-2c while fading Jack's own bet (adversarial review), so the
+     thinned side keeps ≥ `CUD_SKEW_EDGE_FLOOR` (3c) of edge: effective skew
+     ±3c on BTC daily, ±1c elsewhere, plus a `skew_saturated` digest alert.
+  2. **Momentum stand-down** — 1h log-return beyond 1.5×σ₁ₕ (σ_d/√24) blocks the
+     FADING side (asks in an up-move) for 1800s past the last trigger
+     (`CUD_MOMO_*`; heartbeat shows `momo_blocked`/`last_ret_1h`). The 1h-ago
+     reference is the close of the latest **5m candle** that closed ≥1h ago:
+     Kraken stamps candles with OPEN times, and an hourly-candle filter
+     anchored the reference to the top of the CURRENT hour — a 0-60min window,
+     blind after every boundary (adversarial review caught it; test pins the
+     convention). |ret|>1.0 is treated as a data inconsistency (candle-vs-spot
+     source slip) and ignored — a guard must never act on broken data.
+  3. **Per-asset offset** — `KXBTCD` daily quotes 6c off fair
+     (`QUOTE_OFFSET_BY_ASSET_CADENCE`, env `CUD_QUOTE_OFFSET_DAILY_BTC`); the six
+     benign assets stay at 4c.
+  Startup logs a `=== defenses: ... ===` line after the banner.
+- **BTC daily to a SINGLE rung 2026-08-18** (Jack "do 1 only on BTC, keep 1/1 on
+  others"): `NUM_LEVELS_BY_ASSET_CADENCE {("BTC","daily"): 1}` (env
+  `CUD_NUM_LEVELS_DAILY_BTC`); daily default stays 2 rungs × 1. So BTC daily =
+  one 1-lot quote per side at 6c min-edge with ±3c skew and the momentum guard;
+  the other six = two 1-lot rungs at 4c with ±1c skew.
+- **Tenor-collision guard** (Jack 2026-08-14 "do not let it collide with weekly"):
+  `select_events` drops any event whose end is within `TENOR_COLLISION_SECS` (300s)
+  of a LONGER-tenor selected event's end — same settlement print, same bet, quoted
+  once at the longer tenor's size. Concretely: Fridays the 5pm close IS the weekly
+  event (no separate daily lists — verified live), Saturday's daily lists Friday
+  ~5pm and quotes on its own print; and if Kalshi ever double-lists a Friday-close
+  daily it stands down automatically. Generalizes to hourly (the 5pm hourly shares
+  the daily/weekly print every day) should hourly ever be enabled.
+  Switch applied via `enable_updown_daily.bat` (elevated): stop 7 tasks → kill
+  surviving chains (status-file PIDs + cmdline sweep, claude.exe ancestries
+  skipped) → re-register with `daily,weekly` → start → banners must say
+  `cadence=daily,weekly` and `ladder 3x2 (daily 3x1)`.
+
+## Annual variant (`crypto_annual_mm.py`, v1.0 — built 2026-08-13)
+
+One bot per asset (8: BTC/ETH/SOL/XRP/DOGE/BNB/HYPE/ZEC) quoting THREE annual series
+concurrently, with the model chosen **by series, never by strike_type**:
+
+| series | product | model |
+|---|---|---|
+| `KX{A}MAXY` | "how high this year" — settles EARLY on touch | `crypto_touch_mm.touch_prob` (max) |
+| `KX{A}MINY` | "how low this year" — settles EARLY on touch | `touch_prob` (min) |
+| `KX{A}Y` | terminal end-of-year price (SOL: **`KXSOLD26`**) | `crypto_updown_mm.terminal_prob` |
+
+Subclasses `UpDownMarketMaker` (multi-event plumbing, divergence guard, budget
+sharing) which itself rides on the monthly bot's ledger/caps/fail-safe machinery.
+What's new here:
+
+- **Terminal rung shapes**: `greater` (T-rung upper tail), `less` (T-rung LOWER tail
+  — new; YES = ends below cap_strike), `between` (B-rung buckets, floor+cap; fair =
+  `terminal_prob(floor) − terminal_prob(cap)`, telescopes to 1 over a full ladder —
+  pinned by test). Census 2026-08-13: 131 between / 16 greater / 7 less / 91 touch,
+  **0 unpriceable** across all 245 open annual markets.
+- **"annual" cadence** added to `crypto_updown_mm.classify_cadence` (window >
+  `CUD_WEEKLY_MAX_HOURS` = 400h). Annual events run ~8700h from their January open.
+- **YTD breach guard** (touch families only): a strike whose measurement window the
+  year's realised extreme already crossed is settled money in settlement lag — never
+  quoted (`breach` alert, digest-level). Window = the MARKET's own `open_time`
+  (rules: measurement runs "from market issuance" — a rung listed in March is NOT
+  touched by a February spike). Extremes = daily candles (in-progress candle
+  included) + session live-price extremes + current spot. Caught a live one on day
+  one: `KXZECMAXY-...-53000` open with YTD hi 537.37.
+- **Model risk over ~5 months is the point of the guards**: driftless GBM understates
+  fat tails badly at this horizon, so the 10-90c band + 15c fair-vs-mid divergence
+  stand-down + join-don't-lead do the protecting. Observed on day one: our touch
+  fairs sit consistently BELOW deep two-sided market mids (e.g. BTC MINY 44c vs 58c
+  book) — where >15c apart, the bot stands down rather than take the view.
+- **Account positions count toward caps**: the IMM's frozen KXBNBMAXY inventory
+  (+25/−26/−13) shows up as `net=-14` on the BNB bot. Deliberate — caps bound the
+  ACCOUNT per market. incentive_mm **blocklists all annual crypto series** as of
+  2026-08-13 (same arrangement as MAXMON/MINMON; its yearly-pair allowlist entry
+  retired). NB the running IMM picks that up on its next restart.
+- Pilot: 3×1 ladder, 3c off fair, 2c apart, band 10-90c, ≤8 mkts/event, caps
+  40/200/400 (mkt/event/asset), poll 60s, idle 600s, prefix `cay-`, env `CAY_*`,
+  status `run-logs\crypto-annual`. Pinned by `test_crypto_annual_mm` (32 tests).
+- Ops: tasks `KL crypto_annual_mm {ASSET}` ×8 via `register_annual_tasks.bat` (one
+  elevated double-click; **refuses while tasks are Running** — 8/9 lesson), launcher
+  `run_crypto_annual_mm.ps1` + hidden VBS, watchdog covers `KL crypto_annual_mm *`,
+  digest has an Annual section (`fleet_entries(ANNUAL_STATUS_DIR)`).
+- HYPE MAXY/MINY list nothing (idles). HYPE `KXHYPEY` prices all rungs <10c at its
+  73%-annualized vol → correctly quotes nothing at pilot band settings.
 
 ## Quick commands
 
 ```powershell
+# --- annual variant ---
+python crypto_annual_mm.py --discover                       # all open annual events
+python crypto_annual_mm.py --asset BTC --once               # dry run, one cycle
+python crypto_annual_mm.py --asset BTC --cancel-all
+python -m unittest test_crypto_annual_mm
+
 # --- above/below variant ---
 python crypto_updown_mm.py --discover                       # all open events, all tenors
 python crypto_updown_mm.py --asset BTC --cadence all --once  # dry run, one cycle

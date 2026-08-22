@@ -129,7 +129,69 @@ if ($Probe) {
     # IMM_FORCE_EVENTS emptied in the same edit: it held KXTRUMPMENTION-26AUG05
     # (the Aug 18 program-period data bug), which the block makes moot — and a
     # force entry for a blocked series reads like a contradiction later.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXTRUMPMENTION,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=75&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&&"
+    # KXMAMDANIMENTION BLOCKED 2026-08-05 pm (Jack: "yes blocklist this").
+    # THE POOL IS FINE — the CLOCK is broken. Do not read this as a bad-pool
+    # block. MEASURED: 14 programs, one per market, $100.00/market over
+    # 2026-08-05T19:00Z -> 2026-08-27T14:00Z (21.79d) = $4.59/day/market,
+    # $1,400 event pool; cycle_log_2026-08-05.csv carries pool_per_day=4.59 in
+    # all 1,856 MAMDANI rows. That is a healthy pool, mid-pack on yield.
+    # THE DEFECT: trade_cutoff_utc()/parse_event_date() (incentive_mm.py:1939,
+    # :1685) read the "26AUG06" ticker segment as the EVENT date and cut the bot
+    # out at 2026-08-06T04:00Z. MEASURED: Kalshi's own close_time and
+    # expiration_time for these strikes are 2026-08-27T14:00:00Z. For these
+    # political-mention series the ticker date is a LISTING date, not a
+    # resolution date, so the bot plays ~9h of a 22-day program. Note
+    # expected_expiration cannot rescue it: it is only consulted inside the
+    # event_day_cutoff_et override branch, and min() can only pull the cutoff
+    # EARLIER — a series with no override gets the raw ticker date as a ceiling.
+    # CONSEQUENCE: est_peak projects $0.37-$0.87/market, all under the $1.00
+    # per-market Kalshi floor => expected credit $0.00 x 14 (modelled).
+    # So the block is correct WHILE THE CUTOFF BUG EXISTS, and should be
+    # revisited the moment it is fixed. This heuristic was right until ~late
+    # July: of 276 historical MENTION events the median program is 1.05d and
+    # only 11 exceed 5d. Kalshi started issuing 16-24d mention programs.
+    # SAME BUG, OPPOSITE SIGN — currently costing us money in the other
+    # direction: KXTRUMPMENTIONB-26AUG04 ($2,500 pool, ~20.7d left) and
+    # KXTRUMPMENTION-26AUG05 ($3,300, ~14.7d left) are LIVE programs the bot
+    # cannot touch because their ticker cutoff already passed. ~$5,800 of pool
+    # sitting idle. Fixing the cutoff is worth more than any blocklist entry.
+    # IMM_BENCH_COOLDOWN 4h -> 1h (Jack 2026-08-06: "bench only 1hr instead of
+    # 4hr going fwd"). The bench fires on 30 consecutive ZERO-reward-share
+    # cycles (:4905), which measures OUR resting size — so it cannot tell "this
+    # book can't earn" from "we had no orders up". MEASURED that morning:
+    # Kalshi went down for maintenance ~07:16-09:00Z (19,949 503s in hour 07Z,
+    # 18,737 in 08Z, 13 in 09Z); the failsafe cancelled every order at
+    # 07:18:44Z after 4 consecutive cycle errors; with nothing resting, all 307
+    # bench events fired 07:45:59-08:13:29Z — exactly 30 cycles later at the
+    # degraded ~54s/cycle. That benched 293 of 471 candidates and cut selected
+    # 390 -> 31 and est reward ~$404 -> ~$159/day for four hours, none of it a
+    # statement about the markets. 1h caps the blast radius of any future
+    # outage at ~1/4 the lost quoting time. NOT the root fix: the real bug is
+    # that zero-share strikes accrue while the bot has no orders up through no
+    # fault of the book. bench_until is in-memory only (:2707/:4190/:4905, not
+    # in _save_persist), so a restart also clears the whole bench instantly.
+    # KXEARNINGSMENTIONAC blocked 2026-08-06: imm_earnings_overrides.py reports
+    # it UNRESOLVED, so the event has no call-time guard and falls back to
+    # midnight-ET-of-ticker-date (26AUG12). That fallback is NOT safe -- a call
+    # KXEARNINGSMENTIONAC unblocked 2026-08-07 (Jack "yes"): call time found in
+    # Air Canada's own media advisory — analyst call 8:00 AM ET Wed Aug 12 —
+    # and set as an event_start_override, so the stand-down fires 07:50 ET.
+    # The AC scraper gap is structural (TSX listing, Nasdaq-derived calendar):
+    # any non-US name will come up UNRESOLVED and needs a manual --set.
+    # KXMAMDANIMENTION unblocked same day (Jack "allowlist KXMAMDANIMENTION").
+    # Its announcement times are BROADCAST UNRESOLVED, so the call-window
+    # freeze cannot protect those events — quoting runs on ticker-date cutoff
+    # alone, and the OPEN parse_event_date listing-date bug is unpatched again.
+    # FORCE_EVENTS (Jack 2026-08-07 "should also be quoted across markets"):
+    # NCLH/FSLR held only reduce-only orphan positions, which do NOT count as
+    # sticky membership — so their events ranked as NEW and the $2/day
+    # re-entry rate floor excluded every sibling strike (books are 6k-26k deep
+    # vs target 1000; our 20-contract share estimates in pennies/day).
+    # Forcing bypasses the floors + hopeless exit ONLY — cutoff, bands, caps
+    # and budget still apply. DKNG entry is self-limiting (stand-down 08:20
+    # ET 8/7 = call 08:30 minus the 10-min override buffer, settles same
+    # day); prune it on the next touch.
+    $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=75&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 
 while ($true) {

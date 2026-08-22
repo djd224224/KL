@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import incentive_mm as imm
 
@@ -45,6 +46,14 @@ def setUpModule():
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
+    # The suite must never SMTP the user. Pre-existing hazard, noticed while
+    # fixing the 2026-08-06 bench bug: TestWatchdog.test_selected_but_not_
+    # resting_pages fires alerter.alert(..., urgent=True) with no stub, so on
+    # any shell with ALERT_EMAIL_FROM/PASSWORD set (the trading box has them)
+    # every `python -m unittest test_incentive_mm` sent a real watchdog page to
+    # jackdu224@gmail.com. Nothing about the alert LOGIC is stubbed here —
+    # alerter.today still records every alert, which is what tests assert on.
+    imm.ALERT_RECIPIENTS = []
 
 
 def _clean_persist():
@@ -61,6 +70,7 @@ from incentive_mm import (
     estimate_reward_share, _side_share, build_side_ladder, skewed_side_room,
     diff_orders, ladder_collateral_dollars,
 )
+from KalshiClientsBaseV2ApiKey_FIXED import HttpError
 
 
 def utc(y, mo, d, h=0, mi=0):
@@ -118,12 +128,77 @@ class TestTradeCutoff(unittest.TestCase):
         self.assertIsNone(trade_cutoff_utc("KXBOND-30", occ, exp))
 
     def test_min_of_both(self):
-        occ, exp = utc(2026, 7, 12), utc(2026, 8, 1)
+        # exp within the listing-gap bar so the ticker date stays a candidate
+        # (a 21d exp on a MENTION ticker now means "listing date" — see below)
+        occ, exp = utc(2026, 7, 12), utc(2026, 7, 13)
         cut = trade_cutoff_utc("KXWCMENTION-26JUL11ARGSUI", occ, exp)
         self.assertEqual(cut, parse_event_date("KXWCMENTION-26JUL11ARGSUI"))
 
     def test_none(self):
         self.assertIsNone(trade_cutoff_utc("KXBOND-30", None, None))
+
+
+class TestListingDateCutoff(unittest.TestCase):
+    """2026-08-14 fix: long-window mention programs embed the LISTING date in
+    the ticker (KXMAMDANIMENTION-26AUG14 ran to Sep 4). When the market's own
+    expiration proves that, the whole window is quotable and the cutoff is the
+    expiration itself — NOT None, which would trip _screen's no_event_window
+    stand-down for mention-family series."""
+
+    def test_mamdani_listing_window_quotes_to_expiration(self):
+        exp = utc(2026, 9, 4, 14)
+        cut = trade_cutoff_utc("KXMAMDANIMENTION-26AUG14", None, exp)
+        self.assertEqual(cut, exp)
+
+    def test_occurrence_still_wins_on_listing_dated_event(self):
+        occ, exp = utc(2026, 8, 20, 15), utc(2026, 9, 4, 14)
+        cut = trade_cutoff_utc("KXMAMDANIMENTION-26AUG14", occ, exp)
+        self.assertEqual(cut, occ)
+
+    def test_same_day_mention_keeps_ticker_cutoff(self):
+        # earnings-mention settles on call day: gap under the bar
+        exp = utc(2026, 8, 8, 20)
+        cut = trade_cutoff_utc("KXEARNINGSMENTIONDKNG-26AUG07", None, exp)
+        self.assertEqual(cut, parse_event_date("KXEARNINGSMENTIONDKNG-26AUG07"))
+
+    def test_non_mention_long_gap_keeps_ticker_cutoff(self):
+        # only the mention family may flip: an event-dated series with a long
+        # verification window keeps failing toward quoting LESS
+        exp = utc(2026, 10, 15)
+        cut = trade_cutoff_utc("KXDEBATE-26SEP15", None, exp)
+        self.assertEqual(cut, parse_event_date("KXDEBATE-26SEP15"))
+
+    def test_no_expiration_keeps_ticker_cutoff(self):
+        # no expiration = no proof of a listing date: conservative reading
+        cut = trade_cutoff_utc("KXMAMDANIMENTION-26AUG14", None, None)
+        self.assertEqual(cut, parse_event_date("KXMAMDANIMENTION-26AUG14"))
+
+
+class TestListingDatedMentionSelection(unittest.TestCase):
+    """End-to-end guard for the 24h ticker PRE-FILTER (the third copy of the
+    listing-date assumption): KXTRUMPMENTION-26AUG13 was pre-dropped on the
+    ticker string at td+24h before the fixed trade_cutoff_utc ever saw it.
+    A mention market with a PAST ticker date and a far expiration must
+    hydrate, select, and carry cutoff = expiration."""
+
+    def test_past_ticker_date_mention_with_far_expiration_selects(self):
+        _clean_persist()
+        client = FakeClient()
+        now = datetime.now(timezone.utc)
+        ev = "KXFOOMENTION-" + (now - timedelta(days=10)).strftime("%y%b%d").upper()
+        t = ev + "-AI"
+        exp = (now + timedelta(days=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs = [dict(client.programs[0], market_ticker=t, end_date=exp)]
+        client.markets = {t: dict(client.markets["KXGOOD-99DEC31-A"], ticker=t,
+                                  event_ticker=ev, close_time=exp,
+                                  expected_expiration_time=exp)}
+        client.books = {t: {"orderbook_fp": {
+            "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+            "no_dollars": [["0.49", "1200"]]}}}
+        bot = IncentiveMarketMaker(client=client, live=False)
+        bot.run_cycle()
+        self.assertIn(t, bot.state.selected)
+        self.assertEqual(bot.state.selected[t].cutoff, imm.parse_iso_utc(exp))
 
 
 # ----------------------------------------------------------------------------
@@ -967,6 +1042,18 @@ class TestBlocklist(unittest.TestCase):
         self.assertTrue(b("KXHIGHNY-26JUL10-B90"))
         self.assertFalse(b("KXWCMENTION-26JUL11ARGSUI-VAR"))
 
+    def test_annual_crypto_blocked(self):
+        # crypto_annual_mm.py's book as of 2026-08-13 — all three annual
+        # families, same arrangement as *MAXMON/*MINMON (same-account STP).
+        b = IncentiveMarketMaker._blocked
+        self.assertTrue(b("KXBTCMAXY-26DEC31-109999.99"))
+        self.assertTrue(b("KXBNBMAXY-BNB-26DEC31-64000"))
+        self.assertTrue(b("KXHYPEMINY-HYPE-26DEC31-30"))
+        self.assertTrue(b("KXBTCY-27JAN0100-B122500"))
+        self.assertTrue(b("KXSOLD26-27JAN0100-T249.99"))
+        # KXSOLD26 must be blocked WITHOUT eating KXSOLDATHOLDINGS
+        self.assertFalse(b("KXSOLDATHOLDINGS-26AUG14-T2500000"))
+
 
 class TestAllowlist(unittest.TestCase):
     def setUp(self):
@@ -983,15 +1070,18 @@ class TestAllowlist(unittest.TestCase):
 
     def test_crypto_series_exact(self):
         a = IncentiveMarketMaker._allowed
-        self.assertTrue(a("KXBTCMAXY-26-T150"))
         self.assertTrue(a("KXCHINAUNBANBTC-26JUL08-30JAN01"))
-        # yearly pairs for the newer fleet assets (2026-07-22)
-        self.assertTrue(a("KXBNBMAXY-BNB-26DEC31"))
-        self.assertTrue(a("KXHYPEMINY-HYPE-26DEC31"))
-        self.assertTrue(a("KXZECMAXY-ZEC-26DEC31"))
+        self.assertTrue(a("KXCRYPTORETURNY-27JAN01-BTC"))
         # the fleet's MONTHLY series must stay excluded (same-account STP)
         self.assertFalse(a("KXBNBMAXMON-BNB-26JUL31-64000"))
         self.assertFalse(a("KXHYPEMINMON-HYPE-26JUL31-5250"))
+        # ... and since 2026-08-13 the ANNUAL series too: the yearly pairs
+        # (allowlisted 2026-07-22 while no fleet bot quoted them) are
+        # crypto_annual_mm.py's book now, out of the allowlist entirely.
+        self.assertFalse(a("KXBTCMAXY-26-T150"))
+        self.assertFalse(a("KXBNBMAXY-BNB-26DEC31"))
+        self.assertFalse(a("KXHYPEMINY-HYPE-26DEC31"))
+        self.assertFalse(a("KXZECMAXY-ZEC-26DEC31"))
 
     def test_company_metric_series(self):
         # 2026-08-02 RE-ENTRY (Jack): company family quotes again (freeze
@@ -2031,6 +2121,383 @@ class TestNasdaqRelease(unittest.TestCase):
             ieo._nasdaq_cache.clear()
 
 
+class TestUnknownEarningsTimeFailsSafe(unittest.TestCase):
+    """KXEARNINGSMENTIONCELH-26AUG06 (2026-08-06).
+
+    Nasdaq's earnings calendar carried NO time flag for Celsius, the resolver's
+    else-branch synthesized 16:00 ET, Celsius in fact reported BEFORE the open
+    with an 8:00am ET call, and the bot quoted 15 markets from midnight straight
+    through that call with the Q2 results already public. Jack stopped it by
+    hand at 12:31Z.
+
+    The two ways of being wrong are not symmetric, and this is the test that
+    pins the direction: guess before-open when the truth is after-close and the
+    bot stands down early, forfeiting a day of reward accrual; guess after-close
+    when the truth is before-open and the bot makes markets into a print."""
+
+    def setUp(self):
+        import imm_earnings_overrides as ieo
+        self.ieo = ieo
+        # the real run that wrote the bad value: 2026-08-02 16:45 ET
+        self.now = datetime(2026, 8, 2, 20, 45, tzinfo=timezone.utc)
+        ieo._nasdaq_cache.clear()
+        for i in range(9):                      # calendar known-empty by default
+            d = (self.now + timedelta(days=i)).astimezone(ieo.ET).date()
+            ieo._nasdaq_cache[d.isoformat()] = {}
+
+    def tearDown(self):
+        self.ieo._nasdaq_cache.clear()
+
+    def _on(self, days, **flags):
+        d = (self.now + timedelta(days=days)).astimezone(self.ieo.ET).date()
+        self.ieo._nasdaq_cache[d.isoformat()] = dict(flags)
+        return d
+
+    def test_no_time_supplied_lands_in_the_morning_not_after_the_close(self):
+        d = self._on(4, CELH="time-not-supplied")     # the literal CELH row
+        hit = self.ieo.nasdaq_release_datetime("CELH", self.now, 7)
+        self.assertIsNotNone(hit)
+        dt_et, label = hit
+        et = dt_et.astimezone(self.ieo.ET)
+        self.assertEqual((et.date(), et.hour), (d, 7))
+        # and it must be RECORDED as a guess: a fail-safe 07:00 and a measured
+        # pre-market 07:00 are byte-identical in the overrides file, so the
+        # label is the only channel the digest has for telling them apart.
+        self.assertEqual(self.ieo.provenance_of(label), "guess")
+
+    def test_a_missing_time_FIELD_is_the_same_guess(self):
+        # nasdaq_earnings_for_date does `row.get("time") or ""`, so an absent
+        # field arrives as "" — falsy but NOT None, so it clears the
+        # `if flag is None: continue` guard and reaches the same branch.
+        self._on(2, FOO="")
+        dt_et, label = self.ieo.nasdaq_release_datetime("FOO", self.now, 7)
+        self.assertEqual(dt_et.astimezone(self.ieo.ET).hour, 7)
+        self.assertEqual(self.ieo.provenance_of(label), "guess")
+
+    def test_the_failsafe_cutoff_bites_before_the_call_it_missed(self):
+        # end to end on the real numbers: 07:00 ET minus the bot's override
+        # buffer must land before Celsius's 8:00am ET call. The old 16:00 put
+        # the cutoff at 15:50 ET — nearly eight hours of quoting into the news.
+        self._on(4, CELH="time-not-supplied")
+        dt_et = self.ieo.nasdaq_release_datetime("CELH", self.now, 7)[0]
+        cutoff = dt_et - timedelta(minutes=imm.OVERRIDE_BUFFER_MIN)
+        self.assertLess(cutoff, self.ieo.ET.localize(datetime(2026, 8, 6, 8, 0)))
+
+    def test_measured_flags_are_untouched_and_count_as_measurements(self):
+        # the fail-safe must not swallow the 28 genuine after-close readings
+        self._on(1, AAA="time-after-hours", BBB="time-pre-market")
+        amc = self.ieo.nasdaq_release_datetime("AAA", self.now, 7)
+        bmo = self.ieo.nasdaq_release_datetime("BBB", self.now, 7)
+        self.assertEqual(amc[0].astimezone(self.ieo.ET).hour, 16)
+        self.assertEqual(bmo[0].astimezone(self.ieo.ET).hour, 7)
+        self.assertEqual(self.ieo.provenance_of(amc[1]), "read")
+        self.assertEqual(self.ieo.provenance_of(bmo[1]), "read")
+
+    def test_absent_from_the_calendar_is_still_None_not_a_guess(self):
+        # "not on the calendar" and "on the calendar without a time" are
+        # different unknowns and must not collapse into one another: None sends
+        # the event to the IR scrape and then to the UNRESOLVED email.
+        self.assertIsNone(self.ieo.nasdaq_release_datetime("NOPE", self.now, 7))
+
+
+class TestProvisionalGuessRecheck(unittest.TestCase):
+    """A fail-safe guess must stay OPEN until somebody measures it.
+
+    The `covered` short-circuit made every written value permanent. Nasdaq
+    filled CELH in as "time-pre-market" within days of guessing on it — the
+    right answer sat in the same endpoint the resolver already calls — and the
+    thirteen scheduled runs in between each skipped the event without a line of
+    log output. A measurement stays taken; a guess gets re-opened."""
+
+    EV = "KXEARNINGSMENTIONCELH-26AUG06"
+    GUESS = "2026-08-06T07:00:00-04:00"
+
+    def setUp(self):
+        import imm_earnings_overrides as ieo
+        self.ieo = ieo
+        self.dir = tempfile.mkdtemp(prefix="imm_meta_")
+        self.old_meta = ieo.OVERRIDE_META_FILE
+        ieo.OVERRIDE_META_FILE = os.path.join(self.dir, "meta.json")
+
+    def tearDown(self):
+        self.ieo.OVERRIDE_META_FILE = self.old_meta
+
+    def _meta(self, **rec):
+        with open(self.ieo.OVERRIDE_META_FILE, "w", encoding="utf-8") as f:
+            json.dump({self.EV: rec}, f)
+
+    def test_a_standing_guess_is_reopened(self):
+        self._meta(iso=self.GUESS, confidence="guess",
+                   label="time n/a->7am ET BMO assumed (Nasdaq, fail-safe)")
+        self.assertIn(self.EV,
+                      self.ieo.provisional_events({self.EV: self.GUESS}))
+
+    def test_a_measurement_is_never_reopened(self):
+        self._meta(iso=self.GUESS, confidence="read",
+                   label="before open (~7am ET, Nasdaq)")
+        self.assertEqual(self.ieo.provisional_events({self.EV: self.GUESS}),
+                         set())
+
+    def test_a_hand_set_supersedes_and_can_never_be_overwritten(self):
+        # Jack --set CELH to 07:00 at 08:41 on 2026-08-06. record_meta files a
+        # --set as a reading, which is what takes it out of the re-check pool.
+        self.ieo.record_meta([(self.EV, self.GUESS, "hand-set by operator")],
+                             {self.EV: self.GUESS})
+        self.assertEqual(self.ieo.load_meta()[self.EV]["confidence"], "read")
+        self.assertEqual(self.ieo.provisional_events({self.EV: self.GUESS}),
+                         set())
+
+    def test_a_guess_whose_value_moved_is_not_ours_to_move_again(self):
+        self._meta(iso=self.GUESS, confidence="guess", label="time n/a")
+        live = {self.EV: "2026-08-06T08:30:00-04:00"}     # somebody edited it
+        self.assertEqual(self.ieo.provisional_events(live), set())
+
+    def test_the_guess_label_survives_the_round_trip_as_a_guess(self):
+        # provenance_batch decodes the phase tuples; if the bracketed label is
+        # lost the guess silently records as a measurement and never re-checks.
+        rows = self.ieo.provenance_batch(
+            [(self.EV, self.GUESS, "nasdaq:CELH",
+              "call cutoff = earnings RELEASE [time n/a->7am ET BMO assumed "
+              "(Nasdaq, fail-safe)] (safe: call is at/after the release)")],
+            [], [], [])
+        self.ieo.record_meta(rows, {self.EV: self.GUESS})
+        self.assertEqual(self.ieo.load_meta()[self.EV]["confidence"], "guess")
+        self.assertIn(self.EV,
+                      self.ieo.provisional_events({self.EV: self.GUESS}))
+
+    def test_pruning_drops_events_the_overrides_file_no_longer_has(self):
+        self.ieo.record_meta([(self.EV, self.GUESS, "time n/a fail-safe")],
+                             {self.EV: self.GUESS})
+        self.ieo.record_meta([], {})              # event gone from the file
+        self.assertEqual(self.ieo.load_meta(), {})
+
+
+class TestDigestUnverifiedCallTimes(unittest.TestCase):
+    """send_imm_digest's CUTOFF AUDIT compares ET DATES. CELH's override date
+    (Aug 6) MATCHED its ticker date (Aug 6) and was wrong by nine HOURS, so the
+    audit skipped it at `if delta == 0: continue` and the 7:10am email said
+    nothing. These tests pin the hour dimension, and pin that it stays quiet."""
+
+    CELH = "KXEARNINGSMENTIONCELH-26AUG06"
+    ABNB = "KXEARNINGSMENTIONABNB-26AUG06"
+    BAD = "2026-08-06T16:00:00-04:00"          # what the resolver wrote
+
+    class _Client:
+        def __init__(self, events):
+            self.events = events
+
+        def get(self, path, params=None):
+            if "incentive_programs" not in path:
+                return {}
+            progs = []
+            for ev in self.events:
+                for i in range(2):
+                    progs.append({
+                        "incentive_type": "liquidity", "paid_out": False,
+                        "market_ticker": "{}-M{}".format(ev, i),
+                        "start_date": "2026-08-05T00:00:00Z",
+                        "end_date": "2026-08-07T00:00:00Z",
+                        "period_reward": 6000000})
+            return {"incentive_programs": progs, "next_cursor": None}
+
+    def setUp(self):
+        import send_imm_digest as sd
+        self.sd = sd
+        self.now = datetime(2026, 8, 6, 11, 0, tzinfo=timezone.utc)
+        self.old_meta = sd.OVERRIDE_META_PATH
+        self.dir = tempfile.mkdtemp(prefix="imm_digest_")
+        sd.OVERRIDE_META_PATH = os.path.join(self.dir, "meta.json")
+        self.client = self._Client([self.CELH, self.ABNB])
+
+    def tearDown(self):
+        self.sd.OVERRIDE_META_PATH = self.old_meta
+        self._overrides({})                       # unload from the live dict
+        imm.load_file_event_overrides()
+
+    def _overrides(self, data):
+        with open(imm.EVENT_OVERRIDES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        imm._file_override_state["mtime"] = 0.0
+
+    def _meta(self, data):
+        with open(self.sd.OVERRIDE_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def _audit(self, pos=None):
+        return self.sd.cutoff_audit(self.client, self.now,
+                                    pos or {self.CELH + "-M0": 240})
+
+    def _flat(self, a):
+        """The text block as one whitespace-normalized string. The block is
+        wrapped to 76 cols, so a phrase assertion on the raw join would break
+        purely on where a line happens to end."""
+        return " ".join(" ".join(self.sd._unverified_lines(a)).split())
+
+    def test_a_guessed_hour_surfaces_even_though_the_DATE_agrees(self):
+        self._overrides({self.CELH: self.BAD, self.ABNB: self.BAD})
+        self._meta({
+            self.CELH: {"iso": self.BAD, "confidence": "guess",
+                        "label": "time n/a->4pm ET (Nasdaq)"},
+            self.ABNB: {"iso": self.BAD, "confidence": "read",
+                        "label": "after close (4pm ET, Nasdaq)"}})
+        a = self._audit()
+        self.assertIsNone(a["error"])
+        # the DATE audit is blind to this — that is the bug, asserted
+        self.assertNotIn(self.CELH, [r["event"] for r in a["rows"]])
+        flagged = [r["event"] for r in a["unverified"]]
+        self.assertEqual(flagged, [self.CELH])
+        self.assertTrue(a["unverified"][0]["unsafe"])
+        self.assertEqual(a["unverified"][0]["contracts"], 240)
+        self.assertIn("CELH", self.sd.cutoff_banner(a))
+
+    def test_a_measured_after_close_hour_is_never_flagged(self):
+        # 28 of the 29 live 16:00 overrides are a real Nasdaq after-close flag.
+        # Flagging on hour-shape would ship 29 rows to catch one and the block
+        # would be skimmed on the morning it matters.
+        self._overrides({self.ABNB: self.BAD})
+        self._meta({self.ABNB: {"iso": self.BAD, "confidence": "read",
+                                "label": "after close (4pm ET, Nasdaq)"}})
+        a = self._audit(pos={})
+        self.assertEqual(a["unverified"], [])
+        self.assertEqual(self.sd.cutoff_banner(a), "")
+
+    def test_a_hand_set_value_stops_being_flagged_the_same_morning(self):
+        # the sidecar records the ISO it describes; once --set moves the value
+        # the record no longer applies and the row must go quiet, or a fixed
+        # guess stays red forever and trains the reader to skip the block.
+        fixed = "2026-08-06T07:00:00-04:00"
+        self._overrides({self.CELH: fixed})
+        self._meta({self.CELH: {"iso": self.BAD, "confidence": "guess",
+                                "label": "time n/a->4pm ET (Nasdaq)"}})
+        a = self._audit()
+        self.assertEqual(a["unverified"], [])
+        self.assertEqual(self.sd.cutoff_banner(a), "")
+        self.assertGreaterEqual(a["no_prov"], 1)
+
+    def test_a_failsafe_morning_guess_is_reported_but_never_shouted(self):
+        # post-fix world: the guess lands at 07:00, the bot already stands down
+        # early, so the row prints for the record and the banner stays silent.
+        safe = "2026-08-06T07:00:00-04:00"
+        self._overrides({self.CELH: safe})
+        self._meta({self.CELH: {
+            "iso": safe, "confidence": "guess",
+            "label": "time n/a->7am ET BMO assumed (Nasdaq, fail-safe)"}})
+        # 05:00 ET — before the 06:50 ET cutoff, i.e. while there is still
+        # something to act on. That the SAME row disappears once 06:50 passes
+        # is asserted by test_a_passed_cutoff_is_history_and_drops_out.
+        a = self.sd.cutoff_audit(
+            self.client, datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc),
+            {self.CELH + "-M0": 240})
+        self.assertEqual([r["event"] for r in a["unverified"]], [self.CELH])
+        self.assertFalse(a["unverified"][0]["unsafe"])
+        self.assertEqual(self.sd.cutoff_banner(a), "")
+        self.assertTrue(any("UNVERIFIED CALL TIMES" in ln
+                            for ln in self.sd._unverified_lines(a)))
+
+    def test_a_passed_cutoff_is_history_and_drops_out(self):
+        self._overrides({self.CELH: self.BAD})
+        self._meta({self.CELH: {"iso": self.BAD, "confidence": "guess",
+                                "label": "time n/a->4pm ET (Nasdaq)"}})
+        a = self.sd.cutoff_audit(
+            self.client, datetime(2026, 8, 6, 23, 0, tzinfo=timezone.utc), {})
+        self.assertEqual(a["unverified"], [])
+
+    def test_missing_provenance_reports_its_own_coverage_not_a_clean_bill(self):
+        # an empty section must not look the same as a clean one
+        self._overrides({self.CELH: self.BAD})
+        self._meta({})
+        a = self._audit()
+        self.assertEqual(a["unverified"], [])
+        line = self._flat(a)
+        self.assertIn("0/{}".format(a["checked"]), line)
+        self.assertIn("NOT covered by this check", line)
+
+    def test_coverage_is_stated_as_a_fraction_at_every_level(self):
+        """The honesty signal must not evaporate at 1/N coverage.
+
+        The old copy gated "NOT yet effective" on no_prov >= checked, so a single
+        new resolution flipped the section to "...the rest were measured, not
+        guessed" — reassurance while the check could see 2 of 62, with CELH's own
+        class ("written before provenance recording") listed among benign causes.
+        """
+        self._overrides({self.CELH: self.BAD, self.ABNB: self.BAD})
+        self._meta({self.ABNB: {"iso": self.BAD, "confidence": "read",
+                                "label": "after close (4pm ET, Nasdaq)"}})
+        a = self._audit(pos={})
+        self.assertEqual(a["unverified"], [])            # nothing to shout about
+        line = self._flat(a)
+        self.assertIn("1/{}".format(a["checked"]), line)
+        # never closes on reassurance while most of the file is invisible
+        self.assertNotIn("the rest were measured", line)
+        self.assertIn("NOT covered by this check", line)
+        # and it must not promise a convergence the writer cannot deliver:
+        # imm_earnings_overrides.py's `covered` short-circuit never rewrites an
+        # existing entry, so the unrecorded set does not fill in on its own.
+        self.assertIn("does not fill in on its own", line)
+        self.assertNotIn("fills in as", line)
+
+    def test_the_coverage_line_survives_into_the_rows_branch_and_the_html(self):
+        safe = "2026-08-06T07:00:00-04:00"
+        self._overrides({self.CELH: safe, self.ABNB: self.BAD})
+        self._meta({self.CELH: {
+            "iso": safe, "confidence": "guess",
+            "label": "time n/a->7am ET BMO assumed (Nasdaq, fail-safe)"}})
+        a = self.sd.cutoff_audit(
+            self.client, datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc), {})
+        self.assertEqual([r["event"] for r in a["unverified"]], [self.CELH])
+        self.assertIn("NOT covered by this check", self._flat(a))
+        self.assertIn("NOT covered by this check", self.sd._unverified_html(a))
+
+    def _meaning(self, unsafe: bool):
+        return self.sd._unverified_meaning({
+            "event": self.CELH, "dpd": 401.0, "unsafe": unsafe,
+            "override_et": datetime(2026, 8, 20, 7 if not unsafe else 16, 0),
+            "cutoff_et": datetime(2026, 8, 20, 6 if not unsafe else 15, 50)})
+
+    def test_the_safe_side_row_forbids_the_accrual_chasing_edit(self):
+        """Post-fix this is the section's ONLY steady-state output.
+
+        Every future guess lands at 07:00, so this row is what Jack reads at
+        7:10am on an ordinary morning. The old copy ended "Confirm only if you
+        want the $401/day back" — a dangled dollar figure, no prohibition, no
+        source named. Acting on it means pushing a safe 07:00 BMO guess out to
+        16:00, i.e. re-creating CELH by hand."""
+        why, action = self._meaning(unsafe=False)
+        blob = (why + " " + action).lower()
+        self.assertIn("do not push this override later", blob)
+        self.assertIn("celh", blob)                       # names the incident
+        self.assertIn("ir page", blob)                    # names a PRIMARY source
+        # and disowns the source that already returned nothing here
+        self.assertIn("not nasdaq", blob.replace("—", "").replace("  ", " "))
+        self.assertNotIn("confirm only if you want", blob)
+        self.assertTrue(action.startswith("ACTION: none"))
+
+    def test_the_unsafe_side_row_still_asks_for_the_fail_safe_set(self):
+        why, action = self._meaning(unsafe=True)
+        self.assertIn("SYNTHESIZED", why)
+        self.assertIn("--set", action)
+        self.assertIn("07:00 ET", action)
+
+    def test_a_no_action_row_is_not_the_loudest_thing_in_the_html(self):
+        """ACTION: none rendered at font-weight:600 is how a no-op becomes a
+        to-do. Bold is reserved for the row that actually wants a human."""
+        base = {"ticker_date": datetime(2026, 8, 20).date(),
+                "days_out": 1, "mkts": 18, "contracts": 0.0, "dpd": 401.0,
+                "label": "time n/a->7am ET BMO assumed (Nasdaq, fail-safe)"}
+        def row(unsafe):
+            r = dict(base, event=self.CELH, unsafe=unsafe)
+            r["override_et"] = datetime(2026, 8, 20, 16 if unsafe else 7, 0)
+            r["cutoff_et"] = datetime(2026, 8, 20, 15 if unsafe else 6, 50)
+            return r
+        safe_html = self.sd._unverified_html(
+            {"unverified": [row(False)], "checked": 1, "no_prov": 0})
+        unsafe_html = self.sd._unverified_html(
+            {"unverified": [row(True)], "checked": 1, "no_prov": 0})
+        self.assertIn("color:#777;font-weight:400", safe_html)
+        self.assertNotIn("color:#333;font-weight:600", safe_html)
+        self.assertIn("color:#333;font-weight:600", unsafe_html)
+
+
 class TestFileEventOverrides(unittest.TestCase):
     """Hot-reloaded call-time overrides file (imm_earnings_overrides.py)."""
 
@@ -2671,7 +3138,7 @@ class TestStickySelection(unittest.TestCase):
         # quoting past 6pm because restore built a raw midnight cutoff).
         c = imm.apply_series_cutoff_adjustments(
             "KXRAIN", "KXRAIN-26JUL30", imm.parse_event_date("KXRAIN-26JUL30"))
-        self.assertEqual(c, utc(2026, 7, 30, 1, 0))     # 9pm ET day before (Jack 8/1)
+        self.assertEqual(c, utc(2026, 7, 30, 2, 0))     # 10pm ET day before (Jack 8/15)
         # hard-expiry floor rides along (Love Island 8:30pm ET event day)
         c2 = imm.apply_series_cutoff_adjustments(
             "KXLOVEISLMENTION", "KXLOVEISLMENTION-26AUG02", None)
@@ -2700,14 +3167,15 @@ class TestStickySelection(unittest.TestCase):
                        and o.get("expire_at", 0) > time.time()]
         self.assertFalse([o for o in live_orders])
 
-    def test_rain_cutoff_9pm_day_before(self):
-        # Jack 2026-08-01: rain dailies run until 9pm ET the day BEFORE the
-        # rain day (ticker-date midnight minus 180 min; was 6pm since 7/29).
+    def test_rain_cutoff_10pm_day_before(self):
+        # Jack 2026-08-15: rain dailies run until 10pm ET the day BEFORE the
+        # rain day (ticker-date midnight minus 120 min; was 9pm since 8/1,
+        # 6pm since 7/29 — paired with the 7pm size halving).
         ov = imm.series_override("KXRAIN")
-        self.assertEqual(ov.cutoff_before_event_min, 180)
+        self.assertEqual(ov.cutoff_before_event_min, 120)
         td = imm.parse_event_date("KXRAIN-26JUL30")     # Jul 30 00:00 ET
-        early = td - timedelta(minutes=180)             # Jul 29 21:00 ET
-        self.assertEqual(early, utc(2026, 7, 30, 1, 0))
+        early = td - timedelta(minutes=120)             # Jul 29 22:00 ET
+        self.assertEqual(early, utc(2026, 7, 30, 2, 0))
         # non-rain series unaffected
         self.assertIsNone((imm.series_override("KXLOVEISLMENTION")
                            or imm.SeriesOverride()).cutoff_before_event_min)
@@ -4347,6 +4815,98 @@ class TestRateBarScopedToNewEvents(unittest.TestCase):
                                           est, proj))
 
 
+class TestRateFloorEscapeHorizonCap(unittest.TestCase):
+    """Jack 2026-08-07: cap the horizon escape at RATE_FLOOR_ESCAPE_DAYS.
+
+    The escape admits on projected TOTAL >= $5, but a total dilutes with
+    window length: KXCRYPTOSTRUCTURE entered at ~$0.36/day because its
+    13.9-day program window stretched pennies to $5.04 — an effective bar
+    5.5x looser than the $2/day rate bar. The cap makes the escape
+    bar-neutral: <=2.5-day windows keep the full anti-flapping escape,
+    longer windows face the bar undiluted."""
+
+    def test_cryptostructure_shape_is_now_blocked(self):
+        # the exact 2026-08-07 06:22Z admission: $0.36/day x 13.9d window
+        projected = imm.rate_floor_projected(
+            accrued=0.0, est_total=0.36 * 13.9, peak=0.0, quotable_days=13.9)
+        self.assertAlmostEqual(projected, 0.36 * 2.5, places=6)
+        self.assertLess(projected, imm.RATE_FLOOR_TOTAL_ALT)
+
+    def test_short_window_keeps_the_full_escape(self):
+        # a 1-day program at $5/day total: the anti-flapping case must
+        # still clear (cap only shrinks windows LONGER than the escape days)
+        projected = imm.rate_floor_projected(
+            accrued=0.0, est_total=5.0, peak=0.0, quotable_days=1.0)
+        self.assertAlmostEqual(projected, 5.0, places=6)
+        self.assertGreaterEqual(projected, imm.RATE_FLOOR_TOTAL_ALT)
+
+    def test_boundary_window_is_uncapped(self):
+        projected = imm.rate_floor_projected(
+            accrued=0.0, est_total=4.0, peak=0.0,
+            quotable_days=imm.RATE_FLOOR_ESCAPE_DAYS)
+        self.assertAlmostEqual(projected, 4.0, places=6)
+
+    def test_banked_accrual_counts_in_full(self):
+        # accrued credit is money, not a projection — never scaled
+        projected = imm.rate_floor_projected(
+            accrued=5.0, est_total=0.0, peak=0.0, quotable_days=14.0)
+        self.assertAlmostEqual(projected, 5.0, places=6)
+
+    def test_peak_is_scaled_like_the_total(self):
+        # the 1h-peak memory must not smuggle the uncapped horizon back in
+        projected = imm.rate_floor_projected(
+            accrued=0.0, est_total=0.0, peak=5.04, quotable_days=13.9)
+        self.assertAlmostEqual(projected, 5.04 * 2.5 / 13.9, places=6)
+        self.assertLess(projected, imm.RATE_FLOOR_TOTAL_ALT)
+
+    def test_huge_escape_days_restores_old_behaviour(self):
+        # IMM_RATE_FLOOR_ESCAPE_DAYS=big = the pre-cap gate, byte for byte
+        old = imm.RATE_FLOOR_ESCAPE_DAYS
+        imm.RATE_FLOOR_ESCAPE_DAYS = 1e9
+        try:
+            projected = imm.rate_floor_projected(
+                accrued=0.3, est_total=5.04, peak=6.0, quotable_days=13.9)
+            self.assertAlmostEqual(projected, 0.3 + 6.0, places=6)
+        finally:
+            imm.RATE_FLOOR_ESCAPE_DAYS = old
+
+    def test_tiny_window_denominator_is_safe(self):
+        # sub-hour windows must not divide by zero or explode the cap
+        projected = imm.rate_floor_projected(
+            accrued=0.0, est_total=1.0, peak=0.0, quotable_days=0.0)
+        self.assertAlmostEqual(projected, 1.0, places=6)
+
+    def test_selection_branch_calls_the_real_function(self):
+        """Wiring: the refresh_universe rate-floor branch must consult
+        rate_floor_projected — a mirror that drifts is worthless."""
+        bot_cls = TestStickySelection
+        helper = bot_cls.__dict__.get("_quoting_bot")
+        self.assertIsNotNone(helper, "fixture moved; rewire this test")
+        bot = helper(bot_cls())
+        t = bot_cls.T
+        old_ov = imm.SERIES_OVERRIDES.get("KXGOOD")
+        imm.SERIES_OVERRIDES["KXGOOD"] = imm.SeriesOverride(min_est_per_day=1e9)
+        try:
+            for forced_value, expect_in in ((-1.0, False), (1e9, True)):
+                with mock.patch.object(imm, "rate_floor_projected",
+                                       return_value=forced_value) as spy:
+                    bot.state.selected.pop(t, None)
+                    bot.state.sticky_prev.discard(t)
+                    bot._est_peak.clear()
+                    bot.state.universe_at = 0.0
+                    bot.run_cycle()
+                    self.assertTrue(spy.called,
+                                    "branch no longer calls rate_floor_projected")
+                self.assertEqual(t in bot.state.selected, expect_in,
+                                 f"forced projected={forced_value}")
+        finally:
+            if old_ov is None:
+                imm.SERIES_OVERRIDES.pop("KXGOOD", None)
+            else:
+                imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
+            _clean_persist()
+
+
 class TestTwoSidedDepthGate(unittest.TestCase):
     """Jack 2026-08-05: "dont quote, and remove existing quotes, if either
     side has <1000 contracts. only pad on hourly TEMP markets."
@@ -5061,6 +5621,311 @@ class TestCoverageIsNotAnEstimateFactor(unittest.TestCase):
         self.assertTrue(bot._estimate_candidate_yield(meta, []))
         self.assertAlmostEqual(meta.est_dollars_per_day,
                                meta.est_frac * meta.dollars_per_day, places=9)
+
+
+# ---- zero-share strike: is a zero share about the BOOK or about US? --------
+
+class TestZeroShareStrikeCounts(unittest.TestCase):
+    """The 2026-08-06 Kalshi maintenance outage, in predicate form.
+
+    Kalshi went down 07:16-09:00Z (19,949 x 503 in 07Z, 18,737 in 08Z). The
+    failsafe cancelled every order at 07:18:44Z; post-only 409s and our own
+    429 throttle then kept us off the book for two hours (36,321 rejections,
+    ZERO successful placements — and the 08Z half had no 503s at all). The old
+    guard scored `frac` from our RESTING orders but tested our DESIRED quotes,
+    so every selected market struck every cycle against books that never
+    stopped qualifying. 307 markets benched 07:45:59-08:13:29Z: 293 of 471
+    candidates, selected 390 -> 31, est reward ~$404/day -> ~$159/day.
+
+    A zero share is only a verdict on the MARKET when our real non-pad size is
+    actually resting on both sides."""
+
+    FULL = [("bid", 47, 100.0), ("ask", 53, 100.0)]
+
+    def test_a_full_non_pad_ladder_earning_nothing_IS_a_verdict(self):
+        self.assertTrue(imm.zero_share_strike_counts(0.0, self.FULL))
+
+    def test_nothing_resting_is_a_verdict_on_US_not_the_book(self):
+        # the measured outage state: failsafe cancel-all, own == []
+        self.assertFalse(imm.zero_share_strike_counts(0.0, []))
+
+    def test_pads_only_cannot_score_so_cannot_convict(self):
+        # a 1c/99c pad is thousands of ticks below the qualifying walk, so
+        # frac is 0.0 BY CONSTRUCTION — and `mq` is non-empty, which is
+        # exactly what the old `and mq` test waved through.
+        pads = [("bid", imm.PAD_BID_CENTS, 900.0),
+                ("ask", imm.PAD_ASK_CENTS, 900.0)]
+        self.assertFalse(imm.zero_share_strike_counts(0.0, pads))
+
+    def test_a_real_rung_beside_a_pad_still_needs_BOTH_sides(self):
+        self.assertFalse(imm.zero_share_strike_counts(
+            0.0, [("bid", 49, 100.0), ("ask", imm.PAD_ASK_CENTS, 900.0)]))
+
+    def test_one_side_only_is_our_own_cap_or_skew_not_the_book(self):
+        self.assertFalse(imm.zero_share_strike_counts(0.0, [("bid", 49, 100.0)]))
+        self.assertFalse(imm.zero_share_strike_counts(0.0, [("ask", 51, 100.0)]))
+
+    def test_zero_remaining_ghosts_are_not_resting_size(self):
+        # if the count field is ever renamed, order_remaining falls through to
+        # 0.0 and own_by_ticker fills with all-zero entries — the class of the
+        # _fp rename that silently killed position reads for two weeks.
+        self.assertFalse(imm.zero_share_strike_counts(
+            0.0, [("bid", 47, 0.0), ("ask", 53, 0.0)]))
+
+    def test_any_positive_share_is_never_a_strike(self):
+        self.assertFalse(imm.zero_share_strike_counts(1e-9, self.FULL))
+        self.assertFalse(imm.zero_share_strike_counts(0.5, []))
+
+    def test_pads_alongside_real_rungs_still_convict(self):
+        self.assertTrue(imm.zero_share_strike_counts(0.0, [
+            ("bid", imm.PAD_BID_CENTS, 900.0), ("bid", 47, 100.0),
+            ("ask", imm.PAD_ASK_CENTS, 900.0), ("ask", 53, 100.0)]))
+
+    def test_the_estimator_agrees_with_the_predicate_on_the_outage_state(self):
+        """Pin the algebra the predicate rests on: with our orders absent the
+        REAL estimator returns exactly 0.0 while BOTH sides still qualify. So
+        `sides` is 2 during an outage — a fix keyed on `sides` would be wrong,
+        and the coverage alert (sides < 2) never overlaps with the bench."""
+        yes = [[49, 1200.0]]
+        no = [[49, 1200.0]]
+        frac, sides = imm.estimate_reward_share(yes, no, [], 1000.0, 0.5,
+                                                own_in_book=True)
+        self.assertEqual(frac, 0.0)
+        self.assertEqual(sides, 2)
+        self.assertFalse(imm.zero_share_strike_counts(frac, []))
+        # ...and our real size at the touch does earn something
+        own = [("bid", 49, 100.0), ("ask", 51, 100.0)]
+        frac2, sides2 = imm.estimate_reward_share(yes, no, own, 1000.0, 0.5,
+                                                  own_in_book=True)
+        self.assertGreater(frac2, 0.0)
+        self.assertEqual(sides2, 2)
+
+
+def _resting(oid, ticker, book_side, yes_px, n=100):
+    """A resting order of OURS, in the shape fetch_resting_orders accepts."""
+    return {"order_id": oid, "ticker": ticker, "status": "resting",
+            "client_order_id": f"{imm.CLIENT_ORDER_PREFIX}-test-{oid}",
+            "book_side": book_side, "yes_price": yes_px,
+            "remaining_count": n}
+
+
+class TestOutageDoesNotBench(unittest.TestCase):
+    """Full-cycle regression for the 2026-08-06 bench storm.
+
+    live=True is MANDATORY here: in dry mode incentive_mm.py sets est_own to
+    the DESIRED ladder, so frac > 0 by construction, the streak never
+    increments, and a live=False version of every test below would pass
+    identically before and after the fix and prove nothing."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def _bot(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=True)
+        # a book that never stopped qualifying — 1200 a side vs a 1000 target,
+        # which is what the cycle log showed throughout the outage (both sides
+        # at or above target on 97-98% of rows in every 10-minute bucket)
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", "1200"]],
+            "no_dollars": [["0.49", "1200"]]}}
+        return bot
+
+    def _second_cycle(self, bot, orders):
+        """Arm cycle 2 with exactly `orders` of ours resting."""
+        # _merge_ledger unions the exchange view with our local ledger and
+        # counts young unconfirmed entries as resting, so stubbing get_orders
+        # alone does NOT empty `own` — cycle 1's placements survive.
+        bot.state.ledger.clear()
+        bot.client.get_orders = lambda **kw: {"orders": list(orders),
+                                              "cursor": None}
+        bot.state.universe_at = time.time()   # no refresh between cycles
+
+    def test_an_outage_cannot_bench_a_1200x1200_book(self):
+        bot = self._bot()
+        try:
+            bot.run_cycle()
+            self._second_cycle(bot, [])
+            # name the real cause: placements rejected, nothing ever rests
+            def _boom(**kw):
+                raise HttpError("Service Unavailable", 503)
+            bot.client.create_order = _boom
+            bot.state.zero_share_streak[self.T] = imm.QUALIFY_PATIENCE_CYCLES - 1
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.bench_until)
+            self.assertIn(self.T, bot.state.selected)
+            self.assertFalse(any(c == "benched" for c, _m in bot.alerter.today))
+        finally:
+            _clean_persist()
+
+    def test_the_streak_is_RESET_not_paused_so_a_flapping_outage_cannot_bank(self):
+        bot = self._bot()
+        try:
+            bot.run_cycle()
+            self._second_cycle(bot, [])
+            # deliberately NOT one short of the bench: at 29 the old code also
+            # ends at {} — by benching. Mid-streak is the discriminating probe.
+            # An untrusted cycle must ZERO the count, not merely skip it, or a
+            # flapping outage banks strikes across the good cycles between
+            # blackouts and benches anyway.
+            partial = imm.QUALIFY_PATIENCE_CYCLES // 2
+            bot.state.zero_share_streak[self.T] = partial
+            bot.run_cycle()
+            self.assertEqual(bot.state.zero_share_streak, {})
+            self.assertNotIn(self.T, bot.state.bench_until)
+        finally:
+            _clean_persist()
+
+    def test_a_healthy_first_cycle_scores_NO_strike(self):
+        # measured pre-fix: {'KXGOOD-99DEC31-A': 1} after cycle 1, because the
+        # counter at the top of the quote loop judges a placement that has not
+        # happened yet. The counter was off-by-one from its stated meaning
+        # even on the happy path.
+        bot = self._bot()
+        try:
+            bot.run_cycle()
+            self.assertEqual(bot.state.zero_share_streak, {})
+        finally:
+            _clean_persist()
+
+    def test_pads_only_is_not_a_verdict_on_the_book(self):
+        bot = self._bot()
+        try:
+            bot.run_cycle()
+            self._second_cycle(bot, [
+                _resting("p1", self.T, "bid", imm.PAD_BID_CENTS, 900),
+                _resting("p2", self.T, "ask", imm.PAD_ASK_CENTS, 900)])
+            bot.state.zero_share_streak[self.T] = imm.QUALIFY_PATIENCE_CYCLES - 1
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.bench_until)
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            _clean_persist()
+
+    def test_a_full_ladder_earning_nothing_STILL_benches(self):
+        """The anti-deletion test. Without this the fix is indistinguishable
+        from deleting the bench. Our real non-pad size rests on BOTH sides,
+        far below the qualifying walk (which stops at 49c once 1200 >= the
+        1000 target), so we carry fill risk for exactly zero rent."""
+        bot = self._bot()
+        try:
+            bot.run_cycle()
+            self._second_cycle(bot, [
+                _resting("r1", self.T, "bid", 40, 100),
+                _resting("r2", self.T, "ask", 60, 100)])
+            bot.state.zero_share_streak[self.T] = imm.QUALIFY_PATIENCE_CYCLES - 1
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.bench_until)
+            self.assertNotIn(self.T, bot.state.selected)
+            self.assertTrue(any(c == "benched" for c, _m in bot.alerter.today))
+        finally:
+            _clean_persist()
+
+    def test_wake_grace_never_strikes(self):
+        """Post-sleep reads "can SUCCEED with garbage (partial positions/
+        orders)" — the gate standoffs and universe selection already had and
+        this counter never did. Same fixture as the legitimate bench above."""
+        bot = self._bot()
+        try:
+            bot.run_cycle()
+            self._second_cycle(bot, [
+                _resting("r1", self.T, "bid", 40, 100),
+                _resting("r2", self.T, "ask", 60, 100)])
+            bot.wake_grace_until = time.time() + 300
+            bot.state.zero_share_streak[self.T] = imm.QUALIFY_PATIENCE_CYCLES - 1
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.bench_until)
+            self.assertEqual(bot.state.zero_share_streak, {})
+        finally:
+            _clean_persist()
+
+
+class TestCallWindowFreeze(unittest.TestCase):
+    """Jack 2026-08-06: "sit out completely during call windows".
+
+    Once a scheduled earnings call has STARTED, the market gets no orders at
+    all — not even reduce-only wind-down. Positions ride to settlement.
+
+    The bug this closes: restore_orphan_metas built its cutoff from
+    trade_cutoff_utc() alone, which knows nothing about EVENT_START_OVERRIDES
+    (only the selection path consults resolver.resolve()). So
+    KXEARNINGSMENTIONDKNG-26AUG07, whose call ran 16:00 ET on Aug 6, resolved
+    to midnight-ET-of-Aug-7 — still in the future — and kept 7 reduce-only
+    orders resting 1.2h into the live call. MEASURED, not hypothetical.
+    """
+
+    T = "KXGOOD-99DEC31-A"
+    EV = "KXGOOD-99DEC31"
+
+    def setUp(self):
+        _clean_persist()
+        self.addCleanup(_clean_persist)
+        self._saved = dict(imm.EVENT_START_OVERRIDES)
+        self.addCleanup(lambda: (imm.EVENT_START_OVERRIDES.clear(),
+                                 imm.EVENT_START_OVERRIDES.update(self._saved)))
+
+    def _bot(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.state.known_tickers.add(self.T)
+        bot.pnl.pos[self.T] = -40.0
+        return bot
+
+    def _meta_for(self):
+        return MarketMeta(
+            ticker=self.T, event_ticker=self.EV, series="KXGOOD",
+            dollars_per_day=0.0, program_end=None, target_size=0.0,
+            discount_factor=0.5, cutoff=None, close_time=None)
+
+    def _set_call(self, minutes_from_now):
+        imm.EVENT_START_OVERRIDES[self.EV] = (
+            datetime.now(timezone.utc) + timedelta(minutes=minutes_from_now))
+
+    def test_started_call_blocks_orphan_restore(self):
+        self._set_call(-60)                      # call began an hour ago
+        bot = self._bot()
+        bot.restore_orphan_metas({self.T: -40.0})
+        self.assertNotIn(self.T, bot.state.managed_extra,
+                         "orphan restored into a live call window")
+
+    def test_started_call_flushes_an_existing_entry_and_rests_nothing(self):
+        self._set_call(-60)
+        bot = self._bot()
+        # the position must be visible to run_cycle, or managed_extra is
+        # dropped for being flat and the test passes without exercising the
+        # call-window branch at all
+        bot.client.positions[self.T] = -40.0
+        bot.state.managed_extra[self.T] = self._meta_for()
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.managed_extra)
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertFalse([o for o in bot.state.sim_orders.values()
+                          if o.get("ticker") == self.T],
+                         "orders rested during a live call window")
+
+    def test_buffer_counts_as_started(self):
+        """Orders must be gone OVERRIDE_BUFFER_MIN BEFORE the call, so the
+        freeze has to bite inside the buffer too, not exactly at the start."""
+        self._set_call(imm.OVERRIDE_BUFFER_MIN - 1)
+        bot = self._bot()
+        bot.restore_orphan_metas({self.T: -40.0})
+        self.assertNotIn(self.T, bot.state.managed_extra)
+
+    def test_future_call_still_winds_down_normally(self):
+        """The freeze must not become a blanket ban on reduce-only exits —
+        before the call, working out inventory is exactly what we want."""
+        self._set_call(24 * 60)                  # call is tomorrow
+        bot = self._bot()
+        bot.restore_orphan_metas({self.T: -40.0})
+        self.assertIn(self.T, bot.state.managed_extra,
+                      "wind-down wrongly frozen well before the call")
+
+    def test_no_override_is_unaffected(self):
+        """Series with no scheduled call (rates, gas, rain) keep their
+        existing wind-down behaviour — this change is scoped to call windows,
+        and freezing them would strand inventory at settlement instead."""
+        imm.EVENT_START_OVERRIDES.pop(self.EV, None)
+        bot = self._bot()
+        bot.restore_orphan_metas({self.T: -40.0})
+        self.assertIn(self.T, bot.state.managed_extra)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 
@@ -64,6 +65,11 @@ TASK = os.environ.get("IMM_HEALTH_TASK", "KL incentive_mm")
 # past normal jitter (a restart's own startup takes ~60s) but well inside the
 # 23 minutes that went unnoticed.
 STALE_MIN = float(os.environ.get("IMM_HEALTH_STALE_MIN", "6"))
+# Three reads 1s apart span ~2s. The bot's write window is milliseconds, so a
+# collision cannot survive all three; a genuinely dead/corrupt file fails all
+# three and still alerts, only ~2s later.
+READ_TRIES = int(os.environ.get("IMM_HEALTH_READ_TRIES", "3"))
+READ_RETRY_SECS = float(os.environ.get("IMM_HEALTH_READ_RETRY_SECS", "1.0"))
 
 
 def _ps(cmd: str) -> str:
@@ -81,16 +87,30 @@ def probe():
               "Where-Object { $_.CommandLine -like '*incentive_mm.py*' } | "
               "Select-Object -First 1).ProcessId")
     state = _ps(f"(Get-ScheduledTask -TaskName '{TASK}').State")
-    try:
-        with open(STATUS_PATH, encoding="utf-8") as f:
-            st = json.load(f)
-        hb = datetime.strptime(st.get("updated_at", ""), "%Y-%m-%dT%H:%M:%SZ") \
-            .replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - hb).total_seconds() / 60.0
-    except Exception as e:
+    # RETRY, don't cry wolf. The bot rewrites this file every ~11s via
+    # os.replace(), and on Windows a reader landing inside that swap gets
+    # PermissionError. Treating one failed read as death emailed a false
+    # "IMM DOWN" at 2026-08-05 23:38:48Z — the same second the file's own
+    # updated_at was stamped. A dead bot stays unreadable across retries; a
+    # write collision does not, so re-read before concluding anything.
+    err = None
+    for attempt in range(READ_TRIES):
+        try:
+            with open(STATUS_PATH, encoding="utf-8") as f:
+                st = json.load(f)
+            hb = datetime.strptime(st.get("updated_at", ""), "%Y-%m-%dT%H:%M:%SZ") \
+                .replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - hb).total_seconds() / 60.0
+            break
+        except Exception as e:
+            err = e
+            if attempt < READ_TRIES - 1:
+                time.sleep(READ_RETRY_SECS)
+    else:
         return (False, "heartbeat unreadable",
-                f"{type(e).__name__} reading {STATUS_PATH}; "
-                f"task={state or '?'} pid={pid or 'NONE'}")
+                f"{type(err).__name__} reading {STATUS_PATH} on "
+                f"{READ_TRIES} attempts; task={state or '?'} "
+                f"pid={pid or 'NONE'}")
 
     base = f"pid={pid or 'NONE'} task={state or '?'} heartbeat={age:.1f}m"
     if not pid:

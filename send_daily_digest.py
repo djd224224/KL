@@ -105,6 +105,47 @@ def event_pnl(client, event_ticker: str) -> dict:
 
 WEEKLY_STATUS_DIR = os.environ.get(
     "CUD_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\crypto-updown")
+ANNUAL_STATUS_DIR = os.environ.get(
+    "CAY_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\crypto-annual")
+
+# One {date: {fleet/monthly/weekly/daily/annual: P&L$}} entry per SENT digest
+# (written by main() next to the sent-marker, never by --test or ad-hoc
+# builds), so the next morning can show day-over-day deltas.
+PNL_HISTORY_PATH = os.path.join(STATUS_DIR, "digest_pnl_history.json")
+
+
+def load_pnl_history() -> dict:
+    try:
+        with open(PNL_HISTORY_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_pnl_history(today_ct, snap: dict) -> None:
+    hist = load_pnl_history()
+    hist[str(today_ct)] = {k: round(v, 2) for k, v in snap.items()}
+    tmp = PNL_HISTORY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(hist, f, indent=0, sort_keys=True)
+    os.replace(tmp, PNL_HISTORY_PATH)
+
+
+def pnl_deltas(today_ct, snap: dict) -> tuple:
+    """(label, {key -> today - baseline}) against the newest history entry
+    BEFORE today: label "d/d" when that entry is yesterday's, "vs YYYY-MM-DD"
+    when the digest skipped days (standby mornings), (None, {}) when there is
+    no usable baseline yet. Keys missing from the baseline entry (sections
+    that postdate it) simply get no delta."""
+    hist = load_pnl_history()
+    prior = [d for d in hist if d < str(today_ct)]
+    if not prior:
+        return None, {}
+    base_day = max(prior)
+    base = hist[base_day]
+    label = ("d/d" if base_day == str(today_ct - timedelta(days=1))
+             else f"vs {base_day}")
+    return label, {k: v - _f(base[k]) for k, v in snap.items() if k in base}
 
 
 def fleet_health(status_dir: str = STATUS_DIR, label: str = "Bots") -> str:
@@ -147,14 +188,14 @@ TD = 'padding:5px 12px;border:1px solid #ddd;text-align:right;'
 TDL = 'padding:5px 12px;border:1px solid #ddd;text-align:left;'
 
 
-def weekly_entries() -> list:
-    """[(asset, [event_tickers])] for the updown weekly fleet, read from its
-    bots' own heartbeats (their events are DISCOVERED, not computed, so the
-    status files are the source of truth for what each bot is trading).
-    A stale heartbeat still names the right event most of the day; staleness
-    itself is flagged by the weekly health line, not here."""
+def fleet_entries(status_dir: str) -> list:
+    """[(asset, [event_tickers])] for a discovery-based fleet (updown,
+    annual), read from its bots' own heartbeats (their events are DISCOVERED,
+    not computed, so the status files are the source of truth for what each
+    bot is trading). A stale heartbeat still names the right event most of the
+    day; staleness itself is flagged by that fleet's health line, not here."""
     entries = []
-    for path in sorted(glob.glob(os.path.join(WEEKLY_STATUS_DIR, "status_*.json"))):
+    for path in sorted(glob.glob(os.path.join(status_dir, "status_*.json"))):
         try:
             with open(path, encoding="utf-8") as f:
                 st = json.load(f)
@@ -163,6 +204,314 @@ def weekly_entries() -> list:
         evs = [e.get("ticker") for e in (st.get("events") or []) if e.get("ticker")]
         entries.append((st.get("market", os.path.basename(path)), evs))
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Cumulative-by-tenor classification (the bottom table, Jack 2026-08-14)
+# ---------------------------------------------------------------------------
+from crypto_annual_mm import annual_series_for as _annual_series_for  # noqa: E402
+
+MONTHLY_SERIES = {cfg.series for cfg in MARKETS.values()}          # KX*MAXMON/MINMON
+UPDOWN_SERIES = {f"KX{cfg.asset}D" for cfg in MARKETS.values()}    # KX*D
+ANNUAL_SERIES = set()
+for _cfg in MARKETS.values():
+    if _cfg.direction == "max":
+        ANNUAL_SERIES.update(_annual_series_for(_cfg.asset))       # MAXY/MINY/Y
+
+# series -> row label, matching what each section calls its rows: monthlies
+# are "BTC-MIN"/"BTC-MAX", updown and annual are just the asset.
+SERIES_LABEL = {}
+for _cfg in MARKETS.values():
+    SERIES_LABEL[_cfg.series] = _cfg.key
+    SERIES_LABEL[f"KX{_cfg.asset}D"] = _cfg.asset
+    if _cfg.direction == "max":
+        for _s in _annual_series_for(_cfg.asset):
+            SERIES_LABEL[_s] = _cfg.asset
+
+
+def _crypto_family(ticker: str):
+    """'daily'/'weekly'/'monthly'/'annual'/'hourly' for a crypto-fleet market
+    ticker, else None. KX*D tenor is recovered from the EVENT segment: 5pm-ET
+    closes (hour field '17') are weekly on Fridays and daily otherwise; any
+    other hour is an hourly market (never quoted by the fleet — manual
+    trades land there). Unparseable segments classify as None, not guessed."""
+    series = (ticker or "").split("-", 1)[0]
+    if series in MONTHLY_SERIES:
+        return "monthly"
+    if series in ANNUAL_SERIES:
+        return "annual"
+    if series not in UPDOWN_SERIES:
+        return None
+    parts = ticker.split("-")
+    if len(parts) < 2 or len(parts[1]) < 9:
+        return None
+    date_part, hour = parts[1][:7], parts[1][7:9]
+    if hour != "17":
+        return "hourly"
+    try:
+        close_day = datetime.strptime(date_part, "%y%b%d")
+    except ValueError:
+        return None
+    return "weekly" if close_day.weekday() == 4 else "daily"
+
+
+def _settlement_pnl(s: dict) -> float:
+    """Net P&L of one settlement record: payout on the WINNING side's traded
+    count minus ALL money spent on both sides.
+
+    NOT `revenue` — that field is the gross payout on the net held position
+    (never negative, never cost-adjusted; summing it inflated the first
+    version of this table ~4x, caught by Jack 2026-08-14). The payout-cost
+    form is validated against the KXHIGH ground-truth recipe: it reproduces
+    the independently-verified monthly sums (Mar -408 / Apr +1,124 / May
+    -634 / Jun -1,706 / Jul +1,944) from the same records. Results other
+    than yes/no (voids/refunds) fall back to revenue, which for a refund IS
+    the money returned."""
+    yes_n = _f(s.get("yes_count_fp") or s.get("yes_count"))
+    no_n = _f(s.get("no_count_fp") or s.get("no_count"))
+    res = s.get("market_result")
+    if res == "yes":
+        payout = yes_n
+    elif res == "no":
+        payout = no_n
+    else:
+        payout = _f(s.get("revenue")) / 100.0
+    return payout - _f(s.get("yes_total_cost_dollars")) - _f(s.get("no_total_cost_dollars"))
+
+
+def _settle_dt(s: dict) -> datetime:
+    try:
+        return datetime.fromisoformat(
+            (s.get("settled_time") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _event_fully_settled(client, event_ticker: str) -> bool:
+    """True iff every market in the event has a result — the whole event is
+    done, not just early-touched strikes (verified 2026-08-21: a settled
+    monthly shows all markets finalized+result, a live one a mix of active
+    and finalized). A failed probe counts as NOT settled: the row appears a
+    day late rather than a live event slipping in."""
+    try:
+        e = client.get_event(event_ticker)
+        mkts = e.get("markets") or (e.get("event") or {}).get("markets") or []
+        return bool(mkts) and all(m.get("result") for m in mkts)
+    except Exception as ex:
+        log(f"! settled-probe for {event_ticker} failed: {ex}")
+        return False
+
+
+def recent_settlement_rows(client, recs: list, n: int = 20) -> list:
+    """Newest-first [(label, family, settle_date_ct, pnl$)], one row per
+    fully settled EVENT (Jack 2026-08-21: early-settled strikes inside a
+    still-live monthly/annual one-touch event must NOT make rows). KX*D
+    events settle all strikes at one close, so any record there means the
+    event is done; monthly/annual events are probed via _event_fully_settled.
+    A row carries the WHOLE event's P&L (early touches included) dated by
+    its final settle — summed over the records still inside the settlements
+    API retention window (~66d), so a far-back early touch (annual events
+    especially) can age out of the sum. recs items are
+    (dt, family, label, event, pnl)."""
+    groups = {}
+    for dt, fam, label, event, pnl in recs:
+        g = groups.setdefault(event, [label, fam, dt, 0.0])
+        g[3] += pnl
+        if dt > g[2]:
+            g[2] = dt
+    rows = []
+    for event, (label, fam, dt, pnl) in sorted(
+            groups.items(), key=lambda kv: kv[1][2], reverse=True):
+        if fam in ("monthly", "annual") and not _event_fully_settled(client, event):
+            continue
+        rows.append((label, fam, dt.astimezone(CT).date(), pnl))
+        if len(rows) >= n:
+            break
+    return rows
+
+
+def cumulative_family_realized(client) -> tuple:
+    """(family -> all-time realized $, newest-first settlement record tuples
+    for recent_settlement_rows) for the crypto fleets' tenor families.
+
+    Settled history comes from the settlements API — the positions endpoint
+    AGES OUT settled records (verified 2026-08-14: zero July monthlies remain
+    there) while settlements reach back to account origin, the same source
+    the KXHIGH ground-truth recipe trusts — scored per record by
+    _settlement_pnl (see its docstring for why NOT `revenue`). Round-trip
+    realized on STILL-OPEN markets is added from unsettled positions. Round
+    trips on markets that later settled are the one blind spot (neither
+    source keeps them); these fleets are hold-to-settle-dominant, so the
+    miss is small — but this is a measured number with that stated edge,
+    not a model."""
+    fams = {}
+    recs = []
+    cursor = None
+    for _page in range(500):
+        kw = {"limit": 200}
+        if cursor:
+            kw["cursor"] = cursor
+        resp = client.get_portfolio_settlements(**kw)
+        batch = resp.get("settlements") or []
+        for s in batch:
+            ticker = s.get("ticker") or ""
+            fam = _crypto_family(ticker)
+            if fam:
+                pnl = _settlement_pnl(s)
+                fams[fam] = fams.get(fam, 0.0) + pnl
+                label = SERIES_LABEL.get(ticker.split("-", 1)[0],
+                                         ticker.split("-", 1)[0])
+                recs.append((_settle_dt(s), fam, label,
+                             ticker.rsplit("-", 1)[0], pnl))
+        cursor = resp.get("cursor")
+        if not cursor or not batch:
+            break
+    cursor = None
+    for _page in range(50):
+        kw = {"limit": 200, "settlement_status": "unsettled"}
+        if cursor:
+            kw["cursor"] = cursor
+        resp = client.get_positions(**kw)
+        batch = resp.get("market_positions") or []
+        for p in batch:
+            fam = _crypto_family(p.get("ticker") or "")
+            if fam:
+                fams[fam] = fams.get(fam, 0.0) + _f(p.get("realized_pnl_dollars"))
+        cursor = resp.get("cursor")
+        if not cursor or not batch:
+            break
+    return fams, recs
+
+
+CUM_FOOTNOTE = ("realized = settled history + open-market round-trips, "
+                "account-level (manual fills on these series included); "
+                "unrealized = the sections above")
+
+
+def cumulative_text(cum, unreal_by) -> list:
+    lines = ["== CUMULATIVE P&L by tenor (all-time) ==",
+             f"{'TENOR':9s} {'REAL$':>9s} {'UNREAL$':>9s} {'TOTAL$':>9s}"]
+    tot_r = tot_u = 0.0
+    rows = ["daily", "weekly", "monthly", "annual"]
+    if abs(cum.get("hourly", 0.0)) > 0.005:
+        rows.append("hourly")
+    for fam in rows:
+        r = cum.get(fam, 0.0)
+        u = unreal_by.get(fam, 0.0)
+        tot_r += r
+        tot_u += u
+        lines.append(f"{fam:9s} {r:>+9.2f} {u:>+9.2f} {r + u:>+9.2f}")
+    lines.append(f"{'TOTAL':9s} {tot_r:>+9.2f} {tot_u:>+9.2f} {tot_r + tot_u:>+9.2f}")
+    lines.append(f"({CUM_FOOTNOTE})")
+    return lines
+
+
+def cumulative_html(cum, unreal_by) -> list:
+    h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
+         'Cumulative P&amp;L by tenor (all-time)</div>',
+         '<table style="border-collapse:collapse">',
+         f'<tr style="background:#f0f0f0;font-weight:600">'
+         f'<td style="{TDL}">TENOR</td><td style="{TD}">REAL$</td>'
+         f'<td style="{TD}">UNREAL$</td><td style="{TD}">TOTAL$</td></tr>']
+    tot_r = tot_u = 0.0
+    rows = ["daily", "weekly", "monthly", "annual"]
+    if abs(cum.get("hourly", 0.0)) > 0.005:
+        rows.append("hourly")
+    for i, fam in enumerate(rows):
+        r = cum.get(fam, 0.0)
+        u = unreal_by.get(fam, 0.0)
+        tot_r += r
+        tot_u += u
+        bg = "#fafafa" if i % 2 else "#fff"
+        h.append(f'<tr style="background:{bg}"><td style="{TDL}">{fam}</td>'
+                 f'<td style="{TD}">{_pnl_span(r)}</td>'
+                 f'<td style="{TD}">{_pnl_span(u)}</td>'
+                 f'<td style="{TD};font-weight:600">{_pnl_span(r + u)}</td></tr>')
+    h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
+             f'<td style="{TDL}">TOTAL</td><td style="{TD}">{_pnl_span(tot_r)}</td>'
+             f'<td style="{TD}">{_pnl_span(tot_u)}</td>'
+             f'<td style="{TD}">{_pnl_span(tot_r + tot_u)}</td></tr>')
+    h.append('</table>')
+    h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">{CUM_FOOTNOTE}</div>')
+    return h
+
+
+RECENT_FOOTNOTE = ("one row = one fully settled event, whole-event P&L; "
+                   "still-live monthlies/annuals appear once they finish")
+
+
+def recent_settlements_text(recent) -> list:
+    lines = ["== RECENT SETTLEMENTS (last 20 events) ==",
+             f"{'MARKET':9s} {'TENOR':8s} {'SETTLED':10s} {'P&L$':>9s}"]
+    for label, fam, day, pnl in recent:
+        lines.append(f"{label:9s} {fam:8s} {day} {pnl:>+9.2f}")
+    lines.append(f"({RECENT_FOOTNOTE})")
+    return lines
+
+
+def recent_settlements_html(recent) -> list:
+    h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
+         'Recent settlements (last 20 events)</div>',
+         '<table style="border-collapse:collapse">',
+         f'<tr style="background:#f0f0f0;font-weight:600">'
+         f'<td style="{TDL}">MARKET</td><td style="{TDL}">TENOR</td>'
+         f'<td style="{TDL}">SETTLED</td><td style="{TD}">P&amp;L$</td></tr>']
+    for i, (label, fam, day, pnl) in enumerate(recent):
+        bg = "#fafafa" if i % 2 else "#fff"
+        h.append(f'<tr style="background:{bg}"><td style="{TDL}">{label}</td>'
+                 f'<td style="{TDL}">{fam}</td><td style="{TDL}">{day}</td>'
+                 f'<td style="{TD};font-weight:600">{_pnl_span(pnl)}</td></tr>')
+    h.append('</table>')
+    h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">'
+             f'{RECENT_FOOTNOTE.replace("&", "&amp;")}</div>')
+    return h
+
+
+def _event_exists(client, event_ticker: str) -> bool:
+    try:
+        client.get_event(event_ticker)
+        return True
+    except Exception:
+        return False
+
+
+def updown_tenor_entries(client, today_ct) -> tuple:
+    """(daily_entries, weekly_entries) for the updown fleet, split by each
+    heartbeat event's own cadence tag (the bots quote daily+weekly in one
+    process since 2026-08-14, so a single lumped section would hide which
+    tenor made the money).
+
+    Each asset's DAILY list also gets yesterday's settled 5pm-ET event
+    (ticker computed as {series}-{YY}{MON}{DD}17): a daily settles at 5pm
+    and leaves the heartbeat immediately, so the 7am digest would otherwise
+    never show a settled daily's realized P&L. When yesterday was Friday
+    that 5pm close IS the weekly event, so it lands in the WEEKLY list
+    instead. Events that never listed (e.g. KXZECD) are skipped after an
+    existence probe; assets with no fills there just count as flat."""
+    yday = today_ct - timedelta(days=1)
+    yday_ev_suffix = f"{yday:%y%b%d}".upper() + "17"
+    yday_was_friday = yday.weekday() == 4
+    daily, weekly = [], []
+    for path in sorted(glob.glob(os.path.join(WEEKLY_STATUS_DIR, "status_*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            continue
+        label = st.get("market", os.path.basename(path))
+        evs = st.get("events") or []
+        d_evs = [e["ticker"] for e in evs
+                 if e.get("ticker") and e.get("cadence") == "daily"]
+        w_evs = [e["ticker"] for e in evs
+                 if e.get("ticker") and e.get("cadence") == "weekly"]
+        series = st.get("series")
+        if isinstance(series, str) and series:
+            settled = f"{series}-{yday_ev_suffix}"
+            if settled not in d_evs + w_evs and _event_exists(client, settled):
+                (w_evs if yday_was_friday else d_evs).append(settled)
+        daily.append((label, d_evs))
+        weekly.append((label, w_evs))
+    return daily, weekly
 
 
 def collect_rows(client, entries):
@@ -198,10 +547,11 @@ def collect_rows(client, entries):
     return rows, tot, failed, quiet
 
 
-def text_section(title, rows, tot, quiet, failed, health):
+def text_section(title, rows, tot, quiet, failed, health, dd=None):
     total_pnl = tot["realized"] + tot["unrealized"]
+    dd_str = f" ({dd[0]} {dd[1]:+,.2f})" if dd else ""
     lines = [f"== {title} ==",
-             f"P&L: {total_pnl:+,.2f}  (realized {tot['realized']:+,.2f}, "
+             f"P&L: {total_pnl:+,.2f}{dd_str}  (realized {tot['realized']:+,.2f}, "
              f"unrealized {tot['unrealized']:+,.2f}, fees {tot['fees']:,.2f}) | "
              f"net {tot['net_pos']:+,.0f} | expo ${tot['exposure']:,.2f}"]
     if rows:
@@ -221,11 +571,12 @@ def text_section(title, rows, tot, quiet, failed, health):
     return lines
 
 
-def html_section(title, rows, tot, quiet, failed, health):
+def html_section(title, rows, tot, quiet, failed, health, dd=None):
     total_pnl = tot["realized"] + tot["unrealized"]
+    dd_str = f' ({dd[0]} {_pnl_span(dd[1])})' if dd else ""
     h = [f'<div style="font-size:15px;font-weight:600;margin:14px 0 2px">{title}</div>']
     h.append(f'<div style="color:#555;margin-bottom:8px">'
-             f'P&amp;L {_pnl_span(total_pnl)} &nbsp;&middot;&nbsp; '
+             f'P&amp;L {_pnl_span(total_pnl)}{dd_str} &nbsp;&middot;&nbsp; '
              f'realized {_pnl_span(tot["realized"])} &nbsp;&middot;&nbsp; '
              f'unrealized {_pnl_span(tot["unrealized"])} &nbsp;&middot;&nbsp; '
              f'fees {tot["fees"]:,.2f} &nbsp;&middot;&nbsp; '
@@ -269,15 +620,22 @@ def html_section(title, rows, tot, quiet, failed, health):
 
 
 def build_digest(now_utc: datetime):
-    """Returns (plain_text, html): monthly one-touch section + weekly
-    above/below section in the identical format (Jack 2026-08-12)."""
+    """Returns (plain_text, html, pnl_snapshot): monthly one-touch section +
+    weekly above/below section in the identical format (Jack 2026-08-12),
+    plus the annual section (2026-08-13) and, under the cumulative table,
+    the last-20 settlements table (2026-08-21). Fleet and section P&L lines
+    carry day-over-day deltas vs the last SENT digest (2026-08-22); the
+    snapshot is what main() records to make tomorrow's deltas."""
     today_ct = now_utc.astimezone(CT).date()
     client = build_client()
 
     monthly_entries = [(key, [event_ticker_for(MARKETS[key], now_utc)])
                        for key in sorted(MARKETS)]
     m_rows, m_tot, m_failed, m_quiet = collect_rows(client, monthly_entries)
-    w_rows, w_tot, w_failed, w_quiet = collect_rows(client, weekly_entries())
+    d_entries, w_entries = updown_tenor_entries(client, today_ct)
+    w_rows, w_tot, w_failed, w_quiet = collect_rows(client, w_entries)
+    d_rows, d_tot, d_failed, d_quiet = collect_rows(client, d_entries)
+    a_rows, a_tot, a_failed, a_quiet = collect_rows(client, fleet_entries(ANNUAL_STATUS_DIR))
 
     try:
         balance = _f(client.get_balance().get("balance_dollars"))
@@ -285,32 +643,75 @@ def build_digest(now_utc: datetime):
     except Exception:
         bal_str = "?"
 
-    grand = {k: m_tot[k] + w_tot[k] for k in m_tot}
+    # Bottom table: all-time realized per tenor + the sections' current
+    # unrealized. A failed sweep degrades to a note — never kills the digest.
+    try:
+        cum, settle_recs = cumulative_family_realized(client)
+        recent = recent_settlement_rows(client, settle_recs)
+    except Exception as e:
+        log(f"! cumulative-by-tenor sweep failed: {e}")
+        cum, recent = None, []
+    unreal_by = {"daily": d_tot["unrealized"], "weekly": w_tot["unrealized"],
+                 "monthly": m_tot["unrealized"], "annual": a_tot["unrealized"]}
+
+    grand = {k: m_tot[k] + w_tot[k] + d_tot[k] + a_tot[k] for k in m_tot}
     grand_pnl = grand["realized"] + grand["unrealized"]
+    snap = {"fleet": grand_pnl,
+            "monthly": m_tot["realized"] + m_tot["unrealized"],
+            "weekly": w_tot["realized"] + w_tot["unrealized"],
+            "daily": d_tot["realized"] + d_tot["unrealized"],
+            "annual": a_tot["realized"] + a_tot["unrealized"]}
+    dd_label, deltas = pnl_deltas(today_ct, snap)
+
+    def dd(key):
+        return (dd_label, deltas[key]) if dd_label and key in deltas else None
+
     m_health = fleet_health(STATUS_DIR, "Monthly bots")
-    w_health = fleet_health(WEEKLY_STATUS_DIR, "Weekly bots")
+    w_health = fleet_health(WEEKLY_STATUS_DIR, "Updown bots")
+    # daily + weekly are the SAME 7 processes; health shown once under weekly
+    d_health = "(same bots as the weekly section)"
+    a_health = fleet_health(ANNUAL_STATUS_DIR, "Annual bots")
 
     # ---- plain text (fallback part) ----------------------------------------
+    fleet_dd = f" ({dd_label} {deltas['fleet']:+,.2f})" if dd("fleet") else ""
     lines = [f"Kalshi crypto MM - {today_ct}", ""]
-    lines.append(f"FLEET P&L: {grand_pnl:+,.2f}  "
+    lines.append(f"FLEET P&L: {grand_pnl:+,.2f}{fleet_dd}  "
                  f"(realized {grand['realized']:+,.2f}, unrealized {grand['unrealized']:+,.2f}, "
                  f"fees {grand['fees']:,.2f})")
     lines.append(f"Net position {grand['net_pos']:+,.0f} contracts | "
                  f"$ exposure ${grand['exposure']:,.2f} | balance {bal_str}")
     lines.append("")
     lines += text_section("MONTHLY one-touch (KX*MAXMON/*MINMON)",
-                          m_rows, m_tot, m_quiet, m_failed, m_health)
+                          m_rows, m_tot, m_quiet, m_failed, m_health, dd("monthly"))
     lines.append("")
     lines += text_section("WEEKLY above/below (KX*D)",
-                          w_rows, w_tot, w_quiet, w_failed, w_health)
+                          w_rows, w_tot, w_quiet, w_failed, w_health, dd("weekly"))
+    lines.append("")
+    lines += text_section("DAILY above/below (KX*D, incl. yesterday's settle)",
+                          d_rows, d_tot, d_quiet, d_failed, d_health, dd("daily"))
+    lines.append("")
+    lines += text_section("ANNUAL touch+terminal (KX*MAXY/*MINY/*Y)",
+                          a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
+    lines.append("")
+    if cum is not None:
+        lines += cumulative_text(cum, unreal_by)
+    else:
+        lines.append("(cumulative-by-tenor table unavailable this morning: "
+                     "settlements sweep failed)")
+    if recent:
+        lines.append("")
+        lines += recent_settlements_text(recent)
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
     h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">']
     h.append(f'<div style="font-size:17px;font-weight:600">Kalshi crypto MM'
              f' <span style="color:#888;font-weight:400">- {today_ct}</span></div>')
+    fleet_dd_html = (f' <span style="font-size:14px;font-weight:400;color:#555">'
+                     f'({dd_label} {_pnl_span(deltas["fleet"])})</span>'
+                     if dd("fleet") else "")
     h.append(f'<div style="font-size:21px;font-weight:700;margin:8px 0 2px">'
-             f'Fleet P&amp;L: {_pnl_span(grand_pnl)}</div>')
+             f'Fleet P&amp;L: {_pnl_span(grand_pnl)}{fleet_dd_html}</div>')
     h.append(f'<div style="color:#555;margin-bottom:4px">'
              f'realized {_pnl_span(grand["realized"])} &nbsp;&middot;&nbsp; '
              f'unrealized {_pnl_span(grand["unrealized"])} &nbsp;&middot;&nbsp; '
@@ -319,11 +720,22 @@ def build_digest(now_utc: datetime):
              f'exposure <b>${grand["exposure"]:,.2f}</b> &nbsp;&middot;&nbsp; '
              f'balance <b>{bal_str}</b></div>')
     h += html_section("Monthly one-touch (KX*MAXMON / *MINMON)",
-                      m_rows, m_tot, m_quiet, m_failed, m_health)
+                      m_rows, m_tot, m_quiet, m_failed, m_health, dd("monthly"))
     h += html_section("Weekly above/below (KX*D)",
-                      w_rows, w_tot, w_quiet, w_failed, w_health)
+                      w_rows, w_tot, w_quiet, w_failed, w_health, dd("weekly"))
+    h += html_section("Daily above/below (KX*D, incl. yesterday's settle)",
+                      d_rows, d_tot, d_quiet, d_failed, d_health, dd("daily"))
+    h += html_section("Annual touch+terminal (KX*MAXY / *MINY / *Y)",
+                      a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
+    if cum is not None:
+        h += cumulative_html(cum, unreal_by)
+    else:
+        h.append('<div style="color:#c0392b;margin-top:8px">cumulative-by-tenor '
+                 'table unavailable this morning: settlements sweep failed</div>')
+    if recent:
+        h += recent_settlements_html(recent)
     h.append('</div>')
-    return text, "".join(h)
+    return text, "".join(h), snap
 
 
 def main(argv=None) -> int:
@@ -344,10 +756,10 @@ def main(argv=None) -> int:
     # network radio off (observed 2026-07-12: task ran at 7:00:01 mid-standby,
     # exit 1, no email). Retry for up to ~40 minutes so the digest goes out
     # shortly after the machine wakes.
-    body = html = None
+    body = html = snap = None
     for attempt in range(1, 9):
         try:
-            body, html = build_digest(now_utc)
+            body, html, snap = build_digest(now_utc)
             break
         except Exception as e:
             log(f"digest build attempt {attempt}/8 failed: {e!r}; retrying in 5min")
@@ -373,6 +785,7 @@ def main(argv=None) -> int:
     if ok and not args.test:
         with open(marker, "w") as f:
             f.write(now_utc.isoformat())
+        record_pnl_history(today_ct, snap)
         cutoff = today_ct - timedelta(days=7)
         for old in glob.glob(os.path.join(STATUS_DIR, "digest_sent_*.marker")):
             name = os.path.basename(old)[len("digest_sent_"):-len(".marker")]

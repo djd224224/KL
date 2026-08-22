@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "kl-static",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8873", "--bind", "127.0.0.1"],
+      "port": 8873
+    }
+  ]
+}

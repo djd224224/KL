@@ -1580,7 +1580,8 @@ class TouchMarketMaker:
 # Entry point
 # ----------------------------------------------------------------------------
 
-def acquire_singleton(market_key: str) -> bool:
+def acquire_singleton(market_key: str, status_dir: Optional[str] = None,
+                      heartbeat_max_age_secs: float = 180) -> bool:
     """Refuse to start if another live process is already trading this market.
 
     Duplicates are a real money risk: two bots on one market each keep their
@@ -1593,10 +1594,16 @@ def acquire_singleton(market_key: str) -> bool:
 
     Lock = a file holding the owner PID. A stale lock (process gone) is taken
     over. Best-effort: any error here must not stop trading.
+
+    `status_dir`/`heartbeat_max_age_secs` let the sibling fleets (updown,
+    annual) lock in their own heartbeat directories: their bots idle-poll at
+    300-600s, so a 180s freshness window would let a duplicate take an
+    idle-but-alive bot's lock — they pass ~3x their idle poll instead.
     """
-    path = os.path.join(STATUS_DIR, f"lock_{market_key}.pid")
+    status_dir = status_dir or STATUS_DIR
+    path = os.path.join(status_dir, f"lock_{market_key}.pid")
     try:
-        os.makedirs(STATUS_DIR, exist_ok=True)
+        os.makedirs(status_dir, exist_ok=True)
         if os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
@@ -1608,7 +1615,8 @@ def acquire_singleton(market_key: str) -> bool:
             # an unrelated python would otherwise park this market forever
             # (the launcher would retry, re-read the same lock, exit again).
             if (other and other != os.getpid() and _pid_alive(other)
-                    and _heartbeat_fresh(market_key)):
+                    and _heartbeat_fresh(market_key, heartbeat_max_age_secs,
+                                         status_dir)):
                 log(f"[{market_key}] another instance is live (pid {other}); exiting")
                 return False
         with open(path, "w", encoding="utf-8") as f:
@@ -1619,11 +1627,12 @@ def acquire_singleton(market_key: str) -> bool:
     return True
 
 
-def _heartbeat_fresh(market_key: str, max_age_secs: float = 180) -> bool:
+def _heartbeat_fresh(market_key: str, max_age_secs: float = 180,
+                     status_dir: Optional[str] = None) -> bool:
     """True if this market's status file was written very recently, i.e. some
     process really is trading it right now."""
     try:
-        path = os.path.join(STATUS_DIR, f"status_{market_key}.json")
+        path = os.path.join(status_dir or STATUS_DIR, f"status_{market_key}.json")
         return time.time() - os.path.getmtime(path) <= max_age_secs
     except OSError:
         return False
