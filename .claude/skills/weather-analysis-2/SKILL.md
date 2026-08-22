@@ -41,12 +41,18 @@ Grab the output filename from stdout (`Kalshi-Settlements-YYYYMMDD-HHMMSS.csv`),
 # 2. Optional but recommended — also pull trades (gives fill-level detail)
 python fetch_trades_csv.py
 
-# 3. Build the weather dashboard HTML
-python analyze_weather_dashboard.py <settlement.csv> <trade.csv> weather_dashboard_latest.html
-# Or without trades:
-python analyze_weather_dashboard.py <settlement.csv> none weather_dashboard_latest.html
+# 3. Merge the pulls into the append-only archives. Kalshi's portfolio
+#    endpoints only serve ~65 days back, so the archives are the real
+#    dataset — analyzing the raw pull would silently drop older history.
+python merge_kalshi_archive.py Kalshi-Settlements-archive.csv <settlement.csv> "seed_settlements_*.csv" "KalshiRecentActivitySettlement*.csv"
+python merge_kalshi_archive.py Kalshi-Trades-archive.csv <trade.csv>
 
-# 4. Open it
+# 4. Build the weather dashboard HTML from the ARCHIVES (not the raw pulls)
+python analyze_weather_dashboard.py Kalshi-Settlements-archive.csv Kalshi-Trades-archive.csv weather_dashboard_latest.html
+# Or without trades:
+python analyze_weather_dashboard.py Kalshi-Settlements-archive.csv none weather_dashboard_latest.html
+
+# 5. Open it
 start "" weather_dashboard_latest.html
 ```
 
@@ -74,6 +80,12 @@ same steps every day at 7:00 AM and overwrites `weather_dashboard_latest.html`
 refresh, so a browser tab left open on the file picks up each rebuild by
 itself. Manual runs of this skill still work any time — they write the same
 file. Failures email via `send_alert_email.py`; log: `run-logs\dashboards.log`.
+
+Website "Recent Activity" settlement exports (cents prices, fractional
+counts, gross-payout profit) can be dropped into the repo root as
+`seed_settlements_*.csv` or `KalshiRecentActivitySettlement*.csv` — the
+merge normalizes them to the API format and folds them into the archive
+(all gitignored: personal data, public repo).
 
 ## Troubleshooting
 

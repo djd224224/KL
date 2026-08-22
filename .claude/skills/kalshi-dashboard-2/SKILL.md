@@ -36,10 +36,16 @@ Both scripts print the output filename on completion. They follow the pattern:
 Capture those filenames (the `-> ...csv` lines from stdout), then:
 
 ```bash
-# 3. Build the dashboard HTML from the two CSVs
-python analyze_kalshi_dashboard.py <settlement.csv> <trade.csv> none "Kalshi" kalshi_dashboard_latest.html
+# 3. Merge the pulls into the append-only archives. Kalshi's portfolio
+#    endpoints only serve ~65 days back, so the archives are the real
+#    dataset — analyzing the raw pull would silently drop older history.
+python merge_kalshi_archive.py Kalshi-Settlements-archive.csv <settlement.csv> "seed_settlements_*.csv" "KalshiRecentActivitySettlement*.csv"
+python merge_kalshi_archive.py Kalshi-Trades-archive.csv <trade.csv>
 
-# 4. Open it
+# 4. Build the dashboard HTML from the ARCHIVES (not the raw pulls)
+python analyze_kalshi_dashboard.py Kalshi-Settlements-archive.csv Kalshi-Trades-archive.csv none "Kalshi" kalshi_dashboard_latest.html
+
+# 5. Open it
 start "" kalshi_dashboard_latest.html
 ```
 
@@ -76,6 +82,12 @@ same steps every day at 7:00 AM and overwrites `kalshi_dashboard_latest.html`
 refresh, so a browser tab left open on the file picks up each rebuild by
 itself. Manual runs of this skill still work any time — they write the same
 file. Failures email via `send_alert_email.py`; log: `run-logs\dashboards.log`.
+
+Website "Recent Activity" settlement exports (cents prices, fractional
+counts, gross-payout profit) can be dropped into the repo root as
+`seed_settlements_*.csv` or `KalshiRecentActivitySettlement*.csv` — the
+merge normalizes them to the API format and folds them into the archive
+(all gitignored: personal data, public repo).
 
 ## Troubleshooting
 

@@ -17,7 +17,8 @@ $out = (git -C $Repo merge --ff-only origin/main 2>&1) -join ' | '
 # One-time bootstrap: the first sync after register_dashboard_task.ps1 lands,
 # register the daily 7 AM dashboard rebuild and kick its first run — so the
 # task appears on this machine with no manual step. No-op once it exists.
-if (-not (Get-ScheduledTask -TaskName "KL dashboards-daily" -ErrorAction SilentlyContinue)) {
+$dashTask = Get-ScheduledTask -TaskName "KL dashboards-daily" -ErrorAction SilentlyContinue
+if (-not $dashTask) {
     $reg = Join-Path $Repo "register_dashboard_task.ps1"
     if (Test-Path $reg) {
         $regOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $reg 2>&1) -join ' | '
@@ -25,6 +26,15 @@ if (-not (Get-ScheduledTask -TaskName "KL dashboards-daily" -ErrorAction Silentl
         "$stamp dashboard-task bootstrap: $(if ($ok) { 'registered' } else { 'FAILED (run register_dashboard_task.ps1 from an admin PowerShell)' }) | $regOut" | Add-Content -Path $Log -Encoding utf8
         if ($ok) { Start-ScheduledTask -TaskName "KL dashboards-daily" }
     }
+} elseif ($dashTask.State -ne 'Running' -and
+          -not (Test-Path (Join-Path $Repo "Kalshi-Settlements-archive.csv")) -and
+          ((Test-Path (Join-Path $Repo "seed_settlements_*.csv")) -or
+           (Test-Path (Join-Path $Repo "KalshiRecentActivitySettlement*.csv")))) {
+    # A seed export was dropped in but the settlements archive hasn't been
+    # built yet: run the rebuild now instead of waiting for the 7 AM slot.
+    # Self-limiting — the archive exists after the first successful run.
+    Start-ScheduledTask -TaskName "KL dashboards-daily"
+    "$stamp dashboards kicked to build first settlements archive from seed" | Add-Content -Path $Log -Encoding utf8
 }
 
 # Cap the log at ~500 lines so it never grows unbounded

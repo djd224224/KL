@@ -52,14 +52,30 @@ function Run-Step($name, $cmdArgs) {
 $settleOk = Run-Step "fetch_settlements" @("fetch_settlements_csv.py")
 $tradesOk = Run-Step "fetch_trades" @("fetch_trades_csv.py")
 
+# Kalshi's portfolio endpoints only serve a ~65-day rolling window (see
+# bq_retention_guard.py), so every pull — plus any seed exports dropped in
+# the repo root — is merged into local append-only archives, and the
+# analyzers read the ARCHIVES. History accumulates instead of rolling off.
+# (Glob patterns are literal here; merge_kalshi_archive.py expands them.)
+$SettlementsArchive = "Kalshi-Settlements-archive.csv"
+$TradesArchive = "Kalshi-Trades-archive.csv"
+$mergeOk = $false
 if ($settleOk) {
-    # Trades are optional for both analyzers — degrade to 'none' rather than
-    # skip the rebuild when only the fills fetch failed.
-    $trades = if ($tradesOk) { $env:TRADES_OUT } else { "none" }
-    Run-Step "kalshi_dashboard" @("analyze_kalshi_dashboard.py", $env:SETTLEMENTS_OUT, $trades, "none", "Kalshi", "kalshi_dashboard_latest.html") | Out-Null
-    Run-Step "weather_dashboard" @("analyze_weather_dashboard.py", $env:SETTLEMENTS_OUT, $trades, "weather_dashboard_latest.html") | Out-Null
+    $mergeOk = Run-Step "merge_settlements" @("merge_kalshi_archive.py", $SettlementsArchive,
+        $env:SETTLEMENTS_OUT, "seed_settlements_*.csv", "KalshiRecentActivitySettlement*.csv")
+}
+if ($tradesOk) {
+    Run-Step "merge_trades" @("merge_kalshi_archive.py", $TradesArchive, $env:TRADES_OUT, "seed_trades_*.csv") | Out-Null
+}
+
+if ($mergeOk) {
+    # Trades are optional for both analyzers — a stale trades archive (or
+    # 'none' before the first trades merge) still beats skipping the rebuild.
+    $trades = if (Test-Path $TradesArchive) { $TradesArchive } else { "none" }
+    Run-Step "kalshi_dashboard" @("analyze_kalshi_dashboard.py", $SettlementsArchive, $trades, "none", "Kalshi", "kalshi_dashboard_latest.html") | Out-Null
+    Run-Step "weather_dashboard" @("analyze_weather_dashboard.py", $SettlementsArchive, $trades, "weather_dashboard_latest.html") | Out-Null
 } else {
-    Log-Line "!! skipping both analyzers - settlements fetch failed (yesterday's HTML left in place)"
+    Log-Line "!! skipping both analyzers - settlements fetch/merge failed (yesterday's HTML left in place)"
 }
 
 Log-Line "=== dashboards rebuild done (failed: $(if ($failed) { $failed -join ', ' } else { 'none' })) ==="
