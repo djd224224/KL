@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 r"""
-imm_quote_gaps.py — morning email: which live-incentive markets is the IMM bot
-NOT quoting, ranked by what they'd plausibly earn (est $/day and c/min), with a
-plain-English line on what each event is (from Kalshi's event title).
+imm_quote_gaps.py — the combined morning "IMM quotes and overrides" email
+(Jack 2026-08-15: one tight IMM email instead of two). Two parts:
+  OVERRIDES — the 6:45 maintainer's run summary (imm_earnings_overrides.py
+  writes overrides_last_runs.json every run and only emails on its own when
+  action is needed): tallies, any open action items with paste-ready --set
+  commands, and what was auto-handled since yesterday morning.
+  QUOTE GAPS — which live-incentive markets the bot is NOT quoting, ranked
+  by ROI with a plain-English line on what each event is.
 
 Where the numbers come from: the bot's OWN machinery, imported from
 incentive_mm.py — fetch_programs() for the full paying universe, _allowed()/
@@ -115,8 +120,8 @@ STATUS_PATH = os.path.join(imm.STATUS_DIR, "status_incentive_mm.json")
 
 MAX_BOOKS = int(os.environ.get("IMM_GAPS_MAX_BOOKS", "250"))
 MAX_PER_EVENT = int(os.environ.get("IMM_GAPS_MAX_PER_EV", "12"))
-TOP_EVENTS = int(os.environ.get("IMM_GAPS_TOP", "20"))
-MIN_SHOW_DOLLARS = float(os.environ.get("IMM_GAPS_MIN_EST", "0.50"))
+TOP_EVENTS = int(os.environ.get("IMM_GAPS_TOP", "12"))
+MIN_SHOW_DOLLARS = float(os.environ.get("IMM_GAPS_MIN_EST", "1.00"))
 # Detail reads are cheap (50/call); estimate-worthy disallowed tail is bounded.
 MAX_DETAIL_MARKETS = int(os.environ.get("IMM_GAPS_MAX_DETAILS", "900"))
 
@@ -570,11 +575,55 @@ TD = 'padding:5px 10px;border:1px solid #ddd;text-align:right;'
 TDL = 'padding:5px 10px;border:1px solid #ddd;text-align:left;'
 
 
+def _esc(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def load_overrides_runs(now_utc: datetime):
+    """(tallies, action_lines, info_lines, warn) from the overrides task's
+    per-run summaries: the latest run's tallies + still-open action items,
+    plus deduped auto-handled info from every run in the last 25h (so the
+    midday/afternoon runs' quiet work reaches the morning email)."""
+    path = os.path.join(imm.STATUS_DIR, "overrides_last_runs.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            runs = json.load(f)
+        if not (isinstance(runs, list) and runs):
+            raise ValueError("empty")
+    except Exception:
+        return "", [], [], ("no overrides-run summary yet — expected after "
+                            "the next 6:45 ET run of 'KL imm earnings-overrides'")
+    cutoff = now_utc - timedelta(hours=25)
+    fresh = []
+    for r in runs:
+        try:
+            if datetime.fromisoformat(r.get("ts", "")) >= cutoff:
+                fresh.append(r)
+        except ValueError:
+            continue
+    if not fresh:
+        return "", [], [], (f"overrides task has NOT run since "
+                            f"{runs[-1].get('ts', '?')} — check "
+                            f"'KL imm earnings-overrides'")
+    info, seen = [], set()
+    for r in fresh:
+        for s in r.get("info") or []:
+            if s not in seen:
+                seen.add(s)
+                info.append(s)
+    latest = fresh[-1]
+    act = [s for s in (latest.get("action_lines") or [])]
+    while act and not act[-1].strip():
+        act.pop()
+    return latest.get("tallies", ""), act, info, ""
+
+
 def build_report(now_utc: datetime):
     """Returns (plain_text, html, subject)."""
     client = imm.build_client()
     bot = imm.IncentiveMarketMaker(client, live=False)
     event_rows, ctx = classify_and_estimate(client, bot, now_utc)
+    ovr_tallies, ovr_act, ovr_info, ovr_warn = load_overrides_runs(now_utc)
 
     deliberate = [d for d in event_rows
                   if d["reason"].startswith(("blocklisted", "frozen"))]
@@ -586,16 +635,19 @@ def build_report(now_utc: datetime):
     shown_events = {d["event"] for d in show}
     hidden = [d for d in candidates if d["event"] not in shown_events]
     hidden_est = sum(d["est"] or 0.0 for d in hidden)
-    deliberate_show = sorted(deliberate,
-                             key=lambda d: (-(d["est"] or 0), -d["pool"]))[:10]
+    deliberate_top = sorted(deliberate,
+                            key=lambda d: (-(d["est"] or 0), -d["pool"]))[:3]
+    deliberate_est = sum(d["est"] or 0.0 for d in deliberate)
 
-    for d in show + deliberate_show:   # descriptions for both tables
+    for d in show:
         d["title"] = describe_event(
             d["event"], event_title(client, d["event"], d["fallback_title"]))
 
     today_et = now_utc.astimezone(imm.ET).date()
     headline = ctx["est_missed_total"]
-    subject = f"IMM quote gaps {today_et} — est ${headline:,.0f}/day unquoted"
+    subject = (f"IMM quotes and overrides {today_et} — "
+               f"est ${headline:,.0f}/day unquoted"
+               + (" — ACTION" if ovr_act else ""))
 
     def yld_str(d):
         return (f"{d['yld'] * 100:,.1f}%" if d.get("yld") is not None else "—")
@@ -609,94 +661,105 @@ def build_report(now_utc: datetime):
         return f"{'>=' if d['partial'] else ''}{d['est']:,.2f}"
 
     # ---- plain text ---------------------------------------------------------
-    lines = [f"IMM quote gaps — {today_et}", ""]
+    lines = [f"IMM quotes and overrides — {today_et}", ""]
     lines.append(
-        f"Est ${headline:,.2f}/day currently unquoted "
-        f"(over {ctx['unquoted_rows']} paying markets not in the book; "
-        f"{ctx['books_read']} books estimated).")
-    lines.append(
-        f"Quoting {ctx['quoted']} markets across {ctx['quoted_events']}/"
-        f"{ctx['event_cap']} events; est reward today so far "
-        f"${ctx['reward_today']:,.2f}. {ctx['programs']} program markets, "
-        f"${ctx['pool_total']:,.0f}/day total pools.")
+        f"Est ${headline:,.2f}/day unquoted over {ctx['unquoted_rows']} paying "
+        f"markets; quoting {ctx['quoted']} markets across "
+        f"{ctx['quoted_events']}/{ctx['event_cap']} events; est reward today "
+        f"so far ${ctx['reward_today']:,.2f}.")
     if ctx["heartbeat_stale"]:
         lines.append(f"WARNING: bot heartbeat stale (updated_at "
                      f"{ctx['updated_at']}) — 'quoted' set may be old.")
     lines.append("")
+    lines.append(f"OVERRIDES — {ovr_tallies}" if ovr_tallies else "OVERRIDES")
+    if ovr_warn:
+        lines.append(f"  ! {ovr_warn}")
+    if ovr_act:
+        lines.append("ACTION NEEDED:")
+        lines += ovr_act
+    for s in ovr_info:
+        lines.append(f"  {s}")
+    if not (ovr_warn or ovr_act or ovr_info):
+        lines.append("  nothing new; all cutoffs covered.")
+    lines.append("")
     if show:
-        lines.append("ranked by ROI: est $ earned per day for each $ at risk "
-                     "(ties broken by est $/day)")
-        lines.append(f"{'ROI%/DAY':>8} {'EST$/DAY':>8} {'$AT RISK':>8} "
-                     f"{'EVENT':<28} {'WHAT IT IS':<44} "
-                     f"{'MKTS':>4} {'POOL$/D':>8}  WHY NOT QUOTED")
+        lines.append("QUOTE GAPS — ranked by ROI (est $/day per $ at risk):")
+        lines.append(f"{'ROI%/DAY':>8} {'EST$/DAY':>8} "
+                     f"{'EVENT':<28} {'WHAT IT IS':<40}  WHY NOT QUOTED")
         for d in show:
             lines.append(
-                f"{yld_str(d):>8} {est_str(d):>8} {exp_str(d):>8} "
+                f"{yld_str(d):>8} {est_str(d):>8} "
                 f"{d['event'][:28]:<28} "
-                f"{(d['title'] or '?')[:44]:<44} "
-                f"{d['n']:>4} {d['pool']:>8,.0f}  "
+                f"{(d['title'] or '?')[:40]:<40}  "
                 f"{d['reason']} ({fmt_window(d['end'], now_utc)})")
     else:
-        lines.append("No unquoted opportunities above the display floor.")
+        lines.append("QUOTE GAPS — none above the display floor.")
     if hidden:
         lines.append(f"...+{len(hidden)} smaller events below "
                      f"${MIN_SHOW_DOLLARS:.2f}/day (est ${hidden_est:,.2f}/day total).")
     if ctx["unest_pool"] > 0:
         lines.append(f"Unestimated (book-read budget): pools totalling "
                      f"${ctx['unest_pool']:,.0f}/day — est shown as '—'.")
-    if deliberate_show:
-        lines.append("")
-        lines.append("DELIBERATELY OFF (blocklist/freeze) — for awareness:")
-        for d in deliberate_show:
-            lines.append(f"  {d['event'][:28]:<28} {(d['title'] or '?')[:40]:<40} "
-                         f"pool {d['pool']:>7,.0f}/d est {est_str(d):>8} "
-                         f"[{d['reason']}]")
+    if deliberate:
+        lines.append(f"Deliberately off (blocklist/freeze): {len(deliberate)} "
+                     f"events, est ${deliberate_est:,.2f}/day — top: "
+                     + ", ".join(f"{d['event']} ({est_str(d)})"
+                                 for d in deliberate_top))
     lines.append("")
-    lines.append("Est = bot's own amended-rules estimator with its standard "
-                 "at-ref ladder overlaid on the live book; assumes full-day "
-                 "two-sided coverage and no competitor response. Partial "
-                 "event estimates are marked '>='. Rows are independent "
-                 "per-market estimates — quoting them all at once would hit "
-                 "the event cap / collateral budget. ROI%/DAY = est $/day "
-                 "per $ at risk. $AT RISK = the modeled ladder's collateral "
-                 "(incl. depth pads), each order weighted by fill "
-                 "intensity x(1 + min(side flow / queue ahead of it, 3)), "
-                 "side flow = 24h volume / 2: an at-touch lot on a "
-                 "churning book counts up to 4x its dollars (it WILL get "
-                 "bought up); a 1c pad with the whole book ahead counts "
-                 "~1x.")
+    lines.append("Est = bot's own estimator with its standard ladder on the "
+                 "live book; assumes full-day coverage, no competitor "
+                 "response; '>=' = partial.")
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
     h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">']
-    h.append(f'<div style="font-size:17px;font-weight:600">IMM quote gaps'
+    h.append(f'<div style="font-size:17px;font-weight:600">IMM quotes and overrides'
              f' <span style="color:#888;font-weight:400">— {today_et}</span></div>')
     h.append(f'<div style="font-size:24px;font-weight:800;margin:8px 0 2px">'
              f'Est <span style="color:#b45309">${headline:,.2f}/day</span> unquoted</div>')
     h.append(f'<div style="color:#555;margin-bottom:10px">'
-             f'{ctx["unquoted_rows"]} paying markets not in the book '
-             f'({ctx["books_read"]} books estimated) &nbsp;·&nbsp; '
              f'quoting <b>{ctx["quoted"]}</b> markets across '
              f'<b>{ctx["quoted_events"]}/{ctx["event_cap"]}</b> events &nbsp;·&nbsp; '
              f'est reward today ${ctx["reward_today"]:,.2f} &nbsp;·&nbsp; '
-             f'{ctx["programs"]} program markets, ${ctx["pool_total"]:,.0f}/day pools</div>')
+             f'{ctx["unquoted_rows"]} paying markets unquoted</div>')
     if ctx["heartbeat_stale"]:
         h.append(f'<div style="color:#c0392b;font-weight:600;margin-bottom:8px">'
                  f'Bot heartbeat stale (updated_at {ctx["updated_at"]}) — '
                  f'"quoted" set may be old.</div>')
+
+    h.append('<div style="font-size:15px;font-weight:600;margin:10px 0 2px">'
+             'Overrides</div>')
+    if ovr_tallies:
+        h.append(f'<div style="color:#555;font-size:13px;margin-bottom:4px">'
+                 f'{_esc(ovr_tallies)}</div>')
+    if ovr_warn:
+        h.append(f'<div style="color:#c0392b;font-weight:600;font-size:13px">'
+                 f'{_esc(ovr_warn)}</div>')
+    if ovr_act:
+        h.append('<div style="color:#c0392b;font-weight:700;margin-top:4px">'
+                 'ACTION NEEDED</div>')
+        h.append('<pre style="font-family:Consolas,monospace;font-size:12px;'
+                 'background:#fdf6f0;border:1px solid #eee;padding:8px;'
+                 'white-space:pre-wrap;margin:4px 0">'
+                 + _esc("\n".join(ovr_act)) + '</pre>')
+    if ovr_info:
+        h.append('<div style="color:#666;font-size:12px;margin-top:2px">'
+                 + "<br>".join(_esc(s) for s in ovr_info) + '</div>')
+    if not (ovr_warn or ovr_act or ovr_info):
+        h.append('<div style="color:#666;font-size:13px">nothing new; '
+                 'all cutoffs covered.</div>')
+
+    h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
+             'Quote gaps</div>')
     if show:
         h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
-                 'ranked by <b>ROI</b>: estimated $ earned per day for each $ '
-                 'at risk. "$ at risk" = the collateral the ladder would tie '
-                 'up, weighted by how likely each order is to be bought up. '
-                 'Ties broken by est $/day.</div>')
+                 'ranked by <b>ROI</b>: est $ earned per day for each $ the '
+                 'ladder would put at risk</div>')
         h.append('<table style="border-collapse:collapse">')
         h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
                  f'<td style="{TD}">ROI %/DAY</td>'
                  f'<td style="{TD}">EST $/DAY</td>'
-                 f'<td style="{TD}">$ AT RISK</td>'
                  f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
-                 f'<td style="{TD}">MKTS</td><td style="{TD}">POOL $/D</td>'
                  f'<td style="{TDL}">WHY NOT QUOTED</td></tr>')
         for i, d in enumerate(show):
             bg = "#fafafa" if i % 2 else "#fff"
@@ -704,11 +767,8 @@ def build_report(now_utc: datetime):
                 f'<tr style="background:{bg}">'
                 f'<td style="{TD};font-weight:700;color:#b45309">{yld_str(d)}</td>'
                 f'<td style="{TD};font-weight:600">{est_str(d)}</td>'
-                f'<td style="{TD}">{exp_str(d)}</td>'
                 f'<td style="{TDL}"><b>{d["event"]}</b></td>'
                 f'<td style="{TDL}">{d["title"] or "?"}</td>'
-                f'<td style="{TD}">{d["n"]}</td>'
-                f'<td style="{TD}">{d["pool"]:,.0f}</td>'
                 f'<td style="{TDL}">{d["reason"]}'
                 f'<span style="color:#999"> · {fmt_window(d["end"], now_utc)}</span>'
                 f'</td></tr>')
@@ -721,42 +781,18 @@ def build_report(now_utc: datetime):
                      f'${MIN_SHOW_DOLLARS:.2f}/day (est ${hidden_est:,.2f}/day total)')
     if ctx["unest_pool"] > 0:
         notes.append(f'unestimated pools (book budget): ${ctx["unest_pool"]:,.0f}/day')
+    if deliberate:
+        notes.append(f'deliberately off (blocklist/freeze): {len(deliberate)} '
+                     f'events, est ${deliberate_est:,.2f}/day — top: '
+                     + ", ".join(f'{d["event"]} ({est_str(d)})'
+                                 for d in deliberate_top))
     if notes:
         h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">'
-                 f'{" · ".join(notes)}</div>')
-    if deliberate_show:
-        h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
-                 'Deliberately off (blocklist / freeze)</div>')
-        h.append('<table style="border-collapse:collapse">')
-        h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
-                 f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
-                 f'<td style="{TD}">POOL $/D</td><td style="{TD}">EST $/D</td>'
-                 f'<td style="{TDL}">STATUS</td></tr>')
-        for i, d in enumerate(deliberate_show):
-            bg = "#fafafa" if i % 2 else "#fff"
-            h.append(f'<tr style="background:{bg}">'
-                     f'<td style="{TDL}">{d["event"]}</td>'
-                     f'<td style="{TDL}">{d["title"] or "?"}</td>'
-                     f'<td style="{TD}">{d["pool"]:,.0f}</td>'
-                     f'<td style="{TD}">{est_str(d)}</td>'
-                     f'<td style="{TDL}">{d["reason"]}</td></tr>')
-        h.append('</table>')
-    h.append('<div style="color:#777;font-size:12px;margin-top:12px;'
-             'border-top:1px solid #eee;padding-top:8px">'
-             'Est = the bot\'s own amended-rules estimator (reference-band '
-             'pro-rata, tick-decay, exclusion coverage) with its standard '
-             'at-ref ladder overlaid on the live book. Assumes full-day '
-             'two-sided coverage, no competitor response. Partial event '
-             'estimates are marked "&ge;". Rows are independent per-market '
-             'estimates — quoting them all at once would hit the event cap / '
-             'collateral budget. ROI %/DAY = est $/day per $ at risk. '
-             '$ AT RISK = the modeled ladder' "'" 's collateral (incl. depth '
-             'pads), each order weighted by fill intensity: &times;(1 + '
-             'min(side flow / queue ahead of it, 3)), side flow = 24h '
-             'volume / 2 — an at-touch lot on a churning book counts up '
-             'to 4&times; its dollars (it will be bought up); a 1c pad '
-             'with the whole book ahead of it counts ~1&times;. Config '
-             'mirrored from the live launcher env.</div>')
+                 f'{" &nbsp;·&nbsp; ".join(notes)}</div>')
+    h.append('<div style="color:#999;font-size:11px;margin-top:10px">'
+             'Est = the bot&rsquo;s own estimator with its standard ladder on '
+             'the live book; assumes full-day coverage, no competitor '
+             'response; "&ge;" = partial.</div>')
     h.append('</div>')
     return text, "".join(h), subject
 
