@@ -108,6 +108,45 @@ WEEKLY_STATUS_DIR = os.environ.get(
 ANNUAL_STATUS_DIR = os.environ.get(
     "CAY_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\crypto-annual")
 
+# One {date: {fleet/monthly/weekly/daily/annual: P&L$}} entry per SENT digest
+# (written by main() next to the sent-marker, never by --test or ad-hoc
+# builds), so the next morning can show day-over-day deltas.
+PNL_HISTORY_PATH = os.path.join(STATUS_DIR, "digest_pnl_history.json")
+
+
+def load_pnl_history() -> dict:
+    try:
+        with open(PNL_HISTORY_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_pnl_history(today_ct, snap: dict) -> None:
+    hist = load_pnl_history()
+    hist[str(today_ct)] = {k: round(v, 2) for k, v in snap.items()}
+    tmp = PNL_HISTORY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(hist, f, indent=0, sort_keys=True)
+    os.replace(tmp, PNL_HISTORY_PATH)
+
+
+def pnl_deltas(today_ct, snap: dict) -> tuple:
+    """(label, {key -> today - baseline}) against the newest history entry
+    BEFORE today: label "d/d" when that entry is yesterday's, "vs YYYY-MM-DD"
+    when the digest skipped days (standby mornings), (None, {}) when there is
+    no usable baseline yet. Keys missing from the baseline entry (sections
+    that postdate it) simply get no delta."""
+    hist = load_pnl_history()
+    prior = [d for d in hist if d < str(today_ct)]
+    if not prior:
+        return None, {}
+    base_day = max(prior)
+    base = hist[base_day]
+    label = ("d/d" if base_day == str(today_ct - timedelta(days=1))
+             else f"vs {base_day}")
+    return label, {k: v - _f(base[k]) for k, v in snap.items() if k in base}
+
 
 def fleet_health(status_dir: str = STATUS_DIR, label: str = "Bots") -> str:
     """One line: only problems (stale bots, error counts from stored summaries)."""
@@ -508,10 +547,11 @@ def collect_rows(client, entries):
     return rows, tot, failed, quiet
 
 
-def text_section(title, rows, tot, quiet, failed, health):
+def text_section(title, rows, tot, quiet, failed, health, dd=None):
     total_pnl = tot["realized"] + tot["unrealized"]
+    dd_str = f" ({dd[0]} {dd[1]:+,.2f})" if dd else ""
     lines = [f"== {title} ==",
-             f"P&L: {total_pnl:+,.2f}  (realized {tot['realized']:+,.2f}, "
+             f"P&L: {total_pnl:+,.2f}{dd_str}  (realized {tot['realized']:+,.2f}, "
              f"unrealized {tot['unrealized']:+,.2f}, fees {tot['fees']:,.2f}) | "
              f"net {tot['net_pos']:+,.0f} | expo ${tot['exposure']:,.2f}"]
     if rows:
@@ -531,11 +571,12 @@ def text_section(title, rows, tot, quiet, failed, health):
     return lines
 
 
-def html_section(title, rows, tot, quiet, failed, health):
+def html_section(title, rows, tot, quiet, failed, health, dd=None):
     total_pnl = tot["realized"] + tot["unrealized"]
+    dd_str = f' ({dd[0]} {_pnl_span(dd[1])})' if dd else ""
     h = [f'<div style="font-size:15px;font-weight:600;margin:14px 0 2px">{title}</div>']
     h.append(f'<div style="color:#555;margin-bottom:8px">'
-             f'P&amp;L {_pnl_span(total_pnl)} &nbsp;&middot;&nbsp; '
+             f'P&amp;L {_pnl_span(total_pnl)}{dd_str} &nbsp;&middot;&nbsp; '
              f'realized {_pnl_span(tot["realized"])} &nbsp;&middot;&nbsp; '
              f'unrealized {_pnl_span(tot["unrealized"])} &nbsp;&middot;&nbsp; '
              f'fees {tot["fees"]:,.2f} &nbsp;&middot;&nbsp; '
@@ -579,10 +620,12 @@ def html_section(title, rows, tot, quiet, failed, health):
 
 
 def build_digest(now_utc: datetime):
-    """Returns (plain_text, html): monthly one-touch section + weekly
-    above/below section in the identical format (Jack 2026-08-12), plus the
-    annual section (2026-08-13) and, under the cumulative table, the last-20
-    settlements table (2026-08-21)."""
+    """Returns (plain_text, html, pnl_snapshot): monthly one-touch section +
+    weekly above/below section in the identical format (Jack 2026-08-12),
+    plus the annual section (2026-08-13) and, under the cumulative table,
+    the last-20 settlements table (2026-08-21). Fleet and section P&L lines
+    carry day-over-day deltas vs the last SENT digest (2026-08-22); the
+    snapshot is what main() records to make tomorrow's deltas."""
     today_ct = now_utc.astimezone(CT).date()
     client = build_client()
 
@@ -613,6 +656,16 @@ def build_digest(now_utc: datetime):
 
     grand = {k: m_tot[k] + w_tot[k] + d_tot[k] + a_tot[k] for k in m_tot}
     grand_pnl = grand["realized"] + grand["unrealized"]
+    snap = {"fleet": grand_pnl,
+            "monthly": m_tot["realized"] + m_tot["unrealized"],
+            "weekly": w_tot["realized"] + w_tot["unrealized"],
+            "daily": d_tot["realized"] + d_tot["unrealized"],
+            "annual": a_tot["realized"] + a_tot["unrealized"]}
+    dd_label, deltas = pnl_deltas(today_ct, snap)
+
+    def dd(key):
+        return (dd_label, deltas[key]) if dd_label and key in deltas else None
+
     m_health = fleet_health(STATUS_DIR, "Monthly bots")
     w_health = fleet_health(WEEKLY_STATUS_DIR, "Updown bots")
     # daily + weekly are the SAME 7 processes; health shown once under weekly
@@ -620,24 +673,25 @@ def build_digest(now_utc: datetime):
     a_health = fleet_health(ANNUAL_STATUS_DIR, "Annual bots")
 
     # ---- plain text (fallback part) ----------------------------------------
+    fleet_dd = f" ({dd_label} {deltas['fleet']:+,.2f})" if dd("fleet") else ""
     lines = [f"Kalshi crypto MM - {today_ct}", ""]
-    lines.append(f"FLEET P&L: {grand_pnl:+,.2f}  "
+    lines.append(f"FLEET P&L: {grand_pnl:+,.2f}{fleet_dd}  "
                  f"(realized {grand['realized']:+,.2f}, unrealized {grand['unrealized']:+,.2f}, "
                  f"fees {grand['fees']:,.2f})")
     lines.append(f"Net position {grand['net_pos']:+,.0f} contracts | "
                  f"$ exposure ${grand['exposure']:,.2f} | balance {bal_str}")
     lines.append("")
     lines += text_section("MONTHLY one-touch (KX*MAXMON/*MINMON)",
-                          m_rows, m_tot, m_quiet, m_failed, m_health)
+                          m_rows, m_tot, m_quiet, m_failed, m_health, dd("monthly"))
     lines.append("")
     lines += text_section("WEEKLY above/below (KX*D)",
-                          w_rows, w_tot, w_quiet, w_failed, w_health)
+                          w_rows, w_tot, w_quiet, w_failed, w_health, dd("weekly"))
     lines.append("")
     lines += text_section("DAILY above/below (KX*D, incl. yesterday's settle)",
-                          d_rows, d_tot, d_quiet, d_failed, d_health)
+                          d_rows, d_tot, d_quiet, d_failed, d_health, dd("daily"))
     lines.append("")
     lines += text_section("ANNUAL touch+terminal (KX*MAXY/*MINY/*Y)",
-                          a_rows, a_tot, a_quiet, a_failed, a_health)
+                          a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
     lines.append("")
     if cum is not None:
         lines += cumulative_text(cum, unreal_by)
@@ -653,8 +707,11 @@ def build_digest(now_utc: datetime):
     h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">']
     h.append(f'<div style="font-size:17px;font-weight:600">Kalshi crypto MM'
              f' <span style="color:#888;font-weight:400">- {today_ct}</span></div>')
+    fleet_dd_html = (f' <span style="font-size:14px;font-weight:400;color:#555">'
+                     f'({dd_label} {_pnl_span(deltas["fleet"])})</span>'
+                     if dd("fleet") else "")
     h.append(f'<div style="font-size:21px;font-weight:700;margin:8px 0 2px">'
-             f'Fleet P&amp;L: {_pnl_span(grand_pnl)}</div>')
+             f'Fleet P&amp;L: {_pnl_span(grand_pnl)}{fleet_dd_html}</div>')
     h.append(f'<div style="color:#555;margin-bottom:4px">'
              f'realized {_pnl_span(grand["realized"])} &nbsp;&middot;&nbsp; '
              f'unrealized {_pnl_span(grand["unrealized"])} &nbsp;&middot;&nbsp; '
@@ -663,13 +720,13 @@ def build_digest(now_utc: datetime):
              f'exposure <b>${grand["exposure"]:,.2f}</b> &nbsp;&middot;&nbsp; '
              f'balance <b>{bal_str}</b></div>')
     h += html_section("Monthly one-touch (KX*MAXMON / *MINMON)",
-                      m_rows, m_tot, m_quiet, m_failed, m_health)
+                      m_rows, m_tot, m_quiet, m_failed, m_health, dd("monthly"))
     h += html_section("Weekly above/below (KX*D)",
-                      w_rows, w_tot, w_quiet, w_failed, w_health)
+                      w_rows, w_tot, w_quiet, w_failed, w_health, dd("weekly"))
     h += html_section("Daily above/below (KX*D, incl. yesterday's settle)",
-                      d_rows, d_tot, d_quiet, d_failed, d_health)
+                      d_rows, d_tot, d_quiet, d_failed, d_health, dd("daily"))
     h += html_section("Annual touch+terminal (KX*MAXY / *MINY / *Y)",
-                      a_rows, a_tot, a_quiet, a_failed, a_health)
+                      a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
     if cum is not None:
         h += cumulative_html(cum, unreal_by)
     else:
@@ -678,7 +735,7 @@ def build_digest(now_utc: datetime):
     if recent:
         h += recent_settlements_html(recent)
     h.append('</div>')
-    return text, "".join(h)
+    return text, "".join(h), snap
 
 
 def main(argv=None) -> int:
@@ -699,10 +756,10 @@ def main(argv=None) -> int:
     # network radio off (observed 2026-07-12: task ran at 7:00:01 mid-standby,
     # exit 1, no email). Retry for up to ~40 minutes so the digest goes out
     # shortly after the machine wakes.
-    body = html = None
+    body = html = snap = None
     for attempt in range(1, 9):
         try:
-            body, html = build_digest(now_utc)
+            body, html, snap = build_digest(now_utc)
             break
         except Exception as e:
             log(f"digest build attempt {attempt}/8 failed: {e!r}; retrying in 5min")
@@ -728,6 +785,7 @@ def main(argv=None) -> int:
     if ok and not args.test:
         with open(marker, "w") as f:
             f.write(now_utc.isoformat())
+        record_pnl_history(today_ct, snap)
         cutoff = today_ct - timedelta(days=7)
         for old in glob.glob(os.path.join(STATUS_DIR, "digest_sent_*.marker")):
             name = os.path.basename(old)[len("digest_sent_"):-len(".marker")]
