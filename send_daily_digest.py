@@ -419,26 +419,30 @@ CUM_FOOTNOTE = ("realized = settled history + open-market round-trips, "
                 "unrealized = the sections above")
 
 # ---- cumulative P&L by TOKEN (Jack 2026-08-22) ----------------------------
-TOKEN_COLS = ("daily", "weekly", "annual", "high", "low")
-TOKEN_FOOTNOTE = ("cells = all-time realized + current unrealized; HIGH/LOW "
-                  "= the monthly one-touch families; a token's P&L column "
-                  "also counts hourly-close scraps that have no column of "
-                  "their own")
+TOKEN_FAMS = ("daily", "weekly", "annual", "high", "low")   # disjoint P&L
+TOKEN_COLS = ("daily", "weekly", "monthly", "annual", "high", "low")
+TOKEN_FOOTNOTE = ("cells = all-time realized + current unrealized; "
+                  "MONTHLY = HIGH + LOW, the monthly one-touch families; "
+                  "a token's P&L column also counts hourly-close scraps "
+                  "that have no column of their own")
 
 
 def _token_matrix(cum_tok, unreal_tok):
     """[(asset, row_total, {family: pnl})] sorted best row first. Cell =
-    all-time realized + current unrealized; the row total additionally
-    carries 'hourly' amounts (manual scraps) that get no column."""
+    all-time realized + current unrealized; MONTHLY is the display sum of
+    high+low (excluded from the row total, which already counts both); the
+    row total additionally carries 'hourly' amounts (manual scraps) that
+    get no column."""
     keys = set(cum_tok) | set(unreal_tok)
     assets = sorted({a for a, _fam in keys})
     rows = []
     for a in assets:
         cells = {f: cum_tok.get((a, f), 0.0) + unreal_tok.get((a, f), 0.0)
-                 for f in TOKEN_COLS}
+                 for f in TOKEN_FAMS}
         total = (sum(cells.values())
                  + cum_tok.get((a, "hourly"), 0.0)
                  + unreal_tok.get((a, "hourly"), 0.0))
+        cells["monthly"] = cells["high"] + cells["low"]
         rows.append((a, total, cells))
     rows.sort(key=lambda r: -r[1])
     return rows
