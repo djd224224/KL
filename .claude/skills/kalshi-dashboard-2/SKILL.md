@@ -66,6 +66,16 @@ drawdown, and per-family breakdown. Then confirm the HTML opened.
 | Freshness | As-of the uploaded export | Latest available from API |
 | Requires Kalshi creds | No | Yes |
 
+## Automated daily rebuild
+
+The Windows scheduled task `KL dashboards-daily` (register once with
+`register_dashboard_task.ps1`; runner: `run_dashboards.ps1`) executes these
+same steps every day at 7:00 AM and overwrites `kalshi_dashboard_latest.html`
+(plus the weather dashboard). The generated HTML carries a 15-minute meta
+refresh, so a browser tab left open on the file picks up each rebuild by
+itself. Manual runs of this skill still work any time — they write the same
+file. Failures email via `send_alert_email.py`; log: `run-logs\dashboards.log`.
+
 ## Troubleshooting
 
 - **"No private key" / auth error**: ensure `Lisa_Kalshi.txt` is in the project root,
