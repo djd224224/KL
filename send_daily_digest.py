@@ -496,51 +496,93 @@ def cumulative_token_html(cum_tok, unreal_tok) -> list:
     return h
 
 
-def cumulative_text(cum, unreal_by) -> list:
-    lines = ["== CUMULATIVE P&L by tenor (all-time) ==",
-             f"{'TENOR':9s} {'REAL$':>9s} {'UNREAL$':>9s} {'TOTAL$':>9s}"]
-    tot_r = tot_u = 0.0
+# fam6 families each tenor row folds together
+TENOR_ROW_FAMS = {"daily": ("daily",), "weekly": ("weekly",),
+                  "monthly": ("high", "low"), "annual": ("annual",),
+                  "hourly": ("hourly",)}
+
+
+def _tenor_rows(cum):
     rows = ["daily", "weekly", "monthly", "annual"]
     if abs(cum.get("hourly", 0.0)) > 0.005:
         rows.append("hourly")
-    for fam in rows:
+    return rows
+
+
+def _tenor_token_cell(fam, asset, cum_tok, unreal_tok):
+    """This token's realized+unrealized on one tenor row (monthly = high+low)."""
+    return sum(cum_tok.get((asset, f), 0.0) + unreal_tok.get((asset, f), 0.0)
+               for f in TENOR_ROW_FAMS[fam])
+
+
+def _token_order(cum_tok, unreal_tok):
+    """Same best-to-worst order the by-token table uses."""
+    return [a for a, _tot, _cells in _token_matrix(cum_tok, unreal_tok)]
+
+
+def cumulative_text(cum, unreal_by, cum_tok, unreal_tok) -> list:
+    tokens = _token_order(cum_tok, unreal_tok)
+    lines = ["== CUMULATIVE P&L by tenor (all-time) ==",
+             f"{'TENOR':9s} {'REAL$':>9s} {'UNREAL$':>9s} {'TOTAL$':>9s} "
+             + " ".join(f"{t:>8s}" for t in tokens)]
+    tot_r = tot_u = 0.0
+    col_tot = {t: 0.0 for t in tokens}
+    for fam in _tenor_rows(cum):
         r = cum.get(fam, 0.0)
         u = unreal_by.get(fam, 0.0)
         tot_r += r
         tot_u += u
-        lines.append(f"{fam:9s} {r:>+9.2f} {u:>+9.2f} {r + u:>+9.2f}")
-    lines.append(f"{'TOTAL':9s} {tot_r:>+9.2f} {tot_u:>+9.2f} {tot_r + tot_u:>+9.2f}")
-    lines.append(f"({CUM_FOOTNOTE})")
+        cells = []
+        for t in tokens:
+            v = _tenor_token_cell(fam, t, cum_tok, unreal_tok)
+            col_tot[t] += v
+            cells.append(f"{v:>+8.2f}")
+        lines.append(f"{fam:9s} {r:>+9.2f} {u:>+9.2f} {r + u:>+9.2f} "
+                     + " ".join(cells))
+    lines.append(f"{'TOTAL':9s} {tot_r:>+9.2f} {tot_u:>+9.2f} "
+                 f"{tot_r + tot_u:>+9.2f} "
+                 + " ".join(f"{col_tot[t]:>+8.2f}" for t in tokens))
+    lines.append(f"({CUM_FOOTNOTE}; token columns = that token's "
+                 f"realized+unrealized on the row's tenor)")
     return lines
 
 
-def cumulative_html(cum, unreal_by) -> list:
+def cumulative_html(cum, unreal_by, cum_tok, unreal_tok) -> list:
+    tokens = _token_order(cum_tok, unreal_tok)
     h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
          'Cumulative P&amp;L by tenor (all-time)</div>',
          '<table style="border-collapse:collapse">',
          f'<tr style="background:#f0f0f0;font-weight:600">'
          f'<td style="{TDL}">TENOR</td><td style="{TD}">REAL$</td>'
-         f'<td style="{TD}">UNREAL$</td><td style="{TD}">TOTAL$</td></tr>']
+         f'<td style="{TD}">UNREAL$</td><td style="{TD}">TOTAL$</td>'
+         + "".join(f'<td style="{TD}">{t}</td>' for t in tokens) + '</tr>']
     tot_r = tot_u = 0.0
-    rows = ["daily", "weekly", "monthly", "annual"]
-    if abs(cum.get("hourly", 0.0)) > 0.005:
-        rows.append("hourly")
-    for i, fam in enumerate(rows):
+    col_tot = {t: 0.0 for t in tokens}
+    for i, fam in enumerate(_tenor_rows(cum)):
         r = cum.get(fam, 0.0)
         u = unreal_by.get(fam, 0.0)
         tot_r += r
         tot_u += u
         bg = "#fafafa" if i % 2 else "#fff"
-        h.append(f'<tr style="background:{bg}"><td style="{TDL}">{fam}</td>'
-                 f'<td style="{TD}">{_pnl_span(r)}</td>'
-                 f'<td style="{TD}">{_pnl_span(u)}</td>'
-                 f'<td style="{TD};font-weight:600">{_pnl_span(r + u)}</td></tr>')
+        row = [f'<tr style="background:{bg}"><td style="{TDL}">{fam}</td>'
+               f'<td style="{TD}">{_pnl_span(r)}</td>'
+               f'<td style="{TD}">{_pnl_span(u)}</td>'
+               f'<td style="{TD};font-weight:600">{_pnl_span(r + u)}</td>']
+        for t in tokens:
+            v = _tenor_token_cell(fam, t, cum_tok, unreal_tok)
+            col_tot[t] += v
+            row.append(f'<td style="{TD}">{_pnl_span(v)}</td>')
+        h.append("".join(row) + '</tr>')
     h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
              f'<td style="{TDL}">TOTAL</td><td style="{TD}">{_pnl_span(tot_r)}</td>'
              f'<td style="{TD}">{_pnl_span(tot_u)}</td>'
-             f'<td style="{TD}">{_pnl_span(tot_r + tot_u)}</td></tr>')
+             f'<td style="{TD}">{_pnl_span(tot_r + tot_u)}</td>'
+             + "".join(f'<td style="{TD}">{_pnl_span(col_tot[t])}</td>'
+                       for t in tokens) + '</tr>')
     h.append('</table>')
-    h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">{CUM_FOOTNOTE}</div>')
+    h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">'
+             f'{CUM_FOOTNOTE}; token columns = that token&#39;s '
+             f'realized+unrealized on the row&#39;s tenor</div>')
     return h
 
 
@@ -816,7 +858,7 @@ def build_digest(now_utc: datetime):
                           a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
     lines.append("")
     if cum is not None:
-        lines += cumulative_text(cum, unreal_by)
+        lines += cumulative_text(cum, unreal_by, cum_tok, unreal_tok)
         lines.append("")
         lines += cumulative_token_text(cum_tok, unreal_tok)
     else:
@@ -852,7 +894,7 @@ def build_digest(now_utc: datetime):
     h += html_section("Annual touch+terminal (KX*MAXY / *MINY / *Y)",
                       a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
     if cum is not None:
-        h += cumulative_html(cum, unreal_by)
+        h += cumulative_html(cum, unreal_by, cum_tok, unreal_tok)
         h += cumulative_token_html(cum_tok, unreal_tok)
     else:
         h.append('<div style="color:#c0392b;margin-top:8px">cumulative '
