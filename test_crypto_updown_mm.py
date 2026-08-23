@@ -1159,11 +1159,10 @@ class TestFleetIsolation(unittest.TestCase):
     def test_updown_caps_are_its_own(self):
         C = ud.UpDownMarketMaker
         self.assertEqual((C.max_position, C.max_event), (80.0, 400.0))
-        # the monthly's per-market cap returned to 80 on 8/22, so the old
-        # inequality-based isolation proof went away; independence rests on
-        # the CUD_/CMM_ env split, and each fleet's values are pinned here
-        self.assertEqual(mm.TouchMarketMaker.max_position, 80.0)
-        self.assertEqual(mm.TouchMarketMaker.max_event, 500.0)
+        # independence rests on the CUD_/CMM_ env split; each fleet's values
+        # are pinned here (monthly 200/1000 since 8/22 pm)
+        self.assertEqual(mm.TouchMarketMaker.max_position, 200.0)
+        self.assertEqual(mm.TouchMarketMaker.max_event, 1000.0)
 
     def test_data_cache_still_shared(self):
         self.assertTrue(mm._cache_path("price", "XBTUSD").startswith(mm.STATUS_DIR))

@@ -138,17 +138,19 @@ CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 5))
 # Risk / hygiene parameters
 # Caps scale proportionally with ladder size. History: 3x8 -> 128/800;
 # 5x10 (x50/24) -> 267/1667 (2026-08-01); 5x12 (x1.2) -> 320/2000 (2026-08-05);
-# BACK to 3x5 -> 80/500 (Jack 2026-08-22 "return to 3x5" — the 7/3-era pairing;
-# the by-token table showed the monthly HIGH family carrying the account's
-# biggest cumulative losses at 5x12). Markets already holding more than the
-# 80 cap quote reduce-only until they shrink below it.
-MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 80))  # per market, either sign
+# BACK to 3x5 with 80/500 (Jack 2026-08-22 am "return to 3x5" — the 7/3-era
+# pairing; the by-token table showed the monthly HIGH family carrying the
+# account's biggest cumulative losses at 5x12); caps widened same day to
+# 200/1000 (Jack "expand to 200/market, 1000/event") — ladder stays 3x5, so
+# the caps are room to ACCUMULATE, not bigger resting size. Markets holding
+# more than the cap quote reduce-only until they shrink below it.
+MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 200))  # per market, either sign
 # Net cap across all strikes of one event (they are one correlated bet on the
 # same spot). 500 comfortably exceeds 8 full 3x10 ladders (480): non-binding
 # at rest so every bucket gets the full spec ladder; binds as fills
 # accumulate. The event budget is split evenly across quotable markets each
 # cycle.
-MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 500))
+MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 1000))
 SKIP_FAIR_ABOVE_CENTS = 97       # near-certain touch: model risk dominates, stand down
 BOOK_DIVERGENCE_BID = 85         # best bid >= this while our fair is 20c+ lower ->
 BOOK_DIVERGENCE_GAP = 20         # ... suspected touch we can't see; stand down
