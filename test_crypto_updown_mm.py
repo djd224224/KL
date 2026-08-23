@@ -708,6 +708,17 @@ class TestDailyDefenses(unittest.TestCase):
     momentum stand-down, per-asset offset. All daily-only — weekly's
     warehousing made +252 its first settled week and stays untouched."""
 
+    def test_btc_daily_is_switched_off(self):
+        """Jack 2026-08-23 "turn off daily BTC": cumulative daily BTC -315
+        while the six other dailies were collectively positive. Weekly BTC
+        stays; the other assets keep their dailies."""
+        self.assertEqual(ud.DISABLED_ASSET_CADENCES, {("BTC", "daily")})
+        self.assertEqual(ud.effective_cadences("BTC", ("daily", "weekly")),
+                         ("weekly",))
+        self.assertEqual(ud.effective_cadences("ETH", ("daily", "weekly")),
+                         ("daily", "weekly"))
+        self.assertEqual(ud.effective_cadences("BTC", ("weekly",)), ("weekly",))
+
     def test_config_is_pinned(self):
         self.assertEqual(ud.SKEW_BY_CADENCE, {"daily": (4.0, 25.0)})
         self.assertEqual(ud.SKEW_EDGE_FLOOR_CENTS, 3.0)

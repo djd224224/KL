@@ -189,6 +189,25 @@ QUOTE_OFFSET_BY_ASSET_CADENCE = {
     ("BTC", "daily"): _env_i("CUD_QUOTE_OFFSET_DAILY_BTC", 6),
 }
 
+# (asset, tenor) pairs deliberately switched OFF (Jack 2026-08-23 "turn off
+# daily BTC": cumulative daily BTC sat at -315 while the six other dailies
+# were collectively positive — the defenses slowed the bleed, the off switch
+# ends it; BTC weekly stays on). Applied in main() so the effective cadence
+# set shows in the banner; env CUD_DISABLED_ASSET_CADENCES="BTC:daily,..."
+# (unknown cadences ignored).
+DISABLED_ASSET_CADENCES = frozenset(
+    (a.strip(), c.strip())
+    for a, _, c in (p.partition(":") for p in os.environ.get(
+        "CUD_DISABLED_ASSET_CADENCES", "BTC:daily").split(","))
+    if c.strip() in CADENCES and a.strip())
+
+
+def effective_cadences(asset: str, cadences: Sequence[str]) -> Tuple[str, ...]:
+    """The requested cadences minus this asset's deliberate off-switches."""
+    return tuple(c for c in cadences
+                 if (asset, c) not in DISABLED_ASSET_CADENCES)
+
+
 # ---- daily-tenor defenses (Jack 2026-08-17, after the fill autopsy) -------
 # The 8/14-8/16 daily losses were NOT settlement-window gamma: per-fill P&L
 # bucketed by hours-to-close showed the bleed spread across the whole day
@@ -1092,6 +1111,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ValueError as e:
         ap.error(str(e))
 
+    requested = cadences
+    cadences = effective_cadences(args.asset, cadences)
+    if not cadences:
+        ap.error(f"every requested cadence is disabled for {args.asset} "
+                 f"(CUD_DISABLED_ASSET_CADENCES)")
+
     cfg = ASSETS[args.asset]
     client = mm.build_client()
 
@@ -1117,6 +1142,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             cfg.asset, status_dir=UpDownMarketMaker.status_dir,
             heartbeat_max_age_secs=3 * IDLE_POLL_SECS):
         return 1
+
+    for c in requested:
+        if c not in cadences:
+            log(f"=== {cfg.asset} {c} tenor DISABLED "
+                f"(CUD_DISABLED_ASSET_CADENCES) ===")
 
     bot = UpDownMarketMaker(cfg, client, live=args.live, cadences=cadences)
     overridden = (set(CONTRACTS_PER_LEVEL_BY_CADENCE) | set(NUM_LEVELS_BY_CADENCE)
