@@ -708,6 +708,23 @@ class TestDailyDefenses(unittest.TestCase):
     momentum stand-down, per-asset offset. All daily-only — weekly's
     warehousing made +252 its first settled week and stays untouched."""
 
+    def test_no_tenor_quotes_inside_thirty_minutes_of_determination(self):
+        """Jack 2026-08-23: stop placing orders 30min from the determination
+        datetime. Gates measure to close_time (the print), and deselection
+        cancels resting orders, so <=30min means a CLEAR book."""
+        self.assertTrue(all(v >= 1800 for v in ud.MIN_SECS_LEFT.values()),
+                        ud.MIN_SECS_LEFT)
+        self.assertEqual(ud.MIN_SECS_LEFT["daily"], 1800)
+        self.assertEqual(ud.MIN_SECS_LEFT["hourly"], 1800)
+        self.assertEqual(ud.MIN_SECS_LEFT["weekly"], 3600)
+        # a daily 29 minutes from its print is out; 31 minutes is in
+        for mins, want in ((29, 0), (31, 1)):
+            end = NOW + timedelta(minutes=mins)
+            daily = [mkt(100000, EV_D, end - timedelta(hours=25), end)]
+            views = ud.build_event_views(daily, NOW)
+            self.assertEqual(len(ud.select_events(views, ("daily",), NOW)),
+                             want, mins)
+
     def test_btc_daily_is_switched_off(self):
         """Jack 2026-08-23 "turn off daily BTC": cumulative daily BTC -315
         while the six other dailies were collectively positive. Weekly BTC

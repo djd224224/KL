@@ -126,9 +126,15 @@ WEEKLY_MAX_HOURS = _env_f("CUD_WEEKLY_MAX_HOURS", 400.0)
 # becomes a step function at expiry, and settlement is the average of the final
 # 60 seconds (settlement_timer_seconds=60) — the worst possible moment to be
 # resting size. Scaled to the tenor: 3 min is ~5% of an hourly window.
+# Floor of 30 min everywhere (Jack 2026-08-23 "stop placing orders 30min
+# from the determination datetime"): daily was 900s, hourly 180s. All gates
+# measure to close_time = the determination print (the 8/14 basis fix), and
+# deselection actively CANCELS resting orders via sweep_deselected — inside
+# the window the book is clear, not just unrefreshed. An hourly event (tenor
+# not enabled) would now quote only its first ~30 minutes.
 MIN_SECS_LEFT = {
-    "hourly": _env_f("CUD_MIN_SECS_LEFT_HOURLY", 180),
-    "daily": _env_f("CUD_MIN_SECS_LEFT_DAILY", 900),
+    "hourly": _env_f("CUD_MIN_SECS_LEFT_HOURLY", 1800),
+    "daily": _env_f("CUD_MIN_SECS_LEFT_DAILY", 1800),
     "weekly": _env_f("CUD_MIN_SECS_LEFT_WEEKLY", 3600),
     "annual": _env_f("CUD_MIN_SECS_LEFT_ANNUAL", 86400),
 }
