@@ -40,7 +40,10 @@ def _apply_probe_env() -> None:
             txt = f.read()
     except OSError:
         return
-    m = re.search(r'\$ProbeEnv\s*=\s*"(.+?)"', txt, re.S)
+    # Anchor on `"set ` and stay single-line: the launcher also has the
+    # empty `$ProbeEnv = ""` initializer, which a lazy `.+?` with re.S
+    # walks straight through into cross-line garbage.
+    m = re.search(r'\$ProbeEnv\s*=\s*"(set [^"\n]+)"', txt)
     if not m:
         return
     for k, v in re.findall(r"set ([A-Z_0-9]+)=([^&]*)&&", m.group(1) + "&&"):
