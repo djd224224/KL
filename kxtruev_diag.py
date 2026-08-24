@@ -93,7 +93,9 @@ def main() -> None:
     open_now = [m for m in markets if m.get("status") in ("active", "open")]
     print(f"total KXTRUEV markets: {len(markets)}; OPEN now: {len(open_now)}")
     for m in open_now[:20]:
-        print(f"  {m.get('ticker', '?'):42s} open {m.get('open_time', '?')}"
+        bid = imm.market_cents(m, "yes_bid")
+        ask = imm.market_cents(m, "yes_ask")
+        print(f"  {m.get('ticker', '?'):42s} bid {bid!s:>4} ask {ask!s:>4}"
               f"  close {m.get('close_time', '?')}")
 
     section("0. LIVE ACCOUNT SNAPSHOT (is the trading box's bot alive?)")
@@ -121,6 +123,32 @@ def main() -> None:
     print(f"resting orders on the account: {len(resting)}; "
           f"imm- bot orders: {len(imm_orders)}; on KXTRUEV: {len(truev_orders)}")
     print(f"newest imm- order created: {newest or 'n/a'}")
+    # Manual-standoff discriminator: a NON-imm resting order or an account
+    # position >= IMM_MANUAL_STANDOFF (5) on any KXTRUEV market stands the
+    # bot off the WHOLE event by design (manual_events()). Print both
+    # signals so "manual skip" vs "pinned book" is decided by data.
+    foreign_truev = [o for o in resting
+                     if str(o.get("ticker", "")).startswith("KXTRUEV")
+                     and not str(o.get("client_order_id", "")).startswith("imm-")]
+    print(f"NON-imm resting orders on KXTRUEV: {len(foreign_truev)}")
+    for o in foreign_truev[:10]:
+        print(f"  foreign: {o.get('ticker')} {o.get('side', o.get('book_side'))}"
+              f" x{o.get('remaining_count')} created {o.get('created_time')}")
+    pos = []
+    cursor = None
+    while True:
+        resp = client.get_positions(limit=200, cursor=cursor)
+        batch = resp.get("market_positions") or []
+        pos.extend(batch)
+        cursor = resp.get("cursor")
+        if not cursor or not batch or len(pos) > 5000:
+            break
+    truev_pos = [p for p in pos
+                 if str(p.get("ticker", "")).startswith("KXTRUEV")
+                 and abs(float(p.get("position") or 0)) > 0]
+    print(f"KXTRUEV account positions: {len(truev_pos)}")
+    for p in truev_pos[:10]:
+        print(f"  position: {p.get('ticker')} net {p.get('position')}")
     if truev_orders:
         print("-> the box IS quoting KXTRUEV; nothing left to fix.")
     elif imm_orders:
