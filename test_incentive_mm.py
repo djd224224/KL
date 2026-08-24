@@ -1119,6 +1119,13 @@ class TestAllowlist(unittest.TestCase):
         # Truflation's OTHER Kalshi index stays out until asked for — exact
         # series matching, so KXTRUEV must not admit it
         self.assertFalse(a("KXTRUFAIDP-26AUG26-T50"))
+        # KXTRUEV lists each market ON its print day (Jack 2026-08-24), so it
+        # must carry the close-anchored cutoff — cutoff_from_close_min is the
+        # exact attribute the ticker-date pre-filter branches on; without it
+        # the midnight-ET rule kills every market at listing and the series
+        # ships dark (which is how it shipped the first time).
+        self.assertEqual(
+            imm.series_override("KXTRUEV").cutoff_from_close_min, 60)
         # Rate bar KEPT (Jack 2026-08-05) but scoped to the first strike of
         # an event the bot is not already working — see
         # TestRateBarScopedToNewEvents.
@@ -2866,6 +2873,22 @@ class TestStickySelection(unittest.TestCase):
         got = imm.apply_series_cutoff_adjustments(
             "KXGOOD", "KXGOOD-99DEC31", close, close_time=close)
         self.assertEqual(got, close)
+
+    def test_truev_print_day_market_survives_its_own_ticker_date(self):
+        # Kalshi lists each KXTRUEV daily ON its print day (Jack 2026-08-24:
+        # the enrollment shipped dark — the midnight-ET rule's cutoff was
+        # already past the moment each market appeared). The close-anchored
+        # override governs instead: refresh_universe's cutoff_from_close_min
+        # branch skips trade_cutoff_utc entirely, and the shared tightener
+        # yields close-60 for both producers.
+        close = utc(2026, 8, 25, 21, 0)   # print day Aug 25, 5pm ET close
+        got = imm.apply_series_cutoff_adjustments(
+            "KXTRUEV", "KXTRUEV-26AUG25", None, close_time=close)
+        self.assertEqual(got, utc(2026, 8, 25, 20, 0))
+        # 60 aligns with the 1h closing screen — a resting order must never
+        # outlive the screen that would refresh it
+        self.assertEqual(imm.series_override("KXTRUEV").cutoff_from_close_min,
+                         int(imm.MIN_HOURS_TO_CLOSE * 60))
 
     def test_rate_floor_horizon_escape(self):
         # Jack 2026-08-03: a fresh candidate admits on est_rate >= the series

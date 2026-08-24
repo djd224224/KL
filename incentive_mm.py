@@ -651,9 +651,9 @@ def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
 # Windows run to 01:59 ET rather than stopping at midnight: the gas/diesel
 # DAILIES trade until 01:59 ET, so ending at midnight would hand back full
 # size for the last two hours of their life (rain dailies never get that far —
-# their cutoff ends quoting at 10pm; KXTRUEV's midnight-ET ticker rule stands
-# down the imminent print day, but later-dated siblings still quote the
-# overnight tail and stay halved through it). Prefixes are deliberately the
+# their cutoff ends quoting at 10pm; KXTRUEV quotes its single print day to a
+# close-anchored cutoff, so the tail just covers however late Kalshi's close
+# runs). Prefixes are deliberately the
 # DAILY tickers — KXAAAGASW/M weeklies and monthlies keep full size. Times
 # are America/New_York (so EDT in summer), the convention every other window
 # in this file uses.
@@ -1083,13 +1083,16 @@ _DEFAULT_ECON_SERIES = (
     # KXTRUEV added 2026-08-24 (Jack: "allowlist this series"): Truflation EV
     # Commodity Index — a once-DAILY print computed from metals futures
     # (cobalt/copper/nickel/palladium/platinum) whose sessions settle by early
-    # afternoon ET, so the evening book trades against a largely knowable
-    # number — the AAA-survey shape again. Day-dated tickers (KXTRUEV-26APR15)
-    # parse -> the midnight-ET rule stops quoting before each print day, and
-    # the 5pm ET size halving (IMM_SERIES_HOUR_MULT below) covers the knowable
-    # evening hours before that. EXACT series matching keeps Truflation's
-    # OTHER Kalshi index (KXTRUFAIDP, AI & DePIN) out until asked for.
-    # Re-entry guards apply like every econ print.
+    # afternoon ET, so the late-day book trades against a largely knowable
+    # number. UNLIKE the gas trackers, Kalshi lists each daily only ON its
+    # print day (Jack, same day, after the enrollment shipped dark), so the
+    # day-dated tickers (KXTRUEV-26APR15) must NOT reach the midnight-ET rule
+    # — it would kill every market at listing. The SERIES_OVERRIDES entry
+    # below swaps in a close-anchored cutoff (the KXTEMP/AQI shape), and the
+    # 5pm ET size halving (IMM_SERIES_HOUR_MULT) covers the knowable
+    # afternoon-into-evening stretch. EXACT series matching keeps
+    # Truflation's OTHER Kalshi index (KXTRUFAIDP, AI & DePIN) out until
+    # asked for. Re-entry guards apply like every econ print.
     "KXTRUEV")
 # Rotten Tomatoes score markets (Jack 2026-07-23): undated tickers
 # (KXRT-<MOVIE>-<score>) -> occurrence-based cutoff when Kalshi provides
@@ -1246,6 +1249,27 @@ for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
             event_day_cutoff_et=(
                 _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
                 _env_int("IMM_RATES_CUTOFF_MIN_ET", 30)))
+
+# KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
+# after the enrollment shipped dark: "i think Kalshi only lists each market
+# on its print day" / "make sure KXTRUEV is quoting"). That breaks the
+# midnight-ET ticker rule — the right default for every other day-dated
+# print — because the cutoff is already past the moment the market appears:
+# the bot enrolls the series and never quotes a single market of it. The
+# whole life IS the event day, the KXTEMP/AQI shape, so swap in a
+# close-anchored cutoff: quote the print day, be out 60 minutes before
+# Kalshi's close_time. 60 aligns the order-expiration cap with the 1h
+# closing screen (MIN_HOURS_TO_CLOSE) — a smaller buffer would leave resting
+# quotes alive after the screen stops refreshing them, stale in the most
+# informed window (the 2026-08-04 temp-orphan lesson). The 5pm ET size
+# halving (IMM_SERIES_HOUR_MULT) and safe-join placement remain the
+# adverse-selection layers before that. Replaces the re-entry loop's entry,
+# so the rate bar + safe-join are restated (the KXDIESELW/Treasuries
+# pattern).
+SERIES_OVERRIDES["KXTRUEV"] = SeriesOverride(
+    min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
+    safe_join=True,
+    cutoff_from_close_min=_env_int("IMM_TRUEV_CUTOFF_FROM_CLOSE_MIN", 60))
 
 # AAA PRINT BLACKOUT (Jack 2026-08-04: "stop getting sniped ... ensure my
 # quotes expire beforehand"). Observed post times, from the gas sniper's own
