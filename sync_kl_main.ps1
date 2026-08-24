@@ -37,6 +37,38 @@ if (-not $dashTask) {
     "$stamp dashboards kicked to build first settlements archive from seed" | Add-Content -Path $Log -Encoding utf8
 }
 
+# One-shot windowed IMM restart (Jack 2026-08-24 "restart for me at that
+# time"): bumping $RestartRequest in a main push makes the NEXT sync run
+# dispatch restart_imm.ps1 exactly once on this machine — the script itself
+# waits for the :50-:05 hourly-temp dead window before killing the bot, and
+# the launcher relaunches it on the freshly synced code. The done-stamp is
+# LOCAL (run-logs\incentive-mm\ is untracked), so each request id fires
+# once here; a future restart request = push a new id. Dispatched DETACHED
+# on purpose: the window wait can be ~45 min and this sync runs every 30 —
+# a blocking call would pile syncs up behind it. Note the two-tick latency:
+# the sync that PULLS a new id is still executing the old script, so the
+# id dispatches on the run after (~30-60 min post-push), then the window.
+# Stamp is written AFTER a successful dispatch — a failed Start-Process
+# retries next sync (a duplicate windowed restart is harmless; a silently
+# lost one is not).
+$RestartRequest = '20260824-kxtruev-cutover'
+if ($RestartRequest) {
+    $rrDir = Join-Path $Repo "run-logs\incentive-mm"
+    $rrStamp = Join-Path $rrDir "restart_request_$RestartRequest.done"
+    $rrScript = Join-Path $Repo "restart_imm.ps1"
+    if (-not (Test-Path $rrStamp) -and (Test-Path $rrScript)) {
+        New-Item -ItemType Directory -Force $rrDir | Out-Null
+        $rrProc = Start-Process -PassThru -WindowStyle Hidden powershell.exe -ArgumentList @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $rrScript)
+        if ($rrProc) {
+            "$stamp restart request '$RestartRequest' dispatched (restart_imm.ps1 pid $($rrProc.Id), waits for :50-:05 window)" | Add-Content -Path $Log -Encoding utf8
+            New-Item -ItemType File -Force $rrStamp | Out-Null
+        } else {
+            "$stamp ! restart request '$RestartRequest' FAILED to dispatch; will retry next sync" | Add-Content -Path $Log -Encoding utf8
+        }
+    }
+}
+
 # Cap the log at ~500 lines so it never grows unbounded
 $lines = @(Get-Content $Log)
 if ($lines.Count -gt 500) { $lines[-200..-1] | Set-Content -Path $Log -Encoding utf8 }

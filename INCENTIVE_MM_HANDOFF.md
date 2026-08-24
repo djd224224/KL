@@ -307,19 +307,25 @@ an anchor:
 
 - **Use `restart_imm.ps1`** (Jack 2026-08-24: "always restart bot in the
   :45 - 1:05 timeframe, if there is an hourly temp market. since hourly temp
-  isnt quoted"). Hourly temp (KXTEMP*H) quotes ~hh:11 (program activation)
-  to ~hh:50 (close-10 cutoff) — the richest pools in the feed live mid-hour,
-  and :45-:05 brackets the dead zone where a restart forfeits nothing
-  (resting orders die server-side at TTL/cutoff regardless; a python kill
-  does not cancel them). The script reads `selected_tickers` from
-  `imm_state.json`: hourly temp in play → waits for the window; temp dark or
-  no bot process running → restarts immediately.
+  isnt quoted"; window shifted to **:50-:05** later the same day). Hourly
+  temp (KXTEMP*H) quotes ~hh:11 (program activation) to ~hh:50 (close-10
+  cutoff) — the richest pools in the feed live mid-hour, and :50-:05 IS the
+  dead zone where a restart forfeits nothing (resting orders die server-side
+  at TTL/cutoff regardless; a python kill does not cancel them). The script
+  reads `selected_tickers` from `imm_state.json`: hourly temp in play →
+  waits for the window; temp dark or no bot process running → restarts
+  immediately.
 - Default mode kills the `incentive_mm.py` python; the launcher relaunches
   it ~30s later with freshly imported code — the right tool after a
   sync-kl-main code pull. `-Task` does the full scheduled-task bounce (stop
   task, sweep orphaned pythons — the 2026-08-01 Stop-ScheduledTask double —
   start task): **required after a `$ProbeEnv`/launcher change**, which a
   python kill would keep stale. `-Now` skips the window wait (emergencies).
+- **Remote restart from a Claude session**: bump `$RestartRequest` in
+  `sync_kl_main.ps1` and push to main — the sync task dispatches
+  `restart_imm.ps1` (windowed, detached) exactly once per request id on the
+  next sync run after the pull, ~30-60 min post-push. Done-stamps live in
+  `run-logs\incentive-mm\restart_request_<id>.done` (local, untracked).
 
 ## Go-live checklist (when Jack says go)
 
