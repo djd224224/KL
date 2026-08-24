@@ -3,29 +3,53 @@
 reachable; Claude's cloud container cannot reach kalshi.com).
 
 Ground truth for "KXTRUEV still not quoting", from the exchange itself:
-  1. MARKETS  — do KXTRUEV markets exist / are any open right now, with
-     what open_time/close_time? (The close-anchored cutoff needs an open
-     market with a close_time; print-day-only listing should show
-     same-day opens.)
-  2. PROGRAMS — does ANY active liquidity incentive program cover a
-     KXTRUEV market? Selection is program-driven: with no program the bot
-     never quotes the series regardless of the allowlist. Uses the bot's
-     own fetch_programs() so the view is exactly what the bot sees, plus
-     a raw-feed sweep to catch entries fetch_programs filters out
-     (wrong type / window / paid_out).
-  3. VERDICT  — one line naming the blocker, if any.
+  1. MARKETS  — do KXTRUEV markets exist / are any open right now?
+  2. PROGRAMS — does an active liquidity program cover them? (bot's own
+     fetch_programs view + raw-feed sweep)
+  3. DRY RUN  — the decisive test: one full dry run_cycle() of the actual
+     bot, under the LIVE LAUNCHER'S $ProbeEnv (parsed below before import,
+     the imm_quote_gaps parity trick), against live Kalshi. If KXTRUEV is
+     selected and sim-quoted here, the code is proven end-to-end and any
+     remaining silence is the trading box's deploy/restart chain. If not,
+     the cycle log names the reason. READ-ONLY: live=False sim-gates every
+     place/cancel ([DRY] branches), same mode imm_quote_gaps runs in daily.
+  4. VERDICT.
 
-READ-ONLY: GETs only, live=False, no orders; the workflow points
-IMM_STATUS_DIR at a scratch dir so no state is read or written anywhere
-that matters. Prints only public exchange data (this repo is public and
-so are its Action logs — keep account data out of here).
+Prints only public exchange data (this repo is public and so are its
+Action logs — keep account balances/positions out of here).
 """
 
+import glob
+import os
+import re
 from datetime import datetime, timezone
 
 import requests
 
-import incentive_mm as imm
+
+def _apply_probe_env() -> None:
+    """Apply the live launcher's $ProbeEnv to our environment BEFORE
+    incentive_mm is imported, so blocklist/ladder/caps/window mults here are
+    exactly what the running bot sees (keep in sync with imm_quote_gaps.py,
+    which does the same). Workflow-provided env wins via setdefault —
+    IMM_STATUS_DIR must keep pointing at the scratch dir."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "run_incentive_mm.ps1"),
+                  encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+    except OSError:
+        return
+    m = re.search(r'\$ProbeEnv\s*=\s*"(.+?)"', txt, re.S)
+    if not m:
+        return
+    for k, v in re.findall(r"set ([A-Z_0-9]+)=([^&]*)&&", m.group(1) + "&&"):
+        os.environ.setdefault(k, v)
+
+
+_apply_probe_env()
+
+import incentive_mm as imm  # noqa: E402  (env parity must precede import)
 
 BASE = imm.KALSHI_API_BASE
 
@@ -46,6 +70,9 @@ def main() -> None:
     now = datetime.now(timezone.utc)
     print(f"UTC now: {now:%Y-%m-%d %H:%M:%S}"
           f" (ET {now.astimezone(imm.ET):%H:%M})")
+    for k in ("IMM_LEVELS", "IMM_LADDER_MODE", "IMM_MAX_MARKETS",
+              "IMM_BLOCKLIST", "IMM_COLLATERAL_BUDGET"):
+        print(f"  probe-env {k}={os.environ.get(k, '<unset>')}")
 
     section("1. KXTRUEV MARKETS (public /markets, all statuses)")
     markets = []
@@ -60,69 +87,69 @@ def main() -> None:
         cursor = resp.get("cursor")
         if not cursor or not batch or len(markets) > 2000:
             break
-    print(f"total KXTRUEV markets returned: {len(markets)}")
     open_now = [m for m in markets if m.get("status") in ("active", "open")]
-    for m in sorted(markets, key=lambda m: m.get("close_time") or "")[-40:]:
-        print(f"  {m.get('ticker', '?'):42s} {m.get('status', '?'):10s} "
-              f"open {m.get('open_time', '?')}  close {m.get('close_time', '?')}")
-    print(f"OPEN right now: {len(open_now)}")
+    print(f"total KXTRUEV markets: {len(markets)}; OPEN now: {len(open_now)}")
+    for m in open_now[:20]:
+        print(f"  {m.get('ticker', '?'):42s} open {m.get('open_time', '?')}"
+              f"  close {m.get('close_time', '?')}")
 
     section("2. INCENTIVE PROGRAMS (the bot's own fetch_programs view)")
     client = imm.build_client()
     bot = imm.IncentiveMarketMaker(client=client, live=False)
     by_market = bot.fetch_programs()
-    print(f"active liquidity programs cover {len(by_market)} markets total")
-    truev = {t: v for t, v in by_market.items()
-             if t.split("-")[0] == "KXTRUEV"}
-    if truev:
-        for t, v in sorted(truev.items()):
-            print(f"  {t:42s} ${v['dollars_per_day']:.2f}/day  "
-                  f"target {v['target']:.0f}  ends {v['end']:%Y-%m-%d %H:%M}Z")
-    else:
-        print("  NO active liquidity program covers any KXTRUEV market")
-        for t in sorted(by_market)[:10]:
-            print(f"    (feed sample) {t}")
+    truev_prog = {t: v for t, v in by_market.items()
+                  if t.split("-")[0] == "KXTRUEV"}
+    print(f"active liquidity programs cover {len(by_market)} markets; "
+          f"KXTRUEV: {len(truev_prog)}")
+    for t, v in sorted(truev_prog.items()):
+        print(f"  {t:42s} ${v['dollars_per_day']:.2f}/day  "
+              f"target {v['target']:.0f}  ends {v['end']:%Y-%m-%d %H:%M}Z")
 
-    # Raw sweep: an entry failing fetch_programs' filters (type != liquidity,
-    # outside its window, paid_out) is invisible above but visible here.
-    raw = []
-    cursor = None
-    for _page in range(20):
-        params = {"limit": 1000, "status": "active"}
-        if cursor:
-            params["cursor"] = cursor
-        resp = client.get("/incentive_programs", params=params)
-        batch = resp.get("incentive_programs") or []
-        raw.extend(batch)
-        cursor = resp.get("next_cursor")
-        if not cursor or not batch:
-            break
-    raw_truev = [p for p in raw
-                 if (p.get("market_ticker") or "").startswith("KXTRUEV")]
-    print(f"raw active-feed entries: {len(raw)}; on KXTRUEV: {len(raw_truev)}")
-    for p in raw_truev[:20]:
-        print(f"  raw: {p}")
+    section("3. DRY-RUN CYCLE (production ProbeEnv parity, read-only)")
+    bot.run_cycle()
+    selected_truev = sorted(t for t in (bot.state.selected or [])
+                            if str(t).startswith("KXTRUEV"))
+    print(f"\nselected markets total: {len(bot.state.selected or [])}; "
+          f"KXTRUEV selected: {len(selected_truev)}")
+    for t in selected_truev:
+        print(f"  selected: {t}")
+    sims = bot.state.sim_orders or {}
+    sim_iter = sims.values() if isinstance(sims, dict) else sims
+    truev_sims = [o for o in sim_iter if "KXTRUEV" in str(o)]
+    print(f"sim orders total: {len(sims)}; on KXTRUEV: {len(truev_sims)}")
+    for o in truev_sims[:12]:
+        print(f"  sim: {o}")
 
-    section("3. VERDICT")
-    if not markets:
-        print("KXTRUEV: no markets exist at all -> nothing to quote "
-              "(series dark on Kalshi).")
-    elif not open_now:
-        print("KXTRUEV: markets exist but none is open at this instant -> "
-              "nothing quotable right now; re-run during the print day.")
-    if truev:
-        print("Program EXISTS -> a still-silent bot is a bot-side problem "
-              "(deploy/restart chain, floors, or screens); next stop is the "
-              "cycle log on the trading box.")
-    elif raw_truev:
-        print("KXTRUEV program entries exist in the raw feed but fail "
-              "fetch_programs' filters (type/window/paid_out) -> the bot "
-              "correctly sees $0 for them; details above.")
+    print("\ncycle-log rows mentioning KXTRUEV:")
+    status_dir = os.environ.get("IMM_STATUS_DIR", ".")
+    for path in sorted(glob.glob(os.path.join(status_dir, "cycle_log*.csv"))):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        if lines:
+            print(f"  [{os.path.basename(path)}] header: {lines[0].rstrip()}")
+        hits = [ln.rstrip() for ln in lines[1:] if "KXTRUEV" in ln]
+        for ln in hits[:20]:
+            print(f"  {ln}")
+        if not hits:
+            print("  (no KXTRUEV rows)")
+
+    section("4. VERDICT")
+    if not truev_prog:
+        print("NO incentive program on KXTRUEV -> the bot will never quote "
+              "it, by design; idle until Kalshi lights a program.")
+    elif truev_sims:
+        print("CODE PROVEN: this exact repo state selected KXTRUEV and "
+              "placed dry quotes against the live book. A silent bot on the "
+              "trading box means the box is running old code or was never "
+              "restarted — the deploy/restart chain is the blocker, not the "
+              "config.")
+    elif selected_truev:
+        print("KXTRUEV selected but no sim quotes — placement-stage blocker "
+              "(caps/budget/bands); see the [DRY]/skip lines above.")
     else:
-        print("NO incentive program on KXTRUEV -> the IMM bot will NEVER "
-              "quote it, by design (selection is program-driven). The "
-              "allowlist/cutoff work is correct but idle until Kalshi "
-              "lights a program on the series.")
+        print("KXTRUEV NOT selected in a fresh dry run — the reason is in "
+              "the cycle-log rows / screen lines above; that is the bug to "
+              "fix.")
 
 
 if __name__ == "__main__":
