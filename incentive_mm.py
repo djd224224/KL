@@ -1478,6 +1478,52 @@ STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
 HALT_FILE = os.path.join(STATUS_DIR, "HALT")
 
+# Self-restart on code change (Jack 2026-08-24 "restart for me at that time",
+# generalized after the ps1 dispatch chain proved unobservable): sync-kl-main
+# fast-forwards the repo every 30 min, but nothing reliably bounced the bot
+# afterward — the KXTRUEV enrollment shipped and sat inert on a running
+# process ($0 quoted against 15 live $106.89/day programs) because config
+# loads at import. The bot now watches its OWN source file's mtime: when a
+# sync lands new code, it exits cleanly at the next safe moment and the
+# launcher relaunches it ~30s later on the new code. Safe moment = the
+# :50-:05 hourly-temp dead window (restart_imm.ps1's rule) whenever an
+# hourly temp market is in the current selection, immediately otherwise; the
+# new mtime must also be >=60s old so a file mid-write is never imported
+# half-copied. The clean exit runs shutdown_cancel exactly like SIGINT.
+# IMM_EXIT_ON_CODE_CHANGE=0 disables.
+EXIT_ON_CODE_CHANGE = os.environ.get("IMM_EXIT_ON_CODE_CHANGE", "1") == "1"
+_SOURCE_PATH = os.path.abspath(__file__)
+try:
+    _SOURCE_MTIME = os.path.getmtime(_SOURCE_PATH)
+except OSError:
+    _SOURCE_MTIME = 0.0
+_HOURLY_TEMP_RE = re.compile(r"^KXTEMP[A-Z]+H-")
+
+
+def code_change_exit_due(selected, now_utc: datetime,
+                         current_mtime: Optional[float] = None,
+                         now_ts: Optional[float] = None) -> bool:
+    """True when the on-disk source differs from the imported one and this
+    instant is safe to restart in. `selected` is the live selection (ticker
+    -> meta; only the tickers are read) — hourly-temp membership is judged
+    on the same ^KXTEMP<CITY>H- shape restart_imm.ps1 keys on. The
+    current_mtime/now_ts params exist for tests."""
+    if not EXIT_ON_CODE_CHANGE:
+        return False
+    if current_mtime is None:
+        try:
+            current_mtime = os.path.getmtime(_SOURCE_PATH)
+        except OSError:
+            return False
+    if current_mtime == _SOURCE_MTIME:
+        return False
+    if (now_ts if now_ts is not None else time.time()) - current_mtime < 60:
+        return False
+    minute = now_utc.astimezone(ET).minute
+    if minute >= 50 or minute <= 5:
+        return True
+    return not any(_HOURLY_TEMP_RE.match(str(t)) for t in (selected or ()))
+
 ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")
 ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
 ALERT_RECIPIENTS = [r.strip() for r in os.environ.get(
@@ -5802,6 +5848,12 @@ class IncentiveMarketMaker:
                 now_utc = datetime.now(timezone.utc)
                 self.alerter.maybe_daily_summary(now_utc, self.build_daily_summary)
                 self.write_status(now_utc)
+                if (not once and not stopping["flag"]
+                        and code_change_exit_due(self.state.selected, now_utc)):
+                    log(f"{self.tag} source file changed on disk (synced "
+                        f"deploy); clean exit at the safe window — launcher "
+                        f"relaunches on the new code")
+                    break
                 if once or stopping["flag"]:
                     break
                 backoff = min(2 ** max(0, self.state.consecutive_errors - 1), 8)

@@ -326,6 +326,15 @@ an anchor:
   `restart_imm.ps1` (windowed, detached) exactly once per request id on the
   next sync run after the pull, ~30-60 min post-push. Done-stamps live in
   `run-logs\incentive-mm\restart_request_<id>.done` (local, untracked).
+- **The bot also restarts itself on code changes** (2026-08-24, after the
+  KXTRUEV enrollment sat inert on a running process): `incentive_mm`
+  watches its own source mtime and cleanly exits at the next safe moment —
+  the :50-:05 window when hourly temp is selected, immediately otherwise,
+  never on an mtime younger than 60s — and the launcher relaunches it on
+  the new code (`code_change_exit_due`; `IMM_EXIT_ON_CODE_CHANGE=0`
+  disables). Code deploys therefore self-apply once this version is
+  running; the dispatch/ps1 remain for launcher-env changes and manual
+  bounces.
 
 ## Go-live checklist (when Jack says go)
 

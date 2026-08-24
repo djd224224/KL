@@ -51,7 +51,12 @@ if (-not $dashTask) {
 # Stamp is written AFTER a successful dispatch — a failed Start-Process
 # retries next sync (a duplicate windowed restart is harmless; a silently
 # lost one is not).
-$RestartRequest = '20260824-kxtruev-cutover'
+# -2: retry (2026-08-24 pm) — the first id's outcome was unobservable from
+# the cloud side and KXTRUEV was still dark after a proven-good dry run;
+# ids are cheap. Once the in-bot self-restart (incentive_mm
+# code_change_exit_due) is running, future code deploys need no dispatch
+# at all — this stays for env changes and belt-and-suspenders.
+$RestartRequest = '20260824-kxtruev-cutover-2'
 if ($RestartRequest) {
     $rrDir = Join-Path $Repo "run-logs\incentive-mm"
     $rrStamp = Join-Path $rrDir "restart_request_$RestartRequest.done"

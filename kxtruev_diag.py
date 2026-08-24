@@ -96,8 +96,41 @@ def main() -> None:
         print(f"  {m.get('ticker', '?'):42s} open {m.get('open_time', '?')}"
               f"  close {m.get('close_time', '?')}")
 
-    section("2. INCENTIVE PROGRAMS (the bot's own fetch_programs view)")
+    section("0. LIVE ACCOUNT SNAPSHOT (is the trading box's bot alive?)")
+    # Same account key as the box, so resting imm- orders ARE the live bot's
+    # output: order TTL is <=30 min, so ANY resting imm- order proves the
+    # quote loop ran within the last half hour, and a KXTRUEV order proves
+    # the new code is in. Counts + one timestamp only — repo and logs are
+    # public, keep the footprint out of them.
     client = imm.build_client()
+    resting = []
+    cursor = None
+    while True:
+        resp = client.get_orders(status="resting", limit=200, cursor=cursor)
+        batch = resp.get("orders") or []
+        resting.extend(batch)
+        cursor = resp.get("cursor")
+        if not cursor or not batch or len(resting) > 5000:
+            break
+    imm_orders = [o for o in resting
+                  if str(o.get("client_order_id", "")).startswith("imm-")]
+    truev_orders = [o for o in imm_orders
+                    if str(o.get("ticker", "")).startswith("KXTRUEV")]
+    newest = max((str(o.get("created_time") or "") for o in imm_orders),
+                 default="")
+    print(f"resting orders on the account: {len(resting)}; "
+          f"imm- bot orders: {len(imm_orders)}; on KXTRUEV: {len(truev_orders)}")
+    print(f"newest imm- order created: {newest or 'n/a'}")
+    if truev_orders:
+        print("-> the box IS quoting KXTRUEV; nothing left to fix.")
+    elif imm_orders:
+        print("-> bot ALIVE on the box (fresh imm- orders) but ZERO KXTRUEV "
+              "-> it is running OLD code; the restart is what's missing.")
+    else:
+        print("-> NO resting imm- orders: the bot on the box looks DOWN "
+              "(or between waves); launcher/watchdog territory.")
+
+    section("2. INCENTIVE PROGRAMS (the bot's own fetch_programs view)")
     bot = imm.IncentiveMarketMaker(client=client, live=False)
     by_market = bot.fetch_programs()
     truev_prog = {t: v for t, v in by_market.items()

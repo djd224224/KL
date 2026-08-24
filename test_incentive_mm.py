@@ -5609,6 +5609,62 @@ class TestShippedHourMultDefaults(unittest.TestCase):
         self.assertEqual(self.rules["KXRAIN"].get(19), 0.5)
 
 
+class TestCodeChangeSelfRestart(unittest.TestCase):
+    """Jack 2026-08-24: deploys sat inert because nothing restarted the bot
+    after sync pulled new code (KXTRUEV shipped allowlisted and still quoted
+    $0 against live programs). The bot now exits for the launcher at the
+    next safe moment when its own source file changes on disk."""
+
+    CHANGED = imm._SOURCE_MTIME + 1000.0
+    AGED = CHANGED + 3600.0          # now_ts making the new mtime >=60s old
+    TEMP = {"KXTEMPMIAH-26AUG2415-T80.99": None}
+
+    def _at(self, minute):
+        return imm.ET.localize(
+            datetime(2026, 8, 24, 12, minute)).astimezone(timezone.utc)
+
+    def test_no_change_no_exit(self):
+        self.assertFalse(imm.code_change_exit_due(
+            self.TEMP, self._at(55), current_mtime=imm._SOURCE_MTIME,
+            now_ts=self.AGED))
+
+    def test_changed_and_no_hourly_temp_exits_any_minute(self):
+        for m in (7, 30, 44):
+            self.assertTrue(imm.code_change_exit_due(
+                {}, self._at(m), current_mtime=self.CHANGED,
+                now_ts=self.AGED), m)
+        # weekly average-temp is NOT hourly temp — no window hold
+        self.assertTrue(imm.code_change_exit_due(
+            {"KXAVGTKDFW-26AUG24-B85.5": None}, self._at(30),
+            current_mtime=self.CHANGED, now_ts=self.AGED))
+
+    def test_changed_with_hourly_temp_waits_for_the_window(self):
+        for m in (7, 30, 49):
+            self.assertFalse(imm.code_change_exit_due(
+                self.TEMP, self._at(m), current_mtime=self.CHANGED,
+                now_ts=self.AGED), m)
+        for m in (50, 55, 0, 5):
+            self.assertTrue(imm.code_change_exit_due(
+                self.TEMP, self._at(m), current_mtime=self.CHANGED,
+                now_ts=self.AGED), m)
+
+    def test_fresh_mtime_settles_first(self):
+        # a file the sync is still writing must never be half-imported
+        self.assertFalse(imm.code_change_exit_due(
+            {}, self._at(55), current_mtime=self.CHANGED,
+            now_ts=self.CHANGED + 10))
+
+    def test_kill_switch(self):
+        old = imm.EXIT_ON_CODE_CHANGE
+        try:
+            imm.EXIT_ON_CODE_CHANGE = False
+            self.assertFalse(imm.code_change_exit_due(
+                {}, self._at(55), current_mtime=self.CHANGED,
+                now_ts=self.AGED))
+        finally:
+            imm.EXIT_ON_CODE_CHANGE = old
+
+
 class TestSideMaxClampedToPositionCap(unittest.TestCase):
     """A single side may not rest more than the market's whole net position
     cap. Live breach 2026-08-04 (KXTEMPAUSH-26AUG0409-T79.99, cap 50): long
