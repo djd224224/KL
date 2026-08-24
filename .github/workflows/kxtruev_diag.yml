@@ -3,8 +3,17 @@ name: KXTRUEV diagnostic
 # do markets exist, are any open, and does an active liquidity incentive
 # program cover them. Read-only against Kalshi (GETs only, live=False).
 # Safe to delete once KXTRUEV is resolved.
+# push-trigger exists because the GitHub App integration cannot POST
+# workflow dispatches (403) — re-running = push a change to any listed
+# path (kxtruev_diag.trigger is a scratch file for exactly that).
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - kxtruev_diag.py
+      - .github/workflows/kxtruev_diag.yml
+      - kxtruev_diag.trigger
 jobs:
   diag:
     runs-on: ubuntu-latest
