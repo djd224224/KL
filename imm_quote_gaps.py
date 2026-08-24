@@ -257,6 +257,7 @@ _FAMILY = {
     "KXUSGASCPI": "US gasoline CPI print",
     "KXNHSALES": "US new-home sales print",
     "KXSCFI": "Shanghai container freight index",
+    "KXTRUEV": "Truflation EV commodity index, daily print",
     "KXRT": "Rotten Tomatoes critic score",
     "KXBKFT": "Burger King monthly foot traffic",
     "KXYUMTBFT": "Taco Bell monthly foot traffic",

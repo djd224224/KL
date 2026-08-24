@@ -1111,12 +1111,18 @@ class TestAllowlist(unittest.TestCase):
                   "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
                   "KXUSGASCPI-26AUG12-T320",
                   # diesel enrolled 2026-08-02 evening under re-entry guards
-                  "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30"):
+                  "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30",
+                  # Truflation EV index enrolled 2026-08-24 (Jack) — daily
+                  # print, day-dated tickers, same guards as the gas prints
+                  "KXTRUEV-26AUG26-T30.5"):
             self.assertTrue(a(t), t)
+        # Truflation's OTHER Kalshi index stays out until asked for — exact
+        # series matching, so KXTRUEV must not admit it
+        self.assertFalse(a("KXTRUFAIDP-26AUG26-T50"))
         # Rate bar KEPT (Jack 2026-08-05) but scoped to the first strike of
         # an event the bot is not already working — see
         # TestRateBarScopedToNewEvents.
-        for _s in ("KXDIESELD", "KXAAAGASD", "KXUSGASCPI"):
+        for _s in ("KXDIESELD", "KXAAAGASD", "KXUSGASCPI", "KXTRUEV"):
             self.assertEqual(imm.series_min_est_rate(_s), 2.0, _s)
             self.assertTrue(imm.series_safe_join(_s), _s)
         # KXDIESELW override (Jack 2026-08-03): rate bar off, safe-join kept
@@ -5443,7 +5449,8 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
     """Jack 2026-08-04: halve the ladder on KXDIESELD / KXAAAGASD / KXRAIN
     from 4pm ET. Window runs to 01:59 ET because the gas/diesel dailies trade
     until then — stopping at midnight would restore full size for their last
-    two hours."""
+    two hours. KXTRUEV (Jack 2026-08-24, with its allowlisting) halves an
+    hour later, from 5pm ET."""
 
     def setUp(self):
         # Pin the config under test instead of reading whatever
@@ -5451,7 +5458,8 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
         # stays green under an env override.
         self._saved = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = imm._parse_series_hour_mults(
-            "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5")
+            "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5,"
+            "KXTRUEV:17-1:0.5")
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved
@@ -5474,6 +5482,16 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
             self.assertEqual(
                 imm.hour_size_mult("KXDIESELD", self._at(h)), 0.5, f"ET {h}")
         self.assertEqual(imm.hour_size_mult("KXDIESELD", self._at(2)), 1.0)
+
+    def test_truev_halved_from_5pm_et(self):
+        # Jack 2026-08-24: KXTRUEV halves an hour later than gas/diesel —
+        # full size through the 4pm hour, half from 5pm through the
+        # overnight tail (later-dated siblings keep quoting past midnight).
+        self.assertEqual(imm.hour_size_mult("KXTRUEV", self._at(16)), 1.0)
+        for h in (17, 20, 23, 0, 1):
+            self.assertEqual(
+                imm.hour_size_mult("KXTRUEV", self._at(h)), 0.5, f"ET {h}")
+        self.assertEqual(imm.hour_size_mult("KXTRUEV", self._at(2)), 1.0)
 
     def test_full_size_before_4pm(self):
         for h in (9, 12, 15):
@@ -5542,6 +5560,30 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
         for bad in ("KXA", "KXA:", ":1-2:0.5", "KXA:99-1:0.5", "KXA:1-2:x"):
             with self.assertRaises(ValueError, msg=bad):
                 imm._parse_series_hour_mults(bad)
+
+
+class TestShippedHourMultDefaults(unittest.TestCase):
+    """TestPerSeriesHourMultiplier pins its own spec to assert the RULE, so
+    a rule silently dropped from the shipped IMM_SERIES_HOUR_MULT default
+    would still pass it. Assert the import-time default directly (skipped
+    under an env override, like the allowlist-default tests effectively are)."""
+
+    def setUp(self):
+        if os.environ.get("IMM_SERIES_HOUR_MULT"):
+            self.skipTest("IMM_SERIES_HOUR_MULT env override active")
+        self.rules = dict(imm.SERIES_HOUR_MULTS)
+
+    def test_truev_default_halves_at_5pm_not_4(self):
+        # Jack 2026-08-24: "halve normal quote amounts starting at 5pm EST"
+        self.assertIn("KXTRUEV", self.rules)
+        self.assertNotIn(16, self.rules["KXTRUEV"])
+        for h in (17, 23, 0, 1):
+            self.assertEqual(self.rules["KXTRUEV"].get(h), 0.5, f"ET {h}")
+
+    def test_gas_diesel_rain_defaults_still_present(self):
+        self.assertEqual(self.rules["KXDIESELD"].get(16), 0.5)
+        self.assertEqual(self.rules["KXAAAGASD"].get(16), 0.5)
+        self.assertEqual(self.rules["KXRAIN"].get(19), 0.5)
 
 
 class TestSideMaxClampedToPositionCap(unittest.TestCase):

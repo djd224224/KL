@@ -644,16 +644,23 @@ def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
 # blanket one. Jack 2026-08-04: "on KXDIESELD and KXAAAGASD events, cut the
 # contract size in half starting at 4pm EST"; rain was extended in the same
 # breath but moved to 7pm on 2026-08-15 (Jack: "halve size at 7pm ET", paired
-# with the rain cutoff moving 9pm -> 10pm). Windows run to 01:59 ET rather
-# than stopping at midnight: the gas/diesel DAILIES trade until 01:59 ET, so
-# ending at midnight would hand back full size for the last two hours of
-# their life (rain dailies never get that far — their cutoff ends quoting at
-# 10pm). Prefixes are deliberately the DAILY tickers — KXAAAGASW/M weeklies
-# and monthlies keep full size. Times are America/New_York (so EDT in
-# summer), the convention every other window in this file uses.
+# with the rain cutoff moving 9pm -> 10pm). KXTRUEV joined 2026-08-24 at 5pm
+# (Jack, with its allowlisting: "halve normal quote amounts starting at 5pm
+# EST" — the Truflation print's metals-futures inputs settle by early
+# afternoon ET, so evening quotes rest against a largely knowable number).
+# Windows run to 01:59 ET rather than stopping at midnight: the gas/diesel
+# DAILIES trade until 01:59 ET, so ending at midnight would hand back full
+# size for the last two hours of their life (rain dailies never get that far —
+# their cutoff ends quoting at 10pm; KXTRUEV's midnight-ET ticker rule stands
+# down the imminent print day, but later-dated siblings still quote the
+# overnight tail and stay halved through it). Prefixes are deliberately the
+# DAILY tickers — KXAAAGASW/M weeklies and monthlies keep full size. Times
+# are America/New_York (so EDT in summer), the convention every other window
+# in this file uses.
 SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
     "IMM_SERIES_HOUR_MULT",
-    "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:19-1:0.5"))
+    "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:19-1:0.5,"
+    "KXTRUEV:17-1:0.5"))
 
 
 def hour_size_mult(series: str, now_utc: datetime) -> float:
@@ -1072,7 +1079,18 @@ _DEFAULT_ECON_SERIES = (
     # the series was never enrolled; $222/day/mkt x 21 strikes live). Same
     # day-dated midnight-ET safety as the gas trackers; re-entry guards apply.
     "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI,"
-    "KXDIESELD,KXDIESELW")
+    "KXDIESELD,KXDIESELW,"
+    # KXTRUEV added 2026-08-24 (Jack: "allowlist this series"): Truflation EV
+    # Commodity Index — a once-DAILY print computed from metals futures
+    # (cobalt/copper/nickel/palladium/platinum) whose sessions settle by early
+    # afternoon ET, so the evening book trades against a largely knowable
+    # number — the AAA-survey shape again. Day-dated tickers (KXTRUEV-26APR15)
+    # parse -> the midnight-ET rule stops quoting before each print day, and
+    # the 5pm ET size halving (IMM_SERIES_HOUR_MULT below) covers the knowable
+    # evening hours before that. EXACT series matching keeps Truflation's
+    # OTHER Kalshi index (KXTRUFAIDP, AI & DePIN) out until asked for.
+    # Re-entry guards apply like every econ print.
+    "KXTRUEV")
 # Rotten Tomatoes score markets (Jack 2026-07-23): undated tickers
 # (KXRT-<MOVIE>-<score>) -> occurrence-based cutoff when Kalshi provides
 # one, else continuous quoting; bands/floor gate as usual.
@@ -1168,7 +1186,10 @@ _REENTRY_SERIES = (
     # keeps IMM out of print-day books, so no 3:20am sniper collision.
     # Diesel enrolled 2026-08-02 evening (same class, never allowed before).
     "KXAC,KXNHSALES,KXSCFI,KXAAAGASD,KXAAAGASW,KXAAAGASM,KXUSGASCPI,"
-    "KXDIESELD,KXDIESELW,KXBKFT,KXYUMTBFT,"
+    # KXTRUEV enrolled 2026-08-24 with the same guards as the other price
+    # prints — a tight two-sided book until a published number lands is
+    # exactly what safe-join placement exists for.
+    "KXDIESELD,KXDIESELW,KXBKFT,KXYUMTBFT,KXTRUEV,"
     # Treasury yields enrolled 2026-08-04 — a rate print is exactly the book
     # safe-join exists for: it sits tight and two-sided until the number
     # lands, so joining the touch is the expensive way to be there.
