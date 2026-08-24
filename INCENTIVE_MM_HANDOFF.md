@@ -303,6 +303,24 @@ an anchor:
 - Daily summary email 7:00 AM ET-ish (counters roll 6 AM ET): markets quoted,
   est. reward/day captured, realized P&L, fills, top inventory, alert counts.
 
+## Restarting the live bot
+
+- **Use `restart_imm.ps1`** (Jack 2026-08-24: "always restart bot in the
+  :45 - 1:05 timeframe, if there is an hourly temp market. since hourly temp
+  isnt quoted"). Hourly temp (KXTEMP*H) quotes ~hh:11 (program activation)
+  to ~hh:50 (close-10 cutoff) — the richest pools in the feed live mid-hour,
+  and :45-:05 brackets the dead zone where a restart forfeits nothing
+  (resting orders die server-side at TTL/cutoff regardless; a python kill
+  does not cancel them). The script reads `selected_tickers` from
+  `imm_state.json`: hourly temp in play → waits for the window; temp dark or
+  no bot process running → restarts immediately.
+- Default mode kills the `incentive_mm.py` python; the launcher relaunches
+  it ~30s later with freshly imported code — the right tool after a
+  sync-kl-main code pull. `-Task` does the full scheduled-task bounce (stop
+  task, sweep orphaned pythons — the 2026-08-01 Stop-ScheduledTask double —
+  start task): **required after a `$ProbeEnv`/launcher change**, which a
+  python kill would keep stale. `-Now` skips the window wait (emergencies).
+
 ## Go-live checklist (when Jack says go)
 
 1. `python -m unittest test_incentive_mm` → all green.
