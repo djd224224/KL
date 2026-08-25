@@ -1,0 +1,33 @@
+name: KXLOW public data pull
+# Fetches PUBLIC data only (Kalshi market data, IEM CLI reports, Open-Meteo
+# forecasts) for the low-temp bot analysis and commits the gzipped CSVs back
+# to the branch that triggered it. Touches no account secrets.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/daily-low-temp-bot-analysis-jpulbm
+    paths:
+      - analysis/kxlow/fetch_public_data.py
+      - .github/workflows/kxlow_data_pull.yml
+permissions:
+  contents: write
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install requests
+      - name: Fetch public data
+        run: python analysis/kxlow/fetch_public_data.py
+      - name: Commit data back to branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analysis/kxlow/data
+          git commit -m "data: KXLOW public market/trade/CLI/forecast pull" || echo "nothing to commit"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
