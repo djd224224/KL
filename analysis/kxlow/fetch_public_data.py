@@ -105,6 +105,7 @@ def _count(obj):
 
 def fetch_markets():
     rows = []
+    raw = []
     for city, abv in CITY_ABV.items():
         series = f"KXLOW{abv}"
         cursor, n = None, 0
@@ -115,6 +116,8 @@ def fetch_markets():
             data = get(f"{BASE}/markets", params)
             batch = data.get("markets", [])
             for m in batch:
+                m["_city"] = city
+                raw.append(m)
                 rows.append({
                     "city": city,
                     "series": series,
@@ -145,13 +148,39 @@ def fetch_markets():
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows(rows)
+    # Full raw payloads too — the flat CSV guesses at field names and the
+    # API has been migrating (e.g. volume) between int-cents and _fp/dollars
+    # shapes; the raw dump means no second round trip if a guess is wrong.
+    with gzip.open(os.path.join(OUT_DIR, "kxlow_markets_raw.json.gz"), "wt") as f:
+        json.dump(raw, f)
     print(f"markets: {len(rows)} -> {path}")
-    return rows
+    return raw
+
+
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
+
+
+def event_date(event_ticker):
+    """KXLOWTSEA-26AUG25 -> date(2026, 8, 25); None if unparseable."""
+    try:
+        tail = event_ticker.rsplit("-", 1)[1]
+        return date(2000 + int(tail[:2]), MONTHS[tail[2:5]], int(tail[5:7]))
+    except Exception:
+        return None
 
 
 def fetch_trades(markets):
-    traded = [m for m in markets if (m.get("volume") or 0) > 0]
-    print(f"markets with volume>0: {len(traded)}")
+    # The bot went live 2026-07-22; pull the tape for every non-embryonic
+    # market in the era rather than trusting the volume field (which the
+    # current API no longer returns under that flat name).
+    traded = []
+    for m in markets:
+        d = event_date(m.get("event_ticker") or "")
+        if d and d >= date(2026, 7, 15) and m.get("status") != "initialized":
+            traded.append(m)
+    print(f"markets in trading era: {len(traded)}")
     rows = []
     for i, m in enumerate(traded):
         t = m["ticker"]
@@ -165,7 +194,7 @@ def fetch_trades(markets):
             for tr in batch:
                 rows.append({
                     "ticker": t,
-                    "city": m["city"],
+                    "city": m["_city"],
                     "created_time": tr.get("created_time"),
                     "count": _count(tr),
                     "yes_price": _cents(tr, "yes_price", "yes_price_dollars"),
