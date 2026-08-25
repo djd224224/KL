@@ -1129,9 +1129,14 @@ class TestAllowlist(unittest.TestCase):
         # Rate bar KEPT (Jack 2026-08-05) but scoped to the first strike of
         # an event the bot is not already working — see
         # TestRateBarScopedToNewEvents.
-        for _s in ("KXDIESELD", "KXAAAGASD", "KXUSGASCPI", "KXTRUEV"):
+        for _s in ("KXDIESELD", "KXAAAGASD", "KXUSGASCPI"):
             self.assertEqual(imm.series_min_est_rate(_s), 2.0, _s)
             self.assertTrue(imm.series_safe_join(_s), _s)
+        # KXTRUEV: bar OFF (2026-08-25, the KXDIESELW pattern) — at program
+        # open its strikes est within pennies of the $2 bar, which decided
+        # a $89/day/market event on book noise. Safe-join + $1 floor stay.
+        self.assertEqual(imm.series_min_est_rate("KXTRUEV"), 0.0)
+        self.assertTrue(imm.series_safe_join("KXTRUEV"))
         # KXDIESELW override (Jack 2026-08-03): rate bar off, safe-join kept
         self.assertEqual(imm.series_min_est_rate("KXDIESELW"), 0.0)
         self.assertTrue(imm.series_safe_join("KXDIESELW"))

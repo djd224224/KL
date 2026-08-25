@@ -1266,8 +1266,14 @@ for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
 # adverse-selection layers before that. Replaces the re-entry loop's entry,
 # so the rate bar + safe-join are restated (the KXDIESELW/Treasuries
 # pattern).
+# Rate bar OFF for KXTRUEV (2026-08-25, the KXDIESELW pattern): measured at
+# program open (01:29Z, books just formed), the in-band strikes est
+# $2.05-2.44/day against the $2.00 bar — pennies of book noise decide
+# whether a $89-107/day-per-market event enters at all, and the bar is
+# horizon-blind besides. The $1 payout floor (which these pools clear by
+# 2x within hours) and safe-join placement remain the actual gates.
 SERIES_OVERRIDES["KXTRUEV"] = SeriesOverride(
-    min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
+    min_est_per_day=_env_float("IMM_TRUEV_MIN_RATE", 0.0),
     safe_join=True,
     cutoff_from_close_min=_env_int("IMM_TRUEV_CUTOFF_FROM_CLOSE_MIN", 60))
 
