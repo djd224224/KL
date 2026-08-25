@@ -1,0 +1,4 @@
+variant,trades,contracts,cost,pnl
+strict (window+size+<=50c),2913,4597.32,1812.56,-330.12
+"window, any size <=50c",5123,67851.29,26943.69,-4368.94
+all maker-NO on buckets,126205,2409082.59,1304195.82,-74729.68

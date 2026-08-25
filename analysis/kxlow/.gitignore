@@ -1,0 +1,2 @@
+# regenerable binary intermediates; the CSV/JSON aggregates ARE committed
+output/*.pkl

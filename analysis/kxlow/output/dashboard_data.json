@@ -1,0 +1,2267 @@
+{
+ "generated": "2026-08-25 12:51Z",
+ "era": [
+  "2026-07-23",
+  "2026-08-24"
+ ],
+ "controls": {
+  "pre_live_sig_contracts_per_day": 45.1,
+  "pre_live_sig_roi": 0.017,
+  "thu_dayof_contracts_per_day": 39.3,
+  "nonthu_dayof_contracts_per_day": 75.2,
+  "contamination_share": 0.523,
+  "bot_share": 0.477,
+  "lookalike_roi_combined": 0.046,
+  "thu_lookalike_roi": 0.097
+ },
+ "adjusted": {
+  "pnl": -157.47,
+  "cost": 832.02,
+  "contracts": 2105,
+  "note": "strict estimate scaled by the Thursday-control bot share",
+  "pnl_pessimistic": -372.09,
+  "roi_range": [
+   -0.189,
+   -0.447
+  ]
+ },
+ "open_exposure": 68.28,
+ "totals": {
+  "pnl": -330.12,
+  "cost": 1744.28,
+  "roi": -0.1893,
+  "contracts": 4414,
+  "trades": 2802,
+  "markets": 331,
+  "days_with_fills": 33,
+  "days_live": 33,
+  "win_rate_mkts": 0.438,
+  "max_drawdown": -404.17
+ },
+ "tail_share": [
+  {
+   "city": "Atlanta",
+   "tail_day_share": 0.242
+  },
+  {
+   "city": "Boston",
+   "tail_day_share": 0.727
+  },
+  {
+   "city": "Dallas",
+   "tail_day_share": 0.121
+  },
+  {
+   "city": "Houston",
+   "tail_day_share": 0.0
+  },
+  {
+   "city": "Las Vegas",
+   "tail_day_share": 0.781
+  },
+  {
+   "city": "Minneapolis",
+   "tail_day_share": 0.333
+  },
+  {
+   "city": "New Orleans",
+   "tail_day_share": 0.0
+  },
+  {
+   "city": "Oklahoma City",
+   "tail_day_share": 0.212
+  },
+  {
+   "city": "Phoenix",
+   "tail_day_share": 0.531
+  },
+  {
+   "city": "San Antonio",
+   "tail_day_share": 0.062
+  },
+  {
+   "city": "San Francisco",
+   "tail_day_share": 0.062
+  },
+  {
+   "city": "Seattle",
+   "tail_day_share": 0.031
+  },
+  {
+   "city": "Washington DC",
+   "tail_day_share": 0.242
+  }
+ ],
+ "daily": [
+  {
+   "date": "2026-07-23",
+   "pnl": -3.0,
+   "cost": 15.81,
+   "contracts": 36,
+   "cum": -3.0
+  },
+  {
+   "date": "2026-07-24",
+   "pnl": 7.05,
+   "cost": 32.85,
+   "contracts": 73,
+   "cum": 4.05
+  },
+  {
+   "date": "2026-07-25",
+   "pnl": 45.3,
+   "cost": 74.0,
+   "contracts": 202,
+   "cum": 49.35
+  },
+  {
+   "date": "2026-07-26",
+   "pnl": -8.92,
+   "cost": 34.02,
+   "contracts": 95,
+   "cum": 40.43
+  },
+  {
+   "date": "2026-07-27",
+   "pnl": -13.97,
+   "cost": 58.46,
+   "contracts": 145,
+   "cum": 26.46
+  },
+  {
+   "date": "2026-07-28",
+   "pnl": -25.33,
+   "cost": 51.14,
+   "contracts": 128,
+   "cum": 1.14
+  },
+  {
+   "date": "2026-07-29",
+   "pnl": -36.23,
+   "cost": 113.13,
+   "contracts": 302,
+   "cum": -35.1
+  },
+  {
+   "date": "2026-07-30",
+   "pnl": -32.72,
+   "cost": 79.38,
+   "contracts": 203,
+   "cum": -67.82
+  },
+  {
+   "date": "2026-07-31",
+   "pnl": 5.3,
+   "cost": 70.17,
+   "contracts": 163,
+   "cum": -62.52
+  },
+  {
+   "date": "2026-08-01",
+   "pnl": 0.84,
+   "cost": 43.54,
+   "contracts": 103,
+   "cum": -61.68
+  },
+  {
+   "date": "2026-08-02",
+   "pnl": -12.8,
+   "cost": 47.37,
+   "contracts": 117,
+   "cum": -74.48
+  },
+  {
+   "date": "2026-08-03",
+   "pnl": -2.03,
+   "cost": 46.95,
+   "contracts": 107,
+   "cum": -76.51
+  },
+  {
+   "date": "2026-08-04",
+   "pnl": -11.97,
+   "cost": 45.56,
+   "contracts": 108,
+   "cum": -88.48
+  },
+  {
+   "date": "2026-08-05",
+   "pnl": 5.32,
+   "cost": 64.38,
+   "contracts": 144,
+   "cum": -83.16
+  },
+  {
+   "date": "2026-08-06",
+   "pnl": -21.2,
+   "cost": 55.0,
+   "contracts": 129,
+   "cum": -104.36
+  },
+  {
+   "date": "2026-08-07",
+   "pnl": 1.8,
+   "cost": 60.48,
+   "contracts": 165,
+   "cum": -102.56
+  },
+  {
+   "date": "2026-08-08",
+   "pnl": -4.96,
+   "cost": 57.67,
+   "contracts": 140,
+   "cum": -107.52
+  },
+  {
+   "date": "2026-08-09",
+   "pnl": -20.44,
+   "cost": 44.53,
+   "contracts": 107,
+   "cum": -127.96
+  },
+  {
+   "date": "2026-08-10",
+   "pnl": -69.66,
+   "cost": 91.44,
+   "contracts": 225,
+   "cum": -197.62
+  },
+  {
+   "date": "2026-08-11",
+   "pnl": -52.59,
+   "cost": 92.28,
+   "contracts": 231,
+   "cum": -250.21
+  },
+  {
+   "date": "2026-08-12",
+   "pnl": -40.04,
+   "cost": 58.94,
+   "contracts": 158,
+   "cum": -290.24
+  },
+  {
+   "date": "2026-08-13",
+   "pnl": 11.68,
+   "cost": 37.27,
+   "contracts": 88,
+   "cum": -278.56
+  },
+  {
+   "date": "2026-08-14",
+   "pnl": -2.69,
+   "cost": 24.52,
+   "contracts": 62,
+   "cum": -281.25
+  },
+  {
+   "date": "2026-08-15",
+   "pnl": -14.14,
+   "cost": 42.85,
+   "contracts": 106,
+   "cum": -295.39
+  },
+  {
+   "date": "2026-08-16",
+   "pnl": -1.96,
+   "cost": 33.39,
+   "contracts": 85,
+   "cum": -297.35
+  },
+  {
+   "date": "2026-08-17",
+   "pnl": 19.84,
+   "cost": 39.71,
+   "contracts": 95,
+   "cum": -277.51
+  },
+  {
+   "date": "2026-08-18",
+   "pnl": -41.85,
+   "cost": 52.96,
+   "contracts": 139,
+   "cum": -319.36
+  },
+  {
+   "date": "2026-08-19",
+   "pnl": -30.74,
+   "cost": 72.11,
+   "contracts": 193,
+   "cum": -350.1
+  },
+  {
+   "date": "2026-08-20",
+   "pnl": -4.72,
+   "cost": 41.78,
+   "contracts": 111,
+   "cum": -354.82
+  },
+  {
+   "date": "2026-08-21",
+   "pnl": 0.32,
+   "cost": 48.9,
+   "contracts": 141,
+   "cum": -354.5
+  },
+  {
+   "date": "2026-08-22",
+   "pnl": 16.94,
+   "cost": 55.22,
+   "contracts": 152,
+   "cum": -337.56
+  },
+  {
+   "date": "2026-08-23",
+   "pnl": -1.54,
+   "cost": 35.78,
+   "contracts": 91,
+   "cum": -339.1
+  },
+  {
+   "date": "2026-08-24",
+   "pnl": 8.98,
+   "cost": 22.7,
+   "contracts": 56,
+   "cum": -330.12
+  }
+ ],
+ "by_city": [
+  {
+   "city": "Atlanta",
+   "pnl": -22.18,
+   "cost": 167.93,
+   "contracts": 416,
+   "mkts": 36,
+   "wins": 17,
+   "win_rate": 0.472,
+   "avg_no": 42.2,
+   "roi": -0.132,
+   "bot_share": 0.42,
+   "pnl_adj": -9.32
+  },
+  {
+   "city": "Boston",
+   "pnl": 0.72,
+   "cost": 53.46,
+   "contracts": 153,
+   "mkts": 11,
+   "wins": 6,
+   "win_rate": 0.545,
+   "avg_no": 36.6,
+   "roi": 0.014,
+   "bot_share": 0.84,
+   "pnl_adj": 0.61
+  },
+  {
+   "city": "Dallas",
+   "pnl": -121.96,
+   "cost": 371.47,
+   "contracts": 912,
+   "mkts": 37,
+   "wins": 13,
+   "win_rate": 0.351,
+   "avg_no": 41.5,
+   "roi": -0.328,
+   "bot_share": 0.84,
+   "pnl_adj": -102.82
+  },
+  {
+   "city": "Houston",
+   "pnl": -67.74,
+   "cost": 202.45,
+   "contracts": 526,
+   "mkts": 38,
+   "wins": 13,
+   "win_rate": 0.342,
+   "avg_no": 40.5,
+   "roi": -0.335,
+   "bot_share": 0.55,
+   "pnl_adj": -37.39
+  },
+  {
+   "city": "Las Vegas",
+   "pnl": 4.53,
+   "cost": 12.44,
+   "contracts": 27,
+   "mkts": 3,
+   "wins": 2,
+   "win_rate": 0.667,
+   "avg_no": 46.0,
+   "roi": 0.364,
+   "bot_share": 0.99,
+   "pnl_adj": 4.5
+  },
+  {
+   "city": "Minneapolis",
+   "pnl": -3.49,
+   "cost": 58.49,
+   "contracts": 128,
+   "mkts": 11,
+   "wins": 7,
+   "win_rate": 0.636,
+   "avg_no": 46.7,
+   "roi": -0.06,
+   "bot_share": 0.0,
+   "pnl_adj": -0.0
+  },
+  {
+   "city": "New Orleans",
+   "pnl": 9.66,
+   "cost": 131.77,
+   "contracts": 332,
+   "mkts": 32,
+   "wins": 14,
+   "win_rate": 0.438,
+   "avg_no": 41.5,
+   "roi": 0.073,
+   "bot_share": 0.5,
+   "pnl_adj": 4.87
+  },
+  {
+   "city": "Oklahoma City",
+   "pnl": 54.27,
+   "cost": 80.77,
+   "contracts": 184,
+   "mkts": 25,
+   "wins": 22,
+   "win_rate": 0.88,
+   "avg_no": 44.0,
+   "roi": 0.672,
+   "bot_share": 0.54,
+   "pnl_adj": 29.09
+  },
+  {
+   "city": "Phoenix",
+   "pnl": -8.62,
+   "cost": 84.3,
+   "contracts": 206,
+   "mkts": 17,
+   "wins": 10,
+   "win_rate": 0.588,
+   "avg_no": 45.7,
+   "roi": -0.102,
+   "bot_share": 0.23,
+   "pnl_adj": -2.0
+  },
+  {
+   "city": "San Antonio",
+   "pnl": -3.79,
+   "cost": 96.67,
+   "contracts": 237,
+   "mkts": 27,
+   "wins": 11,
+   "win_rate": 0.407,
+   "avg_no": 41.3,
+   "roi": -0.039,
+   "bot_share": 0.62,
+   "pnl_adj": -2.36
+  },
+  {
+   "city": "San Francisco",
+   "pnl": -57.01,
+   "cost": 156.9,
+   "contracts": 483,
+   "mkts": 37,
+   "wins": 10,
+   "win_rate": 0.27,
+   "avg_no": 32.5,
+   "roi": -0.363,
+   "bot_share": 0.48,
+   "pnl_adj": -27.31
+  },
+  {
+   "city": "Seattle",
+   "pnl": -39.14,
+   "cost": 187.93,
+   "contracts": 447,
+   "mkts": 36,
+   "wins": 14,
+   "win_rate": 0.389,
+   "avg_no": 44.6,
+   "roi": -0.208,
+   "bot_share": 0.85,
+   "pnl_adj": -33.43
+  },
+  {
+   "city": "Washington DC",
+   "pnl": -75.37,
+   "cost": 139.7,
+   "contracts": 358,
+   "mkts": 21,
+   "wins": 6,
+   "win_rate": 0.286,
+   "avg_no": 40.5,
+   "roi": -0.54,
+   "bot_share": 0.43,
+   "pnl_adj": -32.48
+  }
+ ],
+ "sessions": [
+  {
+   "session": "day-of",
+   "trades": 1507,
+   "contracts": 2224.4,
+   "cost": 823.64,
+   "pnl": -122.01,
+   "roi": -0.15
+  },
+  {
+   "session": "evening",
+   "trades": 1295,
+   "contracts": 2190.33,
+   "cost": 920.64,
+   "pnl": -208.11,
+   "roi": -0.23
+  }
+ ],
+ "price_edge": [
+  {
+   "pbin": "[0, 15)",
+   "contracts": 73.24,
+   "cost": 9.09,
+   "pnl": -7.59,
+   "avg_no": 12.412,
+   "win_share": 0.02
+  },
+  {
+   "pbin": "[15, 25)",
+   "contracts": 236.33,
+   "cost": 47.222,
+   "pnl": -15.502,
+   "avg_no": 19.982,
+   "win_share": 0.134
+  },
+  {
+   "pbin": "[25, 35)",
+   "contracts": 747.53,
+   "cost": 225.993,
+   "pnl": -59.553,
+   "avg_no": 30.232,
+   "win_share": 0.223
+  },
+  {
+   "pbin": "[35, 45)",
+   "contracts": 1827.4,
+   "cost": 730.577,
+   "pnl": -159.007,
+   "avg_no": 39.979,
+   "win_share": 0.313
+  },
+  {
+   "pbin": "[45, 51)",
+   "contracts": 1530.23,
+   "cost": 731.4,
+   "pnl": -88.47,
+   "avg_no": 47.797,
+   "win_share": 0.42
+  }
+ ],
+ "weekly": [
+  {
+   "week": "2026-07-20/2026-07-26",
+   "contracts": 408.07,
+   "cost": 156.68,
+   "pnl": 40.43
+  },
+  {
+   "week": "2026-07-27/2026-08-02",
+   "contracts": 1163.84,
+   "cost": 463.19,
+   "pnl": -114.91
+  },
+  {
+   "week": "2026-08-03/2026-08-09",
+   "contracts": 903.78,
+   "cost": 374.57,
+   "pnl": -53.48
+  },
+  {
+   "week": "2026-08-10/2026-08-16",
+   "contracts": 958.03,
+   "cost": 380.68,
+   "pnl": -169.39
+  },
+  {
+   "week": "2026-08-17/2026-08-23",
+   "contracts": 924.33,
+   "cost": 346.46,
+   "pnl": -41.75
+  },
+  {
+   "week": "2026-08-24/2026-08-30",
+   "contracts": 56.68,
+   "cost": 22.7,
+   "pnl": 8.98
+  }
+ ],
+ "sensitivity": [
+  {
+   "variant": "strict (window+size+<=50c)",
+   "trades": 2913,
+   "contracts": 4597.32,
+   "cost": 1812.56,
+   "pnl": -330.12
+  },
+  {
+   "variant": "window, any size <=50c",
+   "trades": 5123,
+   "contracts": 67851.29,
+   "cost": 26943.69,
+   "pnl": -4368.94
+  },
+  {
+   "variant": "all maker-NO on buckets",
+   "trades": 126205,
+   "contracts": 2409082.59,
+   "cost": 1304195.82,
+   "pnl": -74729.68
+  }
+ ],
+ "heat": [
+  {
+   "city": "Atlanta",
+   "date": "2026-07-23",
+   "n": 16
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-07-24",
+   "n": 10
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-07-25",
+   "n": 12
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-07-26",
+   "n": 24
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-07-27",
+   "n": 2
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-07-28",
+   "n": 23
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-07-29",
+   "n": 49
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-07-31",
+   "n": 25
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-01",
+   "n": 21
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-02",
+   "n": 4
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-03",
+   "n": 34
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-05",
+   "n": 31
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-06",
+   "n": 8
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-07",
+   "n": 17
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-08",
+   "n": 18
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-09",
+   "n": 10
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-11",
+   "n": 14
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-12",
+   "n": 35
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-13",
+   "n": 5
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-14",
+   "n": 7
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-15",
+   "n": 5
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-16",
+   "n": 1
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-17",
+   "n": 4
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-18",
+   "n": 9
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-19",
+   "n": 6
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-20",
+   "n": 2
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-22",
+   "n": 12
+  },
+  {
+   "city": "Atlanta",
+   "date": "2026-08-23",
+   "n": 1
+  },
+  {
+   "city": "Boston",
+   "date": "2026-07-29",
+   "n": 1
+  },
+  {
+   "city": "Boston",
+   "date": "2026-08-07",
+   "n": 30
+  },
+  {
+   "city": "Boston",
+   "date": "2026-08-17",
+   "n": 4
+  },
+  {
+   "city": "Boston",
+   "date": "2026-08-18",
+   "n": 29
+  },
+  {
+   "city": "Boston",
+   "date": "2026-08-19",
+   "n": 27
+  },
+  {
+   "city": "Boston",
+   "date": "2026-08-21",
+   "n": 19
+  },
+  {
+   "city": "Boston",
+   "date": "2026-08-22",
+   "n": 3
+  },
+  {
+   "city": "Boston",
+   "date": "2026-08-23",
+   "n": 34
+  },
+  {
+   "city": "Boston",
+   "date": "2026-08-24",
+   "n": 5
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-23",
+   "n": 6
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-24",
+   "n": 6
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-25",
+   "n": 53
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-26",
+   "n": 19
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-27",
+   "n": 29
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-28",
+   "n": 31
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-29",
+   "n": 63
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-30",
+   "n": 55
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-07-31",
+   "n": 45
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-01",
+   "n": 5
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-02",
+   "n": 7
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-03",
+   "n": 24
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-04",
+   "n": 11
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-05",
+   "n": 44
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-06",
+   "n": 25
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-07",
+   "n": 32
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-08",
+   "n": 38
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-09",
+   "n": 24
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-10",
+   "n": 42
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-11",
+   "n": 17
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-12",
+   "n": 32
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-13",
+   "n": 8
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-14",
+   "n": 9
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-15",
+   "n": 20
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-16",
+   "n": 14
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-17",
+   "n": 6
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-18",
+   "n": 46
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-19",
+   "n": 72
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-20",
+   "n": 48
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-21",
+   "n": 15
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-22",
+   "n": 15
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-23",
+   "n": 8
+  },
+  {
+   "city": "Dallas",
+   "date": "2026-08-24",
+   "n": 26
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-23",
+   "n": 5
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-24",
+   "n": 22
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-25",
+   "n": 27
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-26",
+   "n": 17
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-27",
+   "n": 15
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-28",
+   "n": 9
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-29",
+   "n": 64
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-30",
+   "n": 28
+  },
+  {
+   "city": "Houston",
+   "date": "2026-07-31",
+   "n": 25
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-01",
+   "n": 23
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-02",
+   "n": 19
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-03",
+   "n": 8
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-04",
+   "n": 19
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-05",
+   "n": 8
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-06",
+   "n": 10
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-07",
+   "n": 4
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-08",
+   "n": 33
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-09",
+   "n": 11
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-11",
+   "n": 19
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-12",
+   "n": 9
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-13",
+   "n": 16
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-14",
+   "n": 8
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-15",
+   "n": 13
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-16",
+   "n": 4
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-17",
+   "n": 17
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-18",
+   "n": 11
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-19",
+   "n": 6
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-20",
+   "n": 10
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-21",
+   "n": 10
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-22",
+   "n": 15
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-23",
+   "n": 1
+  },
+  {
+   "city": "Houston",
+   "date": "2026-08-24",
+   "n": 25
+  },
+  {
+   "city": "Las Vegas",
+   "date": "2026-08-15",
+   "n": 23
+  },
+  {
+   "city": "Las Vegas",
+   "date": "2026-08-16",
+   "n": 4
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-07-27",
+   "n": 13
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-07-29",
+   "n": 38
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-07-30",
+   "n": 39
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-08-05",
+   "n": 11
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-08-09",
+   "n": 6
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-08-14",
+   "n": 1
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-08-15",
+   "n": 4
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-08-16",
+   "n": 4
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-08-19",
+   "n": 8
+  },
+  {
+   "city": "Minneapolis",
+   "date": "2026-08-20",
+   "n": 3
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-07-25",
+   "n": 7
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-07-26",
+   "n": 5
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-07-27",
+   "n": 32
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-07-28",
+   "n": 24
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-07-29",
+   "n": 19
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-07-30",
+   "n": 8
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-07-31",
+   "n": 10
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-01",
+   "n": 18
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-02",
+   "n": 4
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-03",
+   "n": 4
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-04",
+   "n": 25
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-05",
+   "n": 11
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-06",
+   "n": 1
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-07",
+   "n": 9
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-08",
+   "n": 5
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-10",
+   "n": 8
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-11",
+   "n": 12
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-12",
+   "n": 8
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-13",
+   "n": 3
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-14",
+   "n": 13
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-16",
+   "n": 8
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-17",
+   "n": 10
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-18",
+   "n": 9
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-19",
+   "n": 24
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-20",
+   "n": 10
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-21",
+   "n": 5
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-22",
+   "n": 28
+  },
+  {
+   "city": "New Orleans",
+   "date": "2026-08-23",
+   "n": 4
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-07-24",
+   "n": 2
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-07-25",
+   "n": 2
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-07-26",
+   "n": 4
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-07-27",
+   "n": 3
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-07-28",
+   "n": 11
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-07-30",
+   "n": 7
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-07-31",
+   "n": 33
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-01",
+   "n": 1
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-04",
+   "n": 7
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-05",
+   "n": 2
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-08",
+   "n": 13
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-11",
+   "n": 4
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-12",
+   "n": 15
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-13",
+   "n": 5
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-15",
+   "n": 2
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-16",
+   "n": 1
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-17",
+   "n": 5
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-18",
+   "n": 9
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-19",
+   "n": 7
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-20",
+   "n": 2
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-21",
+   "n": 10
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-22",
+   "n": 31
+  },
+  {
+   "city": "Oklahoma City",
+   "date": "2026-08-23",
+   "n": 1
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-07-25",
+   "n": 0
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-07-26",
+   "n": 11
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-07-29",
+   "n": 7
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-07-31",
+   "n": 6
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-02",
+   "n": 8
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-04",
+   "n": 11
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-05",
+   "n": 12
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-06",
+   "n": 17
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-07",
+   "n": 3
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-09",
+   "n": 2
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-10",
+   "n": 52
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-11",
+   "n": 54
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-13",
+   "n": 8
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-16",
+   "n": 10
+  },
+  {
+   "city": "Phoenix",
+   "date": "2026-08-21",
+   "n": 1
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-07-25",
+   "n": 27
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-07-26",
+   "n": 5
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-07-27",
+   "n": 3
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-07-28",
+   "n": 1
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-07-29",
+   "n": 12
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-07-30",
+   "n": 11
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-07-31",
+   "n": 0
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-01",
+   "n": 1
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-04",
+   "n": 5
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-05",
+   "n": 10
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-08",
+   "n": 4
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-09",
+   "n": 6
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-10",
+   "n": 14
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-11",
+   "n": 5
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-13",
+   "n": 13
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-14",
+   "n": 5
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-15",
+   "n": 9
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-16",
+   "n": 17
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-17",
+   "n": 12
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-18",
+   "n": 6
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-19",
+   "n": 6
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-20",
+   "n": 5
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-21",
+   "n": 15
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-22",
+   "n": 23
+  },
+  {
+   "city": "San Antonio",
+   "date": "2026-08-23",
+   "n": 11
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-23",
+   "n": 9
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-24",
+   "n": 4
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-25",
+   "n": 19
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-26",
+   "n": 3
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-27",
+   "n": 24
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-28",
+   "n": 22
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-29",
+   "n": 17
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-30",
+   "n": 15
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-07-31",
+   "n": 4
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-01",
+   "n": 29
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-02",
+   "n": 21
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-03",
+   "n": 15
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-04",
+   "n": 13
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-05",
+   "n": 3
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-06",
+   "n": 22
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-07",
+   "n": 38
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-08",
+   "n": 21
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-09",
+   "n": 30
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-10",
+   "n": 24
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-11",
+   "n": 15
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-12",
+   "n": 2
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-13",
+   "n": 4
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-14",
+   "n": 9
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-15",
+   "n": 3
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-16",
+   "n": 15
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-17",
+   "n": 20
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-18",
+   "n": 6
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-19",
+   "n": 13
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-20",
+   "n": 23
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-21",
+   "n": 16
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-22",
+   "n": 5
+  },
+  {
+   "city": "San Francisco",
+   "date": "2026-08-23",
+   "n": 4
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-07-24",
+   "n": 28
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-07-25",
+   "n": 52
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-07-26",
+   "n": 6
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-07-27",
+   "n": 21
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-07-28",
+   "n": 4
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-07-29",
+   "n": 2
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-07-30",
+   "n": 5
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-07-31",
+   "n": 8
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-01",
+   "n": 1
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-02",
+   "n": 8
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-03",
+   "n": 1
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-04",
+   "n": 13
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-05",
+   "n": 9
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-07",
+   "n": 8
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-08",
+   "n": 4
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-10",
+   "n": 71
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-11",
+   "n": 32
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-12",
+   "n": 38
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-13",
+   "n": 10
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-14",
+   "n": 7
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-15",
+   "n": 24
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-16",
+   "n": 2
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-17",
+   "n": 14
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-18",
+   "n": 5
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-19",
+   "n": 19
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-20",
+   "n": 3
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-21",
+   "n": 16
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-22",
+   "n": 6
+  },
+  {
+   "city": "Seattle",
+   "date": "2026-08-23",
+   "n": 20
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-07-28",
+   "n": 1
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-07-29",
+   "n": 25
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-07-30",
+   "n": 31
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-07-31",
+   "n": 3
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-01",
+   "n": 2
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-02",
+   "n": 45
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-03",
+   "n": 18
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-06",
+   "n": 45
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-07",
+   "n": 21
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-09",
+   "n": 16
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-10",
+   "n": 11
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-11",
+   "n": 55
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-12",
+   "n": 15
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-13",
+   "n": 11
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-17",
+   "n": 0
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-18",
+   "n": 4
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-19",
+   "n": 1
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-21",
+   "n": 32
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-22",
+   "n": 12
+  },
+  {
+   "city": "Washington DC",
+   "date": "2026-08-23",
+   "n": 4
+  }
+ ],
+ "forecast": [
+  {
+   "city": "Atlanta",
+   "bias": -1.18,
+   "mae": 1.94,
+   "sd": 1.95
+  },
+  {
+   "city": "Austin",
+   "bias": 2.25,
+   "mae": 2.57,
+   "sd": 2.27
+  },
+  {
+   "city": "Boston",
+   "bias": -1.66,
+   "mae": 2.2,
+   "sd": 1.91
+  },
+  {
+   "city": "Chicago",
+   "bias": -0.92,
+   "mae": 1.29,
+   "sd": 1.37
+  },
+  {
+   "city": "Dallas",
+   "bias": 0.8,
+   "mae": 1.05,
+   "sd": 1.11
+  },
+  {
+   "city": "Denver",
+   "bias": 2.04,
+   "mae": 2.63,
+   "sd": 3.1
+  },
+  {
+   "city": "Houston",
+   "bias": -0.49,
+   "mae": 1.02,
+   "sd": 1.16
+  },
+  {
+   "city": "Las Vegas",
+   "bias": -3.83,
+   "mae": 3.86,
+   "sd": 2.0
+  },
+  {
+   "city": "Los Angeles",
+   "bias": -1.56,
+   "mae": 1.62,
+   "sd": 1.01
+  },
+  {
+   "city": "Miami",
+   "bias": -1.14,
+   "mae": 2.0,
+   "sd": 2.07
+  },
+  {
+   "city": "Minneapolis",
+   "bias": -1.11,
+   "mae": 1.68,
+   "sd": 1.7
+  },
+  {
+   "city": "New Orleans",
+   "bias": 0.88,
+   "mae": 1.2,
+   "sd": 1.34
+  },
+  {
+   "city": "New York City",
+   "bias": -0.68,
+   "mae": 1.53,
+   "sd": 1.88
+  },
+  {
+   "city": "Oklahoma City",
+   "bias": 4.77,
+   "mae": 4.77,
+   "sd": 2.69
+  },
+  {
+   "city": "Philadelphia",
+   "bias": -2.37,
+   "mae": 2.66,
+   "sd": 2.06
+  },
+  {
+   "city": "Phoenix",
+   "bias": -1.8,
+   "mae": 3.53,
+   "sd": 3.75
+  },
+  {
+   "city": "San Antonio",
+   "bias": -1.52,
+   "mae": 1.78,
+   "sd": 1.4
+  },
+  {
+   "city": "San Francisco",
+   "bias": -1.35,
+   "mae": 1.42,
+   "sd": 1.15
+  },
+  {
+   "city": "Seattle",
+   "bias": 0.73,
+   "mae": 1.24,
+   "sd": 1.31
+  },
+  {
+   "city": "Washington DC",
+   "bias": -0.3,
+   "mae": 1.57,
+   "sd": 1.99
+  }
+ ],
+ "maker_class": [
+  {
+   "city": "San Antonio",
+   "trades": 7362,
+   "contracts": 150732.07,
+   "cost": 64836.05,
+   "pnl": -10478.1
+  },
+  {
+   "city": "Seattle",
+   "trades": 9666,
+   "contracts": 215251.74,
+   "cost": 116787.1,
+   "pnl": -9230.11
+  },
+  {
+   "city": "Minneapolis",
+   "trades": 9603,
+   "contracts": 183020.35,
+   "cost": 91272.92,
+   "pnl": -9099.86
+  },
+  {
+   "city": "Dallas",
+   "trades": 13794,
+   "contracts": 234717.58,
+   "cost": 101020.44,
+   "pnl": -8886.18
+  },
+  {
+   "city": "Atlanta",
+   "trades": 10675,
+   "contracts": 203123.35,
+   "cost": 108597.39,
+   "pnl": -7867.61
+  },
+  {
+   "city": "Washington DC",
+   "trades": 8593,
+   "contracts": 141713.92,
+   "cost": 76221.19,
+   "pnl": -5675.76
+  },
+  {
+   "city": "New Orleans",
+   "trades": 8734,
+   "contracts": 170614.56,
+   "cost": 82450.54,
+   "pnl": -5655.73
+  },
+  {
+   "city": "Las Vegas",
+   "trades": 4412,
+   "contracts": 83605.77,
+   "cost": 58672.11,
+   "pnl": -4990.4
+  },
+  {
+   "city": "Phoenix",
+   "trades": 16696,
+   "contracts": 307966.94,
+   "cost": 217238.06,
+   "pnl": -4178.98
+  },
+  {
+   "city": "Oklahoma City",
+   "trades": 13743,
+   "contracts": 293904.46,
+   "cost": 167896.42,
+   "pnl": -4090.2
+  },
+  {
+   "city": "San Francisco",
+   "trades": 10044,
+   "contracts": 168390.31,
+   "cost": 91931.45,
+   "pnl": -3570.43
+  },
+  {
+   "city": "Houston",
+   "trades": 9313,
+   "contracts": 200518.65,
+   "cost": 97781.26,
+   "pnl": -1975.06
+  },
+  {
+   "city": "Boston",
+   "trades": 3570,
+   "contracts": 55522.89,
+   "cost": 29490.88,
+   "pnl": 968.76
+  }
+ ]
+}

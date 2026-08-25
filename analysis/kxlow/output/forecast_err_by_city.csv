@@ -1,0 +1,41 @@
+city,model,n,bias,mae,sd
+Atlanta,ecmwf_ifs025,34,-1.5,2.04,2.06
+Atlanta,gfs_seamless,34,-0.85,1.86,2.18
+Austin,ecmwf_ifs025,35,2.91,3.13,2.42
+Austin,gfs_seamless,35,1.59,2.23,2.34
+Boston,ecmwf_ifs025,34,-0.64,1.71,1.9
+Boston,gfs_seamless,34,-2.67,2.93,2.22
+Chicago,ecmwf_ifs025,34,-0.07,1.11,1.65
+Chicago,gfs_seamless,34,-1.76,1.87,1.77
+Dallas,ecmwf_ifs025,34,2.41,2.41,1.24
+Dallas,gfs_seamless,34,-0.81,1.19,1.24
+Denver,ecmwf_ifs025,35,2.74,3.4,3.66
+Denver,gfs_seamless,35,1.33,2.27,2.9
+Houston,ecmwf_ifs025,34,0.28,0.92,1.22
+Houston,gfs_seamless,34,-1.26,1.58,1.27
+Las Vegas,ecmwf_ifs025,34,-2.59,3.22,2.41
+Las Vegas,gfs_seamless,34,-5.06,5.06,2.24
+Los Angeles,ecmwf_ifs025,34,1.38,1.46,1.19
+Los Angeles,gfs_seamless,34,-4.5,4.5,1.81
+Miami,ecmwf_ifs025,34,-0.03,1.58,2.07
+Miami,gfs_seamless,34,-2.24,2.86,2.32
+Minneapolis,ecmwf_ifs025,34,-0.33,1.77,2.02
+Minneapolis,gfs_seamless,34,-1.89,2.39,2.1
+New Orleans,ecmwf_ifs025,34,2.24,2.24,1.53
+New Orleans,gfs_seamless,34,-0.48,1.22,1.43
+New York City,ecmwf_ifs025,34,0.29,1.59,1.97
+New York City,gfs_seamless,34,-1.65,2.38,2.27
+Oklahoma City,ecmwf_ifs025,34,6.07,6.07,3.28
+Oklahoma City,gfs_seamless,34,3.47,3.76,2.62
+Philadelphia,ecmwf_ifs025,34,-1.99,2.42,2.25
+Philadelphia,gfs_seamless,34,-2.76,3.01,2.09
+Phoenix,ecmwf_ifs025,34,1.06,3.04,4.14
+Phoenix,gfs_seamless,34,-4.66,5.58,4.17
+San Antonio,ecmwf_ifs025,35,0.45,1.54,1.95
+San Antonio,gfs_seamless,35,-3.5,3.5,1.67
+San Francisco,ecmwf_ifs025,34,-0.1,1.42,1.74
+San Francisco,gfs_seamless,34,-2.61,2.61,1.09
+Seattle,ecmwf_ifs025,34,1.55,1.75,1.31
+Seattle,gfs_seamless,34,-0.09,1.5,1.91
+Washington DC,ecmwf_ifs025,34,-0.07,1.42,1.98
+Washington DC,gfs_seamless,34,-0.52,1.89,2.27
