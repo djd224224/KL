@@ -1111,19 +1111,19 @@ class TestAllowlist(unittest.TestCase):
                   "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
                   "KXUSGASCPI-26AUG12-T320",
                   # diesel enrolled 2026-08-02 evening under re-entry guards
-                  "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30",
-                  # Truflation EV index enrolled 2026-08-24 (Jack) — daily
-                  # print, day-dated tickers, same guards as the gas prints
-                  "KXTRUEV-26AUG26-T30.5"):
+                  "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30"):
             self.assertTrue(a(t), t)
-        # Truflation's OTHER Kalshi index stays out until asked for — exact
-        # series matching, so KXTRUEV must not admit it
+        # Truflation's OTHER Kalshi index stays out — never enrolled
         self.assertFalse(a("KXTRUFAIDP-26AUG26-T50"))
-        # KXTRUEV lists each market ON its print day (Jack 2026-08-24), so it
-        # must carry the close-anchored cutoff — cutoff_from_close_min is the
-        # exact attribute the ticker-date pre-filter branches on; without it
-        # the midnight-ET rule kills every market at listing and the series
-        # ships dark (which is how it shipped the first time).
+        # KXTRUEV BLOCKED 2026-08-25 (Jack), the morning after the 8/24
+        # enrollment saga: blocklist wins over its (kept) allowlist entry and
+        # overrides — zero orders, positions ride. Re-enable = delete the
+        # one SERIES_BLOCKLIST_PREFIXES entry.
+        b = IncentiveMarketMaker._blocked
+        self.assertTrue(b("KXTRUEV-26AUG26-T1241.88"))
+        self.assertFalse(a("KXTRUEV-26AUG26-T1241.88"))
+        # the enrollment machinery is deliberately kept for re-enable: the
+        # close-anchored cutoff override (the print-day-listing fix) stays
         self.assertEqual(
             imm.series_override("KXTRUEV").cutoff_from_close_min, 60)
         # Rate bar KEPT (Jack 2026-08-05) but scoped to the first strike of

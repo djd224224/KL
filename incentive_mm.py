@@ -1007,6 +1007,17 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + ["KXHIGH"]                                    # high_temp_trading.py (cloud)
     + ["KXMLBMENTION", "KXNBAMENTION", "KXNCAABMENTION"]   # mlb/nba/ncaa (cloud)
     + _GPU_RENTAL_PREFIXES                           # GPU rental price (excluded)
+    # KXTRUEV BLOCKED 2026-08-25 (Jack: "block KXTRUEEV" [sic]) — the same
+    # morning it first quoted, after the 8/24 enrollment saga. Blocklist =
+    # FROZEN: zero new orders, resting quotes cancelled on the next cycle,
+    # positions ride to settlement (tonight's close). The full enrollment
+    # (allowlist entry, close-anchored cutoff, 5pm halving, rate-bar-off
+    # override) is deliberately KEPT below — the blocklist wins over all of
+    # it, so re-enabling is deleting this one entry. In code rather than the
+    # launcher's IMM_BLOCKLIST so the self-restart watcher applies it on the
+    # next sync without a task-level bounce (env edits need one, code
+    # doesn't). Prefix is exact-family: KXTRUFAIDP does not match.
+    + ["KXTRUEV"]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 
