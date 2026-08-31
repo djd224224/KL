@@ -106,6 +106,15 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# Kill switch (Jack, 2026-08-31): while low_temp.paused exists next to this
+# script, exit before ANY setup — no cancels, no orders, no BQ writes. The
+# launcher checks it too; this copy also covers the GH workflow_dispatch
+# backup. Delete the file from main to resume.
+_PAUSE_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "low_temp.paused")
+if os.path.exists(_PAUSE_FLAG):
+    print(f"PAUSED — {_PAUSE_FLAG} present; exiting without trading.")
+    sys.exit(0)
+
 DRY_RUN = os.environ.get("LOW_DRY_RUN", "false").lower() == "true"
 # Model-vs-market divergence gate (2026-08-12 settlement study, n=54 traded):
 # when fair_NO exceeded the market's NO mid by >12c, NO won only 28-40% —

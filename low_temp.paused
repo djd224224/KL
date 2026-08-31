@@ -1,0 +1,9 @@
+Paused by Jack ("pause low temp bot", 2026-08-31 evening ET, via Claude session).
+
+While this file exists on main, run_low_temp.ps1 and low_temp_trading.py exit
+immediately on every trigger — no cancels, no orders, no BQ writes. The four
+daily Task Scheduler triggers still fire and log one SKIPPED line each.
+
+To resume: git rm low_temp.paused on main, push, wait for the 30-min
+KL sync-kl-main tick, then check run-logs\low-temp\ shows a normal run start
+instead of SKIPPED.

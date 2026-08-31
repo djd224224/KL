@@ -63,6 +63,20 @@ skipped up front. Gotcha from the first TS run: TS sessions lack user-site packa
 main site-packages now has google-auth installed directly, and the launcher also passes
 PYTHONPATH inside the cmd line (the IMM launcher pattern).
 
+## Pause / kill switch
+
+**PAUSED since 2026-08-31** (Jack): a tracked `low_temp.paused` file in the repo
+root makes every run a no-op — `run_low_temp.ps1` exits before launching Python
+(one SKIPPED line in `run-logs\low-temp\`), and `low_temp_trading.py` has the
+same check up top (covers the GH manual dispatch). The Task Scheduler triggers
+keep firing; they just do nothing. Resume: `git rm low_temp.paused` on main,
+push, wait one 30-min sync tick, confirm the next log entry is a normal run
+start. The flag reaches the laptop via `KL sync-kl-main` (ff-only merge of
+origin/main) — if the laptop repo has diverged the sync stalls and the pause
+does NOT land; `run-logs\sync-kl-main.log` shows it, and
+`Disable-ScheduledTask -TaskName 'KL low-temp-trading'` is the definitive
+local switch.
+
 ## Exchange pause / Kalshi maintenance window
 
 Kalshi runs a **weekly maintenance pause every Thursday 3:00–5:00 AM ET**
