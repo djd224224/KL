@@ -166,8 +166,14 @@ confirming reward eligibility is per-subaccount first.
   book minus our own orders) on either side — or that loses a touch mid-band —
   stands down its WHOLE event: these events' start times aren't reliably known,
   and a thin book is the tell that the event has gone live (adverse selection).
-  Resumes only after every market reads healthy for 15 min
-  (`IMM_EVENT_DEPTH_RESUME_SECS`); halts persist across restarts.
+  A strike that JUMPS from in-band to out-of-band by `IMM_EVENT_DEPTH_JUMP`
+  (8c)+ in one cycle (49c→99c: settled in practice) confirms the event live and
+  kills it **permanently** — no resume, no re-selection ("settled strike SHOULD
+  hold an event down forever"). Thin-only halts resume only once EVERY managed
+  market reads healthy in-band at target for 15 min
+  (`IMM_EVENT_DEPTH_RESUME_SECS`); an out-of-band pin or one-sided book blocks
+  resume for as long as it sits there. Halts, live-confirms, and the gated
+  series' mid history all persist across restarts.
 
 Reconciliation with the yield-to-human rule: for quote_all series the bot ignores
 the user's POSITIONS (he wants full coverage) and its caps/skew track the bot's OWN

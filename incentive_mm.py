@@ -361,16 +361,28 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 #      manufactured depth — it would blind this gate AND re-qualify exactly
 #      the book we no longer want to rest in. With pads off, the per-market
 #      two-sided depth gate in the quote loop re-arms for these series too.
-#   2. any QUOTABLE market (external mid inside the series band — pinned
-#      extreme strikes are thin by nature and prove nothing) whose EXTERNAL
-#      depth (book minus our own resting orders, which would otherwise mask
-#      the withdrawal) is under EVENT_DEPTH_MIN_CONTRACTS on EITHER side
-#      stands down its WHOLE EVENT: every sibling market is cancelled and
-#      none quote. A market that WAS two-sided and lost a touch entirely is
-#      the same signal, louder.
-#   3. the event resumes only once every managed market of it has read
-#      healthy AND the last thin reading is EVENT_DEPTH_RESUME_SECS old —
-#      a book refilling for a moment mid-speech must not re-enter us.
+#   2. any QUOTABLE market (external mid inside the series band — a strike
+#      LISTED at the extremes is thin by nature and proves nothing) whose
+#      EXTERNAL depth (book minus our own resting orders, which would
+#      otherwise mask the withdrawal) is under EVENT_DEPTH_MIN_CONTRACTS on
+#      EITHER side stands down its WHOLE EVENT: every sibling market is
+#      cancelled and none quote. A market that WAS two-sided and lost a
+#      touch entirely is the same signal, louder.
+#   3. a strike that JUMPS from inside the band to OUTSIDE it by
+#      EVENT_DEPTH_JUMP_CENTS+ in one cycle (49c -> 99c: the word got said
+#      and the strike settled in practice) CONFIRMS the event live — that
+#      halt is PERMANENT (Jack 2026-08-31 #2: "settled strike SHOULD hold
+#      an event down forever. I dont want to be quoting a live event").
+#      event_live_halt is persisted; there is no resume path, and the
+#      estimator refuses the whole event so nothing re-selects. The jump
+#      minimum keeps a band-edge drift (89c -> 91c noise) from executing an
+#      event for nothing; such a strike just stands down individually.
+#   4. a thin-only halt resumes once every managed market of the event
+#      reads healthy — in-band, two-sided AND at/over target — and the last
+#      thin reading is EVENT_DEPTH_RESUME_SECS old. An out-of-band pin or a
+#      one-sided book does NOT count as healthy: it blocks resume for as
+#      long as it sits there (a settled strike holds its event down; these
+#      markets die at settlement anyway, so "until settlement" IS forever).
 # Enforced in BOTH the quote loop and the candidate estimator (the
 # 2026-08-05 lesson, plus its event-level twin: a thin sibling that never
 # gets SELECTED is invisible to the quote loop, so without the estimator
@@ -385,6 +397,13 @@ EVENT_DEPTH_MIN_CONTRACTS = _env_float("IMM_EVENT_DEPTH_MIN", 1000)
 # not be able to expire between two of those observations (it would flap —
 # requote the live event for a few minutes out of every refresh interval).
 EVENT_DEPTH_RESUME_SECS = _env_int("IMM_EVENT_DEPTH_RESUME_SECS", 900)
+# Minimum one-cycle mid move for the in-band -> out-of-band jump to count as
+# the settled-strike signature. 8c catches every settlement-grade jump from
+# inside the 5-90 band (worst case ~90 -> 99+) while a 1-2c edge drift stays
+# a per-market band stand-down. A slow creep re-anchors prev_mid outside the
+# band on its first out-of-band cycle, so it can never accumulate into a
+# false confirm.
+EVENT_DEPTH_JUMP_CENTS = _env_float("IMM_EVENT_DEPTH_JUMP", 8)
 
 
 def series_event_depth_gated(series: str) -> bool:
@@ -3114,6 +3133,11 @@ class BotState:
     # testable). Whole event stands down while present. Persisted — this bot
     # restarts many times a day, and a restart mid-speech must not re-quote.
     event_depth_halt: Dict[str, float] = field(default_factory=dict)
+    # Live-CONFIRMED events (a strike jumped out of band = settled in
+    # practice): event_ticker -> confirm ts. PERMANENT — no resume path, the
+    # estimator refuses the event, and the entry outlives the halt above
+    # (pruned only by the 7d persist TTL, long after the event settles).
+    event_live_halt: Dict[str, float] = field(default_factory=dict)
     bench_until: Dict[str, float] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
@@ -3355,6 +3379,13 @@ class IncentiveMarketMaker:
             # quoting the deep strikes before rediscovering the thin one.
             self.state.event_depth_halt = {str(e): float(v) for e, v in
                                            (data.get("event_depth_halt") or {}).items()}
+            # ...and permanent live confirms + the gated-series mid history
+            # the jump detector needs to keep confirming across a restart.
+            self.state.event_live_halt = {str(e): float(v) for e, v in
+                                          (data.get("event_live_halt") or {}).items()}
+            self.state.prev_mid.update(
+                {str(t): float(v) for t, v in
+                 (data.get("prev_mid_gated") or {}).items()})
             # Halt continuity (same roll-day only): a restart must NOT hand
             # the bot a fresh loss budget or clear an active halt. Use
             # --clear-halt (bot stopped) for a deliberate un-halt.
@@ -3464,7 +3495,23 @@ class IncentiveMarketMaker:
                            "event_depth_halt": {
                                e: round(v, 1)
                                for e, v in self.state.event_depth_halt.items()
-                               if time.time() - v < 7 * 86400}}, f)
+                               if time.time() - v < 7 * 86400},
+                           # permanent live confirms — "forever" in practice
+                           # means until settlement, so the 7d TTL is pure
+                           # file hygiene, never an early release
+                           "event_live_halt": {
+                               e: round(v, 1)
+                               for e, v in self.state.event_live_halt.items()
+                               if time.time() - v < 7 * 86400},
+                           # gated-series mid history: the settled-strike
+                           # jump detector needs prev_mid ACROSS restarts, or
+                           # a strike that jumps to 99c during the seconds a
+                           # restart takes would look "always pinned" to the
+                           # new process and confirm nothing
+                           "prev_mid_gated": {
+                               t: round(v, 1)
+                               for t, v in self.state.prev_mid.items()
+                               if series_event_depth_gated(series_of(t))}}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.
@@ -4341,6 +4388,13 @@ class IncentiveMarketMaker:
         what is actually resting (it's already in the book). Otherwise: overlay
         the default ladder joined to the current external best. Returns False
         when the book can't be read."""
+        # Live-CONFIRMED events never come back (Jack 2026-08-31 #2): worth
+        # nothing by decree, without even reading the book — so no market of
+        # the event can be selected or hold an event slot again.
+        if meta.event_ticker in self.state.event_live_halt:
+            meta.est_frac = meta.est_dollars_per_day = 0.0
+            meta.yield_per_contract = 0.0
+            return True
         try:
             ob = self.client.get_orderbook(ticker=meta.ticker)
         except Exception:
@@ -5158,24 +5212,38 @@ class IncentiveMarketMaker:
             if series_event_depth_gated(meta.series):
                 d_yes, d_no = external_depths(yes_levels, no_levels, own_in_book)
                 two_sided = ext_bid is not None and ext_ask is not None
-                # mid outside the series band = pinned/extreme strike: thin
-                # by nature, proves nothing (mirrors the estimator hook). A
-                # lost touch is the same withdrawal signal at full volume —
-                # but only on a market whose last known mid was IN band: a
-                # contested strike losing a side is the signature; a 96c pin
-                # whose scrap ask evaporates is routine book decay and must
-                # not park a multi-day pre-event window (it falls through to
-                # the ordinary one-sided breaker instead). prev_mid is not
-                # popped here, so a strike that goes one-sided mid-band and
-                # STAYS that way holds the halt for the rest of the event.
+                mid_g = (ext_bid + ext_ask) / 2.0 if two_sided else None
+                mid_in_band = pad_band_ok(meta.series, ext_bid, ext_ask)
+                # Lost-touch and jump signals read off the LAST KNOWN mid:
+                # only a strike that was recently in band can signal (a
+                # strike LISTED at the extremes proves nothing; its
+                # scrap-book decay falls through to the ordinary one-sided /
+                # band machinery). prev_mid keeps updating on every
+                # two-sided read — out-of-band ones included, via the normal
+                # flow below — so a slow creep past the band edge re-anchors
+                # each cycle and can never accumulate into a false jump.
                 pm_g = self.state.prev_mid.get(t)
-                went_one_sided = (not two_sided and pm_g is not None
-                                  and series_price_min(meta.series) <= pm_g
-                                  <= series_price_max(meta.series))
-                thin = (pad_band_ok(meta.series, ext_bid, ext_ask)
+                pm_in_band = (pm_g is not None
+                              and series_price_min(meta.series) <= pm_g
+                              <= series_price_max(meta.series))
+                went_one_sided = not two_sided and pm_in_band
+                # Settled-strike signature (Jack 2026-08-31 #2): in-band ->
+                # out-of-band by a real one-cycle jump (49c -> 99c: the word
+                # got said). Confirms the event LIVE — permanently.
+                jumped_out = (two_sided and pm_in_band and not mid_in_band
+                              and abs(mid_g - pm_g) >= EVENT_DEPTH_JUMP_CENTS)
+                thin = (mid_in_band
                         and (d_yes < EVENT_DEPTH_MIN_CONTRACTS
                              or d_no < EVENT_DEPTH_MIN_CONTRACTS))
-                if thin or went_one_sided:
+                if jumped_out and ev not in self.state.event_live_halt:
+                    self.state.event_live_halt[ev] = now_ts
+                    self.alerter.alert(
+                        "event_live",
+                        f"{ev}: {t} jumped out of band ({pm_g:.0f}c -> "
+                        f"{mid_g:.0f}c) — settled strike, event LIVE; "
+                        f"PERMANENTLY standing down the whole event", key=ev)
+                if thin or went_one_sided or jumped_out \
+                        or ev in self.state.event_live_halt:
                     event_depth_thin.add(ev)
                     first = ev not in self.state.event_depth_halt
                     self.state.event_depth_halt[ev] = now_ts
@@ -5185,11 +5253,10 @@ class IncentiveMarketMaker:
                     ev_ticks = {m2.ticker for m2 in by_event.get(ev, [meta])}
                     desired = [q for q in desired if q.ticker not in ev_ticks]
                     if two_sided:   # keep P&L marks honest through the halt
-                        mid = (ext_bid + ext_ask) / 2.0
-                        self.state.prev_mid[t] = mid
-                        self.state.last_mark[t] = mid
+                        self.state.prev_mid[t] = mid_g
+                        self.state.last_mark[t] = mid_g
                         marked.add(t)
-                    if first:
+                    if first and (thin or went_one_sided):
                         self.alerter.alert(
                             "event_depth",
                             f"{ev}: {t} "
@@ -5199,16 +5266,22 @@ class IncentiveMarketMaker:
                             + f" — event likely LIVE; standing down the whole "
                             f"event (cancelled {n_cx})", key=ev, urgent=False)
                     continue
-                event_depth_ok[ev] = event_depth_ok.get(ev, 0) + 1
+                # Only a healthy IN-BAND, two-sided, at/over-target book
+                # argues for resume. An out-of-band pin or a history-less
+                # one-sided book proves nothing, counts nothing, and thereby
+                # BLOCKS resume for as long as it sits there (Jack
+                # 2026-08-31 #2: a settled strike holds its event down —
+                # and settlement ends the event anyway).
+                if mid_in_band:
+                    event_depth_ok[ev] = event_depth_ok.get(ev, 0) + 1
                 if ev in self.state.event_depth_halt:
-                    # healthy market of a still-halted event: hold quiet (and
-                    # keep marks/mid fresh so resume doesn't false-trip the
-                    # move breaker) until the resume pass clears the event.
+                    # market of a still-halted event: hold quiet (and keep
+                    # marks/mid fresh so resume doesn't false-trip the move
+                    # breaker) until the resume pass clears the event.
                     self.cancel_market_orders(t, resting)
                     if two_sided:
-                        mid = (ext_bid + ext_ask) / 2.0
-                        self.state.prev_mid[t] = mid
-                        self.state.last_mark[t] = mid
+                        self.state.prev_mid[t] = mid_g
+                        self.state.last_mark[t] = mid_g
                         marked.add(t)
                     continue
 
@@ -5522,17 +5595,20 @@ class IncentiveMarketMaker:
                 else:
                     self.state.zero_share_streak.pop(t, None)
 
-        # Live-event depth gate, resume pass: release a halted event only on
-        # a full cycle where NO market of it read thin, EVERY managed market
-        # of it was actually evaluated healthy (a blind/breakered/skipped
-        # market is not evidence), and the last thin reading is
-        # EVENT_DEPTH_RESUME_SECS old — a book refilling for a moment
-        # mid-speech must not re-enter us. Events with no managed markets
+        # Live-event depth gate, resume pass: release a THIN-only halt on a
+        # full cycle where NO market of it read thin, EVERY managed market
+        # of it was actually evaluated healthy — in-band, two-sided, at
+        # target; a blind/breakered/pinned/one-sided market is not evidence
+        # and blocks release by not counting — and the last thin reading is
+        # EVENT_DEPTH_RESUME_SECS old (a book refilling for a moment
+        # mid-speech must not re-enter us). Live-CONFIRMED events
+        # (event_live_halt) never release. Events with no managed markets
         # keep their halt (nothing quotes them anyway; the 7d persist TTL
         # prunes dead ones), so a halt can never flap on selection churn.
         if not fast_only:
             for ev_h in list(self.state.event_depth_halt):
-                if ev_h in event_depth_thin:
+                if ev_h in self.state.event_live_halt \
+                        or ev_h in event_depth_thin:
                     continue
                 n_mkts = len(by_event.get(ev_h, []))
                 if (n_mkts and event_depth_ok.get(ev_h, 0) >= n_mkts
@@ -6012,8 +6088,12 @@ class IncentiveMarketMaker:
             log(f"live-event depth gate: {','.join(EVENT_DEPTH_GATE_PREFIXES)} "
                 f"— pads OFF; any quotable side < "
                 f"{EVENT_DEPTH_MIN_CONTRACTS:g} external contracts stands the "
-                f"WHOLE event down (resume after "
-                f"{EVENT_DEPTH_RESUME_SECS // 60}min healthy)")
+                f"WHOLE event down (resume only once ALL markets healthy "
+                f"in-band for {EVENT_DEPTH_RESUME_SECS // 60}min); a strike "
+                f"jumping out of band by {EVENT_DEPTH_JUMP_CENTS:g}c+ kills "
+                f"the event PERMANENTLY"
+                + (f"; {len(self.state.event_live_halt)} event(s) carried in "
+                   f"as live-confirmed" if self.state.event_live_halt else ""))
 
         if self.live:
             n = self.cancel_all_bot_orders()
