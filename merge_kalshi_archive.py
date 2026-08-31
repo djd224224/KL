@@ -17,9 +17,11 @@ Handles both settlement CSV dialects:
     negative). Detected per file, normalized to the API format so the
     analyzers' cost/pay math stays correct.
 
-Dedup: Settlement rows on (ticker, settled-time truncated to seconds) —
-one settlement per market per account, and second-precision survives the
-sources' sub-second formatting differences. Other rows (Trades) on the
+Dedup: Settlement rows on ticker ALONE — one settlement per market per
+account (verified: 7,287 rows / 7,287 distinct tickers in a real export),
+and the website export's settled-time strings do NOT reliably match the
+API's for the same settlement, so any timestamp in the key double-counts
+every market both sources cover. Other rows (Trades) on the
 full row tuple — fills carry no id in this CSV format, but every field is
 deterministic per fill, so refetches collapse cleanly. First-seen wins
 (the archive's existing row is never overwritten). Website-format TRADE
@@ -103,7 +105,7 @@ def normalize_website_settlement(r):
 
 def row_key(r):
     if r.get("type") == "Settlement":
-        return ("S", r.get("Market_Ticker", ""), (r.get("Original_Date") or "")[:19])
+        return ("S", r.get("Market_Ticker", ""))
     return ("T",) + tuple(r.get(c, "") for c in CSV_COLUMNS)
 
 

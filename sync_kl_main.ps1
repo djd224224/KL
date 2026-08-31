@@ -35,6 +35,17 @@ if (-not $dashTask) {
     # Self-limiting — the archive exists after the first successful run.
     Start-ScheduledTask -TaskName "KL dashboards-daily"
     "$stamp dashboards kicked to build first settlements archive from seed" | Add-Content -Path $Log -Encoding utf8
+} elseif ($dashTask.State -ne 'Running' -and
+          (Test-Path (Join-Path $Repo "Kalshi-Settlements-archive.csv")) -and
+          -not (Test-Path (Join-Path $Repo "run-logs\dashboards-dedup-v2.kicked"))) {
+    # One-time heal (2026-08-22): the first archive build double-counted
+    # settlements covered by both the seed export and the API pull (their
+    # settled-time strings differ, and the old dedup key included time).
+    # The merge now dedups on ticker alone and collapses the duplicates on
+    # its next load — kick a rebuild once so the dashboards correct now.
+    New-Item -ItemType File -Force (Join-Path $Repo "run-logs\dashboards-dedup-v2.kicked") | Out-Null
+    Start-ScheduledTask -TaskName "KL dashboards-daily"
+    "$stamp dashboards kicked once to dedup settlements archive (v2 key)" | Add-Content -Path $Log -Encoding utf8
 }
 
 # Cap the log at ~500 lines so it never grows unbounded
