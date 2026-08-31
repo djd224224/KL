@@ -5074,6 +5074,263 @@ class TestTwoSidedDepthGate(unittest.TestCase):
             _clean_persist()
 
 
+class TestLiveEventDepthGate(unittest.TestCase):
+    """Jack 2026-08-31: "Remove padding on TRUMPMENTION and MAMDANIMENTION
+    markets. If <1k on either side of a market, stop quoting the whole
+    event." These events' start times are not reliably known, so a thin
+    EXTERNAL book on any quotable strike is read as the event going LIVE —
+    and the WHOLE event stands down, not just the thin market (adverse
+    selection protection, not reward math)."""
+
+    EV = "KXGOOD-99DEC31"
+    A = "KXGOOD-99DEC31-A"
+    B = "KXGOOD-99DEC31-B"
+
+    def setUp(self):
+        self._prefixes = imm.EVENT_DEPTH_GATE_PREFIXES
+        imm.EVENT_DEPTH_GATE_PREFIXES = ("KXGOOD",)
+        self.addCleanup(setattr, imm, "EVENT_DEPTH_GATE_PREFIXES",
+                        self._prefixes)
+        self.addCleanup(_clean_persist)
+
+    def _bot(self, yes_a=1200, no_a=1200, yes_b=1200, no_b=1200):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # second market in the SAME event as A
+        bot.client.programs.append(
+            {"market_ticker": self.B, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": start, "end_date": end})
+        bot.client.markets[self.B] = {
+            "ticker": self.B, "event_ticker": self.EV,
+            "status": "active", "close_time": far,
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        self._books(bot, yes_a, no_a, yes_b, no_b)
+        return bot
+
+    def _books(self, bot, yes_a, no_a, yes_b, no_b):
+        bot.client.books[self.A] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", str(yes_a)]],
+            "no_dollars": [["0.49", str(no_a)]]}}
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", str(yes_b)]],
+            "no_dollars": [["0.49", str(no_b)]]}}
+
+    def _event_orders(self, bot):
+        return [o for o in bot.state.sim_orders.values()
+                if o["ticker"] in (self.A, self.B)]
+
+    def test_gated_series_never_pad(self):
+        """Padding is manufactured depth — it would blind the gate AND
+        re-qualify exactly the book we no longer want to rest in. Prefix
+        match: KXTRUMPMENTIONB rides the KXTRUMPMENTION entry."""
+        imm.EVENT_DEPTH_GATE_PREFIXES = self._prefixes   # the REAL defaults
+        self.assertTrue(imm.PAD_TO_TARGET_GLOBAL)
+        for s in ("KXTRUMPMENTION", "KXTRUMPMENTIONB", "KXMAMDANIMENTION"):
+            self.assertTrue(imm.series_event_depth_gated(s), s)
+            self.assertFalse(imm.series_pad_to_target(s), s)
+        for s in ("KXGOOD", "KXTEMPAUSH", "KXLOVEISLMENTION"):
+            self.assertFalse(imm.series_event_depth_gated(s), s)
+            self.assertTrue(imm.series_pad_to_target(s), s)
+
+    def test_external_depths_net_out_our_own_orders(self):
+        """The gate measures the EXTERNAL book: our own ladder (or a legacy
+        1k pad still resting through the config change) must not hold the
+        reading over the bar while everyone else pulls out."""
+        yes = [[49, 1200.0]]
+        no = [[49, 800.0]]
+        own = [("bid", 49, 300.0), ("ask", 51, 200.0)]
+        self.assertEqual(imm.external_depths(yes, no, own), (900.0, 600.0))
+        self.assertEqual(imm.external_depths(yes, no, []), (1200.0, 800.0))
+
+    def test_both_markets_deep_quotes_normally(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.A, bot.state.selected)
+        self.assertIn(self.B, bot.state.selected)
+        self.assertTrue(self._event_orders(bot))
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+
+    def test_thin_sibling_stops_the_whole_event(self):
+        """The event-level point: B is thin so A — itself perfectly deep —
+        must not quote either. B never even gets selected (est=0), so this
+        is the estimator hook doing the marking."""
+        bot = self._bot(yes_b=300)
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertTrue(any(c == "event_depth" for c, _m in bot.alerter.today))
+
+    def test_going_thin_cancels_the_whole_quoting_event(self):
+        """'stop quoting the whole event' on a LIVE transition: both markets
+        already resting, then one side of B empties out."""
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        self._books(bot, 1200, 1200, 1200, 200)
+        bot.state.universe_at = time.time()          # no refresh: quote loop only
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot),
+                         "thin side on B must cancel A's quotes too")
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+
+    def test_lost_touch_mid_band_halts_the_event(self):
+        """A book that WAS two-sided in band and lost a touch entirely is
+        the withdrawal signal at full volume (the one-sided breaker alone
+        would stand down only that market for 30min)."""
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", "1200"]], "no_dollars": []}}
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+
+    def test_extreme_pinned_strike_is_not_a_signal(self):
+        """A 96c pin is thin by nature and proves nothing — the event keeps
+        quoting (the strike itself is screened out individually)."""
+        bot = self._bot()
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.95", "30"]], "no_dollars": [["0.03", "40"]]}}
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        self.assertTrue([o for o in bot.state.sim_orders.values()
+                         if o["ticker"] == self.A],
+                        "deep sibling must keep quoting")
+
+    def test_resume_needs_quiet_time_and_all_markets_healthy(self):
+        bot = self._bot(yes_b=300)
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        # book recovers, but the thin reading is FRESH -> still down
+        self._books(bot, 1200, 1200, 1200, 1200)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertFalse(self._event_orders(bot))
+        # quiet for EVENT_DEPTH_RESUME_SECS -> resume pass clears it...
+        bot.state.event_depth_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        # ...and the NEXT cycle quotes again (sticky selection kept A)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+
+    def test_halt_survives_a_restart(self):
+        """~20 restarts/day: a restart mid-speech must come back already
+        standing down, not spend a cycle rediscovering the thin strike."""
+        bot = self._bot(yes_b=300)
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertIn(self.EV, bot2.state.event_depth_halt)
+
+    def test_settled_jump_out_of_band_kills_the_event_forever(self):
+        """Jack 2026-08-31 #2: a deep in-band strike that jumps to 99c (the
+        word got said) is the event CONFIRMED live — permanent halt, and no
+        amount of book recovery or quiet time brings the event back."""
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))          # prev_mid seeded ~50
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.98", "150"]],
+            "no_dollars": [["0.01", "300"]]}}             # 98x99, mid 98.5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        self.assertTrue(any(c == "event_live" for c, _m in bot.alerter.today))
+        # books fully recover AND every timestamp goes stale -> STILL down
+        self._books(bot, 1200, 1200, 1200, 1200)
+        bot.state.event_depth_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.event_live_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+
+    def test_live_confirm_survives_restart_and_refuses_reselection(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.98", "150"]],
+            "no_dollars": [["0.01", "300"]]}}
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertIn(self.EV, bot2.state.event_live_halt)
+        bot2.run_cycle()          # fresh process, healthy default A book
+        self.assertFalse([o for o in bot2.state.sim_orders.values()
+                          if o["ticker"] in (self.A, self.B)],
+                         "live-confirmed event must never quote again")
+
+    def test_pinned_strike_blocks_thin_halt_resume(self):
+        """Jack 2026-08-31 #2: 'settled strike SHOULD hold an event down
+        forever.' Even without jump history (restart amnesia), a strike
+        sitting out of band counts as NOTHING for the resume pass — the
+        halted event stays down until that strike is back in band or gone."""
+        bot = self._bot()
+        bot.run_cycle()
+        self._books(bot, 1200, 1200, 300, 1200)           # B thin in-band
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        bot.state.prev_mid.pop(self.B, None)              # amnesia: no jump
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.95", "30"]],
+            "no_dollars": [["0.03", "40"]]}}              # pinned 95x97
+        bot.state.event_depth_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt,
+                      "out-of-band pin must block resume")
+        self.assertNotIn(self.EV, bot.state.event_live_halt)
+        self.assertFalse(self._event_orders(bot))
+        # only a fully healthy in-band event releases the thin-only halt
+        self._books(bot, 1200, 1200, 1200, 1200)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+
+    def test_thin_then_pin_with_history_escalates_to_live_confirm(self):
+        """With mid history intact the same pin IS the jump signature: the
+        halt branch keeps prev_mid fresh precisely so a later settle-jump
+        still confirms."""
+        bot = self._bot()
+        bot.run_cycle()
+        self._books(bot, 1200, 1200, 300, 1200)           # thin first
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.95", "30"]],
+            "no_dollars": [["0.03", "40"]]}}              # then settles ~96
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_live_halt)
+
+
 class TestSidesCanQualify(unittest.TestCase):
     """Jack 2026-08-05: the gate must ask whether a pad WILL BE PLACED, not
     whether the series is the padding kind. A padding series still gets no pad
