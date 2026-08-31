@@ -140,21 +140,34 @@ def main() -> None:
                   if str(o.get("client_order_id", "")).startswith("imm-")]
     gated_orders = [o for o in imm_orders if is_gated(o.get("ticker", ""))]
     gated_pads = [o for o in gated_orders if order_is_pad_priced(o)]
-    newest = max((str(o.get("created_time") or "") for o in imm_orders),
-                 default="")
+    created = sorted(str(o.get("created_time") or "") for o in imm_orders
+                     if o.get("created_time"))
     print(f"resting orders: {len(resting)}; imm- bot orders: {len(imm_orders)} "
-          f"(newest created {newest or 'n/a'})")
+          f"(created {created[0] if created else 'n/a'} .. "
+          f"{created[-1] if created else 'n/a'}; TTL {imm.ORDER_TTL_SECS}s "
+          f"bounds max age)")
     print(f"imm- on gated series: {len(gated_orders)}; at PAD prices "
           f"(1c bid / 99c ask): {len(gated_pads)}")
     per_mkt = {}
     for o in gated_orders:
         per_mkt[o.get("ticker", "?")] = per_mkt.get(o.get("ticker", "?"), 0) + 1
 
-    # Which quoted gated markets have an in-band side under the 1k bar once
-    # OUR orders are netted out? Old code quotes (and pads) exactly there;
-    # new code refuses the whole event.
-    thin_quoted = []
-    for t in sorted(per_mkt):
+    def event_of(ticker: str) -> str:
+        return str(ticker).rsplit("-", 1)[0]
+
+    # Book sweep over EVERY programmed gated market — quoted or not. The
+    # old/new discriminator lives on markets with an in-band side under the
+    # 1k bar once OUR orders are netted out: old code quotes (and pads)
+    # exactly there; new code stands the whole EVENT down. On books >= 1k
+    # both sides, old and new code are behaviorally IDENTICAL (old code
+    # only pads a side that is short), so deep-everywhere runs are
+    # inconclusive by behavior — the verdict says so instead of guessing.
+    ev_orders, ev_prog, ev_thin = {}, {}, {}
+    for t in per_mkt:
+        ev_orders[event_of(t)] = ev_orders.get(event_of(t), 0) + per_mkt[t]
+    for t in sorted(gated_prog):
+        ev = event_of(t)
+        ev_prog[ev] = ev_prog.get(ev, 0) + 1
         try:
             yl, nl = imm.orderbook_levels(client.get_orderbook(ticker=t))
         except Exception as e:
@@ -169,12 +182,26 @@ def main() -> None:
         thin = in_band and (d_yes < imm.EVENT_DEPTH_MIN_CONTRACTS
                             or d_no < imm.EVENT_DEPTH_MIN_CONTRACTS)
         if thin:
-            thin_quoted.append(t)
-        print(f"  quoted {t}: {per_mkt[t]} imm- orders; ext depth "
+            ev_thin[ev] = ev_thin.get(ev, 0) + 1
+        print(f"  {t}: {per_mkt.get(t, 0)} imm- orders; ext depth "
               f"yes {d_yes:.0f} / no {d_no:.0f}; in-band {in_band}"
               f"{'; SUB-1K SIDE' if thin else ''}")
+    print("per-event: programmed / imm- orders / in-band sub-1k markets")
+    for ev in sorted(set(ev_prog) | set(ev_orders)):
+        print(f"  {ev}: {ev_prog.get(ev, 0)} / {ev_orders.get(ev, 0)} / "
+              f"{ev_thin.get(ev, 0)}")
+    old_proof = sorted(ev for ev, n in ev_thin.items()
+                       if n and ev_orders.get(ev, 0))
+    halt_sig = sorted(ev for ev, n in ev_thin.items()
+                      if n and not ev_orders.get(ev, 0))
 
     section("3. DRY-RUN CYCLE of the CHECKED-OUT code (read-only)")
+    # Caveat: this fresh dry instance sees the LIVE bot's resting orders as
+    # foreign, so its yield-to-human standoff skips exactly the markets the
+    # live bot is quoting ('manual' skips below are expected, not a bug) —
+    # gated markets may therefore be absent from this section whenever the
+    # live bot is on them. Section 2 is the box verdict; this section only
+    # demonstrates the checked-out code refuses pads/thin events itself.
     bot.run_cycle()
     sims = bot.state.sim_orders or {}
     sim_iter = list(sims.values()) if isinstance(sims, dict) else list(sims)
@@ -206,19 +233,29 @@ def main() -> None:
               f"resting on gated series. New code never pads these and "
               f"cancels legacy pads on its first cycle. The box has not "
               f"restarted onto the merge yet.")
-    elif thin_quoted:
-        print(f"OLD code: imm- orders rest on {len(thin_quoted)} gated "
-              f"market(s) with an in-band sub-1k side ({', '.join(thin_quoted)}) "
-              f"— new code stands the whole event down there.")
+    elif old_proof:
+        print(f"OLD code: event(s) {', '.join(old_proof)} carry imm- orders "
+              f"while holding an in-band sub-1k market — new code stands "
+              f"the whole event down there.")
+    elif halt_sig:
+        print(f"NEW code signature: event(s) {', '.join(halt_sig)} hold an "
+              f"in-band sub-1k market and carry ZERO imm- orders while the "
+              f"bot rests elsewhere — that is the event-wide halt acting "
+              f"(old code would have quoted and padded there, unless "
+              f"unselected for unrelated floors).")
     elif not gated_prog and not open_gated:
         print("Bot ALIVE, but no gated markets are open/programmed right "
               "now — nothing for the gate to act on, so box code version is "
               "UNOBSERVABLE from behavior. The dry run above proves the "
               "merged code itself; re-probe when a gated event lists.")
     elif gated_orders:
-        print("NEW code (behavioral match): bot alive, imm- orders on gated "
-              "series but ZERO at pad prices, and no quoting into a sub-1k "
-              "side.")
+        print("INCONCLUSIVE by behavior (leaning new): bot alive, quoting "
+              "gated events, zero pads — but every gated in-band book is "
+              ">= 1k both sides, where old and new code act identically "
+              "(old code only pads a SHORT side). Zero pads is REQUIRED by "
+              "new code and merely unneeded by old. Re-probe when any side "
+              "thins, or rely on the deploy chain (sync + "
+              "code_change_exit_due self-restart, both verified enabled).")
     else:
         print("Consistent with NEW code: bot alive, zero imm- orders on "
               "gated series (halted/unselected events), zero pads. If the "
