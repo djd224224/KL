@@ -1,0 +1,43 @@
+name: IMM deploy probe
+# One-shot: is the TRADING BOX's bot running the live-event depth gate
+# (PR #9) yet? Decides from the account's own resting-order signature on
+# TRUMPMENTION/MAMDANIMENTION (old code pads them at 1c/99c; new code never
+# does and halts thin events whole) plus a read-only dry run_cycle of the
+# checked-out code. GETs only, live=False. Safe to delete once the deploy
+# is confirmed.
+# push-trigger exists because the GitHub App integration cannot POST
+# workflow dispatches (403) — re-running = push a change to any listed
+# path (imm_deploy_probe.trigger is a scratch file for exactly that).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - imm_deploy_probe.py
+      - .github/workflows/imm_deploy_probe.yml
+      - imm_deploy_probe.trigger
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests cryptography pytz python-dateutil
+      - name: Write Kalshi key
+        run: |
+          echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > Lisa_Kalshi.txt
+      - name: Run probe
+        env:
+          IMM_STATUS_DIR: /tmp/imm-probe
+        run: python imm_deploy_probe.py
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f Lisa_Kalshi.txt
