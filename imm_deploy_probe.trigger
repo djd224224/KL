@@ -1,1 +1,1 @@
-2026-08-31T04:50:00Z probe v2 — full programmed-market sweep
+2026-08-31T22:23:00Z run 3 — post-deploy confirmation (2h check, delayed by session suspend)
