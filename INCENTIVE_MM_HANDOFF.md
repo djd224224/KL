@@ -160,6 +160,14 @@ confirming reward eligibility is per-subaccount first.
   Fill note: at 1c/99c the pad almost never fills — near-touch fills first on any
   move and trips the fill-burst breaker (cancel + stand down) long before price
   reaches the pad. A pad fill would count toward P&L/breakers normally.
+- **Live-event depth gate (2026-08-31, Jack)**: `KXTRUMPMENTION*` and
+  `KXMAMDANIMENTION*` (`IMM_EVENT_DEPTH_SERIES`, prefix match) never pad, and any
+  in-band market of theirs with < 1000 external contracts (`IMM_EVENT_DEPTH_MIN`,
+  book minus our own orders) on either side — or that loses a touch mid-band —
+  stands down its WHOLE event: these events' start times aren't reliably known,
+  and a thin book is the tell that the event has gone live (adverse selection).
+  Resumes only after every market reads healthy for 15 min
+  (`IMM_EVENT_DEPTH_RESUME_SECS`); halts persist across restarts.
 
 Reconciliation with the yield-to-human rule: for quote_all series the bot ignores
 the user's POSITIONS (he wants full coverage) and its caps/skew track the bot's OWN

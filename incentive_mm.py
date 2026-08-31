@@ -348,6 +348,49 @@ PAD_SLACK_CONTRACTS = _env_int("IMM_PAD_SLACK", 300)
 PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 
 
+# ---- Live-event depth gate (Jack 2026-08-31) --------------------------------
+# "Remove padding on TRUMPMENTION and MAMDANIMENTION markets. If <1k on
+# either side of a market, stop quoting the whole event." These events
+# (speeches/streams) have start times he doesn't always know and the ticker
+# date deliberately can't provide (see MENTION_LISTING_GAP_DAYS) — the one
+# reliable tell that the event has gone LIVE is the book itself: the other
+# makers pull their depth, and resting through that is pure adverse
+# selection. For the series listed here (PREFIX match, so KXTRUMPMENTIONB
+# rides the KXTRUMPMENTION entry):
+#   1. pad_to_target is FORCED OFF (series_pad_to_target): a pad is
+#      manufactured depth — it would blind this gate AND re-qualify exactly
+#      the book we no longer want to rest in. With pads off, the per-market
+#      two-sided depth gate in the quote loop re-arms for these series too.
+#   2. any QUOTABLE market (external mid inside the series band — pinned
+#      extreme strikes are thin by nature and prove nothing) whose EXTERNAL
+#      depth (book minus our own resting orders, which would otherwise mask
+#      the withdrawal) is under EVENT_DEPTH_MIN_CONTRACTS on EITHER side
+#      stands down its WHOLE EVENT: every sibling market is cancelled and
+#      none quote. A market that WAS two-sided and lost a touch entirely is
+#      the same signal, louder.
+#   3. the event resumes only once every managed market of it has read
+#      healthy AND the last thin reading is EVENT_DEPTH_RESUME_SECS old —
+#      a book refilling for a moment mid-speech must not re-enter us.
+# Enforced in BOTH the quote loop and the candidate estimator (the
+# 2026-08-05 lesson, plus its event-level twin: a thin sibling that never
+# gets SELECTED is invisible to the quote loop, so without the estimator
+# hook the deep strikes of a live event would keep quoting).
+EVENT_DEPTH_GATE_PREFIXES = tuple(
+    s.strip() for s in os.environ.get(
+        "IMM_EVENT_DEPTH_SERIES",
+        "KXTRUMPMENTION,KXMAMDANIMENTION").split(",") if s.strip())
+EVENT_DEPTH_MIN_CONTRACTS = _env_float("IMM_EVENT_DEPTH_MIN", 1000)
+# MUST stay > UNIVERSE_REFRESH_SECS (600): an unselected thin sibling is
+# only re-observed by the estimator hook once per refresh, and the halt must
+# not be able to expire between two of those observations (it would flap —
+# requote the live event for a few minutes out of every refresh interval).
+EVENT_DEPTH_RESUME_SECS = _env_int("IMM_EVENT_DEPTH_RESUME_SECS", 900)
+
+
+def series_event_depth_gated(series: str) -> bool:
+    return series.startswith(tuple(EVENT_DEPTH_GATE_PREFIXES))
+
+
 # User decision 2026-07-12: Love Island mention pools are high incentive-per-minute
 # (live only ~1 day), so go bigger and quote the whole event, but with a hard 8:30pm
 # ET episode expiry and a tighter 50-contract per-market net cap.
@@ -503,6 +546,12 @@ for _s in os.environ.get(
 
 
 def series_pad_to_target(series: str) -> bool:
+    # Live-event depth-gated series NEVER pad (Jack 2026-08-31): thin depth
+    # is their event-went-live signal, and a pad would both blind that gate
+    # and re-qualify a book we specifically no longer want to rest in.
+    # Beats the global AND any per-series override.
+    if series_event_depth_gated(series):
+        return False
     if PAD_TO_TARGET_GLOBAL:
         return True
     ov = SERIES_OVERRIDES.get(series)
@@ -2272,6 +2321,21 @@ def external_best(yes_levels: List[List[float]], no_levels: List[List[float]],
     return best_yes_bid, best_yes_ask
 
 
+def external_depths(yes_levels: List[List[float]], no_levels: List[List[float]],
+                    own_orders: List[Tuple[str, int, float]] = ()
+                    ) -> Tuple[float, float]:
+    """(yes_depth, no_depth) in contracts EXCLUDING our own resting orders
+    (same own-order tuples as external_best). The live-event depth gate must
+    measure the EXTERNAL book: the signal is everyone else pulling out, and
+    our own ladder — or a legacy 1k pad still resting through the config
+    change — would otherwise hold the reading over the bar forever."""
+    own_yes = sum(r for s, _px, r in own_orders if s == "bid")
+    own_no = sum(r for s, _px, r in own_orders if s != "bid")
+    d_yes = sum(q for _px, q in yes_levels) - own_yes
+    d_no = sum(q for _px, q in no_levels) - own_no
+    return max(d_yes, 0.0), max(d_no, 0.0)
+
+
 def order_yes_book_cents(order: dict) -> Optional[Tuple[str, int]]:
     """(book_side, yes_price_cents) from a normalized V2 order dict."""
     book_side = order.get("book_side")
@@ -3045,6 +3109,11 @@ class BotState:
     prev_mid: Dict[str, float] = field(default_factory=dict)
     prev_pos: Dict[str, float] = field(default_factory=dict)
     breaker_until: Dict[str, float] = field(default_factory=dict)
+    # Live-event depth gate: event_ticker -> ts of the LAST thin-side reading
+    # (refreshed while thin, so "quiet for EVENT_DEPTH_RESUME_SECS" is
+    # testable). Whole event stands down while present. Persisted — this bot
+    # restarts many times a day, and a restart mid-speech must not re-quote.
+    event_depth_halt: Dict[str, float] = field(default_factory=dict)
     bench_until: Dict[str, float] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
@@ -3281,6 +3350,11 @@ class IncentiveMarketMaker:
             # same divergent books.
             self.state.rain_dir_done = {str(t): float(v) for t, v in
                                         (data.get("rain_dir_done") or {}).items()}
+            # Live-event depth halts survive restarts: this bot restarts many
+            # times a day, and a restart mid-speech must not spend a cycle
+            # quoting the deep strikes before rediscovering the thin one.
+            self.state.event_depth_halt = {str(e): float(v) for e, v in
+                                           (data.get("event_depth_halt") or {}).items()}
             # Halt continuity (same roll-day only): a restart must NOT hand
             # the bot a fresh loss budget or clear an active halt. Use
             # --clear-halt (bot stopped) for a deliberate un-halt.
@@ -3383,7 +3457,14 @@ class IncentiveMarketMaker:
                                if t in self.state.known_tickers),
                            "rain_dir_done": {t: round(v, 1)
                                              for t, v in self.state.rain_dir_done.items()
-                                             if time.time() - v < 7 * 86400}}, f)
+                                             if time.time() - v < 7 * 86400},
+                           # live-event depth halts (pruned with the same 7d
+                           # TTL: mention events settle within a day, this
+                           # just stops dead events accreting)
+                           "event_depth_halt": {
+                               e: round(v, 1)
+                               for e, v in self.state.event_depth_halt.items()
+                               if time.time() - v < 7 * 86400}}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.
@@ -4268,6 +4349,32 @@ class IncentiveMarketMaker:
         meta.book_depth_contracts = (sum(q for _px, q in yes_levels)
                                      + sum(q for _px, q in no_levels))
         ext_b, ext_a = external_best(yes_levels, no_levels)
+        # LIVE-EVENT DEPTH GATE, selection side (Jack 2026-08-31). This hook
+        # is what makes the gate EVENT-wide in practice: a thin strike reads
+        # est=0 and never gets selected, so the quote loop alone would never
+        # see it — its deep siblings would quote a live event unopposed. Any
+        # quotable (in-band) candidate of a gated series with a thin external
+        # side marks the whole event halted here, and the quote loop refuses
+        # every sibling. Runs BEFORE sides_can_qualify so the thin market
+        # itself also ranks as worthless.
+        if series_event_depth_gated(meta.series) \
+                and pad_band_ok(meta.series, ext_b, ext_a):
+            d_yes, d_no = external_depths(yes_levels, no_levels, own_live)
+            if d_yes < EVENT_DEPTH_MIN_CONTRACTS \
+                    or d_no < EVENT_DEPTH_MIN_CONTRACTS:
+                first = meta.event_ticker not in self.state.event_depth_halt
+                self.state.event_depth_halt[meta.event_ticker] = time.time()
+                if first:
+                    self.alerter.alert(
+                        "event_depth",
+                        f"{meta.event_ticker}: {meta.ticker} external depth "
+                        f"yes {d_yes:.0f} / no {d_no:.0f} < "
+                        f"{EVENT_DEPTH_MIN_CONTRACTS:.0f} — event likely "
+                        f"LIVE; standing down the whole event",
+                        key=meta.event_ticker, urgent=False)
+                meta.est_frac = meta.est_dollars_per_day = 0.0
+                meta.yield_per_contract = 0.0
+                return True      # readable; deliberately worth nothing
         # Same qualification gate the quote loop applies (Jack 2026-08-05).
         # It has to be here as well or selection keeps RANKING markets the
         # loop then refuses to quote — they would hold budget and an event
@@ -4870,6 +4977,11 @@ class IncentiveMarketMaker:
         desired: List[Quote] = []
         blind: Set[str] = set()
         marked: Set[str] = set()          # tickers marked from live books this cycle
+        # live-event depth gate, per-cycle books: events seen thin this
+        # cycle, and per-event count of gated markets that read healthy —
+        # the resume path requires EVERY managed market healthy this cycle.
+        event_depth_thin: Set[str] = set()
+        event_depth_ok: Dict[str, int] = {}
         # per-market external touch this cycle — the asymmetric-chase bound
         # in diff_orders (keep aggressive-drifted rungs while not leading)
         touch_map: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
@@ -5031,6 +5143,74 @@ class IncentiveMarketMaker:
             own_in_book = own if self.live else []
             ext_bid, ext_ask = external_best(yes_levels, no_levels, own_in_book)
             touch_map[t] = (ext_bid, ext_ask)
+
+            # LIVE-EVENT DEPTH GATE (Jack 2026-08-31, TRUMPMENTION /
+            # MAMDANIMENTION — see EVENT_DEPTH_GATE_PREFIXES): a thin
+            # external side on any quotable market of these series means the
+            # event is likely LIVE, so the WHOLE event stands down — resting
+            # orders on every sibling cancelled, quotes already built this
+            # cycle stripped before placement. Sits BEFORE the breakers on
+            # purpose: a gated book that just went one-sided must halt the
+            # event, not merely 30-min-breaker its own market. Selection
+            # stays sticky (the top-in-band pattern), so quoting resumes on
+            # its own once the whole event reads healthy for
+            # EVENT_DEPTH_RESUME_SECS.
+            if series_event_depth_gated(meta.series):
+                d_yes, d_no = external_depths(yes_levels, no_levels, own_in_book)
+                two_sided = ext_bid is not None and ext_ask is not None
+                # mid outside the series band = pinned/extreme strike: thin
+                # by nature, proves nothing (mirrors the estimator hook). A
+                # lost touch is the same withdrawal signal at full volume —
+                # but only on a market whose last known mid was IN band: a
+                # contested strike losing a side is the signature; a 96c pin
+                # whose scrap ask evaporates is routine book decay and must
+                # not park a multi-day pre-event window (it falls through to
+                # the ordinary one-sided breaker instead). prev_mid is not
+                # popped here, so a strike that goes one-sided mid-band and
+                # STAYS that way holds the halt for the rest of the event.
+                pm_g = self.state.prev_mid.get(t)
+                went_one_sided = (not two_sided and pm_g is not None
+                                  and series_price_min(meta.series) <= pm_g
+                                  <= series_price_max(meta.series))
+                thin = (pad_band_ok(meta.series, ext_bid, ext_ask)
+                        and (d_yes < EVENT_DEPTH_MIN_CONTRACTS
+                             or d_no < EVENT_DEPTH_MIN_CONTRACTS))
+                if thin or went_one_sided:
+                    event_depth_thin.add(ev)
+                    first = ev not in self.state.event_depth_halt
+                    self.state.event_depth_halt[ev] = now_ts
+                    n_cx = 0
+                    for m2 in by_event.get(ev, [meta]):
+                        n_cx += self.cancel_market_orders(m2.ticker, resting)
+                    ev_ticks = {m2.ticker for m2 in by_event.get(ev, [meta])}
+                    desired = [q for q in desired if q.ticker not in ev_ticks]
+                    if two_sided:   # keep P&L marks honest through the halt
+                        mid = (ext_bid + ext_ask) / 2.0
+                        self.state.prev_mid[t] = mid
+                        self.state.last_mark[t] = mid
+                        marked.add(t)
+                    if first:
+                        self.alerter.alert(
+                            "event_depth",
+                            f"{ev}: {t} "
+                            + ("went one-sided" if went_one_sided else
+                               f"external depth yes {d_yes:.0f} / no "
+                               f"{d_no:.0f} < {EVENT_DEPTH_MIN_CONTRACTS:.0f}")
+                            + f" — event likely LIVE; standing down the whole "
+                            f"event (cancelled {n_cx})", key=ev, urgent=False)
+                    continue
+                event_depth_ok[ev] = event_depth_ok.get(ev, 0) + 1
+                if ev in self.state.event_depth_halt:
+                    # healthy market of a still-halted event: hold quiet (and
+                    # keep marks/mid fresh so resume doesn't false-trip the
+                    # move breaker) until the resume pass clears the event.
+                    self.cancel_market_orders(t, resting)
+                    if two_sided:
+                        mid = (ext_bid + ext_ask) / 2.0
+                        self.state.prev_mid[t] = mid
+                        self.state.last_mark[t] = mid
+                        marked.add(t)
+                    continue
 
             # A book that WAS two-sided and just lost a side is the classic
             # news signature (everyone pulled their quotes) — the mid-move
@@ -5341,6 +5521,27 @@ class IncentiveMarketMaker:
                             f"{BENCH_COOLDOWN_SECS // 3600}h", key=t, urgent=False)
                 else:
                     self.state.zero_share_streak.pop(t, None)
+
+        # Live-event depth gate, resume pass: release a halted event only on
+        # a full cycle where NO market of it read thin, EVERY managed market
+        # of it was actually evaluated healthy (a blind/breakered/skipped
+        # market is not evidence), and the last thin reading is
+        # EVENT_DEPTH_RESUME_SECS old — a book refilling for a moment
+        # mid-speech must not re-enter us. Events with no managed markets
+        # keep their halt (nothing quotes them anyway; the 7d persist TTL
+        # prunes dead ones), so a halt can never flap on selection churn.
+        if not fast_only:
+            for ev_h in list(self.state.event_depth_halt):
+                if ev_h in event_depth_thin:
+                    continue
+                n_mkts = len(by_event.get(ev_h, []))
+                if (n_mkts and event_depth_ok.get(ev_h, 0) >= n_mkts
+                        and now_ts - self.state.event_depth_halt[ev_h]
+                        >= EVENT_DEPTH_RESUME_SECS):
+                    del self.state.event_depth_halt[ev_h]
+                    log(f"{self.tag} event-depth resume {ev_h}: all "
+                        f"{n_mkts} market(s) healthy and no thin side for "
+                        f"{EVENT_DEPTH_RESUME_SECS // 60}min")
 
         # Reward accrual estimate between cycles (share x $/day x dt), plus the
         # objective's denominator: contract-minutes actually resting.
@@ -5807,6 +6008,12 @@ class IncentiveMarketMaker:
             f"budget ${COLLATERAL_BUDGET:g}, "
             f"{('max ' + str(MAX_MARKETS) + ' events') if MAX_MARKETS > 0 else 'events uncapped'}, "
             f"TTL {ORDER_TTL_SECS}s, poll {POLL_SECS}s")
+        if EVENT_DEPTH_GATE_PREFIXES:
+            log(f"live-event depth gate: {','.join(EVENT_DEPTH_GATE_PREFIXES)} "
+                f"— pads OFF; any quotable side < "
+                f"{EVENT_DEPTH_MIN_CONTRACTS:g} external contracts stands the "
+                f"WHOLE event down (resume after "
+                f"{EVENT_DEPTH_RESUME_SECS // 60}min healthy)")
 
         if self.live:
             n = self.cancel_all_bot_orders()
