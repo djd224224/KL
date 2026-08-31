@@ -26,6 +26,15 @@ $LogDir = Join-Path $Repo "run-logs\low-temp"
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $LogPath = Join-Path $LogDir ("low-temp-{0:yyyy-MM-dd}.log" -f (Get-Date))
 
+# Kill switch: while a tracked low_temp.paused file exists in the repo
+# (lands here via the 30-min main sync), every trigger is a silent no-op.
+# Delete the file from main to resume. low_temp_trading.py checks it too,
+# covering the GH workflow_dispatch backup and direct invocations.
+if (Test-Path (Join-Path $Repo "low_temp.paused")) {
+    "=== $(Get-Date -Format 'u') low-temp run SKIPPED — low_temp.paused present ===" | Add-Content -Path $LogPath -Encoding utf8
+    exit 0
+}
+
 $env:PYTHONIOENCODING = "utf-8"
 # Task Scheduler sessions can lack APPDATA (hides pip --user installs).
 # Passed via `set` inside the cmd line below (the incentive_mm launcher's

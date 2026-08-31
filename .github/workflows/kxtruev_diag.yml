@@ -1,0 +1,41 @@
+name: KXTRUEV diagnostic
+# One-shot, dispatch-only: ground truth for "KXTRUEV still not quoting" —
+# do markets exist, are any open, and does an active liquidity incentive
+# program cover them. Read-only against Kalshi (GETs only, live=False).
+# Safe to delete once KXTRUEV is resolved.
+# push-trigger exists because the GitHub App integration cannot POST
+# workflow dispatches (403) — re-running = push a change to any listed
+# path (kxtruev_diag.trigger is a scratch file for exactly that).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - kxtruev_diag.py
+      - .github/workflows/kxtruev_diag.yml
+      - kxtruev_diag.trigger
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests cryptography pytz python-dateutil
+      - name: Write Kalshi key
+        run: |
+          echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > Lisa_Kalshi.txt
+      - name: Run diagnostic
+        env:
+          IMM_STATUS_DIR: /tmp/imm-diag
+        run: python kxtruev_diag.py
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f Lisa_Kalshi.txt

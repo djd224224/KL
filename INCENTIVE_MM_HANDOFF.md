@@ -160,6 +160,20 @@ confirming reward eligibility is per-subaccount first.
   Fill note: at 1c/99c the pad almost never fills — near-touch fills first on any
   move and trips the fill-burst breaker (cancel + stand down) long before price
   reaches the pad. A pad fill would count toward P&L/breakers normally.
+- **Live-event depth gate (2026-08-31, Jack)**: `KXTRUMPMENTION*` and
+  `KXMAMDANIMENTION*` (`IMM_EVENT_DEPTH_SERIES`, prefix match) never pad, and any
+  in-band market of theirs with < 1000 external contracts (`IMM_EVENT_DEPTH_MIN`,
+  book minus our own orders) on either side — or that loses a touch mid-band —
+  stands down its WHOLE event: these events' start times aren't reliably known,
+  and a thin book is the tell that the event has gone live (adverse selection).
+  A strike that JUMPS from in-band to out-of-band by `IMM_EVENT_DEPTH_JUMP`
+  (8c)+ in one cycle (49c→99c: settled in practice) confirms the event live and
+  kills it **permanently** — no resume, no re-selection ("settled strike SHOULD
+  hold an event down forever"). Thin-only halts resume only once EVERY managed
+  market reads healthy in-band at target for 15 min
+  (`IMM_EVENT_DEPTH_RESUME_SECS`); an out-of-band pin or one-sided book blocks
+  resume for as long as it sits there. Halts, live-confirms, and the gated
+  series' mid history all persist across restarts.
 
 Reconciliation with the yield-to-human rule: for quote_all series the bot ignores
 the user's POSITIONS (he wants full coverage) and its caps/skew track the bot's OWN
@@ -302,6 +316,39 @@ an anchor:
   task-level restart).
 - Daily summary email 7:00 AM ET-ish (counters roll 6 AM ET): markets quoted,
   est. reward/day captured, realized P&L, fills, top inventory, alert counts.
+
+## Restarting the live bot
+
+- **Use `restart_imm.ps1`** (Jack 2026-08-24: "always restart bot in the
+  :45 - 1:05 timeframe, if there is an hourly temp market. since hourly temp
+  isnt quoted"; window shifted to **:50-:05** later the same day). Hourly
+  temp (KXTEMP*H) quotes ~hh:11 (program activation) to ~hh:50 (close-10
+  cutoff) — the richest pools in the feed live mid-hour, and :50-:05 IS the
+  dead zone where a restart forfeits nothing (resting orders die server-side
+  at TTL/cutoff regardless; a python kill does not cancel them). The script
+  reads `selected_tickers` from `imm_state.json`: hourly temp in play →
+  waits for the window; temp dark or no bot process running → restarts
+  immediately.
+- Default mode kills the `incentive_mm.py` python; the launcher relaunches
+  it ~30s later with freshly imported code — the right tool after a
+  sync-kl-main code pull. `-Task` does the full scheduled-task bounce (stop
+  task, sweep orphaned pythons — the 2026-08-01 Stop-ScheduledTask double —
+  start task): **required after a `$ProbeEnv`/launcher change**, which a
+  python kill would keep stale. `-Now` skips the window wait (emergencies).
+- **Remote restart from a Claude session**: bump `$RestartRequest` in
+  `sync_kl_main.ps1` and push to main — the sync task dispatches
+  `restart_imm.ps1` (windowed, detached) exactly once per request id on the
+  next sync run after the pull, ~30-60 min post-push. Done-stamps live in
+  `run-logs\incentive-mm\restart_request_<id>.done` (local, untracked).
+- **The bot also restarts itself on code changes** (2026-08-24, after the
+  KXTRUEV enrollment sat inert on a running process): `incentive_mm`
+  watches its own source mtime and cleanly exits at the next safe moment —
+  the :50-:05 window when hourly temp is selected, immediately otherwise,
+  never on an mtime younger than 60s — and the launcher relaunches it on
+  the new code (`code_change_exit_due`; `IMM_EXIT_ON_CODE_CHANGE=0`
+  disables). Code deploys therefore self-apply once this version is
+  running; the dispatch/ps1 remain for launcher-env changes and manual
+  bounces.
 
 ## Go-live checklist (when Jack says go)
 

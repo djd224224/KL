@@ -1113,12 +1113,30 @@ class TestAllowlist(unittest.TestCase):
                   # diesel enrolled 2026-08-02 evening under re-entry guards
                   "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30"):
             self.assertTrue(a(t), t)
+        # Truflation's OTHER Kalshi index stays out — never enrolled
+        self.assertFalse(a("KXTRUFAIDP-26AUG26-T50"))
+        # KXTRUEV BLOCKED 2026-08-25 (Jack), the morning after the 8/24
+        # enrollment saga: blocklist wins over its (kept) allowlist entry and
+        # overrides — zero orders, positions ride. Re-enable = delete the
+        # one SERIES_BLOCKLIST_PREFIXES entry.
+        b = IncentiveMarketMaker._blocked
+        self.assertTrue(b("KXTRUEV-26AUG26-T1241.88"))
+        self.assertFalse(a("KXTRUEV-26AUG26-T1241.88"))
+        # the enrollment machinery is deliberately kept for re-enable: the
+        # close-anchored cutoff override (the print-day-listing fix) stays
+        self.assertEqual(
+            imm.series_override("KXTRUEV").cutoff_from_close_min, 60)
         # Rate bar KEPT (Jack 2026-08-05) but scoped to the first strike of
         # an event the bot is not already working — see
         # TestRateBarScopedToNewEvents.
         for _s in ("KXDIESELD", "KXAAAGASD", "KXUSGASCPI"):
             self.assertEqual(imm.series_min_est_rate(_s), 2.0, _s)
             self.assertTrue(imm.series_safe_join(_s), _s)
+        # KXTRUEV: bar OFF (2026-08-25, the KXDIESELW pattern) — at program
+        # open its strikes est within pennies of the $2 bar, which decided
+        # a $89/day/market event on book noise. Safe-join + $1 floor stay.
+        self.assertEqual(imm.series_min_est_rate("KXTRUEV"), 0.0)
+        self.assertTrue(imm.series_safe_join("KXTRUEV"))
         # KXDIESELW override (Jack 2026-08-03): rate bar off, safe-join kept
         self.assertEqual(imm.series_min_est_rate("KXDIESELW"), 0.0)
         self.assertTrue(imm.series_safe_join("KXDIESELW"))
@@ -2860,6 +2878,22 @@ class TestStickySelection(unittest.TestCase):
         got = imm.apply_series_cutoff_adjustments(
             "KXGOOD", "KXGOOD-99DEC31", close, close_time=close)
         self.assertEqual(got, close)
+
+    def test_truev_print_day_market_survives_its_own_ticker_date(self):
+        # Kalshi lists each KXTRUEV daily ON its print day (Jack 2026-08-24:
+        # the enrollment shipped dark — the midnight-ET rule's cutoff was
+        # already past the moment each market appeared). The close-anchored
+        # override governs instead: refresh_universe's cutoff_from_close_min
+        # branch skips trade_cutoff_utc entirely, and the shared tightener
+        # yields close-60 for both producers.
+        close = utc(2026, 8, 25, 21, 0)   # print day Aug 25, 5pm ET close
+        got = imm.apply_series_cutoff_adjustments(
+            "KXTRUEV", "KXTRUEV-26AUG25", None, close_time=close)
+        self.assertEqual(got, utc(2026, 8, 25, 20, 0))
+        # 60 aligns with the 1h closing screen — a resting order must never
+        # outlive the screen that would refresh it
+        self.assertEqual(imm.series_override("KXTRUEV").cutoff_from_close_min,
+                         int(imm.MIN_HOURS_TO_CLOSE * 60))
 
     def test_rate_floor_horizon_escape(self):
         # Jack 2026-08-03: a fresh candidate admits on est_rate >= the series
@@ -5040,6 +5074,263 @@ class TestTwoSidedDepthGate(unittest.TestCase):
             _clean_persist()
 
 
+class TestLiveEventDepthGate(unittest.TestCase):
+    """Jack 2026-08-31: "Remove padding on TRUMPMENTION and MAMDANIMENTION
+    markets. If <1k on either side of a market, stop quoting the whole
+    event." These events' start times are not reliably known, so a thin
+    EXTERNAL book on any quotable strike is read as the event going LIVE —
+    and the WHOLE event stands down, not just the thin market (adverse
+    selection protection, not reward math)."""
+
+    EV = "KXGOOD-99DEC31"
+    A = "KXGOOD-99DEC31-A"
+    B = "KXGOOD-99DEC31-B"
+
+    def setUp(self):
+        self._prefixes = imm.EVENT_DEPTH_GATE_PREFIXES
+        imm.EVENT_DEPTH_GATE_PREFIXES = ("KXGOOD",)
+        self.addCleanup(setattr, imm, "EVENT_DEPTH_GATE_PREFIXES",
+                        self._prefixes)
+        self.addCleanup(_clean_persist)
+
+    def _bot(self, yes_a=1200, no_a=1200, yes_b=1200, no_b=1200):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # second market in the SAME event as A
+        bot.client.programs.append(
+            {"market_ticker": self.B, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": start, "end_date": end})
+        bot.client.markets[self.B] = {
+            "ticker": self.B, "event_ticker": self.EV,
+            "status": "active", "close_time": far,
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        self._books(bot, yes_a, no_a, yes_b, no_b)
+        return bot
+
+    def _books(self, bot, yes_a, no_a, yes_b, no_b):
+        bot.client.books[self.A] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", str(yes_a)]],
+            "no_dollars": [["0.49", str(no_a)]]}}
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", str(yes_b)]],
+            "no_dollars": [["0.49", str(no_b)]]}}
+
+    def _event_orders(self, bot):
+        return [o for o in bot.state.sim_orders.values()
+                if o["ticker"] in (self.A, self.B)]
+
+    def test_gated_series_never_pad(self):
+        """Padding is manufactured depth — it would blind the gate AND
+        re-qualify exactly the book we no longer want to rest in. Prefix
+        match: KXTRUMPMENTIONB rides the KXTRUMPMENTION entry."""
+        imm.EVENT_DEPTH_GATE_PREFIXES = self._prefixes   # the REAL defaults
+        self.assertTrue(imm.PAD_TO_TARGET_GLOBAL)
+        for s in ("KXTRUMPMENTION", "KXTRUMPMENTIONB", "KXMAMDANIMENTION"):
+            self.assertTrue(imm.series_event_depth_gated(s), s)
+            self.assertFalse(imm.series_pad_to_target(s), s)
+        for s in ("KXGOOD", "KXTEMPAUSH", "KXLOVEISLMENTION"):
+            self.assertFalse(imm.series_event_depth_gated(s), s)
+            self.assertTrue(imm.series_pad_to_target(s), s)
+
+    def test_external_depths_net_out_our_own_orders(self):
+        """The gate measures the EXTERNAL book: our own ladder (or a legacy
+        1k pad still resting through the config change) must not hold the
+        reading over the bar while everyone else pulls out."""
+        yes = [[49, 1200.0]]
+        no = [[49, 800.0]]
+        own = [("bid", 49, 300.0), ("ask", 51, 200.0)]
+        self.assertEqual(imm.external_depths(yes, no, own), (900.0, 600.0))
+        self.assertEqual(imm.external_depths(yes, no, []), (1200.0, 800.0))
+
+    def test_both_markets_deep_quotes_normally(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.A, bot.state.selected)
+        self.assertIn(self.B, bot.state.selected)
+        self.assertTrue(self._event_orders(bot))
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+
+    def test_thin_sibling_stops_the_whole_event(self):
+        """The event-level point: B is thin so A — itself perfectly deep —
+        must not quote either. B never even gets selected (est=0), so this
+        is the estimator hook doing the marking."""
+        bot = self._bot(yes_b=300)
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertTrue(any(c == "event_depth" for c, _m in bot.alerter.today))
+
+    def test_going_thin_cancels_the_whole_quoting_event(self):
+        """'stop quoting the whole event' on a LIVE transition: both markets
+        already resting, then one side of B empties out."""
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        self._books(bot, 1200, 1200, 1200, 200)
+        bot.state.universe_at = time.time()          # no refresh: quote loop only
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot),
+                         "thin side on B must cancel A's quotes too")
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+
+    def test_lost_touch_mid_band_halts_the_event(self):
+        """A book that WAS two-sided in band and lost a touch entirely is
+        the withdrawal signal at full volume (the one-sided breaker alone
+        would stand down only that market for 30min)."""
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", "1200"]], "no_dollars": []}}
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+
+    def test_extreme_pinned_strike_is_not_a_signal(self):
+        """A 96c pin is thin by nature and proves nothing — the event keeps
+        quoting (the strike itself is screened out individually)."""
+        bot = self._bot()
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.95", "30"]], "no_dollars": [["0.03", "40"]]}}
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        self.assertTrue([o for o in bot.state.sim_orders.values()
+                         if o["ticker"] == self.A],
+                        "deep sibling must keep quoting")
+
+    def test_resume_needs_quiet_time_and_all_markets_healthy(self):
+        bot = self._bot(yes_b=300)
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        # book recovers, but the thin reading is FRESH -> still down
+        self._books(bot, 1200, 1200, 1200, 1200)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertFalse(self._event_orders(bot))
+        # quiet for EVENT_DEPTH_RESUME_SECS -> resume pass clears it...
+        bot.state.event_depth_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        # ...and the NEXT cycle quotes again (sticky selection kept A)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+
+    def test_halt_survives_a_restart(self):
+        """~20 restarts/day: a restart mid-speech must come back already
+        standing down, not spend a cycle rediscovering the thin strike."""
+        bot = self._bot(yes_b=300)
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertIn(self.EV, bot2.state.event_depth_halt)
+
+    def test_settled_jump_out_of_band_kills_the_event_forever(self):
+        """Jack 2026-08-31 #2: a deep in-band strike that jumps to 99c (the
+        word got said) is the event CONFIRMED live — permanent halt, and no
+        amount of book recovery or quiet time brings the event back."""
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))          # prev_mid seeded ~50
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.98", "150"]],
+            "no_dollars": [["0.01", "300"]]}}             # 98x99, mid 98.5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        self.assertTrue(any(c == "event_live" for c, _m in bot.alerter.today))
+        # books fully recover AND every timestamp goes stale -> STILL down
+        self._books(bot, 1200, 1200, 1200, 1200)
+        bot.state.event_depth_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.event_live_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+
+    def test_live_confirm_survives_restart_and_refuses_reselection(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.98", "150"]],
+            "no_dollars": [["0.01", "300"]]}}
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertIn(self.EV, bot2.state.event_live_halt)
+        bot2.run_cycle()          # fresh process, healthy default A book
+        self.assertFalse([o for o in bot2.state.sim_orders.values()
+                          if o["ticker"] in (self.A, self.B)],
+                         "live-confirmed event must never quote again")
+
+    def test_pinned_strike_blocks_thin_halt_resume(self):
+        """Jack 2026-08-31 #2: 'settled strike SHOULD hold an event down
+        forever.' Even without jump history (restart amnesia), a strike
+        sitting out of band counts as NOTHING for the resume pass — the
+        halted event stays down until that strike is back in band or gone."""
+        bot = self._bot()
+        bot.run_cycle()
+        self._books(bot, 1200, 1200, 300, 1200)           # B thin in-band
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        bot.state.prev_mid.pop(self.B, None)              # amnesia: no jump
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.95", "30"]],
+            "no_dollars": [["0.03", "40"]]}}              # pinned 95x97
+        bot.state.event_depth_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt,
+                      "out-of-band pin must block resume")
+        self.assertNotIn(self.EV, bot.state.event_live_halt)
+        self.assertFalse(self._event_orders(bot))
+        # only a fully healthy in-band event releases the thin-only halt
+        self._books(bot, 1200, 1200, 1200, 1200)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+
+    def test_thin_then_pin_with_history_escalates_to_live_confirm(self):
+        """With mid history intact the same pin IS the jump signature: the
+        halt branch keeps prev_mid fresh precisely so a later settle-jump
+        still confirms."""
+        bot = self._bot()
+        bot.run_cycle()
+        self._books(bot, 1200, 1200, 300, 1200)           # thin first
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.95", "30"]],
+            "no_dollars": [["0.03", "40"]]}}              # then settles ~96
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_live_halt)
+
+
 class TestSidesCanQualify(unittest.TestCase):
     """Jack 2026-08-05: the gate must ask whether a pad WILL BE PLACED, not
     whether the series is the padding kind. A padding series still gets no pad
@@ -5443,7 +5734,8 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
     """Jack 2026-08-04: halve the ladder on KXDIESELD / KXAAAGASD / KXRAIN
     from 4pm ET. Window runs to 01:59 ET because the gas/diesel dailies trade
     until then — stopping at midnight would restore full size for their last
-    two hours."""
+    two hours. KXTRUEV (Jack 2026-08-24, with its allowlisting) halves an
+    hour later, from 5pm ET."""
 
     def setUp(self):
         # Pin the config under test instead of reading whatever
@@ -5451,7 +5743,8 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
         # stays green under an env override.
         self._saved = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = imm._parse_series_hour_mults(
-            "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5")
+            "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5,"
+            "KXTRUEV:17-1:0.5")
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved
@@ -5474,6 +5767,16 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
             self.assertEqual(
                 imm.hour_size_mult("KXDIESELD", self._at(h)), 0.5, f"ET {h}")
         self.assertEqual(imm.hour_size_mult("KXDIESELD", self._at(2)), 1.0)
+
+    def test_truev_halved_from_5pm_et(self):
+        # Jack 2026-08-24: KXTRUEV halves an hour later than gas/diesel —
+        # full size through the 4pm hour, half from 5pm through the
+        # overnight tail (later-dated siblings keep quoting past midnight).
+        self.assertEqual(imm.hour_size_mult("KXTRUEV", self._at(16)), 1.0)
+        for h in (17, 20, 23, 0, 1):
+            self.assertEqual(
+                imm.hour_size_mult("KXTRUEV", self._at(h)), 0.5, f"ET {h}")
+        self.assertEqual(imm.hour_size_mult("KXTRUEV", self._at(2)), 1.0)
 
     def test_full_size_before_4pm(self):
         for h in (9, 12, 15):
@@ -5542,6 +5845,86 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
         for bad in ("KXA", "KXA:", ":1-2:0.5", "KXA:99-1:0.5", "KXA:1-2:x"):
             with self.assertRaises(ValueError, msg=bad):
                 imm._parse_series_hour_mults(bad)
+
+
+class TestShippedHourMultDefaults(unittest.TestCase):
+    """TestPerSeriesHourMultiplier pins its own spec to assert the RULE, so
+    a rule silently dropped from the shipped IMM_SERIES_HOUR_MULT default
+    would still pass it. Assert the import-time default directly (skipped
+    under an env override, like the allowlist-default tests effectively are)."""
+
+    def setUp(self):
+        if os.environ.get("IMM_SERIES_HOUR_MULT"):
+            self.skipTest("IMM_SERIES_HOUR_MULT env override active")
+        self.rules = dict(imm.SERIES_HOUR_MULTS)
+
+    def test_truev_default_halves_at_5pm_not_4(self):
+        # Jack 2026-08-24: "halve normal quote amounts starting at 5pm EST"
+        self.assertIn("KXTRUEV", self.rules)
+        self.assertNotIn(16, self.rules["KXTRUEV"])
+        for h in (17, 23, 0, 1):
+            self.assertEqual(self.rules["KXTRUEV"].get(h), 0.5, f"ET {h}")
+
+    def test_gas_diesel_rain_defaults_still_present(self):
+        self.assertEqual(self.rules["KXDIESELD"].get(16), 0.5)
+        self.assertEqual(self.rules["KXAAAGASD"].get(16), 0.5)
+        self.assertEqual(self.rules["KXRAIN"].get(19), 0.5)
+
+
+class TestCodeChangeSelfRestart(unittest.TestCase):
+    """Jack 2026-08-24: deploys sat inert because nothing restarted the bot
+    after sync pulled new code (KXTRUEV shipped allowlisted and still quoted
+    $0 against live programs). The bot now exits for the launcher at the
+    next safe moment when its own source file changes on disk."""
+
+    CHANGED = imm._SOURCE_MTIME + 1000.0
+    AGED = CHANGED + 3600.0          # now_ts making the new mtime >=60s old
+    TEMP = {"KXTEMPMIAH-26AUG2415-T80.99": None}
+
+    def _at(self, minute):
+        return imm.ET.localize(
+            datetime(2026, 8, 24, 12, minute)).astimezone(timezone.utc)
+
+    def test_no_change_no_exit(self):
+        self.assertFalse(imm.code_change_exit_due(
+            self.TEMP, self._at(55), current_mtime=imm._SOURCE_MTIME,
+            now_ts=self.AGED))
+
+    def test_changed_and_no_hourly_temp_exits_any_minute(self):
+        for m in (7, 30, 44):
+            self.assertTrue(imm.code_change_exit_due(
+                {}, self._at(m), current_mtime=self.CHANGED,
+                now_ts=self.AGED), m)
+        # weekly average-temp is NOT hourly temp — no window hold
+        self.assertTrue(imm.code_change_exit_due(
+            {"KXAVGTKDFW-26AUG24-B85.5": None}, self._at(30),
+            current_mtime=self.CHANGED, now_ts=self.AGED))
+
+    def test_changed_with_hourly_temp_waits_for_the_window(self):
+        for m in (7, 30, 49):
+            self.assertFalse(imm.code_change_exit_due(
+                self.TEMP, self._at(m), current_mtime=self.CHANGED,
+                now_ts=self.AGED), m)
+        for m in (50, 55, 0, 5):
+            self.assertTrue(imm.code_change_exit_due(
+                self.TEMP, self._at(m), current_mtime=self.CHANGED,
+                now_ts=self.AGED), m)
+
+    def test_fresh_mtime_settles_first(self):
+        # a file the sync is still writing must never be half-imported
+        self.assertFalse(imm.code_change_exit_due(
+            {}, self._at(55), current_mtime=self.CHANGED,
+            now_ts=self.CHANGED + 10))
+
+    def test_kill_switch(self):
+        old = imm.EXIT_ON_CODE_CHANGE
+        try:
+            imm.EXIT_ON_CODE_CHANGE = False
+            self.assertFalse(imm.code_change_exit_due(
+                {}, self._at(55), current_mtime=self.CHANGED,
+                now_ts=self.AGED))
+        finally:
+            imm.EXIT_ON_CODE_CHANGE = old
 
 
 class TestSideMaxClampedToPositionCap(unittest.TestCase):
