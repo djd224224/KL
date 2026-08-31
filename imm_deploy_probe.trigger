@@ -1,1 +1,1 @@
-2026-08-31T04:00:00Z live-event-depth-gate deploy probe
+2026-08-31T04:50:00Z probe v2 — full programmed-market sweep
