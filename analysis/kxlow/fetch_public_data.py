@@ -10,6 +10,9 @@ forecast said", used to measure forecast error by city).
 Designed to run in GitHub Actions (this repo's cloud sessions can't reach
 these hosts directly) and write compact gzipped CSVs into
 analysis/kxlow/data/ for the analysis step.
+
+Refresh log: 2026-09-01 pull — verifying the Aug 31 pause landed (Sep 1
+events should show only look-alike signature volume, no bot flow).
 """
 
 import csv
