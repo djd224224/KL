@@ -120,7 +120,7 @@ class FakeClient:
         self.created.append(kw)
         return {"order": {"order_id": f"fake-{len(self.created)}"}}
 
-    def cancel_order(self, order_id):
+    def cancel_order(self, order_id, exchange_index=None, market_ticker=None):
         self.cancelled.append(order_id)
         return {}
 
