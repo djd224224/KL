@@ -95,6 +95,9 @@ def main() -> None:
 
     section("1. GATED UNIVERSE (public: open markets + programs)")
     open_gated = []
+    recent_events = set()   # open now, or closed in the last ~3 days —
+    #   an event that went LIVE today is already closed by evening, and the
+    #   forensics section must still see it
     for prefix in GATED:
         markets, cursor = [], None
         while True:
@@ -113,6 +116,17 @@ def main() -> None:
                 break
         opens = [m for m in markets if m.get("status") in ("active", "open")]
         open_gated.extend(opens)
+        for m in markets:
+            if m.get("status") in ("active", "open"):
+                recent_events.add(m.get("event_ticker", "?"))
+                continue
+            try:
+                ct = datetime.fromisoformat(
+                    str(m.get("close_time") or "").replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if (now - ct).total_seconds() < 3 * 86400:
+                recent_events.add(m.get("event_ticker", "?"))
         print(f"  {prefix}: {len(markets)} markets, OPEN now: {len(opens)}")
     by_event = {}
     for m in open_gated:
@@ -183,8 +197,18 @@ def main() -> None:
                             or d_no < imm.EVENT_DEPTH_MIN_CONTRACTS)
         if thin:
             ev_thin[ev] = ev_thin.get(ev, 0) + 1
+        # Junk-depth diagnostic: how much of each side actually sits at
+        # IN-BAND prices (yes-equivalent 5-90c)? 1c lottery bids and 99c-ask
+        # farmer pads are depth that never flees a live event — if the
+        # sub-1k signal is being masked, the mask shows up as a huge
+        # total/in-band gap here.
+        lo, hi = imm.series_price_min(imm.series_of(t)), \
+            imm.series_price_max(imm.series_of(t))
+        band_yes = sum(q for px, q in yl if lo <= px <= hi)
+        band_no = sum(q for px, q in nl if lo <= (100 - px) <= hi)
         print(f"  {t}: {per_mkt.get(t, 0)} imm- orders; ext depth "
-              f"yes {d_yes:.0f} / no {d_no:.0f}; in-band {in_band}"
+              f"yes {d_yes:.0f} / no {d_no:.0f} (in-band-priced "
+              f"yes {band_yes:.0f} / no {band_no:.0f}); in-band {in_band}"
               f"{'; SUB-1K SIDE' if thin else ''}")
     print("per-event: programmed / imm- orders / in-band sub-1k markets")
     for ev in sorted(set(ev_prog) | set(ev_orders)):
@@ -194,6 +218,83 @@ def main() -> None:
                        if n and ev_orders.get(ev, 0))
     halt_sig = sorted(ev for ev, n in ev_thin.items()
                       if n and not ev_orders.get(ev, 0))
+
+    section("2b. TODAY'S FORENSICS (last 24h) on gated events")
+    # Order HISTORY is restart-proof: one pad-priced imm- order CREATED in
+    # the window means the box ran OLD code in the window, whatever is
+    # resting now. The creation time-span per event also shows whether
+    # quoting stopped (a halt firing) or ran straight through a live event.
+    day_ts = int(now.timestamp()) - 24 * 3600
+    pads_today = {}
+    for ev in sorted(recent_events):
+        try:
+            orders, cursor = [], None
+            while True:
+                resp = client.get_orders(event_ticker=ev, min_ts=day_ts,
+                                         limit=200, cursor=cursor)
+                batch = resp.get("orders") or []
+                orders.extend(batch)
+                cursor = resp.get("cursor")
+                if not cursor or not batch or len(orders) > 5000:
+                    break
+        except Exception as e:
+            print(f"  {ev}: order-history read failed: {e}")
+            continue
+        mine = [o for o in orders
+                if str(o.get("client_order_id", "")).startswith("imm-")]
+        pads = [o for o in mine if order_is_pad_priced(o)]
+        if pads:
+            pads_today[ev] = len(pads)
+        lo = imm.series_price_min(imm.series_of(ev))
+        hi = imm.series_price_max(imm.series_of(ev))
+        deep = 0
+        for o in mine:
+            parsed = imm.order_yes_book_cents(o)
+            if parsed and not order_is_pad_priced(o):
+                side, px = parsed
+                if (side == "bid" and px < lo) or (side == "ask" and px > hi):
+                    deep += 1
+        times = sorted(str(o.get("created_time") or "")
+                       for o in mine if o.get("created_time"))
+        span = f"{times[0][11:19]} .. {times[-1][11:19]}Z" if times else "--"
+        print(f"  {ev}: {len(mine)} imm- orders created in window ({span}); "
+              f"PAD-priced (1c/99c): {len(pads)}; deep-rung (outside "
+              f"{lo}-{hi}c band, the pad-lookalikes): {deep}")
+        if pads:
+            pt = sorted(str(o.get("created_time") or "") for o in pads)
+            print(f"    !! pad-priced orders {pt[0]} .. {pt[-1]} — "
+                  f"OLD-code signature")
+    # Fills in the window on gated markets — the sniping record (aggregates
+    # only; repo and Action logs are public).
+    try:
+        fills, cursor = [], None
+        while True:
+            resp = client.get_fills(min_ts=day_ts, limit=200, cursor=cursor)
+            batch = resp.get("fills") or []
+            fills.extend(batch)
+            cursor = resp.get("cursor")
+            if not cursor or not batch or len(fills) > 10000:
+                break
+        by_ev_f = {}
+        for f in fills:
+            tk = str(f.get("ticker", ""))
+            if is_gated(tk):
+                e = event_of(tk)
+                n, c, first, last = by_ev_f.get(e, (0, 0.0, "~", ""))
+                ts = str(f.get("created_time") or "")
+                by_ev_f[e] = (n + 1,
+                              c + float(f.get("count") or
+                                        f.get("count_fp") or 0),
+                              min(first, ts) if ts else first,
+                              max(last, ts))
+        if by_ev_f:
+            for e, (n, c, first, last) in sorted(by_ev_f.items()):
+                print(f"  fills on {e}: {n} fills / {c:.0f} contracts "
+                      f"({first[11:19]} .. {last[11:19]}Z)")
+        else:
+            print("  no fills on gated events in the window")
+    except Exception as e:
+        print(f"  fills read failed: {e}")
 
     section("3. DRY-RUN CYCLE of the CHECKED-OUT code (read-only)")
     # Caveat: this fresh dry instance sees the LIVE bot's resting orders as
@@ -225,7 +326,14 @@ def main() -> None:
             print(f"  alert [{cat}] {msg}")
 
     section("4. VERDICT — what code is the BOX running?")
-    if not imm_orders:
+    if pads_today:
+        print(f"OLD code ran in the last 24h: pad-priced imm- orders were "
+              f"CREATED on {', '.join(sorted(pads_today))} "
+              f"({sum(pads_today.values())} total). Order history is "
+              f"restart-proof — the deploy did not reach the process that "
+              f"placed these. Check the box: sync-kl-main log and the bot "
+              f"process start time vs the merge.")
+    elif not imm_orders:
         print("NO resting imm- orders: bot looks DOWN or between waves "
               "(possibly mid-restart on the deploy) — re-probe in ~15 min.")
     elif gated_pads:
