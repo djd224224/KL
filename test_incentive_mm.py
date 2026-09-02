@@ -2005,6 +2005,57 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                          "skip")
         self.assertEqual(self._classify("KXA100MAX", "KXA100MAX-26DEC31-1.990")[0],
                          "skip")
+        # dated-observation FT/APP families enroll by family (2026-09-01,
+        # after 12 new *APP series appeared overnight)
+        self.assertEqual(self._classify("KXGROKAPP", "KXGROKAPP-26OCT08-T500")[0],
+                         "enroll")
+        self.assertEqual(self._classify("KXWINGSFT",
+                                        "KXWINGSFT-26OCT08-T104.5")[0],
+                         "enroll")
+        # ...but the suffix alone is not membership: person-tail events stay out
+        self.assertEqual(self._classify("KXNFLDRAFT",
+                                        "KXNFLDRAFT-26APR30-JSMITH")[0],
+                         "review")
+
+    def test_state_gas_prefix_allow_and_family_override(self):
+        # A state never seen before is allowed by the KXAAAGASD prefix...
+        self.assertTrue(IncentiveMarketMaker._allowed(
+            "KXAAAGASDOH-26SEP02-3.1500"))
+        # ...and clones the national guard set (safe-join + rate floor +
+        # AAA blackout) on first sight.
+        fake = "KXAAAGASDZZ"
+        self.assertNotIn(fake, imm.SERIES_OVERRIDES)
+        try:
+            imm.ensure_family_override(fake)
+            self.assertTrue(imm.series_safe_join(fake))
+            self.assertEqual(imm.series_min_est_rate(fake),
+                             imm.series_min_est_rate("KXAAAGASD"))
+            self.assertEqual(imm.SERIES_OVERRIDES[fake].blackout_et,
+                             imm.SERIES_OVERRIDES["KXAAAGASD"].blackout_et)
+        finally:
+            imm.SERIES_OVERRIDES.pop(fake, None)
+
+    def test_family_override_suffix_requires_membership(self):
+        # *FT suffix alone (KXNFLDRAFT is never allowlisted) clones nothing...
+        try:
+            imm.ensure_family_override("KXNFLDRAFT")
+            self.assertNotIn("KXNFLDRAFT", imm.SERIES_OVERRIDES)
+            # ...while an extra-allow member inherits the company archetype.
+            imm.EXTRA_ALLOW_SERIES.add("KXZZFT")
+            imm.ensure_family_override("KXZZFT")
+            self.assertTrue(imm.series_safe_join("KXZZFT"))
+            self.assertEqual(imm.SERIES_OVERRIDES["KXZZFT"],
+                             imm.SERIES_OVERRIDES["KXBKFT"])
+            # consumer-observation families carry NO fresh-candidate rate
+            # bar (2026-09-01 "start quoting things as if normal") — but
+            # keep safe-join; gas keeps the national $2 bar.
+            for s in ("KXZZFT", "KXBKFT", "KXCLAUDEAPP"):
+                self.assertEqual(imm.series_min_est_rate(s), 0.0, s)
+            self.assertEqual(imm.series_min_est_rate("KXAAAGASD"), 2.0)
+        finally:
+            imm.EXTRA_ALLOW_SERIES.discard("KXZZFT")
+            imm.SERIES_OVERRIDES.pop("KXZZFT", None)
+            imm.SERIES_OVERRIDES.pop("KXNFLDRAFT", None)
 
     def test_extra_allow_file_reload_and_safety(self):
         old_path = imm.EXTRA_ALLOW_FILE

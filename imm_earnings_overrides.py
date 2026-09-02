@@ -376,6 +376,9 @@ def source_urls(client, event: str):
 COMPANY_EVENT_RE = re.compile(
     r"^\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]{2,10}$")
 CRYPTO_YEARLY_RE = re.compile(r"^KX[A-Z0-9]{2,8}(MINY|MAXY)$")
+# Day-dated event segment (26OCT08) — the dated-observation consumer shape.
+DAY_DATED_EVENT_RE = re.compile(
+    r"^\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}$")
 
 
 def classify_series(series: str, sample_ticker: str):
@@ -391,6 +394,18 @@ def classify_series(series: str, sample_ticker: str):
     if series.startswith("KXTEMP"):
         return "review", "new temp city — needs IMM_TEMP_SERIES override"
     parts = sample_ticker.split("-")
+    # Dated-observation consumer families (Jack allowlisted the foot-traffic
+    # and app-chart families wholesale 2026-08-31; 2026-09-01 "fix this
+    # going forward" after Kalshi added 12 new *APP series overnight): new
+    # members are pre-approved by family, so ENROLL them — the no-new
+    # company rule below is about earnings-release companies, not these.
+    # The day-dated event + T-threshold strike shape keeps unrelated
+    # *FT/*APP-ending series (KXNFLDRAFT-26APR30-<person>) in review; the
+    # bot clones family guards via FAMILY_OVERRIDE_PARENTS at refresh.
+    if (series.endswith(_CONSUMER_OBS_SUFFIXES) and len(parts) >= 3
+            and DAY_DATED_EVENT_RE.match(parts[1])
+            and parts[2].startswith("T")):
+        return "enroll", "dated-observation consumer family (FT/APP)"
     if len(parts) >= 2 and COMPANY_EVENT_RE.match(parts[1]) and len(series) <= 14:
         # NO-NEW company rule (Jack 2026-07-28): the bot no longer admits
         # fresh company markets, so the classifier must not ALLOW new company
@@ -458,10 +473,20 @@ def enroll_new_series(client, dry: bool):
 # the ticker/occurrence already.
 _CONSUMER_PRICE_SERIES = {
     "KXSBUXSAR", "KXCFACHICKSAND", "KXPOPCHICKSAND", "KXCHIPBURRITO",
-    "KXDDCOLDBREW", "KXBKNUGGETS", "KXAMSAVO"}
+    "KXDDCOLDBREW", "KXBKNUGGETS", "KXAMSAVO",
+    # Foot-traffic + app-chart series (swept 2026-08-31 with their
+    # allowlisting; KXBKFT/KXYUMTBFT belonged here since 8/3): dated
+    # observations like the price trackers — there is no press release to
+    # find a time for, so surfacing them as disclosure events would only
+    # nag for overrides that cannot exist. Membership is by suffix so the
+    # family additions (12 new *APP series on 9/1 alone) never regress
+    # this; the comprehension below applies it.
+    "KXBKFT", "KXYUMTBFT"}
+_CONSUMER_OBS_SUFFIXES = ("FT", "APP")
 COMPANY_DISCLOSURE_SERIES = {
     s for s in imm._DEFAULT_COMPANY_SERIES.split(",")
-    if s and s not in _CONSUMER_PRICE_SERIES}
+    if s and s not in _CONSUMER_PRICE_SERIES
+    and not s.endswith(_CONSUMER_OBS_SUFFIXES)}
 # Only surface events whose (unreliable) occurrence is within this many days,
 # so the daily email flags them a bit ahead without spamming months-out ones.
 DISCLOSURE_LEAD_DAYS = int(os.environ.get("IMM_DISCLOSURE_LEAD_DAYS", "12"))

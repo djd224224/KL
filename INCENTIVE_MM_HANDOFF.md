@@ -494,3 +494,73 @@ New-Item C:\Users\jackd\Documents\KL\run-logs\incentive-mm\HALT -ItemType File
 # tests
 python -m unittest test_incentive_mm
 ```
+
+## 2026-08-31 — KXAAAGASW paused (Jack: "pause KXAAAGASW")
+
+(Restored 9/1 — the original section was written by the pause session but
+sat uncommitted and was lost when main synced over the working tree.)
+AAA gas WEEKLY added to the launcher IMM_BLOCKLIST (run_incentive_mm.ps1)
+and the bot bounced via `restart_imm.ps1 -Task` at 19:0x ET. Evidence from
+the 8/31 rewards report: lifetime net −$298 (cred $181 / P&L −$479),
+post-8/12 −$180, last week −$115 — negative in every window. KXAAAGASD
+(daily, net +$77 post-8/12) and KXDIESELW/D stay live. Open weekly
+positions ride to the 9/7 settlement. Blocklist is PREFIX-matched —
+KXAAAGASW collides with nothing (checked) and catches state weeklies too.
+
+## 2026-08-31 — APP + foot-traffic + state-gas families allowlisted (Jack)
+
+Jack: "allowlist the app markets e.g. KXCLAUDEAPP... foottraffic markets
+e.g. KXBKFT... state gas markets e.g. KXAAAGASDIL" — the "e.g." was swept
+to the full families live in the programs feed that evening:
+**APP x10** (KXCARTAPP KXCLAUDEAPP KXDASHAPP KXDISNEYAPP KXDKNGAPP
+KXESPNAPP KXFACEBOOKAPP KXFANDUELAPP KXGEMINIAPP KXGPTAPP) and **FT x8
+new** (KXBROSFT KXCAVAFT KXCMGFT KXCOSTFT KXMCDFT KXSGFT KXSHAKFT KXTGTFT;
+BKFT/YUMTBFT already in since 8/3) into `_DEFAULT_COMPANY_SERIES`; **state
+gas dailies** (six states that day). All day-dated tickers listed weeks
+ahead (no KXTRUEV listing trap — checked); APP/FT are dated observations
+with no release moment, so they joined the overrides script's
+consumer-observation disclosure-sweep exclusion. First live cycle after
+enrollment: state gas + CMG/SG selected and quoting; est share $171 ->
+$209/day.
+
+## 2026-09-01 — family growth coverage (Jack: "fix this going forward")
+
+Kalshi expanded the families overnight and the 8/31 exact lists missed
+every new member for a day: five NEW state gas dailies (GA/NC/OH/PA/WA)
+and 12 NEW `*APP` series (GROK/GRUBHUB/HULU/INSTAGRAM/LYFT/MAX/NFLX/
+PARAMOUNT/PEACOCK/TWITTER/UBER/UBERE). Fix, superseding the 8/31 exact
+lists:
+
+- **State gas = prefix family**: `KXAAAGASD` in `ALLOW_SERIES_PREFIXES`
+  (per-state exact entries retired). `KXAAAGASW*` weeklies untouched.
+- **Family guard inheritance**: `FAMILY_OVERRIDE_PARENTS` +
+  `ensure_family_override()` — a prefix/suffix-admitted series clones its
+  archetype's `SERIES_OVERRIDES` entry (safe-join, rate-floor setting, AAA
+  blackout) at first sight in the candidates loop, logged "family override
+  inherited". Parents: KXAAAGASD / KXBKFT (`*FT`) / KXCLAUDEAPP (`*APP`).
+  Suffix rules also require exact/extra-allow membership (KXNFLDRAFT can
+  never clone).
+- **New FT/APP auto-enroll**: `classify_series` enrolls the
+  dated-observation shape (FT/APP suffix + day-dated event + T-strike) —
+  the no-new company rule is earnings-release companies, not these.
+  Live-feed sweep: exactly the 12 new APPs, zero false positives.
+- **Rate bar OFF for FT/APP** (Jack same evening: "dont hold off. start
+  quoting things as if normal"): `IMM_CONSUMER_OBS_MIN_RATE=0` loop, the
+  KXDIESELW shape — safe-join + $1 payout floor + caps + midnight cutoff
+  stay. Reason: the share-based $2/day bar excluded exactly the LIQUID
+  books (KXHULUAPP/KXINSTAGRAMAPP: real ladders, $21.30/day pools — richer
+  than quoted CMGFT's $18.76 — yet est pennies/day against 1-2k-deep
+  1c-wide touches), while the first-wave APPs had passed only by enrolling
+  when books were thin. The 12 new APPs were also hand-added to
+  extra_allow_series.json (~20:33 ET, hot-reloaded; the merge-writing
+  6:45am task keeps them).
+
+DEPLOYMENT NOTE (the 9/1 wipe): all of the above was first applied locally
+uncommitted, and at 20:41 ET a main fast-forward (PRs #14/#15, after a
+stuck MERGE_HEAD cleared) replaced the working tree — the bot self-
+restarted onto code with none of it, evicting the enrolled families
+(52 -> 39 events), and the uncommitted KXAAAGASW launcher pause vanished
+with it. Everything was reapplied on branch `claude/imm-family-allowlist`
+and landed via PR. Standing lesson: THIS REPO'S WORKING TREE IS DISPOSABLE
+— main syncs every 30 min and other sessions land PRs concurrently, so any
+change that must survive goes through a branch + PR, same day.

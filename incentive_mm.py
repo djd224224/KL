@@ -1130,13 +1130,22 @@ ALLOW_SERIES_SUFFIXES = tuple(
 #     KXEARNINGSMENTIONUAL (United). Same low-adverse-selection structure as the
 #     other MENTIONs — nothing knowable before the call — and the midnight-ET
 #     ticker-date cutoff keeps the bot out on report day (user decision 2026-07-15).
+#   KXAAAGASD<STATE>        state AAA gas dailies (Jack 2026-09-01 "fix this
+#     going forward": Kalshi lit five NEW states overnight — GA/NC/OH/PA/WA
+#     on top of the 8/31 six — and the 8/31 exact-list enrollment missed
+#     them all for a day, so the family is prefix-covered like KXTEMP/
+#     KXAVGT. Bare KXAAAGASD (the national daily) matches too, harmlessly —
+#     it is also exact-allowed. Guards (safe-join, rate floor, AAA blackout)
+#     clone from the national entry at refresh via FAMILY_OVERRIDE_PARENTS;
+#     the 4pm-ET halving was always startswith-matched. KXAAAGASW* weeklies
+#     are untouched by this prefix and stay behind the launcher blocklist.
 # KXTEMP re-enabled (Jack 2026-07-22 morning; was retired 7/21 evening after
 # the adverse-selection post-mortem — see analysis: -6c/contract uniform).
 # The 7/21 SeriesOverride tuning (5/2/2, cap 50, 5-90c, close-15min) applies.
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
         "IMM_ALLOW_PREFIXES",
-        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT").split(",") if p)
+        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT,KXAAAGASD").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
     # The yearly touch pairs (KX*MINY/KX*MAXY, allowlisted 2026-07-22 when no
     # fleet bot quoted them) moved to SERIES_BLOCKLIST_PREFIXES on 2026-08-13:
@@ -1164,7 +1173,20 @@ _DEFAULT_COMPANY_SERIES = (
     # get quoted"): never enrolled — the auto-classifier files day-dated
     # T-threshold shapes (26SEP07-T100) as REVIEW, not enroll. Same consumer-
     # metric class as the price trackers; re-entry guards apply.
-    "KXBKFT,KXYUMTBFT")
+    "KXBKFT,KXYUMTBFT,"
+    # FT + APP family sweeps (Jack 2026-08-31 "allowlist the app markets ...
+    # foottraffic markets e.g. ..."): the "e.g." means the whole families —
+    # these are ALL the series live in the programs feed that day, not just
+    # his examples. Both are dated observations of a published statistic
+    # (foot-traffic index / app-store chart) with no press release to be out
+    # of the way of, so the midnight-ET ticker rule is the cutoff — the safe
+    # direction, same as KXBKFT. NEW members enroll automatically: the daily
+    # classifier files the dated-observation *FT/*APP shape as ENROLL
+    # (2026-09-01, after Kalshi added 12 new *APP series overnight), and
+    # FAMILY_OVERRIDE_PARENTS clones the guard set onto them at refresh.
+    "KXBROSFT,KXCAVAFT,KXCMGFT,KXCOSTFT,KXMCDFT,KXSGFT,KXSHAKFT,KXTGTFT,"
+    "KXCARTAPP,KXCLAUDEAPP,KXDASHAPP,KXDISNEYAPP,KXDKNGAPP,KXESPNAPP,"
+    "KXFACEBOOKAPP,KXFANDUELAPP,KXGEMINIAPP,KXGPTAPP")
 # Economic-data / price-index prints (Jack 2026-07-23): recurring published
 # statistics — AAA gas price (daily/weekly/monthly), new-home sales, gas CPI,
 # the Shanghai freight index. Day-dated tickers -> the midnight-ET rule stops
@@ -1192,6 +1214,18 @@ _DEFAULT_ECON_SERIES = (
     # Truflation's OTHER Kalshi index (KXTRUFAIDP, AI & DePIN) out until
     # asked for. Re-entry guards apply like every econ print.
     "KXTRUEV")
+# State AAA gas DAILIES: allowlisted 2026-08-31 (Jack "allowlist the state
+# gas markets e.g. ...") as six exact entries (CA/FL/IL/NJ/NY/TX), on the
+# 8/31 judgment that a half-covered state (allowed but unguarded) beat
+# prefix coverage. REVERSED 2026-09-01 (Jack "fix this going forward"):
+# Kalshi lit five MORE states overnight (GA/NC/OH/PA/WA) and the exact list
+# missed them all for a day, so the family moved to the KXAAAGASD prefix in
+# ALLOW_SERIES_PREFIXES and the unguarded half of the trade-off was closed
+# properly: FAMILY_OVERRIDE_PARENTS clones the national KXAAAGASD override
+# (safe-join + rate floor + AAA blackout) onto every state at refresh, and
+# the 4pm-ET halving was always startswith-matched. The WEEKLY family stays
+# dark — the launcher IMM_BLOCKLIST's KXAAAGASW entry is prefix-matched and
+# catches any state weekly too.
 # Rotten Tomatoes score markets (Jack 2026-07-23): undated tickers
 # (KXRT-<MOVIE>-<score>) -> occurrence-based cutoff when Kalshi provides
 # one, else continuous quoting; bands/floor gate as usual.
@@ -1328,6 +1362,25 @@ for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
 SERIES_OVERRIDES["KXDIESELW"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_DIESELW_MIN_RATE", 0.0), safe_join=True)
 
+# Dated-observation consumer families quote WITHOUT the $2/day fresh-
+# candidate rate bar (Jack 2026-09-01 "dont hold off. start quoting things
+# as if normal", accepting the exemption offered with the 8/31 enrollment
+# — the KXDIESELW shape). The bar is SHARE-based, so on the deep, tight
+# books these families grow into (KXHULUAPP: 1-2k contracts at a 1c-wide
+# touch) a 20-contract ladder estimates pennies/day and the bar excludes
+# exactly the liquid markets Jack wants quoted — while the first-wave APP
+# series passed it only by enrolling while their books were still thin.
+# Admission by timing luck is not a gate worth keeping for this class. The
+# $1/market payout floor (the exchange's real pay/no-pay line), safe-join
+# placement, caps and the midnight-ET cutoff all stay. Replaces the
+# re-entry loop's entries for the exact members; new members inherit the
+# same via FAMILY_OVERRIDE_PARENTS (KXBKFT / KXCLAUDEAPP archetypes).
+for _s in [s for s in _DEFAULT_COMPANY_SERIES.split(",")
+           if s.endswith(("FT", "APP"))]:
+    SERIES_OVERRIDES[_s] = SeriesOverride(
+        min_est_per_day=_env_float("IMM_CONSUMER_OBS_MIN_RATE", 0.0),
+        safe_join=True)
+
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
 # The default midnight-ET ticker rule cost the whole overnight half of each
@@ -1391,6 +1444,52 @@ for _s in os.environ.get(
             SERIES_OVERRIDES[_s],
             blackout_et=tuple(os.environ.get(
                 "IMM_AAA_BLACKOUT_ET", "03:05-04:00").split("-")))
+
+
+# ---- family guard inheritance (Jack 2026-09-01 "fix this going forward",
+# after Kalshi lit five new state gas dailies + 12 new *APP series overnight
+# and the 8/31 exact lists missed every one for a day). A series admitted by
+# a FAMILY rule — the KXAAAGASD* prefix above, or *FT/*APP via the daily
+# auto-enroll — clones its archetype's SERIES_OVERRIDES entry the first time
+# it shows up in the candidate feed, so a new member is never
+# allowed-but-unguarded: safe-join, the family's rate-floor setting and the
+# AAA blackout read across (hour-mults were already startswith-matched). A
+# hand-tuned exact entry always wins — inheritance only fills a missing key.
+# Called from refresh_universe's candidates loop, where every series has
+# passed _allowed; suffix rules ALSO require exact/extra-allow membership so
+# an unrelated *FT-ending series that is never allowlisted (KXNFLDRAFT) can
+# never clone a guard set even if a future caller runs this over the raw
+# feed.
+FAMILY_OVERRIDE_PARENTS = (
+    ("prefix", "KXAAAGASD", "KXAAAGASD"),
+    ("suffix", "FT", "KXBKFT"),
+    ("suffix", "APP", "KXCLAUDEAPP"),
+)
+_family_override_warned: Set[str] = set()
+
+
+def ensure_family_override(series: str) -> None:
+    if series in SERIES_OVERRIDES:
+        return
+    for kind, pat, parent in FAMILY_OVERRIDE_PARENTS:
+        if kind == "prefix":
+            if not series.startswith(pat):
+                continue
+        elif not series.endswith(pat) or (series not in ALLOW_SERIES
+                                          and series not in EXTRA_ALLOW_SERIES):
+            continue
+        ov = SERIES_OVERRIDES.get(parent)
+        if ov is None:
+            # A missing parent would be a silent exclusion of the guard set
+            # — say so once instead of quietly quoting unguarded.
+            if parent not in _family_override_warned:
+                _family_override_warned.add(parent)
+                log(f"[IMM] ! family parent {parent} has no override; "
+                    f"{series} quotes unguarded")
+            return
+        SERIES_OVERRIDES[series] = ov
+        log(f"[IMM] {series}: family override inherited from {parent}")
+        return
 
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
@@ -4059,6 +4158,11 @@ class IncentiveMarketMaker:
              if self._allowed(t) and info["dollars_per_day"] > 0
              and not ticker_cutoff_passed(t)),
             key=lambda kv: -kv[1]["dollars_per_day"])[:MAX_CANDIDATE_BOOKS]
+
+        # New family members (prefix/suffix-admitted) clone their archetype
+        # guards before anything downstream reads SERIES_OVERRIDES.
+        for t, _info in candidates:
+            ensure_family_override(series_of(t))
 
         metas: List[MarketMeta] = []
         tickers = [t for t, _info in candidates]
