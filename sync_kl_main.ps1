@@ -67,7 +67,14 @@ if (-not $dashTask) {
 # ids are cheap. Once the in-bot self-restart (incentive_mm
 # code_change_exit_due) is running, future code deploys need no dispatch
 # at all — this stays for env changes and belt-and-suspenders.
-$RestartRequest = '20260824-kxtruev-cutover-2'
+# 2026-09-02: belt-and-suspenders invoked for real — order-history
+# forensics (imm_deploy_probe run 4) proved the bot padded and quoted
+# KXMAMDANIMENTION-26SEP01 straight through its live window on 09-01
+# (121 pad-priced orders to 14:41Z, 3,270 contracts filled), 34h after
+# the live-event depth gate merged: the self-restart never fired, so the
+# sync itself is the suspect. If THIS file's new id is executing, the
+# sync recovered — dispatch the restart.
+$RestartRequest = '20260902-event-depth-gate-deploy'
 if ($RestartRequest) {
     $rrDir = Join-Path $Repo "run-logs\incentive-mm"
     $rrStamp = Join-Path $rrDir "restart_request_$RestartRequest.done"

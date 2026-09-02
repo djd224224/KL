@@ -173,7 +173,14 @@ confirming reward eligibility is per-subaccount first.
   market reads healthy in-band at target for 15 min
   (`IMM_EVENT_DEPTH_RESUME_SECS`); an out-of-band pin or one-sided book blocks
   resume for as long as it sits there. Halts, live-confirms, and the gated
-  series' mid history all persist across restarts.
+  series' mid history all persist across restarts. **Fill tripwire
+  (2026-09-01 postmortem)**: an own-book move of `IMM_EVENT_FILL_HALT` (15)+
+  contracts in one cycle on a gated market stands the whole event down; a
+  second burst (`IMM_EVENT_FILL_STRIKES`) confirms it live permanently —
+  active regardless of `IMM_BREAKERS`, because on MAMDANI-shaped books
+  (~99% of side depth is 1c/99c junk that never flees a live event) the
+  depth check is structurally blind and fills are the only unmaskable
+  live signal.
 
 Reconciliation with the yield-to-human rule: for quote_all series the bot ignores
 the user's POSITIONS (he wants full coverage) and its caps/skew track the bot's OWN
