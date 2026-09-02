@@ -383,6 +383,18 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 #      one-sided book does NOT count as healthy: it blocks resume for as
 #      long as it sits there (a settled strike holds its event down; these
 #      markets die at settlement anyway, so "until settlement" IS forever).
+#   5. FILL TRIPWIRE (Jack 2026-09-01, SEP01 postmortem): our own book
+#      moving EVENT_FILL_HALT_CONTRACTS+ on a gated market in one cycle
+#      stands the WHOLE event down (resumable), and a SECOND such burst on
+#      the same event confirms it LIVE — permanent. This is the signal the
+#      depth check structurally cannot give on MAMDANI-shaped books: on
+#      2026-09-01 the live event was swept for 3,270 contracts over 13h
+#      while total side depth never left five figures, because ~99% of it
+#      was 1c/99c junk that has no reason to flee (SEP02-AFFO that evening:
+#      101,699 yes contracts, 31 of them priced in-band). Fills ARE the
+#      adverse selection; everything else only predicts it. Active
+#      regardless of IMM_BREAKERS (the old per-market fill-burst breaker
+#      is default-OFF and was never event-wide).
 # Enforced in BOTH the quote loop and the candidate estimator (the
 # 2026-08-05 lesson, plus its event-level twin: a thin sibling that never
 # gets SELECTED is invisible to the quote loop, so without the estimator
@@ -404,6 +416,13 @@ EVENT_DEPTH_RESUME_SECS = _env_int("IMM_EVENT_DEPTH_RESUME_SECS", 900)
 # band on its first out-of-band cycle, so it can never accumulate into a
 # false confirm.
 EVENT_DEPTH_JUMP_CENTS = _env_float("IMM_EVENT_DEPTH_JUMP", 8)
+# Fill tripwire (point 5 above): own-book move per cycle that stands the
+# event down, and how many such bursts on one event confirm it LIVE for
+# good. 15 = the old fill-burst breaker's bar, sane against routine
+# one-rung crosses (a burst costs one resumable stand-down; only a repeat
+# is permanent).
+EVENT_FILL_HALT_CONTRACTS = _env_float("IMM_EVENT_FILL_HALT", 15)
+EVENT_FILL_HALT_STRIKES = _env_int("IMM_EVENT_FILL_STRIKES", 2)
 
 
 def series_event_depth_gated(series: str) -> bool:
@@ -3134,10 +3153,14 @@ class BotState:
     # restarts many times a day, and a restart mid-speech must not re-quote.
     event_depth_halt: Dict[str, float] = field(default_factory=dict)
     # Live-CONFIRMED events (a strike jumped out of band = settled in
-    # practice): event_ticker -> confirm ts. PERMANENT — no resume path, the
-    # estimator refuses the event, and the entry outlives the halt above
-    # (pruned only by the 7d persist TTL, long after the event settles).
+    # practice, or a repeated fill burst): event_ticker -> confirm ts.
+    # PERMANENT — no resume path, the estimator refuses the event, and the
+    # entry outlives the halt above (pruned only by the 7d persist TTL,
+    # long after the event settles).
     event_live_halt: Dict[str, float] = field(default_factory=dict)
+    # Fill-tripwire strike counts per gated event (persisted: ~20
+    # restarts/day must not reset the two-strikes-and-out escalation).
+    event_fill_strikes: Dict[str, int] = field(default_factory=dict)
     bench_until: Dict[str, float] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
@@ -3383,6 +3406,9 @@ class IncentiveMarketMaker:
             # the jump detector needs to keep confirming across a restart.
             self.state.event_live_halt = {str(e): float(v) for e, v in
                                           (data.get("event_live_halt") or {}).items()}
+            self.state.event_fill_strikes = {
+                str(e): int(v) for e, v in
+                (data.get("event_fill_strikes") or {}).items()}
             self.state.prev_mid.update(
                 {str(t): float(v) for t, v in
                  (data.get("prev_mid_gated") or {}).items()})
@@ -3503,6 +3529,12 @@ class IncentiveMarketMaker:
                                e: round(v, 1)
                                for e, v in self.state.event_live_halt.items()
                                if time.time() - v < 7 * 86400},
+                           # fill-tripwire strikes (pruned with their halts)
+                           "event_fill_strikes": {
+                               e: n
+                               for e, n in self.state.event_fill_strikes.items()
+                               if e in self.state.event_depth_halt
+                               or e in self.state.event_live_halt},
                            # gated-series mid history: the settled-strike
                            # jump detector needs prev_mid ACROSS restarts, or
                            # a strike that jumps to 99c during the seconds a
@@ -5163,6 +5195,39 @@ class IncentiveMarketMaker:
             # Own-book delta, not account delta — the user's manual trades on a
             # nearby market must not false-alarm this.
             prev = self.state.prev_pos.get(t)
+            # GATED FILL TRIPWIRE (Jack 2026-09-01 — see the live-event gate
+            # config block, point 5): fills on a gated market ARE the
+            # adverse selection the gate exists to stop, and on these
+            # junk-stacked books they are the only signal that cannot be
+            # masked. First burst stands the WHOLE event down (resumable);
+            # the EVENT_FILL_HALT_STRIKES-th confirms it LIVE permanently.
+            # Independent of IMM_BREAKERS, and ahead of the per-market
+            # breaker so the event-wide response owns gated series.
+            if (series_event_depth_gated(meta.series) and prev is not None
+                    and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS):
+                strikes = self.state.event_fill_strikes.get(ev, 0) + 1
+                self.state.event_fill_strikes[ev] = strikes
+                event_depth_thin.add(ev)
+                self.state.event_depth_halt[ev] = now_ts
+                confirmed = strikes >= EVENT_FILL_HALT_STRIKES
+                if confirmed:
+                    self.state.event_live_halt.setdefault(ev, now_ts)
+                n_cx = 0
+                for m2 in by_event.get(ev, [meta]):
+                    n_cx += self.cancel_market_orders(m2.ticker, resting)
+                ev_ticks = {m2.ticker for m2 in by_event.get(ev, [meta])}
+                desired = [q for q in desired if q.ticker not in ev_ticks]
+                self.alerter.alert(
+                    "event_fill",
+                    f"{ev}: {t} own book moved {own_pos - prev:+.0f} in one "
+                    f"cycle — getting filled on a gated event; standing the "
+                    f"whole event down "
+                    + ("PERMANENTLY (live confirmed, "
+                       f"burst {strikes})" if confirmed else
+                       f"(burst {strikes}/{EVENT_FILL_HALT_STRIKES})")
+                    + f"; cancelled {n_cx}", key=ev)
+                self.state.prev_pos[t] = own_pos
+                continue
             if (BREAKERS_ENABLED and prev is not None
                     and abs(own_pos - prev) >= FILL_BURST_CONTRACTS):
                 self.state.breaker_until[t] = now_ts + FILL_BURST_COOLDOWN_SECS

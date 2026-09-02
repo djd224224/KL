@@ -5330,6 +5330,52 @@ class TestLiveEventDepthGate(unittest.TestCase):
         bot.run_cycle()
         self.assertIn(self.EV, bot.state.event_live_halt)
 
+    def test_fill_burst_halts_the_whole_event(self):
+        """Jack 2026-09-01 postmortem: fills ARE the adverse selection —
+        one burst on a gated market stands the whole event down even with
+        IMM_BREAKERS off (the box's default) and even though every book
+        still reads deep."""
+        self.assertFalse(imm.BREAKERS_ENABLED)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        # fills move the bot's own book AND the account position together
+        # (a divergence would be the manual-standoff signature instead)
+        bot.pnl.pos[self.B] = imm.EVENT_FILL_HALT_CONTRACTS + 5.0
+        bot.client.positions[self.B] = imm.EVENT_FILL_HALT_CONTRACTS + 5.0
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot),
+                         "A's quotes must die with B's fill burst")
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertNotIn(self.EV, bot.state.event_live_halt)  # strike 1/2
+        self.assertTrue(any(c == "event_fill" for c, _m in bot.alerter.today))
+
+    def test_second_fill_burst_confirms_live_permanently(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot.pnl.pos[self.B] = 20.0                        # burst 1
+        bot.client.positions[self.B] = 20.0
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertEqual(bot.state.event_fill_strikes.get(self.EV), 1)
+        # halt clears (books fine), event re-enters...
+        bot.state.event_depth_halt.pop(self.EV, None)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        bot.pnl.pos[self.B] = 45.0                        # burst 2 -> LIVE
+        bot.client.positions[self.B] = 45.0
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        self.assertFalse(self._event_orders(bot))
+        # strikes survive a restart, so the escalation cannot be reset
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot2.state.event_fill_strikes.get(self.EV), 2)
+        self.assertIn(self.EV, bot2.state.event_live_halt)
+
 
 class TestSidesCanQualify(unittest.TestCase):
     """Jack 2026-08-05: the gate must ask whether a pad WILL BE PLACED, not
