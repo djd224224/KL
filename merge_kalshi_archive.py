@@ -60,15 +60,22 @@ def _f(row, key):
 
 
 def is_website_export(rows):
-    """Website settlement exports have avg prices in cents (values > $1.50
-    are impossible in the API's dollar format) and/or fractional contract
-    counts. One such row anywhere marks the whole file."""
+    """Website settlement exports carry avg prices in CENTS and/or
+    FRACTIONAL contract counts; one such row marks the whole file.
+    API-format files must NEVER trip this: fetch_settlements_csv.py floors
+    counts to integers (never fractional), and its avg-price column is
+    cost/floor(count_fp), which is provably < 2.00 — worst case a position
+    just under 2 contracts at ~$1 (e.g. 1.93 @ 94.82c renders as "1.83").
+    The old 1.5 threshold sat inside that quirk zone: one fractional
+    position in a real API pull got the whole daily file treated as cents,
+    dividing its costs by 100 and inflating P&L to ~gross payout
+    (2026-09-03 incident — hence the v3 archive rebuild in sync_kl_main)."""
     for r in rows:
         if r.get("type") != "Settlement":
             continue
-        if _f(r, "Yes_Contracts_Average_Price_In_Cents") > 1.5:
+        if _f(r, "Yes_Contracts_Average_Price_In_Cents") > 2.5:
             return True
-        if _f(r, "No_Contracts_Average_Price_In_Cents") > 1.5:
+        if _f(r, "No_Contracts_Average_Price_In_Cents") > 2.5:
             return True
         for k in ("Yes_Contracts_Owned", "No_Contracts_Owned"):
             v = _f(r, k)
