@@ -44,7 +44,7 @@ jobs:
           python-version: '3.x'
       - name: Install dependencies
         if: steps.flag.outputs.paused == 'true'
-        run: pip install requests cryptography
+        run: pip install requests cryptography python-dateutil
       - name: Cancel resting KXLOW orders
         if: steps.flag.outputs.paused == 'true'
         env:
