@@ -37,21 +37,24 @@ if (-not $dashTask) {
     "$stamp dashboards kicked to build first settlements archive from seed" | Add-Content -Path $Log -Encoding utf8
 } elseif ($dashTask.State -ne 'Running' -and
           -not (Test-Path (Join-Path $Repo "run-logs\dashboards-archive-v3.rebuilt")) -and
-          (Test-Path (Join-Path $Repo "Kalshi-Settlements-archive.csv")) -and
-          ((Test-Path (Join-Path $Repo "seed_settlements_*.csv")) -or
-           (Test-Path (Join-Path $Repo "KalshiRecentActivitySettlement*.csv")))) {
+          (Test-Path (Join-Path $Repo "Kalshi-Settlements-archive.csv"))) {
     # One-time heal v3 (2026-09-03, supersedes the v2 dedup kick): the
     # merge's format auto-detect false-positived on real API pulls (a
     # fractional position pushes the floored avg-price column past the old
     # 1.5 threshold), so whole daily files were treated as cents — costs
     # /100, P&L ~= gross payout — and those rows are baked into the
-    # archive. Deleting it is safe ONLY while a seed export is present:
-    # seed (mid-June onward) + today's API window re-cover the archive's
-    # whole date range, so the kicked run rebuilds it clean from scratch.
+    # archive. No dedup can repair them, so delete and rebuild clean: the
+    # seed export (mid-June onward) plus today's API window re-cover the
+    # archive's whole range. If the seed file has been removed, rebuild
+    # anyway — a correct API-window archive beats a corrupt long one, and
+    # re-dropping any seed later folds the older weeks back in.
     New-Item -ItemType File -Force (Join-Path $Repo "run-logs\dashboards-archive-v3.rebuilt") | Out-Null
     Remove-Item (Join-Path $Repo "Kalshi-Settlements-archive.csv") -Force
     Start-ScheduledTask -TaskName "KL dashboards-daily"
-    "$stamp settlements archive deleted for v3 rebuild (cents-detector false positive); dashboards kicked" | Add-Content -Path $Log -Encoding utf8
+    $seedNote = if ((Test-Path (Join-Path $Repo "seed_settlements_*.csv")) -or
+                    (Test-Path (Join-Path $Repo "KalshiRecentActivitySettlement*.csv"))) { "seed present" }
+                else { "NO seed found - archive restarts at the API window; re-drop an export to recover mid-June onward" }
+    "$stamp settlements archive deleted for v3 rebuild (cents-detector false positive, $seedNote); dashboards kicked" | Add-Content -Path $Log -Encoding utf8
 }
 
 # One-shot windowed IMM restart (Jack 2026-08-24 "restart for me at that
