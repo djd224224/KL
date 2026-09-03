@@ -2057,10 +2057,12 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         self.assertEqual(cut, {"KXAAAGASDIL-26SEP03-4.22",
                                "KXAAAGASDIL-26SEP03-4.24"})
         # national daily + weekly + states all resolve to N=3 via the
-        # KXAAAGAS prefix; non-gas families are uncapped.
-        for s in ("KXAAAGASD", "KXAAAGASDOH", "KXAAAGASW", "KXAAAGASM"):
+        # KXAAAGAS prefix, diesel D/W via KXDIESEL (2026-09-02 "do the
+        # same with diesel"); other families are uncapped.
+        for s in ("KXAAAGASD", "KXAAAGASDOH", "KXAAAGASW", "KXAAAGASM",
+                  "KXDIESELD", "KXDIESELW"):
             self.assertEqual(imm.event_top_n_for(s), 3, s)
-        for s in ("KXRAINNYC", "KXDIESELD", "KXBKFT", "KXCLAUDEAPP"):
+        for s in ("KXRAINNYC", "KXBKFT", "KXCLAUDEAPP", "KXUSGASCPI"):
             self.assertEqual(imm.event_top_n_for(s), 0, s)
         # incumbency (1.15x) holds a member's slot on a near-tie: fresh 2.05
         # vs member 2.0 -> member ROI 0.2*1.15=0.23 beats 0.205.

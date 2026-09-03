@@ -589,3 +589,8 @@ strands inventory unmanaged). They drain at settlement; fresh events
 start clean at <=3. NOTE the selected_tickers count in imm_state.json
 conflates laddering members with reduce-only orphan management — judge
 the cap by two-sided ladders per event, not by selected count.
+
+Diesel joined the cap the same evening (Jack "do the same with diesel"):
+default now `KXAAAGAS:3,KXDIESEL:3` — KXDIESELD/KXDIESELW have the same
+one-print-per-event correlation; identical semantics (reduce-only
+inventory rides outside the cap).

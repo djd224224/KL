@@ -961,6 +961,8 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 # same 1.15x the yield rank uses so estimator jitter doesn't reshuffle the
 # kept set every refresh. Format "PREFIX:N,...", longest prefix wins,
 # N<=0 = uncapped. KXAAAGAS covers national + state dailies + W/M.
+# KXDIESEL added 2026-09-02 (Jack "do the same with diesel"): covers
+# KXDIESELD + KXDIESELW — same one-print-per-event correlation structure.
 def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
     out = []
     for part in (p.strip() for p in spec.split(",") if p.strip()):
@@ -974,7 +976,7 @@ def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
 
 
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
-                                                "KXAAAGAS:3"))
+                                                "KXAAAGAS:3,KXDIESEL:3"))
 
 
 def event_top_n_for(series: str) -> int:
