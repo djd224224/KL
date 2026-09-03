@@ -77,6 +77,17 @@ does NOT land; `run-logs\sync-kl-main.log` shows it, and
 `Disable-ScheduledTask -TaskName 'KL low-temp-trading'` is the definitive
 local switch.
 
+**2026-09-02: the sync failure actually happened** — the bot quoted Sep 1–3
+with the flag live on main since Aug 31, so the laptop is running a stale
+tree (stalled sync or the task points at an un-synced copy). Backstop added:
+`.github/workflows/kxlow_pause_enforcer.yml` cancels every resting KXLOW
+order at the exchange every 30 min (via `cancel_kxlow_orders.py`, KXLOW
+tickers only) while `low_temp.paused` exists on main. Deleting the flag
+resumes the bot and no-ops the enforcer in one step; delete/disable the
+workflow once the local task is confirmed disabled. Fills that happen in
+the ≤30-min gap between a bot trigger and the next sweep are not prevented —
+only the local Disable-ScheduledTask fully stops those.
+
 ## Exchange pause / Kalshi maintenance window
 
 Kalshi runs a **weekly maintenance pause every Thursday 3:00–5:00 AM ET**
