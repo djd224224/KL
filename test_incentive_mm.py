@@ -2158,20 +2158,48 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         self.assertIn("KXWENBACONATOR-26OCT02-T8.5", cut)
         # ungrouped series are never touched, however strong or weak
         self.assertNotIn("KXRAINNYC-26SEP03-X", cut)
-        # incumbency holds a slot on a near-tie at the boundary
+        # QUOTE-TO-COMPLETION (Jack 2026-09-03 "once start quoting, should
+        # quote to completion. dont unquote them"): a member is NEVER cut,
+        # however badly outranked — it consumes slots and only newcomers
+        # compete for the remainder.
         edge = [m(f"KXSPRLVL-26SEP09-T28{i}", 5.0) for i in range(3)] \
-            + [m("KXVENEZCRUDE-26OCT13-A", 1.0),
-               m("KXBRAZILGDP-26DEC02-B", 1.04)]
+            + [m("KXVENEZCRUDE-26OCT13-A", 0.01),
+               m("KXBRAZILGDP-26DEC02-B", 4.0)]
         try:
             imm.FINECON_TOP_N, _n = 4, imm.FINECON_TOP_N
+            # worst-ROI market is a member -> kept; the strong Brazil
+            # newcomer loses: only one free slot and SPR ROIs beat it.
             cut = imm.finecon_group_cut(
-                edge, incumbent={"KXVENEZCRUDE-26OCT13-A"})
+                edge, incumbent=set(), members={"KXVENEZCRUDE-26OCT13-A"})
             self.assertEqual(cut, {"KXBRAZILGDP-26DEC02-B"})
+            # members consume an EVENT's slots too: 3 SPR members block a
+            # 4th SPR strike however strong; the open global slot goes to
+            # the best other-event newcomer instead.
+            spr_members = {f"KXSPRLVL-26SEP09-T28{i}" for i in range(3)}
+            edge2 = [m(f"KXSPRLVL-26SEP09-T28{i}", 0.01) for i in range(3)] \
+                + [m("KXSPRLVL-26SEP09-T289", 9.0),
+                   m("KXBRAZILGDP-26DEC02-B", 0.5)]
+            cut = imm.finecon_group_cut(edge2, set(), members=spr_members)
+            self.assertEqual(cut, {"KXSPRLVL-26SEP09-T289"})
+            # members beyond a lowered cap ALL stay; nothing new enters.
+            imm.FINECON_TOP_N = 2
+            cut = imm.finecon_group_cut(edge2, set(), members=spr_members)
+            self.assertEqual(cut, {"KXSPRLVL-26SEP09-T289",
+                                   "KXBRAZILGDP-26DEC02-B"})
             # knob off -> no cut at all
             imm.FINECON_TOP_N = 0
             self.assertEqual(imm.finecon_group_cut(edge, set()), set())
         finally:
             imm.FINECON_TOP_N = _n
+        # the same immunity reaches the KXAAAGAS:3 per-event cut, which
+        # catches KXAAAGASMINM/MAXM: an immune member is kept at any ROI
+        # and shrinks the slots the rest compete for.
+        minm = [m(f"KXAAAGASMINM-26SEP30-3.{60 + i}", 5.0 - i)
+                for i in range(5)]                      # 3.64 = worst ROI
+        cut = imm.event_top_n_cut(minm, incumbent=set(),
+                                  immune={"KXAAAGASMINM-26SEP30-3.64"})
+        self.assertEqual(cut, {"KXAAAGASMINM-26SEP30-3.62",
+                               "KXAAAGASMINM-26SEP30-3.63"})
 
     def test_family_override_suffix_requires_membership(self):
         # *FT suffix alone (KXNFLDRAFT is never allowlisted) clones nothing...
@@ -2954,6 +2982,26 @@ class TestStickySelection(unittest.TestCase):
             self.assertNotIn(self.T, bot.state.selected)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_finecon_member_survives_hopeless(self):
+        # Jack 2026-09-03 ("once start quoting, should quote to completion.
+        # dont unquote them"): the SAME sustained-hopeless setup that evicts
+        # an ordinary member must not evict a finecon-group member.
+        bot = self._quoting_bot()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        old_fin = imm.FINECON_SERIES
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.FINECON_SERIES = old_fin | {"KXGOOD"}
+        try:
+            bot._est_peak.clear()
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.FINECON_SERIES = old_fin
 
     def test_hopeless_member_survives_a_dip(self):
         # The same market, WITHOUT a sustained sub-bar history, must keep

@@ -631,3 +631,21 @@ event, everything else cut before sticky seeding (skip bucket
 the scan snapshot kept exactly: NZ HOLD/H25, SPR T286/T284/T281,
 VENEZ 1.2M/1.3M, MINM 3.70/3.75/3.95 — ~$8.3/day est. Point-in-time est
 at enrollment, not a promise; the walk re-ranks every refresh.
+
+## 2026-09-03 — finecon members quote to completion (Jack)
+
+Jack: "once start quoting, should quote to completion. dont unquote them."
+The day-1 group walk re-ranked members every refresh and could evict one
+when a sibling's ROI rose (it did, within hours: morning books reshuffled
+the kept set vs the enrollment snapshot). Now `finecon_group_cut` is
+ADMISSION-ONLY: members (group markets in the previous selection) are
+never cut, consume their global-10 and per-event-3 slots, and newcomers
+compete only for the remainder; if members ever exceed a lowered cap they
+all stay and nothing new enters until attrition frees slots. The same
+immunity is threaded into `event_top_n_cut` (new `immune` arg — the
+KXAAAGAS:3 prefix catches KXAAAGASMINM/MAXM; gas/diesel proper keep their
+evictable semantics) and into the hopeless exit (finecon members exempt —
+cents-a-day rates on quiet long windows are where the absolute-$1
+projection is noisiest). Members leave ONLY by natural completion
+(cutoff/close/program end) or a safety screen stand-down — screens,
+bands, blackouts and budget were deliberately NOT loosened.

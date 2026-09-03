@@ -996,10 +996,16 @@ def _market_roi(m: "MarketMeta", incumbent: Set[str]) -> float:
     return r * (1.15 if m.ticker in incumbent else 1.0)
 
 
-def event_top_n_cut(metas: List["MarketMeta"],
-                    incumbent: Set[str]) -> Set[str]:
+def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
+                    immune: Set[str] = frozenset()) -> Set[str]:
     """Tickers to EXCLUDE under the per-event top-N: for each capped event,
-    everything past the N highest-ROI markets of that event."""
+    everything past the N highest-ROI markets of that event. `immune`
+    tickers (finecon quote-to-completion members, Jack 2026-09-03: "once
+    start quoting, should quote to completion. dont unquote them") are
+    never cut and still consume the event's N, so they block admissions
+    rather than being out-ranked — relevant to KXAAAGASMINM/MAXM, which
+    this prefix cap catches alongside the finecon group walk. The gas/
+    diesel families themselves keep the original evictable semantics."""
     by_event: Dict[str, List["MarketMeta"]] = {}
     for _m in metas:
         if event_top_n_for(_m.series) > 0:
@@ -1009,8 +1015,10 @@ def event_top_n_cut(metas: List["MarketMeta"],
         n = event_top_n_for(group[0].series)
         if n <= 0 or len(group) <= n:
             continue
-        group.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
-        cut.update(m.ticker for m in group[n:])
+        rest = [m for m in group if m.ticker not in immune]
+        slots = max(0, n - (len(group) - len(rest)))
+        rest.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
+        cut.update(m.ticker for m in rest[slots:])
     return cut
 
 POLL_SECS = _env_int("IMM_POLL_SECS", 90)
@@ -1391,29 +1399,39 @@ ALLOW_SERIES = frozenset(
 # The finecon sweep quotes AT MOST 10 markets at once, best-ROI first with
 # no more than 3 per event (Jack 2026-09-02, verbatim above). A GROUP cap,
 # not a per-event one: the group is ranked as a whole by the same ROI the
-# per-event cut uses, kept greedily to N with the per-event limit enforced
-# inside the walk. Like event_top_n_cut this runs BEFORE sticky seeding, so
-# a member that falls out of the top set deselects through the normal
-# cancel path (its banked accrual keeps whatever cleared the $1 floor) —
-# the 1.15x incumbent factor keeps that from flapping on book noise.
-# KXAAAGASMINM/MAXM also pass the KXAAAGAS:3 EVENT_TOP_N first; both rules
-# agree by construction. <=0 disables a knob.
+# per-event cut uses. ADMISSION-ONLY since 2026-09-03 (Jack: "once start
+# quoting, should quote to completion. dont unquote them" — the day-1
+# version re-ranked members every refresh and could evict one when a
+# sibling's ROI rose): a market the bot already quotes (`members`) is
+# NEVER cut here and still consumes its global and per-event slots, so
+# the walk only decides which NEWCOMERS fill whatever slots remain.
+# Members leave only by natural completion — cutoff/close/program end,
+# or a safety screen standing them down. If members ever exceed a cap
+# (e.g. the knob is lowered mid-flight), they all stay and nothing new
+# enters until attrition frees slots. KXAAAGASMINM/MAXM also pass the
+# KXAAAGAS:3 EVENT_TOP_N first — members ride through it via the same
+# quote-to-completion immunity (see event_top_n_cut). <=0 disables a knob.
 FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 10)
 FINECON_EVENT_TOP_N = _env_int("IMM_FINECON_EVENT_TOP_N", 3)
 
 
-def finecon_group_cut(metas: List["MarketMeta"],
-                      incumbent: Set[str]) -> Set[str]:
-    """Tickers to EXCLUDE under the finecon group cap: everything in the
-    group beyond the greedy top-FINECON_TOP_N by ROI, walking best-first
-    and skipping markets past FINECON_EVENT_TOP_N in their event."""
+def finecon_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
+                      members: Set[str] = frozenset()) -> Set[str]:
+    """Tickers to EXCLUDE under the finecon group cap: group markets that
+    are not already-quoting members and don't win a free slot — newcomers
+    ranked by ROI, admitted while the group stays within FINECON_TOP_N
+    total and FINECON_EVENT_TOP_N per event (members counted first)."""
     if FINECON_TOP_N <= 0:
         return set()
     group = [m for m in metas if m.series in FINECON_SERIES]
-    group.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
-    keep: Set[str] = set()
+    keep = {m.ticker for m in group if m.ticker in members}
     per_event: Dict[str, int] = {}
     for m in group:
+        if m.ticker in keep:
+            per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
+    newcomers = [m for m in group if m.ticker not in keep]
+    newcomers.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
+    for m in newcomers:
         if len(keep) >= FINECON_TOP_N:
             break
         if 0 < FINECON_EVENT_TOP_N <= per_event.get(m.event_ticker, 0):
@@ -4511,6 +4529,7 @@ class IncentiveMarketMaker:
             elif HOPELESS_EXIT and not reaches_min \
                     and sub_bar_secs >= HOPELESS_SUSTAIN_SECS \
                     and meta.ticker in prev_selected \
+                    and meta.series not in FINECON_SERIES \
                     and meta.event_ticker not in FORCE_EVENTS \
                     and not curated_event(meta.event_ticker, meta.series, now_utc):
                 # STICKY EXIT (Jack 2026-07-25): "<5% chance to reach $1 by
@@ -4525,7 +4544,12 @@ class IncentiveMarketMaker:
                 # quoted: the drain rule targets the anonymous scrap tail,
                 # not hand-curated event windows, and the estimator's
                 # absolute $1 verdicts are least trustworthy on the short
-                # windows overrides create).
+                # windows overrides create). Finecon members are EXEMPT
+                # too (Jack 2026-09-03 "once start quoting, should quote
+                # to completion. dont unquote them"): cents-a-day rates on
+                # deliberately quiet long windows are where the absolute
+                # $1 projection is noisiest, and the group is 10 small
+                # ladders — the drain rule's fill-risk argument is thin.
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
             elif meta.ticker not in prev_selected \
                     and meta.event_ticker not in prev_events \
@@ -4567,19 +4591,29 @@ class IncentiveMarketMaker:
         ranked.sort(key=lambda m: -m.yield_per_contract
                     * (1.15 if m.ticker in self.state.selected else 1.0))
 
+        # Finecon quote-to-completion members (Jack 2026-09-03: "once start
+        # quoting, should quote to completion. dont unquote them"): a group
+        # market the bot is already quoting is immune to BOTH ranking cuts
+        # below — it leaves only by natural completion or a safety screen.
+        fin_sticky = {m.ticker for m in ranked
+                      if m.series in FINECON_SERIES
+                      and m.ticker in prev_selected}
+
         # Per-event TOP-N (Jack 2026-09-02, gas — see event_top_n_cut):
         # applied BEFORE sticky seeding so a member past the cap falls out of
         # `ranked`, out of `selected`, and through the normal deselect/cancel
-        # path this cycle.
-        topn_cut = event_top_n_cut(ranked, prev_selected)
+        # path this cycle. (Finecon members are immune; gas/diesel keep the
+        # original evictable semantics.)
+        topn_cut = event_top_n_cut(ranked, prev_selected, immune=fin_sticky)
         if topn_cut:
             skipped["event_top_n"] = len(topn_cut)
             ranked = [m for m in ranked if m.ticker not in topn_cut]
 
         # Finecon GROUP top-N (Jack 2026-09-02 — see finecon_group_cut):
         # after the per-event cut so a gas-monthly strike trimmed there can
-        # never re-enter through the group walk; same pre-sticky placement.
-        fin_cut = finecon_group_cut(ranked, prev_selected)
+        # never re-enter through the group walk; admission-only for the
+        # slots the quote-to-completion members leave free.
+        fin_cut = finecon_group_cut(ranked, prev_selected, members=fin_sticky)
         if fin_cut:
             skipped["finecon_top_n"] = len(fin_cut)
             ranked = [m for m in ranked if m.ticker not in fin_cut]
