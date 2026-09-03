@@ -388,6 +388,7 @@ class ExchangeClient(KalshiClient):
                              post_only=None, expiration_ts=None,
                              client_order_id=None, time_in_force=None,
                              self_trade_prevention_type=None,
+                             exchange_index=None,
                              **_ignored):
         """Translate legacy create_order kwargs into a V2 events/orders body.
         `_ignored` absorbs legacy-only params (buy_max_cost, sell_position_floor)
@@ -440,6 +441,12 @@ class ExchangeClient(KalshiClient):
             body['client_order_id'] = client_order_id
         if post_only:
             body['post_only'] = True
+        # Exchange sharding (2026-08-24): crypto markets live on exchange_index 2
+        # and this route defaults to shard 0 (omitted != auto-route here, despite
+        # the docs) -> 404 on every shard-2 create. -1 = auto-route by ticker.
+        # None keeps the field off the wire for shard-0-only callers (IMM etc.).
+        if exchange_index is not None:
+            body['exchange_index'] = int(exchange_index)
         return body
 
     @staticmethod
@@ -466,13 +473,15 @@ class ExchangeClient(KalshiClient):
                         buy_max_cost:Optional[int]=None,
                         time_in_force:Optional[str]=None,
                         self_trade_prevention_type:Optional[str]=None,
+                        exchange_index:Optional[int]=None,
                         ):
         body = self._build_v2_order_body(
             ticker=ticker, side=side, action=action, count=count, type=type,
             yes_price=yes_price, no_price=no_price, post_only=post_only,
             expiration_ts=expiration_ts, client_order_id=client_order_id,
             time_in_force=time_in_force,
-            self_trade_prevention_type=self_trade_prevention_type)
+            self_trade_prevention_type=self_trade_prevention_type,
+            exchange_index=exchange_index)
         print(f"[create_order->V2] {body}")
         order_json = json.dumps(body)
         result = self.post(path=self.events_orders_url, body=order_json)
@@ -493,8 +502,19 @@ class ExchangeClient(KalshiClient):
                            body=decrease_json)
         return result
 
-    def cancel_order(self, order_id:str):
-        result = self.delete(path=self.events_orders_url + '/' + order_id)
+    def cancel_order(self, order_id:str, exchange_index:Optional[int]=None,
+                     market_ticker:Optional[str]=None):
+        # Exchange sharding: this DELETE defaults to shard 0 and 404s for
+        # orders resting on another shard (crypto = 2), which callers would
+        # misread as "already gone". exchange_index=-1 + market_ticker
+        # auto-routes; both omitted = legacy shard-0 behavior.
+        params = {}
+        if exchange_index is not None:
+            params['exchange_index'] = int(exchange_index)
+        if market_ticker is not None:
+            params['market_ticker'] = market_ticker
+        result = self.delete(path=self.events_orders_url + '/' + order_id,
+                             params=params)
         return result
 
     def amend_order(self, order_id:str, ticker:str, book_side:str,

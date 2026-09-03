@@ -423,7 +423,7 @@ class WeeklyTouchMarketMaker(mm.TouchMarketMaker):
                     # Include orders still in flight per the local ledger.
                     orders = self._merge_ledger(orders, time.time())
                 for o in orders:
-                    if self.cancel_order(o["order_id"]):
+                    if self.cancel_order(o["order_id"], o.get("ticker")):
                         n += 1
             except Exception as e:
                 log(f"{self.tag} ! cancel-all sweep of {ev} failed: {e}")

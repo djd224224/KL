@@ -1,1 +1,1 @@
-2026-08-31T22:23:00Z run 3 — post-deploy confirmation (2h check, delayed by session suspend)
+2026-09-02T01:03:00Z run 5 — post-box-fix restart verification

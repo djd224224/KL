@@ -85,7 +85,7 @@ class FakeClient:
     def get_order(self, order_id):
         return {"order": {"status": "canceled"}}
 
-    def cancel_order(self, order_id):
+    def cancel_order(self, order_id, exchange_index=None, market_ticker=None):
         self.cancelled.append(order_id)
         return {}
 

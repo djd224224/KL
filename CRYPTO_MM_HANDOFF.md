@@ -119,6 +119,49 @@ within a few cents on majors; meme coins diverge (see guards).
   `C:\Users\jackd\Downloads\Lisa_Kalshi.txt`. Gmail app password in HKCU env
   `ALERT_EMAIL_FROM`/`ALERT_EMAIL_PASSWORD` (launcher reads the registry directly).
 
+## INCIDENT 2026-08-25→09-01: exchange sharding benched touch + updown (fixed 9/1)
+
+Kalshi sharded its exchange 2026-08-24 12:00 ET: new **crypto** events are created on
+exchange instance `exchange_index: 2` (everything else stays 0). The legacy
+`api.elections` host's `POST /portfolio/events/orders` only knows shard 0 — despite
+docs claiming omitted `exchange_index` auto-routes — so every create on a post-cutoff
+crypto market returned **404 Not Found** while reads (events/books) worked cross-shard.
+Updown went fully dark ~8/29 (all its dailies are post-cutoff; first 404s 8/25 20:02Z);
+touch went dark at the September rollover (zero SEP30 placements, ~30k rejects/task/day).
+Annual was untouched (July-created markets, shard 0) — but NEW annual events will land
+on shard 2 too. IMM (non-crypto) unaffected. `KXSOLD-26AUG2817` landed back on shard 0
+mid-rollout and worked 100% — don't let it fool a future timeline scan.
+
+**Fix (all in `KalshiClientsBaseV2ApiKey_FIXED.py` + `crypto_touch_mm.py`, additive —
+`exchange_index=None` keeps every other bot byte-identical on the wire):**
+- `KALSHI_API_BASE` default → `https://external-api.kalshi.com/trade-api/v2`
+  (env-overridable); all fleets inherit via `mm.build_client()`.
+- `place_order` sends `exchange_index=-1` (auto-route by ticker) through
+  `create_order` → `_build_v2_order_body`.
+- **Cancels needed the same routing** (found on the first restart: creates worked,
+  cancels of shard-2 orders 404'd — which `cancel_order` treats as "already gone":
+  phantom success, the quote rests until its 600s TTL, the next read re-surfaces it,
+  infinite `already gone (404)` spam). Client `cancel_order` now takes
+  `exchange_index`/`market_ticker` QUERY params; the bot wrapper passes `-1` + the
+  order's ticker (explicit arg at every touch/updown/weekly cancel site, ledger
+  fallback, legacy no-params only when no ticker is known). Amend/decrease untouched
+  (IMM-only, shard 0) — thread the same params if a shard-2 bot ever amends.
+- Tests: `test_place_routes_across_shards` + `test_cancel_routes_by_market_ticker`.
+
+**Balances are per-shard**: $3,000 moved 0→2 on 9/1 via
+`POST /portfolio/intra_exchange_instance_transfer` (amount in CENTICENTS; transfer_id
+`d5a202e0-2c92-445f-8d70-ce5eaeb7f3fc`). Top-level `/portfolio/balance` stays the
+cross-shard total (balance floors unaffected); `balance_breakdown` has the split.
+
+**Restart with `restart_crypto_fleets.ps1`** (script gotchas now baked in: kill lists
+from `lock_*.pid` + ParentProcessId ancestry, launchers killed BEFORE pythons so the
+while-loop can't respawn mid-pass, only STALE locks deleted — an unconditional delete
+raced a respawn generation on 9/1 and left 7 live bots lockless/singleton-unprotected
+until an audit rewrote lock=status pid; the script now self-repairs locks at the end).
+Post-restart verify: `placed` lines on current events; real `cancelled <id>` lines and
+no `already gone (404)` spam after the first TTL-refresh wave (~7 min in); stable
+`orders: N resting` (no cancel/re-place churn).
+
 ## INCIDENT 2026-08-09: concurrent bot GENERATIONS (all crypto fleets)
 
 Standby wakes had been MINTING fleets: three generations of the monthly bots (spawned by

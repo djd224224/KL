@@ -191,7 +191,16 @@ if ($Probe) {
     # and budget still apply. DKNG entry is self-limiting (stand-down 08:20
     # ET 8/7 = call 08:30 minus the 10-min override buffer, settles same
     # day); prune it on the next touch.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=75&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
+    # IMM_MAX_MARKETS (the distinct-EVENTS cap) 75 -> 100 (Jack 2026-09-01
+    # "also increase event threshold to 100"): the 9/1 family enrollment
+    # (FT/APP/state gas) pushed selection to 70/75 events — the cap was about
+    # to become the silent breadth governor instead of the collateral budget.
+    # KXAAAGASW paused (Jack 2026-08-31 "pause KXAAAGASW": lifetime net
+    # -$298, negative in every window; dailies + diesel stay live). The
+    # entry was lost once on 9/1 when the pause sat uncommitted through a
+    # main sync — it is committed now; prefix-matched, catches state
+    # weeklies too. Open weekly positions ride to the 9/7 settlement.
+    $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=100&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 
 while ($true) {

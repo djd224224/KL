@@ -2005,6 +2005,108 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                          "skip")
         self.assertEqual(self._classify("KXA100MAX", "KXA100MAX-26DEC31-1.990")[0],
                          "skip")
+        # dated-observation FT/APP families enroll by family (2026-09-01,
+        # after 12 new *APP series appeared overnight)
+        self.assertEqual(self._classify("KXGROKAPP", "KXGROKAPP-26OCT08-T500")[0],
+                         "enroll")
+        self.assertEqual(self._classify("KXWINGSFT",
+                                        "KXWINGSFT-26OCT08-T104.5")[0],
+                         "enroll")
+        # ...but the suffix alone is not membership: person-tail events stay out
+        self.assertEqual(self._classify("KXNFLDRAFT",
+                                        "KXNFLDRAFT-26APR30-JSMITH")[0],
+                         "review")
+
+    def test_state_gas_prefix_allow_and_family_override(self):
+        # A state never seen before is allowed by the KXAAAGASD prefix...
+        self.assertTrue(IncentiveMarketMaker._allowed(
+            "KXAAAGASDOH-26SEP02-3.1500"))
+        # ...and clones the national guard set (safe-join + rate floor +
+        # AAA blackout) on first sight.
+        fake = "KXAAAGASDZZ"
+        self.assertNotIn(fake, imm.SERIES_OVERRIDES)
+        try:
+            imm.ensure_family_override(fake)
+            self.assertTrue(imm.series_safe_join(fake))
+            self.assertEqual(imm.series_min_est_rate(fake),
+                             imm.series_min_est_rate("KXAAAGASD"))
+            self.assertEqual(imm.SERIES_OVERRIDES[fake].blackout_et,
+                             imm.SERIES_OVERRIDES["KXAAAGASD"].blackout_et)
+        finally:
+            imm.SERIES_OVERRIDES.pop(fake, None)
+
+    def test_event_top_n_gas_cap(self):
+        # Jack 2026-09-02: gas events quote only the 3 highest-ROI markets
+        # (all strikes settle on the same AAA print — correlated inventory).
+        def m(t, est, expo=10.0, coll=0.0):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=20.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=expo, est_collateral_dollars=coll)
+        gas = [m("KXAAAGASDIL-26SEP03-4.20", 2.0),
+               m("KXAAAGASDIL-26SEP03-4.21", 3.0),
+               m("KXAAAGASDIL-26SEP03-4.22", 1.0),
+               m("KXAAAGASDIL-26SEP03-4.23", 4.0),
+               m("KXAAAGASDIL-26SEP03-4.24", 0.5)]
+        rain = [m("KXRAINNYC-26SEP03-X", 0.01) for _ in range(5)]
+        cut = imm.event_top_n_cut(gas + rain, incumbent=set())
+        # keep ROI 0.4/0.3/0.2 -> cut the 1.0 and 0.5 est markets; rain
+        # (uncapped series) untouched however weak.
+        self.assertEqual(cut, {"KXAAAGASDIL-26SEP03-4.22",
+                               "KXAAAGASDIL-26SEP03-4.24"})
+        # national daily + weekly + states all resolve to N=3 via the
+        # KXAAAGAS prefix; non-gas families are uncapped.
+        for s in ("KXAAAGASD", "KXAAAGASDOH", "KXAAAGASW", "KXAAAGASM"):
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+        for s in ("KXRAINNYC", "KXDIESELD", "KXBKFT", "KXCLAUDEAPP"):
+            self.assertEqual(imm.event_top_n_for(s), 0, s)
+        # incumbency (1.15x) holds a member's slot on a near-tie: fresh 2.05
+        # vs member 2.0 -> member ROI 0.2*1.15=0.23 beats 0.205.
+        tie = [m("KXAAAGASDTX-26SEP03-3.60", 2.0),
+               m("KXAAAGASDTX-26SEP03-3.61", 2.05),
+               m("KXAAAGASDTX-26SEP03-3.62", 5.0),
+               m("KXAAAGASDTX-26SEP03-3.63", 5.0)]
+        cut = imm.event_top_n_cut(tie, incumbent={"KXAAAGASDTX-26SEP03-3.60"})
+        self.assertEqual(cut, {"KXAAAGASDTX-26SEP03-3.61"})
+        # exposure fallback: no exposure -> plain collateral ranks it; no
+        # denominator at all -> ROI 0 (cut first).
+        fb = [m("KXAAAGASDCA-26SEP03-5.60", 4.0, expo=0.0, coll=8.0),
+              m("KXAAAGASDCA-26SEP03-5.61", 4.0),
+              m("KXAAAGASDCA-26SEP03-5.62", 4.0, expo=0.0, coll=0.0),
+              m("KXAAAGASDCA-26SEP03-5.63", 1.0)]
+        cut = imm.event_top_n_cut(fb, incumbent=set())
+        self.assertEqual(cut, {"KXAAAGASDCA-26SEP03-5.62"})
+        # a group at/below N is never touched
+        self.assertEqual(imm.event_top_n_cut(gas[:3], set()), set())
+        # env spec sanity
+        self.assertEqual(imm._parse_event_top_n("KXAAAGAS:3,KXDIESEL:2"),
+                         (("KXAAAGAS", 3), ("KXDIESEL", 2)))
+        with self.assertRaises(ValueError):
+            imm._parse_event_top_n("KXAAAGAS")
+
+    def test_family_override_suffix_requires_membership(self):
+        # *FT suffix alone (KXNFLDRAFT is never allowlisted) clones nothing...
+        try:
+            imm.ensure_family_override("KXNFLDRAFT")
+            self.assertNotIn("KXNFLDRAFT", imm.SERIES_OVERRIDES)
+            # ...while an extra-allow member inherits the company archetype.
+            imm.EXTRA_ALLOW_SERIES.add("KXZZFT")
+            imm.ensure_family_override("KXZZFT")
+            self.assertTrue(imm.series_safe_join("KXZZFT"))
+            self.assertEqual(imm.SERIES_OVERRIDES["KXZZFT"],
+                             imm.SERIES_OVERRIDES["KXBKFT"])
+            # consumer-observation families carry NO fresh-candidate rate
+            # bar (2026-09-01 "start quoting things as if normal") — but
+            # keep safe-join; gas keeps the national $2 bar.
+            for s in ("KXZZFT", "KXBKFT", "KXCLAUDEAPP"):
+                self.assertEqual(imm.series_min_est_rate(s), 0.0, s)
+            self.assertEqual(imm.series_min_est_rate("KXAAAGASD"), 2.0)
+        finally:
+            imm.EXTRA_ALLOW_SERIES.discard("KXZZFT")
+            imm.SERIES_OVERRIDES.pop("KXZZFT", None)
+            imm.SERIES_OVERRIDES.pop("KXNFLDRAFT", None)
 
     def test_extra_allow_file_reload_and_safety(self):
         old_path = imm.EXTRA_ALLOW_FILE
@@ -5329,6 +5431,52 @@ class TestLiveEventDepthGate(unittest.TestCase):
         bot.state.universe_at = time.time()
         bot.run_cycle()
         self.assertIn(self.EV, bot.state.event_live_halt)
+
+    def test_fill_burst_halts_the_whole_event(self):
+        """Jack 2026-09-01 postmortem: fills ARE the adverse selection —
+        one burst on a gated market stands the whole event down even with
+        IMM_BREAKERS off (the box's default) and even though every book
+        still reads deep."""
+        self.assertFalse(imm.BREAKERS_ENABLED)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        # fills move the bot's own book AND the account position together
+        # (a divergence would be the manual-standoff signature instead)
+        bot.pnl.pos[self.B] = imm.EVENT_FILL_HALT_CONTRACTS + 5.0
+        bot.client.positions[self.B] = imm.EVENT_FILL_HALT_CONTRACTS + 5.0
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertFalse(self._event_orders(bot),
+                         "A's quotes must die with B's fill burst")
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertNotIn(self.EV, bot.state.event_live_halt)  # strike 1/2
+        self.assertTrue(any(c == "event_fill" for c, _m in bot.alerter.today))
+
+    def test_second_fill_burst_confirms_live_permanently(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot.pnl.pos[self.B] = 20.0                        # burst 1
+        bot.client.positions[self.B] = 20.0
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertEqual(bot.state.event_fill_strikes.get(self.EV), 1)
+        # halt clears (books fine), event re-enters...
+        bot.state.event_depth_halt.pop(self.EV, None)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        bot.pnl.pos[self.B] = 45.0                        # burst 2 -> LIVE
+        bot.client.positions[self.B] = 45.0
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        self.assertFalse(self._event_orders(bot))
+        # strikes survive a restart, so the escalation cannot be reset
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot2.state.event_fill_strikes.get(self.EV), 2)
+        self.assertIn(self.EV, bot2.state.event_live_halt)
 
 
 class TestSidesCanQualify(unittest.TestCase):

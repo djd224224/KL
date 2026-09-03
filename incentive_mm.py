@@ -383,6 +383,18 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 #      one-sided book does NOT count as healthy: it blocks resume for as
 #      long as it sits there (a settled strike holds its event down; these
 #      markets die at settlement anyway, so "until settlement" IS forever).
+#   5. FILL TRIPWIRE (Jack 2026-09-01, SEP01 postmortem): our own book
+#      moving EVENT_FILL_HALT_CONTRACTS+ on a gated market in one cycle
+#      stands the WHOLE event down (resumable), and a SECOND such burst on
+#      the same event confirms it LIVE — permanent. This is the signal the
+#      depth check structurally cannot give on MAMDANI-shaped books: on
+#      2026-09-01 the live event was swept for 3,270 contracts over 13h
+#      while total side depth never left five figures, because ~99% of it
+#      was 1c/99c junk that has no reason to flee (SEP02-AFFO that evening:
+#      101,699 yes contracts, 31 of them priced in-band). Fills ARE the
+#      adverse selection; everything else only predicts it. Active
+#      regardless of IMM_BREAKERS (the old per-market fill-burst breaker
+#      is default-OFF and was never event-wide).
 # Enforced in BOTH the quote loop and the candidate estimator (the
 # 2026-08-05 lesson, plus its event-level twin: a thin sibling that never
 # gets SELECTED is invisible to the quote loop, so without the estimator
@@ -404,6 +416,13 @@ EVENT_DEPTH_RESUME_SECS = _env_int("IMM_EVENT_DEPTH_RESUME_SECS", 900)
 # band on its first out-of-band cycle, so it can never accumulate into a
 # false confirm.
 EVENT_DEPTH_JUMP_CENTS = _env_float("IMM_EVENT_DEPTH_JUMP", 8)
+# Fill tripwire (point 5 above): own-book move per cycle that stands the
+# event down, and how many such bursts on one event confirm it LIVE for
+# good. 15 = the old fill-burst breaker's bar, sane against routine
+# one-rung crosses (a burst costs one resumable stand-down; only a repeat
+# is permanent).
+EVENT_FILL_HALT_CONTRACTS = _env_float("IMM_EVENT_FILL_HALT", 15)
+EVENT_FILL_HALT_STRIKES = _env_int("IMM_EVENT_FILL_STRIKES", 2)
 
 
 def series_event_depth_gated(series: str) -> bool:
@@ -926,6 +945,68 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 #   user decision 2026-07-14). All markets within an opened event are eligible
 #   regardless — budget-bounded.
 
+# Per-event TOP-N for correlated ladder families (Jack 2026-09-02: "for GAS
+# markets, quote only the 3 highest ROI markets in each event. because they
+# are all correlated so i dont want to quote them all"). Every strike of a
+# gas event settles on the SAME AAA print — quoting the whole in-band ladder
+# stacks correlated inventory for near-duplicate reward. This carves the ONE
+# deliberate exception out of two standing rules, for the configured
+# prefixes only: the 2026-07-13 "no per-event market cap" (budget was the
+# sole intra-event governor) and sticky never-evict (a member cut here IS
+# deselected — quotes cancelled, banked accrual keeps whatever cleared the
+# $1 floor — because the instruction is about standing correlated exposure,
+# not future admissions). ROI = est $/day per $ at risk, the quote-gaps
+# email's metric (fill-weighted est_exposure_dollars, falling back to plain
+# est_collateral_dollars; unpriceable books rank 0). Incumbents get the
+# same 1.15x the yield rank uses so estimator jitter doesn't reshuffle the
+# kept set every refresh. Format "PREFIX:N,...", longest prefix wins,
+# N<=0 = uncapped. KXAAAGAS covers national + state dailies + W/M.
+def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
+    out = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        try:
+            prefix, n_s = part.split(":")
+            out.append((prefix.strip(), int(n_s)))
+        except ValueError:
+            raise ValueError(f"bad IMM_EVENT_TOP_N part: {part!r}")
+    out.sort(key=lambda kv: -len(kv[0]))
+    return tuple(out)
+
+
+EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
+                                                "KXAAAGAS:3"))
+
+
+def event_top_n_for(series: str) -> int:
+    for _prefix, _n in EVENT_TOP_N:
+        if series.startswith(_prefix):
+            return max(0, _n)
+    return 0
+
+
+def event_top_n_cut(metas: List["MarketMeta"],
+                    incumbent: Set[str]) -> Set[str]:
+    """Tickers to EXCLUDE under the per-event top-N: for each capped event,
+    everything past the N highest-ROI markets of that event."""
+    by_event: Dict[str, List["MarketMeta"]] = {}
+    for _m in metas:
+        if event_top_n_for(_m.series) > 0:
+            by_event.setdefault(_m.event_ticker, []).append(_m)
+    cut: Set[str] = set()
+    for _ev, group in by_event.items():
+        n = event_top_n_for(group[0].series)
+        if n <= 0 or len(group) <= n:
+            continue
+
+        def _roi(m: "MarketMeta") -> float:
+            denom = m.est_exposure_dollars or m.est_collateral_dollars
+            r = (m.est_dollars_per_day / denom) if denom else 0.0
+            return r * (1.15 if m.ticker in incumbent else 1.0)
+
+        group.sort(key=_roi, reverse=True)
+        cut.update(m.ticker for m in group[n:])
+    return cut
+
 POLL_SECS = _env_int("IMM_POLL_SECS", 90)
 UNIVERSE_REFRESH_SECS = _env_int("IMM_UNIVERSE_REFRESH_SECS", 600)
 # Kalshi publishes each hour's hourly-series (KXTEMP) programs LATE — absent
@@ -1111,13 +1192,22 @@ ALLOW_SERIES_SUFFIXES = tuple(
 #     KXEARNINGSMENTIONUAL (United). Same low-adverse-selection structure as the
 #     other MENTIONs — nothing knowable before the call — and the midnight-ET
 #     ticker-date cutoff keeps the bot out on report day (user decision 2026-07-15).
+#   KXAAAGASD<STATE>        state AAA gas dailies (Jack 2026-09-01 "fix this
+#     going forward": Kalshi lit five NEW states overnight — GA/NC/OH/PA/WA
+#     on top of the 8/31 six — and the 8/31 exact-list enrollment missed
+#     them all for a day, so the family is prefix-covered like KXTEMP/
+#     KXAVGT. Bare KXAAAGASD (the national daily) matches too, harmlessly —
+#     it is also exact-allowed. Guards (safe-join, rate floor, AAA blackout)
+#     clone from the national entry at refresh via FAMILY_OVERRIDE_PARENTS;
+#     the 4pm-ET halving was always startswith-matched. KXAAAGASW* weeklies
+#     are untouched by this prefix and stay behind the launcher blocklist.
 # KXTEMP re-enabled (Jack 2026-07-22 morning; was retired 7/21 evening after
 # the adverse-selection post-mortem — see analysis: -6c/contract uniform).
 # The 7/21 SeriesOverride tuning (5/2/2, cap 50, 5-90c, close-15min) applies.
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
         "IMM_ALLOW_PREFIXES",
-        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT").split(",") if p)
+        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT,KXAAAGASD").split(",") if p)
 _DEFAULT_CRYPTO_SERIES = (
     # The yearly touch pairs (KX*MINY/KX*MAXY, allowlisted 2026-07-22 when no
     # fleet bot quoted them) moved to SERIES_BLOCKLIST_PREFIXES on 2026-08-13:
@@ -1145,7 +1235,20 @@ _DEFAULT_COMPANY_SERIES = (
     # get quoted"): never enrolled — the auto-classifier files day-dated
     # T-threshold shapes (26SEP07-T100) as REVIEW, not enroll. Same consumer-
     # metric class as the price trackers; re-entry guards apply.
-    "KXBKFT,KXYUMTBFT")
+    "KXBKFT,KXYUMTBFT,"
+    # FT + APP family sweeps (Jack 2026-08-31 "allowlist the app markets ...
+    # foottraffic markets e.g. ..."): the "e.g." means the whole families —
+    # these are ALL the series live in the programs feed that day, not just
+    # his examples. Both are dated observations of a published statistic
+    # (foot-traffic index / app-store chart) with no press release to be out
+    # of the way of, so the midnight-ET ticker rule is the cutoff — the safe
+    # direction, same as KXBKFT. NEW members enroll automatically: the daily
+    # classifier files the dated-observation *FT/*APP shape as ENROLL
+    # (2026-09-01, after Kalshi added 12 new *APP series overnight), and
+    # FAMILY_OVERRIDE_PARENTS clones the guard set onto them at refresh.
+    "KXBROSFT,KXCAVAFT,KXCMGFT,KXCOSTFT,KXMCDFT,KXSGFT,KXSHAKFT,KXTGTFT,"
+    "KXCARTAPP,KXCLAUDEAPP,KXDASHAPP,KXDISNEYAPP,KXDKNGAPP,KXESPNAPP,"
+    "KXFACEBOOKAPP,KXFANDUELAPP,KXGEMINIAPP,KXGPTAPP")
 # Economic-data / price-index prints (Jack 2026-07-23): recurring published
 # statistics — AAA gas price (daily/weekly/monthly), new-home sales, gas CPI,
 # the Shanghai freight index. Day-dated tickers -> the midnight-ET rule stops
@@ -1173,6 +1276,18 @@ _DEFAULT_ECON_SERIES = (
     # Truflation's OTHER Kalshi index (KXTRUFAIDP, AI & DePIN) out until
     # asked for. Re-entry guards apply like every econ print.
     "KXTRUEV")
+# State AAA gas DAILIES: allowlisted 2026-08-31 (Jack "allowlist the state
+# gas markets e.g. ...") as six exact entries (CA/FL/IL/NJ/NY/TX), on the
+# 8/31 judgment that a half-covered state (allowed but unguarded) beat
+# prefix coverage. REVERSED 2026-09-01 (Jack "fix this going forward"):
+# Kalshi lit five MORE states overnight (GA/NC/OH/PA/WA) and the exact list
+# missed them all for a day, so the family moved to the KXAAAGASD prefix in
+# ALLOW_SERIES_PREFIXES and the unguarded half of the trade-off was closed
+# properly: FAMILY_OVERRIDE_PARENTS clones the national KXAAAGASD override
+# (safe-join + rate floor + AAA blackout) onto every state at refresh, and
+# the 4pm-ET halving was always startswith-matched. The WEEKLY family stays
+# dark — the launcher IMM_BLOCKLIST's KXAAAGASW entry is prefix-matched and
+# catches any state weekly too.
 # Rotten Tomatoes score markets (Jack 2026-07-23): undated tickers
 # (KXRT-<MOVIE>-<score>) -> occurrence-based cutoff when Kalshi provides
 # one, else continuous quoting; bands/floor gate as usual.
@@ -1309,6 +1424,25 @@ for _s in os.environ.get("IMM_REENTRY_SERIES", _REENTRY_SERIES).split(","):
 SERIES_OVERRIDES["KXDIESELW"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_DIESELW_MIN_RATE", 0.0), safe_join=True)
 
+# Dated-observation consumer families quote WITHOUT the $2/day fresh-
+# candidate rate bar (Jack 2026-09-01 "dont hold off. start quoting things
+# as if normal", accepting the exemption offered with the 8/31 enrollment
+# — the KXDIESELW shape). The bar is SHARE-based, so on the deep, tight
+# books these families grow into (KXHULUAPP: 1-2k contracts at a 1c-wide
+# touch) a 20-contract ladder estimates pennies/day and the bar excludes
+# exactly the liquid markets Jack wants quoted — while the first-wave APP
+# series passed it only by enrolling while their books were still thin.
+# Admission by timing luck is not a gate worth keeping for this class. The
+# $1/market payout floor (the exchange's real pay/no-pay line), safe-join
+# placement, caps and the midnight-ET cutoff all stay. Replaces the
+# re-entry loop's entries for the exact members; new members inherit the
+# same via FAMILY_OVERRIDE_PARENTS (KXBKFT / KXCLAUDEAPP archetypes).
+for _s in [s for s in _DEFAULT_COMPANY_SERIES.split(",")
+           if s.endswith(("FT", "APP"))]:
+    SERIES_OVERRIDES[_s] = SeriesOverride(
+        min_est_per_day=_env_float("IMM_CONSUMER_OBS_MIN_RATE", 0.0),
+        safe_join=True)
+
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
 # The default midnight-ET ticker rule cost the whole overnight half of each
@@ -1372,6 +1506,52 @@ for _s in os.environ.get(
             SERIES_OVERRIDES[_s],
             blackout_et=tuple(os.environ.get(
                 "IMM_AAA_BLACKOUT_ET", "03:05-04:00").split("-")))
+
+
+# ---- family guard inheritance (Jack 2026-09-01 "fix this going forward",
+# after Kalshi lit five new state gas dailies + 12 new *APP series overnight
+# and the 8/31 exact lists missed every one for a day). A series admitted by
+# a FAMILY rule — the KXAAAGASD* prefix above, or *FT/*APP via the daily
+# auto-enroll — clones its archetype's SERIES_OVERRIDES entry the first time
+# it shows up in the candidate feed, so a new member is never
+# allowed-but-unguarded: safe-join, the family's rate-floor setting and the
+# AAA blackout read across (hour-mults were already startswith-matched). A
+# hand-tuned exact entry always wins — inheritance only fills a missing key.
+# Called from refresh_universe's candidates loop, where every series has
+# passed _allowed; suffix rules ALSO require exact/extra-allow membership so
+# an unrelated *FT-ending series that is never allowlisted (KXNFLDRAFT) can
+# never clone a guard set even if a future caller runs this over the raw
+# feed.
+FAMILY_OVERRIDE_PARENTS = (
+    ("prefix", "KXAAAGASD", "KXAAAGASD"),
+    ("suffix", "FT", "KXBKFT"),
+    ("suffix", "APP", "KXCLAUDEAPP"),
+)
+_family_override_warned: Set[str] = set()
+
+
+def ensure_family_override(series: str) -> None:
+    if series in SERIES_OVERRIDES:
+        return
+    for kind, pat, parent in FAMILY_OVERRIDE_PARENTS:
+        if kind == "prefix":
+            if not series.startswith(pat):
+                continue
+        elif not series.endswith(pat) or (series not in ALLOW_SERIES
+                                          and series not in EXTRA_ALLOW_SERIES):
+            continue
+        ov = SERIES_OVERRIDES.get(parent)
+        if ov is None:
+            # A missing parent would be a silent exclusion of the guard set
+            # — say so once instead of quietly quoting unguarded.
+            if parent not in _family_override_warned:
+                _family_override_warned.add(parent)
+                log(f"[IMM] ! family parent {parent} has no override; "
+                    f"{series} quotes unguarded")
+            return
+        SERIES_OVERRIDES[series] = ov
+        log(f"[IMM] {series}: family override inherited from {parent}")
+        return
 
 
 # Event-start resolution for mention markets: the ticker date's midnight-ET
@@ -3134,10 +3314,14 @@ class BotState:
     # restarts many times a day, and a restart mid-speech must not re-quote.
     event_depth_halt: Dict[str, float] = field(default_factory=dict)
     # Live-CONFIRMED events (a strike jumped out of band = settled in
-    # practice): event_ticker -> confirm ts. PERMANENT — no resume path, the
-    # estimator refuses the event, and the entry outlives the halt above
-    # (pruned only by the 7d persist TTL, long after the event settles).
+    # practice, or a repeated fill burst): event_ticker -> confirm ts.
+    # PERMANENT — no resume path, the estimator refuses the event, and the
+    # entry outlives the halt above (pruned only by the 7d persist TTL,
+    # long after the event settles).
     event_live_halt: Dict[str, float] = field(default_factory=dict)
+    # Fill-tripwire strike counts per gated event (persisted: ~20
+    # restarts/day must not reset the two-strikes-and-out escalation).
+    event_fill_strikes: Dict[str, int] = field(default_factory=dict)
     bench_until: Dict[str, float] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
@@ -3383,6 +3567,9 @@ class IncentiveMarketMaker:
             # the jump detector needs to keep confirming across a restart.
             self.state.event_live_halt = {str(e): float(v) for e, v in
                                           (data.get("event_live_halt") or {}).items()}
+            self.state.event_fill_strikes = {
+                str(e): int(v) for e, v in
+                (data.get("event_fill_strikes") or {}).items()}
             self.state.prev_mid.update(
                 {str(t): float(v) for t, v in
                  (data.get("prev_mid_gated") or {}).items()})
@@ -3503,6 +3690,12 @@ class IncentiveMarketMaker:
                                e: round(v, 1)
                                for e, v in self.state.event_live_halt.items()
                                if time.time() - v < 7 * 86400},
+                           # fill-tripwire strikes (pruned with their halts)
+                           "event_fill_strikes": {
+                               e: n
+                               for e, n in self.state.event_fill_strikes.items()
+                               if e in self.state.event_depth_halt
+                               or e in self.state.event_live_halt},
                            # gated-series mid history: the settled-strike
                            # jump detector needs prev_mid ACROSS restarts, or
                            # a strike that jumps to 99c during the seconds a
@@ -4028,6 +4221,11 @@ class IncentiveMarketMaker:
              and not ticker_cutoff_passed(t)),
             key=lambda kv: -kv[1]["dollars_per_day"])[:MAX_CANDIDATE_BOOKS]
 
+        # New family members (prefix/suffix-admitted) clone their archetype
+        # guards before anything downstream reads SERIES_OVERRIDES.
+        for t, _info in candidates:
+            ensure_family_override(series_of(t))
+
         metas: List[MarketMeta] = []
         tickers = [t for t, _info in candidates]
         markets: Dict[str, dict] = {}
@@ -4259,6 +4457,15 @@ class IncentiveMarketMaker:
         # Mild stickiness so estimator jitter doesn't churn the selection.
         ranked.sort(key=lambda m: -m.yield_per_contract
                     * (1.15 if m.ticker in self.state.selected else 1.0))
+
+        # Per-event TOP-N (Jack 2026-09-02, gas — see event_top_n_cut):
+        # applied BEFORE sticky seeding so a member past the cap falls out of
+        # `ranked`, out of `selected`, and through the normal deselect/cancel
+        # path this cycle.
+        topn_cut = event_top_n_cut(ranked, prev_selected)
+        if topn_cut:
+            skipped["event_top_n"] = len(topn_cut)
+            ranked = [m for m in ranked if m.ticker not in topn_cut]
 
         selected: Dict[str, MarketMeta] = {}
         collateral = 0.0
@@ -5163,6 +5370,39 @@ class IncentiveMarketMaker:
             # Own-book delta, not account delta — the user's manual trades on a
             # nearby market must not false-alarm this.
             prev = self.state.prev_pos.get(t)
+            # GATED FILL TRIPWIRE (Jack 2026-09-01 — see the live-event gate
+            # config block, point 5): fills on a gated market ARE the
+            # adverse selection the gate exists to stop, and on these
+            # junk-stacked books they are the only signal that cannot be
+            # masked. First burst stands the WHOLE event down (resumable);
+            # the EVENT_FILL_HALT_STRIKES-th confirms it LIVE permanently.
+            # Independent of IMM_BREAKERS, and ahead of the per-market
+            # breaker so the event-wide response owns gated series.
+            if (series_event_depth_gated(meta.series) and prev is not None
+                    and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS):
+                strikes = self.state.event_fill_strikes.get(ev, 0) + 1
+                self.state.event_fill_strikes[ev] = strikes
+                event_depth_thin.add(ev)
+                self.state.event_depth_halt[ev] = now_ts
+                confirmed = strikes >= EVENT_FILL_HALT_STRIKES
+                if confirmed:
+                    self.state.event_live_halt.setdefault(ev, now_ts)
+                n_cx = 0
+                for m2 in by_event.get(ev, [meta]):
+                    n_cx += self.cancel_market_orders(m2.ticker, resting)
+                ev_ticks = {m2.ticker for m2 in by_event.get(ev, [meta])}
+                desired = [q for q in desired if q.ticker not in ev_ticks]
+                self.alerter.alert(
+                    "event_fill",
+                    f"{ev}: {t} own book moved {own_pos - prev:+.0f} in one "
+                    f"cycle — getting filled on a gated event; standing the "
+                    f"whole event down "
+                    + ("PERMANENTLY (live confirmed, "
+                       f"burst {strikes})" if confirmed else
+                       f"(burst {strikes}/{EVENT_FILL_HALT_STRIKES})")
+                    + f"; cancelled {n_cx}", key=ev)
+                self.state.prev_pos[t] = own_pos
+                continue
             if (BREAKERS_ENABLED and prev is not None
                     and abs(own_pos - prev) >= FILL_BURST_CONTRACTS):
                 self.state.breaker_until[t] = now_ts + FILL_BURST_COOLDOWN_SECS

@@ -86,7 +86,11 @@ CLIENT_ORDER_PREFIX = "cmm"  # all client_order_ids look like cmm-<run>-<uuid>
 # Configuration
 # ----------------------------------------------------------------------------
 
-KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+# external-api host since 2026-09-01: the legacy api.elections host's order
+# route only knows exchange shard 0, and new crypto markets are created on
+# shard 2 (Kalshi exchange sharding, 2026-08-24) — every create 404'd there.
+KALSHI_API_BASE = os.environ.get(
+    "KALSHI_API_BASE", "https://external-api.kalshi.com/trade-api/v2")
 KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
 
 ET = pytz.timezone("US/Eastern")
@@ -940,10 +944,12 @@ class TouchMarketMaker:
             log(f"{self.tag} [DRY] place {label}")
             return
         try:
+            # exchange_index=-1: auto-route by ticker across exchange shards —
+            # crypto events created since 2026-08-24 live on shard 2.
             resp = self.client.create_order(
                 ticker=q.ticker, client_order_id=client_order_id,
                 count=q.count, type="limit", post_only=True,
-                expiration_ts=expiration_ts, **kwargs)
+                expiration_ts=expiration_ts, exchange_index=-1, **kwargs)
             oid = (resp.get("order") or {}).get("order_id") or resp.get("order_id", "?")
             self.state.order_ages[oid] = now_ts
             self.state.ledger[oid] = {
@@ -959,15 +965,24 @@ class TouchMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! place failed ({e}): {label}")
 
-    def cancel_order(self, order_id: str) -> bool:
+    def cancel_order(self, order_id: str, ticker: Optional[str] = None) -> bool:
         """Returns True when the order is verifiably no longer resting."""
         if not self.live:
             self.state.sim_orders.pop(order_id, None)
             self.state.order_ages.pop(order_id, None)
             log(f"{self.tag} [DRY] cancel {order_id}")
             return True
+        # Sharded cancel routing: without a market_ticker the DELETE lands on
+        # shard 0 and 404s for shard-2 (crypto) orders — which the except
+        # below would misread as "already gone" while the quote keeps resting
+        # until TTL. Fall back to the ledger's ticker when the caller has none.
+        ticker = ticker or (self.state.ledger.get(order_id) or {}).get("ticker")
         try:
-            self.client.cancel_order(order_id)
+            if ticker:
+                self.client.cancel_order(order_id, exchange_index=-1,
+                                         market_ticker=ticker)
+            else:
+                self.client.cancel_order(order_id)
             self.state.order_ages.pop(order_id, None)
             self.state.ledger.pop(order_id, None)
             log(f"{self.tag} cancelled {order_id}")
@@ -1079,7 +1094,7 @@ class TouchMarketMaker:
                 if i == 0:  # current event: include in-flight ledger orders too
                     orders = self._merge_ledger(orders, time.time())
                 for o in orders:
-                    if self.cancel_order(o["order_id"]):
+                    if self.cancel_order(o["order_id"], o.get("ticker")):
                         n += 1
             except Exception as e:
                 log(f"{self.tag} ! cancel-all sweep of {ev} failed: {e}")
@@ -1323,8 +1338,9 @@ class TouchMarketMaker:
 
         cancel_failures = 0
         cancelled_ids = set()
+        ticker_by_oid = {o.get("order_id"): o.get("ticker") for o in resting}
         for oid in to_cancel:
-            if self.cancel_order(oid):
+            if self.cancel_order(oid, ticker_by_oid.get(oid)):
                 self.state.cancelled_today += 1
                 cancelled_ids.add(oid)
             else:

@@ -678,7 +678,7 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                 orders = self._get_resting_orders(ev)
                 orders = self._merge_ledger(orders, time.time())
                 for o in orders:
-                    if self.cancel_order(o["order_id"]):
+                    if self.cancel_order(o["order_id"], o.get("ticker")):
                         n += 1
             except Exception as e:
                 log(f"{self.tag} ! cancel-all sweep of {ev} failed: {e}")
@@ -729,7 +729,7 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
             self.u.sweep_pending[ev] = 0
             cancelled = failed = 0
             for o in orders:
-                if self.cancel_order(o["order_id"]):
+                if self.cancel_order(o["order_id"], o.get("ticker")):
                     self.state.cancelled_today += 1
                     cancelled += 1
                 else:
@@ -1013,8 +1013,9 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
 
         cancel_failures = 0
         cancelled_ids = set()
+        ticker_by_oid = {o.get("order_id"): o.get("ticker") for o in resting}
         for oid in to_cancel:
-            if self.cancel_order(oid):
+            if self.cancel_order(oid, ticker_by_oid.get(oid)):
                 self.state.cancelled_today += 1
                 cancelled_ids.add(oid)
             else:

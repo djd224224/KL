@@ -453,6 +453,7 @@ class FakeClient:
         self.order_pages = order_pages or [{"orders": [], "cursor": None}]
         self.get_orders_calls = []
         self.cancelled = []
+        self.cancel_routing = []   # (exchange_index, market_ticker) per cancel
         self.cancel_error = None
         self.created = []
         self.single_orders = {}   # order_id -> order dict served by get_order
@@ -472,10 +473,11 @@ class FakeClient:
         self.created.append(kwargs)
         return {"order": {"order_id": oid}}
 
-    def cancel_order(self, order_id):
+    def cancel_order(self, order_id, exchange_index=None, market_ticker=None):
         if self.cancel_error is not None:
             raise self.cancel_error
         self.cancelled.append(order_id)
+        self.cancel_routing.append((exchange_index, market_ticker))
         return {}
 
     def __getattr__(self, name):
@@ -604,6 +606,31 @@ class TestLedgerMerge(unittest.TestCase):
         oid = list(bot.state.ledger)[0]
         self.assertTrue(bot.cancel_order(oid))
         self.assertEqual(bot.state.ledger, {})
+
+    def test_place_routes_across_shards(self):
+        """place_order must send exchange_index=-1 (auto-route by ticker):
+        without it the create lands on shard 0 and 404s for every crypto
+        market created after the 2026-08-24 exchange sharding."""
+        client = FakeClient()
+        bot = self.bot(client)
+        bot.place_order(mm.Quote("T1", "bid", 45, 10), 1000.0)
+        self.assertEqual(client.created[-1].get("exchange_index"), -1)
+
+    def test_cancel_routes_by_market_ticker(self):
+        """Sharded exchanges: a cancel without market_ticker lands on shard 0
+        and 404s for shard-2 (crypto) orders — misread as 'already gone' while
+        the quote rests until TTL. Explicit ticker wins, ledger is the
+        fallback, and only a truly unknown ticker falls back to legacy."""
+        client = FakeClient()
+        bot = self.bot(client)
+        bot.place_order(mm.Quote("T1", "bid", 45, 10), 1000.0)
+        oid = list(bot.state.ledger)[0]
+        bot.cancel_order(oid)                      # ticker from ledger
+        self.assertEqual(client.cancel_routing[-1], (-1, "T1"))
+        bot.cancel_order("unknown-oid", "T9")      # explicit ticker wins
+        self.assertEqual(client.cancel_routing[-1], (-1, "T9"))
+        bot.cancel_order("unknown-oid")            # no ticker anywhere: legacy
+        self.assertEqual(client.cancel_routing[-1], (None, None))
 
 
 class TestSideCap(unittest.TestCase):
