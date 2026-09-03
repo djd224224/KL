@@ -8,14 +8,29 @@
 # bot's lock strips its singleton protection (7 markets ran lockless after the
 # 2026-09-01 restart until an audit pass rewrote them).
 
+param(
+    # all | touch | updown | annual — scope the restart to one fleet
+    [ValidateSet('all','touch','updown','annual')]
+    [string]$Fleet = 'all'
+)
+
 $ErrorActionPreference = 'Continue'
 $repo = 'C:\Users\jackd\Documents\KL'
 $allowed = @('python','cmd','powershell','pwsh','wscript')
 # kill launchers first so the while-loop can't respawn a python mid-pass
 $killRank = @{ 'powershell' = 0; 'pwsh' = 0; 'cmd' = 1; 'wscript' = 2; 'python' = 3 }
-$lockGlobs = @("$repo\run-logs\crypto-touch\lock_*.pid",
-               "$repo\run-logs\crypto-updown\lock_*.pid",
-               "$repo\run-logs\crypto-annual\lock_*.pid")
+$fleetDefs = @{
+    touch  = @{ task = 'KL crypto_touch_mm *';  dir = "$repo\run-logs\crypto-touch"
+                markets = @('BNB-MAX','BNB-MIN','BTC-MAX','BTC-MIN','DOGE-MAX','DOGE-MIN','ETH-MAX','ETH-MIN','HYPE-MAX','HYPE-MIN','SOL-MAX','SOL-MIN','XRP-MAX','XRP-MIN','ZEC-MAX','ZEC-MIN') }
+    updown = @{ task = 'KL crypto_updown_mm *'; dir = "$repo\run-logs\crypto-updown"
+                markets = @('BNB','BTC','DOGE','ETH','HYPE','SOL','XRP') }
+    annual = @{ task = 'KL crypto_annual_mm *'; dir = "$repo\run-logs\crypto-annual"
+                markets = @('BNB','BTC','DOGE','ETH','HYPE','SOL','XRP','ZEC') }
+}
+$active = if ($Fleet -eq 'all') { @('touch','updown','annual') } else { @($Fleet) }
+$lockGlobs = $active | ForEach-Object { "$($fleetDefs[$_].dir)\lock_*.pid" }
+$expected = ($active | ForEach-Object { $fleetDefs[$_].markets.Count } | Measure-Object -Sum).Sum
+Write-Host "fleet scope: $($active -join '+') ($expected bots)"
 
 function Get-LivePython([int]$p) {
     $proc = Get-Process -Id $p -ErrorAction SilentlyContinue
@@ -33,11 +48,11 @@ for ($i=0; $i -lt 8 -and $p; $i++) {
 Write-Host "own ancestry (spared): $($mine -join ',')"
 
 # --- 1. stop the bot tasks ---------------------------------------------------
+$patterns = $active | ForEach-Object { $fleetDefs[$_].task }
 $tasks = Get-ScheduledTask | Where-Object {
-    ($_.TaskName -like 'KL crypto_touch_mm *' -or
-     $_.TaskName -like 'KL crypto_updown_mm *' -or
-     $_.TaskName -like 'KL crypto_annual_mm *') -and
-    ($_.TaskName -notlike '*DIGEST*') -and ($_.TaskName -notlike '*WATCHDOG*')
+    $t = $_.TaskName
+    (($patterns | Where-Object { $t -like $_ }) -ne $null) -and
+    ($t -notlike '*DIGEST*') -and ($t -notlike '*WATCHDOG*')
 }
 Write-Host "stopping $($tasks.Count) tasks..."
 $tasks | ForEach-Object { Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue }
@@ -93,14 +108,10 @@ Write-Host "started $($tasks.Count) tasks; waiting out launcher jitter (90s)..."
 Start-Sleep -Seconds 90
 
 # --- 5. lock repair: a bot whose lock a race deleted never rewrites it -------
-$fleets = @{
-    "$repo\run-logs\crypto-touch"  = @('BNB-MAX','BNB-MIN','BTC-MAX','BTC-MIN','DOGE-MAX','DOGE-MIN','ETH-MAX','ETH-MIN','HYPE-MAX','HYPE-MIN','SOL-MAX','SOL-MIN','XRP-MAX','XRP-MIN','ZEC-MAX','ZEC-MIN')
-    "$repo\run-logs\crypto-updown" = @('BNB','BTC','DOGE','ETH','HYPE','SOL','XRP')
-    "$repo\run-logs\crypto-annual" = @('BNB','BTC','DOGE','ETH','HYPE','SOL','XRP','ZEC')
-}
 $repaired = 0; $lockCount = 0
-foreach ($dir in $fleets.Keys) {
-    foreach ($m in $fleets[$dir]) {
+foreach ($fname in $active) {
+    $dir = $fleetDefs[$fname].dir
+    foreach ($m in $fleetDefs[$fname].markets) {
         $lock = Join-Path $dir "lock_$m.pid"
         $status = Join-Path $dir "status_$m.json"
         if (Test-Path $lock) { $lockCount++; continue }
@@ -116,8 +127,8 @@ foreach ($dir in $fleets.Keys) {
 # --- 6. census ---------------------------------------------------------------
 $py = @(Get-Process python -ErrorAction SilentlyContinue).Count
 Write-Host ""
-Write-Host "pythons now: $py (expect ~32 = 31 bots + IMM)"
-Write-Host "crypto locks now: $lockCount / 31 (repaired: $repaired)"
-Get-ScheduledTask | Where-Object {$_.TaskName -like 'KL crypto*' -and $_.TaskName -notlike '*DIGEST*' -and $_.TaskName -notlike '*WATCHDOG*'} |
+Write-Host "pythons now: $py (expected: restarted fleet(s) $expected + everything out of scope)"
+Write-Host "fleet locks now: $lockCount / $expected (repaired: $repaired)"
+$tasks | ForEach-Object { Get-ScheduledTask -TaskName $_.TaskName } |
     Group-Object State | ForEach-Object { Write-Host ("tasks {0}: {1}" -f $_.Name, $_.Count) }
-Write-Host "if locks < 31: a bot may still be inside launcher jitter - rerun steps 5-6 in a minute"
+Write-Host "if locks < ${expected}: a bot may still be inside launcher jitter - rerun steps 5-6 in a minute"

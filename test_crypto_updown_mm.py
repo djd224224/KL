@@ -725,16 +725,32 @@ class TestDailyDefenses(unittest.TestCase):
             self.assertEqual(len(ud.select_events(views, ("daily",), NOW)),
                              want, mins)
 
-    def test_btc_daily_is_switched_off(self):
-        """Jack 2026-08-23 "turn off daily BTC": cumulative daily BTC -315
-        while the six other dailies were collectively positive. Weekly BTC
-        stays; the other assets keep their dailies."""
-        self.assertEqual(ud.DISABLED_ASSET_CADENCES, {("BTC", "daily")})
-        self.assertEqual(ud.effective_cadences("BTC", ("daily", "weekly")),
-                         ("weekly",))
-        self.assertEqual(ud.effective_cadences("ETH", ("daily", "weekly")),
-                         ("daily", "weekly"))
+    def test_all_dailies_are_switched_off(self):
+        """Jack 2026-09-03 "turn off daily crypto markets. keep
+        weekly/monthly": the default disables the daily tenor for EVERY
+        asset via the "*" wildcard (BTC's 8/23 off-switch subsumed).
+        Weeklies stay on everywhere."""
+        self.assertEqual(ud.DISABLED_ASSET_CADENCES, {("*", "daily")})
+        for asset in ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"):
+            self.assertEqual(ud.effective_cadences(asset, ("daily", "weekly")),
+                             ("weekly",), asset)
         self.assertEqual(ud.effective_cadences("BTC", ("weekly",)), ("weekly",))
+
+    def test_exact_asset_off_switch_still_works(self):
+        """The pre-wildcard form ("BTC:daily") must keep working — the env
+        override replaces the default outright and may use either form."""
+        with mock.patch.dict("os.environ",
+                             {"CUD_DISABLED_ASSET_CADENCES": "BTC:daily"}):
+            disabled = frozenset(
+                (a.strip(), c.strip())
+                for a, _, c in (p.partition(":") for p in os.environ[
+                    "CUD_DISABLED_ASSET_CADENCES"].split(","))
+                if c.strip() in ud.CADENCES and a.strip())
+        with mock.patch.object(ud, "DISABLED_ASSET_CADENCES", disabled):
+            self.assertEqual(ud.effective_cadences("BTC", ("daily", "weekly")),
+                             ("weekly",))
+            self.assertEqual(ud.effective_cadences("ETH", ("daily", "weekly")),
+                             ("daily", "weekly"))
 
     def test_config_is_pinned(self):
         self.assertEqual(ud.SKEW_BY_CADENCE, {"daily": (4.0, 25.0)})

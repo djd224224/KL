@@ -195,23 +195,26 @@ QUOTE_OFFSET_BY_ASSET_CADENCE = {
     ("BTC", "daily"): _env_i("CUD_QUOTE_OFFSET_DAILY_BTC", 6),
 }
 
-# (asset, tenor) pairs deliberately switched OFF (Jack 2026-08-23 "turn off
-# daily BTC": cumulative daily BTC sat at -315 while the six other dailies
-# were collectively positive — the defenses slowed the bleed, the off switch
-# ends it; BTC weekly stays on). Applied in main() so the effective cadence
-# set shows in the banner; env CUD_DISABLED_ASSET_CADENCES="BTC:daily,..."
-# (unknown cadences ignored).
+# (asset, tenor) pairs deliberately switched OFF. Asset "*" matches every
+# asset. History: BTC:daily off 2026-08-23 (cumulative -315 while the other
+# six dailies were collectively positive); Jack 2026-09-03 "turn off daily
+# crypto markets. keep weekly/monthly" -> ALL dailies off ("*:daily" —
+# covers future assets too; weeklies unchanged, monthlies are the touch
+# fleet). Applied in main() so the effective cadence set shows in the
+# banner; env CUD_DISABLED_ASSET_CADENCES="BTC:daily,*:hourly,..."
+# overrides the default entirely (unknown cadences ignored).
 DISABLED_ASSET_CADENCES = frozenset(
     (a.strip(), c.strip())
     for a, _, c in (p.partition(":") for p in os.environ.get(
-        "CUD_DISABLED_ASSET_CADENCES", "BTC:daily").split(","))
+        "CUD_DISABLED_ASSET_CADENCES", "*:daily").split(","))
     if c.strip() in CADENCES and a.strip())
 
 
 def effective_cadences(asset: str, cadences: Sequence[str]) -> Tuple[str, ...]:
     """The requested cadences minus this asset's deliberate off-switches."""
     return tuple(c for c in cadences
-                 if (asset, c) not in DISABLED_ASSET_CADENCES)
+                 if (asset, c) not in DISABLED_ASSET_CADENCES
+                 and ("*", c) not in DISABLED_ASSET_CADENCES)
 
 
 # ---- daily-tenor defenses (Jack 2026-08-17, after the fill autopsy) -------

@@ -271,6 +271,15 @@ tests pass untouched — but the extraction means a future fix to `run_cycle` be
 
 ## Above/below variant (`crypto_updown_mm.py`, v1.0 — built 2026-08-05)
 
+**DAILY TENOR OFF fleet-wide since 2026-09-03** (Jack "turn off daily crypto markets.
+keep weekly/monthly"): `DISABLED_ASSET_CADENCES` default is now `"*:daily"` — the `*`
+wildcard disables a cadence for every asset (BTC's 8/23 solo off-switch subsumed;
+env `CUD_DISABLED_ASSET_CADENCES` still overrides outright). Weeklies unchanged;
+monthlies are the touch fleet. NB the 9/1 sync history-loss (see the sharding incident)
+had silently DROPPED the 8/23 BTC off-switch and the 8/23 30-min pre-determination
+stand-down floor from the branch — both cherry-picked back 9/3 before this change.
+`restart_crypto_fleets.ps1 -Fleet updown` restarts just this fleet.
+
 **LIVE PILOT (armed 2026-08-05, weekly tenor, all assets).** Settings per Jack: `--cadence
 weekly`, ladder **3 x 2** (doubled from 3x1 on 8/10, caps 2x'd 40/200/400 -> **80/400/800**),
 **3c off fair**, 2c apart, band **10-90c**, **8 markets/event**.
