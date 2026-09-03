@@ -564,3 +564,28 @@ with it. Everything was reapplied on branch `claude/imm-family-allowlist`
 and landed via PR. Standing lesson: THIS REPO'S WORKING TREE IS DISPOSABLE
 — main syncs every 30 min and other sessions land PRs concurrently, so any
 change that must survive goes through a branch + PR, same day.
+
+## 2026-09-02 — gas events capped to top-3 by ROI (Jack)
+
+Jack: "for GAS markets, quote only the 3 highest ROI markets in each
+event. because they are all correlated so i dont want to quote them all."
+`IMM_EVENT_TOP_N` (default `KXAAAGAS:3`, prefix:N, longest wins) caps each
+gas event to its N highest-ROI markets — ROI = est $/day per $ at risk
+(the quote-gaps metric: fill-weighted exposure, else collateral), with the
+yield rank's 1.15x incumbent factor against churn. Applied to `ranked`
+before sticky seeding (skip bucket `event_top_n`); overrides the 7/13
+"no per-event market cap" rule for these prefixes only.
+
+Deploy verification (8:41pm ET restart): first universe cut 115 gas
+markets (`event_top_n: 115`); kept-3 are adjacent near-money strikes
+(e.g. KXAAAGASD 4.1400/4.1450/4.1500). Settled server-side state: NO gas
+event carries more than 3 two-sided ladders (tonight actually zero —
+evening books polarize and the per-side band rule one-sides the kept
+markets too). The 4-7 one-sided markets per event beyond the kept-3 are
+NOT fresh quoting: two uncapped days left own-book inventory on 132 gas
+strikes, and those ride as reduce-only orphan-managed exits OUTSIDE
+`ranked` — the cut deliberately never touches them (evicting an orphan
+strands inventory unmanaged). They drain at settlement; fresh events
+start clean at <=3. NOTE the selected_tickers count in imm_state.json
+conflates laddering members with reduce-only orphan management — judge
+the cap by two-sided ladders per event, not by selected count.
