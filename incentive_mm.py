@@ -945,6 +945,68 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 #   user decision 2026-07-14). All markets within an opened event are eligible
 #   regardless — budget-bounded.
 
+# Per-event TOP-N for correlated ladder families (Jack 2026-09-02: "for GAS
+# markets, quote only the 3 highest ROI markets in each event. because they
+# are all correlated so i dont want to quote them all"). Every strike of a
+# gas event settles on the SAME AAA print — quoting the whole in-band ladder
+# stacks correlated inventory for near-duplicate reward. This carves the ONE
+# deliberate exception out of two standing rules, for the configured
+# prefixes only: the 2026-07-13 "no per-event market cap" (budget was the
+# sole intra-event governor) and sticky never-evict (a member cut here IS
+# deselected — quotes cancelled, banked accrual keeps whatever cleared the
+# $1 floor — because the instruction is about standing correlated exposure,
+# not future admissions). ROI = est $/day per $ at risk, the quote-gaps
+# email's metric (fill-weighted est_exposure_dollars, falling back to plain
+# est_collateral_dollars; unpriceable books rank 0). Incumbents get the
+# same 1.15x the yield rank uses so estimator jitter doesn't reshuffle the
+# kept set every refresh. Format "PREFIX:N,...", longest prefix wins,
+# N<=0 = uncapped. KXAAAGAS covers national + state dailies + W/M.
+def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
+    out = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        try:
+            prefix, n_s = part.split(":")
+            out.append((prefix.strip(), int(n_s)))
+        except ValueError:
+            raise ValueError(f"bad IMM_EVENT_TOP_N part: {part!r}")
+    out.sort(key=lambda kv: -len(kv[0]))
+    return tuple(out)
+
+
+EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
+                                                "KXAAAGAS:3"))
+
+
+def event_top_n_for(series: str) -> int:
+    for _prefix, _n in EVENT_TOP_N:
+        if series.startswith(_prefix):
+            return max(0, _n)
+    return 0
+
+
+def event_top_n_cut(metas: List["MarketMeta"],
+                    incumbent: Set[str]) -> Set[str]:
+    """Tickers to EXCLUDE under the per-event top-N: for each capped event,
+    everything past the N highest-ROI markets of that event."""
+    by_event: Dict[str, List["MarketMeta"]] = {}
+    for _m in metas:
+        if event_top_n_for(_m.series) > 0:
+            by_event.setdefault(_m.event_ticker, []).append(_m)
+    cut: Set[str] = set()
+    for _ev, group in by_event.items():
+        n = event_top_n_for(group[0].series)
+        if n <= 0 or len(group) <= n:
+            continue
+
+        def _roi(m: "MarketMeta") -> float:
+            denom = m.est_exposure_dollars or m.est_collateral_dollars
+            r = (m.est_dollars_per_day / denom) if denom else 0.0
+            return r * (1.15 if m.ticker in incumbent else 1.0)
+
+        group.sort(key=_roi, reverse=True)
+        cut.update(m.ticker for m in group[n:])
+    return cut
+
 POLL_SECS = _env_int("IMM_POLL_SECS", 90)
 UNIVERSE_REFRESH_SECS = _env_int("IMM_UNIVERSE_REFRESH_SECS", 600)
 # Kalshi publishes each hour's hourly-series (KXTEMP) programs LATE — absent
@@ -4395,6 +4457,15 @@ class IncentiveMarketMaker:
         # Mild stickiness so estimator jitter doesn't churn the selection.
         ranked.sort(key=lambda m: -m.yield_per_contract
                     * (1.15 if m.ticker in self.state.selected else 1.0))
+
+        # Per-event TOP-N (Jack 2026-09-02, gas — see event_top_n_cut):
+        # applied BEFORE sticky seeding so a member past the cap falls out of
+        # `ranked`, out of `selected`, and through the normal deselect/cancel
+        # path this cycle.
+        topn_cut = event_top_n_cut(ranked, prev_selected)
+        if topn_cut:
+            skipped["event_top_n"] = len(topn_cut)
+            ranked = [m for m in ranked if m.ticker not in topn_cut]
 
         selected: Dict[str, MarketMeta] = {}
         collateral = 0.0

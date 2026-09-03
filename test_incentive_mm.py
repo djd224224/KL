@@ -2035,6 +2035,57 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         finally:
             imm.SERIES_OVERRIDES.pop(fake, None)
 
+    def test_event_top_n_gas_cap(self):
+        # Jack 2026-09-02: gas events quote only the 3 highest-ROI markets
+        # (all strikes settle on the same AAA print — correlated inventory).
+        def m(t, est, expo=10.0, coll=0.0):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=20.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=expo, est_collateral_dollars=coll)
+        gas = [m("KXAAAGASDIL-26SEP03-4.20", 2.0),
+               m("KXAAAGASDIL-26SEP03-4.21", 3.0),
+               m("KXAAAGASDIL-26SEP03-4.22", 1.0),
+               m("KXAAAGASDIL-26SEP03-4.23", 4.0),
+               m("KXAAAGASDIL-26SEP03-4.24", 0.5)]
+        rain = [m("KXRAINNYC-26SEP03-X", 0.01) for _ in range(5)]
+        cut = imm.event_top_n_cut(gas + rain, incumbent=set())
+        # keep ROI 0.4/0.3/0.2 -> cut the 1.0 and 0.5 est markets; rain
+        # (uncapped series) untouched however weak.
+        self.assertEqual(cut, {"KXAAAGASDIL-26SEP03-4.22",
+                               "KXAAAGASDIL-26SEP03-4.24"})
+        # national daily + weekly + states all resolve to N=3 via the
+        # KXAAAGAS prefix; non-gas families are uncapped.
+        for s in ("KXAAAGASD", "KXAAAGASDOH", "KXAAAGASW", "KXAAAGASM"):
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+        for s in ("KXRAINNYC", "KXDIESELD", "KXBKFT", "KXCLAUDEAPP"):
+            self.assertEqual(imm.event_top_n_for(s), 0, s)
+        # incumbency (1.15x) holds a member's slot on a near-tie: fresh 2.05
+        # vs member 2.0 -> member ROI 0.2*1.15=0.23 beats 0.205.
+        tie = [m("KXAAAGASDTX-26SEP03-3.60", 2.0),
+               m("KXAAAGASDTX-26SEP03-3.61", 2.05),
+               m("KXAAAGASDTX-26SEP03-3.62", 5.0),
+               m("KXAAAGASDTX-26SEP03-3.63", 5.0)]
+        cut = imm.event_top_n_cut(tie, incumbent={"KXAAAGASDTX-26SEP03-3.60"})
+        self.assertEqual(cut, {"KXAAAGASDTX-26SEP03-3.61"})
+        # exposure fallback: no exposure -> plain collateral ranks it; no
+        # denominator at all -> ROI 0 (cut first).
+        fb = [m("KXAAAGASDCA-26SEP03-5.60", 4.0, expo=0.0, coll=8.0),
+              m("KXAAAGASDCA-26SEP03-5.61", 4.0),
+              m("KXAAAGASDCA-26SEP03-5.62", 4.0, expo=0.0, coll=0.0),
+              m("KXAAAGASDCA-26SEP03-5.63", 1.0)]
+        cut = imm.event_top_n_cut(fb, incumbent=set())
+        self.assertEqual(cut, {"KXAAAGASDCA-26SEP03-5.62"})
+        # a group at/below N is never touched
+        self.assertEqual(imm.event_top_n_cut(gas[:3], set()), set())
+        # env spec sanity
+        self.assertEqual(imm._parse_event_top_n("KXAAAGAS:3,KXDIESEL:2"),
+                         (("KXAAAGAS", 3), ("KXDIESEL", 2)))
+        with self.assertRaises(ValueError):
+            imm._parse_event_top_n("KXAAAGAS")
+
     def test_family_override_suffix_requires_membership(self):
         # *FT suffix alone (KXNFLDRAFT is never allowlisted) clones nothing...
         try:
