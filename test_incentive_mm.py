@@ -2088,6 +2088,91 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         with self.assertRaises(ValueError):
             imm._parse_event_top_n("KXAAAGAS")
 
+    def test_finecon_sweep_enrollment_and_guards(self):
+        # Jack 2026-09-02: Finance/Economics sweep — the risk-screened
+        # survivors are allowed, guarded (safe-join, no rate bar), and the
+        # AAA touch-extreme monthlies join the print blackout + KXAAAGAS:3.
+        # _allowed is tested with the REAL policy: the suite's setUpModule
+        # turns ALLOWLIST_ONLY off for fixture series, and sibling classifier
+        # tests leave EXTRA_ALLOW_SERIES scratch behind — both restored.
+        saved_extra = set(imm.EXTRA_ALLOW_SERIES)
+        imm.EXTRA_ALLOW_SERIES.clear()
+        imm.ALLOWLIST_ONLY = True
+        try:
+            for s in ("KXSPRLVL", "KXCBDECISIONNZ", "KXCBDISRAEL",
+                      "KXVENEZCRUDE", "KXAAAGASMINM", "KXAAAGASMAXM",
+                      "KXBRAZILGDP", "KXJOLTSOPEN", "KXDATACENTCON",
+                      "KXWENBACONATOR", "KXTBCRUNCHWRAP"):
+                self.assertIn(s, imm.FINECON_SERIES, s)
+                self.assertTrue(
+                    IncentiveMarketMaker._allowed(f"{s}-26OCT13-T1"), s)
+                self.assertTrue(imm.series_safe_join(s), s)
+                self.assertEqual(imm.series_min_est_rate(s), 0.0, s)
+            for s in ("KXAAAGASMINM", "KXAAAGASMAXM"):
+                self.assertEqual(imm.SERIES_OVERRIDES[s].blackout_et,
+                                 imm.SERIES_OVERRIDES["KXAAAGASM"].blackout_et,
+                                 s)
+                self.assertEqual(imm.event_top_n_for(s), 3, s)
+            # the risk-rejected classes stay out (realtime feeds,
+            # quote-through releases) — a sample, not the full list
+            for s in ("KXEURUSDAW", "KXCAC40", "KXUE", "KXISMPMI",
+                      "KXSNOWCRABCATCH", "KXSOCKEYERUN", "KXUSOPENPRICE",
+                      "KXTECHLAYOFF"):
+                self.assertNotIn(s, imm.FINECON_SERIES, s)
+                self.assertFalse(
+                    IncentiveMarketMaker._allowed(f"{s}-26OCT13-T1"), s)
+        finally:
+            imm.ALLOWLIST_ONLY = False
+            imm.EXTRA_ALLOW_SERIES.update(saved_extra)
+
+    def test_finecon_group_cut_top10_max3_per_event(self):
+        # Jack 2026-09-02: "quote the top 10 markets based on ROI (with no
+        # more than 3 on a single event)" across the finecon group.
+        def m(t, est, expo=10.0):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=20.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=expo, est_collateral_dollars=0.0)
+        # 5 SPR strikes with the top ROIs: only 3 may survive; the slack
+        # goes to lower-ROI markets of OTHER events.
+        spr = [m(f"KXSPRLVL-26SEP09-T28{i}", 9.0 - i) for i in range(5)]
+        nz = [m("KXCBDECISIONNZ-26OCT27-HOLD", 3.0),
+              m("KXCBDECISIONNZ-26OCT27-H25", 2.9)]
+        vz = [m(f"KXVENEZCRUDE-26OCT13-T1{i}00000", 2.0 - i * 0.1)
+              for i in range(3)]
+        gas = [m(f"KXAAAGASMINM-26SEP30-3.{60 + i}", 1.0 - i * 0.1)
+               for i in range(4)]
+        wen = [m("KXWENBACONATOR-26OCT02-T8.5", 0.05)]
+        rain = [m("KXRAINNYC-26SEP03-X", 50.0)]     # not in the group
+        cut = imm.finecon_group_cut(spr + nz + vz + gas + wen + rain,
+                                    incumbent=set())
+        kept = {x.ticker for x in spr + nz + vz + gas + wen} - cut
+        self.assertEqual(len(kept), 10)
+        self.assertEqual(sum(1 for t in kept if t.startswith("KXSPRLVL")), 3)
+        self.assertEqual(sum(1 for t in kept if t.startswith("KXCBDEC")), 2)
+        self.assertEqual(sum(1 for t in kept if t.startswith("KXVENEZ")), 3)
+        # 10th slot: two gas strikes beat the $0.05 Baconator
+        self.assertEqual(sum(1 for t in kept if t.startswith("KXAAAGAS")), 2)
+        self.assertIn("KXWENBACONATOR-26OCT02-T8.5", cut)
+        # ungrouped series are never touched, however strong or weak
+        self.assertNotIn("KXRAINNYC-26SEP03-X", cut)
+        # incumbency holds a slot on a near-tie at the boundary
+        edge = [m(f"KXSPRLVL-26SEP09-T28{i}", 5.0) for i in range(3)] \
+            + [m("KXVENEZCRUDE-26OCT13-A", 1.0),
+               m("KXBRAZILGDP-26DEC02-B", 1.04)]
+        try:
+            imm.FINECON_TOP_N, _n = 4, imm.FINECON_TOP_N
+            cut = imm.finecon_group_cut(
+                edge, incumbent={"KXVENEZCRUDE-26OCT13-A"})
+            self.assertEqual(cut, {"KXBRAZILGDP-26DEC02-B"})
+            # knob off -> no cut at all
+            imm.FINECON_TOP_N = 0
+            self.assertEqual(imm.finecon_group_cut(edge, set()), set())
+        finally:
+            imm.FINECON_TOP_N = _n
+
     def test_family_override_suffix_requires_membership(self):
         # *FT suffix alone (KXNFLDRAFT is never allowlisted) clones nothing...
         try:

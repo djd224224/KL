@@ -986,6 +986,16 @@ def event_top_n_for(series: str) -> int:
     return 0
 
 
+def _market_roi(m: "MarketMeta", incumbent: Set[str]) -> float:
+    """The ranking ROI shared by every top-N cut: est $/day per $ at risk
+    (fill-weighted exposure, falling back to plain collateral; unpriceable
+    books rank 0), with the same 1.15x incumbent stickiness the yield rank
+    uses so estimator jitter doesn't reshuffle a kept set every refresh."""
+    denom = m.est_exposure_dollars or m.est_collateral_dollars
+    r = (m.est_dollars_per_day / denom) if denom else 0.0
+    return r * (1.15 if m.ticker in incumbent else 1.0)
+
+
 def event_top_n_cut(metas: List["MarketMeta"],
                     incumbent: Set[str]) -> Set[str]:
     """Tickers to EXCLUDE under the per-event top-N: for each capped event,
@@ -999,13 +1009,7 @@ def event_top_n_cut(metas: List["MarketMeta"],
         n = event_top_n_for(group[0].series)
         if n <= 0 or len(group) <= n:
             continue
-
-        def _roi(m: "MarketMeta") -> float:
-            denom = m.est_exposure_dollars or m.est_collateral_dollars
-            r = (m.est_dollars_per_day / denom) if denom else 0.0
-            return r * (1.15 if m.ticker in incumbent else 1.0)
-
-        group.sort(key=_roi, reverse=True)
+        group.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
         cut.update(m.ticker for m in group[n:])
     return cut
 
@@ -1321,6 +1325,59 @@ _DEFAULT_ENTERTAINMENT_SERIES = "KXRT"
 # weeks, so the per-market cap is what bounds them, not the clock.
 _DEFAULT_RATES_SERIES = ("KXUST2AD,KXUST5AD,KXUST7AD,KXUST10AD,KXUST30AD,"
                          "KXUST2AM,KXUST5AM,KXUST7AM,KXUST10AM,KXUST30AM")
+# Finance/Economics quiet-print sweep (Jack 2026-09-02: "in Finance/Economics
+# sections that are unquoted in normal IMM bot, quote the top 10 markets
+# based on ROI (with no more than 3 on a single event). dont include any
+# events with major adverse selection risk, or have major realtime data
+# risk. bias towards quieter markets"). Every Kalshi category=Economics/
+# Financials live-program series was scanned 2026-09-02 (1,687 paying
+# markets, 453 already quoted); this is the survivors of the risk screen —
+# all settle on a SCHEDULED published statistic with no continuous public
+# feed in between, and all had near-zero 24h volume at enrollment:
+#   KXSPRLVL        weekly EIA SPR level (WPSR, Wed 10:30 ET; day-dated
+#                   ticker -> midnight-ET rule exits before release day)
+#   KXCBDECISIONNZ  RBNZ OCR decision (Oct MPR = Oct 28 2pm NZT, VERIFIED
+#                   rbnz.govt.nz; ticker 26OCT27 -> bot out ~21h before.
+#                   Known residual: NZ Q3 CPI (~mid-Oct) reprices odds
+#                   mid-window — accepted, books are 70c wide and empty)
+#   KXCBDISRAEL     Bank of Israel rate decision (same shape, 16:00 IL time,
+#                   decision-dated ticker exits before decision day)
+#   KXVENEZCRUDE    Venezuela crude output, OPEC MOMR secondary sources
+#                   (mid-month print day in the ticker; Reuters/Bloomberg
+#                   OPEC surveys ~1st-3rd are slow public drift, accepted)
+#   KXAAAGASMINM/MAXM  monthly touch-extremes of the SAME 3:20am-ET AAA
+#                   print the enrolled gas families settle on — nothing
+#                   moves between prints; joins the AAA blackout below and
+#                   the KXAAAGAS:3 per-event cap already covers them
+#   KXBRAZILGDP     IBGE quarterly GDP print (release-dated ticker, ~3mo
+#                   quiet window; monthly IBC-Br drift is slow + public)
+#   KXJOLTSOPEN     BLS JOLTS (release-dated ticker)
+#   KXDATACENTCON   Census construction spending (release-dated ticker)
+#   KXWENBACONATOR/KXTBCRUNCHWRAP  Spice-Data fast-food price monthlies
+#                   (the KXCHIPBURRITO class Jack nowcasts; glacial stat,
+#                   extremes stand down via the 5-90 mid screen)
+# REJECTED and why (so the next sweep doesn't relitigate): KXEURUSD/AW +
+# KXUSDJPY (Pyth live FX feed), KXCAC40/KXHSI/KXRUT (live index), KXFEAR
+# (live CNN index), KXTXERCOTPEAK/D + KXPJMEMERGENCY (realtime grid data),
+# KXUSOPENPRICE (live resale-ticket feed, matchup news), KXDDR5EMS/MS (Ornn
+# daily prints -> knowable monthly drift, busy book, the GPU-class capacity
+# call), KXUE (Rosstat releases BEFORE the 9/30 close and the RUS26SEP
+# ticker has no day -> bot would quote THROUGH the print), KXISMPMI (same
+# no-day-ticker hole, quotes into release morning + flash/regional PMI
+# predictors), KXSKEXPYOY (Korea 10/20-day preliminary exports mid-month),
+# KXTECHLAYOFF (public running tally -> value knowable before settle),
+# KXSNOWCRABCATCH (TAC announces ~Oct 6, cutoff Oct 9 -> quotes through
+# it), KXSOCKEYERUN (ADF&G forecast ~Nov 13, cutoff Nov 27 -> same),
+# KXWATECHEMP/KXWAAEROEMP (monthly BLS state prints quoted through for a
+# 6-8mo hold at ~3% ROI), company KPIs (earnings adverse selection), the
+# ad-spend family (safe but ROI <= 1.5%/day — never contends for a slot).
+_DEFAULT_FINECON_SERIES = (
+    "KXSPRLVL,KXCBDECISIONNZ,KXCBDISRAEL,KXVENEZCRUDE,"
+    "KXAAAGASMINM,KXAAAGASMAXM,KXBRAZILGDP,KXJOLTSOPEN,KXDATACENTCON,"
+    "KXWENBACONATOR,KXTBCRUNCHWRAP")
+FINECON_SERIES = frozenset(
+    s for s in os.environ.get("IMM_ALLOW_FINECON_SERIES",
+                              _DEFAULT_FINECON_SERIES).split(",") if s)
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
@@ -1329,7 +1386,41 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_RATES_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_ENTERTAINMENT_SERIES",
                                        _DEFAULT_ENTERTAINMENT_SERIES)
-                ).split(",") if s)
+                ).split(",") if s) | FINECON_SERIES
+
+# The finecon sweep quotes AT MOST 10 markets at once, best-ROI first with
+# no more than 3 per event (Jack 2026-09-02, verbatim above). A GROUP cap,
+# not a per-event one: the group is ranked as a whole by the same ROI the
+# per-event cut uses, kept greedily to N with the per-event limit enforced
+# inside the walk. Like event_top_n_cut this runs BEFORE sticky seeding, so
+# a member that falls out of the top set deselects through the normal
+# cancel path (its banked accrual keeps whatever cleared the $1 floor) —
+# the 1.15x incumbent factor keeps that from flapping on book noise.
+# KXAAAGASMINM/MAXM also pass the KXAAAGAS:3 EVENT_TOP_N first; both rules
+# agree by construction. <=0 disables a knob.
+FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 10)
+FINECON_EVENT_TOP_N = _env_int("IMM_FINECON_EVENT_TOP_N", 3)
+
+
+def finecon_group_cut(metas: List["MarketMeta"],
+                      incumbent: Set[str]) -> Set[str]:
+    """Tickers to EXCLUDE under the finecon group cap: everything in the
+    group beyond the greedy top-FINECON_TOP_N by ROI, walking best-first
+    and skipping markets past FINECON_EVENT_TOP_N in their event."""
+    if FINECON_TOP_N <= 0:
+        return set()
+    group = [m for m in metas if m.series in FINECON_SERIES]
+    group.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
+    keep: Set[str] = set()
+    per_event: Dict[str, int] = {}
+    for m in group:
+        if len(keep) >= FINECON_TOP_N:
+            break
+        if 0 < FINECON_EVENT_TOP_N <= per_event.get(m.event_ticker, 0):
+            continue
+        keep.add(m.ticker)
+        per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
+    return {m.ticker for m in group} - keep
 
 # NO-NEW gate (Jack 2026-07-28 pm): series listed here admit NO fresh
 # candidates; members ride sticky to natural death. History: company set
@@ -1492,6 +1583,19 @@ SERIES_OVERRIDES["KXTRUEV"] = SeriesOverride(
     safe_join=True,
     cutoff_from_close_min=_env_int("IMM_TRUEV_CUTOFF_FROM_CLOSE_MIN", 60))
 
+# Finecon sweep guards (Jack 2026-09-02, see _DEFAULT_FINECON_SERIES):
+# safe-join placement and NO $/day rate bar — the KXDIESELW/KXTRUEV call,
+# already generalised on 2026-08-05: these are deliberately QUIET markets
+# whose per-market est is cents-to-a-dollar a day over long windows, so a
+# rate bar would exclude exactly what was picked, while the $1/market
+# payout floor (the exchange's real pay/no-pay line) still gates every
+# entry. A hand-tuned exact entry elsewhere wins — this only fills gaps.
+for _s in FINECON_SERIES:
+    if _s not in SERIES_OVERRIDES:
+        SERIES_OVERRIDES[_s] = SeriesOverride(
+            min_est_per_day=_env_float("IMM_FINECON_MIN_RATE", 0.0),
+            safe_join=True)
+
 # AAA PRINT BLACKOUT (Jack 2026-08-04: "stop getting sniped ... ensure my
 # quotes expire beforehand"). Observed post times, from the gas sniper's own
 # 5s-resolution detection: 03:36:25, 03:18:25, 03:20:27, 03:22:53, 03:25:17 ET
@@ -1499,9 +1603,12 @@ SERIES_OVERRIDES["KXTRUEV"] = SeriesOverride(
 # the early side and ~24 on the late side. Applies to gas AND diesel, every
 # horizon: the DAILY markets close 01:59 ET and are structurally safe, but the
 # weekly/monthly ones stay open across the print and are what actually bleed.
+# KXAAAGASMINM/MAXM joined 2026-09-02 with the finecon sweep: monthly
+# touch-extremes of the same print, open across it all month like W/M.
 for _s in os.environ.get(
         "IMM_AAA_PRINT_SERIES",
-        "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXDIESELD,KXDIESELW").split(","):
+        "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXDIESELD,KXDIESELW,"
+        "KXAAAGASMINM,KXAAAGASMAXM").split(","):
     _s = _s.strip()
     if _s and _s in SERIES_OVERRIDES:
         SERIES_OVERRIDES[_s] = replace(
@@ -4468,6 +4575,14 @@ class IncentiveMarketMaker:
         if topn_cut:
             skipped["event_top_n"] = len(topn_cut)
             ranked = [m for m in ranked if m.ticker not in topn_cut]
+
+        # Finecon GROUP top-N (Jack 2026-09-02 — see finecon_group_cut):
+        # after the per-event cut so a gas-monthly strike trimmed there can
+        # never re-enter through the group walk; same pre-sticky placement.
+        fin_cut = finecon_group_cut(ranked, prev_selected)
+        if fin_cut:
+            skipped["finecon_top_n"] = len(fin_cut)
+            ranked = [m for m in ranked if m.ticker not in fin_cut]
 
         selected: Dict[str, MarketMeta] = {}
         collateral = 0.0

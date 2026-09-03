@@ -594,3 +594,40 @@ Diesel joined the cap the same evening (Jack "do the same with diesel"):
 default now `KXAAAGAS:3,KXDIESEL:3` — KXDIESELD/KXDIESELW have the same
 one-print-per-event correlation; identical semantics (reduce-only
 inventory rides outside the cap).
+
+## 2026-09-02 — Finance/Economics quiet-print sweep, group top-10 (Jack)
+
+Jack: "in Finance/Economics sections that are unquoted in normal IMM bot,
+quote the top 10 markets based on ROI (with no more than 3 on a single
+event). dont include any events with major adverse selection risk, or have
+major realtime data risk. bias towards quieter markets."
+
+Every live-program market in Kalshi category Economics/Financials was
+scanned (1,687 paying, 453 already quoted) and each unquoted family
+risk-reviewed for (a) settlement on a continuously-observable live feed
+and (b) scheduled releases the bot would quote THROUGH (release timing
+verified against the bot's actual cutoff per event). Survivors —
+11 series, all near-zero 24h volume, enrolled in `_DEFAULT_FINECON_SERIES`
+(env `IMM_ALLOW_FINECON_SERIES`) with safe-join + no rate bar (the
+KXDIESELW/KXTRUEV pattern; $1 payout floor still gates):
+KXSPRLVL (weekly EIA SPR), KXCBDECISIONNZ (RBNZ, Oct decision verified
+Oct 28 2pm NZT vs bot exit Oct 27 00:00 ET), KXCBDISRAEL, KXVENEZCRUDE
+(OPEC MOMR), KXAAAGASMINM/MAXM (AAA touch-extreme monthlies — join the
+03:05-04:00 ET AAA blackout and the KXAAAGAS:3 event cap), KXBRAZILGDP,
+KXJOLTSOPEN, KXDATACENTCON, KXWENBACONATOR/KXTBCRUNCHWRAP (Spice
+fast-food monthlies). The rejected list and reasons are inline above
+`_DEFAULT_FINECON_SERIES` — notable traps found: KXUE-RUS26SEP and
+KXISMPMI have NO day in the ticker so the midnight-ET rule never fires
+and the bot would quote through Rosstat/into ISM morning;
+KXSNOWCRABCATCH's TAC announcement (~Oct 6) and KXSOCKEYERUN's ADF&G
+forecast (~Nov 13, verified 2025 precedent) both land BEFORE their
+cutoffs — single-report pickoff traps wearing quiet books.
+
+Mechanism: `finecon_group_cut` — greedy walk of the group by the shared
+`_market_roi` (the event_top_n metric, factored out), keeping the best
+`IMM_FINECON_TOP_N` (10) with at most `IMM_FINECON_EVENT_TOP_N` (3) per
+event, everything else cut before sticky seeding (skip bucket
+`finecon_top_n`, same deselect path as `event_top_n`). Dry-run against
+the scan snapshot kept exactly: NZ HOLD/H25, SPR T286/T284/T281,
+VENEZ 1.2M/1.3M, MINM 3.70/3.75/3.95 — ~$8.3/day est. Point-in-time est
+at enrollment, not a promise; the walk re-ranks every refresh.
