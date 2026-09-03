@@ -1,1 +1,1 @@
-2026-09-02T01:03:00Z run 5 — post-box-fix restart verification
+run 6 — 2026-09-03: did the box recover after the Sep 2 merge-abort fix + restart dispatch? (fired from dashboards session)
