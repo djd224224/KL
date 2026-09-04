@@ -14,6 +14,7 @@ analysis/kxlow/data/ for the analysis step.
 Refresh log: 2026-09-01 pull — verifying the Aug 31 pause landed (Sep 1
 events should show only look-alike signature volume, no bot flow).
 2026-09-02 pull — pause re-check night 2 (Sep 2 events, ex-Minneapolis).
+2026-09-04 pull — did the bot quote Sep 3/4 events? (enforcer-era check)
 """
 
 import csv
