@@ -3,16 +3,25 @@ name: KXLOW pause enforcer
 # repo-flag pause relies on the laptop syncing main, which failed silently —
 # the bot quoted on Sep 1-3 with low_temp.paused live on main since Aug 31.
 # While that flag exists, this cancels every resting KXLOW order at the
-# exchange every 30 minutes, so anything the un-synced laptop places dies
-# within ~half an hour of each trigger (20:17 / 23:17 / 03:17 / 04:47 ET).
-# It touches ONLY KXLOW tickers — no other bot's orders.
+# exchange, so anything the un-synced laptop places dies shortly after each
+# trigger (20:17 / 23:17 / 03:17 / 04:47 ET). KXLOW tickers only.
+#
+# Cron reality check (nights 1-2): GitHub throttled the plain */30 cron to
+# ~every 2-5 hours with a 13h overnight gap, so the targeted entries below
+# hit +15/+40 min after each bot trigger slot (UTC, EDT offsets — shift 1h
+# when DST ends). GH may still delay them; this is best-effort. The
+# definitive off switch is local: Disable-ScheduledTask 'KL low-temp-trading'.
 #
 # One switch: deleting low_temp.paused from main both resumes the bot AND
 # makes this workflow a no-op. Remove or disable the workflow entirely once
 # the laptop-side task is confirmed disabled or the pause is over.
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '32,57 0 * * *'   # after 20:17 ET evening run
+    - cron: '32,57 3 * * *'   # after 23:17 ET refresh
+    - cron: '32,57 7 * * *'   # after 03:17 ET day-of
+    - cron: '2,27 9 * * *'    # after 04:47 ET day-of
+    - cron: '*/30 * * * *'    # background layer (heavily throttled by GH)
   workflow_dispatch:
   push:
     branches:
