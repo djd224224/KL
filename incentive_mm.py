@@ -403,6 +403,22 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 #      adverse selection; everything else only predicts it. Active
 #      regardless of IMM_BREAKERS (the old per-market fill-burst breaker
 #      is default-OFF and was never event-wide).
+#   6. DATE ARM (Jack 2026-09-04: trigger "only when 1/ the date of the
+#      event is not known or 2/ the date of the event is known and is
+#      the current date"): every trigger above — thin, one-sided, jump
+#      confirm, fill tripwire — is SUPPRESSED while the event-ticker
+#      date is known and strictly in the future. A Sep 8 speech cannot
+#      be live on Sep 4: SEP08 was falsely live-confirmed twice (9/2,
+#      9/4) by news sweeps days early. Armed from
+#      EVENT_LIVE_GATE_PREARM_H hours before midnight ET of the ticker
+#      day (default 4h ~= the UTC date roll, so an evening speech dated
+#      by either naming convention is covered), through the day itself,
+#      and — deliberately wider than the literal spec — every day after:
+#      a still-trading past-dated ticker is either a post-speech book
+#      settling out or a listing-date program (the parse_event_date
+#      resolution trap), and both belong gated. Unparseable date ->
+#      armed. This arms TRIGGERS only: existing halts are neither
+#      released nor created by it, and resume still works normally.
 # Enforced in BOTH the quote loop and the candidate estimator (the
 # 2026-08-05 lesson, plus its event-level twin: a thin sibling that never
 # gets SELECTED is invisible to the quote loop, so without the estimator
@@ -437,10 +453,24 @@ EVENT_DEPTH_STACK_CONTRACTS = _env_float("IMM_EVENT_DEPTH_STACK", 10000)
 # is permanent).
 EVENT_FILL_HALT_CONTRACTS = _env_float("IMM_EVENT_FILL_HALT", 15)
 EVENT_FILL_HALT_STRIKES = _env_int("IMM_EVENT_FILL_STRIKES", 2)
+# Point 6 pre-arm: hours before midnight ET of the ticker day that the
+# live triggers arm. 0 = strictly the ticker day (ET).
+EVENT_LIVE_GATE_PREARM_SECS = _env_float(
+    "IMM_EVENT_LIVE_GATE_PREARM_H", 4) * 3600.0
 
 
 def series_event_depth_gated(series: str) -> bool:
     return series.startswith(tuple(EVENT_DEPTH_GATE_PREFIXES))
+
+
+def event_live_gate_armed(event_ticker: str, now_ts: float) -> bool:
+    """Point 6 (Jack 2026-09-04): live stand-down triggers fire only when
+    the event-ticker date is unknown (parse -> None) or now is past
+    midnight ET of that date minus the pre-arm. Known-future -> False."""
+    d = parse_event_date(event_ticker)
+    if d is None:
+        return True
+    return now_ts >= d.timestamp() - EVENT_LIVE_GATE_PREARM_SECS
 
 
 # User decision 2026-07-12: Love Island mention pools are high incentive-per-minute
@@ -4784,7 +4814,8 @@ class IncentiveMarketMaker:
         # every sibling. Runs BEFORE sides_can_qualify so the thin market
         # itself also ranks as worthless.
         if series_event_depth_gated(meta.series) \
-                and pad_band_ok(meta.series, ext_b, ext_a):
+                and pad_band_ok(meta.series, ext_b, ext_a) \
+                and event_live_gate_armed(meta.event_ticker, time.time()):
             d_yes, d_no = external_depths(yes_levels, no_levels, own_live)
             stacked = (EVENT_DEPTH_STACK_CONTRACTS > 0
                        and max(d_yes, d_no) >= EVENT_DEPTH_STACK_CONTRACTS)
@@ -5546,7 +5577,8 @@ class IncentiveMarketMaker:
             # Independent of IMM_BREAKERS, and ahead of the per-market
             # breaker so the event-wide response owns gated series.
             if (series_event_depth_gated(meta.series) and prev is not None
-                    and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS):
+                    and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS
+                    and event_live_gate_armed(meta.event_ticker, now_ts)):
                 strikes = self.state.event_fill_strikes.get(ev, 0) + 1
                 self.state.event_fill_strikes[ev] = strikes
                 event_depth_thin.add(ev)
@@ -5633,16 +5665,20 @@ class IncentiveMarketMaker:
                 pm_in_band = (pm_g is not None
                               and series_price_min(meta.series) <= pm_g
                               <= series_price_max(meta.series))
-                went_one_sided = not two_sided and pm_in_band
+                # Point 6: a known-future-dated event cannot be live, so
+                # none of the live signals may fire for it.
+                armed = event_live_gate_armed(meta.event_ticker, now_ts)
+                went_one_sided = armed and not two_sided and pm_in_band
                 # Settled-strike signature (Jack 2026-08-31 #2): in-band ->
                 # out-of-band by a real one-cycle jump (49c -> 99c: the word
                 # got said). Confirms the event LIVE — permanently.
-                jumped_out = (two_sided and pm_in_band and not mid_in_band
+                jumped_out = (armed and two_sided and pm_in_band
+                              and not mid_in_band
                               and abs(mid_g - pm_g) >= EVENT_DEPTH_JUMP_CENTS)
                 stacked = (EVENT_DEPTH_STACK_CONTRACTS > 0
                            and max(d_yes, d_no)
                            >= EVENT_DEPTH_STACK_CONTRACTS)
-                thin = (mid_in_band and not stacked
+                thin = (mid_in_band and armed and not stacked
                         and (d_yes < EVENT_DEPTH_MIN_CONTRACTS
                              or d_no < EVENT_DEPTH_MIN_CONTRACTS))
                 if jumped_out and ev not in self.state.event_live_halt:
@@ -6505,6 +6541,9 @@ class IncentiveMarketMaker:
                 + (f"; a {EVENT_DEPTH_STACK_CONTRACTS:g}+ stacked side "
                    f"waives the thin floor for its market"
                    if EVENT_DEPTH_STACK_CONTRACTS > 0 else "")
+                + (f"; triggers armed only from "
+                   f"{EVENT_LIVE_GATE_PREARM_SECS / 3600:g}h before the "
+                   f"ticker date (ET) onward, unknown dates always armed")
                 + (f"; {len(self.state.event_live_halt)} event(s) carried in "
                    f"as live-confirmed" if self.state.event_live_halt else ""))
 
