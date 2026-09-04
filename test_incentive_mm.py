@@ -2102,12 +2102,24 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             for s in ("KXSPRLVL", "KXCBDECISIONNZ", "KXCBDISRAEL",
                       "KXVENEZCRUDE", "KXAAAGASMINM", "KXAAAGASMAXM",
                       "KXBRAZILGDP", "KXJOLTSOPEN", "KXDATACENTCON",
-                      "KXWENBACONATOR", "KXTBCRUNCHWRAP"):
+                      "KXWENBACONATOR", "KXTBCRUNCHWRAP",
+                      # 2026-09-04 additions: company-KPI set + the two
+                      # state statistics Jack asked after by name
+                      "KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM",
+                      "KXBBY", "KXWSM", "KXOKTA", "KXTXOIL", "KXVAPORTTEU"):
                 self.assertIn(s, imm.FINECON_SERIES, s)
                 self.assertTrue(
                     IncentiveMarketMaker._allowed(f"{s}-26OCT13-T1"), s)
                 self.assertTrue(imm.series_safe_join(s), s)
                 self.assertEqual(imm.series_min_est_rate(s), 0.0, s)
+            # the KPI members' release guard: the overrides task must treat
+            # them as company-disclosure series with a Nasdaq symbol to
+            # resolve the report time (their tickers carry no day, so the
+            # midnight-ET rule can never protect a report-week period).
+            import imm_earnings_overrides as ieo
+            for s in imm._FINECON_KPI_SERIES.split(","):
+                self.assertIn(s, ieo.COMPANY_DISCLOSURE_SERIES, s)
+                self.assertIn(s, ieo.COMPANY_TICKERS, s)
             for s in ("KXAAAGASMINM", "KXAAAGASMAXM"):
                 self.assertEqual(imm.SERIES_OVERRIDES[s].blackout_et,
                                  imm.SERIES_OVERRIDES["KXAAAGASM"].blackout_et,
@@ -2146,8 +2158,16 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                for i in range(4)]
         wen = [m("KXWENBACONATOR-26OCT02-T8.5", 0.05)]
         rain = [m("KXRAINNYC-26SEP03-X", 50.0)]     # not in the group
-        cut = imm.finecon_group_cut(spr + nz + vz + gas + wen + rain,
-                                    incumbent=set())
+        # default cap is 15 since 2026-09-04 (Jack "increase from 10 to
+        # 15"); the walk-semantics assertions below pin 10 so the slot
+        # competition they encode stays exercised.
+        self.assertEqual(imm.FINECON_TOP_N, 15)
+        try:
+            imm.FINECON_TOP_N, _n10 = 10, imm.FINECON_TOP_N
+            cut = imm.finecon_group_cut(spr + nz + vz + gas + wen + rain,
+                                        incumbent=set())
+        finally:
+            imm.FINECON_TOP_N = _n10
         kept = {x.ticker for x in spr + nz + vz + gas + wen} - cut
         self.assertEqual(len(kept), 10)
         self.assertEqual(sum(1 for t in kept if t.startswith("KXSPRLVL")), 3)
@@ -5328,7 +5348,40 @@ class TestLiveEventDepthGate(unittest.TestCase):
         imm.EVENT_DEPTH_GATE_PREFIXES = ("KXGOOD",)
         self.addCleanup(setattr, imm, "EVENT_DEPTH_GATE_PREFIXES",
                         self._prefixes)
+        # Date arm (Jack 2026-09-04, commit 37f16a7): known-FUTURE ticker
+        # dates suppress every live trigger — which is exactly this class's
+        # 99DEC31 fixtures, so the gate-logic tests here all went red when
+        # the arm shipped. Arm unconditionally so they keep testing the
+        # gate itself; the arming rule has its own test below.
+        self._prearm = imm.EVENT_LIVE_GATE_PREARM_SECS
+        imm.EVENT_LIVE_GATE_PREARM_SECS = float("inf")
+        self.addCleanup(setattr, imm, "EVENT_LIVE_GATE_PREARM_SECS",
+                        self._prearm)
         self.addCleanup(_clean_persist)
+
+    def test_date_arm_suppresses_triggers_before_ticker_day(self):
+        # Jack 2026-09-04: triggers fire "only when 1/ the date of the
+        # event is not known or 2/ the date of the event is known and is
+        # the current date" — a Sep 8 speech cannot be live on Sep 4, so
+        # with the REAL pre-arm the far-future fixture must NOT halt on a
+        # thin book...
+        imm.EVENT_LIVE_GATE_PREARM_SECS = self._prearm
+        try:
+            bot = self._bot(no_b=200)          # thin: halts when armed
+            bot.run_cycle()
+            self.assertNotIn(self.EV, bot.state.event_depth_halt)
+            self.assertTrue(self._event_orders(bot))
+            # ...and the arming primitive: unknown date / past date ->
+            # armed, known-future -> suppressed.
+            now_ts = time.time()
+            self.assertTrue(
+                imm.event_live_gate_armed("KXGOOD-NODATE", now_ts))
+            self.assertTrue(
+                imm.event_live_gate_armed("KXGOOD-20AUG01", now_ts))
+            self.assertFalse(
+                imm.event_live_gate_armed("KXGOOD-99DEC31", now_ts))
+        finally:
+            imm.EVENT_LIVE_GATE_PREARM_SECS = float("inf")
 
     def _bot(self, yes_a=1200, no_a=1200, yes_b=1200, no_b=1200):
         _clean_persist()

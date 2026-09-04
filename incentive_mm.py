@@ -1408,8 +1408,10 @@ _DEFAULT_RATES_SERIES = ("KXUST2AD,KXUST5AD,KXUST7AD,KXUST10AD,KXUST30AD,"
 #   KXWENBACONATOR/KXTBCRUNCHWRAP  Spice-Data fast-food price monthlies
 #                   (the KXCHIPBURRITO class Jack nowcasts; glacial stat,
 #                   extremes stand down via the 5-90 mid screen)
-# REJECTED and why (so the next sweep doesn't relitigate): KXEURUSD/AW +
-# KXUSDJPY (Pyth live FX feed), KXCAC40/KXHSI/KXRUT (live index), KXFEAR
+# REJECTED and why (so the next sweep doesn't relitigate — the test, per
+# Jack 2026-09-04, is whether the settling release lands INSIDE a paying
+# program window, not the market's close date or hold length): KXEURUSD/AW
+# + KXUSDJPY (Pyth live FX feed), KXCAC40/KXHSI/KXRUT (live index), KXFEAR
 # (live CNN index), KXTXERCOTPEAK/D + KXPJMEMERGENCY (realtime grid data),
 # KXUSOPENPRICE (live resale-ticket feed, matchup news), KXDDR5EMS/MS (Ornn
 # daily prints -> knowable monthly drift, busy book, the GPU-class capacity
@@ -1421,12 +1423,28 @@ _DEFAULT_RATES_SERIES = ("KXUST2AD,KXUST5AD,KXUST7AD,KXUST10AD,KXUST30AD,"
 # KXSNOWCRABCATCH (TAC announces ~Oct 6, cutoff Oct 9 -> quotes through
 # it), KXSOCKEYERUN (ADF&G forecast ~Nov 13, cutoff Nov 27 -> same),
 # KXWATECHEMP/KXWAAEROEMP (monthly BLS state prints quoted through for a
-# 6-8mo hold at ~3% ROI), company KPIs (earnings adverse selection), the
-# ad-spend family (safe but ROI <= 1.5%/day — never contends for a slot).
+# 6-8mo hold at ~3% ROI), the ad-spend family (safe but ROI <= 1.5%/day —
+# never contends for a slot).
+# Company-KPI set ENROLLED 2026-09-04 (Jack: "yes company-KPI set should
+# be in the scan", REVERSING the day-1 blanket rejection after his release-
+# vs-program-window correction: current weekly periods end months before
+# the Q3 reports, so in-window quoting is release-free). The period that
+# DOES span a report is guarded the way the enrolled company series
+# already are: imm_earnings_overrides.py treats these as company-
+# disclosure series (via _FINECON_KPI_SERIES below) and writes a release-
+# time cutoff into event_start_overrides. Kept as a named sub-constant so
+# that task can key coverage off exactly this set.
+_FINECON_KPI_SERIES = (
+    "KXDKS,KXZM,KXURBN,KXLOW,KXDG,KXAFRM,KXBBY,KXWSM,KXOKTA")
+# KXTXOIL + KXVAPORTTEU added same day (Jack asked after them by name):
+# lagged official state statistics (RRC/EIA production, port authority
+# TEU) — nothing publishes inside a weekly paying window; excluded on
+# day 1 only for ROI, which is the walk's job to judge, not the screen's.
 _DEFAULT_FINECON_SERIES = (
     "KXSPRLVL,KXCBDECISIONNZ,KXCBDISRAEL,KXVENEZCRUDE,"
     "KXAAAGASMINM,KXAAAGASMAXM,KXBRAZILGDP,KXJOLTSOPEN,KXDATACENTCON,"
-    "KXWENBACONATOR,KXTBCRUNCHWRAP")
+    "KXWENBACONATOR,KXTBCRUNCHWRAP,KXTXOIL,KXVAPORTTEU,"
+    + _FINECON_KPI_SERIES)
 FINECON_SERIES = frozenset(
     s for s in os.environ.get("IMM_ALLOW_FINECON_SERIES",
                               _DEFAULT_FINECON_SERIES).split(",") if s)
@@ -1455,7 +1473,9 @@ ALLOW_SERIES = frozenset(
 # enters until attrition frees slots. KXAAAGASMINM/MAXM also pass the
 # KXAAAGAS:3 EVENT_TOP_N first — members ride through it via the same
 # quote-to-completion immunity (see event_top_n_cut). <=0 disables a knob.
-FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 10)
+# 10 -> 15 (Jack 2026-09-04 "increase from 10 to 15 markets", with the
+# same-day KPI + state-stat enrollments widening the candidate pool).
+FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 15)
 FINECON_EVENT_TOP_N = _env_int("IMM_FINECON_EVENT_TOP_N", 3)
 
 

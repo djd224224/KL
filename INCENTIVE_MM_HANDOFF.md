@@ -649,3 +649,37 @@ cents-a-day rates on quiet long windows are where the absolute-$1
 projection is noisiest). Members leave ONLY by natural completion
 (cutoff/close/program end) or a safety screen stand-down — screens,
 bands, blackouts and budget were deliberately NOT loosened.
+
+## 2026-09-04 — finecon widened: KPI set + state stats, top-15, digest tracker (Jack)
+
+Jack, correcting the day-1 risk frame: what matters is whether the
+settling release lands INSIDE a paying program window — "as long as its
+not live during the incentive period duration it should be safe" — not
+the market's close date. Under that test the company-KPI set is clean
+(weekly periods end months before the Q3 reports) and is ENROLLED into
+the finecon group: KXDKS, KXZM, KXURBN, KXLOW, KXDG, KXAFRM, KXBBY,
+KXWSM, KXOKTA (`_FINECON_KPI_SERIES`), plus KXTXOIL + KXVAPORTTEU (lagged
+state statistics he asked after by name; day-1 exclusion was ROI-only).
+Report-week periods get the release-time guard the other company series
+already have: imm_earnings_overrides.py now includes the KPI set in
+COMPANY_DISCLOSURE_SERIES + COMPANY_TICKERS (their tickers carry no day,
+so the midnight-ET rule can never protect them — the override IS the
+guard). Group cap 10 -> 15 (IMM_FINECON_TOP_N; "increase from 10 to 15
+markets"), per-event 3 unchanged.
+
+Payout-floor basis: confirmed ALREADY per Jack's spec — `_quotable_days`
+projects est over the REMAINING program window (to program end, capped
+by cutoff/close), so verdicts renew at each period rollover; no change.
+
+Tracking ("make sure im able to track performance of these"): the daily
+digest (send_imm_digest.py) grew a FINECON SWEEP section — members with
+period-to-date accrual est + net inventory, group past-day/week trading
+P&L from the same per-event windows as the events table, and
+Kalshi-CREDITED rewards on group events from the recon ledger (the only
+actual-money number; credits land 1-2d after period end).
+
+Also in this commit: TestLiveEventDepthGate repaired — 37f16a7 (the
+date-arm) landed with all 11 gate tests red because the class's 99DEC31
+fixtures are exactly the known-future dates the arm suppresses. setUp now
+arms unconditionally (inf pre-arm) so gate logic stays tested, and the
+arm rule itself got the test it shipped without.

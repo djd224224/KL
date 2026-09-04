@@ -136,6 +136,13 @@ COMPANY_TICKERS = {
     "KXRACE": "RACE", "KXTLN": "TLN", "KXTLNA": "TLN", "KXWING": "WING",
     "KXWINGA": "WING", "KXFSLR": "FSLR", "KXFSLRA": "FSLR", "KXYOU": "YOU",
     "KXBA": "BA", "KXRDDT": "RDDT", "KXCOINBASE": "COIN",
+    # Finecon KPI sweep (Jack 2026-09-04 "yes company-KPI set should be in
+    # the scan"): these live in incentive_mm._FINECON_KPI_SERIES (the
+    # finecon top-N group), not _DEFAULT_COMPANY_SERIES, but their release
+    # guard is THIS map + the disclosure sweep below.
+    "KXDKS": "DKS", "KXZM": "ZM", "KXURBN": "URBN", "KXLOW": "LOW",
+    "KXDG": "DG", "KXAFRM": "AFRM", "KXBBY": "BBY", "KXWSM": "WSM",
+    "KXOKTA": "OKTA",
 }
 _nasdaq_cache: dict = {}
 
@@ -483,8 +490,15 @@ _CONSUMER_PRICE_SERIES = {
     # this; the comprehension below applies it.
     "KXBKFT", "KXYUMTBFT"}
 _CONSUMER_OBS_SUFFIXES = ("FT", "APP")
+# The finecon KPI series (enrolled 2026-09-04 via the finecon group, not
+# the company allowlist) settle on earnings press-release numbers exactly
+# like the rest of this set, so they get the same release-time cutoffs —
+# without this, a program period spanning a report week would quote
+# straight through the release (no day in tickers like KXZM-26NOVCUST100K,
+# so the midnight-ET rule never fires for them).
 COMPANY_DISCLOSURE_SERIES = {
-    s for s in imm._DEFAULT_COMPANY_SERIES.split(",")
+    s for s in (imm._DEFAULT_COMPANY_SERIES + ","
+                + getattr(imm, "_FINECON_KPI_SERIES", "")).split(",")
     if s and s not in _CONSUMER_PRICE_SERIES
     and not s.endswith(_CONSUMER_OBS_SUFFIXES)}
 # Only surface events whose (unreliable) occurrence is within this many days,

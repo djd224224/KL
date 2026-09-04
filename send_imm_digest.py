@@ -1710,6 +1710,99 @@ def _cutoff_audit_html(a: dict) -> str:
                 'failed ({}).</div>'.format(repr(e)))
 
 
+def finecon_section(state, w, today_ct):
+    """(text_lines, html) — the Finance/Econ sweep tracker (Jack 2026-09-04
+    "make sure im able to track performance of these"). Three layers, most
+    trustworthy last: current members with the bot's period-to-date accrual
+    ESTIMATE and net inventory; the group's past-day/week TRADING result
+    (fill-attributed, from the same per-event windows the events table
+    uses); and Kalshi-CREDITED rewards on group events from the recon
+    ledger — the only number that is actual paid money."""
+    fin = getattr(imm, "FINECON_SERIES", frozenset())
+    if not fin:
+        return [], ""
+
+    def _is_fin(ticker_or_event):
+        return ticker_or_event.split("-")[0] in fin
+
+    members = sorted(t for t in (state.get("selected_tickers") or [])
+                     if _is_fin(t))
+    accrued = state.get("accrued_est") or {}
+    own_pos = state.get("own_pos") or {}
+    top_n = getattr(imm, "FINECON_TOP_N", 0)
+
+    def _win_pnl(key):
+        evs = (w.get(key) or {}).get("events") or {}
+        tot, n = 0.0, 0
+        for ev, e in evs.items():
+            if _is_fin(ev):
+                tot += e["realized"] + e["settle"] + e["unrealized"]
+                n += 1
+        return tot, n
+
+    day_pnl, day_n = _win_pnl("day")
+    week_pnl, week_n = _win_pnl("week")
+    rows, _calib = load_credit_ledger()
+    fin_credits = [(d, ev, a) for d, ev, a in rows if _is_fin(ev)]
+    cred_life = sum(a for _d, _e, a in fin_credits)
+    week_dates = {(today_ct - timedelta(days=i)).isoformat()
+                  for i in range(0, 8)}
+    cred_week = sum(a for d, _e, a in fin_credits if d in week_dates)
+    acc_sum = sum(_f(accrued.get(t)) for t in members)
+
+    L = []
+    L.append("FINECON SWEEP (Finance/Econ, top-{} by ROI, "
+             "quote-to-completion)".format(top_n))
+    L.append("Quoting {}/{} slots; est accrued this period ${:,.2f} across "
+             "members.".format(len(members), top_n, acc_sum))
+    if members:
+        L.append("{:36s} {:>9s} {:>7s}".format("MEMBER", "ACCRUED$", "POS"))
+        for t in members:
+            L.append("{:36s} {:>9.2f} {:>+7.0f}".format(
+                t[:36], _f(accrued.get(t)), _f(own_pos.get(t))))
+    else:
+        L.append("  (no members quoting right now)")
+    L.append("Group trading P&L: past day {:+,.2f} ({} events), past week "
+             "{:+,.2f} ({} events).".format(day_pnl, day_n, week_pnl, week_n))
+    L.append("Kalshi-CREDITED rewards on group events: past 7d ${:,.2f}, "
+             "all-time ${:,.2f}{}.".format(
+                 cred_week, cred_life,
+                 "" if fin_credits else " (none in ledger yet — credits land "
+                 "1-2d after each period ends)"))
+
+    h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
+         'Finecon sweep <span style="color:#888;font-weight:400">'
+         '&mdash; top-{} by ROI, quote-to-completion</span></div>'.format(top_n)]
+    h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
+             'quoting <b>{}/{}</b> slots &nbsp;&middot;&nbsp; est accrued '
+             'this period ${:,.2f} &nbsp;&middot;&nbsp; trading P&amp;L day '
+             '{} / week {} &nbsp;&middot;&nbsp; Kalshi-credited 7d '
+             '<b>${:,.2f}</b> / all-time <b>${:,.2f}</b></div>'.format(
+                 len(members), top_n, acc_sum, _pnl_span(day_pnl),
+                 _pnl_span(week_pnl), cred_week, cred_life))
+    if members:
+        h.append('<table style="border-collapse:collapse">')
+        h.append('<tr style="background:#f0f0f0;font-weight:600">'
+                 '<td style="{0}">MEMBER</td><td style="{1}">ACCRUED$ (est)</td>'
+                 '<td style="{1}">POS</td></tr>'.format(TDL, TD))
+        for i, t in enumerate(members):
+            h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
+                     '<td style="{3}">{4:,.2f}</td>'
+                     '<td style="{3}">{5:+,.0f}</td></tr>'.format(
+                         "#fafafa" if i % 2 else "#fff", TDL, t, TD,
+                         _f(accrued.get(t)), _f(own_pos.get(t))))
+        h.append('</table>')
+    else:
+        h.append('<div style="color:#666;font-size:13px">no members quoting '
+                 'right now.</div>')
+    h.append('<div style="color:#888;font-size:12px;margin-top:4px">ACCRUED '
+             'is the bot&rsquo;s estimator, period-to-date; CREDITED is '
+             'actual Kalshi money from the recon ledger (lands 1&ndash;2d '
+             'after each period ends). Members ride to natural completion, '
+             'so a slot only frees at settlement/cutoff.</div>')
+    return L, "".join(h)
+
+
 def build_digest(now_utc: datetime):
     """Returns (plain_text, html)."""
     today_ct = now_utc.astimezone(CT).date()
@@ -1842,6 +1935,10 @@ def build_digest(now_utc: datetime):
                      e_tot["unrealized"], e_tot["contracts"], e_tot["mkts"]))
     else:
         L.append("  (no fills in the past 24h)")
+    fin_L, fin_html = finecon_section(state, w, today_ct)
+    if fin_L:
+        L.append("")
+        L.extend(fin_L)
     L.append("")
     L.append(health)
     text = "\n".join(L)
@@ -1993,6 +2090,8 @@ def build_digest(now_utc: datetime):
         h.append("</table>")
     else:
         h.append("<div>No fills in the past 24h.</div>")
+    if fin_html:
+        h.append(fin_html)
     h.append('<div style="color:#777;font-size:12px;margin-top:12px;'
              'border-top:1px solid #eee;padding-top:8px">{}</div>'.format(health))
     h.append("</div>")
