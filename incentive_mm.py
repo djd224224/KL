@@ -366,8 +366,16 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 #      EXTERNAL depth (book minus our own resting orders, which would
 #      otherwise mask the withdrawal) is under EVENT_DEPTH_MIN_CONTRACTS on
 #      EITHER side stands down its WHOLE EVENT: every sibling market is
-#      cancelled and none quote. A market that WAS two-sided and lost a
-#      touch entirely is the same signal, louder.
+#      cancelled and none quote. EXCEPTION (Jack 2026-09-04 "tolerate
+#      one-sided scrap stacks", the SEP08 false-live): a market carrying
+#      EVENT_DEPTH_STACK_CONTRACTS+ on either side is a junk-stacked book,
+#      and sub-floor depth OPPOSITE a stack is that market's normal
+#      lopsided shape (SEP08-AFFO: 856 yes vs 52,472 no, six days before
+#      the speech), not a withdrawal — such a market never reads thin.
+#      Liveness on stacked books is the tripwire's + jump confirm's job
+#      (point 5: whole-side depth structurally can't see it there anyway).
+#      A market that WAS two-sided and lost a touch entirely is the same
+#      signal, louder — and is NOT waived by a stack.
 #   3. a strike that JUMPS from inside the band to OUTSIDE it by
 #      EVENT_DEPTH_JUMP_CENTS+ in one cycle (49c -> 99c: the word got said
 #      and the strike settled in practice) CONFIRMS the event live — that
@@ -416,6 +424,12 @@ EVENT_DEPTH_RESUME_SECS = _env_int("IMM_EVENT_DEPTH_RESUME_SECS", 900)
 # band on its first out-of-band cycle, so it can never accumulate into a
 # false confirm.
 EVENT_DEPTH_JUMP_CENTS = _env_float("IMM_EVENT_DEPTH_JUMP", 8)
+# Scrap-stack tolerance (point 2 exception): a side this deep is a junk
+# stack nobody is pulling out of, so the opposite side escaping the floor
+# is not the withdrawal signature. 10x the floor keeps every modest
+# two-way trip intact (SEP02 CRYP read 966/1457 — still trips) while
+# waiving the blatant stacks (52k+). 0 disables the tolerance.
+EVENT_DEPTH_STACK_CONTRACTS = _env_float("IMM_EVENT_DEPTH_STACK", 10000)
 # Fill tripwire (point 5 above): own-book move per cycle that stands the
 # event down, and how many such bursts on one event confirm it LIVE for
 # good. 15 = the old fill-burst breaker's bar, sane against routine
@@ -4772,8 +4786,10 @@ class IncentiveMarketMaker:
         if series_event_depth_gated(meta.series) \
                 and pad_band_ok(meta.series, ext_b, ext_a):
             d_yes, d_no = external_depths(yes_levels, no_levels, own_live)
-            if d_yes < EVENT_DEPTH_MIN_CONTRACTS \
-                    or d_no < EVENT_DEPTH_MIN_CONTRACTS:
+            stacked = (EVENT_DEPTH_STACK_CONTRACTS > 0
+                       and max(d_yes, d_no) >= EVENT_DEPTH_STACK_CONTRACTS)
+            if not stacked and (d_yes < EVENT_DEPTH_MIN_CONTRACTS
+                                or d_no < EVENT_DEPTH_MIN_CONTRACTS):
                 first = meta.event_ticker not in self.state.event_depth_halt
                 self.state.event_depth_halt[meta.event_ticker] = time.time()
                 if first:
@@ -5623,7 +5639,10 @@ class IncentiveMarketMaker:
                 # got said). Confirms the event LIVE — permanently.
                 jumped_out = (two_sided and pm_in_band and not mid_in_band
                               and abs(mid_g - pm_g) >= EVENT_DEPTH_JUMP_CENTS)
-                thin = (mid_in_band
+                stacked = (EVENT_DEPTH_STACK_CONTRACTS > 0
+                           and max(d_yes, d_no)
+                           >= EVENT_DEPTH_STACK_CONTRACTS)
+                thin = (mid_in_band and not stacked
                         and (d_yes < EVENT_DEPTH_MIN_CONTRACTS
                              or d_no < EVENT_DEPTH_MIN_CONTRACTS))
                 if jumped_out and ev not in self.state.event_live_halt:
@@ -6483,6 +6502,9 @@ class IncentiveMarketMaker:
                 f"in-band for {EVENT_DEPTH_RESUME_SECS // 60}min); a strike "
                 f"jumping out of band by {EVENT_DEPTH_JUMP_CENTS:g}c+ kills "
                 f"the event PERMANENTLY"
+                + (f"; a {EVENT_DEPTH_STACK_CONTRACTS:g}+ stacked side "
+                   f"waives the thin floor for its market"
+                   if EVENT_DEPTH_STACK_CONTRACTS > 0 else "")
                 + (f"; {len(self.state.event_live_halt)} event(s) carried in "
                    f"as live-confirmed" if self.state.event_live_halt else ""))
 
