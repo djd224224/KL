@@ -423,10 +423,23 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 # 2026-08-05 lesson, plus its event-level twin: a thin sibling that never
 # gets SELECTED is invisible to the quote loop, so without the estimator
 # hook the deep strikes of a live event would keep quoting).
+# KXMAMDANIMENTION REMOVED 2026-09-05 (Jack: "turn off the adverse
+# selection filters on MAMDANI mention"). The 9/5 statement showed
+# MAMDANI credits crashing on exactly the gated events — SEP01 (ungated)
+# $12.70/mkt, SEP02 (permanently live-confirmed) $2.13, SEP03 (depth-
+# halted) $1.31 with half its markets never clearing the $1 floor — while
+# a clean day still pays ~$12.70, i.e. the gate, not a pool cut, drove the
+# drop. Jack's call: MAMDANI quotes through liveness now (eats adverse
+# fills on speech days) rather than forgoing the reward. ALL four triggers
+# are prefix-gated, so dropping the prefix disables every one for MAMDANI;
+# TRUMPMENTION stays protected. Re-add here or via IMM_EVENT_DEPTH_SERIES
+# to restore. Existing MAMDANI halts were cleared from imm_state.json the
+# same day (event_live_halt is checked series-independently, so a stale
+# entry would keep an event dead even with the prefix gone).
 EVENT_DEPTH_GATE_PREFIXES = tuple(
     s.strip() for s in os.environ.get(
         "IMM_EVENT_DEPTH_SERIES",
-        "KXTRUMPMENTION,KXMAMDANIMENTION").split(",") if s.strip())
+        "KXTRUMPMENTION").split(",") if s.strip())
 EVENT_DEPTH_MIN_CONTRACTS = _env_float("IMM_EVENT_DEPTH_MIN", 1000)
 # MUST stay > UNIVERSE_REFRESH_SECS (600): an unselected thin sibling is
 # only re-observed by the estimator hook once per refresh, and the halt must
