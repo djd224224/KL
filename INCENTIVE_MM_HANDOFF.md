@@ -730,3 +730,35 @@ burn counter persists (finecon_admit_day/finecon_admits_today in
 imm_state.json — ~20 restarts/day must not refill the day) and resets
 at ET midnight. Digest shows "+used/5 daily openings" in the FINECON
 SWEEP header.
+
+## 2026-09-05 — "Opportunistic IMM" daily email (Jack)
+
+Jack: "add daily email called 'opportunistic IMM' showing a table of the
+events quoted, earning est, P&L, and net." The opportunistic book = the
+finecon sweep (incentive_mm.FINECON_SERIES). New standalone
+`send_opportunistic_imm.py`: one row per currently-quoted finecon EVENT
+with EARN EST$ (bot accrued-reward estimate, period-to-date), P&L$
+(trading: open-book MTM on held inventory + past-day realized/settlement),
+NET$ (P&L + EARN EST), plus MKTS and a plain-English label; TOTAL row;
+footer = actual Kalshi-credited on opportunistic events to date (recon
+ledger). Numbers reuse send_imm_digest's validated helpers
+(pnl_windows/own_book/current_mids/credit ledger) — imported, not
+reimplemented, so a row can't disagree with the digest. Picks up Carbon
+Arc self-extensions via imm.load_finecon_extra_series(). Flags:
+--test (send now, no marker) / --dry / --print (build + print only);
+daily sent-marker idempotency; 8x retry loop; Alerter tag IMM-OPP.
+
+First dry run (2026-09-05): 9 events / 20 markets (openings expanded past
+15), est $32.36/period, trading -$2.10, net +$30.26.
+
+Scheduled "KL imm opportunistic" DAILY 7:25 AM ET (after 7:10 digest,
+7:20 quote-gaps), same principal/settings as quote-gaps (Interactive/
+Limited/jackd, PT2H limit, battery-allowed, StartWhenAvailable). Recreate:
+```powershell
+$arg = '/c "set PYTHONPATH=C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages&& "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe" "C:\Users\jackd\Documents\KL\send_opportunistic_imm.py" >> "C:\Users\jackd\Documents\KL\run-logs\incentive-mm\opportunistic-task.log" 2>&1"'
+Register-ScheduledTask -TaskName 'KL imm opportunistic' -Force `
+  -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $arg) `
+  -Trigger (New-ScheduledTaskTrigger -Daily -At '7:25AM') `
+  -Principal (New-ScheduledTaskPrincipal -UserId 'jackd' -LogonType Interactive -RunLevel Limited) `
+  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2))
+```

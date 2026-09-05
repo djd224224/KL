@@ -6759,5 +6759,27 @@ class TestCallWindowFreeze(unittest.TestCase):
         self.assertIn(self.T, bot.state.managed_extra)
 
 
+class TestOpportunisticEmail(unittest.TestCase):
+    """The 'Opportunistic IMM' daily email (Jack 2026-09-05). Light checks:
+    the module imports (catches syntax/import regressions) and its event
+    labels resolve without a client for mapped families and the ADS suffix
+    (the client path is only the fallback for un-mapped events)."""
+
+    def test_import_and_labels(self):
+        import send_opportunistic_imm as opp
+        # mapped families and the Carbon Arc ad-spend suffix need no client
+        self.assertEqual(opp.event_label(None, "KXSPRLVL-26SEP09"),
+                         "US Strategic Petroleum Reserve level")
+        self.assertEqual(opp.event_label(None, "KXAMZNCC-26OCT07"),
+                         "Amazon credit-card spend")
+        self.assertEqual(opp.event_label(None, "KXFOOTWEARADS-26OCT06"),
+                         "Ad spend (Carbon Arc)")
+        # every base finecon family has a friendly label (no ticker-scheme
+        # leaking into the email) — ADS members are covered by the suffix
+        for s in imm._DEFAULT_FINECON_SERIES.split(","):
+            lbl = opp.event_label(None, f"{s}-26OCT01")
+            self.assertTrue(lbl and not lbl.startswith("KX"), s)
+
+
 if __name__ == "__main__":
     unittest.main()
