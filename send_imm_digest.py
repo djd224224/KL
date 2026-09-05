@@ -1750,11 +1750,19 @@ def finecon_section(state, w, today_ct):
     cred_week = sum(a for d, _e, a in fin_credits if d in week_dates)
     acc_sum = sum(_f(accrued.get(t)) for t in members)
 
+    # Daily over-cap openings (Jack 2026-09-05): show today's burn when the
+    # state's counter day is current — after a quiet midnight the bot may
+    # not have rolled the day yet, so a stale day reads as 0 used.
+    openings_cap = getattr(imm, "FINECON_DAILY_OPENINGS", 0)
+    used = (int(_f(state.get("finecon_admits_today")))
+            if state.get("finecon_admit_day") == today_ct.isoformat() else 0)
+
     L = []
     L.append("FINECON SWEEP (Finance/Econ, top-{} by ROI, "
              "quote-to-completion)".format(top_n))
-    L.append("Quoting {}/{} slots; est accrued this period ${:,.2f} across "
-             "members.".format(len(members), top_n, acc_sum))
+    L.append("Quoting {}/{} slots (+{}/{} daily openings used); est accrued "
+             "this period ${:,.2f} across members.".format(
+                 len(members), top_n, used, openings_cap, acc_sum))
     if members:
         L.append("{:36s} {:>9s} {:>7s}".format("MEMBER", "ACCRUED$", "POS"))
         for t in members:

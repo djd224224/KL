@@ -1463,9 +1463,15 @@ _DEFAULT_FINECON_SERIES = (
     "KXSPORTSBOOKADS,KXBROADLINEADS,KXTEENCLOTHADS,"
     "KXDRPEPPERPOS,KXAMZNCC,"
     + _FINECON_KPI_SERIES)
-FINECON_SERIES = frozenset(
+# MUTABLE since 2026-09-05 (Jack "yes self-extend carbon arc"): the daily
+# overrides task appends new Carbon Arc series to FINECON_EXTRA_FILE and
+# load_finecon_extra_series() (called each refresh, mtime-gated) merges
+# them in, guards them, and — via the FINECON_SERIES check in _allowed —
+# allows them. Base membership stays code-owned here.
+_FINECON_BASE = frozenset(
     s for s in os.environ.get("IMM_ALLOW_FINECON_SERIES",
                               _DEFAULT_FINECON_SERIES).split(",") if s)
+FINECON_SERIES: Set[str] = set(_FINECON_BASE)
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
@@ -1495,14 +1501,28 @@ ALLOW_SERIES = frozenset(
 # same-day KPI + state-stat enrollments widening the candidate pool).
 FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 15)
 FINECON_EVENT_TOP_N = _env_int("IMM_FINECON_EVENT_TOP_N", 3)
+# DAILY OPENINGS (Jack 2026-09-05: "add 5 openings each day to the 15
+# quoted. they dont all need to be used, but its so that new events have
+# a chance to be quoted if high ROI even if the main 15 slots are full").
+# Up to this many admissions per ET day may go THROUGH a full cap —
+# admissions into genuinely free slots (membership below the cap) never
+# consume one. Members admitted this way are ordinary members (sticky,
+# quote-to-completion), so membership can sit above 15 and drains back
+# only through natural completion; while it is above, even freed-by-
+# settlement capacity re-fills only via openings. The used-count lives in
+# BotState (finecon_admit_day/finecon_admits_today), persists across the
+# bot's many restarts, and resets at ET midnight.
+FINECON_DAILY_OPENINGS = _env_int("IMM_FINECON_DAILY_OPENINGS", 5)
 
 
 def finecon_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
-                      members: Set[str] = frozenset()) -> Set[str]:
+                      members: Set[str] = frozenset(),
+                      extra_openings: int = 0) -> Set[str]:
     """Tickers to EXCLUDE under the finecon group cap: group markets that
-    are not already-quoting members and don't win a free slot — newcomers
+    are not already-quoting members and don't win a slot — newcomers
     ranked by ROI, admitted while the group stays within FINECON_TOP_N
-    total and FINECON_EVENT_TOP_N per event (members counted first)."""
+    total (members counted first) plus up to `extra_openings` past that,
+    with FINECON_EVENT_TOP_N per event enforced throughout."""
     if FINECON_TOP_N <= 0:
         return set()
     group = [m for m in metas if m.series in FINECON_SERIES]
@@ -1511,16 +1531,24 @@ def finecon_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
     for m in group:
         if m.ticker in keep:
             per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
+    admit_cap = max(len(keep), FINECON_TOP_N) + max(0, extra_openings)
     newcomers = [m for m in group if m.ticker not in keep]
     newcomers.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
     for m in newcomers:
-        if len(keep) >= FINECON_TOP_N:
+        if len(keep) >= admit_cap:
             break
         if 0 < FINECON_EVENT_TOP_N <= per_event.get(m.event_ticker, 0):
             continue
         keep.add(m.ticker)
         per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
     return {m.ticker for m in group} - keep
+
+
+def finecon_openings_used(n_kept: int, n_members: int) -> int:
+    """How many of a refresh's admissions went THROUGH a full cap: kept
+    beyond both the cap and the pre-refresh membership. In-cap slot fills
+    are free; only over-cap admissions consume daily openings."""
+    return max(0, n_kept - max(n_members, FINECON_TOP_N))
 
 # NO-NEW gate (Jack 2026-07-28 pm): series listed here admit NO fresh
 # candidates; members ride sticky to natural death. History: company set
@@ -2185,6 +2213,58 @@ def load_extra_allow_series() -> int:
     EXTRA_ALLOW_SERIES.update(fresh)
     if changed:
         log(f"[IMM] extra allow series: {len(fresh)} enrolled ({changed} changed)")
+    return changed
+
+
+# Finecon self-extension (Jack 2026-09-05 "yes self-extend carbon arc"):
+# the daily overrides task detects new Carbon Arc-sourced series in the
+# programs feed and appends them here; the bot merges them into
+# FINECON_SERIES (group walk + caps + _allowed) and applies the standard
+# finecon guard (safe-join, no rate bar) on first sight. Same mtime
+# hot-reload and blocklist-wins safety as the extra-allow file; format
+# {"series": [...]}. Removing a line drops group membership on the next
+# refresh (a removed series that is still quoting deselects through the
+# normal path — the file is the source of truth for the EXTRA portion,
+# _FINECON_BASE stays code-owned).
+FINECON_EXTRA_FILE = os.path.join(STATUS_DIR, "finecon_extra_series.json")
+_finecon_extra_state = {"mtime": 0.0}
+
+
+def load_finecon_extra_series() -> int:
+    try:
+        mtime = os.path.getmtime(FINECON_EXTRA_FILE)
+    except OSError:
+        return 0
+    if mtime == _finecon_extra_state["mtime"]:
+        return 0
+    _finecon_extra_state["mtime"] = mtime
+    try:
+        with open(FINECON_EXTRA_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! finecon extra file unreadable: {e}")
+        return 0
+    fresh: Set[str] = set()
+    for s in data.get("series") or []:
+        s = str(s).strip()
+        if not s or not s.startswith("KX"):
+            continue
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
+            log(f"[IMM] ! refused blocklisted series in finecon extra: {s}")
+            continue
+        fresh.add(s)
+    target = _FINECON_BASE | fresh
+    changed = len(target ^ FINECON_SERIES)
+    if changed:
+        for s in target - FINECON_SERIES:
+            if s not in SERIES_OVERRIDES:
+                SERIES_OVERRIDES[s] = SeriesOverride(
+                    min_est_per_day=_env_float("IMM_FINECON_MIN_RATE", 0.0),
+                    safe_join=True)
+        FINECON_SERIES.clear()
+        FINECON_SERIES.update(target)
+        log(f"[IMM] finecon extra series: {len(fresh)} extended "
+            f"({changed} changed)")
     return changed
 
 
@@ -3554,6 +3634,10 @@ class BotState:
     #   hopeless-exit / entry-floor credit: accrued + projection vs the $1 bar.
     rain_dir_done: Dict[str, float] = field(default_factory=dict)  # ticker -> entry ts
     #   (rain-directional once-per-market dedupe; persisted, pruned at 7d)
+    finecon_admit_day: str = ""     # ET date the openings counter belongs to
+    finecon_admits_today: int = 0   # over-cap admissions burned today (of
+    #   FINECON_DAILY_OPENINGS); persisted — ~20 restarts/day must not
+    #   refill the day's openings
     programmed: Set[str] = field(default_factory=set)   # markets with a LIVE incentive
     #   program at the last universe refresh — the no-rent freeze (Jack 2026-07-26,
     #   KXRT: "why still quoting when the rewards have expired") keys off this
@@ -3747,6 +3831,11 @@ class IncentiveMarketMaker:
                                       (data.get("accrued_est") or {}).items()}
             self.state.hopeless_since = {str(t): float(v) for t, v in
                                          (data.get("hopeless_since") or {}).items()}
+            # finecon openings: day mismatch is resolved at refresh (reset),
+            # so restore unconditionally here
+            self.state.finecon_admit_day = str(data.get("finecon_admit_day") or "")
+            self.state.finecon_admits_today = int(
+                data.get("finecon_admits_today") or 0)
             # MIGRATION (2026-08-04, first load after the paid-basis counters
             # shipped): a state file written by the old code has accrued_est
             # but no paid_crossed, so every carried market sitting above the
@@ -3885,6 +3974,10 @@ class IncentiveMarketMaker:
                            "rain_dir_done": {t: round(v, 1)
                                              for t, v in self.state.rain_dir_done.items()
                                              if time.time() - v < 7 * 86400},
+                           # finecon daily-openings counter: restart-proof
+                           # or every deploy would refill the day's 5
+                           "finecon_admit_day": self.state.finecon_admit_day,
+                           "finecon_admits_today": self.state.finecon_admits_today,
                            # live-event depth halts (pruned with the same 7d
                            # TTL: mention events settle within a day, this
                            # just stops dead events accreting)
@@ -4357,7 +4450,11 @@ class IncentiveMarketMaker:
         if not ALLOWLIST_ONLY:
             return True
         series = ticker.split("-")[0]
+        # FINECON_SERIES checked live (not just via the import-time
+        # ALLOW_SERIES merge): task-appended Carbon Arc extensions must
+        # be allowed the same refresh they join the group.
         return series in ALLOW_SERIES or series in EXTRA_ALLOW_SERIES or \
+            series in FINECON_SERIES or \
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
@@ -4368,6 +4465,7 @@ class IncentiveMarketMaker:
         # no restart needed.
         load_file_event_overrides()
         load_extra_allow_series()
+        load_finecon_extra_series()
         load_rain_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
@@ -4694,11 +4792,29 @@ class IncentiveMarketMaker:
         # Finecon GROUP top-N (Jack 2026-09-02 — see finecon_group_cut):
         # after the per-event cut so a gas-monthly strike trimmed there can
         # never re-enter through the group walk; admission-only for the
-        # slots the quote-to-completion members leave free.
-        fin_cut = finecon_group_cut(ranked, prev_selected, members=fin_sticky)
+        # slots the quote-to-completion members leave free, plus the daily
+        # openings (Jack 2026-09-05) — up to FINECON_DAILY_OPENINGS
+        # over-cap admissions per ET day so a fresh high-ROI event can
+        # enter even with all 15 slots held.
+        et_today = now_utc.astimezone(ET).date().isoformat()
+        if self.state.finecon_admit_day != et_today:
+            self.state.finecon_admit_day = et_today
+            self.state.finecon_admits_today = 0
+        openings_left = max(0, FINECON_DAILY_OPENINGS
+                            - self.state.finecon_admits_today)
+        fin_cut = finecon_group_cut(ranked, prev_selected,
+                                    members=fin_sticky,
+                                    extra_openings=openings_left)
         if fin_cut:
             skipped["finecon_top_n"] = len(fin_cut)
             ranked = [m for m in ranked if m.ticker not in fin_cut]
+        kept_group = sum(1 for m in ranked if m.series in FINECON_SERIES)
+        used = finecon_openings_used(kept_group, len(fin_sticky))
+        if used:
+            self.state.finecon_admits_today += used
+            log(f"{self.tag} finecon daily openings: {used} used this "
+                f"refresh ({self.state.finecon_admits_today}"
+                f"/{FINECON_DAILY_OPENINGS} today)")
 
         selected: Dict[str, MarketMeta] = {}
         collateral = 0.0

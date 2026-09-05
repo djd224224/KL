@@ -452,21 +452,58 @@ def enroll_new_series(client, dry: bool):
             enrolled.append((s, why, sample))
         elif verdict == "review":
             review.append((s, why, sample))
+    # Carbon Arc self-extension (Jack 2026-09-05 "yes self-extend carbon
+    # arc"): a REVIEW series whose Kalshi settlement source is Carbon Arc
+    # is a dated-observation vendor print — the finecon class — so it
+    # joins the finecon group file (hot-reloaded by the bot into
+    # FINECON_SERIES: group walk, caps, guards, allowance) instead of
+    # waiting in the review email. One /series read per NOVEL series per
+    # run; everything already allowed was skipped above, so the steady
+    # state is zero reads.
+    fin_additions = []
+    still_review = []
+    for s, why, sample in review:
+        if carbon_arc_series(client, s):
+            fin_additions.append(s)
+            enrolled.append((s, "Carbon Arc source -> finecon group", sample))
+        else:
+            still_review.append((s, why, sample))
+    review = still_review
+    if fin_additions and not dry:
+        _merge_series_file(imm.FINECON_EXTRA_FILE, fin_additions)
+        log(f"finecon-extended {len(fin_additions)} Carbon Arc series -> "
+            f"{imm.FINECON_EXTRA_FILE}")
     if additions and not dry:
-        try:
-            with open(EXTRA_ALLOW_FILE, encoding="utf-8") as f:
-                data = json.load(f) or {}
-        except (OSError, ValueError):
-            data = {}
-        cur = set(data.get("series") or [])
-        cur.update(additions)
-        os.makedirs(os.path.dirname(EXTRA_ALLOW_FILE), exist_ok=True)
-        tmp = EXTRA_ALLOW_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"series": sorted(cur)}, f, indent=1)
-        os.replace(tmp, EXTRA_ALLOW_FILE)
+        _merge_series_file(EXTRA_ALLOW_FILE, additions)
         log(f"enrolled {len(additions)} new series -> {EXTRA_ALLOW_FILE}")
     return enrolled, review
+
+
+def carbon_arc_series(client, series: str) -> bool:
+    """True when the series' Kalshi settlement sources name Carbon Arc."""
+    try:
+        se = (client.get(f"/series/{series}") or {}).get("series") or {}
+        return any("carbon arc" in str(d.get("name") or "").lower()
+                   for d in (se.get("settlement_sources") or []))
+    except Exception as e:
+        log(f"! series source read failed for {series}: {e}")
+        return False
+
+
+def _merge_series_file(path: str, additions) -> None:
+    """Merge series into a {"series": [...]} json file, atomically."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        data = {}
+    cur = set(data.get("series") or [])
+    cur.update(additions)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"series": sorted(cur)}, f, indent=1)
+    os.replace(tmp, path)
 
 
 # ---- company-disclosure release-time cutoffs (Jack 2026-07-23) --------------

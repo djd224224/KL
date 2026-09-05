@@ -702,3 +702,31 @@ Known gap, deliberate: new Carbon Arc series keep appearing (2 in 3
 days) and do NOT auto-enroll — the daily classifier files unknown shapes
 as review. New siblings need a hand add to _DEFAULT_FINECON_SERIES (or a
 future classifier rule if Jack wants the family to self-extend).
+
+## 2026-09-05 pm — Carbon Arc self-extension + daily openings (Jack)
+
+Jack: "yes self-extend carbon arc" + "add 5 openings each day to the 15
+quoted. they dont all need to be used, but its so that new events have a
+chance to be quoted if high ROI even if the main 15 slots are full."
+
+SELF-EXTENSION: the daily overrides task now source-checks every REVIEW
+series (one /series read per novel series; steady state zero) and files
+Carbon Arc-sourced ones into `finecon_extra_series.json` instead of the
+review email. The bot hot-reloads that file each refresh
+(load_finecon_extra_series, mtime-gated): merges into FINECON_SERIES
+(now a mutable set over the code-owned _FINECON_BASE), applies the
+standard finecon guard on first sight, and _allowed() checks
+FINECON_SERIES live so a task-appended series is quotable the same
+refresh. Blocklist wins as everywhere; removing a line from the file
+drops the extra member through the normal deselect path.
+
+DAILY OPENINGS: IMM_FINECON_DAILY_OPENINGS (5) over-cap admissions per
+ET day. In-cap slot fills are free; only admissions THROUGH a full cap
+burn one (finecon_openings_used: kept beyond max(members, cap)).
+Members admitted via openings are ordinary sticky members, so
+membership can sit above 15 and drains only by completion — while
+above, even settlement-freed capacity re-fills via openings only. The
+burn counter persists (finecon_admit_day/finecon_admits_today in
+imm_state.json — ~20 restarts/day must not refill the day) and resets
+at ET midnight. Digest shows "+used/5 daily openings" in the FINECON
+SWEEP header.

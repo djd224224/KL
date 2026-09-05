@@ -42,6 +42,7 @@ def setUpModule():
         tmp, "imm_order_journal.jsonl")
     imm.EVENT_OVERRIDES_FILE = os.path.join(tmp, "event_start_overrides.json")
     imm.EXTRA_ALLOW_FILE = os.path.join(tmp, "extra_allow_series.json")
+    imm.FINECON_EXTRA_FILE = os.path.join(tmp, "finecon_extra_series.json")
     imm.RAIN_FAIR_FILE = os.path.join(tmp, "rain_fair_values.json")
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
@@ -2225,6 +2226,112 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                                   immune={"KXAAAGASMINM-26SEP30-3.64"})
         self.assertEqual(cut, {"KXAAAGASMINM-26SEP30-3.62",
                                "KXAAAGASMINM-26SEP30-3.63"})
+
+    def test_finecon_daily_openings(self):
+        # Jack 2026-09-05: "add 5 openings each day to the 15 quoted...
+        # so that new events have a chance to be quoted if high ROI even
+        # if the main 15 slots are full."
+        def m(t, est, expo=10.0):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=20.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=expo, est_collateral_dollars=0.0)
+        # a full house: 15 members across 5 events (3 each, cap-legal)
+        members = [m(f"KXSPRLVL-26SEP0{9 + e}-T{i}", 1.0)
+                   for e in range(5) for i in range(3)]
+        mem_ids = {x.ticker for x in members}
+        new = [m("KXAMZNCC-26OCT07-T100", 9.0),
+               m("KXAMZNCC-26OCT07-T102", 8.0),
+               m("KXDRPEPPERPOS-26OCT03-T95", 7.0),
+               m("KXBRAZILGDP-26DEC02-T2.2", 6.0)]
+        # no openings: cap full -> every newcomer cut (yesterday's rule)
+        cut = imm.finecon_group_cut(members + new, set(), members=mem_ids)
+        self.assertEqual(cut, {x.ticker for x in new})
+        # 2 openings: the two best go through the full cap; the rest wait
+        cut = imm.finecon_group_cut(members + new, set(), members=mem_ids,
+                                    extra_openings=2)
+        self.assertEqual(cut, {"KXDRPEPPERPOS-26OCT03-T95",
+                               "KXBRAZILGDP-26DEC02-T2.2"})
+        # openings never override the 3-per-event bound: a 3rd AMZNCC
+        # strike is skipped, the opening flows to the next event instead
+        new3 = new + [m("KXAMZNCC-26OCT07-T104", 8.5)]
+        cut = imm.finecon_group_cut(members + new3, set(), members=mem_ids,
+                                    extra_openings=3)
+        kept = {x.ticker for x in new3} - cut
+        self.assertEqual(kept, {"KXAMZNCC-26OCT07-T100",
+                                "KXAMZNCC-26OCT07-T102",
+                                "KXAMZNCC-26OCT07-T104"})
+        # 3 AMZNCC strikes IS the per-event cap — legal. A 4th AMZNCC
+        # (the event's weakest, T102 at 8.0 vs T106's 8.2) is refused
+        # even with openings to spare; the opening flows on to DRPEPPER.
+        new4 = new3 + [m("KXAMZNCC-26OCT07-T106", 8.2)]
+        cut = imm.finecon_group_cut(members + new4, set(), members=mem_ids,
+                                    extra_openings=5)
+        self.assertIn("KXAMZNCC-26OCT07-T102", cut)
+        self.assertNotIn("KXAMZNCC-26OCT07-T106", cut)
+        self.assertNotIn("KXDRPEPPERPOS-26OCT03-T95", cut)
+        # the openings-burn accounting: only over-cap admissions count
+        self.assertEqual(imm.finecon_openings_used(17, 15), 2)
+        self.assertEqual(imm.finecon_openings_used(15, 15), 0)
+        self.assertEqual(imm.finecon_openings_used(20, 17), 3)
+        self.assertEqual(imm.finecon_openings_used(14, 12), 0)
+
+    def test_finecon_extra_series_hot_reload(self):
+        # Jack 2026-09-05 "yes self-extend carbon arc": the overrides task
+        # appends to FINECON_EXTRA_FILE; the bot merges, guards and allows
+        # on the next refresh. Blocklist still wins; base stays code-owned.
+        fake, blocked = "KXFAKECARB", "KXTRUEV"   # KXTRUEV is blocklisted
+        base_n = len(imm._FINECON_BASE)
+        saved_state = dict(imm._finecon_extra_state)
+
+        def _write(series):
+            with open(imm.FINECON_EXTRA_FILE, "w", encoding="utf-8") as f:
+                json.dump({"series": series}, f)
+            os.utime(imm.FINECON_EXTRA_FILE,
+                     (time.time(), time.time() + len(series)))
+        try:
+            _write([fake, blocked])
+            imm.load_finecon_extra_series()
+            self.assertIn(fake, imm.FINECON_SERIES)
+            self.assertNotIn(blocked, imm.FINECON_SERIES)
+            self.assertTrue(imm.series_safe_join(fake))
+            self.assertEqual(imm.series_min_est_rate(fake), 0.0)
+            imm.ALLOWLIST_ONLY = True
+            try:
+                self.assertTrue(IncentiveMarketMaker._allowed(
+                    f"{fake}-26OCT13-T1"))
+            finally:
+                imm.ALLOWLIST_ONLY = False
+            # removal drops the extra but never the base
+            _write([])
+            imm.load_finecon_extra_series()
+            self.assertNotIn(fake, imm.FINECON_SERIES)
+            self.assertEqual(len(imm.FINECON_SERIES), base_n)
+        finally:
+            imm.SERIES_OVERRIDES.pop(fake, None)
+            imm.FINECON_SERIES.clear()
+            imm.FINECON_SERIES.update(imm._FINECON_BASE)
+            imm._finecon_extra_state.update(saved_state)
+            try:
+                os.remove(imm.FINECON_EXTRA_FILE)
+            except OSError:
+                pass
+
+    def test_carbon_arc_detector(self):
+        import imm_earnings_overrides as ieo
+
+        class _Stub:
+            def __init__(self, name):
+                self._name = name
+
+            def get(self, _path):
+                return {"series": {"settlement_sources": [
+                    {"name": self._name}]}}
+        self.assertTrue(ieo.carbon_arc_series(_Stub("Carbon Arc"), "KXX"))
+        self.assertTrue(ieo.carbon_arc_series(_Stub("carbon arc"), "KXX"))
+        self.assertFalse(ieo.carbon_arc_series(_Stub("AAA"), "KXX"))
 
     def test_family_override_suffix_requires_membership(self):
         # *FT suffix alone (KXNFLDRAFT is never allowlisted) clones nothing...
