@@ -1440,10 +1440,28 @@ _FINECON_KPI_SERIES = (
 # lagged official state statistics (RRC/EIA production, port authority
 # TEU) — nothing publishes inside a weekly paying window; excluded on
 # day 1 only for ROI, which is the walk's job to judge, not the screen's.
+# Carbon Arc family 2026-09-05 (Jack asked after KXFOOTWEARADS/
+# KXELECTRONICSADS/KXDRPEPPERPOS/KXAMZNCC): the ad-spend set moves from
+# the day-1 "ROI never contends" rejection to enrolled — ROI is the
+# walk's call, not the screen's, and the walk now has 15 slots. Enrolled
+# as the WHOLE 11-series family, not the two he named (the 8/31 state-gas
+# lesson: a half-covered family misses the next sibling for a day).
+# KXDRPEPPERPOS + KXAMZNCC are post-scan Carbon Arc listings, same
+# dated-observation shape (monthly index print, ticker date = print day
+# -> midnight-ET exit; AMZNCC OCT strikes est 5.9-11.1%/day at
+# enrollment). The month-to-date panel drip visible to Carbon Arc
+# subscribers is the same accepted residual as the FT/APP families.
+# NOTE new Carbon Arc series keep appearing (2 in the 3 days after the
+# scan); they do NOT auto-enroll — the daily classifier files unknown
+# shapes as review, so new siblings need a hand add here.
 _DEFAULT_FINECON_SERIES = (
     "KXSPRLVL,KXCBDECISIONNZ,KXCBDISRAEL,KXVENEZCRUDE,"
     "KXAAAGASMINM,KXAAAGASMAXM,KXBRAZILGDP,KXJOLTSOPEN,KXDATACENTCON,"
     "KXWENBACONATOR,KXTBCRUNCHWRAP,KXTXOIL,KXVAPORTTEU,"
+    "KXSPORTGOODSADS,KXCASINOADS,KXFITNESSADS,KXVIDEOGAMESADS,"
+    "KXAMUSEMENTADS,KXELECTRONICSADS,KXSTREAMINGADS,KXFOOTWEARADS,"
+    "KXSPORTSBOOKADS,KXBROADLINEADS,KXTEENCLOTHADS,"
+    "KXDRPEPPERPOS,KXAMZNCC,"
     + _FINECON_KPI_SERIES)
 FINECON_SERIES = frozenset(
     s for s in os.environ.get("IMM_ALLOW_FINECON_SERIES",

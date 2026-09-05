@@ -683,3 +683,22 @@ date-arm) landed with all 11 gate tests red because the class's 99DEC31
 fixtures are exactly the known-future dates the arm suppresses. setUp now
 arms unconditionally (inf pre-arm) so gate logic stays tested, and the
 arm rule itself got the test it shipped without.
+
+## 2026-09-05 — Carbon Arc family joins finecon (Jack)
+
+Jack asked after KXFOOTWEARADS-26OCT06, KXELECTRONICSADS-26OCT06,
+KXDRPEPPERPOS-26OCT03, KXAMZNCC-26OCT07. The ADS pair was in the Sep-2
+scan and rejected on ROI alone ("never contends") — under the 15-slot
+walk that judgment belongs to the walk, so the WHOLE 11-series ad-spend
+family is enrolled (state-gas lesson: no half-covered families).
+KXDRPEPPERPOS + KXAMZNCC are post-scan Carbon Arc listings, same
+dated-observation shape (monthly index print, ticker date = print day,
+midnight-ET exit; subscriber panel-drip residual = the accepted FT/APP
+one). AMZNCC's Oct strikes est 5.9-11.1%/day at enrollment — immediate
+slot contenders. Standard finecon guards (safe-join, no rate bar, $1
+floor, group walk 15/3).
+
+Known gap, deliberate: new Carbon Arc series keep appearing (2 in 3
+days) and do NOT auto-enroll — the daily classifier files unknown shapes
+as review. New siblings need a hand add to _DEFAULT_FINECON_SERIES (or a
+future classifier rule if Jack wants the family to self-extend).

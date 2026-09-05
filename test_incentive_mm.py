@@ -2106,7 +2106,12 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                       # 2026-09-04 additions: company-KPI set + the two
                       # state statistics Jack asked after by name
                       "KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM",
-                      "KXBBY", "KXWSM", "KXOKTA", "KXTXOIL", "KXVAPORTTEU"):
+                      "KXBBY", "KXWSM", "KXOKTA", "KXTXOIL", "KXVAPORTTEU",
+                      # 2026-09-05: Carbon Arc dated-observation family —
+                      # a sample of the 11 ad-spend series + the two
+                      # post-scan listings Jack asked after
+                      "KXFOOTWEARADS", "KXELECTRONICSADS", "KXCASINOADS",
+                      "KXDRPEPPERPOS", "KXAMZNCC"):
                 self.assertIn(s, imm.FINECON_SERIES, s)
                 self.assertTrue(
                     IncentiveMarketMaker._allowed(f"{s}-26OCT13-T1"), s)
