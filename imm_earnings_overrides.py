@@ -42,7 +42,7 @@ def _env_from_registry(name: str) -> str:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
             return str(winreg.QueryValueEx(key, name)[0])
-    except OSError:
+    except (OSError, ImportError):     # ImportError: non-Windows (tests)
         return ""
 
 

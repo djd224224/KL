@@ -28,6 +28,17 @@ Reason labels (why a paying market isn't quoted):
   blocklisted / frozen        deliberate config (launcher IMM_BLOCKLIST,
                               FREEZE_SERIES) — positions ride, zero orders
   not in allowlist            series outside ALLOW_* policy (the DDR5 class)
+  excluded family (open-scan) outside the allowlist AND on the open-scan
+                              tier's structural exclusion list (live feeds,
+                              sports, weather, other bots' books)
+  open-scan: <verdict>        in the open-scan tier's universe (2026-09-05):
+                              the tier's cached screen verdict for it —
+                              undated / shape / category:<c> / live_source /
+                              history_range|jump|thin|volume / evicted /
+                              series_struck / tier halted today / screens
+                              pending / eligible (slots, ROI or the live
+                              screens decided). Cached verdicts only — this
+                              script never fetches series or candles.
   no-new gate                 series in run-off (NO_NEW_SERIES), fresh
                               markets barred
   yielded to manual           manual standoff / manual footprint in the event
@@ -71,7 +82,7 @@ def _env_from_registry(name: str) -> str:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
             return str(winreg.QueryValueEx(key, name)[0])
-    except OSError:
+    except (OSError, ImportError):     # ImportError: non-Windows (tests)
         return ""
 
 
@@ -328,6 +339,35 @@ def fmt_window(end, now_utc: datetime) -> str:
     return "til " + local.strftime("%b %d")
 
 
+def scan_gap_label(bot, t: str, now_utc: datetime) -> str:
+    """Why an open-scan-universe market is not quoted, from the live bot's
+    PERSISTED screen caches (imm_state.json) — never a fetch. Order mirrors
+    the bot's own admission order; 'eligible' means every cached screen
+    passed and the walk/slots/ROI (or an uncached live screen) decided."""
+    st = bot.state
+    ev = _event_of(t)
+    if ev in st.scan_evicted_events:
+        return "evicted"
+    if st.scan_halt_day == now_utc.astimezone(imm.ET).date().isoformat():
+        return "tier halted today"
+    strikes = [x for x in st.scan_series_strikes.get(imm.series_of(t), [])
+               if now_utc.timestamp() - x < imm.SCAN_SERIES_STRIKE_TTL_SECS]
+    if 0 < imm.SCAN_SERIES_STRIKE_LIMIT <= len(strikes):
+        return "series_struck"
+    why = imm.scan_shape_reason(t)
+    if why:
+        return why
+    sm = st.scan_series_meta.get(imm.series_of(t))
+    if sm and not sm.get("ok"):
+        return str(sm.get("why") or "series screen")
+    hc = st.scan_history_cache.get(t)
+    if hc and not hc.get("ok"):
+        return str(hc.get("why") or "history screen")
+    if sm and hc:
+        return "eligible (slots/ROI/live screens)"
+    return "screens pending"
+
+
 def classify_and_estimate(client, bot, now_utc: datetime):
     """Returns (event_rows, ctx). Walks every live-program market the bot is
     not currently quoting, classifies why, and estimates what the bot's
@@ -371,7 +411,14 @@ def classify_and_estimate(client, bot, now_utc: datetime):
         if bot._blocked(t):
             reason = "frozen" if series in imm.FREEZE_SERIES else "blocklisted"
         elif not bot._allowed(t):
-            reason = "not in allowlist"
+            su = imm.scan_universe_reason(t) if hasattr(
+                imm, "scan_universe_reason") else "n/a"
+            if su is None:
+                reason = "open-scan: " + scan_gap_label(bot, t, now_utc)
+            elif su == "excluded_family":
+                reason = "excluded family (open-scan)"
+            else:
+                reason = "not in allowlist"
         else:
             reason = None      # resolved after details/screen/estimate
         rows.append({"ticker": t, "event": _event_of(t), "series": series,

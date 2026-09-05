@@ -193,15 +193,22 @@ def ref_depth_mult(anchor: Optional[int], ref_px: Optional[int],
 
 
 def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
-                    book_side: str, hour_mult: float = 1.0) -> float:
+                    book_side: str, hour_mult: float = 1.0,
+                    series: Optional[str] = None) -> float:
     """ref_depth_mult with the TOTAL-multiplier cap applied: hour_mult (the
     factor already baked into the hour-scaled ladder) x the returned ref
     mult never exceeds TOTAL_SIZE_MULT_CAP. Trims the ref contribution only
     — never below 1.0, so an hour mult alone can still exceed the cap by
-    deliberate env choice. THE single accessor for every sizing site."""
+    deliberate env choice. THE single accessor for every sizing site.
+    `series` (2026-09-05): open-scan members cap the deep-reference lever
+    at SCAN_REF_MULT_CAP — an unmeasured family gets the structural safety
+    argument for deeper rungs, not the full 3x size that goes with it."""
     m = ref_depth_mult(anchor, ref_px, book_side)
     if TOTAL_SIZE_MULT_CAP > 0 and hour_mult > 0:
         m = min(m, max(1.0, TOTAL_SIZE_MULT_CAP / hour_mult))
+    if series is not None and SCAN_REF_MULT_CAP > 0 \
+            and series in SCAN_GUARDED_SERIES:
+        m = min(m, max(1.0, SCAN_REF_MULT_CAP))
     return m
 
 
@@ -818,6 +825,12 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     for prefix, hours in SERIES_HOUR_MULTS:
         if series.startswith(prefix) and hour in hours:
             return hours[hour]
+    # Open-scan members (2026-09-05) never take the quiet-hours doubling:
+    # the 3-7am ET x2 was measured on the enrolled families' fill data, and
+    # an unreviewed family has no such measurement behind it. IMM_SCAN_HOUR_
+    # MULT=1 restores the global window for them.
+    if not SCAN_HOUR_MULT and series in SCAN_GUARDED_SERIES:
+        return 1.0
     if not HOUR_SIZE_MULTS:
         return 1.0
     if any(series.startswith(p) for p in HOUR_MULT_EXCLUDE):
@@ -1528,6 +1541,36 @@ FINECON_EVENT_TOP_N = _env_int("IMM_FINECON_EVENT_TOP_N", 3)
 FINECON_DAILY_OPENINGS = _env_int("IMM_FINECON_DAILY_OPENINGS", 5)
 
 
+def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
+                    members: Set[str], top_n: int, event_top_n: int,
+                    extra_openings: int = 0) -> Set[str]:
+    """The shared admission-only group walk (finecon since 2026-09-03; the
+    open-scan tier since 2026-09-05): tickers of `group` to EXCLUDE.
+    Members are never cut and consume their global and per-event slots
+    first; newcomers are admitted best-ROI-first while the group stays
+    within `top_n` total (or the member count, if that is already higher)
+    plus up to `extra_openings` past it, with at most `event_top_n` per
+    event enforced throughout (<=0 = uncapped)."""
+    if top_n <= 0:
+        return set()
+    keep = {m.ticker for m in group if m.ticker in members}
+    per_event: Dict[str, int] = {}
+    for m in group:
+        if m.ticker in keep:
+            per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
+    admit_cap = max(len(keep), top_n) + max(0, extra_openings)
+    newcomers = [m for m in group if m.ticker not in keep]
+    newcomers.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
+    for m in newcomers:
+        if len(keep) >= admit_cap:
+            break
+        if 0 < event_top_n <= per_event.get(m.event_ticker, 0):
+            continue
+        keep.add(m.ticker)
+        per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
+    return {m.ticker for m in group} - keep
+
+
 def finecon_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
                       members: Set[str] = frozenset(),
                       extra_openings: int = 0) -> Set[str]:
@@ -1536,32 +1579,350 @@ def finecon_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
     ranked by ROI, admitted while the group stays within FINECON_TOP_N
     total (members counted first) plus up to `extra_openings` past that,
     with FINECON_EVENT_TOP_N per event enforced throughout."""
-    if FINECON_TOP_N <= 0:
-        return set()
-    group = [m for m in metas if m.series in FINECON_SERIES]
-    keep = {m.ticker for m in group if m.ticker in members}
-    per_event: Dict[str, int] = {}
-    for m in group:
-        if m.ticker in keep:
-            per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
-    admit_cap = max(len(keep), FINECON_TOP_N) + max(0, extra_openings)
-    newcomers = [m for m in group if m.ticker not in keep]
-    newcomers.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
-    for m in newcomers:
-        if len(keep) >= admit_cap:
-            break
-        if 0 < FINECON_EVENT_TOP_N <= per_event.get(m.event_ticker, 0):
-            continue
-        keep.add(m.ticker)
-        per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
-    return {m.ticker for m in group} - keep
+    return _group_walk_cut([m for m in metas if m.series in FINECON_SERIES],
+                           incumbent, members, FINECON_TOP_N,
+                           FINECON_EVENT_TOP_N, extra_openings)
 
 
-def finecon_openings_used(n_kept: int, n_members: int) -> int:
+def _openings_used(n_kept: int, n_members: int, top_n: int) -> int:
     """How many of a refresh's admissions went THROUGH a full cap: kept
     beyond both the cap and the pre-refresh membership. In-cap slot fills
     are free; only over-cap admissions consume daily openings."""
-    return max(0, n_kept - max(n_members, FINECON_TOP_N))
+    return max(0, n_kept - max(n_members, top_n))
+
+
+def finecon_openings_used(n_kept: int, n_members: int) -> int:
+    return _openings_used(n_kept, n_members, FINECON_TOP_N)
+
+
+# ============================================================================
+# OPEN SCAN — the second opportunistic tier (Jack 2026-09-05: "extend the
+# opportunistic IMM with 15 slots and 5 to scan all markets. be very careful
+# for adverse selection").
+#
+# The finecon sweep above is a HAND-CURATED universe: every member family was
+# risk-reviewed by a person for (a) a continuously observable live feed and
+# (b) a settling release inside a paying window. This tier has no curator —
+# its candidate universe is EVERY live-program market the bot does not
+# otherwise quote (not _allowed, not blocklisted/frozen) — so the reviewer is
+# replaced by machine screens that encode what the reviewer looked for, and
+# every screen FAILS CLOSED (missing data = not admitted):
+#   STRUCTURE  a day-dated event ticker (the midnight-ET rule is the only
+#              release guard a series without an override has — KXUE and
+#              KXISMPMI carried no day and would have quoted THROUGH their
+#              prints) and a numeric-threshold strike (a statistic PRINT, not
+#              a "will X happen" binary whose one jump IS the resolution —
+#              strategy doc §1: quiet means the jump hasn't happened yet)
+#   FAMILY     Kalshi category (GET /series, cached) outside the excluded
+#              set, no live-price settlement source, and not a structurally
+#              live family by prefix: FX/index/commodity/crypto/sports/
+#              weather, the 9/2 scan's rejected classes, and every other
+#              repo bot's series so two of our bots never anchor to each
+#              other's quotes (the MAXMON lesson)
+#   ACTIVITY   24h volume under a cap for the market AND its whole event
+#              (informed flow on one strike shows up on its siblings), and
+#              the market listed >= SCAN_MIN_AGE_HOURS so the history read
+#              below has something to say
+#   HISTORY    hourly candlesticks over SCAN_HISTORY_HOURS: enough two-sided
+#              bars, mid range <= SCAN_MAX_RANGE_CENTS, no bar-to-bar jump
+#              >= SCAN_MAX_JUMP_CENTS, traded volume under a cap. A book that
+#              moved is not quiet, whatever its family says.
+# Admitted markets are ordinary members (sticky, quote-to-completion — the
+# finecon lifecycle) but carry their OWN guard set — half ladder, tighter
+# net cap, safe-join, no quiet-hours doubling, deep-reference sizing capped
+# — and three eviction tripwires that run REGARDLESS of IMM_BREAKERS:
+#   1. own-book move >= SCAN_FILL_HALT_CONTRACTS in one cycle (we are being
+#      swept: fills ARE the adverse selection) -> the whole EVENT is evicted
+#      from the tier PERMANENTLY, quotes cancelled, inventory winds down
+#      reduce-only through the ordinary managed_extra path
+#   2. external mid jump >= SCAN_MID_JUMP_CENTS in one cycle, or drift
+#      >= SCAN_DRIFT_CENTS from the mid at admission -> same eviction
+#      (information arrived; this was not the quiet print it looked like)
+#   3. the tier's OWN daily loss budget (SCAN_DAILY_LOSS_LIMIT: realized +
+#      MTM over every market the tier ever admitted) -> every scan member
+#      deselected, no admissions until the next ET day
+# Each eviction also strikes the SERIES; SCAN_SERIES_STRIKE_LIMIT strikes in
+# SCAN_SERIES_STRIKE_TTL bar the whole family. Slots: SCAN_TOP_N with at
+# most SCAN_EVENT_TOP_N per event plus SCAN_DAILY_OPENINGS over-cap
+# admissions per ET day — the finecon walk with its own counters.
+# IMM_SCAN_TOP_N=0 switches the tier off; the normal book never reads
+# these knobs. Guards are applied on first sight (ensure_scan_override) and
+# re-applied from the persisted member list at load, so a restart can never
+# leave a scan member quoting the global 20/side / 150-cap geometry.
+# ============================================================================
+SCAN_TOP_N = _env_int("IMM_SCAN_TOP_N", 15)
+SCAN_EVENT_TOP_N = _env_int("IMM_SCAN_EVENT_TOP_N", 3)
+SCAN_DAILY_OPENINGS = _env_int("IMM_SCAN_DAILY_OPENINGS", 5)
+# Guard geometry: half the global 0:20 ladder (strategy doc §3, class C:
+# "touch size halved"), a 50-contract net cap (the KXTEMP/Love Island
+# precedent for books with unmeasured information regimes), deep-reference
+# sizing capped at 1.5x (global 3.0x).
+SCAN_LEVELS = _parse_levels(os.environ.get("IMM_SCAN_LEVELS", "0:10"))
+SCAN_MAX_POSITION = _env_float("IMM_SCAN_MAX_POSITION", 50)
+SCAN_REF_MULT_CAP = _env_float("IMM_SCAN_REF_MULT_CAP", 1.5)
+SCAN_HOUR_MULT = os.environ.get("IMM_SCAN_HOUR_MULT", "0") == "1"
+# Structure screens (both default ON; each is a knob so Jack can widen the
+# universe deliberately rather than by accident).
+SCAN_REQUIRE_DATED = os.environ.get("IMM_SCAN_REQUIRE_DATED", "1") == "1"
+SCAN_REQUIRE_NUMERIC = os.environ.get("IMM_SCAN_REQUIRE_NUMERIC", "1") == "1"
+SCAN_NUMERIC_STRIKE_TYPES = frozenset(
+    {"greater", "less", "greater_or_equal", "less_or_equal", "between"})
+_SCAN_STRIKE_RE = re.compile(r"^[TB]?-?\d[\d,.]*[A-Z]?$")
+# Activity screens. The 9/2 finecon members all read near-zero 24h volume
+# at enrollment; 60 contracts/day on the market and 250 across its event
+# is "someone is trading this" territory, not a quiet print.
+SCAN_MIN_AGE_HOURS = _env_float("IMM_SCAN_MIN_AGE_H", 24)
+SCAN_MAX_VOLUME_24H = _env_float("IMM_SCAN_MAX_VOLUME_24H", 60)
+SCAN_MAX_EVENT_VOLUME_24H = _env_float("IMM_SCAN_MAX_EVENT_VOLUME_24H", 250)
+# History screen (hourly candlesticks). 12 two-sided bars = half a day of
+# quotes to judge from; a 10c range or a 6c bar-to-bar move inside 72h is a
+# market with information in it; 250 traded contracts over 72h likewise.
+SCAN_HISTORY_HOURS = _env_int("IMM_SCAN_HISTORY_H", 72)
+SCAN_MIN_HISTORY_BARS = _env_int("IMM_SCAN_MIN_HISTORY_BARS", 12)
+SCAN_MAX_RANGE_CENTS = _env_float("IMM_SCAN_MAX_RANGE", 10)
+SCAN_MAX_JUMP_CENTS = _env_float("IMM_SCAN_MAX_JUMP", 6)
+SCAN_MAX_HISTORY_VOLUME = _env_float("IMM_SCAN_MAX_HISTORY_VOLUME", 250)
+SCAN_HISTORY_TTL_SECS = _env_float("IMM_SCAN_HISTORY_TTL_H", 6) * 3600.0
+SCAN_SERIES_META_TTL_SECS = _env_float("IMM_SCAN_SERIES_META_TTL_D", 7) * 86400.0
+# Per-refresh read budgets: the scan universe is ~thousands of markets, so
+# bulk reads, series reads, candle reads and book reads are all bounded;
+# verdicts are cached (and persisted) so the steady state is a handful of
+# reads per refresh as programs roll.
+SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 600)
+SCAN_MAX_BOOKS = _env_int("IMM_SCAN_MAX_BOOKS", 120)
+SCAN_MAX_SERIES_FETCHES = _env_int("IMM_SCAN_MAX_SERIES_FETCHES", 30)
+SCAN_MAX_HISTORY_FETCHES = _env_int("IMM_SCAN_MAX_HISTORY_FETCHES", 40)
+# Eviction tripwires (independent of IMM_BREAKERS). 8 = a 10-lot rung mostly
+# taken in one cycle; routine 1-3 lot crosses stay with inventory skew.
+SCAN_FILL_HALT_CONTRACTS = _env_float("IMM_SCAN_FILL_HALT", 8)
+SCAN_MID_JUMP_CENTS = _env_float("IMM_SCAN_MID_JUMP", 8)
+SCAN_DRIFT_CENTS = _env_float("IMM_SCAN_DRIFT", 15)
+SCAN_DAILY_LOSS_LIMIT = _env_float("IMM_SCAN_DAILY_LOSS_LIMIT", 75.0)
+SCAN_SERIES_STRIKE_LIMIT = _env_int("IMM_SCAN_SERIES_STRIKES", 2)
+SCAN_SERIES_STRIKE_TTL_SECS = _env_float("IMM_SCAN_SERIES_STRIKE_DAYS", 7) * 86400.0
+SCAN_EVICT_TTL_SECS = 30 * 86400.0      # file hygiene only; events settle sooner
+# Kalshi categories the scan never enters, whatever the per-market screens
+# say: information there is news- or feed-driven (a quiet 72h says nothing
+# about the next headline). Culture/Entertainment: box office and chart
+# markets reprice on progressively-known data inside their windows.
+# Economics, Financials (minus the live-feed prefixes), Companies, Science
+# and Technology, Health, World and Transportation remain.
+SCAN_EXCLUDE_CATEGORIES = frozenset(
+    c.strip() for c in os.environ.get(
+        "IMM_SCAN_EXCLUDE_CATEGORIES",
+        "Sports,Crypto,Elections,Politics,Climate and Weather,Culture,"
+        "Entertainment").split(",") if c.strip())
+SCAN_EXCLUDE_PREFIXES = tuple(p for p in os.environ.get(
+    "IMM_SCAN_EXCLUDE_PREFIXES",
+    # OTHER REPO BOTS not already blocklisted, and the weather families the
+    # main book owns or deliberately dropped: low_temp_trading.py
+    # (KXLOWT<CITY>), rain_monthly.py / the 7/26 rain removal (KXRAIN*),
+    # KXHIGH (blocked, restated), the main book's temp/avg-temp/AQI.
+    "KXLOWT,KXRAIN,KXHIGH,KXTEMP,KXAVGT,KXAQI,"
+    # crypto by asset (the fleets' KX<ASSET>D dailies, weekly touch pairs,
+    # and every live-price structure; category=Crypto is the primary
+    # filter, these are the backup when a series read fails)
+    "KXBTC,KXETH,KXSOL,KXXRP,KXDOGE,KXBNB,KXHYPE,KXZEC,KXLTC,KXADA,KXAVAX,"
+    "KXLINK,KXSUI,KXTRX,KXTON,KXSHIB,KXPEPE,KXCRYPTO,"
+    # live FX / index / commodity / grid feeds — the 9/2 scan's rejects and
+    # their siblings (Pyth/CME-settled or realtime operator data)
+    "KXEURUSD,KXUSDJPY,KXGBPUSD,KXUSDCAD,KXUSDCHF,KXAUDUSD,KXUSDCNY,KXUSDMXN,"
+    "KXINX,KXNASDAQ,KXNDX,KXRUT,KXDJI,KXCAC40,KXDAX,KXFTSE,KXHSI,KXNIKKEI,"
+    "KXKOSPI,KXVIX,KXFEAR,KXWTI,KXBRENT,KXGOLD,KXSILVER,KXNATGAS,KXCOPPER,"
+    "KXOIL,KXTXERCOT,KXPJM,KXERCOT,KXUSOPENPRICE,KXDDR5,KXTRUFAIDP,"
+    # single-report pickoff traps / knowable public tallies found 9/2
+    "KXUE,KXISMPMI,KXSKEXPYOY,KXTECHLAYOFF,KXSNOWCRABCATCH,KXSOCKEYERUN,"
+    "KXWATECHEMP,KXWAAEROEMP,"
+    # sports families (category is primary; prefixes are the backup)
+    "KXNFL,KXNBA,KXMLB,KXNHL,KXNCAA,KXUFC,KXPGA,KXF1,KXATP,KXWTA,KXWNBA,"
+    "KXMLS,KXEPL,KXPREMIER,KXUCL,KXLALIGA,KXSERIEA,KXBUNDES,KXLIGUE,KXCFB,"
+    "KXTENNIS,KXGOLF,KXSOCCER,KXBOXING,KXMMA,KXNASCAR,KXMARMAD"
+    ).split(",") if p)
+# A settlement source naming a live price feed / live scoreboard means the
+# market is continuously priceable by everyone but us. Matched case-
+# insensitively against the source name + url from GET /series.
+SCAN_LIVE_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
+    "IMM_SCAN_LIVE_SOURCE_KEYWORDS",
+    "pyth,coinbase,coingecko,coinmarketcap,binance,kraken,cmegroup,cboe,"
+    "tradingview,investing.com,finance.yahoo,espn,nba.com,mlb.com,nfl.com,"
+    "nhl.com,ufc.com,pgatour,formula1,atptour,wtatennis,fifa.com,uefa.com,"
+    "sofascore,flashscore,ercot,pjm.com,caiso,fear-and-greed,weather.gov,"
+    "wunderground,timeanddate,polymarket").split(",") if k.strip())
+# Series currently carrying the scan guard set (see ensure_scan_override):
+# read by hour_size_mult (no quiet-hours doubling) and capped_ref_mult (the
+# deep-reference cap). Rebuilt at load from the persisted member list.
+SCAN_GUARDED_SERIES: Set[str] = set()
+_SCAN_PRIOR_OVERRIDES: Dict[str, Optional[SeriesOverride]] = {}
+
+
+def scan_universe_reason(ticker: str) -> Optional[str]:
+    """String-level membership test for the open-scan universe. None = a
+    scan candidate; otherwise why not (no API call): tier off, allowlist
+    off (everything unblocked is quotable already), blocked, allowed (the
+    normal book's, finecon and the suffix/prefix families included), or an
+    excluded family. `_allowed` itself is untouched — this predicate is
+    the complement of the normal book minus the exclusions."""
+    if SCAN_TOP_N <= 0:
+        return "off"
+    if not ALLOWLIST_ONLY:
+        return "allowlist_off"
+    if IncentiveMarketMaker._blocked(ticker):
+        return "blocked"
+    if IncentiveMarketMaker._allowed(ticker):
+        return "allowed"
+    series = series_of(ticker)
+    if any(series.startswith(p) for p in SCAN_EXCLUDE_PREFIXES):
+        return "excluded_family"
+    return None
+
+
+def scan_shape_reason(ticker: str, strike_type: Optional[str] = None
+                      ) -> Optional[str]:
+    """STRUCTURE screen: 'undated' when the event segment carries no day
+    (no midnight-ET release guard exists for it), 'shape' when the strike
+    is not a numeric threshold (a categorical/binary outcome — the class
+    whose one jump is the resolution). Numeric = the ticker's strike
+    segment reads T286 / B90 / 4.1400 / T1.2M, or Kalshi's strike_type is
+    one of the threshold kinds."""
+    if SCAN_REQUIRE_DATED and parse_event_date(ticker) is None:
+        return "undated"
+    if SCAN_REQUIRE_NUMERIC:
+        parts = ticker.split("-")
+        by_type = strike_type in SCAN_NUMERIC_STRIKE_TYPES
+        by_ticker = len(parts) >= 3 and bool(_SCAN_STRIKE_RE.match(parts[-1]))
+        if not (by_type or by_ticker):
+            return "shape"
+    return None
+
+
+def _candle_cents(node, key: str) -> Optional[float]:
+    """A candlestick price field in YES cents, tolerant of both the integer-
+    cents and the '<key>_dollars' string encodings. None when absent."""
+    if not isinstance(node, dict):
+        return None
+    v = node.get(key + "_dollars")
+    if v is not None:
+        c = dollars_to_cents(v)
+        if c is not None:
+            return float(c)
+    v = node.get(key)
+    try:
+        c = float(v)
+    except (TypeError, ValueError):
+        return None
+    return c if 0 <= c <= 100 else None
+
+
+def scan_history_verdict(candles) -> dict:
+    """HISTORY screen, pure. `candles` = the /candlesticks list (hourly).
+    Mids come from two-sided bar CLOSES only (a trade print without a
+    two-sided quote around it is not a level). Returns
+    {ok, why, bars, range, jump, vol}; every failure mode is a reject."""
+    mids: List[float] = []
+    vol = 0.0
+    for c in candles or []:
+        if not isinstance(c, dict):
+            continue
+        try:
+            vol += float(c.get("volume_fp") or c.get("volume") or 0)
+        except (TypeError, ValueError):
+            pass
+        b = _candle_cents(c.get("yes_bid"), "close")
+        a = _candle_cents(c.get("yes_ask"), "close")
+        if b is None or a is None or b <= 0 or a >= 100 or b >= a:
+            continue
+        mids.append((b + a) / 2.0)
+    out = {"ok": False, "why": "", "bars": len(mids), "range": 0.0,
+           "jump": 0.0, "vol": vol}
+    if len(mids) < SCAN_MIN_HISTORY_BARS:
+        out["why"] = "history_thin"
+        return out
+    out["range"] = max(mids) - min(mids)
+    out["jump"] = max(abs(mids[i] - mids[i - 1]) for i in range(1, len(mids)))
+    if out["range"] > SCAN_MAX_RANGE_CENTS:
+        out["why"] = "history_range"
+    elif out["jump"] >= SCAN_MAX_JUMP_CENTS:
+        out["why"] = "history_jump"
+    elif vol > SCAN_MAX_HISTORY_VOLUME:
+        out["why"] = "history_volume"
+    else:
+        out["ok"] = True
+    return out
+
+
+def scan_series_meta_verdict(series_obj: dict) -> Tuple[bool, str, str]:
+    """FAMILY screen on a GET /series object -> (ok, why, category). An
+    excluded category or a live-feed settlement source rejects; an EMPTY
+    object rejects too (an API shape change must fail closed, not open)."""
+    if not isinstance(series_obj, dict) or not series_obj:
+        return False, "series_meta_unavailable", ""
+    cat = str(series_obj.get("category") or "").strip()
+    if not cat:
+        return False, "category:unknown", cat     # fail closed, not open
+    if cat in SCAN_EXCLUDE_CATEGORIES:
+        return False, f"category:{cat}", cat
+    for s in series_obj.get("settlement_sources") or []:
+        if not isinstance(s, dict):
+            continue
+        blob = (str(s.get("name") or "") + " " + str(s.get("url") or "")).lower()
+        if any(k in blob for k in SCAN_LIVE_SOURCE_KEYWORDS):
+            return False, "live_source", cat
+    return True, "", cat
+
+
+def ensure_scan_override(series: str) -> None:
+    """Give a scan-admitted series the tier's guard set. A hand-tuned entry
+    (none should exist for an un-allowed series, but the re-entry loop
+    seeds overrides for company series that are not allowlisted) keeps its
+    own ladder if it has one and is otherwise TIGHTENED: the net cap never
+    exceeds SCAN_MAX_POSITION, safe-join is on, the rate bar is off (the
+    walk ranks by ROI; a per-day bar is horizon-blind — Jack 2026-08-05).
+    Idempotent; release_scan_override undoes it."""
+    if series in SCAN_GUARDED_SERIES:
+        return
+    prior = SERIES_OVERRIDES.get(series)
+    _SCAN_PRIOR_OVERRIDES[series] = prior
+    if prior is None:
+        SERIES_OVERRIDES[series] = SeriesOverride(
+            levels=SCAN_LEVELS, max_position=SCAN_MAX_POSITION,
+            safe_join=True, min_est_per_day=0.0)
+    else:
+        cap = SCAN_MAX_POSITION if prior.max_position is None \
+            else min(prior.max_position, SCAN_MAX_POSITION)
+        SERIES_OVERRIDES[series] = replace(
+            prior, levels=prior.levels or SCAN_LEVELS, max_position=cap,
+            safe_join=True, min_est_per_day=0.0)
+    SCAN_GUARDED_SERIES.add(series)
+    log(f"[IMM] {series}: open-scan guard set applied "
+        f"(ladder {SERIES_OVERRIDES[series].levels}, net cap "
+        f"{SERIES_OVERRIDES[series].max_position:g}, safe-join)")
+
+
+def release_scan_override(series: str) -> None:
+    """Undo ensure_scan_override (a scan series that became allowlisted
+    mid-process goes back to whatever guard set the normal book gives it)."""
+    if series not in SCAN_GUARDED_SERIES:
+        return
+    SCAN_GUARDED_SERIES.discard(series)
+    prior = _SCAN_PRIOR_OVERRIDES.pop(series, None)
+    if prior is None:
+        SERIES_OVERRIDES.pop(series, None)
+    else:
+        SERIES_OVERRIDES[series] = prior
+    log(f"[IMM] {series}: open-scan guard set released")
+
+
+def scan_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
+                   members: Set[str] = frozenset(),
+                   extra_openings: int = 0) -> Set[str]:
+    """Tickers to EXCLUDE under the open-scan group cap — the finecon walk
+    over the metas flagged `scan` (SCAN_TOP_N / SCAN_EVENT_TOP_N)."""
+    return _group_walk_cut([m for m in metas if m.scan], incumbent, members,
+                           SCAN_TOP_N, SCAN_EVENT_TOP_N, extra_openings)
+
+
+def scan_openings_used(n_kept: int, n_members: int) -> int:
+    return _openings_used(n_kept, n_members, SCAN_TOP_N)
 
 # NO-NEW gate (Jack 2026-07-28 pm): series listed here admit NO fresh
 # candidates; members ride sticky to natural death. History: company set
@@ -3142,7 +3503,8 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
         # hour_mult = the factor already inside `levels`; the cap bounds the
         # PRODUCT of the two size levers at TOTAL_SIZE_MULT_CAP
         total = int(round(total * capped_ref_mult(anchor, ref_px, book_side,
-                                                  hour_mult=hour_mult)))
+                                                  hour_mult=hour_mult,
+                                                  series=series_of(ticker))))
         count = min(total, int(room))
         if count <= 0:
             return quotes
@@ -3598,6 +3960,10 @@ class MarketMeta:
     # by these or the budget under-reserves up to 2x (2026-08-02 audit)
     ref_mult_bid: float = 1.0
     ref_mult_ask: float = 1.0
+    # open-scan tier membership candidate (2026-09-05): set on metas built
+    # from the scan universe so the group walk / guards / tripwires can tell
+    # the tier apart without a series lookup
+    scan: bool = False
 
 
 @dataclass
@@ -3651,6 +4017,30 @@ class BotState:
     finecon_admits_today: int = 0   # over-cap admissions burned today (of
     #   FINECON_DAILY_OPENINGS); persisted — ~20 restarts/day must not
     #   refill the day's openings
+    # ---- open-scan tier (2026-09-05; all persisted unless noted) ----
+    scan_admit_day: str = ""        # ET date of the scan openings counter
+    scan_admits_today: int = 0
+    scan_members: Set[str] = field(default_factory=set)   # tickers quoting
+    #   via the scan tier (sticky, quote-to-completion); the persisted set
+    #   also re-applies the guard geometry at load
+    scan_book: Set[str] = field(default_factory=set)      # every ticker the
+    #   tier ever admitted that is still a member or still carries our
+    #   inventory — the daily loss budget is measured over THIS set, so an
+    #   evicted market's wind-down losses stay the tier's
+    scan_entry_mid: Dict[str, float] = field(default_factory=dict)  # YES mid
+    #   at admission — the drift tripwire's anchor
+    scan_evicted_events: Dict[str, float] = field(default_factory=dict)  # ev
+    #   -> ts; PERMANENT for the event (the estimator/admission refuse it)
+    scan_series_strikes: Dict[str, List[float]] = field(default_factory=dict)
+    scan_history_cache: Dict[str, dict] = field(default_factory=dict)  # tick
+    #   -> {ts, ok, why, bars, range, jump, vol} (TTL SCAN_HISTORY_TTL_SECS)
+    scan_series_meta: Dict[str, dict] = field(default_factory=dict)  # series
+    #   -> {ts, ok, why, category} (TTL SCAN_SERIES_META_TTL_SECS)
+    scan_halt_day: str = ""         # ET date the tier's loss budget tripped
+    scan_pnl_baseline: Optional[float] = None   # NOT persisted: anchored on
+    #   the first measurement of each process (like day_baseline)
+    scan_pnl_carry: float = 0.0     # tier P&L today carried across restarts
+    scan_pnl_today_last: float = 0.0
     programmed: Set[str] = field(default_factory=set)   # markets with a LIVE incentive
     #   program at the last universe refresh — the no-rent freeze (Jack 2026-07-26,
     #   KXRT: "why still quoting when the rewards have expired") keys off this
@@ -3849,6 +4239,37 @@ class IncentiveMarketMaker:
             self.state.finecon_admit_day = str(data.get("finecon_admit_day") or "")
             self.state.finecon_admits_today = int(
                 data.get("finecon_admits_today") or 0)
+            # open-scan tier (2026-09-05): membership, caches, counters. The
+            # guard geometry is re-applied for every persisted member's
+            # series RIGHT HERE, before any cycle can size a ladder — a
+            # restart must never leave a scan member on the global shape
+            # (the allowed-but-unguarded class, in restart form).
+            self.state.scan_admit_day = str(data.get("scan_admit_day") or "")
+            self.state.scan_admits_today = int(data.get("scan_admits_today") or 0)
+            self.state.scan_members = set(data.get("scan_members") or [])
+            self.state.scan_book = (set(data.get("scan_book") or [])
+                                    | self.state.scan_members)
+            self.state.scan_entry_mid = {
+                str(t): float(v)
+                for t, v in (data.get("scan_entry_mid") or {}).items()}
+            self.state.scan_evicted_events = {
+                str(e): float(v)
+                for e, v in (data.get("scan_evicted_events") or {}).items()}
+            self.state.scan_series_strikes = {
+                str(s): [float(x) for x in v]
+                for s, v in (data.get("scan_series_strikes") or {}).items()
+                if isinstance(v, list)}
+            self.state.scan_history_cache = {
+                str(t): dict(v)
+                for t, v in (data.get("scan_history_cache") or {}).items()
+                if isinstance(v, dict)}
+            self.state.scan_series_meta = {
+                str(s): dict(v)
+                for s, v in (data.get("scan_series_meta") or {}).items()
+                if isinstance(v, dict)}
+            self.state.scan_halt_day = str(data.get("scan_halt_day") or "")
+            for _t in sorted(self.state.scan_book):
+                ensure_scan_override(series_of(_t))
             # MIGRATION (2026-08-04, first load after the paid-basis counters
             # shipped): a state file written by the old code has accrued_est
             # but no paid_crossed, so every carried market sitting above the
@@ -3891,6 +4312,8 @@ class IncentiveMarketMaker:
                 self.state.pnl_carry = float(data.get("pnl_today_carry") or 0.0)
                 self.state.halted_until = float(data.get("halted_until") or 0.0)
                 self.state.balance_day_start = float(data.get("balance_day_start") or 0.0)
+                # open-scan tier P&L carry (same roll-day rule as pnl_carry)
+                self.state.scan_pnl_carry = float(data.get("scan_pnl_carry") or 0.0)
                 if self.state.halted_until > time.time():
                     log(f"{self.tag} restored ACTIVE daily-loss halt "
                         f"(pnl carry ${self.state.pnl_carry:+.2f})")
@@ -3991,6 +4414,41 @@ class IncentiveMarketMaker:
                            # or every deploy would refill the day's 5
                            "finecon_admit_day": self.state.finecon_admit_day,
                            "finecon_admits_today": self.state.finecon_admits_today,
+                           # open-scan tier (2026-09-05)
+                           "scan_admit_day": self.state.scan_admit_day,
+                           "scan_admits_today": self.state.scan_admits_today,
+                           "scan_members": sorted(self.state.scan_members),
+                           # the loss-budget book: every market the tier
+                           # admitted, kept WHOLE until the daily roll — a
+                           # settlement loss booked on a flat evicted market
+                           # must stay in today's tier P&L, not vanish at the
+                           # next save (pruned in build_daily_summary)
+                           "scan_book": sorted(self.state.scan_book),
+                           "scan_entry_mid": {
+                               t: round(v, 1)
+                               for t, v in self.state.scan_entry_mid.items()
+                               if t in self.state.scan_members},
+                           # permanent for the event; the TTL is file hygiene
+                           "scan_evicted_events": {
+                               e: round(v, 1)
+                               for e, v in self.state.scan_evicted_events.items()
+                               if time.time() - v < SCAN_EVICT_TTL_SECS},
+                           "scan_series_strikes": {
+                               s: [round(x, 1) for x in v
+                                   if time.time() - x < SCAN_SERIES_STRIKE_TTL_SECS]
+                               for s, v in self.state.scan_series_strikes.items()
+                               if any(time.time() - x < SCAN_SERIES_STRIKE_TTL_SECS
+                                      for x in v)},
+                           "scan_history_cache": {
+                               t: v for t, v in self.state.scan_history_cache.items()
+                               if time.time() - float(v.get("ts", 0))
+                               < SCAN_HISTORY_TTL_SECS},
+                           "scan_series_meta": {
+                               s: v for s, v in self.state.scan_series_meta.items()
+                               if time.time() - float(v.get("ts", 0))
+                               < SCAN_SERIES_META_TTL_SECS},
+                           "scan_halt_day": self.state.scan_halt_day,
+                           "scan_pnl_carry": round(self.state.scan_pnl_today_last, 2),
                            # live-event depth halts (pruned with the same 7d
                            # TTL: mention events settle within a day, this
                            # just stops dead events accreting)
@@ -4546,8 +5004,56 @@ class IncentiveMarketMaker:
         for t, _info in candidates:
             ensure_family_override(series_of(t))
 
+        # OPEN SCAN (2026-09-05, see the SCAN_* block): the complement of the
+        # allowed universe, string-screened here (not blocked/allowed/an
+        # excluded family, day-dated ticker) and pool-ranked so the bulk
+        # read below stays bounded. Members ride along regardless of rank —
+        # they are quote-to-completion and must reach the estimator. The
+        # per-market screens that need the market object run after the read.
+        scan_pre: List[Tuple[str, dict]] = []
+        scan_skips: Dict[str, int] = {}
+        scan_on = SCAN_TOP_N > 0 and ALLOWLIST_ONLY
+        if scan_on:
+            for _s in sorted(SCAN_GUARDED_SERIES):
+                # a scan series that became allowlisted meanwhile (extra-allow
+                # / finecon hot reload) hands its guard set back to the book:
+                # the finecon guard if it joined that group (its loader saw
+                # the scan entry and skipped), else the family inheritance
+                if self._allowed(f"{_s}-X"):
+                    release_scan_override(_s)
+                    if _s in FINECON_SERIES and _s not in SERIES_OVERRIDES:
+                        SERIES_OVERRIDES[_s] = SeriesOverride(
+                            min_est_per_day=_env_float("IMM_FINECON_MIN_RATE", 0.0),
+                            safe_join=True)
+                    ensure_family_override(_s)
+            for t, info in by_market.items():
+                if info["dollars_per_day"] <= 0:
+                    continue
+                why = scan_universe_reason(t)
+                if why is not None:
+                    if why not in ("allowed", "blocked", "off", "allowlist_off"):
+                        scan_skips[why] = scan_skips.get(why, 0) + 1
+                    continue
+                if ticker_cutoff_passed(t):
+                    scan_skips["cutoff_passed"] = scan_skips.get("cutoff_passed", 0) + 1
+                    continue
+                if t not in self.state.scan_members \
+                        and SCAN_REQUIRE_DATED and parse_event_date(t) is None:
+                    scan_skips["undated"] = scan_skips.get("undated", 0) + 1
+                    continue
+                scan_pre.append((t, info))
+            scan_pre.sort(key=lambda kv: -kv[1]["dollars_per_day"])
+            if len(scan_pre) > SCAN_MAX_BULK:
+                _keep = scan_pre[:SCAN_MAX_BULK] + [
+                    kv for kv in scan_pre[SCAN_MAX_BULK:]
+                    if kv[0] in self.state.scan_members]
+                scan_skips["bulk_cap"] = len(scan_pre) - len(_keep)
+                scan_pre = _keep
+        scan_pre_set = {t for t, _i in scan_pre}
+        scan_metas: List[Tuple[MarketMeta, dict]] = []
+
         metas: List[MarketMeta] = []
-        tickers = [t for t, _info in candidates]
+        tickers = [t for t, _info in candidates] + [t for t, _i in scan_pre]
         markets: Dict[str, dict] = {}
         for i in range(0, len(tickers), 50):
             chunk = tickers[i:i + 50]
@@ -4559,7 +5065,7 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} ! bulk market read failed ({e}); chunk skipped")
 
         # (imm_quote_gaps.py mirrors this meta construction — keep in sync.)
-        for t, info in candidates:
+        for t, info in candidates + scan_pre:
             m = markets.get(t)
             if not m or m.get("status") not in ("active", "open"):
                 continue
@@ -4612,7 +5118,54 @@ class IncentiveMarketMaker:
                 spread_cents=((ask - bid) if bid and ask else None),
                 volume=volume, status=m.get("status", ""),
                 open_time=parse_iso_utc(m.get("open_time", "")))
+            if t in scan_pre_set:
+                # open-scan candidate: flagged, given its 24h volume (the
+                # activity screen + fill-weighted exposure need it) and held
+                # back for the admission pass below
+                meta.scan = True
+                try:
+                    meta.volume_24h = float(m.get("volume_24h_fp")
+                                            or m.get("volume_24h") or 0)
+                except (TypeError, ValueError):
+                    meta.volume_24h = 0.0
+                scan_metas.append((meta, m))
+                continue
             metas.append(meta)
+
+        # OPEN SCAN admission (2026-09-05): event volumes first (they need
+        # every bulk-read sibling, pinned strikes included — informed flow
+        # on one strike shows up on its neighbours), then the per-market
+        # screens richest pool first so the bounded series/candle reads go
+        # where the money is. Members skip admission (quote-to-completion)
+        # but take the guard set; a tier halted today admits nothing and
+        # drops its members from the candidate list (they were deselected
+        # when the budget tripped).
+        if scan_metas:
+            _et_today = now_utc.astimezone(ET).date().isoformat()
+            ev_vol24: Dict[str, float] = {}
+            for _meta, _m in scan_metas:
+                ev_vol24[_meta.event_ticker] = (
+                    ev_vol24.get(_meta.event_ticker, 0.0) + _meta.volume_24h)
+            budget = {"series": SCAN_MAX_SERIES_FETCHES,
+                      "history": SCAN_MAX_HISTORY_FETCHES}
+            scan_halted = self.state.scan_halt_day == _et_today
+            scan_metas.sort(key=lambda mm: -mm[0].dollars_per_day)
+            n_scan_books = 0
+            for _meta, _m in scan_metas:
+                if scan_halted:
+                    scan_skips["scan_halted"] = scan_skips.get("scan_halted", 0) + 1
+                    continue
+                if _meta.ticker not in self.state.scan_members:
+                    why = self._scan_admission(_meta, _m, ev_vol24, now_utc, budget)
+                    if why is not None:
+                        scan_skips[why] = scan_skips.get(why, 0) + 1
+                        continue
+                    if n_scan_books >= SCAN_MAX_BOOKS:
+                        scan_skips["book_cap"] = scan_skips.get("book_cap", 0) + 1
+                        continue
+                    n_scan_books += 1
+                ensure_scan_override(_meta.series)
+                metas.append(_meta)
 
         # Pass 1: hard screens (+ yield-to-human: never select a market the
         # user is trading manually — divergence vs our own book, a foreign
@@ -4723,6 +5276,7 @@ class IncentiveMarketMaker:
                     and sub_bar_secs >= HOPELESS_SUSTAIN_SECS \
                     and meta.ticker in prev_selected \
                     and meta.series not in FINECON_SERIES \
+                    and not meta.scan \
                     and meta.event_ticker not in FORCE_EVENTS \
                     and not curated_event(meta.event_ticker, meta.series, now_utc):
                 # STICKY EXIT (Jack 2026-07-25): "<5% chance to reach $1 by
@@ -4791,13 +5345,19 @@ class IncentiveMarketMaker:
         fin_sticky = {m.ticker for m in ranked
                       if m.series in FINECON_SERIES
                       and m.ticker in prev_selected}
+        # Open-scan members (2026-09-05): the same quote-to-completion
+        # immunity — they leave by natural completion, a safety screen or
+        # the tier's own tripwires, never by being out-ranked.
+        scan_sticky = {m.ticker for m in ranked
+                       if m.scan and m.ticker in prev_selected}
 
         # Per-event TOP-N (Jack 2026-09-02, gas — see event_top_n_cut):
         # applied BEFORE sticky seeding so a member past the cap falls out of
         # `ranked`, out of `selected`, and through the normal deselect/cancel
         # path this cycle. (Finecon members are immune; gas/diesel keep the
         # original evictable semantics.)
-        topn_cut = event_top_n_cut(ranked, prev_selected, immune=fin_sticky)
+        topn_cut = event_top_n_cut(ranked, prev_selected,
+                                   immune=fin_sticky | scan_sticky)
         if topn_cut:
             skipped["event_top_n"] = len(topn_cut)
             ranked = [m for m in ranked if m.ticker not in topn_cut]
@@ -4828,6 +5388,27 @@ class IncentiveMarketMaker:
             log(f"{self.tag} finecon daily openings: {used} used this "
                 f"refresh ({self.state.finecon_admits_today}"
                 f"/{FINECON_DAILY_OPENINGS} today)")
+
+        # OPEN SCAN group walk (2026-09-05 — see scan_group_cut): the
+        # finecon walk with its own slots, per-event cap, daily openings and
+        # burn counter, over the metas flagged `scan`.
+        if self.state.scan_admit_day != et_today:
+            self.state.scan_admit_day = et_today
+            self.state.scan_admits_today = 0
+        scan_openings_left = max(0, SCAN_DAILY_OPENINGS
+                                 - self.state.scan_admits_today)
+        scan_cut = scan_group_cut(ranked, prev_selected, members=scan_sticky,
+                                  extra_openings=scan_openings_left)
+        if scan_cut:
+            skipped["scan_top_n"] = len(scan_cut)
+            ranked = [m for m in ranked if m.ticker not in scan_cut]
+        kept_scan = sum(1 for m in ranked if m.scan)
+        used_scan = scan_openings_used(kept_scan, len(scan_sticky))
+        if used_scan:
+            self.state.scan_admits_today += used_scan
+            log(f"{self.tag} open-scan daily openings: {used_scan} used this "
+                f"refresh ({self.state.scan_admits_today}"
+                f"/{SCAN_DAILY_OPENINGS} today)")
 
         selected: Dict[str, MarketMeta] = {}
         collateral = 0.0
@@ -4898,6 +5479,23 @@ class IncentiveMarketMaker:
         dropped = [t for t in self.state.selected if t not in selected]
         added = [t for t in selected if t not in self.state.selected]
         self.state.selected = selected
+        # Open-scan membership bookkeeping (2026-09-05): an admission anchors
+        # the drift tripwire at the admission mid and joins the loss-budget
+        # book (which only shrinks once a market is flat AND gone).
+        new_scan = {t for t, m in selected.items() if m.scan}
+        for t in sorted(new_scan - self.state.scan_members):
+            mid0 = selected[t].mid_cents
+            if mid0 is not None:
+                self.state.scan_entry_mid[t] = mid0
+            log(f"{self.tag} open-scan admit {t}: pool "
+                f"${selected[t].dollars_per_day:.2f}/d, est "
+                f"${selected[t].est_dollars_per_day:.2f}/d, mid "
+                f"{mid0 if mid0 is None else round(mid0, 1)}c, vol24h "
+                f"{selected[t].volume_24h:.0f}")
+        for t in self.state.scan_members - new_scan:
+            self.state.scan_entry_mid.pop(t, None)
+        self.state.scan_members = new_scan
+        self.state.scan_book |= new_scan
         # The persisted sticky set is consumed by this refresh: survivors are
         # in state.selected now; the rest died a natural death and must not be
         # resurrected by later refreshes (or grow the persist unboundedly).
@@ -4919,6 +5517,143 @@ class IncentiveMarketMaker:
         if dropped:
             log(f"{self.tag} - deselected: {', '.join(sorted(dropped)[:8])}"
                 + (" ..." if len(dropped) > 8 else ""))
+        if scan_on:
+            log(f"{self.tag} open-scan: {len(scan_pre)} string-screened -> "
+                f"{sum(1 for m in metas if m.scan)} eligible -> "
+                f"{len(new_scan)}/{SCAN_TOP_N} members "
+                f"(+{self.state.scan_admits_today}/{SCAN_DAILY_OPENINGS} "
+                f"openings used today"
+                + (", HALTED today" if self.state.scan_halt_day == et_today else "")
+                + f"); rejects {dict(sorted(scan_skips.items()))}")
+
+    # ---- open-scan tier (2026-09-05) -----------------------------------------
+
+    def _scan_series_ok(self, series: str, now_ts: float,
+                        budget: Dict[str, int]) -> Tuple[bool, str]:
+        """FAMILY screen behind a persisted per-series cache (one GET /series
+        per SCAN_SERIES_META_TTL_SECS). Budget exhausted or unreadable ->
+        NOT ok ('..._pending' / '..._unavailable'), retried next refresh;
+        an unreadable/empty object is never cached."""
+        ent = self.state.scan_series_meta.get(series)
+        if ent and now_ts - float(ent.get("ts", 0)) < SCAN_SERIES_META_TTL_SECS:
+            return bool(ent.get("ok")), str(ent.get("why") or "")
+        if budget["series"] <= 0:
+            return False, "series_meta_pending"
+        budget["series"] -= 1
+        try:
+            resp = self.client.get(f"/series/{series}") or {}
+            so = resp.get("series") or {}
+        except Exception as e:
+            log(f"{self.tag} ! open-scan series read failed {series}: {e}")
+            return False, "series_meta_unavailable"
+        ok, why, cat = scan_series_meta_verdict(so)
+        if why == "series_meta_unavailable":
+            return False, why
+        self.state.scan_series_meta[series] = {
+            "ts": now_ts, "ok": ok, "why": why, "category": cat}
+        return ok, why
+
+    def _scan_history_ok(self, meta: MarketMeta, now_ts: float,
+                         budget: Dict[str, int]) -> Tuple[bool, str]:
+        """HISTORY screen behind a persisted per-market cache (one hourly
+        candlestick read per SCAN_HISTORY_TTL_SECS). Same fail-closed
+        budget/unavailable semantics as the series screen."""
+        ent = self.state.scan_history_cache.get(meta.ticker)
+        if ent and now_ts - float(ent.get("ts", 0)) < SCAN_HISTORY_TTL_SECS:
+            return bool(ent.get("ok")), str(ent.get("why") or "")
+        if budget["history"] <= 0:
+            return False, "history_pending"
+        budget["history"] -= 1
+        try:
+            resp = self.client.get(
+                f"/series/{meta.series}/markets/{meta.ticker}/candlesticks",
+                params={"start_ts": int(now_ts - SCAN_HISTORY_HOURS * 3600),
+                        "end_ts": int(now_ts), "period_interval": 60}) or {}
+        except Exception as e:
+            log(f"{self.tag} ! open-scan candles read failed {meta.ticker}: {e}")
+            return False, "history_unavailable"
+        candles = resp.get("candlesticks")
+        if not isinstance(candles, list):
+            return False, "history_unavailable"
+        v = scan_history_verdict(candles)
+        self.state.scan_history_cache[meta.ticker] = dict(v, ts=now_ts)
+        return v["ok"], v["why"]
+
+    def _scan_admission(self, meta: MarketMeta, m: dict,
+                        ev_vol24: Dict[str, float], now_utc: datetime,
+                        budget: Dict[str, int]) -> Optional[str]:
+        """Every open-scan admission screen for a NON-member candidate, in
+        cost order (string, then market-object, then cached/bounded reads).
+        None = admissible; else the reject reason (also the quote-gaps
+        label). Members never come here — they quote to completion."""
+        now_ts = now_utc.timestamp()
+        if meta.event_ticker in self.state.scan_evicted_events:
+            return "evicted"
+        strikes = [x for x in self.state.scan_series_strikes.get(meta.series, [])
+                   if now_ts - x < SCAN_SERIES_STRIKE_TTL_SECS]
+        if 0 < SCAN_SERIES_STRIKE_LIMIT <= len(strikes):
+            return "series_struck"
+        why = scan_shape_reason(meta.ticker, m.get("strike_type"))
+        if why:
+            return why
+        if meta.open_time is None or \
+                (now_utc - meta.open_time).total_seconds() < SCAN_MIN_AGE_HOURS * 3600:
+            return "age"
+        if meta.volume_24h > SCAN_MAX_VOLUME_24H:
+            return "volume"
+        if ev_vol24.get(meta.event_ticker, 0.0) > SCAN_MAX_EVENT_VOLUME_24H:
+            return "event_volume"
+        ok, why = self._scan_series_ok(meta.series, now_ts, budget)
+        if not ok:
+            return why or "series_meta"
+        ok, why = self._scan_history_ok(meta, now_ts, budget)
+        if not ok:
+            return why or "history"
+        return None
+
+    def _scan_evict_event(self, ev: str, why: str,
+                          by_event: Dict[str, List[MarketMeta]],
+                          resting: List[dict], desired: List[Quote],
+                          now_ts: float) -> None:
+        """PERMANENT open-scan eviction of a whole event: quotes cancelled on
+        every scan member of it, the members deselected (inventory winds
+        down reduce-only through managed_extra like any deselection), this
+        cycle's already-built quotes stripped in place, the event barred
+        from re-admission and its series struck."""
+        self.state.scan_evicted_events[ev] = now_ts
+        members = [m2 for m2 in by_event.get(ev, [])
+                   if m2.ticker in self.state.scan_members]
+        series = members[0].series if members else ev.split("-")[0]
+        self.state.scan_series_strikes.setdefault(series, []).append(now_ts)
+        n_cx = 0
+        for m2 in members:
+            n_cx += self.cancel_market_orders(m2.ticker, resting)
+            self.state.selected.pop(m2.ticker, None)
+            self.state.scan_members.discard(m2.ticker)
+            self.state.scan_entry_mid.pop(m2.ticker, None)
+        ev_ticks = {m2.ticker for m2 in members}
+        desired[:] = [q for q in desired if q.ticker not in ev_ticks]
+        n_strikes = sum(1 for x in self.state.scan_series_strikes.get(series, [])
+                        if now_ts - x < SCAN_SERIES_STRIKE_TTL_SECS)
+        self.alerter.alert(
+            "scan_evict",
+            f"{ev}: {why} — evicting the event from the open-scan tier "
+            f"PERMANENTLY ({len(members)} member(s), {n_cx} orders cancelled; "
+            f"series {series} strike {n_strikes}/{SCAN_SERIES_STRIKE_LIMIT}"
+            + (", family barred" if 0 < SCAN_SERIES_STRIKE_LIMIT <= n_strikes
+               else "") + ")", key=ev)
+
+    def _scan_book_pnl(self) -> float:
+        """The tier's realized + mark-to-market over scan_book (in-process
+        realized; the cross-restart composition is scan_pnl_carry)."""
+        total = 0.0
+        for t in self.state.scan_book:
+            total += self.pnl.realized.get(t, 0.0)
+            p = self.pnl.pos.get(t, 0.0)
+            mark = self.state.last_mark.get(t)
+            if abs(p) > 1e-9 and mark is not None:
+                total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
+        return total
 
     def _coverage(self, ticker: str, counted: bool) -> float:
         """Update + return the per-market counted-snapshot EMA.
@@ -5018,8 +5753,10 @@ class IncentiveMarketMaker:
         # capped so hour x ref <= TOTAL_SIZE_MULT_CAP; consumers (side rooms,
         # collateral reservation) inherit the cap through these meta fields
         _hm = hour_size_mult(meta.series, datetime.now(timezone.utc))
-        meta.ref_mult_bid = capped_ref_mult(ext_b, rb, "bid", hour_mult=_hm)
-        meta.ref_mult_ask = capped_ref_mult(ext_a, ra, "ask", hour_mult=_hm)
+        meta.ref_mult_bid = capped_ref_mult(ext_b, rb, "bid", hour_mult=_hm,
+                                            series=meta.series)
+        meta.ref_mult_ask = capped_ref_mult(ext_a, ra, "ask", hour_mult=_hm,
+                                            series=meta.series)
         if self.live and own_live:
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, own_live,
@@ -5608,6 +6345,10 @@ class IncentiveMarketMaker:
         # the resume path requires EVERY managed market healthy this cycle.
         event_depth_thin: Set[str] = set()
         event_depth_ok: Dict[str, int] = {}
+        # open-scan tripwire victims this cycle: no quotes at all this cycle
+        # (siblings later in the play order included); reduce-only wind-down
+        # begins next cycle through managed_extra
+        scan_evicted_now: Set[str] = set()
         # per-market external touch this cycle — the asymmetric-chase bound
         # in diff_orders (keep aggressive-drifted rungs while not leading)
         touch_map: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
@@ -5690,6 +6431,8 @@ class IncentiveMarketMaker:
                 self.state.managed_extra.pop(t, None)
                 continue
             self.state.manual_standoff.pop(t, None)
+            if t in scan_evicted_now:
+                continue
 
             reduce_only = t not in self.state.selected
             # Registry for place_order: exchange-side expiration is capped at
@@ -5767,6 +6510,19 @@ class IncentiveMarketMaker:
                        f"burst {strikes})" if confirmed else
                        f"(burst {strikes}/{EVENT_FILL_HALT_STRIKES})")
                     + f"; cancelled {n_cx}", key=ev)
+                self.state.prev_pos[t] = own_pos
+                continue
+            # OPEN-SCAN FILL TRIPWIRE (2026-09-05, see the SCAN_* block): being
+            # swept on a scan member IS the adverse selection the tier's
+            # screens exist to avoid — the whole event leaves the tier for
+            # good. Independent of IMM_BREAKERS, ahead of the per-market
+            # breaker so the event-wide response owns scan members.
+            if (t in self.state.scan_members and prev is not None
+                    and abs(own_pos - prev) >= SCAN_FILL_HALT_CONTRACTS):
+                self._scan_evict_event(
+                    ev, f"{t} own book moved {own_pos - prev:+.0f} in one cycle",
+                    by_event, resting, desired, now_ts)
+                scan_evicted_now.update(m2.ticker for m2 in by_event.get(ev, [meta]))
                 self.state.prev_pos[t] = own_pos
                 continue
             if (BREAKERS_ENABLED and prev is not None
@@ -5912,6 +6668,36 @@ class IncentiveMarketMaker:
                         f"{BREAKER_COOLDOWN_SECS // 60}min", key=t, urgent=False)
                     continue
 
+            # OPEN-SCAN MID TRIPWIRE (2026-09-05): a one-cycle jump, or a drift
+            # from the admission mid, on a market admitted for having no
+            # information in it means information arrived. Event-wide
+            # permanent eviction, like the fill tripwire; independent of
+            # IMM_BREAKERS. Read BEFORE the breaker block below updates
+            # prev_mid.
+            if t in self.state.scan_members and ext_bid is not None \
+                    and ext_ask is not None:
+                mid_s = (ext_bid + ext_ask) / 2.0
+                pm_s = self.state.prev_mid.get(t)
+                entry_s = self.state.scan_entry_mid.get(t)
+                jumped = (pm_s is not None
+                          and abs(mid_s - pm_s) >= SCAN_MID_JUMP_CENTS)
+                drifted = (entry_s is not None
+                           and abs(mid_s - entry_s) >= SCAN_DRIFT_CENTS)
+                if jumped or drifted:
+                    self._scan_evict_event(
+                        ev,
+                        (f"{t} mid {pm_s:.0f}c -> {mid_s:.0f}c in one cycle"
+                         if jumped else
+                         f"{t} mid drifted {entry_s:.0f}c -> {mid_s:.0f}c "
+                         f"since admission"),
+                        by_event, resting, desired, now_ts)
+                    scan_evicted_now.update(
+                        m2.ticker for m2 in by_event.get(ev, [meta]))
+                    self.state.prev_mid[t] = mid_s
+                    self.state.last_mark[t] = mid_s
+                    marked.add(t)
+                    continue
+
             # Mid-move circuit breaker (external mid, so our own churn can't trip it).
             if ext_bid is not None and ext_ask is not None:
                 mid = (ext_bid + ext_ask) / 2.0
@@ -6050,10 +6836,12 @@ class IncentiveMarketMaker:
             base_side_max = sum(s for _t, s in lv)
             side_max_bid = int(round(base_side_max *
                                      capped_ref_mult(ext_bid, ref_bid_px, "bid",
-                                                     hour_mult=hm)))
+                                                     hour_mult=hm,
+                                                     series=meta.series)))
             side_max_ask = int(round(base_side_max *
                                      capped_ref_mult(ext_ask, ref_ask_px, "ask",
-                                                     hour_mult=hm)))
+                                                     hour_mult=hm,
+                                                     series=meta.series)))
             maxpos = series_max_position(meta.series)
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
@@ -6298,6 +7086,41 @@ class IncentiveMarketMaker:
             if not fast_only:
                 self._write_cycle_log(cycle_rows)
             return
+
+        # OPEN-SCAN DAILY LOSS BUDGET (2026-09-05): the tier's own realized +
+        # MTM today over every market it ever admitted (scan_book), carried
+        # across restarts like pnl_today. Tripping it deselects every scan
+        # member (inventory winds down reduce-only) and blocks admissions
+        # until the next ET day. The whole-book halt above is untouched —
+        # this bounds the blast radius of an unreviewed universe on its own.
+        if SCAN_DAILY_LOSS_LIMIT > 0 and self.state.scan_book and not fast_only:
+            scan_total = self._scan_book_pnl()
+            if self.state.scan_pnl_baseline is None:
+                self.state.scan_pnl_baseline = scan_total
+            scan_today = (scan_total - self.state.scan_pnl_baseline
+                          + self.state.scan_pnl_carry)
+            self.state.scan_pnl_today_last = scan_today
+            _et_day = now_utc.astimezone(ET).date().isoformat()
+            if scan_today <= -SCAN_DAILY_LOSS_LIMIT \
+                    and self.state.scan_halt_day != _et_day \
+                    and self.state.scan_members:
+                self.state.scan_halt_day = _et_day
+                halted_ids = set(self.state.scan_members)
+                n_cx = 0
+                for t_h in sorted(halted_ids):
+                    n_cx += self.cancel_market_orders(t_h, resting)
+                    self.state.selected.pop(t_h, None)
+                desired = [q for q in desired if q.ticker not in halted_ids]
+                self.state.scan_members = set()
+                self.state.scan_entry_mid.clear()
+                self.alerter.alert(
+                    "scan_halt",
+                    f"open-scan tier P&L today ${scan_today:+.2f} <= "
+                    f"-${SCAN_DAILY_LOSS_LIMIT:.0f}; cancelled {n_cx} orders on "
+                    f"{len(halted_ids)} scan member(s) and closed the tier "
+                    f"until the next ET day (inventory winds down reduce-only)",
+                    key="scan_halt")
+                self._save_persist()
 
         # Fast tick: non-fast managed markets built no `desired` this tick —
         # preserve their resting orders through the diff or it would cancel
@@ -6545,6 +7368,17 @@ class IncentiveMarketMaker:
             "selected": len(s.selected),
             "managed_extra": len(s.managed_extra),
             "manual_standoff": sorted(s.manual_standoff),
+            # open-scan tier (2026-09-05)
+            "scan_members": sorted(s.scan_members),
+            "scan_slots": f"{len(s.scan_members)}/{SCAN_TOP_N}",
+            "scan_openings_used": (
+                s.scan_admits_today
+                if s.scan_admit_day == now_utc.astimezone(ET).date().isoformat()
+                else 0),
+            "scan_evicted_events": len(s.scan_evicted_events),
+            "scan_halted_today": (
+                s.scan_halt_day == now_utc.astimezone(ET).date().isoformat()),
+            "scan_pnl_today": round(s.scan_pnl_today_last, 2),
             "programs_seen": s.programs_count,
             "markets_line": s.last_markets_line,
             "reward_est_today": round(s.reward_est_today, 2),
@@ -6634,6 +7468,16 @@ class IncentiveMarketMaker:
         s.pnl_carry = 0.0
         s.pnl_today_last = 0.0
         s.balance_day_start = 0.0          # re-anchors on the next cycle
+        # open-scan tier loss budget: same roll (baseline re-anchors on the
+        # next cycle's measurement, carry cleared), and the loss-budget book
+        # sheds markets that are flat AND no longer members — only here, so
+        # a settlement booked mid-day stays in that day's tier P&L
+        s.scan_pnl_baseline = None
+        s.scan_pnl_carry = 0.0
+        s.scan_pnl_today_last = 0.0
+        s.scan_book = {t for t in s.scan_book
+                       if t in s.scan_members
+                       or abs(self.pnl.pos.get(t, 0.0)) > 1e-9}
         return body
 
     # ---- main loop -----------------------------------------------------------
@@ -6697,6 +7541,25 @@ class IncentiveMarketMaker:
             f"budget ${COLLATERAL_BUDGET:g}, "
             f"{('max ' + str(MAX_MARKETS) + ' events') if MAX_MARKETS > 0 else 'events uncapped'}, "
             f"TTL {ORDER_TTL_SECS}s, poll {POLL_SECS}s")
+        if SCAN_TOP_N > 0:
+            log(f"open-scan tier: {SCAN_TOP_N} slots, {SCAN_EVENT_TOP_N}/event, "
+                f"{SCAN_DAILY_OPENINGS} daily openings; ladder {SCAN_LEVELS}, "
+                f"net cap {SCAN_MAX_POSITION:g}, ref-mult cap "
+                f"{SCAN_REF_MULT_CAP:g}, hour mult "
+                f"{'on' if SCAN_HOUR_MULT else 'off'}; screens: "
+                f"dated={SCAN_REQUIRE_DATED} numeric={SCAN_REQUIRE_NUMERIC} "
+                f"vol24h<={SCAN_MAX_VOLUME_24H:g} (event "
+                f"{SCAN_MAX_EVENT_VOLUME_24H:g}) age>={SCAN_MIN_AGE_HOURS:g}h "
+                f"history {SCAN_HISTORY_HOURS}h/{SCAN_MIN_HISTORY_BARS}+ bars "
+                f"range<={SCAN_MAX_RANGE_CENTS:g}c jump<{SCAN_MAX_JUMP_CENTS:g}c "
+                f"vol<={SCAN_MAX_HISTORY_VOLUME:g}, categories out "
+                f"{sorted(SCAN_EXCLUDE_CATEGORIES)}; tripwires: fill "
+                f"{SCAN_FILL_HALT_CONTRACTS:g}/cycle, mid jump "
+                f"{SCAN_MID_JUMP_CENTS:g}c, drift {SCAN_DRIFT_CENTS:g}c, daily "
+                f"loss ${SCAN_DAILY_LOSS_LIMIT:g}, {SCAN_SERIES_STRIKE_LIMIT} "
+                f"strikes/{SCAN_SERIES_STRIKE_TTL_SECS / 86400:g}d bar a series; "
+                f"{len(self.state.scan_members)} member(s) carried in, "
+                f"{len(self.state.scan_evicted_events)} evicted event(s)")
         if EVENT_DEPTH_GATE_PREFIXES:
             log(f"live-event depth gate: {','.join(EVENT_DEPTH_GATE_PREFIXES)} "
                 f"— pads OFF; any quotable side < "
@@ -6822,16 +7685,20 @@ class IncentiveMarketMaker:
         self.state.universe_at = 0.0
         self.refresh_universe(now_utc, positions)
         rows = sorted(self.state.selected.values(), key=lambda m: -m.yield_per_contract)
-        print(f"\n{'TICKER':44s} {'pool$/d':>7s} {'est$/d':>7s} {'$/d/ct':>7s} "
-              f"{'mid':>4s} {'sprd':>4s} {'cutoff (UTC)':17s}")
+        print(f"\n{'TICKER':44s} {'tier':5s} {'pool$/d':>7s} {'est$/d':>7s} "
+              f"{'$/d/ct':>7s} {'mid':>4s} {'sprd':>4s} {'cutoff (UTC)':17s}")
         for m in rows:
             cut = m.cutoff.strftime("%m-%d %H:%M") if m.cutoff else "-"
-            print(f"{m.ticker:44s} {m.dollars_per_day:7.2f} {m.est_dollars_per_day:7.2f} "
+            tier = "scan" if m.scan else ("fin" if m.series in FINECON_SERIES else "")
+            print(f"{m.ticker:44s} {tier:5s} {m.dollars_per_day:7.2f} "
+                  f"{m.est_dollars_per_day:7.2f} "
                   f"{m.yield_per_contract:7.3f} {(m.mid_cents or 0):4.0f} "
                   f"{(m.spread_cents or 0):4d} {cut:17s}")
         est_total = sum(m.est_dollars_per_day for m in rows)
+        n_scan = sum(1 for m in rows if m.scan)
         print(f"\n{len(rows)} markets selected of {self.state.programs_count} active "
-              f"program markets; est ${est_total:.0f}/day share at rest")
+              f"program markets; est ${est_total:.0f}/day share at rest; "
+              f"open-scan {n_scan}/{SCAN_TOP_N}")
 
 
 # ----------------------------------------------------------------------------

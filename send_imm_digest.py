@@ -41,7 +41,7 @@ def _env_from_registry(name: str) -> str:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
             return str(winreg.QueryValueEx(key, name)[0])
-    except OSError:
+    except (OSError, ImportError):     # ImportError: non-Windows (tests)
         return ""
 
 
@@ -1834,6 +1834,63 @@ def finecon_section(state, w, today_ct):
              'actual Kalshi money from the recon ledger (lands 1&ndash;2d '
              'after each period ends). Members ride to natural completion, '
              'so a slot only frees at settlement/cutoff.</div>')
+
+    # OPEN SCAN tier (Jack 2026-09-05 "extend the opportunistic IMM with 15
+    # slots and 5 to scan all markets"): the machine-screened all-market
+    # tier, same walk/openings/quote-to-completion; membership + counters
+    # come straight from the bot's persisted state.
+    scan_top = getattr(imm, "SCAN_TOP_N", 0)
+    if scan_top > 0:
+        scan_members = sorted(state.get("scan_members") or [])
+        s_cap = getattr(imm, "SCAN_DAILY_OPENINGS", 0)
+        s_used = (int(_f(state.get("scan_admits_today")))
+                  if state.get("scan_admit_day") == today_ct.isoformat() else 0)
+        s_halted = state.get("scan_halt_day") == today_ct.isoformat()
+        s_evicted = len(state.get("scan_evicted_events") or {})
+        s_acc = sum(_f(accrued.get(t)) for t in scan_members)
+        L.append("OPEN SCAN (all-market tier, top-{} by ROI, machine-screened "
+                 "for adverse selection, quote-to-completion)".format(scan_top))
+        L.append("Quoting {}/{} slots (+{}/{} daily openings used){}; {} "
+                 "event(s) evicted by tripwires to date; est accrued this "
+                 "period ${:,.2f} across members.".format(
+                     len(scan_members), scan_top, s_used, s_cap,
+                     " — HALTED today (loss budget)" if s_halted else "",
+                     s_evicted, s_acc))
+        if scan_members:
+            L.append("{:36s} {:>9s} {:>7s}".format("MEMBER", "ACCRUED$", "POS"))
+            for t in scan_members:
+                L.append("{:36s} {:>9.2f} {:>+7.0f}".format(
+                    t[:36], _f(accrued.get(t)), _f(own_pos.get(t))))
+        else:
+            L.append("  (no scan members quoting right now)")
+        h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
+                 'Open scan <span style="color:#888;font-weight:400">&mdash; '
+                 'all-market tier, top-{} by ROI, machine-screened, '
+                 'quote-to-completion</span></div>'.format(scan_top))
+        h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
+                 'quoting <b>{}/{}</b> slots &nbsp;&middot;&nbsp; +{}/{} daily '
+                 'openings used{} &nbsp;&middot;&nbsp; {} event(s) evicted by '
+                 'tripwires &nbsp;&middot;&nbsp; est accrued this period '
+                 '${:,.2f}</div>'.format(
+                     len(scan_members), scan_top, s_used, s_cap,
+                     ' &nbsp;&middot;&nbsp; <b style="color:#b00">HALTED today'
+                     ' (loss budget)</b>' if s_halted else "",
+                     s_evicted, s_acc))
+        if scan_members:
+            h.append('<table style="border-collapse:collapse">')
+            h.append('<tr style="background:#f0f0f0;font-weight:600">'
+                     '<td style="{0}">MEMBER</td><td style="{1}">ACCRUED$ (est)'
+                     '</td><td style="{1}">POS</td></tr>'.format(TDL, TD))
+            for i, t in enumerate(scan_members):
+                h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
+                         '<td style="{3}">{4:,.2f}</td>'
+                         '<td style="{3}">{5:+,.0f}</td></tr>'.format(
+                             "#fafafa" if i % 2 else "#fff", TDL, t, TD,
+                             _f(accrued.get(t)), _f(own_pos.get(t))))
+            h.append('</table>')
+        else:
+            h.append('<div style="color:#666;font-size:13px">no scan members '
+                     'quoting right now.</div>')
     return L, "".join(h)
 
 

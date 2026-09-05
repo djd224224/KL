@@ -762,3 +762,148 @@ Register-ScheduledTask -TaskName 'KL imm opportunistic' -Force `
   -Principal (New-ScheduledTaskPrincipal -UserId 'jackd' -LogonType Interactive -RunLevel Limited) `
   -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2))
 ```
+
+## 2026-09-05 — OPEN SCAN: second opportunistic tier, +15 slots / +5 openings over ALL markets (Jack)
+
+Jack: "extend the opportunistic IMM with 15 slots and 5 to scan all markets.
+be very careful for adverse selection."
+
+READING OF THE ASK (state it, because the numbers coincide with finecon's):
+the finecon sweep already runs 15 slots + 5 daily openings over a HAND-
+CURATED universe. "Extend ... with 15 slots and 5 to scan all markets" is
+read as a SECOND tier — its own 15 slots, 3/event, 5 daily openings — whose
+candidate universe is every live-program market the bot does not otherwise
+quote. Finecon is untouched (15/3/5, curated list, same walk); the normal
+book is untouched (`_allowed` unchanged). If Jack meant "widen finecon's
+universe to everything", the change is one env var: set
+`IMM_SCAN_TOP_N=0` and enroll series into finecon instead — but that would
+drop every screen below, which is the opposite of "very careful".
+
+### What the tier is
+
+`incentive_mm.py`, the `SCAN_*` block (right after the finecon block).
+Universe (`scan_universe_reason`): NOT blocked/frozen, NOT `_allowed`
+(finecon, suffix/prefix families and extra-allow included), NOT on
+`SCAN_EXCLUDE_PREFIXES`. The curator is replaced by machine screens, every
+one of which FAILS CLOSED (missing data = not admitted), applied cheapest
+first (`_scan_admission`):
+
+| Screen | Rule (default) | Why |
+|---|---|---|
+| STRUCTURE | day-dated event ticker; numeric-threshold strike (`T286`, `B90`, `4.1400`, or Kalshi `strike_type` greater/less/between) | the midnight-ET rule is the only release guard an unknown series has (KXUE/KXISMPMI had no day and would quote THROUGH their prints); a "will X happen" binary's one jump IS the resolution (strategy §1) |
+| FAMILY | Kalshi category not in `Sports, Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment` (GET /series, cached 7d); no live-feed settlement source (pyth/coinbase/espn/ercot/... keywords); prefix exclusions: other repo bots (KXLOWT, KXRAIN, KXHIGH, KXTEMP, KXAVGT, KXAQI), crypto by asset, FX/index/commodity/grid feeds, the 9/2 scan's rejects (KXUE, KXISMPMI, KXSNOWCRABCATCH, KXSOCKEYERUN, KXTECHLAYOFF, ...), sports families | feed- or news-driven information: a quiet 72h says nothing about the next headline; two of our bots must never anchor to each other |
+| ACTIVITY | market `volume_24h` <= 60, EVENT `volume_24h` <= 250 (summed over every bulk-read sibling, pinned strikes included), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
+| HISTORY | 72h of hourly candlesticks: >= 12 two-sided bars, mid range <= 10c, no bar-to-bar move >= 6c, traded volume <= 250 (cached 6h) | a book that moved is not a quiet print, whatever its family says |
+
+Read budgets per refresh (the universe is thousands of markets): bulk
+market reads capped at 600 tickers (pool-ranked, members always in), 30
+`/series` reads, 40 candle reads, 120 estimator book reads for non-
+members. Verdicts are PERSISTED (`scan_series_meta`, `scan_history_cache`
+in imm_state.json), so after the first hour the steady state is a handful
+of reads per refresh. A candidate whose reads didn't fit the budget is
+"pending" — not admitted, retried next refresh.
+
+Admitted markets are ordinary sticky members (quote-to-completion, immune
+to the hopeless exit and the event top-N, like finecon) with their OWN
+guard set, applied on first sight (`ensure_scan_override`) and RE-APPLIED
+AT LOAD from the persisted member list, so a restart can never leave a
+member on the global geometry: ladder `0:10` (half the global 20), net cap
+50 (global 150), safe-join, no rate bar, NO quiet-hours x2, deep-reference
+size multiplier capped at 1.5x (global 3.0x; `capped_ref_mult` grew a
+`series` arg for this — all three sizing sites pass it).
+
+Three eviction tripwires run REGARDLESS of `IMM_BREAKERS` (which is off):
+
+1. **Fill**: own book moves >= 8 contracts in one cycle on a scan member
+   (a 10-lot rung mostly taken) -> the WHOLE EVENT is evicted from the tier
+   PERMANENTLY (`scan_evicted_events`), quotes cancelled on every member of
+   it, this cycle's built quotes stripped, inventory winds down reduce-only
+   through the ordinary managed_extra path. Fills ARE the adverse
+   selection; everything else only predicts it.
+2. **Mid**: external mid jumps >= 8c in one cycle, or drifts >= 15c from
+   the mid at admission (`scan_entry_mid`) -> same eviction. Information
+   arrived in a market admitted for having none.
+3. **Tier loss budget**: the tier's own realized + MTM today over every
+   market it ever admitted (`scan_book`; flat, departed markets leave it
+   only at the daily roll, so a settlement loss booked mid-day stays in
+   that day's figure) <= -$75 -> every scan member deselected, tier closed
+   until the next ET day
+   (`scan_halt_day`), urgent alert `scan_halt`. Carried across restarts
+   like pnl_today (`scan_pnl_carry`, same 5am-CT roll). The whole-book
+   $1,200 halt is untouched — this bounds the blast radius of an
+   unreviewed universe on its own.
+
+Each eviction strikes the SERIES; 2 strikes in 7 days bar the family
+(`series_struck`). Evictions alert (`scan_evict`, keyed by event).
+
+### Knobs (env, prefix IMM_SCAN_)
+
+`TOP_N` 15 (0 = tier OFF, nothing else in the bot reads these) ·
+`EVENT_TOP_N` 3 · `DAILY_OPENINGS` 5 · `LEVELS` 0:10 · `MAX_POSITION` 50 ·
+`REF_MULT_CAP` 1.5 · `HOUR_MULT` 0 · `REQUIRE_DATED` 1 · `REQUIRE_NUMERIC` 1 ·
+`MIN_AGE_H` 24 · `MAX_VOLUME_24H` 60 · `MAX_EVENT_VOLUME_24H` 250 ·
+`HISTORY_H` 72 · `MIN_HISTORY_BARS` 12 · `MAX_RANGE` 10 · `MAX_JUMP` 6 ·
+`MAX_HISTORY_VOLUME` 250 · `HISTORY_TTL_H` 6 · `SERIES_META_TTL_D` 7 ·
+`MAX_BULK` 600 · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·
+`MAX_HISTORY_FETCHES` 40 · `FILL_HALT` 8 · `MID_JUMP` 8 · `DRIFT` 15 ·
+`DAILY_LOSS_LIMIT` 75 · `SERIES_STRIKES` 2 · `SERIES_STRIKE_DAYS` 7 ·
+`EXCLUDE_CATEGORIES` · `EXCLUDE_PREFIXES` · `LIVE_SOURCE_KEYWORDS`.
+Widening levers, in order of how much risk they add: `EXCLUDE_CATEGORIES`
+(drop Culture/Politics), `MAX_VOLUME_24H`, `REQUIRE_NUMERIC=0` (admits
+"will X happen" binaries — the resolution-jump class; don't).
+
+### Observability
+
+- Refresh log: `open-scan: N string-screened -> M eligible -> k/15 members
+  (+u/5 openings used today[, HALTED today]); rejects {...}` with the
+  per-screen reject counts; `open-scan admit <ticker>: pool/est/mid/vol24h`
+  per admission; `open-scan daily openings: n used`.
+- `--status` table grew a TIER column (`scan` / `fin` / blank) and an
+  `open-scan k/15` tail.
+- `status_incentive_mm.json`: `scan_members`, `scan_slots`,
+  `scan_openings_used`, `scan_evicted_events`, `scan_halted_today`,
+  `scan_pnl_today`. `imm_state.json`: `scan_members`, `scan_book`,
+  `scan_entry_mid`, `scan_evicted_events`, `scan_series_strikes`,
+  `scan_history_cache`, `scan_series_meta`, `scan_halt_day`,
+  `scan_admit_day/scan_admits_today`, `scan_pnl_carry`.
+- Opportunistic email (`send_opportunistic_imm.py`): both tiers, a TIER
+  column per event row, per-tier slot/openings counts in the header (with
+  HALTED / evicted flags), Kalshi-credited footer covers scan events too.
+- Digest FINECON SWEEP section gained an OPEN SCAN block (members, accrual,
+  openings, evictions, halt flag).
+- Quote-gaps email: markets in the scan universe are labelled
+  `open-scan: <cached verdict>` (undated / shape / category:<c> /
+  live_source / history_* / evicted / series_struck / tier halted today /
+  screens pending / eligible) from the bot's persisted caches — the script
+  never fetches; excluded families read `excluded family (open-scan)`.
+
+### DEPLOYMENT CAVEAT — read before merging
+
+This was built in a container whose egress policy blocks
+api.elections.kalshi.com (403 on CONNECT). The exclusion list and the
+screens were designed from the repo's code and docs (the 9/2 finecon scan
+notes, the other bots' series, the strategy doc), NOT from a live pass over
+the programs feed, and the candlestick/series parsers are written tolerant
+of both the cents and `_dollars` encodings but were exercised only against
+fixtures. Before merging:
+
+1. `python -m unittest test_incentive_mm` — 497 tests, green on Windows
+   (the two pre-existing red items were fixed in this change: the 35
+   `winreg` ImportErrors on non-Windows and the stale KXMAMDANIMENTION gate
+   assertion from fdc3a17).
+2. `python incentive_mm.py --status` on the trading box (read-only): read
+   the `open-scan:` line — the rejects breakdown is the first live evidence
+   of what the universe looks like — and the TIER column. Expect few or no
+   admissions on the first pass (`series_meta_pending` / `history_pending`
+   until the caches fill, ~an hour of refreshes live) and check that
+   nothing admitted is a family Jack recognises as live-feed. If the
+   candlestick parser sees a field shape it doesn't know, every candidate
+   reads `history_thin` — that is the fail-closed direction and the log
+   will say so; fix the parser, don't loosen the screen.
+3. Merge to main; the bot self-restarts on the code change. The tier's
+   kill switch is `IMM_SCAN_TOP_N=0` in the launcher (`restart_imm.ps1
+   -Task` to apply), or its own loss budget.
+
+Portability note: the five satellite scripts' `_env_from_registry` caught
+only `OSError`, so `import winreg` raised on Linux and every test importing
+them errored; they now also catch `ImportError` (Windows unchanged).

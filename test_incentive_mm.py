@@ -1417,10 +1417,29 @@ class FakeClient:
                 "no_dollars": [["0.49", "1200"]]}},   # ext ask = 51
         }
         self.positions = {}
+        # open-scan tier reads (2026-09-05): GET /series/<s> and the hourly
+        # candlesticks. Absent entries RAISE, like a failed live read.
+        self.series_meta = {}
+        self.candles = {}
 
     def get(self, path, params=None):
-        assert path == "/incentive_programs"
-        return {"incentive_programs": self.programs, "next_cursor": None}
+        if path == "/incentive_programs":
+            return {"incentive_programs": self.programs, "next_cursor": None}
+        if path.startswith("/series/") and path.endswith("/candlesticks"):
+            ticker = path.split("/markets/")[1].rsplit("/", 1)[0]
+            self.candle_reads = getattr(self, "candle_reads", 0) + 1
+            c = self.candles.get(ticker)
+            if c is None:
+                raise RuntimeError(f"no candles for {ticker}")
+            return {"candlesticks": c}
+        if path.startswith("/series/"):
+            series = path.split("/")[2]
+            self.series_reads = getattr(self, "series_reads", 0) + 1
+            meta = self.series_meta.get(series)
+            if meta is None:
+                raise RuntimeError(f"no series meta for {series}")
+            return {"series": meta}
+        raise AssertionError(f"unexpected GET {path}")
 
     def get_markets(self, **kw):
         wanted = (kw.get("tickers") or "").split(",")
@@ -5534,10 +5553,12 @@ class TestLiveEventDepthGate(unittest.TestCase):
         match: KXTRUMPMENTIONB rides the KXTRUMPMENTION entry."""
         imm.EVENT_DEPTH_GATE_PREFIXES = self._prefixes   # the REAL defaults
         self.assertTrue(imm.PAD_TO_TARGET_GLOBAL)
-        for s in ("KXTRUMPMENTION", "KXTRUMPMENTIONB", "KXMAMDANIMENTION"):
+        for s in ("KXTRUMPMENTION", "KXTRUMPMENTIONB"):
             self.assertTrue(imm.series_event_depth_gated(s), s)
             self.assertFalse(imm.series_pad_to_target(s), s)
-        for s in ("KXGOOD", "KXTEMPAUSH", "KXLOVEISLMENTION"):
+        # KXMAMDANIMENTION left the gate 2026-09-05 (fdc3a17, Jack: quote
+        # through liveness) — it pads like any ungated series again
+        for s in ("KXGOOD", "KXTEMPAUSH", "KXLOVEISLMENTION", "KXMAMDANIMENTION"):
             self.assertFalse(imm.series_event_depth_gated(s), s)
             self.assertTrue(imm.series_pad_to_target(s), s)
 
@@ -6779,6 +6800,698 @@ class TestOpportunisticEmail(unittest.TestCase):
         for s in imm._DEFAULT_FINECON_SERIES.split(","):
             lbl = opp.event_label(None, f"{s}-26OCT01")
             self.assertTrue(lbl and not lbl.startswith("KX"), s)
+
+    def test_quote_gaps_open_scan_labels(self):
+        # imm_quote_gaps labels a scan-universe market from the live bot's
+        # PERSISTED screen caches — never a fetch (the script is read-only).
+        import imm_quote_gaps as qg
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=None, live=False)
+        now = datetime.now(timezone.utc)
+        t = "KXNOVEL-99DEC31-T5"
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "screens pending")
+        self.assertEqual(qg.scan_gap_label(bot, "KXNOVEL-99DEC31-HOLD", now),
+                         "shape")
+        self.assertEqual(qg.scan_gap_label(bot, "KXNOVEL-26OCTDELIV-T5", now),
+                         "undated")
+        bot.state.scan_series_meta["KXNOVEL"] = {
+            "ts": time.time(), "ok": False, "why": "category:Sports"}
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "category:Sports")
+        bot.state.scan_series_meta["KXNOVEL"] = {"ts": time.time(), "ok": True}
+        bot.state.scan_history_cache[t] = {
+            "ts": time.time(), "ok": False, "why": "history_range"}
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "history_range")
+        bot.state.scan_history_cache[t] = {"ts": time.time(), "ok": True}
+        self.assertEqual(qg.scan_gap_label(bot, t, now),
+                         "eligible (slots/ROI/live screens)")
+        bot.state.scan_series_strikes["KXNOVEL"] = [time.time(), time.time()]
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "series_struck")
+        bot.state.scan_halt_day = now.astimezone(imm.ET).date().isoformat()
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "tier halted today")
+        bot.state.scan_evicted_events["KXNOVEL-99DEC31"] = time.time()
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "evicted")
+
+    def test_digest_finecon_section_reports_open_scan(self):
+        import send_imm_digest as sd
+        today = datetime.now(timezone.utc).astimezone(imm.CT).date()
+        state = {"selected_tickers": ["KXNOVEL-99DEC31-T5", "KXSPRLVL-26SEP09-T286"],
+                 "scan_members": ["KXNOVEL-99DEC31-T5"],
+                 "scan_admit_day": today.isoformat(), "scan_admits_today": 2,
+                 "scan_evicted_events": {"KXDEAD-26SEP09": 1.0},
+                 "accrued_est": {"KXNOVEL-99DEC31-T5": 1.25,
+                                 "KXSPRLVL-26SEP09-T286": 0.5},
+                 "own_pos": {"KXNOVEL-99DEC31-T5": -7}}
+        w = {"day": {"events": {}}, "week": {"events": {}}}
+        L, html = sd.finecon_section(state, w, today)
+        text = "\n".join(L)
+        self.assertIn("OPEN SCAN", text)
+        self.assertIn(f"Quoting 1/{imm.SCAN_TOP_N} slots (+2/{imm.SCAN_DAILY_OPENINGS}",
+                      text)
+        self.assertIn("1 event(s) evicted", text)
+        self.assertIn("KXNOVEL-99DEC31-T5", text)
+        self.assertNotIn("HALTED", text)
+        self.assertIn("Open scan", html)
+        # the finecon half still reports its own member
+        self.assertIn("KXSPRLVL-26SEP09-T286", text)
+        state["scan_halt_day"] = today.isoformat()
+        L, html = sd.finecon_section(state, w, today)
+        self.assertIn("HALTED today", "\n".join(L))
+        self.assertIn("HALTED today", html)
+
+
+class TestOpenScanTier(unittest.TestCase):
+    """Jack 2026-09-05: "extend the opportunistic IMM with 15 slots and 5 to
+    scan all markets. be very careful for adverse selection". The tier's
+    universe is the COMPLEMENT of the allowed book, so these tests run with
+    the real allowlist policy (ALLOWLIST_ONLY on) and a novel series that no
+    allowlist knows. Every screen fails closed; every tripwire evicts the
+    whole event for good; the tier has its own daily loss budget."""
+
+    S = "KXNOVEL"
+    EV = "KXNOVEL-99DEC31"
+    A = "KXNOVEL-99DEC31-T5"
+    B = "KXNOVEL-99DEC31-T6"
+
+    def setUp(self):
+        self._allow = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+        self.addCleanup(setattr, imm, "ALLOWLIST_ONLY", self._allow)
+        # PRODUCTION ladder mode (the launcher runs IMM_LADDER_MODE=atref):
+        # in the suite's default offsets mode a safe-joined rung two ticks
+        # behind a deep touch sits OUTSIDE the qualifying walk and scores
+        # zero, which is the 2026-08-05 reference-cap lesson, not a scan
+        # property — atref caps safe-join at the reference.
+        self._mode = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"
+        self.addCleanup(setattr, imm, "LADDER_MODE", self._mode)
+        self.addCleanup(_clean_persist)
+        self.addCleanup(self._release)
+        _clean_persist()
+
+    def _release(self):
+        for s in list(imm.SCAN_GUARDED_SERIES):
+            imm.release_scan_override(s)
+        for s in (self.S, "KXPRIOR"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+
+    @staticmethod
+    def _candles(n=20, bid=40, ask=44, vol=1):
+        return [{"yes_bid": {"close": bid}, "yes_ask": {"close": ask},
+                 "volume": vol} for _ in range(n)]
+
+    def _market(self, t, bid="0.4900", ask="0.5100", vol24="5", age_h=48):
+        now = datetime.now(timezone.utc)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        return {"ticker": t, "event_ticker": self.EV, "status": "active",
+                "close_time": (now + timedelta(days=30)).strftime(fmt),
+                "open_time": (now - timedelta(hours=age_h)).strftime(fmt),
+                "yes_bid_dollars": bid, "yes_ask_dollars": ask,
+                "volume_fp": "20.00", "volume_24h_fp": vol24,
+                "strike_type": "greater"}
+
+    def _bot(self, tickers=None, category="Economics", sources=None,
+             candles=None):
+        client = FakeClient()
+        now = datetime.now(timezone.utc)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        start = (now - timedelta(days=1)).strftime(fmt)
+        end = (now + timedelta(days=6)).strftime(fmt)
+        for t in (tickers or [self.A]):
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": start, "end_date": end})
+            client.markets[t] = self._market(t)
+            client.books[t] = {"orderbook_fp": {
+                "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+                "no_dollars": [["0.49", "1200"]]}}
+            client.candles[t] = list(candles) if candles is not None \
+                else self._candles()
+        client.series_meta[self.S] = {
+            "category": category,
+            "settlement_sources": sources or [
+                {"name": "EIA", "url": "https://www.eia.gov"}]}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _meta(self, t=None, **kw):
+        now = datetime.now(timezone.utc)
+        base = dict(ticker=t or self.A, event_ticker=self.EV, series=self.S,
+                    dollars_per_day=100.0, program_end=None,
+                    target_size=1000.0, discount_factor=0.5, cutoff=None,
+                    close_time=None, mid_cents=50.0, spread_cents=2,
+                    open_time=now - timedelta(hours=48), scan=True,
+                    volume_24h=5.0)
+        base.update(kw)
+        return MarketMeta(**base)
+
+    def _orders(self, bot, t):
+        out = []
+        for o in bot.state.sim_orders.values():
+            if o.get("ticker") != t:
+                continue
+            parsed = order_yes_book_cents(o)
+            if parsed is None:
+                continue
+            out.append((parsed[0], parsed[1], order_remaining(o)))
+        return out
+
+    # ---- universe / structure ------------------------------------------------
+
+    def test_universe_is_the_complement_of_the_allowed_book(self):
+        r = imm.scan_universe_reason
+        self.assertIsNone(r("KXNOVEL-26OCT13-T5"))
+        # everything the normal book quotes is NOT scan universe
+        self.assertEqual(r("KXSPRLVL-26OCT13-T286"), "allowed")   # finecon
+        self.assertEqual(r("KXBA-26JULDELIV-130"), "allowed")     # company
+        self.assertEqual(r("KXWCMENTION-26JUL11ARGSUI-VAR"), "allowed")
+        self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"), "allowed")  # prefix
+        # blocklist wins over everything (other bots' books)
+        self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")
+        self.assertEqual(r("KXXRPMAXMON-XRP-26JUL31-140"), "blocked")
+        self.assertEqual(r("KXMLBMENTION-26JUL14ALNL-GRAN"), "blocked")
+        # structural exclusions: other repo bots, live feeds, the 9/2 traps
+        for t in ("KXLOWTSATX-26SEP08-T70", "KXRAINNYC-26SEP03-X",
+                  "KXEURUSD-26SEP08-T1.1", "KXINXU-26SEP08-T6000",
+                  "KXBTCD-26AUG0521-T54099.99", "KXNFLGAME-26SEP08-T1",
+                  "KXUE-RUS26SEP-T5", "KXISMPMI-26OCT01-T50",
+                  "KXSNOWCRABCATCH-26OCT09-T1", "KXTRUFAIDP-26AUG26-T50",
+                  "KXTXERCOTPEAK-26SEP08-T70000"):
+            self.assertEqual(r(t), "excluded_family", t)
+        # knobs: tier off / allowlist off -> no scan universe at all
+        old = imm.SCAN_TOP_N
+        imm.SCAN_TOP_N = 0
+        try:
+            self.assertEqual(r("KXNOVEL-26OCT13-T5"), "off")
+        finally:
+            imm.SCAN_TOP_N = old
+        imm.ALLOWLIST_ONLY = False
+        self.assertEqual(r("KXNOVEL-26OCT13-T5"), "allowlist_off")
+        imm.ALLOWLIST_ONLY = True
+        # _allowed itself is untouched: the scan path is the ONLY way in
+        self.assertFalse(IncentiveMarketMaker._allowed("KXNOVEL-26OCT13-T5"))
+
+    def test_structure_screen_dated_numeric(self):
+        sr = imm.scan_shape_reason
+        for t in ("KXNOVEL-26OCT13-T286", "KXNOVEL-26OCT13-B90",
+                  "KXNOVEL-26OCT13-4.1400", "KXNOVEL-26OCT13-T1.2M",
+                  "KXNOVEL-26OCT13-T54099.99"):
+            self.assertIsNone(sr(t), t)
+        # categorical / binary outcomes are the resolution-jump class
+        self.assertEqual(sr("KXNOVEL-26OCT27-HOLD"), "shape")
+        self.assertEqual(sr("KXNOVEL-26OCT27-YES"), "shape")
+        # Kalshi's own strike_type rescues an odd ticker segment
+        self.assertIsNone(sr("KXNOVEL-26OCT27-HOLD", "greater"))
+        self.assertEqual(sr("KXNOVEL-26OCT27-HOLD", "custom"), "shape")
+        # no day in the ticker = no midnight-ET release guard (KXUE/ISMPMI)
+        self.assertEqual(sr("KXBA-26JULDELIV-130"), "undated")
+        self.assertEqual(sr("KXRT-DOG-45"), "undated")
+        self.assertEqual(sr("KXUE-RUS26SEP-T5"), "undated")
+
+    def test_history_verdict(self):
+        v = imm.scan_history_verdict(self._candles())
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["bars"], 20)
+        self.assertEqual(imm.scan_history_verdict(self._candles(n=5))["why"],
+                         "history_thin")
+        # a 21c re-level inside the window: not quiet
+        moved = self._candles(n=12) + self._candles(n=8, bid=60, ask=64)
+        self.assertEqual(imm.scan_history_verdict(moved)["why"],
+                         "history_range")
+        # a one-bar step under the range cap but over the jump cap
+        stepped = self._candles(n=12) + self._candles(n=8, bid=47, ask=51)
+        self.assertEqual(imm.scan_history_verdict(stepped)["why"],
+                         "history_jump")
+        busy = self._candles(vol=20)          # 400 traded in 72h
+        self.assertEqual(imm.scan_history_verdict(busy)["why"],
+                         "history_volume")
+        # dollars-string encoding parses; junk / one-sided bars don't count
+        dollars = [{"yes_bid": {"close_dollars": "0.40"},
+                    "yes_ask": {"close_dollars": "0.44"}, "volume_fp": "1"}
+                   for _ in range(15)]
+        self.assertTrue(imm.scan_history_verdict(dollars)["ok"])
+        junk = [{"garbage": 1}, {"yes_bid": {"close": 40}}] * 10
+        self.assertEqual(imm.scan_history_verdict(junk)["why"], "history_thin")
+        self.assertEqual(imm.scan_history_verdict(None)["why"], "history_thin")
+
+    def test_series_meta_verdict(self):
+        ok, why, cat = imm.scan_series_meta_verdict({"category": "Sports"})
+        self.assertFalse(ok)
+        self.assertEqual(why, "category:Sports")
+        for c in ("Sports", "Crypto", "Elections", "Politics",
+                  "Climate and Weather", "Culture", "Entertainment"):
+            self.assertIn(c, imm.SCAN_EXCLUDE_CATEGORIES, c)
+        for c in ("Economics", "Financials", "Companies",
+                  "Science and Technology", "Health", "World"):
+            self.assertNotIn(c, imm.SCAN_EXCLUDE_CATEGORIES, c)
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Financials", "settlement_sources": [
+                {"name": "Pyth Network", "url": "https://pyth.network"}]})[1],
+            "live_source")
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Economics", "settlement_sources": [
+                {"name": "EIA", "url": "https://www.eia.gov"}]}),
+            (True, "", "Economics"))
+        # an empty/odd object fails CLOSED (API shape change), not open —
+        # and so does a series object with no category at all
+        self.assertEqual(imm.scan_series_meta_verdict({})[1],
+                         "series_meta_unavailable")
+        self.assertEqual(imm.scan_series_meta_verdict(None)[1],
+                         "series_meta_unavailable")
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"settlement_sources": []})[1], "category:unknown")
+
+    # ---- admission screens (bot-level, cached + budgeted reads) --------------
+
+    def test_admission_screens_fail_closed(self):
+        bot = self._bot()
+        now = datetime.now(timezone.utc)
+        m = self._market(self.A)
+        budget = {"series": 5, "history": 5}
+        self.assertIsNone(bot._scan_admission(self._meta(), m, {}, now, budget))
+        self.assertEqual(budget, {"series": 4, "history": 4})
+        # cached verdicts: a zero budget still admits (no read needed)
+        self.assertIsNone(bot._scan_admission(
+            self._meta(), m, {}, now, {"series": 0, "history": 0}))
+        # activity screens
+        self.assertEqual(bot._scan_admission(
+            self._meta(open_time=None), m, {}, now, budget), "age")
+        self.assertEqual(bot._scan_admission(
+            self._meta(open_time=now - timedelta(hours=2)), m, {}, now,
+            budget), "age")
+        self.assertEqual(bot._scan_admission(
+            self._meta(volume_24h=imm.SCAN_MAX_VOLUME_24H + 1), m, {}, now,
+            budget), "volume")
+        self.assertEqual(bot._scan_admission(
+            self._meta(), m, {self.EV: imm.SCAN_MAX_EVENT_VOLUME_24H + 1},
+            now, budget), "event_volume")
+        # structure (strike_type from the market object counts)
+        self.assertEqual(bot._scan_admission(
+            self._meta(t="KXNOVEL-99DEC31-HOLD"), dict(m, strike_type="custom"),
+            {}, now, budget), "shape")
+        # evicted event / struck series never come back
+        bot.state.scan_evicted_events[self.EV] = time.time()
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "evicted")
+        bot.state.scan_evicted_events.clear()
+        bot.state.scan_series_strikes[self.S] = [time.time(), time.time()]
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "series_struck")
+        bot.state.scan_series_strikes.clear()
+        # strikes age out
+        bot.state.scan_series_strikes[self.S] = [
+            time.time() - imm.SCAN_SERIES_STRIKE_TTL_SECS - 1] * 3
+        self.assertIsNone(bot._scan_admission(self._meta(), m, {}, now, budget))
+        bot.state.scan_series_strikes.clear()
+        # family screen: category, live source, unreadable, budget
+        bot.state.scan_series_meta.clear()
+        bot.client.series_meta[self.S] = {"category": "Sports"}
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "category:Sports")
+        bot.state.scan_series_meta.clear()
+        bot.client.series_meta[self.S] = {
+            "category": "Economics",
+            "settlement_sources": [{"name": "Coinbase", "url": ""}]}
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "live_source")
+        bot.state.scan_series_meta.clear()
+        bot.client.series_meta.pop(self.S)
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "series_meta_unavailable")
+        self.assertNotIn(self.S, bot.state.scan_series_meta)   # not cached
+        bot.client.series_meta[self.S] = {
+            "category": "Economics",
+            "settlement_sources": [{"name": "EIA", "url": "https://www.eia.gov"}]}
+        self.assertEqual(bot._scan_admission(
+            self._meta(), m, {}, now, {"series": 0, "history": 5}),
+            "series_meta_pending")
+        self.assertIsNone(bot._scan_admission(self._meta(), m, {}, now, budget))
+        # history screen: thin / moved / busy / unreadable / budget
+        bot.state.scan_history_cache.clear()
+        bot.client.candles[self.A] = self._candles(n=3)
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "history_thin")
+        bot.state.scan_history_cache.clear()
+        bot.client.candles[self.A] = (self._candles(n=12)
+                                      + self._candles(n=8, bid=60, ask=64))
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "history_range")
+        bot.state.scan_history_cache.clear()
+        bot.client.candles[self.A] = self._candles(vol=30)
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "history_volume")
+        bot.state.scan_history_cache.clear()
+        bot.client.candles.pop(self.A)
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "history_unavailable")
+        self.assertNotIn(self.A, bot.state.scan_history_cache)
+        bot.client.candles[self.A] = self._candles()
+        self.assertEqual(bot._scan_admission(
+            self._meta(), m, {}, now, {"series": 5, "history": 0}),
+            "history_pending")
+        # a fresh budget (the one above is spent): admissible again
+        self.assertIsNone(bot._scan_admission(
+            self._meta(), m, {}, now, {"series": 5, "history": 5}))
+
+    # ---- the walk ------------------------------------------------------------
+
+    def test_group_walk_15_slots_3_per_event_openings(self):
+        def m(t, est, scan=True):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=20.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=10.0, est_collateral_dollars=0.0,
+                scan=scan)
+        self.assertEqual(imm.SCAN_TOP_N, 15)
+        self.assertEqual(imm.SCAN_EVENT_TOP_N, 3)
+        self.assertEqual(imm.SCAN_DAILY_OPENINGS, 5)
+        # 5 strikes of one event with the best ROIs: only 3 survive, the
+        # slack flows to other events; a non-scan meta is never touched
+        ev1 = [m(f"KXAAA-26SEP09-T{i}", 9.0 - i) for i in range(5)]
+        ev2 = [m(f"KXBBB-26SEP09-T{i}", 3.0 - i * 0.1) for i in range(3)]
+        others = [m(f"KXC{i}-26SEP09-T1", 1.0 - i * 0.01) for i in range(12)]
+        fin = [m("KXSPRLVL-26SEP09-T286", 50.0, scan=False)]
+        cut = imm.scan_group_cut(ev1 + ev2 + others + fin, incumbent=set())
+        kept = {x.ticker for x in ev1 + ev2 + others} - cut
+        self.assertEqual(len(kept), 15)
+        self.assertEqual(sum(1 for t in kept if t.startswith("KXAAA")), 3)
+        self.assertEqual(sum(1 for t in kept if t.startswith("KXBBB")), 3)
+        self.assertEqual(sum(1 for t in kept if t.startswith("KXC")), 9)
+        self.assertNotIn("KXSPRLVL-26SEP09-T286", cut)
+        # members are never cut and consume slots; openings go THROUGH a
+        # full cap, never past the per-event 3
+        members = [m(f"KXM{e}-26SEP09-T{i}", 0.01) for e in range(5)
+                   for i in range(3)]
+        mem_ids = {x.ticker for x in members}
+        new = [m("KXNEW-26OCT07-T100", 9.0), m("KXNEW-26OCT07-T102", 8.0),
+               m("KXNEW-26OCT07-T104", 7.5), m("KXNEW-26OCT07-T106", 7.0),
+               m("KXOTHER-26OCT03-T95", 6.0)]
+        cut = imm.scan_group_cut(members + new, set(), members=mem_ids)
+        self.assertEqual(cut, {x.ticker for x in new})
+        cut = imm.scan_group_cut(members + new, set(), members=mem_ids,
+                                 extra_openings=5)
+        self.assertEqual(cut, {"KXNEW-26OCT07-T106"})
+        self.assertEqual(imm.scan_openings_used(19, 15), 4)
+        self.assertEqual(imm.scan_openings_used(15, 15), 0)
+        self.assertEqual(imm.scan_openings_used(14, 12), 0)
+        # finecon's walk still answers to ITS knobs (shared engine)
+        self.assertEqual(imm.finecon_openings_used(17, 15), 2)
+
+    # ---- guard geometry ------------------------------------------------------
+
+    def test_guard_set_applied_tightened_released(self):
+        imm.ensure_scan_override(self.S)
+        ov = imm.SERIES_OVERRIDES[self.S]
+        self.assertEqual(ov.levels, imm.SCAN_LEVELS)
+        self.assertEqual(ov.levels, [(0, 10)])
+        self.assertEqual(ov.max_position, imm.SCAN_MAX_POSITION)
+        self.assertEqual(ov.max_position, 50)
+        self.assertTrue(imm.series_safe_join(self.S))
+        self.assertEqual(imm.series_min_est_rate(self.S), 0.0)
+        self.assertEqual(imm.series_max_position(self.S), 50)
+        # a dormant hand-tuned entry (the re-entry loop seeds company series
+        # that are not allowlisted) is TIGHTENED, never loosened
+        prior = imm.SeriesOverride(min_est_per_day=2.0, safe_join=True,
+                                   max_position=150)
+        imm.SERIES_OVERRIDES["KXPRIOR"] = prior
+        imm.ensure_scan_override("KXPRIOR")
+        ov2 = imm.SERIES_OVERRIDES["KXPRIOR"]
+        self.assertEqual(ov2.levels, imm.SCAN_LEVELS)
+        self.assertEqual(ov2.max_position, 50)
+        self.assertEqual(ov2.min_est_per_day, 0.0)
+        self.assertTrue(ov2.safe_join)
+        imm.release_scan_override("KXPRIOR")
+        self.assertIs(imm.SERIES_OVERRIDES["KXPRIOR"], prior)
+        imm.release_scan_override(self.S)
+        self.assertNotIn(self.S, imm.SERIES_OVERRIDES)
+        self.assertNotIn(self.S, imm.SCAN_GUARDED_SERIES)
+
+    def test_scan_ladder_geometry_safe_join_and_ref_cap(self):
+        # build_side_ladder is the single placement site (quote loop AND
+        # estimator). Scan series: 10-lot, safe-joined, deep-reference
+        # sizing capped at 1.5x; an ordinary series on the same book gets
+        # the full 2.0x (4 ticks x 0.25) — the cap is the only difference.
+        imm.ensure_scan_override(self.S)
+        # reference 4 ticks behind a 49 touch: rung rests AT the reference
+        # (safe-join cap = max(47, 45) -> 45 is deeper, so 45 wins), sized
+        # 10 x min(1.5 cap, 1 + 0.25 x 4 = 2.0) = 15
+        q = imm.build_side_ladder(self.A, "bid", 49, 51, room=100,
+                                  levels=imm.series_levels(self.S), ref_px=45)
+        self.assertEqual([(x.price_cents, x.count) for x in q], [(45, 15)])
+        q = imm.build_side_ladder("KXOTHER-99DEC31-T5", "bid", 49, 51,
+                                  room=100, levels=imm.SCAN_LEVELS, ref_px=45)
+        self.assertEqual([(x.price_cents, x.count) for x in q], [(45, 20)])
+        # reference AT the touch: safe-join wants 47 but is capped at the
+        # reference (2026-08-05: two ticks below a touch-level reference
+        # scores exactly zero), so the rung joins the touch at plain size
+        q = imm.build_side_ladder(self.A, "bid", 49, 51, room=100,
+                                  levels=imm.series_levels(self.S), ref_px=49)
+        self.assertEqual([(x.price_cents, x.count) for x in q], [(49, 10)])
+        # a wide book (spread >= 5) is its own safety net: no offset applied
+        q = imm.build_side_ladder(self.A, "bid", 40, 60, room=100,
+                                  levels=imm.series_levels(self.S), ref_px=40)
+        self.assertEqual([(x.price_cents, x.count) for x in q], [(40, 10)])
+        # room (position cap / event share / skew) still shaves the rung
+        q = imm.build_side_ladder(self.A, "ask", 51, 49, room=4,
+                                  levels=imm.series_levels(self.S), ref_px=51)
+        self.assertEqual([(x.price_cents, x.count) for x in q], [(51, 4)])
+
+    def test_no_quiet_hours_doubling_and_ref_mult_cap(self):
+        imm.ensure_scan_override(self.S)
+        now = datetime.now(timezone.utc)
+        old = imm.HOUR_SIZE_MULTS
+        imm.HOUR_SIZE_MULTS = {h: 2.0 for h in range(24)}
+        try:
+            self.assertEqual(imm.hour_size_mult(self.S, now), 1.0)
+            self.assertEqual(imm.hour_size_mult("KXOTHER", now), 2.0)
+            self.assertEqual(imm.hour_scaled_levels(self.S, now), [(0, 10)])
+        finally:
+            imm.HOUR_SIZE_MULTS = old
+        old_mode = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"
+        try:
+            self.assertEqual(imm.capped_ref_mult(50, 30, "bid"), 3.0)
+            self.assertEqual(imm.capped_ref_mult(50, 30, "bid", series="KXOTHER"),
+                             3.0)
+            self.assertEqual(imm.capped_ref_mult(50, 30, "bid", series=self.S),
+                             imm.SCAN_REF_MULT_CAP)
+            self.assertEqual(imm.capped_ref_mult(50, 49, "bid", series=self.S),
+                             1.25)   # under the cap: untouched
+        finally:
+            imm.LADDER_MODE = old_mode
+
+    # ---- end to end: admission, quoting geometry, persistence ----------------
+
+    def test_admission_quotes_with_scan_geometry(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.A, bot.state.selected)
+        self.assertTrue(bot.state.selected[self.A].scan)
+        self.assertEqual(bot.state.scan_members, {self.A})
+        self.assertIn(self.A, bot.state.scan_book)
+        self.assertEqual(bot.state.scan_entry_mid[self.A], 50.0)
+        self.assertIn(self.S, imm.SCAN_GUARDED_SERIES)
+        # the fixture's KXGOOD/KXWIDE are NOT allowed under the real policy
+        # and carry categorical strikes -> never enter via the scan either
+        self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
+        self.assertNotIn("KXWIDE-99DEC31-B", bot.state.selected)
+        # one 10-lot at-reference rung per side (the scan ladder, NOT the
+        # global 20): on this 49x51 book the reference IS the touch (600 at
+        # 49 >= target/5), so safe-join is capped there and the rung joins
+        # at 49/51 — never improving the touch, never a 20-lot
+        orders = self._orders(bot, self.A)
+        rungs = [o for o in orders if o[1] not in (imm.PAD_BID_CENTS,
+                                                    imm.PAD_ASK_CENTS)]
+        bids = [o for o in rungs if o[0] == "bid"]
+        asks = [o for o in rungs if o[0] == "ask"]
+        self.assertEqual([(o[1], o[2]) for o in bids], [(49, 10.0)])
+        self.assertEqual([(o[1], o[2]) for o in asks], [(51, 10.0)])
+        # status carries the tier
+        bot.write_status(datetime.now(timezone.utc))
+        with open(os.path.join(imm.STATUS_DIR, "status_incentive_mm.json"),
+                  encoding="utf-8") as f:
+            st = json.load(f)
+        self.assertEqual(st["scan_members"], [self.A])
+        self.assertEqual(st["scan_slots"], f"1/{imm.SCAN_TOP_N}")
+        self.assertFalse(st["scan_halted_today"])
+        # the admission was an in-cap slot fill: no opening burned
+        self.assertEqual(bot.state.scan_admits_today, 0)
+
+    def test_tier_off_admits_nothing(self):
+        old = imm.SCAN_TOP_N
+        imm.SCAN_TOP_N = 0
+        try:
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertNotIn(self.A, bot.state.selected)
+            self.assertEqual(bot.state.scan_members, set())
+            self.assertEqual(getattr(bot.client, "series_reads", 0), 0)
+            self.assertEqual(getattr(bot.client, "candle_reads", 0), 0)
+        finally:
+            imm.SCAN_TOP_N = old
+
+    def test_membership_persists_and_reapplies_guards(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot.state.scan_evicted_events["KXDEAD-26SEP09"] = time.time()
+        bot.state.scan_series_strikes["KXDEAD"] = [time.time()]
+        bot._save_persist()
+        # a fresh process has no override in memory — the load must rebuild
+        # it before any cycle can size a ladder
+        imm.release_scan_override(self.S)
+        self.assertNotIn(self.S, imm.SERIES_OVERRIDES)
+        bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+        self.assertEqual(bot2.state.scan_members, {self.A})
+        self.assertIn(self.A, bot2.state.scan_book)
+        self.assertEqual(bot2.state.scan_entry_mid[self.A], 50.0)
+        self.assertIn(self.A, bot2.state.scan_history_cache)
+        self.assertIn(self.S, bot2.state.scan_series_meta)
+        self.assertIn("KXDEAD-26SEP09", bot2.state.scan_evicted_events)
+        self.assertEqual(len(bot2.state.scan_series_strikes["KXDEAD"]), 1)
+        self.assertIn(self.S, imm.SCAN_GUARDED_SERIES)
+        self.assertEqual(imm.SERIES_OVERRIDES[self.S].levels, imm.SCAN_LEVELS)
+        # members quote to completion: the sticky set re-selects the market
+        # WITHOUT re-admission (its candles now unreadable would reject a
+        # newcomer) — and nothing is re-read for it
+        bot2.client.candles.pop(self.A)
+        reads = getattr(bot2.client, "candle_reads", 0)
+        bot2.run_cycle()
+        self.assertIn(self.A, bot2.state.selected)
+        self.assertEqual(bot2.state.scan_members, {self.A})
+        self.assertEqual(getattr(bot2.client, "candle_reads", 0), reads)
+
+    def test_scan_member_survives_hopeless(self):
+        # quote-to-completion (the finecon lifecycle): a sustained sub-$1
+        # projection evicts an ordinary member but not a scan member
+        bot = self._bot()
+        bot.run_cycle()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot._est_peak.clear()
+            bot.state.hopeless_since[self.A] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.A, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    # ---- tripwires -----------------------------------------------------------
+
+    def test_fill_tripwire_evicts_whole_event_permanently(self):
+        bot = self._bot(tickers=[self.A, self.B])
+        bot.run_cycle()
+        self.assertEqual(bot.state.scan_members, {self.A, self.B})
+        # our own book moves 9 in one cycle (account agrees: not manual)
+        bot.pnl.pos[self.A] = 9.0
+        bot.pnl.avg[self.A] = 47.0
+        bot.client.positions[self.A] = 9
+        bot.run_cycle()
+        self.assertNotIn(self.A, bot.state.selected)
+        self.assertNotIn(self.B, bot.state.selected)
+        self.assertEqual(bot.state.scan_members, set())
+        self.assertIn(self.EV, bot.state.scan_evicted_events)
+        self.assertEqual(len(bot.state.scan_series_strikes[self.S]), 1)
+        self.assertEqual(self._orders(bot, self.A), [])
+        self.assertEqual(self._orders(bot, self.B), [])
+        self.assertIn("scan_evict", [c for c, _m in bot.alerter.today])
+        # re-admission refused for good, even on a fresh refresh; the
+        # inventory winds down reduce-only (asks only, never a new bid)
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertNotIn(self.A, bot.state.selected)
+        self.assertNotIn(self.B, bot.state.selected)
+        self.assertEqual(self._orders(bot, self.B), [])
+        self.assertFalse([o for o in self._orders(bot, self.A) if o[0] == "bid"])
+        self.assertLessEqual(sum(o[2] for o in self._orders(bot, self.A)), 9)
+        # the loss-budget book keeps the evicted market while it holds
+        # inventory — and B (flat, gone) too until the DAILY ROLL, so a
+        # settlement loss booked mid-day cannot vanish from today's tier
+        # P&L at the next save
+        self.assertIn(self.A, bot.state.scan_book)
+        self.assertIn(self.B, bot.state.scan_book)
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+        self.assertIn(self.B, bot2.state.scan_book)
+        bot.build_daily_summary()
+        self.assertIn(self.A, bot.state.scan_book)      # still holds 9
+        self.assertNotIn(self.B, bot.state.scan_book)   # flat and gone
+
+    def test_mid_jump_tripwire_evicts_event(self):
+        bot = self._bot(tickers=[self.A, self.B])
+        bot.run_cycle()
+        # A's book re-levels 50c -> 60c between cycles
+        bot.client.books[self.A] = {"orderbook_fp": {
+            "yes_dollars": [["0.58", "500"], ["0.59", "600"]],
+            "no_dollars": [["0.39", "1200"]]}}
+        bot.run_cycle()
+        self.assertNotIn(self.A, bot.state.selected)
+        self.assertNotIn(self.B, bot.state.selected)
+        self.assertIn(self.EV, bot.state.scan_evicted_events)
+        self.assertEqual(self._orders(bot, self.B), [])
+
+    def test_drift_tripwire_evicts_event(self):
+        bot = self._bot()
+        bot.run_cycle()
+        # book unchanged at 50c, but the admission mid was 30c
+        bot.state.scan_entry_mid[self.A] = 30.0
+        bot.run_cycle()
+        self.assertNotIn(self.A, bot.state.selected)
+        self.assertIn(self.EV, bot.state.scan_evicted_events)
+
+    def test_second_strike_bars_the_series(self):
+        bot = self._bot(tickers=[self.A, self.B])
+        bot.run_cycle()
+        bot.state.scan_series_strikes[self.S] = [time.time()]   # one prior
+        bot.state.scan_entry_mid[self.A] = 30.0                   # -> drift
+        bot.run_cycle()
+        self.assertEqual(len(bot.state.scan_series_strikes[self.S]), 2)
+        # a brand-new event of the same series is refused: series_struck
+        now = datetime.now(timezone.utc)
+        self.assertEqual(bot._scan_admission(
+            self._meta(t="KXNOVEL-99NOV30-T5", event_ticker="KXNOVEL-99NOV30"),
+            self._market("KXNOVEL-99NOV30-T5"), {}, now,
+            {"series": 5, "history": 5}), "series_struck")
+
+    def test_daily_loss_budget_closes_the_tier(self):
+        bot = self._bot(tickers=[self.A, self.B])
+        bot.run_cycle()                       # baseline anchors at 0
+        self.assertEqual(bot.state.scan_pnl_baseline, 0.0)
+        bot.pnl.realized[self.A] = -(imm.SCAN_DAILY_LOSS_LIMIT + 1)
+        bot.run_cycle()
+        today_et = datetime.now(timezone.utc).astimezone(imm.ET).date().isoformat()
+        self.assertEqual(bot.state.scan_halt_day, today_et)
+        self.assertEqual(bot.state.scan_members, set())
+        self.assertNotIn(self.A, bot.state.selected)
+        self.assertNotIn(self.B, bot.state.selected)
+        self.assertEqual(self._orders(bot, self.A) + self._orders(bot, self.B), [])
+        self.assertIn("scan_halt", [c for c, _m in bot.alerter.today])
+        # the whole-book halt did NOT fire (its limit is far larger)
+        self.assertEqual(bot.state.halted_until, 0.0)
+        # no admissions for the rest of the day, even on a fresh refresh
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertNotIn(self.A, bot.state.selected)
+        self.assertNotIn(self.B, bot.state.selected)
+        bot.write_status(datetime.now(timezone.utc))
+        with open(os.path.join(imm.STATUS_DIR, "status_incentive_mm.json"),
+                  encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["scan_halted_today"])
+        # the halt day persists across a restart
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+        self.assertEqual(bot2.state.scan_halt_day, today_et)
+        # next ET day: the tier re-opens and admits again
+        bot.state.scan_halt_day = "2000-01-01"
+        bot.state.scan_pnl_baseline = None
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertIn(self.A, bot.state.selected)
+        self.assertEqual(bot.state.scan_members, {self.A, self.B})
+        self.assertEqual(bot.state.scan_halt_day, "2000-01-01")
 
 
 if __name__ == "__main__":
