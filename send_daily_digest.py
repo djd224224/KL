@@ -820,11 +820,18 @@ def build_digest(now_utc: datetime):
 
     grand = {k: m_tot[k] + w_tot[k] + d_tot[k] + a_tot[k] for k in m_tot}
     grand_pnl = grand["realized"] + grand["unrealized"]
+    # Headline number (Jack 9/5): all-time cumulative, computed exactly like
+    # the by-tenor table's TOTAL row so the two never disagree.
+    cum_total = (None if cum is None else
+                 sum(cum.get(f, 0.0) + unreal_by.get(f, 0.0)
+                     for f in _tenor_rows(cum)))
     snap = {"fleet": grand_pnl,
             "monthly": m_tot["realized"] + m_tot["unrealized"],
             "weekly": w_tot["realized"] + w_tot["unrealized"],
             "daily": d_tot["realized"] + d_tot["unrealized"],
             "annual": a_tot["realized"] + a_tot["unrealized"]}
+    if cum_total is not None:
+        snap["cumulative"] = cum_total
     dd_label, deltas = pnl_deltas(today_ct, snap)
 
     def dd(key):
@@ -838,10 +845,21 @@ def build_digest(now_utc: datetime):
 
     # ---- plain text (fallback part) ----------------------------------------
     fleet_dd = f" ({dd_label} {deltas['fleet']:+,.2f})" if dd("fleet") else ""
+    cum_dd = (f" ({dd_label} {deltas['cumulative']:+,.2f})"
+              if dd("cumulative") else "")
     lines = [f"Kalshi crypto MM - {today_ct}", ""]
-    lines.append(f"FLEET P&L: {grand_pnl:+,.2f}{fleet_dd}  "
-                 f"(realized {grand['realized']:+,.2f}, unrealized {grand['unrealized']:+,.2f}, "
-                 f"fees {grand['fees']:,.2f})")
+    # Headline = cumulative P&L + its day-over-day (Jack 9/5); open-fleet P&L
+    # keeps its own line below. Falls back to the old headline when the
+    # settlements sweep failed and there is no cumulative number.
+    if cum_total is not None:
+        lines.append(f"CUMULATIVE P&L (all-time): {cum_total:+,.2f}{cum_dd}")
+        lines.append(f"Open fleet P&L: {grand_pnl:+,.2f}{fleet_dd}  "
+                     f"(realized {grand['realized']:+,.2f}, unrealized {grand['unrealized']:+,.2f}, "
+                     f"fees {grand['fees']:,.2f})")
+    else:
+        lines.append(f"FLEET P&L: {grand_pnl:+,.2f}{fleet_dd}  "
+                     f"(realized {grand['realized']:+,.2f}, unrealized {grand['unrealized']:+,.2f}, "
+                     f"fees {grand['fees']:,.2f})")
     lines.append(f"Net position {grand['net_pos']:+,.0f} contracts | "
                  f"$ exposure ${grand['exposure']:,.2f} | balance {bal_str}")
     lines.append("")
@@ -876,9 +894,19 @@ def build_digest(now_utc: datetime):
     fleet_dd_html = (f' <span style="font-size:14px;font-weight:400;color:#555">'
                      f'({dd_label} {_pnl_span(deltas["fleet"])})</span>'
                      if dd("fleet") else "")
-    h.append(f'<div style="font-size:21px;font-weight:700;margin:8px 0 2px">'
-             f'Fleet P&amp;L: {_pnl_span(grand_pnl)}{fleet_dd_html}</div>')
-    h.append(f'<div style="color:#555;margin-bottom:4px">'
+    if cum_total is not None:
+        cum_dd_html = (f' <span style="font-size:14px;font-weight:400;color:#555">'
+                       f'({dd_label} {_pnl_span(deltas["cumulative"])})</span>'
+                       if dd("cumulative") else "")
+        h.append(f'<div style="font-size:21px;font-weight:700;margin:8px 0 2px">'
+                 f'Cumulative P&amp;L: {_pnl_span(cum_total)}{cum_dd_html}</div>')
+        fleet_line = (f'open fleet P&amp;L <b>{_pnl_span(grand_pnl)}</b>'
+                      f'{fleet_dd_html} &nbsp;&middot;&nbsp; ')
+    else:
+        h.append(f'<div style="font-size:21px;font-weight:700;margin:8px 0 2px">'
+                 f'Fleet P&amp;L: {_pnl_span(grand_pnl)}{fleet_dd_html}</div>')
+        fleet_line = ''
+    h.append(f'<div style="color:#555;margin-bottom:4px">{fleet_line}'
              f'realized {_pnl_span(grand["realized"])} &nbsp;&middot;&nbsp; '
              f'unrealized {_pnl_span(grand["unrealized"])} &nbsp;&middot;&nbsp; '
              f'fees {grand["fees"]:,.2f}<br>'
