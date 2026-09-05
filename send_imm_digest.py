@@ -503,6 +503,7 @@ def daily_series(client, fills, mids, results, state, days=60):
     days_set = set(hist)
     for day in by_day:
         days_set.add(day.isoformat())
+    fresh = {}
     for key in sorted(days_set):
         try:
             day = datetime.strptime(key, "%Y-%m-%d").date()
@@ -513,12 +514,22 @@ def daily_series(client, fills, mids, results, state, days=60):
         reward = paid_hist.get(key, hist.get(key))
         dfills = by_day.get(day, [])
         bf = backfill.get(key)
-        if bf:                              # authoritative: full-history rebuild
-            raw = _f(bf.get("raw"))
-            contracts, nf = _f(bf.get("contracts")), int(bf.get("fills") or 0)
-        elif dfills:
+        # Live in-window recompute wins (marks/settles move until final) and
+        # is upserted into the store — UNLESS the stored record saw MORE
+        # fills: the oldest in-window day is only partially covered by the
+        # fill window, and freezing it would clobber a fuller measurement.
+        if dfills and not (bf and int(bf.get("fills") or 0) > len(dfills)):
             tot, _ev, _p = raw_pnl_for_fills(client, dfills, mids, results)
             raw, contracts, nf = tot["raw"], tot["contracts"], len(dfills)
+            fresh[key] = {"raw": round(raw, 2),
+                          "realized": round(_f(tot.get("realized")), 2),
+                          "settle": round(_f(tot.get("settle")), 2),
+                          "mtm": round(_f(tot.get("unrealized")), 2),
+                          "fees": round(_f(tot.get("fees")), 2),
+                          "contracts": round(contracts, 2), "fills": nf}
+        elif bf:                            # frozen: backfill or prior upsert
+            raw = _f(bf.get("raw"))
+            contracts, nf = _f(bf.get("contracts")), int(bf.get("fills") or 0)
         elif reward is not None:
             raw, contracts, nf = None, 0.0, 0
         else:
@@ -535,6 +546,21 @@ def daily_series(client, fills, mids, results, state, days=60):
             continue
         out.append((day, _f(bf.get("raw")), None, _f(bf.get("contracts")),
                     int(bf.get("fills") or 0)))
+    # Persist the live-computed days: each day keeps refreshing while inside
+    # the fill window, then stays FROZEN at its last (fullest) measurement
+    # instead of dropping to n/a once it ages past FILL_LOOKBACK_HOURS. The
+    # 8/4-8/28 n/a hole was this store going stale after its one-time 8/3
+    # backfill; wholesale rebuilds remain imm_backfill_daily_pnl.py's job.
+    if fresh:
+        merged = dict(backfill)
+        merged.update(fresh)
+        try:
+            tmp = DAILY_PNL_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(merged, f, indent=1, sort_keys=True)
+            os.replace(tmp, DAILY_PNL_PATH)
+        except OSError as e:
+            log(f"! daily_pnl.json upsert failed: {e}")
     out.sort(key=lambda r: r[0])
     return out
 
