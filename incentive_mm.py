@@ -1628,39 +1628,50 @@ def finecon_openings_used(n_kept: int, n_members: int) -> int:
 #              >= SCAN_MAX_JUMP_CENTS, traded volume under a cap. A book that
 #              moved is not quiet, whatever its family says.
 # Admitted markets are ordinary members (sticky, quote-to-completion — the
-# finecon lifecycle) but carry their OWN guard set — half ladder, tighter
-# net cap, safe-join, no quiet-hours doubling, deep-reference sizing capped
-# — and three eviction tripwires that run REGARDLESS of IMM_BREAKERS:
-#   1. own-book move >= SCAN_FILL_HALT_CONTRACTS in one cycle (we are being
-#      swept: fills ARE the adverse selection) -> the whole EVENT is evicted
-#      from the tier PERMANENTLY, quotes cancelled, inventory winds down
-#      reduce-only through the ordinary managed_extra path
-#   2. external mid jump >= SCAN_MID_JUMP_CENTS in one cycle, or drift
-#      >= SCAN_DRIFT_CENTS from the mid at admission -> same eviction
-#      (information arrived; this was not the quiet print it looked like)
-#   3. the tier's OWN daily loss budget (SCAN_DAILY_LOSS_LIMIT: realized +
-#      MTM over every market the tier ever admitted) -> every scan member
-#      deselected, no admissions until the next ET day
-# Each eviction also strikes the SERIES; SCAN_SERIES_STRIKE_LIMIT strikes in
+# finecon lifecycle) sized EXACTLY like the normal book (Jack 2026-09-05 pm:
+# "it can have the same contracts/max net position/deep reference/overnight
+# size as the normal book") with safe-join placement and no rate bar as the
+# only per-series guards. The BACKSTOP is the tier's OWN daily loss budget
+# (SCAN_DAILY_LOSS_LIMIT: realized + MTM over every market the tier ever
+# admitted) -> every scan member deselected, no admissions until the next
+# ET day. Two per-event eviction tripwires exist in the quote loop but are
+# OFF by default (Jack 2026-09-05 pm, on the first cut's fill-burst and
+# mid-jump/drift evictions: "dont need these"); arming knobs, >0 = on, and
+# they then run regardless of IMM_BREAKERS:
+#   IMM_SCAN_FILL_HALT   own-book move >= N contracts in one cycle -> the
+#                        whole EVENT evicted from the tier PERMANENTLY,
+#                        quotes cancelled, inventory reduce-only
+#   IMM_SCAN_MID_JUMP /  external mid jump >= N cents in one cycle, or
+#   IMM_SCAN_DRIFT       drift >= N cents from the admission mid -> same
+# An eviction strikes the SERIES; SCAN_SERIES_STRIKE_LIMIT strikes in
 # SCAN_SERIES_STRIKE_TTL bar the whole family. Slots: SCAN_TOP_N with at
 # most SCAN_EVENT_TOP_N per event plus SCAN_DAILY_OPENINGS over-cap
 # admissions per ET day — the finecon walk with its own counters.
 # IMM_SCAN_TOP_N=0 switches the tier off; the normal book never reads
 # these knobs. Guards are applied on first sight (ensure_scan_override) and
 # re-applied from the persisted member list at load, so a restart can never
-# leave a scan member quoting the global 20/side / 150-cap geometry.
+# leave a scan member quoting without safe-join.
 # ============================================================================
 SCAN_TOP_N = _env_int("IMM_SCAN_TOP_N", 15)
 SCAN_EVENT_TOP_N = _env_int("IMM_SCAN_EVENT_TOP_N", 3)
 SCAN_DAILY_OPENINGS = _env_int("IMM_SCAN_DAILY_OPENINGS", 5)
-# Guard geometry: half the global 0:20 ladder (strategy doc §3, class C:
-# "touch size halved"), a 50-contract net cap (the KXTEMP/Love Island
-# precedent for books with unmeasured information regimes), deep-reference
-# sizing capped at 1.5x (global 3.0x).
-SCAN_LEVELS = _parse_levels(os.environ.get("IMM_SCAN_LEVELS", "0:10"))
-SCAN_MAX_POSITION = _env_float("IMM_SCAN_MAX_POSITION", 50)
-SCAN_REF_MULT_CAP = _env_float("IMM_SCAN_REF_MULT_CAP", 1.5)
-SCAN_HOUR_MULT = os.environ.get("IMM_SCAN_HOUR_MULT", "0") == "1"
+# Sizing = the NORMAL BOOK's (Jack 2026-09-05 pm: "it can have the same
+# contracts/max net position/deep reference/overnight size as the normal
+# book"): global ladder, global net cap, the full deep-reference multiplier,
+# the global quiet-hours window. The first cut shipped half-size guards
+# (0:10 / cap 50 / ref 1.5x / no overnight x2) and Jack removed them the
+# same evening; the four knobs stay so the tier can be tightened again
+# without a code change — IMM_SCAN_LEVELS (e.g. "0:10"), IMM_SCAN_MAX_
+# POSITION (e.g. 50), IMM_SCAN_REF_MULT_CAP (e.g. 1.5; 0 = uncapped),
+# IMM_SCAN_HOUR_MULT=0 (no quiet-hours doubling). Unset = normal book.
+_SCAN_LEVELS_SPEC = os.environ.get("IMM_SCAN_LEVELS", "").strip()
+SCAN_LEVELS: Optional[List[Tuple[int, int]]] = (
+    _parse_levels(_SCAN_LEVELS_SPEC) if _SCAN_LEVELS_SPEC else None)
+_SCAN_MAXPOS_SPEC = os.environ.get("IMM_SCAN_MAX_POSITION", "").strip()
+SCAN_MAX_POSITION: Optional[float] = (
+    float(_SCAN_MAXPOS_SPEC) if _SCAN_MAXPOS_SPEC else None)
+SCAN_REF_MULT_CAP = _env_float("IMM_SCAN_REF_MULT_CAP", 0.0)
+SCAN_HOUR_MULT = os.environ.get("IMM_SCAN_HOUR_MULT", "1") == "1"
 # Structure screens (both default ON; each is a knob so Jack can widen the
 # universe deliberately rather than by accident).
 SCAN_REQUIRE_DATED = os.environ.get("IMM_SCAN_REQUIRE_DATED", "1") == "1"
@@ -1692,11 +1703,14 @@ SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 600)
 SCAN_MAX_BOOKS = _env_int("IMM_SCAN_MAX_BOOKS", 120)
 SCAN_MAX_SERIES_FETCHES = _env_int("IMM_SCAN_MAX_SERIES_FETCHES", 30)
 SCAN_MAX_HISTORY_FETCHES = _env_int("IMM_SCAN_MAX_HISTORY_FETCHES", 40)
-# Eviction tripwires (independent of IMM_BREAKERS). 8 = a 10-lot rung mostly
-# taken in one cycle; routine 1-3 lot crosses stay with inventory skew.
-SCAN_FILL_HALT_CONTRACTS = _env_float("IMM_SCAN_FILL_HALT", 8)
-SCAN_MID_JUMP_CENTS = _env_float("IMM_SCAN_MID_JUMP", 8)
-SCAN_DRIFT_CENTS = _env_float("IMM_SCAN_DRIFT", 15)
+# Per-event eviction tripwires: OFF by default (0), Jack 2026-09-05 pm
+# "dont need these". The first cut shipped fill 8 / mid jump 8c / drift 15c
+# on a 10-lot rung; on the normal ladder the sane fill bar would be 15
+# (most of a 20-lot rung, the gated-event tripwire's number). >0 arms.
+SCAN_FILL_HALT_CONTRACTS = _env_float("IMM_SCAN_FILL_HALT", 0)
+SCAN_MID_JUMP_CENTS = _env_float("IMM_SCAN_MID_JUMP", 0)
+SCAN_DRIFT_CENTS = _env_float("IMM_SCAN_DRIFT", 0)
+# The backstop that IS on: the tier's own daily loss budget.
 SCAN_DAILY_LOSS_LIMIT = _env_float("IMM_SCAN_DAILY_LOSS_LIMIT", 75.0)
 SCAN_SERIES_STRIKE_LIMIT = _env_int("IMM_SCAN_SERIES_STRIKES", 2)
 SCAN_SERIES_STRIKE_TTL_SECS = _env_float("IMM_SCAN_SERIES_STRIKE_DAYS", 7) * 86400.0
@@ -1871,13 +1885,14 @@ def scan_series_meta_verdict(series_obj: dict) -> Tuple[bool, str, str]:
 
 
 def ensure_scan_override(series: str) -> None:
-    """Give a scan-admitted series the tier's guard set. A hand-tuned entry
-    (none should exist for an un-allowed series, but the re-entry loop
-    seeds overrides for company series that are not allowlisted) keeps its
-    own ladder if it has one and is otherwise TIGHTENED: the net cap never
-    exceeds SCAN_MAX_POSITION, safe-join is on, the rate bar is off (the
-    walk ranks by ROI; a per-day bar is horizon-blind — Jack 2026-08-05).
-    Idempotent; release_scan_override undoes it."""
+    """Give a scan-admitted series the tier's guard set: safe-join on, rate
+    bar off (the walk ranks by ROI; a per-day bar is horizon-blind — Jack
+    2026-08-05), and sizing left to the normal book unless the optional
+    IMM_SCAN_LEVELS / IMM_SCAN_MAX_POSITION knobs are set. A hand-tuned
+    entry (none should exist for an un-allowed series, but the re-entry
+    loop seeds overrides for company series that are not allowlisted)
+    keeps its own ladder and cap, the cap tightened to the knob if one is
+    set. Idempotent; release_scan_override undoes it."""
     if series in SCAN_GUARDED_SERIES:
         return
     prior = SERIES_OVERRIDES.get(series)
@@ -1887,15 +1902,23 @@ def ensure_scan_override(series: str) -> None:
             levels=SCAN_LEVELS, max_position=SCAN_MAX_POSITION,
             safe_join=True, min_est_per_day=0.0)
     else:
-        cap = SCAN_MAX_POSITION if prior.max_position is None \
-            else min(prior.max_position, SCAN_MAX_POSITION)
+        if SCAN_MAX_POSITION is None:
+            cap = prior.max_position
+        elif prior.max_position is None:
+            cap = SCAN_MAX_POSITION
+        else:
+            cap = min(prior.max_position, SCAN_MAX_POSITION)
         SERIES_OVERRIDES[series] = replace(
             prior, levels=prior.levels or SCAN_LEVELS, max_position=cap,
             safe_join=True, min_est_per_day=0.0)
     SCAN_GUARDED_SERIES.add(series)
-    log(f"[IMM] {series}: open-scan guard set applied "
-        f"(ladder {SERIES_OVERRIDES[series].levels}, net cap "
-        f"{SERIES_OVERRIDES[series].max_position:g}, safe-join)")
+    ov = SERIES_OVERRIDES[series]
+    log(f"[IMM] {series}: open-scan guard set applied (safe-join, no rate "
+        f"bar; ladder {ov.levels if ov.levels else 'global ' + str(LEVELS)}, "
+        f"net cap {ov.max_position:g}" if ov.max_position is not None else
+        f"[IMM] {series}: open-scan guard set applied (safe-join, no rate "
+        f"bar; ladder {ov.levels if ov.levels else 'global ' + str(LEVELS)}, "
+        f"net cap global {MAX_POSITION_CONTRACTS:g}")
 
 
 def release_scan_override(series: str) -> None:
@@ -6512,12 +6535,14 @@ class IncentiveMarketMaker:
                     + f"; cancelled {n_cx}", key=ev)
                 self.state.prev_pos[t] = own_pos
                 continue
-            # OPEN-SCAN FILL TRIPWIRE (2026-09-05, see the SCAN_* block): being
-            # swept on a scan member IS the adverse selection the tier's
-            # screens exist to avoid — the whole event leaves the tier for
-            # good. Independent of IMM_BREAKERS, ahead of the per-market
-            # breaker so the event-wide response owns scan members.
-            if (t in self.state.scan_members and prev is not None
+            # OPEN-SCAN FILL TRIPWIRE (2026-09-05, see the SCAN_* block; OFF
+            # unless IMM_SCAN_FILL_HALT > 0): being swept on a scan member
+            # IS the adverse selection the tier's screens exist to avoid —
+            # the whole event leaves the tier for good. Independent of
+            # IMM_BREAKERS, ahead of the per-market breaker so the
+            # event-wide response owns scan members.
+            if (SCAN_FILL_HALT_CONTRACTS > 0 and t in self.state.scan_members
+                    and prev is not None
                     and abs(own_pos - prev) >= SCAN_FILL_HALT_CONTRACTS):
                 self._scan_evict_event(
                     ev, f"{t} own book moved {own_pos - prev:+.0f} in one cycle",
@@ -6668,20 +6693,21 @@ class IncentiveMarketMaker:
                         f"{BREAKER_COOLDOWN_SECS // 60}min", key=t, urgent=False)
                     continue
 
-            # OPEN-SCAN MID TRIPWIRE (2026-09-05): a one-cycle jump, or a drift
-            # from the admission mid, on a market admitted for having no
-            # information in it means information arrived. Event-wide
-            # permanent eviction, like the fill tripwire; independent of
-            # IMM_BREAKERS. Read BEFORE the breaker block below updates
-            # prev_mid.
-            if t in self.state.scan_members and ext_bid is not None \
-                    and ext_ask is not None:
+            # OPEN-SCAN MID TRIPWIRE (2026-09-05; OFF unless IMM_SCAN_MID_JUMP
+            # or IMM_SCAN_DRIFT > 0): a one-cycle jump, or a drift from the
+            # admission mid, on a market admitted for having no information
+            # in it means information arrived. Event-wide permanent
+            # eviction, like the fill tripwire; independent of IMM_BREAKERS.
+            # Read BEFORE the breaker block below updates prev_mid.
+            if (SCAN_MID_JUMP_CENTS > 0 or SCAN_DRIFT_CENTS > 0) \
+                    and t in self.state.scan_members \
+                    and ext_bid is not None and ext_ask is not None:
                 mid_s = (ext_bid + ext_ask) / 2.0
                 pm_s = self.state.prev_mid.get(t)
                 entry_s = self.state.scan_entry_mid.get(t)
-                jumped = (pm_s is not None
+                jumped = (SCAN_MID_JUMP_CENTS > 0 and pm_s is not None
                           and abs(mid_s - pm_s) >= SCAN_MID_JUMP_CENTS)
-                drifted = (entry_s is not None
+                drifted = (SCAN_DRIFT_CENTS > 0 and entry_s is not None
                            and abs(mid_s - entry_s) >= SCAN_DRIFT_CENTS)
                 if jumped or drifted:
                     self._scan_evict_event(
@@ -7543,21 +7569,29 @@ class IncentiveMarketMaker:
             f"TTL {ORDER_TTL_SECS}s, poll {POLL_SECS}s")
         if SCAN_TOP_N > 0:
             log(f"open-scan tier: {SCAN_TOP_N} slots, {SCAN_EVENT_TOP_N}/event, "
-                f"{SCAN_DAILY_OPENINGS} daily openings; ladder {SCAN_LEVELS}, "
-                f"net cap {SCAN_MAX_POSITION:g}, ref-mult cap "
-                f"{SCAN_REF_MULT_CAP:g}, hour mult "
-                f"{'on' if SCAN_HOUR_MULT else 'off'}; screens: "
+                f"{SCAN_DAILY_OPENINGS} daily openings; sizing "
+                f"{'ladder ' + str(SCAN_LEVELS) if SCAN_LEVELS else 'global ladder'}, "
+                f"net cap {('%g' % SCAN_MAX_POSITION) if SCAN_MAX_POSITION is not None else 'global'}, "
+                f"ref-mult cap {('%g' % SCAN_REF_MULT_CAP) if SCAN_REF_MULT_CAP > 0 else 'none'}, "
+                f"quiet-hours mult {'on' if SCAN_HOUR_MULT else 'off'}; screens: "
                 f"dated={SCAN_REQUIRE_DATED} numeric={SCAN_REQUIRE_NUMERIC} "
                 f"vol24h<={SCAN_MAX_VOLUME_24H:g} (event "
                 f"{SCAN_MAX_EVENT_VOLUME_24H:g}) age>={SCAN_MIN_AGE_HOURS:g}h "
                 f"history {SCAN_HISTORY_HOURS}h/{SCAN_MIN_HISTORY_BARS}+ bars "
                 f"range<={SCAN_MAX_RANGE_CENTS:g}c jump<{SCAN_MAX_JUMP_CENTS:g}c "
                 f"vol<={SCAN_MAX_HISTORY_VOLUME:g}, categories out "
-                f"{sorted(SCAN_EXCLUDE_CATEGORIES)}; tripwires: fill "
-                f"{SCAN_FILL_HALT_CONTRACTS:g}/cycle, mid jump "
-                f"{SCAN_MID_JUMP_CENTS:g}c, drift {SCAN_DRIFT_CENTS:g}c, daily "
-                f"loss ${SCAN_DAILY_LOSS_LIMIT:g}, {SCAN_SERIES_STRIKE_LIMIT} "
-                f"strikes/{SCAN_SERIES_STRIKE_TTL_SECS / 86400:g}d bar a series; "
+                f"{sorted(SCAN_EXCLUDE_CATEGORIES)}; daily loss budget "
+                f"${SCAN_DAILY_LOSS_LIMIT:g}; per-event tripwires "
+                + (f"fill {SCAN_FILL_HALT_CONTRACTS:g}/cycle"
+                   if SCAN_FILL_HALT_CONTRACTS > 0 else "fill off")
+                + ", "
+                + (f"mid jump {SCAN_MID_JUMP_CENTS:g}c"
+                   if SCAN_MID_JUMP_CENTS > 0 else "mid jump off")
+                + ", "
+                + (f"drift {SCAN_DRIFT_CENTS:g}c"
+                   if SCAN_DRIFT_CENTS > 0 else "drift off")
+                + f" ({SCAN_SERIES_STRIKE_LIMIT} strikes/"
+                f"{SCAN_SERIES_STRIKE_TTL_SECS / 86400:g}d bar a series); "
                 f"{len(self.state.scan_members)} member(s) carried in, "
                 f"{len(self.state.scan_evicted_events)} evicted event(s)")
         if EVENT_DEPTH_GATE_PREFIXES:

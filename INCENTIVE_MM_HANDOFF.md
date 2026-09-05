@@ -804,48 +804,52 @@ of reads per refresh. A candidate whose reads didn't fit the budget is
 "pending" — not admitted, retried next refresh.
 
 Admitted markets are ordinary sticky members (quote-to-completion, immune
-to the hopeless exit and the event top-N, like finecon) with their OWN
-guard set, applied on first sight (`ensure_scan_override`) and RE-APPLIED
-AT LOAD from the persisted member list, so a restart can never leave a
-member on the global geometry: ladder `0:10` (half the global 20), net cap
-50 (global 150), safe-join, no rate bar, NO quiet-hours x2, deep-reference
-size multiplier capped at 1.5x (global 3.0x; `capped_ref_mult` grew a
-`series` arg for this — all three sizing sites pass it).
+to the hopeless exit and the event top-N, like finecon) SIZED LIKE THE
+NORMAL BOOK — Jack, same evening: "it can have the same contracts/max net
+position/deep reference/overnight size as the normal book" — so the global
+ladder, the global net cap, the full deep-reference multiplier and the
+quiet-hours window all apply unchanged. The per-series guard set, applied
+on first sight (`ensure_scan_override`) and RE-APPLIED AT LOAD from the
+persisted member list, is safe-join placement + no rate bar. The first cut
+shipped half-size guards (0:10 / cap 50 / ref 1.5x / no overnight x2); the
+knobs survive for a later tightening: `IMM_SCAN_LEVELS`,
+`IMM_SCAN_MAX_POSITION`, `IMM_SCAN_REF_MULT_CAP` (0 = uncapped;
+`capped_ref_mult` grew a `series` arg for it — all three sizing sites pass
+it), `IMM_SCAN_HOUR_MULT=0`.
 
-Three eviction tripwires run REGARDLESS of `IMM_BREAKERS` (which is off):
+The backstop that is ON: the **tier loss budget** — the tier's own
+realized + MTM today over every market it ever admitted (`scan_book`;
+flat, departed markets leave it only at the daily roll, so a settlement
+loss booked mid-day stays in that day's figure) <= -$75 -> every scan
+member deselected, tier closed until the next ET day (`scan_halt_day`),
+urgent alert `scan_halt`. Carried across restarts like pnl_today
+(`scan_pnl_carry`, same 5am-CT roll). The whole-book $1,200 halt is
+untouched — this bounds the blast radius of an unreviewed universe on its
+own. Inventory skew and the per-market/event caps apply as everywhere.
 
-1. **Fill**: own book moves >= 8 contracts in one cycle on a scan member
-   (a 10-lot rung mostly taken) -> the WHOLE EVENT is evicted from the tier
-   PERMANENTLY (`scan_evicted_events`), quotes cancelled on every member of
-   it, this cycle's built quotes stripped, inventory winds down reduce-only
-   through the ordinary managed_extra path. Fills ARE the adverse
-   selection; everything else only predicts it.
-2. **Mid**: external mid jumps >= 8c in one cycle, or drifts >= 15c from
-   the mid at admission (`scan_entry_mid`) -> same eviction. Information
-   arrived in a market admitted for having none.
-3. **Tier loss budget**: the tier's own realized + MTM today over every
-   market it ever admitted (`scan_book`; flat, departed markets leave it
-   only at the daily roll, so a settlement loss booked mid-day stays in
-   that day's figure) <= -$75 -> every scan member deselected, tier closed
-   until the next ET day
-   (`scan_halt_day`), urgent alert `scan_halt`. Carried across restarts
-   like pnl_today (`scan_pnl_carry`, same 5am-CT roll). The whole-book
-   $1,200 halt is untouched — this bounds the blast radius of an
-   unreviewed universe on its own.
-
-Each eviction strikes the SERIES; 2 strikes in 7 days bar the family
-(`series_struck`). Evictions alert (`scan_evict`, keyed by event).
+Two per-event eviction tripwires exist in the quote loop but are OFF by
+default — the first cut shipped them (fill >= 8 in one cycle; mid jump
+>= 8c or drift >= 15c from the admission mid -> whole event evicted
+PERMANENTLY, series struck, 2 strikes/7d bar the family) and Jack removed
+them the same evening: "dont need these". They arm through
+`IMM_SCAN_FILL_HALT` (15 = most of a 20-lot rung is the sane bar on the
+normal ladder), `IMM_SCAN_MID_JUMP`, `IMM_SCAN_DRIFT` (>0 = on) and then
+run regardless of `IMM_BREAKERS`; `scan_evicted_events` /
+`scan_series_strikes` / the `scan_evict` alert only ever populate when
+armed.
 
 ### Knobs (env, prefix IMM_SCAN_)
 
 `TOP_N` 15 (0 = tier OFF, nothing else in the bot reads these) ·
-`EVENT_TOP_N` 3 · `DAILY_OPENINGS` 5 · `LEVELS` 0:10 · `MAX_POSITION` 50 ·
-`REF_MULT_CAP` 1.5 · `HOUR_MULT` 0 · `REQUIRE_DATED` 1 · `REQUIRE_NUMERIC` 1 ·
+`EVENT_TOP_N` 3 · `DAILY_OPENINGS` 5 · `LEVELS` unset = global ladder ·
+`MAX_POSITION` unset = global cap · `REF_MULT_CAP` 0 = uncapped ·
+`HOUR_MULT` 1 · `REQUIRE_DATED` 1 · `REQUIRE_NUMERIC` 1 ·
 `MIN_AGE_H` 24 · `MAX_VOLUME_24H` 60 · `MAX_EVENT_VOLUME_24H` 250 ·
 `HISTORY_H` 72 · `MIN_HISTORY_BARS` 12 · `MAX_RANGE` 10 · `MAX_JUMP` 6 ·
 `MAX_HISTORY_VOLUME` 250 · `HISTORY_TTL_H` 6 · `SERIES_META_TTL_D` 7 ·
 `MAX_BULK` 600 · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·
-`MAX_HISTORY_FETCHES` 40 · `FILL_HALT` 8 · `MID_JUMP` 8 · `DRIFT` 15 ·
+`MAX_HISTORY_FETCHES` 40 · `FILL_HALT` 0 = off · `MID_JUMP` 0 = off ·
+`DRIFT` 0 = off ·
 `DAILY_LOSS_LIMIT` 75 · `SERIES_STRIKES` 2 · `SERIES_STRIKE_DAYS` 7 ·
 `EXCLUDE_CATEGORIES` · `EXCLUDE_PREFIXES` · `LIVE_SOURCE_KEYWORDS`.
 Widening levers, in order of how much risk they add: `EXCLUDE_CATEGORIES`

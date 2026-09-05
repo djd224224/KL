@@ -7202,83 +7202,137 @@ class TestOpenScanTier(unittest.TestCase):
     # ---- guard geometry ------------------------------------------------------
 
     def test_guard_set_applied_tightened_released(self):
+        # Jack 2026-09-05 pm: "same contracts/max net position/deep
+        # reference/overnight size as the normal book" — the guard set is
+        # safe-join + no rate bar; sizing is inherited, not overridden
+        self.assertIsNone(imm.SCAN_LEVELS)
+        self.assertIsNone(imm.SCAN_MAX_POSITION)
         imm.ensure_scan_override(self.S)
         ov = imm.SERIES_OVERRIDES[self.S]
-        self.assertEqual(ov.levels, imm.SCAN_LEVELS)
-        self.assertEqual(ov.levels, [(0, 10)])
-        self.assertEqual(ov.max_position, imm.SCAN_MAX_POSITION)
-        self.assertEqual(ov.max_position, 50)
+        self.assertIsNone(ov.levels)
+        self.assertIsNone(ov.max_position)
+        self.assertEqual(imm.series_levels(self.S), imm.LEVELS)
+        self.assertEqual(imm.series_max_position(self.S),
+                         imm.MAX_POSITION_CONTRACTS)
         self.assertTrue(imm.series_safe_join(self.S))
         self.assertEqual(imm.series_min_est_rate(self.S), 0.0)
-        self.assertEqual(imm.series_max_position(self.S), 50)
         # a dormant hand-tuned entry (the re-entry loop seeds company series
-        # that are not allowlisted) is TIGHTENED, never loosened
+        # that are not allowlisted) keeps its own ladder/cap and gains
+        # safe-join + no rate bar
         prior = imm.SeriesOverride(min_est_per_day=2.0, safe_join=True,
                                    max_position=150)
         imm.SERIES_OVERRIDES["KXPRIOR"] = prior
         imm.ensure_scan_override("KXPRIOR")
         ov2 = imm.SERIES_OVERRIDES["KXPRIOR"]
-        self.assertEqual(ov2.levels, imm.SCAN_LEVELS)
-        self.assertEqual(ov2.max_position, 50)
+        self.assertIsNone(ov2.levels)
+        self.assertEqual(ov2.max_position, 150)
         self.assertEqual(ov2.min_est_per_day, 0.0)
         self.assertTrue(ov2.safe_join)
+        # the optional tightening knobs still bite when set
+        old_l, old_p = imm.SCAN_LEVELS, imm.SCAN_MAX_POSITION
+        imm.release_scan_override(self.S)
+        imm.release_scan_override("KXPRIOR")
+        imm.SCAN_LEVELS, imm.SCAN_MAX_POSITION = [(0, 10)], 50.0
+        try:
+            imm.ensure_scan_override(self.S)
+            self.assertEqual(imm.series_levels(self.S), [(0, 10)])
+            self.assertEqual(imm.series_max_position(self.S), 50)
+            imm.ensure_scan_override("KXPRIOR")
+            self.assertEqual(imm.SERIES_OVERRIDES["KXPRIOR"].max_position, 50)
+        finally:
+            imm.SCAN_LEVELS, imm.SCAN_MAX_POSITION = old_l, old_p
         imm.release_scan_override("KXPRIOR")
         self.assertIs(imm.SERIES_OVERRIDES["KXPRIOR"], prior)
         imm.release_scan_override(self.S)
         self.assertNotIn(self.S, imm.SERIES_OVERRIDES)
         self.assertNotIn(self.S, imm.SCAN_GUARDED_SERIES)
 
-    def test_scan_ladder_geometry_safe_join_and_ref_cap(self):
+    def test_scan_ladder_geometry_matches_normal_book_plus_safe_join(self):
         # build_side_ladder is the single placement site (quote loop AND
-        # estimator). Scan series: 10-lot, safe-joined, deep-reference
-        # sizing capped at 1.5x; an ordinary series on the same book gets
-        # the full 2.0x (4 ticks x 0.25) — the cap is the only difference.
+        # estimator). A scan series rests the SAME ladder at the SAME
+        # deep-reference size as an ordinary series on the same book; the
+        # only difference is safe-join placement.
         imm.ensure_scan_override(self.S)
-        # reference 4 ticks behind a 49 touch: rung rests AT the reference
-        # (safe-join cap = max(47, 45) -> 45 is deeper, so 45 wins), sized
-        # 10 x min(1.5 cap, 1 + 0.25 x 4 = 2.0) = 15
-        q = imm.build_side_ladder(self.A, "bid", 49, 51, room=100,
-                                  levels=imm.series_levels(self.S), ref_px=45)
-        self.assertEqual([(x.price_cents, x.count) for x in q], [(45, 15)])
-        q = imm.build_side_ladder("KXOTHER-99DEC31-T5", "bid", 49, 51,
-                                  room=100, levels=imm.SCAN_LEVELS, ref_px=45)
-        self.assertEqual([(x.price_cents, x.count) for x in q], [(45, 20)])
+        lv = imm.series_levels(self.S)
+        self.assertEqual(lv, imm.LEVELS)
+        total = sum(s for _t, s in lv)
+        # reference 4 ticks behind a 49 touch: the rung rests AT the
+        # reference (safe-join wants 47; 45 is deeper, so 45 wins) at the
+        # full 1 + 0.25 x 4 = 2.0x size — identical to the ordinary series
+        q = imm.build_side_ladder(self.A, "bid", 49, 51, room=1000,
+                                  levels=lv, ref_px=45)
+        q_other = imm.build_side_ladder("KXOTHER-99DEC31-T5", "bid", 49, 51,
+                                        room=1000, levels=lv, ref_px=45)
+        self.assertEqual([(x.price_cents, x.count) for x in q],
+                         [(45, total * 2)])
+        self.assertEqual([(x.price_cents, x.count) for x in q],
+                         [(x.price_cents, x.count) for x in q_other])
         # reference AT the touch: safe-join wants 47 but is capped at the
         # reference (2026-08-05: two ticks below a touch-level reference
         # scores exactly zero), so the rung joins the touch at plain size
-        q = imm.build_side_ladder(self.A, "bid", 49, 51, room=100,
-                                  levels=imm.series_levels(self.S), ref_px=49)
-        self.assertEqual([(x.price_cents, x.count) for x in q], [(49, 10)])
+        q = imm.build_side_ladder(self.A, "bid", 49, 51, room=1000,
+                                  levels=lv, ref_px=49)
+        self.assertEqual([(x.price_cents, x.count) for x in q], [(49, total)])
         # a wide book (spread >= 5) is its own safety net: no offset applied
-        q = imm.build_side_ladder(self.A, "bid", 40, 60, room=100,
-                                  levels=imm.series_levels(self.S), ref_px=40)
-        self.assertEqual([(x.price_cents, x.count) for x in q], [(40, 10)])
+        q = imm.build_side_ladder(self.A, "bid", 40, 60, room=1000,
+                                  levels=lv, ref_px=40)
+        self.assertEqual([(x.price_cents, x.count) for x in q], [(40, total)])
         # room (position cap / event share / skew) still shaves the rung
         q = imm.build_side_ladder(self.A, "ask", 51, 49, room=4,
-                                  levels=imm.series_levels(self.S), ref_px=51)
+                                  levels=lv, ref_px=51)
         self.assertEqual([(x.price_cents, x.count) for x in q], [(51, 4)])
+        # the optional ref-mult cap knob shrinks ONLY the scan series
+        imm.SCAN_REF_MULT_CAP = 1.5
+        try:
+            q = imm.build_side_ladder(self.A, "bid", 49, 51, room=1000,
+                                      levels=lv, ref_px=45)
+            self.assertEqual([(x.price_cents, x.count) for x in q],
+                             [(45, int(round(total * 1.5)))])
+            q_other = imm.build_side_ladder("KXOTHER-99DEC31-T5", "bid", 49,
+                                            51, room=1000, levels=lv, ref_px=45)
+            self.assertEqual(q_other[0].count, total * 2)
+        finally:
+            imm.SCAN_REF_MULT_CAP = 0.0
 
-    def test_no_quiet_hours_doubling_and_ref_mult_cap(self):
+    def test_overnight_and_deep_reference_sizing_match_normal_book(self):
         imm.ensure_scan_override(self.S)
         now = datetime.now(timezone.utc)
         old = imm.HOUR_SIZE_MULTS
         imm.HOUR_SIZE_MULTS = {h: 2.0 for h in range(24)}
         try:
-            self.assertEqual(imm.hour_size_mult(self.S, now), 1.0)
-            self.assertEqual(imm.hour_size_mult("KXOTHER", now), 2.0)
-            self.assertEqual(imm.hour_scaled_levels(self.S, now), [(0, 10)])
+            # same quiet-hours window as every other series...
+            self.assertEqual(imm.hour_size_mult(self.S, now), 2.0)
+            self.assertEqual(imm.hour_scaled_levels(self.S, now),
+                             imm.hour_scaled_levels("KXOTHER", now))
+            # ...unless the knob switches it off for the tier
+            imm.SCAN_HOUR_MULT = False
+            try:
+                self.assertEqual(imm.hour_size_mult(self.S, now), 1.0)
+                self.assertEqual(imm.hour_size_mult("KXOTHER", now), 2.0)
+            finally:
+                imm.SCAN_HOUR_MULT = True
         finally:
             imm.HOUR_SIZE_MULTS = old
         old_mode = imm.LADDER_MODE
         imm.LADDER_MODE = "atref"
         try:
-            self.assertEqual(imm.capped_ref_mult(50, 30, "bid"), 3.0)
-            self.assertEqual(imm.capped_ref_mult(50, 30, "bid", series="KXOTHER"),
+            # same deep-reference multiplier as the normal book...
+            self.assertEqual(imm.SCAN_REF_MULT_CAP, 0.0)
+            self.assertEqual(imm.capped_ref_mult(50, 30, "bid", series=self.S),
                              3.0)
             self.assertEqual(imm.capped_ref_mult(50, 30, "bid", series=self.S),
-                             imm.SCAN_REF_MULT_CAP)
-            self.assertEqual(imm.capped_ref_mult(50, 49, "bid", series=self.S),
-                             1.25)   # under the cap: untouched
+                             imm.capped_ref_mult(50, 30, "bid", series="KXOTHER"))
+            # ...unless the knob caps it for the tier
+            imm.SCAN_REF_MULT_CAP = 1.5
+            try:
+                self.assertEqual(
+                    imm.capped_ref_mult(50, 30, "bid", series=self.S), 1.5)
+                self.assertEqual(
+                    imm.capped_ref_mult(50, 30, "bid", series="KXOTHER"), 3.0)
+                self.assertEqual(
+                    imm.capped_ref_mult(50, 49, "bid", series=self.S), 1.25)
+            finally:
+                imm.SCAN_REF_MULT_CAP = 0.0
         finally:
             imm.LADDER_MODE = old_mode
 
@@ -7297,17 +7351,19 @@ class TestOpenScanTier(unittest.TestCase):
         # and carry categorical strikes -> never enter via the scan either
         self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
         self.assertNotIn("KXWIDE-99DEC31-B", bot.state.selected)
-        # one 10-lot at-reference rung per side (the scan ladder, NOT the
-        # global 20): on this 49x51 book the reference IS the touch (600 at
-        # 49 >= target/5), so safe-join is capped there and the rung joins
-        # at 49/51 — never improving the touch, never a 20-lot
+        # one at-reference rung per side at the NORMAL book's size (Jack
+        # 2026-09-05 pm): on this 49x51 book the reference IS the touch
+        # (600 at 49 >= target/5), so safe-join is capped there and the
+        # rung joins at 49/51 — never improving the touch
+        self.assertEqual(imm.series_levels(self.S), imm.LEVELS)
+        total = float(sum(s for _t, s in imm.LEVELS))
         orders = self._orders(bot, self.A)
         rungs = [o for o in orders if o[1] not in (imm.PAD_BID_CENTS,
                                                     imm.PAD_ASK_CENTS)]
         bids = [o for o in rungs if o[0] == "bid"]
         asks = [o for o in rungs if o[0] == "ask"]
-        self.assertEqual([(o[1], o[2]) for o in bids], [(49, 10.0)])
-        self.assertEqual([(o[1], o[2]) for o in asks], [(51, 10.0)])
+        self.assertEqual([(o[1], o[2]) for o in bids], [(49, total)])
+        self.assertEqual([(o[1], o[2]) for o in asks], [(51, total)])
         # status carries the tier
         bot.write_status(datetime.now(timezone.utc))
         with open(os.path.join(imm.STATUS_DIR, "status_incentive_mm.json"),
@@ -7351,7 +7407,7 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertIn("KXDEAD-26SEP09", bot2.state.scan_evicted_events)
         self.assertEqual(len(bot2.state.scan_series_strikes["KXDEAD"]), 1)
         self.assertIn(self.S, imm.SCAN_GUARDED_SERIES)
-        self.assertEqual(imm.SERIES_OVERRIDES[self.S].levels, imm.SCAN_LEVELS)
+        self.assertTrue(imm.series_safe_join(self.S))
         # members quote to completion: the sticky set re-selects the market
         # WITHOUT re-admission (its candles now unreadable would reject a
         # newcomer) — and nothing is re-read for it
@@ -7381,14 +7437,52 @@ class TestOpenScanTier(unittest.TestCase):
 
     # ---- tripwires -----------------------------------------------------------
 
+    def _arm_tripwires(self, fill=15.0, jump=8.0, drift=15.0):
+        # OFF by default (Jack 2026-09-05 pm "dont need these"); the tests
+        # below arm them to keep the machinery honest for a later re-enable
+        self.assertEqual(imm.SCAN_FILL_HALT_CONTRACTS, 0)
+        self.assertEqual(imm.SCAN_MID_JUMP_CENTS, 0)
+        self.assertEqual(imm.SCAN_DRIFT_CENTS, 0)
+        imm.SCAN_FILL_HALT_CONTRACTS = fill
+        imm.SCAN_MID_JUMP_CENTS = jump
+        imm.SCAN_DRIFT_CENTS = drift
+        self.addCleanup(setattr, imm, "SCAN_FILL_HALT_CONTRACTS", 0)
+        self.addCleanup(setattr, imm, "SCAN_MID_JUMP_CENTS", 0)
+        self.addCleanup(setattr, imm, "SCAN_DRIFT_CENTS", 0)
+
+    def test_tripwires_off_by_default(self):
+        # a 16-lot sweep AND a 10c re-level on a member: no eviction, the
+        # member keeps quoting (inventory skew and the loss budget are the
+        # controls); the machinery only arms through its env knobs
+        bot = self._bot(tickers=[self.A, self.B])
+        bot.run_cycle()
+        bot.pnl.pos[self.A] = 16.0
+        bot.pnl.avg[self.A] = 47.0
+        bot.client.positions[self.A] = 16
+        bot.state.scan_entry_mid[self.A] = 30.0
+        bot.client.books[self.A] = {"orderbook_fp": {
+            "yes_dollars": [["0.58", "500"], ["0.59", "600"]],
+            "no_dollars": [["0.39", "1200"]]}}
+        bot.run_cycle()
+        self.assertIn(self.A, bot.state.selected)
+        self.assertIn(self.B, bot.state.selected)
+        self.assertEqual(bot.state.scan_members, {self.A, self.B})
+        self.assertEqual(bot.state.scan_evicted_events, {})
+        self.assertEqual(bot.state.scan_series_strikes, {})
+        self.assertNotIn("scan_evict", [c for c, _m in bot.alerter.today])
+        self.assertTrue(self._orders(bot, self.A))
+        self.assertTrue(self._orders(bot, self.B))
+
     def test_fill_tripwire_evicts_whole_event_permanently(self):
+        self._arm_tripwires()
         bot = self._bot(tickers=[self.A, self.B])
         bot.run_cycle()
         self.assertEqual(bot.state.scan_members, {self.A, self.B})
-        # our own book moves 9 in one cycle (account agrees: not manual)
-        bot.pnl.pos[self.A] = 9.0
+        # our own book moves 16 in one cycle — most of a 20-lot rung taken
+        # (account agrees: not manual)
+        bot.pnl.pos[self.A] = 16.0
         bot.pnl.avg[self.A] = 47.0
-        bot.client.positions[self.A] = 9
+        bot.client.positions[self.A] = 16
         bot.run_cycle()
         self.assertNotIn(self.A, bot.state.selected)
         self.assertNotIn(self.B, bot.state.selected)
@@ -7406,7 +7500,7 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertNotIn(self.B, bot.state.selected)
         self.assertEqual(self._orders(bot, self.B), [])
         self.assertFalse([o for o in self._orders(bot, self.A) if o[0] == "bid"])
-        self.assertLessEqual(sum(o[2] for o in self._orders(bot, self.A)), 9)
+        self.assertLessEqual(sum(o[2] for o in self._orders(bot, self.A)), 16)
         # the loss-budget book keeps the evicted market while it holds
         # inventory — and B (flat, gone) too until the DAILY ROLL, so a
         # settlement loss booked mid-day cannot vanish from today's tier
@@ -7417,10 +7511,11 @@ class TestOpenScanTier(unittest.TestCase):
         bot2 = IncentiveMarketMaker(client=bot.client, live=False)
         self.assertIn(self.B, bot2.state.scan_book)
         bot.build_daily_summary()
-        self.assertIn(self.A, bot.state.scan_book)      # still holds 9
+        self.assertIn(self.A, bot.state.scan_book)      # still holds 16
         self.assertNotIn(self.B, bot.state.scan_book)   # flat and gone
 
     def test_mid_jump_tripwire_evicts_event(self):
+        self._arm_tripwires()
         bot = self._bot(tickers=[self.A, self.B])
         bot.run_cycle()
         # A's book re-levels 50c -> 60c between cycles
@@ -7434,6 +7529,7 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(self._orders(bot, self.B), [])
 
     def test_drift_tripwire_evicts_event(self):
+        self._arm_tripwires()
         bot = self._bot()
         bot.run_cycle()
         # book unchanged at 50c, but the admission mid was 30c
@@ -7443,6 +7539,7 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertIn(self.EV, bot.state.scan_evicted_events)
 
     def test_second_strike_bars_the_series(self):
+        self._arm_tripwires()
         bot = self._bot(tickers=[self.A, self.B])
         bot.run_cycle()
         bot.state.scan_series_strikes[self.S] = [time.time()]   # one prior
