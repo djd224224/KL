@@ -209,6 +209,10 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
                 imm.parse_iso_utc(m.get("expected_expiration_time", "")))
     cutoff = imm.apply_series_cutoff_adjustments(series, event_ticker, cutoff,
                                                  close_time=close_time)
+    if imm.scan_universe_reason(t) is None:
+        # open-scan candidates: the report-month rule for month-named
+        # (Fiscal.ai KPI) events — mirrors refresh_universe
+        cutoff = imm.scan_report_month_cutoff(event_ticker, cutoff)
     bid = imm.market_cents(m, "yes_bid")
     ask = imm.market_cents(m, "yes_ask")
     try:
@@ -354,10 +358,25 @@ def scan_gap_label(bot, t: str, now_utc: datetime) -> str:
                if now_utc.timestamp() - x < imm.SCAN_SERIES_STRIKE_TTL_SECS]
     if 0 < imm.SCAN_SERIES_STRIKE_LIMIT <= len(strikes):
         return "series_struck"
-    why = imm.scan_shape_reason(t)
+    sm = st.scan_series_meta.get(imm.series_of(t))
+    # Fiscal.ai month-named KPI events (2026-09-06): the 'undated' reject
+    # is waived for a series the bot has judged Fiscal.ai-settled; a month-
+    # named ticker on a series not yet read is "pending" (the bot hydrates
+    # it and reads the series), not "undated".
+    fiscal = bool(sm.get("fiscal")) if isinstance(sm, dict) else False
+    why = imm.scan_shape_reason(t, fiscal=fiscal)
+    if why == "undated" and imm.parse_event_month(t) is not None:
+        pre = imm.scan_shape_reason(t, fiscal=True)
+        if pre is not None:
+            return pre                      # a month-named binary: 'shape'
+        if not isinstance(sm, dict) or "fiscal" not in sm:
+            return "screens pending"        # series not read yet
     if why:
         return why
-    sm = st.scan_series_meta.get(imm.series_of(t))
+    if fiscal and imm.parse_event_date(t) is None:
+        ms = imm.parse_event_month(t)
+        if ms is not None and now_utc >= ms:
+            return "cutoff_passed (report month)"
     if sm:
         # Same re-read against the category knob the bot applies
         # (scan_cached_verdict): a verdict from a lifted ban is stale —

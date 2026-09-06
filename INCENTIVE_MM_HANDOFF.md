@@ -790,7 +790,7 @@ first (`_scan_admission`):
 
 | Screen | Rule (default) | Why |
 |---|---|---|
-| STRUCTURE | day-dated event ticker; numeric-threshold strike (`T286`, `B90`, `4.1400`, or Kalshi `strike_type` greater/less/between) | the midnight-ET rule is the only release guard an unknown series has (KXUE/KXISMPMI had no day and would quote THROUGH their prints); a "will X happen" binary's one jump IS the resolution (strategy §1) |
+| STRUCTURE | day-dated event ticker — **or, since 2026-09-06, a month-named one on a Fiscal.ai-settled series** (`KXCCL-26SEPALBD`; see the dated note below: the first of that month becomes the cutoff); numeric-threshold strike (`T286`, `B90`, `4.1400`, or Kalshi `strike_type` greater/less/between) | the midnight-ET rule is the only release guard an unknown series has (KXUE/KXISMPMI had no day and would quote THROUGH their prints); for the KPI class the report MONTH is that guard; a "will X happen" binary's one jump IS the resolution (strategy §1) |
 | FAMILY | **no category ban since 2026-09-06** (the first cut banned `Sports, Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment` wholesale — see the dated note below; `IMM_SCAN_EXCLUDE_CATEGORIES` is empty by default and only a deliberate re-ban names a category); no LIVE settlement source (GET /series, cached 7d: pyth/coinbase/**cfbenchmarks**/espn/nba.com/ercot/weather.gov/**weather.com**/... keywords — a live price index, a live scoreboard, a live weather feed); prefix exclusions are OWNERSHIP and feeds, not categories: other repo bots (KXLOWT, KXRAIN, KXHIGH, KXTEMP, KXAVGT, KXAQI), the crypto fleets' families by asset (KX<ASSET>D / MAX-MINW / MAX-MINMON / MAX-MINY / Y), FX/index/commodity/grid feeds, the 9/2 scan's rejects (KXUE, KXISMPMI, KXSNOWCRABCATCH, KXSOCKEYERUN, KXTECHLAYOFF, ...) | realtime risk is a property of the settlement SOURCE, not the category: a market everyone else can price off a live feed is one we are always last to reprice; two of our bots must never anchor to each other |
 | ACTIVITY | market `volume_24h` <= 60, EVENT `volume_24h` <= 250 (summed over every bulk-read sibling, pinned strikes included), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
 | HISTORY | 72h of hourly candlesticks: >= 12 two-sided bars, mid range <= 10c, no bar-to-bar move >= 6c, traded volume <= 250 (cached 6h) | a book that moved is not a quiet print, whatever its family says |
@@ -891,6 +891,73 @@ and approval thresholds, snowfall/hurricane counts off non-live records,
 box-office thresholds) — each still needing 24h of age, a quiet 72h and
 a sub-60-contract day. The refresh log's `rejects {...}` shows the new
 mix (`live_source` up, `category:*` gone after the caches re-read).
+
+### 2026-09-06 — Fiscal.ai KPI markets join the scan (Jack)
+
+Jack: "include markets settled by Fiscal.ai as part of the opportunistic
+scan." Fiscal.ai is the company-KPI aggregator Kalshi settles ~277 series
+on (quarterly + annual KPIs: Carnival ALBD, Chewy active customers, Ford
+US sales, Kroger identical sales, Taco Bell same-store sales, Boeing
+deliveries, ...). Nine carried live programs on 9/6 — 80 markets, ~$1,270/
+day of pool, i.e. more than the whole econ-print tail the scan had been
+admitting. They already reached the scan universe (not allowed, not
+blocked — the main book's company set and the finecon KPI set stay where
+they are) and every one died at the STRUCTURE screen as `undated`: the
+KPI class names its events by month with no day (`KXCCL-26SEPALBD`,
+`KXF-26OCTUSSALES`, `KXBAA-28JANDELIV`).
+
+The live probe settled what that month means: it is the REPORT month.
+Ford's Q3 sales ticker says 26OCT and Kalshi's own occurrence is Oct 3;
+Dollarama's 26SEPCOMP has occurrence Sep 12; Carnival's 26SEPALBD reports
+late September. So the month is a release guard of exactly the kind the
+day-dated midnight rule provides, one level coarser:
+
+- `parse_event_month` reads the month-named segment (`26SEPALBD` ->
+  2026-09-01 00:00 ET); day-dated, month-less (`DOG`, `RUS26SEP`) and
+  bad-month segments stay None.
+- `scan_report_month_cutoff`: an open-scan month-named event is OUT at
+  00:00 ET on the first of its month, or earlier if the resolver / a
+  series tightener / an event_start_overrides release already resolved
+  earlier (min). EARLY is the safe direction — a KPI that leaks before its
+  report (auto sales, monthly deliveries, airline traffic, a pre-announced
+  comp) leaks INSIDE the report month, so the month costs accrual, never a
+  fill against a public number. Deliberately NOT the main book's
+  override-only behaviour (quote up to the Nasdaq release): that path is
+  reviewed by hand per series; the scan is unreviewed. A series Jack wants
+  quoted into its report month belongs in the finecon KPI set /
+  `COMPANY_TICKERS`, the reviewed path.
+- `scan_series_is_fiscal` flags a series whose settlement source names
+  fiscal.ai (`IMM_SCAN_FISCAL_SOURCE_KEYWORDS`); persisted on the series
+  verdict as `fiscal`. `scan_shape_reason(..., fiscal=True)` waives
+  `undated` only when the month parses; binaries stay `shape`.
+- Order of operations: the string pre-screen (`scan_month_prescreen_ok`)
+  lets a month-named ticker hydrate when its series is fiscal or NOT YET
+  JUDGED (one hydration; a judged non-fiscal month series is then screened
+  on the string without a read); `_scan_admission` takes the budgeted
+  series read BEFORE the structure verdict for those, re-reads a verdict
+  persisted before the flag existed, returns `series_meta_pending` with no
+  budget (never admitted on the month alone), `shape` for a month binary
+  without spending a read, and `cutoff_passed` once the report month has
+  begun. Members (quote-to-completion) complete at the month start.
+- `imm_quote_gaps.py` mirrors all of it: `build_meta` applies the month
+  cutoff to scan-universe tickers; the label reads `screens pending` for
+  an unread month-named series, `undated` for a judged non-fiscal one,
+  `cutoff_passed (report month)` inside the month, `shape` for binaries.
+
+What it means today (9/6): the five 26SEP events (CCL, CHWY, DOL, KR,
+TTAN) are already inside their report month — out, correctly (Chewy
+reports ~Sep 10, Kroger ~Sep 11, Dollarama Sep 12, Carnival late Sep).
+Admissible now: KXYUM-26NOVTBSSS (14 mkts, $192/d, to Nov 1), KXF-
+26OCTUSSALES (13, $179/d, to Oct 1), KXFA-28JANUSSALES (11, $151/d) and
+KXBAA-28JANDELIV (8, $286/d) — the last two are running annual tallies
+(Boeing/Ford publish monthly), the public-running-tally class the 9/2
+sweep rejected by hand for KXTECHLAYOFF; here the machine screens are the
+defence (KXBAA's 560 strike read 16,591 contracts/24h -> `volume`; the
+95c annual strikes -> `extreme_mid`; the rest face the 72h history
+screen). All of them still need the 24h age, <=60/day, quiet-72h screens
+and a free slot: the tier stood at 20/15 with 5/5 openings used, so the
+first KPI admissions come at the ET rollover, and by ROI they will
+out-rank the $14/day state prints.
 
 ### Knobs (env, prefix IMM_SCAN_)
 
