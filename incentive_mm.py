@@ -1715,17 +1715,32 @@ SCAN_DAILY_LOSS_LIMIT = _env_float("IMM_SCAN_DAILY_LOSS_LIMIT", 75.0)
 SCAN_SERIES_STRIKE_LIMIT = _env_int("IMM_SCAN_SERIES_STRIKES", 2)
 SCAN_SERIES_STRIKE_TTL_SECS = _env_float("IMM_SCAN_SERIES_STRIKE_DAYS", 7) * 86400.0
 SCAN_EVICT_TTL_SECS = 30 * 86400.0      # file hygiene only; events settle sooner
-# Kalshi categories the scan never enters, whatever the per-market screens
-# say: information there is news- or feed-driven (a quiet 72h says nothing
-# about the next headline). Culture/Entertainment: box office and chart
-# markets reprice on progressively-known data inside their windows.
-# Economics, Financials (minus the live-feed prefixes), Companies, Science
-# and Technology, Health, World and Transportation remain.
+# NO CATEGORY BAN (Jack 2026-09-06: "dont systematically drop Sports,
+# Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment.
+# they should be scanned, but of course watch out for adverse selection and
+# realtime risk"). The first cut banned those seven categories wholesale;
+# now every category is judged one series / one market at a time by the
+# screens that actually measure the risk:
+#   realtime risk  a LIVE settlement source (live price index, live
+#                  scoreboard, live weather feed — SCAN_LIVE_SOURCE_KEYWORDS)
+#                  rejects the SERIES; a day-dated ticker cuts quoting off
+#                  at ET midnight BEFORE event day (trade_cutoff_utc: the
+#                  bot never quotes a game-day market on game day) and
+#                  SCAN_REQUIRE_DATED makes that cutoff mandatory; the 24h
+#                  age screen keeps same-day listings (hourly/daily price
+#                  structures) out entirely.
+#   adverse sel.   numeric-threshold strikes only (a "will X happen"
+#                  binary's one jump IS the resolution), the 72h quiet-
+#                  history screen (range/jump/volume), the 24h activity
+#                  screens, the tier's daily loss budget, the series-strike
+#                  bar, and the optional fill/mid-jump/drift tripwires.
+# Ownership exclusions (other bots' families) stay: they are not a
+# category judgement. The knob remains for a deliberate re-ban — a name
+# here rejects the whole category again (cached verdicts follow the knob
+# both ways, see scan_cached_verdict); default EMPTY.
 SCAN_EXCLUDE_CATEGORIES = frozenset(
     c.strip() for c in os.environ.get(
-        "IMM_SCAN_EXCLUDE_CATEGORIES",
-        "Sports,Crypto,Elections,Politics,Climate and Weather,Culture,"
-        "Entertainment").split(",") if c.strip())
+        "IMM_SCAN_EXCLUDE_CATEGORIES", "").split(",") if c.strip())
 SCAN_EXCLUDE_PREFIXES = tuple(p for p in os.environ.get(
     "IMM_SCAN_EXCLUDE_PREFIXES",
     # OTHER REPO BOTS not already blocklisted, and the weather families the
@@ -1733,11 +1748,18 @@ SCAN_EXCLUDE_PREFIXES = tuple(p for p in os.environ.get(
     # (KXLOWT<CITY>), rain_monthly.py / the 7/26 rain removal (KXRAIN*),
     # KXHIGH (blocked, restated), the main book's temp/avg-temp/AQI.
     "KXLOWT,KXRAIN,KXHIGH,KXTEMP,KXAVGT,KXAQI,"
-    # crypto by asset (the fleets' KX<ASSET>D dailies, weekly touch pairs,
-    # and every live-price structure; category=Crypto is the primary
-    # filter, these are the backup when a series read fails)
+    # crypto fleets' families BY ASSET — OWNERSHIP, not a category ban:
+    # crypto_updown_mm KX<ASSET>D, crypto_touch_mm(_weekly) KX<ASSET>MAX/
+    # MINMON and MAX/MINW, crypto_annual_mm KX<ASSET>MAXY/MINY/Y — two of
+    # our bots must never anchor to each other's quotes. The same prefixes
+    # also cover the remaining live-index price structures (settled on
+    # CF Benchmarks / Pyth — 'cfbenchmarks' in the live-source keywords is
+    # the per-series screen for assets not listed here). Crypto series
+    # that are NOT price structures (hard forks, ETF flows, reserve bills,
+    # the KXBITCOIN25 class) carry other prefixes and are scanned like
+    # anything else.
     "KXBTC,KXETH,KXSOL,KXXRP,KXDOGE,KXBNB,KXHYPE,KXZEC,KXLTC,KXADA,KXAVAX,"
-    "KXLINK,KXSUI,KXTRX,KXTON,KXSHIB,KXPEPE,KXCRYPTO,"
+    "KXLINK,KXSUI,KXTRX,KXTON,KXSHIB,KXPEPE,"
     # live FX / index / commodity / grid feeds — the 9/2 scan's rejects and
     # their siblings (Pyth/CME-settled or realtime operator data)
     "KXEURUSD,KXUSDJPY,KXGBPUSD,KXUSDCAD,KXUSDCHF,KXAUDUSD,KXUSDCNY,KXUSDMXN,"
@@ -1746,22 +1768,27 @@ SCAN_EXCLUDE_PREFIXES = tuple(p for p in os.environ.get(
     "KXOIL,KXTXERCOT,KXPJM,KXERCOT,KXUSOPENPRICE,KXDDR5,KXTRUFAIDP,"
     # single-report pickoff traps / knowable public tallies found 9/2
     "KXUE,KXISMPMI,KXSKEXPYOY,KXTECHLAYOFF,KXSNOWCRABCATCH,KXSOCKEYERUN,"
-    "KXWATECHEMP,KXWAAEROEMP,"
-    # sports families (category is primary; prefixes are the backup)
-    "KXNFL,KXNBA,KXMLB,KXNHL,KXNCAA,KXUFC,KXPGA,KXF1,KXATP,KXWTA,KXWNBA,"
-    "KXMLS,KXEPL,KXPREMIER,KXUCL,KXLALIGA,KXSERIEA,KXBUNDES,KXLIGUE,KXCFB,"
-    "KXTENNIS,KXGOLF,KXSOCCER,KXBOXING,KXMMA,KXNASCAR,KXMARMAD"
+    "KXWATECHEMP,KXWAAEROEMP"
+    # (the sports-family prefix backup was retired with the category ban,
+    # 2026-09-06: a sports series is judged by its settlement source and
+    # its ticker date like any other)
     ).split(",") if p)
-# A settlement source naming a live price feed / live scoreboard means the
-# market is continuously priceable by everyone but us. Matched case-
-# insensitively against the source name + url from GET /series.
+# A settlement source naming a live price feed / live scoreboard / live
+# weather feed means the market is continuously priceable by everyone but
+# us. Matched case-insensitively against the source name + url from
+# GET /series. 2026-09-06 (live probe of the newly scannable categories):
+# + cfbenchmarks (CF Benchmarks — the BRTI-class index every KX<ASSET>
+# hourly/daily/monthly price structure settles on; none named pyth) and
+# + weather.com (The Weather Company feed behind the daily high/low/avg
+# temperature families).
 SCAN_LIVE_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
     "IMM_SCAN_LIVE_SOURCE_KEYWORDS",
-    "pyth,coinbase,coingecko,coinmarketcap,binance,kraken,cmegroup,cboe,"
-    "tradingview,investing.com,finance.yahoo,espn,nba.com,mlb.com,nfl.com,"
-    "nhl.com,ufc.com,pgatour,formula1,atptour,wtatennis,fifa.com,uefa.com,"
-    "sofascore,flashscore,ercot,pjm.com,caiso,fear-and-greed,weather.gov,"
-    "wunderground,timeanddate,polymarket").split(",") if k.strip())
+    "pyth,coinbase,coingecko,coinmarketcap,binance,kraken,cfbenchmarks,"
+    "cmegroup,cboe,tradingview,investing.com,finance.yahoo,espn,nba.com,"
+    "mlb.com,nfl.com,nhl.com,ufc.com,pgatour,formula1,atptour,wtatennis,"
+    "fifa.com,uefa.com,sofascore,flashscore,ercot,pjm.com,caiso,"
+    "fear-and-greed,weather.gov,weather.com,wunderground,timeanddate,"
+    "polymarket").split(",") if k.strip())
 # Series currently carrying the scan guard set (see ensure_scan_override):
 # read by hour_size_mult (no quiet-hours doubling) and capped_ref_mult (the
 # deep-reference cap). Rebuilt at load from the persisted member list.
@@ -1882,6 +1909,31 @@ def scan_series_meta_verdict(series_obj: dict) -> Tuple[bool, str, str]:
         if any(k in blob for k in SCAN_LIVE_SOURCE_KEYWORDS):
             return False, "live_source", cat
     return True, "", cat
+
+
+def scan_cached_verdict(ent) -> Optional[Tuple[bool, str]]:
+    """A persisted series verdict re-read against the CURRENT category knob
+    (2026-09-06, the ban lift): the cache stores (ok, why, category) for
+    up to 7 days, so without this a series banned by category on 9/5 stays
+    banned for a week after the knob changed, and a series admitted before
+    a deliberate re-ban stays admitted. Returns (ok, why) to trust, or None
+    when the entry is STALE and must be re-read (a lifted category ban —
+    the settlement sources are not cached, so the live-source screen has
+    to run again). A category newly named on the knob rejects in place
+    (no read needed). 'category:unknown' (a series object with no category)
+    is a fail-closed verdict, not a ban, and is trusted as cached."""
+    if not isinstance(ent, dict):
+        return None
+    why = str(ent.get("why") or "")
+    cat = str(ent.get("category") or "").strip()
+    if why.startswith("category:") and why != "category:unknown":
+        banned = cat or why.split(":", 1)[1]
+        if banned not in SCAN_EXCLUDE_CATEGORIES:
+            return None
+        return False, why
+    if ent.get("ok") and cat and cat in SCAN_EXCLUDE_CATEGORIES:
+        return False, f"category:{cat}"
+    return bool(ent.get("ok")), why
 
 
 def ensure_scan_override(series: str) -> None:
@@ -5556,10 +5608,15 @@ class IncentiveMarketMaker:
         """FAMILY screen behind a persisted per-series cache (one GET /series
         per SCAN_SERIES_META_TTL_SECS). Budget exhausted or unreadable ->
         NOT ok ('..._pending' / '..._unavailable'), retried next refresh;
-        an unreadable/empty object is never cached."""
+        an unreadable/empty object is never cached. A cached verdict is
+        re-read against the current category knob (scan_cached_verdict):
+        a lifted ban makes the entry stale -> fresh read; a new ban rejects
+        in place."""
         ent = self.state.scan_series_meta.get(series)
         if ent and now_ts - float(ent.get("ts", 0)) < SCAN_SERIES_META_TTL_SECS:
-            return bool(ent.get("ok")), str(ent.get("why") or "")
+            cached = scan_cached_verdict(ent)
+            if cached is not None:
+                return cached
         if budget["series"] <= 0:
             return False, "series_meta_pending"
         budget["series"] -= 1

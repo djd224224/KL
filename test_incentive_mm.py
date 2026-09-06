@@ -6849,9 +6849,25 @@ class TestOpportunisticEmail(unittest.TestCase):
                          "shape")
         self.assertEqual(qg.scan_gap_label(bot, "KXNOVEL-26OCTDELIV-T5", now),
                          "undated")
+        # a cached category ban is only repeated while the knob still names
+        # the category (2026-09-06 ban lift): by default it is stale and the
+        # bot re-reads the series, so the label says pending
         bot.state.scan_series_meta["KXNOVEL"] = {
-            "ts": time.time(), "ok": False, "why": "category:Sports"}
-        self.assertEqual(qg.scan_gap_label(bot, t, now), "category:Sports")
+            "ts": time.time(), "ok": False, "why": "category:Sports",
+            "category": "Sports"}
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "screens pending")
+        with mock.patch.object(imm, "SCAN_EXCLUDE_CATEGORIES",
+                               frozenset({"Sports"})):
+            self.assertEqual(qg.scan_gap_label(bot, t, now), "category:Sports")
+            # and an ok verdict on a newly banned category reads as the ban
+            bot.state.scan_series_meta["KXNOVEL"] = {
+                "ts": time.time(), "ok": True, "why": "", "category": "Sports"}
+            self.assertEqual(qg.scan_gap_label(bot, t, now), "category:Sports")
+        # other cached rejects are trusted as written
+        bot.state.scan_series_meta["KXNOVEL"] = {
+            "ts": time.time(), "ok": False, "why": "live_source",
+            "category": "Sports"}
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "live_source")
         bot.state.scan_series_meta["KXNOVEL"] = {"ts": time.time(), "ok": True}
         bot.state.scan_history_cache[t] = {
             "ts": time.time(), "ok": False, "why": "history_range"}
@@ -7005,14 +7021,24 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")
         self.assertEqual(r("KXXRPMAXMON-XRP-26JUL31-140"), "blocked")
         self.assertEqual(r("KXMLBMENTION-26JUL14ALNL-GRAN"), "blocked")
-        # structural exclusions: other repo bots, live feeds, the 9/2 traps
+        # structural exclusions: other repo bots (ownership), live feeds,
+        # the 9/2 traps
         for t in ("KXLOWTSATX-26SEP08-T70", "KXRAINNYC-26SEP03-X",
                   "KXEURUSD-26SEP08-T1.1", "KXINXU-26SEP08-T6000",
-                  "KXBTCD-26AUG0521-T54099.99", "KXNFLGAME-26SEP08-T1",
+                  "KXBTCD-26AUG0521-T54099.99", "KXETHMAXW-26SEP12-T5000",
                   "KXUE-RUS26SEP-T5", "KXISMPMI-26OCT01-T50",
                   "KXSNOWCRABCATCH-26OCT09-T1", "KXTRUFAIDP-26AUG26-T50",
                   "KXTXERCOTPEAK-26SEP08-T70000"):
             self.assertEqual(r(t), "excluded_family", t)
+        # NO category families by prefix (Jack 2026-09-06 "dont
+        # systematically drop Sports, Crypto, Elections, Politics, Climate
+        # and Weather, Culture, Entertainment"): sports, weather outside the
+        # other bots' families, politics and non-price crypto are scan
+        # universe — the per-series/per-market screens judge them
+        for t in ("KXNFLGAME-26SEP08-T1", "KXPGATOUR-26SEP13-T270",
+                  "KXNYCSNOWM-26DEC31-T10", "KXNYTTRUMPAPPROVAL-26SEP30-T45",
+                  "KXHARDFORKBTC-26DEC31-T1", "KXBOXOFFICE-26SEP13-T50"):
+            self.assertIsNone(r(t), t)
         # knobs: tier off / allowlist off -> no scan universe at all
         old = imm.SCAN_TOP_N
         imm.SCAN_TOP_N = 0
@@ -7070,19 +7096,55 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(imm.scan_history_verdict(None)["why"], "history_thin")
 
     def test_series_meta_verdict(self):
-        ok, why, cat = imm.scan_series_meta_verdict({"category": "Sports"})
-        self.assertFalse(ok)
-        self.assertEqual(why, "category:Sports")
+        # NO category ban by default (Jack 2026-09-06): every category is
+        # judged by its settlement source; the knob is for a deliberate
+        # re-ban only
+        self.assertEqual(imm.SCAN_EXCLUDE_CATEGORIES, frozenset())
         for c in ("Sports", "Crypto", "Elections", "Politics",
                   "Climate and Weather", "Culture", "Entertainment"):
-            self.assertIn(c, imm.SCAN_EXCLUDE_CATEGORIES, c)
-        for c in ("Economics", "Financials", "Companies",
-                  "Science and Technology", "Health", "World"):
-            self.assertNotIn(c, imm.SCAN_EXCLUDE_CATEGORIES, c)
+            self.assertEqual(imm.scan_series_meta_verdict({"category": c}),
+                             (True, "", c), c)
+        with mock.patch.object(imm, "SCAN_EXCLUDE_CATEGORIES",
+                               frozenset({"Sports"})):
+            ok, why, cat = imm.scan_series_meta_verdict({"category": "Sports"})
+            self.assertFalse(ok)
+            self.assertEqual(why, "category:Sports")
+            self.assertEqual(cat, "Sports")
+        # realtime risk is a per-SERIES judgement on the settlement source:
+        # live scoreboards, live price indices and live weather feeds reject
         self.assertEqual(imm.scan_series_meta_verdict(
             {"category": "Financials", "settlement_sources": [
                 {"name": "Pyth Network", "url": "https://pyth.network"}]})[1],
             "live_source")
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Sports", "settlement_sources": [
+                {"name": "the Governing League", "url": "https://www.nfl.com/"},
+                {"name": "ESPN", "url": "https://www.espn.com"}]})[1],
+            "live_source")
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Crypto", "settlement_sources": [
+                {"name": "CF Benchmarks",
+                 "url": "https://www.cfbenchmarks.com/data/indice"}]})[1],
+            "live_source")
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Climate and Weather", "settlement_sources": [
+                {"name": "The Weather Company",
+                 "url": "https://weather.com/kalshi"}]})[1],
+            "live_source")
+        # ... while a sports / politics / crypto series settled on a record
+        # or a report is admissible, like any econ print
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Sports", "settlement_sources": [
+                {"name": "Forbes", "url": "https://www.forbes.com"}]}),
+            (True, "", "Sports"))
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Politics", "settlement_sources": [
+                {"name": "Library of Congress", "url": "https://congress.gov"}]}),
+            (True, "", "Politics"))
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Crypto", "settlement_sources": [
+                {"name": "Reuters", "url": "https://www.reuters.com/"}]}),
+            (True, "", "Crypto"))
         self.assertEqual(imm.scan_series_meta_verdict(
             {"category": "Economics", "settlement_sources": [
                 {"name": "EIA", "url": "https://www.eia.gov"}]}),
@@ -7138,11 +7200,29 @@ class TestOpenScanTier(unittest.TestCase):
             time.time() - imm.SCAN_SERIES_STRIKE_TTL_SECS - 1] * 3
         self.assertIsNone(bot._scan_admission(self._meta(), m, {}, now, budget))
         bot.state.scan_series_strikes.clear()
-        # family screen: category, live source, unreadable, budget
+        # family screen: category (knob only — no ban by default, Jack
+        # 2026-09-06), live source, unreadable, budget
         bot.state.scan_series_meta.clear()
         bot.client.series_meta[self.S] = {"category": "Sports"}
-        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
-                         "category:Sports")
+        # (own read budgets: the shared one below is sized for the original
+        # sequence of reads)
+        self.assertIsNone(bot._scan_admission(
+            self._meta(), m, {}, now, {"series": 5, "history": 5}))
+        bot.state.scan_series_meta.clear()
+        with mock.patch.object(imm, "SCAN_EXCLUDE_CATEGORIES",
+                               frozenset({"Sports"})):
+            self.assertEqual(bot._scan_admission(
+                self._meta(), m, {}, now, {"series": 5, "history": 5}),
+                "category:Sports")
+        # ... a sports series on a live scoreboard is the realtime-risk
+        # reject, judged per series
+        bot.state.scan_series_meta.clear()
+        bot.client.series_meta[self.S] = {
+            "category": "Sports",
+            "settlement_sources": [{"name": "ESPN", "url": "https://www.espn.com"}]}
+        self.assertEqual(bot._scan_admission(
+            self._meta(), m, {}, now, {"series": 5, "history": 5}),
+            "live_source")
         bot.state.scan_series_meta.clear()
         bot.client.series_meta[self.S] = {
             "category": "Economics",
@@ -7187,6 +7267,67 @@ class TestOpenScanTier(unittest.TestCase):
         # a fresh budget (the one above is spent): admissible again
         self.assertIsNone(bot._scan_admission(
             self._meta(), m, {}, now, {"series": 5, "history": 5}))
+
+    def test_cached_category_verdicts_follow_the_knob(self):
+        # The persisted series verdict (7d TTL) is re-read against the
+        # CURRENT category knob (2026-09-06 ban lift): a verdict from a
+        # lifted ban is stale and triggers a fresh /series read (the
+        # live-source screen needs the sources, which are not cached); a
+        # category newly named on the knob rejects in place, no read.
+        now_ts = time.time()
+        # pure helper
+        stale = {"ts": now_ts, "ok": False, "why": "category:Sports",
+                 "category": "Sports"}
+        self.assertIsNone(imm.scan_cached_verdict(stale))
+        # ... an old entry without the category field still names it in why
+        self.assertIsNone(imm.scan_cached_verdict(
+            {"ts": now_ts, "ok": False, "why": "category:Politics"}))
+        self.assertEqual(imm.scan_cached_verdict(
+            {"ts": now_ts, "ok": True, "why": "", "category": "Sports"}),
+            (True, ""))
+        self.assertEqual(imm.scan_cached_verdict(
+            {"ts": now_ts, "ok": False, "why": "live_source",
+             "category": "Sports"}), (False, "live_source"))
+        # fail-closed 'unknown' is a verdict, not a ban: trusted as cached
+        self.assertEqual(imm.scan_cached_verdict(
+            {"ts": now_ts, "ok": False, "why": "category:unknown",
+             "category": ""}), (False, "category:unknown"))
+        with mock.patch.object(imm, "SCAN_EXCLUDE_CATEGORIES",
+                               frozenset({"Sports"})):
+            self.assertEqual(imm.scan_cached_verdict(stale),
+                             (False, "category:Sports"))
+            self.assertEqual(imm.scan_cached_verdict(
+                {"ts": now_ts, "ok": True, "why": "", "category": "Sports"}),
+                (False, "category:Sports"))
+            self.assertEqual(imm.scan_cached_verdict(
+                {"ts": now_ts, "ok": True, "why": "", "category": "Economics"}),
+                (True, ""))
+        # bot-level: the stale ban re-reads the series (one budgeted read)
+        # and the fresh verdict replaces the cache entry
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.state.scan_series_meta[self.S] = dict(stale)
+        bot.client.series_meta[self.S] = {
+            "category": "Sports",
+            "settlement_sources": [{"name": "Forbes", "url": "https://forbes.com"}]}
+        budget = {"series": 5, "history": 5}
+        self.assertEqual(bot._scan_series_ok(self.S, now_ts, budget), (True, ""))
+        self.assertEqual(budget["series"], 4)
+        self.assertTrue(bot.state.scan_series_meta[self.S]["ok"])
+        # ... and a stale ban with no read budget left is 'pending', never
+        # admitted on the strength of a lifted ban alone
+        bot.state.scan_series_meta[self.S] = dict(stale)
+        self.assertEqual(bot._scan_series_ok(self.S, now_ts, {"series": 0}),
+                         (False, "series_meta_pending"))
+        # a fresh ok verdict on a newly banned category rejects with NO read
+        bot.state.scan_series_meta[self.S] = {
+            "ts": now_ts, "ok": True, "why": "", "category": "Sports"}
+        reads = getattr(bot.client, "series_reads", 0)
+        with mock.patch.object(imm, "SCAN_EXCLUDE_CATEGORIES",
+                               frozenset({"Sports"})):
+            self.assertEqual(bot._scan_series_ok(self.S, now_ts, budget),
+                             (False, "category:Sports"))
+        self.assertEqual(getattr(bot.client, "series_reads", 0), reads)
 
     # ---- the walk ------------------------------------------------------------
 

@@ -358,8 +358,16 @@ def scan_gap_label(bot, t: str, now_utc: datetime) -> str:
     if why:
         return why
     sm = st.scan_series_meta.get(imm.series_of(t))
-    if sm and not sm.get("ok"):
-        return str(sm.get("why") or "series screen")
+    if sm:
+        # Same re-read against the category knob the bot applies
+        # (scan_cached_verdict): a verdict from a lifted ban is stale —
+        # the bot re-reads the series next refresh — so it reads "pending"
+        # here rather than repeating a ban that no longer exists.
+        cached = imm.scan_cached_verdict(sm)
+        if cached is None:
+            sm = None
+        elif not cached[0]:
+            return cached[1] or "series screen"
     hc = st.scan_history_cache.get(t)
     if hc and not hc.get("ok"):
         return str(hc.get("why") or "history screen")

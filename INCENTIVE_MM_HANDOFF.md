@@ -791,7 +791,7 @@ first (`_scan_admission`):
 | Screen | Rule (default) | Why |
 |---|---|---|
 | STRUCTURE | day-dated event ticker; numeric-threshold strike (`T286`, `B90`, `4.1400`, or Kalshi `strike_type` greater/less/between) | the midnight-ET rule is the only release guard an unknown series has (KXUE/KXISMPMI had no day and would quote THROUGH their prints); a "will X happen" binary's one jump IS the resolution (strategy §1) |
-| FAMILY | Kalshi category not in `Sports, Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment` (GET /series, cached 7d); no live-feed settlement source (pyth/coinbase/espn/ercot/... keywords); prefix exclusions: other repo bots (KXLOWT, KXRAIN, KXHIGH, KXTEMP, KXAVGT, KXAQI), crypto by asset, FX/index/commodity/grid feeds, the 9/2 scan's rejects (KXUE, KXISMPMI, KXSNOWCRABCATCH, KXSOCKEYERUN, KXTECHLAYOFF, ...), sports families | feed- or news-driven information: a quiet 72h says nothing about the next headline; two of our bots must never anchor to each other |
+| FAMILY | **no category ban since 2026-09-06** (the first cut banned `Sports, Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment` wholesale — see the dated note below; `IMM_SCAN_EXCLUDE_CATEGORIES` is empty by default and only a deliberate re-ban names a category); no LIVE settlement source (GET /series, cached 7d: pyth/coinbase/**cfbenchmarks**/espn/nba.com/ercot/weather.gov/**weather.com**/... keywords — a live price index, a live scoreboard, a live weather feed); prefix exclusions are OWNERSHIP and feeds, not categories: other repo bots (KXLOWT, KXRAIN, KXHIGH, KXTEMP, KXAVGT, KXAQI), the crypto fleets' families by asset (KX<ASSET>D / MAX-MINW / MAX-MINMON / MAX-MINY / Y), FX/index/commodity/grid feeds, the 9/2 scan's rejects (KXUE, KXISMPMI, KXSNOWCRABCATCH, KXSOCKEYERUN, KXTECHLAYOFF, ...) | realtime risk is a property of the settlement SOURCE, not the category: a market everyone else can price off a live feed is one we are always last to reprice; two of our bots must never anchor to each other |
 | ACTIVITY | market `volume_24h` <= 60, EVENT `volume_24h` <= 250 (summed over every bulk-read sibling, pinned strikes included), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
 | HISTORY | 72h of hourly candlesticks: >= 12 two-sided bars, mid range <= 10c, no bar-to-bar move >= 6c, traded volume <= 250 (cached 6h) | a book that moved is not a quiet print, whatever its family says |
 
@@ -838,6 +838,60 @@ run regardless of `IMM_BREAKERS`; `scan_evicted_events` /
 `scan_series_strikes` / the `scan_evict` alert only ever populate when
 armed.
 
+### 2026-09-06 — the category ban is gone (Jack)
+
+Jack, on the first morning's admissions (20 members, every one a state-
+level Economics print: employment, home prices, corn, milk, taconite —
+"why is the open scan placing quotes that seem like finance/econ?"), then:
+"dont systematically drop Sports, Crypto, Elections, Politics, Climate
+and Weather, Culture, Entertainment. they should be scanned, but of
+course watch out for adverse selection and realtime risk."
+
+What changed (`incentive_mm.py`, `SCAN_*` block; `imm_quote_gaps.py`):
+
+- `SCAN_EXCLUDE_CATEGORIES` defaults to EMPTY. The knob stays for a
+  deliberate re-ban; a category named there rejects the whole family
+  again. Cached verdicts follow the knob BOTH ways without waiting out the
+  7-day TTL (`scan_cached_verdict`): a persisted `category:<c>` reject
+  whose category is no longer on the knob is STALE and triggers a fresh
+  `/series` read (the live-source screen needs the settlement sources,
+  which are not cached; no budget = `series_meta_pending`, never admitted
+  on the strength of a lifted ban alone), and a persisted ok on a newly
+  banned category rejects in place with no read. The quote-gaps label
+  applies the same rule (a stale ban reads "screens pending").
+- The sports-family prefix backup (`KXNFL, KXNBA, ...`) and the generic
+  `KXCRYPTO` prefix are retired from `SCAN_EXCLUDE_PREFIXES`. What stays
+  is ownership and feeds, not categories: the other repo bots' weather
+  families, the crypto fleets' families BY ASSET (`KX<ASSET>D`,
+  `MAX/MINW`, `MAX/MINMON`, `MAX/MINY`, `Y` — two of our bots must never
+  anchor to each other; the same prefixes cover the remaining live-index
+  price structures), the FX/index/commodity/grid feeds, the 9/2 pickoff
+  traps. Crypto series that are not price structures (hard forks, ETF
+  flows, reserve bills, the KXBITCOIN25 class) carry other prefixes and
+  are scanned like anything else.
+- `SCAN_LIVE_SOURCE_KEYWORDS` += `cfbenchmarks` (CF Benchmarks — the
+  live probe showed every `KX<ASSET>` hourly/daily/monthly price structure
+  settles on it and none names Pyth) and `weather.com` (The Weather
+  Company feed behind the daily high/low/avg temperature families).
+
+What "watch out for adverse selection and realtime risk" means here — the
+screens that judge a series or a market on its own, all unchanged:
+
+| Risk | Screen |
+|---|---|
+| realtime (a live feed everyone else prices off) | the live-source keyword screen on the SERIES' settlement sources (ESPN/nba.com/nfl.com/pgatour/atptour/fifa/uefa/... for scoreboards, cfbenchmarks/pyth/coinbase/coingecko for price indices, weather.gov/weather.com/wunderground for observations); `SCAN_REQUIRE_DATED` + `trade_cutoff_utc`: a day-dated ticker cuts quoting off at ET midnight BEFORE event day, so a game-day market is never quoted on game day (the live probe: Kalshi's `occurrence_datetime` on game markets equals the expected expiration, i.e. game END — it is no help, the ticker date is the guard); the 24h age screen keeps same-day listings (hourly/daily price structures) out |
+| adverse selection (news gaps, progressively-known data) | numeric-threshold strikes only (`REQUIRE_NUMERIC`: a "will X happen" binary's one jump IS the resolution — this alone still rejects most sports winner / election winner / award markets as `shape`); the 72h quiet-history screen (range <= 10c, jump < 6c, volume <= 250); the 24h activity screens (60/250); the tier's $75/day loss budget; the 2-strikes/7d series bar; the optional fill / mid-jump / drift tripwires (`IMM_SCAN_FILL_HALT` / `MID_JUMP` / `DRIFT`, still off — Jack 9/5 "dont need these") |
+
+Expected effect: most Sports series still reject, per series, as
+`live_source` (nearly every one cites ESPN or the league site); crypto
+price structures reject on `cfbenchmarks`/prefix; what opens up is the
+numeric, dated, record- or report-settled tail of those categories
+(season stat thresholds settled on a governing body's record, vote-share
+and approval thresholds, snowfall/hurricane counts off non-live records,
+box-office thresholds) — each still needing 24h of age, a quiet 72h and
+a sub-60-contract day. The refresh log's `rejects {...}` shows the new
+mix (`live_source` up, `category:*` gone after the caches re-read).
+
 ### Knobs (env, prefix IMM_SCAN_)
 
 `TOP_N` 15 (0 = tier OFF, nothing else in the bot reads these) ·
@@ -851,10 +905,14 @@ armed.
 `MAX_HISTORY_FETCHES` 40 · `FILL_HALT` 0 = off · `MID_JUMP` 0 = off ·
 `DRIFT` 0 = off ·
 `DAILY_LOSS_LIMIT` 75 · `SERIES_STRIKES` 2 · `SERIES_STRIKE_DAYS` 7 ·
-`EXCLUDE_CATEGORIES` · `EXCLUDE_PREFIXES` · `LIVE_SOURCE_KEYWORDS`.
-Widening levers, in order of how much risk they add: `EXCLUDE_CATEGORIES`
-(drop Culture/Politics), `MAX_VOLUME_24H`, `REQUIRE_NUMERIC=0` (admits
-"will X happen" binaries — the resolution-jump class; don't).
+`EXCLUDE_CATEGORIES` (EMPTY since 2026-09-06 — a name here is a
+deliberate re-ban) · `EXCLUDE_PREFIXES` · `LIVE_SOURCE_KEYWORDS`.
+Widening levers, in order of how much risk they add: `MAX_VOLUME_24H`,
+`LIVE_SOURCE_KEYWORDS` (dropping a scoreboard/index keyword admits
+markets everyone else prices off a live feed), `REQUIRE_NUMERIC=0`
+(admits "will X happen" binaries — the resolution-jump class; don't).
+Tightening levers: `EXCLUDE_CATEGORIES` (name a category to ban it
+again; cached verdicts follow within one refresh), the tripwires.
 
 ### Observability
 
