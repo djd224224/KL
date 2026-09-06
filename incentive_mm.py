@@ -4283,6 +4283,7 @@ class IncentiveMarketMaker:
         # right context, not a fresh read.
         self._last_panel: Dict[str, dict] = {}
         self._realized_by_ticker: Dict[str, float] = {}   # per-market delta base
+        self._cycle_hdr_ok = False                 # cycle-log header checked once
         self._selection_prev: Dict[str, str] = {}   # ticker -> last decision
         self._selection_snap_at = 0.0              # hourly full-candidate dump
         self._inventory_snap_day = ""              # daily open-book snapshot
@@ -7399,6 +7400,46 @@ class IncentiveMarketMaker:
                     self.state.coverage_zero_streak.pop(t, None)
             reward_frac_sum += frac * meta.dollars_per_day
             cycle_rate[t] = frac * meta.dollars_per_day
+            # --- enriched quote shape + governing clamps -------------------
+            # The 13 original columns reduce the whole quote to one scalar
+            # (`quoted`), and yes_depth/no_depth INCLUDE our own resting size —
+            # so competitor depth was not computable and "est_frac fell because
+            # a farmer stacked in" could not be told apart from "est_frac fell
+            # because my order got cancelled". Everything below is a live local
+            # in this same iteration and was simply not written.
+            #
+            # Columns are APPENDED, never reordered: imm_reward_recon.py reads
+            # this file positionally (row[0],[1],[7],[8],[11]) and gates on
+            # len(row) >= 13, so appending is backward compatible and the
+            # reward integral is untouched.
+            try:
+                # A tuple build raises NameError on the first unbound name and
+                # we fall back to blanks — an analytics column can never crash
+                # a live placement wave over a branch that skipped an assignment.
+                _hm, _rlo, _rb, _rs, _ro = (hm, rung_lo, room_buy, room_sell,
+                                            reduce_only)
+            except NameError:
+                _hm = _rlo = _rb = _rs = _ro = None
+            try:
+                ob = [(p, c) for s_, p, c in own if s_ == "bid"]
+                oa = [(p, c) for s_, p, c in own if s_ == "ask"]
+                shape = {
+                    "own_bid_ct": sum(c for _p, c in ob),
+                    "own_ask_ct": sum(c for _p, c in oa),
+                    "own_bid_top": max((p for p, _c in ob), default=None),
+                    "own_ask_top": min((p for p, _c in oa), default=None),
+                    "own_pad_bid_ct": sum(c for p, c in ob if p == PAD_BID_CENTS),
+                    "own_pad_ask_ct": sum(c for p, c in oa if p == PAD_ASK_CENTS),
+                    "want_bid_ct": sum(q.count for q in mq if q.book_side == "bid"),
+                    "want_ask_ct": sum(q.count for q in mq if q.book_side == "ask"),
+                    "want_pad_ct": sum(q.count for q in mq if q.is_pad),
+                }
+            except Exception:
+                shape = {}
+
+            def _c(v, fmt="{:.0f}"):
+                return "" if v is None else fmt.format(v)
+
             cycle_rows.append(
                 f"{now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')},{t},"
                 f"{ext_bid if ext_bid is not None else ''},"
@@ -7407,7 +7448,38 @@ class IncentiveMarketMaker:
                 f"{sum(q for _p, q in no_levels):.0f},"
                 f"{meta.target_size:.0f},{frac:.5f},{sides},"
                 f"{pos:.1f},{own_pos:.1f},{meta.dollars_per_day:.2f},"
-                f"{sum(q.count for q in mq)}\n")
+                f"{sum(q.count for q in mq)},"
+                # --- appended: quote shape (ours, so competitor depth =
+                #     yes_depth - own_bid_ct) ---
+                f"{_c(shape.get('own_bid_ct'))},{_c(shape.get('own_ask_ct'))},"
+                f"{_c(shape.get('own_bid_top'))},{_c(shape.get('own_ask_top'))},"
+                f"{_c(shape.get('own_pad_bid_ct'))},"
+                f"{_c(shape.get('own_pad_ask_ct'))},"
+                f"{_c(shape.get('want_bid_ct'))},{_c(shape.get('want_ask_ct'))},"
+                f"{_c(shape.get('want_pad_ct'))},"
+                # --- appended: what governed the size we chose ---
+                f"{_c(_hm, '{:.2f}')},{_c(_rlo)},{_c(_rb)},{_c(_rs)},"
+                # --- appended: market context + provenance ---
+                f"{_c(meta.volume, '{:.0f}')},"
+                f"{_c(meta.discount_factor, '{:.3f}')},"
+                f"{1 if getattr(meta, 'scan', False) else 0},"
+                f"{1 if t in self.state.selected else 0},"
+                f"{1 if _ro else 0},{1 if fast_only else 0},"
+                f"{RUN_ID},{CONFIG_HASH}\n")
+
+            # Cache the panel for the fills and orders sinks. A fill arrives
+            # one cycle AFTER the read that produced the order it hit, so this
+            # cached panel — not a fresh read — is the correct book context,
+            # and it costs no API call.
+            self._last_panel[t] = {
+                "ts": now_utc.isoformat(), "ext_bid": ext_bid,
+                "ext_ask": ext_ask,
+                "yes_depth": sum(q for _p, q in yes_levels),
+                "no_depth": sum(q for _p, q in no_levels),
+                "target": meta.target_size, "est_frac": frac,
+                "qual_sides": sides, "pool_per_day": meta.dollars_per_day,
+                "is_scan": bool(getattr(meta, "scan", False)),
+            }
             if t in self.state.selected and not reduce_only and not fast_only:
                 # 2026-08-06: this read `frac <= 0.0 and mq`. `frac` is scored
                 # from est_own (our RESTING orders) but the guard tested `mq`
@@ -7639,9 +7711,30 @@ class IncentiveMarketMaker:
                 f"{quoted}/{len(managed)} mkts quoted ({len(desired)} quotes), "
                 f"est ${reward_frac_sum:.2f}/day")
             self._write_cycle_log(cycle_rows)
+        else:
+            # Fast-lane mini-cycles BUILT these rows and then threw them away
+            # — the highest-resolution book snapshots this bot takes (5s on
+            # its fastest family) were discarded every time.
+            #
+            # They go to a SEPARATE file, deliberately. imm_reward_recon.py
+            # derives each market's accrual from the gap between consecutive
+            # distinct timestamps in cycle_log_*.csv; interleaving 5s rows
+            # would shrink those gaps and silently under-count the reward
+            # estimate that the whole realization factor rests on. The
+            # filename must also not match its cycle_log_*.csv glob.
+            self._write_fast_log(cycle_rows)
 
+    # 13 original columns + 21 appended 2026-09-06. APPEND ONLY, never
+    # reorder: imm_reward_recon.py reads this file positionally
+    # (row[0],[1],[7],[8],[11]) and gates on len(row) >= 13.
     CYCLE_LOG_HEADER = ("ts,ticker,ext_bid,ext_ask,yes_depth,no_depth,target,"
-                        "est_frac,qual_sides,acct_pos,own_pos,pool_per_day,quoted\n")
+                        "est_frac,qual_sides,acct_pos,own_pos,pool_per_day,quoted,"
+                        "own_bid_ct,own_ask_ct,own_bid_top,own_ask_top,"
+                        "own_pad_bid_ct,own_pad_ask_ct,"
+                        "want_bid_ct,want_ask_ct,want_pad_ct,"
+                        "hour_mult,rung_lo,room_buy,room_sell,"
+                        "vol24h,discount,is_scan,is_sticky,reduce_only,fast,"
+                        "run_id,config_hash\n")
 
     def _write_cycle_log(self, rows: List[str]) -> None:
         """Per-cycle book panel -> daily CSV. This is the jump-frequency /
@@ -7655,12 +7748,55 @@ class IncentiveMarketMaker:
                 STATUS_DIR,
                 f"cycle_log_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv")
             fresh = not os.path.exists(path)
+            # Schema transition: today's file may already carry an older,
+            # narrower header. Re-emitting the header INLINE is safe and is
+            # the cleanest signal to a reader that the width changed —
+            # imm_reward_recon.py already skips any row whose first field is
+            # "ts", so the reward integral is unaffected, and a pandas reader
+            # can split the day on header rows. Rewriting the first line of an
+            # 80 MB file mid-run would be far riskier than a second header.
+            if not fresh and not self._cycle_hdr_ok:
+                try:
+                    with open(path, encoding="utf-8") as chk:
+                        cur = chk.readline()
+                    if cur and cur.strip() != self.CYCLE_LOG_HEADER.strip():
+                        with open(path, "a", encoding="utf-8") as f:
+                            f.write(self.CYCLE_LOG_HEADER)
+                        log(f"{self.tag} cycle log schema widened to "
+                            f"{self.CYCLE_LOG_HEADER.count(',') + 1} cols; "
+                            f"header re-emitted inline in {os.path.basename(path)}")
+                except OSError:
+                    pass
+            self._cycle_hdr_ok = True
             with open(path, "a", encoding="utf-8") as f:
                 if fresh:
                     f.write(self.CYCLE_LOG_HEADER)
                 f.writelines(rows)
         except Exception as e:
             log(f"{self.tag} ! cycle log write failed: {e}")
+
+    def _write_fast_log(self, rows: List[str]) -> None:
+        """Fast-lane book panels -> daily CSV, same schema as the cycle log.
+
+        Kept out of cycle_log_*.csv on purpose (see the call site): the
+        reward reconciler integrates over timestamp gaps in that file, and
+        5-second rows would corrupt the integral. Never raises."""
+        if not rows or os.environ.get("IMM_CYCLE_LOG", "1") != "1":
+            return
+        try:
+            os.makedirs(STATUS_DIR, exist_ok=True)
+            path = os.path.join(
+                STATUS_DIR,
+                f"fastlane_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv")
+            fresh = not os.path.exists(path)
+            with open(path, "a", encoding="utf-8") as f:
+                if fresh:
+                    f.write(self.CYCLE_LOG_HEADER)
+                f.writelines(rows)
+        except Exception as e:
+            if "fastlane" not in self._sink_muted:
+                self._sink_muted.add("fastlane")
+                log(f"{self.tag} ! fast-lane log write failed ({e}); muted")
 
     @staticmethod
     def _is_pad_price(book_side: str, px: int) -> bool:
