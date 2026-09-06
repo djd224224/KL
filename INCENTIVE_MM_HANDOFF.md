@@ -939,12 +939,25 @@ day-dated midnight rule provides, one level coarser:
   the `program_over` screen stand. Report inside the window, or NO
   published date (CHWY/KR/TTAN) -> the month applies, unchanged: an
   unknown date must fail toward quoting less (the 8/6 CELH asymmetry).
-  Measured on the live feed the same afternoon: frees KXCCL-26SEPALBD
-  (reports 9/30, program ends 9/11), KXDOL-26SEPCOMP (9/12 vs 9/11) and
-  KXF-26OCTUSSALES (10/3 vs 9/11) — $356/day of pool, 26 markets. NOTE
-  all three still fail the 250/event activity cap today, so the narrowing
-  removes a wrong stand-down without yet changing what is quoted; see the
-  activity-cap calibration note below.
+  Measured on the live feed the same afternoon: the rule itself stops
+  cutting off KXCCL-26SEPALBD (reports 9/30, program ends 9/11),
+  KXDOL-26SEPCOMP (9/12 vs 9/11) and KXF-26OCTUSSALES (10/3 vs 9/11) —
+  $356/day of pool, 26 markets.
+  **It changed NOTHING observable, and it is important to know why.**
+  Verified after the deploy: the refresh reject counts did not move
+  (`cutoff_passed` 79 before and after). Those 26 markets never reach the
+  admission screens at all — they are cut one layer earlier by
+  `SCAN_MAX_BULK`, which ranks scan candidates by PER-MARKET
+  `dollars_per_day` and keeps 600. The KPI strikes sit at ranks 644-708
+  against a rank-600 cutoff of $14.29/day; each strike is $13.66-13.74.
+  That is the same breadth penalty as the event-volume cap: a 14-strike
+  event worth $192/day ranks BELOW a 2-strike event worth $30/day, because
+  the ranking never sees the event total. The Fiscal.ai change itself made
+  this worse — waving month-named tickers through grew the candidate list
+  and `bulk_cap` went 144 -> 311 over the day. So the KPI class needs the
+  bulk cap raised (`IMM_SCAN_MAX_BULK`, ~12 bulk reads per 600 tickers, so
+  1000 is cheap) or the ranking changed to consider the event pool, AND
+  the event-volume cap below, before any of it quotes.
   `imm_quote_gaps.scan_gap_label` deliberately reports NO report-month
   verdict: the narrowing depends on the report date and the program end,
   neither of which is in the persisted caches that function reads.
@@ -1019,9 +1032,15 @@ Suggested (unimplemented): score the event on its BUSIEST strike rather
 than the sum, and leave the market cap at 60 or raise it to 250 — the
 distribution gap makes that choice nearly free either way. Both are env
 knobs, so an experiment needs no code change: `IMM_SCAN_MAX_EVENT_VOLUME_24H`
-and `IMM_SCAN_MAX_VOLUME_24H`. This is also what currently keeps the three
-events freed by the report-month narrowing (CCL 1,757 / DOL 675 / F 3,220
-event volume) out of the book.
+and `IMM_SCAN_MAX_VOLUME_24H` (the max-vs-sum swap does need code).
+
+**`SCAN_MAX_BULK` has the same breadth flaw and bites FIRST.** It ranks
+candidates by per-market `dollars_per_day` and keeps 600, so a wide ladder
+is punished for being wide however good its event pool is — the 9/6 KPI
+events (CCL/DOL/F, $13.66-13.74 per strike) all land at ranks 644-708
+against a $14.29 cutoff and never reach a single admission screen. Any
+work on the activity caps should raise `IMM_SCAN_MAX_BULK` (or rank on the
+event pool) first, or it will measure nothing.
 
 ### Knobs (env, prefix IMM_SCAN_)
 
