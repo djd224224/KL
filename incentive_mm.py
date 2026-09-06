@@ -4284,6 +4284,7 @@ class IncentiveMarketMaker:
         self._last_panel: Dict[str, dict] = {}
         self._realized_by_ticker: Dict[str, float] = {}   # per-market delta base
         self._cycle_hdr_ok = False                 # cycle-log header checked once
+        self._marks_at = 0.0                       # 5-min mark series throttle
         self._selection_prev: Dict[str, str] = {}   # ticker -> last decision
         self._selection_snap_at = 0.0              # hourly full-candidate dump
         self._inventory_snap_day = ""              # daily open-book snapshot
@@ -5593,6 +5594,11 @@ class IncentiveMarketMaker:
         prev_events = {"-".join(t.split("-")[:2]) for t in prev_selected}
         screened: List[MarketMeta] = []
         skipped: Dict[str, int] = {}
+        # Per-market decision trail. `skipped` counts reasons; this
+        # records WHICH market got which one, so "why was X not quoted"
+        # and "would the markets I cut have earned more" stop being
+        # unanswerable. Analytics only — nothing reads it back.
+        decisions: Dict[str, str] = {}
         for meta in metas:
             t = meta.ticker
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
@@ -5609,6 +5615,7 @@ class IncentiveMarketMaker:
                                or meta.event_ticker in manual_evts)
             if manual_skip:
                 skipped["manual"] = skipped.get("manual", 0) + 1
+                decisions[t] = "manual"
                 continue
             reason = self._screen(meta, now_utc,
                                   member=t in prev_selected)
@@ -5619,6 +5626,7 @@ class IncentiveMarketMaker:
                 screened.append(meta)
             elif reason:
                 skipped[reason] = skipped.get(reason, 0) + 1
+                decisions[t] = reason
             else:
                 screened.append(meta)
 
@@ -5640,6 +5648,7 @@ class IncentiveMarketMaker:
                     ranked.append(meta)   # sticky: transient book-read failure
                 else:
                     skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
+                    decisions[meta.ticker] = "book_unreadable"
                 continue
             # Shared $1-min-payout projection for the entry floor AND the
             # hopeless exit: optimistic = accrued-so-far + max(current,
@@ -5677,6 +5686,7 @@ class IncentiveMarketMaker:
                 # fresh markets; members above keep quoting via the branch
                 # below until natural death.
                 skipped["no_new"] = skipped.get("no_new", 0) + 1
+                decisions[meta.ticker] = "no_new"
             elif HOPELESS_EXIT and not reaches_min \
                     and sub_bar_secs >= HOPELESS_SUSTAIN_SECS \
                     and meta.ticker in prev_selected \
@@ -5703,6 +5713,7 @@ class IncentiveMarketMaker:
                 # $1 projection is noisiest, and the group is 10 small
                 # ladders — the drain rule's fill-risk argument is thin.
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
+                decisions[meta.ticker] = "hopeless"
             elif meta.ticker not in prev_selected \
                     and meta.event_ticker not in prev_events \
                     and meta.event_ticker not in FORCE_EVENTS \
@@ -5720,6 +5731,7 @@ class IncentiveMarketMaker:
                 # est_TOTAL — a per-day RATE has no such excuse. Members stay
                 # sticky (rate dips never evict; hopeless owns exits).
                 skipped["rate_floor"] = skipped.get("rate_floor", 0) + 1
+                decisions[meta.ticker] = "rate_floor"
             elif meta.ticker in prev_selected \
                     or meta.event_ticker in FORCE_EVENTS \
                     or curated_event(meta.event_ticker, meta.series, now_utc):
@@ -5732,11 +5744,13 @@ class IncentiveMarketMaker:
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
+                decisions[meta.ticker] = "zero_yield"
             elif not reaches_min:
                 # entry floor, now with the accrued credit: a re-admitted
                 # market that already banked most of its $1 re-enters even
                 # when the remaining window alone couldn't clear the bar.
                 skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
+                decisions[meta.ticker] = "payout_floor"
             else:
                 ranked.append(meta)
         # Mild stickiness so estimator jitter doesn't churn the selection.
@@ -5765,6 +5779,7 @@ class IncentiveMarketMaker:
                                    immune=fin_sticky | scan_sticky)
         if topn_cut:
             skipped["event_top_n"] = len(topn_cut)
+            decisions.update({_t: "event_top_n" for _t in topn_cut})
             ranked = [m for m in ranked if m.ticker not in topn_cut]
 
         # Finecon GROUP top-N (Jack 2026-09-02 — see finecon_group_cut):
@@ -5785,6 +5800,7 @@ class IncentiveMarketMaker:
                                     extra_openings=openings_left)
         if fin_cut:
             skipped["finecon_top_n"] = len(fin_cut)
+            decisions.update({_t: "finecon_top_n" for _t in fin_cut})
             ranked = [m for m in ranked if m.ticker not in fin_cut]
         kept_group = sum(1 for m in ranked if m.series in FINECON_SERIES)
         used = finecon_openings_used(kept_group, len(fin_sticky))
@@ -5806,6 +5822,7 @@ class IncentiveMarketMaker:
                                   extra_openings=scan_openings_left)
         if scan_cut:
             skipped["scan_top_n"] = len(scan_cut)
+            decisions.update({_t: "scan_top_n" for _t in scan_cut})
             ranked = [m for m in ranked if m.ticker not in scan_cut]
         kept_scan = sum(1 for m in ranked if m.scan)
         used_scan = scan_openings_used(kept_scan, len(scan_sticky))
@@ -5876,6 +5893,7 @@ class IncentiveMarketMaker:
             cost = market_cost(meta)
             if collateral + cost + inv_reserve > COLLATERAL_BUDGET:
                 skipped["budget"] = skipped.get("budget", 0) + 1
+                decisions[meta.ticker] = "budget"
                 continue
             collateral += cost
             selected[meta.ticker] = meta
@@ -5922,6 +5940,65 @@ class IncentiveMarketMaker:
         if dropped:
             log(f"{self.tag} - deselected: {', '.join(sorted(dropped)[:8])}"
                 + (" ..." if len(dropped) > 8 else ""))
+        # The prose above truncates to 8 tickers and the skip reasons are only
+        # ever aggregate counts, so ~86% of the candidate universe has left no
+        # per-market record anywhere. Two sinks fix that at different cadences.
+        try:
+            by_ticker = {m.ticker: m for m in metas}
+
+            def _meta_fields(mt) -> dict:
+                if mt is None:
+                    return {}
+                return {
+                    "series": mt.series, "event_ticker": mt.event_ticker,
+                    "est_dollars_per_day": round(mt.est_dollars_per_day, 4),
+                    "yield_per_contract": round(mt.yield_per_contract, 6),
+                    "dollars_per_day": round(mt.dollars_per_day, 2),
+                    "target_size": mt.target_size,
+                    "est_collateral_dollars": round(mt.est_collateral_dollars, 2),
+                    "book_depth_contracts": mt.book_depth_contracts,
+                    "mid_cents": mt.mid_cents, "spread_cents": mt.spread_cents,
+                    "volume": mt.volume, "is_scan": bool(getattr(mt, "scan", False)),
+                }
+
+            # (a) Event-driven: only decisions that CHANGED since the last
+            # refresh. This is what makes an incident reconstructable — both
+            # times this bot silently benched hundreds of markets, the state
+            # had to be recovered from prose after the fact.
+            now_dec = dict(decisions)
+            for tk in selected:
+                now_dec[tk] = "selected"
+            events = []
+            for tk, dec in now_dec.items():
+                if self._selection_prev.get(tk) != dec:
+                    events.append({"ticker": tk, "decision": dec,
+                                   "prev": self._selection_prev.get(tk),
+                                   **_meta_fields(by_ticker.get(tk))})
+            for tk, prev in self._selection_prev.items():
+                if tk not in now_dec and prev != "gone":
+                    events.append({"ticker": tk, "decision": "gone", "prev": prev})
+            for e in events:
+                e["ts"] = now_utc.isoformat()
+                self._sink("selection_events", e)
+            self._selection_prev = now_dec
+
+            # (b) Hourly full snapshot of every candidate. This is the only
+            # thing that makes the counterfactual possible: realized credits
+            # on the markets we kept against modelled yield on the ones each
+            # cut reason dropped.
+            if now_ts - self._selection_snap_at >= 3600:
+                self._selection_snap_at = now_ts
+                for mt in metas:
+                    self._sink("selection_snapshot", {
+                        "ts": now_utc.isoformat(), "ticker": mt.ticker,
+                        "decision": now_dec.get(mt.ticker, "not_ranked"),
+                        **_meta_fields(mt)})
+                log(f"{self.tag} selection snapshot: {len(metas)} candidates "
+                    f"({len(events)} decision changes this refresh)")
+        except Exception as e:
+            if "selection" not in self._sink_muted:
+                self._sink_muted.add("selection")
+                log(f"{self.tag} ! selection sink failed ({e}); muted this run")
         if scan_on:
             log(f"{self.tag} open-scan: {len(scan_pre)} string-screened -> "
                 f"{sum(1 for m in metas if m.scan)} eligible -> "
@@ -7581,6 +7658,33 @@ class IncentiveMarketMaker:
         # LOSS HALT on TOTAL P&L today (realized + mark-to-market), so gapped
         # inventory counts even before it settles. Runs before any placement.
         self._refresh_marks(marked)
+        # Mark series for every open position, every 5 minutes.
+        #
+        # This is what makes adverse selection measurable. A mark-out needs the
+        # book at the fill and the book N minutes LATER — and the cycle log
+        # goes dark the moment selection drops a market, which is exactly what
+        # happens after a bad fill (bench / hopeless / depth-gate all evict).
+        # Keying on open positions instead of the managed set means the series
+        # continues for as long as we still carry the risk, and it costs no
+        # extra API call: _refresh_marks has just populated last_mark.
+        if now_ts - self._marks_at >= 300:
+            self._marks_at = now_ts
+            try:
+                for tkr, p in self.pnl.pos.items():
+                    if abs(p) <= 1e-9:
+                        continue
+                    self._sink("marks", {
+                        "ts": now_utc.isoformat(), "ticker": tkr,
+                        "series": series_of(tkr),
+                        "event_ticker": self._event_of(tkr),
+                        "pos": p, "avg_cents": self.pnl.avg.get(tkr, 0.0),
+                        "mark_cents": self.state.last_mark.get(tkr),
+                        "realized_dollars": self.pnl.realized.get(tkr, 0.0),
+                    })
+            except Exception as e:
+                if "marks" not in self._sink_muted:
+                    self._sink_muted.add("marks")
+                    log(f"{self.tag} ! marks sink failed ({e}); muted this run")
         unrealized = self.pnl.unrealized(self.state.last_mark)
         unmarked = [t for t, p in self.pnl.pos.items()
                     if abs(p) > 1e-9 and t not in self.state.last_mark]
