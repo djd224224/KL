@@ -4411,6 +4411,61 @@ class IncentiveMarketMaker:
                 self._sink_muted.add("fills")
                 log(f"{self.tag} ! fill sink failed ({e}); muted for this run")
 
+    def _log_order(self, kind: str, ticker: str, book_side: str,
+                   price_cents: Optional[int], count: Optional[float],
+                   order_id: str = "", now_ts: float = 0.0, **extra) -> None:
+        """One row per order-lifecycle event: place / reject / uncertain /
+        amend / cancel.
+
+        This is the denominator nothing else provides. Fills alone say what
+        traded; only the orders that DIDN'T fill make fill-rate, queue
+        position and ladder-shape answerable — and ~99.6% of this bot's
+        ~38k daily placements are cancelled, so the denominator is almost
+        the whole story. The exchange keeps orders for ~67 days and the only
+        local record was a free-text stdout line whose amend variant
+        truncates the order id to 8 chars.
+
+        Book context comes from the cached panel, never a fresh read: this
+        runs inside the placement wave and must not add API calls."""
+        try:
+            panel = self._last_panel.get(ticker) or {}
+            eb, ea = panel.get("ext_bid"), panel.get("ext_ask")
+            # Distance from the touch on our own side, in ticks — the axis
+            # fill-rate is actually a function of.
+            ticks = None
+            if price_cents is not None:
+                if book_side == "bid" and eb is not None:
+                    ticks = int(eb) - int(price_cents)
+                elif book_side == "ask" and ea is not None:
+                    ticks = int(price_cents) - int(ea)
+            rec = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "cycle_ts": now_ts or None,
+                "kind": kind,
+                "order_id": order_id,
+                "ticker": ticker,
+                "series": series_of(ticker),
+                "event_ticker": self._event_of(ticker),
+                "book_side": book_side,
+                "price_cents": price_cents,
+                "count": count,
+                "is_pad": (self._is_pad_price(book_side, price_cents)
+                           if book_side and price_cents is not None else None),
+                "ticks_from_touch": ticks,
+                "ext_bid": eb, "ext_ask": ea,
+                "yes_depth": panel.get("yes_depth"),
+                "no_depth": panel.get("no_depth"),
+                "target": panel.get("target"),
+                "est_frac": panel.get("est_frac"),
+                "is_scan": panel.get("is_scan"),
+            }
+            rec.update(extra)
+            self._sink("orders", rec)
+        except Exception as e:
+            if "orders" not in self._sink_muted:
+                self._sink_muted.add("orders")
+                log(f"{self.tag} ! order sink failed ({e}); muted this run")
+
     def _journal_order_id(self, oid: str, ts: float) -> None:
         """Append-only crash journal for order ownership: one line per placed
         order so a hard-kill can never orphan a fill, without paying the full
@@ -4830,6 +4885,11 @@ class IncentiveMarketMaker:
                 "_placed_at": now_ts, "_confirmed": False,
             }
             log(f"{self.tag} placed {label} -> {oid}")
+            self._log_order("place", q.ticker, q.book_side, q.price_cents,
+                            q.count, oid, now_ts,
+                            client_order_id=client_order_id,
+                            quote_is_pad=q.is_pad,
+                            expiration_ts=expiration_ts)
             # Durable PER ORDER, but cheap: append the id to a journal (<1ms)
             # instead of dumping the full ~3.4MB state (~450ms) — a hard-kill
             # mid-wave orphaned 3 fills on unsaved ids (2026-07-19, ~19:22Z
@@ -4841,6 +4901,14 @@ class IncentiveMarketMaker:
         except HttpError as e:
             # A definitive rejection (post-only would cross, etc.) — no order exists.
             log(f"{self.tag} ! place rejected ({e}): {label}")
+            # Rejections are signal, not noise: a post-only reject means the
+            # touch moved between the book read and the send, which is the
+            # measurable form of "our quotes are stale".
+            self._log_order("reject", q.ticker, q.book_side, q.price_cents,
+                            q.count, "", now_ts,
+                            client_order_id=client_order_id,
+                            quote_is_pad=q.is_pad, error=str(e),
+                            http_status=getattr(e, "status", None))
             return False
         except Exception as e:
             # Ambiguous failure (timeout mid-flight): the order MAY be live but
@@ -4850,9 +4918,16 @@ class IncentiveMarketMaker:
             self.state.place_uncertain[(q.ticker, q.book_side, q.price_cents)] = now_ts
             log(f"{self.tag} ! place failed ({e}): {label}; level cooled "
                 f"{2 * POLL_SECS}s (order may exist untracked)")
+            # kind='uncertain', not 'reject': the order MAY be live but
+            # untracked, so any fill-rate denominator must be able to exclude
+            # these rather than silently count them as unfilled.
+            self._log_order("uncertain", q.ticker, q.book_side, q.price_cents,
+                            q.count, "", now_ts,
+                            client_order_id=client_order_id,
+                            quote_is_pad=q.is_pad, error=str(e))
             return False
 
-    def cancel_order(self, order_id: str) -> bool:
+    def cancel_order(self, order_id: str, reason: str = "") -> bool:
         # Heartbeat per order: a 1000-order sweep/wave legitimately outlasts
         # the hang-watchdog window; a WEDGED call still freezes these touches.
         self._heartbeat = time.time()
@@ -4861,15 +4936,36 @@ class IncentiveMarketMaker:
             self.state.order_ages.pop(order_id, None)
             log(f"{self.tag} [DRY] cancel {order_id}")
             return True
+        # Snapshot the ledger entry before either path pops it — it carries
+        # the ticker/side/price this cancel refers to, and after the pop the
+        # order id alone is meaningless.
+        led = self.state.ledger.get(order_id) or {}
+        placed_at = led.get("_placed_at")
         try:
             self.client.cancel_order(order_id)
             self.state.order_ages.pop(order_id, None)
             self.state.ledger.pop(order_id, None)
+            self._log_order(
+                "cancel", led.get("ticker", ""), led.get("book_side", ""),
+                led.get("yes_price"), led.get("remaining_count"), order_id,
+                reason=reason,
+                rested_secs=(round(time.time() - placed_at, 1)
+                             if placed_at else None))
             return True
         except HttpError as e:
             if e.status in (404, 409):
                 self.state.order_ages.pop(order_id, None)
                 self.state.ledger.pop(order_id, None)
+                # Already gone — filled, expired or cancelled elsewhere.
+                # Distinct from 'cancel' on purpose: an order that vanished
+                # before we could cancel it must not be counted as one we
+                # pulled when computing fill rates.
+                self._log_order(
+                    "gone", led.get("ticker", ""), led.get("book_side", ""),
+                    led.get("yes_price"), led.get("remaining_count"),
+                    order_id, reason=reason, http_status=e.status,
+                    rested_secs=(round(time.time() - placed_at, 1)
+                                 if placed_at else None))
                 return True
             log(f"{self.tag} ! cancel failed {order_id}: {e}")
             return False
@@ -4910,10 +5006,21 @@ class IncentiveMarketMaker:
                 order_id=oid, ticker=q.ticker, book_side=q.book_side,
                 yes_price_cents=q.price_cents, total_count=total)
             led = self.state.ledger.get(oid)
+            # Read the previous price/size BEFORE the overwrite below, and
+            # keep the FULL order id: the prose line truncates it to 8 chars,
+            # which makes an order's price history unreconstructable even by
+            # regex. ~13k amends a day carry the whole requote story.
+            prev_px = led.get("yes_price") if led is not None else None
+            prev_ct = led.get("remaining_count") if led is not None else None
             if led is not None:
                 led["yes_price"] = q.price_cents
                 led["remaining_count"] = float(q.count)
             log(f"{self.tag} amended {label}")
+            self._log_order("amend", q.ticker, q.book_side, q.price_cents,
+                            q.count, oid, now_ts,
+                            prev_price_cents=prev_px, prev_count=prev_ct,
+                            filled_before=filled, total_count=total,
+                            quote_is_pad=q.is_pad)
             return True
         except HttpError as e:
             if e.status in (404, 409):
@@ -5014,7 +5121,7 @@ class IncentiveMarketMaker:
         try:
             orders = self._merge_ledger(self._get_resting_orders_global(), time.time())
             for o in orders:
-                if self.cancel_order(o["order_id"]):
+                if self.cancel_order(o["order_id"], reason="cancel_all"):
                     n += 1
         except Exception as e:
             log(f"{self.tag} ! cancel-all sweep failed: {e}")
@@ -5088,7 +5195,8 @@ class IncentiveMarketMaker:
     def cancel_market_orders(self, ticker: str, resting: List[dict]) -> int:
         n = 0
         for o in resting:
-            if o.get("ticker") == ticker and self.cancel_order(o.get("order_id", "")):
+            if o.get("ticker") == ticker and self.cancel_order(
+                    o.get("order_id", ""), reason="market_cancel"):
                 n += 1
         return n
 
@@ -6629,7 +6737,8 @@ class IncentiveMarketMaker:
         managed_set = set(managed)
         stray = [o for o in resting if o.get("ticker") not in managed_set]
         for o in stray:
-            if self.cancel_order(o.get("order_id", "")):
+            if self.cancel_order(o.get("order_id", ""),
+                                 reason="stray_unmanaged"):
                 self.state.cancelled_today += 1
         if stray:
             resting = [o for o in resting if o.get("ticker") in managed_set]
@@ -7507,7 +7616,7 @@ class IncentiveMarketMaker:
         cancel_failures = 0
         cancelled_ids: Set[str] = set()
         for oid in to_cancel:
-            if self.cancel_order(oid):
+            if self.cancel_order(oid, reason="requote_diff"):
                 self.state.cancelled_today += 1
                 cancelled_ids.add(oid)
             else:
