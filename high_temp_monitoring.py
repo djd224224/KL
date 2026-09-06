@@ -754,19 +754,42 @@ def run_monitoring(upload_to_bq=True):
                     total_cost = S.total_cost,
                     total_payout = S.total_payout,
                     pnl = S.pnl,
-                    num_fills = S.num_fills
+                    num_fills = S.num_fills,
+                    -- Ticker-derived dimensions. Staging parses these
+                    -- correctly, but this MERGE listed only 18 of the table's
+                    -- 27 columns, so all 9 landed empty on every promotion --
+                    -- 924 of 2,369 rows (39%), and 100% of every row settled
+                    -- since 2026-07-08. It stayed invisible because
+                    -- KXHIGH_settlements_clean and _resolved_markets re-parse
+                    -- them from market_ticker rather than trusting the base
+                    -- table. Included in UPDATE as well as INSERT so an
+                    -- existing hollow row heals if it is ever re-merged.
+                    series_city = S.series_city,
+                    city_code = S.city_code,
+                    city_name = S.city_name,
+                    date_code = S.date_code,
+                    event_date = S.event_date,
+                    event_ticker = S.event_ticker,
+                    market_code = S.market_code,
+                    market_type = S.market_type,
+                    temp_value = S.temp_value
                 WHEN NOT MATCHED THEN INSERT (
                     market_ticker, result, revenue, value,
                     yes_total_cost, no_total_cost, yes_count, no_count,
                     fee_cost, settled_time, pulled_at,
                     position_yes, position_no, net_position,
-                    total_cost, total_payout, pnl, num_fills
+                    total_cost, total_payout, pnl, num_fills,
+                    series_city, city_code, city_name, date_code, event_date,
+                    event_ticker, market_code, market_type, temp_value
                 ) VALUES (
                     S.market_ticker, S.result, S.revenue, S.value,
                     S.yes_total_cost, S.no_total_cost, S.yes_count, S.no_count,
                     S.fee_cost, S.settled_time, S.pulled_at,
                     S.position_yes, S.position_no, S.net_position,
-                    S.total_cost, S.total_payout, S.pnl, S.num_fills
+                    S.total_cost, S.total_payout, S.pnl, S.num_fills,
+                    S.series_city, S.city_code, S.city_name, S.date_code,
+                    S.event_date, S.event_ticker, S.market_code,
+                    S.market_type, S.temp_value
                 )
                 """
                 try:
