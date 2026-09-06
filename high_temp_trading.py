@@ -230,6 +230,10 @@ def write_to_bq(df, table_name, write_disposition="WRITE_APPEND", schema=None):
 
 # Collector for orders placed during this run
 all_order_records = []
+# Collector for ladder outcomes — one row per (run, market) that reached the
+# ladder, placed or not. Written to KXHIGH_ladder_outcomes at the end of the
+# run. Telemetry only.
+all_ladder_records = []
 
 # ====================================================================
 # Per-run identity + tracking
@@ -2334,7 +2338,12 @@ for index, row in combined_table.iterrows():
   n_levels = len(price_count)
   _rungs = []           # list of (i, bid, contracts, edge, status, reason)
   _placed_rungs = []    # list of (bid, contracts, edge) for placed orders
-  _skip_cnt = {"below_city_min": 0, "bid>=no_offer": 0, "bid>=no_bid-3": 0, "position_cap": 0, "cash_cap": 0, "order_failed": 0}
+  _skip_cnt = {"below_city_min": 0, "bid>=no_offer": 0, "bid>=no_bid-3": 0,
+               "position_cap": 0, "cash_cap": 0, "cap_check_error": 0, "order_failed": 0}
+  # Same keys, counting CONTRACTS blocked rather than rungs. "How many
+  # contracts did the position cap actually stop" is the question any cap
+  # change turns on, and a rung count cannot answer it.
+  _skip_ct = {k: 0 for k in _skip_cnt}
   # Within-run cap accounting. Kalshi's get_orders is eventually consistent —
   # a freshly created order can take >100ms to appear in the resting list.
   # Without local tracking, the per-rung live cap check below sees stale
@@ -2385,24 +2394,28 @@ for index, row in combined_table.iterrows():
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
                      f'bid<city_min({_city_min}c, {row["City"]})'))
       _skip_cnt["below_city_min"] += 1
+      _skip_ct["below_city_min"] += contracts
       continue
     # Filter A: bid must not cross the offer (post_only would reject)
     if not (bid_price < int(no_offer)):
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
                      f'bid≥no_offer({int(no_offer)})'))
       _skip_cnt["bid>=no_offer"] += 1
+      _skip_ct["bid>=no_offer"] += contracts
       continue
     # Filter B: bid must be ≥4c below current best NO bid (maker buffer)
     if not (bid_price < int(no_bid) - 3):
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
                      f'bid≥no_bid−3({int(no_bid) - 3})'))
       _skip_cnt["bid>=no_bid-3"] += 1
+      _skip_ct["bid>=no_bid-3"] += contracts
       continue
     # Filter C: position cap
     if not (_cap >= row['position'] + row['resting_order_count'] + contracts):
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
                      f'position cap (would exceed {_cap})'))
       _skip_cnt["position_cap"] += 1
+      _skip_ct["position_cap"] += contracts
       continue
     # Filter C2: per-market cash cap — filled cash + this run's placed cost
     # (local arithmetic only; no API dependency, so it survives the read-path
@@ -2414,6 +2427,7 @@ for index, row in combined_table.iterrows():
                      f'cash cap (filled=${_filled_cash:.2f}+run=${_run_placed_cash:.2f}'
                      f'+new=${_rung_cost:.2f}>${MARKET_CASH_CAP_DOLLARS:.0f})'))
       _skip_cnt["cash_cap"] += 1
+      _skip_ct["cash_cap"] += contracts
       continue
 
     i1 = i1 + 1
@@ -2516,13 +2530,17 @@ for index, row in combined_table.iterrows():
                        f'+run={_run_placed_contracts}],'
                        f' eff={_effective_total}+new={contracts}>{_cap})'))
         _skip_cnt["position_cap"] += 1
+        _skip_ct["position_cap"] += contracts
         continue
     except Exception as _ce:
       alert("CAP_CHECK_FAILED",
             f"Pre-placement cap check failed on {row['market_ticker']}; skipping rung to avoid leak",
             {"error": str(_ce)[:200], "rung_contracts": int(contracts), "rung_price": int(bid_price)})
       _rungs.append((i, bid_price, contracts, edge, 'SKIP', 'cap check API error (skipped)'))
-      _skip_cnt["position_cap"] += 1
+      # Own key: an API failure is not the cap binding, and conflating the two
+      # would make the cap look tighter than it is in the readout.
+      _skip_cnt["cap_check_error"] += 1
+      _skip_ct["cap_check_error"] += contracts
       continue
 
     try:
@@ -2606,6 +2624,7 @@ for index, row in combined_table.iterrows():
           _fail_tag = f'ORDER_FAILED: {_err_str[:60]}'
       _rungs.append((i, bid_price, contracts, edge, '✗', _fail_tag))
       _skip_cnt["order_failed"] += 1
+      _skip_ct["order_failed"] += contracts
       time.sleep(0.2)  # Extra pause after error
     if bid_price <= 1:
       break  # Don't place more orders at the 1¢ floor
@@ -2629,6 +2648,7 @@ for index, row in combined_table.iterrows():
       _formatted.append(f"... +{len(_placed_rungs)-5} more")
     _sum_placed = sum(c for _, c, _ in _placed_rungs)
     _n_skipped = len(_rungs) - len(_placed_rungs)
+    _reason = None
     print(f"    → NO: {_formatted} (placed: {len(_placed_rungs)} rungs / "
           f"{_sum_placed} contracts, skipped: {_n_skipped})")
   else:
@@ -2651,6 +2671,74 @@ for index, row in combined_table.iterrows():
       _reason = f"mixed skips: {_skip_cnt}"
     print(f"    → NO: [no orders placed — {_reason}]")
 
+  # ==================================================================
+  # LADDER OUTCOME ROW — one per (run, market) that reached the ladder.
+  # Pure telemetry: nothing here changes trading behaviour.
+  #
+  # Exists because the ladder's skip counters were stdout-only, so the
+  # only way to ask "how often does the position cap actually bind, and
+  # how many contracts does it stop" was to grep GitHub Actions logs.
+  # That is the question any cap change turns on, and it is also the
+  # question the size experiment makes urgent — treatment quotes 25×2×1.5
+  # = 75 contracts a rung, so it reaches a 100/150 cap in two fills where
+  # control rarely does. With `size_arm` on the row, the per-arm cap-bind
+  # rate falls straight out of a GROUP BY.
+  #
+  # Markets that never reach the ladder (pre-trade filters, closed market,
+  # obs already through the bucket) write no row — those are covered by
+  # KXHIGH_market_snapshot.pre_trade_skip_reason.
+  # ==================================================================
+  try:
+    all_ladder_records.append({
+      'run_id': RUN_ID,
+      'market_ticker': ticker,
+      'city': row['City'],
+      'forecast_date': row['Forecast Date'],
+      'run_date': row['Run Date'],
+      'created_at': central_time.strftime('%Y-%m-%d %H:%M:%S'),
+      'variable': int(variable),
+      'size_arm': _size_arm,
+      'size_arm_base_contracts': int(_base_contracts),
+      'sigma_model': SIGMA_MODEL,
+      'is_wet': bool(_is_wet),
+      # Cap state as the ladder found it
+      'position_cap': int(_cap),
+      'position_at_start': float(_initial_position),
+      'resting_at_start': float(_initial_resting),
+      'cap_headroom_contracts': float(_cap - _initial_position - _initial_resting),
+      'cash_cap_dollars': float(MARKET_CASH_CAP_DOLLARS),
+      'filled_cash_at_start': float(_filled_cash),
+      # What the ladder did
+      'n_rungs_considered': int(len(_rungs)),
+      'n_rungs_placed': int(len(_placed_rungs)),
+      'contracts_placed': int(_run_placed_contracts),
+      'cash_placed_dollars': round(float(_run_placed_cash), 2),
+      'ladder_skip_reason': _reason,
+      # Rungs blocked, and the contracts behind them
+      'skip_rungs_position_cap': int(_skip_cnt['position_cap']),
+      'skip_rungs_cash_cap': int(_skip_cnt['cash_cap']),
+      'skip_rungs_maker_buffer': int(_skip_cnt['bid>=no_bid-3']),
+      'skip_rungs_crosses_offer': int(_skip_cnt['bid>=no_offer']),
+      'skip_rungs_city_min': int(_skip_cnt['below_city_min']),
+      'skip_rungs_cap_check_error': int(_skip_cnt['cap_check_error']),
+      'skip_rungs_order_failed': int(_skip_cnt['order_failed']),
+      'blocked_ct_position_cap': int(_skip_ct['position_cap']),
+      'blocked_ct_cash_cap': int(_skip_ct['cash_cap']),
+      'blocked_ct_maker_buffer': int(_skip_ct['bid>=no_bid-3']),
+      'blocked_ct_crosses_offer': int(_skip_ct['bid>=no_offer']),
+      'blocked_ct_city_min': int(_skip_ct['below_city_min']),
+      'blocked_ct_cap_check_error': int(_skip_ct['cap_check_error']),
+      'blocked_ct_order_failed': int(_skip_ct['order_failed']),
+      # Book + model context, so a cap cut can be conditioned on them
+      'no_highest_bid': _safe_float(no_bid),
+      'no_lowest_offer': _safe_float(no_offer),
+      'effective_hi_no': float(_effective_hi_no),
+      'yes_prob': round(float(yes_prob), 4),
+      'effective_sigma': _safe_float(_eff_sigma),
+    })
+  except Exception as _lre:
+    print(f"    (ladder telemetry row skipped: {_lre})")
+
 print(f"\n{'='*60}")
 print(f"TOTAL ORDERS PLACED: {orders_placed}")
 print(f"{'='*60}")
@@ -2662,6 +2750,69 @@ if all_order_records:
     df_orders['run_date'] = pd.to_datetime(df_orders['run_date'])
     df_orders['created_at'] = pd.to_datetime(df_orders['created_at'])
     write_to_bq(df_orders, "orders", "WRITE_APPEND")
+
+# Ladder outcomes (telemetry). Explicit schema so the table is typed correctly
+# on first creation — autodetect on a fresh table repeats the 2026-05-08
+# datetime64→INT64-nanoseconds incident that broke market_snapshot.
+if all_ladder_records:
+    _LADDER_SCHEMA = [
+        bigquery.SchemaField("run_id", "STRING"),
+        bigquery.SchemaField("market_ticker", "STRING"),
+        bigquery.SchemaField("city", "STRING"),
+        bigquery.SchemaField("forecast_date", "DATE"),
+        bigquery.SchemaField("run_date", "TIMESTAMP"),
+        bigquery.SchemaField("created_at", "TIMESTAMP"),
+        bigquery.SchemaField("variable", "INTEGER"),
+        bigquery.SchemaField("size_arm", "STRING"),
+        bigquery.SchemaField("size_arm_base_contracts", "INTEGER"),
+        bigquery.SchemaField("sigma_model", "STRING"),
+        bigquery.SchemaField("is_wet", "BOOLEAN"),
+        bigquery.SchemaField("position_cap", "INTEGER"),
+        bigquery.SchemaField("position_at_start", "FLOAT"),
+        bigquery.SchemaField("resting_at_start", "FLOAT"),
+        bigquery.SchemaField("cap_headroom_contracts", "FLOAT"),
+        bigquery.SchemaField("cash_cap_dollars", "FLOAT"),
+        bigquery.SchemaField("filled_cash_at_start", "FLOAT"),
+        bigquery.SchemaField("n_rungs_considered", "INTEGER"),
+        bigquery.SchemaField("n_rungs_placed", "INTEGER"),
+        bigquery.SchemaField("contracts_placed", "INTEGER"),
+        bigquery.SchemaField("cash_placed_dollars", "FLOAT"),
+        bigquery.SchemaField("ladder_skip_reason", "STRING"),
+        bigquery.SchemaField("skip_rungs_position_cap", "INTEGER"),
+        bigquery.SchemaField("skip_rungs_cash_cap", "INTEGER"),
+        bigquery.SchemaField("skip_rungs_maker_buffer", "INTEGER"),
+        bigquery.SchemaField("skip_rungs_crosses_offer", "INTEGER"),
+        bigquery.SchemaField("skip_rungs_city_min", "INTEGER"),
+        bigquery.SchemaField("skip_rungs_cap_check_error", "INTEGER"),
+        bigquery.SchemaField("skip_rungs_order_failed", "INTEGER"),
+        bigquery.SchemaField("blocked_ct_position_cap", "INTEGER"),
+        bigquery.SchemaField("blocked_ct_cash_cap", "INTEGER"),
+        bigquery.SchemaField("blocked_ct_maker_buffer", "INTEGER"),
+        bigquery.SchemaField("blocked_ct_crosses_offer", "INTEGER"),
+        bigquery.SchemaField("blocked_ct_city_min", "INTEGER"),
+        bigquery.SchemaField("blocked_ct_cap_check_error", "INTEGER"),
+        bigquery.SchemaField("blocked_ct_order_failed", "INTEGER"),
+        bigquery.SchemaField("no_highest_bid", "FLOAT"),
+        bigquery.SchemaField("no_lowest_offer", "FLOAT"),
+        bigquery.SchemaField("effective_hi_no", "FLOAT"),
+        bigquery.SchemaField("yes_prob", "FLOAT"),
+        bigquery.SchemaField("effective_sigma", "FLOAT"),
+    ]
+    try:
+        df_ladder = pd.DataFrame(all_ladder_records)
+        df_ladder = df_ladder.reindex(columns=[f.name for f in _LADDER_SCHEMA])
+        df_ladder['forecast_date'] = pd.to_datetime(
+            df_ladder['forecast_date'], errors='coerce').dt.date
+        df_ladder['run_date'] = pd.to_datetime(df_ladder['run_date'], errors='coerce')
+        df_ladder['created_at'] = pd.to_datetime(df_ladder['created_at'], errors='coerce')
+        write_to_bq(df_ladder, "ladder_outcomes", "WRITE_APPEND", schema=_LADDER_SCHEMA)
+        _capped = int((df_ladder['skip_rungs_position_cap'] > 0).sum())
+        _cap_ct = int(df_ladder['blocked_ct_position_cap'].sum())
+        print(f"  LADDER: {len(df_ladder)} markets reached the ladder; "
+              f"position cap bound on {_capped} "
+              f"({100*_capped/max(1,len(df_ladder)):.1f}%), blocking {_cap_ct} contracts")
+    except Exception as _lwe:
+        print(f"  LADDER telemetry write failed (non-fatal): {_lwe}")
 
 print("\nTrading run complete.")
 
@@ -2734,6 +2885,11 @@ try:
         n_orders_placed=int(orders_placed),
         n_orders_in_records=int(len(all_order_records)),
         n_alerts_emitted=int(len(_ALERTS)),
+        n_markets_reached_ladder=int(len(all_ladder_records)),
+        n_markets_position_cap_bound=int(
+            sum(1 for _r in all_ladder_records if _r.get('skip_rungs_position_cap', 0) > 0)),
+        n_contracts_blocked_by_position_cap=int(
+            sum(_r.get('blocked_ct_position_cap', 0) for _r in all_ladder_records)),
         exit_status="success",
     )
 except Exception as _re:
