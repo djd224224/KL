@@ -1067,9 +1067,63 @@ print(f"  applied to {_n_corr}/{len(combined_table)} rows; "
       f"max |correction|={combined_table['bias_correction_F'].abs().max():.2f}°F")
 # -----------------------------------------------------------------------------
 
-# City-specific floor std dev (from v1 bot calibration, 1816 observations)
-# Model uses: max(inter_source_std, city_floor_std)
-# This prevents 0 std when all sources agree (which gives 100%/0% extremes)
+# =====================================================================
+# FORECAST σ — MEASURED, NOT FLOORED               (2026-09-06)
+# ---------------------------------------------------------------------
+# The old model used  σ = max(std of the 2 vendors, CITY_FLOOR_STD)  with
+# floors of 1.0–1.9°F. Scored against 2,412 city-days of final CLI highs
+# (2026-05-08 → 09-05, evening run, preliminary-report rows excluded), the
+# ACTUAL forecast-error σ at the lead the bot trades is 2.40°F pooled, and
+# every one of the 20 cities came in wider than its floor — median ratio
+# 1.8×, worst 2.8× (Seattle 1.2 → 3.34).
+#
+# Why it mattered: for a centred 2°F band, σ=1.3 implies P(yes)=55.8% when
+# the truth is ~33%. The model was not slightly miscalibrated, it was the
+# wrong shape — which is why its own claimed edge carried no information
+# about realized P&L across 4,374 fills (all buckets +3 to +9c/contract,
+# no monotonicity).
+#
+# The vendor spread is kept, but only as a WIDENER. A 2-vendor standard
+# deviation is a 1-degree-of-freedom estimate of vendor *agreement*, which
+# is a different quantity from forecast error (corr with realized |error|
+# is only +0.35); it can say "both models are lost", it cannot say "this
+# forecast is unusually good".
+# =====================================================================
+# Realized error σ per city, evening run (~26h lead). ~120 city-days each.
+MEASURED_SIGMA_F = {
+    "Seattle": 3.34, "San Francisco": 3.07, "Phoenix": 2.90,
+    "Oklahoma City": 2.89, "Denver": 2.83, "Boston": 2.80,
+    "Minneapolis": 2.61, "Washington DC": 2.22, "New Orleans": 2.20,
+    "Philadelphia": 2.19, "New York City": 2.15, "Atlanta": 2.13,
+    "Dallas": 2.11, "Los Angeles": 2.09, "Chicago": 1.94,
+    "Las Vegas": 1.93, "Houston": 1.91, "San Antonio": 1.75,
+    "Austin": 1.74, "Miami": 1.54,
+}
+MEASURED_SIGMA_DEFAULT_F = 2.40   # pooled, for a city not in the table
+
+# Convective days are harder to forecast: pooled σ 2.54°F on days whose NWS
+# short forecast mentions rain/showers/thunder/storms vs 2.30°F otherwise,
+# and 17 of the 19 cities with both samples agree. Applied as a pooled
+# multiplier rather than a per-city wet σ — several cities have <5 wet days
+# in-sample, so the city dimension comes from n≈120 and the wet dimension
+# from n=2,412. Mean error also runs +0.49°F warm on wet days (vs −0.03
+# dry); that half is left to the rolling bias correction above.
+WET_SIGMA_MULT = float(os.environ.get("WET_SIGMA_MULT", "1.057"))
+DRY_SIGMA_MULT = float(os.environ.get("DRY_SIGMA_MULT", "0.956"))
+_WET_WORDS = ("rain", "shower", "thunder", "storm", "drizzle")
+
+# Day-of runs forecast ~15h out instead of ~26h: pooled σ 2.105 vs 2.402.
+DAYOF_SIGMA_MULT = float(os.environ.get("DAYOF_SIGMA_MULT", "0.876"))
+
+# Hard floor. Not a modelling choice — just stops a bad table edit or a
+# multiplier typo from producing 100%/0% extremes.
+SIGMA_ABS_FLOOR_F = 1.0
+
+# "measured" (default) | "legacy" — one env var reverts the whole change
+# without a deploy. Legacy reproduces the pre-2026-09-06 floors exactly.
+SIGMA_MODEL = os.environ.get("SIGMA_MODEL", "measured").lower()
+
+# Retained for SIGMA_MODEL=legacy and for the A/B-style logging below.
 CITY_FLOOR_STD = {
     "Austin": 1.2, "Miami": 1.0, "Houston": 1.9, "Denver": 1.4,
     "New York City": 1.2, "Philadelphia": 1.3, "Chicago": 1.3, "Los Angeles": 1.2,
@@ -1077,9 +1131,56 @@ CITY_FLOOR_STD = {
     "Las Vegas": 1.1, "Oklahoma City": 1.4, "Seattle": 1.2, "San Francisco": 1.2,
     "San Antonio": 1.2, "Minneapolis": 1.4, "New Orleans": 1.2,
 }
+
 combined_table['City Floor Std'] = combined_table['City'].map(CITY_FLOOR_STD).fillna(1.2)
-combined_table['Standard Deviation'] = combined_table[['Standard Deviation', 'City Floor Std']].max(axis=1)
-combined_table['Standard Deviation'] = combined_table['Standard Deviation'].replace({0: 1.2, np.nan: 1.2})
+# 'Standard Deviation' keeps its original meaning — the raw 2-vendor spread —
+# so KXHIGH_market_snapshot.forecast_std stays comparable to its own history
+# and the forecast-accuracy dashboards keep working. The number the model
+# actually prices with is the new 'Effective Sigma'.
+combined_table['Standard Deviation'] = pd.to_numeric(
+    combined_table['Standard Deviation'], errors='coerce')
+
+combined_table['Is Wet'] = combined_table['NWS Short Conditions'].apply(
+    lambda c: bool(c) and any(w in str(c).lower() for w in _WET_WORDS))
+combined_table['Measured Sigma'] = (
+    combined_table['City'].map(MEASURED_SIGMA_F).fillna(MEASURED_SIGMA_DEFAULT_F))
+# variable==1 → evening run pricing tomorrow's market (the ~26h lead the
+# table was measured at). variable==0 → same-day market, shorter lead.
+_lead_mult = 1.0 if variable == 1 else DAYOF_SIGMA_MULT
+combined_table['Sigma Lead Mult'] = _lead_mult
+combined_table['Sigma Wet Mult'] = np.where(
+    combined_table['Is Wet'], WET_SIGMA_MULT, DRY_SIGMA_MULT)
+
+if SIGMA_MODEL == "legacy":
+    combined_table['Effective Sigma'] = combined_table[
+        ['Standard Deviation', 'City Floor Std']].max(axis=1)
+    combined_table['Effective Sigma'] = combined_table['Effective Sigma'].replace(
+        {0: 1.2, np.nan: 1.2})
+    combined_table['Sigma Source'] = 'legacy_floor'
+else:
+    _measured = (combined_table['Measured Sigma']
+                 * combined_table['Sigma Wet Mult'] * _lead_mult)
+    # Vendor spread widens, never narrows.
+    combined_table['Effective Sigma'] = np.maximum(
+        _measured, combined_table['Standard Deviation'].fillna(0.0))
+    combined_table['Effective Sigma'] = combined_table['Effective Sigma'].clip(
+        lower=SIGMA_ABS_FLOOR_F).replace({np.nan: MEASURED_SIGMA_DEFAULT_F})
+    combined_table['Sigma Source'] = np.where(
+        combined_table['Standard Deviation'].fillna(0.0) > _measured,
+        'vendor_spread', 'measured')
+
+print(f"\n========== FORECAST σ ({SIGMA_MODEL}) ==========")
+print(f"  lead: variable={variable} → ×{_lead_mult:g}   "
+      f"wet ×{WET_SIGMA_MULT:g} / dry ×{DRY_SIGMA_MULT:g}")
+print(f"  wet markets: {int(combined_table['Is Wet'].sum())}/{len(combined_table)}"
+      f"   σ effective: mean={combined_table['Effective Sigma'].mean():.2f}°F"
+      f"  min={combined_table['Effective Sigma'].min():.2f}"
+      f"  max={combined_table['Effective Sigma'].max():.2f}")
+try:
+    _src_counts = combined_table['Sigma Source'].value_counts().to_dict()
+    print(f"  source: {_src_counts}")
+except Exception:
+    pass
 
 # Ensure 'high_range' and 'low_range' are numeric
 combined_table['high_range'] = pd.to_numeric(combined_table['high_range'], errors='coerce')
@@ -1089,9 +1190,20 @@ combined_table['low_range'] = pd.to_numeric(combined_table['low_range'], errors=
 # bot's pricing reflects the rolling-bias adjustment. The raw 'Average' is
 # still what gets written to KXHIGH_market_snapshot.forecast_avg, so the
 # forecast-accuracy dashboards continue to evaluate vendor skill directly.
-combined_table['yes_probability'] = norm.cdf(combined_table['high_range'], loc=combined_table['Average_corrected'], scale=combined_table['Standard Deviation']) - norm.cdf(combined_table['low_range'], loc=combined_table['Average_corrected'], scale=combined_table['Standard Deviation'])
+combined_table['yes_probability'] = norm.cdf(combined_table['high_range'], loc=combined_table['Average_corrected'], scale=combined_table['Effective Sigma']) - norm.cdf(combined_table['low_range'], loc=combined_table['Average_corrected'], scale=combined_table['Effective Sigma'])
 combined_table['yes_probability'] = combined_table['yes_probability'].round(2)
 combined_table['fair_no_price'] = 1 - combined_table['yes_probability']
+
+# Shadow probability under the retired floored σ. Not used for any decision —
+# it exists so the 90-day readout on the σ change can restrict itself to the
+# markets that would have traded under the old model too, instead of comparing
+# across a shifted market mix (Filter 1 pass rate moves 34.2% → 38.7%).
+_legacy_sigma = combined_table[['Standard Deviation', 'City Floor Std']].max(axis=1)
+_legacy_sigma = _legacy_sigma.replace({0: 1.2, np.nan: 1.2})
+combined_table['yes_prob_legacy_sigma'] = (
+    norm.cdf(combined_table['high_range'], loc=combined_table['Average_corrected'], scale=_legacy_sigma)
+    - norm.cdf(combined_table['low_range'], loc=combined_table['Average_corrected'], scale=_legacy_sigma)
+).round(4)
 combined_table
 
 ####PULL ORDER BOOK OF MARKETS
@@ -1399,6 +1511,12 @@ _SNAPSHOT_COL_MAP = {
     "Midnight Temperature": "midnight_temperature",
     "var": "historical_var",
     "var_sqrt": "historical_var_sqrt",
+    # σ model (2026-09-06). forecast_std stays the raw 2-vendor spread;
+    # effective_sigma is what the model actually priced with.
+    "Effective Sigma": "effective_sigma",
+    "Measured Sigma": "measured_sigma",
+    "Sigma Source": "sigma_source",
+    "Is Wet": "is_wet",
 }
 _SNAPSHOT_BQ_COLS = [
     "city", "forecast_date", "run_date",
@@ -1421,6 +1539,12 @@ _SNAPSHOT_BQ_COLS = [
     "nws_forecast_update_ts",       # when NWS issued the hourly forecast we used
     "forecast_temp_at_run_hour_f",  # what NWS said the temp should be at run hour
     "obs_minus_forecast_at_run_f",  # observed − forecast (+: forecast running cold)
+    # σ model (2026-09-06) — the readout columns for the 90-day review.
+    "effective_sigma",              # σ the model priced with
+    "measured_sigma",               # city table value, before wet/lead mults
+    "sigma_source",                 # 'measured' | 'vendor_spread' | 'legacy_floor'
+    "is_wet",                       # NWS short forecast mentions rain/thunder/storm
+    "yes_prob_legacy_sigma",        # P(yes) the retired floored σ would have given
 ]
 _SNAPSHOT_NUMERIC_COLS = [
     "weather_underground", "accuweather", "nws",
@@ -1431,6 +1555,7 @@ _SNAPSHOT_NUMERIC_COLS = [
     "no_highest_bid", "no_lowest_offer",
     "peak_temp_f", "observed_temp_f",
     "forecast_temp_at_run_hour_f", "obs_minus_forecast_at_run_f",
+    "effective_sigma", "measured_sigma", "yes_prob_legacy_sigma",
 ]
 # Explicit schema. Without this, autodetect mis-infers pandas datetime64[ns]
 # columns as INT64 nanoseconds when the table is created from scratch — broke
@@ -1470,6 +1595,11 @@ _SNAPSHOT_SCHEMA = [
     bigquery.SchemaField("nws_forecast_update_ts", "TIMESTAMP"),
     bigquery.SchemaField("forecast_temp_at_run_hour_f", "FLOAT"),
     bigquery.SchemaField("obs_minus_forecast_at_run_f", "FLOAT"),
+    bigquery.SchemaField("effective_sigma", "FLOAT"),
+    bigquery.SchemaField("measured_sigma", "FLOAT"),
+    bigquery.SchemaField("sigma_source", "STRING"),
+    bigquery.SchemaField("is_wet", "BOOLEAN"),
+    bigquery.SchemaField("yes_prob_legacy_sigma", "FLOAT"),
 ]
 
 snapshot_df = combined_table.rename(columns=_SNAPSHOT_COL_MAP).copy()
@@ -1673,6 +1803,40 @@ BAND_TILT_LO_CENTS = int(os.environ.get("BAND_TILT_LO_CENTS", "61"))
 BAND_TILT_HI_CENTS = int(os.environ.get("BAND_TILT_HI_CENTS", "80"))
 BAND_TILT_MULT = float(os.environ.get("BAND_TILT_MULT", "1.5"))
 
+# =====================================================================
+# SIZE EXPERIMENT — is the book capacity-bound?          (2026-09-06)
+# ---------------------------------------------------------------------
+# The one question that actually scales P&L, and observational data cannot
+# answer it. Evidence points at "already at capacity": at near-mid rung
+# offsets, fill rate falls 44.6% → 30.5% → 14.5% → 4.9% as ordered size per
+# rung goes 1-15 → 16-30 → 31-60 → 61-120 contracts, and the ABSOLUTE
+# number of filled contracts stops rising past the 16-30 bucket. But that
+# is confounded — larger rungs land in larger cities and on night runs —
+# and the per-city size-multiplier cut points the other way.
+#
+# Design: sticky 50/50 split on market_ticker alone, so a market stays in
+# one arm for its whole life. Sticky matters here more than it did for the
+# hi_no A/B, because the position cap and the $125 cash cap are per-market:
+# mixing arms inside one market would pollute both.
+#
+# READ IT OUT ON FILL RATE, NOT ON ¢/CONTRACT. Bootstrapped from the
+# Jul-Sep book: the ¢/ct readout has a minimum detectable effect of ~9.2¢
+# at 90 days and ~4.5¢ at a year, against a total edge of ~6.6¢ — it can
+# only detect a size effect large enough to destroy the strategy. The
+# conversion-rate readout has an MDE of 0.46pp at 90 days (0.79pp at 30)
+# against a 5.03% base, and a fully capacity-bound 1.67× arm would show a
+# ~2.0pp drop. So: 30 days answers "is there capacity", ¢/ct never will.
+#
+# Risk: treatment raises base size 15 → 25, so per-market exposure rises
+# ~67% until a cap binds. The 100/150-contract caps and the $125/market
+# cash cap are unchanged and still bind first, so the worst case on any
+# single market is exactly what it is today.
+# =====================================================================
+SIZE_EXP_NAME = "starting_contracts_15_vs_25"
+SIZE_EXP_ENABLED = os.environ.get("SIZE_EXP_ENABLED", "true").lower() == "true"
+SIZE_EXP_TREATMENT_CONTRACTS = int(os.environ.get("SIZE_EXP_TREATMENT_CONTRACTS", "25"))
+SIZE_EXP_PROPORTION = float(os.environ.get("SIZE_EXP_PROPORTION", "0.5"))
+
 # Per-city max contracts override — cities listed here can carry a larger cap
 # than the global max_contracts. Cities not listed default to max_contracts.
 CITY_MAX_CONTRACTS = {
@@ -1759,8 +1923,34 @@ def _ab_assign_arm(market_ticker):
     u = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / (16**8)
     return "treatment" if u < AB_TREATMENT_PROPORTION else "control"
 
+def _size_exp_assign_arm(market_ticker):
+    """Sticky per-market 50/50 split for the size experiment.
+
+    Salted with SIZE_EXP_NAME so the assignment is independent of the hi_no
+    A/B's split and of anything else hashed off market_ticker. It is also
+    independent of the weather by construction, which is what lets the size
+    experiment and the wet/dry σ readout share one book without either
+    biasing the other — the only thing they cannot share is the
+    interaction term, which needs roughly 4x the data.
+    """
+    if not SIZE_EXP_ENABLED:
+        return "control"
+    key = f"{SIZE_EXP_NAME}|{market_ticker}"
+    u = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / (16**8)
+    return "treatment" if u < SIZE_EXP_PROPORTION else "control"
+
+
+def _size_exp_base_contracts(arm):
+    """Base contracts for this arm. Control = the frozen production value."""
+    return SIZE_EXP_TREATMENT_CONTRACTS if arm == "treatment" else starting_contracts
+
+
 print(f"\n[AB] test={AB_TEST_NAME} enabled={AB_TEST_ENABLED} "
       f"margin={AB_SAFETY_MARGIN_CENTS}c proportion={AB_TREATMENT_PROPORTION:.0%}")
+print(f"[SIZE-EXP] test={SIZE_EXP_NAME} enabled={SIZE_EXP_ENABLED} "
+      f"control={starting_contracts} treatment={SIZE_EXP_TREATMENT_CONTRACTS} "
+      f"proportion={SIZE_EXP_PROPORTION:.0%} "
+      f"(read out on fills/ordered contract, not on c/ct)")
 
 # Write the run-start marker now that all config is known. If anything below
 # crashes (BQ errors, Kalshi outages, etc.), this row remains as a "started_at
@@ -1776,6 +1966,12 @@ write_run_row(
     ab_treatment_proportion=float(AB_TREATMENT_PROPORTION),
     ab_safety_margin_cents=int(AB_SAFETY_MARGIN_CENTS),
     n_markets_in_table=int(len(combined_table)),
+    size_exp_name=SIZE_EXP_NAME,
+    size_exp_enabled=bool(SIZE_EXP_ENABLED),
+    size_exp_treatment_contracts=int(SIZE_EXP_TREATMENT_CONTRACTS),
+    size_exp_proportion=float(SIZE_EXP_PROPORTION),
+    sigma_model=SIGMA_MODEL,
+    n_markets_wet=int(combined_table['Is Wet'].sum()),
 )
 
 orders_placed = 0
@@ -1911,6 +2107,9 @@ for index, row in combined_table.iterrows():
   # Computes _effective_hi_no used by the ladder loop below.
   # ==================================================================
   _ab_arm = _ab_assign_arm(ticker)
+  # Size experiment arm — independent hash, affects base contracts only.
+  _size_arm = _size_exp_assign_arm(ticker)
+  _base_contracts = _size_exp_base_contracts(_size_arm)
   _fair_no_cents = 100.0 * (1.0 - float(yes_prob))
   _hi_no_config = float(hi_no)
   if _ab_arm == "treatment":
@@ -1946,38 +2145,25 @@ for index, row in combined_table.iterrows():
   _nws_f = row.get('NWS')
   _wu_f = row.get('Weather Underground')
   _avg_f = row.get('Average')
-  _eff_sigma = row.get('Standard Deviation')
-  _city_floor = row.get('City Floor Std')
+  _eff_sigma = row.get('Effective Sigma')
+  _vendor_sigma = row.get('Standard Deviation')
+  _measured_sigma = row.get('Measured Sigma')
+  _sigma_src = row.get('Sigma Source')
+  _is_wet = bool(row.get('Is Wet'))
   _hist_sigma = row.get('var_sqrt')
   _hi_lo = row.get('Highest Minus Lowest')
 
-  # Inter-source σ = raw std of NWS+WU BEFORE the city-floor is applied.
-  try:
-    _raw_vals = []
-    for _v in [_nws_f, _wu_f]:
-      try:
-        _vf = float(_v)
-        if not np.isnan(_vf): _raw_vals.append(_vf)
-      except Exception:
-        pass
-    _iss = float(np.std(_raw_vals, ddof=1)) if len(_raw_vals) >= 2 else None
-  except Exception:
-    _iss = None
+  # 'Standard Deviation' is now the raw NWS+WU spread end-to-end (the σ block
+  # no longer overwrites it with the floor), so _vendor_sigma IS the
+  # inter-source σ — no separate recomputation needed here any more.
 
   print(f"    Forecasts:  NWS={_fmt(_nws_f, '°F', 0)} | WU={_fmt(_wu_f, '°F', 0)} | "
         f"μ={_fmt(_avg_f, '°F', 1)} | spread={_fmt(_hi_lo, '°F', 1)}")
-  _floor_tag = ''
-  try:
-    if _eff_sigma is not None and _city_floor is not None:
-      _ef = float(_eff_sigma); _cf = float(_city_floor)
-      _is_v = _iss if _iss is not None else 0.0
-      if _ef >= _cf - 1e-9 and _ef > _is_v + 1e-9:
-        _floor_tag = ' (FLOOR ACTIVE — sources agree / too close)'
-  except Exception:
-    pass
-  print(f"    σ:          inter-source={_fmt(_iss, '°F', 2)} | "
-        f"city_floor={_fmt(_city_floor, '°F', 2)} ({row['City']}) | "
-        f"effective={_fmt(_eff_sigma, '°F', 2)}{_floor_tag}")
+  _wx_tag = 'WET' if _is_wet else 'dry'
+  _src_tag = f' ({_sigma_src})' if _sigma_src else ''
+  print(f"    σ:          measured={_fmt(_measured_sigma, '°F', 2)} ({row['City']}) "
+        f"× {_wx_tag} × lead | vendor spread={_fmt(_vendor_sigma, '°F', 2)} | "
+        f"effective={_fmt(_eff_sigma, '°F', 2)}{_src_tag}")
   if _hist_sigma is not None:
     print(f"                historical σ (analytics only, not used in model): "
           f"{_fmt(_hist_sigma, '°F', 2)}")
@@ -2012,6 +2198,14 @@ for index, row in combined_table.iterrows():
     except Exception:
       return None
 
+  def _safe_float(v):
+    """float() or None. combined_table.fillna("") means absent reads as ''."""
+    try:
+      if _missing(v): return None
+      return float(v)
+    except Exception:
+      return None
+
   _peak_hr = row.get('peak_hour_ct')
   _peak_temp = row.get('peak_temp_f')
   _obs_st = row.get('observed_station')
@@ -2043,7 +2237,10 @@ for index, row in combined_table.iterrows():
   _band_str = f"[{_lo_r:g}, {_hi_r:g}]°F" if _hi_r < 150 else f"[≥{_lo_r:g}]°F (tail)"
   print(f"    Band:       {_suf} = {_band_str}")
   try:
-    _mu = float(_avg_f); _s = float(_eff_sigma)
+    # Average_corrected, not Average — the model prices off the bias-corrected
+    # mean, so printing the raw vendor mean here made the formula fail to
+    # reproduce the yes_prob printed on the same line.
+    _mu = float(row.get('Average_corrected', _avg_f)); _s = float(_eff_sigma)
     if _s > 0:
       _z_hi = (_hi_r - _mu) / _s; _z_lo = (_lo_r - _mu) / _s
       _p_hi = float(norm.cdf(_z_hi)); _p_lo = float(norm.cdf(_z_lo))
@@ -2106,13 +2303,14 @@ for index, row in combined_table.iterrows():
 
   _city_mult = CITY_SIZE_MULT.get(row['City'], 1.0)
   _n_levels = len(price_count)
-  _base_size = max(1, int(round(starting_contracts * night_size_mult * 1.0 * _city_mult)))
-  _top_size = max(1, int(round(starting_contracts * night_size_mult * 1.0 * _city_mult)))
+  _base_size = max(1, int(round(_base_contracts * night_size_mult * 1.0 * _city_mult)))
+  _top_size = max(1, int(round(_base_contracts * night_size_mult * 1.0 * _city_mult)))
   _tail_inc = TAIL_INCREMENT_BY_CITY.get(row['City'], increment1)
   _inc_show = _tail_inc if is_tail else increment
   _nm_reason = ("variable=1" if variable == 1 else
                 ("hour<5 CT" if central_time.hour < 5 else "daytime"))
-  print(f"    Sizing:     base={starting_contracts} × night={night_size_mult:g}x "
+  _arm_tag = f" [size-exp:{_size_arm}]" if SIZE_EXP_ENABLED else ""
+  print(f"    Sizing:     base={_base_contracts}{_arm_tag} × night={night_size_mult:g}x "
         f"({_nm_reason}) × city={_city_mult:g}x ({row['City']})")
   print(f"                ladder size: {_base_size} contracts (flat across rungs; "
         f"×{BAND_TILT_MULT:g} on rungs in {BAND_TILT_LO_CENTS}-{BAND_TILT_HI_CENTS}c; "
@@ -2177,7 +2375,7 @@ for index, row in combined_table.iterrows():
     # (see BAND_TILT_* above). Price-conditional, so only the rungs that
     # actually land in-band get the multiplier.
     band_mult = BAND_TILT_MULT if BAND_TILT_LO_CENTS <= bid_price <= BAND_TILT_HI_CENTS else 1.0
-    contracts = max(1, int(round(starting_contracts * night_size_mult * ladder_mult * city_mult * band_mult)))
+    contracts = max(1, int(round(_base_contracts * night_size_mult * ladder_mult * city_mult * band_mult)))
     # Edge = NO-side EV per $1 staked = (1 − P(yes)) − bid/100
     edge = (1.0 - yes_prob) - (bid_price / 100.0)
 
@@ -2352,6 +2550,20 @@ for index, row in combined_table.iterrows():
           'hi_no_config': float(_hi_no_config),
           'fair_no_cents': round(float(_fair_no_cents), 2),
           'yes_prob': round(float(yes_prob), 4),
+          # Size experiment — join fills on client_order_id to get filled vs
+          # ordered contracts per arm. This is the primary readout.
+          'size_exp_name': SIZE_EXP_NAME,
+          'size_exp_enabled': SIZE_EXP_ENABLED,
+          'size_arm': _size_arm,
+          'size_arm_base_contracts': int(_base_contracts),
+          # σ model — lets the 90-day wet/dry readout run off the orders table
+          # alone, and lets it be restricted to the markets the retired σ
+          # would also have traded (yes_prob_legacy_sigma > 0.20).
+          'sigma_model': SIGMA_MODEL,
+          'effective_sigma': _safe_float(_eff_sigma),
+          'sigma_source': str(_sigma_src) if _sigma_src else None,
+          'is_wet': bool(_is_wet),
+          'yes_prob_legacy_sigma': _safe_float(row.get('yes_prob_legacy_sigma')),
       })
       row['resting_order_count'] = row['resting_order_count'] + contracts
       _run_placed_contracts += contracts
