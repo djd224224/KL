@@ -1856,16 +1856,27 @@ def scan_universe_reason(ticker: str) -> Optional[str]:
     return None
 
 
-def scan_shape_reason(ticker: str, strike_type: Optional[str] = None
-                      ) -> Optional[str]:
+def scan_shape_reason(ticker: str, strike_type: Optional[str] = None,
+                      fiscal: bool = False) -> Optional[str]:
     """STRUCTURE screen: 'undated' when the event segment carries no day
     (no midnight-ET release guard exists for it), 'shape' when the strike
     is not a numeric threshold (a categorical/binary outcome — the class
     whose one jump is the resolution). Numeric = the ticker's strike
     segment reads T286 / B90 / 4.1400 / T1.2M, or Kalshi's strike_type is
-    one of the threshold kinds."""
+    one of the threshold kinds.
+
+    `fiscal` (Jack 2026-09-06 "include markets settled by Fiscal.ai as
+    part of the opportunistic scan"): a Fiscal.ai-settled company-KPI
+    series names its events by REPORT MONTH with no day (KXCCL-26SEPALBD,
+    KXF-26OCTUSSALES — the live probe: Ford's Q3 sales ticker says 26OCT
+    and Kalshi's own occurrence is Oct 3). For those the month IS a
+    release guard — scan_report_month_cutoff puts the bot out at 00:00 ET
+    on the first of that month, the month-level twin of the day-dated
+    midnight rule — so 'undated' is waived when the month parses. Any
+    other undated shape (no month at all, KXRT-DOG) stays rejected."""
     if SCAN_REQUIRE_DATED and parse_event_date(ticker) is None:
-        return "undated"
+        if not (fiscal and parse_event_month(ticker) is not None):
+            return "undated"
     if SCAN_REQUIRE_NUMERIC:
         parts = ticker.split("-")
         by_type = strike_type in SCAN_NUMERIC_STRIKE_TYPES
@@ -1873,6 +1884,25 @@ def scan_shape_reason(ticker: str, strike_type: Optional[str] = None
         if not (by_type or by_ticker):
             return "shape"
     return None
+
+
+def scan_report_month_cutoff(event_ticker: str,
+                             cutoff: Optional[datetime]) -> Optional[datetime]:
+    """The open-scan cutoff for a month-named event: never later than 00:00
+    ET on the first day of the ticker's month (Kalshi's report month for the
+    Fiscal.ai KPI class), tightened further by any earlier cutoff already
+    resolved (an event_start_overrides release time, a series tightener).
+    Day-dated and month-less tickers are returned unchanged — the day rule
+    and the resolver own those. EARLY is the safe direction: a KPI that
+    leaks before its report (auto sales, monthly deliveries, traffic
+    releases) leaks INSIDE the report month, so being out for the whole
+    month costs accrual, never a fill against a public number."""
+    if parse_event_date(event_ticker) is not None:
+        return cutoff
+    ms = parse_event_month(event_ticker)
+    if ms is None:
+        return cutoff
+    return ms if cutoff is None else min(cutoff, ms)
 
 
 def _candle_cents(node, key: str) -> Optional[float]:
@@ -1948,6 +1978,42 @@ def scan_series_meta_verdict(series_obj: dict) -> Tuple[bool, str, str]:
         if any(k in blob for k in SCAN_LIVE_SOURCE_KEYWORDS):
             return False, "live_source", cat
     return True, "", cat
+
+
+SCAN_FISCAL_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
+    "IMM_SCAN_FISCAL_SOURCE_KEYWORDS", "fiscal.ai").split(",") if k.strip())
+
+
+def scan_series_is_fiscal(series_obj: dict) -> bool:
+    """True when a GET /series object names Fiscal.ai (the company-KPI data
+    aggregator) among its settlement sources — the class Jack asked into the
+    scan 2026-09-06. Persisted on the series verdict as `fiscal` so the
+    string-level pre-screen can wave its month-named events through without
+    a read. Fail closed: no sources / odd object -> False."""
+    if not isinstance(series_obj, dict):
+        return False
+    for s in series_obj.get("settlement_sources") or []:
+        if not isinstance(s, dict):
+            continue
+        blob = (str(s.get("name") or "") + " " + str(s.get("url") or "")).lower()
+        if any(k in blob for k in SCAN_FISCAL_SOURCE_KEYWORDS):
+            return True
+    return False
+
+
+def scan_month_prescreen_ok(ticker: str, cached) -> bool:
+    """String-level twin of the fiscal waiver in scan_shape_reason, for the
+    pre-bulk-read screen where no market object exists yet: an undated
+    ticker may hydrate when its event segment names a month AND the series
+    is Fiscal.ai-settled per the persisted verdict (`fiscal` True) — or not
+    yet judged at all (no cache entry: hydrate once so _scan_admission can
+    read the series; a non-fiscal month series is then cached fiscal=False
+    and screened here without a read from the next refresh on)."""
+    if parse_event_month(ticker) is None:
+        return False
+    if not isinstance(cached, dict) or "fiscal" not in cached:
+        return True          # unknown (or a pre-flag verdict): hydrate once
+    return bool(cached.get("fiscal"))
 
 
 def scan_cached_verdict(ent) -> Optional[Tuple[bool, str]]:
@@ -2983,6 +3049,31 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
     except ValueError:
         return None
     return ET.localize(naive).astimezone(timezone.utc)
+
+
+# Month-named event segment with NO day: '26SEPALBD', '28JANDELIV',
+# '26OCTUSSALES' (a following digit pair would make it day-dated, which
+# parse_event_date owns). Kalshi's company-KPI convention: the month is the
+# REPORT month (live probe 2026-09-06).
+_TICKER_MONTH_RE = re.compile(r"^(\d{2})([A-Z]{3})(?!\d)[A-Z0-9]*$")
+
+
+def parse_event_month(event_ticker: str) -> Optional[datetime]:
+    """First day of the month embedded in an event ticker's second segment,
+    as 00:00 ET that day (UTC), for month-named (day-less) events:
+    'KXCCL-26SEPALBD' -> 2026-09-01 00:00 ET. Day-dated segments ('26SEP07'),
+    month-less ones ('DOG', '26NL') and bad months -> None."""
+    parts = event_ticker.split("-")
+    if len(parts) < 2:
+        return None
+    m = _TICKER_MONTH_RE.match(parts[1])
+    if not m:
+        return None
+    yy, mon = m.group(1), m.group(2)
+    month = _MONTHS.get(mon)
+    if month is None:
+        return None
+    return ET.localize(datetime(2000 + int(yy), month, 1)).astimezone(timezone.utc)
 
 
 _MENTION_GAME_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})([A-Z]{3})([A-Z]{3})$")
@@ -5484,7 +5575,12 @@ class IncentiveMarketMaker:
                     scan_skips["cutoff_passed"] = scan_skips.get("cutoff_passed", 0) + 1
                     continue
                 if t not in self.state.scan_members \
-                        and SCAN_REQUIRE_DATED and parse_event_date(t) is None:
+                        and SCAN_REQUIRE_DATED and parse_event_date(t) is None \
+                        and not scan_month_prescreen_ok(
+                            t, self.state.scan_series_meta.get(series_of(t))):
+                    # month-named Fiscal.ai KPI events hydrate (Jack
+                    # 2026-09-06); _scan_admission reads the series and
+                    # applies the report-month rule
                     scan_skips["undated"] = scan_skips.get("undated", 0) + 1
                     continue
                 scan_pre.append((t, info))
@@ -5549,6 +5645,11 @@ class IncentiveMarketMaker:
             # orphan-restore path via apply_series_cutoff_adjustments.
             cutoff = apply_series_cutoff_adjustments(series, event_ticker, cutoff,
                                                      close_time=close_time)
+            if t in scan_pre_set:
+                # open-scan month-named events (Fiscal.ai KPI class): out
+                # at 00:00 ET on the first of the report month, or earlier
+                # if something above already resolved earlier
+                cutoff = scan_report_month_cutoff(event_ticker, cutoff)
             bid = market_cents(m, "yes_bid")
             ask = market_cents(m, "yes_ask")
             try:
@@ -6084,8 +6185,17 @@ class IncentiveMarketMaker:
         if why == "series_meta_unavailable":
             return False, why
         self.state.scan_series_meta[series] = {
-            "ts": now_ts, "ok": ok, "why": why, "category": cat}
+            "ts": now_ts, "ok": ok, "why": why, "category": cat,
+            "fiscal": scan_series_is_fiscal(so)}
         return ok, why
+
+    def _scan_series_fiscal(self, series: str) -> Optional[bool]:
+        """The persisted Fiscal.ai flag for a series: True/False once the
+        series has been read, None while unknown."""
+        ent = self.state.scan_series_meta.get(series)
+        if not isinstance(ent, dict) or "fiscal" not in ent:
+            return None
+        return bool(ent.get("fiscal"))
 
     def _scan_history_ok(self, meta: MarketMeta, now_ts: float,
                          budget: Dict[str, int]) -> Tuple[bool, str]:
@@ -6127,9 +6237,34 @@ class IncentiveMarketMaker:
                    if now_ts - x < SCAN_SERIES_STRIKE_TTL_SECS]
         if 0 < SCAN_SERIES_STRIKE_LIMIT <= len(strikes):
             return "series_struck"
-        why = scan_shape_reason(meta.ticker, m.get("strike_type"))
+        # Fiscal.ai month-named KPI events (Jack 2026-09-06): the 'undated'
+        # reject is waived only for a Fiscal.ai-settled series, which takes
+        # the (cached, budgeted) series read BEFORE the structure verdict.
+        # Non-numeric month binaries never earn that read — 'shape' first.
+        fiscal = False
+        if SCAN_REQUIRE_DATED and parse_event_date(meta.ticker) is None \
+                and parse_event_month(meta.ticker) is not None:
+            pre = scan_shape_reason(meta.ticker, m.get("strike_type"), fiscal=True)
+            if pre is not None:
+                return pre        # a month-named binary: 'shape', no read spent
+            known = self._scan_series_fiscal(meta.series)
+            if known is None:
+                # unknown, or a verdict persisted before the flag existed:
+                # read (or re-read) the series now
+                self.state.scan_series_meta.pop(meta.series, None)
+                ok, why = self._scan_series_ok(meta.series, now_ts, budget)
+                if not ok:
+                    return why or "series_meta"
+                known = self._scan_series_fiscal(meta.series)
+            fiscal = bool(known)
+        why = scan_shape_reason(meta.ticker, m.get("strike_type"), fiscal=fiscal)
         if why:
             return why
+        if meta.cutoff is not None and now_utc >= meta.cutoff:
+            # the report-month cutoff (or any resolved cutoff) already
+            # passed: the normal book's _screen would kill it anyway —
+            # say so here, before the reads
+            return "cutoff_passed"
         if meta.open_time is None or \
                 (now_utc - meta.open_time).total_seconds() < SCAN_MIN_AGE_HOURS * 3600:
             return "age"

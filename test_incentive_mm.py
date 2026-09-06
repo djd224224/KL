@@ -6897,7 +6897,12 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertEqual(qg.scan_gap_label(bot, t, now), "screens pending")
         self.assertEqual(qg.scan_gap_label(bot, "KXNOVEL-99DEC31-HOLD", now),
                          "shape")
+        # a month-named numeric ticker on an unread series is no longer a
+        # flat 'undated' (2026-09-06 Fiscal.ai class): the bot hydrates it
+        # and reads the series, so the label is pending; month-less stays
         self.assertEqual(qg.scan_gap_label(bot, "KXNOVEL-26OCTDELIV-T5", now),
+                         "screens pending")
+        self.assertEqual(qg.scan_gap_label(bot, "KXNOVEL-DELIV-T5", now),
                          "undated")
         # a cached category ban is only repeated while the knob still names
         # the category (2026-09-06 ban lift): by default it is stale and the
@@ -6918,6 +6923,29 @@ class TestOpportunisticEmail(unittest.TestCase):
             "ts": time.time(), "ok": False, "why": "live_source",
             "category": "Sports"}
         self.assertEqual(qg.scan_gap_label(bot, t, now), "live_source")
+        # Fiscal.ai month-named KPI events (2026-09-06): pending until the
+        # series is read, 'undated' on a judged non-fiscal series, admissible
+        # (through to the history screen) on a fiscal one, 'cutoff_passed'
+        # once the report month has begun; a month binary is 'shape'
+        nxt = (now.astimezone(imm.ET) + timedelta(days=40)).strftime("%y%b").upper()
+        cur = now.astimezone(imm.ET).strftime("%y%b").upper()
+        ft = f"KXFISC-{nxt}ALBD-25800000.0"
+        self.assertEqual(qg.scan_gap_label(bot, ft, now), "screens pending")
+        self.assertEqual(qg.scan_gap_label(bot, f"KXFISC-{nxt}ALBD-YES", now),
+                         "shape")
+        bot.state.scan_series_meta["KXFISC"] = {
+            "ts": time.time(), "ok": True, "why": "", "category": "Economics",
+            "fiscal": False}
+        self.assertEqual(qg.scan_gap_label(bot, ft, now), "undated")
+        bot.state.scan_series_meta["KXFISC"] = {
+            "ts": time.time(), "ok": True, "why": "", "category": "Financials",
+            "fiscal": True}
+        self.assertEqual(qg.scan_gap_label(bot, ft, now), "screens pending")
+        bot.state.scan_history_cache[ft] = {"ts": time.time(), "ok": True}
+        self.assertEqual(qg.scan_gap_label(bot, ft, now),
+                         "eligible (slots/ROI/live screens)")
+        self.assertEqual(qg.scan_gap_label(bot, f"KXFISC-{cur}ALBD-1", now),
+                         "cutoff_passed (report month)")
         bot.state.scan_series_meta["KXNOVEL"] = {"ts": time.time(), "ok": True}
         bot.state.scan_history_cache[t] = {
             "ts": time.time(), "ok": False, "why": "history_range"}
@@ -7118,6 +7146,65 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(sr("KXBA-26JULDELIV-130"), "undated")
         self.assertEqual(sr("KXRT-DOG-45"), "undated")
         self.assertEqual(sr("KXUE-RUS26SEP-T5"), "undated")
+
+    def test_fiscal_month_named_events(self):
+        # Jack 2026-09-06 "include markets settled by Fiscal.ai as part of
+        # the opportunistic scan": the KPI class names events by REPORT
+        # MONTH with no day (KXCCL-26SEPALBD). The month parses to 00:00 ET
+        # on the first of that month, which becomes the cutoff — the
+        # month-level twin of the day-dated midnight rule — and 'undated'
+        # is waived for a Fiscal.ai-settled series only.
+        pm = imm.parse_event_month
+        self.assertEqual(pm("KXCCL-26SEPALBD"),
+                         imm.ET.localize(datetime(2026, 9, 1)).astimezone(timezone.utc))
+        self.assertEqual(pm("KXF-26OCTUSSALES-480000"),
+                         imm.ET.localize(datetime(2026, 10, 1)).astimezone(timezone.utc))
+        self.assertEqual(pm("KXBAA-28JANDELIV"),
+                         imm.ET.localize(datetime(2028, 1, 1)).astimezone(timezone.utc))
+        # day-dated, month-less, prefixed-month and bad-month segments: None
+        for t in ("KXNFLGAME-26SEP08-T1", "KXBTCD-26SEP0609-T1", "KXRT-DOG",
+                  "KXUE-RUS26SEP-T5", "KXFOO-26NL", "KXFOO-26ABCX", "KXFOO"):
+            self.assertIsNone(pm(t), t)
+        sr = imm.scan_shape_reason
+        self.assertEqual(sr("KXCCL-26SEPALBD-25800000.0", "greater"), "undated")
+        self.assertIsNone(sr("KXCCL-26SEPALBD-25800000.0", "greater", fiscal=True))
+        self.assertIsNone(sr("KXYUM-26NOVTBSSS-N3.0", "greater", fiscal=True))
+        # the waiver needs a month: a month-less undated ticker stays out
+        self.assertEqual(sr("KXRT-DOG-45", "greater", fiscal=True), "undated")
+        # ... and a month-named BINARY is still the resolution-jump class
+        self.assertEqual(sr("KXCAHSR-26DECOPEN-YES", "custom", fiscal=True), "shape")
+        # cutoff: first of the report month, tightened by anything earlier,
+        # day-dated tickers untouched
+        rc = imm.scan_report_month_cutoff
+        sep1 = imm.ET.localize(datetime(2026, 9, 1)).astimezone(timezone.utc)
+        self.assertEqual(rc("KXCCL-26SEPALBD", None), sep1)
+        self.assertEqual(rc("KXCCL-26SEPALBD", sep1 + timedelta(days=20)), sep1)
+        earlier = sep1 - timedelta(days=3)
+        self.assertEqual(rc("KXCCL-26SEPALBD", earlier), earlier)
+        dated = datetime(2026, 9, 21, 4, tzinfo=timezone.utc)
+        self.assertEqual(rc("KXNFLGAME-26SEP21NYGLAR", dated), dated)
+        self.assertIsNone(rc("KXRT-DOG", None))
+        # the fiscal flag comes from the series' settlement sources
+        fiscal = {"category": "Financials", "settlement_sources": [
+            {"name": "Fiscal.ai", "url": "https://fiscal.ai"}]}
+        self.assertTrue(imm.scan_series_is_fiscal(fiscal))
+        self.assertFalse(imm.scan_series_is_fiscal(
+            {"settlement_sources": [{"name": "EIA", "url": "https://eia.gov"}]}))
+        self.assertFalse(imm.scan_series_is_fiscal({}))
+        self.assertFalse(imm.scan_series_is_fiscal(None))
+        # ... and a Fiscal.ai series is otherwise an ordinary admissible
+        # family (Financials, no live feed)
+        self.assertEqual(imm.scan_series_meta_verdict(fiscal),
+                         (True, "", "Financials"))
+        # string-level pre-screen: month-named tickers hydrate when the
+        # series is fiscal or not yet judged (incl. a pre-flag verdict);
+        # a judged non-fiscal series screens out without a read
+        ok = imm.scan_month_prescreen_ok
+        self.assertTrue(ok("KXCCL-26SEPALBD-1", None))
+        self.assertTrue(ok("KXCCL-26SEPALBD-1", {"ok": True, "category": "Economics"}))
+        self.assertTrue(ok("KXCCL-26SEPALBD-1", {"ok": True, "fiscal": True}))
+        self.assertFalse(ok("KXCCL-26SEPALBD-1", {"ok": True, "fiscal": False}))
+        self.assertFalse(ok("KXRT-DOG-45", None))
 
     def test_history_verdict(self):
         v = imm.scan_history_verdict(self._candles())
@@ -7378,6 +7465,76 @@ class TestOpenScanTier(unittest.TestCase):
             self.assertEqual(bot._scan_series_ok(self.S, now_ts, budget),
                              (False, "category:Sports"))
         self.assertEqual(getattr(bot.client, "series_reads", 0), reads)
+
+    def test_fiscal_month_named_admission(self):
+        # Bot-level: a month-named KPI market on a Fiscal.ai-settled series
+        # is admissible (the series read happens BEFORE the structure
+        # verdict and is cached); the same ticker on a non-fiscal series is
+        # 'undated'; a month binary is 'shape' with no series read; a
+        # market whose report month has begun is 'cutoff_passed'.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = datetime.now(timezone.utc)
+        now_ts = now.timestamp()
+        nxt = (now.astimezone(imm.ET) + timedelta(days=40))
+        ev = f"KXFISC-{nxt.strftime('%y%b').upper()}ALBD"      # next month+
+        t = f"{ev}-25800000.0"
+        fiscal_src = [{"name": "Fiscal.ai", "url": "https://fiscal.ai"}]
+        m = dict(self._market(t), event_ticker=ev)
+        bot.client.candles[t] = self._candles()
+        meta = self._meta(t=t, event_ticker=ev, series="KXFISC",
+                          cutoff=imm.scan_report_month_cutoff(ev, None))
+        budget = {"series": 5, "history": 5}
+        # fiscal series -> admissible; one series read, flag cached
+        bot.client.series_meta["KXFISC"] = {"category": "Financials",
+                                            "settlement_sources": fiscal_src}
+        self.assertIsNone(bot._scan_admission(meta, m, {}, now, budget))
+        self.assertEqual(budget["series"], 4)
+        self.assertTrue(bot.state.scan_series_meta["KXFISC"]["fiscal"])
+        # second look: cached, no further read
+        self.assertIsNone(bot._scan_admission(meta, m, {}, now, budget))
+        self.assertEqual(budget["series"], 4)
+        # a verdict persisted before the flag existed is re-read once
+        bot.state.scan_series_meta["KXFISC"] = {
+            "ts": now_ts, "ok": True, "why": "", "category": "Financials"}
+        self.assertIsNone(bot._scan_admission(meta, m, {}, now, budget))
+        self.assertEqual(budget["series"], 3)
+        self.assertIn("fiscal", bot.state.scan_series_meta["KXFISC"])
+        # non-fiscal series: the month is no guard -> 'undated', cached so
+        # the string pre-screen drops it next refresh without a read
+        bot.state.scan_series_meta.clear()
+        bot.client.series_meta["KXFISC"] = {
+            "category": "Economics",
+            "settlement_sources": [{"name": "EIA", "url": "https://eia.gov"}]}
+        self.assertEqual(bot._scan_admission(meta, m, {}, now, budget), "undated")
+        self.assertFalse(bot.state.scan_series_meta["KXFISC"]["fiscal"])
+        self.assertFalse(imm.scan_month_prescreen_ok(
+            t, bot.state.scan_series_meta["KXFISC"]))
+        # read budget exhausted while unknown: pending, never admitted on
+        # the month alone
+        bot.state.scan_series_meta.clear()
+        self.assertEqual(bot._scan_admission(meta, m, {}, now, {"series": 0}),
+                         "series_meta_pending")
+        # a month-named BINARY never earns the series read
+        bot.state.scan_series_meta.clear()
+        reads = getattr(bot.client, "series_reads", 0)
+        tb = f"{ev}-YES"
+        self.assertEqual(bot._scan_admission(
+            self._meta(t=tb, event_ticker=ev, series="KXFISC"),
+            dict(self._market(tb), event_ticker=ev, strike_type="custom"),
+            {}, now, budget), "shape")
+        self.assertEqual(getattr(bot.client, "series_reads", 0), reads)
+        # report month already begun: out (the cutoff is the month start)
+        bot.client.series_meta["KXFISC"] = {"category": "Financials",
+                                            "settlement_sources": fiscal_src}
+        bot.state.scan_series_meta.clear()
+        past_ev = f"KXFISC-{now.astimezone(imm.ET).strftime('%y%b').upper()}ALBD"
+        pt = f"{past_ev}-1"
+        self.assertEqual(bot._scan_admission(
+            self._meta(t=pt, event_ticker=past_ev, series="KXFISC",
+                       cutoff=imm.scan_report_month_cutoff(past_ev, None)),
+            dict(self._market(pt), event_ticker=past_ev), {}, now, budget),
+            "cutoff_passed")
 
     # ---- the walk ------------------------------------------------------------
 
