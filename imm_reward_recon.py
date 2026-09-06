@@ -352,7 +352,90 @@ def refresh_programs():
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(by_market, f)
     os.replace(tmp, PROGRAM_CACHE)
+    _append_program_history(by_market)
     return by_market
+
+
+PROGRAM_HISTORY = os.path.join(STATUS_DIR, "program_history.jsonl")
+
+
+def _append_program_history(by_market):
+    """Daily per-series roll-up of the reward-program supply.
+
+    reward_programs.json is fully OVERWRITTEN on every run and its `paid`
+    flags mutate in place, so there has never been a time series of pool
+    sizes, target counts or program starts/ends. That made the single
+    largest regime break in this bot's history invisible in data: when
+    Kalshi pulled the hourly KXTEMP pools around 2026-08-07 (~12.9k
+    historical programs down to a handful of active ones), the family that
+    had been ~67% of August credits vanished, and the only record of it is
+    prose in a memory file.
+
+    ~1,800 rows/day (one per date x series), so "did the venue cut my
+    family's pool" becomes a query — and a leading indicator, since supply
+    moves before P&L does. Idempotent per day: a re-run replaces the day's
+    rows rather than double-counting. Never raises; this is observability
+    hanging off a reconciliation run that must not fail because of it.
+
+    NOTE the reward fields are the API's `period_reward` summed and
+    medianed AS-IS. Its unit is not dollars and is not verified here
+    (a single market reads e.g. 200000 against pools the bot models at
+    ~$150/day), so they are named _raw and are safe to compare ACROSS
+    TIME for a series, not to read as currency."""
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        agg = defaultdict(lambda: {"n_markets": 0, "n_active": 0, "n_paid": 0,
+                                   "rewards": [], "n_started": 0, "n_ended": 0})
+        for tkr, rec in by_market.items():
+            series = tkr.split("-")[0]
+            a = agg[series]
+            a["n_markets"] += 1
+            end = rec.get("end") or ""
+            start = rec.get("start") or ""
+            if end and end[:10] >= today:
+                a["n_active"] += 1
+            if rec.get("paid"):
+                a["n_paid"] += 1
+            if start[:10] == today:
+                a["n_started"] += 1
+            if end[:10] == today:
+                a["n_ended"] += 1
+            try:
+                a["rewards"].append(float(rec.get("reward") or 0))
+            except (TypeError, ValueError):
+                pass
+        rows = []
+        for series, a in sorted(agg.items()):
+            rw = sorted(a["rewards"]) or [0.0]
+            rows.append({
+                "date": today, "series": series,
+                "n_markets": a["n_markets"], "n_active": a["n_active"],
+                "n_paid": a["n_paid"], "n_started": a["n_started"],
+                "n_ended": a["n_ended"],
+                "total_reward_raw": round(sum(rw), 2),
+                "median_reward_raw": rw[len(rw) // 2],
+                "run_ts": datetime.now(timezone.utc).isoformat(),
+            })
+        # Drop any existing rows for today, then append — safe to re-run.
+        keep = []
+        if os.path.exists(PROGRAM_HISTORY):
+            with open(PROGRAM_HISTORY, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        if json.loads(line).get("date") != today:
+                            keep.append(line.rstrip("\n"))
+                    except ValueError:
+                        continue
+        tmp2 = PROGRAM_HISTORY + ".tmp"
+        with open(tmp2, "w", encoding="utf-8") as f:
+            for line in keep:
+                f.write(line + "\n")
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        os.replace(tmp2, PROGRAM_HISTORY)
+        log(f"  program history: {len(rows)} series rolled up for {today}")
+    except Exception as e:
+        log(f"  ! program history append failed ({e}); continuing")
 
 
 def load_programs():
