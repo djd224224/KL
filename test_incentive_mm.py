@@ -2108,6 +2108,56 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         with self.assertRaises(ValueError):
             imm._parse_event_top_n("KXAAAGAS")
 
+    def test_event_top_n_members_hold_their_slots(self):
+        # Jack 2026-09-06 "the quoted markets are moving around, it should
+        # be constant". The estimator scores a QUOTING market on its real
+        # resting orders and an idle one on a hypothetical full ladder, so
+        # idle siblings read ~2.5x higher and the old re-rank swapped a slot
+        # nearly every refresh. Members now hold their slots.
+        def m(t, est, expo=10.0, coll=0.0):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=20.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=expo, est_collateral_dollars=coll)
+        # the live pattern: 3 quoting members read low, idle siblings read
+        # 2.5x higher. Even 10x cannot displace a member now.
+        mem = {"KXAAAGASDNY-26SEP07-4.3150", "KXAAAGASDNY-26SEP07-4.3200",
+               "KXAAAGASDNY-26SEP07-4.3300"}
+        grp = [m("KXAAAGASDNY-26SEP07-4.3150", 2.9),
+               m("KXAAAGASDNY-26SEP07-4.3200", 2.3),
+               m("KXAAAGASDNY-26SEP07-4.3300", 1.5),
+               m("KXAAAGASDNY-26SEP07-4.3100", 15.0),
+               m("KXAAAGASDNY-26SEP07-4.3050", 30.0)]
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent=mem, members=mem),
+            {"KXAAAGASDNY-26SEP07-4.3100", "KXAAAGASDNY-26SEP07-4.3050"})
+        # without the member set that is exactly the churn we fixed: both
+        # weak members get swapped out for the idle pair.
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent=mem),
+            {"KXAAAGASDNY-26SEP07-4.3300", "KXAAAGASDNY-26SEP07-4.3200"})
+        # a free slot still admits the best challenger...
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent=mem,
+                                members=mem - {"KXAAAGASDNY-26SEP07-4.3300"}),
+            {"KXAAAGASDNY-26SEP07-4.3300", "KXAAAGASDNY-26SEP07-4.3100"})
+        # ...and the cap stays a HARD bound: members alone past N (an N
+        # lowered by config, a restart restoring a wider set) are trimmed
+        # worst-ROI-first rather than riding over the cap.
+        wide = mem | {"KXAAAGASDNY-26SEP07-4.3100",
+                      "KXAAAGASDNY-26SEP07-4.3050"}
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent=wide, members=wide),
+            {"KXAAAGASDNY-26SEP07-4.3300", "KXAAAGASDNY-26SEP07-4.3200"})
+        # immune (finecon/scan) outranks member tenure: it consumes the
+        # event's N first, and a member past what is left is trimmed.
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent=mem, members=mem,
+                                immune={"KXAAAGASDNY-26SEP07-4.3050"}),
+            {"KXAAAGASDNY-26SEP07-4.3300", "KXAAAGASDNY-26SEP07-4.3100"})
+
     def test_finecon_sweep_enrollment_and_guards(self):
         # Jack 2026-09-02: Finance/Economics sweep — the risk-screened
         # survivors are allowed, guarded (safe-join, no rate bar), and the

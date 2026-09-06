@@ -1019,17 +1019,38 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 # markets, quote only the 3 highest ROI markets in each event. because they
 # are all correlated so i dont want to quote them all"). Every strike of a
 # gas event settles on the SAME AAA print — quoting the whole in-band ladder
-# stacks correlated inventory for near-duplicate reward. This carves the ONE
-# deliberate exception out of two standing rules, for the configured
-# prefixes only: the 2026-07-13 "no per-event market cap" (budget was the
-# sole intra-event governor) and sticky never-evict (a member cut here IS
-# deselected — quotes cancelled, banked accrual keeps whatever cleared the
-# $1 floor — because the instruction is about standing correlated exposure,
-# not future admissions). ROI = est $/day per $ at risk, the quote-gaps
-# email's metric (fill-weighted est_exposure_dollars, falling back to plain
-# est_collateral_dollars; unpriceable books rank 0). Incumbents get the
-# same 1.15x the yield rank uses so estimator jitter doesn't reshuffle the
-# kept set every refresh. Format "PREFIX:N,...", longest prefix wins,
+# stacks correlated inventory for near-duplicate reward. This carves a
+# deliberate exception out of the 2026-07-13 "no per-event market cap"
+# (budget was the sole intra-event governor) for the configured prefixes
+# only. ROI = est $/day per $ at risk, the quote-gaps email's metric
+# (fill-weighted est_exposure_dollars, falling back to plain
+# est_collateral_dollars; unpriceable books rank 0).
+#
+# ADMISSION-ONLY as of 2026-09-06 (Jack: "the quoted markets are moving
+# around, it should be constant"). The first cut re-ranked every refresh
+# with only the yield rank's 1.15x incumbent bonus, and that lost to a
+# STRUCTURAL bias in the estimator: _estimate_candidate_yield scores a
+# market the bot is quoting on its ACTUAL resting orders (own_in_book=True
+# — often one rung, one side, priced a cycle ago) but scores an idle one on
+# a HYPOTHETICAL full two-sided ladder at the current reference prices with
+# the deep-reference multiplier and pads. Measured over 2026-09-06's 36
+# refreshes: the same gas strike read 2.54x higher on the cycles it was
+# idle (median paired ratio, n=90; 93% of strikes cleared 1.15x). The cut
+# therefore swapped the strike we were resting on for the sibling we were
+# not, ~1 slot per event PER REFRESH — 554 evictions and 542 re-admissions
+# across 12 gas events in one session — and every eviction that left
+# inventory behind became a reduce-only managed_extra leg, which is why
+# five events showed FOUR gas markets with resting orders under a cap of 3.
+# So members hold their slots (EVENT_TOP_N_STICKY): the cut admits into
+# free slots and never re-ranks a quoting member against a challenger. The
+# comparison that picks the initial N is apples-to-apples anyway — nothing
+# is quoting yet, so every candidate is scored on the hypothetical ladder.
+# Slots come back through the normal member deaths (cutoff, program over,
+# the 1h hopeless exit), and the cap stays a HARD bound: if members alone
+# ever exceed N — an N lowered by config, a restart restoring a wider set —
+# the worst-ROI members are still trimmed to N. IMM_EVENT_TOP_N_STICKY=0
+# restores the original evictable semantics.
+# Format "PREFIX:N,...", longest prefix wins,
 # N<=0 = uncapped. KXAAAGAS covers national + state dailies + W/M.
 # KXDIESEL added 2026-09-02 (Jack "do the same with diesel"): covers
 # KXDIESELD + KXDIESELW — same one-print-per-event correlation structure.
@@ -1047,6 +1068,9 @@ def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
 
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "KXAAAGAS:3,KXDIESEL:3"))
+# Members hold their slots against challengers (see the note above). 0 =
+# the original evictable semantics: re-rank the whole event every refresh.
+EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
 
 
 def event_top_n_for(series: str) -> int:
@@ -1067,15 +1091,22 @@ def _market_roi(m: "MarketMeta", incumbent: Set[str]) -> float:
 
 
 def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
-                    immune: Set[str] = frozenset()) -> Set[str]:
+                    immune: Set[str] = frozenset(),
+                    members: Set[str] = frozenset()) -> Set[str]:
     """Tickers to EXCLUDE under the per-event top-N: for each capped event,
-    everything past the N highest-ROI markets of that event. `immune`
-    tickers (finecon quote-to-completion members, Jack 2026-09-03: "once
-    start quoting, should quote to completion. dont unquote them") are
-    never cut and still consume the event's N, so they block admissions
-    rather than being out-ranked — relevant to KXAAAGASMINM/MAXM, which
-    this prefix cap catches alongside the finecon group walk. The gas/
-    diesel families themselves keep the original evictable semantics."""
+    everything past the N highest-ROI markets of that event.
+
+    Two grades of tenure, both consuming the event's N before any newcomer:
+    `immune` tickers (finecon/open-scan quote-to-completion members, Jack
+    2026-09-03: "once start quoting, should quote to completion. dont
+    unquote them") are never cut at all — relevant to KXAAAGASMINM/MAXM,
+    which this prefix cap catches alongside the finecon group walk.
+    `members` are the capped families' OWN quoting markets (gas, diesel):
+    they hold their slots against challengers so the kept set stops
+    churning (see the note above EVENT_TOP_N), but unlike `immune` they are
+    still trimmed worst-ROI-first if members alone exceed N — a lowered N
+    or a restart restoring a wider set must not leave the cap breached.
+    Everything else competes by ROI for whatever slots remain."""
     by_event: Dict[str, List["MarketMeta"]] = {}
     for _m in metas:
         if event_top_n_for(_m.series) > 0:
@@ -1085,8 +1116,16 @@ def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
         n = event_top_n_for(group[0].series)
         if n <= 0 or len(group) <= n:
             continue
-        rest = [m for m in group if m.ticker not in immune]
-        slots = max(0, n - (len(group) - len(rest)))
+        held = sum(1 for m in group if m.ticker in immune)
+        mem = [m for m in group
+               if m.ticker not in immune and m.ticker in members]
+        rest = [m for m in group
+                if m.ticker not in immune and m.ticker not in members]
+        slots = max(0, n - held)
+        if len(mem) > slots:
+            mem.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
+            cut.update(m.ticker for m in mem[slots:])
+        slots = max(0, slots - len(mem))
         rest.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
         cut.update(m.ticker for m in rest[slots:])
     return cut
@@ -2483,6 +2522,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DAILY_LOSS_LIMIT", "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
+    "EVENT_TOP_N", "EVENT_TOP_N_STICKY",
 )
 
 
@@ -5771,12 +5811,19 @@ class IncentiveMarketMaker:
                        if m.scan and m.ticker in prev_selected}
 
         # Per-event TOP-N (Jack 2026-09-02, gas — see event_top_n_cut):
-        # applied BEFORE sticky seeding so a member past the cap falls out of
+        # applied BEFORE sticky seeding so a market past the cap falls out of
         # `ranked`, out of `selected`, and through the normal deselect/cancel
-        # path this cycle. (Finecon members are immune; gas/diesel keep the
-        # original evictable semantics.)
+        # path this cycle. Finecon/scan members are fully immune; the capped
+        # families' own quoting markets hold their slots against challengers
+        # (Jack 2026-09-06 "it should be constant" — EVENT_TOP_N_STICKY) but
+        # are still trimmed if they alone exceed N.
+        topn_sticky = {m.ticker for m in ranked
+                       if EVENT_TOP_N_STICKY
+                       and event_top_n_for(m.series) > 0
+                       and m.ticker in prev_selected}
         topn_cut = event_top_n_cut(ranked, prev_selected,
-                                   immune=fin_sticky | scan_sticky)
+                                   immune=fin_sticky | scan_sticky,
+                                   members=topn_sticky)
         if topn_cut:
             skipped["event_top_n"] = len(topn_cut)
             decisions.update({_t: "event_top_n" for _t in topn_cut})
