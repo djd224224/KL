@@ -7345,6 +7345,66 @@ class TestOpenScanTier(unittest.TestCase):
 
     # ---- admission screens (bot-level, cached + budgeted reads) --------------
 
+    def test_event_activity_is_a_mean_per_market_not_a_sum(self):
+        # Jack 2026-09-06: "change event cap to be avg_per_market_on_event,
+        # and set that to 60". The old screen was a SUM against 250, which
+        # measured BREADTH: a wide quiet ladder failed for being wide.
+        self.assertEqual(imm.SCAN_MAX_EVENT_AVG_VOLUME_24H, 60)
+        self.assertEqual(imm.SCAN_MAX_VOLUME_24H, 60)
+        self.assertFalse(hasattr(imm, "SCAN_MAX_EVENT_VOLUME_24H"))
+        now = datetime.now(timezone.utc)
+
+        def run(vols):
+            """Build an event with these per-strike volumes, drive
+            refresh_universe, and return (event mean the screen saw,
+            {ticker: admission verdict}). Verdicts are what the ACTIVITY
+            screens said — membership additionally depends on the walk's
+            3-per-event slot cap, which is not what this test is about."""
+            tickers = [f"{self.EV}-T{i}" for i in range(len(vols))]
+            bot = self._bot(tickers=tickers)
+            for t, v in zip(tickers, vols):
+                bot.client.markets[t] = self._market(t, vol24=str(v))
+            seen, verdicts = {}, {}
+            real = bot._scan_admission
+            def spy(meta, m, ev_vol24, now_utc, budget):
+                seen.update(ev_vol24)
+                verdicts[meta.ticker] = real(meta, m, ev_vol24, now_utc, budget)
+                return verdicts[meta.ticker]
+            bot._scan_admission = spy
+            bot.state.universe_at = 0.0
+            bot.refresh_universe(now, {})
+            # FakeClient ships unrelated default markets (KXGOOD/KXWIDE) that
+            # are also scan universe — judge only the event under test
+            mine = {t: v for t, v in verdicts.items() if t.startswith(self.EV)}
+            return seen.get(self.EV), mine, bot
+
+        # SIX strikes at 50/day each: sum 300 (the old cap rejected the
+        # event for being WIDE), mean 50 -> every strike admitted. This is
+        # the KXAGTWINNER-26SEP24 class the 9/6 measurement found.
+        mean, verdicts, bot = run([50] * 6)
+        self.assertAlmostEqual(mean, 50.0)
+        self.assertEqual(set(verdicts.values()), {None})
+        self.assertEqual(len(bot.state.scan_members), imm.SCAN_EVENT_TOP_N)
+
+        # TWO strikes, 0 and 200: mean 100 -> the quiet one is rejected too,
+        # which is the neighbour-contamination the screen is FOR
+        mean, verdicts, bot = run([0, 200])
+        self.assertAlmostEqual(mean, 100.0)
+        self.assertEqual(verdicts[f"{self.EV}-T0"], "event_avg_volume")
+        self.assertEqual(verdicts[f"{self.EV}-T1"], "volume")  # its own cap
+        self.assertEqual(bot.state.scan_members, set())
+
+        # KNOWN, DELIBERATE LOOSENING (documented at the constant): one hot
+        # strike hides behind quiet siblings — 20 strikes, one at 1000, mean
+        # 50 -> the quiet ones pass the event screen and the hot one still
+        # fails the per-market cap. The old sum and a max() would both have
+        # rejected the whole event. Pinned so nobody "fixes" it by accident.
+        mean, verdicts, bot = run([1000] + [0] * 19)
+        self.assertAlmostEqual(mean, 50.0)
+        self.assertEqual(verdicts[f"{self.EV}-T0"], "volume")
+        self.assertEqual({v for t, v in verdicts.items()
+                          if t != f"{self.EV}-T0"}, {None})
+
     def test_admission_screens_fail_closed(self):
         bot = self._bot()
         now = datetime.now(timezone.utc)
@@ -7364,9 +7424,13 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(bot._scan_admission(
             self._meta(volume_24h=imm.SCAN_MAX_VOLUME_24H + 1), m, {}, now,
             budget), "volume")
+        # the event screen is an AVERAGE per market (Jack 2026-09-06)
         self.assertEqual(bot._scan_admission(
-            self._meta(), m, {self.EV: imm.SCAN_MAX_EVENT_VOLUME_24H + 1},
-            now, budget), "event_volume")
+            self._meta(), m, {self.EV: imm.SCAN_MAX_EVENT_AVG_VOLUME_24H + 1},
+            now, budget), "event_avg_volume")
+        self.assertIsNone(bot._scan_admission(
+            self._meta(), m, {self.EV: imm.SCAN_MAX_EVENT_AVG_VOLUME_24H},
+            now, budget))
         # structure (strike_type from the market object counts)
         self.assertEqual(bot._scan_admission(
             self._meta(t="KXNOVEL-99DEC31-HOLD"), dict(m, strike_type="custom"),

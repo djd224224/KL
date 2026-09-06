@@ -792,7 +792,7 @@ first (`_scan_admission`):
 |---|---|---|
 | STRUCTURE | day-dated event ticker — **or, since 2026-09-06, a month-named one on a Fiscal.ai-settled series** (`KXCCL-26SEPALBD`; see the dated note below: the first of that month becomes the cutoff); numeric-threshold strike (`T286`, `B90`, `4.1400`, or Kalshi `strike_type` greater/less/between) | the midnight-ET rule is the only release guard an unknown series has (KXUE/KXISMPMI had no day and would quote THROUGH their prints); for the KPI class the report MONTH is that guard; a "will X happen" binary's one jump IS the resolution (strategy §1) |
 | FAMILY | **no category ban since 2026-09-06** (the first cut banned `Sports, Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment` wholesale — see the dated note below; `IMM_SCAN_EXCLUDE_CATEGORIES` is empty by default and only a deliberate re-ban names a category); no LIVE settlement source (GET /series, cached 7d: pyth/coinbase/**cfbenchmarks**/espn/nba.com/ercot/weather.gov/**weather.com**/... keywords — a live price index, a live scoreboard, a live weather feed); prefix exclusions are OWNERSHIP and feeds, not categories: other repo bots (KXLOWT, KXRAIN, KXHIGH, KXTEMP, KXAVGT, KXAQI), the crypto fleets' families by asset (KX<ASSET>D / MAX-MINW / MAX-MINMON / MAX-MINY / Y), FX/index/commodity/grid feeds, the 9/2 scan's rejects (KXUE, KXISMPMI, KXSNOWCRABCATCH, KXSOCKEYERUN, KXTECHLAYOFF, ...) | realtime risk is a property of the settlement SOURCE, not the category: a market everyone else can price off a live feed is one we are always last to reprice; two of our bots must never anchor to each other |
-| ACTIVITY | market `volume_24h` <= 60, EVENT `volume_24h` <= 250 (summed over every bulk-read sibling, pinned strikes included), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
+| ACTIVITY | market `volume_24h` <= 60, EVENT MEAN `volume_24h` per market <= 60 (averaged over every bulk-read sibling, pinned strikes included; a SUM against 250 until 2026-09-06), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
 | HISTORY | 72h of hourly candlesticks: >= 12 two-sided bars, mid range <= 10c, no bar-to-bar move >= 6c, traded volume <= 250 (cached 6h) | a book that moved is not a quiet print, whatever its family says |
 
 Read budgets per refresh (the universe is thousands of markets): bulk
@@ -994,7 +994,7 @@ and a free slot: the tier stood at 20/15 with 5/5 openings used, so the
 first KPI admissions come at the ET rollover, and by ROI they will
 out-rank the $14/day state prints.
 
-### 2026-09-06 — the activity caps were never measured (finding, NOT yet changed)
+### 2026-09-06 — the activity caps were never measured (finding + the fix Jack chose)
 
 Jack asked where `SCAN_MAX_VOLUME_24H` (60/market) and
 `SCAN_MAX_EVENT_VOLUME_24H` (250/event) came from. Answer: they were
@@ -1028,11 +1028,41 @@ takes the decision.
   FOR ("informed flow on one strike shows up on its siblings"). A sum
   cannot express that intent; `max()` over the event's strikes can.
 
-Suggested (unimplemented): score the event on its BUSIEST strike rather
-than the sum, and leave the market cap at 60 or raise it to 250 — the
-distribution gap makes that choice nearly free either way. Both are env
-knobs, so an experiment needs no code change: `IMM_SCAN_MAX_EVENT_VOLUME_24H`
-and `IMM_SCAN_MAX_VOLUME_24H` (the max-vs-sum swap does need code).
+**SHIPPED** (Jack, same afternoon: "keep market cap at 60, change event cap
+to be avg_per_market_on_event, and set that to 60"). The market cap is
+unchanged at 60. The event screen is now the MEAN 24h volume per market
+over the event's bulk-read strikes, capped at 60:
+`SCAN_MAX_EVENT_AVG_VOLUME_24H` / `IMM_SCAN_MAX_EVENT_AVG_VOLUME_24H`
+(a NEW env name on purpose — an old `IMM_SCAN_MAX_EVENT_VOLUME_24H` value
+was a sum against 250 and would be nonsense against a mean). The reject
+reason in the refresh log is now `event_avg_volume`, not `event_volume`,
+so old and new refreshes can be told apart.
+
+Jack chose the mean over the `max()` suggested above. **Known loosening,
+pinned by a test so nobody "fixes" it silently:** the mean lets ONE hot
+strike hide behind quiet siblings (20 strikes, one at 1000, rest 0 -> mean
+50, passes) where both the old sum and a max() reject the event. The hot
+strike still fails the per-market cap; what changes is that its quiet
+neighbours are admitted, relaxing the original "informed flow on one
+strike shows up on its siblings" intent. Watch the tier's $75/day loss
+budget for whether that holds.
+
+Measured effect on the live feed, 9/6, over the post-bulk-cap universe
+(594 markets): 203 markets / $11.9k per day admitted under the old sum,
+209 / $10.8k under the mean. Net +10 markets, +$143/day — KXKSWHEAT-26SEP30
+(7 strikes, sum 330, mean 47) and KXORBOFHARVEST-27NOV30 (5 strikes, sum
+270, mean 54), exactly the wide-quiet-ladder class. Four KXTTELITEMATCH
+events show as "lost" in a volume-only diff but were already past their
+midnight-ET day cutoff, so nothing real was given up.
+
+**Do not expect the mean at 60 to recover the $5.8k above.** Most of that
+withheld pool sits in events whose MEAN is also far over 60
+(KXYTDAILYTOPVIDEOG mean ~743, KXCOCACOLAPOS mean ~396), so mean<=60 is
+about as strict in aggregate as sum<=250 was. It fixes the breadth flaw in
+principle — a wide quiet ladder is now judged on its per-strike activity —
+but the threshold, not the statistic, is what governs how much opens up.
+Raising `IMM_SCAN_MAX_EVENT_AVG_VOLUME_24H` is the lever, and needs no
+code change.
 
 **`SCAN_MAX_BULK` has the same breadth flaw and bites FIRST.** It ranks
 candidates by per-market `dollars_per_day` and keeps 600, so a wide ladder
@@ -1048,7 +1078,9 @@ event pool) first, or it will measure nothing.
 `EVENT_TOP_N` 3 · `DAILY_OPENINGS` 5 · `LEVELS` unset = global ladder ·
 `MAX_POSITION` unset = global cap · `REF_MULT_CAP` 0 = uncapped ·
 `HOUR_MULT` 1 · `REQUIRE_DATED` 1 · `REQUIRE_NUMERIC` 1 ·
-`MIN_AGE_H` 24 · `MAX_VOLUME_24H` 60 · `MAX_EVENT_VOLUME_24H` 250 ·
+`MIN_AGE_H` 24 · `MAX_VOLUME_24H` 60 · `MAX_EVENT_AVG_VOLUME_24H` 60
+(MEAN per market on the event since 2026-09-06; the old
+`MAX_EVENT_VOLUME_24H` sum-against-250 knob is GONE, not renamed) ·
 `HISTORY_H` 72 · `MIN_HISTORY_BARS` 12 · `MAX_RANGE` 10 · `MAX_JUMP` 6 ·
 `MAX_HISTORY_VOLUME` 250 · `HISTORY_TTL_H` 6 · `SERIES_META_TTL_D` 7 ·
 `MAX_BULK` 600 · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·

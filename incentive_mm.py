@@ -1718,12 +1718,34 @@ SCAN_REQUIRE_NUMERIC = os.environ.get("IMM_SCAN_REQUIRE_NUMERIC", "1") == "1"
 SCAN_NUMERIC_STRIKE_TYPES = frozenset(
     {"greater", "less", "greater_or_equal", "less_or_equal", "between"})
 _SCAN_STRIKE_RE = re.compile(r"^[TB]?-?\d[\d,.]*[A-Z]?$")
-# Activity screens. The 9/2 finecon members all read near-zero 24h volume
-# at enrollment; 60 contracts/day on the market and 250 across its event
-# is "someone is trading this" territory, not a quiet print.
+# Activity screens: 60 contracts/day is "someone is trading this"
+# territory, not a quiet print. Applied to the MARKET, and to its EVENT as
+# an AVERAGE PER MARKET (Jack 2026-09-06: "keep market cap at 60, change
+# event cap to be avg_per_market_on_event, and set that to 60").
+#
+# The event screen was a SUM over the event's strikes against a fixed 250
+# until then, which measured BREADTH as much as activity: a 14-strike
+# ladder trading 20/day each summed to 280 and failed, while a 2-strike
+# event trading 120 each summed to 240 and passed. Measured 9/6 on the
+# live feed, that sum withheld 189 individually-quiet (<=60/day) markets,
+# ~$5.8k/day of pool, e.g. KXAGTWINNER-26SEP24: 11 quiet strikes, 757
+# total, no busy strike at all. The mean is scale-free, so a wide quiet
+# ladder now passes and only genuine per-strike activity fails.
+#
+# KNOWN LOOSENING, deliberate: the mean lets ONE hot strike hide behind
+# quiet siblings (20 strikes, one at 1000, rest at 0 -> mean 50, passes),
+# where the old sum and a max() would both reject the event. The hot
+# strike itself is still rejected by the per-market cap; what changes is
+# that its quiet neighbours are now admitted, which relaxes the original
+# "informed flow on one strike shows up on its siblings" intent. Watch the
+# tier's loss budget for whether that holds.
 SCAN_MIN_AGE_HOURS = _env_float("IMM_SCAN_MIN_AGE_H", 24)
 SCAN_MAX_VOLUME_24H = _env_float("IMM_SCAN_MAX_VOLUME_24H", 60)
-SCAN_MAX_EVENT_VOLUME_24H = _env_float("IMM_SCAN_MAX_EVENT_VOLUME_24H", 250)
+# Deliberately a NEW env name: IMM_SCAN_MAX_EVENT_VOLUME_24H meant a sum
+# against 250, so an old value carried over would be nonsense against a
+# per-market mean. Nothing in the launcher set either (checked 9/6).
+SCAN_MAX_EVENT_AVG_VOLUME_24H = _env_float(
+    "IMM_SCAN_MAX_EVENT_AVG_VOLUME_24H", 60)
 # History screen (hourly candlesticks). 12 two-sided bars = half a day of
 # quotes to judge from; a 10c range or a 6c bar-to-bar move inside 72h is a
 # market with information in it; 250 traded contracts over 72h likewise.
@@ -5734,10 +5756,18 @@ class IncentiveMarketMaker:
         # when the budget tripped).
         if scan_metas:
             _et_today = now_utc.astimezone(ET).date().isoformat()
-            ev_vol24: Dict[str, float] = {}
+            # AVERAGE 24h volume per market on the event (Jack 2026-09-06),
+            # over the bulk-read siblings — pinned/one-sided strikes
+            # included, which is the point: they are part of how busy the
+            # event's ladder really is. Denominator is the same set as the
+            # sum, so an event read in part is judged on what was read.
+            _ev_sum: Dict[str, float] = {}
+            _ev_n: Dict[str, int] = {}
             for _meta, _m in scan_metas:
-                ev_vol24[_meta.event_ticker] = (
-                    ev_vol24.get(_meta.event_ticker, 0.0) + _meta.volume_24h)
+                _ev_sum[_meta.event_ticker] = (
+                    _ev_sum.get(_meta.event_ticker, 0.0) + _meta.volume_24h)
+                _ev_n[_meta.event_ticker] = _ev_n.get(_meta.event_ticker, 0) + 1
+            ev_vol24 = {ev: _ev_sum[ev] / _ev_n[ev] for ev in _ev_sum}
             budget = {"series": SCAN_MAX_SERIES_FETCHES,
                       "history": SCAN_MAX_HISTORY_FETCHES}
             scan_halted = self.state.scan_halt_day == _et_today
@@ -6274,7 +6304,10 @@ class IncentiveMarketMaker:
         """Every open-scan admission screen for a NON-member candidate, in
         cost order (string, then market-object, then cached/bounded reads).
         None = admissible; else the reject reason (also the quote-gaps
-        label). Members never come here — they quote to completion."""
+        label). Members never come here — they quote to completion.
+
+        `ev_vol24` maps event -> AVERAGE 24h volume per market on that
+        event (Jack 2026-09-06), not the sum it held until then."""
         now_ts = now_utc.timestamp()
         if meta.event_ticker in self.state.scan_evicted_events:
             return "evicted"
@@ -6315,8 +6348,8 @@ class IncentiveMarketMaker:
             return "age"
         if meta.volume_24h > SCAN_MAX_VOLUME_24H:
             return "volume"
-        if ev_vol24.get(meta.event_ticker, 0.0) > SCAN_MAX_EVENT_VOLUME_24H:
-            return "event_volume"
+        if ev_vol24.get(meta.event_ticker, 0.0) > SCAN_MAX_EVENT_AVG_VOLUME_24H:
+            return "event_avg_volume"
         ok, why = self._scan_series_ok(meta.series, now_ts, budget)
         if not ok:
             return why or "series_meta"
@@ -8485,8 +8518,9 @@ class IncentiveMarketMaker:
                 f"ref-mult cap {('%g' % SCAN_REF_MULT_CAP) if SCAN_REF_MULT_CAP > 0 else 'none'}, "
                 f"quiet-hours mult {'on' if SCAN_HOUR_MULT else 'off'}; screens: "
                 f"dated={SCAN_REQUIRE_DATED} numeric={SCAN_REQUIRE_NUMERIC} "
-                f"vol24h<={SCAN_MAX_VOLUME_24H:g} (event "
-                f"{SCAN_MAX_EVENT_VOLUME_24H:g}) age>={SCAN_MIN_AGE_HOURS:g}h "
+                f"vol24h<={SCAN_MAX_VOLUME_24H:g} (event avg/market "
+                f"<={SCAN_MAX_EVENT_AVG_VOLUME_24H:g}) "
+                f"age>={SCAN_MIN_AGE_HOURS:g}h "
                 f"history {SCAN_HISTORY_HOURS}h/{SCAN_MIN_HISTORY_BARS}+ bars "
                 f"range<={SCAN_MAX_RANGE_CENTS:g}c jump<{SCAN_MAX_JUMP_CENTS:g}c "
                 f"vol<={SCAN_MAX_HISTORY_VOLUME:g}, categories out "
