@@ -1,6 +1,8 @@
 Lisa_Kalshi.txt
 *.pem
 gcp_sa_key.json
+# written by .claude/hooks/session-start.sh (cloud sessions) / GH Actions
+google_credentials.json
 __pycache__/
 *.pyc
 
