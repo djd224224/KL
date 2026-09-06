@@ -3,10 +3,16 @@ r"""send_opportunistic_imm.py — the daily "Opportunistic IMM" email
 (Jack 2026-09-05: "add daily email called 'opportunistic IMM' showing a
 table of the events quoted, earning est, P&L, and net").
 
-The "opportunistic" book is the finecon sweep (incentive_mm.FINECON_SERIES):
-the Finance/Economics quiet-print families the bot quotes on a top-N-by-ROI
-group walk, quote-to-completion, with daily over-cap openings. This email is
-that book's own scorecard, separate from the whole-account digest.
+The "opportunistic" book is TWO tiers, each a top-N-by-ROI group walk with
+quote-to-completion membership and daily over-cap openings:
+  finecon   the hand-curated Finance/Economics quiet-print families
+            (incentive_mm.FINECON_SERIES)
+  scan      the OPEN SCAN (Jack 2026-09-05 "extend the opportunistic IMM
+            with 15 slots and 5 to scan all markets"): every other live-
+            program market, machine-screened for adverse selection
+            (incentive_mm SCAN_*; membership persisted as scan_members)
+This email is that book's own scorecard, separate from the whole-account
+digest. Every row carries its TIER.
 
 One row per currently-quoted opportunistic EVENT:
   EARN EST   the bot's period-to-date accrued reward estimate (what we
@@ -122,11 +128,29 @@ def build_report(now_utc):
 
     selected = set(state.get("selected_tickers") or [])
     accrued = state.get("accrued_est") or {}
+    # Open-scan tier: membership is persisted by the bot (scan_members);
+    # scan_book adds former members still carrying our inventory, so their
+    # credits and P&L stay attributed to the opportunistic book.
+    scan_members = set(state.get("scan_members") or [])
+    scan_book = set(state.get("scan_book") or []) | scan_members
+    scan_events = {_event_of(t) for t in scan_book}
 
     def _is_fin(t):
         return t.split("-")[0] in fin
 
-    members = [t for t in selected if _is_fin(t)]
+    def _tier(t):
+        if _is_fin(t):
+            return "finecon"
+        if t in scan_members:
+            return "scan"
+        return None
+
+    def _is_opp_event(ev):
+        return _is_fin(ev) or ev in scan_events
+
+    members = [t for t in selected if _tier(t)]
+    fin_members = [t for t in members if _tier(t) == "finecon"]
+    scan_sel = [t for t in members if _tier(t) == "scan"]
     by_event: dict = {}
     for t in members:
         by_event.setdefault(_event_of(t), []).append(t)
@@ -149,6 +173,7 @@ def build_report(now_utc):
         netpos = sum(_f(pos.get(t)) for t in tickers)
         rows.append({
             "event": ev, "label": event_label(client, ev),
+            "tier": _tier(tickers[0]) or "",
             "mkts": len(tickers), "earn": earn, "pnl": pnl,
             "net": pnl + earn, "pos": netpos})
     rows.sort(key=lambda r: -r["net"])
@@ -160,33 +185,45 @@ def build_report(now_utc):
 
     # Actual Kalshi money on opportunistic events (footer reconciliation).
     ledger, _calib = load_credit_ledger()
-    cred_life = sum(a for _d, ev, a in ledger if _is_fin(ev))
+    cred_life = sum(a for _d, ev, a in ledger if _is_opp_event(ev))
 
     top_n = getattr(imm, "FINECON_TOP_N", 0)
     openings_cap = getattr(imm, "FINECON_DAILY_OPENINGS", 0)
     today_et = now_utc.astimezone(imm.ET).date()
     used = (int(_f(state.get("finecon_admits_today")))
             if state.get("finecon_admit_day") == today_et.isoformat() else 0)
+    scan_top_n = getattr(imm, "SCAN_TOP_N", 0)
+    scan_openings_cap = getattr(imm, "SCAN_DAILY_OPENINGS", 0)
+    scan_used = (int(_f(state.get("scan_admits_today")))
+                 if state.get("scan_admit_day") == today_et.isoformat() else 0)
+    scan_halted = state.get("scan_halt_day") == today_et.isoformat()
+    scan_evicted = len(state.get("scan_evicted_events") or {})
+    scan_line = (f"open scan {len(scan_sel)}/{scan_top_n} slots "
+                 f"(+{scan_used}/{scan_openings_cap} openings used"
+                 + (", HALTED today" if scan_halted else "")
+                 + (f", {scan_evicted} event(s) evicted" if scan_evicted else "")
+                 + ")")
 
     subject = (f"Opportunistic IMM {today_et} — est ${tot_earn:,.0f}/period, "
                f"net ${tot_net:+,.0f}")
 
     # ---- plain text ---------------------------------------------------------
     L = [f"Opportunistic IMM — {today_et}", ""]
-    L.append(f"{len(rows)} events quoted / {tot_mkts} markets "
-             f"({len(members)}/{top_n} slots, +{used}/{openings_cap} daily "
-             f"openings used).")
+    L.append(f"{len(rows)} events quoted / {tot_mkts} markets.")
+    L.append(f"Finecon {len(fin_members)}/{top_n} slots (+{used}/{openings_cap} "
+             f"daily openings used)  |  {scan_line}.")
     L.append(f"Est reward this period ${tot_earn:,.2f}  |  trading P&L "
              f"${tot_pnl:+,.2f}  |  net ${tot_net:+,.2f}.")
     L.append("")
     if rows:
-        L.append(f"{'EVENT':<26}{'WHAT IT IS':<34}{'MKTS':>5}{'EARN EST$':>11}"
-                 f"{'P&L$':>10}{'NET$':>10}")
+        L.append(f"{'EVENT':<26}{'TIER':<8}{'WHAT IT IS':<34}{'MKTS':>5}"
+                 f"{'EARN EST$':>11}{'P&L$':>10}{'NET$':>10}")
         for r in rows:
-            L.append(f"{_short_event(r['event'])[:25]:<26}{r['label'][:33]:<34}"
+            L.append(f"{_short_event(r['event'])[:25]:<26}{r['tier']:<8}"
+                     f"{r['label'][:33]:<34}"
                      f"{r['mkts']:>5}{r['earn']:>11.2f}{r['pnl']:>+10.2f}"
                      f"{r['net']:>+10.2f}")
-        L.append(f"{'TOTAL':<26}{'':<34}{tot_mkts:>5}{tot_earn:>11.2f}"
+        L.append(f"{'TOTAL':<26}{'':<8}{'':<34}{tot_mkts:>5}{tot_earn:>11.2f}"
                  f"{tot_pnl:>+10.2f}{tot_net:>+10.2f}")
     else:
         L.append("No opportunistic events quoted right now.")
@@ -215,18 +252,21 @@ def build_report(now_utc):
     h.append(f'<div style="color:#555;margin-bottom:10px">'
              f'<b>{len(rows)}</b> events quoted &nbsp;·&nbsp; '
              f'<b>{tot_mkts}</b> markets &nbsp;·&nbsp; '
-             f'{len(members)}/{top_n} slots &nbsp;·&nbsp; '
-             f'+{used}/{openings_cap} daily openings used</div>')
+             f'finecon {len(fin_members)}/{top_n} slots '
+             f'(+{used}/{openings_cap} openings) &nbsp;·&nbsp; '
+             f'{scan_line}</div>')
     if rows:
         h.append('<table style="border-collapse:collapse;margin:6px 0">')
         h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
-                 f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
+                 f'<td style="{TDL}">EVENT</td><td style="{TDL}">TIER</td>'
+                 f'<td style="{TDL}">WHAT IT IS</td>'
                  f'<td style="{TD}">MKTS</td><td style="{TD}">EARN EST$</td>'
                  f'<td style="{TD}">P&amp;L$</td><td style="{TD}">NET$</td></tr>')
         for i, r in enumerate(rows):
             bg = "#fafafa" if i % 2 else "#fff"
             h.append(f'<tr style="background:{bg}">'
                      f'<td style="{TDL}"><b>{_short_event(r["event"])}</b></td>'
+                     f'<td style="{TDL}">{r["tier"]}</td>'
                      f'<td style="{TDL}">{r["label"]}</td>'
                      f'<td style="{TD}">{r["mkts"]}</td>'
                      f'<td style="{TD}">{r["earn"]:,.2f}</td>'
@@ -235,6 +275,7 @@ def build_report(now_utc):
                      f'</tr>')
         h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
                  f'<td style="{TDL}">TOTAL</td><td style="{TDL}"></td>'
+                 f'<td style="{TDL}"></td>'
                  f'<td style="{TD}">{tot_mkts}</td>'
                  f'<td style="{TD}">{tot_earn:,.2f}</td>'
                  f'<td style="{TD}">{_pnl_span(tot_pnl)}</td>'
