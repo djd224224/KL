@@ -6801,6 +6801,41 @@ class TestOpportunisticEmail(unittest.TestCase):
             lbl = opp.event_label(None, f"{s}-26OCT01")
             self.assertTrue(lbl and not lbl.startswith("KX"), s)
 
+    def test_opportunistic_tables_render_per_tier(self):
+        # Jack 2026-09-06: "a similarly formatted table for non-finecon
+        # opportunistic bot" — both tiers render through the SAME table
+        # functions, each with its own TOTAL row; no TIER column.
+        import send_opportunistic_imm as opp
+        rows = [{"event": "KXSPRLVL-26SEP09", "label": "US SPR level",
+                 "tier": "finecon", "mkts": 3, "earn": 1.50, "pnl": -0.25,
+                 "net": 1.25, "pos": 12},
+                {"event": "KXNOVEL-26OCT13", "label": "Novel print",
+                 "tier": "scan", "mkts": 2, "earn": 0.40, "pnl": 0.10,
+                 "net": 0.50, "pos": -4}]
+        t = opp.tier_totals(rows)
+        self.assertEqual(t["mkts"], 5)
+        self.assertAlmostEqual(t["earn"], 1.90)
+        self.assertAlmostEqual(t["pnl"], -0.15)
+        self.assertAlmostEqual(t["net"], 1.75)
+        L = opp.text_table(rows)
+        self.assertEqual(len(L), 4)                      # header, 2 rows, TOTAL
+        self.assertTrue(L[0].startswith("EVENT"))
+        self.assertNotIn("TIER", L[0])
+        self.assertIn("US SPR level", L[1])
+        self.assertTrue(L[-1].startswith("TOTAL"))
+        self.assertIn("1.90", L[-1])
+        self.assertIn("-0.15", L[-1])
+        self.assertIn("+1.75", L[-1])
+        # the same rows through the HTML twin
+        html = opp.html_table(rows)
+        self.assertIn("Novel print", html)
+        self.assertIn("TOTAL", html)
+        self.assertNotIn("TIER", html)
+        self.assertEqual(html.count("<tr"), 4)
+        # an empty tier still renders a well-formed TOTAL row
+        self.assertTrue(opp.text_table([])[-1].startswith("TOTAL"))
+        self.assertEqual(opp.tier_totals([])["net"], 0.0)
+
     def test_quote_gaps_open_scan_labels(self):
         # imm_quote_gaps labels a scan-universe market from the live bot's
         # PERSISTED screen caches — never a fetch (the script is read-only).
