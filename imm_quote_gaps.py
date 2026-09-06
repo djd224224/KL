@@ -211,8 +211,15 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
                                                  close_time=close_time)
     if imm.scan_universe_reason(t) is None:
         # open-scan candidates: the report-month rule for month-named
-        # (Fiscal.ai KPI) events — mirrors refresh_universe
-        cutoff = imm.scan_report_month_cutoff(event_ticker, cutoff)
+        # (Fiscal.ai KPI) events — mirrors refresh_universe, narrowing
+        # included (no month cutoff when the published report date lands
+        # after the paying window)
+        cutoff = imm.scan_report_month_cutoff(
+            event_ticker, cutoff,
+            report=imm.scan_report_date(
+                imm.parse_iso_utc(m.get("occurrence_datetime", "")),
+                imm.parse_iso_utc(m.get("expected_expiration_time", ""))),
+            program_end=info.get("end"))
     bid = imm.market_cents(m, "yes_bid")
     ask = imm.market_cents(m, "yes_ask")
     try:
@@ -373,10 +380,12 @@ def scan_gap_label(bot, t: str, now_utc: datetime) -> str:
             return "screens pending"        # series not read yet
     if why:
         return why
-    if fiscal and imm.parse_event_date(t) is None:
-        ms = imm.parse_event_month(t)
-        if ms is not None and now_utc >= ms:
-            return "cutoff_passed (report month)"
+    # (No report-month verdict here. Since the 2026-09-06 pm narrowing the
+    # month cutoff depends on the PUBLISHED report date and the program end,
+    # neither of which is in the persisted caches this function reads — the
+    # cutoff belongs to build_meta + the cutoff screen, which see the market
+    # object. Deciding it from the month alone would report a stand-down
+    # that no longer exists for events reporting after their window.)
     if sm:
         # Same re-read against the category knob the bot applies
         # (scan_cached_verdict): a verdict from a lifted ban is stale —

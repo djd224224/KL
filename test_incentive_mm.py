@@ -6944,8 +6944,15 @@ class TestOpportunisticEmail(unittest.TestCase):
         bot.state.scan_history_cache[ft] = {"ts": time.time(), "ok": True}
         self.assertEqual(qg.scan_gap_label(bot, ft, now),
                          "eligible (slots/ROI/live screens)")
-        self.assertEqual(qg.scan_gap_label(bot, f"KXFISC-{cur}ALBD-1", now),
-                         "cutoff_passed (report month)")
+        # A market inside its report month is NOT labelled from the month
+        # alone (2026-09-06 pm narrowing): whether the month cutoff applies
+        # depends on the published report date and the program end, which
+        # this cache-only function cannot see — build_meta + the cutoff
+        # screen own that verdict.
+        cm = f"KXFISC-{cur}ALBD-1"
+        bot.state.scan_history_cache[cm] = {"ts": time.time(), "ok": True}
+        self.assertEqual(qg.scan_gap_label(bot, cm, now),
+                         "eligible (slots/ROI/live screens)")
         bot.state.scan_series_meta["KXNOVEL"] = {"ts": time.time(), "ok": True}
         bot.state.scan_history_cache[t] = {
             "ts": time.time(), "ok": False, "why": "history_range"}
@@ -7184,6 +7191,47 @@ class TestOpenScanTier(unittest.TestCase):
         dated = datetime(2026, 9, 21, 4, tzinfo=timezone.utc)
         self.assertEqual(rc("KXNFLGAME-26SEP21NYGLAR", dated), dated)
         self.assertIsNone(rc("KXRT-DOG", None))
+
+    def test_report_month_narrowed_by_the_paying_window(self):
+        # Jack 2026-09-06 pm ("narrow the month rule"), on KXDOL-26SEPCOMP:
+        # the month is a stand-in for "the report might land while we quote".
+        # When Kalshi PUBLISHES a report date that falls after the paying
+        # program window, that stand-in is provably wrong — the number
+        # cannot print while the bot earns — so no month cutoff.
+        rc = imm.scan_report_month_cutoff
+        sep1 = imm.ET.localize(datetime(2026, 9, 1)).astimezone(timezone.utc)
+        prog_end = datetime(2026, 9, 11, 3, 59, tzinfo=timezone.utc)
+        occ_cut = datetime(2026, 9, 12, 4, tzinfo=timezone.utc)   # DOL reports 9/12
+        # report AFTER the window: the occurrence-derived cutoff stands
+        self.assertEqual(rc("KXDOL-26SEPCOMP", occ_cut, report=occ_cut,
+                            program_end=prog_end), occ_cut)
+        # report INSIDE the window: the month still bites, early
+        inside = datetime(2026, 9, 8, 4, tzinfo=timezone.utc)
+        self.assertEqual(rc("KXDOL-26SEPCOMP", inside, report=inside,
+                            program_end=prog_end), sep1)
+        # report exactly at the window end counts as inside (>, not >=)
+        self.assertEqual(rc("KXDOL-26SEPCOMP", prog_end, report=prog_end,
+                            program_end=prog_end), sep1)
+        # NO published report date (CHWY/KR/TTAN): month stands — an unknown
+        # date must fail toward quoting less (the 8/6 CELH asymmetry)
+        self.assertEqual(rc("KXCHWY-26SEPACTIVECUST", None, report=None,
+                            program_end=prog_end), sep1)
+        # no program end known: month stands
+        self.assertEqual(rc("KXDOL-26SEPCOMP", occ_cut, report=occ_cut,
+                            program_end=None), sep1)
+        # day-dated events never consult any of this
+        dated = datetime(2026, 9, 21, 4, tzinfo=timezone.utc)
+        self.assertEqual(rc("KXNFLGAME-26SEP21NYGLAR", dated, report=dated,
+                            program_end=prog_end), dated)
+        # the report-date reader: occurrence == expiration is Kalshi
+        # restating the expiry, not a published date (CHWY/KR/TTAN read so)
+        rd = imm.scan_report_date
+        exp = datetime(2027, 1, 8, 4, tzinfo=timezone.utc)
+        self.assertEqual(rd(occ_cut, exp), occ_cut)
+        self.assertIsNone(rd(exp, exp))
+        self.assertIsNone(rd(exp - timedelta(minutes=30), exp))
+        self.assertIsNone(rd(None, exp))
+        self.assertEqual(rd(occ_cut, None), occ_cut)
         # the fiscal flag comes from the series' settlement sources
         fiscal = {"category": "Financials", "settlement_sources": [
             {"name": "Fiscal.ai", "url": "https://fiscal.ai"}]}

@@ -926,6 +926,28 @@ day-dated midnight rule provides, one level coarser:
   reviewed by hand per series; the scan is unreviewed. A series Jack wants
   quoted into its report month belongs in the finecon KPI set /
   `COMPANY_TICKERS`, the reviewed path.
+  **NARROWED the same afternoon** (Jack, on KXDOL-26SEPCOMP: "narrow the
+  month rule"): the month is a stand-in for "the report might land while
+  we are quoting", and when Kalshi PUBLISHES a report date that falls
+  AFTER the paying program window closes, that stand-in is provably wrong
+  — the number cannot print while the bot earns, so the window is
+  release-free and the month only forfeits accrual. `scan_report_date`
+  reads the published date (occurrence >1h before expiration, the same
+  test `trade_cutoff_utc` uses; occurrence == expiration means Kalshi
+  publishes none), and the caller passes it with the program end. Report
+  after the window -> no month cutoff, the occurrence-derived cutoff plus
+  the `program_over` screen stand. Report inside the window, or NO
+  published date (CHWY/KR/TTAN) -> the month applies, unchanged: an
+  unknown date must fail toward quoting less (the 8/6 CELH asymmetry).
+  Measured on the live feed the same afternoon: frees KXCCL-26SEPALBD
+  (reports 9/30, program ends 9/11), KXDOL-26SEPCOMP (9/12 vs 9/11) and
+  KXF-26OCTUSSALES (10/3 vs 9/11) — $356/day of pool, 26 markets. NOTE
+  all three still fail the 250/event activity cap today, so the narrowing
+  removes a wrong stand-down without yet changing what is quoted; see the
+  activity-cap calibration note below.
+  `imm_quote_gaps.scan_gap_label` deliberately reports NO report-month
+  verdict: the narrowing depends on the report date and the program end,
+  neither of which is in the persisted caches that function reads.
 - `scan_series_is_fiscal` flags a series whose settlement source names
   fiscal.ai (`IMM_SCAN_FISCAL_SOURCE_KEYWORDS`); persisted on the series
   verdict as `fiscal`. `scan_shape_reason(..., fiscal=True)` waives
@@ -958,6 +980,48 @@ screen). All of them still need the 24h age, <=60/day, quiet-72h screens
 and a free slot: the tier stood at 20/15 with 5/5 openings used, so the
 first KPI admissions come at the ET rollover, and by ROI they will
 out-rank the $14/day state prints.
+
+### 2026-09-06 — the activity caps were never measured (finding, NOT yet changed)
+
+Jack asked where `SCAN_MAX_VOLUME_24H` (60/market) and
+`SCAN_MAX_EVENT_VOLUME_24H` (250/event) came from. Answer: they were
+guessed. Both entered in efb9707 (9/5) from the container that could not
+reach the Kalshi API — the DEPLOYMENT CAVEAT above — and neither has been
+touched since. The source comment's basis is an analogy: "the 9/2 finecon
+members all read near-zero 24h volume at enrollment."
+
+Measured against the live feed 9/6 (594-market scan universe, $24.8k/day
+of pool). Nothing below is implemented; it is the evidence for whoever
+takes the decision.
+
+- **The analogy does not hold.** 3 of the 8 finecon markets selected that
+  afternoon exceed the scan's own 60/day cap; two KXAMZNCC strikes read
+  ~1,700/day. The curated tier the caps were modelled on would be
+  substantially rejected by them.
+- **Volume is bimodal, so the MARKET cap is nearly free.** 58% of the
+  universe reads exactly zero; p60 = 13.7, p70 = 329. Almost nothing lives
+  between 60 and 250, so moving the market cap anywhere in that band
+  changes ~15 markets.
+- **The EVENT cap is the binding constraint.** Holding the market cap at
+  60: event cap 250 -> 205 markets / $11.9k per day; 1000 -> 271 / $13.3k;
+  no event cap -> 394 / $17.7k. It withholds 189 individually-quiet
+  (<=60/day) markets worth ~$5.8k/day of pool.
+- **And it measures the wrong thing.** The event figure is a SUM over
+  every strike compared against a fixed 250, so an event fails on BREADTH
+  as much as on activity: KXAGTWINNER-26SEP24 has 11 quiet strikes and a
+  757 total, no busy strike at all, just a wide ladder. Contrast
+  KXYTDAILYTOPVIDEOG-26SEP07 at 7,430, where a genuinely hot strike is
+  poisoning its neighbours — the case the code comment says the screen is
+  FOR ("informed flow on one strike shows up on its siblings"). A sum
+  cannot express that intent; `max()` over the event's strikes can.
+
+Suggested (unimplemented): score the event on its BUSIEST strike rather
+than the sum, and leave the market cap at 60 or raise it to 250 — the
+distribution gap makes that choice nearly free either way. Both are env
+knobs, so an experiment needs no code change: `IMM_SCAN_MAX_EVENT_VOLUME_24H`
+and `IMM_SCAN_MAX_VOLUME_24H`. This is also what currently keeps the three
+events freed by the report-month narrowing (CCL 1,757 / DOL 675 / F 3,220
+event volume) out of the book.
 
 ### Knobs (env, prefix IMM_SCAN_)
 

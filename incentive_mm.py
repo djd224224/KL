@@ -1886,21 +1886,60 @@ def scan_shape_reason(ticker: str, strike_type: Optional[str] = None,
     return None
 
 
-def scan_report_month_cutoff(event_ticker: str,
-                             cutoff: Optional[datetime]) -> Optional[datetime]:
+def scan_report_date(occurrence: Optional[datetime],
+                     expected_expiration: Optional[datetime]
+                     ) -> Optional[datetime]:
+    """Kalshi's PUBLISHED report date for a KPI market, or None when it
+    publishes none. Same test trade_cutoff_utc uses to tell a scheduled
+    underlying event from a bare expiration stamp: an occurrence_datetime
+    meaningfully (>1h) before expiration is a real date; occurrence ==
+    expiration means Kalshi is just restating the expiry (live probe
+    2026-09-06: CHWY/KR/TTAN read that way, CCL/DOL/F carry real dates)."""
+    if occurrence is None:
+        return None
+    if expected_expiration is None:
+        return occurrence
+    if occurrence < expected_expiration - timedelta(minutes=60):
+        return occurrence
+    return None
+
+
+def scan_report_month_cutoff(event_ticker: str, cutoff: Optional[datetime],
+                             report: Optional[datetime] = None,
+                             program_end: Optional[datetime] = None
+                             ) -> Optional[datetime]:
     """The open-scan cutoff for a month-named event: never later than 00:00
     ET on the first day of the ticker's month (Kalshi's report month for the
     Fiscal.ai KPI class), tightened further by any earlier cutoff already
     resolved (an event_start_overrides release time, a series tightener).
     Day-dated and month-less tickers are returned unchanged — the day rule
-    and the resolver own those. EARLY is the safe direction: a KPI that
-    leaks before its report (auto sales, monthly deliveries, traffic
-    releases) leaks INSIDE the report month, so being out for the whole
-    month costs accrual, never a fill against a public number."""
+    and the resolver own those.
+
+    NARROWED 2026-09-06 pm (Jack, on KXDOL-26SEPCOMP: "narrow the month
+    rule"). The month is a blunt stand-in for "the report might land while
+    we are quoting". When Kalshi PUBLISHES a report date and it falls after
+    the paying program window closes, that stand-in is provably wrong: the
+    number cannot print while the bot is earning, so the whole window is
+    release-free and the month cutoff only forfeits accrual. Measured the
+    same afternoon: the rule was withholding ~$465/day of pool across five
+    September events, two of which (CCL reporting 9/30, DOL 9/12) report
+    after their 9/11 program end. Those keep the report-date cutoff
+    trade_cutoff_utc already derives from the occurrence, plus the
+    program_over screen — the same guard the reviewed company book uses.
+
+    The month still applies, EARLY and deliberately, whenever the release
+    could land inside the paying window: report inside the window, or no
+    published report date at all (CHWY/KR/TTAN). A KPI that leaks before
+    its report (auto sales, monthly deliveries, traffic counts) leaks
+    inside the report month, and an unknown date must fail toward quoting
+    less — the 2026-08-06 CELH asymmetry: standing down early forfeits
+    accrual, standing down late is a fill against a public number."""
     if parse_event_date(event_ticker) is not None:
         return cutoff
     ms = parse_event_month(event_ticker)
     if ms is None:
+        return cutoff
+    if report is not None and program_end is not None and report > program_end:
         return cutoff
     return ms if cutoff is None else min(cutoff, ms)
 
@@ -5646,10 +5685,16 @@ class IncentiveMarketMaker:
             cutoff = apply_series_cutoff_adjustments(series, event_ticker, cutoff,
                                                      close_time=close_time)
             if t in scan_pre_set:
-                # open-scan month-named events (Fiscal.ai KPI class): out
-                # at 00:00 ET on the first of the report month, or earlier
-                # if something above already resolved earlier
-                cutoff = scan_report_month_cutoff(event_ticker, cutoff)
+                # open-scan month-named events (Fiscal.ai KPI class): out at
+                # 00:00 ET on the first of the report month, unless Kalshi's
+                # published report date lands after the paying window (then
+                # the window is release-free — see scan_report_month_cutoff)
+                cutoff = scan_report_month_cutoff(
+                    event_ticker, cutoff,
+                    report=scan_report_date(
+                        parse_iso_utc(m.get("occurrence_datetime", "")),
+                        parse_iso_utc(m.get("expected_expiration_time", ""))),
+                    program_end=info["end"])
             bid = market_cents(m, "yes_bid")
             ask = market_cents(m, "yes_ask")
             try:
