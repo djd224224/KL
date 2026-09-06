@@ -792,7 +792,7 @@ first (`_scan_admission`):
 |---|---|---|
 | STRUCTURE | day-dated event ticker — **or, since 2026-09-06, a month-named one on a Fiscal.ai-settled series** (`KXCCL-26SEPALBD`; see the dated note below: the first of that month becomes the cutoff); numeric-threshold strike (`T286`, `B90`, `4.1400`, or Kalshi `strike_type` greater/less/between) | the midnight-ET rule is the only release guard an unknown series has (KXUE/KXISMPMI had no day and would quote THROUGH their prints); for the KPI class the report MONTH is that guard; a "will X happen" binary's one jump IS the resolution (strategy §1) |
 | FAMILY | **no category ban since 2026-09-06** (the first cut banned `Sports, Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment` wholesale — see the dated note below; `IMM_SCAN_EXCLUDE_CATEGORIES` is empty by default and only a deliberate re-ban names a category); no LIVE settlement source (GET /series, cached 7d: pyth/coinbase/**cfbenchmarks**/espn/nba.com/ercot/weather.gov/**weather.com**/... keywords — a live price index, a live scoreboard, a live weather feed); prefix exclusions are OWNERSHIP and feeds, not categories: other repo bots (KXLOWT, KXRAIN, KXHIGH, KXTEMP, KXAVGT, KXAQI), the crypto fleets' families by asset (KX<ASSET>D / MAX-MINW / MAX-MINMON / MAX-MINY / Y), FX/index/commodity/grid feeds, the 9/2 scan's rejects (KXUE, KXISMPMI, KXSNOWCRABCATCH, KXSOCKEYERUN, KXTECHLAYOFF, ...) | realtime risk is a property of the settlement SOURCE, not the category: a market everyone else can price off a live feed is one we are always last to reprice; two of our bots must never anchor to each other |
-| ACTIVITY | market `volume_24h` <= 60, EVENT MEAN `volume_24h` per market <= 60 (averaged over every bulk-read sibling, pinned strikes included; a SUM against 250 until 2026-09-06), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
+| ACTIVITY | market `volume_24h` <= 80, EVENT MEAN `volume_24h` per market <= 100 (averaged over every bulk-read sibling, pinned strikes included; a SUM against 250, then a mean against 60, both on 2026-09-06), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
 | HISTORY | 72h of hourly candlesticks: >= 12 two-sided bars, mid range <= 10c, no bar-to-bar move >= 6c, traded volume <= 250 (cached 6h) | a book that moved is not a quiet print, whatever its family says |
 
 Read budgets per refresh (the universe is thousands of markets): bulk
@@ -1055,14 +1055,51 @@ Measured effect on the live feed, 9/6, over the post-bulk-cap universe
 events show as "lost" in a volume-only diff but were already past their
 midnight-ET day cutoff, so nothing real was given up.
 
-**Do not expect the mean at 60 to recover the $5.8k above.** Most of that
-withheld pool sits in events whose MEAN is also far over 60
-(KXYTDAILYTOPVIDEOG mean ~743, KXCOCACOLAPOS mean ~396), so mean<=60 is
-about as strict in aggregate as sum<=250 was. It fixes the breadth flaw in
-principle — a wide quiet ladder is now judged on its per-strike activity —
-but the threshold, not the statistic, is what governs how much opens up.
-Raising `IMM_SCAN_MAX_EVENT_AVG_VOLUME_24H` is the lever, and needs no
-code change.
+**The mean at 60 was about as strict in aggregate as sum<=250.** Worth
+understanding, because it is the whole reason the thresholds moved again
+an hour later. `mean <= C` is exactly `sum <= C x n_strikes`, so the mean
+turns a FIXED sum allowance into one that scales with the ladder length.
+At C=60 the crossover is n≈4.2: events with 4 strikes or fewer got
+STRICTER, 5 or more got LOOSER. The 9/6 universe held 85 events at n<=4
+and 65 at n>=5, so the two effects cancelled — 84 events passed the old
+rule, 78 passed the new one. What it did was REALLOCATE, correctly on both
+ends: quiet strikes in a long quiet ladder (KXKSWHEAT, n=7, mean 47) came
+in, quiet strikes sitting beside a busy sibling in a 2-strike event
+(KXTTELITEMATCH, mean 81-125) went out. It could never recover the $5.8k,
+because event means are bimodal too — 57 events under 1, 59 over 120, only
+5 in the 30-60 band — so the cap sits in a near-empty gap, and the big
+withheld pool is BUSY PER STRIKE, not merely wide (KXBAA n=8 mean 7,288;
+KXBWAYATTENDANCE n=8 mean 3,080). The statistic decides fairness across
+ladder lengths; the THRESHOLD decides how much opens up.
+
+**Thresholds and the bulk cap raised, same afternoon** (Jack: "raise to 80
+for the market, and avg 100 for the event" + "raise IMM_SCAN_MAX_BULK to
+1000"). Market 60 -> 80, event mean 60 -> 100, bulk 600 -> 1000. Measured
+on the live feed, activity screens only (the series/history/age/shape
+screens still cut further, so real admissions are a subset):
+
+| config | markets | events | pool/day |
+|---|---|---|---|
+| bulk 600, mkt 60, mean 60 | 211 | 78 | $10,809 |
+| bulk 600, mkt 80, mean 100 | 256 | 87 | $12,192 |
+| bulk 1000, mkt 80, mean 100 | 341 | 98 | $12,951 |
+
++130 markets / +$2.1k per day, roughly half from the thresholds and half
+from retiring the bulk cap (980 candidates that afternoon, so 1000 stops
+binding). Biggest additions: KXTRUMPSAYCOMPANY-26OCT01 (44 strikes),
+KXWALLSTBONUS-27MAR31, KXAGTWINNER-26SEP24 (the wide-quiet-ladder case),
+KXTRUMPACT-26SEP06, KXCTMFPERMITS, KXWYCOAL.
+
+NOTE the tier still admits at most `SCAN_TOP_N` 15 + `SCAN_DAILY_OPENINGS`
+5 per ET day, so a wider candidate pool changes WHICH markets compete on
+ROI far more than how many get quoted. And with the bulk cap retired, more
+unjudged candidates reach the series/candle budgets (30/40 per refresh),
+so the verdict caches take longer to fill and `series_meta_pending` /
+`history_pending` are more common for a while — expected, not a fault.
+
+Of the Fiscal.ai KPI events only KXFA-28JANUSSALES (8 of 11 strikes) now
+clears the activity screens. KXDOL-26SEPCOMP sits at event mean 112 versus
+the 100 cap, just outside; KXCCL 251, KXF 248, KXBAA 7,288.
 
 **`SCAN_MAX_BULK` has the same breadth flaw and bites FIRST.** It ranks
 candidates by per-market `dollars_per_day` and keeps 600, so a wide ladder
@@ -1078,12 +1115,12 @@ event pool) first, or it will measure nothing.
 `EVENT_TOP_N` 3 · `DAILY_OPENINGS` 5 · `LEVELS` unset = global ladder ·
 `MAX_POSITION` unset = global cap · `REF_MULT_CAP` 0 = uncapped ·
 `HOUR_MULT` 1 · `REQUIRE_DATED` 1 · `REQUIRE_NUMERIC` 1 ·
-`MIN_AGE_H` 24 · `MAX_VOLUME_24H` 60 · `MAX_EVENT_AVG_VOLUME_24H` 60
+`MIN_AGE_H` 24 · `MAX_VOLUME_24H` 80 · `MAX_EVENT_AVG_VOLUME_24H` 100
 (MEAN per market on the event since 2026-09-06; the old
 `MAX_EVENT_VOLUME_24H` sum-against-250 knob is GONE, not renamed) ·
 `HISTORY_H` 72 · `MIN_HISTORY_BARS` 12 · `MAX_RANGE` 10 · `MAX_JUMP` 6 ·
 `MAX_HISTORY_VOLUME` 250 · `HISTORY_TTL_H` 6 · `SERIES_META_TTL_D` 7 ·
-`MAX_BULK` 600 · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·
+`MAX_BULK` 1000 · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·
 `MAX_HISTORY_FETCHES` 40 · `FILL_HALT` 0 = off · `MID_JUMP` 0 = off ·
 `DRIFT` 0 = off ·
 `DAILY_LOSS_LIMIT` 75 · `SERIES_STRIKES` 2 · `SERIES_STRIKE_DAYS` 7 ·

@@ -7349,9 +7349,14 @@ class TestOpenScanTier(unittest.TestCase):
         # Jack 2026-09-06: "change event cap to be avg_per_market_on_event,
         # and set that to 60". The old screen was a SUM against 250, which
         # measured BREADTH: a wide quiet ladder failed for being wide.
-        self.assertEqual(imm.SCAN_MAX_EVENT_AVG_VOLUME_24H, 60)
-        self.assertEqual(imm.SCAN_MAX_VOLUME_24H, 60)
+        # thresholds raised 2026-09-06 pm (Jack: "raise to 80 for the
+        # market, and avg 100 for the event"); the STATISTIC is what this
+        # test pins, so it drives the screens off the live constants
+        self.assertEqual(imm.SCAN_MAX_VOLUME_24H, 80)
+        self.assertEqual(imm.SCAN_MAX_EVENT_AVG_VOLUME_24H, 100)
         self.assertFalse(hasattr(imm, "SCAN_MAX_EVENT_VOLUME_24H"))
+        mcap = imm.SCAN_MAX_VOLUME_24H
+        ecap = imm.SCAN_MAX_EVENT_AVG_VOLUME_24H
         now = datetime.now(timezone.utc)
 
         def run(vols):
@@ -7378,29 +7383,37 @@ class TestOpenScanTier(unittest.TestCase):
             mine = {t: v for t, v in verdicts.items() if t.startswith(self.EV)}
             return seen.get(self.EV), mine, bot
 
-        # SIX strikes at 50/day each: sum 300 (the old cap rejected the
-        # event for being WIDE), mean 50 -> every strike admitted. This is
-        # the KXAGTWINNER-26SEP24 class the 9/6 measurement found.
-        mean, verdicts, bot = run([50] * 6)
-        self.assertAlmostEqual(mean, 50.0)
+        # SIX strikes at the market cap each: the sum is 6x the cap, which a
+        # SUM rule rejects for the event being WIDE; the mean equals the
+        # per-strike volume, so every strike is admitted. This is the
+        # KXAGTWINNER-26SEP24 class the 9/6 measurement found.
+        mean, verdicts, bot = run([mcap] * 6)
+        self.assertAlmostEqual(mean, mcap)
+        self.assertLessEqual(mean, ecap)
         self.assertEqual(set(verdicts.values()), {None})
         self.assertEqual(len(bot.state.scan_members), imm.SCAN_EVENT_TOP_N)
 
-        # TWO strikes, 0 and 200: mean 100 -> the quiet one is rejected too,
-        # which is the neighbour-contamination the screen is FOR
-        mean, verdicts, bot = run([0, 200])
-        self.assertAlmostEqual(mean, 100.0)
+        # TWO strikes, one silent and one far over the event cap: the mean
+        # exceeds the cap, so the QUIET one is rejected too — the
+        # neighbour-contamination the screen exists for
+        hot = int(ecap * 2 + 2)
+        mean, verdicts, bot = run([0, hot])
+        self.assertAlmostEqual(mean, hot / 2.0)
+        self.assertGreater(mean, ecap)
         self.assertEqual(verdicts[f"{self.EV}-T0"], "event_avg_volume")
         self.assertEqual(verdicts[f"{self.EV}-T1"], "volume")  # its own cap
         self.assertEqual(bot.state.scan_members, set())
 
         # KNOWN, DELIBERATE LOOSENING (documented at the constant): one hot
-        # strike hides behind quiet siblings — 20 strikes, one at 1000, mean
-        # 50 -> the quiet ones pass the event screen and the hot one still
-        # fails the per-market cap. The old sum and a max() would both have
-        # rejected the whole event. Pinned so nobody "fixes" it by accident.
-        mean, verdicts, bot = run([1000] + [0] * 19)
-        self.assertAlmostEqual(mean, 50.0)
+        # strike hides behind quiet siblings — 20 strikes, one very busy,
+        # mean under the cap -> the quiet ones pass the event screen and the
+        # hot one still fails the per-market cap. The old sum and a max()
+        # would both have rejected the whole event. Pinned so nobody "fixes"
+        # it by accident.
+        buried = int(ecap * 20)          # mean lands exactly on the cap
+        mean, verdicts, bot = run([buried] + [0] * 19)
+        self.assertAlmostEqual(mean, ecap)
+        self.assertGreater(buried, mcap)
         self.assertEqual(verdicts[f"{self.EV}-T0"], "volume")
         self.assertEqual({v for t, v in verdicts.items()
                           if t != f"{self.EV}-T0"}, {None})

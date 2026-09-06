@@ -1740,12 +1740,18 @@ _SCAN_STRIKE_RE = re.compile(r"^[TB]?-?\d[\d,.]*[A-Z]?$")
 # "informed flow on one strike shows up on its siblings" intent. Watch the
 # tier's loss budget for whether that holds.
 SCAN_MIN_AGE_HOURS = _env_float("IMM_SCAN_MIN_AGE_H", 24)
-SCAN_MAX_VOLUME_24H = _env_float("IMM_SCAN_MAX_VOLUME_24H", 60)
+# 60 -> 80 market, 60 -> 100 event mean (Jack 2026-09-06, after the
+# measurement below: "raise to 80 for the market, and avg 100 for the
+# event"). The 9/6 distribution is bimodal — 58% of the universe reads
+# exactly zero and the next percentile band jumps to ~329 — so the exact
+# threshold in the 30-120 range moves few markets; these widen the band
+# without reaching the genuinely active books (event means 1,000-7,000).
+SCAN_MAX_VOLUME_24H = _env_float("IMM_SCAN_MAX_VOLUME_24H", 80)
 # Deliberately a NEW env name: IMM_SCAN_MAX_EVENT_VOLUME_24H meant a sum
 # against 250, so an old value carried over would be nonsense against a
 # per-market mean. Nothing in the launcher set either (checked 9/6).
 SCAN_MAX_EVENT_AVG_VOLUME_24H = _env_float(
-    "IMM_SCAN_MAX_EVENT_AVG_VOLUME_24H", 60)
+    "IMM_SCAN_MAX_EVENT_AVG_VOLUME_24H", 100)
 # History screen (hourly candlesticks). 12 two-sided bars = half a day of
 # quotes to judge from; a 10c range or a 6c bar-to-bar move inside 72h is a
 # market with information in it; 250 traded contracts over 72h likewise.
@@ -1760,7 +1766,21 @@ SCAN_SERIES_META_TTL_SECS = _env_float("IMM_SCAN_SERIES_META_TTL_D", 7) * 86400.
 # bulk reads, series reads, candle reads and book reads are all bounded;
 # verdicts are cached (and persisted) so the steady state is a handful of
 # reads per refresh as programs roll.
-SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 600)
+#
+# BULK 600 -> 1000 (Jack 2026-09-06). This was the tier's real gate, one
+# layer above every screen below it: candidates are ranked by PER-MARKET
+# dollars_per_day and truncated here, which punishes a long ladder for
+# being long — a 14-strike event worth $192/day ranks below a 2-strike
+# event worth $30/day because the ranking never sees the event pool. The
+# 9/6 Fiscal.ai KPI events (CCL/DOL/F, $13.66-13.74 per strike) all landed
+# at ranks 644-708 against a rank-600 cutoff of $14.29 and never reached a
+# single admission screen. The candidate list was ~984 that afternoon, so
+# 1000 effectively retires the cap for now while still bounding a runaway
+# feed. Cost is one bulk market read per 50 tickers: 12 -> 20 calls per
+# universe refresh (600s), which the 25ms throttle absorbs. The screens
+# that actually cost reads (series, candles, estimator books) have their
+# own budgets below and are unchanged.
+SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 1000)
 SCAN_MAX_BOOKS = _env_int("IMM_SCAN_MAX_BOOKS", 120)
 SCAN_MAX_SERIES_FETCHES = _env_int("IMM_SCAN_MAX_SERIES_FETCHES", 30)
 SCAN_MAX_HISTORY_FETCHES = _env_int("IMM_SCAN_MAX_HISTORY_FETCHES", 40)
