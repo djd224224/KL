@@ -2448,6 +2448,76 @@ try:
     _SOURCE_MTIME = os.path.getmtime(_SOURCE_PATH)
 except OSError:
     _SOURCE_MTIME = 0.0
+
+# ---------------------------------------------------------------------------
+# Configuration identity for analysis.
+#
+# Every parameter study this bot's history invites — "did LADDER_MODE=atref
+# help", "was the mention x1.5 worth it", "did the 3-7am 2.0x multiplier pay"
+# — is currently manual archaeology across ~20 restarts a day, because no data
+# row carries any record of WHICH configuration produced it. MODEL_VERSION has
+# been the frozen string "incentive_mm_v1.2" through months of change, and
+# RUN_ID is printed once at startup and attached to nothing.
+#
+# CONFIG_HASH fixes that: it is a stable 8-hex digest of the effective config
+# (every IMM_*/KALSHI_* env var plus the module knobs that are set in code),
+# stamped onto every analytics row below. After this, a before/after study is
+# `GROUP BY config_hash` instead of a git-log excavation.
+#
+# Computed lazily at startup rather than at import so that module constants
+# defined further down this file are all present when it runs.
+CONFIG: Dict[str, str] = {}
+CONFIG_HASH = "unset"
+
+# Module knobs that are NOT env-driven, so they never appear in os.environ but
+# do change behaviour. Captured by name; missing names are skipped silently so
+# a rename can never crash startup.
+_CONFIG_CODE_KNOBS = (
+    "MODEL_VERSION", "LADDER_MODE", "LEVELS", "FAST_LANE_SECS", "POLL_SECS",
+    "ORDER_TTL_SECS", "PAD_BID_CENTS", "PAD_ASK_CENTS", "PAD_MIN_TICKS_BEHIND",
+    "QUALIFY_PATIENCE_CYCLES", "BENCH_COOLDOWN_SECS", "MAX_MARKETS",
+    "MAX_POSITION_CONTRACTS", "MAX_EVENT_CONTRACTS", "MAX_TOTAL_RESTING",
+    "COLLATERAL_BUDGET", "DAILY_LOSS_LIMIT", "RATE_FLOOR_TOTAL_ALT",
+    "PAYOUT_FLOOR", "PRICE_BAND_LO", "PRICE_BAND_HI", "STP_TYPE",
+    "EVENT_LEVEL_STANDOFF", "SCAN_TOP_N", "SCAN_DAILY_OPENINGS",
+    "SCAN_DAILY_LOSS_LIMIT", "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
+    "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
+    "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
+)
+
+
+def _git_sha() -> str:
+    """Short HEAD sha, best-effort. Never raises, never blocks startup."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", os.path.dirname(_SOURCE_PATH) or ".",
+             "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+        return (out.stdout or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _build_config() -> Tuple[Dict[str, str], str]:
+    """Snapshot the effective configuration and digest it.
+
+    Secrets are excluded by name, not by value: this dict is written to disk
+    in full, and KALSHI_* legitimately holds key material."""
+    import hashlib
+    secret = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PRIVATE")
+    cfg: Dict[str, str] = {}
+    for k, v in os.environ.items():
+        if not (k.startswith("IMM_") or k.startswith("KALSHI_")):
+            continue
+        cfg[k] = "<redacted>" if any(s in k.upper() for s in secret) else str(v)
+    g = globals()
+    for name in _CONFIG_CODE_KNOBS:
+        if name in g:
+            cfg[f"code:{name}"] = str(g[name])
+    digest = hashlib.sha1(
+        json.dumps(cfg, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    return cfg, digest
 _HOURLY_TEMP_RE = re.compile(r"^KXTEMP[A-Z]+H-")
 
 
@@ -4204,6 +4274,18 @@ class IncentiveMarketMaker:
         self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
         self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
         self._heartbeat = time.time()      # hang-watchdog liveness marker
+        # ---- analytics sink state (see _sink) ----
+        self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
+        # Book/reward panel from the last cycle, per ticker. The fills sink
+        # reads it to answer "what did the book look like when this filled?"
+        # without a second API call — a fill arrives one cycle AFTER the book
+        # read that produced the order it hit, so the cached panel is the
+        # right context, not a fresh read.
+        self._last_panel: Dict[str, dict] = {}
+        self._realized_by_ticker: Dict[str, float] = {}   # per-market delta base
+        self._selection_prev: Dict[str, str] = {}   # ticker -> last decision
+        self._selection_snap_at = 0.0              # hourly full-candidate dump
+        self._inventory_snap_day = ""              # daily open-book snapshot
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -4215,6 +4297,119 @@ class IncentiveMarketMaker:
     PERSIST_PATH = os.path.join(STATUS_DIR, "imm_state.json")
 
     ORDER_JOURNAL_PATH = os.path.join(STATUS_DIR, "imm_order_journal.jsonl")
+
+    # ------------------------------------------------------------------
+    # Structured analytics sinks
+    #
+    # These write ANALYSIS data only. Three rules hold for every one of
+    # them, and they are why this is safe to run on a live book:
+    #   1. No sink may change a trading decision.
+    #   2. No sink may raise — a failed write is swallowed.
+    #   3. No sink may flood the log — a broken sink mutes itself.
+    #
+    # Each is one append-only JSONL file per UTC day under STATUS_DIR, so a
+    # day of any stream is a single `bq load` (or pandas
+    # read_json(lines=True)) away, and every row carries run_id +
+    # config_hash so results can be grouped by the configuration that
+    # produced them.
+    #
+    # IMM_ANALYTICS=0 disables all of them at once.
+    # ------------------------------------------------------------------
+    ANALYTICS_ON = os.environ.get("IMM_ANALYTICS", "1") == "1"
+
+    def _sink(self, name: str, rec: dict) -> None:
+        """Append one JSON object to STATUS_DIR/<name>_YYYY-MM-DD.jsonl.
+
+        A sink that fails (full disk, permissions, a serialisation bug in a
+        new field) is muted for the rest of the run after one line: on a
+        live book a per-cycle failure would otherwise turn into thousands
+        of identical log lines and bury the trading messages that matter."""
+        if not self.ANALYTICS_ON:
+            return
+        try:
+            rec.setdefault("run_id", RUN_ID)
+            rec.setdefault("config_hash", CONFIG_HASH)
+            path = os.path.join(
+                STATUS_DIR,
+                f"{name}_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
+        except Exception as e:
+            if name not in self._sink_muted:
+                self._sink_muted.add(name)
+                log(f"{self.tag} ! analytics sink '{name}' failed ({e}); "
+                    f"muted for the rest of this run")
+
+    def _log_fill(self, f: dict, tkr: str, side: str, action: str,
+                  count: float, px_cents: float, now_ts: float,
+                  pos_before: float, avg_before: float) -> None:
+        """One row per fill — the single most important thing this bot was
+        not recording.
+
+        Three joins are taken here that are impossible to reconstruct later:
+
+        `ledger`  the order this fill hit is still in self.state.ledger at
+                  this moment, carrying the price WE quoted, the rung's
+                  remaining size, whether it was a 1c/99c pad, and when it
+                  was placed. One dict lookup away, and previously dropped.
+                  Past 7 days our_order_ids prunes and even OWNERSHIP of a
+                  historical fill becomes unprovable on a shared account.
+
+        `panel`   the book/reward state from the last cycle read — ext bid/ask,
+                  depth, target, est_frac, pool. This is what makes
+                  adverse-selection analysis possible: fill price against the
+                  book it filled into.
+
+        `pos_*`   inventory before and after, so a fill can be classified as
+                  opening, adding or reducing without replaying the tape."""
+        try:
+            led = self.state.ledger.get(f.get("order_id") or "") or {}
+            panel = self._last_panel.get(tkr) or {}
+            our_px = led.get("yes_price")
+            self._sink("fills", {
+                "ts": self._fill_ts(f),
+                "cycle_ts": now_ts,
+                "fill_id": f.get("trade_id") or f.get("fill_id"),
+                "order_id": f.get("order_id"),
+                "ticker": tkr,
+                "series": series_of(tkr),
+                "event_ticker": self._event_of(tkr),
+                "side": side,
+                "action": action,
+                "count": count,
+                "yes_price_cents": px_cents,
+                "is_taker": f.get("is_taker"),
+                # --- the order we had resting (ledger join) ---
+                "our_book_side": led.get("book_side"),
+                "our_price_cents": our_px,
+                "our_remaining_before": led.get("remaining_count"),
+                "client_order_id": led.get("client_order_id"),
+                "order_age_secs": (round(now_ts - led["_placed_at"], 1)
+                                   if led.get("_placed_at") else None),
+                "is_pad": (self._is_pad_price(led["book_side"], our_px)
+                           if led.get("book_side") and our_px is not None
+                           else None),
+                # --- inventory context ---
+                "pos_before": pos_before,
+                "avg_before": avg_before,
+                "pos_after": self.pnl.pos.get(tkr, 0.0),
+                "avg_after": self.pnl.avg.get(tkr, 0.0),
+                # --- book context at the last read (adverse selection) ---
+                "ext_bid": panel.get("ext_bid"),
+                "ext_ask": panel.get("ext_ask"),
+                "yes_depth": panel.get("yes_depth"),
+                "no_depth": panel.get("no_depth"),
+                "target": panel.get("target"),
+                "est_frac": panel.get("est_frac"),
+                "qual_sides": panel.get("qual_sides"),
+                "pool_per_day": panel.get("pool_per_day"),
+                "panel_ts": panel.get("ts"),
+                "is_scan": panel.get("is_scan"),
+            })
+        except Exception as e:
+            if "fills" not in self._sink_muted:
+                self._sink_muted.add("fills")
+                log(f"{self.tag} ! fill sink failed ({e}); muted for this run")
 
     def _journal_order_id(self, oid: str, ts: float) -> None:
         """Append-only crash journal for order ownership: one line per placed
@@ -4414,6 +4609,32 @@ class IncentiveMarketMaker:
         if abs(delta) > 1e-9:
             self.state.realized_lifetime += delta
             self.state.realized_seen = total
+        # Per-MARKET realized, appended as deltas. self.pnl.realized is the
+        # right object and has always existed, but it is collapsed into one
+        # lifetime scalar here and dies with the process ~20 times a day, so
+        # "which markets earn credits but lose money on the position" has
+        # never had a per-market answer on our own book. Append-only deltas
+        # mean pruning the live dict stays safe.
+        try:
+            for tkr, val in self.pnl.realized.items():
+                prev = self._realized_by_ticker.get(tkr, 0.0)
+                d = val - prev
+                if abs(d) <= 1e-9:
+                    continue
+                self._realized_by_ticker[tkr] = val
+                self._sink("realized", {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ticker": tkr, "series": series_of(tkr),
+                    "event_ticker": self._event_of(tkr),
+                    "realized_delta_dollars": round(d, 6),
+                    "realized_total_dollars": round(val, 6),
+                    "pos_after": self.pnl.pos.get(tkr, 0.0),
+                    "avg_after": self.pnl.avg.get(tkr, 0.0),
+                })
+        except Exception as e:
+            if "realized" not in self._sink_muted:
+                self._sink_muted.add("realized")
+                log(f"{self.tag} ! realized sink failed ({e}); muted this run")
 
     def _save_persist(self) -> None:
         try:
@@ -5936,14 +6157,44 @@ class IncentiveMarketMaker:
             log(f"{self.tag} ! settle check failed for {t} ({e}); retry next cycle")
             return
         result = str(m.get("result") or "").lower()
+        # Captured before the pops below: this is the entry price the
+        # settlement is scored against, and the else-branch destroys it.
+        own_avg = self.pnl.avg.get(t, 0.0)
         if result in ("yes", "no"):
             px = 100.0 if result == "yes" else 0.0
             self.pnl.on_fill(t, "yes", "sell" if own > 0 else "buy", abs(own), px)
             log(f"{self.tag} {t}: settled {result.upper()}; booked {own:+.0f} @ {px:.0f}c "
                 f"(market realized ${self.pnl.realized.get(t, 0.0):+.2f})")
+            # Nearly all of this bot's trading P&L lands here — it is a maker
+            # that almost never closes a position, so settlement IS the exit.
+            # The prose line above was the only record; the manual stitch
+            # snapshots are event-level, whole-account and run-when-remembered
+            # against an API that now serves ~66 days.
+            self._sink("settlements", {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "ticker": t, "series": series_of(t),
+                "event_ticker": self._event_of(t),
+                "result": result,
+                "settle_price_cents": px,
+                "own_pos_at_settle": own,
+                "own_avg_cents": own_avg,
+                "market_realized_dollars": self.pnl.realized.get(t, 0.0),
+            })
         else:
             log(f"{self.tag} {t}: own book {own:+.0f} but account flat and market "
                 f"unsettled — manually offset; dropping stale entry")
+            # Logged with a distinct result so a manual takeout can never be
+            # counted as a settlement in any downstream P&L sum.
+            self._sink("settlements", {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "ticker": t, "series": series_of(t),
+                "event_ticker": self._event_of(t),
+                "result": "manual_offset",
+                "settle_price_cents": None,
+                "own_pos_at_settle": own,
+                "own_avg_cents": own_avg,
+                "market_realized_dollars": self.pnl.realized.get(t, 0.0),
+            })
             self.pnl.pos.pop(t, None)
             self.pnl.avg.pop(t, None)
         self.state.last_mark.pop(t, None)
@@ -6263,8 +6514,16 @@ class IncentiveMarketMaker:
                 px = f.get("yes_price_dollars")
                 px_cents = float(px) * 100 if px is not None else float(f.get("yes_price") or 0)
                 if side in ("yes", "no") and action in ("buy", "sell") and count > 0:
-                    self.pnl.on_fill(f.get("ticker", "?"), side, action, count, px_cents)
+                    tkr = f.get("ticker", "?")
+                    # Read position BEFORE booking; log AFTER. Ordering is
+                    # deliberate: the fill must be booked into P&L even if
+                    # anything about the analytics row is broken.
+                    pos_before = self.pnl.pos.get(tkr, 0.0)
+                    avg_before = self.pnl.avg.get(tkr, 0.0)
+                    self.pnl.on_fill(tkr, side, action, count, px_cents)
                     self.state.fills_today += count
+                    self._log_fill(f, tkr, side, action, count, px_cents,
+                                   now_ts, pos_before, avg_before)
             except Exception as e:
                 log(f"{self.tag} ! unparseable fill skipped: {e}")
 
@@ -7578,7 +7837,25 @@ class IncentiveMarketMaker:
 
     def run(self, once: bool = False) -> None:
         mode = "LIVE" if self.live else "DRY RUN (no orders placed; --live to trade)"
-        log(f"=== {MODEL_VERSION} run={RUN_ID} mode={mode} ===")
+        # Configuration identity, before anything else is logged: every
+        # analytics row this run emits carries CONFIG_HASH, and this file is
+        # what turns that hash back into the settings it stands for.
+        global CONFIG, CONFIG_HASH
+        try:
+            CONFIG, CONFIG_HASH = _build_config()
+            self._sink("config_history", {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "model_version": MODEL_VERSION,
+                "git_sha": _git_sha(),
+                "mode": mode,
+                "source_mtime": _SOURCE_MTIME,
+                "config": CONFIG,
+            })
+        except Exception as e:      # config identity must never block startup
+            log(f"! config snapshot failed ({e}); analytics rows will carry "
+                f"config_hash={CONFIG_HASH}")
+        log(f"=== {MODEL_VERSION} run={RUN_ID} mode={mode} "
+            f"config={CONFIG_HASH} ===")
         if not once:
             def _hang_watchdog():
                 while True:
