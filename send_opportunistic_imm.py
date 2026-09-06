@@ -12,7 +12,9 @@ quote-to-completion membership and daily over-cap openings:
             program market, machine-screened for adverse selection
             (incentive_mm SCAN_*; membership persisted as scan_members)
 This email is that book's own scorecard, separate from the whole-account
-digest. Every row carries its TIER.
+digest: a combined headline, then ONE TABLE PER TIER in the same format
+(Jack 2026-09-06: "a similarly formatted table for non-finecon
+opportunistic bot"), each with its own slot/openings line and TOTAL row.
 
 One row per currently-quoted opportunistic EVENT:
   EARN EST   the bot's period-to-date accrued reward estimate (what we
@@ -103,6 +105,56 @@ def event_label(client, event_ticker: str) -> str:
     return _title_cache[event_ticker]
 
 
+def tier_totals(rows) -> dict:
+    earn = sum(r["earn"] for r in rows)
+    pnl = sum(r["pnl"] for r in rows)
+    return {"mkts": sum(r["mkts"] for r in rows), "earn": earn, "pnl": pnl,
+            "net": earn + pnl}
+
+
+def text_table(rows) -> list:
+    """Plain-text event table + TOTAL row. One call per tier, so the two
+    tiers' tables are identical in format by construction."""
+    t = tier_totals(rows)
+    L = [f"{'EVENT':<26}{'WHAT IT IS':<34}{'MKTS':>5}{'EARN EST$':>11}"
+         f"{'P&L$':>10}{'NET$':>10}"]
+    for r in rows:
+        L.append(f"{_short_event(r['event'])[:25]:<26}{r['label'][:33]:<34}"
+                 f"{r['mkts']:>5}{r['earn']:>11.2f}{r['pnl']:>+10.2f}"
+                 f"{r['net']:>+10.2f}")
+    L.append(f"{'TOTAL':<26}{'':<34}{t['mkts']:>5}{t['earn']:>11.2f}"
+             f"{t['pnl']:>+10.2f}{t['net']:>+10.2f}")
+    return L
+
+
+def html_table(rows) -> str:
+    """HTML twin of text_table (same columns, same TOTAL row)."""
+    t = tier_totals(rows)
+    h = ['<table style="border-collapse:collapse;margin:6px 0">']
+    h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
+             f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
+             f'<td style="{TD}">MKTS</td><td style="{TD}">EARN EST$</td>'
+             f'<td style="{TD}">P&amp;L$</td><td style="{TD}">NET$</td></tr>')
+    for i, r in enumerate(rows):
+        bg = "#fafafa" if i % 2 else "#fff"
+        h.append(f'<tr style="background:{bg}">'
+                 f'<td style="{TDL}"><b>{_short_event(r["event"])}</b></td>'
+                 f'<td style="{TDL}">{r["label"]}</td>'
+                 f'<td style="{TD}">{r["mkts"]}</td>'
+                 f'<td style="{TD}">{r["earn"]:,.2f}</td>'
+                 f'<td style="{TD}">{_pnl_span(r["pnl"])}</td>'
+                 f'<td style="{TD};font-weight:700">{_pnl_span(r["net"])}</td>'
+                 f'</tr>')
+    h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
+             f'<td style="{TDL}">TOTAL</td><td style="{TDL}"></td>'
+             f'<td style="{TD}">{t["mkts"]}</td>'
+             f'<td style="{TD}">{t["earn"]:,.2f}</td>'
+             f'<td style="{TD}">{_pnl_span(t["pnl"])}</td>'
+             f'<td style="{TD}">{_pnl_span(t["net"])}</td></tr>')
+    h.append('</table>')
+    return "".join(h)
+
+
 def build_report(now_utc):
     """(text, html, subject)."""
     client = sd.build_client()
@@ -177,11 +229,12 @@ def build_report(now_utc):
             "mkts": len(tickers), "earn": earn, "pnl": pnl,
             "net": pnl + earn, "pos": netpos})
     rows.sort(key=lambda r: -r["net"])
+    fin_rows = [r for r in rows if r["tier"] == "finecon"]
+    scan_rows = [r for r in rows if r["tier"] == "scan"]
 
-    tot_earn = sum(r["earn"] for r in rows)
-    tot_pnl = sum(r["pnl"] for r in rows)
-    tot_net = tot_earn + tot_pnl
-    tot_mkts = sum(r["mkts"] for r in rows)
+    tot = tier_totals(rows)
+    tot_earn, tot_pnl, tot_net, tot_mkts = (tot["earn"], tot["pnl"],
+                                            tot["net"], tot["mkts"])
 
     # Actual Kalshi money on opportunistic events (footer reconciliation).
     ledger, _calib = load_credit_ledger()
@@ -198,36 +251,38 @@ def build_report(now_utc):
                  if state.get("scan_admit_day") == today_et.isoformat() else 0)
     scan_halted = state.get("scan_halt_day") == today_et.isoformat()
     scan_evicted = len(state.get("scan_evicted_events") or {})
-    scan_line = (f"open scan {len(scan_sel)}/{scan_top_n} slots "
-                 f"(+{scan_used}/{scan_openings_cap} openings used"
-                 + (", HALTED today" if scan_halted else "")
-                 + (f", {scan_evicted} event(s) evicted" if scan_evicted else "")
-                 + ")")
+    # One section per tier, same table format (Jack 2026-09-06).
+    tiers = [
+        ("FINECON", "curated Finance/Economics quiet prints",
+         f"{len(fin_members)}/{top_n} slots, +{used}/{openings_cap} daily "
+         f"openings used", fin_rows),
+        ("OPEN SCAN", "all other markets, machine-screened for adverse "
+         "selection",
+         f"{len(scan_sel)}/{scan_top_n} slots, +{scan_used}/"
+         f"{scan_openings_cap} daily openings used"
+         + (", HALTED today (loss budget)" if scan_halted else "")
+         + (f", {scan_evicted} event(s) evicted" if scan_evicted else ""),
+         scan_rows),
+    ]
 
     subject = (f"Opportunistic IMM {today_et} — est ${tot_earn:,.0f}/period, "
                f"net ${tot_net:+,.0f}")
 
     # ---- plain text ---------------------------------------------------------
     L = [f"Opportunistic IMM — {today_et}", ""]
-    L.append(f"{len(rows)} events quoted / {tot_mkts} markets.")
-    L.append(f"Finecon {len(fin_members)}/{top_n} slots (+{used}/{openings_cap} "
-             f"daily openings used)  |  {scan_line}.")
+    L.append(f"{len(rows)} events quoted / {tot_mkts} markets across both "
+             f"tiers.")
     L.append(f"Est reward this period ${tot_earn:,.2f}  |  trading P&L "
              f"${tot_pnl:+,.2f}  |  net ${tot_net:+,.2f}.")
     L.append("")
-    if rows:
-        L.append(f"{'EVENT':<26}{'TIER':<8}{'WHAT IT IS':<34}{'MKTS':>5}"
-                 f"{'EARN EST$':>11}{'P&L$':>10}{'NET$':>10}")
-        for r in rows:
-            L.append(f"{_short_event(r['event'])[:25]:<26}{r['tier']:<8}"
-                     f"{r['label'][:33]:<34}"
-                     f"{r['mkts']:>5}{r['earn']:>11.2f}{r['pnl']:>+10.2f}"
-                     f"{r['net']:>+10.2f}")
-        L.append(f"{'TOTAL':<26}{'':<8}{'':<34}{tot_mkts:>5}{tot_earn:>11.2f}"
-                 f"{tot_pnl:>+10.2f}{tot_net:>+10.2f}")
-    else:
-        L.append("No opportunistic events quoted right now.")
-    L.append("")
+    for name, desc, slots, trows in tiers:
+        L.append(f"{name} — {desc}")
+        L.append(f"{slots}.")
+        if trows:
+            L.extend(text_table(trows))
+        else:
+            L.append(f"No {name.lower()} events quoted right now.")
+        L.append("")
     L.append(f"Kalshi-credited on opportunistic events to date: "
              f"${cred_life:,.2f} (actual money; lands 1-2d after each period "
              f"ends).")
@@ -249,41 +304,21 @@ def build_report(now_utc):
              f'<span style="font-size:13px;font-weight:400;color:#999">'
              f' &nbsp;= trading {tot_pnl:+,.2f} + est reward {tot_earn:,.2f}'
              f'</span></div>')
-    h.append(f'<div style="color:#555;margin-bottom:10px">'
+    h.append(f'<div style="color:#555;margin-bottom:6px">'
              f'<b>{len(rows)}</b> events quoted &nbsp;·&nbsp; '
-             f'<b>{tot_mkts}</b> markets &nbsp;·&nbsp; '
-             f'finecon {len(fin_members)}/{top_n} slots '
-             f'(+{used}/{openings_cap} openings) &nbsp;·&nbsp; '
-             f'{scan_line}</div>')
-    if rows:
-        h.append('<table style="border-collapse:collapse;margin:6px 0">')
-        h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
-                 f'<td style="{TDL}">EVENT</td><td style="{TDL}">TIER</td>'
-                 f'<td style="{TDL}">WHAT IT IS</td>'
-                 f'<td style="{TD}">MKTS</td><td style="{TD}">EARN EST$</td>'
-                 f'<td style="{TD}">P&amp;L$</td><td style="{TD}">NET$</td></tr>')
-        for i, r in enumerate(rows):
-            bg = "#fafafa" if i % 2 else "#fff"
-            h.append(f'<tr style="background:{bg}">'
-                     f'<td style="{TDL}"><b>{_short_event(r["event"])}</b></td>'
-                     f'<td style="{TDL}">{r["tier"]}</td>'
-                     f'<td style="{TDL}">{r["label"]}</td>'
-                     f'<td style="{TD}">{r["mkts"]}</td>'
-                     f'<td style="{TD}">{r["earn"]:,.2f}</td>'
-                     f'<td style="{TD}">{_pnl_span(r["pnl"])}</td>'
-                     f'<td style="{TD};font-weight:700">{_pnl_span(r["net"])}</td>'
-                     f'</tr>')
-        h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
-                 f'<td style="{TDL}">TOTAL</td><td style="{TDL}"></td>'
-                 f'<td style="{TDL}"></td>'
-                 f'<td style="{TD}">{tot_mkts}</td>'
-                 f'<td style="{TD}">{tot_earn:,.2f}</td>'
-                 f'<td style="{TD}">{_pnl_span(tot_pnl)}</td>'
-                 f'<td style="{TD}">{_pnl_span(tot_net)}</td></tr>')
-        h.append('</table>')
-    else:
-        h.append('<div>No opportunistic events quoted right now.</div>')
-    h.append(f'<div style="color:#555;font-size:13px;margin-top:8px">'
+             f'<b>{tot_mkts}</b> markets across both tiers</div>')
+    for name, desc, slots, trows in tiers:
+        h.append(f'<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
+                 f'{name} <span style="color:#888;font-weight:400">&mdash; '
+                 f'{desc}</span></div>')
+        h.append(f'<div style="color:#555;font-size:13px;margin-bottom:4px">'
+                 f'{slots}</div>')
+        if trows:
+            h.append(html_table(trows))
+        else:
+            h.append(f'<div style="color:#666;font-size:13px">No '
+                     f'{name.lower()} events quoted right now.</div>')
+    h.append(f'<div style="color:#555;font-size:13px;margin-top:12px">'
              f'Kalshi-credited on opportunistic events to date: '
              f'<b>${cred_life:,.2f}</b> <span style="color:#999">(actual '
              f'money; lands 1&ndash;2d after each period ends)</span></div>')

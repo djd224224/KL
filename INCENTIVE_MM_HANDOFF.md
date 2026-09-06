@@ -870,9 +870,11 @@ Widening levers, in order of how much risk they add: `EXCLUDE_CATEGORIES`
   `scan_entry_mid`, `scan_evicted_events`, `scan_series_strikes`,
   `scan_history_cache`, `scan_series_meta`, `scan_halt_day`,
   `scan_admit_day/scan_admits_today`, `scan_pnl_carry`.
-- Opportunistic email (`send_opportunistic_imm.py`): both tiers, a TIER
-  column per event row, per-tier slot/openings counts in the header (with
-  HALTED / evicted flags), Kalshi-credited footer covers scan events too.
+- Opportunistic email (`send_opportunistic_imm.py`): a combined headline,
+  then one table per tier in the same format — FINECON and OPEN SCAN —
+  each with its own slot/openings line (HALTED / evicted flags on the scan
+  one) and TOTAL row (Jack 2026-09-06: "a similarly formatted table for
+  non-finecon opportunistic bot"); Kalshi-credited footer covers both.
 - Digest FINECON SWEEP section gained an OPEN SCAN block (members, accrual,
   openings, evictions, halt flag).
 - Quote-gaps email: markets in the scan universe are labelled
