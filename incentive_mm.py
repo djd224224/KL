@@ -1019,17 +1019,38 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 # markets, quote only the 3 highest ROI markets in each event. because they
 # are all correlated so i dont want to quote them all"). Every strike of a
 # gas event settles on the SAME AAA print — quoting the whole in-band ladder
-# stacks correlated inventory for near-duplicate reward. This carves the ONE
-# deliberate exception out of two standing rules, for the configured
-# prefixes only: the 2026-07-13 "no per-event market cap" (budget was the
-# sole intra-event governor) and sticky never-evict (a member cut here IS
-# deselected — quotes cancelled, banked accrual keeps whatever cleared the
-# $1 floor — because the instruction is about standing correlated exposure,
-# not future admissions). ROI = est $/day per $ at risk, the quote-gaps
-# email's metric (fill-weighted est_exposure_dollars, falling back to plain
-# est_collateral_dollars; unpriceable books rank 0). Incumbents get the
-# same 1.15x the yield rank uses so estimator jitter doesn't reshuffle the
-# kept set every refresh. Format "PREFIX:N,...", longest prefix wins,
+# stacks correlated inventory for near-duplicate reward. This carves a
+# deliberate exception out of the 2026-07-13 "no per-event market cap"
+# (budget was the sole intra-event governor) for the configured prefixes
+# only. ROI = est $/day per $ at risk, the quote-gaps email's metric
+# (fill-weighted est_exposure_dollars, falling back to plain
+# est_collateral_dollars; unpriceable books rank 0).
+#
+# ADMISSION-ONLY as of 2026-09-06 (Jack: "the quoted markets are moving
+# around, it should be constant"). The first cut re-ranked every refresh
+# with only the yield rank's 1.15x incumbent bonus, and that lost to a
+# STRUCTURAL bias in the estimator: _estimate_candidate_yield scores a
+# market the bot is quoting on its ACTUAL resting orders (own_in_book=True
+# — often one rung, one side, priced a cycle ago) but scores an idle one on
+# a HYPOTHETICAL full two-sided ladder at the current reference prices with
+# the deep-reference multiplier and pads. Measured over 2026-09-06's 36
+# refreshes: the same gas strike read 2.54x higher on the cycles it was
+# idle (median paired ratio, n=90; 93% of strikes cleared 1.15x). The cut
+# therefore swapped the strike we were resting on for the sibling we were
+# not, ~1 slot per event PER REFRESH — 554 evictions and 542 re-admissions
+# across 12 gas events in one session — and every eviction that left
+# inventory behind became a reduce-only managed_extra leg, which is why
+# five events showed FOUR gas markets with resting orders under a cap of 3.
+# So members hold their slots (EVENT_TOP_N_STICKY): the cut admits into
+# free slots and never re-ranks a quoting member against a challenger. The
+# comparison that picks the initial N is apples-to-apples anyway — nothing
+# is quoting yet, so every candidate is scored on the hypothetical ladder.
+# Slots come back through the normal member deaths (cutoff, program over,
+# the 1h hopeless exit), and the cap stays a HARD bound: if members alone
+# ever exceed N — an N lowered by config, a restart restoring a wider set —
+# the worst-ROI members are still trimmed to N. IMM_EVENT_TOP_N_STICKY=0
+# restores the original evictable semantics.
+# Format "PREFIX:N,...", longest prefix wins,
 # N<=0 = uncapped. KXAAAGAS covers national + state dailies + W/M.
 # KXDIESEL added 2026-09-02 (Jack "do the same with diesel"): covers
 # KXDIESELD + KXDIESELW — same one-print-per-event correlation structure.
@@ -1047,6 +1068,9 @@ def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
 
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "KXAAAGAS:3,KXDIESEL:3"))
+# Members hold their slots against challengers (see the note above). 0 =
+# the original evictable semantics: re-rank the whole event every refresh.
+EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
 
 
 def event_top_n_for(series: str) -> int:
@@ -1067,15 +1091,22 @@ def _market_roi(m: "MarketMeta", incumbent: Set[str]) -> float:
 
 
 def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
-                    immune: Set[str] = frozenset()) -> Set[str]:
+                    immune: Set[str] = frozenset(),
+                    members: Set[str] = frozenset()) -> Set[str]:
     """Tickers to EXCLUDE under the per-event top-N: for each capped event,
-    everything past the N highest-ROI markets of that event. `immune`
-    tickers (finecon quote-to-completion members, Jack 2026-09-03: "once
-    start quoting, should quote to completion. dont unquote them") are
-    never cut and still consume the event's N, so they block admissions
-    rather than being out-ranked — relevant to KXAAAGASMINM/MAXM, which
-    this prefix cap catches alongside the finecon group walk. The gas/
-    diesel families themselves keep the original evictable semantics."""
+    everything past the N highest-ROI markets of that event.
+
+    Two grades of tenure, both consuming the event's N before any newcomer:
+    `immune` tickers (finecon/open-scan quote-to-completion members, Jack
+    2026-09-03: "once start quoting, should quote to completion. dont
+    unquote them") are never cut at all — relevant to KXAAAGASMINM/MAXM,
+    which this prefix cap catches alongside the finecon group walk.
+    `members` are the capped families' OWN quoting markets (gas, diesel):
+    they hold their slots against challengers so the kept set stops
+    churning (see the note above EVENT_TOP_N), but unlike `immune` they are
+    still trimmed worst-ROI-first if members alone exceed N — a lowered N
+    or a restart restoring a wider set must not leave the cap breached.
+    Everything else competes by ROI for whatever slots remain."""
     by_event: Dict[str, List["MarketMeta"]] = {}
     for _m in metas:
         if event_top_n_for(_m.series) > 0:
@@ -1085,8 +1116,16 @@ def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
         n = event_top_n_for(group[0].series)
         if n <= 0 or len(group) <= n:
             continue
-        rest = [m for m in group if m.ticker not in immune]
-        slots = max(0, n - (len(group) - len(rest)))
+        held = sum(1 for m in group if m.ticker in immune)
+        mem = [m for m in group
+               if m.ticker not in immune and m.ticker in members]
+        rest = [m for m in group
+                if m.ticker not in immune and m.ticker not in members]
+        slots = max(0, n - held)
+        if len(mem) > slots:
+            mem.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
+            cut.update(m.ticker for m in mem[slots:])
+        slots = max(0, slots - len(mem))
         rest.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
         cut.update(m.ticker for m in rest[slots:])
     return cut
@@ -2514,6 +2553,77 @@ try:
     _SOURCE_MTIME = os.path.getmtime(_SOURCE_PATH)
 except OSError:
     _SOURCE_MTIME = 0.0
+
+# ---------------------------------------------------------------------------
+# Configuration identity for analysis.
+#
+# Every parameter study this bot's history invites — "did LADDER_MODE=atref
+# help", "was the mention x1.5 worth it", "did the 3-7am 2.0x multiplier pay"
+# — is currently manual archaeology across ~20 restarts a day, because no data
+# row carries any record of WHICH configuration produced it. MODEL_VERSION has
+# been the frozen string "incentive_mm_v1.2" through months of change, and
+# RUN_ID is printed once at startup and attached to nothing.
+#
+# CONFIG_HASH fixes that: it is a stable 8-hex digest of the effective config
+# (every IMM_*/KALSHI_* env var plus the module knobs that are set in code),
+# stamped onto every analytics row below. After this, a before/after study is
+# `GROUP BY config_hash` instead of a git-log excavation.
+#
+# Computed lazily at startup rather than at import so that module constants
+# defined further down this file are all present when it runs.
+CONFIG: Dict[str, str] = {}
+CONFIG_HASH = "unset"
+
+# Module knobs that are NOT env-driven, so they never appear in os.environ but
+# do change behaviour. Captured by name; missing names are skipped silently so
+# a rename can never crash startup.
+_CONFIG_CODE_KNOBS = (
+    "MODEL_VERSION", "LADDER_MODE", "LEVELS", "FAST_LANE_SECS", "POLL_SECS",
+    "ORDER_TTL_SECS", "PAD_BID_CENTS", "PAD_ASK_CENTS", "PAD_MIN_TICKS_BEHIND",
+    "QUALIFY_PATIENCE_CYCLES", "BENCH_COOLDOWN_SECS", "MAX_MARKETS",
+    "MAX_POSITION_CONTRACTS", "MAX_EVENT_CONTRACTS", "MAX_TOTAL_RESTING",
+    "COLLATERAL_BUDGET", "DAILY_LOSS_LIMIT", "RATE_FLOOR_TOTAL_ALT",
+    "PAYOUT_FLOOR", "PRICE_BAND_LO", "PRICE_BAND_HI", "STP_TYPE",
+    "EVENT_LEVEL_STANDOFF", "SCAN_TOP_N", "SCAN_DAILY_OPENINGS",
+    "SCAN_DAILY_LOSS_LIMIT", "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
+    "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
+    "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
+    "EVENT_TOP_N", "EVENT_TOP_N_STICKY",
+)
+
+
+def _git_sha() -> str:
+    """Short HEAD sha, best-effort. Never raises, never blocks startup."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", os.path.dirname(_SOURCE_PATH) or ".",
+             "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+        return (out.stdout or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _build_config() -> Tuple[Dict[str, str], str]:
+    """Snapshot the effective configuration and digest it.
+
+    Secrets are excluded by name, not by value: this dict is written to disk
+    in full, and KALSHI_* legitimately holds key material."""
+    import hashlib
+    secret = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PRIVATE")
+    cfg: Dict[str, str] = {}
+    for k, v in os.environ.items():
+        if not (k.startswith("IMM_") or k.startswith("KALSHI_")):
+            continue
+        cfg[k] = "<redacted>" if any(s in k.upper() for s in secret) else str(v)
+    g = globals()
+    for name in _CONFIG_CODE_KNOBS:
+        if name in g:
+            cfg[f"code:{name}"] = str(g[name])
+    digest = hashlib.sha1(
+        json.dumps(cfg, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    return cfg, digest
 _HOURLY_TEMP_RE = re.compile(r"^KXTEMP[A-Z]+H-")
 
 
@@ -4295,6 +4405,20 @@ class IncentiveMarketMaker:
         self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
         self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
         self._heartbeat = time.time()      # hang-watchdog liveness marker
+        # ---- analytics sink state (see _sink) ----
+        self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
+        # Book/reward panel from the last cycle, per ticker. The fills sink
+        # reads it to answer "what did the book look like when this filled?"
+        # without a second API call — a fill arrives one cycle AFTER the book
+        # read that produced the order it hit, so the cached panel is the
+        # right context, not a fresh read.
+        self._last_panel: Dict[str, dict] = {}
+        self._realized_by_ticker: Dict[str, float] = {}   # per-market delta base
+        self._cycle_hdr_ok = False                 # cycle-log header checked once
+        self._marks_at = 0.0                       # 5-min mark series throttle
+        self._selection_prev: Dict[str, str] = {}   # ticker -> last decision
+        self._selection_snap_at = 0.0              # hourly full-candidate dump
+        self._inventory_snap_day = ""              # daily open-book snapshot
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -4306,6 +4430,174 @@ class IncentiveMarketMaker:
     PERSIST_PATH = os.path.join(STATUS_DIR, "imm_state.json")
 
     ORDER_JOURNAL_PATH = os.path.join(STATUS_DIR, "imm_order_journal.jsonl")
+
+    # ------------------------------------------------------------------
+    # Structured analytics sinks
+    #
+    # These write ANALYSIS data only. Three rules hold for every one of
+    # them, and they are why this is safe to run on a live book:
+    #   1. No sink may change a trading decision.
+    #   2. No sink may raise — a failed write is swallowed.
+    #   3. No sink may flood the log — a broken sink mutes itself.
+    #
+    # Each is one append-only JSONL file per UTC day under STATUS_DIR, so a
+    # day of any stream is a single `bq load` (or pandas
+    # read_json(lines=True)) away, and every row carries run_id +
+    # config_hash so results can be grouped by the configuration that
+    # produced them.
+    #
+    # IMM_ANALYTICS=0 disables all of them at once.
+    # ------------------------------------------------------------------
+    ANALYTICS_ON = os.environ.get("IMM_ANALYTICS", "1") == "1"
+
+    def _sink(self, name: str, rec: dict) -> None:
+        """Append one JSON object to STATUS_DIR/<name>_YYYY-MM-DD.jsonl.
+
+        A sink that fails (full disk, permissions, a serialisation bug in a
+        new field) is muted for the rest of the run after one line: on a
+        live book a per-cycle failure would otherwise turn into thousands
+        of identical log lines and bury the trading messages that matter."""
+        if not self.ANALYTICS_ON:
+            return
+        try:
+            rec.setdefault("run_id", RUN_ID)
+            rec.setdefault("config_hash", CONFIG_HASH)
+            path = os.path.join(
+                STATUS_DIR,
+                f"{name}_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
+        except Exception as e:
+            if name not in self._sink_muted:
+                self._sink_muted.add(name)
+                log(f"{self.tag} ! analytics sink '{name}' failed ({e}); "
+                    f"muted for the rest of this run")
+
+    def _log_fill(self, f: dict, tkr: str, side: str, action: str,
+                  count: float, px_cents: float, now_ts: float,
+                  pos_before: float, avg_before: float) -> None:
+        """One row per fill — the single most important thing this bot was
+        not recording.
+
+        Three joins are taken here that are impossible to reconstruct later:
+
+        `ledger`  the order this fill hit is still in self.state.ledger at
+                  this moment, carrying the price WE quoted, the rung's
+                  remaining size, whether it was a 1c/99c pad, and when it
+                  was placed. One dict lookup away, and previously dropped.
+                  Past 7 days our_order_ids prunes and even OWNERSHIP of a
+                  historical fill becomes unprovable on a shared account.
+
+        `panel`   the book/reward state from the last cycle read — ext bid/ask,
+                  depth, target, est_frac, pool. This is what makes
+                  adverse-selection analysis possible: fill price against the
+                  book it filled into.
+
+        `pos_*`   inventory before and after, so a fill can be classified as
+                  opening, adding or reducing without replaying the tape."""
+        try:
+            led = self.state.ledger.get(f.get("order_id") or "") or {}
+            panel = self._last_panel.get(tkr) or {}
+            our_px = led.get("yes_price")
+            self._sink("fills", {
+                "ts": self._fill_ts(f),
+                "cycle_ts": now_ts,
+                "fill_id": f.get("trade_id") or f.get("fill_id"),
+                "order_id": f.get("order_id"),
+                "ticker": tkr,
+                "series": series_of(tkr),
+                "event_ticker": self._event_of(tkr),
+                "side": side,
+                "action": action,
+                "count": count,
+                "yes_price_cents": px_cents,
+                "is_taker": f.get("is_taker"),
+                # --- the order we had resting (ledger join) ---
+                "our_book_side": led.get("book_side"),
+                "our_price_cents": our_px,
+                "our_remaining_before": led.get("remaining_count"),
+                "client_order_id": led.get("client_order_id"),
+                "order_age_secs": (round(now_ts - led["_placed_at"], 1)
+                                   if led.get("_placed_at") else None),
+                "is_pad": (self._is_pad_price(led["book_side"], our_px)
+                           if led.get("book_side") and our_px is not None
+                           else None),
+                # --- inventory context ---
+                "pos_before": pos_before,
+                "avg_before": avg_before,
+                "pos_after": self.pnl.pos.get(tkr, 0.0),
+                "avg_after": self.pnl.avg.get(tkr, 0.0),
+                # --- book context at the last read (adverse selection) ---
+                "ext_bid": panel.get("ext_bid"),
+                "ext_ask": panel.get("ext_ask"),
+                "yes_depth": panel.get("yes_depth"),
+                "no_depth": panel.get("no_depth"),
+                "target": panel.get("target"),
+                "est_frac": panel.get("est_frac"),
+                "qual_sides": panel.get("qual_sides"),
+                "pool_per_day": panel.get("pool_per_day"),
+                "panel_ts": panel.get("ts"),
+                "is_scan": panel.get("is_scan"),
+            })
+        except Exception as e:
+            if "fills" not in self._sink_muted:
+                self._sink_muted.add("fills")
+                log(f"{self.tag} ! fill sink failed ({e}); muted for this run")
+
+    def _log_order(self, kind: str, ticker: str, book_side: str,
+                   price_cents: Optional[int], count: Optional[float],
+                   order_id: str = "", now_ts: float = 0.0, **extra) -> None:
+        """One row per order-lifecycle event: place / reject / uncertain /
+        amend / cancel.
+
+        This is the denominator nothing else provides. Fills alone say what
+        traded; only the orders that DIDN'T fill make fill-rate, queue
+        position and ladder-shape answerable — and ~99.6% of this bot's
+        ~38k daily placements are cancelled, so the denominator is almost
+        the whole story. The exchange keeps orders for ~67 days and the only
+        local record was a free-text stdout line whose amend variant
+        truncates the order id to 8 chars.
+
+        Book context comes from the cached panel, never a fresh read: this
+        runs inside the placement wave and must not add API calls."""
+        try:
+            panel = self._last_panel.get(ticker) or {}
+            eb, ea = panel.get("ext_bid"), panel.get("ext_ask")
+            # Distance from the touch on our own side, in ticks — the axis
+            # fill-rate is actually a function of.
+            ticks = None
+            if price_cents is not None:
+                if book_side == "bid" and eb is not None:
+                    ticks = int(eb) - int(price_cents)
+                elif book_side == "ask" and ea is not None:
+                    ticks = int(price_cents) - int(ea)
+            rec = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "cycle_ts": now_ts or None,
+                "kind": kind,
+                "order_id": order_id,
+                "ticker": ticker,
+                "series": series_of(ticker),
+                "event_ticker": self._event_of(ticker),
+                "book_side": book_side,
+                "price_cents": price_cents,
+                "count": count,
+                "is_pad": (self._is_pad_price(book_side, price_cents)
+                           if book_side and price_cents is not None else None),
+                "ticks_from_touch": ticks,
+                "ext_bid": eb, "ext_ask": ea,
+                "yes_depth": panel.get("yes_depth"),
+                "no_depth": panel.get("no_depth"),
+                "target": panel.get("target"),
+                "est_frac": panel.get("est_frac"),
+                "is_scan": panel.get("is_scan"),
+            }
+            rec.update(extra)
+            self._sink("orders", rec)
+        except Exception as e:
+            if "orders" not in self._sink_muted:
+                self._sink_muted.add("orders")
+                log(f"{self.tag} ! order sink failed ({e}); muted this run")
 
     def _journal_order_id(self, oid: str, ts: float) -> None:
         """Append-only crash journal for order ownership: one line per placed
@@ -4505,6 +4797,32 @@ class IncentiveMarketMaker:
         if abs(delta) > 1e-9:
             self.state.realized_lifetime += delta
             self.state.realized_seen = total
+        # Per-MARKET realized, appended as deltas. self.pnl.realized is the
+        # right object and has always existed, but it is collapsed into one
+        # lifetime scalar here and dies with the process ~20 times a day, so
+        # "which markets earn credits but lose money on the position" has
+        # never had a per-market answer on our own book. Append-only deltas
+        # mean pruning the live dict stays safe.
+        try:
+            for tkr, val in self.pnl.realized.items():
+                prev = self._realized_by_ticker.get(tkr, 0.0)
+                d = val - prev
+                if abs(d) <= 1e-9:
+                    continue
+                self._realized_by_ticker[tkr] = val
+                self._sink("realized", {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ticker": tkr, "series": series_of(tkr),
+                    "event_ticker": self._event_of(tkr),
+                    "realized_delta_dollars": round(d, 6),
+                    "realized_total_dollars": round(val, 6),
+                    "pos_after": self.pnl.pos.get(tkr, 0.0),
+                    "avg_after": self.pnl.avg.get(tkr, 0.0),
+                })
+        except Exception as e:
+            if "realized" not in self._sink_muted:
+                self._sink_muted.add("realized")
+                log(f"{self.tag} ! realized sink failed ({e}); muted this run")
 
     def _save_persist(self) -> None:
         try:
@@ -4700,6 +5018,11 @@ class IncentiveMarketMaker:
                 "_placed_at": now_ts, "_confirmed": False,
             }
             log(f"{self.tag} placed {label} -> {oid}")
+            self._log_order("place", q.ticker, q.book_side, q.price_cents,
+                            q.count, oid, now_ts,
+                            client_order_id=client_order_id,
+                            quote_is_pad=q.is_pad,
+                            expiration_ts=expiration_ts)
             # Durable PER ORDER, but cheap: append the id to a journal (<1ms)
             # instead of dumping the full ~3.4MB state (~450ms) — a hard-kill
             # mid-wave orphaned 3 fills on unsaved ids (2026-07-19, ~19:22Z
@@ -4711,6 +5034,14 @@ class IncentiveMarketMaker:
         except HttpError as e:
             # A definitive rejection (post-only would cross, etc.) — no order exists.
             log(f"{self.tag} ! place rejected ({e}): {label}")
+            # Rejections are signal, not noise: a post-only reject means the
+            # touch moved between the book read and the send, which is the
+            # measurable form of "our quotes are stale".
+            self._log_order("reject", q.ticker, q.book_side, q.price_cents,
+                            q.count, "", now_ts,
+                            client_order_id=client_order_id,
+                            quote_is_pad=q.is_pad, error=str(e),
+                            http_status=getattr(e, "status", None))
             return False
         except Exception as e:
             # Ambiguous failure (timeout mid-flight): the order MAY be live but
@@ -4720,9 +5051,16 @@ class IncentiveMarketMaker:
             self.state.place_uncertain[(q.ticker, q.book_side, q.price_cents)] = now_ts
             log(f"{self.tag} ! place failed ({e}): {label}; level cooled "
                 f"{2 * POLL_SECS}s (order may exist untracked)")
+            # kind='uncertain', not 'reject': the order MAY be live but
+            # untracked, so any fill-rate denominator must be able to exclude
+            # these rather than silently count them as unfilled.
+            self._log_order("uncertain", q.ticker, q.book_side, q.price_cents,
+                            q.count, "", now_ts,
+                            client_order_id=client_order_id,
+                            quote_is_pad=q.is_pad, error=str(e))
             return False
 
-    def cancel_order(self, order_id: str) -> bool:
+    def cancel_order(self, order_id: str, reason: str = "") -> bool:
         # Heartbeat per order: a 1000-order sweep/wave legitimately outlasts
         # the hang-watchdog window; a WEDGED call still freezes these touches.
         self._heartbeat = time.time()
@@ -4731,15 +5069,36 @@ class IncentiveMarketMaker:
             self.state.order_ages.pop(order_id, None)
             log(f"{self.tag} [DRY] cancel {order_id}")
             return True
+        # Snapshot the ledger entry before either path pops it — it carries
+        # the ticker/side/price this cancel refers to, and after the pop the
+        # order id alone is meaningless.
+        led = self.state.ledger.get(order_id) or {}
+        placed_at = led.get("_placed_at")
         try:
             self.client.cancel_order(order_id)
             self.state.order_ages.pop(order_id, None)
             self.state.ledger.pop(order_id, None)
+            self._log_order(
+                "cancel", led.get("ticker", ""), led.get("book_side", ""),
+                led.get("yes_price"), led.get("remaining_count"), order_id,
+                reason=reason,
+                rested_secs=(round(time.time() - placed_at, 1)
+                             if placed_at else None))
             return True
         except HttpError as e:
             if e.status in (404, 409):
                 self.state.order_ages.pop(order_id, None)
                 self.state.ledger.pop(order_id, None)
+                # Already gone — filled, expired or cancelled elsewhere.
+                # Distinct from 'cancel' on purpose: an order that vanished
+                # before we could cancel it must not be counted as one we
+                # pulled when computing fill rates.
+                self._log_order(
+                    "gone", led.get("ticker", ""), led.get("book_side", ""),
+                    led.get("yes_price"), led.get("remaining_count"),
+                    order_id, reason=reason, http_status=e.status,
+                    rested_secs=(round(time.time() - placed_at, 1)
+                                 if placed_at else None))
                 return True
             log(f"{self.tag} ! cancel failed {order_id}: {e}")
             return False
@@ -4780,10 +5139,21 @@ class IncentiveMarketMaker:
                 order_id=oid, ticker=q.ticker, book_side=q.book_side,
                 yes_price_cents=q.price_cents, total_count=total)
             led = self.state.ledger.get(oid)
+            # Read the previous price/size BEFORE the overwrite below, and
+            # keep the FULL order id: the prose line truncates it to 8 chars,
+            # which makes an order's price history unreconstructable even by
+            # regex. ~13k amends a day carry the whole requote story.
+            prev_px = led.get("yes_price") if led is not None else None
+            prev_ct = led.get("remaining_count") if led is not None else None
             if led is not None:
                 led["yes_price"] = q.price_cents
                 led["remaining_count"] = float(q.count)
             log(f"{self.tag} amended {label}")
+            self._log_order("amend", q.ticker, q.book_side, q.price_cents,
+                            q.count, oid, now_ts,
+                            prev_price_cents=prev_px, prev_count=prev_ct,
+                            filled_before=filled, total_count=total,
+                            quote_is_pad=q.is_pad)
             return True
         except HttpError as e:
             if e.status in (404, 409):
@@ -4884,7 +5254,7 @@ class IncentiveMarketMaker:
         try:
             orders = self._merge_ledger(self._get_resting_orders_global(), time.time())
             for o in orders:
-                if self.cancel_order(o["order_id"]):
+                if self.cancel_order(o["order_id"], reason="cancel_all"):
                     n += 1
         except Exception as e:
             log(f"{self.tag} ! cancel-all sweep failed: {e}")
@@ -4958,7 +5328,8 @@ class IncentiveMarketMaker:
     def cancel_market_orders(self, ticker: str, resting: List[dict]) -> int:
         n = 0
         for o in resting:
-            if o.get("ticker") == ticker and self.cancel_order(o.get("order_id", "")):
+            if o.get("ticker") == ticker and self.cancel_order(
+                    o.get("order_id", ""), reason="market_cancel"):
                 n += 1
         return n
 
@@ -5364,6 +5735,11 @@ class IncentiveMarketMaker:
         prev_events = {"-".join(t.split("-")[:2]) for t in prev_selected}
         screened: List[MarketMeta] = []
         skipped: Dict[str, int] = {}
+        # Per-market decision trail. `skipped` counts reasons; this
+        # records WHICH market got which one, so "why was X not quoted"
+        # and "would the markets I cut have earned more" stop being
+        # unanswerable. Analytics only — nothing reads it back.
+        decisions: Dict[str, str] = {}
         for meta in metas:
             t = meta.ticker
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
@@ -5380,6 +5756,7 @@ class IncentiveMarketMaker:
                                or meta.event_ticker in manual_evts)
             if manual_skip:
                 skipped["manual"] = skipped.get("manual", 0) + 1
+                decisions[t] = "manual"
                 continue
             reason = self._screen(meta, now_utc,
                                   member=t in prev_selected)
@@ -5390,6 +5767,7 @@ class IncentiveMarketMaker:
                 screened.append(meta)
             elif reason:
                 skipped[reason] = skipped.get(reason, 0) + 1
+                decisions[t] = reason
             else:
                 screened.append(meta)
 
@@ -5411,6 +5789,7 @@ class IncentiveMarketMaker:
                     ranked.append(meta)   # sticky: transient book-read failure
                 else:
                     skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
+                    decisions[meta.ticker] = "book_unreadable"
                 continue
             # Shared $1-min-payout projection for the entry floor AND the
             # hopeless exit: optimistic = accrued-so-far + max(current,
@@ -5448,6 +5827,7 @@ class IncentiveMarketMaker:
                 # fresh markets; members above keep quoting via the branch
                 # below until natural death.
                 skipped["no_new"] = skipped.get("no_new", 0) + 1
+                decisions[meta.ticker] = "no_new"
             elif HOPELESS_EXIT and not reaches_min \
                     and sub_bar_secs >= HOPELESS_SUSTAIN_SECS \
                     and meta.ticker in prev_selected \
@@ -5474,6 +5854,7 @@ class IncentiveMarketMaker:
                 # $1 projection is noisiest, and the group is 10 small
                 # ladders — the drain rule's fill-risk argument is thin.
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
+                decisions[meta.ticker] = "hopeless"
             elif meta.ticker not in prev_selected \
                     and meta.event_ticker not in prev_events \
                     and meta.event_ticker not in FORCE_EVENTS \
@@ -5491,6 +5872,7 @@ class IncentiveMarketMaker:
                 # est_TOTAL — a per-day RATE has no such excuse. Members stay
                 # sticky (rate dips never evict; hopeless owns exits).
                 skipped["rate_floor"] = skipped.get("rate_floor", 0) + 1
+                decisions[meta.ticker] = "rate_floor"
             elif meta.ticker in prev_selected \
                     or meta.event_ticker in FORCE_EVENTS \
                     or curated_event(meta.event_ticker, meta.series, now_utc):
@@ -5503,11 +5885,13 @@ class IncentiveMarketMaker:
                 ranked.append(meta)
             elif meta.yield_per_contract <= 0:
                 skipped["zero_yield"] = skipped.get("zero_yield", 0) + 1
+                decisions[meta.ticker] = "zero_yield"
             elif not reaches_min:
                 # entry floor, now with the accrued credit: a re-admitted
                 # market that already banked most of its $1 re-enters even
                 # when the remaining window alone couldn't clear the bar.
                 skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
+                decisions[meta.ticker] = "payout_floor"
             else:
                 ranked.append(meta)
         # Mild stickiness so estimator jitter doesn't churn the selection.
@@ -5528,14 +5912,22 @@ class IncentiveMarketMaker:
                        if m.scan and m.ticker in prev_selected}
 
         # Per-event TOP-N (Jack 2026-09-02, gas — see event_top_n_cut):
-        # applied BEFORE sticky seeding so a member past the cap falls out of
+        # applied BEFORE sticky seeding so a market past the cap falls out of
         # `ranked`, out of `selected`, and through the normal deselect/cancel
-        # path this cycle. (Finecon members are immune; gas/diesel keep the
-        # original evictable semantics.)
+        # path this cycle. Finecon/scan members are fully immune; the capped
+        # families' own quoting markets hold their slots against challengers
+        # (Jack 2026-09-06 "it should be constant" — EVENT_TOP_N_STICKY) but
+        # are still trimmed if they alone exceed N.
+        topn_sticky = {m.ticker for m in ranked
+                       if EVENT_TOP_N_STICKY
+                       and event_top_n_for(m.series) > 0
+                       and m.ticker in prev_selected}
         topn_cut = event_top_n_cut(ranked, prev_selected,
-                                   immune=fin_sticky | scan_sticky)
+                                   immune=fin_sticky | scan_sticky,
+                                   members=topn_sticky)
         if topn_cut:
             skipped["event_top_n"] = len(topn_cut)
+            decisions.update({_t: "event_top_n" for _t in topn_cut})
             ranked = [m for m in ranked if m.ticker not in topn_cut]
 
         # Finecon GROUP top-N (Jack 2026-09-02 — see finecon_group_cut):
@@ -5556,6 +5948,7 @@ class IncentiveMarketMaker:
                                     extra_openings=openings_left)
         if fin_cut:
             skipped["finecon_top_n"] = len(fin_cut)
+            decisions.update({_t: "finecon_top_n" for _t in fin_cut})
             ranked = [m for m in ranked if m.ticker not in fin_cut]
         kept_group = sum(1 for m in ranked if m.series in FINECON_SERIES)
         used = finecon_openings_used(kept_group, len(fin_sticky))
@@ -5577,6 +5970,7 @@ class IncentiveMarketMaker:
                                   extra_openings=scan_openings_left)
         if scan_cut:
             skipped["scan_top_n"] = len(scan_cut)
+            decisions.update({_t: "scan_top_n" for _t in scan_cut})
             ranked = [m for m in ranked if m.ticker not in scan_cut]
         kept_scan = sum(1 for m in ranked if m.scan)
         used_scan = scan_openings_used(kept_scan, len(scan_sticky))
@@ -5647,6 +6041,7 @@ class IncentiveMarketMaker:
             cost = market_cost(meta)
             if collateral + cost + inv_reserve > COLLATERAL_BUDGET:
                 skipped["budget"] = skipped.get("budget", 0) + 1
+                decisions[meta.ticker] = "budget"
                 continue
             collateral += cost
             selected[meta.ticker] = meta
@@ -5693,6 +6088,65 @@ class IncentiveMarketMaker:
         if dropped:
             log(f"{self.tag} - deselected: {', '.join(sorted(dropped)[:8])}"
                 + (" ..." if len(dropped) > 8 else ""))
+        # The prose above truncates to 8 tickers and the skip reasons are only
+        # ever aggregate counts, so ~86% of the candidate universe has left no
+        # per-market record anywhere. Two sinks fix that at different cadences.
+        try:
+            by_ticker = {m.ticker: m for m in metas}
+
+            def _meta_fields(mt) -> dict:
+                if mt is None:
+                    return {}
+                return {
+                    "series": mt.series, "event_ticker": mt.event_ticker,
+                    "est_dollars_per_day": round(mt.est_dollars_per_day, 4),
+                    "yield_per_contract": round(mt.yield_per_contract, 6),
+                    "dollars_per_day": round(mt.dollars_per_day, 2),
+                    "target_size": mt.target_size,
+                    "est_collateral_dollars": round(mt.est_collateral_dollars, 2),
+                    "book_depth_contracts": mt.book_depth_contracts,
+                    "mid_cents": mt.mid_cents, "spread_cents": mt.spread_cents,
+                    "volume": mt.volume, "is_scan": bool(getattr(mt, "scan", False)),
+                }
+
+            # (a) Event-driven: only decisions that CHANGED since the last
+            # refresh. This is what makes an incident reconstructable — both
+            # times this bot silently benched hundreds of markets, the state
+            # had to be recovered from prose after the fact.
+            now_dec = dict(decisions)
+            for tk in selected:
+                now_dec[tk] = "selected"
+            events = []
+            for tk, dec in now_dec.items():
+                if self._selection_prev.get(tk) != dec:
+                    events.append({"ticker": tk, "decision": dec,
+                                   "prev": self._selection_prev.get(tk),
+                                   **_meta_fields(by_ticker.get(tk))})
+            for tk, prev in self._selection_prev.items():
+                if tk not in now_dec and prev != "gone":
+                    events.append({"ticker": tk, "decision": "gone", "prev": prev})
+            for e in events:
+                e["ts"] = now_utc.isoformat()
+                self._sink("selection_events", e)
+            self._selection_prev = now_dec
+
+            # (b) Hourly full snapshot of every candidate. This is the only
+            # thing that makes the counterfactual possible: realized credits
+            # on the markets we kept against modelled yield on the ones each
+            # cut reason dropped.
+            if now_ts - self._selection_snap_at >= 3600:
+                self._selection_snap_at = now_ts
+                for mt in metas:
+                    self._sink("selection_snapshot", {
+                        "ts": now_utc.isoformat(), "ticker": mt.ticker,
+                        "decision": now_dec.get(mt.ticker, "not_ranked"),
+                        **_meta_fields(mt)})
+                log(f"{self.tag} selection snapshot: {len(metas)} candidates "
+                    f"({len(events)} decision changes this refresh)")
+        except Exception as e:
+            if "selection" not in self._sink_muted:
+                self._sink_muted.add("selection")
+                log(f"{self.tag} ! selection sink failed ({e}); muted this run")
         if scan_on:
             log(f"{self.tag} open-scan: {len(scan_pre)} string-screened -> "
                 f"{sum(1 for m in metas if m.scan)} eligible -> "
@@ -6071,14 +6525,44 @@ class IncentiveMarketMaker:
             log(f"{self.tag} ! settle check failed for {t} ({e}); retry next cycle")
             return
         result = str(m.get("result") or "").lower()
+        # Captured before the pops below: this is the entry price the
+        # settlement is scored against, and the else-branch destroys it.
+        own_avg = self.pnl.avg.get(t, 0.0)
         if result in ("yes", "no"):
             px = 100.0 if result == "yes" else 0.0
             self.pnl.on_fill(t, "yes", "sell" if own > 0 else "buy", abs(own), px)
             log(f"{self.tag} {t}: settled {result.upper()}; booked {own:+.0f} @ {px:.0f}c "
                 f"(market realized ${self.pnl.realized.get(t, 0.0):+.2f})")
+            # Nearly all of this bot's trading P&L lands here — it is a maker
+            # that almost never closes a position, so settlement IS the exit.
+            # The prose line above was the only record; the manual stitch
+            # snapshots are event-level, whole-account and run-when-remembered
+            # against an API that now serves ~66 days.
+            self._sink("settlements", {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "ticker": t, "series": series_of(t),
+                "event_ticker": self._event_of(t),
+                "result": result,
+                "settle_price_cents": px,
+                "own_pos_at_settle": own,
+                "own_avg_cents": own_avg,
+                "market_realized_dollars": self.pnl.realized.get(t, 0.0),
+            })
         else:
             log(f"{self.tag} {t}: own book {own:+.0f} but account flat and market "
                 f"unsettled — manually offset; dropping stale entry")
+            # Logged with a distinct result so a manual takeout can never be
+            # counted as a settlement in any downstream P&L sum.
+            self._sink("settlements", {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "ticker": t, "series": series_of(t),
+                "event_ticker": self._event_of(t),
+                "result": "manual_offset",
+                "settle_price_cents": None,
+                "own_pos_at_settle": own,
+                "own_avg_cents": own_avg,
+                "market_realized_dollars": self.pnl.realized.get(t, 0.0),
+            })
             self.pnl.pos.pop(t, None)
             self.pnl.avg.pop(t, None)
         self.state.last_mark.pop(t, None)
@@ -6398,8 +6882,16 @@ class IncentiveMarketMaker:
                 px = f.get("yes_price_dollars")
                 px_cents = float(px) * 100 if px is not None else float(f.get("yes_price") or 0)
                 if side in ("yes", "no") and action in ("buy", "sell") and count > 0:
-                    self.pnl.on_fill(f.get("ticker", "?"), side, action, count, px_cents)
+                    tkr = f.get("ticker", "?")
+                    # Read position BEFORE booking; log AFTER. Ordering is
+                    # deliberate: the fill must be booked into P&L even if
+                    # anything about the analytics row is broken.
+                    pos_before = self.pnl.pos.get(tkr, 0.0)
+                    avg_before = self.pnl.avg.get(tkr, 0.0)
+                    self.pnl.on_fill(tkr, side, action, count, px_cents)
                     self.state.fills_today += count
+                    self._log_fill(f, tkr, side, action, count, px_cents,
+                                   now_ts, pos_before, avg_before)
             except Exception as e:
                 log(f"{self.tag} ! unparseable fill skipped: {e}")
 
@@ -6505,7 +6997,8 @@ class IncentiveMarketMaker:
         managed_set = set(managed)
         stray = [o for o in resting if o.get("ticker") not in managed_set]
         for o in stray:
-            if self.cancel_order(o.get("order_id", "")):
+            if self.cancel_order(o.get("order_id", ""),
+                                 reason="stray_unmanaged"):
                 self.state.cancelled_today += 1
         if stray:
             resting = [o for o in resting if o.get("ticker") in managed_set]
@@ -7166,6 +7659,46 @@ class IncentiveMarketMaker:
                     self.state.coverage_zero_streak.pop(t, None)
             reward_frac_sum += frac * meta.dollars_per_day
             cycle_rate[t] = frac * meta.dollars_per_day
+            # --- enriched quote shape + governing clamps -------------------
+            # The 13 original columns reduce the whole quote to one scalar
+            # (`quoted`), and yes_depth/no_depth INCLUDE our own resting size —
+            # so competitor depth was not computable and "est_frac fell because
+            # a farmer stacked in" could not be told apart from "est_frac fell
+            # because my order got cancelled". Everything below is a live local
+            # in this same iteration and was simply not written.
+            #
+            # Columns are APPENDED, never reordered: imm_reward_recon.py reads
+            # this file positionally (row[0],[1],[7],[8],[11]) and gates on
+            # len(row) >= 13, so appending is backward compatible and the
+            # reward integral is untouched.
+            try:
+                # A tuple build raises NameError on the first unbound name and
+                # we fall back to blanks — an analytics column can never crash
+                # a live placement wave over a branch that skipped an assignment.
+                _hm, _rlo, _rb, _rs, _ro = (hm, rung_lo, room_buy, room_sell,
+                                            reduce_only)
+            except NameError:
+                _hm = _rlo = _rb = _rs = _ro = None
+            try:
+                ob = [(p, c) for s_, p, c in own if s_ == "bid"]
+                oa = [(p, c) for s_, p, c in own if s_ == "ask"]
+                shape = {
+                    "own_bid_ct": sum(c for _p, c in ob),
+                    "own_ask_ct": sum(c for _p, c in oa),
+                    "own_bid_top": max((p for p, _c in ob), default=None),
+                    "own_ask_top": min((p for p, _c in oa), default=None),
+                    "own_pad_bid_ct": sum(c for p, c in ob if p == PAD_BID_CENTS),
+                    "own_pad_ask_ct": sum(c for p, c in oa if p == PAD_ASK_CENTS),
+                    "want_bid_ct": sum(q.count for q in mq if q.book_side == "bid"),
+                    "want_ask_ct": sum(q.count for q in mq if q.book_side == "ask"),
+                    "want_pad_ct": sum(q.count for q in mq if q.is_pad),
+                }
+            except Exception:
+                shape = {}
+
+            def _c(v, fmt="{:.0f}"):
+                return "" if v is None else fmt.format(v)
+
             cycle_rows.append(
                 f"{now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')},{t},"
                 f"{ext_bid if ext_bid is not None else ''},"
@@ -7174,7 +7707,38 @@ class IncentiveMarketMaker:
                 f"{sum(q for _p, q in no_levels):.0f},"
                 f"{meta.target_size:.0f},{frac:.5f},{sides},"
                 f"{pos:.1f},{own_pos:.1f},{meta.dollars_per_day:.2f},"
-                f"{sum(q.count for q in mq)}\n")
+                f"{sum(q.count for q in mq)},"
+                # --- appended: quote shape (ours, so competitor depth =
+                #     yes_depth - own_bid_ct) ---
+                f"{_c(shape.get('own_bid_ct'))},{_c(shape.get('own_ask_ct'))},"
+                f"{_c(shape.get('own_bid_top'))},{_c(shape.get('own_ask_top'))},"
+                f"{_c(shape.get('own_pad_bid_ct'))},"
+                f"{_c(shape.get('own_pad_ask_ct'))},"
+                f"{_c(shape.get('want_bid_ct'))},{_c(shape.get('want_ask_ct'))},"
+                f"{_c(shape.get('want_pad_ct'))},"
+                # --- appended: what governed the size we chose ---
+                f"{_c(_hm, '{:.2f}')},{_c(_rlo)},{_c(_rb)},{_c(_rs)},"
+                # --- appended: market context + provenance ---
+                f"{_c(meta.volume, '{:.0f}')},"
+                f"{_c(meta.discount_factor, '{:.3f}')},"
+                f"{1 if getattr(meta, 'scan', False) else 0},"
+                f"{1 if t in self.state.selected else 0},"
+                f"{1 if _ro else 0},{1 if fast_only else 0},"
+                f"{RUN_ID},{CONFIG_HASH}\n")
+
+            # Cache the panel for the fills and orders sinks. A fill arrives
+            # one cycle AFTER the read that produced the order it hit, so this
+            # cached panel — not a fresh read — is the correct book context,
+            # and it costs no API call.
+            self._last_panel[t] = {
+                "ts": now_utc.isoformat(), "ext_bid": ext_bid,
+                "ext_ask": ext_ask,
+                "yes_depth": sum(q for _p, q in yes_levels),
+                "no_depth": sum(q for _p, q in no_levels),
+                "target": meta.target_size, "est_frac": frac,
+                "qual_sides": sides, "pool_per_day": meta.dollars_per_day,
+                "is_scan": bool(getattr(meta, "scan", False)),
+            }
             if t in self.state.selected and not reduce_only and not fast_only:
                 # 2026-08-06: this read `frac <= 0.0 and mq`. `frac` is scored
                 # from est_own (our RESTING orders) but the guard tested `mq`
@@ -7276,6 +7840,33 @@ class IncentiveMarketMaker:
         # LOSS HALT on TOTAL P&L today (realized + mark-to-market), so gapped
         # inventory counts even before it settles. Runs before any placement.
         self._refresh_marks(marked)
+        # Mark series for every open position, every 5 minutes.
+        #
+        # This is what makes adverse selection measurable. A mark-out needs the
+        # book at the fill and the book N minutes LATER — and the cycle log
+        # goes dark the moment selection drops a market, which is exactly what
+        # happens after a bad fill (bench / hopeless / depth-gate all evict).
+        # Keying on open positions instead of the managed set means the series
+        # continues for as long as we still carry the risk, and it costs no
+        # extra API call: _refresh_marks has just populated last_mark.
+        if now_ts - self._marks_at >= 300:
+            self._marks_at = now_ts
+            try:
+                for tkr, p in self.pnl.pos.items():
+                    if abs(p) <= 1e-9:
+                        continue
+                    self._sink("marks", {
+                        "ts": now_utc.isoformat(), "ticker": tkr,
+                        "series": series_of(tkr),
+                        "event_ticker": self._event_of(tkr),
+                        "pos": p, "avg_cents": self.pnl.avg.get(tkr, 0.0),
+                        "mark_cents": self.state.last_mark.get(tkr),
+                        "realized_dollars": self.pnl.realized.get(tkr, 0.0),
+                    })
+            except Exception as e:
+                if "marks" not in self._sink_muted:
+                    self._sink_muted.add("marks")
+                    log(f"{self.tag} ! marks sink failed ({e}); muted this run")
         unrealized = self.pnl.unrealized(self.state.last_mark)
         unmarked = [t for t, p in self.pnl.pos.items()
                     if abs(p) > 1e-9 and t not in self.state.last_mark]
@@ -7383,7 +7974,7 @@ class IncentiveMarketMaker:
         cancel_failures = 0
         cancelled_ids: Set[str] = set()
         for oid in to_cancel:
-            if self.cancel_order(oid):
+            if self.cancel_order(oid, reason="requote_diff"):
                 self.state.cancelled_today += 1
                 cancelled_ids.add(oid)
             else:
@@ -7406,9 +7997,30 @@ class IncentiveMarketMaker:
                 f"{quoted}/{len(managed)} mkts quoted ({len(desired)} quotes), "
                 f"est ${reward_frac_sum:.2f}/day")
             self._write_cycle_log(cycle_rows)
+        else:
+            # Fast-lane mini-cycles BUILT these rows and then threw them away
+            # — the highest-resolution book snapshots this bot takes (5s on
+            # its fastest family) were discarded every time.
+            #
+            # They go to a SEPARATE file, deliberately. imm_reward_recon.py
+            # derives each market's accrual from the gap between consecutive
+            # distinct timestamps in cycle_log_*.csv; interleaving 5s rows
+            # would shrink those gaps and silently under-count the reward
+            # estimate that the whole realization factor rests on. The
+            # filename must also not match its cycle_log_*.csv glob.
+            self._write_fast_log(cycle_rows)
 
+    # 13 original columns + 21 appended 2026-09-06. APPEND ONLY, never
+    # reorder: imm_reward_recon.py reads this file positionally
+    # (row[0],[1],[7],[8],[11]) and gates on len(row) >= 13.
     CYCLE_LOG_HEADER = ("ts,ticker,ext_bid,ext_ask,yes_depth,no_depth,target,"
-                        "est_frac,qual_sides,acct_pos,own_pos,pool_per_day,quoted\n")
+                        "est_frac,qual_sides,acct_pos,own_pos,pool_per_day,quoted,"
+                        "own_bid_ct,own_ask_ct,own_bid_top,own_ask_top,"
+                        "own_pad_bid_ct,own_pad_ask_ct,"
+                        "want_bid_ct,want_ask_ct,want_pad_ct,"
+                        "hour_mult,rung_lo,room_buy,room_sell,"
+                        "vol24h,discount,is_scan,is_sticky,reduce_only,fast,"
+                        "run_id,config_hash\n")
 
     def _write_cycle_log(self, rows: List[str]) -> None:
         """Per-cycle book panel -> daily CSV. This is the jump-frequency /
@@ -7422,12 +8034,55 @@ class IncentiveMarketMaker:
                 STATUS_DIR,
                 f"cycle_log_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv")
             fresh = not os.path.exists(path)
+            # Schema transition: today's file may already carry an older,
+            # narrower header. Re-emitting the header INLINE is safe and is
+            # the cleanest signal to a reader that the width changed —
+            # imm_reward_recon.py already skips any row whose first field is
+            # "ts", so the reward integral is unaffected, and a pandas reader
+            # can split the day on header rows. Rewriting the first line of an
+            # 80 MB file mid-run would be far riskier than a second header.
+            if not fresh and not self._cycle_hdr_ok:
+                try:
+                    with open(path, encoding="utf-8") as chk:
+                        cur = chk.readline()
+                    if cur and cur.strip() != self.CYCLE_LOG_HEADER.strip():
+                        with open(path, "a", encoding="utf-8") as f:
+                            f.write(self.CYCLE_LOG_HEADER)
+                        log(f"{self.tag} cycle log schema widened to "
+                            f"{self.CYCLE_LOG_HEADER.count(',') + 1} cols; "
+                            f"header re-emitted inline in {os.path.basename(path)}")
+                except OSError:
+                    pass
+            self._cycle_hdr_ok = True
             with open(path, "a", encoding="utf-8") as f:
                 if fresh:
                     f.write(self.CYCLE_LOG_HEADER)
                 f.writelines(rows)
         except Exception as e:
             log(f"{self.tag} ! cycle log write failed: {e}")
+
+    def _write_fast_log(self, rows: List[str]) -> None:
+        """Fast-lane book panels -> daily CSV, same schema as the cycle log.
+
+        Kept out of cycle_log_*.csv on purpose (see the call site): the
+        reward reconciler integrates over timestamp gaps in that file, and
+        5-second rows would corrupt the integral. Never raises."""
+        if not rows or os.environ.get("IMM_CYCLE_LOG", "1") != "1":
+            return
+        try:
+            os.makedirs(STATUS_DIR, exist_ok=True)
+            path = os.path.join(
+                STATUS_DIR,
+                f"fastlane_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv")
+            fresh = not os.path.exists(path)
+            with open(path, "a", encoding="utf-8") as f:
+                if fresh:
+                    f.write(self.CYCLE_LOG_HEADER)
+                f.writelines(rows)
+        except Exception as e:
+            if "fastlane" not in self._sink_muted:
+                self._sink_muted.add("fastlane")
+                log(f"{self.tag} ! fast-lane log write failed ({e}); muted")
 
     @staticmethod
     def _is_pad_price(book_side: str, px: int) -> bool:
@@ -7713,7 +8368,25 @@ class IncentiveMarketMaker:
 
     def run(self, once: bool = False) -> None:
         mode = "LIVE" if self.live else "DRY RUN (no orders placed; --live to trade)"
-        log(f"=== {MODEL_VERSION} run={RUN_ID} mode={mode} ===")
+        # Configuration identity, before anything else is logged: every
+        # analytics row this run emits carries CONFIG_HASH, and this file is
+        # what turns that hash back into the settings it stands for.
+        global CONFIG, CONFIG_HASH
+        try:
+            CONFIG, CONFIG_HASH = _build_config()
+            self._sink("config_history", {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "model_version": MODEL_VERSION,
+                "git_sha": _git_sha(),
+                "mode": mode,
+                "source_mtime": _SOURCE_MTIME,
+                "config": CONFIG,
+            })
+        except Exception as e:      # config identity must never block startup
+            log(f"! config snapshot failed ({e}); analytics rows will carry "
+                f"config_hash={CONFIG_HASH}")
+        log(f"=== {MODEL_VERSION} run={RUN_ID} mode={mode} "
+            f"config={CONFIG_HASH} ===")
         if not once:
             def _hang_watchdog():
                 while True:

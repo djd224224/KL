@@ -32,6 +32,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -141,6 +142,62 @@ def save_state(d: dict) -> None:
         log(f"! health-alert state write failed: {e}")
 
 
+CREDITS_PATH = os.path.join(STATUS_DIR, "reward_credits.csv")
+CREDIT_STALE_DAYS = 3
+
+
+def check_credit_staleness(alerter, state: dict, now: str) -> None:
+    """Alert when the reward-credit ledger stops being updated.
+
+    reward_credits.csv is the only record of money actually PAID — the whole
+    outcome side of a rent-collection strategy, ~$24k of realized value — and
+    Kalshi exposes no credits endpoint (8 paths checked 2026-08-03). It grows
+    only when a human opens the rewards UI and pastes the statement, and
+    nothing has ever detected when that stops: the digest and the calibration
+    quietly reconcile against an older ledger and the realization factor
+    drifts, with no visible failure. The human IS the archive job here, so
+    the archive job needs a monitor.
+
+    At most one email per day, and never raises — a health alerter must not
+    die on a side check."""
+    try:
+        if not os.path.exists(CREDITS_PATH):
+            return
+        latest = ""
+        with open(CREDITS_PATH, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                d = (row.get("credit_date") or "").strip()
+                if d > latest:
+                    latest = d
+        if not latest:
+            return
+        today = datetime.now(timezone.utc).date()
+        behind = (today - datetime.strptime(latest, "%Y-%m-%d").date()).days
+        if behind <= CREDIT_STALE_DAYS:
+            if state.pop("credit_alert_date", None):
+                log(f"credit ledger current again (latest {latest})")
+            return
+        if state.get("credit_alert_date") == today.isoformat():
+            return                       # already warned today
+        state["credit_alert_date"] = today.isoformat()
+        log(f"! credit ledger {behind}d stale (latest {latest})")
+        alerter.send_message(
+            f"The IMM reward-credit ledger is {behind} days stale as of {now}.\n\n"
+            f"  Latest credit in reward_credits.csv: {latest}\n"
+            f"  File: {CREDITS_PATH}\n\n"
+            f"Kalshi has no credits API, so this ledger only grows when the "
+            f"rewards statement is pasted in by hand. While it is stale the "
+            f"digest and the reward calibration keep reconciling against old "
+            f"data and the realization factor drifts silently — nothing else "
+            f"fails visibly.\n\n"
+            f"To refresh: open the Kalshi rewards page, select all, paste into "
+            f"a text file, then run\n\n"
+            f"  python imm_reward_recon.py --statement \"<that file>\"\n",
+            subject=f"IMM reward ledger {behind}d stale")
+    except Exception as e:
+        log(f"! credit staleness check failed ({e}); continuing")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--status", action="store_true", help="print, send nothing")
@@ -163,8 +220,15 @@ def main(argv=None) -> int:
         return 1
 
     prev = load_state()
+
+    # Credit-ledger staleness. Deliberately runs BEFORE the transition check
+    # below, which returns early whenever the bot's up/down state is unchanged
+    # — a stale ledger has nothing to do with whether the process is alive.
+    check_credit_staleness(alerter, prev, now)
+
     was_ok = prev.get("ok")
     if was_ok is not None and bool(was_ok) == ok:
+        save_state(prev)              # keep any credit-alert bookkeeping
         return 0                      # no transition, stay quiet
 
     if not ok:
@@ -183,7 +247,9 @@ def main(argv=None) -> int:
                 f"Was down since {down_since}.")
         subj = "IMM recovered"
     alerter.send_message(body, subject=subj)
-    save_state({"ok": ok, "since": now, "headline": headline})
+    # Merge, don't replace: check_credit_staleness records its own last-alert
+    # date in this dict and a bare overwrite would re-arm it every transition.
+    save_state({**prev, "ok": ok, "since": now, "headline": headline})
     return 0
 
 
