@@ -2267,6 +2267,94 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             program_end=None, target_size=0, discount_factor=0.5,
             cutoff=None, close_time=None).quotable_sides, 2)
 
+    def test_event_top_n_lifetime_slots(self):
+        # Jack 2026-09-07: "3 max quoted markets on an event, not 3 at a
+        # given time. so if 2 drop then none replace them."
+        def m(t, est, expo, sides=2):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=100.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=expo, est_collateral_dollars=0.0,
+                quotable_sides=sides)
+        ev = "KXDIESELW-26SEP14"
+        grp = [m(f"{ev}-T5.92", 2.0, 10.0),
+               m(f"{ev}-T5.94", 0.6, 16.6, sides=1),
+               m(f"{ev}-T5.96", 0.6, 19.8, sides=0),
+               m(f"{ev}-T5.84", 1.9, 9.0),
+               m(f"{ev}-T5.86", 3.8, 12.6)]
+        # THE REGRESSION: the concurrent cap handed T5.94/T5.96's slots to
+        # T5.84/T5.86, so the event ended the day holding inventory in five
+        # strikes. With the ledger spent on the first three, the two
+        # newcomers are refused however good they look...
+        # the ledger is ORDERED by when each market took its slot
+        spent = {ev: [f"{ev}-T5.92", f"{ev}-T5.94", f"{ev}-T5.96"]}
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent=set(), slots_used=spent),
+            {f"{ev}-T5.84", f"{ev}-T5.86"})
+        # ...and a spent market keeps its slot even one-sided, because with
+        # the ledger full there is no two-sided market that could take it —
+        # yielding would idle the slot, not reallocate it.
+        self.assertNotIn(f"{ev}-T5.94",
+                         imm.event_top_n_cut(grp, incumbent=set(),
+                                             slots_used=spent))
+        # a partly-spent ledger opens only the remainder, best first
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent=set(),
+                                slots_used={ev: [f"{ev}-T5.92"]}),
+            {f"{ev}-T5.94", f"{ev}-T5.96"})     # T5.86, T5.84 take the two
+        # dropping out refunds NOTHING: T5.94/T5.96 gone from the candidate
+        # list entirely, and the newcomers are still refused
+        self.assertEqual(
+            imm.event_top_n_cut([grp[0], grp[3], grp[4]], incumbent=set(),
+                                slots_used=spent),
+            {f"{ev}-T5.84", f"{ev}-T5.86"})
+        # the lifetime budget also binds when the event has <= N candidates
+        # (the old early-continue would have waved this through)
+        self.assertEqual(
+            imm.event_top_n_cut([grp[3]], incumbent=set(), slots_used=spent),
+            {f"{ev}-T5.84"})
+
+        # KXAAAGASDGA-26SEP08: wide books, EVERY candidate one-sided, so
+        # nothing earned two-sided tenure and the ROI rank alternated the
+        # third slot ~every refresh (3.8800 est 2.07 idle / 0.48 quoting).
+        # With the ledger full nothing is ranked, so nothing can flip.
+        ga = "KXAAAGASDGA-26SEP08"
+        pair = [m(f"{ga}-3.8800", 2.0672, 3.40, sides=1),
+                m(f"{ga}-3.8850", 0.3328, 1.40, sides=1),
+                m(f"{ga}-3.8550", 1.0, 5.0, sides=1)]
+        ga_spent = {ga: [f"{ga}-3.8800", f"{ga}-3.8850", f"{ga}-3.8550"]}
+        first = imm.event_top_n_cut(pair, incumbent=set(), slots_used=ga_spent)
+        # swap the est values the way the estimator does between refreshes
+        pair[0].est_dollars_per_day, pair[1].est_dollars_per_day = 0.4833, 1.9865
+        second = imm.event_top_n_cut(pair, incumbent=set(), slots_used=ga_spent)
+        self.assertEqual(first, set())
+        self.assertEqual(first, second)      # no churn across the swing
+
+        # a ledger somehow OVER N (a lowered N, a seeded ledger) stays a
+        # hard bound, and trims by slot ORDER so it cannot churn: the
+        # earliest three keep their slots on every refresh.
+        over = {ev: [f"{ev}-T5.92", f"{ev}-T5.94", f"{ev}-T5.96",
+                     f"{ev}-T5.84", f"{ev}-T5.86"]}
+        trimmed = imm.event_top_n_cut(grp, incumbent=set(), slots_used=over)
+        self.assertEqual(trimmed, {f"{ev}-T5.84", f"{ev}-T5.86"})
+        for meta in grp:                      # est swings must not move it
+            meta.est_dollars_per_day *= 7.0
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent=set(), slots_used=over), trimmed)
+        for meta in grp:
+            meta.est_dollars_per_day /= 7.0
+
+        # knob off -> the concurrent cap, which is what churned
+        imm.EVENT_TOP_N_LIFETIME = False
+        try:
+            self.assertEqual(
+                imm.event_top_n_cut(grp, incumbent=set(), slots_used=spent),
+                {f"{ev}-T5.94", f"{ev}-T5.96"})   # replaced by the newcomers
+        finally:
+            imm.EVENT_TOP_N_LIFETIME = True
+
     def test_finecon_sweep_enrollment_and_guards(self):
         # Jack 2026-09-02: Finance/Economics sweep — the risk-screened
         # survivors are allowed, guarded (safe-join, no rate bar), and the

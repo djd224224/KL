@@ -1103,6 +1103,32 @@ EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
 # taken by a two-sided market that then holds tenure, so the one-sided
 # market cannot win it back until a slot genuinely frees.
 EVENT_TOP_N_TWO_SIDED = os.environ.get("IMM_EVENT_TOP_N_TWO_SIDED", "1") == "1"
+# LIFETIME slots (Jack 2026-09-07): "3 max quoted markets on an event, not 3
+# at a given time. so if 2 drop then none replace them." N is now the number
+# of DISTINCT markets an event may ever quote, not a concurrent count: a
+# market that takes a slot keeps it for the event's life whether or not it is
+# still quoting, and when it stops nothing replaces it. What the cap is for
+# is correlated INVENTORY, and inventory does not go away when a market is
+# deselected — it rides to settlement. KXDIESELW-26SEP14 never quoted more
+# than 3 at once yet ended the day holding positions in FIVE strikes of one
+# event, because slot handovers kept admitting replacements.
+#
+# It also ends the churn the concurrent cap could not. On a wide book where
+# EVERY candidate is one-sided (KXAAAGASDGA-26SEP08: mid 54 spread 84 -> ask
+# touch above the 90c band) nothing earns two-sided tenure, so the ROI rank
+# ran every refresh — and that rank still carries the incumbent/challenger
+# asymmetry, so 3.8800 and 3.8850 alternated on ~6x est swings over an
+# unchanged book, 10 distinct markets in one day. With the lifetime ledger
+# full there are exactly N candidates for N slots and nothing left to rank.
+#
+# Recorded on SELECTION, not on the first resting order: a market the bot
+# selects has committed the slot, and counting it only once an order lands
+# would let a market that is selected, screened out, and reselected consume
+# the event's capacity repeatedly. Entries are pruned by age only (file
+# hygiene) — never by the event going quiet, or a lull would silently reset
+# the cap. IMM_EVENT_TOP_N_LIFETIME=0 restores the concurrent cap.
+EVENT_TOP_N_LIFETIME = os.environ.get("IMM_EVENT_TOP_N_LIFETIME", "1") == "1"
+EVENT_SLOTS_TTL_SECS = _env_float("IMM_EVENT_SLOTS_TTL_D", 14) * 86400.0
 
 
 def event_top_n_for(series: str) -> int:
@@ -1124,7 +1150,8 @@ def _market_roi(m: "MarketMeta", incumbent: Set[str]) -> float:
 
 def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
                     immune: Set[str] = frozenset(),
-                    members: Set[str] = frozenset()) -> Set[str]:
+                    members: Set[str] = frozenset(),
+                    slots_used: Optional[Dict[str, List[str]]] = None) -> Set[str]:
     """Tickers to EXCLUDE under the per-event top-N: for each capped event,
     everything past the N highest-ROI markets of that event.
 
@@ -1145,7 +1172,14 @@ def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
     below every two-sided candidate, so it can only ever hold a slot no
     two-sided market wants. `immune` is unaffected — finecon/scan
     quote-to-completion is a promise about not unquoting, and this cut is
-    not the place to break it."""
+    not the place to break it.
+
+    `slots_used` (event -> tickers that have ever held a slot) turns N into
+    a LIFETIME budget rather than a concurrent one: a market already in its
+    event's set is always kept, newcomers may only take what the set has
+    not spent, and a market that drops out frees nothing. Pass None (or set
+    EVENT_TOP_N_LIFETIME=0) for the original concurrent semantics. The
+    caller owns the ledger and records admissions after the cut."""
     by_event: Dict[str, List["MarketMeta"]] = {}
     for _m in metas:
         if event_top_n_for(_m.series) > 0:
@@ -1153,7 +1187,10 @@ def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
     cut: Set[str] = set()
     for _ev, group in by_event.items():
         n = event_top_n_for(group[0].series)
-        if n <= 0 or len(group) <= n:
+        if n <= 0:
+            continue
+        if len(group) <= n and not (EVENT_TOP_N_LIFETIME
+                                    and (slots_used or {}).get(_ev)):
             continue
         def _two_sided(m: "MarketMeta") -> bool:
             return (not EVENT_TOP_N_TWO_SIDED) or m.quotable_sides >= 2
@@ -1162,6 +1199,31 @@ def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
         def _rank(m: "MarketMeta") -> Tuple[int, float]:
             return (int(_two_sided(m)), _market_roi(m, incumbent))
 
+        # LIFETIME budget: markets that already hold one of this event's
+        # slots are kept unconditionally (they spent it; dropping out does
+        # not refund it) and only the unspent remainder is open to
+        # newcomers. With the ledger full there are N candidates for N
+        # slots, so nothing is ranked and nothing can churn.
+        spent = (slots_used or {}).get(_ev) if EVENT_TOP_N_LIFETIME else None
+        if spent is not None:
+            # `spent` is ORDERED by when each market took its slot. If it
+            # somehow holds more than N — a lowered N, a seeded ledger — the
+            # cap stays a hard bound and the EARLIEST N keep their slots.
+            # Order, not rank: trimming by ROI here would re-rank every
+            # refresh and churn exactly the way the concurrent cap did.
+            keep = set(spent[:n])
+            room = max(0, n - len(spent))
+            incoming = [m for m in group if m.ticker not in spent]
+            if room:
+                incoming.sort(key=lambda m: (int(_two_sided(m)),
+                                             _market_roi(m, incumbent)),
+                              reverse=True)
+                cut.update(m.ticker for m in incoming[room:])
+            else:
+                cut.update(m.ticker for m in incoming)
+            cut.update(m.ticker for m in group
+                       if m.ticker in spent and m.ticker not in keep)
+            continue
         held = sum(1 for m in group if m.ticker in immune)
         mem = [m for m in group if m.ticker not in immune
                and m.ticker in members and _two_sided(m)]
@@ -2727,6 +2789,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
+    "EVENT_TOP_N_LIFETIME",
 )
 
 
@@ -4452,6 +4515,9 @@ class BotState:
     #   evicted market's wind-down losses stay the tier's
     scan_entry_mid: Dict[str, float] = field(default_factory=dict)  # YES mid
     #   at admission — the drift tripwire's anchor
+    # event -> {"markets": [tickers ever given a slot], "ts": last touch}.
+    # The lifetime per-event slot ledger (EVENT_TOP_N_LIFETIME).
+    event_slots: Dict[str, dict] = field(default_factory=dict)
     scan_evicted_events: Dict[str, float] = field(default_factory=dict)  # ev
     #   -> ts; PERMANENT for the event (the estimator/admission refuse it)
     scan_series_strikes: Dict[str, List[float]] = field(default_factory=dict)
@@ -4857,6 +4923,36 @@ class IncentiveMarketMaker:
             self.state.scan_entry_mid = {
                 str(t): float(v)
                 for t, v in (data.get("scan_entry_mid") or {}).items()}
+            self.state.event_slots = {
+                str(e): {"markets": [str(x) for x in (v.get("markets") or [])],
+                         "ts": float(v.get("ts") or 0.0)}
+                for e, v in (data.get("event_slots") or {}).items()
+                if isinstance(v, dict)}
+            if EVENT_TOP_N_LIFETIME and not self.state.event_slots:
+                # First run on a state file written before the lifetime
+                # ledger existed. Seed it from the persisted selection:
+                # those markets HAVE spent their slots (they are quoting and
+                # carrying inventory), and starting empty would hand every
+                # capped event a fresh budget on every upgrade or restart —
+                # the exact "kept admitting replacements" the ledger exists
+                # to stop. Positions are deliberately NOT used as the seed:
+                # an event the bot churned through before today can hold
+                # inventory in more than N markets, and seeding that would
+                # start the ledger already over its own cap.
+                for _t in sorted(self.state.sticky_prev):
+                    if event_top_n_for(series_of(_t)) <= 0:
+                        continue
+                    _e = "-".join(_t.split("-")[:2])
+                    _s = self.state.event_slots.setdefault(
+                        _e, {"markets": [], "ts": time.time()})
+                    if _t not in _s["markets"]:
+                        _s["markets"].append(_t)
+                if self.state.event_slots:
+                    log(f"{self.tag} seeded lifetime event slots from the "
+                        f"persisted selection: {len(self.state.event_slots)} "
+                        f"events, "
+                        f"{sum(len(v['markets']) for v in self.state.event_slots.values())}"
+                        f" markets")
             self.state.scan_evicted_events = {
                 str(e): float(v)
                 for e, v in (data.get("scan_evicted_events") or {}).items()}
@@ -5059,6 +5155,13 @@ class IncentiveMarketMaker:
                                t: round(v, 1)
                                for t, v in self.state.scan_entry_mid.items()
                                if t in self.state.scan_members},
+                           # lifetime slots: age-pruned ONLY (a quiet event
+                           # must never get its cap back — see EVENT_TOP_N)
+                           "event_slots": {
+                               e: {"markets": v["markets"],
+                                   "ts": round(v["ts"], 1)}
+                               for e, v in self.state.event_slots.items()
+                               if time.time() - v["ts"] < EVENT_SLOTS_TTL_SECS},
                            # permanent for the event; the TTL is file hygiene
                            "scan_evicted_events": {
                                e: round(v, 1)
@@ -6083,13 +6186,33 @@ class IncentiveMarketMaker:
                        if EVENT_TOP_N_STICKY
                        and event_top_n_for(m.series) > 0
                        and m.ticker in prev_selected}
+        # Lifetime slot ledger (Jack 2026-09-07 "3 max quoted markets on an
+        # event, not 3 at a given time"): what each capped event has already
+        # spent. Read before the cut, written after it with whatever the cut
+        # kept — so a market only ever burns a slot by actually surviving
+        # into the selection.
+        slots_used = {e: list(v["markets"])
+                      for e, v in self.state.event_slots.items()}             if EVENT_TOP_N_LIFETIME else None
         topn_cut = event_top_n_cut(ranked, prev_selected,
                                    immune=fin_sticky | scan_sticky,
-                                   members=topn_sticky)
+                                   members=topn_sticky,
+                                   slots_used=slots_used)
         if topn_cut:
             skipped["event_top_n"] = len(topn_cut)
             decisions.update({_t: "event_top_n" for _t in topn_cut})
             ranked = [m for m in ranked if m.ticker not in topn_cut]
+        if EVENT_TOP_N_LIFETIME:
+            for _m in ranked:
+                if event_top_n_for(_m.series) <= 0:
+                    continue
+                _slot = self.state.event_slots.setdefault(
+                    _m.event_ticker, {"markets": [], "ts": now_ts})
+                _slot["ts"] = now_ts
+                if _m.ticker not in _slot["markets"]:
+                    _slot["markets"].append(_m.ticker)
+                    log(f"{self.tag} event slot {len(_slot['markets'])}"
+                        f"/{event_top_n_for(_m.series)} on "
+                        f"{_m.event_ticker}: {_m.ticker}")
 
         # Finecon GROUP top-N (Jack 2026-09-02 — see finecon_group_cut):
         # after the per-event cut so a gas-monthly strike trimmed there can
