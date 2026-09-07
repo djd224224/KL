@@ -6265,6 +6265,12 @@ class IncentiveMarketMaker:
                     "book_depth_contracts": mt.book_depth_contracts,
                     "mid_cents": mt.mid_cents, "spread_cents": mt.spread_cents,
                     "volume": mt.volume, "is_scan": bool(getattr(mt, "scan", False)),
+                    # decides per-event slots as of 2026-09-07 (a one-sided
+                    # candidate sorts below every two-sided one and forfeits
+                    # tenure), so "why did X hold the slot" is unanswerable
+                    # without it — the exact question the est/ROI columns
+                    # alone could not settle for KXTRUEV-26SEP07-T1263.42.
+                    "quotable_sides": mt.quotable_sides,
                 }
 
             # (a) Event-driven: only decisions that CHANGED since the last
