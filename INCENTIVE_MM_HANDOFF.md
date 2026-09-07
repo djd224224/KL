@@ -763,6 +763,67 @@ Register-ScheduledTask -TaskName 'KL imm opportunistic' -Force `
   -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2))
 ```
 
+## 2026-09-07 — profitability pass: 30 slots, undated opened, hopeless exit armed (Jack)
+
+Measured first, on the live tier: 25 members earning an est **$6.58/day**
+in total, while ONE fully admissible blocked event (KXTRUMPENDORSEMENTS,
+target 300) was worth **$3.68/day** on its top 3 strikes and the three
+weakest members were worth **$0.18/day** combined. The tier was slot-bound,
+not screen-bound, and nowhere near its risk limit — $36 of collateral
+deployed, -$1.90 MTM, against a $75/day loss budget.
+
+**`SCAN_TOP_N` 15 -> 30.** The cheapest of the three: the constraint was
+slot count, not exposure.
+
+**Undated opened (`cutoff_known`).** `undated` was never really about the
+ticker string — it is about whether ANY stand-down guard exists. A market
+with no day in the ticker is now admissible when a cutoff RESOLVED
+(Kalshi publishes an occurrence meaningfully before expiration, which
+`trade_cutoff_utc` already turns into a real cutoff) or when it is a
+Fiscal.ai month event. Everything else still rejects as `undated`, which is
+most of the bucket and deliberately so: of the top 120 undated by pool,
+only ~24% carry a derivable cutoff; the rest are YouTube view counts,
+headlines, playoff and primary OUTCOMES, where quoting would mean quoting
+straight through whatever resolves them. The string-level pre-drop is gone
+(an occurrence lives on the market object, so these must hydrate to be
+judged) and `_scan_admission` makes the call.
+
+Measured: scan candidates 926 -> 1699 after the string screens, of which
+71 undated markets (~$1,320/day pool) now clear the structure screen —
+KXBAA/KXF/KXFA/KXKR/KXYUM/KXTTAN (Fiscal.ai KPI ladders) and
+KXPRIMARYTURNOUT. **COST TO WATCH:** the candidate list now exceeds
+`SCAN_MAX_BULK` 1000 by ~700, so the bulk cap drops far more than before.
+It is pool-ranked and existing members are always kept, so nothing quoting
+is lost, but low-pool candidates now go unread. Raising `IMM_SCAN_MAX_BULK`
+is the lever if that starts hiding good markets.
+
+**SAFETY FIX SHIPPED WITH IT:** opening undated made KXYTVIEWSW (327
+markets) and KXYTVIEWSHIGH (139) reachable for the first time, and both
+settle on `charts.youtube.com` — a public view counter that ticks
+continuously, i.e. exactly the "everyone can price this but us" class. They
+PASSED the live-source screen because no youtube keyword existed.
+`youtube.com` added to `SCAN_LIVE_SOURCE_KEYWORDS`.
+
+**Hopeless exit now applies to scan members (`SCAN_HOPELESS_EXIT`, default
+on).** Jack: "refuse candidates that cannot reach a dollar before their
+program ends." Entry ALREADY required a projected $1 — `reaches_min` is
+`accrued + est x _quotable_days`, bounded by the program end — but a MEMBER
+bypassed it forever: sticky members skip the floor and the hopeless exit
+explicitly exempted `meta.scan`. So a slot could be held by a market that
+had become mathematically unable to earn. Measured the same day: the
+weakest member projected ~$0.59 against Kalshi's hard $1.00 per-market
+floor, with 11 days still to run. Now a scan member sustained under the bar
+for `HOPELESS_SUSTAIN_SECS` is evicted and its slot freed; the dip guard
+still means one low reading cannot evict, and since this morning eviction
+cancels every order rather than leaving a wind-down leg. FINECON stays
+exempt — that group's absolute $1 projections are noisiest on deliberately
+quiet long windows, which is why Jack made it quote-to-completion on 9/3.
+
+**Scope note.** `SCAN_DAILY_LOSS_LIMIT` ($75) is the TIER's budget — realized
+plus MTM across every market the scan ever admitted (`scan_book`), for the
+ET day. Not per event, and separate from the whole-bot `DAILY_LOSS_LIMIT`
+($1,200).
+
 ## 2026-09-07 — history screen rebalanced: two checks off, two loosened (Jack)
 
 Jack, after an ELI5 walk through the four history checks: "turn off these
@@ -1225,7 +1286,7 @@ event pool) first, or it will measure nothing.
 
 ### Knobs (env, prefix IMM_SCAN_)
 
-`TOP_N` 15 (0 = tier OFF, nothing else in the bot reads these) ·
+`TOP_N` 30 (0 = tier OFF, nothing else in the bot reads these) ·
 `EVENT_TOP_N` 3 · `DAILY_OPENINGS` 5 · `LEVELS` unset = global ladder ·
 `MAX_POSITION` unset = global cap · `REF_MULT_CAP` 0 = uncapped ·
 `HOUR_MULT` 1 · `REQUIRE_DATED` 1 · `REQUIRE_NUMERIC` 1 ·

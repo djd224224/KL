@@ -7632,6 +7632,13 @@ class TestOpenScanTier(unittest.TestCase):
                 {"name": "The Weather Company",
                  "url": "https://weather.com/kalshi"}]})[1],
             "live_source")
+        # a public, continuously-ticking view counter (2026-09-07, found
+        # when the undated opening first made KXYTVIEWSW reachable)
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Entertainment", "settlement_sources": [
+                {"name": "YouTube Charts",
+                 "url": "https://charts.youtube.com/US"}]})[1],
+            "live_source")
         # ... while a sports / politics / crypto series settled on a record
         # or a report is admissible, like any econ print
         self.assertEqual(imm.scan_series_meta_verdict(
@@ -7928,8 +7935,12 @@ class TestOpenScanTier(unittest.TestCase):
         fiscal_src = [{"name": "Fiscal.ai", "url": "https://fiscal.ai"}]
         m = dict(self._market(t), event_ticker=ev)
         bot.client.candles[t] = self._candles()
-        meta = self._meta(t=t, event_ticker=ev, series="KXFISC",
-                          cutoff=imm.scan_report_month_cutoff(ev, None))
+        # cutoff=None on purpose: since 2026-09-07 a RESOLVED cutoff is on
+        # its own sufficient (cutoff_known short-circuits before any series
+        # read), so the fiscal path is only exercised when none resolved.
+        # In the live loop a month-named event already carries its month
+        # cutoff by this point, so it is admitted without paying for a read.
+        meta = self._meta(t=t, event_ticker=ev, series="KXFISC", cutoff=None)
         budget = {"series": 5, "history": 5}
         # fiscal series -> admissible; one series read, flag cached
         bot.client.series_meta["KXFISC"] = {"category": "Financials",
@@ -7993,7 +8004,10 @@ class TestOpenScanTier(unittest.TestCase):
                 cutoff=None, close_time=None, est_dollars_per_day=est,
                 est_exposure_dollars=10.0, est_collateral_dollars=0.0,
                 scan=scan)
-        self.assertEqual(imm.SCAN_TOP_N, 15)
+        # the walk MECHANICS are what this pins; the production slot count
+        # moved 15 -> 30 on 2026-09-07 and must not break the fixture
+        self.assertEqual(imm.SCAN_TOP_N, 30)
+        self.enterContext(mock.patch.object(imm, "SCAN_TOP_N", 15))
         self.assertEqual(imm.SCAN_EVENT_TOP_N, 3)
         self.assertEqual(imm.SCAN_DAILY_OPENINGS, 5)
         # 5 strikes of one event with the best ROIs: only 3 survive, the
@@ -8247,11 +8261,48 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(bot2.state.scan_members, {self.A})
         self.assertEqual(getattr(bot2.client, "candle_reads", 0), reads)
 
-    def test_scan_member_survives_hopeless(self):
-        # quote-to-completion (the finecon lifecycle): a sustained sub-$1
-        # projection evicts an ordinary member but not a scan member
+    def test_scan_member_evicted_when_it_cannot_reach_a_dollar(self):
+        # Jack 2026-09-07: "refuse candidates that cannot reach a dollar
+        # before their program ends". Entry always required a projected $1,
+        # but a MEMBER bypassed the floor forever because sticky members skip
+        # it and the hopeless exit exempted meta.scan — so a slot could be
+        # held by a market mathematically unable to earn (measured: a member
+        # projecting ~$0.59 against the hard $1.00 floor, 11 days to run).
+        self.assertTrue(imm.SCAN_HOPELESS_EXIT)          # shipped default
         bot = self._bot()
         bot.run_cycle()
+        self.assertIn(self.A, bot.state.selected)
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9                  # nothing can reach it
+        try:
+            # DIP GUARD FIRST: the projection is under the bar but has not
+            # been under it for HOPELESS_SUSTAIN_SECS, so nothing evicts
+            bot._est_peak.clear()
+            bot.state.hopeless_since.pop(self.A, None)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.A, bot.state.selected,
+                          "a single low reading must not evict")
+            # now sustained under the bar -> evicted, slot freed
+            bot._est_peak.clear()
+            bot.state.hopeless_since[self.A] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertNotIn(self.A, bot.state.selected)
+            # ... and the freed market carries no orders (2026-09-07)
+            self.assertEqual(
+                [o for o in bot.state.sim_orders.values()
+                 if o.get("ticker") == self.A], [])
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_scan_hopeless_exit_knob_restores_quote_to_completion(self):
+        """IMM_SCAN_HOPELESS_EXIT=0 puts scan members back on the finecon
+        lifecycle: a sustained sub-$1 projection does NOT evict them."""
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.A, bot.state.selected)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = 1e9
         try:
@@ -8259,7 +8310,8 @@ class TestOpenScanTier(unittest.TestCase):
             bot.state.hopeless_since[self.A] = (
                 time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
             bot.state.universe_at = 0.0
-            bot.run_cycle()
+            with mock.patch.object(imm, "SCAN_HOPELESS_EXIT", False):
+                bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor

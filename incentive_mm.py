@@ -1810,7 +1810,14 @@ def finecon_openings_used(n_kept: int, n_members: int) -> int:
 # re-applied from the persisted member list at load, so a restart can never
 # leave a scan member quoting without safe-join.
 # ============================================================================
-SCAN_TOP_N = _env_int("IMM_SCAN_TOP_N", 15)
+# 15 -> 30 (Jack 2026-09-07, on the measurement below). The tier was slot-
+# bound, not screen-bound: 25 members earning an est $6.58/day held every
+# slot against admissible candidates worth multiples of them, because
+# members quote to completion and only 5 openings exist per day. It was also
+# nowhere near its risk limit — $36 of collateral deployed and -$1.90 MTM
+# against a $75/day loss budget — so the slot count, not the exposure, was
+# the binding constraint.
+SCAN_TOP_N = _env_int("IMM_SCAN_TOP_N", 30)
 SCAN_EVENT_TOP_N = _env_int("IMM_SCAN_EVENT_TOP_N", 3)
 SCAN_DAILY_OPENINGS = _env_int("IMM_SCAN_DAILY_OPENINGS", 5)
 # Sizing = the NORMAL BOOK's (Jack 2026-09-05 pm: "it can have the same
@@ -1933,6 +1940,23 @@ SCAN_MID_JUMP_CENTS = _env_float("IMM_SCAN_MID_JUMP", 0)
 SCAN_DRIFT_CENTS = _env_float("IMM_SCAN_DRIFT", 0)
 # The backstop that IS on: the tier's own daily loss budget.
 SCAN_DAILY_LOSS_LIMIT = _env_float("IMM_SCAN_DAILY_LOSS_LIMIT", 75.0)
+# Scan members face the HOPELESS EXIT (Jack 2026-09-07: "refuse candidates
+# that cannot reach a dollar before their program ends"). Entry already
+# required a projected $1 — `reaches_min` uses est x _quotable_days, which
+# is bounded by the program end — but a MEMBER bypassed that check forever,
+# because sticky members skip the floor and the hopeless exit explicitly
+# exempted `meta.scan`. So a slot could be held by a market that had become
+# mathematically unable to earn: measured 2026-09-07, the weakest member was
+# projecting ~$0.59 against Kalshi's hard $1.00 per-market floor, i.e. a
+# guaranteed zero, with 11 days left on its program.
+#
+# Now a scan member that stays under the bar for HOPELESS_SUSTAIN_SECS is
+# evicted and its slot freed. The dip guard still applies (a single low
+# reading cannot evict), and since 2026-09-07 eviction cancels every order
+# rather than leaving a wind-down leg. FINECON stays exempt — Jack's
+# 2026-09-03 quote-to-completion rule was about that curated group, whose
+# absolute $1 projections are noisiest on deliberately quiet long windows.
+SCAN_HOPELESS_EXIT = os.environ.get("IMM_SCAN_HOPELESS_EXIT", "1") == "1"
 SCAN_SERIES_STRIKE_LIMIT = _env_int("IMM_SCAN_SERIES_STRIKES", 2)
 SCAN_SERIES_STRIKE_TTL_SECS = _env_float("IMM_SCAN_SERIES_STRIKE_DAYS", 7) * 86400.0
 SCAN_EVICT_TTL_SECS = 30 * 86400.0      # file hygiene only; events settle sooner
@@ -2009,6 +2033,12 @@ SCAN_LIVE_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
     "mlb.com,nfl.com,nhl.com,ufc.com,pgatour,formula1,atptour,wtatennis,"
     "fifa.com,uefa.com,sofascore,flashscore,ercot,pjm.com,caiso,"
     "fear-and-greed,weather.gov,weather.com,wunderground,timeanddate,"
+    # youtube.com covers charts.youtube.com, the settlement source for
+    # KXYTVIEWSW (327 markets) and KXYTVIEWSHIGH (139). Added 2026-09-07
+    # WITH the undated opening, which is what first made them reachable:
+    # a public view counter that ticks continuously is the textbook case
+    # the live-source screen exists for — everyone can price it but us.
+    "youtube.com,"
     "polymarket").split(",") if k.strip())
 # Series currently carrying the scan guard set (see ensure_scan_override):
 # read by hour_size_mult (no quiet-hours doubling) and capped_ref_mult (the
@@ -2039,7 +2069,8 @@ def scan_universe_reason(ticker: str) -> Optional[str]:
 
 
 def scan_shape_reason(ticker: str, strike_type: Optional[str] = None,
-                      fiscal: bool = False) -> Optional[str]:
+                      fiscal: bool = False,
+                      cutoff_known: bool = False) -> Optional[str]:
     """STRUCTURE screen: 'undated' when the event segment carries no day
     (no midnight-ET release guard exists for it), 'shape' when the strike
     is not a numeric threshold (a categorical/binary outcome — the class
@@ -2057,7 +2088,23 @@ def scan_shape_reason(ticker: str, strike_type: Optional[str] = None,
     midnight rule — so 'undated' is waived when the month parses. Any
     other undated shape (no month at all, KXRT-DOG) stays rejected."""
     if SCAN_REQUIRE_DATED and parse_event_date(ticker) is None:
-        if not (fiscal and parse_event_month(ticker) is not None):
+        # `undated` was never really about the ticker STRING — it is about
+        # whether any stand-down guard exists at all. Two ways to have one
+        # without a day in the ticker:
+        #   fiscal + month  the Fiscal.ai KPI class, out at the 1st of the
+        #                   report month (2026-09-06)
+        #   cutoff_known    Kalshi PUBLISHES an occurrence meaningfully
+        #                   before expiration, which trade_cutoff_utc turns
+        #                   into a real cutoff (Jack 2026-09-07 "open the
+        #                   undated bucket")
+        # Measured on the live feed the day it shipped: 826 undated
+        # scan-universe markets, $11.7k/day of pool, but only ~24% of the
+        # top 120 by pool carry a derivable cutoff. The rest — YouTube view
+        # counts, headlines, playoff and primary outcomes — have NO guard,
+        # and quoting them would mean quoting straight through whatever
+        # resolves them. Those still reject here, which is the point.
+        if not (fiscal and parse_event_month(ticker) is not None) \
+                and not cutoff_known:
             return "undated"
     if SCAN_REQUIRE_NUMERIC:
         parts = ticker.split("-")
@@ -5895,15 +5942,14 @@ class IncentiveMarketMaker:
                 if ticker_cutoff_passed(t):
                     scan_skips["cutoff_passed"] = scan_skips.get("cutoff_passed", 0) + 1
                     continue
-                if t not in self.state.scan_members \
-                        and SCAN_REQUIRE_DATED and parse_event_date(t) is None \
-                        and not scan_month_prescreen_ok(
-                            t, self.state.scan_series_meta.get(series_of(t))):
-                    # month-named Fiscal.ai KPI events hydrate (Jack
-                    # 2026-09-06); _scan_admission reads the series and
-                    # applies the report-month rule
-                    scan_skips["undated"] = scan_skips.get("undated", 0) + 1
-                    continue
+                # NOTE there is no string-level `undated` drop any more (Jack
+                # 2026-09-07 "open the undated bucket"). Whether an undated
+                # market has a stand-down guard depends on its OCCURRENCE,
+                # which only exists on the market object, so it has to
+                # hydrate to be judged; _scan_admission then rejects it as
+                # `undated` unless a cutoff resolved or it is a Fiscal.ai
+                # month event. The bulk cap below still bounds the reads, and
+                # it is pool-ranked, so the biggest pools hydrate first.
                 scan_pre.append((t, info))
             scan_pre.sort(key=lambda kv: -kv[1]["dollars_per_day"])
             if len(scan_pre) > SCAN_MAX_BULK:
@@ -6167,7 +6213,7 @@ class IncentiveMarketMaker:
                     and sub_bar_secs >= HOPELESS_SUSTAIN_SECS \
                     and meta.ticker in prev_selected \
                     and meta.series not in FINECON_SERIES \
-                    and not meta.scan \
+                    and (SCAN_HOPELESS_EXIT or not meta.scan) \
                     and meta.event_ticker not in FORCE_EVENTS \
                     and not curated_event(meta.event_ticker, meta.series, now_utc):
                 # STICKY EXIT (Jack 2026-07-25): "<5% chance to reach $1 by
@@ -6610,8 +6656,15 @@ class IncentiveMarketMaker:
         # reject is waived only for a Fiscal.ai-settled series, which takes
         # the (cached, budgeted) series read BEFORE the structure verdict.
         # Non-numeric month binaries never earn that read — 'shape' first.
+        # An undated ticker is admissible when SOME stand-down guard exists:
+        # a resolved cutoff (Kalshi's published occurrence, via
+        # trade_cutoff_utc), or the Fiscal.ai report month. cutoff_known is
+        # checked first because it costs no read — only a month-named ticker
+        # with no cutoff pays for a series read to learn its family.
+        cutoff_known = meta.cutoff is not None
         fiscal = False
-        if SCAN_REQUIRE_DATED and parse_event_date(meta.ticker) is None \
+        if SCAN_REQUIRE_DATED and not cutoff_known \
+                and parse_event_date(meta.ticker) is None \
                 and parse_event_month(meta.ticker) is not None:
             pre = scan_shape_reason(meta.ticker, m.get("strike_type"), fiscal=True)
             if pre is not None:
@@ -6626,7 +6679,8 @@ class IncentiveMarketMaker:
                     return why or "series_meta"
                 known = self._scan_series_fiscal(meta.series)
             fiscal = bool(known)
-        why = scan_shape_reason(meta.ticker, m.get("strike_type"), fiscal=fiscal)
+        why = scan_shape_reason(meta.ticker, m.get("strike_type"),
+                                fiscal=fiscal, cutoff_known=cutoff_known)
         if why:
             return why
         if meta.cutoff is not None and now_utc >= meta.cutoff:
