@@ -1677,7 +1677,10 @@ class TestDryRunCycle(unittest.TestCase):
         self.assertEqual(sides, {"ask"})
 
     def test_reduce_only_tail(self):
-        """A market we hold but no longer select gets reduce-only asks <= |pos|."""
+        """A market we hold but no longer select gets reduce-only asks <= |pos|.
+        Requires the wind-down ARMED — off by default since 2026-09-07, when
+        Jack asked for dropped markets to carry no orders at all."""
+        self.enterContext(mock.patch.object(imm, "WINDDOWN_DROPPED", True))
         bot = self._bot()
         t = "KXGOOD-99DEC31-A"
         bot.state.universe_at = time.time()          # skip refresh: nothing selected
@@ -1689,6 +1692,50 @@ class TestDryRunCycle(unittest.TestCase):
         self.assertTrue(orders)
         self.assertTrue(all(o["book_side"] == "ask" for o in orders))
         self.assertLessEqual(sum(o["remaining_count"] for o in orders), 10)
+
+    def test_dropped_market_carries_no_orders(self):
+        """DEFAULT since 2026-09-07 (Jack: "fine for market to get dropped,
+        but quotes on the dropped market should all be canceled"). A market
+        we hold inventory in but no longer select gets NO orders at all —
+        not even the reduce-only leg — and anything still resting on it is
+        cancelled by the stray sweep. Measured cause: KXSBUXCC-26OCT07-T98
+        sat with a lone 82c bid against an 84/85 book, earning nothing from
+        a live program while carrying fill risk."""
+        self.assertFalse(imm.WINDDOWN_DROPPED)     # the shipped default
+        bot = self._bot()
+        t = "KXGOOD-99DEC31-A"
+        bot.state.universe_at = time.time()        # skip refresh: nothing selected
+        bot.state.managed_extra[t] = _meta(ticker=t, event_ticker="KXGOOD-99DEC31")
+        bot.client.positions[t] = 10
+        bot.pnl.pos[t] = 10
+        bot.run_cycle()
+        self.assertEqual(bot.state.sim_orders, {},
+                         "a dropped market must carry no orders")
+        self.assertEqual(bot.state.managed_extra, {},
+                         "the wind-down leg must be released, not retained")
+        # ... and the orphan restore does not put it back on the next cycle
+        bot.restore_orphan_metas({t: 10.0})
+        self.assertEqual(bot.state.managed_extra, {})
+
+    def test_dropped_inventory_still_counts_against_its_event_cap(self):
+        """The cap must not lose sight of inventory just because the market
+        stopped being quoted (2026-09-07): event_net reads the OWN BOOK, so
+        a held-but-unquoted strike still consumes its event's room and the
+        bot cannot rebuild the same exposure on a sibling."""
+        self.assertFalse(imm.WINDDOWN_DROPPED)
+        bot = self._bot()
+        held, quoted = "KXGOOD-99DEC31-Z", "KXGOOD-99DEC31-A"
+        # a big short on a strike that is NOT selected, same event
+        bot.pnl.pos[held] = -imm.MAX_EVENT_CONTRACTS
+        bot.client.positions[held] = -imm.MAX_EVENT_CONTRACTS
+        bot.run_cycle()
+        self.assertIn(quoted, bot.state.selected)
+        # the event is already at its short cap, so no further ASK (sell)
+        # size may rest on the sibling; bids (which reduce) are still fine
+        asks = [o for o in bot.state.sim_orders.values()
+                if o.get("ticker") == quoted and o.get("book_side") == "ask"]
+        self.assertEqual(asks, [],
+                         "held inventory was invisible to the event cap")
 
     def test_halt_file(self):
         bot = self._bot()
@@ -3481,6 +3528,8 @@ class TestStickySelection(unittest.TestCase):
         # wind-down. Empty programmed set = failsafe open (a transient feed
         # outage must not mass-freeze the book).
         _clean_persist()
+        # the no-rent freeze governs the WIND-DOWN path, so arm it
+        self.enterContext(mock.patch.object(imm, "WINDDOWN_DROPPED", True))
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         t = "KXDEAD-99DEC31-A"
         meta = MarketMeta(
@@ -4703,8 +4752,10 @@ class TestPersistence(unittest.TestCase):
 
     def test_orphan_position_restored_reduce_only(self):
         """Restart with OUR inventory on a no-longer-selected market: meta is
-        rebuilt from the market read and only the reducing side is quoted."""
+        rebuilt from the market read and only the reducing side is quoted.
+        Wind-down ARMED (off by default since 2026-09-07)."""
         _clean_persist()
+        self.enterContext(mock.patch.object(imm, "WINDDOWN_DROPPED", True))
         client = FakeClient()
         bot = IncentiveMarketMaker(client=client, live=False)
         t = "KXGOOD-99DEC31-A"
@@ -6815,6 +6866,7 @@ class TestCallWindowFreeze(unittest.TestCase):
         """The freeze must not become a blanket ban on reduce-only exits —
         before the call, working out inventory is exactly what we want."""
         self._set_call(24 * 60)                  # call is tomorrow
+        self.enterContext(mock.patch.object(imm, "WINDDOWN_DROPPED", True))
         bot = self._bot()
         bot.restore_orphan_metas({self.T: -40.0})
         self.assertIn(self.T, bot.state.managed_extra,
@@ -6825,6 +6877,7 @@ class TestCallWindowFreeze(unittest.TestCase):
         existing wind-down behaviour — this change is scoped to call windows,
         and freezing them would strand inventory at settlement instead."""
         imm.EVENT_START_OVERRIDES.pop(self.EV, None)
+        self.enterContext(mock.patch.object(imm, "WINDDOWN_DROPPED", True))
         bot = self._bot()
         bot.restore_orphan_metas({self.T: -40.0})
         self.assertIn(self.T, bot.state.managed_extra)

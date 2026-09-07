@@ -1208,6 +1208,25 @@ BREAKERS_ENABLED = os.environ.get("IMM_BREAKERS", "0") == "1"
 SKEW_SOFT_CONTRACTS = _env_float("IMM_SKEW_SOFT", 30)   # halve accumulating side
 SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
+# DROPPED MARKETS CARRY NO ORDERS (Jack 2026-09-07: "fine for market to get
+# dropped, but quotes on the dropped market should all be canceled").
+#
+# Until now a market that fell out of selection while holding inventory
+# became a reduce-only `managed_extra` leg and kept ONE order resting to
+# work the position out. Measured on KXSBUXCC-26OCT07-T98 the morning Jack
+# asked: a lone 82c bid against an 84/85 book — one-sided and two ticks
+# behind the touch, so it earned nothing from the market's live $100/day
+# program while still carrying fill risk. Same conclusion he reached for
+# blocklisted series on 2026-07-25 (the gas wind-down fire-selling into
+# pinned books): if the bot is not making a market there, it holds no
+# orders. Positions ride to settlement; flatten by hand.
+#
+# OFF = deselection cancels everything on the market (the stray-order sweep
+# does it, exactly as it already does for blocklisted / no-rent / call-window
+# freezes). The market's inventory STILL counts against its event cap — see
+# event_net in run_cycle, which reads the own book, not the managed set, so
+# nothing is hidden from the caps. =1 restores the old wind-down.
+WINDDOWN_DROPPED = os.environ.get("IMM_WINDDOWN_DROPPED", "0") == "1"
 # REMOVED across the bot (Jack 2026-08-02: "remove reduce-only X minutes
 # ahead"): default 0 = both sides quote right up to the cutoff; the exchange-
 # side order-expiration cap at the cutoff (place_order) is the guard, and the
@@ -6692,7 +6711,14 @@ class IncentiveMarketMaker:
         """After a restart, positions can exist on persisted known tickers
         that are no longer selected and whose MarketMeta died with the old
         process — without a meta they get no reduce-only management and are
-        invisible to the event-cap accounting. Rebuild metas for them."""
+        invisible to the event-cap accounting. Rebuild metas for them.
+
+        NO-OP unless WINDDOWN_DROPPED (Jack 2026-09-07): with the wind-down
+        off there is nothing to manage on a dropped market — its orders are
+        cancelled — and the event-cap accounting no longer needs a meta
+        either (event_net reads the own book directly)."""
+        if not WINDDOWN_DROPPED:
+            return
         missing = [t for t in self.state.known_tickers
                    if abs(positions.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS
                    and t not in self.state.selected
@@ -7036,8 +7062,18 @@ class IncentiveMarketMaker:
         if not fast_only:
             self.restore_orphan_metas(positions)
 
-        # Managed set = selected + any market we still hold inventory in.
+        # Managed set = selected + (only when the wind-down is armed) any
+        # market we still hold inventory in. With WINDDOWN_DROPPED off — the
+        # default since 2026-09-07 — a dropped market is simply unmanaged,
+        # and the stray-order sweep below cancels whatever is resting on it.
         managed: Dict[str, MarketMeta] = dict(self.state.selected)
+        if not WINDDOWN_DROPPED and self.state.managed_extra:
+            log(f"{self.tag} dropped-market wind-down is off: releasing "
+                f"{len(self.state.managed_extra)} held market(s) to the "
+                f"stray-order sweep "
+                f"({', '.join(sorted(self.state.managed_extra)[:6])}"
+                + (" ..." if len(self.state.managed_extra) > 6 else "") + ")")
+            self.state.managed_extra.clear()
         for t, meta in list(self.state.managed_extra.items()):
             if self._blocked(t):
                 # frozen series (see restore_orphan_metas): flush any entry
@@ -7057,10 +7093,11 @@ class IncentiveMarketMaker:
                 self.state.managed_extra.pop(t, None)
             elif t not in managed:
                 managed[t] = meta
-        for t in list(self.state.selected):
-            # remember metas for later reduce-only management
-            if abs(positions.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS:
-                self.state.managed_extra[t] = self.state.selected[t]
+        if WINDDOWN_DROPPED:
+            for t in list(self.state.selected):
+                # remember metas for later reduce-only management
+                if abs(positions.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS:
+                    self.state.managed_extra[t] = self.state.selected[t]
 
         self.state.known_tickers |= set(managed)
         # Prune dead entries (unmanaged, flat) so the set stays bounded.
@@ -7111,10 +7148,23 @@ class IncentiveMarketMaker:
         # counted from the BOT'S OWN book — the user's manual positions
         # (on these or sibling markets of the event) are his risk budget,
         # not the bot's (user decision 2026-07-11).
+        # Counted over the OWN BOOK, not the managed set (2026-09-07): with
+        # the dropped-market wind-down off, a market we still hold inventory
+        # in is no longer managed, and iterating `managed` would have made
+        # that inventory invisible to its own event's cap — the bot could
+        # then rebuild the same exposure on a sibling strike. Every own-book
+        # position on a managed event counts, quoted or not.
         event_net: Dict[str, float] = {}
-        for t, meta in managed.items():
-            event_net[meta.event_ticker] = event_net.get(meta.event_ticker, 0.0) \
-                + self.pnl.pos.get(t, 0.0)
+        managed_events = {m.event_ticker for m in managed.values()}
+        _ev_of = {t: m.event_ticker for t, m in managed.items()}
+        for t, p in self.pnl.pos.items():
+            if abs(p) < 1e-9:
+                continue
+            ev = _ev_of.get(t) or self._event_of(t)
+            if ev in managed_events:
+                event_net[ev] = event_net.get(ev, 0.0) + p
+        for ev in managed_events:
+            event_net.setdefault(ev, 0.0)
         event_room_buy = {e: event_cap_contracts(e) - n for e, n in event_net.items()}
         event_room_sell = {e: event_cap_contracts(e) + n for e, n in event_net.items()}
         # Orders preserved on blind markets never enter `desired`, so charge

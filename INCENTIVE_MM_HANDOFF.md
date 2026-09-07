@@ -763,6 +763,61 @@ Register-ScheduledTask -TaskName 'KL imm opportunistic' -Force `
   -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2))
 ```
 
+## 2026-09-07 — a DROPPED market carries no orders (Jack)
+
+Jack, after finding `KXSBUXCC-26OCT07-T98` not earning: "fine for market to
+get dropped, but quotes on the dropped market should all be canceled."
+
+WHAT HE SAW. T98 held a -50 short, had fallen out of the finecon selection
+(the group was 20 members against a cap of 15 with all 5 daily openings
+spent, so it could not re-enter), and was therefore a reduce-only
+`managed_extra` leg. That leg rested exactly ONE order: a 82c bid against
+an 84/85 book — one-sided and two ticks behind the touch, so it qualified
+for nothing while the market's live $100/day program ran, and it still
+carried fill risk. T99 and T100 were in the same state.
+
+THE RULE NOW (`WINDDOWN_DROPPED`, `IMM_WINDDOWN_DROPPED`, default OFF).
+Deselection cancels everything on the market. There is no reduce-only
+wind-down leg: `restore_orphan_metas` is a no-op, the "remember metas"
+loop does not run, any surviving `managed_extra` entries are released with
+a log line, and the stray-order sweep cancels what is resting — exactly
+the path blocklisted / no-rent / call-window freezes already take.
+Positions ride to settlement; flatten by hand. Same conclusion Jack
+reached for blocklisted series on 2026-07-25, when the gas retirement's
+wind-down fire-sold longs into pinned books. `=1` restores the old
+behaviour, and the five tests that exercise the wind-down machinery arm
+the knob explicitly.
+
+THE TRAP THIS CHANGE HAD TO AVOID. `event_net` (the per-event net cap) was
+computed by iterating the MANAGED set, so dropping held markets from it
+would have made their inventory invisible to the cap — the bot could then
+have rebuilt the same exposure on a sibling strike of the same event
+(SBUXCC would have looked flat while carrying -152). It now counts every
+OWN-BOOK position whose event is managed, quoted or not. Strictly more
+conservative than before, and pinned by
+`test_dropped_inventory_still_counts_against_its_event_cap`.
+
+WHAT THIS DOES NOT CHANGE. The pre-cutoff reduce-only window
+(`IMM_PRE_CUTOFF_REDUCE_ONLY`, default 0) still applies to markets that
+are STILL selected. Manual-standoff, cutoff, closing and blackout paths
+already cancelled and are untouched.
+
+### Opportunistic email: P&L covers the tier's BOOK, not its selection
+
+Same morning, same root cause. The email summed MTM only over currently
+SELECTED markets, so a market the bot had stopped quoting dropped out of
+both the P&L and the EARN EST columns while its inventory and accrual were
+still real. KXSBUXCC-26OCT07 reported `P&L $0.00` on 9/6 while its three
+unselected strikes marked to **-$32.72** — which is what Kalshi's -$37
+unrealized (liquidation marks, always below mids) was showing.
+
+Rows are now built from the tier's BOOK: every market it is quoting, plus
+every market of the tier it holds inventory in or has accrued reward on.
+The tables gained a HELD column next to QUOTED (held = in the book, no
+longer quoted), the headline reports both counts, and the footnote says so.
+`mkts` still counts what is QUOTED, so the slot lines above each table
+still line up with the tier caps.
+
 ## 2026-09-05 — OPEN SCAN: second opportunistic tier, +15 slots / +5 openings over ALL markets (Jack)
 
 Jack: "extend the opportunistic IMM with 15 slots and 5 to scan all markets.

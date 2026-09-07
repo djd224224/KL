@@ -108,22 +108,29 @@ def event_label(client, event_ticker: str) -> str:
 def tier_totals(rows) -> dict:
     earn = sum(r["earn"] for r in rows)
     pnl = sum(r["pnl"] for r in rows)
-    return {"mkts": sum(r["mkts"] for r in rows), "earn": earn, "pnl": pnl,
-            "net": earn + pnl}
+    return {"mkts": sum(r["mkts"] for r in rows),
+            "held": sum(r.get("held", 0) for r in rows),
+            "earn": earn, "pnl": pnl, "net": earn + pnl}
 
 
 def text_table(rows) -> list:
     """Plain-text event table + TOTAL row. One call per tier, so the two
-    tiers' tables are identical in format by construction."""
+    tiers' tables are identical in format by construction.
+
+    QUOTED = markets the bot is quoting now. HELD = markets of the same
+    event it has stopped quoting but still holds inventory in, or has
+    accrued reward on (Jack 2026-09-07). Their P&L and accrual are in the
+    row; they just consume no slot."""
     t = tier_totals(rows)
-    L = [f"{'EVENT':<26}{'WHAT IT IS':<34}{'MKTS':>5}{'EARN EST$':>11}"
-         f"{'P&L$':>10}{'NET$':>10}"]
+    L = [f"{'EVENT':<26}{'WHAT IT IS':<34}{'QUOT':>5}{'HELD':>5}"
+         f"{'EARN EST$':>11}{'P&L$':>10}{'NET$':>10}"]
     for r in rows:
         L.append(f"{_short_event(r['event'])[:25]:<26}{r['label'][:33]:<34}"
-                 f"{r['mkts']:>5}{r['earn']:>11.2f}{r['pnl']:>+10.2f}"
+                 f"{r['mkts']:>5}{(r.get('held') or ''):>5}"
+                 f"{r['earn']:>11.2f}{r['pnl']:>+10.2f}"
                  f"{r['net']:>+10.2f}")
-    L.append(f"{'TOTAL':<26}{'':<34}{t['mkts']:>5}{t['earn']:>11.2f}"
-             f"{t['pnl']:>+10.2f}{t['net']:>+10.2f}")
+    L.append(f"{'TOTAL':<26}{'':<34}{t['mkts']:>5}{(t['held'] or ''):>5}"
+             f"{t['earn']:>11.2f}{t['pnl']:>+10.2f}{t['net']:>+10.2f}")
     return L
 
 
@@ -133,14 +140,17 @@ def html_table(rows) -> str:
     h = ['<table style="border-collapse:collapse;margin:6px 0">']
     h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
              f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
-             f'<td style="{TD}">MKTS</td><td style="{TD}">EARN EST$</td>'
+             f'<td style="{TD}">QUOTED</td><td style="{TD}">HELD</td>'
+             f'<td style="{TD}">EARN EST$</td>'
              f'<td style="{TD}">P&amp;L$</td><td style="{TD}">NET$</td></tr>')
     for i, r in enumerate(rows):
         bg = "#fafafa" if i % 2 else "#fff"
+        held = r.get("held") or 0
         h.append(f'<tr style="background:{bg}">'
                  f'<td style="{TDL}"><b>{_short_event(r["event"])}</b></td>'
                  f'<td style="{TDL}">{r["label"]}</td>'
                  f'<td style="{TD}">{r["mkts"]}</td>'
+                 f'<td style="{TD};color:#888">{held or ""}</td>'
                  f'<td style="{TD}">{r["earn"]:,.2f}</td>'
                  f'<td style="{TD}">{_pnl_span(r["pnl"])}</td>'
                  f'<td style="{TD};font-weight:700">{_pnl_span(r["net"])}</td>'
@@ -148,6 +158,7 @@ def html_table(rows) -> str:
     h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
              f'<td style="{TDL}">TOTAL</td><td style="{TDL}"></td>'
              f'<td style="{TD}">{t["mkts"]}</td>'
+             f'<td style="{TD}">{t["held"] or ""}</td>'
              f'<td style="{TD}">{t["earn"]:,.2f}</td>'
              f'<td style="{TD}">{_pnl_span(t["pnl"])}</td>'
              f'<td style="{TD}">{_pnl_span(t["net"])}</td></tr>')
@@ -203,8 +214,23 @@ def build_report(now_utc):
     members = [t for t in selected if _tier(t)]
     fin_members = [t for t in members if _tier(t) == "finecon"]
     scan_sel = [t for t in members if _tier(t) == "scan"]
+    # THE TIER'S BOOK, not just what it is quoting right now (Jack
+    # 2026-09-07: "scope the email's P&L to every market in the tier's book
+    # rather than just the selected ones"). A market the bot has stopped
+    # quoting keeps its inventory and its period-to-date accrual, and the
+    # selected-only sum silently dropped both: KXSBUXCC-26OCT07 reported
+    # P&L $0.00 on 9/6 while the three unselected strikes it still held
+    # (-50/-52/-50) marked to -$32.72, which is what Kalshi showed. So the
+    # row set is every market of the tier we hold inventory in, or have
+    # accrued reward on, in ADDITION to the selected ones. `mkts` still
+    # counts what is being QUOTED — that is the slot number the tier lines
+    # above report — and held-but-unquoted markets are counted separately.
+    held = [t for t in pos if _tier(t) and abs(_f(pos.get(t))) > 1e-9]
+    earned = [t for t in accrued if _tier(t) and _f(accrued.get(t)) > 0]
+    book = sorted(set(members) | set(held) | set(earned))
+    quoted = set(members)
     by_event: dict = {}
-    for t in members:
+    for t in book:
         by_event.setdefault(_event_of(t), []).append(t)
 
     rows = []
@@ -223,10 +249,12 @@ def build_report(now_utc):
         de = day_ev.get(ev) or {}
         pnl = mtm + _f(de.get("realized")) + _f(de.get("settle"))
         netpos = sum(_f(pos.get(t)) for t in tickers)
+        n_quoted = sum(1 for t in tickers if t in quoted)
         rows.append({
             "event": ev, "label": event_label(client, ev),
             "tier": _tier(tickers[0]) or "",
-            "mkts": len(tickers), "earn": earn, "pnl": pnl,
+            "mkts": n_quoted, "held": len(tickers) - n_quoted,
+            "earn": earn, "pnl": pnl,
             "net": pnl + earn, "pos": netpos})
     rows.sort(key=lambda r: -r["net"])
     fin_rows = [r for r in rows if r["tier"] == "finecon"]
@@ -235,6 +263,7 @@ def build_report(now_utc):
     tot = tier_totals(rows)
     tot_earn, tot_pnl, tot_net, tot_mkts = (tot["earn"], tot["pnl"],
                                             tot["net"], tot["mkts"])
+    tot_held = tot["held"]
 
     # Actual Kalshi money on opportunistic events (footer reconciliation).
     ledger, _calib = load_credit_ledger()
@@ -270,8 +299,10 @@ def build_report(now_utc):
 
     # ---- plain text ---------------------------------------------------------
     L = [f"Opportunistic IMM — {today_et}", ""]
-    L.append(f"{len(rows)} events quoted / {tot_mkts} markets across both "
-             f"tiers.")
+    L.append(f"{len(rows)} events / {tot_mkts} markets quoted across both "
+             f"tiers"
+             + (f", plus {tot_held} held but no longer quoted." if tot_held
+                else "."))
     L.append(f"Est reward this period ${tot_earn:,.2f}  |  trading P&L "
              f"${tot_pnl:+,.2f}  |  net ${tot_net:+,.2f}.")
     L.append("")
@@ -287,7 +318,10 @@ def build_report(now_utc):
              f"${cred_life:,.2f} (actual money; lands 1-2d after each period "
              f"ends).")
     L.append("")
-    L.append("EARN EST = bot estimator, accrual basis (period-to-date). P&L = "
+    L.append("QUOTED = markets the tier is quoting now; HELD = markets it "
+             "stopped quoting but still holds inventory in (or accrued on) "
+             "- their P&L and accrual ARE in the row. "
+             "EARN EST = bot estimator, accrual basis (period-to-date). P&L = "
              "trading only (realized + settlement + open-book MTM), same "
              f"windowed attribution as the digest ({FILL_LOOKBACK_HOURS}h). "
              "NET = P&L + EARN EST.")
@@ -305,8 +339,10 @@ def build_report(now_utc):
              f' &nbsp;= trading {tot_pnl:+,.2f} + est reward {tot_earn:,.2f}'
              f'</span></div>')
     h.append(f'<div style="color:#555;margin-bottom:6px">'
-             f'<b>{len(rows)}</b> events quoted &nbsp;·&nbsp; '
-             f'<b>{tot_mkts}</b> markets across both tiers</div>')
+             f'<b>{len(rows)}</b> events &nbsp;·&nbsp; '
+             f'<b>{tot_mkts}</b> markets quoted across both tiers'
+             + (f' &nbsp;·&nbsp; <b>{tot_held}</b> held, no longer quoted'
+                if tot_held else '') + '</div>')
     for name, desc, slots, trows in tiers:
         h.append(f'<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
                  f'{name} <span style="color:#888;font-weight:400">&mdash; '
