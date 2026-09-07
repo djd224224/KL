@@ -819,6 +819,25 @@ cancels every order rather than leaving a wind-down leg. FINECON stays
 exempt — that group's absolute $1 projections are noisiest on deliberately
 quiet long windows, which is why Jack made it quote-to-completion on 9/3.
 
+**Band screen: a book entirely outside the quoting band never takes a slot**
+(Jack 2026-09-07: "add a screen for books entirely outside the quotable
+band, dont allow them as one of the 30"). The quote loop's per-side
+top-in-band rule already stands a side down when its own touch is out of
+band, and stands the WHOLE market down when both are — so such a market
+could be selected, hold a slot, and rest nothing. `_scan_admission` now
+rejects it as `band` before any read. Measured at ship time: 272 scan
+candidates ($9,439/day of nominal pool) were in exactly that state,
+led by KXMLBPLAYOFFS, KXHEADLINE, the KXYT* video families and
+KXPRIMARYTURNOUT — all of which the undated opening had just made
+reachable. ONE side in band is enough to admit: the healthy side still
+earns, which is the same asymmetry the quote loop uses.
+A MEMBER whose book widens into this state is not caught here (members skip
+admission) but the hopeless exit gets it inside `HOPELESS_SUSTAIN_SECS`:
+with no placeable quote the estimator returns 0/day, which cannot reach the
+$1 floor. NOTE the touch can move back INTO band — including because our
+own maker order improved it — so this is a snapshot test at admission, not
+a permanent verdict on the series.
+
 **Loss budget 75 -> 200**, raised with the slot count: it was never close
 to binding (the 25-member tier ran $36 of collateral and -$1.90 MTM), and
 doubling the slots doubles the book it covers.

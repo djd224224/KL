@@ -7526,6 +7526,48 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertTrue(v["ok"])
         self.assertEqual((v["bars"], v["jump"]), (1, 0.0))
 
+    def test_book_entirely_outside_the_band_never_takes_a_slot(self):
+        """Jack 2026-09-07: "add a screen for books entirely outside the
+        quotable band, dont allow them as one of the 30". The quote loop
+        already stands such a market down per side, so admitting it burns a
+        slot to rest nothing — measured on KXDIESELELECT/KXDIESELYE, which
+        took 3 of the tier's new slots on a 4c/98c book."""
+        bot = self._bot()
+        now = datetime.now(timezone.utc)
+        lo, hi = imm.member_price_band(self.S, False)
+        budget = {"series": 9, "history": 9}
+        # both touches outside the band -> rejected, no slot, no reads spent
+        dead = dict(self._market(self.A), yes_bid_dollars="0.0400",
+                    yes_ask_dollars="0.9800")
+        reads = getattr(bot.client, "series_reads", 0)
+        self.assertEqual(bot._scan_admission(self._meta(), dead, {}, now,
+                                             budget), "band")
+        self.assertEqual(getattr(bot.client, "series_reads", 0), reads)
+        # ONE side in band is enough: the healthy side still earns
+        for bid, ask in (("0.0400", "0.5000"), ("0.5000", "0.9800")):
+            one = dict(self._market(self.A), yes_bid_dollars=bid,
+                       yes_ask_dollars=ask)
+            self.assertIsNone(bot._scan_admission(self._meta(), one, {}, now,
+                                                  budget))
+        # and an ordinary two-sided book is unaffected
+        self.assertIsNone(bot._scan_admission(self._meta(),
+                                              self._market(self.A), {}, now,
+                                              budget))
+        # the band edges themselves are IN (<=, not <)
+        edge = dict(self._market(self.A),
+                    yes_bid_dollars=f"{lo/100:.4f}", yes_ask_dollars="0.9800")
+        self.assertIsNone(bot._scan_admission(self._meta(), edge, {}, now,
+                                              budget))
+        edge2 = dict(self._market(self.A), yes_bid_dollars="0.0400",
+                     yes_ask_dollars=f"{hi/100:.4f}")
+        self.assertIsNone(bot._scan_admission(self._meta(), edge2, {}, now,
+                                              budget))
+        # a book with no prices at all is also out
+        blank = dict(self._market(self.A))
+        blank.pop("yes_bid_dollars", None); blank.pop("yes_ask_dollars", None)
+        self.assertEqual(bot._scan_admission(self._meta(), blank, {}, now,
+                                             budget), "band")
+
     def test_cached_history_verdicts_rescore_against_current_caps(self):
         """Jack 2026-09-07: "rescore cached verdicts against current caps".
         Verdicts cache 6h, so without this a knob change took until the TTL

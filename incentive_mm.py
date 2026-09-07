@@ -6694,6 +6694,26 @@ class IncentiveMarketMaker:
             # passed: the normal book's _screen would kill it anyway —
             # say so here, before the reads
             return "cutoff_passed"
+        # BOTH SIDES OUTSIDE THE QUOTING BAND (Jack 2026-09-07: "add a screen
+        # for books entirely outside the quotable band, dont allow them as
+        # one of the 30"). The per-side top-in-band rule in the quote loop
+        # stands a side down when its own touch is out of band, and stands
+        # the whole market down when both are — so such a market is SELECTED,
+        # holds a slot, and rests nothing. Measured the day this shipped:
+        # KXDIESELELECT / KXDIESELYE came in on a 4c/98c book and took three
+        # of the tier's new slots to place zero orders (KXDIESELMINY is the
+        # same shape in the normal book, holding 3 per-event slots).
+        # Cheap and read-free, so it runs before the age/activity screens.
+        # A MEMBER whose book widens into this state is not caught here
+        # (members skip admission) but the hopeless exit gets it: with no
+        # placeable quote the estimator returns 0/day, which cannot reach the
+        # $1 floor, and SCAN_HOPELESS_EXIT evicts it after the sustain window.
+        _pmin, _pmax = member_price_band(meta.series, False)
+        _bid = market_cents(m, "yes_bid")
+        _ask = market_cents(m, "yes_ask")
+        if not (_bid is not None and _pmin <= _bid <= _pmax) \
+                and not (_ask is not None and _pmin <= _ask <= _pmax):
+            return "band"
         if meta.open_time is None or \
                 (now_utc - meta.open_time).total_seconds() < SCAN_MIN_AGE_HOURS * 3600:
             return "age"
