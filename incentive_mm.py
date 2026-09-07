@@ -1939,7 +1939,13 @@ SCAN_FILL_HALT_CONTRACTS = _env_float("IMM_SCAN_FILL_HALT", 0)
 SCAN_MID_JUMP_CENTS = _env_float("IMM_SCAN_MID_JUMP", 0)
 SCAN_DRIFT_CENTS = _env_float("IMM_SCAN_DRIFT", 0)
 # The backstop that IS on: the tier's own daily loss budget.
-SCAN_DAILY_LOSS_LIMIT = _env_float("IMM_SCAN_DAILY_LOSS_LIMIT", 75.0)
+# 75 -> 200 (Jack 2026-09-07, with the slot raise to 30). This is the
+# TIER's budget — realized + MTM across every market the scan ever admitted
+# (scan_book), for the ET day — NOT per event, and separate from the
+# whole-bot DAILY_LOSS_LIMIT. It was never close to binding at 75 (the tier
+# ran $36 of collateral and -$1.90 MTM on 25 members), and doubling the slot
+# count doubles the book it has to cover.
+SCAN_DAILY_LOSS_LIMIT = _env_float("IMM_SCAN_DAILY_LOSS_LIMIT", 200.0)
 # Scan members face the HOPELESS EXIT (Jack 2026-09-07: "refuse candidates
 # that cannot reach a dollar before their program ends"). Entry already
 # required a projected $1 — `reaches_min` uses est x _quotable_days, which

@@ -819,7 +819,11 @@ cancels every order rather than leaving a wind-down leg. FINECON stays
 exempt — that group's absolute $1 projections are noisiest on deliberately
 quiet long windows, which is why Jack made it quote-to-completion on 9/3.
 
-**Scope note.** `SCAN_DAILY_LOSS_LIMIT` ($75) is the TIER's budget — realized
+**Loss budget 75 -> 200**, raised with the slot count: it was never close
+to binding (the 25-member tier ran $36 of collateral and -$1.90 MTM), and
+doubling the slots doubles the book it covers.
+
+**Scope note.** `SCAN_DAILY_LOSS_LIMIT` is the TIER's budget — realized
 plus MTM across every market the scan ever admitted (`scan_book`), for the
 ET day. Not per event, and separate from the whole-bot `DAILY_LOSS_LIMIT`
 ($1,200).
@@ -1299,7 +1303,7 @@ event pool) first, or it will measure nothing.
 `MAX_BULK` 1000 · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·
 `MAX_HISTORY_FETCHES` 40 · `FILL_HALT` 0 = off · `MID_JUMP` 0 = off ·
 `DRIFT` 0 = off ·
-`DAILY_LOSS_LIMIT` 75 · `SERIES_STRIKES` 2 · `SERIES_STRIKE_DAYS` 7 ·
+`DAILY_LOSS_LIMIT` 200 (TIER-wide, per ET day) · `SERIES_STRIKES` 2 · `SERIES_STRIKE_DAYS` 7 ·
 `EXCLUDE_CATEGORIES` (EMPTY since 2026-09-06 — a name here is a
 deliberate re-ban) · `EXCLUDE_PREFIXES` · `LIVE_SOURCE_KEYWORDS`.
 Widening levers, in order of how much risk they add: `MAX_VOLUME_24H`,
