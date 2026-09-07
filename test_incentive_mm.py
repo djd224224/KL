@@ -1116,13 +1116,14 @@ class TestAllowlist(unittest.TestCase):
             self.assertTrue(a(t), t)
         # Truflation's OTHER Kalshi index stays out — never enrolled
         self.assertFalse(a("KXTRUFAIDP-26AUG26-T50"))
-        # KXTRUEV BLOCKED 2026-08-25 (Jack), the morning after the 8/24
-        # enrollment saga: blocklist wins over its (kept) allowlist entry and
-        # overrides — zero orders, positions ride. Re-enable = delete the
-        # one SERIES_BLOCKLIST_PREFIXES entry.
+        # KXTRUEV was blocked 2026-08-25 (Jack) the morning after the 8/24
+        # enrollment saga, and UNBLOCKED 2026-09-07 ("unblock KXTRUEV but
+        # only quote the top 3 ROI markets") — so it is allowed again, but
+        # capped per event rather than free to quote its whole ladder.
         b = IncentiveMarketMaker._blocked
-        self.assertTrue(b("KXTRUEV-26AUG26-T1241.88"))
-        self.assertFalse(a("KXTRUEV-26AUG26-T1241.88"))
+        self.assertFalse(b("KXTRUEV-26AUG26-T1241.88"))
+        self.assertTrue(a("KXTRUEV-26AUG26-T1241.88"))
+        self.assertEqual(imm.event_top_n_for("KXTRUEV"), 3)
         # the enrollment machinery is deliberately kept for re-enable: the
         # close-anchored cutoff override (the print-day-listing fix) stays
         self.assertEqual(
@@ -2131,6 +2132,15 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             self.assertEqual(imm.event_top_n_for(s), 3, s)
         for s in ("KXRAINNYC", "KXBKFT", "KXCLAUDEAPP", "KXUSGASCPI"):
             self.assertEqual(imm.event_top_n_for(s), 0, s)
+        # KXTRUEV unblocked 2026-09-07 ("unblock KXTRUEV but only quote the
+        # top 3 ROI markets"): allowed again AND capped, and the prefix is
+        # exact-family so the unrelated KXTRUFAIDP stays uncapped/blocked.
+        self.assertEqual(imm.event_top_n_for("KXTRUEV"), 3)
+        self.assertTrue(IncentiveMarketMaker._allowed(
+            "KXTRUEV-26SEP07-T1243.42"))
+        self.assertEqual(imm.event_top_n_for("KXTRUFAIDP"), 0)
+        self.assertFalse(any(p == "KXTRUEV"
+                             for p in imm.SERIES_BLOCKLIST_PREFIXES))
         # incumbency (1.15x) holds a member's slot on a near-tie: fresh 2.05
         # vs member 2.0 -> member ROI 0.2*1.15=0.23 beats 0.205.
         tie = [m("KXAAAGASDTX-26SEP03-3.60", 2.0),
@@ -2398,7 +2408,10 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # Jack 2026-09-05 "yes self-extend carbon arc": the overrides task
         # appends to FINECON_EXTRA_FILE; the bot merges, guards and allows
         # on the next refresh. Blocklist still wins; base stays code-owned.
-        fake, blocked = "KXFAKECARB", "KXTRUEV"   # KXTRUEV is blocklisted
+        # KXHIGH rather than the old KXTRUEV stand-in, which stopped being
+        # blocklisted on 2026-09-07: KXHIGH is owned by high_temp_trading.py
+        # and is a permanent code-level block, so it cannot rot the same way.
+        fake, blocked = "KXFAKECARB", "KXHIGH"
         base_n = len(imm._FINECON_BASE)
         saved_state = dict(imm._finecon_extra_state)
 

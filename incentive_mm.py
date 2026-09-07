@@ -1054,6 +1054,15 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 # N<=0 = uncapped. KXAAAGAS covers national + state dailies + W/M.
 # KXDIESEL added 2026-09-02 (Jack "do the same with diesel"): covers
 # KXDIESELD + KXDIESELW — same one-print-per-event correlation structure.
+# KXTRUEV added 2026-09-07 ("unblock KXTRUEV but only quote the top 3 ROI
+# markets") — the series was blocklisted 2026-08-25 the morning after it
+# first quoted, and comes back capped rather than unrestricted. Same
+# structure the cap is for: every strike of a KXTRUEV event settles on the
+# ONE Truflation EV print for that day, so the whole in-band ladder is
+# near-duplicate reward on correlated inventory. Kalshi lists each daily
+# only ON its print day, so an event's slots are filled once and held for
+# that day's life (the enrollment's close-anchored cutoff and 5pm halving
+# still apply on top).
 def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
     out = []
     for part in (p.strip() for p in spec.split(",") if p.strip()):
@@ -1067,7 +1076,8 @@ def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
 
 
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
-                                                "KXAAAGAS:3,KXDIESEL:3"))
+                                                "KXAAAGAS:3,KXDIESEL:3,"
+                                                "KXTRUEV:3"))
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
 EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
@@ -1298,17 +1308,9 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + ["KXHIGH"]                                    # high_temp_trading.py (cloud)
     + ["KXMLBMENTION", "KXNBAMENTION", "KXNCAABMENTION"]   # mlb/nba/ncaa (cloud)
     + _GPU_RENTAL_PREFIXES                           # GPU rental price (excluded)
-    # KXTRUEV BLOCKED 2026-08-25 (Jack: "block KXTRUEEV" [sic]) — the same
-    # morning it first quoted, after the 8/24 enrollment saga. Blocklist =
-    # FROZEN: zero new orders, resting quotes cancelled on the next cycle,
-    # positions ride to settlement (tonight's close). The full enrollment
-    # (allowlist entry, close-anchored cutoff, 5pm halving, rate-bar-off
-    # override) is deliberately KEPT below — the blocklist wins over all of
-    # it, so re-enabling is deleting this one entry. In code rather than the
-    # launcher's IMM_BLOCKLIST so the self-restart watcher applies it on the
-    # next sync without a task-level bounce (env edits need one, code
-    # doesn't). Prefix is exact-family: KXTRUFAIDP does not match.
-    + ["KXTRUEV"]
+    # (KXTRUEV was blocked here 2026-08-25 and UNBLOCKED 2026-09-07 — see
+    # the EVENT_TOP_N note: it comes back capped at 3 markets per event, not
+    # unrestricted. Do not re-add without deciding about that cap too.)
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 
