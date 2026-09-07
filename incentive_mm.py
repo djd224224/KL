@@ -2169,26 +2169,66 @@ def scan_history_verdict(candles) -> dict:
     # bar-count and range checks off). The stats are still MEASURED and
     # persisted either way, so the caches and the quote-gaps labels keep
     # reporting what a book actually did even when nothing rejects on it.
-    if SCAN_MIN_HISTORY_BARS > 0 and len(mids) < SCAN_MIN_HISTORY_BARS:
-        out["why"] = "history_thin"
-        return out
     # Guarded: with the bar-count check off, `mids` can be empty (a market
     # that never showed a two-sided quote in the window) or hold a single
-    # bar, and max()/the pairwise walk would raise on those.
+    # bar, and max()/the pairwise walk would raise on those. Measured
+    # UNCONDITIONALLY — the stats must be complete for score_history() to
+    # re-score this entry later against changed caps.
     if mids:
         out["range"] = max(mids) - min(mids)
     if len(mids) >= 2:
         out["jump"] = max(abs(mids[i] - mids[i - 1])
                           for i in range(1, len(mids)))
-    if SCAN_MAX_RANGE_CENTS > 0 and out["range"] > SCAN_MAX_RANGE_CENTS:
-        out["why"] = "history_range"
-    elif SCAN_MAX_JUMP_CENTS > 0 and out["jump"] >= SCAN_MAX_JUMP_CENTS:
-        out["why"] = "history_jump"
-    elif SCAN_MAX_HISTORY_VOLUME > 0 and vol > SCAN_MAX_HISTORY_VOLUME:
-        out["why"] = "history_volume"
-    else:
-        out["ok"] = True
+    out["ok"], out["why"] = score_history(len(mids), out["range"],
+                                          out["jump"], vol)
     return out
+
+
+def score_history(bars: int, rng: float, jump: float,
+                  vol: float) -> Tuple[bool, str]:
+    """The history CAPS applied to already-measured stats -> (ok, why).
+    THE single place the four thresholds are compared, so a fresh read and
+    a re-scored cache entry can never disagree. Each cap is off at <= 0."""
+    if SCAN_MIN_HISTORY_BARS > 0 and bars < SCAN_MIN_HISTORY_BARS:
+        return False, "history_thin"
+    if SCAN_MAX_RANGE_CENTS > 0 and rng > SCAN_MAX_RANGE_CENTS:
+        return False, "history_range"
+    if SCAN_MAX_JUMP_CENTS > 0 and jump >= SCAN_MAX_JUMP_CENTS:
+        return False, "history_jump"
+    if SCAN_MAX_HISTORY_VOLUME > 0 and vol > SCAN_MAX_HISTORY_VOLUME:
+        return False, "history_volume"
+    return True, ""
+
+
+def scan_history_rescore(ent) -> Optional[Tuple[bool, str]]:
+    """A PERSISTED history verdict re-scored against the CURRENT caps
+    (Jack 2026-09-07: "rescore cached verdicts against current caps").
+
+    Verdicts cache for SCAN_HISTORY_TTL_SECS (6h), so without this a knob
+    change took up to six hours to show: the 9/7 loosening went live and
+    the very next refresh still reported 27 `history_range` rejects from
+    entries written under the old caps. The stats (bars/range/jump/vol) are
+    persisted alongside the verdict, so the caps can simply be re-applied —
+    no re-read, no extra API budget.
+
+    Returns (ok, why) to trust, or None when the entry cannot be re-scored
+    and must be re-read: a pre-2026-09-07 `history_thin` short-circuit
+    never measured range/jump, so its zeros are absence of data, not
+    evidence of calm — re-scoring those would wave a market through on
+    numbers nobody took. Same fail-closed instinct as scan_cached_verdict."""
+    if not isinstance(ent, dict):
+        return None
+    if str(ent.get("why") or "") == "history_thin":
+        return None
+    if any(k not in ent for k in ("bars", "range", "jump", "vol")):
+        return None
+    try:
+        return score_history(int(ent.get("bars") or 0),
+                             float(ent.get("range") or 0.0),
+                             float(ent.get("jump") or 0.0),
+                             float(ent.get("vol") or 0.0))
+    except (TypeError, ValueError):
+        return None
 
 
 def scan_series_meta_verdict(series_obj: dict) -> Tuple[bool, str, str]:
@@ -6525,7 +6565,12 @@ class IncentiveMarketMaker:
         budget/unavailable semantics as the series screen."""
         ent = self.state.scan_history_cache.get(meta.ticker)
         if ent and now_ts - float(ent.get("ts", 0)) < SCAN_HISTORY_TTL_SECS:
-            return bool(ent.get("ok")), str(ent.get("why") or "")
+            # re-scored against the CURRENT caps, so a knob change lands on
+            # the next refresh instead of waiting out the 6h TTL; None means
+            # the entry's stats are incomplete and it must be re-read
+            scored = scan_history_rescore(ent)
+            if scored is not None:
+                return scored
         if budget["history"] <= 0:
             return False, "history_pending"
         budget["history"] -= 1

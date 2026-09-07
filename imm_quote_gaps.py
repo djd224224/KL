@@ -397,8 +397,17 @@ def scan_gap_label(bot, t: str, now_utc: datetime) -> str:
         elif not cached[0]:
             return cached[1] or "series screen"
     hc = st.scan_history_cache.get(t)
-    if hc and not hc.get("ok"):
-        return str(hc.get("why") or "history screen")
+    if hc:
+        # Re-scored against the CURRENT caps, the same way the bot does
+        # (imm.scan_history_rescore): a cached reject whose numbers now pass
+        # must not be reported as a stand-down that no longer exists. None
+        # means the entry's stats are incomplete, so the bot will re-read it
+        # and this reads as pending rather than as a stale verdict.
+        rescored = imm.scan_history_rescore(hc)
+        if rescored is None:
+            hc = None
+        elif not rescored[0]:
+            return rescored[1] or "history screen"
     if sm and hc:
         return "eligible (slots/ROI/live screens)"
     return "screens pending"

@@ -801,6 +801,21 @@ do 9 that were only over the old 250 volume cap. Newly admissible families
 include KXPADATACENTERS, KXILNUCLEAR, KXNECORNYIELD, KXKYBOURBONBARRELS,
 KXNHMAPLE and two KXFA-28JANUSSALES strikes.
 
+CACHED VERDICTS ARE RE-SCORED, not waited out (Jack, same afternoon:
+"rescore cached verdicts against current caps"). History verdicts cache 6h,
+so the loosening went live and the very next refresh still reported 27
+`history_range` rejects written under the old caps. `score_history()` is
+now the ONE place the four thresholds are compared, used by both a fresh
+read and `scan_history_rescore()`, which re-applies today's caps to the
+stats already persisted on a cache entry — no re-read, no API budget. A
+knob change therefore lands on the next refresh. `imm_quote_gaps` re-scores
+the same way, so a label can never report a stand-down that no longer
+exists. FAIL CLOSED: an entry whose `why` is `history_thin` was written by
+the old short-circuit that returned BEFORE measuring range/jump, so its
+zeros are absence of data rather than evidence of calm — those, and any
+entry missing the stats, return None and are re-read. Same instinct as
+`scan_cached_verdict` for the category ban.
+
 CONSEQUENCE TO WATCH. With the bar-count check off, a market that never
 showed a two-sided quote in 72h now reaches the later screens. It is not
 unguarded: `_screen` still requires a real two-sided book RIGHT NOW

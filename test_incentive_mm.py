@@ -7147,7 +7147,7 @@ class TestOpportunisticEmail(unittest.TestCase):
             "ts": time.time(), "ok": True, "why": "", "category": "Financials",
             "fiscal": True}
         self.assertEqual(qg.scan_gap_label(bot, ft, now), "screens pending")
-        bot.state.scan_history_cache[ft] = {"ts": time.time(), "ok": True}
+        bot.state.scan_history_cache[ft] = {"ts": time.time(), "ok": True, "bars": 40, "range": 2.0, "jump": 1.0, "vol": 10.0}
         self.assertEqual(qg.scan_gap_label(bot, ft, now),
                          "eligible (slots/ROI/live screens)")
         # A market inside its report month is NOT labelled from the month
@@ -7156,14 +7156,28 @@ class TestOpportunisticEmail(unittest.TestCase):
         # this cache-only function cannot see — build_meta + the cutoff
         # screen own that verdict.
         cm = f"KXFISC-{cur}ALBD-1"
-        bot.state.scan_history_cache[cm] = {"ts": time.time(), "ok": True}
+        bot.state.scan_history_cache[cm] = {"ts": time.time(), "ok": True, "bars": 40, "range": 2.0, "jump": 1.0, "vol": 10.0}
         self.assertEqual(qg.scan_gap_label(bot, cm, now),
                          "eligible (slots/ROI/live screens)")
         bot.state.scan_series_meta["KXNOVEL"] = {"ts": time.time(), "ok": True}
+        # a cached reject is RE-SCORED against the current caps, so the
+        # label follows today's thresholds, not the ones in the entry
         bot.state.scan_history_cache[t] = {
-            "ts": time.time(), "ok": False, "why": "history_range"}
-        self.assertEqual(qg.scan_gap_label(bot, t, now), "history_range")
+            "ts": time.time(), "ok": False, "why": "history_range",
+            "bars": 40, "range": 30.0, "jump": 30.0, "vol": 10.0}
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "history_jump")
+        with mock.patch.object(imm, "SCAN_MAX_RANGE_CENTS", 10):
+            self.assertEqual(qg.scan_gap_label(bot, t, now), "history_range")
+        # ... and a stale reject whose numbers now pass is NOT reported
+        bot.state.scan_history_cache[t] = {
+            "ts": time.time(), "ok": False, "why": "history_range",
+            "bars": 40, "range": 12.0, "jump": 1.0, "vol": 10.0}
+        self.assertEqual(qg.scan_gap_label(bot, t, now),
+                         "eligible (slots/ROI/live screens)")
+        # an entry with no stats cannot be re-scored -> re-read, so pending
         bot.state.scan_history_cache[t] = {"ts": time.time(), "ok": True}
+        self.assertEqual(qg.scan_gap_label(bot, t, now), "screens pending")
+        bot.state.scan_history_cache[t] = {"ts": time.time(), "ok": True, "bars": 40, "range": 2.0, "jump": 1.0, "vol": 10.0}
         self.assertEqual(qg.scan_gap_label(bot, t, now),
                          "eligible (slots/ROI/live screens)")
         bot.state.scan_series_strikes["KXNOVEL"] = [time.time(), time.time()]
@@ -7511,6 +7525,61 @@ class TestOpenScanTier(unittest.TestCase):
         v = imm.scan_history_verdict(self._candles(n=1))
         self.assertTrue(v["ok"])
         self.assertEqual((v["bars"], v["jump"]), (1, 0.0))
+
+    def test_cached_history_verdicts_rescore_against_current_caps(self):
+        """Jack 2026-09-07: "rescore cached verdicts against current caps".
+        Verdicts cache 6h, so without this a knob change took until the TTL
+        expired to show — the 9/7 loosening went live and the next refresh
+        still reported 27 history_range rejects written under the old caps.
+        The stats are persisted, so the caps are simply re-applied."""
+        rs = imm.scan_history_rescore
+        # a reject written under the OLD range cap: its numbers pass today
+        stale = {"ts": time.time(), "ok": False, "why": "history_range",
+                 "bars": 40, "range": 12.0, "jump": 1.0, "vol": 10.0}
+        self.assertEqual(rs(stale), (True, ""))
+        with mock.patch.object(imm, "SCAN_MAX_RANGE_CENTS", 10):
+            self.assertEqual(rs(stale), (False, "history_range"))
+        # a pass written under the OLD volume cap that today's cap rejects
+        was_ok = {"ts": time.time(), "ok": True, "why": "",
+                  "bars": 40, "range": 1.0, "jump": 1.0, "vol": 900.0}
+        self.assertEqual(rs(was_ok), (True, ""))
+        with mock.patch.object(imm, "SCAN_MAX_HISTORY_VOLUME", 250):
+            self.assertEqual(rs(was_ok), (False, "history_volume"))
+        # FAIL CLOSED: a pre-2026-09-07 thin short-circuit never measured
+        # range/jump, so its zeros are absence of data -> re-read, never a
+        # free pass
+        self.assertIsNone(rs({"ts": time.time(), "ok": False,
+                              "why": "history_thin", "bars": 3,
+                              "range": 0.0, "jump": 0.0, "vol": 0.0}))
+        # ... as are entries with no stats at all, or an unusable shape
+        self.assertIsNone(rs({"ts": time.time(), "ok": True}))
+        self.assertIsNone(rs({"bars": "x", "range": 1, "jump": 1, "vol": 1}))
+        self.assertIsNone(rs(None))
+        # a fresh read and a re-scored entry can never disagree: both go
+        # through score_history()
+        v = imm.scan_history_verdict(self._candles(n=20, bid=40, ask=44))
+        self.assertEqual(rs(dict(v, ts=time.time())), (v["ok"], v["why"]))
+
+        # bot level: the cached entry is re-scored with NO extra candle read
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now_ts = time.time()
+        bot.state.scan_history_cache[self.A] = dict(stale)
+        reads = getattr(bot.client, "candle_reads", 0)
+        meta = self._meta()
+        self.assertEqual(bot._scan_history_ok(meta, now_ts,
+                                              {"history": 5}), (True, ""))
+        self.assertEqual(getattr(bot.client, "candle_reads", 0), reads)
+        with mock.patch.object(imm, "SCAN_MAX_RANGE_CENTS", 10):
+            self.assertEqual(bot._scan_history_ok(meta, now_ts,
+                                                  {"history": 5}),
+                             (False, "history_range"))
+        # an un-rescorable entry falls through to a real read
+        bot.state.scan_history_cache[self.A] = {"ts": now_ts, "ok": True}
+        bot.client.candles[self.A] = self._candles()
+        self.assertEqual(bot._scan_history_ok(meta, now_ts,
+                                              {"history": 5}), (True, ""))
+        self.assertEqual(getattr(bot.client, "candle_reads", 0), reads + 1)
 
     def test_history_caps_are_independently_disablable(self):
         """Each cap is off at <= 0 and enforced above it (2026-09-07)."""
