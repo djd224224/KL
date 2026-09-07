@@ -763,6 +763,50 @@ Register-ScheduledTask -TaskName 'KL imm opportunistic' -Force `
   -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2))
 ```
 
+## 2026-09-07 — history screen rebalanced: two checks off, two loosened (Jack)
+
+Jack, after an ELI5 walk through the four history checks: "turn off these
+requirements: two-sided hourly bars >= 12, mid range <= 10c" and "adjust
+this requirement: traded volume <= 1000, largest bar-to-bar move < 10c".
+
+| check | was | now | why |
+|---|---|---|---|
+| `MIN_HISTORY_BARS` | 12 | **0 = OFF** | it demanded half a day of two-sided quotes before a market could be judged, which rejected exactly the quiet tail the tier hunts. A market nobody quotes is the archetype here, not a warning sign. |
+| `MAX_RANGE` | 10c | **0 = OFF** | high-minus-low over the whole window punished slow drift as hard as news. A book that walked 12c in 1c steps is being repriced by everyone at once, and the bot re-quotes into it every cycle. |
+| `MAX_JUMP` | 6c | **10c** | the check that matters. One hour-to-hour STEP is the moment stale quotes get run over, so it stays; the bar is raised to catch genuine gaps rather than ordinary moves. |
+| `MAX_HISTORY_VOLUME` | 250 | **1000** | still the "someone is trading this" signal, tolerant of real but modest flow. |
+
+EVERY cap is now independently disabled at `<= 0`, and all four stats are
+still MEASURED and persisted whether or not their cap is armed — so the
+caches, the `--status` view and the quote-gaps labels keep reporting what a
+book actually did. `scan_history_verdict` gained guards for the empty and
+single-bar cases that turning the bar-count check off makes reachable
+(`max()` over no mids used to be unreachable, and would raise).
+
+MEASURED by replaying all 337 cached verdicts through both rule sets:
+
+| verdict | old | new |
+|---|---|---|
+| PASS | 245 | **270** |
+| history_range | 28 | 0 |
+| history_volume | 53 | 44 |
+| history_jump | 11 | **23** |
+
+Net +25 markets. Note history_jump goes UP: the old order checked range
+BEFORE jump, so 12 markets with a big range from a single step were
+labelled `history_range` and never reached the jump check. With range off
+they fall through and are still rejected — correctly, and now under the
+name that describes them. The 16 whose range came from drift now pass, as
+do 9 that were only over the old 250 volume cap. Newly admissible families
+include KXPADATACENTERS, KXILNUCLEAR, KXNECORNYIELD, KXKYBOURBONBARRELS,
+KXNHMAPLE and two KXFA-28JANUSSALES strikes.
+
+CONSEQUENCE TO WATCH. With the bar-count check off, a market that never
+showed a two-sided quote in 72h now reaches the later screens. It is not
+unguarded: `_screen` still requires a real two-sided book RIGHT NOW
+(`one_sided`) and a mid inside the 5-90c band, and the 24h age screen still
+applies. But "no quote history at all" is no longer a reason on its own.
+
 ## 2026-09-07 — a DROPPED market carries no orders (Jack)
 
 Jack, after finding `KXSBUXCC-26OCT07-T98` not earning: "fine for market to
@@ -848,7 +892,7 @@ first (`_scan_admission`):
 | STRUCTURE | day-dated event ticker — **or, since 2026-09-06, a month-named one on a Fiscal.ai-settled series** (`KXCCL-26SEPALBD`; see the dated note below: the first of that month becomes the cutoff); numeric-threshold strike (`T286`, `B90`, `4.1400`, or Kalshi `strike_type` greater/less/between) | the midnight-ET rule is the only release guard an unknown series has (KXUE/KXISMPMI had no day and would quote THROUGH their prints); for the KPI class the report MONTH is that guard; a "will X happen" binary's one jump IS the resolution (strategy §1) |
 | FAMILY | **no category ban since 2026-09-06** (the first cut banned `Sports, Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment` wholesale — see the dated note below; `IMM_SCAN_EXCLUDE_CATEGORIES` is empty by default and only a deliberate re-ban names a category); no LIVE settlement source (GET /series, cached 7d: pyth/coinbase/**cfbenchmarks**/espn/nba.com/ercot/weather.gov/**weather.com**/... keywords — a live price index, a live scoreboard, a live weather feed); prefix exclusions are OWNERSHIP and feeds, not categories: other repo bots (KXLOWT, KXRAIN, KXHIGH, KXTEMP, KXAVGT, KXAQI), the crypto fleets' families by asset (KX<ASSET>D / MAX-MINW / MAX-MINMON / MAX-MINY / Y), FX/index/commodity/grid feeds, the 9/2 scan's rejects (KXUE, KXISMPMI, KXSNOWCRABCATCH, KXSOCKEYERUN, KXTECHLAYOFF, ...) | realtime risk is a property of the settlement SOURCE, not the category: a market everyone else can price off a live feed is one we are always last to reprice; two of our bots must never anchor to each other |
 | ACTIVITY | market `volume_24h` <= 80, EVENT MEAN `volume_24h` per market <= 100 (averaged over every bulk-read sibling, pinned strikes included; a SUM against 250, then a mean against 60, both on 2026-09-06), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
-| HISTORY | 72h of hourly candlesticks: >= 12 two-sided bars, mid range <= 10c, no bar-to-bar move >= 6c, traded volume <= 250 (cached 6h) | a book that moved is not a quiet print, whatever its family says |
+| HISTORY | 72h of hourly candlesticks: no bar-to-bar move >= 10c, traded volume <= 1000 (cached 6h). Bar-count and mid-range caps OFF since 2026-09-07 — every cap is independently disabled at <= 0, and all four stats stay MEASURED either way | a single hour-to-hour STEP is the moment stale quotes get run over; slow drift and a thin quote history are not that |
 
 Read budgets per refresh (the universe is thousands of markets): bulk
 market reads capped at 600 tickers (pool-ranked, members always in), 30
@@ -1173,8 +1217,9 @@ event pool) first, or it will measure nothing.
 `MIN_AGE_H` 24 · `MAX_VOLUME_24H` 80 · `MAX_EVENT_AVG_VOLUME_24H` 100
 (MEAN per market on the event since 2026-09-06; the old
 `MAX_EVENT_VOLUME_24H` sum-against-250 knob is GONE, not renamed) ·
-`HISTORY_H` 72 · `MIN_HISTORY_BARS` 12 · `MAX_RANGE` 10 · `MAX_JUMP` 6 ·
-`MAX_HISTORY_VOLUME` 250 · `HISTORY_TTL_H` 6 · `SERIES_META_TTL_D` 7 ·
+`HISTORY_H` 72 · `MIN_HISTORY_BARS` 0 = off · `MAX_RANGE` 0 = off ·
+`MAX_JUMP` 10 ·
+`MAX_HISTORY_VOLUME` 1000 · `HISTORY_TTL_H` 6 · `SERIES_META_TTL_D` 7 ·
 `MAX_BULK` 1000 · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·
 `MAX_HISTORY_FETCHES` 40 · `FILL_HALT` 0 = off · `MID_JUMP` 0 = off ·
 `DRIFT` 0 = off ·

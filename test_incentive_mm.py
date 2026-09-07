@@ -7461,30 +7461,71 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertFalse(ok("KXRT-DOG-45", None))
 
     def test_history_verdict(self):
+        # SHIPPED DEFAULTS since 2026-09-07 (Jack): bar-count and range OFF,
+        # jump 10c, volume 1000/72h.
+        self.assertEqual(imm.SCAN_MIN_HISTORY_BARS, 0)
+        self.assertEqual(imm.SCAN_MAX_RANGE_CENTS, 0)
+        self.assertEqual(imm.SCAN_MAX_JUMP_CENTS, 10)
+        self.assertEqual(imm.SCAN_MAX_HISTORY_VOLUME, 1000)
         v = imm.scan_history_verdict(self._candles())
         self.assertTrue(v["ok"])
         self.assertEqual(v["bars"], 20)
-        self.assertEqual(imm.scan_history_verdict(self._candles(n=5))["why"],
-                         "history_thin")
-        # a 21c re-level inside the window: not quiet
-        moved = self._candles(n=12) + self._candles(n=8, bid=60, ask=64)
-        self.assertEqual(imm.scan_history_verdict(moved)["why"],
-                         "history_range")
-        # a one-bar step under the range cap but over the jump cap
-        stepped = self._candles(n=12) + self._candles(n=8, bid=47, ask=51)
+        # thin / wide books now PASS, and the stats are still measured
+        v = imm.scan_history_verdict(self._candles(n=5))
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["bars"], 5)
+        # a 19c DRIFT in 1c steps: big range, no step -> passes now
+        drift = [c for i in range(20)
+                 for c in self._candles(n=1, bid=40 + i, ask=44 + i)]
+        v = imm.scan_history_verdict(drift)
+        self.assertTrue(v["ok"])
+        self.assertEqual((v["range"], v["jump"]), (19.0, 1.0))
+        # a one-hour STEP is still the reject that matters, at the 10c bar
+        stepped = self._candles(n=12) + self._candles(n=8, bid=52, ask=56)
         self.assertEqual(imm.scan_history_verdict(stepped)["why"],
                          "history_jump")
+        # ... and a 9c step now passes where the old 6c bar rejected it
+        small = self._candles(n=12) + self._candles(n=8, bid=49, ask=53)
+        self.assertTrue(imm.scan_history_verdict(small)["ok"])
         busy = self._candles(vol=20)          # 400 traded in 72h
-        self.assertEqual(imm.scan_history_verdict(busy)["why"],
+        self.assertTrue(imm.scan_history_verdict(busy)["ok"])
+        busier = self._candles(vol=60)        # 1200 traded in 72h
+        self.assertEqual(imm.scan_history_verdict(busier)["why"],
                          "history_volume")
-        # dollars-string encoding parses; junk / one-sided bars don't count
+        # dollars-string encoding parses
         dollars = [{"yes_bid": {"close_dollars": "0.40"},
                     "yes_ask": {"close_dollars": "0.44"}, "volume_fp": "1"}
                    for _ in range(15)]
         self.assertTrue(imm.scan_history_verdict(dollars)["ok"])
+        # NO two-sided bars at all: reachable only with the bar check off,
+        # and it must not raise. Passing here is deliberate — _screen's
+        # one_sided / mid-band checks still demand a real book right now.
         junk = [{"garbage": 1}, {"yes_bid": {"close": 40}}] * 10
-        self.assertEqual(imm.scan_history_verdict(junk)["why"], "history_thin")
-        self.assertEqual(imm.scan_history_verdict(None)["why"], "history_thin")
+        v = imm.scan_history_verdict(junk)
+        self.assertTrue(v["ok"])
+        self.assertEqual((v["bars"], v["range"], v["jump"]), (0, 0.0, 0.0))
+        v = imm.scan_history_verdict(None)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["bars"], 0)
+        # a SINGLE bar has a range but no pairwise jump; must not raise
+        v = imm.scan_history_verdict(self._candles(n=1))
+        self.assertTrue(v["ok"])
+        self.assertEqual((v["bars"], v["jump"]), (1, 0.0))
+
+    def test_history_caps_are_independently_disablable(self):
+        """Each cap is off at <= 0 and enforced above it (2026-09-07)."""
+        moved = self._candles(n=12) + self._candles(n=8, bid=60, ask=64)
+        with mock.patch.object(imm, "SCAN_MAX_RANGE_CENTS", 10):
+            self.assertEqual(imm.scan_history_verdict(moved)["why"],
+                             "history_range")
+        with mock.patch.object(imm, "SCAN_MIN_HISTORY_BARS", 12):
+            self.assertEqual(imm.scan_history_verdict(self._candles(n=5))["why"],
+                             "history_thin")
+        with mock.patch.object(imm, "SCAN_MAX_JUMP_CENTS", 0):
+            stepped = self._candles(n=12) + self._candles(n=8, bid=52, ask=56)
+            self.assertTrue(imm.scan_history_verdict(stepped)["ok"])
+        with mock.patch.object(imm, "SCAN_MAX_HISTORY_VOLUME", 0):
+            self.assertTrue(imm.scan_history_verdict(self._candles(vol=999))["ok"])
 
     def test_series_meta_verdict(self):
         # NO category ban by default (Jack 2026-09-06): every category is
@@ -7712,15 +7753,20 @@ class TestOpenScanTier(unittest.TestCase):
         # history screen: thin / moved / busy / unreadable / budget
         bot.state.scan_history_cache.clear()
         bot.client.candles[self.A] = self._candles(n=3)
-        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
-                         "history_thin")
+        # the bar-count cap is OFF by default since 2026-09-07 — arm it to
+        # keep covering the wiring from the screen to the reject reason
+        with mock.patch.object(imm, "SCAN_MIN_HISTORY_BARS", 12):
+            self.assertEqual(bot._scan_admission(self._meta(), m, {}, now,
+                                                 budget), "history_thin")
         bot.state.scan_history_cache.clear()
         bot.client.candles[self.A] = (self._candles(n=12)
                                       + self._candles(n=8, bid=60, ask=64))
+        # a 20c re-level: the RANGE cap is off since 2026-09-07, so this is
+        # now caught by the JUMP cap (one 20c step)
         self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
-                         "history_range")
+                         "history_jump")
         bot.state.scan_history_cache.clear()
-        bot.client.candles[self.A] = self._candles(vol=30)
+        bot.client.candles[self.A] = self._candles(vol=60)   # 1200 in 72h
         self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
                          "history_volume")
         bot.state.scan_history_cache.clear()

@@ -1871,14 +1871,35 @@ SCAN_MAX_VOLUME_24H = _env_float("IMM_SCAN_MAX_VOLUME_24H", 80)
 # per-market mean. Nothing in the launcher set either (checked 9/6).
 SCAN_MAX_EVENT_AVG_VOLUME_24H = _env_float(
     "IMM_SCAN_MAX_EVENT_AVG_VOLUME_24H", 100)
-# History screen (hourly candlesticks). 12 two-sided bars = half a day of
-# quotes to judge from; a 10c range or a 6c bar-to-bar move inside 72h is a
-# market with information in it; 250 traded contracts over 72h likewise.
+# History screen (hourly candlesticks over SCAN_HISTORY_HOURS). EVERY cap
+# here is independently disabled at <= 0, and the stats are measured and
+# persisted either way, so a disabled check still reports what the book did.
+#
+# Jack 2026-09-07 rebalanced the four: the two checks that reject on the
+# SHAPE of the whole window are OFF, the two that reject on a discrete
+# event are kept and loosened.
+#   MIN_HISTORY_BARS 12 -> 0 (OFF). It required half a day of two-sided
+#     quotes before a market could be judged, which rejected the quiet tail
+#     the tier is actually hunting — a market nobody quotes is the archetype
+#     here, not a red flag. NOTE the consequence: a market with NO two-sided
+#     history now reaches the later screens, where _screen's one_sided and
+#     mid-band checks still require a real two-sided book RIGHT NOW, and the
+#     24h age screen still applies. scan_history_verdict guards the empty
+#     and single-bar cases that this makes reachable.
+#   MAX_RANGE 10c -> 0 (OFF). Total high-minus-low across 72h punished slow
+#     drift as hard as news: a market that walked 12c over three days in 1c
+#     steps is not being picked off, it is being repriced by everyone at
+#     once, and the bot re-quotes into it every cycle anyway.
+#   MAX_JUMP 6c -> 10c. This is the check that matters — a single hour-to-
+#     hour step IS the moment stale quotes get run over — so it stays, with
+#     the bar raised to catch only genuine gaps rather than ordinary moves.
+#   MAX_HISTORY_VOLUME 250 -> 1000 over 72h. Still the "someone is trading
+#     this" signal, just tolerant of a market that saw real but modest flow.
 SCAN_HISTORY_HOURS = _env_int("IMM_SCAN_HISTORY_H", 72)
-SCAN_MIN_HISTORY_BARS = _env_int("IMM_SCAN_MIN_HISTORY_BARS", 12)
-SCAN_MAX_RANGE_CENTS = _env_float("IMM_SCAN_MAX_RANGE", 10)
-SCAN_MAX_JUMP_CENTS = _env_float("IMM_SCAN_MAX_JUMP", 6)
-SCAN_MAX_HISTORY_VOLUME = _env_float("IMM_SCAN_MAX_HISTORY_VOLUME", 250)
+SCAN_MIN_HISTORY_BARS = _env_int("IMM_SCAN_MIN_HISTORY_BARS", 0)
+SCAN_MAX_RANGE_CENTS = _env_float("IMM_SCAN_MAX_RANGE", 0)
+SCAN_MAX_JUMP_CENTS = _env_float("IMM_SCAN_MAX_JUMP", 10)
+SCAN_MAX_HISTORY_VOLUME = _env_float("IMM_SCAN_MAX_HISTORY_VOLUME", 1000)
 SCAN_HISTORY_TTL_SECS = _env_float("IMM_SCAN_HISTORY_TTL_H", 6) * 3600.0
 SCAN_SERIES_META_TTL_SECS = _env_float("IMM_SCAN_SERIES_META_TTL_D", 7) * 86400.0
 # Per-refresh read budgets: the scan universe is ~thousands of markets, so
@@ -2144,16 +2165,26 @@ def scan_history_verdict(candles) -> dict:
         mids.append((b + a) / 2.0)
     out = {"ok": False, "why": "", "bars": len(mids), "range": 0.0,
            "jump": 0.0, "vol": vol}
-    if len(mids) < SCAN_MIN_HISTORY_BARS:
+    # Each cap is independently disabled at <= 0 (Jack 2026-09-07 turned the
+    # bar-count and range checks off). The stats are still MEASURED and
+    # persisted either way, so the caches and the quote-gaps labels keep
+    # reporting what a book actually did even when nothing rejects on it.
+    if SCAN_MIN_HISTORY_BARS > 0 and len(mids) < SCAN_MIN_HISTORY_BARS:
         out["why"] = "history_thin"
         return out
-    out["range"] = max(mids) - min(mids)
-    out["jump"] = max(abs(mids[i] - mids[i - 1]) for i in range(1, len(mids)))
-    if out["range"] > SCAN_MAX_RANGE_CENTS:
+    # Guarded: with the bar-count check off, `mids` can be empty (a market
+    # that never showed a two-sided quote in the window) or hold a single
+    # bar, and max()/the pairwise walk would raise on those.
+    if mids:
+        out["range"] = max(mids) - min(mids)
+    if len(mids) >= 2:
+        out["jump"] = max(abs(mids[i] - mids[i - 1])
+                          for i in range(1, len(mids)))
+    if SCAN_MAX_RANGE_CENTS > 0 and out["range"] > SCAN_MAX_RANGE_CENTS:
         out["why"] = "history_range"
-    elif out["jump"] >= SCAN_MAX_JUMP_CENTS:
+    elif SCAN_MAX_JUMP_CENTS > 0 and out["jump"] >= SCAN_MAX_JUMP_CENTS:
         out["why"] = "history_jump"
-    elif vol > SCAN_MAX_HISTORY_VOLUME:
+    elif SCAN_MAX_HISTORY_VOLUME > 0 and vol > SCAN_MAX_HISTORY_VOLUME:
         out["why"] = "history_volume"
     else:
         out["ok"] = True
@@ -8792,9 +8823,16 @@ class IncentiveMarketMaker:
                 f"vol24h<={SCAN_MAX_VOLUME_24H:g} (event avg/market "
                 f"<={SCAN_MAX_EVENT_AVG_VOLUME_24H:g}) "
                 f"age>={SCAN_MIN_AGE_HOURS:g}h "
-                f"history {SCAN_HISTORY_HOURS}h/{SCAN_MIN_HISTORY_BARS}+ bars "
-                f"range<={SCAN_MAX_RANGE_CENTS:g}c jump<{SCAN_MAX_JUMP_CENTS:g}c "
-                f"vol<={SCAN_MAX_HISTORY_VOLUME:g}, categories out "
+                f"history {SCAN_HISTORY_HOURS}h "
+                + (f"{SCAN_MIN_HISTORY_BARS}+ bars "
+                   if SCAN_MIN_HISTORY_BARS > 0 else "bars off ")
+                + (f"range<={SCAN_MAX_RANGE_CENTS:g}c "
+                   if SCAN_MAX_RANGE_CENTS > 0 else "range off ")
+                + (f"jump<{SCAN_MAX_JUMP_CENTS:g}c "
+                   if SCAN_MAX_JUMP_CENTS > 0 else "jump off ")
+                + (f"vol<={SCAN_MAX_HISTORY_VOLUME:g}"
+                   if SCAN_MAX_HISTORY_VOLUME > 0 else "vol off")
+                + f", categories out "
                 f"{sorted(SCAN_EXCLUDE_CATEGORIES)}; daily loss budget "
                 f"${SCAN_DAILY_LOSS_LIMIT:g}; per-event tripwires "
                 + (f"fill {SCAN_FILL_HALT_CONTRACTS:g}/cycle"
