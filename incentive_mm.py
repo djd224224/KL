@@ -1081,6 +1081,25 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
 EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
+# A slot under the cap is for a REAL two-sided quote (Jack 2026-09-07, on
+# KXTRUEV-26SEP07-T1263.42 taking a slot over T1253.42: "only supports 1
+# side quoting, and is more likely to fall out of the quoting range and
+# stop earning"). The ROI rank could not see that on its own: a missing
+# side halves the numerator — estimate_reward_share scores
+# (share_yes + share_no)/2 — but that side's collateral also leaves the
+# denominator, so the ratio barely moves and can even improve. T1263 won
+# its slot on est $2.49/day over $19.00 at risk against T1253's $2.52 over
+# $25.10, then decayed to $0.17/day one-sided while the market it displaced
+# was worth $1.59. So two-sidedness is ranked ABOVE roi rather than priced
+# into it: a one-sided candidate sorts below every two-sided one and gets
+# no member tenure, which is what lets the fix move a slot that has already
+# gone one-sided. It is not an outright exclusion — if fewer than N
+# candidates are two-sided, a one-sided one may still take a spare slot,
+# since the cap exists to LIMIT correlated exposure, not to force it idle.
+# No hysteresis is needed to keep this from flapping: the released slot is
+# taken by a two-sided market that then holds tenure, so the one-sided
+# market cannot win it back until a slot genuinely frees.
+EVENT_TOP_N_TWO_SIDED = os.environ.get("IMM_EVENT_TOP_N_TWO_SIDED", "1") == "1"
 
 
 def event_top_n_for(series: str) -> int:
@@ -1116,7 +1135,14 @@ def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
     churning (see the note above EVENT_TOP_N), but unlike `immune` they are
     still trimmed worst-ROI-first if members alone exceed N — a lowered N
     or a restart restoring a wider set must not leave the cap breached.
-    Everything else competes by ROI for whatever slots remain."""
+    Everything else competes by ROI for whatever slots remain.
+
+    Under EVENT_TOP_N_TWO_SIDED a candidate whose own ladder can only build
+    ONE side (meta.quotable_sides < 2) forfeits member tenure and sorts
+    below every two-sided candidate, so it can only ever hold a slot no
+    two-sided market wants. `immune` is unaffected — finecon/scan
+    quote-to-completion is a promise about not unquoting, and this cut is
+    not the place to break it."""
     by_event: Dict[str, List["MarketMeta"]] = {}
     for _m in metas:
         if event_top_n_for(_m.series) > 0:
@@ -1126,17 +1152,24 @@ def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
         n = event_top_n_for(group[0].series)
         if n <= 0 or len(group) <= n:
             continue
+        def _two_sided(m: "MarketMeta") -> bool:
+            return (not EVENT_TOP_N_TWO_SIDED) or m.quotable_sides >= 2
+
+        # two-sidedness outranks ROI; a one-sided market also loses tenure
+        def _rank(m: "MarketMeta") -> Tuple[int, float]:
+            return (int(_two_sided(m)), _market_roi(m, incumbent))
+
         held = sum(1 for m in group if m.ticker in immune)
-        mem = [m for m in group
-               if m.ticker not in immune and m.ticker in members]
-        rest = [m for m in group
-                if m.ticker not in immune and m.ticker not in members]
+        mem = [m for m in group if m.ticker not in immune
+               and m.ticker in members and _two_sided(m)]
+        rest = [m for m in group if m.ticker not in immune
+                and not (m.ticker in members and _two_sided(m))]
         slots = max(0, n - held)
         if len(mem) > slots:
-            mem.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
+            mem.sort(key=_rank, reverse=True)
             cut.update(m.ticker for m in mem[slots:])
         slots = max(0, slots - len(mem))
-        rest.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
+        rest.sort(key=_rank, reverse=True)
         cut.update(m.ticker for m in rest[slots:])
     return cut
 
@@ -2690,7 +2723,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DAILY_LOSS_LIMIT", "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
-    "EVENT_TOP_N", "EVENT_TOP_N_STICKY",
+    "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
 )
 
 
@@ -4333,6 +4366,15 @@ class MarketMeta:
     # busy book counts ~4x its collateral (it WILL be bought); a 1c pad counts
     # ~1x (the whole book stands ahead of it). 0 when volume_24h unknown.
     est_exposure_dollars: float = 0.0
+    # How many sides of OUR ladder are actually buildable at the current book
+    # (2 = a real two-sided quote, 1 = the band or a missing touch kills one
+    # side, 0 = nothing quotable). Set by _estimate_candidate_yield on BOTH
+    # the incumbent and challenger paths from the same hypothetical ladder,
+    # so it never inherits the quoting/idle asymmetry that made the per-event
+    # cut churn. Default 2 = "assume fine": every consumer must fail OPEN, so
+    # a meta built outside the estimator (orphan restore, tests) is never
+    # silently disqualified. Read by event_top_n_cut.
+    quotable_sides: int = 2
     # observed deep-reference size multipliers (atref mode), set by the
     # candidate estimator — the collateral reservation must scale rung sizes
     # by these or the budget under-reserves up to 2x (2026-08-02 audit)
@@ -6545,6 +6587,40 @@ class IncentiveMarketMaker:
                                             series=meta.series)
         meta.ref_mult_ask = capped_ref_mult(ext_a, ra, "ask", hour_mult=_hm,
                                             series=meta.series)
+        # The buildable ladder, computed for EVERY candidate (pure local
+        # arithmetic on the book we already read — no extra API call). The
+        # challenger path below scores it; the incumbent path scores its real
+        # resting orders instead, but both need the same honest answer to
+        # "could we quote both sides here right now?", because a market whose
+        # bid falls under the band earns at most half a pool's snapshot score
+        # and is one tick from earning nothing (Jack 2026-09-07 on
+        # KXTRUEV-26SEP07-T1263.42: "only supports 1 side quoting, and is
+        # more likely to fall out of the quoting range and stop earning").
+        _lv = hour_scaled_levels(meta.series, datetime.now(timezone.utc))
+        _base = sum(s for _t, s in _lv)
+        _smb, _sma = clamp_side_max_to_position_cap(
+            int(round(_base * meta.ref_mult_bid)),
+            int(round(_base * meta.ref_mult_ask)),
+            series_max_position(meta.series))
+        _probe: List[Quote] = []
+        # atref: the band gates PLACEMENT no longer follows the touch, so
+        # a touch outside the band must not kill the side (rain books
+        # trade whole cities under 5c).
+        if ext_b is not None and (
+                (LADDER_MODE == "atref" and rb is not None)
+                or ext_b >= series_price_min(meta.series)):
+            _probe += build_side_ladder(meta.ticker, "bid", ext_b, ext_a,
+                                        _smb, levels=_lv, ref_px=rb,
+                                        hour_mult=_hm)
+        if ext_a is not None and (
+                (LADDER_MODE == "atref" and ra is not None)
+                or ext_a <= series_price_max(meta.series)):
+            _probe += build_side_ladder(meta.ticker, "ask", ext_a, ext_b,
+                                        _sma, levels=_lv, ref_px=ra,
+                                        hour_mult=_hm)
+        meta.quotable_sides = (
+            int(any(q.book_side == "bid" and q.count for q in _probe))
+            + int(any(q.book_side == "ask" and q.count for q in _probe)))
         if self.live and own_live:
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, own_live,
@@ -6557,31 +6633,9 @@ class IncentiveMarketMaker:
                 own_live, yes_levels, no_levels, meta.volume_24h,
                 own_in_book=True)
         else:
-            lv = hour_scaled_levels(meta.series, datetime.now(timezone.utc))
-            ext_bid, ext_ask, ref_bid_px, ref_ask_px = ext_b, ext_a, rb, ra
-            base_side_max = sum(s for _t, s in lv)
-            side_max_bid = int(round(base_side_max * meta.ref_mult_bid))
-            side_max_ask = int(round(base_side_max * meta.ref_mult_ask))
-            # same clamp the quote loop applies, or the estimate models a
-            # ladder bigger than the bot will ever rest and overstates share
-            side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
-                side_max_bid, side_max_ask, series_max_position(meta.series))
-            quotes: List[Quote] = []
-            # atref: the band gates PLACEMENT no longer follows the touch, so
-            # a touch outside the band must not kill the side (rain books
-            # trade whole cities under 5c).
-            if ext_bid is not None and (
-                    (LADDER_MODE == "atref" and ref_bid_px is not None)
-                    or ext_bid >= series_price_min(meta.series)):
-                quotes += build_side_ladder(meta.ticker, "bid", ext_bid, ext_ask,
-                                            side_max_bid, levels=lv, ref_px=ref_bid_px,
-                                            hour_mult=_hm)
-            if ext_ask is not None and (
-                    (LADDER_MODE == "atref" and ref_ask_px is not None)
-                    or ext_ask <= series_price_max(meta.series)):
-                quotes += build_side_ladder(meta.ticker, "ask", ext_ask, ext_bid,
-                                            side_max_ask, levels=lv, ref_px=ref_ask_px,
-                                            hour_mult=_hm)
+            lv = _lv
+            ext_bid, ext_ask = ext_b, ext_a
+            quotes: List[Quote] = _probe
             if not quotes:
                 meta.est_frac = meta.est_dollars_per_day = meta.yield_per_contract = 0.0
                 return True

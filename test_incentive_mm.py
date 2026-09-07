@@ -2215,6 +2215,58 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                                 immune={"KXAAAGASDNY-26SEP07-4.3050"}),
             {"KXAAAGASDNY-26SEP07-4.3300", "KXAAAGASDNY-26SEP07-4.3100"})
 
+    def test_event_top_n_two_sided_beats_roi(self):
+        # Jack 2026-09-07, KXTRUEV-26SEP07-T1263.42 taking a slot over
+        # T1253.42: "only supports 1 side quoting, and is more likely to
+        # fall out of the quoting range and stop earning". Live numbers from
+        # that admission — the one-sided market won on the DENOMINATOR.
+        def m(t, est, expo, sides=2):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=106.89,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=expo, est_collateral_dollars=0.0,
+                quotable_sides=sides)
+        ev = "KXTRUEV-26SEP07"
+        grp = [m(f"{ev}-T1243.42", 3.6649, 12.20),          # ROI 0.300
+               m(f"{ev}-T1253.42", 2.5171, 25.10),          # ROI 0.100
+               m(f"{ev}-T1233.42", 2.3465, 10.80),          # ROI 0.217
+               m(f"{ev}-T1263.42", 2.4929, 19.00, sides=1)]  # ROI 0.131, 1-sided
+        # ROI alone put T1263 third and cut T1253; two-sidedness reverses it.
+        self.assertEqual(imm.event_top_n_cut(grp, incumbent=set()),
+                         {f"{ev}-T1263.42"})
+        # a one-sided MEMBER forfeits tenure — this is what lets the fix move
+        # a slot that has already gone one-sided
+        self.assertEqual(
+            imm.event_top_n_cut(grp, incumbent={f"{ev}-T1263.42"},
+                                members={f"{ev}-T1263.42"}),
+            {f"{ev}-T1263.42"})
+        # ...while a two-sided member keeps it against a better challenger
+        self.assertNotIn(f"{ev}-T1253.42",
+                         imm.event_top_n_cut(grp, incumbent={f"{ev}-T1253.42"},
+                                             members={f"{ev}-T1253.42"}))
+        # not an outright exclusion: with only two two-sided candidates the
+        # one-sided market still takes the spare slot rather than idling it
+        thin = [grp[0], grp[1], grp[3]]
+        self.assertEqual(imm.event_top_n_cut(thin, incumbent=set()), set())
+        # immune (finecon/scan quote-to-completion) is never broken by this
+        self.assertNotIn(f"{ev}-T1263.42",
+                         imm.event_top_n_cut(grp, incumbent=set(),
+                                             immune={f"{ev}-T1263.42"}))
+        # knob off -> the old pure-ROI order, which cut T1253
+        imm.EVENT_TOP_N_TWO_SIDED = False
+        try:
+            self.assertEqual(imm.event_top_n_cut(grp, incumbent=set()),
+                             {f"{ev}-T1253.42"})
+        finally:
+            imm.EVENT_TOP_N_TWO_SIDED = True
+        # metas built outside the estimator fail OPEN (default 2)
+        self.assertEqual(imm.MarketMeta(
+            ticker="x", event_ticker="x", series="x", dollars_per_day=0.0,
+            program_end=None, target_size=0, discount_factor=0.5,
+            cutoff=None, close_time=None).quotable_sides, 2)
+
     def test_finecon_sweep_enrollment_and_guards(self):
         # Jack 2026-09-02: Finance/Economics sweep — the risk-screened
         # survivors are allowed, guarded (safe-join, no rate bar), and the
