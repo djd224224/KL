@@ -1088,9 +1088,12 @@ EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
 # side halves the numerator — estimate_reward_share scores
 # (share_yes + share_no)/2 — but that side's collateral also leaves the
 # denominator, so the ratio barely moves and can even improve. T1263 won
-# its slot on est $2.49/day over $19.00 at risk against T1253's $2.52 over
-# $25.10, then decayed to $0.17/day one-sided while the market it displaced
-# was worth $1.59. So two-sidedness is ranked ABOVE roi rather than priced
+# its slot on est $2.49/day over $19.00 at risk (ROI 0.131) against
+# T1253's $2.52 over $25.10 (ROI 0.100) — and kept winning it, because
+# one-sidedness is not a decay the ROI rank eventually notices: measured
+# under launcher-env parity the one-sided market still reads the HIGHER
+# est/day and the higher ROI ($2.4849 vs $2.3607). Nothing in the ratio
+# will ever evict it. So two-sidedness is ranked ABOVE roi rather than priced
 # into it: a one-sided candidate sorts below every two-sided one and gets
 # no member tenure, which is what lets the fix move a slot that has already
 # gone one-sided. It is not an outright exclusion — if fewer than N
@@ -6624,9 +6627,22 @@ class IncentiveMarketMaker:
             _probe += build_side_ladder(meta.ticker, "ask", ext_a, ext_b,
                                         _sma, levels=_lv, ref_px=ra,
                                         hour_mult=_hm)
+        # Sides that will actually REST. This must replicate the quote
+        # loop's PER-SIDE TOP-IN-BAND gate (Jack 2026-08-03, CHIH T69.99):
+        # "a side whose OWN touch is outside the band stands down alone —
+        # its rungs die as diff-unmatched, its pad stays to qualify the
+        # snapshot — while the healthy side keeps earning". Reading it off
+        # `_probe` instead was WRONG and shipped that way for one refresh:
+        # under LADDER_MODE=atref build_side_ladder is deliberately EXEMPT
+        # from the band (Jack 2026-08-01, "don't arbitrarily constrain to
+        # 5c"), so it happily builds a bid rung at a 4c reference that the
+        # loop then never places — KXTRUEV-26SEP07-T1263.42 measured
+        # two-sided while resting an ask and nothing else.
+        _pmin_s, _pmax_s = member_price_band(
+            meta.series, meta.ticker in self.state.selected)
         meta.quotable_sides = (
-            int(any(q.book_side == "bid" and q.count for q in _probe))
-            + int(any(q.book_side == "ask" and q.count for q in _probe)))
+            int(ext_b is not None and _pmin_s <= ext_b <= _pmax_s)
+            + int(ext_a is not None and _pmin_s <= ext_a <= _pmax_s))
         if self.live and own_live:
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, own_live,
