@@ -7295,6 +7295,118 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertIn("HALTED today", html)
 
 
+class TestFineconFamilyRule(unittest.TestCase):
+    """Jack 2026-09-09: "add a family rule for central banks, they are
+    eligible for finecon but quoting must stop at event datetime so no
+    adverse selection."
+
+    Before this, 17 central banks were flagged `review: (unclassified)` by
+    the daily task (England and Japan 25 times each since 2026-07-29) and 2
+    were enrolled by hand. classify_series has no recognizer for them, review
+    is log-only, and the feed audit needs one SERIES over $300/day while the
+    family is a uniform $188/day x 5, so nothing ever escalated."""
+
+    def setUp(self):
+        self._fam = set(imm.FINECON_FAMILY)
+        self._fin = set(imm.FINECON_SERIES)
+        self._ovr = dict(imm.SERIES_OVERRIDES)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        imm.FINECON_FAMILY.clear(); imm.FINECON_FAMILY.update(self._fam)
+        imm.FINECON_SERIES.clear(); imm.FINECON_SERIES.update(self._fin)
+        imm.SERIES_OVERRIDES.clear(); imm.SERIES_OVERRIDES.update(self._ovr)
+
+    def test_prefix_admits_new_banks_from_the_live_feed(self):
+        self.assertEqual(imm.FINECON_SERIES_PREFIXES, ("KXCBD",))
+        for s in ("KXCBDNORWAY", "KXCBDPOLAND", "KXCBDSWEDEN"):
+            imm.FINECON_SERIES.discard(s); imm.FINECON_FAMILY.discard(s)
+            imm.SERIES_OVERRIDES.pop(s, None)
+        n = imm.finecon_expand_family([
+            "KXCBDNORWAY-26SEP24-HOLD", "KXCBDPOLAND-26OCT07-C25",
+            "KXCBDSWEDEN-26SEP24-H25", "KXSPRLVL-26SEP09-T286"])
+        self.assertEqual(n, 3, "only the KXCBD* prefix is admitted")
+        for s in ("KXCBDNORWAY", "KXCBDPOLAND", "KXCBDSWEDEN"):
+            self.assertIn(s, imm.FINECON_SERIES)
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(f"{s}-26SEP24-HOLD"))
+        self.assertNotIn("KXSPRLVL", imm.FINECON_FAMILY)
+        # idempotent: a second pass adds nothing
+        self.assertEqual(imm.finecon_expand_family(["KXCBDNORWAY-26SEP24-HOLD"]), 0)
+
+    def test_family_members_stop_quoting_before_the_decision(self):
+        """The whole point of the rule. Kalshi puts close_time exactly one
+        minute before the announcement, so the guard is close-anchored — the
+        ticker-date midnight-ET rule is 4h early for Norway but 21h early for
+        the RBNZ, whose ticker day and announcement day differ."""
+        imm.FINECON_SERIES.discard("KXCBDNORWAY")
+        imm.FINECON_FAMILY.discard("KXCBDNORWAY")
+        imm.SERIES_OVERRIDES.pop("KXCBDNORWAY", None)
+        imm.finecon_expand_family(["KXCBDNORWAY-26SEP24-HOLD"])
+        ov = imm.SERIES_OVERRIDES["KXCBDNORWAY"]
+        self.assertEqual(ov.cutoff_from_close_min,
+                         imm.FINECON_FAMILY_CUTOFF_FROM_CLOSE_MIN)
+        self.assertTrue(ov.safe_join)
+        self.assertEqual(ov.min_est_per_day, 0.0)      # finecon: no rate bar
+        # the derived cutoff really does land before the announcement
+        decision = datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)
+        close = decision - timedelta(minutes=1)        # Kalshi's shape
+        cut = close - timedelta(minutes=ov.cutoff_from_close_min)
+        self.assertLess(cut, decision)
+        self.assertGreaterEqual((decision - cut).total_seconds() / 60.0, 60)
+        # ... and for an Asia-Pacific bank whose ticker DAY differs from the
+        # announcement day, where the ticker-date rule would be a full day out
+        rbnz_decision = datetime(2026, 10, 28, 1, 0, tzinfo=timezone.utc)
+        rbnz_cut = (rbnz_decision - timedelta(minutes=1)
+                    - timedelta(minutes=ov.cutoff_from_close_min))
+        self.assertLess(rbnz_cut, rbnz_decision)
+        ticker_rule = imm.parse_event_date("KXCBDECISIONNZ-26OCT27")
+        self.assertLess(ticker_rule, rbnz_cut,
+                        "close-anchored must be LATER than the crude ticker "
+                        "rule here, i.e. it recovers forfeited accrual")
+
+    def test_missing_close_time_fails_closed(self):
+        """A close-anchored series with no close_time must stand down, not
+        fall back to quoting."""
+        imm.finecon_expand_family(["KXCBDNORWAY-26SEP24-HOLD"])
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        meta = imm.MarketMeta(
+            ticker="KXCBDNORWAY-26SEP24-HOLD",
+            event_ticker="KXCBDNORWAY-26SEP24", series="KXCBDNORWAY",
+            dollars_per_day=37.66, program_end=None, target_size=1000,
+            discount_factor=0.5, cutoff=None, close_time=None,
+            mid_cents=50.0, spread_cents=2)
+        self.assertEqual(bot._screen(meta, datetime.now(timezone.utc)),
+                         "no_event_window")
+
+    def test_blocklisted_series_is_refused(self):
+        with mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES",
+                               tuple(imm.SERIES_BLOCKLIST_PREFIXES) + ("KXCBDBAD",)):
+            imm.finecon_expand_family(["KXCBDBAD-26SEP24-HOLD"])
+        self.assertNotIn("KXCBDBAD", imm.FINECON_SERIES)
+
+    def test_extra_file_reload_does_not_wipe_family_members(self):
+        """load_finecon_extra_series rebuilds FINECON_SERIES from
+        _FINECON_BASE, so feed-discovered members must be folded in or they
+        would vanish on the next hot reload."""
+        imm.finecon_expand_family(["KXCBDNORWAY-26SEP24-HOLD"])
+        self.assertIn("KXCBDNORWAY", imm.FINECON_SERIES)
+        import json as _json, os as _os
+        _os.makedirs(imm.STATUS_DIR, exist_ok=True)
+        with open(imm.FINECON_EXTRA_FILE, "w") as f:
+            _json.dump({"series": ["KXSOMETHINGADS"]}, f)
+        try:
+            imm._finecon_extra_state["mtime"] = 0.0
+            imm.load_finecon_extra_series()
+            self.assertIn("KXCBDNORWAY", imm.FINECON_SERIES,
+                          "family member wiped by the extra-file rebuild")
+            self.assertIn("KXSOMETHINGADS", imm.FINECON_SERIES)
+        finally:
+            try: _os.remove(imm.FINECON_EXTRA_FILE)
+            except OSError: pass
+            imm._finecon_extra_state["mtime"] = 0.0
+
+
 class TestLifetimeSlotRelease(unittest.TestCase):
     """Jack 2026-09-09: "release a lifetime slot if <=5 contracts were filled
     on it and it becomes unquotable (both sides out of band). only count

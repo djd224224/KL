@@ -1799,6 +1799,44 @@ _FINECON_BASE = frozenset(
     s for s in os.environ.get("IMM_ALLOW_FINECON_SERIES",
                               _DEFAULT_FINECON_SERIES).split(",") if s)
 FINECON_SERIES: Set[str] = set(_FINECON_BASE)
+# ---- FINECON FAMILY RULE (Jack 2026-09-09) ---------------------------------
+# "add a family rule for central banks, they are eligible for finecon but
+# quoting must stop at event datetime so no adverse selection."
+#
+# WHY A FAMILY RULE. KXCBDECISIONNZ and KXCBDISRAEL were enrolled by hand in
+# the 2026-09-02 sweep (bfc126b). Every sibling since has been seen, filed
+# `review: <series> (unclassified)` by the daily classifier, and left there:
+# classify_series has no central-bank recognizer, review is log-only (Jack
+# 8/15), and imm_feed_audit's escalation needs one SERIES over
+# NEW_FAMILY_MIN_DPD ($300) while this family is a uniform $188/day x 5
+# markets, so no member ever pings and the $943/day aggregate is never
+# formed. Result: 17 central banks flagged (England and Japan 25 times each
+# since 2026-07-29), 2 enrolled, ~$15k of gross pool never adjudicated. That
+# is the same failure the code already names as the 8/31 state-gas lesson:
+# "a half-covered family misses the next sibling for a day".
+#
+# The archetype is uniform and already vetted twice: a scheduled sovereign
+# rate decision, categorical HOLD/H25/H25P/C25/C25P strikes, settled on the
+# central bank's own announcement. Members are discovered from the live
+# programs feed by prefix, so a bank Kalshi lists tomorrow is covered the
+# same refresh.
+FINECON_SERIES_PREFIXES = tuple(
+    p for p in os.environ.get("IMM_FINECON_SERIES_PREFIXES", "KXCBD").split(",")
+    if p)
+# Feed-discovered family members, kept separate from _FINECON_BASE so
+# load_finecon_extra_series' rebuild cannot wipe them.
+FINECON_FAMILY: Set[str] = set()
+# QUOTING STOPS BEFORE THE DECISION. These are close-anchored, not ticker-
+# dated: Kalshi publishes the exact announcement instant as
+# occurrence_datetime / expected_expiration_time, with close_time exactly one
+# minute earlier (verified 2026-09-09: Norway 08:00Z, Poland 13:00Z, Israel
+# 14:00Z, RBNZ 01:00Z, BoJ 03:30Z). The ticker-date midnight-ET rule is a bad
+# proxy for that — it is 4h early for Norway but a full 21h early for RBNZ,
+# whose ticker day and announcement day differ. Anchoring to close_time gives
+# one rule that is exact for every timezone, and _screen already fails closed
+# (`no_event_window`) if a close time is missing.
+FINECON_FAMILY_CUTOFF_FROM_CLOSE_MIN = _env_int(
+    "IMM_FINECON_FAMILY_CUTOFF_FROM_CLOSE_MIN", 60)
 ALLOW_SERIES = frozenset(
     s for s in (os.environ.get("IMM_ALLOW_SERIES", _DEFAULT_CRYPTO_SERIES) + ","
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
@@ -3398,6 +3436,51 @@ FINECON_EXTRA_FILE = os.path.join(STATUS_DIR, "finecon_extra_series.json")
 _finecon_extra_state = {"mtime": 0.0}
 
 
+def finecon_family_override() -> "SeriesOverride":
+    """Guard set for a feed-discovered finecon family member: the ordinary
+    finecon guards (safe-join, no rate bar) PLUS a close-anchored cutoff, so
+    quoting stops FINECON_FAMILY_CUTOFF_FROM_CLOSE_MIN before the scheduled
+    announcement instead of at the ticker date's midnight ET."""
+    return SeriesOverride(
+        min_est_per_day=_env_float("IMM_FINECON_MIN_RATE", 0.0),
+        safe_join=True,
+        cutoff_from_close_min=FINECON_FAMILY_CUTOFF_FROM_CLOSE_MIN)
+
+
+def finecon_expand_family(series_seen) -> int:
+    """Admit live-feed series matching FINECON_SERIES_PREFIXES into the
+    finecon group (Jack 2026-09-09). Returns how many were newly added.
+
+    Blocklisted/frozen series are refused, and a series the normal book
+    already allows is left alone — this only ever ADDS a family member the
+    curator would have added by hand. A hand-tuned override elsewhere wins;
+    this only fills gaps, exactly like the base-list loop above."""
+    if not FINECON_SERIES_PREFIXES:
+        return 0
+    added = set()
+    for t in series_seen:
+        s = series_of(t) if "-" in str(t) else str(t)
+        if not s or s in FINECON_SERIES or s in FINECON_FAMILY:
+            continue
+        if not any(s.startswith(p) for p in FINECON_SERIES_PREFIXES):
+            continue
+        if IncentiveMarketMaker._blocked(f"{s}-X"):
+            log(f"[IMM] ! finecon family: refused blocklisted {s}")
+            continue
+        added.add(s)
+    if not added:
+        return 0
+    for s in added:
+        if s not in SERIES_OVERRIDES:
+            SERIES_OVERRIDES[s] = finecon_family_override()
+    FINECON_FAMILY.update(added)
+    FINECON_SERIES.update(added)
+    log(f"[IMM] finecon family: +{len(added)} by prefix "
+        f"{list(FINECON_SERIES_PREFIXES)} -> {', '.join(sorted(added))} "
+        f"(quoting stops {FINECON_FAMILY_CUTOFF_FROM_CLOSE_MIN}min before close)")
+    return len(added)
+
+
 def load_finecon_extra_series() -> int:
     try:
         mtime = os.path.getmtime(FINECON_EXTRA_FILE)
@@ -3421,14 +3504,17 @@ def load_finecon_extra_series() -> int:
             log(f"[IMM] ! refused blocklisted series in finecon extra: {s}")
             continue
         fresh.add(s)
-    target = _FINECON_BASE | fresh
+    target = _FINECON_BASE | FINECON_FAMILY | fresh
     changed = len(target ^ FINECON_SERIES)
     if changed:
         for s in target - FINECON_SERIES:
             if s not in SERIES_OVERRIDES:
-                SERIES_OVERRIDES[s] = SeriesOverride(
-                    min_est_per_day=_env_float("IMM_FINECON_MIN_RATE", 0.0),
-                    safe_join=True)
+                SERIES_OVERRIDES[s] = (
+                    finecon_family_override()
+                    if any(s.startswith(p) for p in FINECON_SERIES_PREFIXES)
+                    else SeriesOverride(
+                        min_est_per_day=_env_float("IMM_FINECON_MIN_RATE", 0.0),
+                        safe_join=True))
         FINECON_SERIES.clear()
         FINECON_SERIES.update(target)
         log(f"[IMM] finecon extra series: {len(fresh)} extended "
@@ -6137,6 +6223,11 @@ class IncentiveMarketMaker:
         # transient feed outage).
         if by_market:
             self.state.programmed = set(by_market)
+            # FINECON FAMILY (2026-09-09): admit prefix-matching series the
+            # moment Kalshi programs them, so a newly listed central bank is
+            # covered the same refresh rather than waiting for a hand add.
+            # Runs on the LIVE feed only — never on a failed/empty read.
+            finecon_expand_family(by_market)
 
         def ticker_cutoff_passed(t: str) -> bool:
             # (imm_quote_gaps.py mirrors this pre-filter — keep in sync.)
