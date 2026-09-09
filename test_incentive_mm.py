@@ -7287,6 +7287,110 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertIn("HALTED today", html)
 
 
+class TestLifetimeSlotRelease(unittest.TestCase):
+    """Jack 2026-09-09: "release a lifetime slot if <=5 contracts were filled
+    on it and it becomes unquotable (both sides out of band). only count
+    lifetime slots if had 6+ filled contracts".
+
+    Measured cause: KXDIESELELECT-26NOV03 held all three lifetime slots on
+    T4.40/T4.60/T4.80, which had drifted to 95-98c against a 5-90c band, so
+    all three stood down while six healthy siblings were cut as event_top_n.
+    KXDIESELMINY-26DEC31 was the mirror image at 1-4c. ~$386/day of pool
+    parked on strikes that could not quote."""
+
+    EV = "KXDIESEL-26NOV03"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.addCleanup(_clean_persist)
+
+    def _slots(self, *tickers):
+        return {"markets": [f"{self.EV}-{t}" for t in tickers], "ts": time.time()}
+
+    def test_barely_traded_and_unquotable_releases_its_slot(self):
+        self.assertEqual(imm.EVENT_SLOT_EARNED_FILLS, 6)
+        entry = self._slots("T4.40", "T4.60", "T4.80")
+        # T4.40 filled 5 (under the bar) and is now out of band -> released
+        self.bot.pnl.filled[f"{self.EV}-T4.40"] = 5.0
+        self.bot.pnl.filled[f"{self.EV}-T4.60"] = 0.0
+        self.bot.pnl.filled[f"{self.EV}-T4.80"] = 40.0     # earned it
+        unquotable = {f"{self.EV}-T4.40", f"{self.EV}-T4.60", f"{self.EV}-T4.80"}
+        kept = self.bot._live_event_slots(self.EV, entry, unquotable)
+        self.assertEqual(kept, [f"{self.EV}-T4.80"],
+                         "only the market that actually traded keeps its slot")
+        # the ledger itself is pruned, so the room is real on the next cut
+        self.assertEqual(entry["markets"], [f"{self.EV}-T4.80"])
+
+    def test_six_fills_earns_the_slot_forever(self):
+        entry = self._slots("T4.40")
+        self.bot.pnl.filled[f"{self.EV}-T4.40"] = 6.0      # exactly the bar
+        kept = self.bot._live_event_slots(self.EV, entry, {f"{self.EV}-T4.40"})
+        self.assertEqual(kept, [f"{self.EV}-T4.40"])
+        self.bot.pnl.filled[f"{self.EV}-T4.40"] = 5.99
+        self.assertEqual(
+            self.bot._live_event_slots(self.EV, dict(entry), {f"{self.EV}-T4.40"}), [])
+
+    def test_a_quotable_market_keeps_its_slot_however_little_it_traded(self):
+        """The concurrency meaning of the cap must survive: a live low-fill
+        market still holds its slot, so an event never quotes more than N."""
+        entry = self._slots("T4.40", "T4.60")
+        self.bot.pnl.filled.clear()
+        kept = self.bot._live_event_slots(self.EV, entry, set())   # none unquotable
+        self.assertEqual(len(kept), 2)
+
+    def test_a_slot_holder_absent_from_this_refresh_is_never_released(self):
+        """unquotable_now only holds markets bulk-read this refresh, so a
+        slot-holder missing from the feed must not be released on no data."""
+        entry = self._slots("T4.40")
+        self.bot.pnl.filled.clear()
+        kept = self.bot._live_event_slots(self.EV, entry, {"KXOTHER-26NOV03-T1"})
+        self.assertEqual(kept, [f"{self.EV}-T4.40"])
+
+    def test_released_slot_lets_a_healthy_sibling_in(self):
+        """End to end through the real cut: with the ledger full of dead
+        strikes the sibling is rejected; once released it is admitted."""
+        def m(t):
+            return imm.MarketMeta(
+                ticker=f"{self.EV}-{t}", event_ticker=self.EV, series="KXDIESEL",
+                dollars_per_day=14.29, program_end=None, target_size=1000,
+                discount_factor=0.5, cutoff=None, close_time=None,
+                est_dollars_per_day=1.0, est_exposure_dollars=10.0,
+                est_collateral_dollars=0.0, quotable_sides=2)
+        healthy = [m("T5.20"), m("T5.60"), m("T5.80")]
+        full = self._slots("T4.40", "T4.60", "T4.80")
+        cut = imm.event_top_n_cut(healthy, incumbent=set(),
+                                  slots_used={self.EV: list(full["markets"])})
+        self.assertEqual(len(cut), 3, "ledger full -> every sibling cut")
+        # now release them: barely traded and out of band
+        self.bot.pnl.filled.clear()
+        unq = {t for t in full["markets"]}
+        live = self.bot._live_event_slots(self.EV, full, unq)
+        self.assertEqual(live, [])
+        cut2 = imm.event_top_n_cut(healthy, incumbent=set(),
+                                   slots_used={self.EV: live})
+        self.assertEqual(cut2, set(), "released slots admit the healthy strikes")
+
+    def test_knob_off_restores_the_strict_lifetime_ledger(self):
+        entry = self._slots("T4.40")
+        self.bot.pnl.filled.clear()
+        with mock.patch.object(imm, "EVENT_SLOT_EARNED_FILLS", 0):
+            kept = self.bot._live_event_slots(self.EV, entry, {f"{self.EV}-T4.40"})
+        self.assertEqual(kept, [f"{self.EV}-T4.40"])
+
+    def test_gross_fills_are_tracked_and_survive_a_restart(self):
+        """`pos` cannot answer 'did we trade here' — a market worked flat
+        reads 0 — so the rule needs the gross figure."""
+        t = f"{self.EV}-T4.40"
+        self.bot.pnl.on_fill(t, "yes", "buy", 20, 50)
+        self.bot.pnl.on_fill(t, "yes", "sell", 20, 51)
+        self.assertEqual(self.bot.pnl.pos.get(t, 0.0), 0.0)   # flat
+        self.assertEqual(self.bot.pnl.filled[t], 40.0)        # but 40 traded
+        self.bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=self.bot.client, live=False)
+        self.assertEqual(bot2.pnl.filled.get(t), 40.0)
+
+
 class TestOpenScanTier(unittest.TestCase):
     """Jack 2026-09-05: "extend the opportunistic IMM with 15 slots and 5 to
     scan all markets. be very careful for adverse selection". The tier's

@@ -1247,6 +1247,30 @@ EVENT_TOP_N_TWO_SIDED = os.environ.get("IMM_EVENT_TOP_N_TWO_SIDED", "1") == "1"
 # hygiene) — never by the event going quiet, or a lull would silently reset
 # the cap. IMM_EVENT_TOP_N_LIFETIME=0 restores the concurrent cap.
 EVENT_TOP_N_LIFETIME = os.environ.get("IMM_EVENT_TOP_N_LIFETIME", "1") == "1"
+# A lifetime slot is EARNED BY TRADING, not merely by being selected (Jack
+# 2026-09-09: "release a lifetime slot if <=5 contracts were filled on it and
+# it becomes unquotable (both sides out of band). only count lifetime slots
+# if had 6+ filled contracts").
+#
+# WHY. The ledger above records a slot on selection and never gives it back,
+# which is right for a market the bot actually worked — but an event whose
+# underlying TRENDS strands its slots on strikes that drifted out of the
+# quoting band. Measured 2026-09-09: KXDIESELELECT-26NOV03 held its three
+# lifetime slots on T4.40/T4.60/T4.80, all sitting at 95-98c against a 5-90c
+# band, so all three stood down and rested nothing while six healthy siblings
+# (T5.20 through T6.40) were rejected as "event_top_n". KXDIESELMINY-26DEC31
+# was the mirror image at 1-4c. Together ~$386/day of pool parked on strikes
+# that could not quote.
+#
+# THE RULE. A recorded slot still counts while EITHER the market has filled
+# EVENT_SLOT_EARNED_FILLS or more contracts (gross, both directions — it
+# genuinely used the slot, so the slot stays spent forever), OR it is still
+# quotable (at least one side inside the band — it is doing its job now).
+# A market that is both barely-traded and unquotable releases its slot and
+# is dropped from the ledger. Keeping the "still quotable" arm is what
+# preserves the CONCURRENT meaning of the cap: a live low-fill market goes
+# on holding its slot, so an event still never quotes more than N at once.
+EVENT_SLOT_EARNED_FILLS = _env_float("IMM_EVENT_SLOT_EARNED_FILLS", 6)
 EVENT_SLOTS_TTL_SECS = _env_float("IMM_EVENT_SLOTS_TTL_D", 14) * 86400.0
 
 
@@ -4515,6 +4539,13 @@ class PnlTracker:
         self.pos: Dict[str, float] = {}
         self.avg: Dict[str, float] = {}     # avg entry price (cents) of open pos
         self.realized: Dict[str, float] = {}
+        # CUMULATIVE GROSS contracts filled per market, both directions, never
+        # netted down (Jack 2026-09-09). `pos` cannot answer "did we actually
+        # trade here": a market that filled 40 and was worked flat reads 0.
+        # The lifetime per-event slot rule needs the gross figure, so it is
+        # tracked here at the single point every fill passes through, and
+        # persisted alongside own_pos/own_avg.
+        self.filled: Dict[str, float] = {}
 
     def on_fill(self, ticker: str, side: str, action: str, count: float,
                 yes_price_cents: float) -> None:
@@ -4525,6 +4556,7 @@ class PnlTracker:
         that yes-price, so only the action flips for the NO side."""
         if side == "no":
             action = "sell" if action == "buy" else "buy"
+        self.filled[ticker] = self.filled.get(ticker, 0.0) + abs(count)
         signed = count if action == "buy" else -count
         pos = self.pos.get(ticker, 0.0)
         avg = self.avg.get(ticker, 0.0)
@@ -5185,6 +5217,11 @@ class IncentiveMarketMaker:
                 self.pnl.pos[str(t)] = float(p)
             for t, a in (data.get("own_avg") or {}).items():
                 self.pnl.avg[str(t)] = float(a)
+            for t, v in (data.get("own_filled") or {}).items():
+                try:
+                    self.pnl.filled[str(t)] = float(v)
+                except (TypeError, ValueError):
+                    pass
             self.state.reward_est_lifetime = float(data.get("reward_est_lifetime") or 0.0)
             # realized_seen deliberately NOT restored: the tracker starts empty
             self.state.realized_lifetime = float(data.get("realized_lifetime") or 0.0)
@@ -5423,6 +5460,11 @@ class IncentiveMarketMaker:
                            "own_avg": {t: self.pnl.avg.get(t, 0.0)
                                        for t, p in self.pnl.pos.items()
                                        if abs(p) > 1e-9},
+                           # gross contracts ever filled per market; the
+                           # lifetime slot rule reads it (2026-09-09)
+                           "own_filled": {t: round(v, 2)
+                                          for t, v in self.pnl.filled.items()
+                                          if v > 0},
                            "reward_est_lifetime": self.state.reward_est_lifetime,
                            # lifetime realized trading P&L incl. settlements
                            "realized_lifetime": round(self.state.realized_lifetime, 4),
@@ -6192,6 +6234,8 @@ class IncentiveMarketMaker:
         scan_metas: List[Tuple[MarketMeta, dict]] = []
 
         metas: List[MarketMeta] = []
+        # tickers whose WHOLE book is outside the quoting band this refresh
+        unquotable_now: Set[str] = set()
         tickers = [t for t, _info in candidates] + [t for t, _i in scan_pre]
         markets: Dict[str, dict] = {}
         for i in range(0, len(tickers), 50):
@@ -6281,6 +6325,13 @@ class IncentiveMarketMaker:
                 spread_cents=((ask - bid) if bid and ask else None),
                 volume=volume, status=m.get("status", ""),
                 open_time=parse_iso_utc(m.get("open_time", "")))
+            # Band state for the LIFETIME SLOT RULE (2026-09-09), recorded
+            # here because this is the last point a slot-holding market is
+            # still in hand: one whose touches are outside the band is
+            # dropped by _screen as `extreme_mid` and never reaches the cut.
+            _plo, _phi = member_price_band(series, t in self.state.selected)
+            if not (bid and _plo <= bid <= _phi)                     and not (ask and _plo <= ask <= _phi):
+                unquotable_now.add(t)
             if t in scan_pre_set:
                 # open-scan candidate: flagged, given its 24h volume (the
                 # activity screen + fill-weighted exposure need it) and held
@@ -6570,8 +6621,9 @@ class IncentiveMarketMaker:
         # spent. Read before the cut, written after it with whatever the cut
         # kept — so a market only ever burns a slot by actually surviving
         # into the selection.
-        slots_used = {e: list(v["markets"])
-                      for e, v in self.state.event_slots.items()}             if EVENT_TOP_N_LIFETIME else None
+        slots_used = ({e: self._live_event_slots(e, v, unquotable_now)
+                       for e, v in self.state.event_slots.items()}
+                      if EVENT_TOP_N_LIFETIME else None)
         topn_cut = event_top_n_cut(ranked, prev_selected,
                                    immune=fin_sticky | scan_sticky,
                                    members=topn_sticky,
@@ -7333,6 +7385,40 @@ class IncentiveMarketMaker:
                     lp = market_cents(m, "last_price")
                     if lp:
                         self.state.last_mark[t] = float(lp)
+
+    def _live_event_slots(self, ev: str, entry: dict,
+                          unquotable_now: Set[str]) -> List[str]:
+        """The recorded lifetime slots of `ev` that STILL COUNT, pruning the
+        ledger of any that no longer do (Jack 2026-09-09).
+
+        A slot keeps counting while EITHER the market earned it by trading
+        (gross fills >= EVENT_SLOT_EARNED_FILLS — spent forever, whatever the
+        book does later) OR it is still quotable (at least one touch inside
+        the band, so it is doing its job now). A market that is BOTH
+        barely-traded AND wholly outside the band releases its slot.
+
+        `unquotable_now` only contains markets bulk-read THIS refresh, so a
+        slot-holder that vanished from the programs feed is never released on
+        missing data — it keeps its slot until it reappears and proves itself
+        unquotable. Fail-closed, matching every other screen here."""
+        markets = list(entry.get("markets") or [])
+        if not EVENT_TOP_N_LIFETIME or EVENT_SLOT_EARNED_FILLS <= 0:
+            return markets
+        kept, released = [], []
+        for t in markets:
+            earned = self.pnl.filled.get(t, 0.0) >= EVENT_SLOT_EARNED_FILLS
+            if earned or t not in unquotable_now:
+                kept.append(t)
+            else:
+                released.append(t)
+        if released:
+            entry["markets"] = kept
+            for t in released:
+                log(f"{self.tag} event slot released on {ev}: {t} "
+                    f"(filled {self.pnl.filled.get(t, 0.0):.0f} < "
+                    f"{EVENT_SLOT_EARNED_FILLS:g} and both sides out of band) "
+                    f"-> {len(kept)}/{event_top_n_for(series_of(t))} spent")
+        return kept
 
     def restore_orphan_metas(self, positions: Dict[str, float]) -> None:
         """After a restart, positions can exist on persisted known tickers
