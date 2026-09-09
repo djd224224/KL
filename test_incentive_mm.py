@@ -2433,7 +2433,8 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # default cap is 15 since 2026-09-04 (Jack "increase from 10 to
         # 15"); the walk-semantics assertions below pin 10 so the slot
         # competition they encode stays exercised.
-        self.assertEqual(imm.FINECON_TOP_N, 20)   # 15 -> 20, Jack 2026-09-09
+        self.assertEqual(imm.FINECON_TOP_N, 25)   # 15->20->25, Jack 2026-09-09
+        self.assertEqual(imm.FINECON_DAILY_OPENINGS, 10)  # 5 -> 10, same day
         try:
             imm.FINECON_TOP_N, _n10 = 10, imm.FINECON_TOP_N
             cut = imm.finecon_group_cut(spr + nz + vz + gas + wen + rain,

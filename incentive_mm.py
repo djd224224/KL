@@ -1868,7 +1868,11 @@ ALLOW_SERIES = frozenset(
 # curated list is 39 series and the group was sitting at its cap with 9
 # markets cut as `finecon_top_n` on the same refresh, so candidates the
 # curator had already vetted were queueing behind the slot count.
-FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 20)
+# 20 -> 25 (Jack 2026-09-09, same afternoon), with openings 5 -> 10: the
+# KXCBD family rule made 25 more markets across 5 central banks eligible at
+# once, and the group was full at 20/20 with 22 candidates cut as
+# `finecon_top_n` on the same refresh.
+FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 25)
 FINECON_EVENT_TOP_N = _env_int("IMM_FINECON_EVENT_TOP_N", 3)
 # DAILY OPENINGS (Jack 2026-09-05: "add 5 openings each day to the 15
 # quoted. they dont all need to be used, but its so that new events have
@@ -1881,7 +1885,13 @@ FINECON_EVENT_TOP_N = _env_int("IMM_FINECON_EVENT_TOP_N", 3)
 # settlement capacity re-fills only via openings. The used-count lives in
 # BotState (finecon_admit_day/finecon_admits_today), persists across the
 # bot's many restarts, and resets at ET midnight.
-FINECON_DAILY_OPENINGS = _env_int("IMM_FINECON_DAILY_OPENINGS", 5)
+# 5 -> 10 (Jack 2026-09-09): at 5/day the newly-eligible central-bank family
+# (25 markets, 3/event) would have taken most of a week to work in.
+# NOTE the finecon walk keeps the ORIGINAL semantics — unlike the open-scan
+# tier it has no refill_to/hard_cap, so openings raise the group and only
+# attrition brings it down. At 10/day it can climb faster than before; watch
+# that it decays, or give it scan_ceiling()-style bounding.
+FINECON_DAILY_OPENINGS = _env_int("IMM_FINECON_DAILY_OPENINGS", 10)
 
 
 def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
