@@ -6112,6 +6112,74 @@ class TestSidesCanQualify(unittest.TestCase):
         finally:
             imm.PAD_TO_TARGET_GLOBAL = old
 
+    def test_no_cutoff_mention_class_joins_the_depth_gate(self):
+        # Jack 2026-09-08 (KXWORLDNEWSMENTION-26SEP08, "What will the
+        # reporters say during ABC World News Tonight?"): a mention event
+        # with no derivable start quoted all 16 markets through the 6:30pm
+        # show and padded 400-700 lots into the crash. "Mention markets
+        # without a clear cutoff time ... should follow TRUMPMENTION
+        # padding/quoting behavior and stand down / not pad."
+        from datetime import datetime, timedelta, timezone
+        exp = datetime(2026, 9, 23, 14, 0, tzinfo=timezone.utc)
+        clear = imm.mention_cutoff_is_clear
+        # WORLDNEWS's real inputs: resolver None, no pre-settlement
+        # occurrence, a two-week expiration placeholder -> NOT clear
+        self.assertFalse(clear("KXWORLDNEWSMENTION", None, None, exp))
+        # an override / fixed hour / feed hit (resolver != None) -> clear
+        self.assertTrue(clear("KXWORLDNEWSMENTION", exp - timedelta(days=15),
+                              None, exp))
+        # an occurrence meaningfully before expiration is a real start
+        self.assertTrue(clear("KXEARNINGSMENTIONCHWY", None,
+                              exp - timedelta(days=2), exp))
+        # ...but an occurrence AT expiration is a settlement stamp
+        # (KXTRUMPMENTION-26SEP09 reads occ == expected expiration)
+        self.assertFalse(clear("KXTRUMPMENTION", None, exp, exp))
+        self.assertFalse(clear("KXTRUMPMENTION", None,
+                               exp - timedelta(minutes=30), exp))
+        # no expiration to compare against: an occurrence alone counts
+        self.assertTrue(clear("KXFEDMENTION", None, exp, None))
+        # the rule is scoped to the MENTION family; everything else is
+        # "clear" by construction and never marked
+        self.assertTrue(clear("KXAAAGASDNY", None, None, exp))
+        self.assertTrue(clear("KXTRUEV", None, None, None))
+
+        # marking a series puts it on the SAME gate TRUMPMENTION uses:
+        # series_event_depth_gated flips and pads are forced off, for the
+        # TTL, refreshed by re-marking, and expiring on its own.
+        s = "KXWORLDNEWSMENTION"
+        saved = dict(imm._DYNAMIC_DEPTH_GATE)
+        old_ttl, old_knob = imm.MENTION_NO_CUTOFF_TTL_SECS, imm.MENTION_NO_CUTOFF_GATE
+        try:
+            imm._DYNAMIC_DEPTH_GATE.clear()
+            imm.MENTION_NO_CUTOFF_GATE = True
+            self.assertFalse(imm.series_event_depth_gated(s))
+            self.assertTrue(imm.series_pad_to_target(s))
+            now = time.time()
+            self.assertTrue(imm.mark_no_cutoff_mention(s, now))     # new mark
+            self.assertFalse(imm.mark_no_cutoff_mention(s, now + 1))  # refresh
+            self.assertTrue(imm.series_event_depth_gated(s))
+            self.assertFalse(imm.series_pad_to_target(s))
+            self.assertIn(s, imm.dynamic_depth_gated_series())
+            # expiry: two refreshes after the last unresolved sighting
+            imm._DYNAMIC_DEPTH_GATE[s] = now - imm.MENTION_NO_CUTOFF_TTL_SECS - 1
+            self.assertFalse(imm.series_event_depth_gated(s))
+            self.assertNotIn(s, imm.dynamic_depth_gated_series())
+            self.assertTrue(imm.series_pad_to_target(s))
+            # an expired mark re-marks as NEW (so the transition logs again)
+            self.assertTrue(imm.mark_no_cutoff_mention(s, now))
+            # the static prefix list is untouched by the knob...
+            self.assertTrue(imm.series_event_depth_gated("KXTRUMPMENTION"))
+            self.assertTrue(imm.series_event_depth_gated("KXTRUMPMENTIONB"))
+            # ...and the class rule is switchable on its own
+            imm.MENTION_NO_CUTOFF_GATE = False
+            self.assertFalse(imm.series_event_depth_gated(s))
+            self.assertFalse(imm.mark_no_cutoff_mention("KXOTHERMENTION", now))
+            self.assertTrue(imm.series_event_depth_gated("KXTRUMPMENTION"))
+        finally:
+            imm._DYNAMIC_DEPTH_GATE.clear()
+            imm._DYNAMIC_DEPTH_GATE.update(saved)
+            imm.MENTION_NO_CUTOFF_TTL_SECS, imm.MENTION_NO_CUTOFF_GATE = old_ttl, old_knob
+
     def test_no_target_is_never_gated(self):
         self.assertEqual(imm.sides_can_qualify(self.S, 0.0, 0, 0, 40, 44),
                          (True, True))

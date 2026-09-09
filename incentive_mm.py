@@ -479,8 +479,88 @@ EVENT_LIVE_GATE_PREARM_SECS = _env_float(
     "IMM_EVENT_LIVE_GATE_PREARM_H", 4) * 3600.0
 
 
+# NO-CUTOFF MENTION CLASS (Jack 2026-09-08, KXWORLDNEWSMENTION-26SEP08:
+# "mention markets without a clear cutoff time, like the ABC reporters one
+# today, should follow TRUMPMENTION padding/quoting behavior and stand down
+# / not pad"). A mention event whose start the bot cannot derive — no
+# event_start_overrides entry, no SERIES_START_ET fixed hour, no schedule
+# feed, no occurrence_datetime meaningfully before expiration — has ONLY the
+# midnight-ET ticker-date fallback, and midnight is not a cutoff for a
+# 6:30pm broadcast. The overrides task's Phase-4 sweep assumed "no override
+# -> the bot just keeps NOT quoting"; that was never a rule, only the
+# accident of short listing windows dying at the $1 payout floor. WORLDNEWS
+# listed at 17:45Z with ten hours to midnight and $107/day pools, cleared
+# the floor, and quoted all 16 markets through the show: the first sibling
+# read thin at 22:30:34Z (yes 7103 / no 0), 34 seconds after air, but the
+# per-market qualify gate stood the markets down ONE AT A TIME over 29
+# minutes, each only after it had already been priced to one side, while
+# the survivors padded (400-700-lot 1c pads) and kept resting into the
+# crash — 3,196 contracts filled in the 25 minutes after air. Under the
+# TRUMPMENTION gate that first observation stands the WHOLE event down and
+# no pad ever rests. So every such series joins the gate dynamically: the
+# universe refresh marks it when it builds a MENTION-family meta whose
+# cutoff came from the fallback, and the mark expires on its own once every
+# live event of the series resolves (an override landing mid-day un-gates
+# it after two refreshes). Earnings mentions are deliberately IN scope — an
+# unresolved call time is exactly "no clear cutoff", and the 3x/day task
+# un-gates them as it lands overrides. KXTRUMPMENTION keeps its static
+# entry (its events resolve to nothing on purpose). Whole-series marking,
+# not per-event, because every consumer of the gate is series-keyed; a
+# resolved sibling event of a marked series rides gated for the day, which
+# is the direction the 8/31 rule already chose for TRUMPMENTION-26SEP08.
+# IMM_MENTION_NO_CUTOFF_GATE=0 turns the class rule off (static list stays).
+MENTION_NO_CUTOFF_GATE = os.environ.get("IMM_MENTION_NO_CUTOFF_GATE", "1") == "1"
+# A mark is fresh for two universe refreshes plus slack; refreshed on every
+# refresh that still finds an unresolved event, so it never expires under a
+# live unresolved event and clears two refreshes after the last one resolves.
+MENTION_NO_CUTOFF_TTL_SECS = _env_int("IMM_MENTION_NO_CUTOFF_TTL_SECS", 1500)
+_DYNAMIC_DEPTH_GATE: Dict[str, float] = {}   # series -> last marked ts
+
+
+def mention_cutoff_is_clear(series: str, resolved: Optional[datetime],
+                            occurrence: Optional[datetime],
+                            expected_expiration: Optional[datetime]) -> bool:
+    """False when a MENTION-family event has no derivable start and would be
+    quoting on the midnight-of-ticker-date fallback alone. Non-mention
+    series are always 'clear' (the rule is scoped like the suffix allowlist
+    that admits these families). Mirrors trade_cutoff_utc's occurrence test
+    exactly: an occurrence that is not >60min before expiration is a
+    settlement stamp, not an event start."""
+    if not any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES):
+        return True
+    if resolved is not None:
+        return True
+    if occurrence is not None and (
+            expected_expiration is None
+            or occurrence < expected_expiration - timedelta(minutes=60)):
+        return True
+    return False
+
+
+def mark_no_cutoff_mention(series: str, now_ts: float) -> bool:
+    """Put `series` on the live-event depth gate for MENTION_NO_CUTOFF_TTL_SECS
+    (refreshing an existing mark). Returns True when this is a NEW mark, so
+    the caller can log the transition once rather than every refresh."""
+    if not MENTION_NO_CUTOFF_GATE:
+        return False
+    fresh = _DYNAMIC_DEPTH_GATE.get(series)
+    _DYNAMIC_DEPTH_GATE[series] = now_ts
+    return fresh is None or now_ts - fresh > MENTION_NO_CUTOFF_TTL_SECS
+
+
+def dynamic_depth_gated_series(now_ts: Optional[float] = None) -> Set[str]:
+    now_ts = time.time() if now_ts is None else now_ts
+    return {s for s, ts in _DYNAMIC_DEPTH_GATE.items()
+            if now_ts - ts <= MENTION_NO_CUTOFF_TTL_SECS}
+
+
 def series_event_depth_gated(series: str) -> bool:
-    return series.startswith(tuple(EVENT_DEPTH_GATE_PREFIXES))
+    if series.startswith(tuple(EVENT_DEPTH_GATE_PREFIXES)):
+        return True
+    if not MENTION_NO_CUTOFF_GATE:
+        return False
+    ts = _DYNAMIC_DEPTH_GATE.get(series)
+    return ts is not None and time.time() - ts <= MENTION_NO_CUTOFF_TTL_SECS
 
 
 def event_live_gate_armed(event_ticker: str, now_ts: float) -> bool:
@@ -2913,7 +2993,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
-    "EVENT_TOP_N_LIFETIME",
+    "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE",
 )
 
 
@@ -5047,6 +5127,11 @@ class IncentiveMarketMaker:
             self.state.scan_entry_mid = {
                 str(t): float(v)
                 for t, v in (data.get("scan_entry_mid") or {}).items()}
+            for _s, _v in (data.get("no_cutoff_mention_gate") or {}).items():
+                try:
+                    _DYNAMIC_DEPTH_GATE[str(_s)] = float(_v)
+                except (TypeError, ValueError):
+                    pass
             self.state.event_slots = {
                 str(e): {"markets": [str(x) for x in (v.get("markets") or [])],
                          "ts": float(v.get("ts") or 0.0)}
@@ -5281,6 +5366,9 @@ class IncentiveMarketMaker:
                                if t in self.state.scan_members},
                            # lifetime slots: age-pruned ONLY (a quiet event
                            # must never get its cap back — see EVENT_TOP_N)
+                           "no_cutoff_mention_gate": {
+                               s: round(v, 1) for s, v in _DYNAMIC_DEPTH_GATE.items()
+                               if time.time() - v <= MENTION_NO_CUTOFF_TTL_SECS},
                            "event_slots": {
                                e: {"markets": v["markets"],
                                    "ts": round(v["ts"], 1)}
@@ -6011,9 +6099,22 @@ class IncentiveMarketMaker:
                         buffer_min = EVENT_START_BUFFER_MIN
                     cutoff = resolved - timedelta(minutes=buffer_min)
                 else:
-                    cutoff = trade_cutoff_utc(
-                        event_ticker, parse_iso_utc(m.get("occurrence_datetime", "")),
-                        parse_iso_utc(m.get("expected_expiration_time", "")))
+                    _occ = parse_iso_utc(m.get("occurrence_datetime", ""))
+                    _exp = parse_iso_utc(m.get("expected_expiration_time", ""))
+                    cutoff = trade_cutoff_utc(event_ticker, _occ, _exp)
+                    # NO-CUTOFF MENTION CLASS (see MENTION_NO_CUTOFF_GATE):
+                    # this branch IS "no derivable start" — the resolver had
+                    # nothing and the cutoff above is the ticker-date
+                    # fallback (or None). Put the series on the live-event
+                    # depth gate before the estimator hook below reads it.
+                    if (not mention_cutoff_is_clear(series, None, _occ, _exp)
+                            and mark_no_cutoff_mention(series, now_ts)):
+                        log(f"{self.tag} {series}: mention event "
+                            f"{event_ticker} has no derivable start "
+                            f"(cutoff {cutoff.isoformat() if cutoff else None}"
+                            f" is the ticker-date fallback) — series on the "
+                            f"live-event depth gate: pads OFF, whole event "
+                            f"stands down on thin depth")
             # Series tighteners (early-stop + hard floor) — shared with the
             # orphan-restore path via apply_series_cutoff_adjustments.
             cutoff = apply_series_cutoff_adjustments(series, event_ticker, cutoff,
@@ -8972,6 +9073,13 @@ class IncentiveMarketMaker:
                 f"{SCAN_SERIES_STRIKE_TTL_SECS / 86400:g}d bar a series); "
                 f"{len(self.state.scan_members)} member(s) carried in, "
                 f"{len(self.state.scan_evicted_events)} evicted event(s)")
+        if MENTION_NO_CUTOFF_GATE:
+            _carried = sorted(dynamic_depth_gated_series())
+            log("no-cutoff mention class (2026-09-08): any MENTION-family "
+                "event with no derivable start joins the live-event depth "
+                "gate for the day — pads OFF, whole event stands down on "
+                "thin depth"
+                + (f"; carried in: {','.join(_carried)}" if _carried else ""))
         if EVENT_DEPTH_GATE_PREFIXES:
             log(f"live-event depth gate: {','.join(EVENT_DEPTH_GATE_PREFIXES)} "
                 f"— pads OFF; any quotable side < "

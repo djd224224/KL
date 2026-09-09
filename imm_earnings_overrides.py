@@ -583,8 +583,18 @@ def discover_company_disclosure(client, now):
 # Sweep: every active-program non-earnings MENTION event with a near ticker
 # date that the bot's own EventStartResolver cannot place. Best-effort air
 # time from the TVmaze US schedule (exact show-name match only); email a
-# paste-ready --set for the rest. Same safe direction as everything here: no
-# override -> the bot just keeps NOT quoting.
+# paste-ready --set for the rest.
+# CORRECTION 2026-09-08: this sweep's original premise — "no override -> the
+# bot just keeps NOT quoting" — was never a rule. A dated ticker gives the
+# midnight-ET fallback, which IS a cutoff, so the bot quotes right up to
+# air; it only looked safe because short listing windows died at the $1
+# payout floor. KXWORLDNEWSMENTION-26SEP08 listed at 17:45Z between two
+# runs of this task, cleared the floor on ten hours of window, and quoted
+# 16 markets through the 6:30pm show. The bot now handles the class itself
+# (incentive_mm MENTION_NO_CUTOFF_GATE): an unresolved mention event puts
+# its series on the live-event depth gate — pads off, whole event stands
+# down on thin depth — until an override lands. So a --set from this email
+# is what UN-gates the event and lets it quote normally to the real start.
 # ---------------------------------------------------------------------------
 
 BROADCAST_LOOKAHEAD_DAYS = int(os.environ.get("IMM_BCAST_LOOKAHEAD_DAYS", "3"))
@@ -1119,8 +1129,9 @@ def main(argv=None) -> int:
                        f'"YYYY-MM-DDTHH:MM:00-04:00"   # the REAL call time')
         act.append("")
     if bc_unresolved:
-        act.append("BROADCAST mention events UNRESOLVED — the bot will "
-                   "NOT quote these until --set (find the air time):")
+        act.append("BROADCAST mention events UNRESOLVED — quoting GATED "
+                   "(no pads; whole event stands down on thin depth) until "
+                   "--set gives the air time:")
         for ev, title in bc_unresolved:
             d = parse_event_date(ev)
             hint = (d.astimezone(ET).strftime("%Y-%m-%d")
