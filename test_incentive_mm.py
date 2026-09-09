@@ -2553,6 +2553,77 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # under cap and under membership: in-cap fills are free
         self.assertEqual(imm.finecon_openings_used(_n - 1, _n - 3), 0)
 
+    def test_finecon_group_is_bounded_and_refills(self):
+        """Jack 2026-09-09: "yes add it" — the finecon walk had no ceiling.
+        admit_cap was max(members, FINECON_TOP_N) + openings, so each ET day's
+        openings stacked on the previous high-water mark and only attrition
+        pulled it back. Measured that day 15:28Z: 30 members against a nominal
+        25 with all 10 openings spent = a 40-market cap the next morning, 80
+        inside a week at zero attrition. Same bound + refill the open scan got
+        on 2026-09-05/09."""
+        self.assertTrue(imm.FINECON_REFILL_ON_DEPARTURE)
+        self.assertEqual(imm.finecon_ceiling(),
+                         imm.FINECON_TOP_N + imm.FINECON_DAILY_OPENINGS)
+
+        def m(t, est):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=20.0, program_end=None,
+                target_size=1000, discount_factor=0.5, cutoff=None,
+                close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=10.0, est_collateral_dollars=0.0)
+
+        cap, opens = imm.FINECON_TOP_N, imm.FINECON_DAILY_OPENINGS
+        ceiling = imm.finecon_ceiling()
+        # newcomers are SPR strikes on distinct events so FINECON_EVENT_TOP_N
+        # can never be what bounds the result here.
+        newcomers = [m(f"KXSPRLVL-26DEC{1 + i:02d}-T1", 0.5) for i in range(20)]
+
+        # BOUNDED: the live 2026-09-09 shape — over the cap, a full day of
+        # openings left. Uncapped this admitted 30 + 10 = 40.
+        over = [m(f"KXSPRLVL-26SEP{9 + (i // 3):02d}-T{i % 3}", 1.0)
+                for i in range(cap + 5)]
+        mem_over = {x.ticker for x in over}
+        cut = imm.finecon_group_cut(over + newcomers, set(), members=mem_over,
+                                    extra_openings=opens, refill_to=len(over))
+        self.assertEqual(len(over) + len(newcomers) - len(cut), ceiling,
+                         "the group grew past its ceiling")
+
+        # members are NEVER evicted by the ceiling — they quote to completion.
+        # A group already above it simply admits nobody until attrition.
+        big = [m(f"KXSPRLVL-26OCT{1 + (i // 3):02d}-T{i % 3}", 1.0)
+               for i in range(ceiling + 15)]
+        mem_big = {x.ticker for x in big}
+        cut_big = imm.finecon_group_cut(big + newcomers, set(),
+                                        members=mem_big, extra_openings=opens,
+                                        refill_to=len(big))
+        self.assertEqual(cut_big, {x.ticker for x in newcomers},
+                         "the ceiling evicted quote-to-completion members")
+
+        # REFILL: at the ceiling with the day's openings spent, a departure's
+        # seat is closed in the same pass and bills no opening.
+        surv = [m(f"KXSPRLVL-26NOV{1 + (i // 3):02d}-T{i % 3}", 1.0)
+                for i in range(ceiling - 1)]
+        mem = {x.ticker for x in surv}
+        cut2 = imm.finecon_group_cut(surv + newcomers, set(), members=mem,
+                                     extra_openings=0, refill_to=ceiling)
+        kept = len(surv) + len(newcomers) - len(cut2)
+        self.assertEqual(kept, ceiling, "the freed seat was not refilled")
+        self.assertEqual(
+            imm.finecon_openings_used(kept, max(len(mem), ceiling)), 0,
+            "a refill must not be billed as an expansion")
+
+        # and the knob restores the old bleed-down
+        with mock.patch.object(imm, "FINECON_REFILL_ON_DEPARTURE", False):
+            cut3 = imm.finecon_group_cut(surv + newcomers, set(), members=mem,
+                                         extra_openings=0, refill_to=ceiling)
+            self.assertEqual(
+                len(surv) + len(newcomers) - len(cut3), ceiling - 1)
+
+        # IMM_FINECON_DAILY_OPENINGS=0 gives a hard FINECON_TOP_N
+        with mock.patch.object(imm, "FINECON_DAILY_OPENINGS", 0):
+            self.assertEqual(imm.finecon_ceiling(), cap)
+
     def test_finecon_extra_series_hot_reload(self):
         # Jack 2026-09-05 "yes self-extend carbon arc": the overrides task
         # appends to FINECON_EXTRA_FILE; the bot merges, guards and allows

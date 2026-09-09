@@ -1942,17 +1942,45 @@ def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
     return {m.ticker for m in group} - keep
 
 
+def finecon_ceiling() -> int:
+    """The tier's ABSOLUTE size ceiling: the cap plus one full day of
+    openings. Without it `admit_cap` was max(members, FINECON_TOP_N) +
+    openings, so each ET day's openings stacked on the previous high-water
+    mark and only attrition ever pulled the group back — 25 -> 35 -> 45 ...
+    with no bound. Measured 2026-09-09 15:28Z: 30 members against a nominal
+    25 with the day's 10 openings already spent, i.e. a 40-market cap the
+    next morning and 80 inside a week at zero attrition. Steady state is
+    this number, not FINECON_TOP_N — set IMM_FINECON_DAILY_OPENINGS=0 for a
+    hard FINECON_TOP_N. Mirrors scan_ceiling() (2026-09-05)."""
+    return FINECON_TOP_N + max(0, FINECON_DAILY_OPENINGS)
+
+
+# A departure is refilled in the SAME refresh, even above the cap — the
+# open-scan rule (Jack 2026-09-09) applied to finecon for tier parity.
+# Required BECAUSE of the ceiling above, not merely alongside it: once the
+# group sits at the ceiling with the day's openings spent, `extra_openings`
+# is 0 and admit_cap collapses to the survivor count, so a departure's seat
+# stays empty until the next ET midnight. See _group_walk_cut's `refill_to`.
+FINECON_REFILL_ON_DEPARTURE = os.environ.get(
+    "IMM_FINECON_REFILL_ON_DEPARTURE", "1") == "1"
+
+
 def finecon_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
                       members: Set[str] = frozenset(),
-                      extra_openings: int = 0) -> Set[str]:
+                      extra_openings: int = 0,
+                      refill_to: int = 0) -> Set[str]:
     """Tickers to EXCLUDE under the finecon group cap: group markets that
     are not already-quoting members and don't win a slot — newcomers
     ranked by ROI, admitted while the group stays within FINECON_TOP_N
     total (members counted first) plus up to `extra_openings` past that,
-    with FINECON_EVENT_TOP_N per event enforced throughout."""
+    with FINECON_EVENT_TOP_N per event enforced throughout, the whole
+    result bounded absolutely by finecon_ceiling()."""
     return _group_walk_cut([m for m in metas if m.series in FINECON_SERIES],
                            incumbent, members, FINECON_TOP_N,
-                           FINECON_EVENT_TOP_N, extra_openings)
+                           FINECON_EVENT_TOP_N, extra_openings,
+                           refill_to=refill_to if FINECON_REFILL_ON_DEPARTURE
+                           else 0,
+                           hard_cap=finecon_ceiling())
 
 
 def _openings_used(n_kept: int, n_members: int, top_n: int) -> int:
@@ -6763,15 +6791,27 @@ class IncentiveMarketMaker:
             self.state.finecon_admits_today = 0
         openings_left = max(0, FINECON_DAILY_OPENINGS
                             - self.state.finecon_admits_today)
+        # Pre-refresh membership for the refill target. `fin_sticky` is built
+        # from the post-screen `ranked`, so this refresh's departures are
+        # already subtracted from it; `prev_selected` still holds them.
+        fin_prev_count = sum(1 for _t in prev_selected
+                             if series_of(_t) in FINECON_SERIES)
         fin_cut = finecon_group_cut(ranked, prev_selected,
                                     members=fin_sticky,
-                                    extra_openings=openings_left)
+                                    extra_openings=openings_left,
+                                    refill_to=fin_prev_count)
         if fin_cut:
             skipped["finecon_top_n"] = len(fin_cut)
             decisions.update({_t: "finecon_top_n" for _t in fin_cut})
             ranked = [m for m in ranked if m.ticker not in fin_cut]
         kept_group = sum(1 for m in ranked if m.series in FINECON_SERIES)
-        used = finecon_openings_used(kept_group, len(fin_sticky))
+        # A REFILL IS NOT AN EXPANSION: charge openings only for growth past
+        # the pre-refresh membership, or the seat a departure freed would
+        # bill an opening it never used.
+        used = finecon_openings_used(
+            kept_group, max(len(fin_sticky),
+                            fin_prev_count if FINECON_REFILL_ON_DEPARTURE
+                            else 0))
         if used:
             self.state.finecon_admits_today += used
             log(f"{self.tag} finecon daily openings: {used} used this "

@@ -1389,3 +1389,66 @@ fixtures. Before merging:
 Portability note: the five satellite scripts' `_env_from_registry` caught
 only `OSError`, so `import winreg` raised on Linux and every test importing
 them errored; they now also catch `ImportError` (Windows unchanged).
+
+## 2026-09-09 — the finecon group had no ceiling (Jack)
+
+Jack, after I explained the admission semantics: "yes add it."
+
+WHAT WAS WRONG. Both opportunistic tiers share one admission walk,
+`_group_walk_cut`, whose size line is
+
+```python
+admit_cap = max(len(keep), top_n, max(0, refill_to)) + max(0, extra_openings)
+if hard_cap > 0:
+    admit_cap = min(admit_cap, hard_cap)
+```
+
+The open scan passes `refill_to` and `hard_cap=scan_ceiling()`. Finecon
+passed neither, so its cap reduced to `max(members, FINECON_TOP_N) +
+openings`. That `max` is a ratchet: once membership passes the cap, the
+CURRENT SIZE becomes the new floor, and each ET day's openings stack on the
+previous high-water mark. Members quote to completion and are never
+out-ranked, so only attrition — a program ending, a safety screen, a
+hopeless eviction — ever pulls the group down. On any day attrition is
+under `FINECON_DAILY_OPENINGS`, the tier is permanently larger.
+
+Measured live 2026-09-09 15:28Z: **30 members against a nominal cap of 25**,
+with all 10 of the day's openings already spent. Next morning's cap would
+have been 40, then 50, then 80 inside a week at zero attrition. Raising
+openings 5 -> 10 earlier the same day had doubled the climb rate.
+
+THE RULE NOW. `finecon_ceiling()` = `FINECON_TOP_N +
+max(0, FINECON_DAILY_OPENINGS)` = 35, passed as `hard_cap`. Steady state is
+that number, not `FINECON_TOP_N`. `IMM_FINECON_DAILY_OPENINGS=0` gives a
+hard `FINECON_TOP_N`. This is additive-only: incumbents are seeded into
+`keep` BEFORE `admit_cap` is consulted, so a group already above the
+ceiling (as it is today at 30, and would be at 36+) evicts nobody — it
+simply admits no one until attrition brings it under.
+
+REFILL CAME WITH IT, and had to. `members` is built from the post-screen
+`ranked`, so a market that departed this refresh is already subtracted;
+once the group sits at the ceiling with the day's openings spent,
+`extra_openings` is 0 and `admit_cap` collapses to the survivor count. The
+freed seat then stays empty until the next ET midnight — the exact dead-seat
+bug the open scan had (measured 9/8: 15h07m with zero admissions while it
+bled 35 -> 30). Finecon has carried that bug since 9/3; the ratchet just
+papered over it every morning. `FINECON_REFILL_ON_DEPARTURE`
+(`IMM_FINECON_REFILL_ON_DEPARTURE`, default ON) closes the seat in the same
+pass.
+
+The refill target is `fin_prev_count` = the pre-refresh finecon selection,
+counted off `prev_selected` rather than a persisted member list — finecon
+has no `scan_members` equivalent. That is exact, not a proxy:
+`prev_selected = state.selected | state.sticky_prev`, and `sticky_prev` is
+populated only from the persisted selection at load and cleared at the end
+of the first refresh, so the union is the pre-refresh selection in both the
+steady-state and post-restart cases.
+
+A REFILL IS NOT AN EXPANSION. The openings counter's baseline became
+`max(len(fin_sticky), fin_prev_count)`, so a seat a departure freed no
+longer bills an opening it never used. Same correction the scan tier got.
+
+Pinned by `test_finecon_group_is_bounded_and_refills`: the ceiling binds at
+the live 30-member shape, incumbents above the ceiling are never cut, the
+freed seat refills and charges nothing, the knob restores the bleed-down,
+and `FINECON_DAILY_OPENINGS=0` collapses the ceiling to the cap.
