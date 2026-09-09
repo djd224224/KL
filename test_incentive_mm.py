@@ -2433,7 +2433,7 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # default cap is 15 since 2026-09-04 (Jack "increase from 10 to
         # 15"); the walk-semantics assertions below pin 10 so the slot
         # competition they encode stays exercised.
-        self.assertEqual(imm.FINECON_TOP_N, 15)
+        self.assertEqual(imm.FINECON_TOP_N, 20)   # 15 -> 20, Jack 2026-09-09
         try:
             imm.FINECON_TOP_N, _n10 = 10, imm.FINECON_TOP_N
             cut = imm.finecon_group_cut(spr + nz + vz + gas + wen + rain,
@@ -2504,9 +2504,12 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                 program_end=None, target_size=1000, discount_factor=0.5,
                 cutoff=None, close_time=None, est_dollars_per_day=est,
                 est_exposure_dollars=expo, est_collateral_dollars=0.0)
-        # a full house: 15 members across 5 events (3 each, cap-legal)
-        members = [m(f"KXSPRLVL-26SEP0{9 + e}-T{i}", 1.0)
-                   for e in range(5) for i in range(3)]
+        # a full house: FINECON_TOP_N members, 3 per event (cap-legal).
+        # Built from the constant so the 2026-09-09 raise to 20 does not
+        # leave the group half-empty and let newcomers in for free.
+        _n = imm.FINECON_TOP_N
+        members = [m(f"KXSPRLVL-26SEP{9 + (i // 3):02d}-T{i % 3}", 1.0)
+                   for i in range(_n)]
         mem_ids = {x.ticker for x in members}
         new = [m("KXAMZNCC-26OCT07-T100", 9.0),
                m("KXAMZNCC-26OCT07-T102", 8.0),
@@ -2538,11 +2541,16 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         self.assertIn("KXAMZNCC-26OCT07-T102", cut)
         self.assertNotIn("KXAMZNCC-26OCT07-T106", cut)
         self.assertNotIn("KXDRPEPPERPOS-26OCT03-T95", cut)
-        # the openings-burn accounting: only over-cap admissions count
-        self.assertEqual(imm.finecon_openings_used(17, 15), 2)
-        self.assertEqual(imm.finecon_openings_used(15, 15), 0)
-        self.assertEqual(imm.finecon_openings_used(20, 17), 3)
-        self.assertEqual(imm.finecon_openings_used(14, 12), 0)
+        # the openings-burn accounting: only over-cap admissions count.
+        # Relative to FINECON_TOP_N so a cap change (15 -> 20 on
+        # 2026-09-09) cannot silently turn these into no-ops.
+        _n = imm.FINECON_TOP_N
+        self.assertEqual(imm.finecon_openings_used(_n + 2, _n), 2)
+        self.assertEqual(imm.finecon_openings_used(_n, _n), 0)
+        # members already OVER the cap: growth is charged past THEM, not the cap
+        self.assertEqual(imm.finecon_openings_used(_n + 5, _n + 2), 3)
+        # under cap and under membership: in-cap fills are free
+        self.assertEqual(imm.finecon_openings_used(_n - 1, _n - 3), 0)
 
     def test_finecon_extra_series_hot_reload(self):
         # Jack 2026-09-05 "yes self-extend carbon arc": the overrides task
@@ -8257,8 +8265,12 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(imm.scan_openings_used(19, 15), 4)
         self.assertEqual(imm.scan_openings_used(15, 15), 0)
         self.assertEqual(imm.scan_openings_used(14, 12), 0)
-        # finecon's walk still answers to ITS knobs (shared engine)
-        self.assertEqual(imm.finecon_openings_used(17, 15), 2)
+        # finecon's walk still answers to ITS knobs (shared engine).
+        # Driven off FINECON_TOP_N so raising the cap (15 -> 20 on
+        # 2026-09-09) cannot silently invalidate the fixture.
+        _f = imm.FINECON_TOP_N
+        self.assertEqual(imm.finecon_openings_used(_f + 2, _f), 2)
+        self.assertEqual(imm.finecon_openings_used(_f, _f), 0)
 
     # ---- guard geometry ------------------------------------------------------
 

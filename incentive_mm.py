@@ -1826,7 +1826,11 @@ ALLOW_SERIES = frozenset(
 # quote-to-completion immunity (see event_top_n_cut). <=0 disables a knob.
 # 10 -> 15 (Jack 2026-09-04 "increase from 10 to 15 markets", with the
 # same-day KPI + state-stat enrollments widening the candidate pool).
-FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 15)
+# 15 -> 20 (Jack 2026-09-09), alongside the central-bank enrollments: the
+# curated list is 39 series and the group was sitting at its cap with 9
+# markets cut as `finecon_top_n` on the same refresh, so candidates the
+# curator had already vetted were queueing behind the slot count.
+FINECON_TOP_N = _env_int("IMM_FINECON_TOP_N", 20)
 FINECON_EVENT_TOP_N = _env_int("IMM_FINECON_EVENT_TOP_N", 3)
 # DAILY OPENINGS (Jack 2026-09-05: "add 5 openings each day to the 15
 # quoted. they dont all need to be used, but its so that new events have
