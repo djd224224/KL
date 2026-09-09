@@ -543,6 +543,8 @@ def mark_no_cutoff_mention(series: str, now_ts: float) -> bool:
     the caller can log the transition once rather than every refresh."""
     if not MENTION_NO_CUTOFF_GATE:
         return False
+    if series.startswith(tuple(EVENT_DEPTH_GATE_PREFIXES)):
+        return False     # already gated statically; don't re-attribute it
     fresh = _DYNAMIC_DEPTH_GATE.get(series)
     _DYNAMIC_DEPTH_GATE[series] = now_ts
     return fresh is None or now_ts - fresh > MENTION_NO_CUTOFF_TTL_SECS

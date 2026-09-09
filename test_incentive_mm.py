@@ -6167,6 +6167,10 @@ class TestSidesCanQualify(unittest.TestCase):
             self.assertTrue(imm.series_pad_to_target(s))
             # an expired mark re-marks as NEW (so the transition logs again)
             self.assertTrue(imm.mark_no_cutoff_mention(s, now))
+            # a statically-gated series is never re-marked (the log line
+            # would misattribute its protection to the class rule)
+            self.assertFalse(imm.mark_no_cutoff_mention("KXTRUMPMENTION", now))
+            self.assertNotIn("KXTRUMPMENTION", imm.dynamic_depth_gated_series())
             # the static prefix list is untouched by the knob...
             self.assertTrue(imm.series_event_depth_gated("KXTRUMPMENTION"))
             self.assertTrue(imm.series_event_depth_gated("KXTRUMPMENTIONB"))
