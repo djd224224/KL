@@ -61,6 +61,7 @@ Usage:
 import argparse
 import atexit
 import base64
+import collections
 import json
 import math
 import os
