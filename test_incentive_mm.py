@@ -8411,6 +8411,115 @@ class TestOpenScanTier(unittest.TestCase):
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
+    def test_departure_refills_in_the_same_pass_even_above_the_cap(self):
+        """Jack 2026-09-09: "instant refill upon a departure, even above the
+        cap". `members` is built from post-screen `ranked`, so a departure has
+        already been subtracted; above the cap admit_cap used to collapse to
+        the survivor count and the seat stayed empty until membership decayed.
+        Measured 2026-09-08: 30 -> 35 at ET midnight, then 15h07m with zero
+        admissions while it bled back to 30."""
+        self.assertTrue(imm.SCAN_REFILL_ON_DEPARTURE)
+        self.assertEqual(imm.scan_ceiling(),
+                         imm.SCAN_TOP_N + imm.SCAN_DAILY_OPENINGS)
+
+        def m(t, est):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=20.0, program_end=None,
+                target_size=1000, discount_factor=0.5, cutoff=None,
+                close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=10.0, est_collateral_dollars=0.0, scan=True)
+
+        cap, opens = imm.SCAN_TOP_N, imm.SCAN_DAILY_OPENINGS
+        ceiling = imm.scan_ceiling()
+        # OVER CAP, one departed: survivors + newcomers must return to the
+        # pre-refresh level, and charge NO opening
+        survivors = [m(f"KXA{i}-26SEP09-T1", 1.0) for i in range(ceiling - 1)]
+        newcomers = [m(f"KXN{i}-26SEP09-T1", 0.5) for i in range(6)]
+        mem = {x.ticker for x in survivors}
+        cut = imm.scan_group_cut(survivors + newcomers, set(), members=mem,
+                                 extra_openings=0, refill_to=ceiling)
+        kept = len(survivors) + len(newcomers) - len(cut)
+        self.assertEqual(kept, ceiling, "the freed seat was not refilled")
+        self.assertEqual(
+            imm.scan_openings_used(kept, max(len(mem), ceiling)), 0,
+            "a refill must not be billed as an expansion")
+
+        # AT cap, one departed: unchanged behaviour, still free
+        surv2 = [m(f"KXA{i}-26SEP09-T1", 1.0) for i in range(cap - 1)]
+        mem2 = {x.ticker for x in surv2}
+        cut2 = imm.scan_group_cut(surv2 + newcomers, set(), members=mem2,
+                                  extra_openings=0, refill_to=cap)
+        kept2 = len(surv2) + len(newcomers) - len(cut2)
+        self.assertEqual(kept2, cap)
+        self.assertEqual(imm.scan_openings_used(kept2, max(len(mem2), cap)), 0)
+
+        # BOUNDED: at the ceiling with a fresh day's openings, nothing grows.
+        # Without the hard cap each day would stack on the last high-water
+        # mark (30 -> 35 -> 40 -> ...) because refills stop the decay.
+        full = [m(f"KXA{i}-26SEP09-T1", 1.0) for i in range(ceiling)]
+        memf = {x.ticker for x in full}
+        cutf = imm.scan_group_cut(full + newcomers, set(), members=memf,
+                                  extra_openings=opens, refill_to=ceiling)
+        self.assertEqual(len(full) + len(newcomers) - len(cutf), ceiling)
+
+        # and the knob restores the old bleed-down
+        with mock.patch.object(imm, "SCAN_REFILL_ON_DEPARTURE", False):
+            cutb = imm.scan_group_cut(survivors + newcomers, set(), members=mem,
+                                      extra_openings=0, refill_to=ceiling)
+            self.assertEqual(
+                len(survivors) + len(newcomers) - len(cutb), ceiling - 1)
+
+    def test_hopeless_eviction_bars_the_market_permanently(self):
+        """Jack 2026-09-09: "after hopeless eviction, the market should be
+        barred". The exit was self-undoing — it requires prev_selected, so once
+        out only the entry floor judged the market and a jittering estimate
+        bought it back. KXDIESELELECT-26NOV03-T4.40 on 2026-09-08: admit 20:38,
+        hopeless 22:42, RE-ADMIT 04:00 on a scarce opening, hopeless 06:00."""
+        self.assertTrue(imm.SCAN_HOPELESS_BAR)
+        bot = self._bot(tickers=[self.A, self.B])
+        now = datetime.now(timezone.utc)
+        budget = {"series": 9, "history": 9}
+        m = self._market(self.A)
+        self.assertIsNone(bot._scan_admission(self._meta(), m, {}, now, budget))
+        # evict it the way refresh_universe does
+        bot.state.scan_hopeless_barred[self.A] = time.time()
+        self.assertEqual(bot._scan_admission(self._meta(), m, {}, now, budget),
+                         "hopeless_barred")
+        # per MARKET, not per event: a sibling strike is untouched
+        self.assertIsNone(bot._scan_admission(
+            self._meta(t=self.B), self._market(self.B), {}, now, budget))
+        # survives a restart
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+        self.assertIn(self.A, bot2.state.scan_hopeless_barred)
+        with mock.patch.object(imm, "SCAN_HOPELESS_BAR", False):
+            self.assertIsNone(bot._scan_admission(self._meta(), m, {}, now,
+                                                  budget))
+
+    def test_daily_openings_are_paced_across_the_et_day(self):
+        """Jack 2026-09-09: "improve the burst timing". All five fired in the
+        single refresh after ET midnight on 2026-09-08, committing the day's
+        whole expansion budget to whatever was eligible at 00:00 ET."""
+        self.assertTrue(imm.SCAN_OPENINGS_PACED)
+        n = imm.SCAN_DAILY_OPENINGS
+
+        def at(h, mi=0):
+            naive = datetime(2026, 9, 9, h, mi)
+            return imm.ET.localize(naive).astimezone(timezone.utc)
+
+        # ramps 1 -> n across the day, never 0, never over the daily budget
+        self.assertEqual(imm.scan_openings_allowed(at(0, 0)), 1)
+        self.assertEqual(imm.scan_openings_allowed(at(23, 59)), n)
+        seq = [imm.scan_openings_allowed(at(h)) for h in range(24)]
+        self.assertEqual(seq, sorted(seq), "allowance must be non-decreasing")
+        self.assertTrue(all(1 <= x <= n for x in seq))
+        # the whole budget is NOT available at midnight any more
+        self.assertLess(imm.scan_openings_allowed(at(0, 30)), n)
+        # unpaced restores the pre-2026-09-09 burst
+        with mock.patch.object(imm, "SCAN_OPENINGS_PACED", False):
+            self.assertEqual(imm.scan_openings_allowed(at(0, 0)), n)
+
     def test_scan_hopeless_exit_knob_restores_quote_to_completion(self):
         """IMM_SCAN_HOPELESS_EXIT=0 puts scan members back on the finecon
         lifecycle: a sustained sub-$1 projection does NOT evict them."""

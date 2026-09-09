@@ -75,7 +75,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import pytz
 import requests
@@ -478,6 +478,42 @@ EVENT_FILL_HALT_STRIKES = _env_int("IMM_EVENT_FILL_STRIKES", 2)
 EVENT_LIVE_GATE_PREARM_SECS = _env_float(
     "IMM_EVENT_LIVE_GATE_PREARM_H", 4) * 3600.0
 
+
+# FILL-TRIPWIRE CORROBORATION + DEPTH COLLAPSE (Jack 2026-09-09, "yes make
+# that change", after the KXMAMDANIMENTION-26SEP04 replay). Two findings:
+#   1. The fill tripwire alone is trigger-happy. Replaying the gate over
+#      SEP04's logged book, it would have gone PERMANENTLY live-confirmed at
+#      14:34:58Z on 9/6 — two ordinary 20-lot fills in consecutive cycles on
+#      a quiet day — 32 hours before the real announcement. That is exactly
+#      how SEP02/SEP03 ended "permanently live-confirmed" with $2/market of
+#      credits. A HIGHER threshold is the wrong fix: the ladder is 0:20, so
+#      every full fill is exactly 20 whether the event is live or not — the
+#      real 9/7 strikes were 20-lots too. The discriminator is the BOOK.
+#   2. The thin floor missed the real live moment. At 23:03->23:13Z on 9/7
+#      NYPD's external YES depth went 27,075 -> 2,401 and the mid jumped
+#      15/30 -> 35/60: the other makers withdrew, which is the signal the
+#      gate exists for — but 2,401 is above the 1,000 floor, so nothing
+#      fired and the bot rested through the announcement (-$127 own book
+#      in that window, of -$175 on the event).
+# So: a fill burst counts as a strike ONLY when the event has shown a
+# withdrawal signature (thin, collapse, lost touch or jump) within
+# EVENT_FILL_CORROBORATION_SECS; an uncorroborated burst is logged and
+# otherwise ignored by the gate (the ordinary per-market breaker, if armed,
+# is untouched). And a COLLAPSE — an in-band sibling's external side
+# falling to (1 - EVENT_DEPTH_COLLAPSE_FRAC) of its max over the last
+# EVENT_DEPTH_COLLAPSE_WINDOW_SECS, from a base of at least
+# EVENT_DEPTH_COLLAPSE_MIN_BASE — is a withdrawal in its own right: the
+# same resumable whole-event stand-down as thin. The stack waiver applies
+# to collapse too (a book still carrying a 10k+ side is a junk stack whose
+# opposite side thins as its normal shape — the SEP08-AFFO lesson).
+# IMM_EVENT_FILL_NEEDS_WITHDRAWAL=0 restores unconditional strikes;
+# IMM_EVENT_DEPTH_COLLAPSE_FRAC=0 disables the collapse signal.
+EVENT_FILL_NEEDS_WITHDRAWAL = os.environ.get(
+    "IMM_EVENT_FILL_NEEDS_WITHDRAWAL", "1") == "1"
+EVENT_FILL_CORROBORATION_SECS = _env_float("IMM_EVENT_FILL_CORROBORATION_SECS", 1800)
+EVENT_DEPTH_COLLAPSE_FRAC = _env_float("IMM_EVENT_DEPTH_COLLAPSE_FRAC", 0.5)
+EVENT_DEPTH_COLLAPSE_WINDOW_SECS = _env_float("IMM_EVENT_DEPTH_COLLAPSE_WINDOW_SECS", 1800)
+EVENT_DEPTH_COLLAPSE_MIN_BASE = _env_float("IMM_EVENT_DEPTH_COLLAPSE_MIN_BASE", 2000)
 
 # NO-CUTOFF MENTION CLASS (Jack 2026-09-08, KXWORLDNEWSMENTION-26SEP08:
 # "mention markets without a clear cutoff time, like the ABC reporters one
@@ -1783,14 +1819,29 @@ FINECON_DAILY_OPENINGS = _env_int("IMM_FINECON_DAILY_OPENINGS", 5)
 
 def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
                     members: Set[str], top_n: int, event_top_n: int,
-                    extra_openings: int = 0) -> Set[str]:
+                    extra_openings: int = 0, refill_to: int = 0,
+                    hard_cap: int = 0) -> Set[str]:
     """The shared admission-only group walk (finecon since 2026-09-03; the
     open-scan tier since 2026-09-05): tickers of `group` to EXCLUDE.
     Members are never cut and consume their global and per-event slots
     first; newcomers are admitted best-ROI-first while the group stays
     within `top_n` total (or the member count, if that is already higher)
     plus up to `extra_openings` past it, with at most `event_top_n` per
-    event enforced throughout (<=0 = uncapped)."""
+    event enforced throughout (<=0 = uncapped).
+
+    `refill_to` (Jack 2026-09-09: "instant refill upon a departure, even
+    above the cap") is the PRE-refresh membership. `members` here is built
+    from the post-screen `ranked`, so a market that departed this refresh
+    has already been subtracted from it — which meant that above the cap
+    `admit_cap` collapsed to the survivor count and the seat stayed empty
+    until membership decayed back to `top_n`. Measured 2026-09-08: the five
+    openings fired in one refresh at ET midnight (30 -> 35) and the tier
+    then admitted NOTHING for 15h07m while it bled 35 -> 30. Admitting back
+    up to `refill_to` closes that seat in the same pass.
+
+    `hard_cap` bounds the result absolutely. It is required once refills
+    stop the tier decaying: without it, each ET day's openings would stack
+    on the previous high-water mark (30 -> 35 -> 40 -> ...) forever."""
     if top_n <= 0:
         return set()
     keep = {m.ticker for m in group if m.ticker in members}
@@ -1798,7 +1849,10 @@ def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
     for m in group:
         if m.ticker in keep:
             per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
-    admit_cap = max(len(keep), top_n) + max(0, extra_openings)
+    admit_cap = max(len(keep), top_n, max(0, refill_to)) \
+        + max(0, extra_openings)
+    if hard_cap > 0:
+        admit_cap = min(admit_cap, hard_cap)
     newcomers = [m for m in group if m.ticker not in keep]
     newcomers.sort(key=lambda m: _market_roi(m, incumbent), reverse=True)
     for m in newcomers:
@@ -1901,6 +1955,20 @@ def finecon_openings_used(n_kept: int, n_members: int) -> int:
 # the binding constraint.
 SCAN_TOP_N = _env_int("IMM_SCAN_TOP_N", 30)
 SCAN_EVENT_TOP_N = _env_int("IMM_SCAN_EVENT_TOP_N", 3)
+# A departure is refilled in the SAME refresh, even above the cap (Jack
+# 2026-09-09). See _group_walk_cut's `refill_to`; bounded by scan_ceiling().
+SCAN_REFILL_ON_DEPARTURE = os.environ.get(
+    "IMM_SCAN_REFILL_ON_DEPARTURE", "1") == "1"
+# Openings are PACED across the ET day rather than spent in one burst (Jack
+# 2026-09-09: "improve the burst timing"). Measured 2026-09-08: all five
+# fired in the single refresh after ET midnight, committing the day's whole
+# expansion budget to whatever happened to be eligible at 00:00 ET — while
+# the one genuinely good market of that day (KXBABELMANDEBWEEKLY, est
+# $9.08/day against a tier median under $0.30) appeared at 19:07 and got in
+# only because a seat happened to free. The allowance ramps
+# 1 -> SCAN_DAILY_OPENINGS over the day, so later, better candidates can
+# still buy a seat. 0 = off (all openings available immediately).
+SCAN_OPENINGS_PACED = os.environ.get("IMM_SCAN_OPENINGS_PACED", "1") == "1"
 SCAN_DAILY_OPENINGS = _env_int("IMM_SCAN_DAILY_OPENINGS", 5)
 # Sizing = the NORMAL BOOK's (Jack 2026-09-05 pm: "it can have the same
 # contracts/max net position/deep reference/overnight size as the normal
@@ -2045,6 +2113,15 @@ SCAN_DAILY_LOSS_LIMIT = _env_float("IMM_SCAN_DAILY_LOSS_LIMIT", 200.0)
 # 2026-09-03 quote-to-completion rule was about that curated group, whose
 # absolute $1 projections are noisiest on deliberately quiet long windows.
 SCAN_HOPELESS_EXIT = os.environ.get("IMM_SCAN_HOPELESS_EXIT", "1") == "1"
+# A hopeless eviction BARS that market permanently (Jack 2026-09-09: "after
+# hopeless eviction, the market should be barred"). Without it the exit is
+# self-undoing: the hopeless branch requires `prev_selected`, so once out a
+# market is judged only by the entry floor and a jittering estimate buys it
+# straight back — measured 2026-09-08, KXDIESELELECT-26NOV03-T4.40 went
+# admit 20:38 -> hopeless 22:42 -> re-admit 04:00 (on a scarce daily
+# opening) -> hopeless 06:00. Per MARKET, not per event: siblings are
+# untouched. Persisted in scan_hopeless_barred with a 30d file-hygiene TTL.
+SCAN_HOPELESS_BAR = os.environ.get("IMM_SCAN_HOPELESS_BAR", "1") == "1"
 SCAN_SERIES_STRIKE_LIMIT = _env_int("IMM_SCAN_SERIES_STRIKES", 2)
 SCAN_SERIES_STRIKE_TTL_SECS = _env_float("IMM_SCAN_SERIES_STRIKE_DAYS", 7) * 86400.0
 SCAN_EVICT_TTL_SECS = 30 * 86400.0      # file hygiene only; events settle sooner
@@ -2498,17 +2575,44 @@ def release_scan_override(series: str) -> None:
     log(f"[IMM] {series}: open-scan guard set released")
 
 
+def scan_ceiling() -> int:
+    """The tier's ABSOLUTE size ceiling: the cap plus one full day of
+    openings. Once departures refill (2026-09-09) the tier no longer decays
+    back toward SCAN_TOP_N, so something has to stop each day's openings
+    stacking on the last high-water mark. Steady state is this number, not
+    SCAN_TOP_N — set IMM_SCAN_DAILY_OPENINGS=0 for a hard SCAN_TOP_N."""
+    return SCAN_TOP_N + max(0, SCAN_DAILY_OPENINGS)
+
+
 def scan_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
                    members: Set[str] = frozenset(),
-                   extra_openings: int = 0) -> Set[str]:
+                   extra_openings: int = 0, refill_to: int = 0) -> Set[str]:
     """Tickers to EXCLUDE under the open-scan group cap — the finecon walk
-    over the metas flagged `scan` (SCAN_TOP_N / SCAN_EVENT_TOP_N)."""
+    over the metas flagged `scan` (SCAN_TOP_N / SCAN_EVENT_TOP_N), with
+    departure refill (`refill_to`) bounded by scan_ceiling()."""
     return _group_walk_cut([m for m in metas if m.scan], incumbent, members,
-                           SCAN_TOP_N, SCAN_EVENT_TOP_N, extra_openings)
+                           SCAN_TOP_N, SCAN_EVENT_TOP_N, extra_openings,
+                           refill_to=refill_to if SCAN_REFILL_ON_DEPARTURE
+                           else 0,
+                           hard_cap=scan_ceiling())
 
 
 def scan_openings_used(n_kept: int, n_members: int) -> int:
     return _openings_used(n_kept, n_members, SCAN_TOP_N)
+
+
+def scan_openings_allowed(now_utc: datetime) -> int:
+    """How many of the day's openings may be spent BY NOW (Jack 2026-09-09:
+    "improve the burst timing"). Ramps 1 -> SCAN_DAILY_OPENINGS across the
+    ET day, so the tier keeps expansion budget for markets that appear
+    later instead of committing all of it at 00:00 ET. Unpaced = the full
+    allowance immediately, the pre-2026-09-09 behaviour."""
+    if not SCAN_OPENINGS_PACED or SCAN_DAILY_OPENINGS <= 0:
+        return max(0, SCAN_DAILY_OPENINGS)
+    et = now_utc.astimezone(ET)
+    elapsed = (et.hour * 3600 + et.minute * 60 + et.second) / 86400.0
+    return max(1, min(SCAN_DAILY_OPENINGS,
+                      1 + int(SCAN_DAILY_OPENINGS * elapsed)))
 
 # NO-NEW gate (Jack 2026-07-28 pm): series listed here admit NO fresh
 # candidates; members ride sticky to natural death. History: company set
@@ -2996,6 +3100,9 @@ _CONFIG_CODE_KNOBS = (
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE",
+    "EVENT_FILL_NEEDS_WITHDRAWAL", "EVENT_FILL_CORROBORATION_SECS",
+    "EVENT_DEPTH_COLLAPSE_FRAC", "EVENT_DEPTH_COLLAPSE_WINDOW_SECS",
+    "EVENT_DEPTH_COLLAPSE_MIN_BASE",
 )
 
 
@@ -4726,6 +4833,10 @@ class BotState:
     event_slots: Dict[str, dict] = field(default_factory=dict)
     scan_evicted_events: Dict[str, float] = field(default_factory=dict)  # ev
     #   -> ts; PERMANENT for the event (the estimator/admission refuse it)
+    scan_hopeless_barred: Dict[str, float] = field(default_factory=dict)
+    #   ticker -> ts; PERMANENT for that MARKET after a hopeless eviction
+    #   (Jack 2026-09-09). Not per-event: only the strike that proved it
+    #   cannot reach the payout floor is barred, its siblings are untouched.
     scan_series_strikes: Dict[str, List[float]] = field(default_factory=dict)
     scan_history_cache: Dict[str, dict] = field(default_factory=dict)  # tick
     #   -> {ts, ok, why, bars, range, jump, vol} (TTL SCAN_HISTORY_TTL_SECS)
@@ -4811,6 +4922,11 @@ class IncentiveMarketMaker:
         self.pnl = PnlTracker()
         self.tag = f"[{self.TAG}]"
         self.alerter = Alerter(self.TAG, live)
+        # live-event gate corroboration (2026-09-09): per-market external
+        # depth history for the collapse signal, and the last withdrawal
+        # signature seen per event (persisted as event_withdrawal_ts)
+        self._depth_hist: Dict[str, Deque[Tuple[float, float, float]]] = {}
+        self._event_withdrawal_ts: Dict[str, float] = {}
         # ticker -> EMA of "snapshot would count" (both sides >= target).
         # Deliberately NOT persisted: warms up within ~an hour of cycles.
         self._coverage_ema: Dict[str, float] = {}
@@ -5167,6 +5283,9 @@ class IncentiveMarketMaker:
             self.state.scan_evicted_events = {
                 str(e): float(v)
                 for e, v in (data.get("scan_evicted_events") or {}).items()}
+            self.state.scan_hopeless_barred = {
+                str(t): float(v)
+                for t, v in (data.get("scan_hopeless_barred") or {}).items()}
             self.state.scan_series_strikes = {
                 str(s): [float(x) for x in v]
                 for s, v in (data.get("scan_series_strikes") or {}).items()
@@ -5214,6 +5333,9 @@ class IncentiveMarketMaker:
             self.state.event_fill_strikes = {
                 str(e): int(v) for e, v in
                 (data.get("event_fill_strikes") or {}).items()}
+            self._event_withdrawal_ts = {
+                str(e): float(v) for e, v in
+                (data.get("event_withdrawal_ts") or {}).items()}
             self.state.prev_mid.update(
                 {str(t): float(v) for t, v in
                  (data.get("prev_mid_gated") or {}).items()})
@@ -5381,6 +5503,11 @@ class IncentiveMarketMaker:
                                e: round(v, 1)
                                for e, v in self.state.scan_evicted_events.items()
                                if time.time() - v < SCAN_EVICT_TTL_SECS},
+                           # permanent for the market; TTL is file hygiene
+                           "scan_hopeless_barred": {
+                               t: round(v, 1)
+                               for t, v in self.state.scan_hopeless_barred.items()
+                               if time.time() - v < SCAN_EVICT_TTL_SECS},
                            "scan_series_strikes": {
                                s: [round(x, 1) for x in v
                                    if time.time() - x < SCAN_SERIES_STRIKE_TTL_SECS]
@@ -5411,6 +5538,12 @@ class IncentiveMarketMaker:
                                e: round(v, 1)
                                for e, v in self.state.event_live_halt.items()
                                if time.time() - v < 7 * 86400},
+                           # last withdrawal signature per event (corroborates
+                           # the fill tripwire; short-lived, pruned at 1 day)
+                           "event_withdrawal_ts": {
+                               e: round(v, 1)
+                               for e, v in self._event_withdrawal_ts.items()
+                               if time.time() - v < 86400},
                            # fill-tripwire strikes (pruned with their halts)
                            "event_fill_strikes": {
                                e: n
@@ -6345,6 +6478,25 @@ class IncentiveMarketMaker:
                 # ladders — the drain rule's fill-risk argument is thin.
                 skipped["hopeless"] = skipped.get("hopeless", 0) + 1
                 decisions[meta.ticker] = "hopeless"
+                # HOPELESS IS A PERMANENT BAR FOR SCAN MARKETS (Jack
+                # 2026-09-09: "after hopeless eviction, the market should be
+                # barred"). Nothing used to stop a re-admission: the exit
+                # branch requires `prev_selected`, so once out the market is
+                # judged only by the ordinary entry floor, and a jittering
+                # estimate buys it back. Measured 2026-09-08:
+                # KXDIESELELECT-26NOV03-T4.40 was admitted 20:38, evicted
+                # 22:42, RE-ADMITTED 04:00 on one of the five scarce daily
+                # openings, and evicted again 06:00 — two of that day's five
+                # openings spent re-buying markets already judged unable to
+                # reach the $1 floor. Scan only; the normal book keeps its
+                # existing re-entry behaviour.
+                if meta.scan and SCAN_HOPELESS_BAR:
+                    if meta.ticker not in self.state.scan_hopeless_barred:
+                        log(f"{self.tag} open-scan barred {meta.ticker}: "
+                            f"hopeless (projection cannot reach "
+                            f"${series_min_est_total(meta.series):.2f} before "
+                            f"program end); no re-admission")
+                    self.state.scan_hopeless_barred[meta.ticker] = now_ts
             elif meta.ticker not in prev_selected \
                     and meta.event_ticker not in prev_events \
                     and meta.event_ticker not in FORCE_EVENTS \
@@ -6474,16 +6626,26 @@ class IncentiveMarketMaker:
         if self.state.scan_admit_day != et_today:
             self.state.scan_admit_day = et_today
             self.state.scan_admits_today = 0
-        scan_openings_left = max(0, SCAN_DAILY_OPENINGS
+        # PACED (2026-09-09): only the openings unlocked by now are spendable.
+        scan_openings_left = max(0, scan_openings_allowed(now_utc)
                                  - self.state.scan_admits_today)
+        # Pre-refresh membership: `scan_sticky` already lost this refresh's
+        # departures, so the refill target has to come from persisted state.
+        scan_prev_count = len(self.state.scan_members)
         scan_cut = scan_group_cut(ranked, prev_selected, members=scan_sticky,
-                                  extra_openings=scan_openings_left)
+                                  extra_openings=scan_openings_left,
+                                  refill_to=scan_prev_count)
         if scan_cut:
             skipped["scan_top_n"] = len(scan_cut)
             decisions.update({_t: "scan_top_n" for _t in scan_cut})
             ranked = [m for m in ranked if m.ticker not in scan_cut]
         kept_scan = sum(1 for m in ranked if m.scan)
-        used_scan = scan_openings_used(kept_scan, len(scan_sticky))
+        # A REFILL IS NOT AN EXPANSION: charge openings only for growth past
+        # the pre-refresh membership, or the seat a departure freed would
+        # bill an opening it never used.
+        used_scan = scan_openings_used(
+            kept_scan, max(len(scan_sticky),
+                           scan_prev_count if SCAN_REFILL_ON_DEPARTURE else 0))
         if used_scan:
             self.state.scan_admits_today += used_scan
             log(f"{self.tag} open-scan daily openings: {used_scan} used this "
@@ -6757,6 +6919,10 @@ class IncentiveMarketMaker:
         now_ts = now_utc.timestamp()
         if meta.event_ticker in self.state.scan_evicted_events:
             return "evicted"
+        if SCAN_HOPELESS_BAR and meta.ticker in self.state.scan_hopeless_barred:
+            # this exact strike already proved it cannot reach the payout
+            # floor before its program ends (see the hopeless branch)
+            return "hopeless_barred"
         strikes = [x for x in self.state.scan_series_strikes.get(meta.series, [])
                    if now_ts - x < SCAN_SERIES_STRIKE_TTL_SECS]
         if 0 < SCAN_SERIES_STRIKE_LIMIT <= len(strikes):
@@ -7427,6 +7593,33 @@ class IncentiveMarketMaker:
             f"resume deliberately.", key="balance_floor")
         return True
 
+    def _depth_collapsed(self, t: str, now_ts: float, d_yes: float,
+                         d_no: float, evaluate: bool
+                         ) -> Optional[Tuple[str, float, float]]:
+        """Record this cycle's EXTERNAL depths for `t` and report a
+        collapse against the rolling max of the PRIOR readings inside
+        EVENT_DEPTH_COLLAPSE_WINDOW_SECS: (side, base, current) when a side
+        fell to (1 - EVENT_DEPTH_COLLAPSE_FRAC) of a base >=
+        EVENT_DEPTH_COLLAPSE_MIN_BASE, else None. `evaluate` False (out of
+        band, unarmed, stacked) still records but never signals."""
+        h = self._depth_hist.setdefault(t, collections.deque())
+        while h and now_ts - h[0][0] > EVENT_DEPTH_COLLAPSE_WINDOW_SECS:
+            h.popleft()
+        hit = None
+        if evaluate and EVENT_DEPTH_COLLAPSE_FRAC > 0 and h:
+            for side, cur in (("yes", d_yes), ("no", d_no)):
+                base = max((x[1] if side == "yes" else x[2]) for x in h)
+                if base >= EVENT_DEPTH_COLLAPSE_MIN_BASE \
+                        and cur <= base * (1.0 - EVENT_DEPTH_COLLAPSE_FRAC):
+                    hit = (side, base, cur)
+                    break
+        h.append((now_ts, d_yes, d_no))
+        return hit
+
+    def _withdrawal_recent(self, ev: str, now_ts: float) -> bool:
+        ts_ = self._event_withdrawal_ts.get(ev)
+        return ts_ is not None and now_ts - ts_ <= EVENT_FILL_CORROBORATION_SECS
+
     def run_cycle(self, fast_only: bool = False) -> None:
         # fast_only = a FAST-LANE mini-cycle (see FAST_LANE_SECS): same managed
         # set, same resting read, but only fast-lane series are (re)quoted and
@@ -7802,9 +7995,22 @@ class IncentiveMarketMaker:
             # the EVENT_FILL_HALT_STRIKES-th confirms it LIVE permanently.
             # Independent of IMM_BREAKERS, and ahead of the per-market
             # breaker so the event-wide response owns gated series.
-            if (series_event_depth_gated(meta.series) and prev is not None
-                    and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS
-                    and event_live_gate_armed(meta.event_ticker, now_ts)):
+            _burst = (series_event_depth_gated(meta.series) and prev is not None
+                      and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS
+                      and event_live_gate_armed(meta.event_ticker, now_ts))
+            if _burst and EVENT_FILL_NEEDS_WITHDRAWAL \
+                    and not self._withdrawal_recent(ev, now_ts):
+                # A burst with no withdrawal signature on the event in the
+                # last EVENT_FILL_CORROBORATION_SECS is an ordinary fill on
+                # a quiet book (SEP04 9/6 14:34Z: two 20-lots in a minute,
+                # 32h before the announcement). Not a strike; the market
+                # carries on to normal processing below.
+                log(f"{self.tag} {ev}: {t} own book moved {own_pos - prev:+.0f} "
+                    f"in one cycle but no withdrawal signature on the event "
+                    f"in the last {EVENT_FILL_CORROBORATION_SECS / 60:.0f}min "
+                    f"— burst ignored (EVENT_FILL_NEEDS_WITHDRAWAL)")
+                _burst = False
+            if _burst:
                 strikes = self.state.event_fill_strikes.get(ev, 0) + 1
                 self.state.event_fill_strikes[ev] = strikes
                 event_depth_thin.add(ev)
@@ -7922,6 +8128,14 @@ class IncentiveMarketMaker:
                 thin = (mid_in_band and armed and not stacked
                         and (d_yes < EVENT_DEPTH_MIN_CONTRACTS
                              or d_no < EVENT_DEPTH_MIN_CONTRACTS))
+                # Withdrawal by COLLAPSE (2026-09-09): the makers pulled
+                # most of a deep side even though what is left still clears
+                # the 1,000 floor (NYPD 27,075 -> 2,401 at 23:03Z on 9/7).
+                collapsed = self._depth_collapsed(
+                    t, now_ts, d_yes, d_no,
+                    evaluate=mid_in_band and armed and not stacked)
+                if thin or collapsed or went_one_sided or jumped_out:
+                    self._event_withdrawal_ts[ev] = now_ts
                 if jumped_out and ev not in self.state.event_live_halt:
                     self.state.event_live_halt[ev] = now_ts
                     self.alerter.alert(
@@ -7929,7 +8143,7 @@ class IncentiveMarketMaker:
                         f"{ev}: {t} jumped out of band ({pm_g:.0f}c -> "
                         f"{mid_g:.0f}c) — settled strike, event LIVE; "
                         f"PERMANENTLY standing down the whole event", key=ev)
-                if thin or went_one_sided or jumped_out \
+                if thin or collapsed or went_one_sided or jumped_out \
                         or ev in self.state.event_live_halt:
                     event_depth_thin.add(ev)
                     first = ev not in self.state.event_depth_halt
@@ -7943,11 +8157,15 @@ class IncentiveMarketMaker:
                         self.state.prev_mid[t] = mid_g
                         self.state.last_mark[t] = mid_g
                         marked.add(t)
-                    if first and (thin or went_one_sided):
+                    if first and (thin or went_one_sided or collapsed):
                         self.alerter.alert(
                             "event_depth",
                             f"{ev}: {t} "
                             + ("went one-sided" if went_one_sided else
+                               (f"external {collapsed[0]} depth collapsed "
+                                f"{collapsed[1]:.0f} -> {collapsed[2]:.0f} "
+                                f"({(1 - collapsed[2] / collapsed[1]) * 100:.0f}% "
+                                f"withdrawn)") if (collapsed and not thin) else
                                f"external depth yes {d_yes:.0f} / no "
                                f"{d_no:.0f} < {EVENT_DEPTH_MIN_CONTRACTS:.0f}")
                             + f" — event likely LIVE; standing down the whole "
@@ -8857,6 +9075,7 @@ class IncentiveMarketMaker:
                 if s.scan_admit_day == now_utc.astimezone(ET).date().isoformat()
                 else 0),
             "scan_evicted_events": len(s.scan_evicted_events),
+            "scan_hopeless_barred": len(s.scan_hopeless_barred),
             "scan_halted_today": (
                 s.scan_halt_day == now_utc.astimezone(ET).date().isoformat()),
             "scan_pnl_today": round(s.scan_pnl_today_last, 2),
@@ -9041,8 +9260,14 @@ class IncentiveMarketMaker:
             f"{('max ' + str(MAX_MARKETS) + ' events') if MAX_MARKETS > 0 else 'events uncapped'}, "
             f"TTL {ORDER_TTL_SECS}s, poll {POLL_SECS}s")
         if SCAN_TOP_N > 0:
-            log(f"open-scan tier: {SCAN_TOP_N} slots, {SCAN_EVENT_TOP_N}/event, "
-                f"{SCAN_DAILY_OPENINGS} daily openings; sizing "
+            log(f"open-scan tier: {SCAN_TOP_N} slots "
+                f"(ceiling {scan_ceiling()}), {SCAN_EVENT_TOP_N}/event, "
+                f"{SCAN_DAILY_OPENINGS} daily openings"
+                + (" PACED" if SCAN_OPENINGS_PACED else "")
+                + (", refill on departure" if SCAN_REFILL_ON_DEPARTURE
+                   else "")
+                + (", hopeless bars the market" if SCAN_HOPELESS_BAR else "")
+                + f"; sizing "
                 f"{'ladder ' + str(SCAN_LEVELS) if SCAN_LEVELS else 'global ladder'}, "
                 f"net cap {('%g' % SCAN_MAX_POSITION) if SCAN_MAX_POSITION is not None else 'global'}, "
                 f"ref-mult cap {('%g' % SCAN_REF_MULT_CAP) if SCAN_REF_MULT_CAP > 0 else 'none'}, "
