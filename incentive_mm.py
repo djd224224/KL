@@ -61,7 +61,6 @@ Usage:
 import argparse
 import atexit
 import base64
-import collections
 import json
 import math
 import os
@@ -76,7 +75,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Deque, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pytz
 import requests
@@ -479,42 +478,6 @@ EVENT_FILL_HALT_STRIKES = _env_int("IMM_EVENT_FILL_STRIKES", 2)
 EVENT_LIVE_GATE_PREARM_SECS = _env_float(
     "IMM_EVENT_LIVE_GATE_PREARM_H", 4) * 3600.0
 
-
-# FILL-TRIPWIRE CORROBORATION + DEPTH COLLAPSE (Jack 2026-09-09, "yes make
-# that change", after the KXMAMDANIMENTION-26SEP04 replay). Two findings:
-#   1. The fill tripwire alone is trigger-happy. Replaying the gate over
-#      SEP04's logged book, it would have gone PERMANENTLY live-confirmed at
-#      14:34:58Z on 9/6 — two ordinary 20-lot fills in consecutive cycles on
-#      a quiet day — 32 hours before the real announcement. That is exactly
-#      how SEP02/SEP03 ended "permanently live-confirmed" with $2/market of
-#      credits. A HIGHER threshold is the wrong fix: the ladder is 0:20, so
-#      every full fill is exactly 20 whether the event is live or not — the
-#      real 9/7 strikes were 20-lots too. The discriminator is the BOOK.
-#   2. The thin floor missed the real live moment. At 23:03->23:13Z on 9/7
-#      NYPD's external YES depth went 27,075 -> 2,401 and the mid jumped
-#      15/30 -> 35/60: the other makers withdrew, which is the signal the
-#      gate exists for — but 2,401 is above the 1,000 floor, so nothing
-#      fired and the bot rested through the announcement (-$127 own book
-#      in that window, of -$175 on the event).
-# So: a fill burst counts as a strike ONLY when the event has shown a
-# withdrawal signature (thin, collapse, lost touch or jump) within
-# EVENT_FILL_CORROBORATION_SECS; an uncorroborated burst is logged and
-# otherwise ignored by the gate (the ordinary per-market breaker, if armed,
-# is untouched). And a COLLAPSE — an in-band sibling's external side
-# falling to (1 - EVENT_DEPTH_COLLAPSE_FRAC) of its max over the last
-# EVENT_DEPTH_COLLAPSE_WINDOW_SECS, from a base of at least
-# EVENT_DEPTH_COLLAPSE_MIN_BASE — is a withdrawal in its own right: the
-# same resumable whole-event stand-down as thin. The stack waiver applies
-# to collapse too (a book still carrying a 10k+ side is a junk stack whose
-# opposite side thins as its normal shape — the SEP08-AFFO lesson).
-# IMM_EVENT_FILL_NEEDS_WITHDRAWAL=0 restores unconditional strikes;
-# IMM_EVENT_DEPTH_COLLAPSE_FRAC=0 disables the collapse signal.
-EVENT_FILL_NEEDS_WITHDRAWAL = os.environ.get(
-    "IMM_EVENT_FILL_NEEDS_WITHDRAWAL", "1") == "1"
-EVENT_FILL_CORROBORATION_SECS = _env_float("IMM_EVENT_FILL_CORROBORATION_SECS", 1800)
-EVENT_DEPTH_COLLAPSE_FRAC = _env_float("IMM_EVENT_DEPTH_COLLAPSE_FRAC", 0.5)
-EVENT_DEPTH_COLLAPSE_WINDOW_SECS = _env_float("IMM_EVENT_DEPTH_COLLAPSE_WINDOW_SECS", 1800)
-EVENT_DEPTH_COLLAPSE_MIN_BASE = _env_float("IMM_EVENT_DEPTH_COLLAPSE_MIN_BASE", 2000)
 
 # NO-CUTOFF MENTION CLASS (Jack 2026-09-08, KXWORLDNEWSMENTION-26SEP08:
 # "mention markets without a clear cutoff time, like the ABC reporters one
@@ -3205,9 +3168,6 @@ _CONFIG_CODE_KNOBS = (
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE",
-    "EVENT_FILL_NEEDS_WITHDRAWAL", "EVENT_FILL_CORROBORATION_SECS",
-    "EVENT_DEPTH_COLLAPSE_FRAC", "EVENT_DEPTH_COLLAPSE_WINDOW_SECS",
-    "EVENT_DEPTH_COLLAPSE_MIN_BASE",
 )
 
 
@@ -5083,11 +5043,6 @@ class IncentiveMarketMaker:
         self.pnl = PnlTracker()
         self.tag = f"[{self.TAG}]"
         self.alerter = Alerter(self.TAG, live)
-        # live-event gate corroboration (2026-09-09): per-market external
-        # depth history for the collapse signal, and the last withdrawal
-        # signature seen per event (persisted as event_withdrawal_ts)
-        self._depth_hist: Dict[str, Deque[Tuple[float, float, float]]] = {}
-        self._event_withdrawal_ts: Dict[str, float] = {}
         # ticker -> EMA of "snapshot would count" (both sides >= target).
         # Deliberately NOT persisted: warms up within ~an hour of cycles.
         self._coverage_ema: Dict[str, float] = {}
@@ -5350,6 +5305,20 @@ class IncentiveMarketMaker:
                     self.pnl.filled[str(t)] = float(v)
                 except (TypeError, ValueError):
                     pass
+            # SEED FROM INVENTORY (Jack 2026-09-09 "Seed own_filled from
+            # |own_pos| on load"). `filled` was born with 3e91438 and started
+            # at ZERO for every market that traded before it, so the earned-
+            # slot rule read heavily worked slot-holders as never traded:
+            # KXDIESELW-26SEP14 released T5.84/T5.86/T5.92 as "filled 0 < 6"
+            # while holding -65/-72/-40 in them, refilled the slots with
+            # T6.00/T6.02/T6.04, and ended the day with inventory in EIGHT
+            # strikes of one weekly. A market holding N contracts has filled
+            # at least N — a lower bound, never a reduction — so a counter
+            # can never again read below the position it is carrying,
+            # whatever state file this process inherits.
+            for t, p in self.pnl.pos.items():
+                if abs(p) > self.pnl.filled.get(t, 0.0):
+                    self.pnl.filled[t] = abs(p)
             self.state.reward_est_lifetime = float(data.get("reward_est_lifetime") or 0.0)
             # realized_seen deliberately NOT restored: the tracker starts empty
             self.state.realized_lifetime = float(data.get("realized_lifetime") or 0.0)
@@ -5499,9 +5468,6 @@ class IncentiveMarketMaker:
             self.state.event_fill_strikes = {
                 str(e): int(v) for e, v in
                 (data.get("event_fill_strikes") or {}).items()}
-            self._event_withdrawal_ts = {
-                str(e): float(v) for e, v in
-                (data.get("event_withdrawal_ts") or {}).items()}
             self.state.prev_mid.update(
                 {str(t): float(v) for t, v in
                  (data.get("prev_mid_gated") or {}).items()})
@@ -5709,12 +5675,6 @@ class IncentiveMarketMaker:
                                e: round(v, 1)
                                for e, v in self.state.event_live_halt.items()
                                if time.time() - v < 7 * 86400},
-                           # last withdrawal signature per event (corroborates
-                           # the fill tripwire; short-lived, pruned at 1 day)
-                           "event_withdrawal_ts": {
-                               e: round(v, 1)
-                               for e, v in self._event_withdrawal_ts.items()
-                               if time.time() - v < 86400},
                            # fill-tripwire strikes (pruned with their halts)
                            "event_fill_strikes": {
                                e: n
@@ -7859,33 +7819,6 @@ class IncentiveMarketMaker:
             f"resume deliberately.", key="balance_floor")
         return True
 
-    def _depth_collapsed(self, t: str, now_ts: float, d_yes: float,
-                         d_no: float, evaluate: bool
-                         ) -> Optional[Tuple[str, float, float]]:
-        """Record this cycle's EXTERNAL depths for `t` and report a
-        collapse against the rolling max of the PRIOR readings inside
-        EVENT_DEPTH_COLLAPSE_WINDOW_SECS: (side, base, current) when a side
-        fell to (1 - EVENT_DEPTH_COLLAPSE_FRAC) of a base >=
-        EVENT_DEPTH_COLLAPSE_MIN_BASE, else None. `evaluate` False (out of
-        band, unarmed, stacked) still records but never signals."""
-        h = self._depth_hist.setdefault(t, collections.deque())
-        while h and now_ts - h[0][0] > EVENT_DEPTH_COLLAPSE_WINDOW_SECS:
-            h.popleft()
-        hit = None
-        if evaluate and EVENT_DEPTH_COLLAPSE_FRAC > 0 and h:
-            for side, cur in (("yes", d_yes), ("no", d_no)):
-                base = max((x[1] if side == "yes" else x[2]) for x in h)
-                if base >= EVENT_DEPTH_COLLAPSE_MIN_BASE \
-                        and cur <= base * (1.0 - EVENT_DEPTH_COLLAPSE_FRAC):
-                    hit = (side, base, cur)
-                    break
-        h.append((now_ts, d_yes, d_no))
-        return hit
-
-    def _withdrawal_recent(self, ev: str, now_ts: float) -> bool:
-        ts_ = self._event_withdrawal_ts.get(ev)
-        return ts_ is not None and now_ts - ts_ <= EVENT_FILL_CORROBORATION_SECS
-
     def run_cycle(self, fast_only: bool = False) -> None:
         # fast_only = a FAST-LANE mini-cycle (see FAST_LANE_SECS): same managed
         # set, same resting read, but only fast-lane series are (re)quoted and
@@ -8261,22 +8194,9 @@ class IncentiveMarketMaker:
             # the EVENT_FILL_HALT_STRIKES-th confirms it LIVE permanently.
             # Independent of IMM_BREAKERS, and ahead of the per-market
             # breaker so the event-wide response owns gated series.
-            _burst = (series_event_depth_gated(meta.series) and prev is not None
-                      and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS
-                      and event_live_gate_armed(meta.event_ticker, now_ts))
-            if _burst and EVENT_FILL_NEEDS_WITHDRAWAL \
-                    and not self._withdrawal_recent(ev, now_ts):
-                # A burst with no withdrawal signature on the event in the
-                # last EVENT_FILL_CORROBORATION_SECS is an ordinary fill on
-                # a quiet book (SEP04 9/6 14:34Z: two 20-lots in a minute,
-                # 32h before the announcement). Not a strike; the market
-                # carries on to normal processing below.
-                log(f"{self.tag} {ev}: {t} own book moved {own_pos - prev:+.0f} "
-                    f"in one cycle but no withdrawal signature on the event "
-                    f"in the last {EVENT_FILL_CORROBORATION_SECS / 60:.0f}min "
-                    f"— burst ignored (EVENT_FILL_NEEDS_WITHDRAWAL)")
-                _burst = False
-            if _burst:
+            if (series_event_depth_gated(meta.series) and prev is not None
+                    and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS
+                    and event_live_gate_armed(meta.event_ticker, now_ts)):
                 strikes = self.state.event_fill_strikes.get(ev, 0) + 1
                 self.state.event_fill_strikes[ev] = strikes
                 event_depth_thin.add(ev)
@@ -8394,14 +8314,6 @@ class IncentiveMarketMaker:
                 thin = (mid_in_band and armed and not stacked
                         and (d_yes < EVENT_DEPTH_MIN_CONTRACTS
                              or d_no < EVENT_DEPTH_MIN_CONTRACTS))
-                # Withdrawal by COLLAPSE (2026-09-09): the makers pulled
-                # most of a deep side even though what is left still clears
-                # the 1,000 floor (NYPD 27,075 -> 2,401 at 23:03Z on 9/7).
-                collapsed = self._depth_collapsed(
-                    t, now_ts, d_yes, d_no,
-                    evaluate=mid_in_band and armed and not stacked)
-                if thin or collapsed or went_one_sided or jumped_out:
-                    self._event_withdrawal_ts[ev] = now_ts
                 if jumped_out and ev not in self.state.event_live_halt:
                     self.state.event_live_halt[ev] = now_ts
                     self.alerter.alert(
@@ -8409,7 +8321,7 @@ class IncentiveMarketMaker:
                         f"{ev}: {t} jumped out of band ({pm_g:.0f}c -> "
                         f"{mid_g:.0f}c) — settled strike, event LIVE; "
                         f"PERMANENTLY standing down the whole event", key=ev)
-                if thin or collapsed or went_one_sided or jumped_out \
+                if thin or went_one_sided or jumped_out \
                         or ev in self.state.event_live_halt:
                     event_depth_thin.add(ev)
                     first = ev not in self.state.event_depth_halt
@@ -8423,15 +8335,11 @@ class IncentiveMarketMaker:
                         self.state.prev_mid[t] = mid_g
                         self.state.last_mark[t] = mid_g
                         marked.add(t)
-                    if first and (thin or went_one_sided or collapsed):
+                    if first and (thin or went_one_sided):
                         self.alerter.alert(
                             "event_depth",
                             f"{ev}: {t} "
                             + ("went one-sided" if went_one_sided else
-                               (f"external {collapsed[0]} depth collapsed "
-                                f"{collapsed[1]:.0f} -> {collapsed[2]:.0f} "
-                                f"({(1 - collapsed[2] / collapsed[1]) * 100:.0f}% "
-                                f"withdrawn)") if (collapsed and not thin) else
                                f"external depth yes {d_yes:.0f} / no "
                                f"{d_no:.0f} < {EVENT_DEPTH_MIN_CONTRACTS:.0f}")
                             + f" — event likely LIVE; standing down the whole "
