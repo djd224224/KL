@@ -6766,17 +6766,20 @@ class IncentiveMarketMaker:
             decisions.update({_t: "event_top_n" for _t in topn_cut})
             ranked = [m for m in ranked if m.ticker not in topn_cut]
         if EVENT_TOP_N_LIFETIME:
+            # TTL TOUCH ONLY — the slot itself is spent much further down,
+            # against the FINAL selection (Jack 2026-09-09: "fix the lifetime
+            # slot ordering too"). The touch cannot move with it: `ts` is the
+            # persist filter (EVENT_SLOTS_TTL_SECS, 14d), so an event whose
+            # candidates are all cut this refresh must still keep its ledger
+            # entry alive or it would age out of the state file and hand the
+            # event a fresh lifetime budget — the exact "kept admitting
+            # replacements" the ledger exists to stop.
             for _m in ranked:
                 if event_top_n_for(_m.series) <= 0:
                     continue
                 _slot = self.state.event_slots.setdefault(
                     _m.event_ticker, {"markets": [], "ts": now_ts})
                 _slot["ts"] = now_ts
-                if _m.ticker not in _slot["markets"]:
-                    _slot["markets"].append(_m.ticker)
-                    log(f"{self.tag} event slot {len(_slot['markets'])}"
-                        f"/{event_top_n_for(_m.series)} on "
-                        f"{_m.event_ticker}: {_m.ticker}")
 
         # Finecon GROUP top-N (Jack 2026-09-02 — see finecon_group_cut):
         # after the per-event cut so a gas-monthly strike trimmed there can
@@ -6920,6 +6923,37 @@ class IncentiveMarketMaker:
         dropped = [t for t in self.state.selected if t not in selected]
         added = [t for t in selected if t not in self.state.selected]
         self.state.selected = selected
+        # LIFETIME SLOTS ARE SPENT HERE (Jack 2026-09-09: "fix the lifetime
+        # slot ordering too"). The ledger used to be written straight after
+        # event_top_n_cut, which is what the comment up there always claimed
+        # ("written after it with whatever the cut kept — so a market only
+        # ever burns a slot by actually surviving into the selection"). Three
+        # more filters run after that point, and every one of them could take
+        # a market that had already recorded its slot: finecon_group_cut,
+        # scan_group_cut, and the MAX_MARKETS/collateral loop below. A market
+        # cut by any of them held a PERMANENT slot on its event without ever
+        # being quoted or earning a cent. Measured 2026-09-09 17:17Z: 3 such
+        # slots on events with live programs (KXDIESELYE-26DEC31 2 of its 3,
+        # KXAAAGASDVA-26SEP10 1 of 3).
+        #
+        # `ranked` is iterated rather than `selected` so the ledger keeps its
+        # ROI order; `selected` is built only from `ranked`, so the two agree
+        # on membership. The per-event cap is unaffected: event_top_n_cut
+        # reads `slots_used` from the PREVIOUS refreshes' ledger, above, and
+        # appending later cannot let an event exceed N — only markets the cut
+        # already allowed can reach here.
+        if EVENT_TOP_N_LIFETIME:
+            for _m in ranked:
+                if _m.ticker not in selected or event_top_n_for(_m.series) <= 0:
+                    continue
+                _slot = self.state.event_slots.setdefault(
+                    _m.event_ticker, {"markets": [], "ts": now_ts})
+                _slot["ts"] = now_ts
+                if _m.ticker not in _slot["markets"]:
+                    _slot["markets"].append(_m.ticker)
+                    log(f"{self.tag} event slot {len(_slot['markets'])}"
+                        f"/{event_top_n_for(_m.series)} on "
+                        f"{_m.event_ticker}: {_m.ticker}")
         # Open-scan membership bookkeeping (2026-09-05): an admission anchors
         # the drift tripwire at the admission mid and joins the loss-budget
         # book (which only shrinks once a market is flat AND gone).

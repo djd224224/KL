@@ -1452,3 +1452,61 @@ Pinned by `test_finecon_group_is_bounded_and_refills`: the ceiling binds at
 the live 30-member shape, incumbents above the ceiling are never cut, the
 freed seat refills and charges nothing, the knob restores the bleed-down,
 and `FINECON_DAILY_OPENINGS=0` collapses the ceiling to the cap.
+
+## 2026-09-09 — a cut market was burning a lifetime event slot (Jack)
+
+Jack, after the adversarial review of the finecon ceiling surfaced it:
+"fix the lifetime slot ordering too."
+
+WHAT WAS WRONG. The lifetime slot ledger claimed an invariant it did not
+hold. Its own comment says the ledger is "written after it with whatever
+the cut kept — so a market only ever burns a slot by actually surviving
+into the selection." It was written immediately after `event_top_n_cut`,
+and THREE more filters run after that point:
+
+| Filter | Line |
+|---|---|
+| `finecon_group_cut` | ~6799 |
+| `scan_group_cut` | ~6822 |
+| MAX_MARKETS / collateral budget loop | ~6900 |
+
+A market taken by any of them had already appended itself to
+`state.event_slots[ev]["markets"]`. Because those slots are PERMANENT, the
+event lost one forever to a market that was never quoted and never earned a
+cent. Measured 2026-09-09 17:17Z, restricted to events with live liquidity
+programs: 3 such slots — `KXDIESELYE-26DEC31` holding 2 of its 3, and
+`KXAAAGASDVA-26SEP10` holding 1 of 3. (The 87-of-162 figure across the whole
+ledger is mostly expired Sept 8 gas dailies; that is stale ledger, not a
+leak.)
+
+THE FIX. The append moved to just after `self.state.selected = selected`,
+where the selection is final. `ranked` is still what gets iterated, filtered
+by `_m.ticker in selected`, so the ledger keeps its ROI ordering and the two
+agree on membership (`selected` is built only from `ranked`).
+
+THE TRAP THIS CHANGE HAD TO AVOID. The `ts` touch could NOT move with the
+append. `ts` is the persist filter (`EVENT_SLOTS_TTL_SECS`, 14 days), and it
+was being refreshed for every event with a surviving candidate. Had the whole
+block moved, an event whose candidates were all cut would stop being touched,
+age out of the state file, and come back with a FRESH lifetime budget — the
+exact "kept admitting replacements" the ledger exists to stop. The touch
+therefore stays where it was, now doing nothing but `setdefault` + `ts`, and
+only the slot spend moved.
+
+THE PER-EVENT CAP IS UNAFFECTED. `event_top_n_cut` reads `slots_used` from
+the ledger as of PREVIOUS refreshes, above the append either way. Appending
+later cannot let an event exceed N, because only markets that cut already
+allowed can reach the selection.
+
+Pinned by `test_a_cut_market_never_burns_a_lifetime_event_slot`, driven
+through the MAX_MARKETS filter (the last of the three, furthest from the old
+write point). It asserts the cut event spent nothing AND still holds a live
+ledger entry so the TTL cannot age it out. Verified to FAIL on 54ef318:
+`Lists differ: ['KXGOOD-99DEC30-A'] != []`.
+
+WHAT THIS DOES NOT FIX. The 3 slots already burned stay burned. State alone
+cannot tell a slot mis-recorded by this bug from one legitimately spent by a
+market that was quoted and later dropped without fills — both read as "not
+selected, no fills" — so an automatic repair would over-release and weaken
+the lifetime semantics. They release through the normal rule
+(`_live_event_slots`) once those markets go out of band.

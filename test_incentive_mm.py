@@ -1485,6 +1485,64 @@ class TestDryRunCycle(unittest.TestCase):
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         return bot
 
+    def test_a_cut_market_never_burns_a_lifetime_event_slot(self):
+        """Jack 2026-09-09: "fix the lifetime slot ordering too". The ledger
+        was written straight after event_top_n_cut, but THREE more filters run
+        after that point — finecon_group_cut, scan_group_cut and the
+        MAX_MARKETS/collateral loop. A market taken by any of them had already
+        recorded a PERMANENT slot on its event without ever being quoted.
+        Measured live 2026-09-09 17:17Z: 3 such slots on events with live
+        programs (KXDIESELYE-26DEC31 held 2 of its 3, KXAAAGASDVA-26SEP10 1).
+
+        Driven here through the MAX_MARKETS filter, which is the last of the
+        three and sits furthest from the old write point."""
+        _clean_persist()
+        c = FakeClient()
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        evs = ["KXGOOD-99DEC31", "KXGOOD-99DEC30"]
+        c.programs, c.markets, c.books = [], {}, {}
+        for ev in evs:
+            t = f"{ev}-A"
+            c.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": start, "end_date": end})
+            c.markets[t] = {
+                "ticker": t, "event_ticker": ev, "status": "active",
+                "close_time": far, "yes_bid_dollars": "0.4900",
+                "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+            c.books[t] = {"orderbook_fp": {
+                "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+                "no_dollars": [["0.49", "1200"]]}}
+
+        bot = IncentiveMarketMaker(client=c, live=False)
+        # KXGOOD is not a capped family by default; make it one so the
+        # lifetime ledger applies, and let only ONE event through.
+        with mock.patch.object(imm, "EVENT_TOP_N", [("KXGOOD", 3)]),                 mock.patch.object(imm, "EVENT_TOP_N_LIFETIME", True),                 mock.patch.object(imm, "MAX_MARKETS", 1):
+            bot.run_cycle()
+
+        chosen = {m.event_ticker for m in bot.state.selected.values()}
+        self.assertEqual(len(chosen), 1, "the MAX_MARKETS filter did not bite")
+        cut_ev = [e for e in evs if e not in chosen][0]
+        sel_ev = chosen.pop()
+
+        # the SELECTED event spent its slot
+        self.assertEqual(
+            (bot.state.event_slots.get(sel_ev) or {}).get("markets"),
+            [f"{sel_ev}-A"])
+        # THE REGRESSION: the CUT event must have spent nothing...
+        self.assertEqual(
+            (bot.state.event_slots.get(cut_ev) or {}).get("markets") or [], [],
+            f"{cut_ev} burned a lifetime slot on a market it never quoted")
+        # ...while still holding a live ledger entry, so the 14-day persist
+        # TTL cannot age it out and hand the event a fresh lifetime budget.
+        self.assertIn(cut_ev, bot.state.event_slots)
+        self.assertGreater((bot.state.event_slots[cut_ev] or {}).get("ts", 0), 0)
+
     def test_fast_tick_touches_nothing_without_fast_series(self):
         # Fast-lane mini-cycle (Jack 2026-08-02) on a universe with no
         # fast-lane series: every order the full cycle placed must survive
