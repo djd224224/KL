@@ -7558,6 +7558,32 @@ class TestLifetimeSlotRelease(unittest.TestCase):
     def _slots(self, *tickers):
         return {"markets": [f"{self.EV}-{t}" for t in tickers], "ts": time.time()}
 
+    def test_filled_is_seeded_from_inventory_on_load(self):
+        """Jack 2026-09-09 "Seed own_filled from |own_pos| on load". `filled`
+        started at zero for every market that traded before 3e91438, so the
+        earned-slot rule released KXDIESELW-26SEP14's T5.84/T5.86/T5.92 as
+        "filled 0 < 6" while the bot held -65/-72/-40 in them, and the event
+        ended the day with inventory in eight strikes. A position is a lower
+        bound on gross fills: seed it, never reduce a real counter."""
+        worked, real, flat = (f"{self.EV}-T5.84", f"{self.EV}-T4.80",
+                              f"{self.EV}-T4.40")
+        self.bot.pnl.pos[worked] = -65.0          # traded before the counter existed
+        self.bot.pnl.filled.pop(worked, None)
+        self.bot.pnl.pos[real] = 10.0             # counter already knows more
+        self.bot.pnl.filled[real] = 90.0
+        self.bot.pnl.pos[flat] = 0.0              # never traded: stays 0
+        self.bot.pnl.filled[flat] = 0.0
+        self.bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot2.pnl.filled.get(worked), 65.0)
+        self.assertEqual(bot2.pnl.filled.get(real), 90.0)      # not reduced
+        self.assertEqual(bot2.pnl.filled.get(flat, 0.0), 0.0)
+        # and the consequence: the worked, now-unquotable holder keeps its
+        # slot instead of being released as never-traded
+        entry = self._slots("T5.84", "T4.40")
+        kept = bot2._live_event_slots(self.EV, entry, {worked, flat})
+        self.assertEqual(kept, [worked])
+
     def test_barely_traded_and_unquotable_releases_its_slot(self):
         self.assertEqual(imm.EVENT_SLOT_EARNED_FILLS, 6)
         entry = self._slots("T4.40", "T4.60", "T4.80")
