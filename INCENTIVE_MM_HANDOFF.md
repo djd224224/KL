@@ -569,7 +569,7 @@ change that must survive goes through a branch + PR, same day.
 
 Jack: "for GAS markets, quote only the 3 highest ROI markets in each
 event. because they are all correlated so i dont want to quote them all."
-`IMM_EVENT_TOP_N` (default `KXAAAGAS:3`, prefix:N, longest wins) caps each
+`IMM_EVENT_TOP_N` (default `KXAAAGAS:3`, prefix:N or `*suffix:N` since 2026-09-10, longest wins) caps each
 gas event to its N highest-ROI markets — ROI = est $/day per $ at risk
 (the quote-gaps metric: fill-weighted exposure, else collateral), with the
 yield rank's 1.15x incumbent factor against churn. Applied to `ranked`
@@ -1319,7 +1319,7 @@ event pool) first, or it will measure nothing.
 `HISTORY_H` 72 · `MIN_HISTORY_BARS` 0 = off · `MAX_RANGE` 0 = off ·
 `MAX_JUMP` 10 ·
 `MAX_HISTORY_VOLUME` 1000 · `HISTORY_TTL_H` 6 · `SERIES_META_TTL_D` 7 ·
-`MAX_BULK` 1000 · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·
+`MAX_BULK` 2000 (1000 until 2026-09-10) · `MAX_BOOKS` 120 · `MAX_SERIES_FETCHES` 30 ·
 `MAX_HISTORY_FETCHES` 40 · `FILL_HALT` 0 = off · `MID_JUMP` 0 = off ·
 `DRIFT` 0 = off ·
 `DAILY_LOSS_LIMIT` 200 (TIER-wide, per ET day) · `SERIES_STRIKES` 2 · `SERIES_STRIKE_DAYS` 7 ·
@@ -1620,3 +1620,25 @@ membership test drops KXAMZNCC; test_finecon_daily_openings' synthetic
 group members were KXAMZNCC tickers and are KXVENEZCRUDE now (same
 shape, still a base member); the scan-admission test pins the 6h default
 and admits a 7h-old listing.
+
+## 2026-09-10 pm (later) — *CC events capped at 3 by ROI; scan bulk read 1000 -> 2000 (Jack)
+
+Jack, minutes after the *CC family went into the normal book (27 events,
+234 selected strikes, 100/100 events): "just quote max 3 markets per
+event, based on ROI, for CC family" and "bulk read the top 2k markets by
+pool by day".
+
+CAP: `IMM_EVENT_TOP_N` now accepts a `*suffix:N` pattern next to the
+prefix ones; default is `KXAAAGAS:3,KXDIESEL:3,KXTRUEV:3,*CC:3`. Same
+machinery as gas: ROI rank (two-sided first), 1.15x incumbency, sticky
+members, LIFETIME slot ledger. On the first refresh the 9-strike CC
+selections are trimmed to 3 by the concurrent path (no ledger entries
+yet), the 3 survivors are recorded, and the 6 cut wind down reduce-only.
+A bare `*` or empty pattern is a config error.
+
+BULK: `SCAN_MAX_BULK` 1000 -> 2000. Measured 2026-09-11 01:45Z: the scan
+pre-read list was 2,718 markets and rank 1000 sat at ~$24/day/market, so
+KX30YMORTW-26SEP17 ($14.91, rank ~1588) never reached an admission screen
+and the 6h age change could not help it (the `age` reject key vanished
+from the scan line for exactly that reason). 2000 covers it with headroom;
+cost 20 -> 40 bulk reads per 600s refresh.

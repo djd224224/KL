@@ -2233,6 +2233,28 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                          (("KXAAAGAS", 3), ("KXDIESEL", 2)))
         with self.assertRaises(ValueError):
             imm._parse_event_top_n("KXAAAGAS")
+        # *CC:3 (Jack 2026-09-10 "just quote max 3 markets per event, based
+        # on ROI, for CC family"): a leading '*' is a series-name SUFFIX.
+        # Longest pattern still wins; a bare '*' or empty pattern is a
+        # config error, not a match-everything.
+        self.assertEqual(imm._parse_event_top_n("*CC:3,KXAAAGAS:3"),
+                         (("KXAAAGAS", 3), ("*CC", 3)))
+        with self.assertRaises(ValueError):
+            imm._parse_event_top_n("*:3")
+        for s in ("KXURBNCC", "KXAMZNCC", "KXCOSTCC", "KXDGCC",
+                  "KXNEVERSEENCC"):
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+        # a series that merely CONTAINS 'CC' is not the family
+        for s in ("KXCCL", "KXCCMONTHLY", "KXSBUX"):
+            self.assertEqual(imm.event_top_n_for(s), 0, s)
+        # and the cut itself works on a CC event: 9 strikes -> 3 by ROI
+        cc = [m(f"KXURBNCC-26OCT07-T{90 + 3 * i}", float(9 - i))
+              for i in range(9)]
+        cut = imm.event_top_n_cut(cc, incumbent=set())
+        self.assertEqual(len(cut), 6)
+        self.assertEqual({t for t in {x.ticker for x in cc} - cut},
+                         {"KXURBNCC-26OCT07-T90", "KXURBNCC-26OCT07-T93",
+                          "KXURBNCC-26OCT07-T96"})
 
     def test_event_top_n_members_hold_their_slots(self):
         # Jack 2026-09-06 "the quoted markets are moving around, it should
@@ -8359,6 +8381,8 @@ class TestOpenScanTier(unittest.TestCase):
             budget), "age")
         # Jack 2026-09-10: "drop the open scan 24h requirement to 6h"
         self.assertEqual(imm.SCAN_MIN_AGE_HOURS, 6)
+        # and "bulk read the top 2k markets by pool by day"
+        self.assertEqual(imm.SCAN_MAX_BULK, 2000)
         self.assertIsNone(bot._scan_admission(
             self._meta(open_time=now - timedelta(hours=7)), m, {}, now,
             budget))

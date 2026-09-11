@@ -1173,20 +1173,33 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 # that day's life (the enrollment's close-anchored cutoff and 5pm halving
 # still apply on top).
 def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
+    """'<pattern>:<N>,...' -> ((pattern, N), ...) longest pattern first. A
+    pattern is a series-name PREFIX, or a SUFFIX when it starts with '*'
+    ('*CC:3' = every series ending in CC — the Carbon Arc credit-card
+    family, Jack 2026-09-10: "just quote max 3 markets per event, based on
+    ROI, for CC family")."""
     out = []
     for part in (p.strip() for p in spec.split(",") if p.strip()):
         try:
             prefix, n_s = part.split(":")
-            out.append((prefix.strip(), int(n_s)))
+            prefix = prefix.strip()
+            if not prefix or prefix == "*":
+                raise ValueError
+            out.append((prefix, int(n_s)))
         except ValueError:
             raise ValueError(f"bad IMM_EVENT_TOP_N part: {part!r}")
     out.sort(key=lambda kv: -len(kv[0]))
     return tuple(out)
 
 
+# *CC:3 (Jack 2026-09-10 pm, the same evening the family was allowed into
+# the normal book by ALLOW_FAMILY_SUFFIXES): 30 Carbon Arc credit-card
+# events x 9 strikes each, all one monthly print apart on the same date —
+# correlated the way the gas ladders are, so the same 3-highest-ROI rule.
+# Measured before the cap: 27 CC events held 234 selected strikes.
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "KXAAAGAS:3,KXDIESEL:3,"
-                                                "KXTRUEV:3"))
+                                                "KXTRUEV:3,*CC:3"))
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
 EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
@@ -1265,8 +1278,11 @@ EVENT_SLOTS_TTL_SECS = _env_float("IMM_EVENT_SLOTS_TTL_D", 14) * 86400.0
 
 
 def event_top_n_for(series: str) -> int:
-    for _prefix, _n in EVENT_TOP_N:
-        if series.startswith(_prefix):
+    for _pat, _n in EVENT_TOP_N:
+        if _pat.startswith("*"):
+            if series.endswith(_pat[1:]):
+                return max(0, _n)
+        elif series.startswith(_pat):
             return max(0, _n)
     return 0
 
@@ -2215,7 +2231,18 @@ SCAN_SERIES_META_TTL_SECS = _env_float("IMM_SCAN_SERIES_META_TTL_D", 7) * 86400.
 # universe refresh (600s), which the 25ms throttle absorbs. The screens
 # that actually cost reads (series, candles, estimator books) have their
 # own budgets below and are unchanged.
-SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 1000)
+#
+# BULK 1000 -> 2000 (Jack 2026-09-10 pm: "bulk read the top 2k markets by
+# pool by day"). Measured 2026-09-11 01:45Z on the live feed: the scan's
+# pre-read list was 2,718 markets and rank 1000 sat at ~$24/day/market, so
+# KX30YMORTW-26SEP17 (13 strikes at $14.91/day, rank ~1588) and
+# KX10YRDIRHM-26SEP30H ($19.21, rank ~1297) were truncated here before any
+# admission screen ran — the same breadth flaw as the 9/6 KPI case, one
+# tier lower. Dropping the age screen to 6h the same evening changed
+# nothing for them for exactly this reason (the `age` reject key vanished
+# from the scan line: nothing young enough survived the cap). 2000 covers
+# rank ~1588 with headroom; cost 20 -> 40 bulk reads per refresh.
+SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 2000)
 SCAN_MAX_BOOKS = _env_int("IMM_SCAN_MAX_BOOKS", 120)
 SCAN_MAX_SERIES_FETCHES = _env_int("IMM_SCAN_MAX_SERIES_FETCHES", 30)
 SCAN_MAX_HISTORY_FETCHES = _env_int("IMM_SCAN_MAX_HISTORY_FETCHES", 40)
