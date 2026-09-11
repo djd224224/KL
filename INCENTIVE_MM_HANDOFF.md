@@ -1642,3 +1642,11 @@ KX30YMORTW-26SEP17 ($14.91, rank ~1588) never reached an admission screen
 and the 6h age change could not help it (the `age` reject key vanished
 from the scan line for exactly that reason). 2000 covers it with headroom;
 cost 20 -> 40 bulk reads per 600s refresh.
+
+## 2026-09-10 pm (later still) — event cap 100 -> 150 (Jack)
+
+Jack: "increase 100 event cap to 150". Launcher `$ProbeEnv`
+`IMM_MAX_MARKETS=150` (run_incentive_mm.ps1); applied with
+`restart_imm.ps1 -Task` (env lives in the running launcher, so the bot's
+own code-change restart cannot pick it up). Before: 100/100 events with the
+three CC events KXCFILCC/KXWENCC/KXWMTCC out as `not_ranked`.
