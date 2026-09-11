@@ -1510,3 +1510,56 @@ market that was quoted and later dropped without fills — both read as "not
 selected, no fills" — so an automatic repair would over-release and weaken
 the lifetime semantics. They release through the normal rule
 (`_live_event_slots`) once those markets go out of band.
+
+## 2026-09-10 — KXRAINWKND weekend rain allowlisted, out at the ticker date (Jack)
+
+Jack: "allowlist KXRAINWKND in IMM bot, but only quote until the cutoff e.g.
+KXRAINWKND-26SEP12 stops quoting on 9/12".
+
+WHAT THE SERIES IS. `KXRAINWKND-26SEP12-<CITY>`, "Where will it rain this
+weekend (Sep 12 - Sep 13)?": YES if total precipitation at the city's CLI
+station is > 0 on either day. 23 cities. Listed Thursday ~21:00Z, closes
+Monday 05:00Z, settles on The Weather Company (weather.com/kalshi), same
+source as the KXRAIN dailies. One `series_lip` program per market at $100
+(period 9/10 21:01Z -> 9/14), $2,300 on the event — about $29/day/market.
+The overrides task had been filing it as `review: KXRAINWKND (unclassified)`
+three times a day since 9/5; an allowed series is skipped by the classifier,
+so that line stops.
+
+THE CUTOFF. The ticker date is the weekend's FIRST day, so the bot's plain
+midnight-ET ticker rule (`trade_cutoff_utc`) already reads "out at 00:00 ET
+Saturday" — exactly the ask. The new `SERIES_OVERRIDES["KXRAINWKND"]` pins
+it: `cutoff_before_event_min=0` (env `IMM_RAINWKND_CUTOFF_BEFORE_MIN`; the
+dailies run 120 = 10pm the night before, deliberately NOT copied — Jack named
+the date), rain band 5-90c, global ladder. Both producers (selection and
+orphan-restore) go through `apply_series_cutoff_adjustments`, so a restored
+position gets the same instant. Kalshi's `occurrence_datetime` on these
+(9/15 05:00Z) sits AFTER `expected_expiration_time` (9/15 03:59Z), so it is
+never a candidate and cannot move the cutoff later; the `_screen` cutoff
+rule + exchange-side order expiration at the cutoff are the hard stop.
+Fresh entry stops `IMM_CUTOFF_SCREEN_BUFFER` (5 min) earlier, members quote
+to the instant. For 26SEP12 that is Fri 9/11 23:55 ET (fresh) / Sat 9/12
+00:00 ET (members) = 04:00Z; the pre-filter drops the event outright from
+Sun 04:00Z. ~26.5h of a ~82h program are quotable per weekend; the rest is
+forfeited by design.
+
+ALLOWANCE. In CODE: `_DEFAULT_WEATHER_SERIES = "KXRAINWKND"` (env
+`IMM_ALLOW_WEATHER_SERIES`), merged into `ALLOW_SERIES`. Exact series, no
+prefix — the daily KXRAIN stays where it was (the extra-allow file) and the
+KXRAIN<CITY>M monthlies stay behind the launcher blocklist. The open-scan
+ownership exclusion (`KXRAIN` prefix) still covers it, which is correct: it
+is enrolled, not scanned.
+
+WHAT READS ACROSS FROM THE DAILIES, AND WHAT DOES NOT.
+| Rule | Match | Weekend? |
+|---|---|---|
+| 7pm-01:59 ET size halving (`IMM_SERIES_HOUR_MULT` `KXRAIN:19-1:0.5`) | startswith | yes — Thu/Fri evenings run half size, same as a daily two days out |
+| quiet-hours 3-7am x2 (launcher `IMM_HOUR_SIZE_MULT`) | global | yes |
+| 5-90c band + top-in-band stand-aside | override | yes |
+| NWS fair gate / directional take / curated next-day tier | `== RAIN_FAIR_SERIES` (exact `KXRAIN`) | no — the weekend contract is P(rain on either day); the daily station fair does not price it |
+| 10pm-night-before early stop | override, per series | no (0 here) |
+
+Pinned by `test_rain_weekend_series_allowed` and
+`test_rain_weekend_quotes_to_ticker_date_midnight` (cutoff through both
+producers, screen at the instant, hour-mult inheritance, fair-gate
+non-inheritance). Deployed through the source-mtime self-restart.

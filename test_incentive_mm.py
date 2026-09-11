@@ -1069,6 +1069,17 @@ class TestAllowlist(unittest.TestCase):
         self.assertTrue(a("KXWCMENTION-26JUL11ARGSUI-VAR"))
         self.assertTrue(a("KXLOVEISLMENTION-26JUL10-LOYA"))
 
+    def test_rain_weekend_series_allowed(self):
+        # Jack 2026-09-10 "allowlist KXRAINWKND": weekend rain is allowed in
+        # CODE (the daily KXRAIN rides the extra-allow file instead), as an
+        # exact series — no prefix, so nothing else KXRAIN* comes along.
+        a = IncentiveMarketMaker._allowed
+        self.assertTrue(a("KXRAINWKND-26SEP12-NYC"))
+        self.assertIn("KXRAINWKND", imm.ALLOW_SERIES)
+        self.assertFalse(a("KXRAINWKNDX-26SEP12-NYC"))
+        self.assertFalse(any(p.startswith("KXRAIN")
+                             for p in imm.ALLOW_SERIES_PREFIXES))
+
     def test_crypto_series_exact(self):
         a = IncentiveMarketMaker._allowed
         self.assertTrue(a("KXCHINAUNBANBTC-26JUL08-30JAN01"))
@@ -3991,6 +4002,58 @@ class TestStickySelection(unittest.TestCase):
         # non-rain series unaffected
         self.assertIsNone((imm.series_override("KXLOVEISLMENTION")
                            or imm.SeriesOverride()).cutoff_before_event_min)
+
+    def test_rain_weekend_quotes_to_ticker_date_midnight(self):
+        # Jack 2026-09-10: "allowlist KXRAINWKND ... but only quote until the
+        # cutoff e.g. KXRAINWKND-26SEP12 stops quoting on 9/12". The ticker
+        # date is the weekend's FIRST day and the cutoff is 00:00 ET that
+        # day (the plain ticker rule) — NOT the dailies' 10pm-the-night-
+        # before, and nothing Kalshi stamps on the market may push it later.
+        ov = imm.series_override("KXRAINWKND")
+        self.assertEqual(ov.cutoff_before_event_min, 0)
+        self.assertEqual((imm.series_price_min("KXRAINWKND"),
+                          imm.series_price_max("KXRAINWKND")), (5, 90))
+        self.assertIsNone(ov.cutoff_from_close_min)
+        self.assertIsNone(ov.levels)
+        # live 9/10 market shape: listed Thu, closes Mon 05:00Z; Kalshi's
+        # occurrence sits AFTER expiration, so it can never win the min()
+        close, exp, occ = (utc(2026, 9, 14, 5), utc(2026, 9, 15, 3, 59),
+                           utc(2026, 9, 15, 5))
+        midnight_sat = utc(2026, 9, 12, 4)              # 00:00 EDT Sep 12
+        raw = imm.trade_cutoff_utc("KXRAINWKND-26SEP12", occ, exp)
+        self.assertEqual(raw, midnight_sat)
+        cut = imm.apply_series_cutoff_adjustments(
+            "KXRAINWKND", "KXRAINWKND-26SEP12", raw, close_time=close)
+        self.assertEqual(cut, midnight_sat)
+        # the orphan-restore producer (no occurrence/close) lands the same
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINWKND", "KXRAINWKND-26SEP12",
+            imm.trade_cutoff_utc("KXRAINWKND-26SEP12", None, None)),
+            midnight_sat)
+        # a member quotes to the instant; fresh entry stops the buffer early
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        meta = imm.MarketMeta(
+            ticker="KXRAINWKND-26SEP12-NYC",
+            event_ticker="KXRAINWKND-26SEP12", series="KXRAINWKND",
+            dollars_per_day=29.0, program_end=close, target_size=1000,
+            discount_factor=0.5, cutoff=cut, close_time=close,
+            mid_cents=50.0, spread_cents=4)
+        self.assertNotEqual(bot._screen(
+            meta, midnight_sat - timedelta(minutes=1), member=True), "cutoff")
+        self.assertEqual(bot._screen(meta, midnight_sat, member=True), "cutoff")
+        self.assertEqual(bot._screen(
+            meta, midnight_sat - timedelta(minutes=4)), "cutoff")
+        # family rules by PREFIX read across: the KXRAIN 7pm ET halving
+        self.assertEqual(imm.hour_size_mult(
+            "KXRAINWKND", utc(2026, 9, 11, 23, 30)), 0.5)   # 7:30pm EDT
+        self.assertEqual(imm.hour_size_mult(
+            "KXRAINWKND", utc(2026, 9, 11, 16, 0)), 1.0)    # noon EDT
+        # exact-match daily-rain machinery does NOT read across
+        self.assertFalse(imm.curated_event(
+            "KXRAINWKND-26SEP12", "KXRAINWKND", utc(2026, 9, 11, 16)))
+        self.assertIsNone(imm.rain_fair_p("KXRAINWKND-26SEP12-NYC",
+                                          time.time()))
 
     def test_curated_tier_and_econ_runoff(self):
         # 2026-07-29 pm: (a) the rolling next-day rain event is CURATED —

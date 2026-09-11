@@ -728,6 +728,33 @@ for _s in os.environ.get(
             # respect cutoff_ts).
             cutoff_before_event_min=_env_int("IMM_RAIN_CUTOFF_BEFORE_MIN", 120))
 
+# WEEKEND rain (Jack 2026-09-10: "allowlist KXRAINWKND in IMM bot, but only
+# quote until the cutoff e.g. KXRAINWKND-26SEP12 stops quoting on 9/12").
+# KXRAINWKND-26SEP12-<CITY> = "any day within Sep 12 through Sep 13" at the
+# city's CLI station: listed Thursday, closes Monday 05:00Z, one $100
+# series_lip program per market (23 cities = $2,300 on the 9/10 event). The
+# ticker date is the weekend's FIRST day, so the plain midnight-ET ticker
+# rule already puts the bot out at 00:00 ET Saturday; this entry PINS that
+# reading — early-stop 0 minutes, NOT the dailies' 120 (Jack named the
+# date, not 10pm Friday; IMM_RAINWKND_CUTOFF_BEFORE_MIN moves it) — and
+# shares the rain band. Kalshi's occurrence_datetime on these sits AFTER
+# expected_expiration (9/15 05:00Z vs 03:59Z), so it never becomes a
+# trade_cutoff_utc candidate. Inherited by PREFIX, deliberately unchanged:
+# the KXRAIN 7pm-01:59 ET halving in IMM_SERIES_HOUR_MULT (startswith) and
+# the open-scan ownership exclusion. NOT inherited (exact match on
+# RAIN_FAIR_SERIES): the NWS fair gate, the directional take and the
+# curated next-day tier — the weekend contract is P(rain on either day),
+# which the daily station fair does not price. Allowance is in code
+# (_DEFAULT_WEATHER_SERIES), unlike the daily KXRAIN, which rides the
+# extra-allow file.
+for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
+            price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
+            cutoff_before_event_min=_env_int(
+                "IMM_RAINWKND_CUTOFF_BEFORE_MIN", 0))
+
 
 def series_pad_to_target(series: str) -> bool:
     # Live-event depth-gated series NEVER pad (Jack 2026-08-31): thin depth
@@ -1645,6 +1672,13 @@ _DEFAULT_ECON_SERIES = (
 # no_new'd while its screens passed). Entertainment reveals are not macro
 # prints; keep this list OUT of NO_NEW_SERIES.
 _DEFAULT_ENTERTAINMENT_SERIES = "KXRT"
+# Weather series allowed IN CODE (Jack 2026-09-10 "allowlist KXRAINWKND in
+# IMM bot, but only quote until the cutoff"): the weekend rain family — see
+# its SERIES_OVERRIDES entry beside the rain loop for the ticker-date
+# cutoff and band. Exact series, no prefix: nothing else KXRAIN* rides in.
+# (The daily KXRAIN is allowed through the extra-allow file, and the rain
+# monthlies sit behind the launcher blocklist — neither lives here.)
+_DEFAULT_WEATHER_SERIES = "KXRAINWKND"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -1808,6 +1842,8 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_RATES_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_ENTERTAINMENT_SERIES",
                                        _DEFAULT_ENTERTAINMENT_SERIES)
+                + "," + os.environ.get("IMM_ALLOW_WEATHER_SERIES",
+                                       _DEFAULT_WEATHER_SERIES)
                 ).split(",") if s) | FINECON_SERIES
 
 # The finecon sweep quotes AT MOST 10 markets at once, best-ROI first with
