@@ -46,12 +46,29 @@ one ever touched, settled-and-gone included, on the most trustworthy basis
 available per column:
   CREDITED  actual Kalshi money, all-time, from the recon ledger. Per EVENT
             and back to 2026-03-21, so this column is complete.
-  EST       the bot's own accrual estimator. NOTE accrued_est is a per-
-            market counter that is NEVER reset at a program-period boundary
-            (incentive_mm BotState.accrued_est, "ticker -> lifetime est"),
-            so EST is credited-plus-still-in-flight: KXAMZNCC-26OCT07 reads
-            est $8.70 against $3.79 already credited. CREDITED is therefore
-            a SUBSET of EST, not an addend — the tables never sum the two.
+  EST       the bot's own accrual estimator, over the markets it is
+            tracking RIGHT NOW. Two scopes, one stream: EST and CREDITED
+            measure the same earnings and NEITHER CONTAINS THE OTHER, so
+            the tables never sum them.
+              EST > CREDITED is the normal case — the accrual code never
+            resets at a period boundary, so a continuously-quoted market's
+            estimate is credited-plus-still-in-flight (KXAMZNCC-26OCT07:
+            est $8.70 against $3.79 credited).
+              EST < CREDITED happens two ways, both real on 2026-09-11.
+            (a) accrued_est is PRUNED with known_tickers, and
+            known_tickers &= (managed | positions) drops a market the
+            cycle it stops being quoted and is flat — so accrual is
+            DELETED and restarts from zero across program periods.
+            KXMONSTERPOS-26OCT03-T105 went "-> gone" on 9/07 and 9/08 and
+            only resumed quoting 9/11 02:23Z: its $0.44 is a fresh accrual
+            while its $1.05 credit was earned in the earlier stretch.
+            (b) credits are per EVENT and forever, while a row's EST sums
+            only the tickers still in its book. KXCBDECISIONNZ-26OCT27 was
+            credited twice ($4.61 + $6.31) but only -HOLD survives in state
+            (the one market still carrying inventory), so $4.61 has no EST
+            counterpart at all.
+              The estimator itself is not the problem: on the market that
+            was never pruned, est $6.33 vs credit $6.31.
   REALIZED  the bot's own per-market realized trading P&L, summed from the
             `realized` analytics sink's deltas. That sink only starts
             2026-09-06 (commit ffe4b48), so this column is floored at the
@@ -426,7 +443,9 @@ def html_table(rows) -> str:
 # Same twin-renderer discipline as the active tables above: one row builder,
 # a text renderer and an HTML renderer that must stay identical in shape.
 # Columns and their bases are the docstring's contract — CREDITED is actual
-# money and is a SUBSET of EST, so nothing here ever adds the two.
+# money, EST is the live accrual, and NEITHER contains the other (accrual is
+# deleted and restarts when a market goes unquoted-and-flat), so nothing here
+# ever adds the two into one figure.
 _CUM_COLS = ("EVENTS", "CREDITED$", "EST$", "REALIZED$", "MTM$", "NET$")
 
 
@@ -733,13 +752,18 @@ def build_report(now_utc):
     L.append("QUOTED = markets the tier is quoting now; HELD = markets it "
              "stopped quoting but still holds inventory in (or accrued on) "
              "- their P&L and accrual ARE in the row. "
-             "EARN EST = the bot's own accrual estimator, running since it "
-             "first quoted the market and NOT reset at a program-period end, "
-             "so it is credited-plus-still-in-flight. CREDITED = actual "
-             "Kalshi money on that event to date, all-time - a SUBSET of "
-             "EARN EST, never an addend. P&L = trading only (realized + "
-             "settlement + open-book MTM), same windowed attribution as the "
-             f"digest ({FILL_LOOKBACK_HOURS}h). NET = P&L + EARN EST.")
+             "EARN EST = the bot's accrual estimator over the markets it "
+             "is tracking NOW. CREDITED = actual Kalshi money on the event, "
+             "all-time, every market. Same earnings, different scope - "
+             "NEITHER CONTAINS THE OTHER, so never add them. EARN EST is "
+             "usually the larger (the accrual is not reset at a period end, "
+             "so it is credited-plus-in-flight), but it is DELETED and "
+             "restarts from zero whenever a market goes unquoted and flat, "
+             "and it cannot see markets that have left the book at all - "
+             "which is why some rows show CREDITED above EARN EST. P&L = "
+             "trading only (realized + settlement + open-book MTM), same "
+             f"windowed attribution as the digest ({FILL_LOOKBACK_HOURS}h). "
+             "NET = P&L + EARN EST, so on those rows NET understates.")
     L.append(f"In the CUMULATIVE table REALIZED is the bot's own per-market "
              f"realized trading P&L, which only starts {cum_since} (the "
              f"first analytics-sink day) - anything earlier is not in it. "
@@ -793,14 +817,19 @@ def build_report(now_utc):
                  '<code>imm_reward_recon.py --statement</code>; every CREDITED '
                  'figure above is a floor until then.</div>')
     h.append(f'<div style="color:#999;font-size:11px;margin-top:10px">'
-             f'EARN EST = the bot&rsquo;s own accrual estimator, running since '
-             f'it first quoted the market and NOT reset at a program-period '
-             f'end &mdash; so it is credited-plus-still-in-flight. CREDITED = '
-             f'actual Kalshi money on that event to date, all-time: a SUBSET '
-             f'of EARN EST, never an addend. P&amp;L = trading only (realized '
-             f'+ settlement + open-book MTM), same windowed attribution as '
-             f'the digest ({FILL_LOOKBACK_HOURS}h). NET = P&amp;L + EARN EST.'
-             f'</div>')
+             f'EARN EST = the bot&rsquo;s accrual estimator over the markets '
+             f'it is tracking NOW. CREDITED = actual Kalshi money on the '
+             f'event, all-time, every market. Same earnings, different scope '
+             f'&mdash; <b>neither contains the other, so never add them</b>. '
+             f'EARN EST is usually the larger (the accrual is not reset at a '
+             f'period end, so it is credited-plus-in-flight), but it is '
+             f'DELETED and restarts from zero whenever a market goes unquoted '
+             f'and flat, and it cannot see markets that have left the book at '
+             f'all &mdash; which is why some rows show CREDITED above EARN '
+             f'EST. P&amp;L = trading only (realized + settlement + open-book '
+             f'MTM), same windowed attribution as the digest '
+             f'({FILL_LOOKBACK_HOURS}h). NET = P&amp;L + EARN EST, so on those '
+             f'rows NET understates.</div>')
     h.append(f'<div style="color:#999;font-size:11px;margin-top:4px">'
              f'Cumulative REALIZED is the bot&rsquo;s own per-market realized '
              f'trading P&amp;L and only starts <b>{cum_since}</b> (the first '

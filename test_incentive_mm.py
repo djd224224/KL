@@ -7580,6 +7580,36 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertEqual(chtml.count("<tr"), 3)
         self.assertIn("21.83", chtml)
 
+    def test_est_and_credited_are_not_nested(self):
+        # Jack 2026-09-11 pm: "how can credited$ be more than earn est$ for
+        # certain markets?" Because accrued_est is pruned with
+        # known_tickers (`known_tickers &= managed | positions`), so a
+        # market that stops being quoted while flat has its accrual DELETED
+        # and restarts from zero next period; and because credits are per
+        # EVENT forever while a row's EST sums only tickers still in its
+        # book. Live on 2026-09-11: KXCBDECISIONNZ-26OCT27 est 6.33 vs
+        # credited 10.92, KXMONSTERPOS-26OCT03 est 1.63 vs credited 3.41.
+        # Neither quantity contains the other; the renderers must never sum
+        # them, and a CREDITED above EARN EST must render without complaint.
+        import send_opportunistic_imm as opp
+        rows = [{"event": "KXCBDECISIONNZ-26OCT27", "label": "RBNZ",
+                 "tier": "finecon", "mkts": 0, "held": 1, "earn": 6.33,
+                 "cred": 10.92, "pnl": 3.60, "net": 9.93, "pos": -40}]
+        t = opp.tier_totals(rows)
+        self.assertGreater(t["cred"], t["earn"])          # the whole point
+        self.assertAlmostEqual(t["net"], t["earn"] + t["pnl"])
+        L = opp.text_table(rows)
+        self.assertIn("10.92", L[1])
+        self.assertIn("6.33", L[1])
+        self.assertIn("10.92", L[-1])
+        html = opp.html_table(rows)
+        self.assertIn("10.92", html)
+        # and the same inversion in the cumulative table
+        cum = [{"tier": "FINECON", "events": 1, "cred": 10.92, "est": 6.33,
+                "realized": 0.0, "mtm": 3.60, "net": 9.93}]
+        self.assertIn("10.92", opp.cum_text_table(cum)[1])
+        self.assertIn("10.92", opp.cum_html_table(cum))
+
     def test_durable_history_folds_sinks_without_double_counting(self):
         # The cumulative table's one real hazard: the `realized` sink writes
         # DELTAS, so re-reading a day would inflate it. Only COMPLETE UTC

@@ -1744,14 +1744,14 @@ their bases:
             `sd.LEDGER_STALE_DAYS` — `reward_credits.csv` is a hand-run
             statement paste, so a $0.00 that really means "not pasted yet"
             must not read as "earned nothing".
-- EST       the bot's accrual estimator. **`accrued_est` is NEVER reset at
-            a program-period boundary** (`BotState.accrued_est`, "ticker ->
-            lifetime est"), so EST is credited-plus-still-in-flight:
-            KXAMZNCC-26OCT07 reads est $8.70 against $3.79 already
-            credited. CREDITED is a SUBSET of EST, never an addend — no
-            renderer sums the two, and NET stays EST + REALIZED + MTM so it
-            is the same basis as the active tables' NET. The old footnote
-            called EST "period-to-date", which was simply wrong.
+- EST       the bot's accrual estimator, over the markets it is tracking
+            RIGHT NOW. EST and CREDITED measure the same earnings at
+            different scopes and **NEITHER CONTAINS THE OTHER** — no
+            renderer sums them. NET stays EST + REALIZED + MTM, the same
+            basis as the active tables' NET. The old footnote called EST
+            "period-to-date", which was wrong; a first pass then called
+            CREDITED "a SUBSET of EST", which was also wrong — see the
+            2026-09-11 pm correction below.
 - REALIZED  per-market realized trading P&L summed from the `realized`
             sink's DELTAS. That sink starts 2026-09-06 (commit ffe4b48),
             and the footer states that floor rather than implying history
@@ -1792,3 +1792,36 @@ NOT CHANGED: quoting, selection, caps, the launcher, the schedule. The
 `python send_opportunistic_imm.py --dry` (a plain re-run is a no-op once
 the day's marker exists; `--test` resends for real).
 Pinned by six new cases in `TestOpportunisticEmail`.
+
+### Correction (2026-09-11 pm): EST does NOT contain CREDITED
+
+Jack, reading the test send: "how can credited$ be more than earn est$ for
+certain markets?" He is right and the first footnote was wrong. Two live
+counterexamples:
+
+- **KXCBDECISIONNZ-26OCT27** — credited twice ($4.61 + $6.31 = $10.92) but
+  EST $6.33. Credits are per EVENT and forever; a row's EST sums only the
+  tickers still in its book, and only `-HOLD` survives in state (the one
+  market still carrying inventory, -40). The other market's $4.61 has no EST
+  counterpart at all.
+- **KXMONSTERPOS-26OCT03** — credited $3.41 across three markets, EST $1.63
+  across those same three. `accrued_est` is pruned with `known_tickers`, and
+  `known_tickers &= (managed | positions)` (incentive_mm.py ~8096) drops a
+  market the cycle it stops being quoted AND is flat. So accrual is DELETED
+  and restarts from zero across program periods. `selection_events` shows
+  T105 going `-> gone` on 9/07 01:02Z and 9/08 01:21Z and not quoting again
+  until 9/11 02:23Z: its $0.44 is a fresh accrual, its $1.05 credit was
+  earned in the earlier stretch.
+
+So the accrual CODE never resets at a period boundary (that part was right),
+but the known_tickers PRUNE deletes the counter outright, which in practice
+resets it whenever a market goes unquoted-and-flat between periods. The
+estimator itself is fine: on the one market that was never pruned,
+est $6.33 vs credit $6.31.
+
+The rule is therefore: EST and CREDITED are two scopes on one stream,
+neither contains the other, and they must never be summed. EST > CREDITED is
+the normal case (the current period has not paid). EST < CREDITED means
+accrual was deleted, or the credited market has left the book. NET stays on
+the EST basis, so it UNDERSTATES on those rows, and the footer says so.
+Pinned by `test_est_and_credited_are_not_nested`.
