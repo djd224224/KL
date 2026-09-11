@@ -33,8 +33,10 @@ then the CUMULATIVE table (Jack 2026-09-11: "make sure it shows not just
 active, but also cumulative") — see below.
 
 One row per currently-quoted opportunistic EVENT:
-  EARN EST   the bot's period-to-date accrued reward estimate (what we
-             expect Kalshi to credit at the program's period end)
+  EARN EST   the bot's accrued reward estimate over the markets it is
+             tracking NOW (NOT period-to-date: see the EST note below —
+             the accrual is not reset at a period end, but it IS deleted
+             when a market goes unquoted and flat)
   P&L        trading P&L on the event's markets (realized + settlement +
              open-book MTM) over the digest's attribution window — the cost
              of holding the inventory that earns the reward
@@ -296,10 +298,20 @@ def durable_history(today_utc: str) -> dict:
     """{"scan_events", "realized", "first_day"} — the opportunistic book's
     history, folded out of the bot's analytics sinks.
 
-    scan_events is a SET of event tickers the open-scan tier ever admitted
-    (`selection_events` sink, is_scan flag). A set folds idempotently, so a
-    partially written day can be re-read safely; it is only marked folded
-    once the UTC day is complete.
+    scan_events is a SET of event tickers the open-scan tier ever QUOTED.
+    The membership test is `is_scan AND decision == "selected"`, which is
+    exactly how the bot itself forms scan_members
+    (`new_scan = {t for t, m in selected.items() if m.scan}`). The is_scan
+    flag ALONE is not membership — the sink logs every decision CHANGE, and
+    is_scan rides on the candidate meta, so a market the scan merely looked
+    at and rejected carries it too. Measured 2026-09-11: 136 events carried
+    is_scan, only 39 were ever selected, and all $118.40 of ledger credit on
+    the other 97 belongs to markets the bot never quoted through this tier —
+    $84.74 of it on `manual` stand-asides, i.e. Jack's own orders. Attributing
+    those to the scan tier is the inverse of the "IMM own fills are not
+    manual" mistake and inflated the lifetime footer 4.8x.
+    A set folds idempotently, so a partially written day can be re-read
+    safely; it is only marked folded once the UTC day is complete.
 
     realized is event -> cumulative realized trading dollars, summed from the
     `realized` sink's DELTAS. Deltas are NOT idempotent — re-reading today's
@@ -319,13 +331,18 @@ def durable_history(today_utc: str) -> dict:
         try:
             with open(path, encoding="utf-8") as f:
                 for line in f:
-                    # substring pre-filter: the sink writes one long line per
-                    # decision change and only a few carry the scan flag
-                    if '"is_scan": true' not in line:
+                    # substring pre-filter on BOTH halves of the membership
+                    # test: the sink writes one long line per decision change
+                    # and most carry a reject reason, not "selected"
+                    if ('"is_scan": true' not in line
+                            or '"decision": "selected"' not in line):
                         continue
                     try:
                         rec = json.loads(line)
                     except ValueError:
+                        continue
+                    if (rec.get("decision") != "selected"
+                            or not rec.get("is_scan")):
                         continue
                     ev = rec.get("event_ticker")
                     if ev:
@@ -339,7 +356,11 @@ def durable_history(today_utc: str) -> dict:
         complete = day < today_utc
         if complete and day in r["folded_realized"]:
             continue
-        into = r["realized"] if complete else live
+        # Accumulate into a PER-DAY dict and merge only on a clean read. A
+        # part-read that raised (locked file, disk) used to leave its partial
+        # deltas in the cache with the day still unfolded, so the next run
+        # folded the whole day again on top — a permanent, silent overstate.
+        day_sum: dict = {}
         try:
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -352,10 +373,14 @@ def durable_history(today_utc: str) -> dict:
                         continue
                     ev = rec.get("event_ticker")
                     if ev:
-                        into[str(ev)] = (into.get(str(ev), 0.0)
-                                         + _f(rec.get("realized_delta_dollars")))
+                        day_sum[str(ev)] = (
+                            day_sum.get(str(ev), 0.0)
+                            + _f(rec.get("realized_delta_dollars")))
         except OSError:
             continue
+        into = r["realized"] if complete else live
+        for ev, v in day_sum.items():
+            into[ev] = into.get(ev, 0.0) + v
         if complete:
             r["folded_realized"].add(day)
     _write_roster(r)
@@ -386,18 +411,21 @@ def text_table(rows) -> list:
     accrued reward on (Jack 2026-09-07). Their P&L and accrual are in the
     row; they just consume no slot."""
     t = tier_totals(rows)
-    L = [f"{'EVENT':<24}{'WHAT IT IS':<32}{'QUOT':>5}{'HELD':>5}"
+    # EVENT holds 26 so a <SERIES>-<YYMMMDD> label keeps its day-of-month:
+    # at 23 the two events of a weekly series printed identically
+    # (BABELMANDEBWEEKLY-26SEP13 and -26SEP20 both truncated to ...26SEP).
+    L = [f"{'EVENT':<27}{'WHAT IT IS':<29}{'QUOT':>5}{'HELD':>5}"
          f"{'EARN EST$':>11}{'CRED$':>9}{'P&L$':>10}{'NET$':>10}"]
     for r in rows:
         # blank, not 0.00 — an event with no credit yet reads as "nothing has
         # landed", which is the fact; the HTML twin blanks it the same way
         cred = r.get("cred") or 0.0
         cred_s = f"{cred:,.2f}" if cred else ""
-        L.append(f"{_short_event(r['event'])[:23]:<24}{r['label'][:31]:<32}"
+        L.append(f"{_short_event(r['event'])[:26]:<27}{r['label'][:28]:<29}"
                  f"{r['mkts']:>5}{(r.get('held') or ''):>5}"
                  f"{r['earn']:>11.2f}{cred_s:>9}"
                  f"{r['pnl']:>+10.2f}{r['net']:>+10.2f}")
-    L.append(f"{'TOTAL':<24}{'':<32}{t['mkts']:>5}{(t['held'] or ''):>5}"
+    L.append(f"{'TOTAL':<27}{'':<29}{t['mkts']:>5}{(t['held'] or ''):>5}"
              f"{t['earn']:>11.2f}{t['cred']:>9,.2f}{t['pnl']:>+10.2f}"
              f"{t['net']:>+10.2f}")
     return L
@@ -716,9 +744,12 @@ def build_report(now_utc):
          fam_rows),
     ]
 
-    subject = (f"Opportunistic IMM {today_et} — est ${tot_earn:,.0f} in "
-               f"flight, net ${tot_net:+,.0f}, ${cred_life:,.0f} credited "
-               f"to date")
+    # Deliberately does NOT put the estimate and the credited figure side by
+    # side as if they were addends — they are two scopes on one stream (see
+    # the footer). The estimate and the net it feeds lead; credited money is
+    # its own clause.
+    subject = (f"Opportunistic IMM {today_et} — est ${tot_earn:,.0f} accrued, "
+               f"net ${tot_net:+,.0f} (${cred_life:,.0f} paid to date)")
 
     # ---- plain text ---------------------------------------------------------
     L = [f"Opportunistic IMM — {today_et}", ""]
@@ -738,8 +769,9 @@ def build_report(now_utc):
             L.append(f"No {name.lower()} events quoted right now.")
         L.append("")
     if cum_rows:
-        L.append("CUMULATIVE — every event each tier has ever touched, "
-                 "settled and gone included")
+        L.append("CUMULATIVE — CREDITED and REALIZED cover every event each "
+                 "tier has ever touched, settled and gone included; EST and "
+                 "MTM can only see the live book")
         L.extend(cum_text_table(cum_rows))
         L.append("")
     L.append(f"Kalshi-credited on opportunistic events to date: "
@@ -803,8 +835,9 @@ def build_report(now_utc):
     if cum_rows:
         h.append('<div style="font-size:15px;font-weight:600;margin:18px 0 2px">'
                  'Cumulative <span style="color:#888;font-weight:400">&mdash; '
-                 'every event each tier has ever touched, settled and gone '
-                 'included</span></div>')
+                 'CREDITED and REALIZED cover every event each tier has ever '
+                 'touched, settled and gone included; EST and MTM can only '
+                 'see the live book</span></div>')
         h.append(cum_html_table(cum_rows))
     h.append(f'<div style="color:#555;font-size:13px;margin-top:12px">'
              f'Kalshi-credited on opportunistic events to date: '
@@ -816,7 +849,11 @@ def build_report(now_utc):
                  '<b>LEDGER STALE</b> &mdash; paste a fresh statement through '
                  '<code>imm_reward_recon.py --statement</code>; every CREDITED '
                  'figure above is a floor until then.</div>')
-    h.append(f'<div style="color:#999;font-size:11px;margin-top:10px">'
+    h.append('<div style="color:#999;font-size:11px;margin-top:10px">'
+             'QUOTED = markets the tier is quoting now; HELD = markets it '
+             'stopped quoting but still holds inventory in (or accrued on) '
+             '&mdash; their P&amp;L and accrual ARE in the row.</div>')
+    h.append(f'<div style="color:#999;font-size:11px;margin-top:4px">'
              f'EARN EST = the bot&rsquo;s accrual estimator over the markets '
              f'it is tracking NOW. CREDITED = actual Kalshi money on the '
              f'event, all-time, every market. Same earnings, different scope '

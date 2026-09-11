@@ -7637,13 +7637,31 @@ class TestOpportunisticEmail(unittest.TestCase):
             sink("realized", "2026-09-10",
                  [{"event_ticker": "KXA-26OCT07",
                    "realized_delta_dollars": 0.5}])
+            # is_scan ALONE is not membership: the sink logs every decision
+            # CHANGE and is_scan rides on the candidate meta, so a market the
+            # scan merely looked at and REJECTED carries it too. Only
+            # decision == "selected" means the tier quoted it -- that is how
+            # the bot itself forms scan_members. Shipping the loose test
+            # attributed $118.40 of credits to the scan tier that it never
+            # earned, $84.74 of it on `manual` stand-asides (Jack's own
+            # orders) -- a 4.8x overstatement of the lifetime footer.
             sink("selection_events", "2026-09-09",
-                 [{"event_ticker": "KXS-26OCT07", "is_scan": True},
-                  {"event_ticker": "KXNOT-26OCT07", "is_scan": False}])
+                 [{"event_ticker": "KXS-26OCT07", "is_scan": True,
+                   "decision": "selected"},
+                  {"event_ticker": "KXREJECT-26OCT07", "is_scan": True,
+                   "decision": "scan_top_n"},
+                  {"event_ticker": "KXMANUAL-26OCT07", "is_scan": True,
+                   "decision": "manual"},
+                  {"event_ticker": "KXFLOOR-26OCT07", "is_scan": True,
+                   "decision": "payout_floor"},
+                  {"event_ticker": "KXNOT-26OCT07", "is_scan": False,
+                   "decision": "selected"}])
             today = "2026-09-10"              # so 09-10 is the partial day
             first = opp.durable_history(today)
             self.assertAlmostEqual(first["realized"]["KXA-26OCT07"], -2.5)
             self.assertAlmostEqual(first["realized"]["KXB-26OCT07"], 5.0)
+            # ONLY the selected scan candidate; not the three rejects, and
+            # not the selected NON-scan market (that is the normal book)
             self.assertEqual(first["scan_events"], {"KXS-26OCT07"})
             self.assertEqual(first["first_day"], "2026-09-09")
             # re-run: identical, because the partial day is never cached
