@@ -990,7 +990,7 @@ first (`_scan_admission`):
 |---|---|---|
 | STRUCTURE | day-dated event ticker — **or, since 2026-09-06, a month-named one on a Fiscal.ai-settled series** (`KXCCL-26SEPALBD`; see the dated note below: the first of that month becomes the cutoff); numeric-threshold strike (`T286`, `B90`, `4.1400`, or Kalshi `strike_type` greater/less/between) | the midnight-ET rule is the only release guard an unknown series has (KXUE/KXISMPMI had no day and would quote THROUGH their prints); for the KPI class the report MONTH is that guard; a "will X happen" binary's one jump IS the resolution (strategy §1) |
 | FAMILY | **no category ban since 2026-09-06** (the first cut banned `Sports, Crypto, Elections, Politics, Climate and Weather, Culture, Entertainment` wholesale — see the dated note below; `IMM_SCAN_EXCLUDE_CATEGORIES` is empty by default and only a deliberate re-ban names a category); no LIVE settlement source (GET /series, cached 7d: pyth/coinbase/**cfbenchmarks**/espn/nba.com/ercot/weather.gov/**weather.com**/... keywords — a live price index, a live scoreboard, a live weather feed); prefix exclusions are OWNERSHIP and feeds, not categories: other repo bots (KXLOWT, KXRAIN, KXHIGH, KXTEMP, KXAVGT, KXAQI), the crypto fleets' families by asset (KX<ASSET>D / MAX-MINW / MAX-MINMON / MAX-MINY / Y), FX/index/commodity/grid feeds, the 9/2 scan's rejects (KXUE, KXISMPMI, KXSNOWCRABCATCH, KXSOCKEYERUN, KXTECHLAYOFF, ...) | realtime risk is a property of the settlement SOURCE, not the category: a market everyone else can price off a live feed is one we are always last to reprice; two of our bots must never anchor to each other |
-| ACTIVITY | market `volume_24h` <= 80, EVENT MEAN `volume_24h` per market <= 100 (averaged over every bulk-read sibling, pinned strikes included; a SUM against 250, then a mean against 60, both on 2026-09-06), listed >= 24h | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
+| ACTIVITY | market `volume_24h` <= 80, EVENT MEAN `volume_24h` per market <= 100 (averaged over every bulk-read sibling, pinned strikes included; a SUM against 250, then a mean against 60, both on 2026-09-06), listed >= 6h (24h until 2026-09-10) | finecon members read ~0 volume at enrollment; informed flow on one strike shows up on its siblings; the history read needs data |
 | HISTORY | 72h of hourly candlesticks: no bar-to-bar move >= 10c, traded volume <= 1000 (cached 6h). Bar-count and mid-range caps OFF since 2026-09-07 — every cap is independently disabled at <= 0, and all four stats stay MEASURED either way | a single hour-to-hour STEP is the moment stale quotes get run over; slow drift and a thin quote history are not that |
 
 Read budgets per refresh (the universe is thousands of markets): bulk
@@ -1313,7 +1313,7 @@ event pool) first, or it will measure nothing.
 `EVENT_TOP_N` 3 · `DAILY_OPENINGS` 5 · `LEVELS` unset = global ladder ·
 `MAX_POSITION` unset = global cap · `REF_MULT_CAP` 0 = uncapped ·
 `HOUR_MULT` 1 · `REQUIRE_DATED` 1 · `REQUIRE_NUMERIC` 1 ·
-`MIN_AGE_H` 24 · `MAX_VOLUME_24H` 80 · `MAX_EVENT_AVG_VOLUME_24H` 100
+`MIN_AGE_H` 6 (24 until 2026-09-10) · `MAX_VOLUME_24H` 80 · `MAX_EVENT_AVG_VOLUME_24H` 100
 (MEAN per market on the event since 2026-09-06; the old
 `MAX_EVENT_VOLUME_24H` sum-against-250 knob is GONE, not renamed) ·
 `HISTORY_H` 72 · `MIN_HISTORY_BARS` 0 = off · `MAX_RANGE` 0 = off ·
@@ -1563,3 +1563,60 @@ Pinned by `test_rain_weekend_series_allowed` and
 `test_rain_weekend_quotes_to_ticker_date_midnight` (cutoff through both
 producers, screen at the instant, hour-mult inheritance, fair-gate
 non-inheritance). Deployed through the source-mtime self-restart.
+
+## 2026-09-10 pm — *CC Carbon Arc family into the NORMAL book; scan age 24h -> 6h (Jack)
+
+Jack, on KX30YMORTW-26SEP17 / KX10YRDIRHM-26SEP30H / KXURBNCC-26OCT07
+not being quoted: "drop the open scan 24h requirement to 6h. allowlist the
+CC Carbon Arc family -- KXURBNCC, KXDGCC, KXCOSTCC, etc. and they should be
+picked up by the normal IMM right not the opportunistic".
+
+WHY THE THREE WERE OUT (measured 2026-09-11 ~01:45Z):
+- KX30YMORTW-26SEP17: not allowlisted, so open-scan only; its markets
+  opened 22:40Z 9/10 and the scan wanted 24h of listing age. The tier was
+  also at its 35/35 ceiling. Last week's SEP10 event had no program at all.
+- KX10YRDIRHM-26SEP30H ("10Y how high monthly"): the treasury enrollment
+  is ten exact KXUST{2,5,7,10,30}A{D,M} names, no prefix; the scan rejects
+  it on activity every cycle (event mean 1,604 contracts/market/24h vs the
+  100 cap; 10 of 21 strikes pinned 96-99c because the yield already
+  touched them). A one-touch max on a live yield -- left out by design.
+- KXURBNCC-26OCT07: KXURBN (Fiscal.ai KPI) is in _FINECON_KPI_SERIES;
+  KXURBNCC is a different Carbon Arc series and allowlisting is exact.
+  Its first program ran 8/28-8/30 (filed "unclassified" before the 9/5
+  self-extend rule existed); the second lit 9/10 22:02Z, after the 4:45pm
+  overrides run. The finecon tier was also at its 35/35 ceiling.
+
+CHANGE 1 — ALLOW_FAMILY_SUFFIXES ("CC"; env IMM_ALLOW_FAMILY_SUFFIXES):
+a name-pattern allowlist for the NORMAL book, deliberately separate from
+ALLOW_SERIES_SUFFIXES (that tuple is the MENTION family and three call
+sites read it as mention semantics: mention_cutoff_is_clear, the
+no_event_window stand-down, the never-pre-drop-on-ticker-date rule).
+Live feed 2026-09-10 pm: all 30 paying *CC series are "<Company> Credit
+Card Spend", Financials, Carbon Arc, 9 strikes each on 26OCT07 -- the
+suffix IS the family, no false positive in the feed. Guards: a new
+"family_suffix" kind in FAMILY_OVERRIDE_PARENTS clones the KXAMZNCC
+archetype (safe-join, no fresh-candidate rate bar -- the FT/APP consumer-
+observation set) WITHOUT the exact/extra-allow membership the *FT/*APP
+suffix entries require, because here the suffix is the membership.
+KXAMZNCC left _DEFAULT_FINECON_SERIES and got its own SERIES_OVERRIDES
+entry; KXSBUXCC was removed from finecon_extra_series.json (hot reload)
+after the new code was live, so both keep quoting as sticky normal-book
+selections. Being `_allowed`, every *CC series is now "allowed" to
+scan_universe_reason and never scanned; the overrides task's Carbon Arc
+self-extend skips them before classification (`_allowed` first), so the
+finecon file cannot re-absorb them. Blocklist still wins in `_allowed`.
+
+Effect on the normal book: up to 30 new events x 9 strikes (~$7/market/
+day, ~$1.9k/day of pool) compete under the usual screens (5-90c band,
+extreme_mid, $1/market payout floor) and the IMM_MAX_MARKETS=100 event
+cap, which was at 73 events -- expect it to bind.
+
+CHANGE 2 — SCAN_MIN_AGE_HOURS default 24 -> 6 (IMM_SCAN_MIN_AGE_H).
+6h still keeps same-day price structures out and leaves the 72h history
+read something to see. Comments updated where they said 24h.
+
+Tests: test_cc_family_suffix_allows_into_normal_book; the finecon
+membership test drops KXAMZNCC; test_finecon_daily_openings' synthetic
+group members were KXAMZNCC tickers and are KXVENEZCRUDE now (same
+shape, still a base member); the scan-admission test pins the 6h default
+and admits a 7h-old listing.

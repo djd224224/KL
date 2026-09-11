@@ -454,6 +454,10 @@ def enroll_new_series(client, dry: bool):
             review.append((s, why, sample))
     # Carbon Arc self-extension (Jack 2026-09-05 "yes self-extend carbon
     # arc"): a REVIEW series whose Kalshi settlement source is Carbon Arc
+    # (NOT the *CC credit-card-spend family: since 2026-09-10 the bot
+    # allows those into the NORMAL book by name pattern --
+    # incentive_mm.ALLOW_FAMILY_SUFFIXES -- so `_allowed` above skips them
+    # before they can reach this loop and the finecon file.)
     # is a dated-observation vendor print — the finecon class — so it
     # joins the finecon group file (hot-reloaded by the bot into
     # FINECON_SERIES: group walk, caps, guards, allowance) instead of

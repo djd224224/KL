@@ -2444,10 +2444,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                       "KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM",
                       "KXBBY", "KXWSM", "KXOKTA", "KXTXOIL", "KXVAPORTTEU",
                       # 2026-09-05: Carbon Arc dated-observation family —
-                      # a sample of the 11 ad-spend series + the two
-                      # post-scan listings Jack asked after
+                      # a sample of the 11 ad-spend series + the post-scan
+                      # listing Jack asked after (KXAMZNCC moved to the *CC
+                      # family in the normal book 2026-09-10, tested below)
                       "KXFOOTWEARADS", "KXELECTRONICSADS", "KXCASINOADS",
-                      "KXDRPEPPERPOS", "KXAMZNCC"):
+                      "KXDRPEPPERPOS"):
                 self.assertIn(s, imm.FINECON_SERIES, s)
                 self.assertTrue(
                     IncentiveMarketMaker._allowed(f"{s}-26OCT13-T1"), s)
@@ -2581,8 +2582,8 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         members = [m(f"KXSPRLVL-26SEP{9 + (i // 3):02d}-T{i % 3}", 1.0)
                    for i in range(_n)]
         mem_ids = {x.ticker for x in members}
-        new = [m("KXAMZNCC-26OCT07-T100", 9.0),
-               m("KXAMZNCC-26OCT07-T102", 8.0),
+        new = [m("KXVENEZCRUDE-26OCT07-T100", 9.0),
+               m("KXVENEZCRUDE-26OCT07-T102", 8.0),
                m("KXDRPEPPERPOS-26OCT03-T95", 7.0),
                m("KXBRAZILGDP-26DEC02-T2.2", 6.0)]
         # no openings: cap full -> every newcomer cut (yesterday's rule)
@@ -2593,23 +2594,23 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                                     extra_openings=2)
         self.assertEqual(cut, {"KXDRPEPPERPOS-26OCT03-T95",
                                "KXBRAZILGDP-26DEC02-T2.2"})
-        # openings never override the 3-per-event bound: a 3rd AMZNCC
+        # openings never override the 3-per-event bound: a 3rd VENEZCRUDE
         # strike is skipped, the opening flows to the next event instead
-        new3 = new + [m("KXAMZNCC-26OCT07-T104", 8.5)]
+        new3 = new + [m("KXVENEZCRUDE-26OCT07-T104", 8.5)]
         cut = imm.finecon_group_cut(members + new3, set(), members=mem_ids,
                                     extra_openings=3)
         kept = {x.ticker for x in new3} - cut
-        self.assertEqual(kept, {"KXAMZNCC-26OCT07-T100",
-                                "KXAMZNCC-26OCT07-T102",
-                                "KXAMZNCC-26OCT07-T104"})
-        # 3 AMZNCC strikes IS the per-event cap — legal. A 4th AMZNCC
+        self.assertEqual(kept, {"KXVENEZCRUDE-26OCT07-T100",
+                                "KXVENEZCRUDE-26OCT07-T102",
+                                "KXVENEZCRUDE-26OCT07-T104"})
+        # 3 VENEZCRUDE strikes IS the per-event cap — legal. A 4th VENEZCRUDE
         # (the event's weakest, T102 at 8.0 vs T106's 8.2) is refused
         # even with openings to spare; the opening flows on to DRPEPPER.
-        new4 = new3 + [m("KXAMZNCC-26OCT07-T106", 8.2)]
+        new4 = new3 + [m("KXVENEZCRUDE-26OCT07-T106", 8.2)]
         cut = imm.finecon_group_cut(members + new4, set(), members=mem_ids,
                                     extra_openings=5)
-        self.assertIn("KXAMZNCC-26OCT07-T102", cut)
-        self.assertNotIn("KXAMZNCC-26OCT07-T106", cut)
+        self.assertIn("KXVENEZCRUDE-26OCT07-T102", cut)
+        self.assertNotIn("KXVENEZCRUDE-26OCT07-T106", cut)
         self.assertNotIn("KXDRPEPPERPOS-26OCT03-T95", cut)
         # the openings-burn accounting: only over-cap admissions count.
         # Relative to FINECON_TOP_N so a cap change (15 -> 20 on
@@ -2772,6 +2773,48 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             imm.EXTRA_ALLOW_SERIES.discard("KXZZFT")
             imm.SERIES_OVERRIDES.pop("KXZZFT", None)
             imm.SERIES_OVERRIDES.pop("KXNFLDRAFT", None)
+
+    def test_cc_family_suffix_allows_into_normal_book(self):
+        # Jack 2026-09-10: "allowlist the CC Carbon Arc family -- KXURBNCC,
+        # KXDGCC, KXCOSTCC, etc. and they should be picked up by the normal
+        # IMM ... not the opportunistic". Membership is the *CC name
+        # pattern (ALLOW_FAMILY_SUFFIXES), not an exact list and not the
+        # finecon group.
+        saved_only = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+        try:
+            self.assertEqual(imm.ALLOW_FAMILY_SUFFIXES, ("CC",))
+            for s in ("KXURBNCC", "KXDGCC", "KXCOSTCC", "KXAMZNCC",
+                      "KXSBUXCC", "KXNEVERSEENCC"):
+                self.assertTrue(
+                    IncentiveMarketMaker._allowed(f"{s}-26OCT07-T100"), s)
+                # allowed => the open scan never touches it
+                self.assertEqual(
+                    imm.scan_universe_reason(f"{s}-26OCT07-T100"),
+                    "allowed", s)
+                # ...and it is NOT walked/capped as finecon
+                self.assertNotIn(s, imm.FINECON_SERIES, s)
+                self.assertNotIn(s, imm._FINECON_BASE, s)
+            # the MENTION suffix tuple is untouched: *CC carries no mention
+            # semantics (no no_event_window stand-down, no pre-drop waiver)
+            self.assertEqual(imm.ALLOW_SERIES_SUFFIXES, ("MENTION",))
+            self.assertTrue(imm.mention_cutoff_is_clear(
+                "KXURBNCC", None, None, None))
+            # a never-seen sibling clones the KXAMZNCC archetype on first
+            # sight WITHOUT exact/extra-allow membership (unlike *FT/*APP)
+            fake = "KXNEVERSEENCC"
+            self.assertNotIn(fake, imm.SERIES_OVERRIDES)
+            imm.ensure_family_override(fake)
+            self.assertIn(fake, imm.SERIES_OVERRIDES)
+            self.assertEqual(imm.SERIES_OVERRIDES[fake],
+                             imm.SERIES_OVERRIDES["KXAMZNCC"])
+            self.assertTrue(imm.series_safe_join(fake))
+            self.assertEqual(imm.series_min_est_rate(fake), 0.0)
+            # blocklist still wins over the family rule
+            self.assertFalse(IncentiveMarketMaker._allowed("KXHIGHCC-26OCT07-T1"))
+        finally:
+            imm.ALLOWLIST_ONLY = saved_only
+            imm.SERIES_OVERRIDES.pop("KXNEVERSEENCC", None)
 
     def test_extra_allow_file_reload_and_safety(self):
         old_path = imm.EXTRA_ALLOW_FILE
@@ -8314,6 +8357,11 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(bot._scan_admission(
             self._meta(open_time=now - timedelta(hours=2)), m, {}, now,
             budget), "age")
+        # Jack 2026-09-10: "drop the open scan 24h requirement to 6h"
+        self.assertEqual(imm.SCAN_MIN_AGE_HOURS, 6)
+        self.assertIsNone(bot._scan_admission(
+            self._meta(open_time=now - timedelta(hours=7)), m, {}, now,
+            budget))
         self.assertEqual(bot._scan_admission(
             self._meta(volume_24h=imm.SCAN_MAX_VOLUME_24H + 1), m, {}, now,
             budget), "volume")
