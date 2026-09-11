@@ -1080,6 +1080,33 @@ class TestAllowlist(unittest.TestCase):
         self.assertFalse(any(p.startswith("KXRAIN")
                              for p in imm.ALLOW_SERIES_PREFIXES))
 
+    def test_truev_sunset_winds_down_one_event(self):
+        # Jack 2026-09-11: "quote KXTRUEV-26SEP11 until completion, but
+        # block KXTRUEV going forward". The series prefix is blocklisted;
+        # the named event is the single exemption and keeps every normal
+        # rule (top-3 cap, close-60 cutoff, 5pm halving) to its own end.
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        self.assertIn("KXTRUEV-26SEP11", imm.BLOCKLIST_WIND_DOWN_EVENTS)
+        for t in ("KXTRUEV-26SEP11-T1213.73", "KXTRUEV-26SEP11-T1293.73"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+        self.assertFalse(b("KXTRUEV-26SEP11"))          # event-ticker form
+        # yesterday's event (positions ride, no orders) and every later one
+        for t in ("KXTRUEV-26SEP10-T1231.36", "KXTRUEV-26SEP12-T1200.00",
+                  "KXTRUEV-26OCT01-T1300.00", "KXTRUEV-X"):
+            self.assertTrue(b(t), t)
+            self.assertFalse(a(t), t)
+        # the exemption never reaches a different blocklisted family
+        self.assertTrue(b("KXHIGH-26SEP11-NYC"))
+        # the daily classifier files the series as blocklisted, not review
+        import imm_earnings_overrides as ovmod
+        self.assertEqual(ovmod.classify_series(
+            "KXTRUEV", "KXTRUEV-26SEP12-T1200.00")[0], "skip")
+        # everything the wind-down event still relies on is intact
+        self.assertEqual(imm.event_top_n_for("KXTRUEV"), 3)
+        self.assertEqual(
+            imm.series_override("KXTRUEV").cutoff_from_close_min, 60)
+
     def test_crypto_series_exact(self):
         a = IncentiveMarketMaker._allowed
         self.assertTrue(a("KXCHINAUNBANBTC-26JUL08-30JAN01"))
@@ -1127,13 +1154,16 @@ class TestAllowlist(unittest.TestCase):
             self.assertTrue(a(t), t)
         # Truflation's OTHER Kalshi index stays out — never enrolled
         self.assertFalse(a("KXTRUFAIDP-26AUG26-T50"))
-        # KXTRUEV was blocked 2026-08-25 (Jack) the morning after the 8/24
-        # enrollment saga, and UNBLOCKED 2026-09-07 ("unblock KXTRUEV but
-        # only quote the top 3 ROI markets") — so it is allowed again, but
-        # capped per event rather than free to quote its whole ladder.
+        # KXTRUEV: blocked 2026-08-25, UNBLOCKED 2026-09-07 capped at 3 per
+        # event, and SUNSET 2026-09-11 (Jack "quote KXTRUEV-26SEP11 until
+        # completion, but block KXTRUEV going forward"): the series is
+        # blocklisted again with the 26SEP11 event alone exempt to its own
+        # completion — see test_truev_sunset_winds_down_one_event.
         b = IncentiveMarketMaker._blocked
-        self.assertFalse(b("KXTRUEV-26AUG26-T1241.88"))
-        self.assertTrue(a("KXTRUEV-26AUG26-T1241.88"))
+        self.assertTrue(b("KXTRUEV-26AUG26-T1241.88"))
+        self.assertFalse(a("KXTRUEV-26AUG26-T1241.88"))
+        self.assertFalse(b("KXTRUEV-26SEP11-T1213.73"))
+        self.assertTrue(a("KXTRUEV-26SEP11-T1213.73"))
         self.assertEqual(imm.event_top_n_for("KXTRUEV"), 3)
         # the enrollment machinery is deliberately kept for re-enable: the
         # close-anchored cutoff override (the print-day-listing fix) stays
@@ -2202,14 +2232,18 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         for s in ("KXRAINNYC", "KXBKFT", "KXCLAUDEAPP", "KXUSGASCPI"):
             self.assertEqual(imm.event_top_n_for(s), 0, s)
         # KXTRUEV unblocked 2026-09-07 ("unblock KXTRUEV but only quote the
-        # top 3 ROI markets"): allowed again AND capped, and the prefix is
-        # exact-family so the unrelated KXTRUFAIDP stays uncapped/blocked.
+        # top 3 ROI markets") and SUNSET 2026-09-11: the cap is kept for the
+        # wind-down event (and any later un-block); past and future events
+        # are frozen by the blocklist entry; the prefix is exact-family so
+        # the unrelated KXTRUFAIDP stays uncapped/blocked.
         self.assertEqual(imm.event_top_n_for("KXTRUEV"), 3)
-        self.assertTrue(IncentiveMarketMaker._allowed(
+        self.assertFalse(IncentiveMarketMaker._allowed(
             "KXTRUEV-26SEP07-T1243.42"))
+        self.assertTrue(IncentiveMarketMaker._allowed(
+            "KXTRUEV-26SEP11-T1213.73"))
         self.assertEqual(imm.event_top_n_for("KXTRUFAIDP"), 0)
-        self.assertFalse(any(p == "KXTRUEV"
-                             for p in imm.SERIES_BLOCKLIST_PREFIXES))
+        self.assertTrue(any(p == "KXTRUEV"
+                            for p in imm.SERIES_BLOCKLIST_PREFIXES))
         # incumbency (1.15x) holds a member's slot on a near-tie: fresh 2.05
         # vs member 2.0 -> member ROI 0.2*1.15=0.23 beats 0.205.
         tie = [m("KXAAAGASDTX-26SEP03-3.60", 2.0),

@@ -1650,3 +1650,45 @@ Jack: "increase 100 event cap to 150". Launcher `$ProbeEnv`
 `restart_imm.ps1 -Task` (env lives in the running launcher, so the bot's
 own code-change restart cannot pick it up). Before: 100/100 events with the
 three CC events KXCFILCC/KXWENCC/KXWMTCC out as `not_ranked`.
+
+## 2026-09-11 — KXTRUEV sunset: 26SEP11 quotes to completion, series blocked going forward (Jack)
+
+Jack: "quote KXTRUEV-26SEP11 until completion, but block KXTRUEV going
+forward".
+
+STATE AT THE TIME (08:13 ET). KXTRUEV-26SEP11 was the only open KXTRUEV
+event: 15 strikes, $600 of programs to 9/12 03:59Z, 3 markets selected under
+the top-3 ROI cap (T1213.73 / T1223.73 / T1233.73), cutoff = close - 60 min =
+10:59pm ET tonight. Positions on the settled 26SEP10 strikes (55/60/60) ride
+to settlement as they would under any blocklist.
+
+MECHANISM. Two pieces, both in code (the launcher `IMM_BLOCKLIST` is not
+touched):
+
+1. `"KXTRUEV"` joins `SERIES_BLOCKLIST_PREFIXES`. Blocklist semantics as
+   always: no orders at all, not even reduce-only; positions ride; the
+   daily classifier files the series as `skip: blocklisted` rather than
+   review; the extra-allow loader refuses it.
+2. `BLOCKLIST_WIND_DOWN_EVENTS = {"KXTRUEV-26SEP11"}` (env
+   `IMM_BLOCKLIST_WIND_DOWN_EVENTS`): `_blocked()` — the single choke point
+   every freeze path already goes through (candidates, orphan-restore,
+   managed flush, open-scan verdicts) — lets a market of a named event
+   through a prefix block. The event then runs under every rule it had
+   before: top-3 cap, close-anchored cutoff, 5pm halving, safe-join. When
+   its cutoff passes it leaves through the ordinary cutoff/closing path;
+   the entry is then inert and needs no cleanup.
+
+A plain blocklist entry would have cancelled the three resting ladders on
+the next cycle (the 8/25 shape); `NO_NEW_SERIES` would have grandfathered
+the three members but refused a replacement strike if one dropped out of
+band. The event-scoped exemption is the reading that matches the ask.
+
+KEPT ON PURPOSE for a one-line un-block later: the `_DEFAULT_ECON_SERIES`
+entry, the `KXTRUEV:3` top-N cap, the `KXTRUEV:17-1:0.5` halving and the
+close-60 override. The blocklist entry wins over all of them.
+
+Pinned by `test_truev_sunset_winds_down_one_event`; the two 9/7 un-block
+pins were flipped to the new state. Deployed through the source-mtime
+self-restart; verify with `imm_feed_audit.py` (26SEP11 must NOT appear as an
+excluded-with-programs event; later KXTRUEV dailies appear in the
+not-allowed leaderboard as deliberate exclusions).

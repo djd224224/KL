@@ -1555,11 +1555,31 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + ["KXHIGH"]                                    # high_temp_trading.py (cloud)
     + ["KXMLBMENTION", "KXNBAMENTION", "KXNCAABMENTION"]   # mlb/nba/ncaa (cloud)
     + _GPU_RENTAL_PREFIXES                           # GPU rental price (excluded)
-    # (KXTRUEV was blocked here 2026-08-25 and UNBLOCKED 2026-09-07 — see
-    # the EVENT_TOP_N note: it comes back capped at 3 markets per event, not
-    # unrestricted. Do not re-add without deciding about that cap too.)
+    # KXTRUEV SUNSET (Jack 2026-09-11: "quote KXTRUEV-26SEP11 until
+    # completion, but block KXTRUEV going forward"). History: blocked here
+    # 2026-08-25, UNBLOCKED 2026-09-07 capped at 3 markets/event (the
+    # EVENT_TOP_N note), retired again here. The 26SEP11 event alone is
+    # exempt via BLOCKLIST_WIND_DOWN_EVENTS below and quotes to its own
+    # close-60 cutoff under every normal rule; every other KXTRUEV event is
+    # frozen (no orders, not even reduce-only; positions ride to
+    # settlement). The allowlist entry, the top-3 cap, the 5pm halving and
+    # the close-anchored override are all KEPT so a later un-block is one
+    # line — this entry wins over all of them.
+    + ["KXTRUEV"]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
+
+# WIND-DOWN EXEMPTION for a blocklisted series (Jack 2026-09-11, KXTRUEV):
+# event tickers that keep quoting to their own completion even though their
+# series prefix is blocklisted. Everything the event's normal rules already
+# do (top-N cap, close-anchored cutoff, hour halving, safe-join) still
+# applies — the exemption only says "not frozen". Once the event's cutoff
+# passes it leaves through the ordinary cutoff/closing path and the entry
+# is inert. Env IMM_BLOCKLIST_WIND_DOWN_EVENTS (comma list) overrides.
+BLOCKLIST_WIND_DOWN_EVENTS = frozenset(
+    e.strip() for e in os.environ.get(
+        "IMM_BLOCKLIST_WIND_DOWN_EVENTS", "KXTRUEV-26SEP11").split(",")
+    if e.strip())
 
 # ---- universe allowlist (user decision 2026-07-11: MENTION + CRYPTO only) ----
 # Mention/broadcast markets have DEFINED information windows (nothing to know
@@ -6286,8 +6306,15 @@ class IncentiveMarketMaker:
 
     @staticmethod
     def _blocked(ticker: str) -> bool:
-        return (any(ticker.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES)
-                or series_of(ticker) in FREEZE_SERIES)
+        if any(ticker.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
+            # A wind-down event (BLOCKLIST_WIND_DOWN_EVENTS) is the one
+            # exception to a prefix block. Accept the market ticker or the
+            # event ticker itself: the freeze paths pass markets, the
+            # family probe passes "<series>-X".
+            if ticker not in BLOCKLIST_WIND_DOWN_EVENTS and \
+                    ticker.rsplit("-", 1)[0] not in BLOCKLIST_WIND_DOWN_EVENTS:
+                return True
+        return series_of(ticker) in FREEZE_SERIES
 
     @classmethod
     def _allowed(cls, ticker: str) -> bool:
