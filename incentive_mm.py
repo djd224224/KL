@@ -1554,6 +1554,31 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
 ALLOWLIST_ONLY = os.environ.get("IMM_ALLOWLIST_ONLY", "1") == "1"
 ALLOW_SERIES_SUFFIXES = tuple(
     s for s in os.environ.get("IMM_ALLOW_SUFFIXES", "MENTION").split(",") if s)
+# Series-name FAMILY suffixes (Jack 2026-09-10: "allowlist the CC Carbon Arc
+# family -- KXURBNCC, KXDGCC, KXCOSTCC, etc. and they should be picked up by
+# the normal IMM ... not the opportunistic"). Kept SEPARATE from
+# ALLOW_SERIES_SUFFIXES on purpose: that tuple IS the mention family and
+# three call sites read it as mention semantics (mention_cutoff_is_clear,
+# the no_event_window stand-down, the never-pre-drop-on-ticker-date rule in
+# refresh_universe), none of which a dated vendor print wants. This tuple
+# is membership only; guards come from FAMILY_OVERRIDE_PARENTS.
+#   *CC   Carbon Arc credit-card-spend monthlies (KXAMZNCC, KXURBNCC,
+#         KXCOSTCC, ...). Live feed 2026-09-10 pm: all 30 paying *CC series
+#         are "<Company> Credit Card Spend", category Financials, source
+#         Carbon Arc, 9 strikes each on 26OCT07 -- the suffix IS the family,
+#         no false positive in the feed. Same shape as the FT/APP dated-
+#         observation class (monthly vendor print, ticker date = print day
+#         -> midnight-ET exit), so members clone the KXAMZNCC archetype:
+#         safe-join, no fresh-candidate rate bar, the $1/market payout
+#         floor still gates every entry. Until now each sibling waited for
+#         the 3x/day classifier to SEE an active program (KXURBNCC-26OCT07's
+#         first period ran 8/28-8/30, before the self-extend rule existed;
+#         its second lit 9/10 22:02Z, after the 4:45pm run) and then landed
+#         in the capped finecon tier. KXAMZNCC (finecon base) and KXSBUXCC
+#         (finecon extra file) move to the normal book with the family.
+ALLOW_FAMILY_SUFFIXES = tuple(
+    s for s in os.environ.get("IMM_ALLOW_FAMILY_SUFFIXES", "CC").split(",")
+    if s)
 # Series-name PREFIXES — for mention/incentive families that append a variable
 # tail so the "MENTION" suffix match misses:
 #   KXTEMP<CITY>            weather temp (covers new cities automatically)
@@ -1771,6 +1796,9 @@ _FINECON_KPI_SERIES = (
 # as the WHOLE 11-series family, not the two he named (the 8/31 state-gas
 # lesson: a half-covered family misses the next sibling for a day).
 # KXDRPEPPERPOS + KXAMZNCC are post-scan Carbon Arc listings, same
+# (KXAMZNCC LEFT this group 2026-09-10 pm: the whole *CC credit-card family
+# is now allowed into the NORMAL book by name pattern -- ALLOW_FAMILY_SUFFIXES
+# -- and a series in both sets would still be walked/capped as finecon.)
 # dated-observation shape (monthly index print, ticker date = print day
 # -> midnight-ET exit; AMZNCC OCT strikes est 5.9-11.1%/day at
 # enrollment). The month-to-date panel drip visible to Carbon Arc
@@ -1785,7 +1813,7 @@ _DEFAULT_FINECON_SERIES = (
     "KXSPORTGOODSADS,KXCASINOADS,KXFITNESSADS,KXVIDEOGAMESADS,"
     "KXAMUSEMENTADS,KXELECTRONICSADS,KXSTREAMINGADS,KXFOOTWEARADS,"
     "KXSPORTSBOOKADS,KXBROADLINEADS,KXTEENCLOTHADS,"
-    "KXDRPEPPERPOS,KXAMZNCC,"
+    "KXDRPEPPERPOS,"
     + _FINECON_KPI_SERIES)
 # MUTABLE since 2026-09-05 (Jack "yes self-extend carbon arc"): the daily
 # overrides task appends new Carbon Arc series to FINECON_EXTRA_FILE and
@@ -2119,7 +2147,13 @@ _SCAN_STRIKE_RE = re.compile(r"^[TB]?-?\d[\d,.]*[A-Z]?$")
 # that its quiet neighbours are now admitted, which relaxes the original
 # "informed flow on one strike shows up on its siblings" intent. Watch the
 # tier's loss budget for whether that holds.
-SCAN_MIN_AGE_HOURS = _env_float("IMM_SCAN_MIN_AGE_H", 24)
+# Listing age before the scan will read a market. 24h from 2026-09-05;
+# 6h since 2026-09-10 (Jack: "drop the open scan 24h requirement to 6h"):
+# a series lit late in the evening (KX30YMORTW-26SEP17 at 22:40Z on a
+# 7-day pool) sat out a full day of a short program for no screen it would
+# later fail. 6h still keeps same-day price structures (hourly/daily) out
+# and leaves the 72h history read something to see.
+SCAN_MIN_AGE_HOURS = _env_float("IMM_SCAN_MIN_AGE_H", 6)
 # 60 -> 80 market, 60 -> 100 event mean (Jack 2026-09-06, after the
 # measurement below: "raise to 80 for the market, and avg 100 for the
 # event"). The 9/6 distribution is bimodal — 58% of the universe reads
@@ -2145,7 +2179,7 @@ SCAN_MAX_EVENT_AVG_VOLUME_24H = _env_float(
 #     here, not a red flag. NOTE the consequence: a market with NO two-sided
 #     history now reaches the later screens, where _screen's one_sided and
 #     mid-band checks still require a real two-sided book RIGHT NOW, and the
-#     24h age screen still applies. scan_history_verdict guards the empty
+#     age screen (SCAN_MIN_AGE_HOURS) still applies. scan_history_verdict guards the empty
 #     and single-bar cases that this makes reachable.
 #   MAX_RANGE 10c -> 0 (OFF). Total high-minus-low across 72h punished slow
 #     drift as hard as news: a market that walked 12c over three days in 1c
@@ -2240,9 +2274,9 @@ SCAN_EVICT_TTL_SECS = 30 * 86400.0      # file hygiene only; events settle soone
 #                  rejects the SERIES; a day-dated ticker cuts quoting off
 #                  at ET midnight BEFORE event day (trade_cutoff_utc: the
 #                  bot never quotes a game-day market on game day) and
-#                  SCAN_REQUIRE_DATED makes that cutoff mandatory; the 24h
-#                  age screen keeps same-day listings (hourly/daily price
-#                  structures) out entirely.
+#                  SCAN_REQUIRE_DATED makes that cutoff mandatory; the
+#                  SCAN_MIN_AGE_HOURS age screen (6h; 24h until 9/10) keeps
+#                  same-day listings (hourly/daily price structures) out.
 #   adverse sel.   numeric-threshold strikes only (a "will X happen"
 #                  binary's one jump IS the resolution), the 72h quiet-
 #                  history screen (range/jump/volume), the 24h activity
@@ -2831,6 +2865,14 @@ for _s in [s for s in _DEFAULT_COMPANY_SERIES.split(",")
     SERIES_OVERRIDES[_s] = SeriesOverride(
         min_est_per_day=_env_float("IMM_CONSUMER_OBS_MIN_RATE", 0.0),
         safe_join=True)
+# CARBON ARC *CC FAMILY archetype (Jack 2026-09-10, see ALLOW_FAMILY_SUFFIXES):
+# the same consumer-observation guard set as FT/APP -- safe-join, no fresh-
+# candidate rate bar -- on the exact member every *CC sibling clones from
+# (FAMILY_OVERRIDE_PARENTS). KXAMZNCC carried these identical values as a
+# finecon base member until today, so the tier move changes no guard.
+SERIES_OVERRIDES["KXAMZNCC"] = SeriesOverride(
+    min_est_per_day=_env_float("IMM_CONSUMER_OBS_MIN_RATE", 0.0),
+    safe_join=True)
 
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
@@ -2926,11 +2968,15 @@ for _s in os.environ.get(
 # passed _allowed; suffix rules ALSO require exact/extra-allow membership so
 # an unrelated *FT-ending series that is never allowlisted (KXNFLDRAFT) can
 # never clone a guard set even if a future caller runs this over the raw
-# feed.
+# feed. A "family_suffix" entry is the exception: there the suffix itself
+# IS the allowlist membership (ALLOW_FAMILY_SUFFIXES, the *CC family since
+# 2026-09-10), so no exact list exists to require -- _blocked still wins
+# upstream in _allowed.
 FAMILY_OVERRIDE_PARENTS = (
     ("prefix", "KXAAAGASD", "KXAAAGASD"),
     ("suffix", "FT", "KXBKFT"),
     ("suffix", "APP", "KXCLAUDEAPP"),
+    ("family_suffix", "CC", "KXAMZNCC"),
 )
 _family_override_warned: Set[str] = set()
 
@@ -2941,6 +2987,9 @@ def ensure_family_override(series: str) -> None:
     for kind, pat, parent in FAMILY_OVERRIDE_PARENTS:
         if kind == "prefix":
             if not series.startswith(pat):
+                continue
+        elif kind == "family_suffix":
+            if not series.endswith(pat):
                 continue
         elif not series.endswith(pat) or (series not in ALLOW_SERIES
                                           and series not in EXTRA_ALLOW_SERIES):
@@ -6216,7 +6265,9 @@ class IncentiveMarketMaker:
     @classmethod
     def _allowed(cls, ticker: str) -> bool:
         """Blocklist always wins; then the exact-series allowlist (MENTION
-        suffix + named crypto series) unless ALLOWLIST_ONLY is off."""
+        suffix + named crypto series), the finecon group, and the name-
+        pattern families (prefixes; *CC via ALLOW_FAMILY_SUFFIXES) unless
+        ALLOWLIST_ONLY is off."""
         if cls._blocked(ticker):
             return False
         if not ALLOWLIST_ONLY:
@@ -6228,6 +6279,7 @@ class IncentiveMarketMaker:
         return series in ALLOW_SERIES or series in EXTRA_ALLOW_SERIES or \
             series in FINECON_SERIES or \
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
+            any(series.endswith(suf) for suf in ALLOW_FAMILY_SUFFIXES) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
