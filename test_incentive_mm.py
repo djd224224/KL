@@ -7464,6 +7464,179 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertTrue(opp.text_table([])[-1].startswith("TOTAL"))
         self.assertEqual(opp.tier_totals([])["net"], 0.0)
 
+    def test_cc_family_is_its_own_reporting_tier(self):
+        # Jack 2026-09-11: "AmazonCC and StarbucksCC arent in the
+        # opportunistic daily email anymore". The 2026-09-10 family rule
+        # (ALLOW_FAMILY_SUFFIXES) took KXAMZNCC out of FINECON_SERIES and
+        # KXSBUXCC out of the finecon extra file, and the email's two-tier
+        # test then matched neither -- 30 series left the report in silence.
+        # REPORTING only: nothing here changes which book quotes them, so
+        # test_cc_family_suffix_allows_into_normal_book still holds.
+        import send_opportunistic_imm as opp
+        fin = {"KXSPRLVL", "KXJOLTSOPEN"}
+        scan = {"KXNOVEL-26OCT13-T5"}
+        for t in ("KXAMZNCC-26OCT07-T108", "KXSBUXCC-26OCT07-T98",
+                  "KXURBNCC-26OCT07-T94", "KXNEVERSEENCC-26OCT07-T1"):
+            self.assertEqual(opp.tier_of(t, fin, scan), "family", t)
+            self.assertTrue(opp.is_family(t), t)
+        # the EVENT ticker resolves the same way -- the cumulative table
+        # attributes settled-and-gone events, not tickers
+        self.assertEqual(opp.tier_of("KXSBUXCC-26OCT07", fin, scan), "family")
+        # the other two tiers are unchanged
+        self.assertEqual(opp.tier_of("KXSPRLVL-26SEP16-T1", fin, scan),
+                         "finecon")
+        self.assertEqual(opp.tier_of("KXNOVEL-26OCT13-T5", fin, scan), "scan")
+        # and the normal book is still not opportunistic
+        for t in ("KXTRUMPMENTION-26SEP12-WALL", "KXBTCD-26SEP11-T100"):
+            self.assertIsNone(opp.tier_of(t, fin, scan), t)
+        # a series that merely CONTAINS the suffix is not the family (the
+        # same rule incentive_mm._parse_event_top_n's "*CC" match uses)
+        self.assertFalse(opp.is_family("KXCCOUNTY-26OCT07-T1"))
+
+    def test_tier_precedence_matches_the_bot(self):
+        # finecon first: a series in BOTH sets is walked and capped as
+        # finecon by incentive_mm._allowed, so the email must say finecon.
+        # scan before family: scan membership is an explicit per-ticker fact
+        # the bot persisted, and a member admitted before the family rule
+        # existed keeps reporting where the bot put it.
+        import send_opportunistic_imm as opp
+        t = "KXWEIRDCC-26OCT07-T1"
+        self.assertEqual(opp.tier_of(t, {"KXWEIRDCC"}, set()), "finecon")
+        self.assertEqual(opp.tier_of(t, set(), {t}), "scan")
+        self.assertEqual(opp.tier_of(t, set(), set()), "family")
+
+    def test_every_family_series_the_bot_allows_has_a_tier(self):
+        # The invariant the 2026-09-10 regression broke: a market the bot
+        # quotes through a family suffix must map to a tier this email
+        # reports. Driven off the bot's own constant, so adding a suffix to
+        # ALLOW_FAMILY_SUFFIXES can never silently drop it from the email.
+        import send_opportunistic_imm as opp
+        self.assertTrue(imm.ALLOW_FAMILY_SUFFIXES)
+        saved_only = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+        try:
+            for suf in imm.ALLOW_FAMILY_SUFFIXES:
+                t = "KXPROBE{}-26OCT07-T1".format(suf)
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+                self.assertIsNotNone(opp.tier_of(t, set(), set()), t)
+        finally:
+            imm.ALLOWLIST_ONLY = saved_only
+
+    def test_cc_labels_never_leak_the_ticker_scheme(self):
+        # 28 of the 30 *CC series have no _LABEL entry and resolve from the
+        # live event title; with no client the family fallback must still
+        # read as English rather than "KXURBNCC".
+        import send_opportunistic_imm as opp
+        self.assertEqual(opp.event_label(None, "KXSBUXCC-26OCT07"),
+                         "Starbucks credit-card spend")
+        self.assertEqual(opp.family_label("KXURBNCC"),
+                         "Credit-card spend (Carbon Arc)")
+        self.assertEqual(opp.family_label("KXFOOTWEARADS"),
+                         "Ad spend (Carbon Arc)")
+        self.assertEqual(opp.family_label("KXSPRLVL"), "")
+        lbl = opp.event_label(None, "KXNEVERSEENCC-26OCT07")
+        self.assertTrue(lbl and not lbl.startswith("KX"), lbl)
+
+    def test_credited_column_and_cumulative_tables(self):
+        # Jack 2026-09-11 "make sure it shows not just active, but also
+        # cumulative": CREDITED rides alongside the estimate per row, and
+        # the cumulative table carries the tier totals. CREDITED is a SUBSET
+        # of EARN EST (accrued_est is never reset at a period end), so no
+        # renderer may add the two into one figure.
+        import send_opportunistic_imm as opp
+        rows = [{"event": "KXSBUXCC-26OCT07", "label": "Starbucks cc spend",
+                 "tier": "family", "mkts": 3, "earn": 8.55, "cred": 5.21,
+                 "pnl": -48.33, "net": -39.78, "pos": -202},
+                # a row with NO cred key at all -- the pre-2026-09-11 shape
+                {"event": "KXSPRLVL-26SEP16", "label": "US SPR level",
+                 "tier": "finecon", "mkts": 3, "earn": 2.29, "pnl": 0.0,
+                 "net": 2.29, "pos": 0}]
+        t = opp.tier_totals(rows)
+        self.assertAlmostEqual(t["cred"], 5.21)
+        self.assertAlmostEqual(t["earn"], 10.84)
+        # NET never absorbs CREDITED -- it would double-count the accrual
+        self.assertAlmostEqual(t["net"], t["earn"] + t["pnl"])
+        L = opp.text_table(rows)
+        self.assertIn("CRED$", L[0])
+        self.assertIn("5.21", L[1])
+        # the CRED field of a never-credited row is BLANK, not 0.00 (the
+        # 9 chars straight after that row's EARN EST value)
+        self.assertEqual(L[2].split("2.29")[1][:9], " " * 9)
+        self.assertIn("5.21", L[-1])
+        html = opp.html_table(rows)
+        self.assertIn("CREDITED$", html)
+        self.assertIn("5.21", html)
+        self.assertEqual(html.count("<tr"), 4)
+        cum = [{"tier": "FINECON", "events": 12, "cred": 21.83, "est": 64.65,
+                "realized": -26.20, "mtm": -22.55, "net": 15.90},
+               {"tier": "TOTAL", "events": 12, "cred": 21.83, "est": 64.65,
+                "realized": -26.20, "mtm": -22.55, "net": 15.90}]
+        CL = opp.cum_text_table(cum)
+        self.assertEqual(len(CL), 3)                     # header + 2 rows
+        self.assertIn("CREDITED$", CL[0])
+        self.assertIn("REALIZED$", CL[0])
+        self.assertTrue(CL[-1].startswith("TOTAL"))
+        chtml = opp.cum_html_table(cum)
+        self.assertEqual(chtml.count("<tr"), 3)
+        self.assertIn("21.83", chtml)
+
+    def test_durable_history_folds_sinks_without_double_counting(self):
+        # The cumulative table's one real hazard: the `realized` sink writes
+        # DELTAS, so re-reading a day would inflate it. Only COMPLETE UTC
+        # days may be cached; today's partial file is summed live every run.
+        # The scan roster is a SET and folds idempotently either way.
+        import send_opportunistic_imm as opp
+        d = tempfile.mkdtemp(prefix="imm_opp_hist_")
+        old_dir, old_roster = imm.STATUS_DIR, opp.ROSTER_PATH
+        imm.STATUS_DIR = d
+        opp.ROSTER_PATH = os.path.join(d, "opportunistic_roster.json")
+
+        def sink(name, day, recs):
+            with open(os.path.join(d, "{}_{}.jsonl".format(name, day)), "a",
+                      encoding="utf-8") as f:
+                for r in recs:
+                    f.write(json.dumps(r) + "\n")
+        try:
+            sink("realized", "2026-09-09",
+                 [{"event_ticker": "KXA-26OCT07",
+                   "realized_delta_dollars": -2.0},
+                  {"event_ticker": "KXA-26OCT07",
+                   "realized_delta_dollars": -1.0},
+                  {"event_ticker": "KXB-26OCT07",
+                   "realized_delta_dollars": 5.0}])
+            sink("realized", "2026-09-10",
+                 [{"event_ticker": "KXA-26OCT07",
+                   "realized_delta_dollars": 0.5}])
+            sink("selection_events", "2026-09-09",
+                 [{"event_ticker": "KXS-26OCT07", "is_scan": True},
+                  {"event_ticker": "KXNOT-26OCT07", "is_scan": False}])
+            today = "2026-09-10"              # so 09-10 is the partial day
+            first = opp.durable_history(today)
+            self.assertAlmostEqual(first["realized"]["KXA-26OCT07"], -2.5)
+            self.assertAlmostEqual(first["realized"]["KXB-26OCT07"], 5.0)
+            self.assertEqual(first["scan_events"], {"KXS-26OCT07"})
+            self.assertEqual(first["first_day"], "2026-09-09")
+            # re-run: identical, because the partial day is never cached
+            for _ in range(3):
+                again = opp.durable_history(today)
+                self.assertAlmostEqual(again["realized"]["KXA-26OCT07"], -2.5)
+                self.assertAlmostEqual(again["realized"]["KXB-26OCT07"], 5.0)
+            with open(opp.ROSTER_PATH, encoding="utf-8") as f:
+                cached = json.load(f)
+            self.assertEqual(cached["folded_realized"], ["2026-09-09"])
+            self.assertNotIn(today, cached["folded_realized"])
+            # the partial day's remainder lands once the day completes
+            sink("realized", "2026-09-10",
+                 [{"event_ticker": "KXA-26OCT07",
+                   "realized_delta_dollars": 0.25}])
+            done = opp.durable_history("2026-09-11")
+            self.assertAlmostEqual(done["realized"]["KXA-26OCT07"], -2.25)
+            self.assertAlmostEqual(
+                opp.durable_history("2026-09-11")["realized"]["KXA-26OCT07"],
+                -2.25)
+        finally:
+            imm.STATUS_DIR, opp.ROSTER_PATH = old_dir, old_roster
+
     def test_quote_gaps_open_scan_labels(self):
         # imm_quote_gaps labels a scan-universe market from the live bot's
         # PERSISTED screen caches — never a fetch (the script is read-only).

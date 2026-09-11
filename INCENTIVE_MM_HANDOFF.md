@@ -1347,10 +1347,11 @@ again; cached verdicts follow within one refresh), the tripwires.
   `scan_history_cache`, `scan_series_meta`, `scan_halt_day`,
   `scan_admit_day/scan_admits_today`, `scan_pnl_carry`.
 - Opportunistic email (`send_opportunistic_imm.py`): a combined headline,
-  then one table per tier in the same format — FINECON and OPEN SCAN —
-  each with its own slot/openings line (HALTED / evicted flags on the scan
-  one) and TOTAL row (Jack 2026-09-06: "a similarly formatted table for
-  non-finecon opportunistic bot"); Kalshi-credited footer covers both.
+  then one table per tier in the same format — FINECON, OPEN SCAN and
+  (since 2026-09-11) CARBON ARC *CC — each with its own slot/openings line
+  (HALTED / evicted flags on the scan one) and TOTAL row (Jack 2026-09-06:
+  "a similarly formatted table for non-finecon opportunistic bot"), then
+  the CUMULATIVE per-tier table; Kalshi-credited footer covers all three.
 - Digest FINECON SWEEP section gained an OPEN SCAN block (members, accrual,
   openings, evictions, halt flag).
 - Quote-gaps email: markets in the scan universe are labelled
@@ -1692,3 +1693,102 @@ pins were flipped to the new state. Deployed through the source-mtime
 self-restart; verify with `imm_feed_audit.py` (26SEP11 must NOT appear as an
 excluded-with-programs event; later KXTRUEV dailies appear in the
 not-allowed leaderboard as deliberate exclusions).
+
+## 2026-09-11 — *CC back in the opportunistic email; CUMULATIVE table (Jack)
+
+Jack: "AmazonCC and StarbucksCC arent in the opportunistic daily email
+anymore. make sure it shows not just active, but also cumulative".
+
+WHY THEY VANISHED. The 9/10 family rule (previous section) moved the whole
+*CC set into the NORMAL book by name pattern, which meant taking KXAMZNCC
+out of `_DEFAULT_FINECON_SERIES` and KXSBUXCC out of
+`finecon_extra_series.json`. The opportunistic email's tier test was a
+closed two-way enumeration of the two QUOTING groups — finecon by
+`FINECON_SERIES`, else scan by `scan_members` — and every row-set
+comprehension filters on its truthiness, so a market matching neither is
+dropped from the email entirely rather than rendered untiered. A *CC ticker
+can never be scan either (it is `_allowed`, so `scan_universe_reason`
+returns "allowed" and it is never a scan candidate). All 30 series / 30
+events / 90 selected markets left the report in silence, and with them the
+$9.00 of real Kalshi credit already booked on KXSBUXCC-26OCT07 ($5.21) and
+KXAMZNCC-26OCT07 ($3.79) — `_is_opp_event` gates the footer off the same
+predicate.
+
+The root cause is that QUOTING tier and REPORTING tier are different
+questions. Jack's 9/10 "picked up by the normal IMM right not the
+opportunistic" was about slots and caps (no finecon walk, no scan screen);
+his 9/11 ask is about this scorecard. Nothing in the bot changed here.
+
+CHANGE 1 — THIRD REPORTING TIER. `tier_of(ticker_or_event, fin, scan_set)`
+is now MODULE LEVEL in `send_opportunistic_imm.py` (it was a closure inside
+`build_report`, which is exactly how 538 green tests missed 30 vanished
+series — the tests could only reach the pure formatters). Precedence is
+finecon, then scan, then `is_family()` — the *CC arm reads
+`imm.ALLOW_FAMILY_SUFFIXES`, the bot's OWN membership constant, so a future
+family suffix lands in the email for free. finecon first because a series
+in both sets is walked and capped as finecon; scan before family because
+scan membership is an explicit per-ticker fact the bot persisted. The tier
+line reports no slot budget, because the family has no tier walk — it
+states the caps that actually bind, read from the bot
+(`imm.event_top_n_for` → `*CC:3`, `imm.MAX_MARKETS` → 150).
+
+CHANGE 2 — CUMULATIVE TABLE + per-row CREDITED$. The per-tier tables stay
+the ACTIVE book; the new CUMULATIVE table is the same three tiers over
+every event each has ever touched, settled-and-gone included. Columns and
+their bases:
+- CREDITED  actual Kalshi money, per event, all-time, from the recon
+            ledger (back to 2026-03-21, so complete). Also a per-row
+            CRED$ column in the active tables, BLANK not 0.00 when nothing
+            has landed. Footer carries an as-of stamp ("ledger through
+            <date>, Nd behind") and a LEDGER STALE banner past
+            `sd.LEDGER_STALE_DAYS` — `reward_credits.csv` is a hand-run
+            statement paste, so a $0.00 that really means "not pasted yet"
+            must not read as "earned nothing".
+- EST       the bot's accrual estimator. **`accrued_est` is NEVER reset at
+            a program-period boundary** (`BotState.accrued_est`, "ticker ->
+            lifetime est"), so EST is credited-plus-still-in-flight:
+            KXAMZNCC-26OCT07 reads est $8.70 against $3.79 already
+            credited. CREDITED is a SUBSET of EST, never an addend — no
+            renderer sums the two, and NET stays EST + REALIZED + MTM so it
+            is the same basis as the active tables' NET. The old footnote
+            called EST "period-to-date", which was simply wrong.
+- REALIZED  per-market realized trading P&L summed from the `realized`
+            sink's DELTAS. That sink starts 2026-09-06 (commit ffe4b48),
+            and the footer states that floor rather than implying history
+            it does not have.
+- MTM       the open book right now, same `own_book()`/mids path.
+
+CHANGE 3 — DURABLE TIER ATTRIBUTION (`opportunistic_roster.json`). finecon
+and *CC are series-name rules, durable by construction. The scan tier is
+per-TICKER and the bot PRUNES it — `scan_book` sheds flat non-members at
+every daily roll — so a settled scan event silently stops being ours.
+`durable_history()` folds the `selection_events` sink's `is_scan` flag into
+a per-event set and caches it. Measured 2026-09-11: 7 credited scan events
+worth $118.40 had already left `scan_book`, against $21.83 the two-tier
+footer was reporting as the book's whole lifetime. Footer now reads
+$149.23 (finecon 21.83 + scan 118.40 + *CC 9.00).
+
+The cache folds once per UTC day so the email stays O(one day) as the sinks
+grow (27MB on 9/11, ~4MB/day) and keeps its history if those files are ever
+archived off. The scan roster is a SET and folds idempotently; the realized
+map is DELTAS and does NOT, so only COMPLETE UTC days are ever cached and
+today's partial file is summed live on top every run. That asymmetry is the
+one real hazard here and is pinned by
+`test_durable_history_folds_sinks_without_double_counting`. The call is
+wrapped: `build_report` is retried 8x/5min and a sink read must never cost
+the whole day's email — on failure the cumulative table degrades to the
+live book.
+
+ALSO FIXED, same bug class: the ticker-level tier test used `scan_members`
+where it should have used `scan_book`, so a market the scan tier had
+stopped quoting but still held inventory in was dropped from the tier's
+book — contradicting the 2026-09-07 "scope the email's P&L to every market
+in the tier's book" rule. Slot counts stay on true membership so the tier
+line cannot inflate. Worth +2 events / +4 held markets on the day.
+
+NOT CHANGED: quoting, selection, caps, the launcher, the schedule. The
+"KL imm opportunistic" task runs the .py directly with no flags, so the
+7:25 AM ET run picks this up with no restart. Verify with
+`python send_opportunistic_imm.py --dry` (a plain re-run is a no-op once
+the day's marker exists; `--test` resends for real).
+Pinned by six new cases in `TestOpportunisticEmail`.
