@@ -296,6 +296,13 @@ class SeriesOverride:
     safe_join: bool = False                             # safety-net placement:
     #   rest >= SAFE_JOIN_OFFSET_TICKS behind the touch unless the bid/ask
     #   spread is >= SAFE_JOIN_MIN_SPREAD ticks (re-entry company/econ)
+    release_guard_day: Optional[int] = None             # DATA-MONTH release
+    #   guard: cutoff = 00:00 ET on this day of the month AFTER the data month
+    #   the market's own title/rules name ("... for September 2026 be above
+    #   6%?"), applied as a min() on top of every other rule. For series whose
+    #   ticker date is a listing-derived far date that sits AFTER the release
+    #   (the Ramp AI Index family). A guarded market whose text carries no
+    #   month is stood down, never quoted on the ticker-date fallback.
     pre_cutoff_reduce_only_secs: Optional[int] = None   # override the global
     #   PRE_CUTOFF_REDUCE_ONLY_SECS (default 0 since 2026-08-02 — the window
     #   is removed bot-wide; set >0 here or via env to restore per-series)
@@ -796,6 +803,51 @@ for _s in os.environ.get(
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(safe_join=True)
 
+# RAMP AI INDEX FAMILY (Jack 2026-09-12: "allowlist the Ramp AI Index events
+# into the IMM bot. set a release guard at midnight ET on the 6th day of the
+# following month e.g. Oct 6th for the Sept event. top 3 markets per event").
+# The 13 series Kalshi tags 'AI Indices', every one settled on
+# ramp.com/data/ai-index (GET /series?tags=AI%20Indices on 2026-09-12):
+# headline adoption, five model authors, five sectors, two spend-per-employee
+# tiers. ONE monthly print out of Ramp's own card data and nothing public in
+# between -- the books sit quiet (most strikes at zero volume) until the
+# release, which is the whole risk:
+#   2026 releases   May 13, Jun 10, Jul 8, Aug 12, Sep 9 -- ~10am ET
+#   what it does    KXAIMANU-26OCT01-T61.5 (August data): resting bids at
+#                   32c/26c/3c/2c swept by 2,142 NO-taker lots between
+#                   14:24Z and 14:56Z on Sep 9; Kalshi early-closed 15:25Z.
+# The ticker date is NOT the release: it is a listing-derived far date
+# (26OCT01 for the August data, 26OCT17 for September's), so the midnight-ET
+# ticker rule and Kalshi's occurrence (after expiration) both leave the bot
+# quoting straight through the print -- the KXUE/KXISMPMI shape the 9/2
+# finecon sweep rejected. The guard therefore keys on the DATA MONTH, which
+# every market states in its title and rules ("Will Ramp AI Index Google
+# model adoption rate for September 2026 be above 6%?" -- verified on all 26
+# markets of the 13 series, both batches): out at 00:00 ET on
+# RAMP_RELEASE_GUARD_DAY of the month AFTER the data month (September data
+# -> Oct 6, two days ahead of the earliest release day seen this year). A
+# market whose text carries no month gets NO guessed cutoff: it is stood
+# down, logged once per event (fail closed). See release_guard_cutoff and
+# apply_series_cutoff_adjustments, which every cutoff producer runs.
+# Safe-join rides along: the competing books are deep and 9c wide (400-3,000
+# lots per level on 9/12), so the reference clamp makes it free at the
+# touch, and it binds exactly where a touch is thin (the undated set above).
+# Kalshi's programs on the family so far were 2-3 day listing boosts
+# (Aug 28-30, Sep 10-13); Jack: the current batch will not clear the $1
+# payout floor -- this is for the next batches and any renewal.
+_DEFAULT_RAMP_AI_SERIES = (
+    "KXAIADOPTION,KXANTHADOPT,KXOPENADOPT,KXGOOGLADOPT,KXXAIADOPT,KXDEEPADOPT,"
+    "KXAIMANU,KXAIFINANCE,KXAIFOOD,KXAIHEALTH,KXAITECH,KXAISPEND1,KXAISPEND10")
+RAMP_AI_SERIES: Tuple[str, ...] = tuple(
+    s.strip() for s in os.environ.get("IMM_ALLOW_RAMP_AI_SERIES",
+                                      _DEFAULT_RAMP_AI_SERIES).split(",")
+    if s.strip())
+RAMP_RELEASE_GUARD_DAY = _env_int("IMM_RAMP_RELEASE_GUARD_DAY", 6)
+RAMP_EVENT_TOP_N = _env_int("IMM_RAMP_EVENT_TOP_N", 3)
+for _s in RAMP_AI_SERIES:
+    SERIES_OVERRIDES[_s] = SeriesOverride(
+        safe_join=True, release_guard_day=RAMP_RELEASE_GUARD_DAY)
+
 
 def series_pad_to_target(series: str) -> bool:
     # Live-event depth-gated series NEVER pad (Jack 2026-08-31): thin depth
@@ -1238,9 +1290,17 @@ def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
 # events x 9 strikes each, all one monthly print apart on the same date —
 # correlated the way the gas ladders are, so the same 3-highest-ROI rule.
 # Measured before the cap: 27 CC events held 234 selected strikes.
+# Ramp AI Index family (Jack 2026-09-12 "top 3 markets per event"): every
+# strike of an event settles on the ONE monthly print -- the gas/CC shape.
+# Exact series names rather than a KXAI prefix, so nothing else rides in;
+# IMM_RAMP_EVENT_TOP_N=0 lifts the family cap without restating the spec.
+_RAMP_EVENT_TOP_N_SPEC = (
+    "," + ",".join(f"{_s}:{RAMP_EVENT_TOP_N}" for _s in RAMP_AI_SERIES)
+    if RAMP_EVENT_TOP_N > 0 and RAMP_AI_SERIES else "")
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "KXAAAGAS:3,KXDIESEL:3,"
-                                                "KXTRUEV:3,*CC:3"))
+                                                "KXTRUEV:3,*CC:3"
+                                                + _RAMP_EVENT_TOP_N_SPEC))
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
 EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
@@ -2029,6 +2089,9 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_WEATHER_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_SPORTS_SERIES",
                                        _DEFAULT_SPORTS_SERIES)
+                # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
+                # is honored where RAMP_AI_SERIES is built, next to its guard
+                + "," + ",".join(RAMP_AI_SERIES)
                 ).split(",") if s) | FINECON_SERIES
 
 # The finecon sweep quotes AT MOST 10 markets at once, best-ROI first with
@@ -4150,9 +4213,45 @@ def series_hard_expiry_utc(series: str, event_ticker: str) -> Optional[datetime]
         .astimezone(timezone.utc)
 
 
+# DATA-MONTH RELEASE GUARD (the Ramp AI Index family, 2026-09-12 -- any
+# series whose override sets release_guard_day). The market's title/rules
+# name the DATA month ("... for September 2026 be above 6%?") and the release
+# lands in the FOLLOWING month, so the guard is 00:00 ET on `day` of that
+# following month. Title first (short, always present), then the rules.
+_DATA_MONTH_RE = re.compile(
+    r"\bfor\s+(January|February|March|April|May|June|July|August|September|"
+    r"October|November|December),?\s+(20\d\d)\b", re.IGNORECASE)
+_MONTH_NUM = {m: i for i, m in enumerate(
+    ("january", "february", "march", "april", "may", "june", "july",
+     "august", "september", "october", "november", "december"), start=1)}
+# Fail-closed cutoff for a guarded market whose text carries no data month:
+# far in the past, so every consumer (_screen's cutoff rule, the estimator's
+# horizon, the pre-cutoff reduce-only window) reads it as already over.
+RELEASE_GUARD_UNKNOWN = datetime(2000, 1, 1, tzinfo=timezone.utc)
+_release_guard_warned: Set[str] = set()
+
+
+def market_data_month(market: Optional[dict]) -> Optional[Tuple[int, int]]:
+    """(year, month) of the DATA month a market's text names, or None."""
+    if not isinstance(market, dict):
+        return None
+    for key in ("title", "rules_primary", "rules_secondary"):
+        m = _DATA_MONTH_RE.search(str(market.get(key) or ""))
+        if m:
+            return int(m.group(2)), _MONTH_NUM[m.group(1).lower()]
+    return None
+
+
+def release_guard_cutoff(year: int, month: int, day: int) -> datetime:
+    """00:00 ET on `day` of the month AFTER (year, month), as UTC."""
+    y, mo = (year + 1, 1) if month == 12 else (year, month + 1)
+    return ET.localize(datetime(y, mo, day)).astimezone(timezone.utc)
+
+
 def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                                     cutoff: Optional[datetime],
                                     close_time: Optional[datetime] = None,
+                                    market: Optional[dict] = None,
                                     ) -> Optional[datetime]:
     """Series-level tighteners every cutoff PRODUCER must run: the
     CLOSE-ANCHORED rule (cutoff_from_close_min, e.g. hourly temp close-10),
@@ -4168,7 +4267,15 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     close instead of close-10 and quoted into the final ten minutes, the most
     informed window of the hour (7 fills observed as late as 6.7 min to
     close, on a -18c/contract-at-4am book). Pass close_time and the tightener
-    is applied for BOTH producers."""
+    is applied for BOTH producers.
+
+    2026-09-12: the DATA-MONTH release guard (release_guard_day) lives here
+    for the same reason, and needs the market OBJECT (`market`), whose
+    title/rules carry the month. A guarded series called without a
+    parseable month -- no object passed, or text without "for <Month>
+    <Year>" -- gets RELEASE_GUARD_UNKNOWN, a cutoff already in the past: a
+    producer that forgets the object stands the market down rather than
+    quoting it through the print on the ticker-date fallback."""
     ov = SERIES_OVERRIDES.get(series)
     # NOTE the event-day EXTENDER (event_day_cutoff_et) deliberately does NOT
     # live here — it shifts the ticker-date CANDIDATE inside trade_cutoff_utc,
@@ -4183,6 +4290,18 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         if td is not None:
             early = td - timedelta(minutes=ov.cutoff_before_event_min)
             cutoff = early if cutoff is None else min(cutoff, early)
+    if ov and ov.release_guard_day is not None:
+        ym = market_data_month(market)
+        if ym is None:
+            guard = RELEASE_GUARD_UNKNOWN
+            if event_ticker not in _release_guard_warned:
+                _release_guard_warned.add(event_ticker)
+                log(f"[IMM] ! {series}: release guard needs the data month "
+                    f"but {event_ticker}'s market text does not say "
+                    f"'for <Month> <Year>' -- standing it down (fail closed)")
+        else:
+            guard = release_guard_cutoff(ym[0], ym[1], ov.release_guard_day)
+        cutoff = guard if cutoff is None else min(cutoff, guard)
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
@@ -6731,7 +6850,8 @@ class IncentiveMarketMaker:
             # Series tighteners (early-stop + hard floor) — shared with the
             # orphan-restore path via apply_series_cutoff_adjustments.
             cutoff = apply_series_cutoff_adjustments(series, event_ticker, cutoff,
-                                                     close_time=close_time)
+                                                     close_time=close_time,
+                                                     market=m)
             if t in scan_pre_set:
                 # open-scan month-named events (Fiscal.ai KPI class): out at
                 # 00:00 ET on the first of the report month, unless Kalshi's
@@ -7957,8 +8077,10 @@ class IncentiveMarketMaker:
                             parse_iso_utc(m.get("occurrence_datetime", "")),
                             parse_iso_utc(m.get("expected_expiration_time", ""))),
                         # close_time is what makes the close-anchored rule
-                        # (temp close-10) work on THIS producer too
-                        close_time=parse_iso_utc(m.get("close_time", ""))),
+                        # (temp close-10) work on THIS producer too; market
+                        # is what makes the data-month release guard work here
+                        close_time=parse_iso_utc(m.get("close_time", "")),
+                        market=m),
                     close_time=parse_iso_utc(m.get("close_time", "")))
                 log(f"{self.tag} restored orphan position market {t} "
                     f"(pos {positions.get(t, 0):+.0f}, reduce-only)")

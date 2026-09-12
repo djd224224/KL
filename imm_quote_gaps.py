@@ -208,7 +208,8 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
                 event_ticker, imm.parse_iso_utc(m.get("occurrence_datetime", "")),
                 imm.parse_iso_utc(m.get("expected_expiration_time", "")))
     cutoff = imm.apply_series_cutoff_adjustments(series, event_ticker, cutoff,
-                                                 close_time=close_time)
+                                                 close_time=close_time,
+                                                 market=m)
     if imm.scan_universe_reason(t) is None:
         # open-scan candidates: the report-month rule for month-named
         # (Fiscal.ai KPI) events — mirrors refresh_universe, narrowing

@@ -1213,6 +1213,150 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
                 any(s.endswith(suf) for suf in imm.ALLOW_SERIES_SUFFIXES), s)
 
 
+class TestRampAIIndexAllowlist(unittest.TestCase):
+    """Jack 2026-09-12: "allowlist the Ramp AI Index events into the IMM
+    bot. set a release guard at midnight ET on the 6th day of the following
+    month e.g. Oct 6th for the Sept event. top 3 markets per event"."""
+
+    SERIES = ("KXAIADOPTION", "KXANTHADOPT", "KXOPENADOPT", "KXGOOGLADOPT",
+              "KXXAIADOPT", "KXDEEPADOPT", "KXAIMANU", "KXAIFINANCE",
+              "KXAIFOOD", "KXAIHEALTH", "KXAITECH", "KXAISPEND1",
+              "KXAISPEND10")
+    # live market text 2026-09-12 -- both batches carry the DATA month
+    SEP = {"ticker": "KXGOOGLADOPT-26OCT17-T6",
+           "title": "Will Ramp AI Index Google model adoption rate for "
+                    "September 2026 be above 6%?",
+           "rules_primary": "If the Ramp AI Index Google model adoption rate "
+                            "for September 2026 is above 6%, then the market "
+                            "resolves to Yes."}
+    AUG = {"ticker": "KXAIMANU-26OCT01-T61",
+           "title": "Will Ramp AI Index: Sector adoption rate - Manufacturing "
+                    "for August 2026 be above 61%?"}
+
+    def setUp(self):
+        # The sandbox disables allowlist-only for its fixture series; these
+        # tests are ABOUT allowlist membership, so restore production mode.
+        self._old = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+
+    def tearDown(self):
+        imm.ALLOWLIST_ONLY = self._old
+
+    def test_the_whole_family_is_allowed_by_exact_name(self):
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        self.assertEqual(tuple(imm.RAMP_AI_SERIES), self.SERIES)
+        for s in self.SERIES:
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            t = f"{s}-26OCT17-T6"
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+            # allowed means the open-scan tier leaves it to the normal book
+            self.assertEqual(imm.scan_universe_reason(t), "allowed", t)
+        # exact names: no near-miss series rides in on them
+        for t in ("KXAIADOPTIONX-26OCT17-T6", "KXAI-26OCT17-T6",
+                  "KXGOOGLADOPTW-26OCT17-T6", "KXAISPEND-26OCT17-T6"):
+            self.assertFalse(a(t), t)
+
+    def test_guard_set_safe_join_plus_release_day(self):
+        for s in self.SERIES:
+            ov = imm.series_override(s)
+            self.assertIsNotNone(ov, s)
+            self.assertTrue(ov.safe_join, s)
+            self.assertEqual(ov.release_guard_day, 6, s)
+        # the scan-guard handoff keeps the release day either way
+        # (ensure_scan_override rebuilds from the prior with replace())
+        s = "KXAIADOPTION"
+        before = imm.SERIES_OVERRIDES[s]
+        try:
+            imm.ensure_scan_override(s)
+            self.assertEqual(imm.SERIES_OVERRIDES[s].release_guard_day, 6)
+            imm.release_scan_override(s)
+            self.assertIs(imm.SERIES_OVERRIDES[s], before)
+        finally:
+            imm.SCAN_GUARDED_SERIES.discard(s)
+            imm._SCAN_PRIOR_OVERRIDES.pop(s, None)
+            imm.SERIES_OVERRIDES[s] = before
+
+    def test_top_three_per_event(self):
+        for s in self.SERIES:
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+        self.assertEqual(imm.event_top_n_for("KXGOOD"), 0)
+        # the pre-existing caps are untouched by the appended spec
+        self.assertEqual(imm.event_top_n_for("KXAAAGASD"), 3)
+        self.assertEqual(imm.event_top_n_for("KXAMZNCC"), 3)
+
+    def test_data_month_parses_from_title_then_rules(self):
+        self.assertEqual(imm.market_data_month(self.SEP), (2026, 9))
+        self.assertEqual(imm.market_data_month(self.AUG), (2026, 8))
+        self.assertEqual(imm.market_data_month(
+            {"rules_primary": self.SEP["rules_primary"]}), (2026, 9))
+        # a dated phrase is NOT a data month ("for September 8, 2026")
+        self.assertIsNone(imm.market_data_month(
+            {"title": "Will X for September 8, 2026 be above 6%?"}))
+        self.assertIsNone(imm.market_data_month({"title": "Will X be above 6%?"}))
+        self.assertIsNone(imm.market_data_month(None))
+
+    def test_release_guard_is_midnight_et_on_the_6th_of_the_next_month(self):
+        self.assertEqual(imm.release_guard_cutoff(2026, 9, 6),
+                         utc(2026, 10, 6, 4, 0))          # EDT
+        self.assertEqual(imm.release_guard_cutoff(2026, 8, 6),
+                         utc(2026, 9, 6, 4, 0))
+        self.assertEqual(imm.release_guard_cutoff(2026, 12, 6),
+                         utc(2027, 1, 6, 5, 0))           # year roll, EST
+
+    def test_guard_beats_the_ticker_date_for_both_producers(self):
+        # ticker 26OCT17 says Oct 17; the September print lands ~Oct 8-13;
+        # the guard puts the bot out at 00:00 ET Oct 6 -- through the ONE
+        # function both cutoff producers (refresh, orphan-restore) call
+        ev = "KXGOOGLADOPT-26OCT17"
+        raw = imm.trade_cutoff_utc(ev, None, None)
+        self.assertEqual(raw, utc(2026, 10, 17, 4, 0))
+        c = imm.apply_series_cutoff_adjustments(
+            "KXGOOGLADOPT", ev, raw, close_time=utc(2026, 10, 17, 3, 59),
+            market=self.SEP)
+        self.assertEqual(c, utc(2026, 10, 6, 4, 0))
+        # August data under a 26OCT01 ticker: Sep 6, not Oct 1 (the real
+        # release was Sep 9 10am ET; Kalshi early-closed 15:25Z)
+        ev2 = "KXAIMANU-26OCT01"
+        c2 = imm.apply_series_cutoff_adjustments(
+            "KXAIMANU", ev2, imm.trade_cutoff_utc(ev2, None, None),
+            close_time=None, market=self.AUG)
+        self.assertEqual(c2, utc(2026, 9, 6, 4, 0))
+        # an EARLIER cutoff (Kalshi occurrence, a hand override) still wins
+        c3 = imm.apply_series_cutoff_adjustments(
+            "KXGOOGLADOPT", ev, utc(2026, 10, 1, 12, 0), market=self.SEP)
+        self.assertEqual(c3, utc(2026, 10, 1, 12, 0))
+        # and a None cutoff becomes the guard, not None
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGOOGLADOPT", ev, None, market=self.SEP), utc(2026, 10, 6, 4, 0))
+
+    def test_no_data_month_fails_closed(self):
+        ev = "KXGOOGLADOPT-26OCT17"
+        raw = imm.trade_cutoff_utc(ev, None, None)
+        c = imm.apply_series_cutoff_adjustments(
+            "KXGOOGLADOPT", ev, raw,
+            market={"ticker": ev + "-T6", "title": "Will it be above 6%?"})
+        self.assertEqual(c, imm.RELEASE_GUARD_UNKNOWN)
+        # no market object at all (a producer that forgot to pass it) is the
+        # same stand-down, never the raw ticker-date fallback
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGOOGLADOPT", ev, raw), imm.RELEASE_GUARD_UNKNOWN)
+        # _screen reads that as over, member or not
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        meta = imm.MarketMeta(ticker=ev + "-T6", event_ticker=ev,
+                              series="KXGOOGLADOPT", dollars_per_day=24.0,
+                              program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=c,
+                              close_time=utc(2026, 10, 17, 3, 59))
+        self.assertEqual(bot._screen(meta, utc(2026, 9, 12, 12, 0)), "cutoff")
+        self.assertEqual(bot._screen(meta, utc(2026, 9, 12, 12, 0),
+                                     member=True), "cutoff")
+        # unguarded series never see any of this
+        self.assertIsNone(imm.apply_series_cutoff_adjustments(
+            "KXGOOD", "KXGOOD-99DEC31", None, market={"title": "for May 2026"}))
+
+
 class TestAllowlist(unittest.TestCase):
     def setUp(self):
         self._old = imm.ALLOWLIST_ONLY
