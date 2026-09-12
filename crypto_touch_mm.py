@@ -1033,6 +1033,18 @@ class TouchMarketMaker:
             return f"fair={fair}c >= {SKIP_FAIR_ABOVE_CENTS}c (near touch)"
         return None
 
+    def risk_rules_line(self) -> str:
+        """Startup-banner description of the v2.6 risk rules as THIS class runs
+        them (variants with per-tenor tables override it)."""
+        rules_on = (self.vol_shrink_w < 1.0 or self.ask_min_fair_cents > 0
+                    or self.max_event_risk_dollars < float("inf") or self.skew_max_cents > 0
+                    or self.reduce_only_at < float("inf"))
+        return (f"risk rules v2.6 {'ON' if rules_on else 'off'}: vol shrink w={self.vol_shrink_w:g} "
+                f"toward long-run median, ask floor fair<{self.ask_min_fair_cents}c, "
+                f"event risk cap ${self.max_event_risk_dollars:g}/direction, "
+                f"skew +-{self.skew_max_cents}c full at {self.skew_full_at:g} net "
+                f"(edge floor {self.skew_edge_floor_cents}c), reduce-only at +-{self.reduce_only_at:g} net")
+
     def __init__(self, cfg: MarketConfig, client: Optional[ExchangeClient], live: bool):
         self.cfg = cfg
         self.client = client
@@ -1687,14 +1699,7 @@ class TouchMarketMaker:
             f"{self.quote_offset_cents}c off fair, {self.level_spacing_cents}c apart, post-only, "
             f"TTL {ORDER_TTL_SECS}s, per-market cap {self.max_position:g}, "
             f"event cap {self.max_event:g}")
-        rules_on = (self.vol_shrink_w < 1.0 or self.ask_min_fair_cents > 0
-                    or self.max_event_risk_dollars < float("inf") or self.skew_max_cents > 0
-                    or self.reduce_only_at < float("inf"))
-        log(f"risk rules v2.6 {'ON' if rules_on else 'off'}: vol shrink w={self.vol_shrink_w:g} "
-            f"toward long-run median, ask floor fair<{self.ask_min_fair_cents}c, "
-            f"event risk cap ${self.max_event_risk_dollars:g}/direction, "
-            f"skew +-{self.skew_max_cents}c full at {self.skew_full_at:g} net "
-            f"(edge floor {self.skew_edge_floor_cents}c), reduce-only at +-{self.reduce_only_at:g} net")
+        log(self.risk_rules_line())
 
         self.startup_event_and_sweep()
 

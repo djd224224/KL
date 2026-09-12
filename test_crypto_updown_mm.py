@@ -755,7 +755,8 @@ class TestDailyDefenses(unittest.TestCase):
                              ("daily", "weekly"))
 
     def test_config_is_pinned(self):
-        self.assertEqual(ud.SKEW_BY_CADENCE, {"daily": (4.0, 25.0)})
+        self.assertEqual(ud.SKEW_BY_CADENCE,
+                         {"daily": (4.0, 25.0), "weekly": (4.0, 120.0)})   # weekly: v1.1
         self.assertEqual(ud.SKEW_EDGE_FLOOR_CENTS, 3.0)
         self.assertEqual(ud.MOMO_CADENCES, ("daily",))
         self.assertEqual(ud.MOMO_Z, 1.5)
@@ -1207,6 +1208,144 @@ class TestDiscoverReport(unittest.TestCase):
                 raise RuntimeError("boom")
         self.assertIn("ERROR", ud.discover_report(Flaky(), NOW))
 
+
+
+# ---------------------------------------------------------------------------
+# v1.1 risk rules on the WEEKLY tenor (Jack 2026-09-12 "add to weekly and annual
+# bots too"): vol shrinkage, ask floor, $-at-risk cap, skew back-off + reduce-only.
+# The live values are pinned here; the (off) daily tenor keeps its 8/17 defenses.
+# ---------------------------------------------------------------------------
+
+def _weekly_markets(strikes):
+    return [mkt(s, EV_W, NOW - timedelta(days=5), NOW + timedelta(days=2)) for s in strikes]
+
+
+class _BookByTicker(FakeClient):
+    """FakeClient with a per-ticker (bid, ask) book; unknown tickers get 40/55."""
+
+    def __init__(self, books, **kw):
+        super().__init__(**kw)
+        self.books = books or {}
+
+    def get_orderbook(self, ticker, **kw):
+        self.orderbook_calls.append(ticker)
+        bb, ba = self.books.get(ticker, (40, 55))
+        return {"orderbook": {"yes": [[bb, 50]], "no": [[100 - ba, 50]]}}
+
+
+def _weekly_cycle(fairs, positions=None, books=None):
+    """One dry weekly cycle with fair_value_cents pinned per strike -> (bids,
+    asks, bot) with bids/asks as sorted YES-price lists per ticker. `books`
+    maps ticker -> (ext bid, ext ask); a cheap strike needs a cheap book or
+    the 15c divergence guard benches it before the rules run."""
+    c = _BookByTicker(books, markets=_weekly_markets(sorted(fairs)), positions=positions or {})
+    b = bot(c, cadences=("weekly",))
+    with priced(), mock.patch.object(ud, "fair_value_cents",
+                                     side_effect=lambda spot, strike, sigma, t: fairs[strike]):
+        b.run_cycle()
+    bids, asks = {}, {}
+    for o in b.state.sim_orders.values():
+        (bids if o["book_side"] == "bid" else asks).setdefault(o["ticker"], []).append(o["yes_price"])
+    return ({t: sorted(v, reverse=True) for t, v in bids.items()},
+            {t: sorted(v) for t, v in asks.items()}, b)
+
+
+class TestWeeklyRiskRules(unittest.TestCase):
+    def test_live_values_are_pinned(self):
+        self.assertEqual(ud.MODEL_VERSION, "crypto_updown_mm_v1.1")
+        self.assertEqual(ud.VOL_SHRINK_W, 0.5)
+        self.assertEqual(ud.ASK_MIN_FAIR_BY_CADENCE, {"weekly": 15})
+        self.assertEqual(ud.MAX_EVENT_RISK_BY_CADENCE, {"weekly": 120.0})
+        self.assertEqual(ud.SKEW_BY_CADENCE["weekly"], (4.0, 120.0))
+        self.assertEqual(ud.SKEW_BY_CADENCE["daily"], (4.0, 25.0))      # untouched
+        self.assertEqual(ud.SKEW_BACKOFF_CADENCES, ("weekly",))
+        self.assertEqual(ud.REDUCE_ONLY_BY_CADENCE, {"weekly": 240.0})
+        m = ud.UpDownMarketMaker
+        self.assertEqual((m.vol_shrink_w, m.ask_min_fair_by_cadence, m.max_event_risk_by_cadence,
+                          m.reduce_only_by_cadence, m.skew_backoff_cadences),
+                         (0.5, {"weekly": 15}, {"weekly": 120.0}, {"weekly": 240.0}, ("weekly",)))
+
+    def test_daily_and_hourly_tenors_get_no_new_rules(self):
+        for c in ("daily", "hourly"):
+            self.assertNotIn(c, ud.ASK_MIN_FAIR_BY_CADENCE)
+            self.assertNotIn(c, ud.MAX_EVENT_RISK_BY_CADENCE)
+            self.assertNotIn(c, ud.REDUCE_ONLY_BY_CADENCE)
+            self.assertNotIn(c, ud.SKEW_BACKOFF_CADENCES)
+
+    def test_shrunk_daily_vol(self):
+        rows = candles(400, 1440, 0.01)
+        raw = ud.scaled_daily_vol(rows, 1440)
+        self.assertEqual(ud.shrunk_scaled_daily_vol(rows, 1440, 1.0), (raw, raw, None))
+        r5 = ud.scaled_daily_vol(candles(400, 5, 0.001), 5)
+        self.assertEqual(ud.shrunk_scaled_daily_vol(candles(400, 5, 0.001), 5, 0.5),
+                         (r5, r5, None))                       # intraday: never shrunk
+        sigma, raw2, med = ud.shrunk_scaled_daily_vol(rows, 1440, 0.5)
+        self.assertEqual(raw2, raw)
+        closes = [c for _t, c, _h, _l in rows][:-1]
+        self.assertAlmostEqual(med, ud.long_run_median_ewma(closes), places=12)
+        self.assertAlmostEqual(sigma, math.sqrt(0.5 * raw ** 2 + 0.5 * med ** 2), places=12)
+        self.assertIsNone(ud.long_run_median_ewma(closes[:100]))   # too short a history
+        self.assertIsNone(ud.shrunk_scaled_daily_vol(rows[:100], 1440, 0.5)[2])
+
+    def test_low_vol_regime_is_lifted(self):
+        loud = candles(300, 1440, 0.04, seed=1)
+        quiet = candles(100, 1440, 0.01, seed=2, start=loud[-1][1])
+        rows = loud + [(ts + 300 * 86400, c, h, lo) for ts, c, h, lo in quiet]
+        sigma, raw, med = ud.shrunk_scaled_daily_vol(rows, 1440, 0.5)
+        self.assertGreater(med, raw * 1.5)
+        self.assertGreater(sigma, raw * 1.2)
+
+    def test_sigma_at_daily_is_shrunk_and_recorded(self):
+        b = bot(cadences=("weekly",))
+        rows = candles(400, 1440, 0.01)
+        with mock.patch.object(mm, "fetch_ohlc", return_value=rows):
+            s = b._sigma_at(1440, 0.0)
+            b.refresh_vol(0.0, NOW)
+        expected, raw, med = ud.shrunk_scaled_daily_vol(rows, 1440, ud.VOL_SHRINK_W)
+        self.assertEqual(s, expected)
+        self.assertEqual((b.state.sigma_raw, b.state.sigma_median), (raw, med))
+        self.assertEqual(b.state.sigma_daily, expected)
+
+    def test_ask_floor_bids_only_between_10_and_15c(self):
+        cheap, mid = f"{EV_W}-T102000.0", f"{EV_W}-T100000.0"
+        bids, asks, _ = _weekly_cycle({100000.0: 50, 102000.0: 12}, books={cheap: (8, 12)})
+        self.assertNotIn(cheap, asks)                 # fair 12 < 15: no asks
+        self.assertEqual(bids[cheap], [7, 5, 3])      # bids still quote at fair-5
+        self.assertEqual(asks[mid], [55, 57, 59])     # fair 50 sells as before
+        self.assertEqual(bids[mid], [40, 38, 36])
+
+    def test_reduce_only_long_blocks_new_bids_on_the_event(self):
+        cheap, mid = f"{EV_W}-T102000.0", f"{EV_W}-T100000.0"
+        fairs = {100000.0: 50, 102000.0: 12}
+        bids, asks, _ = _weekly_cycle(fairs, positions={EV_W: {cheap: 100.0}})   # net 100 < 240
+        self.assertIn(mid, bids)
+        bids, asks, _ = _weekly_cycle(fairs, positions={EV_W: {cheap: 250.0}})   # net 250 >= 240
+        self.assertEqual(bids, {})
+        self.assertIn(mid, asks)
+
+    def test_risk_cap_blocks_asks_across_the_event(self):
+        a, b_ = f"{EV_W}-T100000.0", f"{EV_W}-T102000.0"
+        fairs = {100000.0: 40, 102000.0: 50}
+        # 200 short x 60c = $120 >= the $120 cap; net -200 stays inside reduce-only
+        bids, asks, bot_ = _weekly_cycle(fairs, positions={EV_W: {a: -200.0}})
+        self.assertEqual(asks, {})
+        self.assertIn(b_, bids)
+        self.assertAlmostEqual(bot_.state.risk_short, 120.0)
+        bids, asks, _ = _weekly_cycle(fairs, positions={EV_W: {a: -100.0}})       # $60: room left
+        self.assertIn(b_, asks)
+
+    def test_skew_backoff_moves_the_discouraged_side_by_the_full_skew(self):
+        a, b_ = f"{EV_W}-T100000.0", f"{EV_W}-T102000.0"
+        books = {a: (48, 52), b_: (8, 12)}      # 48/52 sits inside fair+-5 on the 50c strike
+        fairs = {100000.0: 50, 102000.0: 12}
+        flat_b, flat_a, _ = _weekly_cycle(fairs, books=books)
+        self.assertEqual((flat_b[a], flat_a[a]), ([45, 43, 41], [55, 57, 59]))
+        long_b, long_a, _ = _weekly_cycle(fairs, positions={EV_W: {b_: 120.0}}, books=books)
+        self.assertEqual(long_b[a], [41, 39, 37])    # bids back off the full 4c
+        self.assertEqual(long_a[a], [53, 55, 57])    # asks come in 2c (5c offset - 3c floor)
+        short_b, short_a, _ = _weekly_cycle(fairs, positions={EV_W: {b_: -120.0}}, books=books)
+        self.assertEqual(short_a[a], [59, 61, 63])   # asks back off 4c
+        self.assertEqual(short_b[a], [47, 45, 43])   # bids come in 2c
 
 if __name__ == "__main__":
     unittest.main()

@@ -476,7 +476,9 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertEqual(ann.AnnualMarketMaker.num_levels_by_cadence, {})
         self.assertEqual(ann.AnnualMarketMaker.quote_offset_by_cadence, {})
         self.assertEqual(ann.AnnualMarketMaker.quote_offset_by_asset_cadence, {})
-        self.assertEqual(ann.AnnualMarketMaker.skew_by_cadence, {})
+        # v1.1: the annual skew table is its OWN (not the updown daily entry)
+        self.assertEqual(ann.AnnualMarketMaker.skew_by_cadence, {"annual": (4.0, 60.0)})
+        self.assertNotIn("daily", ann.AnnualMarketMaker.skew_by_cadence)
         self.assertEqual(ann.AnnualMarketMaker.momo_cadences, ())
         self.assertEqual(ud.UpDownMarketMaker.contracts_per_level_by_cadence,
                          {"daily": 1})
@@ -505,6 +507,124 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertNotEqual(ann.STATUS_DIR, ud.STATUS_DIR)
         self.assertNotEqual(ann.STATUS_DIR, mm.STATUS_DIR)
 
+
+
+# ---------------------------------------------------------------------------
+# v1.1 risk rules on the ANNUAL fleet (Jack 2026-09-12 "add to weekly and annual
+# bots too"): vol shrinkage (via the monthly estimator this bot reuses), ask
+# floor, $-at-risk cap, skew back-off + reduce-only. Live values pinned here.
+# ---------------------------------------------------------------------------
+
+class _BookByTicker(FakeClient):
+    """FakeClient with a per-ticker (bid, ask) book; unknown tickers get 40/55."""
+
+    def __init__(self, books, **kw):
+        super().__init__(**kw)
+        self.books = books or {}
+
+    def get_orderbook(self, ticker, **kw):
+        self.orderbook_calls.append(ticker)
+        bb, ba = self.books.get(ticker, (40, 55))
+        return {"orderbook": {"yes": [[bb, 50]], "no": [[100 - ba, 50]]}}
+
+
+def _touch_cycle(probs, positions=None, books=None):
+    """Dry cycle on MAXY touch strikes with touch_prob pinned per strike ->
+    (bids, asks, bot) with sorted YES-price lists per ticker. `books` maps
+    ticker -> (ext bid, ext ask); a cheap strike needs a cheap book or the
+    15c divergence guard benches it before the rules run."""
+    mkts = [touch_mkt(k) for k in sorted(probs)]
+    c = _BookByTicker(books, markets_by_series={"KXBTCMAXY": mkts}, positions=positions or {})
+    b = bot(c)
+    with priced(), mock.patch.object(mm, "touch_prob",
+                                     side_effect=lambda spot, strike, sigma, t, d="max": probs[strike]):
+        b.run_cycle()
+    bids, asks = {}, {}
+    for o in b.state.sim_orders.values():
+        (bids if o["book_side"] == "bid" else asks).setdefault(o["ticker"], []).append(o["yes_price"])
+    return ({t: sorted(v, reverse=True) for t, v in bids.items()},
+            {t: sorted(v) for t, v in asks.items()}, b)
+
+
+class TestAnnualRiskRules(unittest.TestCase):
+    def test_live_values_are_pinned(self):
+        self.assertEqual(ann.MODEL_VERSION, "crypto_annual_mm_v1.1")
+        self.assertEqual(ann.VOL_SHRINK_W, 0.25)
+        self.assertEqual(ann.ASK_MIN_FAIR_CENTS, 15)
+        self.assertEqual(ann.MAX_EVENT_RISK_DOLLARS, 60.0)
+        self.assertEqual((ann.SKEW_MAX_CENTS, ann.SKEW_FULL_AT_CONTRACTS), (4.0, 60.0))
+        self.assertEqual(ann.REDUCE_ONLY_AT_CONTRACTS, 120.0)
+        m = ann.AnnualMarketMaker
+        self.assertEqual(m.vol_shrink_w, 0.25)
+        self.assertEqual(m.ask_min_fair_by_cadence, {"annual": 15})
+        self.assertEqual(m.max_event_risk_by_cadence, {"annual": 60.0})
+        self.assertEqual(m.skew_by_cadence, {"annual": (4.0, 60.0)})
+        self.assertEqual(m.skew_backoff_cadences, ("annual",))
+        self.assertEqual(m.reduce_only_by_cadence, {"annual": 120.0})
+        # the updown fleet's own tables are not disturbed by the annual values
+        self.assertEqual(ud.UpDownMarketMaker.max_event_risk_by_cadence, {"weekly": 120.0})
+        self.assertEqual(ud.UpDownMarketMaker.vol_shrink_w, 0.5)
+        self.assertEqual(ud.UpDownMarketMaker.skew_backoff_cadences, ("weekly",))
+
+    def test_refresh_vol_shrinks_toward_the_long_run_median(self):
+        b = bot()
+        rows = candles(400, 1440, 0.02)
+        with mock.patch.object(mm, "fetch_ohlc", return_value=rows):
+            b.refresh_vol(0.0, NOW)
+        closes = [c for _t, c, _h, _l in rows]     # synthetic stamps are years old: none dropped
+        raw = mm.blended_daily_vol(closes)
+        med = mm.long_run_median_vol(closes)
+        self.assertEqual(b.state.sigma_raw, raw)
+        self.assertEqual(b.state.sigma_median, med)
+        self.assertAlmostEqual(b.state.sigma_daily, math.sqrt(0.25 * raw ** 2 + 0.75 * med ** 2),
+                               places=12)
+        self.assertEqual(b.sigma_for_horizon(100.0, 0.0), b.state.sigma_daily)
+
+    def test_ask_floor_bids_only_between_10_and_15c(self):
+        cheap, mid = f"{EV_MAXY}-130000", f"{EV_MAXY}-120000"
+        bids, asks, _ = _touch_cycle({120000: 0.5, 130000: 0.12}, books={cheap: (8, 12)})
+        self.assertNotIn(cheap, asks)                 # fair 12 < 15: no asks
+        self.assertEqual(bids[cheap], [8, 6, 4])      # bids still rest (fair-3, joining the 8 bid)
+        self.assertEqual(asks[mid], [55, 57, 59])     # fair 50: join the 55 ask
+        self.assertEqual(bids[mid], [40, 38, 36])
+
+    def test_reduce_only_long_blocks_new_bids(self):
+        cheap, mid = f"{EV_MAXY}-130000", f"{EV_MAXY}-120000"
+        probs = {120000: 0.5, 130000: 0.12}
+        bids, asks, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: 100.0}})   # net 100 < 120
+        self.assertIn(mid, bids)
+        bids, asks, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: 130.0}})   # net 130 >= 120
+        self.assertEqual(bids, {})
+        self.assertIn(mid, asks)
+
+    def test_risk_cap_blocks_asks_across_the_event(self):
+        """Three 35-contract shorts stay inside the 40/market cap but put
+        $78.75 at risk (> $60): every strike's sell room is zero while bids
+        still quote. At 20 each ($45) the nearest strike sells again."""
+        t20, t25, t30 = (f"{EV_MAXY}-{k}" for k in (140000, 130000, 120000))
+        probs = {120000: 0.30, 130000: 0.25, 140000: 0.20}
+        books = {t30: (26, 30), t25: (21, 25), t20: (16, 20)}   # inside the 15c divergence guard
+        short = {EV_MAXY: {t20: -35.0, t25: -35.0, t30: -35.0}}   # net -105 < reduce-only 120
+        bids, asks, b = _touch_cycle(probs, positions=short, books=books)
+        self.assertEqual(asks, {})
+        self.assertEqual(set(bids), {t20, t25, t30})
+        self.assertAlmostEqual(b.state.risk_short, 35 * (0.8 + 0.75 + 0.7))
+        lighter = {EV_MAXY: {t20: -20.0, t25: -20.0, t30: -20.0}}      # $45: room left
+        bids, asks, _ = _touch_cycle(probs, positions=lighter, books=books)
+        self.assertIn(t30, asks)                                       # nearest-to-50c quotes first
+
+    def test_skew_backoff_only_moves_the_discouraged_side(self):
+        cheap, mid = f"{EV_MAXY}-130000", f"{EV_MAXY}-120000"
+        books = {mid: (48, 52), cheap: (8, 12)}   # 48/52 sits inside fair+-3 on the 50c strike
+        probs = {120000: 0.5, 130000: 0.12}
+        flat_b, flat_a, _ = _touch_cycle(probs, books=books)
+        self.assertEqual((flat_b[mid], flat_a[mid]), ([47, 45, 43], [53, 55, 57]))
+        long_b, long_a, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: 60.0}}, books=books)
+        self.assertEqual(long_b[mid], [43, 41, 39])   # bids back off the full 4c
+        self.assertEqual(long_a[mid], [53, 55, 57])   # 3c offset = 3c floor: asks cannot come in
+        short_b, short_a, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: -60.0}}, books=books)
+        self.assertEqual(short_a[mid], [57, 59, 61])  # asks back off 4c
+        self.assertEqual(short_b[mid], [47, 45, 43])  # bids unchanged
 
 if __name__ == "__main__":
     unittest.main()

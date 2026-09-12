@@ -104,6 +104,34 @@ net BUYER of touches in low-vol regimes — long vol, lumpy), both +$357. Rule 1
 Verify after any restart: banner line `risk rules v2.6 ON: vol shrink w=0.25 ...` on all 16 bots;
 status json carries `sigma_raw`, `sigma_median`, `risk_short_dollars`, `risk_long_dollars`.
 
+## v1.1 risk rules on the weekly and annual fleets (2026-09-12, Jack "add to weekly and annual bots too")
+
+The same four rules, applied through the above/below cycle's per-cadence tables (the annual bot
+runs that cycle with cadence "annual"), sized to each fleet's own event cap with the monthly
+ratios (risk cap 30%, skew full at 30%, reduce-only at 60% of the event cap):
+
+| fleet | vol shrink w | ask floor | risk cap / event / direction | skew | reduce-only |
+|---|---|---|---|---|---|
+| weekly above/below (`crypto_updown_mm` v1.1, caps 80/400/800) | 0.5 on the daily EWMA sigma | fair < 15c | $120 | +-4c full at 120 net, back-off | +-240 net |
+| annual (`crypto_annual_mm` v1.1, caps 40/200/400) | 0.25 on the monthly estimator it reuses | fair < 15c | $60 | +-4c full at 60 net, back-off | +-120 net |
+| weekly one-touch (`crypto_touch_mm_weekly`, idle) | inherits `MonthlyTouchMarketMaker` | 15c | 30% of its event cap | full at 30% | 60% |
+
+- **Weekly w=0.5, not 0.25**: at a 7-day horizon the vol-regime bias is only +-2 pts (vs +-11-13 at
+  30 days) and w=0.5 minimises the 2y calibration error (MAE 3.96 -> 3.53); it is mostly a guard
+  against the estimator sitting at a cyclical low. `shrunk_scaled_daily_vol` shrinks only the
+  DAILY (1440m) estimate; the intraday blends used by the (off) hourly/daily tenors are untouched.
+- **Skew back-off** (`SKEW_BACKOFF_CADENCES`): the side the inventory skew DISCOURAGES backs off by
+  the full unclamped skew (more edge can never violate the 3c floor); the encouraged side keeps
+  the floor-clamped shift exactly as the daily tenor had it. On the annual fleet the 3c offset
+  equals the 3c floor, so its skew is purely the back-off. The daily tenor keeps its 8/17 defenses
+  unchanged (`test_config_is_pinned`, `test_skew_thinned_edge_never_drops_below_the_floor`).
+- The 10-90c band still drops BOTH sides below 10c; the ask floor lifts only the ask side to 15c.
+- Risk dollars are summed per event from account-level positions (strikes outside the quoted band
+  count at 50c) and shown on the event summary line (`risk short/long $x/$y cap $z`); the cycle
+  header now shows `sigma_d=... (raw r, median m)`. Banner: `risk rules v1.1 ON: ...` per tenor.
+- Pins: `TestWeeklyRiskRules`, `TestAnnualRiskRules`, and the weekly-touch suite's
+  `test_ask_floor_inherited_from_the_monthly_rules`. 341 tests across the four suites.
+
 ## Order management & safety
 
 - **TTL 600s stamped per-send / refreshed at 420s age** — quotes die ≤10 min if anything dies.

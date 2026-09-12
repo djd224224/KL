@@ -618,6 +618,7 @@ class TestRunCycle(unittest.TestCase):
         c = FakeClient([{"markets": [mkt("KXBTCMAXW-26AUG09-T110", 110000)],
                          "cursor": None}])
         b = bot(c)
+        b.ask_min_fair_cents = 0     # this strike prices ~13c; the ask floor has its own test
         with priced():
             b.run_cycle()
         self.assertEqual(b.state.event_ticker, EV)
@@ -635,6 +636,25 @@ class TestRunCycle(unittest.TestCase):
         self.assertEqual([asks[i + 1] - asks[i] for i in range(len(asks) - 1)],
                          [mm.LEVEL_SPACING_CENTS] * (len(asks) - 1))
         self.assertTrue(all(o["remaining_count"] <= mm.CONTRACTS_PER_LEVEL for o in placed))
+
+    def test_ask_floor_inherited_from_the_monthly_rules(self):
+        """v2.6 rules ride along (2026-09-12): a ~13c strike gets bids only."""
+        self.assertTrue(issubclass(wk.WeeklyTouchMarketMaker, mm.MonthlyTouchMarketMaker))
+        self.assertEqual(wk.WeeklyTouchMarketMaker.ask_min_fair_cents, 15)
+        self.assertEqual(wk.WeeklyTouchMarketMaker.vol_shrink_w, 0.25)
+        self.assertEqual(wk.WeeklyTouchMarketMaker.max_event_risk_dollars,
+                         0.3 * wk.WeeklyTouchMarketMaker.max_event)
+        self.assertEqual(wk.WeeklyTouchMarketMaker.reduce_only_at,
+                         0.6 * wk.WeeklyTouchMarketMaker.max_event)
+        c = FakeClient([{"markets": [mkt("KXBTCMAXW-26AUG09-T110", 110000)],
+                         "cursor": None}])
+        b = bot(c)
+        with priced():
+            b.run_cycle()
+        placed = list(b.state.sim_orders.values())
+        self.assertTrue(placed)
+        self.assertTrue(all(o["book_side"] == "bid" for o in placed))   # floor: no asks
+        self.assertLessEqual(max(o["yes_price"] for o in placed), 10)  # still joins, never leads
 
     def test_last_hours_stand_down(self):
         end = NOW + timedelta(hours=1)      # inside min_hours_left (2h)

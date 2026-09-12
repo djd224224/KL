@@ -86,7 +86,7 @@ import crypto_touch_mm as mm            # noqa: E402
 import crypto_updown_mm as ud           # noqa: E402
 from crypto_touch_mm import DataError, log   # noqa: E402
 
-MODEL_VERSION = "crypto_annual_mm_v1.0"
+MODEL_VERSION = "crypto_annual_mm_v1.1"
 CLIENT_ORDER_PREFIX = os.environ.get("CAY_CLIENT_ORDER_PREFIX", "cay")
 
 
@@ -120,6 +120,29 @@ SKIP_FAIR_ABOVE_CENTS = _env_i("CAY_SKIP_FAIR_ABOVE_CENTS", 90)
 SKIP_FAIR_BELOW_CENTS = _env_i("CAY_SKIP_FAIR_BELOW_CENTS", 10)
 MAX_MARKETS_PER_EVENT = _env_i("CAY_MAX_MARKETS_PER_EVENT", 8)
 MAX_FAIR_DIVERGENCE_CENTS = _env_i("CAY_MAX_FAIR_DIVERGENCE_CENTS", 15)
+
+# ---- v1.1 risk rules (Jack 2026-09-12 "add to weekly and annual bots too") ----
+# The monthly fleet's v2.6 set, sized for 3x1 rungs and caps 40/200/400.
+# Applied through the updown cycle's per-cadence tables (everything here is
+# cadence "annual"). Code defaults ARE the live config.
+#  1. sigma shrinkage toward the long-run median of the monthly estimator this
+#     bot already reuses (TouchMarketMaker.refresh_vol): at a months-long
+#     horizon vol mean-reversion dominates, so the 30-day calibration result
+#     (w=0.25: error 6.4 -> 4.3 pts) is the closest evidence.
+VOL_SHRINK_W = _env_f("CAY_VOL_SHRINK_W", 0.25)
+#  2. no asks where the model fair is below 15c (the 10-90c band already
+#     drops both sides below 10c).
+ASK_MIN_FAIR_CENTS = _env_i("CAY_ASK_MIN_FAIR_CENTS", 15)
+#  3. dollars-at-risk cap per event AND direction, valued at fair: 30% of the
+#     200-contract event cap (the monthly fleet's 300/1000 ratio).
+MAX_EVENT_RISK_DOLLARS = _env_f("CAY_MAX_EVENT_RISK", 60.0)
+#  4. inventory skew +-4c, full at 30% of the event cap. With a 3c offset and
+#     the 3c edge floor the ENCOURAGED side cannot move, so here the skew is
+#     purely the back-off of the discouraged side (up to 4c), plus reduce-only
+#     beyond 60% of the event cap.
+SKEW_MAX_CENTS = _env_f("CAY_SKEW_MAX_CENTS", 4.0)
+SKEW_FULL_AT_CONTRACTS = _env_f("CAY_SKEW_FULL_AT", 60.0)
+REDUCE_ONLY_AT_CONTRACTS = _env_f("CAY_REDUCE_ONLY_AT", 120.0)
 
 # Year-scale markets move slowly; 60s keeps 8 bots light on the shared API.
 POLL_SECS = _env_i("CAY_POLL_SECS", 60)
@@ -259,8 +282,14 @@ class AnnualMarketMaker(ud.UpDownMarketMaker):
     num_levels_by_asset_cadence = {}
     quote_offset_by_cadence = {}
     quote_offset_by_asset_cadence = {}
-    skew_by_cadence = {}
     momo_cadences = ()
+    # v1.1 risk rules — this fleet's own values, never the updown tables.
+    vol_shrink_w = VOL_SHRINK_W
+    ask_min_fair_by_cadence = {"annual": ASK_MIN_FAIR_CENTS}
+    max_event_risk_by_cadence = {"annual": MAX_EVENT_RISK_DOLLARS}
+    skew_by_cadence = {"annual": (SKEW_MAX_CENTS, SKEW_FULL_AT_CONTRACTS)}
+    skew_backoff_cadences = ("annual",)
+    reduce_only_by_cadence = {"annual": REDUCE_ONLY_AT_CONTRACTS}
 
     def __init__(self, cfg: mm.MarketConfig, client, live: bool):
         super().__init__(cfg, client, live, cadences=("annual",))
@@ -502,7 +531,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"{SKIP_FAIR_ABOVE_CENTS}c, <={MAX_MARKETS_PER_EVENT} mkts/event | "
         f"caps {MAX_POSITION_CONTRACTS:g}/{MAX_EVENT_CONTRACTS:g}/"
         f"{MAX_ASSET_CONTRACTS:g} (mkt/event/asset) ===")
-    bot.run(once=args.once)
+    bot.run(once=args.once)    # run() logs risk_rules_line() (per-cadence tables) in its banner
     return 0
 
 

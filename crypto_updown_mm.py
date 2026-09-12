@@ -69,6 +69,7 @@ import argparse
 import math
 import os
 import re
+import statistics
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -92,7 +93,7 @@ for _cud, _cmm in _PASSTHROUGH.items():
 import crypto_touch_mm as mm            # noqa: E402
 from crypto_touch_mm import DataError, log   # noqa: E402
 
-MODEL_VERSION = "crypto_updown_mm_v1.0"
+MODEL_VERSION = "crypto_updown_mm_v1.1"
 CLIENT_ORDER_PREFIX = os.environ.get("CUD_CLIENT_ORDER_PREFIX", "cud")
 
 
@@ -242,6 +243,11 @@ def effective_cadences(asset: str, cadences: Sequence[str]) -> Tuple[str, ...]:
 SKEW_BY_CADENCE = {
     "daily": (_env_f("CUD_SKEW_CENTS_DAILY", 4.0),
               _env_f("CUD_SKEW_FULL_AT_DAILY", 25.0)),
+    # v1.1 (Jack 2026-09-12 "add to weekly and annual bots too"): weekly
+    # skew, full at 30% of the 400-contract event cap. See the risk-rules
+    # block below for the back-off semantics on the discouraged side.
+    "weekly": (_env_f("CUD_SKEW_CENTS_WEEKLY", 4.0),
+               _env_f("CUD_SKEW_FULL_AT_WEEKLY", 120.0)),
 }
 # The skew-THINNED side's edge never drops below this floor (adversarial
 # review 2026-08-17): event_net is ACCOUNT-level, so a manual position on the
@@ -278,6 +284,36 @@ MAX_ASSET_CONTRACTS = _env_f("CUD_MAX_ASSET", 800)         # across all tenors
 
 # Model/market disagreement guard (same spirit as the one-touch bot).
 MAX_FAIR_DIVERGENCE_CENTS = _env_i("CUD_MAX_FAIR_DIVERGENCE_CENTS", 15)
+
+# ---- v1.1 risk rules (Jack 2026-09-12 "add to weekly and annual bots too") ----
+# The monthly one-touch fleet's v2.6 rules, sized for this fleet's weekly tenor
+# (3x1 rungs, caps 80/400/800). Per-cadence tables: the (off) daily tenor keeps
+# its own defenses and crypto_annual_mm carries its own values. Code defaults
+# ARE the live config (no launcher sets the CUD_* overrides).
+#  1. sigma shrinkage toward the long-run median of the daily EWMA estimator
+#     (`shrunk_scaled_daily_vol`). At a 7-day horizon the vol-regime bias is
+#     small (+-2 pts vs +-11-13 pts at 30 days) and w=0.5 minimises the 2y
+#     calibration error (MAE 3.96 -> 3.53 pts); it is mostly a guard against
+#     the estimator sitting at a cyclical low, as it did in August 2026.
+VOL_SHRINK_W = _env_f("CUD_VOL_SHRINK_W", 0.5)
+#  2. never SELL a strike whose model fair is below this (bids still quote).
+#     The 10-90c band already drops BOTH sides below 10c; this lifts only the
+#     ask side to 15c, where the monthly fleet's cheap-tail losses lived.
+ASK_MIN_FAIR_BY_CADENCE = {"weekly": _env_i("CUD_ASK_MIN_FAIR_WEEKLY", 15)}
+#  3. dollars-at-risk cap per event AND direction, valued at fair (shorts risk
+#     100-fair per contract if the strike prints in the money, longs risk
+#     fair). 30% of the event contract cap = the monthly fleet's 300/1000 ratio.
+MAX_EVENT_RISK_BY_CADENCE = {"weekly": _env_f("CUD_MAX_EVENT_RISK_WEEKLY", 120.0)}
+#  4. skew BACK-OFF: on these cadences the side being discouraged by the
+#     inventory skew backs off by the FULL (unclamped) skew, since more edge
+#     there can never violate SKEW_EDGE_FLOOR; the encouraged side keeps the
+#     floor-clamped shift exactly as before (the daily tenor is unchanged).
+#     Plus reduce-only beyond 60% of the event cap: the losing direction stops
+#     adding well before the contract cap binds.
+SKEW_BACKOFF_CADENCES = tuple(
+    c.strip() for c in os.environ.get("CUD_SKEW_BACKOFF_CADENCES", "weekly").split(",")
+    if c.strip() in CADENCES)
+REDUCE_ONLY_BY_CADENCE = {"weekly": _env_f("CUD_REDUCE_ONLY_WEEKLY", 240.0)}
 
 # Volatility. Horizon-matched sampling: a 1h market wants recent realised vol,
 # a 7d market wants the stable daily estimate. Kraken spans: 5m->60h,
@@ -369,6 +405,37 @@ def scaled_daily_vol(candles: Sequence[Tuple[int, float, float, float]],
     if len(rets) < 20:
         raise DataError(f"only {len(rets)} returns at {interval_minutes}m")
     return mm.ewma_vol(rets) * math.sqrt(bars)
+
+
+def long_run_median_ewma(closes: Sequence[float],
+                         min_history: int = mm.VOL_MEDIAN_MIN_HISTORY) -> Optional[float]:
+    """Median of the daily EWMA vol over the expanding history — what
+    scaled_daily_vol(1440) would have said on each past day. None when the
+    history is too short for a meaningful median."""
+    rets = mm.log_returns(list(closes))
+    if len(rets) <= min_history:
+        return None
+    return statistics.median(mm.ewma_vol(rets[:i]) for i in range(min_history, len(rets) + 1))
+
+
+def shrunk_scaled_daily_vol(candles: Sequence[Tuple[int, float, float, float]],
+                            interval_minutes: int, w: float
+                            ) -> Tuple[float, float, Optional[float]]:
+    """(sigma_used, sigma_raw, long_run_median): the DAILY (1440m) estimate
+    shrunk toward its long-run median, sigma^2 = w*raw^2 + (1-w)*median^2.
+    Intraday intervals, w >= 1 and short histories return the raw estimate
+    unchanged, bit-for-bit."""
+    raw = scaled_daily_vol(candles, interval_minutes)
+    if w >= 1.0 or interval_minutes != 1440:
+        return raw, raw, None
+    closes = [c for _ts, c, _h, _l in candles]
+    if len(closes) > 2:
+        closes = closes[:-1]          # same in-progress-candle rule as scaled_daily_vol
+    med = long_run_median_ewma(closes)
+    if med is None:
+        return raw, raw, None
+    w = max(0.0, w)
+    return math.sqrt(w * raw * raw + (1.0 - w) * med * med), raw, med
 
 
 def vol_interval_for_horizon(t_days: float) -> int:
@@ -568,6 +635,9 @@ class UpDownState:
     momo_side: Optional[str] = None
     momo_until: float = 0.0
     last_ret_1h: Optional[float] = None
+    # v1.1: unshrunk daily sigma + the median it shrinks toward (status/log)
+    sigma_raw: Optional[float] = None
+    sigma_median: Optional[float] = None
 
 
 class UpDownMarketMaker(mm.TouchMarketMaker):
@@ -602,6 +672,12 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
     momo_cadences = MOMO_CADENCES
     momo_z = MOMO_Z
     momo_hold_secs = MOMO_HOLD_SECS
+    # v1.1 risk rules, per cadence (crypto_annual_mm carries its own tables)
+    vol_shrink_w = VOL_SHRINK_W
+    ask_min_fair_by_cadence = ASK_MIN_FAIR_BY_CADENCE
+    max_event_risk_by_cadence = MAX_EVENT_RISK_BY_CADENCE
+    reduce_only_by_cadence = REDUCE_ONLY_BY_CADENCE
+    skew_backoff_cadences = SKEW_BACKOFF_CADENCES
 
     def __init__(self, cfg: mm.MarketConfig, client, live: bool,
                  cadences: Sequence[str] = ("hourly", "daily")):
@@ -617,9 +693,11 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
         if cached and now_ts - cached[1] < VOL_REFRESH_SECS:
             return cached[0]
         candles = mm.fetch_ohlc(self.cfg, interval_minutes)
-        sigma = scaled_daily_vol(candles, interval_minutes)
+        sigma, raw, med = shrunk_scaled_daily_vol(candles, interval_minutes, self.vol_shrink_w)
         if not (VOL_MIN <= sigma <= VOL_MAX):
             raise DataError(f"{interval_minutes}m vol {sigma:.4f} outside sanity range")
+        if interval_minutes == 1440:
+            self.u.sigma_raw, self.u.sigma_median = raw, med
         self.u.sigma_cache[interval_minutes] = (sigma, now_ts)
         return sigma
 
@@ -639,11 +717,35 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
             return slow
         return VOL_FAST_WEIGHT * fast + (1.0 - VOL_FAST_WEIGHT) * slow
 
+    def risk_rules_line(self) -> str:
+        """Startup banner: the v1.1 rules per quoted tenor (tables, not the
+        monthly fleet's scalar attributes)."""
+        rules = []
+        if self.vol_shrink_w < 1.0:
+            rules.append(f"vol shrink w={self.vol_shrink_w:g} toward long-run median (daily sigma)")
+        for c in self.cadences:
+            parts = []
+            if c in self.ask_min_fair_by_cadence:
+                parts.append(f"ask floor fair<{self.ask_min_fair_by_cadence[c]}c")
+            if c in self.max_event_risk_by_cadence:
+                parts.append(f"event risk cap ${self.max_event_risk_by_cadence[c]:g}/direction")
+            if c in self.skew_by_cadence:
+                mx, full = self.skew_by_cadence[c]
+                parts.append(f"skew +-{mx:g}c full at {full:g} net"
+                             + (" with back-off" if c in self.skew_backoff_cadences else ""))
+            if c in self.reduce_only_by_cadence:
+                parts.append(f"reduce-only at +-{self.reduce_only_by_cadence[c]:g} net")
+            if parts:
+                rules.append(f"{c}: " + ", ".join(parts))
+        return f"risk rules v1.1 {'ON' if rules else 'off'}: {'; '.join(rules)}"
+
     def refresh_vol(self, now_ts: float, now_utc: datetime) -> None:
         """Base-class hook: the daily estimate underpins every blend, so make
         sure it exists (and fails the cycle if it can't be built)."""
         sigma = self._sigma_at(1440, now_ts)
         self.state.sigma_daily = sigma
+        self.state.sigma_raw = self.u.sigma_raw
+        self.state.sigma_median = self.u.sigma_median
         self.state.vol_fetched_at = now_ts
 
     # ---- discovery ----------------------------------------------------------
@@ -925,10 +1027,13 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
         self.state.last_event_net = asset_net
         asset_room_buy = self.max_asset - asset_net
         asset_room_sell = self.max_asset + asset_net
+        self.state.risk_short = self.state.risk_long = 0.0   # v1.1: summed over events
 
         summary = [f"{self.tag} {self.cfg.asset}=${spot:,.2f} "
-                   f"sigma_d={self.state.sigma_daily:.4f} net={asset_net:+.0f} "
-                   f"events={len(selected)}"
+                   f"sigma_d={self.state.sigma_daily:.4f}"
+                   + (f" (raw {self.state.sigma_raw:.4f}, median {self.state.sigma_median:.4f})"
+                      if self.state.sigma_median is not None else "")
+                   + f" net={asset_net:+.0f} events={len(selected)}"
                    + (f" MOMO-BLOCK:{momo_block}s" if momo_block else "")]
         desired: List[mm.Quote] = []
         blind = set()
@@ -975,10 +1080,32 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                         f"inventory skew (account-level: may include non-bot "
                         f"positions)", key=v.ticker, urgent=False)
             band = self.quotable_markets(v, spot, now_utc, now_ts)
+            # v1.1 risk rules for this tenor (absent from the tables = off).
+            ask_floor = self.ask_min_fair_by_cadence.get(v.cadence, 0)
+            risk_cap = self.max_event_risk_by_cadence.get(v.cadence, float("inf"))
+            reduce_at = self.reduce_only_by_cadence.get(v.cadence, float("inf"))
+            backoff = skew
+            if skew_cfg and v.cadence in self.skew_backoff_cadences:
+                # unclamped: the discouraged side only ever GAINS edge
+                backoff = inventory_skew_cents(event_net, *skew_cfg)
+            risk_short, risk_long = mm.event_risk_dollars(
+                positions, {t: f for _m, t, _s, f in band})
+            self.state.risk_short += risk_short
+            self.state.risk_long += risk_long
+            ev_notes: List[str] = []
+            if event_net >= reduce_at:
+                event_room_buy = 0.0
+                ev_notes.append("reduce-only (long)")
+            elif event_net <= -reduce_at:
+                event_room_sell = 0.0
+                ev_notes.append("reduce-only (short)")
             summary.append(
                 f"  {v.ticker} [{v.cadence}] {v.secs_left(now_utc) / 3600:.2f}h left, "
                 f"{len(v.markets)} strikes -> {len(band)} quotable, net={event_net:+.0f}"
-                + (f", skew={skew:+.1f}c" if skew else ""))
+                + (f", skew={skew:+.1f}c" if skew else "")
+                + (f", risk short/long ${risk_short:.0f}/${risk_long:.0f} cap ${risk_cap:g}"
+                   if risk_cap != float("inf") else "")
+                + (f" [{'; '.join(ev_notes)}]" if ev_notes else ""))
             remaining = len(band)
             for _moneyness, ticker, strike, fair in band:
                 share_buy = event_room_buy / remaining if remaining > 0 else 0.0
@@ -1017,13 +1144,44 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                 pos = positions.get(ticker, 0.0)
                 room_buy = min(self.max_position - pos, share_buy)
                 room_sell = min(self.max_position + pos, share_sell)
+                notes: List[str] = []
+                # v1.1 rule 3: dollars-at-risk room (a whole ladder is assumed
+                # to fill, like the contract caps); later strikes see this
+                # ladder's risk.
+                short_unit = (100 - fair) / 100.0
+                long_unit = fair / 100.0
+                risk_sell = mm.risk_room_contracts(risk_short, risk_cap, short_unit)
+                risk_buy = mm.risk_room_contracts(risk_long, risk_cap, long_unit)
+                if risk_sell < room_sell:
+                    room_sell = risk_sell
+                    notes.append(f"risk cap sell room {risk_sell:.0f}")
+                if risk_buy < room_buy:
+                    room_buy = risk_buy
+                    notes.append(f"risk cap buy room {risk_buy:.0f}")
+                # v1.1 rule 2: never sell cheap tails (bids still quote).
+                if fair < ask_floor:
+                    room_sell = 0.0
+                    notes.append(f"ask floor (fair<{ask_floor}c)")
                 # Inventory skew moves only the QUOTING fair — band selection
-                # and the divergence guard above judged the model fair.
+                # and the divergence guard above judged the model fair. On the
+                # back-off cadences the discouraged side uses the full skew.
                 q_fair = int(round(max(1, min(99, fair + skew))))
-                quotes = mm.build_quotes(ticker, q_fair, best_bid, best_ask,
-                                         room_buy, room_sell,
-                                         n_levels, cpl,
-                                         offset, self.level_spacing_cents)
+                q_back = int(round(max(1, min(99, fair + backoff))))
+                q_fair_bid, q_fair_ask = q_fair, q_fair
+                if backoff < 0:       # long: bids back off
+                    q_fair_bid = q_back
+                elif backoff > 0:     # short: asks back off
+                    q_fair_ask = q_back
+                if (q_fair_bid, q_fair_ask) != (fair, fair):
+                    notes.append(f"skew bid/ask fair {q_fair_bid}/{q_fair_ask}c")
+                quotes = ([q for q in mm.build_quotes(ticker, q_fair_bid, best_bid, best_ask,
+                                                      room_buy, 0.0, n_levels, cpl,
+                                                      offset, self.level_spacing_cents)
+                           if q.book_side == "bid"]
+                          + [q for q in mm.build_quotes(ticker, q_fair_ask, best_bid, best_ask,
+                                                        0.0, room_sell, n_levels, cpl,
+                                                        offset, self.level_spacing_cents)
+                             if q.book_side == "ask"])
                 if momo_block and v.cadence in self.momo_cadences:
                     quotes = [q for q in quotes if q.book_side != momo_block]
                 desired.extend(quotes)
@@ -1033,13 +1191,16 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                 event_room_sell -= sold
                 asset_room_buy -= bought
                 asset_room_sell -= sold
+                risk_long += bought * long_unit
+                risk_short += sold * short_unit
 
                 summary.append(
                     f"    {ticker} K={strike:g} fair={fair}c ext "
                     f"{best_bid if best_bid is not None else '--'}/"
                     f"{best_ask if best_ask is not None else '--'} pos={pos:+.0f} "
                     f"bids={sorted((q.price_cents for q in quotes if q.book_side == 'bid'), reverse=True)} "
-                    f"asks={sorted(q.price_cents for q in quotes if q.book_side == 'ask')}")
+                    f"asks={sorted(q.price_cents for q in quotes if q.book_side == 'ask')}"
+                    + (f" [{'; '.join(notes)}]" if notes else ""))
 
         to_place, to_cancel = mm.diff_orders(desired, resting, self.state.order_ages,
                                              now_ts, preserve_tickers=blind)
@@ -1202,7 +1363,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         defenses.append(f"{a} {c} {', '.join(parts)}")
     if defenses:
         log(f"=== defenses: {'; '.join(defenses)} ===")
-    bot.run(once=args.once)
+    bot.run(once=args.once)    # run() logs risk_rules_line() in its banner
     return 0
 
 

@@ -236,7 +236,11 @@ class WeeklyState:
     idle_reason: str = ""
 
 
-class WeeklyTouchMarketMaker(mm.TouchMarketMaker):
+class WeeklyTouchMarketMaker(mm.MonthlyTouchMarketMaker):
+    # Inherits the monthly fleet's v2.6 risk rules (vol shrinkage, ask floor,
+    # $-at-risk cap, skew + reduce-only) since 2026-09-12 (Jack "add to weekly
+    # and annual bots too"); the contract-scaled ones are resized to this
+    # fleet's own event cap below (30% / 30% / 60%, the monthly's ratios).
     window_label = "WTD"
     min_hours_left = MIN_HOURS_LEFT
     status_dir = STATUS_DIR
@@ -245,6 +249,9 @@ class WeeklyTouchMarketMaker(mm.TouchMarketMaker):
     poll_secs = _risk("poll_secs")
     max_position = _risk("max_position")
     max_event = _risk("max_event")
+    max_event_risk_dollars = 0.3 * _risk("max_event")
+    skew_full_at = 0.3 * _risk("max_event")
+    reduce_only_at = 0.6 * _risk("max_event")
 
     def __init__(self, cfg: mm.MarketConfig, client, live: bool,
                  pinned_event: Optional[str] = None):
