@@ -6005,6 +6005,24 @@ class TestDailySeries(unittest.TestCase):
         imm.refresh_daily_series(feed, t0)
         imm.refresh_daily_series({}, t0 + timedelta(days=15))
         self.assertFalse(imm.is_daily_series("KXNEWGASD"))
+        # the horizon is NOT hysteretic: a member whose event day moves out
+        # of bounds (a weekly funded in daily chunks) is dropped at once
+        imm.refresh_daily_series(feed, t0)
+        added, dropped = imm.refresh_daily_series(
+            self._feed([("KXNEWGASD-26SEP19-4.00", t0, 16),
+                        ("KXNEWGASD-26SEP26-4.00", t0, 16)]),
+            t0 + timedelta(hours=4))
+        self.assertEqual(dropped, ["KXNEWGASD"])
+        # ...and a stale file cannot seed such a member on load
+        imm.DAILY_SERIES_DYNAMIC.clear()
+        with open(imm.daily_series_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": {"KXSTALEWEEKLY": {"p75_h": 24.0, "horizon_h": 203.5,
+                                                    "dates": 2, "n": 10},
+                                  "KXGOODDAILY": {"p75_h": 16.0, "horizon_h": 40.0,
+                                                  "dates": 2, "n": 4}}}, f)
+        self.assertEqual(imm.load_daily_series_file(), 1)
+        self.assertTrue(imm.is_daily_series("KXGOODDAILY"))
+        self.assertFalse(imm.is_daily_series("KXSTALEWEEKLY"))
         # absent file: untouched
         os.remove(imm.daily_series_path())
         self.assertEqual(imm.load_daily_series_file(), 0)

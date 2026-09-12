@@ -1972,9 +1972,13 @@ families are excluded (in addition to current daily families)."
   (KXSUEZWEEKLY, KXBABELMANDEBWEEKLY: horizon ~228h) long-dated; the p75
   keeps KXTRUMPMENTION (same-day speech events + 22-day programs) long-
   dated; the dates test keeps earnings mention (one event per company)
-  long-dated. Hysteresis: stays daily until p75 program > 72h; forgotten
-  after 14 days out of the feed. Persisted to `daily_series.json`, loaded
-  at startup (main) and by the tracker. Validated on the full feed history:
+  long-dated. Hysteresis on the program window only: stays daily until
+  p75 program > 72h; the horizon is re-checked every refresh AND on load
+  (a launcher relaunch at 17:06Z ran the half-patched, horizon-less rule
+  for six minutes and seeded the five shipping weeklies as daily; the
+  purge-on-load dropped them). Forgotten after 14 days out of the feed.
+  Persisted to `daily_series.json`, loaded at startup (main) and by the
+  tracker. Validated on the full feed history:
   daily = temp hourlies, gas state dailies, KXDIESELD, KXRAIN, KXTRUEV,
   KXUST*AD, KXSOFRD, KXEURUSD/KXUSDJPY, KXTXERCOTPEAKD, 15-minute metals,
   KXWORLDNEWSMENTION, KXTRUMPMENTIONB, KXMAMDANIMENTION; long-dated =

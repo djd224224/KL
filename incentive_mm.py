@@ -1159,6 +1159,19 @@ def _daily_by_rule(st: dict) -> bool:
             and hz is not None and -24.0 <= hz <= DAILY_MAX_HORIZON_HOURS)
 
 
+def _daily_out_of_bounds(st: dict) -> bool:
+    """A member leaves the class when its program window crosses the
+    hysteresis line OR its event horizon is outside the structural bound.
+    Only the dates test is hysteretic (a feed can momentarily carry one
+    date); the horizon is a property of the family, so it is re-checked
+    every refresh and on load — 2026-09-12: a stale file seeded five
+    shipping weeklies (24h programs on 7-day markets, horizon 203h) and the
+    program-length-only drop would have kept them daily forever."""
+    hz = st.get("horizon_h")
+    return (st.get("p75_h", 0.0) > DAILY_DROP_HOURS
+            or (hz is not None and not (-24.0 <= hz <= DAILY_MAX_HORIZON_HOURS)))
+
+
 def daily_series_path() -> str:
     return os.path.join(STATUS_DIR, DAILY_SERIES_FILE)
 
@@ -1189,7 +1202,8 @@ def load_daily_series_file() -> int:
     if isinstance(ser, dict):
         DAILY_SERIES_DYNAMIC.clear()
         DAILY_SERIES_DYNAMIC.update({str(k): dict(v) for k, v in ser.items()
-                                     if isinstance(v, dict)})
+                                     if isinstance(v, dict)
+                                     and not _daily_out_of_bounds(v)})
     return len(DAILY_SERIES_DYNAMIC)
 
 
@@ -1212,7 +1226,7 @@ def refresh_daily_series(by_market: Dict[str, dict],
         else:
             cur.update(st)
             cur["seen"] = now_utc.isoformat()
-            if st["p75_h"] > DAILY_DROP_HOURS:
+            if _daily_out_of_bounds(st):
                 DAILY_SERIES_DYNAMIC.pop(s)
                 dropped.append(s)
     cutoff = now_utc - timedelta(days=14)
