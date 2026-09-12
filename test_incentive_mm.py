@@ -7610,6 +7610,51 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertIn("10.92", opp.cum_text_table(cum)[1])
         self.assertIn("10.92", opp.cum_html_table(cum))
 
+    def test_realized_is_lifetime_and_bot_attributed(self):
+        # Jack 2026-09-11, on the AAA gas monthlies: "P&L of $1.30 is wrong.
+        # I see P&L of -$5". The row P&L was open-book MTM plus only the
+        # past 24h of fill-attributed realized, so a book that holds
+        # multi-week inventory showed almost none of its trading.
+        # KXAAAGASMINM-26SEP30 printed +1.30 (pure MTM) while Kalshi's own
+        # realized on the same two markets was -5.20 -- -4.00 of it on a
+        # strike the bot had already closed, which contributed nothing.
+        import send_opportunistic_imm as opp
+        # -3.75 still open and ours; -3.85 closed out (flat, still in the
+        # account with its realized); both in the account, positions agree
+        acct_real = {"KXAAAGASMINM-26SEP30-3.75": -1.20,
+                     "KXAAAGASMINM-26SEP30-3.85": -4.00}
+        acct_pos = {"KXAAAGASMINM-26SEP30-3.75": -20.0,
+                    "KXAAAGASMINM-26SEP30-3.85": 0.0}
+        bot_pos = {"KXAAAGASMINM-26SEP30-3.75": -20.0}
+        sink = {}
+        tick = sorted(acct_real)
+        got, disputed = opp.realized_for(tick, acct_real, acct_pos, bot_pos, sink)
+        self.assertAlmostEqual(got, -5.20)
+        self.assertEqual(disputed, 0)
+
+        # a market that has SETTLED has aged out of the positions endpoint;
+        # only the bot's sink still carries it
+        tick2 = tick + ["KXAAAGASMAXM-26SEP30-4.20"]
+        sink2 = dict(sink, **{"KXAAAGASMAXM-26SEP30-4.20": -9.40})
+        got2, _ = opp.realized_for(tick2, acct_real, acct_pos, bot_pos, sink2)
+        self.assertAlmostEqual(got2, -14.60)
+
+        # SHARED MARKET: the account figure is account-level, so where the
+        # bot's position does NOT match the account's, another bot or a
+        # manual trade is in the market and OUR attribution must win.
+        acct_real3 = {"KXSHARED-26OCT07-T1": -50.0}
+        acct_pos3 = {"KXSHARED-26OCT07-T1": -90.0}    # account holds 90
+        bot_pos3 = {"KXSHARED-26OCT07-T1": -20.0}     # the bot only 20
+        sink3 = {"KXSHARED-26OCT07-T1": -3.00}
+        got3, disputed3 = opp.realized_for(["KXSHARED-26OCT07-T1"], acct_real3,
+                                           acct_pos3, bot_pos3, sink3)
+        self.assertAlmostEqual(got3, -3.00)           # the sink, not -50.00
+        self.assertEqual(disputed3, 1)
+
+        # a market in neither source contributes nothing (a floor, not a lie)
+        self.assertEqual(opp.realized_for(["KXGONE-26OCT07-T1"], {}, {}, {}, {}),
+                         (0.0, 0))
+
     def test_durable_history_folds_sinks_without_double_counting(self):
         # The cumulative table's one real hazard: the `realized` sink writes
         # DELTAS, so re-reading a day would inflate it. Only COMPLETE UTC
@@ -7627,15 +7672,17 @@ class TestOpportunisticEmail(unittest.TestCase):
                 for r in recs:
                     f.write(json.dumps(r) + "\n")
         try:
+            # keyed by TICKER since 2026-09-11: the row P&L unions this
+            # per market with Kalshi's own realized_pnl_dollars
             sink("realized", "2026-09-09",
-                 [{"event_ticker": "KXA-26OCT07",
+                 [{"ticker": "KXA-26OCT07-T1", "event_ticker": "KXA-26OCT07",
                    "realized_delta_dollars": -2.0},
-                  {"event_ticker": "KXA-26OCT07",
+                  {"ticker": "KXA-26OCT07-T1", "event_ticker": "KXA-26OCT07",
                    "realized_delta_dollars": -1.0},
-                  {"event_ticker": "KXB-26OCT07",
+                  {"ticker": "KXB-26OCT07-T1", "event_ticker": "KXB-26OCT07",
                    "realized_delta_dollars": 5.0}])
             sink("realized", "2026-09-10",
-                 [{"event_ticker": "KXA-26OCT07",
+                 [{"ticker": "KXA-26OCT07-T1", "event_ticker": "KXA-26OCT07",
                    "realized_delta_dollars": 0.5}])
             # is_scan ALONE is not membership: the sink logs every decision
             # CHANGE and is_scan rides on the candidate meta, so a market the
@@ -7658,8 +7705,8 @@ class TestOpportunisticEmail(unittest.TestCase):
                    "decision": "selected"}])
             today = "2026-09-10"              # so 09-10 is the partial day
             first = opp.durable_history(today)
-            self.assertAlmostEqual(first["realized"]["KXA-26OCT07"], -2.5)
-            self.assertAlmostEqual(first["realized"]["KXB-26OCT07"], 5.0)
+            self.assertAlmostEqual(first["realized"]["KXA-26OCT07-T1"], -2.5)
+            self.assertAlmostEqual(first["realized"]["KXB-26OCT07-T1"], 5.0)
             # ONLY the selected scan candidate; not the three rejects, and
             # not the selected NON-scan market (that is the normal book)
             self.assertEqual(first["scan_events"], {"KXS-26OCT07"})
@@ -7667,20 +7714,20 @@ class TestOpportunisticEmail(unittest.TestCase):
             # re-run: identical, because the partial day is never cached
             for _ in range(3):
                 again = opp.durable_history(today)
-                self.assertAlmostEqual(again["realized"]["KXA-26OCT07"], -2.5)
-                self.assertAlmostEqual(again["realized"]["KXB-26OCT07"], 5.0)
+                self.assertAlmostEqual(again["realized"]["KXA-26OCT07-T1"], -2.5)
+                self.assertAlmostEqual(again["realized"]["KXB-26OCT07-T1"], 5.0)
             with open(opp.ROSTER_PATH, encoding="utf-8") as f:
                 cached = json.load(f)
             self.assertEqual(cached["folded_realized"], ["2026-09-09"])
             self.assertNotIn(today, cached["folded_realized"])
             # the partial day's remainder lands once the day completes
             sink("realized", "2026-09-10",
-                 [{"event_ticker": "KXA-26OCT07",
+                 [{"ticker": "KXA-26OCT07-T1", "event_ticker": "KXA-26OCT07",
                    "realized_delta_dollars": 0.25}])
             done = opp.durable_history("2026-09-11")
-            self.assertAlmostEqual(done["realized"]["KXA-26OCT07"], -2.25)
+            self.assertAlmostEqual(done["realized"]["KXA-26OCT07-T1"], -2.25)
             self.assertAlmostEqual(
-                opp.durable_history("2026-09-11")["realized"]["KXA-26OCT07"],
+                opp.durable_history("2026-09-11")["realized"]["KXA-26OCT07-T1"],
                 -2.25)
         finally:
             imm.STATUS_DIR, opp.ROSTER_PATH = old_dir, old_roster

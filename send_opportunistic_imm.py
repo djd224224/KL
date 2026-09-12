@@ -254,6 +254,64 @@ def tier_of(ticker_or_event: str, fin, scan_set) -> str:
 ROSTER_PATH = os.path.join(imm.STATUS_DIR, "opportunistic_roster.json")
 
 
+def account_realized(client) -> tuple:
+    """(realized_by_ticker, position_by_ticker) from the account's UNSETTLED
+    positions — Kalshi's own `realized_pnl_dollars`, which is per market and
+    LIFETIME.
+
+    This is the authoritative answer to "what has this market actually cost
+    us", and the email had no access to it: the row P&L was open-book MTM
+    plus whatever realized the fill replay could attribute in the past 24h,
+    so trades older than a day were simply absent. Measured 2026-09-11 on the
+    two events Jack queried: KXAAAGASMINM-26SEP30 printed P&L +$1.30 where
+    Kalshi's realized alone is -$5.20, and KXAAAGASMAXM-26SEP30 printed
+    -$17.48 against realized -$7.55 on its live strikes.
+
+    CAVEAT, and why the caller still cross-checks: this figure is
+    ACCOUNT-level. The key is shared with the crypto fleet and with Jack's
+    manual trading, so on a market the bot does not solely own it would
+    credit someone else's P&L to this book. The caller therefore takes it
+    only where the bot's own position MATCHES the account's, and falls back
+    to the bot-attributed sink otherwise.
+
+    Settled markets age out of this endpoint entirely, so it is a union with
+    the sink, never a replacement for it."""
+    real, pos = {}, {}
+    cursor = None
+    for _page in range(40):
+        resp = client.get_positions(limit=200, cursor=cursor,
+                                    settlement_status="unsettled")
+        for p in (resp.get("market_positions") or resp.get("positions") or []):
+            t = p.get("ticker")
+            if not t:
+                continue
+            real[t] = _f(p.get("realized_pnl_dollars"))
+            pos[t] = _f(p.get("position"))
+        cursor = resp.get("cursor")
+        if not cursor:
+            break
+    return real, pos
+
+
+def realized_for(tickers, acct_real, acct_pos, bot_pos, sink) -> tuple:
+    """(dollars, n_disputed) — lifetime realized over `tickers`.
+
+    Per market: Kalshi's own realized where the market is still in the
+    account AND the bot's position matches it (so the number is ours), the
+    bot-attributed sink otherwise. The sink only reaches back to its first
+    day, so a pre-sink market the bot no longer holds contributes nothing —
+    that is a floor, and the footer says so."""
+    tot, disputed = 0.0, 0
+    for t in tickers:
+        if t in acct_real:
+            if abs(_f(acct_pos.get(t)) - _f(bot_pos.get(t))) <= 0.51:
+                tot += acct_real[t]
+                continue
+            disputed += 1                 # shared market: keep OUR attribution
+        tot += _f(sink.get(t))
+    return tot, disputed
+
+
 def _sink_days(name: str) -> list:
     """[(utc_date, path)] for STATUS_DIR/<name>_YYYY-MM-DD.jsonl, oldest
     first. The sink names its files by UTC date (incentive_mm._sink), so the
@@ -268,6 +326,12 @@ def _sink_days(name: str) -> list:
 
 def _read_roster() -> dict:
     r = load_json(ROSTER_PATH) or {}
+    # SCHEMA 2 keys realized by TICKER, not event: the row P&L unions it
+    # per market with Kalshi's own realized_pnl_dollars, which needs the same
+    # granularity. A cache written by schema 1 is discarded rather than
+    # migrated — it re-folds from the sinks in 0.2s.
+    if int(_f(r.get("schema"))) != 2:
+        r = {}
     return {"scan_events": set(r.get("scan_events") or []),
             "realized": {str(k): _f(v)
                          for k, v in (r.get("realized") or {}).items()},
@@ -282,7 +346,8 @@ def _write_roster(r: dict) -> None:
     try:
         tmp = ROSTER_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"scan_events": sorted(r["scan_events"]),
+            json.dump({"schema": 2,
+                       "scan_events": sorted(r["scan_events"]),
                        "realized": {k: round(v, 6)
                                     for k, v in r["realized"].items()},
                        "folded_scan": sorted(r["folded_scan"]),
@@ -313,8 +378,8 @@ def durable_history(today_utc: str) -> dict:
     A set folds idempotently, so a partially written day can be re-read
     safely; it is only marked folded once the UTC day is complete.
 
-    realized is event -> cumulative realized trading dollars, summed from the
-    `realized` sink's DELTAS. Deltas are NOT idempotent — re-reading today's
+    realized is TICKER -> cumulative realized trading dollars, summed from
+    the `realized` sink's DELTAS. Deltas are NOT idempotent — re-reading today's
     partial file would double-count — so only COMPLETE days are ever cached
     and today's file is summed live on top of the cache every run. (Deltas,
     not realized_total_dollars: the tracker's per-ticker total restarts from
@@ -371,10 +436,10 @@ def durable_history(today_utc: str) -> dict:
                         rec = json.loads(line)
                     except ValueError:
                         continue
-                    ev = rec.get("event_ticker")
-                    if ev:
-                        day_sum[str(ev)] = (
-                            day_sum.get(str(ev), 0.0)
+                    tk = rec.get("ticker")
+                    if tk:
+                        day_sum[str(tk)] = (
+                            day_sum.get(str(tk), 0.0)
                             + _f(rec.get("realized_delta_dollars")))
         except OSError:
             continue
@@ -528,11 +593,19 @@ def build_report(now_utc):
     pos, avg = own_book(state)
     touched = {f.get("ticker", "") for f in fills} | set(pos)
     mids, results = current_mids(client, touched)
-    # pnl_windows only to keep this email's basis identical to the digest's
-    # (and to book the past-day per-event realized/settlement).
+    # pnl_windows keeps this email's basis identical to the digest's; its
+    # per-event past-day window is NO LONGER the row P&L's realized term
+    # (see realized_for) but the call stays, so the two reports still walk
+    # the same validated path.
     w = pnl_windows(client, state, our_ids, fills, mids, results,
                     ss["reward_lifetime"])
     day_ev = w["day"]["events"]
+    try:
+        acct_real, acct_pos = account_realized(client)
+    except Exception as e:                                  # noqa: BLE001
+        log(f"opportunistic account realized unavailable ({e!r}); realized "
+            f"falls back to the sink alone")
+        acct_real, acct_pos = {}, {}
 
     selected = set(state.get("selected_tickers") or [])
     accrued = state.get("accrued_est") or {}
@@ -603,7 +676,9 @@ def build_report(now_utc):
     for _d, _ev, _a in ledger:
         cred_by_event[_ev] = cred_by_event.get(_ev, 0.0) + _a
 
+    realized_by_ticker = hist["realized"]
     rows = []
+    n_disputed = 0
     for ev, tickers in by_event.items():
         earn = sum(_f(accrued.get(t)) for t in tickers)
         # P&L per event: open-book MTM on held inventory (this book almost
@@ -616,8 +691,18 @@ def build_report(now_utc):
             m = mids.get(t)
             if abs(p) > 1e-9 and m is not None:
                 mtm += p * (m - _f(avg.get(t))) / 100.0
-        de = day_ev.get(ev) or {}
-        pnl = mtm + _f(de.get("realized")) + _f(de.get("settle"))
+        # REALIZED IS LIFETIME (Jack 2026-09-11: "P&L of $1.30 is wrong. I
+        # see P&L of -$5"). It used to be the past-DAY window only -- the
+        # footer even called it 168h, which was wrong twice over: the window
+        # is 86400s, and a book that holds multi-week inventory realises most
+        # of its P&L outside ANY fill window. KXAAAGASMINM-26SEP30 printed
+        # +1.30 (pure MTM) while Kalshi's own realized on the same two
+        # markets was -5.20, including -4.00 on a strike the bot had already
+        # closed and which therefore contributed nothing at all.
+        rlz, disp = realized_for(tickers, acct_real, acct_pos, pos,
+                                 realized_by_ticker)
+        n_disputed += disp
+        pnl = mtm + rlz
         netpos = sum(_f(pos.get(t)) for t in tickers)
         n_quoted = sum(1 for t in tickers if t in quoted)
         rows.append({
@@ -657,7 +742,15 @@ def build_report(now_utc):
         if _f(av) > 0:
             ev = _event_of(t)
             cum_est[ev] = cum_est.get(ev, 0.0) + _f(av)
-    realized_by_event = hist["realized"]
+    # Cumulative REALIZED unions the same two sources per market, so it can
+    # never disagree with the rows above it.
+    realized_by_event: dict = {}
+    for _t in set(realized_by_ticker) | set(acct_real):
+        _v, _ = realized_for([_t], acct_real, acct_pos, pos,
+                             realized_by_ticker)
+        if abs(_v) > 1e-9:
+            _e = _event_of(_t)
+            realized_by_event[_e] = realized_by_event.get(_e, 0.0) + _v
     cum_universe = (set(cred_by_event) | set(realized_by_event)
                     | set(cum_mtm) | set(cum_est) | {r["event"] for r in rows})
     cum_by_tier: dict = {}
@@ -793,9 +886,15 @@ def build_report(now_utc):
              "restarts from zero whenever a market goes unquoted and flat, "
              "and it cannot see markets that have left the book at all - "
              "which is why some rows show CREDITED above EARN EST. P&L = "
-             "trading only (realized + settlement + open-book MTM), same "
-             f"windowed attribution as the digest ({FILL_LOOKBACK_HOURS}h). "
-             "NET = P&L + EARN EST, so on those rows NET understates.")
+             "trading only: LIFETIME realized (Kalshi's own per-market "
+             "realized_pnl_dollars where the bot's position matches the "
+             "account's, the bot's realized sink otherwise) plus open-book "
+             "MTM at the mid. Until 2026-09-11 it was the past 24 HOURS of "
+             "realized, which left weeks of a multi-week book's trading out "
+             "of the column. A row covers the event's LIVE book, so a strike "
+             "that has already settled sits in the CUMULATIVE table below, "
+             "not here. NET = P&L + EARN EST, so on the rows where CREDITED "
+             "exceeds EARN EST, NET understates.")
     L.append(f"In the CUMULATIVE table REALIZED is the bot's own per-market "
              f"realized trading P&L, which only starts {cum_since} (the "
              f"first analytics-sink day) - anything earlier is not in it. "
@@ -863,10 +962,16 @@ def build_report(now_utc):
              f'DELETED and restarts from zero whenever a market goes unquoted '
              f'and flat, and it cannot see markets that have left the book at '
              f'all &mdash; which is why some rows show CREDITED above EARN '
-             f'EST. P&amp;L = trading only (realized + settlement + open-book '
-             f'MTM), same windowed attribution as the digest '
-             f'({FILL_LOOKBACK_HOURS}h). NET = P&amp;L + EARN EST, so on those '
-             f'rows NET understates.</div>')
+             f'EST. P&amp;L = trading only: LIFETIME realized '
+             f'(Kalshi&rsquo;s own per-market realized_pnl_dollars where the '
+             f'bot&rsquo;s position matches the account&rsquo;s, the '
+             f'bot&rsquo;s realized sink otherwise) plus open-book MTM at the '
+             f'mid. Until 2026-09-11 it was the past 24 HOURS of realized, '
+             f'which left weeks of a multi-week book&rsquo;s trading out of '
+             f'the column. A row covers the event&rsquo;s LIVE book, so a '
+             f'strike that has already settled sits in the CUMULATIVE table '
+             f'below, not here. NET = P&amp;L + EARN EST, so on the rows where '
+             f'CREDITED exceeds EARN EST, NET understates.</div>')
     h.append(f'<div style="color:#999;font-size:11px;margin-top:4px">'
              f'Cumulative REALIZED is the bot&rsquo;s own per-market realized '
              f'trading P&amp;L and only starts <b>{cum_since}</b> (the first '
