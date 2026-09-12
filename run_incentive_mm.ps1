@@ -215,7 +215,23 @@ if ($Probe) {
     # next cycle, open NQE positions ride to settlement (SEP12 -10, SEP22
     # +45 at the time). Code-only change, so a python kill reloads it; the
     # env knob needs the task-level restart like every other env change.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=150&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
+    # SATURDAY x1.5 (Jack 2026-09-12 "Saturday multiplier of 1.5x, only on
+    # long-dated families"): IMM_SAT_SIZE_MULT=1.5 scales every rung on the
+    # ET Saturday calendar day for all series EXCEPT the dailies + temp
+    # (code default IMM_SAT_MULT_EXCLUDE=KXAAAGAS,KXDIESEL,KXRAIN,KXTEMP).
+    # From the 8/8-9/11 weekday-vs-weekend study: Saturday fills per resting
+    # contract 0.20 vs 0.64 weekday at the same rent per contract and the
+    # same loss per fill (net +1.17c vs +0.44c per resting contract-day,
+    # +5.8c vs +0.7c per FILLED contract); Sunday is the worst day (net
+    # -0.61c/ct-day) and gets nothing; the dailies fill at the same rate
+    # every day and are excluded. Composes with the 3-7am x2 (Sat 3-7am =
+    # x3 on the global ladder; TOTAL_SIZE_MULT_CAP still bounds hour x ref).
+    # Env knob => task-level restart (restart_imm.ps1 -Task). Re-measured
+    # every Monday 07:40 ET by "KL imm saturday-tracker"
+    # (imm_saturday_tracker.py): rent per filled contract, turnover, loss
+    # per fill by day type since 9/12 vs the baseline. 4 Saturdays of
+    # evidence at deploy — a hypothesis under test.
+    $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=150&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 
 while ($true) {

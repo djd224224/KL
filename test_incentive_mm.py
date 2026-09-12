@@ -5732,6 +5732,90 @@ class TestHourSizeMult(unittest.TestCase):
         self.assertTrue(all(s >= 1 for _t, s in got))
 
 
+class TestSaturdaySizeMult(unittest.TestCase):
+    """Saturday ladder multiplier (IMM_SAT_SIZE_MULT, Jack 2026-09-12): ET
+    calendar-day membership, long-dated-only via prefix exclusion, ladder
+    rounding, and composition with the hour windows. Code default OFF.
+    2026-09-12 is a Saturday; September => EDT (UTC-4)."""
+
+    def setUp(self):
+        self._sat = imm.SAT_SIZE_MULT
+        self._excl = imm.SAT_MULT_EXCLUDE
+        self._mults = imm.HOUR_SIZE_MULTS
+        self._series_mults = imm.SERIES_HOUR_MULTS
+        imm.SAT_SIZE_MULT = 1.5
+        imm.HOUR_SIZE_MULTS = {}
+
+    def tearDown(self):
+        imm.SAT_SIZE_MULT = self._sat
+        imm.SAT_MULT_EXCLUDE = self._excl
+        imm.HOUR_SIZE_MULTS = self._mults
+        imm.SERIES_HOUR_MULTS = self._series_mults
+
+    def test_code_default_is_off(self):
+        self.assertEqual(self._sat, 1.0)
+        imm.SAT_SIZE_MULT = 1.0
+        self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION",
+                                            utc(2026, 9, 12, 16, 0)), 1.0)
+        imm.SAT_SIZE_MULT = 0.0                     # invalid knob == off
+        self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION",
+                                            utc(2026, 9, 12, 16, 0)), 1.0)
+
+    def test_saturday_is_the_et_calendar_day(self):
+        s = "KXTRUMPMENTION"
+        # 03:59Z Sat = Fri 23:59 EDT -> off; 04:00Z = Sat 00:00 EDT -> on;
+        # 03:59Z Sun = Sat 23:59 EDT -> still on; 04:00Z Sun = Sun 00:00 -> off.
+        self.assertEqual(imm.hour_size_mult(s, utc(2026, 9, 12, 3, 59)), 1.0)
+        self.assertEqual(imm.hour_size_mult(s, utc(2026, 9, 12, 4, 0)), 1.5)
+        self.assertEqual(imm.hour_size_mult(s, utc(2026, 9, 12, 16, 0)), 1.5)
+        self.assertEqual(imm.hour_size_mult(s, utc(2026, 9, 13, 3, 59)), 1.5)
+        self.assertEqual(imm.hour_size_mult(s, utc(2026, 9, 13, 4, 0)), 1.0)
+        # a weekday is untouched
+        self.assertEqual(imm.hour_size_mult(s, utc(2026, 9, 9, 16, 0)), 1.0)
+
+    def test_dailies_and_temp_excluded_by_prefix(self):
+        sat = utc(2026, 9, 12, 16, 0)
+        for s in ("KXAAAGASD", "KXAAAGASDTX", "KXAAAGASW", "KXAAAGASM",
+                  "KXDIESELD", "KXDIESELW", "KXRAIN", "KXRAINWKND",
+                  "KXRAINNYCM", "KXTEMPMIAH"):
+            self.assertEqual(imm.hour_size_mult(s, sat), 1.0, s)
+        for s in ("KXTRUMPMENTION", "KXEARNINGSMENTIONHIMS", "KXUST2AD",
+                  "KXDKNGAPP", "KXAMZNCC", "KXAQICITYNYC", "KXFOO"):
+            self.assertEqual(imm.hour_size_mult(s, sat), 1.5, s)
+        # the exclude list is env-tunable and prefix-matched
+        imm.SAT_MULT_EXCLUDE = ("KXTRUMP",)
+        self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION", sat), 1.0)
+        self.assertEqual(imm.hour_size_mult("KXAAAGASD", sat), 1.5)
+
+    def test_ladder_scales_half_up_and_excluded_series_keep_shape(self):
+        sat = utc(2026, 9, 12, 16, 0)
+        base = imm.series_levels("KXTRUMPMENTION")
+        self.assertEqual(imm.hour_scaled_levels("KXTRUMPMENTION", sat),
+                         [(t, max(1, int(s * 1.5 + 0.5))) for t, s in base])
+        self.assertEqual(imm.hour_scaled_levels("KXAAAGASD", sat),
+                         imm.series_levels("KXAAAGASD"))
+        self.assertIs(imm.hour_scaled_levels("KXFOO", utc(2026, 9, 11, 16, 0)),
+                      imm.series_levels("KXFOO"))
+
+    def test_composes_with_quiet_hours_and_per_series_windows(self):
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("3-7:2.0")
+        imm.SERIES_HOUR_MULTS = imm._parse_series_hour_mults(
+            "KXDIESELD:16-1:0.5,KXFOOBAR:17-1:0.5")
+        sat_4am = utc(2026, 9, 12, 8, 0)          # 4:00am EDT Saturday
+        self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION", sat_4am), 3.0)
+        self.assertEqual(imm.hour_size_mult("KXAAAGASD", sat_4am), 2.0)
+        self.assertEqual(imm.hour_size_mult("KXTEMPMIAH", sat_4am), 1.0)
+        self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION",
+                                            utc(2026, 9, 11, 8, 0)), 2.0)
+        sat_6pm = utc(2026, 9, 12, 22, 0)         # 6:00pm EDT Saturday
+        self.assertAlmostEqual(imm.hour_size_mult("KXFOOBAR", sat_6pm), 0.75)
+        self.assertEqual(imm.hour_size_mult("KXDIESELD", sat_6pm), 0.5)
+        # the total-multiplier cap still bounds hour x ref mult on Saturday
+        self.assertLessEqual(
+            3.0 * imm.capped_ref_mult(50, 40, "bid", hour_mult=3.0),
+            max(3.0, imm.TOTAL_SIZE_MULT_CAP))
+
+
 # ----------------------------------------------------------------------------
 # Rain daily fair-value anchor (2026-07-28)
 # ----------------------------------------------------------------------------

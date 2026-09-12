@@ -1016,9 +1016,9 @@ SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
     "KXTRUEV:17-1:0.5"))
 
 
-def hour_size_mult(series: str, now_utc: datetime) -> float:
-    """Active ladder multiplier for this series at this instant (1.0 outside
-    configured windows and for excluded series prefixes)."""
+def _hour_window_mult(series: str, now_utc: datetime) -> float:
+    """The hour-of-day part of hour_size_mult(): 1.0 outside configured
+    windows and for excluded series prefixes."""
     hour = now_utc.astimezone(ET).hour
     # A per-series rule wins ONLY for the hours it actually names. Returning
     # its default for every other hour would silently cancel the global
@@ -1038,6 +1038,56 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     if any(series.startswith(p) for p in HOUR_MULT_EXCLUDE):
         return 1.0
     return HOUR_SIZE_MULTS.get(hour, 1.0)
+
+
+# Saturday ladder multiplier (Jack 2026-09-12: "Saturday multiplier of 1.5x,
+# only on long-dated families"), from the weekday-vs-weekend study on the
+# post-temp window 2026-08-08..09-11 (cycle logs + the account fills API,
+# IMM maker fills scored to settlement). Rent per RESTING contract is flat
+# across day types (~2c/day) — pools and competition do not change by day —
+# so the whole difference is on the cost side. Saturday: 0.20 fills per
+# resting contract (weekday 0.64), 2.4c lost per filled contract (2.6c) ->
+# net +1.17c per resting contract-day vs +0.44c, and +5.8c per FILLED
+# contract vs +0.7c. Sunday is the WORST day of the week (turnover 0.59,
+# 4.6c lost per fill, net -0.61c/ct-day: Sunday rain + Sunday-evening
+# mention bursts) and gets nothing. The effect lives in the long-dated
+# families — mention, econ/company prints, earnings, Carbon Arc: turnover
+# 0.51 -> 0.08 on Saturday, 13.5c rent per fill — while the dailies fill at
+# the same rate every day (gas/diesel 1.3 vs 1.0, rain 0.3 vs 0.4) and are
+# excluded by PREFIX (KXAAAGAS covers the daily/weekly/monthly trackers and
+# every state daily), as is the hourly-temp residual. Saturday is the ET
+# calendar day (Sat 00:00-23:59 ET). Composes multiplicatively with the hour
+# windows (Sat 3-7am ET on the global ladder = x3, exactly how the mention
+# family mult composed) and sits INSIDE hour_size_mult so every consumer —
+# ladder shape, placement caps, collateral estimate, TOTAL_SIZE_MULT_CAP via
+# capped_ref_mult, the cycle log's hour_mult column — sees one number.
+# Code default OFF (1.0); the launcher sets IMM_SAT_SIZE_MULT=1.5. Four
+# Saturdays of evidence at deploy: a hypothesis under test, re-measured
+# every Monday by imm_saturday_tracker.py (rent per filled contract, fill
+# turnover, settlement loss per fill, by day type since the change).
+SAT_SIZE_MULT = _env_float("IMM_SAT_SIZE_MULT", 1.0)
+SAT_MULT_EXCLUDE = tuple(
+    p for p in os.environ.get("IMM_SAT_MULT_EXCLUDE",
+                              "KXAAAGAS,KXDIESEL,KXRAIN,KXTEMP").split(",") if p)
+
+
+def saturday_size_mult(series: str, now_utc: datetime) -> float:
+    """SAT_SIZE_MULT on Saturdays (ET calendar day) for series outside
+    SAT_MULT_EXCLUDE; 1.0 otherwise (and whenever the knob is off/invalid)."""
+    if SAT_SIZE_MULT <= 0 or SAT_SIZE_MULT == 1.0:
+        return 1.0
+    if now_utc.astimezone(ET).weekday() != 5:
+        return 1.0
+    if any(series.startswith(p) for p in SAT_MULT_EXCLUDE):
+        return 1.0
+    return SAT_SIZE_MULT
+
+
+def hour_size_mult(series: str, now_utc: datetime) -> float:
+    """Active ladder multiplier for this series at this instant: the
+    hour-of-day window (global or per-series) times the Saturday multiplier;
+    1.0 when neither applies."""
+    return _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
 
 
 # Mention-family ladder multiplier. Jack 2026-07-28: x1.5 ("raise any caps
@@ -10153,6 +10203,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"[IMM] hour-size multipliers (ET hour -> x): "
             f"{dict(sorted(HOUR_SIZE_MULTS.items()))}; excluded prefixes: "
             f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'}")
+    if SAT_SIZE_MULT != 1.0:
+        log(f"[IMM] Saturday ladder multiplier x{SAT_SIZE_MULT:g} (ET calendar "
+            f"day, composes with hour windows); excluded prefixes: "
+            f"{','.join(SAT_MULT_EXCLUDE) or '(none)'}")
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):

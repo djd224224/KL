@@ -1869,3 +1869,60 @@ n=2 is too thin to rescale anything on.
 Pinned by `test_reward_period_roll_rebaselines_accrual` (first sight, the
 roll, a start-less program, persist/prune) and
 `test_period_column_unmeasurable_is_not_zero`. 548 tests.
+
+## 2026-09-12 — Saturday x1.5 on the long-dated families + weekly tracker (Jack)
+
+Jack asked whether weekends are quieter and whether the bot should quote
+bigger on them. Measured on the post-temp window 2026-08-08..09-11 (cycle
+logs; the account fills API back to 7/8, IMM fills = ticker in the cycle log
+within +-2h, maker only; scored to settlement), by ET day type:
+
+| | Weekday (25) | Saturday (4) | Sunday (4) |
+|---|---|---|---|
+| fills per resting contract-day | 0.64 | 0.20 | 0.59 |
+| rent per resting contract-day | 2.08c | 1.66c | 2.10c |
+| loss per filled contract | 2.58c | 2.40c | 4.62c |
+| net per resting contract-day | +0.44c | +1.17c | -0.61c |
+| net per filled contract | +0.68c | +5.80c | -1.04c |
+
+Rent per resting contract is flat across day types (pools and competition
+do not change by day — competitor depth 1.05x, est_frac 0.98x on weekends);
+the whole difference is the cost side. The Saturday effect lives in the
+long-dated families (mention / econ+company / earnings / Carbon Arc:
+turnover 0.51 -> 0.08, 13.5c rent per fill) while the dailies fill at the
+same rate every day (gas/diesel 1.3 vs 1.0, rain 0.3 vs 0.4). Sunday is the
+worst day of the week (Sunday rain -11.8c/fill on 8/16 and 8/23, the 8/30
+21h ET 4,600-contract KXTRUMPMENTION burst). Weekday-only pools explain the
+smaller weekend book: KXWORLDNEWSMENTION (~$500/day est), KXTRUMPMENTIONB,
+earnings mention, econ prints. Budget/event caps bind on neither day.
+
+Jack: "Saturday multiplier of 1.5x, only on long-dated families. and lets
+remeasure each weekend to understand performance."
+
+- `saturday_size_mult()` (IMM_SAT_SIZE_MULT, code default 1.0 = off;
+  launcher sets 1.5) applies on the ET Saturday calendar day to every series
+  except the prefixes in IMM_SAT_MULT_EXCLUDE (default
+  KXAAAGAS,KXDIESEL,KXRAIN,KXTEMP). It sits INSIDE `hour_size_mult()`
+  (= `_hour_window_mult() x saturday_size_mult()`), so the ladder, placement
+  caps, collateral estimate, TOTAL_SIZE_MULT_CAP via capped_ref_mult and the
+  cycle log's `hour_mult` column all see one number. Composes with the
+  3-7am x2 (Sat 3-7am = x3 on the global 20 -> 60/side; the x5 total cap
+  still trims the at-ref depth mult). Env knob => task-level restart
+  (`restart_imm.ps1 -Task`).
+- `imm_saturday_tracker.py`: every ET day since 9/12, long-dated vs
+  excluded: resting, modelled rent, own fills (fills_*.jsonl), turnover,
+  rent per filled contract, 24h mark-out, settled share, settlement loss per
+  fill, net per fill, net per resting contract-day, and the mean cycle-log
+  hour_mult as proof the multiplier was live; pooled by day type against the
+  8/8-9/11 baseline table embedded in the script. Cycle-log parsing cached
+  under run-logs/incentive-mm/sat_tracker_cache/. Scheduled "KL imm
+  saturday-tracker" WEEKLY Monday 07:40 ET (same principal/settings as the
+  opportunistic task), `--print` for a local look.
+- Pinned by `TestSaturdaySizeMult` (ET calendar-day edges at 04:00Z, prefix
+  exclusion incl. the env override, half-up rounding, composition with the
+  global and per-series hour windows, the total cap).
+
+Four Saturdays of evidence at deploy (Saturday day-to-day sd 3.3c per
+contract-day), so this is a hypothesis under test: the tracker's long-dated
+Saturday `rent/fill` and `net/ct-day` against the baseline row (13.5c /
+0.62c) are the read, once `settled%` is high; `mo24` is the early read.
