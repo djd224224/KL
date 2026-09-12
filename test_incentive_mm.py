@@ -7610,6 +7610,92 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertIn("10.92", opp.cum_text_table(cum)[1])
         self.assertIn("10.92", opp.cum_html_table(cum))
 
+    def test_period_column_unmeasurable_is_not_zero(self):
+        # Jack 2026-09-11: "earn est of 23.70 seems wrong ... i see earnings
+        # of ~$4". accrued_est runs from first quote and is not reset at a
+        # program boundary, while the exchange's rewards view shows the
+        # CURRENT period -- two different quantities. The email now carries
+        # both, and a market whose roll the bot has not SEEN yet must print
+        # "-", never 0.00: no baseline exists, so the period is unmeasurable.
+        import send_opportunistic_imm as opp
+        rows = [{"event": "KXA-26SEP30", "label": "measured", "tier": "finecon",
+                 "mkts": 3, "earn": 24.64, "period": 4.10, "cred": 0.0,
+                 "pnl": -3.90, "net": 20.74, "pos": -20},
+                {"event": "KXB-26SEP30", "label": "not seen roll yet",
+                 "tier": "finecon", "mkts": 1, "earn": 5.00, "period": None,
+                 "cred": 0.0, "pnl": 0.0, "net": 5.00, "pos": 0}]
+        t = opp.tier_totals(rows)
+        self.assertAlmostEqual(t["period"], 4.10)      # only the measured one
+        self.assertAlmostEqual(t["earn"], 29.64)       # all-time sums both
+        L = opp.text_table(rows)
+        self.assertIn("PERIOD$", L[0])
+        self.assertIn("ALL-TIME$", L[0])
+        self.assertIn("4.10", L[1])
+        # the unmeasurable row renders "-" in PERIOD and still shows all-time
+        self.assertIn("5.00", L[2])
+        self.assertEqual(L[2].split("5.00")[0].strip()[-1], "-")
+        html = opp.html_table(rows)
+        self.assertIn("THIS PERIOD$", html)
+        self.assertIn("ALL-TIME EST$", html)
+        self.assertIn("&mdash;", html)
+        # a tier where NOTHING is measurable yet shows "-", not a false 0.00
+        none_rows = [dict(rows[1])]
+        self.assertIsNone(opp.tier_totals(none_rows)["period"])
+        self.assertIn("-", opp.text_table(none_rows)[-1])
+        # and the pre-period row shape still renders (no "period" key at all)
+        legacy = [{"event": "KXC-26SEP30", "label": "old", "tier": "scan",
+                   "mkts": 1, "earn": 1.0, "pnl": 0.0, "net": 1.0, "pos": 0}]
+        self.assertIsNone(opp.tier_totals(legacy)["period"])
+        self.assertTrue(opp.text_table(legacy)[-1].startswith("TOTAL"))
+
+    def test_reward_period_roll_rebaselines_accrual(self):
+        # The bot records accrued_est as each market's program period opens,
+        # so `accrued - base` is that period's earning. Measured 2026-09-11:
+        # KXAAAGASMINM-26SEP30 ran 09-02 -> 09-09 and again 09-09 -> 09-16,
+        # with accrual running straight through the boundary.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=None, live=False)
+        T1 = "KXAAAGASMINM-26SEP30-3.75"
+        p1 = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        p2 = datetime(2026, 9, 9, tzinfo=timezone.utc)
+
+        # FIRST SIGHT: the period may already be half over, so there is no
+        # honest baseline -- record the period, leave the baseline absent.
+        bot.state.accrued_est[T1] = 12.00
+        bot._roll_reward_periods({T1: {"start": p1, "end": p2}})
+        self.assertEqual(bot.state.period_start[T1], p1.isoformat())
+        self.assertNotIn(T1, bot.state.period_base)
+
+        # same period again: no re-baseline, and no baseline invented
+        bot.state.accrued_est[T1] = 20.00
+        bot._roll_reward_periods({T1: {"start": p1, "end": p2}})
+        self.assertNotIn(T1, bot.state.period_base)
+
+        # THE ROLL: baseline captures accrual through the end of the period
+        # that just closed, so the new period starts measuring from zero
+        bot._roll_reward_periods({T1: {"start": p2, "end": p2}})
+        self.assertEqual(bot.state.period_start[T1], p2.isoformat())
+        self.assertAlmostEqual(bot.state.period_base[T1], 20.00)
+        bot.state.accrued_est[T1] = 24.10
+        self.assertAlmostEqual(
+            bot.state.accrued_est[T1] - bot.state.period_base[T1], 4.10)
+
+        # a program with no start is skipped rather than treated as a roll
+        bot._roll_reward_periods({T1: {"end": p2}})
+        self.assertEqual(bot.state.period_start[T1], p2.isoformat())
+
+        # both dicts survive a save/restore and prune with known_tickers
+        bot.state.known_tickers.add(T1)
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=None, live=False)   # loads on init
+        self.assertAlmostEqual(bot2.state.period_base[T1], 20.00)
+        self.assertEqual(bot2.state.period_start[T1], p2.isoformat())
+        bot.state.known_tickers.discard(T1)
+        bot._save_persist()
+        bot3 = IncentiveMarketMaker(client=None, live=False)
+        self.assertNotIn(T1, bot3.state.period_base)
+        self.assertNotIn(T1, bot3.state.period_start)
+
     def test_realized_is_lifetime_and_bot_attributed(self):
         # Jack 2026-09-11, on the AAA gas monthlies: "P&L of $1.30 is wrong.
         # I see P&L of -$5". The row P&L was open-book MTM plus only the

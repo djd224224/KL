@@ -464,6 +464,13 @@ def tier_totals(rows) -> dict:
             # .get: CRED is per EVENT and arrives from the ledger, which can
             # legitimately hold nothing for a young event
             "cred": sum(r.get("cred", 0.0) for r in rows),
+            # None, not 0.0, when NO row in the tier can measure its period
+            # yet: a tier-wide "0.00" would read as "earned nothing this
+            # period" when it means "no baseline observed yet"
+            "period": (sum(r["period"] for r in rows
+                           if r.get("period") is not None)
+                       if any(r.get("period") is not None for r in rows)
+                       else None),
             "earn": earn, "pnl": pnl, "net": earn + pnl}
 
 
@@ -480,19 +487,25 @@ def text_table(rows) -> list:
     # at 23 the two events of a weekly series printed identically
     # (BABELMANDEBWEEKLY-26SEP13 and -26SEP20 both truncated to ...26SEP).
     L = [f"{'EVENT':<27}{'WHAT IT IS':<29}{'QUOT':>5}{'HELD':>5}"
-         f"{'EARN EST$':>11}{'CRED$':>9}{'P&L$':>10}{'NET$':>10}"]
+         f"{'PERIOD$':>9}{'ALL-TIME$':>11}{'CRED$':>9}"
+         f"{'P&L$':>10}{'NET$':>10}"]
     for r in rows:
         # blank, not 0.00 — an event with no credit yet reads as "nothing has
         # landed", which is the fact; the HTML twin blanks it the same way
         cred = r.get("cred") or 0.0
         cred_s = f"{cred:,.2f}" if cred else ""
+        # "-" not "0.00": the bot has not seen this market's program roll
+        # yet, so its period accrual is UNMEASURABLE, not nil
+        per = r.get("period")
+        per_s = f"{per:,.2f}" if per is not None else "-"
         L.append(f"{_short_event(r['event'])[:26]:<27}{r['label'][:28]:<29}"
                  f"{r['mkts']:>5}{(r.get('held') or ''):>5}"
-                 f"{r['earn']:>11.2f}{cred_s:>9}"
+                 f"{per_s:>9}{r['earn']:>11.2f}{cred_s:>9}"
                  f"{r['pnl']:>+10.2f}{r['net']:>+10.2f}")
+    tper = f"{t['period']:,.2f}" if t["period"] is not None else "-"
     L.append(f"{'TOTAL':<27}{'':<29}{t['mkts']:>5}{(t['held'] or ''):>5}"
-             f"{t['earn']:>11.2f}{t['cred']:>9,.2f}{t['pnl']:>+10.2f}"
-             f"{t['net']:>+10.2f}")
+             f"{tper:>9}{t['earn']:>11.2f}{t['cred']:>9,.2f}"
+             f"{t['pnl']:>+10.2f}{t['net']:>+10.2f}")
     return L
 
 
@@ -503,28 +516,35 @@ def html_table(rows) -> str:
     h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
              f'<td style="{TDL}">EVENT</td><td style="{TDL}">WHAT IT IS</td>'
              f'<td style="{TD}">QUOTED</td><td style="{TD}">HELD</td>'
-             f'<td style="{TD}">EARN EST$</td><td style="{TD}">CREDITED$</td>'
+             f'<td style="{TD}">THIS PERIOD$</td>'
+             f'<td style="{TD}">ALL-TIME EST$</td>'
+             f'<td style="{TD}">CREDITED$</td>'
              f'<td style="{TD}">P&amp;L$</td><td style="{TD}">NET$</td></tr>')
     for i, r in enumerate(rows):
         bg = "#fafafa" if i % 2 else "#fff"
         held = r.get("held") or 0
         cred = r.get("cred") or 0.0
+        per = r.get("period")
+        per_s = f'{per:,.2f}' if per is not None else '&mdash;'
         h.append(f'<tr style="background:{bg}">'
                  f'<td style="{TDL}"><b>{_short_event(r["event"])}</b></td>'
                  f'<td style="{TDL}">{r["label"]}</td>'
                  f'<td style="{TD}">{r["mkts"]}</td>'
                  f'<td style="{TD};color:#888">{held or ""}</td>'
-                 f'<td style="{TD}">{r["earn"]:,.2f}</td>'
+                 f'<td style="{TD}">{per_s}</td>'
+                 f'<td style="{TD};color:#777">{r["earn"]:,.2f}</td>'
                  f'<td style="{TD};color:#0a7">{cred and f"{cred:,.2f}" or ""}'
                  f'</td>'
                  f'<td style="{TD}">{_pnl_span(r["pnl"])}</td>'
                  f'<td style="{TD};font-weight:700">{_pnl_span(r["net"])}</td>'
                  f'</tr>')
+    tper = f'{t["period"]:,.2f}' if t["period"] is not None else '&mdash;'
     h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
              f'<td style="{TDL}">TOTAL</td><td style="{TDL}"></td>'
              f'<td style="{TD}">{t["mkts"]}</td>'
              f'<td style="{TD}">{t["held"] or ""}</td>'
-             f'<td style="{TD}">{t["earn"]:,.2f}</td>'
+             f'<td style="{TD}">{tper}</td>'
+             f'<td style="{TD};color:#777">{t["earn"]:,.2f}</td>'
              f'<td style="{TD};color:#0a7">{t["cred"]:,.2f}</td>'
              f'<td style="{TD}">{_pnl_span(t["pnl"])}</td>'
              f'<td style="{TD}">{_pnl_span(t["net"])}</td></tr>')
@@ -677,6 +697,23 @@ def build_report(now_utc):
         cred_by_event[_ev] = cred_by_event.get(_ev, 0.0) + _a
 
     realized_by_ticker = hist["realized"]
+    # Per-program-period accrual (Jack 2026-09-11). The bot records what
+    # accrued_est read when each market's CURRENT program period opened;
+    # `accrued - base` is this period's earning, the quantity the exchange's
+    # own rewards view shows. A market with no recorded baseline has not been
+    # seen roll yet — its period is unmeasurable, NOT zero, and the row
+    # renders "-". An event is measurable only if EVERY market in it is, so a
+    # partial sum can never masquerade as the event's period total.
+    period_base = state.get("period_base") or {}
+
+    def _period_earn(tickers):
+        vals = []
+        for t in tickers:
+            if t not in period_base:
+                return None
+            vals.append(_f(accrued.get(t)) - _f(period_base.get(t)))
+        return sum(vals) if vals else None
+
     rows = []
     n_disputed = 0
     for ev, tickers in by_event.items():
@@ -713,7 +750,8 @@ def build_report(now_utc):
             # silent drop this change exists to fix.
             "tier": _event_tier(ev) or _tier(tickers[0]) or "",
             "mkts": n_quoted, "held": len(tickers) - n_quoted,
-            "earn": earn, "cred": cred_by_event.get(ev, 0.0), "pnl": pnl,
+            "earn": earn, "period": _period_earn(tickers),
+            "cred": cred_by_event.get(ev, 0.0), "pnl": pnl,
             "net": pnl + earn, "pos": netpos})
     rows.sort(key=lambda r: -r["net"])
     fin_rows = [r for r in rows if r["tier"] == "finecon"]

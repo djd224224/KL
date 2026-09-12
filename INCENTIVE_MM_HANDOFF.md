@@ -1825,3 +1825,47 @@ the normal case (the current period has not paid). EST < CREDITED means
 accrual was deleted, or the credited market has left the book. NET stays on
 the EST basis, so it UNDERSTATES on those rows, and the footer says so.
 Pinned by `test_est_and_credited_are_not_nested`.
+
+## 2026-09-11 pm — per-program-period accrual (Jack)
+
+Jack, on the AAA gas monthlies: "AAAGASMINM-26SEP30 earn est of 23.70 seems
+wrong ... I see earnings of ~$4". The estimate was not wrong; it was a
+different quantity. The live `/incentive_programs` feed shows these markets
+re-list WEEKLY — KXAAAGASMINM-26SEP30 ran 2026-09-02 -> 09-09 and again
+09-09 -> 09-16 — and `accrued_est` is not reset at a boundary (and these
+strikes were quoted continuously, so the known_tickers prune never cleared
+it either). EARN EST was therefore the sum across BOTH periods while the
+exchange's rewards view shows only the current one, ~2.5 days in.
+
+BOT: `BotState.period_start` (ticker -> current program start iso) and
+`period_base` (accrued_est when that period opened), rolled by
+`_roll_reward_periods(by_market)` off the LIVE programs feed only — same
+guard as `finecon_expand_family`, so an empty/failed read cannot look like
+every market's period ending. `fetch_programs` now carries `start` in
+`by_market` (min across overlapping programs, mirroring the max on `end`:
+overlapping programs on one market are ONE paying stretch and must not
+read as a new period). Both dicts persist and prune on the accrued_est
+rule — a ticker that drops out of one drops out of both, or a re-listed
+market would measure this period against a baseline from its last life.
+
+`period_base` is written ONLY on an OBSERVED roll. On first sight of a
+market the running period may already be half over, so no honest baseline
+exists; the entry stays absent and the email prints "-". This means the
+column is blank on every row until each market's next roll — by design,
+and the alternative (baselining at first sight) would silently report a
+partial period as a whole one.
+
+EMAIL: columns are now PERIOD$ (this program period, the number that
+reconciles against the app) and ALL-TIME$ (the old EARN EST, kept because
+it is what NET is built on). "-" never means zero: a tier whose rows are
+all unmeasurable totals "-" rather than 0.00.
+
+Not asserted in the email, but worth knowing: reward_calibration.json
+measures KXAAAGASM at credited $15.94 vs floored estimate $30.10 — factor
+0.53 on n=2 settled events, against 1.01 for the GAS/DIESEL family and 1.22
+account-wide. The estimator has run hot on the gas monthlies specifically;
+n=2 is too thin to rescale anything on.
+
+Pinned by `test_reward_period_roll_rebaselines_accrual` (first sight, the
+roll, a start-less program, persist/prune) and
+`test_period_column_unmeasurable_is_not_zero`. 548 tests.

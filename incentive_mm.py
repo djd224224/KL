@@ -5057,6 +5057,21 @@ class BotState:
     manual_standoff: Dict[str, float] = field(default_factory=dict)  # ticker -> since ts
     cutoff_ts: Dict[str, float] = field(default_factory=dict)     # ticker -> cutoff epoch
     accrued_est: Dict[str, float] = field(default_factory=dict)   # ticker -> lifetime est
+    # PER-PROGRAM-PERIOD accrual (Jack 2026-09-11, on the AAA gas monthlies:
+    # "earn est of 23.70 seems wrong ... i see earnings of ~$4"). accrued_est
+    # runs from the first time the bot quoted the market and is NOT reset at a
+    # period boundary, while Kalshi's own rewards view shows the CURRENT
+    # period — so the two are different quantities and the email could not
+    # reconcile against the app. These record which period each market is in
+    # and what accrued_est read when that period opened, so
+    # `accrued_est[t] - period_base[t]` is this period's accrual.
+    period_start: Dict[str, str] = field(default_factory=dict)    # ticker -> program start iso
+    # ticker -> accrued_est when the CURRENT period opened. Only written on an
+    # OBSERVED roll: on first sight of a market the bot has no idea how much
+    # of its accrual belongs to the period already running, and inventing a
+    # baseline would silently report a partial period as a whole one. Absent
+    # here means "not measurable yet", and the email prints it as such.
+    period_base: Dict[str, float] = field(default_factory=dict)
     # ticker -> ts the projection first went under the payout bar (cleared the
     # moment it recovers). The hopeless exit reads this so a DIP cannot evict —
     # see HOPELESS_SUSTAIN_SECS.
@@ -5492,6 +5507,10 @@ class IncentiveMarketMaker:
             # (or re-floor) markets that already banked most of their $1.
             self.state.accrued_est = {str(t): float(v) for t, v in
                                       (data.get("accrued_est") or {}).items()}
+            self.state.period_start = {str(t): str(v) for t, v in
+                                       (data.get("period_start") or {}).items()}
+            self.state.period_base = {str(t): float(v) for t, v in
+                                      (data.get("period_base") or {}).items()}
             self.state.hopeless_since = {str(t): float(v) for t, v in
                                          (data.get("hopeless_since") or {}).items()}
             # finecon openings: day mismatch is resolved at refresh (reset),
@@ -5723,6 +5742,17 @@ class IncentiveMarketMaker:
                                            for t, v in self.state.accrued_est.items()
                                            if v >= 1e-4
                                            and t in self.state.known_tickers},
+                           # pruned on the SAME rule as accrued_est — a
+                           # ticker that drops out of one must drop out of
+                           # both, or a re-listed market would measure this
+                           # period against a baseline from its last life
+                           "period_start": {
+                               t: v for t, v in self.state.period_start.items()
+                               if t in self.state.known_tickers},
+                           "period_base": {
+                               t: round(v, 4)
+                               for t, v in self.state.period_base.items()
+                               if t in self.state.known_tickers},
                            # the sub-bar clock must survive restarts or this
                            # bot's ~20 deploys/day would keep resetting it and
                            # the hopeless exit could never fire at all
@@ -6295,10 +6325,15 @@ class IncentiveMarketMaker:
             t = p.get("market_ticker") or ""
             cur = by_market.get(t)
             if cur is None:
-                by_market[t] = {"dollars_per_day": dpd, "end": end,
-                                "target": target, "df": df}
+                by_market[t] = {"dollars_per_day": dpd, "start": start,
+                                "end": end, "target": target, "df": df}
             else:
                 cur["dollars_per_day"] += dpd
+                # the union window: overlapping programs on one market are
+                # one paying stretch, and the period roll below keys off its
+                # start, so a second program joining late must not look like
+                # a new period
+                cur["start"] = min(cur["start"], start)
                 cur["end"] = max(cur["end"], end)
                 cur["target"] = max(cur["target"], target)
         self.state.programs_count = len(by_market)
@@ -6336,6 +6371,39 @@ class IncentiveMarketMaker:
             any(series.endswith(suf) for suf in ALLOW_FAMILY_SUFFIXES) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
+    def _roll_reward_periods(self, by_market: Dict[str, dict]) -> None:
+        """Re-baseline per-period accrual when a market's program re-lists.
+
+        These programs re-list weekly (measured 2026-09-11:
+        KXAAAGASMINM-26SEP30 ran 09-02 -> 09-09 and again 09-09 -> 09-16),
+        and accrued_est keeps running across the boundary, so without a
+        baseline "what did this market earn this period" is unanswerable —
+        the number the exchange's own rewards view shows.
+
+        Called on the LIVE feed only: an empty/failed programs read must not
+        look like every market's period ended."""
+        rolled = 0
+        for t, info in by_market.items():
+            start = info.get("start")
+            if start is None:
+                continue
+            key = start.isoformat()
+            prev = self.state.period_start.get(t)
+            if prev == key:
+                continue
+            if prev is None:
+                # First sight. The running period may be half over already,
+                # so there is no honest baseline — record the period and
+                # leave the baseline absent until the next roll.
+                self.state.period_base.pop(t, None)
+            else:
+                self.state.period_base[t] = self.state.accrued_est.get(t, 0.0)
+                rolled += 1
+            self.state.period_start[t] = key
+        if rolled:
+            log(f"{self.tag} reward period rolled on {rolled} market(s); "
+                f"per-period accrual re-baselined")
+
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
         now_ts = now_utc.timestamp()
         # Pick up call-time overrides and auto-enrolled series written since
@@ -6368,6 +6436,9 @@ class IncentiveMarketMaker:
             # covered the same refresh rather than waiting for a hand add.
             # Runs on the LIVE feed only — never on a failed/empty read.
             finecon_expand_family(by_market)
+            # Per-period accrual baselines (Jack 2026-09-11). LIVE feed only,
+            # same guard as the family expansion above.
+            self._roll_reward_periods(by_market)
 
         def ticker_cutoff_passed(t: str) -> bool:
             # (imm_quote_gaps.py mirrors this pre-filter — keep in sync.)
