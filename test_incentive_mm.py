@@ -1055,6 +1055,65 @@ class TestBlocklist(unittest.TestCase):
         # KXSOLD26 must be blocked WITHOUT eating KXSOLDATHOLDINGS
         self.assertFalse(b("KXSOLDATHOLDINGS-26AUG14-T2500000"))
 
+    def test_market_suffix_block_freezes_the_nqe_leg_only(self):
+        # Jack 2026-09-11 pm ("implement the suffix block"): the mention
+        # family's "Event does not qualify" leg is frozen by STRIKE SUFFIX
+        # in every series that carries it, while the word legs beside it
+        # keep quoting. See MARKET_BLOCK_SUFFIXES for the why.
+        b, a = IncentiveMarketMaker._blocked, IncentiveMarketMaker._allowed
+        self.assertIn("NQE", imm.MARKET_BLOCK_SUFFIXES)
+        for t in ("KXTRUMPMENTION-26SEP12-NQE", "KXTRUMPMENTIONB-26SEP12-NQE",
+                  "KXFEDMENTION-26SEP-NQE", "KXWORLDNEWSMENTION-26SEP11-NQE"):
+            self.assertTrue(b(t), t)
+            self.assertFalse(a(t), t)
+        for t in ("KXTRUMPMENTION-26SEP12-TARI", "KXTRUMPMENTION-26SEP12-GOLF",
+                  "KXTRUMPMENTIONB-26SEP12-DOON"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+
+    def test_market_suffix_block_is_the_strike_segment_only(self):
+        b = IncentiveMarketMaker._blocked
+        # event-ticker and family-probe forms carry no strike segment
+        self.assertFalse(b("KXTRUMPMENTION-26SEP12"))
+        self.assertFalse(b("KXTRUMPMENTION-X"))
+        # a series or event segment spelled NQE is not a strike
+        self.assertFalse(b("KXNQE-26SEP12-T100"))
+        self.assertFalse(b("KXFOOMENTION-NQE-TARI"))
+        # a strike that merely CONTAINS the suffix is a different strike
+        self.assertFalse(b("KXTRUMPMENTION-26SEP12-NQEX"))
+        self.assertFalse(b("KXTRUMPMENTION-26SEP12-XNQE"))
+        # env-driven: empty disables, extra suffixes extend
+        with mock.patch.object(imm, "MARKET_BLOCK_SUFFIXES", ()):
+            self.assertFalse(b("KXTRUMPMENTION-26SEP12-NQE"))
+        with mock.patch.object(imm, "MARKET_BLOCK_SUFFIXES", ("NQE", "TARI")):
+            self.assertTrue(b("KXTRUMPMENTION-26SEP12-TARI"))
+            self.assertTrue(b("KXTRUMPMENTION-26SEP12-NQE"))
+
+    def test_market_suffix_block_is_a_full_freeze(self):
+        # Same semantics as a prefix block (the KXGOOD test below the
+        # restore paths): no restore, a stale meta is flushed, no orders --
+        # the open position rides. An allowlisted MENTION series is used so
+        # the ONLY thing standing the market down is its strike suffix.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        t = "KXGOODMENTION-99DEC31-NQE"
+        word = "KXGOODMENTION-99DEC31-TARI"
+        self.assertFalse(IncentiveMarketMaker._blocked(word))
+        bot.state.known_tickers.add(t)
+        bot.pnl.pos[t] = -10.0
+        bot.restore_orphan_metas({t: -10.0})
+        self.assertNotIn(t, bot.state.managed_extra)   # not restored
+        bot.state.managed_extra[t] = MarketMeta(
+            ticker=t, event_ticker="KXGOODMENTION-99DEC31",
+            series="KXGOODMENTION", dollars_per_day=0.0, program_end=None,
+            target_size=0.0, discount_factor=0.5, cutoff=None,
+            close_time=None)
+        bot.run_cycle()
+        self.assertNotIn(t, bot.state.managed_extra)     # flushed
+        self.assertNotIn(t, bot.state.selected)
+        self.assertFalse([o for o in bot.state.sim_orders.values()
+                          if o.get("ticker") == t])
+
 
 class TestAllowlist(unittest.TestCase):
     def setUp(self):

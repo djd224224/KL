@@ -205,6 +205,16 @@ if ($Probe) {
     # entry was lost once on 9/1 when the pause sat uncommitted through a
     # main sync — it is committed now; prefix-matched, catches state
     # weeklies too. Open weekly positions ride to the 9/7 settlement.
+    # NQE STRIKE-SUFFIX BLOCK (Jack 2026-09-11 pm "implement the suffix
+    # block"): the mention family's "Event does not qualify" leg is frozen
+    # IN CODE by market-ticker suffix (incentive_mm.MARKET_BLOCK_SUFFIXES,
+    # default NQE; env IMM_BLOCK_MARKET_SUFFIXES overrides, empty disables).
+    # Not an IMM_BLOCKLIST entry: that list is series-PREFIX matched and
+    # would need one entry per event. Word legs beside it are untouched.
+    # Same freeze semantics: no orders, resting NQE quotes cancelled on the
+    # next cycle, open NQE positions ride to settlement (SEP12 -10, SEP22
+    # +45 at the time). Code-only change, so a python kill reloads it; the
+    # env knob needs the task-level restart like every other env change.
     $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=150&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 

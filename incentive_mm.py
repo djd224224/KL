@@ -1581,6 +1581,29 @@ BLOCKLIST_WIND_DOWN_EVENTS = frozenset(
         "IMM_BLOCKLIST_WIND_DOWN_EVENTS", "KXTRUEV-26SEP11").split(",")
     if e.strip())
 
+# MARKET STRIKE-SUFFIX BLOCK (Jack 2026-09-11 pm: "implement the suffix
+# block"): freeze a market by the LAST dash segment of its ticker, whatever
+# the series. Written for the mention family's "Event does not qualify" leg
+# (-NQE: YES iff the event is cancelled or never qualifies, every word leg
+# then NO), which every mention series carries (KXTRUMPMENTION/-B,
+# KXFEDMENTION, KXWORLDNEWSMENTION, ...). Why block it: it is the event's
+# busiest leg by far (SEP12: 21k contracts/24h, 62k deep, so our qualifying
+# share is ~2% and the est ~$1.80/day pre-discount) yet took 21% of the
+# event's fills, and the bot is structurally short its tail -- it sells YES
+# into the lottery bid. Settled: -8.1c/contract over 6 NQE legs vs -1.7c
+# over 632 word legs; the 8/20 event's NQE paid YES with the bot 71 net
+# short (-$54, that event's biggest leg). NQE paid YES on 3 of 52 settled
+# Trump events, 2 of the 5 bilaterals. Same freeze semantics as the prefix
+# blocklist (no new orders, resting quotes cancelled next cycle, NOT
+# reduce-only: open NQE positions ride to settlement). Strike segment only:
+# event tickers ("KXTRUMPMENTION-26SEP12"), the family probe ("<series>-X")
+# and a series NAME ending in the suffix are untouched. NOT an IMM_BLOCKLIST
+# entry -- that list is series-prefix matched and would need one entry per
+# event. Env IMM_BLOCK_MARKET_SUFFIXES (comma list) overrides; empty disables.
+MARKET_BLOCK_SUFFIXES = tuple(
+    s.strip() for s in os.environ.get("IMM_BLOCK_MARKET_SUFFIXES", "NQE").split(",")
+    if s.strip())
+
 # ---- universe allowlist (user decision 2026-07-11: MENTION + CRYPTO only) ----
 # Mention/broadcast markets have DEFINED information windows (nothing to know
 # before the broadcast starts) and the crypto structural markets have no
@@ -6349,6 +6372,12 @@ class IncentiveMarketMaker:
             if ticker not in BLOCKLIST_WIND_DOWN_EVENTS and \
                     ticker.rsplit("-", 1)[0] not in BLOCKLIST_WIND_DOWN_EVENTS:
                 return True
+        # Strike-suffix block (MARKET_BLOCK_SUFFIXES, the -NQE leg): only a
+        # MARKET ticker has a strike segment -- two dashes or more. Event
+        # tickers and the "<series>-X" probe have one and fall through.
+        if (MARKET_BLOCK_SUFFIXES and ticker.count("-") >= 2
+                and ticker.rsplit("-", 1)[1] in MARKET_BLOCK_SUFFIXES):
+            return True
         return series_of(ticker) in FREEZE_SERIES
 
     @classmethod
