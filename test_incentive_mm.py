@@ -1150,34 +1150,43 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
                   "KXMLBPLAYOFFSX-26-NYY"):
             self.assertFalse(a(t), t)
 
-    def test_only_the_live_game_series_is_safe_joined(self):
-        # KXMLBPLAYOFFS has an in-play feed (nightly games) and no cutoff,
-        # so it gets safe-join. The other two must NOT: measured 9/11,
-        # resting two ticks back scores exactly ZERO on KXMLBSEASONGAMES
-        # (touch rung ~9,500 vs a 1,000 target) and on half of
-        # KXVENUEPERFORM, so guarding them would make the allowlist entry
-        # look live in every log while crediting nothing.
-        ov = imm.series_override("KXMLBPLAYOFFS")
-        self.assertIsNotNone(ov)
-        self.assertTrue(ov.safe_join)
-        for s in ("KXMLBSEASONGAMES", "KXVENUEPERFORM"):
+    def test_all_three_get_the_safe_join_guard(self):
+        # trade_cutoff_utc is None for all three, so safe-join stands in for
+        # the cutoff they cannot have -- the same guard the open-scan tier
+        # gives this shape. It is free here (see the reference-clamp test
+        # below), so there is no reason to scope it to one of them.
+        for s in self.SERIES:
             ov = imm.series_override(s)
-            self.assertFalse(ov is not None and ov.safe_join, s)
+            self.assertIsNotNone(ov, s)
+            self.assertTrue(ov.safe_join, s)
 
-    def test_safe_join_two_ticks_back_is_worthless_on_a_stacked_touch(self):
-        # The measurement the scoping decision rests on, as a unit test:
-        # a 1,000-target walk over a 9,500-contract touch rung never
-        # reaches a rung two ticks behind it, so our size scores nothing.
+    def test_safe_join_is_free_when_the_reference_is_the_touch(self):
+        # The measurement the guard scoping rests on, and the correction of
+        # a wrong one: reading "safe-join = two ticks back" says a stacked
+        # touch (KXMLBSEASONGAMES: ~9,500 contracts vs a 1,000 target) would
+        # score ZERO. The placement path clamps safe-join at the REFERENCE,
+        # and on a touch rung above target/5 the reference IS the touch, so
+        # it lands at the touch and costs nothing.
         levels = [(50, 9571.0), (49, 300.0), (48, 250.0)]
-        own_at_touch = {50: 20.0}
-        lv = sorted({**dict(levels), 50: 9571.0 + 20.0}.items(), key=lambda x: -x[0])
-        share_touch, ok_touch = imm._side_share(lv, own_at_touch, 1000.0, 0.5)
-        self.assertTrue(ok_touch)
-        self.assertGreater(share_touch, 0.0)
+        ref = imm.side_reference_level(levels, 1000.0)
+        self.assertEqual(ref, 50)                      # reference == touch
+        capped = max(50 - imm.SAFE_JOIN_OFFSET_TICKS, 1)
+        self.assertEqual(max(capped, ref), 50)         # clamp pulls it back
+        # and the naive two-back placement really would have scored zero,
+        # which is why the clamp exists rather than the guard being dropped
         own_back = {48: 20.0}
-        lv_back = sorted({**dict(levels), 48: 250.0 + 20.0}.items(), key=lambda x: -x[0])
-        share_back, ok_back = imm._side_share(lv_back, own_back, 1000.0, 0.5)
-        self.assertEqual(share_back, 0.0)
+        lv_back = sorted({**dict(levels), 48: 270.0}.items(), key=lambda x: -x[0])
+        self.assertEqual(imm._side_share(lv_back, own_back, 1000.0, 0.5)[0], 0.0)
+
+    def test_safe_join_still_binds_on_a_thin_touch(self):
+        # The case the guard is actually for: a touch below target/5 puts
+        # the reference behind the touch, so safe-join moves us off the
+        # front of a book that can reprice on a result we cannot see.
+        levels = [(50, 40.0), (49, 60.0), (48, 120.0), (47, 900.0)]
+        ref = imm.side_reference_level(levels, 1000.0)
+        self.assertIsNotNone(ref)
+        self.assertLess(ref, 50)
+        self.assertEqual(max(max(50 - imm.SAFE_JOIN_OFFSET_TICKS, 1), ref), 48)
 
     def test_no_cutoff_is_invented_for_them(self):
         # Documents the known gap deliberately: these have no scheduled

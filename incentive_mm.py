@@ -755,39 +755,43 @@ for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
             cutoff_before_event_min=_env_int(
                 "IMM_RAINWKND_CUTOFF_BEFORE_MIN", 0))
 
-# LIVE-GAME GUARD for KXMLBPLAYOFFS (Jack 2026-09-11 pm "allowlist
-# KXMLBPLAYOFFS into IMM"). Scoped to this ONE series of the three admitted
-# that evening, because it is the only one with an in-play feed to be last
-# on: the 2026 regular season plays nightly into its final fortnight and
-# every result moves the bubble teams, while the ticker has no date segment,
-# so trade_cutoff_utc is None and no hour of the day stands it down
-# ("breakers are the only protection", per that function's docstring). The
-# band does most of the work -- 13 of 30 teams were one-sided and 8 more
-# outside 5-90c on 9/11, leaving 9 contested teams -- and safe-join keeps
-# the bot off the front of those 9. It is the same guard the open-scan tier
-# gives a Sports series it admits (ensure_scan_override), so the normal
-# book is not the weaker path here.
+# UNDATED-TICKER GUARD SET for the three series allowed in code on
+# 2026-09-11 pm (KXMLBPLAYOFFS, KXMLBSEASONGAMES, KXVENUEPERFORM -- see
+# _DEFAULT_SPORTS_SERIES and _DEFAULT_ENTERTAINMENT_SERIES for what each is
+# and what it pays). All three are season/venue-level tickers whose second
+# segment does not parse as a date, so trade_cutoff_utc returns None and NO
+# hour of the day stands them down: "breakers are the only protection", per
+# that function's own docstring. KXMLBPLAYOFFS is the sharpest case -- the
+# 2026 regular season plays nightly into its final fortnight and every
+# result moves the bubble teams -- but the shape is the same for all three,
+# and the open-scan tier already gives exactly this shape in exactly these
+# categories a safe-join guard via ensure_scan_override. Admitting them to
+# the NORMAL book without one would make the normal book the weaker path.
 #
-# MEASURED before scoping it this way (9/11, live books, _side_share with
-# a 20-lot at the touch vs two ticks back, $/market/day):
-#     KXMLBPLAYOFFS      CLE 1.11 -> 0.39   SD 0.98 -> 0.28   TOR 1.17 -> 0.35
-#     KXMLBSEASONGAMES  2425 1.03 -> 0.00  1930 1.15 -> 0.00
-#     KXVENUEPERFORM     ZED 0.84 -> 0.22   MTJ 0.23 -> 0.00   GOO 0.18 -> 0.00
-# Safe-join costs playoffs ~65% of credit and it still clears the $1.00
-# per-market-per-period floor over a 14-day program. On the other two it is
-# not a discount, it is an OFF switch: KXMLBSEASONGAMES' touch rung alone is
-# ~9,500 contracts against a 1,000 target, so anything behind the touch sits
-# outside the qualifying walk and scores exactly zero -- on the richest
-# per-market pool in the feed ($500/market/day, daily periods). Guarding
-# those two would have left an allowlist entry that looks live in every log
-# and credits nothing, which is the silent-exclusion shape this file keeps
-# paying for. They go in bare; the global band, floors and caps still apply.
+# Safe-join is FREE on books like these, which is why it goes on all three
+# rather than only the playoff series. The clamp above in the placement
+# path caps safe-join at the REFERENCE and never behind it, so it costs
+# reward only where the reference sits behind the touch. Measured 9/11 on
+# live books: the touch rung alone is 200+ contracts (target/5) on every
+# market checked -- KXMLBSEASONGAMES-27-2425 touch 50 ref 50, -1930 73/73,
+# KXVENUEPERFORM MTJ 69/69, GOO 71/71, KXMLBPLAYOFFS CLE 56/56 -- so the
+# reference IS the touch and safe-join lands AT the touch, zero cost.
+# (A naive "two ticks back" reading of the same books says the guard would
+# zero out KXMLBSEASONGAMES, whose touch rung is ~9,500 against a 1,000
+# target. That reading ignores the reference clamp and is wrong; the clamp
+# exists precisely because of the 8/05 KXFSLR/KXHOOD measurement recorded
+# beside it. Re-measure through the placement path, not by hand.)
+# What the guard still buys: it binds exactly when the touch is THIN, which
+# is when resting in front of a book that reprices on a game result or a
+# tour announcement is worth avoiding.
 #
 # No cutoff is invented for any of the three: none has a scheduled instant
 # to anchor to (qualification resolves across a fortnight of games, a tour
 # announcement lands whenever it lands), and a made-up hour would read like
 # a real event window to every later reader of this file.
-for _s in os.environ.get("IMM_LIVEGAME_GUARD_SERIES", "KXMLBPLAYOFFS").split(","):
+for _s in os.environ.get(
+        "IMM_UNDATED_GUARD_SERIES",
+        "KXMLBPLAYOFFS,KXMLBSEASONGAMES,KXVENUEPERFORM").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(safe_join=True)
 
