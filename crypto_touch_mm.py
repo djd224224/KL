@@ -62,6 +62,7 @@ import os
 import signal
 import subprocess
 import smtplib
+import statistics
 import sys
 import time
 import uuid
@@ -78,7 +79,7 @@ from cryptography.hazmat.primitives import serialization
 
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
-MODEL_VERSION = "crypto_touch_mm_v2.5"
+MODEL_VERSION = "crypto_touch_mm_v2.6"
 RUN_ID = uuid.uuid4().hex[:8]
 CLIENT_ORDER_PREFIX = "cmm"  # all client_order_ids look like cmm-<run>-<uuid>
 
@@ -134,6 +135,38 @@ QUOTE_OFFSET_CENTS = int(os.environ.get("CMM_QUOTE_OFFSET_CENTS", 5))
 LEVEL_SPACING_CENTS = int(os.environ.get("CMM_LEVEL_SPACING_CENTS", 2))
 NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 3))
 CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 5))
+
+# v2.6 monthly risk rules (Jack 2026-09-12 "ship 1, 2, 3, 4"). Backed by the
+# tape replay of Jul-Sep 2026 + a 2y Kraken calibration backtest (see
+# CRYPTO_MM_HANDOFF.md "v2.6 risk rules"). They are CLASS attributes on
+# MonthlyTouchMarketMaker only: the annual bot reuses TouchMarketMaker's
+# refresh_vol and the (idle) weekly touch bot reuses its run_cycle, and both
+# suites pin the old behaviour. Code defaults ARE the live config; the env
+# overrides are for emergencies only (no launcher sets them).
+#  1. vol shrinkage: sigma^2 = w*raw^2 + (1-w)*median^2, median = long-run
+#     median of the same estimator over the fetched daily history. The raw
+#     EWMA/90d blend under-prices touches ~11 pts in low-vol regimes and
+#     over-prices ~13 pts in high-vol ones; w=0.25 cut the 2y calibration
+#     error from 6.4 to 4.3 pts.
+VOL_SHRINK_W = float(os.environ.get("CMM_VOL_SHRINK_W", 0.25))
+VOL_MEDIAN_MIN_HISTORY = 120     # daily closes needed before a median exists
+#  2. ask floor: never SELL a strike whose model fair is below this (bids still
+#     quote). Every dollar of the Jul-Sep loss was sells under 25c; 93% of them
+#     had fair < 15c.
+ASK_MIN_FAIR_CENTS = int(os.environ.get("CMM_ASK_MIN_FAIR_CENTS", 15))
+#  3. dollars-at-risk cap per event AND direction, valued at fair: shorts risk
+#     (100-fair)/ct if the strike touches, longs risk fair/ct if it never does.
+#     Adjacent strikes are one bet in a trend; the 28 cap-sized tickers made
+#     ALL of the Jul-Sep loss (-$1,651) while the other 162 made +$905.
+MAX_EVENT_RISK_DOLLARS = float(os.environ.get("CMM_MAX_EVENT_RISK", 300))
+#  4. inventory skew (fair shifts against the event net, full at SKEW_FULL_AT;
+#     the side being encouraged keeps >= SKEW_EDGE_FLOOR of edge vs the
+#     unskewed fair, like the daily updown bot) + reduce-only at
+#     REDUCE_ONLY_AT net, well before the 1000-contract event cap.
+SKEW_MAX_CENTS = int(os.environ.get("CMM_SKEW_MAX_CENTS", 4))
+SKEW_FULL_AT_CONTRACTS = float(os.environ.get("CMM_SKEW_FULL_AT", 300))
+SKEW_EDGE_FLOOR_CENTS = int(os.environ.get("CMM_SKEW_EDGE_FLOOR_CENTS", 3))
+REDUCE_ONLY_AT_CONTRACTS = float(os.environ.get("CMM_REDUCE_ONLY_AT", 600))
 
 # Risk / hygiene parameters
 # Caps scale proportionally with ladder size. History: 3x8 -> 128/800;
@@ -460,6 +493,34 @@ def blended_daily_vol(closes: List[float]) -> float:
     return VOL_BLEND_EWMA_WEIGHT * ewma_vol(rets) + (1 - VOL_BLEND_EWMA_WEIGHT) * simple_vol(rets)
 
 
+def long_run_median_vol(closes: List[float],
+                        min_history: int = VOL_MEDIAN_MIN_HISTORY) -> Optional[float]:
+    """Median of blended_daily_vol over the expanding history — i.e. of what
+    this estimator would have said on each past day of the fetched candles.
+    None when there is not enough history for a meaningful median."""
+    if len(closes) <= min_history:
+        return None
+    return statistics.median(blended_daily_vol(closes[:i])
+                             for i in range(min_history, len(closes) + 1))
+
+
+def shrunk_daily_vol(closes: List[float], w: float,
+                     min_history: int = VOL_MEDIAN_MIN_HISTORY
+                     ) -> Tuple[float, float, Optional[float]]:
+    """(sigma_used, sigma_raw, long_run_median). Variance shrinkage of the raw
+    blended estimator toward its long-run median: sigma^2 = w*raw^2 +
+    (1-w)*median^2. w >= 1 (or no median yet) returns the raw estimate
+    unchanged, bit-for-bit."""
+    raw = blended_daily_vol(closes)
+    if w >= 1.0:
+        return raw, raw, None
+    med = long_run_median_vol(closes, min_history)
+    if med is None:
+        return raw, raw, None
+    w = max(0.0, w)
+    return math.sqrt(w * raw * raw + (1.0 - w) * med * med), raw, med
+
+
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -569,6 +630,50 @@ def build_quotes(ticker: str, fair: int,
             room -= count
 
     return quotes
+
+
+def skewed_fairs(fair: int, event_net: float, skew_max_cents: int, full_at: float,
+                 offset_cents: int, edge_floor_cents: int) -> Tuple[int, int]:
+    """(fair for bids, fair for asks) after inventory skew. Long inventory
+    (event_net > 0) shifts both DOWN: bids back off by the full skew, asks come
+    in but keep >= edge_floor_cents of edge vs the unskewed fair (the daily
+    updown bot's floor: a manual position must never pin the bot 0-2c off fair
+    fading it). Symmetric when short. Skew is proportional to event_net /
+    full_at, saturating at +-skew_max_cents."""
+    if skew_max_cents <= 0 or full_at <= 0 or event_net == 0:
+        return fair, fair
+    frac = max(-1.0, min(1.0, event_net / full_at))
+    s = abs(skew_max_cents * frac)
+    enc = min(s, max(0.0, offset_cents - edge_floor_cents))   # encouraged side
+    clamp = lambda x: int(max(1, min(99, round(x))))            # noqa: E731
+    if frac > 0:    # long: discourage bids (full), encourage asks (capped)
+        return clamp(fair - s), clamp(fair - enc)
+    return clamp(fair + enc), clamp(fair + s)   # short: mirror image
+
+
+def event_risk_dollars(positions: Dict[str, float], fairs: Dict[str, int],
+                       unknown_fair: int = 50) -> Tuple[float, float]:
+    """(short_risk, long_risk) in dollars across an event, valued at fair (a
+    proxy for cost): every shorted strike touching costs (100 - fair)/ct, every
+    longed strike never touching costs fair/ct. Strikes not priced this cycle
+    (breached / stood down) are valued at `unknown_fair`."""
+    short = long = 0.0
+    for ticker, pos in positions.items():
+        f = fairs.get(ticker, unknown_fair)
+        if pos < 0:
+            short += -pos * (100 - f) / 100.0
+        elif pos > 0:
+            long += pos * f / 100.0
+    return short, long
+
+
+def risk_room_contracts(risk_used: float, risk_cap: float, per_contract: float) -> float:
+    """Contracts that may still be added on a side before `risk_cap` dollars
+    are at risk, given `risk_used` already at risk and `per_contract` dollars
+    of risk per new contract (a whole ladder is assumed to fill)."""
+    if per_contract <= 0 or risk_cap == float("inf"):
+        return float("inf")
+    return max(0.0, (risk_cap - risk_used) / per_contract)
 
 
 def orderbook_levels(orderbook_response: dict) -> Tuple[List[List[float]], List[List[float]]]:
@@ -848,6 +953,10 @@ class BotState:
     event_ticker: str = ""
     live_price: Optional[float] = None
     sigma_daily: Optional[float] = None
+    sigma_raw: Optional[float] = None          # v2.6: unshrunk blended estimate
+    sigma_median: Optional[float] = None       # v2.6: long-run median it shrinks toward
+    risk_short: float = 0.0                    # v2.6: $ lost if every short strike touches
+    risk_long: float = 0.0                     # v2.6: $ lost if no long strike touches
     vol_fetched_at: float = 0.0
     daily_candles: List[Tuple[int, float, float, float]] = field(default_factory=list)
     session_extreme: Optional[float] = None    # session high (max) / low (min)
@@ -897,6 +1006,16 @@ class TouchMarketMaker:
     contracts_per_level = CONTRACTS_PER_LEVEL
     quote_offset_cents = QUOTE_OFFSET_CENTS
     level_spacing_cents = LEVEL_SPACING_CENTS
+    # v2.6 risk rules — OFF here. The annual bot calls this class's refresh_vol
+    # and the weekly touch bot inherits run_cycle; only MonthlyTouchMarketMaker
+    # (the live monthly fleet's entrypoint) switches them on.
+    vol_shrink_w = 1.0                       # 1.0 = raw estimator, no shrinkage
+    ask_min_fair_cents = 0                   # 0 = sell at any fair
+    max_event_risk_dollars = float("inf")    # per event and direction
+    skew_max_cents = 0                       # 0 = no inventory skew
+    skew_full_at = 1.0                       # net contracts at which skew saturates
+    skew_edge_floor_cents = SKEW_EDGE_FLOOR_CENTS
+    reduce_only_at = float("inf")            # |event net| beyond which we only reduce
 
     def status_extra(self) -> Dict[str, object]:
         """Extra fields merged into the heartbeat by variants."""
@@ -1133,14 +1252,20 @@ class TouchMarketMaker:
         today_utc_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         if candles and candles[-1][0] >= today_utc_ts:
             closes = closes[:-1]
-        sigma = blended_daily_vol(closes)
+        sigma, raw, med = shrunk_daily_vol(closes, self.vol_shrink_w)
         if not (0.001 <= sigma <= 0.5):
             raise DataError(f"daily vol {sigma:.4f} outside sanity range")
         self.state.daily_candles = candles
         self.state.sigma_daily = sigma
+        self.state.sigma_raw = raw
+        self.state.sigma_median = med
         self.state.vol_fetched_at = now_ts
+        shrink = (f"; raw {raw:.4f}, long-run median {med:.4f}, shrink w={self.vol_shrink_w:g}"
+                  if med is not None else
+                  (f"; no shrinkage ({len(closes)} closes < {VOL_MEDIAN_MIN_HISTORY} history)"
+                   if self.vol_shrink_w < 1.0 else ""))
         log(f"{self.tag} vol refreshed: sigma_daily={sigma:.4f} "
-            f"({sigma * math.sqrt(365):.1%} annualized), {len(candles)} daily candles")
+            f"({sigma * math.sqrt(365):.1%} annualized), {len(candles)} daily candles{shrink}")
 
     def refresh_mtd_extreme(self, now_utc: datetime) -> None:
         """Month-to-date extreme from hourly candles (refetched at most every
@@ -1273,6 +1398,13 @@ class TouchMarketMaker:
         desired: List[Quote] = []
         blind: Set[str] = set()
         remaining_markets = len(priced)
+        # v2.6 rule 3: dollars at risk on the event right now, per direction.
+        fairs_now = {t: f for _m, t, _s, f in priced}
+        risk_short, risk_long = event_risk_dollars(positions, fairs_now)
+        self.state.risk_short, self.state.risk_long = risk_short, risk_long
+        summary[0] += (f" risk short/long ${risk_short:.0f}/${risk_long:.0f}"
+                       + (f" sigma_raw={self.state.sigma_raw:.4f} sigma_med={self.state.sigma_median:.4f}"
+                          if self.state.sigma_median is not None else ""))
         for _moneyness, ticker, strike, fair in sorted(priced):
             # Even split of the event budget over the markets not yet quoted
             # (near-money first); shares a skipped market doesn't use roll
@@ -1320,19 +1452,58 @@ class TouchMarketMaker:
             pos = positions.get(ticker, 0.0)
             room_buy = min(self.max_position - pos, share_buy)
             room_sell = min(self.max_position + pos, share_sell)
-            quotes = build_quotes(ticker, fair, best_bid, best_ask, room_buy, room_sell,
-                                  self.num_levels, self.contracts_per_level,
-                                  self.quote_offset_cents, self.level_spacing_cents)
+            notes: List[str] = []
+            # v2.6 rule 3: dollars-at-risk cap per event and direction (valued
+            # at fair; a whole ladder is assumed to fill, like the contract caps).
+            short_unit = (100 - fair) / 100.0
+            long_unit = fair / 100.0
+            risk_sell = risk_room_contracts(risk_short, self.max_event_risk_dollars, short_unit)
+            risk_buy = risk_room_contracts(risk_long, self.max_event_risk_dollars, long_unit)
+            if risk_sell < room_sell:
+                room_sell = risk_sell
+                notes.append(f"risk cap sell room {risk_sell:.0f}")
+            if risk_buy < room_buy:
+                room_buy = risk_buy
+                notes.append(f"risk cap buy room {risk_buy:.0f}")
+            # v2.6 rule 4: inventory skew + reduce-only well before the cap.
+            fair_bid, fair_ask = skewed_fairs(fair, event_net, self.skew_max_cents,
+                                              self.skew_full_at, self.quote_offset_cents,
+                                              self.skew_edge_floor_cents)
+            if (fair_bid, fair_ask) != (fair, fair):
+                notes.append(f"skew bid/ask fair {fair_bid}/{fair_ask}c")
+            if event_net >= self.reduce_only_at:
+                room_buy = 0.0
+                notes.append("reduce-only (long)")
+            elif event_net <= -self.reduce_only_at:
+                room_sell = 0.0
+                notes.append("reduce-only (short)")
+            # v2.6 rule 2: never sell cheap tails (bids still quote).
+            if fair < self.ask_min_fair_cents:
+                room_sell = 0.0
+                notes.append(f"ask floor (fair<{self.ask_min_fair_cents}c)")
+            quotes = ([q for q in build_quotes(ticker, fair_bid, best_bid, best_ask, room_buy, 0.0,
+                                               self.num_levels, self.contracts_per_level,
+                                               self.quote_offset_cents, self.level_spacing_cents)
+                       if q.book_side == "bid"]
+                      + [q for q in build_quotes(ticker, fair_ask, best_bid, best_ask, 0.0, room_sell,
+                                                 self.num_levels, self.contracts_per_level,
+                                                 self.quote_offset_cents, self.level_spacing_cents)
+                         if q.book_side == "ask"])
             desired.extend(quotes)
-            event_room_buy -= sum(q.count for q in quotes if q.book_side == "bid")
-            event_room_sell -= sum(q.count for q in quotes if q.book_side == "ask")
+            n_bid = sum(q.count for q in quotes if q.book_side == "bid")
+            n_ask = sum(q.count for q in quotes if q.book_side == "ask")
+            event_room_buy -= n_bid
+            event_room_sell -= n_ask
+            risk_long += n_bid * long_unit      # later strikes see this ladder's risk
+            risk_short += n_ask * short_unit
 
             mkt = (f"ext {best_bid if best_bid is not None else '--'}/"
                    f"{best_ask if best_ask is not None else '--'}")
             our_bids = sorted((q.price_cents for q in quotes if q.book_side == "bid"), reverse=True)
             our_asks = sorted(q.price_cents for q in quotes if q.book_side == "ask")
             summary.append(f"  {ticker} strike={strike:g}: fair={fair}c {mkt} pos={pos:+.0f} "
-                           f"bids={our_bids} asks={our_asks}")
+                           f"bids={our_bids} asks={our_asks}"
+                           + (f" [{'; '.join(notes)}]" if notes else ""))
 
         to_place, to_cancel = diff_orders(desired, resting, self.state.order_ages,
                                           now_ts, preserve_tickers=blind)
@@ -1379,6 +1550,10 @@ class TouchMarketMaker:
             "event": s.event_ticker,
             "price": s.live_price,
             "sigma_daily": s.sigma_daily,
+            "sigma_raw": s.sigma_raw,
+            "sigma_median": s.sigma_median,
+            "risk_short_dollars": s.risk_short,
+            "risk_long_dollars": s.risk_long,
             "mtd_extreme": s.mtd_extreme,
             "net_position": s.last_event_net,
             "markets_line": s.last_markets_line,
@@ -1512,6 +1687,14 @@ class TouchMarketMaker:
             f"{self.quote_offset_cents}c off fair, {self.level_spacing_cents}c apart, post-only, "
             f"TTL {ORDER_TTL_SECS}s, per-market cap {self.max_position:g}, "
             f"event cap {self.max_event:g}")
+        rules_on = (self.vol_shrink_w < 1.0 or self.ask_min_fair_cents > 0
+                    or self.max_event_risk_dollars < float("inf") or self.skew_max_cents > 0
+                    or self.reduce_only_at < float("inf"))
+        log(f"risk rules v2.6 {'ON' if rules_on else 'off'}: vol shrink w={self.vol_shrink_w:g} "
+            f"toward long-run median, ask floor fair<{self.ask_min_fair_cents}c, "
+            f"event risk cap ${self.max_event_risk_dollars:g}/direction, "
+            f"skew +-{self.skew_max_cents}c full at {self.skew_full_at:g} net "
+            f"(edge floor {self.skew_edge_floor_cents}c), reduce-only at +-{self.reduce_only_at:g} net")
 
         self.startup_event_and_sweep()
 
@@ -1601,6 +1784,18 @@ class TouchMarketMaker:
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
+
+class MonthlyTouchMarketMaker(TouchMarketMaker):
+    """The live monthly fleet: TouchMarketMaker with the v2.6 risk rules ON.
+    main() constructs this; variants keep constructing/subclassing the base."""
+    vol_shrink_w = VOL_SHRINK_W
+    ask_min_fair_cents = ASK_MIN_FAIR_CENTS
+    max_event_risk_dollars = MAX_EVENT_RISK_DOLLARS
+    skew_max_cents = SKEW_MAX_CENTS
+    skew_full_at = SKEW_FULL_AT_CONTRACTS
+    skew_edge_floor_cents = SKEW_EDGE_FLOOR_CENTS
+    reduce_only_at = REDUCE_ONLY_AT_CONTRACTS
+
 
 def acquire_singleton(market_key: str, status_dir: Optional[str] = None,
                       heartbeat_max_age_secs: float = 180) -> bool:
@@ -1726,7 +1921,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cancel_all:
         # Cancellation is inherently risk-reducing: always run it against the
         # real book, whether or not --live was passed.
-        bot = TouchMarketMaker(cfg, client, live=True)
+        bot = MonthlyTouchMarketMaker(cfg, client, live=True)
         bot.state.event_ticker = event_ticker_for(cfg, datetime.now(timezone.utc))
         n = bot.cancel_all_bot_orders(include_prev_month=True)
         log(f"cancelled {n} real resting orders for {cfg.key} "
@@ -1738,7 +1933,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.live and not args.once and not acquire_singleton(cfg.key):
         return 0
 
-    bot = TouchMarketMaker(cfg, client, live=args.live)
+    bot = MonthlyTouchMarketMaker(cfg, client, live=args.live)
     bot.run(once=args.once)
     return 0
 

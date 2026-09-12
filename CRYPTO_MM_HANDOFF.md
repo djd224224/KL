@@ -62,6 +62,48 @@ within a few cents on majors; meme coins diverge (see guards).
   strike; fair ≥97c (near touch); book bid ≥85c while fair ≤ bid−20c (suspected unseen touch —
   the one urgent alert); |fair − book mid| >30c on a two-sided book (model/market disagreement).
 
+## v2.6 risk rules (2026-09-12, Jack "ship 1, 2, 3, 4")
+
+Live ladder since 8/22 is **3x5, 5c off fair, caps 200/market, 1000/event** (the 5x12 above
+is history). v2.6 adds four rules on top, ON for the monthly fleet only: `main()` constructs
+`MonthlyTouchMarketMaker`, a subclass whose class attributes switch them on. `TouchMarketMaker`
+keeps every rule OFF (`vol_shrink_w=1`, `ask_min_fair_cents=0`, `max_event_risk_dollars=inf`,
+`skew_max_cents=0`, `reduce_only_at=inf`) because the annual bot reuses its `refresh_vol` and the
+idle weekly touch bot its `run_cycle`; their suites pin the old behaviour. Values are pinned by
+`TestLiveRiskRuleConfig` (change a rule -> change the test). Env overrides `CMM_VOL_SHRINK_W`,
+`CMM_ASK_MIN_FAIR_CENTS`, `CMM_MAX_EVENT_RISK`, `CMM_SKEW_MAX_CENTS`, `CMM_SKEW_FULL_AT`,
+`CMM_REDUCE_ONLY_AT` exist for emergencies; no launcher sets them (code defaults ARE live config).
+
+1. **Vol shrinkage** (`shrunk_daily_vol`): sigma^2 = 0.25*raw^2 + 0.75*median^2, median = the
+   long-run median of the same EWMA/90d estimator over the fetched ~720 daily candles
+   (`long_run_median_vol`, needs >120 closes else raw is used). The raw estimator was found to
+   under-price touches ~11 pts in its low-vol tercile and over-price ~13 pts in its high-vol
+   tercile (2y Kraken, 30d windows, barriers 10-30%); w=0.25 cut the calibration error 6.4 -> 4.3
+   pts. On 8/1/2026 every asset sat in its low tercile (XRP 2.1%/d vs median 3.6) and the fleet
+   sold August's upside tails at 1-7c. Vol-refresh log line now carries `raw`, `long-run median`.
+2. **Ask floor**: no asks on a strike whose model fair is `< 15c` (bids still quote). Every dollar
+   of the Jul-Sep 2026 loss (-$888 on 3,597 maker fills) was sells under 25c; 93% of those had
+   fair < 15c. Cycle line shows `[ask floor (fair<15c)]`.
+3. **Dollars-at-risk cap, $300 per event AND direction**, valued at fair: shorts risk (100-fair)/ct
+   if the strike touches, longs risk fair/ct if it never does (`event_risk_dollars`,
+   `risk_room_contracts`; unpriced strikes count at 50c). Ladder sizes are shaved to the remaining
+   risk room near-money-first, so a later strike sees earlier ladders' risk. The 28 tickers that
+   reached |net| >= 250 made ALL of the loss (-$1,651) while the other 162 made +$905. Cycle line:
+   `[risk cap sell room N]`; header: `risk short/long $x/$y`.
+4. **Inventory skew + reduce-only** (`skewed_fairs`): fair shifts against the event net,
+   +-4c at |net| >= 300; the discouraged side gets the full shift, the encouraged side keeps >= 3c
+   of edge vs the unskewed fair (the daily updown bot's floor). Beyond |net| >= 600 the losing
+   direction stops adding (reduce-only) — well before the 1000 event cap. Cycle line:
+   `[skew bid/ask fair a/b c; reduce-only (long|short)]`.
+
+Backtest (tape replay of Jul-Sep 2026, today's ladder): baseline -$448, rule 2 alone +$285
+(smooth: Jul +409 / Aug -105), rule 1 alone +$458 but Jul -703 / Aug +1,149 (it makes the bot a
+net BUYER of touches in low-vol regimes — long vol, lumpy), both +$357. Rule 1's case rests on the
+2y calibration, not the 3-month sample. Watch the by-token MONTHLY column for a quiet month.
+
+Verify after any restart: banner line `risk rules v2.6 ON: vol shrink w=0.25 ...` on all 16 bots;
+status json carries `sigma_raw`, `sigma_median`, `risk_short_dollars`, `risk_long_dollars`.
+
 ## Order management & safety
 
 - **TTL 600s stamped per-send / refreshed at 420s age** — quotes die ≤10 min if anything dies.

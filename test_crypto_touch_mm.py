@@ -1119,5 +1119,327 @@ class TestRefreshVol(unittest.TestCase):
         self.assertEqual(len(bot.state.daily_candles), len(candles))
 
 
+
+# ---------------------------------------------------------------------------
+# v2.6 monthly risk rules (Jack 2026-09-12 "ship 1, 2, 3, 4"): vol shrinkage
+# toward the long-run median, ask floor on cheap tails, dollars-at-risk cap,
+# inventory skew + reduce-only. ON only for MonthlyTouchMarketMaker (the live
+# monthly entrypoint); the base class — reused by the annual and weekly
+# variants — must behave exactly as before. These tests PIN the live values:
+# changing a rule's parameter must break a test here.
+# ---------------------------------------------------------------------------
+import os
+import statistics
+import time
+from datetime import timedelta
+
+
+def _gbm_closes(n, sigma, seed, start=100.0):
+    import random
+    random.seed(seed)
+    closes = [start]
+    for _ in range(n):
+        closes.append(closes[-1] * math.exp(random.gauss(0, sigma)))
+    return closes
+
+
+class TestLiveRiskRuleConfig(unittest.TestCase):
+    def test_monthly_class_pins_the_shipped_values(self):
+        m = mm.MonthlyTouchMarketMaker
+        self.assertEqual(m.vol_shrink_w, 0.25)
+        self.assertEqual(m.ask_min_fair_cents, 15)
+        self.assertEqual(m.max_event_risk_dollars, 300)
+        self.assertEqual(m.skew_max_cents, 4)
+        self.assertEqual(m.skew_full_at, 300)
+        self.assertEqual(m.skew_edge_floor_cents, 3)
+        self.assertEqual(m.reduce_only_at, 600)
+        self.assertEqual(mm.MODEL_VERSION, "crypto_touch_mm_v2.6")
+
+    def test_base_class_rules_are_off(self):
+        b = mm.TouchMarketMaker
+        self.assertEqual(b.vol_shrink_w, 1.0)
+        self.assertEqual(b.ask_min_fair_cents, 0)
+        self.assertEqual(b.max_event_risk_dollars, float("inf"))
+        self.assertEqual(b.skew_max_cents, 0)
+        self.assertEqual(b.reduce_only_at, float("inf"))
+        # the shipped ladder/caps are inherited unchanged
+        self.assertEqual((mm.MonthlyTouchMarketMaker.num_levels,
+                          mm.MonthlyTouchMarketMaker.contracts_per_level,
+                          mm.MonthlyTouchMarketMaker.max_position,
+                          mm.MonthlyTouchMarketMaker.max_event), (3, 5, 200, 1000))
+
+
+class TestShrunkVol(unittest.TestCase):
+    def test_w1_is_raw_bit_for_bit(self):
+        closes = _gbm_closes(400, 0.03, 1)
+        sigma, raw, med = mm.shrunk_daily_vol(closes, 1.0)
+        self.assertEqual(sigma, mm.blended_daily_vol(closes))
+        self.assertEqual(raw, sigma)
+        self.assertIsNone(med)
+
+    def test_w0_is_the_long_run_median(self):
+        closes = _gbm_closes(400, 0.03, 2)
+        sigma, raw, med = mm.shrunk_daily_vol(closes, 0.0)
+        expected = statistics.median(mm.blended_daily_vol(closes[:i])
+                                     for i in range(mm.VOL_MEDIAN_MIN_HISTORY, len(closes) + 1))
+        self.assertAlmostEqual(med, expected, places=12)
+        self.assertAlmostEqual(sigma, expected, places=12)
+        self.assertEqual(mm.long_run_median_vol(closes), med)
+
+    def test_variance_shrinkage_formula(self):
+        closes = _gbm_closes(400, 0.03, 3)
+        sigma, raw, med = mm.shrunk_daily_vol(closes, 0.25)
+        self.assertAlmostEqual(sigma, math.sqrt(0.25 * raw ** 2 + 0.75 * med ** 2), places=12)
+        lo, hi = sorted((raw, med))
+        self.assertTrue(lo <= sigma <= hi)
+
+    def test_low_vol_regime_is_lifted_toward_the_median(self):
+        # 300 days at 4%/day then 100 quiet days at 1%: the raw EWMA/90d blend
+        # sits near the quiet regime, the long-run median near 4% -> shrinkage
+        # lifts sigma well above raw (the August 2026 failure mode).
+        closes = _gbm_closes(300, 0.04, 4)
+        quiet = _gbm_closes(100, 0.01, 5)
+        closes += [closes[-1] * c / 100.0 for c in quiet[1:]]
+        sigma, raw, med = mm.shrunk_daily_vol(closes, 0.25)
+        self.assertGreater(med, raw * 1.5)
+        self.assertGreater(sigma, raw * 1.3)
+
+    def test_high_vol_regime_is_pulled_down(self):
+        closes = _gbm_closes(300, 0.02, 8)
+        wild = _gbm_closes(60, 0.06, 9)
+        closes += [closes[-1] * c / 100.0 for c in wild[1:]]
+        sigma, raw, med = mm.shrunk_daily_vol(closes, 0.25)
+        self.assertLess(med, raw)
+        self.assertLess(sigma, raw)
+
+    def test_short_history_falls_back_to_raw(self):
+        closes = _gbm_closes(100, 0.03, 6)   # <= VOL_MEDIAN_MIN_HISTORY closes
+        sigma, raw, med = mm.shrunk_daily_vol(closes, 0.25)
+        self.assertIsNone(med)
+        self.assertEqual(sigma, raw)
+        self.assertIsNone(mm.long_run_median_vol(closes))
+
+    def test_refresh_vol_applies_the_class_weight(self):
+        closes = _gbm_closes(400, 0.03, 7)
+        today_ts = int(utc(2026, 9, 12, 0, 0).timestamp())
+        candles = [(today_ts - 86400 * (len(closes) - i), c, c, c) for i, c in enumerate(closes)]
+        base = mm.TouchMarketMaker(SOL_MAX, None, live=False)
+        monthly = mm.MonthlyTouchMarketMaker(SOL_MAX, None, live=False)
+        with mock.patch.object(mm, "fetch_ohlc", return_value=candles):
+            base.refresh_vol(now_ts=1.0, now_utc=utc(2026, 9, 12, 0, 30))
+            monthly.refresh_vol(now_ts=1.0, now_utc=utc(2026, 9, 12, 0, 30))
+        raw = mm.blended_daily_vol(closes)
+        self.assertEqual(base.state.sigma_daily, raw)
+        self.assertIsNone(base.state.sigma_median)
+        self.assertEqual(monthly.state.sigma_raw, raw)
+        self.assertIsNotNone(monthly.state.sigma_median)
+        w = mm.MonthlyTouchMarketMaker.vol_shrink_w
+        self.assertAlmostEqual(monthly.state.sigma_daily,
+                               math.sqrt(w * raw ** 2 + (1 - w) * monthly.state.sigma_median ** 2),
+                               places=12)
+
+
+class TestSkewedFairs(unittest.TestCase):
+    def test_flat_or_disabled_is_identity(self):
+        self.assertEqual(mm.skewed_fairs(50, 0, 4, 300, 5, 3), (50, 50))
+        self.assertEqual(mm.skewed_fairs(50, 250, 0, 300, 5, 3), (50, 50))
+        self.assertEqual(mm.skewed_fairs(50, 250, 4, 0, 5, 3), (50, 50))
+
+    def test_long_inventory_shifts_down_with_edge_floor_on_asks(self):
+        # full skew 4c on the discouraged side (bids), asks come in only 2c so
+        # they keep 5-2 = 3c of edge vs the unskewed fair
+        self.assertEqual(mm.skewed_fairs(50, 300, 4, 300, 5, 3), (46, 48))
+        fair_bid, fair_ask = mm.skewed_fairs(50, 300, 4, 300, 5, 3)
+        self.assertGreaterEqual(fair_ask + 5, 50 + 3)
+
+    def test_short_inventory_is_the_mirror_image(self):
+        self.assertEqual(mm.skewed_fairs(50, -300, 4, 300, 5, 3), (52, 54))
+
+    def test_skew_is_proportional_and_saturates(self):
+        self.assertEqual(mm.skewed_fairs(50, 150, 4, 300, 5, 3), (48, 48))
+        self.assertEqual(mm.skewed_fairs(50, 900, 4, 300, 5, 3), (46, 48))
+        self.assertEqual(mm.skewed_fairs(50, -900, 4, 300, 5, 3), (52, 54))
+
+    def test_clamped_to_price_range(self):
+        self.assertEqual(mm.skewed_fairs(2, 300, 4, 300, 5, 3), (1, 1))
+        self.assertEqual(mm.skewed_fairs(98, -300, 4, 300, 5, 3), (99, 99))
+
+
+class TestEventRisk(unittest.TestCase):
+    def test_risk_dollars_by_direction(self):
+        short, long = mm.event_risk_dollars({"A": -100, "B": 50, "C": -20}, {"A": 20, "B": 40})
+        self.assertAlmostEqual(short, 100 * 0.8 + 20 * 0.5)   # C unpriced -> 50c
+        self.assertAlmostEqual(long, 50 * 0.4)
+
+    def test_risk_room(self):
+        self.assertAlmostEqual(mm.risk_room_contracts(80, 300, 0.8), 275)
+        self.assertEqual(mm.risk_room_contracts(320, 300, 0.8), 0.0)
+        self.assertEqual(mm.risk_room_contracts(0, float("inf"), 0.8), float("inf"))
+        self.assertEqual(mm.risk_room_contracts(0, 300, 0.0), float("inf"))
+
+
+class RulesFakeClient(FakeClient):
+    """FakeClient + the read endpoints one quoting cycle needs."""
+
+    def __init__(self, markets, positions, books):
+        super().__init__()
+        self.markets, self.positions, self.books = markets, positions, books
+
+    def get_event(self, event_ticker):
+        return {"event": {"markets": self.markets}}
+
+    def get_positions(self, **kwargs):
+        return {"market_positions": [{"ticker": t, "position": p}
+                                     for t, p in self.positions.items()]}
+
+    def get_orderbook(self, ticker):
+        bb, ba = self.books[ticker]
+        return {"orderbook": {"yes": [[bb, 50]], "no": [[100 - ba, 50]]}}
+
+
+def _mk(strike):
+    return {"ticker": f"KXSOLMAXMON-SOL-26SEP30-{int(strike)}", "status": "active",
+            "strike_type": "greater", "floor_strike": strike}
+
+
+def _cycle(cls, markets, positions, books, fairs):
+    """One live cycle with fairs pinned per strike; returns (bids, asks) per
+    ticker as sorted YES-price lists plus the raw created orders."""
+    client = RulesFakeClient(markets, positions, {m["ticker"]: books[m["floor_strike"]] for m in markets})
+    bot = cls(SOL_MAX, client, live=True)
+    bot.state.sigma_daily = 0.03
+    bot.state.vol_fetched_at = time.time()      # skip the vol fetch
+    bot.state.mtd_hourly_at = time.time()       # skip the hourly fetch (session extreme = spot)
+    with mock.patch.object(bot.alerter, "alert"), \
+         mock.patch.object(mm, "fetch_live_price", return_value=100.0), \
+         mock.patch.object(mm, "fair_value_cents",
+                           side_effect=lambda spot, strike, sigma, t, d: fairs[strike]), \
+         mock.patch.object(bot, "window_end_utc",
+                           return_value=datetime.now(timezone.utc) + timedelta(days=10)):
+        bot.run_cycle()
+    bids, asks = {}, {}
+    for o in client.created:
+        if o["side"] == "yes":
+            bids.setdefault(o["ticker"], []).append((o["yes_price"], o["count"]))
+        else:
+            asks.setdefault(o["ticker"], []).append((100 - o["no_price"], o["count"]))
+    return ({t: sorted(v, reverse=True) for t, v in bids.items()},
+            {t: sorted(v) for t, v in asks.items()}, client.created)
+
+
+class TestMonthlyRulesCycle(unittest.TestCase):
+    CHEAP, MID = 116.0, 108.0
+
+    def _markets(self):
+        return [_mk(self.CHEAP), _mk(self.MID)]
+
+    def test_ask_floor_suppresses_cheap_asks_only_for_the_monthly_class(self):
+        books = {self.CHEAP: (10, 12), self.MID: (35, 45)}
+        fairs = {self.CHEAP: 12, self.MID: 40}
+        t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
+        b_bids, b_asks, _ = _cycle(mm.TouchMarketMaker, self._markets(), {}, books, fairs)
+        self.assertEqual(b_asks[t_cheap], [(17, 5), (19, 5), (21, 5)])   # base still sells
+        self.assertEqual(b_bids[t_cheap], [(7, 5), (5, 5), (3, 5)])
+        m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), {}, books, fairs)
+        self.assertNotIn(t_cheap, m_asks)                                 # floor: no asks
+        self.assertEqual(m_bids[t_cheap], [(7, 5), (5, 5), (3, 5)])       # bids untouched
+        self.assertEqual(m_asks[t_mid], [(45, 5), (47, 5), (49, 5)])      # fair 40 >= 15: sells
+        self.assertEqual(m_bids[t_mid], [(35, 5), (33, 5), (31, 5)])
+
+    def test_reduce_only_when_long_past_threshold(self):
+        books = {self.CHEAP: (30, 34), self.MID: (35, 45)}
+        fairs = {self.CHEAP: 32, self.MID: 40}
+        t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
+        positions = {t_cheap: 650.0}          # event net +650 >= 600
+        b_bids, b_asks, _ = _cycle(mm.TouchMarketMaker, self._markets(), positions, books, fairs)
+        self.assertIn(t_mid, b_bids)          # base keeps buying the other strike
+        m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), positions, books, fairs)
+        self.assertEqual(m_bids, {})          # monthly: no bids anywhere
+        self.assertIn(t_mid, m_asks)          # asks (reducing) still quote
+        self.assertIn(t_cheap, m_asks)
+
+    def test_reduce_only_when_short_past_threshold(self):
+        books = {self.CHEAP: (30, 34), self.MID: (35, 45)}
+        fairs = {self.CHEAP: 32, self.MID: 40}
+        t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
+        # -650 short at fair 32 also puts $442 at risk (> $300 cap): both rules
+        # agree — no asks; bids quote on both strikes.
+        m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(),
+                                   {t_cheap: -650.0}, books, fairs)
+        self.assertEqual(m_asks, {})
+        self.assertIn(t_mid, m_bids)
+
+    def test_risk_cap_blocks_asks_across_the_event(self):
+        books = {self.CHEAP: (15, 25), self.MID: (35, 45)}
+        fairs = {self.CHEAP: 20, self.MID: 40}
+        t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
+        positions = {t_cheap: -400.0}         # 400 x (100-20)c = $320 >= $300 cap; net -400 < 600
+        b_bids, b_asks, _ = _cycle(mm.TouchMarketMaker, self._markets(), positions, books, fairs)
+        self.assertIn(t_mid, b_asks)
+        m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), positions, books, fairs)
+        self.assertEqual(m_asks, {})          # every strike's sell room is zero
+        self.assertIn(t_mid, m_bids)          # buying (reducing) still allowed
+
+    def test_risk_cap_shaves_the_ladder(self):
+        class TightRisk(mm.MonthlyTouchMarketMaker):
+            max_event_risk_dollars = 20.0
+            skew_max_cents = 0
+
+        books = {self.CHEAP: (15, 25), self.MID: (35, 45)}
+        fairs = {self.CHEAP: 20, self.MID: 40}
+        t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
+        _b, asks, _ = _cycle(TightRisk, self._markets(), {}, books, fairs)
+        # near-money first: MID (fair 40) quotes 15 asks = $9 at risk; CHEAP
+        # (fair 20, 80c/ct) then gets (20-9)/0.8 = 13 contracts, not 15.
+        self.assertEqual(sum(c for _p, c in asks[t_mid]), 15)
+        self.assertEqual(sum(c for _p, c in asks[t_cheap]), 13)
+
+    def test_inventory_skew_moves_quotes_against_the_position(self):
+        books = {self.CHEAP: (30, 34), self.MID: (46, 54)}
+        fairs = {self.CHEAP: 32, self.MID: 50}
+        t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
+        positions = {t_cheap: 150.0}          # half of skew_full_at -> 2c skew
+        b_bids, b_asks, _ = _cycle(mm.TouchMarketMaker, self._markets(), positions, books, fairs)
+        self.assertEqual(b_bids[t_mid], [(45, 5), (43, 5), (41, 5)])
+        self.assertEqual(b_asks[t_mid], [(55, 5), (57, 5), (59, 5)])
+        m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), positions, books, fairs)
+        self.assertEqual(m_bids[t_mid], [(43, 5), (41, 5), (39, 5)])   # bids back off 2c
+        self.assertEqual(m_asks[t_mid], [(54, 5), (56, 5), (58, 5)])   # asks join the book's 54
+
+    def test_flat_book_monthly_matches_base_when_fair_is_above_floor(self):
+        books = {self.CHEAP: (30, 34), self.MID: (35, 45)}
+        fairs = {self.CHEAP: 32, self.MID: 40}
+        b = _cycle(mm.TouchMarketMaker, self._markets(), {}, books, fairs)
+        m = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), {}, books, fairs)
+        self.assertEqual(b[:2], m[:2])
+
+    def test_status_carries_risk_and_sigma_fields(self):
+        books = {self.CHEAP: (15, 25), self.MID: (35, 45)}
+        fairs = {self.CHEAP: 20, self.MID: 40}
+        t_cheap = _mk(self.CHEAP)["ticker"]
+        client = RulesFakeClient(self._markets(), {t_cheap: -100.0},
+                                 {m["ticker"]: books[m["floor_strike"]] for m in self._markets()})
+        bot = mm.MonthlyTouchMarketMaker(SOL_MAX, client, live=True)
+        bot.state.sigma_daily = 0.03
+        bot.state.vol_fetched_at = time.time()
+        bot.state.mtd_hourly_at = time.time()
+        with mock.patch.object(bot.alerter, "alert"), \
+             mock.patch.object(mm, "fetch_live_price", return_value=100.0), \
+             mock.patch.object(mm, "fair_value_cents",
+                               side_effect=lambda spot, strike, sigma, t, d: fairs[strike]), \
+             mock.patch.object(bot, "window_end_utc",
+                               return_value=datetime.now(timezone.utc) + timedelta(days=10)):
+            bot.run_cycle()
+        self.assertAlmostEqual(bot.state.risk_short, 100 * 0.8)
+        self.assertEqual(bot.state.risk_long, 0.0)
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(bot, "status_dir", d):
+                bot.write_status(datetime.now(timezone.utc))
+            import json as _json
+            st = _json.load(open(os.path.join(d, f"status_{SOL_MAX.key}.json")))
+        self.assertEqual(st["risk_short_dollars"], 80.0)
+        self.assertIn("sigma_median", st)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
