@@ -25,9 +25,9 @@ to and for the EXCLUDED prefixes (gas/diesel/rain dailies + temp):
   net/fill    rent/fill - loss/fill (cents)
   net/ct-day  rent per resting contract-day - turnover x loss/fill (cents):
               what a size multiplier actually scales
-  mult        mean cycle-log hour_mult on the group's quoted rows — proof
-              the multiplier was live (Saturday long-dated: 1.5 by day, 3.0
-              inside the 3-7am ET quiet window)
+  mult        mean cycle-log hour_mult on the group's quoted rows OUTSIDE
+              the 3-7am ET quiet window — proof the multiplier was live
+              (Saturday long-dated 1.5, everything else 1.0)
 
 grouped per day, pooled by day type (Saturday / Sunday / Weekday) since
 SINCE, and set against the pre-change baseline (2026-08-08..09-11, measured
@@ -151,7 +151,11 @@ def _parse_cycle_file(path: str):
     q = df[df["quoted"] > 0]
     ser = df.groupby(["et_date", "et_hour", "series"]).agg(
         sum_est_usd=("est_usd", "sum"), sum_quoted=("quoted", "sum"), n_rows=("ts", "size")).reset_index()
-    hm = q.groupby(["et_date", "et_hour", "series"]).agg(
+    # hour_mult outside the 3-7am ET quiet window (its x2 would otherwise
+    # dominate a partial morning): Saturday long-dated rows should read the
+    # Saturday knob exactly, everything else 1.0.
+    qd = q[~q["et_hour"].between(3, 7)]
+    hm = qd.groupby(["et_date", "et_hour", "series"]).agg(
         q_rows=("ts", "size"), hm_sum=("hour_mult", "sum")).reset_index()
     ser = ser.merge(hm, on=["et_date", "et_hour", "series"], how="left").fillna({"q_rows": 0, "hm_sum": 0.0})
     cyc = df.groupby(["et_date", "et_hour"])["ts"].nunique().reset_index(name="n_cycles")
@@ -343,7 +347,7 @@ def render(g: pd.DataFrame, through_et: str):
         return d.to_string()
 
     lines = []
-    lines.append(f"IMM Saturday multiplier tracker — through {through_et} (ET days since {SINCE})")
+    lines.append(f"IMM Saturday multiplier tracker - through {through_et} (ET days since {SINCE})")
     lines.append(f"live knob: IMM_SAT_SIZE_MULT={imm.SAT_SIZE_MULT:g} on Saturdays (ET) for every series except "
                  f"prefixes {','.join(EXCL)}; hour windows compose (Sat 3-7am ET = x{2 * imm.SAT_SIZE_MULT:g}).")
     lines.append("cents per contract unless noted; rent = modelled accrual (pre-realization, ~1.2x paid account-wide, "
@@ -405,7 +409,7 @@ def main() -> int:
         return 0
     html = ('<pre style="font-family:Consolas,Menlo,monospace;font-size:12px;line-height:1.35">'
             + text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</pre>")
-    subject = f"IMM Saturday x{imm.SAT_SIZE_MULT:g} tracker — through {through_et}"
+    subject = f"IMM Saturday x{imm.SAT_SIZE_MULT:g} tracker - through {through_et}"
     ok = imm.Alerter("IMM-SAT", live=True).send_message(text, subject=subject, html=html)
     log(f"[SAT] email {'sent' if ok else 'FAILED'}: {subject}")
     if ok and not args.test:
