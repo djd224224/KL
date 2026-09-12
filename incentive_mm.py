@@ -1030,6 +1030,13 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     for prefix, hours in SERIES_HOUR_MULTS:
         if series.startswith(prefix) and hour in hours:
             return hours[hour]
+    # Daily (print) families never take the GLOBAL window (Jack 2026-09-12,
+    # with the 0-9am ET extension): the quiet hours are quiet for long-dated
+    # books, while a daily's overnight fills are informed by its own print
+    # (gas dailies at 8-9am ET fill at 0.093/contract-hour, 3.2c lost per
+    # fill; rain 11.8c). Their per-series windows above still apply.
+    if is_daily_series(series):
+        return 1.0
     # Open-scan members (2026-09-05) never take the quiet-hours doubling:
     # the 3-7am ET x2 was measured on the enrolled families' fill data, and
     # an unreviewed family has no such measurement behind it. IMM_SCAN_HOUR_
@@ -1043,6 +1050,184 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     return HOUR_SIZE_MULTS.get(hour, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# DAILY (print) FAMILIES — a structural class, not a prefix list (Jack
+# 2026-09-12: "extend to midnight to 10am ET for longdated. ensure future
+# daily families are excluded (in addition to current daily families)").
+# A daily family is one whose markets resolve on a scheduled print within
+# about a day of listing: gas/diesel dailies (16-18h programs, a new event
+# every day), rain dailies (44h, listed two days out), hourly temp (1h),
+# Truflation (27h), the Treasury daily prints (23.5h). Their overnight and
+# weekend fills are informed by the print itself, so they take NEITHER the
+# quiet-hours doubling NOR the Saturday multiplier — only their own
+# per-series windows (the 16-1 / 19-1 halvings). Two layers:
+#   * DAILY_PREFIXES is the floor for the families we know today (rain's
+#     44h listing window sits outside the structural rule).
+#   * every universe refresh classifies each programmed series from the
+#     LIVE feed (classify_daily_series / refresh_daily_series). Three tests,
+#     all on the series' live markets: DATED event tickers with at least
+#     DAILY_MIN_DATES distinct event dates live at once (a daily family
+#     always carries today's and tomorrow's; earnings mention lists one
+#     event per company and fails here even at 12-20h windows); a 75th-
+#     percentile program window of at most DAILY_MAX_HOURS (KXTRUMPMENTION
+#     mixes same-day speech events with 22-day programs, p75 112-450h, so
+#     the p75 rather than the median keeps it long-dated); and a 75th-
+#     percentile EVENT HORIZON — program start to the end of the ticker's
+#     event day — of at most DAILY_MAX_HORIZON_HOURS. The horizon is what
+#     separates a print daily from a weekly market that Kalshi funds in
+#     24h program chunks: KXSUEZWEEKLY / KXBABELMANDEBWEEKLY run 24-36h
+#     programs on 7-day markets (horizon ~228h) and stay long-dated.
+#     Validated 2026-09-12 on the whole feed history (76k programs): daily
+#     = temp hourlies, gas state dailies (16h/40h), KXDIESELD, KXRAIN (45h/
+#     43h), KXTRUEV, KXUST*AD (23.5h/32h), KXSOFRD, KXEURUSD/KXUSDJPY,
+#     KXTXERCOTPEAKD, the 15-minute metals, WORLDNEWSMENTION, TRUMPMENTIONB,
+#     KXMAMDANIMENTION (44h/37h); long-dated = KXTRUMPMENTION, every
+#     earnings mention, *CC, KPI months, the shipping weeklies, gas/diesel
+#     weeklies/monthlies/annuals.
+# Hysteresis: once daily, a series stays daily until its p75 program window
+# exceeds DAILY_DROP_HOURS (a momentary single-date feed cannot flip the
+# ladder shape), and is forgotten after 14 days out of the feed. The set
+# persists to STATUS_DIR/daily_series.json so a restart quotes right from
+# its first cycle and imm_saturday_tracker.py shares the classification.
+# IMM_DAILY_EXEMPT prefixes are never classified daily (the knob if a
+# structurally-daily family should take the boosts after all).
+# The prefix floor is the TRUE dailies only: KXAAAGASD (national + every
+# state daily), KXDIESELD, KXRAIN (dailies + KXRAINWKND), KXTEMP. The gas/
+# diesel weeklies, monthlies and annuals are long-dated by structure and
+# measured benign overnight (weekday 0-9 ET: 0.024 fills per contract-hour,
+# 0.6c lost per fill, vs the dailies' 0.165 / 3.2c), so they keep the hour
+# window; the Saturday multiplier still skips the whole gas/diesel family
+# via SAT_MULT_EXCLUDE, as decided that morning.
+DAILY_PREFIXES = tuple(p for p in os.environ.get(
+    "IMM_DAILY_PREFIXES", "KXAAAGASD,KXDIESELD,KXRAIN,KXTEMP").split(",") if p)
+DAILY_EXEMPT_PREFIXES = tuple(
+    p for p in os.environ.get("IMM_DAILY_EXEMPT", "").split(",") if p)
+DAILY_MAX_HOURS = _env_float("IMM_DAILY_MAX_HOURS", 48.0)
+DAILY_DROP_HOURS = _env_float("IMM_DAILY_DROP_HOURS", 72.0)
+DAILY_MAX_HORIZON_HOURS = _env_float("IMM_DAILY_MAX_HORIZON_HOURS", 72.0)
+DAILY_MIN_DATES = _env_int("IMM_DAILY_MIN_DATES", 2)
+DAILY_SERIES_FILE = "daily_series.json"
+DAILY_SERIES_DYNAMIC: Dict[str, dict] = {}   # series -> {p75_h, dates, n, since, seen}
+
+
+def is_daily_series(series: str) -> bool:
+    """Prefix floor OR structurally classified from the live feed; exempt
+    prefixes never count."""
+    if any(series.startswith(p) for p in DAILY_EXEMPT_PREFIXES):
+        return False
+    if any(series.startswith(p) for p in DAILY_PREFIXES):
+        return True
+    return series in DAILY_SERIES_DYNAMIC
+
+
+def _p75(values: List[float]) -> float:
+    """Nearest-rank 75th percentile (n=1 -> the value, n=2 -> the max)."""
+    s = sorted(values)
+    idx = -(-3 * len(s) // 4) - 1
+    return s[max(0, min(len(s) - 1, idx))]
+
+
+def classify_daily_series(by_market: Dict[str, dict]) -> Dict[str, dict]:
+    """Pure: per-series {p75_h, horizon_h, dates, n} from a programs feed
+    (market_ticker -> {start, end, ...} as fetch_programs returns it).
+    horizon_h = p75 of (end of the ticker's event day - program start);
+    None when no ticker in the series carries a date."""
+    hours: Dict[str, List[float]] = {}
+    horizons: Dict[str, List[float]] = {}
+    dates: Dict[str, set] = {}
+    for t, info in by_market.items():
+        start, end = info.get("start"), info.get("end")
+        if start is None or end is None:
+            continue
+        s = series_of(t)
+        hours.setdefault(s, []).append((end - start).total_seconds() / 3600.0)
+        d = parse_event_date(t)          # reads the ticker's date segment
+        if d is not None:
+            dates.setdefault(s, set()).add(d.date())
+            horizons.setdefault(s, []).append(
+                (d + timedelta(hours=24) - start).total_seconds() / 3600.0)
+    return {s: {"p75_h": round(_p75(hs), 2),
+                "horizon_h": (round(_p75(horizons[s]), 2) if horizons.get(s) else None),
+                "dates": len(dates.get(s, ())), "n": len(hs)}
+            for s, hs in hours.items()}
+
+
+def _daily_by_rule(st: dict) -> bool:
+    hz = st.get("horizon_h")
+    return (st.get("dates", 0) >= DAILY_MIN_DATES
+            and st.get("p75_h", 1e9) <= DAILY_MAX_HOURS
+            and hz is not None and -24.0 <= hz <= DAILY_MAX_HORIZON_HOURS)
+
+
+def daily_series_path() -> str:
+    return os.path.join(STATUS_DIR, DAILY_SERIES_FILE)
+
+
+def save_daily_series_file(now_utc: datetime) -> None:
+    try:
+        tmp = daily_series_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"updated": now_utc.isoformat(), "max_hours": DAILY_MAX_HOURS,
+                       "drop_hours": DAILY_DROP_HOURS, "min_dates": DAILY_MIN_DATES,
+                       "max_horizon_hours": DAILY_MAX_HORIZON_HOURS,
+                       "prefixes": list(DAILY_PREFIXES),
+                       "series": DAILY_SERIES_DYNAMIC}, f, indent=1, sort_keys=True)
+        os.replace(tmp, daily_series_path())
+    except OSError as e:
+        log(f"[IMM] ! {DAILY_SERIES_FILE} write failed: {e}")
+
+
+def load_daily_series_file() -> int:
+    """Seed DAILY_SERIES_DYNAMIC from the persisted file; returns the count
+    (0 and untouched when the file is absent/unreadable)."""
+    try:
+        with open(daily_series_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    ser = data.get("series") if isinstance(data, dict) else None
+    if isinstance(ser, dict):
+        DAILY_SERIES_DYNAMIC.clear()
+        DAILY_SERIES_DYNAMIC.update({str(k): dict(v) for k, v in ser.items()
+                                     if isinstance(v, dict)})
+    return len(DAILY_SERIES_DYNAMIC)
+
+
+def refresh_daily_series(by_market: Dict[str, dict],
+                         now_utc: datetime) -> Tuple[List[str], List[str]]:
+    """Update DAILY_SERIES_DYNAMIC from a LIVE feed (the caller guards
+    empty/failed reads) and persist it. Returns (added, dropped)."""
+    stats = classify_daily_series(by_market)
+    added: List[str] = []
+    dropped: List[str] = []
+    for s, st in stats.items():
+        if any(s.startswith(p) for p in DAILY_EXEMPT_PREFIXES + DAILY_PREFIXES):
+            continue                     # floor / exempt: no bookkeeping
+        cur = DAILY_SERIES_DYNAMIC.get(s)
+        if cur is None:
+            if _daily_by_rule(st):
+                DAILY_SERIES_DYNAMIC[s] = dict(st, since=now_utc.isoformat(),
+                                               seen=now_utc.isoformat())
+                added.append(s)
+        else:
+            cur.update(st)
+            cur["seen"] = now_utc.isoformat()
+            if st["p75_h"] > DAILY_DROP_HOURS:
+                DAILY_SERIES_DYNAMIC.pop(s)
+                dropped.append(s)
+    cutoff = now_utc - timedelta(days=14)
+    for s in list(DAILY_SERIES_DYNAMIC):
+        seen = DAILY_SERIES_DYNAMIC[s].get("seen")
+        try:
+            if seen and datetime.fromisoformat(seen) < cutoff:
+                DAILY_SERIES_DYNAMIC.pop(s)
+                dropped.append(s)
+        except (TypeError, ValueError):
+            pass
+    save_daily_series_file(now_utc)
+    return added, dropped
+
+
 # Saturday ladder multiplier (Jack 2026-09-12: "Saturday multiplier of 1.5x,
 # only on long-dated families"), from the weekday-vs-weekend study on the
 # post-temp window 2026-08-08..09-11 (cycle logs + the account fills API,
@@ -1054,34 +1239,35 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
 # contract vs +0.7c. Sunday is the WORST day of the week (turnover 0.59,
 # 4.6c lost per fill, net -0.61c/ct-day: Sunday rain + Sunday-evening
 # mention bursts) and gets nothing. The effect lives in the long-dated
-# families — mention, econ/company prints, earnings, Carbon Arc: turnover
-# 0.51 -> 0.08 on Saturday, 13.5c rent per fill — while the dailies fill at
-# the same rate every day (gas/diesel 1.3 vs 1.0, rain 0.3 vs 0.4) and are
-# excluded by PREFIX (KXAAAGAS covers the daily/weekly/monthly trackers and
-# every state daily), as is the hourly-temp residual. Saturday is the ET
-# calendar day (Sat 00:00-23:59 ET). Composes multiplicatively with the hour
-# windows (Sat 3-7am ET on the global ladder = x3, exactly how the mention
-# family mult composed) and sits INSIDE hour_size_mult so every consumer —
-# ladder shape, placement caps, collateral estimate, TOTAL_SIZE_MULT_CAP via
-# capped_ref_mult, the cycle log's hour_mult column — sees one number.
-# Code default OFF (1.0); the launcher sets IMM_SAT_SIZE_MULT=1.5. Four
-# Saturdays of evidence at deploy: a hypothesis under test, re-measured
-# every Monday by imm_saturday_tracker.py (rent per filled contract, fill
-# turnover, settlement loss per fill, by day type since the change).
+# families (turnover 0.51 -> 0.08 on Saturday, 13.5c rent per fill) while
+# the dailies fill at the same rate every day — is_daily_series() (prefix
+# floor + the structural class above) keeps them out, and SAT_MULT_EXCLUDE
+# (default KXAAAGAS,KXDIESEL) keeps the whole gas/diesel family out the way
+# it was measured, weeklies and monthlies included (their Saturday evidence
+# is thin and negative: KXDIESELW -29c/fill on 89 contracts, KXAAAGASM
+# -17c on 66/day). Saturday is the ET calendar day (Sat 00:00-
+# 23:59 ET). Composes multiplicatively with the hour windows (Sat 0-9am ET
+# on the global ladder = x3, exactly how the mention family mult composed)
+# and sits INSIDE hour_size_mult so every consumer — ladder shape, placement
+# caps, collateral estimate, TOTAL_SIZE_MULT_CAP via capped_ref_mult, the
+# cycle log's hour_mult column — sees one number. Code default OFF (1.0);
+# the launcher sets IMM_SAT_SIZE_MULT=1.5. Four Saturdays of evidence at
+# deploy: a hypothesis under test, re-measured every Monday by
+# imm_saturday_tracker.py.
 SAT_SIZE_MULT = _env_float("IMM_SAT_SIZE_MULT", 1.0)
 SAT_MULT_EXCLUDE = tuple(
-    p for p in os.environ.get("IMM_SAT_MULT_EXCLUDE",
-                              "KXAAAGAS,KXDIESEL,KXRAIN,KXTEMP").split(",") if p)
+    p for p in os.environ.get("IMM_SAT_MULT_EXCLUDE", "KXAAAGAS,KXDIESEL").split(",") if p)
 
 
 def saturday_size_mult(series: str, now_utc: datetime) -> float:
-    """SAT_SIZE_MULT on Saturdays (ET calendar day) for series outside
-    SAT_MULT_EXCLUDE; 1.0 otherwise (and whenever the knob is off/invalid)."""
+    """SAT_SIZE_MULT on Saturdays (ET calendar day) for long-dated series
+    (not daily families, not SAT_MULT_EXCLUDE prefixes); 1.0 otherwise and
+    whenever the knob is off/invalid."""
     if SAT_SIZE_MULT <= 0 or SAT_SIZE_MULT == 1.0:
         return 1.0
     if now_utc.astimezone(ET).weekday() != 5:
         return 1.0
-    if any(series.startswith(p) for p in SAT_MULT_EXCLUDE):
+    if is_daily_series(series) or any(series.startswith(p) for p in SAT_MULT_EXCLUDE):
         return 1.0
     return SAT_SIZE_MULT
 
@@ -6756,6 +6942,14 @@ class IncentiveMarketMaker:
             # Per-period accrual baselines (Jack 2026-09-11). LIVE feed only,
             # same guard as the family expansion above.
             self._roll_reward_periods(by_market)
+            # Daily-family classification from the live feed (Jack 2026-09-12):
+            # feeds hour_size_mult / saturday_size_mult; persisted each refresh.
+            _added, _dropped = refresh_daily_series(by_market, now_utc)
+            if _added or _dropped:
+                log(f"{self.tag} daily families (structural): "
+                    f"+{','.join(_added) or '-'} -{','.join(_dropped) or '-'} "
+                    f"-> {len(DAILY_SERIES_DYNAMIC)} classified + prefixes "
+                    f"{','.join(DAILY_PREFIXES)}")
 
         def ticker_cutoff_passed(t: str) -> bool:
             # (imm_quote_gaps.py mirrors this pre-filter — keep in sync.)
@@ -10221,13 +10415,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     client = build_client()
 
     if HOUR_SIZE_MULTS:
-        log(f"[IMM] hour-size multipliers (ET hour -> x): "
+        log(f"[IMM] hour-size multipliers (ET hour -> x, long-dated only): "
             f"{dict(sorted(HOUR_SIZE_MULTS.items()))}; excluded prefixes: "
-            f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'}")
+            f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'} + daily families")
+    _n_daily = load_daily_series_file()
+    log(f"[IMM] daily-family exclusion (no global hour window, no Saturday "
+        f"mult): prefixes {','.join(DAILY_PREFIXES) or '(none)'} + structural "
+        f"(dated, >={DAILY_MIN_DATES} live dates, p75 program <= "
+        f"{DAILY_MAX_HOURS:g}h, p75 event horizon <= {DAILY_MAX_HORIZON_HOURS:g}h, "
+        f"drop > {DAILY_DROP_HOURS:g}h): {_n_daily} loaded "
+        f"from {DAILY_SERIES_FILE}: {','.join(sorted(DAILY_SERIES_DYNAMIC)) or '(none)'}"
+        f"; exempt: {','.join(DAILY_EXEMPT_PREFIXES) or '(none)'}")
     if SAT_SIZE_MULT != 1.0:
         log(f"[IMM] Saturday ladder multiplier x{SAT_SIZE_MULT:g} (ET calendar "
-            f"day, composes with hour windows); excluded prefixes: "
-            f"{','.join(SAT_MULT_EXCLUDE) or '(none)'}")
+            f"day, long-dated only, composes with hour windows)"
+            + (f"; extra excluded prefixes: {','.join(SAT_MULT_EXCLUDE)}"
+               if SAT_MULT_EXCLUDE else ""))
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):

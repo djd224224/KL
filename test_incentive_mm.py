@@ -5833,10 +5833,11 @@ class TestSaturdaySizeMult(unittest.TestCase):
         for s in ("KXTRUMPMENTION", "KXEARNINGSMENTIONHIMS", "KXUST2AD",
                   "KXDKNGAPP", "KXAMZNCC", "KXAQICITYNYC", "KXFOO"):
             self.assertEqual(imm.hour_size_mult(s, sat), 1.5, s)
-        # the exclude list is env-tunable and prefix-matched
+        # extra prefixes on top of the daily floor are env-tunable
         imm.SAT_MULT_EXCLUDE = ("KXTRUMP",)
         self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION", sat), 1.0)
-        self.assertEqual(imm.hour_size_mult("KXAAAGASD", sat), 1.5)
+        self.assertEqual(imm.hour_size_mult("KXFOO", sat), 1.5)
+        self.assertEqual(imm.hour_size_mult("KXAAAGASD", sat), 1.0)   # floor stays
 
     def test_ladder_scales_half_up_and_excluded_series_keep_shape(self):
         sat = utc(2026, 9, 12, 16, 0)
@@ -5854,7 +5855,8 @@ class TestSaturdaySizeMult(unittest.TestCase):
             "KXDIESELD:16-1:0.5,KXFOOBAR:17-1:0.5")
         sat_4am = utc(2026, 9, 12, 8, 0)          # 4:00am EDT Saturday
         self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION", sat_4am), 3.0)
-        self.assertEqual(imm.hour_size_mult("KXAAAGASD", sat_4am), 2.0)
+        # daily families take neither multiplier (2026-09-12 pm)
+        self.assertEqual(imm.hour_size_mult("KXAAAGASD", sat_4am), 1.0)
         self.assertEqual(imm.hour_size_mult("KXTEMPMIAH", sat_4am), 1.0)
         self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION",
                                             utc(2026, 9, 11, 8, 0)), 2.0)
@@ -5865,6 +5867,184 @@ class TestSaturdaySizeMult(unittest.TestCase):
         self.assertLessEqual(
             3.0 * imm.capped_ref_mult(50, 40, "bid", hour_mult=3.0),
             max(3.0, imm.TOTAL_SIZE_MULT_CAP))
+
+
+class TestDailySeries(unittest.TestCase):
+    """Structural daily-family class (Jack 2026-09-12): prefix floor +
+    live-feed classification (dated tickers, >=2 live event dates, p75
+    program window <= DAILY_MAX_HOURS) with hysteresis and a persisted file.
+    Daily families take neither the global hour window nor the Saturday
+    multiplier but keep their own per-series windows."""
+
+    def setUp(self):
+        self._dyn = dict(imm.DAILY_SERIES_DYNAMIC)
+        self._status = imm.STATUS_DIR
+        self._mults = imm.HOUR_SIZE_MULTS
+        self._series_mults = imm.SERIES_HOUR_MULTS
+        self._sat = imm.SAT_SIZE_MULT
+        self._excl = imm.SAT_MULT_EXCLUDE
+        self._exempt = imm.DAILY_EXEMPT_PREFIXES
+        self._tmp = tempfile.mkdtemp()
+        imm.STATUS_DIR = self._tmp
+        imm.DAILY_SERIES_DYNAMIC.clear()
+        imm.HOUR_SIZE_MULTS = {}
+        imm.SAT_SIZE_MULT = 1.0
+        imm.SAT_MULT_EXCLUDE = ()
+
+    def tearDown(self):
+        imm.DAILY_SERIES_DYNAMIC.clear()
+        imm.DAILY_SERIES_DYNAMIC.update(self._dyn)
+        imm.STATUS_DIR = self._status
+        imm.HOUR_SIZE_MULTS = self._mults
+        imm.SERIES_HOUR_MULTS = self._series_mults
+        imm.SAT_SIZE_MULT = self._sat
+        imm.SAT_MULT_EXCLUDE = self._excl
+        imm.DAILY_EXEMPT_PREFIXES = self._exempt
+
+    @staticmethod
+    def _feed(spec):
+        """[(ticker, start_utc, hours)] -> the fetch_programs() shape."""
+        return {t: {"start": st, "end": st + timedelta(hours=h),
+                    "dollars_per_day": 1.0, "target": 1000.0, "df": 0.5}
+                for t, st, h in spec}
+
+    def test_prefix_floor_and_exempt(self):
+        for s in ("KXAAAGASD", "KXAAAGASDTX", "KXDIESELD",
+                  "KXRAIN", "KXRAINWKND", "KXTEMPMIAH"):
+            self.assertTrue(imm.is_daily_series(s), s)
+        # the floor is the TRUE dailies: gas/diesel weeklies, monthlies and
+        # annuals are long-dated by structure (they keep the hour window;
+        # the Saturday mult skips them via SAT_MULT_EXCLUDE instead)
+        for s in ("KXAAAGASW", "KXAAAGASMAXM", "KXDIESELW", "KXDIESELMAXY",
+                  "KXTRUMPMENTION", "KXEARNINGSMENTIONHD", "KXAMZNCC", "KXFOO"):
+            self.assertFalse(imm.is_daily_series(s), s)
+        self.assertEqual(self._excl, ("KXAAAGAS", "KXDIESEL"))   # module default
+        imm.DAILY_EXEMPT_PREFIXES = ("KXRAINWKND",)
+        self.assertFalse(imm.is_daily_series("KXRAINWKND"))
+        self.assertTrue(imm.is_daily_series("KXRAIN"))
+
+    def test_classification_from_feed(self):
+        t0 = utc(2026, 9, 12, 12, 0)
+        feed = self._feed([
+            # gas-like new daily: two dated events live, 16h programs -> daily
+            ("KXNEWGASD-26SEP12-4.00", t0 - timedelta(hours=8), 16),
+            ("KXNEWGASD-26SEP12-4.10", t0 - timedelta(hours=8), 16),
+            ("KXNEWGASD-26SEP13-4.00", t0, 16),
+            # treasury-like: listed the day before the print, two dates,
+            # 23.5h programs, event horizon ~36h -> daily
+            ("KXNEWUST-26SEP12-T4.1", t0 - timedelta(hours=20), 23.5),
+            ("KXNEWUST-26SEP13-T4.1", t0 + timedelta(hours=4), 23.5),
+            # earnings-like: ONE dated event, 14h -> not daily (dates test)
+            ("KXNEWEARN-26SEP15-WORD", t0, 14),
+            ("KXNEWEARN-26SEP15-OTHER", t0, 14),
+            # mention-like: many dates, same-day AND 22-day programs -> p75
+            # long -> not daily
+            ("KXNEWMENTION-26SEP12-A", t0, 4),
+            ("KXNEWMENTION-26SEP13-B", t0, 6),
+            ("KXNEWMENTION-26SEP14-C", t0, 500),
+            ("KXNEWMENTION-26SEP15-D", t0, 520),
+            # month-named KPI: undated -> not daily
+            ("KXNEWKPI-26SEPALBD-T10", t0, 20),
+            ("KXNEWKPI-26OCTALBD-T10", t0, 20),
+            # weekly market funded in 24h program chunks (the Suez / Bab-el-
+            # Mandeb shape): two dated events, short programs, but the event
+            # day is a week out -> horizon test keeps it long-dated
+            ("KXNEWSHIPWEEKLY-26SEP19-T100", t0, 24),
+            ("KXNEWSHIPWEEKLY-26SEP26-T100", t0, 24),
+            # floor prefix: daily by prefix, never bookkept dynamically
+            ("KXAAAGASDZZ-26SEP12-4.00", t0, 16),
+            ("KXAAAGASDZZ-26SEP13-4.00", t0, 16),
+        ])
+        stats = imm.classify_daily_series(feed)
+        self.assertEqual(stats["KXNEWGASD"]["dates"], 2)
+        self.assertEqual(stats["KXNEWGASD"]["p75_h"], 16.0)
+        self.assertEqual(stats["KXNEWEARN"]["dates"], 1)
+        self.assertGreater(stats["KXNEWMENTION"]["p75_h"], imm.DAILY_MAX_HOURS)
+        self.assertEqual(stats["KXNEWKPI"]["dates"], 0)
+        self.assertIsNone(stats["KXNEWKPI"]["horizon_h"])
+        self.assertGreater(stats["KXNEWSHIPWEEKLY"]["horizon_h"], imm.DAILY_MAX_HORIZON_HOURS)
+        self.assertLessEqual(stats["KXNEWGASD"]["horizon_h"], imm.DAILY_MAX_HORIZON_HOURS)
+        added, dropped = imm.refresh_daily_series(feed, t0)
+        self.assertEqual(sorted(added), ["KXNEWGASD", "KXNEWUST"])
+        self.assertEqual(dropped, [])
+        for s in ("KXNEWGASD", "KXNEWUST", "KXAAAGASDZZ"):
+            self.assertTrue(imm.is_daily_series(s), s)
+        for s in ("KXNEWEARN", "KXNEWMENTION", "KXNEWKPI", "KXNEWSHIPWEEKLY"):
+            self.assertFalse(imm.is_daily_series(s), s)
+        self.assertNotIn("KXAAAGASDZZ", imm.DAILY_SERIES_DYNAMIC)
+
+    def test_hysteresis_and_persistence(self):
+        t0 = utc(2026, 9, 12, 12, 0)
+        feed = self._feed([("KXNEWGASD-26SEP12-4.00", t0, 16),
+                           ("KXNEWGASD-26SEP13-4.00", t0, 16)])
+        imm.refresh_daily_series(feed, t0)
+        self.assertTrue(imm.is_daily_series("KXNEWGASD"))
+        # a momentary single-date feed keeps it daily
+        imm.refresh_daily_series(
+            self._feed([("KXNEWGASD-26SEP13-4.00", t0, 16)]),
+            t0 + timedelta(hours=1))
+        self.assertTrue(imm.is_daily_series("KXNEWGASD"))
+        # between MAX and DROP: still daily
+        imm.refresh_daily_series(
+            self._feed([("KXNEWGASD-26SEP13-4.00", t0, 60),
+                        ("KXNEWGASD-26SEP14-4.00", t0, 60)]),
+            t0 + timedelta(hours=2))
+        self.assertTrue(imm.is_daily_series("KXNEWGASD"))
+        # persisted + reloaded
+        imm.DAILY_SERIES_DYNAMIC.clear()
+        self.assertEqual(imm.load_daily_series_file(), 1)
+        self.assertTrue(imm.is_daily_series("KXNEWGASD"))
+        # beyond DROP: dropped
+        added, dropped = imm.refresh_daily_series(
+            self._feed([("KXNEWGASD-26SEP13-4.00", t0, 80),
+                        ("KXNEWGASD-26SEP14-4.00", t0, 80)]),
+            t0 + timedelta(hours=3))
+        self.assertEqual(dropped, ["KXNEWGASD"])
+        self.assertFalse(imm.is_daily_series("KXNEWGASD"))
+        # out of the feed for 14 days: forgotten
+        imm.refresh_daily_series(feed, t0)
+        imm.refresh_daily_series({}, t0 + timedelta(days=15))
+        self.assertFalse(imm.is_daily_series("KXNEWGASD"))
+        # absent file: untouched
+        os.remove(imm.daily_series_path())
+        self.assertEqual(imm.load_daily_series_file(), 0)
+
+    def test_daily_families_take_no_global_window_but_keep_their_own(self):
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        imm.SERIES_HOUR_MULTS = imm._parse_series_hour_mults(
+            "KXNEWGASD:16-1:0.5,KXAAAGASD:16-1:0.5")
+        t0 = utc(2026, 9, 9, 12, 0)                  # a Wednesday
+        imm.refresh_daily_series(
+            self._feed([("KXNEWGASD-26SEP09-4.00", t0, 16),
+                        ("KXNEWGASD-26SEP10-4.00", t0, 16)]), t0)
+        at_4am = utc(2026, 9, 9, 8, 0)               # 4:00am EDT
+        at_9am = utc(2026, 9, 9, 13, 0)              # 9:00am EDT: hour 9 inclusive
+        at_10am = utc(2026, 9, 9, 14, 0)             # 10:00am EDT: window closed
+        at_8pm = utc(2026, 9, 10, 0, 0)              # 8:00pm EDT Sep 9
+        self.assertEqual(imm.hour_size_mult("KXFOO", at_4am), 2.0)
+        self.assertEqual(imm.hour_size_mult("KXFOO", at_9am), 2.0)
+        self.assertEqual(imm.hour_size_mult("KXFOO", at_10am), 1.0)
+        for daily in ("KXNEWGASD", "KXAAAGASD", "KXRAIN", "KXTEMPMIAH"):
+            self.assertEqual(imm.hour_size_mult(daily, at_4am), 1.0, daily)
+            self.assertEqual(imm.hour_size_mult(daily, at_9am), 1.0, daily)
+        # a daily's own per-series window still wins
+        self.assertEqual(imm.hour_size_mult("KXNEWGASD", at_8pm), 0.5)
+        self.assertEqual(imm.hour_size_mult("KXAAAGASD", at_8pm), 0.5)
+
+    def test_saturday_mult_skips_daily_families(self):
+        imm.SAT_SIZE_MULT = 1.5
+        t0 = utc(2026, 9, 12, 12, 0)                 # Saturday
+        imm.refresh_daily_series(
+            self._feed([("KXNEWUST-26SEP12-T4.1", t0 - timedelta(hours=20), 23.5),
+                        ("KXNEWUST-26SEP13-T4.1", t0 + timedelta(hours=4), 23.5)]), t0)
+        self.assertTrue(imm.is_daily_series("KXNEWUST"))
+        sat_noon = utc(2026, 9, 12, 16, 0)
+        self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION", sat_noon), 1.5)
+        self.assertEqual(imm.hour_size_mult("KXNEWUST", sat_noon), 1.0)
+        self.assertEqual(imm.hour_size_mult("KXAAAGASD", sat_noon), 1.0)
+        imm.SAT_MULT_EXCLUDE = ("KXTRUMP",)
+        self.assertEqual(imm.hour_size_mult("KXTRUMPMENTION", sat_noon), 1.0)
+        self.assertEqual(imm.hour_size_mult("KXFOO", sat_noon), 1.5)
 
 
 # ----------------------------------------------------------------------------
@@ -7355,13 +7535,20 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
             imm.HOUR_SIZE_MULTS, imm.HOUR_MULT_EXCLUDE = old_g, old_x
 
     def test_global_window_survives_outside_the_per_series_hours(self):
-        """Adding a 4pm rule must not cancel the quiet-hours 3-7am x2 these
-        families already had — a per-series rule owns only its own hours."""
+        """A per-series rule owns only its own hours: outside them a
+        long-dated series keeps the global window (KXTRUEV's 5pm halving
+        must not cancel its quiet hours). Daily families (2026-09-12 pm)
+        take no global window at all, but their own halving still applies."""
         old_g = imm.HOUR_SIZE_MULTS
         try:
             imm.HOUR_SIZE_MULTS = {3: 2.0, 4: 2.0, 5: 2.0, 6: 2.0, 7: 2.0}
+            self.assertFalse(imm.is_daily_series("KXTRUEV"))
+            self.assertEqual(imm.hour_size_mult("KXTRUEV", self._at(5)), 2.0)
+            self.assertEqual(imm.hour_size_mult("KXTRUEV", self._at(20)), 0.5)
+            self.assertEqual(imm.hour_size_mult("KXTRUEV", self._at(12)), 1.0)
             for s in ("KXDIESELD", "KXAAAGASD", "KXRAIN"):
-                self.assertEqual(imm.hour_size_mult(s, self._at(5)), 2.0, s)
+                self.assertTrue(imm.is_daily_series(s), s)
+                self.assertEqual(imm.hour_size_mult(s, self._at(5)), 1.0, s)
                 self.assertEqual(imm.hour_size_mult(s, self._at(20)), 0.5, s)
                 self.assertEqual(imm.hour_size_mult(s, self._at(12)), 1.0, s)
         finally:

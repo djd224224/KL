@@ -1926,3 +1926,67 @@ Four Saturdays of evidence at deploy (Saturday day-to-day sd 3.3c per
 contract-day), so this is a hypothesis under test: the tracker's long-dated
 Saturday `rent/fill` and `net/ct-day` against the baseline row (13.5c /
 0.62c) are the read, once `settled%` is high; `mo24` is the early read.
+
+## 2026-09-12 pm — Quiet hours 0-9 ET, long-dated only; daily families become a structural class (Jack)
+
+Jack asked whether the 3-7am ET x2 still makes sense. Re-measured on the
+post-temp window (8/8-9/11 weekdays, fills scored to settlement, per ET
+hour block; the doubled 3-7 book is IN the data):
+
+| long-dated, weekday | fills / resting ct-hour | loss per fill | net per fill | net per ct-hour | net $/day, block |
+|---|---|---|---|---|---|
+| 0-2 | 0.010 | -1.4c | +7.1c | +0.074c | +23 |
+| 3-7 (x2 live) | 0.005 | +0.8c | +11.1c | +0.054c | +47 |
+| 8-9 | 0.009 | -0.8c | +5.8c | +0.054c | +13 |
+| 10-13 | 0.036 | +3.0c | -1.0c | -0.036c | -16 |
+| 14-16 | 0.047 | +0.1c | +1.6c | +0.073c | +28 |
+| 17-19 | 0.032 | +2.8c | -0.1c | -0.003c | -1 |
+| 20-23 | 0.020 | +4.8c | -1.6c | -0.032c | -15 |
+
+The doubling did not dilute rent per resting contract (0.057c/ct-hour in
+3-7 vs 0.060 in the undoubled 0-2), and the turnover cliff is the US open,
+not 8am. The 8am jump in the overall numbers was the gas dailies (0.093
+fills per contract-hour, 3.2c lost per fill at the AAA print) and rain
+(11.8c). Other pockets, for later: KXTRUMPMENTION 10-13 / 17-23 (-$56/day
+modelled, ~-$24 after its 2x credit realization), gas/diesel dailies 14-19
+(7-10c lost per fill, -$24/day, the 4pm halving is not enough), KXUST*
+17-23 (8-9c per fill, Asian session), Saturday 20-23 long-dated (-$8/
+Saturday), Sunday dailies 8-9 and 17-19 (16-17c per fill on 4 Sundays).
+
+Jack: "extend to midnight to 10am ET for longdated. ensure future daily
+families are excluded (in addition to current daily families)."
+
+- Launcher `IMM_HOUR_SIZE_MULT=0-9:2.0` (was 3-7). Expected +$30/weekday
+  modelled from doubling 0-2 and 8-9 on the long-dated book.
+- Daily families take NO global window and no Saturday multiplier; their
+  own per-series windows (16-1 / 19-1 halvings) still apply.
+  `is_daily_series()` = prefix floor (`IMM_DAILY_PREFIXES`, default
+  KXAAAGASD,KXDIESELD,KXRAIN,KXTEMP — the TRUE dailies; the gas/diesel
+  weeklies/monthlies/annuals are long-dated by structure and benign
+  overnight: 0.024 fills per ct-hour, 0.6c per fill) + a STRUCTURAL class
+  refreshed from the live program feed every universe refresh
+  (`classify_daily_series` / `refresh_daily_series`): dated tickers with
+  >= 2 event dates live at once, p75 program window <= 48h, and p75 EVENT
+  HORIZON (program start -> end of the ticker's event day) <= 72h. The
+  horizon is what keeps weekly markets funded in 24h program chunks
+  (KXSUEZWEEKLY, KXBABELMANDEBWEEKLY: horizon ~228h) long-dated; the p75
+  keeps KXTRUMPMENTION (same-day speech events + 22-day programs) long-
+  dated; the dates test keeps earnings mention (one event per company)
+  long-dated. Hysteresis: stays daily until p75 program > 72h; forgotten
+  after 14 days out of the feed. Persisted to `daily_series.json`, loaded
+  at startup (main) and by the tracker. Validated on the full feed history:
+  daily = temp hourlies, gas state dailies, KXDIESELD, KXRAIN, KXTRUEV,
+  KXUST*AD, KXSOFRD, KXEURUSD/KXUSDJPY, KXTXERCOTPEAKD, 15-minute metals,
+  KXWORLDNEWSMENTION, KXTRUMPMENTIONB, KXMAMDANIMENTION; long-dated =
+  KXTRUMPMENTION, earnings, *CC, KPI months, shipping weeklies, gas/diesel
+  W/M/Y. `IMM_DAILY_EXEMPT` prefixes are never classified daily.
+- Saturday x1.5 keeps skipping the whole gas/diesel family through
+  `IMM_SAT_MULT_EXCLUDE` (default KXAAAGAS,KXDIESEL) as decided that
+  morning; rain/temp via the daily floor.
+- `imm_saturday_tracker.py` groups by `imm.is_daily_series` (same
+  classification the bot sizes with) and reads the mult check outside 0-9.
+- Pinned by `TestDailySeries` (floor/exempt, feed classification incl.
+  the shipping-weekly and undated-KPI shapes, hysteresis + persistence,
+  no global window for dailies but own windows kept, Saturday skip) and the
+  reworked `test_global_window_survives_outside_the_per_series_hours`
+  (KXTRUEV keeps the window outside its 5pm rule; dailies do not).

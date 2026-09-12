@@ -231,7 +231,24 @@ if ($Probe) {
     # (imm_saturday_tracker.py): rent per filled contract, turnover, loss
     # per fill by day type since 9/12 vs the baseline. 4 Saturdays of
     # evidence at deploy — a hypothesis under test.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=150&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=3-7:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
+    # QUIET HOURS 3-7 -> 0-9 ET, LONG-DATED ONLY (Jack 2026-09-12 "extend to
+    # midnight to 10am ET for longdated. ensure future daily families are
+    # excluded"): the post-temp hour study (8/8-9/11 weekdays, fills scored
+    # to settlement) put the turnover cliff at the US open, not at 8am —
+    # long-dated fills per resting contract-hour 0.010 (0-2), 0.005 (3-7 at
+    # x2), 0.009 (8-9) vs 0.036+ from 10am; net 7.1c / 11.1c / 5.8c per
+    # fill. The 8am jump in the overall numbers was the gas dailies (0.093
+    # per contract-hour, 3.2c lost per fill at the AAA print) and rain
+    # (11.8c), so dailies now take NO global window at all: incentive_mm
+    # is_daily_series() = prefix floor (KXAAAGAS,KXDIESEL,KXRAIN,KXTEMP,
+    # IMM_DAILY_PREFIXES) + a structural class refreshed from the live
+    # program feed every universe refresh (dated tickers, >=2 live event
+    # dates, p75 program window <= 30h; persisted to daily_series.json), so
+    # future daily families are excluded without a launcher edit. Their own
+    # per-series windows (16-1 / 19-1 halvings) still apply. Expected
+    # +$30/weekday modelled from doubling 0-2 and 8-9 on the long-dated
+    # book. Env knob => task-level restart.
+    $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=150&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 
 while ($true) {

@@ -5,8 +5,10 @@ multiplier (Jack 2026-09-12: "Saturday multiplier of 1.5x, only on long-dated
 families. and lets remeasure each weekend to understand performance").
 
 For every ET day since the multiplier went live (SINCE, default 2026-09-12)
-it computes, separately for the LONG-DATED families the multiplier applies
-to and for the EXCLUDED prefixes (gas/diesel/rain dailies + temp):
+it computes, separately for the LONG-DATED families the multipliers apply
+to and for the EXCLUDED daily families (imm.is_daily_series: the prefix
+floor gas/diesel/rain/temp plus the structural class the bot persists in
+daily_series.json):
 
   resting     mean own resting contracts (cycle log `quoted`, one cycle =
               1/cycles-that-day of a day)
@@ -26,7 +28,7 @@ to and for the EXCLUDED prefixes (gas/diesel/rain dailies + temp):
   net/ct-day  rent per resting contract-day - turnover x loss/fill (cents):
               what a size multiplier actually scales
   mult        mean cycle-log hour_mult on the group's quoted rows OUTSIDE
-              the 3-7am ET quiet window — proof the multiplier was live
+              the 0-9am ET quiet window — proof the multiplier was live
               (Saturday long-dated 1.5, everything else 1.0)
 
 grouped per day, pooled by day type (Saturday / Sunday / Weekday) since
@@ -101,7 +103,8 @@ import pandas as pd                             # noqa: E402
 
 SINCE = os.environ.get("IMM_SAT_TRACKER_SINCE", "2026-09-12")
 CACHE_DIR = os.path.join(STATUS_DIR, "sat_tracker_cache")
-EXCL = tuple(imm.SAT_MULT_EXCLUDE)
+imm.load_daily_series_file()          # the bot's persisted structural daily set
+EXCL = tuple(imm.DAILY_PREFIXES)
 GROUPS = ("long-dated", "excluded")
 COLS = ("ts,ticker,ext_bid,ext_ask,yes_depth,no_depth,target,est_frac,qual_sides,acct_pos,own_pos,"
         "pool_per_day,quoted,own_bid_ct,own_ask_ct,own_bid_top,own_ask_top,own_pad_bid_ct,"
@@ -122,7 +125,9 @@ BASELINE = {
 
 
 def group_of(series: str) -> str:
-    return "excluded" if series.startswith(EXCL) else "long-dated"
+    """Same classification the bot sizes with: prefix floor + the structural
+    daily set (imm.is_daily_series), so 'excluded' here == no multiplier."""
+    return "excluded" if imm.is_daily_series(series) else "long-dated"
 
 
 def day_type(d: str) -> str:
@@ -151,10 +156,10 @@ def _parse_cycle_file(path: str):
     q = df[df["quoted"] > 0]
     ser = df.groupby(["et_date", "et_hour", "series"]).agg(
         sum_est_usd=("est_usd", "sum"), sum_quoted=("quoted", "sum"), n_rows=("ts", "size")).reset_index()
-    # hour_mult outside the 3-7am ET quiet window (its x2 would otherwise
+    # hour_mult outside the 0-9am ET quiet window (its x2 would otherwise
     # dominate a partial morning): Saturday long-dated rows should read the
     # Saturday knob exactly, everything else 1.0.
-    qd = q[~q["et_hour"].between(3, 7)]
+    qd = q[~q["et_hour"].between(0, 9)]
     hm = qd.groupby(["et_date", "et_hour", "series"]).agg(
         q_rows=("ts", "size"), hm_sum=("hour_mult", "sum")).reset_index()
     ser = ser.merge(hm, on=["et_date", "et_hour", "series"], how="left").fillna({"q_rows": 0, "hm_sum": 0.0})
@@ -348,8 +353,10 @@ def render(g: pd.DataFrame, through_et: str):
 
     lines = []
     lines.append(f"IMM Saturday multiplier tracker - through {through_et} (ET days since {SINCE})")
-    lines.append(f"live knob: IMM_SAT_SIZE_MULT={imm.SAT_SIZE_MULT:g} on Saturdays (ET) for every series except "
-                 f"prefixes {','.join(EXCL)}; hour windows compose (Sat 3-7am ET = x{2 * imm.SAT_SIZE_MULT:g}).")
+    lines.append(f"live knobs: IMM_SAT_SIZE_MULT={imm.SAT_SIZE_MULT:g} on Saturdays (ET); quiet hours "
+                 f"{dict(sorted(imm.HOUR_SIZE_MULTS.items())) or 'off'} - both long-dated only. Daily families "
+                 f"(no multiplier): prefixes {','.join(EXCL)} + {len(imm.DAILY_SERIES_DYNAMIC)} structural "
+                 f"({','.join(sorted(imm.DAILY_SERIES_DYNAMIC)) or 'none yet'}).")
     lines.append("cents per contract unless noted; rent = modelled accrual (pre-realization, ~1.2x paid account-wide, "
                  "~2x on mention); loss/fill = settlement loss on the settled subset; mo24 = 24h mark-out (all fills).")
     if g.empty:
@@ -361,7 +368,7 @@ def render(g: pd.DataFrame, through_et: str):
     per_day["partial"] = g["partial"].values
     per_day["et_date"] = per_day["et_date"] + np.where(per_day["partial"], "*", "")
     for grp in GROUPS:
-        lines.append(f"\n== per day: {grp.upper()} " + ("(the multiplier applies)" if grp == "long-dated" else "(gas/diesel/rain/temp, no multiplier)") + " ==")
+        lines.append(f"\n== per day: {grp.upper()} " + ("(the multiplier applies)" if grp == "long-dated" else "(daily families, no multiplier)") + " ==")
         d = per_day[per_day["group"] == grp].drop(columns=["group", "partial"]).set_index(["et_date", "day_type"])
         lines.append(table(d))
     lines.append("\n(* partial day: fewer than 20 hours logged; kept out of the pooled rows)")
