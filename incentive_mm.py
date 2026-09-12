@@ -755,6 +755,42 @@ for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
             cutoff_before_event_min=_env_int(
                 "IMM_RAINWKND_CUTOFF_BEFORE_MIN", 0))
 
+# LIVE-GAME GUARD for KXMLBPLAYOFFS (Jack 2026-09-11 pm "allowlist
+# KXMLBPLAYOFFS into IMM"). Scoped to this ONE series of the three admitted
+# that evening, because it is the only one with an in-play feed to be last
+# on: the 2026 regular season plays nightly into its final fortnight and
+# every result moves the bubble teams, while the ticker has no date segment,
+# so trade_cutoff_utc is None and no hour of the day stands it down
+# ("breakers are the only protection", per that function's docstring). The
+# band does most of the work -- 13 of 30 teams were one-sided and 8 more
+# outside 5-90c on 9/11, leaving 9 contested teams -- and safe-join keeps
+# the bot off the front of those 9. It is the same guard the open-scan tier
+# gives a Sports series it admits (ensure_scan_override), so the normal
+# book is not the weaker path here.
+#
+# MEASURED before scoping it this way (9/11, live books, _side_share with
+# a 20-lot at the touch vs two ticks back, $/market/day):
+#     KXMLBPLAYOFFS      CLE 1.11 -> 0.39   SD 0.98 -> 0.28   TOR 1.17 -> 0.35
+#     KXMLBSEASONGAMES  2425 1.03 -> 0.00  1930 1.15 -> 0.00
+#     KXVENUEPERFORM     ZED 0.84 -> 0.22   MTJ 0.23 -> 0.00   GOO 0.18 -> 0.00
+# Safe-join costs playoffs ~65% of credit and it still clears the $1.00
+# per-market-per-period floor over a 14-day program. On the other two it is
+# not a discount, it is an OFF switch: KXMLBSEASONGAMES' touch rung alone is
+# ~9,500 contracts against a 1,000 target, so anything behind the touch sits
+# outside the qualifying walk and scores exactly zero -- on the richest
+# per-market pool in the feed ($500/market/day, daily periods). Guarding
+# those two would have left an allowlist entry that looks live in every log
+# and credits nothing, which is the silent-exclusion shape this file keeps
+# paying for. They go in bare; the global band, floors and caps still apply.
+#
+# No cutoff is invented for any of the three: none has a scheduled instant
+# to anchor to (qualification resolves across a fortnight of games, a tour
+# announcement lands whenever it lands), and a made-up hour would read like
+# a real event window to every later reader of this file.
+for _s in os.environ.get("IMM_LIVEGAME_GUARD_SERIES", "KXMLBPLAYOFFS").split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(safe_join=True)
+
 
 def series_pad_to_target(series: str) -> bool:
     # Live-event depth-gated series NEVER pad (Jack 2026-08-31): thin depth
@@ -1755,7 +1791,20 @@ _DEFAULT_ECON_SERIES = (
 # config placement, silently barring fresh RT events (SPI-89 est $7/day was
 # no_new'd while its screens passed). Entertainment reveals are not macro
 # prints; keep this list OUT of NO_NEW_SERIES.
-_DEFAULT_ENTERTAINMENT_SERIES = "KXRT"
+# Venue performer markets (Jack 2026-09-11 pm: "allowlist KXVENUEPERFORM").
+# KXVENUEPERFORM-<VENUE><CLOSE>-<ARTIST> = "does <artist> perform at <venue>
+# in <year>", 35 artists on the Red Rocks 2027 event, $500/day pool spread
+# over the set ($14.29/market/day, the thinnest of the three admitted this
+# evening) and a close 16 months out (2028-01-01). UNDATED ticker: the venue
+# segment does not parse as a date and Kalshi's occurrence_datetime equals
+# expiration, so trade_cutoff_utc yields None -- same shape as KXRT, which
+# has quoted that way since 7/23. Safe because the information event is a
+# tour ANNOUNCEMENT, not a scheduled print: there is no hour of the day at
+# which the bot is structurally the last to know. It is still a jump risk
+# (an announcement reprices one artist from 20c to 95c with no warning), so
+# the entry below gives it the safe-join guard rather than the bare
+# allowance. Entertainment, not macro -- kept out of NO_NEW_SERIES with KXRT.
+_DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXVENUEPERFORM"
 # Weather series allowed IN CODE (Jack 2026-09-10 "allowlist KXRAINWKND in
 # IMM bot, but only quote until the cutoff"): the weekend rain family — see
 # its SERIES_OVERRIDES entry beside the rain loop for the ticker-date
@@ -1763,6 +1812,32 @@ _DEFAULT_ENTERTAINMENT_SERIES = "KXRT"
 # (The daily KXRAIN is allowed through the extra-allow file, and the rain
 # monthlies sit behind the launcher blocklist — neither lives here.)
 _DEFAULT_WEATHER_SERIES = "KXRAINWKND"
+# SPORTS series allowed IN CODE (Jack 2026-09-11 pm: "allowlist
+# KXMLBPLAYOFFS into IMM", then "allowlist KXMLBSEASONGAMES"). First sports
+# entries in the normal book -- the 9/6 open-scan category lift already
+# scans Sports per series, and this is the same judgment made deliberately
+# for two named season-level series. NEITHER is a game market: no in-play
+# feed to be last on. Exact series, no prefix: nothing else KXMLB* rides in,
+# and KXMLBMENTION stays blocklisted for mlb_trading.py (checked 9/11: that
+# bot's SERIES_TICKER is KXMLBMENTION alone, so there is no same-account STP
+# overlap with either series here).
+#
+# KXMLBPLAYOFFS-26-<TEAM> ("is <team> a 2026 playoff qualifier"): 30 teams,
+# $500/market over 14 days = $35.71/market/day, target 1,000, pool through
+# 9/17. THIS ONE CARRIES LIVE-EVENT RISK and is the reason the guard entry
+# below exists. The ticker has no date segment, so trade_cutoff_utc is None
+# and nothing stops quoting at a fixed hour -- while the 2026 regular season
+# plays nightly into its last two weeks and every result moves the bubble
+# teams. The band does most of the work (clinched teams sit at 97-99c and
+# eliminated ones near 0, both outside 5-90c), which leaves the bot quoting
+# exactly the contested middle. Safe-join keeps it off the touch there.
+#
+# KXMLBSEASONGAMES-27-<N> ("more than N games played in the 2027 season"):
+# 5 strikes, $500/market/DAY (the richest per-market pool in the feed on
+# 9/11) but the program ends 9/12, and the 2027 season has not started --
+# no realtime risk at all, and four of the five strikes are near-certain
+# enough that the band stands the bot aside. Expect one quotable strike.
+_DEFAULT_SPORTS_SERIES = "KXMLBPLAYOFFS,KXMLBSEASONGAMES"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -1931,6 +2006,8 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_ENTERTAINMENT_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_WEATHER_SERIES",
                                        _DEFAULT_WEATHER_SERIES)
+                + "," + os.environ.get("IMM_ALLOW_SPORTS_SERIES",
+                                       _DEFAULT_SPORTS_SERIES)
                 ).split(",") if s) | FINECON_SERIES
 
 # The finecon sweep quotes AT MOST 10 markets at once, best-ROI first with

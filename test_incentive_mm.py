@@ -1115,6 +1115,91 @@ class TestBlocklist(unittest.TestCase):
                           if o.get("ticker") == t])
 
 
+class TestSportsAndVenueAllowlist(unittest.TestCase):
+    """Jack 2026-09-11 pm: "allowlist KXMLBPLAYOFFS into IMM",
+    "allowlist KXVENUEPERFORM", "allowlist KXMLBSEASONGAMES"."""
+
+    SERIES = ("KXMLBPLAYOFFS", "KXMLBSEASONGAMES", "KXVENUEPERFORM")
+
+    def setUp(self):
+        # The sandbox disables allowlist-only for its fixture series; these
+        # tests are ABOUT allowlist membership, so restore production mode.
+        self._old = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+
+    def tearDown(self):
+        imm.ALLOWLIST_ONLY = self._old
+
+    def test_the_three_series_are_allowed_and_not_blocked(self):
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        for t in ("KXMLBPLAYOFFS-26-NYY", "KXMLBPLAYOFFS-26-ATH",
+                  "KXMLBSEASONGAMES-27-2425",
+                  "KXVENUEPERFORM-REDROCKS28JAN01-ODE"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+        for s in self.SERIES:
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+
+    def test_exact_series_only_no_mlb_prefix_bleed(self):
+        # KXMLBMENTION is mlb_trading.py's book and must stay frozen; no
+        # other KXMLB* series rides in on these two entries.
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        self.assertTrue(b("KXMLBMENTION-26SEP12PITNYM-HOME"))
+        self.assertFalse(a("KXMLBMENTION-26SEP12PITNYM-HOME"))
+        for t in ("KXMLBTEAMSALE-26-NYY", "KXLEADERMLBHR-26-JUDGE",
+                  "KXMLBPLAYOFFSX-26-NYY"):
+            self.assertFalse(a(t), t)
+
+    def test_only_the_live_game_series_is_safe_joined(self):
+        # KXMLBPLAYOFFS has an in-play feed (nightly games) and no cutoff,
+        # so it gets safe-join. The other two must NOT: measured 9/11,
+        # resting two ticks back scores exactly ZERO on KXMLBSEASONGAMES
+        # (touch rung ~9,500 vs a 1,000 target) and on half of
+        # KXVENUEPERFORM, so guarding them would make the allowlist entry
+        # look live in every log while crediting nothing.
+        ov = imm.series_override("KXMLBPLAYOFFS")
+        self.assertIsNotNone(ov)
+        self.assertTrue(ov.safe_join)
+        for s in ("KXMLBSEASONGAMES", "KXVENUEPERFORM"):
+            ov = imm.series_override(s)
+            self.assertFalse(ov is not None and ov.safe_join, s)
+
+    def test_safe_join_two_ticks_back_is_worthless_on_a_stacked_touch(self):
+        # The measurement the scoping decision rests on, as a unit test:
+        # a 1,000-target walk over a 9,500-contract touch rung never
+        # reaches a rung two ticks behind it, so our size scores nothing.
+        levels = [(50, 9571.0), (49, 300.0), (48, 250.0)]
+        own_at_touch = {50: 20.0}
+        lv = sorted({**dict(levels), 50: 9571.0 + 20.0}.items(), key=lambda x: -x[0])
+        share_touch, ok_touch = imm._side_share(lv, own_at_touch, 1000.0, 0.5)
+        self.assertTrue(ok_touch)
+        self.assertGreater(share_touch, 0.0)
+        own_back = {48: 20.0}
+        lv_back = sorted({**dict(levels), 48: 250.0 + 20.0}.items(), key=lambda x: -x[0])
+        share_back, ok_back = imm._side_share(lv_back, own_back, 1000.0, 0.5)
+        self.assertEqual(share_back, 0.0)
+
+    def test_no_cutoff_is_invented_for_them(self):
+        # Documents the known gap deliberately: these have no scheduled
+        # instant to anchor to. If a later change gives one of them a real
+        # occurrence-based cutoff this test should be updated, not deleted.
+        for ev in ("KXMLBPLAYOFFS-26", "KXMLBSEASONGAMES-27",
+                   "KXVENUEPERFORM-REDROCKS28JAN01"):
+            self.assertIsNone(imm.parse_event_date(ev), ev)
+            self.assertIsNone(
+                imm.apply_series_cutoff_adjustments(
+                    imm.series_of(ev + "-X"), ev,
+                    imm.trade_cutoff_utc(ev, None, None), None), ev)
+
+    def test_no_event_window_standdown_does_not_reach_them(self):
+        # That screen is scoped to the MENTION suffix; a bare cutoff-less
+        # sports/venue market must NOT be stood down by it (if it were,
+        # the allowlist entry would be inert and nothing would say so).
+        for s in self.SERIES:
+            self.assertFalse(
+                any(s.endswith(suf) for suf in imm.ALLOW_SERIES_SUFFIXES), s)
+
+
 class TestAllowlist(unittest.TestCase):
     def setUp(self):
         self._old = imm.ALLOWLIST_ONLY
