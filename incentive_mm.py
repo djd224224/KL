@@ -755,10 +755,11 @@ for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
             cutoff_before_event_min=_env_int(
                 "IMM_RAINWKND_CUTOFF_BEFORE_MIN", 0))
 
-# UNDATED-TICKER GUARD SET for the three series allowed in code on
-# 2026-09-11 pm (KXMLBPLAYOFFS, KXMLBSEASONGAMES, KXVENUEPERFORM -- see
-# _DEFAULT_SPORTS_SERIES and _DEFAULT_ENTERTAINMENT_SERIES for what each is
-# and what it pays). All three are season/venue-level tickers whose second
+# UNDATED-TICKER GUARD SET for the five series allowed in code on
+# 2026-09-11 pm (KXMLBPLAYOFFS, KXMLBSEASONGAMES, KXVENUEPERFORM, then
+# KXCMA and KXMC -- see _DEFAULT_SPORTS_SERIES and
+# _DEFAULT_ENTERTAINMENT_SERIES for what each is and what it pays).
+# All five are season/venue/title-level tickers whose second
 # segment does not parse as a date, so trade_cutoff_utc returns None and NO
 # hour of the day stands them down: "breakers are the only protection", per
 # that function's own docstring. KXMLBPLAYOFFS is the sharpest case -- the
@@ -768,8 +769,8 @@ for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
 # categories a safe-join guard via ensure_scan_override. Admitting them to
 # the NORMAL book without one would make the normal book the weaker path.
 #
-# Safe-join is FREE on books like these, which is why it goes on all three
-# rather than only the playoff series. The clamp above in the placement
+# Safe-join is FREE on books like these, which is why it goes on all of
+# them rather than only the playoff series. The clamp above in the placement
 # path caps safe-join at the REFERENCE and never behind it, so it costs
 # reward only where the reference sits behind the touch. Measured 9/11 on
 # live books: the touch rung alone is 200+ contracts (target/5) on every
@@ -791,7 +792,7 @@ for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
 # a real event window to every later reader of this file.
 for _s in os.environ.get(
         "IMM_UNDATED_GUARD_SERIES",
-        "KXMLBPLAYOFFS,KXMLBSEASONGAMES,KXVENUEPERFORM").split(","):
+        "KXMLBPLAYOFFS,KXMLBSEASONGAMES,KXVENUEPERFORM,KXCMA,KXMC").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(safe_join=True)
 
@@ -1808,7 +1809,23 @@ _DEFAULT_ECON_SERIES = (
 # (an announcement reprices one artist from 20c to 95c with no warning), so
 # the entry below gives it the safe-join guard rather than the bare
 # allowance. Entertainment, not macro -- kept out of NO_NEW_SERIES with KXRT.
-_DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXVENUEPERFORM"
+# CMA Awards and Metacritic scores (Jack 2026-09-11 pm: "also allowlist
+# KXCMA, KXMC"). Same entertainment shape as KXRT and KXVENUEPERFORM above,
+# and the two richest of the five series admitted that evening:
+#   KXCMA-<CATEGORY>26-<NOMINEE>: the 60th CMA Awards, 72 markets over 12
+#     award categories (6 nominees each, "Tie" included), $1,917/day across
+#     the set on ~2.4-day periods. The reveal is the ceremony itself, and
+#     Kalshi closes these BEFORE it, so the bot is out by construction
+#     rather than by a cutoff rule -- occurrence_datetime sits AFTER
+#     expected_expiration here, so it never becomes a cutoff candidate.
+#   KXMC-<TITLE>-<SCORE>: "is the Metascore above N seven days after
+#     release", 156 markets over 12 titles (13 strikes each), $1,773/day.
+#     Close IS the resolution instant (10:00 ET on day seven), so the
+#     global MIN_HOURS_TO_CLOSE screen is what stands the bot down at the
+#     end. The score drifts publicly as reviews land rather than jumping on
+#     a private reveal, which is the property that makes it quotable.
+# Both are undated tickers, so both join the guard set below.
+_DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXVENUEPERFORM,KXCMA,KXMC"
 # Weather series allowed IN CODE (Jack 2026-09-10 "allowlist KXRAINWKND in
 # IMM bot, but only quote until the cutoff"): the weekend rain family — see
 # its SERIES_OVERRIDES entry beside the rain loop for the ticker-date

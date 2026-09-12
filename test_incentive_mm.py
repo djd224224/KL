@@ -1119,7 +1119,8 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
     """Jack 2026-09-11 pm: "allowlist KXMLBPLAYOFFS into IMM",
     "allowlist KXVENUEPERFORM", "allowlist KXMLBSEASONGAMES"."""
 
-    SERIES = ("KXMLBPLAYOFFS", "KXMLBSEASONGAMES", "KXVENUEPERFORM")
+    SERIES = ("KXMLBPLAYOFFS", "KXMLBSEASONGAMES", "KXVENUEPERFORM",
+              "KXCMA", "KXMC")
 
     def setUp(self):
         # The sandbox disables allowlist-only for its fixture series; these
@@ -1134,7 +1135,9 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
         for t in ("KXMLBPLAYOFFS-26-NYY", "KXMLBPLAYOFFS-26-ATH",
                   "KXMLBSEASONGAMES-27-2425",
-                  "KXVENUEPERFORM-REDROCKS28JAN01-ODE"):
+                  "KXVENUEPERFORM-REDROCKS28JAN01-ODE",
+                  "KXCMA-NAOTY26-TWET", "KXCMA-MEOTY26-TIE",
+                  "KXMC-MARV-95", "KXMC-SIL-70"):
             self.assertFalse(b(t), t)
             self.assertTrue(a(t), t)
         for s in self.SERIES:
@@ -1147,7 +1150,7 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         self.assertTrue(b("KXMLBMENTION-26SEP12PITNYM-HOME"))
         self.assertFalse(a("KXMLBMENTION-26SEP12PITNYM-HOME"))
         for t in ("KXMLBTEAMSALE-26-NYY", "KXLEADERMLBHR-26-JUDGE",
-                  "KXMLBPLAYOFFSX-26-NYY"):
+                  "KXMLBPLAYOFFSX-26-NYY", "KXMCX-MARV-95", "KXCMAX-A-B"):
             self.assertFalse(a(t), t)
 
     def test_all_three_get_the_safe_join_guard(self):
@@ -1193,7 +1196,8 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         # instant to anchor to. If a later change gives one of them a real
         # occurrence-based cutoff this test should be updated, not deleted.
         for ev in ("KXMLBPLAYOFFS-26", "KXMLBSEASONGAMES-27",
-                   "KXVENUEPERFORM-REDROCKS28JAN01"):
+                   "KXVENUEPERFORM-REDROCKS28JAN01",
+                   "KXCMA-NAOTY26", "KXMC-MARV"):
             self.assertIsNone(imm.parse_event_date(ev), ev)
             self.assertIsNone(
                 imm.apply_series_cutoff_adjustments(
