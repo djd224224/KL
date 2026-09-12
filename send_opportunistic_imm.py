@@ -885,7 +885,12 @@ def build_report(now_utc):
              "so it is credited-plus-in-flight), but it is DELETED and "
              "restarts from zero whenever a market goes unquoted and flat, "
              "and it cannot see markets that have left the book at all - "
-             "which is why some rows show CREDITED above EARN EST. P&L = "
+             "which is why some rows show CREDITED above EARN EST. EARN EST "
+             "also spans EVERY program period since the bot first quoted the "
+             "market, not just the current one: these programs re-list weekly "
+             "(KXAAAGASMINM-26SEP30 ran 9/02-9/09 and again 9/09-9/16), so "
+             "the exchange's own rewards view - which shows the CURRENT "
+             "period - reads far lower than this column. P&L = "
              "trading only: LIFETIME realized (Kalshi's own per-market "
              "realized_pnl_dollars where the bot's position matches the "
              "account's, the bot's realized sink otherwise) plus open-book "
@@ -962,7 +967,13 @@ def build_report(now_utc):
              f'DELETED and restarts from zero whenever a market goes unquoted '
              f'and flat, and it cannot see markets that have left the book at '
              f'all &mdash; which is why some rows show CREDITED above EARN '
-             f'EST. P&amp;L = trading only: LIFETIME realized '
+             f'EST. EARN EST also spans EVERY program period since the bot '
+             f'first quoted the market, not just the current one: these '
+             f'programs re-list weekly (KXAAAGASMINM-26SEP30 ran 9/02&ndash;'
+             f'9/09 and again 9/09&ndash;9/16), so the exchange&rsquo;s own '
+             f'rewards view &mdash; which shows the CURRENT period &mdash; '
+             f'reads far lower than this column. '
+             f'P&amp;L = trading only: LIFETIME realized '
              f'(Kalshi&rsquo;s own per-market realized_pnl_dollars where the '
              f'bot&rsquo;s position matches the account&rsquo;s, the '
              f'bot&rsquo;s realized sink otherwise) plus open-book MTM at the '
