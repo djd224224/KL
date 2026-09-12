@@ -645,8 +645,11 @@ for _s in os.environ.get(
             # NOTHING under $1.00 per market per program period, so the sub-$1
             # band this bought was quoted for exactly zero reward — it is
             # clamped back to PAYOUT_FLOOR_DOLLARS by series_min_est_total()
-            # regardless, and the default now says so.
-            min_est_total=_env_float("IMM_TEMP_MIN_EST_TOTAL", 1.00),
+            # regardless. 1.00 until 2026-09-12; now NO per-series value, so
+            # temp inherits the global MIN_EST_TOTAL_DOLLARS ($1.50 -- Jack:
+            # "across IMM going forward"). Set IMM_TEMP_MIN_EST_TOTAL to pin
+            # a temp-only bar again (still clamped to the exchange minimum).
+            min_est_total=(_env_float("IMM_TEMP_MIN_EST_TOTAL", 0.0) or None),
             atref_price_tol_ticks=_env_int("IMM_TEMP_ATREF_PRICE_TOL", 0),
             # the ONE family that still pads (Jack 2026-08-05): an hourly
             # strike's book is thin by nature and lives <1h, so standing down
@@ -1178,7 +1181,9 @@ def series_min_est_total(series: str) -> float:
     was exactly that (40 markets landed in the dead $0.70-$1.00 band over the
     2026-08-02..04 window, ~20/day, earning $0). The GLOBAL knob
     is left alone so setting it to 0 still disables floors wholesale, which is
-    how the cutoff/mention-window tests isolate their subject."""
+    how the cutoff/mention-window tests isolate their subject.
+    2026-09-12: the global moved 1.0 -> 1.5 and KXTEMP dropped its own value,
+    so every series reads the same $1.50 unless an override pins one."""
     ov = SERIES_OVERRIDES.get(series)
     if ov and ov.min_est_total is not None:
         return max(ov.min_est_total, PAYOUT_FLOOR_DOLLARS)
@@ -3349,10 +3354,22 @@ MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 5000)
 # (est $/day x days to program end, capped by cutoff/close) — NOT a per-day
 # rate (Jack 2026-07-22): a $0.40/day estimate on a 5-day program clears the
 # $1 minimum comfortably; the old per-day floor only existed to catch 1-2-day
-# programs that couldn't. Margin above $1 via the env knob if wanted.
+# programs that couldn't.
+# 1.0 -> 1.5 (Jack 2026-09-12: "across IMM going forward, increase $1 payout
+# floor to $1.5 (to account for risks of the orderbook changing and earnings
+# falling below $1 minimum)"). The bar WAS the exchange minimum itself, so a
+# market projected to just clear $1.00 at entry paid zero whenever the book
+# moved against it afterwards -- a competitor stacking the touch, the
+# reference walking a rung away, a period ending early -- and the accrual
+# finished under the minimum. The extra $0.50 is that margin, and it is the
+# same bar everywhere series_min_est_total() is read: fresh entry, the
+# hopeless exit, the open-scan hopeless bar and the finecon walk. KXTEMP
+# dropped its own $1.00 value the same day, so nothing reads a lower bar.
+# PAYOUT_FLOOR_DOLLARS below stays $1.00: that one is a FACT about the
+# exchange, not a choice.
 # Per-series override: SeriesOverride.min_est_total via series_min_est_total(),
 # but NOTHING may sit below PAYOUT_FLOOR_DOLLARS — see series_min_est_total().
-MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.0)
+MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.5)
 # The exchange's own minimum: a market whose payout for a program period comes
 # to less than this is paid NOTHING. Measured, not assumed — across all 2,720
 # LIQUIDITY credits on Jack's 2026-08-04 statement the smallest is exactly
@@ -3527,7 +3544,11 @@ _CONFIG_CODE_KNOBS = (
     "QUALIFY_PATIENCE_CYCLES", "BENCH_COOLDOWN_SECS", "MAX_MARKETS",
     "MAX_POSITION_CONTRACTS", "MAX_EVENT_CONTRACTS", "MAX_TOTAL_RESTING",
     "COLLATERAL_BUDGET", "DAILY_LOSS_LIMIT", "RATE_FLOOR_TOTAL_ALT",
-    "PAYOUT_FLOOR", "PRICE_BAND_LO", "PRICE_BAND_HI", "STP_TYPE",
+    # both floors by their REAL global names (2026-09-12: "PAYOUT_FLOOR" had
+    # never matched a global, so the exchange minimum was silently unhashed,
+    # and the entry bar was never in the hash at all)
+    "MIN_EST_TOTAL_DOLLARS", "PAYOUT_FLOOR_DOLLARS",
+    "PRICE_BAND_LO", "PRICE_BAND_HI", "STP_TYPE",
     "EVENT_LEVEL_STANDOFF", "SCAN_TOP_N", "SCAN_DAILY_OPENINGS",
     "SCAN_DAILY_LOSS_LIMIT", "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
@@ -7143,7 +7164,7 @@ class IncentiveMarketMaker:
                 # 22:42, RE-ADMITTED 04:00 on one of the five scarce daily
                 # openings, and evicted again 06:00 — two of that day's five
                 # openings spent re-buying markets already judged unable to
-                # reach the $1 floor. Scan only; the normal book keeps its
+                # reach the payout floor. Scan only; the normal book keeps its
                 # existing re-entry behaviour.
                 if meta.scan and SCAN_HOPELESS_BAR:
                     if meta.ticker not in self.state.scan_hopeless_barred:

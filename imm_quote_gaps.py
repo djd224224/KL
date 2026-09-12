@@ -46,7 +46,8 @@ Reason labels (why a paying market isn't quoted):
                               no_volume, ...)
   under payout floor          est total accrual (with accrued + 1h-peak
                               credit) can't reach the series' min-payout
-                              floor (global $1; per-series overrides apply)
+                              floor (global $1.50 since 2026-09-12; per-series overrides
+                              apply, never below the exchange's $1.00)
   zero est yield              estimator sees no earnable share
   capacity (cap/budget)       eligible, positive — lost to the event cap /
                               collateral budget / candidate-cap truncation

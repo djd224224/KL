@@ -407,8 +407,8 @@ earnings per minute"): every live-incentive market the bot is NOT quoting,
 rolled up by event, ranked by est $/day (+ c/min), each with Kalshi's event
 title as a plain-English "what is this" snippet and a WHY-NOT-QUOTED reason
 (blocklisted/frozen, not in allowlist, no-new gate, yielded to manual,
-screened:<reason>, under payout floor (global $1; TEMP $0.70 since
-2026-08-02), zero yield, capacity, candidate cap). Second table: deliberately-off blocklist/freeze families with their
+screened:<reason>, under payout floor (global $1.50 since 2026-09-12, 1.5x the
+exchange's $1.00 minimum; TEMP inherits it), zero yield, capacity, candidate cap). Second table: deliberately-off blocklist/freeze families with their
 pools, so a deliberate block that starts leaving real money shows up.
 
 - Numbers come from the bot's OWN machinery imported from `incentive_mm.py`

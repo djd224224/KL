@@ -1011,14 +1011,16 @@ class TestScreen(unittest.TestCase):
             imm.MIN_VOLUME_CONTRACTS = old
 
     def test_payout_floor_is_total_accrual(self):
-        # $0.40/day on a 5-day program clears the $1 minimum; the same rate
-        # on a 1-day program does not (the old per-day floor got this wrong
-        # in both directions).
+        # $0.40/day on a 5-day program clears the bar ($1.50 since
+        # 2026-09-12); the same rate on a 1-day program does not (the old
+        # per-day floor got this wrong in both directions).
         now = datetime.now(timezone.utc)
         long_meta = _meta(program_end=now + timedelta(days=5))
         short_meta = _meta(program_end=now + timedelta(days=1))
-        self.assertGreaterEqual(0.40 * imm._quotable_days(long_meta, now), 1.0)
-        self.assertLess(0.40 * imm._quotable_days(short_meta, now), 1.0)
+        self.assertGreaterEqual(0.40 * imm._quotable_days(long_meta, now),
+                                imm.MIN_EST_TOTAL_DOLLARS)
+        self.assertLess(0.40 * imm._quotable_days(short_meta, now),
+                        imm.MIN_EST_TOTAL_DOLLARS)
         # cutoff caps the window even when the program runs longer
         capped = _meta(program_end=now + timedelta(days=5),
                        cutoff=now + timedelta(days=1))
@@ -1355,6 +1357,44 @@ class TestRampAIIndexAllowlist(unittest.TestCase):
         # unguarded series never see any of this
         self.assertIsNone(imm.apply_series_cutoff_adjustments(
             "KXGOOD", "KXGOOD-99DEC31", None, market={"title": "for May 2026"}))
+
+
+class TestPayoutFloorOneFifty(unittest.TestCase):
+    """Jack 2026-09-12: "across IMM going forward, increase $1 payout floor
+    to $1.5 (to account for risks of the orderbook changing and earnings
+    falling below $1 minimum)"."""
+
+    def test_the_bar_is_one_fifty_and_the_exchange_minimum_is_untouched(self):
+        self.assertEqual(imm.MIN_EST_TOTAL_DOLLARS, 1.5)
+        self.assertEqual(imm.PAYOUT_FLOOR_DOLLARS, 1.0)   # a fact, not a knob
+
+    def test_every_family_reads_the_same_bar(self):
+        # plain, temp, a Ramp series, a Treasury, a finecon member, an
+        # undated-guard series: nothing carries a lower bar of its own
+        for s in ("KXGOOD", "KXTEMPDCH", "KXGOOGLADOPT", "KXUST2AD",
+                  "KXSPRLVL", "KXMLBPLAYOFFS"):
+            self.assertEqual(imm.series_min_est_total(s), 1.5, s)
+        for s, ov in imm.SERIES_OVERRIDES.items():
+            if ov.min_est_total is not None:
+                self.assertGreaterEqual(imm.series_min_est_total(s), 1.5,
+                                        f"{s} carries a bar under $1.50")
+
+    def test_a_projection_between_one_and_one_fifty_no_longer_enters(self):
+        # mirror of the entry/hopeless test in refresh_universe:
+        #   accrued + max(est_total, peak) >= series_min_est_total(series)
+        def reaches(accrued, est_total, peak=0.0, series="KXGOOD"):
+            return (accrued + max(est_total, peak)
+                    >= imm.series_min_est_total(series))
+        self.assertFalse(reaches(0.0, 1.20))          # cleared the old $1 bar
+        self.assertFalse(reaches(0.0, 1.49))
+        self.assertTrue(reaches(0.0, 1.50))
+        self.assertTrue(reaches(0.6, 0.95))           # accrued counts
+        self.assertTrue(reaches(0.0, 0.9, peak=1.6))  # the 1h peak counts
+
+    def test_both_floors_are_in_the_config_hash(self):
+        cfg, _digest = imm._build_config()
+        self.assertEqual(cfg.get("code:MIN_EST_TOTAL_DOLLARS"), "1.5")
+        self.assertEqual(cfg.get("code:PAYOUT_FLOOR_DOLLARS"), "1.0")
 
 
 class TestAllowlist(unittest.TestCase):
@@ -3775,15 +3815,26 @@ class TestTempSeriesTuning(unittest.TestCase):
         self.assertIsNone(bot._screen(meta, now, member=True))
 
     def test_temp_min_payout_floor(self):
-        # The temp override may still win DOWNWARD against a raised global,
-        # but never below PAYOUT_FLOOR_DOLLARS — the exchange pays nothing
-        # under $1.00 per market per program period (2026-08-04 statement).
-        self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 1.00)
+        # 2026-09-12: temp carries NO bar of its own any more -- it reads the
+        # global ($1.50), and a raised global raises temp with it. An explicit
+        # per-series value (IMM_TEMP_MIN_EST_TOTAL) may still win downward,
+        # but never below PAYOUT_FLOOR_DOLLARS (next test).
+        import dataclasses
+        self.assertIsNone(imm.SERIES_OVERRIDES["KXTEMPDCH"].min_est_total)
+        self.assertEqual(imm.series_min_est_total("KXTEMPDCH"),
+                         imm.MIN_EST_TOTAL_DOLLARS)
         old = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = 123.0
         try:
             self.assertEqual(imm.series_min_est_total("KXGOOD"), 123.0)
-            self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 1.00)
+            self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 123.0)
+            ov = imm.SERIES_OVERRIDES["KXTEMPDCH"]
+            imm.SERIES_OVERRIDES["KXTEMPDCH"] = dataclasses.replace(
+                ov, min_est_total=1.00)
+            try:
+                self.assertEqual(imm.series_min_est_total("KXTEMPDCH"), 1.00)
+            finally:
+                imm.SERIES_OVERRIDES["KXTEMPDCH"] = ov
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old
 
