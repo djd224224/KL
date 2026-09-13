@@ -162,6 +162,39 @@ class TestBuildQuotes(unittest.TestCase):
         self.assertEqual(self.bids(quotes), [(45 - S * i, C) for i in range(N)])
         self.assertEqual(self.asks(quotes), [(55 + S * i, C) for i in range(N)])
 
+    def test_price_envelope_never_buys_a_side_above_90c(self):
+        """Jack 2026-09-13: "Don't quote Crypto above 90c". The anchor is
+        clamped, so the ladder keeps its shape inside the envelope."""
+        C, N, S = mm.CONTRACTS_PER_LEVEL, mm.NUM_LEVELS, mm.LEVEL_SPACING_CENTS
+        self.assertEqual((mm.BID_MAX_CENTS, mm.ASK_MIN_CENTS), (90, 10))
+        # near-certain touch: fair 95, book 96/97 -> bids top out at 90c
+        quotes = self.q(95, bb=96, ba=97)
+        self.assertEqual(self.bids(quotes), [(90 - S * i, C) for i in range(N)])
+        self.assertTrue(all(p <= 90 for p, _c in self.bids(quotes)))
+        # a bid anchor already under 90c is untouched
+        self.assertEqual(self.bids(self.q(92, bb=93, ba=94)),
+                         [(87 - S * i, C) for i in range(N)])
+        # deep tail: fair 3, book 2/4 -> asks start at 10c (NO bought at 90c),
+        # never at 8c (NO bought at 92c)
+        quotes = self.q(3, bb=2, ba=4)
+        self.assertEqual(self.asks(quotes), [(10 + S * i, C) for i in range(N)])
+        self.assertTrue(all(p >= 10 for p, _c in self.asks(quotes)))
+        # an ask anchor already over 10c is untouched
+        self.assertEqual(self.asks(self.q(20, bb=19, ba=21)),
+                         [(25 + S * i, C) for i in range(N)])
+
+    def test_place_order_refuses_quotes_outside_the_envelope(self):
+        bot = mm.TouchMarketMaker(SOL_MAX, None, live=False)
+        now = 1_700_000_000.0
+        bot.place_order(mm.Quote("T", "bid", 95, 5), now)      # buys YES at 95c
+        bot.place_order(mm.Quote("T", "ask", 5, 5), now)       # buys NO at 95c
+        self.assertEqual(bot.state.sim_orders, {})
+        bot.place_order(mm.Quote("T", "bid", 90, 5), now)      # at the edge: fine
+        bot.place_order(mm.Quote("T", "ask", 10, 5), now)
+        self.assertEqual(sorted((o["book_side"], o["yes_price"])
+                                for o in bot.state.sim_orders.values()),
+                         [("ask", 10), ("bid", 90)])
+
     def test_never_lead_bid_joins_external_best(self):
         # fair 50 but the best external bid is only 40: join it, never improve;
         # deeper levels keep the exact 2c spacing off the clamped anchor
@@ -186,15 +219,19 @@ class TestBuildQuotes(unittest.TestCase):
         quotes = self.q(3, bb=2, ba=4)
         self.assertEqual(self.bids(quotes), [])   # ladder wants -2,-4,-6: dropped
         C = mm.CONTRACTS_PER_LEVEL
+        # asks wanted 8/10/12; since 2026-09-13 the ask anchor never sits
+        # under ASK_MIN_CENTS (a 8c ask buys NO at 92c), so 10/12/14
         self.assertEqual(self.asks(quotes),
-                         [(8 + mm.LEVEL_SPACING_CENTS * i, C) for i in range(mm.NUM_LEVELS)])
+                         [(10 + mm.LEVEL_SPACING_CENTS * i, C) for i in range(mm.NUM_LEVELS)])
 
     def test_high_fair_drops_over_99_asks(self):
         quotes = self.q(96, bb=92, ba=99)
         self.assertEqual(self.asks(quotes), [])   # ladder wants 101+: dropped
         C = mm.CONTRACTS_PER_LEVEL
+        # bids wanted 91/89/87; since 2026-09-13 the bid anchor never sits
+        # over BID_MAX_CENTS, so 90/88/86
         self.assertEqual(self.bids(quotes),
-                         [(91 - mm.LEVEL_SPACING_CENTS * i, C) for i in range(mm.NUM_LEVELS)])
+                         [(90 - mm.LEVEL_SPACING_CENTS * i, C) for i in range(mm.NUM_LEVELS)])
 
     def test_cross_clamp_bid_never_crosses_ask(self):
         quotes = self.q(60, bb=48, ba=50)

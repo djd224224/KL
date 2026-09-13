@@ -135,6 +135,21 @@ QUOTE_OFFSET_CENTS = int(os.environ.get("CMM_QUOTE_OFFSET_CENTS", 5))
 LEVEL_SPACING_CENTS = int(os.environ.get("CMM_LEVEL_SPACING_CENTS", 2))
 NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 3))
 CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 5))
+# HARD PRICE ENVELOPE (Jack 2026-09-13: "Don't quote Crypto above 90c"). No
+# resting order may BUY a side above BID_MAX_CENTS: a YES bid above 90c, or
+# a YES ask below ASK_MIN_CENTS (10c), which Kalshi books as a NO purchase
+# above 90c. Measured Jul 8 - Sep 13 across the fleets: 4,449 contracts
+# bought at 90-99c settled, 73.4% paid against prices that need 90%+, net
+# -$840; 497 of those 506 fills were asks resting at 1-10c on the monthly
+# MAX/MIN tails (none since the v2.6 15c ask floor went live on 9/12), the
+# other 9 were YES bids at 90-96c on near-certain touches (the monthly
+# stand-down only starts at 97c). Enforced in build_quotes for EVERY fleet
+# (the weekly, updown and annual bots all ladder through it) by clamping
+# the ladder ANCHOR -- the module's invariant is that clamps move the whole
+# ladder and never squeeze its spacing -- and again in place_order as the
+# last line of defense for any quote built elsewhere.
+BID_MAX_CENTS = int(os.environ.get("CMM_BID_MAX_CENTS", 90))
+ASK_MIN_CENTS = int(os.environ.get("CMM_ASK_MIN_CENTS", 10))
 
 # v2.6 monthly risk rules (Jack 2026-09-12 "ship 1, 2, 3, 4"). Backed by the
 # tape replay of Jul-Sep 2026 + a 2y Kraken calibration backtest (see
@@ -583,6 +598,9 @@ def build_quotes(ticker: str, fair: int,
     with no external quotes at all gets nothing — we are never alone at the
     top of the book. Levels are always exactly LEVEL_SPACING_CENTS apart
     (clamps move the whole ladder via its anchor, never squeeze the gaps).
+    Price envelope (2026-09-13): the bid anchor never sits above
+    BID_MAX_CENTS and the ask anchor never below ASK_MIN_CENTS, so no rung
+    buys a side above 90c.
     The ladder's total size is shaved to fit `room_buy`/`room_sell`
     (contracts we may still buy/sell before hitting the caps, assuming the
     whole ladder fills)."""
@@ -604,6 +622,7 @@ def build_quotes(ticker: str, fair: int,
         anchor = min(fair - offset_cents, ext_best_bid)         # match, never lead
         if ext_best_ask is not None:
             anchor = min(anchor, ext_best_ask - 1)              # post-only: never cross
+        anchor = min(anchor, BID_MAX_CENTS)                     # never buy YES above 90c
         for i in range(num_levels):
             if room <= 0:
                 break
@@ -619,6 +638,7 @@ def build_quotes(ticker: str, fair: int,
         anchor = max(fair + offset_cents, ext_best_ask)         # match, never lead
         if ext_best_bid is not None:
             anchor = max(anchor, ext_best_bid + 1)              # post-only: never cross
+        anchor = max(anchor, ASK_MIN_CENTS)                     # never buy NO above 90c
         for i in range(num_levels):
             if room <= 0:
                 break
@@ -1057,6 +1077,15 @@ class TouchMarketMaker:
     # ---- exchange wrappers (all writes gated on self.live) -----------------
 
     def place_order(self, q: Quote, now_ts: float) -> None:
+        # last line of defense for the price envelope (see BID_MAX_CENTS):
+        # nothing that buys a side above 90c reaches the exchange, whatever
+        # built the quote
+        if (q.book_side == "bid" and q.price_cents > BID_MAX_CENTS) or \
+                (q.book_side != "bid" and q.price_cents < ASK_MIN_CENTS):
+            log(f"{self.tag} ! envelope: NOT placing {q.book_side} {q.count}x "
+                f"@ {q.price_cents}c on {q.ticker} (bids <= {BID_MAX_CENTS}c, "
+                f"asks >= {ASK_MIN_CENTS}c)")
+            return
         client_order_id = f"{self.client_order_prefix}-{RUN_ID}-{uuid.uuid4().hex[:12]}"
         # Stamp expiration at SEND time, not cycle start: a slow placement
         # wave (dozens of orders x ~2s) would otherwise burn minutes of TTL
