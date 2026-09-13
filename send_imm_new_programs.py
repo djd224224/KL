@@ -77,10 +77,14 @@ USAGE:
   python send_imm_new_programs.py --test       # send now, ignore the marker
   python send_imm_new_programs.py --dry        # build + print, send nothing
   python send_imm_new_programs.py --since 72   # widen the window by hand
-Scheduled daily 7:30 AM ET ("KL imm new-programs"), after the 7:10 digest,
-7:20 quote-gaps and 7:25 opportunistic emails. Idempotent via a daily
-sent-marker; Modern-Standby retries (8x5min); credentials from
-ALERT_EMAIL_FROM / ALERT_EMAIL_PASSWORD with the HKCU registry fallback.
+Scheduled daily as "KL imm new-programs", 5 minutes after the opportunistic
+email (register_imm_new_programs.ps1 reads that task's own trigger rather
+than hardcoding a time, because the repo's task notes disagree about whether
+those triggers are in ET or the box's local Central; 7:30 AM ET is the
+fallback). Registration is bootstrapped by sync_kl_main.ps1 the first time
+this lands on main. Idempotent via a daily sent-marker; Modern-Standby
+retries (8x5min); credentials from ALERT_EMAIL_FROM / ALERT_EMAIL_PASSWORD
+with the HKCU registry fallback.
 """
 
 import argparse

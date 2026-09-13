@@ -57,6 +57,21 @@ if (-not $dashTask) {
     "$stamp settlements archive deleted for v3 rebuild (cents-detector false positive, $seedNote); dashboards kicked" | Add-Content -Path $Log -Encoding utf8
 }
 
+# One-time bootstrap (2026-09-13): register the daily "new incentive
+# programs" email once register_imm_new_programs.ps1 lands on main — same
+# pattern as the dashboards task above, so the task appears on this machine
+# with no manual step. No-op once it exists. Deliberately NOT started here:
+# the first run of that email is its own seeding run and kicking it would
+# fire it at an arbitrary minute; its next scheduled trigger is fine.
+if (-not (Get-ScheduledTask -TaskName "KL imm new-programs" -ErrorAction SilentlyContinue)) {
+    $npReg = Join-Path $Repo "register_imm_new_programs.ps1"
+    if (Test-Path $npReg) {
+        $npOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $npReg 2>&1) -join ' | '
+        $npOk = [bool](Get-ScheduledTask -TaskName "KL imm new-programs" -ErrorAction SilentlyContinue)
+        "$stamp imm new-programs bootstrap: $(if ($npOk) { 'registered' } else { 'FAILED (run register_imm_new_programs.ps1 from PowerShell)' }) | $npOut" | Add-Content -Path $Log -Encoding utf8
+    }
+}
+
 # One-shot windowed IMM restart (Jack 2026-08-24 "restart for me at that
 # time"): bumping $RestartRequest in a main push makes the NEXT sync run
 # dispatch restart_imm.ps1 exactly once on this machine — the script itself
