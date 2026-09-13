@@ -320,6 +320,17 @@ class SeriesOverride:
 # is unambiguous again; the 5-90 pad_band_ok mid gate still applies.
 PAD_BID_CENTS = _env_int("IMM_PAD_BID_CENTS", 1)
 PAD_ASK_CENTS = _env_int("IMM_PAD_ASK_CENTS", 99)
+# TOUCH band for pads (Jack 2026-09-13: "remove 1000 pads on markets where
+# the top of the orderbook is <10c or >90c... i dont want pads to be
+# bought"): on top of the 5-90 MID gate, no pad rests on a market whose
+# best bid is under PAD_TOUCH_MIN_CENTS or whose best ask is over
+# PAD_TOUCH_MAX_CENTS. The mid gate let KXAAAGASDNC-26SEP14-4.0100 pad
+# 1,000 contracts at 1c under a 6c/7c book (mid 6.5, inside 5-90): five
+# ticks from the touch on a market that settles on one print, a pad like
+# that is the first thing a seller hits. Whole market, both sides -- a
+# one-sided pad on such a book qualifies nothing worth the fill.
+PAD_TOUCH_MIN_CENTS = _env_int("IMM_PAD_TOUCH_MIN", 10)
+PAD_TOUCH_MAX_CENTS = _env_int("IMM_PAD_TOUCH_MAX", 90)
 PAD_ROUND = _env_int("IMM_PAD_ROUND", 100)
 # 5000 -> 800 ("Max do 800") -> 1000 (Jack 2026-08-03 "allow pads to go up
 # to 1k"): bounds each pad order's contracts — worst-case ~$10/side at 1c.
@@ -868,7 +879,8 @@ def series_pad_to_target(series: str) -> bool:
 def pad_band_ok(series: str, ext_bid: Optional[int],
                 ext_ask: Optional[int]) -> bool:
     """Pads only on markets whose EXTERNAL mid sits inside the SERIES band
-    (5-90) — Jack 2026-08-02 "Do not pad on markets outside of 5-90 range":
+    (5-90) — Jack 2026-08-02 "Do not pad on markets outside of 5-90 range" —
+    AND whose touches sit inside PAD_TOUCH_MIN/MAX (10-90, 2026-09-13):
     a 1000+-contract pad on a near-settled extreme is the closest thing to a
     standing pickoff (98c asks under near-certain YES). One-sided books
     count as outside. Shared by the quote loop AND the estimator overlay so
@@ -877,7 +889,12 @@ def pad_band_ok(series: str, ext_bid: Optional[int],
     if ext_bid is None or ext_ask is None:
         return False
     mid = (ext_bid + ext_ask) / 2.0
-    return series_price_min(series) <= mid <= series_price_max(series)
+    if not (series_price_min(series) <= mid <= series_price_max(series)):
+        return False
+    # 2026-09-13: the TOUCHES must sit inside 10-90 too (see the knobs) --
+    # a low best bid puts the 1c pad within reach of any seller, a high
+    # best ask does the same for the 99c pad
+    return PAD_TOUCH_MIN_CENTS <= ext_bid and ext_ask <= PAD_TOUCH_MAX_CENTS
 
 
 def pad_quantity(external_and_touch_depth: float, target: float) -> int:

@@ -472,27 +472,51 @@ class TestAtRefLadder(unittest.TestCase):
         imm.PAD_TO_TARGET_GLOBAL = True
         self.addCleanup(setattr, imm, 'PAD_TO_TARGET_GLOBAL', _pad)
         # Jack 2026-08-03 "Do 1": a wide live book (3c x 29c) stands down
-        # only its out-of-band BID side; the ask keeps quoting and the bid
-        # pad still qualifies the snapshot.
+        # only its out-of-band BID side; the ask keeps quoting. Until
+        # 2026-09-13 the 1c bid pad under the 3c bid "qualified the
+        # snapshot" -- that pad is exactly what Jack's touch rule removes
+        # ("remove 1000 pads on markets where the top of the orderbook is
+        # <10c or >90c... i dont want pads to be bought"), so with only 400
+        # external contracts on the yes side the market can no longer
+        # qualify and stands down WHOLE: no rungs on either side, no pad.
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         bot.run_cycle()
         t = "KXGOOD-99DEC31-A"
         self.assertIn(t, bot.state.selected)
+
+        def _orders():
+            orders = [o for o in bot.state.sim_orders.values()
+                      if o["ticker"] == t]
+            asks = [o for o in orders if o["book_side"] == "ask"
+                    and o["yes_price"] < imm.PAD_ASK_CENTS]
+            bad_bids = [o for o in orders if o["book_side"] == "bid"
+                        and o["yes_price"] > imm.PAD_BID_CENTS]
+            pads = [o for o in orders if o["book_side"] == "bid"
+                    and o["yes_price"] == imm.PAD_BID_CENTS]
+            return asks, bad_bids, pads
+
         bot.client.books[t] = {"orderbook_fp": {
             "yes_dollars": [["0.03", "400"]], "no_dollars": [["0.71", "400"]]}}
         bot.client.markets[t]["yes_bid_dollars"] = "0.0300"
         bot.client.markets[t]["yes_ask_dollars"] = "0.2900"
         bot.state.universe_at = time.time()
         bot.run_cycle()
-        orders = list(bot.state.sim_orders.values())
-        asks = [o for o in orders if o["ticker"] == t and o["book_side"] == "ask"
-                and o["yes_price"] < imm.PAD_ASK_CENTS]
-        bad_bids = [o for o in orders if o["ticker"] == t
-                    and o["book_side"] == "bid"
-                    and o["yes_price"] > imm.PAD_BID_CENTS]
+        asks, bad_bids, pads = _orders()
+        self.assertEqual(pads, [])            # no 1c pad under a 3c bid
+        self.assertEqual(bad_bids, [])        # stood-down side: no rungs
+        self.assertEqual(asks, [])            # and nothing to qualify the ask
+        # With enough EXTERNAL depth on BOTH sides to qualify without any
+        # pad, the per-side rule is intact: the healthy ask quotes, the bid
+        # rests none
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.03", "1200"]], "no_dollars": [["0.71", "1200"]]}}
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        asks, bad_bids, pads = _orders()
         self.assertTrue(asks)                 # healthy side quotes
         self.assertEqual(bad_bids, [])        # stood-down side: no rungs
+        self.assertEqual(pads, [])            # still no pad on a 3c touch
 
     def test_ref_absolute_bounds(self):
         # Absolute envelope = the sticky band (5-93 since 2026-08-03)
@@ -2083,7 +2107,17 @@ class TestDryRunCycle(unittest.TestCase):
         # Jack 2026-08-02: no pads on markets outside the 5-90 series band —
         # extreme-mid and one-sided books get no qualification depth.
         self.assertTrue(imm.pad_band_ok("KXGOOD", 40, 60))     # mid 50
-        self.assertTrue(imm.pad_band_ok("KXGOOD", 5, 9))       # mid 7
+        # 2026-09-13 touch band: a low best bid or a high best ask kills
+        # the pad even with the mid inside 5-90 (the 6c/7c NC gas book that
+        # padded 1,000 at 1c)
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 5, 9))      # mid 7, bid < 10
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 6, 7))      # the NC gas book
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 9, 15))     # bid 9 < 10
+        self.assertTrue(imm.pad_band_ok("KXGOOD", 10, 14))     # bid at 10 is in
+        self.assertTrue(imm.pad_band_ok("KXGOOD", 86, 90))     # ask at 90 is in
+        self.assertFalse(imm.pad_band_ok("KXGOOD", 85, 91))    # ask 91 > 90
+        self.assertEqual((imm.PAD_TOUCH_MIN_CENTS, imm.PAD_TOUCH_MAX_CENTS),
+                         (10, 90))
         self.assertFalse(imm.pad_band_ok("KXGOOD", 2, 4))      # mid 3 < 5
         self.assertFalse(imm.pad_band_ok("KXGOOD", 93, 97))    # mid 95 > 90
         self.assertFalse(imm.pad_band_ok("KXGOOD", None, 50))  # one-sided
