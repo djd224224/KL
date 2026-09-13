@@ -4739,9 +4739,12 @@ class TestStickySelection(unittest.TestCase):
         finally:
             imm.COLLATERAL_BUDGET = old_budget
 
-    def test_peak_entry_carries_flapping_market_over_floor(self):
-        # A noisy estimate that cleared the floor within the last hour keeps
-        # the market entry-eligible even if THIS refresh's sample is below.
+    def test_peak_guards_a_member_but_no_longer_carries_a_fresh_market_in(self):
+        # Until 2026-09-13 a noisy estimate that cleared the floor within the
+        # last hour kept a market ENTRY-eligible even if this refresh's sample
+        # was below (the flapping-market rule). Jack 2026-09-13: "test fresh
+        # admissions on the current estimate plus accrued only, no peak" --
+        # the peak is a members-only dip guard now.
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
@@ -4749,7 +4752,21 @@ class TestStickySelection(unittest.TestCase):
         try:
             bot._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())  # recent peak
             bot.run_cycle()
+            self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+        # admitted on its own numbers, it is a member; the same peak now
+        # holds it over a floor its sample cannot reach, with no hopeless clock
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
             self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
+            self.assertNotIn("KXGOOD-99DEC31-A", bot.state.hopeless_since)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
@@ -4758,18 +4775,23 @@ class TestStickySelection(unittest.TestCase):
         # wipe it and force borderline markets to re-clear the floor.
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()                        # a MEMBER, persisted as sticky
+        self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
         bot._est_peak["KXGOOD-99DEC31-A"] = (2.5, time.time())
         bot._save_persist()
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertIn("KXGOOD-99DEC31-A", bot2._est_peak)
         self.assertAlmostEqual(bot2._est_peak["KXGOOD-99DEC31-A"][0], 2.5, places=3)
-        # and it actually carries a below-floor sample over the floor
+        # and, for the restarted MEMBER, it still carries a below-floor
+        # sample over the floor (since 2026-09-13 a fresh market gets no such
+        # carry -- see the flapping-market test above)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = 1e9
         try:
             bot2._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
             bot2.run_cycle()
             self.assertIn("KXGOOD-99DEC31-A", bot2.state.selected)
+            self.assertNotIn("KXGOOD-99DEC31-A", bot2.state.hopeless_since)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
@@ -10191,6 +10213,47 @@ class TestOpenScanTier(unittest.TestCase):
             with mock.patch.object(imm, "SCAN_HOPELESS_EXIT", False):
                 bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_fresh_admission_ignores_the_stale_peak_members_keep_it(self):
+        """Jack 2026-09-13: "test fresh admissions on the current estimate
+        plus accrued only, no peak". The day the 60-seat cap opened, 15
+        state-print strikes entered on 13:3x peaks while their live
+        projection sat under the floor, and were on the hopeless clock eight
+        minutes later."""
+        bot = self._bot()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        # FRESH: a peak far above anything the live book projects, still
+        # inside its hour -- the old rule admitted on it, the new one does not
+        imm.MIN_EST_TOTAL_DOLLARS = 1e6
+        try:
+            bot._est_peak[self.A] = (2e6, time.time())
+            bot.run_cycle()
+            self.assertNotIn(self.A, bot.state.selected)
+            self.assertNotIn(self.A, bot.state.scan_members)
+            # what it has BANKED still counts for a fresh candidate
+            bot.state.accrued_est[self.A] = 1e6
+            bot._est_peak.clear()
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.A, bot.state.selected)
+            # MEMBER: the peak remains its dip guard -- a sub-bar reading
+            # with a live peak neither evicts nor starts the hopeless clock
+            bot.state.accrued_est.pop(self.A, None)
+            bot._est_peak[self.A] = (2e6, time.time())
+            bot.state.hopeless_since.pop(self.A, None)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.A, bot.state.selected)
+            self.assertNotIn(self.A, bot.state.hopeless_since)
+            # ... and without the peak the clock starts (sticky until it
+            # has run HOPELESS_SUSTAIN_SECS), which is the pre-existing exit
+            bot._est_peak.clear()
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.A, bot.state.selected)
+            self.assertIn(self.A, bot.state.hopeless_since)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 

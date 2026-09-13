@@ -1376,7 +1376,8 @@ def series_min_est_total(series: str) -> float:
 
     A per-series OVERRIDE is clamped up to PAYOUT_FLOOR_DOLLARS (2026-08-04):
     the floor is compared against an OPTIMISTIC projection (accrued + best of
-    current/1h-peak), so a series bar below the exchange's own $1 minimum
+    current/1h-peak; members only since 2026-09-13, a fresh candidate is
+    judged on current + accrued), so a series bar below the exchange's own $1 minimum
     admits markets whose very best case is a payout of zero. KXTEMP's $0.70
     was exactly that (40 markets landed in the dead $0.70-$1.00 band over the
     2026-08-02..04 window, ~20/day, earning $0). The GLOBAL knob
@@ -3694,8 +3695,15 @@ def rate_floor_projected(accrued: float, est_total: float, peak: float,
 # share estimate ±50% between refreshes), so borderline markets could flap
 # just under $1 at every sampling instant and never enter (observed
 # 2026-07-23: 28 company markets measuring $1-2.6 in a spot check, all
-# floored at the live refreshes). Entry therefore uses the market's PEAK
+# floored at the live refreshes). Entry therefore used the market's PEAK
 # estimate over the last hour; sticky selection holds it once in.
+# 2026-09-13: the peak is a MEMBERS-ONLY dip guard now. A fresh candidate is
+# judged on its current estimate plus accrued (Jack: "test fresh admissions
+# on the current estimate plus accrued only, no peak") -- see the projection
+# block in refresh_universe for the 15-strike admit-then-evict that decided
+# it. The borderline-flap concern above is covered from the other side: a
+# seat left empty costs nothing, while a seat filled on a stale peak costs
+# an hour of fill risk and a permanent bar.
 EST_PEAK_TTL_SECS = _env_int("IMM_EST_PEAK_TTL", 3600)
 # STICKY EXIT for hopeless markets (Jack 2026-07-25: "quoting markets that
 # don't hit $1 is a big drain" — if there's <5% chance of reaching the $1 min
@@ -7411,12 +7419,25 @@ class IncentiveMarketMaker:
                     skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
                     decisions[meta.ticker] = "book_unreadable"
                 continue
-            # Shared $1-min-payout projection for the entry floor AND the
-            # hopeless exit: optimistic = accrued-so-far + max(current,
-            # 1h-peak) remaining. NOTE the peak alone does NOT stop a dip from
-            # evicting: `pts` only refreshes on a new HIGH, so a declining
-            # estimate lets the peak expire and then one low reading is
-            # enough. The explicit dip guard below is what actually holds.
+            # Shared min-payout projection for the entry floor AND the
+            # hopeless exit. For a MEMBER it is optimistic: accrued-so-far +
+            # max(current, 1h-peak) remaining -- the peak is a dip guard so
+            # one low reading cannot evict. NOTE the peak alone does NOT stop
+            # a dip from evicting: `pts` only refreshes on a new HIGH, so a
+            # declining estimate lets the peak expire and then one low
+            # reading is enough. The explicit dip guard below is what holds.
+            # For a FRESH candidate the peak is NOT consulted (Jack
+            # 2026-09-13: "test fresh admissions on the current estimate
+            # plus accrued only, no peak"): the entry test is what the
+            # market earns NOW plus what it has banked. Measured the day the
+            # 60-seat cap opened: 15 Sunday state-print strikes entered at
+            # 14:31Z on peaks from the 13:3x window ($1.5-2.1 projected)
+            # while their live projection was $0.75-1.46; the peaks expired
+            # by the 14:39Z refresh and the same rule put all 15 on the
+            # hopeless clock -- an hour of fill risk, then a permanent bar,
+            # for markets that never cleared the floor on their own numbers.
+            # Accrued still counts for a re-entrant (a market that banked
+            # most of its floor re-enters on the remaining window).
             qdays = _quotable_days(meta, now_utc)
             est_total = meta.est_dollars_per_day * qdays
             peak, pts = self._est_peak.get(meta.ticker, (0.0, 0.0))
@@ -7426,7 +7447,8 @@ class IncentiveMarketMaker:
                 self._est_peak[meta.ticker] = (est_total, now_ts)
                 peak = est_total
             accrued = self.state.accrued_est.get(meta.ticker, 0.0)
-            reaches_min = accrued + max(est_total, peak) \
+            proj_peak = peak if meta.ticker in prev_selected else 0.0
+            reaches_min = accrued + max(est_total, proj_peak) \
                 >= series_min_est_total(meta.series)
             # DIP GUARD (Jack 2026-08-05). Track how long the projection has
             # been continuously under the bar; the exit below refuses to fire
@@ -7498,7 +7520,8 @@ class IncentiveMarketMaker:
                     and meta.event_ticker not in prev_events \
                     and meta.event_ticker not in FORCE_EVENTS \
                     and meta.est_dollars_per_day < series_min_est_rate(meta.series) \
-                    and rate_floor_projected(accrued, est_total, peak, qdays) \
+                    and rate_floor_projected(accrued, est_total, proj_peak,
+                                             qdays) \
                     < RATE_FLOOR_TOTAL_ALT:
                 # Rate-floored only when the market ALSO fails the horizon
                 # escape. The projected total uses the same quantity as the
