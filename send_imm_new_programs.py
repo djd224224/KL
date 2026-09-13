@@ -861,8 +861,14 @@ def main(argv=None) -> int:
     # it is an email Jack saw.
     save_seen(seen_next)
     if not args.test:
-        with open(marker, "w") as f:
-            f.write(now_utc.isoformat())
+        # Post-send bookkeeping: never turn a delivered email into a non-zero
+        # exit (and a red task) because a marker could not be written.
+        try:
+            with open(marker, "w") as f:
+                f.write(now_utc.isoformat())
+        except OSError as e:
+            log(f"! sent-marker not written ({e!r}); a re-run today would "
+                f"send again")
         cutoff = today_ct - timedelta(days=7)
         for old in glob.glob(os.path.join(imm.STATUS_DIR,
                                           "imm_new_programs_sent_*.marker")):

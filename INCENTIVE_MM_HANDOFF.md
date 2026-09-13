@@ -2064,7 +2064,7 @@ An unknown event whose programs started BEFORE the window is a LATE ARRIVAL
 - Flags: `--test` (send now, no marker) / `--dry` / `--print` (build + print,
   write nothing) / `--since HOURS` (widen the window by hand) /
   `--include-ended` / `--html-out FILE` (with `--dry`).
-- Tests: `python -m unittest test_send_imm_new_programs` (44) — centi-cent
+- Tests: `python -m unittest test_send_imm_new_programs` (46) — centi-cent
   and $/day math incl. the hourly floor, the ROLL case, late arrivals, the
   window/watermark rules, the feed-shrink hold, the BOT column and cutoff
   flags, row-cap totals, ASCII body, and main()'s marker/state writes.
