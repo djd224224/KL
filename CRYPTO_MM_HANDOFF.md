@@ -126,6 +126,11 @@ ratios (risk cap 30%, skew full at 30%, reduce-only at 60% of the event cap):
   equals the 3c floor, so its skew is purely the back-off. The daily tenor keeps its 8/17 defenses
   unchanged (`test_config_is_pinned`, `test_skew_thinned_edge_never_drops_below_the_floor`).
 - The 10-90c band still drops BOTH sides below 10c; the ask floor lifts only the ask side to 15c.
+- **Weekly pre-print stand-down is 6h** (`MIN_SECS_LEFT["weekly"]` 3600 -> 21600, Jack 2026-09-12
+  "stop quoting 6 hours before the Friday print"): the last six hours were 29% of weekly volume
+  and lost in 4 of the 5 settled weeks that had them (-$147 vs +$139 outside them). Deselection
+  cancels the resting book, so from Friday ~11:00 ET the weekly event is clear; the bot idles (or
+  quotes the next listed week) until then. Banner shows `stand-down 6h before the print`.
 - Risk dollars are summed per event from account-level positions (strikes outside the quoted band
   count at 50c) and shown on the event summary line (`risk short/long $x/$y cap $z`); the cycle
   header now shows `sigma_d=... (raw r, median m)`. Banner: `risk rules v1.1 ON: ...` per tenor.

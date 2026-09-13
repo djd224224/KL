@@ -718,7 +718,7 @@ class TestDailyDefenses(unittest.TestCase):
                         ud.MIN_SECS_LEFT)
         self.assertEqual(ud.MIN_SECS_LEFT["daily"], 1800)
         self.assertEqual(ud.MIN_SECS_LEFT["hourly"], 1800)
-        self.assertEqual(ud.MIN_SECS_LEFT["weekly"], 3600)
+        self.assertEqual(ud.MIN_SECS_LEFT["weekly"], 21600)   # 6h before the Friday print (9/12)
         # a daily 29 minutes from its print is out; 31 minutes is in
         for mins, want in ((29, 0), (31, 1)):
             end = NOW + timedelta(minutes=mins)

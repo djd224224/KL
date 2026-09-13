@@ -136,7 +136,11 @@ WEEKLY_MAX_HOURS = _env_f("CUD_WEEKLY_MAX_HOURS", 400.0)
 MIN_SECS_LEFT = {
     "hourly": _env_f("CUD_MIN_SECS_LEFT_HOURLY", 1800),
     "daily": _env_f("CUD_MIN_SECS_LEFT_DAILY", 1800),
-    "weekly": _env_f("CUD_MIN_SECS_LEFT_WEEKLY", 3600),
+    # Weekly: 6h before the Friday print (Jack 2026-09-12 "stop quoting 6 hours
+    # before the Friday print"; was 3600). The final six hours were 29% of the
+    # weekly volume and lost money in 4 of the 5 settled weeks that had them
+    # (-$147 net of +$139 outside them): the pre-print flow is informed.
+    "weekly": _env_f("CUD_MIN_SECS_LEFT_WEEKLY", 21600),
     "annual": _env_f("CUD_MIN_SECS_LEFT_ANNUAL", 86400),
 }
 
@@ -735,6 +739,7 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                              + (" with back-off" if c in self.skew_backoff_cadences else ""))
             if c in self.reduce_only_by_cadence:
                 parts.append(f"reduce-only at +-{self.reduce_only_by_cadence[c]:g} net")
+            parts.append(f"stand-down {MIN_SECS_LEFT.get(c, 900) / 3600:g}h before the print")
             if parts:
                 rules.append(f"{c}: " + ", ".join(parts))
         return f"risk rules v1.1 {'ON' if rules else 'off'}: {'; '.join(rules)}"
