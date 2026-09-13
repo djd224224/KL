@@ -1994,3 +1994,93 @@ families are excluded (in addition to current daily families)."
   no global window for dailies but own windows kept, Saturday skip) and the
   reworked `test_global_window_survives_outside_the_per_series_hours`
   (KXTRUEV keeps the window outside its 5pm rule; dailies do not).
+
+## 2026-09-13 — "New incentive programs" daily email (Jack)
+
+Jack: "new daily morning email, table of all the new incentive rewards events
+that started in the past day." New standalone `send_imm_new_programs.py` —
+the SUPPLY-side email, the one thing the morning lineup had no report for.
+The 7:10 digest is the bot's own book, the 7:20 quote-gaps email ranks
+markets that already pay and are not quoted, and the 6:45 sweeper only pings
+a new family once it clears `IMM_AUDIT_NEW_FAMILY_MIN_DPD` ($300/day). Every
+expensive surprise here has been a supply event seen late: 11 KXAVGT
+stations lit at ~$2,600/day on 2026-08-20 with nothing surfacing them, and
+KXTEMPMIAH's 2026-08-15 relaunch that left the bot dark on its top reward
+family for 16 days.
+
+One table, one row per EVENT whose liquidity programs started in the window:
+`EVENT | WHAT IT IS | MKTS | $/DAY | POOL$ | PROGRAM WINDOW (ET) | TGT | BOT`,
+sorted by $/day, TOTAL row across EVERY new event (row list is capped at
+`IMM_NEWPROG_MAX_ROWS`, the total is not). Headline leads with the pool
+actually on the table and the rate it pays at — those diverge hard on short
+programs (four $20 hourly markets = $80 of pool at a $1,920/day rate) — then
+bot-eligible / already-quoting / unearnable splits, then NEW SERIES and
+RELIT SERIES call-outs (a series back after >= `IMM_NEWPROG_RELIT_DAYS`
+dark: the KXTEMPMIAH class). Footer carries the whole feed's program count,
+event count and $/day with the delta vs the last email — the supply time
+series, in every email, for free.
+
+**How "new" is decided** — two conditions, both required: the event is not
+in the script's own seen-file (`run-logs\incentive-mm\imm_new_programs_seen.json`)
+AND the earliest program start across its markets is at or after the window
+start. Condition 1 alone floods the first run with the live feed; condition 2
+alone re-reports a long-running event the morning a fresh program period
+opens on it (the ROLL case). The window start is the last SUCCESSFUL send
+(the seen-file watermark), capped at `IMM_NEWPROG_MAX_LOOKBACK_HOURS` (168h),
+so a failed send or a skipped day is picked up by the next email instead of
+falling in a hole; with no watermark it is `IMM_NEWPROG_LOOKBACK_HOURS` (24h).
+An unknown event whose programs started BEFORE the window is a LATE ARRIVAL
+(second table, listed once the seen-file is seeded), not a new event.
+
+- **BOT column** from the bot's own machinery: `_allowed`/`_blocked` with
+  the extra-allow + finecon extension files hot-loaded, `selected_tickers`
+  from `imm_state.json` for "quoting k/n", and a red cutoff flag
+  (`UNEARNABLE` / `cutoff passed`) computed with the same guards as
+  `imm_feed_audit.run_audit` (close-anchored overrides and the mention
+  family are carved out — keep in sync). Config parity comes from importing
+  `imm_quote_gaps` FIRST, which mirrors the launcher's `$ProbeEnv` before
+  `incentive_mm`'s config is read (it logs "[GAPS] mirrored N launcher env
+  vars"; a 0 there means the allowlist columns ran on defaults).
+- **Coverage boundary**: the feed read is `status=active`, so a program that
+  both starts AND ends between two runs is invisible. Hourly families are not
+  in that hole (a current-hour program is always active). `--include-ended`
+  additionally pages `IMM_NEWPROG_ENDED_STATUSES` (settled, closed) for the
+  same window — off by default, because the size and ordering of the
+  historical feed (~76k rows) is not something a 7:30 AM email should
+  discover for the first time.
+- **Feed-health guard**: a feed under `IMM_NEWPROG_FEED_SHRINK` (25%) of the
+  last run's program count is treated as an API problem, not a supply event —
+  red banner, and the watermark is NOT advanced, so anything hidden today is
+  reported tomorrow. The seen-file is written only after a successful send
+  (a `--test` send counts; `--dry` never writes), for the same reason.
+- STRICTLY READ-ONLY: GETs only (feed pages + up to `IMM_NEWPROG_TITLES`=60
+  event-title reads, biggest pools first), no cycle, no orders, and the only
+  file written is its own seen-file.
+- Task **`KL imm new-programs`**, daily **7:30 AM ET** (after the 7:10
+  digest, 7:20 quote-gaps, 7:25 opportunistic), cmd.exe wrapper →
+  `run-logs\incentive-mm\new-programs-task.log`. Idempotent marker
+  (`imm_new_programs_sent_<date>.marker`), Modern-Standby retries (8×5min),
+  registry cred fallback, Alerter tag `IMM-NEWPROG`.
+- Flags: `--test` (send now, no marker) / `--dry` / `--print` (build + print,
+  write nothing) / `--since HOURS` (widen the window by hand) /
+  `--include-ended` / `--html-out FILE` (with `--dry`).
+- Tests: `python -m unittest test_send_imm_new_programs` (44) — centi-cent
+  and $/day math incl. the hourly floor, the ROLL case, late arrivals, the
+  window/watermark rules, the feed-shrink hold, the BOT column and cutoff
+  flags, row-cap totals, ASCII body, and main()'s marker/state writes.
+
+Recreate the task:
+```powershell
+$arg = '/c "set PYTHONPATH=C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages&& "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe" "C:\Users\jackd\Documents\KL\send_imm_new_programs.py" >> "C:\Users\jackd\Documents\KL\run-logs\incentive-mm\new-programs-task.log" 2>&1"'
+Register-ScheduledTask -TaskName 'KL imm new-programs' -Force `
+  -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $arg) `
+  -Trigger (New-ScheduledTaskTrigger -Daily -At '7:30AM') `
+  -Principal (New-ScheduledTaskPrincipal -UserId 'jackd' -LogonType Interactive -RunLevel Limited) `
+  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2))
+```
+
+**First run is a seeding run**: with no seen-file, every event already in the
+feed is recorded as known and only events that started inside the default 24h
+window can be reported — so the first email is small by construction and the
+footer says so. Run `python send_imm_new_programs.py --dry` once before
+registering the task to see what it would say.
