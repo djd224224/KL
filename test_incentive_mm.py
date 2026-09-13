@@ -1416,7 +1416,7 @@ class TestScanCapSixty(unittest.TestCase):
         self.assertEqual(imm.SCAN_TOP_N, 60)
         self.assertEqual(imm.SCAN_DAILY_OPENINGS, 0)
         self.assertEqual(imm.scan_ceiling(), 60)
-        self.assertEqual(imm.SCAN_MIN_ROI, 0.0)
+        self.assertEqual(imm.SCAN_MIN_ROI, 0.05)     # 5%/day, see the knob
 
     def test_every_free_seat_goes_to_the_best_roi_up_to_sixty_and_no_further(self):
         # 80 candidates on 80 events (the 3/event cap never binds), ROI
@@ -1424,6 +1424,8 @@ class TestScanCapSixty(unittest.TestCase):
         # openings spent, the 61st does not, whatever its pool
         cands = [self._m(f"KXS{i:03d}-26SEP20-T1", 8.0 - 0.1 * i, pool=1000.0 - i)
                  for i in range(80)]
+        # (every one of the top 60 clears the 5%/day bar by a wide margin:
+        # the 60th is $2.1/day on $10 at risk)
         cut = imm.scan_group_cut(cands, set(), members=set(),
                                  extra_openings=0, refill_to=0)
         kept = [c.ticker for c in cands if c.ticker not in cut]

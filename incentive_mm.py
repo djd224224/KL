@@ -2588,11 +2588,17 @@ SCAN_TOP_N = _env_int("IMM_SCAN_TOP_N", 60)
 SCAN_EVENT_TOP_N = _env_int("IMM_SCAN_EVENT_TOP_N", 3)
 # Minimum ROI (est $/day per $ at risk -- the walk's own ranking metric) for
 # a NEW scan admission; 0 = off, rank only. Members are never re-tested.
-# Left at 0 on 2026-09-13 with the numbers above in hand: the top 60 by ROI
-# sit far above any bar one would pick. For scale, IMM_SCAN_MIN_ROI=0.05
-# would have refused 79 of the 321 cut candidates and, at their own
-# admission, roughly nine in ten of the sitting members.
-SCAN_MIN_ROI = _env_float("IMM_SCAN_MIN_ROI", 0.0)
+# 0 -> 0.05 the same afternoon (2026-09-13 14:33Z, the first refresh on the
+# 60 cap): the 25 freed seats filled in ONE refresh with what a Sunday had
+# on offer -- state-statistics prints at est $0.09-0.68/day on ~$20 of
+# collateral -- leaving 50 of 54 members under 5%/day (median 1.0%), each
+# holding a seat to completion, which is exactly the shape Jack's "room for
+# high ROI" rules out. 5%/day is the whole book's own return on collateral
+# (est ~$450-550/day on ~$10.5k); it would have admitted only the four
+# chokepoint weeklies that morning (5.7-18.4%/day) and kept 242 of 263 of
+# Saturday's cap-cut candidates eligible. A seat under the bar stays EMPTY
+# for the next high-ROI arrival. Members already seated are not re-tested.
+SCAN_MIN_ROI = _env_float("IMM_SCAN_MIN_ROI", 0.05)
 # A departure is refilled in the SAME refresh, even above the cap (Jack
 # 2026-09-09). See _group_walk_cut's `refill_to`; bounded by scan_ceiling().
 SCAN_REFILL_ON_DEPARTURE = os.environ.get(
