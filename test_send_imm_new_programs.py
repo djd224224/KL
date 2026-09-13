@@ -640,6 +640,19 @@ class MainFlow(unittest.TestCase):
         self.assertFalse(os.path.exists(np.SEEN_PATH))
         self.assertFalse(os.path.exists(self._marker()))
 
+    def test_unwritable_marker_does_not_fail_a_delivered_email(self):
+        real_open = open
+
+        def fake_open(path, *a, **kw):
+            if str(path).endswith(".marker"):
+                raise OSError("read-only")
+            return real_open(path, *a, **kw)
+
+        with mock.patch("builtins.open", fake_open):
+            rc = self._run([])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(FakeAlerter.sent), 1)
+
     def test_failed_send_writes_no_state(self):
         FakeAlerter.ok = False
         with mock.patch.object(np.time, "sleep", lambda *_a: None):
