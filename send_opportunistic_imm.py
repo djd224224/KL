@@ -99,6 +99,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -252,6 +253,82 @@ def tier_of(ticker_or_event: str, fin, scan_set) -> str:
 # files are ever archived off — the repo has lost data to silent retention
 # twice, so the durable copy is the point, not the speed.
 ROSTER_PATH = os.path.join(imm.STATUS_DIR, "opportunistic_roster.json")
+# NEW-SINCE-LAST-EMAIL (Jack 2026-09-13: "always bold the events that are
+# new (werent in the previous email)"). Every SENT email (scheduled or
+# --test, never --dry) records the events its tables showed; the next
+# build bolds the rows whose event is not in that record. Before the first
+# record exists, the previous email is recovered from the task log, which
+# has always carried each sent body verbatim ("opportunistic body:" ...
+# "opportunistic send: ok").
+LAST_SENT_PATH = os.path.join(imm.STATUS_DIR, "opportunistic_last_sent.json")
+TASK_LOG_PATH = os.path.join(imm.STATUS_DIR, "opportunistic-task.log")
+_LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})Z ")
+_ROW_EVENT_RE = re.compile(r"^[A-Z0-9]+-[A-Z0-9.-]+$")
+
+
+def parse_last_sent_body(log_text: str):
+    """(sent_at, {short event names}) of the LAST body in the task log that
+    was actually sent (its block is followed by 'opportunistic send: ok'
+    before the next body), else (None, None). A --dry body is logged too and
+    must not count as an email anyone saw. Table rows are recognised by
+    their first column: a short event name (the KX prefix dropped) in the
+    27-character EVENT field; header, TOTAL and prose lines never match."""
+    blocks = []      # [start_line_index, ts, sent_ok]
+    lines = log_text.splitlines()
+    for i, line in enumerate(lines):
+        m = _LOG_TS_RE.match(line)
+        if not m:
+            continue
+        if line.endswith("opportunistic body:"):
+            blocks.append([i, m.group(1) + "Z", False])
+        elif "opportunistic send: ok" in line and blocks:
+            blocks[-1][2] = True
+    sent = [b for b in blocks if b[2]]
+    if not sent:
+        return None, None
+    start, ts, _ok = sent[-1]
+    events = set()
+    for line in lines[start + 1:]:
+        if _LOG_TS_RE.match(line):
+            break
+        first = line[:27].strip()
+        if first and first not in ("EVENT", "TOTAL", "TIER") \
+                and _ROW_EVENT_RE.match(first):
+            events.add(first)
+    return ts, events
+
+
+def previous_email_events():
+    """(sent_at, {short event names}, source) for the previous SENT email:
+    the persisted record first, the task-log body as the fallback, and
+    (None, None, 'none') when neither exists -- in which case nothing is
+    bolded and the email says so, rather than bolding everything."""
+    rec = load_json(LAST_SENT_PATH) or {}
+    if rec.get("events") is not None:
+        return (str(rec.get("sent_at") or ""),
+                {_short_event(str(e)) for e in rec.get("events") or []},
+                "record")
+    try:
+        with open(TASK_LOG_PATH, encoding="utf-8", errors="replace") as f:
+            ts, evs = parse_last_sent_body(f.read())
+    except OSError:
+        ts, evs = None, None
+    if evs is None:
+        return None, None, "none"
+    return ts, evs, "log"
+
+
+def write_last_sent(now_utc, events) -> None:
+    """Best-effort, after a successful send only."""
+    try:
+        tmp = LAST_SENT_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"sent_at": now_utc.isoformat(),
+                       "events": sorted(set(events))}, f)
+        os.replace(tmp, LAST_SENT_PATH)
+    except OSError as e:
+        log(f"opportunistic last-sent record not written ({e!r}); the next "
+            f"email falls back to the task log")
 
 
 def account_realized(client) -> tuple:
@@ -474,7 +551,7 @@ def tier_totals(rows) -> dict:
             "earn": earn, "pnl": pnl, "net": earn + pnl}
 
 
-def text_table(rows) -> list:
+def text_table(rows, new_events=frozenset()) -> list:
     """Plain-text event table + TOTAL row. One call per tier, so the two
     tiers' tables are identical in format by construction.
 
@@ -498,7 +575,10 @@ def text_table(rows) -> list:
         # yet, so its period accrual is UNMEASURABLE, not nil
         per = r.get("period")
         per_s = f"{per:,.2f}" if per is not None else "-"
-        L.append(f"{_short_event(r['event'])[:26]:<27}{r['label'][:28]:<29}"
+        # '*' = new since the previous email (the HTML twin bolds the row)
+        _name = (("*" if r["event"] in new_events else "")
+                 + _short_event(r["event"]))[:26]
+        L.append(f"{_name:<27}{r['label'][:28]:<29}"
                  f"{r['mkts']:>5}{(r.get('held') or ''):>5}"
                  f"{per_s:>9}{r['earn']:>11.2f}{cred_s:>9}"
                  f"{r['pnl']:>+10.2f}{r['net']:>+10.2f}")
@@ -509,8 +589,16 @@ def text_table(rows) -> list:
     return L
 
 
-def html_table(rows) -> str:
-    """HTML twin of text_table (same columns, same TOTAL row)."""
+_NEW_BADGE = ('<span style="background:#ffd54a;color:#333;font-size:10px;'
+              'font-weight:700;padding:0 4px;border-radius:3px;'
+              'margin-left:5px;vertical-align:middle">NEW</span>')
+
+
+def html_table(rows, new_events=frozenset()) -> str:
+    """HTML twin of text_table (same columns, same TOTAL row). Since
+    2026-09-13 the EVENT cell is bold ONLY for a row new since the previous
+    email (plus a NEW badge); the rest sit in normal weight so the new ones
+    stand out."""
     t = tier_totals(rows)
     h = ['<table style="border-collapse:collapse;margin:6px 0">']
     h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
@@ -526,8 +614,11 @@ def html_table(rows) -> str:
         cred = r.get("cred") or 0.0
         per = r.get("period")
         per_s = f'{per:,.2f}' if per is not None else '&mdash;'
+        _new = r["event"] in new_events
+        _ev = (f'<b>{_short_event(r["event"])}</b>{_NEW_BADGE}' if _new
+               else _short_event(r["event"]))
         h.append(f'<tr style="background:{bg}">'
-                 f'<td style="{TDL}"><b>{_short_event(r["event"])}</b></td>'
+                 f'<td style="{TDL}">{_ev}</td>'
                  f'<td style="{TDL}">{r["label"]}</td>'
                  f'<td style="{TD}">{r["mkts"]}</td>'
                  f'<td style="{TD};color:#888">{held or ""}</td>'
@@ -884,6 +975,23 @@ def build_report(now_utc):
     subject = (f"Opportunistic IMM {today_et} — est ${tot_earn:,.0f} accrued, "
                f"net ${tot_net:+,.0f} (${cred_life:,.0f} paid to date)")
 
+    # ---- new since the previous email (Jack 2026-09-13) ---------------------
+    prev_at, prev_short, prev_src = previous_email_events()
+    if prev_short is None:
+        new_events = set()
+        new_note = ("no previous email on record, so nothing is marked new "
+                    "this time")
+    else:
+        new_events = {r["event"] for r in rows
+                      if _short_event(r["event"]) not in prev_short}
+        _when = (prev_at or "?")[:16].replace("T", " ")
+        new_note = (f"{len(new_events)} new event(s) since the previous email "
+                    f"(sent {_when}Z" + (", recovered from the task log"
+                                         if prev_src == "log" else "") + ")")
+    new_list = sorted(_short_event(e) for e in new_events)
+    if len(new_list) > 12:
+        new_list = new_list[:12] + [f"+{len(new_events) - 12} more"]
+
     # ---- plain text ---------------------------------------------------------
     L = [f"Opportunistic IMM — {today_et}", ""]
     L.append(f"ACTIVE — {len(rows)} events / {tot_mkts} markets quoted "
@@ -892,12 +1000,15 @@ def build_report(now_utc):
                 else "."))
     L.append(f"Est reward accrued ${tot_earn:,.2f}  |  trading P&L "
              f"${tot_pnl:+,.2f}  |  net ${tot_net:+,.2f}.")
+    L.append(f"NEW: {new_note}"
+             + (": " + ", ".join(new_list) if new_list else "")
+             + ". '*' marks a new row below.")
     L.append("")
     for name, desc, slots, trows in tiers:
         L.append(f"{name} — {desc}")
         L.append(f"{slots}.")
         if trows:
-            L.extend(text_table(trows))
+            L.extend(text_table(trows, new_events))
         else:
             L.append(f"No {name.lower()} events quoted right now.")
         L.append("")
@@ -965,6 +1076,11 @@ def build_report(now_utc):
                 if tot_held else '')
              + (f' &nbsp;·&nbsp; <b style="color:#0a7">${cred_life:,.2f}</b>'
                 f' credited to date' if cred_life else '') + '</div>')
+    h.append(f'<div style="color:#555;font-size:13px;margin-bottom:6px">'
+             f'{_NEW_BADGE} {new_note}'
+             + (': <b>' + '</b>, <b>'.join(new_list) + '</b>' if new_list
+                else '')
+             + '. Bold rows below are new since the previous email.</div>')
     for name, desc, slots, trows in tiers:
         h.append(f'<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
                  f'{name} <span style="color:#888;font-weight:400">&mdash; '
@@ -972,7 +1088,7 @@ def build_report(now_utc):
         h.append(f'<div style="color:#555;font-size:13px;margin-bottom:4px">'
                  f'{slots}</div>')
         if trows:
-            h.append(html_table(trows))
+            h.append(html_table(trows, new_events))
         else:
             h.append(f'<div style="color:#666;font-size:13px">No '
                      f'{name.lower()} events quoted right now.</div>')
@@ -1030,7 +1146,7 @@ def build_report(now_utc):
              f'is the open book right now. NET = EST + REALIZED + MTM, the '
              f'same estimate basis as the tables above.</div>')
     h.append('</div>')
-    return text, "".join(h), subject
+    return text, "".join(h), subject, sorted(r["event"] for r in rows)
 
 
 def main(argv=None) -> int:
@@ -1054,9 +1170,10 @@ def main(argv=None) -> int:
 
     attempts = 1 if (args.test or dry) else 8
     text = html = subject = None
+    shown_events: list = []
     for attempt in range(1, attempts + 1):
         try:
-            text, html, subject = build_report(now_utc)
+            text, html, subject, shown_events = build_report(now_utc)
             break
         except Exception as e:
             log(f"opportunistic build attempt {attempt}/{attempts} failed: {e!r}")
@@ -1081,6 +1198,10 @@ def main(argv=None) -> int:
         if attempt < attempts:
             time.sleep(300)
     log(f"opportunistic send: {'ok' if ok else 'FAILED'}")
+    if ok:
+        # a --test send is still an email Jack saw: the next one is judged
+        # against it
+        write_last_sent(now_utc, shown_events)
     if ok and not args.test:
         with open(marker, "w") as f:
             f.write(now_utc.isoformat())
