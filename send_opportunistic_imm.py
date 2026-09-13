@@ -857,8 +857,10 @@ def build_report(now_utc):
          f"openings used", fin_rows),
         ("OPEN SCAN", "all other markets, machine-screened for adverse "
          "selection",
-         f"{len(scan_sel)}/{scan_top_n} slots, +{scan_used}/"
-         f"{scan_openings_cap} daily openings used"
+         f"{len(scan_sel)}/{scan_top_n} slots, "
+         + (f"+{scan_used}/{scan_openings_cap} daily openings used"
+            if scan_openings_cap > 0
+            else f"hard cap {scan_top_n}, no daily openings")
          + (", HALTED today (loss budget)" if scan_halted else "")
          + (f", {scan_evicted} event(s) evicted" if scan_evicted else ""),
          scan_rows),

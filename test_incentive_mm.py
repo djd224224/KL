@@ -1397,6 +1397,96 @@ class TestPayoutFloorOneFifty(unittest.TestCase):
         self.assertEqual(cfg.get("code:PAYOUT_FLOOR_DOLLARS"), "1.0")
 
 
+class TestScanCapSixty(unittest.TestCase):
+    """Jack 2026-09-13: "open scan should always have room for more markets,
+    if they are high ROI. with a hard cap of 60. should scan for new
+    available markets hourly"."""
+
+    @staticmethod
+    def _m(t, est, pool=20.0, exposure=10.0):
+        return imm.MarketMeta(
+            ticker=t, event_ticker=t.rsplit("-", 1)[0],
+            series=t.split("-")[0], dollars_per_day=pool, program_end=None,
+            target_size=1000, discount_factor=0.5, cutoff=None,
+            close_time=None, est_dollars_per_day=est,
+            est_exposure_dollars=exposure, est_collateral_dollars=0.0,
+            scan=True)
+
+    def test_flat_hard_cap_of_sixty(self):
+        self.assertEqual(imm.SCAN_TOP_N, 60)
+        self.assertEqual(imm.SCAN_DAILY_OPENINGS, 0)
+        self.assertEqual(imm.scan_ceiling(), 60)
+        self.assertEqual(imm.SCAN_MIN_ROI, 0.0)
+
+    def test_every_free_seat_goes_to_the_best_roi_up_to_sixty_and_no_further(self):
+        # 80 candidates on 80 events (the 3/event cap never binds), ROI
+        # 80%/day down to 0.5%/day: the top 60 get in on ONE refresh with no
+        # openings spent, the 61st does not, whatever its pool
+        cands = [self._m(f"KXS{i:03d}-26SEP20-T1", 8.0 - 0.1 * i, pool=1000.0 - i)
+                 for i in range(80)]
+        cut = imm.scan_group_cut(cands, set(), members=set(),
+                                 extra_openings=0, refill_to=0)
+        kept = [c.ticker for c in cands if c.ticker not in cut]
+        self.assertEqual(len(kept), 60)
+        self.assertEqual(kept, [c.ticker for c in cands[:60]])
+        self.assertEqual(imm.scan_openings_used(60, 0), 0)
+        # a fresh day's openings (there are none) cannot push past 60
+        cut2 = imm.scan_group_cut(cands, set(), members=set(kept),
+                                  extra_openings=imm.scan_openings_allowed(
+                                      datetime(2026, 9, 13, 12, tzinfo=timezone.utc)),
+                                  refill_to=60)
+        self.assertEqual(len(cands) - len(cut2), 60)
+
+    def test_min_roi_keeps_seats_empty_rather_than_filling_them(self):
+        cands = [self._m(f"KXS{i:03d}-26SEP20-T1", 8.0 - 0.1 * i) for i in range(80)]
+        with mock.patch.object(imm, "SCAN_MIN_ROI", 0.5):     # 50%/day
+            cut = imm.scan_group_cut(cands, set(), members=set())
+        kept = {c.ticker for c in cands} - cut
+        # est >= 5.0 on $10 at risk clears 50%/day: i <= 30 -> 31 seats used
+        self.assertEqual(len(kept), 31)
+        self.assertTrue(all(imm._raw_roi(c) >= 0.5 for c in cands
+                            if c.ticker in kept))
+        # members are never re-tested against the bar
+        with mock.patch.object(imm, "SCAN_MIN_ROI", 0.99):
+            cut3 = imm.scan_group_cut(cands, set(), members=kept)
+        self.assertTrue(kept.isdisjoint(cut3))
+
+    def test_tail_sweep_covers_the_whole_tail_once_an_hour(self):
+        # 9/12 shape: 7,800 under the bulk cap, 600s refreshes, 1h sweep
+        seen, cursor = [], 0
+        for _ in range(6):
+            idx, cursor = imm.scan_tail_slice(7800, cursor, 600, 1.0)
+            self.assertEqual(len(idx), 1300)
+            seen += idx
+        self.assertEqual(sorted(seen), list(range(7800)))
+        self.assertEqual(cursor, 0)                     # wrapped exactly
+        # wrap in the middle of a slice
+        idx, cursor = imm.scan_tail_slice(7800, 7500, 600, 1.0)
+        self.assertEqual(idx[:300], list(range(7500, 7800)))
+        self.assertEqual(idx[300:], list(range(0, 1000)))
+        self.assertEqual(cursor, 1000)
+        # off, or nothing to sweep: empty and the cursor untouched
+        self.assertEqual(imm.scan_tail_slice(7800, 42, 600, 0.0), ([], 42))
+        self.assertEqual(imm.scan_tail_slice(0, 42, 600, 1.0), ([], 42))
+        # a tiny tail is read whole every refresh
+        self.assertEqual(imm.scan_tail_slice(3, 0, 600, 1.0), ([0, 1, 2], 0))
+        self.assertEqual(imm.SCAN_SWEEP_HOURS, 1.0)
+
+    def test_book_budget_goes_to_the_least_recently_estimated_first(self):
+        a = self._m("KXA-26SEP20-T1", 1.0, pool=10.0)    # never estimated
+        b = self._m("KXB-26SEP20-T1", 1.0, pool=50.0)    # seen most recently
+        c = self._m("KXC-26SEP20-T1", 1.0, pool=20.0)    # seen a while ago
+        d = self._m("KXD-26SEP20-T1", 1.0, pool=30.0)    # never estimated, richer
+        order = imm.scan_book_order([a, b, c, d], {"KXB-26SEP20-T1": 100.0,
+                                                   "KXC-26SEP20-T1": 50.0})
+        self.assertEqual([m.ticker for m in order],
+                         ["KXD-26SEP20-T1", "KXA-26SEP20-T1",
+                          "KXC-26SEP20-T1", "KXB-26SEP20-T1"])
+        self.assertEqual(imm.SCAN_MAX_BOOKS, 120)
+        self.assertEqual((imm.SCAN_MAX_SERIES_FETCHES, imm.SCAN_MAX_HISTORY_FETCHES),
+                         (60, 80))
+
+
 class TestAllowlist(unittest.TestCase):
     def setUp(self):
         self._old = imm.ALLOWLIST_ONLY
@@ -8568,8 +8658,8 @@ class TestOpportunisticEmail(unittest.TestCase):
         L, html = sd.finecon_section(state, w, today)
         text = "\n".join(L)
         self.assertIn("OPEN SCAN", text)
-        self.assertIn(f"Quoting 1/{imm.SCAN_TOP_N} slots (+2/{imm.SCAN_DAILY_OPENINGS}",
-                      text)
+        self.assertIn(f"Quoting 1/{imm.SCAN_TOP_N} slots (hard cap "
+                      f"{imm.SCAN_TOP_N}, no daily openings)", text)
         self.assertIn("1 event(s) evicted", text)
         self.assertIn("KXNOVEL-99DEC31-T5", text)
         self.assertNotIn("HALTED", text)
@@ -9663,11 +9753,12 @@ class TestOpenScanTier(unittest.TestCase):
                 est_exposure_dollars=10.0, est_collateral_dollars=0.0,
                 scan=scan)
         # the walk MECHANICS are what this pins; the production slot count
-        # moved 15 -> 30 on 2026-09-07 and must not break the fixture
-        self.assertEqual(imm.SCAN_TOP_N, 30)
+        # moved 15 -> 30 on 2026-09-07 and 30 -> 60 (hard cap, openings 0)
+        # on 2026-09-13, and neither must break the fixture
+        self.assertEqual(imm.SCAN_TOP_N, 60)
         self.enterContext(mock.patch.object(imm, "SCAN_TOP_N", 15))
         self.assertEqual(imm.SCAN_EVENT_TOP_N, 3)
-        self.assertEqual(imm.SCAN_DAILY_OPENINGS, 5)
+        self.assertEqual(imm.SCAN_DAILY_OPENINGS, 0)
         # 5 strikes of one event with the best ROIs: only 3 survive, the
         # slack flows to other events; a non-scan meta is never touched
         ev1 = [m(f"KXAAA-26SEP09-T{i}", 9.0 - i) for i in range(5)]
@@ -9969,6 +10060,11 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertTrue(imm.SCAN_REFILL_ON_DEPARTURE)
         self.assertEqual(imm.scan_ceiling(),
                          imm.SCAN_TOP_N + imm.SCAN_DAILY_OPENINGS)
+        # refill/bleed-down MECHANICS need a ceiling ABOVE the cap; since
+        # 2026-09-13 production runs cap 60 with 0 openings (ceiling == cap),
+        # so pin the fixture to the 30/5 shape the semantics were built on
+        self.enterContext(mock.patch.object(imm, "SCAN_TOP_N", 30))
+        self.enterContext(mock.patch.object(imm, "SCAN_DAILY_OPENINGS", 5))
 
         def m(t, est):
             return imm.MarketMeta(
@@ -10050,11 +10146,18 @@ class TestOpenScanTier(unittest.TestCase):
         single refresh after ET midnight on 2026-09-08, committing the day's
         whole expansion budget to whatever was eligible at 00:00 ET."""
         self.assertTrue(imm.SCAN_OPENINGS_PACED)
-        n = imm.SCAN_DAILY_OPENINGS
 
         def at(h, mi=0):
             naive = datetime(2026, 9, 9, h, mi)
             return imm.ET.localize(naive).astimezone(timezone.utc)
+
+        # production since 2026-09-13: NO openings at all, at any hour
+        self.assertEqual(imm.SCAN_DAILY_OPENINGS, 0)
+        self.assertEqual([imm.scan_openings_allowed(at(h)) for h in (0, 12, 23)],
+                         [0, 0, 0])
+        # the pacing mechanics, for anyone who sets openings again
+        self.enterContext(mock.patch.object(imm, "SCAN_DAILY_OPENINGS", 5))
+        n = imm.SCAN_DAILY_OPENINGS
 
         # ramps 1 -> n across the day, never 0, never over the daily budget
         self.assertEqual(imm.scan_openings_allowed(at(0, 0)), 1)

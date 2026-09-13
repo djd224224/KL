@@ -1643,6 +1643,12 @@ def event_top_n_for(series: str) -> int:
     return 0
 
 
+def _raw_roi(m: "MarketMeta") -> float:
+    """est $/day per $ at risk, no stickiness: the bar SCAN_MIN_ROI tests."""
+    denom = m.est_exposure_dollars or m.est_collateral_dollars
+    return (m.est_dollars_per_day / denom) if denom else 0.0
+
+
 def _market_roi(m: "MarketMeta", incumbent: Set[str]) -> float:
     """The ranking ROI shared by every top-N cut: est $/day per $ at risk
     (fill-weighted exposure, falling back to plain collateral; unpriceable
@@ -2399,7 +2405,7 @@ FINECON_DAILY_OPENINGS = _env_int("IMM_FINECON_DAILY_OPENINGS", 10)
 def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
                     members: Set[str], top_n: int, event_top_n: int,
                     extra_openings: int = 0, refill_to: int = 0,
-                    hard_cap: int = 0) -> Set[str]:
+                    hard_cap: int = 0, min_roi: float = 0.0) -> Set[str]:
     """The shared admission-only group walk (finecon since 2026-09-03; the
     open-scan tier since 2026-09-05): tickers of `group` to EXCLUDE.
     Members are never cut and consume their global and per-event slots
@@ -2438,6 +2444,11 @@ def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
         if len(keep) >= admit_cap:
             break
         if 0 < event_top_n <= per_event.get(m.event_ticker, 0):
+            continue
+        # `min_roi` (2026-09-13, open scan only): a seat stays EMPTY rather
+        # than go to a newcomer under the bar -- the raw ratio, without the
+        # incumbent stickiness the ranking applies
+        if min_roi > 0 and _raw_roi(m) < min_roi:
             continue
         keep.add(m.ticker)
         per_event[m.event_ticker] = per_event.get(m.event_ticker, 0) + 1
@@ -2560,8 +2571,28 @@ def finecon_openings_used(n_kept: int, n_members: int) -> int:
 # nowhere near its risk limit — $36 of collateral deployed and -$1.90 MTM
 # against a $75/day loss budget — so the slot count, not the exposure, was
 # the binding constraint.
-SCAN_TOP_N = _env_int("IMM_SCAN_TOP_N", 30)
+# 30 -> 60 HARD CAP, openings retired (Jack 2026-09-13: "open scan should
+# always have room for more markets, if they are high ROI. with a hard cap
+# of 60. should scan for new available markets hourly"). Measured over
+# 9/12-9/13 before the change: the cap cut 321 distinct candidates
+# (decision scan_top_n) with a median ROI of 8.1%/day -- 116 of them above
+# 10%/day, the best 60 all above 16%/day -- while the sitting members,
+# admitted whenever a seat happened to be free and quoting to completion,
+# had a median ROI of 1.7%/day. Slots, not screens or risk, were binding
+# again. The cap is now a flat 60 (SCAN_DAILY_OPENINGS 0 -> scan_ceiling()
+# == SCAN_TOP_N): the walk fills every free seat best-ROI-first on every
+# refresh, no pacing and no daily allowance, and SCAN_MIN_ROI below can
+# hold seats empty for high-ROI arrivals instead of filling them with
+# whatever happens to be eligible.
+SCAN_TOP_N = _env_int("IMM_SCAN_TOP_N", 60)
 SCAN_EVENT_TOP_N = _env_int("IMM_SCAN_EVENT_TOP_N", 3)
+# Minimum ROI (est $/day per $ at risk -- the walk's own ranking metric) for
+# a NEW scan admission; 0 = off, rank only. Members are never re-tested.
+# Left at 0 on 2026-09-13 with the numbers above in hand: the top 60 by ROI
+# sit far above any bar one would pick. For scale, IMM_SCAN_MIN_ROI=0.05
+# would have refused 79 of the 321 cut candidates and, at their own
+# admission, roughly nine in ten of the sitting members.
+SCAN_MIN_ROI = _env_float("IMM_SCAN_MIN_ROI", 0.0)
 # A departure is refilled in the SAME refresh, even above the cap (Jack
 # 2026-09-09). See _group_walk_cut's `refill_to`; bounded by scan_ceiling().
 SCAN_REFILL_ON_DEPARTURE = os.environ.get(
@@ -2576,7 +2607,9 @@ SCAN_REFILL_ON_DEPARTURE = os.environ.get(
 # 1 -> SCAN_DAILY_OPENINGS over the day, so later, better candidates can
 # still buy a seat. 0 = off (all openings available immediately).
 SCAN_OPENINGS_PACED = os.environ.get("IMM_SCAN_OPENINGS_PACED", "1") == "1"
-SCAN_DAILY_OPENINGS = _env_int("IMM_SCAN_DAILY_OPENINGS", 5)
+# 5 -> 0 (2026-09-13): the cap IS the ceiling now, see SCAN_TOP_N. The
+# pacing machinery stays intact for anyone who sets this above 0 again.
+SCAN_DAILY_OPENINGS = _env_int("IMM_SCAN_DAILY_OPENINGS", 0)
 # Sizing = the NORMAL BOOK's (Jack 2026-09-05 pm: "it can have the same
 # contracts/max net position/deep reference/overnight size as the normal
 # book"): global ladder, global net cap, the full deep-reference multiplier,
@@ -2702,9 +2735,50 @@ SCAN_SERIES_META_TTL_SECS = _env_float("IMM_SCAN_SERIES_META_TTL_D", 7) * 86400.
 # from the scan line: nothing young enough survived the cap). 2000 covers
 # rank ~1588 with headroom; cost 20 -> 40 bulk reads per refresh.
 SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 2000)
+# HOURLY TAIL SWEEP (Jack 2026-09-13 "should scan for new available markets
+# hourly"). Everything under the bulk cap was never hydrated at all: 7,800
+# of ~9,800 string-screened markets per refresh on 9/12, and the SAME
+# 7,800 every refresh, because the cut is pool-ranked and pools barely
+# move between refreshes. Each refresh now also hydrates a rotating slice
+# of that tail, sized so the whole tail is read once per SCAN_SWEEP_HOURS
+# at the UNIVERSE_REFRESH_SECS cadence (~1,300 markets, 26 bulk reads, per
+# 600s refresh on 9/12's numbers). The slice goes through exactly the
+# screens the head does. 0 = off (the pre-2026-09-13 behaviour).
+SCAN_SWEEP_HOURS = _env_float("IMM_SCAN_SWEEP_H", 1.0)
 SCAN_MAX_BOOKS = _env_int("IMM_SCAN_MAX_BOOKS", 120)
-SCAN_MAX_SERIES_FETCHES = _env_int("IMM_SCAN_MAX_SERIES_FETCHES", 30)
-SCAN_MAX_HISTORY_FETCHES = _env_int("IMM_SCAN_MAX_HISTORY_FETCHES", 40)
+# 30/40 -> 60/80 (2026-09-13): the tail sweep brings first-sight markets
+# every refresh, each needing a series verdict and a candle read before it
+# can be judged; both are cached (7d / 6h) so steady state stays cheap.
+SCAN_MAX_SERIES_FETCHES = _env_int("IMM_SCAN_MAX_SERIES_FETCHES", 60)
+SCAN_MAX_HISTORY_FETCHES = _env_int("IMM_SCAN_MAX_HISTORY_FETCHES", 80)
+
+
+def scan_tail_slice(tail_len: int, cursor: int, refresh_secs: float,
+                    sweep_hours: Optional[float] = None
+                    ) -> Tuple[List[int], int]:
+    """Indexes of the bulk-cap tail to hydrate THIS refresh, and the
+    advanced cursor. Sized so `tail_len` entries are each read once per
+    `sweep_hours` at one refresh per `refresh_secs`; wraps around; empty
+    (cursor untouched) when the sweep is off or there is no tail."""
+    if sweep_hours is None:
+        sweep_hours = SCAN_SWEEP_HOURS
+    if tail_len <= 0 or sweep_hours <= 0 or refresh_secs <= 0:
+        return [], cursor
+    k = min(tail_len, max(1, int(math.ceil(
+        tail_len * float(refresh_secs) / (sweep_hours * 3600.0)))))
+    start = cursor % tail_len
+    return [(start + i) % tail_len for i in range(k)], (start + k) % tail_len
+
+
+def scan_book_order(admissible: List["MarketMeta"],
+                    seen: Dict[str, float]) -> List["MarketMeta"]:
+    """Order for the per-refresh book budget (2026-09-13): never-estimated
+    first, then the longest-unestimated, richest pool as the tie-break --
+    so every admissible market gets its estimate within
+    ceil(admissible / SCAN_MAX_BOOKS) refreshes instead of the same
+    top-pool names taking the whole budget every time."""
+    return sorted(admissible,
+                  key=lambda m: (seen.get(m.ticker, 0.0), -m.dollars_per_day))
 # Per-event eviction tripwires: OFF by default (0), Jack 2026-09-05 pm
 # "dont need these". The first cut shipped fill 8 / mid jump 8c / drift 15c
 # on a 10-lot rung; on the normal ladder the sane fill bar would be 15
@@ -3218,7 +3292,7 @@ def scan_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
                            SCAN_TOP_N, SCAN_EVENT_TOP_N, extra_openings,
                            refill_to=refill_to if SCAN_REFILL_ON_DEPARTURE
                            else 0,
-                           hard_cap=scan_ceiling())
+                           hard_cap=scan_ceiling(), min_roi=SCAN_MIN_ROI)
 
 
 def scan_openings_used(n_kept: int, n_members: int) -> int:
@@ -5716,6 +5790,10 @@ class IncentiveMarketMaker:
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
+        # open-scan discovery rotation (2026-09-13), deliberately not
+        # persisted: a restart just starts the sweep over
+        self._scan_tail_cursor: int = 0            # scan_tail_slice cursor
+        self._scan_book_seen: Dict[str, float] = {}  # ticker -> last estimate ts
         # Book/reward panel from the last cycle, per ticker. The fills sink
         # reads it to answer "what did the book look like when this filled?"
         # without a second API call — a fill arrives one cycle AFTER the book
@@ -7059,6 +7137,16 @@ class IncentiveMarketMaker:
                 _keep = scan_pre[:SCAN_MAX_BULK] + [
                     kv for kv in scan_pre[SCAN_MAX_BULK:]
                     if kv[0] in self.state.scan_members]
+                # HOURLY TAIL SWEEP (2026-09-13, see SCAN_SWEEP_HOURS): a
+                # rotating slice of what the pool-ranked cap would otherwise
+                # never hydrate, so the whole tail is screened once an hour
+                _tail = [kv for kv in scan_pre[SCAN_MAX_BULK:]
+                         if kv[0] not in self.state.scan_members]
+                _idx, self._scan_tail_cursor = scan_tail_slice(
+                    len(_tail), self._scan_tail_cursor, UNIVERSE_REFRESH_SECS)
+                if _idx:
+                    _keep += [_tail[i] for i in _idx]
+                    scan_skips["tail_swept"] = len(_idx)
                 scan_skips["bulk_cap"] = len(scan_pre) - len(_keep)
                 scan_pre = _keep
         scan_pre_set = {t for t, _i in scan_pre}
@@ -7204,7 +7292,7 @@ class IncentiveMarketMaker:
                       "history": SCAN_MAX_HISTORY_FETCHES}
             scan_halted = self.state.scan_halt_day == _et_today
             scan_metas.sort(key=lambda mm: -mm[0].dollars_per_day)
-            n_scan_books = 0
+            _admissible: List[MarketMeta] = []
             for _meta, _m in scan_metas:
                 if scan_halted:
                     scan_skips["scan_halted"] = scan_skips.get("scan_halted", 0) + 1
@@ -7214,12 +7302,31 @@ class IncentiveMarketMaker:
                     if why is not None:
                         scan_skips[why] = scan_skips.get(why, 0) + 1
                         continue
-                    if n_scan_books >= SCAN_MAX_BOOKS:
-                        scan_skips["book_cap"] = scan_skips.get("book_cap", 0) + 1
-                        continue
-                    n_scan_books += 1
+                    _admissible.append(_meta)
+                    continue
                 ensure_scan_override(_meta.series)
                 metas.append(_meta)
+            # BOOK BUDGET BY LEAST-RECENTLY-ESTIMATED (2026-09-13 "scan for
+            # new available markets hourly"): the budget went to the same
+            # top-SCAN_MAX_BOOKS pools every refresh, so an admissible market
+            # under that line was never estimated at all (`book_cap` 45-612
+            # per refresh on 9/11-9/12, the same names each time). See
+            # scan_book_order: every admissible market is estimated within
+            # ceil(admissible / SCAN_MAX_BOOKS) refreshes -- two, at 9/12's
+            # 155-213 eligible against 120. Members skip the budget as before.
+            _seen = self._scan_book_seen
+            _now_ts = now_utc.timestamp()
+            for _i, _meta in enumerate(scan_book_order(_admissible, _seen)):
+                if _i >= SCAN_MAX_BOOKS:
+                    scan_skips["book_cap"] = scan_skips.get("book_cap", 0) + 1
+                    continue
+                _seen[_meta.ticker] = _now_ts
+                ensure_scan_override(_meta.series)
+                metas.append(_meta)
+            # forget names that left the candidate set (memory hygiene)
+            _live = {_meta.ticker for _meta, _m in scan_metas}
+            for _t in [t for t in _seen if t not in _live]:
+                _seen.pop(_t, None)
 
         # Pass 1: hard screens (+ yield-to-human: never select a market the
         # user is trading manually — divergence vs our own book, a foreign
@@ -7760,8 +7867,9 @@ class IncentiveMarketMaker:
             log(f"{self.tag} open-scan: {len(scan_pre)} string-screened -> "
                 f"{sum(1 for m in metas if m.scan)} eligible -> "
                 f"{len(new_scan)}/{SCAN_TOP_N} members "
-                f"(+{self.state.scan_admits_today}/{SCAN_DAILY_OPENINGS} "
-                f"openings used today"
+                + (f"(+{self.state.scan_admits_today}/{SCAN_DAILY_OPENINGS} "
+                   f"openings used today" if SCAN_DAILY_OPENINGS > 0
+                   else f"(hard cap {scan_ceiling()}")
                 + (", HALTED today" if self.state.scan_halt_day == et_today else "")
                 + f"); rejects {dict(sorted(scan_skips.items()))}")
 

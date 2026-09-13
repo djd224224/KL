@@ -1848,12 +1848,15 @@ def finecon_section(state, w, today_ct):
         s_halted = state.get("scan_halt_day") == today_ct.isoformat()
         s_evicted = len(state.get("scan_evicted_events") or {})
         s_acc = sum(_f(accrued.get(t)) for t in scan_members)
+        s_open = ("+{}/{} daily openings used".format(s_used, s_cap)
+                  if s_cap > 0 else
+                  "hard cap {}, no daily openings".format(scan_top))
         L.append("OPEN SCAN (all-market tier, top-{} by ROI, machine-screened "
                  "for adverse selection, quote-to-completion)".format(scan_top))
-        L.append("Quoting {}/{} slots (+{}/{} daily openings used){}; {} "
+        L.append("Quoting {}/{} slots ({}){}; {} "
                  "event(s) evicted by tripwires to date; est accrued this "
                  "period ${:,.2f} across members.".format(
-                     len(scan_members), scan_top, s_used, s_cap,
+                     len(scan_members), scan_top, s_open,
                      " — HALTED today (loss budget)" if s_halted else "",
                      s_evicted, s_acc))
         if scan_members:
@@ -1868,11 +1871,11 @@ def finecon_section(state, w, today_ct):
                  'all-market tier, top-{} by ROI, machine-screened, '
                  'quote-to-completion</span></div>'.format(scan_top))
         h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
-                 'quoting <b>{}/{}</b> slots &nbsp;&middot;&nbsp; +{}/{} daily '
-                 'openings used{} &nbsp;&middot;&nbsp; {} event(s) evicted by '
+                 'quoting <b>{}/{}</b> slots &nbsp;&middot;&nbsp; {}'
+                 '{} &nbsp;&middot;&nbsp; {} event(s) evicted by '
                  'tripwires &nbsp;&middot;&nbsp; est accrued this period '
                  '${:,.2f}</div>'.format(
-                     len(scan_members), scan_top, s_used, s_cap,
+                     len(scan_members), scan_top, s_open,
                      ' &nbsp;&middot;&nbsp; <b style="color:#b00">HALTED today'
                      ' (loss budget)</b>' if s_halted else "",
                      s_evicted, s_acc))
