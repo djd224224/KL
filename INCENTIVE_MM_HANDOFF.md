@@ -2056,8 +2056,10 @@ An unknown event whose programs started BEFORE the window is a LATE ARRIVAL
 - STRICTLY READ-ONLY: GETs only (feed pages + up to `IMM_NEWPROG_TITLES`=60
   event-title reads, biggest pools first), no cycle, no orders, and the only
   file written is its own seen-file.
-- Task **`KL imm new-programs`**, daily **7:30 AM ET** (after the 7:10
-  digest, 7:20 quote-gaps, 7:25 opportunistic), cmd.exe wrapper →
+- Task **`KL imm new-programs`**, daily **5 minutes after the opportunistic
+  email** (whatever clock that task is registered in — see the registration
+  note below; 7:30 AM ET when no sibling task exists to copy), cmd.exe
+  wrapper →
   `run-logs\incentive-mm\new-programs-task.log`. Idempotent marker
   (`imm_new_programs_sent_<date>.marker`), Modern-Standby retries (8×5min),
   registry cred fallback, Alerter tag `IMM-NEWPROG`.
@@ -2069,18 +2071,35 @@ An unknown event whose programs started BEFORE the window is a LATE ARRIVAL
   window/watermark rules, the feed-shrink hold, the BOT column and cutoff
   flags, row-cap totals, ASCII body, and main()'s marker/state writes.
 
-Recreate the task:
-```powershell
-$arg = '/c "set PYTHONPATH=C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages&& "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe" "C:\Users\jackd\Documents\KL\send_imm_new_programs.py" >> "C:\Users\jackd\Documents\KL\run-logs\incentive-mm\new-programs-task.log" 2>&1"'
-Register-ScheduledTask -TaskName 'KL imm new-programs' -Force `
-  -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $arg) `
-  -Trigger (New-ScheduledTaskTrigger -Daily -At '7:30AM') `
-  -Principal (New-ScheduledTaskPrincipal -UserId 'jackd' -LogonType Interactive -RunLevel Limited) `
-  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2))
-```
+**Registration is automatic once this lands on main.** `sync_kl_main.ps1`
+(the every-30-minutes "KL sync-kl-main" task) fast-forwards the repo and then
+bootstraps the task if it is missing, exactly as it does for
+"KL dashboards-daily": it runs `register_imm_new_programs.ps1` and logs
+`imm new-programs bootstrap: registered` (or FAILED, with the output) to
+`run-logs\sync-kl-main.log`. No-op once the task exists. The bootstrap
+deliberately does NOT `Start-ScheduledTask` — the first run is a seeding run
+and kicking it would fire an email at an arbitrary minute. To do it by hand:
+`powershell -ExecutionPolicy Bypass -File register_imm_new_programs.ps1`.
+
+`register_imm_new_programs.ps1` derives both the schedule and the command
+line from the box instead of hardcoding them, because the repo is ambiguous
+about which clock the task triggers are in: `register_portfolio_digest.ps1`
+documents 6:00 AM **local (Central)** = 7:00 AM ET "matching the crypto
+DIGEST / imm quote-gaps conventions", while the quote-gaps and opportunistic
+notes above describe 7:20/7:25 as ET. So the script reads the
+"KL imm opportunistic" task's own trigger and adds 5 minutes (quote-gaps
++10 as second choice), which puts this email right after the lineup under
+either convention, and prints the resolved time in BOTH local and ET so the
+answer is visible the first time it runs. With no sibling task registered it
+falls back to 7:30 AM ET converted into the machine's local time. The command
+line is the sibling's own, with the script and log names swapped, so a Python
+upgrade cannot leave this task pointing at a `Python312` path that no longer
+exists; the documented literal paths are the fallback, used only when both
+swaps cannot be verified.
 
 **First run is a seeding run**: with no seen-file, every event already in the
 feed is recorded as known and only events that started inside the default 24h
 window can be reported — so the first email is small by construction and the
 footer says so. Run `python send_imm_new_programs.py --dry` once before
-registering the task to see what it would say.
+registering the task to see what it would say (the box's Kalshi key and
+`ALERT_EMAIL_*` are required — this runs nowhere but the trading box).
