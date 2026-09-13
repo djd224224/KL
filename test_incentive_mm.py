@@ -1468,8 +1468,9 @@ class TestScanCapSixty(unittest.TestCase):
         # off, or nothing to sweep: empty and the cursor untouched
         self.assertEqual(imm.scan_tail_slice(7800, 42, 600, 0.0), ([], 42))
         self.assertEqual(imm.scan_tail_slice(0, 42, 600, 1.0), ([], 42))
-        # a tiny tail is read whole every refresh
-        self.assertEqual(imm.scan_tail_slice(3, 0, 600, 1.0), ([0, 1, 2], 0))
+        # a tiny tail cycles one name per refresh (ceil(3*600/3600) = 1),
+        # still inside the hour
+        self.assertEqual(imm.scan_tail_slice(3, 0, 600, 1.0), ([0], 1))
         self.assertEqual(imm.SCAN_SWEEP_HOURS, 1.0)
 
     def test_book_budget_goes_to_the_least_recently_estimated_first(self):
@@ -9756,9 +9757,10 @@ class TestOpenScanTier(unittest.TestCase):
         # moved 15 -> 30 on 2026-09-07 and 30 -> 60 (hard cap, openings 0)
         # on 2026-09-13, and neither must break the fixture
         self.assertEqual(imm.SCAN_TOP_N, 60)
-        self.enterContext(mock.patch.object(imm, "SCAN_TOP_N", 15))
-        self.assertEqual(imm.SCAN_EVENT_TOP_N, 3)
         self.assertEqual(imm.SCAN_DAILY_OPENINGS, 0)
+        self.enterContext(mock.patch.object(imm, "SCAN_TOP_N", 15))
+        self.enterContext(mock.patch.object(imm, "SCAN_DAILY_OPENINGS", 5))
+        self.assertEqual(imm.SCAN_EVENT_TOP_N, 3)
         # 5 strikes of one event with the best ROIs: only 3 survive, the
         # slack flows to other events; a non-scan meta is never touched
         ev1 = [m(f"KXAAA-26SEP09-T{i}", 9.0 - i) for i in range(5)]
