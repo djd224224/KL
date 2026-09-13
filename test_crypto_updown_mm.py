@@ -716,11 +716,12 @@ class TestDailyDefenses(unittest.TestCase):
         cancels resting orders, so <=30min means a CLEAR book."""
         self.assertTrue(all(v >= 1800 for v in ud.MIN_SECS_LEFT.values()),
                         ud.MIN_SECS_LEFT)
-        self.assertEqual(ud.MIN_SECS_LEFT["daily"], 1800)
-        self.assertEqual(ud.MIN_SECS_LEFT["hourly"], 1800)
+        self.assertEqual(ud.MIN_SECS_LEFT["daily"], 21600)    # 6h before the print (9/12)
+        self.assertEqual(ud.MIN_SECS_LEFT["hourly"], 1800)    # 6h > window: tenor is OFF instead
         self.assertEqual(ud.MIN_SECS_LEFT["weekly"], 21600)   # 6h before the Friday print (9/12)
-        # a daily 29 minutes from its print is out; 31 minutes is in
-        for mins, want in ((29, 0), (31, 1)):
+        self.assertEqual(ud.MIN_SECS_LEFT["annual"], 86400)   # already a day
+        # a daily 5h59m from its print is out; 6h01m is in
+        for mins, want in ((359, 0), (361, 1)):
             end = NOW + timedelta(minutes=mins)
             daily = [mkt(100000, EV_D, end - timedelta(hours=25), end)]
             views = ud.build_event_views(daily, NOW)
@@ -732,7 +733,9 @@ class TestDailyDefenses(unittest.TestCase):
         weekly/monthly": the default disables the daily tenor for EVERY
         asset via the "*" wildcard (BTC's 8/23 off-switch subsumed).
         Weeklies stay on everywhere."""
-        self.assertEqual(ud.DISABLED_ASSET_CADENCES, {("*", "daily")})
+        # "*:hourly" since 2026-09-12: the 6h pre-print rule exceeds the hourly window
+        self.assertEqual(ud.DISABLED_ASSET_CADENCES, {("*", "daily"), ("*", "hourly")})
+        self.assertEqual(ud.effective_cadences("BTC", ("hourly", "weekly")), ("weekly",))
         for asset in ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"):
             self.assertEqual(ud.effective_cadences(asset, ("daily", "weekly")),
                              ("weekly",), asset)

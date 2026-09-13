@@ -131,6 +131,12 @@ ratios (risk cap 30%, skew full at 30%, reduce-only at 60% of the event cap):
   and lost in 4 of the 5 settled weeks that had them (-$147 vs +$139 outside them). Deselection
   cancels the resting book, so from Friday ~11:00 ET the weekly event is clear; the bot idles (or
   quotes the next listed week) until then. Banner shows `stand-down 6h before the print`.
+- **Same rule on every tenor** (Jack 2026-09-12 "do the same for daily/hourly/annual gates"):
+  daily `MIN_SECS_LEFT` 1800 -> 21600 (dormant while dailies are off; live only if they are
+  re-enabled — the 8/17 note about the profitable end-of-day window is superseded); hourly gets
+  `"*:hourly"` in `DISABLED_ASSET_CADENCES` because a 6h gate is longer than its window; annual
+  keeps its 24h gate, which already exceeds 6h. No running bot changed behaviour (all seven run
+  cadence=weekly); the values load on the next restart.
 - Risk dollars are summed per event from account-level positions (strikes outside the quoted band
   count at 50c) and shown on the event summary line (`risk short/long $x/$y cap $z`); the cycle
   header now shows `sigma_d=... (raw r, median m)`. Banner: `risk rules v1.1 ON: ...` per tenor.

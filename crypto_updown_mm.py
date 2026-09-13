@@ -131,11 +131,16 @@ WEEKLY_MAX_HOURS = _env_f("CUD_WEEKLY_MAX_HOURS", 400.0)
 # from the determination datetime"): daily was 900s, hourly 180s. All gates
 # measure to close_time = the determination print (the 8/14 basis fix), and
 # deselection actively CANCELS resting orders via sweep_deselected — inside
-# the window the book is clear, not just unrefreshed. An hourly event (tenor
-# not enabled) would now quote only its first ~30 minutes.
+# the window the book is clear, not just unrefreshed.
+# 2026-09-12 (Jack "stop quoting 6 hours before the Friday print", then "do the
+# same for daily/hourly/annual gates"): every tenor stands down at least 6h
+# before its print. Daily 1800 -> 21600 (dormant while the tenor is off).
+# Hourly keeps 1800 as the number here because a 6h gate is longer than the
+# whole ~1h window; the 6h rule is applied to it as an explicit off-switch in
+# DISABLED_ASSET_CADENCES instead ("*:hourly"). Annual was already 24h.
 MIN_SECS_LEFT = {
     "hourly": _env_f("CUD_MIN_SECS_LEFT_HOURLY", 1800),
-    "daily": _env_f("CUD_MIN_SECS_LEFT_DAILY", 1800),
+    "daily": _env_f("CUD_MIN_SECS_LEFT_DAILY", 21600),
     # Weekly: 6h before the Friday print (Jack 2026-09-12 "stop quoting 6 hours
     # before the Friday print"; was 3600). The final six hours were 29% of the
     # weekly volume and lost money in 4 of the 5 settled weeks that had them
@@ -216,11 +221,14 @@ QUOTE_OFFSET_BY_ASSET_CADENCE = {
 # covers future assets too; weeklies unchanged, monthlies are the touch
 # fleet). Applied in main() so the effective cadence set shows in the
 # banner; env CUD_DISABLED_ASSET_CADENCES="BTC:daily,*:hourly,..."
-# overrides the default entirely (unknown cadences ignored).
+# overrides the default entirely (unknown cadences ignored). "*:hourly" added
+# 2026-09-12: a 6h pre-print stand-down (see MIN_SECS_LEFT) is longer than an
+# hourly window, so the tenor is switched off outright rather than carrying a
+# gate it can never pass.
 DISABLED_ASSET_CADENCES = frozenset(
     (a.strip(), c.strip())
     for a, _, c in (p.partition(":") for p in os.environ.get(
-        "CUD_DISABLED_ASSET_CADENCES", "*:daily").split(","))
+        "CUD_DISABLED_ASSET_CADENCES", "*:daily,*:hourly").split(","))
     if c.strip() in CADENCES and a.strip())
 
 
