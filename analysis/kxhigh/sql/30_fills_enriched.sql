@@ -11,6 +11,33 @@ outcomes AS (
   SELECT market_ticker, result, outcome_yes
   FROM `elite-contact-446323-q7.Kalshi.KXHIGH_settlements_clean`
 ),
+-- Trading-bot timestamp bug: high_temp_trading.py stamps run_date with
+-- `datetime.now(US/Central)` *without* a timezone, which BigQuery then labels
+-- as UTC. The stored value is therefore CT wall-clock time tagged as UTC —
+-- five hours earlier than reality during CDT, six during CST. We undo the
+-- mislabeling at read time with
+--     TIMESTAMP(DATETIME(col), "America/Chicago")
+-- which interprets the naive datetime in CT and returns a real UTC timestamp.
+-- Same correction as analysis/kxhigh/python/live_dashboard.py:50-60.
+--
+-- THIS MATTERED HERE. fill_ts is genuine UTC (06_fills_clean.sql: an epoch
+-- from the Kalshi API), so joining it against the uncorrected run_date let the
+-- `<= fill_ts` predicate admit snapshots whose true time was up to 5h AFTER
+-- the fill, and `ORDER BY run_date DESC LIMIT 1` then preferred exactly those.
+-- Measured before this fix: 2,365 of 4,400 fills since 2026-06-01 (53.8%)
+-- carried model context from a run that had not yet happened, up to 299
+-- minutes of lookahead — contaminating model_edge_at_fill,
+-- model_yes_prob_at_fill and the forecast_* columns the accuracy dashboard
+-- calibrates on.
+--
+-- Correcting it here (rather than at each use) also fixes the exposed
+-- snap_run_date. Do NOT use INTERVAL 5 HOUR: the offset is DST-dependent.
+-- If high_temp_trading.py is ever fixed to write real UTC, this CTE must be
+-- made cutover-aware or removed — grep for America/Chicago in this directory.
+snapshots AS (
+  SELECT * REPLACE(TIMESTAMP(DATETIME(run_date), "America/Chicago") AS run_date)
+  FROM `elite-contact-446323-q7.Kalshi.KXHIGH_market_snapshot`
+),
 fills_with_snap AS (
   SELECT
     f.*,
@@ -21,7 +48,7 @@ fills_with_snap AS (
       ORDER BY s.run_date DESC LIMIT 1
     )[SAFE_OFFSET(0)] AS snap
   FROM `elite-contact-446323-q7.Kalshi.KXHIGH_fills_clean` f
-  LEFT JOIN `elite-contact-446323-q7.Kalshi.KXHIGH_market_snapshot` s
+  LEFT JOIN snapshots s
     ON f.market_ticker = s.market_ticker
     AND s.run_date <= f.fill_ts
   GROUP BY
