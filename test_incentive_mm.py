@@ -2652,12 +2652,37 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                                         "KXNFLDRAFT-26APR30-JSMITH")[0],
                          "review")
 
-    def test_state_gas_prefix_allow_and_family_override(self):
-        # A state never seen before is allowed by the KXAAAGASD prefix...
-        self.assertTrue(IncentiveMarketMaker._allowed(
-            "KXAAAGASDOH-26SEP02-3.1500"))
-        # ...and clones the national guard set (safe-join + rate floor +
-        # AAA blackout) on first sight.
+    def test_state_gas_family_is_pattern_blocked(self):
+        # Jack 2026-09-14: "block the state daily family (including any future
+        # ones). keep monthlies." The states share the KXAAAGASD prefix with the
+        # NATIONAL daily, so this is a SERIES_BLOCK_PATTERNS full-match, not a
+        # blocklist prefix. Blocked in BOTH tiers: de-allowlisting alone would
+        # make scan_universe_reason return None = scan candidate, and these
+        # books clear every scan gate (median vol24h 0, median ROI 0.53/day).
+        # scan_universe_reason short-circuits on "allowlist_off" before it
+        # reaches _blocked, and this class runs with the allowlist off, so
+        # pin the real policy for the scan-tier half of the assertion.
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            for st in ("OH", "CA", "TX", "NC", "ZZ"):  # ZZ = never-listed state
+                t = f"KXAAAGASD{st}-26SEP02-3.1500"
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+                self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        # the national daily and the monthlies are deliberately KEPT
+        for keep in ("KXAAAGASD-26SEP02-3.1500", "KXAAAGASM-26SEP30-4.20",
+                     "KXAAAGASMINM-26SEP30-4.20", "KXAAAGASMAXM-26SEP30-4.20"):
+            self.assertFalse(IncentiveMarketMaker._blocked(keep), keep)
+            self.assertTrue(IncentiveMarketMaker._allowed(keep), keep)
+        # full-match, not prefix-match: the pattern must not reach the national
+        self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDOH"))
+        # the family-override clone machinery is unchanged and still resolves
+        # the national parent; a blocked state simply never reaches the
+        # candidate loop, because _allowed() is False above.
         fake = "KXAAAGASDZZ"
         self.assertNotIn(fake, imm.SERIES_OVERRIDES)
         try:
@@ -2669,6 +2694,31 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                              imm.SERIES_OVERRIDES["KXAAAGASD"].blackout_et)
         finally:
             imm.SERIES_OVERRIDES.pop(fake, None)
+
+    def test_pattern_block_is_configurable_and_winds_down(self):
+        # empty env disables the mechanism entirely
+        self.assertFalse(imm.series_pattern_blocked("KXANYTHING")
+                         if not imm.SERIES_BLOCK_PATTERNS else False)
+        # a pattern-blocked event can still be exempted to quote to completion,
+        # exactly like a prefix-blocked one (BLOCKLIST_WIND_DOWN_EVENTS)
+        ev = "KXAAAGASDOH-26SEP15"
+        self.assertTrue(IncentiveMarketMaker._blocked(f"{ev}-4.1450"))
+        prev = imm.BLOCKLIST_WIND_DOWN_EVENTS
+        try:
+            imm.BLOCKLIST_WIND_DOWN_EVENTS = frozenset({ev})
+            self.assertFalse(IncentiveMarketMaker._blocked(f"{ev}-4.1450"))
+            # a sibling state event is untouched by that exemption
+            self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASDCA-26SEP15-4.1450"))
+        finally:
+            imm.BLOCKLIST_WIND_DOWN_EVENTS = prev
+
+    def test_auto_enroll_loaders_refuse_a_pattern_blocked_series(self):
+        # the 6:45am classifier writes extra_allow_series.json; a pattern-blocked
+        # family must never be readmitted through it (the whole point of
+        # "including any future ones")
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDWY"))
+        self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
+        self.assertFalse(imm.series_pattern_blocked("KXDIESELD"))
 
     def test_event_top_n_gas_cap(self):
         # Jack 2026-09-02: gas events quote only the 3 highest-ROI markets
@@ -9079,7 +9129,11 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(r("KXSPRLVL-26OCT13-T286"), "allowed")   # finecon
         self.assertEqual(r("KXBA-26JULDELIV-130"), "allowed")     # company
         self.assertEqual(r("KXWCMENTION-26JUL11ARGSUI-VAR"), "allowed")
-        self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"), "allowed")  # prefix
+        # state gas dailies: pattern-blocked 2026-09-14, so they are NOT
+        # scan universe either (the de-allowlist-only route would have made
+        # this None = scan candidate)
+        self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"), "blocked")
+        self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "allowed")   # national kept
         # blocklist wins over everything (other bots' books)
         self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")
         self.assertEqual(r("KXXRPMAXMON-XRP-26JUL31-140"), "blocked")
