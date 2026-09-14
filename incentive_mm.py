@@ -1984,6 +1984,64 @@ MARKET_BLOCK_SUFFIXES = tuple(
     s.strip() for s in os.environ.get("IMM_BLOCK_MARKET_SUFFIXES", "NQE").split(",")
     if s.strip())
 
+
+# SERIES-NAME PATTERN BLOCK (Jack 2026-09-14: "block the state daily family
+# (including any future ones). keep monthlies."): freeze a family by the SHAPE
+# of its series name rather than by a prefix. Written for the AAA per-state gas
+# dailies (KXAAAGASDCA/NC/TX/...), which a prefix genuinely cannot express: they
+# share the KXAAAGASD prefix with the NATIONAL daily, which stays live, so an
+# IMM_BLOCKLIST entry would take both. An explicit 16-series list would work
+# today and silently re-open tomorrow -- Kalshi lit five new states overnight on
+# 2026-09-01 and the 6:45am classifier auto-enrolls them; the pattern covers a
+# new state on the day it lists, which is what "including any future ones" asks
+# for.
+#
+# Why they are blocked. Sep 6-11 measured as settled P&L + change in open
+# unrealized basis (marks_*.jsonl) + credits matched by date: the 16 state
+# dailies ran -$39.64/day net (trading -$611.58 against +$373.71 of credits)
+# while the national ran +$1.00/day. 85% of the gas family's entire fill loss is
+# one cell -- state dailies in 08:00-15:59 ET, -$639.11 over 8 days at -9.96
+# c/ct, negative on all 8 days individually and robust to leave-one-day-out.
+# The cause is structural, not a regime: median external spread 30-64c and
+# median 24h volume 0, so the external book alone clears the 1,000-contract
+# reward target in 100.0% of quoted cycles and our rung (0.4-0.6% of depth) is
+# the only tradeable price inside a 45c spread -- anything that trades against
+# it is informed. The unit economics cannot carry that: credit is ~$2.443 per
+# market-period against 10.18 c/ct of cost, i.e. break-even at 24 contracts per
+# market-day, and these books fill 42.2.
+#
+# Blocking (not merely de-allowlisting) is required. scan_universe_reason()
+# treats "not blocked and not allowed" as a SCAN CANDIDATE, and these books
+# clear every open-scan gate -- median vol24h 0 against SCAN_MAX_VOLUME_24H=80
+# and median ROI 0.527/day against SCAN_MIN_ROI=0.05 -- so dropping the
+# allowlist prefix alone would hand the family straight to the scan tier, which
+# with SCAN_REFILL_ON_DEPARTURE would readmit it at the TOP of the ROI ranking.
+# _blocked is tested first in both tiers, so this entry closes both.
+#
+# Semantics are the prefix blocklist's exactly: no new orders, resting quotes
+# cancelled next cycle, NOT reduce-only (open positions ride to settlement), and
+# BLOCKLIST_WIND_DOWN_EVENTS still exempts a named event that should finish.
+# Monthlies (KXAAAGASM/MINM/MAXM), the national KXAAAGASD, KXAAAGASW and the
+# whole KXDIESEL* family do not match and are untouched -- verified against
+# every KXAAAGAS*/KXDIESEL* series in the settlement archive and in the live
+# incentive-programs feed.
+#
+# Env IMM_BLOCK_SERIES_PATTERNS (comma list of regexes, FULL-match against the
+# series name); empty string disables. Full-match, not search: a bare
+# "KXAAAGASD" pattern must not silently take the national.
+SERIES_BLOCK_PATTERNS = tuple(
+    re.compile(p.strip()) for p in os.environ.get(
+        "IMM_BLOCK_SERIES_PATTERNS", "KXAAAGASD[A-Z]+").split(",")
+    if p.strip())
+
+
+def series_pattern_blocked(series: str) -> bool:
+    """True if a SERIES NAME matches a SERIES_BLOCK_PATTERNS entry. Shared by
+    _blocked and by both auto-enroll loaders, so a pattern-blocked family can
+    never be written back into extra_allow_series.json / the finecon file by
+    the classifier tasks and then read as allowed."""
+    return any(p.fullmatch(series) for p in SERIES_BLOCK_PATTERNS)
+
 # ---- universe allowlist (user decision 2026-07-11: MENTION + CRYPTO only) ----
 # Mention/broadcast markets have DEFINED information windows (nothing to know
 # before the broadcast starts) and the crypto structural markets have no
@@ -3858,6 +3916,8 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DAILY_LOSS_LIMIT", "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
+    "SERIES_BLOCK_PATTERNS", "MARKET_BLOCK_SUFFIXES",
+    "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE",
 )
@@ -4100,7 +4160,8 @@ def load_extra_allow_series() -> int:
         if s.endswith("MAXMON") or s.endswith("MINMON"):
             log(f"[IMM] ! refused fleet monthly series in extra allow: {s}")
             continue
-        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES) \
+                or series_pattern_blocked(s):
             log(f"[IMM] ! refused blocklisted series in extra allow: {s}")
             continue
         fresh.add(s)
@@ -4190,7 +4251,8 @@ def load_finecon_extra_series() -> int:
         s = str(s).strip()
         if not s or not s.startswith("KX"):
             continue
-        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES) \
+                or series_pattern_blocked(s):
             log(f"[IMM] ! refused blocklisted series in finecon extra: {s}")
             continue
         fresh.add(s)
@@ -6961,7 +7023,8 @@ class IncentiveMarketMaker:
 
     @staticmethod
     def _blocked(ticker: str) -> bool:
-        if any(ticker.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
+        if any(ticker.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES) \
+                or series_pattern_blocked(series_of(ticker)):
             # A wind-down event (BLOCKLIST_WIND_DOWN_EVENTS) is the one
             # exception to a prefix block. Accept the market ticker or the
             # event ticker itself: the freeze paths pass markets, the
