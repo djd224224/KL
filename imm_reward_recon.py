@@ -314,9 +314,19 @@ def refresh_programs():
     import incentive_mm as imm
     client = imm.build_client()
     by_market = {}
+    # Page cap. At limit=1000 this bounds each status sweep to 80,000 rows.
+    # The unfiltered sweep already returns ~77k markets, so the cap is close
+    # to binding — and when it binds the sweep just stops mid-feed and the
+    # cache (and program_history's daily row) silently under-report the venue.
+    # Truncation is therefore recorded per status and surfaced both in the log
+    # and in the history row, so a short day is visibly short rather than
+    # indistinguishable from Kalshi actually cutting the pools.
+    PAGE_CAP = 200
+    sweep_status = {}
     for status in (None, "active", "settled", "closed"):
         cursor, got = None, 0
-        for _page in range(80):
+        outcome = "cap"          # overwritten on clean exhaustion or error
+        for _page in range(PAGE_CAP):
             params = {"limit": 1000}
             if status:
                 params["status"] = status
@@ -326,6 +336,7 @@ def refresh_programs():
                 r = client.get("/incentive_programs", params=params)
             except Exception as e:
                 log(f"  ! program page failed ({status}): {e}")
+                outcome = "error"
                 break
             batch = r.get("incentive_programs") or []
             for p in batch:
@@ -345,21 +356,29 @@ def refresh_programs():
             got += len(batch)
             cursor = r.get("next_cursor")
             if not cursor or not batch:
+                outcome = "complete"
                 break
-        log(f"  programs status={status!r}: {got} rows, {len(by_market)} markets")
+        sweep_status[str(status)] = outcome
+        note = "" if outcome == "complete" else f"  <-- INCOMPLETE ({outcome})"
+        log(f"  programs status={status!r}: {got} rows, "
+            f"{len(by_market)} markets{note}")
+        if outcome == "cap":
+            log(f"  ! page cap {PAGE_CAP} hit on status={status!r} with a live "
+                f"cursor — the feed is LONGER than this sweep read. Raise "
+                f"PAGE_CAP; today's counts under-report the venue.")
     os.makedirs(STATUS_DIR, exist_ok=True)
     tmp = PROGRAM_CACHE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(by_market, f)
     os.replace(tmp, PROGRAM_CACHE)
-    _append_program_history(by_market)
+    _append_program_history(by_market, sweep_status)
     return by_market
 
 
 PROGRAM_HISTORY = os.path.join(STATUS_DIR, "program_history.jsonl")
 
 
-def _append_program_history(by_market):
+def _append_program_history(by_market, sweep_status=None):
     """Daily per-series roll-up of the reward-program supply.
 
     reward_programs.json is fully OVERWRITTEN on every run and its `paid`
@@ -415,6 +434,15 @@ def _append_program_history(by_market):
                 "total_reward_raw": round(sum(rw), 2),
                 "median_reward_raw": rw[len(rw) // 2],
                 "run_ts": datetime.now(timezone.utc).isoformat(),
+                # Self-describing completeness: "complete" for all four
+                # sweeps means the row measures the whole venue. Anything
+                # else means this day is short for a reading reason, not
+                # because Kalshi cut the pools — do not read a dip across
+                # such a row as a regime change.
+                "sweeps": dict(sweep_status or {}),
+                "complete": all(v == "complete"
+                                for v in (sweep_status or {}).values())
+                           if sweep_status else None,
             })
         # Drop any existing rows for today, then append — safe to re-run.
         keep = []
