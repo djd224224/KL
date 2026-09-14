@@ -98,6 +98,36 @@ if (-not $loggedIn) {
 }
 Write-Log "auth ok; starting host"
 
+# --- Reap orphaned hosts ------------------------------------------------------
+# Stop-ScheduledTask kills the launcher but NOT the claude.exe it spawned, so
+# every stop/restart leaves a live host behind holding its own registration.
+# This box has been here before: the old desktop sync task leaked a claude.exe
+# every 30 minutes until ~66 zombies were eating ~5 GB.
+#
+# Deliberately narrow, in the spirit of enable_updown_daily.ps1: a process is
+# only touched if its command line proves it is one of OUR hosts (remote-control
+# AND this session name) AND its parent is gone. A host with a live parent is
+# supervised by somebody -- leave it alone.
+function Remove-OrphanedHosts {
+    try {
+        $hosts = Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and
+                           $_.CommandLine -like '*remote-control*' -and
+                           $_.CommandLine -like "*$SessionName*" }
+        foreach ($h in $hosts) {
+            $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($h.ParentProcessId)" -ErrorAction SilentlyContinue
+            if ($parent) { continue }
+            Stop-Process -Id $h.ProcessId -Force -ErrorAction Stop
+            Write-Log "reaped orphaned host pid=$($h.ProcessId) (parent gone)"
+        }
+    } catch {
+        Write-Log "orphan sweep failed (non-fatal): $_"
+    }
+}
+
+Remove-OrphanedHosts
+
+
 # --- Supervised run ----------------------------------------------------------
 # The bridge self-heals across the laptop's Modern Standby naps, so a process
 # exit means something real went wrong. Restart with a widening backoff, and
