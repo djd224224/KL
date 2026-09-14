@@ -443,6 +443,16 @@ def _append_program_history(by_market, sweep_status=None):
                 "complete": all(v == "complete"
                                 for v in (sweep_status or {}).values())
                            if sweep_status else None,
+                # The discriminator that actually matters. The settled and
+                # unfiltered sweeps are enormous (200k+ rows) and will cap
+                # on most days, so `complete` is almost always False and
+                # cannot separate a short read from a real venue cut.
+                # n_active — the supply signal this series exists to track
+                # — comes from the `active` sweep alone, which is small
+                # (~2.5k rows) and completes. Trust n_active when this is
+                # true; a drop then means Kalshi cut the pools, not that
+                # the pager gave up early.
+                "active_complete": (sweep_status or {}).get("active") == "complete",
             })
         # Drop any existing rows for today, then append — safe to re-run.
         keep = []
