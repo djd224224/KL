@@ -2695,6 +2695,54 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         finally:
             imm.SERIES_OVERRIDES.pop(fake, None)
 
+    def test_hourly_temp_family_is_pattern_blocked(self):
+        # Jack 2026-09-17: "blocklist hourly temp markets like KXTEMPMIAH".
+        # KXTEMPMIAH is the example, the hourly FAMILY is the target, so this
+        # is a SERIES_BLOCK_PATTERNS full-match on the same ^KXTEMP<CITY>H
+        # shape _HOURLY_TEMP_RE and restart_imm.ps1 already key on. Blocked in
+        # BOTH tiers for the gas-daily reason: de-allowlisting alone would
+        # make scan_universe_reason return None = scan candidate.
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            # the six live hourly books, plus a city that has not listed yet
+            for city in ("MIA", "NYC", "AUS", "CHI", "DC", "LAX", "ZZZ"):
+                t = f"KXTEMP{city}H-26SEP1714-T79.99"
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+                self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        # full-match, not prefix-match: KXTEMPHELP is the near miss in the live
+        # feed and stays quotable through the KXTEMP allow prefix
+        self.assertFalse(imm.series_pattern_blocked("KXTEMPHELP"))
+        self.assertTrue(IncentiveMarketMaker._allowed("KXTEMPHELP-26SEP17-X"))
+        # the gas-daily entry is untouched by the second pattern
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDCA"))
+        self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
+        # ...and so is every other weather family the bot quotes
+        for keep in ("KXHIGHNY", "KXLOWTNY", "KXAVGTNYC", "KXAQICITYNYC",
+                     "KXRAINNYCM"):
+            self.assertFalse(imm.series_pattern_blocked(keep), keep)
+        # the auto-enroll loaders share series_pattern_blocked, so the 6:45am
+        # classifier can never write an hourly temp series back in as allowed
+        self.assertTrue(imm.series_pattern_blocked("KXTEMPMIAH"))
+
+    def test_hourly_temp_block_winds_down_like_any_other(self):
+        # standard blocklist semantics: a named event can still be exempted to
+        # quote to completion, and open positions are never force-flattened
+        ev = "KXTEMPMIAH-26SEP1714"
+        self.assertTrue(IncentiveMarketMaker._blocked(f"{ev}-T79.99"))
+        prev = imm.BLOCKLIST_WIND_DOWN_EVENTS
+        try:
+            imm.BLOCKLIST_WIND_DOWN_EVENTS = frozenset({ev})
+            self.assertFalse(IncentiveMarketMaker._blocked(f"{ev}-T79.99"))
+            # the next hour's event is untouched by that exemption
+            self.assertTrue(
+                IncentiveMarketMaker._blocked("KXTEMPMIAH-26SEP1715-T79.99"))
+        finally:
+            imm.BLOCKLIST_WIND_DOWN_EVENTS = prev
+
     def test_pattern_block_is_configurable_and_winds_down(self):
         # empty env disables the mechanism entirely
         self.assertFalse(imm.series_pattern_blocked("KXANYTHING")
@@ -5924,6 +5972,12 @@ class TestHourSizeMult(unittest.TestCase):
         self._old_mult = imm.MENTION_SIZE_MULT
         imm.MENTION_SIZE_MULT = 1.5
         self.addCleanup(lambda: setattr(imm, "MENTION_SIZE_MULT", self._old_mult))
+        # Neutralise the earnings-only knob (default 1.5 since 2026-09-17) so
+        # this test still measures the FAMILY multiplier by itself; the two
+        # knobs' composition is pinned in test_earnings_family_multiplier.
+        self._old_earn = imm.EARNINGS_SIZE_MULT
+        imm.EARNINGS_SIZE_MULT = 1.0
+        self.addCleanup(lambda: setattr(imm, "EARNINGS_SIZE_MULT", self._old_earn))
         imm.HOUR_SIZE_MULTS = {}
         outside = utc(2026, 7, 28, 13, 0)      # 9am ET, no hour mult
         base = imm.series_levels("KXWCMENTION")
@@ -5970,6 +6024,71 @@ class TestHourSizeMult(unittest.TestCase):
         self.assertGreater(room, 0)            # 40 < scaled soft 45: no clamp
         room2 = imm.skewed_side_room(100, 40, accumulating=True, side_max=100)
         self.assertLess(room2, 100)            # default soft 30: halved
+
+    def test_earnings_family_multiplier(self):
+        # Jack 2026-09-17: "increase quote size on EARNINGSMENTIONS by 1.5x".
+        # A knob of its own, NOT the family one: only KXEARNINGSMENTION<TKR>
+        # moves, and every commensurate cap moves with it.
+        self.assertEqual(imm.EARNINGS_SIZE_MULT, 1.5)   # live default
+        self.assertEqual(imm.MENTION_SIZE_MULT, 1.0)    # family still off
+        imm.HOUR_SIZE_MULTS = {}
+        outside = utc(2026, 7, 28, 13, 0)      # 9am ET, no hour/Saturday mult
+        base = imm.series_levels("KXEARNINGSMENTIONUAL")
+
+        # the earnings books scale...
+        for s_ in ("KXEARNINGSMENTIONUAL", "KXEARNINGSMENTIONTSLA",
+                   "KXEARNINGSMENTIONF", "KXEARNINGSMENTION"):
+            self.assertEqual(imm.applied_mention_mult(s_), 1.5, s_)
+            self.assertEqual(imm.hour_scaled_levels(s_, outside),
+                             [(t, int(sz * 1.5 + 0.5)) for t, sz in base], s_)
+        # ...and the rest of the mention family does NOT
+        for s_ in ("KXTRUMPMENTION", "KXNBAMENTION", "KXWCMENTION",
+                   "KXMAMDANIMENTION"):
+            self.assertEqual(imm.applied_mention_mult(s_), 1.0, s_)
+            self.assertEqual(imm.hour_scaled_levels(s_, outside),
+                             imm.series_levels(s_), s_)
+        # non-mention untouched
+        self.assertIs(imm.hour_scaled_levels("KXGOOD", outside),
+                      imm.series_levels("KXGOOD"))
+
+        # caps move commensurately with the ladder
+        self.assertAlmostEqual(imm.series_max_position("KXEARNINGSMENTIONUAL"),
+                               imm.MAX_POSITION_CONTRACTS * 1.5)
+        self.assertAlmostEqual(imm.series_max_position("KXTRUMPMENTION"),
+                               imm.MAX_POSITION_CONTRACTS)
+        self.assertAlmostEqual(
+            imm.event_cap_contracts("KXEARNINGSMENTIONUAL-26OCT16"),
+            imm.MAX_EVENT_CONTRACTS * 1.5)
+        self.assertAlmostEqual(
+            imm.event_cap_contracts("KXTRUMPMENTION-26OCT16"),
+            imm.MAX_EVENT_CONTRACTS)
+
+        # composes with the family knob rather than replacing it
+        self._old_mult = imm.MENTION_SIZE_MULT
+        imm.MENTION_SIZE_MULT = 1.5
+        self.addCleanup(lambda: setattr(imm, "MENTION_SIZE_MULT", self._old_mult))
+        self.assertAlmostEqual(imm.applied_mention_mult("KXEARNINGSMENTIONUAL"),
+                               2.25)
+        self.assertAlmostEqual(imm.applied_mention_mult("KXWCMENTION"), 1.5)
+        # ...and with the quiet-hours window on top of both
+        imm.HOUR_SIZE_MULTS = {3: 2.0}
+        inside = utc(2026, 7, 28, 7, 30)       # 3:30am ET
+        self.assertEqual(imm.hour_scaled_levels("KXEARNINGSMENTIONUAL", inside),
+                         [(t, int(sz * 4.5 + 0.5)) for t, sz in base])
+
+    def test_earnings_multiplier_is_revertible(self):
+        # 1.0 puts the family straight back on the global ladder, no other
+        # edit required (the knob is env-tunable: IMM_EARNINGS_SIZE_MULT).
+        self._old_earn = imm.EARNINGS_SIZE_MULT
+        imm.EARNINGS_SIZE_MULT = 1.0
+        self.addCleanup(lambda: setattr(imm, "EARNINGS_SIZE_MULT", self._old_earn))
+        imm.HOUR_SIZE_MULTS = {}
+        outside = utc(2026, 7, 28, 13, 0)
+        self.assertEqual(imm.applied_mention_mult("KXEARNINGSMENTIONUAL"), 1.0)
+        self.assertEqual(imm.hour_scaled_levels("KXEARNINGSMENTIONUAL", outside),
+                         imm.series_levels("KXEARNINGSMENTIONUAL"))
+        self.assertAlmostEqual(imm.series_max_position("KXEARNINGSMENTIONUAL"),
+                               imm.MAX_POSITION_CONTRACTS)
 
     def test_rounding_half_up_floor_one(self):
         imm.HOUR_SIZE_MULTS = {3: 0.5}

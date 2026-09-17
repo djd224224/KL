@@ -1318,9 +1318,38 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
 # machinery stays env-tunable (IMM_MENTION_SIZE_MULT) if he wants it back.
 MENTION_SIZE_MULT = _env_float("IMM_MENTION_SIZE_MULT", 1.0)
 
+# EARNINGS-ONLY ladder multiplier (Jack 2026-09-17: "increase quote size on
+# EARNINGSMENTIONS by 1.5x"). A SEPARATE knob from MENTION_SIZE_MULT on
+# purpose: that one is the WHOLE mention family -- KXTRUMPMENTION,
+# KXNBAMENTION, KXWCMENTION, KXLOVEISLMENTION and every future *MENTION ride
+# it -- and only the per-company earnings-call books (KXEARNINGSMENTION<TKR>)
+# were asked for. It MULTIPLIES on top of the family knob rather than
+# replacing it, so restoring IMM_MENTION_SIZE_MULT=1.5 would put earnings at
+# 2.25x and the rest of the family at 1.5x, which is the composition the two
+# knobs are meant to express.
+#
+# Everything downstream scales commensurately because this rides
+# applied_mention_mult, the single multiplier every geometry consumer reads:
+# ladder rung sizes (hour_scaled_levels: 20 -> 30 at the live IMM_LEVELS=0:20),
+# the per-market position cap (series_max_position: 150 -> 225), the per-event
+# net cap (event_cap_contracts: 1000 -> 1500) and the inventory skew knees
+# (SKEW_SOFT/HARD_CONTRACTS: 30/60 -> 45/90). That is exactly the wiring the
+# 2026-07-28 family-wide x1.5 used, so the pieces stay proportional to each
+# other instead of a fat ladder fighting an unchanged cap.
+#
+# Hand-tuned override series are still exempt via applied_mention_mult (no
+# earnings series carries a SeriesOverride today; the exemption is structural,
+# not a guess). Env IMM_EARNINGS_SIZE_MULT; 1.0 reverts to family-only.
+EARNINGS_SIZE_MULT = _env_float("IMM_EARNINGS_SIZE_MULT", 1.5)
+
 
 def mention_size_mult(series: str) -> float:
-    if series.endswith("MENTION") or series.startswith("KXEARNINGSMENTION"):
+    # Earnings first: KXEARNINGSMENTION<TKR> does NOT end in "MENTION" (the
+    # company symbol is the tail), but the bare stem does, so the order
+    # matters for the stem and is harmless for every real series.
+    if series.startswith("KXEARNINGSMENTION"):
+        return MENTION_SIZE_MULT * EARNINGS_SIZE_MULT
+    if series.endswith("MENTION"):
         return MENTION_SIZE_MULT
     return 1.0
 
@@ -2026,12 +2055,45 @@ MARKET_BLOCK_SUFFIXES = tuple(
 # every KXAAAGAS*/KXDIESEL* series in the settlement archive and in the live
 # incentive-programs feed.
 #
+# SECOND ENTRY -- HOURLY TEMP (Jack 2026-09-17: "blocklist hourly temp markets
+# like KXTEMPMIAH"). KXTEMPMIAH is the example, the hourly temp FAMILY is the
+# target, so this is a pattern and not a one-series IMM_BLOCKLIST line: the
+# family has relisted and re-shaped repeatedly (the legacy five were retired
+# 2026-07-21, re-enabled 07-22, and the program relaunched as KXTEMPMIAH-only
+# on 08-22), and a new city lights up as a new series that the auto-enroll
+# tasks would pick up unasked.
+#
+# "KXTEMP[A-Z]+H" is the SAME shape _HOURLY_TEMP_RE (^KXTEMP<CITY>H-) already
+# uses to recognise an hourly temp market for the restart guard, and the same
+# one restart_imm.ps1 keys on -- one definition of "hourly temp", three call
+# sites. Verified against the live incentive-programs feed (1,231 distinct
+# series): it full-matches exactly the six hourly books -- KXTEMPAUSH,
+# KXTEMPCHIH, KXTEMPDCH, KXTEMPLAXH, KXTEMPMIAH, KXTEMPNYCH -- and nothing
+# else. KXTEMPHELP is the near miss the full-match rule saves us from
+# (a `search` would still not take it, but a "KXTEMP" prefix entry would),
+# and it stays quotable through the KXTEMP allow prefix.
+#
+# Blocking rather than dropping the KXTEMP allow prefix, for the reason the
+# gas dailies documented above: scan_universe_reason() reads "not blocked and
+# not allowed" as a SCAN CANDIDATE, so de-allowlisting alone would hand the
+# hourly books to the open-scan tier instead of turning them off. _blocked is
+# tested first in both tiers, so this entry closes both. The KXTEMP prefix
+# stays in ALLOW_SERIES_PREFIXES (blocklist wins over allowlist) exactly as
+# KXAAAGASD did, so non-hourly KXTEMP* members are untouched.
+#
+# Standard blocklist semantics: no new orders, resting quotes cancelled next
+# cycle, NOT reduce-only -- open hourly positions ride to their (hourly)
+# settlement. The temp-specific plumbing left behind is inert, not dead:
+# IMM_TEMP_LEVELS, the FAST_LANE_SECS mini-cycle, the close-anchored cutoff
+# city list, IMM_HOUR_MULT_EXCLUDE and the KXTEMP daily-prefix entry all keep
+# working the moment the pattern is removed.
+#
 # Env IMM_BLOCK_SERIES_PATTERNS (comma list of regexes, FULL-match against the
 # series name); empty string disables. Full-match, not search: a bare
 # "KXAAAGASD" pattern must not silently take the national.
 SERIES_BLOCK_PATTERNS = tuple(
     re.compile(p.strip()) for p in os.environ.get(
-        "IMM_BLOCK_SERIES_PATTERNS", "KXAAAGASD[A-Z]+").split(",")
+        "IMM_BLOCK_SERIES_PATTERNS", "KXAAAGASD[A-Z]+,KXTEMP[A-Z]+H").split(",")
     if p.strip())
 
 
@@ -3920,6 +3982,9 @@ _CONFIG_CODE_KNOBS = (
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE",
+    # ladder family multipliers (2026-09-17): the earnings x1.5 changes every
+    # downstream cap through applied_mention_mult, so it belongs in the hash
+    "MENTION_SIZE_MULT", "EARNINGS_SIZE_MULT",
 )
 
 
@@ -10385,7 +10450,8 @@ class IncentiveMarketMaker:
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
                 f"refresh {RAIN_FAIR_REFRESH_MIN}m, file {RAIN_FAIR_FILE}")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
-            f"mention x{MENTION_SIZE_MULT:g}), "
+            f"mention x{MENTION_SIZE_MULT:g}, "
+            f"earnings x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT:g}), "
             f"caps: market ±{MAX_POSITION_CONTRACTS:g}, event ±{MAX_EVENT_CONTRACTS:g} "
             f"(mention-scaled), "
             f"budget ${COLLATERAL_BUDGET:g}, "
