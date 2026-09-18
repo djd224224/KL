@@ -72,6 +72,22 @@ if (-not (Get-ScheduledTask -TaskName "KL imm new-programs" -ErrorAction Silentl
     }
 }
 
+# One-time bootstrap (2026-09-18): register the daily open-scan performance
+# scorer ("KL imm scan-perf", 07:55 ET, trigger PINNED inside its register
+# script) once register_imm_scan_perf.ps1 lands on main — same pattern as the
+# new-programs task above. No-op once it exists. Deliberately NOT started
+# here: its first run writes the first scan_perf.json, the bot hot-reloads the
+# table within ~10 min of it appearing, and the next 07:55 trigger is fine.
+# Preview by hand, which writes nothing:  python imm_scan_perf.py --dry
+if (-not (Get-ScheduledTask -TaskName "KL imm scan-perf" -ErrorAction SilentlyContinue)) {
+    $spReg = Join-Path $Repo "register_imm_scan_perf.ps1"
+    if (Test-Path $spReg) {
+        $spOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $spReg 2>&1) -join ' | '
+        $spOk = [bool](Get-ScheduledTask -TaskName "KL imm scan-perf" -ErrorAction SilentlyContinue)
+        "$stamp imm scan-perf bootstrap: $(if ($spOk) { 'registered' } else { 'FAILED (run register_imm_scan_perf.ps1 from PowerShell)' }) | $spOut" | Add-Content -Path $Log -Encoding utf8
+    }
+}
+
 # One-shot windowed IMM restart (Jack 2026-08-24 "restart for me at that
 # time"): bumping $RestartRequest in a main push makes the NEXT sync run
 # dispatch restart_imm.ps1 exactly once on this machine — the script itself
