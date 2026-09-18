@@ -9645,6 +9645,44 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(imm.scan_series_meta_verdict(
             {"settlement_sources": []})[1], "category:unknown")
 
+    def test_live_source_ai_leaderboards_and_running_tallies(self):
+        # 2026-09-18 keyword fix. MEASURED by a read-only GET /series sweep
+        # of all 158 series the scan tier has ever cached a verdict for:
+        # 'openrouter' + 'ai-gateway' + 'federalregister' catch EXACTLY the
+        # four series below and no other of the 158. KXTOKENUSE cost the
+        # tier -$21.70 and KXEOWEEK -$9.16 (empirical_scan_tier §3);
+        # KXTENCENTSHARE was found by sweeping the CLASS, not by its own
+        # loss. Jack's 2026-09-12 note had already recorded 'openrouter' as
+        # missing from these keywords.
+        for series, name, url in (
+            ("KXTOKENUSE", "OpenRouter - AI Model Rankings",
+             "https://openrouter.ai/rankings#top-models"),
+            ("KXTENCENTSHARE", "OpenRouter - AI Market Share",
+             "https://openrouter.ai/rankings#market-share"),
+            ("KXOPENSOURCESHARE", "Vercel AI Gateway Leaderboards",
+             "https://vercel.com/ai-gateway/leaderboards/models#open-vs-closed"),
+            ("KXEOWEEK", "Federal Register", "https://www.federalregister.gov/"),
+        ):
+            self.assertEqual(imm.scan_series_meta_verdict(
+                {"category": "Science and Technology",
+                 "settlement_sources": [{"name": name, "url": url}]})[1],
+                "live_source", series)
+        # ...and the neighbours in that same sweep are still ADMISSIBLE: a
+        # scheduled print (KXCPIYOY on bls.gov — deliberately NOT keyworded,
+        # that loss belongs to the performance loop), the Fiscal.ai KPI
+        # class Jack asked into the scan 2026-09-06, and IMF PortWatch.
+        for series, cat, name, url in (
+            ("KXCPIYOY", "Economics", "Bureau of Labor Statistics",
+             "https://www.bls.gov/cpi/"),
+            ("KXAMZNA", "Companies", "Fiscal.ai", "https://fiscal.ai"),
+            ("KXHORMUZWEEKLY", "World", "IMF PortWatch",
+             "https://portwatch.imf.org/pages/chokepoint6"),
+        ):
+            self.assertEqual(imm.scan_series_meta_verdict(
+                {"category": cat,
+                 "settlement_sources": [{"name": name, "url": url}]}),
+                (True, "", cat), series)
+
     # ---- admission screens (bot-level, cached + budgeted reads) --------------
 
     def test_event_activity_is_a_mean_per_market_not_a_sum(self):

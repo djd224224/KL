@@ -3346,6 +3346,34 @@ SCAN_LIVE_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
     # a public view counter that ticks continuously is the textbook case
     # the live-source screen exists for — everyone can price it but us.
     "youtube.com,"
+    # LIVE AI LEADERBOARDS + a PUBLIC RUNNING TALLY, added 2026-09-18 after
+    # a read-only GET /series sweep of all 158 series the scan tier has ever
+    # cached a verdict for: these three substrings catch EXACTLY four of the
+    # 158 and no others (no bls.gov / fiscal.ai / newyorkfed / portwatch /
+    # aaa / truthsocial collateral).
+    #   openrouter       KXTOKENUSE ("OpenRouter - AI Model Rankings",
+    #                    openrouter.ai/rankings#top-models) — a key-less
+    #                    request-share board that re-ranks continuously,
+    #                    priceable by everyone but us. MEASURED -$21.70 of
+    #                    scan-tier trading P&L (empirical_scan_tier §3), and
+    #                    Jack's 2026-09-12 note already recorded
+    #                    'openrouter' as missing from these keywords.
+    #                    KXTENCENTSHARE ("OpenRouter - AI Market Share") was
+    #                    found by sweeping the CLASS, not by its own loss —
+    #                    the same feed, a second series.
+    #   ai-gateway       KXOPENSOURCESHARE ("Vercel AI Gateway
+    #                    Leaderboards") — the same live-leaderboard shape
+    #                    from another vendor.
+    #   federalregister  KXEOWEEK ("Federal Register") — executive orders
+    #                    signed this week, a public running tally anyone can
+    #                    refresh: the KXTECHLAYOFF class the 9/2 sweep
+    #                    rejected. MEASURED -$9.16.
+    # A current MEMBER is unaffected: members quote to completion and never
+    # re-enter _scan_admission, so this screens NEW entrants only.
+    # DELIBERATELY not keyworded: KXCPIYOY settles on bls.gov, a SCHEDULED
+    # print and not a live feed — that loss belongs to the performance loop,
+    # not to this screen.
+    "openrouter,ai-gateway,federalregister,"
     "polymarket").split(",") if k.strip())
 # Series currently carrying the scan guard set (see ensure_scan_override):
 # read by hour_size_mult (no quiet-hours doubling) and capped_ref_mult (the
