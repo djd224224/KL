@@ -44,6 +44,12 @@ def setUpModule():
     imm.EXTRA_ALLOW_FILE = os.path.join(tmp, "extra_allow_series.json")
     imm.FINECON_EXTRA_FILE = os.path.join(tmp, "finecon_extra_series.json")
     imm.RAIN_FAIR_FILE = os.path.join(tmp, "rain_fair_values.json")
+    # the open-scan performance table (2026-09-18) is baked from STATUS_DIR at
+    # import like the four above, so it needs the same redirect — otherwise
+    # the suite would READ the live scorer's verdicts and a test that writes a
+    # hostile fixture would write into run-logs\incentive-mm, which the live
+    # bot and four daily tasks own.
+    imm.SCAN_PERF_FILE = os.path.join(tmp, "scan_perf.json")
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -10618,6 +10624,940 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertIn(self.A, bot.state.selected)
         self.assertEqual(bot.state.scan_members, {self.A, self.B})
         self.assertEqual(bot.state.scan_halt_day, "2000-01-01")
+
+
+
+class TestScanPerfTable(unittest.TestCase):
+    """The open-scan performance loop (2026-09-18).
+
+    MEASURED, 9/6-9/16: the tier lost -$237.77 of trading P&L over 10,434
+    $-days at risk (-0.02279/$-day, 24h markout -5.09 c/ct on 106 fills),
+    with 12 of 83 events carrying 89% of it, and the losses are STRUCTURAL
+    (mid 30-70c -150.7, spread 5-9c -106.7 and 20c+ -83.8, dtc 30-90d
+    -107.9, pools <$20/day -153.2) rather than per-series -- which is what
+    `empirical_persistence` 8.1 predicted when it found the unshrunk series
+    mean to be the WORST forward predictor in every cut.
+
+    imm_scan_perf.py scores that per structural cohort and this bot
+    subtracts it from `_raw_roi`, in the same units, scoped on `m.scan`.
+    Every test below defends one of two invariants: the loop can only ever
+    SUBTRACT opportunity (there is no promote path for a hostile or
+    sign-flipped file to exploit), and one bad file cannot empty the tier.
+    Ships observe-only -- IMM_SCAN_PERF_WEIGHT is 0.0 -- so the default
+    behaviour these tests must reproduce is literally today's."""
+
+    NOW = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+
+    # ---- fixtures ------------------------------------------------------------
+
+    @staticmethod
+    def _b(key, lo, hi, centre, dev, blend=None, muted=False):
+        return {"key": key, "lo": lo, "hi": hi, "centre": centre,
+                "n_markets": 10, "n_series": 8, "n_events": 6, "n_fills": 12,
+                "risk_days": 500.0, "raw_trading": dev, "dev_trading": dev,
+                "raw_blend": dev, "dev_blend": dev if blend is None else blend,
+                "muted": muted}
+
+    @classmethod
+    def _perf_table(cls, **overrides):
+        """A minimal but complete table in SPEC 5's schema. Overrides are
+        shallow, so a test passes a whole `cohorts`/`series`/`params` block."""
+        b = cls._b
+        t = {
+            "version": 1,
+            "generated_at": cls.NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "generated_by": "imm_scan_perf.py@test",
+            "window": {"days": 45, "halflife_days": 21, "horizon_hours": 24},
+            "params": {"score_basis": "trading", "cohort_prior_risk_days": 400.0,
+                       "series_prior_fills": 20, "dim_clip": 0.04,
+                       "adj_clip": 0.04, "max_req": 0.10, "winsor_cents": 40,
+                       "cohort_edges_sha256": "0" * 64, "edges_refit": False},
+            "coverage": {"markets": 147, "events": 83, "series": 71},
+            "tier": {"mu_trading_only": -0.02279, "mu_rent_blended": 0.00063},
+            "cohorts": {
+                "spread": {"field": "spread_cents", "assign": "trailing_median_6h",
+                           "buckets": [b("1c", 0, 1, 1.0, 0.0),
+                                       b("2-4c", 1, 4, 2.5, 0.0),
+                                       b("5-9c", 4, 9, 7.0, 0.0),
+                                       b("10-19c", 9, 19, 14.0, 0.0),
+                                       b("20c+", 19, None, 25.0, 0.0)]},
+                "mid": {"field": "mid_cents", "assign": "trailing_median_6h",
+                        "buckets": [b("0-10", 0, 10, 5.0, 0.0),
+                                    b("10-30", 10, 30, 20.0, 0.0),
+                                    b("30-70", 30, 70, 50.0, 0.0),
+                                    b("70-90", 70, 90, 80.0, 0.0),
+                                    b("90-100", 90, 100, 95.0, 0.0)]},
+                "dtc": {"field": "days_to_close", "assign": "admission_snapshot",
+                        "buckets": [b("0-7", 0, 7, 3.5, 0.0),
+                                    b("7-30", 7, 30, 18.5, 0.0),
+                                    b("30-90", 30, 90, 60.0, 0.0),
+                                    b("90-180", 90, 180, 135.0, 0.0),
+                                    b("180+", 180, None, 270.0, 0.0)]},
+                "pool": {"field": "dollars_per_day", "assign": "admission_snapshot",
+                         "buckets": [b("0-20", 0, 20, 10.0, 0.0),
+                                     b("20-50", 20, 50, 35.0, 0.0),
+                                     b("50-100", 50, 100, 75.0, 0.0),
+                                     b("100-200", 100, 200, 150.0, 0.0),
+                                     b("200+", 200, None, 300.0, 0.0)]},
+            },
+            "series": {}, "events": {}, "markets": {},
+            "limits": {"barred_series": 0, "barred_events": 0, "down_ranked": 0,
+                       "bar_frac_universe": 0.0, "max_barred": 5,
+                       "max_penalized": 25, "max_bar_frac_universe": 0.25},
+            "warnings": [], "notes": ["adj = the SINGLE most negative dimension"],
+        }
+        t.update(overrides)
+        return t
+
+    @staticmethod
+    def _rec(verdict="down_rank", dev=-0.01, until=None):
+        r = {"n_fills": 5, "n_episodes": 3, "n_markets": 3, "n_days": 1,
+             "dev": dev, "verdict": verdict, "ci_hi": None, "unmarked_fills": 0}
+        if until is not None:
+            r["until"] = until
+        return r
+
+    @staticmethod
+    def _iso(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _write(self, table):
+        """Write the table and BUMP the mtime — a same-second rewrite does not
+        change it, which is exactly how the mtime gate is supposed to behave
+        and exactly how a test silently stops testing anything."""
+        with open(imm.SCAN_PERF_FILE, "w", encoding="utf-8") as f:
+            json.dump(table, f)
+        self._mt += 1
+        os.utime(imm.SCAN_PERF_FILE, (time.time(), time.time() + self._mt))
+
+    def _meta(self, ticker="KXPERF-26NOV-T1", **kw):
+        base = dict(ticker=ticker, event_ticker="KXPERF-26NOV",
+                    series="KXPERF", dollars_per_day=150.0, program_end=None,
+                    target_size=1000.0, discount_factor=0.5, cutoff=None,
+                    close_time=self.NOW + timedelta(days=90),
+                    mid_cents=50.0, spread_cents=25,
+                    est_dollars_per_day=1.0, est_exposure_dollars=10.0,
+                    est_collateral_dollars=0.0, scan=True)
+        base.update(kw)
+        return MarketMeta(**base)
+
+    def setUp(self):
+        self._mt = 0
+        self._saved = (dict(imm._scan_perf_state), dict(imm.SCAN_PERF_COHORTS),
+                       dict(imm.SCAN_PERF_SERIES), dict(imm.SCAN_PERF_EVENTS),
+                       dict(imm._scan_perf_counts))
+        self.addCleanup(self._restore)
+        self._reset()
+
+    def _reset(self):
+        """Back to the cold-start state: no file, empty tables."""
+        try:
+            os.remove(imm.SCAN_PERF_FILE)
+        except OSError:
+            pass
+        imm.SCAN_PERF_COHORTS.clear()
+        imm.SCAN_PERF_SERIES.clear()
+        imm.SCAN_PERF_EVENTS.clear()
+        imm._scan_perf_counts.clear()
+        imm._scan_perf_state.update({"mtime": 0.0, "generated_at": 0.0,
+                                     "stale": True, "n_down_rank": 0,
+                                     "n_bar": 0, "gen_iso": "",
+                                     "stale_logged": False})
+
+    def _restore(self):
+        st, c, s, e, k = self._saved
+        for tbl, saved in ((imm.SCAN_PERF_COHORTS, c), (imm.SCAN_PERF_SERIES, s),
+                           (imm.SCAN_PERF_EVENTS, e),
+                           (imm._scan_perf_counts, k), (imm._scan_perf_state, st)):
+            tbl.clear()
+            tbl.update(saved)
+        try:
+            os.remove(imm.SCAN_PERF_FILE)
+        except OSError:
+            pass
+
+    # a table whose only negative term is `dim`/`bucket_index`
+    def _one_dim(self, dim, idx, dev, **params):
+        t = self._perf_table()
+        t["cohorts"][dim]["buckets"][idx]["dev_trading"] = dev
+        t["cohorts"][dim]["buckets"][idx]["dev_blend"] = dev
+        t["params"].update(params)
+        return t
+
+    # ---- 1-8: fail-open, all-or-nothing, and the bounds ----------------------
+
+    def test_absent_file_reproduces_production(self):
+        """Jack's KXHIGH A/B rule: a missing config block must reproduce
+        production behaviour to the float, not approximately. `getmtime`
+        raises OSError, the in-memory tables are untouched, and every hook
+        collapses to the pre-loop arithmetic."""
+        self.assertFalse(os.path.exists(imm.SCAN_PERF_FILE))
+        self.assertEqual(imm.load_scan_perf(), 0)
+        self.assertEqual(imm.SCAN_PERF_COHORTS, {})
+        self.assertFalse(imm.scan_perf_fresh())
+        for m in (self._meta(), self._meta(scan=False),
+                  self._meta(est_exposure_dollars=0.0,
+                             est_collateral_dollars=0.0)):
+            self.assertEqual(imm.scan_perf_req(m), 0.0)
+            self.assertEqual(imm.scan_perf_adj(m), (0.0, ""))
+            self.assertEqual(imm._raw_roi(m), imm._raw_roi_gross(m))
+            self.assertEqual(imm._market_roi(m, set()), imm._raw_roi_gross(m))
+            self.assertEqual(imm._market_roi(m, {m.ticker}),
+                             imm._raw_roi_gross(m) * 1.15)
+        self.assertIsNone(imm.scan_perf_barred("KXPERF", "KXPERF-26NOV"))
+        # and the admission screen never says perf_barred
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        budget = {"series": 0, "history": 0}
+        self.assertNotEqual(
+            bot._scan_admission(self._meta(), {"ticker": "KXPERF-26NOV-T1"},
+                                {}, self.NOW, budget), "perf_barred")
+        _clean_persist()
+
+    def test_hot_reload_mtime_gate_and_last_good_on_bad_json(self):
+        """The load_finecon_extra_series contract: the mtime is recorded
+        BEFORE parsing, so an unreadable file logs once and is not retried
+        until it changes, and the previous good table stays in effect. A
+        half-applied table is the one failure that could mix a good bar with
+        a bad adjustment."""
+        self._write(self._one_dim("spread", 4, -0.02))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        self.assertTrue(imm.scan_perf_fresh())
+        self.assertEqual(imm.load_scan_perf(), 0, "mtime gate did not hold")
+        good = imm._interp_dev("spread", 25.0)
+        self.assertAlmostEqual(good, -0.02)
+
+        with open(imm.SCAN_PERF_FILE, "w", encoding="utf-8") as f:
+            f.write("{not json at all")
+        self._mt += 1
+        os.utime(imm.SCAN_PERF_FILE, (time.time(), time.time() + self._mt))
+        with mock.patch.object(imm, "log") as lg:
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertEqual(sum(1 for c in lg.call_args_list
+                                 if "scan perf table unreadable" in c.args[0]), 1)
+            self.assertEqual(imm.load_scan_perf(), 0)   # not retried
+        self.assertAlmostEqual(imm._interp_dev("spread", 25.0), good,
+                               msg="a bad file dropped the last good table")
+
+        self._write(self._one_dim("spread", 4, -0.03))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        self.assertAlmostEqual(imm._interp_dev("spread", 25.0), -0.03)
+
+    def test_stale_table_is_neutral(self):
+        """Fail OPEN, never frozen. A real bar dying during a scorer outage
+        is the accepted cost; a verdict outliving its evidence is not. The
+        age is re-checked on EVERY refresh, not only at parse."""
+        old = self.NOW - timedelta(days=3)
+        t = self._one_dim("spread", 4, -0.03)
+        t["generated_at"] = self._iso(old)
+        t["series"] = {"KXPERF": self._rec("bar", -0.04,
+                                           self._iso(self.NOW + timedelta(days=9)))}
+        t["limits"]["barred_series"] = 1
+        self._write(t)
+        with mock.patch.object(imm, "log") as lg:
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertEqual(sum(1 for c in lg.call_args_list
+                                 if "scan perf table stale" in c.args[0]), 1)
+        self.assertEqual(imm.SCAN_PERF_COHORTS, {})
+        self.assertEqual(imm.SCAN_PERF_SERIES, {})
+        self.assertEqual(imm.SCAN_PERF_EVENTS, {})
+        self.assertFalse(imm.scan_perf_fresh())
+        self.assertEqual(imm.scan_perf_req(self._meta()), 0.0)
+        with mock.patch.object(imm, "SCAN_PERF_BAR_ENABLED", True):
+            self.assertIsNone(imm.scan_perf_barred("KXPERF", "KXPERF-26NOV"))
+
+        # a FRESH table that ages out in place is cleared on the next refresh,
+        # with no file change at all
+        self._reset()
+        self._write(self._one_dim("spread", 4, -0.03))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        self.assertTrue(imm.scan_perf_fresh())
+        with mock.patch.object(imm, "SCAN_PERF_MAX_AGE_H", 0.0):
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertFalse(imm.scan_perf_fresh())
+
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.write_status(self.NOW)
+        with open(os.path.join(imm.STATUS_DIR, "status_incentive_mm.json"),
+                  encoding="utf-8") as f:
+            blk = json.load(f)["scan_perf"]
+        self.assertFalse(blk["fresh"])
+        self.assertTrue(blk["stale"])
+        self.assertFalse(blk["bar_enabled"])
+        _clean_persist()
+
+    def test_table_is_rejected_whole_not_partially(self):
+        self._write(self._one_dim("spread", 4, -0.02))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        bad = self._one_dim("spread", 4, -0.02)
+        bad["cohorts"]["mid"]["buckets"][2]["dev_trading"] = float("nan")
+        self._write(bad)
+        with mock.patch.object(imm, "log") as lg:
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertTrue(any("scan perf table refused" in c.args[0]
+                                for c in lg.call_args_list))
+        # the PRIOR table is intact — not the NaN one, and not empty
+        self.assertAlmostEqual(imm._interp_dev("spread", 25.0), -0.02)
+        self.assertAlmostEqual(imm._interp_dev("mid", 50.0), 0.0)
+
+    def test_wrong_version_and_refit_edges_are_rejected(self):
+        for mutate in (lambda t: t.update(version=2),
+                       lambda t: t["params"].update(edges_refit=True),
+                       lambda t: t.update(generated_at="not a timestamp")):
+            self._reset()
+            t = self._one_dim("spread", 4, -0.02)
+            mutate(t)
+            self._write(t)
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertFalse(imm.scan_perf_fresh())
+        # the edges were PRE-REGISTERED and frozen by sha256 after reading the
+        # n=147 loss table; a re-fit table is a specification search and is
+        # only ever loaded by hand, with the guard off
+        self._reset()
+        t = self._one_dim("spread", 4, -0.02)
+        t["params"]["edges_refit"] = True
+        self._write(t)
+        with mock.patch.object(imm, "SCAN_PERF_REQUIRE_FROZEN_EDGES", False):
+            self.assertGreater(imm.load_scan_perf(), 0)
+
+    def test_clamp_storm_is_rejected(self):
+        """A uniformly negated file is individually in range and passes every
+        NaN/schema check; a pile-up at the clip is the only signature left."""
+        t = self._perf_table()
+        for i in range(5):
+            t["cohorts"]["spread"]["buckets"][i]["dev_trading"] = -0.04
+        t["cohorts"]["mid"]["buckets"][0]["dev_trading"] = -0.04
+        self._write(t)                       # 6 of 20 = 30% at -dim_clip
+        with mock.patch.object(imm, "log") as lg:
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertTrue(any("clamp storm" in c.args[0]
+                                for c in lg.call_args_list))
+        self.assertFalse(imm.scan_perf_fresh())
+        # 2 of 20 = 10% is NOT a storm (the rule is strictly greater than)
+        self._reset()
+        t = self._perf_table()
+        t["cohorts"]["spread"]["buckets"][4]["dev_trading"] = -0.04
+        t["cohorts"]["mid"]["buckets"][2]["dev_trading"] = -0.04
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+
+    def test_loop_can_never_promote(self):
+        """THE invariant. `adj` is clipped at 0.0 on the upside and
+        `req = clip(-W*adj, 0, MAX_REQ) >= 0`, so no code path in this module
+        can RAISE an ROI — not for a favourably-scored cohort, not for a
+        sign-flipped file, not for a hostile one."""
+        t = self._perf_table()
+        for dim in t["cohorts"]:
+            for i, b in enumerate(t["cohorts"][dim]["buckets"]):
+                b["dev_trading"] = b["dev_blend"] = 0.01 + 0.001 * i
+        t["series"] = {"KXPERF": self._rec("neutral", 0.03)}
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0):
+            for spread in (0, 2, 5, 12, 40):
+                for mid in (5.0, 25.0, 50.0, 85.0, 99.0):
+                    m = self._meta(spread_cents=spread, mid_cents=mid)
+                    adj, _c = imm.scan_perf_adj(m, self.NOW)
+                    self.assertEqual(adj, 0.0)
+                    self.assertEqual(imm.scan_perf_req(m, self.NOW), 0.0)
+                    self.assertEqual(imm._raw_roi(m), imm._raw_roi_gross(m))
+                    self.assertLessEqual(imm._market_roi(m, set()),
+                                         imm._raw_roi_gross(m))
+        # a file inventing a "boost" verdict is refused outright
+        self._reset()
+        t = self._perf_table()
+        t["series"] = {"KXPERF": self._rec("boost", 0.04)}
+        self._write(t)
+        self.assertEqual(imm.load_scan_perf(), 0)
+        self.assertFalse(imm.scan_perf_fresh())
+        self.assertEqual(imm._raw_roi(self._meta()),
+                         imm._raw_roi_gross(self._meta()))
+
+    def test_req_is_bounded_and_the_effective_bar_never_exceeds_0_15(self):
+        """MAX_REQ 0.10 -> effective bar <= 0.15/day, under the MEASURED Q5
+        median admission ROI of 0.2205/day (n=29): the tier's best-ROI
+        quintile clears the worst table the scorer can possibly emit."""
+        self.assertEqual(imm.SCAN_MIN_ROI, 0.05)
+        self.assertEqual(imm.SCAN_PERF_MAX_REQ, 0.10)
+        self.assertAlmostEqual(imm.SCAN_MIN_ROI + imm.SCAN_PERF_MAX_REQ, 0.15)
+        t = self._one_dim("spread", 4, -5.0, dim_clip=5.0)
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m = self._meta(spread_cents=25)
+        with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 10.0):
+            # the file claims -5.0/day; ADJ_CLIP holds adj at -0.04 and
+            # MAX_REQ holds req at 0.10 whatever the weight
+            self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.04)
+            self.assertAlmostEqual(imm.scan_perf_req(m, self.NOW), 0.10)
+            # and the bar it implies is exactly 0.15/day, no more
+            def cand(t_, roi):
+                return self._meta(ticker=t_, event_ticker=t_.rsplit("-", 1)[0],
+                                  series=t_.split("-")[0], spread_cents=25,
+                                  est_dollars_per_day=roi * 10.0)
+            under, over = cand("KXPERF-26NOV-T2", 0.149), cand("KXPERF-26DEC-T3", 0.151)
+            cut = imm.scan_group_cut([under, over], set(), members=set())
+            self.assertEqual(cut, {under.ticker})
+
+    # ---- 9-13: the arithmetic and the blast-radius bounds ---------------------
+
+    def test_adj_is_the_min_not_the_sum(self):
+        """must_fix #1, both judges. Spread, dtc and pool are heavily
+        collinear on this roster — KXCPIYOY sits in spread 20c+, dtc 30-90d
+        AND pool <$20 at once, so a SUM counted the same MEASURED -$46.30
+        three times and made the loop most over-confident exactly where it
+        was most over-fit."""
+        t = self._perf_table()
+        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        t["cohorts"]["spread"]["buckets"][4]["dev_trading"] = -0.02
+        t["cohorts"]["mid"]["buckets"][2]["dev_trading"] = -0.03
+        for i in (2, 3, 4):        # flat -0.04 from 60d out, so dtc is exact
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m = self._meta(spread_cents=25, mid_cents=50.0,
+                       close_time=self.NOW + timedelta(days=90))
+        adj, code = imm.scan_perf_adj(m, self.NOW)
+        self.assertAlmostEqual(adj, -0.04)
+        self.assertNotAlmostEqual(adj, -0.09)
+        self.assertTrue(code.startswith("dtc"), code)     # binding term first
+        self.assertIsInstance(code, str)
+        # and a series/event term can only make it MORE negative, never less
+        t["series"] = {"KXPERF": self._rec("down_rank", -0.005)}
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.04)
+
+    def test_dev_is_interpolated_between_bucket_centres(self):
+        """judge 2 must_fix #4. A book that flickers between 4c and 5c must
+        not move a candidate a WHOLE bucket step on one admission snapshot."""
+        t = self._perf_table()
+        devs = [0.0, -0.01, -0.03, -0.02, -0.01]
+        for i, d in enumerate(devs):
+            t["cohorts"]["spread"]["buckets"][i]["dev_trading"] = d
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        d4, d5 = imm._interp_dev("spread", 4.0), imm._interp_dev("spread", 5.0)
+        step = abs(devs[2] - devs[1])
+        self.assertNotAlmostEqual(d4, d5)
+        self.assertLess(abs(d5 - d4), 0.5 * step,
+                        "4c and 5c still differ by most of a bucket step")
+        for d in (d4, d5):
+            self.assertLess(devs[2], d)      # strictly between the two centres
+            self.assertLess(d, devs[1])
+        # FLAT outside the end centres — never extrapolated
+        self.assertAlmostEqual(imm._interp_dev("spread", 0.0), devs[0])
+        self.assertAlmostEqual(imm._interp_dev("spread", -99.0), devs[0])
+        self.assertAlmostEqual(imm._interp_dev("spread", 25.0), devs[4])
+        self.assertAlmostEqual(imm._interp_dev("spread", 9999.0), devs[4])
+        # a dimension the table does not carry simply does not vote
+        self.assertEqual(imm._interp_dev("nosuchdim", 1.0), 0.0)
+
+    def test_cohort_edges_come_from_the_file(self):
+        """SPEC 3.3: the dimensions and edges are pre-registered and FROZEN,
+        and they ship in the JSON, never as constants here — so re-fitting
+        them can never be a quiet code edit."""
+        t = self._perf_table()
+        t["cohorts"]["spread"]["buckets"][2]["dev_trading"] = -0.03
+        self._write(t)
+        imm.load_scan_perf()
+        self.assertAlmostEqual(imm._interp_dev("spread", 7.0), -0.03)
+        # move the CENTRE in the file and the same 7c book scores differently
+        self._reset()
+        t = self._perf_table()
+        t["cohorts"]["spread"]["buckets"][2]["centre"] = 14.0
+        t["cohorts"]["spread"]["buckets"][3]["centre"] = 20.0
+        t["cohorts"]["spread"]["buckets"][4]["centre"] = 30.0
+        t["cohorts"]["spread"]["buckets"][2]["dev_trading"] = -0.03
+        self._write(t)
+        imm.load_scan_perf()
+        self.assertNotAlmostEqual(imm._interp_dev("spread", 7.0), -0.03)
+        self.assertAlmostEqual(imm._interp_dev("spread", 14.0), -0.03)
+        with open(imm.__file__, encoding="utf-8") as f:
+            src = f.read()
+        for bad in ("COHORT_EDGES", "SCAN_PERF_EDGES", "_COHORT_BUCKETS",
+                    "BUCKET_EDGES"):
+            self.assertNotIn(bad, src, f"{bad} is a cohort constant in the bot")
+
+    def test_penalized_and_barred_caps_bound_the_blast_radius(self):
+        """SPEC 7.1: whatever the file claims, at most 25 down-rank records
+        and 5 live bars ever take effect, and a file over the writer caps is
+        refused outright."""
+        until = self._iso(self.NOW + timedelta(days=9))
+        t = self._perf_table()
+        t["series"] = {f"KXP{i:03d}": self._rec("down_rank", -0.0001 * (i + 1))
+                       for i in range(200)}
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        kept = [k for k, v in imm.SCAN_PERF_SERIES.items()
+                if v["verdict"] == "down_rank"]
+        self.assertEqual(len(kept), imm.SCAN_PERF_MAX_PENALIZED)
+        self.assertEqual(imm._scan_perf_state["n_down_rank"], 25)
+        # worst-dev first: the 25 deepest survive
+        self.assertEqual(sorted(kept), sorted(f"KXP{i:03d}" for i in range(175, 200)))
+
+        self._reset()
+        t = self._perf_table()
+        t["series"] = {f"KXB{i:03d}": self._rec("bar", -0.001 * (i + 1), until)
+                       for i in range(100)}
+        t["limits"].update(barred_series=100)
+        self._write(t)
+        self.assertEqual(imm.load_scan_perf(), 0, "100 bars must reject the file")
+        self.assertFalse(imm.scan_perf_fresh())
+
+        self._reset()
+        t = self._perf_table()
+        t["series"] = {f"KXB{i}": self._rec("bar", -0.001 * (i + 1), until)
+                       for i in range(6)}
+        t["limits"].update(barred_series=6)
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        live = [k for k, v in imm.SCAN_PERF_SERIES.items() if v["verdict"] == "bar"]
+        self.assertEqual(len(live), imm.SCAN_PERF_MAX_BARRED)
+        self.assertEqual(imm._scan_perf_state["n_bar"], 5)
+        # a bar share above a quarter of the universe rejects the whole file
+        self._reset()
+        t = self._perf_table()
+        t["limits"]["bar_frac_universe"] = 0.4
+        self._write(t)
+        self.assertEqual(imm.load_scan_perf(), 0)
+        # and so does a table over the record cap
+        self._reset()
+        t = self._perf_table()
+        t["series"] = {f"KXR{i:04d}": self._rec("neutral", 0.0)
+                       for i in range(imm.SCAN_PERF_MAX_RECORDS + 1)}
+        self._write(t)
+        self.assertEqual(imm.load_scan_perf(), 0)
+
+    def test_record_past_its_until_is_dropped_at_load(self):
+        t = self._perf_table()
+        t["series"] = {
+            "KXDEAD": self._rec("bar", -0.04,
+                                self._iso(self.NOW - timedelta(days=1))),
+            "KXLIVE": self._rec("bar", -0.03,
+                                self._iso(datetime.now(timezone.utc)
+                                          + timedelta(days=3)))}
+        t["limits"].update(barred_series=2)
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        self.assertNotIn("KXDEAD", imm.SCAN_PERF_SERIES)
+        self.assertIn("KXLIVE", imm.SCAN_PERF_SERIES)
+        # a bar with NO until is a permanent verdict: SPEC 3.6 forbids it
+        self._reset()
+        t = self._perf_table()
+        t["series"] = {"KXFOREVER": self._rec("bar", -0.04)}
+        t["limits"].update(barred_series=1)
+        self._write(t)
+        self.assertEqual(imm.load_scan_perf(), 0)
+
+    # ---- 14-17: the hard bar --------------------------------------------------
+
+    def _barred_table(self, series=None, events=None):
+        t = self._perf_table()
+        until = self._iso(datetime.now(timezone.utc) + timedelta(days=9))
+        t["series"] = {s: self._rec("bar", -0.04, until) for s in (series or [])}
+        t["events"] = {e: self._rec("bar", -0.04, until) for e in (events or [])}
+        t["limits"].update(barred_series=len(t["series"]),
+                           barred_events=len(t["events"]))
+        return t
+
+    def test_perf_bar_rejects_a_newcomer_and_never_a_member(self):
+        """Jack 2026-09-03: "once start quoting, should quote to completion.
+        dont unquote them". MEMBERS NEVER REACH _scan_admission — that is a
+        structural property of the call site, not a convention, and this
+        pins both halves."""
+        self._write(self._barred_table(series=["KXPERF"]))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        budget = {"series": 5, "history": 5}
+        with mock.patch.object(imm, "SCAN_PERF_BAR_ENABLED", True):
+            self.assertEqual(
+                bot._scan_admission(self._meta(), {"ticker": "KXPERF-26NOV-T1"},
+                                    {}, self.NOW, budget), "perf_barred")
+            # no book or series read was spent getting there
+            self.assertEqual(budget, {"series": 5, "history": 5})
+            # a member of the barred series is never cut by the group walk
+            m = self._meta()
+            cut = imm.scan_group_cut([m], set(), members={m.ticker})
+            self.assertEqual(cut, set())
+        # the call site itself only ever passes NON-members
+        with open(imm.__file__, encoding="utf-8") as f:
+            src = f.read().split("\n")
+        calls = [i for i, ln in enumerate(src) if "self._scan_admission(" in ln]
+        self.assertTrue(calls)
+        for i in calls:
+            window = "\n".join(src[max(0, i - 25):i])
+            self.assertIn("scan_members", window,
+                          "_scan_admission is reachable without a member guard")
+        _clean_persist()
+
+    def test_bar_is_disarmed_by_default(self):
+        """IMM_SCAN_PERF_BAR is 0 and stays 0 until the first statement paste:
+        the tier's rent is $244.33 MODELLED against $21.28 MEASURED on 2 of
+        83 events, and a verdict whose positive term is 99% unmeasured is the
+        "a model is not a measurement" failure. Ranking arms first."""
+        self.assertFalse(imm.SCAN_PERF_BAR_ENABLED)
+        self._write(self._barred_table(series=["KXPERF"],
+                                       events=["KXPERF"]))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        self.assertIsNone(imm.scan_perf_barred("KXPERF", "KXPERF-26NOV"))
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertNotEqual(
+            bot._scan_admission(self._meta(), {"ticker": "KXPERF-26NOV-T1"},
+                                {}, self.NOW, {"series": 0, "history": 0}),
+            "perf_barred")
+        _clean_persist()
+
+    def test_bar_expires_at_until(self):
+        """`until` = generated_at + 14d. A barred unit stops generating
+        evidence, so a forced re-test is the only honest relaxation:
+        tighten immediate, relax by timeout only."""
+        soon = datetime.now(timezone.utc) + timedelta(seconds=120)
+        t = self._perf_table()
+        t["series"] = {"KXPERF": self._rec("bar", -0.04, self._iso(soon))}
+        t["limits"].update(barred_series=1)
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        with mock.patch.object(imm, "SCAN_PERF_BAR_ENABLED", True):
+            self.assertEqual(imm.scan_perf_barred("KXPERF", "KXPERF-26NOV"),
+                             "series:KXPERF")
+            self.assertIsNone(imm.scan_perf_barred(
+                "KXPERF", "KXPERF-26NOV", now_ts=soon.timestamp() + 1))
+
+    def test_event_root_bar_covers_siblings_but_not_other_roots(self):
+        """The bar unit is the event ROOT (the ticker minus its trailing date
+        segment): weekly events re-list under a new date every week, so a bar
+        keyed on the dated event would expire the instant it could act."""
+        self.assertEqual(imm.scan_perf_event_root("KXAXP-26OCTCARDS"), "KXAXP")
+        self.assertEqual(imm.scan_perf_event_root("KXCPIYOY-26NOV"), "KXCPIYOY")
+        self.assertEqual(imm.scan_perf_event_root("KXEOWEEK-26SEP19"), "KXEOWEEK")
+        self.assertEqual(imm.scan_perf_event_root("KXMLBPLAYOFFS"),
+                         "KXMLBPLAYOFFS")
+        self._write(self._barred_table(events=["KXEOWEEK"]))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        with mock.patch.object(imm, "SCAN_PERF_BAR_ENABLED", True):
+            for ev in ("KXEOWEEK-26SEP19", "KXEOWEEK-26SEP26", "KXEOWEEK-27JAN02"):
+                self.assertEqual(imm.scan_perf_barred("KXEOWEEK", ev),
+                                 "event:KXEOWEEK")
+            self.assertIsNone(imm.scan_perf_barred("KXOTHER", "KXOTHER-26SEP19"))
+            self.assertIsNone(imm.scan_perf_barred("KXEOWEEKLY",
+                                                   "KXEOWEEKLY-26SEP19"))
+
+    # ---- 18-21: the cut, the label and the untouched neighbours ---------------
+
+    def test_req_leaves_the_seat_empty_rather_than_filling_it(self):
+        """Mirrors test_min_roi_keeps_seats_empty_rather_than_filling_them
+        (Jack 2026-09-13): a seat under the bar stays EMPTY. The whole point
+        of riding the existing min_roi test is that this needs no new rule."""
+        t = self._perf_table()
+        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        for i in (2, 3, 4):
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m = self._meta(est_dollars_per_day=0.8)       # gross ROI 0.08/day
+        self.assertAlmostEqual(imm._raw_roi_gross(m), 0.08)
+        with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0):
+            self.assertAlmostEqual(imm.scan_perf_req(m, self.NOW), 0.04)
+            self.assertAlmostEqual(imm._raw_roi(m), 0.04)
+            cut = imm.scan_group_cut([m], set(), members=set())
+        self.assertEqual(cut, {m.ticker}, "the seat was filled under the bar")
+        self.assertGreater(imm.SCAN_TOP_N, 1)        # seats were available
+
+    def test_cut_is_labelled_perf_roi_not_scan_top_n(self):
+        """A seat left empty by the loop must be countable. Forgone rent is
+        never booked as a loss, so seats-left-empty is a pre-registered input
+        to the kill rule (SPEC 10.3), not decoration."""
+        t = self._perf_table()
+        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        for i in (2, 3, 4):
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        real_gross = imm._raw_roi_gross
+
+        def gross(m):
+            return 0.08 if getattr(m, "scan", False) else real_gross(m)
+        rows, logs = self._drive_scan_refresh(
+            weight=1.0, gross=gross, close_days=90)
+        scan_rows = [r for r in rows if r.get("is_scan")]
+        self.assertTrue(scan_rows, "the fixture produced no scan candidates")
+        self.assertEqual({r["decision"] for r in scan_rows}, {"perf_roi"})
+        self.assertTrue(any("'perf_roi': " in ln for ln in logs), logs[-3:])
+        # and a bar shows up in the scan_skips counters / open-scan log line
+        self._reset()
+        self._write(self._barred_table(series=["KXNOVEL"]))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        with mock.patch.object(imm, "SCAN_PERF_BAR_ENABLED", True):
+            _rows, logs = self._drive_scan_refresh()
+        self.assertTrue(any("perf_barred" in ln and "open-scan:" in ln
+                            for ln in logs), logs[-3:])
+
+    def test_penalty_is_applied_exactly_once(self):
+        """`_market_roi` recomputes the ratio INLINE rather than calling
+        `_raw_roi`, which is the double-subtraction hazard this guards."""
+        t = self._perf_table()
+        t["cohorts"]["mid"]["buckets"][2]["dev_trading"] = -0.03
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m = self._meta(mid_cents=50.0, est_dollars_per_day=1.0)
+        with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0):
+            req = imm.scan_perf_req(m)
+            self.assertAlmostEqual(req, 0.03)
+            self.assertAlmostEqual(imm._raw_roi(m), imm._raw_roi_gross(m) - req)
+            self.assertAlmostEqual(imm._market_roi(m, set()),
+                                   (imm._raw_roi_gross(m) - req) * 1.0)
+            self.assertAlmostEqual(imm._market_roi(m, {m.ticker}),
+                                   (imm._raw_roi_gross(m) - req) * 1.15)
+            # RANK_ONLY de-escalation: the rank moves, the bar does not
+            with mock.patch.object(imm, "SCAN_PERF_RANK_ONLY", True):
+                self.assertAlmostEqual(imm._raw_roi(m), imm._raw_roi_gross(m))
+                self.assertAlmostEqual(imm._market_roi(m, set()),
+                                       imm._raw_roi_gross(m) - req)
+
+    def test_normal_book_finecon_and_gas_walks_are_untouched(self):
+        """Every hook is scoped on `m.scan`. _group_walk_cut, scan_group_cut
+        and SCAN_MIN_ROI are not modified at all, so a hostile table cannot
+        reach finecon, the normal book, Ramp, *CC, gas or KXRAIN."""
+        def m(t, est, scan=False):
+            return MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=150.0, program_end=None,
+                target_size=1000, discount_factor=0.5, cutoff=None,
+                close_time=self.NOW + timedelta(days=90), mid_cents=50.0,
+                spread_cents=25, est_dollars_per_day=est,
+                est_exposure_dollars=10.0, est_collateral_dollars=0.0, scan=scan)
+        fincon = [m(f"KXSPRLVL-26DEC{1 + i:02d}-T1", 1.0 - 0.01 * i)
+                  for i in range(12)]
+        gas = [m(f"KXAAAGASM-26OCT{1 + i:02d}-T1", 1.0 - 0.01 * i)
+               for i in range(6)]
+        before = (imm.finecon_group_cut(fincon, set(), members=set()),
+                  imm.event_top_n_cut(gas, incumbent=set()),
+                  [imm._market_roi(x, set()) for x in fincon + gas])
+        hostile = self._perf_table()
+        hostile["params"]["dim_clip"] = 0.05
+        for dim in hostile["cohorts"]:
+            for i, b in enumerate(hostile["cohorts"][dim]["buckets"]):
+                b["dev_trading"] = b["dev_blend"] = -0.04 if i == 2 else -0.01
+        hostile["series"] = {"KXSPRLVL": self._rec("down_rank", -0.04),
+                             "KXAAAGASM": self._rec("down_rank", -0.04)}
+        self._write(hostile)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0):
+            after = (imm.finecon_group_cut(fincon, set(), members=set()),
+                     imm.event_top_n_cut(gas, incumbent=set()),
+                     [imm._market_roi(x, set()) for x in fincon + gas])
+            self.assertEqual(before, after)
+            for x in fincon + gas:
+                self.assertEqual(imm.scan_perf_req(x), 0.0)
+                self.assertEqual(imm._raw_roi(x), imm._raw_roi_gross(x))
+
+    # ---- 22-26: the rollout stage, the sinks and what is NOT built ------------
+
+    def test_weight_zero_is_observe_only(self):
+        """The rollout stage, and the cheapest insurance in the whole design:
+        at WEIGHT 0 the decisions are identical to an absent table, but
+        perf_adj/perf_req ARE stamped — which turns the IN-SAMPLE, MODELLED
+        counterfactual into a real out-of-sample one at zero risk."""
+        self.assertEqual(imm.SCAN_PERF_WEIGHT, 0.0)
+        t = self._perf_table()
+        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        for i in (2, 3, 4):
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m = self._meta(close_time=self.NOW + timedelta(days=90))
+        self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.04)
+        self.assertEqual(imm.scan_perf_req(m, self.NOW), 0.0)
+        self.assertEqual(imm._raw_roi(m), imm._raw_roi_gross(m))
+        self.assertEqual(imm._market_roi(m, set()), imm._raw_roi_gross(m))
+        rows, _logs = self._drive_scan_refresh(close_days=90)
+        scan_rows = [r for r in rows if r.get("is_scan")]
+        self.assertTrue(scan_rows)
+        self.assertNotIn("perf_roi", {r["decision"] for r in scan_rows})
+        self.assertTrue(any(r["perf_adj"] < 0.0 for r in scan_rows),
+                        "observe-only stamped nothing")
+        self.assertTrue(all(r["perf_req"] == 0.0 for r in scan_rows))
+
+    def test_selection_events_row_size_discipline(self):
+        """selection_events wrote 56,720 rows on 2026-09-15 and
+        IMM_LOGGING's third guarantee is "no sink floods the log": two floats
+        on EVERY row, the strings only on non-neutral rows, and `perf_code`
+        is ONE string, never a list."""
+        t = self._perf_table()
+        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        for i in (2, 3, 4):
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        rows, _logs = self._drive_scan_refresh(close_days=90)
+        self.assertTrue(rows)
+        for r in rows:
+            if "series" not in r:
+                continue                       # a "gone" row carries no meta
+            self.assertIn("perf_adj", r)
+            self.assertIn("perf_req", r)
+            self.assertIsInstance(r["perf_adj"], float)
+            self.assertIsInstance(r["perf_req"], float)
+            neutral = r["perf_adj"] == 0.0 and r["perf_req"] == 0.0
+            if neutral:
+                for k in ("perf_v", "perf_code", "perf_unit", "perf_gen"):
+                    self.assertNotIn(k, r, f"{k} on a neutral row")
+            else:
+                self.assertIn(r["perf_v"], ("down_rank", "bar"))
+                self.assertIsInstance(r["perf_code"], str)
+                self.assertEqual(r["perf_gen"],
+                                 self.NOW.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.assertTrue(any(r.get("perf_v") == "down_rank" for r in rows))
+
+    def test_cycle_log_column_is_appended_last(self):
+        """APPEND ONLY: imm_reward_recon.py reads this file POSITIONALLY
+        (row[0],[1],[7],[8],[11]) and gates on len(row) >= 13. One column,
+        at the end, and the 34 pre-existing indices unchanged."""
+        hdr = IncentiveMarketMaker.CYCLE_LOG_HEADER.strip().split(",")
+        self.assertEqual(hdr[-1], "perf_req")
+        self.assertEqual(len(hdr), 35)
+        self.assertEqual(hdr[:34], [
+            "ts", "ticker", "ext_bid", "ext_ask", "yes_depth", "no_depth",
+            "target", "est_frac", "qual_sides", "acct_pos", "own_pos",
+            "pool_per_day", "quoted", "own_bid_ct", "own_ask_ct",
+            "own_bid_top", "own_ask_top", "own_pad_bid_ct", "own_pad_ask_ct",
+            "want_bid_ct", "want_ask_ct", "want_pad_ct", "hour_mult",
+            "rung_lo", "room_buy", "room_sell", "vol24h", "discount",
+            "is_scan", "is_sticky", "reduce_only", "fast", "run_id",
+            "config_hash"])
+        for i, name in ((0, "ts"), (1, "ticker"), (7, "est_frac"),
+                        (8, "qual_sides"), (11, "pool_per_day")):
+            self.assertEqual(hdr[i], name)
+        path = os.path.join(
+            imm.STATUS_DIR,
+            f"cycle_log_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        with open(path, encoding="utf-8") as f:
+            lines = [ln for ln in f.read().split("\n") if ln.strip()]
+        self.assertGreater(len(lines), 1, "no cycle rows were written")
+        for ln in lines[1:]:
+            if ln.split(",")[0] == "ts":
+                continue                       # an inline schema-widen header
+            cells = ln.split(",")
+            self.assertEqual(len(cells), 35)
+            self.assertEqual(float(cells[-1]), 0.0)   # neutral, no table
+        _clean_persist()
+
+    def test_kill_switch_disables_every_read(self):
+        """IMM_SCAN_PERF=0: the loader never runs and every lookup is
+        neutral — decisions byte-identical to an absent file."""
+        self._write(self._barred_table(series=["KXPERF"]))
+        with mock.patch.object(imm, "SCAN_PERF_ENABLED", False):
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertEqual(imm.SCAN_PERF_COHORTS, {})
+            self.assertFalse(imm.scan_perf_fresh())
+            m = self._meta()
+            self.assertEqual(imm.scan_perf_req(m), 0.0)
+            self.assertEqual(imm._raw_roi(m), imm._raw_roi_gross(m))
+            with mock.patch.object(imm, "SCAN_PERF_BAR_ENABLED", True):
+                self.assertIsNone(imm.scan_perf_barred("KXPERF", "KXPERF-26NOV"))
+        # and the fastest kill switch of all: an EMPTY table clears everything
+        # within one universe refresh, no restart
+        self._reset()
+        self._write(self._one_dim("spread", 4, -0.03))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        self.assertTrue(imm.scan_perf_fresh())
+        empty = self._perf_table()
+        empty["cohorts"] = {}
+        self._write(empty)
+        imm.load_scan_perf()
+        self.assertFalse(imm.scan_perf_fresh())
+        self.assertEqual(imm.scan_perf_req(self._meta()), 0.0)
+
+    def test_no_perf_exit_branch_exists(self):
+        """SPEC 11. Design C's exit re-implemented the SCAN_DRIFT /
+        SCAN_FILL_HALT tripwire Jack disarmed on 2026-09-05 ("dont need
+        these") with three more dials; its 40-contract threshold was
+        judgement, not measurement (0 of 147 scan markets ever reached the
+        persistence study's ~80-contract split; max observed |pos| is 60).
+        There is no exit branch AT ALL in v1, which is what makes
+        quote-to-completion structural."""
+        with open(imm.__file__, encoding="utf-8") as f:
+            src = f.read()
+        for bad in ("perf_exit", "IMM_SCAN_PERF_EXIT",
+                    "scan_perf_barred_markets", "perf_exit_since"):
+            self.assertNotIn(bad, src)
+        self.assertFalse(hasattr(imm, "SCAN_PERF_EXIT"))
+        # the only decision labels this loop adds
+        self.assertIn("perf_barred", src)
+        self.assertIn("perf_roi", src)
+
+    # ---- the refresh harness -------------------------------------------------
+
+    def _drive_scan_refresh(self, weight=None, gross=None, close_days=30):
+        """One real refresh_universe over a novel (= scan universe) series,
+        returning (selection_events rows written this refresh, log lines)."""
+        ev, tickers = "KXNOVEL-99DEC31", ["KXNOVEL-99DEC31-T5",
+                                          "KXNOVEL-99DEC31-T6"]
+        now = datetime.now(timezone.utc)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        client = FakeClient()
+        for t in tickers:
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": (now - timedelta(days=1)).strftime(fmt),
+                 "end_date": (now + timedelta(days=6)).strftime(fmt)})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": ev, "status": "active",
+                "close_time": (now + timedelta(days=close_days)).strftime(fmt),
+                "open_time": (now - timedelta(hours=48)).strftime(fmt),
+                "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+                "volume_fp": "20.00", "volume_24h_fp": "5",
+                "strike_type": "greater"}
+            client.books[t] = {"orderbook_fp": {
+                "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+                "no_dollars": [["0.49", "1200"]]}}
+            client.candles[t] = [{"yes_bid": {"close": 40},
+                                  "yes_ask": {"close": 44}, "volume": 1}
+                                 for _ in range(20)]
+        client.series_meta["KXNOVEL"] = {
+            "category": "Economics",
+            "settlement_sources": [{"name": "EIA", "url": "https://www.eia.gov"}]}
+        path = os.path.join(
+            imm.STATUS_DIR,
+            f"selection_events_{now.strftime('%Y-%m-%d')}.jsonl")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        logs = []
+        stack = [mock.patch.object(imm, "ALLOWLIST_ONLY", True),
+                 mock.patch.object(imm, "LADDER_MODE", "atref"),
+                 mock.patch.object(imm, "log",
+                                   side_effect=lambda s, *a, **k: logs.append(s))]
+        if weight is not None:
+            stack.append(mock.patch.object(imm, "SCAN_PERF_WEIGHT", weight))
+        if gross is not None:
+            stack.append(mock.patch.object(imm, "_raw_roi_gross", gross))
+        _clean_persist()
+        try:
+            for p in stack:
+                p.start()
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.state.universe_at = 0.0
+            bot.refresh_universe(now, {})
+        finally:
+            for p in reversed(stack):
+                p.stop()
+            _clean_persist()
+        rows = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                rows = [json.loads(ln) for ln in f if ln.strip()]
+        except OSError:
+            pass
+        return rows, logs
 
 
 if __name__ == "__main__":

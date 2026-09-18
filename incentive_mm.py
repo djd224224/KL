@@ -1310,6 +1310,278 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     return _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
 
 
+# ---------------------------------------------------------------------------
+# OPEN-SCAN PERFORMANCE LOOP — accessors (2026-09-18).
+#
+# The open-scan tier's first 12 days are MEASURED at -$237.77 of trading P&L
+# over 10,434 $-days at risk (mu_trading_only -0.02279/$-day, 24h markout
+# -5.09 c/ct on 106 fills), with 12 of 83 events carrying 89% of the loss.
+# The losses are STRUCTURAL, not per-series: mid 30-70c (n=82, -150.7),
+# spread 5-9c (n=31, -106.7) and 20c+ (n=38, -83.8), 30-90d to close (n=38,
+# -107.9) and pools under $20/day (n=86, -153.2), while 1c-spread state
+# prints (n=51, 56% of the risk-days) lost only -21.8. `empirical_persistence`
+# 8.1 is the reason the key is structure and not the series name: the
+# unshrunk series mean is the WORST predictor in every forward cut (3-13%
+# worse MAE than ignoring history, ICC(net) 0.035-0.05), and a scan market is
+# a one-shot weekly, so a key needing a second observation on the same series
+# fires after the money is gone.
+#
+# imm_scan_perf.py scores that loss per structural cohort in the SAME UNITS
+# as _raw_roi ($/day per $ at risk) and writes SCAN_PERF_FILE. The bot then
+# demands that much EXTRA ROI of a scan newcomer:
+#
+#     req(m)  = clip(-WEIGHT * adj(m), 0, MAX_REQ)      # >= 0 ALWAYS
+#     roi'(m) = _raw_roi_gross(m) - req(m)              # scoped on m.scan
+#
+# `_raw_roi(m) - req < SCAN_MIN_ROI` is exactly `_raw_roi(m) < SCAN_MIN_ROI
+# + req`, so the raised bar needs NO change to _group_walk_cut,
+# scan_group_cut or SCAN_MIN_ROI — zero blast radius on finecon and the
+# gas/*CC/Ramp event_top_n_cut, and no shared-signature maintenance
+# liability in a file that ff-merges into prod every 30 minutes.
+#
+# THE INVARIANT: req >= 0 and adj <= 0, both by construction. There is no
+# code path here that can RAISE an ROI, so neither a sign-flipped table nor
+# a hostile "promote" file can move the queue upward. Ships observe-only:
+# IMM_SCAN_PERF_WEIGHT defaults to 0.0, so req is identically 0 and only the
+# perf_adj/perf_req stamps on selection_events and cycle_log change. Kill
+# switch, fastest first: delete SCAN_PERF_FILE (neutral within one universe
+# refresh, no restart) -> IMM_SCAN_PERF_WEIGHT=0 -> IMM_SCAN_PERF=0.
+_SCAN_PERF_DIM_CODE = {"spread": "sp", "mid": "mid", "dtc": "dtc", "pool": "p"}
+
+
+def scan_perf_event_root(event_ticker: str) -> str:
+    """EVENT ROOT = the event ticker minus its TRAILING DATE SEGMENT.
+
+    KXCPIYOY-26NOV -> KXCPIYOY, KXAXP-26OCTCARDS -> KXAXP,
+    KXNOVEL-99DEC31 -> KXNOVEL. The trailing segment qualifies as a date
+    when it starts YYMMM (two digits + a three-letter month), which is
+    Kalshi's universal event-date spelling; anything else (an undated event
+    such as KXMLBPLAYOFFS) is its own root and is returned unchanged.
+
+    The root, not the dated event, is the bar unit (SPEC 3.5/7): weekly
+    events re-list under a new date every week, so a bar keyed on the dated
+    event would expire the instant it could act. The scorer emits an event
+    record only when the root has >= 2 distinct dated events, otherwise the
+    "event" term is a market-level scorecard with n=1."""
+    s = str(event_ticker or "")
+    m = re.match(r"^(?P<root>.+)-\d{2}[A-Z]{3}", s)
+    return m.group("root") if m else s
+
+
+def _scan_perf_dim_value(meta, field: str,
+                         now_utc: Optional[datetime] = None) -> Optional[float]:
+    """The APPLYING-side value of one cohort dimension for a candidate.
+
+    A candidate has never been quoted, so the bot has only the live
+    admission snapshot — the scorer fits `spread`/`mid` from a trailing-6h
+    median instead (SPEC 3.4), which is why the applying side interpolates
+    between bucket CENTRES rather than stepping at an edge. Returns None
+    when the meta cannot answer (an unpriceable book, no close_time): that
+    dimension simply does not vote."""
+    if field == "spread_cents":
+        v = getattr(meta, "spread_cents", None)
+    elif field == "mid_cents":
+        v = getattr(meta, "mid_cents", None)
+    elif field == "dollars_per_day":
+        v = getattr(meta, "dollars_per_day", None)
+    elif field == "days_to_close":
+        ct = getattr(meta, "close_time", None)
+        if ct is None:
+            return None
+        now = now_utc or datetime.now(timezone.utc)
+        try:
+            return (ct - now).total_seconds() / 86400.0
+        except (TypeError, AttributeError):
+            return None
+    else:
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def scan_perf_fresh() -> bool:
+    """True when a loaded, in-date table may be acted on. Empty tables (no
+    file, a cleared stale table, the kill switch) read as NOT fresh, which
+    is byte-identical to the pre-loop bot."""
+    return bool(SCAN_PERF_ENABLED and SCAN_PERF_COHORTS
+                and not _scan_perf_state["stale"])
+
+
+def _interp_dev(dim: str, value: float) -> float:
+    """Piecewise-linear between adjacent bucket CENTRES; FLAT outside the
+    end centres (never extrapolated).
+
+    The cliff fix (judge 2 must_fix #4): bucket-edge assignment made a 4c
+    book and a 5c book differ by a WHOLE bucket step on a single flickering
+    admission snapshot. Interpolating between centres makes them differ by
+    a fraction of a step instead. Centres (including the open-ended top
+    bucket's risk_days-weighted mean) are emitted BY THE SCORER in the file
+    — there is no bucket constant in this module, which test
+    `test_cohort_edges_come_from_the_file` pins.
+
+    A muted bucket carries dev 0.0 in the file and is used as written, so a
+    muted region pulls the curve back toward neutral rather than letting
+    its neighbours interpolate a penalty across it."""
+    ent = SCAN_PERF_COHORTS.get(dim) or {}
+    pts: List[Tuple[float, float]] = []
+    for b in ent.get("buckets") or []:
+        c, d = b.get("centre"), b.get("dev")
+        if c is None or d is None:
+            continue
+        pts.append((float(c), float(d)))
+    if not pts:
+        return 0.0
+    pts.sort()
+    if value <= pts[0][0]:
+        return pts[0][1]
+    if value >= pts[-1][0]:
+        return pts[-1][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x0 <= value <= x1:
+            if x1 == x0:
+                return min(y0, y1)
+            return y0 + (y1 - y0) * (value - x0) / (x1 - x0)
+    return 0.0
+
+
+def scan_perf_adj(meta, now_utc: Optional[datetime] = None) -> Tuple[float, str]:
+    """(adj <= 0.0, short code). adj = the MIN over the four interpolated
+    dimension devs and the series / event-root devs, clipped to
+    [-SCAN_PERF_ADJ_CLIP, 0.0].
+
+    MIN, NEVER A SUM (must_fix #1, both judges). Spread, days-to-close and
+    pool are heavily collinear on this roster: KXCPIYOY sits in spread 20c+,
+    dtc 30-90d AND pool <$20 at once, so summing counted the same MEASURED
+    -$46.30 three times and made the loop most over-confident exactly where
+    it was most over-fit. Taking the single most negative deviation caps
+    |adj| at DIM_CLIP by construction and re-runs the worked example at an
+    effective bar of 0.0781/day (was 0.115) — which still blocks all three
+    KXCPIYOY-26NOV strikes (admission ROIs 0.069/0.058/0.077), the tier's
+    single worst event, on structure alone with no CPI-specific rule.
+
+    The upside clip at 0.0 is the whole safety story: a favourably-scored
+    cohort yields adj = 0, req = 0, i.e. today's behaviour. THE LOOP CAN
+    ONLY SUBTRACT OPPORTUNITY. The acting column is `trading` (SPEC 3.2):
+    the blended basis softens the largest loss cohort (mid 30-70c is -150.7
+    trading but only -9.8 net) on a rent side that is 99% MODELLED until the
+    first statement paste."""
+    if not scan_perf_fresh():
+        return 0.0, ""
+    terms: List[Tuple[float, str]] = []
+    for dim, ent in SCAN_PERF_COHORTS.items():
+        v = _scan_perf_dim_value(meta, str(ent.get("field") or ""), now_utc)
+        if v is None:
+            continue
+        d = _interp_dev(dim, v)
+        if d < 0.0:
+            terms.append((d, f"{_SCAN_PERF_DIM_CODE.get(dim, dim[:3])}"
+                             f"{int(round(v))}"))
+    rec = SCAN_PERF_SERIES.get(str(getattr(meta, "series", "") or ""))
+    if rec is not None:
+        d = rec.get("dev")
+        if d is not None and float(d) < 0.0:
+            terms.append((float(d), "ser"))
+    rec = SCAN_PERF_EVENTS.get(
+        scan_perf_event_root(getattr(meta, "event_ticker", "") or ""))
+    if rec is not None:
+        d = rec.get("dev")
+        if d is not None and float(d) < 0.0:
+            terms.append((float(d), "evt"))
+    if not terms:
+        return 0.0, ""
+    terms.sort()                       # most negative first: the binding term
+    adj = max(-abs(SCAN_PERF_ADJ_CLIP), min(terms[0][0], 0.0))
+    # ONE short string, never a list (SPEC 6.7): selection_events wrote
+    # 56,720 rows on 2026-09-15 and "no sink floods the log" is
+    # IMM_LOGGING's third guarantee. Binding term first.
+    return adj, "|".join(c for _d, c in terms[:4])
+
+
+def scan_perf_req(meta, now_utc: Optional[datetime] = None) -> float:
+    """The EXTRA $/day-per-$ a scan newcomer must earn. >= 0 ALWAYS, and
+    bounded by SCAN_PERF_MAX_REQ (0.10), so the effective admission bar is
+    at most SCAN_MIN_ROI + 0.10 = 0.15/day — under the MEASURED Q5 median
+    admission ROI of 0.2205/day (n=29), i.e. the tier's best-ROI quintile
+    clears the worst table the scorer can possibly emit. Non-scan metas and
+    an absent/stale table return 0.0, which is today's behaviour."""
+    if not (scan_perf_fresh() and getattr(meta, "scan", False)):
+        return 0.0
+    adj, _code = scan_perf_adj(meta, now_utc)
+    return min(max(-SCAN_PERF_WEIGHT * adj, 0.0), SCAN_PERF_MAX_REQ)
+
+
+def _scan_perf_live(rec: Optional[dict], now_ts: float) -> bool:
+    if not rec or rec.get("verdict") != "bar":
+        return False
+    until = rec.get("until_ts")
+    return until is None or now_ts < float(until)
+
+
+def scan_perf_barred(series: str, event_ticker: str,
+                     now_ts: Optional[float] = None) -> Optional[str]:
+    """"series:KXFOO" / "event:KXFOO" (the event ROOT) while a live bar
+    covers this candidate, else None.
+
+    DISARMED BY DEFAULT: IMM_SCAN_PERF_BAR is 0 and stays 0 until the first
+    Kalshi statement paste makes the rent side MEASURED — today the tier's
+    rent is $244.33 MODELLED against $21.28 MEASURED on 2 of 83 events, and
+    barring a series on a statistic whose positive term is 99% unmeasured is
+    the "a model is not a measurement" failure. Ranking arms first."""
+    if not (SCAN_PERF_ENABLED and SCAN_PERF_BAR_ENABLED and scan_perf_fresh()):
+        return None
+    now = time.time() if now_ts is None else now_ts
+    s = str(series or "")
+    if _scan_perf_live(SCAN_PERF_SERIES.get(s), now):
+        return f"series:{s}"
+    root = scan_perf_event_root(event_ticker or "")
+    if _scan_perf_live(SCAN_PERF_EVENTS.get(root), now):
+        return f"event:{root}"
+    return None
+
+
+def scan_perf_note(kind: str, n: int, now_ts: float) -> None:
+    """24h rolling counter behind the COST LINE (SPEC 8.1, judge 2
+    must_fix #6): forgone rent is never observed as a loss, so the seats
+    this loop leaves EMPTY and the candidates it penalises have to be
+    published or the asymmetry cuts against the loop at review time. Both
+    are inputs to the pre-registered kill rule, not decoration."""
+    if n <= 0:
+        return
+    lst = _scan_perf_counts.setdefault(kind, [])
+    lst.append((float(now_ts), int(n)))
+    cut = now_ts - 86400.0
+    if lst[0][0] < cut:
+        _scan_perf_counts[kind] = [x for x in lst if x[0] >= cut]
+
+
+def scan_perf_count_24h(kind: str, now_ts: float) -> int:
+    cut = now_ts - 86400.0
+    return sum(n for ts, n in _scan_perf_counts.get(kind, ()) if ts >= cut)
+
+
+def scan_perf_status(now_utc: datetime) -> dict:
+    """The write_status / digest block (SPEC 6.9)."""
+    now_ts = now_utc.timestamp()
+    gen = float(_scan_perf_state.get("generated_at") or 0.0)
+    return {
+        "generated_at": _scan_perf_state.get("gen_iso", ""),
+        "age_h": round((now_ts - gen) / 3600.0, 2) if gen else None,
+        "fresh": scan_perf_fresh(),
+        "stale": bool(_scan_perf_state.get("stale", True)),
+        "down_ranked": int(_scan_perf_state.get("n_down_rank", 0)),
+        "barred": int(_scan_perf_state.get("n_bar", 0)),
+        "bar_enabled": bool(SCAN_PERF_BAR_ENABLED),
+        "weight": SCAN_PERF_WEIGHT,
+        "seats_empty_24h": scan_perf_count_24h("seats_empty", now_ts),
+        "req_applied_24h": scan_perf_count_24h("req_applied", now_ts),
+    }
+
+
+
+
 # Mention-family ladder multiplier. Jack 2026-07-28: x1.5 ("raise any caps
 # commensurately") -> REMOVED 2026-07-30 ("remove 1.5x multiplier on
 # MENTION, so that they are at 10 contracts"): default 1.0 = whole family
@@ -1690,19 +1962,47 @@ def event_top_n_for(series: str) -> int:
     return 0
 
 
-def _raw_roi(m: "MarketMeta") -> float:
-    """est $/day per $ at risk, no stickiness: the bar SCAN_MIN_ROI tests."""
+def _raw_roi_gross(m: "MarketMeta") -> float:
+    """est $/day per $ at risk BEFORE the open-scan performance penalty.
+
+    Exists so the penalty is applied in exactly ONE place per consumer and
+    the `perf_roi` walk-cut label can compare gross against net without
+    re-deriving the ratio — the two can then never disagree."""
     denom = m.est_exposure_dollars or m.est_collateral_dollars
     return (m.est_dollars_per_day / denom) if denom else 0.0
+
+
+def _raw_roi(m: "MarketMeta") -> float:
+    """est $/day per $ at risk, no stickiness: the bar SCAN_MIN_ROI tests.
+
+    NET of the open-scan performance requirement (2026-09-18), scoped on
+    m.scan: `_raw_roi(m) - req < SCAN_MIN_ROI` is exactly `_raw_roi(m) <
+    SCAN_MIN_ROI + req`, so the tier's raised bar rides the EXISTING
+    min_roi test inside _group_walk_cut and a candidate under it leaves the
+    seat EMPTY (Jack 2026-09-13). req >= 0 by construction, so this can
+    only ever subtract. IMM_SCAN_PERF_RANK_ONLY=1 moves the subtraction to
+    _market_roi alone (rank moves, the bar does not)."""
+    r = _raw_roi_gross(m)
+    if getattr(m, "scan", False) and not SCAN_PERF_RANK_ONLY:
+        r -= scan_perf_req(m)
+    return r
 
 
 def _market_roi(m: "MarketMeta", incumbent: Set[str]) -> float:
     """The ranking ROI shared by every top-N cut: est $/day per $ at risk
     (fill-weighted exposure, falling back to plain collateral; unpriceable
     books rank 0), with the same 1.15x incumbent stickiness the yield rank
-    uses so estimator jitter doesn't reshuffle a kept set every refresh."""
-    denom = m.est_exposure_dollars or m.est_collateral_dollars
-    r = (m.est_dollars_per_day / denom) if denom else 0.0
+    uses so estimator jitter doesn't reshuffle a kept set every refresh.
+
+    This recomputes the ratio inline rather than calling _raw_roi, so the
+    open-scan performance penalty has to be subtracted HERE too — BEFORE
+    the 1.15x multiplier, and exactly once (pinned by
+    test_penalty_is_applied_exactly_once). Non-scan metas are untouched:
+    the normal book, finecon, Ramp, *CC and gas walks are byte-identical
+    with any table loaded."""
+    r = _raw_roi_gross(m)
+    if getattr(m, "scan", False):
+        r -= scan_perf_req(m)
     return r * (1.15 if m.ticker in incumbent else 1.0)
 
 
@@ -3985,6 +4285,17 @@ _CONFIG_CODE_KNOBS = (
     # ladder family multipliers (2026-09-17): the earnings x1.5 changes every
     # downstream cap through applied_mention_mult, so it belongs in the hash
     "MENTION_SIZE_MULT", "EARNINGS_SIZE_MULT",
+    # open-scan performance loop (2026-09-18). Every one of these is a code
+    # default — the launcher's $ProbeEnv sets no IMM_SCAN_PERF_*, so without
+    # them in the hash the arming restart (WEIGHT 0.0 -> 1.0) would not move
+    # config_hash and the re-measurement could not tell the two regimes
+    # apart. SCAN_PERF_FILE is deliberately NOT here: it is a path, it is
+    # rebound by the test sandbox, and it changes no behaviour.
+    "SCAN_PERF_ENABLED", "SCAN_PERF_WEIGHT", "SCAN_PERF_BAR_ENABLED",
+    "SCAN_PERF_MAX_REQ", "SCAN_PERF_ADJ_CLIP", "SCAN_PERF_MAX_AGE_H",
+    "SCAN_PERF_MAX_PENALIZED", "SCAN_PERF_MAX_BARRED",
+    "SCAN_PERF_MAX_BARRED_FILE", "SCAN_PERF_MAX_RECORDS",
+    "SCAN_PERF_REQUIRE_FROZEN_EDGES", "SCAN_PERF_RANK_ONLY",
 )
 
 
@@ -4337,6 +4648,363 @@ def load_finecon_extra_series() -> int:
         log(f"[IMM] finecon extra series: {len(fresh)} extended "
             f"({changed} changed)")
     return changed
+
+
+# ----------------------------------------------------------------------------
+# OPEN-SCAN PERFORMANCE LOOP — knobs, module state and the hot-reloaded table
+# (2026-09-18). The accessors live next to saturday_size_mult; this is the
+# file half: same mtime hot-reload, same all-or-nothing contract and the same
+# "record the mtime BEFORE parsing" rule as load_finecon_extra_series above,
+# so an unreadable file logs ONCE and the previous good table stays in effect.
+#
+# imm_scan_perf.py (daily 07:55 ET, read-only over STATUS_DIR) writes the
+# table. Nothing here ever writes it, and nothing here calls
+# imm_reward_recon.rebuild_estimates() — that rewrites reward_est_cache.json
+# unconditionally and would fight the 07:50 `KL imm program-history` job.
+#
+# MASTER ENABLE. IMM_SCAN_PERF=0 makes every lookup neutral and the loader
+# never runs: the kill switch of last resort, one restart away.
+SCAN_PERF_ENABLED = os.environ.get("IMM_SCAN_PERF", "1") == "1"
+SCAN_PERF_FILE = os.environ.get(
+    "IMM_SCAN_PERF_FILE", os.path.join(STATUS_DIR, "scan_perf.json"))
+# SHIPS OBSERVE-ONLY. At 0.0 the table loads, perf_adj/perf_req are stamped on
+# every selection_events row and at the end of every cycle_log row, and NOTHING
+# about the bot's decisions changes -- which converts the IN-SAMPLE, MODELLED
+# counterfactual (~14-20 of 147 admissions blocked, ~3-6 of 60 seats empty)
+# into a real out-of-sample one at zero risk. Arming is IMM_SCAN_PERF_WEIGHT=1.0
+# in $ProbeEnv + restart_imm.ps1 -Task, and only after the SPEC 10.2 gate: the
+# pre-registered cohort SIGNS must reproduce on post-ship data, the
+# leave-one-EVENT-out and leave-one-SERIES-out re-fits must be published
+# without a sign flip, and the reconciliation must have come back OK on every
+# run in the window. Not 3 days -- a full program cycle.
+SCAN_PERF_WEIGHT = _env_float("IMM_SCAN_PERF_WEIGHT", 0.0)
+# HARD BAR, DISARMED. The tier's rent is $244.33 MODELLED against $21.28
+# MEASURED on 2 of 83 events; barring a series on a statistic whose positive
+# term is 99% unmeasured is exactly the "a model is not a measurement"
+# failure. Arms separately, after the first statement paste.
+SCAN_PERF_BAR_ENABLED = os.environ.get("IMM_SCAN_PERF_BAR", "0") == "1"
+# Effective admission bar <= SCAN_MIN_ROI + MAX_REQ = 0.15/day, comfortably
+# under the MEASURED Q5 median admission ROI of 0.2205/day (n=29): the tier's
+# best-ROI quintile clears the worst table the scorer can emit. Set 0.0 to
+# neutralise the ranking effect while keeping the audit trail.
+SCAN_PERF_MAX_REQ = _env_float("IMM_SCAN_PERF_MAX_REQ", 0.10)
+# Equal to the scorer's dim_clip by construction of the MIN (SPEC 3.5): with
+# min() instead of a sum, |adj| <= dim_clip already, so this is belt and
+# braces against a file that ships a larger clip.
+SCAN_PERF_ADJ_CLIP = _env_float("IMM_SCAN_PERF_ADJ_CLIP", 0.04)
+# Fail OPEN, never frozen: an older table is CLEARED, not kept. Cost is that a
+# real bar dies during a scorer outage -- accepted, and visible in the status
+# block and the email banner. Re-checked on EVERY refresh, not only at parse.
+SCAN_PERF_MAX_AGE_H = _env_float("IMM_SCAN_PERF_MAX_AGE_H", 48)
+# Reader-side blast-radius bounds, independent of whatever the file claims
+# (SPEC 7.1): at most 25 down-rank records and 5 live bars ever take effect.
+SCAN_PERF_MAX_PENALIZED = _env_int("IMM_SCAN_PERF_MAX_PENALIZED", 25)
+SCAN_PERF_MAX_BARRED = _env_int("IMM_SCAN_PERF_MAX_BARRED", 5)
+# Writer-side caps restated at the reader: more bars than this in the file, or
+# a bar share above 25% of the universe, rejects the WHOLE file.
+SCAN_PERF_MAX_BARRED_FILE = _env_int("IMM_SCAN_PERF_MAX_BARRED_FILE", 40)
+SCAN_PERF_MAX_RECORDS = _env_int("IMM_SCAN_PERF_MAX_RECORDS", 500)
+# The cohort dimensions and bucket edges are PRE-REGISTERED and FROZEN (SPEC
+# 3.3) after reading the n=147 loss table; a table whose edges were re-fit
+# carries edges_refit:true and is refused here. 0 accepts a re-fit table --
+# only ever for a hand-run experiment, never in prod.
+SCAN_PERF_REQUIRE_FROZEN_EDGES = os.environ.get(
+    "IMM_SCAN_PERF_REQUIRE_FROZEN_EDGES", "1") == "1"
+# De-escalation short of the kill switch: 1 applies the penalty in
+# _market_roi ONLY, so the rank moves and the SCAN_MIN_ROI bar does not.
+SCAN_PERF_RANK_ONLY = os.environ.get("IMM_SCAN_PERF_RANK_ONLY", "0") == "1"
+
+_scan_perf_state: Dict[str, object] = {
+    "mtime": 0.0, "generated_at": 0.0, "stale": True,
+    "n_down_rank": 0, "n_bar": 0, "gen_iso": "", "stale_logged": False}
+SCAN_PERF_COHORTS: Dict[str, dict] = {}    # dimension -> {field, buckets:[...]}
+SCAN_PERF_SERIES: Dict[str, dict] = {}
+SCAN_PERF_EVENTS: Dict[str, dict] = {}     # keyed by EVENT ROOT
+_scan_perf_counts: Dict[str, List[Tuple[float, int]]] = {}
+
+
+def _scan_perf_float(v) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _scan_perf_parse_ts(v) -> Optional[float]:
+    try:
+        s = str(v).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        d = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.timestamp()
+
+
+def _scan_perf_clear(why: str) -> None:
+    SCAN_PERF_COHORTS.clear()
+    SCAN_PERF_SERIES.clear()
+    SCAN_PERF_EVENTS.clear()
+    _scan_perf_state["stale"] = True
+    _scan_perf_state["n_down_rank"] = 0
+    _scan_perf_state["n_bar"] = 0
+    if not _scan_perf_state.get("stale_logged"):
+        _scan_perf_state["stale_logged"] = True
+        log(f"[IMM] ! scan perf table {why} -> neutral")
+
+
+def _scan_perf_age_check(now_ts: Optional[float] = None) -> None:
+    """The retained last-good table is age-checked on EVERY refresh, not only
+    at parse time (SPEC 6.2 step 5). A scorer that stops writing must decay
+    the table to neutral by itself; a frozen verdict outliving its evidence
+    is the failure mode this exists to prevent."""
+    gen = float(_scan_perf_state.get("generated_at") or 0.0)
+    if not gen or _scan_perf_state.get("stale"):
+        return
+    now = time.time() if now_ts is None else now_ts
+    age_h = (now - gen) / 3600.0
+    if age_h > SCAN_PERF_MAX_AGE_H:
+        _scan_perf_clear(f"stale ({age_h:.1f}h)")
+
+
+def load_scan_perf() -> int:
+    """Hot-reload SCAN_PERF_FILE. Returns the number of records installed;
+    0 means "nothing changed" or "the file was refused".
+
+    ALL-OR-NOTHING (the load_finecon_extra_series contract): any schema
+    failure ignores the file ENTIRELY and keeps the previous good table. A
+    partially applied table is the one failure that could mix a good bar
+    with a bad adjustment. The mtime is recorded BEFORE parsing, so a bad
+    file logs once and is not retried until it changes.
+
+    Called at the top of refresh_universe beside the four other hot-reload
+    loaders -- every 600 s / hour crossing, never on a fast tick."""
+    if not SCAN_PERF_ENABLED:
+        return 0
+    try:
+        mtime = os.path.getmtime(SCAN_PERF_FILE)
+    except OSError:
+        # absent file = last good in effect; cold start = empty = today's
+        # behaviour. One action recovers the tier: delete this file.
+        _scan_perf_age_check()
+        return 0
+    if mtime == _scan_perf_state["mtime"]:
+        _scan_perf_age_check()
+        return 0
+    _scan_perf_state["mtime"] = mtime
+    try:
+        with open(SCAN_PERF_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! scan perf table unreadable: {e}")
+        _scan_perf_age_check()
+        return 0
+    try:
+        cohorts, series, events, gen_ts, gen_iso = _scan_perf_validate(data)
+    except ValueError as e:
+        log(f"[IMM] ! scan perf table refused ({e}); previous table kept")
+        _scan_perf_age_check()
+        return 0
+
+    # Staleness decided against the file's OWN generated_at, before anything
+    # is installed: a scorer that wrote a three-day-old table is not fresher
+    # than one that wrote nothing.
+    now = time.time()
+    age_h = (now - gen_ts) / 3600.0
+    _scan_perf_state["generated_at"] = gen_ts
+    _scan_perf_state["gen_iso"] = gen_iso
+    if age_h > SCAN_PERF_MAX_AGE_H:
+        _scan_perf_state["stale_logged"] = False
+        _scan_perf_clear(f"stale ({age_h:.1f}h)")
+        return 0
+
+    # Drop at load anything past its own `until` (belt and braces with the
+    # freshness check), then bound the blast radius at the READER regardless
+    # of what the file claims.
+    series = {k: v for k, v in series.items()
+              if v.get("until_ts") is None or now < float(v["until_ts"])}
+    events = {k: v for k, v in events.items()
+              if v.get("until_ts") is None or now < float(v["until_ts"])}
+    series, events, n_down, n_bar, trimmed = _scan_perf_truncate(series, events)
+
+    SCAN_PERF_COHORTS.clear()
+    SCAN_PERF_COHORTS.update(cohorts)
+    SCAN_PERF_SERIES.clear()
+    SCAN_PERF_SERIES.update(series)
+    SCAN_PERF_EVENTS.clear()
+    SCAN_PERF_EVENTS.update(events)
+    _scan_perf_state["stale"] = False
+    _scan_perf_state["stale_logged"] = False
+    _scan_perf_state["n_down_rank"] = n_down
+    _scan_perf_state["n_bar"] = n_bar
+    n = len(cohorts) + len(series) + len(events)
+    log(f"[IMM] scan perf table: {len(cohorts)} dims, {len(series)} series, "
+        f"{len(events)} event roots ({n_down} down-rank, {n_bar} bar), "
+        f"generated {gen_iso} ({age_h:.1f}h old), weight {SCAN_PERF_WEIGHT}, "
+        f"bar {'ON' if SCAN_PERF_BAR_ENABLED else 'off'}"
+        + (f"; TRUNCATED {trimmed} record(s) at the reader caps"
+           if trimmed else ""))
+    return n
+
+
+def _scan_perf_truncate(series: Dict[str, dict], events: Dict[str, dict]):
+    """Reader-side blast-radius truncation: at most SCAN_PERF_MAX_PENALIZED
+    down-rank records (worst dev first) and SCAN_PERF_MAX_BARRED live bars
+    (worst dev first) survive, whatever the file says. Neutral records are
+    untouched -- they cost nothing and carry the dev the cohort term reads."""
+    def _key(kv):
+        return _scan_perf_float(kv[1].get("dev")) or 0.0
+    pool = ([("s", k, v) for k, v in series.items()]
+            + [("e", k, v) for k, v in events.items()])
+    keep_down = sorted([p for p in pool if p[2].get("verdict") == "down_rank"],
+                       key=lambda p: _key((p[1], p[2])))
+    keep_bar = sorted([p for p in pool if p[2].get("verdict") == "bar"],
+                      key=lambda p: _key((p[1], p[2])))
+    drop = {(p[0], p[1]) for p in keep_down[SCAN_PERF_MAX_PENALIZED:]}
+    drop |= {(p[0], p[1]) for p in keep_bar[SCAN_PERF_MAX_BARRED:]}
+    out_s = {k: v for k, v in series.items() if ("s", k) not in drop}
+    out_e = {k: v for k, v in events.items() if ("e", k) not in drop}
+    n_down = min(len(keep_down), SCAN_PERF_MAX_PENALIZED)
+    n_bar = min(len(keep_bar), SCAN_PERF_MAX_BARRED)
+    return out_s, out_e, n_down, n_bar, len(drop)
+
+
+def _scan_perf_validate(data: dict):
+    """Schema validation in the SPEC 6.2 order. Raises ValueError with a
+    short reason; never returns a partially built table."""
+    if data.get("version") != 1:
+        raise ValueError(f"version {data.get('version')!r}")
+    gen_iso = str(data.get("generated_at") or "")
+    gen_ts = _scan_perf_parse_ts(gen_iso)
+    if gen_ts is None:
+        raise ValueError("generated_at unparseable")
+    params = data.get("params") or {}
+    if not isinstance(params, dict):
+        raise ValueError("params not an object")
+    if SCAN_PERF_REQUIRE_FROZEN_EDGES and bool(params.get("edges_refit")):
+        raise ValueError("edges_refit with REQUIRE_FROZEN_EDGES=1")
+    dim_clip = _scan_perf_float(params.get("dim_clip"))
+    if dim_clip is None:
+        dim_clip = abs(SCAN_PERF_ADJ_CLIP)
+    if dim_clip <= 0:
+        raise ValueError("dim_clip <= 0")
+
+    devs: List[float] = []
+    cohorts: Dict[str, dict] = {}
+    raw_cohorts = data.get("cohorts") or {}
+    if not isinstance(raw_cohorts, dict):
+        raise ValueError("cohorts not an object")
+    n_buckets = 0
+    for dim, ent in raw_cohorts.items():
+        if not isinstance(ent, dict):
+            raise ValueError(f"cohort {dim} not an object")
+        field_name = str(ent.get("field") or "")
+        out: List[dict] = []
+        prev_hi: Optional[float] = None
+        for b in (ent.get("buckets") or []):
+            if not isinstance(b, dict):
+                raise ValueError(f"cohort {dim} bucket not an object")
+            lo = _scan_perf_float(b.get("lo"))
+            hi = _scan_perf_float(b.get("hi"))
+            if hi is None and b.get("hi") is None:
+                hi = float("inf")
+            if lo is None or hi is None or hi < lo:
+                raise ValueError(f"cohort {dim} bucket lo/hi")
+            if prev_hi is not None and lo < prev_hi - 1e-9:
+                raise ValueError(f"cohort {dim} buckets overlap/not monotone")
+            prev_hi = hi
+            centre = _scan_perf_float(b.get("centre"))
+            if centre is None:
+                raise ValueError(f"cohort {dim} bucket centre")
+            dev_t = _scan_perf_float(b.get("dev_trading"))
+            dev_b = _scan_perf_float(b.get("dev_blend"))
+            if dev_t is None or dev_b is None:
+                raise ValueError(f"cohort {dim} bucket dev not finite")
+            if abs(dev_t) > dim_clip + 1e-9 or abs(dev_b) > dim_clip + 1e-9:
+                raise ValueError(f"cohort {dim} bucket dev past dim_clip")
+            devs.append(dev_t)
+            n_buckets += 1
+            # `trading` is the ACTING column (SPEC 3.2): the blended basis
+            # softens the largest loss cohort on a rent side that is 99%
+            # MODELLED. Normalised to `dev` here so there is exactly one
+            # place the acting basis is chosen.
+            out.append({"lo": lo, "hi": hi, "centre": centre, "dev": dev_t,
+                        "dev_blend": dev_b, "muted": bool(b.get("muted"))})
+        cohorts[str(dim)] = {"field": field_name, "buckets": out}
+
+    series = _scan_perf_records(data.get("series") or {}, "series",
+                                dim_clip, devs)
+    events = _scan_perf_records(data.get("events") or {}, "events",
+                                dim_clip, devs)
+
+    # CLAMP STORM (the sign-flip detector): a uniformly negated file is
+    # individually in range and passes every NaN/schema check, so the only
+    # signature left is a pile-up at the clip.
+    if devs:
+        clamped = sum(1 for d in devs if abs(abs(d) - dim_clip) <= 1e-9)
+        if clamped > 0.10 * len(devs):
+            raise ValueError(f"clamp storm {clamped}/{len(devs)} at dim_clip")
+
+    limits = data.get("limits") or {}
+    if isinstance(limits, dict):
+        n_barred_file = (_scan_perf_float(limits.get("barred_series")) or 0.0) \
+            + (_scan_perf_float(limits.get("barred_events")) or 0.0)
+        if n_barred_file > SCAN_PERF_MAX_BARRED_FILE:
+            raise ValueError(f"{n_barred_file:.0f} bars in file "
+                             f"> {SCAN_PERF_MAX_BARRED_FILE}")
+        frac = _scan_perf_float(limits.get("bar_frac_universe"))
+        if frac is not None and frac > 0.25:
+            raise ValueError(f"bar_frac_universe {frac:.2f} > 0.25")
+    # The file's own limits block can lie; count what is actually there too.
+    n_bar_real = sum(1 for v in list(series.values()) + list(events.values())
+                     if v.get("verdict") == "bar")
+    if n_bar_real > SCAN_PERF_MAX_BARRED_FILE:
+        raise ValueError(f"{n_bar_real} bar records > "
+                         f"{SCAN_PERF_MAX_BARRED_FILE}")
+
+    total = len(series) + len(events) + n_buckets
+    if total > SCAN_PERF_MAX_RECORDS:
+        raise ValueError(f"{total} records > {SCAN_PERF_MAX_RECORDS}")
+    return cohorts, series, events, gen_ts, gen_iso
+
+
+def _scan_perf_records(raw, what: str, dim_clip: float,
+                       devs: List[float]) -> Dict[str, dict]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{what} not an object")
+    out: Dict[str, dict] = {}
+    for key, rec in raw.items():
+        if not isinstance(rec, dict):
+            raise ValueError(f"{what} {key} not an object")
+        verdict = str(rec.get("verdict") or "neutral")
+        if verdict not in ("neutral", "down_rank", "bar"):
+            raise ValueError(f"{what} {key} verdict {verdict!r}")
+        dev = rec.get("dev")
+        dev_f = 0.0 if dev is None else _scan_perf_float(dev)
+        if dev_f is None:
+            raise ValueError(f"{what} {key} dev not finite")
+        if abs(dev_f) > dim_clip + 1e-9:
+            raise ValueError(f"{what} {key} dev past dim_clip")
+        devs.append(dev_f)
+        until_ts = None
+        if rec.get("until") is not None:
+            until_ts = _scan_perf_parse_ts(rec.get("until"))
+            if until_ts is None:
+                raise ValueError(f"{what} {key} until unparseable")
+        elif verdict == "bar":
+            # a bar with no TTL is a permanent verdict, which SPEC 3.6
+            # forbids: tighten immediate, relax by timeout only
+            raise ValueError(f"{what} {key} bar without until")
+        out[str(key)] = {"verdict": verdict, "dev": dev_f,
+                         "until_ts": until_ts,
+                         "until": rec.get("until")}
+    return out
+
 
 
 # ----------------------------------------------------------------------------
@@ -7167,6 +7835,11 @@ class IncentiveMarketMaker:
         load_extra_allow_series()
         load_finecon_extra_series()
         load_rain_fair()
+        # Open-scan performance table (2026-09-18): written daily 07:55 ET by
+        # imm_scan_perf.py. Same mtime gate as the four above, and the only
+        # place the table is read from disk — the age check inside it runs on
+        # EVERY refresh so a scorer outage decays the table to neutral.
+        load_scan_perf()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
         # refresh reliably fires before Kalshi publishes now that keep-alive
@@ -7816,9 +8489,29 @@ class IncentiveMarketMaker:
         scan_cut = scan_group_cut(ranked, prev_selected, members=scan_sticky,
                                   extra_openings=scan_openings_left,
                                   refill_to=scan_prev_count)
+        # PERF_ROI (2026-09-18): a scan candidate whose GROSS ROI clears
+        # SCAN_MIN_ROI but whose NET value (gross - req) does not was cut by
+        # the performance loop, not by the group cap, and its seat stays
+        # EMPTY. Labelling it apart is the only way the cost side of the loop
+        # is observable — forgone rent is never booked as a loss, so
+        # seats-left-empty is a pre-registered input to the kill rule, not
+        # decoration. Gross comes from _raw_roi_gross so the two can never
+        # disagree with the value the cut actually tested.
+        perf_cut = {m.ticker for m in ranked
+                    if m.ticker in scan_cut and getattr(m, "scan", False)
+                    and _raw_roi_gross(m) >= SCAN_MIN_ROI
+                    and _raw_roi(m) < SCAN_MIN_ROI} if scan_cut else set()
+        req_applied = sum(1 for m in ranked
+                          if getattr(m, "scan", False) and scan_perf_req(m) > 0)
+        scan_perf_note("seats_empty", len(perf_cut), now_ts)
+        scan_perf_note("req_applied", req_applied, now_ts)
         if scan_cut:
-            skipped["scan_top_n"] = len(scan_cut)
-            decisions.update({_t: "scan_top_n" for _t in scan_cut})
+            if len(scan_cut) - len(perf_cut):
+                skipped["scan_top_n"] = len(scan_cut) - len(perf_cut)
+            if perf_cut:
+                skipped["perf_roi"] = len(perf_cut)
+            decisions.update({_t: ("perf_roi" if _t in perf_cut
+                                   else "scan_top_n") for _t in scan_cut})
             ranked = [m for m in ranked if m.ticker not in scan_cut]
         kept_scan = sum(1 for m in ranked if m.scan)
         # A REFILL IS NOT AN EXPANSION: charge openings only for growth past
@@ -7981,7 +8674,21 @@ class IncentiveMarketMaker:
             def _meta_fields(mt) -> dict:
                 if mt is None:
                     return {}
-                return {
+                # Open-scan performance stamps (2026-09-18). SINK-SIZE
+                # DISCIPLINE: selection_events wrote 56,720 rows on
+                # 2026-09-15 and IMM_LOGGING's third guarantee is "no sink
+                # floods the log", so EVERY row gets exactly two floats and
+                # the string fields appear only on NON-NEUTRAL rows. They are
+                # stamped even at IMM_SCAN_PERF_WEIGHT=0, which is what makes
+                # the observe-only stage worth anything: the counterfactual
+                # block rate becomes a real out-of-sample measurement instead
+                # of the IN-SAMPLE, MODELLED replay it is today.
+                _adj, _code, _req, _unit = 0.0, "", 0.0, None
+                if getattr(mt, "scan", False):
+                    _adj, _code = scan_perf_adj(mt)
+                    _req = scan_perf_req(mt)
+                    _unit = scan_perf_barred(mt.series, mt.event_ticker)
+                out = {
                     "series": mt.series, "event_ticker": mt.event_ticker,
                     "est_dollars_per_day": round(mt.est_dollars_per_day, 4),
                     "yield_per_contract": round(mt.yield_per_contract, 6),
@@ -7997,7 +8704,19 @@ class IncentiveMarketMaker:
                     # without it — the exact question the est/ROI columns
                     # alone could not settle for KXTRUEV-26SEP07-T1263.42.
                     "quotable_sides": mt.quotable_sides,
+                    "perf_adj": round(_adj, 5), "perf_req": round(_req, 5),
                 }
+                if _unit is not None:
+                    out["perf_v"] = "bar"
+                    out["perf_unit"] = _unit
+                elif _adj < 0.0 or _req > 0.0:
+                    out["perf_v"] = "down_rank"
+                if "perf_v" in out:
+                    out["perf_code"] = _code       # ONE string, never a list
+                    # CONFIG_HASH does not cover a data file, so the table's
+                    # generated_at is the only attribution stamp a row carries
+                    out["perf_gen"] = _scan_perf_state.get("gen_iso", "")
+                return out
 
             # (a) Event-driven: only decisions that CHANGED since the last
             # refresh. This is what makes an incident reconstructable — both
@@ -8140,6 +8859,15 @@ class IncentiveMarketMaker:
                    if now_ts - x < SCAN_SERIES_STRIKE_TTL_SECS]
         if 0 < SCAN_SERIES_STRIKE_LIMIT <= len(strikes):
             return "series_struck"
+        # Performance bar (2026-09-18, DISARMED by default — see
+        # SCAN_PERF_BAR_ENABLED). Placed here, right after the last string
+        # check and before the shape screen, so it costs no book/series read.
+        # MEMBERS NEVER REACH THIS FUNCTION, so quote-to-completion (Jack
+        # 2026-09-03 "dont unquote them") holds STRUCTURALLY, not by
+        # convention; the label flows for free into scan_skips, the
+        # `open-scan:` rejects line and the quote-gaps labelling.
+        if scan_perf_barred(meta.series, meta.event_ticker):
+            return "perf_barred"
         # Fiscal.ai month-named KPI events (Jack 2026-09-06): the 'undated'
         # reject is waived only for a Fiscal.ai-settled series, which takes
         # the (cached, budgeted) series read BEFORE the structure verdict.
@@ -9747,7 +10475,12 @@ class IncentiveMarketMaker:
                 f"{1 if getattr(meta, 'scan', False) else 0},"
                 f"{1 if t in self.state.selected else 0},"
                 f"{1 if _ro else 0},{1 if fast_only else 0},"
-                f"{RUN_ID},{CONFIG_HASH}\n")
+                f"{RUN_ID},{CONFIG_HASH},"
+                # --- appended 2026-09-18: the open-scan performance
+                #     requirement actually applied to this market this cycle
+                #     (0.00000 for every non-scan market and whenever the
+                #     table is absent/stale). ONE column, at the END.
+                f"{scan_perf_req(meta):.5f}\n")
 
             # Cache the panel for the fills and orders sinks. A fill arrives
             # one cycle AFTER the read that produced the order it hit, so this
@@ -10033,9 +10766,9 @@ class IncentiveMarketMaker:
             # filename must also not match its cycle_log_*.csv glob.
             self._write_fast_log(cycle_rows)
 
-    # 13 original columns + 21 appended 2026-09-06. APPEND ONLY, never
-    # reorder: imm_reward_recon.py reads this file positionally
-    # (row[0],[1],[7],[8],[11]) and gates on len(row) >= 13.
+    # 13 original columns + 21 appended 2026-09-06 + perf_req 2026-09-18.
+    # APPEND ONLY, never reorder: imm_reward_recon.py reads this file
+    # positionally (row[0],[1],[7],[8],[11]) and gates on len(row) >= 13.
     CYCLE_LOG_HEADER = ("ts,ticker,ext_bid,ext_ask,yes_depth,no_depth,target,"
                         "est_frac,qual_sides,acct_pos,own_pos,pool_per_day,quoted,"
                         "own_bid_ct,own_ask_ct,own_bid_top,own_ask_top,"
@@ -10043,7 +10776,7 @@ class IncentiveMarketMaker:
                         "want_bid_ct,want_ask_ct,want_pad_ct,"
                         "hour_mult,rung_lo,room_buy,room_sell,"
                         "vol24h,discount,is_scan,is_sticky,reduce_only,fast,"
-                        "run_id,config_hash\n")
+                        "run_id,config_hash,perf_req\n")
 
     def _write_cycle_log(self, rows: List[str]) -> None:
         """Per-cycle book panel -> daily CSV. This is the jump-frequency /
@@ -10276,6 +11009,11 @@ class IncentiveMarketMaker:
             "scan_halted_today": (
                 s.scan_halt_day == now_utc.astimezone(ET).date().isoformat()),
             "scan_pnl_today": round(s.scan_pnl_today_last, 2),
+            # open-scan performance loop (2026-09-18): `fresh` false means
+            # every verdict is neutral right now — absent file, stale table
+            # or the kill switch. seats_empty_24h/req_applied_24h are the
+            # COST side, published because forgone rent is never booked.
+            "scan_perf": scan_perf_status(now_utc),
             "programs_seen": s.programs_count,
             "markets_line": s.last_markets_line,
             "reward_est_today": round(s.reward_est_today, 2),
