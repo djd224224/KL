@@ -124,5 +124,78 @@ class ProbeReadRetry(unittest.TestCase):
         self.assertEqual(headline, "PROCESS GONE")
 
 
+class _Alerter:
+    """Records instead of sending. The suite must never SMTP the user."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send_message(self, body, subject=None, html=None):
+        self.sent.append((subject, body))
+        return True
+
+
+class ScanPerfStaleness(unittest.TestCase):
+    """The open-scan performance table gets the same treatment as the reward
+    ledger, and for the same reason: the bot fails OPEN on scan_perf.json, so
+    a scorer that quietly stops running breaks nothing and announces nothing
+    — the tier just drifts back to ranking on gross ROI while the daily email
+    keeps printing verdicts that are no longer applied. A failure that is
+    invisible by construction is exactly what needs a monitor."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="perf_health_")
+        self.path = os.path.join(self.tmp, "scan_perf.json")
+        p = mock.patch.object(ha, "SCAN_PERF_PATH", self.path)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write(self, age_h):
+        ts = datetime.now(timezone.utc) - timedelta(hours=age_h)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1,
+                       "generated_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ")}, f)
+
+    def test_a_three_day_old_table_alerts_once_a_day(self):
+        self._write(72)
+        a, state = _Alerter(), {}
+        ha.check_scan_perf_staleness(a, state, "now")
+        self.assertEqual(len(a.sent), 1, a.sent)
+        self.assertIn("scan-perf", a.sent[0][0])
+        self.assertIn("72", a.sent[0][0])
+        self.assertIn(self.path, a.sent[0][1])
+        # a second run the same day stays quiet
+        ha.check_scan_perf_staleness(a, state, "now")
+        self.assertEqual(len(a.sent), 1)
+
+    def test_a_fresh_table_is_silent_and_clears_the_marker(self):
+        self._write(4)
+        a, state = _Alerter(), {"scan_perf_alert_date": "2026-01-01"}
+        ha.check_scan_perf_staleness(a, state, "now")
+        self.assertEqual(a.sent, [])
+        self.assertNotIn("scan_perf_alert_date", state)
+
+    def test_just_inside_the_threshold_is_silent(self):
+        self._write(ha.SCAN_PERF_STALE_HOURS - 1)
+        a = _Alerter()
+        ha.check_scan_perf_staleness(a, {}, "now")
+        self.assertEqual(a.sent, [])
+
+    def test_a_missing_table_is_not_an_alert(self):
+        """The loop may simply not be deployed. A monitor that pages about a
+        feature nobody turned on is a monitor that gets ignored."""
+        a = _Alerter()
+        ha.check_scan_perf_staleness(a, {}, "now")
+        self.assertEqual(a.sent, [])
+
+    def test_a_garbled_table_never_raises(self):
+        for junk in ("{not json", '{"version": 1}', '[]'):
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write(junk)
+            a = _Alerter()
+            ha.check_scan_perf_staleness(a, {}, "now")
+            self.assertEqual(a.sent, [], junk)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

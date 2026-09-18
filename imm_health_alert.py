@@ -198,6 +198,77 @@ def check_credit_staleness(alerter, state: dict, now: str) -> None:
         log(f"! credit staleness check failed ({e}); continuing")
 
 
+SCAN_PERF_PATH = (os.environ.get("IMM_SCAN_PERF_FILE")
+                  or os.path.join(STATUS_DIR, "scan_perf.json"))
+# The bot's own IMM_SCAN_PERF_MAX_AGE_H default. Above this the loader clears
+# its tables and every verdict goes neutral — so this is the exact age at
+# which the loop stops being a loop.
+SCAN_PERF_STALE_HOURS = float(os.environ.get("IMM_SCAN_PERF_MAX_AGE_H", "48"))
+
+
+def check_scan_perf_staleness(alerter, state: dict, now: str) -> None:
+    """Alert when the open-scan performance table stops being regenerated.
+
+    Same shape and the same reason as check_credit_staleness above. scan_perf.json
+    is written once a day by the `KL imm scan-perf` task; the bot fails OPEN on
+    it, so a scorer that quietly stops running does not break anything and
+    therefore announces nothing — the tier simply drifts back to ranking on
+    gross ROI and every verdict in the daily email silently stops being
+    applied. The failure mode is invisible by construction, which is exactly
+    the case for a monitor (cf. the reward ledger: "the human IS the archive
+    job here, so the archive job needs a monitor").
+
+    A MISSING file is NOT an alert: the loop may simply not be deployed, and a
+    monitor that pages about a feature nobody turned on is a monitor that gets
+    ignored. Only a table that exists and has gone stale is a regression.
+
+    At most one email per day, and never raises — a health alerter must not
+    die on a side check."""
+    try:
+        if not os.path.exists(SCAN_PERF_PATH):
+            return
+        with open(SCAN_PERF_PATH, encoding="utf-8") as f:
+            table = json.load(f)
+        if not isinstance(table, dict):
+            return
+        gen = str(table.get("generated_at") or "")
+        if not gen:
+            return
+        try:
+            when = datetime.fromisoformat(gen.replace("Z", "+00:00"))
+        except ValueError:
+            return
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        age_h = (datetime.now(timezone.utc) - when).total_seconds() / 3600.0
+        today = datetime.now(timezone.utc).date()
+        if age_h <= SCAN_PERF_STALE_HOURS:
+            if state.pop("scan_perf_alert_date", None):
+                log(f"scan-perf table current again (generated {gen})")
+            return
+        if state.get("scan_perf_alert_date") == today.isoformat():
+            return                       # already warned today
+        state["scan_perf_alert_date"] = today.isoformat()
+        log(f"! scan-perf table {age_h:.0f}h stale (generated {gen})")
+        alerter.send_message(
+            f"The IMM open-scan performance table is {age_h:.0f} hours stale "
+            f"as of {now}.\n\n"
+            f"  Generated at: {gen}\n"
+            f"  File: {SCAN_PERF_PATH}\n"
+            f"  Bot's neutral-out threshold: {SCAN_PERF_STALE_HOURS:.0f}h\n\n"
+            f"Past that threshold incentive_mm clears its scan-perf tables and "
+            f"treats every series, event and cohort as neutral, so the open "
+            f"scan tier is back to ranking on gross ROI alone. Nothing breaks "
+            f"and nothing else reports it — the bot fails OPEN on this file by "
+            f"design.\n\n"
+            f"Check the scheduled task 'KL imm scan-perf' and its log:\n\n"
+            f"  Get-ScheduledTaskInfo -TaskName 'KL imm scan-perf'\n"
+            f"  python imm_scan_perf.py --dry\n",
+            subject=f"IMM scan-perf table {age_h:.0f}h stale")
+    except Exception as e:                                  # noqa: BLE001
+        log(f"! scan-perf staleness check failed ({e}); continuing")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--status", action="store_true", help="print, send nothing")
@@ -225,6 +296,10 @@ def main(argv=None) -> int:
     # below, which returns early whenever the bot's up/down state is unchanged
     # — a stale ledger has nothing to do with whether the process is alive.
     check_credit_staleness(alerter, prev, now)
+    # Same placement and the same reasoning: a stale scan-perf table has
+    # nothing to do with whether the process is alive, so it must run before
+    # the transition check returns early on an unchanged up/down state.
+    check_scan_perf_staleness(alerter, prev, now)
 
     was_ok = prev.get("ok")
     if was_ok is not None and bool(was_ok) == ok:

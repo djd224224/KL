@@ -316,6 +316,277 @@ LEDGER_STALE_DAYS = int(os.environ.get("IMM_LEDGER_STALE_DAYS", "4"))
 DAILY_PNL_PATH = os.path.join(STATUS_DIR, "daily_pnl.json")
 
 
+# ---- OPEN-SCAN PERFORMANCE TABLE (the reporting side) -----------------------
+# The open-scan performance loop publishes ONE data file,
+# STATUS_DIR/scan_perf.json, written daily by imm_scan_perf.py and read by the
+# bot's own load_scan_perf(). Everything below is the REPORTING side of that
+# file, and it lives HERE rather than in send_opportunistic_imm.py because the
+# import edge only runs one way (the opportunistic email imports this module,
+# never the reverse) and both emails have to print the same numbers from the
+# same parse — the digest's one-line summary and the opportunistic email's
+# SCAN PERF block can never disagree if they share this code.
+#
+# LABELS ARE PART OF THE CONTRACT (Jack, "a model is not a measurement"): the
+# markout side of this table is MEASURED from the bot's own fills, the rent
+# side is MODELLED (the cycle-log accrual integral with the $1.00/market/period
+# floor), and the file's `credited_measured` is MEASURED money. EST and
+# CREDITED are NEVER summed — the same rule the CUMULATIVE table in the
+# opportunistic email already enforces — so credits get their own column here
+# too, never an addend.
+#
+# NOTHING IN THIS SECTION MAY RAISE. Precedent: 2026-09-10, a reporting-side
+# change silently dropped 30 *CC events from the opportunistic email and 538
+# green tests did not notice. A missing, truncated or garbled table must print
+# "no table" and leave every other number in the email untouched, so each entry
+# point swallows its own errors and returns a plain dict/str.
+SCAN_PERF_PATH = (os.environ.get("IMM_SCAN_PERF_FILE")
+                  or os.path.join(STATUS_DIR, "scan_perf.json"))
+# The SAME env var the bot reads (IMM_SCAN_PERF_FILE) — if the table is
+# redirected for a test or a dry run, the email follows it rather than
+# reporting on a file the bot is not using.
+#
+# Mirrors the bot's IMM_SCAN_PERF_MAX_AGE_H default. Above this age the bot
+# clears its tables and every verdict goes neutral, so an email that kept
+# printing verdicts would be describing a policy that is not being applied.
+SCAN_PERF_MAX_AGE_H = float(os.environ.get("IMM_SCAN_PERF_MAX_AGE_H", "48"))
+# One program period, used only for the $1.00-per-market-per-period floor in
+# the MODELLED forgone-rent figure below. reward_programs.json collapses
+# periods per market and cannot answer "which period ended", so the 7-day
+# bucket is the same fallback the scorer uses.
+SCAN_PERF_PERIOD_DAYS = 7.0
+# The exchange's MEASURED minimum Liquidity credit: exactly $1.00 across 7,264
+# ledger rows, and 39% of quoted markets never clear it.
+SCAN_PERF_CREDIT_FLOOR = 1.00
+
+
+def _iso_dt(s):
+    """UTC datetime, or None, from an ISO-8601 stamp with or without a Z."""
+    try:
+        d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def load_scan_perf(path=None) -> dict:
+    """The scan-performance table as a plain dict, or {} meaning "no table".
+
+    Absent file, unreadable file, bad JSON, a JSON document that is not an
+    object, or a document with no `generated_at` all return {} — the callers
+    print "no table" and nothing else in the email changes. This reader
+    deliberately does NOT re-implement the bot's validation (version, clamp
+    storm, frozen edges, blast-radius caps): the bot validates before ACTING,
+    while this side only has to render whatever is on disk, and a table the
+    bot rejected is exactly the table a human most needs to see printed."""
+    p = path or SCAN_PERF_PATH
+    try:
+        with open(p, encoding="utf-8") as f:
+            t = json.load(f)
+    except Exception:                                       # noqa: BLE001
+        return {}
+    if not isinstance(t, dict) or not t.get("generated_at"):
+        return {}
+    return t
+
+
+def scan_perf_header(table, status=None, now_utc=None) -> dict:
+    """The header facts the block prints before any verdict:
+    {present, generated_at, age_h, stale, weight, bar_on, source, basis}.
+
+    WEIGHT and BAR are printed explicitly because they decide whether any of
+    the verdicts below them mean anything: the loop ships observe-only
+    (IMM_SCAN_PERF_WEIGHT 0.0) and with the hard bar disarmed
+    (IMM_SCAN_PERF_BAR 0), so a reader who sees "9 down-ranked" without them
+    would read a table of intentions as a table of actions.
+
+    They are read from the BOT's status file first (that is what is actually
+    in force in the live process), then the table's own params, then this
+    repo's code defaults — and `source` says which, because guessing the
+    live weight from a code default after a $ProbeEnv change is precisely the
+    class of error the 9/7 "verified fix measured the wrong branch" incident
+    came from."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    out = {"present": bool(table), "generated_at": "", "age_h": None,
+           "stale": False, "weight": None, "bar_on": None,
+           "source": "unknown", "basis": "", "max_req": None}
+    if not table:
+        return out
+    out["generated_at"] = str(table.get("generated_at") or "")
+    gen = _iso_dt(out["generated_at"])
+    if gen is not None:
+        out["age_h"] = (now_utc - gen).total_seconds() / 3600.0
+        out["stale"] = out["age_h"] > SCAN_PERF_MAX_AGE_H
+    params = table.get("params") if isinstance(table.get("params"), dict) else {}
+    out["basis"] = str(params.get("score_basis") or "trading")
+    # the file's own MAX_REQ, so the printed req is bounded by the same
+    # number the bot bounds it with rather than by a constant restated here
+    if params.get("max_req") is not None:
+        out["max_req"] = _f(params.get("max_req"))
+    sp = (status or {}).get("scan_perf")
+    if isinstance(sp, dict) and ("weight" in sp or "bar_enabled" in sp):
+        out["weight"] = sp.get("weight")
+        out["bar_on"] = sp.get("bar_enabled")
+        out["source"] = "bot status file"
+    elif "weight" in params or "bar_enabled" in params:
+        out["weight"] = params.get("weight")
+        out["bar_on"] = params.get("bar_enabled")
+        out["source"] = "table params"
+    else:
+        w = getattr(imm, "SCAN_PERF_WEIGHT", None)
+        b = getattr(imm, "SCAN_PERF_BAR_ENABLED", None)
+        if w is not None or b is not None:
+            out["weight"], out["bar_on"] = w, b
+            out["source"] = "incentive_mm code default"
+    return out
+
+
+def _sink_day_files(name: str, status_dir=None) -> list:
+    """[(utc_day, path)] for STATUS_DIR/<name>_YYYY-MM-DD.jsonl, oldest first.
+    The sink names its files by UTC day (incentive_mm._sink), so any window
+    over them is a UTC window, never the ET/CT day an email is keyed on."""
+    out = []
+    d = status_dir or STATUS_DIR
+    for path in glob.glob(os.path.join(d, f"{name}_*.jsonl")):
+        day = os.path.basename(path)[len(name) + 1:-len(".jsonl")]
+        if len(day) == 10 and day[4] == "-":
+            out.append((day, path))
+    return sorted(out)
+
+
+def scan_perf_cost(now_utc=None, hours: float = 24.0, status_dir=None) -> dict:
+    """THE COST SIDE of the loop, from the `selection_events` sink.
+
+    Forgone rent is never observed as a loss: a seat the loop leaves empty
+    earns nothing and nothing anywhere records that it could have. The markout
+    improvement, by contrast, shows up in every P&L column. Unless the cost is
+    published next to the benefit the review two weeks from now is structurally
+    biased toward keeping the loop, which is why both numbers here are inputs
+    to the pre-registered kill rule and not decoration.
+
+    Counted over the last `hours` of the sink:
+      seats_empty  distinct tickers whose decision was `perf_roi` — the walk
+                   cut them for the performance requirement and, because
+                   SCAN_MIN_ROI leaves a seat EMPTY rather than filling it
+                   with the next candidate (Jack 2026-09-13), that is a seat
+                   the tier did not use
+      barred       distinct tickers whose decision was `perf_barred`
+      forgone      MODELLED: each blocked ticker's own est_dollars_per_day,
+                   floored — a market whose est would not reach the exchange's
+                   MEASURED $1.00 minimum credit over a 7-day program period
+                   contributes ZERO, because that is what it would actually
+                   have been paid, not what the model accrued
+
+    DISTINCT TICKERS, not rows: `selection_events` re-emits with `prev: null`
+    after each of the ~20 daily restarts, so a row count would scale with
+    restarts rather than with decisions. `rows` is reported separately so the
+    gap between the two is visible.
+
+    Never raises; an unreadable sink returns zeros with `read_error` set."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    cut = now_utc - timedelta(hours=hours)
+    out = {"window_h": hours, "seats_empty": 0, "barred": 0,
+           "forgone_dollars_per_day": 0.0, "rows": 0, "days": [],
+           "floored_out": 0, "read_error": "",
+           "seats_cap": int(getattr(imm, "SCAN_TOP_N", 0) or 0)}
+    want_days = {(cut + timedelta(days=i)).strftime("%Y-%m-%d")
+                 for i in range(0, int(hours // 24) + 2)}
+    est: dict = {}          # ticker -> (latest ts, est_dollars_per_day)
+    roi, bar = set(), set()
+    try:
+        for day, path in _sink_day_files("selection_events", status_dir):
+            if day not in want_days:
+                continue
+            out["days"].append(day)
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    # substring pre-filter: these files run to 56,720 rows a
+                    # day and almost none of them carry a perf decision
+                    if "perf_roi" not in line and "perf_barred" not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    dec = rec.get("decision")
+                    if dec not in ("perf_roi", "perf_barred"):
+                        continue
+                    ts = _iso_dt(rec.get("ts"))
+                    if ts is None or ts < cut or ts > now_utc:
+                        continue
+                    tk = str(rec.get("ticker") or "")
+                    if not tk:
+                        continue
+                    out["rows"] += 1
+                    (roi if dec == "perf_roi" else bar).add(tk)
+                    prev = est.get(tk)
+                    if prev is None or ts >= prev[0]:
+                        est[tk] = (ts, _f(rec.get("est_dollars_per_day")))
+    except OSError as e:
+        out["read_error"] = repr(e)
+    out["seats_empty"], out["barred"] = len(roi), len(bar)
+    for tk in (roi | bar):
+        per_day = est.get(tk, (None, 0.0))[1]
+        if per_day * SCAN_PERF_PERIOD_DAYS < SCAN_PERF_CREDIT_FLOOR:
+            out["floored_out"] += 1          # would never have cleared $1.00
+            continue
+        out["forgone_dollars_per_day"] += per_day
+    return out
+
+
+def scan_perf_cost_line(cost) -> str:
+    """THE COST LINE, verbatim in both emails. Format is fixed on purpose so
+    the two reports are greppable against each other and against the sink."""
+    return ("seats left empty by perf_roi ({h:.0f}h): {n} of {cap} | "
+            "admissions barred ({h:.0f}h): {m} | MODELLED forgone floored est "
+            "on blocked candidates: ${x:,.2f} [MODELLED]".format(
+                h=cost.get("window_h") or 24, n=cost.get("seats_empty", 0),
+                cap=cost.get("seats_cap", 0) or 0,
+                m=cost.get("barred", 0),
+                x=cost.get("forgone_dollars_per_day", 0.0)))
+
+
+def scan_perf_cost_basis_note(cost) -> str:
+    """The one sentence that keeps the cost line from being read as a
+    measurement. $X is a RATE ($/day) and it is floored."""
+    return ("Forgone est is MODELLED: each blocked candidate's own "
+            "est_dollars_per_day, in $/day, with any market that would not "
+            "reach the MEASURED $1.00 minimum credit over a {:.0f}-day program "
+            "period counted as zero ({} of {} blocked candidates). It is never "
+            "observed as a loss anywhere else, which is why it is printed "
+            "next to the benefit.".format(
+                SCAN_PERF_PERIOD_DAYS, cost.get("floored_out", 0),
+                cost.get("seats_empty", 0) + cost.get("barred", 0)))
+
+
+def scan_perf_digest_line(table, cost, status=None, now_utc=None) -> str:
+    """The digest's ONE line (the opportunistic email carries the full block).
+    Always returns a string; "no table" when there is nothing on disk."""
+    hdr = scan_perf_header(table, status, now_utc)
+    if not hdr["present"]:
+        return ("perf: no scan-perf table on disk ({}) — the open-scan tier "
+                "ranks on gross ROI alone.".format(SCAN_PERF_PATH))
+    lim = table.get("limits") if isinstance(table.get("limits"), dict) else {}
+    down = int(_f(lim.get("down_ranked")))
+    barred = int(_f(lim.get("barred_series"))) + int(_f(lim.get("barred_events")))
+    age = ("{:.0f}h old".format(hdr["age_h"]) if hdr["age_h"] is not None
+           else "age unknown")
+    w = ("weight {}".format(hdr["weight"]) if hdr["weight"] is not None
+         else "weight ?")
+    b = ("bar {}".format("on" if hdr["bar_on"] else "off")
+         if hdr["bar_on"] is not None else "bar ?")
+    sp = (status or {}).get("scan_perf")
+    applied = ""
+    if isinstance(sp, dict) and sp.get("req_applied_24h") is not None:
+        applied = ", req applied to {:.0f} candidate(s) (24h)".format(
+            _f(sp.get("req_applied_24h")))
+    return ("perf: table {}{}, {}, {}, {} down-ranked, {} barred{}, "
+            "{} seat(s) left empty (24h), ${:,.2f}/day MODELLED rent forgone."
+            .format(age, " — STALE, verdicts NOT applied" if hdr["stale"] else "",
+                    w, b, down, barred, applied,
+                    cost.get("seats_empty", 0),
+                    cost.get("forgone_dollars_per_day", 0.0)))
+
+
 def load_credit_ledger():
     """(rows, calibration) — the per-credit ledger and the summary written by
     imm_reward_recon.py. Empty/absent is fine: the digest falls back to the
@@ -1736,7 +2007,7 @@ def _cutoff_audit_html(a: dict) -> str:
                 'failed ({}).</div>'.format(repr(e)))
 
 
-def finecon_section(state, w, today_ct):
+def finecon_section(state, w, today_ct, status=None):
     """(text_lines, html) — the Finance/Econ sweep tracker (Jack 2026-09-04
     "make sure im able to track performance of these"). Three layers, most
     trustworthy last: current members with the bot's period-to-date accrual
@@ -1894,6 +2165,21 @@ def finecon_section(state, w, today_ct):
         else:
             h.append('<div style="color:#666;font-size:13px">no scan members '
                      'quoting right now.</div>')
+        # ONE line for the performance loop (the opportunistic email carries
+        # the full SCAN PERF block). It states the table's age, the WEIGHT and
+        # BAR actually in force, and the COST side — seats the loop left empty
+        # and the MODELLED rent that went with them — because a digest that
+        # printed only "9 down-ranked" would report the loop's intentions as
+        # if they were its effects. Never raises: no table prints "no table".
+        try:
+            _perf_t = load_scan_perf()
+            _perf_line = scan_perf_digest_line(
+                _perf_t, scan_perf_cost(), status)
+        except Exception as e:                              # noqa: BLE001
+            _perf_line = "perf: scan-perf line unavailable ({!r})".format(e)
+        L.append(_perf_line)
+        h.append('<div style="color:#555;font-size:12px;margin-top:4px">'
+                 '{}</div>'.format(_perf_line))
     return L, "".join(h)
 
 
@@ -2029,7 +2315,7 @@ def build_digest(now_utc: datetime):
                      e_tot["unrealized"], e_tot["contracts"], e_tot["mkts"]))
     else:
         L.append("  (no fills in the past 24h)")
-    fin_L, fin_html = finecon_section(state, w, today_ct)
+    fin_L, fin_html = finecon_section(state, w, today_ct, status)
     if fin_L:
         L.append("")
         L.extend(fin_L)

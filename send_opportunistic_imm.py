@@ -91,6 +91,17 @@ Numbers come from the SAME validated path as the whole-account digest: this
 script imports send_imm_digest and calls its pnl_windows() / own_book() /
 credit-ledger helpers, so a row here can never disagree with the digest.
 
+Under the tier tables sits the SCAN PERF block: the open-scan performance
+loop's scorecard, read from STATUS_DIR/scan_perf.json (the same file the bot
+loads, honouring the same IMM_SCAN_PERF_FILE override). It prints the table's
+age, the WEIGHT and BAR actually in force, the cohort table on BOTH bases with
+the acting column marked, every non-neutral key, the mark-source mix, and —
+required, not optional — THE COST LINE: the seats the loop left empty, the
+admissions it barred, and the MODELLED rent that went with them. Forgone rent
+is never observed as a loss anywhere, so without that line the two-week review
+is structurally biased toward keeping the loop. A missing or garbled table
+prints "no table" and changes nothing else in the email.
+
 STRICTLY READ-ONLY. Scheduled daily 7:25 AM ET ("KL imm opportunistic"),
 after the 7:10 digest and 7:20 quote-gaps. --test sends now ignoring the
 sent-marker; --dry / --print build and print only.
@@ -114,7 +125,13 @@ from send_imm_digest import (TD, TDL, _f, _event_of, _short_event, _pnl_span,
                              load_json, own_book, fetch_own_fills,
                              current_mids, pnl_windows, status_summary,
                              load_credit_ledger, STATE_PATH, STATUS_PATH,
-                             FILL_LOOKBACK_HOURS)
+                             FILL_LOOKBACK_HOURS,
+                             # the open-scan performance table's reader lives
+                             # in the digest so both emails parse it once, the
+                             # same way (see that module's SCAN_PERF section)
+                             load_scan_perf, scan_perf_header, scan_perf_cost,
+                             scan_perf_cost_line, scan_perf_cost_basis_note,
+                             SCAN_PERF_PATH, SCAN_PERF_MAX_AGE_H)
 
 # Compact family labels; anything unmatched falls back to the Kalshi event
 # title (fetched + cached below), so new Carbon Arc self-extensions read
@@ -318,13 +335,19 @@ def previous_email_events():
     return ts, evs, "log"
 
 
-def write_last_sent(now_utc, events) -> None:
-    """Best-effort, after a successful send only."""
+def write_last_sent(now_utc, events, perf_verdicts=None) -> None:
+    """Best-effort, after a successful send only.
+
+    `perf_verdicts` ({"series:KXFOO": "down_rank"}) rides in the same record
+    so the next email can bold the SCAN PERF rows whose verdict CHANGED. One
+    record, one write, one fsync-free os.replace: a second file would be a
+    second thing to go stale independently of this one."""
     try:
         tmp = LAST_SENT_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"sent_at": now_utc.isoformat(),
-                       "events": sorted(set(events))}, f)
+                       "events": sorted(set(events)),
+                       "perf_verdicts": dict(perf_verdicts or {})}, f)
         os.replace(tmp, LAST_SENT_PATH)
     except OSError as e:
         log(f"opportunistic last-sent record not written ({e!r}); the next "
@@ -551,21 +574,28 @@ def tier_totals(rows) -> dict:
             "earn": earn, "pnl": pnl, "net": earn + pnl}
 
 
-def text_table(rows, new_events=frozenset()) -> list:
+def text_table(rows, new_events=frozenset(), perf=None) -> list:
     """Plain-text event table + TOTAL row. One call per tier, so the two
     tiers' tables are identical in format by construction.
 
     QUOTED = markets the bot is quoting now. HELD = markets of the same
     event it has stopped quoting but still holds inventory in, or has
     accrued reward on (Jack 2026-09-07). Their P&L and accrual are in the
-    row; they just consume no slot."""
+    row; they just consume no slot.
+
+    `perf` is an event -> PERF cell map and is passed for the OPEN SCAN tier
+    ONLY: the performance loop is scoped on m.scan, so a PERF column on the
+    finecon or *CC tables would invent a policy that does not exist there.
+    Absent (the default) the column is not rendered at all, so those two
+    tables stay byte-identical to what they were."""
     t = tier_totals(rows)
     # EVENT holds 26 so a <SERIES>-<YYMMMDD> label keeps its day-of-month:
     # at 23 the two events of a weekly series printed identically
     # (BABELMANDEBWEEKLY-26SEP13 and -26SEP20 both truncated to ...26SEP).
     L = [f"{'EVENT':<27}{'WHAT IT IS':<29}{'QUOT':>5}{'HELD':>5}"
          f"{'PERIOD$':>9}{'ALL-TIME$':>11}{'CRED$':>9}"
-         f"{'P&L$':>10}{'NET$':>10}"]
+         f"{'P&L$':>10}{'NET$':>10}"
+         + (f"{'PERF':>8}" if perf else "")]
     for r in rows:
         # blank, not 0.00 — an event with no credit yet reads as "nothing has
         # landed", which is the fact; the HTML twin blanks it the same way
@@ -581,11 +611,13 @@ def text_table(rows, new_events=frozenset()) -> list:
         L.append(f"{_name:<27}{r['label'][:28]:<29}"
                  f"{r['mkts']:>5}{(r.get('held') or ''):>5}"
                  f"{per_s:>9}{r['earn']:>11.2f}{cred_s:>9}"
-                 f"{r['pnl']:>+10.2f}{r['net']:>+10.2f}")
+                 f"{r['pnl']:>+10.2f}{r['net']:>+10.2f}"
+                 + (f"{(perf.get(r['event']) or ''):>8}" if perf else ""))
     tper = f"{t['period']:,.2f}" if t["period"] is not None else "-"
     L.append(f"{'TOTAL':<27}{'':<29}{t['mkts']:>5}{(t['held'] or ''):>5}"
              f"{tper:>9}{t['earn']:>11.2f}{t['cred']:>9,.2f}"
-             f"{t['pnl']:>+10.2f}{t['net']:>+10.2f}")
+             f"{t['pnl']:>+10.2f}{t['net']:>+10.2f}"
+             + (f"{'':>8}" if perf else ""))
     return L
 
 
@@ -594,11 +626,11 @@ _NEW_BADGE = ('<span style="background:#ffd54a;color:#333;font-size:10px;'
               'margin-left:5px;vertical-align:middle">NEW</span>')
 
 
-def html_table(rows, new_events=frozenset()) -> str:
-    """HTML twin of text_table (same columns, same TOTAL row). Since
-    2026-09-13 the EVENT cell is bold ONLY for a row new since the previous
-    email (plus a NEW badge); the rest sit in normal weight so the new ones
-    stand out."""
+def html_table(rows, new_events=frozenset(), perf=None) -> str:
+    """HTML twin of text_table (same columns, same TOTAL row, same optional
+    PERF column). Since 2026-09-13 the EVENT cell is bold ONLY for a row new
+    since the previous email (plus a NEW badge); the rest sit in normal weight
+    so the new ones stand out."""
     t = tier_totals(rows)
     h = ['<table style="border-collapse:collapse;margin:6px 0">']
     h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
@@ -607,7 +639,8 @@ def html_table(rows, new_events=frozenset()) -> str:
              f'<td style="{TD}">THIS PERIOD$</td>'
              f'<td style="{TD}">ALL-TIME EST$</td>'
              f'<td style="{TD}">CREDITED$</td>'
-             f'<td style="{TD}">P&amp;L$</td><td style="{TD}">NET$</td></tr>')
+             f'<td style="{TD}">P&amp;L$</td><td style="{TD}">NET$</td>'
+             + (f'<td style="{TD}">PERF</td>' if perf else '') + '</tr>')
     for i, r in enumerate(rows):
         bg = "#fafafa" if i % 2 else "#fff"
         held = r.get("held") or 0
@@ -628,7 +661,9 @@ def html_table(rows, new_events=frozenset()) -> str:
                  f'</td>'
                  f'<td style="{TD}">{_pnl_span(r["pnl"])}</td>'
                  f'<td style="{TD};font-weight:700">{_pnl_span(r["net"])}</td>'
-                 f'</tr>')
+                 + (f'<td style="{TD};color:#b00">'
+                    f'{perf.get(r["event"]) or ""}</td>' if perf else '')
+                 + '</tr>')
     tper = f'{t["period"]:,.2f}' if t["period"] is not None else '&mdash;'
     h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
              f'<td style="{TDL}">TOTAL</td><td style="{TDL}"></td>'
@@ -638,8 +673,424 @@ def html_table(rows, new_events=frozenset()) -> str:
              f'<td style="{TD};color:#777">{t["earn"]:,.2f}</td>'
              f'<td style="{TD};color:#0a7">{t["cred"]:,.2f}</td>'
              f'<td style="{TD}">{_pnl_span(t["pnl"])}</td>'
-             f'<td style="{TD}">{_pnl_span(t["net"])}</td></tr>')
+             f'<td style="{TD}">{_pnl_span(t["net"])}</td>'
+             + (f'<td style="{TD}"></td>' if perf else '') + '</tr>')
     h.append('</table>')
+    return "".join(h)
+
+
+# ---- SCAN PERF (the open-scan performance loop's scorecard) ----------------
+# The loop demands extra ROI of a scan candidate whose STRUCTURE (spread, mid,
+# days-to-close, pool $/day) the scorer has MEASURED as loss-making, by
+# subtracting a requirement `req` from its ROI before the 5%/day admission
+# bar. It can only ever subtract — `adj` is clipped at 0.0 on the upside and
+# `req = clip(-WEIGHT*adj, 0, MAX_REQ) >= 0` — so there is no code path that
+# promotes a market, and this block never needs to explain one.
+#
+# Everything printed here comes from ONE file (STATUS_DIR/scan_perf.json,
+# parsed by send_imm_digest.load_scan_perf). The block is defensive at every
+# level: no file prints "no table", and a field the scorer did not write
+# renders blank rather than raising. The email must never fail because of
+# this block — it is a scorecard bolted onto a report that already carries the
+# tier's money.
+#
+# Two labels are load-bearing and appear on every number:
+#   MEASURED  markout from the bot's own fills against the strategy doc's
+#             four-tier mark hierarchy; `credited_measured` from the ledger
+#   MODELLED  the rent estimate (cycle-log accrual integral, $1.00 floor) and
+#             every counterfactual
+# MEASURED credits get their OWN column and are never added to the MODELLED
+# rent — the same rule the CUMULATIVE table below enforces for EST/CREDITED,
+# and for the same reason: they are two scopes on one stream and neither
+# contains the other.
+_PERF_DIM_ORDER = ("spread", "mid", "dtc", "pool")
+
+
+def _perf_keys_for(event_ticker: str) -> list:
+    """The keys under which this event could be scored, most specific first.
+
+    The table keys series records by SERIES and event records by EVENT ROOT,
+    and the root is "the ticker minus the trailing date segment" — which for
+    KXAXP-26OCTCARDS is written as the full event ticker in one place of the
+    schema and as KXAXP in another. Rather than guess, the lookup tries the
+    full event ticker, then the event ticker minus its last segment, then the
+    series. All three are plain dict hits and the first one found wins, so
+    either keying convention reports correctly and neither can silently
+    report nothing — which is exactly how 30 *CC events left this email on
+    2026-09-10."""
+    series = event_ticker.split("-")[0]
+    out = [event_ticker]
+    trimmed = event_ticker.rsplit("-", 1)[0]
+    if trimmed != event_ticker:
+        out.append(trimmed)
+    if series not in out:
+        out.append(series)
+    return out
+
+
+def perf_record(table, event_ticker: str):
+    """(key, unit, record) for an event, or (None, None, None).
+
+    EVENT records are checked before SERIES records: a verdict on the narrower
+    unit is the one that describes this row."""
+    if not table:
+        return None, None, None
+    events = table.get("events") if isinstance(table.get("events"), dict) else {}
+    series = table.get("series") if isinstance(table.get("series"), dict) else {}
+    for key in _perf_keys_for(event_ticker):
+        rec = events.get(key)
+        if isinstance(rec, dict):
+            return key, "event", rec
+    for key in _perf_keys_for(event_ticker):
+        rec = series.get(key)
+        if isinstance(rec, dict):
+            return key, "series", rec
+    return None, None, None
+
+
+def perf_req_of(rec, hdr) -> float:
+    """The requirement in $/day per $ at risk that this record implies at the
+    weight currently in force: `req = clip(-WEIGHT * dev, 0, MAX_REQ)`.
+
+    Recomputed here rather than read from the file because the file carries
+    `dev` (the MEASURED deviation) and the bot carries the WEIGHT: printing a
+    req from one without the other is how a table of intentions gets read as a
+    table of actions. Returns 0.0 for a missing/neutral record, and NEVER a
+    negative number — the loop has no promote path and neither does its
+    report."""
+    if not isinstance(rec, dict):
+        return 0.0
+    dev = _f(rec.get("dev"))
+    w = hdr.get("weight")
+    w = _f(w) if w is not None else 0.0
+    max_req = _f((hdr.get("max_req") if hdr.get("max_req") is not None
+                  else 0.10)) or 0.10
+    return max(0.0, min(-w * dev, max_req))
+
+
+def perf_req_at_full_weight(rec) -> float:
+    """What the req WOULD be at WEIGHT=1.0 — the observe-only readout. While
+    the loop ships at weight 0 this is the only number in the row that moves,
+    and hiding it would make the whole table read as zeros."""
+    return perf_req_of(rec, {"weight": 1.0})
+
+
+def perf_cell(rec, hdr) -> str:
+    """The PERF cell on an OPEN SCAN row: "BAR", the applied req, a
+    parenthesised would-be req while the loop is observe-only or the table is
+    stale, or blank when the row is neutral/unscored.
+
+    Parentheses mean NOT APPLIED. Printing "0.000" for a down-ranked row at
+    weight 0 would be true and useless; printing the bare req would be a lie.
+    """
+    if not isinstance(rec, dict):
+        return ""
+    verdict = str(rec.get("verdict") or "neutral")
+    if verdict == "bar" and hdr.get("bar_on") and not hdr.get("stale"):
+        return "BAR"
+    if verdict == "bar":
+        return "(BAR)"
+    if verdict == "neutral":
+        return ""
+    req = perf_req_of(rec, hdr)
+    if req > 0 and not hdr.get("stale"):
+        return f"{req:.3f}"
+    return f"({perf_req_at_full_weight(rec):.3f})"
+
+
+def perf_cells_for(table, rows, hdr) -> dict:
+    """event -> PERF cell, for the OPEN SCAN rows only."""
+    out = {}
+    for r in rows:
+        _k, _u, rec = perf_record(table, r["event"])
+        cell = perf_cell(rec, hdr)
+        if cell:
+            out[r["event"]] = cell
+    return out
+
+
+def perf_nonneutral(table) -> list:
+    """[(unit, key, record)] for every non-neutral record in the table, worst
+    dev first. Neutral records are the overwhelming majority and say nothing;
+    a bar or a down-rank is the whole point of the file."""
+    out = []
+    for unit, field in (("series", "series"), ("event", "events")):
+        d = table.get(field) if isinstance(table.get(field), dict) else {}
+        for key, rec in sorted(d.items()):
+            if isinstance(rec, dict) and str(rec.get("verdict") or "neutral") \
+                    != "neutral":
+                out.append((unit, key, rec))
+    out.sort(key=lambda t: (_f(t[2].get("dev")), t[1]))
+    return out
+
+
+def perf_verdict_map(table) -> dict:
+    """{"series:KXFOO": "down_rank", ...} — the record this email persists so
+    the NEXT one can bold the rows whose verdict CHANGED. Same mechanism as
+    the new-event marking (opportunistic_last_sent.json), for the same reason:
+    a verdict that flipped overnight is the one thing in a 40-row table that
+    a human has to see."""
+    return {f"{unit}:{key}": str(rec.get("verdict") or "neutral")
+            for unit, key, rec in perf_nonneutral(table)}
+
+
+def previous_perf_verdicts():
+    """{"unit:key": verdict} from the last SENT email, or None when there is
+    no record — in which case nothing is marked changed and the block says
+    so, rather than marking everything."""
+    rec = load_json(LAST_SENT_PATH) or {}
+    pv = rec.get("perf_verdicts")
+    if not isinstance(pv, dict):
+        return None
+    return {str(k): str(v) for k, v in pv.items()}
+
+
+def _perf_rent_c_per_ct(rec) -> str:
+    """MODELLED rent in cents per contract for one record, or "" when the
+    scorer did not give enough to derive it. Never invented from a
+    denominator that is not in the file."""
+    if rec.get("rent_cents_per_contract") is not None:
+        return f"{_f(rec.get('rent_cents_per_contract')):.2f}"
+    ct = _f(rec.get("contracts_matured")) or _f(rec.get("contracts_filled"))
+    if ct <= 0:
+        return ""
+    return f"{_f(rec.get('rent_modelled')) * 100.0 / ct:.2f}"
+
+
+def _perf_num(v, fmt: str) -> str:
+    """Blank for a field the scorer did not write; formatted otherwise. A
+    missing number must never print as 0.00 — that is a measurement claim."""
+    if v is None:
+        return ""
+    try:
+        return format(float(v), fmt)
+    except (TypeError, ValueError):
+        return ""
+
+
+def perf_unmarked_frac(table):
+    """The share of fills the mark hierarchy could not mark. Above 0.35 the
+    scorer forces a group neutral, so a drift toward it is visible BEFORE it
+    changes a verdict."""
+    cov = table.get("coverage") if isinstance(table.get("coverage"), dict) else {}
+    tier = table.get("tier") if isinstance(table.get("tier"), dict) else {}
+    if tier.get("unmarked_frac") is not None:
+        return _f(tier.get("unmarked_frac"))
+    fills = _f(cov.get("fills"))
+    if fills <= 0:
+        return None
+    return _f(cov.get("fills_unmarked")) / fills
+
+
+def scan_perf_text_block(table, hdr, cost, prev_verdicts=None) -> list:
+    """The SCAN PERF block, plain text. Returns lines; never raises."""
+    L = ["SCAN PERF — open-scan performance loop (markout MEASURED, rent "
+         "MODELLED)"]
+    if not table:
+        L.append(f"no table — {SCAN_PERF_PATH} is absent or unreadable, so "
+                 f"every scan candidate ranks on gross ROI alone (today's "
+                 f"behaviour).")
+        L.append(scan_perf_cost_line(cost))
+        return L
+    age = (f"{hdr['age_h']:.1f}h old" if hdr["age_h"] is not None
+           else "age unknown")
+    w = hdr["weight"] if hdr["weight"] is not None else "?"
+    b = ("on" if hdr["bar_on"] else "off") if hdr["bar_on"] is not None else "?"
+    L.append(f"table generated {hdr['generated_at']} ({age})  |  WEIGHT={w}  "
+             f"|  BAR {b}   [weight/bar read from the {hdr['source']}]")
+    if hdr["stale"]:
+        L.append(f"STALE — verdicts not applied. Above "
+                 f"{SCAN_PERF_MAX_AGE_H:.0f}h the bot clears its tables and "
+                 f"every verdict below goes neutral; this is a picture of an "
+                 f"old policy, not the live one.")
+    tier = table.get("tier") if isinstance(table.get("tier"), dict) else {}
+    cov = table.get("coverage") if isinstance(table.get("coverage"), dict) else {}
+    L.append("coverage {} mkts / {} events / {} series | {} fills -> {} "
+             "episodes ({} matured) | risk-days {}".format(
+                 _perf_num(cov.get("markets"), ",.0f") or "?",
+                 _perf_num(cov.get("events"), ",.0f") or "?",
+                 _perf_num(cov.get("series"), ",.0f") or "?",
+                 _perf_num(cov.get("fills"), ",.0f") or "?",
+                 _perf_num(cov.get("episodes"), ",.0f") or "?",
+                 _perf_num(cov.get("episodes_matured"), ",.0f") or "?",
+                 _perf_num(cov.get("risk_days"), ",.1f") or "?"))
+    L.append("tier markout {} c/ct [MEASURED] | rent {} [MODELLED, basis {}] "
+             "| mu_trading_only {} | mu_rent_blended {}".format(
+                 _perf_num(tier.get("markout_c_per_ct_24h"), "+.2f") or "?",
+                 "$" + (_perf_num(tier.get("rent_modelled_dollars"), ",.2f")
+                        or "?"),
+                 tier.get("rent_basis") or "?",
+                 _perf_num(tier.get("mu_trading_only"), "+.5f") or "?",
+                 _perf_num(tier.get("mu_rent_blended"), "+.5f") or "?"))
+    L.append("MEASURED credits ${} on {} of {} events — its OWN column, never "
+             "added to the MODELLED rent above (two scopes on one stream, "
+             "neither contains the other).".format(
+                 _perf_num(tier.get("credited_measured_dollars"), ",.2f")
+                 or "0.00",
+                 _perf_num(cov.get("credited_events"), ",.0f") or "0",
+                 _perf_num(cov.get("events"), ",.0f") or "?"))
+    mix = tier.get("mark_source_mix") if isinstance(
+        tier.get("mark_source_mix"), dict) else {}
+    uf = perf_unmarked_frac(table)
+    L.append("marks: " + (", ".join(
+        f"{k} {_f(v):.2f}" for k, v in sorted(mix.items())) or "not reported")
+        + ("  |  unmarked {:.2f}".format(uf) if uf is not None
+           else "  |  unmarked n/a")
+        + "  (a drift toward one-sided/settlement marks shows up here BEFORE "
+          "it changes a verdict; above 0.35 unmarked a group is forced "
+          "neutral)")
+
+    # ---- cohorts, BOTH bases, acting column marked ------------------------
+    basis = hdr.get("basis") or "trading"
+    acting = "trading" if basis != "blend" else "blend"
+    cohorts = table.get("cohorts") if isinstance(table.get("cohorts"), dict) else {}
+    L.append("")
+    L.append("COHORTS — both bases; '*' marks the ACTING column "
+             f"(score_basis={basis}). dev is MEASURED deviation from the tier "
+             f"centre, in $/day per $ at risk.")
+    L.append("{:<7}{:<10}{:>6}{:>5}{:>5}{:>11}{:>10}{:>10}{:>10}{:>10}  {}"
+             .format("DIM", "BUCKET", "MKTS", "SER", "EVT", "$-DAYS",
+                     "RAW_TR" + ("*" if acting == "trading" else ""),
+                     "DEV_TR" + ("*" if acting == "trading" else ""),
+                     "RAW_BL" + ("*" if acting == "blend" else ""),
+                     "DEV_BL" + ("*" if acting == "blend" else ""), "MUTED"))
+    dims = [d for d in _PERF_DIM_ORDER if d in cohorts]
+    dims += [d for d in sorted(cohorts) if d not in _PERF_DIM_ORDER]
+    any_bucket = False
+    for dim in dims:
+        c = cohorts.get(dim) or {}
+        for bkt in (c.get("buckets") or []):
+            if not isinstance(bkt, dict):
+                continue
+            any_bucket = True
+            L.append("{:<7}{:<10}{:>6}{:>5}{:>5}{:>11}{:>10}{:>10}{:>10}{:>10}"
+                     "  {}".format(
+                         dim[:6], str(bkt.get("key") or "")[:9],
+                         _perf_num(bkt.get("n_markets"), ",.0f"),
+                         _perf_num(bkt.get("n_series"), ",.0f"),
+                         _perf_num(bkt.get("n_events"), ",.0f"),
+                         _perf_num(bkt.get("risk_days"), ",.1f"),
+                         _perf_num(bkt.get("raw_trading"), "+.4f"),
+                         _perf_num(bkt.get("dev_trading"), "+.4f"),
+                         _perf_num(bkt.get("raw_blend"), "+.4f"),
+                         _perf_num(bkt.get("dev_blend"), "+.4f"),
+                         "muted" if bkt.get("muted") else ""))
+    if not any_bucket:
+        L.append("  (no cohort buckets in the table)")
+
+    # ---- non-neutral keys --------------------------------------------------
+    nn = perf_nonneutral(table)
+    L.append("")
+    if not nn:
+        L.append("NON-NEUTRAL KEYS: none — every scored series and event root "
+                 "is neutral in this table.")
+    else:
+        L.append("NON-NEUTRAL KEYS — '!' marks a verdict that CHANGED since "
+                 "the previous email. REQ is at the weight in force; a "
+                 "parenthesised value is what it WOULD be at WEIGHT=1.0 and "
+                 "is not applied. CRED$ is MEASURED money and is NOT part of "
+                 "RENT.")
+        L.append("{:<26}{:<8}{:>4}{:>6}{:>9}{:>10}{:>10}{:>10}  {:<10}{:<12}"
+                 "{:>9}".format("KEY", "UNIT", "EP", "MKTS", "MO24c",
+                                "RENTc/ct", "DEV", "REQ", "VERDICT", "UNTIL",
+                                "CRED$"))
+        for unit, key, rec in nn:
+            vk = f"{unit}:{key}"
+            changed = (prev_verdicts is not None
+                       and prev_verdicts.get(vk)
+                       != str(rec.get("verdict") or "neutral"))
+            req = perf_req_of(rec, hdr)
+            req_s = (f"{req:.4f}" if req > 0 and not hdr.get("stale")
+                     else f"({perf_req_at_full_weight(rec):.4f})")
+            L.append("{:<26}{:<8}{:>4}{:>6}{:>9}{:>10}{:>10}{:>10}  {:<10}"
+                     "{:<12}{:>9}".format(
+                         (("!" if changed else "") + key)[:25],
+                         unit[:7],
+                         _perf_num(rec.get("n_episodes"), ",.0f"),
+                         _perf_num(rec.get("n_markets"), ",.0f"),
+                         _perf_num(rec.get("markout_c_per_ct_24h"), "+.2f"),
+                         _perf_rent_c_per_ct(rec),
+                         _perf_num(rec.get("dev"), "+.4f"),
+                         req_s,
+                         str(rec.get("verdict") or "")[:9],
+                         str(rec.get("until") or "")[:11],
+                         _perf_num(rec.get("credited_measured"), ",.2f")))
+    if prev_verdicts is None:
+        L.append("  (no previous SCAN PERF record on file, so no verdict is "
+                 "marked changed this time)")
+
+    # ---- bars --------------------------------------------------------------
+    bars = [(u, k, r) for u, k, r in nn
+            if str(r.get("verdict") or "") == "bar"]
+    L.append("")
+    if bars:
+        L.append("ACTIVE BARS ({}), BAR {}:".format(len(bars), b))
+        for unit, key, rec in bars:
+            L.append(f"  {unit}:{key} until {rec.get('until') or '?'}")
+    else:
+        L.append("bars: 0 live. The bar fires on nothing in this table"
+                 + (" and BAR is off." if b == "off" else "."))
+    unmatched = table.get("unmatched_bar_keys") or []
+    L.append("unmatched bar keys (a bar whose group produced no scan "
+             "candidate in 24h — a dead bar, visible rather than silently "
+             "mis-firing): "
+             + (", ".join(str(x) for x in unmatched[:12]) if unmatched
+                else "none"))
+
+    # ---- the cost line -----------------------------------------------------
+    L.append("")
+    L.append(scan_perf_cost_line(cost))
+    L.append(scan_perf_cost_basis_note(cost))
+    for wmsg in (table.get("warnings") or [])[:6]:
+        L.append(f"warning: {wmsg}")
+    return L
+
+
+def scan_perf_html_block(table, hdr, cost, prev_verdicts=None) -> str:
+    """HTML twin of scan_perf_text_block. Same facts, same order, same
+    labels — the two renderers are kept side by side on purpose so a number
+    can never appear in one and not the other."""
+    h = ['<div style="font-size:15px;font-weight:600;margin:18px 0 2px">'
+         'Scan perf <span style="color:#888;font-weight:400">&mdash; '
+         'open-scan performance loop (markout MEASURED, rent MODELLED)'
+         '</span></div>']
+    if not table:
+        h.append('<div style="color:#666;font-size:13px">no table &mdash; '
+                 '<code>{}</code> is absent or unreadable, so every scan '
+                 'candidate ranks on gross ROI alone (today&rsquo;s '
+                 'behaviour).</div>'.format(SCAN_PERF_PATH))
+        h.append('<div style="color:#555;font-size:13px;margin-top:4px">'
+                 '{}</div>'.format(scan_perf_cost_line(cost)))
+        return "".join(h)
+    age = (f"{hdr['age_h']:.1f}h old" if hdr["age_h"] is not None
+           else "age unknown")
+    w = hdr["weight"] if hdr["weight"] is not None else "?"
+    b = ("on" if hdr["bar_on"] else "off") if hdr["bar_on"] is not None else "?"
+    h.append('<div style="color:#555;font-size:13px">table generated '
+             '<b>{}</b> ({}) &nbsp;&middot;&nbsp; <b>WEIGHT={}</b> '
+             '&nbsp;&middot;&nbsp; <b>BAR {}</b> <span style="color:#999">'
+             '(weight/bar read from the {})</span></div>'.format(
+                 hdr["generated_at"], age, w, b, hdr["source"]))
+    if hdr["stale"]:
+        h.append('<div style="color:#b00;font-size:13px;font-weight:700">'
+                 'STALE &mdash; verdicts not applied. Above {:.0f}h the bot '
+                 'clears its tables and every verdict below goes neutral.'
+                 '</div>'.format(SCAN_PERF_MAX_AGE_H))
+    # The header lines above are already rendered as HTML; skip exactly those
+    # from the text twin (title, generated line, and the STALE line when it is
+    # present) so nothing is printed twice.
+    skip = 2 + (1 if hdr["stale"] else 0)
+    for line in scan_perf_text_block(table, hdr, cost, prev_verdicts)[skip:]:
+        if not line.strip():
+            continue
+        esc = (line.replace("&", "&amp;").replace("<", "&lt;")
+                   .replace(">", "&gt;"))
+        # a verdict that CHANGED since the previous email carries the '!'
+        # marker in its first column; the HTML twin bolds the whole row
+        if line.startswith("!"):
+            esc = f"<b>{esc}</b>"
+        h.append('<div style="font-family:Consolas,monospace;font-size:11px;'
+                 'color:#333;white-space:pre">{}</div>'.format(esc))
     return "".join(h)
 
 
@@ -941,11 +1392,33 @@ def build_report(now_utc):
                  if state.get("scan_admit_day") == today_et.isoformat() else 0)
     scan_halted = state.get("scan_halt_day") == today_et.isoformat()
     scan_evicted = len(state.get("scan_evicted_events") or {})
+
+    # ---- the open-scan performance loop ------------------------------------
+    # Whole block is best-effort. A scorecard bolted onto this report must
+    # never be the reason the report does not go out, so every failure here
+    # degrades to "no table" and the rest of the email is byte-identical.
+    try:
+        perf_table = load_scan_perf()
+        perf_hdr = scan_perf_header(perf_table, status, now_utc)
+        perf_cost = scan_perf_cost(now_utc)
+    except Exception as e:                                  # noqa: BLE001
+        log(f"opportunistic scan-perf block unavailable ({e!r}); the SCAN "
+            f"PERF section will print 'no table'")
+        perf_table, perf_cost = {}, {"window_h": 24, "seats_empty": 0,
+                                     "barred": 0, "floored_out": 0,
+                                     "forgone_dollars_per_day": 0.0,
+                                     "seats_cap": getattr(imm, "SCAN_TOP_N", 0)}
+        perf_hdr = {"present": False, "generated_at": "", "age_h": None,
+                    "stale": False, "weight": None, "bar_on": None,
+                    "source": "unknown", "basis": "", "max_req": None}
+    perf_cells = perf_cells_for(perf_table, scan_rows, perf_hdr)
+    perf_verdicts = perf_verdict_map(perf_table)
+    prev_perf = previous_perf_verdicts()
     # One section per tier, same table format (Jack 2026-09-06).
     tiers = [
         ("FINECON", "curated Finance/Economics quiet prints",
          f"{len(fin_members)}/{top_n} slots, +{used}/{openings_cap} daily "
-         f"openings used", fin_rows),
+         f"openings used", fin_rows, None),
         ("OPEN SCAN", "all other markets, machine-screened for adverse "
          "selection",
          f"{len(scan_sel)}/{scan_top_n} slots, "
@@ -954,7 +1427,9 @@ def build_report(now_utc):
             else f"hard cap {scan_top_n}, no daily openings")
          + (", HALTED today (loss budget)" if scan_halted else "")
          + (f", {scan_evicted} event(s) evicted" if scan_evicted else ""),
-         scan_rows),
+         # PERF is the OPEN SCAN tier's column only — the loop is scoped on
+         # m.scan and nothing it does touches finecon or the *CC family
+         scan_rows, perf_cells),
         # No tier slot budget to report: the family is quoted by the NORMAL
         # book, so its only caps are the per-event ROI cut and the global
         # event ceiling. Saying "N/M slots" here would invent a budget that
@@ -965,7 +1440,7 @@ def build_report(now_utc):
          f"{len(fam_rows)} event(s) / {len(fam_members)} markets; no tier "
          f"slot cap — max {_family_event_top_n()} markets per event by ROI, "
          f"inside the global {getattr(imm, 'MAX_MARKETS', 0)}-event ceiling",
-         fam_rows),
+         fam_rows, None),
     ]
 
     # Deliberately does NOT put the estimate and the credited figure side by
@@ -1004,11 +1479,11 @@ def build_report(now_utc):
              + (": " + ", ".join(new_list) if new_list else "")
              + ". '*' marks a new row below.")
     L.append("")
-    for name, desc, slots, trows in tiers:
+    for name, desc, slots, trows, tperf in tiers:
         L.append(f"{name} — {desc}")
         L.append(f"{slots}.")
         if trows:
-            L.extend(text_table(trows, new_events))
+            L.extend(text_table(trows, new_events, tperf))
         else:
             L.append(f"No {name.lower()} events quoted right now.")
         L.append("")
@@ -1018,6 +1493,8 @@ def build_report(now_utc):
                  "MTM can only see the live book")
         L.extend(cum_text_table(cum_rows))
         L.append("")
+    L.extend(scan_perf_text_block(perf_table, perf_hdr, perf_cost, prev_perf))
+    L.append("")
     L.append(f"Kalshi-credited on opportunistic events to date: "
              f"${cred_life:,.2f} (actual money; lands 1-2d after each period "
              f"ends; {cred_asof})."
@@ -1081,14 +1558,14 @@ def build_report(now_utc):
              + (': <b>' + '</b>, <b>'.join(new_list) + '</b>' if new_list
                 else '')
              + '. Bold rows below are new since the previous email.</div>')
-    for name, desc, slots, trows in tiers:
+    for name, desc, slots, trows, tperf in tiers:
         h.append(f'<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
                  f'{name} <span style="color:#888;font-weight:400">&mdash; '
                  f'{desc}</span></div>')
         h.append(f'<div style="color:#555;font-size:13px;margin-bottom:4px">'
                  f'{slots}</div>')
         if trows:
-            h.append(html_table(trows, new_events))
+            h.append(html_table(trows, new_events, tperf))
         else:
             h.append(f'<div style="color:#666;font-size:13px">No '
                      f'{name.lower()} events quoted right now.</div>')
@@ -1099,6 +1576,7 @@ def build_report(now_utc):
                  'touched, settled and gone included; EST and MTM can only '
                  'see the live book</span></div>')
         h.append(cum_html_table(cum_rows))
+    h.append(scan_perf_html_block(perf_table, perf_hdr, perf_cost, prev_perf))
     h.append(f'<div style="color:#555;font-size:13px;margin-top:12px">'
              f'Kalshi-credited on opportunistic events to date: '
              f'<b>${cred_life:,.2f}</b> <span style="color:#999">(actual '
@@ -1146,7 +1624,8 @@ def build_report(now_utc):
              f'is the open book right now. NET = EST + REALIZED + MTM, the '
              f'same estimate basis as the tables above.</div>')
     h.append('</div>')
-    return text, "".join(h), subject, sorted(r["event"] for r in rows)
+    return (text, "".join(h), subject, sorted(r["event"] for r in rows),
+            perf_verdicts)
 
 
 def main(argv=None) -> int:
@@ -1171,9 +1650,11 @@ def main(argv=None) -> int:
     attempts = 1 if (args.test or dry) else 8
     text = html = subject = None
     shown_events: list = []
+    perf_verdicts: dict = {}
     for attempt in range(1, attempts + 1):
         try:
-            text, html, subject, shown_events = build_report(now_utc)
+            (text, html, subject, shown_events,
+             perf_verdicts) = build_report(now_utc)
             break
         except Exception as e:
             log(f"opportunistic build attempt {attempt}/{attempts} failed: {e!r}")
@@ -1201,7 +1682,7 @@ def main(argv=None) -> int:
     if ok:
         # a --test send is still an email Jack saw: the next one is judged
         # against it
-        write_last_sent(now_utc, shown_events)
+        write_last_sent(now_utc, shown_events, perf_verdicts)
     if ok and not args.test:
         with open(marker, "w") as f:
             f.write(now_utc.isoformat())
