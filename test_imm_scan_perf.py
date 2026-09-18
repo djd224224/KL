@@ -152,15 +152,15 @@ class Sinks:
         return self
 
     def admit(self, ts, ticker, *, per_day=1.0, collateral=10.0, mid=41.0,
-              spread=2, pool=30.0):
+              spread=2, pool=30.0, event=None):
+        ev = event or M.ev_of(ticker)
         self.selection.append({
             "ticker": ticker, "decision": "selected", "prev": None,
-            "series": M.ser_of(ticker), "event_ticker": M.ev_of(ticker),
+            "series": M.ser_of(ticker), "event_ticker": ev,
             "est_dollars_per_day": per_day, "est_collateral_dollars": collateral,
             "dollars_per_day": pool, "mid_cents": mid, "spread_cents": spread,
             "is_scan": True, "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ")})
         self.state["scan_book"].append(ticker)
-        ev = M.ev_of(ticker)
         if ev not in self.roster["scan_events"]:
             self.roster["scan_events"].append(ev)
         return self
@@ -266,10 +266,10 @@ class Base(unittest.TestCase):
         return rc, buf.getvalue()
 
     def simple_market(self, ticker, *, start=None, hours=8, bid=40, ask=42,
-                      own_bid_ct=20, pool=30.0, **kw):
+                      own_bid_ct=20, pool=30.0, event=None, **kw):
         start = start or T0
         self.s.admit(start, ticker, pool=pool, mid=(bid + ask) / 2.0,
-                     spread=ask - bid)
+                     spread=ask - bid, event=event)
         self.s.quotes(ticker, start, int(hours * 12), bid=bid, ask=ask,
                       own_bid_ct=own_bid_ct, pool=pool, **kw)
         return ticker
@@ -310,12 +310,45 @@ class TestMarkHierarchy(Base):
         src = {r["ticker"]: r for r in sc.fill_rows}
         self.assertEqual(src["KXSET-26SEP20-T1"]["source"], "settlement")
         self.assertAlmostEqual(src["KXSET-26SEP20-T1"]["mark"], 100.0)
-        self.assertEqual(src["KXTWO-26SEP20-T1"]["source"], "two_sided")
+        # the SUB-source: the live cycle book, distinct from the marks-sink
+        # fallback that shares tier 2 with it
+        self.assertEqual(src["KXTWO-26SEP20-T1"]["source"], "cycle_two_sided")
         self.assertAlmostEqual(src["KXTWO-26SEP20-T1"]["mark"], 62.0)
         self.assertEqual(src["KXONE-26SEP20-T1"]["source"], "one_sided")
         self.assertEqual(src["KXNIL-26SEP20-T1"]["source"], "unmarked")
         self.assertIsNone(src["KXNIL-26SEP20-T1"]["mo"])
         self.assertEqual(sc.market_mo.get("KXNIL-26SEP20-T1", 0.0), 0.0)
+        # the SPEC's three-key mix still folds both tier-2 sinks together
+        self.assertEqual(set(sc.mark_source_mix),
+                         {"two_sided", "one_sided", "settlement"})
+        self.assertAlmostEqual(sum(sc.mark_source_mix.values()), 1.0, places=3)
+
+    def test_marks_sink_fallback_is_reported_as_its_own_sub_source(self):
+        """F1: the marks-sink fallback shares tier 2 with the live cycle book
+        but is NOT the same thing -- its value is state.last_mark, which the
+        bot fills from a bulk get_markets mid, falls back to last_price (a
+        trade print) when bid/ask are missing, and leaves in place on an API
+        failure ("stale marks stand"). Reporting it as `two_sided` blinded
+        mark_source_mix, the one detector SPEC 2.4 added so a drift toward
+        staler marks is visible BEFORE it changes a verdict. MEASURED on the
+        live window: 22.66% of scored contracts rode this channel."""
+        t_fill = T0 + timedelta(hours=1)
+        t_mark = t_fill + timedelta(hours=24)
+        tkr = "KXSINK-26SEP20-T1"
+        self.simple_market(tkr, hours=2)
+        # NO cycle row anywhere near the horizon; only a marks_*.jsonl row
+        self.s.mark(t_mark - timedelta(seconds=120), tkr, 70.0)
+        self.s.fill(t_fill, tkr, 10, px=40)
+        sc = self.build()
+        row = next(r for r in sc.fill_rows if r["ticker"] == tkr)
+        self.assertEqual(row["source"], "sink_mark")
+        self.assertAlmostEqual(row["mark"], 70.0)
+        # still counts as two_sided in the SPEC's three-key mix ...
+        self.assertAlmostEqual(sc.mark_source_mix["two_sided"], 1.0)
+        # ... and is broken out in the detail, which is the honest detector
+        self.assertAlmostEqual(sc.mark_source_detail["sink_mark"], 1.0)
+        self.assertAlmostEqual(sc.mark_source_detail["cycle_two_sided"], 0.0)
+        self.assertEqual(sc.mark_source_detail["sink_mark_fills"], 1)
 
     def test_one_sided_mark_uses_the_trailing_24h_median_half_spread(self):
         """SPEC 2.4 tier 3: MEDIAN over the trailing 24 h, never the
@@ -327,7 +360,12 @@ class TestMarkHierarchy(Base):
         self.simple_market(tkr, start=T0, hours=2)
         # trailing two-sided history: mostly 2c, one 30c blow-out
         self.s.quotes(tkr, t_mark - timedelta(hours=6), 40, bid=49, ask=51)
-        self.s.cycle(t_mark - timedelta(seconds=600), tkr, bid=35, ask=65)
+        # The blow-out sits OUTSIDE the +/-900s mark tolerance on purpose: it
+        # must feed the trailing-24h median and nothing else. Inside the
+        # tolerance it is a legitimate tier-2 two-sided row and tier 3 never
+        # runs -- which is what the old nearest-3-neighbours search in
+        # _cycle_near was accidentally hiding (F11).
+        self.s.cycle(t_mark - timedelta(hours=2), tkr, bid=35, ask=65)
         self.s.cycle(t_mark - timedelta(seconds=30), tkr, bid=50, ask=None, sides=1)
         self.s.fill(t_fill, tkr, 10, px=40)
         sc = self.build()
@@ -386,7 +424,13 @@ class TestMarkHierarchy(Base):
         sc = self.build()
         self.assertEqual(sc.cov["fills_pending"], 1)
         self.assertEqual(sc.cov["fills_matured"], 0)
-        self.assertEqual(sc.cov["episodes"], 0)
+        # `episodes` counts EVERY fill collapsed to (ticker, UTC hour) and
+        # `episodes_matured` the marked-and-matured subset, so the file can
+        # express SPEC 2.2's "106 fills -> 85 episodes (63 matured)" shape.
+        # Emitting len(self.episodes) for both made them identical by
+        # construction and the distinction unfalsifiable.
+        self.assertEqual(sc.cov["episodes"], 1)
+        self.assertEqual(sc.cov["episodes_matured"], 0)
         self.assertEqual(sc.market_mo.get(tkr, 0.0), 0.0)
         row = next(r for r in sc.fill_rows if r["ticker"] == tkr)
         self.assertEqual(row["status"], "pending")
@@ -423,17 +467,37 @@ class TestGroupsAndExposure(Base):
         self.assertNotIn("until", rec)
 
     def test_bucket_is_muted_below_five_series_or_three_events(self):
-        """SPEC 3.4 mute rules: < 5 distinct series or < 3 distinct events."""
-        for i in range(6):                       # 6 series, 6 events, 1c books
+        """SPEC 3.4 mute rules: < 5 distinct series OR < 3 distinct events.
+
+        The two conditions are SEPARATED here on purpose. The first cut used
+        one fixture bucket with 2 series AND 2 events, so dropping either
+        term from the predicate left the test green and neither condition was
+        pinned on its own."""
+        # (a) SERIES condition alone: 4 series spread over 4 events
+        for i in range(4):
             self.simple_market(f"KXW{i}-26SEP20-T1", bid=40, ask=41, hours=3)
-        for i in range(2):                       # 2 series only -> muted
-            self.simple_market(f"KXN{i}-26SEP20-T1", bid=30, ask=45, hours=3)
+        # (b) EVENTS condition alone: 6 series concentrated in 2 events
+        for i in range(6):
+            self.simple_market(f"KXN{i}-26SEP20-T1", bid=40, ask=43, hours=3,
+                               event=f"KXSHARED{i % 2}-26SEP20")
+        # (c) neither: 5 series over exactly 3 events -> NOT muted
+        for i in range(5):
+            self.simple_market(f"KXK{i}-26SEP20-T1", bid=40, ask=47, hours=3,
+                               event=f"KXTRIO{i % 3}-26SEP20")
         sc = self.build()
         by_key = {b["key"]: b for b in sc.cohorts["spread"]["buckets"]}
-        self.assertFalse(by_key["1c"]["muted"])
-        self.assertGreaterEqual(by_key["1c"]["n_series"], 5)
-        self.assertTrue(by_key["10-19c"]["muted"])
-        self.assertEqual(by_key["10-19c"]["dev_trading"], 0.0)
+        a, b, c = by_key["1c"], by_key["2-4c"], by_key["5-9c"]
+        self.assertEqual((a["n_series"], a["n_events"]), (4, 4))
+        self.assertTrue(a["muted"], "4 distinct series must mute on the "
+                                    "series condition alone")
+        self.assertEqual(a["dev_trading"], 0.0)
+        self.assertEqual((b["n_series"], b["n_events"]), (6, 2))
+        self.assertTrue(b["muted"], "2 distinct events must mute on the "
+                                    "events condition alone")
+        self.assertEqual(b["dev_trading"], 0.0)
+        self.assertEqual((c["n_series"], c["n_events"]), (5, 3))
+        self.assertFalse(c["muted"], "5 series / 3 events is exactly at both "
+                                     "floors and must NOT mute")
 
     def test_adopted_position_is_capped_at_own_fill_contracts(self):
         """SPEC 2.5 adopted-position rule. MEASURED: KXAALA-27JANPLF-83 held
@@ -539,7 +603,14 @@ class TestIdempotenceAndGuards(Base):
 
     def test_scorer_is_idempotent_on_rerun(self):
         """SPEC 4.2: two runs in the same minute produce a byte-identical
-        table modulo generated_at."""
+        table modulo the run-to-run deltas scrubbed below.
+
+        `generated_at` and the whole `window` block are NOT among them:
+        run_cli always passes an explicit --asof, so all four are derived
+        from a constant and compared as-is. (Without that pin they would be
+        stamped from datetime.now() and two runs straddling a UTC second
+        boundary would fail -- which is why the --asof is load-bearing here
+        and not decoration.)"""
         self._corpus()
         rc1, _ = self.run_cli()
         with open(os.path.join(self.wd, M.TABLE_NAME), encoding="utf-8") as f:
@@ -549,6 +620,10 @@ class TestIdempotenceAndGuards(Base):
             second = f.read()
         self.assertEqual(rc1, 0)
         self.assertEqual(rc2, 0)
+        self.assertEqual(json.loads(first)["generated_at"],
+                         json.loads(second)["generated_at"])
+        self.assertEqual(json.loads(first)["window"],
+                         json.loads(second)["window"])
 
         def scrub(txt):
             d = json.loads(txt)
@@ -761,9 +836,11 @@ class TestVerdictsAndBases(Base):
         t2 = [t for t in sc2.markets if t.startswith("KXBAR")]
         self.assertIsNotNone(sc2._bootstrap_ci_hi(t2, 0.0, "t"))
 
-    def test_ratchet_eases_by_at_most_one_cent_per_run_but_deepens_immediately(self):
-        """SPEC 3.7: tightening on realized pain stays immediate and
-        asymmetric; relaxing is bounded at RATCHET_EASE_PER_RUN per run."""
+    def test_ratchet_eases_by_at_most_one_cent_per_run(self):
+        """SPEC 3.7: relaxing is bounded at RATCHET_EASE_PER_RUN per run, on
+        BOTH the cohort-bucket path (_apply_ratchet) and the series path
+        (_build_units). The other half of the asymmetry -- deepening is
+        immediate -- needs its own fixture and lives in the sibling test."""
         self._bar_corpus(n_events=3, n_strikes=3)
         rc, _ = self.run_cli()
         self.assertEqual(rc, 0)
@@ -781,15 +858,52 @@ class TestVerdictsAndBases(Base):
         self.assertGreater(sc.ratchet_eased, 0)
         self.assertLessEqual(sc.series_recs["KXBAR"]["dev"],
                              deep + M.RATCHET_EASE_PER_RUN + 1e-9)
-        # deepening is immediate: a shallow previous value does not hold it up
-        prev["cohorts"][dim]["buckets"] = [
-            dict(x, dev_trading=0.0) for x in prev["cohorts"][dim]["buckets"]]
-        M.atomic_write_json(os.path.join(self.wd, M.TABLE_NAME), prev)
-        sc2 = self.build()
-        got2 = next(x for x in sc2.cohorts[dim]["buckets"] if x["key"] == "2-4c")
-        self.assertAlmostEqual(got2["dev_trading"],
-                               next(x for x in self.build().cohorts[dim]["buckets"]
-                                    if x["key"] == "2-4c")["dev_trading"])
+    def _mixed_corpus(self):
+        """KXBAR adverse, four favourable neighbours in other series/events.
+        _bar_corpus alone puts the WHOLE tier in one series and one bucket,
+        so y == y_cohort == mu and every unconstrained dev is 0.0 -- nothing
+        to deepen to, which is why the deepening half needs its own fixture."""
+        self._bar_corpus(n_events=3, n_strikes=3, mark=20)
+        for e in range(4):
+            tkr = f"KXGOOD{e}-26SEP2{e}-T1"
+            self.simple_market(tkr, hours=6, bid=40, ask=42)
+            for h in range(3):
+                day = T0 + timedelta(days=h % 2)
+                t = day + timedelta(hours=1 + h)
+                self.s.fill(t, tkr, 10, px=40, pos_before=10.0 * h)
+                self.s.quotes(tkr, t + timedelta(hours=24)
+                              - timedelta(seconds=30), 2, bid=59, ask=61)
+
+    def _write_prev(self, dev):
+        M.WORK_DIR = self.wd
+        M.atomic_write_json(os.path.join(self.wd, M.TABLE_NAME), {
+            "version": 1, "cohorts": {}, "events": {},
+            "series": {"KXBAR": {"dev": dev, "verdict": "down_rank"}}})
+
+    def test_ratchet_deepens_immediately_against_an_unconstrained_build(self):
+        """SPEC 3.7's ASYMMETRY: easing is bounded, deepening is not.
+
+        The reference has to be an UNCONSTRAINED build -- no previous table
+        at all. Comparing one constrained build against another constrained
+        build against the SAME previous table moves both sides together under
+        any ratchet rule, symmetric or not, so a symmetric clamp (which
+        destroys the asymmetry this rule exists for) passed that comparison.
+        """
+        self._mixed_corpus()
+        free = self.build().series_recs["KXBAR"]["dev"]
+        self.assertLess(free, -M.RATCHET_EASE_PER_RUN - 1e-9,
+                        "fixture too weak: the unconstrained dev must be "
+                        "deeper than one ratchet step, or a symmetric clamp "
+                        "would be invisible")
+        # a SHALLOWER previous value must not hold the deepening up. Under a
+        # symmetric clamp this would come back at
+        # prev + RATCHET_EASE_PER_RUN = -0.01 instead.
+        self._write_prev(0.0)
+        self.assertAlmostEqual(self.build().series_recs["KXBAR"]["dev"], free)
+        self._write_prev(-0.005)
+        self.assertAlmostEqual(self.build().series_recs["KXBAR"]["dev"], free)
+        # (the EASING bound is pinned by the sibling test above, on both the
+        # bucket path and this same series path.)
 
     def test_both_bases_are_emitted_and_trading_is_the_acting_one(self):
         """SPEC 3.2 / judge must_fix J1-6: scoring NET softens the largest
@@ -1143,6 +1257,399 @@ class TestBotLoaderRoundTrip(Base):
                         "no open-ended top bucket in this artefact")
         self.assertEqual(table["params"]["edges_refit"], False)
         self.assertEqual(table["version"], 1)
+
+    # -- LEAD RULING R5: the two integration guard fixes, pinned -----------
+
+    @staticmethod
+    def _shape(sc, *, n_series, n_muted, n_clamped):
+        """Overwrite a built scorer's emitted records so the two guard
+        DENOMINATORS take an exact, hand-checkable shape.
+
+        acting  (what the BOT counts) = every bucket dev_trading + every
+                series/event dev
+        blended (what the writer counted first) = unmuted buckets x2 +
+                every series/event dev
+        """
+        tmpl = dict(next(iter(sc.series_recs.values())))
+        sc.event_recs = {}
+        sc.series_recs = {}
+        for i in range(n_series):
+            r = dict(tmpl)
+            r["verdict"] = "neutral"
+            r["dev"] = 0.0
+            sc.series_recs[f"KXFAKE{i:03d}"] = r
+        muted = 0
+        for blk in sc.cohorts.values():
+            for b in blk["buckets"]:
+                b["dev_trading"] = 0.0
+                b["dev_blend"] = 0.0
+                b["muted"] = muted < n_muted
+                muted += 1
+        for i in range(n_clamped):
+            sc.series_recs[f"KXFAKE{i:03d}"]["dev"] = -M.DIM_CLIP
+            sc.series_recs[f"KXFAKE{i:03d}"]["verdict"] = "down_rank"
+
+    def _patch_build(self, fn):
+        orig = M.ScanPerfScorer.build
+
+        def patched(sc):
+            orig(sc)
+            fn(sc)
+        M.ScanPerfScorer.build = patched
+        self.addCleanup(setattr, M.ScanPerfScorer, "build", orig)
+
+    def test_clamp_storm_uses_the_max_of_both_denominators(self):
+        """LEAD RULING R5 / integration fix A. The bot's
+        `_scan_perf_validate` counts a DIFFERENT set than the writer first
+        did: every bucket `dev_trading` (muted ones included) plus each
+        series/event `dev`, and never `dev_blend`. MEASURED on the live table
+        those denominators are 115 and 129, so a file with 12 clamped acting
+        devs is 10.4% to the LOADER (refused whole, tier silently reverts to
+        the last good table) and 9.3% to the writer (shipped). The writer
+        must never be laxer, so the MAX drives the abort.
+
+        Constructed here to exactly that 12-of-115 / 12-of-129 case: 20
+        buckets of which 17 unmuted, 95 series records, 12 of them clamped.
+        Reverting to the writer's own denominator alone makes this pass."""
+        self._patch_build(lambda sc: self._shape(
+            sc, n_series=95, n_muted=3, n_clamped=12))
+        for i in range(3):
+            self.simple_market(f"KXA{i}-26SEP20-T1", hours=6)
+        self.s.write()
+        M.STATUS_DIR, M.WORK_DIR = self.sd, self.wd
+        sc = M.ScanPerfScorer(self.sd, self.wd, asof=ASOF, use_cache=False)
+        sc.load()
+        sc.build()
+        n_buckets = sum(len(b["buckets"]) for b in sc.cohorts.values())
+        self.assertEqual(n_buckets + len(sc.series_recs), 115)
+        frac, n_acting = sc.clamped_frac()
+        self.assertEqual(n_acting, 115)
+        self.assertAlmostEqual(frac, 12 / 115.0, places=6)
+        self.assertGreater(frac, M.CLAMP_STORM_FRAC)          # the loader's view
+        self.assertLess(12 / 129.0, M.CLAMP_STORM_FRAC)       # the writer's view
+        rc, txt = self.run_cli(write_sinks=False)
+        self.assertEqual(rc, 4)
+        self.assertIn("CLAMP STORM", txt)
+        self.assertFalse(os.path.exists(os.path.join(self.wd, M.TABLE_NAME)))
+
+    def test_max_records_sheds_only_neutral_records_most_positive_first(self):
+        """LEAD RULING R5 / integration fix B. The `markets` trim bounds the
+        writer's own count; the BOT's cap counts series + events + BUCKETS
+        and never reads `markets` at all, so a table over it is refused WHOLE
+        and the tier keeps a stale verdict. The shed must therefore bound the
+        LOADER's denominator, and it may only drop NEUTRAL records,
+        most-positive `dev` first: a neutral record with dev >= 0 is a pure
+        no-op for scan_perf_adj, and shedding a mildly negative one can only
+        REDUCE a penalty. down_rank and bar records are never shed."""
+        imm = self._bot()
+        keep_down = {"KXFAKE000", "KXFAKE001", "KXFAKE002"}
+
+        def shape(sc):
+            self._shape(sc, n_series=95, n_muted=0, n_clamped=0)
+            for i, k in enumerate(sorted(sc.series_recs)):
+                # a strictly increasing dev, so "most positive first" has a
+                # unique answer and the shed order is checkable. Kept inside
+                # dim_clip so the loader has no other reason to refuse.
+                sc.series_recs[k]["dev"] = round(-0.0003 * (95 - i), 6)
+            for k in keep_down:
+                sc.series_recs[k]["verdict"] = "down_rank"
+                sc.series_recs[k]["dev"] = -0.03      # deepest, never shed
+        self._patch_build(shape)
+        old_max = M.MAX_RECORDS
+        self.addCleanup(setattr, M, "MAX_RECORDS", old_max)
+        M.MAX_RECORDS = 100                        # 20 buckets + 95 = 115 > 100
+        now = datetime.now(UTC).replace(microsecond=0)
+        for i in range(3):
+            self.simple_market(f"KXA{i}-26SEP20-T1",
+                               start=now - timedelta(days=2), hours=6)
+        rc, txt = self.run_cli(asof=now)
+        self.assertEqual(rc, 0)
+        tbl = self.read_table()
+        n_buckets = sum(len(b["buckets"]) for b in tbl["cohorts"].values())
+        n_loader = len(tbl["series"]) + len(tbl["events"]) + n_buckets
+        self.assertLessEqual(n_loader, M.MAX_RECORDS)
+        # every down_rank survived ...
+        for k in keep_down:
+            self.assertIn(k, tbl["series"], f"{k} (down_rank) was shed")
+        # ... only neutral records went ...
+        shed = {k for k in (f"KXFAKE{i:03d}" for i in range(95))
+                if k not in tbl["series"]}
+        self.assertTrue(shed)
+        self.assertFalse(shed & keep_down)
+        # ... and they were the MOST POSITIVE devs, i.e. the least punitive
+        all_keys = sorted(f"KXFAKE{j:03d}" for j in range(95))
+        want_dev = {k: round(-0.0003 * (95 - i), 6)
+                    for i, k in enumerate(all_keys)}
+        for k in keep_down:
+            want_dev[k] = -0.03
+        kept = [tbl["series"][k]["dev"] for k in all_keys if k in tbl["series"]]
+        shed_devs = [want_dev[k] for k in shed]
+        self.assertGreater(min(shed_devs), max(kept),
+                           "a shed record was more punitive than a kept one")
+        # ... a warning says so ...
+        self.assertTrue(any("MAX_RECORDS" in w for w in tbl["warnings"]), txt)
+        self.assertTrue(any(str(n_loader) in w for w in tbl["warnings"]))
+        # ... and the bot then ACCEPTS the file rather than refusing it whole
+        n, loaded = self._load_into_bot(
+            imm, os.path.join(self.wd, M.TABLE_NAME))
+        self.assertTrue(loaded[0], "the loader still refused the file whole")
+        self._assert_writer_is_not_laxer(imm, tbl, where="shed")
+
+
+# ================================================ fixer-added invariants
+
+
+class TestScorerInvariants(Base):
+
+    def test_event_root_matches_the_bots_rule_exactly(self):
+        """The scorer EMITS the `events` block and the bot LOOKS UP in it, so
+        the two must derive the key by the same rule or the scorer publishes
+        a key the bot can never find. rsplit('-', 1) agreed on the easy cases
+        and disagreed on KXVOTEGENERAL-HOUSECO3-26CBRO (574 of 1,455 scan
+        candidates over the last 20 selection_events files)."""
+        try:
+            import incentive_mm as imm
+        except Exception as e:                       # pragma: no cover
+            raise unittest.SkipTest(f"incentive_mm not importable: {e}")
+        for ev in ("KXCPIYOY-26NOV", "KXAXP-26OCTCARDS",
+                   "KXHYPEMINMON-HYPE-26JUL31", "KXVOTEGENERAL-HOUSECO3-26CBRO",
+                   "KXMLBPLAYOFFS", "KXNOVEL-99DEC31", "KXWEEKSNUM1-26SEP21",
+                   "KXBNBMAXMON-BNB-26JUL31"):
+            self.assertEqual(M.root_of(ev), imm.scan_perf_event_root(ev), ev)
+
+    def test_event_ticker_comes_from_the_sink_not_a_string_guess(self):
+        """The fills and selection_events sinks both carry the bot's own
+        `event_ticker`; ev_of's two-segment guess is the fallback only. A
+        wrong event here misses that event's ledger rows AND publishes an
+        `events` key under the wrong root."""
+        tkr = "KXVOTEGENERAL-HOUSECO3-26CBRO-7"
+        self.simple_market(tkr, hours=6, event="KXVOTEGENERAL-HOUSECO3-26CBRO")
+        sc = self.build()
+        self.assertEqual(sc.ev(tkr), "KXVOTEGENERAL-HOUSECO3-26CBRO")
+        self.assertNotEqual(sc.ev(tkr), M.ev_of(tkr))
+        self.assertEqual(M.root_of(sc.ev(tkr)), "KXVOTEGENERAL-HOUSECO3")
+        # and an unseen ticker still falls back rather than raising
+        self.assertEqual(sc.ev("KXNEVERSEEN-26SEP20-T1"),
+                         "KXNEVERSEEN-26SEP20")
+
+    def test_a_half_cent_median_spread_still_lands_in_a_bucket(self):
+        """SPEC 3.3's spread edges are integer cents with GAPS -- [0,1],
+        [2,4], [5,9], [10,19], [20,inf) -- while the fitting-side value is a
+        median that is a half-cent for any even-length sample. 4.5 is exactly
+        the 4c<->5c flicker the trailing-6h median exists to smooth, and it
+        used to fall into no bucket at all: the market vanished from the
+        whole dimension with no warning and no count."""
+        sc = self._sc()
+        for v in (1.5, 4.5, 9.5, 19.5, 0.5):
+            self.assertIsNotNone(sc._bucket_of("spread", v),
+                                 f"spread {v} fell into no bucket")
+        self.assertEqual(sc._bucket_of("spread", 4.0), "2-4c")
+        self.assertEqual(sc._bucket_of("spread", 5.0), "5-9c")
+        self.assertEqual(sc._bucket_of("spread", 4.5), "5-9c")   # half UP
+        # the contiguous "left"-closed dimensions are NOT rounded
+        self.assertEqual(sc._bucket_of("mid", 29.5), "10-30")
+        self.assertEqual(sc._bucket_of("dtc", 6.9), "0-7")
+
+    def _sc(self):
+        M.STATUS_DIR, M.WORK_DIR = self.sd, self.wd
+        return M.ScanPerfScorer(self.sd, self.wd, asof=ASOF, use_cache=False)
+
+    def test_every_bucket_dimension_accounts_for_all_its_risk_days(self):
+        """feedback_sweep_class_after_fix: silent exclusions never show in
+        logs. A market whose dimension value is not None but whose bucket is
+        None contributes to the tier mu and to n_markets but to NO bucket, so
+        the column stops summing to coverage.risk_days and every dev on that
+        dimension shifts."""
+        for i in range(4):
+            self.simple_market(f"KXS{i}-26SEP20-T1", bid=40, ask=41 + i, hours=4)
+        sc = self.build()
+        for dim in M.DIM_ORDER:
+            missing = sc.unassigned[dim]["risk_days"]
+            bucketed = sum(b["risk_days"]
+                           for b in sc.cohorts[dim]["buckets"])
+            none_valued = sum(sc.markets[t]["risk_days"] for t in sc.markets
+                              if sc.dim_value[dim].get(t) is None)
+            self.assertAlmostEqual(
+                bucketed + missing + none_valued, round(sc.risk_total, 2),
+                places=1, msg=f"{dim}: buckets do not account for every $-day")
+            self.assertEqual(missing, 0.0, f"{dim}: {sc.unassigned[dim]}")
+
+    def test_a_qualified_period_with_no_ledger_row_stays_modelled(self):
+        """$0.00 is NOT evidence of a credit. A period that qualifies on age
+        but whose ledger rows fall outside its window has no MEASURED term;
+        stamping it `credited` and zeroing the estimate produced records
+        reading `rent_basis: mixed_by_period` next to `rent_measured_frac:
+        0.0` next to a non-zero `credited_measured` -- three statements about
+        one event that cannot all be true, and an invitation to add EST and
+        CREDITED."""
+        tkr = "KXNOCR-26SEP20-T1"
+        self.simple_market(tkr, hours=10, pool=5000.0)
+        self.s.program(tkr, T0 - timedelta(days=3), T0 + timedelta(hours=5))
+        # a credit for a DIFFERENT event, dated late enough that `newest`
+        # makes this market's period age-qualify
+        self.s.credit("2026-09-09", "KXOTHER-26SEP20", 3.0)
+        sc = self.build()
+        self.assertEqual({p["basis"] for p in sc.market_rent_periods[tkr]},
+                         {"est_floored"})
+        rec = sc.series_recs["KXNOCR"]
+        self.assertEqual(rec["rent_basis"], "est_floored")
+        self.assertEqual(rec["rent_measured_frac"], 0.0)
+        self.assertEqual(rec["rent_measured_dollars"], 0.0)
+
+    def test_no_record_claims_a_credited_basis_with_a_zero_measured_term(self):
+        """The invariant the three contradictory fields above violated: a
+        basis other than `est_floored` means a MEASURED credit actually
+        replaced an estimate, so rent_measured_dollars must be non-zero."""
+        tkr = "KXCR2-26SEP20-T1"
+        self.simple_market(tkr, hours=10, pool=5000.0)
+        self.s.program(tkr, T0 - timedelta(days=3), T0 + timedelta(hours=5))
+        self.s.credit("2026-09-07", M.ev_of(tkr), 7.25)
+        self.s.credit("2026-09-09", "KXOTHER-26SEP20", 3.0)
+        sc = self.build()
+        tbl = sc.table()
+        recs = list(tbl["series"].values()) + list(tbl["events"].values())
+        self.assertTrue(recs)
+        for r in recs:
+            if r["rent_basis"] != "est_floored":
+                self.assertGreater(
+                    r["rent_measured_dollars"], 0.0,
+                    f"rent_basis {r['rent_basis']} with a $0 measured term")
+                self.assertGreater(r["rent_measured_frac"], 0.0)
+        # the pseudo-period before the program start can never be credited
+        for p in sc.market_rent_periods[tkr]:
+            if p["basis"] == "credited":
+                self.assertTrue(p["lo"] > -1e308)
+
+    def test_a_flat_through_fill_is_not_counted_as_unmarked(self):
+        """`unmarked/n_fills` is the input to the data_thin rule and to bar
+        condition 4. A fill whose position did not move carries no direction
+        -- there is nothing to mark -- so booking it as `unmarked` put the
+        one thing that CAN raise that ratio into a denominator that names
+        something else."""
+        tkr = "KXFLAT-26SEP20-T1"
+        t_fill = T0 + timedelta(hours=1)
+        self.simple_market(tkr, hours=6)
+        self.s.quotes(tkr, t_fill + timedelta(hours=24) - timedelta(seconds=30),
+                      2, bid=29, ask=31)
+        self.s.fill(t_fill, tkr, 10, px=40, pos_before=5.0, pos_after=5.0)
+        sc = self.build()
+        self.assertEqual(sc.cov["fills_unmarked"], 0)
+        self.assertEqual(sc.cov["fills_flat_through"], 1)
+        row = next(r for r in sc.fill_rows if r["ticker"] == tkr)
+        self.assertEqual(row["status"], "flat_through")
+
+    def test_each_markout_horizon_has_its_own_maturity_and_sample_size(self):
+        """SPEC 10.3 pre-registers 1h/24h/72h baselines, so the three numbers
+        printed on one line labelled MEASURED must be the SAME statistic at
+        three horizons. The first cut computed 1h and 72h inside the 24h
+        loop, conditioning both on the fill already having matured AND been
+        markable at 24h, and winsorised/episode-collapsed neither."""
+        tkr = "KXHZ-26SEP20-T1"
+        t_fill = T0 + timedelta(hours=1)
+        self.simple_market(tkr, hours=6)
+        for h in (1, 24, 72):
+            self.s.quotes(tkr, t_fill + timedelta(hours=h)
+                          - timedelta(seconds=30), 2, bid=49 + h, ask=51 + h)
+        self.s.fill(t_fill, tkr, 10, px=40)
+        # a SECOND fill that has matured at 1h but not at 72h
+        late = ASOF - timedelta(hours=30)
+        self.s.quotes(tkr, late + timedelta(hours=1) - timedelta(seconds=30),
+                      2, bid=39, ask=41)
+        self.s.fill(late, tkr, 10, px=40, pos_before=10.0)
+        sc = self.build()
+        hz = sc.markout_horizons
+        self.assertEqual(set(hz), {1, 24, 72})
+        self.assertGreater(hz[1]["n_fills"], hz[72]["n_fills"],
+                           "the 1h sample must not be conditioned on 72h "
+                           "maturity")
+        for h in (1, 24, 72):
+            self.assertLessEqual(abs(hz[h]["c_per_ct"]), M.WINSOR_CENTS + 1e-9)
+            self.assertGreaterEqual(hz[h]["n_episodes"], 0)
+        # the 24h entry reproduces the acting figure by the same path
+        tbl = sc.table()
+        self.assertAlmostEqual(hz[24]["c_per_ct"],
+                               tbl["tier"]["markout_c_per_ct_24h"], places=3)
+
+
+class TestGuardsLeaveTheLastGoodTable(Base):
+    """Every abort path prints 'NO FILE WRITTEN'. The three guard tests start
+    from an EMPTY work dir and assert the table was never created, which a
+    write-then-validate refactor would also satisfy. What actually matters on
+    the box is that the PREVIOUS GOOD TABLE is still there, byte for byte,
+    and that no history row was appended."""
+
+    def _corpus(self):
+        for i in range(3):
+            self.simple_market(f"KXA{i}-26SEP20-T1", hours=6, bid=40, ask=42)
+        self.s.fill(T0 + timedelta(hours=1), "KXA0-26SEP20-T1", 10, px=40)
+        self.s.quotes("KXA0-26SEP20-T1", T0 + timedelta(hours=25)
+                      - timedelta(seconds=30), 2, bid=29, ask=31)
+
+    def _snapshot(self):
+        with open(os.path.join(self.wd, M.TABLE_NAME), "rb") as f:
+            tbl = f.read()
+        with open(os.path.join(self.wd, M.HISTORY_NAME), "rb") as f:
+            hist = f.read()
+        return tbl, hist
+
+    def _assert_unchanged(self, before):
+        self.assertEqual(self._snapshot(), before,
+                         "an aborted run changed the last good table or "
+                         "appended a history row")
+
+    def test_reconciliation_abort_leaves_the_previous_table_untouched(self):
+        self._corpus()
+        rc, _ = self.run_cli()
+        self.assertEqual(rc, 0)
+        before = self._snapshot()
+        self.s.extra_realized.append({
+            "ts": (T0 + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ticker": "KXA0-26SEP20-T1", "series": "KXA0",
+            "event_ticker": "KXA0-26SEP20", "realized_delta_dollars": -2.0,
+            "realized_total_dollars": -2.0, "pos_after": 0.0, "avg_after": 0.0})
+        rc2, txt = self.run_cli()
+        self.assertEqual(rc2, 2)
+        self.assertIn("NO FILE WRITTEN", txt)
+        self._assert_unchanged(before)
+
+    def test_exposure_abort_leaves_the_previous_table_untouched(self):
+        self._corpus()
+        rc, _ = self.run_cli()
+        self.assertEqual(rc, 0)
+        before = self._snapshot()
+        M.WORK_DIR = self.wd
+        M.append_jsonl(os.path.join(self.wd, M.HISTORY_NAME),
+                       {"generated_at": "2026-09-09T07:55:00Z", "risk_days": 1e6})
+        after_row = self._snapshot()
+        rc2, txt = self.run_cli()
+        self.assertEqual(rc2, 3)
+        self.assertIn("NO FILE WRITTEN", txt)
+        self._assert_unchanged(after_row)
+
+    def test_clamp_storm_abort_leaves_the_previous_table_untouched(self):
+        # a mild corpus writes the GOOD table first ...
+        self._corpus()
+        rc, _ = self.run_cli()
+        self.assertEqual(rc, 0)
+        before = self._snapshot()
+        # ... then the two-group corpus the clamp-storm guard test uses (every
+        # unmuted bucket needs a real, non-zero deviation to be clamped)
+        t_fill = T0 + timedelta(hours=1)
+        t_mark = t_fill + timedelta(hours=24)
+        for tag, bid, ask, px, mark, dt, pool in (
+                ("C", 40, 41, 40.0, 70, "26SEP20", 30.0),
+                ("D", 15, 22, 18.0, 5, "26DEC20", 10.0)):
+            for i in range(6):
+                tkr = f"KX{tag}{i}-{dt}-T1"
+                self.simple_market(tkr, hours=6, bid=bid, ask=ask, pool=pool)
+                self.s.fill(t_fill, tkr, 10, px=px)
+                self.s.quotes(tkr, t_mark - timedelta(seconds=30), 2,
+                              bid=mark - 1, ask=mark + 1)
+        M.DIM_CLIP = 1e-4            # force every dev onto a clamp
+        rc2, txt = self.run_cli()
+        self.assertEqual(rc2, 4)
+        self.assertIn("NO FILE WRITTEN", txt)
+        self._assert_unchanged(before)
 
 
 if __name__ == "__main__":

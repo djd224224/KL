@@ -706,45 +706,43 @@ def html_table(rows, new_events=frozenset(), perf=None) -> str:
 _PERF_DIM_ORDER = ("spread", "mid", "dtc", "pool")
 
 
-def _perf_keys_for(event_ticker: str) -> list:
-    """The keys under which this event could be scored, most specific first.
+# VERBATIM incentive_mm.scan_perf_event_root / imm_scan_perf.root_of. The
+# scorer keys its `events` block by EVENT ROOT and its `series` block by
+# SERIES — those are the only two keyings the schema has — so this lookup
+# uses exactly the rule the bot uses and nothing else. An earlier cut also
+# tried the FULL event ticker and an rsplit("-", 1) trim on the way, which
+# reported correctly under either convention but could also hit a key that
+# describes a DIFFERENT unit than the row it is printed on.
+_PERF_ROOT_RE = re.compile(r"^(?P<root>.+)-\d{2}[A-Z]{3}")
 
-    The table keys series records by SERIES and event records by EVENT ROOT,
-    and the root is "the ticker minus the trailing date segment" — which for
-    KXAXP-26OCTCARDS is written as the full event ticker in one place of the
-    schema and as KXAXP in another. Rather than guess, the lookup tries the
-    full event ticker, then the event ticker minus its last segment, then the
-    series. All three are plain dict hits and the first one found wins, so
-    either keying convention reports correctly and neither can silently
-    report nothing — which is exactly how 30 *CC events left this email on
-    2026-09-10."""
-    series = event_ticker.split("-")[0]
-    out = [event_ticker]
-    trimmed = event_ticker.rsplit("-", 1)[0]
-    if trimmed != event_ticker:
-        out.append(trimmed)
-    if series not in out:
-        out.append(series)
-    return out
+
+def perf_event_root(event_ticker: str) -> str:
+    """KXCPIYOY-26NOV -> KXCPIYOY; KXAXP-26OCTCARDS -> KXAXP;
+    KXHYPEMINMON-HYPE-26JUL31 -> KXHYPEMINMON-HYPE; an UNDATED event
+    (KXMLBPLAYOFFS) is its own root."""
+    m = _PERF_ROOT_RE.match(str(event_ticker or ""))
+    return m.group("root") if m else str(event_ticker or "")
 
 
 def perf_record(table, event_ticker: str):
     """(key, unit, record) for an event, or (None, None, None).
 
     EVENT records are checked before SERIES records: a verdict on the narrower
-    unit is the one that describes this row."""
+    unit is the one that describes this row. 30 *CC events left this email
+    silently on 2026-09-10, so a miss must be a real absence, not a keying
+    mismatch — which is why the root rule here is the bot's, verbatim."""
     if not table:
         return None, None, None
     events = table.get("events") if isinstance(table.get("events"), dict) else {}
     series = table.get("series") if isinstance(table.get("series"), dict) else {}
-    for key in _perf_keys_for(event_ticker):
-        rec = events.get(key)
-        if isinstance(rec, dict):
-            return key, "event", rec
-    for key in _perf_keys_for(event_ticker):
-        rec = series.get(key)
-        if isinstance(rec, dict):
-            return key, "series", rec
+    root = perf_event_root(event_ticker)
+    rec = events.get(root)
+    if isinstance(rec, dict):
+        return root, "event", rec
+    ser = str(event_ticker or "").split("-")[0]
+    rec = series.get(ser)
+    if isinstance(rec, dict):
+        return ser, "series", rec
     return None, None, None
 
 
@@ -898,6 +896,9 @@ def scan_perf_text_block(table, hdr, cost, prev_verdicts=None) -> list:
     b = ("on" if hdr["bar_on"] else "off") if hdr["bar_on"] is not None else "?"
     L.append(f"table generated {hdr['generated_at']} ({age})  |  WEIGHT={w}  "
              f"|  BAR {b}   [weight/bar read from the {hdr['source']}]")
+    _banner = sd.scan_perf_not_loaded_banner(hdr)
+    if _banner:
+        L.append(_banner)
     if hdr["stale"]:
         L.append(f"STALE — verdicts not applied. Above "
                  f"{SCAN_PERF_MAX_AGE_H:.0f}h the bot clears its tables and "
@@ -914,14 +915,20 @@ def scan_perf_text_block(table, hdr, cost, prev_verdicts=None) -> list:
                  _perf_num(cov.get("episodes"), ",.0f") or "?",
                  _perf_num(cov.get("episodes_matured"), ",.0f") or "?",
                  _perf_num(cov.get("risk_days"), ",.1f") or "?"))
-    L.append("tier markout {} c/ct [MEASURED] | rent {} [MODELLED, basis {}] "
+    L.append("tier markout {} c/ct [MEASURED] | rent {} [MODELLED, basis {}, "
+             "MEASURED credit that replaced an estimate ${}] "
              "| mu_trading_only {} | mu_rent_blended {}".format(
                  _perf_num(tier.get("markout_c_per_ct_24h"), "+.2f") or "?",
                  "$" + (_perf_num(tier.get("rent_modelled_dollars"), ",.2f")
                         or "?"),
                  tier.get("rent_basis") or "?",
+                 _perf_num(tier.get("rent_measured_dollars"), ",.2f") or "0.00",
                  _perf_num(tier.get("mu_trading_only"), "+.5f") or "?",
                  _perf_num(tier.get("mu_rent_blended"), "+.5f") or "?"))
+    L.append("  mu_trading_only = MEASURED MARKOUT dollars per $-day at risk "
+             "— the ACTING statistic. realized_dollars / mtm_dollars are "
+             "stored separately and drive nothing, and the realized+MTM rate "
+             "is a DIFFERENT number; do not read one as the other.")
     L.append("MEASURED credits ${} on {} of {} events — its OWN column, never "
              "added to the MODELLED rent above (two scopes on one stream, "
              "neither contains the other).".format(

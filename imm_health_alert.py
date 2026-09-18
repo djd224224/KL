@@ -227,13 +227,39 @@ def check_scan_perf_staleness(alerter, state: dict, now: str) -> None:
     try:
         if not os.path.exists(SCAN_PERF_PATH):
             return
-        with open(SCAN_PERF_PATH, encoding="utf-8") as f:
-            table = json.load(f)
-        if not isinstance(table, dict):
+        # An existing-but-UNPARSEABLE table is a scorer regression, not an
+        # undeployed feature, and it is silent everywhere else: the bot
+        # refuses the file whole and runs neutral, and only the 07:25 email
+        # says "no table". Same once-a-day bookkeeping key, so a scorer
+        # writing garbage every morning sends one mail a day, not a flood.
+        try:
+            with open(SCAN_PERF_PATH, encoding="utf-8") as f:
+                table = json.load(f)
+            ok_shape = isinstance(table, dict) and bool(table.get("generated_at"))
+            parse_err = "" if ok_shape else "no generated_at / not an object"
+        except (OSError, ValueError) as e:
+            table, ok_shape, parse_err = {}, False, str(e)
+        if not ok_shape:
+            today = datetime.now(timezone.utc).date()
+            if state.get("scan_perf_alert_date") == today.isoformat():
+                return
+            state["scan_perf_alert_date"] = today.isoformat()
+            log(f"! scan-perf table exists but does not parse ({parse_err})")
+            alerter.send_message(
+                f"The IMM open-scan performance table EXISTS but does not "
+                f"parse, as of {now}.\n\n"
+                f"  File: {SCAN_PERF_PATH}\n"
+                f"  Error: {parse_err}\n\n"
+                f"incentive_mm refuses a bad table WHOLE (all-or-nothing) and "
+                f"keeps the previous one until it ages out, so the tier is "
+                f"running a stale policy or none at all and nothing else "
+                f"reports it. This is a scorer regression, not an undeployed "
+                f"feature.\n\n"
+                f"  python imm_scan_perf.py --dry\n"
+                f"  Get-ScheduledTaskInfo -TaskName 'KL imm scan-perf'\n",
+                subject="IMM scan-perf table does not parse")
             return
         gen = str(table.get("generated_at") or "")
-        if not gen:
-            return
         try:
             when = datetime.fromisoformat(gen.replace("Z", "+00:00"))
         except ValueError:

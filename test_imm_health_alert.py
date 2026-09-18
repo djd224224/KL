@@ -188,13 +188,23 @@ class ScanPerfStaleness(unittest.TestCase):
         ha.check_scan_perf_staleness(a, {}, "now")
         self.assertEqual(a.sent, [])
 
-    def test_a_garbled_table_never_raises(self):
+    def test_a_garbled_table_never_raises_and_alerts_once_a_day(self):
+        """A table that EXISTS but does not parse is a scorer regression, not
+        an undeployed feature, and it is silent everywhere else: the bot
+        refuses a bad file WHOLE and runs the previous table or none, and
+        only the 07:25 email says "no table". A missing file stays silent (see
+        the sibling test); this does not."""
         for junk in ("{not json", '{"version": 1}', '[]'):
             with open(self.path, "w", encoding="utf-8") as f:
                 f.write(junk)
             a = _Alerter()
-            ha.check_scan_perf_staleness(a, {}, "now")
-            self.assertEqual(a.sent, [], junk)
+            state = {}
+            ha.check_scan_perf_staleness(a, state, "now")     # never raises
+            self.assertEqual(len(a.sent), 1, junk)
+            self.assertIn("does not parse", a.sent[0][0])
+            # at most one a day, on the same bookkeeping key
+            ha.check_scan_perf_staleness(a, state, "now")
+            self.assertEqual(len(a.sent), 1, junk)
 
 
 if __name__ == "__main__":

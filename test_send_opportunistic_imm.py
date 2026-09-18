@@ -165,7 +165,9 @@ def _table(age_h=4.0, **over):
             "n_episodes": 3, "n_markets": 3, "contracts_matured": 150,
             "markout_c_per_ct_24h": -25.5, "rent_modelled": 0.0,
             "dev": -0.0129, "verdict": "down_rank", "credited_measured": 0.0}},
-        "events": {"KXEOWEEK-26SEP19": {
+        # The scorer keys `events` by EVENT ROOT (imm_scan_perf.root_of ==
+        # incentive_mm.scan_perf_event_root), never by the dated event.
+        "events": {"KXEOWEEK": {
             "root": "KXEOWEEK", "n_episodes": 8, "n_markets": 2,
             "contracts_matured": 40, "markout_c_per_ct_24h": -11.4,
             "rent_modelled": 2.00, "dev": -0.0402, "verdict": "bar",
@@ -211,7 +213,7 @@ class TestScanPerfBlock(unittest.TestCase):
         self.assertIn("muted", body)
         # non-neutral keys, both units
         self.assertIn("KXCPIYOY", body)
-        self.assertIn("KXEOWEEK-26SEP19", body)
+        self.assertIn("KXEOWEEK", body)          # keyed by EVENT ROOT
         self.assertIn("2026-10-02", body)           # the bar's until
         self.assertIn("ACTIVE BARS", body)
         self.assertIn("series:KXGONE", body)        # unmatched_bar_keys
@@ -280,7 +282,7 @@ class TestScanPerfBlock(unittest.TestCase):
     def test_a_changed_verdict_is_marked_and_bolded(self):
         t = _table()
         hdr = sd.scan_perf_header(t, STATUS)
-        prev = {"series:KXCPIYOY": "neutral", "event:KXEOWEEK-26SEP19": "bar"}
+        prev = {"series:KXCPIYOY": "neutral", "event:KXEOWEEK": "bar"}
         body = "\n".join(so.scan_perf_text_block(t, hdr, ZERO_COST, prev))
         self.assertIn("!KXCPIYOY", body)          # neutral -> down_rank
         self.assertNotIn("!KXEOWEEK", body)       # unchanged
@@ -300,7 +302,7 @@ class TestScanPerfBlock(unittest.TestCase):
         self.assertIsNone(so.previous_perf_verdicts())
         v = so.perf_verdict_map(_table())
         self.assertEqual(v, {"series:KXCPIYOY": "down_rank",
-                             "event:KXEOWEEK-26SEP19": "bar"})
+                             "event:KXEOWEEK": "bar"})
         so.write_last_sent(datetime.now(timezone.utc), ["KXA-26OCT01"], v)
         self.assertEqual(so.previous_perf_verdicts(), v)
 
@@ -413,6 +415,96 @@ class TestScanPerfCostLine(unittest.TestCase):
         self.assertIn("STALE",
                       sd.scan_perf_digest_line(_table(age_h=72), ZERO_COST,
                                                STATUS))
+
+    def test_the_file_is_not_the_policy(self):
+        """The email reads scan_perf.json; the BOT may have refused it whole
+        (any schema failure is all-or-nothing) or not reloaded it yet, and in
+        either case the tier is running the previous table or none. Rendering
+        a refused file as a live policy, WEIGHT and BAR and all, is the "a
+        model is not a measurement" failure at the reporting end: a hostile
+        copy of the real table (every dev the string 'oops') printed as a
+        normal header with '?' values and no hint the loader rejects it."""
+        t = _table()
+        status = {"scan_perf": {"weight": 0.0, "bar_enabled": False,
+                                "fresh": True,
+                                "generated_at": "2026-09-01T07:55:00Z",
+                                "down_ranked": 0, "barred": 0}}
+        hdr = sd.scan_perf_header(t, status)
+        self.assertIs(hdr["loaded_by_bot"], False)
+        banner = sd.scan_perf_not_loaded_banner(hdr)
+        self.assertIn("HAS NOT LOADED THIS TABLE", banner)
+        self.assertIn("2026-09-01T07:55:00Z", banner)
+        line = sd.scan_perf_digest_line(t, ZERO_COST, status)
+        self.assertIn("HAS NOT LOADED THIS TABLE", line)
+        # the block says so too, above the verdicts
+        body = "\n".join(so.scan_perf_text_block(t, hdr, ZERO_COST, {}))
+        self.assertIn("HAS NOT LOADED THIS TABLE", body)
+        # ... and when the bot IS running this table, no banner, and the
+        # counts come from what it INSTALLED, not from the file's own limits
+        # (the reader-side caps legitimately truncate them)
+        status2 = {"scan_perf": {"weight": 0.0, "bar_enabled": False,
+                                 "fresh": True,
+                                 "generated_at": t["generated_at"],
+                                 "down_ranked": 25, "barred": 5}}
+        hdr2 = sd.scan_perf_header(t, status2)
+        self.assertIs(hdr2["loaded_by_bot"], True)
+        self.assertEqual(sd.scan_perf_not_loaded_banner(hdr2), "")
+        line2 = sd.scan_perf_digest_line(t, ZERO_COST, status2)
+        self.assertIn("25 down-ranked in force", line2)
+        self.assertIn("5 barred", line2)
+        # a status file that cannot say (no scan_perf block) must not cry wolf
+        hdr3 = sd.scan_perf_header(t, {})
+        self.assertIsNone(hdr3["loaded_by_bot"])
+        self.assertEqual(sd.scan_perf_not_loaded_banner(hdr3), "")
+
+
+class TestPerfRecordKeying(unittest.TestCase):
+    """The scorer keys `events` by EVENT ROOT and `series` by SERIES. Those
+    are the only two keyings the schema has, and the root rule is the bot's
+    own (incentive_mm.scan_perf_event_root), verbatim — 30 *CC events left
+    this email silently on 2026-09-10, so a miss must be a real absence and
+    not a keying mismatch."""
+
+    def test_root_rule_matches_the_bot_and_the_scorer(self):
+        import incentive_mm as imm_mod
+        import imm_scan_perf as sp
+        for ev in ("KXCPIYOY-26NOV", "KXAXP-26OCTCARDS",
+                   "KXHYPEMINMON-HYPE-26JUL31", "KXEOWEEK-26SEP19",
+                   "KXVOTEGENERAL-HOUSECO3-26CBRO", "KXMLBPLAYOFFS"):
+            self.assertEqual(so.perf_event_root(ev),
+                             imm_mod.scan_perf_event_root(ev), ev)
+            self.assertEqual(so.perf_event_root(ev), sp.root_of(ev), ev)
+
+    def test_lookup_finds_the_root_record_and_falls_back_to_series(self):
+        t = _table()
+        k, unit, rec = so.perf_record(t, "KXEOWEEK-26SEP19")
+        self.assertEqual((k, unit), ("KXEOWEEK", "event"))
+        self.assertEqual(rec["verdict"], "bar")
+        # a later re-listing of the same weekly hits the SAME root record
+        k2, unit2, _ = so.perf_record(t, "KXEOWEEK-26OCT03")
+        self.assertEqual((k2, unit2), ("KXEOWEEK", "event"))
+        # no event record -> the series record, by series key
+        k3, unit3, rec3 = so.perf_record(t, "KXCPIYOY-26NOV")
+        self.assertEqual((k3, unit3), ("KXCPIYOY", "series"))
+        self.assertEqual(rec3["verdict"], "down_rank")
+        # and an unscored event is a real absence
+        self.assertEqual(so.perf_record(t, "KXNOTHING-26DEC01"),
+                         (None, None, None))
+
+    def test_every_root_in_a_real_scorer_table_is_reachable(self):
+        """Pinned against the scorer's own shape: every key in the `events`
+        block must be exactly root_of() of the dated events it covers, so the
+        email can always find it."""
+        src = os.environ.get("IMM_SCAN_PERF_TEST_TABLE", "")
+        if not src or not os.path.exists(src):
+            self.skipTest("IMM_SCAN_PERF_TEST_TABLE unset — see "
+                          "test_imm_scan_perf for the one-liner")
+        with open(src, encoding="utf-8") as f:
+            table = json.load(f)
+        for root, rec in (table.get("events") or {}).items():
+            for ev in rec.get("events") or []:
+                self.assertEqual(so.perf_event_root(ev), root, ev)
+                self.assertIsNot(so.perf_record(table, ev)[2], None)
 
 
 if __name__ == "__main__":

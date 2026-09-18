@@ -93,7 +93,12 @@ _ALLOWED_WRITE = {TABLE_NAME, CACHE_NAME, HISTORY_NAME}
 # never needs a bot restart (SPEC 6.10).
 
 WINDOW_DAYS = 45
-HALFLIFE_DAYS = 21
+# NO TIME DECAY IN v1. SPEC 3 defines no half-life weighting anywhere, and a
+# decay invented here would silently change mu. An earlier draft carried a
+# --halflife-days flag that was echoed into params and printed in the header
+# but applied to nothing; it was REMOVED 2026-09-18 rather than left to
+# mislead a reader into thinking the window is weighted. Every observation in
+# the window has weight 1.
 HORIZON_H = 24
 MATURITY_SLACK_SECS = 900           # a fill enters the sample at t + H + 15min
 MARK_TOLERANCE_SECS = 900           # same dt grain as imm_reward_recon
@@ -197,6 +202,16 @@ C_IS_SCAN = 28
 # ---------------------------------------------------------------- utilities
 
 def ev_of(ticker: str) -> str:
+    """LAST-RESORT event guess: the first two dash segments.
+
+    It is WRONG for any family whose event ticker is not exactly two
+    segments -- MEASURED over the last 20 selection_events files, 580 of
+    1,455 distinct scan-candidate tickers (KXVOTEGENERAL 574, KXWEEKSNUM1 6)
+    disagree with the authoritative `event_ticker` field, and
+    reward_credits.csv has 18 event keys with >2 segments that this can
+    never reach. Both the fills and the selection_events sinks carry
+    `event_ticker`, so ScanPerfScorer.ev() prefers that map and falls back
+    here only when a ticker appears in neither."""
     parts = ticker.split("-")
     return "-".join(parts[:2]) if len(parts) >= 2 else ticker
 
@@ -205,12 +220,25 @@ def ser_of(ticker: str) -> str:
     return ticker.split("-")[0]
 
 
-def root_of(event_ticker: str) -> str:
-    """EVENT ROOT = the event ticker minus its trailing dated segment.
+# VERBATIM the bot's incentive_mm.scan_perf_event_root rule. The scorer emits
+# the `events` block and the bot looks records up in it, so the two must
+# derive the key by the SAME rule or the scorer publishes a key the bot can
+# never find: rsplit("-", 1) maps KXHYPEMINMON-HYPE-26JUL31 to
+# KXHYPEMINMON-HYPE (agreeing) but KXVOTEGENERAL-HOUSECO3-26CBRO-7's guessed
+# event to KXVOTEGENERAL (disagreeing). Pinned against the bot by a test.
+_EVENT_ROOT_RE = re.compile(r"^(?P<root>.+)-\d{2}[A-Z]{3}")
 
-    KXAXP-26OCTCARDS -> KXAXP;  KXHYPEMINMON-HYPE-26JUL31 -> KXHYPEMINMON-HYPE.
-    Re-listed weeklies therefore share one root (SPEC section 7)."""
-    return event_ticker.rsplit("-", 1)[0] if "-" in event_ticker else event_ticker
+
+def root_of(event_ticker: str) -> str:
+    """EVENT ROOT = the event ticker minus its TRAILING DATE SEGMENT.
+
+    KXAXP-26OCTCARDS -> KXAXP;  KXHYPEMINMON-HYPE-26JUL31 -> KXHYPEMINMON-HYPE;
+    KXCPIYOY-26NOV -> KXCPIYOY. An UNDATED event (KXMLBPLAYOFFS) is its own
+    root and is returned unchanged. Re-listed weeklies therefore share one
+    root (SPEC section 7)."""
+    s = str(event_ticker or "")
+    m = _EVENT_ROOT_RE.match(s)
+    return m.group("root") if m else s
 
 
 def parse_iso(s):
@@ -580,14 +608,13 @@ class PnlReplay:
 class ScanPerfScorer:
 
     def __init__(self, status_dir, work_dir, *, asof=None, window_days=WINDOW_DAYS,
-                 halflife_days=HALFLIFE_DAYS, horizon_h=HORIZON_H,
+                 horizon_h=HORIZON_H,
                  score_basis="trading", refit_edges=False, use_cache=True,
                  bar_enabled=None, log=print):
         self.status_dir = status_dir
         self.work_dir = work_dir
         self.asof = asof or datetime.now(timezone.utc)
         self.window_days = window_days
-        self.halflife_days = halflife_days
         self.horizon_h = horizon_h
         self.score_basis = score_basis
         self.refit_edges = refit_edges
@@ -610,6 +637,19 @@ class ScanPerfScorer:
         if msg not in self.warnings:
             self.warnings.append(msg)
 
+    def ev(self, ticker: str) -> str:
+        """The market's EVENT TICKER, from the sinks' own `event_ticker`
+        field where either sink carried it, else ev_of's two-segment guess.
+
+        The guess is wrong for every family whose event is not exactly two
+        segments, and the `events` block the bot reads is keyed by
+        root_of(event), so a wrong event here publishes a key the bot can
+        never look up and misses that event's ledger rows (MEASURED: 580 of
+        1,455 scan-candidate tickers over the last 20 selection_events
+        files; 0 of them in today's scored roster, so this is latent, not
+        observed)."""
+        return self.event_of.get(ticker) or ev_of(ticker or "")
+
     def load(self):
         t0 = time.time()
         sd = self.status_dir
@@ -626,6 +666,9 @@ class ScanPerfScorer:
         # membership; only decision == "selected" AND is_scan is.
         self.admission = {}
         self.sel_rows = defaultdict(int)
+        # ticker -> AUTHORITATIVE event ticker. Both sinks carry the field the
+        # bot itself used; ev_of's two-segment guess is the fallback only.
+        self.event_of = {}
         scan_book = set(self.state.get("scan_book") or [])
         roster_events = set(self.roster_file.get("scan_events") or [])
         selected = set()
@@ -638,12 +681,15 @@ class ScanPerfScorer:
                 t = d.get("ticker")
                 if not t:
                     continue
+                _evt = d.get("event_ticker")
+                if _evt:
+                    self.event_of[t] = str(_evt)
                 # any scan CANDIDATE in the last 24 h, so a bar whose group
                 # has gone quiet shows up as an unmatched_bar_key instead of
                 # silently mis-firing (SPEC 3.6).
                 if str(d.get("ts") or "") >= recent_cut:
                     self.recent_scan_groups.add(ser_of(t))
-                    self.recent_scan_groups.add(root_of(ev_of(t)))
+                    self.recent_scan_groups.add(root_of(self.ev(t)))
                 if d.get("decision") != "selected":
                     continue
                 selected.add(t)
@@ -722,7 +768,10 @@ class ScanPerfScorer:
                     continue
                 seen_fill.add(fid)
                 t = d.get("ticker")
-                if t in self.roster or ev_of(t or "") in roster_events:
+                _evt = d.get("event_ticker")
+                if _evt:
+                    self.event_of.setdefault(t, str(_evt))
+                if t in self.roster or self.ev(t or "") in roster_events:
                     self.fills.append(d)
         self.fills.sort(key=lambda d: ts_of(d.get("ts")) or 0.0)
         self.roster |= {d["ticker"] for d in self.fills}
@@ -814,11 +863,19 @@ class ScanPerfScorer:
         if not q:
             return None
         ts, bids, asks = q
-        i = bisect.bisect_left(ts, t)
+        # The WHOLE +/-MARK_TOLERANCE_SECS window, not the three bisect
+        # neighbours: on the 300s quote grid a +/-900s window spans up to
+        # seven samples, and the predicate here is CONDITIONAL (both sides
+        # present and ask > bid), so a qualifying sample can sit inside the
+        # tolerance while the nearest neighbours do not qualify. The
+        # nearest-3 shortcut is only correct for an unconditional predicate;
+        # with one, it silently demoted the fill to a lower mark tier.
+        # (MEASURED 2026-09-18: 0 of 128 matured fills were affected on
+        # today's data -- latent, not observed. Bounded by the tolerance, so
+        # this stays O(7).)
         best = None
-        for j in (i - 1, i, i + 1):
-            if j < 0 or j >= len(ts):
-                continue
+        for j in range(bisect.bisect_left(ts, t - MARK_TOLERANCE_SECS),
+                       bisect.bisect_right(ts, t + MARK_TOLERANCE_SECS)):
             dt = abs(ts[j] - t)
             if dt > MARK_TOLERANCE_SECS:
                 continue
@@ -835,11 +892,11 @@ class ScanPerfScorer:
         arr = self.mark_ts.get(ticker)
         if not arr:
             return None
-        i = bisect.bisect_left(arr, t)
+        # Same +/-tolerance sweep as _cycle_near: the predicate (mark_cents
+        # is not None) is conditional, so the nearest three are not enough.
         best = None
-        for j in (i - 1, i, i + 1):
-            if j < 0 or j >= len(arr):
-                continue
+        for j in range(bisect.bisect_left(arr, t - MARK_TOLERANCE_SECS),
+                       bisect.bisect_right(arr, t + MARK_TOLERANCE_SECS)):
             dt = abs(arr[j] - t)
             if dt > MARK_TOLERANCE_SECS:
                 continue
@@ -872,7 +929,23 @@ class ScanPerfScorer:
 
     def _mark(self, ticker, t):
         """M_H(ticker, t). Returns (value_cents, source) or (None, 'unmarked').
-        Four tiers, NO fifth carry-forward tier (SPEC 2.4 / judge must_fix 7)."""
+        Four tiers, NO fifth carry-forward tier (SPEC 2.4 / judge must_fix 7).
+
+        SOURCE is the SUB-source, not the SPEC's three-key bucket. Tier 2 has
+        two sinks -- the live two-sided cycle book and the marks_*.jsonl
+        fallback -- and reporting the fallback as `two_sided` blinded the one
+        detector SPEC 2.4 added "so a drift toward one-sided/settlement marks
+        is visible BEFORE it changes a verdict". MEASURED 2026-09-18 on the
+        live window: cycle_two_sided 87 fills / 2,169 ct (67.97%), sink_mark
+        29 fills / 719 ct (22.66%), settlement 12 fills / 382 ct (9.38%) --
+        i.e. 22% of the acting statistic's contracts rode the sink channel
+        under a label that said otherwise. The two are NOT equivalent: the
+        sink value is `state.last_mark`, which incentive_mm fills from a bulk
+        get_markets mid, falls back to `last_price` (a trade print, not a
+        book mid) when bid/ask are missing, and on an API failure leaves the
+        previous value in place ("stale marks stand"). `mark_source_mix`
+        keeps the SPEC's three keys by folding sink_mark into two_sided;
+        `mark_source_detail` publishes the split."""
         for d in self.settle_by_ticker.get(ticker, ()):
             sts = ts_of(d.get("ts"))
             if sts is not None and sts <= t and d.get("result") in ("yes", "no"):
@@ -881,10 +954,10 @@ class ScanPerfScorer:
                     return px, "settlement"
         two = self._cycle_near(ticker, t, True)
         if two:
-            return (two[1] + two[2]) / 2.0, "two_sided"
+            return (two[1] + two[2]) / 2.0, "cycle_two_sided"
         mc = self._mark_near_sink(ticker, t)
         if mc is not None:
-            return mc, "two_sided"
+            return mc, "sink_mark"
         one = self._cycle_near(ticker, t, False)
         if one:
             s = self._median_spread(ticker, t)
@@ -1111,17 +1184,18 @@ class ScanPerfScorer:
         self.fill_rows = []
         eps = defaultdict(lambda: {"num": 0.0, "ct": 0.0, "fills": 0})
         src_mix = defaultdict(int)
+        src_ct = defaultdict(float)
         self.market_mo = defaultdict(float)
         self.market_ct_matured = defaultdict(float)
         self.market_unmarked = defaultdict(int)
+        self.market_flat = defaultdict(int)
         self.market_fills = defaultdict(int)
         self.market_fills_matured = defaultdict(int)
         self.market_pending = defaultdict(int)
         self.market_episodes = defaultdict(set)
         self.market_days = defaultdict(set)
-        self.mo_other = {1: defaultdict(float), 72: defaultdict(float)}
-        self.ct_other = {1: defaultdict(float), 72: defaultdict(float)}
-        n_fills = n_matured = n_pending = n_unmarked = 0
+        all_hours = set()
+        n_fills = n_matured = n_pending = n_unmarked = n_flat = 0
         contracts = contracts_mat = 0.0
 
         for d in self.fills:
@@ -1142,22 +1216,37 @@ class ScanPerfScorer:
                 datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d"))
             row = {"ticker": t, "ts": ts, "q": q, "d": direction, "px": px,
                    "fill_id": d.get("fill_id"), "count": fnum(d.get("count"), 0.0)}
+            all_hours.add((t, int(ts // 3600)))
             if ts + self.horizon_h * 3600 + MATURITY_SLACK_SECS > self.asof.timestamp():
                 n_pending += 1
                 self.market_pending[t] += 1
                 row.update(status="pending", mark=None, source="pending", mo=None)
                 self.fill_rows.append(row)
                 continue
-            mark, source = self._mark(t, ts + self.horizon_h * 3600)
             n_matured += 1
             self.market_fills_matured[t] += 1
-            if mark is None or direction == 0.0:
+            if direction == 0.0:
+                # A FLAT-THROUGH fill (pos_after == pos_before) is not an
+                # unmarkable fill -- it carries no direction, so there is
+                # nothing to mark. Booking it as `unmarked` put the one thing
+                # that CAN raise the ratio into a denominator that names
+                # something else, and `unmarked/n_fills` is the input to the
+                # data_thin rule and to bar condition 4.
+                n_flat += 1
+                self.market_flat[t] += 1
+                row.update(status="flat_through", mark=None,
+                           source="flat_through", mo=None)
+                self.fill_rows.append(row)
+                continue
+            mark, source = self._mark(t, ts + self.horizon_h * 3600)
+            if mark is None:
                 n_unmarked += 1
                 self.market_unmarked[t] += 1
                 row.update(status="unmarked", mark=None, source="unmarked", mo=None)
                 self.fill_rows.append(row)
                 continue
             src_mix[source] += 1
+            src_ct[source] += abs(q)
             mo = direction * (mark - px)
             row.update(status="marked", mark=mark, source=source, mo=mo)
             self.fill_rows.append(row)
@@ -1167,14 +1256,6 @@ class ScanPerfScorer:
             e["ct"] += abs(q)
             e["fills"] += 1
             contracts_mat += abs(q)
-            for h in (1, 72):
-                if ts + h * 3600 + MATURITY_SLACK_SECS > self.asof.timestamp():
-                    continue
-                m2, _s2 = self._mark(t, ts + h * 3600)
-                if m2 is None:
-                    continue
-                self.mo_other[h][t] += abs(q) * direction * (m2 - px)
-                self.ct_other[h][t] += abs(q)
 
         self.episodes = {}
         for (t, hour), e in eps.items():
@@ -1187,16 +1268,83 @@ class ScanPerfScorer:
             self.market_episodes[t].add(hour)
 
         tot = sum(src_mix.values()) or 1
-        self.mark_source_mix = {k: round(src_mix.get(k, 0) / tot, 4)
-                                for k in ("two_sided", "one_sided", "settlement")}
+        # The SPEC's three keys (sink_mark folds into two_sided: same tier,
+        # different sink) ...
+        self.mark_source_mix = {
+            "two_sided": round((src_mix.get("cycle_two_sided", 0)
+                                + src_mix.get("sink_mark", 0)) / tot, 4),
+            "one_sided": round(src_mix.get("one_sided", 0) / tot, 4),
+            "settlement": round(src_mix.get("settlement", 0) / tot, 4),
+        }
+        # ... and the SUB-source split, which is the honest freshness
+        # detector: a drift from the live cycle book toward `state.last_mark`
+        # is invisible in the three-key mix because both report as two_sided.
+        tot_ct = sum(src_ct.values()) or 1.0
+        self.mark_source_detail = {}
+        for k in ("cycle_two_sided", "sink_mark", "one_sided", "settlement"):
+            self.mark_source_detail[k] = round(src_mix.get(k, 0) / tot, 4)
+            self.mark_source_detail[k + "_fills"] = src_mix.get(k, 0)
+            self.mark_source_detail[k + "_contract_frac"] = round(
+                src_ct.get(k, 0.0) / tot_ct, 4)
         self.cov = {
             "fills": n_fills, "fills_matured": n_matured, "fills_pending": n_pending,
-            "fills_unmarked": n_unmarked,
-            "episodes": len(self.episodes),
+            "fills_unmarked": n_unmarked, "fills_flat_through": n_flat,
+            # episodes = EVERY fill collapsed to (ticker, UTC hour);
+            # episodes_matured = the marked-and-matured subset. Emitting
+            # len(self.episodes) for both made the two identical by
+            # construction, so the file could not express SPEC 2.2's
+            # "106 fills -> 85 episodes (63 matured)" shape at all.
+            "episodes": len(all_hours),
             "episodes_matured": len(self.episodes),
             "contracts_filled": round(contracts, 2),
             "contracts_matured": round(contracts_mat, 2),
         }
+        self.markout_horizons = {
+            h: self._markout_at(h, w_lo, w_hi) for h in (1, self.horizon_h, 72)}
+
+    def _markout_at(self, h, w_lo, w_hi):
+        """The SAME statistic as the acting 24h markout, at horizon `h`.
+
+        Its own maturity cutoff (a fill enters at t + h + slack, NOT at
+        t + 24h + slack), its own (ticker, hour) episode collapse and its own
+        +/-WINSOR_CENTS clip. The first cut computed the 1h and 72h figures
+        inside the 24h loop, so both were conditioned on the fill having
+        already matured AND been markable at 24h, and neither was winsorised
+        or episode-collapsed -- three different statistics printed on one
+        line labelled MEASURED, and not comparable with the SPEC 10.3
+        pre-registered baselines (1h -5.75 on n=105, 72h -2.95 on n=49) that
+        they exist to be compared with."""
+        eps = defaultdict(lambda: [0.0, 0.0])
+        n_fills = 0
+        for d in self.fills:
+            ts = ts_of(d.get("ts"))
+            if ts is None or ts < w_lo or ts > w_hi:
+                continue
+            if ts + h * 3600 + MATURITY_SLACK_SECS > w_hi:
+                continue
+            q = ((fnum(d.get("pos_after"), 0.0) or 0.0)
+                 - (fnum(d.get("pos_before"), 0.0) or 0.0))
+            if abs(q) < 1e-9:
+                continue
+            t = d.get("ticker")
+            mark, _src = self._mark(t, ts + h * 3600)
+            if mark is None:
+                continue
+            px = fnum(d.get("yes_price_cents"), 0.0) or 0.0
+            direction = 1.0 if q > 0 else -1.0
+            n_fills += 1
+            e = eps[(t, int(ts // 3600))]
+            e[0] += abs(q) * direction * (mark - px)
+            e[1] += abs(q)
+        mo = ct = 0.0
+        for num, c in eps.values():
+            if c <= 0:
+                continue
+            mo += c * clip(num / c, -WINSOR_CENTS, WINSOR_CENTS) / 100.0
+            ct += c
+        return {"horizon_h": h, "c_per_ct": round(safe_div(100.0 * mo, ct), 3),
+                "mo_dollars": round(mo, 4), "n_fills": n_fills,
+                "n_contracts": round(ct, 2), "n_episodes": len(eps)}
 
     # ------------------------------------------------------------ rent side
 
@@ -1258,7 +1406,7 @@ class ScanPerfScorer:
         self.event_credited_all = defaultdict(float)
         by_event = defaultdict(list)
         for t, acc in self.market_rent_periods.items():
-            by_event[ev_of(t)].append((t, acc))
+            by_event[self.ev(t)].append((t, acc))
         for ev, items in by_event.items():
             rows = self.credits.get(ev) or []
             # Distinct period bounds ACROSS the event's markets: ledger rows
@@ -1271,30 +1419,49 @@ class ScanPerfScorer:
             qualified = {}
             for (lo, hi) in bounds:
                 measured = None
-                if newest and rows and math.isfinite(hi):
+                # `lo` non-finite is the (-inf, program_start) PSEUDO-period
+                # that _periods_for manufactures from bounds[0]. It always
+                # carries $0 of raw rent and it has a finite `hi`, so it was
+                # the ONLY period old enough to pass the CREDIT_LAG_DAYS test
+                # while the ledger is stale -- i.e. the real, rent-bearing
+                # period stayed est_floored and a $0 pseudo-period consumed
+                # the credit and got stamped `credited`. It is not a program
+                # period and can never be credited.
+                if newest and rows and math.isfinite(hi) and math.isfinite(lo):
                     p_end = datetime.fromtimestamp(hi, timezone.utc)
                     if p_end <= newest - timedelta(days=CREDIT_LAG_DAYS):
                         lo_d = p_end.strftime("%Y-%m-%d")
                         hi_d = (p_end + timedelta(days=CREDIT_WINDOW_DAYS)).strftime("%Y-%m-%d")
                         amt = 0.0
+                        hit = False
                         for i, (dte, a, _k) in enumerate(rows):
                             if i in consumed or not dte:
                                 continue
                             if lo_d <= dte <= hi_d:
                                 amt += a
+                                hit = True
                                 consumed.add(i)
-                        measured = amt
+                        # $0.00 is NOT evidence of a credit. A period that
+                        # qualifies but whose ledger rows fall outside its
+                        # window has no MEASURED term at all; stamping it
+                        # `credited` and zeroing the estimate produced records
+                        # reading `rent_basis: mixed_by_period` next to
+                        # `rent_measured_frac: 0.0`. Leave it MODELLED.
+                        measured = amt if hit else None
                 qualified[(lo, hi)] = measured
             for _t, acc in items:
                 for p in acc:
-                    if qualified.get((p["lo"], p["hi"])) is not None:
-                        # MEASURED replaces MODELLED for this period, at EVENT
-                        # level only; the market-level share is unknowable.
-                        p["basis"] = "credited"
-                        p["value"] = 0.0
-                    else:
-                        p["basis"] = "est_floored"
-                        p["value"] = p["floored"] * RENT_FACTOR
+                    # MEASURED replaces MODELLED for this period at EVENT
+                    # level only; the market-level share is unknowable, so
+                    # `market_rent` below stays MODELLED in every case and
+                    # there is deliberately NO per-period `value` field --
+                    # an earlier cut wrote one that nothing read, so a future
+                    # editor "fixing" it would have changed nothing while the
+                    # real EST/CREDITED-never-summed invariant lives in the
+                    # `total` accumulator underneath.
+                    p["basis"] = ("credited"
+                                  if qualified.get((p["lo"], p["hi"])) is not None
+                                  else "est_floored")
             total = meas_total = 0.0
             for (lo, hi), meas in qualified.items():
                 if meas is not None:
@@ -1305,7 +1472,7 @@ class ScanPerfScorer:
                                  if (p["lo"], p["hi"]) == (lo, hi)) * RENT_FACTOR
             self.event_rent[ev] = total
             self.event_rent_measured[ev] = meas_total
-        roster_events = {ev_of(t) for t in self.roster} | set(self.roster_events_file)
+        roster_events = {self.ev(t) for t in self.roster} | set(self.roster_events_file)
         for ev, rows in self.credits.items():
             if ev in roster_events:
                 self.event_credited_all[ev] = sum(a for (_d, a, _k) in rows)
@@ -1354,6 +1521,20 @@ class ScanPerfScorer:
             return None
         spec = self.edges[dim]
         closed = spec["closed"]
+        # A "closed":"both" dimension has INTEGER-CENT edges with GAPS
+        # between them -- spread is [0,1], [2,4], [5,9], [10,19], [20,inf).
+        # The fitting-side value is statistics.median() over the trailing 6h
+        # of two-sided rows, which returns a half-cent for any even-length
+        # sample, so 1.5 / 4.5 / 9.5 / 19.5 fell into NO bucket and the
+        # market vanished from the whole `spread` dimension with no warning
+        # and no count -- and 4.5 is exactly the 4c<->5c flicker the
+        # trailing median was introduced to smooth (judge must_fix J2-4).
+        # Rounding HALF-UP to the cent the edges are written in keeps the
+        # frozen sha intact; the INTERPOLATION on the applying side still
+        # uses the unrounded value (dim_value), so the cliff fix is
+        # unaffected.
+        if closed == "both":
+            v = math.floor(v + 0.5) if v >= 0 else math.ceil(v - 0.5)
         for key, lo, hi in spec["buckets"]:
             if hi is None:
                 if v >= lo:
@@ -1399,11 +1580,31 @@ class ScanPerfScorer:
         if self.refit_edges:
             self._refit_edges()
         self.bucket_of = {dim: {} for dim in DIM_ORDER}
-        for dim in DIM_ORDER:
-            for t in self.markets:
-                self.bucket_of[dim][t] = self._bucket_of(dim, self._assign(dim, t))
         self.dim_value = {dim: {t: self._assign(dim, t) for t in self.markets}
                           for dim in DIM_ORDER}
+        # SILENT EXCLUSIONS NEVER SHOW IN LOGS (feedback_sweep_class_after_fix):
+        # a market with a real dimension value that lands in no bucket
+        # contributes to the tier mu and to n_markets but to NO bucket, so the
+        # dimension's bucket risk-days stop summing to coverage.risk_days and
+        # every dev_D on that dimension shifts. Count it and say so.
+        self.unassigned = {}
+        for dim in DIM_ORDER:
+            miss, miss_rd = [], 0.0
+            for t in self.markets:
+                v = self.dim_value[dim][t]
+                b = self._bucket_of(dim, v)
+                self.bucket_of[dim][t] = b
+                if b is None and v is not None:
+                    miss.append(t)
+                    miss_rd += self.markets[t]["risk_days"]
+            self.unassigned[dim] = {"n_markets": len(miss),
+                                    "risk_days": round(miss_rd, 2),
+                                    "tickers": sorted(miss)[:10]}
+            if miss:
+                self._warn(
+                    f"{len(miss)} market(s) / {miss_rd:,.1f} $-days have a "
+                    f"{dim} value that falls in NO bucket and are dropped from "
+                    f"that dimension only (e.g. {', '.join(sorted(miss)[:3])})")
 
         self.risk_total = sum(m["risk_days"] for m in self.markets.values())
         self.risk_total_50 = sum(m["risk_days_at50c"] for m in self.markets.values())
@@ -1435,7 +1636,7 @@ class ScanPerfScorer:
                 num_tr = sum(self.market_mo.get(t, 0.0) for t in members)
                 num_bl = num_tr + sum(self.market_rent.get(t, 0.0) for t in members)
                 n_ser = len({ser_of(t) for t in members})
-                n_ev = len({ev_of(t) for t in members})
+                n_ev = len({self.ev(t) for t in members})
                 n_fills = sum(self.market_fills_matured.get(t, 0) for t in members)
                 n_unm = sum(self.market_unmarked.get(t, 0) for t in members)
                 w = safe_div(d, d + COHORT_PRIOR_RISK_DAYS)
@@ -1577,7 +1778,7 @@ class ScanPerfScorer:
         rng = random.Random(f"{BOOTSTRAP_SEED}:{seed_key}")
         clusters = defaultdict(lambda: [0.0, 0.0])
         for t in ts:
-            c = clusters[ev_of(t)]
+            c = clusters[self.ev(t)]
             c[0] += self.market_mo.get(t, 0.0)
             c[1] += self.markets[t]["risk_days"]
         mos = [c[0] for c in clusters.values()]
@@ -1611,7 +1812,7 @@ class ScanPerfScorer:
         self.event_markets = defaultdict(list)
         for t in self.markets:
             by_series[ser_of(t)].append(t)
-            ev = ev_of(t)
+            ev = self.ev(t)
             self.event_markets[ev].append(t)
             by_root[root_of(ev)].append(t)
 
@@ -1629,7 +1830,7 @@ class ScanPerfScorer:
                 st = self._unit_stats(tickers, basis)
                 if st["episodes"] > self.max_episodes_unit[1]:
                     self.max_episodes_unit = (key, st["episodes"])
-                dated = {ev_of(t) for t in tickers}
+                dated = {self.ev(t) for t in tickers}
                 if unit_kind == "events" and len(dated) < 2:
                     continue          # the event term would be a market-level n=1 scorecard
                 thin = (st["fills_matured"] > 0 and
@@ -1706,11 +1907,12 @@ class ScanPerfScorer:
                     until = None
 
                 code = self._unit_code(tickers, basis)
+                tset = set(tickers)          # hoisted: was rebuilt per fill row
                 rec = {
                     "n_fills": st["fills"], "n_episodes": st["episodes"],
                     "n_markets": st["n_markets"], "n_days": st["n_days"],
                     "contracts_filled": round(sum(abs(r["q"]) for r in self.fill_rows
-                                                  if r["ticker"] in set(tickers)), 2),
+                                                  if r["ticker"] in tset), 2),
                     "contracts_matured": round(st["contracts"], 2),
                     "risk_days": round(st["risk_days"], 2),
                     "mo_dollars": round(st["mo"], 4),
@@ -1722,6 +1924,8 @@ class ScanPerfScorer:
                     "rent_modelled": round(st["rent"], 4),
                     "rent_basis": self._unit_rent_basis(tickers),
                     "rent_measured_frac": round(self._unit_measured_frac(tickers), 4),
+                    "rent_measured_dollars": round(
+                        self._unit_measured_dollars(tickers), 4),
                     "credited_measured": round(self._unit_credited(tickers), 4),
                     "y_trading": round(safe_div(st["mo"], st["risk_days"]), 6),
                     "y_cohort": round(y_cohort, 6),
@@ -1787,14 +1991,23 @@ class ScanPerfScorer:
             return "mixed_by_period"
         return "est_floored"
 
+    def _unit_measured_dollars(self, tickers):
+        """The MEASURED credit that REPLACED an estimate for a qualifying
+        period (not the same thing as `credited_measured`, which is every
+        ledger dollar the event ever received). Emitted next to the fraction
+        because a fraction that rounds to 0.0 next to a non-zero
+        `credited_measured` reads as a contradiction."""
+        evs = {self.ev(t) for t in tickers}
+        return sum(self.event_rent_measured.get(e, 0.0) for e in evs)
+
     def _unit_measured_frac(self, tickers):
-        evs = {ev_of(t) for t in tickers}
+        evs = {self.ev(t) for t in tickers}
         meas = sum(self.event_rent_measured.get(e, 0.0) for e in evs)
         tot = sum(self.event_rent.get(e, 0.0) for e in evs)
         return safe_div(meas, tot)
 
     def _unit_credited(self, tickers):
-        evs = {ev_of(t) for t in tickers}
+        evs = {self.ev(t) for t in tickers}
         return sum(self.event_credited_all.get(e, 0.0) for e in evs)
 
     # ------------------------------------------------------------- guards
@@ -1886,7 +2099,7 @@ class ScanPerfScorer:
             n_adm += 1
             gross = per_day / denom
             adj, _c = self.adj_struct(t, self.score_basis)
-            for kind, key in (("series", ser_of(t)), ("events", root_of(ev_of(t)))):
+            for kind, key in (("series", ser_of(t)), ("events", root_of(self.ev(t)))):
                 d = self.unit_dev.get((kind, key))
                 if d is not None and d < adj:
                     adj = d
@@ -1911,7 +2124,7 @@ class ScanPerfScorer:
         """leave-one-EVENT-out and leave-one-SERIES-out re-fits (judge
         must_fix J1-2: the per-MARKET leave-one-out is nearly a no-op)."""
         base = self.cohorts
-        keyfn = (lambda t: ev_of(t)) if level == "event" else (lambda t: ser_of(t))
+        keyfn = (lambda t: self.ev(t)) if level == "event" else (lambda t: ser_of(t))
         groups = defaultdict(list)
         for t in self.markets:
             groups[keyfn(t)].append(t)
@@ -1943,7 +2156,7 @@ class ScanPerfScorer:
 
     def table(self):
         cov_markets = len(self.markets)
-        cov_events = len({ev_of(t) for t in self.markets})
+        cov_events = len({self.ev(t) for t in self.markets})
         cov_series = len({ser_of(t) for t in self.markets})
         recon_delta, _mine, _sink = self.reconciliation()
         dod = self.exposure_dod()
@@ -1963,13 +2176,26 @@ class ScanPerfScorer:
             "unless rent_basis=credited",
             "EST and CREDITED are never summed: per (market, period) the rent is one "
             "basis or the other",
+            "MARKET-level rent is ALWAYS MODELLED: ledger rows are event-keyed, so a "
+            "credit replaces an estimate at EVENT level only. rent_modelled and "
+            "credited_measured on one record are NOT two halves of a total and must "
+            "never be added; rent_measured_dollars is the part that replaced an "
+            "estimate, and rent_basis != est_floored implies it is non-zero",
             "adj = the SINGLE most negative dimension deviation, never a sum",
             "cohort bucket 'hi': null means +infinity (open-ended top bucket); 'closed' "
             "is 'both' (lo<=v<=hi) for spread and 'left' (lo<=v<hi) elsewhere",
             "'events' records are keyed by EVENT ROOT (SPEC 6.1), not by dated event",
-            "halflife_days is echoed for the record but NOT applied: SPEC 3 defines "
-            "no time-decay weighting, and a decay invented here would silently "
-            "change mu. Every observation in the window has weight 1",
+            "NO time decay in v1: SPEC 3 defines no half-life weighting, so every "
+            "observation in the window has weight 1 (an echoed-but-unapplied "
+            "--halflife-days was removed 2026-09-18 rather than left to mislead)",
+            "mark tiers 3 (one-sided) and 4 (unmarked) are UNREACHABLE while a "
+            "position is open: marks_*.jsonl writes every 300s per open position, so "
+            "tier 2's sink fallback pre-empts them. data_thin and bar condition 4 "
+            "therefore cannot fire on a held market; the honest freshness detector is "
+            "tier.mark_source_detail, not mark_source_mix",
+            "the avg-cost replay is independent of the REALIZED SINK but NOT of the "
+            "bot's cost basis on the tickers listed in tier.recon_seeded_tickers "
+            "(seeded from the first fill's pos_before/avg_before)",
             "the bootstrap clusters by EVENT (SPEC test 44), not by market: the "
             "coarser cluster widens the interval and therefore bars less often",
         ]
@@ -2020,11 +2246,23 @@ class ScanPerfScorer:
             n_drop = min(len(shed), n_loader - MAX_RECORDS)
             for kind, k, _r in shed[:n_drop]:
                 (series_out if kind == "s" else events_out).pop(k, None)
+            residual = n_loader - n_drop
             self._warn(
                 f"{n_drop} neutral record(s) dropped so the BOT LOADER's count "
-                f"(series+events+buckets = {n_loader}) stays under "
-                f"MAX_RECORDS={MAX_RECORDS}; above that it refuses the file "
-                f"whole and the tier reverts to the last good table")
+                f"(series+events+buckets = {n_loader}) comes down to "
+                f"{residual} against MAX_RECORDS={MAX_RECORDS}; above that it "
+                f"refuses the file whole and the tier reverts to the last "
+                f"good table")
+            if residual > MAX_RECORDS:
+                # There were not enough NEUTRAL records to get under the cap
+                # and down_rank/bar records are never shed, so the loader WILL
+                # refuse this file whole. Say so rather than claim the count
+                # "stays under" a cap it does not.
+                self._warn(
+                    f"! the loader count is still {residual} > "
+                    f"{MAX_RECORDS} after shedding every sheddable neutral "
+                    f"record: the BOT WILL REFUSE THIS FILE WHOLE and keep "
+                    f"the last good table")
 
         ct = self.cov["contracts_matured"]
         out = {
@@ -2033,7 +2271,7 @@ class ScanPerfScorer:
             "generated_by": f"imm_scan_perf.py@{_git_sha()}",
             "window": {
                 "start": iso_z(self.window_start), "end": iso_z(self.asof),
-                "days": self.window_days, "halflife_days": self.halflife_days,
+                "days": self.window_days,
                 "horizon_hours": self.horizon_h,
                 "maturity_cutoff": iso_z(self.maturity_cutoff),
             },
@@ -2075,10 +2313,13 @@ class ScanPerfScorer:
                 "mu_trading_only": round(self.mu["trading"], 6),
                 "mu_rent_blended": round(self.mu["blend"], 6),
                 "markout_c_per_ct_24h": round(safe_div(100.0 * self.mo_total, ct), 3),
-                "markout_c_per_ct_1h": round(safe_div(
-                    sum(self.mo_other[1].values()), sum(self.ct_other[1].values())), 3),
-                "markout_c_per_ct_72h": round(safe_div(
-                    sum(self.mo_other[72].values()), sum(self.ct_other[72].values())), 3),
+                "markout_c_per_ct_1h": self.markout_horizons[1]["c_per_ct"],
+                "markout_c_per_ct_72h": self.markout_horizons[72]["c_per_ct"],
+                # same statistic at three horizons, each with its own
+                # maturity cutoff / episode collapse / winsorisation, and its
+                # own sample size next to the SPEC 10.3 baselines
+                "markout_horizons": {str(h): v for h, v
+                                     in sorted(self.markout_horizons.items())},
                 "mo_dollars": round(self.mo_total, 2),
                 "realized_dollars": round(sum(m["realized_dollars"]
                                               for m in self.markets.values()), 2),
@@ -2087,11 +2328,24 @@ class ScanPerfScorer:
                 "rent_cents_per_contract": round(safe_div(100.0 * self.rent_total, ct), 3),
                 "rent_basis": self._unit_rent_basis(list(self.markets)),
                 "rent_measured_frac": round(self._unit_measured_frac(list(self.markets)), 4),
+                "rent_measured_dollars": round(
+                    self._unit_measured_dollars(list(self.markets)), 2),
                 "credited_measured_dollars": round(sum(self.event_credited_all.values()), 2),
                 "ledger_newest_credit_date": self.newest_credit_date,
                 "ledger_stale_days": self.ledger_stale_days,
                 "mark_source_mix": self.mark_source_mix,
+                "mark_source_detail": self.mark_source_detail,
                 "reconciliation_delta_dollars": recon_delta,
+                # The replay is INDEPENDENT of the realized sink but NOT of
+                # the bot's cost basis on these tickers: they predate the
+                # fills sink, so the replay is seeded from the first fill's
+                # own pos_before/avg_before. For them the check verifies the
+                # replay arithmetic, not the basis. Published in `tier`, not
+                # only in audit.diagnostics, because it bounds what the
+                # cent-exact result means.
+                "recon_seeded_tickers": self.seeded_tickers,
+                "recon_seeded_frac": round(
+                    safe_div(len(self.seeded_tickers), len(self.markets)), 4),
                 "risk_days_dod_change": (None if dod is None else round(dod, 4)),
                 "clamped_record_frac": round(clamped, 4),
             },
@@ -2117,6 +2371,7 @@ class ScanPerfScorer:
                     "counterfactual_mo_avoided_measured": round(cf["mo_avoided"], 2),
                     "counterfactual_rent_forgone_modelled": round(cf["rent_forgone"], 2),
                     "seeded_tickers": self.seeded_tickers,
+                    "bucket_unassigned": self.unassigned,
                     "ratchet_eased_records": self.ratchet_eased,
                     "cycle_files_scanned": self.n_cycle_files,
                     "cache_hits": self.cache.hits, "cache_misses": self.cache.misses,
@@ -2147,6 +2402,8 @@ class ScanPerfScorer:
             "mu_rent_blended": tbl["tier"]["mu_rent_blended"],
             "markout_c_per_ct_24h": tbl["tier"]["markout_c_per_ct_24h"],
             "fills": tbl["coverage"]["fills"], "episodes": tbl["coverage"]["episodes"],
+            "episodes_matured": tbl["coverage"]["episodes_matured"],
+            "mark_source_detail": tbl["tier"]["mark_source_detail"],
             "unmarked_frac": round(safe_div(tbl["coverage"]["fills_unmarked"],
                                             tbl["coverage"]["fills_matured"]), 4),
             "mark_source_mix": tbl["tier"]["mark_source_mix"],
@@ -2187,18 +2444,29 @@ def print_report(sc: ScanPerfScorer, tbl, out=sys.stdout):
     p = lambda s="": print(s, file=out)
     cov, tier = tbl["coverage"], tbl["tier"]
     p(f"scan-perf {tbl['generated_at']}  window {sc.window_days}d  "
-      f"halflife {sc.halflife_days}d  H={sc.horizon_h}h  basis={sc.score_basis}")
+      f"no decay  H={sc.horizon_h}h  basis={sc.score_basis}")
     p(f"coverage : {cov['markets']} mkts / {cov['events']} events / {cov['series']} series"
       f" | {cov['fills']} fills -> {cov['episodes']} episodes "
-      f"({cov['fills_matured']} matured, {cov['fills_pending']} pending, "
-      f"{cov['fills_unmarked']} unmarked)")
+      f"({cov['episodes_matured']} matured, {cov['fills_pending']} pending fills, "
+      f"{cov['fills_unmarked']} unmarked, "
+      f"{cov.get('fills_flat_through', 0)} flat-through)")
     p(f"           risk_days {cov['risk_days']:,.1f} (at50c {cov['risk_days_at50c']:,.1f})"
       f"  adopted-capped: {', '.join(cov['adopted_capped_tickers']) or 'none'}")
     m = tier["mark_source_mix"]
+    md = tier["mark_source_detail"]
     p(f"marks    : two_sided {m['two_sided']:.2f} | one_sided {m['one_sided']:.2f} "
       f"| settlement {m['settlement']:.2f}")
-    p(f"tier     : markout {tier['markout_c_per_ct_24h']:+.2f} c/ct  (MEASURED)   "
-      f"[1h {tier['markout_c_per_ct_1h']:+.2f}  72h {tier['markout_c_per_ct_72h']:+.2f}]")
+    p(f"           of which  cycle book {md['cycle_two_sided']:.2f} "
+      f"({md['cycle_two_sided_fills']} fills) | marks sink "
+      f"{md['sink_mark']:.2f} ({md['sink_mark_fills']} fills, "
+      f"state.last_mark -- NOT a live two-sided book)")
+    hz = tier["markout_horizons"]
+    p(f"tier     : markout {tier['markout_c_per_ct_24h']:+.2f} c/ct  (MEASURED)")
+    for hk in sorted(hz, key=lambda k: int(k)):
+        r = hz[hk]
+        p(f"           markout @{r['horizon_h']:>2}h {r['c_per_ct']:+.2f} c/ct on "
+          f"{r['n_fills']} fills / {r['n_episodes']} episodes / "
+          f"{r['n_contracts']:,.0f} ct  (own maturity cutoff, winsorised)")
     p(f"           rent    ${tier['rent_modelled_dollars']:,.2f} floored = "
       f"{tier['rent_cents_per_contract']:+.2f} c/ct  (MODELLED, {tier['rent_basis']}, "
       f"RENT_FACTOR {RENT_FACTOR})")
@@ -2266,7 +2534,7 @@ def print_report(sc: ScanPerfScorer, tbl, out=sys.stdout):
 def print_explain(sc: ScanPerfScorer, key, out=sys.stdout):
     p = lambda s="": print(s, file=out)
     sel = [t for t in sc.markets
-           if ser_of(t) == key or ev_of(t) == key or root_of(ev_of(t)) == key or t == key]
+           if ser_of(t) == key or sc.ev(t) == key or root_of(sc.ev(t)) == key or t == key]
     if not sel:
         p(f"--explain {key}: no scan market matches (series, event, event root or ticker)")
         return
@@ -2314,7 +2582,6 @@ def run(argv=None, out=sys.stdout):
     ap.add_argument("--explain", metavar="SERIES|EVENT")
     ap.add_argument("--asof", metavar="ISO")
     ap.add_argument("--window-days", type=int, default=WINDOW_DAYS)
-    ap.add_argument("--halflife-days", type=int, default=HALFLIFE_DAYS)
     ap.add_argument("--horizon-h", type=int, default=HORIZON_H)
     ap.add_argument("--score-basis", choices=("trading", "blend"), default="trading")
     ap.add_argument("--out", metavar="PATH")
@@ -2338,7 +2605,7 @@ def run(argv=None, out=sys.stdout):
 
     t_start = time.time()
     sc = ScanPerfScorer(status_dir, work_dir, asof=asof, window_days=a.window_days,
-                        halflife_days=a.halflife_days, horizon_h=a.horizon_h,
+                        horizon_h=a.horizon_h,
                         score_basis=a.score_basis, refit_edges=a.refit_edges,
                         use_cache=not a.no_cache)
     if not a.refit_edges and edges_sha256() != FROZEN_EDGES_SHA256:
@@ -2348,10 +2615,6 @@ def run(argv=None, out=sys.stdout):
         return 1
     sc.load()
     sc.build()
-    # --dry means "write NOTHING", and that includes the private cache; it is
-    # still READ, so a dry preview after a real run is fast.
-    if not a.explain and not a.dry:
-        sc.cache.save()
 
     if a.explain:
         print_explain(sc, a.explain, out)
@@ -2395,6 +2658,13 @@ def run(argv=None, out=sys.stdout):
               f"misses {sc.cache.misses}, total {time.time() - t_start:.1f}s", file=out)
         return 0
 
+    # The private cache is saved only AFTER all three guards pass, so
+    # "NO FILE WRITTEN" is literally true of every file this process owns.
+    # It was previously written before sc.table(), which cost the abort paths
+    # their honesty for the sake of one saved scan on a run that failed.
+    # --dry means "write NOTHING", and that includes the cache; it is still
+    # READ, so a dry preview after a real run is fast.
+    sc.cache.save()
     path = a.out or os.path.join(work_dir, TABLE_NAME)
     atomic_write_json(path, tbl)
     append_jsonl(os.path.join(work_dir, HISTORY_NAME), sc.history_row(tbl, 0))

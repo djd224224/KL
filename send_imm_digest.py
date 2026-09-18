@@ -408,7 +408,8 @@ def scan_perf_header(table, status=None, now_utc=None) -> dict:
     now_utc = now_utc or datetime.now(timezone.utc)
     out = {"present": bool(table), "generated_at": "", "age_h": None,
            "stale": False, "weight": None, "bar_on": None,
-           "source": "unknown", "basis": "", "max_req": None}
+           "source": "unknown", "basis": "", "max_req": None,
+           "loaded_by_bot": None, "bot_generated_at": ""}
     if not table:
         return out
     out["generated_at"] = str(table.get("generated_at") or "")
@@ -437,7 +438,36 @@ def scan_perf_header(table, status=None, now_utc=None) -> dict:
         if w is not None or b is not None:
             out["weight"], out["bar_on"] = w, b
             out["source"] = "incentive_mm code default"
+    # THE FILE IS NOT THE POLICY. This block reads scan_perf.json; the bot
+    # may have REFUSED it whole (any schema failure is all-or-nothing) or
+    # simply not reloaded it yet, and in either case the tier is running the
+    # PREVIOUS table or none at all. Rendering a refused file as a live
+    # policy, WEIGHT and BAR and all, is the "a model is not a measurement"
+    # failure at the reporting end: verified against a hostile copy of the
+    # real table (every dev the string 'oops') that this block printed as a
+    # normal header with '?' values and no hint the loader rejects it.
+    if isinstance(sp, dict):
+        out["bot_generated_at"] = str(sp.get("generated_at") or "")
+        if out["bot_generated_at"]:
+            out["loaded_by_bot"] = (out["bot_generated_at"]
+                                    == out["generated_at"]
+                                    and bool(sp.get("fresh")))
+        elif sp.get("fresh") is False:
+            out["loaded_by_bot"] = False
     return out
+
+
+def scan_perf_not_loaded_banner(hdr) -> str:
+    """One line, in place of the verdicts, when the bot is demonstrably not
+    running the table on disk. Empty when it is (or when the status file
+    cannot say)."""
+    if hdr.get("loaded_by_bot") is not False:
+        return ""
+    bot = hdr.get("bot_generated_at") or "no table"
+    return ("!! THE BOT HAS NOT LOADED THIS TABLE: the live process reports "
+            "{} while this file says {}. It was REFUSED (any schema failure "
+            "is all-or-nothing) or has not been reloaded yet, so the verdicts "
+            "below are NOT in force.".format(bot, hdr.get("generated_at") or "?"))
 
 
 def _sink_day_files(name: str, status_dir=None) -> list:
@@ -464,11 +494,20 @@ def scan_perf_cost(now_utc=None, hours: float = 24.0, status_dir=None) -> dict:
     to the pre-registered kill rule and not decoration.
 
     Counted over the last `hours` of the sink:
-      seats_empty  distinct tickers whose decision was `perf_roi` — the walk
-                   cut them for the performance requirement and, because
+      seats_empty  distinct tickers whose decision was `perf_roi` — they were
+                   cut AND they sit under the RAISED bar, and because
                    SCAN_MIN_ROI leaves a seat EMPTY rather than filling it
                    with the next candidate (Jack 2026-09-13), that is a seat
-                   the tier did not use
+                   the tier did not use.
+                   IT IS AN UPPER BOUND, NOT A MEASUREMENT: _group_walk_cut
+                   breaks out on the group cap and continues on the per-event
+                   cap BEFORE it reaches its min_roi test, so at a FULL tier
+                   a candidate the cap cut is labelled `perf_roi` although the
+                   loop never touched it (REPRODUCED against the real walk:
+                   30 labelled, 0 actually caused). Instrumenting the walk
+                   means changing a signature finecon and the gas/*CC/Ramp
+                   event_top_n_cut also traverse, which is the blast radius
+                   SPEC 0 chose this chassis to avoid. Read it as a ceiling.
       barred       distinct tickers whose decision was `perf_barred`
       forgone      MODELLED: each blocked ticker's own est_dollars_per_day,
                    floored — a market whose est would not reach the exchange's
@@ -548,7 +587,10 @@ def scan_perf_cost_line(cost) -> str:
 def scan_perf_cost_basis_note(cost) -> str:
     """The one sentence that keeps the cost line from being read as a
     measurement. $X is a RATE ($/day) and it is floored."""
-    return ("Forgone est is MODELLED: each blocked candidate's own "
+    return ("Seats left empty is an UPPER BOUND: a candidate the group cap "
+            "or the per-event cap cut before the walk reached its min_roi "
+            "test carries the same `perf_roi` label. "
+            "Forgone est is MODELLED: each blocked candidate's own "
             "est_dollars_per_day, in $/day, with any market that would not "
             "reach the MEASURED $1.00 minimum credit over a {:.0f}-day program "
             "period counted as zero ({} of {} blocked candidates). It is never "
@@ -565,9 +607,22 @@ def scan_perf_digest_line(table, cost, status=None, now_utc=None) -> str:
     if not hdr["present"]:
         return ("perf: no scan-perf table on disk ({}) — the open-scan tier "
                 "ranks on gross ROI alone.".format(SCAN_PERF_PATH))
+    banner = scan_perf_not_loaded_banner(hdr)
+    if banner:
+        return "perf: " + banner
+    sp0 = (status or {}).get("scan_perf")
     lim = table.get("limits") if isinstance(table.get("limits"), dict) else {}
-    down = int(_f(lim.get("down_ranked")))
-    barred = int(_f(lim.get("barred_series"))) + int(_f(lim.get("barred_events")))
+    # PREFER what the bot actually INSTALLED. `limits` is the file's own
+    # count; the reader-side caps (25 down-rank, 5 bars) legitimately
+    # truncate it, so the file can say 89 records while 25 are in force.
+    if isinstance(sp0, dict) and sp0.get("down_ranked") is not None:
+        down = int(_f(sp0.get("down_ranked")))
+        barred = int(_f(sp0.get("barred")))
+        src = " in force"
+    else:
+        down = int(_f(lim.get("down_ranked")))
+        barred = int(_f(lim.get("barred_series"))) + int(_f(lim.get("barred_events")))
+        src = " in file"
     age = ("{:.0f}h old".format(hdr["age_h"]) if hdr["age_h"] is not None
            else "age unknown")
     w = ("weight {}".format(hdr["weight"]) if hdr["weight"] is not None
@@ -579,10 +634,10 @@ def scan_perf_digest_line(table, cost, status=None, now_utc=None) -> str:
     if isinstance(sp, dict) and sp.get("req_applied_24h") is not None:
         applied = ", req applied to {:.0f} candidate(s) (24h)".format(
             _f(sp.get("req_applied_24h")))
-    return ("perf: table {}{}, {}, {}, {} down-ranked, {} barred{}, "
+    return ("perf: table {}{}, {}, {}, {} down-ranked{}, {} barred{}, "
             "{} seat(s) left empty (24h), ${:,.2f}/day MODELLED rent forgone."
             .format(age, " — STALE, verdicts NOT applied" if hdr["stale"] else "",
-                    w, b, down, barred, applied,
+                    w, b, down, src, barred, applied,
                     cost.get("seats_empty", 0),
                     cost.get("forgone_dollars_per_day", 0.0)))
 

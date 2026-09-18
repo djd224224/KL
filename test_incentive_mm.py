@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for incentive_mm.py — run: python -m unittest test_incentive_mm"""
 
+import ast
 import csv
 import json
 import os
@@ -10711,7 +10712,9 @@ class TestScanPerfTable(unittest.TestCase):
                        "adj_clip": 0.04, "max_req": 0.10, "winsor_cents": 40,
                        "cohort_edges_sha256": "0" * 64, "edges_refit": False},
             "coverage": {"markets": 147, "events": 83, "series": 71},
-            "tier": {"mu_trading_only": -0.02279, "mu_rent_blended": 0.00063},
+            "tier": {  # MEASURED markout $ per $-day; the realized+MTM rate
+                       # (-0.0244) is a DIFFERENT quantity, stored apart
+                       "mu_trading_only": -0.01201, "mu_rent_blended": 0.00063},
             "cohorts": {
                 "spread": {"field": "spread_cents", "assign": "trailing_median_6h",
                            "buckets": [b("1c", 0, 1, 1.0, 0.0),
@@ -10851,6 +10854,138 @@ class TestScanPerfTable(unittest.TestCase):
                                 {}, self.NOW, budget), "perf_barred")
         _clean_persist()
 
+    def test_deleting_the_file_actually_neutralises_a_loaded_table(self):
+        """THE KILL SWITCH. The module header and SPEC 6.11 both promise
+        "delete SCAN_PERF_FILE -> neutral within one universe refresh, no
+        restart". It did not: the OSError branch only ran the age check, so a
+        deleted table stayed fully armed for up to IMM_SCAN_PERF_MAX_AGE_H
+        (48 h), with status still reporting fresh:true and not one log line.
+        A kill switch that does not kill is worse than no kill switch."""
+        t = self._one_dim("dtc", 2, -0.03)
+        t["series"] = {"KXPERF": self._rec("down_rank", -0.03)}
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m = self._meta(close_time=self.NOW + timedelta(days=60))
+        with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0):
+            self.assertGreater(imm.scan_perf_req(m, self.NOW), 0.0)
+            self.assertLess(imm._raw_roi(m), imm._raw_roi_gross(m))
+            os.remove(imm.SCAN_PERF_FILE)
+            with mock.patch.object(imm, "log") as lg:
+                for _ in range(5):          # several universe refreshes
+                    self.assertEqual(imm.load_scan_perf(), 0)
+                self.assertTrue(any("file removed" in c.args[0]
+                                    for c in lg.call_args_list),
+                                "the kill switch was silent")
+            self.assertFalse(imm.scan_perf_fresh())
+            self.assertEqual(imm.scan_perf_status(self.NOW)["fresh"], False)
+            self.assertEqual(imm.scan_perf_req(m, self.NOW), 0.0)
+            self.assertEqual(imm._raw_roi(m), imm._raw_roi_gross(m))
+            self.assertIsNone(imm.scan_perf_barred("KXPERF", "KXPERF-26NOV"))
+        # a COLD start (no table ever loaded in this process) is untouched:
+        # test_absent_file_reproduces_production must stay byte-identical
+        self._reset()
+        with mock.patch.object(imm, "log") as lg2:
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertFalse([c for c in lg2.call_args_list
+                              if "file removed" in c.args[0]])
+
+    def test_a_file_cannot_raise_its_own_dim_clip(self):
+        """params.dim_clip is the denominator of the per-dev range check AND
+        of the clamp-storm sign-flip detector, so a file that simply DECLARES
+        a large one turns both into no-ops and the layered defence collapses
+        to the reader's ADJ_CLIP alone. REPRODUCED: a table with
+        dim_clip=1000 and every dev at -900 loaded clean and produced
+        adj -0.04000 against the honest table's -0.01195, with no warning.
+        The ADJ_CLIP comment already claims dim_clip == ADJ_CLIP by
+        construction of the MIN, and the real scorer emits exactly 0.04."""
+        hostile = self._perf_table()
+        hostile["params"]["dim_clip"] = 1000.0
+        for dim in hostile["cohorts"]:
+            for b in hostile["cohorts"][dim]["buckets"]:
+                b["dev_trading"] = b["dev_blend"] = -900.0
+        self._write(hostile)
+        with mock.patch.object(imm, "log") as lg:
+            self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertTrue(any("dim_clip" in c.args[0]
+                                for c in lg.call_args_list), lg.call_args_list)
+        self.assertFalse(imm.scan_perf_fresh())
+        # and the honest value is accepted
+        self._reset()
+        t = self._perf_table()
+        self.assertEqual(t["params"]["dim_clip"], imm.SCAN_PERF_ADJ_CLIP)
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+
+    def test_a_negative_knob_can_never_invert_the_sign_of_the_loop(self):
+        """THE invariant, from the other side: "there is no code path here
+        that can RAISE an ROI". scan_perf_req's inner max() floored the
+        penalty at 0 but the outer min() inherited the CAP, so
+        IMM_SCAN_PERF_MAX_REQ=-0.05 returned req -0.05 and lifted every scan
+        candidate over SCAN_MIN_ROI (0.10 gross -> 0.15 net). The knob's own
+        comment invites hand-editing it during a de-escalation, so a sign
+        typo is the realistic route in. Both caps are floored at import."""
+        t = self._one_dim("dtc", 2, -0.03)
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m = self._meta(close_time=self.NOW + timedelta(days=60))
+        gross = imm._raw_roi_gross(m)
+        for cap in (-1.0, -0.05, 0.0):
+            with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0), \
+                    mock.patch.object(imm, "SCAN_PERF_MAX_REQ", cap):
+                req = imm.scan_perf_req(m, self.NOW)
+                self.assertGreaterEqual(req, 0.0, f"MAX_REQ={cap}")
+                self.assertLessEqual(imm._raw_roi(m), gross, f"MAX_REQ={cap}")
+                self.assertLessEqual(imm._market_roi(m, set()), gross)
+        # the shipped default is positive, and the import-time floor holds
+        self.assertGreaterEqual(imm.SCAN_PERF_MAX_REQ, 0.0)
+        self.assertGreaterEqual(imm.SCAN_PERF_MAX_PENALIZED, 0)
+        self.assertGreaterEqual(imm.SCAN_PERF_MAX_BARRED, 0)
+
+    def test_negative_reader_caps_cannot_publish_a_negative_count(self):
+        """_scan_perf_truncate slices keep_down[CAP:]; a negative cap inverts
+        that into "keep only the LEAST punitive record" and publishes a
+        negative down_ranked into write_status and the digest (REPRODUCED:
+        n_down_rank -1 with MAX_PENALIZED=-1). 0 must mean what it reads as:
+        no down-ranks take effect."""
+        t = self._perf_table()
+        t["series"] = {f"KXS{i}": self._rec("down_rank", -0.01 - 0.001 * i)
+                       for i in range(6)}
+        self._write(t)
+        for cap in (-1, 0, 3):
+            self._reset()
+            self._write(t)
+            with mock.patch.object(imm, "SCAN_PERF_MAX_PENALIZED",
+                                   max(0, cap)):
+                self.assertGreater(imm.load_scan_perf(), 0)
+                st = imm.scan_perf_status(self.NOW)
+                self.assertGreaterEqual(st["down_ranked"], 0, f"cap={cap}")
+                self.assertLessEqual(st["down_ranked"], max(0, cap))
+                self.assertLessEqual(len(imm.SCAN_PERF_SERIES), max(0, cap))
+
+    def test_an_expired_down_rank_stops_penalising_without_a_new_file(self):
+        """`until` is honoured at load and by scan_perf_barred; it has to be
+        honoured on the DOWN-RANK path too, or a TTL that expires while the
+        table sits loaded keeps penalising until the next file write -- up to
+        IMM_SCAN_PERF_MAX_AGE_H later. SPEC 3.6 is "tighten immediate, relax
+        by TIMEOUT only", and a timeout the acting path ignores is not one."""
+        # the TTL must be in the REAL future: load_scan_perf drops an expired
+        # record against time.time(), and self.NOW is a fixed fixture instant
+        soon = datetime.now(timezone.utc) + timedelta(hours=2)
+        t = self._perf_table()
+        t["series"] = {"KXPERF": self._rec("down_rank", -0.03,
+                                           until=self._iso(soon))}
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m = self._meta()
+        with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0):
+            # inside the TTL the penalty applies ...
+            self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.03)
+            self.assertAlmostEqual(imm.scan_perf_req(m, self.NOW), 0.03)
+            # ... and past it, with the SAME table still loaded, it does not
+            later = soon + timedelta(minutes=1)
+            self.assertEqual(imm.scan_perf_adj(m, later), (0.0, ""))
+            self.assertEqual(imm.scan_perf_req(m, later), 0.0)
+
     def test_hot_reload_mtime_gate_and_last_good_on_bad_json(self):
         """The load_finecon_extra_series contract: the mtime is recorded
         BEFORE parsing, so an unreadable file logs once and is not retried
@@ -10870,9 +11005,15 @@ class TestScanPerfTable(unittest.TestCase):
         os.utime(imm.SCAN_PERF_FILE, (time.time(), time.time() + self._mt))
         with mock.patch.object(imm, "log") as lg:
             self.assertEqual(imm.load_scan_perf(), 0)
+            self.assertEqual(imm.load_scan_perf(), 0)   # not retried
+            # The "not retried" half is the whole point of recording the
+            # mtime BEFORE the open/parse, and it is only pinned if the log
+            # count is taken AFTER the second call: moving the assignment to
+            # after a successful validate re-opens, re-parses and re-logs an
+            # unreadable file on every refresh, and the second call still
+            # returns 0 either way.
             self.assertEqual(sum(1 for c in lg.call_args_list
                                  if "scan perf table unreadable" in c.args[0]), 1)
-            self.assertEqual(imm.load_scan_perf(), 0)   # not retried
         self.assertAlmostEqual(imm._interp_dev("spread", 25.0), good,
                                msg="a bad file dropped the last good table")
 
@@ -11017,13 +11158,23 @@ class TestScanPerfTable(unittest.TestCase):
         self.assertEqual(imm.SCAN_MIN_ROI, 0.05)
         self.assertEqual(imm.SCAN_PERF_MAX_REQ, 0.10)
         self.assertAlmostEqual(imm.SCAN_MIN_ROI + imm.SCAN_PERF_MAX_REQ, 0.15)
-        t = self._one_dim("spread", 4, -5.0, dim_clip=5.0)
+        # A file claiming a huge dev AND a matching dim_clip no longer gets
+        # in at all -- raising params.dim_clip was the one move that turned
+        # both the per-dev range check and the clamp-storm detector into
+        # no-ops, so it is refused at the door now (F4).
+        self._write(self._one_dim("spread", 4, -5.0, dim_clip=5.0))
+        self.assertEqual(imm.load_scan_perf(), 0)
+        self.assertFalse(imm.scan_perf_fresh())
+        # ... and with a LEGITIMATE dim_clip, the reader-side clips still
+        # hold the bar at exactly 0.15/day whatever weight is applied.
+        self._reset()
+        t = self._one_dim("spread", 4, -0.04)
         self._write(t)
         self.assertGreater(imm.load_scan_perf(), 0)
         m = self._meta(spread_cents=25)
         with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 10.0):
-            # the file claims -5.0/day; ADJ_CLIP holds adj at -0.04 and
-            # MAX_REQ holds req at 0.10 whatever the weight
+            # ADJ_CLIP holds adj at -0.04 and MAX_REQ holds req at 0.10
+            # whatever the weight
             self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.04)
             self.assertAlmostEqual(imm.scan_perf_req(m, self.NOW), 0.10)
             # and the bar it implies is exactly 0.15/day, no more
@@ -11044,25 +11195,49 @@ class TestScanPerfTable(unittest.TestCase):
         three times and made the loop most over-confident exactly where it
         was most over-fit."""
         t = self._perf_table()
-        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
-        t["cohorts"]["spread"]["buckets"][4]["dev_trading"] = -0.02
-        t["cohorts"]["mid"]["buckets"][2]["dev_trading"] = -0.03
-        for i in (2, 3, 4):        # flat -0.04 from 60d out, so dtc is exact
-            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+        # The three devs SUM to -0.030, which is inside dim_clip 0.04, so a
+        # summing implementation is distinguishable from a MIN one. The first
+        # cut used -0.02/-0.03/-0.04: the sum was -0.09, ADJ_CLIP truncated
+        # it straight back to the -0.04 the test asserted, and a summing
+        # implementation passed (and `assertNotAlmostEqual(adj, -0.09)` was
+        # vacuous for the same reason).
+        t["cohorts"]["spread"]["buckets"][4]["dev_trading"] = -0.005
+        t["cohorts"]["mid"]["buckets"][2]["dev_trading"] = -0.010
+        for i in (2, 3, 4):        # flat from 60d out, so dtc is exact
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.015
         self._write(t)
         self.assertGreater(imm.load_scan_perf(), 0)
         m = self._meta(spread_cents=25, mid_cents=50.0,
                        close_time=self.NOW + timedelta(days=90))
         adj, code = imm.scan_perf_adj(m, self.NOW)
-        self.assertAlmostEqual(adj, -0.04)
-        self.assertNotAlmostEqual(adj, -0.09)
+        self.assertAlmostEqual(adj, -0.015)               # the MIN
+        self.assertNotAlmostEqual(adj, -0.030)            # not the SUM
         self.assertTrue(code.startswith("dtc"), code)     # binding term first
         self.assertIsInstance(code, str)
+        # ... and a SECOND leg at the clip, so ADJ_CLIP is still pinned
+        # separately rather than doing double duty as the min/sum assertion
+        self._reset()
+        # ONE bucket at the clip: 1 of 20 is 5%, under the clamp-storm bar,
+        # and the meta sits exactly on that bucket's centre (60d) so the
+        # interpolation returns the bucket value itself.
+        self._write(self._one_dim("dtc", 2, -0.04))
+        self.assertGreater(imm.load_scan_perf(), 0)
+        m2 = self._meta(spread_cents=25, mid_cents=50.0,
+                        close_time=self.NOW + timedelta(days=60))
+        self.assertAlmostEqual(imm.scan_perf_adj(m2, self.NOW)[0], -0.04)
         # and a series/event term can only make it MORE negative, never less
+        self._reset()
         t["series"] = {"KXPERF": self._rec("down_rank", -0.005)}
         self._write(t)
         self.assertGreater(imm.load_scan_perf(), 0)
-        self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.04)
+        self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.015)
+        self._reset()
+        t["series"] = {"KXPERF": self._rec("down_rank", -0.02)}
+        self._write(t)
+        self.assertGreater(imm.load_scan_perf(), 0)
+        adj2, code2 = imm.scan_perf_adj(m, self.NOW)
+        self.assertAlmostEqual(adj2, -0.02)
+        self.assertTrue(code2.startswith("ser"), code2)
 
     def test_dev_is_interpolated_between_bucket_centres(self):
         """judge 2 must_fix #4. A book that flickers between 4c and 5c must
@@ -11286,16 +11461,19 @@ class TestScanPerfTable(unittest.TestCase):
         (Jack 2026-09-13): a seat under the bar stays EMPTY. The whole point
         of riding the existing min_roi test is that this needs no new rule."""
         t = self._perf_table()
-        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        # Just INSIDE dim_clip 0.04. A dev AT the clip correctly reads as
+        # a clamp, and a file that raises its own params.dim_clip to dodge
+        # the per-dev check and the clamp-storm detector is now refused at
+        # the door (test_a_file_cannot_raise_its_own_dim_clip).
         for i in (2, 3, 4):
-            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.039
         self._write(t)
         self.assertGreater(imm.load_scan_perf(), 0)
         m = self._meta(est_dollars_per_day=0.8)       # gross ROI 0.08/day
         self.assertAlmostEqual(imm._raw_roi_gross(m), 0.08)
         with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0):
-            self.assertAlmostEqual(imm.scan_perf_req(m, self.NOW), 0.04)
-            self.assertAlmostEqual(imm._raw_roi(m), 0.04)
+            self.assertAlmostEqual(imm.scan_perf_req(m, self.NOW), 0.039)
+            self.assertAlmostEqual(imm._raw_roi(m), 0.041)
             cut = imm.scan_group_cut([m], set(), members=set())
         self.assertEqual(cut, {m.ticker}, "the seat was filled under the bar")
         self.assertGreater(imm.SCAN_TOP_N, 1)        # seats were available
@@ -11305,9 +11483,12 @@ class TestScanPerfTable(unittest.TestCase):
         never booked as a loss, so seats-left-empty is a pre-registered input
         to the kill rule (SPEC 10.3), not decoration."""
         t = self._perf_table()
-        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        # Just INSIDE dim_clip 0.04. A dev AT the clip correctly reads as
+        # a clamp, and a file that raises its own params.dim_clip to dodge
+        # the per-dev check and the clamp-storm detector is now refused at
+        # the door (test_a_file_cannot_raise_its_own_dim_clip).
         for i in (2, 3, 4):
-            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.039
         self._write(t)
         self.assertGreater(imm.load_scan_perf(), 0)
         real_gross = imm._raw_roi_gross
@@ -11328,6 +11509,14 @@ class TestScanPerfTable(unittest.TestCase):
             _rows, logs = self._drive_scan_refresh()
         self.assertTrue(any("perf_barred" in ln and "open-scan:" in ln
                             for ln in logs), logs[-3:])
+        # SPEC test 19 asks for the label in the scan_skips COUNTERS as well
+        # as the log line: a label that reaches the string but never
+        # increments the counter would otherwise pass. The log line prints
+        # `rejects {dict(sorted(scan_skips.items()))}`, so parse it back.
+        line = next(ln for ln in logs
+                    if "open-scan:" in ln and "perf_barred" in ln)
+        skips = ast.literal_eval(line[line.index("rejects ") + len("rejects "):])
+        self.assertGreaterEqual(skips.get("perf_barred", 0), 1, skips)
 
     def test_penalty_is_applied_exactly_once(self):
         """`_market_roi` recomputes the ratio INLINE rather than calling
@@ -11371,12 +11560,11 @@ class TestScanPerfTable(unittest.TestCase):
                   imm.event_top_n_cut(gas, incumbent=set()),
                   [imm._market_roi(x, set()) for x in fincon + gas])
         hostile = self._perf_table()
-        hostile["params"]["dim_clip"] = 0.05
         for dim in hostile["cohorts"]:
             for i, b in enumerate(hostile["cohorts"][dim]["buckets"]):
-                b["dev_trading"] = b["dev_blend"] = -0.04 if i == 2 else -0.01
-        hostile["series"] = {"KXSPRLVL": self._rec("down_rank", -0.04),
-                             "KXAAAGASM": self._rec("down_rank", -0.04)}
+                b["dev_trading"] = b["dev_blend"] = -0.039 if i == 2 else -0.01
+        hostile["series"] = {"KXSPRLVL": self._rec("down_rank", -0.039),
+                             "KXAAAGASM": self._rec("down_rank", -0.039)}
         self._write(hostile)
         self.assertGreater(imm.load_scan_perf(), 0)
         with mock.patch.object(imm, "SCAN_PERF_WEIGHT", 1.0):
@@ -11397,13 +11585,16 @@ class TestScanPerfTable(unittest.TestCase):
         counterfactual into a real out-of-sample one at zero risk."""
         self.assertEqual(imm.SCAN_PERF_WEIGHT, 0.0)
         t = self._perf_table()
-        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        # Just INSIDE dim_clip 0.04. A dev AT the clip correctly reads as
+        # a clamp, and a file that raises its own params.dim_clip to dodge
+        # the per-dev check and the clamp-storm detector is now refused at
+        # the door (test_a_file_cannot_raise_its_own_dim_clip).
         for i in (2, 3, 4):
-            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.039
         self._write(t)
         self.assertGreater(imm.load_scan_perf(), 0)
         m = self._meta(close_time=self.NOW + timedelta(days=90))
-        self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.04)
+        self.assertAlmostEqual(imm.scan_perf_adj(m, self.NOW)[0], -0.039)
         self.assertEqual(imm.scan_perf_req(m, self.NOW), 0.0)
         self.assertEqual(imm._raw_roi(m), imm._raw_roi_gross(m))
         self.assertEqual(imm._market_roi(m, set()), imm._raw_roi_gross(m))
@@ -11421,13 +11612,25 @@ class TestScanPerfTable(unittest.TestCase):
         on EVERY row, the strings only on non-neutral rows, and `perf_code`
         is ONE string, never a list."""
         t = self._perf_table()
-        t["params"]["dim_clip"] = 0.05     # else -0.04 reads as a clamp storm
+        # Just INSIDE dim_clip 0.04. A dev AT the clip correctly reads as
+        # a clamp, and a file that raises its own params.dim_clip to dodge
+        # the per-dev check and the clamp-storm detector is now refused at
+        # the door (test_a_file_cannot_raise_its_own_dim_clip).
         for i in (2, 3, 4):
-            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.04
+            t["cohorts"]["dtc"]["buckets"][i]["dev_trading"] = -0.039
         self._write(t)
         self.assertGreater(imm.load_scan_perf(), 0)
-        rows, _logs = self._drive_scan_refresh(close_days=90)
+        # close_days=8 puts the candidate in the dtc 7-30 bucket, whose dev
+        # is 0.0 -> a NEUTRAL scan row. Without one the assertNotIn branch
+        # below never ran: the fixture produced two rows and both were
+        # non-neutral, so stamping the strings on EVERY row (the exact sink
+        # flood IMM_LOGGING's third guarantee forbids) passed this test.
+        rows = []
+        for days in (90, 8):
+            got, _logs = self._drive_scan_refresh(close_days=days)
+            rows.extend(got)
         self.assertTrue(rows)
+        n_neutral = n_nonneutral = 0
         for r in rows:
             if "series" not in r:
                 continue                       # a "gone" row carries no meta
@@ -11435,16 +11638,26 @@ class TestScanPerfTable(unittest.TestCase):
             self.assertIn("perf_req", r)
             self.assertIsInstance(r["perf_adj"], float)
             self.assertIsInstance(r["perf_req"], float)
+            # perf_gen is deliberately NOT stamped per row: it is constant
+            # for the whole refresh and is published in the status block and
+            # the per-refresh log line instead
+            self.assertNotIn("perf_gen", r)
             neutral = r["perf_adj"] == 0.0 and r["perf_req"] == 0.0
             if neutral:
+                n_neutral += 1
                 for k in ("perf_v", "perf_code", "perf_unit", "perf_gen"):
                     self.assertNotIn(k, r, f"{k} on a neutral row")
             else:
-                self.assertIn(r["perf_v"], ("down_rank", "bar"))
+                n_nonneutral += 1
+                self.assertIn(r["perf_v"],
+                              ("would_down_rank", "down_rank", "bar"))
                 self.assertIsInstance(r["perf_code"], str)
-                self.assertEqual(r["perf_gen"],
-                                 self.NOW.strftime("%Y-%m-%dT%H:%M:%SZ"))
-        self.assertTrue(any(r.get("perf_v") == "down_rank" for r in rows))
+        self.assertGreaterEqual(n_neutral, 1, "no neutral row in the fixture: "
+                                              "the assertNotIn branch is dark")
+        self.assertGreaterEqual(n_nonneutral, 1)
+        # At WEIGHT 0 nothing was down-ranked, so the vocabulary says so.
+        self.assertTrue(any(r.get("perf_v") == "would_down_rank" for r in rows))
+        self.assertFalse(any(r.get("perf_v") == "down_rank" for r in rows))
 
     def test_cycle_log_column_is_appended_last(self):
         """APPEND ONLY: imm_reward_recon.py reads this file POSITIONALLY
