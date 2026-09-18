@@ -204,6 +204,18 @@ No hedge exists for any of this; sizing and stand-downs are the entire risk stac
 
 ## 6. Measurement before belief (the go-live sequence)
 
+> **PARTIALLY DELIVERED, 2026-09-18** — the markout protocol and the CI-gated
+> demotion below are BUILT for the open-scan tier (`imm_scan_perf.py` +
+> `scan_perf.json`, see `INCENTIVE_MM_HANDOFF.md` 2026-09-18) and **ship
+> disarmed**: the ranking penalty is live at `IMM_SCAN_PERF_WEIGHT=0.0`
+> (observe-only) and the hard bar at `IMM_SCAN_PERF_BAR=0`. The **share-decay
+> EWMA rule further down this section is explicitly NOT built** and is not
+> planned: it would be a second MODELLED-projection eviction for a purpose the
+> $1.00 payout floor and the hopeless exit already serve, and this book keeps
+> one mechanism per purpose. Scope is open-scan only — every hook is scoped on
+> `m.scan`; the normal book, finecon, Ramp, `*CC`, gas and KXRAIN are
+> untouched.
+
 **The base case is unknown until one period has actually paid** **[RT]**. The v1.0
 "$50–125/day" figure was an unvalidated estimator times a guessed haircut. Restated
 honestly: *unknown, bounded above by ~$500/day of estimator share at full size.* The
@@ -237,6 +249,38 @@ category-side, bootstrap CI. Demotion trigger: upper CI bound of
 (markout + accrued rent) < 0 with ≥ 30 fills — never on raw markout (queue-last fills
 skew negative even in healthy markets) and never on <30 fills in either direction.
 
+**AS BUILT (open-scan, 2026-09-18).** The hierarchy is implemented with
+**settlement FIRST** (it is the best mark and on this universe the common
+case), then the two-sided mid from `cycle_log` ± 900 s falling back to the
+`marks_*.jsonl` sink, then the one-sided leg widened by the trailing-24h
+**median** half-spread, and then **UNMARKED** — there is deliberately no fifth
+"carry the last mark forward" tier, because a market that went flat and was
+dropped has a dead book. Marks come from the EXTERNAL touch, never from our own
+quotes. Episode markouts are winsorised at ±40 c.
+
+Three reinterpretations of this paragraph, each a **tightening**, each recorded
+rather than slipped in:
+
+- **">= 30 fills" is implemented as ">= 30 EPISODES"**, where
+  `episode = (ticker, floor(fill_ts to the UTC hour))`, contract-weighted
+  inside. MEASURED: 21 fills of >= 40 contracts carry 34% of the tier's
+  contracts, so a multi-rung ladder sweep in one cycle is ONE price event and
+  counting rungs as independent fills triples the apparent sample. 106 fills
+  collapse to 85 episodes; 30 episodes is ~38 fills at the tier's MEASURED 25
+  contracts/fill.
+- the bootstrap (2,000 resamples, one-sided 90%) is **clustered by EVENT, not
+  by market** — three strikes of one event reprice on one print, and the
+  coarser cluster widens the CI, i.e. demotes *less* often.
+- the acting statistic is **markout only** (`score_basis = trading`); the
+  rent-blended column is computed and printed on every run but may not produce
+  a verdict while the tier's rent is 99% MODELLED ($353.09 MODELLED floored est
+  against $21.28 MEASURED credit on 2 of 96 events as of 2026-09-18). Direction
+  comes from the position delta, never from the `side` string.
+
+The demotion is also **bounded on the upside by construction**: the penalty can
+only ever *subtract* opportunity (`adj <= 0`, `req >= 0`), so no table — stale,
+sign-flipped or hostile — can promote a market or raise an ROI.
+
 **Dial tuning without the peso problem** **[RT]**: the EV-gate margin may only
 *relax* when the Phase-0/live jump panel shows observed jump counts ≤ the current
 class's 80th-percentile Poisson band over ≥300 market-days — never because a quiet
@@ -244,10 +288,19 @@ class's 80th-percentile Poisson band over ≥300 market-days — never because a
 jump). Tightening on realized pain (any day worse than −1.5× modeled) stays
 immediate and asymmetric.
 
-**Share-decay rule, concrete**: persist per-market estimated share each cycle;
-3-day EWMA < 50% of the market's first-72h EWMA *and* estimated $/day < 2× the
-min-payout floor → deselect, 7-day re-entry cooldown. Never respond to dilution by
-adding size (concavity + arms race).
+**Share-decay rule, concrete** — **NOT BUILT (2026-09-18), and deliberately**:
+persist per-market estimated share each cycle; 3-day EWMA < 50% of the market's
+first-72h EWMA *and* estimated $/day < 2× the min-payout floor → deselect,
+7-day re-entry cooldown. Never respond to dilution by adding size (concavity +
+arms race).
+
+The 2026-09-18 performance loop built the *other* half of this section and
+stopped there. Share-decay would be a second eviction driven by a MODELLED
+projection, aimed at a purpose the MEASURED $1.00-per-market-per-period payout
+floor and the hopeless exit already cover — and the open-scan build has **no
+eviction path at all** (members quote to completion, Jack 9/3). If it is ever
+litigated it arrives as one default-OFF knob with one condition and its own
+evidence, not as a third dial on an existing mechanism.
 
 ---
 
@@ -283,7 +336,19 @@ adding size (concavity + arms race).
 9. Category classifier + measured class table; per-class ladder shapes; tail-side
    asymmetry; selection score = net-EV/WCB replacing $/day sort.
 10. Markout pipeline + CI-gated demotions; share-decay EWMA rule; decomposed
-    reconciliation.
+    reconciliation. — **PARTIAL, 2026-09-18.** The markout pipeline is built and
+    runs offline (`imm_scan_perf.py`, daily 07:55 ET → `scan_perf.json` +
+    `scan_perf_history.jsonl`), with the CI-gated demotion implemented as a
+    per-series / per-event-root bar that ships **disarmed**
+    (`IMM_SCAN_PERF_BAR=0`) and a ranking penalty that ships **observe-only**
+    (`IMM_SCAN_PERF_WEIGHT=0.0`). Scope: the open-scan tier only. Share-decay
+    EWMA: **not built, not planned** (see §6). Decomposed reconciliation: still
+    outstanding — the scorer does a cent-exact self-check against the `realized`
+    sink and refuses to write on a mismatch, but the uptime / qualification-flap
+    / residual split of the realized-vs-estimated ratio is not implemented, and
+    the scan tier's own realization factor stays unmeasured (`RENT_FACTOR` 1.0,
+    source `default_n2`) until a Kalshi statement paste covers its 9/20-21
+    program periods.
 
 The v1.0 chassis (caps, cutoffs, single-cycle breakers, loss halt, join-don't-lead,
 fill dedupe, orphan restore) is the substrate all of this assumes — already built.

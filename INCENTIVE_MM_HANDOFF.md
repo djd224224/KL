@@ -2103,3 +2103,549 @@ window can be reported — so the first email is small by construction and the
 footer says so. Run `python send_imm_new_programs.py --dry` once before
 registering the task to see what it would say (the box's Kalshi key and
 `ALERT_EMAIL_*` are required — this runs nowhere but the trading box).
+
+## 2026-09-18 — Open-scan performance loop (Jack)
+
+The open-scan tier has been live since 2026-09-06 and had never been scored
+against what it actually traded. Phase 1 measured it end to end (9/6-9/16,
+147 tickers / 83 events / 71 series). This section is that measurement and the
+one mechanism it justifies. It ships **observe-only**: the table is written,
+loaded and stamped on every sink row, and **no decision changes** until
+`IMM_SCAN_PERF_WEIGHT` is raised by hand.
+
+WHAT WAS WRONG. Admission ranks a scan candidate by `_raw_roi` = MODELLED
+`est_dollars_per_day / est_collateral_dollars`, a **gross rent rate**, and
+`_group_walk_cut` bars anything under `SCAN_MIN_ROI` = 0.05/day. Nothing
+anywhere subtracted what the tier was losing on the other side of that rent.
+MEASURED over 9/6-9/16, 357.5 quoted market-days, 10,434 $-days at risk:
+
+- trading P&L **-$237.77** (realized **-$81.44** MEASURED from fills +
+  settlements; MTM **-$156.33** at the bot's own last mark, a MODELLED mark),
+  against MODELLED floored rent of **$244.33** — of which only **$21.28** was
+  MEASURED credit, on 2 of 83 events. The tier is break-even *only if the rent
+  model pays 1.0x*, which is measured on 2 events.
+- adverse selection is systematic, not diffuse: 106 fills, **0 taker**,
+  1h markout **-5.75 c/ct** (78% negative, n=105), 24h **-4.93 c/ct**
+  unweighted / **-5.1 c/ct** contract-weighted (71% negative, n=80), 72h
+  **-2.95 c/ct** (n=49). 31 of 38 open positions had drifted against us.
+- **12 events are -$211 of the -$238 (89%)**: KXCPIYOY-26NOV -46.30,
+  KXDIESELELECT-26NOV03 -24.47, KXTOKENUSE-26SEP21 -21.70,
+  KXTRUMPENDORSEMENTS-26SEP11 -21.45, KXAXP -19.10, KXAALA -15.05 (an ADOPTED
+  account position with zero bot fills), KXAMZNA -13.50, KXOPENADOPT -11.59,
+  KXAAL -11.05, KXBABEL-26SEP13 -10.40, KXEOWEEK-26SEP12 -9.16, KXCCLA -7.52.
+- **the losses are STRUCTURAL, and visible at admission**: mid 30-70c (n=82,
+  trading -150.7), spread 5-9c (n=31, -106.7) and 20c+ (n=38, -83.8), 30-90
+  days to close (n=38, -107.9), pools under $20/day (n=86, -153.2), the
+  Fiscal.ai Financials KPI weeklies (n=20, -58.2 trading against $3.7 of
+  floored MODELLED est). What did *not* lose: 1c-spread books (n=51, 56% of
+  all risk-days, -21.8), $100-200/day weekly pools (n=16, net +98 MODELLED),
+  under 7 days to close (net +54.8 MODELLED).
+- **the ranking signal is anti-predictive on the fill sample.** Admission ROI
+  does not predict fills at all (Spearman vs has_fill rho 0.00, n=147) and,
+  *conditional on a fill*, predicts WORSE trading: rho **-0.43** vs trading
+  P&L (p=0.003) and **-0.66** per quoted day, n=47, robust to excluding
+  Politics and to excluding settled markets. Quintile Q4 (median 6.9%/day)
+  lost -0.095 per $-day. The "quiet = safe" premise is inverted too:
+  adm_volume vs trading rho +0.37, adm_spread -0.52 (n=47).
+
+And the obvious fix — score each SERIES on its own realized history — is
+measurably the wrong one. `empirical_persistence`: per-event net quality does
+**not** persist at series level (ICC(net) **0.035-0.05** excluding TEMP,
+ICC per contract-day ~0 in every key; implied Empirical-Bayes prior strength
+m ~ 20-30 events), and a forward EB test says the **unshrunk series mean is
+the worst predictor in every cut**, 3-13% higher MAE than ignoring history
+entirely. Scan markets are one-shot weeklies or long-dated, so a key that
+needs a second observation on the same series fires after the money is gone.
+
+THE RULE NOW. One offline scorer, one number, one subtraction.
+
+`imm_scan_perf.py` (daily 07:55 ET, read-only over `STATUS_DIR` except its own
+three files) re-derives, per **structural cohort**, a MEASURED loss rate in the
+*same units as `_raw_roi`* — markout dollars per $-day at risk — and writes
+`run-logs\incentive-mm\scan_perf.json`. The bot hot-reloads it beside the four
+existing loaders at the top of `refresh_universe` and demands that much extra
+ROI of a scan **newcomer**:
+
+```python
+req(m)  = clip(-SCAN_PERF_WEIGHT * adj(m), 0, SCAN_PERF_MAX_REQ)   # >= 0 ALWAYS
+roi'(m) = _raw_roi_gross(m) - req(m)                               # only if m.scan
+```
+
+`_raw_roi(m) - req < SCAN_MIN_ROI` is exactly `_raw_roi(m) < SCAN_MIN_ROI +
+req`, so the raised bar needed **no change to `_group_walk_cut`,
+`scan_group_cut` or `SCAN_MIN_ROI`** — zero blast radius on finecon and on the
+gas / `*CC` / Ramp `event_top_n_cut`, and no shared-signature maintenance
+liability in a file that ff-merges into prod every 30 minutes and self-restarts
+on its own mtime. A cut candidate leaves the seat **EMPTY**, which is the
+`SCAN_MIN_ROI` behaviour Jack ratified on 9/13.
+
+- **`adj` is the MIN over dimensions, never a sum.** Four pre-registered,
+  frozen dimensions — spread, mid, days-to-close, pool $/day — plus a shrunk
+  series term (m=20 fills) and an event-ROOT term (only where the root has >=2
+  dated events). `adj = clip(min(adj_struct, dev_series, dev_event, 0.0),
+  -ADJ_CLIP, 0)`. Spread, dtc and pool are heavily collinear on this roster:
+  KXCPIYOY sits in spread 20c+, dtc 30-90d **and** pool <$20 at once, so a sum
+  counted the same MEASURED -$46.30 three times and was most over-confident
+  exactly where it was most over-fit.
+- **The upside clip at 0.0 is the whole safety story.** `adj <= 0` and
+  `req >= 0` by construction: **there is no code path that can raise an ROI.**
+  A favourably-scored cohort yields `req = 0`, i.e. today's behaviour, and a
+  sign-flipped or hostile "promote" file cannot move the queue upward.
+- **The applying side interpolates between bucket CENTRES** (piecewise-linear,
+  flat outside the end centres), so a 4c and a 5c book differ by a fraction of
+  a bucket step rather than a full one. The **fitting** side assigns spread and
+  mid from the market's trailing-6h median of two-sided cycle rows, so a book
+  that flickers between 4c and 5c does not change bucket on one snapshot.
+- **Cohort edges live in the JSON file, never as constants in
+  `incentive_mm.py`**, and are pinned by `params.cohort_edges_sha256`
+  (`cb9ed77f…`). A table whose edges were re-fit carries `edges_refit: true`
+  and is refused by the loader while `IMM_SCAN_PERF_REQUIRE_FROZEN_EDGES=1`.
+- **The acting statistic is `mu_trading_only` = Σ markout dollars / Σ $-days**
+  (`score_basis` default `trading`). `realized_dollars` and `mtm_dollars` are
+  stored separately on every record and are **not** the acting statistic; the
+  blended (markout + MODELLED rent) column is computed and printed on every
+  run but no verdict may come from it before the first statement paste.
+  Scoring net would soften the largest loss cohort — mid 30-70c is -150.7
+  trading but only -9.8 net.
+- **Two new decision labels, `perf_roi` and `perf_barred`**, and nothing else.
+  `perf_roi` marks a scan market whose GROSS `_raw_roi` cleared 0.05/day but
+  whose net value did not; `perf_barred` is an admission reject. There is **no
+  exit branch at all** — members never reach `_scan_admission` and are never
+  cut by `_group_walk_cut`, so quote-to-completion (Jack 9/3, "dont unquote
+  them") holds structurally, not by convention.
+- **The hard bar ships DISARMED** (`IMM_SCAN_PERF_BAR=0`). It needs 30
+  EPISODES, >=3 markets, >=2 days, a negative one-sided 90% bootstrap upper
+  bound, <=35% unmarked fills, the same eligibility on the previous run, a
+  14-day TTL and a 7-day minimum dwell — and it fires on nothing today (max
+  n_episodes = 9, on KXAXP). Every run prints that sentence in full rather
+  than leaving a dormant mechanism unlabelled.
+
+**The scorer's own numbers.** Re-scoring the Phase-1 window (`--dry --asof
+2026-09-16T00:38:00Z`) reproduces Phase 1 where it must and differs only where
+the method deliberately differs: fills 106 (exact), realized **-$81.44**
+(exact to the cent), $-days at 50c 10,491.8 vs 10,434 (+0.6%), floored MODELLED
+est $244.79 vs $244.33 (+0.2%), MEASURED credits $21.28 on 2 events (exact),
+reconciliation delta **$0.00**. On that window it reports markout **-5.43 c/ct
+[MEASURED]** (episode-collapsed and winsorised at ±40c, so not identical to
+Phase-1's per-fill -5.1) and **`mu_trading_only` = -0.01201 /$-day
+[MEASURED]**. That field means *markout dollars per $-day* — the §6-sanctioned
+quantity and the only one a verdict is allowed to use. The trading-P&L rate
+(realized + MODELLED MTM per $-day) is a **different** number, **-0.0244
+/$-day** on the same file, one division from `tier.realized_dollars` and
+`tier.mtm_dollars`; Phase 1's -0.0228 is that statistic, not this one. They are
+never interchanged and the docs, the table `notes` and the email all say which
+is which.
+
+The current 45-day run (2026-09-18T16:06Z, 167 mkts / 96 events / 89 series)
+reads markout **-7.40 c/ct** MEASURED, `mu_trading_only` -0.01516,
+`mu_rent_blended` +0.00703, rent **$353.09 MODELLED** against **$21.28
+MEASURED** on 2 of 96 events, marks two-sided 0.91 / settlement 0.09 /
+one-sided 0.00, 0 unmarked, clamped records 1.6%, **14 down_rank, 0 bar**. The
+pre-registered cohort SIGNS reproduce on the acting column: spread 20c+
+(-0.0233) and 2-4c negative, dtc 30-90d (-0.0178) and 0-7d negative, pool
+<$20 negative, 1c spread and dtc 90-180d positive.
+
+**Rollout state: SHIPPED, OBSERVE-ONLY.** `IMM_SCAN_PERF_WEIGHT` is **0.0** and
+`IMM_SCAN_PERF_BAR` is **0** in code, and the launcher's `$ProbeEnv` sets no
+`IMM_SCAN_*`, so the code defaults are what is live. At 0.0 the table loads,
+`perf_adj` / `perf_req` are stamped on every `selection_events` row and at the
+end of every `cycle_log` row, and nothing else changes — which is the point:
+it converts an IN-SAMPLE, MODELLED counterfactual into a real out-of-sample one
+at zero risk. Arming the ranking is `IMM_SCAN_PERF_WEIGHT=1.0` in
+`run_incentive_mm.ps1`'s `$ProbeEnv` + `restart_imm.ps1 -Task`, and only after
+the gate below. The bar arms separately and later.
+
+**[IN-SAMPLE, MODELLED COUNTERFACTUAL]** on the current table: the loop would
+have blocked ~21 of 167 admissions (13%), MEASURED markout avoided ~$84.95,
+MODELLED floored rent forgone ~$27.71. **[OUT-OF-SAMPLE LOOK, MODELLED]**
+replaying today's live candidate snapshot (384 distinct `is_scan` tickers)
+through the bot's own accessors at a hypothetical WEIGHT=1.0: 360 of 384 draw a
+non-zero `req`, but the median is **0.0019/day** and on 171 of them the binding
+term is the pool 0-20 bucket at dev -0.0020 — a 0.2 c/day bar raise, i.e. a
+rounding error. Nothing reaches half of `MAX_REQ`; the worst effective bar
+today is 0.0761/day. Only **2 of 384** would change a decision, both existing
+MEMBERS (which are never re-admitted and have no eviction path), and **0 of 9
+true newcomers**. Do not read the 93.8% as a blast radius. At the shipped
+WEIGHT=0.0 the replay is exact: 0 of 384 have `req != 0` and `_raw_roi(m) ==
+_raw_roi_gross(m)` to the float on all 384.
+
+THE TRAP THIS CHANGE HAD TO AVOID. Five, and each one has a guard that aborts
+rather than degrades:
+
+1. **The `realized`-delta double count.** The per-process `realized_total_
+   dollars` restarts ~20x/day, so differencing the `realized` sink and calling
+   it the numerator would have been wrong in a way that looks right. The score
+   numerator is an **independent avg-cost replay of fills + settlements**; the
+   `realized` sink is used **only** as the comparison side of a cent-exact
+   check over complete UTC days. A mismatch over $1.00 writes **no file** and
+   exits 2. It fired for real during the build at $+6.33 — the adopted
+   KXAALA-27JANPLF-83 position finally traded and the replay had no basis for
+   it — and the fix was to seed from the first fill's own `pos_before` /
+   `avg_before`, the same basis the bot's tracker used. Delta has been $0.00 on
+   every run since. Fills are deduped by `fill_id`, settlements by
+   `(ticker, settled_ts)`, cycle rows by `(ts, ticker)`, and only COMPLETE UTC
+   day-files are cached — today's partial day is recomputed from scratch every
+   run.
+2. **Summing EST and CREDITED.** They are two scopes on one stream and neither
+   contains the other (`accrued_est` never resets; the `known_tickers` prune
+   deletes the counter). Per (market, program period) the rent is **one basis
+   or the other**, never a sum: a MEASURED credit replaces the MODELLED
+   estimate for that period only, `rent_basis` and `rent_measured_frac` say
+   which, and because ledger rows are event-keyed the substitution exists only
+   at EVENT and SERIES level. The email prints MEASURED credits in their own
+   column with the sentence saying so.
+3. **A table that could promote.** Design C's rank-key variant added a
+   *positive* adjustment to the rank, so a positive-dev table could reorder the
+   queue upward. Here `adj` is clipped at 0.0 on the upside and `req` is
+   clipped into `[0, MAX_REQ]`, so the worst a hostile or sign-flipped file can
+   do is refuse opportunity. `MAX_REQ = 0.10` bounds the effective admission
+   bar at **0.15/day**, under the MEASURED Q5 median admission ROI of
+   **0.2205/day** (n=29) — the tier's best-ROI quintile clears the worst table
+   the scorer can emit.
+4. **Summing collinear marginals** (see `adj = min` above).
+5. **A shrunken denominator inflating every dev.** `_sink` self-mutes after a
+   single failure and can go dark mid-day, and a quietly smaller `risk_days`
+   inflates every deviation at once — the most likely route to a bad table. A
+   **>30% day-over-day drop in tier `risk_days`** writes no file and exits 3
+   (announced-and-skipped, never silently, on a deliberate backward `--asof`
+   re-score). A **clamp storm** — more than 10% of emitted devs sitting exactly
+   at ±`dim_clip` — writes no file and exits 4; that is the sign-flip detector,
+   because a uniformly negated file passes every NaN and range check
+   individually. The same clamp-storm test runs again at the reader.
+
+Two integration mismatches were found by driving the writer against the real
+loader rather than reading the two files side by side, and both were **guard
+denominators** — cases where the writer would ship a file the reader refuses
+WHOLE, leaving the tier silently on the previous verdicts:
+
+- the loader counts every bucket `dev_trading` (muted included) plus each
+  series/event `dev` and never `dev_blend`; the writer counted non-muted
+  buckets x (`dev_trading` + `dev_blend`). MEASURED on today's table that is
+  **115 (loader) vs 129 (writer)**, so a file with 12 clamped acting devs was
+  10.43% to the loader (REFUSED) and 9.30% to the writer (shipped). The writer
+  now computes both and aborts on the **MAX**, and reports that max.
+- the writer's `MAX_RECORDS` cap counted `markets + series + events` and
+  trimmed `markets`, which the loader never reads; the loader counts
+  `series + events + buckets`. The writer now bounds the loader's denominator
+  too, shedding only **NEUTRAL** records, most-positive `dev` first — a
+  neutral record with `dev >= 0` is a pure no-op for `scan_perf_adj` — never a
+  `down_rank` or a `bar`, with a `warnings` line. At the shipped cap of 500
+  nothing sheds (today: 89 series + 6 event roots + 20 buckets = 115).
+
+**Fail-open, everywhere.** Absent file: `getmtime` raises, tables untouched,
+byte-identical to today. Invalid JSON / wrong version / bad schema / re-fit
+edges: the mtime is recorded **before** parsing, so it is logged once and not
+retried until the file changes, and the file is ignored **entirely** — never
+partially, because a partially applied table is the one failure that could mix
+a good bar with a bad adjustment. Older than `IMM_SCAN_PERF_MAX_AGE_H` (48h):
+all three tables are **cleared**, not frozen, and the age is re-checked on
+every refresh rather than only at parse time (a real bar dies during a scorer
+outage — accepted, and visible in the status block and the email banner).
+Reader-side blast radius is bounded independently of the file: at most 25
+down-rank records and 5 live bars, worst-dev first, and records past their own
+`until` are dropped at load.
+
+**The "30 fills" -> "30 EPISODES" reinterpretation (say it out loud).**
+`INCENTIVE_MM_STRATEGY` §6's demotion protocol says ">= 30 fills". This build
+uses **30 episodes**, where `episode = (ticker, floor(fill_ts to the UTC
+hour))` and contracts are aggregated contract-weighted inside one. That is a
+**tightening**, not a relabelling: MEASURED, 21 fills of >=40 contracts carry
+910 of 2,685 contracts (34%), so a multi-rung ladder sweep inside one cycle is
+ONE price event, and counting the rungs as independent fills triples the
+apparent sample. 106 fills collapse to 85 episodes at H=1h. 30 episodes is
+roughly 38 fills at the tier's MEASURED 25 contracts/fill. Direction comes from
+the **position delta only** (`pos_after - pos_before`), never from the
+`side`/`action` strings — the `Price_In_Cents` trap class, where a sell-YES and
+a buy-NO at the same effective YES price must get the same sign.
+
+**THE OBSERVE-ONLY GATE — not 3 days.** The observe-only phase runs through at
+least one full program cycle, i.e. **through the ~9/23 statement paste**.
+Before `IMM_SCAN_PERF_WEIGHT` may go above 0, ALL of:
+
+- the pre-registered cohort **SIGNS reproduce** when re-fit on markets admitted
+  *after* the ship date (report every bucket, muted ones included);
+- the **leave-one-EVENT-out** and **leave-one-SERIES-out** re-fits are
+  published and flip no sign on a bucket the loop would act on (today: max 2
+  sign flips of 17 acting buckets on any single event or series dropped);
+- the observe-only `selection_events` record shows the counterfactual block
+  rate and the MODELLED forgone rent, and Jack has seen both;
+- the cent-exact reconciliation came back OK on **every** run in the window.
+
+Arm with `IMM_SCAN_PERF_WEIGHT=1.0` in `$ProbeEnv` + `restart_imm.ps1 -Task`,
+and start the clock at that restart's `config_hash`. The bar arms **separately**
+(`IMM_SCAN_PERF_BAR=1`) and only after the first statement paste turns the rent
+side from MODELLED into MEASURED.
+
+**THE 2-WEEK RE-MEASUREMENT — pre-registered now, with the Phase-1 baselines.**
+Due **2026-10-03**, or 14 days after arming, whichever is later. Restrict to
+fills on markets admitted after the arming timestamp. Report the point estimate
+**and** the bootstrap CI, and do not claim an effect the CI does not support.
+
+| metric | baseline (Phase-1, 9/6-9/16) | label | success |
+|---|---|---|---|
+| **PRIMARY** — contract-weighted 24h markout on scan fills | **-5.1 c/ct** (unweighted -4.93, 71% negative, n=80; 1h -5.75, 78% negative, n=105; 72h -2.95, n=49) | MEASURED | less negative, CI-supported |
+| **Stated MDE** | ~**2.5 c/ct** at ~150 fills and a per-fill sd of ~15c (SE ~1.2c) | — | *stated up front so a null is not read as a win* |
+| SECONDARY 1 — trading P&L per $-day at risk | **-0.0228** (-$237.77 / 10,434 $-days; compare on `risk_days_at50c`, and note this is NOT `mu_trading_only`) | MEASURED | less negative |
+| SECONDARY 2 — share of tier $-days in the pre-registered bad cohorts | spread 5-9c + 20c+ = 3,098/10,434 = **30%**; pool <$20 = 6,520/10,434 = **62%**; dtc 30-90d = 1,450/10,434 = **14%** | MEASURED | falls |
+| SECONDARY 3 — loss concentration | **12 events = 89%** of the -$238 | MEASURED | falls |
+| SECONDARY 4 — fill-conditional rho(admission ROI, trading/day) | **-0.66** (n=47; vs trading_pnl -0.43) | MEASURED | net ROI should be >= 0; if net ROI is *also* anti-predictive, kill the loop |
+| **COST 1** — mean occupied seats | **60/60** | MEASURED | >= 54 sustained (below ~55 means over-tight — the participation readout the KXHIGH A/B established) |
+| **COST 2** — MODELLED floored rent forgone on blocked candidates | 0 today | MODELLED | must not exceed the MEASURED markout gain |
+| **CALIBRATION GATE** — est vs credited for scan events | MODELLED **$244.33** floored vs MEASURED **$21.28** on 2 of 83 events; ~$122 of est on periods ending 9/15, ~$105 on 9/20-21; 59 of 81 tickers' programs end 9/20-21 | mixed | after the paste, recompute with `rent_basis=credited`, re-fit `RENT_FACTOR`, re-evaluate `score_basis` |
+
+**Decision rule, pre-registered.** **Keep** if the 24h markout improves by
+>=2.5 c/ct with a CI that supports it AND credited-$/risk-day does not fall by
+more than the markout gain AND mean seats >= 54. **Kill** (`IMM_SCAN_PERF=0`)
+if seats sit >25% empty with no markout improvement, or if the MODELLED forgone
+rent exceeds the MEASURED gain, or if net ROI is as anti-predictive as gross
+ROI was. Tightening lands immediately; per `INCENTIVE_MM_STRATEGY` §6,
+**relaxing any dial** (raising `DIM_CLIP`/`MAX_REQ`, lowering K or m, lowering
+the bar's N) requires **>=300 scan market-days** of fresh evidence and never a
+quiet 30-day P&L window. The tier had 357.5 quoted market-days since 9/6, so
+~300 is roughly one further measurement cycle.
+
+**KILL SWITCHES, fastest first.**
+
+1. Delete `run-logs\incentive-mm\scan_perf.json` (or overwrite it with an empty
+   `cohorts`/`series`/`events`) -> neutral at the next universe refresh,
+   **<=10 min, no restart**.
+2. Disable the `KL imm scan-perf` task -> the table ages out to neutral by
+   itself in 48h.
+3. `IMM_SCAN_PERF_WEIGHT=0` in `$ProbeEnv` + `restart_imm.ps1 -Task` -> keeps
+   the full audit trail while zeroing the effect.
+   (`IMM_SCAN_PERF_RANK_ONLY=1` is the de-escalation short of this: the
+   subtraction happens in `_market_roi` only, so the rank moves and the
+   `SCAN_MIN_ROI` bar does not.)
+4. `IMM_SCAN_PERF=0` + `restart_imm.ps1 -Task` -> the loader never runs.
+
+**THE SCORER TASK.** `KL imm scan-perf`, daily **07:55 ET** — five minutes
+after `KL imm program-history` (07:50) so `reward_programs.json` holds fresh
+period ends, and before the day's decisions matter. cmd.exe wrapper, PYTHONPATH
+at the user site-packages, output appended to
+`run-logs\incentive-mm\scan-perf-task.log`, Interactive/Limited principal,
+StartWhenAvailable, batteries allowed, PT2H limit (a cold run re-reads up to 45
+days of `cycle_log_*.csv`: MEASURED cold 154.7s, warm 18.8-26.2s, 9.1 MB
+private cache). **The trigger is written literally in
+`register_imm_scan_perf.ps1` and documented in its header — it is NOT derived
+from a sibling task's StartBoundary.** That derivation is exactly why
+`KL imm new-programs` silently moved from 06:45 back to 07:30 on 9/13 the
+moment its register script was re-run, and a scoring job that feeds a live
+trading knob must not have a schedule that drifts as a side effect of
+re-running its own installer. `sync_kl_main.ps1` bootstraps the task once this
+lands on main (logged to `run-logs\sync-kl-main.log`), and deliberately does
+**NOT** start it — the house convention. **Until that registration runs on the
+box there is no `scan_perf.json`, and every reader — bot, 07:25 opportunistic
+email, 07:10 digest — prints the neutral / "no table" path.** To do it by hand:
+`powershell -ExecutionPolicy Bypass -File register_imm_scan_perf.ps1`, and
+preview with `python imm_scan_perf.py --dry`, which writes nothing.
+
+**WHERE TO LOOK.** `python incentive_mm.py --status` -> the new `scan_perf`
+block (generated_at, age_h, fresh, down_ranked, barred, bar_enabled, weight,
+seats_at_risk_24h, req_applied_24h) and the `open-scan:` rejects line. The 07:25
+opportunistic email carries a PERF column on every OPEN SCAN row and a SCAN
+PERF block (both cohort bases with the acting column marked, non-neutral keys,
+active bars, `unmatched_bar_keys`, mark-source mix, MEASURED credits in their
+own column) and **THE COST LINE**: `seats left empty by perf_roi (24h): N of
+60 | admissions barred (24h): M | MODELLED forgone floored est on blocked
+candidates: $X [MODELLED]`. The 07:10 digest carries the one-line version.
+`imm_health_alert.py` emails once a day when an EXISTING table is older than
+48h (a MISSING table is not an alert — the loop may simply not be deployed).
+Sink rows and the table files are documented in `IMM_LOGGING.md`.
+
+WHAT THIS DOES NOT FIX. Written as the honest self-criticism list, because the
+forgone half of this trade is never observed as a loss:
+
+1. **It cannot stop the FIRST market of a toxic series.** KXCPIYOY-26NOV was
+   admitted 9/14 and marked 20-30c against us inside ~1 day for -$46.30 (a
+   third of the tier's whole trading loss) on one matured episode. Structure
+   catches it the *next* time; nothing here catches it the first time.
+2. **The live-source keyword gap is a separate, cheaper fix worth ~$31 of the
+   ~$238.** KXTOKENUSE (-$21.70, OpenRouter live feed) and KXEOWEEK (-$9.16,
+   executive-order counts, federalregister.gov) entered because the
+   live-source keyword screen carried no matching term. That ships as its own
+   commit with its own test (next section) and this loop must never be
+   described as covering it. KXCPIYOY (-$46.30) is NOT in that number: it
+   settles on a scheduled BLS print, not a live feed, and is exactly the
+   30-90d / 20c-spread / sub-$20-pool structure this loop scores.
+3. **The cohort fit is 12 days, 147 markets and 106 fills**, straddling two
+   regime changes inside the window — the 9/13 scan cap 30 -> 60 and the 9/14
+   Fiscal.ai KPI wave. Every bucket value in the shipped table is a fit on that.
+4. **The rent side is 99% MODELLED.** $353.09 MODELLED floored est against
+   $21.28 MEASURED credit on 2 of 96 events, ledger 7 days stale. That is why
+   `score_basis` is `trading`, why the bar is disarmed, and why the blended
+   column is printed but never acted on. The credited substitution is
+   EVENT-level only, so `mu_rent_blended` and the `raw_blend` cohort column are
+   100% MODELLED today.
+5. **Every counterfactual in this section is IN-SAMPLE** — the ~21 of 167
+   blocked admissions, the ~$84.95 avoided, the ~$27.71 forgone. The
+   out-of-sample look at today's live snapshot is labelled MODELLED for the
+   same reason. The observe-only phase exists precisely to replace them.
+6. **The loop leaves seats EMPTY and the forgone rent is never observed as a
+   loss.** That asymmetry cuts against the loop at review time unless it is
+   published, which is why the COST LINE is in both the email and the digest
+   and why both numbers are inputs to the kill rule above — not decoration.
+7. **`empirical_persistence` §8.1's verdict is ACCEPTED, not argued with**: a
+   loop keyed on series realized history cannot beat "use the family mean, or
+   nothing" (the unshrunk series mean is the worst predictor in every cut, and
+   out-of-time the plain global mean wins). That is why the series term is
+   shrunk at m=20, why the event term needs >=2 dated events, and why the
+   **structural cohorts carry the signal**. It is also why this loop is not the
+   main lever: §8.1 says the information is in-flight (max |position| /
+   position-days, 2-day MTM drift), not in a per-series scorecard.
+8. **No member eviction, and no exit branch at all.** No `perf_exit`, no
+   `IMM_SCAN_PERF_EXIT`, no per-market scorecard. Design C's exit
+   re-implemented the `SCAN_DRIFT` / `SCAN_FILL_HALT` tripwire Jack disarmed on
+   9/5 ("dont need these") with three more dials; its evidence is n=41 with 8
+   tests and its 40-contract threshold was judgement, not measurement (the
+   persistence split is at ~80 contracts and **0 of 147 scan markets ever
+   reached 80**; max observed |pos| is 60). If an exit is ever litigated again
+   it arrives as one default-OFF knob with one condition and its own evidence.
+9. **No cohort-cell bars, no category verdicts, no auto-mute.** A cohort cell
+   is not a series, event or market, and Jack ratified only those three units
+   (9/6). The category-concentration share is printed as a WARNING and is never
+   acted on (Jack 9/6, "dont systematically drop ... categories").
+10. **No share-decay EWMA rule, no sizing lever, and no change to the normal
+    book, finecon, Ramp, `*CC`, gas or KXRAIN.** Every hook is scoped on
+    `m.scan`. A simultaneous size change would confound the markout
+    re-measurement.
+11. **Deviations from the spec that are live, and are deviations:** the
+    bootstrap clusters by **EVENT**, not by market (three strikes reprice on
+    one print; the coarser cluster widens the CI and therefore bars *less*
+    often — fail-safe, and irrelevant while the bar is disarmed and no group
+    reaches 30 episodes); there is **no time decay** in v1 (no half-life is
+    applied anywhere — an echoed-but-unapplied parameter was removed rather
+    than left to mislead); `until` is *required* on a bar and *allowed*
+    elsewhere; `events` is keyed by EVENT ROOT everywhere.
+12. **Mark tiers 3 and 4 are UNREACHABLE while a position is open.** The
+    `marks` sink writes every 300 s per open position, so tier 2's sink
+    fallback pre-empts the one-sided tier and the UNMARKED tier
+    (`one_sided 0.00`, `fills_unmarked 0` on both windows), which in turn
+    makes the `data_thin` rule and bar condition 4 structurally unable to
+    fire on a held market. The honest freshness detector is therefore
+    `tier.mark_source_detail`, which splits tier 2 into `cycle_two_sided`
+    (MEASURED 67.97% of scored contracts) and `sink_mark` (22.66% —
+    `state.last_mark`, a bulk `get_markets` mid that falls back to a trade
+    print and survives an API failure as "stale marks stand"), not
+    `mark_source_mix`, which folds both into `two_sided` per SPEC 2.4.
+13. **`scan_perf_status`'s `seats_at_risk_24h` / `req_applied_24h` are
+    same-process counters** and reset on each of the ~20 daily restarts. The
+    durable 24h answer is the one the email and digest print, derived from the
+    `selection_events` sink; treat the status numbers as a same-process
+    convenience only. `seats_at_risk_24h` is also an **UPPER BOUND, not a
+    measurement**: `_group_walk_cut` breaks out on the group cap and continues
+    on the per-event cap BEFORE it reaches its `min_roi` test, so at a full
+    tier a candidate the cap cut carries the `perf_roi` label although the
+    loop never touched it (REPRODUCED against the real walk: 30 labelled, 0
+    caused). Measuring it exactly means changing the signature of a walk
+    finecon and the gas/*CC/Ramp `event_top_n_cut` also traverse, which is
+    the blast radius SPEC 0 chose this chassis to avoid.
+14. **`imm_reward_recon.py` has not been run end to end against a 35-column
+    `cycle_log`.** The change is strictly append-only and the positional reads
+    (`row[0],[1],[7],[8],[11]`) are pinned by a test, but nobody has parsed a
+    file the new bot actually wrote.
+15. **The cent-exact reconciliation is only PARTLY de-circularised.** The
+    "independent" avg-cost replay is INDEPENDENT of the `realized` sink -- that
+    is what the check compares -- but NOT of the bot's own COST BASIS on the
+    handful of tickers that predate the fills sink, because the replay is
+    seeded from the first fill's `pos_before` / `avg_before`. For those the
+    check verifies the replay arithmetic, not the basis. They are listed in
+    `tier.recon_seeded_tickers` with `tier.recon_seeded_frac` beside them
+    (MEASURED 4 of 169 today, all four adopted or pre-sink positions). The
+    alternative seed breaks the check outright (KXAALA filled once after 9/16
+    and the sink booked -$6.33 against a basis the replay did not have), so
+    this is recorded rather than fixed.
+16. **`selection_events` `perf_v` says `would_down_rank`, not `down_rank`,
+    while `WEIGHT=0`.** At the shipped weight `req` is identically 0 and
+    nothing is down-ranked, but a negative `adj` was MEASURED on 93.8% of live
+    scan candidates; the third value keeps the sink from recording an
+    intention in the vocabulary of an action. There is also no per-row
+    `perf_gen` -- the table's `generated_at` is constant per refresh and lives
+    in the status block and the refresh log line instead.
+
+Pinned by `TestScanPerfTable` in `test_incentive_mm.py` (31 cases: absent file
+reproduces production to the float; hot-reload mtime gate and last-good on bad
+JSON; stale -> neutral; whole-file-not-partial rejection; wrong version and
+re-fit edges; clamp storm; **the loop can never promote**; req bounded and the
+effective bar never above 0.15; `adj` is the MIN not the sum; interpolation
+between centres; edges come from the file; penalised/barred caps; record past
+its `until`; bar rejects a newcomer and never a member; bar disarmed by
+default; bar expiry; event-root bars cover siblings only; the cut leaves the
+seat empty; the `perf_roi` label and the `scan_skips` counters; penalty applied
+exactly once through `_market_roi`; normal-book/finecon/gas walks byte-
+identical under a hostile table; weight-zero is observe-only but still stamps;
+`selection_events` row-size discipline; `perf_req` is the LAST cycle-log
+column; the `IMM_SCAN_PERF=0` kill switch; DELETING the file actually
+neutralises a loaded table while a cold start stays byte-identical; a file
+cannot raise its own `params.dim_clip`; a negative `IMM_SCAN_PERF_MAX_REQ` /
+`MAX_PENALIZED` / `MAX_BARRED` can never invert the sign of the loop or publish
+a negative count; an expired down-rank stops penalising without a new file; and
+`"perf_exit"` appears nowhere in
+`incentive_mm.py`), by `test_imm_scan_perf.py` (46 cases: the four mark tiers
+with no fifth; the trailing-median half-spread; episode collapse; sign from the
+position delta; pending-not-zero; data-thin; bucket mutes; the adopted cap;
+the $1.00 rent floor; EST and CREDITED never summed for one period; partial-day
+recompute; idempotence; the three write-abort guards; `reward_est_cache.json`
+untouched; the bar's floors and a CI straddling zero; event-clustered
+bootstrap; the ratchet; both bases emitted; the frozen-edges hash; the writer's
+two guard denominators — clamp storm computed on the MAX of the writer's and
+the loader's counts (`test_clamp_storm_uses_the_max_of_both_denominators`,
+constructed to exactly the MEASURED 12-of-115 / 12-of-129 case), and
+`MAX_RECORDS` shedding only NEUTRAL records, most-positive dev first
+(`test_max_records_sheds_only_neutral_records_most_positive_first`, which then
+loads the shed file through the real `imm.load_scan_perf`) — plus
+`TestScorerInvariants` (event root identical to the bot's rule; the event
+ticker taken from the sink rather than a two-segment guess; a half-cent median
+spread still lands in a bucket; every dimension accounts for all its $-days; a
+qualified-but-uncredited period stays MODELLED; no record claims a credited
+basis with a $0 measured term; a flat-through fill is not `unmarked`; each
+markout horizon has its own maturity cutoff and sample size) and
+`TestGuardsLeaveTheLastGoodTable` (each abort path leaves the previous good
+table byte-identical and appends no history row), and the round-trip
+`test_written_file_validates_against_the_bot_loader`, whose live half runs
+against a real scorer output when `IMM_SCAN_PERF_TEST_TABLE` is set and skips
+cleanly when it is not), by `TestScanPerfBlock` / `TestScanPerfCostLine` /
+`TestPerfRecordKeying` in `test_send_opportunistic_imm.py` and
+`ScanPerfStaleness` in `test_imm_health_alert.py`. Full suite: **777 green
+(rc 0)** across `test_incentive_mm test_imm_scan_perf test_send_opportunistic_imm
+test_imm_health_alert test_send_imm_new_programs test_imm_reward_recon`, up
+from 591 at `f87a2a7`.
+
+## 2026-09-18 — live-source keywords: openrouter / ai-gateway / federalregister (Jack)
+
+Separate from the performance loop above, and deliberately so: this is the
+cheaper half of the same $238.
+
+WHAT WAS WRONG. `_scan_series_ok`'s live-source screen refuses a scan series
+whose settlement source is a continuously-updating public feed — everyone can
+price it tick by tick and we cannot. `SCAN_LIVE_SOURCE_KEYWORDS` carried the
+crypto exchanges, the sports sites, the power markets, the weather services and
+`youtube.com`, but nothing for the AI-usage feeds or the Federal Register. So
+KXTOKENUSE-26SEP21 (OpenRouter weekly token use — which `imm_feed_audit`
+already listed as a not-allowed family at $1.8-3.9k/day) was admitted on 9/14
+and lost **-$21.70** MEASURED, and KXEOWEEK-26SEP12 (executive-order counts,
+federalregister.gov) lost **-$9.16** MEASURED.
+
+THE RULE NOW. Three terms added to the default
+`SCAN_LIVE_SOURCE_KEYWORDS`: **`openrouter`**, **`ai-gateway`**,
+**`federalregister`**. MEASURED on the live series feed by the sweep that came with the fix,
+they match **4 of 158** scan-reachable series — a scalpel, not a category ban. Still
+env-overridable in one place (`IMM_SCAN_LIVE_SOURCE_KEYWORDS`).
+
+**KXCPIYOY is deliberately NOT keyworded**, even though it is the single worst
+event in the window (-$46.30 MEASURED). A CPI release is a *scheduled BLS
+print*, not a continuously-updating source: there is no public tick anyone can
+read ahead of us, and the keyword screen is not the right instrument for it.
+Adding a `cpi` or `bls.gov` term would be a category ban on the quiet-print
+book by the back door, which Jack ruled against on 9/6 ("dont systematically
+drop ... categories"). The 30-90d / 20c-spread / sub-$20-pool structure is what
+the performance loop above is for.
+
+WHAT THIS DOES NOT FIX. The screen reads the series text; a live-source market
+whose blurb names none of these terms still gets in, and this is a
+string-matching screen, not a taxonomy. ~$31 of the ~$238 (these two events)
+is the honest ceiling on this fix; KXCPIYOY's -$46.30 belongs to the loop
+above, not to this screen.
+
+Pinned by one test asserting the three terms are in the default list and that
+the KXTOKENUSE / KXEOWEEK series text is refused by `_scan_series_ok` while a
+neighbouring quiet-print series is not.
