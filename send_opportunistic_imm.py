@@ -93,14 +93,17 @@ credit-ledger helpers, so a row here can never disagree with the digest.
 
 Under the tier tables sits the SCAN PERF block: the open-scan performance
 loop's scorecard, read from STATUS_DIR/scan_perf.json (the same file the bot
-loads, honouring the same IMM_SCAN_PERF_FILE override). It prints the table's
-age, the WEIGHT and BAR actually in force, the cohort table on BOTH bases with
-the acting column marked, every non-neutral key, the mark-source mix, and —
-required, not optional — THE COST LINE: the seats the loop left empty, the
-admissions it barred, and the MODELLED rent that went with them. Forgone rent
-is never observed as a loss anywhere, so without that line the two-week review
-is structurally biased toward keeping the loop. A missing or garbled table
-prints "no table" and changes nothing else in the email.
+loads, honouring the same IMM_SCAN_PERF_FILE override). Jack 2026-09-20: a
+re-listed event is judged on its own event ROOT's history, a new root on its
+series, a new series on its grouped family. The block prints the table's age,
+BLOCK and BLEND as actually in force, every unit with a verdict (its $-days,
+rent with its MEASURED/MODELLED basis, realized, mtm, roi_hist, TTL) with the
+MEASURED credits in their own column, the families, the blocks, and — required,
+not optional — THE COST LINE: the admissions the loop blocked, the seats the
+blend put at risk, and the MODELLED rent that went with them. Forgone rent is
+never observed as a loss anywhere, so without that line the review is
+structurally biased toward keeping the loop. A missing or garbled table prints
+"no table" and changes nothing else in the email.
 
 STRICTLY READ-ONLY. Scheduled daily 7:25 AM ET ("KL imm opportunistic"),
 after the 7:10 digest and 7:20 quote-gaps. --test sends now ignoring the
@@ -338,7 +341,7 @@ def previous_email_events():
 def write_last_sent(now_utc, events, perf_verdicts=None) -> None:
     """Best-effort, after a successful send only.
 
-    `perf_verdicts` ({"series:KXFOO": "down_rank"}) rides in the same record
+    `perf_verdicts` ({"series:KXFOO": "block"}) rides in the same record
     so the next email can bold the SCAN PERF rows whose verdict CHANGED. One
     record, one write, one fsync-free os.replace: a second file would be a
     second thing to go stale independently of this one."""
@@ -680,12 +683,12 @@ def html_table(rows, new_events=frozenset(), perf=None) -> str:
 
 
 # ---- SCAN PERF (the open-scan performance loop's scorecard) ----------------
-# The loop demands extra ROI of a scan candidate whose STRUCTURE (spread, mid,
-# days-to-close, pool $/day) the scorer has MEASURED as loss-making, by
-# subtracting a requirement `req` from its ROI before the 5%/day admission
-# bar. It can only ever subtract — `adj` is clipped at 0.0 on the upside and
-# `req = clip(-WEIGHT*adj, 0, MAX_REQ) >= 0` — so there is no code path that
-# promotes a market, and this block never needs to explain one.
+# Jack 2026-09-18/20: open scan picks up new markets or not based on the
+# HISTORICAL ROI of the unit that judges them — the event ROOT for a re-listed
+# event (gas dailies, AI token share ...) or a new strike, else the series,
+# else the grouped family (Fiscal.ai KPIs, AAA state gas dailies, CPI). The
+# bot BLOCKS admission when that unit's MEASURED history is under the
+# threshold and BLENDS the history into the ranking ROI otherwise.
 #
 # Everything printed here comes from ONE file (STATUS_DIR/scan_perf.json,
 # parsed by send_imm_digest.load_scan_perf). The block is defensive at every
@@ -694,25 +697,15 @@ def html_table(rows, new_events=frozenset(), perf=None) -> str:
 # this block — it is a scorecard bolted onto a report that already carries the
 # tier's money.
 #
-# Two labels are load-bearing and appear on every number:
-#   MEASURED  markout from the bot's own fills against the strategy doc's
-#             four-tier mark hierarchy; `credited_measured` from the ledger
-#   MODELLED  the rent estimate (cycle-log accrual integral, $1.00 floor) and
-#             every counterfactual
-# MEASURED credits get their OWN column and are never added to the MODELLED
-# rent — the same rule the CUMULATIVE table below enforces for EST/CREDITED,
-# and for the same reason: they are two scopes on one stream and neither
-# contains the other.
-_PERF_DIM_ORDER = ("spread", "mid", "dtc", "pool")
-
+# Labels are load-bearing and appear on every number: rent is MEASURED where
+# the ledger covers the period and MODELLED elsewhere (the record says
+# which), realized is MEASURED, mtm is a MODELLED mark; `credited_measured`
+# is ledger money and gets its OWN column — never an addend to the rent, the
+# same rule the CUMULATIVE table below enforces for EST/CREDITED.
 
 # VERBATIM incentive_mm.scan_perf_event_root / imm_scan_perf.root_of. The
-# scorer keys its `events` block by EVENT ROOT and its `series` block by
-# SERIES — those are the only two keyings the schema has — so this lookup
-# uses exactly the rule the bot uses and nothing else. An earlier cut also
-# tried the FULL event ticker and an rsplit("-", 1) trim on the way, which
-# reported correctly under either convention but could also hit a key that
-# describes a DIFFERENT unit than the row it is printed on.
+# scorer keys its `events` block by EVENT ROOT, so this lookup uses exactly
+# the rule the bot uses and nothing else.
 _PERF_ROOT_RE = re.compile(r"^(?P<root>.+)-\d{2}[A-Z]{3}")
 
 
@@ -724,112 +717,130 @@ def perf_event_root(event_ticker: str) -> str:
     return m.group("root") if m else str(event_ticker or "")
 
 
-def perf_record(table, event_ticker: str):
-    """(key, unit, record) for an event, or (None, None, None).
+def perf_family_of(table, series: str):
+    """The grouped family the scorer's match rules put `series` in (explicit
+    members, then a name regex), else None. The Fiscal.ai flag lives in the
+    bot's persisted state, so a fiscal series the scorer has not yet listed
+    as a member is a miss HERE (the bot itself has the flag and resolves it);
+    the email prints what it can prove from the file."""
+    fams = table.get("families") if isinstance(table.get("families"), dict) else {}
+    s = str(series or "")
+    for name, rec in fams.items():
+        if not isinstance(rec, dict):
+            continue
+        if s in (rec.get("members") or []):
+            return name
+        match = rec.get("match") if isinstance(rec.get("match"), dict) else {}
+        rx = match.get("regex")
+        if rx:
+            try:
+                if re.match(rx, s):
+                    return name
+            except re.error:
+                continue
+    return None
 
-    EVENT records are checked before SERIES records: a verdict on the narrower
-    unit is the one that describes this row. 30 *CC events left this email
-    silently on 2026-09-10, so a miss must be a real absence, not a keying
-    mismatch — which is why the root rule here is the bot's, verbatim."""
+
+def _perf_floor(table) -> float:
+    params = table.get("params") if isinstance(table.get("params"), dict) else {}
+    v = params.get("min_risk_days")
+    return _f(v) if v is not None else 100.0
+
+
+def perf_record(table, event_ticker: str, series=None):
+    """(key, unit, record) for the unit that JUDGES this event under the
+    bot's hierarchy — event ROOT, then series, then grouped family, the most
+    specific one with enough history — or (None, None, None).
+
+    The floor is re-checked here the way the bot re-checks it, so the email
+    never prints a verdict the bot would not act on. 30 *CC events left this
+    email silently on 2026-09-10, so a miss must be a real absence, not a
+    keying mismatch — which is why the root rule is the bot's, verbatim."""
     if not table:
         return None, None, None
-    events = table.get("events") if isinstance(table.get("events"), dict) else {}
-    series = table.get("series") if isinstance(table.get("series"), dict) else {}
+    floor = _perf_floor(table)
+    s = str(series or "") or str(event_ticker or "").split("-")[0]
     root = perf_event_root(event_ticker)
-    rec = events.get(root)
-    if isinstance(rec, dict):
-        return root, "event", rec
-    ser = str(event_ticker or "").split("-")[0]
-    rec = series.get(ser)
-    if isinstance(rec, dict):
-        return ser, "series", rec
+    fam = perf_family_of(table, s)
+    for unit, key, blk in (("event", root, "events"), ("series", s, "series"),
+                           ("family", fam, "families")):
+        if not key:
+            continue
+        d = table.get(blk) if isinstance(table.get(blk), dict) else {}
+        rec = d.get(key)
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("verdict") or "") == "insufficient":
+            continue
+        if _f(rec.get("risk_days")) < floor:
+            continue
+        return key, unit, rec
     return None, None, None
 
 
-def perf_req_of(rec, hdr) -> float:
-    """The requirement in $/day per $ at risk that this record implies at the
-    weight currently in force: `req = clip(-WEIGHT * dev, 0, MAX_REQ)`.
-
-    Recomputed here rather than read from the file because the file carries
-    `dev` (the MEASURED deviation) and the bot carries the WEIGHT: printing a
-    req from one without the other is how a table of intentions gets read as a
-    table of actions. Returns 0.0 for a missing/neutral record, and NEVER a
-    negative number — the loop has no promote path and neither does its
-    report."""
-    if not isinstance(rec, dict):
-        return 0.0
-    dev = _f(rec.get("dev"))
-    w = hdr.get("weight")
-    w = _f(w) if w is not None else 0.0
-    max_req = _f((hdr.get("max_req") if hdr.get("max_req") is not None
-                  else 0.10)) or 0.10
-    return max(0.0, min(-w * dev, max_req))
-
-
-def perf_req_at_full_weight(rec) -> float:
-    """What the req WOULD be at WEIGHT=1.0 — the observe-only readout. While
-    the loop ships at weight 0 this is the only number in the row that moves,
-    and hiding it would make the whole table read as zeros."""
-    return perf_req_of(rec, {"weight": 1.0})
-
-
 def perf_cell(rec, hdr) -> str:
-    """The PERF cell on an OPEN SCAN row: "BAR", the applied req, a
-    parenthesised would-be req while the loop is observe-only or the table is
-    stale, or blank when the row is neutral/unscored.
-
-    Parentheses mean NOT APPLIED. Printing "0.000" for a down-ranked row at
-    weight 0 would be true and useless; printing the bare req would be a lie.
-    """
+    """The PERF cell on an OPEN SCAN row: "BLOCK" / "(BLOCK)" when the block
+    is off or the table stale; the judging unit's roi_hist ("+0.145") /
+    "(+0.145)" when the blend is off or the table stale; blank when no unit
+    judges the row. Parentheses mean NOT APPLIED — printing a bare number
+    for a verdict that is not in force would be a lie."""
     if not isinstance(rec, dict):
         return ""
-    verdict = str(rec.get("verdict") or "neutral")
-    if verdict == "bar" and hdr.get("bar_on") and not hdr.get("stale"):
-        return "BAR"
-    if verdict == "bar":
-        return "(BAR)"
-    if verdict == "neutral":
-        return ""
-    req = perf_req_of(rec, hdr)
-    if req > 0 and not hdr.get("stale"):
-        return f"{req:.3f}"
-    return f"({perf_req_at_full_weight(rec):.3f})"
+    v = str(rec.get("verdict") or "")
+    fresh = not hdr.get("stale")
+    if v == "block":
+        return "BLOCK" if (hdr.get("block_on") and fresh) else "(BLOCK)"
+    if v == "allow":
+        roi = f"{_f(rec.get('roi_hist')):+.3f}"
+        return roi if (hdr.get("blend_on") and fresh) else f"({roi})"
+    return ""
 
 
 def perf_cells_for(table, rows, hdr) -> dict:
     """event -> PERF cell, for the OPEN SCAN rows only."""
     out = {}
     for r in rows:
-        _k, _u, rec = perf_record(table, r["event"])
+        _k, _u, rec = perf_record(table, r["event"], r.get("series"))
         cell = perf_cell(rec, hdr)
         if cell:
             out[r["event"]] = cell
     return out
 
 
-def perf_nonneutral(table) -> list:
-    """[(unit, key, record)] for every non-neutral record in the table, worst
-    dev first. Neutral records are the overwhelming majority and say nothing;
-    a bar or a down-rank is the whole point of the file."""
+def perf_judged(table) -> list:
+    """[(unit, key, record)] for every unit with a verdict (block or allow):
+    blocks first, worst roi_hist first; then allows, best first. An event
+    root that IS a series key carries the same markets as the series record
+    and is listed once, as the series. Units under the floor are not listed:
+    the bot treats them as unknown."""
     out = []
-    for unit, field in (("series", "series"), ("event", "events")):
+    series_keys = set(table.get("series") or {}) if isinstance(table.get("series"), dict) else set()
+    for unit, field in (("event", "events"), ("series", "series"), ("family", "families")):
         d = table.get(field) if isinstance(table.get(field), dict) else {}
-        for key, rec in sorted(d.items()):
-            if isinstance(rec, dict) and str(rec.get("verdict") or "neutral") \
-                    != "neutral":
+        for key, rec in d.items():
+            if not isinstance(rec, dict):
+                continue
+            if unit == "event" and key in series_keys:
+                continue
+            if str(rec.get("verdict") or "") in ("block", "allow"):
                 out.append((unit, key, rec))
-    out.sort(key=lambda t: (_f(t[2].get("dev")), t[1]))
+
+    def _k(t):
+        v = str(t[2].get("verdict") or "")
+        r = _f(t[2].get("roi_hist"))
+        return (0, r, t[1]) if v == "block" else (1, -r, t[1])
+    out.sort(key=_k)
     return out
 
 
 def perf_verdict_map(table) -> dict:
-    """{"series:KXFOO": "down_rank", ...} — the record this email persists so
+    """{"series:KXCPIYOY": "block", ...} — the record this email persists so
     the NEXT one can bold the rows whose verdict CHANGED. Same mechanism as
     the new-event marking (opportunistic_last_sent.json), for the same reason:
     a verdict that flipped overnight is the one thing in a 40-row table that
     a human has to see."""
-    return {f"{unit}:{key}": str(rec.get("verdict") or "neutral")
-            for unit, key, rec in perf_nonneutral(table)}
+    return {f"{unit}:{key}": str(rec.get("verdict") or "")
+            for unit, key, rec in perf_judged(table)}
 
 
 def previous_perf_verdicts():
@@ -843,18 +854,6 @@ def previous_perf_verdicts():
     return {str(k): str(v) for k, v in pv.items()}
 
 
-def _perf_rent_c_per_ct(rec) -> str:
-    """MODELLED rent in cents per contract for one record, or "" when the
-    scorer did not give enough to derive it. Never invented from a
-    denominator that is not in the file."""
-    if rec.get("rent_cents_per_contract") is not None:
-        return f"{_f(rec.get('rent_cents_per_contract')):.2f}"
-    ct = _f(rec.get("contracts_matured")) or _f(rec.get("contracts_filled"))
-    if ct <= 0:
-        return ""
-    return f"{_f(rec.get('rent_modelled')) * 100.0 / ct:.2f}"
-
-
 def _perf_num(v, fmt: str) -> str:
     """Blank for a field the scorer did not write; formatted otherwise. A
     missing number must never print as 0.00 — that is a measurement claim."""
@@ -866,36 +865,30 @@ def _perf_num(v, fmt: str) -> str:
         return ""
 
 
-def perf_unmarked_frac(table):
-    """The share of fills the mark hierarchy could not mark. Above 0.35 the
-    scorer forces a group neutral, so a drift toward it is visible BEFORE it
-    changes a verdict."""
-    cov = table.get("coverage") if isinstance(table.get("coverage"), dict) else {}
-    tier = table.get("tier") if isinstance(table.get("tier"), dict) else {}
-    if tier.get("unmarked_frac") is not None:
-        return _f(tier.get("unmarked_frac"))
-    fills = _f(cov.get("fills"))
-    if fills <= 0:
-        return None
-    return _f(cov.get("fills_unmarked")) / fills
+def _perf_basis(rec) -> str:
+    return {"est_floored": "est", "credited": "cred",
+            "mixed_by_period": "mixed"}.get(str(rec.get("rent_basis") or ""),
+                                            str(rec.get("rent_basis") or "")[:5])
 
 
 def scan_perf_text_block(table, hdr, cost, prev_verdicts=None) -> list:
     """The SCAN PERF block, plain text. Returns lines; never raises."""
-    L = ["SCAN PERF — open-scan performance loop (markout MEASURED, rent "
-         "MODELLED)"]
+    L = ["SCAN PERF — open-scan performance loop: historical ROI per event root "
+         "/ series / family (rent MEASURED where the ledger covers it, else "
+         "MODELLED; realized MEASURED; mtm a MODELLED mark)"]
     if not table:
-        L.append(f"no table — {SCAN_PERF_PATH} is absent or unreadable, so "
-                 f"every scan candidate ranks on gross ROI alone (today's "
+        L.append(f"no table — {SCAN_PERF_PATH} is absent or unreadable, so open "
+                 f"scan admits and ranks on the model's ROI alone (today's "
                  f"behaviour).")
         L.append(scan_perf_cost_line(cost))
         return L
     age = (f"{hdr['age_h']:.1f}h old" if hdr["age_h"] is not None
            else "age unknown")
-    w = hdr["weight"] if hdr["weight"] is not None else "?"
-    b = ("on" if hdr["bar_on"] else "off") if hdr["bar_on"] is not None else "?"
-    L.append(f"table generated {hdr['generated_at']} ({age})  |  WEIGHT={w}  "
-             f"|  BAR {b}   [weight/bar read from the {hdr['source']}]")
+    b = ("on" if hdr["block_on"] else "off") if hdr["block_on"] is not None else "?"
+    l = ("on" if hdr["blend_on"] else "off") if hdr["blend_on"] is not None else "?"
+    m = f" (m={_f(hdr['blend_m']):g})" if hdr.get("blend_m") is not None else ""
+    L.append(f"table generated {hdr['generated_at']} ({age})  |  BLOCK {b}  "
+             f"|  BLEND {l}{m}   [read from the {hdr['source']}]")
     _banner = sd.scan_perf_not_loaded_banner(hdr)
     if _banner:
         L.append(_banner)
@@ -906,29 +899,24 @@ def scan_perf_text_block(table, hdr, cost, prev_verdicts=None) -> list:
                  f"old policy, not the live one.")
     tier = table.get("tier") if isinstance(table.get("tier"), dict) else {}
     cov = table.get("coverage") if isinstance(table.get("coverage"), dict) else {}
-    L.append("coverage {} mkts / {} events / {} series | {} fills -> {} "
-             "episodes ({} matured) | risk-days {}".format(
+    L.append("coverage {} mkts / {} events / {} series | {} fills | risk-days {} | "
+             "ledger {}d old".format(
                  _perf_num(cov.get("markets"), ",.0f") or "?",
                  _perf_num(cov.get("events"), ",.0f") or "?",
                  _perf_num(cov.get("series"), ",.0f") or "?",
                  _perf_num(cov.get("fills"), ",.0f") or "?",
-                 _perf_num(cov.get("episodes"), ",.0f") or "?",
-                 _perf_num(cov.get("episodes_matured"), ",.0f") or "?",
-                 _perf_num(cov.get("risk_days"), ",.1f") or "?"))
-    L.append("tier markout {} c/ct [MEASURED] | rent {} [MODELLED, basis {}, "
-             "MEASURED credit that replaced an estimate ${}] "
-             "| mu_trading_only {} | mu_rent_blended {}".format(
-                 _perf_num(tier.get("markout_c_per_ct_24h"), "+.2f") or "?",
-                 "$" + (_perf_num(tier.get("rent_modelled_dollars"), ",.2f")
-                        or "?"),
+                 _perf_num(cov.get("risk_days"), ",.1f") or "?",
+                 _perf_num(tier.get("ledger_stale_days"), ".0f") or "?"))
+    L.append("tier roi_hist {} /$-day = (rent ${} [{}] + realized ${} [MEASURED] "
+             "+ mtm ${} [MODELLED mark]) / risk-days | trading-only {} | "
+             "measured-only {}".format(
+                 _perf_num(tier.get("roi_hist"), "+.5f") or "?",
+                 _perf_num(tier.get("rent_used_dollars"), ",.2f") or "?",
                  tier.get("rent_basis") or "?",
-                 _perf_num(tier.get("rent_measured_dollars"), ",.2f") or "0.00",
-                 _perf_num(tier.get("mu_trading_only"), "+.5f") or "?",
-                 _perf_num(tier.get("mu_rent_blended"), "+.5f") or "?"))
-    L.append("  mu_trading_only = MEASURED MARKOUT dollars per $-day at risk "
-             "— the ACTING statistic. realized_dollars / mtm_dollars are "
-             "stored separately and drive nothing, and the realized+MTM rate "
-             "is a DIFFERENT number; do not read one as the other.")
+                 _perf_num(tier.get("realized_dollars"), ",.2f") or "?",
+                 _perf_num(tier.get("mtm_dollars"), ",.2f") or "?",
+                 _perf_num(tier.get("roi_hist_trading"), "+.5f") or "?",
+                 _perf_num(tier.get("roi_hist_measured"), "+.5f") or "?"))
     L.append("MEASURED credits ${} on {} of {} events — its OWN column, never "
              "added to the MODELLED rent above (two scopes on one stream, "
              "neither contains the other).".format(
@@ -936,111 +924,95 @@ def scan_perf_text_block(table, hdr, cost, prev_verdicts=None) -> list:
                  or "0.00",
                  _perf_num(cov.get("credited_events"), ",.0f") or "0",
                  _perf_num(cov.get("events"), ",.0f") or "?"))
-    mix = tier.get("mark_source_mix") if isinstance(
-        tier.get("mark_source_mix"), dict) else {}
-    uf = perf_unmarked_frac(table)
-    L.append("marks: " + (", ".join(
-        f"{k} {_f(v):.2f}" for k, v in sorted(mix.items())) or "not reported")
-        + ("  |  unmarked {:.2f}".format(uf) if uf is not None
-           else "  |  unmarked n/a")
-        + "  (a drift toward one-sided/settlement marks shows up here BEFORE "
-          "it changes a verdict; above 0.35 unmarked a group is forced "
-          "neutral)")
+    floor = hdr.get("min_risk_days")
+    thr = hdr.get("block_roi")
+    L.append("rule: a unit with >= {} $-days of history BLOCKS new admissions "
+             "below {}/day; otherwise its history is BLENDED into the model's "
+             "ROI with weight n/(n+m). Event ROOT judges a re-listed event or a "
+             "new strike; the series a new root; the family a new series.".format(
+                 f"{floor:.0f}" if floor is not None else "?",
+                 f"{thr:+.2f}" if thr is not None else "?"))
 
-    # ---- cohorts, BOTH bases, acting column marked ------------------------
-    basis = hdr.get("basis") or "trading"
-    acting = "trading" if basis != "blend" else "blend"
-    cohorts = table.get("cohorts") if isinstance(table.get("cohorts"), dict) else {}
+    # ---- the units --------------------------------------------------------
+    judged = perf_judged(table)
     L.append("")
-    L.append("COHORTS — both bases; '*' marks the ACTING column "
-             f"(score_basis={basis}). dev is MEASURED deviation from the tier "
-             f"centre, in $/day per $ at risk.")
-    L.append("{:<7}{:<10}{:>6}{:>5}{:>5}{:>11}{:>10}{:>10}{:>10}{:>10}  {}"
-             .format("DIM", "BUCKET", "MKTS", "SER", "EVT", "$-DAYS",
-                     "RAW_TR" + ("*" if acting == "trading" else ""),
-                     "DEV_TR" + ("*" if acting == "trading" else ""),
-                     "RAW_BL" + ("*" if acting == "blend" else ""),
-                     "DEV_BL" + ("*" if acting == "blend" else ""), "MUTED"))
-    dims = [d for d in _PERF_DIM_ORDER if d in cohorts]
-    dims += [d for d in sorted(cohorts) if d not in _PERF_DIM_ORDER]
-    any_bucket = False
-    for dim in dims:
-        c = cohorts.get(dim) or {}
-        for bkt in (c.get("buckets") or []):
-            if not isinstance(bkt, dict):
-                continue
-            any_bucket = True
-            L.append("{:<7}{:<10}{:>6}{:>5}{:>5}{:>11}{:>10}{:>10}{:>10}{:>10}"
-                     "  {}".format(
-                         dim[:6], str(bkt.get("key") or "")[:9],
-                         _perf_num(bkt.get("n_markets"), ",.0f"),
-                         _perf_num(bkt.get("n_series"), ",.0f"),
-                         _perf_num(bkt.get("n_events"), ",.0f"),
-                         _perf_num(bkt.get("risk_days"), ",.1f"),
-                         _perf_num(bkt.get("raw_trading"), "+.4f"),
-                         _perf_num(bkt.get("dev_trading"), "+.4f"),
-                         _perf_num(bkt.get("raw_blend"), "+.4f"),
-                         _perf_num(bkt.get("dev_blend"), "+.4f"),
-                         "muted" if bkt.get("muted") else ""))
-    if not any_bucket:
-        L.append("  (no cohort buckets in the table)")
-
-    # ---- non-neutral keys --------------------------------------------------
-    nn = perf_nonneutral(table)
-    L.append("")
-    if not nn:
-        L.append("NON-NEUTRAL KEYS: none — every scored series and event root "
-                 "is neutral in this table.")
+    if not judged:
+        L.append("UNITS: none with a verdict — every scored unit is under the "
+                 "floor, so the bot treats them all as unknown.")
     else:
-        L.append("NON-NEUTRAL KEYS — '!' marks a verdict that CHANGED since "
-                 "the previous email. REQ is at the weight in force; a "
-                 "parenthesised value is what it WOULD be at WEIGHT=1.0 and "
-                 "is not applied. CRED$ is MEASURED money and is NOT part of "
-                 "RENT.")
-        L.append("{:<26}{:<8}{:>4}{:>6}{:>9}{:>10}{:>10}{:>10}  {:<10}{:<12}"
-                 "{:>9}".format("KEY", "UNIT", "EP", "MKTS", "MO24c",
-                                "RENTc/ct", "DEV", "REQ", "VERDICT", "UNTIL",
-                                "CRED$"))
-        for unit, key, rec in nn:
+        L.append("UNITS — blocks first (worst first), then allows (best first). "
+                 "'!' marks a verdict that CHANGED since the previous email. A "
+                 "parenthesised cell is NOT APPLIED. CRED$ is MEASURED money and "
+                 "is NOT part of RENT$.")
+        L.append("{:<26}{:<8}{:>5}{:>4}{:>9}{:>8}{:<6}{:>8}{:>8}{:>9}  {:<8}{:<17}"
+                 "{:>8}".format("KEY", "UNIT", "MKTS", "EV", "$-DAYS", "RENT$",
+                                " BASIS", "REAL$", "MTM$", "ROI/DAY", "VERDICT",
+                                "UNTIL", "CRED$"))
+        shown = 0
+        for unit, key, rec in judged:
+            if str(rec.get("verdict")) == "allow" and shown >= 25:
+                continue
+            shown += 1 if str(rec.get("verdict")) == "allow" else 0
             vk = f"{unit}:{key}"
             changed = (prev_verdicts is not None
-                       and prev_verdicts.get(vk)
-                       != str(rec.get("verdict") or "neutral"))
-            req = perf_req_of(rec, hdr)
-            req_s = (f"{req:.4f}" if req > 0 and not hdr.get("stale")
-                     else f"({perf_req_at_full_weight(rec):.4f})")
-            L.append("{:<26}{:<8}{:>4}{:>6}{:>9}{:>10}{:>10}{:>10}  {:<10}"
-                     "{:<12}{:>9}".format(
+                       and prev_verdicts.get(vk) != str(rec.get("verdict") or ""))
+            L.append("{:<26}{:<8}{:>5}{:>4}{:>9}{:>8} {:<5}{:>8}{:>8}{:>9}  {:<8}"
+                     "{:<17}{:>8}".format(
                          (("!" if changed else "") + key)[:25],
                          unit[:7],
-                         _perf_num(rec.get("n_episodes"), ",.0f"),
                          _perf_num(rec.get("n_markets"), ",.0f"),
-                         _perf_num(rec.get("markout_c_per_ct_24h"), "+.2f"),
-                         _perf_rent_c_per_ct(rec),
-                         _perf_num(rec.get("dev"), "+.4f"),
-                         req_s,
-                         str(rec.get("verdict") or "")[:9],
-                         str(rec.get("until") or "")[:11],
+                         _perf_num(rec.get("n_events"), ",.0f"),
+                         _perf_num(rec.get("risk_days"), ",.1f"),
+                         _perf_num(rec.get("rent_used"), "+.2f"),
+                         _perf_basis(rec),
+                         _perf_num(rec.get("realized_dollars"), "+.2f"),
+                         _perf_num(rec.get("mtm_dollars"), "+.2f"),
+                         _perf_num(rec.get("roi_hist"), "+.4f"),
+                         str(rec.get("verdict") or "")[:6],
+                         str(rec.get("until") or "")[:16].replace("T", " "),
                          _perf_num(rec.get("credited_measured"), ",.2f")))
+        n_allow = sum(1 for _u, _k, r in judged if str(r.get("verdict")) == "allow")
+        if n_allow > 25:
+            L.append(f"  ... {n_allow - 25} more allowed unit(s) not listed")
     if prev_verdicts is None:
         L.append("  (no previous SCAN PERF record on file, so no verdict is "
                  "marked changed this time)")
+    n_ins = 0
+    for field in ("events", "series", "families"):
+        d = table.get(field) if isinstance(table.get(field), dict) else {}
+        n_ins += sum(1 for r in d.values()
+                     if isinstance(r, dict) and r.get("verdict") == "insufficient")
+    L.append(f"  {n_ins} unit(s) under the floor are not listed; the bot treats "
+             f"them as unknown (model alone).")
 
-    # ---- bars --------------------------------------------------------------
-    bars = [(u, k, r) for u, k, r in nn
-            if str(r.get("verdict") or "") == "bar"]
+    # ---- families ---------------------------------------------------------
+    fams = table.get("families") if isinstance(table.get("families"), dict) else {}
     L.append("")
-    if bars:
-        L.append("ACTIVE BARS ({}), BAR {}:".format(len(bars), b))
-        for unit, key, rec in bars:
-            L.append(f"  {unit}:{key} until {rec.get('until') or '?'}")
-    else:
-        L.append("bars: 0 live. The bar fires on nothing in this table"
-                 + (" and BAR is off." if b == "off" else "."))
-    unmatched = table.get("unmatched_bar_keys") or []
-    L.append("unmatched bar keys (a bar whose group produced no scan "
-             "candidate in 24h — a dead bar, visible rather than silently "
-             "mis-firing): "
+    L.append("FAMILIES (grouped series share one history for a NEW series):")
+    for name, rec in fams.items():
+        if not isinstance(rec, dict):
+            continue
+        members = rec.get("members") or []
+        L.append("  {:<20} {:<12} {} member(s){}  roi_hist {} on {} $-days".format(
+            name[:20], str(rec.get("verdict") or "?"), len(members),
+            (": " + ", ".join(str(x) for x in members[:8])
+             + (" ..." if len(members) > 8 else "")) if members else "",
+            _perf_num(rec.get("roi_hist"), "+.4f") or "?",
+            _perf_num(rec.get("risk_days"), ",.0f") or "?"))
+    if not fams:
+        L.append("  (none in the table)")
+
+    # ---- blocks -----------------------------------------------------------
+    lim = table.get("limits") if isinstance(table.get("limits"), dict) else {}
+    L.append("")
+    L.append("blocks: {} event root(s), {} series, {} family(ies) in the file; "
+             "BLOCK {}.".format(_perf_num(lim.get("blocked_events"), ",.0f") or "?",
+                                _perf_num(lim.get("blocked_series"), ",.0f") or "?",
+                                _perf_num(lim.get("blocked_families"), ",.0f") or "?",
+                                b))
+    unmatched = table.get("unmatched_block_keys") or []
+    L.append("unmatched block keys (a block whose unit produced no scan "
+             "candidate in 24h — visible rather than silently mis-firing): "
              + (", ".join(str(x) for x in unmatched[:12]) if unmatched
                 else "none"))
 
@@ -1059,41 +1031,45 @@ def scan_perf_html_block(table, hdr, cost, prev_verdicts=None) -> str:
     can never appear in one and not the other."""
     h = ['<div style="font-size:15px;font-weight:600;margin:18px 0 2px">'
          'Scan perf <span style="color:#888;font-weight:400">&mdash; '
-         'open-scan performance loop (markout MEASURED, rent MODELLED)'
-         '</span></div>']
+         'open-scan performance loop: historical ROI per event root / series '
+         '/ family</span></div>']
     if not table:
         h.append('<div style="color:#666;font-size:13px">no table &mdash; '
-                 '<code>{}</code> is absent or unreadable, so every scan '
-                 'candidate ranks on gross ROI alone (today&rsquo;s '
+                 '<code>{}</code> is absent or unreadable, so open scan admits '
+                 'and ranks on the model&rsquo;s ROI alone (today&rsquo;s '
                  'behaviour).</div>'.format(SCAN_PERF_PATH))
         h.append('<div style="color:#555;font-size:13px;margin-top:4px">'
                  '{}</div>'.format(scan_perf_cost_line(cost)))
         return "".join(h)
     age = (f"{hdr['age_h']:.1f}h old" if hdr["age_h"] is not None
            else "age unknown")
-    w = hdr["weight"] if hdr["weight"] is not None else "?"
-    b = ("on" if hdr["bar_on"] else "off") if hdr["bar_on"] is not None else "?"
+    b = ("on" if hdr["block_on"] else "off") if hdr["block_on"] is not None else "?"
+    l = ("on" if hdr["blend_on"] else "off") if hdr["blend_on"] is not None else "?"
+    m = f" (m={_f(hdr['blend_m']):g})" if hdr.get("blend_m") is not None else ""
     h.append('<div style="color:#555;font-size:13px">table generated '
-             '<b>{}</b> ({}) &nbsp;&middot;&nbsp; <b>WEIGHT={}</b> '
-             '&nbsp;&middot;&nbsp; <b>BAR {}</b> <span style="color:#999">'
-             '(weight/bar read from the {})</span></div>'.format(
-                 hdr["generated_at"], age, w, b, hdr["source"]))
+             '<b>{}</b> ({}) &nbsp;&middot;&nbsp; <b>BLOCK {}</b> '
+             '&nbsp;&middot;&nbsp; <b>BLEND {}{}</b> <span style="color:#999">'
+             '(read from the {})</span></div>'.format(
+                 hdr["generated_at"], age, b, l, m, hdr["source"]))
     if hdr["stale"]:
         h.append('<div style="color:#b00;font-size:13px;font-weight:700">'
                  'STALE &mdash; verdicts not applied. Above {:.0f}h the bot '
                  'clears its tables and every verdict below goes neutral.'
                  '</div>'.format(SCAN_PERF_MAX_AGE_H))
-    # The header lines above are already rendered as HTML; skip exactly those
-    # from the text twin (title, generated line, and the STALE line when it is
-    # present) so nothing is printed twice.
-    skip = 2 + (1 if hdr["stale"] else 0)
-    for line in scan_perf_text_block(table, hdr, cost, prev_verdicts)[skip:]:
-        if not line.strip():
+    # The title, the generated line and the STALE line are rendered above as
+    # HTML; everything else comes from the text twin, so nothing can appear
+    # in one renderer and not the other. The not-loaded banner gets its own
+    # styling; a row whose verdict CHANGED carries the '!' marker in its
+    # first column and is bolded whole.
+    for line in scan_perf_text_block(table, hdr, cost, prev_verdicts)[2:]:
+        if not line.strip() or line.startswith("STALE — verdicts not applied"):
             continue
         esc = (line.replace("&", "&amp;").replace("<", "&lt;")
                    .replace(">", "&gt;"))
-        # a verdict that CHANGED since the previous email carries the '!'
-        # marker in its first column; the HTML twin bolds the whole row
+        if line.startswith("!! THE BOT HAS NOT LOADED"):
+            h.append('<div style="color:#b00;font-size:13px;font-weight:700">'
+                     '{}</div>'.format(esc))
+            continue
         if line.startswith("!"):
             esc = f"<b>{esc}</b>"
         h.append('<div style="font-family:Consolas,monospace;font-size:11px;'
@@ -1411,13 +1387,15 @@ def build_report(now_utc):
     except Exception as e:                                  # noqa: BLE001
         log(f"opportunistic scan-perf block unavailable ({e!r}); the SCAN "
             f"PERF section will print 'no table'")
-        perf_table, perf_cost = {}, {"window_h": 24, "seats_empty": 0,
-                                     "barred": 0, "floored_out": 0,
+        perf_table, perf_cost = {}, {"window_h": 24, "seats_at_risk": 0,
+                                     "blocked": 0, "floored_out": 0,
                                      "forgone_dollars_per_day": 0.0,
                                      "seats_cap": getattr(imm, "SCAN_TOP_N", 0)}
         perf_hdr = {"present": False, "generated_at": "", "age_h": None,
-                    "stale": False, "weight": None, "bar_on": None,
-                    "source": "unknown", "basis": "", "max_req": None}
+                    "stale": False, "block_on": None, "blend_on": None,
+                    "blend_m": None, "source": "unknown", "min_risk_days": None,
+                    "block_roi": None, "loaded_by_bot": None,
+                    "bot_generated_at": ""}
     perf_cells = perf_cells_for(perf_table, scan_rows, perf_hdr)
     perf_verdicts = perf_verdict_map(perf_table)
     prev_perf = previous_perf_verdicts()
