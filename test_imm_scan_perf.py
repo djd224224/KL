@@ -233,11 +233,10 @@ class Base(unittest.TestCase):
         os.makedirs(self.sd, exist_ok=True)
         os.makedirs(self.wd, exist_ok=True)
         self.s = Sinks(self.sd)
-        self._old = (M.STATUS_DIR, M.WORK_DIR, M.DIM_CLIP, M.BAR_MIN_EPISODES)
+        self._old = (M.STATUS_DIR, M.WORK_DIR, M.MIN_RISK_DAYS, M.BLOCK_ROI)
 
     def tearDown(self):
-        (M.STATUS_DIR, M.WORK_DIR, M.DIM_CLIP, M.BAR_MIN_EPISODES) = self._old
-        os.environ.pop("IMM_SCAN_PERF_BAR", None)
+        (M.STATUS_DIR, M.WORK_DIR, M.MIN_RISK_DAYS, M.BLOCK_ROI) = self._old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # -- helpers ----------------------------------------------------------
@@ -440,64 +439,6 @@ class TestMarkHierarchy(Base):
 
 class TestGroupsAndExposure(Base):
 
-    def _thin_series(self):
-        """3 markets, 4 matured fills, 3 of them UNMARKED (75% > 35%)."""
-        t_fill = T0 + timedelta(hours=1)
-        for i in range(3):
-            tkr = f"KXTHIN-26SEP2{i}-T1"
-            self.simple_market(tkr, hours=2)
-            self.s.fill(t_fill, tkr, 10, px=40)
-        # only the first gets a mark at the horizon
-        self.s.quotes("KXTHIN-26SEP20-T1", t_fill + timedelta(hours=24)
-                      - timedelta(seconds=30), 2, bid=9, ask=11)
-        self.s.fill(t_fill + timedelta(hours=2), "KXTHIN-26SEP20-T1", 10, px=40,
-                    pos_before=10.0)
-
-    def test_data_thin_group_is_forced_neutral_and_can_never_be_barred(self):
-        """SPEC 2.4: any group over 35% unmarked is forced to
-        verdict "neutral" / cohort "data_thin" and can never be barred —
-        66% of the acting signal must not be a mark on a book the tier itself
-        measures as dead."""
-        self._thin_series()
-        sc = self.build()
-        rec = sc.series_recs["KXTHIN"]
-        self.assertEqual(rec["cohort"], "data_thin")
-        self.assertEqual(rec["verdict"], "neutral")
-        self.assertEqual(rec["dev"], 0.0)
-        self.assertNotIn("until", rec)
-
-    def test_bucket_is_muted_below_five_series_or_three_events(self):
-        """SPEC 3.4 mute rules: < 5 distinct series OR < 3 distinct events.
-
-        The two conditions are SEPARATED here on purpose. The first cut used
-        one fixture bucket with 2 series AND 2 events, so dropping either
-        term from the predicate left the test green and neither condition was
-        pinned on its own."""
-        # (a) SERIES condition alone: 4 series spread over 4 events
-        for i in range(4):
-            self.simple_market(f"KXW{i}-26SEP20-T1", bid=40, ask=41, hours=3)
-        # (b) EVENTS condition alone: 6 series concentrated in 2 events
-        for i in range(6):
-            self.simple_market(f"KXN{i}-26SEP20-T1", bid=40, ask=43, hours=3,
-                               event=f"KXSHARED{i % 2}-26SEP20")
-        # (c) neither: 5 series over exactly 3 events -> NOT muted
-        for i in range(5):
-            self.simple_market(f"KXK{i}-26SEP20-T1", bid=40, ask=47, hours=3,
-                               event=f"KXTRIO{i % 3}-26SEP20")
-        sc = self.build()
-        by_key = {b["key"]: b for b in sc.cohorts["spread"]["buckets"]}
-        a, b, c = by_key["1c"], by_key["2-4c"], by_key["5-9c"]
-        self.assertEqual((a["n_series"], a["n_events"]), (4, 4))
-        self.assertTrue(a["muted"], "4 distinct series must mute on the "
-                                    "series condition alone")
-        self.assertEqual(a["dev_trading"], 0.0)
-        self.assertEqual((b["n_series"], b["n_events"]), (6, 2))
-        self.assertTrue(b["muted"], "2 distinct events must mute on the "
-                                    "events condition alone")
-        self.assertEqual(b["dev_trading"], 0.0)
-        self.assertEqual((c["n_series"], c["n_events"]), (5, 3))
-        self.assertFalse(c["muted"], "5 series / 3 events is exactly at both "
-                                     "floors and must NOT mute")
 
     def test_adopted_position_is_capped_at_own_fill_contracts(self):
         """SPEC 2.5 adopted-position rule. MEASURED: KXAALA-27JANPLF-83 held
@@ -559,7 +500,7 @@ class TestGroupsAndExposure(Base):
         self.assertNotAlmostEqual(sc.event_rent[M.ev_of(tkr)],
                                   7.25 + est_side + credited_est)
         rec = sc.series_recs["KXCRED"]
-        self.assertGreater(rec["rent_measured_frac"], 0.0)
+        self.assertGreater(rec["rent_measured_dollars"], 0.0)
         self.assertIn(rec["rent_basis"], ("credited", "mixed_by_period"))
 
 
@@ -681,29 +622,6 @@ class TestIdempotenceAndGuards(Base):
         self.assertIn("exposure-drop guard skipped", txt)
         self.assertIn("BACKWARD re-score", txt)
 
-    def test_scorer_refuses_to_write_on_a_clamp_storm(self):
-        """SPEC 4.4 guard 3: a uniformly negated file is individually in
-        range and passes every NaN/schema check — the clamp storm is the
-        sign-flip detector."""
-        # TWO groups of 6 series each, in different spread/mid/dtc/pool
-        # buckets and with opposite markouts, so every unmuted bucket has a
-        # real (non-zero) deviation to be clamped.
-        t_fill = T0 + timedelta(hours=1)
-        t_mark = t_fill + timedelta(hours=24)
-        groups = [("A", 40, 41, 40.0, 70, "26SEP20", 30.0),
-                  ("B", 15, 22, 18.0, 5, "26DEC20", 10.0)]
-        for tag, bid, ask, px, mark, dt, pool in groups:
-            for i in range(6):
-                tkr = f"KX{tag}{i}-{dt}-T1"
-                self.simple_market(tkr, hours=6, bid=bid, ask=ask, pool=pool)
-                self.s.fill(t_fill, tkr, 10, px=px)
-                self.s.quotes(tkr, t_mark - timedelta(seconds=30), 2,
-                              bid=mark - 1, ask=mark + 1)
-        M.DIM_CLIP = 1e-4          # force every dev onto a clamp
-        rc, txt = self.run_cli()
-        self.assertEqual(rc, 4)
-        self.assertIn("CLAMP STORM", txt)
-        self.assertFalse(os.path.exists(os.path.join(self.wd, M.TABLE_NAME)))
 
     def test_scorer_does_not_write_reward_est_cache(self):
         """SPEC 2.6 / judge must_fix J2-10: rebuild_estimates() rewrites the
@@ -749,277 +667,8 @@ class TestIdempotenceAndGuards(Base):
             M.check_write_path(os.path.join(self.sd, "imm_state.json"))
 
 
-# ===================================================================== 43-48
-
-class TestVerdictsAndBases(Base):
-
-    def _bar_corpus(self, n_events=4, n_strikes=3, mark=20, spread_events=True):
-        """>=30 episodes over >=3 markets and >=2 days, all adverse."""
-        for e in range(n_events):
-            for k in range(n_strikes):
-                tkr = f"KXBAR-26SEP2{e}-T{k}"
-                self.simple_market(tkr, hours=6, bid=40, ask=42)
-                for h in range(3):
-                    day = T0 + timedelta(days=h % 2)
-                    t_fill = day + timedelta(hours=1 + h)
-                    self.s.fill(t_fill, tkr, 10, px=40,
-                                pos_before=10.0 * h)
-                    self.s.quotes(tkr, t_fill + timedelta(hours=24)
-                                  - timedelta(seconds=30), 2,
-                                  bid=mark - 1, ask=mark + 1)
-
-    def test_bar_requires_thirty_episodes_three_markets_and_a_negative_ci(self):
-        """SPEC 3.6: n_episodes >= 30 (the ratified section-6 floor,
-        re-expressed in EPISODE units — a TIGHTENING, recorded as a
-        reinterpretation), n_markets >= 3, n_days >= 2, a negative one-sided
-        90% bootstrap upper bound and the same verdict on the previous run."""
-        os.environ["IMM_SCAN_PERF_BAR"] = "1"
-        self._bar_corpus()
-        sc = self.build()
-        rec = sc.series_recs["KXBAR"]
-        self.assertGreaterEqual(rec["n_episodes"], 30)
-        self.assertGreaterEqual(rec["n_markets"], 3)
-        self.assertGreaterEqual(rec["n_days"], 2)
-        self.assertIsNotNone(rec["ci_hi"])
-        self.assertLess(rec["ci_hi"], 0.0)
-        self.assertTrue(rec["bar_eligible"])
-        # run 1: eligible but not sustained -> down_rank only
-        self.assertEqual(rec["verdict"], "down_rank")
-        rc1, _ = self.run_cli()
-        self.assertEqual(rc1, 0)
-        rc2, _ = self.run_cli()
-        self.assertEqual(rc2, 0)
-        tbl = self.read_table()
-        self.assertEqual(tbl["series"]["KXBAR"]["verdict"], "bar")
-        self.assertIn("until", tbl["series"]["KXBAR"])
-
-    def test_a_ci_straddling_zero_never_bars(self):
-        """SPEC 3.6 condition 3: 40 episodes are not enough if the interval
-        covers 0. 'do not claim an effect the CI does not support'."""
-        os.environ["IMM_SCAN_PERF_BAR"] = "1"
-        # alternate favourable / adverse marks -> the CI straddles zero
-        for e in range(4):
-            for k in range(3):
-                tkr = f"KXMIX-26SEP2{e}-T{k}"
-                self.simple_market(tkr, hours=6, bid=40, ask=42)
-                mark = 20 if (e + k) % 2 else 60
-                for h in range(3):
-                    day = T0 + timedelta(days=h % 2)
-                    t_fill = day + timedelta(hours=1 + h)
-                    self.s.fill(t_fill, tkr, 10, px=40, pos_before=10.0 * h)
-                    self.s.quotes(tkr, t_fill + timedelta(hours=24)
-                                  - timedelta(seconds=30), 2,
-                                  bid=mark - 1, ask=mark + 1)
-        sc = self.build()
-        rec = sc.series_recs["KXMIX"]
-        self.assertGreaterEqual(rec["n_episodes"], 30)
-        self.assertFalse(rec["bar_eligible"])
-        self.assertNotEqual(rec["verdict"], "bar")
-
-    def test_bootstrap_is_clustered_by_market(self):
-        """SPEC test 44: three strikes of one event are ONE draw.
-
-        DEVIATION, recorded: SPEC 3.6's prose says "clustered by market" while
-        this test defines the cluster as the EVENT; both cannot hold. The
-        event is taken because three strikes reprice on the same print
-        (KXCPIYOY's three strikes all moved on the same September CPI) and the
-        coarser cluster gives the WIDER interval, i.e. it bars LESS often."""
-        self._bar_corpus(n_events=1, n_strikes=3)
-        sc = self.build()
-        tickers = [t for t in sc.markets if t.startswith("KXBAR")]
-        self.assertEqual(len({M.ev_of(t) for t in tickers}), 1)
-        # one cluster -> every resample is the same draw -> a degenerate CI
-        ci = sc._bootstrap_ci_hi(tickers, 0.0, "t")
-        self.assertIsNone(ci)
-        self._bar_corpus(n_events=3, n_strikes=3)
-        sc2 = self.build()
-        t2 = [t for t in sc2.markets if t.startswith("KXBAR")]
-        self.assertIsNotNone(sc2._bootstrap_ci_hi(t2, 0.0, "t"))
-
-    def test_ratchet_eases_by_at_most_one_cent_per_run(self):
-        """SPEC 3.7: relaxing is bounded at RATCHET_EASE_PER_RUN per run, on
-        BOTH the cohort-bucket path (_apply_ratchet) and the series path
-        (_build_units). The other half of the asymmetry -- deepening is
-        immediate -- needs its own fixture and lives in the sibling test."""
-        self._bar_corpus(n_events=3, n_strikes=3)
-        rc, _ = self.run_cli()
-        self.assertEqual(rc, 0)
-        prev = self.read_table()
-        dim = "spread"
-        b = next(x for x in prev["cohorts"][dim]["buckets"] if x["key"] == "2-4c")
-        deep = -0.035
-        b["dev_trading"] = deep
-        prev["series"]["KXBAR"]["dev"] = deep
-        M.WORK_DIR = self.wd
-        M.atomic_write_json(os.path.join(self.wd, M.TABLE_NAME), prev)
-        sc = self.build()
-        got = next(x for x in sc.cohorts[dim]["buckets"] if x["key"] == "2-4c")
-        self.assertLessEqual(got["dev_trading"], deep + M.RATCHET_EASE_PER_RUN + 1e-9)
-        self.assertGreater(sc.ratchet_eased, 0)
-        self.assertLessEqual(sc.series_recs["KXBAR"]["dev"],
-                             deep + M.RATCHET_EASE_PER_RUN + 1e-9)
-    def _mixed_corpus(self):
-        """KXBAR adverse, four favourable neighbours in other series/events.
-        _bar_corpus alone puts the WHOLE tier in one series and one bucket,
-        so y == y_cohort == mu and every unconstrained dev is 0.0 -- nothing
-        to deepen to, which is why the deepening half needs its own fixture."""
-        self._bar_corpus(n_events=3, n_strikes=3, mark=20)
-        for e in range(4):
-            tkr = f"KXGOOD{e}-26SEP2{e}-T1"
-            self.simple_market(tkr, hours=6, bid=40, ask=42)
-            for h in range(3):
-                day = T0 + timedelta(days=h % 2)
-                t = day + timedelta(hours=1 + h)
-                self.s.fill(t, tkr, 10, px=40, pos_before=10.0 * h)
-                self.s.quotes(tkr, t + timedelta(hours=24)
-                              - timedelta(seconds=30), 2, bid=59, ask=61)
-
-    def _write_prev(self, dev):
-        M.WORK_DIR = self.wd
-        M.atomic_write_json(os.path.join(self.wd, M.TABLE_NAME), {
-            "version": 1, "cohorts": {}, "events": {},
-            "series": {"KXBAR": {"dev": dev, "verdict": "down_rank"}}})
-
-    def test_ratchet_deepens_immediately_against_an_unconstrained_build(self):
-        """SPEC 3.7's ASYMMETRY: easing is bounded, deepening is not.
-
-        The reference has to be an UNCONSTRAINED build -- no previous table
-        at all. Comparing one constrained build against another constrained
-        build against the SAME previous table moves both sides together under
-        any ratchet rule, symmetric or not, so a symmetric clamp (which
-        destroys the asymmetry this rule exists for) passed that comparison.
-        """
-        self._mixed_corpus()
-        free = self.build().series_recs["KXBAR"]["dev"]
-        self.assertLess(free, -M.RATCHET_EASE_PER_RUN - 1e-9,
-                        "fixture too weak: the unconstrained dev must be "
-                        "deeper than one ratchet step, or a symmetric clamp "
-                        "would be invisible")
-        # a SHALLOWER previous value must not hold the deepening up. Under a
-        # symmetric clamp this would come back at
-        # prev + RATCHET_EASE_PER_RUN = -0.01 instead.
-        self._write_prev(0.0)
-        self.assertAlmostEqual(self.build().series_recs["KXBAR"]["dev"], free)
-        self._write_prev(-0.005)
-        self.assertAlmostEqual(self.build().series_recs["KXBAR"]["dev"], free)
-        # (the EASING bound is pinned by the sibling test above, on both the
-        # bucket path and this same series path.)
-
-    def test_both_bases_are_emitted_and_trading_is_the_acting_one(self):
-        """SPEC 3.2 / judge must_fix J1-6: scoring NET softens the largest
-        loss cohort (mid 30-70c is -150.7 trading but only -9.8 net) and the
-        tier's realization factor is MEASURED on 2 of 83 events. Both bases
-        are printed every run; only `trading` acts."""
-        self._bar_corpus(n_events=3, n_strikes=3)
-        rc, txt = self.run_cli(write=False)
-        self.assertEqual(rc, 0)
-        self.assertIn("acting column = trading", txt)
-        sc = self.build()
-        tbl = sc.table()
-        self.assertEqual(tbl["params"]["score_basis"], "trading")
-        for dim in M.DIM_ORDER:
-            for b in tbl["cohorts"][dim]["buckets"]:
-                for f in ("raw_trading", "dev_trading", "raw_blend", "dev_blend"):
-                    self.assertIn(f, b)
-                    self.assertIsInstance(b[f], float)
-        self.assertIn("mu_trading_only", tbl["tier"])
-        self.assertIn("mu_rent_blended", tbl["tier"])
-        sc_t = self.build(score_basis="trading")
-        sc_b = self.build(score_basis="blend")
-        tk = sorted(sc_t.markets)[0]
-        self.assertEqual(sc_t.adj_struct(tk)[0], sc_t.adj_struct(tk, "trading")[0])
-        self.assertEqual(sc_b.score_basis, "blend")
-
-    def test_frozen_edges_hash_matches_the_constant(self):
-        """SPEC 3.3 / judge must_fix J1-3: the bucket edges are PRE-REGISTERED
-        and FROZEN. A silent edit is specification search after the fact."""
-        self.assertEqual(M.edges_sha256(), M.FROZEN_EDGES_SHA256)
-        for dim in M.DIM_ORDER:
-            self.assertIn(dim, M.COHORT_EDGES)
-            self.assertEqual(len(M.COHORT_EDGES[dim]["buckets"]), 5)
-        mutated = json.loads(json.dumps(M.COHORT_EDGES))
-        mutated["spread"]["buckets"][0] = ["1c", 0, 2]
-        self.assertNotEqual(M.edges_sha256(mutated), M.FROZEN_EDGES_SHA256)
-
-    def test_refit_edges_stamps_the_flag_and_a_mutated_constant_is_refused(self):
-        """SPEC 4.3: --refit-edges stamps edges_refit:true (the loader refuses
-        it while IMM_SCAN_PERF_REQUIRE_FROZEN_EDGES=1); without the flag a
-        changed edge table aborts the run."""
-        self._bar_corpus(n_events=3, n_strikes=3)
-        rc, _ = self.run_cli("--refit-edges")
-        self.assertEqual(rc, 0)
-        tbl = self.read_table()
-        self.assertTrue(tbl["params"]["edges_refit"])
-        old = M.FROZEN_EDGES_SHA256
-        try:
-            M.FROZEN_EDGES_SHA256 = "deadbeef"
-            rc2, txt = self.run_cli()
-            self.assertEqual(rc2, 1)
-            self.assertIn("pre-registered edges were modified", txt)
-        finally:
-            M.FROZEN_EDGES_SHA256 = old
-
-
 class TestFileShape(Base):
 
-    def test_written_table_matches_the_spec_section_5_shape(self):
-        """SPEC 5: the bot's loader validates against this schema, so the
-        field names and types are the contract."""
-        for i in range(3):
-            self.simple_market(f"KXS{i}-26SEP20-T1", hours=6)
-        self.s.fill(T0 + timedelta(hours=1), "KXS0-26SEP20-T1", 10, px=40)
-        self.s.quotes("KXS0-26SEP20-T1", T0 + timedelta(hours=25)
-                      - timedelta(seconds=30), 2, bid=29, ask=31)
-        rc, _ = self.run_cli()
-        self.assertEqual(rc, 0)
-        tbl = self.read_table()
-        self.assertEqual(tbl["version"], 1)
-        for k in ("generated_at", "generated_by", "window", "params", "coverage",
-                  "tier", "cohorts", "series", "events", "markets", "limits",
-                  "audit", "unmatched_bar_keys", "warnings", "notes"):
-            self.assertIn(k, tbl)
-        for k in ("score_basis", "dim_clip", "adj_clip", "max_req",
-                  "cohort_edges_sha256", "edges_refit"):
-            self.assertIn(k, tbl["params"])
-        for dim in M.DIM_ORDER:
-            blk = tbl["cohorts"][dim]
-            self.assertIn("field", blk)
-            self.assertIn("assign", blk)
-            los = [b["lo"] for b in blk["buckets"]]
-            self.assertEqual(los, sorted(los))
-            for b in blk["buckets"]:
-                self.assertIsInstance(b["centre"], float)
-                self.assertLessEqual(abs(b["dev_trading"]), tbl["params"]["dim_clip"] + 1e-12)
-                self.assertLessEqual(abs(b["dev_blend"]), tbl["params"]["dim_clip"] + 1e-12)
-        for rec in list(tbl["series"].values()) + list(tbl["events"].values()):
-            self.assertIn(rec["verdict"], ("neutral", "down_rank", "bar"))
-            self.assertEqual("until" in rec, rec["verdict"] == "bar")
-        self.assertLessEqual(tbl["limits"]["barred_series"] +
-                             tbl["limits"]["barred_events"], M.MAX_BARRED_FILE)
-        self.assertLessEqual(tbl["limits"]["bar_frac_universe"], 0.25)
-        self.assertEqual(tbl["audit"]["counterfactual_label"],
-                         "IN-SAMPLE, MODELLED COUNTERFACTUAL")
-        self.assertTrue(os.path.exists(os.path.join(self.wd, M.HISTORY_NAME)))
-        with open(os.path.join(self.wd, M.HISTORY_NAME), encoding="utf-8") as f:
-            rows = [json.loads(x) for x in f if x.strip()]
-        for k in ("generated_at", "risk_days", "risk_days_at50c", "mo_dollars",
-                  "mu_trading_only", "mu_rent_blended", "exit_code"):
-            self.assertIn(k, rows[-1])
-
-    def test_counterfactual_lines_carry_the_in_sample_label(self):
-        """SPEC 4.5 / judge must_fix J1-4: every counterfactual carries the
-        literal prefix at every point of use — the '41% of loss' figure was an
-        IN-SAMPLE replay stated as a measurement."""
-        for i in range(3):
-            self.simple_market(f"KXC{i}-26SEP20-T1", hours=6)
-        rc, txt = self.run_cli(write=False)
-        self.assertEqual(rc, 0)
-        for line in txt.splitlines():
-            if "counterfactual" in line.lower() and "would have blocked" in line:
-                self.assertIn("[IN-SAMPLE, MODELLED COUNTERFACTUAL]", line)
-        self.assertIn("[IN-SAMPLE, MODELLED COUNTERFACTUAL]", txt)
-        self.assertIn("WARNING ONLY, never acted on", txt)
-        self.assertIn("The bar fires on nothing.", txt)
 
     def test_empty_window_is_handled_without_complaint(self):
         """The sinks start 2026-09-06; a 45-day window necessarily begins
@@ -1030,7 +679,7 @@ class TestFileShape(Base):
         tbl = self.read_table()
         self.assertEqual(tbl["coverage"]["markets"], 0)
         self.assertEqual(tbl["series"], {})
-        self.assertEqual(tbl["limits"]["down_ranked"], 0)
+        self.assertEqual(tbl["limits"]["n_units"], len(M.FAMILY_GROUPS))
 
     def test_explain_prints_a_fill_by_fill_table(self):
         """SPEC 4.3 --explain: each fill's mark, mark source, horizon and
@@ -1049,8 +698,67 @@ class TestFileShape(Base):
         txt = buf.getvalue()
         self.assertIn("KXEXP-26SEP20-T1", txt)
         self.assertIn("two_sided", txt)
-        self.assertIn("adj_struct", txt)
+        self.assertIn("roi_hist", txt)
         self.assertFalse(os.path.exists(os.path.join(self.wd, M.TABLE_NAME)))
+    def test_written_table_matches_the_v2_shape(self):
+        """The bot's loader validates against this schema (version 2), so the
+        field names and types are the contract: every unit record carries the
+        MEASURED/MODELLED components of its roi_hist, a verdict from the
+        three-word vocabulary, and a TTL exactly when it blocks."""
+        for i in range(3):
+            self.simple_market(f"KXS{i}-26SEP20-T1", hours=6)
+        self.s.fill(T0 + timedelta(hours=1), "KXS0-26SEP20-T1", 10, px=40)
+        self.s.quotes("KXS0-26SEP20-T1", T0 + timedelta(hours=25)
+                      - timedelta(seconds=30), 2, bid=29, ask=31)
+        rc, _ = self.run_cli()
+        self.assertEqual(rc, 0)
+        tbl = self.read_table()
+        self.assertEqual(tbl["version"], 2)
+        for k in ("generated_at", "generated_by", "window", "params", "coverage",
+                  "tier", "events", "series", "families", "markets", "limits",
+                  "audit", "unmatched_block_keys", "warnings", "notes"):
+            self.assertIn(k, tbl)
+        for k in ("min_risk_days", "block_roi", "block_ttl_hours", "roi_clip_lo",
+                  "roi_clip_hi", "family_groups"):
+            self.assertIn(k, tbl["params"])
+        for blk in ("events", "series", "families"):
+            for key, rec in tbl[blk].items():
+                self.assertIn(rec["verdict"], ("block", "allow", "insufficient"))
+                self.assertEqual("until" in rec, rec["verdict"] == "block", f"{blk}:{key}")
+                for f in ("kind", "key", "risk_days", "roi_hist", "roi_hist_trading",
+                          "roi_hist_measured", "rent_used", "rent_modelled",
+                          "rent_measured_dollars", "rent_basis", "credited_measured",
+                          "realized_dollars", "mtm_dollars", "net_dollars", "reason",
+                          "n_markets", "n_events"):
+                    self.assertIn(f, rec, f"{blk}:{key} lacks {f}")
+        for name, rec in tbl["families"].items():
+            self.assertIn("members", rec)
+            self.assertIn("match", rec)
+        self.assertEqual(set(tbl["families"]), {g["name"] for g in M.FAMILY_GROUPS})
+        for k in ("blocked_events", "blocked_series", "blocked_families", "n_units"):
+            self.assertIn(k, tbl["limits"])
+        self.assertEqual(tbl["audit"]["counterfactual_label"],
+                         "IN-SAMPLE, MODELLED COUNTERFACTUAL")
+        self.assertTrue(os.path.exists(os.path.join(self.wd, M.HISTORY_NAME)))
+        with open(os.path.join(self.wd, M.HISTORY_NAME), encoding="utf-8") as f:
+            rows = [json.loads(x) for x in f if x.strip()]
+        for k in ("generated_at", "risk_days", "risk_days_at50c", "roi_hist",
+                  "roi_hist_trading", "n_block_series", "n_units", "exit_code"):
+            self.assertIn(k, rows[-1])
+
+    def test_counterfactual_lines_carry_the_in_sample_label(self):
+        """Every counterfactual carries the literal prefix at every point of
+        use (Jack: a model is not a measurement), and every printed money
+        figure says whether it is MEASURED or MODELLED."""
+        for i in range(3):
+            self.simple_market(f"KXC{i}-26SEP20-T1", hours=6)
+        rc, txt = self.run_cli(write=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("[IN-SAMPLE, MODELLED COUNTERFACTUAL]", txt)
+        self.assertIn("[MEASURED]", txt)
+        self.assertIn("[MODELLED mark]", txt)
+        self.assertIn("units (event ROOT -> series -> family", txt)
+        self.assertIn("rule: block a unit under", txt)
 
 
 class TestBotLoaderRoundTrip(Base):
@@ -1088,7 +796,6 @@ class TestBotLoaderRoundTrip(Base):
             raise unittest.SkipTest("incentive_mm has no load_scan_perf yet "
                                     "(SPEC test 47 lands with the bot unit)")
         return imm
-
     def _load_into_bot(self, imm, path):
         """Run the REAL loader against ``path``, restoring every scrap of bot
         module state afterwards. test_incentive_mm imports the same module
@@ -1096,145 +803,110 @@ class TestBotLoaderRoundTrip(Base):
         table sitting under another suite's tests."""
         saved = (getattr(imm, "SCAN_PERF_FILE", None),
                  dict(getattr(imm, "_scan_perf_state", {}) or {}),
-                 dict(imm.SCAN_PERF_COHORTS), dict(imm.SCAN_PERF_SERIES),
-                 dict(imm.SCAN_PERF_EVENTS))
+                 dict(imm.SCAN_PERF_EVENTS), dict(imm.SCAN_PERF_SERIES),
+                 dict(imm.SCAN_PERF_FAMILIES), imm._scan_perf_fiscal_lookup)
         self.addCleanup(self._restore_bot, imm, saved)
         imm.SCAN_PERF_FILE = path
         imm._scan_perf_state["mtime"] = 0.0
+        imm.set_scan_perf_fiscal_lookup(None)
         n = imm.load_scan_perf()
-        return n, (dict(imm.SCAN_PERF_COHORTS), dict(imm.SCAN_PERF_SERIES),
-                   dict(imm.SCAN_PERF_EVENTS))
+        return n, (dict(imm.SCAN_PERF_EVENTS), dict(imm.SCAN_PERF_SERIES),
+                   dict(imm.SCAN_PERF_FAMILIES))
 
     @staticmethod
     def _restore_bot(imm, saved):
-        f, state, coh, ser, evt = saved
+        f, state, evt, ser, fam, hook = saved
         if f is not None:
             imm.SCAN_PERF_FILE = f
         imm._scan_perf_state.clear()
         imm._scan_perf_state.update(state)
-        for live, old in ((imm.SCAN_PERF_COHORTS, coh),
+        for live, old in ((imm.SCAN_PERF_EVENTS, evt),
                           (imm.SCAN_PERF_SERIES, ser),
-                          (imm.SCAN_PERF_EVENTS, evt)):
+                          (imm.SCAN_PERF_FAMILIES, fam)):
             live.clear()
             live.update(old)
+        imm.set_scan_perf_fiscal_lookup(hook)
 
     def _assert_zero_rejects(self, imm, table, loaded, n, *, where):
-        """ZERO REJECTS: every dimension, every bucket and every record in the
-        file is present in the bot's in-memory table afterwards."""
-        cohorts, series, events = loaded
-        self.assertTrue(cohorts, f"{where}: bot loader refused the table "
-                                 f"whole (load_scan_perf returned {n})")
-        self.assertEqual(set(cohorts), set(table["cohorts"]),
-                         f"{where}: dimensions dropped")
-        for dim, ent in table["cohorts"].items():
-            self.assertEqual(len(cohorts[dim]["buckets"]), len(ent["buckets"]),
-                             f"{where}: buckets dropped from {dim}")
-            self.assertEqual(cohorts[dim]["field"], ent["field"])
-            for got, want in zip(cohorts[dim]["buckets"], ent["buckets"]):
-                self.assertEqual(got["centre"], want["centre"])
-                # SPEC 3.2: `trading` is the acting column, normalised to
-                # `dev` by the loader. A reader that silently acted on
-                # `dev_blend` would soften the largest loss cohort (mid
-                # 30-70c is -150.7 trading but only -9.8 net) on a rent side
-                # that is 99% MODELLED until the first statement paste.
-                self.assertEqual(got["dev"], want["dev_trading"])
-                self.assertEqual(got["hi"],
-                                 float("inf") if want["hi"] is None
-                                 else float(want["hi"]),
-                                 f"{where}: 'hi': null must read as +infinity")
-        # The reader-side blast-radius caps (SPEC 6.2 step 7) legitimately
-        # drop records; that is truncation, not a reject. Assert the file is
-        # under them first, then demand exact key equality.
-        n_down = sum(1 for blk in ("series", "events")
-                     for r in table[blk].values()
-                     if r["verdict"] == "down_rank")
-        n_bar = sum(1 for blk in ("series", "events")
-                    for r in table[blk].values() if r["verdict"] == "bar")
-        self.assertLessEqual(n_down, imm.SCAN_PERF_MAX_PENALIZED)
-        self.assertLessEqual(n_bar, imm.SCAN_PERF_MAX_BARRED)
-        self.assertEqual(set(series), set(table["series"]),
-                         f"{where}: series records dropped")
-        self.assertEqual(set(events), set(table["events"]),
-                         f"{where}: event records dropped")
-        self.assertEqual(n, len(cohorts) + len(series) + len(events))
+        """ZERO REJECTS: every unit record in the file is present in the
+        bot's in-memory tables afterwards, every family match rule compiled,
+        and every key resolves under the bot's own rules."""
+        events, series, families = loaded
+        self.assertTrue(events or series or families,
+                        f"{where}: bot loader refused the table whole "
+                        f"(load_scan_perf returned {n})")
+        n_block = sum(1 for blk in ("events", "series", "families")
+                      for r in table[blk].values() if r["verdict"] == "block")
+        self.assertLessEqual(n_block, imm.SCAN_PERF_MAX_BLOCKED,
+                             f"{where}: over the reader cap, which truncates")
+        self.assertEqual(set(events), set(table["events"]), f"{where}: event roots dropped")
+        self.assertEqual(set(series), set(table["series"]), f"{where}: series dropped")
+        self.assertEqual(set(families), set(table["families"]), f"{where}: families dropped")
+        self.assertEqual(n, len(events) + len(series) + len(families))
         self.assertFalse(imm._scan_perf_state["stale"])
-        for k, rec in table["series"].items():
-            self.assertEqual(series[k]["dev"], rec["dev"])
-            self.assertEqual(series[k]["verdict"], rec["verdict"])
-        # SPEC 6.1/6.3: `events` is keyed by EVENT ROOT, and the two units
-        # must derive that root the same way or a bar never matches the
-        # candidate it was meant to stop.
+        for blk, live in (("events", events), ("series", series), ("families", families)):
+            for k, rec in table[blk].items():
+                self.assertEqual(live[k]["verdict"], rec["verdict"], f"{where}: {blk}:{k}")
+                self.assertAlmostEqual(live[k]["roi_hist"], rec["roi_hist"], places=6)
+                self.assertAlmostEqual(live[k]["n"], rec["risk_days"], places=3)
+        # the event ROOT: derived the same way by both units
         for k, rec in table["events"].items():
-            self.assertEqual(rec.get("root", k), k)
             for dated in rec.get("events", []):
                 self.assertEqual(imm.scan_perf_event_root(dated), k,
                                  f"{where}: {dated} -> "
                                  f"{imm.scan_perf_event_root(dated)} != {k}")
+        # family match rules: every emitted member resolves to its family
+        for name, rec in table["families"].items():
+            if rec.get("match", {}).get("regex"):
+                self.assertIsNotNone(families[name]["regex_c"])
+            for member in rec.get("members", []):
+                self.assertEqual(imm.scan_perf_family_of(member), name,
+                                 f"{where}: {member} does not resolve to {name}")
 
-    def _assert_writer_is_not_laxer(self, imm, table, *, where):
-        """The two guards whose denominators differ between the units."""
-        dim_clip = float(table["params"]["dim_clip"])
-        acting = [b["dev_trading"] for e in table["cohorts"].values()
-                  for b in e["buckets"]]
-        acting += [float(r.get("dev") or 0.0) for blk in ("series", "events")
-                   for r in table[blk].values()]
-        clamped = sum(1 for d in acting if abs(abs(d) - dim_clip) <= 1e-9)
-        self.assertLessEqual(clamped, 0.10 * len(acting),
-                             f"{where}: clamp storm on the ACTING set "
-                             f"({clamped}/{len(acting)}) — the loader would "
-                             f"refuse this file whole")
-        n_loader = (len(table["series"]) + len(table["events"])
-                    + sum(len(e["buckets"])
-                          for e in table["cohorts"].values()))
-        self.assertLessEqual(n_loader, imm.SCAN_PERF_MAX_RECORDS,
-                             f"{where}: {n_loader} loader-counted records "
-                             f"(series+events+buckets) over the cap; the "
-                             f"`markets` trim does not bound this")
-
-    # -- the tests --------------------------------------------------------
     def test_written_file_validates_against_the_bot_loader(self):
-        """SPEC test 47, synthetic half: a table the scorer has just written
-        from synthetic sinks is accepted by imm.load_scan_perf() with ZERO
-        rejects."""
+        """A table the scorer has just written from synthetic sinks is
+        accepted by imm.load_scan_perf() with ZERO rejects, and a unit the
+        scorer blocked is a unit the bot blocks."""
         imm = self._bot()
         # The loader ages a table out at 48 h, so the fixture must sit in the
         # real present, not on the synthetic 2026-09-06 timeline.
         now = datetime.now(UTC).replace(microsecond=0)
         start = now - timedelta(days=2)
         for i in range(3):
-            self.simple_market(f"KXR{i}-26SEP20-T1", start=start, hours=6)
+            self.simple_market(f"KXR{i}-26SEP20-T1", start=start, hours=6,
+                               own_bid_ct=2000, pool=5000.0)
+        loser = "KXLOSE-26SEP20-T1"
+        self.simple_market(loser, start=start, hours=6, own_bid_ct=2000, pool=30.0)
+        self.s.fill(start + timedelta(hours=1), loser, 10, px=40)
+        self.s.quotes(loser, start + timedelta(hours=6), 2, bid=9, ask=11,
+                      own_bid_ct=2000)
         rc, _ = self.run_cli(asof=now)
         self.assertEqual(rc, 0)
         path = os.path.join(self.wd, M.TABLE_NAME)
         with open(path, encoding="utf-8") as f:
             table = json.load(f)
+        self.assertEqual(table["series"]["KXLOSE"]["verdict"], "block")
+        self.assertEqual(table["series"]["KXR0"]["verdict"], "allow")
         n, loaded = self._load_into_bot(imm, path)
         self._assert_zero_rejects(imm, table, loaded, n, where="synthetic")
-        self._assert_writer_is_not_laxer(imm, table, where="synthetic")
-        self.assertEqual(len(loaded[0]), len(M.DIM_ORDER))
-        # and the table that just loaded is inert at the shipped weight
-        self.assertEqual(imm.SCAN_PERF_WEIGHT, 0.0)
+        self.assertEqual(imm.scan_perf_blocked("KXLOSE", "KXLOSE-26SEP27"),
+                         "event:KXLOSE")
+        self.assertIsNone(imm.scan_perf_blocked("KXR0", "KXR0-26SEP27"))
 
     def test_a_real_scorer_output_validates_against_the_bot_loader(self):
-        """SPEC test 47, LIVE half. Synthetic sinks cannot produce a muted
-        bucket, an open-ended top bucket with a risk_days-weighted centre, an
-        ``events`` record carrying several dated siblings, or 89 series
-        records at once — and every one of those is a place the two units
-        could have disagreed. Point IMM_SCAN_PERF_TEST_TABLE at a table the
-        scorer produced from the real sinks:
+        """LIVE half. Synthetic sinks cannot produce a hundred series, a
+        family with a dozen members, or an event root with several dated
+        siblings at once — every one of those is a place the two units could
+        disagree. Point IMM_SCAN_PERF_TEST_TABLE at a table the scorer
+        produced from the real sinks:
 
             IMM_SCAN_PERF_TEST_TABLE=<dir>/scan_perf.json \\
                 python -m unittest test_imm_scan_perf
 
         Skipped when unset, so the suite stays hermetic: no test in this
-        module ever reads run-logs/incentive-mm, which the live bot and four
-        daily tasks own (2026-07-28: gate-test dry takes landed in the LIVE
-        ledger).
-
-        ``generated_at`` is re-stamped to now in a COPY before loading. Age
-        is a wall-clock property, not a schema one — an artefact from last
-        week is still the same shape — and the staleness path has its own
-        test."""
+        module ever reads run-logs/incentive-mm. ``generated_at`` is
+        re-stamped to now in a COPY before loading (age is a wall-clock
+        property, not a schema one; the staleness path has its own test)."""
         imm = self._bot()
         src = os.environ.get("IMM_SCAN_PERF_TEST_TABLE", "")
         if not src or not os.path.exists(src):
@@ -1242,158 +914,24 @@ class TestBotLoaderRoundTrip(Base):
                           "the docstring for the one-liner")
         with open(src, encoding="utf-8") as f:
             table = json.load(f)
-        table["generated_at"] = datetime.now(UTC).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")
+        table["generated_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for blk in ("events", "series", "families"):
+            for rec in table[blk].values():
+                if rec.get("verdict") == "block":
+                    rec["until"] = (datetime.now(UTC) + timedelta(hours=60)
+                                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
         path = os.path.join(self.wd, M.TABLE_NAME)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(table, f)
         n, loaded = self._load_into_bot(imm, path)
         self._assert_zero_rejects(imm, table, loaded, n, where="live")
-        self._assert_writer_is_not_laxer(imm, table, where="live")
-        # the shapes synthetic fixtures cannot reach
-        self.assertTrue(any(b["hi"] is None
-                            for e in table["cohorts"].values()
-                            for b in e["buckets"]),
-                        "no open-ended top bucket in this artefact")
-        self.assertEqual(table["params"]["edges_refit"], False)
-        self.assertEqual(table["version"], 1)
+        self.assertEqual(table["version"], 2)
+        self.assertTrue(any(len(r.get("members") or []) > 1
+                            for r in table["families"].values()),
+                        "no multi-member family in this artefact")
+
 
     # -- LEAD RULING R5: the two integration guard fixes, pinned -----------
-
-    @staticmethod
-    def _shape(sc, *, n_series, n_muted, n_clamped):
-        """Overwrite a built scorer's emitted records so the two guard
-        DENOMINATORS take an exact, hand-checkable shape.
-
-        acting  (what the BOT counts) = every bucket dev_trading + every
-                series/event dev
-        blended (what the writer counted first) = unmuted buckets x2 +
-                every series/event dev
-        """
-        tmpl = dict(next(iter(sc.series_recs.values())))
-        sc.event_recs = {}
-        sc.series_recs = {}
-        for i in range(n_series):
-            r = dict(tmpl)
-            r["verdict"] = "neutral"
-            r["dev"] = 0.0
-            sc.series_recs[f"KXFAKE{i:03d}"] = r
-        muted = 0
-        for blk in sc.cohorts.values():
-            for b in blk["buckets"]:
-                b["dev_trading"] = 0.0
-                b["dev_blend"] = 0.0
-                b["muted"] = muted < n_muted
-                muted += 1
-        for i in range(n_clamped):
-            sc.series_recs[f"KXFAKE{i:03d}"]["dev"] = -M.DIM_CLIP
-            sc.series_recs[f"KXFAKE{i:03d}"]["verdict"] = "down_rank"
-
-    def _patch_build(self, fn):
-        orig = M.ScanPerfScorer.build
-
-        def patched(sc):
-            orig(sc)
-            fn(sc)
-        M.ScanPerfScorer.build = patched
-        self.addCleanup(setattr, M.ScanPerfScorer, "build", orig)
-
-    def test_clamp_storm_uses_the_max_of_both_denominators(self):
-        """LEAD RULING R5 / integration fix A. The bot's
-        `_scan_perf_validate` counts a DIFFERENT set than the writer first
-        did: every bucket `dev_trading` (muted ones included) plus each
-        series/event `dev`, and never `dev_blend`. MEASURED on the live table
-        those denominators are 115 and 129, so a file with 12 clamped acting
-        devs is 10.4% to the LOADER (refused whole, tier silently reverts to
-        the last good table) and 9.3% to the writer (shipped). The writer
-        must never be laxer, so the MAX drives the abort.
-
-        Constructed here to exactly that 12-of-115 / 12-of-129 case: 20
-        buckets of which 17 unmuted, 95 series records, 12 of them clamped.
-        Reverting to the writer's own denominator alone makes this pass."""
-        self._patch_build(lambda sc: self._shape(
-            sc, n_series=95, n_muted=3, n_clamped=12))
-        for i in range(3):
-            self.simple_market(f"KXA{i}-26SEP20-T1", hours=6)
-        self.s.write()
-        M.STATUS_DIR, M.WORK_DIR = self.sd, self.wd
-        sc = M.ScanPerfScorer(self.sd, self.wd, asof=ASOF, use_cache=False)
-        sc.load()
-        sc.build()
-        n_buckets = sum(len(b["buckets"]) for b in sc.cohorts.values())
-        self.assertEqual(n_buckets + len(sc.series_recs), 115)
-        frac, n_acting = sc.clamped_frac()
-        self.assertEqual(n_acting, 115)
-        self.assertAlmostEqual(frac, 12 / 115.0, places=6)
-        self.assertGreater(frac, M.CLAMP_STORM_FRAC)          # the loader's view
-        self.assertLess(12 / 129.0, M.CLAMP_STORM_FRAC)       # the writer's view
-        rc, txt = self.run_cli(write_sinks=False)
-        self.assertEqual(rc, 4)
-        self.assertIn("CLAMP STORM", txt)
-        self.assertFalse(os.path.exists(os.path.join(self.wd, M.TABLE_NAME)))
-
-    def test_max_records_sheds_only_neutral_records_most_positive_first(self):
-        """LEAD RULING R5 / integration fix B. The `markets` trim bounds the
-        writer's own count; the BOT's cap counts series + events + BUCKETS
-        and never reads `markets` at all, so a table over it is refused WHOLE
-        and the tier keeps a stale verdict. The shed must therefore bound the
-        LOADER's denominator, and it may only drop NEUTRAL records,
-        most-positive `dev` first: a neutral record with dev >= 0 is a pure
-        no-op for scan_perf_adj, and shedding a mildly negative one can only
-        REDUCE a penalty. down_rank and bar records are never shed."""
-        imm = self._bot()
-        keep_down = {"KXFAKE000", "KXFAKE001", "KXFAKE002"}
-
-        def shape(sc):
-            self._shape(sc, n_series=95, n_muted=0, n_clamped=0)
-            for i, k in enumerate(sorted(sc.series_recs)):
-                # a strictly increasing dev, so "most positive first" has a
-                # unique answer and the shed order is checkable. Kept inside
-                # dim_clip so the loader has no other reason to refuse.
-                sc.series_recs[k]["dev"] = round(-0.0003 * (95 - i), 6)
-            for k in keep_down:
-                sc.series_recs[k]["verdict"] = "down_rank"
-                sc.series_recs[k]["dev"] = -0.03      # deepest, never shed
-        self._patch_build(shape)
-        old_max = M.MAX_RECORDS
-        self.addCleanup(setattr, M, "MAX_RECORDS", old_max)
-        M.MAX_RECORDS = 100                        # 20 buckets + 95 = 115 > 100
-        now = datetime.now(UTC).replace(microsecond=0)
-        for i in range(3):
-            self.simple_market(f"KXA{i}-26SEP20-T1",
-                               start=now - timedelta(days=2), hours=6)
-        rc, txt = self.run_cli(asof=now)
-        self.assertEqual(rc, 0)
-        tbl = self.read_table()
-        n_buckets = sum(len(b["buckets"]) for b in tbl["cohorts"].values())
-        n_loader = len(tbl["series"]) + len(tbl["events"]) + n_buckets
-        self.assertLessEqual(n_loader, M.MAX_RECORDS)
-        # every down_rank survived ...
-        for k in keep_down:
-            self.assertIn(k, tbl["series"], f"{k} (down_rank) was shed")
-        # ... only neutral records went ...
-        shed = {k for k in (f"KXFAKE{i:03d}" for i in range(95))
-                if k not in tbl["series"]}
-        self.assertTrue(shed)
-        self.assertFalse(shed & keep_down)
-        # ... and they were the MOST POSITIVE devs, i.e. the least punitive
-        all_keys = sorted(f"KXFAKE{j:03d}" for j in range(95))
-        want_dev = {k: round(-0.0003 * (95 - i), 6)
-                    for i, k in enumerate(all_keys)}
-        for k in keep_down:
-            want_dev[k] = -0.03
-        kept = [tbl["series"][k]["dev"] for k in all_keys if k in tbl["series"]]
-        shed_devs = [want_dev[k] for k in shed]
-        self.assertGreater(min(shed_devs), max(kept),
-                           "a shed record was more punitive than a kept one")
-        # ... a warning says so ...
-        self.assertTrue(any("MAX_RECORDS" in w for w in tbl["warnings"]), txt)
-        self.assertTrue(any(str(n_loader) in w for w in tbl["warnings"]))
-        # ... and the bot then ACCEPTS the file rather than refusing it whole
-        n, loaded = self._load_into_bot(
-            imm, os.path.join(self.wd, M.TABLE_NAME))
-        self.assertTrue(loaded[0], "the loader still refused the file whole")
-        self._assert_writer_is_not_laxer(imm, tbl, where="shed")
 
 
 # ================================================ fixer-added invariants
@@ -1432,47 +970,6 @@ class TestScorerInvariants(Base):
         self.assertEqual(sc.ev("KXNEVERSEEN-26SEP20-T1"),
                          "KXNEVERSEEN-26SEP20")
 
-    def test_a_half_cent_median_spread_still_lands_in_a_bucket(self):
-        """SPEC 3.3's spread edges are integer cents with GAPS -- [0,1],
-        [2,4], [5,9], [10,19], [20,inf) -- while the fitting-side value is a
-        median that is a half-cent for any even-length sample. 4.5 is exactly
-        the 4c<->5c flicker the trailing-6h median exists to smooth, and it
-        used to fall into no bucket at all: the market vanished from the
-        whole dimension with no warning and no count."""
-        sc = self._sc()
-        for v in (1.5, 4.5, 9.5, 19.5, 0.5):
-            self.assertIsNotNone(sc._bucket_of("spread", v),
-                                 f"spread {v} fell into no bucket")
-        self.assertEqual(sc._bucket_of("spread", 4.0), "2-4c")
-        self.assertEqual(sc._bucket_of("spread", 5.0), "5-9c")
-        self.assertEqual(sc._bucket_of("spread", 4.5), "5-9c")   # half UP
-        # the contiguous "left"-closed dimensions are NOT rounded
-        self.assertEqual(sc._bucket_of("mid", 29.5), "10-30")
-        self.assertEqual(sc._bucket_of("dtc", 6.9), "0-7")
-
-    def _sc(self):
-        M.STATUS_DIR, M.WORK_DIR = self.sd, self.wd
-        return M.ScanPerfScorer(self.sd, self.wd, asof=ASOF, use_cache=False)
-
-    def test_every_bucket_dimension_accounts_for_all_its_risk_days(self):
-        """feedback_sweep_class_after_fix: silent exclusions never show in
-        logs. A market whose dimension value is not None but whose bucket is
-        None contributes to the tier mu and to n_markets but to NO bucket, so
-        the column stops summing to coverage.risk_days and every dev on that
-        dimension shifts."""
-        for i in range(4):
-            self.simple_market(f"KXS{i}-26SEP20-T1", bid=40, ask=41 + i, hours=4)
-        sc = self.build()
-        for dim in M.DIM_ORDER:
-            missing = sc.unassigned[dim]["risk_days"]
-            bucketed = sum(b["risk_days"]
-                           for b in sc.cohorts[dim]["buckets"])
-            none_valued = sum(sc.markets[t]["risk_days"] for t in sc.markets
-                              if sc.dim_value[dim].get(t) is None)
-            self.assertAlmostEqual(
-                bucketed + missing + none_valued, round(sc.risk_total, 2),
-                places=1, msg=f"{dim}: buckets do not account for every $-day")
-            self.assertEqual(missing, 0.0, f"{dim}: {sc.unassigned[dim]}")
 
     def test_a_qualified_period_with_no_ledger_row_stays_modelled(self):
         """$0.00 is NOT evidence of a credit. A period that qualifies on age
@@ -1493,7 +990,6 @@ class TestScorerInvariants(Base):
                          {"est_floored"})
         rec = sc.series_recs["KXNOCR"]
         self.assertEqual(rec["rent_basis"], "est_floored")
-        self.assertEqual(rec["rent_measured_frac"], 0.0)
         self.assertEqual(rec["rent_measured_dollars"], 0.0)
 
     def test_no_record_claims_a_credited_basis_with_a_zero_measured_term(self):
@@ -1514,7 +1010,6 @@ class TestScorerInvariants(Base):
                 self.assertGreater(
                     r["rent_measured_dollars"], 0.0,
                     f"rent_basis {r['rent_basis']} with a $0 measured term")
-                self.assertGreater(r["rent_measured_frac"], 0.0)
         # the pseudo-period before the program start can never be credited
         for p in sc.market_rent_periods[tkr]:
             if p["basis"] == "credited":
@@ -1626,30 +1121,199 @@ class TestGuardsLeaveTheLastGoodTable(Base):
         self.assertIn("NO FILE WRITTEN", txt)
         self._assert_unchanged(after_row)
 
-    def test_clamp_storm_abort_leaves_the_previous_table_untouched(self):
-        # a mild corpus writes the GOOD table first ...
-        self._corpus()
-        rc, _ = self.run_cli()
+
+# =============================================================== the rule
+
+class TestUnitVerdicts(Base):
+    """Jack 2026-09-18: "make open scan pick up new markets or not based on
+    historical ROI of those market families." Jack 2026-09-20: "If it's a
+    new event listed then use the family historical ROI but if it's the same
+    event that is just relisted for new dates (eg gas dailies, AI token
+    share, etc) then use the specific ROI of that event, not the family
+    historical ROI." These pin the scorer's half of that rule: the three
+    nested units, their verdicts, and the arithmetic behind roi_hist."""
+
+    def _heavy(self, ticker, *, hours=8, pool=5000.0, event=None, start=None,
+               losing=False, own_bid_ct=2000):
+        """A market with well over MIN_RISK_DAYS of history ($800 resting
+        for 8h = ~267 $-days). `losing` adds a 10-lot fill at 40 marked at
+        10 afterwards (-$3 of MTM against ~$0 of floored rent)."""
+        start = start or T0
+        self.simple_market(ticker, start=start, hours=hours, own_bid_ct=own_bid_ct,
+                           pool=pool, event=event)
+        if losing:
+            self.s.fill(start + timedelta(hours=1), ticker, 10, px=40)
+            self.s.quotes(ticker, start + timedelta(hours=hours), 2, bid=9, ask=11,
+                          own_bid_ct=own_bid_ct, pool=pool)
+        return ticker
+
+    def test_verdict_thresholds_insufficient_block_allow(self):
+        """Under MIN_RISK_DAYS -> insufficient (the bot treats the unit as
+        unknown); at or above it, roi_hist < BLOCK_ROI -> block (with a TTL),
+        else allow."""
+        self._heavy("KXPOS-26SEP20-T1")                       # earns rent, no fills
+        self._heavy("KXNEG-26SEP20-T1", pool=30.0, losing=True)   # loses, no rent
+        self.simple_market("KXTHIN-26SEP20-T1", hours=1, own_bid_ct=20)
+        sc = self.build()
+        pos, neg, thin = (sc.series_recs["KXPOS"], sc.series_recs["KXNEG"],
+                          sc.series_recs["KXTHIN"])
+        self.assertGreaterEqual(pos["risk_days"], M.MIN_RISK_DAYS)
+        self.assertEqual(pos["verdict"], "allow")
+        self.assertGreater(pos["roi_hist"], 0.0)
+        self.assertNotIn("until", pos)
+        self.assertEqual(neg["verdict"], "block")
+        self.assertLess(neg["roi_hist"], M.BLOCK_ROI)
+        self.assertIn("until", neg)
+        self.assertLess(M.parse_iso(neg["until"]) - ASOF,
+                        timedelta(hours=M.BLOCK_TTL_HOURS + 1))
+        self.assertIn("roi_hist", neg["reason"])
+        self.assertLess(thin["risk_days"], M.MIN_RISK_DAYS)
+        self.assertEqual(thin["verdict"], "insufficient")
+        self.assertNotIn("until", thin)
+        # the arithmetic is the one the docstring states, on the record itself
+        for r in (pos, neg):
+            self.assertAlmostEqual(
+                r["roi_hist"],
+                M.clip((r["rent_used"] + r["realized_dollars"] + r["mtm_dollars"])
+                       / r["risk_days"], M.ROI_CLIP_LO, M.ROI_CLIP_HI), places=5)
+            self.assertAlmostEqual(
+                r["roi_hist_trading"],
+                M.clip((r["realized_dollars"] + r["mtm_dollars"]) / r["risk_days"],
+                       M.ROI_CLIP_LO, M.ROI_CLIP_HI), places=5)
+
+    def test_relisted_dates_share_one_event_root_and_new_roots_split(self):
+        """KXGAS-26SEP07 and KXGAS-26SEP08 are the same event re-listed: ONE
+        root record carrying both dated events. KXV-NORTH-26OCT01 and
+        KXV-SOUTH-26OCT01 are two roots under one series."""
+        self._heavy("KXGAS-26SEP07-T1", event="KXGAS-26SEP07")
+        self._heavy("KXGAS-26SEP08-T1", event="KXGAS-26SEP08",
+                    start=T0 + timedelta(days=1))
+        self._heavy("KXV-NORTH-26OCT01-T1", event="KXV-NORTH-26OCT01")
+        self._heavy("KXV-SOUTH-26OCT01-T1", event="KXV-SOUTH-26OCT01")
+        sc = self.build()
+        gas = sc.event_recs["KXGAS"]
+        self.assertEqual(gas["n_events"], 2)
+        self.assertEqual(gas["events"], ["KXGAS-26SEP07", "KXGAS-26SEP08"])
+        self.assertEqual(gas["n_markets"], 2)
+        self.assertEqual(sc.series_recs["KXGAS"]["risk_days"], gas["risk_days"])
+        self.assertEqual(sc.series_recs["KXGAS"]["roots"], ["KXGAS"])
+        self.assertIn("KXV-NORTH", sc.event_recs)
+        self.assertIn("KXV-SOUTH", sc.event_recs)
+        self.assertEqual(sc.series_recs["KXV"]["n_markets"], 2)
+        self.assertEqual(sc.series_recs["KXV"]["roots"], ["KXV-NORTH", "KXV-SOUTH"])
+        self.assertEqual(sc.event_recs["KXV-NORTH"]["series"], "KXV")
+
+    def test_family_grouping_by_regex_members_and_fiscal_flag(self):
+        """FAMILY_GROUPS: the CPI prints group by name, the Fiscal.ai KPIs by
+        the persisted `fiscal` flag; everything else is its own family. The
+        match rules ride in the file so the bot classifies a never-seen
+        series the same way."""
+        self._heavy("KXCPI-26OCT-T1")
+        self._heavy("KXCPIYOY-26NOV-T1", start=T0 + timedelta(days=1))
+        self._heavy("KXAXP-26OCTCARDS-T1")
+        self._heavy("KXAAAGASDTX-26SEP20-T1")
+        self._heavy("KXOTHER-26SEP20-T1")
+        self.s.state["scan_series_meta"]["KXAXP"] = {"ok": True, "fiscal": True}
+        sc = self.build()
+        self.assertEqual(sc.family_of("KXCPI"), "CPI")
+        self.assertEqual(sc.family_of("KXCPIYOY"), "CPI")
+        self.assertEqual(sc.family_of("KXCPICORE"), "CPI")
+        self.assertEqual(sc.family_of("KXAXP"), "FISCAL_KPI")
+        self.assertEqual(sc.family_of("KXAAAGASDTX"), "AAAGAS_STATE_DAILY")
+        self.assertEqual(sc.family_of("KXAAAGASD"), "KXAAAGASD")     # the national daily is not a state
+        self.assertEqual(sc.family_of("KXOTHER"), "KXOTHER")
+        cpi = sc.family_recs["CPI"]
+        self.assertEqual(cpi["members"], ["KXCPI", "KXCPIYOY"])
+        self.assertEqual(cpi["n_markets"], 2)
+        self.assertEqual(cpi["match"], {"regex": r"^KXCPI(CORE)?(YOY)?$"})
+        self.assertEqual(sc.family_recs["FISCAL_KPI"]["members"], ["KXAXP"])
+        self.assertEqual(sc.family_recs["FISCAL_KPI"]["match"], {"fiscal": True})
+        self.assertNotIn("KXOTHER", {m for r in sc.family_recs.values()
+                                      for m in r["members"]})
+
+    def test_lookup_unit_prefers_the_most_specific_unit_with_history(self):
+        """Root with history -> the root. Thin root under a series with
+        history -> the series. Thin series inside a family with history ->
+        the family. Nothing with history -> nothing."""
+        self._heavy("KXV-NORTH-26OCT01-T1", event="KXV-NORTH-26OCT01")
+        self.simple_market("KXV-SOUTH-26OCT01-T1", hours=1, own_bid_ct=20,
+                           event="KXV-SOUTH-26OCT01")
+        self._heavy("KXCPIYOY-26NOV-T1")
+        self.simple_market("KXCPI-26OCT-T1", hours=1, own_bid_ct=20)
+        self.simple_market("KXLONE-26SEP20-T1", hours=1, own_bid_ct=20)
+        sc = self.build()
+        self.assertEqual(sc.lookup_unit("KXV-NORTH-26OCT01-T1")[:2], ("event", "KXV-NORTH"))
+        self.assertEqual(sc.lookup_unit("KXV-SOUTH-26OCT01-T1")[:2], ("series", "KXV"))
+        self.assertEqual(sc.lookup_unit("KXCPI-26OCT-T1")[:2], ("family", "CPI"))
+        self.assertEqual(sc.lookup_unit("KXLONE-26SEP20-T1"), (None, None, None))
+
+    def test_roi_hist_uses_the_credited_rent_where_the_ledger_covers_the_period(self):
+        """rent_used is ONE basis per period: the MEASURED credit replaces the
+        floored estimate for a covered period and is never added to it; the
+        replaced amount is published beside the basis."""
+        tkr = "KXCRED-26SEP20-T1"
+        self.simple_market(tkr, hours=10, pool=5000.0, own_bid_ct=2000)
+        self.s.program(tkr, T0 - timedelta(days=3), T0 + timedelta(hours=5))
+        self.s.credit("2026-09-07", M.ev_of(tkr), 7.25)
+        self.s.credit("2026-09-09", "KXOTHER-26SEP20", 3.0)
+        sc = self.build()
+        rec = sc.series_recs["KXCRED"]
+        periods = sc.market_rent_periods[tkr]
+        est_side = sum(p["floored"] for p in periods if p["basis"] != "credited")
+        self.assertAlmostEqual(rec["rent_measured_dollars"], 7.25)
+        self.assertAlmostEqual(rec["rent_used"], 7.25 + est_side, places=4)
+        self.assertGreater(rec["rent_modelled"], rec["rent_used"] - 7.25)
+        self.assertIn(rec["rent_basis"], ("credited", "mixed_by_period"))
+        self.assertAlmostEqual(rec["roi_hist_measured"],
+                               M.clip((7.25 + rec["realized_dollars"]) / rec["risk_days"],
+                                      M.ROI_CLIP_LO, M.ROI_CLIP_HI), places=5)
+
+    def test_report_lists_blocks_once_with_their_ttl_and_the_counterfactual(self):
+        """The printed report: a root that IS its series prints once (as the
+        series), every block shows its `until`, the blocks line counts each
+        kind, and the counterfactual carries its label."""
+        self._heavy("KXNEG-26SEP20-T1", pool=30.0, losing=True)
+        self._heavy("KXPOS-26SEP20-T1")
+        rc, txt = self.run_cli(write=False)
         self.assertEqual(rc, 0)
-        before = self._snapshot()
-        # ... then the two-group corpus the clamp-storm guard test uses (every
-        # unmuted bucket needs a real, non-zero deviation to be clamped)
-        t_fill = T0 + timedelta(hours=1)
-        t_mark = t_fill + timedelta(hours=24)
-        for tag, bid, ask, px, mark, dt, pool in (
-                ("C", 40, 41, 40.0, 70, "26SEP20", 30.0),
-                ("D", 15, 22, 18.0, 5, "26DEC20", 10.0)):
-            for i in range(6):
-                tkr = f"KX{tag}{i}-{dt}-T1"
-                self.simple_market(tkr, hours=6, bid=bid, ask=ask, pool=pool)
-                self.s.fill(t_fill, tkr, 10, px=px)
-                self.s.quotes(tkr, t_mark - timedelta(seconds=30), 2,
-                              bid=mark - 1, ask=mark + 1)
-        M.DIM_CLIP = 1e-4            # force every dev onto a clamp
-        rc2, txt = self.run_cli()
-        self.assertEqual(rc2, 4)
-        self.assertIn("NO FILE WRITTEN", txt)
-        self._assert_unchanged(before)
+        neg_rows = [ln for ln in txt.splitlines()
+                    if ln.lstrip().startswith(("event ", "series ", "family "))
+                    and "KXNEG" in ln]
+        self.assertEqual(len(neg_rows), 1, neg_rows)
+        self.assertIn("until", neg_rows[0])
+        self.assertIn("series  KXNEG", neg_rows[0])
+        self.assertIn("blocks   : 1 event root(s), 1 series, 0 family(ies)", txt)
+        self.assertIn("counterfactual [IN-SAMPLE, MODELLED COUNTERFACTUAL]: 1 of 2 "
+                      "markets", txt)
+
+    def test_insufficient_records_are_shed_first_when_over_max_records(self):
+        """The bot refuses a file over its record cap WHOLE, so the writer
+        bounds the count by shedding `insufficient` records — no-ops for the
+        bot — smallest history first, and says so."""
+        for i in range(5):
+            self.simple_market(f"KXT{i}-26SEP20-T1", hours=1, own_bid_ct=20)
+        old = M.MAX_RECORDS
+        self.addCleanup(setattr, M, "MAX_RECORDS", old)
+        M.MAX_RECORDS = 4
+        rc, txt = self.run_cli()
+        self.assertEqual(rc, 0)
+        tbl = self.read_table()
+        self.assertLessEqual(tbl["limits"]["n_units"], 4)
+        self.assertTrue(any("MAX_RECORDS" in w for w in tbl["warnings"]), tbl["warnings"])
+        self.assertEqual(set(tbl["families"]), {g["name"] for g in M.FAMILY_GROUPS})
+
+    def test_explain_resolves_a_root_a_series_a_family_or_a_ticker(self):
+        self._heavy("KXCPIYOY-26NOV-T1")
+        self.s.write()
+        for key in ("KXCPIYOY", "CPI", "KXCPIYOY-26NOV-T1"):
+            buf = io.StringIO()
+            rc = M.run(["--status-dir", self.sd, "--work-dir", self.wd,
+                        "--asof", ASOF.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "--explain", key], out=buf)
+            self.assertEqual(rc, 0, key)
+            self.assertIn("roi_hist", buf.getvalue(), key)
+            self.assertIn("KXCPIYOY-26NOV-T1", buf.getvalue(), key)
+        self.assertFalse(os.path.exists(os.path.join(self.wd, M.TABLE_NAME)))
 
 
 if __name__ == "__main__":

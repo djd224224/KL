@@ -2,38 +2,53 @@
 """
 imm_scan_perf.py — the OFFLINE SCORER of the open-scan performance loop.
 
-It re-derives, from the IMM sinks alone, how the open-scan tier actually
-traded, and writes one small table (``scan_perf.json``) that the bot may
-later read to demand EXTRA admission ROI from structurally bad candidates.
+Jack (2026-09-15 / 09-18 / 09-20): "make open scan pick up new markets or
+not based on historical ROI of those market families ... If it's a new
+event listed then use the family historical ROI but if it's the same event
+that is just relisted for new dates (eg gas dailies, AI token share, etc)
+then use the specific ROI of that event, not the family historical ROI."
 
-Labels, used in every printed and stored number (Jack, "a model is not a
-measurement" — the "$1,500 non-IMM reward" was a reconstruction stated as
-fact and was off 10x):
+It re-derives, from the IMM sinks alone, what the open-scan tier ACTUALLY
+earned per dollar at risk — the historical ROI — for three nested units:
 
-  MEASURED  re-derived from fills / settlements / marks / cycle_log / ledger
-  MODELLED  the bot's est_frac x pool accrual, a mid-based mark, or a
-            counterfactual replay
+  events    keyed by EVENT ROOT (the event ticker minus its trailing date
+            segment, KXTOKENUSE-26SEP28 -> KXTOKENUSE): a re-listed weekly,
+            or a new strike on a dated event, is judged on that event's OWN
+            history
+  series    the ticker prefix (KXCPIYOY, KXAXP, ...): a NEW event root under
+            a known series is judged on the series' history
+  families  grouped series that are one market family (FAMILY_GROUPS:
+            Fiscal.ai KPIs, the AAA state gas dailies, the CPI prints): a
+            NEW series inside a known family is judged on the family's
+            history. Every other series is its own family.
 
-EST and CREDITED are NEVER summed anywhere (memory
-``reference_imm_accrued_est_never_resets.md``: the accrual counter never
-resets at a period end but the known_tickers prune DELETES it, so neither
-quantity contains the other).
+and writes one table (``scan_perf.json``) that the bot hot-reloads. The bot
+looks a candidate up in that order — the MOST SPECIFIC unit with enough
+history wins — and (a) refuses to admit it while the unit's historical ROI
+is under the block threshold, (b) blends the unit's historical ROI into the
+ranking ROI in proportion to the evidence behind it.
 
-WHAT THIS EXISTS TO CATCH (all MEASURED on 2026-09-06..09-16, 147 tickers /
-83 events / 71 series, Phase-1 ``empirical_scan_tier``):
+  roi_hist = (rent + realized + mtm) / risk_days        $/day per $ at risk
 
-  1. The tier lost -$237.77 of trading P&L on 10,434 $-days at risk while
-     its own model said +$6.55, and 12 events are 89% of that loss. The
-     admission ROI the walk ranks on is ANTI-predictive conditional on a
-     fill (Spearman -0.43 vs trading P&L, -0.66 per quoted day, n=47).
-  2. The losses are STRUCTURAL, not per-series: mid 30-70c (n=82, -150.7),
-     spread 5-9c (n=31, -106.7) and 20c+ (n=38, -83.8), 30-90 days to close
-     (n=38, -107.9), pools <$20/day (n=86, -153.2); while 1c-spread state
-     prints (56% of the tier's risk-days) lost only -21.8.
-  3. Per-event net quality does NOT persist at series level
-     (``empirical_persistence`` 8.1: the unshrunk series mean is the WORST
-     predictor in every cut), so the acting key is structure known at
-     admission, and the series term is shrunk at m=20 fills.
+  rent      MEASURED credits from reward_credits.csv where the ledger covers
+            a program period, else the same MODELLED est_frac x pool accrual
+            the walk's own ROI ranks on (with the MEASURED $1.00 per market
+            per period floor). ONE basis per period, never both: EST and
+            CREDITED are never summed (memory: neither contains the other).
+  realized  MEASURED — an independent avg-cost replay of fills + settlements
+            (reproduces the bot's realized sink to the cent; the sink itself
+            is only the comparison side of the self-check).
+  mtm       the open position at the bot's own last mark (a MODELLED mark;
+            positions ride to settlement, so this is the honest current
+            value of what the tier still holds).
+  risk_days sum over cycles of (resting collateral + inventory) x dt — the
+            exposure the walk's est_collateral_dollars approximates.
+
+Verdicts: `insufficient` under MIN_RISK_DAYS of history (the bot treats the
+unit as unknown = today's behaviour), `block` when roi_hist < BLOCK_ROI,
+else `allow`. Labels (Jack, "a model is not a measurement"): MEASURED =
+re-derived from fills / settlements / marks / cycle_log / ledger; MODELLED =
+the bot's accrual, a mid-based mark, or a replay.
 
 WHAT IT MUST NEVER DO
   * write anything into STATUS_DIR other than its own three files (the live
@@ -42,17 +57,18 @@ WHAT IT MUST NEVER DO
     ``reward_est_cache.json`` unconditionally and would fight the 07:50
     ``KL imm program-history`` job. The accrual integral is re-implemented
     here against a PRIVATE cache;
-  * publish a table that can RAISE an ROI. Every deviation is clipped at
-    0.0 on the upside; the bot subtracts ``req >= 0`` and nothing else.
+  * ship a table it cannot reconcile: the replay must match the realized
+    sink to the cent over complete UTC days, and the tier's $-days must not
+    have collapsed >30% day over day (a sink gone dark), else NO FILE.
 
 Usage
     python imm_scan_perf.py --dry
     python imm_scan_perf.py --now
-    python imm_scan_perf.py --explain KXCPIYOY
+    python imm_scan_perf.py --explain KXCPIYOY      (series, event root, family or ticker)
     python imm_scan_perf.py --status-dir <dir> --work-dir <dir> --dry
 
 Exit codes: 0 wrote (or --dry OK), 1 internal error, 2 reconciliation
-failed (no file), 3 exposure-drop abort (no file), 4 clamp storm (no file).
+failed (no file), 3 exposure-drop abort (no file).
 """
 
 from __future__ import annotations
@@ -90,103 +106,64 @@ _ALLOWED_WRITE = {TABLE_NAME, CACHE_NAME, HISTORY_NAME}
 
 # ---------------------------------------------------------------- parameters
 # Scorer-side parameters live here and are echoed into params, so a re-score
-# never needs a bot restart (SPEC 6.10).
+# never needs a bot restart.
 
-WINDOW_DAYS = 45
-# NO TIME DECAY IN v1. SPEC 3 defines no half-life weighting anywhere, and a
-# decay invented here would silently change mu. An earlier draft carried a
-# --halflife-days flag that was echoed into params and printed in the header
-# but applied to nothing; it was REMOVED 2026-09-18 rather than left to
-# mislead a reader into thinking the window is weighted. Every observation in
-# the window has weight 1.
-HORIZON_H = 24
-MATURITY_SLACK_SECS = 900           # a fill enters the sample at t + H + 15min
+WINDOW_DAYS = 45                    # trailing history the ROI is measured over
+HORIZON_H = 24                      # markout horizon (a DIAGNOSTIC, not the verdict)
+MATURITY_SLACK_SECS = 900           # a fill enters the markout sample at t + H + 15min
 MARK_TOLERANCE_SECS = 900           # same dt grain as imm_reward_recon
 MAX_DT = 900.0                      # accrual integral cap (restarts cannot bill hours)
-WINSOR_CENTS = 40.0                 # KXCPIYOY's 24h markout is -25.5 c/ct; 40 keeps it
-COHORT_PRIOR_RISK_DAYS = 400.0      # K: thinnest real bucket (397.8 $-days) gets 50%
-SERIES_PRIOR_FILLS = 20             # m
-DIM_CLIP = 0.04
-ADJ_CLIP = 0.04                     # equals DIM_CLIP by construction of min()
-MAX_REQ = 0.10                      # effective admission bar <= 0.15/day
-DATA_THIN_UNMARKED_FRAC = 0.35
-BUCKET_MUTE_MIN_SERIES = 5
-BUCKET_MUTE_MIN_EVENTS = 3
-BAR_MIN_EPISODES = 30               # the ratified section-6 floor, in EPISODE units
-BAR_MIN_MARKETS = 3
-BAR_MIN_DAYS = 2
-BAR_CI = 0.90
-BAR_BOOTSTRAP = 2000
-BAR_TTL_DAYS = 14
-BAR_SUSTAIN_RUNS = 2
-BAR_MIN_DWELL_DAYS = 7
-RATCHET_EASE_PER_RUN = 0.01
+WINSOR_CENTS = 40.0                 # markout winsor (diagnostic)
 RENT_FACTOR = 1.0
 RENT_FACTOR_SOURCE = "default_n2"   # 2 MEASURED scan credits: no basis to haircut
 PAYOUT_FLOOR = 1.00                 # MEASURED: min Liquidity credit is exactly $1.00
 CREDIT_LAG_DAYS = 2                 # a period is measurable 2d before the newest credit
 CREDIT_WINDOW_DAYS = 4              # ledger rows land 1-2d after a period end
-MAX_BARRED_FILE = 40
-MAX_PENALIZED = 25
-MAX_BARRED = 5
-MAX_RECORDS = 500
-MAX_BAR_FRAC_UNIVERSE = 0.25
+# THE RULE (Jack 2026-09-18/20). A unit is judged only once it carries
+# MIN_RISK_DAYS of history: 100 $-days is four market-days at the tier's
+# typical ~$25 of resting collateral, i.e. about one weekly program period
+# of one market, or a day and a half of a three-strike event. Under it the
+# verdict is `insufficient` and the bot treats the unit as unknown (today's
+# behaviour). At or above it, roi_hist < BLOCK_ROI blocks NEW admissions
+# from the unit and a positive history is blended into the ranking ROI by
+# the bot (IMM_SCAN_PERF_BLEND_M). 0.0/day asks exactly Jack's question:
+# has this family earned its rent net of what it lost trading?
+MIN_RISK_DAYS = 100.0
+BLOCK_ROI = 0.0
+# A block carries a short `until` so a scorer that dies cannot hold a block
+# forever. The bot ages the WHOLE table out at IMM_SCAN_PERF_MAX_AGE_H (48h)
+# anyway; the daily 07:55 run re-issues every live block.
+BLOCK_TTL_HOURS = 60
+# roi_hist is clipped before it is published: a unit at the 100 $-day floor
+# carrying one settled $60 loss reads -0.6/day, which the bot's blend must
+# see as "very bad" and not as an arithmetic accident that swamps the model.
+ROI_CLIP_LO = -2.0
+ROI_CLIP_HI = 1.0
+# GROUPED FAMILIES: series that are one market family and share one history
+# when a NEW series of the family lists (Jack: "family historical ROI").
+# Every other series is its own family (family == series). A member is a
+# series whose name matches `regex`, or (Fiscal.ai) whose cached
+# scan_series_meta verdict carries fiscal=true. The rules are emitted into
+# the file so the bot classifies a never-seen series the same way.
+FAMILY_GROUPS = (
+    {"name": "FISCAL_KPI", "fiscal": True,
+     "note": "Fiscal.ai company-KPI weeklies (KXAXP, KXAAL, KXCCLA, ...)"},
+    {"name": "AAAGAS_STATE_DAILY", "regex": r"^KXAAAGASD[A-Z]{2}$",
+     "note": "AAA per-state gas dailies"},
+    {"name": "CPI", "regex": r"^KXCPI(CORE)?(YOY)?$",
+     "note": "BLS CPI prints: headline/core x MoM/YoY"},
+)
+MAX_RECORDS = 2000                  # unit records in the file; the bot refuses more
+MAX_MARKET_RECORDS = 600            # the `markets` block (never read by the bot)
+MAX_EVENTS_LISTED = 40              # dated events listed per unit record
 RECON_TOLERANCE_DOLLARS = 1.00
 EXPOSURE_DROP_ABORT = 0.30
-CLAMP_STORM_FRAC = 0.10
 SCAN_MIN_ROI = 0.05                 # incentive_mm.SCAN_MIN_ROI (Jack 9/13, seat stays EMPTY)
-BOOTSTRAP_SEED = 20260918           # deterministic: two runs in a minute must agree
 
 QUOTE_GRID_SECS = 300               # cycle samples are kept on a 5-min grid
 
-# ------------------------------------------------- PRE-REGISTERED, FROZEN
-# SPEC 3.3. Selected after reading empirical_scan_tier section 4's loss table
-# on n=147 markets over 12 days in which 12 events are 89% of the loss.
-# These are hereby pre-registered and frozen: the scorer refuses to emit a
-# table whose sha differs unless --refit-edges is passed, and the bot's
-# loader refuses a re-fit table while IMM_SCAN_PERF_REQUIRE_FROZEN_EDGES=1.
-#
-# lo/hi convention: "closed":"both" -> lo <= v <= hi (integer cents);
-#                   "closed":"left" -> lo <= v < hi.  hi = None means +inf.
-COHORT_EDGES = {
-    "spread": {
-        "field": "spread_cents", "assign": "trailing_median_6h", "closed": "both",
-        "buckets": [("1c", 0, 1), ("2-4c", 2, 4), ("5-9c", 5, 9),
-                    ("10-19c", 10, 19), ("20c+", 20, None)],
-    },
-    "mid": {
-        "field": "mid_cents", "assign": "trailing_median_6h", "closed": "left",
-        "buckets": [("0-10", 0, 10), ("10-30", 10, 30), ("30-70", 30, 70),
-                    ("70-90", 70, 90), ("90-100", 90, None)],
-    },
-    "dtc": {
-        "field": "days_to_close", "assign": "admission_snapshot", "closed": "left",
-        "buckets": [("0-7", 0, 7), ("7-30", 7, 30), ("30-90", 30, 90),
-                    ("90-180", 90, 180), ("180+", 180, None)],
-    },
-    "pool": {
-        "field": "dollars_per_day", "assign": "admission_snapshot", "closed": "left",
-        "buckets": [("0-20", 0, 20), ("20-50", 20, 50), ("50-100", 50, 100),
-                    ("100-200", 100, 200), ("200+", 200, None)],
-    },
-}
-DIM_ORDER = ("spread", "mid", "dtc", "pool")
-_DIM_CODE = {"spread": "sp", "mid": "m", "dtc": "dtc", "pool": "p"}
-
-
-def edges_sha256(edges=None) -> str:
-    """Canonical hash of the pre-registered bucket edges."""
-    payload = json.dumps(edges if edges is not None else COHORT_EDGES,
-                         sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-# Pinned by test_frozen_edges_hash_matches_the_constant (SPEC test 48).
-FROZEN_EDGES_SHA256 = "cb9ed77fb1ba0cfdefde3b63c94b2b1296b46537cb6797938b3b2930436c5a85"
-
 MON = {m: i + 1 for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
-_TICKER_DATE_RE = re.compile(r"^[A-Z0-9]+-(\d\d)([A-Z]{3})(\d\d)?")
 _CYCLE_HDR = ("ts,ticker,ext_bid,ext_ask,yes_depth,no_depth,target,est_frac,qual_sides,"
               "acct_pos,own_pos,pool_per_day,quoted,own_bid_ct,own_ask_ct,own_bid_top,"
               "own_ask_top,own_pad_bid_ct,own_pad_ask_ct,want_bid_ct,want_ask_ct,"
@@ -262,26 +239,6 @@ def ts_of(rec_ts):
         return float(rec_ts)
     d = parse_iso(rec_ts)
     return d.timestamp() if d else None
-
-
-def ticker_close_date(ticker: str):
-    """Kalshi ticker date -> UTC datetime (the LISTING/close date convention
-    used by Phase-1; memory project_imm_ticker_date_cutoff_bug is about the
-    bot's cutoff, not about this descriptive field)."""
-    m = _TICKER_DATE_RE.match(ticker)
-    if not m:
-        return None
-    year = 2000 + int(m.group(1))
-    mo = MON.get(m.group(2))
-    if not mo:
-        return None
-    if m.group(3):
-        try:
-            return datetime(year, mo, int(m.group(3)), tzinfo=timezone.utc)
-        except ValueError:
-            return None
-    nxt = datetime(year + (mo == 12), (mo % 12) + 1, 1, tzinfo=timezone.utc)
-    return nxt - timedelta(days=1)
 
 
 def fnum(x, default=None):
@@ -608,22 +565,14 @@ class PnlReplay:
 class ScanPerfScorer:
 
     def __init__(self, status_dir, work_dir, *, asof=None, window_days=WINDOW_DAYS,
-                 horizon_h=HORIZON_H,
-                 score_basis="trading", refit_edges=False, use_cache=True,
-                 bar_enabled=None, log=print):
+                 horizon_h=HORIZON_H, use_cache=True, log=print):
         self.status_dir = status_dir
         self.work_dir = work_dir
         self.asof = asof or datetime.now(timezone.utc)
         self.window_days = window_days
         self.horizon_h = horizon_h
-        self.score_basis = score_basis
-        self.refit_edges = refit_edges
         self.use_cache = use_cache
         self.log = log
-        self.edges = json.loads(json.dumps(COHORT_EDGES))
-        if bar_enabled is None:
-            bar_enabled = os.environ.get("IMM_SCAN_PERF_BAR", "0") == "1"
-        self.bar_enabled = bool(bar_enabled)
         self.window_start = self.asof - timedelta(days=window_days)
         self.maturity_cutoff = self.asof - timedelta(
             seconds=horizon_h * 3600 + MATURITY_SLACK_SECS)
@@ -975,39 +924,30 @@ class ScanPerfScorer:
         self._build_markets()
         self._build_markouts()
         self._build_rent()
-        self._build_cohorts()
+        self._build_totals()
         self._build_units()
         self.timings["build_secs"] = round(time.time() - t0, 2)
 
     def _prep_spreads(self):
-        """Trailing-6h median spread / mid per market (the FITTING side).
-
-        A book that flickers between 4c and 5c must not move a market between
-        buckets on one selection_events row (judge must_fix J2-4)."""
+        """Per-series and tier MEDIAN two-sided spreads over each market's
+        first 6h of quotes: the fallbacks the one-sided mark tier widens by
+        when a ticker has no two-sided sample of its own (SPEC 2.4 tier 3)."""
         self._series_spread = {}
         self._tier_spread = None
         per_series = defaultdict(list)
         all_sp = []
-        self.fit_spread = {}
-        self.fit_mid = {}
         for t, q in self.quotes.items():
             ts, bids, asks = q
             if not ts:
                 continue
             t0 = ts[0]
-            sp, mid = [], []
             for j, tt in enumerate(ts):
                 if tt > t0 + 6 * 3600:
                     break
                 b, a = bids[j], asks[j]
                 if b is not None and a is not None and a > b:
-                    sp.append(a - b)
-                    mid.append((a + b) / 2.0)
-            if sp:
-                self.fit_spread[t] = statistics.median(sp)
-                self.fit_mid[t] = statistics.median(mid)
-                per_series[ser_of(t)].extend(sp)
-                all_sp.extend(sp)
+                    per_series[ser_of(t)].append(a - b)
+                    all_sp.append(a - b)
         for s, v in per_series.items():
             self._series_spread[s] = statistics.median(v)
         self._tier_spread = statistics.median(all_sp) if all_sp else 4.0
@@ -1491,495 +1431,167 @@ class ScanPerfScorer:
             return "mixed_by_period"
         return "est_floored"
 
-    # ------------------------------------------------------------- cohorts
 
-    def _assign(self, dim, ticker):
-        a = self.admission.get(ticker) or {}
-        if dim == "spread":
-            v = self.fit_spread.get(ticker)
-            if v is None:
-                v = fnum(a.get("spread_cents"))
-        elif dim == "mid":
-            v = self.fit_mid.get(ticker)
-            if v is None:
-                v = fnum(a.get("mid_cents"))
-        elif dim == "dtc":
-            close = ticker_close_date(ticker)
-            adm = parse_iso(a.get("ts"))
-            if adm is None:
-                fc = (self.markets.get(ticker) or {}).get("first_cycle")
-                adm = datetime.fromtimestamp(fc, timezone.utc) if fc else None
-            v = ((close - adm).total_seconds() / 86400.0
-                 if (close and adm) else None)
-        else:
-            # pool $/day is the admission snapshot; it does not flicker.
-            v = fnum(a.get("dollars_per_day"))
-        return v
+    # -------------------------------------------------- units (the verdicts)
 
-    def _bucket_of(self, dim, v):
-        if v is None:
-            return None
-        spec = self.edges[dim]
-        closed = spec["closed"]
-        # A "closed":"both" dimension has INTEGER-CENT edges with GAPS
-        # between them -- spread is [0,1], [2,4], [5,9], [10,19], [20,inf).
-        # The fitting-side value is statistics.median() over the trailing 6h
-        # of two-sided rows, which returns a half-cent for any even-length
-        # sample, so 1.5 / 4.5 / 9.5 / 19.5 fell into NO bucket and the
-        # market vanished from the whole `spread` dimension with no warning
-        # and no count -- and 4.5 is exactly the 4c<->5c flicker the
-        # trailing median was introduced to smooth (judge must_fix J2-4).
-        # Rounding HALF-UP to the cent the edges are written in keeps the
-        # frozen sha intact; the INTERPOLATION on the applying side still
-        # uses the unrounded value (dim_value), so the cliff fix is
-        # unaffected.
-        if closed == "both":
-            v = math.floor(v + 0.5) if v >= 0 else math.ceil(v - 0.5)
-        for key, lo, hi in spec["buckets"]:
-            if hi is None:
-                if v >= lo:
-                    return key
-            elif closed == "both":
-                if lo <= v <= hi:
-                    return key
-            else:
-                if lo <= v < hi:
-                    return key
-        return spec["buckets"][-1][0] if v >= spec["buckets"][-1][1] else None
-
-    def _refit_edges(self):
-        """--refit-edges: quintiles of risk-days per dimension. Stamps
-        edges_refit:true and the bot's loader rejects the file by default."""
-        for dim in DIM_ORDER:
-            pairs = []
-            for t, m in self.markets.items():
-                v = self._assign(dim, t)
-                if v is None or m["risk_days"] <= 0:
-                    continue
-                pairs.append((v, m["risk_days"]))
-            if len(pairs) < 10:
-                continue
-            pairs.sort()
-            total = sum(p[1] for p in pairs)
-            cuts, acc, k = [], 0.0, 1
-            for v, w in pairs:
-                acc += w
-                while k < 5 and acc >= total * k / 5.0:
-                    cuts.append(round(v, 2))
-                    k += 1
-            cuts = sorted(set(cuts))[:4]
-            bounds = [0.0] + cuts
-            buckets = []
-            for i, lo in enumerate(bounds):
-                hi = bounds[i + 1] if i + 1 < len(bounds) else None
-                buckets.append((f"q{i+1}", lo, hi))
-            self.edges[dim]["buckets"] = buckets
-            self.edges[dim]["closed"] = "left"
-
-    def _build_cohorts(self):
-        if self.refit_edges:
-            self._refit_edges()
-        self.bucket_of = {dim: {} for dim in DIM_ORDER}
-        self.dim_value = {dim: {t: self._assign(dim, t) for t in self.markets}
-                          for dim in DIM_ORDER}
-        # SILENT EXCLUSIONS NEVER SHOW IN LOGS (feedback_sweep_class_after_fix):
-        # a market with a real dimension value that lands in no bucket
-        # contributes to the tier mu and to n_markets but to NO bucket, so the
-        # dimension's bucket risk-days stop summing to coverage.risk_days and
-        # every dev_D on that dimension shifts. Count it and say so.
-        self.unassigned = {}
-        for dim in DIM_ORDER:
-            miss, miss_rd = [], 0.0
-            for t in self.markets:
-                v = self.dim_value[dim][t]
-                b = self._bucket_of(dim, v)
-                self.bucket_of[dim][t] = b
-                if b is None and v is not None:
-                    miss.append(t)
-                    miss_rd += self.markets[t]["risk_days"]
-            self.unassigned[dim] = {"n_markets": len(miss),
-                                    "risk_days": round(miss_rd, 2),
-                                    "tickers": sorted(miss)[:10]}
-            if miss:
-                self._warn(
-                    f"{len(miss)} market(s) / {miss_rd:,.1f} $-days have a "
-                    f"{dim} value that falls in NO bucket and are dropped from "
-                    f"that dimension only (e.g. {', '.join(sorted(miss)[:3])})")
-
+    def _build_totals(self):
         self.risk_total = sum(m["risk_days"] for m in self.markets.values())
         self.risk_total_50 = sum(m["risk_days_at50c"] for m in self.markets.values())
         self.mo_total = sum(self.market_mo.values())
-        self.rent_total = sum(self.market_rent.values())
-        self.mu = {
-            "trading": safe_div(self.mo_total, self.risk_total),
-            "blend": safe_div(self.mo_total + self.rent_total, self.risk_total),
-        }
-        self.cohorts = self._fit_cohorts(set(self.markets))
-        self.prev_table = load_json(os.path.join(self.work_dir, TABLE_NAME), None)
-        self._apply_ratchet()
+        self.rent_total = sum(self.market_rent.values())        # MODELLED, floored
+        self.realized_total = sum(m["realized_dollars"] for m in self.markets.values())
+        self.mtm_total = sum(m["mtm_dollars"] for m in self.markets.values())
+        evs = {self.ev(t) for t in self.markets}
+        # per-period basis: a MEASURED credit replaced the estimate where the
+        # ledger covers the period, else the floored estimate (never both)
+        self.rent_used_total = sum(self.event_rent.get(e, 0.0) for e in evs)
+        self.rent_measured_total = sum(self.event_rent_measured.get(e, 0.0) for e in evs)
+        self.net_total = self.rent_used_total + self.realized_total + self.mtm_total
 
-    def _fit_cohorts(self, keep):
-        """The cohort table on BOTH bases. Only `keep` markets contribute
-        (leave-one-EVENT-out / leave-one-SERIES-out re-fit the same way)."""
-        risk_total = sum(self.markets[t]["risk_days"] for t in keep)
-        mo_total = sum(self.market_mo.get(t, 0.0) for t in keep)
-        rent_total = sum(self.market_rent.get(t, 0.0) for t in keep)
-        mu = {"trading": safe_div(mo_total, risk_total),
-              "blend": safe_div(mo_total + rent_total, risk_total)}
-        out = {}
-        for dim in DIM_ORDER:
-            spec = self.edges[dim]
-            buckets = []
-            for key, lo, hi in spec["buckets"]:
-                members = [t for t in keep if self.bucket_of[dim].get(t) == key]
-                d = sum(self.markets[t]["risk_days"] for t in members)
-                num_tr = sum(self.market_mo.get(t, 0.0) for t in members)
-                num_bl = num_tr + sum(self.market_rent.get(t, 0.0) for t in members)
-                n_ser = len({ser_of(t) for t in members})
-                n_ev = len({self.ev(t) for t in members})
-                n_fills = sum(self.market_fills_matured.get(t, 0) for t in members)
-                n_unm = sum(self.market_unmarked.get(t, 0) for t in members)
-                w = safe_div(d, d + COHORT_PRIOR_RISK_DAYS)
-                raw_tr = safe_div(num_tr, d)
-                raw_bl = safe_div(num_bl, d)
-                muted = (n_ser < BUCKET_MUTE_MIN_SERIES or n_ev < BUCKET_MUTE_MIN_EVENTS
-                         or (n_fills > 0 and n_unm / n_fills > DATA_THIN_UNMARKED_FRAC))
-                dev_tr = 0.0 if muted else clip(w * (raw_tr - mu["trading"]), -DIM_CLIP, DIM_CLIP)
-                dev_bl = 0.0 if muted else clip(w * (raw_bl - mu["blend"]), -DIM_CLIP, DIM_CLIP)
-                vals = [(self.dim_value[dim][t], self.markets[t]["risk_days"])
-                        for t in members if self.dim_value[dim].get(t) is not None]
-                wsum = sum(v[1] for v in vals)
-                if wsum > 0:
-                    centre = sum(v[0] * v[1] for v in vals) / wsum
-                elif hi is None:
-                    centre = float(lo)
-                else:
-                    centre = (float(lo) + float(hi)) / 2.0
-                buckets.append({
-                    "key": key, "lo": lo, "hi": hi, "centre": round(centre, 4),
-                    "n_markets": len(members), "n_series": n_ser, "n_events": n_ev,
-                    "n_fills": n_fills, "risk_days": round(d, 2),
-                    "raw_trading": round(raw_tr, 6), "dev_trading": round(dev_tr, 6),
-                    "raw_blend": round(raw_bl, 6), "dev_blend": round(dev_bl, 6),
-                    "muted": bool(muted),
-                })
-            out[dim] = {"field": spec["field"], "assign": spec["assign"],
-                        "closed": spec["closed"], "buckets": buckets}
-        return out
+    def family_of(self, series: str) -> str:
+        """The grouped family a series belongs to (FAMILY_GROUPS), else the
+        series itself. A Fiscal.ai member is recognised by the `fiscal` flag
+        the bot cached on its scan_series_meta verdict; the others by name."""
+        meta = self.series_meta.get(series) or {}
+        for g in FAMILY_GROUPS:
+            if g.get("fiscal") and bool(meta.get("fiscal")):
+                return g["name"]
+            rx = g.get("regex")
+            if rx and re.match(rx, series):
+                return g["name"]
+        return series
 
-    def _apply_ratchet(self):
-        """SPEC 3.7: req may DEEPEN immediately but may only EASE by at most
-        RATCHET_EASE_PER_RUN versus the previously published value."""
-        self.ratchet_eased = 0
-        prev = self.prev_table
-        if not prev:
-            self.notes.append("no previous scan_perf.json: the asymmetry ratchet "
-                              "has nothing to ease against on this run")
-            return
-        pb = {}
-        for dim, blk in (prev.get("cohorts") or {}).items():
-            for b in blk.get("buckets") or []:
-                pb[(dim, b.get("key"))] = b
-        for dim, blk in self.cohorts.items():
-            for b in blk["buckets"]:
-                p = pb.get((dim, b["key"]))
-                if not p:
-                    continue
-                for col in ("dev_trading", "dev_blend"):
-                    pv = p.get(col)
-                    if pv is None:
-                        continue
-                    lim = float(pv) + RATCHET_EASE_PER_RUN
-                    if b[col] > lim:
-                        b[col] = round(min(0.0, lim), 6)
-                        self.ratchet_eased += 1
+    @staticmethod
+    def _roi(num, risk):
+        return clip(safe_div(num, risk), ROI_CLIP_LO, ROI_CLIP_HI) if risk > 0 else 0.0
 
-    # --------------------------------------------------------- the adjustment
+    def _unit_rec(self, kind: str, key: str, tickers) -> dict:
+        """One unit's historical-ROI record (event root / series / family).
 
-    def _interp_dev(self, dim, value, basis="trading", cohorts=None):
-        """Piecewise-linear between adjacent bucket CENTRES; flat outside the
-        end centres (the cliff fix, judge must_fix J2-4)."""
-        blk = (cohorts or self.cohorts)[dim]
-        pts = [(b["centre"], b["dev_trading" if basis == "trading" else "dev_blend"])
-               for b in blk["buckets"]]
-        pts.sort()
-        if value is None or not pts:
-            return 0.0
-        if value <= pts[0][0]:
-            return pts[0][1]
-        if value >= pts[-1][0]:
-            return pts[-1][1]
-        for i in range(len(pts) - 1):
-            x0, y0 = pts[i]
-            x1, y1 = pts[i + 1]
-            if x0 <= value <= x1:
-                if x1 == x0:
-                    return min(y0, y1)
-                f = (value - x0) / (x1 - x0)
-                return y0 + f * (y1 - y0)
-        return pts[-1][1]
-
-    def adj_struct(self, ticker, basis=None, cohorts=None):
-        """adj_struct = the SINGLE most negative dimension deviation.
-
-        NEVER a sum: spread, days-to-close and pool are heavily collinear on
-        this roster (KXCPIYOY sits in spread 20c+, dtc 30-90d AND pool <$20 at
-        once), so summing counts the same -$46.30 three times."""
-        basis = basis or self.score_basis
-        best = 0.0
-        code = ""
-        for dim in DIM_ORDER:
-            v = self.dim_value[dim].get(ticker)
-            if v is None:
-                continue
-            d = self._interp_dev(dim, v, basis, cohorts)
-            if d < best:
-                best = d
-                b = self.bucket_of[dim].get(ticker) or ""
-                code = f"{_DIM_CODE[dim]}{b}"
-        return best, code
-
-    # --------------------------------------------------------- series/events
-
-    def _unit_stats(self, tickers, basis):
-        risk = sum(self.markets[t]["risk_days"] for t in tickers)
+        roi_hist = (rent_used + realized + mtm) / risk_days. rent_used is the
+        per-period basis (MEASURED credit where the ledger covers the period,
+        else the floored MODELLED estimate); realized is MEASURED; mtm is the
+        bot's own last mark on what the unit still holds. Two companion
+        rates are published so nobody has to trust the blend: trading-only
+        (no rent at all) and measured-only (credits that replaced an
+        estimate + realized; no estimate, no mark)."""
+        tickers = sorted(tickers)
+        tset = set(tickers)
+        evs = sorted({self.ev(t) for t in tickers})
+        mk = self.markets
+        risk = sum(mk[t]["risk_days"] for t in tickers)
+        risk50 = sum(mk[t]["risk_days_at50c"] for t in tickers)
+        realized = sum(mk[t]["realized_dollars"] for t in tickers)
+        mtm = sum(mk[t]["mtm_dollars"] for t in tickers)
+        rent_mod = sum(self.market_rent.get(t, 0.0) for t in tickers)
+        rent_used = sum(self.event_rent.get(e, 0.0) for e in evs)
+        rent_meas = sum(self.event_rent_measured.get(e, 0.0) for e in evs)
+        credited_all = sum(self.event_credited_all.get(e, 0.0) for e in evs)
         mo = sum(self.market_mo.get(t, 0.0) for t in tickers)
-        rent = sum(self.market_rent.get(t, 0.0) for t in tickers)
-        num = mo if basis == "trading" else mo + rent
-        eps = sum(len(self.market_episodes.get(t, ())) for t in tickers)
-        fills = sum(self.market_fills.get(t, 0) for t in tickers)
-        fills_mat = sum(self.market_fills_matured.get(t, 0) for t in tickers)
-        unm = sum(self.market_unmarked.get(t, 0) for t in tickers)
         ct = sum(self.market_ct_matured.get(t, 0.0) for t in tickers)
+        fills = sum(self.market_fills.get(t, 0) for t in tickers)
+        contracts = sum(abs(r["q"]) for r in self.fill_rows if r["ticker"] in tset)
         days = set()
         for t in tickers:
             days |= self.market_days.get(t, set())
-        return {"risk_days": risk, "mo": mo, "rent": rent, "num": num,
-                "episodes": eps, "fills": fills, "fills_matured": fills_mat,
-                "unmarked": unm, "contracts": ct, "n_days": len(days),
-                "n_markets": len(tickers), "y": safe_div(num, risk)}
-
-    def _bootstrap_ci_hi(self, tickers, rent, seed_key):
-        """One-sided upper bound of (markout + rent) per $-day.
-
-        CLUSTERED: SPEC 3.6 says "clustered by market" but SPEC test 44
-        ("three strikes of one event are one draw") defines the cluster as
-        the EVENT, and the two cannot both hold. The event is taken, because
-        three strikes of one event move on the same print (KXCPIYOY's three
-        strikes all repriced on the same September CPI) and the coarser
-        cluster gives the WIDER interval — i.e. it bars LESS often, which is
-        the fail-safe direction. Recorded as a deviation.
-
-        Rent enters as a deterministic offset: the CI covers the markout
-        term, which is what queue selection makes noisy."""
-        ts = [t for t in tickers if self.markets[t]["risk_days"] > 0]
-        if len(ts) < 2:
-            return None
-        rng = random.Random(f"{BOOTSTRAP_SEED}:{seed_key}")
-        clusters = defaultdict(lambda: [0.0, 0.0])
-        for t in ts:
-            c = clusters[self.ev(t)]
-            c[0] += self.market_mo.get(t, 0.0)
-            c[1] += self.markets[t]["risk_days"]
-        mos = [c[0] for c in clusters.values()]
-        rds = [c[1] for c in clusters.values()]
-        n = len(mos)
-        if n < 2:
-            return None
-        draws = []
-        for _ in range(BAR_BOOTSTRAP):
-            num = den = 0.0
-            for _j in range(n):
-                k = rng.randrange(n)
-                num += mos[k]
-                den += rds[k]
-            if den > 0:
-                draws.append((num + rent) / den)
-        if not draws:
-            return None
-        draws.sort()
-        idx = min(len(draws) - 1, int(math.ceil(BAR_CI * len(draws))) - 1)
-        return draws[idx]
-
-    def _prev_verdicts(self, kind):
-        prev = self.prev_table or {}
-        return {k: v for k, v in (prev.get(kind) or {}).items()}
+        firsts = [mk[t]["first_cycle"] for t in tickers if mk[t]["first_cycle"] is not None]
+        lasts = [mk[t]["last_cycle"] for t in tickers if mk[t]["last_cycle"] is not None]
+        net = rent_used + realized + mtm
+        roi = self._roi(net, risk)
+        roi_tr = self._roi(realized + mtm, risk)
+        roi_meas = self._roi(rent_meas + realized, risk)
+        if risk < MIN_RISK_DAYS:
+            verdict = "insufficient"
+            reason = f"{risk:.0f} < {MIN_RISK_DAYS:.0f} $-days of history"
+        elif roi < BLOCK_ROI:
+            verdict = "block"
+            reason = (f"roi_hist {roi:+.4f}/day < {BLOCK_ROI:+.2f} on "
+                      f"{risk:.0f} $-days (net ${net:+.2f})")
+        else:
+            verdict = "allow"
+            reason = f"roi_hist {roi:+.4f}/day on {risk:.0f} $-days (net ${net:+.2f})"
+        rec = {
+            "kind": kind, "key": key,
+            "n_markets": len(tickers), "n_events": len(evs),
+            "events": evs[:MAX_EVENTS_LISTED],
+            "n_fills": fills, "contracts_filled": round(contracts, 2),
+            "n_fill_days": len(days),
+            "first_cycle": (iso_z(datetime.fromtimestamp(min(firsts), timezone.utc))
+                            if firsts else None),
+            "last_cycle": (iso_z(datetime.fromtimestamp(max(lasts), timezone.utc))
+                           if lasts else None),
+            "risk_days": round(risk, 2), "risk_days_at50c": round(risk50, 2),
+            "rent_modelled": round(rent_mod, 4),
+            "rent_used": round(rent_used, 4),
+            "rent_measured_dollars": round(rent_meas, 4),
+            "rent_basis": self._unit_rent_basis(tickers),
+            "credited_measured": round(credited_all, 4),
+            "realized_dollars": round(realized, 4),
+            "mtm_dollars": round(mtm, 4),
+            "net_dollars": round(net, 4),
+            "roi_hist": round(roi, 6),
+            "roi_hist_trading": round(roi_tr, 6),
+            "roi_hist_measured": round(roi_meas, 6),
+            "markout_c_per_ct_24h": round(safe_div(100.0 * mo, ct), 3),
+            "verdict": verdict, "reason": reason,
+        }
+        if verdict == "block":
+            rec["until"] = iso_z(self.asof + timedelta(hours=BLOCK_TTL_HOURS))
+        return rec
 
     def _build_units(self):
-        basis = self.score_basis
-        by_series = defaultdict(list)
+        """events (by ROOT), series and grouped families. The bot resolves a
+        candidate root -> series -> family and uses the first unit whose
+        verdict is not `insufficient` (lookup_unit mirrors it here)."""
         by_root = defaultdict(list)
-        self.event_markets = defaultdict(list)
+        by_series = defaultdict(list)
+        by_family = defaultdict(list)
+        self.family_map = {}
         for t in self.markets:
-            by_series[ser_of(t)].append(t)
-            ev = self.ev(t)
-            self.event_markets[ev].append(t)
-            by_root[root_of(ev)].append(t)
-
-        prev_series = self._prev_verdicts("series")
-        prev_events = self._prev_verdicts("events")
-        self.series_recs = {}
+            s = ser_of(t)
+            fam = self.family_map.get(s)
+            if fam is None:
+                fam = self.family_map[s] = self.family_of(s)
+            by_root[root_of(self.ev(t))].append(t)
+            by_series[s].append(t)
+            if fam != s:
+                by_family[fam].append(t)
         self.event_recs = {}
-        self.unit_dev = {}
-        self.bar_blocked_reason = []
-        self.max_episodes_unit = ("", 0)
+        for key, tickers in sorted(by_root.items()):
+            rec = self._unit_rec("event", key, tickers)
+            rec["series"] = ser_of(tickers[0])
+            rec["family"] = self.family_map.get(rec["series"], rec["series"])
+            self.event_recs[key] = rec
+        self.series_recs = {}
+        for key, tickers in sorted(by_series.items()):
+            rec = self._unit_rec("series", key, tickers)
+            rec["family"] = self.family_map.get(key, key)
+            rec["roots"] = sorted({root_of(self.ev(t)) for t in tickers})[:MAX_EVENTS_LISTED]
+            self.series_recs[key] = rec
+        self.family_recs = {}
+        for g in FAMILY_GROUPS:
+            name = g["name"]
+            tickers = by_family.get(name, [])
+            rec = self._unit_rec("family", name, tickers)
+            rec["members"] = sorted({ser_of(t) for t in tickers})
+            rec["match"] = {k: v for k, v in g.items() if k in ("regex", "fiscal")}
+            rec["note"] = g.get("note", "")
+            self.family_recs[name] = rec
 
-        for unit_kind, groups, prev in (("series", by_series, prev_series),
-                                        ("events", by_root, prev_events)):
-            for key, tickers in sorted(groups.items()):
-                st = self._unit_stats(tickers, basis)
-                if st["episodes"] > self.max_episodes_unit[1]:
-                    self.max_episodes_unit = (key, st["episodes"])
-                dated = {self.ev(t) for t in tickers}
-                if unit_kind == "events" and len(dated) < 2:
-                    continue          # the event term would be a market-level n=1 scorecard
-                thin = (st["fills_matured"] > 0 and
-                        st["unmarked"] / st["fills_matured"] > DATA_THIN_UNMARKED_FRAC)
-                # structural expectation for this unit
-                wsum = sum(self.markets[t]["risk_days"] for t in tickers)
-                if wsum > 0:
-                    struct = sum(self.adj_struct(t, basis)[0] * self.markets[t]["risk_days"]
-                                 for t in tickers) / wsum
-                else:
-                    struct = 0.0
-                y_cohort = self.mu[basis] + struct
-                shrink = safe_div(st["fills"], st["fills"] + SERIES_PRIOR_FILLS)
-                raw_dev = clip(shrink * (st["y"] - y_cohort), -DIM_CLIP, DIM_CLIP)
-                if thin or st["risk_days"] <= 0:
-                    raw_dev = 0.0
-                pk = prev.get(key) or {}
-                pdev = pk.get("dev")
-                dev = raw_dev
-                if isinstance(pdev, (int, float)):
-                    lim = float(pdev) + RATCHET_EASE_PER_RUN
-                    if dev > lim:
-                        dev = min(0.0, lim)
-                        self.ratchet_eased += 1
-                dev = clip(dev, -DIM_CLIP, 0.0) if dev < 0 else 0.0
-
-                ci_hi = None
-                bar_ok = False
-                if (st["episodes"] >= BAR_MIN_EPISODES and st["n_markets"] >= BAR_MIN_MARKETS
-                        and st["n_days"] >= BAR_MIN_DAYS and not thin):
-                    ci_hi = self._bootstrap_ci_hi(tickers, st["rent"], key)
-                    bar_ok = ci_hi is not None and ci_hi < 0
-                # sustain_runs >= 2 means "the same verdict on the previous
-                # run", but a first run can never publish "bar", so the
-                # sustain flag is the previous run's bar ELIGIBILITY (which is
-                # what condition 3 actually tests) — otherwise the bar could
-                # never arm at all.
-                sustained = bool(pk.get("verdict") == "bar" or pk.get("bar_eligible"))
-                bar_since = pk.get("bar_since")
-                verdict = "neutral"
-                until = None
-                if dev < -1e-9:
-                    verdict = "down_rank"
-                if bar_ok and sustained and self.bar_enabled:
-                    verdict = "bar"
-                    until = iso_z(self.asof + timedelta(days=BAR_TTL_DAYS))
-                elif bar_ok and not sustained:
-                    self.bar_blocked_reason.append(
-                        f"{key}: bar-eligible but sustain_runs<{BAR_SUSTAIN_RUNS}")
-                    if verdict == "neutral":
-                        verdict = "down_rank"
-                elif bar_ok and not self.bar_enabled:
-                    self.bar_blocked_reason.append(
-                        f"{key}: bar-eligible but IMM_SCAN_PERF_BAR=0")
-                    if verdict == "neutral":
-                        verdict = "down_rank"
-                # MINIMUM DWELL: a bar already live keeps running for
-                # BAR_MIN_DWELL_DAYS unless its own TTL expires. Tightening is
-                # immediate; relaxing is by timeout only.
-                if verdict != "bar" and pk.get("verdict") == "bar" and bar_since:
-                    since = parse_iso(bar_since)
-                    prev_until = parse_iso(pk.get("until"))
-                    live = prev_until is None or prev_until > self.asof
-                    if (live and since and
-                            (self.asof - since).days < BAR_MIN_DWELL_DAYS):
-                        verdict = "bar"
-                        until = pk.get("until")
-
-                # a data_thin group is forced neutral and can NEVER be barred
-                cohort_label = "data_thin" if thin else ""
-                if thin:
-                    verdict = "neutral"
-                    dev = 0.0
-                    until = None
-
-                code = self._unit_code(tickers, basis)
-                tset = set(tickers)          # hoisted: was rebuilt per fill row
-                rec = {
-                    "n_fills": st["fills"], "n_episodes": st["episodes"],
-                    "n_markets": st["n_markets"], "n_days": st["n_days"],
-                    "contracts_filled": round(sum(abs(r["q"]) for r in self.fill_rows
-                                                  if r["ticker"] in tset), 2),
-                    "contracts_matured": round(st["contracts"], 2),
-                    "risk_days": round(st["risk_days"], 2),
-                    "mo_dollars": round(st["mo"], 4),
-                    "markout_c_per_ct_24h": round(safe_div(100.0 * st["mo"], st["contracts"]), 3),
-                    "realized_dollars": round(sum(self.markets[t]["realized_dollars"]
-                                                  for t in tickers), 4),
-                    "mtm_dollars": round(sum(self.markets[t]["mtm_dollars"]
-                                             for t in tickers), 4),
-                    "rent_modelled": round(st["rent"], 4),
-                    "rent_basis": self._unit_rent_basis(tickers),
-                    "rent_measured_frac": round(self._unit_measured_frac(tickers), 4),
-                    "rent_measured_dollars": round(
-                        self._unit_measured_dollars(tickers), 4),
-                    "credited_measured": round(self._unit_credited(tickers), 4),
-                    "y_trading": round(safe_div(st["mo"], st["risk_days"]), 6),
-                    "y_cohort": round(y_cohort, 6),
-                    "dev": round(dev, 6),
-                    "ci_hi": (None if ci_hi is None else round(ci_hi, 6)),
-                    "unmarked_fills": st["unmarked"],
-                    "cohort": cohort_label,
-                    "verdict": verdict,
-                    "bar_eligible": bool(bar_ok),
-                    "code": code,
-                }
-                if until:
-                    rec["until"] = until
-                if verdict == "bar":
-                    rec["bar_since"] = bar_since or iso_z(self.asof)
-                if unit_kind == "events":
-                    rec["root"] = key
-                    rec["n_dated_events"] = len(dated)
-                    rec["events"] = sorted(dated)
-                    self.event_recs[key] = rec
-                else:
-                    self.series_recs[key] = rec
-                self.unit_dev[(unit_kind, key)] = dev
-        self._enforce_bar_caps()
-
-    def _enforce_bar_caps(self):
-        """Bars over the caps are downgraded to down_rank BEFORE writing and
-        the downgrade is recorded in notes (writer half of the double guard;
-        the loader rejects >40 and the reader truncates to 5)."""
-        bars = [(k, "series", r) for k, r in self.series_recs.items() if r["verdict"] == "bar"]
-        bars += [(k, "events", r) for k, r in self.event_recs.items() if r["verdict"] == "bar"]
-        # The "universe" denominator is the scored MARKET count, not the unit
-        # count: with two scored units 25% would round to zero and no bar
-        # could ever fire, which is not what a cap is for.
-        n_markets = max(1, len(self.markets))
-        allowed = min(MAX_BARRED, int(MAX_BAR_FRAC_UNIVERSE * n_markets))
-        if len(bars) <= allowed:
-            return
-        bars.sort(key=lambda x: x[2].get("ci_hi") if x[2].get("ci_hi") is not None else 0.0)
-        for key, _kind, rec in bars[allowed:]:
-            rec["verdict"] = "down_rank"
-            rec.pop("until", None)
-            rec.pop("bar_since", None)
-            self.notes.append(f"bar on {key} downgraded to down_rank before writing: "
-                              f"over the writer cap of {allowed} live bars")
-
-    def _unit_code(self, tickers, basis):
-        counts = defaultdict(float)
-        for t in tickers:
-            _d, c = self.adj_struct(t, basis)
-            if c:
-                counts[c] += self.markets[t]["risk_days"] or 1.0
-        top = sorted(counts.items(), key=lambda kv: -kv[1])[:2]
-        return "|".join(k for k, _v in top)
+    def lookup_unit(self, ticker: str):
+        """The bot's hierarchy, mirrored: event root -> series -> family; the
+        most specific unit with enough history wins. (kind, key, rec) or
+        (None, None, None) when nothing has MIN_RISK_DAYS yet."""
+        s = ser_of(ticker)
+        root = root_of(self.ev(ticker))
+        fam = self.family_map.get(s, s)
+        for kind, key, recs in (("event", root, self.event_recs),
+                                ("series", s, self.series_recs),
+                                ("family", fam, self.family_recs)):
+            rec = recs.get(key)
+            if rec and rec["verdict"] != "insufficient":
+                return kind, key, rec
+        return None, None, None
 
     def _unit_rent_basis(self, tickers):
         bases = set()
@@ -1991,14 +1603,29 @@ class ScanPerfScorer:
             return "mixed_by_period"
         return "est_floored"
 
-    def _unit_measured_dollars(self, tickers):
-        """The MEASURED credit that REPLACED an estimate for a qualifying
-        period (not the same thing as `credited_measured`, which is every
-        ledger dollar the event ever received). Emitted next to the fraction
-        because a fraction that rounds to 0.0 next to a non-zero
-        `credited_measured` reads as a contradiction."""
-        evs = {self.ev(t) for t in tickers}
-        return sum(self.event_rent_measured.get(e, 0.0) for e in evs)
+    # ------------------------------------------------------ counterfactual
+
+    def counterfactual(self):
+        """[IN-SAMPLE, MODELLED COUNTERFACTUAL] — never a measurement. The
+        markets admitted in the window whose unit, judged on the WHOLE
+        window, is now blocked. In-sample because the unit's history at each
+        admission was shorter than it is now."""
+        rows = []
+        for t in sorted(self.markets):
+            kind, key, rec = self.lookup_unit(t)
+            if rec and rec["verdict"] == "block":
+                rows.append((t, kind, key))
+        mk = self.markets
+        return {
+            "n_markets": len(rows), "n_all": len(self.markets),
+            "trading": sum(mk[t]["realized_dollars"] + mk[t]["mtm_dollars"]
+                           for t, _k, _y in rows),
+            "rent_modelled": sum(self.market_rent.get(t, 0.0) for t, _k, _y in rows),
+            "risk_days": sum(mk[t]["risk_days"] for t, _k, _y in rows),
+            "markets": [t for t, _k, _y in rows],
+            "units": sorted({f"{k}:{y}" for _t, k, y in rows}),
+        }
+
 
     def _unit_measured_frac(self, tickers):
         evs = {self.ev(t) for t in tickers}
@@ -2006,9 +1633,6 @@ class ScanPerfScorer:
         tot = sum(self.event_rent.get(e, 0.0) for e in evs)
         return safe_div(meas, tot)
 
-    def _unit_credited(self, tickers):
-        evs = {self.ev(t) for t in tickers}
-        return sum(self.event_credited_all.get(e, 0.0) for e in evs)
 
     # ------------------------------------------------------------- guards
 
@@ -2047,112 +1671,21 @@ class ScanPerfScorer:
             return None
         return (self.risk_total - pr) / pr
 
-    def clamped_frac(self):
-        """SPEC 4.4 guard 3 / SPEC 6.2 -- the sign-flip detector.
-
-        INTEGRATION 2026-09-18: the bot's `_scan_perf_validate` counts a
-        DIFFERENT set than this writer did -- every bucket's `dev_trading`
-        (muted ones included, which carry 0.0) plus each series/event
-        `dev`, and never `dev_blend`, because `trading` is the only acting
-        column (SPEC 3.2). MEASURED on today's live table that denominator
-        is 115 against the writer's 129, so a file sitting at 12 clamped
-        acting devs is 10.4% to the loader (REFUSED WHOLE, tier silently
-        reverts to the last good table) and 9.3% to the writer (shipped).
-        The writer must never be laxer than the reader: both bases are
-        computed and the MAX drives the abort and the reported figure, so
-        the printed number is never below what the bot will compute."""
-        acting = []
-        for blk in self.cohorts.values():
-            for b in blk["buckets"]:
-                acting.append(b["dev_trading"])
-        blended = []
-        for blk in self.cohorts.values():
-            for b in blk["buckets"]:
-                if b["muted"]:
-                    continue
-                blended.append(b["dev_trading"])
-                blended.append(b["dev_blend"])
-        for rec in list(self.series_recs.values()) + list(self.event_recs.values()):
-            acting.append(rec["dev"])
-            blended.append(rec["dev"])
-
-        def _frac(xs):
-            if not xs:
-                return 0.0
-            return sum(1 for d in xs
-                       if abs(abs(d) - DIM_CLIP) < 1e-9) / float(len(xs))
-        if not acting:
-            return 0.0, 0
-        return max(_frac(acting), _frac(blended)), len(acting)
-
-    # ------------------------------------------------------ counterfactual
-
-    def counterfactual(self):
-        """[IN-SAMPLE, MODELLED COUNTERFACTUAL] — never a measurement."""
-        blocked = []
-        n_adm = 0
-        for t, a in self.admission.items():
-            denom = fnum(a.get("est_collateral_dollars"), 0.0) or 0.0
-            per_day = fnum(a.get("est_dollars_per_day"), 0.0) or 0.0
-            if denom <= 0:
-                continue
-            n_adm += 1
-            gross = per_day / denom
-            adj, _c = self.adj_struct(t, self.score_basis)
-            for kind, key in (("series", ser_of(t)), ("events", root_of(self.ev(t)))):
-                d = self.unit_dev.get((kind, key))
-                if d is not None and d < adj:
-                    adj = d
-            adj = clip(adj, -ADJ_CLIP, 0.0)
-            req = clip(-1.0 * adj, 0.0, MAX_REQ)
-            if gross >= SCAN_MIN_ROI and gross - req < SCAN_MIN_ROI:
-                blocked.append(t)
-        mo = sum(self.market_mo.get(t, 0.0) for t in blocked)
-        rent = sum(self.market_rent.get(t, 0.0) for t in blocked)
-        cats = defaultdict(float)
-        for t in blocked:
-            cat = ((self.series_meta.get(ser_of(t)) or {}).get("category") or "unknown")
-            cats[cat] += 1.0
-        tot = sum(cats.values()) or 1.0
-        return {"n_admissions": n_adm, "n_blocked": len(blocked),
-                "blocked": sorted(blocked),
-                "mo_avoided": mo, "rent_forgone": rent,
-                "category_share": {k: round(v / tot, 4)
-                                   for k, v in sorted(cats.items(), key=lambda kv: -kv[1])}}
-
-    def leave_one_out(self, level):
-        """leave-one-EVENT-out and leave-one-SERIES-out re-fits (judge
-        must_fix J1-2: the per-MARKET leave-one-out is nearly a no-op)."""
-        base = self.cohorts
-        keyfn = (lambda t: self.ev(t)) if level == "event" else (lambda t: ser_of(t))
-        groups = defaultdict(list)
-        for t in self.markets:
-            groups[keyfn(t)].append(t)
-        ranked = sorted(groups.items(),
-                        key=lambda kv: -sum(abs(self.market_mo.get(t, 0.0)) for t in kv[1]))
-        rows = []
-        for key, tickers in ranked[:10]:
-            keep = set(self.markets) - set(tickers)
-            ref = self._fit_cohorts(keep)
-            flips = 0
-            acting = 0
-            for dim in DIM_ORDER:
-                for b0, b1 in zip(base[dim]["buckets"], ref[dim]["buckets"]):
-                    if b0["muted"] or b1["muted"]:
-                        continue
-                    acting += 1
-                    s0 = (b0["dev_trading"] > 1e-9) - (b0["dev_trading"] < -1e-9)
-                    s1 = (b1["dev_trading"] > 1e-9) - (b1["dev_trading"] < -1e-9)
-                    if s0 and s1 and s0 != s1:
-                        flips += 1
-            worst = min((b["dev_trading"] for dim in DIM_ORDER
-                         for b in ref[dim]["buckets"] if not b["muted"]), default=0.0)
-            rows.append({"key": key, "n_markets": len(tickers),
-                         "sign_flips": flips, "acting_buckets": acting,
-                         "worst_dev_trading": round(worst, 5)})
-        return rows
 
     # --------------------------------------------------------------- output
+
+    # --------------------------------------------------------------- output
+
+    def _shed_insufficient(self, recs: dict, n_over: int) -> int:
+        """Bound the file for the bot's record cap by dropping `insufficient`
+        records (pure no-ops for the bot), smallest history first."""
+        if n_over <= 0:
+            return 0
+        cand = sorted((k for k, r in recs.items() if r["verdict"] == "insufficient"),
+                      key=lambda k: recs[k]["risk_days"])
+        for k in cand[:n_over]:
+            recs.pop(k)
+        return min(len(cand), n_over)
 
     def table(self):
         cov_markets = len(self.markets)
@@ -2160,113 +1693,95 @@ class ScanPerfScorer:
         cov_series = len({ser_of(t) for t in self.markets})
         recon_delta, _mine, _sink = self.reconciliation()
         dod = self.exposure_dod()
-        clamped, _n = self.clamped_frac()
         cf = self.counterfactual()
 
-        barred_series = sum(1 for r in self.series_recs.values() if r["verdict"] == "bar")
-        barred_events = sum(1 for r in self.event_recs.values() if r["verdict"] == "bar")
-        down = (sum(1 for r in self.series_recs.values() if r["verdict"] == "down_rank") +
-                sum(1 for r in self.event_recs.values() if r["verdict"] == "down_rank"))
-        n_units = max(1, len(self.markets))
+        events_out = dict(self.event_recs)
+        series_out = dict(self.series_recs)
+        families_out = dict(self.family_recs)
+        n_units = len(events_out) + len(series_out) + len(families_out)
+        if n_units > MAX_RECORDS:
+            over = n_units - MAX_RECORDS
+            shed = self._shed_insufficient(events_out, over)
+            shed += self._shed_insufficient(series_out, over - shed)
+            n_units -= shed
+            self._warn(f"{shed} insufficient record(s) dropped so the bot's record "
+                       f"count ({n_units}) stays under MAX_RECORDS={MAX_RECORDS}")
+            if n_units > MAX_RECORDS:
+                self._warn(f"! still {n_units} > {MAX_RECORDS} records after shedding "
+                           f"every insufficient one: the BOT WILL REFUSE THIS FILE WHOLE")
+
+        n_block = {
+            "events": sum(1 for r in events_out.values() if r["verdict"] == "block"),
+            "series": sum(1 for r in series_out.values() if r["verdict"] == "block"),
+            "families": sum(1 for r in families_out.values() if r["verdict"] == "block"),
+        }
+        recent = self.recent_scan_groups
+        unmatched = []
+        for k, r in events_out.items():
+            if r["verdict"] == "block" and k not in recent:
+                unmatched.append(f"event:{k}")
+        for k, r in series_out.items():
+            if r["verdict"] == "block" and k not in recent:
+                unmatched.append(f"series:{k}")
+        for k, r in families_out.items():
+            if r["verdict"] == "block" and not (set(r.get("members") or []) & recent):
+                unmatched.append(f"family:{k}")
 
         notes = list(self.notes) + [
-            "markout is MEASURED from own fills against the INCENTIVE_MM_STRATEGY "
-            "s6 mark hierarchy (4 tiers, no carry-forward tier)",
-            "rent is MODELLED (cycle-log accrual integral, $1.00/market/period floor) "
-            "unless rent_basis=credited",
-            "EST and CREDITED are never summed: per (market, period) the rent is one "
-            "basis or the other",
+            "roi_hist = (rent_used + realized + mtm) / risk_days, in $/day per $ at "
+            "risk -- the same units as the bot's _raw_roi",
+            "rent_used is ONE basis per program period: a MEASURED ledger credit "
+            "where the ledger covers the period, else the floored MODELLED accrual; "
+            "EST and CREDITED are never summed",
             "MARKET-level rent is ALWAYS MODELLED: ledger rows are event-keyed, so a "
             "credit replaces an estimate at EVENT level only. rent_modelled and "
-            "credited_measured on one record are NOT two halves of a total and must "
-            "never be added; rent_measured_dollars is the part that replaced an "
-            "estimate, and rent_basis != est_floored implies it is non-zero",
-            "adj = the SINGLE most negative dimension deviation, never a sum",
-            "cohort bucket 'hi': null means +infinity (open-ended top bucket); 'closed' "
-            "is 'both' (lo<=v<=hi) for spread and 'left' (lo<=v<hi) elsewhere",
-            "'events' records are keyed by EVENT ROOT (SPEC 6.1), not by dated event",
-            "NO time decay in v1: SPEC 3 defines no half-life weighting, so every "
-            "observation in the window has weight 1 (an echoed-but-unapplied "
-            "--halflife-days was removed 2026-09-18 rather than left to mislead)",
-            "mark tiers 3 (one-sided) and 4 (unmarked) are UNREACHABLE while a "
-            "position is open: marks_*.jsonl writes every 300s per open position, so "
-            "tier 2's sink fallback pre-empts them. data_thin and bar condition 4 "
-            "therefore cannot fire on a held market; the honest freshness detector is "
-            "tier.mark_source_detail, not mark_source_mix",
+            "credited_measured on one record are NOT two halves of a total",
+            "realized is MEASURED (independent avg-cost replay of fills + "
+            "settlements); mtm is the bot's own last mark on open positions (a "
+            "MODELLED mark); roi_hist_trading and roi_hist_measured are published "
+            "beside roi_hist so the blend is never the only number",
+            "verdicts: insufficient (< MIN_RISK_DAYS of history; the bot treats the "
+            "unit as unknown), block (roi_hist < BLOCK_ROI), allow",
+            "'events' records are keyed by EVENT ROOT (the event ticker minus its "
+            "trailing date segment); the bot resolves a candidate root -> series -> "
+            "family and uses the most specific unit that is not insufficient",
+            "families are FAMILY_GROUPS only (fiscal flag or name regex, emitted "
+            "under match); every other series is its own family",
+            "markout is a DIAGNOSTIC (INCENTIVE_MM_STRATEGY s6 mark hierarchy, 4 "
+            "tiers, no carry-forward); no verdict reads it",
             "the avg-cost replay is independent of the REALIZED SINK but NOT of the "
             "bot's cost basis on the tickers listed in tier.recon_seeded_tickers "
             "(seeded from the first fill's pos_before/avg_before)",
-            "the bootstrap clusters by EVENT (SPEC test 44), not by market: the "
-            "coarser cluster widens the interval and therefore bars less often",
+            "NO time decay: every observation in the window has weight 1",
         ]
-        if barred_series + barred_events == 0:
-            notes.append("no group qualifies for a bar in this window")
 
         markets = {}
-        for t, m in sorted(self.markets.items()):
+        for t, m in sorted(self.markets.items(), key=lambda kv: -kv[1]["risk_days"]):
+            if len(markets) >= MAX_MARKET_RECORDS:
+                self._warn(f"markets block capped at {MAX_MARKET_RECORDS} records "
+                           f"by risk_days ({len(self.markets)} scored)")
+                break
+            rent = self.market_rent.get(t, 0.0)
+            net = rent + m["realized_dollars"] + m["mtm_dollars"]
             markets[t] = {
+                "series": ser_of(t), "event": self.ev(t),
+                "root": root_of(self.ev(t)),
+                "risk_days": round(m["risk_days"], 3),
+                "rent_modelled": round(rent, 4),
                 "realized_dollars": round(m["realized_dollars"], 4),
                 "mtm_dollars": round(m["mtm_dollars"], 4),
-                "mo_dollars": round(self.market_mo.get(t, 0.0), 4),
-                "risk_days": round(m["risk_days"], 3),
+                "net_dollars_modelled_rent": round(net, 4),
+                "roi_hist_modelled_rent": round(self._roi(net, m["risk_days"]), 6),
                 "pos": round(m["pos"], 3),
                 "avg_cents": round(m["avg_cents"], 3),
                 "mark_cents": (None if m["mark_cents"] is None else round(m["mark_cents"], 2)),
+                "fills": self.market_fills.get(t, 0),
                 "adopted_capped": bool(m["adopted_capped"]),
             }
-        if len(markets) + len(self.series_recs) + len(self.event_recs) > MAX_RECORDS:
-            keep = sorted(markets, key=lambda t: -abs(markets[t]["mo_dollars"]))
-            room = max(0, MAX_RECORDS - len(self.series_recs) - len(self.event_recs))
-            dropped = len(markets) - room
-            markets = {t: markets[t] for t in keep[:room]}
-            self._warn(f"markets block trimmed to {room} records "
-                       f"({dropped} dropped) to stay under MAX_RECORDS={MAX_RECORDS}")
-
-        # INTEGRATION 2026-09-18: the trim above counts markets+series+events,
-        # but the bot's record cap counts series + events + BUCKETS -- it never
-        # reads `markets` (SPEC 5). Trimming `markets` therefore does not bound
-        # the quantity that actually decides acceptance, and a table over the
-        # cap is refused WHOLE (fail-open to the last good table, i.e. a stale
-        # verdict outliving its evidence). Bound the loader's denominator here
-        # too, shedding only NEUTRAL records, most-positive `dev` first: a
-        # neutral record with dev >= 0 is a pure no-op for `scan_perf_adj`, and
-        # shedding a mildly negative one can only REDUCE a penalty, never add
-        # one. down_rank and bar records are never shed.
-        series_out = dict(self.series_recs)
-        events_out = dict(self.event_recs)
-        n_buckets = sum(len(blk["buckets"]) for blk in self.cohorts.values())
-        n_loader = len(series_out) + len(events_out) + n_buckets
-        if n_loader > MAX_RECORDS:
-            shed = sorted(
-                [("s", k, r) for k, r in series_out.items()
-                 if r.get("verdict") == "neutral"]
-                + [("e", k, r) for k, r in events_out.items()
-                   if r.get("verdict") == "neutral"],
-                key=lambda p: -float(p[2].get("dev") or 0.0))
-            n_drop = min(len(shed), n_loader - MAX_RECORDS)
-            for kind, k, _r in shed[:n_drop]:
-                (series_out if kind == "s" else events_out).pop(k, None)
-            residual = n_loader - n_drop
-            self._warn(
-                f"{n_drop} neutral record(s) dropped so the BOT LOADER's count "
-                f"(series+events+buckets = {n_loader}) comes down to "
-                f"{residual} against MAX_RECORDS={MAX_RECORDS}; above that it "
-                f"refuses the file whole and the tier reverts to the last "
-                f"good table")
-            if residual > MAX_RECORDS:
-                # There were not enough NEUTRAL records to get under the cap
-                # and down_rank/bar records are never shed, so the loader WILL
-                # refuse this file whole. Say so rather than claim the count
-                # "stays under" a cap it does not.
-                self._warn(
-                    f"! the loader count is still {residual} > "
-                    f"{MAX_RECORDS} after shedding every sheddable neutral "
-                    f"record: the BOT WILL REFUSE THIS FILE WHOLE and keep "
-                    f"the last good table")
 
         ct = self.cov["contracts_matured"]
         out = {
-            "version": 1,
+            "version": 2,
             "generated_at": iso_z(self.asof),
             "generated_by": f"imm_scan_perf.py@{_git_sha()}",
             "window": {
@@ -2276,29 +1791,20 @@ class ScanPerfScorer:
                 "maturity_cutoff": iso_z(self.maturity_cutoff),
             },
             "params": {
-                "score_basis": self.score_basis,
-                "cohort_prior_risk_days": COHORT_PRIOR_RISK_DAYS,
-                "series_prior_fills": SERIES_PRIOR_FILLS,
-                "dim_clip": DIM_CLIP, "adj_clip": ADJ_CLIP, "max_req": MAX_REQ,
-                "winsor_cents": WINSOR_CENTS, "mark_tolerance_secs": MARK_TOLERANCE_SECS,
-                "data_thin_unmarked_frac": DATA_THIN_UNMARKED_FRAC,
-                "bucket_mute_min_series": BUCKET_MUTE_MIN_SERIES,
-                "bucket_mute_min_events": BUCKET_MUTE_MIN_EVENTS,
-                "bar_min_episodes": BAR_MIN_EPISODES, "bar_min_markets": BAR_MIN_MARKETS,
-                "bar_min_days": BAR_MIN_DAYS, "bar_ci": BAR_CI,
-                "bar_bootstrap": BAR_BOOTSTRAP, "bar_ttl_days": BAR_TTL_DAYS,
-                "bar_sustain_runs": BAR_SUSTAIN_RUNS,
-                "bar_min_dwell_days": BAR_MIN_DWELL_DAYS,
-                "ratchet_ease_per_run": RATCHET_EASE_PER_RUN,
+                "min_risk_days": MIN_RISK_DAYS, "block_roi": BLOCK_ROI,
+                "block_ttl_hours": BLOCK_TTL_HOURS,
+                "roi_clip_lo": ROI_CLIP_LO, "roi_clip_hi": ROI_CLIP_HI,
                 "rent_factor": RENT_FACTOR, "rent_factor_source": RENT_FACTOR_SOURCE,
-                "cohort_edges_sha256": edges_sha256(self.edges),
-                "edges_refit": bool(self.refit_edges),
+                "payout_floor": PAYOUT_FLOOR,
+                "winsor_cents": WINSOR_CENTS, "mark_tolerance_secs": MARK_TOLERANCE_SECS,
+                "family_groups": [dict(g) for g in FAMILY_GROUPS],
             },
             "coverage": {
                 "markets": cov_markets, "events": cov_events, "series": cov_series,
                 "fills": self.cov["fills"], "fills_matured": self.cov["fills_matured"],
                 "fills_pending": self.cov["fills_pending"],
                 "fills_unmarked": self.cov["fills_unmarked"],
+                "fills_flat_through": self.cov.get("fills_flat_through", 0),
                 "episodes": self.cov["episodes"],
                 "episodes_matured": self.cov["episodes_matured"],
                 "contracts_filled": self.cov["contracts_filled"],
@@ -2310,108 +1816,97 @@ class ScanPerfScorer:
                 "adopted_capped_tickers": self.adopted_capped,
             },
             "tier": {
-                "mu_trading_only": round(self.mu["trading"], 6),
-                "mu_rent_blended": round(self.mu["blend"], 6),
-                "markout_c_per_ct_24h": round(safe_div(100.0 * self.mo_total, ct), 3),
-                "markout_c_per_ct_1h": self.markout_horizons[1]["c_per_ct"],
-                "markout_c_per_ct_72h": self.markout_horizons[72]["c_per_ct"],
-                # same statistic at three horizons, each with its own
-                # maturity cutoff / episode collapse / winsorisation, and its
-                # own sample size next to the SPEC 10.3 baselines
-                "markout_horizons": {str(h): v for h, v
-                                     in sorted(self.markout_horizons.items())},
-                "mo_dollars": round(self.mo_total, 2),
-                "realized_dollars": round(sum(m["realized_dollars"]
-                                              for m in self.markets.values()), 2),
-                "mtm_dollars": round(sum(m["mtm_dollars"] for m in self.markets.values()), 2),
+                "roi_hist": round(self._roi(self.net_total, self.risk_total), 6),
+                "roi_hist_trading": round(
+                    self._roi(self.realized_total + self.mtm_total, self.risk_total), 6),
+                "roi_hist_measured": round(
+                    self._roi(self.rent_measured_total + self.realized_total,
+                              self.risk_total), 6),
+                "net_dollars": round(self.net_total, 2),
+                "realized_dollars": round(self.realized_total, 2),
+                "mtm_dollars": round(self.mtm_total, 2),
+                "rent_used_dollars": round(self.rent_used_total, 2),
                 "rent_modelled_dollars": round(self.rent_total, 2),
-                "rent_cents_per_contract": round(safe_div(100.0 * self.rent_total, ct), 3),
+                "rent_measured_dollars": round(self.rent_measured_total, 2),
                 "rent_basis": self._unit_rent_basis(list(self.markets)),
                 "rent_measured_frac": round(self._unit_measured_frac(list(self.markets)), 4),
-                "rent_measured_dollars": round(
-                    self._unit_measured_dollars(list(self.markets)), 2),
                 "credited_measured_dollars": round(sum(self.event_credited_all.values()), 2),
                 "ledger_newest_credit_date": self.newest_credit_date,
                 "ledger_stale_days": self.ledger_stale_days,
+                "markout_c_per_ct_24h": round(safe_div(100.0 * self.mo_total, ct), 3),
+                "markout_horizons": {str(h): v for h, v
+                                     in sorted(self.markout_horizons.items())},
+                "mo_dollars": round(self.mo_total, 2),
                 "mark_source_mix": self.mark_source_mix,
                 "mark_source_detail": self.mark_source_detail,
                 "reconciliation_delta_dollars": recon_delta,
-                # The replay is INDEPENDENT of the realized sink but NOT of
-                # the bot's cost basis on these tickers: they predate the
-                # fills sink, so the replay is seeded from the first fill's
-                # own pos_before/avg_before. For them the check verifies the
-                # replay arithmetic, not the basis. Published in `tier`, not
-                # only in audit.diagnostics, because it bounds what the
-                # cent-exact result means.
                 "recon_seeded_tickers": self.seeded_tickers,
                 "recon_seeded_frac": round(
                     safe_div(len(self.seeded_tickers), len(self.markets)), 4),
                 "risk_days_dod_change": (None if dod is None else round(dod, 4)),
-                "clamped_record_frac": round(clamped, 4),
             },
-            "cohorts": self.cohorts,
-            "series": series_out,
             "events": events_out,
+            "series": series_out,
+            "families": families_out,
             "markets": markets,
             "limits": {
-                "barred_series": barred_series, "barred_events": barred_events,
-                "down_ranked": down,
-                "bar_frac_universe": round((barred_series + barred_events) / n_units, 4),
-                "max_barred": MAX_BARRED, "max_penalized": MAX_PENALIZED,
-                "max_bar_frac_universe": MAX_BAR_FRAC_UNIVERSE,
+                "blocked_events": n_block["events"],
+                "blocked_series": n_block["series"],
+                "blocked_families": n_block["families"],
+                "n_units": n_units, "max_records": MAX_RECORDS,
             },
             "audit": {
-                "category_block_share": cf["category_share"],
-                "category_warning": bool(cf["category_share"] and
-                                         max(cf["category_share"].values()) > 0.60),
                 "counterfactual_label": "IN-SAMPLE, MODELLED COUNTERFACTUAL",
+                "counterfactual": {
+                    "n_markets_in_blocked_units": cf["n_markets"],
+                    "n_markets": cf["n_all"],
+                    "trading_dollars": round(cf["trading"], 2),
+                    "rent_modelled_dollars": round(cf["rent_modelled"], 2),
+                    "risk_days": round(cf["risk_days"], 2),
+                    "units": cf["units"],
+                },
                 "diagnostics": {
-                    "counterfactual_blocked": cf["n_blocked"],
-                    "counterfactual_admissions": cf["n_admissions"],
-                    "counterfactual_mo_avoided_measured": round(cf["mo_avoided"], 2),
-                    "counterfactual_rent_forgone_modelled": round(cf["rent_forgone"], 2),
                     "seeded_tickers": self.seeded_tickers,
-                    "bucket_unassigned": self.unassigned,
-                    "ratchet_eased_records": self.ratchet_eased,
                     "cycle_files_scanned": self.n_cycle_files,
                     "cache_hits": self.cache.hits, "cache_misses": self.cache.misses,
                     "timings": self.timings,
                 },
             },
-            "unmatched_bar_keys": sorted(
-                k for k, r in (list(self.series_recs.items()) +
-                               list(self.event_recs.items()))
-                if r["verdict"] == "bar" and k not in self.recent_scan_groups),
+            "unmatched_block_keys": sorted(unmatched),
             "warnings": self.warnings,
             "notes": notes,
         }
         return out
 
     def history_row(self, tbl, exit_code):
+        tier, cov, lim = tbl["tier"], tbl["coverage"], tbl["limits"]
         return {
             "generated_at": tbl["generated_at"], "window_days": self.window_days,
-            "basis": self.score_basis,
-            "risk_days": tbl["coverage"]["risk_days"],
-            "risk_days_at50c": tbl["coverage"]["risk_days_at50c"],
-            "mo_dollars": tbl["tier"]["mo_dollars"],
-            "realized_dollars": tbl["tier"]["realized_dollars"],
-            "mtm_dollars": tbl["tier"]["mtm_dollars"],
-            "rent_modelled": tbl["tier"]["rent_modelled_dollars"],
-            "credited_measured": tbl["tier"]["credited_measured_dollars"],
-            "mu_trading_only": tbl["tier"]["mu_trading_only"],
-            "mu_rent_blended": tbl["tier"]["mu_rent_blended"],
-            "markout_c_per_ct_24h": tbl["tier"]["markout_c_per_ct_24h"],
-            "fills": tbl["coverage"]["fills"], "episodes": tbl["coverage"]["episodes"],
-            "episodes_matured": tbl["coverage"]["episodes_matured"],
-            "mark_source_detail": tbl["tier"]["mark_source_detail"],
-            "unmarked_frac": round(safe_div(tbl["coverage"]["fills_unmarked"],
-                                            tbl["coverage"]["fills_matured"]), 4),
-            "mark_source_mix": tbl["tier"]["mark_source_mix"],
-            "n_down_rank": tbl["limits"]["down_ranked"],
-            "n_bar": tbl["limits"]["barred_series"] + tbl["limits"]["barred_events"],
-            "reconciliation_delta": tbl["tier"]["reconciliation_delta_dollars"],
+            "risk_days": cov["risk_days"], "risk_days_at50c": cov["risk_days_at50c"],
+            "net_dollars": tier["net_dollars"],
+            "realized_dollars": tier["realized_dollars"],
+            "mtm_dollars": tier["mtm_dollars"],
+            "rent_used": tier["rent_used_dollars"],
+            "rent_modelled": tier["rent_modelled_dollars"],
+            "rent_measured": tier["rent_measured_dollars"],
+            "credited_measured": tier["credited_measured_dollars"],
+            "roi_hist": tier["roi_hist"],
+            "roi_hist_trading": tier["roi_hist_trading"],
+            "roi_hist_measured": tier["roi_hist_measured"],
+            "markout_c_per_ct_24h": tier["markout_c_per_ct_24h"],
+            "fills": cov["fills"], "episodes": cov["episodes"],
+            "episodes_matured": cov["episodes_matured"],
+            "mark_source_detail": tier["mark_source_detail"],
+            "mark_source_mix": tier["mark_source_mix"],
+            "unmarked_frac": round(safe_div(cov["fills_unmarked"], cov["fills_matured"]), 4),
+            "n_block_events": lim["blocked_events"],
+            "n_block_series": lim["blocked_series"],
+            "n_block_families": lim["blocked_families"],
+            "n_units": lim["n_units"],
+            "reconciliation_delta": tier["reconciliation_delta_dollars"],
             "exit_code": exit_code,
         }
+
 
 
 def _git_sha() -> str:
@@ -2440,93 +1935,99 @@ def _git_sha() -> str:
 
 # ---------------------------------------------------------------- printing
 
+def _fmt_unit_row(kind, key, r):
+    basis = {"est_floored": "est", "credited": "cred", "mixed_by_period": "mixed"}.get(
+        r["rent_basis"], r["rent_basis"])
+    until = r.get("until", "")
+    return (f"  {kind:<7} {key:<30} {r['n_markets']:>4} {r['n_events']:>3} "
+            f"{r['risk_days']:>9,.1f} {r['rent_used']:>+8.2f} {basis:<5} "
+            f"{r['realized_dollars']:>+9.2f} {r['mtm_dollars']:>+8.2f} "
+            f"{r['roi_hist']:>+8.4f} {r['verdict']:<12}"
+            + (f" until {until[:16]}" if until else ""))
+
+
 def print_report(sc: ScanPerfScorer, tbl, out=sys.stdout):
     p = lambda s="": print(s, file=out)
-    cov, tier = tbl["coverage"], tbl["tier"]
-    p(f"scan-perf {tbl['generated_at']}  window {sc.window_days}d  "
-      f"no decay  H={sc.horizon_h}h  basis={sc.score_basis}")
+    cov, tier, lim = tbl["coverage"], tbl["tier"], tbl["limits"]
+    p(f"scan-perf {tbl['generated_at']}  window {sc.window_days}d  no decay  "
+      f"rule: block a unit under {BLOCK_ROI:+.2f}/day once it has "
+      f">= {MIN_RISK_DAYS:.0f} $-days of history")
     p(f"coverage : {cov['markets']} mkts / {cov['events']} events / {cov['series']} series"
       f" | {cov['fills']} fills -> {cov['episodes']} episodes "
       f"({cov['episodes_matured']} matured, {cov['fills_pending']} pending fills, "
-      f"{cov['fills_unmarked']} unmarked, "
-      f"{cov.get('fills_flat_through', 0)} flat-through)")
+      f"{cov['fills_unmarked']} unmarked, {cov['fills_flat_through']} flat-through)")
     p(f"           risk_days {cov['risk_days']:,.1f} (at50c {cov['risk_days_at50c']:,.1f})"
       f"  adopted-capped: {', '.join(cov['adopted_capped_tickers']) or 'none'}")
     m = tier["mark_source_mix"]
     md = tier["mark_source_detail"]
     p(f"marks    : two_sided {m['two_sided']:.2f} | one_sided {m['one_sided']:.2f} "
-      f"| settlement {m['settlement']:.2f}")
-    p(f"           of which  cycle book {md['cycle_two_sided']:.2f} "
-      f"({md['cycle_two_sided_fills']} fills) | marks sink "
-      f"{md['sink_mark']:.2f} ({md['sink_mark_fills']} fills, "
-      f"state.last_mark -- NOT a live two-sided book)")
+      f"| settlement {m['settlement']:.2f}   (of which cycle book "
+      f"{md['cycle_two_sided']:.2f}, marks sink {md['sink_mark']:.2f})")
+    p(f"tier     : roi_hist {tier['roi_hist']:+.5f} /$-day  =  "
+      f"(rent ${tier['rent_used_dollars']:,.2f} [{tier['rent_basis']}] "
+      f"+ realized ${tier['realized_dollars']:,.2f} [MEASURED] "
+      f"+ mtm ${tier['mtm_dollars']:,.2f} [MODELLED mark]) / {cov['risk_days']:,.1f} $-days")
+    p(f"           trading-only {tier['roi_hist_trading']:+.5f} /$-day   "
+      f"measured-only {tier['roi_hist_measured']:+.5f} /$-day "
+      f"(credits that replaced an estimate + realized; no estimate, no mark)")
+    p(f"           rent MODELLED ${tier['rent_modelled_dollars']:,.2f} floored "
+      f"(RENT_FACTOR {RENT_FACTOR}); MEASURED credits "
+      f"${tier['credited_measured_dollars']:,.2f} on {cov['credited_events']} of "
+      f"{cov['events']} events [never summed with rent]; ledger "
+      f"{tier['ledger_stale_days'] if tier['ledger_stale_days'] is not None else '?'}d old")
     hz = tier["markout_horizons"]
-    p(f"tier     : markout {tier['markout_c_per_ct_24h']:+.2f} c/ct  (MEASURED)")
-    for hk in sorted(hz, key=lambda k: int(k)):
-        r = hz[hk]
-        p(f"           markout @{r['horizon_h']:>2}h {r['c_per_ct']:+.2f} c/ct on "
-          f"{r['n_fills']} fills / {r['n_episodes']} episodes / "
-          f"{r['n_contracts']:,.0f} ct  (own maturity cutoff, winsorised)")
-    p(f"           rent    ${tier['rent_modelled_dollars']:,.2f} floored = "
-      f"{tier['rent_cents_per_contract']:+.2f} c/ct  (MODELLED, {tier['rent_basis']}, "
-      f"RENT_FACTOR {RENT_FACTOR})")
-    p(f"           MEASURED credits ${tier['credited_measured_dollars']:,.2f} on "
-      f"{cov['credited_events']} of {cov['events']} events  [never summed with rent]")
-    p(f"           realized ${tier['realized_dollars']:,.2f} (MEASURED)   "
-      f"mtm ${tier['mtm_dollars']:,.2f} (MODELLED mark)   "
-      f"mo ${tier['mo_dollars']:,.2f} (MEASURED)")
-    p(f"           mu_trading_only  {tier['mu_trading_only']:+.5f} /$-day     "
-      f"mu_rent_blended  {tier['mu_rent_blended']:+.5f} /$-day")
+    p(f"           markout (DIAGNOSTIC, MEASURED): "
+      + "  ".join(f"@{hz[k]['horizon_h']}h {hz[k]['c_per_ct']:+.2f} c/ct on "
+                  f"{hz[k]['n_fills']} fills" for k in sorted(hz, key=lambda k: int(k))))
     dod = tier["risk_days_dod_change"]
     p(f"reconciliation vs realized sink: "
       f"{'OK' if abs(tier['reconciliation_delta_dollars']) <= RECON_TOLERANCE_DOLLARS else 'FAILED'}"
       f" (delta ${tier['reconciliation_delta_dollars']:+.2f})   "
       f"risk_days d/d: {'n/a' if dod is None else f'{dod*100:+.1f}%'}   "
-      f"clamped records: {tier['clamped_record_frac']*100:.1f}%")
-    p("cohorts (BOTH BASES, acting column = " + sc.score_basis + "):")
-    p("  dim    bucket    mkts ser evt  fills     $-days     raw_tr     dev_tr |"
-      "     raw_bl     dev_bl | muted")
-    for dim in DIM_ORDER:
-        blk = tbl["cohorts"][dim]
-        for b in blk["buckets"]:
-            p(f"  {dim:<6} {b['key']:<9} {b['n_markets']:>4} {b['n_series']:>3} "
-              f"{b['n_events']:>3} {b['n_fills']:>6} {b['risk_days']:>10,.1f} "
-              f"{b['raw_trading']:>+10.4f} {b['dev_trading']:>+10.4f} |"
-              f" {b['raw_blend']:>+10.4f} {b['dev_blend']:>+10.4f} | "
-              f"{'MUTED' if b['muted'] else ''}  centre={b['centre']:g}")
-    lim = tbl["limits"]
-    worst = min([r["dev"] for r in list(tbl["series"].values()) +
-                 list(tbl["events"].values())] or [0.0])
-    p(f"verdicts : {lim['down_ranked']} down_rank (worst req {abs(worst):.4f} /day)   "
-      f"{lim['barred_series'] + lim['barred_events']} bar")
-    key, n = sc.max_episodes_unit
-    if lim["barred_series"] + lim["barred_events"] == 0:
-        p(f"bars     : 0 live. NO group qualifies for a bar today (max n_episodes = {n}"
-          f"{' on ' + key if key else ''} vs the floor of {BAR_MIN_EPISODES}),")
-        p(f"           and IMM_SCAN_PERF_BAR is {1 if sc.bar_enabled else 0} until the "
-          f"first statement paste. The bar fires on nothing.")
-    else:
-        p(f"bars     : {lim['barred_series'] + lim['barred_events']} live "
-          f"(TTL {BAR_TTL_DAYS}d, dwell {BAR_MIN_DWELL_DAYS}d).")
-    cf = sc.counterfactual()
-    p(f"counterfactual [IN-SAMPLE, MODELLED COUNTERFACTUAL]: would have blocked "
-      f"~{cf['n_blocked']} of {cf['n_admissions']} admissions "
-      f"({safe_div(cf['n_blocked'], cf['n_admissions'])*100:.0f}%),")
-    p(f"           [IN-SAMPLE, MODELLED COUNTERFACTUAL] MEASURED markout avoided "
-      f"~${-cf['mo_avoided']:,.2f}, MODELLED floored rent forgone ~${cf['rent_forgone']:,.2f}")
-    for level in ("event", "series"):
-        rows = sc.leave_one_out(level)
-        p(f"           leave-one-{level.upper()}-out (top 10 by |markout|): "
-          f"max sign flips {max([r['sign_flips'] for r in rows] or [0])} of "
-          f"{max([r['acting_buckets'] for r in rows] or [0])} acting buckets")
-        for r in rows:
-            p(f"             {r['key']:<32} mkts {r['n_markets']:>3}  "
-              f"flips {r['sign_flips']:>2}/{r['acting_buckets']:<3} "
-              f"worst_dev {r['worst_dev_trading']:+.5f}")
-    aud = tbl["audit"]
-    share = "  ".join(f"{k} {v:.2f}" for k, v in aud["category_block_share"].items())
-    p(f"category concentration (WARNING ONLY, never acted on): {share or 'n/a'}"
-      f"{'   [WARNING >60%]' if aud['category_warning'] else ''}")
+      f"recon-seeded {tier['recon_seeded_frac']*100:.1f}%")
+    p("units (event ROOT -> series -> family; a re-listed event is judged on its ROOT, "
+      "a new root on its SERIES, a new series on its FAMILY):")
+    p(f"  {'kind':<7} {'key':<30} {'mkts':>4} {'ev':>3} {'$-days':>9} {'rent$':>8} "
+      f"{'basis':<5} {'realized$':>9} {'mtm$':>8} {'roi/day':>8} verdict")
+    # An event root that IS its series (KXCPIYOY-26NOV -> root KXCPIYOY ==
+    # series KXCPIYOY) carries the same markets and the same numbers as the
+    # series record; print it once, as the series. The file keeps both (the
+    # bot's lookup tries the root first).
+    units = ([("event", k, r) for k, r in tbl["events"].items()
+              if k not in tbl["series"]]
+             + [("series", k, r) for k, r in tbl["series"].items()]
+             + [("family", k, r) for k, r in tbl["families"].items()])
+    blocks = sorted((u for u in units if u[2]["verdict"] == "block"),
+                    key=lambda u: u[2]["roi_hist"])
+    allows = sorted((u for u in units if u[2]["verdict"] == "allow"),
+                    key=lambda u: -u[2]["roi_hist"])
+    insuff = sorted((u for u in units if u[2]["verdict"] == "insufficient"),
+                    key=lambda u: -u[2]["risk_days"])
+    for u in blocks:
+        p(_fmt_unit_row(*u))
+    for u in allows:
+        p(_fmt_unit_row(*u))
+    shown = 12
+    for u in insuff[:shown]:
+        p(_fmt_unit_row(*u))
+    if len(insuff) > shown:
+        p(f"  ... {len(insuff) - shown} more insufficient unit(s) (< {MIN_RISK_DAYS:.0f} "
+          f"$-days) not listed; all are neutral for the bot")
+    p("families (grouped):")
+    for k, r in tbl["families"].items():
+        p(f"  {k:<20} members {len(r.get('members') or [])}: "
+          f"{', '.join(r.get('members') or []) or '-'}  -> {r['verdict']} "
+          f"({r['reason']})")
+    p(f"blocks   : {lim['blocked_events']} event root(s), {lim['blocked_series']} "
+      f"series, {lim['blocked_families']} family(ies)"
+      + (f"; unmatched (no candidate seen in 24h): "
+         f"{', '.join(tbl['unmatched_block_keys'])}" if tbl["unmatched_block_keys"] else ""))
+    cf = tbl["audit"]["counterfactual"]
+    p(f"counterfactual [IN-SAMPLE, MODELLED COUNTERFACTUAL]: "
+      f"{cf['n_markets_in_blocked_units']} of {cf['n_markets']} markets admitted in the "
+      f"window sit in a unit that is blocked NOW; their trading "
+      f"${cf['trading_dollars']:+,.2f} (MEASURED + mark), MODELLED rent "
+      f"${cf['rent_modelled_dollars']:,.2f}, {cf['risk_days']:,.1f} $-days")
     for w in tbl["warnings"]:
         p(f"warning  : {w}")
 
@@ -2534,42 +2035,57 @@ def print_report(sc: ScanPerfScorer, tbl, out=sys.stdout):
 def print_explain(sc: ScanPerfScorer, key, out=sys.stdout):
     p = lambda s="": print(s, file=out)
     sel = [t for t in sc.markets
-           if ser_of(t) == key or sc.ev(t) == key or root_of(sc.ev(t)) == key or t == key]
+           if ser_of(t) == key or sc.ev(t) == key or root_of(sc.ev(t)) == key
+           or sc.family_map.get(ser_of(t)) == key or t == key]
     if not sel:
-        p(f"--explain {key}: no scan market matches (series, event, event root or ticker)")
+        p(f"--explain {key}: no scan market matches (series, event, event root, "
+          f"family or ticker)")
         return
-    p(f"--explain {key}: {len(sel)} market(s), H={sc.horizon_h}h, "
-      f"winsor +/-{WINSOR_CENTS:g}c, tolerance {MARK_TOLERANCE_SECS}s")
-    p(f"  {'ticker':<34} {'fill ts (UTC)':<20} {'q':>7} {'px':>6} {'mark':>7} "
-      f"{'src':<11} {'mo c/ct':>8}  status")
+    for kind, recs in (("event", sc.event_recs), ("series", sc.series_recs),
+                       ("family", sc.family_recs)):
+        r = recs.get(key)
+        if r:
+            p(f"--explain {key} [{kind}]: {r['verdict']} -- {r['reason']}")
+            p(f"  rent_used ${r['rent_used']:+.2f} [{r['rent_basis']}]  "
+              f"realized ${r['realized_dollars']:+.2f} [MEASURED]  "
+              f"mtm ${r['mtm_dollars']:+.2f} [MODELLED mark]  "
+              f"risk_days {r['risk_days']:,.1f}  ->  roi_hist {r['roi_hist']:+.5f}/day "
+              f"(trading-only {r['roi_hist_trading']:+.5f}, "
+              f"measured-only {r['roi_hist_measured']:+.5f})")
+    if key in sc.markets:
+        # a TICKER: say which unit judges it under the bot's hierarchy
+        kind, k, rec = sc.lookup_unit(key)
+        if rec is None:
+            p(f"--explain {key} [ticker]: no unit with >= {MIN_RISK_DAYS:.0f} $-days "
+              f"of history judges it (root/series/family all insufficient) -> the "
+              f"bot uses the model alone")
+        else:
+            p(f"--explain {key} [ticker]: judged by {kind}:{k} -> {rec['verdict']} "
+              f"-- {rec['reason']}")
+    p(f"  {len(sel)} market(s):")
+    p(f"  {'ticker':<34} {'first cycle':<17} {'$-days':>8} {'rent$':>7} {'real$':>8} "
+      f"{'mtm$':>8} {'roi/day':>8} {'fills':>5} {'pos':>6}")
+    for t in sorted(sel, key=lambda t: -sc.markets[t]["risk_days"]):
+        m = sc.markets[t]
+        rent = sc.market_rent.get(t, 0.0)
+        net = rent + m["realized_dollars"] + m["mtm_dollars"]
+        fc = m["first_cycle"]
+        fcs = (datetime.fromtimestamp(fc, timezone.utc).strftime("%Y-%m-%d %H:%M")
+               if fc else "-")
+        p(f"  {t:<34} {fcs:<17} {m['risk_days']:>8,.1f} {rent:>+7.2f} "
+          f"{m['realized_dollars']:>+8.2f} {m['mtm_dollars']:>+8.2f} "
+          f"{sc._roi(net, m['risk_days']):>+8.4f} {sc.market_fills.get(t, 0):>5} "
+          f"{m['pos']:>+6.0f}")
+    p("  fills (markout is a diagnostic):")
     sset = set(sel)
+    p(f"  {'ticker':<34} {'fill ts (UTC)':<20} {'q':>7} {'px':>6} {'mark':>7} "
+      f"{'src':<15} {'mo c/ct':>8}  status")
     for r in sorted((r for r in sc.fill_rows if r["ticker"] in sset), key=lambda r: r["ts"]):
         ts = datetime.fromtimestamp(r["ts"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         mark_s = "-" if r["mark"] is None else format(r["mark"], ".1f")
         mo_s = "-" if r["mo"] is None else format(r["mo"], "+.2f")
         p(f"  {r['ticker']:<34} {ts:<20} {r['q']:>+7.0f} {r['px']:>6.1f} "
-          f"{mark_s:>7} {r['source']:<11} {mo_s:>8}  {r['status']}")
-    p("  episodes:")
-    for (t, hour), e in sorted((kv for kv in sc.episodes.items() if kv[0][0] in sset)):
-        hs = datetime.fromtimestamp(hour * 3600, timezone.utc).strftime("%Y-%m-%d %H:00")
-        p(f"    {t:<34} {hs}  fills {e['fills']:>2}  contracts {e['ct']:>7.0f}  "
-          f"mo {e['mo']:+.2f} c/ct (winsorised)")
-    tot_mo = sum(sc.market_mo.get(t, 0.0) for t in sel)
-    tot_rd = sum(sc.markets[t]["risk_days"] for t in sel)
-    tot_rent = sum(sc.market_rent.get(t, 0.0) for t in sel)
-    p(f"  totals: mo ${tot_mo:+.2f} (MEASURED)  risk_days {tot_rd:,.1f}  "
-      f"rent ${tot_rent:,.2f} (MODELLED)  y_trading {safe_div(tot_mo, tot_rd):+.5f}/$-day")
-    for dim in DIM_ORDER:
-        vals = {t: sc.dim_value[dim].get(t) for t in sel}
-        buck = {t: sc.bucket_of[dim].get(t) for t in sel}
-        p(f"  {dim:<7}: " + ", ".join(
-            f"{t.split('-')[-1]}={'-' if vals[t] is None else format(vals[t], '.2f')}"
-            f"[{buck[t]}]" for t in sorted(sel)))
-    for t in sorted(sel):
-        adj, code = sc.adj_struct(t, sc.score_basis)
-        p(f"  adj_struct {t:<34} {adj:+.5f}  binding={code or 'none'}  "
-          f"req@weight1.0 {clip(-adj, 0.0, MAX_REQ):.4f}/day  "
-          f"effective bar {SCAN_MIN_ROI + clip(-adj, 0.0, MAX_REQ):.4f}/day")
+          f"{mark_s:>7} {r['source']:<15} {mo_s:>8}  {r['status']}")
 
 
 # -------------------------------------------------------------------- main
@@ -2579,13 +2095,11 @@ def run(argv=None, out=sys.stdout):
     ap = argparse.ArgumentParser(description="open-scan performance scorer")
     ap.add_argument("--now", action="store_true", help="write the table (default)")
     ap.add_argument("--dry", action="store_true", help="print everything, write NOTHING")
-    ap.add_argument("--explain", metavar="SERIES|EVENT")
+    ap.add_argument("--explain", metavar="SERIES|ROOT|FAMILY|TICKER")
     ap.add_argument("--asof", metavar="ISO")
     ap.add_argument("--window-days", type=int, default=WINDOW_DAYS)
     ap.add_argument("--horizon-h", type=int, default=HORIZON_H)
-    ap.add_argument("--score-basis", choices=("trading", "blend"), default="trading")
     ap.add_argument("--out", metavar="PATH")
-    ap.add_argument("--refit-edges", action="store_true")
     ap.add_argument("--status-dir", metavar="DIR")
     ap.add_argument("--work-dir", metavar="DIR")
     ap.add_argument("--no-cache", action="store_true")
@@ -2605,14 +2119,7 @@ def run(argv=None, out=sys.stdout):
 
     t_start = time.time()
     sc = ScanPerfScorer(status_dir, work_dir, asof=asof, window_days=a.window_days,
-                        horizon_h=a.horizon_h,
-                        score_basis=a.score_basis, refit_edges=a.refit_edges,
-                        use_cache=not a.no_cache)
-    if not a.refit_edges and edges_sha256() != FROZEN_EDGES_SHA256:
-        print(f"! cohort edges sha {edges_sha256()} != frozen {FROZEN_EDGES_SHA256}; "
-              f"the pre-registered edges were modified. Pass --refit-edges to accept.",
-              file=out)
-        return 1
+                        horizon_h=a.horizon_h, use_cache=not a.no_cache)
     sc.load()
     sc.build()
 
@@ -2623,7 +2130,7 @@ def run(argv=None, out=sys.stdout):
     tbl = sc.table()
     print_report(sc, tbl, out)
 
-    # ---- writer-side guards: all three abort the write and alert
+    # ---- writer-side guards: both abort the write and say so
     recon_delta, mine, sink = sc.reconciliation()
     if abs(recon_delta) > RECON_TOLERANCE_DOLLARS:
         print(f"! RECONCILIATION FAILED: replay ${mine:.2f} vs realized sink "
@@ -2645,32 +2152,26 @@ def run(argv=None, out=sys.stdout):
     if dod is not None and dod < -EXPOSURE_DROP_ABORT:
         print(f"! EXPOSURE DROP {dod*100:.1f}% d/d exceeds "
               f"{EXPOSURE_DROP_ABORT*100:.0f}%: a silently shrunken denominator "
-              f"inflates every dev. NO FILE WRITTEN.", file=out)
+              f"inflates every roi_hist. NO FILE WRITTEN.", file=out)
         return 3
-    clamped, n_dev = sc.clamped_frac()
-    if clamped > CLAMP_STORM_FRAC:
-        print(f"! CLAMP STORM: {clamped*100:.1f}% of {n_dev} dev records sit exactly at "
-              f"+/-{DIM_CLIP} (sign-flip detector). NO FILE WRITTEN.", file=out)
-        return 4
 
     if a.dry:
         print(f"[--dry] nothing written. cold/warm: cache hits {sc.cache.hits}, "
               f"misses {sc.cache.misses}, total {time.time() - t_start:.1f}s", file=out)
         return 0
 
-    # The private cache is saved only AFTER all three guards pass, so
-    # "NO FILE WRITTEN" is literally true of every file this process owns.
-    # It was previously written before sc.table(), which cost the abort paths
-    # their honesty for the sake of one saved scan on a run that failed.
-    # --dry means "write NOTHING", and that includes the cache; it is still
-    # READ, so a dry preview after a real run is fast.
+    # The private cache is saved only AFTER the guards pass, so "NO FILE
+    # WRITTEN" is literally true of every file this process owns. --dry
+    # means "write NOTHING", and that includes the cache; it is still READ.
     sc.cache.save()
     path = a.out or os.path.join(work_dir, TABLE_NAME)
     atomic_write_json(path, tbl)
     append_jsonl(os.path.join(work_dir, HISTORY_NAME), sc.history_row(tbl, 0))
-    print(f"wrote {os.path.basename(path)} ({tbl['limits']['down_ranked']} down_rank, "
-          f"{tbl['limits']['barred_series'] + tbl['limits']['barred_events']} bar); "
-          f"history row appended  [{time.time() - t_start:.1f}s]", file=out)
+    lim = tbl["limits"]
+    print(f"wrote {os.path.basename(path)} ({lim['blocked_events']} event roots / "
+          f"{lim['blocked_series']} series / {lim['blocked_families']} families blocked "
+          f"of {lim['n_units']} units); history row appended  "
+          f"[{time.time() - t_start:.1f}s]", file=out)
     return 0
 
 
