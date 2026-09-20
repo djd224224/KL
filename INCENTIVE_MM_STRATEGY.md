@@ -204,11 +204,18 @@ No hedge exists for any of this; sizing and stand-downs are the entire risk stac
 
 ## 6. Measurement before belief (the go-live sequence)
 
-> **PARTIALLY DELIVERED, 2026-09-18** — the markout protocol and the CI-gated
-> demotion below are BUILT for the open-scan tier (`imm_scan_perf.py` +
-> `scan_perf.json`, see `INCENTIVE_MM_HANDOFF.md` 2026-09-18) and **ship
-> disarmed**: the ranking penalty is live at `IMM_SCAN_PERF_WEIGHT=0.0`
-> (observe-only) and the hard bar at `IMM_SCAN_PERF_BAR=0`. The **share-decay
+> **DELIVERED FOR THE OPEN-SCAN TIER, 2026-09-20, in Jack's form rather than
+> this section's** — `imm_scan_perf.py` + `scan_perf.json`, see
+> `INCENTIVE_MM_HANDOFF.md` 2026-09-18/20. The tier judges a NEW admission on
+> the MEASURED historical ROI (rent + realized + mtm per $-day at risk, 45 d)
+> of the unit that already traded it: the event ROOT for a re-listed event or
+> a new strike, else the series, else the grouped family. A unit under
+> 0.00/day with >= 100 $-days of history BLOCKS new admissions (60 h TTL,
+> re-derived daily); otherwise its history is BLENDED into the ranking ROI
+> (m = 200 $-days, boost capped at +0.05/day). Both effects are ARMED
+> (`IMM_SCAN_PERF_BLOCK=1`, `IMM_SCAN_PERF_BLEND=1`). The markout pipeline
+> below is built and published as a DIAGNOSTIC; no verdict reads it, so the
+> CI-gated markout demotion is NOT the shipped mechanism. The **share-decay
 > EWMA rule further down this section is explicitly NOT built** and is not
 > planned: it would be a second MODELLED-projection eviction for a purpose the
 > $1.00 payout floor and the hopeless exit already serve, and this book keeps
@@ -294,13 +301,14 @@ first-72h EWMA *and* estimated $/day < 2× the min-payout floor → deselect,
 7-day re-entry cooldown. Never respond to dilution by adding size (concavity +
 arms race).
 
-The 2026-09-18 performance loop built the *other* half of this section and
+The 2026-09-18/20 performance loop built the *other* half of this section and
 stopped there. Share-decay would be a second eviction driven by a MODELLED
 projection, aimed at a purpose the MEASURED $1.00-per-market-per-period payout
 floor and the hopeless exit already cover — and the open-scan build has **no
-eviction path at all** (members quote to completion, Jack 9/3). If it is ever
-litigated it arrives as one default-OFF knob with one condition and its own
-evidence, not as a third dial on an existing mechanism.
+eviction path at all** (members quote to completion, Jack 9/3; the loop acts on
+ADMISSION only). If it is ever litigated it arrives as one default-OFF knob with
+one condition and its own evidence, not as a third dial on an existing
+mechanism.
 
 ---
 
@@ -336,19 +344,19 @@ evidence, not as a third dial on an existing mechanism.
 9. Category classifier + measured class table; per-class ladder shapes; tail-side
    asymmetry; selection score = net-EV/WCB replacing $/day sort.
 10. Markout pipeline + CI-gated demotions; share-decay EWMA rule; decomposed
-    reconciliation. — **PARTIAL, 2026-09-18.** The markout pipeline is built and
-    runs offline (`imm_scan_perf.py`, daily 07:55 ET → `scan_perf.json` +
-    `scan_perf_history.jsonl`), with the CI-gated demotion implemented as a
-    per-series / per-event-root bar that ships **disarmed**
-    (`IMM_SCAN_PERF_BAR=0`) and a ranking penalty that ships **observe-only**
-    (`IMM_SCAN_PERF_WEIGHT=0.0`). Scope: the open-scan tier only. Share-decay
-    EWMA: **not built, not planned** (see §6). Decomposed reconciliation: still
-    outstanding — the scorer does a cent-exact self-check against the `realized`
-    sink and refuses to write on a mismatch, but the uptime / qualification-flap
-    / residual split of the realized-vs-estimated ratio is not implemented, and
-    the scan tier's own realization factor stays unmeasured (`RENT_FACTOR` 1.0,
-    source `default_n2`) until a Kalshi statement paste covers its 9/20-21
-    program periods.
+    reconciliation. — **PARTIAL, 2026-09-20.** The markout pipeline is built
+    and runs offline (`imm_scan_perf.py`, daily 07:55 ET → `scan_perf.json` +
+    `scan_perf_history.jsonl`) as a DIAGNOSTIC; the demotion that shipped is
+    Jack's historical-ROI rule (event root → series → family; block under
+    0.00/day with >= 100 $-days, blend otherwise), ARMED, open-scan tier only.
+    Share-decay EWMA: **not built, not planned** (see §6). Decomposed
+    reconciliation: still outstanding — the scorer does a cent-exact
+    self-check against the `realized` sink and refuses to write on a
+    mismatch, but the uptime / qualification-flap / residual split of the
+    realized-vs-estimated ratio is not implemented, and the scan tier's own
+    realization factor stays unmeasured (`RENT_FACTOR` 1.0, source
+    `default_n2`) until a Kalshi statement paste covers its 9/20-21 program
+    periods.
 
 The v1.0 chassis (caps, cutoffs, single-cycle breakers, loss halt, join-don't-lead,
 fill dedupe, orphan restore) is the substrate all of this assumes — already built.
