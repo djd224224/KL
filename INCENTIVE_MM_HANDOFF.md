@@ -2181,3 +2181,20 @@ NOT changed: IMM_MAX_MARKETS=150 (launcher env). It was already BINDING
 before this change (150/150 events; KXAAAGASD-26SEP23 and KXDIESELD-26SEP23
 were `not_ranked` at 13:05Z), so the family events with no quoting market
 compete for seats with everything else by yield rank as seats free up.
+
+POST-RESTART MEASUREMENT (first refresh of the new process, 13:58:34Z):
+1733 candidates -> 846 selected across 150/150 events (808 before); skips
+{'event_top_n': 251, 'not_ranked': 42, ...} and `finecon_top_n` is GONE from
+the skip list (189 the refresh before). Per family, max 3 per event
+everywhere: *ADS 18 selected in 6 events (16 in 6 before), *POS 26 in 9
+events (22 in 12 before -- KXBUDLIGHTPOS / KXCELSIUSPOS / KXVELOPOS each
+lost their single sticky finecon member to the hopeless screen on the
+same refresh), *CC 89 in all 30 events. The 42 `not_ranked` are ALL family
+markets: 15 *ADS (5 events: KXSPORTGOODSADS, KXSPORTSBOOKADS,
+KXSTREAMINGADS, KXTEENCLOTHADS, KXVIDEOGAMESADS) and 27 *POS (9 events) --
+the IMM_MAX_MARKETS=150 event cap, full with sticky events, is now the ONLY
+thing between those 14 events and the book. They enter as seats free
+(events settling), by yield rank against every other newcomer, or when the
+launcher cap is raised (the 9/10 precedent: 100 -> 150 for the *CC wave via
+$ProbeEnv + `restart_imm.ps1 -Task`). The verdict file was not rewritten
+(every verdict fresh), and no family read was needed.
