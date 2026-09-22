@@ -43,6 +43,12 @@ def setUpModule():
     imm.EVENT_OVERRIDES_FILE = os.path.join(tmp, "event_start_overrides.json")
     imm.EXTRA_ALLOW_FILE = os.path.join(tmp, "extra_allow_series.json")
     imm.FINECON_EXTRA_FILE = os.path.join(tmp, "finecon_extra_series.json")
+    # the family source verdicts (2026-09-22) load from the live file at
+    # import: redirect the path AND forget what was loaded, or membership
+    # tests would depend on the trading box's verdict file
+    imm.FAMILY_VERDICT_FILE = os.path.join(tmp, "family_series_verdicts.json")
+    imm.FAMILY_VERDICTS.clear()
+    imm._family_verdict_state["mtime"] = 0.0
     imm.RAIN_FAIR_FILE = os.path.join(tmp, "rain_fair_values.json")
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
@@ -3064,18 +3070,21 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                       # 2026-09-04 additions: company-KPI set + the two
                       # state statistics Jack asked after by name
                       "KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM",
-                      "KXBBY", "KXWSM", "KXOKTA", "KXTXOIL", "KXVAPORTTEU",
-                      # 2026-09-05: Carbon Arc dated-observation family —
-                      # a sample of the 11 ad-spend series + the post-scan
-                      # listing Jack asked after (KXAMZNCC moved to the *CC
-                      # family in the normal book 2026-09-10, tested below)
-                      "KXFOOTWEARADS", "KXELECTRONICSADS", "KXCASINOADS",
-                      "KXDRPEPPERPOS"):
+                      "KXBBY", "KXWSM", "KXOKTA", "KXTXOIL", "KXVAPORTTEU"):
                 self.assertIn(s, imm.FINECON_SERIES, s)
                 self.assertTrue(
                     IncentiveMarketMaker._allowed(f"{s}-26OCT13-T1"), s)
                 self.assertTrue(imm.series_safe_join(s), s)
                 self.assertEqual(imm.series_min_est_rate(s), 0.0, s)
+            # 2026-09-05's Carbon Arc dated-observation members LEFT the
+            # group: KXAMZNCC on 2026-09-10 (*CC), the 11 ad-spend series
+            # and KXDRPEPPERPOS on 2026-09-22 (*ADS / *POS) -- all three
+            # families are name-pattern members of the NORMAL book now
+            # (test_cc_family_suffix_allows_into_normal_book)
+            for s in ("KXFOOTWEARADS", "KXELECTRONICSADS", "KXCASINOADS",
+                      "KXDRPEPPERPOS", "KXAMZNCC"):
+                self.assertNotIn(s, imm.FINECON_SERIES, s)
+                self.assertTrue(imm.series_family_suffix(s), s)
             # the KPI members' release guard: the overrides task must treat
             # them as company-disclosure series with a Nasdaq symbol to
             # resolve the report time (their tickers carry no day, so the
@@ -3206,7 +3215,7 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         mem_ids = {x.ticker for x in members}
         new = [m("KXVENEZCRUDE-26OCT07-T100", 9.0),
                m("KXVENEZCRUDE-26OCT07-T102", 8.0),
-               m("KXDRPEPPERPOS-26OCT03-T95", 7.0),
+               m("KXJOLTSOPEN-26OCT03-T95", 7.0),
                m("KXBRAZILGDP-26DEC02-T2.2", 6.0)]
         # no openings: cap full -> every newcomer cut (yesterday's rule)
         cut = imm.finecon_group_cut(members + new, set(), members=mem_ids)
@@ -3214,7 +3223,7 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # 2 openings: the two best go through the full cap; the rest wait
         cut = imm.finecon_group_cut(members + new, set(), members=mem_ids,
                                     extra_openings=2)
-        self.assertEqual(cut, {"KXDRPEPPERPOS-26OCT03-T95",
+        self.assertEqual(cut, {"KXJOLTSOPEN-26OCT03-T95",
                                "KXBRAZILGDP-26DEC02-T2.2"})
         # openings never override the 3-per-event bound: a 3rd VENEZCRUDE
         # strike is skipped, the opening flows to the next event instead
@@ -3227,13 +3236,13 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                                 "KXVENEZCRUDE-26OCT07-T104"})
         # 3 VENEZCRUDE strikes IS the per-event cap — legal. A 4th VENEZCRUDE
         # (the event's weakest, T102 at 8.0 vs T106's 8.2) is refused
-        # even with openings to spare; the opening flows on to DRPEPPER.
+        # even with openings to spare; the opening flows on to JOLTS.
         new4 = new3 + [m("KXVENEZCRUDE-26OCT07-T106", 8.2)]
         cut = imm.finecon_group_cut(members + new4, set(), members=mem_ids,
                                     extra_openings=5)
         self.assertIn("KXVENEZCRUDE-26OCT07-T102", cut)
         self.assertNotIn("KXVENEZCRUDE-26OCT07-T106", cut)
-        self.assertNotIn("KXDRPEPPERPOS-26OCT03-T95", cut)
+        self.assertNotIn("KXJOLTSOPEN-26OCT03-T95", cut)
         # the openings-burn accounting: only over-cap admissions count.
         # Relative to FINECON_TOP_N so a cap change (15 -> 20 on
         # 2026-09-09) cannot silently turn these into no-ops.
@@ -3396,18 +3405,44 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             imm.SERIES_OVERRIDES.pop("KXZZFT", None)
             imm.SERIES_OVERRIDES.pop("KXNFLDRAFT", None)
 
+    def _seed_family_verdicts(self, *series, carbon_arc=True):
+        for s in series:
+            imm.FAMILY_VERDICTS[s] = {"carbon_arc": carbon_arc,
+                                      "ts": time.time(), "title": s}
+
     def test_cc_family_suffix_allows_into_normal_book(self):
         # Jack 2026-09-10: "allowlist the CC Carbon Arc family -- KXURBNCC,
         # KXDGCC, KXCOSTCC, etc. and they should be picked up by the normal
         # IMM ... not the opportunistic". Membership is the *CC name
         # pattern (ALLOW_FAMILY_SUFFIXES), not an exact list and not the
-        # finecon group.
+        # finecon group. 2026-09-22: *ADS and *POS join the same rule (Jack
+        # "should be auto-quoted as part of IMM right? ... set limit of max
+        # 3 per event"), and membership is the suffix AND a Carbon Arc
+        # source verdict (the catalog sweep in the ALLOW_FAMILY_SUFFIXES
+        # note: KXAMAZONADS, KXINXPOS, FCC ... all end in a family suffix).
         saved_only = imm.ALLOWLIST_ONLY
+        saved_verdicts = dict(imm.FAMILY_VERDICTS)
         imm.ALLOWLIST_ONLY = True
+        imm.FAMILY_VERDICTS.clear()
         try:
-            self.assertEqual(imm.ALLOW_FAMILY_SUFFIXES, ("CC",))
-            for s in ("KXURBNCC", "KXDGCC", "KXCOSTCC", "KXAMZNCC",
-                      "KXSBUXCC", "KXNEVERSEENCC"):
+            self.assertEqual(imm.ALLOW_FAMILY_SUFFIXES, ("CC", "ADS", "POS"))
+            self.assertTrue(imm.FAMILY_SOURCE_CHECK)
+            members = ("KXURBNCC", "KXDGCC", "KXCOSTCC", "KXAMZNCC",
+                       "KXSBUXCC", "KXNEVERSEENCC",
+                       "KXCASINOADS", "KXAMUSEMENTADS", "KXELECTRONICSADS",
+                       "KXC4POS", "KXBUDLIGHTPOS", "KXCOORSLIGHTPOS",
+                       "KXDRPEPPERPOS", "KXNEVERSEENPOS")
+            # no verdict yet: NOT allowed (fail closed), and the scan tier
+            # leaves it to the normal book rather than screening it
+            for s in members:
+                self.assertTrue(imm.series_family_suffix(s), s)
+                self.assertFalse(
+                    IncentiveMarketMaker._allowed(f"{s}-26OCT07-T100"), s)
+                self.assertEqual(
+                    imm.scan_universe_reason(f"{s}-26OCT07-T100"),
+                    "family_pending", s)
+            self._seed_family_verdicts(*members)
+            for s in members:
                 self.assertTrue(
                     IncentiveMarketMaker._allowed(f"{s}-26OCT07-T100"), s)
                 # allowed => the open scan never touches it
@@ -3417,26 +3452,54 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                 # ...and it is NOT walked/capped as finecon
                 self.assertNotIn(s, imm.FINECON_SERIES, s)
                 self.assertNotIn(s, imm._FINECON_BASE, s)
-            # the MENTION suffix tuple is untouched: *CC carries no mention
-            # semantics (no no_event_window stand-down, no pre-drop waiver)
+                # ...and it carries the 3-per-event ROI cap
+                self.assertEqual(imm.event_top_n_for(s), 3, s)
+            # a suffix match that is NOT Carbon Arc (the 2026-09-22 catalog
+            # sweep: KXAMAZONADS is a PACER-settled lawsuit binary, KXINXPOS
+            # a Trading View-settled live index, KXFCC the next commissioner)
+            # is refused by the family rule and left to the scan's screens
+            self._seed_family_verdicts("KXAMAZONADS", "KXINXPOS", "KXFCC",
+                                       carbon_arc=False)
+            for t in ("KXAMAZONADS-29-YES", "KXINXPOS-26DEC31H1900-T6845.5",
+                      "KXFCC-26DEC31-JOE"):
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+                # ...and the scan judges it on its own terms: an ordinary
+                # candidate, or (KXINX*) its prefix ban on live index families
+                self.assertIn(imm.scan_universe_reason(t),
+                              (None, "excluded_family"), t)
+            # the MENTION suffix tuple is untouched: the families carry no
+            # mention semantics (no no_event_window stand-down, no pre-drop
+            # waiver)
             self.assertEqual(imm.ALLOW_SERIES_SUFFIXES, ("MENTION",))
             self.assertTrue(imm.mention_cutoff_is_clear(
                 "KXURBNCC", None, None, None))
-            # a never-seen sibling clones the KXAMZNCC archetype on first
+            # a never-seen sibling clones its family's archetype on first
             # sight WITHOUT exact/extra-allow membership (unlike *FT/*APP)
-            fake = "KXNEVERSEENCC"
-            self.assertNotIn(fake, imm.SERIES_OVERRIDES)
-            imm.ensure_family_override(fake)
-            self.assertIn(fake, imm.SERIES_OVERRIDES)
-            self.assertEqual(imm.SERIES_OVERRIDES[fake],
-                             imm.SERIES_OVERRIDES["KXAMZNCC"])
-            self.assertTrue(imm.series_safe_join(fake))
-            self.assertEqual(imm.series_min_est_rate(fake), 0.0)
+            for fake, parent in (("KXNEVERSEENCC", "KXAMZNCC"),
+                                 ("KXNEVERSEENADS", "KXAMUSEMENTADS"),
+                                 ("KXNEVERSEENPOS", "KXDRPEPPERPOS")):
+                self.assertNotIn(fake, imm.SERIES_OVERRIDES)
+                imm.ensure_family_override(fake)
+                self.assertIn(fake, imm.SERIES_OVERRIDES)
+                self.assertEqual(imm.SERIES_OVERRIDES[fake],
+                                 imm.SERIES_OVERRIDES[parent], fake)
+                self.assertTrue(imm.series_safe_join(fake))
+                self.assertEqual(imm.series_min_est_rate(fake), 0.0)
             # blocklist still wins over the family rule
+            self._seed_family_verdicts("KXHIGHCC")
             self.assertFalse(IncentiveMarketMaker._allowed("KXHIGHCC-26OCT07-T1"))
+            # kill switch: IMM_FAMILY_SOURCE_CHECK=0 is the bare suffix rule
+            with mock.patch.object(imm, "FAMILY_SOURCE_CHECK", False):
+                self.assertTrue(IncentiveMarketMaker._allowed(
+                    "KXUNREADCC-26OCT07-T1"))
+                self.assertEqual(imm.scan_universe_reason(
+                    "KXUNREADCC-26OCT07-T1"), "allowed")
         finally:
             imm.ALLOWLIST_ONLY = saved_only
-            imm.SERIES_OVERRIDES.pop("KXNEVERSEENCC", None)
+            imm.FAMILY_VERDICTS.clear()
+            imm.FAMILY_VERDICTS.update(saved_verdicts)
+            for fake in ("KXNEVERSEENCC", "KXNEVERSEENADS", "KXNEVERSEENPOS"):
+                imm.SERIES_OVERRIDES.pop(fake, None)
 
     def test_extra_allow_file_reload_and_safety(self):
         old_path = imm.EXTRA_ALLOW_FILE
@@ -8472,14 +8535,21 @@ class TestOpportunisticEmail(unittest.TestCase):
         import send_opportunistic_imm as opp
         self.assertTrue(imm.ALLOW_FAMILY_SUFFIXES)
         saved_only = imm.ALLOWLIST_ONLY
+        saved_verdicts = dict(imm.FAMILY_VERDICTS)
         imm.ALLOWLIST_ONLY = True
         try:
             for suf in imm.ALLOW_FAMILY_SUFFIXES:
                 t = "KXPROBE{}-26OCT07-T1".format(suf)
+                # the bot's membership needs its Carbon Arc source verdict
+                # (2026-09-22); the email's tier test is the name pattern
+                imm.FAMILY_VERDICTS["KXPROBE" + suf] = {
+                    "carbon_arc": True, "ts": time.time(), "title": ""}
                 self.assertTrue(IncentiveMarketMaker._allowed(t), t)
                 self.assertIsNotNone(opp.tier_of(t, set(), set()), t)
         finally:
             imm.ALLOWLIST_ONLY = saved_only
+            imm.FAMILY_VERDICTS.clear()
+            imm.FAMILY_VERDICTS.update(saved_verdicts)
 
     def test_cc_labels_never_leak_the_ticker_scheme(self):
         # 28 of the 30 *CC series have no _LABEL entry and resolve from the
@@ -8999,13 +9069,18 @@ class TestFineconFamilyRule(unittest.TestCase):
         import json as _json, os as _os
         _os.makedirs(imm.STATUS_DIR, exist_ok=True)
         with open(imm.FINECON_EXTRA_FILE, "w") as f:
-            _json.dump({"series": ["KXSOMETHINGADS"]}, f)
+            _json.dump({"series": ["KXSOMETHINGNEW", "KXSOMETHINGADS",
+                                   "KXSOMETHINGPOS"]}, f)
         try:
             imm._finecon_extra_state["mtime"] = 0.0
             imm.load_finecon_extra_series()
             self.assertIn("KXCBDNORWAY", imm.FINECON_SERIES,
                           "family member wiped by the extra-file rebuild")
-            self.assertIn("KXSOMETHINGADS", imm.FINECON_SERIES)
+            self.assertIn("KXSOMETHINGNEW", imm.FINECON_SERIES)
+            # a name-pattern family member in the file is the NORMAL book's
+            # (2026-09-22): skipped by the loader, never walked as finecon
+            self.assertNotIn("KXSOMETHINGADS", imm.FINECON_SERIES)
+            self.assertNotIn("KXSOMETHINGPOS", imm.FINECON_SERIES)
         finally:
             try: _os.remove(imm.FINECON_EXTRA_FILE)
             except OSError: pass
@@ -10618,6 +10693,167 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertIn(self.A, bot.state.selected)
         self.assertEqual(bot.state.scan_members, {self.A, self.B})
         self.assertEqual(bot.state.scan_halt_day, "2000-01-01")
+
+
+class TestFamilySourceVerdicts(unittest.TestCase):
+    """2026-09-22: name-pattern family membership is source-verified by the
+    bot (the ALLOW_FAMILY_SUFFIXES note). The catalog sweep that day found
+    35 non-Carbon-Arc series ending in CC/ADS/POS, one of which -- the
+    KXAMAZONADS lawsuit binary -- had carried a paying program the week
+    before."""
+
+    def setUp(self):
+        _clean_persist()
+        self._saved = dict(imm.FAMILY_VERDICTS)
+        self._saved_state = dict(imm._family_verdict_state)
+        # the module runs with the allowlist OFF for the fixture series;
+        # membership here is only visible with it on, as in production
+        self._saved_only = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+        imm.FAMILY_VERDICTS.clear()
+        try:
+            os.remove(imm.FAMILY_VERDICT_FILE)
+        except OSError:
+            pass
+
+    def tearDown(self):
+        imm.ALLOWLIST_ONLY = self._saved_only
+        imm.FAMILY_VERDICTS.clear()
+        imm.FAMILY_VERDICTS.update(self._saved)
+        imm._family_verdict_state.update(self._saved_state)
+        try:
+            os.remove(imm.FAMILY_VERDICT_FILE)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _feed(*tickers):
+        return {t: {"dollars_per_day": 14.29} for t in tickers}
+
+    @staticmethod
+    def _meta(title, *sources):
+        return {"title": title,
+                "settlement_sources": [{"name": s} for s in sources]}
+
+    def test_detector_is_the_overrides_tasks_test(self):
+        ca = self._meta("Amazon Credit Card Spend", "Carbon Arc")
+        self.assertTrue(imm.series_is_carbon_arc(ca))
+        self.assertTrue(imm.series_is_carbon_arc(
+            self._meta("x", "Kalshi using data from CARBON ARC")))
+        self.assertFalse(imm.series_is_carbon_arc(
+            self._meta("Amazon ad surcharge lawsuit", "PACER",
+                       "U.S. District Court Clerk's Office")))
+        self.assertFalse(imm.series_is_carbon_arc(
+            self._meta("S&P500 Positive this year", "Trading View")))
+        self.assertFalse(imm.series_is_carbon_arc({"title": "no sources"}))
+        self.assertFalse(imm.series_is_carbon_arc(None))
+        # and the task's wrapper reads the same function
+        import imm_earnings_overrides as ieo
+
+        class _Stub:
+            def get(self, _path):
+                return {"series": ca}
+        self.assertTrue(ieo.carbon_arc_series(_Stub(), "KXAMZNCC"))
+
+    def test_resolve_reads_each_novel_series_once_and_persists(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.series_meta["KXNEWADS"] = self._meta(
+            "New Category Ad Spend", "Carbon Arc")
+        bot.client.series_meta["KXINXPOS"] = self._meta(
+            "S&P500 Positive this year", "Trading View")
+        feed = self._feed("KXNEWADS-26OCT06-T5", "KXNEWADS-26OCT06-T6",
+                          "KXINXPOS-26DEC31H1900-T6845.5", "KXGOOD-99DEC31-A")
+        now = time.time()
+        self.assertEqual(bot._resolve_family_verdicts(feed, now), 2)
+        # one read per SERIES, never per market; a non-family series is
+        # never read at all
+        self.assertEqual(bot.client.series_reads, 2)
+        self.assertIs(imm.family_verdict("KXNEWADS"), True)
+        self.assertIs(imm.family_verdict("KXINXPOS"), False)
+        self.assertIsNone(imm.family_verdict("KXGOOD"))
+        self.assertTrue(imm.family_series_allowed("KXNEWADS"))
+        self.assertTrue(IncentiveMarketMaker._allowed("KXNEWADS-26OCT06-T5"))
+        self.assertFalse(imm.family_series_allowed("KXINXPOS"))
+        self.assertFalse(
+            IncentiveMarketMaker._allowed("KXINXPOS-26DEC31H1900-T6845.5"))
+        # the live index is the scan's to judge now, not pending and not a
+        # member -- and the scan bans index families by prefix on top
+        self.assertEqual(
+            imm.scan_universe_reason("KXINXPOS-26DEC31H1900-T6845.5"),
+            "excluded_family")
+        # persisted, and the loader round-trips it (a restart, a script)
+        self.assertTrue(os.path.exists(imm.FAMILY_VERDICT_FILE))
+        imm.FAMILY_VERDICTS.clear()
+        imm._family_verdict_state["mtime"] = 0.0
+        self.assertEqual(imm.load_family_verdicts(), 2)
+        self.assertIs(imm.family_verdict("KXNEWADS"), True)
+        self.assertIs(imm.family_verdict("KXINXPOS"), False)
+        self.assertEqual(imm.FAMILY_VERDICTS["KXNEWADS"]["title"],
+                         "New Category Ad Spend")
+        # a second refresh reads nothing: both verdicts are fresh
+        self.assertEqual(bot._resolve_family_verdicts(feed, now + 60), 0)
+        self.assertEqual(bot.client.series_reads, 2)
+        # ...until the TTL passes, then the series is re-read in place
+        self.assertEqual(bot._resolve_family_verdicts(
+            feed, now + imm.FAMILY_VERDICT_TTL_SECS + 1), 2)
+        self.assertEqual(bot.client.series_reads, 4)
+
+    def test_failed_read_keeps_a_verdict_and_an_unread_series_stays_out(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        # KXOLDCC was verified long ago; KXNEWPOS was never read; both
+        # reads fail (no fixture meta -> the fake raises, like a 429)
+        imm.FAMILY_VERDICTS["KXOLDCC"] = {
+            "carbon_arc": True, "ts": time.time() - 30 * 86400, "title": ""}
+        feed = self._feed("KXOLDCC-26OCT07-T1", "KXNEWPOS-26OCT03-T1")
+        self.assertEqual(bot._resolve_family_verdicts(feed, time.time()), 0)
+        self.assertEqual(bot.client.series_reads, 2)
+        self.assertIs(imm.family_verdict("KXOLDCC"), True)   # stale, kept
+        self.assertTrue(imm.family_series_allowed("KXOLDCC"))
+        self.assertIsNone(imm.family_verdict("KXNEWPOS"))
+        self.assertFalse(imm.family_series_allowed("KXNEWPOS"))
+        self.assertFalse(IncentiveMarketMaker._allowed("KXNEWPOS-26OCT03-T1"))
+        self.assertEqual(imm.scan_universe_reason("KXNEWPOS-26OCT03-T1"),
+                         "family_pending")
+        # nothing was written, so no file appeared
+        self.assertFalse(os.path.exists(imm.FAMILY_VERDICT_FILE))
+
+    def test_budget_reads_never_read_series_before_stale_ones(self):
+        with mock.patch.object(imm, "FAMILY_MAX_SERIES_FETCHES", 1):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.client.series_meta["KXACC"] = self._meta("A", "Carbon Arc")
+            bot.client.series_meta["KXBPOS"] = self._meta("B", "Carbon Arc")
+            imm.FAMILY_VERDICTS["KXACC"] = {"carbon_arc": True, "ts": 0.0,
+                                            "title": ""}   # expired
+            feed = self._feed("KXACC-26OCT07-T1", "KXBPOS-26OCT03-T1")
+            self.assertEqual(bot._resolve_family_verdicts(feed, time.time()), 1)
+            self.assertEqual(bot.client.series_reads, 1)
+            self.assertGreater(imm.FAMILY_VERDICTS["KXBPOS"]["ts"], 0.0)
+            self.assertEqual(imm.FAMILY_VERDICTS["KXACC"]["ts"], 0.0)
+            # the stale one goes next refresh
+            self.assertEqual(bot._resolve_family_verdicts(feed, time.time()), 1)
+            self.assertGreater(imm.FAMILY_VERDICTS["KXACC"]["ts"], 0.0)
+
+    def test_kill_switch_restores_the_bare_suffix_rule(self):
+        with mock.patch.object(imm, "FAMILY_SOURCE_CHECK", False):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self.assertEqual(bot._resolve_family_verdicts(
+                self._feed("KXZZCC-26OCT07-T1"), time.time()), 0)
+            self.assertEqual(getattr(bot.client, "series_reads", 0), 0)
+            self.assertTrue(imm.family_series_allowed("KXZZCC"))
+            self.assertTrue(IncentiveMarketMaker._allowed("KXZZCC-26OCT07-T1"))
+
+    def test_a_judged_non_member_is_refused_but_visible(self):
+        # the overrides task skips a suffix match the bot has not judged yet
+        # and classifies a judged NON-member like any other series; the
+        # bot itself refuses it and leaves it to the scan's own screens
+        self.assertIsNone(imm.family_verdict("KXAMAZONADS"))
+        imm.FAMILY_VERDICTS["KXAMAZONADS"] = {"carbon_arc": False,
+                                              "ts": time.time(), "title": ""}
+        self.assertIs(imm.family_verdict("KXAMAZONADS"), False)
+        self.assertTrue(imm.series_family_suffix("KXAMAZONADS"))
+        self.assertFalse(imm.family_series_allowed("KXAMAZONADS"))
+        self.assertFalse(IncentiveMarketMaker._allowed("KXAMAZONADS-29-YES"))
+        self.assertIsNone(imm.scan_universe_reason("KXAMAZONADS-29-YES"))
 
 
 if __name__ == "__main__":

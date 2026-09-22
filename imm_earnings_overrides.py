@@ -446,6 +446,15 @@ def enroll_new_series(client, dry: bool):
     for s, sample in sorted(seen.items()):
         if imm.IncentiveMarketMaker._allowed(sample):
             continue                      # already covered somewhere
+        # A family-suffix series the bot has not source-verified yet
+        # (2026-09-22, incentive_mm.ALLOW_FAMILY_SUFFIXES): the bot's own
+        # refresh admits or rejects it within the hour; classifying it here
+        # could only write a Carbon Arc sibling into the finecon file, where
+        # the loader now refuses it anyway. A verified NON-member (the
+        # KXAMAZONADS lawsuit binary) falls through and is classified like
+        # any other series.
+        if imm.series_family_suffix(s) and imm.family_verdict(s) is None:
+            continue
         verdict, why = classify_series(s, sample)
         if verdict == "enroll":
             additions.append(s)
@@ -454,10 +463,13 @@ def enroll_new_series(client, dry: bool):
             review.append((s, why, sample))
     # Carbon Arc self-extension (Jack 2026-09-05 "yes self-extend carbon
     # arc"): a REVIEW series whose Kalshi settlement source is Carbon Arc
-    # (NOT the *CC credit-card-spend family: since 2026-09-10 the bot
-    # allows those into the NORMAL book by name pattern --
-    # incentive_mm.ALLOW_FAMILY_SUFFIXES -- so `_allowed` above skips them
-    # before they can reach this loop and the finecon file.)
+    # (NOT the *CC / *ADS / *POS name-pattern families: since 2026-09-10
+    # (CC) and 2026-09-22 (ADS, POS) the bot allows those into the NORMAL
+    # book by suffix + its own Carbon Arc source verdict --
+    # incentive_mm.ALLOW_FAMILY_SUFFIXES -- so `_allowed` above skips the
+    # verified members and the pending-verdict skip holds the rest back;
+    # the bot's loader also refuses family-suffix names from the finecon
+    # file, so nothing written here could re-absorb them.)
     # is a dated-observation vendor print — the finecon class — so it
     # joins the finecon group file (hot-reloaded by the bot into
     # FINECON_SERIES: group walk, caps, guards, allowance) instead of
@@ -487,8 +499,7 @@ def carbon_arc_series(client, series: str) -> bool:
     """True when the series' Kalshi settlement sources name Carbon Arc."""
     try:
         se = (client.get(f"/series/{series}") or {}).get("series") or {}
-        return any("carbon arc" in str(d.get("name") or "").lower()
-                   for d in (se.get("settlement_sources") or []))
+        return imm.series_is_carbon_arc(se)   # ONE test, shared with the bot
     except Exception as e:
         log(f"! series source read failed for {series}: {e}")
         return False

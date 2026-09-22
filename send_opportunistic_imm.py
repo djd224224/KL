@@ -149,6 +149,7 @@ _LABEL = {
     "KXSBUXCC": "Starbucks credit-card spend",
 }
 _ADS_SUFFIX = "ADS"
+_POS_SUFFIX = "POS"
 _title_cache: dict = {}
 
 
@@ -159,15 +160,17 @@ def family_label(series: str) -> str:
     of the family's 30 events."""
     if series.endswith(_ADS_SUFFIX):
         return "Ad spend (Carbon Arc)"
+    if series.endswith(_POS_SUFFIX):
+        return "Point-of-sale growth (Carbon Arc)"
     if is_family(series):
         return "Credit-card spend (Carbon Arc)"
     return ""
 
 
 def _family_suffix() -> str:
-    """The family suffix this email reports as its own tier. One suffix is
-    configured (CC); if a second is ever added, they share the tier and the
-    label joins them rather than silently naming only the first."""
+    """The family suffixes this email reports as ONE tier (CC, and since
+    2026-09-22 ADS and POS): they share the tier and the label joins them
+    rather than silently naming only the first."""
     return "/".join(getattr(imm, "ALLOW_FAMILY_SUFFIXES", ()) or ()) or "?"
 
 

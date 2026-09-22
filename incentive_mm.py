@@ -1592,6 +1592,11 @@ def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
 # events x 9 strikes each, all one monthly print apart on the same date —
 # correlated the way the gas ladders are, so the same 3-highest-ROI rule.
 # Measured before the cap: 27 CC events held 234 selected strikes.
+# *ADS:3 / *POS:3 (Jack 2026-09-22 "set limit of max 3 per event", the day
+# the Carbon Arc ad-spend and point-of-sale families moved into the normal
+# book -- see ALLOW_FAMILY_SUFFIXES): 11 ad-spend events x 13 strikes and
+# 18 point-of-sale events x 9 strikes, each event settling on ONE monthly
+# Carbon Arc print -- the *CC shape, so the same 3-highest-ROI rule.
 # Ramp AI Index family (Jack 2026-09-12 "top 3 markets per event"): every
 # strike of an event settles on the ONE monthly print -- the gas/CC shape.
 # Exact series names rather than a KXAI prefix, so nothing else rides in;
@@ -1601,7 +1606,8 @@ _RAMP_EVENT_TOP_N_SPEC = (
     if RAMP_EVENT_TOP_N > 0 and RAMP_AI_SERIES else "")
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "KXAAAGAS:3,KXDIESEL:3,"
-                                                "KXTRUEV:3,*CC:3"
+                                                "KXTRUEV:3,*CC:3,"
+                                                "*ADS:3,*POS:3"
                                                 + _RAMP_EVENT_TOP_N_SPEC))
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
@@ -2135,9 +2141,105 @@ ALLOW_SERIES_SUFFIXES = tuple(
 #         its second lit 9/10 22:02Z, after the 4:45pm run) and then landed
 #         in the capped finecon tier. KXAMZNCC (finecon base) and KXSBUXCC
 #         (finecon extra file) move to the normal book with the family.
+#   *ADS  Carbon Arc ad-spend monthlies (KXCASINOADS, KXAMUSEMENTADS,
+#         KXELECTRONICSADS, ... 11 series, 13 strikes each on 26OCT06) and
+#   *POS  Carbon Arc point-of-sale growth monthlies (KXC4POS, KXBUDLIGHTPOS,
+#         KXCOORSLIGHTPOS, ... 18 series, 9 strikes each on 26OCT03).
+#         Jack 2026-09-22: "should be auto-quoted as part of IMM right? why
+#         arent these picked up? set limit of max 3 per event". They WERE
+#         allowed -- as FINECON members (the 11 *ADS in _DEFAULT_FINECON_
+#         SERIES since 9/05, 17 *POS self-extended into the finecon file by
+#         the overrides task) -- so they competed for the finecon group's
+#         25 slots (+10 openings) against ~60 other series and mostly lost.
+#         Measured 2026-09-22 13:05Z, one refresh: 189 `finecon_top_n`
+#         rejections, 38 of the families' 305 markets quoted, 11 of the 29
+#         events with no market quoted at all ($4.4k/day of pool). Same
+#         shape as *CC, same fix: the families move to the normal book by
+#         name pattern with their own *ADS:3 / *POS:3 per-event ROI cap
+#         (EVENT_TOP_N), and the finecon loader refuses family names.
+#
+# MEMBERSHIP IS SOURCE-VERIFIED (2026-09-22). The 9/10 note above says "the
+# suffix IS the family, no false positive in the feed" -- true of the
+# programs FEED that night, not of the catalog. Sweeping all 14,248 series
+# on 2026-09-22 found 35 non-Carbon-Arc series ending in these suffixes:
+# KXAMAZONADS ("Will Amazon win the FTC ad surcharge lawsuit before 2029?",
+# PACER-settled -- and it HAD a paying program 9/07-9/13), KXSBADS / KXWCADS
+# / KXNFLREDZONEADS (broadcast ad counts), KXDRUGADS, KXKHCGRADS; the
+# live-index "positive" family KXINXPOS / KXNASDAQ100POS / KXDJIAPOS /
+# KXNIKKEIPOS / ... (11 series, Trading View-settled, with day-dated NUMERIC
+# tickers like KXINXPOS-26DEC31H1900-T6845.5 -- no ticker-shape rule can
+# tell them from a Carbon Arc print); five KXNFL*POS draft-position
+# markets; and, for the *CC rule that had been running since 9/10: FCC /
+# KXFCC (next FCC commissioner), KXGRAMBCC / KXGRAMBCCC (Grammys), KXAUWPCC
+# (Westpac consumer confidence), KXANIMEMPAACC and six KXNCAA*CC conference
+# tournaments. So a suffix match is only the CANDIDATE test. The bot reads
+# GET /series/<s> once per novel suffix-matching series in the live feed
+# (_resolve_family_verdicts: FAMILY_MAX_SERIES_FETCHES per refresh, never-
+# read first, re-read after FAMILY_VERDICT_TTL_SECS) and admits the series
+# only when a settlement source names Carbon Arc -- series_is_carbon_arc,
+# the exact test the overrides task's finecon self-extend uses. Verdicts
+# persist in FAMILY_VERDICT_FILE, loaded at import (so imm_quote_gaps /
+# imm_feed_audit / send_imm_new_programs / the overrides task classify the
+# feed with the bot's own membership) and by mtime each refresh. No verdict
+# yet = NOT allowed this refresh, fail closed: the scan tier reports it as
+# `family_pending` rather than screening it, and the read budget resolves a
+# new sibling on the next refresh, not the next day. A failed read keeps the
+# previous verdict (a transient 429 must never un-admit a quoting family).
+# IMM_FAMILY_SOURCE_CHECK=0 is the kill switch back to the bare suffix rule.
 ALLOW_FAMILY_SUFFIXES = tuple(
-    s for s in os.environ.get("IMM_ALLOW_FAMILY_SUFFIXES", "CC").split(",")
+    s for s in os.environ.get("IMM_ALLOW_FAMILY_SUFFIXES", "CC,ADS,POS").split(",")
     if s)
+FAMILY_SOURCE_CHECK = os.environ.get("IMM_FAMILY_SOURCE_CHECK", "1") == "1"
+FAMILY_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
+    "IMM_FAMILY_SOURCE_KEYWORDS", "carbon arc").split(",") if k.strip())
+FAMILY_VERDICT_TTL_SECS = _env_float("IMM_FAMILY_VERDICT_TTL_D", 7) * 86400.0
+FAMILY_MAX_SERIES_FETCHES = _env_int("IMM_FAMILY_MAX_SERIES_FETCHES", 80)
+# series -> {"carbon_arc": bool, "ts": float, "title": str}: the in-memory
+# mirror of FAMILY_VERDICT_FILE (see load_family_verdicts).
+FAMILY_VERDICTS: Dict[str, dict] = {}
+
+
+def series_family_suffix(series: str) -> bool:
+    """Name-pattern CANDIDATE test: the series ends in a family suffix."""
+    return any(series.endswith(suf) for suf in ALLOW_FAMILY_SUFFIXES)
+
+
+def series_is_carbon_arc(series_obj: dict) -> bool:
+    """True when a GET /series object names Carbon Arc (FAMILY_SOURCE_
+    KEYWORDS) among its settlement sources. Shared with the overrides task's
+    finecon self-extend (imm_earnings_overrides.carbon_arc_series) so the
+    two Carbon Arc tests can never drift. Fail closed: no sources / odd
+    object -> False."""
+    if not isinstance(series_obj, dict):
+        return False
+    for s in series_obj.get("settlement_sources") or []:
+        if not isinstance(s, dict):
+            continue
+        blob = (str(s.get("name") or "") + " " + str(s.get("url") or "")).lower()
+        if any(k in blob for k in FAMILY_SOURCE_KEYWORDS):
+            return True
+    return False
+
+
+def family_verdict(series: str) -> Optional[bool]:
+    """The persisted source verdict for a series: True (Carbon Arc), False
+    (matched a suffix, is NOT Carbon Arc), None (never read). A verdict past
+    FAMILY_VERDICT_TTL_SECS is still returned -- age only schedules a
+    re-read, it never un-admits a family on its own."""
+    ent = FAMILY_VERDICTS.get(series)
+    if not isinstance(ent, dict) or "carbon_arc" not in ent:
+        return None
+    return bool(ent.get("carbon_arc"))
+
+
+def family_series_allowed(series: str) -> bool:
+    """The family-suffix arm of _allowed: suffix match AND (source check off
+    OR a True verdict). Unknown -> False, fail closed."""
+    if not series_family_suffix(series):
+        return False
+    if not FAMILY_SOURCE_CHECK:
+        return True
+    return family_verdict(series) is True
 # Series-name PREFIXES — for mention/incentive families that append a variable
 # tail so the "MENTION" suffix match misses:
 #   KXTEMP<CITY>            weather temp (covers new cities automatically)
@@ -2424,10 +2526,13 @@ _DEFAULT_FINECON_SERIES = (
     "KXSPRLVL,KXCBDECISIONNZ,KXCBDISRAEL,KXVENEZCRUDE,"
     "KXAAAGASMINM,KXAAAGASMAXM,KXBRAZILGDP,KXJOLTSOPEN,KXDATACENTCON,"
     "KXWENBACONATOR,KXTBCRUNCHWRAP,KXTXOIL,KXVAPORTTEU,"
-    "KXSPORTGOODSADS,KXCASINOADS,KXFITNESSADS,KXVIDEOGAMESADS,"
-    "KXAMUSEMENTADS,KXELECTRONICSADS,KXSTREAMINGADS,KXFOOTWEARADS,"
-    "KXSPORTSBOOKADS,KXBROADLINEADS,KXTEENCLOTHADS,"
-    "KXDRPEPPERPOS,"
+    # (The 11 *ADS series and KXDRPEPPERPOS LEFT this group 2026-09-22 --
+    # Jack: "should be auto-quoted as part of IMM right? why arent these
+    # picked up?" -- the whole Carbon Arc *ADS and *POS families are
+    # allowed into the NORMAL book by name pattern now, ALLOW_FAMILY_
+    # SUFFIXES, and load_finecon_extra_series refuses family-suffix names
+    # from the extra file for the same reason: a series in both sets is
+    # walked/capped as finecon, which is exactly what kept them unquoted.)
     + _FINECON_KPI_SERIES)
 # MUTABLE since 2026-09-05 (Jack "yes self-extend carbon arc"): the daily
 # overrides task appends new Carbon Arc series to FINECON_EXTRA_FILE and
@@ -3060,7 +3165,9 @@ def scan_universe_reason(ticker: str) -> Optional[str]:
     off (everything unblocked is quotable already), blocked, allowed (the
     normal book's, finecon and the suffix/prefix families included), or an
     excluded family. `_allowed` itself is untouched — this predicate is
-    the complement of the normal book minus the exclusions."""
+    the complement of the normal book minus the exclusions -- plus
+    `family_pending` for a family-suffix series awaiting its source read
+    (2026-09-22): neither book's yet, so not the scan's to screen."""
     if SCAN_TOP_N <= 0:
         return "off"
     if not ALLOWLIST_ONLY:
@@ -3070,6 +3177,13 @@ def scan_universe_reason(ticker: str) -> Optional[str]:
     if IncentiveMarketMaker._allowed(ticker):
         return "allowed"
     series = series_of(ticker)
+    # A family-suffix series with no source verdict yet (2026-09-22, see
+    # ALLOW_FAMILY_SUFFIXES) is the normal book's to judge, not the scan's:
+    # next refresh it resolves into `allowed` (Carbon Arc) or, verdict
+    # False, an ordinary scan candidate screened like any other.
+    if FAMILY_SOURCE_CHECK and series_family_suffix(series) \
+            and family_verdict(series) is None:
+        return "family_pending"
     if any(series.startswith(p) for p in SCAN_EXCLUDE_PREFIXES):
         return "excluded_family"
     return None
@@ -3577,6 +3691,15 @@ for _s in [s for s in _DEFAULT_COMPANY_SERIES.split(",")
 SERIES_OVERRIDES["KXAMZNCC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_CONSUMER_OBS_MIN_RATE", 0.0),
     safe_join=True)
+# CARBON ARC *ADS / *POS FAMILY archetypes (Jack 2026-09-22, see
+# ALLOW_FAMILY_SUFFIXES): the same guard set on the member each sibling
+# clones from. Both carried these identical values as finecon members
+# (KXAMUSEMENTADS in the base list, KXDRPEPPERPOS likewise) until today, so
+# the tier move changes no guard -- only the walk that was capping them.
+for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
+    SERIES_OVERRIDES[_s] = SeriesOverride(
+        min_est_per_day=_env_float("IMM_CONSUMER_OBS_MIN_RATE", 0.0),
+        safe_join=True)
 
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
@@ -3681,6 +3804,8 @@ FAMILY_OVERRIDE_PARENTS = (
     ("suffix", "FT", "KXBKFT"),
     ("suffix", "APP", "KXCLAUDEAPP"),
     ("family_suffix", "CC", "KXAMZNCC"),
+    ("family_suffix", "ADS", "KXAMUSEMENTADS"),
+    ("family_suffix", "POS", "KXDRPEPPERPOS"),
 )
 _family_override_warned: Set[str] = set()
 
@@ -4250,6 +4375,7 @@ def load_extra_allow_series() -> int:
 # _FINECON_BASE stays code-owned).
 FINECON_EXTRA_FILE = os.path.join(STATUS_DIR, "finecon_extra_series.json")
 _finecon_extra_state = {"mtime": 0.0}
+_finecon_family_skipped: Set[str] = set()
 
 
 def finecon_family_override() -> "SeriesOverride":
@@ -4320,6 +4446,16 @@ def load_finecon_extra_series() -> int:
                 or series_pattern_blocked(s):
             log(f"[IMM] ! refused blocklisted series in finecon extra: {s}")
             continue
+        # A name-pattern family member belongs to the NORMAL book (2026-09-22:
+        # the 17 *POS entries the Carbon Arc self-extend wrote here were
+        # walked/capped as finecon and mostly unquoted). Skipped and logged
+        # once; the file itself is left alone.
+        if series_family_suffix(s):
+            if s not in _finecon_family_skipped:
+                _finecon_family_skipped.add(s)
+                log(f"[IMM] finecon extra: {s} matches a family suffix "
+                    f"-> normal book (ALLOW_FAMILY_SUFFIXES), not finecon")
+            continue
         fresh.add(s)
     target = _FINECON_BASE | FINECON_FAMILY | fresh
     changed = len(target ^ FINECON_SERIES)
@@ -4337,6 +4473,72 @@ def load_finecon_extra_series() -> int:
         log(f"[IMM] finecon extra series: {len(fresh)} extended "
             f"({changed} changed)")
     return changed
+
+
+# Family-suffix source verdicts (2026-09-22, see ALLOW_FAMILY_SUFFIXES):
+# {"series": {"KXAMZNCC": {"carbon_arc": true, "ts": ..., "title": ...},
+# ...}}. WRITTEN by the bot as it resolves novel suffix matches
+# (_resolve_family_verdicts), READ at import by every script that
+# classifies the feed through _allowed (quote gaps, feed audit, new-
+# programs email, the overrides task) and by mtime each refresh, so one
+# membership serves the bot and its reports. Deleting the file = every
+# family series is re-read on the next refresh (and NOT allowed until it
+# is -- fail closed); a hand edit is honored on the next refresh.
+FAMILY_VERDICT_FILE = os.path.join(STATUS_DIR, "family_series_verdicts.json")
+_family_verdict_state = {"mtime": 0.0}
+
+
+def load_family_verdicts() -> int:
+    """Mirror FAMILY_VERDICT_FILE into FAMILY_VERDICTS (mtime-gated).
+    Returns the number of series whose verdict changed."""
+    try:
+        mtime = os.path.getmtime(FAMILY_VERDICT_FILE)
+    except OSError:
+        return 0
+    if mtime == _family_verdict_state["mtime"]:
+        return 0
+    _family_verdict_state["mtime"] = mtime
+    try:
+        with open(FAMILY_VERDICT_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! family verdict file unreadable: {e}")
+        return 0
+    fresh: Dict[str, dict] = {}
+    for s, ent in (data.get("series") or {}).items():
+        s = str(s).strip()
+        if not s.startswith("KX") or not isinstance(ent, dict) \
+                or "carbon_arc" not in ent:
+            continue
+        fresh[s] = {"carbon_arc": bool(ent.get("carbon_arc")),
+                    "ts": float(ent.get("ts") or 0.0),
+                    "title": str(ent.get("title") or "")}
+    changed = sum(
+        1 for s in set(fresh) | set(FAMILY_VERDICTS)
+        if (fresh.get(s) or {}).get("carbon_arc")
+        != (FAMILY_VERDICTS.get(s) or {}).get("carbon_arc"))
+    FAMILY_VERDICTS.clear()
+    FAMILY_VERDICTS.update(fresh)
+    if changed:
+        log(f"[IMM] family verdicts: {len(fresh)} loaded ({changed} changed)")
+    return changed
+
+
+def save_family_verdicts() -> None:
+    """Persist FAMILY_VERDICTS atomically. The loader's mtime is bumped so
+    the bot does not re-read its own write on the next refresh."""
+    try:
+        os.makedirs(STATUS_DIR, exist_ok=True)
+        tmp = FAMILY_VERDICT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"series": FAMILY_VERDICTS}, f, indent=1, sort_keys=True)
+        os.replace(tmp, FAMILY_VERDICT_FILE)
+        _family_verdict_state["mtime"] = os.path.getmtime(FAMILY_VERDICT_FILE)
+    except OSError as e:
+        log(f"[IMM] ! family verdict file write failed: {e}")
+
+
+load_family_verdicts()
 
 
 # ----------------------------------------------------------------------------
@@ -7109,8 +7311,9 @@ class IncentiveMarketMaker:
     def _allowed(cls, ticker: str) -> bool:
         """Blocklist always wins; then the exact-series allowlist (MENTION
         suffix + named crypto series), the finecon group, and the name-
-        pattern families (prefixes; *CC via ALLOW_FAMILY_SUFFIXES) unless
-        ALLOWLIST_ONLY is off."""
+        pattern families (prefixes; *CC/*ADS/*POS via ALLOW_FAMILY_SUFFIXES,
+        source-verified -- family_series_allowed) unless ALLOWLIST_ONLY is
+        off."""
         if cls._blocked(ticker):
             return False
         if not ALLOWLIST_ONLY:
@@ -7122,7 +7325,7 @@ class IncentiveMarketMaker:
         return series in ALLOW_SERIES or series in EXTRA_ALLOW_SERIES or \
             series in FINECON_SERIES or \
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
-            any(series.endswith(suf) for suf in ALLOW_FAMILY_SUFFIXES) or \
+            family_series_allowed(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def _roll_reward_periods(self, by_market: Dict[str, dict]) -> None:
@@ -7166,6 +7369,7 @@ class IncentiveMarketMaker:
         load_file_event_overrides()
         load_extra_allow_series()
         load_finecon_extra_series()
+        load_family_verdicts()
         load_rain_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
@@ -7185,6 +7389,11 @@ class IncentiveMarketMaker:
         # transient feed outage).
         if by_market:
             self.state.programmed = set(by_market)
+            # CARBON ARC FAMILIES (2026-09-22, see ALLOW_FAMILY_SUFFIXES):
+            # source-verify novel suffix matches BEFORE the candidates
+            # filter below reads _allowed, so a sibling Kalshi listed since
+            # the last refresh is admitted in this one. LIVE feed only.
+            self._resolve_family_verdicts(by_market, now_ts)
             # FINECON FAMILY (2026-09-09): admit prefix-matching series the
             # moment Kalshi programs them, so a newly listed central bank is
             # covered the same refresh rather than waiting for a hand add.
@@ -8046,6 +8255,65 @@ class IncentiveMarketMaker:
                    else f"(hard cap {scan_ceiling()}")
                 + (", HALTED today" if self.state.scan_halt_day == et_today else "")
                 + f"); rejects {dict(sorted(scan_skips.items()))}")
+
+    # ---- Carbon Arc name-pattern families (2026-09-22) ---------------------
+
+    def _resolve_family_verdicts(self, by_market: Dict[str, dict],
+                                 now_ts: float) -> int:
+        """Source-verify the family-suffix series in the LIVE programs feed
+        (ALLOW_FAMILY_SUFFIXES): one GET /series per series that has no
+        verdict or whose verdict is older than FAMILY_VERDICT_TTL_SECS, at
+        most FAMILY_MAX_SERIES_FETCHES per refresh, never-read series first.
+        A failed or empty read keeps whatever verdict exists (a transient
+        429 must not un-admit a quoting family) and is retried next refresh;
+        a never-read series stays NOT allowed until its read succeeds. Runs
+        BEFORE the candidates filter so a resolution admits in the same
+        refresh. Returns the number of verdicts written."""
+        if not FAMILY_SOURCE_CHECK or not by_market:
+            return 0
+        pending: List[Tuple[int, str]] = []
+        seen: Set[str] = set()
+        for t in by_market:
+            s = series_of(t)
+            if s in seen or not series_family_suffix(s):
+                continue
+            seen.add(s)
+            ent = FAMILY_VERDICTS.get(s)
+            if not isinstance(ent, dict) or "carbon_arc" not in ent:
+                pending.append((0, s))
+            elif now_ts - float(ent.get("ts") or 0.0) >= FAMILY_VERDICT_TTL_SECS:
+                pending.append((1, s))
+        if not pending:
+            return 0
+        pending.sort()
+        budget = max(0, FAMILY_MAX_SERIES_FETCHES)
+        written = 0
+        for _rank, s in pending[:budget]:
+            try:
+                so = (self.client.get(f"/series/{s}") or {}).get("series") or {}
+            except Exception as e:
+                log(f"{self.tag} ! family series read failed {s}: {e}; "
+                    f"{'verdict kept' if s in FAMILY_VERDICTS else 'not allowed until read'}")
+                continue
+            if not so:
+                log(f"{self.tag} ! family series read empty for {s}; retry next refresh")
+                continue
+            ok = series_is_carbon_arc(so)
+            prev = family_verdict(s)
+            title = str(so.get("title") or "")[:80]
+            title = title.encode("ascii", "replace").decode("ascii")
+            FAMILY_VERDICTS[s] = {"carbon_arc": ok, "ts": now_ts, "title": title}
+            written += 1
+            if prev != ok:
+                log(f"{self.tag} family verdict {s}: "
+                    f"{'Carbon Arc -> normal book' if ok else 'NOT Carbon Arc -> not a family member'}"
+                    f" ({title or 'untitled'})")
+        if written:
+            save_family_verdicts()
+        if len(pending) > budget:
+            log(f"{self.tag} family verdicts: {len(pending) - budget} series "
+                f"still pending (budget {budget}/refresh)")
+        return written
 
     # ---- open-scan tier (2026-09-05) -----------------------------------------
 

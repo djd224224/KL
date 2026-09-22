@@ -2103,3 +2103,81 @@ window can be reported — so the first email is small by construction and the
 footer says so. Run `python send_imm_new_programs.py --dry` once before
 registering the task to see what it would say (the box's Kalshi key and
 `ALERT_EMAIL_*` are required — this runs nowhere but the trading box).
+
+## 2026-09-22 — Carbon Arc *ADS / *POS families into the NORMAL book at 3/event; family membership source-verified (Jack)
+
+Jack: "ad spend markets by Carbon Arc e.g. KXAMUSEMENTADS, KXCASINOADS,
+KXELECTRONICSADS should be auto-quoted as part of IMM right? why arent these
+picked up? set limit of max 3 per event" -- and the same for the POS family
+(KXC4POS, KXBUDLIGHTPOS, KXCOORSLIGHTPOS).
+
+WHY THEY WERE NOT PICKED UP. Both families WERE allowed -- as FINECON
+members: the 11 *ADS series sat in _DEFAULT_FINECON_SERIES since 9/05 and 17
+*POS series had been self-extended into finecon_extra_series.json by the
+overrides task (KXDRPEPPERPOS in the base list). The finecon tier is a
+25-slot group walk (+10 openings/day, ceiling 35) shared by ~60 series, so
+they mostly lost the ROI walk. Measured 13:05Z, one refresh: 189
+`finecon_top_n` rejections; *ADS 143 markets / 11 events with 16 selected in
+6 events; *POS 162 markets / 18 events with 22 selected in 12 events; 11 of
+the 29 events had NO market quoted at all; $4.4k/day of pool.
+
+CHANGE 1 -- ALLOW_FAMILY_SUFFIXES "CC" -> "CC,ADS,POS" (env
+IMM_ALLOW_FAMILY_SUFFIXES). FAMILY_OVERRIDE_PARENTS gains ("family_suffix",
+"ADS", "KXAMUSEMENTADS") and ("family_suffix", "POS", "KXDRPEPPERPOS"), both
+archetypes given an explicit SERIES_OVERRIDES entry (safe-join, no rate bar
+-- the identical guard set they carried as finecon members). The 11 *ADS +
+KXDRPEPPERPOS leave _DEFAULT_FINECON_SERIES; load_finecon_extra_series now
+SKIPS any family-suffix name in the extra file (logged once), so the 17 *POS
+entries there are inert and the task's self-extend cannot re-absorb a
+sibling. The overrides task also skips a suffix match the bot has not
+judged yet (its refresh does that within the hour).
+
+CHANGE 2 -- EVENT_TOP_N default gains `*ADS:3,*POS:3` (the *CC:3 machinery:
+ROI rank, two-sided first, sticky + lifetime slots, IMM_EVENT_TOP_N).
+
+CHANGE 3 -- MEMBERSHIP IS SOURCE-VERIFIED. The 9/10 note said "the suffix IS
+the family, no false positive in the feed" -- true of the feed that night,
+not of the catalog. Sweeping all 14,248 series found 35 non-Carbon-Arc
+series ending in CC/ADS/POS: KXAMAZONADS (an FTC-lawsuit binary,
+PACER-settled, which carried a paying program 9/07-9/13), KXSBADS / KXWCADS
+/ KXNFLREDZONEADS / KXDRUGADS / KXKHCGRADS, the live-index "positive" family
+KXINXPOS / KXNASDAQ100POS / KXDJIAPOS / KXNIKKEIPOS ... (11 series, Trading
+View-settled, DAY-DATED NUMERIC tickers such as KXINXPOS-26DEC31H1900-
+T6845.5 -- no ticker-shape rule separates them from a Carbon Arc print),
+five KXNFL*POS draft-position series, and for the *CC rule already live:
+FCC / KXFCC, KXGRAMBCC / KXGRAMBCCC, KXAUWPCC, KXANIMEMPAACC, six KXNCAA*CC.
+So a suffix match is now only the CANDIDATE test. `_resolve_family_verdicts`
+reads GET /series/<s> once per novel suffix-matching series in the live
+feed (IMM_FAMILY_MAX_SERIES_FETCHES=80 per refresh, never-read first,
+re-read after IMM_FAMILY_VERDICT_TTL_D=7) and the verdict is "a settlement
+source names Carbon Arc" (series_is_carbon_arc -- now also what
+imm_earnings_overrides.carbon_arc_series calls, one test for both).
+Verdicts persist in run-logs/incentive-mm/family_series_verdicts.json,
+loaded at import (so imm_quote_gaps / imm_feed_audit / send_imm_new_programs
+/ the overrides task classify the feed with the bot's own membership) and by
+mtime each refresh. No verdict = NOT allowed (fail closed), and
+scan_universe_reason reports `family_pending` rather than letting the scan
+screen it; a failed or empty read keeps the previous verdict (a 429 must
+never un-admit a quoting family). Kill switch: IMM_FAMILY_SOURCE_CHECK=0 =
+the bare suffix rule. Deleting the file = every family series re-reads on
+the next refresh (and is out until it does).
+
+Probe under the launcher env against the live feed (13:51Z): 59 suffix
+matches in the feed, all 59 verified Carbon Arc (CC 30 series / 270 mkts /
+$2,058/day; ADS 11 / 143 / $2,043; POS 18 / 162 / $2,315), none unresolved,
+every member inherits its archetype guard. The verdict file that probe wrote
+was copied into run-logs before the restart, so the first refresh needed no
+reads.
+
+Tests: test_cc_family_suffix_allows_into_normal_book rewritten for three
+suffixes + the verdict gate + the kill switch; new TestFamilySourceVerdicts
+(detector shared with the task, one read per series + persist + TTL
+re-read, failed read keeps a verdict / unread stays out, budget order,
+kill switch, judged non-member); finecon loader skip; the finecon
+membership test no longer names ADS/POS. setUpModule redirects
+FAMILY_VERDICT_FILE and clears the import-time load.
+
+NOT changed: IMM_MAX_MARKETS=150 (launcher env). It was already BINDING
+before this change (150/150 events; KXAAAGASD-26SEP23 and KXDIESELD-26SEP23
+were `not_ranked` at 13:05Z), so the family events with no quoting market
+compete for seats with everything else by yield rank as seats free up.
