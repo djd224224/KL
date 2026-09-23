@@ -2274,3 +2274,15 @@ real throttles and are unchanged. SCAN_MAX_BULK default 2000 -> 5000
 outgrows 5,000. Expect `bulk_cap` and `tail_swept` to vanish from the
 open-scan funnel line and `book_cap` / history_pending to absorb the
 newly visible candidates through their rotations.
+
+EVICTION MEASURED (first refresh past the 1h sustain, 01:43:16Z 9/23): 93
+members left as `hopeless` in one refresh -- 77 KXRT (KXRT-STRA-50 and
+-45 among them: selection_events `selected -> hopeless`, est $0.14 /
+$0.16 per day), 10 KXVENUEPERFORM, 3 KXMLBSEASONGAMES, KXHOODA, KXBA,
+KXCART (the last also permanently barred by the scan tier). Selected 839
+-> 746 across 156/200 events; their quotes were cancelled and the
+positions ride to settlement (managed_extra 0 -- the 9/07 "dropped
+markets carry no orders" rule), e.g. KXRT-STRA-50 short 65, -45 short 40.
+Of the 119 that started the clock, the rest either recovered above the
+bar on a later reading (the clock resets) or are exempt by design
+(KXFSLR-26OCTMWSOLD is an IMM_FORCE_EVENTS event, KXAAAGASMINM is finecon).
