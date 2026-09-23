@@ -77,6 +77,14 @@ class FamilyMoversTests(unittest.TestCase):
                          "mostly mark (settled yes)")
         self.assertEqual(pf._mover_tag(_row("X", value_d=1.0, note="new")), "new")
 
+    def test_default_shows_25_families(self):
+        # Jack 2026-09-22: "show up to 25 families, not 10"
+        rows = [_row(f"KXSERIES{i:02d}-26DEC31", value_d=float(40 - i)) for i in range(40)]
+        shown, tot, (hidden_n, _) = pf.family_movers(rows)
+        self.assertEqual(len(shown), 25)
+        self.assertEqual(hidden_n, 15)
+        self.assertEqual(tot["n_families"], 40)
+
     def test_empty(self):
         shown, tot, hidden = pf.family_movers([])
         self.assertEqual(shown, [])

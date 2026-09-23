@@ -560,7 +560,7 @@ def render_chart(history, out_png: str) -> bool:
 # Email body
 # ----------------------------------------------------------------------------
 
-def family_movers(rows, top_n: int = 10, per_family: int = 3):
+def family_movers(rows, top_n: int = 25, per_family: int = 3):
     """Every event row — settled, still open, new, closed — rolled up by
     family and ranked by the SIZE of the day's move, realized and the
     mark-to-mid change alike (Jack 2026-09-22: "include the position families
