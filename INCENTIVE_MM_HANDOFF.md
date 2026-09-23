@@ -2249,3 +2249,11 @@ NEXT one-day re-listing they never enter (entry floor on this period's
 numbers -> payout_floor). Tests: test_floor_credit_is_this_periods_accrual,
 test_floor_credit_keeps_a_member_that_banked_this_period,
 test_paid_basis_crosses_the_floor_per_period.
+
+MEASURED after the restart (new process 00:36:16Z, first refresh 00:37:34Z):
+"paid-basis: 236 market(s) uncrossed" on the first pass (734 -> 498 flags);
+119 members started the hopeless clock on the first refresh -- 79 KXRT
+(KXRT-STRA-50 and -45 among them), 10 KXVENUEPERFORM, 9 KXFSLR, 3
+KXMLBSEASONGAMES, 3 KXAAL, the rest singletons -- against the probe's 107;
+fresh-candidate `payout_floor` rejections 303 -> 313. Evictions follow at
+the first refresh after 01:37Z (HOPELESS_SUSTAIN_SECS = 3600).
