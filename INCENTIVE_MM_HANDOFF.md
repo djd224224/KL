@@ -2257,3 +2257,20 @@ MEASURED after the restart (new process 00:36:16Z, first refresh 00:37:34Z):
 KXMLBSEASONGAMES, 3 KXAAL, the rest singletons -- against the probe's 107;
 fresh-candidate `payout_floor` rejections 303 -> 313. Evictions follow at
 the first refresh after 01:37Z (HOPELESS_SUSTAIN_SECS = 3600).
+
+## 2026-09-22 pm — Scan bulk read 2000 -> 5000: the whole universe every refresh (Jack)
+
+Jack, after the KXCPICORE-26DEC-T0.2 vs KXCPI-26DEC-T0.3 question ("why
+not read all the markets? what's the loss?"): "set default to 5000".
+Measured 00:37Z 9/23: pre-read list 3,018 markets; 1,159 tied at $14.29/day
+across ranks 1332-2490, so which ties fell outside the 2,000 cap was feed
+order (KXCPI-26DEC-T0.3 rank 2454 quoting as a sticky member, KXCPICORE-
+26DEC-T0.2 rank 2176 judged hourly by the tail sweep and losing every
+borderline call); 630 `bulk_cap` rejects per refresh, 127 tail-swept. Cost
+of reading everything: 13 more chunked market reads (~3s of a 2-3 minute
+refresh); the series/candle/book budgets (60/80/120 per refresh) are the
+real throttles and are unchanged. SCAN_MAX_BULK default 2000 -> 5000
+(IMM_SCAN_MAX_BULK); the hourly tail sweep is a no-op until the feed
+outgrows 5,000. Expect `bulk_cap` and `tail_swept` to vanish from the
+open-scan funnel line and `book_cap` / history_pending to absorb the
+newly visible candidates through their rotations.

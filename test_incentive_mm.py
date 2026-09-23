@@ -9909,8 +9909,10 @@ class TestOpenScanTier(unittest.TestCase):
             budget), "age")
         # Jack 2026-09-10: "drop the open scan 24h requirement to 6h"
         self.assertEqual(imm.SCAN_MIN_AGE_HOURS, 6)
-        # and "bulk read the top 2k markets by pool by day"
-        self.assertEqual(imm.SCAN_MAX_BULK, 2000)
+        # and "bulk read the top 2k markets by pool by day"; 2026-09-22 pm
+        # "set default to 5000" -- the whole 3,018-market universe read
+        # every refresh, no more feed-order lottery among the $14.29 ties
+        self.assertEqual(imm.SCAN_MAX_BULK, 5000)
         self.assertIsNone(bot._scan_admission(
             self._meta(open_time=now - timedelta(hours=7)), m, {}, now,
             budget))

@@ -2983,7 +2983,20 @@ SCAN_SERIES_META_TTL_SECS = _env_float("IMM_SCAN_SERIES_META_TTL_D", 7) * 86400.
 # nothing for them for exactly this reason (the `age` reject key vanished
 # from the scan line: nothing young enough survived the cap). 2000 covers
 # rank ~1588 with headroom; cost 20 -> 40 bulk reads per refresh.
-SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 2000)
+#
+# BULK 2000 -> 5000 (Jack 2026-09-22 pm: "why not read all the markets?
+# what's the loss?" -> "set default to 5000"). Measured 00:37Z 9/23: the
+# pre-read list was 3,018 markets, 1,159 of them TIED at $14.29/day (ranks
+# 1332-2490), so which of the ties fell outside 2000 was feed order --
+# KXCPI-26DEC-T0.3 (rank 2454) quoted as a sticky member while
+# KXCPICORE-26DEC-T0.2 (rank 2176) got the hourly tail-sweep look and lost
+# every borderline judgement; 630 `bulk_cap` rejects per refresh. Reading
+# everything costs 13 more chunked market reads (~3s of a 2-3 min refresh);
+# the reads that actually cost -- SCAN_MAX_SERIES_FETCHES, SCAN_MAX_HISTORY_
+# FETCHES, SCAN_MAX_BOOKS -- keep their own rotating budgets. 5000 retires
+# the cap for the current universe while still bounding a runaway feed;
+# the tail sweep below becomes a no-op until the feed outgrows it.
+SCAN_MAX_BULK = _env_int("IMM_SCAN_MAX_BULK", 5000)
 # HOURLY TAIL SWEEP (Jack 2026-09-13 "should scan for new available markets
 # hourly"). Everything under the bulk cap was never hydrated at all: 7,800
 # of ~9,800 string-screened markets per refresh on 9/12, and the SAME
