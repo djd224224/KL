@@ -2286,3 +2286,44 @@ markets carry no orders" rule), e.g. KXRT-STRA-50 short 65, -45 short 40.
 Of the 119 that started the clock, the rest either recovered above the
 bar on a later reading (the clock resets) or are exempt by design
 (KXFSLR-26OCTMWSOLD is an IMM_FORCE_EVENTS event, KXAAAGASMINM is finecon).
+
+## 2026-09-23 — Opportunistic email: the CARBON ARC group is by settlement source, not suffix (Jack)
+
+Jack: "in daily Opportunistic IMM email, why doesnt carbon arc group include
+all carbon arc events including foottraffic markets like KXBROSFT-26OCT08 and
+KXCAVAFT-26OCT08. and app download markets like KXDKNGAPP-26OCT08 and
+KXNFLXAPP-26OCT08?"
+
+WHY. The email's third tier was the NAME-PATTERN family (is_family: a suffix
+in imm.ALLOW_FAMILY_SUFFIXES = CC/ADS/POS) -- a "how it was admitted"
+bucket. The foot-traffic (*FT) and app-download (*APP) series are Carbon
+Arc-settled too (GET /series: settlement source "Carbon Arc" for KXBROSFT,
+KXCAVAFT, KXDKNGAPP, KXNFLXAPP, KXBKFT, KXCLAUDEAPP ...) but they enter the
+normal book through the exact company allowlist (_DEFAULT_COMPANY_SERIES +
+the daily *FT/*APP auto-enroll into extra_allow_series.json), so tier_of
+returned None (normal book, not opportunistic) and the email never listed
+them. Quoting is unchanged by this note.
+
+CHANGE (send_opportunistic_imm.py, reporting only): tier "family" =
+is_carbon_arc(series) OR the old suffix rule. is_carbon_arc reads
+CARBON_ARC_SERIES, a module dict seeded from the bot's own verdicts
+(imm.FAMILY_VERDICTS, the suffix families) and filled by
+resolve_carbon_arc(client, series, now): one GET /series per novel series in
+the book through imm.series_is_carbon_arc (the bot's detector), persisted in
+run-logs/incentive-mm/carbon_arc_series.json with a 30-day TTL, at most 250
+reads per run, a failed read = unknown this run (normal book) and retried
+next run. build_report resolves the active book's series before tier
+assignment and the cumulative universe's series before the cumulative
+table. Headers: "CARBON ARC" (was "CARBON ARC *CC/ADS/POS"); the slot line
+says CC/ADS/POS are capped at 3/event by ROI and FT/APP are uncapped.
+family_label gains "Foot traffic (Carbon Arc)" / "App downloads (Carbon
+Arc)", source-checked so KXNFLDRAFT (a *FT) never gets the label.
+
+DRY RENDER 12:55Z 9/23 (patched script, live state): CARBON ARC 77 events /
+416 markets (was the 59 suffix-family events); 161 series read once and
+cached. Every FT/APP row shows as NEW in the first email after this change
+(they were never in a previous email's record); the cumulative table now
+also carries their ledger credits and realized P&L. Test:
+test_carbon_arc_tier_is_by_settlement_source (tier by source, event ticker
+resolves the same, precedence finecon > scan > carbon arc, TTL, cache
+round-trip, failed read tolerated, labels).

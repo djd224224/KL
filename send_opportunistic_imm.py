@@ -11,7 +11,7 @@ The "opportunistic" book is THREE tiers:
             with 15 slots and 5 to scan all markets"): every other live-
             program market, machine-screened for adverse selection
             (incentive_mm SCAN_*; membership persisted as scan_members)
-  *CC       the Carbon Arc credit-card family (Jack 2026-09-11: "AmazonCC
+  carbon arc  every Carbon Arc-settled series (Jack 2026-09-11: "AmazonCC
             and StarbucksCC arent in the opportunistic daily email
             anymore"). REPORTING ONLY — the family is quoted by the NORMAL
             book and that does not change here. It entered the normal book
@@ -22,9 +22,18 @@ The "opportunistic" book is THREE tiers:
             tier and reporting tier are DIFFERENT questions: Jack's 9/10
             "picked up by the normal IMM ... not the opportunistic" was
             about slots and caps (no finecon walk, no scan screen), and his
-            9/11 ask is about this scorecard. Membership is read from
-            imm.ALLOW_FAMILY_SUFFIXES, so a future family suffix lands here
-            automatically.
+            9/11 ask is about this scorecard. Membership WAS the name
+            pattern (imm.ALLOW_FAMILY_SUFFIXES) until 2026-09-23, when Jack
+            asked why the group did not include the foot-traffic
+            (KXBROSFT, KXCAVAFT) and app-download (KXDKNGAPP, KXNFLXAPP)
+            events -- Carbon Arc-settled too, but admitted by the exact
+            company allowlist + the daily auto-enroll, so no suffix rule
+            ever saw them. Membership is now the SETTLEMENT SOURCE: the
+            bot's own verdicts (family_series_verdicts.json) first, then
+            this script's cached GET /series lookup (carbon_arc_series.json)
+            for every series in the book, so any Carbon Arc family lands
+            here whatever route admits it; the suffix rule stays as a
+            fallback.
 This email is that book's own scorecard, separate from the whole-account
 digest: a combined headline, then ONE TABLE PER TIER in the same format
 (Jack 2026-09-06: "a similarly formatted table for non-finecon
@@ -152,6 +161,91 @@ _ADS_SUFFIX = "ADS"
 _POS_SUFFIX = "POS"
 _title_cache: dict = {}
 
+# CARBON ARC BY SETTLEMENT SOURCE (Jack 2026-09-23: "why doesnt carbon arc
+# group include all carbon arc events including foottraffic markets like
+# KXBROSFT-26OCT08 and KXCAVAFT-26OCT08. and app download markets like
+# KXDKNGAPP-26OCT08 and KXNFLXAPP-26OCT08?"). series -> True/False, seeded
+# from the bot's own verdicts (imm.FAMILY_VERDICTS: the *CC/*ADS/*POS
+# suffix families) and filled for everything else in the book by
+# resolve_carbon_arc -- one GET /series per novel series through the same
+# detector the bot uses, persisted with a 30-day TTL. Module level so
+# tier_of stays a pure, testable function: the tests seed this dict.
+CARBON_ARC_SERIES: dict = {}
+_carbon_arc_ts: dict = {}
+CARBON_ARC_CACHE_PATH = os.path.join(imm.STATUS_DIR, "carbon_arc_series.json")
+CARBON_ARC_TTL_SECS = 30 * 86400.0
+CARBON_ARC_MAX_READS = 250
+
+
+def is_carbon_arc(ticker_or_event: str) -> bool:
+    """Settlement-source membership: this script's resolved/cached verdict,
+    else the bot's own. Unknown -> False (reported as the normal book until
+    a run resolves it)."""
+    series = ticker_or_event.split("-")[0]
+    v = CARBON_ARC_SERIES.get(series)
+    if v is None:
+        v = getattr(imm, "family_verdict", lambda _s: None)(series)
+    return bool(v)
+
+
+def load_carbon_arc_cache() -> int:
+    data = load_json(CARBON_ARC_CACHE_PATH) or {}
+    n = 0
+    for s, ent in (data.get("series") or {}).items():
+        if isinstance(ent, dict) and "carbon_arc" in ent:
+            CARBON_ARC_SERIES[str(s)] = bool(ent.get("carbon_arc"))
+            _carbon_arc_ts[str(s)] = float(ent.get("ts") or 0.0)
+            n += 1
+    return n
+
+
+def _save_carbon_arc_cache() -> None:
+    try:
+        os.makedirs(os.path.dirname(CARBON_ARC_CACHE_PATH), exist_ok=True)
+        tmp = CARBON_ARC_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"series": {s: {"carbon_arc": v,
+                                      "ts": _carbon_arc_ts.get(s, 0.0)}
+                                  for s, v in sorted(CARBON_ARC_SERIES.items())}},
+                      f, indent=1)
+        os.replace(tmp, CARBON_ARC_CACHE_PATH)
+    except OSError as e:                                    # noqa: BLE001
+        log(f"carbon arc cache write failed: {e!r}")
+
+
+def resolve_carbon_arc(client, series_iter, now_ts: float) -> int:
+    """Fill CARBON_ARC_SERIES for every series in `series_iter` without a
+    fresh verdict: the bot's FAMILY_VERDICTS first (free), then GET /series
+    through imm.series_is_carbon_arc, at most CARBON_ARC_MAX_READS per run.
+    A failed read leaves the series unknown for this run (reported as the
+    normal book, retried next run) -- never fatal, this is a scorecard.
+    Returns the number of reads attempted."""
+    reads = 0
+    for s in sorted({str(x) for x in series_iter if x}):
+        if s in CARBON_ARC_SERIES \
+                and now_ts - _carbon_arc_ts.get(s, 0.0) < CARBON_ARC_TTL_SECS:
+            continue
+        v = getattr(imm, "family_verdict", lambda _s: None)(s)
+        if v is not None:
+            CARBON_ARC_SERIES[s] = bool(v)
+            _carbon_arc_ts[s] = now_ts
+            continue
+        if client is None or reads >= CARBON_ARC_MAX_READS:
+            continue
+        reads += 1
+        try:
+            so = (client.get(f"/series/{s}") or {}).get("series") or {}
+        except Exception as e:                              # noqa: BLE001
+            log(f"carbon arc lookup failed for {s}: {e!r}; unknown this run")
+            continue
+        if not so:
+            continue
+        CARBON_ARC_SERIES[s] = bool(imm.series_is_carbon_arc(so))
+        _carbon_arc_ts[s] = now_ts
+    if reads:
+        _save_carbon_arc_cache()
+    return reads
+
 
 def family_label(series: str) -> str:
     """Deterministic label for a name-pattern family, or "" — the answer when
@@ -164,6 +258,12 @@ def family_label(series: str) -> str:
         return "Point-of-sale growth (Carbon Arc)"
     if is_family(series):
         return "Credit-card spend (Carbon Arc)"
+    # the exact-list Carbon Arc families (2026-09-23): source-checked, so a
+    # *FT that is not Carbon Arc (KXNFLDRAFT) never gets this label
+    if series.endswith("FT") and is_carbon_arc(series):
+        return "Foot traffic (Carbon Arc)"
+    if series.endswith("APP") and is_carbon_arc(series):
+        return "App downloads (Carbon Arc)"
     return ""
 
 
@@ -240,7 +340,9 @@ def tier_of(ticker_or_event: str, fin, scan_set) -> str:
         return "finecon"
     if ticker_or_event in scan_set:
         return "scan"
-    if is_family(ticker_or_event):
+    # Carbon Arc by SETTLEMENT SOURCE (2026-09-23) -- the suffix rule stays
+    # as the fallback so a member is never lost while a lookup is pending.
+    if is_carbon_arc(ticker_or_event) or is_family(ticker_or_event):
         return "family"
     return None
 
@@ -729,6 +831,18 @@ def build_report(now_utc):
     scan_members = set(state.get("scan_members") or [])
     scan_book = set(state.get("scan_book") or []) | scan_members
     scan_events = {_event_of(t) for t in scan_book}
+    # Carbon Arc by settlement source (Jack 2026-09-23): resolve every
+    # series in the book BEFORE the tier assignment below reads it. The
+    # bot's verdicts cover the suffix families; the exact-list families
+    # (*FT / *APP) are looked up once and cached for 30 days.
+    load_carbon_arc_cache()
+    _now_ts = now_utc.timestamp()
+    _n_reads = resolve_carbon_arc(
+        client, [t.split("-")[0] for t in
+                 set(selected) | set(pos)
+                 | {t for t, v in accrued.items() if _f(v) > 0}], _now_ts)
+    if _n_reads:
+        log(f"carbon arc source lookups: {_n_reads} series read")
 
     # Durable per-event history for the cumulative table (see the module
     # docstring): the scan tier's lifetime roster and per-event realized.
@@ -885,6 +999,10 @@ def build_report(now_utc):
             realized_by_event[_e] = realized_by_event.get(_e, 0.0) + _v
     cum_universe = (set(cred_by_event) | set(realized_by_event)
                     | set(cum_mtm) | set(cum_est) | {r["event"] for r in rows})
+    # departed events in the cumulative universe may be Carbon Arc series
+    # the active book no longer holds -- resolve them too (cached)
+    resolve_carbon_arc(client, [ev.split("-")[0] for ev in cum_universe],
+                       _now_ts)
     cum_by_tier: dict = {}
     for ev in cum_universe:
         tier = _event_tier(ev)
@@ -899,7 +1017,7 @@ def build_report(now_utc):
         b["mtm"] += cum_mtm.get(ev, 0.0)
     cum_rows = []
     for key, name in (("finecon", "FINECON"), ("scan", "OPEN SCAN"),
-                      ("family", "CARBON ARC *CC")):
+                      ("family", "CARBON ARC")):
         b = cum_by_tier.get(key)
         if not b:
             continue
@@ -962,12 +1080,15 @@ def build_report(now_utc):
         # book, so its only caps are the per-event ROI cut and the global
         # event ceiling. Saying "N/M slots" here would invent a budget that
         # does not exist, so the line states the caps that DO bind.
-        (f"CARBON ARC *{_family_suffix()}",
-         "credit-card spend monthlies — quoted by the normal book, "
-         "reported here",
+        ("CARBON ARC",
+         "every series Kalshi settles on Carbon Arc data (credit-card "
+         "spend, ad spend, point-of-sale, foot traffic, app downloads) "
+         "— quoted by the normal book, reported here",
          f"{len(fam_rows)} event(s) / {len(fam_members)} markets; no tier "
-         f"slot cap — max {_family_event_top_n()} markets per event by ROI, "
-         f"inside the global {getattr(imm, 'MAX_MARKETS', 0)}-event ceiling",
+         f"slot cap — *{_family_suffix()} capped at "
+         f"{_family_event_top_n()} markets per event by ROI, foot traffic / "
+         f"app downloads uncapped, inside the global "
+         f"{getattr(imm, 'MAX_MARKETS', 0)}-event ceiling",
          fam_rows),
     ]
 

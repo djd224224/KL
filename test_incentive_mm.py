@@ -8622,6 +8622,99 @@ class TestOpportunisticEmail(unittest.TestCase):
         lbl = opp.event_label(None, "KXNEVERSEENCC-26OCT07")
         self.assertTrue(lbl and not lbl.startswith("KX"), lbl)
 
+    def test_carbon_arc_tier_is_by_settlement_source(self):
+        # Jack 2026-09-23: "why doesnt carbon arc group include all carbon
+        # arc events including foottraffic markets like KXBROSFT-26OCT08
+        # and KXCAVAFT-26OCT08. and app download markets like
+        # KXDKNGAPP-26OCT08 and KXNFLXAPP-26OCT08?" -- all four are Carbon
+        # Arc-settled but admitted by the exact company allowlist, so the
+        # suffix-only tier never saw them. Membership is the settlement
+        # source now: the bot's verdict, else this script's cached lookup.
+        import send_opportunistic_imm as opp
+        saved = dict(opp.CARBON_ARC_SERIES)
+        saved_ts = dict(opp._carbon_arc_ts)
+        saved_v = dict(imm.FAMILY_VERDICTS)
+        saved_path = opp.CARBON_ARC_CACHE_PATH
+        opp.CARBON_ARC_CACHE_PATH = os.path.join(imm.STATUS_DIR,
+                                                 "test_carbon_arc.json")
+        opp.CARBON_ARC_SERIES.clear()
+        opp._carbon_arc_ts.clear()
+        try:
+            fin, scan = {"KXSPRLVL"}, set()
+            # unknown source -> the normal book, not the tier
+            for t in ("KXBROSFT-26OCT08-T5", "KXDKNGAPP-26OCT08-T1.2M"):
+                self.assertIsNone(opp.tier_of(t, fin, scan), t)
+            # the bot's own verdict (a suffix family) counts, no read spent
+            imm.FAMILY_VERDICTS["KXURBNCC"] = {"carbon_arc": True, "ts": 1.0,
+                                               "title": ""}
+            self.assertTrue(opp.is_carbon_arc("KXURBNCC-26OCT07-T94"))
+
+            class _C:
+                reads = 0
+
+                def get(self, path, params=None):
+                    _C.reads += 1
+                    s = path.rsplit("/", 1)[1]
+                    src = ("Carbon Arc" if s.endswith(("FT", "APP"))
+                           and s != "KXNFLDRAFT" else "the Governing League")
+                    return {"series": {"title": s,
+                                       "settlement_sources": [{"name": src}]}}
+            n = opp.resolve_carbon_arc(
+                _C(), ["KXBROSFT", "KXCAVAFT", "KXDKNGAPP", "KXNFLXAPP",
+                       "KXNFLDRAFT", "KXURBNCC"], 1000.0)
+            self.assertEqual(n, 5)          # KXURBNCC: the bot's verdict
+            for t in ("KXBROSFT-26OCT08-T5", "KXCAVAFT-26OCT08-T5",
+                      "KXDKNGAPP-26OCT08-T1.2M", "KXNFLXAPP-26OCT08-T30M"):
+                self.assertEqual(opp.tier_of(t, fin, scan), "family", t)
+                # the EVENT ticker resolves the same way (cumulative table)
+                self.assertEqual(opp.tier_of(t.rsplit("-", 1)[0], fin, scan),
+                                 "family", t)
+            # a *FT that is NOT Carbon Arc stays out of the tier
+            self.assertIsNone(opp.tier_of("KXNFLDRAFT-27-QB", fin, scan))
+            # a second resolve inside the TTL reads nothing
+            _C.reads = 0
+            self.assertEqual(opp.resolve_carbon_arc(
+                _C(), ["KXBROSFT", "KXNFLDRAFT"], 2000.0), 0)
+            self.assertEqual(_C.reads, 0)
+            # the cache round-trips
+            self.assertTrue(os.path.exists(opp.CARBON_ARC_CACHE_PATH))
+            opp.CARBON_ARC_SERIES.clear()
+            opp._carbon_arc_ts.clear()
+            self.assertEqual(opp.load_carbon_arc_cache(), 6)
+            self.assertTrue(opp.is_carbon_arc("KXCAVAFT-26OCT08"))
+            self.assertFalse(opp.is_carbon_arc("KXNFLDRAFT-27"))
+            # finecon and scan still take precedence
+            self.assertEqual(opp.tier_of("KXBROSFT-26OCT08-T5", {"KXBROSFT"},
+                                         set()), "finecon")
+            self.assertEqual(opp.tier_of("KXBROSFT-26OCT08-T5", set(),
+                                         {"KXBROSFT-26OCT08-T5"}), "scan")
+            # labels for the two families that have no per-series entry
+            self.assertEqual(opp.family_label("KXBROSFT"),
+                             "Foot traffic (Carbon Arc)")
+            self.assertEqual(opp.family_label("KXDKNGAPP"),
+                             "App downloads (Carbon Arc)")
+            self.assertEqual(opp.family_label("KXNFLDRAFT"), "")
+            # a failed read leaves the series unknown, never raises
+
+            class _Bad:
+                def get(self, path, params=None):
+                    raise RuntimeError("429")
+            self.assertEqual(opp.resolve_carbon_arc(_Bad(), ["KXNEWFT"],
+                                                    3000.0), 1)
+            self.assertIsNone(opp.tier_of("KXNEWFT-26OCT08-T1", fin, scan))
+        finally:
+            opp.CARBON_ARC_SERIES.clear()
+            opp.CARBON_ARC_SERIES.update(saved)
+            opp._carbon_arc_ts.clear()
+            opp._carbon_arc_ts.update(saved_ts)
+            imm.FAMILY_VERDICTS.clear()
+            imm.FAMILY_VERDICTS.update(saved_v)
+            try:
+                os.remove(opp.CARBON_ARC_CACHE_PATH)
+            except OSError:
+                pass
+            opp.CARBON_ARC_CACHE_PATH = saved_path
+
     def test_credited_column_and_cumulative_tables(self):
         # Jack 2026-09-11 "make sure it shows not just active, but also
         # cumulative": CREDITED rides alongside the estimate per row, and
