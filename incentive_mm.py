@@ -3995,6 +3995,24 @@ HOPELESS_EXIT = os.environ.get("IMM_HOPELESS_EXIT", "1") == "1"
 # `hopeless` fires — 96 -> 106 over the same window. So the exit needs to be
 # sure, not fast.
 HOPELESS_SUSTAIN_SECS = _env_int("IMM_HOPELESS_SUSTAIN_SECS", 3600)
+# THE $1 FLOOR IS PER PROGRAM PERIOD (Jack 2026-09-22 pm, on KXRT-STRA-50 /
+# -45: "why is this quoted? it should be hopeless"). Kalshi had re-listed
+# the Rotten Tomatoes programs as a fresh ONE-DAY period at 16:49Z; in it
+# those two had accrued $0.09 / $0.06 with 0.68 days left and $0.15-0.22/day
+# of estimated share -- hopeless by the 7/25 rule -- but the projection
+# credited their LIFETIME accrued_est ($5.01 / $6.83, banked and PAID in the
+# period that ended 16:46Z), so reaches_min was trivially true and the
+# hopeless clock never started. The exchange pays each market's credits per
+# program period behind a hard $1 floor (reference: imm_reward_recon), so
+# the floor credit -- entry floor, hopeless exit AND the digest's paid-basis
+# crossing -- is THIS period's accrual: accrued_est - period_base, the
+# baseline _roll_reward_periods records at every re-listing (2026-09-11);
+# no baseline = first period seen = the lifetime number, as before. Measured
+# 00:10Z 9/23: 89 of 833 quoting members cleared the bar on lifetime
+# accrual alone (74 KXRT, 11 KXFSLR, 4 others), every one under $0.30 for
+# the period. IMM_FLOOR_ACCRUAL_PER_PERIOD=0 restores the lifetime credit.
+FLOOR_ACCRUAL_PER_PERIOD = os.environ.get(
+    "IMM_FLOOR_ACCRUAL_PER_PERIOD", "1") == "1"
 
 
 def _quotable_days(meta, now_utc: datetime) -> float:
@@ -7328,6 +7346,32 @@ class IncentiveMarketMaker:
             family_series_allowed(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
+    def period_accrued(self, ticker: str) -> float:
+        """The floor credit: THIS program period's estimated accrual
+        (accrued_est - period_base) under FLOOR_ACCRUAL_PER_PERIOD, else the
+        lifetime accrued_est. No baseline = first period seen = lifetime."""
+        acc = self.state.accrued_est.get(ticker, 0.0)
+        if not FLOOR_ACCRUAL_PER_PERIOD:
+            return acc
+        return max(0.0, acc - self.state.period_base.get(ticker, 0.0))
+
+    def _paid_basis_delta(self, ticker: str, prev_acc: float,
+                          new_acc: float) -> float:
+        """PAID basis: nothing counts until this market's own accrual clears
+        the $1 program floor, and the whole backlog lands in the cycle that
+        crosses it. Per PERIOD since 2026-09-22 (FLOOR_ACCRUAL_PER_PERIOD): a
+        market that crossed in a paid period starts the next one uncrossed
+        (the roll discards its flag) and is measured from that period's
+        baseline, so a re-listing that stays under the floor pays nothing."""
+        base = (self.state.period_base.get(ticker, 0.0)
+                if FLOOR_ACCRUAL_PER_PERIOD else 0.0)
+        if ticker in self.state.paid_crossed:
+            return new_acc - prev_acc
+        if new_acc - base >= PAYOUT_FLOOR_DOLLARS:
+            self.state.paid_crossed.add(ticker)
+            return new_acc - base
+        return 0.0
+
     def _roll_reward_periods(self, by_market: Dict[str, dict]) -> None:
         """Re-baseline per-period accrual when a market's program re-lists.
 
@@ -7355,11 +7399,27 @@ class IncentiveMarketMaker:
                 self.state.period_base.pop(t, None)
             else:
                 self.state.period_base[t] = self.state.accrued_est.get(t, 0.0)
+                if FLOOR_ACCRUAL_PER_PERIOD:
+                    # a new period starts uncrossed (see _paid_basis_delta)
+                    self.state.paid_crossed.discard(t)
                 rolled += 1
             self.state.period_start[t] = key
         if rolled:
             log(f"{self.tag} reward period rolled on {rolled} market(s); "
                 f"per-period accrual re-baselined")
+        # Heal a paid_crossed flag earned in an EARLIER period on a market
+        # whose current period is still under the floor -- the state the
+        # 2026-09-22 change inherited (KXRT re-listed at 16:49Z with the
+        # flags of the paid period still set). Once per refresh, cheap.
+        if FLOOR_ACCRUAL_PER_PERIOD:
+            stale = [t for t in self.state.paid_crossed
+                     if t in self.state.period_base
+                     and self.period_accrued(t) < PAYOUT_FLOOR_DOLLARS]
+            for t in stale:
+                self.state.paid_crossed.discard(t)
+            if stale:
+                log(f"{self.tag} paid-basis: {len(stale)} market(s) uncrossed -- "
+                    f"this period is under the ${PAYOUT_FLOOR_DOLLARS:.2f} floor")
 
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
         now_ts = now_utc.timestamp()
@@ -7800,7 +7860,7 @@ class IncentiveMarketMaker:
             if est_total > peak:
                 self._est_peak[meta.ticker] = (est_total, now_ts)
                 peak = est_total
-            accrued = self.state.accrued_est.get(meta.ticker, 0.0)
+            accrued = self.period_accrued(meta.ticker)
             proj_peak = peak if meta.ticker in prev_selected else 0.0
             reaches_min = accrued + max(est_total, proj_peak) \
                 >= series_min_est_total(meta.series)
@@ -10114,14 +10174,9 @@ class IncentiveMarketMaker:
                         prev_acc = self.state.accrued_est.get(t_, 0.0)
                         new_acc = prev_acc + rate * dt_days
                         self.state.accrued_est[t_] = new_acc
-                        # PAID basis: nothing counts until this market's own
-                        # accrual clears the $1 program floor, and the whole
-                        # backlog lands in the cycle that crosses it.
-                        if t_ in self.state.paid_crossed:
-                            paid_delta += new_acc - prev_acc
-                        elif new_acc >= PAYOUT_FLOOR_DOLLARS:
-                            self.state.paid_crossed.add(t_)
-                            paid_delta += new_acc
+                        # PAID basis: _paid_basis_delta (per program period
+                        # since 2026-09-22, see FLOOR_ACCRUAL_PER_PERIOD).
+                        paid_delta += self._paid_basis_delta(t_, prev_acc, new_acc)
                 self.state.reward_paid_today += paid_delta
                 self.state.reward_paid_lifetime += paid_delta
                 self.state.contract_minutes_today += \

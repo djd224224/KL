@@ -4323,6 +4323,62 @@ class TestStickySelection(unittest.TestCase):
         finally:
             imm.MIN_EST_TOTAL_DOLLARS = old_floor
 
+    def test_floor_credit_is_this_periods_accrual(self):
+        # Jack 2026-09-22 pm, KXRT-STRA-50 / -45: "why is this quoted? it
+        # should be hopeless". Kalshi had re-listed the program as a fresh
+        # one-day period; the two had accrued $0.09 / $0.06 in it, but the
+        # projection credited their LIFETIME accrued_est ($5 / $7, paid out
+        # in the period that had just ended), so the hopeless clock never
+        # started. The exchange's $1 floor is per program period, so the
+        # credit is accrued_est - period_base (this period), not lifetime.
+        bot = self._quoting_bot()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot._est_peak.clear()
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            # a market that banked a fortune in EARLIER periods and nothing
+            # in this one is hopeless
+            bot.state.accrued_est[self.T] = 2e9
+            bot.state.period_base[self.T] = 2e9
+            self.assertAlmostEqual(bot.period_accrued(self.T), 0.0)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
+    def test_floor_credit_keeps_a_member_that_banked_this_period(self):
+        # ...while one whose THIS-period accrual clears the bar keeps
+        # quoting (the 7/24 rule, now measured per period), and the kill
+        # switch restores the lifetime credit.
+        bot = self._quoting_bot()
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        try:
+            bot._est_peak.clear()
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            bot.state.accrued_est[self.T] = 5e9
+            bot.state.period_base[self.T] = 2e9
+            self.assertAlmostEqual(bot.period_accrued(self.T), 3e9)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+            # kill switch: the lifetime credit, the pre-2026-09-22 reading
+            bot.state.accrued_est[self.T] = 2e9
+            bot.state.period_base[self.T] = 2e9
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            with mock.patch.object(imm, "FLOOR_ACCRUAL_PER_PERIOD", False):
+                self.assertAlmostEqual(bot.period_accrued(self.T), 2e9)
+                bot.state.universe_at = 0.0
+                bot.run_cycle()
+                self.assertIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+
     def test_hopeless_exit_kill_switch(self):
         # IMM_HOPELESS_EXIT=0 restores the unconditional 7/21 retention.
         bot = self._quoting_bot()
@@ -8724,6 +8780,52 @@ class TestOpportunisticEmail(unittest.TestCase):
         bot3 = IncentiveMarketMaker(client=None, live=False)
         self.assertNotIn(T1, bot3.state.period_base)
         self.assertNotIn(T1, bot3.state.period_start)
+
+    def test_paid_basis_crosses_the_floor_per_period(self):
+        # The digest's paid-basis counter had the same lifetime defect as
+        # the floor projection (2026-09-22): a market that crossed $1 in a
+        # PAID period counted every cent of a fresh sub-floor period as paid.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=None, live=False)
+        T = "KXRT-STRA-50"
+        p1 = datetime(2026, 9, 10, 2, 7, tzinfo=timezone.utc)
+        p2 = datetime(2026, 9, 22, 16, 49, tzinfo=timezone.utc)
+        bot.state.accrued_est[T] = 0.0
+        bot._roll_reward_periods({T: {"start": p1, "end": p2}})
+        # first period: crosses at $1 with the backlog, then cent by cent
+        self.assertAlmostEqual(bot._paid_basis_delta(T, 0.0, 0.6), 0.0)
+        self.assertNotIn(T, bot.state.paid_crossed)
+        self.assertAlmostEqual(bot._paid_basis_delta(T, 0.6, 1.2), 1.2)
+        self.assertIn(T, bot.state.paid_crossed)
+        self.assertAlmostEqual(bot._paid_basis_delta(T, 1.2, 4.9), 3.7)
+        bot.state.accrued_est[T] = 4.9123
+        # THE ROLL (the KXRT-STRA-50 numbers): the new period starts
+        # uncrossed and measures from the baseline, so sub-floor accrual is
+        # NOT paid...
+        bot._roll_reward_periods({T: {"start": p2, "end": p2}})
+        self.assertNotIn(T, bot.state.paid_crossed)
+        self.assertAlmostEqual(bot._paid_basis_delta(T, 4.9123, 5.0058), 0.0)
+        self.assertNotIn(T, bot.state.paid_crossed)
+        self.assertAlmostEqual(bot.period_accrued(T) if False else
+                               5.0058 - 4.9123, 0.0935)
+        # ...until this period clears $1 on its own, and then only this
+        # period's backlog lands
+        self.assertAlmostEqual(bot._paid_basis_delta(T, 5.0058, 5.95),
+                               5.95 - 4.9123)
+        self.assertIn(T, bot.state.paid_crossed)
+        self.assertAlmostEqual(bot._paid_basis_delta(T, 5.95, 6.0), 0.05)
+        # a stale flag from an earlier period is healed on the next refresh
+        # when the current period is under the floor (the inherited state)
+        bot.state.accrued_est[T] = 5.0
+        bot.state.paid_crossed.add(T)
+        bot._roll_reward_periods({T: {"start": p2, "end": p2}})
+        self.assertNotIn(T, bot.state.paid_crossed)
+        self.assertAlmostEqual(bot.period_accrued(T), 5.0 - 4.9123)
+        # kill switch: the lifetime crossing, the old accounting
+        with mock.patch.object(imm, "FLOOR_ACCRUAL_PER_PERIOD", False):
+            bot.state.paid_crossed.discard(T)
+            self.assertAlmostEqual(bot.period_accrued(T), 5.0)
+            self.assertAlmostEqual(bot._paid_basis_delta(T, 5.0, 5.1), 5.1)
 
     def test_realized_is_lifetime_and_bot_attributed(self):
         # Jack 2026-09-11, on the AAA gas monthlies: "P&L of $1.30 is wrong.

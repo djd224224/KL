@@ -2207,3 +2207,45 @@ across 150/150 the refresh before), `not_ranked` 0 (was 51). Every family
 event now holds a seat at most 3 strikes deep: *ADS 31 markets in all 11
 events, *POS 50 in all 18, *CC 88 in all 30. No family read was needed and
 no family/finecon error line since the restart.
+
+## 2026-09-22 pm — The $1 floor credit is THIS period's accrual, not lifetime (Jack: KXRT-STRA-50 / -45 "should be hopeless")
+
+Jack, 8pm ET: "why is this quoted? it should be hopeless KXRT-STRA-50,
+KXRT-STRA-45" (Street Fighter Rotten Tomatoes score, resolves Oct 19).
+
+WHAT HAPPENED. Kalshi re-listed the KXRT programs as a fresh ONE-DAY period
+(start 2026-09-22 16:49:35Z, end 2026-09-23 16:49:35Z, $100/day) right after
+the paid 9/10-9/22 period ended at 16:46Z. In the new period the two markets
+had accrued $0.09 / $0.06 with 0.68 days left and $0.15-0.22/day of
+estimated share (20 lots at the touch of a 29k/21k-deep book, est_frac
+0.0015) -- projection about $0.25, hopeless by the 7/25 rule, and the bot was
+short 65 / 40 contracts there. But the shared floor projection
+(refresh_universe, "reaches_min") credited `accrued_est`, the LIFETIME
+counter ($5.01 / $6.83, nearly all of it banked and PAID in the period that
+had just ended), so reaches_min was trivially true, hopeless_since never
+started, and the bot kept re-placing the same quotes every refresh. The
+per-period baseline (`period_base`, 2026-09-11) existed for the digest but
+the floor logic never subtracted it. The exchange pays credits per market
+per PROGRAM PERIOD behind a hard $1 floor, so the old reading was wrong for
+every re-listed market.
+
+CHANGE (FLOOR_ACCRUAL_PER_PERIOD, env IMM_FLOOR_ACCRUAL_PER_PERIOD, default
+on): `IncentiveMarketMaker.period_accrued(t)` = accrued_est - period_base
+(no baseline = first period seen = lifetime, unchanged) is now the credit in
+the shared projection (entry floor AND hopeless exit). The digest's
+paid-basis crossing had the same defect (a market that crossed $1 in a paid
+period counted every cent of a fresh sub-floor period as paid): it is now
+`_paid_basis_delta`, measured from the period baseline; a roll discards the
+market's `paid_crossed` flag, and each refresh heals a flag left from an
+earlier period on a market whose current period is under the floor (the
+state this change inherited). =0 restores the lifetime credit everywhere.
+
+CLASS SWEEP at 00:10Z 9/23 (833 quoting members): 89 cleared the bar on
+lifetime accrual only -- 74 KXRT, 11 KXFSLR, 1 each KXMLBSEASONGAMES /
+KXHOODA / KXBA / KXAAAGASMINM -- every one under $0.30 for its period. After
+the restart they start the hopeless clock and exit after the 1h sustain
+(reduce-only wind-down for any inventory, the normal hopeless path); on the
+NEXT one-day re-listing they never enter (entry floor on this period's
+numbers -> payout_floor). Tests: test_floor_credit_is_this_periods_accrual,
+test_floor_credit_keeps_a_member_that_banked_this_period,
+test_paid_basis_crosses_the_floor_per_period.
