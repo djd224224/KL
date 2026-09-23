@@ -4,7 +4,9 @@ send_portfolio_digest.py — 7:00 AM ET whole-account portfolio email.
 
 One email covering the ENTIRE Kalshi account (every bot + manual trades):
 a chart of daily account value (cash + open positions marked to mid), then
-a table of gains and losses vs the prior morning, by event.
+the biggest movers since the prior morning by family (settled and unrealized
+alike, ranked by the size of the move, realized and mark-to-mid split out),
+then the events that settled, by series.
 
 Day P&L per event = change in E(event) between morning snapshots, where
     E = value of open contracts (marked bid/ask mid, else last, else
@@ -124,6 +126,13 @@ FAMILY_RULES = [
     (re.compile(r"^KXRAIN"), "Rain (KXRAIN*)"),
     (re.compile(r"MENTION"), "Mention markets"),
     (re.compile(r"^KXAQI"), "Air quality (KXAQI*)"),
+    # 2026-09-22: the movers table made the long tail visible — fleets and
+    # vendor families that had been showing as one line per series.
+    # (?!X): KXNFLX* is Netflix, not football — it belongs to the APP rule
+    (re.compile(r"^KXNFL(?!X)"), "NFL (KXNFL*)"),
+    (re.compile(r"^KXRT$"), "Rotten Tomatoes (KXRT)"),
+    (re.compile(r"CC$"), "Carbon Arc cards (KX*CC)"),
+    (re.compile(r"APP$"), "App downloads (KX*APP)"),
 ]
 
 
@@ -551,6 +560,64 @@ def render_chart(history, out_png: str) -> bool:
 # Email body
 # ----------------------------------------------------------------------------
 
+def family_movers(rows, top_n: int = 10, per_family: int = 3):
+    """Every event row — settled, still open, new, closed — rolled up by
+    family and ranked by the SIZE of the day's move, realized and the
+    mark-to-mid change alike (Jack 2026-09-22: "include the position families
+    that moved the most (even if unrealized) since the last daily update").
+
+    Returns (shown, totals, hidden): `shown` is the top_n families by |day|
+    as (name, group) pairs, each group carrying day / realized / unreal /
+    value_now sums, its rows, and `top` = the per_family events with the
+    largest |day|; `totals` covers ALL families; `hidden` is
+    (n_families_not_shown, their net day) so the shown rows plus the hidden
+    line always add to the total. Per row day == realized + value_d (P&L to
+    date differenced against the prior morning), so the split is exact."""
+    groups = {}
+    for r in rows:
+        g = groups.setdefault(family_for(r["event"]),
+                              {"day": 0.0, "realized": 0.0, "unreal": 0.0,
+                               "value_now": 0.0, "rows": []})
+        g["day"] += r["day"]
+        g["realized"] += r["realized"]
+        g["unreal"] += r["value_d"]
+        g["value_now"] += r["value_now"]
+        g["rows"].append(r)
+    for g in groups.values():
+        for k in ("day", "realized", "unreal", "value_now"):
+            g[k] = round(g[k], 2)
+        g["rows"].sort(key=lambda r: -abs(r["day"]))
+        g["top"] = g["rows"][:per_family]
+    ranked = sorted(groups.items(), key=lambda kv: (-abs(kv[1]["day"]), kv[0]))
+    shown, hidden = ranked[:top_n], ranked[top_n:]
+    totals = {k: round(sum(g[k] for _, g in ranked), 2)
+              for k in ("day", "realized", "unreal", "value_now")}
+    totals["n_events"] = len(rows)
+    totals["n_families"] = len(ranked)
+    hidden_net = round(sum(g["day"] for _, g in hidden), 2)
+    return shown, totals, (len(hidden), hidden_net)
+
+
+def _mover_tag(r) -> str:
+    """Why an event moved: the settlement/new/closed note when there is one,
+    otherwise whether the move was realized (a sell), a pure mark change, or
+    both."""
+    note = r.get("note") or ""
+    realized_abs = abs(r.get("realized", 0.0))
+    marked_abs = abs(r.get("value_d", 0.0))
+    if note.startswith("settled") and marked_abs > realized_abs:
+        # a strike settled, but the still-open legs' mark drove the number
+        # (monthly touch events settle strike by strike and live on)
+        return f"mostly mark ({note})"
+    if note:
+        return note
+    realized = realized_abs >= 0.005
+    marked = marked_abs >= 0.005
+    if realized and marked:
+        return "partly realized"
+    return "realized" if realized else "mark"
+
+
 def build_email(pf, history, chart_ok: bool):
     today = pf["today"]
     settled_rows = [r for r in pf["rows"] if r["note"].startswith("settled")]
@@ -583,6 +650,14 @@ def build_email(pf, history, chart_ok: bool):
         pf["equity_kalshi"] - _f(prior.get("equity_kalshi") or prior.get("equity")), 2)
     other = None if first else round(d_equity - tot_pnl, 2)
 
+    # Biggest movers, settled AND unrealized. Every event row is in here; the
+    # settled table below is the realized subset of the same rows. What this
+    # table cannot see, and the residual line says so: liquidity credits,
+    # deposits/withdrawals, and Kalshi marking positions at the bid where
+    # these rows use mid.
+    movers, mv_tot, (mv_hidden_n, mv_hidden_net) = family_movers(pf["rows"])
+    mv_residual = None if first else round(d_equity - mv_tot["day"], 2)
+
     subject = (f"Kalshi portfolio {today} — first baseline" if first else
                f"Kalshi portfolio {today} — day {d_equity:+,.2f}, "
                f"settled {tot_pnl:+,.2f}")
@@ -598,6 +673,30 @@ def build_email(pf, history, chart_ok: bool):
         lines.append(f"vs yesterday: {d_equity:+,.2f}  =  settled events "
                      f"{tot_pnl:+,.2f}  +  open positions, credits & deposits "
                      f"{other:+,.2f}")
+    lines.append("")
+    lines.append(f"Biggest movers since yesterday, by family (settled + unrealized; "
+                 f"top {len(movers)} of {mv_tot['n_families']} families):")
+    lines.append(f"{'FAMILY':28s} {'DAY P&L':>9s} {'REALIZED':>9s} "
+                 f"{'UNREALIZED':>10s} {'OPEN NOW':>9s}")
+    for name, g in movers:
+        n = len(g["rows"])
+        lines.append(f"{name[:28]:28s} {g['day']:>+9.2f} {g['realized']:>+9.2f} "
+                     f"{g['unreal']:>+10.2f} {g['value_now']:>9.2f}"
+                     f"  ({n} event{'s' if n != 1 else ''})")
+        for r in g["top"]:
+            lines.append(f"    {r['event']:34s} {r['day']:>+9.2f}  {_mover_tag(r)}")
+    if mv_hidden_n:
+        lines.append(f"{'+' + str(mv_hidden_n) + ' more families':28s} "
+                     f"{mv_hidden_net:>+9.2f}")
+    lines.append(f"{'ALL FAMILIES':28s} {mv_tot['day']:>+9.2f} {mv_tot['realized']:>+9.2f} "
+                 f"{mv_tot['unreal']:>+10.2f} {mv_tot['value_now']:>9.2f}"
+                 f"  ({mv_tot['n_events']} events)")
+    if not movers:
+        lines.append("(nothing moved since the prior morning)")
+    if mv_residual is not None:
+        lines.append(f"(account value moved {d_equity:+,.2f}; the {mv_residual:+,.2f} "
+                     f"not in this table is credits, deposits/withdrawals, and "
+                     f"Kalshi marking at the bid where this table uses mid)")
     lines.append("")
     lines.append(f"Settled since yesterday ({n_events} events):")
     lines.append(f"{'SERIES':28s} {'P&L':>10s} {'STILL OPEN':>11s}  TOP EVENTS")
@@ -638,6 +737,62 @@ def build_email(pf, history, chart_ok: bool):
         h.append('<div style="margin:10px 0"><img src="cid:balancechart" '
                  'alt="Daily account balance" width="760" '
                  'style="width:100%;max-width:760px;height:auto"></div>')
+
+    h.append(f'<div style="font-size:15px;font-weight:600;margin:12px 0 4px">'
+             f'Biggest movers since yesterday, by family'
+             f' <span style="color:{C_MUTED};font-weight:400;font-size:13px">'
+             f'settled + unrealized &middot; top {len(movers)} of '
+             f'{mv_tot["n_families"]} families</span></div>')
+    if movers:
+        h.append('<table style="border-collapse:collapse;font-size:13px">')
+        h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
+                 f'<td style="{TDL}">Family</td><td style="{TD}">Day P&amp;L $</td>'
+                 f'<td style="{TD}">Realized $</td><td style="{TD}">Unrealized $</td>'
+                 f'<td style="{TD}">Open now $</td>'
+                 f'<td style="{TDL}">Top events (by size of move)</td></tr>')
+        for i, (name, g) in enumerate(movers):
+            bg = "#fafafa" if i % 2 else "#fff"
+            evs = "<br>".join(
+                f'{r["event"]}&nbsp; {_pnl_span(r["day"])} '
+                f'<span style="color:{C_MUTED}">{_mover_tag(r)}</span>'
+                for r in g["top"])
+            more = len(g["rows"]) - len(g["top"])
+            if more > 0:
+                evs += f'<br><span style="color:{C_MUTED}">+{more} more</span>'
+            n = len(g["rows"])
+            h.append(f'<tr style="background:{bg}">'
+                     f'<td style="{TDL}vertical-align:top">{name}'
+                     f'<div style="color:{C_MUTED};font-size:11px">'
+                     f'{n} event{"s" if n != 1 else ""}</div></td>'
+                     f'<td style="{TD}font-weight:600;vertical-align:top">'
+                     f'{_pnl_span(g["day"])}</td>'
+                     f'<td style="{TD}vertical-align:top">{_pnl_span(g["realized"])}</td>'
+                     f'<td style="{TD}vertical-align:top">{_pnl_span(g["unreal"])}</td>'
+                     f'<td style="{TD}vertical-align:top">{g["value_now"]:,.2f}</td>'
+                     f'<td style="{TDL}font-size:12px">{evs}</td></tr>')
+        if mv_hidden_n:
+            h.append(f'<tr style="color:{C_MUTED}">'
+                     f'<td style="{TDL}">+{mv_hidden_n} more families</td>'
+                     f'<td style="{TD}">{_pnl_span(mv_hidden_net)}</td>'
+                     f'<td style="{TD}" colspan="4"></td></tr>')
+        h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
+                 f'<td style="{TDL}">ALL FAMILIES</td>'
+                 f'<td style="{TD}">{_pnl_span(mv_tot["day"])}</td>'
+                 f'<td style="{TD}">{_pnl_span(mv_tot["realized"])}</td>'
+                 f'<td style="{TD}">{_pnl_span(mv_tot["unreal"])}</td>'
+                 f'<td style="{TD}">{mv_tot["value_now"]:,.2f}</td>'
+                 f'<td style="{TDL}font-weight:400;color:{C_INK2}">'
+                 f'{mv_tot["n_events"]} events</td></tr>')
+        h.append('</table>')
+        if mv_residual is not None:
+            h.append(f'<div style="color:{C_MUTED};font-size:12px;margin:4px 0 0">'
+                     f'Account value moved {_pnl_span(d_equity)}; the '
+                     f'{_pnl_span(mv_residual)} not in this table is liquidity '
+                     f'credits, deposits/withdrawals, and Kalshi marking at the '
+                     f'bid where this table uses mid.</div>')
+    else:
+        h.append(f'<div style="color:{C_INK2}">Nothing moved since the prior '
+                 f'morning.</div>')
 
     h.append(f'<div style="font-size:15px;font-weight:600;margin:12px 0 4px">'
              f'Settled since yesterday, by series</div>')
