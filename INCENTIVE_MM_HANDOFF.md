@@ -2198,3 +2198,12 @@ thing between those 14 events and the book. They enter as seats free
 launcher cap is raised (the 9/10 precedent: 100 -> 150 for the *CC wave via
 $ProbeEnv + `restart_imm.ps1 -Task`). The verdict file was not rewritten
 (every verdict fresh), and no family read was needed.
+
+EVENT CAP 150 -> 200 (Jack 2026-09-22 pm: "increase to IMM_MAX_MARKETS to
+200"; launcher $ProbeEnv, commit 8707d5e, applied 00:08Z 9/23 with
+`restart_imm.ps1 -Task` -- hourly temp was dark, so no window wait). First
+refresh under the new cap (00:10Z): 833 selected across 164/200 events (795
+across 150/150 the refresh before), `not_ranked` 0 (was 51). Every family
+event now holds a seat at most 3 strikes deep: *ADS 31 markets in all 11
+events, *POS 50 in all 18, *CC 88 in all 30. No family read was needed and
+no family/finecon error line since the restart.
