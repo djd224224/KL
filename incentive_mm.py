@@ -2407,6 +2407,75 @@ ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
         "IMM_ALLOW_PREFIXES",
         "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT,KXAAAGASD").split(",") if p)
+# SPORTS LADDERS & ESCALATORS (Jack 2026-09-24: "allowlist sports ladders
+# and escalators, up until the game starts. e.g. NFLLADDERREC-26SEP24ATLGB,
+# NFLLADDERRECYDS-26SEP24ATLGB. though these shouldnt be quoted since the
+# game started"). Kalshi's per-game player-prop SCALARS: a Receptions
+# Ladder YES pays $0.05 per catch (capped at $1), a Fantasy Ladder $0.01 per
+# PPR point, an Escalator a convex per-stat schedule; strike_type "custom",
+# one market per player, event = one game (26SEP24ATLGB = ET game date +
+# the two team codes). Live 2026-09-24: 7 NFL series on the Thursday game --
+# ladders REC / RECYDS / RSHYDS / FFPTS ($478-956/day per series, programs
+# from ~2 days out) and escalators REC / RECYDS / RSHYDS (programs 21:55Z-
+# 03:59Z, game-time pools of ~$790/market/day).
+#
+# Allowed by NAME PATTERN -- a league prefix with LADDER or ESCALATOR
+# anywhere after it -- so every stat and every future league's ladders are
+# covered without a hand add; guards clone the KXNFLLADDERREC archetype
+# through the "pattern" kind in FAMILY_OVERRIDE_PARENTS (safe-join, no rate
+# bar).
+#
+# THE CUTOFF IS THE KICKOFF. Kalshi's occurrence_datetime on these is ~3h
+# AFTER kickoff (ATL@GB: kickoff 00:15Z, occurrence 03:15Z, expiration
+# 06:15Z, close two days later), so trade_cutoff_utc's occurrence branch
+# would have quoted three hours INTO the game. The schedule resolver owns
+# the cutoff instead: EventStartResolver looks the game up on the league's
+# ESPN scoreboard (ESPN_LEAGUE_PATHS) and refresh_universe cuts off
+# EVENT_START_BUFFER_MIN before kickoff. When the resolver cannot place the
+# game (no ESPN path for the league, API down, unknown team code) the
+# ticker-date midnight-ET rule wins the min() in trade_cutoff_utc -- out
+# the night before the game, the safe direction -- never the occurrence.
+_SPORTS_LADDER_PATTERN = (
+    r"KX(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAB|CFB|CBB|MLS)[A-Z0-9]*"
+    r"(LADDER|ESCALATOR)[A-Z0-9]*")
+ALLOW_SERIES_PATTERNS = tuple(
+    re.compile(p.strip()) for p in os.environ.get(
+        "IMM_ALLOW_SERIES_PATTERNS", _SPORTS_LADDER_PATTERN).split(",")
+    if p.strip())
+SPORTS_LADDER_LEAGUE_RE = re.compile("^" + _SPORTS_LADDER_PATTERN + "$")
+# ESPN scoreboard path per league prefix. site.web.api.espn.com: the
+# site.api host started answering 403 "Access Denied" to the browser UA in
+# 2026-09 (measured 2026-09-24 for nfl / wnba / cfb alike), this host serves
+# the same API with it. No entry = no schedule source = the midnight-ET
+# fallback for that league's ladders.
+ESPN_LEAGUE_PATHS = {
+    "NFL": "football/nfl", "NBA": "basketball/nba", "WNBA": "basketball/wnba",
+    "NHL": "hockey/nhl", "MLB": "baseball/mlb",
+    "NCAAF": "football/college-football", "CFB": "football/college-football",
+    "NCAAB": "basketball/mens-college-basketball",
+    "CBB": "basketball/mens-college-basketball", "MLS": "soccer/usa.1",
+}
+ESPN_SITE_API = "https://site.web.api.espn.com/apis/site/v2/sports"
+
+
+def series_pattern_allowed(series: str) -> bool:
+    """The regex allowlist (sports ladders / escalators)."""
+    return any(p.fullmatch(series) for p in ALLOW_SERIES_PATTERNS)
+
+
+def sports_ladder_league(series: str) -> Optional[str]:
+    """'KXNFLESCALATORRECYDS' -> 'NFL'; None for anything else."""
+    m = SPORTS_LADDER_LEAGUE_RE.match(series)
+    return m.group(1) if m else None
+
+
+def schedule_resolved_series(series: str) -> bool:
+    """Series whose cutoff comes from a LIVE schedule and must never be
+    pre-dropped on the ticker date (a postponed game keeps paying): the
+    exact SCHEDULE_RESOLVED_SERIES set plus every sports ladder / escalator
+    league that has an ESPN path."""
+    return series in SCHEDULE_RESOLVED_SERIES \
+        or sports_ladder_league(series) in ESPN_LEAGUE_PATHS
 _DEFAULT_CRYPTO_SERIES = (
     # The yearly touch pairs (KX*MINY/KX*MAXY, allowlisted 2026-07-22 when no
     # fleet bot quoted them) moved to SERIES_BLOCKLIST_PREFIXES on 2026-08-13:
@@ -3898,6 +3967,13 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
     SERIES_OVERRIDES[_s] = SeriesOverride(
         min_est_per_day=_env_float("IMM_CONSUMER_OBS_MIN_RATE", 0.0),
         safe_join=True)
+# SPORTS LADDER / ESCALATOR archetype (Jack 2026-09-24, see
+# ALLOW_SERIES_PATTERNS): safe-join placement, no rate bar; the cutoff is
+# the resolver's kickoff minus the global EVENT_START_BUFFER_MIN (30 min).
+# Every pattern-allowed sibling clones this on first sight.
+SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
+    min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
+    safe_join=True)
 
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
@@ -4004,6 +4080,8 @@ FAMILY_OVERRIDE_PARENTS = (
     ("family_suffix", "CC", "KXAMZNCC"),
     ("family_suffix", "ADS", "KXAMUSEMENTADS"),
     ("family_suffix", "POS", "KXDRPEPPERPOS"),
+    # regex kind (2026-09-24): the sports ladder / escalator families
+    ("pattern", SPORTS_LADDER_LEAGUE_RE, "KXNFLLADDERREC"),
 )
 _family_override_warned: Set[str] = set()
 
@@ -4014,6 +4092,9 @@ def ensure_family_override(series: str) -> None:
     for kind, pat, parent in FAMILY_OVERRIDE_PARENTS:
         if kind == "prefix":
             if not series.startswith(pat):
+                continue
+        elif kind == "pattern":
+            if not pat.fullmatch(series):
                 continue
         elif kind == "family_suffix":
             if not series.endswith(pat):
@@ -5034,6 +5115,13 @@ class EventStartResolver:
         # (observed 2026-07-19: LADAL, a 1pm-ET tip, skipped all morning).
         if series == "KXWNBAMENTION":
             return self._espn_wnba_start(event_ticker)
+        # Sports ladders / escalators (2026-09-24): the league from the series
+        # name, the kickoff from that league's ESPN scoreboard. No path ->
+        # None -> the midnight-ET fallback upstream (out the night before).
+        lg = sports_ladder_league(series)
+        if lg is not None:
+            path = ESPN_LEAGUE_PATHS.get(lg)
+            return self._espn_game_start(path, event_ticker, 2) if path else None
         game = parse_mention_game(event_ticker)
         if game is None:
             return None
@@ -5060,7 +5148,7 @@ class EventStartResolver:
 
     def _espn_soccer_start(self, et_date, teams: Set[str]) -> Optional[datetime]:
         data = self._get(
-            "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/"
+            f"{ESPN_SITE_API}/soccer/fifa.world/"
             f"scoreboard?dates={et_date.strftime('%Y%m%d')}")
         for ev in data.get("events", []):
             comps = (ev.get("competitions") or [{}])[0].get("competitors") or []
@@ -5072,25 +5160,29 @@ class EventStartResolver:
     def _espn_wnba_start(self, event_ticker: str) -> Optional[datetime]:
         # Variable-length team codes, and Kalshi's don't always equal ESPN's
         # (Kalshi CONN vs ESPN CON — cost the whole CONNPHX game day when the
-        # exact-concat match failed, 2026-07-19). Try every split of the blob;
-        # a part matches a team when it prefix-matches the abbreviation in
-        # either direction, or the uppercased location (WAS vs WSH/WASHINGTON).
+        # exact-concat match failed, 2026-07-19); the 14-day window is
+        # Kalshi's postponement window (NYDAL 7/16 -> makeup 7/20).
+        return self._espn_game_start("basketball/wnba", event_ticker, 14)
+
+    def _espn_game_start(self, path: str, event_ticker: str,
+                         window_days: int = 2) -> Optional[datetime]:
+        """Kickoff/tip of the game a '<date><TEAMS>' event ticker names, from
+        the league's ESPN scoreboard. Try every split of the team blob; a
+        part matches a team when it prefix-matches the abbreviation in
+        either direction, or the uppercased location (WAS vs WSH /
+        WASHINGTON). One call per ET day from the ticker date through
+        `window_days` later (the site.web.api host rejects date RANGES for
+        some leagues); the first day holding a NON-postponed match wins, so
+        a postponed game resolves to its makeup start inside the window and
+        an unscheduled makeup -> None -> the midnight fallback (no quotes,
+        the safe direction; the 30-min negative cache re-checks)."""
         d = parse_event_date(event_ticker)
         seg = event_ticker.split("-")[1] if "-" in event_ticker else ""
-        m = re.match(r"^\d{2}[A-Z]{3}\d{2}([A-Z]{4,8})$", seg)
+        m = re.match(r"^\d{2}[A-Z]{3}\d{2}([A-Z]{4,10})$", seg)
         if d is None or not m:
             return None
         blob = m.group(1)
         et_date = d.astimezone(ET).date()
-        # Range query (ticker date + Kalshi's 14-day postponement window):
-        # a postponed game (NYDAL 7/16 -> makeup 7/20) keeps its markets open,
-        # so the start we want is the pair's earliest NON-postponed meeting in
-        # the window. Makeup not scheduled yet -> None -> midnight fallback
-        # (no quotes, safe direction); the 30-min negative cache re-checks.
-        data = self._get(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/"
-            f"scoreboard?dates={et_date.strftime('%Y%m%d')}"
-            f"-{(et_date + timedelta(days=14)).strftime('%Y%m%d')}")
 
         def team_hit(part: str, team: dict) -> bool:
             ab = (team.get("abbreviation") or "").upper()
@@ -5098,24 +5190,31 @@ class EventStartResolver:
             return bool(ab) and (ab.startswith(part) or part.startswith(ab)
                                  or bool(loc and loc.startswith(part)))
 
-        starts = []
-        for ev in data.get("events", []):
-            status = ((ev.get("status") or {}).get("type") or {}).get("name", "")
-            if status in ("STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_CANCELLED"):
-                continue
-            comps = (ev.get("competitions") or [{}])[0].get("competitors") or []
-            teams = [(c.get("team") or {}) for c in comps]
-            if len(teams) != 2:
-                continue
-            for i in range(2, len(blob) - 1):
-                x, y = blob[:i], blob[i:]
-                if (team_hit(x, teams[0]) and team_hit(y, teams[1])) \
-                        or (team_hit(x, teams[1]) and team_hit(y, teams[0])):
-                    s = parse_iso_utc(ev.get("date", ""))
-                    if s is not None:
-                        starts.append(s)
-                    break
-        return min(starts) if starts else None
+        for k in range(max(0, int(window_days)) + 1):
+            day = et_date + timedelta(days=k)
+            data = self._get(f"{ESPN_SITE_API}/{path}/scoreboard"
+                             f"?dates={day.strftime('%Y%m%d')}")
+            starts = []
+            for ev in (data or {}).get("events", []):
+                status = ((ev.get("status") or {}).get("type") or {}).get("name", "")
+                if status in ("STATUS_POSTPONED", "STATUS_CANCELED",
+                              "STATUS_CANCELLED"):
+                    continue
+                comps = (ev.get("competitions") or [{}])[0].get("competitors") or []
+                teams = [(c.get("team") or {}) for c in comps]
+                if len(teams) != 2:
+                    continue
+                for i in range(2, len(blob) - 1):
+                    x, y = blob[:i], blob[i:]
+                    if (team_hit(x, teams[0]) and team_hit(y, teams[1])) \
+                            or (team_hit(x, teams[1]) and team_hit(y, teams[0])):
+                        s = parse_iso_utc(ev.get("date", ""))
+                        if s is not None:
+                            starts.append(s)
+                        break
+            if starts:
+                return min(starts)
+        return None
 
 
 def series_hard_expiry_utc(series: str, event_ticker: str) -> Optional[datetime]:
@@ -7535,7 +7634,8 @@ class IncentiveMarketMaker:
         """Blocklist always wins; then the exact-series allowlist (MENTION
         suffix + named crypto series), the finecon group, and the name-
         pattern families (prefixes; *CC/*ADS/*POS via ALLOW_FAMILY_SUFFIXES,
-        source-verified -- family_series_allowed) unless ALLOWLIST_ONLY is
+        source-verified -- family_series_allowed; the sports ladder /
+        escalator regexes, ALLOW_SERIES_PATTERNS) unless ALLOWLIST_ONLY is
         off."""
         if cls._blocked(ticker):
             return False
@@ -7549,6 +7649,7 @@ class IncentiveMarketMaker:
             series in FINECON_SERIES or \
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
             family_series_allowed(series) or \
+            series_pattern_allowed(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -7697,7 +7798,7 @@ class IncentiveMarketMaker:
             # Schedule-API series: a postponed game moves past the ticker
             # date while its programs keep paying — never pre-drop on the
             # string; the resolver's live schedule + _screen govern.
-            if series_of(t) in SCHEDULE_RESOLVED_SERIES:
+            if schedule_resolved_series(series_of(t)):
                 return False
             # Mention-family tickers may embed a LISTING date (26AUG13
             # ran to Sep 4 — the 2026-08-14 listing-date fix): the string

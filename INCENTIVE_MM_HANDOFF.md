@@ -2486,3 +2486,63 @@ date-arm never suppresses it), untested on KXRT.
 Tests: test_kxrt_release_week_stand_down (override registered, nothing
 else changed, tightener anchors on close and never loosens, screen inside
 vs outside the window, quotable-days horizon, kill switch); 606 green.
+
+## 2026-09-24 pm — Sports ladders and escalators allowlisted, cutoff = kickoff (Jack)
+
+Jack: "allowlist sports ladders and escalators, up until the game starts.
+e.g. NFLLADDERREC-26SEP24ATLGB, NFLLADDERRECYDS-26SEP24ATLGB. though these
+shouldnt be quoted since the game started".
+
+WHAT THEY ARE. Kalshi's per-game player-prop SCALARS (strike_type
+"custom"): a Receptions Ladder YES pays $0.05 per catch capped at $1, a
+Fantasy Ladder $0.01 per PPR point, an Escalator a convex per-stat
+schedule; one market per player, event = one game (26SEP24ATLGB = ET game
+date + team codes). Live 2026-09-24: seven NFL series on the Thursday game
+-- ladders REC / RECYDS / RSHYDS / FFPTS ($478-956/day per series, programs
+from ~2 days out) and escalators REC / RECYDS / RSHYDS (programs 21:55Z-
+03:59Z only, game-time pools of ~$790/market/day).
+
+ALLOWLIST BY REGEX (ALLOW_SERIES_PATTERNS, env IMM_ALLOW_SERIES_PATTERNS):
+a league prefix (NFL NBA WNBA NHL MLB NCAAF NCAAB CFB CBB MLS) with LADDER
+or ESCALATOR anywhere after it, checked in _allowed after the suffix
+families -- every stat and every future league's ladders are covered
+without a hand add. Guards clone the KXNFLLADDERREC archetype (safe-join,
+no rate bar) through a new "pattern" kind in FAMILY_OVERRIDE_PARENTS.
+
+THE CUTOFF IS THE KICKOFF. Kalshi's occurrence_datetime on these markets is
+~3h AFTER kickoff (ATL@GB: kickoff 00:15Z, occurrence 03:15Z, expiration
+06:15Z, close two days later), so trade_cutoff_utc's occurrence branch
+would have quoted three hours into the game. EventStartResolver now
+resolves sports_ladder_league(series) -> ESPN_LEAGUE_PATHS -> the league's
+ESPN scoreboard (_espn_game_start: the WNBA blob-split team matcher,
+generalised; one single-date call per ET day, ticker date + 2 days for
+ladders, 14 for WNBA mentions) and refresh_universe cuts off
+EVENT_START_BUFFER_MIN (30) before kickoff. schedule_resolved_series()
+(the old exact set + every ladder league with an ESPN path) replaces the
+SCHEDULE_RESOLVED_SERIES membership test in ticker_cutoff_passed so game-
+day markets are never pre-dropped on the string. FAILURE MODE: no ESPN
+path / API down / unknown team code -> resolver None -> trade_cutoff_utc's
+min() = the ticker-date midnight-ET rule = out the night before the game,
+never the occurrence. Tonight's game resolved 00:15Z -> cutoff 23:45Z,
+already past at deploy, so the ATL@GB ladders show as `cutoff`, unquoted.
+
+ESPN HOST: site.api.espn.com answers 403 "Access Denied" to the browser UA
+since ~2026-09 (measured for nfl / wnba / cfb alike), so ALL ESPN lookups
+(WNBA, World Cup, the ladders) now use site.web.api.espn.com, which serves
+the same API; the WNBA/World Cup mention resolvers had been silently
+falling back to midnight since the block began (no live games in the
+window, so no log line).
+
+NOT DONE / TO WATCH: inactives are announced ~90 min before kickoff and are
+THE information event for player props (a scratched player's ladder goes
+to ~0); the 30-min buffer leaves an hour of that. A larger buffer is one
+knob: SERIES_OVERRIDES["KXNFLLADDERREC"].start_buffer_min. Escalator mids
+are often under the 5c band (Bijan REC 1.0/9.4c) and will reject as
+extreme_mid / wide by themselves. First real quoting window: the Sunday
+Sep 27 slate once Kalshi lists it (~2 days out).
+
+Tests: test_sports_ladder_resolves_kickoff_from_espn (kickoff either team
+order, no match -> None, no league path -> None, the fallback is the night
+before not the occurrence), test_sports_ladders_and_escalators_are_
+allowlisted_by_pattern (7 live shapes + an NBA one, non-ladders refused,
+archetype clone, schedule predicate, blocklist wins). 608 green.

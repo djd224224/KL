@@ -1783,6 +1783,50 @@ class TestEventStartResolver(unittest.TestCase):
         "competitions": [{"competitors": [
             {"team": {"abbreviation": "DAL"}}, {"team": {"abbreviation": "LA"}}]}]}]}
 
+    NFL_JSON = {"events": [{
+        "date": "2026-09-25T00:15Z", "shortName": "ATL @ GB",
+        "status": {"type": {"name": "STATUS_SCHEDULED"}},
+        "competitions": [{"competitors": [
+            {"team": {"abbreviation": "GB", "location": "Green Bay"},
+             "homeAway": "home"},
+            {"team": {"abbreviation": "ATL", "location": "Atlanta"},
+             "homeAway": "away"}]}]}]}
+
+    def test_sports_ladder_resolves_kickoff_from_espn(self):
+        # Jack 2026-09-24: "allowlist sports ladders and escalators, up until
+        # the game starts ... these shouldnt be quoted since the game
+        # started". Kalshi's occurrence_datetime on these is kickoff + ~3h,
+        # so the resolver's kickoff is what keeps the bot out of the game.
+        urls = []
+
+        def get(url):
+            urls.append(url)
+            return self.NFL_JSON
+        r = imm.EventStartResolver(http_get_json=get)
+        for ev in ("KXNFLLADDERREC-26SEP24ATLGB",
+                   "KXNFLESCALATORRECYDS-26SEP24ATLGB",
+                   "KXNFLFFPTSLADDER-26SEP24ATLGB"):
+            self.assertEqual(r.resolve(ev.split("-")[0], ev),
+                             utc(2026, 9, 25, 0, 15), ev)
+        self.assertIn("site.web.api.espn.com/apis/site/v2/sports/football/nfl/"
+                      "scoreboard?dates=20260924", urls[0])
+        # either team order in the blob
+        self.assertEqual(r.resolve("KXNFLLADDERREC", "KXNFLLADDERREC-26SEP24GBATL"),
+                         utc(2026, 9, 25, 0, 15))
+        # no matching game -> None -> the midnight-ET fallback upstream
+        self.assertIsNone(r.resolve("KXNFLLADDERREC", "KXNFLLADDERREC-26SEP24KCLAC"))
+        # a league without an ESPN path resolves nothing (fallback = quote less)
+        with mock.patch.dict(imm.ESPN_LEAGUE_PATHS, {}, clear=True):
+            r2 = imm.EventStartResolver(http_get_json=get)
+            self.assertIsNone(r2.resolve("KXNFLLADDERREC",
+                                         "KXNFLLADDERREC-26SEP25ATLGB"))
+        # and the fallback itself is the night BEFORE the game, never the
+        # occurrence three hours into it
+        self.assertEqual(imm.trade_cutoff_utc("KXNFLLADDERREC-26SEP24ATLGB",
+                                              utc(2026, 9, 25, 3, 15),
+                                              utc(2026, 9, 25, 6, 15)),
+                         utc(2026, 9, 24, 4, 0))
+
     def test_wnba_resolves_tip_either_order(self):
         # Ticker blob LADAL = away+home; ESPN lists home (DAL) first — the
         # variable-length codes can't be split, so both concat orders match.
@@ -3547,6 +3591,48 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             imm.FAMILY_VERDICTS.update(saved_verdicts)
             for fake in ("KXNEVERSEENCC", "KXNEVERSEENADS", "KXNEVERSEENPOS"):
                 imm.SERIES_OVERRIDES.pop(fake, None)
+
+    def test_sports_ladders_and_escalators_are_allowlisted_by_pattern(self):
+        # Jack 2026-09-24: "allowlist sports ladders and escalators" -- a
+        # league prefix with LADDER / ESCALATOR anywhere after it, every stat
+        # and every future league covered; guards clone KXNFLLADDERREC.
+        saved_only = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+        try:
+            for t in ("KXNFLLADDERREC-26SEP24ATLGB-ATLDLONDON5",
+                      "KXNFLLADDERRECYDS-26SEP24ATLGB-ATLBROBINSON7",
+                      "KXNFLLADDERRSHYDS-26SEP24ATLGB-GBJJACOBS8",
+                      "KXNFLESCALATORREC-26SEP24ATLGB-ATLBROBINSON7",
+                      "KXNFLFFPTSLADDER-26SEP24ATLGB-GBJLOVE10",
+                      "KXNBALADDERPTS-26OCT21BOSNYK-BOSJTATUM25"):
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+                self.assertEqual(imm.scan_universe_reason(t), "allowed", t)
+            for s in ("KXNFLGAME", "KXLADDERCPI", "KXNFLMENTION", "KXNFL"):
+                self.assertFalse(imm.series_pattern_allowed(s), s)
+            self.assertFalse(IncentiveMarketMaker._allowed("KXNFLGAME-26SEP24ATLGB-ATL"))
+            # guards: a never-seen sibling clones the archetype on first sight
+            imm.SERIES_OVERRIDES.pop("KXNBALADDERPTS", None)
+            imm.ensure_family_override("KXNBALADDERPTS")
+            self.assertEqual(imm.SERIES_OVERRIDES["KXNBALADDERPTS"],
+                             imm.SERIES_OVERRIDES["KXNFLLADDERREC"])
+            self.assertTrue(imm.series_safe_join("KXNBALADDERPTS"))
+            self.assertEqual(imm.series_min_est_rate("KXNBALADDERPTS"), 0.0)
+            # the cutoff comes from the live schedule, so the ticker-date
+            # pre-drop never applies; leagues without an ESPN path fall back
+            self.assertEqual(imm.sports_ladder_league("KXNFLESCALATORRSHYDS"), "NFL")
+            self.assertIsNone(imm.sports_ladder_league("KXNFLGAME"))
+            self.assertTrue(imm.schedule_resolved_series("KXNFLLADDERREC"))
+            self.assertTrue(imm.schedule_resolved_series("KXWNBAMENTION"))
+            self.assertFalse(imm.schedule_resolved_series("KXNFLGAME"))
+            # blocklist still wins
+            with mock.patch.object(imm, "SERIES_BLOCK_PATTERNS",
+                                   tuple(imm.SERIES_BLOCK_PATTERNS)
+                                   + (imm.re.compile(r"KXNFLESCALATOR[A-Z]+"),)):
+                self.assertFalse(IncentiveMarketMaker._allowed(
+                    "KXNFLESCALATORREC-26SEP24ATLGB-ATLBROBINSON7"))
+        finally:
+            imm.ALLOWLIST_ONLY = saved_only
+            imm.SERIES_OVERRIDES.pop("KXNBALADDERPTS", None)
 
     def test_extra_allow_file_reload_and_safety(self):
         old_path = imm.EXTRA_ALLOW_FILE
