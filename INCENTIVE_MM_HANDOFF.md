@@ -2722,3 +2722,23 @@ ALLOW_SERIES_PREFIXES; blocklist wins; kill switch) and
 test_rainstorm_span_quotes_until_the_start_date (parse -> raw -> both
 producers land Sat 00:00 ET; archetype fields; NYC inherits; member quotes
 to the instant, fresh entry stops at the buffer); 616 green.
+
+MEASURED AT DEPLOY (relaunch 02:09:23Z, first refresh 02:10:58Z 9/25):
+candidates 1792 -> 1841, "KXRAINSNYC: family override inherited from
+KXRAINSBOS" logged, all 20 rainstorm markets evaluated -- and all 20
+rejected as payout_floor: est $0.05-0.10/market/day against the $1.50
+projected floor with ~1.08 quotable days left. The books are the reason:
+KXRAINSBOS-...-T5 rests 5 @ 32c YES / 5 @ 23c NO at the touch (a 45c
+spread) over 4,400 @ 2c + 1,047 @ 1c YES and 5,300 @ 2c + 1,162 @ 1c NO;
+T1 is 9 @ 59c over 3,917 @ 2c + 1,801 @ 1c YES and 8,714 @ 1c NO. The
+estimator's reference walk (cumulative depth >= target/5 = 200) lands on
+the 2c junk level, so a 10-20 lot rung is ~0.2% of the counted depth and
+the pool projects to pennies. Same shape on the weekend family: the
+KXRAINWKND-26SEP26 members sit at est_frac 0.00000 as sticky members
+(ask-only 30 lots on HOU, 3/22 book). The bot re-evaluates every refresh
+until the Sat 00:00 ET stop, so it enters on its own if the junk clears
+or a pool grows. Levers if Jack wants them quoted regardless:
+IMM_FORCE_EVENTS (bypasses the floor; precedent KXFSLR) or a min_est_total
+on the KXRAINSBOS archetype -- both are paying collateral for an
+estimated ~$0.10 of reward per market unless the estimator is wrong about
+1c/2c junk counting as qualifying depth (unmeasured for this family).
