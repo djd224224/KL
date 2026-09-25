@@ -2375,3 +2375,15 @@ scale_levels incl. the empty blocked ladder),
 test_late_month_rule_shapes_the_resting_ladder (cycle-log want columns:
 no bids, asks = half the plain ladder),
 test_verdict_reads_cover_the_exact_list_carbon_arc_families.
+
+MEASURED after the restart (new process 01:18:45Z 9/25, first refresh
+01:20:12Z): 86 events logged "bid side BLOCKED / asks x0.5"; on the next
+cycle all 394 managed Carbon Arc markets show want_bid_ct 0 and want_ask_ct
+10-30 (the halved 10-lot base times the deep-reference multiplier), 81
+already resting ask-only, zero bids, zero bid pads. Members all retained
+(CC 80/30 events, ADS 31/11, POS 53/18, FT 104/10, APP 153/18), estimated
+reward on them 222 -> 70 $/day (CC 29.6 -> 11.6, ADS 15.2 -> 5.4, POS 41.4
+-> 13.3, FT 58.9 -> 13.3, APP 77.3 -> 26.4); fresh-candidate payout_floor
+rejections in the families rose (CC 1 -> 82, ADS 29 -> 72, POS 13 -> 44);
+5 members (3 POS, 2 CC) started the hopeless clock. Universe 728 selected
+across 171/200 events, ladder collateral ~$12.5k -> ~$7.1k, no errors.
