@@ -1659,10 +1659,15 @@ class TestAllowlist(unittest.TestCase):
         a = IncentiveMarketMaker._allowed
         for t in ("KXAAAGASD-26JUL23-4.150", "KXAAAGASW-26JUL27-4.040",
                   "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
-                  "KXUSGASCPI-26AUG12-T320",
                   # diesel enrolled 2026-08-02 evening under re-entry guards
                   "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30"):
             self.assertTrue(a(t), t)
+        # KXUSGASCPI (US gasoline CPI) is still an econ allow entry, but it
+        # is a CPI print: the 2026-09-24 CPI pattern block wins over the
+        # allowlist (Jack "blocklist CPI markets"); the entry is kept for a
+        # one-line un-block, the KXTRUEV convention
+        self.assertTrue(IncentiveMarketMaker._blocked("KXUSGASCPI-26AUG12-T320"))
+        self.assertFalse(a("KXUSGASCPI-26AUG12-T320"))
         # Truflation's OTHER Kalshi index stays out — never enrolled
         self.assertFalse(a("KXTRUFAIDP-26AUG26-T50"))
         # KXTRUEV: blocked 2026-08-25, UNBLOCKED 2026-09-07 capped at 3 per
@@ -2576,7 +2581,9 @@ class TestOverrideBuffer(unittest.TestCase):
         _clean_persist()
         now = datetime.now(timezone.utc)
         release = now + timedelta(hours=3)          # e.g. today's 4pm release
-        ev = "KXINTC-26JULHEAD"
+        # (was KXINTC-26JULHEAD until 2026-09-24: company headcount events
+        # are blocked now, and the subject here is the cutoff wiring)
+        ev = "KXINTC-26JULDCAI"
         t = f"{ev}-82000"
         client = FakeClient()
         client.programs = [dict(client.programs[0], market_ticker=t)]
@@ -2864,6 +2871,94 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDWY"))
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
         self.assertFalse(imm.series_pattern_blocked("KXDIESELD"))
+
+    def test_cpi_family_is_pattern_blocked(self):
+        # Jack 2026-09-24: "blocklist CPI markets". Every series whose NAME
+        # carries CPI, in BOTH tiers (KXCPI / KXCPIYOY / KXCPICOREYOY were
+        # quoting that morning as open-scan members), plus the two CPI prints
+        # whose ticker lacks the letters. Audited against the full 14,379-
+        # series catalog: all 90 tickers containing "CPI" are CPI/inflation
+        # markets -- the substring has no near miss.
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            for t in ("KXCPI-26DEC-T0.2", "KXCPICORE-26DEC-T0.2",
+                      "KXCPIYOY-26NOV-T3.5", "KXCPICOREYOY-26DEC-T2.3",
+                      "KXCPICOMBO-26OCT-X", "KXECONSTATCPI-26OCT-T0.3",
+                      "KXECONSTATCORECPIYOY-26OCT-T3", "KXUSGASCPI-26OCT-T1",
+                      "KXCHINACPI-26OCT-T1", "KXCPINDEX-26OCT-T330",
+                      "KXCOREUND-26DEC31-T2.5", "KXUSEDCAR-26OCT-T1",
+                      "KXNEWCPIFAMILY-26OCT-T1"):    # a series not listed yet
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+                self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        # the other inflation / macro prints are untouched
+        for keep in ("KXPCE", "KXPPI", "KXGDP", "KXJOLTS", "KXUST10Y", "KXFED",
+                     "KXUSGBEEF", "KXTRUFEGGS"):
+            self.assertFalse(imm.series_pattern_blocked(keep), keep)
+        # the earlier two entries still hold
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDCA"))
+        self.assertTrue(imm.series_pattern_blocked("KXTEMPMIAH"))
+
+    def test_company_headcount_events_are_blocked(self):
+        # Jack 2026-09-24: "blocklist ... company headcount markets". The
+        # Fiscal.ai KPI class names the metric in the EVENT segment
+        # (KXAMZN-26OCTEMP = Amazon headcount in Q3, KXGOOGA-28JANHEAD =
+        # Google headcount in 2026; 21 HEAD + 1 EMP events in the catalog),
+        # so the block is an EVENT_BLOCK_PATTERNS full-match on the event
+        # ticker and the company SERIES keeps its other KPIs. Meta's own
+        # KXMETAHEADCOUNT series (26Q4 / 26JUL events, no suffix) is a
+        # SERIES_BLOCK_PATTERNS entry.
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            for t in ("KXAMZN-26OCTEMP-1600000.0", "KXAMZNA-28JANHEAD-1575000",
+                      "KXGOOGA-28JANHEAD-205000", "KXINTC-26OCTHEAD-83500.0",
+                      "KXSBUXA-26NOVHEAD-368000", "KXMETAHEADCOUNT-26Q4-70000",
+                      "KXMETAHEADCOUNT-26JUL-70000", "KXNEWCO-27Q1HEAD-100",
+                      "KXNEWCO-27JANEMPLOYEES-100"):
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+                self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
+            # the event ticker itself is blocked; the family probe is not,
+            # so the company SERIES stays in the normal book
+            self.assertTrue(IncentiveMarketMaker._blocked("KXAMZN-26OCTEMP"))
+            self.assertFalse(IncentiveMarketMaker._blocked("KXAMZN-X"))
+            self.assertTrue(IncentiveMarketMaker._allowed("KXAMZN-X"))
+            # sibling KPIs of the same companies are untouched (the catalog's
+            # near misses: DAP / CLICKS / IMPR / PROD / DEL / CARDS / MAU /
+            # RESTS / STORES / COMPTXN / F35 / PREMSUBS), and so is anything
+            # whose KPI merely CONTAINS the letters
+            for keep in ("KXMETA-26OCTDAP-3.5", "KXGOOG-26OCTCLICKS-T5",
+                         "KXAMZN-26OCTREV-T170", "KXSBUXA-28JANSTORES-42000",
+                         "KXTSLAA-28JANDEL-1800000", "KXBA-26OCTDELIV-T45",
+                         "KXAMZN-26OCTTEMP-1", "KXAMZN-26OCTHEADLINE-1",
+                         "KXTEMPHELP-26SEP17-X"):
+                self.assertFalse(IncentiveMarketMaker._blocked(keep), keep)
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        # standard semantics: a named event can still be exempted to quote
+        # to completion, its siblings stay frozen
+        ev = "KXAMZN-26OCTEMP"
+        prev = imm.BLOCKLIST_WIND_DOWN_EVENTS
+        try:
+            imm.BLOCKLIST_WIND_DOWN_EVENTS = frozenset({ev})
+            self.assertFalse(IncentiveMarketMaker._blocked(f"{ev}-1600000.0"))
+            self.assertTrue(
+                IncentiveMarketMaker._blocked("KXAMZNA-28JANHEAD-1575000"))
+        finally:
+            imm.BLOCKLIST_WIND_DOWN_EVENTS = prev
+        # full-match on the event ticker; env-configurable like the others
+        self.assertTrue(imm.event_pattern_blocked("KXAMZN-26OCTEMP"))
+        self.assertFalse(imm.event_pattern_blocked("KXAMZN-26OCTEMPX"))
+        self.assertEqual(imm.event_ticker_of("KXAMZN-26OCTEMP-1600000.0"),
+                         "KXAMZN-26OCTEMP")
+        self.assertEqual(imm.event_ticker_of("KXAMZN-26OCTEMP"), "KXAMZN-26OCTEMP")
+        self.assertEqual(imm.event_ticker_of("KXAMZN-X"), "KXAMZN-X")
+        with mock.patch.object(imm, "EVENT_BLOCK_PATTERNS", ()):
+            self.assertFalse(imm.event_pattern_blocked("KXAMZN-26OCTEMP"))
 
     def test_event_top_n_gas_cap(self):
         # Jack 2026-09-02: gas events quote only the 3 highest-ROI markets
@@ -9224,15 +9319,30 @@ class TestOpportunisticEmail(unittest.TestCase):
                          "shape")
         bot.state.scan_series_meta["KXFISC"] = {
             "ts": time.time(), "ok": True, "why": "", "category": "Economics",
-            "fiscal": False}
+            "fiscal": False, "sources": ["fiscal.ai https://fiscal.ai"]}
         self.assertEqual(qg.scan_gap_label(bot, ft, now), "undated")
         bot.state.scan_series_meta["KXFISC"] = {
             "ts": time.time(), "ok": True, "why": "", "category": "Financials",
-            "fiscal": True}
+            "fiscal": True, "sources": ["fiscal.ai https://fiscal.ai"]}
         self.assertEqual(qg.scan_gap_label(bot, ft, now), "screens pending")
         bot.state.scan_history_cache[ft] = {"ts": time.time(), "ok": True, "bars": 40, "range": 2.0, "jump": 1.0, "vol": 10.0}
         self.assertEqual(qg.scan_gap_label(bot, ft, now),
                          "eligible (slots/ROI/live screens)")
+        # a pre-2026-09-24 ok entry (no persisted sources) is STALE -- the
+        # bot re-reads the series before trusting it, so the label is
+        # pending rather than eligible; a source that a keyword now names
+        # reads as the live-source reject with no re-read
+        bot.state.scan_series_meta["KXFISC"] = {
+            "ts": time.time(), "ok": True, "why": "", "category": "Financials",
+            "fiscal": True}
+        self.assertEqual(qg.scan_gap_label(bot, ft, now), "screens pending")
+        bot.state.scan_series_meta["KXFISC"] = {
+            "ts": time.time(), "ok": True, "why": "", "category": "Financials",
+            "fiscal": True, "sources": ["openrouter https://openrouter.ai/x"]}
+        self.assertEqual(qg.scan_gap_label(bot, ft, now), "live_source")
+        bot.state.scan_series_meta["KXFISC"] = {
+            "ts": time.time(), "ok": True, "why": "", "category": "Financials",
+            "fiscal": True, "sources": ["fiscal.ai https://fiscal.ai"]}
         # A market inside its report month is NOT labelled from the month
         # alone (2026-09-06 pm narrowing): whether the month cutoff applies
         # depends on the published report date and the program end, which
@@ -9242,7 +9352,9 @@ class TestOpportunisticEmail(unittest.TestCase):
         bot.state.scan_history_cache[cm] = {"ts": time.time(), "ok": True, "bars": 40, "range": 2.0, "jump": 1.0, "vol": 10.0}
         self.assertEqual(qg.scan_gap_label(bot, cm, now),
                          "eligible (slots/ROI/live screens)")
-        bot.state.scan_series_meta["KXNOVEL"] = {"ts": time.time(), "ok": True}
+        bot.state.scan_series_meta["KXNOVEL"] = {
+            "ts": time.time(), "ok": True, "why": "", "category": "Economics",
+            "sources": ["eia https://www.eia.gov"]}
         # a cached reject is RE-SCORED against the current caps, so the
         # label follows today's thresholds, not the ones in the entry
         bot.state.scan_history_cache[t] = {
@@ -10044,6 +10156,220 @@ class TestOpenScanTier(unittest.TestCase):
 
     # ---- admission screens (bot-level, cached + budgeted reads) --------------
 
+    def test_live_source_keywords_cover_the_ai_gateway_feeds(self):
+        # Jack 2026-09-24: KXTOKENUSE-26SEP28 / KXXIAOMISHARE-26SEP28
+        # (OpenRouter rankings, a key-less live request/token feed) had been
+        # ADMITTED and quoted -- 'openrouter' was not a keyword. Class sweep
+        # of the catalog's settlement-source hosts against the live program
+        # feed added the same-shape feeds: Vercel AI Gateway share (five
+        # members that morning), LMArena, Artificial Analysis,
+        # RealClearPolling, Steam top sellers, USGS, Synoptic, tt-series,
+        # Ornn, Rotten Tomatoes / Metacritic.
+        for name, url in (
+                ("OpenRouter - AI Model Rankings",
+                 "https://openrouter.ai/rankings#top-models"),
+                ("OpenRouter - AI Market Share",
+                 "https://openrouter.ai/rankings#market-share"),
+                ("Vercel AI Gateway", "https://vercel.com/ai-gateway"),
+                ("LMArena", "https://arena.ai/leaderboard"),
+                ("Artificial Analysis", "https://artificialanalysis.ai/"),
+                ("RealClearPolling", "https://www.realclearpolling.com/"),
+                ("Steam", "https://store.steampowered.com/charts/topselling"),
+                ("USGS", "https://earthquake.usgs.gov/"),
+                ("Synoptic", "https://synopticdata.com/"),
+                ("Ornn", "https://dashboard.ornnai.com/"),
+                ("Ornn data", "https://data.ornn.com/b200"),
+                ("Rotten Tomatoes", "https://www.rottentomatoes.com/tv/x"),
+                ("Metacritic", "https://www.metacritic.com/game/x")):
+            self.assertEqual(imm.scan_series_meta_verdict(
+                {"category": "Science and Technology",
+                 "settlement_sources": [{"name": name, "url": url}]})[1],
+                "live_source", name)
+        # a scheduled statistical release is not a live feed
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Economics", "settlement_sources": [
+                {"name": "Bureau of Labor Statistics",
+                 "url": "https://www.bls.gov/cpi/"}]}),
+            (True, "", "Economics"))
+        self.assertEqual(imm.series_source_blobs(
+            {"settlement_sources": [{"name": "OpenRouter", "url": "https://X"},
+                                    "junk", {"name": "", "url": ""}]}),
+            ["openrouter https://x"])
+
+    def test_cached_series_verdicts_are_rescored_against_the_keywords(self):
+        # The series cache now carries the settlement-source blobs, so a
+        # keyword added after the read (openrouter, 9/24) re-judges a cached
+        # verdict IN PLACE -- the scan_history_rescore pattern.
+        now_ts = time.time()
+        ent = {"ts": now_ts, "ok": True, "why": "",
+               "category": "Science and Technology", "fiscal": False,
+               "sources": ["openrouter - ai model rankings "
+                           "https://openrouter.ai/rankings#top-models"]}
+        self.assertEqual(imm.scan_cached_verdict(ent), (False, "live_source"))
+        with mock.patch.object(imm, "SCAN_LIVE_SOURCE_KEYWORDS", ("espn",)):
+            # keyword gone -> a cached live_source reject reads ok again
+            self.assertEqual(imm.scan_cached_verdict(
+                dict(ent, ok=False, why="live_source")), (True, ""))
+            self.assertEqual(imm.scan_cached_verdict(ent), (True, ""))
+        # a pre-9/24 ok-verdict has no sources: STALE, re-read (fail closed
+        # -- that is how KXTOKENUSE sat admitted on a week-old ok)
+        self.assertIsNone(imm.scan_cached_verdict(
+            {"ts": now_ts, "ok": True, "why": "", "category": "Economics",
+             "fiscal": False}))
+        # ... a pre-9/24 live_source reject is trusted to its TTL, and the
+        # category branch is untouched
+        self.assertEqual(imm.scan_cached_verdict(
+            {"ts": now_ts, "ok": False, "why": "live_source",
+             "category": "Sports"}), (False, "live_source"))
+        self.assertEqual(imm.scan_cached_verdict(
+            {"ts": now_ts, "ok": False, "why": "category:unknown",
+             "category": "", "sources": []}), (False, "category:unknown"))
+        # bot level: the read persists the blobs; a later keyword change
+        # lands with NO re-read
+        bot = self._bot(sources=[{"name": "OpenRouter",
+                                  "url": "https://openrouter.ai/rankings"}])
+        self.assertEqual(bot._scan_series_ok(self.S, now_ts, {"series": 5}),
+                         (False, "live_source"))
+        self.assertEqual(bot.state.scan_series_meta[self.S]["sources"],
+                         ["openrouter https://openrouter.ai/rankings"])
+        reads = bot.client.series_reads
+        with mock.patch.object(imm, "SCAN_LIVE_SOURCE_KEYWORDS", ("espn",)):
+            self.assertEqual(bot._scan_series_ok(self.S, now_ts,
+                                                 {"series": 5}), (True, ""))
+        self.assertEqual(bot.client.series_reads, reads)
+        # a stale (source-less) ok entry costs one read, then carries sources
+        bot.state.scan_series_meta[self.S] = {
+            "ts": now_ts, "ok": True, "why": "",
+            "category": "Science and Technology", "fiscal": False}
+        self.assertEqual(bot._scan_series_ok(self.S, now_ts, {"series": 5}),
+                         (False, "live_source"))
+        self.assertEqual(bot.client.series_reads, reads + 1)
+        self.assertIn("sources", bot.state.scan_series_meta[self.S])
+
+    def test_live_source_rejects_when_the_reward_window_covers_the_market(self):
+        # Jack 2026-09-24: "dont quote markets that are easily adversely
+        # selected against because there is live data flowing visibly ...
+        # AND the market resolution overlaps entirely or almost entirely
+        # with the incentive reward period". Prong B = the reward window
+        # covers >= SCAN_LIVE_OVERLAP_MIN of the open->close life OR ends
+        # within SCAN_LIVE_TAIL_HOURS of the close. Sampled 9/24: OpenRouter
+        # weeklies 0.84-1.00 / tail 0-24h, Vercel 0.85 / 0h, YouTube 1.00 /
+        # 0h -> all rejected.
+        now = datetime.now(timezone.utc)
+
+        def meta(open_h_ago, close_h_ahead, start_h_ago, end_h_ahead, **kw):
+            base = dict(open_time=now - timedelta(hours=open_h_ago),
+                        close_time=now + timedelta(hours=close_h_ahead),
+                        program_start=now - timedelta(hours=start_h_ago),
+                        program_end=now + timedelta(hours=end_h_ahead))
+            base.update(kw)
+            return self._meta(**base)
+
+        self.assertEqual(imm.SCAN_LIVE_OVERLAP_MIN, 0.8)
+        self.assertEqual(imm.SCAN_LIVE_TAIL_HOURS, 24.0)
+        # KXTOKENUSE-26SEP28 shape: the program IS the market's life
+        full = meta(80, 88, 80, 88)
+        self.assertEqual(imm.live_window_overlap(full), (1.0, 0.0))
+        self.assertTrue(imm.live_reward_overlaps(full))
+        # a 3-day listing boost early in a 30-day market: not (almost) entire
+        boost = meta(24, 696, 24, 48)
+        frac, tail = imm.live_window_overlap(boost)
+        self.assertAlmostEqual(frac, 0.1)
+        self.assertAlmostEqual(tail, 648.0)
+        self.assertFalse(imm.live_reward_overlaps(boost))
+        # ... but a short boost that runs INTO the close is the reveal
+        # (KXOPENSHARE-26SEP21: the last 3.3 days of a 6.5-day week)
+        late = meta(80, 12, 60, 12)
+        self.assertLess(imm.live_window_overlap(late)[0], 0.8)
+        self.assertTrue(imm.live_reward_overlaps(late))
+        # 0.84 covered / 24h tail (the widest OpenRouter shape seen) rejects
+        edge = meta(100, 24, 100, 0)
+        self.assertGreaterEqual(imm.live_window_overlap(edge)[0], 0.8)
+        self.assertTrue(imm.live_reward_overlaps(edge))
+        # unknown timestamps fail closed
+        self.assertIsNone(imm.live_window_overlap(meta(80, 88, 80, 88,
+                                                       open_time=None)))
+        self.assertTrue(imm.live_reward_overlaps(meta(80, 88, 80, 88,
+                                                      program_start=None)))
+        self.assertTrue(imm.live_reward_overlaps(meta(24, 696, 24, 48,
+                                                      close_time=None)))
+        # kill switch: OVERLAP_MIN <= 0 = the pure live-source reject
+        with mock.patch.object(imm, "SCAN_LIVE_OVERLAP_MIN", 0.0):
+            self.assertTrue(imm.live_reward_overlaps(boost))
+        # admission: live source + covering window rejects; live source +
+        # an early boost passes through to the history screen; every other
+        # family reject stands regardless of the window
+        bot = self._bot(sources=[{"name": "OpenRouter",
+                                  "url": "https://openrouter.ai/rankings"}])
+        m = self._market(self.A)
+        budget = {"series": 5, "history": 5}
+        self.assertEqual(bot._scan_admission(full, m, {}, now, budget),
+                         "live_source")
+        self.assertEqual(bot._scan_admission(late, m, {}, now, budget),
+                         "live_source")
+        self.assertIsNone(bot._scan_admission(boost, m, {}, now, budget))
+        with mock.patch.object(imm, "SCAN_LIVE_OVERLAP_MIN", 0.0):
+            self.assertEqual(bot._scan_admission(boost, m, {}, now, budget),
+                             "live_source")
+        with mock.patch.object(imm, "SCAN_EXCLUDE_CATEGORIES",
+                               frozenset({"Economics"})):
+            bot.state.scan_series_meta.clear()
+            bot.client.series_meta[self.S] = {"category": "Economics"}
+            self.assertEqual(bot._scan_admission(boost, m, {}, now, budget),
+                             "category:Economics")
+        # the quote-gaps mirror applies prong B when handed the meta, and
+        # reads the conservative 'live_source' without one
+        import imm_quote_gaps as qg
+        bot.state.scan_series_meta[self.S] = {
+            "ts": now.timestamp(), "ok": False, "why": "live_source",
+            "category": "Science and Technology", "fiscal": False,
+            "sources": ["openrouter https://openrouter.ai/rankings"]}
+        bot.state.scan_history_cache.clear()
+        self.assertEqual(qg.scan_gap_label(bot, self.A, now), "live_source")
+        self.assertEqual(qg.scan_gap_label(bot, self.A, now, meta=full),
+                         "live_source")
+        self.assertNotEqual(qg.scan_gap_label(bot, self.A, now, meta=boost),
+                            "live_source")
+
+    def test_a_member_whose_series_turns_live_is_evicted_on_refresh(self):
+        # The 9/24 deploy shape: KXTOKENUSE / KXXIAOMISHARE / KX*VREQ members
+        # sat on cached ok-verdicts. Members skip admission, so the refresh
+        # re-tests the POLICY screens on them: the source-less entry is
+        # re-read, the series is now live-source, the reward window covers
+        # the market -> the member leaves the candidate list, the selection
+        # and (through the stray-order sweep) its quotes. A member on a
+        # scheduled-release source is retained by the same pass.
+        now = datetime.now(timezone.utc)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+        def run(sources):
+            bot = self._bot(sources=sources)
+            # the market closes when its program ends (a weekly, like
+            # KXTOKENUSE-26SEP28): the window covers 7 of 9 days
+            bot.client.markets[self.A]["close_time"] = (
+                now + timedelta(days=6)).strftime(fmt)
+            bot.state.scan_series_meta[self.S] = {
+                "ts": now.timestamp(), "ok": True, "why": "",
+                "category": "Science and Technology", "fiscal": False}
+            bot.state.scan_members = {self.A}
+            bot.state.scan_book = {self.A}
+            bot.state.sticky_prev = {self.A}
+            bot.state.universe_at = 0.0
+            bot.refresh_universe(now, {})
+            return bot
+
+        bot = run([{"name": "OpenRouter",
+                    "url": "https://openrouter.ai/rankings"}])
+        self.assertNotIn(self.A, bot.state.scan_members)
+        self.assertNotIn(self.A, bot.state.selected)
+        self.assertEqual(bot.state.scan_series_meta[self.S]["why"],
+                         "live_source")
+        # control: a scheduled-release source keeps the member
+        bot = run([{"name": "EIA", "url": "https://www.eia.gov"}])
+        self.assertIn(self.A, bot.state.scan_members)
+        self.assertIn(self.A, bot.state.selected)
+        self.assertEqual(bot.state.scan_series_meta[self.S]["why"], "")
+
     def test_event_activity_is_a_mean_per_market_not_a_sum(self):
         # Jack 2026-09-06: "change event cap to be avg_per_market_on_event,
         # and set that to 60". The old screen was a SUM against 250, which
@@ -10258,8 +10584,14 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertIsNone(imm.scan_cached_verdict(
             {"ts": now_ts, "ok": False, "why": "category:Politics"}))
         self.assertEqual(imm.scan_cached_verdict(
-            {"ts": now_ts, "ok": True, "why": "", "category": "Sports"}),
+            {"ts": now_ts, "ok": True, "why": "", "category": "Sports",
+             "sources": ["the league https://league.example"]}),
             (True, ""))
+        # (an ok entry WITHOUT persisted sources is stale since 2026-09-24:
+        # the live-source screen re-reads it -- see
+        # test_cached_series_verdicts_are_rescored_against_the_keywords)
+        self.assertIsNone(imm.scan_cached_verdict(
+            {"ts": now_ts, "ok": True, "why": "", "category": "Sports"}))
         self.assertEqual(imm.scan_cached_verdict(
             {"ts": now_ts, "ok": False, "why": "live_source",
              "category": "Sports"}), (False, "live_source"))
@@ -10275,7 +10607,8 @@ class TestOpenScanTier(unittest.TestCase):
                 {"ts": now_ts, "ok": True, "why": "", "category": "Sports"}),
                 (False, "category:Sports"))
             self.assertEqual(imm.scan_cached_verdict(
-                {"ts": now_ts, "ok": True, "why": "", "category": "Economics"}),
+                {"ts": now_ts, "ok": True, "why": "", "category": "Economics",
+                 "sources": ["eia https://www.eia.gov"]}),
                 (True, ""))
         # bot-level: the stale ban re-reads the series (one budgeted read)
         # and the fresh verdict replaces the cache entry

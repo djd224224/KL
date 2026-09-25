@@ -1324,7 +1324,9 @@ event pool) first, or it will measure nothing.
 `DRIFT` 0 = off ·
 `DAILY_LOSS_LIMIT` 200 (TIER-wide, per ET day) · `SERIES_STRIKES` 2 · `SERIES_STRIKE_DAYS` 7 ·
 `EXCLUDE_CATEGORIES` (EMPTY since 2026-09-06 — a name here is a
-deliberate re-ban) · `EXCLUDE_PREFIXES` · `LIVE_SOURCE_KEYWORDS`.
+deliberate re-ban) · `EXCLUDE_PREFIXES` · `LIVE_SOURCE_KEYWORDS` ·
+`LIVE_OVERLAP_MIN` 0.8 · `LIVE_TAIL_H` 24 (the live-feed rule's reward-window
+prong, 2026-09-24; OVERLAP_MIN <= 0 = the pure live-source reject).
 Widening levers, in order of how much risk they add: `MAX_VOLUME_24H`,
 `LIVE_SOURCE_KEYWORDS` (dropping a scoreboard/index keyword admits
 markets everyone else prices off a live feed), `REQUIRE_NUMERIC=0`
@@ -2546,3 +2548,123 @@ order, no match -> None, no league path -> None, the fallback is the night
 before not the occurrence), test_sports_ladders_and_escalators_are_
 allowlisted_by_pattern (7 live shapes + an NBA one, non-ladders refused,
 archetype clone, schedule predicate, blocklist wins). 608 green.
+
+## 2026-09-24 pm — CPI + company headcount blocklisted; live-feed rule gains the reward-window prong (Jack)
+
+Jack: "blocklist CPI markets and company headcount markets. also dont quote
+markets that are easily adversely selected against because there is live
+data flowing visibly directly impacting the market that the bot is quoting,
+and the market resolution overlaps entirely or almost entirely with the
+incentive reward period e.g. KXTOKENUSE-26SEP28, KXXIAOMISHARE-26SEP28".
+
+WHAT THE BOOK LOOKED LIKE (imm_state.json 01:44Z 9/25): 11 CPI strikes
+quoting as OPEN-SCAN members (KXCPI-26NOV/26DEC, KXCPIYOY-26NOV/26DEC,
+KXCPICOREYOY-26DEC; 15 CPI positions, 490 contracts gross); one headcount
+market selected in the NORMAL book (KXAMZN-26OCTEMP-1600000.0, -49) with
+31 headcount markets held from earlier programs (599 gross: KXGOOG-26NOVHEAD
+15 strikes, KXINTC-26OCTHEAD 10, KXSBUXA/KXAXPA/KXCMGA-27FEBHEAD,
+KXAMZNA-28JANHEAD); and EIGHT live-feed scan members -- KXTOKENUSE-26SEP28
+x3, KXXIAOMISHARE-26SEP28 x1 (both settle on openrouter.ai/rankings, a
+key-less feed that "updates live as traffic flows") plus KXANTHVREQ /
+KXANTHVSPEND / KXMOONVSPEND-26SEP26 x5 (Vercel AI Gateway share, the same
+shape). All eight had passed the scan's live-source screen: neither
+`openrouter` nor `vercel` was a keyword, and their cached ok-verdicts were
+up to a week old. Both OpenRouter events run their reward window over the
+market's entire life (open 9/21 16:00Z or 9/22 00:00Z -> close 9/28
+03:59Z = the program window exactly).
+
+### 1. CPI: SERIES_BLOCK_PATTERNS `.*CPI.*` (+ KXCOREUND, KXUSEDCAR, USEDCAR)
+
+The family is not one prefix (KXECONSTATCPI/CPIYOY/CPICORE/CORECPIYOY carry
+60 live program markets and do not start with KXCPI; KXUSGASCPI,
+KXSHELTERCPI, KXCHINACPI, KXJPCPIYOY ... likewise). The substring pattern
+takes every series whose NAME carries CPI, today's and future. Audited
+against the whole 14,379-series catalog before shipping: all 90 tickers
+containing "CPI" are CPI/inflation markets -- no KXTEMPHELP-style near
+miss. Two CPI prints whose ticker lacks the letters are named explicitly
+(KXCOREUND "Will Core CPI fall below x.x%", KXUSEDCAR/USEDCAR "US CPI print
+on used cars"). Deliberately NOT taken: KXUSGBEEF (BLS average ground-beef
+price, a price tracker by shape), KXTRUFEGGS (Truflation index with "CPI"
+only in its title), PCE/PPI. Blocked rather than de-allowlisted because
+scan_universe_reason() reads "not blocked and not allowed" as a scan
+candidate -- these were scan members.
+
+### 2. Company headcount: EVENT_BLOCK_PATTERNS (new) + `KX[A-Z0-9]+HEADCOUNT`
+
+The Fiscal.ai company-KPI class names the metric in the EVENT segment, one
+series per company for all its KPIs: KXAMZN-26OCTEMP ("Amazon headcount in
+Q3"), KXAMZNA-28JANHEAD, KXGOOGA-28JANHEAD, KXINTC-26OCTHEAD ... (21 HEAD
+events + 1 EMP event in the catalog) beside the same companies' DAP /
+CLICKS / IMPR / PROD / DEL / CARDS / MAU / RESTS / STORES / COMPTXN events
+that stay quotable. No series prefix or pattern can say "this KPI of every
+company", so `_blocked()` gained a third test: `event_pattern_blocked`,
+a FULL-match of the event ticker against EVENT_BLOCK_PATTERNS (env
+IMM_BLOCK_EVENT_PATTERNS), default
+`KX[A-Z0-9]+-\d\d(?:[A-Z]{3}|Q[1-4])(?:HEAD|HEADCOUNT|EMP|EMPL|EMPLOYEES)`.
+The "<series>-X" family probe has no date and never matches, so KXAMZN
+stays in the company set with its other KPIs. Meta's headcount is its own
+series (KXMETAHEADCOUNT-26Q4, no suffix) -> SERIES_BLOCK_PATTERNS entry.
+Wind-down exemption (BLOCKLIST_WIND_DOWN_EVENTS) works on event blocks too.
+
+### 3. Live-feed rule: keywords swept, prong B added, cache re-scored, members re-tested
+
+- `SCAN_LIVE_SOURCE_KEYWORDS` += openrouter, vercel.com, arena.ai,
+  artificialanalysis, realclearpolling, steampowered, usgs.gov,
+  synopticdata, tt-series, ornnai.com, data.ornn.com, rottentomatoes,
+  metacritic. Chosen by sweeping every settlement-source host in the
+  catalog against the live program feed for the OpenRouter shape (public,
+  continuously updated, the market is a function of the running value).
+  KXRT / KXMC are NORMAL-book allow entries (Jack's) and untouched -- the
+  keywords only keep a look-alike (KXRTTV) out of the scan. Judgment calls
+  NOT added: portwatch.imf.org (KXSUEZWEEKLY / KXBABELMANDEBWEEKLY --
+  daily transit counts published with a multi-day lag; credited scan
+  admits so far, 0 unpaid events today), luminatedata (weekly album
+  consumption, a weekly report), gasprices.aaa (a daily print; the gas
+  families are hand-managed in the normal book).
+- Prong B (`live_reward_overlaps`): a live source rejects a market only
+  when the reward window covers >= SCAN_LIVE_OVERLAP_MIN (0.8) of the
+  market's open->close life OR ends within SCAN_LIVE_TAIL_HOURS (24) of
+  the close (a late boost on a live-feed market IS the reveal:
+  KXOPENSHARE-26SEP21's program was the last 3.3 days of its 6.5-day
+  week). Unknown timestamps fail closed. `IMM_SCAN_LIVE_OVERLAP_MIN=0`
+  restores the pure live-source reject the tier ran with 9/5-9/24.
+  MEASURED 9/24 over 516 program markets on live-feed hosts: OpenRouter
+  0.84-1.00 covered / tail 0-24h, Vercel 0.85 / 0h, YouTube 1.00 / 0h ->
+  every one rejected; the only A-and-not-B shapes were categorical
+  (KXLLM1, KXTOPMODEL, KXSTEAMTOPSELLER -> 'shape') or prefix-excluded
+  (KXBTCPRICE), so the literal two-prong rule admits nothing the old rule
+  rejected in practice.
+- The series cache (`scan_series_meta`) now persists the source blobs
+  (`sources`), and `scan_cached_verdict` re-scores them against the
+  current keywords in place -- the scan_history_rescore pattern. A
+  pre-9/24 ok-entry has no sources and is STALE (re-read, fail closed);
+  a pre-9/24 live_source reject is trusted to its TTL. MarketMeta gained
+  `program_start` (the reward window's start; imm_quote_gaps.build_meta
+  mirrors it).
+- MEMBER POLICY RE-TEST: members skip _scan_admission (quote-to-
+  completion), which is how the eight sat on week-old ok-verdicts. The
+  refresh now runs `_scan_member_policy` on every member FIRST (the
+  series-read budget goes to the quoted book before any candidate): a
+  live-source (with prong B) or category-ban verdict evicts the member --
+  left out of the candidate list, so it leaves `selected` and the stray-
+  order sweep cancels its quotes; positions ride. A pending/unreadable
+  read keeps the member. Log tell: `open-scan member <t> evicted: <why>
+  (policy re-test)`; refresh reject counts gain `member_<why>`.
+
+Positions ride to settlement under every mechanism above (standard
+blocklist semantics; flatten by hand if wanted): CPI 15 markets / 490
+gross, headcount 31 / 599, OpenRouter+Vercel 6 / 307 (KXTOKENUSE T150 +62,
+T156 +55, T158 +50; KXXIAOMISHARE 1.8 -35, 3.7 +60; KXANTHVREQ T5P5 -45).
+
+Knobs: IMM_BLOCK_SERIES_PATTERNS (now 7 entries), IMM_BLOCK_EVENT_PATTERNS,
+IMM_SCAN_LIVE_SOURCE_KEYWORDS, IMM_SCAN_LIVE_OVERLAP_MIN 0.8,
+IMM_SCAN_LIVE_TAIL_H 24 -- all in the config hash. Deploy = the in-bot
+self-restart on the source mtime (no env change).
+
+Tests: test_cpi_family_is_pattern_blocked,
+test_company_headcount_events_are_blocked,
+test_live_source_keywords_cover_the_ai_gateway_feeds,
+test_cached_series_verdicts_are_rescored_against_the_keywords,
+test_live_source_rejects_when_the_reward_window_covers_the_market,
+test_a_member_whose_series_turns_live_is_evicted_on_refresh; two older
+tests modernised to the sourced cache shape.

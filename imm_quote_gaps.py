@@ -240,7 +240,8 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
         mid_cents=((bid + ask) / 2.0 if bid and ask else None),
         spread_cents=((ask - bid) if bid and ask else None),
         volume=volume, volume_24h=volume_24h, status=m.get("status", ""),
-        open_time=imm.parse_iso_utc(m.get("open_time", "")))
+        open_time=imm.parse_iso_utc(m.get("open_time", "")),
+        program_start=info.get("start"))
 
 
 def bulk_market_details(client, tickers) -> dict:
@@ -352,11 +353,16 @@ def fmt_window(end, now_utc: datetime) -> str:
     return "til " + local.strftime("%b %d")
 
 
-def scan_gap_label(bot, t: str, now_utc: datetime) -> str:
+def scan_gap_label(bot, t: str, now_utc: datetime, meta=None) -> str:
     """Why an open-scan-universe market is not quoted, from the live bot's
     PERSISTED screen caches (imm_state.json) — never a fetch. Order mirrors
     the bot's own admission order; 'eligible' means every cached screen
-    passed and the walk/slots/ROI (or an uncached live screen) decided."""
+    passed and the walk/slots/ROI (or an uncached live screen) decided.
+    `meta` (optional, a built MarketMeta) lets the live-source verdict
+    apply the bot's prong B (imm.live_reward_overlaps, 2026-09-24); without
+    it a live source reads as `live_source` unconditionally -- the
+    conservative direction, and the only one the classify pass has (it
+    labels before it reads market details)."""
     st = bot.state
     ev = _event_of(t)
     if ev in st.scan_evicted_events:
@@ -397,7 +403,9 @@ def scan_gap_label(bot, t: str, now_utc: datetime) -> str:
         if cached is None:
             sm = None
         elif not cached[0]:
-            return cached[1] or "series screen"
+            if not (cached[1] == "live_source" and meta is not None
+                    and not imm.live_reward_overlaps(meta)):
+                return cached[1] or "series screen"
     hc = st.scan_history_cache.get(t)
     if hc:
         # Re-scored against the CURRENT caps, the same way the bot does

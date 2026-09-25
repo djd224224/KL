@@ -2094,12 +2094,47 @@ MARKET_BLOCK_SUFFIXES = tuple(
 # city list, IMM_HOUR_MULT_EXCLUDE and the KXTEMP daily-prefix entry all keep
 # working the moment the pattern is removed.
 #
+# THIRD ENTRY -- CPI (Jack 2026-09-24: "blocklist CPI markets"). The CPI
+# family is not one prefix: KXCPI / KXCPICORE / KXCPIYOY / KXCPICOREYOY /
+# KXCPICOMBO share KXCPI, but the ECONSTAT twins (KXECONSTATCPI,
+# KXECONSTATCPIYOY, KXECONSTATCPICORE, KXECONSTATCORECPIYOY -- 60 live
+# program markets on 9/24), the component prints (KXUSGASCPI, KXSHELTERCPI,
+# KXAIRFARECPI, KXUSEDCARCPI, KXTOBACCPI, KXCPINDEX ...) and the foreign
+# prints (KXCHINACPI, KXJPCPIYOY, KXUKCPIYOY, KXEZCPIYOYF ...) do not. ".*CPI.*"
+# takes every series whose NAME carries CPI, today's and any future one.
+# Audited 2026-09-24 against the full 14,379-series catalog: all 90 tickers
+# containing "CPI" are CPI/inflation markets, so the substring has no near
+# miss (the KXTEMPHELP lesson applied before shipping, not after). Two CPI
+# prints whose ticker lacks the letters are named explicitly: KXCOREUND
+# ("Will Core CPI fall below x.x% in 2026?") and KXUSEDCAR / USEDCAR ("US
+# CPI print on used cars"). KXUSGBEEF (BLS average ground-beef price, an
+# average-price table released with the CPI) is NOT taken -- it is a price
+# tracker by shape, and Jack said CPI. KXUSGASCPI stays in the econ allow
+# lists below (blocklist wins over allowlist; kept for a one-line un-block,
+# the KXTRUEV convention). Why blocked here and not merely
+# de-allowlisted: the three headline series were quoting that morning as
+# OPEN-SCAN members (11 strikes of KXCPI/KXCPIYOY/KXCPICOREYOY-26NOV/26DEC,
+# admitted as quiet Economics prints), and scan_universe_reason() reads
+# "not blocked and not allowed" as a scan candidate -- only _blocked closes
+# both tiers. Standard semantics: no new orders, resting quotes cancelled
+# next cycle, NOT reduce-only; the 15 open CPI positions (gross 490
+# contracts on 9/24) ride to settlement or are flattened by hand.
+#
+# FOURTH ENTRY -- COMPANY HEADCOUNT, series form (Jack 2026-09-24:
+# "blocklist ... company headcount markets"). Most headcount markets are
+# EVENTS of a company's multi-KPI series (KXAMZN-26OCTEMP, KXGOOGA-28JANHEAD
+# -- see EVENT_BLOCK_PATTERNS below), but Meta's is its own series,
+# KXMETAHEADCOUNT (events 26JUL / 26Q4, no KPI suffix), so the series form
+# is covered here for it and any future KX<CO>HEADCOUNT listing.
+#
 # Env IMM_BLOCK_SERIES_PATTERNS (comma list of regexes, FULL-match against the
 # series name); empty string disables. Full-match, not search: a bare
 # "KXAAAGASD" pattern must not silently take the national.
 SERIES_BLOCK_PATTERNS = tuple(
     re.compile(p.strip()) for p in os.environ.get(
-        "IMM_BLOCK_SERIES_PATTERNS", "KXAAAGASD[A-Z]+,KXTEMP[A-Z]+H").split(",")
+        "IMM_BLOCK_SERIES_PATTERNS",
+        "KXAAAGASD[A-Z]+,KXTEMP[A-Z]+H,"
+        ".*CPI.*,KXCOREUND,KXUSEDCAR,USEDCAR,KX[A-Z0-9]+HEADCOUNT").split(",")
     if p.strip())
 
 
@@ -2109,6 +2144,55 @@ def series_pattern_blocked(series: str) -> bool:
     never be written back into extra_allow_series.json / the finecon file by
     the classifier tasks and then read as allowed."""
     return any(p.fullmatch(series) for p in SERIES_BLOCK_PATTERNS)
+
+
+# EVENT-TICKER PATTERN BLOCK (Jack 2026-09-24: "blocklist ... company
+# headcount markets"). The Fiscal.ai company-KPI class names the METRIC in
+# the event segment, one series per company for every KPI: KXAMZN-26OCTEMP
+# ("Amazon headcount in Q3"), KXAMZNA-28JANHEAD ("Amazon headcount in 2026"),
+# KXGOOGA-28JANHEAD, KXINTC-26OCTHEAD, KXSBUXA-26NOVHEAD, KXAXPA-27FEBHEAD ...
+# -- 21 HEAD events and one EMP event in the catalog on 9/24, beside the
+# same companies' DAP / CLICKS / IMPR / PROD / DEL / CARDS / MAU / RESTS /
+# STORES / COMPTXN events that stay quotable. Neither a series prefix nor a
+# series pattern can express "this KPI of every company", so this block
+# full-matches the EVENT ticker: <series>-<YYMON or YYQn><KPI> with the KPI
+# in the headcount vocabulary (HEAD, HEADCOUNT, EMP, EMPL, EMPLOYEES -- the
+# two observed spellings plus the obvious variants, so a new company's
+# listing is caught on the day it lists). Full-match, so 26OCTTEMP or a
+# hypothetical 26OCTHEADLINE do not match.
+#
+# Exposure that motivated it (own book, 9/24): 31 headcount markets held,
+# 599 contracts gross (KXGOOG-26NOVHEAD 15 strikes, KXINTC-26OCTHEAD 10,
+# KXSBUXA/KXAXPA/KXCMGA/KXAMZNA/KXAMZN), quoted through the company set
+# (_DEFAULT_COMPANY_SERIES) and the finecon KPI walk; one live program that
+# morning (KXAMZN-26OCTEMP, selected, -49 contracts).
+#
+# Semantics are the prefix blocklist's: _blocked() is True for every market
+# of a matching event (no new orders, resting quotes cancelled next cycle,
+# NOT reduce-only, positions ride), BLOCKLIST_WIND_DOWN_EVENTS can exempt a
+# named event, and the "<series>-X" family probe never matches (one dash,
+# no date), so the company SERIES keeps its allowlist membership and its
+# other KPIs. Env IMM_BLOCK_EVENT_PATTERNS (comma list of regexes,
+# FULL-match against the event ticker); empty disables.
+EVENT_BLOCK_PATTERNS = tuple(
+    re.compile(p.strip()) for p in os.environ.get(
+        "IMM_BLOCK_EVENT_PATTERNS",
+        r"KX[A-Z0-9]+-\d\d(?:[A-Z]{3}|Q[1-4])(?:HEAD|HEADCOUNT|EMP|EMPL|EMPLOYEES)"
+    ).split(",") if p.strip())
+
+
+def event_ticker_of(ticker: str) -> str:
+    """The EVENT ticker of a market ticker (the strike segment dropped), or
+    the ticker itself when it has no strike: an event ticker or the
+    '<series>-X' family probe (one dash)."""
+    return ticker.rsplit("-", 1)[0] if ticker.count("-") >= 2 else ticker
+
+
+def event_pattern_blocked(ticker: str) -> bool:
+    """True if the EVENT of this market/event ticker matches an
+    EVENT_BLOCK_PATTERNS entry."""
+    ev = event_ticker_of(ticker)
+    return any(p.fullmatch(ev) for p in EVENT_BLOCK_PATTERNS)
 
 # ---- universe allowlist (user decision 2026-07-11: MENTION + CRYPTO only) ----
 # Mention/broadcast markets have DEFINED information windows (nothing to know
@@ -3418,7 +3502,67 @@ SCAN_LIVE_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
     # a public view counter that ticks continuously is the textbook case
     # the live-source screen exists for — everyone can price it but us.
     "youtube.com,"
+    # 2026-09-24 (Jack: "dont quote markets that are easily adversely
+    # selected against because there is live data flowing visibly directly
+    # impacting the market ... e.g. KXTOKENUSE-26SEP28, KXXIAOMISHARE-26SEP28"):
+    # both settle on openrouter.ai/rankings, a key-less live request/token
+    # feed ("updates live as traffic flows"), and both had been ADMITTED --
+    # no keyword named it. Class sweep of every settlement-source host in
+    # the catalog against the live program feed, same shape: Vercel AI
+    # Gateway request/spend share (KX*VREQ / KX*VSPEND / KXOPENSOURCESHARE,
+    # five members that morning), the LMArena leaderboard (arena.ai),
+    # Artificial Analysis benchmarks, the RealClearPolling average,
+    # Steam's top-sellers chart, USGS quake feed (KXBIGGESTQUAKE is a
+    # running max), Synoptic obs (hourly temp), tt-series (table tennis
+    # results), Ornn GPU prints, Rotten Tomatoes / Metacritic scores (the
+    # KXRT / KXMC entries are the NORMAL book's, judged by Jack; this keeps
+    # a look-alike -- KXRTTV -- out of the scan).
+    "openrouter,vercel.com,arena.ai,artificialanalysis,realclearpolling,"
+    "steampowered,usgs.gov,synopticdata,tt-series,ornnai.com,data.ornn.com,"
+    "rottentomatoes,metacritic,"
     "polymarket").split(",") if k.strip())
+# LIVE-FEED RULE, prong B (Jack 2026-09-24, same breath: "... and the
+# market resolution overlaps entirely or almost entirely with the incentive
+# reward period"). A live settlement source (prong A, the keywords above)
+# rejects a market only when its reward window covers the market's own
+# resolution: at least SCAN_LIVE_OVERLAP_MIN of the open->close life, OR the
+# window runs to within SCAN_LIVE_TAIL_HOURS of the close (a late boost on
+# a live-feed market is the reveal, however short -- KXOPENSHARE-26SEP21's
+# program was the last 3.3 days of its 6.5-day week). Measured 9/24 across
+# 516 program markets on live-feed hosts: OpenRouter 0.84-1.00 covered /
+# tail 0-24h, Vercel 0.85 / 0h, YouTube 1.00 / 0h -> all rejected; the only
+# A-and-not-B shapes were categorical (KXLLM1, KXTOPMODEL, KXSTEAMTOPSELLER
+# -> 'shape') or prefix-excluded (KXBTCPRICE) anyway. Unknown windows fail
+# closed. OVERLAP_MIN <= 0 = every window overlaps = the pure live-source
+# reject the tier ran with from 9/5 to 9/24.
+SCAN_LIVE_OVERLAP_MIN = _env_float("IMM_SCAN_LIVE_OVERLAP_MIN", 0.8)
+SCAN_LIVE_TAIL_HOURS = _env_float("IMM_SCAN_LIVE_TAIL_H", 24.0)
+
+
+def live_window_overlap(meta) -> Optional[Tuple[float, float]]:
+    """(fraction of the market's open->close life that its reward window
+    covers, hours from the reward window's end to the close), or None when
+    any of the four timestamps is unknown."""
+    o, c = meta.open_time, meta.close_time
+    s, e = meta.program_start, meta.program_end
+    if o is None or c is None or s is None or e is None or c <= o:
+        return None
+    life = (c - o).total_seconds()
+    inside = max(0.0, (min(e, c) - max(s, o)).total_seconds())
+    return inside / life, (c - e).total_seconds() / 3600.0
+
+
+def live_reward_overlaps(meta) -> bool:
+    """Prong B: True when the reward window overlaps the market's resolution
+    entirely or almost entirely (see SCAN_LIVE_OVERLAP_MIN). Unknown
+    windows -> True (fail closed); OVERLAP_MIN <= 0 -> always True."""
+    if SCAN_LIVE_OVERLAP_MIN <= 0:
+        return True
+    ov = live_window_overlap(meta)
+    if ov is None:
+        return True
+    frac, tail_h = ov
+    return frac >= SCAN_LIVE_OVERLAP_MIN or tail_h <= SCAN_LIVE_TAIL_HOURS
 # Series currently carrying the scan guard set (see ensure_scan_override):
 # read by hour_size_mult (no quiet-hours doubling) and capped_ref_mult (the
 # deep-reference cap). Rebuilt at load from the persisted member list.
@@ -3666,6 +3810,28 @@ def scan_history_rescore(ent) -> Optional[Tuple[bool, str]]:
         return None
 
 
+def series_source_blobs(series_obj) -> List[str]:
+    """The settlement sources of a GET /series object as lowercased
+    'name url' strings -- what the live-source keywords are matched
+    against, and what the series cache persists (2026-09-24) so a cached
+    verdict can be re-scored when the keyword list changes."""
+    out: List[str] = []
+    if not isinstance(series_obj, dict):
+        return out
+    for s in series_obj.get("settlement_sources") or []:
+        if not isinstance(s, dict):
+            continue
+        blob = (str(s.get("name") or "") + " " + str(s.get("url") or "")).lower().strip()
+        if blob:
+            out.append(blob[:200])
+    return out[:12]
+
+
+def sources_are_live(blobs) -> bool:
+    """Prong A of the live-feed rule: any source blob names a live feed."""
+    return any(k in b for b in (blobs or []) for k in SCAN_LIVE_SOURCE_KEYWORDS)
+
+
 def scan_series_meta_verdict(series_obj: dict) -> Tuple[bool, str, str]:
     """FAMILY screen on a GET /series object -> (ok, why, category). An
     excluded category or a live-feed settlement source rejects; an EMPTY
@@ -3677,12 +3843,8 @@ def scan_series_meta_verdict(series_obj: dict) -> Tuple[bool, str, str]:
         return False, "category:unknown", cat     # fail closed, not open
     if cat in SCAN_EXCLUDE_CATEGORIES:
         return False, f"category:{cat}", cat
-    for s in series_obj.get("settlement_sources") or []:
-        if not isinstance(s, dict):
-            continue
-        blob = (str(s.get("name") or "") + " " + str(s.get("url") or "")).lower()
-        if any(k in blob for k in SCAN_LIVE_SOURCE_KEYWORDS):
-            return False, "live_source", cat
+    if sources_are_live(series_source_blobs(series_obj)):
+        return False, "live_source", cat
     return True, "", cat
 
 
@@ -3744,6 +3906,20 @@ def scan_cached_verdict(ent) -> Optional[Tuple[bool, str]]:
         return False, why
     if ent.get("ok") and cat and cat in SCAN_EXCLUDE_CATEGORIES:
         return False, f"category:{cat}"
+    # LIVE-SOURCE RE-SCORE (2026-09-24): entries persist their source blobs,
+    # so a keyword added after the read (openrouter / vercel that day)
+    # re-judges the cached verdict in place -- the scan_history_rescore
+    # pattern, no re-read. A pre-9/24 ok-verdict carries no sources: STALE,
+    # re-read (fail closed -- that is exactly how KXTOKENUSE sat admitted on
+    # a week-old ok). A pre-9/24 live_source reject is trusted to its TTL.
+    srcs = ent.get("sources")
+    if isinstance(srcs, list):
+        if sources_are_live(srcs):
+            return False, "live_source"
+        if why == "live_source":
+            return True, ""          # the keyword that rejected it is gone
+    elif ent.get("ok"):
+        return None
     return bool(ent.get("ok")), why
 
 
@@ -4400,7 +4576,8 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DAILY_LOSS_LIMIT", "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
-    "SERIES_BLOCK_PATTERNS", "MARKET_BLOCK_SUFFIXES",
+    "SERIES_BLOCK_PATTERNS", "MARKET_BLOCK_SUFFIXES", "EVENT_BLOCK_PATTERNS",
+    "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE",
@@ -6252,6 +6429,9 @@ class MarketMeta:
     volume: float = 0.0
     status: str = ""
     open_time: Optional[datetime] = None
+    # the reward window's START (its end is program_end); with open_time /
+    # close_time it is what the live-feed rule's prong B measures (2026-09-24)
+    program_start: Optional[datetime] = None
     est_frac: float = 0.0               # estimated pool share with our ladder resting
     est_dollars_per_day: float = 0.0    # est_frac x pool rate
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
@@ -7613,7 +7793,8 @@ class IncentiveMarketMaker:
     @staticmethod
     def _blocked(ticker: str) -> bool:
         if any(ticker.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES) \
-                or series_pattern_blocked(series_of(ticker)):
+                or series_pattern_blocked(series_of(ticker)) \
+                or event_pattern_blocked(ticker):
             # A wind-down event (BLOCKLIST_WIND_DOWN_EVENTS) is the one
             # exception to a prefix block. Accept the market ticker or the
             # event ticker itself: the freeze paths pass markets, the
@@ -7978,7 +8159,8 @@ class IncentiveMarketMaker:
                 mid_cents=((bid + ask) / 2.0 if bid and ask else None),
                 spread_cents=((ask - bid) if bid and ask else None),
                 volume=volume, status=m.get("status", ""),
-                open_time=parse_iso_utc(m.get("open_time", "")))
+                open_time=parse_iso_utc(m.get("open_time", "")),
+                program_start=info.get("start"))
             # Band state for the LIFETIME SLOT RULE (2026-09-09), recorded
             # here because this is the last point a slot-holding market is
             # still in hand: one whose touches are outside the band is
@@ -8026,10 +8208,32 @@ class IncentiveMarketMaker:
                       "history": SCAN_MAX_HISTORY_FETCHES}
             scan_halted = self.state.scan_halt_day == _et_today
             scan_metas.sort(key=lambda mm: -mm[0].dollars_per_day)
+            # MEMBER POLICY RE-TEST FIRST (2026-09-24): the series-read
+            # budget goes to the book the bot is actually quoting before any
+            # candidate spends it, so a keyword change reaches every member
+            # on the first refresh. An evicted member is left out of the
+            # candidate list: it leaves `selected`, the stray-order sweep
+            # cancels its quotes, positions ride. _scan_admission re-rejects
+            # it on the same screen every refresh, so no bar is needed.
+            _evicted: Set[str] = set()
+            if not scan_halted:
+                for _meta, _m in scan_metas:
+                    if _meta.ticker not in self.state.scan_members:
+                        continue
+                    _why = self._scan_member_policy(
+                        _meta, now_utc.timestamp(), budget)
+                    if _why is not None:
+                        _evicted.add(_meta.ticker)
+                        _k = "member_" + _why
+                        scan_skips[_k] = scan_skips.get(_k, 0) + 1
+                        log(f"{self.tag} open-scan member {_meta.ticker} "
+                            f"evicted: {_why} (policy re-test)")
             _admissible: List[MarketMeta] = []
             for _meta, _m in scan_metas:
                 if scan_halted:
                     scan_skips["scan_halted"] = scan_skips.get("scan_halted", 0) + 1
+                    continue
+                if _meta.ticker in _evicted:
                     continue
                 if _meta.ticker not in self.state.scan_members:
                     why = self._scan_admission(_meta, _m, ev_vol24, now_utc, budget)
@@ -8733,8 +8937,28 @@ class IncentiveMarketMaker:
             return False, why
         self.state.scan_series_meta[series] = {
             "ts": now_ts, "ok": ok, "why": why, "category": cat,
-            "fiscal": scan_series_is_fiscal(so)}
+            "fiscal": scan_series_is_fiscal(so),
+            "sources": series_source_blobs(so)}
         return ok, why
+
+    def _scan_member_policy(self, meta: MarketMeta, now_ts: float,
+                            budget: Dict[str, int]) -> Optional[str]:
+        """POLICY re-test of a sitting open-scan MEMBER (2026-09-24). Members
+        skip _scan_admission (quote-to-completion: the ROI, activity and
+        history screens judged them once), but the policy screens are not
+        a one-time judgement: a live-source keyword added after admission
+        (openrouter / vercel on 9/24 -- KXTOKENUSE, KXXIAOMISHARE and five
+        Vercel members were quoting on week-old ok-verdicts) or a category
+        re-ban must take the member out that refresh. None = keep; else the
+        reject reason. A pending or unreadable series read KEEPS the member
+        (never evict on a missing read); the live rule's prong B applies
+        exactly as it does at admission."""
+        ok, why = self._scan_series_ok(meta.series, now_ts, budget)
+        if ok or why in ("series_meta_pending", "series_meta_unavailable"):
+            return None
+        if why == "live_source" and not live_reward_overlaps(meta):
+            return None
+        return why or "series_meta"
 
     def _scan_series_fiscal(self, series: str) -> Optional[bool]:
         """The persisted Fiscal.ai flag for a series: True/False once the
@@ -8861,7 +9085,12 @@ class IncentiveMarketMaker:
             return "event_avg_volume"
         ok, why = self._scan_series_ok(meta.series, now_ts, budget)
         if not ok:
-            return why or "series_meta"
+            # LIVE-FEED RULE prong B (Jack 2026-09-24): a live settlement
+            # source rejects only when the reward window overlaps the
+            # market's resolution (almost) entirely -- live_reward_overlaps.
+            # Every other family reject stands as read.
+            if why != "live_source" or live_reward_overlaps(meta):
+                return why or "series_meta"
         ok, why = self._scan_history_ok(meta, now_ts, budget)
         if not ok:
             return why or "history"
