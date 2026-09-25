@@ -2890,3 +2890,96 @@ Tests: test_award_shows_three_per_event_and_one_month_stand_down (starts from
 table / occurrence / expiration / placeholder / missing, cutoffs for all
 five incl. the Oscar family inheritance and the mention carve-out, exact
 allow vs the strangers, caps, screen); allowlist test extended; suite green.
+
+## 2026-09-25 pm — Sub-$1 credit was being stranded: the exit bar is now the $1.00 cliff, the floor projection is judged at day size, counters survive an eviction (Jack)
+
+Jack: "why are there a bunch of markets on KXVENUEPERFORM-REDROCKS28JAN01
+that stopped quoting but are close to the $1 cutoff? that is lost money"
+-> "build it".
+
+WHAT WAS HAPPENING (measured 9/25, live feed + state + selection_events +
+cycle logs): Red Rocks = 35 markets, one $200 program each, period 9/17
+21:02Z -> 10/01 21:02Z ($14.29/market/day), est share $0.04-0.15/market/day.
+Eleven members had banked $0.50-$0.99 this period (REB .99, HOZ .93, DEA
+.92, RUF .92, JOH .91, GRE .91, NAT .86, TUR .79, LUM .77, ODE .74, BIL
+.50) and were being evicted as "hopeless"; twelve more (JOE .99, VAM .96,
+TAM .82, PRE .79, FRE .77, DOM .72, KAC .72, CHR .70, NOA .66, WID .65,
+LOR .62, BLU .55 -- reconstructed from the cycle logs, the same integral
+matches the 23 surviving counters to the cent) had no counter at all and sat
+in payout_floor. ~$18 of period accrual on the event, ~$44 book-wide (25
+kept-counter + 35 pruned markets in the $0.50-$1.00 band), all paying $0
+unless each market crosses $1.00 by its period end. 1,510 unquoted
+market-hours on the event over the period.
+
+THREE DEFECTS, THREE MECHANISMS (each with a kill switch):
+
+1. THE EXIT READ THE ENTRY BAR. The 9/12 move of MIN_EST_TOTAL_DOLLARS to
+   $1.50 fed the same `series_min_est_total()` to the hopeless exit, so a
+   member with $0.93 banked and a $1.25 projection (HOZ, 9/24 14:00Z) was
+   above the exchange's real cliff, under the entry bar, and evicted -- the
+   $0.93 then pays nothing. The $0.50 margin was ENTRY risk cover; on an
+   exit it guarantees the sub-$1 outcome it was meant to avoid.
+   -> `floor_bar_dollars(series, banked)`: a MEMBER, or a re-entrant with
+   ANY banked accrual this period, is tested against PAYOUT_FLOOR_DOLLARS
+   ($1.00); a fresh candidate still needs $1.50. `EXIT_FLOOR_IS_PAYOUT`
+   (env IMM_EXIT_FLOOR_IS_PAYOUT=0 restores the single $1.50 bar).
+2. THE CHURN ENGINE. `_estimate_candidate_yield` sizes its ladder with
+   `hour_size_mult` (launcher IMM_HOUR_SIZE_MULT=0-9:2.0, Saturday x1.5),
+   so est/day doubled 04:00-13:59Z: the evicted markets cleared $1.50 and
+   re-entered at the 04:00Z refresh, halved at 14:00Z (cycle log: HOZ
+   est_frac .00613 -> .00308 at 14:00:32Z), and HOPELESS_SUSTAIN_SECS later
+   were evicted again -- ~9h quoted / ~14h dark, every day (HOZ 9/23, 9/24,
+   9/25 identical). A market must not be admitted on doubled size and
+   evicted on normal size.
+   -> `MarketMeta.floor_dollars_per_day`: the share the DAY ladder
+   (`base_scaled_levels`: hour/Saturday multiplier off, family multiplier
+   and the Carbon Arc late-month rule kept) would earn on the EXTERNAL book
+   (an incumbent's own hour-scaled orders stripped first by
+   `external_levels`, touches and reference prices re-read on that book).
+   Equal to est_dollars_per_day whenever no multiplier is active, so nothing
+   changes outside the windows. Read by the entry floor, the hopeless exit,
+   the 1h peak and the rate-floor escape; ranking/yield keep the live
+   estimate. `FLOOR_PROJECTION_BASE_SIZE` (env
+   IMM_FLOOR_PROJECTION_BASE_SIZE=0 restores the live-size projection).
+   Logged per market in selection_events as `floor_dollars_per_day`.
+3. THE CREDIT WAS FORGOTTEN. `known_tickers &= managed | positions` and
+   `_save_persist` pruned accrued_est / period_base / period_start /
+   hopeless_since / paid_crossed with it, so a FLAT evicted market lost its
+   counter at the next restart (~20 restarts/day), re-entered with $0 and
+   could never clear $1.50 on rate alone. The 11 with positions kept
+   theirs; the 12 flat ones did not.
+   -> `_keeps_accrual(t)`: persist while quoted/held (known_tickers) OR
+   while the market's LIVE program period is running (`state.programmed`);
+   before the first successful feed of a run (programmed empty) the
+   counters the file already held are kept (`_loaded_credit`), a counter
+   born in memory this run still prunes as before. Once the program ends
+   and the market is flat, it prunes as it always did, so a re-listing
+   starts clean. `KEEP_ACCRUAL_WHILE_PROGRAMMED` (env
+   IMM_KEEP_ACCRUAL_WHILE_PROGRAMMED=0 restores the known_tickers-only
+   prune).
+
+The quote-gaps email mirror (`imm_quote_gaps.py`) reads the same three
+things (`floor_dollars_per_day`, `period_accrued`, `floor_bar_dollars`) so
+"under payout floor" means what the bot means. All three knobs are in the
+config hash. Startup logs one ASCII line: `[IMM] floor credit (2026-09-25):
+exit / banked re-entry bar = $1.00 payout cliff; fresh entry bar = $1.50;
+floor projection at day size; accrual counters kept while programmed`.
+
+ONE-OFF STATE RESTORE: the 12 forgotten Red Rocks counters were written
+back into imm_state.json during the deploy's restart window (accrued_est =
+the cycle-log reconstruction, period_base 0, period_start = the live
+period key; backup `imm_state_backup_<ts>_pre_redrocks_restore.json`).
+Existing counters were not touched.
+
+WHAT THIS DOES NOT FIX: the estimate itself (accrual model ~1.07x on
+covered periods, see imm_reward_recon) -- the cliff test is only as good
+as the counter; markets whose program ended with the credit under $1
+before 9/25 are gone; deliberate stand-downs (KXCPI blocklist, KXRT 7-day
+cutoff) still park credit under the cliff by design; the day-size
+projection is conservative during the multiplier windows (a doubled ladder
+really does accrue faster), so a market genuinely borderline at day size
+is judged as if it never got the quiet-hours boost.
+
+Tests: `TestExitBarIsThePayoutCliff`, `TestFloorProjectionAtDaySize`,
+`TestAccrualCountersSurviveEviction` (+ the existing "nothing can reach the
+bar" tests now raise BOTH bars). Suite 626 green at deploy.

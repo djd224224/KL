@@ -1445,6 +1445,18 @@ def hour_scaled_levels(series: str, now_utc: datetime) -> List[Tuple[int, int]]:
     return [(t, max(1, int(s * m + 0.5))) for t, s in lv]
 
 
+def base_scaled_levels(series: str) -> List[Tuple[int, int]]:
+    """hour_scaled_levels() with the time-of-day / Saturday multiplier OFF
+    (1.0): the day ladder. The family (mention / earnings) multiplier is
+    kept -- it is not a time-of-day effect. Feeds the day-size floor
+    projection (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25)."""
+    lv = series_levels(series)
+    m = applied_mention_mult(series)
+    if m == 1.0:
+        return lv
+    return [(t, max(1, int(s * m + 0.5))) for t, s in lv]
+
+
 def series_max_position(series: str) -> float:
     ov = SERIES_OVERRIDES.get(series)
     base = ov.max_position if (ov and ov.max_position is not None) \
@@ -1501,6 +1513,19 @@ def series_min_est_total(series: str) -> float:
     if ov and ov.min_est_total is not None:
         return max(ov.min_est_total, PAYOUT_FLOOR_DOLLARS)
     return MIN_EST_TOTAL_DOLLARS
+
+
+def floor_bar_dollars(series: str, banked: bool) -> float:
+    """The min-payout bar a projection must reach. `banked` = the market is
+    a current member OR has accrued anything this program period: those
+    are judged against the exchange's own PAYOUT_FLOOR_DOLLARS cliff
+    (EXIT_FLOOR_IS_PAYOUT, 2026-09-25) because sub-$1 accrual pays NOTHING
+    and evicting a market that has banked most of its $1 destroys a
+    near-certain credit. A fresh candidate keeps the series entry bar
+    (series_min_est_total, $1.50 since 2026-09-12)."""
+    if EXIT_FLOOR_IS_PAYOUT and banked:
+        return PAYOUT_FLOOR_DOLLARS
+    return series_min_est_total(series)
 
 
 def series_atref_price_tol(series: str) -> int:
@@ -4615,6 +4640,50 @@ HOPELESS_SUSTAIN_SECS = _env_int("IMM_HOPELESS_SUSTAIN_SECS", 3600)
 # the period. IMM_FLOOR_ACCRUAL_PER_PERIOD=0 restores the lifetime credit.
 FLOOR_ACCRUAL_PER_PERIOD = os.environ.get(
     "IMM_FLOOR_ACCRUAL_PER_PERIOD", "1") == "1"
+# THE EXIT BAR IS THE EXCHANGE'S $1.00 CLIFF, NOT THE $1.50 ENTRY MARGIN
+# (Jack 2026-09-25, KXVENUEPERFORM-REDROCKS28JAN01: "a bunch of markets ...
+# stopped quoting but are close to the $1 cutoff -- that is lost money").
+# The 9/12 move of MIN_EST_TOTAL_DOLLARS to $1.50 fed the SAME bar to the
+# hopeless exit, so a member with $0.93 banked this period and $0.04-0.06/day
+# over the 6 days left projected $1.2-1.3 -- above the cliff, under the
+# entry bar -- and was evicted; the $0.93 then pays nothing. Measured 9/25:
+# 11 Red Rocks markets with $0.50-$0.99 banked, 1,510 unquoted market-hours
+# over the period, book-wide ~$44 of period accrual parked under the cliff.
+# The $0.50 margin was asked for as ENTRY risk cover; on an exit it
+# guarantees the sub-$1 outcome it was meant to avoid. So (floor_bar_dollars):
+#   * a MEMBER, or a re-entrant with ANY banked accrual this period, is
+#     tested against PAYOUT_FLOOR_DOLLARS;
+#   * a fresh candidate (nothing banked) still needs MIN_EST_TOTAL_DOLLARS.
+# IMM_EXIT_FLOOR_IS_PAYOUT=0 restores the single $1.50 bar everywhere.
+EXIT_FLOOR_IS_PAYOUT = os.environ.get("IMM_EXIT_FLOOR_IS_PAYOUT", "1") == "1"
+# THE FLOOR PROJECTION IS JUDGED AT DAY SIZE (same incident). The yield
+# estimator sizes its ladder with hour_size_mult (launcher
+# IMM_HOUR_SIZE_MULT=0-9:2.0, Saturday x1.5), so est_dollars_per_day
+# doubled 04:00-13:59Z: the evicted markets cleared the bar and re-entered
+# at the 04:00Z refresh, halved at 14:00Z, and HOPELESS_SUSTAIN_SECS later
+# were evicted again -- ~9h quoted / ~14h dark per day, every day (HOZ on
+# 9/23, 9/24, 9/25). A market must not be admitted on doubled size and
+# evicted on normal size, so the entry floor, the hopeless exit, the 1h
+# peak and the rate-floor escape all read MarketMeta.floor_dollars_per_day:
+# the share the DAY ladder (hour/Saturday multiplier off; the family
+# multiplier and the Carbon Arc late-month rule kept -- those are not
+# time-of-day) would earn on the EXTERNAL book. Equal to est_dollars_per_day
+# whenever no multiplier is active. Ranking / yield keep the live estimate.
+# IMM_FLOOR_PROJECTION_BASE_SIZE=0 restores the live-size projection.
+FLOOR_PROJECTION_BASE_SIZE = os.environ.get(
+    "IMM_FLOOR_PROJECTION_BASE_SIZE", "1") == "1"
+# THE CREDIT SURVIVES AN EVICTION (same incident, third leg). known_tickers
+# drops every flat unmanaged market, and _save_persist pruned accrued_est /
+# period_base / period_start / hopeless_since / paid_crossed with it, so a
+# FLAT evicted market lost its counter at the next restart, re-entered as a
+# fresh candidate with $0 credit and could never clear $1.50 on rate alone
+# (12 Red Rocks markets, JOE at $0.99 and VAM at $0.96 among them; the 11
+# with positions kept theirs). Now the counters persist while the market's
+# LIVE program period is still running (state.programmed; an empty set --
+# failed/unread feed -- prunes nothing). IMM_KEEP_ACCRUAL_WHILE_PROGRAMMED=0
+# restores the known_tickers-only prune.
+KEEP_ACCRUAL_WHILE_PROGRAMMED = os.environ.get(
+    "IMM_KEEP_ACCRUAL_WHILE_PROGRAMMED", "1") == "1"
 
 
 def _quotable_days(meta, now_utc: datetime) -> float:
@@ -4734,6 +4803,9 @@ _CONFIG_CODE_KNOBS = (
     # ladder family multipliers (2026-09-17): the earnings x1.5 changes every
     # downstream cap through applied_mention_mult, so it belongs in the hash
     "MENTION_SIZE_MULT", "EARNINGS_SIZE_MULT",
+    # floor credit (2026-09-25): exit bar, day-size projection, kept counters
+    "EXIT_FLOOR_IS_PAYOUT", "FLOOR_PROJECTION_BASE_SIZE",
+    "KEEP_ACCRUAL_WHILE_PROGRAMMED",
 )
 
 
@@ -5992,6 +6064,33 @@ def external_depths(yes_levels: List[List[float]], no_levels: List[List[float]],
     return max(d_yes, 0.0), max(d_no, 0.0)
 
 
+def external_levels(yes_levels: List[List[float]], no_levels: List[List[float]],
+                    own_orders: List[Tuple[str, int, float]]
+                    ) -> Tuple[List[List[float]], List[List[float]]]:
+    """The book WITHOUT our own resting orders, level by level (a bid rests
+    on the YES side at its price; an ask is a NO bid at 100 - price). Sizes
+    clamp at zero and emptied levels drop, so the result can be re-overlaid
+    with estimate_reward_share(own_in_book=False). Feeds the day-size floor
+    projection for an incumbent (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25)."""
+    own_yes: Dict[int, float] = {}
+    own_no: Dict[int, float] = {}
+    for book_side, yes_px, remaining in own_orders:
+        if book_side == "bid":
+            own_yes[int(yes_px)] = own_yes.get(int(yes_px), 0.0) + float(remaining)
+        else:
+            own_no[100 - int(yes_px)] = (own_no.get(100 - int(yes_px), 0.0)
+                                         + float(remaining))
+
+    def strip(levels: List[List[float]], own: Dict[int, float]) -> List[List[float]]:
+        out: List[List[float]] = []
+        for px, q in levels:
+            q2 = float(q) - own.get(int(px), 0.0)
+            if q2 > 1e-9:
+                out.append([px, q2])
+        return out
+    return strip(yes_levels, own_yes), strip(no_levels, own_no)
+
+
 def order_yes_book_cents(order: dict) -> Optional[Tuple[str, int]]:
     """(book_side, yes_price_cents) from a normalized V2 order dict."""
     book_side = order.get("book_side")
@@ -6749,6 +6848,7 @@ class MarketMeta:
     program_start: Optional[datetime] = None
     est_frac: float = 0.0               # estimated pool share with our ladder resting
     est_dollars_per_day: float = 0.0    # est_frac x pool rate
+    floor_dollars_per_day: float = 0.0  # est at DAY size for the $ floors (FLOOR_PROJECTION_BASE_SIZE)
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
     # set by _estimate_candidate_yield alongside est_frac; consumed by the
     # quote-gaps email's earnings-per-$-of-exposure ranking (Jack 2026-08-12)
@@ -6963,6 +7063,9 @@ class IncentiveMarketMaker:
         self._reconciled = False      # one-time orphaned-own-fill cleanup pending
         self._reconcile_recheck_at = 0.0   # two-shot: second pass after sweep window
         self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
+        # per-period credit tickers the persisted file held at startup: what
+        # _keeps_accrual protects until the first successful feed read
+        self._loaded_credit: Set[str] = set()
         self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
@@ -7279,6 +7382,10 @@ class IncentiveMarketMaker:
                                       (data.get("period_base") or {}).items()}
             self.state.hopeless_since = {str(t): float(v) for t, v in
                                          (data.get("hopeless_since") or {}).items()}
+            self._loaded_credit = (set(self.state.accrued_est)
+                                   | set(self.state.period_base)
+                                   | set(self.state.period_start)
+                                   | set(self.state.hopeless_since))
             # finecon openings: day mismatch is resolved at refresh (reset),
             # so restore unconditionally here
             self.state.finecon_admit_day = str(data.get("finecon_admit_day") or "")
@@ -7449,6 +7556,26 @@ class IncentiveMarketMaker:
                 self._sink_muted.add("realized")
                 log(f"{self.tag} ! realized sink failed ({e}); muted this run")
 
+    def _keeps_accrual(self, t: str) -> bool:
+        """Persist this market's per-period credit (accrued_est, period_base,
+        period_start, hopeless_since, paid_crossed)? Always while it is
+        quoted or held (known_tickers); since 2026-09-25 also while its LIVE
+        program period is still running (KEEP_ACCRUAL_WHILE_PROGRAMMED) --
+        the counter is what lets a flat evicted market re-enter on its
+        banked accrual, and once pruned it is gone for good. With NO feed
+        read yet this run (`programmed` empty: startup before the first
+        refresh, or a failed read) the counters the file already held are
+        kept -- a feed outage must never look like every program ended --
+        while a counter born in memory this run still prunes with
+        known_tickers, as before."""
+        if t in self.state.known_tickers:
+            return True
+        if not KEEP_ACCRUAL_WHILE_PROGRAMMED:
+            return False
+        if self.state.programmed:
+            return t in self.state.programmed
+        return t in self._loaded_credit
+
     def _save_persist(self) -> None:
         try:
             self._fold_realized()
@@ -7503,35 +7630,37 @@ class IncentiveMarketMaker:
                                         for t, v in self._est_peak.items()
                                         if time.time() - v[1] <= EST_PEAK_TTL_SECS},
                            # accrued-est credit, pruned with known_tickers so
-                           # settled markets don't grow it unboundedly
+                           # settled markets don't grow it unboundedly -- but
+                           # KEPT while the live program period runs
+                           # (_keeps_accrual, 2026-09-25)
                            "accrued_est": {t: round(v, 4)
                                            for t, v in self.state.accrued_est.items()
                                            if v >= 1e-4
-                                           and t in self.state.known_tickers},
+                                           and self._keeps_accrual(t)},
                            # pruned on the SAME rule as accrued_est — a
                            # ticker that drops out of one must drop out of
                            # both, or a re-listed market would measure this
                            # period against a baseline from its last life
                            "period_start": {
                                t: v for t, v in self.state.period_start.items()
-                               if t in self.state.known_tickers},
+                               if self._keeps_accrual(t)},
                            "period_base": {
                                t: round(v, 4)
                                for t, v in self.state.period_base.items()
-                               if t in self.state.known_tickers},
+                               if self._keeps_accrual(t)},
                            # the sub-bar clock must survive restarts or this
                            # bot's ~20 deploys/day would keep resetting it and
                            # the hopeless exit could never fire at all
                            "hopeless_since": {
                                t: round(v, 1)
                                for t, v in self.state.hopeless_since.items()
-                               if t in self.state.known_tickers},
+                               if self._keeps_accrual(t)},
                            # pruned on the SAME rule as accrued_est: a ticker
                            # that drops out of one must drop out of the other,
                            # or a re-listed ticker resumes "already paid"
                            "paid_crossed": sorted(
                                t for t in self.state.paid_crossed
-                               if t in self.state.known_tickers),
+                               if self._keeps_accrual(t)),
                            "rain_dir_done": {t: round(v, 1)
                                              for t, v in self.state.rain_dir_done.items()
                                              if time.time() - v < 7 * 86400},
@@ -8679,7 +8808,9 @@ class IncentiveMarketMaker:
             # Accrued still counts for a re-entrant (a market that banked
             # most of its floor re-enters on the remaining window).
             qdays = _quotable_days(meta, now_utc)
-            est_total = meta.est_dollars_per_day * qdays
+            # day-size projection (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25):
+            # a market is not admitted on doubled size and evicted on normal
+            est_total = meta.floor_dollars_per_day * qdays
             peak, pts = self._est_peak.get(meta.ticker, (0.0, 0.0))
             if now_ts - pts > EST_PEAK_TTL_SECS:
                 peak = 0.0
@@ -8688,8 +8819,14 @@ class IncentiveMarketMaker:
                 peak = est_total
             accrued = self.period_accrued(meta.ticker)
             proj_peak = peak if meta.ticker in prev_selected else 0.0
-            reaches_min = accrued + max(est_total, proj_peak) \
-                >= series_min_est_total(meta.series)
+            # THE BAR (floor_bar_dollars, 2026-09-25): the exchange's $1.00
+            # cliff for a member or a re-entrant with banked period accrual,
+            # the $1.50 entry margin for a fresh candidate. Sub-$1 accrual
+            # pays nothing, so the exit must ask "can it still clear $1",
+            # not "would we enter it today".
+            floor_bar = floor_bar_dollars(
+                meta.series, meta.ticker in prev_selected or accrued > 0.0)
+            reaches_min = accrued + max(est_total, proj_peak) >= floor_bar
             # DIP GUARD (Jack 2026-08-05). Track how long the projection has
             # been continuously under the bar; the exit below refuses to fire
             # until that exceeds HOPELESS_SUSTAIN_SECS. Any single reading at
@@ -8753,7 +8890,7 @@ class IncentiveMarketMaker:
                     if meta.ticker not in self.state.scan_hopeless_barred:
                         log(f"{self.tag} open-scan barred {meta.ticker}: "
                             f"hopeless (projection cannot reach "
-                            f"${series_min_est_total(meta.series):.2f} before "
+                            f"${floor_bar:.2f} before "
                             f"program end); no re-admission")
                     self.state.scan_hopeless_barred[meta.ticker] = now_ts
             elif meta.ticker not in prev_selected \
@@ -9082,6 +9219,7 @@ class IncentiveMarketMaker:
                 return {
                     "series": mt.series, "event_ticker": mt.event_ticker,
                     "est_dollars_per_day": round(mt.est_dollars_per_day, 4),
+                    "floor_dollars_per_day": round(mt.floor_dollars_per_day, 4),
                     "yield_per_contract": round(mt.yield_per_contract, 6),
                     "dollars_per_day": round(mt.dollars_per_day, 2),
                     "target_size": mt.target_size,
@@ -9493,6 +9631,7 @@ class IncentiveMarketMaker:
         what is actually resting (it's already in the book). Otherwise: overlay
         the default ladder joined to the current external best. Returns False
         when the book can't be read."""
+        meta.floor_dollars_per_day = 0.0     # set with the estimate below
         # Live-CONFIRMED events never come back (Jack 2026-08-31 #2): worth
         # nothing by decree, without even reading the book — so no market of
         # the event can be selected or hold an event slot again.
@@ -9573,27 +9712,74 @@ class IncentiveMarketMaker:
         # so the reward estimate (and the $1 floor projection built on it)
         # see the size the quote loop will actually rest.
         _cbm, _cam = ca_late_month_mults(meta.ticker, _now)
-        _lvb, _lva = scale_levels(_lv, _cbm), scale_levels(_lv, _cam)
-        _smb, _sma = clamp_side_max_to_position_cap(
-            int(round(sum(s for _t, s in _lvb) * meta.ref_mult_bid)),
-            int(round(sum(s for _t, s in _lva) * meta.ref_mult_ask)),
-            series_max_position(meta.series))
-        _probe: List[Quote] = []
-        # atref: the band gates PLACEMENT no longer follows the touch, so
-        # a touch outside the band must not kill the side (rain books
-        # trade whole cities under 5c).
-        if ext_b is not None and (
-                (LADDER_MODE == "atref" and rb is not None)
-                or ext_b >= series_price_min(meta.series)):
-            _probe += build_side_ladder(meta.ticker, "bid", ext_b, ext_a,
-                                        _smb, levels=_lvb, ref_px=rb,
-                                        hour_mult=_hm)
-        if ext_a is not None and (
-                (LADDER_MODE == "atref" and ra is not None)
-                or ext_a <= series_price_max(meta.series)):
-            _probe += build_side_ladder(meta.ticker, "ask", ext_a, ext_b,
-                                        _sma, levels=_lva, ref_px=ra,
-                                        hour_mult=_hm)
+        def _probe_ladder(hm: float, lv: List[Tuple[int, int]],
+                          rmb: float, rma: float,
+                          eb: Optional[int], ea: Optional[int],
+                          rpb: Optional[int], rpa: Optional[int]) -> List[Quote]:
+            """The buildable ladder at hour multiplier `hm` on rung sizes
+            `lv`, per-side reference multipliers `rmb` / `rma`, external
+            touches `eb` / `ea` and reference prices `rpb` / `rpa` -- pure
+            local arithmetic on the book already read. Called at the live
+            multiplier for the yield estimate and at 1.0 (day size) for the
+            floor projection (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25)."""
+            lvb, lva = scale_levels(lv, _cbm), scale_levels(lv, _cam)
+            smb, sma = clamp_side_max_to_position_cap(
+                int(round(sum(s for _t, s in lvb) * rmb)),
+                int(round(sum(s for _t, s in lva) * rma)),
+                series_max_position(meta.series))
+            out: List[Quote] = []
+            # atref: the band gates PLACEMENT no longer follows the touch, so
+            # a touch outside the band must not kill the side (rain books
+            # trade whole cities under 5c).
+            if eb is not None and (
+                    (LADDER_MODE == "atref" and rpb is not None)
+                    or eb >= series_price_min(meta.series)):
+                out += build_side_ladder(meta.ticker, "bid", eb, ea,
+                                         smb, levels=lvb, ref_px=rpb,
+                                         hour_mult=hm)
+            if ea is not None and (
+                    (LADDER_MODE == "atref" and rpa is not None)
+                    or ea <= series_price_max(meta.series)):
+                out += build_side_ladder(meta.ticker, "ask", ea, eb,
+                                         sma, levels=lva, ref_px=rpa,
+                                         hour_mult=hm)
+            return out
+
+        def _overlay_with_pads(quotes: List[Quote],
+                               ylv: List[List[float]], nlv: List[List[float]],
+                               eb: Optional[int], ea: Optional[int]
+                               ) -> List[Tuple[str, int, float]]:
+            """Overlay tuples for estimate_reward_share(own_in_book=False):
+            the ladder plus the depth pads the quote loop would rest on thin
+            sides of the book `ylv` / `nlv` (global pad_to_target,
+            2026-07-29): without them a side under the reward target reads
+            qualifies=False -> est 0 -> the market dies at the floor before
+            the quote loop could ever pad it. Mirrors the quote loop's
+            pad_missing_side (coverage-leak fix) AND the pad distance gates:
+            any quoting at all pads BOTH sides for members, but only
+            >= PAD_MIN_TICKS_BEHIND the external touch."""
+            overlay = [(q.book_side, q.price_cents, float(q.count)) for q in quotes]
+            if series_pad_to_target(meta.series) and meta.target_size > 0 \
+                    and pad_band_ok(meta.series, eb, ea):
+                nt_bid = sum(q.count for q in quotes if q.book_side == "bid")
+                nt_ask = sum(q.count for q in quotes if q.book_side == "ask")
+                if nt_bid > 0 or nt_ask > 0:
+                    if eb is not None \
+                            and eb - PAD_BID_CENTS >= PAD_MIN_TICKS_BEHIND:
+                        n = pad_quantity(sum(sz for _px, sz in ylv) + nt_bid,
+                                         meta.target_size)
+                        if n > 0:
+                            overlay.append(("bid", PAD_BID_CENTS, float(n)))
+                    if ea is not None \
+                            and PAD_ASK_CENTS - ea >= PAD_MIN_TICKS_BEHIND:
+                        n = pad_quantity(sum(sz for _px, sz in nlv) + nt_ask,
+                                         meta.target_size)
+                        if n > 0:
+                            overlay.append(("ask", PAD_ASK_CENTS, float(n)))
+            return overlay
+
+        _probe = _probe_ladder(_hm, _lv, meta.ref_mult_bid, meta.ref_mult_ask,
+                               ext_b, ext_a, rb, ra)
         # Sides that will actually REST. This must replicate the quote
         # loop's PER-SIDE TOP-IN-BAND gate (Jack 2026-08-03, CHIH T69.99):
         # "a side whose OWN touch is outside the band stands down alone —
@@ -9622,40 +9808,11 @@ class IncentiveMarketMaker:
                 own_live, yes_levels, no_levels, meta.volume_24h,
                 own_in_book=True)
         else:
-            lv = _lv
-            ext_bid, ext_ask = ext_b, ext_a
             quotes: List[Quote] = _probe
             if not quotes:
                 meta.est_frac = meta.est_dollars_per_day = meta.yield_per_contract = 0.0
                 return True
-            overlay = [(q.book_side, q.price_cents, float(q.count)) for q in quotes]
-            # Model the depth pads on thin sides (global pad_to_target,
-            # 2026-07-29): without them a side under the reward target reads
-            # qualifies=False -> est 0 -> the market dies at the floor before
-            # the quote loop could ever pad it. Pads stay OUT of n_contracts:
-            # yield ranks incentive per near-touch contract; a 1c filler is
-            # overhead, not deployed size.
-            if series_pad_to_target(meta.series) and meta.target_size > 0 \
-                    and pad_band_ok(meta.series, ext_bid, ext_ask):
-                nt_bid = sum(q.count for q in quotes if q.book_side == "bid")
-                nt_ask = sum(q.count for q in quotes if q.book_side == "ask")
-                # mirror the quote loop's pad_missing_side (coverage-leak
-                # fix) AND the pad distance gates: any quoting at all pads
-                # BOTH sides for members, but only >= PAD_MIN_TICKS_BEHIND
-                # the external touch
-                if nt_bid > 0 or nt_ask > 0:
-                    if ext_bid is not None \
-                            and ext_bid - PAD_BID_CENTS >= PAD_MIN_TICKS_BEHIND:
-                        n = pad_quantity(sum(sz for _px, sz in yes_levels) + nt_bid,
-                                         meta.target_size)
-                        if n > 0:
-                            overlay.append(("bid", PAD_BID_CENTS, float(n)))
-                    if ext_ask is not None \
-                            and PAD_ASK_CENTS - ext_ask >= PAD_MIN_TICKS_BEHIND:
-                        n = pad_quantity(sum(sz for _px, sz in no_levels) + nt_ask,
-                                         meta.target_size)
-                        if n > 0:
-                            overlay.append(("ask", PAD_ASK_CENTS, float(n)))
+            overlay = _overlay_with_pads(quotes, yes_levels, no_levels, ext_b, ext_a)
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, overlay,
                 meta.target_size, meta.discount_factor, own_in_book=False)
@@ -9673,6 +9830,34 @@ class IncentiveMarketMaker:
         meta.est_dollars_per_day = frac * meta.dollars_per_day
         meta.yield_per_contract = \
             (meta.est_dollars_per_day / n_contracts) if n_contracts else 0.0
+        # DAY-SIZE FLOOR PROJECTION (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25):
+        # what the day ladder (hour / Saturday multiplier off) would earn on
+        # the EXTERNAL book -- an incumbent's own hour-scaled orders are
+        # stripped first (external_levels) and the day ladder re-overlaid on
+        # that book's touches and reference prices. Identical to the live
+        # estimate whenever no multiplier is active, so nothing changes
+        # outside the multiplier windows.
+        meta.floor_dollars_per_day = meta.est_dollars_per_day
+        if FLOOR_PROJECTION_BASE_SIZE and _hm != 1.0 and meta.dollars_per_day > 0:
+            if self.live and own_live:
+                ext_yes, ext_no = external_levels(yes_levels, no_levels, own_live)
+                xb, xa = external_best(ext_yes, ext_no)
+                xrb, xra = ladder_reference_prices(ext_yes, ext_no, meta.target_size)
+            else:
+                ext_yes, ext_no = yes_levels, no_levels
+                xb, xa, xrb, xra = ext_b, ext_a, rb, ra
+            base_q = _probe_ladder(
+                1.0, base_scaled_levels(meta.series),
+                capped_ref_mult(xb, xrb, "bid", hour_mult=1.0, series=meta.series),
+                capped_ref_mult(xa, xra, "ask", hour_mult=1.0, series=meta.series),
+                xb, xa, xrb, xra)
+            bfrac = 0.0
+            if base_q:
+                bfrac, _bsides = estimate_reward_share(
+                    ext_yes, ext_no,
+                    _overlay_with_pads(base_q, ext_yes, ext_no, xb, xa),
+                    meta.target_size, meta.discount_factor, own_in_book=False)
+            meta.floor_dollars_per_day = bfrac * meta.dollars_per_day
         return True
 
     def _settle_or_drop(self, t: str) -> None:
@@ -11923,6 +12108,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"[IMM] hour-size multipliers (ET hour -> x, long-dated only): "
             f"{dict(sorted(HOUR_SIZE_MULTS.items()))}; excluded prefixes: "
             f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'} + daily families")
+    log("[IMM] floor credit (2026-09-25): exit / banked re-entry bar = "
+        + ("$%.2f payout cliff" % PAYOUT_FLOOR_DOLLARS if EXIT_FLOOR_IS_PAYOUT
+           else "series entry bar")
+        + "; fresh entry bar = $%.2f" % MIN_EST_TOTAL_DOLLARS
+        + "; floor projection at %s size" % ("day" if FLOOR_PROJECTION_BASE_SIZE
+                                             else "live")
+        + "; accrual counters %s" % ("kept while programmed"
+                                     if KEEP_ACCRUAL_WHILE_PROGRAMMED
+                                     else "pruned with known_tickers"))
     _n_daily = load_daily_series_file()
     log(f"[IMM] daily-family exclusion (no global hour window, no Saturday "
         f"mult): prefixes {','.join(DAILY_PREFIXES) or '(none)'} + structural "

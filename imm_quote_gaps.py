@@ -595,11 +595,13 @@ def classify_and_estimate(client, bot, now_utc: datetime):
         if r["est"] is None:
             r["reason"] = "capacity (cap/budget)"   # not estimated this run
             continue
-        est_total = meta.est_dollars_per_day * imm._quotable_days(meta, now_utc)
+        # day-size projection and THIS period's credit, as the bot reads
+        # them (2026-09-25 / 2026-09-22)
+        est_total = meta.floor_dollars_per_day * imm._quotable_days(meta, now_utc)
         peak, pts = (bot._est_peak.get(r["ticker"]) or (0.0, 0.0))
         if now_ts - pts > imm.EST_PEAK_TTL_SECS:
             peak = 0.0
-        accrued = bot.state.accrued_est.get(r["ticker"], 0.0)
+        accrued = bot.period_accrued(r["ticker"])
         curated = imm.curated_event(meta.event_ticker, meta.series, now_utc)
         if meta.series in imm.NO_NEW_SERIES and r["ticker"] not in prev_selected:
             r["reason"] = "no-new gate"
@@ -609,7 +611,9 @@ def classify_and_estimate(client, bot, now_utc: datetime):
                 < imm.series_min_est_rate(meta.series):
             r["reason"] = "under rate floor"
         elif not curated and accrued + max(est_total, peak) \
-                < imm.series_min_est_total(meta.series):
+                < imm.floor_bar_dollars(meta.series,
+                                        r["ticker"] in prev_selected
+                                        or accrued > 0.0):
             r["reason"] = "under payout floor"
         else:
             r["reason"] = "capacity (cap/budget)"

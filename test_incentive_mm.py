@@ -2815,7 +2815,7 @@ class TestMentionWindowPolicy(unittest.TestCase):
             self.assertIn(t, bot.state.selected)
             self.assertTrue(bot.state.sim_orders)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_postponed_game_quotable_until_makeup(self):
         """A WNBA game postponed past its ticker date (NYDAL 7/16 -> makeup
@@ -2857,7 +2857,7 @@ class TestMentionWindowPolicy(unittest.TestCase):
             self.assertIsNotNone(cutoff)
             self.assertGreater(cutoff, now)   # quoting NOW, not killed by ticker date
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
 
 class TestOverrideBuffer(unittest.TestCase):
@@ -2905,7 +2905,7 @@ class TestOverrideBuffer(unittest.TestCase):
             for o in bot.state.sim_orders.values():
                 self.assertLessEqual(o["expire_at"], cutoff.timestamp() + 1)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
             imm.NO_NEW_SERIES = old_no_new
             imm.FREEZE_SERIES = old_freeze
             imm.EVENT_START_OVERRIDES.pop(ev, None)
@@ -4781,7 +4781,7 @@ class TestStickySelection(unittest.TestCase):
         # pays nothing, so riding it out is pure fill risk for zero reward.
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9        # projection can never reach
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9        # projection can never reach
         try:
             bot._est_peak.clear()              # no stale peak credit
             # SUSTAINED, not a dip (Jack 2026-08-05): backdate the sub-bar
@@ -4792,7 +4792,7 @@ class TestStickySelection(unittest.TestCase):
             bot.run_cycle()
             self.assertNotIn(self.T, bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_finecon_member_survives_hopeless(self):
         # Jack 2026-09-03 ("once start quoting, should quote to completion.
@@ -4801,7 +4801,7 @@ class TestStickySelection(unittest.TestCase):
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         old_fin = imm.FINECON_SERIES
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         imm.FINECON_SERIES = old_fin | {"KXGOOD"}
         try:
             bot._est_peak.clear()
@@ -4811,7 +4811,7 @@ class TestStickySelection(unittest.TestCase):
             bot.run_cycle()
             self.assertIn(self.T, bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
             imm.FINECON_SERIES = old_fin
 
     def test_hopeless_member_survives_a_dip(self):
@@ -4819,7 +4819,7 @@ class TestStickySelection(unittest.TestCase):
         # quoting — this is the regression that cost KXUST7AM 8 of 15 strikes.
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot._est_peak.clear()
             bot.state.hopeless_since.clear()   # first cycle under the bar
@@ -4827,7 +4827,7 @@ class TestStickySelection(unittest.TestCase):
             bot.run_cycle()
             self.assertIn(self.T, bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_accrued_credit_retains_member(self):
         # ...but a member that already banked (most of) the $1 keeps quoting:
@@ -4836,14 +4836,14 @@ class TestStickySelection(unittest.TestCase):
         # whenever finishing the job is plausible).
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot.state.accrued_est[self.T] = 2e9
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertIn(self.T, bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_floor_credit_is_this_periods_accrual(self):
         # Jack 2026-09-22 pm, KXRT-STRA-50 / -45: "why is this quoted? it
@@ -4855,7 +4855,7 @@ class TestStickySelection(unittest.TestCase):
         # credit is accrued_est - period_base (this period), not lifetime.
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot._est_peak.clear()
             bot.state.hopeless_since[self.T] = (
@@ -4869,7 +4869,7 @@ class TestStickySelection(unittest.TestCase):
             bot.run_cycle()
             self.assertNotIn(self.T, bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_floor_credit_keeps_a_member_that_banked_this_period(self):
         # ...while one whose THIS-period accrual clears the bar keeps
@@ -4877,7 +4877,7 @@ class TestStickySelection(unittest.TestCase):
         # switch restores the lifetime credit.
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot._est_peak.clear()
             bot.state.hopeless_since[self.T] = (
@@ -4899,7 +4899,7 @@ class TestStickySelection(unittest.TestCase):
                 bot.run_cycle()
                 self.assertIn(self.T, bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_hopeless_exit_kill_switch(self):
         # IMM_HOPELESS_EXIT=0 restores the unconditional 7/21 retention.
@@ -5061,7 +5061,7 @@ class TestStickySelection(unittest.TestCase):
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         old_force = imm.FORCE_EVENTS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         imm.FORCE_EVENTS = frozenset({"KXGOOD-99DEC31"})
         try:
             bot._est_peak.clear()
@@ -5069,7 +5069,7 @@ class TestStickySelection(unittest.TestCase):
             bot.run_cycle()
             self.assertIn(self.T, bot.state.selected)   # forced: stays
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
             imm.FORCE_EVENTS = old_force
 
     def test_override_event_no_longer_exempt_from_hopeless(self):
@@ -5079,7 +5079,7 @@ class TestStickySelection(unittest.TestCase):
         # cutoff source only.
         bot = self._quoting_bot()
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         imm.EVENT_START_OVERRIDES["KXGOOD-99DEC31"] = utc(2099, 1, 1)
         try:
             bot._est_peak.clear()
@@ -5089,7 +5089,7 @@ class TestStickySelection(unittest.TestCase):
             bot.run_cycle()
             self.assertNotIn(self.T, bot.state.selected)   # evicted like any
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
             imm.EVENT_START_OVERRIDES.pop("KXGOOD-99DEC31", None)
 
     def test_accrued_credit_admits_returning_market(self):
@@ -5099,13 +5099,13 @@ class TestStickySelection(unittest.TestCase):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot.state.accrued_est[self.T] = 2e9
             bot.run_cycle()
             self.assertIn(self.T, bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_accrual_integrates_per_market(self):
         bot = self._quoting_bot()          # cycle 1 stamps reward_accrue_at
@@ -5573,19 +5573,19 @@ class TestStickySelection(unittest.TestCase):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9        # today's sample is always below
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9        # today's sample is always below
         try:
             bot._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())  # recent peak
             bot.run_cycle()
             self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
         # admitted on its own numbers, it is a member; the same peak now
         # holds it over a floor its sample cannot reach, with no hopeless clock
         bot.state.universe_at = 0.0
         bot.run_cycle()
         self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
             bot.state.universe_at = 0.0
@@ -5593,7 +5593,7 @@ class TestStickySelection(unittest.TestCase):
             self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
             self.assertNotIn("KXGOOD-99DEC31-A", bot.state.hopeless_since)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_est_peak_survives_restart(self):
         # The 1h peak-entry memory must persist so restarts (frequent) don't
@@ -5611,27 +5611,27 @@ class TestStickySelection(unittest.TestCase):
         # sample over the floor (since 2026-09-13 a fresh market gets no such
         # carry -- see the flapping-market test above)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot2._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
             bot2.run_cycle()
             self.assertIn("KXGOOD-99DEC31-A", bot2.state.selected)
             self.assertNotIn("KXGOOD-99DEC31-A", bot2.state.hopeless_since)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_stale_peak_does_not_carry(self):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot._est_peak["KXGOOD-99DEC31-A"] = (
                 2e9, time.time() - imm.EST_PEAK_TTL_SECS - 60)   # expired
             bot.run_cycle()
             self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_sticky_survives_restart(self):
         # state.selected is rebuilt live; without the persisted sticky set a
@@ -5645,13 +5645,13 @@ class TestStickySelection(unittest.TestCase):
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertIn(self.T, bot2.state.sticky_prev)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9        # would exclude it as a NEW pick
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9        # would exclude it as a NEW pick
         try:
             bot2.run_cycle()
             self.assertIn(self.T, bot2.state.selected)     # retained via persist
             self.assertEqual(bot2.state.sticky_prev, set())  # consumed
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
 
 class TestOrderJournal(unittest.TestCase):
@@ -11351,7 +11351,7 @@ class TestOpenScanTier(unittest.TestCase):
         bot.run_cycle()
         self.assertIn(self.A, bot.state.selected)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9                  # nothing can reach it
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9                  # nothing can reach it
         try:
             # DIP GUARD FIRST: the projection is under the bar but has not
             # been under it for HOPELESS_SUSTAIN_SECS, so nothing evicts
@@ -11373,7 +11373,7 @@ class TestOpenScanTier(unittest.TestCase):
                 [o for o in bot.state.sim_orders.values()
                  if o.get("ticker") == self.A], [])
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_departure_refills_in_the_same_pass_even_above_the_cap(self):
         """Jack 2026-09-09: "instant refill upon a departure, even above the
@@ -11503,7 +11503,7 @@ class TestOpenScanTier(unittest.TestCase):
         bot.run_cycle()
         self.assertIn(self.A, bot.state.selected)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
-        imm.MIN_EST_TOTAL_DOLLARS = 1e9
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot._est_peak.clear()
             bot.state.hopeless_since[self.A] = (
@@ -11513,7 +11513,7 @@ class TestOpenScanTier(unittest.TestCase):
                 bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     def test_fresh_admission_ignores_the_stale_peak_members_keep_it(self):
         """Jack 2026-09-13: "test fresh admissions on the current estimate
@@ -11525,7 +11525,7 @@ class TestOpenScanTier(unittest.TestCase):
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         # FRESH: a peak far above anything the live book projects, still
         # inside its hour -- the old rule admitted on it, the new one does not
-        imm.MIN_EST_TOTAL_DOLLARS = 1e6
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e6
         try:
             bot._est_peak[self.A] = (2e6, time.time())
             bot.run_cycle()
@@ -11554,7 +11554,7 @@ class TestOpenScanTier(unittest.TestCase):
             self.assertIn(self.A, bot.state.selected)
             self.assertIn(self.A, bot.state.hopeless_since)
         finally:
-            imm.MIN_EST_TOTAL_DOLLARS = old_floor
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
     # ---- tripwires -----------------------------------------------------------
 
@@ -12025,6 +12025,247 @@ class TestFamilySourceVerdicts(unittest.TestCase):
         self.assertFalse(imm.family_series_allowed("KXAMAZONADS"))
         self.assertFalse(IncentiveMarketMaker._allowed("KXAMAZONADS-29-YES"))
         self.assertIsNone(imm.scan_universe_reason("KXAMAZONADS-29-YES"))
+
+
+class TestExitBarIsThePayoutCliff(unittest.TestCase):
+    """Jack 2026-09-25, KXVENUEPERFORM-REDROCKS28JAN01: "a bunch of markets
+    ... stopped quoting but are close to the $1 cutoff -- that is lost
+    money". The hopeless exit read the $1.50 ENTRY bar, so members with
+    $0.86-0.99 banked and a $1.2-1.3 projection were evicted and the banked
+    credit paid nothing. The exit -- and the re-entry of a market with
+    banked period accrual -- now reads the exchange's $1.00 cliff
+    (floor_bar_dollars / EXIT_FLOOR_IS_PAYOUT)."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def _quoting_bot(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        assert self.T in bot.state.selected
+        return bot
+
+    def _period_key(self, bot):
+        return imm.parse_iso_utc(bot.client.programs[0]["start_date"]).isoformat()
+
+    def test_the_bar_by_state(self):
+        self.assertEqual(imm.floor_bar_dollars("KXGOOD", banked=False),
+                         imm.MIN_EST_TOTAL_DOLLARS)
+        self.assertEqual(imm.floor_bar_dollars("KXGOOD", banked=True),
+                         imm.PAYOUT_FLOOR_DOLLARS)
+        self.assertLess(imm.PAYOUT_FLOOR_DOLLARS, imm.MIN_EST_TOTAL_DOLLARS)
+        with mock.patch.object(imm, "EXIT_FLOOR_IS_PAYOUT", False):
+            self.assertEqual(imm.floor_bar_dollars("KXGOOD", banked=True),
+                             imm.MIN_EST_TOTAL_DOLLARS)
+
+    def test_member_between_the_cliff_and_the_entry_bar_keeps_quoting(self):
+        # accrued + projection ABOVE the payout cliff and UNDER the entry
+        # bar -- the Red Rocks state (HOZ: $0.93 banked, $1.25 projected)
+        bot = self._quoting_bot()
+        old = (imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS)
+        imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = 2e9, 1e9
+        try:
+            bot._est_peak.clear()
+            bot.state.accrued_est[self.T] = 1.5e9          # banked this period
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+            # the sub-bar clock resets: it reaches the cliff
+            self.assertNotIn(self.T, bot.state.hopeless_since)
+            # kill switch: the single $1.50 bar evicts it (9/12 - 9/25 behaviour)
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            with mock.patch.object(imm, "EXIT_FLOOR_IS_PAYOUT", False):
+                bot.state.universe_at = 0.0
+                bot.run_cycle()
+                self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
+
+    def test_member_under_the_cliff_is_still_hopeless(self):
+        bot = self._quoting_bot()
+        old = (imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS)
+        imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = 2e9, 1e9
+        try:
+            bot._est_peak.clear()
+            bot.state.accrued_est[self.T] = 0.5e9          # cannot reach 1e9
+            bot.state.hopeless_since[self.T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
+
+    def test_banked_re_entrant_reads_the_cliff_fresh_candidate_the_entry_bar(self):
+        old = (imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS)
+        imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = 2e9, 1e9
+        try:
+            # fresh: nothing banked -> the entry bar (2e9 here) floors it
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)
+            # re-entrant with banked period accrual -> judged at the cliff
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.accrued_est[self.T] = 1.5e9
+            bot.state.period_start[self.T] = self._period_key(bot)
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+            # ...but only THIS period's accrual is banked (2026-09-22 rule)
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.accrued_est[self.T] = 1.5e9
+            bot.state.period_base[self.T] = 1.5e9
+            bot.state.period_start[self.T] = self._period_key(bot)
+            bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)
+            # kill switch: banked or not, the entry bar
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.accrued_est[self.T] = 1.5e9
+            bot.state.period_start[self.T] = self._period_key(bot)
+            with mock.patch.object(imm, "EXIT_FLOOR_IS_PAYOUT", False):
+                bot.run_cycle()
+            self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
+
+
+class TestFloorProjectionAtDaySize(unittest.TestCase):
+    """Same incident, the churn engine: the estimator sizes its ladder with
+    the hour multiplier, so the projection doubled at 04:00Z (re-admit) and
+    halved at 14:00Z (evict an hour later, every day). The floors now read
+    a day-size projection (MarketMeta.floor_dollars_per_day)."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        self._mults = imm.HOUR_SIZE_MULTS
+
+    def tearDown(self):
+        imm.HOUR_SIZE_MULTS = self._mults
+
+    def _meta(self):
+        return MarketMeta(ticker=self.T, event_ticker="KXGOOD-99DEC31",
+                          series="KXGOOD", dollars_per_day=100.0,
+                          program_end=None, target_size=1000.0,
+                          discount_factor=0.5, cutoff=None, close_time=None)
+
+    def test_day_size_projection_under_a_multiplier(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        imm.HOUR_SIZE_MULTS = {}
+        base = self._meta()
+        self.assertTrue(bot._estimate_candidate_yield(base, []))
+        self.assertGreater(base.est_dollars_per_day, 0.0)
+        # no multiplier active: the floor reads the live estimate, exactly
+        self.assertEqual(base.floor_dollars_per_day, base.est_dollars_per_day)
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-23:2.0")   # always doubled
+        doubled = self._meta()
+        self.assertTrue(bot._estimate_candidate_yield(doubled, []))
+        # the live estimate grows with the ladder...
+        self.assertGreater(doubled.est_dollars_per_day, base.est_dollars_per_day)
+        # ...the floor projection does not
+        self.assertAlmostEqual(doubled.floor_dollars_per_day,
+                               base.est_dollars_per_day, places=9)
+        with mock.patch.object(imm, "FLOOR_PROJECTION_BASE_SIZE", False):
+            live = self._meta()
+            self.assertTrue(bot._estimate_candidate_yield(live, []))
+            self.assertEqual(live.floor_dollars_per_day, live.est_dollars_per_day)
+
+    def test_incumbent_reads_the_day_ladder_on_the_external_book(self):
+        # live path: our doubled ladder is IN the book. The floor must see
+        # what the DAY ladder earns on the book WITHOUT us -- the same
+        # number a fresh read of the plain book gives with no multiplier.
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        imm.HOUR_SIZE_MULTS = {}
+        base = self._meta()
+        self.assertTrue(bot._estimate_candidate_yield(base, []))
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-23:2.0")
+        plain = bot.client.books[self.T]
+        # our resting (doubled) ladder: bid 40 @ 49c, ask 40 @ 51c (= NO bid @ 49c)
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.48", "500"], ["0.49", "640"]],
+            "no_dollars": [["0.49", "1240"]]}}
+        own = [("bid", 49, 40.0), ("ask", 51, 40.0)]
+        bot.live = True
+        try:
+            inc = self._meta()
+            self.assertTrue(bot._estimate_candidate_yield(inc, own))
+        finally:
+            bot.live = False
+            bot.client.books[self.T] = plain
+        self.assertGreater(inc.est_dollars_per_day, 0.0)
+        self.assertAlmostEqual(inc.floor_dollars_per_day,
+                               base.est_dollars_per_day, places=9)
+
+    def test_external_levels_strips_own_orders(self):
+        yes, no = imm.external_levels(
+            [[48, 500.0], [49, 640.0]], [[49, 1240.0], [40, 30.0]],
+            [("bid", 49, 40.0), ("ask", 51, 40.0), ("ask", 60, 30.0)])
+        self.assertEqual(yes, [[48, 500.0], [49, 600.0]])
+        self.assertEqual(no, [[49, 1200.0]])          # the emptied 40c level drops
+
+
+class TestAccrualCountersSurviveEviction(unittest.TestCase):
+    """Same incident, third leg: a FLAT evicted market lost its per-period
+    credit at the next restart (pruned with known_tickers), re-entered with
+    $0 banked and could never clear the entry bar on rate alone. Counters
+    now persist while the market's live program period runs."""
+
+    T2 = "KXWIDE-99DEC31-B"     # programmed (FakeClient), never quoted, flat
+
+    def _saved(self, bot):
+        bot._save_persist()
+        with open(bot.PERSIST_PATH, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_counters_persist_while_the_program_runs(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()                     # state.programmed from the feed
+        self.assertIn(self.T2, bot.state.programmed)
+        self.assertNotIn(self.T2, bot.state.known_tickers)
+        bot.state.accrued_est[self.T2] = 0.93
+        bot.state.period_base[self.T2] = 0.10
+        bot.state.period_start[self.T2] = "2026-09-17T21:01:58+00:00"
+        bot.state.hopeless_since[self.T2] = time.time()
+        bot.state.paid_crossed.add(self.T2)
+        dead = "KXDEAD-99DEC31-Z"          # no live program, flat, unmanaged
+        bot.state.accrued_est[dead] = 0.93
+        bot.state.period_base[dead] = 0.10
+        data = self._saved(bot)
+        for key in ("accrued_est", "period_base", "period_start", "hopeless_since"):
+            self.assertIn(self.T2, data[key], key)
+            self.assertNotIn(dead, data[key], key)
+        self.assertIn(self.T2, data["paid_crossed"])
+        # a restart reads the credit back
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertAlmostEqual(bot2.period_accrued(self.T2), 0.83)
+        # kill switch: the known_tickers-only prune
+        with mock.patch.object(imm, "KEEP_ACCRUAL_WHILE_PROGRAMMED", False):
+            data = self._saved(bot)
+        self.assertNotIn(self.T2, data["accrued_est"])
+        self.assertNotIn(self.T2, data["period_base"])
+        # failsafe: a restart whose feed has not been read yet (programmed
+        # empty) keeps every counter the file held...
+        data = self._saved(bot)                 # T2 back on disk
+        bot3 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot3.state.programmed, set())
+        self.assertAlmostEqual(bot3.period_accrued(self.T2), 0.83)
+        data = self._saved(bot3)
+        self.assertIn(self.T2, data["accrued_est"])
+        self.assertIn(self.T2, data["period_base"])
+        # ...while a counter born in memory this run still prunes with
+        # known_tickers until a feed says its program is live
+        bot3.state.accrued_est[dead] = 0.93
+        data = self._saved(bot3)
+        self.assertNotIn(dead, data["accrued_est"])
 
 
 if __name__ == "__main__":
