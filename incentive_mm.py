@@ -776,6 +776,63 @@ for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
             cutoff_before_event_min=_env_int(
                 "IMM_RAINWKND_CUTOFF_BEFORE_MIN", 0))
 
+# RAINSTORM spans (Jack 2026-09-24 pm: "allowlist these types of rain
+# markets, up until the start date. KXRAINSBOS-26SEP26-27SEP26,
+# KXRAINSNYC-26SEP26-27SEP26"). KXRAINS<CITY>-<start>-<end>-T<inches> =
+# "how much will it rain in <city> in <start>-<end>": total precipitation
+# at the city's airport station over a two-day window, a 10-rung inch
+# ladder (T0P5 .. T5). Catalog 9/24: KXRAINSBOS "Rainstorm in Boston" and
+# KXRAINSNYC "Rainstorm in NYC", custom-frequency series Kalshi lists as
+# storms come -- so this is a FAMILY rule, not the day's member list (the
+# 9/1 gas-states lesson). Programs on the first event: $16.57/market/day,
+# target 1000, 9/24 18:04Z -> Sat 9/26 23:59 ET.
+# "Up until the start date" is the plain midnight-ET ticker rule:
+# parse_event_date reads the second segment, which is the window's START
+# day, so the bot is out at 00:00 ET on that day. The archetype override
+# below PINS that reading (early-stop 0; IMM_RAINSTORM_CUTOFF_BEFORE_MIN
+# moves it for every city) and shares the rain band -- the KXRAINWKND
+# shape above. Kalshi's occurrence_datetime equals expiration (Mon 05:00Z),
+# so it never becomes a cutoff candidate.
+# Membership is by TICKER SHAPE, not by name: the KXRAINS prefix also names
+# the Seattle / San Francisco / St Petersburg MONTHLY rain series
+# (KXRAINSEAM-26SEP-7, KXRAINSFOM, KXRAINSTPM -- KXRAINSFOM is not even in
+# the launcher blocklist) and the Seattle daily (KXRAINSEA-26SEP26), so
+# rainstorm_span_allowed wants a 3-letter city after KXRAINS AND two
+# day-dated segments (start, end) after that. The override lives on
+# KXRAINSBOS; every other city clones it through FAMILY_OVERRIDE_PARENTS
+# (pattern kind) the first time it appears in the candidates loop, and a
+# city the quote-gaps mirror sees first still gets the same cutoff from
+# the midnight rule alone. Inherited by PREFIX like the weekend family:
+# the KXRAIN 7pm-01:59 ET size halving and the open-scan ownership
+# exclusion. NOT inherited: the NWS fair gate and the directional take
+# (exact RAIN_FAIR_SERIES). Kill switch IMM_RAINSTORM_ALLOW=0 (env change
+# = task-level restart).
+RAINSTORM_ALLOW = os.environ.get("IMM_RAINSTORM_ALLOW", "1") == "1"
+RAINSTORM_SERIES_RE = re.compile(
+    os.environ.get("IMM_RAINSTORM_SERIES_RE", r"KXRAINS[A-Z]{3}"))
+_RAINSTORM_DATE_SEG_RE = re.compile(r"\d{2}[A-Z]{3}\d{2}")
+RAINSTORM_ARCHETYPE = "KXRAINSBOS"
+
+
+def rainstorm_span_allowed(ticker: str) -> bool:
+    """True for a market or event ticker of the rainstorm-span family:
+    <KXRAINS+city>-<start day-date>-<end day-date>[-<strike>]. The monthly
+    KXRAINS*M series (26SEP-7), the Seattle daily (26SEP26 alone) and the
+    "<series>-X" family probe all fail the two-date shape."""
+    if not RAINSTORM_ALLOW:
+        return False
+    parts = ticker.split("-")
+    if len(parts) < 3 or not RAINSTORM_SERIES_RE.fullmatch(parts[0]):
+        return False
+    return bool(_RAINSTORM_DATE_SEG_RE.fullmatch(parts[1])
+                and _RAINSTORM_DATE_SEG_RE.fullmatch(parts[2]))
+
+
+SERIES_OVERRIDES[RAINSTORM_ARCHETYPE] = SeriesOverride(
+    price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
+    price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
+    cutoff_before_event_min=_env_int("IMM_RAINSTORM_CUTOFF_BEFORE_MIN", 0))
+
 # UNDATED-TICKER GUARD SET for the five series allowed in code on
 # 2026-09-11 pm (KXMLBPLAYOFFS, KXMLBSEASONGAMES, KXVENUEPERFORM, then
 # KXCMA and KXMC -- see _DEFAULT_SPORTS_SERIES and
@@ -4258,6 +4315,10 @@ FAMILY_OVERRIDE_PARENTS = (
     ("family_suffix", "POS", "KXDRPEPPERPOS"),
     # regex kind (2026-09-24): the sports ladder / escalator families
     ("pattern", SPORTS_LADDER_LEAGUE_RE, "KXNFLLADDERREC"),
+    # rainstorm spans (2026-09-24 pm): KXRAINS<CITY>, archetype KXRAINSBOS.
+    # The name regex also matches the KXRAINS*M monthlies, but only a
+    # series that passed _allowed (the two-date ticker shape) reaches here.
+    ("pattern", RAINSTORM_SERIES_RE, RAINSTORM_ARCHETYPE),
 )
 _family_override_warned: Set[str] = set()
 
@@ -7831,6 +7892,7 @@ class IncentiveMarketMaker:
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
             family_series_allowed(series) or \
             series_pattern_allowed(series) or \
+            rainstorm_span_allowed(ticker) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:

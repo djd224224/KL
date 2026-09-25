@@ -1591,6 +1591,43 @@ class TestAllowlist(unittest.TestCase):
         self.assertFalse(any(p.startswith("KXRAIN")
                              for p in imm.ALLOW_SERIES_PREFIXES))
 
+    def test_rainstorm_span_family_allowed_by_shape(self):
+        # Jack 2026-09-24 pm: "allowlist these types of rain markets, up
+        # until the start date. KXRAINSBOS-26SEP26-27SEP26, KXRAINSNYC-
+        # 26SEP26-27SEP26". A FAMILY rule keyed on the ticker shape
+        # (KXRAINS+city, then a start and an end day-date), so the next
+        # city Kalshi lists rides in without a member-list edit.
+        a = IncentiveMarketMaker._allowed
+        self.assertTrue(a("KXRAINSBOS-26SEP26-27SEP26-T1"))
+        self.assertTrue(a("KXRAINSNYC-26SEP26-27SEP26-T0P5"))
+        self.assertTrue(a("KXRAINSBOS-26SEP26-27SEP26"))       # event form
+        self.assertTrue(a("KXRAINSCHI-26OCT03-04OCT26-T2"))    # a future city
+        # same prefix, other families: the KXRAINS*M monthlies (month-only
+        # segment), the Seattle daily (one date), a one-date sibling, and
+        # the "<series>-X" family probe all fail the two-date shape
+        for t in ("KXRAINSEAM-26SEP-7", "KXRAINSFOM-26OCT-5",
+                  "KXRAINSTPM-26SEP-3", "KXRAINSEA-26SEP26-T1",
+                  "KXRAINSBOS-26SEP26-T1", "KXRAINSBOS-X",
+                  "KXRAINWKND-26SEP26-NYC"):
+            self.assertFalse(imm.rainstorm_span_allowed(t), t)
+        self.assertFalse(a("KXRAINSFOM-26OCT-5"))
+        self.assertFalse(any(p.startswith("KXRAIN")
+                             for p in imm.ALLOW_SERIES_PREFIXES))
+        # the blocklist still wins over the shape rule
+        old = imm.SERIES_BLOCKLIST_PREFIXES
+        imm.SERIES_BLOCKLIST_PREFIXES = tuple(old) + ("KXRAINSNYC",)
+        try:
+            self.assertFalse(a("KXRAINSNYC-26SEP26-27SEP26-T1"))
+            self.assertTrue(a("KXRAINSBOS-26SEP26-27SEP26-T1"))
+        finally:
+            imm.SERIES_BLOCKLIST_PREFIXES = old
+        # kill switch
+        imm.RAINSTORM_ALLOW = False
+        try:
+            self.assertFalse(a("KXRAINSBOS-26SEP26-27SEP26-T1"))
+        finally:
+            imm.RAINSTORM_ALLOW = True
+
     def test_truev_sunset_winds_down_one_event(self):
         # Jack 2026-09-11: "quote KXTRUEV-26SEP11 until completion, but
         # block KXTRUEV going forward". The series prefix is blocklisted;
@@ -5025,6 +5062,58 @@ class TestStickySelection(unittest.TestCase):
         # non-rain series unaffected
         self.assertIsNone((imm.series_override("KXLOVEISLMENTION")
                            or imm.SeriesOverride()).cutoff_before_event_min)
+
+    def test_rainstorm_span_quotes_until_the_start_date(self):
+        # "up until the start date": out at 00:00 ET on the window's first
+        # day (the ticker's second segment), pinned by the KXRAINSBOS
+        # archetype and inherited by every other city through the pattern
+        # parent. Kalshi's occurrence equals expiration, so it never wins.
+        ev = "KXRAINSBOS-26SEP26-27SEP26"
+        occ = exp = utc(2026, 9, 28, 5, 0)
+        close = utc(2026, 9, 28, 4, 59)
+        stop = utc(2026, 9, 26, 4, 0)                   # 00:00 EDT Sep 26
+        self.assertEqual(imm.parse_event_date(ev), stop)
+        raw = imm.trade_cutoff_utc(ev, occ, exp)
+        self.assertEqual(raw, stop)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINSBOS", ev, raw, close_time=close), stop)
+        # the orphan-restore producer (no occurrence/close) lands the same
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINSBOS", ev, imm.trade_cutoff_utc(ev, None, None)), stop)
+        ov = imm.series_override("KXRAINSBOS")
+        self.assertEqual(ov.cutoff_before_event_min, 0)
+        self.assertEqual((imm.series_price_min("KXRAINSBOS"),
+                          imm.series_price_max("KXRAINSBOS")), (5, 90))
+        self.assertIsNone(ov.cutoff_from_close_min)
+        self.assertIsNone(ov.levels)
+        self.assertFalse(ov.safe_join)
+        # a new city clones the archetype at first sight in the candidates
+        # loop, and lands the same cutoff
+        imm.SERIES_OVERRIDES.pop("KXRAINSNYC", None)
+        try:
+            imm.ensure_family_override("KXRAINSNYC")
+            self.assertEqual(
+                imm.series_override("KXRAINSNYC").cutoff_before_event_min, 0)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXRAINSNYC", "KXRAINSNYC-26SEP26-27SEP26",
+                imm.trade_cutoff_utc("KXRAINSNYC-26SEP26-27SEP26", occ, exp),
+                close_time=close), stop)
+        finally:
+            imm.SERIES_OVERRIDES.pop("KXRAINSNYC", None)
+        # a member quotes to the instant; fresh entry stops the buffer early
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        meta = imm.MarketMeta(
+            ticker="KXRAINSBOS-26SEP26-27SEP26-T1", event_ticker=ev,
+            series="KXRAINSBOS", dollars_per_day=16.57, program_end=exp,
+            target_size=1000.0, discount_factor=0.5, cutoff=stop,
+            close_time=close, mid_cents=50.0, spread_cents=2,
+            volume=50.0, status="active")
+        self.assertIsNone(bot._screen(meta, stop - timedelta(minutes=2),
+                                      member=True))
+        self.assertEqual(bot._screen(meta, stop - timedelta(minutes=2)),
+                         "cutoff")
+        self.assertEqual(bot._screen(meta, stop, member=True), "cutoff")
 
     def test_rain_weekend_quotes_to_ticker_date_midnight(self):
         # Jack 2026-09-10: "allowlist KXRAINWKND ... but only quote until the

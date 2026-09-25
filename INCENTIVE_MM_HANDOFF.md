@@ -2668,3 +2668,57 @@ test_cached_series_verdicts_are_rescored_against_the_keywords,
 test_live_source_rejects_when_the_reward_window_covers_the_market,
 test_a_member_whose_series_turns_live_is_evicted_on_refresh; two older
 tests modernised to the sourced cache shape.
+
+## 2026-09-24 pm — Rainstorm spans (KXRAINS<CITY>-<start>-<end>) allowed as a family, quoted until the START date (Jack)
+
+Jack: "allowlist these types of rain markets, up until the start date.
+KXRAINSBOS-26SEP26-27SEP26, KXRAINSNYC-26SEP26-27SEP26".
+
+WHAT THEY ARE: "How much will it rain in <city> in September 26-27, 2026?"
+-- total precipitation at the city's airport station over a two-day
+window, a 10-rung inch ladder (T0P5 .. T5), listed Thu 18:00Z, close Mon
+04:59Z. Catalog 9/24: KXRAINSBOS "Rainstorm in Boston", KXRAINSNYC
+"Rainstorm in NYC" (custom-frequency series Kalshi lists as storms come).
+Live programs (fetch_programs under the launcher env): 10 markets each,
+$16.57/market/day, target 1000, df 0.5, 9/24 18:04Z -> Sat 9/26 23:59 ET.
+Neither series was allowed before this change (the KXRAIN prefix is only
+an open-scan ownership exclusion, never an allow).
+
+RULE: a FAMILY allow keyed on TICKER SHAPE, not name (the 9/1 gas-states
+lesson: wire the family, member lists go stale in a day).
+rainstorm_span_allowed(ticker) = series fullmatches
+RAINSTORM_SERIES_RE (env IMM_RAINSTORM_SERIES_RE, default KXRAINS[A-Z]{3})
+AND the next two segments are both day-dates (start, end). Added as one
+more clause in _allowed (the blocklist still wins upstream). The name
+prefix alone is NOT enough: KXRAINS also names the Seattle / San
+Francisco / St Petersburg MONTHLIES (KXRAINSEAM-26SEP-7, KXRAINSFOM --
+which is not even in the launcher blocklist -- KXRAINSTPM) and the Seattle
+daily KXRAINSEA-26SEP26; all fail the two-date shape, as does the
+"<series>-X" family probe. Kill switch IMM_RAINSTORM_ALLOW=0.
+CUTOFF: "up until the start date" is the plain midnight-ET ticker rule --
+parse_event_date reads the second segment, the window's START day -- so
+the bot is out at 00:00 ET on that day (Sat 9/26 04:00Z for the first
+event). The archetype override SERIES_OVERRIDES["KXRAINSBOS"]
+(cutoff_before_event_min=0 via IMM_RAINSTORM_CUTOFF_BEFORE_MIN, rain band
+5-90) PINS that reading, the KXRAINWKND pattern; every other city clones
+it through FAMILY_OVERRIDE_PARENTS ("pattern", RAINSTORM_SERIES_RE,
+KXRAINSBOS) at first sight in the candidates loop, and a city the
+quote-gaps mirror sees first still gets the same cutoff from the midnight
+rule alone. Kalshi's occurrence_datetime equals expiration (Mon 05:00Z),
+never a cutoff candidate. Inherited by PREFIX like the weekend family: the
+KXRAIN 7pm-01:59 ET size halving (measured at deploy: hour_mult 0.5,
+ladder [(0, 10)]) and the open-scan exclusion. NOT inherited: the NWS fair
+gate and the directional take (exact RAIN_FAIR_SERIES).
+
+DEPLOY (9/25 ~02:07Z, in-place edits -> source-mtime clean exits ->
+launcher relaunch): both 9/26-27 events enter on the first refresh,
+~26h of quoting to the Saturday 00:00 ET stop; positions ride to Monday's
+settlement.
+
+Tests: test_rainstorm_span_family_allowed_by_shape (BOS/NYC/event form/a
+future city allowed; monthlies, Seattle daily, one-date sibling, probe
+form and KXRAINWKND fail the shape; no KXRAIN prefix in
+ALLOW_SERIES_PREFIXES; blocklist wins; kill switch) and
+test_rainstorm_span_quotes_until_the_start_date (parse -> raw -> both
+producers land Sat 00:00 ET; archetype fields; NYC inherits; member quotes
+to the instant, fresh entry stops at the buffer); 616 green.
