@@ -2240,6 +2240,118 @@ def family_series_allowed(series: str) -> bool:
     if not FAMILY_SOURCE_CHECK:
         return True
     return family_verdict(series) is True
+
+
+# Source verdicts are also read for the EXACT-LIST Carbon Arc families (*FT
+# foot traffic, *APP app downloads, 2026-09-24): they are admitted by the
+# company allowlist, not by the suffix rule, but "is this series Carbon
+# Arc-settled?" is a question the late-month rule below and the
+# opportunistic email both need answered. Reading verdicts for them changes
+# nothing about admission -- family_series_allowed still requires a suffix
+# in ALLOW_FAMILY_SUFFIXES.
+FAMILY_VERDICT_EXTRA_SUFFIXES = tuple(
+    s for s in os.environ.get("IMM_FAMILY_VERDICT_EXTRA_SUFFIXES",
+                              "FT,APP").split(",") if s)
+
+
+def series_verdict_wanted(series: str) -> bool:
+    """Series the bot source-verifies: the suffix families plus the
+    exact-list Carbon Arc families."""
+    return series_family_suffix(series) or any(
+        series.endswith(suf) for suf in FAMILY_VERDICT_EXTRA_SUFFIXES)
+
+
+def carbon_arc_settled(series: str) -> bool:
+    """True when the bot has verified this series settles on Carbon Arc
+    data. Unknown = False: a rule that keys on this fails toward the
+    ordinary (full-size) behaviour, never toward a guess."""
+    return family_verdict(series) is True
+
+
+# CARBON ARC LATE-MONTH RULE (Jack 2026-09-24: "when Carbon Arc events are
+# 2 weeks from month-end, halve size and skew away from the toxic side").
+#
+# WHY. Every Carbon Arc contract settles on a monthly year-over-year panel
+# index ("Amazon Credit Card Spend for September above 104"), published a
+# week after month-end, and the bot quotes from listing (late the month
+# before) to the print-day close -- across the whole measurement month.
+# Carbon Arc sells that panel self-serve ($20/month, updated weekly/daily by
+# segment), so by mid-month most of the statistic is observable to anyone
+# who pays, and our fills show it: 450 Carbon Arc fills 9/06-9/24 marked out
+# -4.1c/contract at 1h (the worst family in the book; gas -0.6, mention
+# -1.5, other -2.3), widening to -5.5c at 24h and -6.75c at 72h. The toxic
+# side was BUYING YES: -7.5c at 24h when counterparties sold us YES vs -3.1c
+# when we sold. The settled August cycle's bracketing strikes were still
+# ~44c from their final value 3 days before close and moved 20 -> 99 inside
+# the last day -- the information arrives late and fast.
+#
+# THE RULE. For a market whose series is Carbon Arc-settled (carbon_arc_
+# settled) and whose ticker is day-dated, from CA_LATE_DAYS before the end
+# of the MEASUREMENT month until the market closes, every ladder rung is
+# scaled by CA_LATE_SIZE_MULT on both sides and by CA_LATE_TOXIC_MULT again
+# on the toxic side (CA_LATE_TOXIC_SIDE = the book side we rest that side
+# on: "bid" = we buy YES). Jack, minutes after the first instruction:
+# "completely block the toxic side when 2 weeks from month-end" -> the
+# toxic multiplier defaults to 0: NO bid rungs at all inside the window,
+# asks at 50% of the normal ladder. (The 1c depth pad on the bid side is
+# not a quote in this sense -- it rests at 1c only to qualify the reward
+# snapshot, carries ~1c/contract of worst case, and stays.) The
+# measurement month is the month
+# BEFORE the ticker date (the print day is always early the next month:
+# 26OCT03 POS, 26OCT06 ADS, 26OCT07 CC, 26OCT08 FT/APP), so its end is
+# 00:00 ET on the 1st of the ticker-date month; the window then runs
+# through the close since the month is COMPLETE by then. Applied to the
+# quote loop's per-side ladders, to the estimator's hypothetical ladder (so
+# the reward estimate and the $1 floor projection see the size that will
+# actually rest) and to the collateral reservation. Position/event caps
+# and the inventory skew knees are untouched -- they bound inventory, and
+# halving them would push existing positions into reduce-only.
+# IMM_CA_LATE_SIZE_MULT=1 with IMM_CA_LATE_TOXIC_MULT=1 switches it off.
+CA_LATE_DAYS = _env_float("IMM_CA_LATE_DAYS", 14)
+CA_LATE_SIZE_MULT = _env_float("IMM_CA_LATE_SIZE_MULT", 0.5)
+CA_LATE_TOXIC_SIDE = os.environ.get("IMM_CA_LATE_TOXIC_SIDE", "bid").strip().lower()
+CA_LATE_TOXIC_MULT = _env_float("IMM_CA_LATE_TOXIC_MULT", 0.0)
+
+
+def scale_levels(lv: List[Tuple[int, int]], m: float) -> List[Tuple[int, int]]:
+    """A ladder with every rung size scaled by `m` (half-up, floor 1); the
+    same object back when m == 1 so identity checks keep working, and NO
+    rungs at all when m <= 0 (a blocked side)."""
+    if m == 1.0:
+        return lv
+    if m <= 0.0:
+        return []
+    return [(t, max(1, int(s * m + 0.5))) for t, s in lv]
+
+
+def ca_late_window_start(ticker: str) -> Optional[datetime]:
+    """UTC instant the late-month rule engages for this market: CA_LATE_DAYS
+    before 00:00 ET on the 1st of the ticker-date month (= the end of the
+    measurement month). None for an undated ticker."""
+    td = parse_event_date(ticker)
+    if td is None:
+        return None
+    d = td.astimezone(ET)
+    month_end = ET.localize(datetime(d.year, d.month, 1)).astimezone(timezone.utc)
+    return month_end - timedelta(days=CA_LATE_DAYS)
+
+
+def ca_late_month_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
+    """(bid_mult, ask_mult) for this market right now under the Carbon Arc
+    late-month rule; (1.0, 1.0) whenever it does not apply."""
+    if CA_LATE_SIZE_MULT >= 1.0 and CA_LATE_TOXIC_MULT >= 1.0:
+        return (1.0, 1.0)
+    if not carbon_arc_settled(series_of(ticker)):
+        return (1.0, 1.0)
+    start = ca_late_window_start(ticker)
+    if start is None or now_utc < start:
+        return (1.0, 1.0)
+    bm = am = CA_LATE_SIZE_MULT
+    if CA_LATE_TOXIC_SIDE == "bid":
+        bm *= CA_LATE_TOXIC_MULT
+    elif CA_LATE_TOXIC_SIDE == "ask":
+        am *= CA_LATE_TOXIC_MULT
+    return (bm, am)
 # Series-name PREFIXES — for mention/incentive families that append a variable
 # tail so the "MENTION" suffix match misses:
 #   KXTEMP<CITY>            weather temp (covers new cities automatically)
@@ -8135,8 +8247,11 @@ class IncentiveMarketMaker:
             # atref rests up to 2x the spec size, so an unscaled reservation
             # under-charged the budget up to ~2x on mid-priced deep-ref books
             # (anchor pricing stays — actual rests at/below the anchor cost).
-            worst = (ladder_collateral_dollars(bid, None, lv) * meta.ref_mult_bid
-                     + ladder_collateral_dollars(None, ask, lv) * meta.ref_mult_ask)
+            _cbm, _cam = ca_late_month_mults(meta.ticker, now_utc)
+            worst = (ladder_collateral_dollars(bid, None, scale_levels(lv, _cbm))
+                     * meta.ref_mult_bid
+                     + ladder_collateral_dollars(None, ask, scale_levels(lv, _cam))
+                     * meta.ref_mult_ask)
             return worst * COLLATERAL_REALIZATION   # realistic, not worst-case
 
         # quote_all series (e.g. Love Island) are force-included: EVERY market
@@ -8331,6 +8446,20 @@ class IncentiveMarketMaker:
 
     # ---- Carbon Arc name-pattern families (2026-09-22) ---------------------
 
+    def _ca_late_note(self, event_ticker: str, bm: float, am: float) -> None:
+        """Log once per event (per process) when the Carbon Arc late-month
+        rule engages, so the halved ladder is never a silent change."""
+        seen = getattr(self, "_ca_late_seen", None)
+        if seen is None:
+            seen = self._ca_late_seen = set()
+        if event_ticker in seen:
+            return
+        seen.add(event_ticker)
+        _b = "bid side BLOCKED" if bm <= 0 else f"bids x{bm:g}"
+        _a = "ask side BLOCKED" if am <= 0 else f"asks x{am:g}"
+        log(f"{self.tag} Carbon Arc late-month: {event_ticker} {_b} / {_a} "
+            f"(inside {CA_LATE_DAYS:g}d of the measurement month's end)")
+
     def _resolve_family_verdicts(self, by_market: Dict[str, dict],
                                  now_ts: float) -> int:
         """Source-verify the family-suffix series in the LIVE programs feed
@@ -8348,7 +8477,7 @@ class IncentiveMarketMaker:
         seen: Set[str] = set()
         for t in by_market:
             s = series_of(t)
-            if s in seen or not series_family_suffix(s):
+            if s in seen or not series_verdict_wanted(s):
                 continue
             seen.add(s)
             ent = FAMILY_VERDICTS.get(s)
@@ -8707,11 +8836,16 @@ class IncentiveMarketMaker:
         # and is one tick from earning nothing (Jack 2026-09-07 on
         # KXTRUEV-26SEP07-T1263.42: "only supports 1 side quoting, and is
         # more likely to fall out of the quoting range and stop earning").
-        _lv = hour_scaled_levels(meta.series, datetime.now(timezone.utc))
-        _base = sum(s for _t, s in _lv)
+        _now = datetime.now(timezone.utc)
+        _lv = hour_scaled_levels(meta.series, _now)
+        # Carbon Arc late-month rule: the hypothetical ladder is per side too,
+        # so the reward estimate (and the $1 floor projection built on it)
+        # see the size the quote loop will actually rest.
+        _cbm, _cam = ca_late_month_mults(meta.ticker, _now)
+        _lvb, _lva = scale_levels(_lv, _cbm), scale_levels(_lv, _cam)
         _smb, _sma = clamp_side_max_to_position_cap(
-            int(round(_base * meta.ref_mult_bid)),
-            int(round(_base * meta.ref_mult_ask)),
+            int(round(sum(s for _t, s in _lvb) * meta.ref_mult_bid)),
+            int(round(sum(s for _t, s in _lva) * meta.ref_mult_ask)),
             series_max_position(meta.series))
         _probe: List[Quote] = []
         # atref: the band gates PLACEMENT no longer follows the touch, so
@@ -8721,13 +8855,13 @@ class IncentiveMarketMaker:
                 (LADDER_MODE == "atref" and rb is not None)
                 or ext_b >= series_price_min(meta.series)):
             _probe += build_side_ladder(meta.ticker, "bid", ext_b, ext_a,
-                                        _smb, levels=_lv, ref_px=rb,
+                                        _smb, levels=_lvb, ref_px=rb,
                                         hour_mult=_hm)
         if ext_a is not None and (
                 (LADDER_MODE == "atref" and ra is not None)
                 or ext_a <= series_price_max(meta.series)):
             _probe += build_side_ladder(meta.ticker, "ask", ext_a, ext_b,
-                                        _sma, levels=_lv, ref_px=ra,
+                                        _sma, levels=_lva, ref_px=ra,
                                         hour_mult=_hm)
         # Sides that will actually REST. This must replicate the quote
         # loop's PER-SIDE TOP-IN-BAND gate (Jack 2026-08-03, CHIH T69.99):
@@ -9903,17 +10037,24 @@ class IncentiveMarketMaker:
             # coexisting manual position doesn't shrink the bot's room.
             lv = hour_scaled_levels(meta.series, now_utc)
             hm = hour_size_mult(meta.series, now_utc)
+            # Carbon Arc late-month rule (Jack 2026-09-24, ca_late_month_mults):
+            # from here the ladder is PER SIDE -- no bid rungs and asks at
+            # 50% inside the window, the plain ladder on both sides otherwise.
+            ca_bm, ca_am = ca_late_month_mults(t, now_utc)
+            lv_bid = scale_levels(lv, ca_bm)
+            lv_ask = scale_levels(lv, ca_am)
+            if (ca_bm, ca_am) != (1.0, 1.0):
+                self._ca_late_note(meta.event_ticker, ca_bm, ca_am)
             # deep-reference size multiplier feeds the side_max component of
             # room (position/event caps and skew still bind unscaled);
             # capped so hour x ref <= TOTAL_SIZE_MULT_CAP
             ref_bid_px, ref_ask_px = ladder_reference_prices(
                 yes_levels, no_levels, meta.target_size)
-            base_side_max = sum(s for _t, s in lv)
-            side_max_bid = int(round(base_side_max *
+            side_max_bid = int(round(sum(s for _t, s in lv_bid) *
                                      capped_ref_mult(ext_bid, ref_bid_px, "bid",
                                                      hour_mult=hm,
                                                      series=meta.series)))
-            side_max_ask = int(round(base_side_max *
+            side_max_ask = int(round(sum(s for _t, s in lv_ask) *
                                      capped_ref_mult(ext_ask, ref_ask_px, "ask",
                                                      hour_mult=hm,
                                                      series=meta.series)))
@@ -9953,7 +10094,7 @@ class IncentiveMarketMaker:
                     or ext_bid >= pmin_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
-                                                levels=lv, ref_px=ref_bid_px,
+                                                levels=lv_bid, ref_px=ref_bid_px,
                                                 band=(rung_lo, pmax_s),
                                                 hour_mult=hm))
             if ext_ask is not None and room_sell > 0 and ask_in_band:
@@ -9961,7 +10102,7 @@ class IncentiveMarketMaker:
                     or ext_ask <= pmax_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
-                                                levels=lv, ref_px=ref_ask_px,
+                                                levels=lv_ask, ref_px=ref_ask_px,
                                                 band=(rung_lo, pmax_s),
                                                 hour_mult=hm))
 

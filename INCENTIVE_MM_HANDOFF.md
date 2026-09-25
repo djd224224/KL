@@ -2327,3 +2327,51 @@ also carries their ledger credits and realized P&L. Test:
 test_carbon_arc_tier_is_by_settlement_source (tier by source, event ticker
 resolves the same, precedence finecon > scan > carbon arc, TTL, cache
 round-trip, failed read tolerated, labels).
+
+## 2026-09-24 — Carbon Arc late-month rule: no bids, half-size asks inside 14 days of month-end (Jack)
+
+Jack, after the adverse-selection assessment (markouts -4.1c/ct at 1h, the
+worst family in the book, widening to -6.75c at 72h; buying YES the toxic
+side at -7.5c/24h vs -3.1c selling; the August cycle's bracketing strikes
+moving 20 -> 99 inside the last day before close): "when Carbon Arc events
+are 2 weeks from month-end, halve size and skew away from the toxic side",
+then minutes later "completely block the toxic side when 2 weeks from
+month-end".
+
+RULE (ca_late_month_mults): for a market whose series is Carbon Arc-settled
+(carbon_arc_settled = the bot's own source verdict) and day-dated, from
+CA_LATE_DAYS (14) before 00:00 ET on the 1st of the ticker-date month (= the
+end of the measurement month; the print day is early the NEXT month) until
+the market closes: bid rungs x CA_LATE_TOXIC_MULT (0 = none), ask rungs x
+CA_LATE_SIZE_MULT (0.5). Applied per side in the quote loop (lv_bid /
+lv_ask), in the estimator's hypothetical ladder (so est reward and the
+$1.50 floor projection see the real size) and in the collateral
+reservation. Position / event caps and the inventory-skew knees are
+untouched. The 1c depth pad on the bid side stays (it qualifies the reward
+snapshot at ~1c/ct of worst case; it is not liquidity at the touch). Logged
+once per event: "Carbon Arc late-month: <event> bid side BLOCKED / asks
+x0.5". Knobs: IMM_CA_LATE_DAYS, IMM_CA_LATE_SIZE_MULT, IMM_CA_LATE_TOXIC_SIDE
+(bid|ask), IMM_CA_LATE_TOXIC_MULT; SIZE_MULT=1 with TOXIC_MULT=1 = off.
+
+VERDICT COVERAGE: the bot now source-verifies the exact-list Carbon Arc
+families too (FAMILY_VERDICT_EXTRA_SUFFIXES = FT,APP), so carbon_arc_settled
+answers for foot traffic and app downloads; admission is unchanged
+(family_series_allowed still requires a suffix in ALLOW_FAMILY_SUFFIXES).
+The opportunistic email's own lookup seeds from these verdicts first.
+
+CONSEQUENCES TO EXPECT: est reward on every Carbon Arc market drops to
+roughly a quarter to a third inside the window, so some markets (the
+shortest remaining periods -- POS closes Oct 3) may fall under the $1.50
+projection and exit `hopeless` after the 1h sustain, or never enter; every
+Carbon Arc market reads quotable_sides = 1 in the window (one-sided
+candidates rank below two-sided ones in the per-event cut, lifetime slots
+already held are unaffected). Window for the current cycle: Sep 17 00:00 ET
+onward, i.e. the rule engaged on deploy for all 77 events.
+
+Tests: test_late_month_rule_halves_and_skews_carbon_arc_markets (window
+boundary at Sep 17 00:00 ET, holds past month-end, exact-list families,
+unknown/undated/non-Carbon-Arc untouched, ask-side variant, kill switch,
+scale_levels incl. the empty blocked ladder),
+test_late_month_rule_shapes_the_resting_ladder (cycle-log want columns:
+no bids, asks = half the plain ladder),
+test_verdict_reads_cover_the_exact_list_carbon_arc_families.

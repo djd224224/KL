@@ -11039,6 +11039,121 @@ class TestFamilySourceVerdicts(unittest.TestCase):
             self.assertTrue(imm.family_series_allowed("KXZZCC"))
             self.assertTrue(IncentiveMarketMaker._allowed("KXZZCC-26OCT07-T1"))
 
+    def test_verdict_reads_cover_the_exact_list_carbon_arc_families(self):
+        # 2026-09-24: *FT / *APP are Carbon Arc-settled but exact-list
+        # admitted; the bot now source-verifies them too (for the late-month
+        # rule and the email) WITHOUT that changing their admission route.
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.series_meta["KXNEWFT"] = self._meta("New Foot Traffic",
+                                                       "Carbon Arc")
+        bot.client.series_meta["KXNFLDRAFT"] = self._meta(
+            "NFL draft", "the Governing League")
+        feed = self._feed("KXNEWFT-26OCT08-T5", "KXNFLDRAFT-27-QB",
+                          "KXGOOD-99DEC31-A")
+        self.assertEqual(bot._resolve_family_verdicts(feed, time.time()), 2)
+        self.assertTrue(imm.carbon_arc_settled("KXNEWFT"))
+        self.assertFalse(imm.carbon_arc_settled("KXNFLDRAFT"))
+        self.assertFalse(imm.carbon_arc_settled("KXGOOD"))      # never read
+        # neither is a suffix-family member: admission is unchanged
+        self.assertFalse(imm.series_family_suffix("KXNEWFT"))
+        self.assertFalse(imm.family_series_allowed("KXNEWFT"))
+        self.assertTrue(imm.series_verdict_wanted("KXNEWFT"))
+        self.assertTrue(imm.series_verdict_wanted("KXURBNCC"))
+        self.assertFalse(imm.series_verdict_wanted("KXGOOD"))
+
+    def test_late_month_rule_halves_and_skews_carbon_arc_markets(self):
+        # Jack 2026-09-24: "when Carbon Arc events are 2 weeks from
+        # month-end, halve size and skew away from the toxic side". The toxic
+        # side measured that day was BUYING YES (24h markout -7.5c/ct vs
+        # -3.1c selling). The measurement month ends at 00:00 ET on the 1st
+        # of the ticker-date month (the print day is early the next month).
+        imm.FAMILY_VERDICTS["KXFAKECC"] = {"carbon_arc": True, "ts": 1.0, "title": ""}
+        imm.FAMILY_VERDICTS["KXFAKEFT"] = {"carbon_arc": True, "ts": 1.0, "title": ""}
+        imm.FAMILY_VERDICTS["KXFAKEPOS"] = {"carbon_arc": False, "ts": 1.0, "title": ""}
+        self.assertEqual((imm.CA_LATE_DAYS, imm.CA_LATE_SIZE_MULT,
+                          imm.CA_LATE_TOXIC_SIDE, imm.CA_LATE_TOXIC_MULT),
+                         (14, 0.5, "bid", 0.0))
+        t = "KXFAKECC-26OCT07-T104"
+        ws = imm.ca_late_window_start(t)
+        self.assertEqual(ws.astimezone(imm.ET).strftime("%Y-%m-%d %H:%M"),
+                         "2026-09-17 00:00")
+        before, after = ws - timedelta(minutes=1), ws + timedelta(minutes=1)
+        self.assertEqual(imm.ca_late_month_mults(t, before), (1.0, 1.0))
+        self.assertEqual(imm.ca_late_month_mults(t, after), (0.0, 0.5))
+        # ...and it holds through the print-day close, past month-end
+        self.assertEqual(imm.ca_late_month_mults(t, utc(2026, 10, 6, 12, 0)),
+                         (0.0, 0.5))
+        # exact-list Carbon Arc families are covered by their verdict too
+        self.assertEqual(imm.ca_late_month_mults("KXFAKEFT-26OCT08-T101", after),
+                         (0.0, 0.5))
+        # not Carbon Arc, unknown, or undated -> the plain ladder
+        for x in ("KXFAKEPOS-26OCT03-T90", "KXUNREADCC-26OCT07-T1",
+                  "KXGOOD-26OCT07-T1", "KXFAKECC-DOG-T1"):
+            self.assertEqual(imm.ca_late_month_mults(x, after), (1.0, 1.0), x)
+        # the other toxic side, and the kill switch
+        with mock.patch.object(imm, "CA_LATE_TOXIC_SIDE", "ask"):
+            self.assertEqual(imm.ca_late_month_mults(t, after), (0.5, 0.0))
+        # a softer toxic-side multiplier is still available by env
+        with mock.patch.object(imm, "CA_LATE_TOXIC_MULT", 0.5):
+            self.assertEqual(imm.ca_late_month_mults(t, after), (0.25, 0.5))
+        with mock.patch.object(imm, "CA_LATE_SIZE_MULT", 1.0), \
+                mock.patch.object(imm, "CA_LATE_TOXIC_MULT", 1.0):
+            self.assertEqual(imm.ca_late_month_mults(t, after), (1.0, 1.0))
+        # rung scaling: half-up, floor 1, identity object at x1
+        lv = [(0, 20), (1, 10), (2, 1)]
+        self.assertEqual(imm.scale_levels(lv, 0.25), [(0, 5), (1, 3), (2, 1)])
+        self.assertEqual(imm.scale_levels(lv, 0.5), [(0, 10), (1, 5), (2, 1)])
+        self.assertIs(imm.scale_levels(lv, 1.0), lv)
+        self.assertEqual(imm.scale_levels(lv, 0.0), [])          # a blocked side
+
+    def test_late_month_rule_shapes_the_resting_ladder(self):
+        # The loop rests NO bids and asks at 50% of the ladder it would
+        # otherwise rest (read off the cycle log's want columns, the same
+        # sensor the strategy's calibration uses).
+        _clean_persist()
+        imm.ALLOWLIST_ONLY = False      # the fixture series is not allowlisted
+        T = "KXGOOD-99DEC31-A"
+        path = os.path.join(imm.STATUS_DIR,
+                            f"cycle_log_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+        def want(row_ticker):
+            hdr, want_b, want_a = None, None, None
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    cells = line.rstrip("\n").split(",")
+                    if cells[0] == "ts":
+                        hdr = cells
+                        continue
+                    if hdr and cells[1] == row_ticker:
+                        want_b = float(cells[hdr.index("want_bid_ct")])
+                        want_a = float(cells[hdr.index("want_ask_ct")])
+            return want_b, want_a
+        # floors off: a blocked bid + half ask shrinks the fixture's reward
+        # estimate under the $1.50 entry floor (a real consequence of the
+        # rule, tested elsewhere); here only the ladder SHAPE is under test
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 0.0
+        self.addCleanup(setattr, imm, "MIN_EST_TOTAL_DOLLARS", old_floor)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        base_b, base_a = want(T)
+        self.assertGreater(base_b, 0); self.assertGreater(base_a, 0)
+        os.remove(path)
+        _clean_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "ca_late_month_mults",
+                               lambda t, now: (0.0, 0.5) if t == T else (1.0, 1.0)):
+            bot2.run_cycle()
+        b, a = want(T)
+        lv = imm.hour_scaled_levels("KXGOOD", datetime.now(timezone.utc))
+        self.assertEqual(b, 0)                                   # blocked side
+        self.assertEqual(a, sum(s for _t, s in imm.scale_levels(lv, 0.5)))
+        self.assertLess(a, base_a)
+
     def test_a_judged_non_member_is_refused_but_visible(self):
         # the overrides task skips a suffix match the bot has not judged yet
         # and classifies a judged NON-member like any other series; the
