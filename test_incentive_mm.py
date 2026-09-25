@@ -1157,6 +1157,137 @@ class TestScreen(unittest.TestCase):
                                        and not ov.safe_join
                                        and ov.cutoff_from_close_min is None))
 
+    def test_award_shows_three_per_event_and_one_month_stand_down(self):
+        # Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY,
+        # KXOSCAR, KXVMA. max 3 markets per event, and do not quote within
+        # 1 month of when the event starts". Market objects as Kalshi served
+        # them on 9/25: occurrence is the close or the expiration on every
+        # one, the expiration is the only real date -- except the Oscars,
+        # whose expiration is the 2027-12-31 placeholder.
+        gg = {"occurrence_datetime": "2027-12-08T15:00:00Z",
+              "expected_expiration_time": "2026-12-09T15:00:00Z",
+              "close_time": "2027-12-08T15:00:00Z"}
+        gr = {"occurrence_datetime": "2027-02-08T04:59:00Z",
+              "expected_expiration_time": "2027-02-08T04:59:00Z",
+              "close_time": "2027-12-31T15:00:00Z"}
+        vma = {"occurrence_datetime": "2026-09-28T03:59:00Z",
+               "expected_expiration_time": "2026-09-28T03:59:00Z"}
+        nba = {"occurrence_datetime": "2026-11-19T04:59:00Z",
+               "expected_expiration_time": "2026-11-19T04:59:00Z"}
+        osc = {"expected_expiration_time": "2027-12-31T15:00:00Z",
+               "close_time": "2027-12-31T15:00:00Z"}
+        self.assertEqual(imm.AWARDS_PRE_EVENT_DAYS, 31.0)
+        # event start: the expiration (day after the announcement / end of
+        # the ceremony day); a scheduled occurrence ahead of it wins; a
+        # placeholder, a missing object or a table-only series -> None
+        self.assertEqual(imm.awards_event_start("KXGGNOM-ANI26", gg),
+                         utc(2026, 12, 9, 15, 0))
+        self.assertEqual(imm.awards_event_start("KXGRAMMY-BAMP69", gr),
+                         utc(2027, 2, 8, 4, 59))
+        self.assertEqual(imm.awards_event_start(
+            "KXX-1", {"occurrence_datetime": "2026-11-18T23:00:00Z",
+                      "expected_expiration_time": "2026-11-19T04:59:00Z"}),
+            utc(2026, 11, 18, 23, 0))
+        self.assertIsNone(imm.awards_event_start("KXOSCARPIC-28", osc))
+        self.assertIsNone(imm.awards_event_start("KXGGNOM-ANI26", None))
+        self.assertIsNone(imm.awards_event_start("KXGGNOM-ANI26", gg,
+                                                 dates_only=True))
+        # the hand table: 99th Oscars ceremony Mar 14 2027 (EST), nominations
+        # Jan 21 2027; the nominations glob is listed first and wins
+        self.assertEqual(imm.awards_event_start("KXOSCARINTLFILM-27", osc, True),
+                         utc(2027, 3, 14, 5, 0))
+        self.assertEqual(imm.awards_event_start("KXOSCARNOMAS-27", osc, True),
+                         utc(2027, 1, 21, 5, 0))
+        self.assertEqual(imm._parse_awards_dates("KXA*-27=2027-03-14"),
+                         (("KXA*-27", utc(2027, 3, 14, 5, 0)),))
+        with self.assertRaises(ValueError):
+            imm._parse_awards_dates("KXA*-27=March 14")
+        # cutoff = start - 31 days, through the shared tightener (both
+        # producers and the quote-gaps mirror pass the market object)
+        for s, ev, m, want in (
+                ("KXGGNOM", "KXGGNOM-ANI26", gg, utc(2026, 11, 8, 15, 0)),
+                ("KXGRAMMY", "KXGRAMMY-BAMP69", gr, utc(2027, 1, 8, 4, 59)),
+                ("KXNATBOOKAWARDS", "KXNATBOOKAWARDS-FIC26", nba,
+                 utc(2026, 10, 19, 4, 59)),
+                ("KXVMA", "KXVMA-ALB26", vma, utc(2026, 8, 28, 3, 59))):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                s, ev, None, close_time=None, market=m), want, s)
+            # never loosens an earlier cutoff
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                s, ev, want - timedelta(days=3), close_time=None, market=m),
+                want - timedelta(days=3), s)
+        # no market object / placeholder date -> stood down, fail closed
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGGNOM", "KXGGNOM-ANI26", None, close_time=None, market=None),
+            imm.RELEASE_GUARD_UNKNOWN)
+        # the Oscar family inherits KXOSCAR's guard set (table-only, 3/event,
+        # safe-join, 31d); KXOSCARMENTION is the mention family's and gets
+        # neither the override nor the prefix cap
+        for s in ("KXOSCARPIC", "KXOSCARINTLFILM", "KXOSCARMENTION"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+        try:
+            imm.ensure_family_override("KXOSCARPIC")
+            ov = imm.series_override("KXOSCARPIC")
+            self.assertEqual(ov.pre_event_days, 31.0)
+            self.assertTrue(ov.pre_event_dates_only)
+            self.assertTrue(ov.safe_join)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXOSCARPIC", "KXOSCARPIC-27", None, close_time=None,
+                market=osc), utc(2027, 2, 11, 5, 0))
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXOSCARPIC", "KXOSCARPIC-28", None, close_time=None,
+                market=osc), imm.RELEASE_GUARD_UNKNOWN)
+            imm.ensure_family_override("KXOSCARMENTION")
+            self.assertNotIn("KXOSCARMENTION", imm.SERIES_OVERRIDES)
+        finally:
+            for s in ("KXOSCARPIC", "KXOSCARINTLFILM", "KXOSCARMENTION"):
+                imm.SERIES_OVERRIDES.pop(s, None)
+        # the four exact series carry the same set
+        for s in ("KXGGNOM", "KXNATBOOKAWARDS", "KXGRAMMY", "KXVMA"):
+            ov = imm.series_override(s)
+            self.assertEqual(ov.pre_event_days, 31.0, s)
+            self.assertFalse(ov.pre_event_dates_only, s)
+            self.assertTrue(ov.safe_join, s)
+        # allowed exactly (KXGRAMMY / KXVMA are prefixes of dozens of
+        # strangers) and the Oscar family by prefix; caps 3 by ROI, with a
+        # mention series never capped by a prefix
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            for t in ("KXGGNOM-ANI26-TOY", "KXNATBOOKAWARDS-FIC26-PARADI",
+                      "KXGRAMMY-BAMP69-CHA", "KXVMA-ALB26-BRU",
+                      "KXOSCARINTLFILM-27-LAB", "KXOSCARPIC-27-ODY"):
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+                self.assertEqual(imm.scan_universe_reason(t), "allowed", t)
+            for t in ("KXGRAMMYWINNERS-69-X", "KXGRAMMYNOMSOTY-69-X",
+                      "KXGRAMMYCOUNTSZA-69-T3", "KXVMAPOP-26-X",
+                      "KXGGWIN-26-X"):
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        for s in ("KXGGNOM", "KXNATBOOKAWARDS", "KXGRAMMY", "KXVMA",
+                  "KXOSCARPIC", "KXOSCARINTLFILM", "KXOSCARSVIEWER"):
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+        for s in ("KXGRAMMYNOMSOTY", "KXVMAPOP", "KXOSCARMENTION",
+                  "KXTRUMPMENTION", "KXGGWIN"):
+            self.assertEqual(imm.event_top_n_for(s), 0, s)
+        # screen: the VMAs are Sep 27 2026, so on Sep 25 the family is
+        # already inside its month -> cutoff; the Golden Globe nominations
+        # (Dec 8) quote until Nov 8 15:00Z
+        m = _meta(ticker="KXVMA-ALB26-BRU", event_ticker="KXVMA-ALB26",
+                  series="KXVMA", cutoff=utc(2026, 8, 28, 3, 59),
+                  close_time=utc(2027, 9, 27, 14, 0))
+        self.assertEqual(self.bot._screen(m, utc(2026, 9, 25, 14, 0)),
+                         "cutoff")
+        m2 = _meta(ticker="KXGGNOM-ANI26-TOY", event_ticker="KXGGNOM-ANI26",
+                   series="KXGGNOM", cutoff=utc(2026, 11, 8, 15, 0),
+                   close_time=utc(2027, 12, 8, 15, 0))
+        self.assertIsNone(self.bot._screen(m2, utc(2026, 9, 25, 14, 0)))
+        self.assertEqual(self.bot._screen(m2, utc(2026, 11, 8, 16, 0)),
+                         "cutoff")
+        self.assertEqual(self.bot._screen(m2, utc(2026, 11, 8, 16, 0),
+                                          member=True), "cutoff")
+
     def test_cutoff_imminent(self):
         self.assertEqual(self.bot._screen(
             _meta(cutoff=self.now + timedelta(minutes=2)), self.now), "cutoff")
@@ -1865,6 +1996,11 @@ class TestAllowlist(unittest.TestCase):
         self.assertTrue(a("KXRTTV-VIS-45"))
         # Sotheby's lot prices (Jack 2026-09-25 "allowlist KXART")
         self.assertTrue(a("KXART-SOT10107OCT26-30000"))
+        # award shows (Jack 2026-09-25): four exact series + the Oscar family
+        for t in ("KXGGNOM-ANI26-TOY", "KXNATBOOKAWARDS-FIC26-PARADI",
+                  "KXGRAMMY-BAMP69-CHA", "KXVMA-ALB26-BRU",
+                  "KXOSCARINTLFILM-27-LAB", "KXOSCARPIC-27-ODY"):
+            self.assertTrue(a(t), t)
 
     def test_substring_trap_rejected(self):
         # 'HEGSETH' contains 'ETH' — exact series matching must reject it

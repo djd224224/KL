@@ -2814,3 +2814,79 @@ Tests: test_kxart_auction_day_cutoff_and_three_per_event (date parse incl.
 4-digit lot / other house / EST, tightener never loosens, fail-closed,
 kill switch, screen, exact allow vs the KXART* near misses, exact cap
 form, 9-lot ROI cut keeps 3), parser test for '=' form; suite green.
+
+## 2026-09-25 — Award shows allowlisted: KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY, KXVMA + the KXOSCAR family; 3 per event; out one month before the event (Jack)
+
+Jack: "also allowlist KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY, KXOSCAR, KXVMA.
+max 3 markets per event, and do not quote within 1 month of when the event
+starts".
+
+WHAT THEY ARE (API 9/25): one series per show, one event per category,
+~10 nominee binaries each, all undated tickers --
+- KXGGNOM-ANI26 ... (22 events): 84th Golden Globe NOMINATIONS, announced
+  Dec 8 2026 (expected_expiration Dec 9 15:00Z; occurrence = the 2027
+  placeholder close). $100/market, 5-day program 9/22 -> 9/27.
+- KXNATBOOKAWARDS-FIC26 ... (5): 77th National Book Awards, ceremony Nov 18
+  2026 (expiration Nov 19 04:59Z). $80/market.
+- KXGRAMMY-BAMP69 ... (29): 69th Grammys, Feb 7 2027 (expiration Feb 8
+  04:59Z; close is a 2027-12-31 placeholder). $60/market.
+- KXVMA-ALB26 ... (23): 2026 MTV VMAs, Sep 27 2026 (expiration Sep 28
+  03:59Z) -- two days away, i.e. already inside its month.
+- KXOSCAR: no such series. The Oscars are a FAMILY of per-category series
+  (KXOSCARPIC-27, KXOSCARINTLFILM-27 ... 66 in the catalog, every one an
+  Oscars market); only KXOSCARINTLFILM-27 carries a program today
+  ($40/market). Their expected_expiration is the 2027-12-31 placeholder
+  and there is no occurrence: NO machine-readable date at all.
+None had ever been quoted; zero positions.
+
+RULE SET (registered beside `awards_event_start`, AWARDS_SERIES =
+KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR):
+1. Allow: the four exact series in _DEFAULT_ENTERTAINMENT_SERIES (KXGRAMMY
+   / KXVMA are prefixes of dozens of per-category / per-artist strangers --
+   KXGRAMMYNOMSOTY, KXGRAMMYCOUNTSZA, KXVMAPOP -- which stay out); KXOSCAR
+   as a PREFIX in ALLOW_SERIES_PREFIXES (the whole family), with a
+   FAMILY_OVERRIDE_PARENTS pattern `(?!.*MENTION)KXOSCAR[A-Z0-9]*` so every
+   category series inherits KXOSCAR's guard set and KXOSCARMENTION stays
+   the mention family's.
+2. 3 per event by ROI: EVENT_TOP_N `=KXGGNOM:3,=KXNATBOOKAWARDS:3,
+   =KXGRAMMY:3,=KXVMA:3,KXOSCAR:3`. event_top_n_for gained one rule with
+   it: a MENTION-suffix series is capped only by an EXACT entry, so the
+   KXOSCAR prefix never trims KXOSCARMENTION's word legs.
+3. Safe-join (the KXCMA precedent for nominee binaries; free on stacked
+   touches per the 9/11 measurement).
+4. PRE-EVENT STAND-DOWN, new SeriesOverride fields `pre_event_days` (31)
+   and `pre_event_dates_only`: cutoff = event start - 31 days, applied in
+   apply_series_cutoff_adjustments (both producers + quote-gaps mirror),
+   never loosening. The start comes from (a) AWARDS_EVENT_DATES, a hand
+   table of event-ticker globs (default `KXOSCARNOM*-27=2027-01-21,
+   KXOSCAR*-27=2027-03-14`, the Academy's published 99th-Oscars schedule --
+   ceremony Mar 14 2027, nominations Jan 21 2027 -- per Deadline / Screen
+   Daily / The Gold Knight, Apr 2026; UPDATE YEARLY, a family year without
+   a row stands down), else (b) Kalshi's occurrence when it precedes the
+   expiration by >= 60 min, else the expiration itself; a Dec 31 expiration
+   is the placeholder shape and reads as unknown; unknown ->
+   RELEASE_GUARD_UNKNOWN (stood down, fail closed, logged once). KXOSCAR is
+   table-only (IMM_AWARDS_TABLE_ONLY_SERIES). 31 not 30: measured from an
+   end-of-day expiration, 30 days would start the stand-down inside the
+   month before the ceremony evening.
+
+RESULTING CUTOFFS: GGNOM Nov 8 15:00Z, National Book Awards Oct 19 04:59Z,
+Grammys Jan 8 2027 04:59Z, Oscars (winners) Feb 11 2027 05:00Z / (nominations
+series) Dec 21 2026, VMAs Aug 28 -- already past, so KXVMA is stood down
+from the first refresh (its live program IS the ceremony week: exactly the
+window the rule excludes).
+
+WHAT THIS DOES NOT COVER: nomination / finalist announcements that land more
+than a month before the ceremony -- Oscar nominations Jan 21 (ceremony Mar
+14), Grammy nominations ~Nov 7 (Feb 7), National Book Awards finalists Oct 6
+(Nov 18). The rule as given is the event start, so the bot quotes through
+those reveals unless IMM_AWARDS_PRE_EVENT_DAYS is raised or a nominations
+row is added to the table. Today's programs all end 9/27, before any of
+them.
+
+Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES,
+IMM_AWARDS_TABLE_ONLY_SERIES (all in the config hash).
+Tests: test_award_shows_three_per_event_and_one_month_stand_down (starts from
+table / occurrence / expiration / placeholder / missing, cutoffs for all
+five incl. the Oscar family inheritance and the mention carve-out, exact
+allow vs the strangers, caps, screen); allowlist test extended; suite green.

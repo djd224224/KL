@@ -64,6 +64,7 @@ import base64
 import json
 import math
 import os
+import fnmatch
 import re
 import signal
 import smtplib
@@ -308,6 +309,14 @@ class SeriesOverride:
     #   is removed bot-wide; set >0 here or via env to restore per-series)
     price_min_cents: Optional[int] = None               # per-series order price
     price_max_cents: Optional[int] = None               #   band (else global)
+    pre_event_days: Optional[float] = None              # AWARDS STAND-DOWN
+    #   (Jack 2026-09-25 "do not quote within 1 month of when the event
+    #   starts"): cutoff = the event's start minus this many days, the start
+    #   read by awards_event_start (hand table first, then Kalshi's
+    #   occurrence / expected expiration); no usable start -> stood down.
+    pre_event_dates_only: bool = False                  # only the hand table
+    #   (AWARDS_EVENT_DATES) may supply the start -- for families whose
+    #   Kalshi expiration is a Dec 31 placeholder (the Oscars)
 
 
 # Depth-padding (pad_to_target): fill a thin side up to the reward target with
@@ -1670,7 +1679,12 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "*ADS:3,*POS:3,"
                                                 # exact: KXART is a prefix
                                                 # of 20 unrelated series
-                                                "=KXART:3"
+                                                "=KXART:3,"
+                                                # award shows (2026-09-25);
+                                                # the Oscars are a prefix
+                                                # FAMILY (KXOSCAR<CATEGORY>)
+                                                "=KXGGNOM:3,=KXNATBOOKAWARDS:3,"
+                                                "=KXGRAMMY:3,=KXVMA:3,KXOSCAR:3"
                                                 + _RAMP_EVENT_TOP_N_SPEC))
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
@@ -1750,14 +1764,18 @@ EVENT_SLOTS_TTL_SECS = _env_float("IMM_EVENT_SLOTS_TTL_D", 14) * 86400.0
 
 
 def event_top_n_for(series: str) -> int:
+    # A MENTION-family series is capped only by an EXACT entry (2026-09-25):
+    # the KXOSCAR prefix cap must not trim KXOSCARMENTION's word legs, and
+    # no prefix/suffix cap has ever been meant for a mention book.
+    mention = any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES)
     for _pat, _n in EVENT_TOP_N:
         if _pat.startswith("*"):
-            if series.endswith(_pat[1:]):
+            if not mention and series.endswith(_pat[1:]):
                 return max(0, _n)
         elif _pat.startswith("="):
             if series == _pat[1:]:
                 return max(0, _n)
-        elif series.startswith(_pat):
+        elif not mention and series.startswith(_pat):
             return max(0, _n)
     return 0
 
@@ -2553,10 +2571,16 @@ def ca_late_month_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
 # KXTEMP re-enabled (Jack 2026-07-22 morning; was retired 7/21 evening after
 # the adverse-selection post-mortem — see analysis: -6c/contract uniform).
 # The 7/21 SeriesOverride tuning (5/2/2, cap 50, 5-90c, close-15min) applies.
+# KXOSCAR (2026-09-25): the Oscars are a family of per-category series
+# (KXOSCARPIC, KXOSCARINTLFILM, KXOSCARNOMAS ... 66 in the catalog, every
+# one an Oscars market) -- see _DEFAULT_ENTERTAINMENT_SERIES. The family's
+# guard set (3/event, safe-join, the 1-month stand-down off a hand date
+# table) is inherited through FAMILY_OVERRIDE_PARENTS; KXOSCARMENTION is
+# the MENTION family's and is carved out of both.
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
         "IMM_ALLOW_PREFIXES",
-        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT,KXAAAGASD").split(",") if p)
+        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT,KXAAAGASD,KXOSCAR").split(",") if p)
 # SPORTS LADDERS & ESCALATORS (Jack 2026-09-24: "allowlist sports ladders
 # and escalators, up until the game starts. e.g. NFLLADDERREC-26SEP24ATLGB,
 # NFLLADDERRECYDS-26SEP24ATLGB. though these shouldnt be quoted since the
@@ -2765,7 +2789,25 @@ _DEFAULT_ECON_SERIES = (
 # added for it) and the AUCTION-DAY CUTOFF (AUCTION_DATE_SERIES): the hammer
 # is the reveal, a day before the close, and the trailing DDMMMYY in the
 # event segment is what parse_event_date cannot read.
-_DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXRTTV,KXVENUEPERFORM,KXCMA,KXMC,KXART"
+# AWARD SHOWS (Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS,
+# KXGRAMMY, KXOSCAR, KXVMA. max 3 markets per event, and do not quote within
+# 1 month of when the event starts"). One series per show, one event per
+# category, ~10 nominee binaries each: KXGGNOM-ANI26-TOY (84th Golden Globe
+# nominations, announced Dec 8 2026), KXNATBOOKAWARDS-FIC26-PARADI (77th
+# National Book Awards, Nov 18 2026), KXGRAMMY-BAMP69-CHA (69th Grammys,
+# Feb 7 2027), KXVMA-ALB26-BRU (2026 VMAs, Sep 27 2026). On 9/25 every one
+# sat on a 3-5 day listing program ($60-100/market); none had been quoted.
+# Exact series: KXGRAMMY and KXVMA are prefixes of dozens of per-category /
+# per-artist strangers (KXGRAMMYNOMSOTY, KXGRAMMYCOUNTSZA, KXVMAPOP ...).
+# The Oscars are the other way round -- no KXOSCAR series exists, the show
+# is a FAMILY of per-category series (KXOSCARPIC-27, KXOSCARINTLFILM-27,
+# 66 in the catalog, all Oscars) -- so KXOSCAR is a PREFIX allow entry
+# (ALLOW_SERIES_PREFIXES) with a family override parent. All five carry
+# the awards rule set registered beside awards_event_start: 3 per event by
+# ROI (EVENT_TOP_N), safe-join (the KXCMA precedent for nominee binaries)
+# and the pre-event stand-down (pre_event_days).
+_DEFAULT_ENTERTAINMENT_SERIES = ("KXRT,KXRTTV,KXVENUEPERFORM,KXCMA,KXMC,KXART,"
+                                 "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA")
 # ROTTEN TOMATOES RELEASE-WEEK STAND-DOWN (Jack 2026-09-24 pm: "stand down
 # KXRT events 7 days before close"). Every KXRT market closes 10:00 ET on
 # the Monday after a Friday release, so close - 7d is 10:00 ET on the Monday
@@ -4345,8 +4387,13 @@ for _s in os.environ.get(
 # IS the allowlist membership (ALLOW_FAMILY_SUFFIXES, the *CC family since
 # 2026-09-10), so no exact list exists to require -- _blocked still wins
 # upstream in _allowed.
+# The Oscar family (2026-09-25): every KXOSCAR<CATEGORY> series inherits
+# the awards guard set registered on "KXOSCAR" (beside awards_event_start),
+# EXCEPT the mention book, which belongs to the mention family's rules.
+OSCAR_FAMILY_RE = re.compile(r"(?!.*MENTION)KXOSCAR[A-Z0-9]*")
 FAMILY_OVERRIDE_PARENTS = (
     ("prefix", "KXAAAGASD", "KXAAAGASD"),
+    ("pattern", OSCAR_FAMILY_RE, "KXOSCAR"),
     ("suffix", "FT", "KXBKFT"),
     ("suffix", "APP", "KXCLAUDEAPP"),
     ("family_suffix", "CC", "KXAMZNCC"),
@@ -4678,6 +4725,8 @@ _CONFIG_CODE_KNOBS = (
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
     "SERIES_BLOCK_PATTERNS", "MARKET_BLOCK_SUFFIXES", "EVENT_BLOCK_PATTERNS",
     "AUCTION_DATE_SERIES", "EVENT_TOP_N",
+    "AWARDS_SERIES", "AWARDS_PRE_EVENT_DAYS", "AWARDS_EVENT_DATES",
+    "AWARDS_TABLE_ONLY_SERIES",
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
@@ -5572,6 +5621,98 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
     return ET.localize(naive).astimezone(timezone.utc)
 
 
+# AWARDS PRE-EVENT STAND-DOWN (Jack 2026-09-25: "allowlist KXGGNOM,
+# KXNATBOOKAWARDS, KXGRAMMY, KXOSCAR, KXVMA. max 3 markets per event, and do
+# not quote within 1 month of when the event starts"). None of these tickers
+# carries a date, and Kalshi's occurrence_datetime is no help on any of them
+# (equal to the close or to the expiration), so the event start comes from,
+# in order:
+#   1. AWARDS_EVENT_DATES -- a hand table of event-ticker globs -> date, for
+#      families whose expected_expiration is a Dec 31 placeholder (the Oscar
+#      family: every KXOSCAR*-27 market expires 2027-12-31). 99th Academy
+#      Awards: ceremony Mar 14 2027, nominations Jan 21 2027 (the Academy's
+#      schedule as reported by Deadline / Screen Daily / The Gold Knight,
+#      Apr 2026). Update yearly; a family year with no entry stands down.
+#   2. Kalshi's occurrence_datetime when it sits >= 60 min before the
+#      expected expiration (a scheduled instant), else the expected
+#      expiration itself -- the end of the ceremony day (Grammys 02-08
+#      04:59Z, VMAs 09-28 03:59Z, National Book Awards 11-19 04:59Z) or the
+#      day after the announcement (Golden Globe nominations 12-09 15:00Z).
+#      A Dec 31 expiration is the placeholder shape and reads as unknown.
+# cutoff = start - AWARDS_PRE_EVENT_DAYS. 31 days is "1 month" measured from
+# an end-of-day expiration: the stand-down begins a full month before the
+# ceremony EVENING (30 would land inside it). No usable start ->
+# RELEASE_GUARD_UNKNOWN (stood down, fail closed, logged once). Applied in
+# apply_series_cutoff_adjustments for both producers and the quote-gaps
+# mirror, never loosening. What this does NOT cover: nominations and
+# finalist announcements that land more than a month before the ceremony
+# (Oscar nominations Jan 21 for Mar 14, Grammy nominations ~Nov 7 for Feb 7,
+# National Book Awards finalists Oct 6 for Nov 18) -- the rule as given is
+# the ceremony, so the bot quotes through those; raise the days or add a
+# nomination-date row to stand down earlier. Knobs: IMM_AWARDS_SERIES,
+# IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES,
+# IMM_AWARDS_TABLE_ONLY_SERIES.
+AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 31.0)
+AWARDS_SERIES = tuple(
+    s.strip() for s in os.environ.get(
+        "IMM_AWARDS_SERIES",
+        "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR").split(",")
+    if s.strip())
+AWARDS_TABLE_ONLY_SERIES = frozenset(
+    s.strip() for s in os.environ.get(
+        "IMM_AWARDS_TABLE_ONLY_SERIES", "KXOSCAR").split(",") if s.strip())
+
+
+def _parse_awards_dates(spec: str) -> Tuple[Tuple[str, datetime], ...]:
+    """'<event-ticker glob>=<YYYY-MM-DD>,...' -> ((glob, 00:00 ET of that
+    day as UTC), ...) in the order given: the first matching glob wins, so
+    a nominations glob must be listed before its family-wide ceremony glob."""
+    out = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        try:
+            glob_s, day = part.split("=")
+            when = datetime.strptime(day.strip(), "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"bad IMM_AWARDS_EVENT_DATES part: {part!r}")
+        out.append((glob_s.strip(), ET.localize(when).astimezone(timezone.utc)))
+    return tuple(out)
+
+
+AWARDS_EVENT_DATES = _parse_awards_dates(os.environ.get(
+    "IMM_AWARDS_EVENT_DATES",
+    "KXOSCARNOM*-27=2027-01-21,KXOSCAR*-27=2027-03-14"))
+
+
+def awards_event_start(event_ticker: str, market: Optional[dict],
+                       dates_only: bool = False) -> Optional[datetime]:
+    """When an award event starts (UTC): the hand table first, then Kalshi's
+    occurrence / expected expiration off the market object unless
+    `dates_only`. None when nothing trustworthy says (the caller fails
+    closed)."""
+    for glob_s, when in AWARDS_EVENT_DATES:
+        if fnmatch.fnmatchcase(event_ticker, glob_s):
+            return when
+    if dates_only or not isinstance(market, dict):
+        return None
+    occ = parse_iso_utc(market.get("occurrence_datetime", ""))
+    exp = parse_iso_utc(market.get("expected_expiration_time", ""))
+    if occ is not None and exp is not None \
+            and occ <= exp - timedelta(minutes=60):
+        start = occ
+    else:
+        start = exp
+    if start is None or (start.month == 12 and start.day == 31):
+        return None          # absent, or Kalshi's year-end placeholder
+    return start
+
+
+for _s in AWARDS_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        safe_join=True, pre_event_days=AWARDS_PRE_EVENT_DAYS,
+        pre_event_dates_only=(_s in AWARDS_TABLE_ONLY_SERIES))
+
+
 def market_data_month(market: Optional[dict]) -> Optional[Tuple[int, int]]:
     """(year, month) of the DATA month a market's text names, or None."""
     if not isinstance(market, dict):
@@ -5656,6 +5797,23 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                     f"DDMMMYY date in {event_ticker} -- standing it down "
                     f"(fail closed)")
         cutoff = ad if cutoff is None else min(cutoff, ad)
+    if ov and ov.pre_event_days is not None:
+        # AWARDS PRE-EVENT STAND-DOWN (2026-09-25, see AWARDS_SERIES): out
+        # pre_event_days before the event's start; no usable start ->
+        # stood down (fail closed), logged once.
+        start = awards_event_start(event_ticker, market,
+                                   ov.pre_event_dates_only)
+        if start is None:
+            pre = RELEASE_GUARD_UNKNOWN
+            if event_ticker not in _release_guard_warned:
+                _release_guard_warned.add(event_ticker)
+                log(f"[IMM] ! {series}: pre-event stand-down needs the event "
+                    f"start but {event_ticker} has no usable date (hand "
+                    f"table, occurrence, expected expiration) -- standing it "
+                    f"down (fail closed)")
+        else:
+            pre = start - timedelta(days=ov.pre_event_days)
+        cutoff = pre if cutoff is None else min(cutoff, pre)
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
