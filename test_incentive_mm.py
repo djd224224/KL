@@ -1045,6 +1045,35 @@ class TestScreen(unittest.TestCase):
             imm.register_close_cutoff_days(7.0, "KXRT")
         self.assertEqual(imm.series_override("KXRT").cutoff_from_close_min,
                          7 * 1440)
+        # KXRTTV, the TV twin (Jack 2026-09-24 pm: "yes quote KXRTTV under
+        # the KXRT rules"): allowed as an exact series, not blocked, not the
+        # scan's, and carrying the SAME 7-day stand-down and nothing else
+        ov_tv = imm.series_override("KXRTTV")
+        self.assertEqual(ov_tv.cutoff_from_close_min, 7 * 1440)
+        self.assertIsNone(ov_tv.levels)
+        self.assertIsNone(ov_tv.max_position)
+        self.assertFalse(ov_tv.safe_join)
+        self.assertEqual(imm.series_max_position("KXRTTV"),
+                         imm.MAX_POSITION_CONTRACTS)
+        self.assertEqual(imm.event_top_n_for("KXRTTV"),
+                         imm.event_top_n_for("KXRT"))
+        self.assertTrue(IncentiveMarketMaker._allowed("KXRTTV-VIS-45"))
+        self.assertFalse(IncentiveMarketMaker._blocked("KXRTTV-VIS-45"))
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            self.assertEqual(imm.scan_universe_reason("KXRTTV-VIS-45"),
+                             "allowed")
+            # exact series: a third RT-named series is nobody's until
+            # enrolled (this class runs with the allowlist off, hence the
+            # pin here)
+            self.assertFalse(IncentiveMarketMaker._allowed("KXRTGAME-X-45"))
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        tv_close = utc(2026, 10, 17, 14, 0)      # VisionQuest, Sat 10:00 ET
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRTTV", "KXRTTV-VIS", None, close_time=tv_close),
+            tv_close - timedelta(days=7))
 
     def test_cutoff_imminent(self):
         self.assertEqual(self.bot._screen(
@@ -1748,8 +1777,10 @@ class TestAllowlist(unittest.TestCase):
                   "KXRTX5090MS-26JUL-0.250"):
             self.assertTrue(b(t), t)
             self.assertFalse(a(t), t)
-        # Rotten Tomatoes scores (undated tickers)
+        # Rotten Tomatoes scores (undated tickers); the TV twin joined
+        # 2026-09-24 pm under the KXRT rules
         self.assertTrue(a("KXRT-DOG-45"))
+        self.assertTrue(a("KXRTTV-VIS-45"))
 
     def test_substring_trap_rejected(self):
         # 'HEGSETH' contains 'ETH' — exact series matching must reject it
@@ -10253,7 +10284,8 @@ class TestOpenScanTier(unittest.TestCase):
         # feed added the same-shape feeds: Vercel AI Gateway share (five
         # members that morning), LMArena, Artificial Analysis,
         # RealClearPolling, Steam top sellers, USGS, Synoptic, tt-series,
-        # Ornn, Rotten Tomatoes / Metacritic.
+        # Ornn, Metacritic. Rotten Tomatoes is NOT one: both RT series are
+        # normal-book allow entries under the KXRT stand-down (below).
         for name, url in (
                 ("OpenRouter - AI Model Rankings",
                  "https://openrouter.ai/rankings#top-models"),
@@ -10268,7 +10300,6 @@ class TestOpenScanTier(unittest.TestCase):
                 ("Synoptic", "https://synopticdata.com/"),
                 ("Ornn", "https://dashboard.ornnai.com/"),
                 ("Ornn data", "https://data.ornn.com/b200"),
-                ("Rotten Tomatoes", "https://www.rottentomatoes.com/tv/x"),
                 ("Metacritic", "https://www.metacritic.com/game/x")):
             self.assertEqual(imm.scan_series_meta_verdict(
                 {"category": "Science and Technology",
@@ -10280,6 +10311,14 @@ class TestOpenScanTier(unittest.TestCase):
                 {"name": "Bureau of Labor Statistics",
                  "url": "https://www.bls.gov/cpi/"}]}),
             (True, "", "Economics"))
+        # Rotten Tomatoes: not a scan keyword (Jack 2026-09-24 pm quotes
+        # KXRT and KXRTTV in the normal book under the release-week
+        # stand-down; a future RT series is enrolled there, not scanned)
+        self.assertEqual(imm.scan_series_meta_verdict(
+            {"category": "Entertainment", "settlement_sources": [
+                {"name": "Rotten Tomatoes",
+                 "url": "https://www.rottentomatoes.com/"}]}),
+            (True, "", "Entertainment"))
         self.assertEqual(imm.series_source_blobs(
             {"settlement_sources": [{"name": "OpenRouter", "url": "https://X"},
                                     "junk", {"name": "", "url": ""}]}),

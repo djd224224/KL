@@ -2742,3 +2742,32 @@ IMM_FORCE_EVENTS (bypasses the floor; precedent KXFSLR) or a min_est_total
 on the KXRAINSBOS archetype -- both are paying collateral for an
 estimated ~$0.10 of reward per market unless the estimator is wrong about
 1c/2c junk counting as qualifying depth (unmeasured for this family).
+
+## 2026-09-24 pm — KXRTTV quoted under the KXRT rules (Jack)
+
+Jack, after "what is KXRTTV": "yes quote KXRTTV under the KXRT rules".
+
+KXRTTV is Kalshi's Rotten Tomatoes series for TELEVISION shows, the twin of
+KXRT (movies): one event per show (KXRTTV-VIS VisionQuest, scores Oct 17;
+-BLA Blade Runner 2099, Nov 28; -HAR Harry Potter and the Philosopher's
+Stone, Dec 28), ~10 Tomatometer-score strikes each, "score above N on
+<date> at 10:00 AM ET", same rottentomatoes.com source. Never in the book:
+3 program events all-time, all paid out, zero positions; KXRT is an exact
+allow entry so KXRTTV was reachable only as an open-scan candidate, and
+the 9/24 pm live-feed sweep had just given the scan a `rottentomatoes`
+keyword to keep it out.
+
+CHANGE: `KXRTTV` added to `_DEFAULT_ENTERTAINMENT_SERIES` (exact series) and
+to the `IMM_KXRT_CUTOFF_SERIES` default ("KXRT,KXRTTV"), so
+`register_close_cutoff_days` gives it the same 7-day release-week
+stand-down and nothing else -- no guard set, no cap, no hour rule, exactly
+KXRT's SeriesOverride. `rottentomatoes` dropped from
+`SCAN_LIVE_SOURCE_KEYWORDS` (inert once KXRTTV is allowed, and misleading:
+RT series are the normal book's call; a future one belongs in the allow
+list + cutoff list, not the scan). imm_quote_gaps gains the series label.
+Tests: test_kxrt_release_week_stand_down covers KXRTTV; the keyword test
+pins RT as NOT a keyword.
+
+WATCH: no live program on any KXRTTV event today, so nothing changes in the
+book until Kalshi funds one; the first sign will be KXRTTV in the
+"selected" log line, quoting until close - 7d.

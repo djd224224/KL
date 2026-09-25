@@ -2734,7 +2734,16 @@ _DEFAULT_ECON_SERIES = (
 #     end. The score drifts publicly as reviews land rather than jumping on
 #     a private reveal, which is the property that makes it quotable.
 # Both are undated tickers, so both join the guard set below.
-_DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXVENUEPERFORM,KXCMA,KXMC"
+# KXRTTV (Jack 2026-09-24 pm: "yes quote KXRTTV under the KXRT rules"): the
+# TELEVISION twin of KXRT -- one event per show (KXRTTV-VIS, -BLA, -HAR),
+# ~10 Tomatometer-score strikes each, "score above N on <date> 10:00 ET",
+# same rottentomatoes.com source. It rides every KXRT rule and nothing
+# else: this allow entry (exact series; the KXRT entry never matched it)
+# and the 7-day release-week stand-down registered below (IMM_KXRT_CUTOFF_
+# SERIES). No guard-set membership, no cap, no hour rule -- exactly KXRT.
+# Never funded since the 9/5 scan opened (3 program events all-time, all
+# paid out), zero positions; it was reachable only as a scan candidate.
+_DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXRTTV,KXVENUEPERFORM,KXCMA,KXMC"
 # ROTTEN TOMATOES RELEASE-WEEK STAND-DOWN (Jack 2026-09-24 pm: "stand down
 # KXRT events 7 days before close"). Every KXRT market closes 10:00 ET on
 # the Monday after a Friday release, so close - 7d is 10:00 ET on the Monday
@@ -2779,9 +2788,12 @@ def register_close_cutoff_days(days: float, series_csv: str) -> None:
             SERIES_OVERRIDES[s] = replace(prior, cutoff_from_close_min=mins)
 
 
+# KXRTTV joined the list 2026-09-24 pm ("under the KXRT rules"): a TV
+# show's score date is set the same way, and the reviews land the same
+# week, so the same stand-down applies. One env knob for both.
 register_close_cutoff_days(
     KXRT_CUTOFF_BEFORE_CLOSE_DAYS,
-    os.environ.get("IMM_KXRT_CUTOFF_SERIES", "KXRT"))
+    os.environ.get("IMM_KXRT_CUTOFF_SERIES", "KXRT,KXRTTV"))
 # Weather series allowed IN CODE (Jack 2026-09-10 "allowlist KXRAINWKND in
 # IMM bot, but only quote until the cutoff"): the weekend rain family — see
 # its SERIES_OVERRIDES entry beside the rain loop for the ticker-date
@@ -3571,12 +3583,17 @@ SCAN_LIVE_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
     # Artificial Analysis benchmarks, the RealClearPolling average,
     # Steam's top-sellers chart, USGS quake feed (KXBIGGESTQUAKE is a
     # running max), Synoptic obs (hourly temp), tt-series (table tennis
-    # results), Ornn GPU prints, Rotten Tomatoes / Metacritic scores (the
-    # KXRT / KXMC entries are the NORMAL book's, judged by Jack; this keeps
-    # a look-alike -- KXRTTV -- out of the scan).
+    # results), Ornn GPU prints, Metacritic scores (KXMC is the NORMAL
+    # book's, judged by Jack; the keyword keeps a look-alike out of the
+    # scan). Rotten Tomatoes is deliberately NOT a keyword (added, then
+    # dropped the same evening): both RT series, KXRT and KXRTTV, are
+    # normal-book allow entries under the KXRT release-week stand-down
+    # (Jack 2026-09-24 pm "quote KXRTTV under the KXRT rules"), so a future
+    # RT series belongs in _DEFAULT_ENTERTAINMENT_SERIES + IMM_KXRT_CUTOFF_
+    # SERIES, not in the scan tier either way.
     "openrouter,vercel.com,arena.ai,artificialanalysis,realclearpolling,"
     "steampowered,usgs.gov,synopticdata,tt-series,ornnai.com,data.ornn.com,"
-    "rottentomatoes,metacritic,"
+    "metacritic,"
     "polymarket").split(",") if k.strip())
 # LIVE-FEED RULE, prong B (Jack 2026-09-24, same breath: "... and the
 # market resolution overlaps entirely or almost entirely with the incentive

@@ -284,6 +284,7 @@ _FAMILY = {
     "KXSCFI": "Shanghai container freight index",
     "KXTRUEV": "Truflation EV commodity index, daily print",
     "KXRT": "Rotten Tomatoes critic score",
+    "KXRTTV": "Rotten Tomatoes critic score (TV series)",
     "KXBKFT": "Burger King monthly foot traffic",
     "KXYUMTBFT": "Taco Bell monthly foot traffic",
     "KXAQICITY": "Air-quality index reading",
