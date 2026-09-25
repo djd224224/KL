@@ -1075,6 +1075,88 @@ class TestScreen(unittest.TestCase):
             "KXRTTV", "KXRTTV-VIS", None, close_time=tv_close),
             tv_close - timedelta(days=7))
 
+    def test_kxart_auction_day_cutoff_and_three_per_event(self):
+        # Jack 2026-09-25: "allowlist KXART, max 3 markets per event".
+        # KXART-SOT10107OCT26 = Sotheby's lot 101, live auction beginning
+        # Oct 7 2026 11:00 ET, close Oct 8 14:00Z, occurrence = close.
+        ev = "KXART-SOT10107OCT26"
+        close = utc(2026, 10, 8, 14, 0)
+        sale_midnight = utc(2026, 10, 7, 4, 0)       # 00:00 ET, EDT
+        # the trailing DDMMMYY is invisible to the ordinary date rule, so
+        # without the auction rule the bot would quote through the hammer
+        self.assertIsNone(imm.parse_event_date(ev))
+        self.assertIsNone(imm.trade_cutoff_utc(ev, close, close))
+        self.assertEqual(imm.auction_event_date(ev), sale_midnight)
+        self.assertEqual(imm.auction_event_date("KXART-SOT110707OCT26"),
+                         sale_midnight)                 # 4-digit lot
+        self.assertEqual(imm.auction_event_date("KXART-CHR1201DEC26"),
+                         utc(2026, 12, 1, 5, 0))        # EST, other house
+        for bad in ("KXART-SOTHEBYS", "KXART-SOT10132OCT26",
+                    "KXART-SOT10107XXX26", "KXART"):
+            self.assertIsNone(imm.auction_event_date(bad), bad)
+        # the shared tightener (both producers + the quote-gaps mirror)
+        # anchors on the sale day and never loosens an earlier cutoff
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXART", ev, None, close_time=close), sale_midnight)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXART", ev, sale_midnight - timedelta(days=2), close_time=close),
+            sale_midnight - timedelta(days=2))
+        # unreadable segment: stood down, fail closed
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXART", "KXART-SOTHEBYS", None, close_time=close),
+            imm.RELEASE_GUARD_UNKNOWN)
+        # other series never see the rule
+        self.assertIsNone(imm.apply_series_cutoff_adjustments(
+            "KXRT", "KXRT-HEA", None, close_time=None))
+        with mock.patch.object(imm, "AUCTION_DATE_SERIES", frozenset()):
+            self.assertIsNone(imm.apply_series_cutoff_adjustments(
+                "KXART", ev, None, close_time=close))
+        # screen: quotable the evening before, out from midnight ET
+        m = _meta(ticker=f"{ev}-30000", event_ticker=ev, series="KXART",
+                  close_time=close, cutoff=sale_midnight)
+        self.assertIsNone(self.bot._screen(m, sale_midnight - timedelta(hours=6)))
+        self.assertEqual(self.bot._screen(m, sale_midnight + timedelta(hours=1)),
+                         "cutoff")
+        self.assertEqual(self.bot._screen(m, sale_midnight + timedelta(hours=1),
+                                          member=True), "cutoff")
+        # allowed as an EXACT series; the twenty KXART*-prefixed series
+        # (artist streams, Artemis, arctic ice) are nobody's
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            self.assertTrue(IncentiveMarketMaker._allowed(f"{ev}-30000"))
+            self.assertFalse(IncentiveMarketMaker._blocked(f"{ev}-30000"))
+            self.assertEqual(imm.scan_universe_reason(f"{ev}-30000"), "allowed")
+            for t in ("KXARTISTSTREAMS-26SEP28-T1", "KXARTEMISII-26DEC31-T1",
+                      "KXARTICICE-26SEP30-T4"):
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        # max 3 markets per event, by ROI, EXACT series (a prefix entry
+        # would have capped KXARTISTSTREAMS the day the scan admitted one)
+        self.assertEqual(imm.event_top_n_for("KXART"), 3)
+        for s in ("KXARTISTSTREAMS", "KXARTEMISII", "KXARTICICE", "KXRT"):
+            self.assertEqual(imm.event_top_n_for(s), 0, s)
+
+        def lot(strike, est):
+            return imm.MarketMeta(
+                ticker=f"{ev}-{strike}", event_ticker=ev, series="KXART",
+                dollars_per_day=20.0, program_end=None, target_size=1000,
+                discount_factor=0.5, cutoff=sale_midnight, close_time=close,
+                est_dollars_per_day=est, est_exposure_dollars=10.0)
+        lots = [lot(30000 + 10000 * i, est)
+                for i, est in enumerate((2.0, 3.0, 1.0, 4.0, 0.5, 2.5, 0.2,
+                                         1.5, 0.1))]
+        cut = imm.event_top_n_cut(lots, incumbent=set())
+        self.assertEqual(len(cut), 6)
+        self.assertEqual({m.ticker for m in lots} - cut,
+                         {f"{ev}-60000", f"{ev}-40000", f"{ev}-80000"})
+        # no other override: no cap, no safe-join, no hour rule
+        ov = imm.series_override("KXART")
+        self.assertTrue(ov is None or (ov.max_position is None
+                                       and not ov.safe_join
+                                       and ov.cutoff_from_close_min is None))
+
     def test_cutoff_imminent(self):
         self.assertEqual(self.bot._screen(
             _meta(cutoff=self.now + timedelta(minutes=2)), self.now), "cutoff")
@@ -1781,6 +1863,8 @@ class TestAllowlist(unittest.TestCase):
         # 2026-09-24 pm under the KXRT rules
         self.assertTrue(a("KXRT-DOG-45"))
         self.assertTrue(a("KXRTTV-VIS-45"))
+        # Sotheby's lot prices (Jack 2026-09-25 "allowlist KXART")
+        self.assertTrue(a("KXART-SOT10107OCT26-30000"))
 
     def test_substring_trap_rejected(self):
         # 'HEGSETH' contains 'ETH' — exact series matching must reject it
@@ -3089,6 +3173,12 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # a group at/below N is never touched
         self.assertEqual(imm.event_top_n_cut(gas[:3], set()), set())
         # env spec sanity
+        # exact-match form (2026-09-25, KXART): longest-first sort keeps
+        # it beside the prefix/suffix forms; a bare '=' is rejected
+        self.assertEqual(imm._parse_event_top_n("=KXART:3,*CC:3"),
+                         (("=KXART", 3), ("*CC", 3)))
+        with self.assertRaises(ValueError):
+            imm._parse_event_top_n("=:3")
         self.assertEqual(imm._parse_event_top_n("KXAAAGAS:3,KXDIESEL:2"),
                          (("KXAAAGAS", 3), ("KXDIESEL", 2)))
         with self.assertRaises(ValueError):

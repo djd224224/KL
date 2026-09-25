@@ -1626,16 +1626,19 @@ MAX_MARKETS = _env_int("IMM_MAX_MARKETS", 35)   # max distinct EVENTS quoted at
 # still apply on top).
 def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
     """'<pattern>:<N>,...' -> ((pattern, N), ...) longest pattern first. A
-    pattern is a series-name PREFIX, or a SUFFIX when it starts with '*'
+    pattern is a series-name PREFIX, a SUFFIX when it starts with '*'
     ('*CC:3' = every series ending in CC — the Carbon Arc credit-card
     family, Jack 2026-09-10: "just quote max 3 markets per event, based on
-    ROI, for CC family")."""
+    ROI, for CC family"), or an EXACT series name when it starts with '='
+    ('=KXART:3', 2026-09-25: KXART is a prefix of twenty unrelated series,
+    so a prefix entry would have capped KXARTISTSTREAMS and KXARTEMISII the
+    day the scan admitted one)."""
     out = []
     for part in (p.strip() for p in spec.split(",") if p.strip()):
         try:
             prefix, n_s = part.split(":")
             prefix = prefix.strip()
-            if not prefix or prefix == "*":
+            if not prefix or prefix in ("*", "="):
                 raise ValueError
             out.append((prefix, int(n_s)))
         except ValueError:
@@ -1664,7 +1667,10 @@ _RAMP_EVENT_TOP_N_SPEC = (
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "KXAAAGAS:3,KXDIESEL:3,"
                                                 "KXTRUEV:3,*CC:3,"
-                                                "*ADS:3,*POS:3"
+                                                "*ADS:3,*POS:3,"
+                                                # exact: KXART is a prefix
+                                                # of 20 unrelated series
+                                                "=KXART:3"
                                                 + _RAMP_EVENT_TOP_N_SPEC))
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
@@ -1747,6 +1753,9 @@ def event_top_n_for(series: str) -> int:
     for _pat, _n in EVENT_TOP_N:
         if _pat.startswith("*"):
             if series.endswith(_pat[1:]):
+                return max(0, _n)
+        elif _pat.startswith("="):
+            if series == _pat[1:]:
                 return max(0, _n)
         elif series.startswith(_pat):
             return max(0, _n)
@@ -2743,7 +2752,20 @@ _DEFAULT_ECON_SERIES = (
 # SERIES). No guard-set membership, no cap, no hour rule -- exactly KXRT.
 # Never funded since the 9/5 scan opened (3 program events all-time, all
 # paid out), zero positions; it was reachable only as a scan candidate.
-_DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXRTTV,KXVENUEPERFORM,KXCMA,KXMC"
+# KXART (Jack 2026-09-25: "allowlist KXART, max 3 markets per event"):
+# Sotheby's live-auction lot sale prices -- one event per lot,
+# KXART-SOT10107OCT26 = lot 101 of the sale beginning Oct 7 2026 11:00 ET,
+# 9 "greater" strikes on the sold price ($30K ... $500K), close Oct 8
+# 14:00Z, Kalshi occurrence = close. On 9/25: 11 lots (Alma Thomas,
+# Alexander Calder), ~$45/market on a 2-day listing program (9/25 00:02Z ->
+# 9/27 03:59Z), never quoted, zero positions. Exact series -- KXART is a
+# prefix of twenty unrelated series (KXARTISTSTREAMS*, KXARTISTCOLLAB*,
+# KXARTEMISII, KXARTICICE), none of which rides in. Two rules of its own:
+# the 3-per-event ROI cap (EVENT_TOP_N "=KXART:3", the exact-match form
+# added for it) and the AUCTION-DAY CUTOFF (AUCTION_DATE_SERIES): the hammer
+# is the reveal, a day before the close, and the trailing DDMMMYY in the
+# event segment is what parse_event_date cannot read.
+_DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXRTTV,KXVENUEPERFORM,KXCMA,KXMC,KXART"
 # ROTTEN TOMATOES RELEASE-WEEK STAND-DOWN (Jack 2026-09-24 pm: "stand down
 # KXRT events 7 days before close"). Every KXRT market closes 10:00 ET on
 # the Monday after a Friday release, so close - 7d is 10:00 ET on the Monday
@@ -4655,6 +4677,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
     "SERIES_BLOCK_PATTERNS", "MARKET_BLOCK_SUFFIXES", "EVENT_BLOCK_PATTERNS",
+    "AUCTION_DATE_SERIES", "EVENT_TOP_N",
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
@@ -5505,6 +5528,49 @@ _MONTH_NUM = {m: i for i, m in enumerate(
 RELEASE_GUARD_UNKNOWN = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _release_guard_warned: Set[str] = set()
 
+# AUCTION-DAY CUTOFF (Jack 2026-09-25: "allowlist KXART, max 3 markets per
+# event"). A KXART market settles on the hammer price of one Sotheby's lot
+# "during the live auction beginning October 7, 2026 at 11:00 AM"; the
+# result is on sothebys.com within minutes of the hammer, a full day before
+# the market's Oct 8 14:00Z close, and Kalshi's occurrence_datetime is the
+# close itself -- no help. The auction date sits at the END of the event
+# segment as DDMMMYY, glued to the lot number (KXART-SOT101|07OCT26), which
+# parse_event_date's leading-YYMMMDD rule cannot read: trade_cutoff_utc
+# returns None and the bot would quote straight through the sale and the
+# day after it. auction_event_date reads the trailing date; the cutoff is
+# 00:00 ET on auction day -- the midnight-before rule every day-dated
+# ticker already gets (the sale starts 11:00 ET) -- applied in
+# apply_series_cutoff_adjustments for BOTH producers and the quote-gaps
+# mirror, never loosening an earlier cutoff. An event whose segment does
+# not parse gets RELEASE_GUARD_UNKNOWN (stood down, fail closed), logged
+# once. Env IMM_AUCTION_DATE_SERIES (comma list); empty disables the rule,
+# which means quoting through the hammer -- do not.
+AUCTION_DATE_SERIES = frozenset(
+    s.strip() for s in os.environ.get(
+        "IMM_AUCTION_DATE_SERIES", "KXART").split(",") if s.strip())
+_AUCTION_SEG_RE = re.compile(r"^[A-Z]+\d*?(\d{2})([A-Z]{3})(\d{2})$")
+
+
+def auction_event_date(event_ticker: str) -> Optional[datetime]:
+    """00:00 ET (as UTC) of the auction day embedded at the END of a
+    KXART-style event segment: 'KXART-SOT10107OCT26' -> 2026-10-07. None
+    when the segment carries no trailing DDMMMYY or the date is invalid."""
+    parts = event_ticker.split("-")
+    if len(parts) < 2:
+        return None
+    m = _AUCTION_SEG_RE.match(parts[1])
+    if not m:
+        return None
+    dd, mon, yy = m.groups()
+    month = _MONTHS.get(mon)
+    if month is None:
+        return None
+    try:
+        naive = datetime(2000 + int(yy), month, int(dd))
+    except ValueError:
+        return None
+    return ET.localize(naive).astimezone(timezone.utc)
+
 
 def market_data_month(market: Optional[dict]) -> Optional[Tuple[int, int]]:
     """(year, month) of the DATA month a market's text names, or None."""
@@ -5577,6 +5643,19 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         else:
             guard = release_guard_cutoff(ym[0], ym[1], ov.release_guard_day)
         cutoff = guard if cutoff is None else min(cutoff, guard)
+    if series in AUCTION_DATE_SERIES:
+        # AUCTION-DAY CUTOFF (2026-09-25, see AUCTION_DATE_SERIES): out at
+        # 00:00 ET on the sale day read from the event segment's trailing
+        # DDMMMYY; unreadable -> stood down (fail closed), logged once.
+        ad = auction_event_date(event_ticker)
+        if ad is None:
+            ad = RELEASE_GUARD_UNKNOWN
+            if event_ticker not in _release_guard_warned:
+                _release_guard_warned.add(event_ticker)
+                log(f"[IMM] ! {series}: auction-day cutoff needs a trailing "
+                    f"DDMMMYY date in {event_ticker} -- standing it down "
+                    f"(fail closed)")
+        cutoff = ad if cutoff is None else min(cutoff, ad)
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)

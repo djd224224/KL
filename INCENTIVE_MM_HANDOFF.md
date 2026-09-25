@@ -2771,3 +2771,46 @@ pins RT as NOT a keyword.
 WATCH: no live program on any KXRTTV event today, so nothing changes in the
 book until Kalshi funds one; the first sign will be KXRTTV in the
 "selected" log line, quoting until close - 7d.
+
+## 2026-09-25 — KXART (Sotheby's lot prices) allowlisted, 3 per event, out at midnight before the sale (Jack)
+
+Jack: "allowlist KXART, max 3 markets per event".
+
+WHAT IT IS: Kalshi's Sotheby's live-auction series -- one event per lot,
+KXART-SOT10107OCT26 = lot 101 of the sale beginning Oct 7 2026 at 11:00 AM
+ET ("If the lot sold price of Opus III (lot 101) by Alma Thomas on Sotheby's
+is above $30K during the live auction beginning October 7, 2026 at 11:00
+AM"), 9 "greater" strikes per lot ($30K ... $500K), close Oct 8 14:00Z,
+occurrence_datetime = close. On 9/25: 11 lots (Alma Thomas, Alexander
+Calder), ~$45/market on a 2-day listing program (9/25 00:02Z -> 9/27
+03:59Z, ~$21/market/day), never quoted, zero positions, no scan verdict.
+
+THREE MECHANISMS:
+1. `KXART` in `_DEFAULT_ENTERTAINMENT_SERIES` (exact series). KXART is a
+   PREFIX of twenty unrelated series (KXARTISTSTREAMS*, KXARTISTCOLLAB*,
+   KXARTEMISII, KXARTICICE); the allowlist is exact so none ride in.
+2. Per-event cap: EVENT_TOP_N gained an EXACT-match form, `=KXART:3`
+   (`_parse_event_top_n` / `event_top_n_for`), because the prefix form
+   would have capped KXARTISTSTREAMS etc. the day the scan admitted one.
+   ROI-ranked, sticky slots, lifetime ledger -- the CC/gas semantics.
+3. AUCTION-DAY CUTOFF (`AUCTION_DATE_SERIES`, env IMM_AUCTION_DATE_SERIES,
+   default KXART): the hammer IS the reveal, a day before the close, and
+   the auction date sits at the END of the event segment as DDMMMYY glued
+   to the lot number (SOT101|07OCT26), which parse_event_date's
+   leading-YYMMMDD rule cannot read -- trade_cutoff_utc returned None, so
+   without this the bot would have quoted through the sale and the day
+   after. `auction_event_date` reads the trailing date; the cutoff is 00:00
+   ET on sale day (the midnight-before rule every dated ticker gets),
+   applied in apply_series_cutoff_adjustments for BOTH producers and the
+   quote-gaps mirror, never loosening. Unreadable segment ->
+   RELEASE_GUARD_UNKNOWN (stood down, fail closed), logged once. Today's
+   program ends 9/27, ten days before the sale, so the cutoff is inert
+   until Kalshi renews the pools into October.
+
+No safe-join, no cap, no hour rule -- KXRT's shape. Both knobs are in the
+config hash. imm_quote_gaps labels the series.
+
+Tests: test_kxart_auction_day_cutoff_and_three_per_event (date parse incl.
+4-digit lot / other house / EST, tightener never loosens, fail-closed,
+kill switch, screen, exact allow vs the KXART* near misses, exact cap
+form, 9-lot ROI cut keeps 3), parser test for '=' form; suite green.
