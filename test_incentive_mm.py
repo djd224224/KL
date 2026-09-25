@@ -999,6 +999,53 @@ class TestScreen(unittest.TestCase):
         self.assertEqual(self.bot._screen(
             _meta(cutoff=self.now - timedelta(hours=1)), self.now), "cutoff")
 
+    def test_kxrt_release_week_stand_down(self):
+        # Jack 2026-09-24 pm: "stand down KXRT events 7 days before close".
+        ov = imm.series_override("KXRT")
+        self.assertEqual(ov.cutoff_from_close_min, 7 * 1440)
+        # nothing else about KXRT changes: no ladder/cap/band/safe-join
+        self.assertIsNone(ov.levels)
+        self.assertIsNone(ov.max_position)
+        self.assertIsNone(ov.price_min_cents)
+        self.assertFalse(ov.safe_join)
+        self.assertEqual(imm.series_max_position("KXRT"),
+                         imm.MAX_POSITION_CONTRACTS)
+        # the other entertainment series keep their cutoff-less life
+        for s in ("KXMC", "KXCMA", "KXVENUEPERFORM"):
+            self.assertIsNone(imm.series_override(s).cutoff_from_close_min, s)
+        close = utc(2026, 9, 28, 14, 0)          # Mon 10:00 ET (HEA/FOR/PRI)
+        stop = close - timedelta(days=7)         # Mon 9/21 10:00 ET
+        # the shared tightener (both producers) anchors on the close ...
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRT", "KXRT-HEA", None, close_time=close), stop)
+        # ... and never loosens an earlier cutoff
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRT", "KXRT-HEA", stop - timedelta(days=2), close_time=close),
+            stop - timedelta(days=2))
+        # screen: inside the last 7 days -> cutoff, member or not;
+        # half a day before the stop -> quotable
+        m = _meta(ticker="KXRT-HEA-75", event_ticker="KXRT-HEA",
+                  series="KXRT", close_time=close, cutoff=stop)
+        self.assertEqual(self.bot._screen(m, stop + timedelta(hours=1)),
+                         "cutoff")
+        self.assertEqual(self.bot._screen(m, stop + timedelta(hours=1),
+                                          member=True), "cutoff")
+        self.assertIsNone(self.bot._screen(m, stop - timedelta(hours=12)))
+        # the accrual horizon ends at the stand-down, not the close
+        self.assertAlmostEqual(
+            imm._quotable_days(m, stop - timedelta(days=1)), 1.0, places=6)
+        # kill switch: 0 days removes the rule and nothing else; re-arming
+        # restores it
+        imm.register_close_cutoff_days(0, "KXRT")
+        try:
+            self.assertIsNone(imm.series_override("KXRT").cutoff_from_close_min)
+            self.assertIsNone(imm.apply_series_cutoff_adjustments(
+                "KXRT", "KXRT-HEA", None, close_time=close))
+        finally:
+            imm.register_close_cutoff_days(7.0, "KXRT")
+        self.assertEqual(imm.series_override("KXRT").cutoff_from_close_min,
+                         7 * 1440)
+
     def test_cutoff_imminent(self):
         self.assertEqual(self.bot._screen(
             _meta(cutoff=self.now + timedelta(minutes=2)), self.now), "cutoff")

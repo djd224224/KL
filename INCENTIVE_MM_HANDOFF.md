@@ -2420,3 +2420,69 @@ fresh candidates reject as payout_floor. Both are the intended direction.
 Tests: test_late_month_stop_is_the_last_five_days_of_the_month (26th
 00:00 ET, no-prior-cutoff, never loosens, non-Carbon-Arc / unknown /
 undated untouched, kill switch); 605 green.
+
+## 2026-09-24 pm — KXRT: stand down every Rotten Tomatoes event 7 days before close (Jack)
+
+Jack: "seems im getting picked off on Rotten Tomatoes markets in the past
+few days, why?" -> "is the release day trackable for each movie?" ->
+"stand down KXRT events 7 days before close".
+
+WHY (measured from fills_*.jsonl vs the 5-min marks, 9/16-9/24): 1,137
+KXRT fills / 26k contracts / ~$12.4k at risk, all our own resting orders;
+mark-out -$589 at 1h / -$769 at 6h (-2.9c per contract, the worst family
+in the book by dollars); realized -$346 since 9/11 plus -$483 open MTM
+against ~$1,105 of estimated reward (credits landed ~$697 for 9/17-9/22).
+By days-to-close at fill time: est reward >14d $737 / 7-14d $192 / 4-7d
+$152 / 2-4d $71 / 0-2d $23 versus 6h mark-out -$260 / -$151 / -$244 /
+-$48 / -$63 -- the last week earns ~21% of the reward and takes ~46% of
+the loss. Every KXRT market closes 10:00 ET on the Monday after a Friday
+release (close - 3d = release day, verified on all 42 titles; Kalshi
+exposes no release field, occurrence_datetime = close_time). Review
+embargoes lift Mon-Thu of release week (Heart of the Beast Tue 9/22 09:03
+ET: 74 contracts sold at 51-55c across four strikes, 96c by the weekend;
+Forgotten Island Thu 9/24 16:39 ET: a 100-lot bid at 37c, resting 6-9
+ticks under the touch at the top-200-contract reference, swept as the
+touch went 44 -> 29) and the score keeps drifting as reviews land (HEA
+96%/25 reviews on 9/22 -> 89%/94 reviews on 9/24): >=10c five-minute
+jumps explain -$145 of the marked loss, small moves -$412. Public trade
+history of the 23 settled titles: the event only settles within 10c the
+weekend AFTER release, so the stand-down runs through the close. KXRT had
+NO SeriesOverride at all (not in IMM_UNDATED_GUARD_SERIES: no safe-join,
+no cutoff, no hour rule) and the 0-9 ET x2 doubled rungs in the hours
+reviews drop (29% of contracts, 49% of the 6h loss).
+
+RULE: KXRT_CUTOFF_BEFORE_CLOSE_DAYS = 7 (env IMM_KXRT_CUTOFF_BEFORE_CLOSE_DAYS,
+0 = off; series list IMM_KXRT_CUTOFF_SERIES, default KXRT).
+register_close_cutoff_days() sets SERIES_OVERRIDES["KXRT"] =
+SeriesOverride(cutoff_from_close_min=10080), keeping any other override
+field (the kill switch clears just this one). It rides the existing
+close-anchored machinery: both cutoff producers (refresh_universe and the
+orphan restore) and the imm_quote_gaps mirror compute cutoff = close_time
+- 7d, _screen returns "cutoff" from then on (members and candidates
+alike), quotes are cancelled, positions ride to settlement (the 9/07
+dropped-markets-carry-no-orders rule), nothing re-enters. _quotable_days
+ends at the cutoff, so the $1.50 floor is judged on the shorter window.
+Nothing else about KXRT changes (ladder, 150 cap, band, no safe-join).
+
+DEPLOY (9/25 01:44Z, in-place edit -> source-mtime clean exit 01:44:30Z ->
+launcher relaunch): Heart of the Beast, Forgotten Island, Primetime (close
+Mon 9/28) are past the stop and cut off on the first refresh; their
+inventory (HEA-75/-70 short at 44-51c, FOR-97/-98 long at 25-41c, ...)
+rides to Monday's settlement. Next stops: Digger + Verity Mon 9/28 10:00
+ET; Social Reckoning + Other Mommy 10/5; You Can See Everything /
+Whalefall / Sense and Sensibility / Street Fighter 10/12; Wildwood +
+Clayface 10/19; Godzilla Minus Zero + Wild Horse Nine 11/2; I Play Rocky
++ Hunger Games 11/16; Avengers + Dune 12/14.
+
+NOT COVERED: festival reveals (Digger revealed 9/22 for a 10/2 release;
+Sense and Sensibility drifted 65c -> 7c from 9/19 for 10/16) land weeks
+before release. A direct reveal tracker is feasible -- the
+rottentomatoes.com/m/<slug> page renders "Tomatometer NN% based on N
+Reviews" plus the release date in plain text (slug ambiguity for generic
+titles, scraping fragility) -- or the in-market IMM_EVENT_DEPTH_SERIES
+gate (jump confirm / fill tripwire; KXRT tickers are undated so the
+date-arm never suppresses it), untested on KXRT.
+
+Tests: test_kxrt_release_week_stand_down (override registered, nothing
+else changed, tightener anchors on close and never loosens, screen inside
+vs outside the window, quotable-days horizon, kill switch); 606 green.

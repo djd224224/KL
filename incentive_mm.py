@@ -2525,6 +2525,53 @@ _DEFAULT_ECON_SERIES = (
 #     a private reveal, which is the property that makes it quotable.
 # Both are undated tickers, so both join the guard set below.
 _DEFAULT_ENTERTAINMENT_SERIES = "KXRT,KXVENUEPERFORM,KXCMA,KXMC"
+# ROTTEN TOMATOES RELEASE-WEEK STAND-DOWN (Jack 2026-09-24 pm: "stand down
+# KXRT events 7 days before close"). Every KXRT market closes 10:00 ET on
+# the Monday after a Friday release, so close - 7d is 10:00 ET on the Monday
+# OF release week. Measured 9/16-9/24 (fills vs 5-min marks, 6h mark-out by
+# days-to-close at fill time): >14d -$260 / 7-14d -$151 / 4-7d -$244 /
+# 2-4d -$48 / 0-2d -$63, against est reward $737 / $192 / $152 / $71 / $23:
+# the last week earns ~21% of the reward and takes ~46% of the loss. Review
+# embargoes lift Mon-Thu of release week (Heart of the Beast Tue 9/22
+# 09:03 ET: 74 sold at 51-55c, 96c by the weekend; Forgotten Island Thu
+# 9/24) and the score keeps drifting as reviews land, so the public trade
+# history of the 23 settled titles only settles within 10c the weekend
+# AFTER release -- the stand-down must run through the close. Festival
+# reveals (Digger 9/22 for a 10/2 release, Sense and Sensibility from 9/19
+# for 10/16) land weeks early and are NOT covered by a date rule.
+#
+# MECHANISM: the existing close-anchored cutoff (cutoff_from_close_min),
+# registered here for KXRT. Both producers (refresh_universe and the
+# orphan restore) and the imm_quote_gaps mirror compute cutoff =
+# close_time - N; _screen returns "cutoff" from then on: quotes are
+# cancelled, positions ride to settlement (the 9/07 dropped-markets-carry-
+# no-orders rule) and nothing re-enters. _quotable_days ends at the cutoff
+# too, so the $1.50 floor is judged on the shorter window (a market with
+# 8 days to close has 1 quotable day left). Kill switch:
+# IMM_KXRT_CUTOFF_BEFORE_CLOSE_DAYS=0 (env change = task-level restart).
+KXRT_CUTOFF_BEFORE_CLOSE_DAYS = _env_float("IMM_KXRT_CUTOFF_BEFORE_CLOSE_DAYS", 7.0)
+
+
+def register_close_cutoff_days(days: float, series_csv: str) -> None:
+    """(Re)register a close-anchored stand-down of `days` before close on
+    every series in `series_csv`, keeping whatever else its override says.
+    days <= 0 removes just that rule (the kill switch)."""
+    for _s in series_csv.split(","):
+        s = _s.strip()
+        if not s:
+            continue
+        prior = SERIES_OVERRIDES.get(s)
+        mins = int(round(days * 1440)) if days > 0 else None
+        if prior is None:
+            if mins is not None:
+                SERIES_OVERRIDES[s] = SeriesOverride(cutoff_from_close_min=mins)
+        else:
+            SERIES_OVERRIDES[s] = replace(prior, cutoff_from_close_min=mins)
+
+
+register_close_cutoff_days(
+    KXRT_CUTOFF_BEFORE_CLOSE_DAYS,
+    os.environ.get("IMM_KXRT_CUTOFF_SERIES", "KXRT"))
 # Weather series allowed IN CODE (Jack 2026-09-10 "allowlist KXRAINWKND in
 # IMM bot, but only quote until the cutoff"): the weekend rain family — see
 # its SERIES_OVERRIDES entry beside the rain loop for the ticker-date
