@@ -11106,6 +11106,45 @@ class TestFamilySourceVerdicts(unittest.TestCase):
         self.assertIs(imm.scale_levels(lv, 1.0), lv)
         self.assertEqual(imm.scale_levels(lv, 0.0), [])          # a blocked side
 
+    def test_late_month_stop_is_the_last_five_days_of_the_month(self):
+        # Jack 2026-09-24 pm: "stop quoting entirely in the last 5 days OF
+        # THE MONTH" -> the cutoff is capped at 00:00 ET on the 26th of the
+        # measurement month (Sep 26 for the 26OCT07 prints) and, being
+        # terminal, keeps the bot out through the print. Both cutoff
+        # producers run apply_series_cutoff_adjustments, so testing the
+        # tightener covers refresh_universe and the orphan restore alike.
+        imm.FAMILY_VERDICTS["KXFAKECC"] = {"carbon_arc": True, "ts": 1.0, "title": ""}
+        imm.FAMILY_VERDICTS["KXSWIFTFT"] = {"carbon_arc": False, "ts": 1.0, "title": ""}
+        self.assertEqual(imm.CA_LATE_STOP_DAYS, 5)
+        ev, close = "KXFAKECC-26OCT07", utc(2026, 10, 7, 2, 29)
+        midnight_print_day = utc(2026, 10, 7, 4, 0)          # the ticker-date rule
+        stop = imm.ca_stop_utc(ev)
+        self.assertEqual(stop.astimezone(imm.ET).strftime("%Y-%m-%d %H:%M"),
+                         "2026-09-26 00:00")
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXFAKECC", ev, midnight_print_day, close_time=close), stop)
+        # no prior cutoff at all still stops
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXFAKECC", ev, None, close_time=close), stop)
+        # never loosens an earlier cutoff
+        earlier = utc(2026, 9, 20, 12, 0)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXFAKECC", ev, earlier, close_time=close), earlier)
+        # the 14-day size window still starts on the 17th
+        self.assertEqual(imm.ca_late_window_start(ev).astimezone(imm.ET)
+                         .strftime("%Y-%m-%d %H:%M"), "2026-09-17 00:00")
+        # not Carbon Arc (a *FT chart series), unknown series, undated: untouched
+        for s, e in (("KXSWIFTFT", "KXSWIFTFT-26OCT08"), ("KXGOOD", "KXGOOD-26OCT07"),
+                     ("KXFAKECC", "KXFAKECC-DOG")):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                s, e, midnight_print_day, close_time=close), midnight_print_day, s)
+        # kill switch
+        with mock.patch.object(imm, "CA_LATE_STOP_DAYS", 0):
+            self.assertIsNone(imm.ca_stop_utc(ev))
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXFAKECC", ev, midnight_print_day, close_time=close),
+                midnight_print_day)
+
     def test_late_month_rule_shapes_the_resting_ladder(self):
         # The loop rests NO bids and asks at 50% of the ladder it would
         # otherwise rest (read off the cycle log's want columns, the same

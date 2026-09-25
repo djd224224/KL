@@ -2387,3 +2387,36 @@ reward on them 222 -> 70 $/day (CC 29.6 -> 11.6, ADS 15.2 -> 5.4, POS 41.4
 rejections in the families rose (CC 1 -> 82, ADS 29 -> 72, POS 13 -> 44);
 5 members (3 POS, 2 CC) started the hopeless clock. Universe 728 selected
 across 171/200 events, ladder collateral ~$12.5k -> ~$7.1k, no errors.
+
+## 2026-09-24 pm — Carbon Arc: stop quoting entirely in the last 5 days of the month (Jack)
+
+Jack, after the cost/benefit of the half-size rule ("so you're saying it's
+a negative trade overall?" -- reward accrues linearly, the informed flow
+and the price moves are back-loaded; the families' P&L to date was -$1,180
+MTM on 6,190 long-YES / 4,890 short-YES contracts against ~$1,110 of
+estimated reward): "2. stop quoting entirely in the last 5 days OF THE
+MONTH".
+
+RULE (CA_LATE_STOP_DAYS = 5, env IMM_CA_LATE_STOP_DAYS, 0 = off): for a
+Carbon Arc-settled, day-dated market, apply_series_cutoff_adjustments caps
+the cutoff at ca_stop_utc = 00:00 ET on the 26th of the measurement month
+(month_end - 5d; Sep 26 04:00Z for every 26OCT03/06/07/08 print). It runs
+in the shared tightener, so BOTH cutoff producers (refresh_universe and the
+orphan restore) agree; members leave through the ordinary cutoff death
+(quotes cancelled, positions ride to settlement) and nothing enters. A
+cutoff is terminal, so the bot also stays out of Oct 1-8 -- the post-month-
+end days before the print, when the panel is complete. The 14-day rule
+(bids blocked, asks x0.5 from the 17th) covers the 17th-25th. Keyed on the
+source verdict, not the name: the two Taylor Swift *FT chart series keep
+their ordinary cutoff. The per-event late-month log line now ends
+"quoting stops Sep 26 00:00 ET (last 5 days of the month)".
+
+SIDE EFFECT ON DEPLOY (9/25 01:xxZ, ~26h before the stop): _quotable_days
+on every Carbon Arc member drops to ~1.1 days, so the $1.50 projection
+(this period's accrual + est x 1.1d) puts thinly-accrued members on the
+hopeless clock an hour before the stop would have taken them anyway, and
+fresh candidates reject as payout_floor. Both are the intended direction.
+
+Tests: test_late_month_stop_is_the_last_five_days_of_the_month (26th
+00:00 ET, no-prior-cutoff, never loosens, non-Carbon-Arc / unknown /
+undated untouched, kill switch); 605 green.

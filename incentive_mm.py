@@ -2311,6 +2311,16 @@ CA_LATE_DAYS = _env_float("IMM_CA_LATE_DAYS", 14)
 CA_LATE_SIZE_MULT = _env_float("IMM_CA_LATE_SIZE_MULT", 0.5)
 CA_LATE_TOXIC_SIDE = os.environ.get("IMM_CA_LATE_TOXIC_SIDE", "bid").strip().lower()
 CA_LATE_TOXIC_MULT = _env_float("IMM_CA_LATE_TOXIC_MULT", 0.0)
+# ...and then STOP (Jack 2026-09-24 pm, after the cost/benefit of the
+# half-size rule -- reward accrues linearly, the informed flow is back-loaded
+# -- "stop quoting entirely in the last 5 days OF THE MONTH"): from
+# CA_LATE_STOP_DAYS before the measurement month's end the market's cutoff
+# is capped there, so members exit through the ordinary cutoff path (quotes
+# cancelled, positions ride to settlement) and nothing enters; a cutoff is
+# terminal, so the bot also stays out of the post-month-end days before the
+# print, when the panel is complete. Applied in apply_series_cutoff_
+# adjustments, the tightener BOTH cutoff producers run. 0 = off.
+CA_LATE_STOP_DAYS = _env_float("IMM_CA_LATE_STOP_DAYS", 5)
 
 
 def scale_levels(lv: List[Tuple[int, int]], m: float) -> List[Tuple[int, int]]:
@@ -2324,16 +2334,32 @@ def scale_levels(lv: List[Tuple[int, int]], m: float) -> List[Tuple[int, int]]:
     return [(t, max(1, int(s * m + 0.5))) for t, s in lv]
 
 
-def ca_late_window_start(ticker: str) -> Optional[datetime]:
-    """UTC instant the late-month rule engages for this market: CA_LATE_DAYS
-    before 00:00 ET on the 1st of the ticker-date month (= the end of the
-    measurement month). None for an undated ticker."""
+def ca_month_end_utc(ticker: str) -> Optional[datetime]:
+    """End of a Carbon Arc market's MEASUREMENT month: 00:00 ET on the 1st of
+    the ticker-date month (the print day is early the next month). None for
+    an undated ticker."""
     td = parse_event_date(ticker)
     if td is None:
         return None
     d = td.astimezone(ET)
-    month_end = ET.localize(datetime(d.year, d.month, 1)).astimezone(timezone.utc)
-    return month_end - timedelta(days=CA_LATE_DAYS)
+    return ET.localize(datetime(d.year, d.month, 1)).astimezone(timezone.utc)
+
+
+def ca_late_window_start(ticker: str) -> Optional[datetime]:
+    """UTC instant the late-month size rule engages: CA_LATE_DAYS before the
+    measurement month's end. None for an undated ticker."""
+    me = ca_month_end_utc(ticker)
+    return None if me is None else me - timedelta(days=CA_LATE_DAYS)
+
+
+def ca_stop_utc(ticker: str) -> Optional[datetime]:
+    """UTC instant quoting STOPS for good: CA_LATE_STOP_DAYS before the
+    measurement month's end (the last 5 days of the month, by default).
+    None when the knob is off or the ticker is undated."""
+    if CA_LATE_STOP_DAYS <= 0:
+        return None
+    me = ca_month_end_utc(ticker)
+    return None if me is None else me - timedelta(days=CA_LATE_STOP_DAYS)
 
 
 def ca_late_month_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
@@ -5153,6 +5179,13 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
+    # CARBON ARC LATE-MONTH STOP (Jack 2026-09-24 pm, see CA_LATE_STOP_DAYS):
+    # keyed on the bot's own source verdict, not the name, so a *FT that is
+    # not Carbon Arc (the Taylor Swift charts) keeps its ordinary cutoff.
+    if carbon_arc_settled(series):
+        stop = ca_stop_utc(event_ticker)
+        if stop is not None:
+            cutoff = stop if cutoff is None else min(cutoff, stop)
     return cutoff
 
 
@@ -8457,8 +8490,13 @@ class IncentiveMarketMaker:
         seen.add(event_ticker)
         _b = "bid side BLOCKED" if bm <= 0 else f"bids x{bm:g}"
         _a = "ask side BLOCKED" if am <= 0 else f"asks x{am:g}"
+        _stop = ca_stop_utc(event_ticker)
+        _tail = ""
+        if _stop is not None:
+            _tail = (f"; quoting stops {_stop.astimezone(ET).strftime('%b %d %H:%M ET')}"
+                     f" (last {CA_LATE_STOP_DAYS:g} days of the month)")
         log(f"{self.tag} Carbon Arc late-month: {event_ticker} {_b} / {_a} "
-            f"(inside {CA_LATE_DAYS:g}d of the measurement month's end)")
+            f"(inside {CA_LATE_DAYS:g}d of the measurement month's end){_tail}")
 
     def _resolve_family_verdicts(self, by_market: Dict[str, dict],
                                  now_ts: float) -> int:
