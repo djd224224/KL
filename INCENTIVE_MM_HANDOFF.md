@@ -3292,3 +3292,27 @@ re-enters with near_cliff set, stays as a member with the hopeless clock
 expired, $0.80 stays floored, banked-fraction knob at 0.95 keeps it out, a
 fresh candidate keeps the $1.50 bar, NEAR_CLIFF_DOLLARS=0 keeps it out.
 630 green.
+
+VERIFIED 16:39-16:42Z (deploy 99cbf6f 16:34Z, relaunch 16:37:03Z, first
+refresh 16:39:29Z): 10 near-cliff verdicts. Red Rocks LOR ($0.62 + $0.31
+= $0.93), NOA ($0.66 + $0.27 = $0.92), CHR ($0.70 + $0.23 = $0.93) and BLU
+($0.55 + $0.33 = $0.88) re-entered and are resting two-sided 29/30-lots
+since 16:41:39Z (placed in the third cycle: the post-restart placement
+cap of 250/cycle deferred them twice); BIL slipped to ~$0.80 and stays
+floored, as the rule says. Also admitted on the same verdict:
+KXTXOIL-27MAR31-T5.9 ($0.60 + $0.35), KXCBDTHAILAND-26OCT28-C25 ($0.83 +
+$0.11), KXFSLR-26OCTMWSOLD-4100/-4200 ($0.71 + $0.23 / $0.16), all
+placed. Selected 413 -> 418, payout_floor 820 -> 810, no evictions.
+Two notes for the next reader: (1) KXNFLESCALATORREC-26SEP27NYJDET-
+DETJGIBBS0 was KEPT as a member on $0.95 banked + $0.00 projected -- the
+zero is the estimator's integer-spread blind spot on a sub-penny escalator
+(its bid and ask round to one cent), the market earned that $0.95 today
+and now rests at the exact touch, so keeping it is right in substance
+even though the estimator's own number says nothing more can be earned;
+if you want the rule to demand a positive forward projection, that is a
+one-line change in near_cliff_ok. (2) The near-cliff log line fires
+before the entry chain, so a FRESH zero-yield candidate can log "quoting
+to completion" and then be stopped by the zero_yield gate (the RECYDS
+DETASTBROWN14 escalator did exactly that; the sink row shows near_cliff
+true with decision zero_yield) -- cosmetic, fix with the next functional
+change rather than a restart of its own.
