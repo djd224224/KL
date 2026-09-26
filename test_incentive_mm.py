@@ -12314,6 +12314,7 @@ class TestNearCliffQuoteToCompletion(unittest.TestCase):
 
     def test_the_rule(self):
         self.assertEqual((imm.NEAR_CLIFF_DOLLARS, imm.NEAR_CLIFF_MIN_BANKED_FRAC), (0.15, 0.5))
+        self.assertEqual((imm.NEAR_CLIFF_SIZE_MULT, imm.NEAR_CLIFF_BOOST_MIN_BANKED), (1.5, 0.50))
         self.assertTrue(imm.near_cliff_ok(0.70, 0.93))        # banked 0.70, total 0.93 >= 0.85
         self.assertTrue(imm.near_cliff_ok(0.50, 0.85))        # both edges inclusive
         self.assertFalse(imm.near_cliff_ok(0.70, 0.84))       # outside the margin
@@ -12377,15 +12378,39 @@ class TestNearCliffQuoteToCompletion(unittest.TestCase):
                 after = {int(o["remaining_count"]) for o in bot.state.sim_orders.values()
                          if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
                 self.assertEqual(after, plain)
-                # size knob off: armed but the ladder stays plain
+                # size knob off: the verdict still admits, nothing is armed,
+                # the ladder stays plain
                 with mock.patch.object(imm, "NEAR_CLIFF_SIZE_MULT", 1.0):
                     bot2 = self._banked_bot(0.90e9)
                     bot2.run_cycle()
-                    self.assertIn(self.T, bot2._near_cliff_boost)
+                    self.assertIn(self.T, bot2.state.selected)
+                    self.assertTrue(bot2.state.selected[self.T].near_cliff)
+                    self.assertNotIn(self.T, bot2._near_cliff_boost)
                     self.assertEqual(bot2._near_cliff_size_mult(self.T), 1.0)
                     sz = {int(o["remaining_count"]) for o in bot2.state.sim_orders.values()
                           if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
                     self.assertEqual(sz, plain)
+                # the banked gate on the SIZE mode (Jack: "only do this if
+                # banked is > $0.50", strict): at the gate exactly the market
+                # is admitted on the verdict but rests plain size; a cent over
+                # it arms. (On this scale the gate is moved to $0.90e9 so the
+                # verdict -- total within $0.15e9 of the cliff -- still fires.)
+                with mock.patch.object(imm, "NEAR_CLIFF_BOOST_MIN_BANKED", 0.90e9):
+                    at_gate = self._banked_bot(0.90e9)
+                    at_gate.run_cycle()
+                    self.assertIn(self.T, at_gate.state.selected)
+                    self.assertTrue(at_gate.state.selected[self.T].near_cliff)
+                    self.assertNotIn(self.T, at_gate._near_cliff_boost)
+                    self.assertFalse(at_gate.state.selected[self.T].near_cliff_boost)
+                    sz = {int(o["remaining_count"]) for o in at_gate.state.sim_orders.values()
+                          if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
+                    self.assertEqual(sz, plain)
+                    over = self._banked_bot(0.91e9)
+                    over.run_cycle()
+                    self.assertIn(self.T, over._near_cliff_boost)
+                    sz = {int(o["remaining_count"]) for o in over.state.sim_orders.values()
+                          if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
+                    self.assertEqual(sz, {int(c * 1.5 + 0.5) for c in plain})
                 bot = self._banked_bot(0.90e9)            # re-arm for the member checks below
                 bot.run_cycle()
                 self.assertIn(self.T, bot.state.selected)

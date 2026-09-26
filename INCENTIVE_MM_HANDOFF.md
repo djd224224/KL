@@ -3365,3 +3365,25 @@ reference depth, so it is not a linear bound), that crossing the cliff
 (banked 1.05 on the 1e9 scale) ends the mode and the next cycle re-places
 the plain sizes, and that NEAR_CLIFF_SIZE_MULT=1.0 arms but does not
 resize. 630 green.
+
+## 2026-09-26 pm — Near-cliff size mode only past $0.50 banked (Jack)
+
+Jack, on the size mode: "only do this if banked is > $0.50" (strict).
+
+CHANGE (NEAR_CLIFF_BOOST_MIN_BANKED = 0.50, env IMM_NEAR_CLIFF_BOOST_MIN_
+BANKED). The quote-to-completion verdict is unchanged (banked >= half the
+cliff and projected within $0.15 under it). The x1.5 SIZE mode now arms
+only when, in addition, the banked accrual is strictly above
+NEAR_CLIFF_BOOST_MIN_BANKED and the size knob is on; a near-cliff market
+with $0.50 or less banked keeps quoting at plain size (log: "quoting to
+completion at plain size (banked <= $0.50)"), and a market at exactly
+$0.50 is admitted but not resized. Because banked accrual only grows
+while a market quotes, the gate is checked at arming time; a market that
+crosses $0.50 later arms at the next refresh's verdict (the log fires
+again when it arms). With the knob off nothing arms (the earlier build
+armed and sized 1.0). Banner names the gate; knob in the config hash.
+
+Tests: at the gate exactly (banked = gate, moved to $0.90e9 on the test
+scale so the verdict still fires) the market is admitted with near_cliff
+set, no size mode, plain rung sizes; a cent over the gate arms and rests
+x1.5; knob-off admits without arming. 630 green.

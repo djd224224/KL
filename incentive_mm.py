@@ -4771,6 +4771,11 @@ NEAR_CLIFF_MIN_BANKED_FRAC = _env_float("IMM_NEAR_CLIFF_MIN_BANKED_FRAC", 0.5)
 # projection clearing the bar outright never switches the boost off and
 # on again. 1.0 = off.
 NEAR_CLIFF_SIZE_MULT = _env_float("IMM_NEAR_CLIFF_SIZE_MULT", 1.5)
+# ...and only for a market that has ALREADY banked more than this (Jack
+# 2026-09-26 pm: "only do this if banked is > $0.50" -- strict). The
+# quote-to-completion verdict is unaffected: a near-cliff market with
+# $0.50 or less banked keeps quoting at plain size.
+NEAR_CLIFF_BOOST_MIN_BANKED = _env_float("IMM_NEAR_CLIFF_BOOST_MIN_BANKED", 0.50)
 # THE FLOOR PROJECTION IS JUDGED AT DAY SIZE (same incident). The yield
 # estimator sizes its ladder with hour_size_mult (launcher
 # IMM_HOUR_SIZE_MULT=0-9:2.0, Saturday x1.5), so est_dollars_per_day
@@ -4943,6 +4948,7 @@ _CONFIG_CODE_KNOBS = (
     "FLOOR_PROJECTION_SCHEDULE", "FLOOR_PROFILE_MAX_DAYS",
     # near-cliff quote-to-completion + size mode (2026-09-26)
     "NEAR_CLIFF_DOLLARS", "NEAR_CLIFF_MIN_BANKED_FRAC", "NEAR_CLIFF_SIZE_MULT",
+    "NEAR_CLIFF_BOOST_MIN_BANKED",
 )
 
 
@@ -7397,6 +7403,7 @@ class IncentiveMarketMaker:
         # near-cliff SIZE mode (2026-09-26): ticker -> armed ts; sticky until
         # the banked accrual crosses the cliff or the market leaves the selection
         self._near_cliff_boost: Dict[str, float] = {}
+        self._near_cliff_noted: Dict[str, float] = {}   # ticker -> ts of the last verdict log
         # per-period credit tickers the persisted file held at startup: what
         # _keeps_accrual protects until the first successful feed read
         self._loaded_credit: Set[str] = set()
@@ -9205,14 +9212,25 @@ class IncentiveMarketMaker:
                     and (meta.ticker in prev_selected or meta.yield_per_contract > 0):
                 reaches_min = True
                 meta.near_cliff = True
-                if meta.ticker not in self._near_cliff_boost:
-                    self._near_cliff_boost[meta.ticker] = now_ts     # arm SIZE mode
+                # SIZE mode arms only past the banked gate (strict, Jack:
+                # "only do this if banked is > $0.50") and with the knob on
+                armed = False
+                if meta.ticker not in self._near_cliff_boost \
+                        and accrued > NEAR_CLIFF_BOOST_MIN_BANKED \
+                        and NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0:
+                    self._near_cliff_boost[meta.ticker] = now_ts
+                    armed = True
+                if meta.ticker not in self._near_cliff_noted or armed:
+                    self._near_cliff_noted[meta.ticker] = now_ts
                     _sz = self._near_cliff_size_mult(meta.ticker)
                     log(f"{self.tag} near-cliff: {meta.ticker} banked ${accrued:.2f} "
                         f"+ projected ${max(est_total, proj_peak):.2f} = "
                         f"${projected_total:.2f}, within ${NEAR_CLIFF_DOLLARS:.2f} of "
                         f"the ${PAYOUT_FLOOR_DOLLARS:.2f} cliff; quoting to completion"
-                        + (f" at x{_sz:g} size until it crosses" if _sz != 1.0 else ""))
+                        + (f" at x{_sz:g} size until it crosses" if _sz != 1.0
+                           else f" at plain size (banked <= ${NEAR_CLIFF_BOOST_MIN_BANKED:.2f})"
+                           if NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0
+                           else ""))
             meta.near_cliff_boost = meta.ticker in self._near_cliff_boost
             # DIP GUARD (Jack 2026-08-05). Track how long the projection has
             # been continuously under the bar; the exit below refuses to fire
@@ -12558,7 +12576,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         + ("; near-cliff: banked >= %g of the cliff and projected within $%.2f "
            "under it quotes to completion%s"
            % (NEAR_CLIFF_MIN_BANKED_FRAC, NEAR_CLIFF_DOLLARS,
-              (" at x%g size until it crosses" % NEAR_CLIFF_SIZE_MULT)
+              (" at x%g size until it crosses (banked > $%.2f only)"
+               % (NEAR_CLIFF_SIZE_MULT, NEAR_CLIFF_BOOST_MIN_BANKED))
               if NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0 else "")
            if NEAR_CLIFF_DOLLARS > 0 and EXIT_FLOOR_IS_PAYOUT else "; near-cliff off"))
     _n_daily = load_daily_series_file()
