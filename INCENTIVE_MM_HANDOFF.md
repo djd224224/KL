@@ -3450,3 +3450,20 @@ same buckets; end to end on a 0.1940 / 0.1960 escalator: external best
 19.60, the estimator in the live (atref) ladder mode reads two quotable
 sides with a positive estimate, and a locked 0.1950 book snaps neither
 side. 632 green.
+
+VERIFIED 17:30Z (deploy f55414a 17:24Z, clean exit 17:26:30Z, relaunch
+17:27:37Z, first refresh 17:30:06Z): zero_yield 161 -> 1 (the one left is
+KXAAAGASMAXM, an 11c spread, a different reason). Of the 160 former
+zero-yield escalators, 38 selected (floor $/day p50 $0.70, max $1.63, all
+now read a 1c integer spread) and 122 payout_floor (p50 $0.57/day on a
+one-day window against the $1.50 fresh bar -- the floor, not the book,
+keeps them out now). Selected 416 -> 455 across 132 -> 145 events,
+collateral ~$11.7k -> ~$13.2k. Exchange probe ~17:45Z: 250 resting orders
+on ladder / escalator markets (98 this morning), 250 of 250 AT the exact
+external touch, 0 behind; escalators rest at both touches of one-sub-tick
+markets (LARDADAMS17 0.1280 / 0.1281, SFCMCCAFFREY23 0.0799 / 0.0800,
+DETASTBROWN14 0.1915 / 0.1926), 136 whole-cent rungs on the penny-grid
+ladders. Watch: these one-sub-tick books put our 60-lots at the maker's
+own touch on both sides, so fill risk on the escalators is now the
+maker's, not a penny behind it; the first Sunday of settled escalator
+fills (9/27) is the measurement.
