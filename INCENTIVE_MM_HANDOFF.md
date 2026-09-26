@@ -3220,3 +3220,22 @@ rule read the day number there; it still does behind the kill switch),
 equals (14 x day + 10 x doubled) / 24 under a 0-9 ET window over a
 one-day accrual window, and an incumbent's day term is the plain external
 read. 628 green.
+
+VERIFIED 16:13Z (deploy 7c06a01 16:07Z, clean exit 16:09:54Z, relaunch
+16:10:55Z with the new banner, first refresh 16:13:23Z), a Saturday
+afternoon: selected 394 -> 413 across 129 -> 134 events, payout_floor
+845 -> 820 (selection_snapshot decisions), 19 payout_floor -> selected
+flips, all Sunday NFL ladders (window = rest of Saturday at x1.5, the
+overnight quiet hours at x2, Sunday morning at x1: profile
+1:0.10,1.5:0.49,2:0.41; e.g. KXNFLLADDERREC-26SEP27NYJDET-DETASTBROWN14
+floor $0.49 -> $0.81/day, over the cliff with its banked accrual), zero
+selected -> other flips (no evictions). Over the 1,227 markets with a
+projection in both refreshes the new/old ratio is p10 1.31 / p50 1.50 /
+p90 1.65 -- the Saturday x1.5 plus tonight's x2 -- and the evening-halved
+families read UNDER 1 as intended: KXRAIN dailies mean 0.88 (profile
+0.5:0.31,1:0.69 to the 10pm cutoff), KXDIESELD 0.76 (0.5:0.68,1:0.32).
+The extremes (KXRT-HUN-85 18x, the DETASTBROWN14 escalator 0.15x,
+KXSUEZWEEKLY 0.25x) are book moves -- their LIVE estimates moved the same
+way between the two reads. Profiles are in the sink rows
+(floor_mult_profile); 1,697 rows carry none because they never reached
+the estimator (cutoff / extreme_mid / one_sided / manual).
