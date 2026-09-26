@@ -6176,12 +6176,54 @@ def dollars_to_cents(v) -> Optional[int]:
     return c if 0 <= c <= 100 else None
 
 
+# ---- SUB-PENNY CENT BUCKETS (Jack 2026-09-26, "yes" to making the estimator
+# sub-penny aware). The sports escalators trade in 0.0001 steps; the whole
+# bot reasons in whole cents, and it used to ROUND every price to the penny.
+# Rounding put a 0.1940 bid and a 0.1960 ask in the SAME cent (19/19): no
+# integer bid can rest below the ask, so no ladder, est $0.00, 157-160
+# "zero_yield" skips per refresh -- while the sub-penny join can only move a
+# rung that was already built. The convention is now FLOOR for bids and
+# CEIL for asks (a NO level is floored in NO terms, which is the YES ask
+# ceiled): the integer touch is never better than the true touch, so an
+# integer bid never crosses the true ask, and any sub-cent spread survives
+# as a >= 1c integer spread. 19.40 / 19.60 reads 19 / 20; the ordinary
+# pipeline builds 19 / 20 and subpenny_snap (same buckets) rests them at
+# 19.40 / 19.60 exactly. Whole-cent prices are unchanged (floor == ceil ==
+# round). Levels that share a cent are MERGED (sizes summed) -- the share
+# model keyed on integer prices used to keep only the last of them.
+def _floor_cents(p) -> int:
+    """Dollars -> whole cents, floored (0.1940 -> 19; 0.29 -> 29: the round to
+    4 dp + 1e-9 absorbs 0.29 * 100 == 28.999...)."""
+    return int(math.floor(round(float(p) * 100, 4) + 1e-9))
+
+
+def _ceil_cents(p) -> int:
+    """Dollars -> whole cents, ceiled (0.1960 -> 20; 0.19 -> 19)."""
+    return int(math.ceil(round(float(p) * 100, 4) - 1e-9))
+
+
+def _merge_levels(pairs) -> List[List[float]]:
+    """[[cents, qty]] ascending with equal cents merged (sizes summed)."""
+    acc: Dict[int, float] = {}
+    for c, q in pairs:
+        acc[c] = acc.get(c, 0.0) + q
+    return [[c, acc[c]] for c in sorted(acc)]
+
+
 def market_cents(m: dict, base: str) -> Optional[int]:
     """Read a price off a market object: prefers '<base>_dollars' (V2 string),
     falls back to legacy integer-cent '<base>'. Returns None when absent or 0
-    (Kalshi reports an empty side as 0)."""
+    (Kalshi reports an empty side as 0). Sub-penny aware: a *_bid is floored
+    to the cent, a *_ask ceiled (see _floor_cents)."""
     v = m.get(base + "_dollars")
-    c = dollars_to_cents(v) if v is not None else None
+    c = None
+    if v is not None:
+        try:
+            c = _ceil_cents(v) if base.endswith("_ask") else _floor_cents(v)
+        except (TypeError, ValueError):
+            c = None
+        if c is not None and not (0 <= c <= 100):
+            c = None
     if c is None:
         v = m.get(base)
         try:
@@ -6192,13 +6234,18 @@ def market_cents(m: dict, base: str) -> Optional[int]:
 
 
 def orderbook_levels(orderbook_response: dict) -> Tuple[List[List[float]], List[List[float]]]:
-    """(yes_levels, no_levels) as [price_cents, qty], ascending by price."""
+    """(yes_levels, no_levels) as [price_cents, qty], ascending by price.
+    Sub-penny aware (2026-09-26): each book's prices are FLOORED to the cent
+    in their own terms -- a YES bid down, a NO bid down, which is the YES ask
+    UP -- so a 0.1940 / 0.1960 escalator reads bid 19 / ask 20 instead of a
+    locked 19 / 19, and levels sharing a cent are merged (sizes summed).
+    Whole-cent books are unchanged."""
     yes_levels: List[List[float]] = []
     no_levels: List[List[float]] = []
     if "orderbook_fp" in orderbook_response:
         ob = orderbook_response.get("orderbook_fp") or {}
-        yes_levels = [[round(float(p) * 100), float(q)] for p, q in (ob.get("yes_dollars") or [])]
-        no_levels = [[round(float(p) * 100), float(q)] for p, q in (ob.get("no_dollars") or [])]
+        yes_levels = _merge_levels((_floor_cents(p), float(q)) for p, q in (ob.get("yes_dollars") or []))
+        no_levels = _merge_levels((_floor_cents(p), float(q)) for p, q in (ob.get("no_dollars") or []))
     elif "orderbook" in orderbook_response:
         ob = orderbook_response.get("orderbook") or {}
         yes_levels = [[float(p), float(q)] for p, q in (ob.get("yes") or [])]
@@ -6290,7 +6337,10 @@ def subpenny_snap(quotes: List["Quote"], yes_exact: List[List[float]],
     own cent bucket. yes_exact/no_exact from orderbook_exact_levels (cents,
     2 dp); own_exact = (book_side, yes_cents_2dp, remaining) of our resting
     orders, netted out first. A rung whose bucket holds no external level
-    keeps its integer price (it is already the best in that cent)."""
+    keeps its integer price (it is already the best in that cent). Buckets
+    follow orderbook_levels: a bid level belongs to floor(price), an ask
+    level to ceil(price) -- so the 19 / 20 rungs the integer pipeline builds
+    on a 19.40 / 19.60 escalator snap to 19.40 / 19.60 exactly."""
     if not quotes:
         return quotes
     own_yes: Dict[float, float] = {}
@@ -6314,13 +6364,13 @@ def subpenny_snap(quotes: List["Quote"], yes_exact: List[List[float]],
             continue
         exact = None
         if q.book_side == "bid":
-            cands = [px for px, _q in bids if round(px) == q.price_cents]
+            cands = [px for px, _q in bids if int(math.floor(px + 1e-9)) == q.price_cents]
             if cands:
                 exact = max(cands)
                 if best_ask is not None and exact >= best_ask:
                     exact = None                       # would cross: keep the cent
         else:
-            cands = [px for px, _q in asks if round(px) == q.price_cents]
+            cands = [px for px, _q in asks if int(math.ceil(px - 1e-9)) == q.price_cents]
             if cands:
                 exact = min(cands)
                 if best_bid is not None and exact <= best_bid:
@@ -6409,14 +6459,17 @@ def order_yes_book_cents(order: dict) -> Optional[Tuple[str, int]]:
             book_side = "bid" if (side == "yes") == (action == "buy") else "ask"
         else:
             return None
+    # sub-penny aware (2026-09-26): the same cent buckets as orderbook_levels
+    # -- a bid's YES price floored, an ask's ceiled (= its NO price floored)
     for key in ("price_dollars", "yes_price_dollars"):
         v = order.get(key)
         if v is not None:
-            return book_side, round(float(v) * 100)
+            return book_side, (_floor_cents(v) if book_side == "bid" else _ceil_cents(v))
     if order.get("yes_price") is not None:
         return book_side, int(order["yes_price"])
     if order.get("no_price_dollars") is not None:
-        return book_side, 100 - round(float(order["no_price_dollars"]) * 100)
+        v = order["no_price_dollars"]
+        return book_side, 100 - (_ceil_cents(v) if book_side == "bid" else _floor_cents(v))
     if order.get("no_price") is not None:
         return book_side, 100 - int(order["no_price"])
     return None

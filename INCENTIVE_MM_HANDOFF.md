@@ -3387,3 +3387,66 @@ Tests: at the gate exactly (banked = gate, moved to $0.90e9 on the test
 scale so the verdict still fires) the market is admitted with near_cliff
 set, no size mode, plain rung sizes; a cent over the gate arms and rests
 x1.5; knob-off admits without arming. 630 green.
+
+VERIFIED (near-cliff size mode + banked gate, bacc225): relaunch banner
+17:14:38Z, first refresh 17:16:58Z, 9 near-cliff verdicts all "at x1.5
+size until it crosses" (every one had > $0.50 banked: DETJGIBBS0 $0.95,
+CBDTHAILAND C25 $0.83, TXOIL T5.9 $0.60, FSLR 4200/4100 $0.71, Red Rocks
+LOR $0.62 / BLU $0.55 / NOA $0.66 / CHR $0.70). Red Rocks placed 17:19:10Z
+(third cycle, placement cap): ASK 45 (= 30 x 1.5) on all four; BID 28-29,
+unchanged, because the bid side was already room-limited at 29 before the
+boost (cycle_log room_buy 29 / room_sell 30 -- inventory skew and the
+event cap bind the buy side; caps are deliberately untouched). Selected
+416, no evictions.
+
+## 2026-09-26 pm — Sub-penny books: floor/ceil cent buckets so a sub-cent spread survives as a quotable 1c spread (Jack)
+
+Jack, after "why are sub-penny books a blindspot?" -- the whole bot
+reasons in whole cents and orderbook_levels ROUNDED every price to the
+penny, so a 0.1940 bid / 0.1960 ask escalator read 19 / 19: no integer bid
+can rest below the ask, no ladder, est $0.00, zero_yield (157-160 skips
+per refresh, nearly all NFL escalators), and the sub-penny join can only
+move a rung that was already built. "yes" to fixing it.
+
+CHANGE (no knob: it is a representation fix; whole-cent books are
+bit-for-bit unchanged). The whole-cent view of a book is now FLOOR for
+bids and CEIL for asks: orderbook_levels floors each book's prices in its
+own terms (a YES bid down, a NO bid down = the YES ask up), and MERGES
+levels that share a cent (sizes summed -- the share model's integer keys
+used to keep only the last of them); order_yes_book_cents buckets a
+resting bid's YES price down and an ask's up (or its NO price down);
+market_cents floors a *_bid and ceils a *_ask (mid / spread for the pass-1
+screen); subpenny_snap uses the same buckets (bid level -> floor, ask level
+-> ceil). Consequences: the integer touch is never better than the true
+touch, so an integer rung never crosses the true book; any sub-cent spread
+becomes a >= 1c integer spread, so the ordinary pipeline (sides_can_
+qualify, reference prices, build_side_ladder, the estimator's probe
+ladder, the quote loop) treats 0.1940 / 0.1960 as 19 / 20, builds 19 / 20,
+and subpenny_snap rests them at 19.40 / 19.60 exactly; a truly LOCKED
+exact book (bid == ask) still reads floor / ceil around it and the snap
+refuses both sides (crossing guard), so the integer rungs stay one cent
+outside the lock and never cross. Helpers _floor_cents / _ceil_cents
+(round to 4 dp first: 0.29 * 100 is 28.999...). The reward share is scored
+on the merged cent buckets: our exact-touch order shares the maker's
+cent, which is what Kalshi's exact walk pays when we sit on the maker's
+level; the decay term still counts whole cents, so a level a fraction of
+a cent behind the reference is scored as at it -- an over-estimate of at
+most one decay step, acceptable until Kalshi's tick definition for
+0.0001-step markets is confirmed.
+
+What this opens: the escalators that read zero_yield only because their
+spread was sub-cent (the estimator now sees a 1c spread; the payout floor,
+the band and the event caps still apply). What it does not change: the
+integer rungs' size, caps, bands, pads (a 1c pad is a valid price on the
+0.0001 grid), fills accounting (a 0.1915 fill still books as 19c in the
+P&L tracker -- pre-existing 0.15c imprecision, separate fix).
+
+Tests: TestSubPennyCentBuckets -- floor/ceil helpers incl. the 0.29 float
+guard; a sub-cent book floors, ceils and merges (DETASTBROWN14 shape ->
+[[19, 13332.43]] / [[77, 1359], [80, 10030]] -> external best 19 / 20);
+whole-cent books unchanged; resting orders and market objects use the
+same buckets; end to end on a 0.1940 / 0.1960 escalator: external best
+19 / 20, build_side_ladder builds 19 / 20, subpenny_snap rests 19.40 /
+19.60, the estimator in the live (atref) ladder mode reads two quotable
+sides with a positive estimate, and a locked 0.1950 book snaps neither
+side. 632 green.

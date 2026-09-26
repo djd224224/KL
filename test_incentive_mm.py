@@ -12292,6 +12292,87 @@ class TestExitBarIsThePayoutCliff(unittest.TestCase):
             imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
 
 
+class TestSubPennyCentBuckets(unittest.TestCase):
+    """Jack 2026-09-26 ("yes" to making the estimator sub-penny aware): the
+    whole-cent view of a 0.0001-step book is FLOOR for bids / CEIL for asks
+    with same-cent levels merged, so a sub-cent spread survives as a >= 1c
+    integer spread, the ordinary pipeline builds a ladder, and subpenny_snap
+    rests it at the exact touches. Rounding used to lock 19.40 / 19.60 into
+    19 / 19 -> no ladder -> zero_yield (157-160 escalators per refresh)."""
+
+    def test_buckets_and_merging(self):
+        self.assertEqual((imm._floor_cents("0.1940"), imm._ceil_cents("0.1960")), (19, 20))
+        self.assertEqual((imm._floor_cents("0.29"), imm._ceil_cents("0.29")), (29, 29))   # float guard
+        self.assertEqual((imm._floor_cents("0.995"), imm._ceil_cents("0.005")), (99, 1))
+        ob = {"orderbook_fp": {
+            "yes_dollars": [["0.1900", "130"], ["0.1915", "13192.43"], ["0.1940", "10"]],
+            "no_dollars": [["0.7778", "1359"], ["0.8030", "10025"], ["0.8060", "5"]]}}
+        y, n = imm.orderbook_levels(ob)
+        self.assertEqual(y, [[19, 13332.43]])                    # merged, floored
+        self.assertEqual(n, [[77, 1359.0], [80, 10030.0]])       # NO floored = YES ask ceiled
+        self.assertEqual(imm.external_best(y, n), (19, 20))
+        # whole-cent books are unchanged
+        y, n = imm.orderbook_levels({"orderbook_fp": {"yes_dollars": [["0.40", "10"], ["0.45", "5.5"]],
+                                                      "no_dollars": [["0.50", "7"]]}})
+        self.assertEqual((y, n), ([[40, 10.0], [45, 5.5]], [[50, 7.0]]))
+        # resting orders and market objects use the same buckets
+        self.assertEqual(imm.order_yes_book_cents({"book_side": "bid", "yes_price_dollars": "0.1940"}), ("bid", 19))
+        self.assertEqual(imm.order_yes_book_cents({"book_side": "ask", "yes_price_dollars": "0.1940"}), ("ask", 20))
+        self.assertEqual(imm.order_yes_book_cents({"side": "no", "action": "buy", "no_price_dollars": "0.8040"}), ("ask", 20))
+        self.assertEqual(imm.order_yes_book_cents({"side": "yes", "action": "buy", "no_price_dollars": "0.8040"}), ("bid", 19))
+        self.assertEqual(imm.order_yes_book_cents({"book_side": "bid", "price_dollars": "0.45"}), ("bid", 45))
+        self.assertEqual((imm.market_cents({"yes_bid_dollars": "0.1940"}, "yes_bid"),
+                          imm.market_cents({"yes_ask_dollars": "0.1940"}, "yes_ask"),
+                          imm.market_cents({"yes_ask_dollars": "0.4500"}, "yes_ask")), (19, 20, 45))
+
+    def test_sub_cent_spread_escalator_is_quotable_end_to_end(self):
+        # the blind spot: 0.1940 bid / 0.1960 ask (NO 0.8040) round to 19/19
+        T = "KXNFLESCALATORREC-26SEP27NYJDET-DETJGIBBS0"
+        ob = {"orderbook_fp": {"yes_dollars": [["0.1522", "1359"], ["0.1940", "13000"]],
+                               "no_dollars": [["0.7778", "1359"], ["0.8040", "10000"]]}}
+        y, n = imm.orderbook_levels(ob)
+        eb, ea = imm.external_best(y, n)
+        self.assertEqual((eb, ea), (19, 20))                      # a 1c integer spread now
+        # the ordinary ladder builds on both sides...
+        bid = imm.build_side_ladder(T, "bid", eb, ea, 60, levels=[(0, 60)])
+        ask = imm.build_side_ladder(T, "ask", ea, eb, 60, levels=[(0, 60)])
+        self.assertEqual(([q.price_cents for q in bid], [q.price_cents for q in ask]), ([19], [20]))
+        # ...and snaps to the exact touches without crossing
+        out = imm.subpenny_snap(bid + ask, *imm.orderbook_exact_levels(ob))
+        self.assertEqual([q.price_exact for q in out], [19.4, 19.6])
+        # the estimator reads it as a live two-sided book worth something --
+        # in the live ladder mode (atref): the reference level IS the touch
+        # when the maker alone fills the target there, so the rung rests at
+        # 19 / 20 and shares the level (in "offsets" mode the safe-join
+        # offset would park it two ticks behind a walk that ends at the first
+        # level, worth exactly nothing -- the same truth for any thick book)
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.books[T] = ob
+        meta = MarketMeta(ticker=T, event_ticker="KXNFLESCALATORREC-26SEP27NYJDET",
+                          series="KXNFLESCALATORREC", dollars_per_day=222.0,
+                          program_end=None, target_size=1000.0, discount_factor=0.5,
+                          cutoff=None, close_time=None, price_step=0.0001)
+        imm.ensure_family_override("KXNFLESCALATORREC")
+        mode = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"
+        try:
+            self.assertTrue(bot._estimate_candidate_yield(meta, []))
+        finally:
+            imm.LADDER_MODE = mode
+        self.assertEqual(meta.quotable_sides, 2)
+        self.assertGreater(meta.est_dollars_per_day, 0.0)
+        self.assertGreater(meta.yield_per_contract, 0.0)
+        # a truly LOCKED exact book (bid == ask at 0.1950) still stays out:
+        # the integer rungs 19 / 20 refuse to snap onto the locked price
+        locked = {"orderbook_fp": {"yes_dollars": [["0.1950", "500"]], "no_dollars": [["0.8050", "500"]]}}
+        y2, n2 = imm.orderbook_levels(locked)
+        self.assertEqual(imm.external_best(y2, n2), (19, 20))
+        out2 = imm.subpenny_snap([imm.Quote(T, "bid", 19, 60), imm.Quote(T, "ask", 20, 60)],
+                                 *imm.orderbook_exact_levels(locked))
+        self.assertEqual([q.price_exact for q in out2], [None, None])
+
+
 class TestNearCliffQuoteToCompletion(unittest.TestCase):
     """Jack 2026-09-26, "build the knob for banked markets near the cliff":
     a market that has banked at least half the $1.00 cliff this period and
