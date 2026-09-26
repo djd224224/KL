@@ -4758,6 +4758,19 @@ EXIT_FLOOR_IS_PAYOUT = os.environ.get("IMM_EXIT_FLOOR_IS_PAYOUT", "1") == "1"
 # IMM_NEAR_CLIFF_DOLLARS=0 switches it off.
 NEAR_CLIFF_DOLLARS = _env_float("IMM_NEAR_CLIFF_DOLLARS", 0.15)
 NEAR_CLIFF_MIN_BANKED_FRAC = _env_float("IMM_NEAR_CLIFF_MIN_BANKED_FRAC", 0.5)
+# ...and a SIZE BOOST to get it across (Jack 2026-09-26: "if Banked +
+# projected is near cliff, do a 1.5x size multiplier to ensure it gets
+# across the cliff"). While a market is in near-cliff mode its ladder is
+# scaled by NEAR_CLIFF_SIZE_MULT everywhere the shape is read -- the quote
+# loop, the collateral reservation, the placement guard's bracket and the
+# estimator's hypothetical ladder (the 2026-07-14 lesson: every consumer
+# sees the same shape). The mode is STICKY for the period once armed: it
+# ends when the banked accrual crosses the cliff (the $1 is secured and
+# accrual above it pays linearly, so size goes back to normal), when the
+# market leaves the selection, or when the period rolls -- so the boosted
+# projection clearing the bar outright never switches the boost off and
+# on again. 1.0 = off.
+NEAR_CLIFF_SIZE_MULT = _env_float("IMM_NEAR_CLIFF_SIZE_MULT", 1.5)
 # THE FLOOR PROJECTION IS JUDGED AT DAY SIZE (same incident). The yield
 # estimator sizes its ladder with hour_size_mult (launcher
 # IMM_HOUR_SIZE_MULT=0-9:2.0, Saturday x1.5), so est_dollars_per_day
@@ -4928,8 +4941,8 @@ _CONFIG_CODE_KNOBS = (
     "KEEP_ACCRUAL_WHILE_PROGRAMMED",
     # schedule-weighted floor projection (2026-09-26)
     "FLOOR_PROJECTION_SCHEDULE", "FLOOR_PROFILE_MAX_DAYS",
-    # near-cliff quote-to-completion (2026-09-26)
-    "NEAR_CLIFF_DOLLARS", "NEAR_CLIFF_MIN_BANKED_FRAC",
+    # near-cliff quote-to-completion + size mode (2026-09-26)
+    "NEAR_CLIFF_DOLLARS", "NEAR_CLIFF_MIN_BANKED_FRAC", "NEAR_CLIFF_SIZE_MULT",
 )
 
 
@@ -7163,6 +7176,7 @@ class MarketMeta:
     #   size schedule (FLOOR_PROJECTION_SCHEDULE), else at DAY size (FLOOR_PROJECTION_BASE_SIZE)
     floor_mult_profile: str = ""        # "1:0.583,2:0.417" -- the schedule mix behind it
     near_cliff: bool = False            # admitted / kept by the near-cliff rule this refresh
+    near_cliff_boost: bool = False      # in near-cliff SIZE mode (ladder x NEAR_CLIFF_SIZE_MULT, sticky)
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
     # set by _estimate_candidate_yield alongside est_frac; consumed by the
     # quote-gaps email's earnings-per-$-of-exposure ranking (Jack 2026-08-12)
@@ -7380,6 +7394,9 @@ class IncentiveMarketMaker:
         self._reconciled = False      # one-time orphaned-own-fill cleanup pending
         self._reconcile_recheck_at = 0.0   # two-shot: second pass after sweep window
         self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
+        # near-cliff SIZE mode (2026-09-26): ticker -> armed ts; sticky until
+        # the banked accrual crosses the cliff or the market leaves the selection
+        self._near_cliff_boost: Dict[str, float] = {}
         # per-period credit tickers the persisted file held at startup: what
         # _keeps_accrual protects until the first successful feed read
         self._loaded_credit: Set[str] = set()
@@ -8613,6 +8630,27 @@ class IncentiveMarketMaker:
             return acc
         return max(0.0, acc - self.state.period_base.get(ticker, 0.0))
 
+    def _near_cliff_size_mult(self, ticker: str) -> float:
+        """NEAR_CLIFF_SIZE_MULT while `ticker` is in near-cliff mode (armed by
+        the floor verdict, sticky until the banked accrual crosses the cliff
+        or the market leaves the selection), else 1.0."""
+        if NEAR_CLIFF_SIZE_MULT <= 0 or NEAR_CLIFF_SIZE_MULT == 1.0:
+            return 1.0
+        return NEAR_CLIFF_SIZE_MULT if ticker in self._near_cliff_boost else 1.0
+
+    def _prune_near_cliff_boost(self) -> None:
+        """End near-cliff mode for markets that crossed the cliff (banked >=
+        PAYOUT_FLOOR_DOLLARS this period) or left the selection. Runs at the
+        top of the refresh's yield pass, before the estimator reads it."""
+        for t in list(self._near_cliff_boost):
+            banked = self.period_accrued(t)
+            crossed = banked >= PAYOUT_FLOOR_DOLLARS
+            if crossed or t not in self.state.selected:
+                del self._near_cliff_boost[t]
+                if crossed:
+                    log(f"{self.tag} near-cliff: {t} crossed the cliff (banked "
+                        f"${banked:.2f}); ladder back to normal size")
+
     def _paid_basis_delta(self, ticker: str, prev_acc: float,
                           new_acc: float) -> float:
         """PAID basis: nothing counts until this market's own accrual clears
@@ -9105,6 +9143,7 @@ class IncentiveMarketMaker:
                 own_by_ticker.setdefault(o.get("ticker", ""), []).append(
                     (o.get("book_side", "bid"), int(o.get("yes_price", 0)),
                      float(o.get("remaining_count", 0))))
+        self._prune_near_cliff_boost()
         ranked: List[MarketMeta] = []
         for meta in screened:
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
@@ -9160,16 +9199,21 @@ class IncentiveMarketMaker:
             # it quotes to completion -- the same verdict feeds the hopeless
             # exit below, so it cannot flap around the cliff.
             meta.near_cliff = False
-            if not reaches_min and near_cliff_ok(accrued, projected_total):
+            # (a fresh zero-yield candidate is still stopped by the zero_yield
+            # gate below, so it neither logs nor arms the size mode)
+            if not reaches_min and near_cliff_ok(accrued, projected_total) \
+                    and (meta.ticker in prev_selected or meta.yield_per_contract > 0):
                 reaches_min = True
                 meta.near_cliff = True
-                _noted = self.__dict__.setdefault("_near_cliff_noted", {})
-                if meta.ticker not in _noted:
-                    _noted[meta.ticker] = now_ts
+                if meta.ticker not in self._near_cliff_boost:
+                    self._near_cliff_boost[meta.ticker] = now_ts     # arm SIZE mode
+                    _sz = self._near_cliff_size_mult(meta.ticker)
                     log(f"{self.tag} near-cliff: {meta.ticker} banked ${accrued:.2f} "
                         f"+ projected ${max(est_total, proj_peak):.2f} = "
                         f"${projected_total:.2f}, within ${NEAR_CLIFF_DOLLARS:.2f} of "
-                        f"the ${PAYOUT_FLOOR_DOLLARS:.2f} cliff; quoting to completion")
+                        f"the ${PAYOUT_FLOOR_DOLLARS:.2f} cliff; quoting to completion"
+                        + (f" at x{_sz:g} size until it crosses" if _sz != 1.0 else ""))
+            meta.near_cliff_boost = meta.ticker in self._near_cliff_boost
             # DIP GUARD (Jack 2026-08-05). Track how long the projection has
             # been continuously under the bar; the exit below refuses to fire
             # until that exceeds HOPELESS_SUSTAIN_SECS. Any single reading at
@@ -9423,7 +9467,8 @@ class IncentiveMarketMaker:
                 return 0.0
             bid = int(meta.mid_cents - meta.spread_cents / 2)
             ask = int(meta.mid_cents + meta.spread_cents / 2)
-            lv = hour_scaled_levels(meta.series, now_utc)
+            lv = scale_levels(hour_scaled_levels(meta.series, now_utc),
+                              self._near_cliff_size_mult(meta.ticker))
             # per-side deep-reference size multipliers (2026-08-02 audit):
             # atref rests up to 2x the spec size, so an unscaled reservation
             # under-charged the budget up to ~2x on mid-priced deep-ref books
@@ -9565,6 +9610,7 @@ class IncentiveMarketMaker:
                     "floor_dollars_per_day": round(mt.floor_dollars_per_day, 4),
                     "floor_mult_profile": mt.floor_mult_profile,
                     "near_cliff": bool(getattr(mt, "near_cliff", False)),
+                    "near_cliff_boost": bool(getattr(mt, "near_cliff_boost", False)),
                     "yield_per_contract": round(mt.yield_per_contract, 6),
                     "dollars_per_day": round(mt.dollars_per_day, 2),
                     "target_size": mt.target_size,
@@ -10052,7 +10098,10 @@ class IncentiveMarketMaker:
         # KXTRUEV-26SEP07-T1263.42: "only supports 1 side quoting, and is
         # more likely to fall out of the quoting range and stop earning").
         _now = datetime.now(timezone.utc)
-        _lv = hour_scaled_levels(meta.series, _now)
+        # near-cliff SIZE mode scales the hypothetical ladder too, so the
+        # projection sees the size the quote loop will rest
+        _ncm = self._near_cliff_size_mult(meta.ticker)
+        _lv = scale_levels(hour_scaled_levels(meta.series, _now), _ncm)
         # Carbon Arc late-month rule: the hypothetical ladder is per side too,
         # so the reward estimate (and the $1 floor projection built on it)
         # see the size the quote loop will actually rest.
@@ -10208,7 +10257,7 @@ class IncentiveMarketMaker:
                 total = 0.0
                 for m, w in profile:
                     q_m = _probe_ladder(
-                        m, scaled_levels_at(meta.series, m),
+                        m, scale_levels(scaled_levels_at(meta.series, m), _ncm),
                         capped_ref_mult(xb, xrb, "bid", hour_mult=m, series=meta.series),
                         capped_ref_mult(xa, xra, "ask", hour_mult=m, series=meta.series),
                         xb, xa, xrb, xra)
@@ -11326,6 +11375,10 @@ class IncentiveMarketMaker:
             # series the cap/skew track the bot's OWN book, so the user's
             # coexisting manual position doesn't shrink the bot's room.
             lv = hour_scaled_levels(meta.series, now_utc)
+            # near-cliff SIZE mode (2026-09-26): x NEAR_CLIFF_SIZE_MULT until
+            # the banked accrual crosses the cliff (same shape everywhere:
+            # collateral reservation and placement guard scale with it)
+            lv = scale_levels(lv, self._near_cliff_size_mult(t))
             hm = hour_size_mult(meta.series, now_utc)
             # Carbon Arc late-month rule (Jack 2026-09-24, ca_late_month_mults):
             # from here the ladder is PER SIDE -- no bid rungs and asks at
@@ -11991,8 +12044,9 @@ class IncentiveMarketMaker:
             # books on fresh events); bracket by the max legitimate
             # multiplier — the precise per-book cap already ran in the
             # room/ladder layer, this is the runaway backstop.
-            lv_now = hour_scaled_levels(
-                series, datetime.fromtimestamp(now_ts, tz=timezone.utc))
+            lv_now = scale_levels(
+                hour_scaled_levels(series, datetime.fromtimestamp(now_ts, tz=timezone.utc)),
+                self._near_cliff_size_mult(q.ticker))
             cap_mult = REF_DEPTH_MAX_MULT if LADDER_MODE == "atref" else 1.0
             side_cap = sum(s for _t, s in lv_now) * cap_mult
             # atref collapses the side's WHOLE ladder to one price level by
@@ -12502,7 +12556,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                                      if KEEP_ACCRUAL_WHILE_PROGRAMMED
                                      else "pruned with known_tickers")
         + ("; near-cliff: banked >= %g of the cliff and projected within $%.2f "
-           "under it quotes to completion" % (NEAR_CLIFF_MIN_BANKED_FRAC, NEAR_CLIFF_DOLLARS)
+           "under it quotes to completion%s"
+           % (NEAR_CLIFF_MIN_BANKED_FRAC, NEAR_CLIFF_DOLLARS,
+              (" at x%g size until it crosses" % NEAR_CLIFF_SIZE_MULT)
+              if NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0 else "")
            if NEAR_CLIFF_DOLLARS > 0 and EXIT_FLOOR_IS_PAYOUT else "; near-cliff off"))
     _n_daily = load_daily_series_file()
     log(f"[IMM] daily-family exclusion (no global hour window, no Saturday "

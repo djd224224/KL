@@ -3316,3 +3316,52 @@ to completion" and then be stopped by the zero_yield gate (the RECYDS
 DETASTBROWN14 escalator did exactly that; the sink row shows near_cliff
 true with decision zero_yield) -- cosmetic, fix with the next functional
 change rather than a restart of its own.
+
+## 2026-09-26 pm — Near-cliff SIZE mode: x1.5 ladder until the banked accrual crosses the cliff (Jack)
+
+Jack: "if Banked + projected is near cliff, do a 1.5x size multiplier to
+ensure it gets across the cliff".
+
+CHANGE (NEAR_CLIFF_SIZE_MULT = 1.5, env IMM_NEAR_CLIFF_SIZE_MULT, 1.0 =
+off). When the floor verdict admits or keeps a market on the near-cliff
+rule it also ARMS size mode for that ticker (IncentiveMarketMaker.
+_near_cliff_boost, ticker -> armed ts). While armed, _near_cliff_size_mult
+(ticker) scales the ladder everywhere the shape is read -- the quote
+loop's rungs (so side_max and the deep-reference multiplier scale with
+them), the refresh's collateral reservation, the placement guard's
+side/level bracket in place_with_caps, and the estimator's hypothetical
+ladder (live estimate and every multiplier of the schedule profile) -- the
+2026-07-14 rule that every consumer sees one shape. The mode is STICKY
+for the period once armed: _prune_near_cliff_boost, run at the top of the
+refresh's yield pass, ends it when the banked accrual crosses the cliff
+(logs "near-cliff: <ticker> crossed the cliff (banked $x); ladder back to
+normal size" -- the $1 is secured and accrual above it pays linearly, so
+there is no reason to carry the extra size) or when the market has left
+the selection; a period roll resets the banked amount and the market is
+judged fresh anyway. Stickiness matters: the boosted projection often
+clears the bar outright at the next refresh, which would otherwise switch
+the boost off, drop the projection back under, and switch it on again.
+Arming happens in the floor verdict, AFTER that refresh's estimate, so the
+estimator sees the boosted ladder from the following refresh; the quote
+loop sizes it up in the same cycle. The near-cliff log line now names the
+size ("quoting to completion at x1.5 size until it crosses"), and the
+selection_snapshot rows carry near_cliff_boost next to near_cliff. Also
+fixed here: a FRESH zero-yield candidate no longer logs or arms (the
+zero_yield gate stops it anyway); members are unaffected.
+
+Why 1.5x and not more: the share model is roughly linear in our size at
+these depths (the Red Rocks strikes are ~0.4% of a 12k-50k book), so 1.5x
+size is ~1.5x accrual rate -- CHR at $0.045/day x 5.2d = $0.23 becomes
+~$0.35 on top of $0.70 banked, over the cliff instead of $0.07 under it.
+The cost is 1.5x the fill exposure on markets that are, by construction,
+already mostly paid for; caps are untouched (the 29/30-lot Red Rocks
+ladders go to 44/45 against a 150 position cap).
+
+Tests: the near-cliff test now runs a plain control first, then checks
+the armed market rests exactly x1.5 the control's rung sizes, is flagged
+near_cliff_boost in the selection, that the estimator's number rises from
+the refresh after arming (bounded by 2x -- the share model steps at the
+reference depth, so it is not a linear bound), that crossing the cliff
+(banked 1.05 on the 1e9 scale) ends the mode and the next cycle re-places
+the plain sizes, and that NEAR_CLIFF_SIZE_MULT=1.0 arms but does not
+resize. 630 green.

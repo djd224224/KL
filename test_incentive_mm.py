@@ -12325,6 +12325,16 @@ class TestNearCliffQuoteToCompletion(unittest.TestCase):
             self.assertFalse(imm.near_cliff_ok(0.70, 0.99))
 
     def test_banked_market_inside_the_margin_re_enters_and_stays(self):
+        # control first, at the ordinary bars: a fresh member rests the plain
+        # ladder (its estimate and sizes are the yardstick below)
+        _clean_persist()
+        ctl = IncentiveMarketMaker(client=FakeClient(), live=False)
+        ctl.run_cycle()
+        self.assertIn(self.T, ctl.state.selected)
+        plain = {int(o["remaining_count"]) for o in ctl.state.sim_orders.values()
+                 if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
+        self.assertTrue(plain)
+        self.assertNotIn(self.T, ctl._near_cliff_boost)
         # the 1e9 scale of the exit-bar tests: the real ~$1 projection is
         # then negligible and the total is the banked amount
         old = (imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS)
@@ -12336,6 +12346,49 @@ class TestNearCliffQuoteToCompletion(unittest.TestCase):
                 self.assertIn(self.T, bot.state.selected)
                 self.assertTrue(bot.state.selected[self.T].near_cliff)
                 self.assertNotIn(self.T, bot.state.hopeless_since)
+                # SIZE MODE (Jack: "do a 1.5x size multiplier to ensure it gets
+                # across the cliff"): armed, flagged, and the resting ladder
+                # is x1.5 the control's
+                self.assertIn(self.T, bot._near_cliff_boost)
+                self.assertTrue(bot.state.selected[self.T].near_cliff_boost)
+                boosted = {int(o["remaining_count"]) for o in bot.state.sim_orders.values()
+                           if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
+                self.assertEqual(boosted, {int(c * 1.5 + 0.5) for c in plain})
+                # the estimator sees the boosted ladder too (the same shape
+                # everywhere) from the refresh AFTER arming -- the mode is armed
+                # in the floor verdict, which runs after that refresh's estimate
+                bot.state.universe_at = 0.0
+                bot.run_cycle()
+                self.assertIn(self.T, bot._near_cliff_boost)      # sticky
+                ctl_meta = ctl.state.selected[self.T]
+                self.assertGreater(bot.state.selected[self.T].est_dollars_per_day,
+                                   ctl_meta.est_dollars_per_day)
+                # (not a linear bound: the share model steps at the reference
+                # depth, so x1.5 size can read a little more than x1.5 share)
+                self.assertLess(bot.state.selected[self.T].est_dollars_per_day,
+                                2.0 * ctl_meta.est_dollars_per_day)
+                # crossing the cliff ends the mode: size back to the plain ladder
+                bot.state.accrued_est[self.T] = 1.05e9
+                bot.state.universe_at = 0.0
+                bot.run_cycle()
+                self.assertIn(self.T, bot.state.selected)
+                self.assertNotIn(self.T, bot._near_cliff_boost)
+                self.assertFalse(bot.state.selected[self.T].near_cliff_boost)
+                after = {int(o["remaining_count"]) for o in bot.state.sim_orders.values()
+                         if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
+                self.assertEqual(after, plain)
+                # size knob off: armed but the ladder stays plain
+                with mock.patch.object(imm, "NEAR_CLIFF_SIZE_MULT", 1.0):
+                    bot2 = self._banked_bot(0.90e9)
+                    bot2.run_cycle()
+                    self.assertIn(self.T, bot2._near_cliff_boost)
+                    self.assertEqual(bot2._near_cliff_size_mult(self.T), 1.0)
+                    sz = {int(o["remaining_count"]) for o in bot2.state.sim_orders.values()
+                          if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
+                    self.assertEqual(sz, plain)
+                bot = self._banked_bot(0.90e9)            # re-arm for the member checks below
+                bot.run_cycle()
+                self.assertIn(self.T, bot.state.selected)
                 # as a member with the hopeless clock long expired, it stays
                 bot._est_peak.clear()
                 bot.state.hopeless_since[self.T] = (
