@@ -3467,3 +3467,32 @@ ladders. Watch: these one-sub-tick books put our 60-lots at the maker's
 own touch on both sides, so fill risk on the escalators is now the
 maker's, not a penny behind it; the first Sunday of settled escalator
 fills (9/27) is the measurement.
+
+## 2026-09-26 pm — Ladders / escalators: x3 size (90 on a Saturday) and a $1.20 fresh-entry bar (Jack)
+
+Jack, once the sub-penny buckets had the escalators resting at the exact
+touch: "3x ESCALATOR/LADDER instead of 2x'ing. so should be 90. and lower
+entry floor to 1.2 for ESCALATOR/LADDER".
+
+CHANGE (archetype KXNFLLADDERREC, cloned onto every pattern sibling):
+size_mult 2.0 -> 3.0 (env IMM_SPORTS_LADDER_SIZE_MULT): 20 x 3 = 60 on a
+weekday, x1.5 Saturday = 90 (the number Jack named), quiet hours x2 on top
+(120 / 180), near-cliff size mode x1.5 on top of that; per-market cap 450
+and per-event cap 3,000 follow through applied_mention_mult; the
+estimator's hypothetical ladder and so the payout-floor projection see x3.
+min_est_total = 1.20 (env IMM_SPORTS_LADDER_MIN_EST_TOTAL): the family's
+FRESH-entry bar (series_min_est_total, read by floor_bar_dollars for a
+candidate with nothing banked); members and banked re-entrants keep the
+$1.00 cliff, the near-cliff rule keeps its $0.15 margin. Every other
+series stays at $1.50 -- the 9/12 "same bar everywhere" test now carves
+out exactly the SPORTS_LADDER_LEAGUE_RE family.
+
+Expect: at the 17:30Z refresh 122 escalators were payout_floor at a p50
+projection of $0.57/day on a one-day window against $1.50; x1.5 more size
+(3 vs 2) and a $1.20 bar should admit a good part of the top half. Collateral
+rises with it (~$13.2k ladder collateral before this; the $1,000-per-market
+COLLATERAL_BUDGET check and the inventory reserve are unchanged).
+
+Tests: the allowlist test reads x3 rungs / caps and the $1.20 bar for a
+fresh candidate, the cliff for banked, $1.50 for an ordinary series; the
+same-bar invariant test admits only this family under $1.50. 632 green.

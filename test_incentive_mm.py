@@ -1728,6 +1728,12 @@ class TestPayoutFloorOneFifty(unittest.TestCase):
             self.assertEqual(imm.series_min_est_total(s), 1.5, s)
         for s, ov in imm.SERIES_OVERRIDES.items():
             if ov.min_est_total is not None:
+                if imm.SPORTS_LADDER_LEAGUE_RE.fullmatch(s):
+                    # the ONE family with its own fresh-entry bar (Jack
+                    # 2026-09-26 pm: "lower entry floor to 1.2 for
+                    # ESCALATOR/LADDER"); the $1.00 cliff still binds
+                    self.assertEqual(imm.series_min_est_total(s), 1.2, s)
+                    continue
                 self.assertGreaterEqual(imm.series_min_est_total(s), 1.5,
                                         f"{s} carries a bar under $1.50")
 
@@ -4044,15 +4050,22 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             # hits payout floor)" -- band, x2 geometry, and the screen
             self.assertEqual(imm.member_price_band("KXNBALADDERPTS", False), (1, 99))
             self.assertEqual(imm.member_price_band("KXNBALADDERPTS", True), (1, 99))
-            self.assertEqual(imm.applied_mention_mult("KXNBALADDERPTS"), 2.0)
+            # 2026-09-26 pm: x3 ("so should be 90" on a Saturday) and a $1.20
+            # fresh-entry bar for the family; the cliff for banked / members
+            self.assertEqual(imm.applied_mention_mult("KXNBALADDERPTS"), 3.0)
+            self.assertEqual(imm.series_min_est_total("KXNBALADDERPTS"), 1.2)
+            self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=False), 1.2)
+            self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=True),
+                             imm.PAYOUT_FLOOR_DOLLARS)
+            self.assertEqual(imm.series_min_est_total("KXGOOD"), imm.MIN_EST_TOTAL_DOLLARS)
             noon = utc(2026, 9, 30, 15, 0)              # a weekday, no hour mult
             base = imm.series_levels("KXNBALADDERPTS")
             self.assertEqual(imm.hour_scaled_levels("KXNBALADDERPTS", noon),
-                             [(t_, 2 * s_) for t_, s_ in base])
+                             [(t_, 3 * s_) for t_, s_ in base])
             self.assertEqual(imm.series_max_position("KXNBALADDERPTS"),
-                             2 * imm.MAX_POSITION_CONTRACTS)
+                             3 * imm.MAX_POSITION_CONTRACTS)
             self.assertEqual(imm.event_cap_contracts("KXNBALADDERPTS-26OCT21BOSNYK"),
-                             2 * imm.MAX_EVENT_CONTRACTS)
+                             3 * imm.MAX_EVENT_CONTRACTS)
             bot = IncentiveMarketMaker(client=None, live=False)
             now = datetime.now(timezone.utc)
             lad_meta = _meta(series="KXNBALADDERPTS",

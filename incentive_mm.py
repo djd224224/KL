@@ -4392,12 +4392,21 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # size multiplier (size_mult -> applied_mention_mult -> hour_scaled_levels,
 # so the estimator projects the doubled ladder against the floor; caps and
 # skew knees scale with it).
+# 2026-09-26 pm, once the sub-penny fixes had the escalators resting at the
+# exact touch (Jack: "3x ESCALATOR/LADDER instead of 2x'ing. so should be
+# 90. and lower entry floor to 1.2 for ESCALATOR/LADDER"): size_mult 2 -> 3
+# (20 x 3 = 60 on a weekday, x1.5 Saturday = 90, quiet hours x2 on top;
+# per-market cap 450 / per-event 3,000 through applied_mention_mult) and a
+# family FRESH-entry bar of $1.20 (min_est_total; the $1.00 cliff still
+# governs members and banked re-entrants via floor_bar_dollars). Env
+# IMM_SPORTS_LADDER_SIZE_MULT / IMM_SPORTS_LADDER_MIN_EST_TOTAL.
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
+    min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.2),
     safe_join=True,
     price_min_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MIN", 1),
     price_max_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MAX", 99),
-    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 2.0))
+    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 3.0))
 
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
