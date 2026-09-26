@@ -1582,6 +1582,19 @@ def floor_bar_dollars(series: str, banked: bool) -> float:
     return series_min_est_total(series)
 
 
+def near_cliff_ok(accrued: float, projected_total: float) -> bool:
+    """The near-cliff rule (NEAR_CLIFF_DOLLARS, 2026-09-26): True when this
+    period's banked accrual is at least NEAR_CLIFF_MIN_BANKED_FRAC of the
+    PAYOUT_FLOOR_DOLLARS cliff AND the projected total (banked + remaining
+    window) lands within NEAR_CLIFF_DOLLARS under the cliff. Off outside
+    the cliff regime and when the knob is 0."""
+    if NEAR_CLIFF_DOLLARS <= 0 or not EXIT_FLOOR_IS_PAYOUT:
+        return False
+    if accrued < NEAR_CLIFF_MIN_BANKED_FRAC * PAYOUT_FLOOR_DOLLARS:
+        return False
+    return projected_total >= PAYOUT_FLOOR_DOLLARS - NEAR_CLIFF_DOLLARS
+
+
 def series_atref_price_tol(series: str) -> int:
     """Per-series at-ref requote hysteresis (ticks), else the global
     ATREF_PRICE_TOL_TICKS (read at call time so env/test patches apply)."""
@@ -4728,6 +4741,23 @@ FLOOR_ACCRUAL_PER_PERIOD = os.environ.get(
 #   * a fresh candidate (nothing banked) still needs MIN_EST_TOTAL_DOLLARS.
 # IMM_EXIT_FLOOR_IS_PAYOUT=0 restores the single $1.50 bar everywhere.
 EXIT_FLOOR_IS_PAYOUT = os.environ.get("IMM_EXIT_FLOOR_IS_PAYOUT", "1") == "1"
+# NEAR-CLIFF QUOTE-TO-COMPLETION (Jack 2026-09-26, "build the knob for
+# banked markets near the cliff"). Measured at the 16:10Z refresh: the
+# Red Rocks strikes had $0.50-0.70 banked this period and projected
+# $0.85-1.00 in total against the $1.00 cliff -- CHR at $1.00 vs $1.00,
+# floored by rounding -- and while they sit out the banked part is frozen,
+# so they can only drift further under. A market that has ALREADY banked
+# at least NEAR_CLIFF_MIN_BANKED_FRAC of the cliff this period and projects
+# (banked + remaining) to within NEAR_CLIFF_DOLLARS under it is treated as
+# reaching the bar: it re-enters or stays (the hopeless exit reads the same
+# verdict, so no flapping around the cliff) and quotes to completion. The
+# downside is bounded -- at most NEAR_CLIFF_DOLLARS of projected shortfall
+# on a market that is mostly paid for -- and the upside is the whole banked
+# credit. Fresh candidates (nothing banked) are untouched: the $1.50 entry
+# bar stays. Only meaningful in the cliff regime (EXIT_FLOOR_IS_PAYOUT).
+# IMM_NEAR_CLIFF_DOLLARS=0 switches it off.
+NEAR_CLIFF_DOLLARS = _env_float("IMM_NEAR_CLIFF_DOLLARS", 0.15)
+NEAR_CLIFF_MIN_BANKED_FRAC = _env_float("IMM_NEAR_CLIFF_MIN_BANKED_FRAC", 0.5)
 # THE FLOOR PROJECTION IS JUDGED AT DAY SIZE (same incident). The yield
 # estimator sizes its ladder with hour_size_mult (launcher
 # IMM_HOUR_SIZE_MULT=0-9:2.0, Saturday x1.5), so est_dollars_per_day
@@ -4898,6 +4928,8 @@ _CONFIG_CODE_KNOBS = (
     "KEEP_ACCRUAL_WHILE_PROGRAMMED",
     # schedule-weighted floor projection (2026-09-26)
     "FLOOR_PROJECTION_SCHEDULE", "FLOOR_PROFILE_MAX_DAYS",
+    # near-cliff quote-to-completion (2026-09-26)
+    "NEAR_CLIFF_DOLLARS", "NEAR_CLIFF_MIN_BANKED_FRAC",
 )
 
 
@@ -7130,6 +7162,7 @@ class MarketMeta:
     floor_dollars_per_day: float = 0.0  # the $ floors' projection: window-weighted over the
     #   size schedule (FLOOR_PROJECTION_SCHEDULE), else at DAY size (FLOOR_PROJECTION_BASE_SIZE)
     floor_mult_profile: str = ""        # "1:0.583,2:0.417" -- the schedule mix behind it
+    near_cliff: bool = False            # admitted / kept by the near-cliff rule this refresh
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
     # set by _estimate_candidate_yield alongside est_frac; consumed by the
     # quote-gaps email's earnings-per-$-of-exposure ranking (Jack 2026-08-12)
@@ -9120,7 +9153,23 @@ class IncentiveMarketMaker:
             # not "would we enter it today".
             floor_bar = floor_bar_dollars(
                 meta.series, meta.ticker in prev_selected or accrued > 0.0)
-            reaches_min = accrued + max(est_total, proj_peak) >= floor_bar
+            projected_total = accrued + max(est_total, proj_peak)
+            reaches_min = projected_total >= floor_bar
+            # NEAR-CLIFF (Jack 2026-09-26, see NEAR_CLIFF_DOLLARS): a market
+            # that has banked most of the cliff and projects to just under
+            # it quotes to completion -- the same verdict feeds the hopeless
+            # exit below, so it cannot flap around the cliff.
+            meta.near_cliff = False
+            if not reaches_min and near_cliff_ok(accrued, projected_total):
+                reaches_min = True
+                meta.near_cliff = True
+                _noted = self.__dict__.setdefault("_near_cliff_noted", {})
+                if meta.ticker not in _noted:
+                    _noted[meta.ticker] = now_ts
+                    log(f"{self.tag} near-cliff: {meta.ticker} banked ${accrued:.2f} "
+                        f"+ projected ${max(est_total, proj_peak):.2f} = "
+                        f"${projected_total:.2f}, within ${NEAR_CLIFF_DOLLARS:.2f} of "
+                        f"the ${PAYOUT_FLOOR_DOLLARS:.2f} cliff; quoting to completion")
             # DIP GUARD (Jack 2026-08-05). Track how long the projection has
             # been continuously under the bar; the exit below refuses to fire
             # until that exceeds HOPELESS_SUSTAIN_SECS. Any single reading at
@@ -9515,6 +9564,7 @@ class IncentiveMarketMaker:
                     "est_dollars_per_day": round(mt.est_dollars_per_day, 4),
                     "floor_dollars_per_day": round(mt.floor_dollars_per_day, 4),
                     "floor_mult_profile": mt.floor_mult_profile,
+                    "near_cliff": bool(getattr(mt, "near_cliff", False)),
                     "yield_per_contract": round(mt.yield_per_contract, 6),
                     "dollars_per_day": round(mt.dollars_per_day, 2),
                     "target_size": mt.target_size,
@@ -12450,7 +12500,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             else "at day size" if FLOOR_PROJECTION_BASE_SIZE else "at live size")
         + "; accrual counters %s" % ("kept while programmed"
                                      if KEEP_ACCRUAL_WHILE_PROGRAMMED
-                                     else "pruned with known_tickers"))
+                                     else "pruned with known_tickers")
+        + ("; near-cliff: banked >= %g of the cliff and projected within $%.2f "
+           "under it quotes to completion" % (NEAR_CLIFF_MIN_BANKED_FRAC, NEAR_CLIFF_DOLLARS)
+           if NEAR_CLIFF_DOLLARS > 0 and EXIT_FLOOR_IS_PAYOUT else "; near-cliff off"))
     _n_daily = load_daily_series_file()
     log(f"[IMM] daily-family exclusion (no global hour window, no Saturday "
         f"mult): prefixes {','.join(DAILY_PREFIXES) or '(none)'} + structural "

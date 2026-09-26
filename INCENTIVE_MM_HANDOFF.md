@@ -3239,3 +3239,56 @@ KXSUEZWEEKLY 0.25x) are book moves -- their LIVE estimates moved the same
 way between the two reads. Profiles are in the sink rows
 (floor_mult_profile); 1,697 rows carry none because they never reached
 the estimator (cutoff / extreme_mid / one_sided / manual).
+
+## 2026-09-26 pm — Near-cliff rule: a market that has banked most of the $1 and projects to just under it quotes to completion (Jack)
+
+Jack, after the schedule-weighted projection flipped only Sunday NFL
+ladders ("im just surprised that ONLY nfl ladders flip and nothing else
+flipped at all"): the measured picture at the 16:10Z refresh was 525 of
+820 floored markets in daily program periods with ~12h of window left
+(4-90x short of the bar, nothing a size multiplier can fix), the NFL
+ladders the only large near-bar group, and the Red Rocks strikes the one
+family sitting AT the cliff: KXVENUEPERFORM-REDROCKS28JAN01 CHR $0.70
+banked + $0.30 projected = $1.00 vs $1.00 (floored by rounding), LOR $0.62
++ $0.36 = $0.98, NOA $0.66 + $0.30 = $0.96, BLU $0.55 + $0.38 = $0.93, BIL
+$0.50 + $0.35 = $0.85. While they sit out the banked part is frozen and
+the window keeps shrinking, so they can only drift further under. Jack:
+"yes, build the knob for banked markets near the cliff".
+
+CHANGE (near_cliff_ok; knobs NEAR_CLIFF_DOLLARS = 0.15, env
+IMM_NEAR_CLIFF_DOLLARS, 0 = off; NEAR_CLIFF_MIN_BANKED_FRAC = 0.5, env
+IMM_NEAR_CLIFF_MIN_BANKED_FRAC). In the shared floor verdict (entry bar
+AND hopeless exit), after `reaches_min = banked + max(projection, 1h peak)
+>= floor_bar`: a market that has banked at least half the PAYOUT_FLOOR
+cliff THIS period and whose projected total lands within
+NEAR_CLIFF_DOLLARS under the cliff is treated as reaching the bar. It
+re-enters (or stays -- the hopeless exit reads the same verdict, so no
+flapping around the cliff) and quotes to completion. Fresh candidates
+(nothing banked) are untouched: the $1.50 entry bar stays. Only in the
+cliff regime (EXIT_FLOOR_IS_PAYOUT); off outside it. Bounded downside: at
+most NEAR_CLIFF_DOLLARS of projected shortfall on a market that is at
+least half paid for, against the whole banked credit as upside. One log
+line per market ("near-cliff: <ticker> banked $x + projected $y = $z,
+within $0.15 of the $1.00 cliff; quoting to completion"),
+MarketMeta.near_cliff in the selection_snapshot rows, both knobs in the
+config hash, the banner names the rule.
+
+Not changed: the rate floor (re-entry of non-members below the series
+min rate still needs the horizon escape), zero_yield, event caps and
+ranking -- a near-cliff market still competes for its seat on
+yield_per_contract like everyone else; Red Rocks held seats before, so it
+should again.
+
+Expect at the first refresh after deploy: the four Red Rocks strikes
+within $0.15 (CHR, LOR, NOA, BLU) back in with near_cliff=true; BIL
+($0.85 exactly at the edge, inclusive) in if its projection has not
+slipped; KXBAA-28JANDELIV-640 ($1.49 vs the $1.50 FRESH bar) stays out --
+nothing banked, the rule does not apply.
+
+Tests: TestNearCliffQuoteToCompletion -- the rule's edges (0.70/0.93 in,
+0.50/0.85 in, 0.70/0.84 out, 0.40/0.93 out, fresh never, kill switch,
+non-cliff regime); on the exit-bar tests' 1e9 scale a $0.90-banked market
+re-enters with near_cliff set, stays as a member with the hopeless clock
+expired, $0.80 stays floored, banked-fraction knob at 0.95 keeps it out, a
+fresh candidate keeps the $1.50 bar, NEAR_CLIFF_DOLLARS=0 keeps it out.
+630 green.

@@ -12292,6 +12292,81 @@ class TestExitBarIsThePayoutCliff(unittest.TestCase):
             imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
 
 
+class TestNearCliffQuoteToCompletion(unittest.TestCase):
+    """Jack 2026-09-26, "build the knob for banked markets near the cliff":
+    a market that has banked at least half the $1.00 cliff this period and
+    projects (banked + remaining) to within NEAR_CLIFF_DOLLARS under it
+    quotes to completion -- the Red Rocks state at 16:10Z (CHR $0.70 banked
+    + $0.30 projected = $1.00 vs $1.00, floored by rounding; BLU $0.55 +
+    $0.38 = $0.93). Same verdict for entry and the hopeless exit."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def _period_key(self, bot):
+        return imm.parse_iso_utc(bot.client.programs[0]["start_date"]).isoformat()
+
+    def _banked_bot(self, banked):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.state.accrued_est[self.T] = banked
+        bot.state.period_start[self.T] = self._period_key(bot)
+        return bot
+
+    def test_the_rule(self):
+        self.assertEqual((imm.NEAR_CLIFF_DOLLARS, imm.NEAR_CLIFF_MIN_BANKED_FRAC), (0.15, 0.5))
+        self.assertTrue(imm.near_cliff_ok(0.70, 0.93))        # banked 0.70, total 0.93 >= 0.85
+        self.assertTrue(imm.near_cliff_ok(0.50, 0.85))        # both edges inclusive
+        self.assertFalse(imm.near_cliff_ok(0.70, 0.84))       # outside the margin
+        self.assertFalse(imm.near_cliff_ok(0.40, 0.93))       # not banked enough
+        self.assertFalse(imm.near_cliff_ok(0.0, 1.40))        # fresh: never
+        with mock.patch.object(imm, "NEAR_CLIFF_DOLLARS", 0.0):
+            self.assertFalse(imm.near_cliff_ok(0.70, 0.99))
+        with mock.patch.object(imm, "EXIT_FLOOR_IS_PAYOUT", False):
+            self.assertFalse(imm.near_cliff_ok(0.70, 0.99))
+
+    def test_banked_market_inside_the_margin_re_enters_and_stays(self):
+        # the 1e9 scale of the exit-bar tests: the real ~$1 projection is
+        # then negligible and the total is the banked amount
+        old = (imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS)
+        imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = 2e9, 1e9
+        try:
+            with mock.patch.object(imm, "NEAR_CLIFF_DOLLARS", 0.15e9):
+                bot = self._banked_bot(0.90e9)            # $0.90 of the $1.00 cliff
+                bot.run_cycle()
+                self.assertIn(self.T, bot.state.selected)
+                self.assertTrue(bot.state.selected[self.T].near_cliff)
+                self.assertNotIn(self.T, bot.state.hopeless_since)
+                # as a member with the hopeless clock long expired, it stays
+                bot._est_peak.clear()
+                bot.state.hopeless_since[self.T] = (
+                    time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+                bot.state.universe_at = 0.0
+                bot.run_cycle()
+                self.assertIn(self.T, bot.state.selected)
+                self.assertNotIn(self.T, bot.state.hopeless_since)
+                # outside the margin: floored as before
+                bot = self._banked_bot(0.80e9)
+                bot.run_cycle()
+                self.assertNotIn(self.T, bot.state.selected)
+                # inside the margin but not banked enough for the rule
+                with mock.patch.object(imm, "NEAR_CLIFF_MIN_BANKED_FRAC", 0.95):
+                    bot = self._banked_bot(0.90e9)
+                    bot.run_cycle()
+                    self.assertNotIn(self.T, bot.state.selected)
+                # a fresh candidate keeps the $1.50 entry bar
+                _clean_persist()
+                bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+                bot.run_cycle()
+                self.assertNotIn(self.T, bot.state.selected)
+            # kill switch
+            with mock.patch.object(imm, "NEAR_CLIFF_DOLLARS", 0.0):
+                bot = self._banked_bot(0.90e9)
+                bot.run_cycle()
+                self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
+
+
 class TestFloorProjectionFollowsSchedule(unittest.TestCase):
     """2026-09-25: the floors read a DAY-size projection so a market was not
     admitted on doubled size and evicted on normal size (the estimator sizes
