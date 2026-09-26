@@ -12292,58 +12292,113 @@ class TestExitBarIsThePayoutCliff(unittest.TestCase):
             imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
 
 
-class TestFloorProjectionAtDaySize(unittest.TestCase):
-    """Same incident, the churn engine: the estimator sizes its ladder with
-    the hour multiplier, so the projection doubled at 04:00Z (re-admit) and
-    halved at 14:00Z (evict an hour later, every day). The floors now read
-    a day-size projection (MarketMeta.floor_dollars_per_day)."""
+class TestFloorProjectionFollowsSchedule(unittest.TestCase):
+    """2026-09-25: the floors read a DAY-size projection so a market was not
+    admitted on doubled size and evicted on normal size (the estimator sizes
+    its ladder with the hour multiplier). 2026-09-26, Jack: "the payout-floor
+    should factor in Saturday and quiet-hour size proportionally to the
+    calculation ... this should be true generally, not just on
+    ESCALATOR/LADDER" -> floor_dollars_per_day is the window-weighted mean
+    of what the ladder earns at each multiplier the schedule will apply."""
 
     T = "KXGOOD-99DEC31-A"
 
     def setUp(self):
-        self._mults = imm.HOUR_SIZE_MULTS
+        self._mults, self._sat = imm.HOUR_SIZE_MULTS, imm.SAT_SIZE_MULT
+        imm.SAT_SIZE_MULT = 1.0
 
     def tearDown(self):
-        imm.HOUR_SIZE_MULTS = self._mults
+        imm.HOUR_SIZE_MULTS, imm.SAT_SIZE_MULT = self._mults, self._sat
 
-    def _meta(self):
+    def _meta(self, days=None):
+        end = (datetime.now(timezone.utc) + timedelta(days=days)) if days else None
         return MarketMeta(ticker=self.T, event_ticker="KXGOOD-99DEC31",
                           series="KXGOOD", dollars_per_day=100.0,
-                          program_end=None, target_size=1000.0,
+                          program_end=end, target_size=1000.0,
                           discount_factor=0.5, cutoff=None, close_time=None)
 
-    def test_day_size_projection_under_a_multiplier(self):
+    def test_profile_splits_the_window_by_multiplier(self):
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        imm.SAT_SIZE_MULT = 1.5
+        sat_8pm = imm.ET.localize(datetime(2026, 9, 26, 20, 0)).astimezone(timezone.utc)
+        # Sat 20:00-24:00 ET at x1.5 (4h), then Sun 00:00-06:00 at x2 (6h)
+        self.assertEqual(imm.size_mult_profile("KXGOOD", sat_8pm, 10 / 24),
+                         [(1.5, 0.4), (2.0, 0.6)])
+        # one full day from a Tuesday 12:17: 10 quiet hours of 24, wherever it starts
+        tue = imm.ET.localize(datetime(2026, 9, 29, 12, 17)).astimezone(timezone.utc)
+        prof = dict(imm.size_mult_profile("KXGOOD", tue, 1.0))
+        self.assertAlmostEqual(prof[2.0], 10 / 24, places=9)
+        self.assertAlmostEqual(prof[1.0], 14 / 24, places=9)
+        # one full week: Saturday splits 14h at x1.5 and 10h at x3 (composed)
+        prof = dict(imm.size_mult_profile("KXGOOD", tue, 7.0))
+        self.assertAlmostEqual(prof[3.0], 10 / 168, places=9)
+        self.assertAlmostEqual(prof[1.5], 14 / 168, places=9)
+        self.assertAlmostEqual(prof[2.0], 60 / 168, places=9)
+        self.assertAlmostEqual(prof[1.0], 84 / 168, places=9)
+        # the walk caps at FLOOR_PROFILE_MAX_DAYS; that mix stands for longer windows
+        self.assertEqual(imm.size_mult_profile("KXGOOD", tue, 60.0),
+                         imm.size_mult_profile("KXGOOD", tue, imm.FLOOR_PROFILE_MAX_DAYS))
+        # a series the schedule excludes sees only 1.0; an empty window
+        # reports the live multiplier alone
+        self.assertEqual(imm.size_mult_profile("KXTEMPNYC", sat_8pm, 10 / 24), [(1.0, 1.0)])
+        self.assertEqual(imm.size_mult_profile("KXGOOD", sat_8pm, 0.0), [(1.5, 1.0)])
+        # the explicit-multiplier ladder is the hour ladder at that multiplier
+        self.assertEqual(imm.scaled_levels_at("KXGOOD", 2.0),
+                         [(t_, 2 * s_) for t_, s_ in imm.series_levels("KXGOOD")])
+        self.assertEqual(imm.scaled_levels_at("KXGOOD", 1.0), imm.base_scaled_levels("KXGOOD"))
+
+    def test_floor_is_the_window_weighted_mean_over_the_schedule(self):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         imm.HOUR_SIZE_MULTS = {}
         base = self._meta()
         self.assertTrue(bot._estimate_candidate_yield(base, []))
         self.assertGreater(base.est_dollars_per_day, 0.0)
-        # no multiplier active: the floor reads the live estimate, exactly
+        # no multiplier anywhere in the window: the floor IS the live estimate
         self.assertEqual(base.floor_dollars_per_day, base.est_dollars_per_day)
-        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-23:2.0")   # always doubled
+        self.assertEqual(base.floor_mult_profile, "1:1.000")
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-23:2.0")   # doubled all day
         doubled = self._meta()
         self.assertTrue(bot._estimate_candidate_yield(doubled, []))
-        # the live estimate grows with the ladder...
         self.assertGreater(doubled.est_dollars_per_day, base.est_dollars_per_day)
-        # ...the floor projection does not
-        self.assertAlmostEqual(doubled.floor_dollars_per_day,
-                               base.est_dollars_per_day, places=9)
+        # the whole window rests the doubled ladder, so the floor follows it
+        # (the 9/25 day-size rule read base.est here -- still there behind
+        # the kill switch), and the live-size knob still means live
+        self.assertEqual(doubled.floor_dollars_per_day, doubled.est_dollars_per_day)
+        with mock.patch.object(imm, "FLOOR_PROJECTION_SCHEDULE", False):
+            day = self._meta()
+            self.assertTrue(bot._estimate_candidate_yield(day, []))
+            self.assertAlmostEqual(day.floor_dollars_per_day,
+                                   base.est_dollars_per_day, places=9)
+            self.assertEqual(day.floor_mult_profile, "1:1.000")
         with mock.patch.object(imm, "FLOOR_PROJECTION_BASE_SIZE", False):
             live = self._meta()
             self.assertTrue(bot._estimate_candidate_yield(live, []))
             self.assertEqual(live.floor_dollars_per_day, live.est_dollars_per_day)
+            self.assertEqual(live.floor_mult_profile, "")
+        # a 0-9 ET window over a one-day accrual window: 10/24 of the doubled
+        # ladder's share plus 14/24 of the day ladder's -- PROPORTIONALLY
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        mixed = self._meta(days=1)
+        self.assertTrue(bot._estimate_candidate_yield(mixed, []))
+        self.assertEqual(mixed.floor_mult_profile, "1:0.583,2:0.417")
+        self.assertAlmostEqual(
+            mixed.floor_dollars_per_day,
+            (14 * base.est_dollars_per_day + 10 * doubled.est_dollars_per_day) / 24,
+            places=6)
+        self.assertLess(base.est_dollars_per_day, mixed.floor_dollars_per_day)
+        self.assertLess(mixed.floor_dollars_per_day, doubled.est_dollars_per_day)
 
-    def test_incumbent_reads_the_day_ladder_on_the_external_book(self):
-        # live path: our doubled ladder is IN the book. The floor must see
-        # what the DAY ladder earns on the book WITHOUT us -- the same
-        # number a fresh read of the plain book gives with no multiplier.
+    def test_incumbent_projects_every_multiplier_on_the_external_book(self):
+        # live path: our doubled ladder is IN the book. Each multiplier's
+        # ladder is scored on the book WITHOUT us -- the day ladder's term is
+        # the number a fresh read of the plain book gives with no multiplier.
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         imm.HOUR_SIZE_MULTS = {}
         base = self._meta()
         self.assertTrue(bot._estimate_candidate_yield(base, []))
-        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-23:2.0")
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
         plain = bot.client.books[self.T]
         # our resting (doubled) ladder: bid 40 @ 49c, ask 40 @ 51c (= NO bid @ 49c)
         bot.client.books[self.T] = {"orderbook_fp": {
@@ -12352,14 +12407,27 @@ class TestFloorProjectionAtDaySize(unittest.TestCase):
         own = [("bid", 49, 40.0), ("ask", 51, 40.0)]
         bot.live = True
         try:
-            inc = self._meta()
+            inc = self._meta(days=1)
             self.assertTrue(bot._estimate_candidate_yield(inc, own))
+            # the day-size kill switch, under an all-day window so the
+            # live multiplier is 2.0 whatever the clock says (a window
+            # that is exactly the live multiplier reads the live estimate)
+            imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-23:2.0")
+            with mock.patch.object(imm, "FLOOR_PROJECTION_SCHEDULE", False):
+                day = self._meta(days=1)
+                self.assertTrue(bot._estimate_candidate_yield(day, own))
         finally:
             bot.live = False
             bot.client.books[self.T] = plain
         self.assertGreater(inc.est_dollars_per_day, 0.0)
-        self.assertAlmostEqual(inc.floor_dollars_per_day,
+        # day-size rule (kill switch): exactly the plain read
+        self.assertAlmostEqual(day.floor_dollars_per_day,
                                base.est_dollars_per_day, places=9)
+        # schedule: 14/24 of that plus 10/24 of the doubled ladder on the
+        # same external book -> strictly more, strictly under double
+        self.assertEqual(inc.floor_mult_profile, "1:0.583,2:0.417")
+        self.assertGreater(inc.floor_dollars_per_day, base.est_dollars_per_day)
+        self.assertLess(inc.floor_dollars_per_day, 2 * base.est_dollars_per_day)
 
     def test_external_levels_strips_own_orders(self):
         yes, no = imm.external_levels(

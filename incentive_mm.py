@@ -1470,6 +1470,47 @@ def base_scaled_levels(series: str) -> List[Tuple[int, int]]:
     return [(t, max(1, int(s * m + 0.5))) for t, s in lv]
 
 
+def scaled_levels_at(series: str, mult: float) -> List[Tuple[int, int]]:
+    """series_levels() at an EXPLICIT time-of-day multiplier `mult` (the
+    family multiplier always applied): the ladder the quote loop rests
+    whenever hour_size_mult() reads `mult`. hour_scaled_levels() is this at
+    the live multiplier, base_scaled_levels() at 1.0. Feeds the
+    schedule-weighted floor projection (FLOOR_PROJECTION_SCHEDULE)."""
+    lv = series_levels(series)
+    m = mult * applied_mention_mult(series)
+    if m == 1.0:
+        return lv
+    return [(t, max(1, int(s * m + 0.5))) for t, s in lv]
+
+
+def size_mult_profile(series: str, start_utc: datetime,
+                      horizon_days: float) -> List[Tuple[float, float]]:
+    """[(multiplier, share of the window)], sorted by multiplier: how the
+    next `horizon_days` split between the size multipliers hour_size_mult()
+    will apply to this series -- quiet hours x2, Saturday x1.5 (composed:
+    x3), the per-series evening halvings, the daily-family / scan / prefix
+    exclusions, all of it, because this IS hour_size_mult sampled once per
+    ET hour (ET hour boundaries are UTC hour boundaries). The walk is capped
+    at FLOOR_PROFILE_MAX_DAYS, whose mix then stands for a longer window.
+    An empty window reports the live multiplier alone."""
+    if horizon_days <= 0:
+        return [(hour_size_mult(series, start_utc), 1.0)]
+    remaining = min(horizon_days, max(FLOOR_PROFILE_MAX_DAYS, 1.0 / 24)) * 24.0
+    weights: Dict[float, float] = {}
+    t = start_utc
+    while remaining > 1e-9:
+        nxt = t.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        step = min(remaining, (nxt - t).total_seconds() / 3600.0)
+        if step <= 0:
+            step = min(remaining, 1.0)
+        m = hour_size_mult(series, t + timedelta(hours=step / 2.0))
+        weights[m] = weights.get(m, 0.0) + step
+        t += timedelta(hours=step)
+        remaining -= step
+    total = sum(weights.values()) or 1.0
+    return sorted((m, w / total) for m, w in weights.items())
+
+
 def series_max_position(series: str) -> float:
     ov = SERIES_OVERRIDES.get(series)
     base = ov.max_position if (ov and ov.max_position is not None) \
@@ -4703,6 +4744,24 @@ EXIT_FLOOR_IS_PAYOUT = os.environ.get("IMM_EXIT_FLOOR_IS_PAYOUT", "1") == "1"
 # IMM_FLOOR_PROJECTION_BASE_SIZE=0 restores the live-size projection.
 FLOOR_PROJECTION_BASE_SIZE = os.environ.get(
     "IMM_FLOOR_PROJECTION_BASE_SIZE", "1") == "1"
+# THE FLOOR PROJECTION FOLLOWS THE SIZE SCHEDULE (Jack 2026-09-26: "the
+# payout-floor should factor in Saturday and quiet-hour size proportionally
+# to the calculation ... this should be true generally, not just on
+# ESCALATOR/LADDER"). The flat day size above stopped the admit-on-doubled /
+# evict-on-normal churn, but it under-projects every market whose remaining
+# window holds quiet hours or a Saturday: the bot WILL rest the bigger
+# ladder then and earn its share of the pool. So floor_dollars_per_day is
+# now the window-weighted mean of what the ladder earns at each multiplier
+# hour_size_mult will apply between now and the end of the accrual window
+# (size_mult_profile: the schedule sampled once per ET hour, capped at
+# FLOOR_PROFILE_MAX_DAYS -- two weekly cycles stand for a longer window).
+# Time-consistent by construction: the mix a window carries does not depend
+# on which part of it is happening now, so the 04:00Z / 14:00Z projections
+# agree (up to the window shrinking) and nothing re-admits and evicts on the
+# clock. IMM_FLOOR_PROJECTION_SCHEDULE=0 restores the flat day size.
+FLOOR_PROJECTION_SCHEDULE = os.environ.get(
+    "IMM_FLOOR_PROJECTION_SCHEDULE", "1") == "1"
+FLOOR_PROFILE_MAX_DAYS = _env_float("IMM_FLOOR_PROFILE_MAX_DAYS", 14.0)
 # THE CREDIT SURVIVES AN EVICTION (same incident, third leg). known_tickers
 # drops every flat unmanaged market, and _save_persist pruned accrued_est /
 # period_base / period_start / hopeless_since / paid_crossed with it, so a
@@ -4837,6 +4896,8 @@ _CONFIG_CODE_KNOBS = (
     # floor credit (2026-09-25): exit bar, day-size projection, kept counters
     "EXIT_FLOOR_IS_PAYOUT", "FLOOR_PROJECTION_BASE_SIZE",
     "KEEP_ACCRUAL_WHILE_PROGRAMMED",
+    # schedule-weighted floor projection (2026-09-26)
+    "FLOOR_PROJECTION_SCHEDULE", "FLOOR_PROFILE_MAX_DAYS",
 )
 
 
@@ -7066,7 +7127,9 @@ class MarketMeta:
     program_start: Optional[datetime] = None
     est_frac: float = 0.0               # estimated pool share with our ladder resting
     est_dollars_per_day: float = 0.0    # est_frac x pool rate
-    floor_dollars_per_day: float = 0.0  # est at DAY size for the $ floors (FLOOR_PROJECTION_BASE_SIZE)
+    floor_dollars_per_day: float = 0.0  # the $ floors' projection: window-weighted over the
+    #   size schedule (FLOOR_PROJECTION_SCHEDULE), else at DAY size (FLOOR_PROJECTION_BASE_SIZE)
+    floor_mult_profile: str = ""        # "1:0.583,2:0.417" -- the schedule mix behind it
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
     # set by _estimate_candidate_yield alongside est_frac; consumed by the
     # quote-gaps email's earnings-per-$-of-exposure ranking (Jack 2026-08-12)
@@ -9451,6 +9514,7 @@ class IncentiveMarketMaker:
                     "series": mt.series, "event_ticker": mt.event_ticker,
                     "est_dollars_per_day": round(mt.est_dollars_per_day, 4),
                     "floor_dollars_per_day": round(mt.floor_dollars_per_day, 4),
+                    "floor_mult_profile": mt.floor_mult_profile,
                     "yield_per_contract": round(mt.yield_per_contract, 6),
                     "dollars_per_day": round(mt.dollars_per_day, 2),
                     "target_size": mt.target_size,
@@ -10061,34 +10125,51 @@ class IncentiveMarketMaker:
         meta.est_dollars_per_day = frac * meta.dollars_per_day
         meta.yield_per_contract = \
             (meta.est_dollars_per_day / n_contracts) if n_contracts else 0.0
-        # DAY-SIZE FLOOR PROJECTION (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25):
-        # what the day ladder (hour / Saturday multiplier off) would earn on
-        # the EXTERNAL book -- an incumbent's own hour-scaled orders are
-        # stripped first (external_levels) and the day ladder re-overlaid on
-        # that book's touches and reference prices. Identical to the live
-        # estimate whenever no multiplier is active, so nothing changes
-        # outside the multiplier windows.
+        # FLOOR PROJECTION. 2026-09-25 (FLOOR_PROJECTION_BASE_SIZE): judged at
+        # DAY size so a market is not admitted on doubled size and evicted
+        # on normal size. 2026-09-26 (FLOOR_PROJECTION_SCHEDULE, Jack: "the
+        # payout-floor should factor in Saturday and quiet-hour size
+        # proportionally to the calculation ... generally"): the projection
+        # is the window-weighted mean of what the ladder earns at EACH
+        # multiplier the schedule will apply over the remaining accrual
+        # window (size_mult_profile), every multiplier scored on the EXTERNAL
+        # book -- an incumbent's own hour-scaled orders stripped first
+        # (external_levels), that multiplier's ladder re-overlaid on the
+        # book's touches and reference prices. A window that carries the
+        # live multiplier alone is the live estimate itself (for an
+        # incumbent that is the score of what actually rests).
         meta.floor_dollars_per_day = meta.est_dollars_per_day
-        if FLOOR_PROJECTION_BASE_SIZE and _hm != 1.0 and meta.dollars_per_day > 0:
-            if self.live and own_live:
-                ext_yes, ext_no = external_levels(yes_levels, no_levels, own_live)
-                xb, xa = external_best(ext_yes, ext_no)
-                xrb, xra = ladder_reference_prices(ext_yes, ext_no, meta.target_size)
+        meta.floor_mult_profile = ""
+        if FLOOR_PROJECTION_BASE_SIZE and meta.dollars_per_day > 0:
+            if FLOOR_PROJECTION_SCHEDULE:
+                profile = size_mult_profile(meta.series, _now,
+                                            _quotable_days(meta, _now))
             else:
-                ext_yes, ext_no = yes_levels, no_levels
-                xb, xa, xrb, xra = ext_b, ext_a, rb, ra
-            base_q = _probe_ladder(
-                1.0, base_scaled_levels(meta.series),
-                capped_ref_mult(xb, xrb, "bid", hour_mult=1.0, series=meta.series),
-                capped_ref_mult(xa, xra, "ask", hour_mult=1.0, series=meta.series),
-                xb, xa, xrb, xra)
-            bfrac = 0.0
-            if base_q:
-                bfrac, _bsides = estimate_reward_share(
-                    ext_yes, ext_no,
-                    _overlay_with_pads(base_q, ext_yes, ext_no, xb, xa),
-                    meta.target_size, meta.discount_factor, own_in_book=False)
-            meta.floor_dollars_per_day = bfrac * meta.dollars_per_day
+                profile = [(1.0, 1.0)]
+            meta.floor_mult_profile = ",".join(f"{m:g}:{w:.3f}" for m, w in profile)
+            if not (len(profile) == 1 and abs(profile[0][0] - _hm) < 1e-9):
+                if self.live and own_live:
+                    ext_yes, ext_no = external_levels(yes_levels, no_levels, own_live)
+                    xb, xa = external_best(ext_yes, ext_no)
+                    xrb, xra = ladder_reference_prices(ext_yes, ext_no, meta.target_size)
+                else:
+                    ext_yes, ext_no = yes_levels, no_levels
+                    xb, xa, xrb, xra = ext_b, ext_a, rb, ra
+                total = 0.0
+                for m, w in profile:
+                    q_m = _probe_ladder(
+                        m, scaled_levels_at(meta.series, m),
+                        capped_ref_mult(xb, xrb, "bid", hour_mult=m, series=meta.series),
+                        capped_ref_mult(xa, xra, "ask", hour_mult=m, series=meta.series),
+                        xb, xa, xrb, xra)
+                    f_m = 0.0
+                    if q_m:
+                        f_m, _s = estimate_reward_share(
+                            ext_yes, ext_no,
+                            _overlay_with_pads(q_m, ext_yes, ext_no, xb, xa),
+                            meta.target_size, meta.discount_factor, own_in_book=False)
+                    total += w * f_m * meta.dollars_per_day
+                meta.floor_dollars_per_day = total
         return True
 
     def _settle_or_drop(self, t: str) -> None:
@@ -12362,8 +12443,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         + ("$%.2f payout cliff" % PAYOUT_FLOOR_DOLLARS if EXIT_FLOOR_IS_PAYOUT
            else "series entry bar")
         + "; fresh entry bar = $%.2f" % MIN_EST_TOTAL_DOLLARS
-        + "; floor projection at %s size" % ("day" if FLOOR_PROJECTION_BASE_SIZE
-                                             else "live")
+        + "; floor projection %s" % (
+            "follows the size schedule (quiet hours / Saturday weighted over "
+            "the accrual window, walk capped at %g days)" % FLOOR_PROFILE_MAX_DAYS
+            if FLOOR_PROJECTION_BASE_SIZE and FLOOR_PROJECTION_SCHEDULE
+            else "at day size" if FLOOR_PROJECTION_BASE_SIZE else "at live size")
         + "; accrual counters %s" % ("kept while programmed"
                                      if KEEP_ACCRUAL_WHILE_PROGRAMMED
                                      else "pruned with known_tickers"))

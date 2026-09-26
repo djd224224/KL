@@ -3142,3 +3142,81 @@ their integer prices, which ARE the touch there. Order log run 84064ca2:
 621 places, 0 rejects, 19 exact-price place rows on 8 escalator markets,
 no amend rows on the sub-penny markets. Before-picture (15:14Z, scratchpad
 subpenny_before.json): 98 orders on 49 markets, none at a sub-penny price.
+
+## 2026-09-26 pm — The payout-floor projection follows the size schedule: quiet hours and Saturday weighted over the accrual window, every series (Jack)
+
+Jack, after seeing the ladder sizing table (weekday 40 / Saturday 60 /
+quiet hours 80 / Saturday quiet hours 120 for a ladder series; 20 / 30 /
+40 / 60 for an ordinary one) and that the floor projection used the day
+size: "the payout-floor should factor in Saturday and quiet-hour size
+proportionally to the calculation. this should be true generally, not just
+on ESCALATOR/LADDER".
+
+WHY. 9/25 moved the floors (entry bar, hopeless exit, 1h peak, rate-floor
+escape) from the live-size estimate to a DAY-size projection because the
+live estimate doubled at 04:00Z and halved at 14:00Z and markets were
+admitted on the doubled number and evicted an hour after the halving,
+every day. Day size stopped the churn but under-projects every market
+whose remaining window contains quiet hours or a Saturday: the bot WILL
+rest the bigger ladder then and take the bigger share, and that credit is
+real. It also over-projects the evening-halved families (gas / diesel /
+rain dailies, KXTRUEV at x0.5 from 16:00-19:00 ET to 01:59) on the same
+logic in reverse.
+
+CHANGE (FLOOR_PROJECTION_SCHEDULE, default on; IMM_FLOOR_PROJECTION_
+SCHEDULE=0 restores the flat day size; IMM_FLOOR_PROJECTION_BASE_SIZE=0
+still means the live-size projection). MarketMeta.floor_dollars_per_day
+is now the window-weighted mean of what the ladder earns at EACH size
+multiplier the schedule will apply over the remaining accrual window:
+  * size_mult_profile(series, now, _quotable_days(meta)) samples
+    hour_size_mult once per ET hour from now to the end of the window
+    (program end capped by cutoff / close, the same horizon the $ total
+    uses) and returns [(multiplier, share of the window)] -- quiet hours
+    x2, Saturday x1.5 (composed x3), the per-series evening halvings, the
+    daily-family / open-scan / prefix exclusions, all of it, because it IS
+    hour_size_mult. The walk is capped at FLOOR_PROFILE_MAX_DAYS (14, two
+    weekly cycles, env IMM_FLOOR_PROFILE_MAX_DAYS); that mix stands for a
+    longer window. An empty window reports the live multiplier alone.
+  * for each multiplier m in the profile the estimator builds the ladder
+    at m (scaled_levels_at: series levels x m x family multiplier, the
+    same shape hour_scaled_levels produces when the clock reads m; the
+    reference multiplier goes through capped_ref_mult(hour_mult=m), so
+    TOTAL_SIZE_MULT_CAP applies the way it will at that hour) on the
+    EXTERNAL book -- an incumbent's own hour-scaled orders stripped first
+    (external_levels), touches and reference prices re-read from that
+    book -- scores it with estimate_reward_share, and the floor $/day is
+    sum(share_m x pool x weight_m). A window carrying the live multiplier
+    alone is the live estimate itself (for an incumbent: the score of what
+    actually rests), exactly as before.
+  * est_total = floor_dollars_per_day x quotable_days is unchanged
+    downstream (entry bar, hopeless exit, 1h peak, rate-floor escape).
+  * MarketMeta.floor_mult_profile ("1:0.583,2:0.417") is written to the
+    selection_snapshot sink next to floor_dollars_per_day, and the two
+    knobs join the config hash.
+
+Properties. Time-consistent by construction: the mix a window carries does
+not depend on which part of it is happening now, so the 04:00Z and 14:00Z
+projections agree up to the window shrinking -- no re-admit / evict cycle
+(the 9/25 property is kept, the under-projection is not). Saturday
+afternoon: every long-dated candidate's window holds the rest of Saturday
+at x1.5 and tonight's quiet hours at x3, so projections rise at once;
+weekdays they rise by the quiet-hours share (10/24 of the window at the
+x2 ladder's share). Evening-halved families project lower for the hours
+they are halved. The share is concave in size, so a x2 window is worth
+less than 2x -- the estimator scores each multiplier's ladder against the
+book rather than scaling a number.
+
+Cost: up to len(profile) extra estimate_reward_share calls per candidate
+per refresh (2-4, pure arithmetic on the book already read; the
+orderbook GET dominates) plus <=336 hour_size_mult samples per candidate.
+
+Tests: TestFloorProjectionFollowsSchedule -- the profile splits a Saturday
+evening window 4h x1.5 / 6h x2, a full day 10/24 x2, a full week
+10/168 x3 + 14/168 x1.5 + 60/168 x2 + 84/168 x1, caps at 14 days, reads
+1.0 for an excluded family, reports the live multiplier for an empty
+window; the floor equals the live estimate with no multiplier in the
+window, equals the doubled estimate under an all-day x2 window (the 9/25
+rule read the day number there; it still does behind the kill switch),
+equals (14 x day + 10 x doubled) / 24 under a 0-9 ET window over a
+one-day accrual window, and an incumbent's day term is the plain external
+read. 628 green.
