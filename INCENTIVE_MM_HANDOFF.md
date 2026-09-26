@@ -3029,3 +3029,36 @@ despite their names (both in the shortlist list).
 Tests: test_award_shows_three_per_event_and_one_month_stand_down updated
 (table beats API for winners, shortlist vs nominations rows, VMA fail
 closed, table-only flags, the SAG block); suite green.
+
+## 2026-09-26 — Sports ladders / escalators: 1-99c band and x2 size (Jack)
+
+Jack, after "i see a lot of events like KXNFLLADDERRECYDS-26SEP27NEJAC, but
+none are quoting. why?": the Sunday slate (466 markets / 98 events, programs
+since 9/25 22:03Z) was allowed and kickoffs resolved, but at the 14:08Z
+refresh 221 ladders failed the $1.50 projection -- a designated maker rests
+20k-60k contracts at the touch, Kalshi scores the first 1,000, so our 30-lot
+was ~0.3% of the scored depth (~$0.35/day on a $113/day pool, ~$0.40 to
+kickoff) -- 117 escalators sat under the 5c mid band, 69 read zero yield
+(sub-penny escalator prices round to a 0c spread), 59 were selected and 46
+resting. Jack: "for ESCALATOR/LADDER only, allow quoting range 1-99c and
+double contract size (use that for calculating if hits payout floor)".
+
+CHANGE (on the KXNFLLADDERREC archetype every pattern sibling clones):
+price_min_cents 1 / price_max_cents 99 (env IMM_SPORTS_LADDER_PRICE_MIN/MAX)
+and a new SeriesOverride.size_mult = 2.0 (env IMM_SPORTS_LADDER_SIZE_MULT).
+size_mult rides applied_mention_mult -- the single family multiplier the
+ladder (hour_scaled_levels), the per-market cap (series_max_position), the
+per-event cap (event_cap_contracts) and the skew knees already read -- so
+the estimator's hypothetical ladder, and with it the payout-floor
+projection, is the doubled one. The extreme_mid screen now widens to the
+series' own band (min/max with the global 5-90; a narrower series band
+never tightens it), so 2-4c escalator mids are candidates. quotable_sides,
+the quote loop's band and the sticky widening all read the series band.
+Expect: ladder rungs 40 (x deep-ref up to 60), est share ~x2 on the same
+books -- most 20k-deep ladders still project under $1.50 to kickoff, the
+thinner books and the escalators clear more often; escalators whose bid and
+ask round to the same cent stay zero_yield (sub-penny pricing, not fixed).
+
+Tests: the ladder allowlist test now checks band (1,99) for fresh and
+members, x2 rungs / caps, the screen passing a 3c ladder mid and still
+rejecting a 3c ordinary mid, ordinary series unchanged. 626 green.

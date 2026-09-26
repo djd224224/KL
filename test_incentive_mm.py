@@ -4039,6 +4039,33 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                              imm.SERIES_OVERRIDES["KXNFLLADDERREC"])
             self.assertTrue(imm.series_safe_join("KXNBALADDERPTS"))
             self.assertEqual(imm.series_min_est_rate("KXNBALADDERPTS"), 0.0)
+            # Jack 2026-09-26: "for ESCALATOR/LADDER only, allow quoting range
+            # 1-99c and double contract size (use that for calculating if
+            # hits payout floor)" -- band, x2 geometry, and the screen
+            self.assertEqual(imm.member_price_band("KXNBALADDERPTS", False), (1, 99))
+            self.assertEqual(imm.member_price_band("KXNBALADDERPTS", True), (1, 99))
+            self.assertEqual(imm.applied_mention_mult("KXNBALADDERPTS"), 2.0)
+            noon = utc(2026, 9, 30, 15, 0)              # a weekday, no hour mult
+            base = imm.series_levels("KXNBALADDERPTS")
+            self.assertEqual(imm.hour_scaled_levels("KXNBALADDERPTS", noon),
+                             [(t_, 2 * s_) for t_, s_ in base])
+            self.assertEqual(imm.series_max_position("KXNBALADDERPTS"),
+                             2 * imm.MAX_POSITION_CONTRACTS)
+            self.assertEqual(imm.event_cap_contracts("KXNBALADDERPTS-26OCT21BOSNYK"),
+                             2 * imm.MAX_EVENT_CONTRACTS)
+            bot = IncentiveMarketMaker(client=None, live=False)
+            now = datetime.now(timezone.utc)
+            lad_meta = _meta(series="KXNBALADDERPTS",
+                             ticker="KXNBALADDERPTS-26OCT21BOSNYK-BOSJTATUM25",
+                             event_ticker="KXNBALADDERPTS-26OCT21BOSNYK",
+                             mid_cents=3.0, spread_cents=1)
+            self.assertIsNone(bot._screen(lad_meta, now))
+            self.assertEqual(bot._screen(_meta(mid_cents=3.0, spread_cents=1), now),
+                             "extreme_mid")
+            # ordinary series keep their band and geometry
+            self.assertEqual(imm.applied_mention_mult("KXGOOD"), 1.0)
+            self.assertEqual(imm.member_price_band("KXGOOD", False),
+                             (imm.PRICE_MIN_CENTS, imm.PRICE_MAX_CENTS))
             # the cutoff comes from the live schedule, so the ticker-date
             # pre-drop never applies; leagues without an ESPN path fall back
             self.assertEqual(imm.sports_ladder_league("KXNFLESCALATORRSHYDS"), "NFL")

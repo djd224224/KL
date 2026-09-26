@@ -309,6 +309,11 @@ class SeriesOverride:
     #   is removed bot-wide; set >0 here or via env to restore per-series)
     price_min_cents: Optional[int] = None               # per-series order price
     price_max_cents: Optional[int] = None               #   band (else global)
+    size_mult: Optional[float] = None                   # FAMILY size multiplier
+    #   on the global geometry: ladder rungs, per-market and per-event caps
+    #   and the skew knees scale together (the mention x1.5 wire). Sports
+    #   ladders / escalators x2 (Jack 2026-09-26). Ignored when `levels` or
+    #   `max_position` are hand-tuned (applied_mention_mult returns 1.0).
     pre_event_days: Optional[float] = None              # AWARDS STAND-DOWN
     #   (Jack 2026-09-25 "do not quote within 1 month of when the event
     #   starts"): cutoff = the event's start minus this many days, the start
@@ -1430,7 +1435,15 @@ def applied_mention_mult(series: str) -> float:
     ov = SERIES_OVERRIDES.get(series)
     if ov and (ov.levels or ov.max_position is not None):
         return 1.0
-    return mention_size_mult(series)
+    m = mention_size_mult(series)
+    # FAMILY size multiplier on the global geometry (2026-09-26: sports
+    # ladders / escalators x2). Rides the same wire as the mention x1.5, so
+    # ladder rungs, per-market and per-event caps and the skew knees stay
+    # proportional -- and the estimator's hypothetical ladder, hence the
+    # payout-floor projection, sees the doubled size, as Jack asked.
+    if ov and ov.size_mult is not None:
+        m *= ov.size_mult
+    return m
 
 
 def hour_scaled_levels(series: str, now_utc: datetime) -> List[Tuple[int, int]]:
@@ -4314,9 +4327,23 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # ALLOW_SERIES_PATTERNS): safe-join placement, no rate bar; the cutoff is
 # the resolver's kickoff minus the global EVENT_START_BUFFER_MIN (30 min).
 # Every pattern-allowed sibling clones this on first sight.
+# Jack 2026-09-26 ("for ESCALATOR/LADDER only, allow quoting range 1-99c
+# and double contract size (use that for calculating if hits payout
+# floor)"), the day after the Sunday slate listed: 221 of 466 ladder
+# markets failed the $1.50 projection (a designated maker rests 20k-60k
+# contracts at the touch, so our 30-lot was ~0.3% of the scored depth,
+# ~$0.35/day) and 117 escalators sat under the 5c band. So: band 1-99c
+# (price_min/max -- read by member_price_band, the quote loop, the
+# estimator's quotable_sides and the extreme_mid screen) and a x2 family
+# size multiplier (size_mult -> applied_mention_mult -> hour_scaled_levels,
+# so the estimator projects the doubled ladder against the floor; caps and
+# skew knees scale with it).
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
-    safe_join=True)
+    safe_join=True,
+    price_min_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MIN", 1),
+    price_max_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MAX", 99),
+    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 2.0))
 
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
@@ -10178,6 +10205,12 @@ class IncentiveMarketMaker:
         # in (member_price_band); fresh entry keeps the tighter 5-90.
         band_lo, band_hi = (MID_BAND_MEMBER_LO, MID_BAND_MEMBER_HI) if member \
             else (MID_BAND_LO, MID_BAND_HI)
+        # A series whose OWN quoting band is wider than the global mid band is
+        # screened on its band (sports ladders / escalators 1-99c, Jack
+        # 2026-09-26): escalator mids of 2-4c are the product, not a pinned
+        # book. A narrower series band never tightens this screen (unchanged).
+        band_lo = min(band_lo, series_price_min(meta.series))
+        band_hi = max(band_hi, series_price_max(meta.series))
         if not (band_lo <= meta.mid_cents <= band_hi):
             return "extreme_mid"
         if MIN_VOLUME_CONTRACTS > 0 and meta.volume < MIN_VOLUME_CONTRACTS:
