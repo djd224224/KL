@@ -3496,3 +3496,12 @@ COLLATERAL_BUDGET check and the inventory reserve are unchanged).
 Tests: the allowlist test reads x3 rungs / caps and the $1.20 bar for a
 fresh candidate, the cliff for banked, $1.50 for an ordinary series; the
 same-bar invariant test admits only this family under $1.50. 632 green.
+
+VERIFIED 17:59Z (deploy e46ed31 17:54Z, relaunch 17:56:28Z, first refresh
+17:58:58Z): ladder / escalator rungs place at exactly 90 (274 of 274 in
+the first wave: 20 x 3 x 1.5 Saturday); selected 455 -> 510 across 145 ->
+153 events, 42 ladder / escalator markets flipped payout_floor ->
+selected on the $1.20 bar and the x3 projection (family: 125 -> 167
+selected, 341 -> 299 floored), payout_floor 930 -> 875 overall, zero_yield
+still 1; ladder collateral ~$13.2k -> ~$18.3k against the $15.2k inventory
+reserve. The two near-cliff escalators re-armed at x1.5 on top (135).
