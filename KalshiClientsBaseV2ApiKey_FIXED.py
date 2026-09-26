@@ -389,6 +389,7 @@ class ExchangeClient(KalshiClient):
                              client_order_id=None, time_in_force=None,
                              self_trade_prevention_type=None,
                              exchange_index=None,
+                             price_dollars=None,
                              **_ignored):
         """Translate legacy create_order kwargs into a V2 events/orders body.
         `_ignored` absorbs legacy-only params (buy_max_cost, sell_position_floor)
@@ -430,7 +431,11 @@ class ExchangeClient(KalshiClient):
                 "create_order(type='market') is not supported on the V2 endpoint; "
                 "use a limit price with time_in_force='immediate_or_cancel' plus an "
                 "explicit slippage cap instead.")
-        body['price'] = self._cents_to_dollar_str(cents)
+        # price_dollars: an exact sub-penny YES price ("0.1915") for markets
+        # whose price step is finer than a cent (IMM sub-penny join,
+        # 2026-09-26); yes_price/no_price still decide the book side above.
+        body['price'] = (str(price_dollars) if price_dollars is not None
+                         else self._cents_to_dollar_str(cents))
         tif = time_in_force or 'good_till_canceled'
         body['time_in_force'] = tif
         # expiration_time (unix SECONDS) is only valid with good_till_canceled
@@ -474,6 +479,7 @@ class ExchangeClient(KalshiClient):
                         time_in_force:Optional[str]=None,
                         self_trade_prevention_type:Optional[str]=None,
                         exchange_index:Optional[int]=None,
+                        price_dollars:Optional[str]=None,
                         ):
         body = self._build_v2_order_body(
             ticker=ticker, side=side, action=action, count=count, type=type,
@@ -481,7 +487,7 @@ class ExchangeClient(KalshiClient):
             expiration_ts=expiration_ts, client_order_id=client_order_id,
             time_in_force=time_in_force,
             self_trade_prevention_type=self_trade_prevention_type,
-            exchange_index=exchange_index)
+            exchange_index=exchange_index, price_dollars=price_dollars)
         print(f"[create_order->V2] {body}")
         order_json = json.dumps(body)
         result = self.post(path=self.events_orders_url, body=order_json)

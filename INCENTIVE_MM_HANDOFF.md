@@ -3062,3 +3062,67 @@ ask round to the same cent stay zero_yield (sub-penny pricing, not fixed).
 Tests: the ladder allowlist test now checks band (1,99) for fresh and
 members, x2 rungs / caps, the screen passing a 3c ladder mid and still
 rejecting a 3c ordinary mid, ordinary series unchanged. 626 green.
+
+## 2026-09-26 pm — Sub-penny join: ladder / escalator rungs rest AT the exact touch, not a fraction of a cent behind it (Jack)
+
+Jack: "allow for quoting within a cent if it means staying in the earnings
+range. e.g. KXNFLESCALATORREC-26SEP27NYJDET-DETASTBROWN14".
+
+WHY. The sports ladders / escalators are priced in 0.0001 steps
+(price_level_structure center_centi_edge_centi_cent, price_ranges step
+0.0001); the whole bot reasons in integer cents: orderbook_levels rounds
+the book to the penny, the ladder rests on the penny grid, the client
+writes body['price'] from integer cents. On DETASTBROWN14 that afternoon
+the true book was YES bid 0.1915 x 13,192 (the designated maker) and NO
+0.8030 x 10,025 (= YES ask 0.1970); the bot read 19/20 and rested its
+30-lots at 0.1900 and 0.2000 -- 0.15c and 0.30c BEHIND the two touches.
+Kalshi scores the first 1,000 contracts walking from the best price, all of
+them at the maker's level, so a rung one sub-tick behind is not in the
+scored range at all: zero share on every sub-penny market, whatever the
+band or size (the 9/26 am change doubled a zero).
+
+CHANGE (SUBPENNY_JOIN, env IMM_SUBPENNY_JOIN=0 = off). Every integer-cent
+decision is untouched. For a market whose MarketMeta.price_step is finer
+than a cent (market_price_step(m): finest price_ranges step, else 0.001 if
+the level structure says "centi", else 0.01; set on the selection meta and
+the orphan-restore meta), the quote loop runs subpenny_snap(mq, exact book,
+own exact) after the ladder and pads are built: each non-pad rung snaps to
+the most aggressive EXTERNAL level inside its own cent bucket -- bid 19 ->
+19.15, ask 20 -> 19.70. Rules: never outside the rung's bucket ("within a
+cent"), never crossing the exact opposite touch, never a price that does
+not already exist on the grid (we only join a level), our own resting size
+netted out first (no self-chase), no external level in the bucket -> the
+integer price stands (it is already the best in that cent). Quote gained
+price_exact (YES cents, 2 dp); place_order sends it as
+create_order(price_dollars="0.1915") -- the client's _build_v2_order_body
+takes price_dollars and still derives the book side from yes_price /
+no_price -- and records yes_price_exact in the ledger / sim order and the
+order log (place rows). diff_orders: an exact rung matches only a resting
+order at that exact price (order_yes_exact_cents: our ledger's
+yes_price_exact, else the exchange's yes_price_dollars / price_dollars, 4
+dp); a moved touch is a cancel + fresh place, never an amend (amend takes
+integer cents) and never an aggressive-keep; an INTEGER rung still keeps an
+exact resting order sitting in its bucket. Integer-priced markets never
+reach any of it (price_step 0.01).
+
+Expect on the Sunday escalators: resting orders at the maker's exact levels
+(0.1915 / 0.1970 on DETASTBROWN14 while the maker sits there), share per the
+scored walk instead of zero; more cancel+place churn on those markets as the
+maker moves by sub-ticks (each move re-places the rung). Not changed:
+escalators whose bid and ask round to the same cent still read zero_yield in
+the estimator (integer spread 0), so they are not selected in the first
+place; the "within a cent" rule cannot help a market the integer logic will
+not quote.
+
+Verify: run-logs/incentive-mm order log place rows carry yes_price_exact;
+the bot log prints "placed ... @ 19.15c"; the exchange's resting orders for
+KXNFLESCALATOR*/KXNFLLADDER* show 4-decimal yes_price_dollars.
+
+Tests: test_subpenny_join_rests_at_the_exact_touch -- the DETASTBROWN14 book
+snaps 19/20 -> 19.15/19.70 with the buckets kept and the pad untouched;
+own-size netting leaves a lone rung on the cent; a locked synthetic book
+refuses to cross; price-step detection; exact-price parsing; the diff in
+both ladder modes (cancel+place on a moved touch, no-op at the exact price,
+integer rung keeps an exact order); the wire body ("0.1915" / "0.1970" vs
+"0.20" on the integer path); a dry placement records the exact price so the
+next diff keeps it. 627 green.

@@ -12025,6 +12025,103 @@ class TestFamilySourceVerdicts(unittest.TestCase):
                 "KXFAKECC", ev, midnight_print_day, close_time=close),
                 midnight_print_day)
 
+    def test_subpenny_join_rests_at_the_exact_touch(self):
+        # Jack 2026-09-26: "allow for quoting within a cent if it means
+        # staying in the earnings range. e.g. KXNFLESCALATORREC-26SEP27NYJDET-
+        # DETASTBROWN14". The live book that afternoon: yes 0.1915 x 13,192
+        # (true bid), our 0.1900 x 30 behind it; no 0.8030 x 10,025 (true ask
+        # 0.1970), our 0.2000 x 30 behind it. Whole-cent rungs 19 / 20 must
+        # snap to 19.15 / 19.70 -- inside their own cent, never crossing.
+        ob = {"orderbook_fp": {
+            "yes_dollars": [["0.0104", "3876"], ["0.1522", "1359"],
+                            ["0.1900", "130"], ["0.1915", "13192.43"]],
+            "no_dollars": [["0.1000", "100"], ["0.7778", "1359"],
+                           ["0.8000", "130"], ["0.8030", "10024.90"]]}}
+        yx, nx = imm.orderbook_exact_levels(ob)
+        self.assertEqual(yx[-1], [19.15, 13192.43])
+        self.assertEqual(nx[-1], [80.3, 10024.9])
+        T = "KXNFLESCALATORREC-26SEP27NYJDET-DETASTBROWN14"
+        own = [("bid", 19.0, 30.0), ("ask", 20.0, 30.0)]        # our resting
+        qs = [imm.Quote(T, "bid", 19, 60), imm.Quote(T, "ask", 20, 60),
+              imm.Quote(T, "bid", 18, 60), imm.Quote(T, "bid", 1, 1000, is_pad=True)]
+        out = imm.subpenny_snap(qs, yx, nx, own)
+        self.assertEqual([q.price_exact for q in out], [19.15, 19.7, None, None])
+        self.assertEqual([q.price_cents for q in out], [19, 20, 18, 1])   # buckets kept
+        # our own 30 at 19.00 / 20.00 are netted out, so with nobody else in
+        # those cents the rung keeps its integer price (no self-chase)
+        ob2 = {"orderbook_fp": {"yes_dollars": [["0.1900", "30"]],
+                                "no_dollars": [["0.8000", "30"]]}}
+        out2 = imm.subpenny_snap([imm.Quote(T, "bid", 19, 60)],
+                                 *imm.orderbook_exact_levels(ob2), own)
+        self.assertIsNone(out2[0].price_exact)
+        # a snap that would cross the exact opposite touch is refused
+        # (synthetic locked book: bid 19.60 == ask 19.60, both in bucket 20)
+        ob3 = {"orderbook_fp": {"yes_dollars": [["0.1960", "500"]],
+                                "no_dollars": [["0.8040", "500"]]}}
+        out3 = imm.subpenny_snap([imm.Quote(T, "bid", 20, 60),
+                                  imm.Quote(T, "ask", 20, 60)],
+                                 *imm.orderbook_exact_levels(ob3), [])
+        self.assertEqual([q.price_exact for q in out3], [None, None])
+        # price step detection off the market object
+        self.assertEqual(imm.market_price_step(
+            {"price_ranges": [{"start": "0.0000", "end": "1.0000", "step": "0.0001"}],
+             "price_level_structure": "center_centi_edge_centi_cent"}), 0.0001)
+        self.assertEqual(imm.market_price_step(
+            {"price_level_structure": "center_centi_edge_centi_cent"}), 0.001)
+        self.assertEqual(imm.market_price_step({"price_level_structure": "cent"}), 0.01)
+        self.assertEqual(imm.market_price_step({}), 0.01)
+        self.assertEqual(imm.market_price_step(None), 0.01)
+        # resting-order exact price: exchange dollars fields or our own ledger
+        self.assertEqual(imm.order_yes_exact_cents({"yes_price_dollars": "0.1915"}), 19.15)
+        self.assertEqual(imm.order_yes_exact_cents({"no_price_dollars": "0.8030"}), 19.7)
+        self.assertEqual(imm.order_yes_exact_cents({"yes_price": 20, "yes_price_exact": 19.7}), 19.7)
+        self.assertIsNone(imm.order_yes_exact_cents({"yes_price": 19}))
+        self.assertEqual(imm.order_yes_book_cents({"side": "yes", "action": "buy",
+                                                   "yes_price_dollars": "0.1915"}),
+                         ("bid", 19))
+        # the diff, in both ladder modes: an exact rung only matches a resting
+        # order at that exact price; a moved touch is a cancel + place, never
+        # an amend; an integer rung still keeps an exact order in its bucket
+        now = time.time()
+        mode = imm.LADDER_MODE
+        try:
+            for m_ in ("offsets", "atref"):
+                imm.LADDER_MODE = m_
+                rest = [{"order_id": "o1", "ticker": T, "side": "yes", "action": "buy",
+                         "yes_price_dollars": "0.1900", "remaining_count": 60.0}]
+                want = [imm.Quote(T, "bid", 19, 60, price_exact=19.15)]
+                pl, cx, am = imm.diff_orders(want, rest, {"o1": now}, now)
+                self.assertEqual(([q.price_exact for q in pl], cx, am),
+                                 ([19.15], ["o1"], []), m_)
+                rest[0]["yes_price_dollars"] = "0.1915"
+                pl, cx, am = imm.diff_orders(want, rest, {"o1": now}, now)
+                self.assertEqual((pl, cx, am), ([], [], []), m_)
+                pl, cx, am = imm.diff_orders([imm.Quote(T, "bid", 19, 60)], rest,
+                                             {"o1": now}, now)
+                self.assertEqual((pl, cx, am), ([], [], []), m_)
+        finally:
+            imm.LADDER_MODE = mode
+        # the wire body carries the exact price; the integer path is unchanged
+        from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient as _EC
+        body = _EC._build_v2_order_body(_EC, ticker=T, side="yes", action="buy",
+                                        count=60, yes_price=19, price_dollars="0.1915")
+        self.assertEqual((body["side"], body["price"]), ("bid", "0.1915"))
+        body = _EC._build_v2_order_body(_EC, ticker=T, side="no", action="buy",
+                                        count=60, no_price=80, price_dollars="0.1970")
+        self.assertEqual((body["side"], body["price"]), ("ask", "0.1970"))
+        body = _EC._build_v2_order_body(_EC, ticker=T, side="no", action="buy",
+                                        count=60, no_price=80)
+        self.assertEqual((body["side"], body["price"]), ("ask", "0.20"))
+        # dry placement records the exact price, so the next diff keeps it
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertTrue(bot.place_order(imm.Quote(T, "ask", 20, 60, price_exact=19.7), now))
+        so = next(iter(bot.state.sim_orders.values()))
+        self.assertEqual((so["yes_price"], so["yes_price_exact"]), (20, 19.7))
+        self.assertEqual(imm.order_yes_exact_cents(so), 19.7)
+        self.assertEqual(imm.order_yes_book_cents(so), ("ask", 20))
+        self.assertTrue(imm.SUBPENNY_JOIN)          # default on; IMM_SUBPENNY_JOIN=0 = off
+
     def test_late_month_rule_shapes_the_resting_ladder(self):
         # The loop rests NO bids and asks at 50% of the ladder it would
         # otherwise rest (read off the cycle log's want columns, the same

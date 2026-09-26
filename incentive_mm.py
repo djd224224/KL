@@ -6094,6 +6094,132 @@ def orderbook_levels(orderbook_response: dict) -> Tuple[List[List[float]], List[
     return yes_levels, no_levels
 
 
+# ---- SUB-PENNY JOIN (Jack 2026-09-26: "allow for quoting within a cent if it
+# means staying in the earnings range. e.g. KXNFLESCALATORREC-26SEP27NYJDET-
+# DETASTBROWN14"). The sports ladders / escalators are priced in 0.0001
+# steps (price_level_structure center_centi_edge_centi_cent). The bot reasons
+# in whole cents: orderbook_levels rounds the book to the penny and the
+# ladder rests on the penny grid -- so on DETASTBROWN14 the true bid was
+# 0.1915 (13,192 contracts) and the ask 0.1970, the bot read 19/20 and rested
+# 0.1900 / 0.2000, a fraction of a cent BEHIND both touches. Kalshi scores
+# the first 1,000 contracts from the best price, all of them at the maker's
+# 0.1915 level, so a 0.1900 order is not in the scored range at all. The fix
+# keeps every integer-cent decision as it is and, for a market whose
+# price_step is finer than a cent, snaps each rung to the most aggressive
+# EXTERNAL level inside the rung's own cent bucket (the level the integer
+# logic meant to join): bid 19 -> 19.15, ask 20 -> 19.70. Never crosses (the
+# snapped bid stays under the exact external ask and vice versa), never moves
+# a rung outside its bucket ("within a cent"), never invents a price (it only
+# joins a level that already exists on the grid), pads untouched, our own
+# resting size netted out so we never chase ourselves. Exact rungs match
+# resting orders by their 4-decimal price (diff_orders), so a moved touch
+# gets a cancel + fresh place, never an amend. IMM_SUBPENNY_JOIN=0 = off.
+SUBPENNY_JOIN = os.environ.get("IMM_SUBPENNY_JOIN", "1") == "1"
+
+
+def market_price_step(m: Optional[dict]) -> float:
+    """Kalshi price granularity in dollars from a market object: the finest
+    `price_ranges[].step`, else 0.001 when the level structure names centi
+    ticks, else the penny grid."""
+    steps = []
+    for r in (m or {}).get("price_ranges") or []:
+        try:
+            steps.append(float((r or {}).get("step")))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    steps = [s for s in steps if s > 0]
+    if steps:
+        return max(min(steps), 0.0001)
+    if "centi" in str((m or {}).get("price_level_structure") or "").lower():
+        return 0.001
+    return 0.01
+
+
+def orderbook_exact_levels(orderbook_response: dict
+                           ) -> Tuple[List[List[float]], List[List[float]]]:
+    """(yes_levels, no_levels) as [price_cents_2dp, qty], ascending, keeping
+    the sub-penny precision orderbook_levels rounds away (V2 dollars only)."""
+    ob = orderbook_response.get("orderbook_fp") or {}
+    yes_levels = [[round(float(p) * 100, 2), float(q)] for p, q in (ob.get("yes_dollars") or [])]
+    no_levels = [[round(float(p) * 100, 2), float(q)] for p, q in (ob.get("no_dollars") or [])]
+    return yes_levels, no_levels
+
+
+def order_yes_exact_cents(order: dict) -> Optional[float]:
+    """A resting order's YES price in cents at sub-penny precision (19.15):
+    the bot's own ledger/sim `yes_price_exact`, else the exchange's 4-decimal
+    dollar fields. None when the order carries only an integer price."""
+    v = order.get("yes_price_exact")
+    if v is not None:
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            pass
+    for key in ("yes_price_dollars", "price_dollars"):
+        v = order.get(key)
+        if v is not None:
+            try:
+                return round(float(v) * 100, 2)
+            except (TypeError, ValueError):
+                return None
+    v = order.get("no_price_dollars")
+    if v is not None:
+        try:
+            return round(100 - float(v) * 100, 2)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def subpenny_snap(quotes: List["Quote"], yes_exact: List[List[float]],
+                  no_exact: List[List[float]],
+                  own_exact: List[Tuple[str, float, float]] = ()) -> List["Quote"]:
+    """Snap each non-pad rung to the most aggressive EXTERNAL level inside its
+    own cent bucket. yes_exact/no_exact from orderbook_exact_levels (cents,
+    2 dp); own_exact = (book_side, yes_cents_2dp, remaining) of our resting
+    orders, netted out first. A rung whose bucket holds no external level
+    keeps its integer price (it is already the best in that cent)."""
+    if not quotes:
+        return quotes
+    own_yes: Dict[float, float] = {}
+    own_no: Dict[float, float] = {}
+    for bs, px, rem in own_exact:
+        if bs == "bid":
+            own_yes[px] = own_yes.get(px, 0.0) + rem
+        else:
+            k = round(100 - px, 2)
+            own_no[k] = own_no.get(k, 0.0) + rem
+    bids = [(px, q - own_yes.get(px, 0.0)) for px, q in yes_exact]
+    bids = [(px, q) for px, q in bids if q > 1e-9]
+    asks = [(round(100 - px, 2), q - own_no.get(px, 0.0)) for px, q in no_exact]
+    asks = [(px, q) for px, q in asks if q > 1e-9]
+    best_bid = max((px for px, _q in bids), default=None)
+    best_ask = min((px for px, _q in asks), default=None)
+    out: List[Quote] = []
+    for q in quotes:
+        if getattr(q, "is_pad", False) or q.price_exact is not None:
+            out.append(q)
+            continue
+        exact = None
+        if q.book_side == "bid":
+            cands = [px for px, _q in bids if round(px) == q.price_cents]
+            if cands:
+                exact = max(cands)
+                if best_ask is not None and exact >= best_ask:
+                    exact = None                       # would cross: keep the cent
+        else:
+            cands = [px for px, _q in asks if round(px) == q.price_cents]
+            if cands:
+                exact = min(cands)
+                if best_bid is not None and exact <= best_bid:
+                    exact = None
+        if exact is None or abs(exact - q.price_cents) < 0.005:
+            out.append(q)
+        else:
+            out.append(replace(q, price_exact=exact))
+    return out
+
+
 def external_best(yes_levels: List[List[float]], no_levels: List[List[float]],
                   own_orders: List[Tuple[str, int, float]] = ()
                   ) -> Tuple[Optional[int], Optional[int]]:
@@ -6389,6 +6515,12 @@ class Quote:
     is_pad: bool = False   # deep 1c/99c depth-padding order (see pad_to_target):
     #   fills the side to the reward target so the near-touch ladder qualifies;
     #   earns ~0 itself, exempt from the per-market ladder/position caps.
+    price_exact: Optional[float] = None   # SUB-PENNY JOIN (Jack 2026-09-26):
+    #   the exact YES price in cents (2 dp, e.g. 19.15) to send instead of the
+    #   whole-cent price_cents, set by subpenny_snap on markets whose price
+    #   step is finer than a cent so the rung rests AT the scored touch
+    #   rather than a fraction of a cent behind it. price_cents stays the
+    #   integer bucket every other consumer (bands, caps, ledger) reasons in.
 
 
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
@@ -6563,9 +6695,19 @@ def diff_orders(desired: List[Quote], resting: List[dict],
     unmatched = list(desired)
 
     def matches(q: Quote, ticker: str, book_side: str, px: int,
-                remaining: float) -> bool:
+                remaining: float, ox: Optional[float] = None) -> bool:
         if q.ticker != ticker or q.book_side != book_side:
             return False
+        # sub-penny join: an exact rung matches only a resting order at that
+        # exact price (a touch that moved 0.01c re-places the rung); the
+        # integer checks below are skipped because the bucket of a half-cent
+        # price can round either way
+        if getattr(q, "price_exact", None) is not None:
+            if ox is None or abs(ox - q.price_exact) >= 0.005:
+                return False
+            if LADDER_MODE == "atref":
+                return abs(remaining - q.count) <= max(1.0, ATREF_COUNT_TOL_FRAC * q.count)
+            return round(remaining) == q.count
         if LADDER_MODE == "atref" and not getattr(q, "is_pad", False):
             # per-series hysteresis (KXTEMP runs 0 — reprice on any ref move)
             if abs(px - q.price_cents) > series_atref_price_tol(series_of(q.ticker)):
@@ -6584,6 +6726,8 @@ def diff_orders(desired: List[Quote], resting: List[dict],
                         remaining: float) -> bool:
         if q.ticker != ticker or q.book_side != book_side:
             return False
+        if getattr(q, "price_exact", None) is not None:
+            return False               # exact rungs re-place, never keep-drift
         if LADDER_MODE != "atref" or getattr(q, "is_pad", False):
             return False
         # Zero-tolerance series (KXTEMP) re-pin at the reference in BOTH
@@ -6616,6 +6760,8 @@ def diff_orders(desired: List[Quote], resting: List[dict],
                   rest_is_pad: bool) -> bool:
         if q.ticker != ticker or q.book_side != book_side:
             return False
+        if getattr(q, "price_exact", None) is not None:
+            return False               # amend takes integer cents only
         if getattr(q, "is_pad", False) != rest_is_pad:
             return False               # rungs amend rungs; pads amend pads
         return LADDER_MODE == "atref" or rest_is_pad
@@ -6631,11 +6777,12 @@ def diff_orders(desired: List[Quote], resting: List[dict],
             continue
         book_side, px = parsed
         remaining = order_remaining(o)
+        ox = order_yes_exact_cents(o)
         age = now_ts - order_ages.get(oid, now_ts)
         stale = age > ORDER_REFRESH_SECS
         tk = o.get("ticker")
         match = next((q for q in unmatched
-                      if matches(q, tk, book_side, px, remaining)), None)
+                      if matches(q, tk, book_side, px, remaining, ox)), None)
         if match is not None and not stale:
             unmatched.remove(match)
             continue
@@ -6949,6 +7096,9 @@ class MarketMeta:
     # from the scan universe so the group walk / guards / tripwires can tell
     # the tier apart without a series lookup
     scan: bool = False
+    # Kalshi price granularity in dollars (0.01 = the penny grid; the sports
+    # ladders / escalators trade in 0.0001 steps -- see subpenny_snap)
+    price_step: float = 0.01
 
 
 @dataclass
@@ -7847,12 +7997,19 @@ class IncentiveMarketMaker:
         else:
             kwargs = dict(side="no", action="buy", no_price=100 - q.price_cents)
         kwargs["self_trade_prevention_type"] = STP_TYPE   # user's order wins a self-cross
-        label = (f"{q.ticker} {q.book_side.upper():4s} {q.count}x @ {q.price_cents}c")
+        if q.price_exact is not None:
+            # sub-penny join: the wire price is the exact YES price (4 dp);
+            # the integer bucket above still drives side/ledger/caps
+            kwargs["price_dollars"] = f"{q.price_exact / 100.0:.4f}"
+        label = (f"{q.ticker} {q.book_side.upper():4s} {q.count}x @ "
+                 + (f"{q.price_exact:.2f}c" if q.price_exact is not None
+                    else f"{q.price_cents}c"))
         if not self.live:
             oid = f"sim-{uuid.uuid4().hex[:12]}"
             self.state.sim_orders[oid] = {
                 "order_id": oid, "ticker": q.ticker, "book_side": q.book_side,
                 "yes_price": q.price_cents, "remaining_count": float(q.count),
+                "yes_price_exact": q.price_exact,
                 "status": "resting", "client_order_id": client_order_id,
                 "expire_at": float(expiration_ts),
             }
@@ -7870,6 +8027,7 @@ class IncentiveMarketMaker:
             self.state.ledger[oid] = {
                 "order_id": oid, "ticker": q.ticker, "book_side": q.book_side,
                 "yes_price": q.price_cents, "remaining_count": float(q.count),
+                "yes_price_exact": q.price_exact,
                 "status": "resting", "client_order_id": client_order_id,
                 "_placed_at": now_ts, "_confirmed": False,
             }
@@ -7878,6 +8036,7 @@ class IncentiveMarketMaker:
                             q.count, oid, now_ts,
                             client_order_id=client_order_id,
                             quote_is_pad=q.is_pad,
+                            yes_price_exact=q.price_exact,
                             expiration_ts=expiration_ts)
             # Durable PER ORDER, but cheap: append the id to a journal (<1ms)
             # instead of dumping the full ~3.4MB state (~450ms) — a hard-kill
@@ -8676,7 +8835,8 @@ class IncentiveMarketMaker:
                 spread_cents=((ask - bid) if bid and ask else None),
                 volume=volume, status=m.get("status", ""),
                 open_time=parse_iso_utc(m.get("open_time", "")),
-                program_start=info.get("start"))
+                program_start=info.get("start"),
+                price_step=market_price_step(m))
             # Band state for the LIFETIME SLOT RULE (2026-09-09), recorded
             # here because this is the last point a slot-holding market is
             # still in hand: one whose touches are outside the band is
@@ -10104,7 +10264,8 @@ class IncentiveMarketMaker:
                         # is what makes the data-month release guard work here
                         close_time=parse_iso_utc(m.get("close_time", "")),
                         market=m),
-                    close_time=parse_iso_utc(m.get("close_time", "")))
+                    close_time=parse_iso_utc(m.get("close_time", "")),
+                    price_step=market_price_step(m))
                 log(f"{self.tag} restored orphan position market {t} "
                     f"(pos {positions.get(t, 0):+.0f}, reduce-only)")
 
@@ -10462,11 +10623,16 @@ class IncentiveMarketMaker:
 
         resting = self.fetch_resting_orders(now_ts)   # populates _foreign_resting
         own_by_ticker: Dict[str, List[Tuple[str, int, float]]] = {}
+        own_exact_by_ticker: Dict[str, List[Tuple[str, float, float]]] = {}
         for o in resting:
             parsed = order_yes_book_cents(o)
             if parsed is not None:
                 own_by_ticker.setdefault(o.get("ticker", ""), []).append(
                     (parsed[0], parsed[1], order_remaining(o)))
+                _ox = order_yes_exact_cents(o)
+                own_exact_by_ticker.setdefault(o.get("ticker", ""), []).append(
+                    (parsed[0], _ox if _ox is not None else float(parsed[1]),
+                     order_remaining(o)))
         # Events the user is trading by hand THIS cycle (foreign orders now
         # fresh). The per-market loop below yields every market of these.
         manual_evts = self.manual_events(positions)
@@ -11113,6 +11279,13 @@ class IncentiveMarketMaker:
                                       and not reduce_only),
                     ext_bid=ext_bid, ext_ask=ext_ask))
 
+            # SUB-PENNY JOIN (Jack 2026-09-26, see subpenny_snap): on a market
+            # priced finer than a cent, rest each rung AT the scored touch
+            # inside its cent bucket instead of a fraction of a cent behind.
+            if SUBPENNY_JOIN and mq and meta.price_step < 0.01:
+                _yx, _nx = orderbook_exact_levels(ob)
+                mq = subpenny_snap(mq, _yx, _nx,
+                                   own_exact_by_ticker.get(t, []) if self.live else [])
             desired.extend(mq)
             if mq:
                 quoted += 1
