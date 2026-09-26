@@ -27,23 +27,27 @@ RECON = {   # this-period accrual, $ (cycle-log reconstruction, 2026-09-25 ~14:0
 }
 
 
-def today_log():
-    return os.path.join(LOGDIR, "incentive-mm-%s.log" % dt.date.today().strftime("%Y-%m-%d"))
+def recent_logs():
+    """The launcher names each run's log by the LOCAL date at the run's start
+    and appends the 'bot exited' line to that same file, so a run that began
+    before midnight exits into yesterday's file: watch the newest two."""
+    import glob
+    files = sorted(glob.glob(os.path.join(LOGDIR, "incentive-mm-????-??-??.log")))
+    return files[-2:]
 
 
 def wait_for_exit(timeout_s=1800):
-    """Block until a NEW 'launcher: bot exited' line appears in today's log."""
-    path = today_log()
-    start_size = os.path.getsize(path) if os.path.exists(path) else 0
+    """Block until a NEW 'launcher: bot exited' line appears in a recent log."""
+    start = {p: os.path.getsize(p) for p in recent_logs()}
     t0 = time.time()
-    print("waiting for bot exit; log", path, "size", start_size, flush=True)
+    print("waiting for bot exit; watching", ", ".join(os.path.basename(p) for p in start), flush=True)
     while time.time() - t0 < timeout_s:
-        path = today_log()
-        if os.path.exists(path):
-            size = os.path.getsize(path)
-            if size > start_size:
+        for path in recent_logs():
+            base = start.setdefault(path, 0)
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            if size > base:
                 with open(path, "rb") as f:
-                    f.seek(start_size)
+                    f.seek(base)
                     new = f.read().decode("utf-8", "replace")
                 if "launcher: bot exited" in new:
                     return True
