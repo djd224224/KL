@@ -56,6 +56,10 @@ def wait_for_exit(timeout_s=1800):
 
 
 def patch():
+    try:
+        os.remove(STATE + ".restore.tmp")     # a stale leftover from a failed swap
+    except OSError:
+        pass
     with open(STATE, encoding="utf-8") as f:
         d = json.load(f)
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -78,7 +82,33 @@ def patch():
     tmp = STATE + ".restore.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f)
-    os.replace(tmp, STATE)
+    # Windows: a concurrent reader (a status task, an editor) that has the
+    # state file open makes the atomic swap fail with PermissionError. Retry
+    # for a few seconds, then write the content straight into the file --
+    # not atomic, but the bot is down in this window and it is what counts.
+    swapped = False
+    for _ in range(20):
+        try:
+            os.replace(tmp, STATE)
+            swapped = True
+            break
+        except PermissionError as e:
+            print("swap blocked (%s); retrying" % e, flush=True)
+            time.sleep(0.5)
+    if not swapped:
+        with open(STATE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        print("wrote the state file directly (swap kept failing)")
+    with open(STATE, encoding="utf-8") as f:
+        check = json.load(f).get("accrued_est") or {}
+    missing = [t for t, _v in done if t not in check]
+    if missing:
+        print("VERIFY FAILED: not in the state file after the write:", missing)
+        sys.exit(3)
     print("backup:", backup)
     print("restored %d counter(s): %s" % (len(done), ", ".join("%s=%.3f" % (t.split("-")[-1], v) for t, v in done)))
     print("skipped (already present): %s" % ", ".join("%s=%.3f" % (t.split("-")[-1], v) for t, v in skipped))
