@@ -3126,3 +3126,16 @@ both ladder modes (cancel+place on a moved touch, no-op at the exact price,
 integer rung keeps an exact order); the wire body ("0.1915" / "0.1970" vs
 "0.20" on the integer path); a dry placement records the exact price so the
 next diff keeps it. 627 green.
+
+VERIFIED 15:21Z (deploy c76a0e3 15:15Z, clean exit 15:16:14Z, relaunch
+15:17:19Z, first cycle 15:21:15Z): the DETASTBROWN14 rungs went 0.1900 /
+0.2000 -> 0.1915 / 0.1965 (the maker's ask had moved 0.1970 -> 0.1966 ->
+0.1965); exchange probe 40s later: 82 resting orders on 41 ladder /
+escalator markets, 78 exactly at the external touch, 4 one sub-tick behind
+(the maker moved after placement) and all 4 re-placed by the next cycle
+(cancel + place, the unchanged exact rungs left alone); the whole-cent
+ladders (LADDERREC / FFPTS / RECYDS makers quote on the penny grid) keep
+their integer prices, which ARE the touch there. Order log run 84064ca2:
+621 places, 0 rejects, 19 exact-price place rows on 8 escalator markets,
+no amend rows on the sub-penny markets. Before-picture (15:14Z, scratchpad
+subpenny_before.json): 98 orders on 49 markets, none at a sub-penny price.
