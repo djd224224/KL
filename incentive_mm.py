@@ -2243,7 +2243,11 @@ SERIES_BLOCK_PATTERNS = tuple(
     re.compile(p.strip()) for p in os.environ.get(
         "IMM_BLOCK_SERIES_PATTERNS",
         "KXAAAGASD[A-Z]+,KXTEMP[A-Z]+H,"
-        ".*CPI.*,KXCOREUND,KXUSEDCAR,USEDCAR,KX[A-Z0-9]+HEADCOUNT").split(",")
+        ".*CPI.*,KXCOREUND,KXUSEDCAR,USEDCAR,KX[A-Z0-9]+HEADCOUNT,"
+        # KXOSCARAWARDACTR is a SAG Award series filed under the Oscar
+        # prefix (2026-09-26 audit of the 66 KXOSCAR* names); the KXOSCAR
+        # prefix allow must never quote it under the Oscars' dates
+        "KXOSCARAWARD[A-Z]*").split(",")
     if p.strip())
 
 
@@ -5713,17 +5717,37 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #      A Dec 31 expiration is the placeholder shape and reads as unknown.
 # cutoff = start - AWARDS_PRE_EVENT_DAYS. 31 days is "1 month" measured from
 # an end-of-day expiration: the stand-down begins a full month before the
-# ceremony EVENING (30 would land inside it). No usable start ->
+# event EVENING (30 would land inside it). No usable start ->
 # RELEASE_GUARD_UNKNOWN (stood down, fail closed, logged once). Applied in
 # apply_series_cutoff_adjustments for both producers and the quote-gaps
-# mirror, never loosening. What this does NOT cover: nominations and
-# finalist announcements that land more than a month before the ceremony
-# (Oscar nominations Jan 21 for Mar 14, Grammy nominations ~Nov 7 for Feb 7,
-# National Book Awards finalists Oct 6 for Nov 18) -- the rule as given is
-# the ceremony, so the bot quotes through those; raise the days or add a
-# nomination-date row to stand down earlier. Knobs: IMM_AWARDS_SERIES,
-# IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES,
-# IMM_AWARDS_TABLE_ONLY_SERIES.
+# mirror, never loosening.
+#
+# THE EVENT IS THE NOMINATIONS, NOT THE CEREMONY (Jack 2026-09-26: "stand
+# down at nominations instead of the ceremony"). For a WINNER market the
+# first reveal that narrows the field is the nominations / finalists /
+# shortlist announcement, weeks to months before the show, and Kalshi's
+# API knows nothing about it -- so every winner family is TABLE-ONLY
+# (AWARDS_TABLE_ONLY_SERIES) and the hand table carries the announcement
+# dates; a family year without a row stands down until someone adds one.
+# KXGGNOM is the exception: its markets ARE the nominations, so Kalshi's
+# expiration (the day after the announcement) is the right start and it
+# stays on the API fallback. Dates in the default table (verified 9/26):
+#   69th Grammys        nominations Nov 16 2026 (Recording Academy /
+#                       Rolling Stone; ceremony Feb 7 2027)
+#   2026 Nat'l Book Aw. finalists Oct 6 2026 (nationalbook.org; ceremony
+#                       Nov 18) -- already inside the month on 9/26
+#   99th Oscars         shortlists Dec 15 2026 for the shortlist categories
+#                       (international / documentary feature + short /
+#                       animated + live-action short / score / song /
+#                       makeup & hair / sound / VFX / casting -- the
+#                       first narrowing for those), nominations Jan 21
+#                       2027 for everything else (Academy schedule via
+#                       Deadline / Screen Daily / The Gold Knight)
+#   2026 VMAs           nominations landed in early September; no row on
+#                       purpose (unverified day, and the family is inside
+#                       its month either way -> stood down)
+# Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES
+# (replaces the WHOLE table), IMM_AWARDS_TABLE_ONLY_SERIES.
 AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 31.0)
 AWARDS_SERIES = tuple(
     s.strip() for s in os.environ.get(
@@ -5732,7 +5756,28 @@ AWARDS_SERIES = tuple(
     if s.strip())
 AWARDS_TABLE_ONLY_SERIES = frozenset(
     s.strip() for s in os.environ.get(
-        "IMM_AWARDS_TABLE_ONLY_SERIES", "KXOSCAR").split(",") if s.strip())
+        "IMM_AWARDS_TABLE_ONLY_SERIES",
+        "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR").split(",") if s.strip())
+# 99th-Oscars categories whose first narrowing is the Dec 15 2026 SHORTLIST
+# (winner AND nomination series, by Kalshi's own names; KXOSCARNOMBSOUND is
+# "Oscar nomination for Best Song" and KXOSCARVIS is Makeup & Hairstyling
+# despite their names). Casting is included on the conservative side --
+# an earlier stand-down is the safe error.
+_OSCAR_SHORTLIST_SERIES_27 = (
+    "KXOSCARINTLFILM", "KXOSCARNOMINTERFILM",
+    "KXOSCARDOCU", "KXOSCARNOMDOCU",
+    "KXOSCARDS", "KXOSCARDSFILM", "KXOSCARNOMDOCUS",
+    "KXOSCARAS", "KXOSCARNOMAS",
+    "KXOSCARLAS", "KXOSCARLASF", "KXOSCARNOMSHORTFILM",
+    "KXOSCARSCORE", "KXOSCARNOMSCORE",
+    "KXOSCARSONG", "KXOSCARNOMSONG", "KXOSCARNOMBSOUND",
+    "KXOSCARMAH", "KXOSCARNOMMAKEUP", "KXOSCARVIS",
+    "KXOSCARSOUND", "KXOSCARNOMVISUAL",
+    "KXOSCARCASTING", "KXOSCARNOMBCASTING")
+_AWARDS_DATES_DEFAULT = (
+    "KXGRAMMY-*69=2026-11-16,KXNATBOOKAWARDS-*26=2026-10-06,"
+    + ",".join(f"{_s}-27=2026-12-15" for _s in _OSCAR_SHORTLIST_SERIES_27)
+    + ",KXOSCAR*-27=2027-01-21")
 
 
 def _parse_awards_dates(spec: str) -> Tuple[Tuple[str, datetime], ...]:
@@ -5751,8 +5796,7 @@ def _parse_awards_dates(spec: str) -> Tuple[Tuple[str, datetime], ...]:
 
 
 AWARDS_EVENT_DATES = _parse_awards_dates(os.environ.get(
-    "IMM_AWARDS_EVENT_DATES",
-    "KXOSCARNOM*-27=2027-01-21,KXOSCAR*-27=2027-03-14"))
+    "IMM_AWARDS_EVENT_DATES", _AWARDS_DATES_DEFAULT))
 
 
 def awards_event_start(event_ticker: str, market: Optional[dict],

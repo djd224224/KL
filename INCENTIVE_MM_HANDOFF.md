@@ -2983,3 +2983,49 @@ is judged as if it never got the quiet-hours boost.
 Tests: `TestExitBarIsThePayoutCliff`, `TestFloorProjectionAtDaySize`,
 `TestAccrualCountersSurviveEviction` (+ the existing "nothing can reach the
 bar" tests now raise BOTH bars). Suite 626 green at deploy.
+
+## 2026-09-26 — Award shows: the stand-down month runs to the NOMINATIONS, not the ceremony (Jack)
+
+Jack, on the 9/25 caveat: "stand down at nominations instead of the
+ceremony".
+
+CHANGE: the awards event start is now the first reveal that narrows the
+field. Kalshi's API knows nothing about nominations (occurrence = close or
+expiration; expiration = the ceremony), so every WINNER family is now
+TABLE-ONLY (`AWARDS_TABLE_ONLY_SERIES` = KXGRAMMY,KXNATBOOKAWARDS,KXVMA,
+KXOSCAR): the hand table `AWARDS_EVENT_DATES` carries the announcement
+dates and a family year without a row stands down until someone adds one.
+KXGGNOM stays on the API fallback because its markets ARE the nominations
+(expiration = the day after the Dec 8 announcement).
+
+TABLE (default, verified 9/26; env IMM_AWARDS_EVENT_DATES replaces the
+whole thing):
+- `KXGRAMMY-*69=2026-11-16` -- 69th Grammy nominations Nov 16 2026
+  (Recording Academy / Rolling Stone; show Feb 7 2027) -> out Oct 16
+  05:00Z (was Jan 8).
+- `KXNATBOOKAWARDS-*26=2026-10-06` -- finalists Oct 6 2026
+  (nationalbook.org; ceremony Nov 18) -> out Sep 5, i.e. ALREADY inside
+  the month: the family stands down from this deploy (it had 0 selected
+  anyway: payout floor / extreme mid).
+- 24 rows `KXOSCAR<shortlist category>-27=2026-12-15` -- the 99th Oscars
+  shortlists (international / documentary feature + short / animated +
+  live-action short / score / song / makeup & hair / sound / VFX / casting,
+  winner AND nomination series; _OSCAR_SHORTLIST_SERIES_27) -> out Nov 14;
+  KXOSCARINTLFILM, the one Oscar series with a live program, is one of
+  them.
+- `KXOSCAR*-27=2027-01-21` -- nominations Jan 21 2027 for every other
+  Oscar series -> out Dec 21 (was Feb 11). The Mar 14 ceremony date is
+  gone from the table.
+- KXVMA: no row on purpose (the 2026 nominations landed in early
+  September, exact day unverified; the family is inside its month either
+  way) -> RELEASE_GUARD_UNKNOWN, stood down, one warning line per event.
+
+ALSO: the 66-name audit of the KXOSCAR prefix found KXOSCARAWARDACTR, a SAG
+Award series filed under the Oscar prefix -> SERIES_BLOCK_PATTERNS
+`KXOSCARAWARD[A-Z]*` so the prefix allow can never quote it on the Oscars'
+dates. KXOSCARNOMBSOUND is Best Song and KXOSCARVIS is Makeup & Hairstyling
+despite their names (both in the shortlist list).
+
+Tests: test_award_shows_three_per_event_and_one_month_stand_down updated
+(table beats API for winners, shortlist vs nominations rows, VMA fail
+closed, table-only flags, the SAG block); suite green.

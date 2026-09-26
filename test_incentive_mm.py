@@ -1182,8 +1182,12 @@ class TestScreen(unittest.TestCase):
         # placeholder, a missing object or a table-only series -> None
         self.assertEqual(imm.awards_event_start("KXGGNOM-ANI26", gg),
                          utc(2026, 12, 9, 15, 0))
+        # Jack 2026-09-26 "stand down at nominations instead of the
+        # ceremony": the table (nominations) beats the API (ceremony)
         self.assertEqual(imm.awards_event_start("KXGRAMMY-BAMP69", gr),
-                         utc(2027, 2, 8, 4, 59))
+                         utc(2026, 11, 16, 5, 0))
+        self.assertEqual(imm.awards_event_start("KXNATBOOKAWARDS-FIC26", nba),
+                         utc(2026, 10, 6, 4, 0))
         self.assertEqual(imm.awards_event_start(
             "KXX-1", {"occurrence_datetime": "2026-11-18T23:00:00Z",
                       "expected_expiration_time": "2026-11-19T04:59:00Z"}),
@@ -1192,12 +1196,21 @@ class TestScreen(unittest.TestCase):
         self.assertIsNone(imm.awards_event_start("KXGGNOM-ANI26", None))
         self.assertIsNone(imm.awards_event_start("KXGGNOM-ANI26", gg,
                                                  dates_only=True))
-        # the hand table: 99th Oscars ceremony Mar 14 2027 (EST), nominations
-        # Jan 21 2027; the nominations glob is listed first and wins
-        self.assertEqual(imm.awards_event_start("KXOSCARINTLFILM-27", osc, True),
-                         utc(2027, 3, 14, 5, 0))
-        self.assertEqual(imm.awards_event_start("KXOSCARNOMAS-27", osc, True),
+        # the hand table: 99th Oscars nominations Jan 21 2027 (EST) for the
+        # family, the Dec 15 2026 shortlist for the shortlist categories
+        # (listed first, so they win); the ceremony date is nowhere
+        self.assertEqual(imm.awards_event_start("KXOSCARPIC-27", osc, True),
                          utc(2027, 1, 21, 5, 0))
+        self.assertEqual(imm.awards_event_start("KXOSCARDIR-27", osc, True),
+                         utc(2027, 1, 21, 5, 0))
+        for s in ("KXOSCARINTLFILM", "KXOSCARNOMINTERFILM", "KXOSCARDOCU",
+                  "KXOSCARDS", "KXOSCARAS", "KXOSCARNOMAS", "KXOSCARLAS",
+                  "KXOSCARSCORE", "KXOSCARSONG", "KXOSCARNOMBSOUND",
+                  "KXOSCARMAH", "KXOSCARVIS", "KXOSCARSOUND",
+                  "KXOSCARNOMVISUAL", "KXOSCARCASTING"):
+            self.assertEqual(imm.awards_event_start(f"{s}-27", osc, True),
+                             utc(2026, 12, 15, 5, 0), s)
+        self.assertIsNone(imm.awards_event_start("KXOSCARPIC-28", osc, True))
         self.assertEqual(imm._parse_awards_dates("KXA*-27=2027-03-14"),
                          (("KXA*-27", utc(2027, 3, 14, 5, 0)),))
         with self.assertRaises(ValueError):
@@ -1206,16 +1219,23 @@ class TestScreen(unittest.TestCase):
         # producers and the quote-gaps mirror pass the market object)
         for s, ev, m, want in (
                 ("KXGGNOM", "KXGGNOM-ANI26", gg, utc(2026, 11, 8, 15, 0)),
-                ("KXGRAMMY", "KXGRAMMY-BAMP69", gr, utc(2027, 1, 8, 4, 59)),
+                # nominations Nov 16 -> out Oct 16 (was Jan 8 off the show)
+                ("KXGRAMMY", "KXGRAMMY-BAMP69", gr, utc(2026, 10, 16, 5, 0)),
+                # finalists Oct 6 -> out Sep 5, already past on 9/26
                 ("KXNATBOOKAWARDS", "KXNATBOOKAWARDS-FIC26", nba,
-                 utc(2026, 10, 19, 4, 59)),
-                ("KXVMA", "KXVMA-ALB26", vma, utc(2026, 8, 28, 3, 59))):
+                 utc(2026, 9, 5, 4, 0))):
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 s, ev, None, close_time=None, market=m), want, s)
             # never loosens an earlier cutoff
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 s, ev, want - timedelta(days=3), close_time=None, market=m),
                 want - timedelta(days=3), s)
+        # the VMAs: table-only with no row (nominations landed in early
+        # September, day unverified) -> stood down, fail closed -- the
+        # same outcome the ceremony date gave (Sep 27 - 31d is past)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXVMA", "KXVMA-ALB26", None, close_time=None, market=vma),
+            imm.RELEASE_GUARD_UNKNOWN)
         # no market object / placeholder date -> stood down, fail closed
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXGGNOM", "KXGGNOM-ANI26", None, close_time=None, market=None),
@@ -1231,9 +1251,15 @@ class TestScreen(unittest.TestCase):
             self.assertEqual(ov.pre_event_days, 31.0)
             self.assertTrue(ov.pre_event_dates_only)
             self.assertTrue(ov.safe_join)
+            # Best Picture: nominations Jan 21 -> out Dec 21; International
+            # Feature: shortlist Dec 15 -> out Nov 14
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXOSCARPIC", "KXOSCARPIC-27", None, close_time=None,
-                market=osc), utc(2027, 2, 11, 5, 0))
+                market=osc), utc(2026, 12, 21, 5, 0))
+            imm.ensure_family_override("KXOSCARINTLFILM")
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXOSCARINTLFILM", "KXOSCARINTLFILM-27", None,
+                close_time=None, market=osc), utc(2026, 11, 14, 5, 0))
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXOSCARPIC", "KXOSCARPIC-28", None, close_time=None,
                 market=osc), imm.RELEASE_GUARD_UNKNOWN)
@@ -1242,12 +1268,19 @@ class TestScreen(unittest.TestCase):
         finally:
             for s in ("KXOSCARPIC", "KXOSCARINTLFILM", "KXOSCARMENTION"):
                 imm.SERIES_OVERRIDES.pop(s, None)
-        # the four exact series carry the same set
+        # the four exact series carry the same set; every WINNER family is
+        # table-only (the API only knows the ceremony), KXGGNOM -- whose
+        # markets are the nominations -- stays on the API fallback
         for s in ("KXGGNOM", "KXNATBOOKAWARDS", "KXGRAMMY", "KXVMA"):
             ov = imm.series_override(s)
             self.assertEqual(ov.pre_event_days, 31.0, s)
-            self.assertFalse(ov.pre_event_dates_only, s)
+            self.assertEqual(ov.pre_event_dates_only, s != "KXGGNOM", s)
             self.assertTrue(ov.safe_join, s)
+        # a SAG series filed under the Oscar prefix is blocked, not quoted
+        # on the Oscars' dates
+        self.assertTrue(IncentiveMarketMaker._blocked("KXOSCARAWARDACTR-27-X"))
+        self.assertFalse(IncentiveMarketMaker._allowed("KXOSCARAWARDACTR-27-X"))
+        self.assertFalse(IncentiveMarketMaker._blocked("KXOSCARACTR-27-X"))
         # allowed exactly (KXGRAMMY / KXVMA are prefixes of dozens of
         # strangers) and the Oscar family by prefix; caps 3 by ROI, with a
         # mention series never capped by a prefix
