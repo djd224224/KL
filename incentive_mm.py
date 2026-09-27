@@ -2995,6 +2995,25 @@ _DEFAULT_WEATHER_SERIES = "KXRAINWKND"
 # no realtime risk at all, and four of the five strikes are near-certain
 # enough that the band stands the bot aside. Expect one quotable strike.
 _DEFAULT_SPORTS_SERIES = "KXMLBPLAYOFFS,KXMLBSEASONGAMES"
+# POLITICS (Jack 2026-09-26: "yes allowlist it, and stop it at 7:00 ET on
+# settlement day"). KXTRUMPAPPROVE-<YYMONDD>-<strike>: Trump's
+# RealClearPolitics "RCP Average" Approve value at EXACTLY 1:00 PM ET on the
+# ticker date, nine 0.1-point strikes (U/E/A buckets); listed 10:01 ET the
+# day before, closes 12:59 ET; $600/market per 24h program (10:02 ET ->
+# 10:02 ET). It is a live public number that steps whenever RCP folds in a
+# poll, so the open-scan tier rejects it on the `realclearpolling` keyword;
+# this normal-book entry is the deliberate exception, made on a measurement
+# of the public tape (14 daily events 9/13-9/26, 54k trades, 3.05M
+# contracts): all of the maker pick-off sits in the settlement-morning
+# update window. 21 re-pricings between 07:00 and 12:59 ET (15 of them
+# 09:00-10:59) cost resting orders ~$10.5k on 51k contracts, the takers
+# leading the visible move by 3-6 minutes; the 7 overnight/evening
+# re-pricings netted makers +$40, and flow away from the jumps marks out
+# +0.3c/contract at 5 minutes. So the entry ships with the 07:00 ET
+# settlement-day cutoff (SERIES_OVERRIDES["KXTRUMPAPPROVE"] below), which
+# keeps ~21 of each program's 24 hours. IMM_ALLOW_POLITICS_SERIES=""
+# removes it.
+_DEFAULT_POLITICS_SERIES = "KXTRUMPAPPROVE"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -3168,6 +3187,8 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_WEATHER_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_SPORTS_SERIES",
                                        _DEFAULT_SPORTS_SERIES)
+                + "," + os.environ.get("IMM_ALLOW_POLITICS_SERIES",
+                                       _DEFAULT_POLITICS_SERIES)
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -4436,6 +4457,23 @@ for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
                 _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
                 _env_int("IMM_RATES_CUTOFF_MIN_ET", 30)))
 
+# KXTRUMPAPPROVE: out at 07:00 ET ON the settlement day (Jack 2026-09-26,
+# with the allowlist entry -- see _DEFAULT_POLITICS_SERIES). The event-day
+# extender moves the ticker-date candidate from midnight to 07:00 ET, ahead
+# of the 07:00-12:59 ET window where every measured pick-off landed. Kalshi
+# sets occurrence 16:59Z against a 17:00Z expected expiration, inside the
+# 60-minute gap trade_cutoff_utc requires, so no occurrence candidate
+# undercuts it (checked on 26SEP27). What this does NOT cover: inventory
+# taken overnight still rides through the morning update to the 1:00 PM ET
+# snapshot (positions ride, standard cutoff semantics), and the quiet-hour
+# size multiplier (00:00-09:00 ET) applies right up to 07:00 -- the
+# overnight flow measured benign. IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET /
+# IMM_TRUMPAPPROVE_CUTOFF_MIN_ET move it.
+SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
+    event_day_cutoff_et=(
+        _env_int("IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET", 7),
+        _env_int("IMM_TRUMPAPPROVE_CUTOFF_MIN_ET", 0)))
+
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market
 # on its print day" / "make sure KXTRUEV is quoting"). That breaks the
@@ -4695,6 +4733,9 @@ def rate_floor_projected(accrued: float, est_total: float, peak: float,
 # it. The borderline-flap concern above is covered from the other side: a
 # seat left empty costs nothing, while a seat filled on a stale peak costs
 # an hour of fill risk and a permanent bar.
+# 2026-09-26: OFF for members too by default (MEMBER_PEAK_GUARD, below
+# HOPELESS_SUSTAIN_SECS); still tracked and persisted so the knob can
+# restore it.
 EST_PEAK_TTL_SECS = _env_int("IMM_EST_PEAK_TTL", 3600)
 # STICKY EXIT for hopeless markets (Jack 2026-07-25: "quoting markets that
 # don't hit $1 is a big drain" — if there's <5% chance of reaching the $1 min
@@ -4723,7 +4764,32 @@ HOPELESS_EXIT = os.environ.get("IMM_HOPELESS_EXIT", "1") == "1"
 # against a $2/day bar). The `rate_floor` skip bucket climbs monotonically as
 # `hopeless` fires — 96 -> 106 over the same window. So the exit needs to be
 # sure, not fast.
-HOPELESS_SUSTAIN_SECS = _env_int("IMM_HOPELESS_SUSTAIN_SECS", 3600)
+#
+# 30 MINUTES, ON THE LIVE PROJECTION (Jack 2026-09-26, on
+# KXNFLFFPTSLADDER-26SEP27MINTB-MINKMURRAY1: "let's make the hopeless clock
+# more consistent / faster. what about 30min checks instead of hourly?").
+# The exit had TWO one-hour guards in series: a member's projection carried
+# its 1h est peak (EST_PEAK_TTL_SECS), and only after that lapsed did this
+# clock start its own hour. The peak made the timing a lottery -- it
+# re-seeds from whatever SINGLE reading lands on the first refresh after it
+# expires, so a thin-book moment at that instant buys another full hour.
+# MURRAY1: admitted 21:32Z on a 10-minute thin-book reading ($2.50/day
+# est), carried by that peak to 22:42Z, re-seeded inside a second 20-minute
+# thin window, carried to 23:43Z, and only then put on the clock -- ~3h15m
+# quoted, 135 contracts filled, $0.11 banked against the $1.00 cliff.
+# Measured 9/6-9/26: 1,826 admit -> hopeless rides, median 2.8h, p25 2.07h
+# (the structural 2h floor), 13% of them filled, 12,206 contracts taken on
+# markets then evicted as unable to reach the floor. Now a MEMBER is judged
+# on its live projection (banked + current remaining estimate -- the test a
+# fresh candidate has had since 9/13) and this clock is the one dip guard:
+# evicted after 30 continuous minutes under the bar (~3-4 refreshes at the
+# 600s cadence), i.e. 30-40 minutes after its last above-bar reading,
+# whatever lands on any single refresh. A market with >= half the cliff
+# banked that projects within NEAR_CLIFF_DOLLARS of it is still held by the
+# near-cliff rule. IMM_HOPELESS_SUSTAIN_SECS=3600 restores the hour;
+# IMM_MEMBER_PEAK_GUARD=1 restores the member peak carry.
+HOPELESS_SUSTAIN_SECS = _env_int("IMM_HOPELESS_SUSTAIN_SECS", 1800)
+MEMBER_PEAK_GUARD = os.environ.get("IMM_MEMBER_PEAK_GUARD", "0") == "1"
 # THE $1 FLOOR IS PER PROGRAM PERIOD (Jack 2026-09-22 pm, on KXRT-STRA-50 /
 # -45: "why is this quoted? it should be hopeless"). Kalshi had re-listed
 # the Rotten Tomatoes programs as a fresh ONE-DAY period at 16:49Z; in it
@@ -4966,6 +5032,8 @@ _CONFIG_CODE_KNOBS = (
     # near-cliff quote-to-completion + size mode (2026-09-26)
     "NEAR_CLIFF_DOLLARS", "NEAR_CLIFF_MIN_BANKED_FRAC", "NEAR_CLIFF_SIZE_MULT",
     "NEAR_CLIFF_BOOST_MIN_BANKED",
+    # hopeless clock (2026-09-26): 30-minute sustain on the live projection
+    "HOPELESS_SUSTAIN_SECS", "MEMBER_PEAK_GUARD", "EST_PEAK_TTL_SECS",
 )
 
 
@@ -9250,6 +9318,11 @@ class IncentiveMarketMaker:
             # for markets that never cleared the floor on their own numbers.
             # Accrued still counts for a re-entrant (a market that banked
             # most of its floor re-enters on the remaining window).
+            # 2026-09-26: MEMBERS are on the live projection too unless
+            # IMM_MEMBER_PEAK_GUARD=1 (see MEMBER_PEAK_GUARD) -- the peak's
+            # single-reading re-seed made exits a lottery, and the 30-minute
+            # sustain clock below is the dip guard. The peak is still
+            # tracked, so the knob restores it without a warm-up hour.
             qdays = _quotable_days(meta, now_utc)
             # day-size projection (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25):
             # a market is not admitted on doubled size and evicted on normal
@@ -9261,7 +9334,8 @@ class IncentiveMarketMaker:
                 self._est_peak[meta.ticker] = (est_total, now_ts)
                 peak = est_total
             accrued = self.period_accrued(meta.ticker)
-            proj_peak = peak if meta.ticker in prev_selected else 0.0
+            proj_peak = peak if (MEMBER_PEAK_GUARD
+                                 and meta.ticker in prev_selected) else 0.0
             # THE BAR (floor_bar_dollars, 2026-09-25): the exchange's $1.00
             # cliff for a member or a re-entrant with banked period accrual,
             # the $1.50 entry margin for a fresh candidate. Sub-$1 accrual

@@ -1582,6 +1582,50 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
                 any(s.endswith(suf) for suf in imm.ALLOW_SERIES_SUFFIXES), s)
 
 
+class TestTrumpApproveAllowlist(unittest.TestCase):
+    """Jack 2026-09-26: "yes allowlist it, and stop it at 7:00 ET on
+    settlement day" -- KXTRUMPAPPROVE, the RCP approval average at 1:00 PM
+    ET, whose measured maker pick-offs all sit in 07:00-12:59 ET."""
+
+    def setUp(self):
+        self._old = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+
+    def tearDown(self):
+        imm.ALLOWLIST_ONLY = self._old
+
+    def test_allowed_in_the_normal_book(self):
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        for t in ("KXTRUMPAPPROVE-26SEP27-E38.7",
+                  "KXTRUMPAPPROVE-26SEP27-U38.5",
+                  "KXTRUMPAPPROVE-26SEP27-A39.1"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+        self.assertIn("KXTRUMPAPPROVE", imm.ALLOW_SERIES)
+        # exact series, no prefix: a look-alike does not ride in
+        self.assertFalse(a("KXTRUMPAPPROVEX-26SEP27-E38.7"))
+
+    def test_cutoff_is_7am_et_on_the_settlement_day(self):
+        # the live 26SEP27 fields: occurrence 16:59Z sits one minute before
+        # the 17:00Z expected expiration, so it is no candidate -> the
+        # extender's 07:00 EDT = 11:00Z is the cutoff
+        occ = datetime(2026, 9, 27, 16, 59, tzinfo=timezone.utc)
+        exp = datetime(2026, 9, 27, 17, 0, tzinfo=timezone.utc)
+        cut = imm.trade_cutoff_utc("KXTRUMPAPPROVE-26SEP27", occ, exp)
+        self.assertEqual(cut, datetime(2026, 9, 27, 11, 0, tzinfo=timezone.utc))
+        # the series tighteners leave it there (no early-stop, no close
+        # anchor, no hard expiry)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXTRUMPAPPROVE", "KXTRUMPAPPROVE-26SEP27", cut,
+            datetime(2026, 9, 27, 16, 59, tzinfo=timezone.utc)), cut)
+        # standard time: 07:00 EST = 12:00Z
+        occ = datetime(2026, 12, 15, 17, 59, tzinfo=timezone.utc)
+        exp = datetime(2026, 12, 15, 18, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            imm.trade_cutoff_utc("KXTRUMPAPPROVE-26DEC15", occ, exp),
+            datetime(2026, 12, 15, 12, 0, tzinfo=timezone.utc))
+
+
 class TestRampAIIndexAllowlist(unittest.TestCase):
     """Jack 2026-09-12: "allowlist the Ramp AI Index events into the IMM
     bot. set a release guard at midnight ET on the 6th day of the following
@@ -5668,8 +5712,9 @@ class TestStickySelection(unittest.TestCase):
             self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
-        # admitted on its own numbers, it is a member; the same peak now
-        # holds it over a floor its sample cannot reach, with no hopeless clock
+        # admitted on its own numbers, it is a member; under
+        # IMM_MEMBER_PEAK_GUARD=1 the same peak holds it over a floor its
+        # sample cannot reach, with no hopeless clock
         bot.state.universe_at = 0.0
         bot.run_cycle()
         self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
@@ -5677,9 +5722,16 @@ class TestStickySelection(unittest.TestCase):
         try:
             bot._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
             bot.state.universe_at = 0.0
-            bot.run_cycle()
+            with mock.patch.object(imm, "MEMBER_PEAK_GUARD", True):
+                bot.run_cycle()
             self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
             self.assertNotIn("KXGOOD-99DEC31-A", bot.state.hopeless_since)
+            # by default (2026-09-26) the member is on its live projection:
+            # still selected (the clock has not run), but the clock starts
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
+            self.assertIn("KXGOOD-99DEC31-A", bot.state.hopeless_since)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
@@ -5695,14 +5747,16 @@ class TestStickySelection(unittest.TestCase):
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertIn("KXGOOD-99DEC31-A", bot2._est_peak)
         self.assertAlmostEqual(bot2._est_peak["KXGOOD-99DEC31-A"][0], 2.5, places=3)
-        # and, for the restarted MEMBER, it still carries a below-floor
-        # sample over the floor (since 2026-09-13 a fresh market gets no such
-        # carry -- see the flapping-market test above)
+        # and, for the restarted MEMBER under IMM_MEMBER_PEAK_GUARD=1, it
+        # still carries a below-floor sample over the floor (since
+        # 2026-09-13 a fresh market gets no such carry, and since 2026-09-26
+        # a member neither by default -- see the flapping-market test above)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot2._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
-            bot2.run_cycle()
+            with mock.patch.object(imm, "MEMBER_PEAK_GUARD", True):
+                bot2.run_cycle()
             self.assertIn("KXGOOD-99DEC31-A", bot2.state.selected)
             self.assertNotIn("KXGOOD-99DEC31-A", bot2.state.hopeless_since)
         finally:
@@ -8447,8 +8501,38 @@ class TestHopelessExitDipGuard(unittest.TestCase):
         finally:
             _clean_persist()
 
-    def test_sustain_window_is_an_hour_by_default(self):
-        self.assertEqual(imm.HOPELESS_SUSTAIN_SECS, 3600)
+    def test_sustain_window_is_30_minutes_by_default(self):
+        # Jack 2026-09-26: "30min checks instead of hourly" (was 3600)
+        self.assertEqual(imm.HOPELESS_SUSTAIN_SECS, 1800)
+        self.assertFalse(imm.MEMBER_PEAK_GUARD)
+
+    def test_member_exit_runs_on_the_live_projection_not_the_peak(self):
+        """MURRAY1 (2026-09-26): a member admitted on a thin-book reading
+        was carried by that reading's 1h peak, then by a re-seed that landed
+        on a second blip -- ~3h15m before the clock even started. Now the
+        live projection starts the clock whatever the peak says, and the
+        member leaves after HOPELESS_SUSTAIN_SECS."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        T = "KXGOOD-99DEC31-A"
+        bot.run_cycle()
+        self.assertIn(T, bot.state.selected)
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
+        try:
+            bot._est_peak[T] = (2e9, time.time())      # a fresh, huge peak
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(T, bot.state.selected)       # clock started, not run
+            self.assertIn(T, bot.state.hopeless_since)
+            bot.state.hopeless_since[T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertNotIn(T, bot.state.selected)    # 30 min under -> out
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
+            _clean_persist()
 
 
 class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
@@ -11625,18 +11709,21 @@ class TestOpenScanTier(unittest.TestCase):
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)
-            # MEMBER: the peak remains its dip guard -- a sub-bar reading
-            # with a live peak neither evicts nor starts the hopeless clock
+            # MEMBER under IMM_MEMBER_PEAK_GUARD=1 (the pre-2026-09-26
+            # rule): the peak is its dip guard -- a sub-bar reading with a
+            # live peak neither evicts nor starts the hopeless clock
             bot.state.accrued_est.pop(self.A, None)
             bot._est_peak[self.A] = (2e6, time.time())
             bot.state.hopeless_since.pop(self.A, None)
             bot.state.universe_at = 0.0
-            bot.run_cycle()
+            with mock.patch.object(imm, "MEMBER_PEAK_GUARD", True):
+                bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)
             self.assertNotIn(self.A, bot.state.hopeless_since)
-            # ... and without the peak the clock starts (sticky until it
-            # has run HOPELESS_SUSTAIN_SECS), which is the pre-existing exit
-            bot._est_peak.clear()
+            # DEFAULT since 2026-09-26: the same live peak does not carry a
+            # member -- the clock starts on the live projection (sticky
+            # until it has run HOPELESS_SUSTAIN_SECS)
+            bot._est_peak[self.A] = (2e6, time.time())
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)
