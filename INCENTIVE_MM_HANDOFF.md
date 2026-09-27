@@ -4027,3 +4027,47 @@ decides entry, and over a 16h period with the 4pm-1am halving it needs about
 $2/day of estimate as well: 4 of the 68 gate-passing two-sided strikes
 cleared it on 9/27's books (17 at x2 size, 28 at x3, 43 at x4). Test:
 test_state_clone_drops_only_the_rate_floor. 799 green.
+
+## 2026-09-27 pm — PICK-OFF WINDOWS: the emails say when Kalshi's event start is LATER than the real event (Jack)
+
+Jack: "when kalshi's datetimes are off, sometimes i can manually pick off
+other traders who have their orders expire 'at event start'. be clear in the
+emails when this is the case, with what time the event is and what time
+kalshi thinks the event is."
+
+Kalshi's "At event start" time-in-force pulls a resting order when the
+scheduled event its market is tied to starts: the milestone feed (GET
+/milestones start_date, e.g. "Nike Earnings Call"). New module imm_pickoff.py
+sweeps every milestone starting after now (~6,000 rows, 13 pages, ~2s; ALL
+types, because DELL's call was a one_off_milestone) and compares each start
+with our own time: the event_start_overrides, else, for an earnings-mention
+event with no override (no program, which is most of them: JPM, GS, BAC,
+PEP...), the Nasdaq calendar.
+
+A window = Kalshi's start later than the real event by more than a normal
+release->call gap. After-close release or no hour: Kalshi after NOON the next
+day (TOL's next-morning call stays quiet). Anything else: 6h+. Measured over
+the 135 overrides with a milestone: LLY (+49.5h) and DELL (+48.5h) clear it,
+nothing else does (-47h..+4.8h, TOL +16.5h). Replays flag LLY on Aug 5, BULL
+on Aug 19 (Nasdaq-only; markets closed Aug 20 09:08 while Kalshi said Aug 27)
+and DELL on Sep 1. CCL/NKE (9/27) are Kalshi EARLY: orders pulled before the
+real call, nothing to pick off. Also required: a market still trading (Kalshi
+closes them after the real call), real event in [now-3d, now+14d], gap <= 30d
+(else it is next quarter's event).
+
+Where it shows:
+- 7:10 digest: ">> PICK-OFF WINDOW" block at the top (blue box in HTML),
+  subject tagged. The red banner and the cutoff-audit rows now give Kalshi's
+  event start next to ours, and each row says which way the gap cuts.
+- 7:20 quotes-and-overrides: the same block atop OVERRIDES, subject tagged.
+- imm_earnings_overrides.py (6:45/12:45/4:45): a NEW window emails at once
+  ("IMM PICK-OFF WINDOW: <event>"), once per event + both times
+  (run-logs/incentive-mm/pickoff_seen.json, marked only after the send
+  succeeds). Kept out of overrides_last_runs.json action_lines so the 7:20
+  email does not print it twice.
+
+Read-only, never raises (a failure prints "PICK-OFF CHECK could not run").
+Text is ASCII (cp1252 task console). Kill switch IMM_PICKOFF_ENABLE=0;
+lookahead IMM_PICKOFF_LOOKAHEAD_DAYS (14). Blind spot: a same-day hour error
+smaller than the bar, which the data cannot tell from a normal release->call
+gap. Tests: test_imm_pickoff.

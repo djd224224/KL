@@ -83,6 +83,7 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
 
 # Import AFTER the env fixup so the module-level cred constants pick them up.
 import incentive_mm as imm                                          # noqa: E402
+import imm_pickoff                                                  # noqa: E402
 from incentive_mm import (CT, ET, STATUS_DIR, Alerter, PnlTracker,  # noqa: E402
                           build_client, log, market_cents)
 
@@ -1127,7 +1128,8 @@ def _days_out_phrase(n: int) -> str:
     return "{}d ago".format(-n)
 
 
-def cutoff_audit(client, now_utc: datetime, own_pos: dict = None) -> dict:
+def cutoff_audit(client, now_utc: datetime, own_pos: dict = None,
+                 kalshi: dict = None, pick_events=()) -> dict:
     """Start overrides whose ET DATE disagrees with their Kalshi ticker date.
 
     Returns {"rows": [...], "checked", "total", "excluded", "no_day",
@@ -1165,7 +1167,14 @@ def cutoff_audit(client, now_utc: datetime, own_pos: dict = None) -> dict:
     The overrides file is never garbage-collected, so without this the section
     would ship BA-26JUL21 and PGR-26JUL15 forever and grow by one row with every
     stale-ticker autofix. The same sweep supplies the pool $/day, which sizes a
-    row but is NOT its risk."""
+    row but is NOT its risk.
+
+    kalshi / pick_events come from imm_pickoff.scan() (Jack 2026-09-27: say
+    what time the event is AND what time Kalshi thinks it is). Every row gets
+    "kalshi_start" -- Kalshi's milestone, i.e. when "at event start" orders are
+    pulled -- and "pickoff" when that start is far enough past ours to leave
+    those orders resting through the real event. Omitted, rows carry
+    kalshi_start None and read exactly as before."""
     a = {"rows": [], "checked": 0, "total": 0, "excluded": 0, "no_day": 0,
          "dead": [], "error": None, "unverified": [], "no_prov": 0}
     try:
@@ -1287,6 +1296,17 @@ def cutoff_audit(client, now_utc: datetime, own_pos: dict = None) -> dict:
                 "cutoff_et": cutoff_et,
                 "hour_label": _override_hour_label(
                     ov_et, series.startswith(imm._EARNINGS_PREFIX))})
+        # Kalshi's own start per row. The scan's sweep only carries starts
+        # still ahead, so a row whose Kalshi start is behind us (yesterday's
+        # ticker date) costs one lookup; rows are a handful.
+        for r in a["rows"]:
+            ks = (kalshi or {}).get(r["event"])
+            if ks is None and kalshi is not None:
+                ks = imm_pickoff.kalshi_start_for(client, r["event"])
+            r["kalshi_start"] = ks
+            r["kalshi_days_out"] = ((ks.astimezone(ET).date() - today_et).days
+                                    if ks is not None else None)
+            r["pickoff"] = r["event"] in set(pick_events or ())
         # risk rows are ranked by IMMINENCE, not by pool size: the thing that
         # decides whether this needs action before the open is how soon Kalshi
         # thinks the call is, and dpd is the reward forfeited by standing down,
@@ -1313,7 +1333,17 @@ def _cutoff_meaning(r: dict):
     particular has to lead with the PROHIBITION: a tired reader who sees "costs
     accrual" next to a $310/day pool will reach for the obvious remedy — push
     the override out to match Kalshi — which is exactly the edit that would have
-    had the bot quoting through Lilly's print on Aug 5."""
+    had the bot quoting through Lilly's print on Aug 5.
+
+    Every branch then says what time Kalshi's own event start is and which
+    way that cuts for "at event start" orders (imm_pickoff.kalshi_note)."""
+    why, action = _cutoff_meaning_base(r)
+    note = imm_pickoff.kalshi_note(r["override_et"], r.get("kalshi_start"),
+                                   r.get("pickoff", False))
+    return (why + ". " + note if note else why), action
+
+
+def _cutoff_meaning_base(r: dict):
     when = r["cutoff_et"].strftime("%b %d %H:%M")
     if r["severity"] == "risk":
         return ("Kalshi says the call is {} ({}); the bot keeps quoting until {} "
@@ -1379,6 +1409,20 @@ def _unverified_meaning(r: dict) -> tuple:
             "risks nothing.".format(r["dpd"]))
 
 
+def _kalshi_vs_ours(r: dict) -> str:
+    """Both times for a banner row: what Kalshi thinks (its milestone start,
+    i.e. when "at event start" orders go) and what we have. Falls back to the
+    ticker date when Kalshi publishes no start for the event."""
+    ev = _short_event(r["event"])
+    if r.get("kalshi_start") is None:
+        return "Kalshi says the {} call is {} ({})".format(
+            ev, _days_out_phrase(r["days_out"]), r["ticker_date"])
+    return ("Kalshi thinks the {} call starts {}, {}; our time is {}, {}"
+            .format(ev, _days_out_phrase(r["kalshi_days_out"]),
+                    imm_pickoff.fmt_et(r["kalshi_start"]),
+                    imm_pickoff.fmt_et(r["override_et"]), r["hour_label"]))
+
+
 def cutoff_banner(a: dict) -> str:
     """One-line shout for the top of the digest, or "" when nothing is at risk.
 
@@ -1423,13 +1467,10 @@ def cutoff_banner(a: dict) -> str:
                 "beyond the date Kalshi thinks the call is on. ".format(
                     len(risk), "" if len(risk) == 1 else "s")
                 + " ".join(
-                    "LIVE EXPOSURE: Kalshi says the {ev} call is {when} ({date})"
-                    " — the bot has {cts:,.0f} contracts on the book and keeps "
-                    "quoting until {cut} ET. Standing down forfeits "
-                    "${dpd:,.0f}/day of reward pool.".format(
-                        ev=_short_event(r["event"]),
-                        when=_days_out_phrase(r["days_out"]),
-                        date=r["ticker_date"], cts=r["contracts"],
+                    "LIVE EXPOSURE: {kalshi} — the bot has {cts:,.0f} contracts "
+                    "on the book and keeps quoting until {cut} ET. Standing "
+                    "down forfeits ${dpd:,.0f}/day of reward pool.".format(
+                        kalshi=_kalshi_vs_ours(r), cts=r["contracts"],
                         cut=r["cutoff_et"].strftime("%b %d %H:%M"),
                         dpd=r["dpd"]) for r in risk))
         parts.extend(
@@ -1706,7 +1747,7 @@ def _cutoff_audit_html(a: dict) -> str:
                 '<td style="{td}">{ov}<div style="color:#999;font-size:11px">'
                 '{hour}</div></td>'
                 '<td style="{td}">{tick}<div style="color:{col};font-size:11px">'
-                '{when}</div></td>'
+                '{when}</div>{kstart}</td>'
                 # TD already ends in ';' — no extra one, or the declaration
                 # renders as 'text-align:right;;color:...'
                 '<td style="{td}color:{col};font-weight:700">{d:+d}d</td>'
@@ -1719,7 +1760,12 @@ def _cutoff_audit_html(a: dict) -> str:
                     why=why, act=action, hour=r["hour_label"],
                     ov=r["override_et"].strftime("%b %d %H:%M"),
                     tick=r["ticker_date"].isoformat(),
-                    when=_days_out_phrase(r["days_out"]), d=r["delta"],
+                    when=_days_out_phrase(r["days_out"]),
+                    kstart=('<div style="color:#999;font-size:11px">event '
+                            'start {}</div>'.format(imm_pickoff.fmt_et(
+                                r["kalshi_start"]))
+                            if r.get("kalshi_start") is not None else ""),
+                    d=r["delta"],
                     dir="LATE" if r["delta"] > 0 else "EARLY",
                     mkts=r["mkts"], cts=r["contracts"], dpd=r["dpd"]))
         h.append("</table>")
@@ -1920,9 +1966,14 @@ def build_digest(now_utc: datetime):
     rows, tot, resting = event_rows(client)     # open book + resting quotes
     cap_rows = capacity_rows(state, status, resting,
                              _f(status.get("pnl_today")) if status else None)
+    # Kalshi's event starts vs ours, for the PICK-OFF block (never raises).
+    # First, so the audit rows below can print Kalshi's start beside ours.
+    pick = imm_pickoff.scan(client, now_utc,
+                            meta=load_json(OVERRIDE_META_PATH))
     # pos (own_book, above) gives the audit its only real exposure number;
     # everything else it reports is reward pool. never raises — see docstring.
-    audit = cutoff_audit(client, now_utc, pos)
+    audit = cutoff_audit(client, now_utc, pos, kalshi=pick["kalshi"],
+                         pick_events=[r["event"] for r in pick["rows"]])
 
     try:
         bal_str = "${:,.2f}".format(_f(client.get_balance().get("balance_dollars")))
@@ -1944,6 +1995,13 @@ def build_digest(now_utc: datetime):
 
     # ---- plain text ---------------------------------------------------------
     L = ["Kalshi incentive MM \u2014 {}".format(today_ct), ""]
+    # An opportunity, not a risk: its own marker, above the red banner,
+    # because a window can be open right now.
+    _pick = imm_pickoff.text_lines(pick, now_utc)
+    if _pick:
+        L.append(">> " + _pick[0])
+        L.extend(_pick[1:])
+        L.append("")
     _banner = cutoff_banner(audit)
     if _banner:
         L.append("!! " + _banner)
@@ -1991,6 +2049,9 @@ def build_digest(now_utc: datetime):
     L.append("")
     L.append("")
     L.extend(_cutoff_audit_text(audit))
+    _perr = imm_pickoff.error_text(pick)
+    if _perr:
+        L.append(_perr)
     L.append("")
     L.append("CAPACITY — how close the bot is to each ceiling ({})".format(
         capacity_note()))
@@ -2048,6 +2109,7 @@ def build_digest(now_utc: datetime):
              'color:#999"> &nbsp;= trading {:+,.2f} + rewards {:,.2f}</span>'
              '</div>'.format(_pnl_span(nl) if nl is not None else "n/a",
                              w["life"]["raw"], w["life"]["reward"]))
+    h.append(imm_pickoff.html_block(pick, now_utc))        # "" when none
     if _banner:
         h.append('<div style="background:#fdecea;border-left:4px solid #c0392b;'
                  'color:#8e2b21;padding:8px 10px;margin:8px 0;font-weight:600">'
@@ -2110,6 +2172,9 @@ def build_digest(now_utc: datetime):
     h.append(_calibration_caveat_html())
 
     h.append(_cutoff_audit_html(audit))
+    if _perr:
+        h.append('<div style="color:#888;font-size:11px;margin-top:4px">{}'
+                 '</div>'.format(imm_pickoff._esc(_perr)))
 
     h.append('<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
              'Capacity &mdash; how close to each ceiling</div>')
@@ -2237,10 +2302,12 @@ def main(argv=None) -> int:
     if not alerter.enabled:
         log("cannot send imm digest: alert credentials not configured")
         return 1
+    subject = f"Kalshi incentive MM digest {today_ct}"
+    if (">> " + imm_pickoff.HEADER) in body:    # a window is in the text
+        subject += " - " + imm_pickoff.HEADER
     ok = False
     for attempt in range(1, 9):
-        ok = alerter.send_message(body, subject=f"Kalshi incentive MM digest {today_ct}",
-                                  html=html)
+        ok = alerter.send_message(body, subject=subject, html=html)
         if ok:
             break
         log(f"imm digest send attempt {attempt}/8 failed; retry in 5min")

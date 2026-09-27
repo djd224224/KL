@@ -53,6 +53,7 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
             os.environ[_v] = _val
 
 import incentive_mm as imm  # noqa: E402
+import imm_pickoff  # noqa: E402
 from incentive_mm import (Alerter, ET, EVENT_OVERRIDES_FILE,  # noqa: E402
                           EVENT_START_OVERRIDES, EXTRA_ALLOW_FILE,
                           _EARNINGS_PREFIX, build_client,
@@ -62,6 +63,9 @@ from incentive_mm import (Alerter, ET, EVENT_OVERRIDES_FILE,  # noqa: E402
 # Per-run summary consumed by the 7:20 combined email (imm_quote_gaps.py).
 SUMMARY_FILE = os.path.join(os.path.dirname(EVENT_OVERRIDES_FILE),
                             "overrides_last_runs.json")
+# Pick-off windows this task has already emailed (imm_pickoff.new_rows).
+PICKOFF_SEEN_FILE = os.path.join(os.path.dirname(EVENT_OVERRIDES_FILE),
+                                 "pickoff_seen.json")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -1334,13 +1338,35 @@ def main(argv=None) -> int:
     act += fa_act
     inf += fa_inf
 
+    # PICK-OFF WINDOWS (Jack 2026-09-27): Kalshi's event start LATER than the
+    # real event, so orders set to expire "at event start" are still resting
+    # while it happens. The 7:10 digest and 7:20 email list every open window;
+    # THIS run emails only NEW ones, because a window found at 12:45 for a 5pm
+    # call is no use in tomorrow's digest. Kept out of action_lines: the 7:20
+    # email renders its own live block and would otherwise print it twice.
+    # Runs after this run's writes, so a fresh override is already its input.
+    # Marked seen only once the email has gone (below): a failed send must
+    # retry at the next run, not go quiet until tomorrow's digest.
+    pick = imm_pickoff.scan(client, now, meta=load_meta(),
+                            nasdaq_for_date=nasdaq_earnings_for_date)
+    pick_new = imm_pickoff.new_rows(pick, now, PICKOFF_SEEN_FILE, save=False)
+    pick_act = (imm_pickoff.text_lines({"rows": pick_new}, now) + [""]
+                if pick_new else [])
+    for r in pick.get("rows") or []:
+        log(f"pick-off window: {r['event']} real {r['real'].isoformat()} "
+            f"kalshi {r['kalshi_start'].isoformat()}"
+            f"{'' if r in pick_new else ' (already emailed)'}")
+    if pick.get("error"):
+        inf.append(imm_pickoff.error_text(pick))
+
     tallies = (f"calls {len(resolved)}+/{len(unresolved)}?, "
                f"releases {len(rel_resolved)}+/{len(rel_unresolved)}?, "
                f"broadcast {len(bc_resolved)}+/{len(bc_unresolved)}?"
                + (f", {len(enrolled)} enrolled" if enrolled else "")
                + (f", {len(stale_fixed)} stale fixed" if stale_fixed else "")
                + (f", {len(stale_open)} STALE OPEN" if stale_open else "")
-               + (f", audit {len(fa_act)} new" if fa_act else ""))
+               + (f", audit {len(fa_act)} new" if fa_act else "")
+               + (f", {len(pick_new)} NEW PICK-OFF" if pick_new else ""))
 
     # Run summary for the 7:20 combined email (kept for the last 8 runs, so
     # info from the midday/afternoon runs still reaches the next morning).
@@ -1361,27 +1387,41 @@ def main(argv=None) -> int:
             json.dump(runs[-8:], f, indent=1)
 
     # This task emails on its own ONLY when something needs Jack; routine
-    # auto-handled runs surface in the morning combined email instead.
-    if not args.dry and act:
-        lines = ["Earnings call + release override run — ACTION NEEDED", ""]
-        lines += act
+    # auto-handled runs surface in the morning combined email instead. A new
+    # pick-off window leads the email AND the subject: it is the time-critical
+    # item, and "calls 0+/0?, ..." would bury it at the end of the line.
+    if not args.dry and (act or pick_act):
+        lines = list(pick_act)
+        if act:
+            lines += ["Earnings call + release override run — ACTION NEEDED",
+                      ""]
+            lines += act
         if inf:
             lines.append("auto-handled this run:")
             lines += [f"  {s}" for s in inf]
             lines.append("")
         if covered:
             lines.append(f"already covered: {', '.join(covered)}")
+        subject = f"IMM overrides ACTION: {tallies}"
+        if pick_new:
+            subject = "IMM {}: {}{}".format(
+                imm_pickoff.HEADER,
+                ", ".join(r["title"] or r["event"] for r in pick_new),
+                f" + overrides ACTION ({tallies})" if act else "")
         alerter = Alerter("IMM-EARNINGS", live=True)
         if alerter.enabled:
-            ok = alerter.send_message("\n".join(lines),
-                                      subject=f"IMM overrides ACTION: {tallies}")
+            ok = alerter.send_message("\n".join(lines), subject=subject)
             log(f"action email: {'sent' if ok else 'FAILED'}")
+            if ok and pick_new:
+                imm_pickoff.new_rows(pick, now, PICKOFF_SEEN_FILE, save=True)
         else:
             log("alert credentials not configured; action summary not emailed")
             print("\n".join(lines))
     else:
         log(f"no action needed ({tallies}); {len(covered)} covered, "
-            f"{len(provisional_open)} provisional, dry={args.dry}; "
+            f"{len(provisional_open)} provisional, "
+            f"{len(pick.get('rows') or [])} pick-off window(s) "
+            f"({len(pick_new)} new), dry={args.dry}; "
             f"summary saved for the morning combined email")
 
     return 0

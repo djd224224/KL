@@ -118,6 +118,7 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
 
 # Import AFTER the env fixups so module-level config/creds pick them up.
 import incentive_mm as imm            # noqa: E402
+import imm_pickoff                    # noqa: E402
 from incentive_mm import log          # noqa: E402
 
 if _LAUNCHER_ENV:
@@ -739,6 +740,10 @@ def build_report(now_utc: datetime):
     bot = imm.IncentiveMarketMaker(client, live=False)
     event_rows, ctx = classify_and_estimate(client, bot, now_utc)
     ovr_tallies, ovr_act, ovr_info, ovr_warn = load_overrides_runs(now_utc)
+    # Kalshi event start LATER than the real event (imm_pickoff); never raises
+    pick = imm_pickoff.scan(client, now_utc)
+    pick_lines = imm_pickoff.text_lines(pick, now_utc)
+    pick_err = imm_pickoff.error_text(pick)
 
     deliberate = [d for d in event_rows
                   if d["reason"].startswith(("blocklisted", "frozen"))]
@@ -762,7 +767,8 @@ def build_report(now_utc: datetime):
     headline = ctx["est_missed_total"]
     subject = (f"IMM quotes and overrides {today_et} — "
                f"est ${headline:,.0f}/day unquoted"
-               + (" — ACTION" if ovr_act else ""))
+               + (" — ACTION" if ovr_act else "")
+               + (" — " + imm_pickoff.HEADER if pick_lines else ""))
 
     def yld_str(d):
         return (f"{d['yld'] * 100:,.1f}%" if d.get("yld") is not None else "—")
@@ -787,6 +793,11 @@ def build_report(now_utc: datetime):
                      f"{ctx['updated_at']}) — 'quoted' set may be old.")
     lines.append("")
     lines.append(f"OVERRIDES — {ovr_tallies}" if ovr_tallies else "OVERRIDES")
+    if pick_lines:
+        lines.append(">> " + pick_lines[0])
+        lines += pick_lines[1:]
+    if pick_err:
+        lines.append(f"  ! {pick_err}")
     if ovr_warn:
         lines.append(f"  ! {ovr_warn}")
     if ovr_act:
@@ -794,7 +805,7 @@ def build_report(now_utc: datetime):
         lines += ovr_act
     for s in ovr_info:
         lines.append(f"  {s}")
-    if not (ovr_warn or ovr_act or ovr_info):
+    if not (ovr_warn or ovr_act or ovr_info or pick_lines or pick_err):
         lines.append("  nothing new; all cutoffs covered.")
     lines.append("")
     if show:
@@ -847,6 +858,10 @@ def build_report(now_utc: datetime):
     if ovr_tallies:
         h.append(f'<div style="color:#555;font-size:13px;margin-bottom:4px">'
                  f'{_esc(ovr_tallies)}</div>')
+    h.append(imm_pickoff.html_block(pick, now_utc))        # "" when none
+    if pick_err:
+        h.append(f'<div style="color:#888;font-size:12px">{_esc(pick_err)}'
+                 f'</div>')
     if ovr_warn:
         h.append(f'<div style="color:#c0392b;font-weight:600;font-size:13px">'
                  f'{_esc(ovr_warn)}</div>')
@@ -860,7 +875,7 @@ def build_report(now_utc: datetime):
     if ovr_info:
         h.append('<div style="color:#666;font-size:12px;margin-top:2px">'
                  + "<br>".join(_esc(s) for s in ovr_info) + '</div>')
-    if not (ovr_warn or ovr_act or ovr_info):
+    if not (ovr_warn or ovr_act or ovr_info or pick_lines or pick_err):
         h.append('<div style="color:#666;font-size:13px">nothing new; '
                  'all cutoffs covered.</div>')
 
