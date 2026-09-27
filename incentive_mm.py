@@ -12260,10 +12260,12 @@ class IncentiveMarketMaker:
             # (sticky selection keeps the market meanwhile).
             if CA_FAIR_ENABLE and carbon_arc_settled(meta.series):
                 ca_why = ""
+                ca_in: dict = {}     # guard-skip inputs, built on THIS path
                 if ca_refresh_held(t, now_ts):
                     ca_why = (f"new Carbon Arc read, holding "
                               f"{CA_FAIR_REFRESH_HOLD_MIN:g}m while the book "
                               f"reprices")
+                    ca_in = dict(hold_min=CA_FAIR_REFRESH_HOLD_MIN)
                 else:
                     band = ca_fair_band(t, now_ts)
                     if band is not None:
@@ -12277,11 +12279,18 @@ class IncentiveMarketMaker:
                                       f"{phi * 100:.0f}] (tol "
                                       f"{CA_FAIR_TOL_CENTS}c, "
                                       f"{'bid' if ca_bid_bad else 'ask'} side)")
+                            ca_in = dict(fair=round(pc * 100, 2),
+                                         lo=round(plo * 100, 2),
+                                         hi=round(phi * 100, 2),
+                                         tol=CA_FAIR_TOL_CENTS,
+                                         bid_bad=ca_bid_bad,
+                                         ask_bad=ca_ask_bad)
                 if ca_why:
                     if t not in self._ca_fair_stood:
                         self._ca_fair_stood.add(t)
                         log(f"{self.tag} ca-fair stand-aside {t}: {ca_why}")
                     self.cancel_market_orders(t, resting)
+                    self._gskip(t, "ca_fair", lambda: ca_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
             if t in self._ca_fair_stood:
                 self._ca_fair_stood.discard(t)

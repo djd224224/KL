@@ -3757,4 +3757,7 @@ refresh hold incl. first load and unchanged rewrites, stand-aside -> hold
 Arc quote plainly) and test_carbon_arc_fair.py (catalog map, month spread,
 entry math, thin / stale refusals, case-insensitive entity match, file +
 vintage writes, series-map reuse and failure, feed settings env vs home
-file, bearer header + payload shape). 783 green.
+file, bearer header + payload shape). Guard-skip sink: the stand-aside is
+guard "ca_fair" in guard_skips_*.jsonl (inputs: hold_min, or fair / lo / hi /
+tol / bid_bad / ask_bad), so the sweep test counts 24 continues. 820 green
+after the rebase onto the data-capture merge.

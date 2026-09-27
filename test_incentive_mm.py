@@ -13638,7 +13638,8 @@ class TestGuardSkipSink(unittest.TestCase):
                         if src[j].strip())
             if not prev.startswith("self._gskip("):
                 bare.append(prev)
-        self.assertEqual(len(conts), 23)
+        # 24 = 23 + the Carbon Arc fair gate (2026-09-26)
+        self.assertEqual(len(conts), 24)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
