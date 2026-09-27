@@ -8145,7 +8145,6 @@ class TestGasBuddyFairGate(unittest.TestCase):
 
     def test_family_shape_and_kill_switch_patterns(self):
         self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
-        self.assertFalse(imm.gb_fair_series("KXAAAGASD"))        # the national
         self.assertFalse(imm.gb_fair_series("KXAAAGASDNYC"))     # not a state shape
         self.assertFalse(imm.gb_fair_series("KXAAAGASW"))
         # the diesel daily joins (2026-09-27: "ok do that for diesel daily"),
@@ -8156,6 +8155,15 @@ class TestGasBuddyFairGate(unittest.TestCase):
         with mock.patch.object(imm, "GB_DIESEL_ENABLE", False):
             self.assertFalse(imm.gb_fair_series("KXDIESELD"))
             self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
+        # the national gas daily joins (2026-09-27: "yes gate KXAAAGASD
+        # national on gasbuddy"); the weekly/monthly do not;
+        # IMM_GB_NATGAS_ENABLE=0 takes it back out
+        self.assertTrue(imm.gb_fair_series("KXAAAGASD"))
+        self.assertFalse(imm.gb_fair_series("KXAAAGASM"))
+        with mock.patch.object(imm, "GB_NATGAS_ENABLE", False):
+            self.assertFalse(imm.gb_fair_series("KXAAAGASD"))
+            self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
+            self.assertTrue(imm.gb_fair_series("KXDIESELD"))
         # gate on (default): state dailies unblocked, anything longer blocked
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASDCA"))
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
@@ -8214,6 +8222,20 @@ class TestGasBuddyFairGate(unittest.TestCase):
                 self.assertEqual(imm.series_min_est_rate(fake), 2.0)
         finally:
             imm.SERIES_OVERRIDES.pop(fake, None)
+
+    def test_national_gas_strike_format_and_guards(self):
+        # KXAAAGASD strikes are plain: KXAAAGASD-26SEP28-4.5050
+        self._write(mu=4.0, sigma=0.005, ev="KXAAAGASD-68DEC04")
+        self.assertEqual(imm.gb_gate_reason("KXAAAGASD-68DEC04-4.0000", time.time(), 49, 51),
+                         ("", {}))
+        inp = imm.gb_gate_reason("KXAAAGASD-68DEC04-4.0020", time.time(), 49, 51)[1]
+        self.assertEqual((inp["reason"], inp["bid_bad"]), ("band", True))
+        self.assertEqual(imm.gb_gate_reason("KXAAAGASD-68DEC05-4.0000", time.time(), 49, 51)[1]["reason"],
+                         "no_read")
+        # the parent keeps its own guard set: no state-style rate-floor swap
+        before = imm.SERIES_OVERRIDES["KXAAAGASD"]
+        imm.ensure_family_override("KXAAAGASD")
+        self.assertIs(imm.SERIES_OVERRIDES["KXAAAGASD"], before)
 
     def test_diesel_strike_format(self):
         # KXDIESELD strikes carry a T: KXDIESELD-26SEP28-T6.470

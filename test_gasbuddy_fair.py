@@ -109,7 +109,12 @@ class _WriterFixture(unittest.TestCase):
             live=live if live is not None else {"CA": 6.40, "TX": 3.955, "FL": 4.4},
             anchor_fn=self.anchor_fn, prev_fn=self.prev_fn, history_fn=self.hist_fn,
             live_log=self.log, pace=0, diesel_live=diesel,
-            diesel_live_fn=lambda: None, diesel_hist_fn=self.diesel_hist_fn)
+            diesel_live_fn=lambda: None, diesel_hist_fn=self.diesel_hist_fn,
+            natgas_hist_fn=self.natgas_hist_fn)
+
+    def natgas_hist_fn(self):
+        self.calls.setdefault("nhist", []).append(1)
+        return dict(getattr(self, "nhist", {}))
 
     def diesel_hist_fn(self):
         self.calls.setdefault("dhist", []).append(1)
@@ -133,7 +138,7 @@ class TestWriteFairFile(_WriterFixture):
         self.assertEqual((tx["mu"], tx["sigma"]), (want["mu"], want["sigma"]))
         self.assertEqual((tx["anchor"], tx["prev"], tx["prev_source"]), (3.93, 3.94, "gasbuddy"))
         self.assertEqual(tx["fetched_at"], self.NOW.isoformat())
-        self.assertEqual(len(d["absent"]), 50)                   # other states + diesel
+        self.assertEqual(len(d["absent"]), 51)                   # other states + diesel + national
         self.assertEqual(self.calls["hist"], [])                 # Friday print: no b2
         n_anchor, n_prev = len(self.calls["anchor"]), len(self.calls["prev"])
         # five minutes later: anchors, absents and yesterday's averages are cached
@@ -146,7 +151,7 @@ class TestWriteFairFile(_WriterFixture):
         self.write()
         n = len(self.calls["anchor"])
         self.write(now=utc(2026, 10, 1, 22, 5), meta=self.meta("2026-10-01T18:00:00"))
-        self.assertEqual(len(self.calls["anchor"]) - n, 50)     # 49 states + KXDIESELD
+        self.assertEqual(len(self.calls["anchor"]) - n, 51)     # 49 states + KXDIESELD + KXAAAGASD
 
     def test_nothing_before_seven_et(self):
         early = utc(2026, 10, 1, 10, 30)                          # 06:30 EDT
@@ -256,6 +261,20 @@ class TestDieselDaily(_WriterFixture):
         e = self.read()["entries"]["KXDIESELD-26OCT02"]
         self.assertEqual((e["prev"], e["prev_source"]), (6.455, "close"))
 
+    def test_todays_partial_chart_point_is_not_a_final(self):
+        # GasBuddy's chart carries TODAY's figure so far; filed as a final it
+        # made the next day skip the re-read and price off that partial
+        self.dhist = {"2026-09-29": 6.44, "2026-09-30": 6.46, "2026-10-01": 6.45}
+        self.write(diesel=6.45)
+        self.assertNotIn("2026-10-01", self.read()["diesel_finals"])
+        self.dhist = {"2026-10-01": 6.43, "2026-10-02": 6.42}
+        fri = utc(2026, 10, 2, 16, 0)
+        self.write(now=fri, meta={"updated": "2026-10-02T11:55:00", "today": "2026-10-02",
+                                  "prev": "2026-10-01"}, diesel=6.42)
+        e = self.read()["entries"]["KXDIESELD-26OCT03"]
+        self.assertEqual((e["prev"], e["prev_source"]), (6.43, "gasbuddy"))   # re-read, final
+        self.assertEqual(len(self.calls["dhist"]), 2)
+
     def test_monday_trading_skipped_for_diesel_too(self):
         mon = utc(2026, 10, 5, 16, 0)
         self.dhist = {"2026-10-04": 6.4}
@@ -269,6 +288,104 @@ class TestDieselDaily(_WriterFixture):
         self.write(diesel=6.45)
         with open(self.log, encoding="utf-8") as f:
             self.assertEqual(json.loads(f.readline())["diesel_us"], 6.45)
+
+
+class TestNatGasFair(unittest.TestCase):
+    """AAA's national regular print (KXAAAGASD, Jack 2026-09-27: "yes gate
+    KXAAAGASD national on gasbuddy"): the national weekday fit."""
+
+    def test_friday_print_math(self):
+        noon_thu = datetime(2026, 10, 1, 12, 0, tzinfo=gb.ET)
+        f = gb.natgas_fair(date(2026, 10, 2), anchor=4.48, live=4.47, prev=4.49,
+                           prev2=None, now_et=noon_thu)
+        alpha, b1, b2, e = gb.NATGAS_WEEKDAY_MODEL[4]
+        self.assertAlmostEqual(f["mu"], round(4.48 + alpha + b1 * (4.47 - 4.49), 5))
+        rem = gb.NATGAS_DAY_MOVE_SD[3] * 0.5
+        self.assertAlmostEqual(f["sigma"], round(math.sqrt(e ** 2 + (b1 * rem) ** 2), 5))
+        self.assertEqual((f["weekday"], f["b2"], f["e"]), (4, 0.0, e))
+
+    def test_monday_print_needs_saturdays_move(self):
+        sun = datetime(2026, 9, 27, 19, 30, tzinfo=gb.ET)
+        self.assertIsNone(gb.natgas_fair(date(2026, 9, 28), 4.4798, 4.425, 4.468, None, sun))
+        f = gb.natgas_fair(date(2026, 9, 28), 4.4798, 4.425, 4.468, 4.480, sun)
+        alpha, b1, b2, e = gb.NATGAS_WEEKDAY_MODEL[0]
+        want = 4.4798 + alpha + b1 * (4.425 - 4.468) + b2 * (4.468 - 4.480)
+        self.assertAlmostEqual(f["mu"], round(want, 5))
+        # Sunday's live move barely counts and little of the day is left
+        self.assertLess(f["sigma"], 0.0045)
+
+
+class TestNationalGasDaily(_WriterFixture):
+    """One KXAAAGASD entry per event from GasBuddy's national regular live
+    average, which rides in the country LiveAvg read (no extra call)."""
+
+    def setUp(self):
+        super().setUp()
+        self.anchors["KXAAAGASD"] = ("ok", 4.48)
+
+    def nmeta(self, updated="2026-10-01T11:55:00", today="2026-10-01",
+              prev="2026-09-30", live=4.47, prev_price=4.49):
+        return {"updated": updated, "today": today, "prev": prev,
+                "live_price": live, "prev_price": prev_price}
+
+    def test_national_entry(self):
+        self.assertEqual(self.write(meta=self.nmeta()), (3, 0))
+        e = self.read()["entries"]["KXAAAGASD-26OCT02"]
+        want = gb.natgas_fair(date(2026, 10, 2), 4.48, 4.47, 4.49, None,
+                              self.NOW.astimezone(gb.ET))
+        self.assertEqual((e["mu"], e["sigma"]), (want["mu"], want["sigma"]))
+        self.assertEqual((e["fuel"], e["series"], e["anchor"], e["prev"], e["prev_source"]),
+                         ("gas", "KXAAAGASD", 4.48, 4.49, "gasbuddy"))
+        self.assertEqual(self.calls.get("nhist"), None)          # Friday print: no b2
+        self.assertEqual(self.read()["natgas_closes"]["2026-10-01"]["US"], 4.47)
+
+    def test_pending_anchor_and_no_live_read(self):
+        self.anchors["KXAAAGASD"] = ("pending", None)            # settles ~07:06 ET
+        self.assertEqual(self.write(meta=self.nmeta()), (2, 1))
+        self.assertIn("KXAAAGASD", self.read()["missing"])
+        self.assertNotIn("KXAAAGASD", self.read()["anchors"])
+        self.anchors["KXAAAGASD"] = ("ok", 4.48)
+        self.assertEqual(self.write(meta=self.nmeta(live=None)), (2, 1))
+        # yesterday's average missing: our own last live read of yesterday stands in
+        with open(self.path, encoding="utf-8") as f:
+            d = json.load(f)
+        d["natgas_closes"] = {"2026-09-30": {"US": 4.485}}
+        d.pop("natgas_finals", None)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        self.write(meta=self.nmeta(prev="2026-09-29", prev_price=4.50))
+        e = self.read()["entries"]["KXAAAGASD-26OCT02"]
+        self.assertEqual((e["prev"], e["prev_source"]), (4.485, "close"))
+
+    def test_monday_trading_skipped(self):
+        mon = utc(2026, 10, 5, 16, 0)
+        self.write(now=mon, meta=self.nmeta("2026-10-05T11:55:00", "2026-10-05",
+                                            "2026-10-04"))
+        d = self.read()
+        self.assertEqual(d["entries"], {})
+        self.assertIn("KXAAAGASD", d["missing"])
+
+    def test_sunday_trading_reads_friday_once(self):
+        sun = utc(2026, 10, 4, 16, 0)
+        self.nhist = {"2026-10-02": 4.46}
+        m = self.nmeta("2026-10-04T11:55:00", "2026-10-04", "2026-10-03", 4.44, 4.47)
+        self.write(now=sun, meta=m)
+        e = self.read()["entries"]["KXAAAGASD-26OCT05"]
+        self.assertEqual((e["prev"], e["prev2"], e["b2"]), (4.47, 4.46, 0.48))
+        self.write(now=utc(2026, 10, 4, 16, 5), meta=dict(m, updated="2026-10-04T12:00:00"))
+        self.assertEqual(len(self.calls["nhist"]), 1)             # kept in natgas_finals
+        # no Friday anywhere: no entry, and the chart is asked once a day only
+        self.setUp()
+        self.nhist = {}
+        self.write(now=sun, meta=m)
+        self.write(now=utc(2026, 10, 4, 16, 5), meta=dict(m, updated="2026-10-04T12:00:00"))
+        self.assertEqual(self.read()["entries"].get("KXAAAGASD-26OCT05"), None)
+        self.assertEqual(len(self.calls["nhist"]), 1)
+
+    def test_live_log_carries_the_national(self):
+        self.write(meta=self.nmeta())
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["gas_us"], 4.47)
 
 
 class TestFetchParsing(unittest.TestCase):
@@ -308,7 +425,14 @@ class TestFetchParsing(unittest.TestCase):
         with mock.patch.object(gb, "_get", return_value=payload):
             m = gb.fetch_live_avg(300005)
         self.assertEqual(m, {"updated": "2026-09-27T10:45:00.63", "today": "2026-09-27",
-                             "prev": "2026-09-26", "prev_price": 6.35})
+                             "live_price": 6.355, "prev": "2026-09-26", "prev_price": 6.35})
+        # no LiveTickingAvg: today's average stands in; junk prices are None
+        bare = json.loads(json.dumps(payload))
+        del bare["LiveTickingAvg"]
+        bare["AvgPriceDict"]["OneDayAgo"]["AvgPrice"] = "n/a"
+        with mock.patch.object(gb, "_get", return_value=bare):
+            m = gb.fetch_live_avg(500000)
+        self.assertEqual((m["live_price"], m["prev_price"]), (6.355, None))
         gb._REGION_IDS["CA"] = 300005
         with mock.patch.object(gb, "_get", return_value=payload):
             self.assertEqual(gb.fetch_prev("CA"), ("2026-09-26", 6.35))
@@ -370,10 +494,12 @@ class TestSignedAnchorReads(unittest.TestCase):
                 diesel_live_fn=lambda: None, diesel_hist_fn=lambda: {},
                 get_json=get_json)
         self.assertEqual((ok, miss), (2, 0))
-        # every state's anchor AND the diesel daily's, all through the reader
-        self.assertEqual(len(seen), len(set(gb.STATES.values())) + 1)
+        # every state's anchor AND the diesel and national gas dailies', all
+        # through the reader
+        self.assertEqual(len(seen), len(set(gb.STATES.values())) + 2)
         self.assertIn("KXAAAGASDTX-26OCT01", seen)
         self.assertIn("KXDIESELD-26OCT01", seen)
+        self.assertIn("KXAAAGASD-26OCT01", seen)
 
 
 if __name__ == "__main__":

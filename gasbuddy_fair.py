@@ -81,6 +81,29 @@ published after the close, so it cannot be used. No weekday structure is
 fitted (too few days); the Tuesday print is skipped as for gas. One entry
 per event, KXDIESELD-<print date>, same fields as a state's.
 
+NATIONAL GAS DAILY (Jack 2026-09-27: "yes gate KXAAAGASD national on
+gasbuddy"). KXAAAGASD settles on AAA's NATIONAL regular average -- the same
+clock as the states: each event trades 08:00-23:59 ET the day before, AAA posts
+~03:20 ET, Kalshi settles ~07:06 ET (Sundays ~09:10). GasBuddy's national live
+average and 1 Day Ago Full Day Average ride in the LiveAvg read every refresh
+already makes (region 500000, regular), so the entry costs no extra GasBuddy
+call; the chart (fuel type 3, national) fills the day before yesterday for the
+Monday print. Measured on 129 print days (Kalshi KXAAAGASD expiration values
+against GasBuddy's national Full Day Averages, Mar 27 - Sep 26), the states'
+weekday shape with tighter residuals (leave-one-out; carried forward in
+brackets):
+    Mon print  alpha +1.07c  b1 0.11  b2 0.48  e 0.41c  (0.67c)   n 26
+    Tue print  UNMEASURED (3 days: GasBuddy's chart has no Mondays) -- skipped
+    Wed print  UNMEASURED: b1 0.87, e 1.0c assumed
+    Thu print  alpha -0.03c  b1 0.91           e 0.63c  (2.88c)   n 23
+    Fri print  alpha -0.35c  b1 0.87           e 0.46c  (2.68c)   n 25
+    Sat print  alpha +0.46c  b1 0.85           e 0.58c  (1.77c)   n 25
+    Sun print  alpha +0.66c  b1 0.65           e 0.41c  (0.82c)   n 27
+The unseen part of the trading day scales with GasBuddy's national daily move
+(sd by trading weekday: Wed 3.1c, Thu 3.0c, Fri 2.0c, Sat 1.1c, Sun 0.7c) on
+the same linear default as the states. One entry per event,
+KXAAAGASD-<print date>, fuel "gas".
+
 Standalone:  python gasbuddy_fair.py [--out path]
 """
 
@@ -203,6 +226,23 @@ DIESEL_SERIES = "KXDIESELD"
 DIESEL_MODEL = (0.0024, 0.76, 0.0169)     # alpha, b1, e in dollars (39 days)
 DIESEL_DAY_MOVE_SD = 0.0357               # sd of GasBuddy's daily diesel move
 
+NATGAS_SERIES = SERIES_PREFIX             # KXAAAGASD: AAA's national regular
+# print weekday (Mon=0) -> (alpha, b1, b2, e) in dollars, national fit on 129
+# print days (e = leave-one-out residual). Tue (skipped) and Wed unmeasured.
+NATGAS_WEEKDAY_MODEL = {
+    0: (0.0107, 0.11, 0.48, 0.0041),
+    1: (0.0055, 0.63, 0.00, 0.0150),
+    2: (0.0000, 0.87, 0.00, 0.0100),
+    3: (-0.0003, 0.91, 0.00, 0.0063),
+    4: (-0.0035, 0.87, 0.00, 0.0046),
+    5: (0.0046, 0.85, 0.00, 0.0058),
+    6: (0.0066, 0.65, 0.00, 0.0041),
+}
+# sd of GasBuddy's national daily move by TRADING weekday (Mon=0), dollars.
+# Mon (3 obs) and Tue (none) unmeasured: the states' figures stand in.
+NATGAS_DAY_MOVE_SD = {0: 0.0148, 1: 0.0320, 2: 0.0311, 3: 0.0303, 4: 0.0198,
+                      5: 0.0111, 6: 0.0069}
+
 _MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP",
            "OCT", "NOV", "DEC"]
 
@@ -322,19 +362,45 @@ def fetch_diesel_history() -> Dict[str, float]:
     return out
 
 
+def fetch_natgas_history() -> Dict[str, float]:
+    """National regular Full Day Averages over the last month: date -> price
+    (only for the Monday print's day-before-yesterday)."""
+    r = requests.post(f"{GB_API}/HighChart/GetHighChartRecords/",
+                      json={"regionID": [US], "fuelType": 3, "timeWindow": [4],
+                            "frequency": 1}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    out: Dict[str, float] = {}
+    for block in r.json() or []:
+        for row in block.get("USList") or []:
+            try:
+                d = datetime.strptime(str(row["datetime"]), "%m/%d/%Y").date()
+                out[d.isoformat()] = float(row["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
 def fetch_live_avg(region_id: int = US) -> dict:
     """A region's LiveAvg: when the live averages were last updated (the
-    site's clock is ET), today's date, and the 1 Day Ago average + date."""
+    site's clock is ET), today's date, the live (ticking) regular average,
+    and the 1 Day Ago average + date. For the country these are the
+    NATIONAL regular figures the KXAAAGASD entry uses."""
     d = _get(f"{GB_API}/LiveAvg/", {"id": region_id, "countryID": US}) or {}
     avg = d.get("AvgPriceDict") or {}
     one = avg.get("OneDayAgo") or {}
-    try:
-        prev_price = float(one.get("AvgPrice"))
-    except (TypeError, ValueError):
-        prev_price = None
+    today = avg.get("Today") or {}
+
+    def _px(v) -> Optional[float]:
+        try:
+            p = float(v)
+        except (TypeError, ValueError):
+            return None
+        return p if math.isfinite(p) and p > 0 else None
+    live = _px(d.get("LiveTickingAvg"))
     return {"updated": d.get("LastUpdatedTime"),
-            "today": str((avg.get("Today") or {}).get("date") or "")[:10],
-            "prev": str(one.get("date") or "")[:10], "prev_price": prev_price}
+            "today": str(today.get("date") or "")[:10],
+            "live_price": live if live is not None else _px(today.get("AvgPrice")),
+            "prev": str(one.get("date") or "")[:10], "prev_price": _px(one.get("AvgPrice"))}
 
 
 def fetch_prev(abbr: str) -> Tuple[str, Optional[float]]:
@@ -441,6 +507,23 @@ def diesel_fair(print_day: date, anchor: float, live: float, prev: float,
             "e": e, "remain": round(rem, 5)}
 
 
+def natgas_fair(print_day: date, anchor: float, live: float, prev: float,
+                prev2: Optional[float], now_et: datetime) -> Optional[dict]:
+    """N(mu, sigma) in dollars for AAA's national regular print on print_day,
+    or None when the Monday print's day-before-yesterday is missing."""
+    wd = print_day.weekday()
+    alpha, b1, b2, e = NATGAS_WEEKDAY_MODEL[wd]
+    if b2 and prev2 is None:
+        return None
+    hour = now_et.hour + now_et.minute / 60.0
+    rem = (NATGAS_DAY_MOVE_SD.get(now_et.weekday(), 0.0277)
+           * min(1.0, max(0.0, (24.0 - hour) / 24.0)))
+    mu = anchor + alpha + b1 * (live - prev) + (b2 * (prev - prev2) if b2 else 0.0)
+    sigma = GB_SIGMA_MULT * math.sqrt(e ** 2 + (b1 * rem) ** 2)
+    return {"mu": round(mu, 5), "sigma": round(sigma, 5), "weekday": wd,
+            "alpha": alpha, "b1": b1, "b2": b2, "e": e, "remain": round(rem, 5)}
+
+
 def _read_json(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
@@ -461,7 +544,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     diesel_live: Optional[float] = None,
                     diesel_live_fn: Optional[Callable] = None,
                     diesel_hist_fn: Optional[Callable] = None,
-                    get_json: Optional[Callable[[str, dict], dict]] = None
+                    get_json: Optional[Callable[[str, dict], dict]] = None,
+                    natgas_hist_fn: Optional[Callable] = None
                     ) -> Tuple[int, int]:
     """Fetch (unless given), build and atomically write the fair file.
     Returns (events with an entry, series without one). Anchors, absent
@@ -483,6 +567,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     prev_fn = prev_fn or fetch_prev
     history_fn = history_fn or fetch_history
     diesel_hist_fn = diesel_hist_fn or fetch_diesel_history
+    natgas_hist_fn = natgas_hist_fn or fetch_natgas_history
     old = _read_json(path)
     if meta is None:
         meta = fetch_live_avg(US)
@@ -510,6 +595,13 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     dfinals, dcloses = _days("diesel_finals"), _days("diesel_closes")
     if live_fresh and diesel_live:
         dcloses[today.isoformat()] = {"US": diesel_live}
+    # the national regular average rides in the country LiveAvg read (meta)
+    nfinals, ncloses = _days("natgas_finals"), _days("natgas_closes")
+    ng_live = meta.get("live_price")
+    if live_fresh and ng_live:
+        ncloses[today.isoformat()] = {"US": ng_live}
+    if meta.get("prev_price") and str(meta.get("prev") or "") >= keep_from:
+        nfinals.setdefault(str(meta["prev"]), {})["US"] = meta["prev_price"]
     anchors: Dict[str, dict] = {s: a for s, a in (old.get("anchors") or {}).items()
                                 if isinstance(a, dict)}
     absent: Dict[str, float] = {s: float(t) for s, t in (old.get("absent") or {}).items()
@@ -572,7 +664,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             except Exception:
                 hist = {}
             for d, p in hist.items():
-                if d >= keep_from:
+                if keep_from <= d < today.isoformat():   # today's is still forming
                     finals.setdefault(d, {}).setdefault(abbr, p)
             pv2 = (finals.get(d2) or {}).get(abbr)
         f = state_fair(abbr, print_day, a["value"], lv, pv, pv2, now_et)
@@ -610,8 +702,11 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         if ok:
             if yday.isoformat() not in dfinals and tried_prev.get("diesel") != today.isoformat():
                 try:
+                    # the chart's point for TODAY is the day so far, not a
+                    # Full Day Average: filed as one it made the next day skip
+                    # this read and price off a partial (fixed 2026-09-27)
                     for d, p in diesel_hist_fn().items():
-                        if d >= keep_from:
+                        if keep_from <= d < today.isoformat():
                             dfinals.setdefault(d, {})["US"] = p
                     tried_prev["diesel"] = today.isoformat()
                 except Exception:
@@ -630,6 +725,58 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     prev_source=src, prev2=None, print_day=print_day.isoformat(),
                     live_updated=upd.isoformat() if upd else None,
                     fetched_at=now.isoformat())
+    # ---- the national gas daily (KXAAAGASD): anchored on Kalshi's settled
+    # national print (~07:06 ET, Sundays ~09:10), "pending" until then
+    if trading and absent.get(NATGAS_SERIES, 0.0) <= now.timestamp() - ABSENT_RECHECK_SECS:
+        series = NATGAS_SERIES
+        a = anchors.get(series) or {}
+        ok = a.get("date") == today.isoformat()
+        if not ok:
+            try:
+                status, val = anchor_fn(series, today)
+            except Exception:
+                status, val = "error", None
+                failed += 1
+            finally:
+                time.sleep(pace)
+            if status == "absent":
+                absent[series] = now.timestamp()
+            elif status == "ok":
+                absent.pop(series, None)
+                a = anchors[series] = {"date": today.isoformat(), "value": val}
+                ok = True
+            else:                                 # pending / read error
+                missing.append(series)
+        if ok:
+            pv, src = (nfinals.get(yday.isoformat()) or {}).get("US"), "gasbuddy"
+            if pv is None:
+                pv, src = (ncloses.get(yday.isoformat()) or {}).get("US"), "close"
+            pv2 = (nfinals.get(d2) or {}).get("US")
+            if pv2 is None:
+                pv2 = (ncloses.get(d2) or {}).get("US")
+            if (pv2 is None and NATGAS_WEEKDAY_MODEL[print_day.weekday()][2]
+                    and tried_prev.get("natgas") != today.isoformat()):
+                try:
+                    for d, p in natgas_hist_fn().items():
+                        if keep_from <= d < today.isoformat():
+                            nfinals.setdefault(d, {}).setdefault("US", p)
+                    tried_prev["natgas"] = today.isoformat()
+                except Exception:
+                    pass
+                pv2 = (nfinals.get(d2) or {}).get("US")
+            f = None
+            if (print_day.weekday() not in GB_SKIP_PRINT_WEEKDAYS and live_fresh
+                    and ng_live and pv is not None):
+                f = natgas_fair(print_day, a["value"], ng_live, pv, pv2, now_et)
+            if f is None:
+                missing.append(series)
+            else:
+                entries[event_ticker(series, print_day)] = dict(
+                    f, series=series, fuel="gas", anchor=a["value"],
+                    anchor_date=a["date"], live=ng_live, prev=pv,
+                    prev_source=src, prev2=pv2, print_day=print_day.isoformat(),
+                    live_updated=upd.isoformat() if upd else None,
+                    fetched_at=now.isoformat())
     if failed:
         _log(f"! Kalshi anchor read failed for {failed} series; retrying next refresh")
     # the intraday record the remain() curve gets calibrated from, one row
@@ -645,7 +792,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         with open(lp, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"ts": now.isoformat(), "updated": upd.isoformat(),
                                  "day": meta.get("today"), "live": live,
-                                 "diesel_us": diesel_live},
+                                 "diesel_us": diesel_live, "gas_us": ng_live},
                                 sort_keys=True) + "\n")
         logged = upd.isoformat()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -658,6 +805,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                    "anchors": anchors, "absent": absent, "finals": finals,
                    "closes": closes, "tried_prev": tried_prev,
                    "diesel_finals": dfinals, "diesel_closes": dcloses,
+                   "natgas_finals": nfinals, "natgas_closes": ncloses,
                    "live_logged": logged or None,
                    "model": {"sigma_mult": GB_SIGMA_MULT,
                              "max_age_min": GB_MAX_AGE_MIN,

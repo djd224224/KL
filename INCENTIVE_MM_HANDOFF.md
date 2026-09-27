@@ -4582,3 +4582,72 @@ above: its anchor goes through the same anchor_fn, so it is read signed too
 (the GasBuddy write test counts 51 state anchors + KXDIESELD through the
 reader). The Vercel pre-D gate above reads no Kalshi (vercel_fair.py reads
 only Vercel's export), so it takes no reader. Full suite 1424 green.
+
+## 2026-09-27 pm — KXAAAGASD (the national gas daily) joins the GasBuddy gate (Jack: "yes gate KXAAAGASD national on gasbuddy")
+
+WHY. The national AAA gas daily was the one gas daily still quoted without a
+fair after the state dailies and KXDIESELD went behind GasBuddy. On the 9/27
+rewards statement (mark-to-market) it lost $161 over 9/23-9/27 on $27 of
+credits: the 9/24, 9/25 and 9/26 events -$60, -$57 and -$53.
+
+MODEL (gasbuddy_fair.py). Same clock as the states: event D trades 08:00-23:59
+ET on D-1 (open 12:00Z, close 03:59Z), AAA posts ~03:20 ET, Kalshi settles
+~07:06 ET (Sundays ~09:10). Fitted on 129 print days (Kalshi's KXAAAGASD
+expiration values, 211 events back to 2023 via /historical/markets, against
+GasBuddy's national Full Day Averages Mar 27 - Sep 26; leave-one-out
+residual, carried-forward sd in brackets):
+    Mon print  alpha +1.07c  b1 0.11  b2 0.48  e 0.41c  (0.67c)  n 26
+    Tue print  unmeasured (3 days) -- skipped, like the states
+    Wed print  unmeasured -- b1 0.87, e 1.0c assumed
+    Thu print  alpha -0.03c  b1 0.91  e 0.63c  (2.88c)  n 23
+    Fri print  alpha -0.35c  b1 0.87  e 0.46c  (2.68c)  n 25
+    Sat print  alpha +0.46c  b1 0.85  e 0.58c  (1.77c)  n 25
+    Sun print  alpha +0.66c  b1 0.65  e 0.41c  (0.82c)  n 27
+remain(t) scales with GasBuddy's national daily move by trading weekday (Wed
+3.1c, Thu 3.0c, Fri 2.0c, Sat 1.1c, Sun 0.7c; Mon/Tue the states' figures),
+linear in the ET hour like the states. The national live average (LiveTicking
+Avg) and 1 Day Ago come from the country LiveAvg read every refresh already
+makes -- no extra GasBuddy call (4.425 matched the map endpoint's USA row);
+the chart is read only for the Monday print's day-before-yesterday. Entry
+KXAAAGASD-<print date>, fuel "gas"; natgas_finals / natgas_closes persist in
+the fair file; gasbuddy_live.jsonl rows gain "gas_us".
+
+GATE (incentive_mm.py). gb_fair_series() includes KXAAAGASD while
+GB_NATGAS_ENABLE: fail CLOSED, tol 0, the 0.5-sigma band, the 2c sigma cap,
+no slot without a read, Monday trading (the Tuesday print) skipped. Its own
+guards are untouched (ensure_family_override never re-clones the parent, so
+no state-style rate-floor swap). Kill switch IMM_GB_NATGAS_ENABLE=0 = plain
+quoting again. Startup line: "gb-fair gate: AAA state dailies + KXDIESELD +
+KXAAAGASD ...".
+
+DRY RUN 9/27 19:35 ET (Sunday -> Monday print): 28 entries (26 states,
+KXDIESELD, KXAAAGASD), 0 missing. National fair 4.4800 +- 0.41c (anchor
+4.4798, GasBuddy live 4.425 vs Saturday's 4.468 -- a large Sunday drop the
+Monday fit passes through at only 0.11). The book disagreed near the money
+(4.480 strike 17x18 against a 50c fair, 4.475 61x62 against 89c): those 4
+strikes stand aside, the 13 far strikes where book and fair agree quote.
+
+ALSO FIXED (all three chart reads). GasBuddy's chart carries TODAY's figure
+so far. The diesel path filed it as a Full Day Average, so the next day saw
+"yesterday present", skipped its re-read and priced KXDIESELD off a partial
+(every other day: 9/27's 6.445 was sitting in diesel_finals as a "final").
+Chart points for today are no longer filed (states, diesel, national).
+
+WHAT THIS DOES NOT FIX / WATCH:
+- The Monday print's b1 0.11 was fitted on ordinary Sundays (sd 0.7c); a
+  large Sunday drop like 9/27's (-4.3c live) is outside the sample. The gate
+  stands aside where the book disagrees, so an under-reaction costs quotes,
+  not fills -- check 9/28's print (AAA vs 4.4800) against it.
+- remain(t) is the same linear guess as the states until gb_live.jsonl is
+  calibrated; the national now logs "gas_us" for that.
+- Tuesday prints stay unquoted (no Monday Full Day Averages in the chart).
+- Measure: the national's fills markout vs settlement over the first week.
+
+Tests: TestNatGasFair, TestNationalGasDaily (entry math, pending anchor, no
+live read, close fallback, Monday skip, Sunday chart read once, live log),
+TestDieselDaily.test_todays_partial_chart_point_is_not_a_final,
+test_fetch_live_avg (live_price), the national in the gate's family-shape and
+kill-switch test, test_national_gas_strike_format_and_guards; anchor/absent
+counts +1. 977 green (test_incentive_mm, test_gasbuddy_fair,
+test_carbon_arc_fair, test_openrouter_fair, test_send_imm_new_programs,
+test_usgs_quake_fair, test_imm_pickoff, test_earnings_announcements).

@@ -5483,7 +5483,7 @@ _CONFIG_CODE_KNOBS = (
     # fair file's "model" block (gasbuddy_fair.py)
     "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",
     "GB_FAIR_SIGMA_LO_FRAC", "GB_FAIR_MAX_SIGMA_CENTS", "GB_FAIR_REFRESH_SECS",
-    "GB_STATE_MIN_RATE", "GB_DIESEL_ENABLE",
+    "GB_STATE_MIN_RATE", "GB_DIESEL_ENABLE", "GB_NATGAS_ENABLE",
     # the three fair refreshers' Kalshi reads signed (2026-09-27)
     "FAIR_SIGNED_READS",
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
@@ -6422,6 +6422,21 @@ GB_STATE_MIN_RATE = _env_float("IMM_GB_STATE_MIN_RATE", 0.0)
 # plain quoting.
 GB_DIESEL_ENABLE = GB_FAIR_ENABLE and os.environ.get("IMM_GB_DIESEL_ENABLE", "1") == "1"
 GB_DIESEL_SERIES = "KXDIESELD"
+# NATIONAL GAS DAILY (Jack 2026-09-27: "yes gate KXAAAGASD national on
+# gasbuddy"). KXAAAGASD -- AAA's national regular average, the parent of the
+# state family -- was the one gas daily still quoted without a fair: 9/23-9/27
+# it lost $161 marked to mid on $27 of credits (the 9/24, 9/25 and 9/26 events
+# -$53 to -$60 each). gasbuddy_fair.py writes a national entry per event
+# (Kalshi's settled anchor + GasBuddy's national live and 1 Day Ago averages
+# from the LiveAvg read it already makes; weekday fit on 129 print days, Mar 27
+# - Sep 26: residual 0.41-0.63c against 0.67-2.88c carried forward), and the
+# series is gated exactly like the states: fail CLOSED, tol 0, the 0.5-sigma
+# band, the 2c sigma cap, no slot without a read, the Tuesday print (Monday
+# trading) skipped. Its own guards stay as they are -- the $2/day rate floor
+# included: ensure_family_override never re-clones the parent.
+# IMM_GB_NATGAS_ENABLE=0 returns KXAAAGASD to plain quoting.
+GB_NATGAS_ENABLE = GB_FAIR_ENABLE and os.environ.get("IMM_GB_NATGAS_ENABLE", "1") == "1"
+GB_NATGAS_SERIES = "KXAAAGASD"
 # strike segment: the states' "-6.3950", the diesel daily's "-T6.470"
 _GB_STRIKE_RE = re.compile(r"-T?(\d+(?:\.\d+)?)$")
 _gb_fair_state: dict = {"mtime": 0.0, "entries": {}}
@@ -6439,12 +6454,14 @@ FAIR_SIGNED_READS = os.environ.get("IMM_FAIR_SIGNED_READS", "1") == "1"
 
 
 def gb_fair_series(series: str) -> bool:
-    """True for a two-letter AAA state daily (KXAAAGASDCA) and, while
-    GB_DIESEL_ENABLE, the national diesel daily KXDIESELD -- never the
-    national gas KXAAAGASD, KXDIESELW or anything longer."""
+    """True for a two-letter AAA state daily (KXAAAGASDCA), and while their
+    switches are on the national diesel daily KXDIESELD and the national gas
+    daily KXAAAGASD -- never KXDIESELW, the gas weekly/monthly or anything
+    longer."""
     s = series or ""
     return (GB_FAIR_SERIES_RE.fullmatch(s) is not None
-            or (GB_DIESEL_ENABLE and s == GB_DIESEL_SERIES))
+            or (GB_DIESEL_ENABLE and s == GB_DIESEL_SERIES)
+            or (GB_NATGAS_ENABLE and s == GB_NATGAS_SERIES))
 
 
 def load_gb_fair() -> int:
@@ -15072,7 +15089,8 @@ class IncentiveMarketMaker:
                 f"{OR_FAIR_FAST_WINDOW_MIN}m after 00:00Z), file {OR_FAIR_FILE}")
         if GB_FAIR_ENABLE:
             log(f"gb-fair gate: AAA state dailies"
-                f"{' + KXDIESELD' if GB_DIESEL_ENABLE else ''} fail-closed at-touch, tol "
+                f"{' + KXDIESELD' if GB_DIESEL_ENABLE else ''}"
+                f"{' + KXAAAGASD' if GB_NATGAS_ENABLE else ''} fail-closed at-touch, tol "
                 f"{GB_FAIR_TOL_CENTS}c, band sigma x{GB_FAIR_SIGMA_LO_FRAC:g}-1, "
                 f"max sigma {GB_FAIR_MAX_SIGMA_CENTS:g}c, ttl {GB_FAIR_TTL_MIN}m, "
                 f"refresh {GB_FAIR_REFRESH_SECS}s, file {GB_FAIR_FILE}")
