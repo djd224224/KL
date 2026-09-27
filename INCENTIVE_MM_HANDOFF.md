@@ -4459,3 +4459,70 @@ books 18 of 21 strikes quotable, 3 stood aside (a 99c bid on T6.435 vs fair
 88c, a 59c ask on T6.450 vs 64c, a 5c ask on T6.470 vs 23c). Tests:
 TestDieselDaily (4), the diesel fetch parser, gate strike format + series
 membership; 950 green across the IMM suites.
+
+## 2026-09-27 — Vercel pre-D gate: the eight Vercel AI Gateway series quoted only BEFORE their measured day (Jack)
+
+Jack: "build the pre-D Vercel gate".
+
+WHY THIS FAMILY, AND WHY ONLY PRE-D. KXOPENVSPEND / KXMOONVSPEND /
+KXANTHVSPEND (a lab's share of SPEND), KXGOOGVREQ / KXOPENVREQ / KXDEEPVREQ /
+KXANTHVREQ (share of REQUESTS) and KXOPENSOURCESHARE (the open-weights share
+of TOKENS) settle on one UTC day D of Vercel's official leaderboard export
+(vercel.com/docs/ai-gateway/leaderboards, CC BY 4.0 (c) 2026 Vercel). Read-only
+study 9/27 (session scratchpad vau/vercel/): all 19 numeric lab settlements
+reproduce exactly (dataset=labs, modality=all); the open-weights share is
+reconstructed within 0.6 pp as the summed token share of the open-weight-only
+labs. The export shows D LIVE (50/50 fresh reads 30 s apart changed), and the
+informed flow trades D off it: makers lost -$4,846 (-7.9c/ct) during D and
+made +$679 before it. Kalshi posted the 28SEP26 programs ($50/market,
+16:00Z 9/27 -> 03:59Z 9/29) 8 hours before D -- at that lead a pre-D-only
+book clears the $1 floor on the better strikes (~$1.26/market at a 13%
+share); at the 1-2 h leads of 9/22 and 9/24 it never does.
+
+CUTOFF. Out at D 00:00Z - IMM_VERCEL_CUTOFF_BEFORE_D_MIN (60) = 23:00Z the day
+before, in apply_series_cutoff_adjustments (both producers). D from the
+ticker by series: lab DDMMMYY = D, KXOPENSOURCESHARE YYMMMDD = D+1.
+parse_event_date reads both wrong (05OCT26 would be 2005), so the series get
+cutoff_from_close_min=0 (the ticker-date rule out) and this tightener sets the
+real cutoff; an unparseable event stands down (fail closed, logged once).
+
+FAIR (vercel_fair.py, new; refresher thread "vercel-fair" every
+IMM_VERCEL_FAIR_REFRESH_SECS=900; one fresh export read per refresh -- the
+plain URL is cached 24 h, so each read uses a distinct `to` date, clamped by
+the API). The deep-dive's backtested pre-D model: X_D = X_L + e with L the
+latest COMPLETE day (D-2 while quoting on D-1) and e the empirical h-day
+changes of the last 60 days, widened about the median x1.5 for the lab
+series (their backtest was overconfident: 80-100% fairs settled YES 67%)
+and x1.0 for the open-weights share (well calibrated). P(YES) =
+P(round1(X_D) > K) = P(X_D >= g - 0.05). VERCEL_FAIR_FILE per EVENT ticker
+for D = today+1 .. today+3.
+
+GATE (vercel_gate_reason, quote loop after the quake gate, guard
+"vercel_fair"): stand aside (cancel) on an unparseable ticker, a close not
+on D+1, less than 60 min to D, no read (fail CLOSED), a stale read (90 min),
+a new complete day within 10 min (the book reprices), a decided strike
+(fair < 5c or > 95c) or a touch fighting the fair by > 15c on the adverse
+side. Otherwise the ordinary two-sided ladder (safe-join placement, regular
+size, no per-event cap). Strikes parse as T5P5 (labs) or T67.5
+(open-weights). Whether a program's pre-D window clears the $1 floor is left
+to the existing floor projection (the quotable window ends at the cutoff).
+
+DRY CHECK 9/27 22:20Z (live books from the Vercel logger, fair from the
+export): of the 81 28SEP26 markets, 75 would quote, 4 stood aside on the
+band (e.g. KXOPENSOURCESHARE T82.5: ask 9c vs fair 25c), 2 decided.
+
+KILL SWITCHES. IMM_VERCEL_ENABLE=0 takes the family out of the allowlist
+(never quoted without the gate); IMM_ALLOW_VERCEL_SERIES="" does the same.
+
+WHAT THIS DOES NOT FIX. The fair ignores the RUNNING D-1 value (only complete
+days), so an informed trader reading today's running share knows more than
+the gate before D; the measured pre-D maker P&L was positive anyway (95
+trades -- thin). Programs are bursty (none for days at a time). The
+open-weights classification is undocumented. The intraday history needed
+for any DURING-D quoting is being logged separately (Windows task "KL
+vercel-logger", Documents/KL-data/vercel-logger).
+
+WATCH AFTER DEPLOY: startup "vercel gate: ... PRE-D only, fail-closed ...",
+"vercel-fair refresh: 24 events with a read", run-logs/incentive-mm/
+vercel_fair.json refreshing every 15 min, "vercel stand-aside / resume"
+lines, and no Vercel orders at or after 23:00Z the day before D.

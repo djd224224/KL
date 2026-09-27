@@ -84,6 +84,9 @@ def setUpModule():
     # refresher thread writes the file, but never let a test touch the live one
     imm.QUAKE_STATUS_FILE = os.path.join(tmp, "usgs_quake_state.json")
     imm._quake_state["watch"] = None
+    # the Vercel pre-D fair file (2026-09-27) is read by every run_cycle
+    imm.VERCEL_FAIR_FILE = os.path.join(tmp, "vercel_fair.json")
+    imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -14127,6 +14130,127 @@ def imm_usgs_stale_secs():
     return uqf.USGS_STALE_SECS
 
 
+class TestVercelPreDGate(unittest.TestCase):
+    """vercel_fair.json -> load_vercel_fair / vercel_gate_reason -> the Vercel
+    families quoted ONLY before their measured UTC day D, against the pre-D
+    fair (Jack 2026-09-27: "build the pre-D Vercel gate"). Fixture event
+    KXOPENVREQ-05DEC68 (D = 2068-12-05, far from any cutoff), strike T20."""
+
+    T = "KXOPENVREQ-05DEC68-T20"
+    EV = "KXOPENVREQ-05DEC68"
+    CLOSE = datetime(2068, 12, 6, 3, 59, tzinfo=timezone.utc)
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.VERCEL_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, x_l=20.0, errs=None, last="2068-12-03", age_secs=0.0):
+        errs = errs if errs is not None else [-1.0, -0.5, 0.0, 0.5, 1.0] * 12
+        fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
+        with open(imm.VERCEL_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {self.EV: {
+                "x_l": x_l, "errs": errs, "last": last, "d": "2068-12-05",
+                "h": 2, "n": len(errs), "series": "KXOPENVREQ",
+                "fetched_at": fetched}}}, f)
+        os.utime(imm.VERCEL_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestVercelPreDGate._bump += 1
+        return imm.load_vercel_fair()
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_enrolled_with_a_pre_d_cutoff(self):
+        for s in ("KXOPENVSPEND", "KXMOONVSPEND", "KXANTHVSPEND", "KXGOOGVREQ",
+                  "KXOPENVREQ", "KXDEEPVREQ", "KXANTHVREQ", "KXOPENSOURCESHARE"):
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.vercel_series(s), s)
+            ov = imm.series_override(s)
+            self.assertEqual(ov.cutoff_from_close_min, 0, s)   # ticker rule out
+            self.assertTrue(ov.safe_join, s)
+        # out at 23:00Z the day before D, whatever the close
+        lab_close = datetime(2026, 9, 29, 3, 59, tzinfo=timezone.utc)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXOPENVREQ", "KXOPENVREQ-28SEP26", lab_close, close_time=lab_close),
+            datetime(2026, 9, 27, 23, 0, tzinfo=timezone.utc))
+        os_close = datetime(2026, 9, 29, 14, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXOPENSOURCESHARE", "KXOPENSOURCESHARE-26SEP29", os_close,
+            close_time=os_close),
+            datetime(2026, 9, 27, 23, 0, tzinfo=timezone.utc))
+        # parse_event_date would read 05OCT26 as 2005: the tightener does not
+        self.assertEqual(imm.vercel_measured_day("KXOPENVREQ-05OCT26"),
+                         datetime(2026, 10, 5, tzinfo=timezone.utc))
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXOPENVREQ", "KXOPENVREQ-XYZ", None), imm.RELEASE_GUARD_UNKNOWN)
+
+    def test_reasons_fail_closed(self):
+        now = time.time()
+        r = lambda t=self.T, ts=now, b=49, a=51, c=self.CLOSE: \
+            imm.vercel_gate_reason(t, ts, b, a, c)[1].get("reason")
+        self.assertEqual(r(), "no_read")
+        self.assertEqual(self._write(), (1, 0))               # first load: no hold
+        self.assertIsNone(r())                                # fair 40c, book 49x51
+        self.assertEqual(r(b=60, a=62), "band")               # bid 60 > 40 + 15
+        self.assertEqual(r(t=f"{self.EV}-T30"), "decided")    # nothing reaches 30
+        self.assertEqual(r(ts=now + imm.VERCEL_FAIR_TTL_MIN * 60 + 10), "stale")
+        self.assertEqual(r(c=self.CLOSE + timedelta(days=1)), "close_day")
+        d0 = datetime(2068, 12, 5, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(r(ts=d0 - 30 * 60), "pre_d_over")
+        self.assertEqual(r(t="KXOPENVREQ-05DEC68-X20"), "ticker")
+        # the open-weights series writes decimal strikes with a point
+        self.assertEqual(r(t="KXOPENVREQ-05DEC68-T19.5", b=None, a=None), None)
+        self._write(last="2068-12-04")                        # a new complete day
+        self.assertEqual(r(), "hold")
+        imm._vercel_state["moved_at"][self.EV] -= 3600
+        self.assertIsNone(r())
+
+    def test_quotes_before_d_only_against_an_agreeing_fair(self):
+        bot = self._bot()
+        bot.run_cycle()                                       # no file: nothing
+        self.assertEqual(self._quotes(bot), [])
+        self._write()                                         # fair 40c agrees
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn("bid", {s_ for s_, _p in q})
+        self.assertIn("ask", {s_ for s_, _p in q})
+        self.assertNotIn(self.T, bot._vercel_stood)
+        self._write(x_l=17.0)                                 # decided NO now
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._vercel_stood)
+
+
 class TestGuardSkipSink(unittest.TestCase):
     """guard_skips_*.jsonl (2026-09-26): a market an in-loop guard skips wrote
     no cycle_log row that cycle, so what the guard saw was lost. Change-driven:
@@ -14282,10 +14406,11 @@ class TestGuardSkipSink(unittest.TestCase):
                         if src[j].strip())
             if not prev.startswith("self._gskip("):
                 bare.append(prev)
-        # 28 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
+        # 29 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
         # token-usage gate (2026-09-27) + the GasBuddy state-gas gate
         # (2026-09-27) + the quake gate's stand-aside and hold (2026-09-27)
-        self.assertEqual(len(conts), 28)
+        # + the Vercel pre-D gate (2026-09-27)
+        self.assertEqual(len(conts), 29)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

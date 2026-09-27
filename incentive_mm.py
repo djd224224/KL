@@ -3198,6 +3198,15 @@ _DEFAULT_AI_USAGE_SERIES = "KXTOKENUSE,KXTOKENUSEM"
 # IMM_ALLOW_QUAKE_SERIES="".
 _QUAKE_LIVE = os.environ.get("IMM_QUAKE_ENABLE", "1") == "1"
 _DEFAULT_QUAKE_SERIES = "KXBIGGESTQUAKE"
+# VERCEL AI GATEWAY (Jack 2026-09-27: "build the pre-D Vercel gate"). Eight
+# series settle on one UTC day D of Vercel's official leaderboard data -- a
+# live public feed the open-scan tier rejects on `vercel.com`. Enrolled here
+# only with the VERCEL_* gate: quoted strictly BEFORE D (the export shows D
+# live) and only where the book agrees with vercel_fair's pre-D fair;
+# IMM_VERCEL_ENABLE=0 or IMM_ALLOW_VERCEL_SERIES="" takes them out.
+_VERCEL_LIVE = os.environ.get("IMM_VERCEL_ENABLE", "1") == "1"
+_DEFAULT_VERCEL_SERIES = ("KXOPENVSPEND,KXMOONVSPEND,KXANTHVSPEND,KXGOOGVREQ,"
+                          "KXOPENVREQ,KXDEEPVREQ,KXANTHVREQ,KXOPENSOURCESHARE")
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -3379,6 +3388,10 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_QUAKE_SERIES",
                                         _DEFAULT_QUAKE_SERIES)
                          if _QUAKE_LIVE else "")
+                # Vercel AI Gateway (2026-09-27): only while the pre-D gate is on
+                + "," + (os.environ.get("IMM_ALLOW_VERCEL_SERIES",
+                                        _DEFAULT_VERCEL_SERIES)
+                         if _VERCEL_LIVE else "")
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -5475,6 +5488,11 @@ _CONFIG_CODE_KNOBS = (
     # (freeze, lags, staleness) ride in its status file's "knobs" block
     "QUAKE_ENABLE", "QUAKE_SERIES", "QUAKE_MARGIN_CENTS", "QUAKE_USGS_POLL_SECS",
     "QUAKE_GFZ_POLL_SECS", "QUAKE_CUTOFF_FROM_CLOSE_MIN", "QUAKE_SIZE_MULT",
+    # Vercel pre-D gate (2026-09-27); vercel_fair's model knobs ride in the
+    # fair file's "model" block
+    "VERCEL_ENABLE", "VERCEL_SERIES", "VERCEL_CUTOFF_BEFORE_D_MIN",
+    "VERCEL_FAIR_TOL_CENTS", "VERCEL_FAIR_MIN_P", "VERCEL_FAIR_TTL_MIN",
+    "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     # ROI scan (2026-09-27): admission clock, hourly-window auto-arm, the
     # planned-restart order handoff, the realized floor anchor and the
     # near-cliff room priority
@@ -6693,6 +6711,172 @@ def quake_cap_quotes(quotes: List["Quote"], cap_c: int) -> List["Quote"]:
     return out
 
 
+# ----------------------------------------------------------------------------
+# VERCEL PRE-D GATE (Jack 2026-09-27: "build the pre-D Vercel gate"). The
+# Vercel families settle on one UTC day D of Vercel's official AI Gateway
+# leaderboard export (a lab's share of spend / requests: KXOPENVSPEND,
+# KXMOONVSPEND, KXANTHVSPEND, KXGOOGVREQ, KXOPENVREQ, KXDEEPVREQ, KXANTHVREQ
+# -- all 19 numeric settlements reproduce exactly; the open-weights token
+# share: KXOPENSOURCESHARE, reconstructed within 0.6 pp). The export shows D
+# LIVE and the informed flow trades D off it (makers lost ~8c/contract during
+# D, +$679 before it), so the family is quoted ONLY BEFORE D:
+#   - CUTOFF at D 00:00Z - VERCEL_CUTOFF_BEFORE_D_MIN (60), in
+#     apply_series_cutoff_adjustments. D comes from the ticker by series:
+#     lab DDMMMYY = D, KXOPENSOURCESHARE YYMMMDD = D+1 (parse_event_date
+#     reads both wrong, so cutoff_from_close_min=0 takes the ticker-date rule
+#     out and this tightener sets the real cutoff); unparseable -> stood down.
+#   - FAIR: vercel_fair.py (refresher thread "vercel-fair", every
+#     VERCEL_FAIR_REFRESH_SECS) -- X_D = X_L + e, L the latest complete day,
+#     e the empirical h-day changes of the last 60 days (widened x1.5 for
+#     the labs, whose backtest was overconfident).
+#   - The quote loop stands a market aside (cancel) with no fresh read
+#     (fail CLOSED), a stale read (VERCEL_FAIR_TTL_MIN), a new complete day
+#     within VERCEL_FAIR_HOLD_MIN, a close not on D+1, a decided strike
+#     (fair < VERCEL_FAIR_MIN_P or > 1 - it) or a touch fighting the fair by
+#     more than VERCEL_FAIR_TOL_CENTS on the adverse side.
+# Whether a program's pre-D window is long enough to clear the $1 floor is
+# left to the existing floor projection (the quotable window ends at the
+# cutoff). Safe-join placement. Kill switch IMM_VERCEL_ENABLE=0 takes the
+# family out of the allowlist entirely.
+VERCEL_ENABLE = _VERCEL_LIVE
+VERCEL_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_VERCEL_SERIES", _DEFAULT_VERCEL_SERIES).split(",") if s.strip())
+VERCEL_CUTOFF_BEFORE_D_MIN = _env_int("IMM_VERCEL_CUTOFF_BEFORE_D_MIN", 60)
+VERCEL_FAIR_TOL_CENTS = _env_int("IMM_VERCEL_FAIR_TOL_CENTS", 15)
+VERCEL_FAIR_MIN_P = _env_float("IMM_VERCEL_FAIR_MIN_P", 0.05)
+VERCEL_FAIR_TTL_MIN = _env_int("IMM_VERCEL_FAIR_TTL_MIN", 90)
+VERCEL_FAIR_HOLD_MIN = _env_float("IMM_VERCEL_FAIR_HOLD_MIN", 10)
+VERCEL_FAIR_REFRESH_SECS = _env_int("IMM_VERCEL_FAIR_REFRESH_SECS", 900)
+VERCEL_FAIR_FILE = os.environ.get(
+    "IMM_VERCEL_FAIR_FILE", os.path.join(STATUS_DIR, "vercel_fair.json"))
+# event -> entry; event -> epoch its read last moved (new complete day)
+_vercel_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}}
+# lab tickers write 5.5 as T5P5, KXOPENSOURCESHARE as T67.5
+_VERCEL_STRIKE_RE = re.compile(r"^T(\d+)(?:[P.](\d+))?$")
+_VERCEL_OPEN_SERIES = "KXOPENSOURCESHARE"
+
+for _s in VERCEL_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        cutoff_from_close_min=0, safe_join=True)
+
+
+def vercel_series(series: str) -> bool:
+    return VERCEL_ENABLE and series in VERCEL_SERIES
+
+
+def vercel_measured_day(event_ticker: str) -> Optional[datetime]:
+    """00:00Z of the UTC day D a Vercel event measures: lab series DDMMMYY =
+    D, KXOPENSOURCESHARE YYMMMDD = D + 1. None when it does not parse."""
+    parts = (event_ticker or "").split("-")
+    if len(parts) < 2 or len(parts[1]) != 7:
+        return None
+    series, seg = parts[0], parts[1]
+    try:
+        if series == _VERCEL_OPEN_SERIES:
+            d = datetime(2000 + int(seg[:2]), _MONTHS[seg[2:5]], int(seg[5:7]),
+                         tzinfo=timezone.utc)
+            return d - timedelta(days=1)
+        return datetime(2000 + int(seg[5:7]), _MONTHS[seg[2:5]], int(seg[:2]),
+                        tzinfo=timezone.utc)
+    except (KeyError, ValueError):
+        return None
+
+
+def load_vercel_fair() -> Tuple[int, int]:
+    """Hot-reload VERCEL_FAIR_FILE by mtime into _vercel_state. Returns
+    (events loaded, events whose latest complete day moved) on a reload,
+    else (0, 0). A move starts that event's hold, except on the first load."""
+    try:
+        mtime = os.path.getmtime(VERCEL_FAIR_FILE)
+    except OSError:
+        return 0, 0
+    if mtime == _vercel_state["mtime"]:
+        return 0, 0
+    _vercel_state["mtime"] = mtime
+    try:
+        with open(VERCEL_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! vercel fair file unreadable: {e}")
+        return 0, 0
+    old = _vercel_state["entries"]
+    fresh: Dict[str, dict] = {}
+    for ev, e in (data.get("entries") or {}).items():
+        try:
+            ts = parse_iso_utc(str(e["fetched_at"]))
+            x_l = float(e["x_l"])
+            errs = [float(v) for v in e["errs"]]
+            last = str(e["last"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or not errs or not math.isfinite(x_l):
+            continue
+        fresh[str(ev)] = {"x_l": x_l, "errs": errs, "last": last,
+                          "ts": ts.timestamp()}
+    moved = [ev for ev, e in fresh.items()
+             if ev in old and old[ev].get("last") != e["last"]]
+    if old:
+        now_ts = time.time()
+        for ev in moved:
+            _vercel_state["moved_at"][ev] = now_ts
+    _vercel_state["entries"] = fresh
+    return len(fresh), len(moved)
+
+
+def vercel_fair_p(entry: dict, k: float) -> float:
+    """P(round1(X_D) > K) = P(X_D >= g - 0.05), g the first 0.1 step above
+    K, from the entry's X_L + error sample; clipped to [0.01, 0.99]."""
+    thr = math.floor(k * 10 + 1e-9) / 10.0 + 0.1 - 0.05
+    errs = entry["errs"]
+    hit = sum(1 for e in errs if entry["x_l"] + e >= thr - 1e-9)
+    return min(max(hit / len(errs), 0.01), 0.99)
+
+
+def vercel_gate_reason(ticker: str, now_ts: float,
+                       ext_bid: Optional[float], ext_ask: Optional[float],
+                       close_time: Optional[datetime] = None) -> Tuple[str, dict]:
+    """('', {}) when a Vercel market may quote, else (reason, guard-skip
+    inputs). Fails CLOSED on a missing / stale / moving read."""
+    ev, _, ks = ticker.rpartition("-")
+    d0 = vercel_measured_day(ev)
+    m = _VERCEL_STRIKE_RE.match(ks)
+    if d0 is None or m is None:
+        return f"unparseable Vercel ticker {ticker}", {"reason": "ticker"}
+    if close_time is not None and close_time.astimezone(timezone.utc).date() \
+            != (d0 + timedelta(days=1)).date():
+        return (f"close {close_time.isoformat()} is not on D+1 "
+                f"({(d0 + timedelta(days=1)).date()})", {"reason": "close_day"})
+    if now_ts >= d0.timestamp() - VERCEL_CUTOFF_BEFORE_D_MIN * 60:
+        return ("the measured day is about to start (the export shows it "
+                "live)", {"reason": "pre_d_over"})
+    e = _vercel_state["entries"].get(ev)
+    if e is None:
+        return "no Vercel read for this event", {"reason": "no_read"}
+    if now_ts - e["ts"] > VERCEL_FAIR_TTL_MIN * 60:
+        return "Vercel read is stale", {"reason": "stale"}
+    moved = _vercel_state["moved_at"].get(ev)
+    if VERCEL_FAIR_HOLD_MIN > 0 and moved is not None \
+            and now_ts - moved <= VERCEL_FAIR_HOLD_MIN * 60:
+        return (f"new complete Vercel day, holding {VERCEL_FAIR_HOLD_MIN:g}m "
+                f"while the book reprices", {"reason": "hold"})
+    k = float(f"{m.group(1)}.{m.group(2) or 0}")
+    p = vercel_fair_p(e, k)
+    if p < VERCEL_FAIR_MIN_P or p > 1.0 - VERCEL_FAIR_MIN_P:
+        return (f"decided: fair {p * 100:.0f}c (X_L {e['x_l']:.2f} vs K {k:g})",
+                {"reason": "decided", "fair": round(p * 100, 2)})
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, p * 100.0,
+                                        VERCEL_FAIR_TOL_CENTS, p * 100.0)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {p * 100:.0f}c (tol "
+                f"{VERCEL_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+                f"X_L {e['x_l']:.2f} vs K {k:g})",
+                {"reason": "band", "fair": round(p * 100, 2),
+                 "tol": VERCEL_FAIR_TOL_CENTS, "bid_bad": bid_bad,
+                 "ask_bad": ask_bad})
+    return "", {}
+
+
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
 _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 
@@ -7261,6 +7445,21 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
+    if vercel_series(series):
+        # VERCEL PRE-D CUTOFF (2026-09-27, see VERCEL_ENABLE): out
+        # VERCEL_CUTOFF_BEFORE_D_MIN before the measured UTC day starts --
+        # the export shows D live. Unparseable -> stood down, logged once.
+        d0 = vercel_measured_day(event_ticker)
+        if d0 is None:
+            pre = RELEASE_GUARD_UNKNOWN
+            if event_ticker not in _release_guard_warned:
+                _release_guard_warned.add(event_ticker)
+                log(f"[IMM] ! {series}: Vercel pre-D cutoff needs the measured "
+                    f"day but {event_ticker} does not parse -- standing it "
+                    f"down (fail closed)")
+        else:
+            pre = d0 - timedelta(minutes=VERCEL_CUTOFF_BEFORE_D_MIN)
+        cutoff = pre if cutoff is None else min(cutoff, pre)
     # CARBON ARC LATE-MONTH STOP (Jack 2026-09-24 pm, see CA_LATE_STOP_DAYS):
     # keyed on the bot's own source verdict, not the name, so a *FT that is
     # not Carbon Arc (the Taylor Swift charts) keeps its ordinary cutoff.
@@ -8741,6 +8940,7 @@ class IncentiveMarketMaker:
         self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
         self._quake_held: Set[str] = set()        # quake gate holds (frozen bids)
+        self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
@@ -10337,6 +10537,10 @@ class IncentiveMarketMaker:
         if _or_moved:
             log(f"{self.tag} or-fair reloaded: {_or_n} events, "
                 f"{_or_moved} with a new day")
+        _vc_n, _vc_moved = load_vercel_fair()
+        if _vc_moved:
+            log(f"{self.tag} vercel-fair reloaded: {_vc_n} events, "
+                f"{_vc_moved} with a new complete day")
         load_gb_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
@@ -13421,6 +13625,23 @@ class IncentiveMarketMaker:
                 self._quake_held.discard(t)
                 log(f"{self.tag} quake resume {t}")
 
+            # VERCEL PRE-D GATE (Jack 2026-09-27, see VERCEL_ENABLE): quoted
+            # only before the measured day and only where the book agrees with
+            # the pre-D fair; fails CLOSED without a fresh read.
+            if vercel_series(meta.series):
+                vc_why, vc_in = vercel_gate_reason(t, now_ts, ext_bid, ext_ask,
+                                                   meta.close_time)
+                if vc_why:
+                    if t not in self._vercel_stood:
+                        self._vercel_stood.add(t)
+                        log(f"{self.tag} vercel stand-aside {t}: {vc_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "vercel_fair", lambda: vc_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._vercel_stood:
+                self._vercel_stood.discard(t)
+                log(f"{self.tag} vercel resume {t}")
+
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go
             # silent. Without this, a restored rain position kept reduce-only
@@ -14782,6 +15003,38 @@ class IncentiveMarketMaker:
                     time.sleep(1.0)
             threading.Thread(target=_quake_refresh, daemon=True,
                              name="quake").start()
+        if VERCEL_ENABLE and not once:
+            # Vercel pre-D fair refresher (2026-09-27): the OpenRouter
+            # refresher's contract -- the network read off the trading
+            # thread, the quote loop reads only VERCEL_FAIR_FILE; a failed
+            # refresh keeps the old file, whose entries age out of
+            # VERCEL_FAIR_TTL_MIN (the gate fails closed).
+            def _vercel_fair_refresh():
+                try:
+                    import vercel_fair
+                except Exception as e:
+                    log(f"{self.tag} ! vercel-fair refresher disabled: {e}")
+                    return
+                last = None
+                while True:
+                    delay = max(120, VERCEL_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = vercel_fair.write_fair_file(VERCEL_FAIR_FILE)
+                        if last != (ok, miss):
+                            log(f"{self.tag} vercel-fair refresh: {ok} events "
+                                f"with a read"
+                                + (f", {miss} series without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! vercel-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = 120
+                    time.sleep(delay)
+            threading.Thread(target=_vercel_fair_refresh, daemon=True,
+                             name="vercel-fair").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
@@ -14816,6 +15069,15 @@ class IncentiveMarketMaker:
                 f"{QUAKE_CUTOFF_FROM_CLOSE_MIN}m, status {QUAKE_STATUS_FILE}")
         else:
             log("quake gate: OFF -- KXBIGGESTQUAKE not enrolled")
+        if VERCEL_ENABLE:
+            log(f"vercel gate: {','.join(sorted(VERCEL_SERIES))} PRE-D only, "
+                f"fail-closed, out {VERCEL_CUTOFF_BEFORE_D_MIN}m before the "
+                f"measured day, tol {VERCEL_FAIR_TOL_CENTS}c, decided outside "
+                f"{VERCEL_FAIR_MIN_P * 100:g}-{100 - VERCEL_FAIR_MIN_P * 100:g}c, "
+                f"ttl {VERCEL_FAIR_TTL_MIN}m, hold {VERCEL_FAIR_HOLD_MIN:g}m, "
+                f"refresh {VERCEL_FAIR_REFRESH_SECS}s, file {VERCEL_FAIR_FILE}")
+        else:
+            log("vercel gate: OFF -- the Vercel series are not enrolled")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
             f"earnings x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT:g}), "
