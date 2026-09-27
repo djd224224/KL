@@ -3588,6 +3588,21 @@ text part). Both test modules point the bot at a never-existing verdict
 name so no test reads the box's live file. 673 green (+87 in the other
 IMM suites).
 
+VERIFIED 2026-09-27 01:16Z (3b2657a synced 00:55:37Z, riding the same
+relaunch as 7576bf9): banner `[IMM] Saturday gate: step-up x2 awaiting the
+tracker's verdict (no sat_mult_gate.json); Saturday stays x1.5`. The
+00:59:01Z relaunch's first cycle ran 605s -- ESPN scoreboard SSL retries
+(~75s each) resolving NFL escalator kickoffs on a cold start -- and the
+600s hang watchdog hard-exited it at 01:09:12Z (code 86); the 01:10:03Z
+relaunch refreshed in 4 min (ESPN back: 200 in 0.3s), 454 selected across
+144 events. Cycle log: config_hash 246f70c9 -> b4486d0b; long-dated quoted
+rows at hour_mult 1.5 (399 of 404), dailies 0.5 -- unchanged, as it must
+be before a verdict. The step-up costs ~1s a refresh (3,130 fourteen-day
+size_mult_profile walks: 22.8s vs 21.0s). Tracker preview (print mode):
+9/12 and 9/19 pass G1-G3 (9/19 0-9 ET 51.1 vs 26.1, 10-23 ET 25.7 vs 11.6
+c per 1k ct-h; mark-outs -1.61c vs -3.81c), G4 +7.9c on 2,319 settled
+contracts; 9/26 pending until Monday.
+
 ## 2026-09-26 pm — KXTRUMPAPPROVE allowlisted (out 07:00 ET on settlement day); hopeless clock 30 min on the live projection (Jack)
 
 KXTRUMPAPPROVE. Jack: "yes allowlist it, and stop it at 7:00 ET on
