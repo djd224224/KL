@@ -5300,7 +5300,11 @@ class TestStickySelection(unittest.TestCase):
         self.assertEqual(imm.series_override(s).blackout_et, ("03:05", "04:00"))
         self.assertTrue(imm.series_in_blackout(s, imm.ET.localize(
             datetime(2026, 9, 28, 3, 20)).astimezone(timezone.utc)))
-        self.assertEqual(imm.event_top_n_for(s), 3)
+        # no per-event cap (Jack 2026-09-27: "no 3 market max for this
+        # one"); the rest of the diesel family keeps its 3
+        self.assertEqual(imm.event_top_n_for(s), 0)
+        for other in ("KXDIESELD", "KXDIESELW", "KXDIESELMON", "KXDIESELM"):
+            self.assertEqual(imm.event_top_n_for(other), 3, other)
         # the day-dated ticker: out at 00:00 ET on the print day, before the
         # 00:29 ET close and the ~03:20 ET print
         cut = imm.trade_cutoff_utc(

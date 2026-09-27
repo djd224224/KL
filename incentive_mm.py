@@ -1859,6 +1859,13 @@ _RAMP_EVENT_TOP_N_SPEC = (
     if RAMP_EVENT_TOP_N > 0 and RAMP_AI_SERIES else "")
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "KXAAAGAS:3,KXDIESEL:3,"
+                                                # Alaska diesel UNCAPPED
+                                                # (Jack 2026-09-27: "no 3
+                                                # market max for this one");
+                                                # exact + longer, so it wins
+                                                # over the KXDIESEL prefix
+                                                # (0 = no cap)
+                                                "=KXDIESELMONAK:0,"
                                                 "KXTRUEV:3,*CC:3,"
                                                 "*ADS:3,*POS:3,"
                                                 # exact: KXART is a prefix
@@ -2959,9 +2966,10 @@ _DEFAULT_ECON_SERIES = (
     # 9/27 17:16Z -> 9/30 04:29Z). Open a week across six daily AAA prints --
     # the KXDIESELW shape -- so the diesel guards: safe-join + the scoped
     # rate bar (re-entry set), the 03:05-04:00 ET AAA print blackout
-    # (IMM_AAA_PRINT_SERIES), 3 per event and no Saturday step-up (both
-    # match the KXDIESEL prefix); the day-dated ticker's midnight-ET rule
-    # keeps it out of the print day (close 00:29 ET).
+    # (IMM_AAA_PRINT_SERIES), no Saturday step-up (the KXDIESEL prefix);
+    # NO per-event cap (Jack, same day: "no 3 market max for this one" --
+    # =KXDIESELMONAK:0 in EVENT_TOP_N); the day-dated ticker's midnight-ET
+    # rule keeps it out of the print day (close 00:29 ET).
     "KXDIESELMONAK,"
     # KXTRUEV added 2026-08-24 (Jack: "allowlist this series"): Truflation EV
     # Commodity Index — a once-DAILY print computed from metals futures
