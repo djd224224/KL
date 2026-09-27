@@ -1361,18 +1361,107 @@ SAT_SIZE_MULT = _env_float("IMM_SAT_SIZE_MULT", 1.0)
 SAT_MULT_EXCLUDE = tuple(
     p for p in os.environ.get("IMM_SAT_MULT_EXCLUDE", "KXAAAGAS,KXDIESEL").split(",") if p)
 
+# GATED STEP-UP (Jack 2026-09-26: "2x next saturday if today + prior
+# saturdays show no sign of edge degradation"). Armed by a VERDICT FILE, not
+# by a clock: imm_saturday_tracker.py scores every boosted Saturday (9/12
+# from 10:00 ET, when the knob went live; 9/19; 9/26) once the newest one's
+# fills carry a full 24h mark-out -- the Monday 07:40 ET run -- and writes
+# SAT_GATE_FILE ONCE: {"verdict": "PASS"|"FAIL", "mult": 2.0,
+# "effective_from": <the first Saturday after the run>, "checks": [...]}.
+# On PASS, Saturdays from effective_from on run at min(SAT_SIZE_MULT_GATED,
+# the file's mult) instead of SAT_SIZE_MULT; on FAIL, a missing/unreadable
+# file, a verdict whose mult is not above SAT_SIZE_MULT, or the Saturday
+# knob off, Saturday stays at SAT_SIZE_MULT (fail closed). Same exclusions
+# and the same composition with the hour windows (a PASS makes Saturday
+# 0-9 ET x4 on the global ladder, where TOTAL_SIZE_MULT_CAP leaves the at-ref
+# depth mult x1.25). Read at import and by mtime each refresh: hand-editing
+# the verdict to anything but PASS is an instant kill with no restart;
+# IMM_SAT_SIZE_MULT_GATED=0 is the restart-level kill. Deleting the file
+# RE-ARMS the gate (the next Monday tracker run evaluates again).
+SAT_SIZE_MULT_GATED = _env_float("IMM_SAT_SIZE_MULT_GATED", 2.0)
+SAT_GATE_FILE = "sat_mult_gate.json"
+SAT_GATE_STATE: Dict[str, object] = {"mtime": 0.0, "verdict": "", "mult": 0.0,
+                                      "effective_from": None}
+
+
+def sat_gate_path() -> str:
+    return os.path.join(STATUS_DIR, SAT_GATE_FILE)
+
+
+def gated_sat_mult(et_day) -> float:
+    """The approved Saturday step-up for this ET calendar date (a
+    datetime.date), or 0.0 when the gate does not apply."""
+    if SAT_SIZE_MULT_GATED <= 0 or SAT_GATE_STATE["verdict"] != "PASS":
+        return 0.0
+    eff = SAT_GATE_STATE["effective_from"]
+    if eff is None or et_day < eff:
+        return 0.0
+    m = min(SAT_SIZE_MULT_GATED, float(SAT_GATE_STATE["mult"] or 0.0))
+    return m if m > SAT_SIZE_MULT else 0.0
+
+
+def sat_gate_summary() -> str:
+    """One line for the banner / refresh log / tracker knobs block."""
+    st = SAT_GATE_STATE
+    if SAT_SIZE_MULT <= 0 or SAT_SIZE_MULT == 1.0:
+        return "Saturday multiplier off (IMM_SAT_SIZE_MULT), so the step-up is inert"
+    if SAT_SIZE_MULT_GATED <= 0:
+        return "step-up off (IMM_SAT_SIZE_MULT_GATED=0)"
+    if not st["mtime"]:
+        return (f"step-up x{SAT_SIZE_MULT_GATED:g} awaiting the tracker's verdict "
+                f"(no {SAT_GATE_FILE}); Saturday stays x{SAT_SIZE_MULT:g}")
+    eff = st["effective_from"]
+    if st["verdict"] == "PASS" and eff is not None:
+        m = min(SAT_SIZE_MULT_GATED, float(st["mult"] or 0.0))
+        if m > SAT_SIZE_MULT:
+            return f"verdict PASS: x{m:g} on Saturdays from {eff.isoformat()}"
+        return (f"verdict PASS for x{float(st['mult'] or 0.0):g}, not above "
+                f"x{SAT_SIZE_MULT:g}; Saturday stays x{SAT_SIZE_MULT:g}")
+    return f"verdict {st['verdict'] or 'unreadable'}; Saturday stays x{SAT_SIZE_MULT:g}"
+
+
+def load_sat_gate() -> bool:
+    """Mirror SAT_GATE_FILE into SAT_GATE_STATE (mtime-gated). A missing or
+    unreadable file clears the verdict (fail closed). True when it changed."""
+    try:
+        mtime = os.path.getmtime(sat_gate_path())
+    except OSError:
+        mtime = 0.0
+    if mtime == SAT_GATE_STATE["mtime"]:
+        return False
+    before = (SAT_GATE_STATE["verdict"], SAT_GATE_STATE["mult"],
+              SAT_GATE_STATE["effective_from"])
+    verdict, mult, eff = "", 0.0, None
+    if mtime:
+        try:
+            with open(sat_gate_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            verdict = str(data.get("verdict") or "").strip().upper()
+            mult = float(data.get("mult") or 0.0)
+            eff = datetime.strptime(str(data.get("effective_from")), "%Y-%m-%d").date()
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            log(f"[IMM] ! {SAT_GATE_FILE} unreadable ({e}); fail closed")
+            verdict, mult, eff = "", 0.0, None
+    SAT_GATE_STATE.update(mtime=mtime, verdict=verdict, mult=mult, effective_from=eff)
+    changed = (verdict, mult, eff) != before
+    if changed:
+        log(f"[IMM] Saturday gate: {sat_gate_summary()}")
+    return changed
+
 
 def saturday_size_mult(series: str, now_utc: datetime) -> float:
     """SAT_SIZE_MULT on Saturdays (ET calendar day) for long-dated series
-    (not daily families, not SAT_MULT_EXCLUDE prefixes); 1.0 otherwise and
-    whenever the knob is off/invalid."""
+    (not daily families, not SAT_MULT_EXCLUDE prefixes) -- or the gated
+    step-up on a Saturday the tracker's PASS verdict covers; 1.0 otherwise
+    and whenever the Saturday knob is off/invalid."""
     if SAT_SIZE_MULT <= 0 or SAT_SIZE_MULT == 1.0:
         return 1.0
-    if now_utc.astimezone(ET).weekday() != 5:
+    et = now_utc.astimezone(ET)
+    if et.weekday() != 5:
         return 1.0
     if is_daily_series(series) or any(series.startswith(p) for p in SAT_MULT_EXCLUDE):
         return 1.0
-    return SAT_SIZE_MULT
+    return gated_sat_mult(et.date()) or SAT_SIZE_MULT
 
 
 def hour_size_mult(series: str, now_utc: datetime) -> float:
@@ -2996,6 +3085,25 @@ _DEFAULT_WEATHER_SERIES = "KXRAINWKND"
 # no realtime risk at all, and four of the five strikes are near-certain
 # enough that the band stands the bot aside. Expect one quotable strike.
 _DEFAULT_SPORTS_SERIES = "KXMLBPLAYOFFS,KXMLBSEASONGAMES"
+# POLITICS (Jack 2026-09-26: "yes allowlist it, and stop it at 7:00 ET on
+# settlement day"). KXTRUMPAPPROVE-<YYMONDD>-<strike>: Trump's
+# RealClearPolitics "RCP Average" Approve value at EXACTLY 1:00 PM ET on the
+# ticker date, nine 0.1-point strikes (U/E/A buckets); listed 10:01 ET the
+# day before, closes 12:59 ET; $600/market per 24h program (10:02 ET ->
+# 10:02 ET). It is a live public number that steps whenever RCP folds in a
+# poll, so the open-scan tier rejects it on the `realclearpolling` keyword;
+# this normal-book entry is the deliberate exception, made on a measurement
+# of the public tape (14 daily events 9/13-9/26, 54k trades, 3.05M
+# contracts): all of the maker pick-off sits in the settlement-morning
+# update window. 21 re-pricings between 07:00 and 12:59 ET (15 of them
+# 09:00-10:59) cost resting orders ~$10.5k on 51k contracts, the takers
+# leading the visible move by 3-6 minutes; the 7 overnight/evening
+# re-pricings netted makers +$40, and flow away from the jumps marks out
+# +0.3c/contract at 5 minutes. So the entry ships with the 07:00 ET
+# settlement-day cutoff (SERIES_OVERRIDES["KXTRUMPAPPROVE"] below), which
+# keeps ~21 of each program's 24 hours. IMM_ALLOW_POLITICS_SERIES=""
+# removes it.
+_DEFAULT_POLITICS_SERIES = "KXTRUMPAPPROVE"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -3169,6 +3277,8 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_WEATHER_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_SPORTS_SERIES",
                                        _DEFAULT_SPORTS_SERIES)
+                + "," + os.environ.get("IMM_ALLOW_POLITICS_SERIES",
+                                       _DEFAULT_POLITICS_SERIES)
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -4437,6 +4547,23 @@ for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
                 _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
                 _env_int("IMM_RATES_CUTOFF_MIN_ET", 30)))
 
+# KXTRUMPAPPROVE: out at 07:00 ET ON the settlement day (Jack 2026-09-26,
+# with the allowlist entry -- see _DEFAULT_POLITICS_SERIES). The event-day
+# extender moves the ticker-date candidate from midnight to 07:00 ET, ahead
+# of the 07:00-12:59 ET window where every measured pick-off landed. Kalshi
+# sets occurrence 16:59Z against a 17:00Z expected expiration, inside the
+# 60-minute gap trade_cutoff_utc requires, so no occurrence candidate
+# undercuts it (checked on 26SEP27). What this does NOT cover: inventory
+# taken overnight still rides through the morning update to the 1:00 PM ET
+# snapshot (positions ride, standard cutoff semantics), and the quiet-hour
+# size multiplier (00:00-09:00 ET) applies right up to 07:00 -- the
+# overnight flow measured benign. IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET /
+# IMM_TRUMPAPPROVE_CUTOFF_MIN_ET move it.
+SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
+    event_day_cutoff_et=(
+        _env_int("IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET", 7),
+        _env_int("IMM_TRUMPAPPROVE_CUTOFF_MIN_ET", 0)))
+
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market
 # on its print day" / "make sure KXTRUEV is quoting"). That breaks the
@@ -4696,6 +4823,9 @@ def rate_floor_projected(accrued: float, est_total: float, peak: float,
 # it. The borderline-flap concern above is covered from the other side: a
 # seat left empty costs nothing, while a seat filled on a stale peak costs
 # an hour of fill risk and a permanent bar.
+# 2026-09-26: OFF for members too by default (MEMBER_PEAK_GUARD, below
+# HOPELESS_SUSTAIN_SECS); still tracked and persisted so the knob can
+# restore it.
 EST_PEAK_TTL_SECS = _env_int("IMM_EST_PEAK_TTL", 3600)
 # STICKY EXIT for hopeless markets (Jack 2026-07-25: "quoting markets that
 # don't hit $1 is a big drain" — if there's <5% chance of reaching the $1 min
@@ -4724,7 +4854,32 @@ HOPELESS_EXIT = os.environ.get("IMM_HOPELESS_EXIT", "1") == "1"
 # against a $2/day bar). The `rate_floor` skip bucket climbs monotonically as
 # `hopeless` fires — 96 -> 106 over the same window. So the exit needs to be
 # sure, not fast.
-HOPELESS_SUSTAIN_SECS = _env_int("IMM_HOPELESS_SUSTAIN_SECS", 3600)
+#
+# 30 MINUTES, ON THE LIVE PROJECTION (Jack 2026-09-26, on
+# KXNFLFFPTSLADDER-26SEP27MINTB-MINKMURRAY1: "let's make the hopeless clock
+# more consistent / faster. what about 30min checks instead of hourly?").
+# The exit had TWO one-hour guards in series: a member's projection carried
+# its 1h est peak (EST_PEAK_TTL_SECS), and only after that lapsed did this
+# clock start its own hour. The peak made the timing a lottery -- it
+# re-seeds from whatever SINGLE reading lands on the first refresh after it
+# expires, so a thin-book moment at that instant buys another full hour.
+# MURRAY1: admitted 21:32Z on a 10-minute thin-book reading ($2.50/day
+# est), carried by that peak to 22:42Z, re-seeded inside a second 20-minute
+# thin window, carried to 23:43Z, and only then put on the clock -- ~3h15m
+# quoted, 135 contracts filled, $0.11 banked against the $1.00 cliff.
+# Measured 9/6-9/26: 1,826 admit -> hopeless rides, median 2.8h, p25 2.07h
+# (the structural 2h floor), 13% of them filled, 12,206 contracts taken on
+# markets then evicted as unable to reach the floor. Now a MEMBER is judged
+# on its live projection (banked + current remaining estimate -- the test a
+# fresh candidate has had since 9/13) and this clock is the one dip guard:
+# evicted after 30 continuous minutes under the bar (~3-4 refreshes at the
+# 600s cadence), i.e. 30-40 minutes after its last above-bar reading,
+# whatever lands on any single refresh. A market with >= half the cliff
+# banked that projects within NEAR_CLIFF_DOLLARS of it is still held by the
+# near-cliff rule. IMM_HOPELESS_SUSTAIN_SECS=3600 restores the hour;
+# IMM_MEMBER_PEAK_GUARD=1 restores the member peak carry.
+HOPELESS_SUSTAIN_SECS = _env_int("IMM_HOPELESS_SUSTAIN_SECS", 1800)
+MEMBER_PEAK_GUARD = os.environ.get("IMM_MEMBER_PEAK_GUARD", "0") == "1"
 # THE $1 FLOOR IS PER PROGRAM PERIOD (Jack 2026-09-22 pm, on KXRT-STRA-50 /
 # -45: "why is this quoted? it should be hopeless"). Kalshi had re-listed
 # the Rotten Tomatoes programs as a fresh ONE-DAY period at 16:49Z; in it
@@ -5009,13 +5164,19 @@ _CONFIG_CODE_KNOBS = (
     "NEAR_CLIFF_BOOST_MIN_BANKED",
     # decision-input logging (2026-09-26): the thresholds the logged inputs
     # are compared against, so a guard_skips / floor row can be read against
-    # the rule that was actually in force
-    "GUARD_LOG", "SELECTION_INPUTS", "HOPELESS_EXIT", "HOPELESS_SUSTAIN_SECS",
-    "EST_PEAK_TTL_SECS", "FLOOR_ACCRUAL_PER_PERIOD", "RATE_FLOOR_ESCAPE_DAYS",
+    # the rule that was actually in force (HOPELESS_SUSTAIN_SECS and
+    # EST_PEAK_TTL_SECS are listed with the hopeless clock below)
+    "GUARD_LOG", "SELECTION_INPUTS", "HOPELESS_EXIT",
+    "FLOOR_ACCRUAL_PER_PERIOD", "RATE_FLOOR_ESCAPE_DAYS",
     "MAX_JOIN_SPREAD_CENTS", "BREAKERS_ENABLED", "EVENT_FILL_HALT_CONTRACTS",
     "EVENT_FILL_HALT_STRIKES", "EVENT_DEPTH_RESUME_SECS", "RAIN_FAIR_ENABLE",
     "RAIN_FAIR_TOL_CENTS", "STICKY_PRICE_MIN", "STICKY_PRICE_MAX",
     "SCAN_HOPELESS_EXIT", "SCAN_HOPELESS_BAR", "BLIND_PRESERVE_CYCLES",
+    # hopeless clock (2026-09-26): 30-minute sustain on the live projection
+    "HOPELESS_SUSTAIN_SECS", "MEMBER_PEAK_GUARD", "EST_PEAK_TTL_SECS",
+    # gated Saturday step-up (2026-09-26); the verdict itself is a runtime
+    # file, so the cycle log's hour_mult is where a PASS shows
+    "SAT_SIZE_MULT_GATED",
 )
 
 
@@ -5445,6 +5606,7 @@ def save_family_verdicts() -> None:
 
 
 load_family_verdicts()
+load_sat_gate()          # Saturday step-up verdict (defined next to saturday_size_mult)
 
 
 # ----------------------------------------------------------------------------
@@ -9068,6 +9230,7 @@ class IncentiveMarketMaker:
         load_extra_allow_series()
         load_finecon_extra_series()
         load_family_verdicts()
+        load_sat_gate()
         load_rain_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
@@ -9523,6 +9686,11 @@ class IncentiveMarketMaker:
             # for markets that never cleared the floor on their own numbers.
             # Accrued still counts for a re-entrant (a market that banked
             # most of its floor re-enters on the remaining window).
+            # 2026-09-26: MEMBERS are on the live projection too unless
+            # IMM_MEMBER_PEAK_GUARD=1 (see MEMBER_PEAK_GUARD) -- the peak's
+            # single-reading re-seed made exits a lottery, and the 30-minute
+            # sustain clock below is the dip guard. The peak is still
+            # tracked, so the knob restores it without a warm-up hour.
             qdays = _quotable_days(meta, now_utc)
             # day-size projection (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25):
             # a market is not admitted on doubled size and evicted on normal
@@ -9534,7 +9702,8 @@ class IncentiveMarketMaker:
                 self._est_peak[meta.ticker] = (est_total, now_ts)
                 peak = est_total
             accrued = self.period_accrued(meta.ticker)
-            proj_peak = peak if meta.ticker in prev_selected else 0.0
+            proj_peak = peak if (MEMBER_PEAK_GUARD
+                                 and meta.ticker in prev_selected) else 0.0
             # THE BAR (floor_bar_dollars, 2026-09-25): the exchange's $1.00
             # cliff for a member or a re-entrant with banked period accrual,
             # the $1.50 entry margin for a fresh candidate. Sub-$1 accrual
@@ -13127,6 +13296,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"day, long-dated only, composes with hour windows)"
             + (f"; extra excluded prefixes: {','.join(SAT_MULT_EXCLUDE)}"
                if SAT_MULT_EXCLUDE else ""))
+        log(f"[IMM] Saturday gate: {sat_gate_summary()}")
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):

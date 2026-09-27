@@ -3505,3 +3505,166 @@ selected on the $1.20 bar and the x3 projection (family: 125 -> 167
 selected, 341 -> 299 floored), payout_floor 930 -> 875 overall, zero_yield
 still 1; ladder collateral ~$13.2k -> ~$18.3k against the $15.2k inventory
 reserve. The two near-cliff escalators re-armed at x1.5 on top (135).
+
+## 2026-09-26 pm — Saturday x2, gated: the Monday tracker decides once from the boosted Saturdays (Jack)
+
+Jack, after the 1.5 -> 2.0 read (9/19 plus the morning of 9/26; long-dated
+net per resting contract-hour by block against weekdays, ex-KXRT: Saturday
+10-23 ET 30.6 vs 11.4, Saturday 0-9 ET 33.0 vs 13.8 cents per 1k ct-h;
+modelled share ~10%, no saturation): "yes, 2x next saturday if today +
+prior saturdays show no sign of edge degradation".
+
+MECHANISM -- one decision, made by a script, read by the bot, armed:
+- `imm_saturday_tracker.py` scores every boosted Saturday -- 9/12 from
+  10:00 ET (the x1.5 went live ~09:10 ET, so its 0-9 block is not an
+  observation), 9/19, 9/26 -- per ET block (0-9 / 10-23) against the same
+  block on the weekdays of its own Mon-Fri (all weekdays in the window
+  when its week has fewer than two). Net = modelled rent minus mark-out
+  cost, cents per 1,000 resting contract-hours. The mark is the 24h
+  cycle-log mid, else the settlement value, else the last logged mid inside
+  24h: the strict 24h mid (the report's mo24 column, unchanged) drops
+  12-62% of long-dated fills a day, mostly the ones nearest resolution
+  (KXTRUMPMENTION 59% missing, 99% of those settled) -- exactly the lumpy
+  losses a gate has to see. Degradation = any of:
+    G1 a boosted block nets less than the same block on its weekdays;
+    G2 the Saturday's boosted hours net <= 0;
+    G3 its fills mark out more than 2c/contract worse than its weekdays';
+    G4 pooled over the boosted Saturdays, rent per fill minus settlement
+       loss per settled fill < 0 (judged from 500 settled contracts).
+  Every boosted Saturday must be a full day + 24h old, else PENDING and
+  nothing is written. The SCHEDULED run ("KL imm saturday-tracker", Monday
+  07:40 ET, no flags) writes run-logs/incentive-mm/sat_mult_gate.json ONCE
+  -- {"verdict": "PASS"|"FAIL", "mult": 2.0, "effective_from": <the first
+  Saturday after the run>, "checks": [...]} -- and never overwrites it;
+  `--gate-rewrite` re-evaluates and rewrites by hand. The email carries a
+  "2x gate" section (status, per-block rates, every check, a who-moved-it
+  family table for the newest Saturday); the subject names the verdict on
+  the run that writes it. A gate exception never costs the weekly email
+  (status ERROR, nothing written).
+- `incentive_mm.py`: `saturday_size_mult` returns `gated_sat_mult` --
+  min(IMM_SAT_SIZE_MULT_GATED, the file's mult), code default 2.0 -- on
+  Saturdays on/after effective_from when the verdict is PASS; anything
+  else (FAIL, no file, unreadable, a mult not above SAT_SIZE_MULT) keeps
+  x1.5, fail closed. Same exclusions; composes with the quiet hours
+  (Saturday 0-9 ET = x4 on the global ladder, where TOTAL_SIZE_MULT_CAP
+  leaves the at-ref depth mult x1.25); the payout-floor projection sees
+  the step because size_mult_profile samples hour_size_mult. The file is
+  read at import and by mtime every refresh (`load_sat_gate`, next to
+  load_family_verdicts), logged `[IMM] Saturday gate: ...` on change and
+  in the banner. SAT_SIZE_MULT_GATED joins the config hash; the verdict is
+  runtime state, so a PASS shows in the cycle log's hour_mult (2.0 on
+  Saturday long-dated rows outside 0-9 ET) and the tracker's mult column.
+
+KILL SWITCHES: hand-edit the file's verdict to anything but PASS (instant,
+no restart; the tracker never overwrites an existing file);
+IMM_SAT_SIZE_MULT_GATED=0 in the launcher (task-level restart);
+IMM_SAT_SIZE_MULT=1.0 turns the whole Saturday multiplier off. Deleting
+the file RE-ARMS the gate: the next Monday run evaluates again.
+
+WHAT THIS DOES NOT FIX / WATCH:
+- 9/26 afternoon changed the Saturday book under the gate. Ladders x3
+  (13:53 ET) put the sports ladders/escalators at 90/side: 49% of
+  long-dated resting contracts 10-20 ET, earning 16.5c per 1k ct-h (our
+  share ~0.5% of ~$113/day pools -- crowded, not saturated) against ~47c
+  for the rest of the book. On partial marks at 20:40 ET the 9/26 10-23
+  block was tracking just under its weekdays (21.0 vs 23.4). A G1 FAIL
+  there is the rule working: 2x would mostly double down on the ladder
+  book. A PASS takes ladders to 120/side on Saturday daytime (240 in 0-9
+  ET, x1.5 more in near-cliff mode; per-market cap 450), above the 90 Jack
+  named for the x3.
+- One decision. Afterwards the tracker keeps re-checking every Monday
+  (labelled "re-check only") but nothing reverts a PASS automatically.
+- Modelled rent (pre-realization), not credits; mark-outs, not P&L.
+
+Tests: TestSaturdayGatedStepUp (file-armed; ET day edges on 10/3;
+exclusions and the x4 composition; fail closed on FAIL / garbage / a mult
+not above base; the step is the smaller of file and env; both kill
+switches; deleting clears; the mtime cache; the floor profile sees x2;
+ASCII summary). GateEvaluateTests / GateVerdictFileTests / GateInputsTests
+/ GateRenderTests in test_imm_saturday_tracker (G1-G4, pending until
+Saturday + 24h, only boosted hours judged, every Saturday must pass,
+one-shot write, logged-hours-only fills, the mark fallback chain, ASCII
+text part). Both test modules point the bot at a never-existing verdict
+name so no test reads the box's live file. 673 green (+87 in the other
+IMM suites).
+
+VERIFIED 2026-09-27 01:16Z (3b2657a synced 00:55:37Z, riding the same
+relaunch as 7576bf9): banner `[IMM] Saturday gate: step-up x2 awaiting the
+tracker's verdict (no sat_mult_gate.json); Saturday stays x1.5`. The
+00:59:01Z relaunch's first cycle ran 605s -- ESPN scoreboard SSL retries
+(~75s each) resolving NFL escalator kickoffs on a cold start -- and the
+600s hang watchdog hard-exited it at 01:09:12Z (code 86); the 01:10:03Z
+relaunch refreshed in 4 min (ESPN back: 200 in 0.3s), 454 selected across
+144 events. Cycle log: config_hash 246f70c9 -> b4486d0b; long-dated quoted
+rows at hour_mult 1.5 (399 of 404), dailies 0.5 -- unchanged, as it must
+be before a verdict. The step-up costs ~1s a refresh (3,130 fourteen-day
+size_mult_profile walks: 22.8s vs 21.0s). Tracker preview (print mode):
+9/12 and 9/19 pass G1-G3 (9/19 0-9 ET 51.1 vs 26.1, 10-23 ET 25.7 vs 11.6
+c per 1k ct-h; mark-outs -1.61c vs -3.81c), G4 +7.9c on 2,319 settled
+contracts; 9/26 pending until Monday.
+
+## 2026-09-26 pm — KXTRUMPAPPROVE allowlisted (out 07:00 ET on settlement day); hopeless clock 30 min on the live projection (Jack)
+
+KXTRUMPAPPROVE. Jack: "yes allowlist it, and stop it at 7:00 ET on
+settlement day". RCP "RCP Average" Approve value at exactly 1:00 PM ET,
+nine 0.1-point strikes, listed 10:01 ET the day before, $600/market per
+24h program (10:02 -> 10:02 ET). New politics group
+_DEFAULT_POLITICS_SERIES (env IMM_ALLOW_POLITICS_SERIES) plus
+SERIES_OVERRIDES["KXTRUMPAPPROVE"] event_day_cutoff_et=(7, 0) (env
+IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET / _MIN_ET). Occurrence 16:59Z sits one
+minute before the 17:00Z expected expiration, so the extender's 07:00 ET
+is the cutoff: 11:00Z in EDT, 12:00Z in EST. Basis, the public tape of 14
+daily events 9/13-9/26 (54k trades): 21 re-pricings between 07:00 and
+12:59 ET cost resting orders ~$10.5k on 51k contracts, takers leading the
+visible move by 3-6 minutes; the 7 overnight/evening re-pricings netted
+makers +$40.
+
+LIVE (config 19367f4e, first refresh 00:59Z 9/27): all nine 26SEP27
+strikes in the universe at $600/day and screened `manual`. The account
+holds a hand book in that event: 11 resting orders with no
+client_order_id (none in imm_order_journal / our_order_ids; every bot on
+the account tags its orders), positions E38.6 -200, E38.7 +95, E38.8
++137, $643 cost. Yield-to-human is event-level, so the bot quotes only
+KXTRUMPAPPROVE events with no manual footprint.
+
+HOPELESS CLOCK. Jack, on KXNFLFFPTSLADDER-26SEP27MINTB-MINKMURRAY1:
+"make the hopeless clock more consistent / faster. what about 30min
+checks instead of hourly?". HOPELESS_SUSTAIN_SECS 3600 -> 1800, and
+MEMBER_PEAK_GUARD (env IMM_MEMBER_PEAK_GUARD, default 0): a member is
+judged on banked + CURRENT remaining estimate, the test fresh candidates
+have had since 9/13, not max(current, 1h est peak). The peak re-seeded
+from the single reading on the first refresh after it expired, so one
+thin-book moment bought another hour. MURRAY1: admitted 21:32Z on a
+10-minute thin-book reading, peak to 22:42Z, re-seeded inside a 20-minute
+blip, clock started 23:43Z, evicted 00:51Z under the old rule; -135
+filled, $0.11 banked. 9/6-9/26: 1,826 admit -> hopeless rides, median
+2.8h, p25 2.07h (the structural 2h floor), 13% filled, 12,206 contracts.
+The exit now lands 30-40 minutes after the last above-bar live reading.
+_est_peak is still tracked and persisted; near-cliff is unchanged.
+
+LIVE: the new process's first refresh (started 00:59:08Z, finished
+01:09Z, slow on two transient ESPN SSL failures that fell back to
+midnight-ET) evicted 10 hopeless members (NFL ladders / escalators and
+one KXRT strike) already 30+ minutes under the bar. The members left on
+long clocks are exempt by design (KXRAIN curated tier, finecon
+KXCBD* / KXSPRLVL, forced KXFSLR-26OCTMWSOLD).
+
+KILL SWITCHES (launcher env, task-level restart): IMM_ALLOW_POLITICS_SERIES=""
+drops the allow; IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET / _MIN_ET move the
+cutoff; IMM_HOPELESS_SUSTAIN_SECS=3600 restores the hour;
+IMM_MEMBER_PEAK_GUARD=1 restores the member peak carry.
+
+WHAT THIS DOES NOT FIX / WATCH:
+- Admission on a one-refresh blip still happens: MURRAY1 was admitted on
+  a 10-minute thin-book reading and filled 90 lots 11 minutes later. A
+  two-consecutive-refresh entry test would stop that; suggested, not built.
+- KXTRUMPAPPROVE inventory taken overnight still rides through the
+  morning update to the 1:00 PM snapshot; quiet-hour size applies up to
+  07:00 (the overnight flow measured benign).
+- A hand book on an approval event keeps the bot out of that whole event.
+
+Tests: TestTrumpApproveAllowlist (allowed, exact series; cutoff 11:00Z
+EDT / 12:00Z EST; the series tighteners leave it);
+test_sustain_window_is_30_minutes_by_default;
+test_member_exit_runs_on_the_live_projection_not_the_peak; the three
+member-peak tests now pin the default AND the knob. 636 green at 7576bf9.

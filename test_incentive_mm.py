@@ -13,6 +13,14 @@ from unittest import mock
 
 import incentive_mm as imm
 
+# The Saturday step-up verdict is a LIVE runtime file (run-logs/incentive-mm/
+# sat_mult_gate.json, written by imm_saturday_tracker.py and read at import).
+# Point the module at a name that never exists so no test sizes a Saturday by
+# whatever verdict the box holds; TestSaturdayGatedStepUp writes its own into
+# a temp STATUS_DIR.
+imm.SAT_GATE_FILE = "sat_mult_gate.absent-under-test.json"
+imm.SAT_GATE_STATE.update(mtime=0.0, verdict="", mult=0.0, effective_from=None)
+
 # Wall-clock hazard: during the first HOURLY_ACTIVATION_WINDOW_SECS of every
 # real hour the universe-refresh gate is bypassed, so tests that rely on
 # `universe_at = time.time()` to suppress a refresh go flaky for 12 minutes
@@ -1585,6 +1593,50 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         for s in self.SERIES:
             self.assertFalse(
                 any(s.endswith(suf) for suf in imm.ALLOW_SERIES_SUFFIXES), s)
+
+
+class TestTrumpApproveAllowlist(unittest.TestCase):
+    """Jack 2026-09-26: "yes allowlist it, and stop it at 7:00 ET on
+    settlement day" -- KXTRUMPAPPROVE, the RCP approval average at 1:00 PM
+    ET, whose measured maker pick-offs all sit in 07:00-12:59 ET."""
+
+    def setUp(self):
+        self._old = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+
+    def tearDown(self):
+        imm.ALLOWLIST_ONLY = self._old
+
+    def test_allowed_in_the_normal_book(self):
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        for t in ("KXTRUMPAPPROVE-26SEP27-E38.7",
+                  "KXTRUMPAPPROVE-26SEP27-U38.5",
+                  "KXTRUMPAPPROVE-26SEP27-A39.1"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+        self.assertIn("KXTRUMPAPPROVE", imm.ALLOW_SERIES)
+        # exact series, no prefix: a look-alike does not ride in
+        self.assertFalse(a("KXTRUMPAPPROVEX-26SEP27-E38.7"))
+
+    def test_cutoff_is_7am_et_on_the_settlement_day(self):
+        # the live 26SEP27 fields: occurrence 16:59Z sits one minute before
+        # the 17:00Z expected expiration, so it is no candidate -> the
+        # extender's 07:00 EDT = 11:00Z is the cutoff
+        occ = datetime(2026, 9, 27, 16, 59, tzinfo=timezone.utc)
+        exp = datetime(2026, 9, 27, 17, 0, tzinfo=timezone.utc)
+        cut = imm.trade_cutoff_utc("KXTRUMPAPPROVE-26SEP27", occ, exp)
+        self.assertEqual(cut, datetime(2026, 9, 27, 11, 0, tzinfo=timezone.utc))
+        # the series tighteners leave it there (no early-stop, no close
+        # anchor, no hard expiry)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXTRUMPAPPROVE", "KXTRUMPAPPROVE-26SEP27", cut,
+            datetime(2026, 9, 27, 16, 59, tzinfo=timezone.utc)), cut)
+        # standard time: 07:00 EST = 12:00Z
+        occ = datetime(2026, 12, 15, 17, 59, tzinfo=timezone.utc)
+        exp = datetime(2026, 12, 15, 18, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            imm.trade_cutoff_utc("KXTRUMPAPPROVE-26DEC15", occ, exp),
+            datetime(2026, 12, 15, 12, 0, tzinfo=timezone.utc))
 
 
 class TestRampAIIndexAllowlist(unittest.TestCase):
@@ -5776,8 +5828,9 @@ class TestStickySelection(unittest.TestCase):
             self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
-        # admitted on its own numbers, it is a member; the same peak now
-        # holds it over a floor its sample cannot reach, with no hopeless clock
+        # admitted on its own numbers, it is a member; under
+        # IMM_MEMBER_PEAK_GUARD=1 the same peak holds it over a floor its
+        # sample cannot reach, with no hopeless clock
         bot.state.universe_at = 0.0
         bot.run_cycle()
         self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
@@ -5785,9 +5838,16 @@ class TestStickySelection(unittest.TestCase):
         try:
             bot._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
             bot.state.universe_at = 0.0
-            bot.run_cycle()
+            with mock.patch.object(imm, "MEMBER_PEAK_GUARD", True):
+                bot.run_cycle()
             self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
             self.assertNotIn("KXGOOD-99DEC31-A", bot.state.hopeless_since)
+            # by default (2026-09-26) the member is on its live projection:
+            # still selected (the clock has not run), but the clock starts
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn("KXGOOD-99DEC31-A", bot.state.selected)
+            self.assertIn("KXGOOD-99DEC31-A", bot.state.hopeless_since)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
 
@@ -5803,14 +5863,16 @@ class TestStickySelection(unittest.TestCase):
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertIn("KXGOOD-99DEC31-A", bot2._est_peak)
         self.assertAlmostEqual(bot2._est_peak["KXGOOD-99DEC31-A"][0], 2.5, places=3)
-        # and, for the restarted MEMBER, it still carries a below-floor
-        # sample over the floor (since 2026-09-13 a fresh market gets no such
-        # carry -- see the flapping-market test above)
+        # and, for the restarted MEMBER under IMM_MEMBER_PEAK_GUARD=1, it
+        # still carries a below-floor sample over the floor (since
+        # 2026-09-13 a fresh market gets no such carry, and since 2026-09-26
+        # a member neither by default -- see the flapping-market test above)
         old_floor = imm.MIN_EST_TOTAL_DOLLARS
         imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
         try:
             bot2._est_peak["KXGOOD-99DEC31-A"] = (2e9, time.time())
-            bot2.run_cycle()
+            with mock.patch.object(imm, "MEMBER_PEAK_GUARD", True):
+                bot2.run_cycle()
             self.assertIn("KXGOOD-99DEC31-A", bot2.state.selected)
             self.assertNotIn("KXGOOD-99DEC31-A", bot2.state.hopeless_since)
         finally:
@@ -7074,6 +7136,135 @@ class TestSaturdaySizeMult(unittest.TestCase):
         self.assertLessEqual(
             3.0 * imm.capped_ref_mult(50, 40, "bid", hour_mult=3.0),
             max(3.0, imm.TOTAL_SIZE_MULT_CAP))
+
+
+class TestSaturdayGatedStepUp(unittest.TestCase):
+    """Gated Saturday step-up (Jack 2026-09-26: "2x next saturday if today +
+    prior saturdays show no sign of edge degradation"): the tracker's verdict
+    file arms it; anything but a readable PASS naming a bigger multiplier
+    leaves Saturday at SAT_SIZE_MULT. 2026-10-03 and 2026-09-26 are
+    Saturdays; October => EDT (UTC-4)."""
+
+    SAT = "KXTRUMPMENTION"
+
+    def setUp(self):
+        self._saved = (imm.SAT_SIZE_MULT, imm.SAT_SIZE_MULT_GATED, imm.SAT_MULT_EXCLUDE,
+                       imm.HOUR_SIZE_MULTS, imm.STATUS_DIR, imm.SAT_GATE_FILE, dict(imm.SAT_GATE_STATE))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        imm.STATUS_DIR = tmp.name
+        imm.SAT_GATE_FILE = "sat_mult_gate.json"
+        imm.SAT_SIZE_MULT = 1.5
+        imm.SAT_SIZE_MULT_GATED = 2.0
+        imm.SAT_MULT_EXCLUDE = ("KXAAAGAS", "KXDIESEL")
+        imm.HOUR_SIZE_MULTS = {}
+        imm.SAT_GATE_STATE.update(mtime=0.0, verdict="", mult=0.0, effective_from=None)
+        self._tick = 0
+
+    def tearDown(self):
+        (imm.SAT_SIZE_MULT, imm.SAT_SIZE_MULT_GATED, imm.SAT_MULT_EXCLUDE,
+         imm.HOUR_SIZE_MULTS, imm.STATUS_DIR, imm.SAT_GATE_FILE, state) = self._saved
+        imm.SAT_GATE_STATE.clear()
+        imm.SAT_GATE_STATE.update(state)
+
+    def _write(self, raw=None, **kw):
+        """Write a verdict (dict fields, or raw text) and load it; each write
+        gets a distinct mtime so the mtime gate always sees it."""
+        payload = {"verdict": "PASS", "mult": 2.0, "effective_from": "2026-10-03"}
+        payload.update(kw)
+        path = imm.sat_gate_path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(raw if raw is not None else json.dumps(payload))
+        self._tick += 1
+        os.utime(path, (1_800_000_000 + self._tick, 1_800_000_000 + self._tick))
+        return imm.load_sat_gate()
+
+    def test_code_default_is_two(self):
+        self.assertEqual(self._saved[1], 2.0)
+
+    def test_no_verdict_file_keeps_saturday_at_base(self):
+        self.assertFalse(imm.load_sat_gate())
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 16, 0)), 1.5)
+        self.assertIn("awaiting", imm.sat_gate_summary())
+
+    def test_pass_applies_from_the_effective_saturday_on(self):
+        self.assertTrue(self._write())
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 9, 26, 16, 0)), 1.5)   # before: base
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 2, 16, 0)), 1.0)   # Friday
+        # ET calendar-day edges: 03:59Z Sat = Fri 23:59 EDT; 04:00Z = Sat 00:00 EDT
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 3, 59)), 1.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 4, 0)), 2.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 4, 3, 59)), 2.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 4, 4, 0)), 1.0)    # Sunday
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 10, 16, 0)), 2.0)  # stays on
+        self.assertIn("PASS: x2 on Saturdays from 2026-10-03", imm.sat_gate_summary())
+
+    def test_exclusions_and_composition_are_unchanged(self):
+        self._write()
+        sat = utc(2026, 10, 3, 16, 0)
+        for s in ("KXAAAGASD", "KXAAAGASW", "KXDIESELW", "KXRAINNYCM", "KXTEMPMIAH"):
+            self.assertEqual(imm.hour_size_mult(s, sat), 1.0, s)
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 8, 0)), 4.0)   # 4am EDT
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 16, 0)), 2.0)  # noon EDT
+        self.assertEqual(imm.hour_scaled_levels(self.SAT, sat),
+                         [(t, max(1, int(s * 2.0 + 0.5))) for t, s in imm.series_levels(self.SAT)])
+
+    def test_anything_but_a_readable_pass_fails_closed(self):
+        sat = utc(2026, 10, 3, 16, 0)
+        for kw in ({"verdict": "FAIL"}, {"verdict": "OFF"}, {"verdict": ""}, {"mult": 0},
+                   {"mult": 1.25}, {"mult": "two"}, {"effective_from": None},
+                   {"effective_from": "next saturday"}):
+            self._write(**kw)
+            self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.5, kw)
+        for raw in ("{not json", "[1, 2]", ""):
+            self._write(raw=raw)
+            self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.5, raw)
+        self._write(verdict="pass")                       # case-insensitive
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 2.0)
+
+    def test_deleting_the_file_clears_the_verdict(self):
+        self._write()
+        os.remove(imm.sat_gate_path())
+        self.assertTrue(imm.load_sat_gate())
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 16, 0)), 1.5)
+
+    def test_the_step_is_the_smaller_of_file_and_env(self):
+        sat = utc(2026, 10, 3, 16, 0)
+        self._write(mult=3.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 2.0)     # env caps an approval
+        imm.SAT_SIZE_MULT_GATED = 1.75
+        self._write(mult=2.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.75)    # a lowered env wins
+
+    def test_kill_switches(self):
+        sat = utc(2026, 10, 3, 16, 0)
+        self._write()
+        imm.SAT_SIZE_MULT_GATED = 0.0                  # restart-level kill
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.5)
+        self.assertIn("off", imm.sat_gate_summary())
+        imm.SAT_SIZE_MULT_GATED = 2.0
+        imm.SAT_SIZE_MULT = 1.0                        # Saturday knob off -> everything off
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.0)
+
+    def test_unchanged_file_is_not_reread(self):
+        self.assertTrue(self._write())
+        with mock.patch("builtins.open", side_effect=AssertionError("re-read")):
+            self.assertFalse(imm.load_sat_gate())
+
+    def test_floor_projection_sees_the_step(self):
+        # the payout-floor projection samples hour_size_mult, so a window over
+        # an armed Saturday projects the x2 ladder there, and x1.5 before it
+        self._write()
+        prof = dict(imm.size_mult_profile(self.SAT, utc(2026, 10, 3, 4, 0), 1.0))
+        self.assertEqual(set(prof), {2.0})
+        prof = dict(imm.size_mult_profile(self.SAT, utc(2026, 9, 26, 4, 0), 1.0))
+        self.assertEqual(set(prof), {1.5})
+
+    def test_summary_is_ascii(self):
+        for kw in ({}, {"verdict": "FAIL"}, {"mult": 1.25}):
+            self._write(**kw)
+            imm.sat_gate_summary().encode("ascii")
 
 
 class TestDailySeries(unittest.TestCase):
@@ -8555,8 +8746,38 @@ class TestHopelessExitDipGuard(unittest.TestCase):
         finally:
             _clean_persist()
 
-    def test_sustain_window_is_an_hour_by_default(self):
-        self.assertEqual(imm.HOPELESS_SUSTAIN_SECS, 3600)
+    def test_sustain_window_is_30_minutes_by_default(self):
+        # Jack 2026-09-26: "30min checks instead of hourly" (was 3600)
+        self.assertEqual(imm.HOPELESS_SUSTAIN_SECS, 1800)
+        self.assertFalse(imm.MEMBER_PEAK_GUARD)
+
+    def test_member_exit_runs_on_the_live_projection_not_the_peak(self):
+        """MURRAY1 (2026-09-26): a member admitted on a thin-book reading
+        was carried by that reading's 1h peak, then by a re-seed that landed
+        on a second blip -- ~3h15m before the clock even started. Now the
+        live projection starts the clock whatever the peak says, and the
+        member leaves after HOPELESS_SUSTAIN_SECS."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        T = "KXGOOD-99DEC31-A"
+        bot.run_cycle()
+        self.assertIn(T, bot.state.selected)
+        old_floor = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = imm.PAYOUT_FLOOR_DOLLARS = 1e9
+        try:
+            bot._est_peak[T] = (2e9, time.time())      # a fresh, huge peak
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertIn(T, bot.state.selected)       # clock started, not run
+            self.assertIn(T, bot.state.hopeless_since)
+            bot.state.hopeless_since[T] = (
+                time.time() - imm.HOPELESS_SUSTAIN_SECS - 1)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            self.assertNotIn(T, bot.state.selected)    # 30 min under -> out
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old_floor, 1.0
+            _clean_persist()
 
 
 class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
@@ -11733,18 +11954,21 @@ class TestOpenScanTier(unittest.TestCase):
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)
-            # MEMBER: the peak remains its dip guard -- a sub-bar reading
-            # with a live peak neither evicts nor starts the hopeless clock
+            # MEMBER under IMM_MEMBER_PEAK_GUARD=1 (the pre-2026-09-26
+            # rule): the peak is its dip guard -- a sub-bar reading with a
+            # live peak neither evicts nor starts the hopeless clock
             bot.state.accrued_est.pop(self.A, None)
             bot._est_peak[self.A] = (2e6, time.time())
             bot.state.hopeless_since.pop(self.A, None)
             bot.state.universe_at = 0.0
-            bot.run_cycle()
+            with mock.patch.object(imm, "MEMBER_PEAK_GUARD", True):
+                bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)
             self.assertNotIn(self.A, bot.state.hopeless_since)
-            # ... and without the peak the clock starts (sticky until it
-            # has run HOPELESS_SUSTAIN_SECS), which is the pre-existing exit
-            bot._est_peak.clear()
+            # DEFAULT since 2026-09-26: the same live peak does not carry a
+            # member -- the clock starts on the live projection (sticky
+            # until it has run HOPELESS_SUSTAIN_SECS)
+            bot._est_peak[self.A] = (2e6, time.time())
             bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertIn(self.A, bot.state.selected)

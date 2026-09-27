@@ -5,13 +5,21 @@ The frame under test is what build_rows() returns: one row per (et_date,
 group) with the summed inputs _derive() works from. Values are chosen so the
 derived metrics are the ones the assertions name (rent/fill = 100*rent/fills,
 loss/fill = -100*settle_pnl/settled_cts, net/fill = the difference)."""
+import json
+import os
 import re
+import tempfile
 import unittest
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
 import imm_saturday_tracker as sat
+
+# never read the box's live Saturday-gate verdict (see test_incentive_mm)
+sat.imm.SAT_GATE_FILE = "sat_mult_gate.absent-under-test.json"
+sat.imm.SAT_GATE_STATE.update(mtime=0.0, verdict="", mult=0.0, effective_from=None)
 
 
 def _row(et_date, group, day_type, partial, resting, rent, fills, settled_cts=0.0, settle_pnl=0.0,
@@ -128,6 +136,215 @@ class HelperTests(unittest.TestCase):
         self.assertIn("#0a7a2f", sat._colour("net/ct-day", 0.5, "0.50"))
         self.assertNotIn("<span", sat._colour("rent/fill", -1.0, "-1.00"))          # level row: plain
         self.assertIn("#c0392b", sat._colour("rent/fill", -1.0, "-1.00", delta=True))  # delta row: red
+
+
+def _utc(y, mo, d, h=0, mi=0):
+    return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
+
+
+def _blk(et_date, block, ct_h, rent_usd, fills, mark=-3.0, hm=1.0, settled_cts=0.0, settle_pnl=0.0):
+    """One gate_blocks() row. Rates it produces: rent 1000*100*rent_usd/ct_h
+    and fills 1000*fills/ct_h per 1k resting contract-hours; net = rent +
+    fills*mark."""
+    return dict(et_date=et_date, block=block, day_type=sat.day_type(et_date), hours=10 if block == "quiet" else 14,
+                ct_h=float(ct_h), rent_usd=float(rent_usd), fills=float(fills), mk_w=float(mark) * float(fills),
+                mk_n=float(fills), settled_cts=float(settled_cts), settle_pnl=float(settle_pnl),
+                hm=float(hm) if block == "day" else np.nan)
+
+
+WEEKDAYS = ("2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18")
+DONE = _utc(2026, 9, 21, 12)          # Saturday 9/19 ended 9/20 04:00Z; +24h passed
+
+
+def _week(sat_quiet=None, sat_day=None, sat_date="2026-09-19", weekdays=WEEKDAYS):
+    """Weekdays: quiet net 42.5 - 4*5 = 22.5, day net 51.4 - 11.4*3.5 = 11.4.
+    Saturday default: quiet net 48.3 + 3*0.7 = 50.4, day net 44.1 - 6.8*3.2 = 22.3."""
+    rows = []
+    for d in weekdays:
+        rows.append(_blk(d, "quiet", 400_000, 170, 1_600, mark=-5.0))
+        rows.append(_blk(d, "day", 350_000, 180, 4_000, mark=-3.5))
+    rows.append(_blk(sat_date, "quiet", **(sat_quiet or dict(ct_h=600_000, rent_usd=290, fills=1_800, mark=0.7))))
+    rows.append(_blk(sat_date, "day", **(sat_day or dict(ct_h=590_000, rent_usd=260, fills=4_000, mark=-3.2, hm=1.49))))
+    return pd.DataFrame(rows)
+
+
+class GateEvaluateTests(unittest.TestCase):
+    """The x2 gate (Jack 2026-09-26: "2x next saturday if today + prior
+    saturdays show no sign of edge degradation") over gate_blocks-shaped frames."""
+
+    def _failed(self, g):
+        return {(c["saturday"], c["check"], c["block"]) for c in g["checks"] if c["ok"] is False}
+
+    def test_a_saturday_with_its_premium_intact_passes(self):
+        g = sat.evaluate_gate(_week(), DONE, "2026-09-20", 1.5)
+        self.assertEqual(g["status"], "PASS", g["reason"])
+        self.assertEqual(g["saturdays"], ["2026-09-19"])
+        self.assertEqual({r["anchor"] for r in g["rows"]}, {"same week"})
+        g4 = [c for c in g["checks"] if c["check"] == "G4 settled"][0]
+        self.assertIsNone(g4["ok"])                   # nothing settled: not judged, not a fail
+        day = [r for r in g["rows"] if r["block"] == "day"][0]
+        self.assertAlmostEqual(day["sat"]["net_k"], 44.07 - 6.78 * 3.2, delta=0.1)
+        self.assertAlmostEqual(day["wk"]["net_k"], 51.43 - 11.43 * 3.5, delta=0.1)
+
+    def test_pending_until_the_saturday_is_a_day_plus_24h_old(self):
+        g = sat.evaluate_gate(_week(), _utc(2026, 9, 21, 3, 59), "2026-09-20", 1.5)
+        self.assertEqual(g["status"], "PENDING")
+        self.assertTrue(all(c["ok"] is None for c in g["checks"] if c["saturday"] in ("2026-09-19", "pooled")))
+        self.assertEqual(sat.evaluate_gate(_week(), _utc(2026, 9, 21, 4, 0), "2026-09-20", 1.5)["status"], "PASS")
+
+    def test_g1_a_block_below_its_weekdays_fails(self):
+        # day block rent 100/590k = 16.9 -> net 16.9 - 6.8*3.2 = -4.8 < weekday 11.4
+        g = sat.evaluate_gate(_week(sat_day=dict(ct_h=590_000, rent_usd=100, fills=4_000, mark=-3.2, hm=1.49)),
+                              DONE, "2026-09-20", 1.5)
+        self.assertEqual(g["status"], "FAIL")
+        self.assertIn(("2026-09-19", "G1 net vs weekdays", "day"), self._failed(g))
+        self.assertNotIn(("2026-09-19", "G1 net vs weekdays", "quiet"), self._failed(g))
+        self.assertIn("G1 net vs weekdays", g["reason"])
+
+    def test_g2_a_saturday_that_nets_negative_fails_even_above_weak_weekdays(self):
+        rows = _week(sat_quiet=dict(ct_h=600_000, rent_usd=10, fills=1_800, mark=-9.0),
+                     sat_day=dict(ct_h=590_000, rent_usd=10, fills=4_000, mark=-9.0, hm=1.49))
+        g = sat.evaluate_gate(rows, DONE, "2026-09-20", 1.5)
+        self.assertIn(("2026-09-19", "G2 net positive", "boosted"), self._failed(g))
+
+    def test_g3_markouts_more_than_two_cents_worse_fail(self):
+        worse = _week(sat_quiet=dict(ct_h=600_000, rent_usd=900, fills=1_800, mark=-6.5),
+                      sat_day=dict(ct_h=590_000, rent_usd=900, fills=4_000, mark=-6.5, hm=1.49))
+        g = sat.evaluate_gate(worse, DONE, "2026-09-20", 1.5)
+        self.assertEqual(self._failed(g), {("2026-09-19", "G3 mark-out", "boosted")})   # rent keeps G1/G2 green
+        ok = _week(sat_quiet=dict(ct_h=600_000, rent_usd=900, fills=1_800, mark=-5.5),
+                   sat_day=dict(ct_h=590_000, rent_usd=900, fills=4_000, mark=-5.5, hm=1.49))
+        self.assertEqual(sat.evaluate_gate(ok, DONE, "2026-09-20", 1.5)["status"], "PASS")   # within 2c
+
+    def test_g4_settled_loss_judged_only_past_the_minimum(self):
+        small = _week(sat_day=dict(ct_h=590_000, rent_usd=260, fills=4_000, mark=-3.2, hm=1.49,
+                                   settled_cts=400, settle_pnl=-400))
+        g = sat.evaluate_gate(small, DONE, "2026-09-20", 1.5)
+        self.assertEqual(g["status"], "PASS")
+        big = _week(sat_day=dict(ct_h=590_000, rent_usd=260, fills=4_000, mark=-3.2, hm=1.49,
+                                 settled_cts=800, settle_pnl=-200))      # 25c lost per settled fill > 9.5c rent
+        g = sat.evaluate_gate(big, DONE, "2026-09-20", 1.5)
+        self.assertEqual(self._failed(g), {("pooled", "G4 settled", "boosted")})
+
+    def test_only_boosted_hours_are_judged(self):
+        # 9/12: the knob went live ~09:10 ET, so its 0-9 block is not an observation
+        rows = _week(sat_date="2026-09-12")
+        g = sat.evaluate_gate(rows, _utc(2026, 9, 21, 12), "2026-09-20", 1.5)
+        self.assertEqual([(r["saturday"], r["block"]) for r in g["rows"]], [("2026-09-12", "day")])
+        self.assertEqual({r["anchor"] for r in g["rows"]}, {"all weekdays"})   # its own week predates the window
+        # a Saturday whose day block shows no multiplier (knob off) is skipped
+        off = _week(sat_day=dict(ct_h=590_000, rent_usd=260, fills=4_000, mark=-3.2, hm=1.0))
+        g = sat.evaluate_gate(off, DONE, "2026-09-20", 1.5)
+        self.assertEqual((g["status"], g["saturdays"]), ("PENDING", []))
+
+    def test_every_boosted_saturday_must_pass(self):
+        both = pd.concat([_week(), _week(sat_date="2026-09-26",
+                                         weekdays=("2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25"),
+                                         sat_day=dict(ct_h=590_000, rent_usd=100, fills=4_000, mark=-3.2, hm=1.49))])
+        g = sat.evaluate_gate(both, _utc(2026, 9, 28, 11, 40), "2026-09-27", 1.5)
+        self.assertEqual(g["saturdays"], ["2026-09-19", "2026-09-26"])
+        self.assertEqual(g["status"], "FAIL")
+        self.assertEqual({c[0] for c in self._failed(g)}, {"2026-09-26"})
+
+    def test_empty_window(self):
+        self.assertEqual(sat.evaluate_gate(pd.DataFrame(), DONE, "2026-09-20", 1.5)["status"], "PENDING")
+
+
+class GateVerdictFileTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = os.path.join(tmp.name, "sat_mult_gate.json")
+        self.gate = sat.evaluate_gate(_week(), DONE, "2026-09-20", 1.5)
+
+    def test_next_saturday_after(self):
+        d = lambda s: datetime.strptime(s, "%Y-%m-%d").date()
+        self.assertEqual(sat.next_saturday_after(d("2026-09-28")), d("2026-10-03"))   # Monday
+        self.assertEqual(sat.next_saturday_after(d("2026-10-02")), d("2026-10-03"))   # Friday
+        self.assertEqual(sat.next_saturday_after(d("2026-09-26")), d("2026-10-03"))   # a Saturday -> the next
+
+    def test_written_once_and_read_back_by_the_bot_format(self):
+        monday = _utc(2026, 9, 28, 11, 40)                 # the 07:40 ET run
+        self.assertTrue(sat.write_gate_verdict(self.gate, monday, "2026-09-27", 1.5, 2.0, self.path))
+        with open(self.path, encoding="utf-8") as f:
+            v = json.load(f)
+        self.assertEqual((v["verdict"], v["mult"], v["base_mult"], v["effective_from"]),
+                         ("PASS", 2.0, 1.5, "2026-10-03"))
+        self.assertEqual(v["saturdays"], ["2026-09-19"])
+        self.assertTrue(v["checks"])
+        # one-shot: the next Monday's run never overwrites; --gate-rewrite does
+        fail = dict(self.gate, status="FAIL")
+        self.assertFalse(sat.write_gate_verdict(fail, monday, "2026-09-27", 1.5, 2.0, self.path))
+        self.assertTrue(sat.write_gate_verdict(fail, monday, "2026-09-27", 1.5, 2.0, self.path, overwrite=True))
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["verdict"], "FAIL")
+
+    def test_pending_and_error_are_never_written(self):
+        for status in ("PENDING", "ERROR"):
+            self.assertFalse(sat.write_gate_verdict(dict(self.gate, status=status), DONE, "2026-09-20", 1.5, 2.0,
+                                                    self.path, overwrite=True))
+        self.assertFalse(os.path.exists(self.path))
+
+
+class GateInputsTests(unittest.TestCase):
+    def test_gate_blocks_counts_fills_in_logged_hours_only(self):
+        # the parser records hour_mult (q_rows / hm_sum) outside the 0-9 quiet window only
+        ser = pd.DataFrame([dict(et_date="2026-09-19", et_hour=h, series="KXTRUMPMENTION", sum_est_usd=240.0,
+                                 sum_quoted=50_000.0, n_rows=50, q_rows=(50 if h >= 10 else 0),
+                                 hm_sum=(75.0 if h >= 10 else 0.0)) for h in (3, 12)])
+        cyc = pd.DataFrame([dict(et_date="2026-09-19", et_hour=h, n_cycles=50) for h in (3, 12)])
+        scored = pd.DataFrame([dict(et_date="2026-09-19", et_hour=h, group="long-dated", cnt=10.0, mk_w=-20.0,
+                                    mk_n=10.0, settled_cts=0.0, settle_pnl=np.nan) for h in (3, 12, 15)])
+        b = sat.gate_blocks(ser, cyc, scored, "2026-09-20").set_index("block")
+        self.assertEqual(b.loc["day", "fills"], 10.0)       # the 15:00 fill sits in an unlogged hour
+        self.assertEqual(b.loc["quiet", "fills"], 10.0)
+        self.assertAlmostEqual(b.loc["day", "ct_h"], 1_000.0)
+        self.assertAlmostEqual(b.loc["day", "rent_usd"], 240.0 / 50 / 24)
+        self.assertAlmostEqual(b.loc["day", "hm"], 1.5)
+        self.assertTrue(np.isnan(b.loc["quiet", "hm"]))     # the parser records hour_mult outside 0-9 only
+
+    def test_mark_falls_back_to_settlement_then_last_mid(self):
+        t = 1_789_000_200                                   # on a 10-minute boundary
+        mids = {"A": ([t, t + 86400], [40.0, 55.0]),       # 24h mid exists
+                "B": ([t], [40.0]),                         # settled, no 24h mid
+                "C": ([t, t + 3 * 3600], [40.0, 30.0])}     # unsettled, logged 3h after only
+        fills = pd.DataFrame([dict(t=t, et_date="2026-09-19", et_hour=12, ticker=k, series="KXFOO",
+                                   eff_side="yes", px=40.0, cnt=1.0) for k in ("A", "B", "C")])
+        f = sat.score_fills(fills, mids, {"B": "no"}).set_index("ticker")
+        self.assertEqual(f.loc["A", "mo24"], 15.0)
+        self.assertEqual(f.loc["A", "mk"], 15.0)
+        self.assertTrue(np.isnan(f.loc["B", "mo24"]))
+        self.assertEqual(f.loc["B", "mk"], -40.0)           # settled NO: a YES bought at 40 marks to 0
+        self.assertTrue(np.isnan(f.loc["C", "mo24"]))
+        self.assertEqual(f.loc["C", "mk"], -10.0)           # last logged mid inside the 24h
+
+
+class GateRenderTests(unittest.TestCase):
+    def setUp(self):
+        self.gate = sat.evaluate_gate(_week(), DONE, "2026-09-20", 1.5)
+
+    def test_text_section_is_ascii_and_has_no_nan(self):
+        text = sat.render(_frame(), "2026-09-20", self.gate, written=True)
+        text.encode("cp1252")
+        self.assertIn("== 2x gate", text)
+        self.assertIn("status: PASS - verdict WRITTEN this run", text)
+        self.assertNotIn("nan", text)
+        self.assertIn("Saturday step-up:", text)
+
+    def test_html_section(self):
+        html = sat.render_html(_frame(), "2026-09-20", self.gate)
+        self.assertIn("2× gate", html)
+        self.assertIn("G1 net vs weekdays", html)
+        self.assertIn(">PASS<", html)
+
+    def test_pending_rows_render_a_dash(self):
+        g = sat.evaluate_gate(_week(sat_day=dict(ct_h=590_000, rent_usd=260, fills=4_000, mark=float("nan"),
+                                                  hm=1.49)).assign(mk_n=lambda d: np.where(d["day_type"] == "Saturday", 0.0, d["mk_n"]),
+                                                                   mk_w=lambda d: np.where(d["day_type"] == "Saturday", 0.0, d["mk_w"])),
+                              _utc(2026, 9, 20, 12), "2026-09-20", 1.5)
+        text = "\n".join(sat.gate_text(g, False))
+        self.assertIn("PENDING", text)
+        self.assertNotIn("nan", text)
 
 
 if __name__ == "__main__":
