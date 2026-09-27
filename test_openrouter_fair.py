@@ -126,6 +126,33 @@ class TestWriteAndKey(unittest.TestCase):
         with open(self.vint, encoding="utf-8") as f:
             self.assertEqual(len(f.readlines()), 2)
 
+    def test_fetch_windows_retries_a_rate_limit(self):
+        busy = mock.Mock(status_code=429)
+        ok = mock.Mock(status_code=200)
+        ok.json.return_value = {"markets": [
+            {"event_ticker": "KXTOKENUSE-26SEP28", "close_time": "2026-09-28T03:59:00Z",
+             "rules_primary": "for Sep 21\u201327, 2026 is above 164T"}]}
+        ok.raise_for_status.return_value = None
+        with mock.patch.object(orf.requests, "get", side_effect=[busy, ok]) as g, \
+                mock.patch.object(orf.time, "sleep") as sl:
+            w = orf.fetch_windows(series=("KXTOKENUSE",))
+        self.assertEqual(g.call_count, 2)
+        sl.assert_called_once()
+        self.assertEqual(w["KXTOKENUSE-26SEP28"]["start"], "2026-09-21")
+
+    def test_failed_window_read_reuses_cached_windows(self):
+        orf.write_fair_file(self.out, daily=self.daily, windows=self.windows,
+                            now=self.now, vintage_path=self.vint)
+        with mock.patch.object(orf, "fetch_windows", side_effect=RuntimeError("429")):
+            ok, miss = orf.write_fair_file(self.out, daily=self.daily, now=self.now,
+                                           vintage_path=self.vint)
+        self.assertEqual((ok, miss), (2, 0))
+        os.remove(self.out)                              # no cache: the error surfaces
+        with mock.patch.object(orf, "fetch_windows", side_effect=RuntimeError("429")):
+            with self.assertRaises(RuntimeError):
+                orf.write_fair_file(self.out, daily=self.daily, now=self.now,
+                                    vintage_path=self.vint)
+
     def test_no_key_writes_nothing(self):
         with mock.patch.object(orf, "api_key", return_value=""):
             self.assertEqual(orf.write_fair_file(self.out, windows=self.windows), (0, 0))

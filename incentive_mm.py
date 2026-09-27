@@ -13467,6 +13467,8 @@ class IncentiveMarketMaker:
                             log(f"{self.tag} ! or-fair refresh failed: "
                                 f"{type(e).__name__}: {str(e)[:120]}")
                         last = "err"
+                        # the gate is fail-closed: retry soon, not in 10 min
+                        delay = min(delay, max(30, OR_FAIR_FAST_SECS))
                     time.sleep(delay)
             threading.Thread(target=_or_fair_refresh, daemon=True,
                              name="or-fair").start()

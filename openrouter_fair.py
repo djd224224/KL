@@ -53,6 +53,7 @@ import os
 import re
 import statistics
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -211,13 +212,23 @@ def windows_from_markets(markets: List[dict]) -> Dict[str, dict]:
 
 
 def fetch_windows(series: Tuple[str, ...] = OR_SERIES,
-                  timeout: float = HTTP_TIMEOUT) -> Dict[str, dict]:
+                  timeout: float = HTTP_TIMEOUT,
+                  retries: int = 3, backoff: float = 3.0) -> Dict[str, dict]:
+    """Event windows from Kalshi's public markets endpoint. A 429 or 5xx is
+    retried with a growing sleep (3s, 12s, 27s): the first refresh after a
+    bot restart met a 429 on 2026-09-27, while the bot's own startup reads
+    were hitting the same host."""
     markets: List[dict] = []
     for s in series:
-        r = requests.get(KALSHI_MARKETS_URL, params={"series_ticker": s,
-                                                     "status": "open",
-                                                     "limit": 200},
-                         timeout=timeout)
+        for attempt in range(retries + 1):
+            r = requests.get(KALSHI_MARKETS_URL, params={"series_ticker": s,
+                                                         "status": "open",
+                                                         "limit": 200},
+                             timeout=timeout)
+            if (r.status_code == 429 or r.status_code >= 500) and attempt < retries:
+                time.sleep(backoff * (attempt + 1) ** 2)
+                continue
+            break
         r.raise_for_status()
         markets += (r.json() or {}).get("markets") or []
     return windows_from_markets(markets)
@@ -295,8 +306,21 @@ def write_fair_file(path: str, daily: Optional[Dict[date, float]] = None,
         if not key:
             return 0, 0
         daily = fetch_daily(key, today - timedelta(days=HISTORY_DAYS), today)
+    prev = _read_json(path)
     if windows is None:
-        windows = fetch_windows()
+        try:
+            windows = fetch_windows()
+        except Exception as e:
+            # an event's window never changes: keep refreshing the totals on
+            # the windows already known, and only new events wait for Kalshi
+            windows = {ev: {"series": str(e2.get("series") or ev.split("-")[0]),
+                            "start": e2["start"], "end": e2["end"]}
+                       for ev, e2 in (prev.get("entries") or {}).items()
+                       if isinstance(e2, dict) and e2.get("start") and e2.get("end")}
+            if not windows:
+                raise
+            _log(f"! Kalshi window read failed ({type(e).__name__}); "
+                 f"reusing {len(windows)} cached event windows")
     entries: Dict[str, dict] = {}
     missing: List[str] = []
     for ev, w in sorted(windows.items()):
@@ -308,7 +332,6 @@ def write_fair_file(path: str, daily: Optional[Dict[date, float]] = None,
         entries[ev] = dict(f, series=w["series"], start=w["start"],
                            end=w["end"], fetched_at=now.isoformat())
     last_day = max(daily).isoformat() if daily else ""
-    prev = _read_json(path)
     if last_day and last_day != prev.get("last_day"):
         vp = vintage_path or OR_VINTAGE_FILE
         os.makedirs(os.path.dirname(vp) or ".", exist_ok=True)
