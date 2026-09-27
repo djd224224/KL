@@ -2953,6 +2953,16 @@ _DEFAULT_ECON_SERIES = (
     # day-dated midnight-ET safety as the gas trackers; re-entry guards apply.
     "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXNHSALES,KXUSGASCPI,KXSCFI,"
     "KXDIESELD,KXDIESELW,"
+    # KXDIESELMONAK added 2026-09-27 (Jack: "allowlist KXDIESELMONAK"): AAA's
+    # Alaska average diesel on one date ("Will Alaska average diesel price on
+    # September 30, 2026 be above $6.4000?", 9 strikes, $500/market program
+    # 9/27 17:16Z -> 9/30 04:29Z). Open a week across six daily AAA prints --
+    # the KXDIESELW shape -- so the diesel guards: safe-join + the scoped
+    # rate bar (re-entry set), the 03:05-04:00 ET AAA print blackout
+    # (IMM_AAA_PRINT_SERIES), 3 per event and no Saturday step-up (both
+    # match the KXDIESEL prefix); the day-dated ticker's midnight-ET rule
+    # keeps it out of the print day (close 00:29 ET).
+    "KXDIESELMONAK,"
     # KXTRUEV added 2026-08-24 (Jack: "allowlist this series"): Truflation EV
     # Commodity Index — a once-DAILY print computed from metals futures
     # (cobalt/copper/nickel/palladium/platinum) whose sessions settle by early
@@ -4505,7 +4515,7 @@ _REENTRY_SERIES = (
     # KXTRUEV enrolled 2026-08-24 with the same guards as the other price
     # prints — a tight two-sided book until a published number lands is
     # exactly what safe-join placement exists for.
-    "KXDIESELD,KXDIESELW,KXBKFT,KXYUMTBFT,KXTRUEV,"
+    "KXDIESELD,KXDIESELW,KXDIESELMONAK,KXBKFT,KXYUMTBFT,KXTRUEV,"
     # Treasury yields enrolled 2026-08-04 — a rate print is exactly the book
     # safe-join exists for: it sits tight and two-sided until the number
     # lands, so joining the touch is the expensive way to be there.
@@ -4710,7 +4720,7 @@ for _s in FINECON_SERIES:
 for _s in os.environ.get(
         "IMM_AAA_PRINT_SERIES",
         "KXAAAGASD,KXAAAGASW,KXAAAGASM,KXDIESELD,KXDIESELW,"
-        "KXAAAGASMINM,KXAAAGASMAXM").split(","):
+        "KXAAAGASMINM,KXAAAGASMAXM,KXDIESELMONAK").split(","):
     _s = _s.strip()
     if _s and _s in SERIES_OVERRIDES:
         SERIES_OVERRIDES[_s] = replace(

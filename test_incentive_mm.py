@@ -5289,6 +5289,26 @@ class TestStickySelection(unittest.TestCase):
             else:
                 imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
 
+    def test_dieselmonak_enrolled_with_the_diesel_guards(self):
+        # Jack 2026-09-27: "allowlist KXDIESELMONAK" (AAA Alaska diesel on
+        # one date, open across six daily AAA prints -- the KXDIESELW shape)
+        s = "KXDIESELMONAK"
+        self.assertIn(s, imm.ALLOW_SERIES)
+        self.assertFalse(imm.series_pattern_blocked(s))
+        self.assertTrue(imm.series_safe_join(s))
+        self.assertEqual(imm.series_min_est_rate(s), imm.series_min_est_rate("KXDIESELD"))
+        self.assertEqual(imm.series_override(s).blackout_et, ("03:05", "04:00"))
+        self.assertTrue(imm.series_in_blackout(s, imm.ET.localize(
+            datetime(2026, 9, 28, 3, 20)).astimezone(timezone.utc)))
+        self.assertEqual(imm.event_top_n_for(s), 3)
+        # the day-dated ticker: out at 00:00 ET on the print day, before the
+        # 00:29 ET close and the ~03:20 ET print
+        cut = imm.trade_cutoff_utc(
+            "KXDIESELMONAK-26SEP30",
+            datetime(2026, 9, 30, 6, 0, tzinfo=timezone.utc),
+            datetime(2026, 10, 7, 6, 0, tzinfo=timezone.utc))
+        self.assertEqual(cut, datetime(2026, 9, 30, 4, 0, tzinfo=timezone.utc))
+
     def test_aaa_print_blackout_window(self):
         # Jack 2026-08-04: AAA posts gas AND diesel 03:18-03:36 ET (5 days
         # observed at 5s resolution). Weekly/monthly markets stay open across
