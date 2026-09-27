@@ -3735,6 +3735,19 @@ Until it is set the bot logs "ca-fair: no feed configured -- gate open"
 once and quotes exactly as before. IMM_CA_FEED_URL is redacted in the
 config snapshot (FEED_URL joined the secret-name list).
 
+FEED UPDATE (same evening): Jack opened a Carbon Arc Professional account
+($20/mo). A TOKEN alone now works -- {"token": "..."} in
+~/.carbonarc_feed.json (or IMM_CA_FEED_TOKEN), from app.carbonarc.ai ->
+Developers. It reads the official Prisms API that the carbonarc SDK's
+client.prisms wraps (Carbon-Arc/carbonarc src/carbonarc/prisms.py): GET
+https://api.carbonarc.co/v2/prisms?insight_id=<id> per insight, falling
+back to /v2/prisms/<prism_id>, header "Authorization: Bearer <token>";
+per the SDK, any valid token may read prisms with no entitlement and no
+cost per call. The prism -> insight map is learned on the first sweep and
+kept in the fair file (prism_insights), so a steady sweep is ~6 calls,
+not ~40. Same payload shape as the Prisms page. The config file may carry
+a Notepad BOM (read as utf-8-sig).
+
 KILL SWITCH: IMM_CA_FAIR_ENABLE=0 (launcher env, task restart), or delete
 the feed config (the gate opens when entries pass their 60-minute TTL).
 

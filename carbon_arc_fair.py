@@ -37,10 +37,20 @@ down when its touch fights that fair (the rain-gate shape). Series ->
 (".../prisms?prism=<id>&entity=<name>"), read from the public GET /series
 catalog at most once a day.
 
-Feed: IMM_CA_FEED_URL (+ optional IMM_CA_FEED_TOKEN, sent as a Bearer
-token), or the same two as {"url": ..., "token": ...} in CA_FEED_CONFIG
-(default ~/.carbonarc_feed.json, outside the repo because the repo is
-public), must return the Prisms JSON shape
+Feed, in CA_FEED_CONFIG (default ~/.carbonarc_feed.json, outside the repo
+because the repo is public) as {"token": ..., "url": ...}, or the env vars
+IMM_CA_FEED_TOKEN / IMM_CA_FEED_URL:
+  - a TOKEN alone (the Carbon Arc account's API token, app.carbonarc.ai ->
+    Developers) reads the official Prisms API, the one the `carbonarc` SDK's
+    client.prisms wraps: GET {CA_API_HOST}/v2/prisms?insight_id=<id> per
+    insight, falling back to GET /v2/prisms/<prism_id>, with
+    "Authorization: Bearer <token>". Carbon Arc: "Any valid API token may
+    read prisms. There is no entitlement to enable and no cost per call."
+    The prism -> insight map is learned on the first read and kept in the
+    fair file, so a steady sweep is one call per insight (~6), not per
+    prism (~40).
+  - a URL (+ optional token as Bearer) is read as one payload.
+Either way the data is the Prisms JSON shape
 
     {"prisms": [{"prism_id", "category", "data_through",
                  "last_refreshed_at",
@@ -94,6 +104,8 @@ CA_VINTAGE_FILE = os.environ.get(
 KALSHI_SERIES_URL = os.environ.get(
     "IMM_CA_SERIES_URL",
     "https://api.elections.kalshi.com/trade-api/v2/series")
+# the official API host (the carbonarc SDK's BaseAPIClient default)
+CA_API_HOST = os.environ.get("IMM_CA_API_HOST", "https://api.carbonarc.co")
 CA_SIGMA_MULT = _env_float("IMM_CA_SIGMA_MULT", 1.7)
 CA_SIGMA_FLOOR_PTS = _env_float("IMM_CA_SIGMA_FLOOR_PTS", 1.0)
 CA_SIGMA_FLOOR_REL = _env_float("IMM_CA_SIGMA_FLOOR_REL", 0.01)
@@ -117,14 +129,15 @@ def _log(msg: str) -> None:
 
 
 def feed_settings() -> Tuple[str, str]:
-    """(url, token) for the feed: IMM_CA_FEED_URL / IMM_CA_FEED_TOKEN, else
-    CA_FEED_CONFIG. ("", "") when neither is set -- the gate stays open."""
+    """(url, token) for the feed: the env vars when either is set, else
+    CA_FEED_CONFIG. ("", "") when neither is set -- the gate stays open.
+    utf-8-sig: Windows Notepad may save the file with a BOM."""
     url = os.environ.get("IMM_CA_FEED_URL", "").strip()
     token = os.environ.get("IMM_CA_FEED_TOKEN", "").strip()
-    if url:
+    if url or token:
         return url, token
     try:
-        with open(CA_FEED_CONFIG, encoding="utf-8") as f:
+        with open(CA_FEED_CONFIG, encoding="utf-8-sig") as f:
             cfg = json.load(f) or {}
         return (str(cfg.get("url") or "").strip(),
                 str(cfg.get("token") or "").strip())
@@ -132,19 +145,79 @@ def feed_settings() -> Tuple[str, str]:
         return "", ""
 
 
-def fetch_payload(url: str = "", token: str = "",
-                  timeout: float = HTTP_TIMEOUT) -> Optional[dict]:
-    """The Prisms payload from the configured feed; None when no feed is
-    configured. Raises on HTTP / parse errors (the caller logs and keeps the
-    previous file)."""
-    if not url:
-        url, token = feed_settings()
-    if not url:
-        return None
+def feed_configured() -> bool:
+    """A URL or an API token is set."""
+    url, token = feed_settings()
+    return bool(url or token)
+
+
+def _auth_headers(token: str) -> dict:
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    r = requests.get(url, headers=headers, timeout=timeout)
+    return headers
+
+
+def fetch_prisms_api(prism_ids: List[str], token: str,
+                     insights: Dict[str, int],
+                     timeout: float = HTTP_TIMEOUT) -> dict:
+    """{"prisms": [...]} for `prism_ids` from the official Prisms API. One
+    GET /v2/prisms?insight_id= per insight already known in `insights`
+    (prism_id -> insight_id, updated in place), then GET /v2/prisms/<id>
+    for any prism still missing. A 404 (unknown / not public / never
+    published -- one answer by design) skips that prism; any other HTTP
+    error raises so the caller keeps the previous file."""
+    base = f"{CA_API_HOST.rstrip('/')}/v2/prisms"
+    headers = _auth_headers(token)
+    want = set(prism_ids)
+    got: Dict[str, dict] = {}
+    by_insight: Dict[int, List[str]] = {}
+    for pid in sorted(want):
+        iid = insights.get(pid)
+        if iid is not None:
+            by_insight.setdefault(iid, []).append(pid)
+    for iid in sorted(by_insight):
+        r = requests.get(base, params={"insight_id": iid}, headers=headers,
+                         timeout=timeout)
+        r.raise_for_status()
+        for p in (r.json() or {}).get("prisms") or []:
+            if isinstance(p, dict) and p.get("prism_id") in want:
+                got[p["prism_id"]] = p
+    for pid in sorted(want - set(got)):
+        r = requests.get(f"{base}/{pid}", headers=headers, timeout=timeout)
+        if r.status_code == 404:
+            continue
+        r.raise_for_status()
+        p = r.json()
+        if not isinstance(p, dict):
+            continue
+        p.setdefault("prism_id", pid)
+        got[pid] = p
+        if p.get("insight_id") is not None:
+            try:
+                insights[pid] = int(p["insight_id"])
+            except (TypeError, ValueError):
+                pass
+    return {"prisms": [got[k] for k in sorted(got)]}
+
+
+def fetch_payload(url: str = "", token: str = "",
+                  prism_ids: Optional[List[str]] = None,
+                  insights: Optional[Dict[str, int]] = None,
+                  timeout: float = HTTP_TIMEOUT) -> Optional[dict]:
+    """The Prisms payload from the configured feed; None when no feed is
+    configured. A URL is one GET of a {"prisms": [...]} payload; a token
+    alone reads `prism_ids` from the official Prisms API. Raises on HTTP /
+    parse errors (the caller logs and keeps the previous file)."""
+    if not url and not token:
+        url, token = feed_settings()
+    if not url and not token:
+        return None
+    if not url:
+        return fetch_prisms_api(list(prism_ids or []), token,
+                                insights if insights is not None else {},
+                                timeout=timeout)
+    r = requests.get(url, headers=_auth_headers(token), timeout=timeout)
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, dict) or not isinstance(data.get("prisms"), list):
@@ -336,10 +409,8 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
     reused from the previous file for SERIES_MAP_TTL_SECS; a failed catalog
     read keeps the old map."""
     now = now or datetime.now(timezone.utc)
-    if payload is None:
-        payload = fetch_payload()
-        if payload is None:
-            return 0, 0
+    if payload is None and not feed_configured():
+        return 0, 0
     prev = _read_json(path)
     smap = series_map
     if smap is None:
@@ -352,6 +423,19 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
             except Exception as e:   # keep the old map
                 _log(f"! series catalog read failed ({e}); "
                      f"keeping {len(smap)} mapped series")
+    insights: Dict[str, int] = {}
+    for k, v in (prev.get("prism_insights") or {}).items():
+        try:
+            insights[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    if payload is None:
+        payload = fetch_payload(
+            prism_ids=sorted({r.get("prism", "") for r in smap.values()
+                              if r.get("prism")}),
+            insights=insights)
+        if payload is None:
+            return 0, 0
     entries, missing = build_entries(payload, smap, now)
     fetched_at = now.isoformat()
     for e in entries.values():
@@ -364,6 +448,7 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
         "missing": missing,
         "series_map": smap,
         "series_map_ts": float(prev.get("series_map_ts") or time.time()),
+        "prism_insights": insights,
         "model": {"sigma_mult": CA_SIGMA_MULT,
                   "sigma_floor_pts": CA_SIGMA_FLOOR_PTS,
                   "sigma_floor_rel": CA_SIGMA_FLOOR_REL,
@@ -393,8 +478,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             payload = json.load(f)
     ok, miss = write_fair_file(args.out, payload=payload)
     if ok == 0 and miss == 0 and payload is None:
-        _log(f"no feed configured (IMM_CA_FEED_URL or {CA_FEED_CONFIG}); "
-             f"nothing written")
+        _log(f"no feed configured (token or url in {CA_FEED_CONFIG}, or "
+             f"IMM_CA_FEED_TOKEN / IMM_CA_FEED_URL); nothing written")
         return 1
     _log(f"{ok} series with a fair entry, {miss} mapped without one "
          f"-> {args.out}")

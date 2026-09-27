@@ -202,8 +202,105 @@ class TestFeedSettings(unittest.TestCase):
                              ("https://env.invalid/x", "t1"))
         with mock.patch.object(caf, "CA_FEED_CONFIG",
                                os.path.join(tmp, "absent.json")), \
-                mock.patch.dict(os.environ, {"IMM_CA_FEED_URL": ""}):
+                mock.patch.dict(os.environ, {"IMM_CA_FEED_URL": "",
+                                             "IMM_CA_FEED_TOKEN": ""}):
             self.assertEqual(caf.feed_settings(), ("", ""))
+            self.assertFalse(caf.feed_configured())
+
+    def test_token_only_config_with_a_notepad_bom(self):
+        tmp = tempfile.mkdtemp(prefix="caf_cfg_")
+        cfg = os.path.join(tmp, "feed.json")
+        with open(cfg, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps({"token": "abc"}).encode())
+        with mock.patch.object(caf, "CA_FEED_CONFIG", cfg), \
+                mock.patch.dict(os.environ, {"IMM_CA_FEED_URL": "",
+                                             "IMM_CA_FEED_TOKEN": ""}):
+            self.assertEqual(caf.feed_settings(), ("", "abc"))
+            self.assertTrue(caf.feed_configured())
+
+
+def _resp(status, body):
+    r = mock.Mock()
+    r.status_code = status
+    r.json.return_value = body
+    if status >= 400:
+        r.raise_for_status.side_effect = RuntimeError(f"HTTP {status}")
+    else:
+        r.raise_for_status.return_value = None
+    return r
+
+
+class TestOfficialApi(unittest.TestCase):
+    """The account-token path: the Prisms API the carbonarc SDK wraps
+    (client.prisms.get_prisms / get_prism)."""
+
+    BASE = "https://api.carbonarc.co/v2/prisms"
+
+    def _prism(self, pid, iid, name="Amazon"):
+        p = _prism(pid, [_entity(name, [("2026-09-23", 108.64)], HIST)])
+        p["insight_id"] = iid
+        return p
+
+    def test_groups_by_known_insight_then_falls_back_per_prism(self):
+        calls = []
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            calls.append((url, dict(params or {}), headers))
+            if url == self.BASE and (params or {}).get("insight_id") == 245:
+                return _resp(200, {"prisms": [self._prism("P1", 245),
+                                              self._prism("PX", 245)]})
+            if url == self.BASE + "/P2":
+                p = self._prism("P2", 700)
+                del p["prism_id"]              # the single read may omit it
+                return _resp(200, p)
+            if url == self.BASE + "/P3":
+                return _resp(404, {"detail": "not found"})
+            raise AssertionError(f"unexpected GET {url} {params}")
+
+        insights = {"P1": 245}
+        with mock.patch.object(caf.requests, "get", side_effect=fake_get):
+            out = caf.fetch_prisms_api(["P1", "P2", "P3"], "tok", insights)
+        self.assertEqual([p["prism_id"] for p in out["prisms"]], ["P1", "P2"])
+        self.assertEqual(insights, {"P1": 245, "P2": 700})   # learned
+        self.assertEqual(len(calls), 3)                      # 1 grouped + 2
+        for _url, _params, headers in calls:
+            self.assertEqual(headers["Authorization"], "Bearer tok")
+
+    def test_other_http_errors_raise(self):
+        with mock.patch.object(caf.requests, "get",
+                               return_value=_resp(500, {})):
+            with self.assertRaises(RuntimeError):
+                caf.fetch_prisms_api(["P1"], "tok", {})
+
+    def test_token_only_write_reads_the_api_and_keeps_the_insight_map(self):
+        tmp = tempfile.mkdtemp(prefix="caf_api_")
+        out = os.path.join(tmp, "fair.json")
+        vint = os.path.join(tmp, "v.jsonl")
+        smap = {"KXAMZNCC": {"prism": "P1", "entity": "Amazon"}}
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            self.assertEqual(url, self.BASE + "/P1")
+            return _resp(200, self._prism("P1", 245))
+
+        with mock.patch.object(caf, "feed_settings", return_value=("", "tok")), \
+                mock.patch.object(caf.requests, "get", side_effect=fake_get):
+            ok, miss = caf.write_fair_file(out, now=NOW, series_map=smap,
+                                           vintage_path=vint)
+        self.assertEqual((ok, miss), (1, 0))
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["prism_insights"], {"P1": 245})
+        self.assertAlmostEqual(data["entries"]["KXAMZNCC"]["mu"], 108.64)
+
+        # next sweep: one grouped call per insight, no per-prism reads
+        def grouped(url, params=None, headers=None, timeout=None):
+            self.assertEqual((url, params), (self.BASE, {"insight_id": 245}))
+            return _resp(200, {"prisms": [self._prism("P1", 245)]})
+
+        with mock.patch.object(caf, "feed_settings", return_value=("", "tok")), \
+                mock.patch.object(caf.requests, "get", side_effect=grouped):
+            self.assertEqual(caf.write_fair_file(out, now=NOW, series_map=smap,
+                                                 vintage_path=vint), (1, 0))
 
     def test_fetch_sends_bearer_and_checks_shape(self):
         resp = mock.Mock()

@@ -13230,10 +13230,11 @@ class IncentiveMarketMaker:
             # Carbon Arc fair refresher (2026-09-26): the rain refresher's
             # contract -- every network call off the trading thread, the
             # quote loop reads only CA_FAIR_FILE. With no feed configured
-            # (IMM_CA_FEED_URL or ~/.carbonarc_feed.json, kept outside the
-            # public repo) nothing is written and the gate stays open; the
-            # settings are re-read every 10 minutes, so adding the feed
-            # needs no restart. Logs only when the outcome changes.
+            # (a Carbon Arc API token or a feed URL, in ~/.carbonarc_feed.json
+            # or IMM_CA_FEED_TOKEN / IMM_CA_FEED_URL -- never in the public
+            # repo) nothing is written and the gate stays open; the settings
+            # are re-read every 10 minutes, so adding the token needs no
+            # restart. Logs only when the outcome changes.
             def _ca_fair_refresh():
                 try:
                     import carbon_arc_fair
@@ -13244,7 +13245,7 @@ class IncentiveMarketMaker:
                 while True:
                     delay = max(30, CA_FAIR_REFRESH_SECS)
                     try:
-                        if not carbon_arc_fair.feed_settings()[0]:
+                        if not carbon_arc_fair.feed_configured():
                             if last != "off":
                                 log(f"{self.tag} ca-fair: no feed configured "
                                     f"-- gate open (plain quoting)")
