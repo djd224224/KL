@@ -3587,3 +3587,69 @@ one-shot write, logged-hours-only fills, the mark fallback chain, ASCII
 text part). Both test modules point the bot at a never-existing verdict
 name so no test reads the box's live file. 673 green (+87 in the other
 IMM suites).
+
+## 2026-09-26 pm — KXTRUMPAPPROVE allowlisted (out 07:00 ET on settlement day); hopeless clock 30 min on the live projection (Jack)
+
+KXTRUMPAPPROVE. Jack: "yes allowlist it, and stop it at 7:00 ET on
+settlement day". RCP "RCP Average" Approve value at exactly 1:00 PM ET,
+nine 0.1-point strikes, listed 10:01 ET the day before, $600/market per
+24h program (10:02 -> 10:02 ET). New politics group
+_DEFAULT_POLITICS_SERIES (env IMM_ALLOW_POLITICS_SERIES) plus
+SERIES_OVERRIDES["KXTRUMPAPPROVE"] event_day_cutoff_et=(7, 0) (env
+IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET / _MIN_ET). Occurrence 16:59Z sits one
+minute before the 17:00Z expected expiration, so the extender's 07:00 ET
+is the cutoff: 11:00Z in EDT, 12:00Z in EST. Basis, the public tape of 14
+daily events 9/13-9/26 (54k trades): 21 re-pricings between 07:00 and
+12:59 ET cost resting orders ~$10.5k on 51k contracts, takers leading the
+visible move by 3-6 minutes; the 7 overnight/evening re-pricings netted
+makers +$40.
+
+LIVE (config 19367f4e, first refresh 00:59Z 9/27): all nine 26SEP27
+strikes in the universe at $600/day and screened `manual`. The account
+holds a hand book in that event: 11 resting orders with no
+client_order_id (none in imm_order_journal / our_order_ids; every bot on
+the account tags its orders), positions E38.6 -200, E38.7 +95, E38.8
++137, $643 cost. Yield-to-human is event-level, so the bot quotes only
+KXTRUMPAPPROVE events with no manual footprint.
+
+HOPELESS CLOCK. Jack, on KXNFLFFPTSLADDER-26SEP27MINTB-MINKMURRAY1:
+"make the hopeless clock more consistent / faster. what about 30min
+checks instead of hourly?". HOPELESS_SUSTAIN_SECS 3600 -> 1800, and
+MEMBER_PEAK_GUARD (env IMM_MEMBER_PEAK_GUARD, default 0): a member is
+judged on banked + CURRENT remaining estimate, the test fresh candidates
+have had since 9/13, not max(current, 1h est peak). The peak re-seeded
+from the single reading on the first refresh after it expired, so one
+thin-book moment bought another hour. MURRAY1: admitted 21:32Z on a
+10-minute thin-book reading, peak to 22:42Z, re-seeded inside a 20-minute
+blip, clock started 23:43Z, evicted 00:51Z under the old rule; -135
+filled, $0.11 banked. 9/6-9/26: 1,826 admit -> hopeless rides, median
+2.8h, p25 2.07h (the structural 2h floor), 13% filled, 12,206 contracts.
+The exit now lands 30-40 minutes after the last above-bar live reading.
+_est_peak is still tracked and persisted; near-cliff is unchanged.
+
+LIVE: the new process's first refresh (started 00:59:08Z, finished
+01:09Z, slow on two transient ESPN SSL failures that fell back to
+midnight-ET) evicted 10 hopeless members (NFL ladders / escalators and
+one KXRT strike) already 30+ minutes under the bar. The members left on
+long clocks are exempt by design (KXRAIN curated tier, finecon
+KXCBD* / KXSPRLVL, forced KXFSLR-26OCTMWSOLD).
+
+KILL SWITCHES (launcher env, task-level restart): IMM_ALLOW_POLITICS_SERIES=""
+drops the allow; IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET / _MIN_ET move the
+cutoff; IMM_HOPELESS_SUSTAIN_SECS=3600 restores the hour;
+IMM_MEMBER_PEAK_GUARD=1 restores the member peak carry.
+
+WHAT THIS DOES NOT FIX / WATCH:
+- Admission on a one-refresh blip still happens: MURRAY1 was admitted on
+  a 10-minute thin-book reading and filled 90 lots 11 minutes later. A
+  two-consecutive-refresh entry test would stop that; suggested, not built.
+- KXTRUMPAPPROVE inventory taken overnight still rides through the
+  morning update to the 1:00 PM snapshot; quiet-hour size applies up to
+  07:00 (the overnight flow measured benign).
+- A hand book on an approval event keeps the bot out of that whole event.
+
+Tests: TestTrumpApproveAllowlist (allowed, exact series; cutoff 11:00Z
+EDT / 12:00Z EST; the series tighteners leave it);
+test_sustain_window_is_30_minutes_by_default;
+test_member_exit_runs_on_the_live_projection_not_the_peak; the three
+member-peak tests now pin the default AND the knob. 636 green at 7576bf9.
