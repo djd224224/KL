@@ -66,6 +66,9 @@ def setUpModule():
     # the Carbon Arc fair file (2026-09-26) is read by every run_cycle
     imm.CA_FAIR_FILE = os.path.join(tmp, "carbon_arc_fair.json")
     imm._ca_fair_state.update(mtime=0.0, entries={}, moved_at={})
+    # the OpenRouter token-usage fair file (2026-09-27), same reason
+    imm.OR_FAIR_FILE = os.path.join(tmp, "openrouter_fair.json")
+    imm._or_fair_state.update(mtime=0.0, entries={}, moved_at={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -7852,6 +7855,128 @@ class TestCarbonArcFairGate(unittest.TestCase):
         self.assertNotEqual(self._quotes(bot, other), [])
 
 
+class TestOpenRouterFairGate(unittest.TestCase):
+    """openrouter_fair.json -> load_or_fair/or_gate_reason -> the stand-aside
+    on KXTOKENUSE / KXTOKENUSEM (Jack 2026-09-27: "yes build the OpenRouter
+    token usage gate"). Unlike the Carbon Arc gate it fails CLOSED: these
+    series are allowed only because the feed exists. Fixture event
+    KXTOKENUSE-68DEC04 (far from any cutoff), strike T100."""
+
+    T = "KXTOKENUSE-68DEC04-T100"
+    EV = "KXTOKENUSE-68DEC04"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._or_fair_state.update(mtime=0.0, entries={}, moved_at={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.OR_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, mu=100.0, sigma=2.0, known=5, complete=False, age_secs=0.0):
+        fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
+        with open(imm.OR_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {self.EV: {
+                "mu": mu, "sigma": sigma, "known": known, "complete": complete,
+                "fetched_at": fetched}}}, f)
+        os.utime(imm.OR_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestOpenRouterFairGate._bump += 1
+        return imm.load_or_fair()
+
+    def _bot(self):
+        client = FakeClient()
+        now = datetime.now(timezone.utc)
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV,
+            "status": "active", "close_time": far,
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_allowlisted_capped_and_exact(self):
+        self.assertIn("KXTOKENUSE", imm.ALLOW_SERIES)
+        self.assertIn("KXTOKENUSEM", imm.ALLOW_SERIES)
+        self.assertEqual(imm.event_top_n_for("KXTOKENUSE"), 3)
+        self.assertEqual(imm.event_top_n_for("KXTOKENUSEM"), 3)
+        self.assertEqual(imm.event_top_n_for("KXTOKENUSED"), 0)   # exact names only
+        self.assertIn("KXTOKENUSE", imm.OR_FAIR_SERIES)
+
+    def test_reason_fail_closed_complete_hold_and_band(self):
+        now_ts = time.time()
+        self.assertEqual(imm.or_gate_reason(self.T, now_ts, 49, 51)[1]["reason"], "no_read")
+        self.assertEqual(self._write(mu=100.0), (1, 1))          # first load: no hold
+        self.assertEqual(imm.or_gate_reason(self.T, time.time(), 49, 51), ("", {}))
+        self.assertEqual(imm.or_gate_reason("KXTOKENUSE-68DEC04", time.time(), 49, 51)[1]["reason"],
+                         "no_read")                              # no strike segment
+        self.assertEqual(imm.or_gate_reason(
+            self.T, time.time() + imm.OR_FAIR_TTL_MIN * 60 + 5, 49, 51)[1]["reason"], "stale")
+        self._write(mu=100.0, known=6)                            # a new day published
+        self.assertEqual(imm.or_gate_reason(self.T, time.time(), 49, 51)[1]["reason"], "hold")
+        imm._or_fair_state["moved_at"][self.EV] -= 3600
+        self.assertEqual(imm.or_gate_reason(self.T, time.time(), 49, 51), ("", {}))
+        self._write(mu=98.95, known=6)                            # same day, lower read
+        why, inp = imm.or_gate_reason(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], inp["bid_bad"], inp["ask_bad"]), ("band", True, False))
+        self._write(mu=150.0, sigma=0.0, known=7, complete=True)
+        self.assertEqual(imm.or_gate_reason(self.T, time.time(), 99, 100)[1]["reason"], "complete")
+
+    def test_quotes_on_an_agreeing_read_and_stands_aside_without_one(self):
+        bot = self._bot()
+        bot.run_cycle()                                           # no file: closed
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._or_fair_stood)
+        self._write(mu=100.0)                                     # first load: no hold
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._or_fair_stood)
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertIn(("ask", 51), q)
+        self._write(mu=98.95)                                     # bid 49 > 30 + 15
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._or_fair_stood)
+        self.assertIn(self.T, bot.state.selected)                 # sticky
+
+    def test_complete_window_and_stale_read_stand_aside(self):
+        self._write(mu=100.2, sigma=0.0, known=7, complete=True)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        imm._or_fair_state.update(mtime=0.0, entries={}, moved_at={})
+        self._write(mu=100.0, age_secs=imm.OR_FAIR_TTL_MIN * 60 + 60)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+
+    def test_gate_off_quotes_plainly(self):
+        with mock.patch.object(imm, "OR_FAIR_ENABLE", False):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertNotEqual(self._quotes(bot), [])
+
+
 class TestPayoutFloorAccounting(unittest.TestCase):
     """The exchange pays NOTHING for a market whose program-period payout
     lands under $1.00 (2026-08-04 statement: 2,720 LIQUIDITY credits, minimum
@@ -13663,8 +13788,9 @@ class TestGuardSkipSink(unittest.TestCase):
                         if src[j].strip())
             if not prev.startswith("self._gskip("):
                 bare.append(prev)
-        # 24 = 23 + the Carbon Arc fair gate (2026-09-26)
-        self.assertEqual(len(conts), 24)
+        # 25 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
+        # token-usage gate (2026-09-27)
+        self.assertEqual(len(conts), 25)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

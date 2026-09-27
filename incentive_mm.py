@@ -1866,7 +1866,13 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 # the Oscars are a prefix
                                                 # FAMILY (KXOSCAR<CATEGORY>)
                                                 "=KXGGNOM:3,=KXNATBOOKAWARDS:3,"
-                                                "=KXGRAMMY:3,=KXVMA:3,KXOSCAR:3"
+                                                "=KXGRAMMY:3,=KXVMA:3,KXOSCAR:3,"
+                                                # OpenRouter token usage
+                                                # (2026-09-27): every strike
+                                                # settles on one total; exact
+                                                # names (KXTOKENUSE prefixes
+                                                # KXTOKENUSEM / KXTOKENUSED)
+                                                "=KXTOKENUSE:3,=KXTOKENUSEM:3"
                                                 + _RAMP_EVENT_TOP_N_SPEC))
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
@@ -3104,6 +3110,18 @@ _DEFAULT_SPORTS_SERIES = "KXMLBPLAYOFFS,KXMLBSEASONGAMES"
 # keeps ~21 of each program's 24 hours. IMM_ALLOW_POLITICS_SERIES=""
 # removes it.
 _DEFAULT_POLITICS_SERIES = "KXTRUMPAPPROVE"
+# AI USAGE (Jack 2026-09-27: "yes build the OpenRouter token usage gate").
+# KXTOKENUSE ("OpenRouter total token usage for Sep 21-27 above 164T") and
+# KXTOKENUSEM (the same over a 4-week "month") settle on OpenRouter's
+# rankings summed over UTC days -- a live public feed, so the open-scan
+# tier rejects them on the `openrouter` keyword. This normal-book entry is
+# the exception, made because OpenRouter publishes the settling data
+# itself (official Data API, CC BY 4.0, reproduces all five settled weeks
+# to the rounding) and the OR fair gate (OR_FAIR_*) quotes them only
+# against it: fail CLOSED without a fresh read, out once the window's last
+# day is published (~4h before the 03:59Z close), a hold after each new
+# day. IMM_ALLOW_AI_USAGE_SERIES="" removes them.
+_DEFAULT_AI_USAGE_SERIES = "KXTOKENUSE,KXTOKENUSEM"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -3279,6 +3297,8 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_SPORTS_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_POLITICS_SERIES",
                                        _DEFAULT_POLITICS_SERIES)
+                + "," + os.environ.get("IMM_ALLOW_AI_USAGE_SERIES",
+                                       _DEFAULT_AI_USAGE_SERIES)
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -5193,6 +5213,10 @@ _CONFIG_CODE_KNOBS = (
     # carbon_arc_fair.py and ride along in the fair file's "model" block
     "CA_FAIR_ENABLE", "CA_FAIR_TOL_CENTS", "CA_FAIR_TTL_MIN",
     "CA_FAIR_SIGMA_LO_FRAC", "CA_FAIR_MAX_REL_SIGMA", "CA_FAIR_REFRESH_HOLD_MIN",
+    # OpenRouter token-usage gate (2026-09-27); model knobs ride in the
+    # fair file's "model" block (openrouter_fair.py)
+    "OR_FAIR_ENABLE", "OR_FAIR_SERIES", "OR_FAIR_TOL_CENTS", "OR_FAIR_TTL_MIN",
+    "OR_FAIR_SIGMA_LO_FRAC", "OR_FAIR_REFRESH_HOLD_MIN",
 )
 
 
@@ -5928,6 +5952,126 @@ def fair_gate_breach(ext_bid: Optional[float], ext_ask: Optional[float],
     hi = fair_lo_c if fair_hi_c is None else fair_hi_c
     return (ext_bid is not None and ext_bid > hi + tol,
             ext_ask is not None and ext_ask < fair_lo_c - tol)
+
+
+# ----------------------------------------------------------------------------
+# OPENROUTER TOKEN-USAGE FAIR GATE (Jack 2026-09-27: "yes build the OpenRouter
+# token usage gate"). openrouter_fair.py reads OpenRouter's official Data API
+# (daily token totals, the exact quantity KXTOKENUSE / KXTOKENUSEM settle on
+# -- verified against all five settled weeks) and writes OR_FAIR_FILE: per
+# EVENT, N(mu, sigma) in T for the window's total with sigma MEASURED by a
+# 31-week backtest, and `complete` once every day of the window is
+# published. The Carbon Arc gate's shape with one inversion: these series
+# are allowed at all ONLY because the feed exists (_DEFAULT_AI_USAGE_SERIES),
+# so the gate fails CLOSED -- no fresh entry, no quote. A market stands
+# aside on BOTH sides while
+#   - its event has no fresh read (missing file, stale past OR_FAIR_TTL_MIN,
+#     no key, unparseable window),
+#   - the window is complete (the final day lands after 00:00Z Monday, ~4h
+#     before the 03:59Z close: everyone with the API knows the answer),
+#   - its read moved within OR_FAIR_REFRESH_HOLD_MIN (a new day published;
+#     not on the first load after a restart),
+#   - its external touch fights the fair band (P at sigma and at sigma x
+#     OR_FAIR_SIGMA_LO_FRAC) on the adverse side by more than
+#     OR_FAIR_TOL_CENTS.
+# Kill switch IMM_OR_FAIR_ENABLE=0 turns the GATE off (plain quoting);
+# IMM_ALLOW_AI_USAGE_SERIES="" takes the series out instead.
+OR_FAIR_ENABLE = os.environ.get("IMM_OR_FAIR_ENABLE", "1") == "1"
+OR_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_OR_FAIR_SERIES", "KXTOKENUSE,KXTOKENUSEM").split(",") if s.strip())
+OR_FAIR_TOL_CENTS = _env_int("IMM_OR_FAIR_TOL_CENTS", 15)
+OR_FAIR_TTL_MIN = _env_int("IMM_OR_FAIR_TTL_MIN", 60)
+OR_FAIR_REFRESH_SECS = _env_int("IMM_OR_FAIR_REFRESH_SECS", 600)
+# faster polling just after 00:00Z, when the previous day is published
+# (500 requests/day per OpenRouter account; ~170/day at these settings)
+OR_FAIR_FAST_SECS = _env_int("IMM_OR_FAIR_FAST_SECS", 120)
+OR_FAIR_FAST_WINDOW_MIN = _env_int("IMM_OR_FAIR_FAST_WINDOW_MIN", 45)
+OR_FAIR_SIGMA_LO_FRAC = _env_float("IMM_OR_FAIR_SIGMA_LO_FRAC", 0.5)
+OR_FAIR_REFRESH_HOLD_MIN = _env_float("IMM_OR_FAIR_REFRESH_HOLD_MIN", 10)
+OR_FAIR_FILE = os.environ.get(
+    "IMM_OR_FAIR_FILE", os.path.join(STATUS_DIR, "openrouter_fair.json"))
+# event -> entry; event -> epoch its read last moved (refresh hold)
+_or_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}}
+
+
+def load_or_fair() -> Tuple[int, int]:
+    """Hot-reload OR_FAIR_FILE by mtime into _or_fair_state. Returns (events
+    loaded, events whose read moved) on a reload, else (0, 0). A move
+    starts that event's refresh hold, except on the first load."""
+    try:
+        mtime = os.path.getmtime(OR_FAIR_FILE)
+    except OSError:
+        return 0, 0
+    if mtime == _or_fair_state["mtime"]:
+        return 0, 0
+    _or_fair_state["mtime"] = mtime
+    try:
+        with open(OR_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! openrouter fair file unreadable: {e}")
+        return 0, 0
+    old = _or_fair_state["entries"]
+    fresh: Dict[str, dict] = {}
+    for ev, e in (data.get("entries") or {}).items():
+        try:
+            ts = parse_iso_utc(str(e["fetched_at"]))
+            mu, sigma = float(e["mu"]), float(e["sigma"])
+            known, complete = int(e["known"]), bool(e["complete"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or not (math.isfinite(mu) and math.isfinite(sigma)) \
+                or sigma < 0:
+            continue
+        fresh[str(ev)] = {"mu": mu, "sigma": sigma, "known": known,
+                          "complete": complete, "ts": ts.timestamp()}
+    moved = [ev for ev, e in fresh.items()
+             if (old.get(ev) or {}).get("known") != e["known"]
+             or (old.get(ev) or {}).get("complete") != e["complete"]]
+    if old:
+        now_ts = time.time()
+        for ev in moved:
+            _or_fair_state["moved_at"][ev] = now_ts
+    _or_fair_state["entries"] = fresh
+    return len(fresh), len(moved)
+
+
+def or_gate_reason(ticker: str, now_ts: float,
+                   ext_bid: Optional[float], ext_ask: Optional[float]
+                   ) -> Tuple[str, dict]:
+    """('' , {}) when an OpenRouter token-usage market may quote, else
+    (reason, guard-skip inputs). Fails CLOSED on a missing / stale read."""
+    ev = ticker.rsplit("-", 1)[0]
+    m = _CA_STRIKE_RE.search(ticker)
+    e = _or_fair_state["entries"].get(ev)
+    if m is None or e is None:
+        return "no OpenRouter read for this event", {"reason": "no_read"}
+    if now_ts - e["ts"] > OR_FAIR_TTL_MIN * 60:
+        return "OpenRouter read is stale", {"reason": "stale"}
+    if e["complete"]:
+        return ("window complete, every day published",
+                {"reason": "complete", "mu": e["mu"]})
+    moved = _or_fair_state["moved_at"].get(ev)
+    if OR_FAIR_REFRESH_HOLD_MIN > 0 and moved is not None \
+            and now_ts - moved <= OR_FAIR_REFRESH_HOLD_MIN * 60:
+        return (f"new OpenRouter day, holding {OR_FAIR_REFRESH_HOLD_MIN:g}m "
+                f"while the book reprices", {"reason": "hold"})
+    k = float(m.group(1))
+    pc = _p_above(k, e["mu"], max(1e-9, e["sigma"]))
+    pt = _p_above(k, e["mu"], max(1e-9, e["sigma"] * OR_FAIR_SIGMA_LO_FRAC))
+    lo, hi = min(pc, pt), max(pc, pt)
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo * 100.0,
+                                        OR_FAIR_TOL_CENTS, hi * 100.0)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {pc * 100:.0f}c "
+                f"[{lo * 100:.0f}-{hi * 100:.0f}] (tol {OR_FAIR_TOL_CENTS}c, "
+                f"{'bid' if bid_bad else 'ask'} side; total ~{e['mu']:.1f}T "
+                f"+-{e['sigma']:.1f})",
+                {"reason": "band", "fair": round(pc * 100, 2),
+                 "lo": round(lo * 100, 2), "hi": round(hi * 100, 2),
+                 "tol": OR_FAIR_TOL_CENTS, "bid_bad": bid_bad,
+                 "ask_bad": ask_bad})
+    return "", {}
 
 
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
@@ -7895,6 +8039,7 @@ class IncentiveMarketMaker:
         self._loaded_credit: Set[str] = set()
         self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
         self._ca_fair_stood: Set[str] = set()     # Carbon Arc fair stand-asides
+        self._or_fair_stood: Set[str] = set()     # OpenRouter token-usage stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
@@ -9434,6 +9579,10 @@ class IncentiveMarketMaker:
         if _ca_moved:
             log(f"{self.tag} ca-fair reloaded: {_ca_n} series, "
                 f"{_ca_moved} with a new read")
+        _or_n, _or_moved = load_or_fair()
+        if _or_moved:
+            log(f"{self.tag} or-fair reloaded: {_or_n} events, "
+                f"{_or_moved} with a new day")
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
         # refresh reliably fires before Kalshi publishes now that keep-alive
@@ -12308,6 +12457,22 @@ class IncentiveMarketMaker:
                 self._ca_fair_stood.discard(t)
                 log(f"{self.tag} ca-fair resume {t}")
 
+            # OPENROUTER TOKEN-USAGE GATE (Jack 2026-09-27, see OR_FAIR_ENABLE):
+            # the same stand-aside on OpenRouter's own daily totals, failing
+            # CLOSED -- these series are quoted only against the feed.
+            if OR_FAIR_ENABLE and meta.series in OR_FAIR_SERIES:
+                or_why, or_in = or_gate_reason(t, now_ts, ext_bid, ext_ask)
+                if or_why:
+                    if t not in self._or_fair_stood:
+                        self._or_fair_stood.add(t)
+                        log(f"{self.tag} or-fair stand-aside {t}: {or_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "or_fair", lambda: or_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._or_fair_stood:
+                self._or_fair_stood.discard(t)
+                log(f"{self.tag} or-fair resume {t}")
+
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go
             # silent. Without this, a restored rain position kept reduce-only
@@ -13266,6 +13431,45 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_ca_fair_refresh, daemon=True,
                              name="ca-fair").start()
+        if OR_FAIR_ENABLE and not once:
+            # OpenRouter token-usage refresher (2026-09-27): the Carbon Arc
+            # refresher's contract. Polls every OR_FAIR_REFRESH_SECS, and
+            # every OR_FAIR_FAST_SECS for OR_FAIR_FAST_WINDOW_MIN after
+            # 00:00Z, when OpenRouter publishes the day just ended. No key
+            # (~/.openrouter_key.json or IMM_OR_API_KEY) = nothing written,
+            # so the token series stay stood aside (the gate fails closed).
+            def _or_fair_refresh():
+                try:
+                    import openrouter_fair
+                except Exception as e:
+                    log(f"{self.tag} ! or-fair refresher disabled: {e}")
+                    return
+                last = None
+                while True:
+                    now_u = datetime.now(timezone.utc)
+                    fast = (now_u.hour * 60 + now_u.minute) < OR_FAIR_FAST_WINDOW_MIN
+                    delay = max(30, OR_FAIR_FAST_SECS if fast else OR_FAIR_REFRESH_SECS)
+                    try:
+                        if not openrouter_fair.api_key():
+                            if last != "off":
+                                log(f"{self.tag} or-fair: no OpenRouter key "
+                                    f"-- token-usage series stand aside")
+                            last, delay = "off", 600
+                        else:
+                            ok, miss = openrouter_fair.write_fair_file(OR_FAIR_FILE)
+                            if last != (ok, miss):
+                                log(f"{self.tag} or-fair refresh: {ok} events "
+                                    f"with a read"
+                                    + (f", {miss} without one" if miss else ""))
+                            last = (ok, miss)
+                    except Exception as e:
+                        if last != "err":
+                            log(f"{self.tag} ! or-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = "err"
+                    time.sleep(delay)
+            threading.Thread(target=_or_fair_refresh, daemon=True,
+                             name="or-fair").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
@@ -13276,6 +13480,13 @@ class IncentiveMarketMaker:
                 f"max sigma {CA_FAIR_MAX_REL_SIGMA:g} of mu, refresh hold "
                 f"{CA_FAIR_REFRESH_HOLD_MIN:g}m, ttl {CA_FAIR_TTL_MIN}m, "
                 f"refresh {CA_FAIR_REFRESH_SECS}s, file {CA_FAIR_FILE}")
+        if OR_FAIR_ENABLE:
+            log(f"or-fair gate: {','.join(sorted(OR_FAIR_SERIES))} fail-closed "
+                f"at-touch, tol {OR_FAIR_TOL_CENTS}c, band sigma "
+                f"x{OR_FAIR_SIGMA_LO_FRAC:g}-1, refresh hold "
+                f"{OR_FAIR_REFRESH_HOLD_MIN:g}m, ttl {OR_FAIR_TTL_MIN}m, refresh "
+                f"{OR_FAIR_REFRESH_SECS}s ({OR_FAIR_FAST_SECS}s for "
+                f"{OR_FAIR_FAST_WINDOW_MIN}m after 00:00Z), file {OR_FAIR_FILE}")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
             f"earnings x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT:g}), "

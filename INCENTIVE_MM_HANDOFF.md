@@ -3798,3 +3798,85 @@ update -- up to 450 contracts per strike, 3,000 net per event.
 Tests: test_x3_family_size_like_the_ladders (mult 3.0; caps x3; day
 ladder and weekday ladder exactly x3; band / entry bar not copied;
 cutoff kept). 694 green.
+
+## 2026-09-27 — OpenRouter token-usage gate: KXTOKENUSE / KXTOKENUSEM allowlisted, quoted only against OpenRouter's own daily totals (Jack)
+
+Jack: "yes build the OpenRouter token usage gate".
+
+WHY THIS FAMILY. KXTOKENUSE ("OpenRouter total token usage for Sep 21-27 above
+164T") and KXTOKENUSEM (the same over a 4-week "month": "September 2026
+(measured August 31 - September 27)") settle on OpenRouter's rankings summed
+over UTC days, read 10:00 AM ET the Monday after. That is a live public feed,
+so the open-scan tier rejects them on the `openrouter` keyword. But OpenRouter
+publishes the settling data itself: the official Data API
+(openrouter.ai/docs/cookbook/administration/data-api, CC BY 4.0, commercial
+use with attribution, any OpenRouter key, 30 req/min + 500 req/day), endpoint
+/api/v1/datasets/rankings-daily = 51 rows per COMPLETED UTC day (top 50 +
+"other"). The Monday-Sunday sums reproduce all five settled weeks:
+93.38 -> 93.4T, 113.00 -> 113, 115.46 -> 115T, 126.76 -> 127T, 128.90 -> 129T.
+Pool ~$15k/30d at $200/strike/week; the books are thin and wide (T144 38x92).
+
+MODEL (openrouter_fair.py, new). Per event window: mu = known days + each
+remaining day at base x weekday factor x half the recent weekly growth, plus
+a measured bias; sigma = 1.2 x measured RMSE. base = mean of the last 7
+completed days; weekday factor = trailing 4 weeks; growth = last 7 / prior 7
+(clipped -10%..+20%) at weight 0.5. RMSE / BIAS in units of one day's volume,
+MEASURED by a backtest over 2026-02..09 (63 week + 30 four-week windows): one
+day left 0.09 / +0.05, seven left 0.82 / +0.31, twenty-eight left 7.07 / +3.52
+(usage has been growing, so the plain forecast runs low; the full-trend
+variant overshot). Event windows are parsed from the open markets' own rules
+text on Kalshi's public API (the "month" is NOT a calendar month); a weekly
+event whose text does not parse falls back to the 7 days before its ticker
+date, a monthly one gets no entry. Writes run-logs/incentive-mm/
+openrouter_fair.json per EVENT (mu, sigma in T, known / days, complete) and
+appends each newly published day to openrouter_vintages.jsonl. Dry run 9/27
+05Z: week of Sep 21 at 6/7 days -> mu 144.5T sigma 2.3 (book T144 38x92,
+T146 14x45); the Aug 31-Sep 27 month -> 515.7T (book T500 84 bid, T525 no bid).
+
+ALLOWLIST + CAP. _DEFAULT_AI_USAGE_SERIES = "KXTOKENUSE,KXTOKENUSEM" joins
+ALLOW_SERIES (IMM_ALLOW_AI_USAGE_SERIES="" removes it); EVENT_TOP_N gains
+=KXTOKENUSE:3,=KXTOKENUSEM:3 (exact names: KXTOKENUSE prefixes KXTOKENUSEM
+and KXTOKENUSED) -- every strike of an event settles on one total, the same
+3-highest-ROI rule as the other one-number families.
+
+GATE (the Carbon Arc gate's shape, but fail CLOSED -- these series are
+allowed only because the feed exists). A KXTOKENUSE/KXTOKENUSEM market stands
+aside on BOTH sides while: its event has no fresh read (no file, no key,
+older than IMM_OR_FAIR_TTL_MIN 60, unparseable window); the window is
+complete (the last day is published just after 00:00Z Monday, ~4h before the
+03:59Z close -- everyone with the API knows the answer); its read moved
+within IMM_OR_FAIR_REFRESH_HOLD_MIN (10) minutes (a new day published; not
+on the first load); or its external touch fights the fair band (P at sigma
+and at sigma x 0.5) on the adverse side by more than IMM_OR_FAIR_TOL_CENTS
+(15). Quotes still join the touch unchanged. Logs "or-fair stand-aside <t>:
+<why>" / "or-fair resume <t>" once per episode, "or-fair refresh: N events
+with a read" when that changes, guard "or_fair" in guard_skips_*.jsonl
+(the sweep test now counts 25 continues). The refresher thread polls every
+IMM_OR_FAIR_REFRESH_SECS (600) and every IMM_OR_FAIR_FAST_SECS (120) for
+IMM_OR_FAIR_FAST_WINDOW_MIN (45) after 00:00Z, ~170 of the 500 daily
+requests.
+
+KEY. ~/.openrouter_key.json {"key": "sk-or-..."} (or IMM_OR_API_KEY), outside
+the public repo, read at call time (no restart to add it); never logged; the
+config snapshot redacts env names containing KEY. No key = the family stands
+aside.
+
+KILL SWITCHES: IMM_ALLOW_AI_USAGE_SERIES="" (take the series out);
+IMM_OR_FAIR_ENABLE=0 turns the gate OFF (plain quoting -- only for testing).
+
+WHAT THIS DOES NOT FIX / WATCH:
+- The current UTC day is invisible to the API until it completes; anyone with
+  intraday numbers (the site's live chart) still sees the last day forming.
+- The bias table is a growth era's; if usage growth stalls, mu runs high --
+  recheck against openrouter_vintages.jsonl and the settlements.
+- Rounding: Kalshi compares against the displayed total (e.g. "129T"); a
+  total within 0.5T of a strike can round across it. sigma covers it except
+  on the final day, when the gate is already out (complete).
+
+Tests: TestOpenRouterFairGate (allowlist + exact caps, fail-closed / stale /
+complete / hold / band reasons, quote-then-stand-aside end to end, complete
+and stale stand aside, gate-off plain quoting) and test_openrouter_fair.py
+(window parsing incl. en dash, cross-month and year boundary, ticker-date
+fallback, flat / complete / thin-history / growth model cases, file +
+vintage writes, no-key, key sources incl. a Notepad BOM, Bearer fetch).
+840 green.
