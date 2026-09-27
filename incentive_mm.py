@@ -4559,10 +4559,22 @@ for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
 # size multiplier (00:00-09:00 ET) applies right up to 07:00 -- the
 # overnight flow measured benign. IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET /
 # IMM_TRUMPAPPROVE_CUTOFF_MIN_ET move it.
+# x3 FAMILY SIZE (Jack 2026-09-26 pm: "give KXTRUMPAPPROVE markets a 3x
+# multiplier, like LADDER/ESCALATOR"): the ladders' size_mult wire --
+# applied_mention_mult scales the rungs, the per-market and per-event caps
+# and the skew knees together, and the estimator's hypothetical ladder, so
+# the payout-floor projection sees the x3 size. With the launcher geometry
+# (20-lot rung, 150 / 1,000 caps): 60 on a weekday, 90 Saturday, 120 in
+# quiet hours up to the 07:00 cutoff, 180 when the settlement day is a
+# Saturday (00:00-07:00 ET = Saturday x quiet hours; checked with the
+# launcher env); caps 450 per market / 3,000 net per event. Only the size
+# -- not the ladders' 1-99c band or $1.20 entry bar.
+# IMM_TRUMPAPPROVE_SIZE_MULT=1.0 reverts.
 SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
     event_day_cutoff_et=(
         _env_int("IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET", 7),
-        _env_int("IMM_TRUMPAPPROVE_CUTOFF_MIN_ET", 0)))
+        _env_int("IMM_TRUMPAPPROVE_CUTOFF_MIN_ET", 0)),
+    size_mult=_env_float("IMM_TRUMPAPPROVE_SIZE_MULT", 3.0))
 
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market

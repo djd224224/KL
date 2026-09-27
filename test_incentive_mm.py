@@ -1641,6 +1641,31 @@ class TestTrumpApproveAllowlist(unittest.TestCase):
             imm.trade_cutoff_utc("KXTRUMPAPPROVE-26DEC15", occ, exp),
             datetime(2026, 12, 15, 12, 0, tzinfo=timezone.utc))
 
+    def test_x3_family_size_like_the_ladders(self):
+        # Jack 2026-09-26 pm: "give KXTRUMPAPPROVE markets a 3x multiplier,
+        # like LADDER/ESCALATOR" -- the same size_mult wire, so rungs, both
+        # caps and the floor projection's day ladder scale together
+        S = "KXTRUMPAPPROVE"
+        self.assertEqual(imm.SERIES_OVERRIDES[S].size_mult, 3.0)
+        self.assertEqual(imm.applied_mention_mult(S), 3.0)
+        self.assertEqual(imm.series_max_position(S),
+                         3 * imm.MAX_POSITION_CONTRACTS)
+        self.assertEqual(imm.event_cap_contracts("KXTRUMPAPPROVE-26SEP28"),
+                         3 * imm.MAX_EVENT_CONTRACTS)
+        base = imm.series_levels(S)
+        self.assertEqual(imm.base_scaled_levels(S),
+                         [(t, max(1, int(s * 3 + 0.5))) for t, s in base])
+        # a weekday afternoon (no hour / Saturday multiplier): exactly x3
+        wk = datetime(2026, 9, 28, 18, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.hour_size_mult(S, wk), 1.0)
+        self.assertEqual(imm.hour_scaled_levels(S, wk),
+                         [(t, max(1, int(s * 3 + 0.5))) for t, s in base])
+        # only the size: the ladders' band and entry bar are NOT copied
+        ov = imm.SERIES_OVERRIDES[S]
+        self.assertIsNone(ov.price_min_cents)
+        self.assertIsNone(ov.min_est_total)
+        self.assertEqual(ov.event_day_cutoff_et, (7, 0))
+
 
 class TestRampAIIndexAllowlist(unittest.TestCase):
     """Jack 2026-09-12: "allowlist the Ramp AI Index events into the IMM
