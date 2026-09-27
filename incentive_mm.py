@@ -2157,6 +2157,14 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     # the close-anchored override are all KEPT so a later un-block is one
     # line — this entry wins over all of them.
     + ["KXTRUEV"]
+    # KXMLBPLAYOFFS-26 (Jack 2026-09-26: "blocklist KXMLBPLAYOFFS-26"). An
+    # EVENT-ticker prefix, not the series: startswith freezes every
+    # KXMLBPLAYOFFS-26-<TEAM> market and the event itself, while the
+    # "KXMLBPLAYOFFS-X" family probe and the series name (auto-enroll
+    # checks) do not match, so the series allowlist entry stays live for a
+    # 2027 listing. Standard semantics: no new orders, resting quotes
+    # cancelled next cycle, NOT reduce-only, positions ride to settlement.
+    + ["KXMLBPLAYOFFS-26"]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 

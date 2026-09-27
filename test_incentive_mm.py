@@ -1487,7 +1487,9 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
 
     def test_the_three_series_are_allowed_and_not_blocked(self):
         a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
-        for t in ("KXMLBPLAYOFFS-26-NYY", "KXMLBPLAYOFFS-26-ATH",
+        # KXMLBPLAYOFFS-26 itself is event-blocklisted since 9/26 (see
+        # test_mlbplayoffs_26_event_blocked); the series stays allowed
+        for t in ("KXMLBPLAYOFFS-27-NYY", "KXMLBPLAYOFFS-27-ATH",
                   "KXMLBSEASONGAMES-27-2425",
                   "KXVENUEPERFORM-REDROCKS28JAN01-ODE",
                   "KXCMA-NAOTY26-TWET", "KXCMA-MEOTY26-TIE",
@@ -1496,6 +1498,19 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
             self.assertTrue(a(t), t)
         for s in self.SERIES:
             self.assertIn(s, imm.ALLOW_SERIES, s)
+
+    def test_mlbplayoffs_26_event_blocked(self):
+        # Jack 2026-09-26: "blocklist KXMLBPLAYOFFS-26". Every market of
+        # the 2026 event and the event ticker are frozen; the series (the
+        # "-X" family probe) and any other season stay allowed.
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        for t in ("KXMLBPLAYOFFS-26-NYY", "KXMLBPLAYOFFS-26-TEX",
+                  "KXMLBPLAYOFFS-26"):
+            self.assertTrue(b(t), t)
+            self.assertFalse(a(t), t)
+        for t in ("KXMLBPLAYOFFS-X", "KXMLBPLAYOFFS-27-NYY"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
 
     def test_exact_series_only_no_mlb_prefix_bleed(self):
         # KXMLBMENTION is mlb_trading.py's book and must stay frozen; no
