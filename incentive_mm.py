@@ -65,6 +65,7 @@ import json
 import math
 import os
 import fnmatch
+import gzip
 import re
 import signal
 import smtplib
@@ -4889,6 +4890,31 @@ STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
 HALT_FILE = os.path.join(STATUS_DIR, "HALT")
 
+# FULL-DEPTH BOOK LOG (2026-09-26). Kalshi scores rent level by level against
+# the full resting book and serves NO historical orderbook, so any book not
+# recorded now is gone for good. The bot already reads every book it needs
+# (candidates in _estimate_candidate_yield, managed markets in run_cycle) and
+# used to keep only per-side TOTALS (cycle_log yes_depth/no_depth), which
+# replays our own accrual but cannot re-score any alternative ladder, size,
+# depth curve or sub-penny snap. Rows keep the RAW orderbook_fp arrays --
+# orderbook_levels floors to the cent and merges levels, so it is lossy -- plus
+# our own resting size per exact level, so competitor depth = level - own.
+# Analytics only: never raises, never changes a decision, O(1) in the hot loop
+# (a reference to the response), serialised and flushed once per cycle from
+# run() AFTER placements. IMM_BOOK_LOG=0 (or IMM_ANALYTICS=0) turns it off;
+# IMM_BOOK_LOG_CANDIDATES=0 keeps managed books only.
+BOOK_LOG_ON = os.environ.get("IMM_BOOK_LOG", "1") == "1"
+BOOK_LOG_CANDIDATES = os.environ.get("IMM_BOOK_LOG_CANDIDATES", "1") == "1"
+BOOK_LOG_GZ_LEVEL = _env_int("IMM_BOOK_LOG_GZ_LEVEL", 6)
+BOOK_LOG_MAX_BUFFER = _env_int("IMM_BOOK_LOG_MAX_BUFFER", 20000)
+
+
+def book_log_dir() -> str:
+    """Resolved at WRITE time, not import: tests re-point STATUS_DIR after
+    import, and resolving early would write test books into the live tree."""
+    return (os.environ.get("IMM_BOOK_LOG_DIR")
+            or os.path.join(STATUS_DIR, "book_depth"))
+
 # Self-restart on code change (Jack 2026-08-24 "restart for me at that time",
 # generalized after the ps1 dispatch chain proved unobservable): sync-kl-main
 # fast-forwards the repo every 30 min, but nothing reliably bounced the bot
@@ -7497,6 +7523,12 @@ class IncentiveMarketMaker:
         self._selection_prev: Dict[str, str] = {}   # ticker -> last decision
         self._selection_snap_at = 0.0              # hourly full-candidate dump
         self._inventory_snap_day = ""              # daily open-book snapshot
+        # ---- full-depth book log (see BOOK_LOG_ON) ----
+        self._book_buf: List[tuple] = []           # rows pending flush
+        self._book_fail = 0                        # consecutive failed flushes
+        self._book_part = 0                        # bumped after a failed write
+        self._book_cycle_ts = ""                   # joins cycle_log.ts
+        self._book_own_ledger: Dict[str, List[Tuple[str, float, float]]] = {}
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -7550,6 +7582,105 @@ class IncentiveMarketMaker:
                 self._sink_muted.add(name)
                 log(f"{self.tag} ! analytics sink '{name}' failed ({e}); "
                     f"muted for the rest of this run")
+
+    def _book_log_add(self, ticker: str, source: str, ob, own_exact,
+                      meta=None, fast: bool = False) -> None:
+        """Queue one book for the full-depth log. O(1): keeps a REFERENCE to
+        the raw response; serialisation happens in _book_log_flush, off the
+        placement path. Never raises."""
+        if not (self.ANALYTICS_ON and BOOK_LOG_ON) or not isinstance(ob, dict):
+            return
+        try:
+            if len(self._book_buf) >= BOOK_LOG_MAX_BUFFER:
+                # A stuck disk must not grow memory without bound: drop the
+                # oldest half (the flush is failing anyway; it will say so).
+                del self._book_buf[:len(self._book_buf) // 2]
+            self._book_buf.append((
+                time.time(), self._book_cycle_ts, ticker, source, bool(fast), ob,
+                list(own_exact or ()),
+                getattr(meta, "target_size", None),
+                getattr(meta, "discount_factor", None),
+                getattr(meta, "dollars_per_day", None)))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _book_row(rec) -> Optional[str]:
+        """One queued book -> one compact JSON line, or None. Prices stay in
+        the unit Kalshi sent them (orderbook_fp: dollars, sub-penny exact);
+        `unit` says which. Our own size is keyed by exact YES cents on the yes
+        side and by NO cents (100 - YES) on the no side, matching the book."""
+        try:
+            ts, cyc, t, src, fast, ob, own, tgt, disc, pool = rec
+            fp = ob.get("orderbook_fp")
+            if fp is not None:
+                yes = fp.get("yes_dollars") or []
+                no = fp.get("no_dollars") or []
+                unit = "dollars"
+            else:                                   # legacy integer-cent shape
+                lg = ob.get("orderbook") or {}
+                yes, no, unit = lg.get("yes") or [], lg.get("no") or [], "cents"
+            oy: Dict[float, float] = {}
+            on: Dict[float, float] = {}
+            for bs, px, rem in own:                 # (book_side, yes_cents, remaining)
+                if bs == "bid":
+                    k = round(float(px), 4)
+                    oy[k] = oy.get(k, 0.0) + float(rem)
+                else:                               # our ask is a NO bid at 100 - yes
+                    k = round(100.0 - float(px), 4)
+                    on[k] = on.get(k, 0.0) + float(rem)
+            return json.dumps({
+                "ts": round(ts, 3), "cycle_ts": cyc, "ticker": t, "source": src,
+                "fast": fast, "unit": unit, "yes": yes, "no": no,
+                "own_yes_cents": sorted([k, v] for k, v in oy.items()),
+                "own_no_cents": sorted([k, v] for k, v in on.items()),
+                "target": tgt, "discount": disc, "pool_per_day": pool,
+                "run_id": RUN_ID, "config_hash": CONFIG_HASH,
+            }, separators=(",", ":"), default=str)
+        except Exception:
+            return None                              # one bad row never kills a flush
+
+    def _book_log_flush(self) -> None:
+        """Write queued books: one complete gzip member per UTC day per flush,
+        appended to a per-run file book_depth/book_depth_<day>_<RUN_ID>.jsonl.gz.
+        Concatenated gzip members are valid gzip. A hard kill can only truncate
+        THIS run's tail member, and a failed write moves to a fresh part file,
+        so a partial member is never followed by good data. Never raises; mutes
+        itself after 5 consecutive failures."""
+        if not self._book_buf:
+            return
+        if "book_depth" in self._sink_muted:
+            self._book_buf = []
+            return
+        buf = self._book_buf
+        try:
+            by_day: Dict[str, List[str]] = {}
+            for rec in buf:
+                line = self._book_row(rec)
+                if line is not None:
+                    d = time.strftime("%Y-%m-%d", time.gmtime(rec[0]))
+                    by_day.setdefault(d, []).append(line)
+            dirp = book_log_dir()
+            os.makedirs(dirp, exist_ok=True)
+            sfx = f"_{RUN_ID}" + (f".p{self._book_part}" if self._book_part else "")
+            for d, lines in by_day.items():
+                member = gzip.compress(("\n".join(lines) + "\n").encode("utf-8"),
+                                       compresslevel=BOOK_LOG_GZ_LEVEL)
+                with open(os.path.join(dirp, f"book_depth_{d}{sfx}.jsonl.gz"),
+                          "ab") as f:
+                    f.write(member)
+            self._book_buf = []
+            self._book_fail = 0
+        except Exception as e:
+            self._book_fail += 1
+            self._book_part += 1
+            if self._book_fail == 1:
+                log(f"{self.tag} ! book-depth flush failed ({e}); keeping "
+                    f"{len(buf)} rows, retry next cycle")
+            if self._book_fail >= 5:
+                self._sink_muted.add("book_depth")
+                self._book_buf = []
+                log(f"{self.tag} ! book-depth log muted for the rest of this run")
 
     def _log_fill(self, f: dict, tkr: str, side: str, action: str,
                   count: float, px_cents: float, now_ts: float,
@@ -9215,11 +9346,22 @@ class IncentiveMarketMaker:
         # $25/day pool with an empty near-touch beats a $145/day pool where
         # farmers already stack the qualification walk.
         own_by_ticker: Dict[str, List[Tuple[str, int, float]]] = {}
+        # Exact-price twin for the book log only (own_by_ticker is whole-cent
+        # and drives the estimate, so it stays untouched).
+        self._book_own_ledger = {}
         if self.live:
             for o in self.state.ledger.values():
                 own_by_ticker.setdefault(o.get("ticker", ""), []).append(
                     (o.get("book_side", "bid"), int(o.get("yes_price", 0)),
                      float(o.get("remaining_count", 0))))
+                try:
+                    _x = order_yes_exact_cents(o)
+                    self._book_own_ledger.setdefault(o.get("ticker", ""), []).append(
+                        (o.get("book_side", "bid"),
+                         _x if _x is not None else float(o.get("yes_price", 0)),
+                         float(o.get("remaining_count", 0))))
+                except Exception:
+                    pass
         self._prune_near_cliff_boost()
         ranked: List[MarketMeta] = []
         for meta in screened:
@@ -10122,6 +10264,9 @@ class IncentiveMarketMaker:
             ob = self.client.get_orderbook(ticker=meta.ticker)
         except Exception:
             return False
+        if BOOK_LOG_CANDIDATES:
+            self._book_log_add(meta.ticker, "candidate", ob,
+                               self._book_own_ledger.get(meta.ticker, ()), meta)
         yes_levels, no_levels = orderbook_levels(ob)
         meta.book_depth_contracts = (sum(q for _px, q in yes_levels)
                                      + sum(q for _px, q in no_levels))
@@ -10747,6 +10892,9 @@ class IncentiveMarketMaker:
         now_utc = datetime.now(timezone.utc)
         now_ts = now_utc.timestamp()
         self._heartbeat = now_ts
+        # Book-log rows from this cycle join cycle_log on (cycle_ts, ticker):
+        # same format as the cycle_log `ts` column.
+        self._book_cycle_ts = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
         if os.path.exists(HALT_FILE):
             n = self.cancel_all_bot_orders()
@@ -11188,6 +11336,15 @@ class IncentiveMarketMaker:
                 continue
 
             own = own_by_ticker.get(t, [])
+            # FULL-DEPTH BOOK LOG. `ob` here is always THIS market's fresh
+            # book: a failed read `continue`s above, before this line, so a
+            # stale previous-iteration `ob` can never be logged. MUST stay
+            # above the quote-shape block further down, which rebinds `ob`
+            # to a list of own-bid tuples. own_exact nets our orders out at
+            # read time (competitor depth = level - own).
+            self._book_log_add(t, "managed", ob,
+                               own_exact_by_ticker.get(t, []) if self.live else [],
+                               meta, fast=fast_only)
             # Dry-run sim orders were never sent, so they are NOT in the real
             # book — netting them out would erode phantom levels and walk our
             # anchor away from the true external best cycle after cycle.
@@ -12492,6 +12649,10 @@ class IncentiveMarketMaker:
                                 "failsafe", f"{self.state.consecutive_errors} consecutive "
                                 f"cycle errors (last: {e!r:.120}); cancelled all",
                                 key="failsafe")
+                # Full-depth book log: serialise + write this cycle's books
+                # AFTER placements, never on the placement path. Also picks up
+                # rows from a cycle that raised or returned early. Never raises.
+                self._book_log_flush()
                 now_utc = datetime.now(timezone.utc)
                 self.alerter.maybe_daily_summary(now_utc, self.build_daily_summary)
                 self.write_status(now_utc)
@@ -12529,8 +12690,12 @@ class IncentiveMarketMaker:
                         self.run_cycle(fast_only=True)
                     except Exception as e:
                         log(f"{self.tag} ! fast-lane cycle error: {e!r}")
+                    self._book_log_flush()
         finally:
             self.shutdown_cancel()
+            # After the cancel, deliberately: a flush must never delay pulling
+            # live orders on shutdown. Catches the final partial cycle.
+            self._book_log_flush()
             if not once:
                 self.alerter.alert("shutdown",
                                    f"bot stopped (run {RUN_ID}); resting orders "

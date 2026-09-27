@@ -2,6 +2,7 @@
 """Unit tests for incentive_mm.py — run: python -m unittest test_incentive_mm"""
 
 import csv
+import glob
 import json
 import os
 import tempfile
@@ -50,6 +51,10 @@ def setUpModule():
     imm.FAMILY_VERDICTS.clear()
     imm._family_verdict_state["mtime"] = 0.0
     imm.RAIN_FAIR_FILE = os.path.join(tmp, "rain_fair_values.json")
+    # The full-depth book log resolves its directory at WRITE time from
+    # STATUS_DIR (redirected above) unless IMM_BOOK_LOG_DIR is set; a stray
+    # value in the shell would send test books wherever it points.
+    os.environ.pop("IMM_BOOK_LOG_DIR", None)
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -12810,6 +12815,153 @@ class TestAccrualCountersSurviveEviction(unittest.TestCase):
         bot3.state.accrued_est[dead] = 0.93
         data = self._saved(bot3)
         self.assertNotIn(dead, data["accrued_est"])
+
+
+class TestFullDepthBookLog(unittest.TestCase):
+    """Full-depth order-book log (2026-09-26). Kalshi serves no historical
+    orderbook, so the RAW books the bot already reads are recorded, plus our
+    own resting size per exact level. Analytics only: must never raise, never
+    change a decision, and never write outside the sandbox."""
+
+    T = "KXGOOD-99DEC31-A"
+    SUBPENNY = {"orderbook_fp": {
+        "yes_dollars": [["0.4235", "1200.00"], ["0.4100", "300.00"]],
+        "no_dollars": [["0.5000", "1100.00"], ["0.4700", "250.00"]]}}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="imm_book_")
+        p = mock.patch.dict(os.environ, {"IMM_BOOK_LOG_DIR": self.dir})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _bot(self, book=None):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.books[self.T] = json.loads(json.dumps(book or self.SUBPENNY))
+        self.addCleanup(_clean_persist)
+        return bot
+
+    def _rows(self):
+        import imm_book_depth_read as rd
+        out = []
+        for path in sorted(glob.glob(os.path.join(self.dir, "*.jsonl.gz"))):
+            out.extend(rd.iter_rows(path))
+        return out
+
+    def test_run_cycle_captures_raw_books_losslessly(self):
+        bot = self._bot()
+        bot.run_cycle()
+        srcs = {r[3] for r in bot._book_buf if r[2] == self.T}
+        self.assertIn("managed", srcs)
+        self.assertIn("candidate", srcs)
+        bot._book_log_flush()
+        self.assertEqual(bot._book_buf, [])
+        rows = [r for r in self._rows()
+                if r["ticker"] == self.T and r["source"] == "managed"]
+        self.assertTrue(rows)
+        r = rows[0]
+        # RAW arrays, sub-penny intact (orderbook_levels would floor 42.35)
+        self.assertEqual(r["yes"], self.SUBPENNY["orderbook_fp"]["yes_dollars"])
+        self.assertEqual(r["no"], self.SUBPENNY["orderbook_fp"]["no_dollars"])
+        self.assertEqual(r["unit"], "dollars")
+        self.assertRegex(r["cycle_ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(r["run_id"], imm.RUN_ID)
+
+    def test_book_row_own_size_per_exact_level(self):
+        rec = (1.0, "2026-09-26T00:00:00Z", self.T, "managed", False,
+               self.SUBPENNY, [("bid", 42.35, 10.0), ("bid", 42.35, 5.0),
+                               ("ask", 53.0, 7.0)], 1000.0, 0.5, 150.0)
+        row = json.loads(IncentiveMarketMaker._book_row(rec))
+        self.assertEqual(row["own_yes_cents"], [[42.35, 15.0]])
+        # our ask at YES 53c is a NO bid at 47c on the no side
+        self.assertEqual(row["own_no_cents"], [[47.0, 7.0]])
+        self.assertEqual((row["target"], row["discount"], row["pool_per_day"]),
+                         (1000.0, 0.5, 150.0))
+
+    def test_competitor_depth_nets_own_out_and_clamps(self):
+        import imm_book_depth_read as rd
+        row = {"unit": "dollars",
+               "yes": [["0.4235", "1200"], ["0.4100", "300"]],
+               "own_yes_cents": [[42.35, 200.0], [41.0, 900.0]]}
+        self.assertEqual(rd.competitor_levels(row, "yes"), [[42.35, 1000.0]])
+
+    def test_candidates_can_be_turned_off(self):
+        with mock.patch.object(imm, "BOOK_LOG_CANDIDATES", False):
+            bot = self._bot()
+            bot.run_cycle()
+        self.assertFalse([r for r in bot._book_buf if r[3] == "candidate"])
+        self.assertTrue([r for r in bot._book_buf if r[3] == "managed"])
+
+    def test_kill_switch_records_nothing(self):
+        with mock.patch.object(imm, "BOOK_LOG_ON", False):
+            bot = self._bot()
+            bot.run_cycle()
+            bot._book_log_flush()
+        self.assertEqual(bot._book_buf, [])
+        self.assertEqual(glob.glob(os.path.join(self.dir, "*")), [])
+
+    def test_trading_is_identical_with_the_log_on_or_off(self):
+        orders = {}
+        for on in (True, False):
+            with mock.patch.object(imm, "BOOK_LOG_ON", on):
+                bot = self._bot()
+                bot.run_cycle()
+                orders[on] = sorted((o["ticker"], o["book_side"], o["yes_price"],
+                                     o["remaining_count"])
+                                    for o in bot.state.sim_orders.values())
+        self.assertTrue(orders[True])
+        self.assertEqual(orders[True], orders[False])
+
+    def test_unwritable_dir_never_raises_then_mutes(self):
+        bad = os.path.join(self.dir, "not_a_dir")
+        with open(bad, "w") as f:
+            f.write("x")
+        with mock.patch.dict(os.environ, {"IMM_BOOK_LOG_DIR": bad}):
+            bot = self._bot()
+            bot.run_cycle()
+            n = len(bot._book_buf)
+            self.assertGreater(n, 0)
+            bot._book_log_flush()                       # 1st failure: rows kept
+            self.assertEqual(len(bot._book_buf), n)
+            self.assertEqual(bot._book_part, 1)
+            for _ in range(4):
+                bot._book_log_flush()
+            self.assertIn("book_depth", bot._sink_muted)
+            self.assertEqual(bot._book_buf, [])
+
+    def test_buffer_is_bounded(self):
+        with mock.patch.object(imm, "BOOK_LOG_MAX_BUFFER", 10):
+            bot = self._bot()
+            for _ in range(25):
+                bot._book_log_add(self.T, "managed", self.SUBPENNY, [], None)
+            self.assertLessEqual(len(bot._book_buf), 10)
+
+    def test_existing_readers_never_glob_the_new_files(self):
+        sd = tempfile.mkdtemp(prefix="imm_sd_")
+        with mock.patch.object(imm, "STATUS_DIR", sd), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("IMM_BOOK_LOG_DIR", None)
+            bot = self._bot()
+            bot._book_log_add(self.T, "managed", self.SUBPENNY, [], None)
+            bot._book_log_flush()
+            self.assertTrue(glob.glob(os.path.join(sd, "book_depth", "*.jsonl.gz")))
+            for pat in ("cycle_log_*.csv", "*.jsonl", "*.csv", "fastlane_*.csv"):
+                self.assertEqual(glob.glob(os.path.join(sd, pat)), [], pat)
+
+    def test_reader_survives_a_truncated_tail_member(self):
+        import imm_book_depth_read as rd
+        bot = self._bot()
+        bot._book_log_add(self.T, "managed", self.SUBPENNY, [], None)
+        bot._book_log_flush()
+        bot._book_log_add(self.T, "candidate", self.SUBPENNY, [], None)
+        bot._book_log_flush()
+        (path,) = glob.glob(os.path.join(self.dir, "*.jsonl.gz"))
+        with open(path, "rb") as f:
+            data = f.read()
+        with open(path, "wb") as f:
+            f.write(data[:-12])                        # hard kill mid-write
+        rows = list(rd.iter_rows(path))
+        self.assertEqual([r["source"] for r in rows], ["managed"])
 
 
 if __name__ == "__main__":
