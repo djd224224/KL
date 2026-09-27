@@ -39,16 +39,24 @@ Every row carries `run_id` and `config_hash`.
 | `config_history_*.jsonl` | per run | which config produced which rows |
 | `cycle_log_*.csv` | per full cycle | book panel + quote shape (34 cols) |
 | `fastlane_*.csv` | per fast-lane cycle | same schema, 5s resolution |
+| `book_depth/book_depth_*.jsonl.gz` | every book read | re-scoring ANY alternative ladder (since 2026-09-27) |
+| `guard_skips_*.jsonl` | on guard change + hourly | why a managed market went quiet, and on what book |
+| `floor_state_*.jsonl` | on member floor-state change | the hopeless clock and near-cliff, visible |
 
 ### fills
 
 One row per fill, carrying three joins that cannot be reconstructed later:
 
-- **ledger** — the order this fill hit is still in `state.ledger` at that
-  moment: `our_price_cents`, `our_remaining_before`, `is_pad`,
-  `order_age_secs`, `client_order_id`. One dict lookup away, previously
-  dropped. Past 7 days `our_order_ids` prunes and even *ownership* of a
-  historical fill becomes unprovable on a shared account.
+- **ledger** — `our_price_cents`, `our_remaining_before`, `is_pad`,
+  `order_age_secs`, `client_order_id`, from the order's entry in
+  `state.ledger`. **Only ~60% of fills get it**, and the missing ones are not
+  random: `_merge_ledger` pops an entry the cycle the fill removes the order
+  from the resting read, which is before the fills poll books it. Missing rows
+  are biased toward fills that took the whole rung (88% vs 76%) -- exactly the
+  large fills adverse-selection work cares about. Do not read
+  `our_price_cents` directly: every fill's `order_id` joins to a `place` row
+  in `orders_*.jsonl` (100%, using day N and N-1), and replaying that order's
+  `place` + `amend` rows recovers its resting price for ~99% of them.
 - **panel** — the book from the last cycle read (`ext_bid`, `ext_ask`,
   `yes_depth`, `no_depth`, `target`, `est_frac`, `qual_sides`,
   `pool_per_day`). A fill arrives one cycle *after* the read that produced the
@@ -85,6 +93,73 @@ Decisions: `selected`, `manual`, `book_unreadable`, `no_new`, `hopeless`,
 `rate_floor`, `zero_yield`, `payout_floor`, `event_top_n`, `finecon_top_n`,
 `scan_top_n`, `budget`, `gone`, plus any `_screen()` reason.
 
+**Decision inputs (since 2026-09-27).** Selection rows also carry what each
+floor rule looked at, so a rule change can be replayed rather than guessed:
+`banked` (this program period), `period_base`, `period_start`, `floor_bar`,
+`projected_total`, `reaches_min_raw` (before near-cliff can flip it) and
+`reaches_min`, `peak` and `peak_age_s`, `qdays`, `est_total`, the hopeless
+clock (`hopeless_since`, `sub_bar_secs`), `rate_bar` / `rate_proj`, `exempt`
+(the tier that bypasses a floor), `near_cliff_armed_ts`, `est_frac`,
+`est_hour_mult` / `nc_size_mult` (`null` = the estimate never ran at a
+multiplier), `floor_by_mult` (`[[mult, weight, $/day], ...]`; `null` = the floor
+is the live estimate), `cutoff`, `program_end`, and `screen_waived` (the sticky
+waiver that kept a member). Fields only appear on candidates that reached pass
+2. Selection rows never lose their existing keys: the email that reads them
+substring-matches `"decision": "selected"` and `"is_scan": true`.
+
+### book_depth
+
+One row per book the bot reads -- managed markets every full cycle,
+candidates every universe refresh -- with the **raw** Kalshi `orderbook_fp`
+arrays (sub-penny exact; `orderbook_levels` floors and merges, so it is
+lossy) plus our own resting size per exact level. Kalshi serves no historical
+orderbook, so this is the only way to re-score a different ladder shape, size,
+depth curve or sub-penny snap later. Read it with `imm_book_depth_read.py`
+(`iter_day`, `competitor_levels`); plain `gzip.open` works too but raises on a
+truncated tail member. Managed rows join `cycle_log` on `(cycle_ts, ticker)`.
+
+- `unit` is `dollars` for the book arrays; own size is in **cents**
+  (`own_yes_cents`, `own_no_cents`). Our ask at YES `p` is a NO bid at `100-p`.
+- `own_src`: `resting_read` (managed; this cycle's exchange read, empty for
+  an event an earlier sibling's event-wide cancel pulled this cycle) or
+  `resting_prev_cycle` (candidate; one cycle old). For a market we quote,
+  prefer the managed row.
+- Sampled: ~every cycle for managed books, ~every refresh for candidates,
+  against Kalshi's per-second reward snapshot. Re-scoring is still an
+  estimate, and there is no trade tape or order identity in it.
+- Dedup on read by `(ts, ticker, source)`.
+
+### guard_skips
+
+A market that an in-loop guard skips writes **no** `cycle_log` row that
+cycle. These rows record which guard, what it judged (`inputs`), and the book
+it judged. `kind`: `enter` (a guard starts holding a ticker, or it moves to
+another guard; `prev` = the old one), `clear` (evaluated clean again;
+`managed=false` means it left the book, and then the book fields are null),
+`snapshot` (hourly, every held ticker), `cycle` (hourly counts per guard with
+`n_managed` as the denominator). The key is `(ticker, guard)`, so input drift
+while a guard holds shows only in the hourly snapshot. After a restart every
+held guard re-emits `enter` with `prev=null`, which does not mean a new
+episode.
+
+Guards: `manual_grace`, `manual_yield`, `scan_evicted`, `cutoff_passed`,
+`aaa_blackout`, `closing`, `breaker_cooldown`, `event_fill_tripwire`,
+`scan_fill_tripwire`, `fill_burst`, `blind`, `event_depth_trip`,
+`event_depth_hold`, `one_sided_breaker`, `scan_mid_tripwire`, `move_breaker`,
+`crossed`, `wide_spread`, `band_both_out`, `cannot_qualify`, `rain_fair`,
+`cutoff_extra`. Several are dead under the live env (breakers off, scan
+tripwires at 0, `MAX_JOIN_SPREAD_CENTS=99`) and will simply never appear. A test
+fails if a new `continue` is added to the quote loop without a row.
+
+### floor_state
+
+Members only. A member under the floor bar keeps decision `selected` while its
+hopeless clock runs, so `selection_events` never showed the clock starting,
+resetting, being carried by near-cliff, or the size boost arming. A row is
+written when `(reaches_min_raw, reaches_min, near_cliff_boost_armed)` changes,
+with `prev_state` and the full decision inputs. Its own file, so
+`selection_events` still means one row per decision change.
+
 ## Two compatibility traps, both tested
 
 **Cycle-log columns are APPEND-ONLY.** `imm_reward_recon.py` reads the file
@@ -116,12 +191,25 @@ already skips rows whose first field is `ts`. Files from 09-07 on are clean.
   and has no API behind it — the human pasting the statement *is* the archive
   job, so it needs a monitor.
 
+## Kill switches
+
+`IMM_ANALYTICS=0` (every JSONL sink), `IMM_CYCLE_LOG=0` (the two CSVs),
+`IMM_BOOK_LOG=0`, `IMM_BOOK_LOG_CANDIDATES=0`, `IMM_GUARD_LOG=0`,
+`IMM_SELECTION_INPUTS=0`. Setting any of them in the launcher changes
+`CONFIG_HASH`, like every `IMM_*` variable. Tests prove order placement is
+identical with the logging on or off.
+
 ## Still open
 
-- **Storage.** The widened cycle log roughly doubles to ~160 MB/day, on a
-  directory with no rotation and no off-box backup. Do not gzip
+- **Storage.** The book log roughly doubles IMM's disk growth (~385 MB/day
+  before it; ESTIMATED 100-200 MB/day more for `book_depth`, possibly higher),
+  on a directory with no rotation and no off-box backup. Retention should be a
+  deliberate, registered decision, not a side effect. Do not gzip
   `cycle_log_*.csv` in place: `imm_reward_recon.py` globs and signature-caches
   them, and compression would break it.
+- **Memory.** Queued books are held until the flush at the end of each cycle,
+  which makes the bot's existing full-GC pauses roughly twice as frequent.
+  Trading was unaffected in replay.
 - **BigQuery.** These are still flat files, so every analysis is a pandas scan
   rather than SQL. An `imm_bq_load.py` daily job would fix that — the dataset is
   in `northamerica-northeast1` and needs explicit expiration clearing given the
