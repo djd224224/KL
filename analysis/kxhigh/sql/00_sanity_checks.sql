@@ -160,3 +160,32 @@ SELECT
   COUNTIF(low_range < -100) AS low_sentinels,
   COUNTIF(high_range > 200) AS high_sentinels
 FROM `elite-contact-446323-q7.Kalshi.KXHIGH_market_snapshot`;
+
+-- =======================================================================
+-- 9. Lookahead regression guard — model context must PRECEDE the fill
+-- =======================================================================
+-- high_temp_trading.py stamps KXHIGH_market_snapshot.run_date with
+-- datetime.now(US/Central) without a tzinfo, so BigQuery stores CT wall-clock
+-- time labelled UTC: 5h early under CDT, 6h under CST. fill_ts, by contrast,
+-- is genuine UTC from the Kalshi API.
+--
+-- Joining the two without correcting run_date let KXHIGH_fills_enriched attach
+-- model context from runs that had not happened yet -- 2,365 of 4,400 fills
+-- (53.8%) as measured on 2026-09-13, up to 299 minutes of lookahead, silently
+-- inflating model_edge_at_fill and the calibration the accuracy dashboard
+-- reports. Fixed by correcting run_date inside 10_* and 30_*.
+--
+-- This guard makes a regression loud. It reads the VIEW, so it fails if anyone
+-- rebuilds those DDLs without the correction, or adds a new consumer that
+-- joins raw run_date against a true-UTC column.
+--
+-- EXPECT: lookahead_fills = 0, and avg_snap_age_min comfortably POSITIVE
+-- (~90 min). A negative age means the correction has been lost again.
+SELECT
+  COUNT(*)                                             AS fills_with_context,
+  COUNTIF(snap_run_date > fill_ts)                     AS lookahead_fills,
+  ROUND(AVG(TIMESTAMP_DIFF(fill_ts, snap_run_date, MINUTE)), 1)
+                                                       AS avg_snap_age_min,
+  MIN(TIMESTAMP_DIFF(fill_ts, snap_run_date, MINUTE))  AS min_snap_age_min
+FROM `elite-contact-446323-q7.Kalshi.KXHIGH_fills_enriched`
+WHERE snap_run_date IS NOT NULL;

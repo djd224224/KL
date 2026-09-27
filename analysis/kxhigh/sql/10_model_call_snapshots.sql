@@ -31,9 +31,24 @@ city_abv_map AS (
 ),
 snapshots AS (
   -- Dedupe to one row per (market_ticker, run_date) (ties: highest yes_probability first)
+  --
+  -- run_date is corrected to a true UTC instant FIRST. high_temp_trading.py
+  -- stamps it with `datetime.now(US/Central)` without a tzinfo, so BigQuery
+  -- stores CT wall-clock time labelled UTC — 5h early under CDT, 6h under CST.
+  -- Same correction as analysis/kxhigh/python/live_dashboard.py:50-60; do NOT
+  -- use INTERVAL 5 HOUR, the offset is DST-dependent.
+  --
+  -- THIS MATTERED HERE, subtly: cutoff_ts below is built CORRECTLY as a true
+  -- UTC instant via TIMESTAMP(DATETIME(...), "America/Chicago"), and was then
+  -- compared against the UNCORRECTED run_date. Because the stored value runs
+  -- 5h early, `WHERE run_date < cutoff_ts` admitted snapshots taken up to 5h
+  -- AFTER the market's real expiration cutoff, and `ORDER BY run_date DESC`
+  -- then picked the latest of them as the "model call" — i.e. the call the bot
+  -- is scored on could be a run that happened after the market had cut off.
+  -- That propagates into KXHIGH_resolved_markets and everything built on it.
   SELECT * EXCEPT(rn) FROM (
     SELECT
-      ms.*,
+      ms.* REPLACE(TIMESTAMP(DATETIME(ms.run_date), "America/Chicago") AS run_date),
       ROW_NUMBER() OVER (PARTITION BY market_ticker, run_date
                          ORDER BY yes_probability DESC NULLS LAST) AS rn
     FROM `elite-contact-446323-q7.Kalshi.KXHIGH_market_snapshot` ms
