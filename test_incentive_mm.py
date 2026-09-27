@@ -12,6 +12,14 @@ from unittest import mock
 
 import incentive_mm as imm
 
+# The Saturday step-up verdict is a LIVE runtime file (run-logs/incentive-mm/
+# sat_mult_gate.json, written by imm_saturday_tracker.py and read at import).
+# Point the module at a name that never exists so no test sizes a Saturday by
+# whatever verdict the box holds; TestSaturdayGatedStepUp writes its own into
+# a temp STATUS_DIR.
+imm.SAT_GATE_FILE = "sat_mult_gate.absent-under-test.json"
+imm.SAT_GATE_STATE.update(mtime=0.0, verdict="", mult=0.0, effective_from=None)
+
 # Wall-clock hazard: during the first HOURLY_ACTIVATION_WINDOW_SECS of every
 # real hour the universe-refresh gate is bypassed, so tests that rely on
 # `universe_at = time.time()` to suppress a refresh go flaky for 12 minutes
@@ -7020,6 +7028,135 @@ class TestSaturdaySizeMult(unittest.TestCase):
         self.assertLessEqual(
             3.0 * imm.capped_ref_mult(50, 40, "bid", hour_mult=3.0),
             max(3.0, imm.TOTAL_SIZE_MULT_CAP))
+
+
+class TestSaturdayGatedStepUp(unittest.TestCase):
+    """Gated Saturday step-up (Jack 2026-09-26: "2x next saturday if today +
+    prior saturdays show no sign of edge degradation"): the tracker's verdict
+    file arms it; anything but a readable PASS naming a bigger multiplier
+    leaves Saturday at SAT_SIZE_MULT. 2026-10-03 and 2026-09-26 are
+    Saturdays; October => EDT (UTC-4)."""
+
+    SAT = "KXTRUMPMENTION"
+
+    def setUp(self):
+        self._saved = (imm.SAT_SIZE_MULT, imm.SAT_SIZE_MULT_GATED, imm.SAT_MULT_EXCLUDE,
+                       imm.HOUR_SIZE_MULTS, imm.STATUS_DIR, imm.SAT_GATE_FILE, dict(imm.SAT_GATE_STATE))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        imm.STATUS_DIR = tmp.name
+        imm.SAT_GATE_FILE = "sat_mult_gate.json"
+        imm.SAT_SIZE_MULT = 1.5
+        imm.SAT_SIZE_MULT_GATED = 2.0
+        imm.SAT_MULT_EXCLUDE = ("KXAAAGAS", "KXDIESEL")
+        imm.HOUR_SIZE_MULTS = {}
+        imm.SAT_GATE_STATE.update(mtime=0.0, verdict="", mult=0.0, effective_from=None)
+        self._tick = 0
+
+    def tearDown(self):
+        (imm.SAT_SIZE_MULT, imm.SAT_SIZE_MULT_GATED, imm.SAT_MULT_EXCLUDE,
+         imm.HOUR_SIZE_MULTS, imm.STATUS_DIR, imm.SAT_GATE_FILE, state) = self._saved
+        imm.SAT_GATE_STATE.clear()
+        imm.SAT_GATE_STATE.update(state)
+
+    def _write(self, raw=None, **kw):
+        """Write a verdict (dict fields, or raw text) and load it; each write
+        gets a distinct mtime so the mtime gate always sees it."""
+        payload = {"verdict": "PASS", "mult": 2.0, "effective_from": "2026-10-03"}
+        payload.update(kw)
+        path = imm.sat_gate_path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(raw if raw is not None else json.dumps(payload))
+        self._tick += 1
+        os.utime(path, (1_800_000_000 + self._tick, 1_800_000_000 + self._tick))
+        return imm.load_sat_gate()
+
+    def test_code_default_is_two(self):
+        self.assertEqual(self._saved[1], 2.0)
+
+    def test_no_verdict_file_keeps_saturday_at_base(self):
+        self.assertFalse(imm.load_sat_gate())
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 16, 0)), 1.5)
+        self.assertIn("awaiting", imm.sat_gate_summary())
+
+    def test_pass_applies_from_the_effective_saturday_on(self):
+        self.assertTrue(self._write())
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 9, 26, 16, 0)), 1.5)   # before: base
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 2, 16, 0)), 1.0)   # Friday
+        # ET calendar-day edges: 03:59Z Sat = Fri 23:59 EDT; 04:00Z = Sat 00:00 EDT
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 3, 59)), 1.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 4, 0)), 2.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 4, 3, 59)), 2.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 4, 4, 0)), 1.0)    # Sunday
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 10, 16, 0)), 2.0)  # stays on
+        self.assertIn("PASS: x2 on Saturdays from 2026-10-03", imm.sat_gate_summary())
+
+    def test_exclusions_and_composition_are_unchanged(self):
+        self._write()
+        sat = utc(2026, 10, 3, 16, 0)
+        for s in ("KXAAAGASD", "KXAAAGASW", "KXDIESELW", "KXRAINNYCM", "KXTEMPMIAH"):
+            self.assertEqual(imm.hour_size_mult(s, sat), 1.0, s)
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 8, 0)), 4.0)   # 4am EDT
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 16, 0)), 2.0)  # noon EDT
+        self.assertEqual(imm.hour_scaled_levels(self.SAT, sat),
+                         [(t, max(1, int(s * 2.0 + 0.5))) for t, s in imm.series_levels(self.SAT)])
+
+    def test_anything_but_a_readable_pass_fails_closed(self):
+        sat = utc(2026, 10, 3, 16, 0)
+        for kw in ({"verdict": "FAIL"}, {"verdict": "OFF"}, {"verdict": ""}, {"mult": 0},
+                   {"mult": 1.25}, {"mult": "two"}, {"effective_from": None},
+                   {"effective_from": "next saturday"}):
+            self._write(**kw)
+            self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.5, kw)
+        for raw in ("{not json", "[1, 2]", ""):
+            self._write(raw=raw)
+            self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.5, raw)
+        self._write(verdict="pass")                       # case-insensitive
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 2.0)
+
+    def test_deleting_the_file_clears_the_verdict(self):
+        self._write()
+        os.remove(imm.sat_gate_path())
+        self.assertTrue(imm.load_sat_gate())
+        self.assertEqual(imm.hour_size_mult(self.SAT, utc(2026, 10, 3, 16, 0)), 1.5)
+
+    def test_the_step_is_the_smaller_of_file_and_env(self):
+        sat = utc(2026, 10, 3, 16, 0)
+        self._write(mult=3.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 2.0)     # env caps an approval
+        imm.SAT_SIZE_MULT_GATED = 1.75
+        self._write(mult=2.0)
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.75)    # a lowered env wins
+
+    def test_kill_switches(self):
+        sat = utc(2026, 10, 3, 16, 0)
+        self._write()
+        imm.SAT_SIZE_MULT_GATED = 0.0                  # restart-level kill
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.5)
+        self.assertIn("off", imm.sat_gate_summary())
+        imm.SAT_SIZE_MULT_GATED = 2.0
+        imm.SAT_SIZE_MULT = 1.0                        # Saturday knob off -> everything off
+        self.assertEqual(imm.hour_size_mult(self.SAT, sat), 1.0)
+
+    def test_unchanged_file_is_not_reread(self):
+        self.assertTrue(self._write())
+        with mock.patch("builtins.open", side_effect=AssertionError("re-read")):
+            self.assertFalse(imm.load_sat_gate())
+
+    def test_floor_projection_sees_the_step(self):
+        # the payout-floor projection samples hour_size_mult, so a window over
+        # an armed Saturday projects the x2 ladder there, and x1.5 before it
+        self._write()
+        prof = dict(imm.size_mult_profile(self.SAT, utc(2026, 10, 3, 4, 0), 1.0))
+        self.assertEqual(set(prof), {2.0})
+        prof = dict(imm.size_mult_profile(self.SAT, utc(2026, 9, 26, 4, 0), 1.0))
+        self.assertEqual(set(prof), {1.5})
+
+    def test_summary_is_ascii(self):
+        for kw in ({}, {"verdict": "FAIL"}, {"mult": 1.25}):
+            self._write(**kw)
+            imm.sat_gate_summary().encode("ascii")
 
 
 class TestDailySeries(unittest.TestCase):

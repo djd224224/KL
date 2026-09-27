@@ -1360,18 +1360,107 @@ SAT_SIZE_MULT = _env_float("IMM_SAT_SIZE_MULT", 1.0)
 SAT_MULT_EXCLUDE = tuple(
     p for p in os.environ.get("IMM_SAT_MULT_EXCLUDE", "KXAAAGAS,KXDIESEL").split(",") if p)
 
+# GATED STEP-UP (Jack 2026-09-26: "2x next saturday if today + prior
+# saturdays show no sign of edge degradation"). Armed by a VERDICT FILE, not
+# by a clock: imm_saturday_tracker.py scores every boosted Saturday (9/12
+# from 10:00 ET, when the knob went live; 9/19; 9/26) once the newest one's
+# fills carry a full 24h mark-out -- the Monday 07:40 ET run -- and writes
+# SAT_GATE_FILE ONCE: {"verdict": "PASS"|"FAIL", "mult": 2.0,
+# "effective_from": <the first Saturday after the run>, "checks": [...]}.
+# On PASS, Saturdays from effective_from on run at min(SAT_SIZE_MULT_GATED,
+# the file's mult) instead of SAT_SIZE_MULT; on FAIL, a missing/unreadable
+# file, a verdict whose mult is not above SAT_SIZE_MULT, or the Saturday
+# knob off, Saturday stays at SAT_SIZE_MULT (fail closed). Same exclusions
+# and the same composition with the hour windows (a PASS makes Saturday
+# 0-9 ET x4 on the global ladder, where TOTAL_SIZE_MULT_CAP leaves the at-ref
+# depth mult x1.25). Read at import and by mtime each refresh: hand-editing
+# the verdict to anything but PASS is an instant kill with no restart;
+# IMM_SAT_SIZE_MULT_GATED=0 is the restart-level kill. Deleting the file
+# RE-ARMS the gate (the next Monday tracker run evaluates again).
+SAT_SIZE_MULT_GATED = _env_float("IMM_SAT_SIZE_MULT_GATED", 2.0)
+SAT_GATE_FILE = "sat_mult_gate.json"
+SAT_GATE_STATE: Dict[str, object] = {"mtime": 0.0, "verdict": "", "mult": 0.0,
+                                      "effective_from": None}
+
+
+def sat_gate_path() -> str:
+    return os.path.join(STATUS_DIR, SAT_GATE_FILE)
+
+
+def gated_sat_mult(et_day) -> float:
+    """The approved Saturday step-up for this ET calendar date (a
+    datetime.date), or 0.0 when the gate does not apply."""
+    if SAT_SIZE_MULT_GATED <= 0 or SAT_GATE_STATE["verdict"] != "PASS":
+        return 0.0
+    eff = SAT_GATE_STATE["effective_from"]
+    if eff is None or et_day < eff:
+        return 0.0
+    m = min(SAT_SIZE_MULT_GATED, float(SAT_GATE_STATE["mult"] or 0.0))
+    return m if m > SAT_SIZE_MULT else 0.0
+
+
+def sat_gate_summary() -> str:
+    """One line for the banner / refresh log / tracker knobs block."""
+    st = SAT_GATE_STATE
+    if SAT_SIZE_MULT <= 0 or SAT_SIZE_MULT == 1.0:
+        return "Saturday multiplier off (IMM_SAT_SIZE_MULT), so the step-up is inert"
+    if SAT_SIZE_MULT_GATED <= 0:
+        return "step-up off (IMM_SAT_SIZE_MULT_GATED=0)"
+    if not st["mtime"]:
+        return (f"step-up x{SAT_SIZE_MULT_GATED:g} awaiting the tracker's verdict "
+                f"(no {SAT_GATE_FILE}); Saturday stays x{SAT_SIZE_MULT:g}")
+    eff = st["effective_from"]
+    if st["verdict"] == "PASS" and eff is not None:
+        m = min(SAT_SIZE_MULT_GATED, float(st["mult"] or 0.0))
+        if m > SAT_SIZE_MULT:
+            return f"verdict PASS: x{m:g} on Saturdays from {eff.isoformat()}"
+        return (f"verdict PASS for x{float(st['mult'] or 0.0):g}, not above "
+                f"x{SAT_SIZE_MULT:g}; Saturday stays x{SAT_SIZE_MULT:g}")
+    return f"verdict {st['verdict'] or 'unreadable'}; Saturday stays x{SAT_SIZE_MULT:g}"
+
+
+def load_sat_gate() -> bool:
+    """Mirror SAT_GATE_FILE into SAT_GATE_STATE (mtime-gated). A missing or
+    unreadable file clears the verdict (fail closed). True when it changed."""
+    try:
+        mtime = os.path.getmtime(sat_gate_path())
+    except OSError:
+        mtime = 0.0
+    if mtime == SAT_GATE_STATE["mtime"]:
+        return False
+    before = (SAT_GATE_STATE["verdict"], SAT_GATE_STATE["mult"],
+              SAT_GATE_STATE["effective_from"])
+    verdict, mult, eff = "", 0.0, None
+    if mtime:
+        try:
+            with open(sat_gate_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            verdict = str(data.get("verdict") or "").strip().upper()
+            mult = float(data.get("mult") or 0.0)
+            eff = datetime.strptime(str(data.get("effective_from")), "%Y-%m-%d").date()
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            log(f"[IMM] ! {SAT_GATE_FILE} unreadable ({e}); fail closed")
+            verdict, mult, eff = "", 0.0, None
+    SAT_GATE_STATE.update(mtime=mtime, verdict=verdict, mult=mult, effective_from=eff)
+    changed = (verdict, mult, eff) != before
+    if changed:
+        log(f"[IMM] Saturday gate: {sat_gate_summary()}")
+    return changed
+
 
 def saturday_size_mult(series: str, now_utc: datetime) -> float:
     """SAT_SIZE_MULT on Saturdays (ET calendar day) for long-dated series
-    (not daily families, not SAT_MULT_EXCLUDE prefixes); 1.0 otherwise and
-    whenever the knob is off/invalid."""
+    (not daily families, not SAT_MULT_EXCLUDE prefixes) -- or the gated
+    step-up on a Saturday the tracker's PASS verdict covers; 1.0 otherwise
+    and whenever the Saturday knob is off/invalid."""
     if SAT_SIZE_MULT <= 0 or SAT_SIZE_MULT == 1.0:
         return 1.0
-    if now_utc.astimezone(ET).weekday() != 5:
+    et = now_utc.astimezone(ET)
+    if et.weekday() != 5:
         return 1.0
     if is_daily_series(series) or any(series.startswith(p) for p in SAT_MULT_EXCLUDE):
         return 1.0
-    return SAT_SIZE_MULT
+    return gated_sat_mult(et.date()) or SAT_SIZE_MULT
 
 
 def hour_size_mult(series: str, now_utc: datetime) -> float:
@@ -5034,6 +5123,9 @@ _CONFIG_CODE_KNOBS = (
     "NEAR_CLIFF_BOOST_MIN_BANKED",
     # hopeless clock (2026-09-26): 30-minute sustain on the live projection
     "HOPELESS_SUSTAIN_SECS", "MEMBER_PEAK_GUARD", "EST_PEAK_TTL_SECS",
+    # gated Saturday step-up (2026-09-26); the verdict itself is a runtime
+    # file, so the cycle log's hour_mult is where a PASS shows
+    "SAT_SIZE_MULT_GATED",
 )
 
 
@@ -5463,6 +5555,7 @@ def save_family_verdicts() -> None:
 
 
 load_family_verdicts()
+load_sat_gate()          # Saturday step-up verdict (defined next to saturday_size_mult)
 
 
 # ----------------------------------------------------------------------------
@@ -8871,6 +8964,7 @@ class IncentiveMarketMaker:
         load_extra_allow_series()
         load_finecon_extra_series()
         load_family_verdicts()
+        load_sat_gate()
         load_rain_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
@@ -12737,6 +12831,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"day, long-dated only, composes with hour windows)"
             + (f"; extra excluded prefixes: {','.join(SAT_MULT_EXCLUDE)}"
                if SAT_MULT_EXCLUDE else ""))
+        log(f"[IMM] Saturday gate: {sat_gate_summary()}")
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):

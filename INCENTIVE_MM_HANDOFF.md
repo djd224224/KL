@@ -3505,3 +3505,85 @@ selected on the $1.20 bar and the x3 projection (family: 125 -> 167
 selected, 341 -> 299 floored), payout_floor 930 -> 875 overall, zero_yield
 still 1; ladder collateral ~$13.2k -> ~$18.3k against the $15.2k inventory
 reserve. The two near-cliff escalators re-armed at x1.5 on top (135).
+
+## 2026-09-26 pm — Saturday x2, gated: the Monday tracker decides once from the boosted Saturdays (Jack)
+
+Jack, after the 1.5 -> 2.0 read (9/19 plus the morning of 9/26; long-dated
+net per resting contract-hour by block against weekdays, ex-KXRT: Saturday
+10-23 ET 30.6 vs 11.4, Saturday 0-9 ET 33.0 vs 13.8 cents per 1k ct-h;
+modelled share ~10%, no saturation): "yes, 2x next saturday if today +
+prior saturdays show no sign of edge degradation".
+
+MECHANISM -- one decision, made by a script, read by the bot, armed:
+- `imm_saturday_tracker.py` scores every boosted Saturday -- 9/12 from
+  10:00 ET (the x1.5 went live ~09:10 ET, so its 0-9 block is not an
+  observation), 9/19, 9/26 -- per ET block (0-9 / 10-23) against the same
+  block on the weekdays of its own Mon-Fri (all weekdays in the window
+  when its week has fewer than two). Net = modelled rent minus mark-out
+  cost, cents per 1,000 resting contract-hours. The mark is the 24h
+  cycle-log mid, else the settlement value, else the last logged mid inside
+  24h: the strict 24h mid (the report's mo24 column, unchanged) drops
+  12-62% of long-dated fills a day, mostly the ones nearest resolution
+  (KXTRUMPMENTION 59% missing, 99% of those settled) -- exactly the lumpy
+  losses a gate has to see. Degradation = any of:
+    G1 a boosted block nets less than the same block on its weekdays;
+    G2 the Saturday's boosted hours net <= 0;
+    G3 its fills mark out more than 2c/contract worse than its weekdays';
+    G4 pooled over the boosted Saturdays, rent per fill minus settlement
+       loss per settled fill < 0 (judged from 500 settled contracts).
+  Every boosted Saturday must be a full day + 24h old, else PENDING and
+  nothing is written. The SCHEDULED run ("KL imm saturday-tracker", Monday
+  07:40 ET, no flags) writes run-logs/incentive-mm/sat_mult_gate.json ONCE
+  -- {"verdict": "PASS"|"FAIL", "mult": 2.0, "effective_from": <the first
+  Saturday after the run>, "checks": [...]} -- and never overwrites it;
+  `--gate-rewrite` re-evaluates and rewrites by hand. The email carries a
+  "2x gate" section (status, per-block rates, every check, a who-moved-it
+  family table for the newest Saturday); the subject names the verdict on
+  the run that writes it. A gate exception never costs the weekly email
+  (status ERROR, nothing written).
+- `incentive_mm.py`: `saturday_size_mult` returns `gated_sat_mult` --
+  min(IMM_SAT_SIZE_MULT_GATED, the file's mult), code default 2.0 -- on
+  Saturdays on/after effective_from when the verdict is PASS; anything
+  else (FAIL, no file, unreadable, a mult not above SAT_SIZE_MULT) keeps
+  x1.5, fail closed. Same exclusions; composes with the quiet hours
+  (Saturday 0-9 ET = x4 on the global ladder, where TOTAL_SIZE_MULT_CAP
+  leaves the at-ref depth mult x1.25); the payout-floor projection sees
+  the step because size_mult_profile samples hour_size_mult. The file is
+  read at import and by mtime every refresh (`load_sat_gate`, next to
+  load_family_verdicts), logged `[IMM] Saturday gate: ...` on change and
+  in the banner. SAT_SIZE_MULT_GATED joins the config hash; the verdict is
+  runtime state, so a PASS shows in the cycle log's hour_mult (2.0 on
+  Saturday long-dated rows outside 0-9 ET) and the tracker's mult column.
+
+KILL SWITCHES: hand-edit the file's verdict to anything but PASS (instant,
+no restart; the tracker never overwrites an existing file);
+IMM_SAT_SIZE_MULT_GATED=0 in the launcher (task-level restart);
+IMM_SAT_SIZE_MULT=1.0 turns the whole Saturday multiplier off. Deleting
+the file RE-ARMS the gate: the next Monday run evaluates again.
+
+WHAT THIS DOES NOT FIX / WATCH:
+- 9/26 afternoon changed the Saturday book under the gate. Ladders x3
+  (13:53 ET) put the sports ladders/escalators at 90/side: 49% of
+  long-dated resting contracts 10-20 ET, earning 16.5c per 1k ct-h (our
+  share ~0.5% of ~$113/day pools -- crowded, not saturated) against ~47c
+  for the rest of the book. On partial marks at 20:40 ET the 9/26 10-23
+  block was tracking just under its weekdays (21.0 vs 23.4). A G1 FAIL
+  there is the rule working: 2x would mostly double down on the ladder
+  book. A PASS takes ladders to 120/side on Saturday daytime (240 in 0-9
+  ET, x1.5 more in near-cliff mode; per-market cap 450), above the 90 Jack
+  named for the x3.
+- One decision. Afterwards the tracker keeps re-checking every Monday
+  (labelled "re-check only") but nothing reverts a PASS automatically.
+- Modelled rent (pre-realization), not credits; mark-outs, not P&L.
+
+Tests: TestSaturdayGatedStepUp (file-armed; ET day edges on 10/3;
+exclusions and the x4 composition; fail closed on FAIL / garbage / a mult
+not above base; the step is the smaller of file and env; both kill
+switches; deleting clears; the mtime cache; the floor profile sees x2;
+ASCII summary). GateEvaluateTests / GateVerdictFileTests / GateInputsTests
+/ GateRenderTests in test_imm_saturday_tracker (G1-G4, pending until
+Saturday + 24h, only boosted hours judged, every Saturday must pass,
+one-shot write, logged-hours-only fills, the mark fallback chain, ASCII
+text part). Both test modules point the bot at a never-existing verdict
+name so no test reads the box's live file. 673 green (+87 in the other
+IMM suites).

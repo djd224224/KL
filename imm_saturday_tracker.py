@@ -45,7 +45,13 @@ Scheduled "KL imm saturday-tracker" WEEKLY Monday 07:40 ET (after the 07:10
 digest / 07:20 gaps / 07:25 opportunistic). --print builds and prints only;
 --dry builds, prints and skips the email; --test emails without the sent
 marker; --html-out PATH also writes the HTML body to PATH (with --print: a
-no-send preview of the email). Credentials: ALERT_EMAIL_FROM /
+no-send preview of the email).
+
+2x gate (Jack 2026-09-26: "2x next saturday if today + prior saturdays show
+no sign of edge degradation"): every run also scores the boosted Saturdays
+(evaluate_gate, G1-G4); the SCHEDULED run writes the bot's verdict file
+STATUS_DIR/sat_mult_gate.json once, and --gate-rewrite rewrites it by hand.
+Credentials: ALERT_EMAIL_FROM /
 ALERT_EMAIL_PASSWORD from the
 environment, falling back to HKCU\\Environment like the other IMM reports.
 """
@@ -241,7 +247,7 @@ def load_fills(first_file_day: str) -> pd.DataFrame:
                     px = 100.0 - px
                 t = int(float(r.get("ts") or 0))
                 et = datetime.fromtimestamp(t, tz=timezone.utc).astimezone(ET)
-                rows.append(dict(t=t, et_date=et.strftime("%Y-%m-%d"), ticker=r.get("ticker"),
+                rows.append(dict(t=t, et_date=et.strftime("%Y-%m-%d"), et_hour=et.hour, ticker=r.get("ticker"),
                                  series=r.get("series") or str(r.get("ticker")).split("-")[0],
                                  eff_side=side, px=px, cnt=float(r.get("count") or 0.0)))
     return pd.DataFrame(rows)
@@ -273,6 +279,51 @@ def mid_at(mid_tab: dict, ticker: str, t: int, horizon: int):
     return np.nan
 
 
+def last_mid_within(mid_tab: dict, ticker: str, t0: int, t1: int):
+    """The last cycle-log mid after t0 and at/before t1, or NaN."""
+    ent = mid_tab.get(ticker)
+    if not ent:
+        return np.nan
+    keys, vals = ent
+    i = bisect.bisect_right(keys, t1 // 600 * 600) - 1
+    return vals[i] if i >= 0 and keys[i] > t0 // 600 * 600 else np.nan
+
+
+def score_fills(fills: pd.DataFrame, mid_tab: dict, results: dict) -> pd.DataFrame:
+    """Group, settlement P&L (settled subset) and 24h mark-out per fill row,
+    plus the weighted columns the aggregations sum.
+
+    Two mark-outs. `mo24` is the report's column: the cycle-log mid 24h
+    later, NaN when the market was no longer logged then -- which drops 12-62%
+    of long-dated fills a day, mostly the ones nearest resolution (a mention
+    market settling that evening, a ladder past its kickoff cutoff).
+    `mk` is the gate's: the 24h mid, else the settlement value when the
+    market has settled, else the last mid logged inside the 24h -- so the
+    fills closest to the news are priced, not skipped."""
+    f = fills.copy()
+    f["group"] = f["series"].map(group_of)
+    f["result"] = f["ticker"].map(results)
+    f["settle_pnl"] = np.where(f["result"].isna(), np.nan,
+                               f["cnt"] * ((f["result"] == f["eff_side"]).astype(float) * 100.0 - f["px"]) / 100.0)
+    mo, mk = [], []
+    for r in f.itertuples():
+        m = mid_at(mid_tab, r.ticker, r.t, 86400)
+        mo.append(np.nan if np.isnan(m) else ((m - r.px) if r.eff_side == "yes" else ((100.0 - m) - r.px)))
+        if np.isnan(m):
+            res = results.get(r.ticker)
+            m = (100.0 if res == "yes" else 0.0) if res in ("yes", "no") else \
+                last_mid_within(mid_tab, r.ticker, r.t, r.t + 86400)
+        mk.append(np.nan if np.isnan(m) else ((m - r.px) if r.eff_side == "yes" else ((100.0 - m) - r.px)))
+    f["mo24"] = mo
+    f["mo24_w"] = f["mo24"] * f["cnt"]
+    f["mo24_n"] = np.where(f["mo24"].notna(), f["cnt"], 0.0)
+    f["mk"] = mk
+    f["mk_w"] = f["mk"] * f["cnt"]
+    f["mk_n"] = np.where(f["mk"].notna(), f["cnt"], 0.0)
+    f["settled_cts"] = np.where(f["settle_pnl"].notna(), f["cnt"], 0.0)
+    return f
+
+
 # ---------------------------------------------------------------------------
 # the table
 # ---------------------------------------------------------------------------
@@ -296,19 +347,7 @@ def build_rows(ser, cyc, mid_tab, fills, results, through_et: str):
     g["mult"] = g["hm_sum"] / g["q_rows"].replace(0, np.nan)
 
     if not fills.empty:
-        f = fills[(fills["et_date"] >= SINCE) & (fills["et_date"] <= through_et)].copy()
-        f["group"] = f["series"].map(group_of)
-        f["result"] = f["ticker"].map(results)
-        f["settle_pnl"] = np.where(f["result"].isna(), np.nan,
-                                   f["cnt"] * ((f["result"] == f["eff_side"]).astype(float) * 100.0 - f["px"]) / 100.0)
-        mo = []
-        for r in f.itertuples():
-            m = mid_at(mid_tab, r.ticker, r.t, 86400)
-            mo.append(np.nan if np.isnan(m) else ((m - r.px) if r.eff_side == "yes" else ((100.0 - m) - r.px)))
-        f["mo24"] = mo
-        f["mo24_w"] = f["mo24"] * f["cnt"]
-        f["mo24_n"] = np.where(f["mo24"].notna(), f["cnt"], 0.0)
-        f["settled_cts"] = np.where(f["settle_pnl"].notna(), f["cnt"], 0.0)
+        f = score_fills(fills[(fills["et_date"] >= SINCE) & (fills["et_date"] <= through_et)], mid_tab, results)
         fa = f.groupby(["et_date", "group"]).agg(fills=("cnt", "sum"), settled_cts=("settled_cts", "sum"),
                                                  settle_pnl=("settle_pnl", "sum"), mo24_w=("mo24_w", "sum"),
                                                  mo24_n=("mo24_n", "sum")).reset_index()
@@ -338,6 +377,321 @@ def _derive(a: pd.DataFrame) -> pd.DataFrame:
     out["net/ct-day"] = 100.0 * a["rent"] / a["resting"].replace(0, np.nan) - out["turnover"] * out["loss/fill"]
     out["mult"] = a["mult"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# the x2 gate (Jack 2026-09-26, after the 9/19 + partial 9/26 read: "2x next
+# saturday if today + prior saturdays show no sign of edge degradation").
+#
+# The edge the Saturday multiplier sells is net per RESTING contract-hour --
+# modelled rent minus the 24h mark-out cost of the fills it draws -- above
+# what a weekday contract earns. Every boosted Saturday (9/12 from 10:00 ET:
+# the knob went live ~09:10 ET, so its 0-9 block is not a boosted
+# observation; 9/19; 9/26) is scored per ET block (quiet 0-9 = x2 weekday /
+# x3 Saturday; day 10-23 = x1 / x1.5) against the weekdays of its own Mon-Fri
+# (that week's regime: listing waves, blocklists), or every weekday in the
+# window when its own week has fewer than two. Signs of degradation, any
+# one of which fails the gate:
+#   G1 net vs weekdays  a boosted block earns less per resting contract-hour
+#                       than the same block on its weekdays (the Saturday
+#                       premium is gone there);
+#   G2 net positive     the Saturday's boosted hours net <= 0;
+#   G3 mark-out         its fills mark out more than GATE_MARKOUT_TOL_C per
+#                       contract worse than its weekdays' fills over the same
+#                       blocks (the bigger size is getting picked off);
+#   G4 settled          pooled over every boosted Saturday, rent per fill
+#                       minus settlement loss per SETTLED fill < 0 (not
+#                       judged under GATE_MIN_SETTLED_CTS settled contracts).
+# Every boosted Saturday through the newest must be MATURE (a full day plus
+# 24h, so every mark-out exists), else the verdict is PENDING and nothing is
+# written. The scheduled run writes imm.SAT_GATE_FILE ONCE -- an existing
+# file is never overwritten; --gate-rewrite re-evaluates by hand -- with
+# effective_from = the first Saturday after the run. The bot reads it.
+# ---------------------------------------------------------------------------
+
+GATE_KNOB_LIVE = ("2026-09-12", 10)     # first full ET hour the x1.5 was live
+GATE_MARKOUT_TOL_C = 2.0
+GATE_MIN_SETTLED_CTS = 500.0
+GATE_RULE = "Jack 2026-09-26: 2x next saturday if today + prior saturdays show no sign of edge degradation"
+QUIET_HOURS = frozenset(range(0, 10))   # the live IMM_HOUR_SIZE_MULT=0-9:2.0 window
+BLOCKS = ("quiet", "day")
+BLOCK_START = {"quiet": 0, "day": 10}
+BLOCK_LABEL = {"quiet": "0-9 ET", "day": "10-23 ET"}
+_SUMS = ("ct_h", "rent_usd", "fills", "mk_w", "mk_n", "settled_cts", "settle_pnl")
+
+
+def gate_blocks(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, through_et: str) -> pd.DataFrame:
+    """Long-dated sums per (et_date, block) from the tracker's own loaders:
+    resting contract-hours, modelled $ accrued, fills, mark-out and
+    settlement sums, hours logged, and the day block's mean cycle-log
+    hour_mult (the parser records it outside 0-9 only). Fills count in
+    LOGGED hours only, so a logging gap cannot inflate turnover."""
+    cols = ["et_date", "block", "day_type", "hours", *_SUMS, "hm"]
+    if ser.empty or cyc.empty:
+        return pd.DataFrame(columns=cols)
+    c = cyc[(cyc["et_date"] >= SINCE) & (cyc["et_date"] <= through_et)].copy()
+    c["block"] = np.where(c["et_hour"].isin(QUIET_HOURS), "quiet", "day")
+    s = ser[(ser["et_date"] >= SINCE) & (ser["et_date"] <= through_et)]
+    s = s[s["series"].map(group_of) == "long-dated"].merge(c, on=["et_date", "et_hour"], how="inner")
+    s["ct_h"] = s["sum_quoted"] / s["n_cycles"]
+    s["rent_usd"] = s["sum_est_usd"] / s["n_cycles"] / 24.0
+    a = s.groupby(["et_date", "block"]).agg(ct_h=("ct_h", "sum"), rent_usd=("rent_usd", "sum"),
+                                            q_rows=("q_rows", "sum"), hm_sum=("hm_sum", "sum"))
+    a["hm"] = a["hm_sum"] / a["q_rows"].replace(0, np.nan)
+    a = a.join(c.groupby(["et_date", "block"])["et_hour"].nunique().rename("hours"))
+    if scored is not None and not scored.empty:
+        f = scored[(scored["group"] == "long-dated") & (scored["et_date"] >= SINCE) & (scored["et_date"] <= through_et)]
+        logged = set(zip(c["et_date"], c["et_hour"]))
+        f = f[[k in logged for k in zip(f["et_date"], f["et_hour"])]].copy()
+        f["block"] = np.where(f["et_hour"].isin(QUIET_HOURS), "quiet", "day")
+        fa = f.groupby(["et_date", "block"]).agg(fills=("cnt", "sum"), mk_w=("mk_w", "sum"),
+                                                 mk_n=("mk_n", "sum"), settled_cts=("settled_cts", "sum"),
+                                                 settle_pnl=("settle_pnl", "sum"))
+        a = a.join(fa)
+    for col in _SUMS:
+        a[col] = a[col].fillna(0.0) if col in a.columns else 0.0
+    a = a.reset_index()
+    a["day_type"] = a["et_date"].map(day_type)
+    return a[cols]
+
+
+def block_metrics(r) -> dict:
+    """Per-block rates from summed columns (one row or a pooled sum):
+    cents per 1,000 resting contract-hours for rent and net, fills per 1,000
+    contract-hours, cents per filled contract for the mark-out."""
+    ct_h, fills = float(r["ct_h"]), float(r["fills"])
+    rent_k = 1000.0 * 100.0 * float(r["rent_usd"]) / ct_h if ct_h > 0 else float("nan")
+    fills_k = 1000.0 * fills / ct_h if ct_h > 0 else float("nan")
+    mark = float(r["mk_w"]) / float(r["mk_n"]) if float(r["mk_n"]) > 0 else float("nan")
+    if fills <= 0:
+        net_k = rent_k
+    else:
+        net_k = rent_k + fills_k * mark          # NaN when no fill has a mark-out yet
+    rent_fill = 100.0 * float(r["rent_usd"]) / fills if fills > 0 else float("nan")
+    return dict(ct_h=ct_h, fills=fills, rent_k=rent_k, fills_k=fills_k, mark=mark, net_k=net_k, rent_fill=rent_fill)
+
+
+def _pool(df: pd.DataFrame) -> dict:
+    return {c: float(df[c].sum()) for c in _SUMS}
+
+
+def _saturday_end_utc(sat: str) -> datetime:
+    d = datetime.strptime(sat, "%Y-%m-%d") + timedelta(days=1)
+    return ET.localize(d).astimezone(timezone.utc)          # pytz: localize, never replace(tzinfo=)
+
+
+def next_saturday_after(d):
+    """The first Saturday strictly after date d (a Saturday maps to the next one)."""
+    return d + timedelta(days=((5 - d.weekday()) % 7) or 7)
+
+
+def _nan_none(v):
+    return None if _isnan(v) else round(float(v), 4)
+
+
+def evaluate_gate(blocks: pd.DataFrame, now_utc: datetime, through_et: str, base_mult: float) -> dict:
+    """Score every boosted Saturday in `blocks` (gate_blocks output). Returns
+    {"status": PASS|FAIL|PENDING, "reason", "saturdays", "rows", "checks"}:
+    rows = one per (Saturday, boosted block) with the Saturday and anchor
+    rates; checks = one per test with ok True/False (None = not judged)."""
+    out = {"status": "PENDING", "reason": "", "saturdays": [], "rows": [], "checks": []}
+    if blocks is None or blocks.empty:
+        out["reason"] = "no cycle-log rows in the window"
+        return out
+    thr = 1.0 + 0.5 * (base_mult - 1.0)
+    weekdays = blocks[blocks["day_type"] == "Weekday"]
+    pooled = {c: 0.0 for c in _SUMS}
+    immature = []
+    for sat in sorted(d for d in set(blocks["et_date"]) if day_type(d) == "Saturday" and d <= through_et):
+        sb = blocks[blocks["et_date"] == sat].set_index("block")
+        day_hm = float(sb.loc["day", "hm"]) if "day" in sb.index else float("nan")
+        knob_live = not _isnan(day_hm) and day_hm >= thr
+        boosted = [b for b in BLOCKS if b in sb.index and knob_live and (sat, BLOCK_START[b]) >= GATE_KNOB_LIVE
+                   and sb.loc[b, "ct_h"] > 0]
+        if not boosted:
+            continue
+        out["saturdays"].append(sat)
+        if now_utc < _saturday_end_utc(sat) + timedelta(hours=24):
+            immature.append(sat)
+        d = datetime.strptime(sat, "%Y-%m-%d")
+        week = {(d - timedelta(days=k)).strftime("%Y-%m-%d") for k in range(1, 6)}
+        own = sorted(set(weekdays["et_date"]) & week)
+        anchor_dates, anchor_kind = (own, "same week") if len(own) >= 2 else (sorted(set(weekdays["et_date"])), "all weekdays")
+        anchor = weekdays[weekdays["et_date"].isin(anchor_dates)]
+        sat_sum = {c: 0.0 for c in _SUMS}
+        anc_sum = {c: 0.0 for c in _SUMS}
+        for b in boosted:
+            sm = block_metrics(sb.loc[b])
+            ab = anchor[anchor["block"] == b]
+            am = block_metrics(_pool(ab)) if not ab.empty else block_metrics({c: 0.0 for c in _SUMS})
+            out["rows"].append(dict(saturday=sat, block=b, hours=int(sb.loc[b, "hours"]), anchor=anchor_kind,
+                                    anchor_dates=anchor_dates, sat=sm, wk=am))
+            ok = (not _isnan(sm["net_k"])) and (not _isnan(am["net_k"])) and sm["net_k"] >= am["net_k"]
+            out["checks"].append(dict(saturday=sat, check="G1 net vs weekdays", block=b, ok=ok,
+                                      value=_nan_none(sm["net_k"]), threshold=_nan_none(am["net_k"]),
+                                      detail=f"{BLOCK_LABEL[b]}: net {_g(sm['net_k'], '{:.1f}')} vs weekdays "
+                                             f"{_g(am['net_k'], '{:.1f}')} c per 1k resting ct-h ({anchor_kind})"))
+            for c in _SUMS:
+                sat_sum[c] += float(sb.loc[b, c])
+                anc_sum[c] += float(ab[c].sum()) if not ab.empty else 0.0
+                pooled[c] += float(sb.loc[b, c])
+        st, an = block_metrics(sat_sum), block_metrics(anc_sum)
+        out["rows"][-1]["sat_all"], out["rows"][-1]["wk_all"] = st, an
+        ok = (not _isnan(st["net_k"])) and st["net_k"] > 0
+        out["checks"].append(dict(saturday=sat, check="G2 net positive", block="boosted", ok=ok,
+                                  value=_nan_none(st["net_k"]), threshold=0.0,
+                                  detail=f"boosted hours net {_g(st['net_k'], '{:.1f}')} c per 1k resting ct-h"))
+        if st["fills"] <= 0:
+            ok, detail = True, "no fills in the boosted hours"
+        elif _isnan(st["mark"]) or _isnan(an["mark"]):
+            ok, detail = False, "mark-out missing"
+        else:
+            ok = st["mark"] >= an["mark"] - GATE_MARKOUT_TOL_C
+            detail = f"mark-out {st['mark']:+.2f}c/fill vs weekdays {an['mark']:+.2f}c (tolerance {GATE_MARKOUT_TOL_C:g}c)"
+        out["checks"].append(dict(saturday=sat, check="G3 mark-out", block="boosted", ok=ok,
+                                  value=_nan_none(st["mark"]),
+                                  threshold=_nan_none(an["mark"] - GATE_MARKOUT_TOL_C if not _isnan(an["mark"]) else float("nan")),
+                                  detail=detail))
+    if not out["saturdays"]:
+        out["reason"] = "no boosted Saturday in the window yet"
+        return out
+    pm = block_metrics(pooled)
+    loss_fill = -100.0 * pooled["settle_pnl"] / pooled["settled_cts"] if pooled["settled_cts"] > 0 else float("nan")
+    if pooled["settled_cts"] < GATE_MIN_SETTLED_CTS:
+        ok, detail = None, (f"{pooled['settled_cts']:,.0f} settled contracts < {GATE_MIN_SETTLED_CTS:,.0f}; not judged")
+        net_fill = float("nan")
+    else:
+        net_fill = pm["rent_fill"] - loss_fill
+        ok = net_fill >= 0
+        detail = (f"rent {pm['rent_fill']:.2f}c/fill - settlement loss {loss_fill:.2f}c per settled fill = "
+                  f"{net_fill:+.2f}c ({pooled['settled_cts']:,.0f} of {pooled['fills']:,.0f} contracts settled)")
+    out["checks"].append(dict(saturday="pooled", check="G4 settled", block="boosted", ok=ok,
+                              value=_nan_none(net_fill), threshold=0.0, detail=detail))
+    if immature:
+        for c in out["checks"]:                     # an immature Saturday is not judged yet
+            if c["saturday"] in immature or c["saturday"] == "pooled":
+                c["ok"] = None
+                c["detail"] += " - pending (mark-outs incomplete)"
+        out["reason"] = f"{', '.join(immature)} not yet a full day + 24h old (mark-outs incomplete)"
+        return out
+    failed = [c for c in out["checks"] if c["ok"] is False]
+    out["status"] = "FAIL" if failed else "PASS"
+    out["reason"] = ("; ".join(f"{c['saturday']} {c['check']} ({c['detail']})" for c in failed)
+                     if failed else "no sign of edge degradation on any boosted Saturday")
+    return out
+
+
+def gate_family(series: str) -> str:
+    """Family key for the gate's who-drove-it table: every sports ladder /
+    escalator series is one family, every earnings-call book is one."""
+    if re.search(r"LADDER|ESCALATOR", series):
+        return "sports ladders/escalators"
+    if series.startswith("KXEARNINGSMENTION"):
+        return "earnings mention"
+    return series
+
+
+def gate_family_table(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, gate: dict, top: int = 8) -> list:
+    """For the NEWEST boosted Saturday: its boosted blocks by family against
+    the same blocks on its anchor weekdays, the top families by the
+    Saturday's resting contract-hours. Informational -- the checks judge the
+    whole long-dated book; this says who moved it."""
+    rows = [r for r in gate.get("rows", [])]
+    if not rows or ser.empty or cyc.empty:
+        return []
+    sat = rows[-1]["saturday"]
+    blocks = {r["block"] for r in rows if r["saturday"] == sat}
+    anchor_dates = rows[-1]["anchor_dates"]
+    hours = {h for h in range(24) if ("quiet" if h in QUIET_HOURS else "day") in blocks}
+
+    def agg(dates):
+        c = cyc[cyc["et_date"].isin(dates) & cyc["et_hour"].isin(hours)]
+        s = ser[ser["et_date"].isin(dates) & ser["et_hour"].isin(hours)]
+        s = s[s["series"].map(group_of) == "long-dated"].merge(c, on=["et_date", "et_hour"], how="inner")
+        s = s.assign(ct_h=s["sum_quoted"] / s["n_cycles"], rent_usd=s["sum_est_usd"] / s["n_cycles"] / 24.0,
+                     fam=s["series"].map(gate_family))
+        a = s.groupby("fam")[["ct_h", "rent_usd"]].sum()
+        if scored is not None and not scored.empty:
+            logged = set(zip(c["et_date"], c["et_hour"]))
+            f = scored[(scored["group"] == "long-dated") & scored["et_date"].isin(dates)]
+            f = f[[k in logged for k in zip(f["et_date"], f["et_hour"])]]
+            fa = f.assign(fam=f["series"].map(gate_family)).groupby("fam").agg(
+                fills=("cnt", "sum"), mk_w=("mk_w", "sum"), mk_n=("mk_n", "sum"),
+                settled_cts=("settled_cts", "sum"), settle_pnl=("settle_pnl", "sum"))
+            a = a.join(fa, how="left")
+        for col in _SUMS:
+            a[col] = a[col].fillna(0.0) if col in a.columns else 0.0
+        return a
+
+    sa, wa = agg([sat]), agg(anchor_dates)
+    tot = float(sa["ct_h"].sum()) or 1.0
+    out = []
+    for fam in sa.sort_values("ct_h", ascending=False).index[:top]:
+        sm = block_metrics(sa.loc[fam])
+        wm = block_metrics(wa.loc[fam]) if fam in wa.index else None
+        out.append(dict(saturday=sat, fam=fam, share=100.0 * float(sa.loc[fam, "ct_h"]) / tot, sat=sm, wk=wm))
+    return out
+
+
+def write_gate_verdict(gate: dict, now_utc: datetime, through_et: str, base_mult: float, gated_mult: float,
+                       path: str, overwrite: bool = False) -> bool:
+    """Write the verdict the bot reads (atomically). Only a PASS/FAIL is ever
+    written, and an existing file only with overwrite=True (--gate-rewrite):
+    the scheduled run decides ONCE."""
+    if gate.get("status") not in ("PASS", "FAIL"):
+        return False
+    if os.path.exists(path) and not overwrite:
+        return False
+    payload = {
+        "verdict": gate["status"],
+        "mult": float(gated_mult),
+        "base_mult": float(base_mult),
+        "effective_from": next_saturday_after(now_utc.astimezone(ET).date()).isoformat(),
+        "written_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "through_et": through_et,
+        "rule": GATE_RULE,
+        "saturdays": gate["saturdays"],
+        "reason": gate["reason"],
+        "checks": gate["checks"],
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=1)
+    os.replace(tmp, path)
+    return True
+
+
+def _g(v, f: str = "{:7.1f}") -> str:
+    """Gate text number: '-' for a missing value (the report's convention)."""
+    return "-".rjust(len(f.format(0.0))) if _isnan(v) else f.format(v)
+
+
+def gate_text(gate: dict, written: bool) -> list:
+    """ASCII lines for the text part (cp1252 console, see _hours_summary)."""
+    lines = ["", f"== 2x gate ({GATE_RULE}) =="]
+    lines.append(f"status: {gate['status']}" + (" - verdict WRITTEN this run" if written else "")
+                 + (f" - {gate['reason']}" if gate.get("reason") else ""))
+    for r in gate.get("rows", []):
+        s, w = r["sat"], r["wk"]
+        lines.append(f"  {r['saturday']} {BLOCK_LABEL[r['block']]:8} ({r['hours']}h)  "
+                     f"Sat net {_g(s['net_k'])} rent {_g(s['rent_k'], '{:6.1f}')} fills/1k {_g(s['fills_k'], '{:5.2f}')} "
+                     f"mark {_g(s['mark'], '{:+6.2f}')}  |  weekdays net {_g(w['net_k'])} rent {_g(w['rent_k'], '{:6.1f}')} "
+                     f"fills/1k {_g(w['fills_k'], '{:5.2f}')} mark {_g(w['mark'], '{:+6.2f}')}  [{r['anchor']}]")
+    for c in gate.get("checks", []):
+        mark = "ok  " if c["ok"] is True else ("FAIL" if c["ok"] is False else "n/a ")
+        lines.append(f"  [{mark}] {c['saturday']} {c['check']}: {c['detail']}")
+    lines.append("  (net = modelled rent - mark-out cost, cents per 1,000 resting contract-hours; mark = 24h mid, else "
+                 "settlement, else the last logged mid inside 24h, cents per filled contract)")
+    fams = gate.get("families") or []
+    if fams:
+        lines.append(f"  who moved it, {fams[0]['saturday']} boosted hours by family (Sat | anchor weekdays, same hours):")
+        for r in fams:
+            s, w = r["sat"], r["wk"]
+            wk = (f"rent {_g(w['rent_k'], '{:6.1f}')} fills/1k {_g(w['fills_k'], '{:5.2f}')} "
+                  f"mark {_g(w['mark'], '{:+6.2f}')} net {_g(w['net_k'])}" if w else "not quoted on the anchor weekdays")
+            lines.append(f"    {r['fam'][:26]:26} {r['share']:5.1f}% of ct-h  rent {_g(s['rent_k'], '{:6.1f}')} "
+                         f"fills/1k {_g(s['fills_k'], '{:5.2f}')} mark {_g(s['mark'], '{:+6.2f}')} net {_g(s['net_k'])}  |  {wk}")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +787,7 @@ def _knob_lines(through_et: str, html: bool = False):
     times, arrow = ("×", "→") if html else ("x", "->")
     return [
         ("Saturday multiplier", f"{times}{imm.SAT_SIZE_MULT:g} on Saturdays (ET), long-dated families only"),
+        ("Saturday step-up", imm.sat_gate_summary()),
         ("Quiet hours", f"{_hours_summary(dict(imm.HOUR_SIZE_MULTS), html)} (long-dated only)"),
         ("No multiplier", f"daily families: prefixes {', '.join(EXCL)} + {len(structural)} structural"
                           + (f" ({', '.join(structural)})" if structural else " (none yet)")),
@@ -462,7 +817,7 @@ LEGEND = (
 
 # ---- plain text (console, task log, email text part) ------------------------
 
-def render(g: pd.DataFrame, through_et: str):
+def render(g: pd.DataFrame, through_et: str, gate: dict = None, written: bool = False):
     pd.set_option("display.width", 250)
 
     def table(df: pd.DataFrame) -> str:
@@ -478,6 +833,8 @@ def render(g: pd.DataFrame, through_et: str):
         lines.append(f"{label}: {value}")
     lines.append("cents per contract unless noted; rent = modelled accrual (pre-realization, ~1.2x paid account-wide, "
                  "~2x on mention); loss/fill = settlement loss on the settled subset; mo24 = 24h mark-out (all fills).")
+    if gate:
+        lines.extend(gate_text(gate, written))
     per_day, pooled_m, base = _tables(g)
     if per_day.empty:
         lines.append("\n(no cycle-log rows in the window yet)")
@@ -590,7 +947,64 @@ def _per_day_table(per_day: pd.DataFrame, grp: str) -> str:
     return _html_table(head, rows)
 
 
-def render_html(g: pd.DataFrame, through_et: str) -> str:
+def _gate_html(gate: dict, written: bool) -> str:
+    """The x2 gate: status line, per-(Saturday, block) rates against the
+    weekday anchor, then every check."""
+    colour = {"PASS": "#0a7a2f", "FAIL": "#c0392b"}.get(gate["status"], "#b36b00")
+    h = ['<div style="font-size:15px;font-weight:600;margin-top:6px">2× gate</div>',
+         f'<div style="color:{_MUTED};margin:2px 0 4px">{_esc(GATE_RULE)}. Net = modelled rent − 24h mark-out '
+         f'cost, ¢ per 1,000 resting contract-hours; each boosted block against the same block on its own '
+         f'week\'s weekdays.</div>',
+         f'<div style="margin:2px 0 6px"><span style="color:{colour};font-weight:600">{_esc(gate["status"])}</span>'
+         + (" — verdict written this run" if written else "")
+         + (f' <span style="color:{_MUTED}">— {_esc(gate["reason"])}</span>' if gate.get("reason") else "")
+         + "</div>"]
+    if gate.get("rows"):
+        head = [("Saturday", True), ("Block", True), ("Hours", False), ("Sat net", False), ("Weekday net", False),
+                ("Sat rent", False), ("Weekday rent", False), ("Sat fills/1k", False), ("Weekday fills/1k", False),
+                ("Sat mark-out ¢", False), ("Weekday mark-out ¢", False), ("Anchor", True)]
+        rows = []
+        for r in gate["rows"]:
+            s, w = r["sat"], r["wk"]
+            num = lambda v, f="{:.1f}": _esc("–" if _isnan(v) else f.format(v))
+            cells = [f'<td style="{_TDL}">{r["saturday"]}</td>', f'<td style="{_TDL}">{BLOCK_LABEL[r["block"]]}</td>',
+                     f'<td style="{_TD}">{r["hours"]}</td>',
+                     f'<td style="{_TD};font-weight:600">{num(s["net_k"])}</td>', f'<td style="{_TD}">{num(w["net_k"])}</td>',
+                     f'<td style="{_TD}">{num(s["rent_k"])}</td>', f'<td style="{_TD}">{num(w["rent_k"])}</td>',
+                     f'<td style="{_TD}">{num(s["fills_k"], "{:.2f}")}</td>', f'<td style="{_TD}">{num(w["fills_k"], "{:.2f}")}</td>',
+                     f'<td style="{_TD}">{num(s["mark"], "{:+.2f}")}</td>', f'<td style="{_TD}">{num(w["mark"], "{:+.2f}")}</td>',
+                     f'<td style="{_TDL};color:{_MUTED}">{_esc(r["anchor"])}</td>']
+            rows.append((f"background:{_SAT_BG}", cells))
+        h.append(_html_table(head, rows))
+    if gate.get("checks"):
+        rows = []
+        for c in gate["checks"]:
+            res, col = (("ok", "#0a7a2f") if c["ok"] is True else (("FAIL", "#c0392b") if c["ok"] is False
+                                                                   else ("not judged", _MUTED)))
+            rows.append(("", [f'<td style="{_TDL}">{_esc(c["check"])}</td>', f'<td style="{_TDL}">{_esc(c["saturday"])}</td>',
+                              f'<td style="{_TDL};color:{col};font-weight:600">{res}</td>',
+                              f'<td style="{_TDL};white-space:normal">{_esc(c["detail"])}</td>']))
+        h.append(_html_table([("Check", True), ("Saturday", True), ("Result", True), ("Detail", True)], rows))
+    fams = gate.get("families") or []
+    if fams:
+        num = lambda v, f="{:.1f}": _esc("–" if (v is None or _isnan(v)) else f.format(v))
+        h.append(f'<div style="font-size:14px;font-weight:600">Who moved it — {fams[0]["saturday"]} boosted hours by family</div>'
+                 f'<div style="color:{_MUTED};margin:2px 0 4px">Informational: the checks judge the whole long-dated '
+                 f'book. Anchor = the same hours on its weekdays.</div>')
+        head = [("Family", True), ("Share of ct-h %", False), ("Sat rent", False), ("Sat fills/1k", False),
+                ("Sat mark-out ¢", False), ("Sat net", False), ("Weekday rent", False), ("Weekday net", False)]
+        rows = []
+        for r in fams:
+            s, w = r["sat"], r["wk"] or {}
+            rows.append(("", [f'<td style="{_TDL}">{_esc(r["fam"])}</td>', f'<td style="{_TD}">{num(r["share"])}</td>',
+                              f'<td style="{_TD}">{num(s["rent_k"])}</td>', f'<td style="{_TD}">{num(s["fills_k"], "{:.2f}")}</td>',
+                              f'<td style="{_TD}">{num(s["mark"], "{:+.2f}")}</td>', f'<td style="{_TD};font-weight:600">{num(s["net_k"])}</td>',
+                              f'<td style="{_TD}">{num(w.get("rent_k"))}</td>', f'<td style="{_TD}">{num(w.get("net_k"))}</td>']))
+        h.append(_html_table(head, rows))
+    return "".join(h)
+
+
+def render_html(g: pd.DataFrame, through_et: str, gate: dict = None, written: bool = False) -> str:
     per_day, pooled_m, base = _tables(g)
     h = [f'<div style="{_FONT}">']
     h.append(f'<div style="font-size:17px;font-weight:600">IMM Saturday ×{imm.SAT_SIZE_MULT:g} tracker'
@@ -600,6 +1014,8 @@ def render_html(g: pd.DataFrame, through_et: str) -> str:
         h.append(f'<tr><td style="{_TDL};color:{_MUTED}">{_esc(label)}</td>'
                  f'<td style="{_TDL};white-space:normal">{_esc(value)}</td></tr>')
     h.append("</table>")
+    if gate:
+        h.append(_gate_html(gate, written))
     if per_day.empty:
         h.append(f'<div style="color:{_MUTED}">(no cycle-log rows in the window yet)</div></div>')
         return "".join(h)
@@ -636,6 +1052,8 @@ def main() -> int:
     ap.add_argument("--test", action="store_true", help="email now, no sent marker")
     ap.add_argument("--through", default="", help="last ET date to include (default: yesterday ET)")
     ap.add_argument("--html-out", default="", help="also write the HTML email body to this path (with --print: a no-send preview)")
+    ap.add_argument("--gate-rewrite", action="store_true",
+                    help="re-evaluate the 2x gate and OVERWRITE the bot's verdict file now (by hand; any mode)")
     args = ap.parse_args()
     now_et = datetime.now(timezone.utc).astimezone(ET)
     through_et = args.through or (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -649,8 +1067,32 @@ def main() -> int:
     fills = load_fills(first_file)
     results = load_results()
     g = build_rows(ser, cyc, mid_tab, fills, results, through_et)
-    text = render(g, through_et)
-    html = render_html(g, through_et)
+    # the x2 gate: evaluated every run; the verdict file is written by the
+    # scheduled run only while none exists (or by hand, --gate-rewrite)
+    now_utc = datetime.now(timezone.utc)
+    gate, written = dict(status="PENDING", reason="", saturdays=[], rows=[], checks=[]), False
+    try:
+        scored = score_fills(fills, mid_tab, results) if not fills.empty else pd.DataFrame()
+        gate = evaluate_gate(gate_blocks(ser, cyc, scored, through_et), now_utc, through_et, imm.SAT_SIZE_MULT)
+        try:
+            gate["families"] = gate_family_table(ser, cyc, scored, gate)
+        except Exception as e:                      # explanatory only; never costs the verdict
+            log(f"[SAT] ! gate family table failed: {type(e).__name__}: {e}")
+        on_file = os.path.exists(imm.sat_gate_path())
+        if on_file and not args.gate_rewrite:
+            gate["reason"] = (f"re-check only, verdict on file is not rewritten ({imm.sat_gate_summary()})"
+                              + (f"; {gate['reason']}" if gate.get("reason") else ""))
+        if imm.SAT_SIZE_MULT_GATED > imm.SAT_SIZE_MULT and (args.gate_rewrite or not (args.print or args.dry or args.test)):
+            written = write_gate_verdict(gate, now_utc, through_et, imm.SAT_SIZE_MULT, imm.SAT_SIZE_MULT_GATED,
+                                         imm.sat_gate_path(), overwrite=args.gate_rewrite)
+            if written:
+                imm.load_sat_gate()
+                log(f"[SAT] 2x gate verdict {gate['status']} written to {imm.sat_gate_path()}: {imm.sat_gate_summary()}")
+    except Exception as e:                          # the gate must never cost the weekly email
+        gate = dict(status="ERROR", reason=f"{type(e).__name__}: {e}", saturdays=[], rows=[], checks=[])
+        log(f"[SAT] ! 2x gate evaluation failed: {type(e).__name__}: {e}")
+    text = render(g, through_et, gate, written)
+    html = render_html(g, through_et, gate, written)
     print(text)
     if args.html_out:
         with open(args.html_out, "w", encoding="utf-8") as f:
@@ -659,6 +1101,13 @@ def main() -> int:
     if args.print or args.dry:
         return 0
     subject = f"IMM Saturday x{imm.SAT_SIZE_MULT:g} tracker - through {through_et}"
+    if written:
+        eff = imm.SAT_GATE_STATE.get("effective_from")
+        step = imm.gated_sat_mult(eff) if eff is not None else 0.0
+        subject += (f" - 2x gate PASS: x{step:g} on Saturdays from {eff.isoformat()}" if gate["status"] == "PASS" and step
+                    else f" - 2x gate {gate['status']}: Saturday stays x{imm.SAT_SIZE_MULT:g}")
+    elif gate["status"] == "ERROR":
+        subject += " - 2x gate ERROR"
     ok = imm.Alerter("IMM-SAT", live=True).send_message(text, subject=subject, html=html)
     log(f"[SAT] email {'sent' if ok else 'FAILED'}: {subject}")
     if ok and not args.test:
