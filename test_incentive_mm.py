@@ -3238,8 +3238,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         try:
             imm.ensure_family_override(fake)
             self.assertTrue(imm.series_safe_join(fake))
+            # every guard but the rate floor (2026-09-27: "drop the $2/day
+            # floor" for the states while the GasBuddy gate is on)
             self.assertEqual(imm.series_min_est_rate(fake),
-                             imm.series_min_est_rate("KXAAAGASD"))
+                             imm.GB_STATE_MIN_RATE if imm.GB_FAIR_ENABLE
+                             else imm.series_min_est_rate("KXAAAGASD"))
             self.assertEqual(imm.SERIES_OVERRIDES[fake].blackout_et,
                              imm.SERIES_OVERRIDES["KXAAAGASD"].blackout_et)
         finally:
@@ -8043,8 +8046,8 @@ class TestGasBuddyFairGate(unittest.TestCase):
         now = datetime.now(timezone.utc)
         far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         client.programs.append(
-            # 10x the OpenRouter fixture: the family inherits the national
-            # KXAAAGASD $2/day rate floor
+            # 10x the OpenRouter fixture: the $1-per-period payout floor
+            # still applies to the family
             {"market_ticker": self.T, "incentive_type": "liquidity",
              "period_reward": 70000000, "target_size_fp": "1000.00",
              "discount_factor_bps": 5000, "paid_out": False,
@@ -8108,6 +8111,27 @@ class TestGasBuddyFairGate(unittest.TestCase):
         self._write(mu=4.0, sigma=0.005)
         self.assertEqual(imm.gb_gate_reason(self.T, time.time(), 50, 50), ("", {}))
         self.assertEqual(imm.gb_gate_reason(self.T, time.time(), 51, 52)[1]["bid_bad"], True)
+
+    def test_state_clone_drops_only_the_rate_floor(self):
+        fake = "KXAAAGASDQX"
+        self.assertNotIn(fake, imm.SERIES_OVERRIDES)
+        try:
+            imm.ensure_family_override(fake)
+            self.assertEqual(imm.series_min_est_rate(fake), 0.0)
+            self.assertEqual(imm.series_min_est_rate("KXAAAGASD"), 2.0)   # national keeps it
+            self.assertTrue(imm.series_safe_join(fake))
+            self.assertEqual(imm.SERIES_OVERRIDES[fake].blackout_et,
+                             imm.SERIES_OVERRIDES["KXAAAGASD"].blackout_et)
+            with mock.patch.object(imm, "GB_STATE_MIN_RATE", 2.0):
+                imm.SERIES_OVERRIDES.pop(fake, None)
+                imm.ensure_family_override(fake)
+                self.assertEqual(imm.series_min_est_rate(fake), 2.0)
+            with mock.patch.object(imm, "GB_FAIR_ENABLE", False):
+                imm.SERIES_OVERRIDES.pop(fake, None)
+                imm.ensure_family_override(fake)                   # plain clone
+                self.assertEqual(imm.series_min_est_rate(fake), 2.0)
+        finally:
+            imm.SERIES_OVERRIDES.pop(fake, None)
 
     def test_loader_drops_bad_rows(self):
         with open(imm.GB_FAIR_FILE, "w", encoding="utf-8") as f:

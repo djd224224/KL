@@ -4006,3 +4006,24 @@ history, pending / failing anchors, 15-min live log, fetch parsing); the
 four 9/14 pattern tests now assert the kill-switch form. 798 green
 (test_incentive_mm, test_gasbuddy_fair, test_carbon_arc_fair,
 test_openrouter_fair, test_send_imm_new_programs).
+
+### 2026-09-27 pm — live check + the state dailies' $2/day rate floor dropped (Jack)
+
+Deployed 15:46Z (Jack's 15:39Z restart ran before the 11:45 ET sync, so it
+reloaded the old code; restart_imm.ps1 re-run after the sync). First refresh
+15:48Z: 26/26 events with a read. First selection with reads (15:58Z): of
+442 state strikes, 335 rejected by the gate at selection (gb_fair), 42
+one-sided, 10 extreme-mid, 61 rate_floor, 14 payout_floor -- NONE selected.
+The accepted strikes' estimated share is ~0.4% of books holding 10-30k
+contracts at the 20-lot size: est median $0.58/day per strike (p90 $1.68,
+max $4.02) against the national KXAAAGASD $2/day rate floor they inherited.
+
+Jack: "drop the $2/day floor". GB_STATE_MIN_RATE (IMM_GB_STATE_MIN_RATE,
+default 0) replaces min_est_per_day when ensure_family_override clones the
+national guard set onto a two-letter state (only while the gate is on);
+every other guard is unchanged and the national keeps its $2/day bar.
+IMM_GB_STATE_MIN_RATE=2 restores it. The $1-per-period payout floor still
+decides entry, and over a 16h period with the 4pm-1am halving it needs about
+$2/day of estimate as well: 4 of the 68 gate-passing two-sided strikes
+cleared it on 9/27's books (17 at x2 size, 28 at x3, 43 at x4). Test:
+test_state_clone_drops_only_the_rate_floor. 799 green.

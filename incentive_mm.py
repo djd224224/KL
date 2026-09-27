@@ -4739,6 +4739,11 @@ def ensure_family_override(series: str) -> None:
                 log(f"[IMM] ! family parent {parent} has no override; "
                     f"{series} quotes unguarded")
             return
+        if GB_FAIR_ENABLE and parent == "KXAAAGASD" and gb_fair_series(series):
+            # The AAA state dailies keep every national guard EXCEPT its
+            # $2/day rate floor (Jack 2026-09-27: "drop the $2/day floor"):
+            # the $1-per-period payout floor still decides entry.
+            ov = replace(ov, min_est_per_day=GB_STATE_MIN_RATE)
         SERIES_OVERRIDES[series] = ov
         log(f"[IMM] {series}: family override inherited from {parent}")
         return
@@ -5243,6 +5248,7 @@ _CONFIG_CODE_KNOBS = (
     # fair file's "model" block (gasbuddy_fair.py)
     "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",
     "GB_FAIR_SIGMA_LO_FRAC", "GB_FAIR_MAX_SIGMA_CENTS", "GB_FAIR_REFRESH_SECS",
+    "GB_STATE_MIN_RATE",
 )
 
 
@@ -6133,6 +6139,15 @@ GB_FAIR_SIGMA_LO_FRAC = _env_float("IMM_GB_FAIR_SIGMA_LO_FRAC", 0.5)
 GB_FAIR_MAX_SIGMA_CENTS = _env_float("IMM_GB_FAIR_MAX_SIGMA_CENTS", 2.0)
 GB_FAIR_FILE = os.environ.get(
     "IMM_GB_FAIR_FILE", os.path.join(STATUS_DIR, "gasbuddy_fair.json"))
+# The state dailies' est-$/day RATE floor (Jack 2026-09-27: "drop the $2/day
+# floor"). They inherit the national KXAAAGASD guard set, whose $2/day bar
+# screened every gate-passing strike on the first live refresh (61 of them,
+# est median $0.58/day at the 20-lot size); only this key is replaced at the
+# clone (ensure_family_override). 0 = off. The $1-per-period payout floor
+# still applies, and over a 16h period with the 4pm-1am halving it needs
+# ~$2/day of estimate too -- 4 of 68 gate-passing strikes cleared it on
+# 9/27. IMM_GB_STATE_MIN_RATE=2 restores the national bar.
+GB_STATE_MIN_RATE = _env_float("IMM_GB_STATE_MIN_RATE", 0.0)
 _GB_STRIKE_RE = re.compile(r"-(\d+(?:\.\d+)?)$")
 _gb_fair_state: dict = {"mtime": 0.0, "entries": {}}
 
