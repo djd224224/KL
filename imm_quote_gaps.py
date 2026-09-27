@@ -616,6 +616,17 @@ def classify_and_estimate(client, bot, now_utc: datetime):
                                         r["ticker"] in prev_selected
                                         or accrued > 0.0):
             r["reason"] = "under payout floor"
+        elif (imm.ADMIT_SUSTAIN_SECS > 0 and not curated
+              and r["ticker"] not in prev_selected
+              and meta.event_ticker not in imm.FORCE_EVENTS
+              and now_ts - (bot.state.admit_run.get(r["ticker"])
+                            or [now_ts])[0] < imm.ADMIT_SUSTAIN_SECS):
+            # over the bar, but the bot admits only once the projection has
+            # HELD there for the sustain window (2026-09-27 admission clock)
+            _run = bot.state.admit_run.get(r["ticker"])
+            _held = (now_ts - _run[0]) if _run else 0.0
+            r["reason"] = (f"admission clock ({_held / 60:.0f} of "
+                           f"{imm.ADMIT_SUSTAIN_SECS / 60:.0f} min held)")
         else:
             r["reason"] = "capacity (cap/budget)"
 

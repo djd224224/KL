@@ -28,6 +28,14 @@ imm.SAT_GATE_STATE.update(mtime=0.0, verdict="", mult=0.0, effective_from=None)
 # Neutralize globally; the activation-window tests re-enable it locally.
 imm.HOURLY_ACTIVATION_WINDOW_SECS = 0
 
+# The admission clock (2026-09-27) makes every fresh admission wait for a
+# second above-bar reading ADMIT_SUSTAIN_SECS later. The suite's selection
+# tests are about the rule that ADMITS (floors, bands, caps...) in one
+# refresh, so the clock is off by default here, exactly as
+# IMM_ADMIT_SUSTAIN_SECS=0 turns it off live; TestAdmissionClock re-arms it.
+_ADMIT_SUSTAIN_CODE_DEFAULT = imm.ADMIT_SUSTAIN_SECS
+imm.ADMIT_SUSTAIN_SECS = 0
+
 
 def setUpModule():
     """Sandbox all file side effects (HALT file, persisted state, status
@@ -6071,8 +6079,10 @@ class TestHourBoundaryRefresh(unittest.TestCase):
     def test_activation_window_refreshes_every_cycle(self):
         # Kalshi publishes hourly programs minutes AFTER hh:00: inside the
         # first HOURLY_ACTIVATION_WINDOW_SECS the 600s gate must not hold,
-        # even same-hour and seconds after the last refresh.
+        # even same-hour and seconds after the last refresh -- while an
+        # hourly program is in the feed (auto-arm, 2026-09-27).
         bot = self._bot()
+        bot._hourly_programs_live = True
         imm.HOURLY_ACTIVATION_WINDOW_SECS = 720
         try:
             now = datetime(2099, 1, 1, 5, 5, 0, tzinfo=timezone.utc)
@@ -14365,6 +14375,524 @@ class TestSelectionDecisionInputs(unittest.TestCase):
                                     for o in bot.state.sim_orders.values())
         self.assertTrue(orders[True])
         self.assertEqual(orders[True], orders[False])
+
+
+# ----------------------------------------------------------------------------
+# ROI scan 2026-09-27 (Jack: "build 1,2,3,4")
+# ----------------------------------------------------------------------------
+
+class TestAdmissionClock(unittest.TestCase):
+    """Item 1. Entry was a single reading, and the estimate swings ~2x between
+    refreshes, so admission bought the spikes: at admission the estimate was a
+    median 1.69x the market's last rejected reading, the market then earned
+    0.71x of it, and 69% of fresh admissions (9/13-9/26) ended hopeless. A
+    projection must now HOLD at/above its bar for ADMIT_SUSTAIN_SECS before a
+    fresh admission, and before an above-bar run may reset the hopeless
+    clock."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        self._saved = imm.ADMIT_SUSTAIN_SECS
+        imm.ADMIT_SUSTAIN_SECS = 600
+        _clean_persist()
+
+    def tearDown(self):
+        imm.ADMIT_SUSTAIN_SECS = self._saved
+        _clean_persist()
+
+    def _bot(self):
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def _refresh(self, bot):
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+
+    def test_defaults(self):
+        # armed in code (the suite switches it off at import for the rest)
+        if "IMM_ADMIT_SUSTAIN_SECS" not in os.environ:
+            self.assertEqual(_ADMIT_SUSTAIN_CODE_DEFAULT, 600)
+        self.assertEqual(self._saved, 0)
+        self.assertEqual(imm.ADMIT_RUN_MAX_GAP_SECS, 1500)
+
+    def test_fresh_candidate_waits_one_sustain_window(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot._selection_prev.get(self.T), "admit_pending")
+        self.assertIn(self.T, bot.state.admit_run)
+        self.assertFalse(bot.state.sim_orders)              # nothing rests yet
+        # the run has now held for the sustain window: the next reading admits
+        bot.state.admit_run[self.T][0] -= 601
+        self._refresh(bot)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertTrue(bot.state.sim_orders)
+
+    def test_a_sub_bar_reading_restarts_the_run(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot.state.admit_run[self.T][0] -= 601               # would admit next...
+        old = imm.MIN_EST_TOTAL_DOLLARS
+        imm.MIN_EST_TOTAL_DOLLARS = 1e9                     # ...but it dips first
+        try:
+            self._refresh(bot)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS = old
+        self.assertNotIn(self.T, bot.state.admit_run)
+        self._refresh(bot)                                  # back over the bar
+        self.assertNotIn(self.T, bot.state.selected)        # a NEW run: waits
+        self.assertEqual(bot._selection_prev.get(self.T), "admit_pending")
+
+    def test_a_reading_gap_restarts_the_run(self):
+        # a market screened out for a while (or a restart after a sleep) must
+        # not come back and be admitted on its first reading by an old run
+        bot = self._bot()
+        now = time.time()
+        bot.state.admit_run[self.T] = [now - 5000.0,
+                                       now - imm.ADMIT_RUN_MAX_GAP_SECS - 60]
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertGreater(bot.state.admit_run[self.T][0], now - 60)
+
+    def test_kill_switch_admits_on_one_reading(self):
+        imm.ADMIT_SUSTAIN_SECS = 0
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+
+    def test_near_cliff_reentrant_does_not_wait(self):
+        # the near-cliff scale trick of TestNearCliffQuoteToCompletion: banked
+        # $0.90 of a 1e9-scaled cliff, projection within the margin
+        old = (imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS)
+        imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = 2e9, 1e9
+        try:
+            with mock.patch.object(imm, "NEAR_CLIFF_DOLLARS", 0.15e9):
+                bot = self._bot()
+                bot.state.accrued_est[self.T] = 0.90e9
+                bot.state.period_start[self.T] = imm.parse_iso_utc(
+                    bot.client.programs[0]["start_date"]).isoformat()
+                # it sat under the bar for hours before this reading
+                bot.state.hopeless_since[self.T] = time.time() - 4 * 3600
+                bot.run_cycle()
+                self.assertIn(self.T, bot.state.selected)
+                self.assertTrue(bot.state.selected[self.T].near_cliff)
+                # ...and is admitted with a CLEAN dip guard, not a clock that
+                # would evict it on the very next sub-bar reading
+                self.assertNotIn(self.T, bot.state.hopeless_since)
+        finally:
+            imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
+
+    def test_members_never_wait(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot.state.admit_run[self.T][0] -= 601
+        self._refresh(bot)
+        self.assertIn(self.T, bot.state.selected)
+        bot.state.admit_run.pop(self.T)                     # a brand-new run
+        self._refresh(bot)
+        self.assertIn(self.T, bot.state.selected)           # members ride
+
+    def test_single_spike_does_not_reset_the_hopeless_clock(self):
+        bot = self._bot()
+        t0 = 1_000_000.0
+        sub, above = bot._floor_clocks("A", False, t0)
+        self.assertEqual((sub, above), (0.0, 0.0))
+        self.assertEqual(bot.state.hopeless_since["A"], t0)
+        sub, above = bot._floor_clocks("A", True, t0 + 600)  # one spike
+        self.assertEqual(above, 0.0)
+        self.assertEqual(bot.state.hopeless_since["A"], t0)  # clock NOT reset
+        sub, above = bot._floor_clocks("A", False, t0 + 1800)
+        self.assertEqual(sub, 1800.0)                         # ...so it fires
+        self.assertNotIn("A", bot.state.admit_run)
+        self.assertTrue(imm.HOPELESS_EXIT and sub >= imm.HOPELESS_SUSTAIN_SECS)
+        # a HELD recovery resets it
+        bot._floor_clocks("A", True, t0 + 1900)
+        self.assertIn("A", bot.state.hopeless_since)
+        sub, above = bot._floor_clocks("A", True, t0 + 2500)
+        self.assertEqual(above, 600.0)
+        self.assertNotIn("A", bot.state.hopeless_since)
+        self.assertEqual(sub, 0.0)
+
+    def test_single_reading_reset_under_the_kill_switch(self):
+        imm.ADMIT_SUSTAIN_SECS = 0
+        bot = self._bot()
+        bot._floor_clocks("A", False, 1_000_000.0)
+        bot._floor_clocks("A", True, 1_000_600.0)
+        self.assertNotIn("A", bot.state.hopeless_since)
+
+    def test_member_evicted_through_a_spike(self):
+        """End to end: a member under the bar since long ago whose projection
+        spikes over the bar for ONE refresh and falls back leaves at that next
+        refresh, instead of starting a fresh 30 minutes."""
+        imm.ADMIT_SUSTAIN_SECS = 0
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        imm.ADMIT_SUSTAIN_SECS = 600
+        long_ago = time.time() - imm.HOPELESS_SUSTAIN_SECS - 60
+        bot.state.hopeless_since[self.T] = long_ago
+        self._refresh(bot)                                   # over the bar: spike
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.hopeless_since.get(self.T), long_ago)
+        old = imm.PAYOUT_FLOOR_DOLLARS
+        imm.PAYOUT_FLOOR_DOLLARS = 1e9                       # member bar: under
+        try:
+            self._refresh(bot)
+        finally:
+            imm.PAYOUT_FLOOR_DOLLARS = old
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot._selection_prev.get(self.T), "hopeless")
+
+    def test_run_survives_a_restart(self):
+        bot = self._bot()
+        bot.state.known_tickers = {"A"}
+        bot.state.admit_run["A"] = [1_000_000.0, 1_000_600.0]
+        bot._save_persist()
+        bot2 = self._bot()
+        self.assertEqual(bot2.state.admit_run.get("A"), [1_000_000.0, 1_000_600.0])
+
+
+class TestHourlyWindowAutoArm(unittest.TestCase):
+    """Item 2. The hh:00-hh:11 per-cycle refresh window exists for hourly
+    program families; with none in the feed since >= 9/25 it only slowed the
+    quote loop (126s vs 42s cycles) for a fifth of every hour."""
+
+    def setUp(self):
+        _clean_persist()
+        self._win = imm.HOURLY_ACTIVATION_WINDOW_SECS
+        imm.HOURLY_ACTIVATION_WINDOW_SECS = 720
+
+    def tearDown(self):
+        imm.HOURLY_ACTIVATION_WINDOW_SECS = self._win
+        _clean_persist()
+
+    def _in_window(self, bot):
+        now = datetime(2099, 1, 1, 5, 5, 0, tzinfo=timezone.utc)
+        prev = datetime(2099, 1, 1, 5, 3, 30, tzinfo=timezone.utc).timestamp()
+        bot.state.universe_at = prev
+        bot.refresh_universe(now, {})
+        return bot.state.universe_at != prev                 # True = refreshed
+
+    def test_window_stays_off_without_an_hourly_program(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertFalse(bot._hourly_programs_live)
+        self.assertFalse(self._in_window(bot))
+
+    def test_kill_switch_keeps_the_window_unconditional(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "HOURLY_ACTIVATION_AUTO", False):
+            self.assertTrue(self._in_window(bot))
+
+    def test_a_live_feed_arms_and_disarms_it(self):
+        c = FakeClient()
+        now = datetime.now(timezone.utc)
+        c.programs[0] = dict(
+            c.programs[0],
+            start_date=(now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            end_date=(now + timedelta(minutes=50)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        bot = IncentiveMarketMaker(client=c, live=False)
+        bot.refresh_universe(now, {})
+        self.assertTrue(bot._hourly_programs_live)
+        self.assertTrue(self._in_window(bot))
+        # the hourly program is gone from the next live read -> disarmed
+        c.programs[0] = FakeClient().programs[0]
+        bot.state.universe_at = 0.0
+        bot.refresh_universe(datetime.now(timezone.utc), {})
+        self.assertFalse(bot._hourly_programs_live)
+        # a failed / empty read keeps the previous verdict
+        bot._hourly_programs_live = True
+        c.programs = []
+        bot.state.universe_at = 0.0
+        bot.refresh_universe(datetime.now(timezone.utc), {})
+        self.assertTrue(bot._hourly_programs_live)
+
+
+class _HandoffClient(FakeClient):
+    """FakeClient with a resting book of imm- orders, for the restart
+    handoff: get_orders serves `resting` until cancel_order removes one."""
+
+    def __init__(self, resting):
+        super().__init__()
+        self.resting = list(resting)
+
+    def get_orders(self, **kw):
+        return {"orders": [dict(o) for o in self.resting], "cursor": None}
+
+    def cancel_order(self, order_id):
+        super().cancel_order(order_id)
+        self.resting = [o for o in self.resting if o["order_id"] != order_id]
+        return {}
+
+
+class TestRestartHandoff(unittest.TestCase):
+    """Item 3. A planned code-change restart used to cancel the whole book at
+    exit AND again at startup: ~6 minutes empty or partial per deploy (9/26:
+    656 orders pulled at 17:27:03, first placements 17:30:32), 17 deploys that
+    day. Now the exit hands the book over and the relaunch adopts it."""
+
+    OK, NEAR, GATED, UNSEL = ("KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B",
+                              "KXTRUMPMENTION-99DEC31-X", "KXGOOD-99DEC31-C")
+
+    def setUp(self):
+        _clean_persist()
+        try:
+            os.remove(imm.restart_handoff_path())
+        except OSError:
+            pass
+        self.created = (datetime.now(timezone.utc) - timedelta(minutes=10))
+
+    tearDown = setUp
+
+    def _order(self, oid, ticker):
+        return {"order_id": oid, "ticker": ticker, "status": "resting",
+                "client_order_id": f"imm-abc-{oid}", "book_side": "bid",
+                "yes_price": 40, "remaining_count": 20,
+                "created_time": self.created.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    def _bot(self):
+        orders = [self._order(f"o{i}", t) for i, t in
+                  enumerate((self.OK, self.NEAR, self.GATED, self.UNSEL))]
+        bot = IncentiveMarketMaker(client=_HandoffClient(orders), live=True)
+        now = datetime.now(timezone.utc)
+        for t, cut in ((self.OK, now + timedelta(days=2)),
+                       (self.NEAR, now + timedelta(minutes=10)),
+                       (self.GATED, now + timedelta(days=2))):
+            bot.state.selected[t] = MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0], series=imm.series_of(t),
+                dollars_per_day=10.0, program_end=now + timedelta(days=3),
+                target_size=1000.0, discount_factor=0.5, cutoff=cut,
+                close_time=now + timedelta(days=4))
+        return bot
+
+    def test_defaults(self):
+        self.assertTrue(imm.RESTART_KEEP_ORDERS)
+        self.assertEqual((imm.RESTART_HANDOFF_MAX_AGE_SECS,
+                          imm.RESTART_KEEP_MIN_CUTOFF_SECS), (300, 1800))
+
+    def test_exit_hands_over_the_safe_part_of_the_book(self):
+        bot = self._bot()
+        with mock.patch.object(bot, "_restart_preflight", return_value=(True, "ok")):
+            self.assertTrue(bot._prepare_restart_handoff())
+        # near-cutoff, live-event-gated and unselected markets are cancelled
+        self.assertEqual(sorted(bot.client.cancelled), ["o1", "o2", "o3"])
+        with open(imm.restart_handoff_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["order_ids"], ["o0"])
+        self.assertEqual((data["kept"], data["cancelled"]), (1, 3))
+        # ...and the shutdown path leaves the rest resting
+        bot.shutdown_cancel()
+        self.assertEqual(sorted(bot.client.cancelled), ["o1", "o2", "o3"])
+        self.assertEqual([o["order_id"] for o in bot.client.resting], ["o0"])
+
+    def test_failed_preflight_cancels_everything_as_before(self):
+        bot = self._bot()
+        with mock.patch.object(bot, "_restart_preflight",
+                               return_value=(False, "exit 1: SyntaxError")):
+            self.assertFalse(bot._prepare_restart_handoff())
+        self.assertFalse(os.path.exists(imm.restart_handoff_path()))
+        bot.shutdown_cancel()
+        self.assertEqual(sorted(bot.client.cancelled), ["o0", "o1", "o2", "o3"])
+
+    def test_kill_switch_and_halt_hand_over_nothing(self):
+        for patch in (mock.patch.object(imm, "RESTART_KEEP_ORDERS", False),
+                      mock.patch.object(imm, "HALT_FILE", __file__)):
+            bot = self._bot()
+            with patch, mock.patch.object(bot, "_restart_preflight",
+                                          return_value=(True, "ok")):
+                self.assertFalse(bot._prepare_restart_handoff())
+            self.assertFalse(getattr(bot.client, "cancelled", []))
+            self.assertFalse(os.path.exists(imm.restart_handoff_path()))
+
+    def _write_handoff(self, age):
+        with open(imm.restart_handoff_path(), "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time() - age, "run_id": "old", "kept": 4,
+                       "order_ids": ["o0"]}, f)
+
+    def test_startup_adopts_a_fresh_handoff(self):
+        self._write_handoff(30)
+        bot = self._bot()
+        self.assertEqual(bot._adopt_restart_handoff(), 4)
+        self.assertFalse(os.path.exists(imm.restart_handoff_path()))   # consumed
+        self.assertFalse(getattr(bot.client, "cancelled", []))
+        born = self.created.replace(microsecond=0).timestamp()
+        self.assertAlmostEqual(bot.state.order_ages["o0"], born, places=0)
+        led = bot.state.ledger["o0"]
+        self.assertEqual((led["ticker"], led["book_side"], led["yes_price"],
+                          led["remaining_count"], led["_confirmed"]),
+                         (self.OK, "bid", 40, 20.0, True))
+        self.assertIn("o0", bot.state.our_order_ids)
+        # the TTL refresh clock runs from the real birth: a matching 10-minute-
+        # old order is kept, the same order past ORDER_REFRESH_SECS is renewed
+        o0 = bot.client.resting[0]
+        q = Quote(self.OK, "bid", 40, 20)
+        with mock.patch.object(imm, "ORDER_REFRESH_SECS", 1500):
+            _p, cx, _a = imm.diff_orders([q], [o0], bot.state.order_ages, time.time())
+            self.assertEqual(cx, [])
+            _p, cx, _a = imm.diff_orders([q], [o0], bot.state.order_ages,
+                                         time.time() + 1000)
+            self.assertEqual(cx, ["o0"])
+
+    def test_stale_missing_or_disabled_handoff_is_not_adopted(self):
+        self._write_handoff(imm.RESTART_HANDOFF_MAX_AGE_SECS + 30)
+        bot = self._bot()
+        self.assertIsNone(bot._adopt_restart_handoff())
+        self.assertFalse(os.path.exists(imm.restart_handoff_path()))
+        self.assertIsNone(bot._adopt_restart_handoff())          # missing
+        self._write_handoff(30)
+        with mock.patch.object(imm, "RESTART_KEEP_ORDERS", False):
+            self.assertIsNone(bot._adopt_restart_handoff())
+        self.assertFalse(os.path.exists(imm.restart_handoff_path()))
+
+    def test_preflight_imports_the_real_source(self):
+        ok, why = IncentiveMarketMaker._restart_preflight()
+        self.assertTrue(ok, why)
+
+    def test_preflight_catches_a_broken_deploy(self):
+        d = tempfile.mkdtemp(prefix="imm_preflight_")
+        path = os.path.join(d, "incentive_mm.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("raise RuntimeError('broken deploy')\n")
+        with mock.patch.object(imm, "_SOURCE_PATH", path):
+            ok, why = IncentiveMarketMaker._restart_preflight()
+        self.assertFalse(ok)
+        self.assertIn("broken deploy", why)
+
+
+class TestFloorRealizedAnchor(unittest.TestCase):
+    """Item 4a. The schedule-weighted projection scores HYPOTHETICAL ladders;
+    an incumbent's real orders are also cut by the event-room share, skew,
+    the position cap and the per-side band (same-instant reads: p25 0.76 of
+    the hypothetical on Red Rocks, 0.54 on KXTRUMPMENTION). The schedule is
+    now scaled by resting / hypothetical at the live multiplier, <= 1."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def _meta(self):
+        return MarketMeta(ticker=self.T, event_ticker="KXGOOD-99DEC31",
+                          series="KXGOOD", dollars_per_day=100.0,
+                          program_end=datetime.now(timezone.utc) + timedelta(days=1),
+                          target_size=1000.0, discount_factor=0.5,
+                          cutoff=None, close_time=None)
+
+    def _estimate(self, own, realized=True):
+        """Live incumbent read with our `own` orders in the book, under a
+        schedule whose live multiplier is 1.0 and later hours 2.0."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        book = {"yes": {49: 600.0, 48: 500.0}, "no": {49: 1200.0}}
+        for side, px, n in own:
+            if side == "bid":
+                book["yes"][px] = book["yes"].get(px, 0.0) + n
+            else:
+                book["no"][100 - px] = book["no"].get(100 - px, 0.0) + n
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{p / 100:.2f}", f"{q:.0f}"] for p, q in sorted(book["yes"].items())],
+            "no_dollars": [[f"{p / 100:.2f}", f"{q:.0f}"] for p, q in sorted(book["no"].items())]}}
+        cut = datetime.now(timezone.utc) + timedelta(hours=1)
+        real_hsm = imm.hour_size_mult
+
+        def hsm(series, t):
+            return 1.0 if t < cut else 2.0
+        meta = self._meta()
+        bot.live = bool(own)
+        with mock.patch.object(imm, "hour_size_mult", hsm), \
+                mock.patch.object(imm, "FLOOR_PROJECTION_REALIZED", realized):
+            self.assertTrue(bot._estimate_candidate_yield(meta, own))
+        self.assertIs(imm.hour_size_mult, real_hsm)
+        return meta
+
+    def test_short_resting_book_scales_the_schedule(self):
+        own = [("bid", 49, 5.0), ("ask", 51, 5.0)]          # 5 lots vs a 35 ladder
+        raw = self._estimate(own, realized=False)
+        anchored = self._estimate(own)
+        self.assertEqual(anchored.floor_mult_profile, raw.floor_mult_profile)
+        self.assertIn(",", raw.floor_mult_profile)          # a mixed profile
+        live_hyp = dict((m, d) for m, _w, d in raw.floor_by_mult)[1.0]
+        ratio = anchored.floor_realized_ratio
+        self.assertIsNotNone(ratio)
+        self.assertLess(ratio, 1.0)
+        self.assertAlmostEqual(ratio, anchored.est_dollars_per_day / live_hyp, places=3)
+        self.assertAlmostEqual(anchored.floor_dollars_per_day,
+                               raw.floor_dollars_per_day * ratio, places=6)
+        self.assertIsNone(raw.floor_realized_ratio)
+
+    def test_never_scales_up(self):
+        own = [("bid", 49, 300.0), ("ask", 51, 300.0)]      # far over the ladder
+        raw = self._estimate(own, realized=False)
+        anchored = self._estimate(own)
+        self.assertEqual(anchored.floor_realized_ratio, 1.0)
+        self.assertAlmostEqual(anchored.floor_dollars_per_day,
+                               raw.floor_dollars_per_day, places=9)
+
+    def test_fresh_candidate_untouched(self):
+        fresh = self._estimate([])
+        self.assertIsNone(fresh.floor_realized_ratio)
+
+
+class TestNearCliffRoomPriority(unittest.TestCase):
+    """Item 4b. The loop splits an event's net cap evenly across its strikes,
+    so the near-cliff x1.5 size mode never reached the book on many-strike
+    events (boost-armed Red Rocks / KXRT members had room below the boosted
+    ladder in 88% / 91% of rows). A near-cliff market now goes first in its
+    event and may take the whole remaining room."""
+
+    EV = "KXGOOD-99DEC31"
+    TICKERS = [f"KXGOOD-99DEC31-{x}" for x in "ABCD"]
+
+    def _client(self):
+        c = FakeClient()
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        c.programs, c.markets, c.books = [], {}, {}
+        for t in self.TICKERS:
+            c.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": start, "end_date": end})
+            c.markets[t] = {
+                "ticker": t, "event_ticker": self.EV, "status": "active",
+                "close_time": far, "yes_bid_dollars": "0.4900",
+                "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+            c.books[t] = {"orderbook_fp": {
+                "yes_dollars": [["0.48", "500"], ["0.49", "600"]],
+                "no_dollars": [["0.49", "1200"]]}}
+        return c
+
+    def _bids_after_boost(self, priority):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=self._client(), live=False)
+        with mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 100.0), \
+                mock.patch.object(imm, "NEAR_CLIFF_ROOM_PRIORITY", priority):
+            bot.run_cycle()
+            self.assertEqual(set(bot.state.selected), set(self.TICKERS))
+            boosted = self.TICKERS[2]
+            bot._near_cliff_boost[boosted] = time.time()
+            bot.state.selected[boosted].near_cliff = True
+            bot.state.universe_at = time.time()             # no refresh: loop only
+            bot.run_cycle()
+        bids = {t: 0 for t in self.TICKERS}
+        for o in bot.state.sim_orders.values():
+            if o["book_side"] == "bid" and 1 < o["yes_price"] < 99:
+                bids[o["ticker"]] += int(o["remaining_count"])
+        return boosted, bids
+
+    def test_near_cliff_market_takes_its_boosted_ladder_first(self):
+        boosted_ladder = imm.scale_levels(
+            imm.hour_scaled_levels("KXGOOD", datetime.now(timezone.utc)),
+            imm.NEAR_CLIFF_SIZE_MULT)
+        full = sum(s for _t, s in boosted_ladder)
+        self.assertGreater(full, 25)            # more than an even quarter...
+        self.assertLess(full, 100)              # ...and inside the event cap
+        boosted, bids = self._bids_after_boost(True)
+        self.assertEqual(bids[boosted], full)               # the whole boosted ladder
+        self.assertLessEqual(sum(bids.values()), 100)       # event cap intact
+        # the even split (knob off) held it to a quarter of the cap
+        boosted, bids = self._bids_after_boost(False)
+        self.assertLessEqual(bids[boosted], 25)
+        self.assertLessEqual(sum(bids.values()), 100)
 
 
 if __name__ == "__main__":

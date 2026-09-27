@@ -2086,6 +2086,22 @@ UNIVERSE_REFRESH_SECS = _env_int("IMM_UNIVERSE_REFRESH_SECS", 600)
 # about their timing. A refresh costs a few seconds under keep-alive, so the
 # worst case is ~7 cheap extra refreshes/hour.
 HOURLY_ACTIVATION_WINDOW_SECS = _env_int("IMM_HOURLY_ACTIVATION_WINDOW", 720)
+# ...but ONLY while an hourly program is actually in the feed (2026-09-27, the
+# ROI scan). "A few seconds" became a full ~2,700-book read once the allowed
+# universe grew: on 9/26 quote cycles inside hh:00-hh:11 took a median 126s
+# against 42s the rest of the hour, so every quote sat ~3x staler for a fifth
+# of each hour, and those per-cycle refreshes were 46% of all refreshes --
+# admission tests and hopeless-clock readings bunched into 12 minutes. All
+# for a family that is gone: no KXTEMP (and no program of <= 3h at all) has
+# been in the candidate set since at least 9/25. The window now arms itself
+# when the last live feed carried a candidate whose program lasts at most
+# HOURLY_PROGRAM_MAX_HOURS, and disarms when none does; the hour-crossed
+# refresh and the 600s cadence are untouched. The first hour of a returning
+# hourly family is picked up by the ordinary cadence (<= one refresh late).
+# IMM_HOURLY_ACTIVATION_AUTO=0 restores the unconditional window;
+# IMM_HOURLY_ACTIVATION_WINDOW=0 still switches it off entirely.
+HOURLY_ACTIVATION_AUTO = os.environ.get("IMM_HOURLY_ACTIVATION_AUTO", "1") == "1"
+HOURLY_PROGRAM_MAX_HOURS = _env_float("IMM_HOURLY_PROGRAM_MAX_HOURS", 2.0)
 ORDER_TTL_SECS = _env_int("IMM_ORDER_TTL_SECS", 600)
 ORDER_REFRESH_SECS = _env_int("IMM_ORDER_REFRESH_SECS", 420)
 
@@ -4950,6 +4966,35 @@ HOPELESS_EXIT = os.environ.get("IMM_HOPELESS_EXIT", "1") == "1"
 # IMM_MEMBER_PEAK_GUARD=1 restores the member peak carry.
 HOPELESS_SUSTAIN_SECS = _env_int("IMM_HOPELESS_SUSTAIN_SECS", 1800)
 MEMBER_PEAK_GUARD = os.environ.get("IMM_MEMBER_PEAK_GUARD", "0") == "1"
+# THE ADMISSION CLOCK (Jack 2026-09-27, from the ROI scan: "build 1,2,3,4").
+# Entry used to be ONE reading: a fresh candidate (or a re-entrant with any
+# banked accrual) whose projection touched the bar at a single refresh was
+# admitted in that refresh. The estimate swings ~2x between refreshes, so
+# admission systematically bought the spikes. Measured 9/18-9/27: at
+# admission the estimate was a median 1.69x the market's last REJECTED
+# reading (p75 2.64x, n=2,217); once resting, the market earned a median
+# 0.74x of the admission estimate in its first 3 cycles and 0.71x over its
+# first hour (n=1,276) -- while members scored at the same instant match the
+# estimator's hypothetical ladder (median 1.00), so the gap is the spike
+# reverting, not the model. 1,370 of 1,987 fresh admissions 9/13-9/26 (69%)
+# ended `hopeless`, and the fills taken on those rides lost $495 held to
+# settlement (-5.6c/ct). The same noise slowed the EXIT: one above-bar
+# reading reset the 30-minute hopeless clock (42 single-reading resets on 18
+# members on 9/27 alone).
+# So a projection must now HOLD at/above its bar for ADMIT_SUSTAIN_SECS --
+# an unbroken run of readings, the mirror of HOPELESS_SUSTAIN_SECS -- before
+# a fresh candidate is admitted (skip reason `admit_pending`), and before an
+# above-bar run may reset a member's hopeless clock. A run breaks on any
+# sub-bar reading, and on a gap of more than ADMIT_RUN_MAX_GAP_SECS between
+# readings (a market screened out, a restart after a sleep): an old run must
+# never admit a market on its first reading back. Near-cliff re-entrants
+# (>= half the cliff banked this period) skip the admission wait -- their
+# credit is real and the verdict is "quote to completion". Members,
+# quote_all, FORCE_EVENTS and curated events never wait. At the 600s refresh
+# cadence the default is exactly two consecutive readings.
+# IMM_ADMIT_SUSTAIN_SECS=0 restores single-reading entry AND reset.
+ADMIT_SUSTAIN_SECS = _env_int("IMM_ADMIT_SUSTAIN_SECS", 600)
+ADMIT_RUN_MAX_GAP_SECS = _env_int("IMM_ADMIT_RUN_MAX_GAP_SECS", 1500)
 # THE $1 FLOOR IS PER PROGRAM PERIOD (Jack 2026-09-22 pm, on KXRT-STRA-50 /
 # -45: "why is this quoted? it should be hopeless"). Kalshi had re-listed
 # the Rotten Tomatoes programs as a fresh ONE-DAY period at 16:49Z; in it
@@ -5019,6 +5064,28 @@ NEAR_CLIFF_SIZE_MULT = _env_float("IMM_NEAR_CLIFF_SIZE_MULT", 1.5)
 # quote-to-completion verdict is unaffected: a near-cliff market with
 # $0.50 or less banked keeps quoting at plain size.
 NEAR_CLIFF_BOOST_MIN_BANKED = _env_float("IMM_NEAR_CLIFF_BOOST_MIN_BANKED", 0.50)
+# ...and FIRST CALL ON ITS EVENT'S ROOM (2026-09-27, ROI scan item 4). The
+# quote loop splits each event's net cap evenly across its strikes
+# (share = remaining room / markets left), so on a many-strike event the
+# boost above never reached the book: on 9/27 the boost-armed Red Rocks and
+# KXRT members had room below the BOOSTED ladder in 88% / 91% of cycle rows
+# (below even the plain ladder in 78% / 82%) while the projection counted the
+# boost. A near-cliff market now goes first in its event and may take the
+# event's whole remaining room for its (boosted) ladder; its siblings split
+# what is left. Position caps, skew and the event cap itself are unchanged.
+# IMM_NEAR_CLIFF_ROOM_PRIORITY=0 restores the even split.
+NEAR_CLIFF_ROOM_PRIORITY = os.environ.get("IMM_NEAR_CLIFF_ROOM_PRIORITY", "1") == "1"
+# THE FLOOR PROJECTION IS ANCHORED TO WHAT RESTS (2026-09-27, same item). The
+# schedule-weighted projection scores HYPOTHETICAL ladders on the external
+# book, which never see the event-room share, the inventory skew, the
+# position cap or the per-side band -- same-instant member reads put the
+# resting score at a median 1.00 of the hypothetical but p25 0.76 on Red
+# Rocks, 0.54 on KXTRUMPMENTION, 0.69 on KXRBLX. For an incumbent the whole
+# schedule is scaled by (resting score / hypothetical at the live multiplier),
+# capped at 1, so the hopeless exit and the near-cliff verdict judge the size
+# the loop can actually place. Fresh candidates are untouched (nothing rests
+# yet). IMM_FLOOR_PROJECTION_REALIZED=0 restores the pure hypothetical.
+FLOOR_PROJECTION_REALIZED = os.environ.get("IMM_FLOOR_PROJECTION_REALIZED", "1") == "1"
 # THE FLOOR PROJECTION IS JUDGED AT DAY SIZE (same incident). The yield
 # estimator sizes its ladder with hour_size_mult (launcher
 # IMM_HOUR_SIZE_MULT=0-9:2.0, Saturday x1.5), so est_dollars_per_day
@@ -5170,6 +5237,46 @@ SELECTION_INPUTS = os.environ.get("IMM_SELECTION_INPUTS", "1") == "1"
 # half-copied. The clean exit runs shutdown_cancel exactly like SIGINT.
 # IMM_EXIT_ON_CODE_CHANGE=0 disables.
 EXIT_ON_CODE_CHANGE = os.environ.get("IMM_EXIT_ON_CODE_CHANGE", "1") == "1"
+# KEEP THE BOOK THROUGH A PLANNED RESTART (Jack 2026-09-27, ROI scan item 3).
+# The code-change exit used to run shutdown_cancel like SIGINT, and the new
+# process cancelled every imm- order AGAIN at startup, so each deploy took the
+# whole book down. Measured 9/26 17:26:30Z: 656 orders pulled at 17:27:03,
+# relaunch 17:27:36, first full refresh done 17:30:06, first placements
+# 17:30:32, rebuilt ~17:33 at 250 placements a cycle -- ~6 minutes empty or
+# partial per restart, and 9/26 had 17 restarts. Now a planned code-change
+# exit HANDS THE BOOK OVER:
+#   1. PREFLIGHT: the new source is imported in a child python first. If that
+#      fails the exit cancels everything exactly as before -- a broken deploy
+#      must never leave unmanaged orders behind it.
+#   2. Orders on markets where a few unmanaged minutes are the risk this bot
+#      otherwise manages cycle by cycle are cancelled anyway: live-event
+#      depth-gated series (TRUMPMENTION, the no-cutoff mention class), events
+#      under a depth halt, fast-lane (hourly) series, the bid-only quake
+#      family, anything not in the selection, and any market whose cutoff is
+#      within RESTART_KEEP_MIN_CUTOFF_SECS.
+#   3. Everything else stays resting and the exit writes RESTART_HANDOFF_FILE.
+#   4. The next process ADOPTS the book when that file is at most
+#      RESTART_HANDOFF_MAX_AGE_SECS old (a slower relaunch falls back to the
+#      old startup cancel-all): the orders enter the ledger and the TTL
+#      refresh clock at their exchange created_time, and the first cycle's
+#      refresh + diff re-prices, keeps or strays each of them.
+# Exchange-side expirations (TTL, cutoff) bind throughout. What this does NOT
+# fix: nothing re-prices between the old process's last quote pass and the
+# new one's first (~4-5 min including the first full refresh) -- the book is
+# stale there instead of empty. IMM_RESTART_KEEP_ORDERS=0 restores the
+# cancel-on-exit + cancel-at-startup behaviour.
+RESTART_KEEP_ORDERS = os.environ.get("IMM_RESTART_KEEP_ORDERS", "1") == "1"
+RESTART_HANDOFF_MAX_AGE_SECS = _env_int("IMM_RESTART_HANDOFF_MAX_AGE_SECS", 300)
+RESTART_KEEP_MIN_CUTOFF_SECS = _env_int("IMM_RESTART_KEEP_MIN_CUTOFF_SECS", 1800)
+RESTART_PREFLIGHT_TIMEOUT_SECS = _env_int("IMM_RESTART_PREFLIGHT_TIMEOUT_SECS", 120)
+RESTART_HANDOFF_FILE = "restart_handoff.json"
+
+
+def restart_handoff_path() -> str:
+    """Resolved at call time: tests re-point STATUS_DIR after import."""
+    return os.path.join(STATUS_DIR, RESTART_HANDOFF_FILE)
+
+
 _SOURCE_PATH = os.path.abspath(__file__)
 try:
     _SOURCE_MTIME = os.path.getmtime(_SOURCE_PATH)
@@ -5268,6 +5375,15 @@ _CONFIG_CODE_KNOBS = (
     # (freeze, lags, staleness) ride in its status file's "knobs" block
     "QUAKE_ENABLE", "QUAKE_SERIES", "QUAKE_MARGIN_CENTS", "QUAKE_USGS_POLL_SECS",
     "QUAKE_GFZ_POLL_SECS", "QUAKE_CUTOFF_FROM_CLOSE_MIN", "QUAKE_SIZE_MULT",
+    # ROI scan (2026-09-27): admission clock, hourly-window auto-arm, the
+    # planned-restart order handoff, the realized floor anchor and the
+    # near-cliff room priority
+    "ADMIT_SUSTAIN_SECS", "ADMIT_RUN_MAX_GAP_SECS",
+    "HOURLY_ACTIVATION_WINDOW_SECS", "HOURLY_ACTIVATION_AUTO",
+    "HOURLY_PROGRAM_MAX_HOURS",
+    "RESTART_KEEP_ORDERS", "RESTART_HANDOFF_MAX_AGE_SECS",
+    "RESTART_KEEP_MIN_CUTOFF_SECS",
+    "FLOOR_PROJECTION_REALIZED", "NEAR_CLIFF_ROOM_PRIORITY",
 )
 
 
@@ -8170,6 +8286,8 @@ class MarketMeta:
     nc_size_mult: Optional[float] = None    # near-cliff mult on the probe ladder
     floor_by_mult: List[List[float]] = field(default_factory=list)
     #   [[mult, weight, $/day at that mult], ...]; [] = floor is the live estimate
+    floor_realized_ratio: Optional[float] = None   # incumbent: resting score /
+    #   hypothetical at the live multiplier, applied to the schedule (<= 1)
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
     # set by _estimate_candidate_yield alongside est_frac; consumed by the
     # quote-gaps email's earnings-per-$-of-exposure ranking (Jack 2026-08-12)
@@ -8262,6 +8380,11 @@ class BotState:
     # moment it recovers). The hopeless exit reads this so a DIP cannot evict —
     # see HOPELESS_SUSTAIN_SECS.
     hopeless_since: Dict[str, float] = field(default_factory=dict)
+    # ticker -> [run_start_ts, last_reading_ts] of the current unbroken run of
+    # at/above-bar readings (ADMIT_SUSTAIN_SECS, 2026-09-27): admission waits
+    # for the run to reach the sustain window, and only such a run may reset
+    # hopeless_since. Persisted with hopeless_since (~20 restarts a day).
+    admit_run: Dict[str, List[float]] = field(default_factory=dict)
     #   reward accrued ($; live share x $/day integrated per cycle). Feeds the
     #   hopeless-exit / entry-floor credit: accrued + projection vs the $1 bar.
     rain_dir_done: Dict[str, float] = field(default_factory=dict)  # ticker -> entry ts
@@ -8391,6 +8514,15 @@ class IncentiveMarketMaker:
         # the banked accrual crosses the cliff or the market leaves the selection
         self._near_cliff_boost: Dict[str, float] = {}
         self._near_cliff_noted: Dict[str, float] = {}   # ticker -> ts of the last verdict log
+        # hourly-window auto-arm (2026-09-27): did the last live feed carry a
+        # candidate on an hourly program? Set by every refresh; the first
+        # refresh runs regardless (universe_at starts at 0).
+        self._hourly_programs_live = False
+        # planned-restart order handoff (2026-09-27, RESTART_KEEP_ORDERS):
+        # True once a code-change exit has written the handoff file, so the
+        # shutdown path leaves the book resting for the relaunch
+        self._handoff_keep = False
+        self._handoff_kept = 0
         # per-period credit tickers the persisted file held at startup: what
         # _keeps_accrual protects until the first successful feed read
         self._loaded_credit: Set[str] = set()
@@ -8923,10 +9055,15 @@ class IncentiveMarketMaker:
                                       (data.get("period_base") or {}).items()}
             self.state.hopeless_since = {str(t): float(v) for t, v in
                                          (data.get("hopeless_since") or {}).items()}
+            self.state.admit_run = {
+                str(t): [float(v[0]), float(v[1])]
+                for t, v in (data.get("admit_run") or {}).items()
+                if isinstance(v, (list, tuple)) and len(v) == 2}
             self._loaded_credit = (set(self.state.accrued_est)
                                    | set(self.state.period_base)
                                    | set(self.state.period_start)
-                                   | set(self.state.hopeless_since))
+                                   | set(self.state.hopeless_since)
+                                   | set(self.state.admit_run))
             # finecon openings: day mismatch is resolved at refresh (reset),
             # so restore unconditionally here
             self.state.finecon_admit_day = str(data.get("finecon_admit_day") or "")
@@ -9195,6 +9332,12 @@ class IncentiveMarketMaker:
                            "hopeless_since": {
                                t: round(v, 1)
                                for t, v in self.state.hopeless_since.items()
+                               if self._keeps_accrual(t)},
+                           # the admission / clock-reset run (2026-09-27),
+                           # same pruning as the clock it gates
+                           "admit_run": {
+                               t: [round(v[0], 1), round(v[1], 1)]
+                               for t, v in self.state.admit_run.items()
                                if self._keeps_accrual(t)},
                            # pruned on the SAME rule as accrued_est: a ticker
                            # that drops out of one must drop out of the other,
@@ -9837,6 +9980,48 @@ class IncentiveMarketMaker:
             return acc
         return max(0.0, acc - self.state.period_base.get(ticker, 0.0))
 
+    def _floor_clocks(self, ticker: str, reaches_min: bool,
+                      now_ts: float) -> Tuple[float, float]:
+        """Advance the two floor clocks for one reading of `ticker` and return
+        (sub_bar_secs, above_secs).
+
+        above_secs: how long the projection has held at/above its bar in an
+        unbroken run (state.admit_run; a run breaks on a sub-bar reading or a
+        gap > ADMIT_RUN_MAX_GAP_SECS between readings). Fresh admission waits
+        for it to reach ADMIT_SUSTAIN_SECS.
+
+        sub_bar_secs: how long the hopeless clock has run (state.hopeless_since,
+        started by the first sub-bar reading). Since 2026-09-27 an above-bar
+        reading resets it only once its run has lasted ADMIT_SUSTAIN_SECS --
+        a single spike no longer buys a fresh 30 minutes. A member is still
+        never evicted on an above-bar reading (the exit needs reaches_min
+        False), so the clock can only fire on the NEXT sub-bar reading.
+        ADMIT_SUSTAIN_SECS <= 0 restores the single-reading reset."""
+        run = self.state.admit_run.get(ticker)
+        if reaches_min:
+            if run is None or now_ts - run[1] > ADMIT_RUN_MAX_GAP_SECS \
+                    or now_ts < run[1]:
+                run = [now_ts, now_ts]
+            else:
+                run = [run[0], now_ts]
+            self.state.admit_run[ticker] = run
+            above_secs = now_ts - run[0]
+            if ADMIT_SUSTAIN_SECS <= 0 or above_secs >= ADMIT_SUSTAIN_SECS:
+                self.state.hopeless_since.pop(ticker, None)
+        else:
+            self.state.admit_run.pop(ticker, None)
+            above_secs = 0.0
+            self.state.hopeless_since.setdefault(ticker, now_ts)
+        sub_bar_secs = now_ts - self.state.hopeless_since.get(ticker, now_ts)
+        return sub_bar_secs, above_secs
+
+    def _room_priority(self, meta: "MarketMeta") -> bool:
+        """First call on the event's room in the quote loop: a market in
+        near-cliff mode (verdict this refresh, or the sticky size mode)."""
+        return NEAR_CLIFF_ROOM_PRIORITY and (
+            meta.ticker in self._near_cliff_boost
+            or bool(getattr(meta, "near_cliff", False)))
+
     def _near_cliff_size_mult(self, ticker: str) -> float:
         """NEAR_CLIFF_SIZE_MULT while `ticker` is in near-cliff mode (armed by
         the floor verdict, sticky until the banked accrual crosses the cliff
@@ -9951,8 +10136,12 @@ class IncentiveMarketMaker:
         # (observed 2026-07-21: AUSH-2023 dark 12 min). So inside the
         # activation window the gate drops to per-cycle; hour_crossed still
         # covers long gaps (sleep/wake) that skip the window entirely.
+        # 2026-09-27: armed only while an hourly program is in the feed
+        # (HOURLY_ACTIVATION_AUTO; _hourly_programs_live is set below).
         hour_crossed = int(now_ts // 3600) != int(self.state.universe_at // 3600)
-        in_activation_window = (now_ts % 3600) < HOURLY_ACTIVATION_WINDOW_SECS
+        in_activation_window = (
+            (now_ts % 3600) < HOURLY_ACTIVATION_WINDOW_SECS
+            and (not HOURLY_ACTIVATION_AUTO or self._hourly_programs_live))
         if (now_ts - self.state.universe_at < UNIVERSE_REFRESH_SECS
                 and not hour_crossed and not in_activation_window):
             return
@@ -10091,6 +10280,25 @@ class IncentiveMarketMaker:
                 scan_skips["bulk_cap"] = len(scan_pre) - len(_keep)
                 scan_pre = _keep
         scan_pre_set = {t for t, _i in scan_pre}
+        # HOURLY-WINDOW AUTO-ARM (2026-09-27, see HOURLY_ACTIVATION_AUTO): the
+        # per-cycle refresh window is for hourly program families only, so
+        # it follows whether one is in the feed. LIVE feed only: a failed or
+        # empty read keeps the previous verdict.
+        if by_market:
+            _max_len = timedelta(hours=HOURLY_PROGRAM_MAX_HOURS)
+            _hourly = sum(1 for _t, _i in candidates + scan_pre
+                          if _i.get("start") is not None
+                          and _i.get("end") is not None
+                          and _i["end"] - _i["start"] <= _max_len)
+            if (_hourly > 0) != self._hourly_programs_live:
+                log(f"{self.tag} hourly activation window "
+                    + (f"ARMED: {_hourly} candidate market(s) on programs of "
+                       f"<= {HOURLY_PROGRAM_MAX_HOURS:g}h" if _hourly else
+                       f"disarmed: no candidate program of <= "
+                       f"{HOURLY_PROGRAM_MAX_HOURS:g}h in the feed")
+                    + ("" if HOURLY_ACTIVATION_AUTO else
+                       " (IMM_HOURLY_ACTIVATION_AUTO=0: window stays on)"))
+            self._hourly_programs_live = _hourly > 0
         scan_metas: List[Tuple[MarketMeta, dict]] = []
 
         metas: List[MarketMeta] = []
@@ -10458,13 +10666,12 @@ class IncentiveMarketMaker:
             meta.near_cliff_boost = meta.ticker in self._near_cliff_boost
             # DIP GUARD (Jack 2026-08-05). Track how long the projection has
             # been continuously under the bar; the exit below refuses to fire
-            # until that exceeds HOPELESS_SUSTAIN_SECS. Any single reading at
-            # or above the bar resets the clock, so a dip cannot evict.
-            if reaches_min:
-                self.state.hopeless_since.pop(meta.ticker, None)
-            else:
-                self.state.hopeless_since.setdefault(meta.ticker, now_ts)
-            sub_bar_secs = now_ts - self.state.hopeless_since.get(meta.ticker, now_ts)
+            # until that exceeds HOPELESS_SUSTAIN_SECS, so a dip cannot evict.
+            # ADMISSION CLOCK (2026-09-27): the mirror image -- how long it
+            # has HELD at/above the bar. Fresh entry waits for it, and only a
+            # held run (not a single spike) resets the dip guard's clock.
+            sub_bar_secs, above_secs = self._floor_clocks(
+                meta.ticker, reaches_min, now_ts)
             # DECISION INPUTS: stash what the floor rules below look at. Reads
             # only; its own try so an analytics bug can never break selection.
             if SELECTION_INPUTS:
@@ -10490,6 +10697,8 @@ class IncentiveMarketMaker:
                         "near_cliff_armed_ts": self._near_cliff_boost.get(meta.ticker),
                         "hopeless_since": self.state.hopeless_since.get(meta.ticker),
                         "sub_bar_secs": round(sub_bar_secs),
+                        # the admission clock (2026-09-27): held-above time
+                        "above_secs": round(above_secs),
                         "rate_bar": series_min_est_rate(meta.series),
                         "rate_proj": round(rate_floor_projected(
                             accrued, est_total, proj_peak, qdays), 4),
@@ -10598,7 +10807,19 @@ class IncentiveMarketMaker:
                 # when the remaining window alone couldn't clear the bar.
                 skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
                 decisions[meta.ticker] = "payout_floor"
+            elif ADMIT_SUSTAIN_SECS > 0 and not meta.near_cliff \
+                    and above_secs < ADMIT_SUSTAIN_SECS:
+                # THE ADMISSION CLOCK (2026-09-27, see ADMIT_SUSTAIN_SECS):
+                # over the bar on this reading, but not yet for the sustain
+                # window -- a spike this refresh is not an admission. It
+                # enters on the first reading that finds the run long enough.
+                skipped["admit_pending"] = skipped.get("admit_pending", 0) + 1
+                decisions[meta.ticker] = "admit_pending"
             else:
+                # an ADMISSION starts the dip guard clean, as it always did
+                # (a held run already cleared it; this covers the near-cliff
+                # re-entrant, admitted on its first reading)
+                self.state.hopeless_since.pop(meta.ticker, None)
                 ranked.append(meta)
         # Mild stickiness so estimator jitter doesn't churn the selection.
         ranked.sort(key=lambda m: -m.yield_per_contract
@@ -10899,6 +11120,9 @@ class IncentiveMarketMaker:
                         "est_hour_mult": mt.est_hour_mult,
                         "nc_size_mult": mt.nc_size_mult,
                         "floor_by_mult": mt.floor_by_mult or None,
+                        "floor_realized_ratio": (
+                            round(mt.floor_realized_ratio, 4)
+                            if mt.floor_realized_ratio is not None else None),
                         "cutoff": mt.cutoff.isoformat() if mt.cutoff else None,
                         "program_end": (mt.program_end.isoformat()
                                         if mt.program_end else None),
@@ -11375,6 +11599,7 @@ class IncentiveMarketMaker:
         meta.floor_dollars_per_day = 0.0     # set with the estimate below
         # decision-input logging: set below only if the estimate actually runs
         meta.est_hour_mult = meta.nc_size_mult = None
+        meta.floor_realized_ratio = None
         # Live-CONFIRMED events never come back (Jack 2026-08-31 #2): worth
         # nothing by decree, without even reading the book — so no market of
         # the event can be selected or hold an event slot again.
@@ -11623,25 +11848,46 @@ class IncentiveMarketMaker:
                 else:
                     ext_yes, ext_no = yes_levels, no_levels
                     xb, xa, xrb, xra = ext_b, ext_a, rb, ra
-                total = 0.0
-                for m, w in profile:
+                def _hyp_share(m: float) -> float:
+                    """The ladder at multiplier m, scored on the external book."""
                     q_m = _probe_ladder(
                         m, scale_levels(scaled_levels_at(meta.series, m), _ncm),
                         capped_ref_mult(xb, xrb, "bid", hour_mult=m, series=meta.series),
                         capped_ref_mult(xa, xra, "ask", hour_mult=m, series=meta.series),
                         xb, xa, xrb, xra)
-                    f_m = 0.0
-                    if q_m:
-                        f_m, _s = estimate_reward_share(
-                            ext_yes, ext_no,
-                            _overlay_with_pads(q_m, ext_yes, ext_no, xb, xa),
-                            meta.target_size, meta.discount_factor, own_in_book=False)
+                    if not q_m:
+                        return 0.0
+                    return estimate_reward_share(
+                        ext_yes, ext_no,
+                        _overlay_with_pads(q_m, ext_yes, ext_no, xb, xa),
+                        meta.target_size, meta.discount_factor, own_in_book=False)[0]
+
+                total = 0.0
+                f_live: Optional[float] = None
+                for m, w in profile:
+                    f_m = _hyp_share(m)
+                    if abs(m - _hm) < 1e-9:
+                        f_live = f_m
                     total += w * f_m * meta.dollars_per_day
                     try:          # decision-input logging: the per-mult split
                         meta.floor_by_mult.append(
                             [m, round(w, 4), round(f_m * meta.dollars_per_day, 4)])
                     except Exception:
                         pass
+                # REALIZED ANCHOR (2026-09-27, FLOOR_PROJECTION_REALIZED): the
+                # hypothetical ladders above are what the loop WOULD rest with
+                # nothing in its way; an incumbent's real orders are also cut
+                # by the event-room share, the inventory skew, the position
+                # cap and the per-side band. Scale the whole schedule by what
+                # actually rests over what the hypothetical says at the LIVE
+                # multiplier (never above 1: the anchor only removes size the
+                # loop cannot place).
+                if FLOOR_PROJECTION_REALIZED and self.live and own_live:
+                    if f_live is None:
+                        f_live = _hyp_share(_hm)
+                    if f_live > 0:
+                        meta.floor_realized_ratio = min(1.0, frac / f_live)
+                        total *= meta.floor_realized_ratio
                 meta.floor_dollars_per_day = total
         return True
 
@@ -12317,9 +12563,13 @@ class IncentiveMarketMaker:
         by_event: Dict[str, List[MarketMeta]] = {}
         for _m in managed.values():
             by_event.setdefault(_m.event_ticker, []).append(_m)
+        # Near-cliff markets lead their event (NEAR_CLIFF_ROOM_PRIORITY,
+        # 2026-09-27) so they claim event room before any sibling; the event
+        # order itself still follows the event's best pool.
         for _grp in by_event.values():
-            _grp.sort(key=lambda m: -m.dollars_per_day)
-        _event_order = sorted(by_event, key=lambda e: -by_event[e][0].dollars_per_day)
+            _grp.sort(key=lambda m: (not self._room_priority(m), -m.dollars_per_day))
+        _event_order = sorted(
+            by_event, key=lambda e: -max(m.dollars_per_day for m in by_event[e]))
         order_of_play: List[MarketMeta] = []
         _depth = 0
         while any(_depth < len(by_event[e]) for e in _event_order):
@@ -12338,8 +12588,11 @@ class IncentiveMarketMaker:
             pos = positions.get(t, 0.0)
             n_left = max(event_markets_left.get(ev, 1), 1)
             event_markets_left[ev] = n_left - 1
-            share_buy = max(event_room_buy.get(ev, event_cap_contracts(ev)), 0.0) / n_left
-            share_sell = max(event_room_sell.get(ev, event_cap_contracts(ev)), 0.0) / n_left
+            # a near-cliff market may take the event's WHOLE remaining room
+            # for its (boosted) ladder; everyone else splits what is left
+            split = 1 if self._room_priority(meta) else n_left
+            share_buy = max(event_room_buy.get(ev, event_cap_contracts(ev)), 0.0) / split
+            share_sell = max(event_room_sell.get(ev, event_cap_contracts(ev)), 0.0) / split
 
             # YIELD TO THE HUMAN: account position diverging from the bot's
             # own book, or a non-imm resting order here, means the user is
@@ -13769,10 +14022,176 @@ class IncentiveMarketMaker:
 
     # ---- main loop -----------------------------------------------------------
 
+    # ---- planned-restart order handoff (RESTART_KEEP_ORDERS, 2026-09-27) ----
+
+    @staticmethod
+    def _restart_preflight() -> Tuple[bool, str]:
+        """Import the ON-DISK source in a child python (same interpreter, same
+        environment, the source's own directory). (True, "ok") when it
+        imports; else (False, why). The handoff never proceeds without it."""
+        import subprocess
+        mod = os.path.splitext(os.path.basename(_SOURCE_PATH))[0]
+        try:
+            # UTF-8 both ways: a cp1252 console pipe must not turn one exotic
+            # glyph in an import-time log line into a failed preflight
+            out = subprocess.run(
+                [sys.executable, "-c", f"import {mod}"],
+                cwd=os.path.dirname(_SOURCE_PATH) or ".",
+                env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=RESTART_PREFLIGHT_TIMEOUT_SECS)
+        except Exception as e:
+            return False, f"{type(e).__name__}: {str(e)[:160]}"
+        if out.returncode != 0:
+            tail = (out.stderr or out.stdout or "").strip().splitlines()
+            return False, (f"exit {out.returncode}: "
+                           f"{tail[-1][:160] if tail else 'no output'}")
+        return True, "ok"
+
+    def _restart_keep_ok(self, ticker: str, now_ts: float) -> bool:
+        """May this market's resting orders ride through a planned restart?
+        Only a SELECTED market off every live-event / fast / near-cutoff
+        list (see RESTART_KEEP_ORDERS)."""
+        meta = self.state.selected.get(ticker)
+        if meta is None:
+            return False
+        if (series_event_depth_gated(meta.series)
+                or series_fast_lane(meta.series)
+                or series_bid_only(meta.series)):
+            return False
+        if meta.event_ticker in self.state.event_depth_halt \
+                or meta.event_ticker in self.state.event_live_halt:
+            return False
+        cut = self.state.cutoff_ts.get(ticker)
+        if cut is None and meta.cutoff is not None:
+            cut = meta.cutoff.timestamp()
+        if cut is not None and cut - now_ts < RESTART_KEEP_MIN_CUTOFF_SECS:
+            return False
+        return True
+
+    def _prepare_restart_handoff(self) -> bool:
+        """Planned code-change exit: leave the book resting for the relaunch
+        instead of cancelling it. Cancels the orders _restart_keep_ok refuses,
+        writes the handoff file and arms _handoff_keep (read by
+        shutdown_cancel). Returns True when armed; any failure returns False
+        and the exit cancels everything as before."""
+        if not (RESTART_KEEP_ORDERS and self.live):
+            return False
+        if os.path.exists(HALT_FILE) or self.state.halted_until > time.time():
+            return False                    # a halted bot hands over nothing
+        ok, why = self._restart_preflight()
+        if not ok:
+            log(f"{self.tag} restart handoff SKIPPED: the new source failed "
+                f"its import preflight ({why}); cancelling the book as before")
+            return False
+        now_ts = time.time()
+        try:
+            orders = self._merge_ledger(self._get_resting_orders_global(), now_ts)
+        except Exception as e:
+            log(f"{self.tag} restart handoff SKIPPED: resting read failed "
+                f"({e}); cancelling the book as before")
+            return False
+        keep = [o for o in orders if self._restart_keep_ok(o.get("ticker", ""), now_ts)]
+        keep_ids = {o.get("order_id") for o in keep}
+        n_cx = 0
+        for o in orders:
+            if o.get("order_id") in keep_ids:
+                continue
+            if self.cancel_order(o.get("order_id", ""), reason="restart_handoff"):
+                n_cx += 1
+        payload = {"ts": round(now_ts, 3), "run_id": RUN_ID,
+                   "source_mtime": _SOURCE_MTIME, "kept": len(keep),
+                   "cancelled": n_cx,
+                   "order_ids": sorted(str(i) for i in keep_ids if i)}
+        try:
+            os.makedirs(STATUS_DIR, exist_ok=True)
+            tmp = restart_handoff_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, restart_handoff_path())
+        except OSError as e:
+            log(f"{self.tag} restart handoff SKIPPED: could not write "
+                f"{RESTART_HANDOFF_FILE} ({e}); cancelling the book as before")
+            return False
+        self._handoff_keep = True
+        self._handoff_kept = len(keep)
+        log(f"{self.tag} restart handoff: {len(keep)} order(s) left resting for "
+            f"the relaunch; cancelled {n_cx} on gated / fast-lane / "
+            f"near-cutoff / unselected markets")
+        return True
+
+    def _adopt_restart_handoff(self) -> Optional[int]:
+        """Startup: adopt the book a planned restart handed over. Returns the
+        number of resting orders adopted, or None when the caller must cancel
+        everything as before (no/unreadable/stale handoff file, knob off, or
+        the resting read failed). The file is consumed either way, so a
+        handoff can never be adopted twice."""
+        path = restart_handoff_path()
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as e:
+            log(f"{self.tag} ! {RESTART_HANDOFF_FILE} unreadable ({e})")
+            data = None
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        if not RESTART_KEEP_ORDERS or not isinstance(data, dict):
+            return None
+        try:
+            age = time.time() - float(data.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= age <= RESTART_HANDOFF_MAX_AGE_SECS):
+            log(f"{self.tag} restart handoff from run {data.get('run_id')} is "
+                f"{age:.0f}s old (limit {RESTART_HANDOFF_MAX_AGE_SECS}s); "
+                f"cancelling the book as before")
+            return None
+        try:
+            orders = self._get_resting_orders_global()
+        except Exception as e:
+            log(f"{self.tag} restart handoff: resting read failed ({e}); "
+                f"cancelling the book as before")
+            return None
+        now_ts = time.time()
+        n = 0
+        for o in orders:
+            oid = o.get("order_id")
+            parsed = order_yes_book_cents(o)
+            if not oid or parsed is None:
+                continue
+            created = parse_iso_utc(o.get("created_time") or "")
+            placed = min(created.timestamp(), now_ts) if created else now_ts
+            # the TTL refresh clock runs from the order's real birth, and the
+            # ledger carries it like one of our own placements
+            self.state.order_ages[oid] = placed
+            self.state.our_order_ids.setdefault(oid, placed)
+            self.state.ledger[oid] = {
+                "order_id": oid, "ticker": o.get("ticker", ""),
+                "book_side": parsed[0], "yes_price": parsed[1],
+                "remaining_count": order_remaining(o),
+                "yes_price_exact": order_yes_exact_cents(o),
+                "status": "resting",
+                "client_order_id": o.get("client_order_id"),
+                "_placed_at": placed, "_confirmed": True,
+            }
+            n += 1
+        log(f"{self.tag} startup: adopted {n} resting imm- order(s) handed over "
+            f"by run {data.get('run_id')} {age:.0f}s ago (restart handoff); the "
+            f"first cycle re-prices, keeps or strays them")
+        return n
+
     def shutdown_cancel(self) -> None:
         if self._shutdown_done or not self.live:
             return
         self._shutdown_done = True
+        if self._handoff_keep:
+            log(f"{self.tag} shutdown: left {self._handoff_kept} resting bot "
+                f"order(s) for the relaunch (restart handoff)")
+            return
         try:
             n = self.cancel_all_bot_orders()
             log(f"{self.tag} shutdown: cancelled {n} resting bot orders")
@@ -14128,8 +14547,12 @@ class IncentiveMarketMaker:
                    f"as live-confirmed" if self.state.event_live_halt else ""))
 
         if self.live:
-            n = self.cancel_all_bot_orders()
-            log(f"{self.tag} startup: cancelled {n} leftover imm- orders")
+            # A planned code-change restart hands its book over
+            # (RESTART_KEEP_ORDERS): adopt it. Anything else -- a crash, a
+            # manual stop, a stale or missing handoff -- cancels as always.
+            if self._adopt_restart_handoff() is None:
+                n = self.cancel_all_bot_orders()
+                log(f"{self.tag} startup: cancelled {n} leftover imm- orders")
 
         stopping = {"flag": False}
         prev_top: Optional[float] = None
@@ -14189,6 +14612,11 @@ class IncentiveMarketMaker:
                     log(f"{self.tag} source file changed on disk (synced "
                         f"deploy); clean exit at the safe window — launcher "
                         f"relaunches on the new code")
+                    # hand the resting book to the relaunch instead of
+                    # cancelling it (RESTART_KEEP_ORDERS); persist first so
+                    # the new process sees every order id and floor clock
+                    if self._prepare_restart_handoff():
+                        self._save_persist()
                     break
                 if once or stopping["flag"]:
                     break
@@ -14236,7 +14664,11 @@ class IncentiveMarketMaker:
             if not once:
                 self.alerter.alert("shutdown",
                                    f"bot stopped (run {RUN_ID}); resting orders "
-                                   f"{'cancelled' if self.live else 'were simulated'}",
+                                   + (f"handed over to the relaunch "
+                                      f"({self._handoff_kept} kept)"
+                                      if self._handoff_keep else
+                                      'cancelled' if self.live
+                                      else 'were simulated'),
                                    key="shutdown")
         log("=== done ===")
 
