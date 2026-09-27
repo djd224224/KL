@@ -3668,3 +3668,93 @@ EDT / 12:00Z EST; the series tighteners leave it);
 test_sustain_window_is_30_minutes_by_default;
 test_member_exit_runs_on_the_live_projection_not_the_peak; the three
 member-peak tests now pin the default AND the knob. 636 green at 7576bf9.
+
+## 2026-09-26 pm — Carbon Arc fair-value gate: quoting reads Carbon Arc's month-to-date index (Jack, with Carbon Arc's consent)
+
+Jack, after the data-subscription review and with Carbon Arc's written
+consent: "use Carbon Arc's data when quoting".
+
+WHY. Every Carbon Arc contract settles on the FIRST monthly value Carbon Arc
+reports. Carbon Arc's Prisms feed publishes the month-to-date (MTD) value of
+the same index daily, 2-6 days lagged (POS ~2, card ~3, app ~5, foot
+traffic / ads ~6), and that read is what the book trades on: on 9/26 the
+market-implied median sat within ~0.5 index points of the MTD value on card
+spend, POS and foot traffic. Our fills 9/06-9/26 marked out -7.8c/contract
+(bids -14.6c, asks 0.0) -- we were the stale quote when the read moved.
+
+MODEL (carbon_arc_fair.py, new): per series and measurement month,
+first print ~ N(mu, sigma) with mu = latest MTD (+ IMM_CA_DRIFT_PTS, 0),
+sigma = 1.7 * sqrt(((1-w) * sigma_m)^2 + floor^2), w = observed days / days
+in month, sigma_m = stdev of the entity's month-over-month changes
+(hist_yoy, complete months only), floor = max(1.0, 1% of mu). The 1.7 is the
+median market-implied / model sigma ratio on the 9/26 books (69 series:
+card 1.59-1.71, POS 1.51, FT 1.77, ads 1.76, apps 1.56). Series -> (prism,
+entity) comes from each series' Kalshi settlement-source URL, read from the
+PUBLIC GET /series catalog (no auth) once a day. No entry before 10% of the
+month is observed or when the read is 10+ days old. Every new read is
+appended to run-logs/incentive-mm/carbon_arc_vintages.jsonl for calibration
+against the prints.
+
+GATE (incentive_mm.py, the rain gate's shape): quotes still join the touch
+unchanged (safe-join for these families); a Carbon Arc-settled market
+(carbon_arc_settled verdict) stands aside on BOTH sides while
+- its read MOVED within IMM_CA_FAIR_REFRESH_HOLD_MIN (10) minutes (the book
+  is repricing; not on the first load after a restart), or
+- its external touch fights the fair BAND on the adverse side: bid touch >
+  hi + tol or ask touch < lo - tol, tol IMM_CA_FAIR_TOL_CENTS (15), band =
+  P(first print > K) at sigma and at sigma x IMM_CA_FAIR_SIGMA_LO_FRAC (0.5).
+No gate when the read is too noisy to overrule the book (sigma > 20% of mu,
+IMM_CA_FAIR_MAX_REL_SIGMA: Eli Lilly's pharmacy index, most app and ad
+series), when the entry is stale (IMM_CA_FAIR_TTL_MIN 60), or for another
+month's read -- plain quoting, exactly as before. Strikes read on the index;
+a negative strike reads as growth percent (the August POS ladders, T-3 =
+index 97). Sticky selection keeps a stood-aside market; logs
+"ca-fair stand-aside <t>: <why>" / "ca-fair resume <t>" once per episode and
+"ca-fair reloaded: N series, M with a new read" when reads move. The
+late-month rule (CA_LATE_*: no bids from the 17th, out from the 26th) is
+untouched and applies on top.
+
+DRY RUN on the 9/26 books (909 September strikes, today's reads): 16 stand
+asides (1.8%), every one a 1-3 index-point book-vs-read disagreement near
+the money (9 POS asks where the book prices the print under the MTD read,
+ANF / COST / SBUX / URBN card strikes). Without the band the same run
+fired 75 times, mostly on wing strikes the book prices tighter than the
+model (Amazon's history swings with Prime Day timing); a nearer-reading
+growth-percent rule flipped KXGROKAPP / KXAMUSEMENTADS strikes and was
+dropped.
+
+FEED -- NOT CONFIGURED AT DEPLOY. The refresher thread (ca-fair, every
+IMM_CA_FAIR_REFRESH_SECS = 120s, all I/O off the trading thread) reads the
+feed URL from IMM_CA_FEED_URL (+ IMM_CA_FEED_TOKEN as a Bearer token) or from
+~/.carbonarc_feed.json {"url": ..., "token": ...} -- OUTSIDE the repo,
+because the repo is public. The settings are re-read every 10 minutes, so
+adding the file needs no restart. The URL must return the Prisms JSON shape
+({"prisms": [{"prism_id", "category", "data_through", "last_refreshed_at",
+"entities": [{"entity_name", "mtd_yoy": [...], "hist_yoy": [...]}]}]}).
+Until it is set the bot logs "ca-fair: no feed configured -- gate open"
+once and quotes exactly as before. IMM_CA_FEED_URL is redacted in the
+config snapshot (FEED_URL joined the secret-name list).
+
+KILL SWITCH: IMM_CA_FAIR_ENABLE=0 (launcher env, task restart), or delete
+the feed config (the gate opens when entries pass their 60-minute TTL).
+
+WHAT THIS DOES NOT FIX / WATCH:
+- The informed flow reacts within seconds of a Carbon Arc refresh; we see
+  it after up to 120s + one cycle. The hold covers the repricing minutes,
+  not the first fill.
+- The MTD read vs FIRST print gap is unmeasured (drift = 0). August's card
+  values were later revised up a median 3.4 points over the first print, so
+  never use revised hist_yoy levels; calibrate drift / sigma per category
+  from carbon_arc_vintages.jsonl against the Oct 3-8 prints.
+- The late-month stand-down is unchanged: lifting it on the strength of the
+  data is Jack's call after the October prints.
+- A stood-aside market keeps its seat and its lifetime event slot.
+
+Tests: TestCarbonArcFairGate (measurement month, strike scale, lookup / TTL
+/ wrong month, reload counting, strict per-side breach, band + noise cap,
+refresh hold incl. first load and unchanged rewrites, stand-aside -> hold
+-> resume end to end, ask-side stand-aside, stale / disabled / non-Carbon
+Arc quote plainly) and test_carbon_arc_fair.py (catalog map, month spread,
+entry math, thin / stale refusals, case-insensitive entity match, file +
+vintage writes, series-map reuse and failure, feed settings env vs home
+file, bearer header + payload shape). 783 green.

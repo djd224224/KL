@@ -5177,6 +5177,10 @@ _CONFIG_CODE_KNOBS = (
     # gated Saturday step-up (2026-09-26); the verdict itself is a runtime
     # file, so the cycle log's hour_mult is where a PASS shows
     "SAT_SIZE_MULT_GATED",
+    # Carbon Arc fair-value gate (2026-09-26); the model's knobs live in
+    # carbon_arc_fair.py and ride along in the fair file's "model" block
+    "CA_FAIR_ENABLE", "CA_FAIR_TOL_CENTS", "CA_FAIR_TTL_MIN",
+    "CA_FAIR_SIGMA_LO_FRAC", "CA_FAIR_MAX_REL_SIGMA", "CA_FAIR_REFRESH_HOLD_MIN",
 )
 
 
@@ -5199,7 +5203,8 @@ def _build_config() -> Tuple[Dict[str, str], str]:
     Secrets are excluded by name, not by value: this dict is written to disk
     in full, and KALSHI_* legitimately holds key material."""
     import hashlib
-    secret = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PRIVATE")
+    # FEED_URL: a data-feed URL can carry its key in the query string
+    secret = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PRIVATE", "FEED_URL")
     cfg: Dict[str, str] = {}
     for k, v in os.environ.items():
         if not (k.startswith("IMM_") or k.startswith("KALSHI_")):
@@ -5731,6 +5736,186 @@ def rain_fair_p(ticker: str, now_ts: float) -> Optional[float]:
     if now_ts - fetched_ts > RAIN_FAIR_TTL_MIN * 60:
         return None
     return p
+
+
+# ----------------------------------------------------------------------------
+# CARBON ARC FAIR-VALUE GATE (Jack 2026-09-26, with Carbon Arc's written
+# consent: "use Carbon Arc's data when quoting"). The rain gate's shape, for
+# the rain gate's reason -- reward credit halves per tick behind the touch,
+# so data must never re-price quotes off the join. carbon_arc_fair.py turns
+# Carbon Arc's daily month-to-date read of each series' index into N(mu,
+# sigma) for the FIRST print (the value these contracts settle on) and
+# writes CA_FAIR_FILE; a daemon thread started in run() refreshes it every
+# CA_FAIR_REFRESH_SECS and the quote loop hot-reloads it by mtime. A strike
+# K is worth P(first print > K). The gate stands a Carbon Arc-settled market
+# down on BOTH sides while its external touch fights that fair on the side
+# that would fill us badly (bid touch > fair+TOL: joining pays over fair;
+# ask touch < fair-TOL: joining sells under it) and resumes when they agree
+# again. What it is for: the stretch after a Carbon Arc refresh before the
+# book reprices, when our resting touch quotes were the ones picked off
+# (fills 9/06-9/26 marked out -7.8c/contract, bids -14.6c), and strikes the
+# book prices far from the read. Missing, stale (per-entry TTL) or
+# wrong-month entries open the gate -- plain quoting, as before this rule.
+# The late-month rule (CA_LATE_*) is untouched and still applies on top.
+# Kill switch IMM_CA_FAIR_ENABLE=0.
+#
+# Three guards keep a coarse model from overruling a book it cannot beat
+# (dry run on the 9/26 books, 909 September strikes): the fair is a BAND,
+# P(first print > K) at sigma and at sigma * CA_FAIR_SIGMA_LO_FRAC (the
+# market prices tighter than the model on some series: Amazon's history
+# swings with Prime Day timing), and a breach must clear the whole band
+# (75 -> 16 stand-asides, all 1-3 index-point disagreements near the money);
+# a read whose sigma exceeds CA_FAIR_MAX_REL_SIGMA * mu (Eli Lilly's
+# pharmacy index, most app and ad series) is too noisy to gate on at all;
+# and strikes read on the index, negative strikes as growth percent (the
+# August point-of-sale ladders were T-3 = -3% = index 97). Separately, when
+# a series' read MOVES, its markets stand aside for CA_FAIR_REFRESH_HOLD_MIN
+# while the book reprices -- the minutes the informed flow uses.
+CA_FAIR_ENABLE = os.environ.get("IMM_CA_FAIR_ENABLE", "1") == "1"
+CA_FAIR_TOL_CENTS = _env_int("IMM_CA_FAIR_TOL_CENTS", 15)
+CA_FAIR_TTL_MIN = _env_int("IMM_CA_FAIR_TTL_MIN", 60)
+CA_FAIR_REFRESH_SECS = _env_int("IMM_CA_FAIR_REFRESH_SECS", 120)
+CA_FAIR_SIGMA_LO_FRAC = _env_float("IMM_CA_FAIR_SIGMA_LO_FRAC", 0.5)
+CA_FAIR_MAX_REL_SIGMA = _env_float("IMM_CA_FAIR_MAX_REL_SIGMA", 0.20)
+CA_FAIR_REFRESH_HOLD_MIN = _env_float("IMM_CA_FAIR_REFRESH_HOLD_MIN", 10)
+CA_FAIR_FILE = os.environ.get(
+    "IMM_CA_FAIR_FILE", os.path.join(STATUS_DIR, "carbon_arc_fair.json"))
+# series -> entry; series -> epoch its read last moved (refresh hold)
+_ca_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}}
+_CA_STRIKE_RE = re.compile(r"-T(-?\d+(?:\.\d+)?)$")
+
+
+def load_ca_fair() -> Tuple[int, int]:
+    """Hot-reload CA_FAIR_FILE by mtime into _ca_fair_state. Returns
+    (series loaded, series whose read moved) on a reload, else (0, 0). A
+    move starts that series' refresh hold -- except on the first load (a
+    restart is not new data)."""
+    try:
+        mtime = os.path.getmtime(CA_FAIR_FILE)
+    except OSError:
+        return 0, 0
+    if mtime == _ca_fair_state["mtime"]:
+        return 0, 0
+    _ca_fair_state["mtime"] = mtime
+    try:
+        with open(CA_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! carbon arc fair file unreadable: {e}")
+        return 0, 0
+    old = _ca_fair_state["entries"]
+    fresh: Dict[str, dict] = {}
+    for series, e in (data.get("entries") or {}).items():
+        try:
+            ts = parse_iso_utc(str(e["fetched_at"]))
+            mu, sigma = float(e["mu"]), float(e["sigma"])
+            month = str(e["month"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or not (math.isfinite(mu) and math.isfinite(sigma)) \
+                or sigma <= 0:
+            continue
+        fresh[str(series)] = {"mu": mu, "sigma": sigma, "month": month,
+                              "ts": ts.timestamp()}
+    moved = [s for s, e in fresh.items()
+             if (old.get(s) or {}).get("mu") != e["mu"]
+             or (old.get(s) or {}).get("month") != e["month"]]
+    if old:
+        now_ts = time.time()
+        for s in moved:
+            _ca_fair_state["moved_at"][s] = now_ts
+    _ca_fair_state["entries"] = fresh
+    return len(fresh), len(moved)
+
+
+def ca_measurement_month(ticker: str) -> Optional[str]:
+    """'YYYY-MM' of a Carbon Arc market's measurement month -- the month
+    BEFORE its ticker-date month (the print is early the next month). None
+    for an undated ticker."""
+    me = ca_month_end_utc(ticker)
+    if me is None:
+        return None
+    return (me.astimezone(ET) - timedelta(days=1)).strftime("%Y-%m")
+
+
+def ca_strike_value(strike: float) -> float:
+    """The strike on the index scale (100 = flat year over year). Every
+    ladder listed since September is on the index; a NEGATIVE strike can
+    only be growth percent (the August point-of-sale ladders: T-3 = -3% =
+    index 97). A positive growth-percent ladder would read as an index far
+    below the read -- fair ~1, so the gate stands the asks aside: it fails
+    toward not quoting, never toward a wrong-side quote."""
+    return strike + 100.0 if strike < 0 else strike
+
+
+def _ca_read(ticker: str, now_ts: float) -> Optional[Tuple[dict, float]]:
+    """(entry, strike on the index) for a fresh read of this market's
+    measurement month, else None."""
+    m = _CA_STRIKE_RE.search(ticker)
+    if not m:
+        return None
+    e = _ca_fair_state["entries"].get(series_of(ticker))
+    if e is None or now_ts - e["ts"] > CA_FAIR_TTL_MIN * 60:
+        return None
+    if e["month"] != ca_measurement_month(ticker):
+        return None
+    return e, ca_strike_value(float(m.group(1)))
+
+
+def _p_above(k: float, mu: float, sigma: float) -> float:
+    return 0.5 * math.erfc((k - mu) / (sigma * math.sqrt(2.0)))
+
+
+def ca_fair_p(ticker: str, now_ts: float) -> Optional[float]:
+    """Fair P(YES) for a Carbon Arc 'above K' strike (KXAMZNCC-26OCT07-T96)
+    at the read's sigma, or None when there is no fresh read of its
+    measurement month -- None must degrade to plain quoting."""
+    r = _ca_read(ticker, now_ts)
+    if r is None:
+        return None
+    e, k = r
+    return _p_above(k, e["mu"], e["sigma"])
+
+
+def ca_fair_band(ticker: str, now_ts: float
+                 ) -> Optional[Tuple[float, float, float]]:
+    """(p_center, p_lo, p_hi): P(first print > K) at sigma and at sigma *
+    CA_FAIR_SIGMA_LO_FRAC. None when there is no fresh read of the market's
+    month, or the read is too uncertain to overrule the book (sigma above
+    CA_FAIR_MAX_REL_SIGMA of mu)."""
+    r = _ca_read(ticker, now_ts)
+    if r is None:
+        return None
+    e, k = r
+    if CA_FAIR_MAX_REL_SIGMA > 0 and \
+            e["sigma"] > CA_FAIR_MAX_REL_SIGMA * abs(e["mu"]):
+        return None
+    pc = _p_above(k, e["mu"], e["sigma"])
+    pt = _p_above(k, e["mu"], max(1e-9, e["sigma"] * CA_FAIR_SIGMA_LO_FRAC))
+    return pc, min(pc, pt), max(pc, pt)
+
+
+def ca_refresh_held(ticker: str, now_ts: float) -> bool:
+    """True for CA_FAIR_REFRESH_HOLD_MIN after this series' read moved, for
+    a market of the read's month (the book is repricing to new data)."""
+    if CA_FAIR_REFRESH_HOLD_MIN <= 0:
+        return False
+    moved = _ca_fair_state["moved_at"].get(series_of(ticker))
+    if moved is None or now_ts - moved > CA_FAIR_REFRESH_HOLD_MIN * 60:
+        return False
+    return _ca_read(ticker, now_ts) is not None
+
+
+def fair_gate_breach(ext_bid: Optional[float], ext_ask: Optional[float],
+                     fair_lo_c: float, tol: float,
+                     fair_hi_c: Optional[float] = None) -> Tuple[bool, bool]:
+    """(bid_bad, ask_bad): the external touch fights a fair value (or a
+    [lo, hi] fair band) on the side that would fill us badly -- joining the
+    bid pays over hi + tol, joining the ask sells under lo - tol. Strict, so
+    a touch exactly at the tolerance still quotes."""
+    hi = fair_lo_c if fair_hi_c is None else fair_hi_c
+    return (ext_bid is not None and ext_bid > hi + tol,
+            ext_ask is not None and ext_ask < fair_lo_c - tol)
 
 
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
@@ -7697,6 +7882,7 @@ class IncentiveMarketMaker:
         # _keeps_accrual protects until the first successful feed read
         self._loaded_credit: Set[str] = set()
         self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
+        self._ca_fair_stood: Set[str] = set()     # Carbon Arc fair stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
@@ -9232,6 +9418,10 @@ class IncentiveMarketMaker:
         load_family_verdicts()
         load_sat_gate()
         load_rain_fair()
+        _ca_n, _ca_moved = load_ca_fair()
+        if _ca_moved:
+            log(f"{self.tag} ca-fair reloaded: {_ca_n} series, "
+                f"{_ca_moved} with a new read")
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
         # refresh reliably fires before Kalshi publishes now that keep-alive
@@ -12063,6 +12253,40 @@ class IncentiveMarketMaker:
                 self._rain_fair_stood.discard(t)
                 log(f"{self.tag} rain-fair resume {t}")
 
+            # CARBON ARC FAIR GATE (Jack 2026-09-26, see CA_FAIR_ENABLE): the
+            # rain gate's shape on Carbon Arc's month-to-date read. Quotes
+            # still join the touch unchanged; a touch that fights the read on
+            # the adverse side parks BOTH sides until they agree again
+            # (sticky selection keeps the market meanwhile).
+            if CA_FAIR_ENABLE and carbon_arc_settled(meta.series):
+                ca_why = ""
+                if ca_refresh_held(t, now_ts):
+                    ca_why = (f"new Carbon Arc read, holding "
+                              f"{CA_FAIR_REFRESH_HOLD_MIN:g}m while the book "
+                              f"reprices")
+                else:
+                    band = ca_fair_band(t, now_ts)
+                    if band is not None:
+                        pc, plo, phi = band
+                        ca_bid_bad, ca_ask_bad = fair_gate_breach(
+                            ext_bid, ext_ask, plo * 100.0, CA_FAIR_TOL_CENTS,
+                            phi * 100.0)
+                        if ca_bid_bad or ca_ask_bad:
+                            ca_why = (f"book {ext_bid}x{ext_ask} vs fair "
+                                      f"{pc * 100:.0f}c [{plo * 100:.0f}-"
+                                      f"{phi * 100:.0f}] (tol "
+                                      f"{CA_FAIR_TOL_CENTS}c, "
+                                      f"{'bid' if ca_bid_bad else 'ask'} side)")
+                if ca_why:
+                    if t not in self._ca_fair_stood:
+                        self._ca_fair_stood.add(t)
+                        log(f"{self.tag} ca-fair stand-aside {t}: {ca_why}")
+                    self.cancel_market_orders(t, resting)
+                    continue
+            if t in self._ca_fair_stood:
+                self._ca_fair_stood.discard(t)
+                log(f"{self.tag} ca-fair resume {t}")
+
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go
             # silent. Without this, a restored rain position kept reduce-only
@@ -12981,10 +13205,55 @@ class IncentiveMarketMaker:
                     time.sleep(max(300, RAIN_FAIR_REFRESH_MIN * 60))
             threading.Thread(target=_rain_fair_refresh, daemon=True,
                              name="rain-fair").start()
+        if CA_FAIR_ENABLE and not once:
+            # Carbon Arc fair refresher (2026-09-26): the rain refresher's
+            # contract -- every network call off the trading thread, the
+            # quote loop reads only CA_FAIR_FILE. With no feed configured
+            # (IMM_CA_FEED_URL or ~/.carbonarc_feed.json, kept outside the
+            # public repo) nothing is written and the gate stays open; the
+            # settings are re-read every 10 minutes, so adding the feed
+            # needs no restart. Logs only when the outcome changes.
+            def _ca_fair_refresh():
+                try:
+                    import carbon_arc_fair
+                except Exception as e:
+                    log(f"{self.tag} ! ca-fair refresher disabled: {e}")
+                    return
+                last = None
+                while True:
+                    delay = max(30, CA_FAIR_REFRESH_SECS)
+                    try:
+                        if not carbon_arc_fair.feed_settings()[0]:
+                            if last != "off":
+                                log(f"{self.tag} ca-fair: no feed configured "
+                                    f"-- gate open (plain quoting)")
+                            last, delay = "off", 600
+                        else:
+                            ok, miss = carbon_arc_fair.write_fair_file(
+                                CA_FAIR_FILE)
+                            if last != (ok, miss):
+                                log(f"{self.tag} ca-fair refresh: {ok} series "
+                                    f"with a read"
+                                    + (f", {miss} mapped without one"
+                                       if miss else ""))
+                            last = (ok, miss)
+                    except Exception as e:
+                        if last != "err":
+                            log(f"{self.tag} ! ca-fair refresh failed: {e}")
+                        last = "err"
+                    time.sleep(delay)
+            threading.Thread(target=_ca_fair_refresh, daemon=True,
+                             name="ca-fair").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
                 f"refresh {RAIN_FAIR_REFRESH_MIN}m, file {RAIN_FAIR_FILE}")
+        if CA_FAIR_ENABLE:
+            log(f"ca-fair gate: Carbon Arc-settled at-touch, tol "
+                f"{CA_FAIR_TOL_CENTS}c, band sigma x{CA_FAIR_SIGMA_LO_FRAC:g}-1, "
+                f"max sigma {CA_FAIR_MAX_REL_SIGMA:g} of mu, refresh hold "
+                f"{CA_FAIR_REFRESH_HOLD_MIN:g}m, ttl {CA_FAIR_TTL_MIN}m, "
+                f"refresh {CA_FAIR_REFRESH_SECS}s, file {CA_FAIR_FILE}")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
             f"earnings x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT:g}), "

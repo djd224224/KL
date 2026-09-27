@@ -63,6 +63,9 @@ def setUpModule():
     # STATUS_DIR (redirected above) unless IMM_BOOK_LOG_DIR is set; a stray
     # value in the shell would send test books wherever it points.
     os.environ.pop("IMM_BOOK_LOG_DIR", None)
+    # the Carbon Arc fair file (2026-09-26) is read by every run_cycle
+    imm.CA_FAIR_FILE = os.path.join(tmp, "carbon_arc_fair.json")
+    imm._ca_fair_state.update(mtime=0.0, entries={}, moved_at={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -7603,6 +7606,225 @@ class TestRainFairAnchor(unittest.TestCase):
             self.assertEqual(self._rain_quotes(bot), self.PLAIN_JOIN)
         finally:
             imm.RAIN_FAIR_ENABLE = old
+
+
+class TestCarbonArcFairGate(unittest.TestCase):
+    """carbon_arc_fair.json -> load_ca_fair/ca_fair_p -> the rain gate's
+    shape on Carbon Arc-settled markets (Jack 2026-09-26, with Carbon Arc's
+    consent: "use Carbon Arc's data when quoting"). Fixture ticker
+    KXFAKECC-68DEC07-T100: a Carbon Arc verdict, measurement month 2068-11
+    (the month before the ticker date), far from the late-month windows."""
+
+    T = "KXFAKECC-68DEC07-T100"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._ca_fair_state.update(mtime=0.0, entries={}, moved_at={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        imm.FAMILY_VERDICTS["KXFAKECC"] = {
+            "carbon_arc": True, "ts": time.time(), "title": ""}
+        imm.FAMILY_VERDICTS["KXNOTCACC"] = {
+            "carbon_arc": False, "ts": time.time(), "title": ""}
+        try:
+            os.remove(imm.CA_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm.FAMILY_VERDICTS.pop("KXFAKECC", None)
+        imm.FAMILY_VERDICTS.pop("KXNOTCACC", None)
+
+    def _write_fair(self, entries, age_secs=0.0):
+        fetched = (datetime.now(timezone.utc)
+                   - timedelta(seconds=age_secs)).isoformat()
+        with open(imm.CA_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {s: dict(e, fetched_at=fetched)
+                                   for s, e in entries.items()}}, f)
+        os.utime(imm.CA_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestCarbonArcFairGate._bump += 1
+        n, _moved = imm.load_ca_fair()
+        self.assertEqual(n, len(entries))
+
+    def _entry(self, mu, sigma=2.0, month="2068-11"):
+        return {"mu": mu, "sigma": sigma, "month": month}
+
+    def _bot(self, ticker=None):
+        t = ticker or self.T
+        client = FakeClient()
+        now = datetime.now(timezone.utc)
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": t, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[t] = {
+            "ticker": t, "event_ticker": t.rsplit("-", 1)[0],
+            "status": "active", "close_time": far,
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        # 49 x 51, five levels a side: the *CC family safe-joins behind the
+        # touch, so the qualifying walk must reach past it or the market is
+        # zero_yield and never quoted at all
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[t] = {"orderbook_fp": {"yes_dollars": lv,
+                                            "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot, ticker=None):
+        t = ticker or self.T
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == t)
+
+    def test_measurement_month_and_strike_scale(self):
+        self.assertEqual(imm.ca_measurement_month("KXAMZNCC-26OCT07-T96"),
+                         "2026-09")
+        self.assertEqual(imm.ca_measurement_month("KXDRPEPPERPOS-26OCT03-T98"),
+                         "2026-09")
+        self.assertIsNone(imm.ca_measurement_month("KXAMZNCC-DOG-T1"))
+        # a negative strike can only be growth percent (the August point-of-
+        # sale ladders: T-3 = index 97); everything else is the index, even
+        # far below the read (KXGROKAPP lists 20-46 under a ~122 read, and
+        # KXAMUSEMENTADS 117-127 under ~192 -- a nearer-reading rule flipped
+        # both on the 9/26 books)
+        self.assertEqual(imm.ca_strike_value(-3.0), 97.0)
+        self.assertEqual(imm.ca_strike_value(12.0), 12.0)
+        self.assertEqual(imm.ca_strike_value(98.0), 98.0)
+        self.assertEqual(imm.ca_strike_value(40.0), 40.0)
+
+    def test_lookup_month_ttl_and_strike(self):
+        self._write_fair({"KXFAKECC": self._entry(100.0)})
+        now_ts = time.time()
+        self.assertAlmostEqual(imm.ca_fair_p(self.T, now_ts), 0.5)
+        self.assertAlmostEqual(imm.ca_fair_p("KXFAKECC-68DEC07-T102", now_ts),
+                               0.158655, places=5)       # one sigma above
+        self.assertAlmostEqual(imm.ca_fair_p("KXFAKECC-68DEC07-T98", now_ts),
+                               0.841345, places=5)
+        # growth-percent strike reads on the index (T-2 = 98)
+        self.assertAlmostEqual(imm.ca_fair_p("KXFAKECC-68DEC07-T-2", now_ts),
+                               0.841345, places=5)
+        # wrong measurement month (next cycle's event), no strike, other
+        # series, stale -> None (plain quoting)
+        self.assertIsNone(imm.ca_fair_p("KXFAKECC-69JAN07-T100", now_ts))
+        self.assertIsNone(imm.ca_fair_p("KXFAKECC-68DEC07", now_ts))
+        self.assertIsNone(imm.ca_fair_p("KXOTHERCC-68DEC07-T100", now_ts))
+        self.assertIsNone(imm.ca_fair_p(
+            self.T, now_ts + imm.CA_FAIR_TTL_MIN * 60 + 5))
+
+    def test_reload_counts_moved_reads_and_skips_bad_entries(self):
+        self._write_fair({"KXFAKECC": self._entry(100.0)})
+        with open(imm.CA_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {
+                "KXFAKECC": dict(self._entry(100.0),
+                                 fetched_at=datetime.now(timezone.utc).isoformat()),
+                "KXBADSIG": {"mu": 100.0, "sigma": 0.0, "month": "2068-11",
+                             "fetched_at": datetime.now(timezone.utc).isoformat()},
+                "KXNOTS": {"mu": 100.0, "sigma": 1.0, "month": "2068-11"}}}, f)
+        os.utime(imm.CA_FAIR_FILE, (time.time(), time.time() + 99))
+        self.assertEqual(imm.load_ca_fair(), (1, 0))     # same read, 2 dropped
+        self.assertEqual(imm.load_ca_fair(), (0, 0))     # unchanged mtime
+
+    def test_breach_is_strict_and_per_side(self):
+        self.assertEqual(imm.fair_gate_breach(49, 51, 30.0, 15), (True, False))
+        self.assertEqual(imm.fair_gate_breach(49, 51, 34.0, 15), (False, False))
+        self.assertEqual(imm.fair_gate_breach(49, 51, 70.0, 15), (False, True))
+        self.assertEqual(imm.fair_gate_breach(None, 51, 70.0, 15), (False, True))
+        self.assertEqual(imm.fair_gate_breach(49, None, 30.0, 15), (True, False))
+
+    def test_band_and_noise_cap(self):
+        # mu 98.95, sigma 2: P(> 100) = 0.30 at sigma, 0.147 at sigma / 2
+        self._write_fair({"KXFAKECC": self._entry(98.95)})
+        pc, lo, hi = imm.ca_fair_band(self.T, time.time())
+        self.assertAlmostEqual(pc, 0.2997, places=3)
+        self.assertAlmostEqual(lo, 0.1469, places=3)
+        self.assertEqual(hi, pc)
+        # a read noisier than 20% of mu cannot overrule the book: no band
+        self._write_fair({"KXFAKECC": self._entry(100.0, sigma=25.0)})
+        self.assertIsNone(imm.ca_fair_band(self.T, time.time()))
+        self.assertIsNotNone(imm.ca_fair_p(self.T, time.time()))
+        # a wing strike the book prices confidently (3x6 on T104, read 100 /
+        # sigma 2.5: 5.5% at sigma, 0.3% at sigma/2) is NOT a breach: the ask
+        # at 6 sits inside [0.3 - 15, ...] -- the Amazon-wing case that
+        # fired 75 times on the 9/26 books without the band
+        self._write_fair({"KXFAKECC": self._entry(100.0, sigma=2.5)})
+        _pc, lo, hi = imm.ca_fair_band("KXFAKECC-68DEC07-T104", time.time())
+        self.assertEqual(imm.fair_gate_breach(3, 6, lo * 100, 15, hi * 100),
+                         (False, False))
+
+    def test_refresh_hold_after_a_moved_read_not_on_first_load(self):
+        self._write_fair({"KXFAKECC": self._entry(100.0)})     # first load
+        self.assertFalse(imm.ca_refresh_held(self.T, time.time()))
+        self._write_fair({"KXFAKECC": self._entry(100.4)})     # read moved
+        now_ts = time.time()
+        self.assertTrue(imm.ca_refresh_held(self.T, now_ts))
+        # other months' markets are not held by this read
+        self.assertFalse(imm.ca_refresh_held("KXFAKECC-69JAN07-T100", now_ts))
+        self.assertFalse(imm.ca_refresh_held(
+            self.T, now_ts + imm.CA_FAIR_REFRESH_HOLD_MIN * 60 + 1))
+        # an unchanged rewrite does not restart the hold
+        imm._ca_fair_state["moved_at"]["KXFAKECC"] -= 3600
+        self._write_fair({"KXFAKECC": self._entry(100.4)})
+        self.assertFalse(imm.ca_refresh_held(self.T, time.time()))
+        with mock.patch.object(imm, "CA_FAIR_REFRESH_HOLD_MIN", 0):
+            self._write_fair({"KXFAKECC": self._entry(100.9)})
+            self.assertFalse(imm.ca_refresh_held(self.T, time.time()))
+
+    def test_bid_touch_over_fair_stands_aside_then_resumes(self):
+        # mu 98.95 / sigma 2 -> P(> 100) = 0.30: bid touch 49 > 30 + 15
+        self._write_fair({"KXFAKECC": self._entry(98.95)})
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._ca_fair_stood)
+        self.assertIn(self.T, bot.state.selected)     # sticky: still selected
+        # the read moves back to the book: first the refresh hold keeps the
+        # market out while the book reprices...
+        self._write_fair({"KXFAKECC": self._entry(100.0)})
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._ca_fair_stood)
+        # ...then it resumes at the (safe-)join
+        imm._ca_fair_state["moved_at"]["KXFAKECC"] -= 3600
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._ca_fair_stood)
+        q = self._quotes(bot)
+        self.assertTrue(any(s == "bid" for s, _p in q), q)
+        self.assertTrue(any(s == "ask" for s, _p in q), q)
+
+    def test_ask_touch_under_fair_stands_aside(self):
+        # mu 101.05 -> P(> 100) = 0.70: ask touch 51 < 70 - 15
+        self._write_fair({"KXFAKECC": self._entry(101.05)})
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._ca_fair_stood)
+
+    def test_stale_or_disabled_or_not_carbon_arc_quotes_plainly(self):
+        self._write_fair({"KXFAKECC": self._entry(98.95)},
+                         age_secs=imm.CA_FAIR_TTL_MIN * 60 + 60)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertNotEqual(self._quotes(bot), [])
+        self.assertNotIn(self.T, bot._ca_fair_stood)
+        self._write_fair({"KXFAKECC": self._entry(98.95)})
+        with mock.patch.object(imm, "CA_FAIR_ENABLE", False):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertNotEqual(self._quotes(bot), [])
+        # a series without a Carbon Arc verdict is never gated, even with a
+        # (bogus) read under its name
+        other = "KXPLAINX-68DEC07-T100"
+        self._write_fair({"KXPLAINX": self._entry(98.95)})
+        bot = self._bot(other)
+        bot.run_cycle()
+        self.assertNotIn(other, bot._ca_fair_stood)
+        self.assertNotEqual(self._quotes(bot, other), [])
 
 
 class TestPayoutFloorAccounting(unittest.TestCase):
