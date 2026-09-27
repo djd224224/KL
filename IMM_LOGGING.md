@@ -98,12 +98,17 @@ floor rule looked at, so a rule change can be replayed rather than guessed:
 `banked` (this program period), `period_base`, `period_start`, `floor_bar`,
 `projected_total`, `reaches_min_raw` (before near-cliff can flip it) and
 `reaches_min`, `peak` and `peak_age_s`, `qdays`, `est_total`, the hopeless
-clock (`hopeless_since`, `sub_bar_secs`), `rate_bar` / `rate_proj`, `exempt`
+clock (`hopeless_since`, `sub_bar_secs`), `rate_bar` / `rate_est` (the $/day
+the bar compares: the schedule-weighted floor rate since 2026-09-27) /
+`rate_proj`, `exempt`
 (the tier that bypasses a floor), `near_cliff_armed_ts`, `est_frac`,
 `est_hour_mult` / `nc_size_mult` (`null` = the estimate never ran at a
 multiplier), `floor_by_mult` (`[[mult, weight, $/day], ...]`; `null` = the floor
-is the live estimate), `cutoff`, `program_end`, and `screen_waived` (the sticky
-waiver that kept a member). Fields only appear on candidates that reached pass
+is the live estimate; a row whose per-side multipliers are not 1 -- the Carbon
+Arc late-month cut, the bid-only quake family -- carries them as two more
+entries, `[mult, weight, $/day, bid_mult, ask_mult]`, and the matching
+`floor_mult_profile` token is tagged, e.g. `1/b0a0.5:0.210`), `cutoff`,
+`program_end`, and `screen_waived` (the sticky waiver that kept a member). Fields only appear on candidates that reached pass
 2. Selection rows never lose their existing keys: the email that reads them
 substring-matches `"decision": "selected"` and `"is_scan": true`.
 

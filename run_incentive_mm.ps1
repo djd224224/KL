@@ -248,7 +248,21 @@ if ($Probe) {
     # per-series windows (16-1 / 19-1 halvings) still apply. Expected
     # +$30/weekday modelled from doubling 0-2 and 8-9 on the long-dated
     # book. Env knob => task-level restart.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=KXNCLH-26OCTPAX,KXFSLR-26OCTMWSOLD,KXEARNINGSMENTIONDKNG-26AUG07&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=200&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
+    # IMM_FORCE_EVENTS EMPTIED (Jack 2026-09-27, ROI scan: "fix these"). The
+    # 8/14 entries had outlived their reasons: KXEARNINGSMENTIONDKNG-26AUG07
+    # settled 8/7 ("prune it on the next touch") and KXNCLH-26OCTPAX has had
+    # no live program since at least 9/20 -- both dead text. The force on
+    # KXFSLR-26OCTMWSOLD (added so the $2/day re-entry rate bar would not
+    # shut out sibling strikes of an event held only as orphaned inventory)
+    # also switched off the hopeless exit, so 11 selected strikes projecting
+    # under the $1.00 cliff for the period ending 9/28 03:02Z kept quoting
+    # for zero payout -- four of them (4800/5000/5100/5200) at $0.02-0.06.
+    # Without the force they face the ordinary rules: near-cliff holds 4100/
+    # 4200 ($0.92 projected) to completion, 4500/4600 are over $1, the rest
+    # leave after the 30-minute clock (positions ride). The rate bar only
+    # binds an event with no quoting member left, which is the right answer
+    # for strikes earning ~$0.04-0.17/day. Env knob => task-level restart.
+    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=200&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 
 while ($true) {

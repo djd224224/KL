@@ -4232,3 +4232,194 @@ MENTION, so the no-cutoff depth gate never applied to KXEARNINGSMENTION<SYM>
 despite the 9/8 comment saying earnings were "deliberately IN scope". With the
 14-day lead an undated earnings event no longer quotes near its call anyway.
 Tests: test_earnings_announcements (26), TestListingDateCutoff (3 new).
+
+## 2026-09-27 pm — ROI scan: admission clock, hourly-window auto-arm, restart book handoff, realized floor anchor + near-cliff room priority (Jack)
+
+Jack asked for a scan of the bot for ROI optimizations "e.g. previously wasn't
+incorporating saturday multiplier or overnight multiplier to calculate $1 /
+$1.50 floor min / entry min. hopeless clock could malfunction / be slow to
+eject MURRAY, if banked > $0.50 it wouldnt keep quoting to hit the $1 min",
+then "build 1,2,3,4". Measurement window 9/13-9/27, from selection_events /
+selection_snapshot / floor_state / cycle_log / fills / realized / orders.
+Context: 1,401 of 2,873 quoted markets (49%) never reached $1 in the window
+($324 of accrual stranded).
+
+1. ADMISSION CLOCK (IMM_ADMIT_SUSTAIN_SECS, default 600; run-gap limit
+   IMM_ADMIT_RUN_MAX_GAP_SECS 1500). Entry was one reading and the estimate
+   swings ~2x between refreshes, so admission bought spikes: at admission the
+   estimate was a median 1.69x the market's last rejected reading (p75 2.64x,
+   n=2,217); once resting the market earned a median 0.74x of it in its first
+   3 cycles and 0.71x over the first hour (n=1,276). Members scored at the
+   same instant match the hypothetical ladder (median 1.00), so it is the spike
+   reverting, not the model. 1,370 of 1,987 fresh admissions (69%) ended
+   hopeless; fills on those rides lost $495 held to settlement (-5.6c/ct).
+   Now a fresh candidate is admitted only once its projection has HELD at/above
+   its bar for the sustain window (an unbroken run; a sub-bar reading or a gap
+   > 1500s between readings starts it over) -- decision `admit_pending` until
+   then. The same held run is now what resets a member's hopeless clock: one
+   above-bar spike no longer buys a fresh 30 minutes (9/27: 42 single-reading
+   resets on 18 members). Near-cliff re-entrants skip the wait; members,
+   quote_all, FORCE_EVENTS and curated events never wait; an admission still
+   starts the dip guard clean. State: `admit_run` (ticker -> [start, last]) in
+   imm_state.json, pruned like hopeless_since; `above_secs` on selection rows.
+   imm_quote_gaps reports such markets as "admission clock (x of 10 min held)".
+   Kill: IMM_ADMIT_SUSTAIN_SECS=0 (single-reading entry and reset).
+
+2. HOURLY ACTIVATION WINDOW AUTO-ARM (IMM_HOURLY_ACTIVATION_AUTO, default 1;
+   IMM_HOURLY_PROGRAM_MAX_HOURS 2). The hh:00-hh:11 per-cycle refresh window
+   exists for hourly program families; none (no program of <= 3h at all) has
+   been in the candidate set since at least 9/25, and each per-cycle refresh
+   reads ~2,700 books: on 9/26 quote cycles in the window took a median 126s
+   vs 42s outside it, and the window held 46% of all refreshes. It now arms
+   only when the last live feed carried a candidate on a program of <= 2h
+   (logged "hourly activation window ARMED / disarmed"). Kill:
+   IMM_HOURLY_ACTIVATION_AUTO=0 (always on, the old behaviour).
+
+3. RESTART BOOK HANDOFF (IMM_RESTART_KEEP_ORDERS, default 1). A code-change
+   exit cancelled the whole book and the relaunch cancelled again at startup:
+   9/26 17:26:30Z exit -> 656 orders pulled 17:27:03 -> relaunch 17:27:36 ->
+   first refresh done 17:30:06 -> first placements 17:30:32 -> rebuilt ~17:33;
+   17 such restarts that day. Now the code-change exit (only that path; SIGINT,
+   crashes, halts and manual stops are unchanged):
+   a. imports the NEW source in a child python (preflight); a failure cancels
+      the book exactly as before -- a broken deploy never leaves orders behind;
+   b. cancels orders on live-event depth-gated series, events under a depth
+      halt, fast-lane and bid-only (quake) series, unselected markets, and any
+      market whose cutoff is within IMM_RESTART_KEEP_MIN_CUTOFF_SECS (1800);
+   c. leaves the rest resting and writes run-logs/incentive-mm/
+      restart_handoff.json;
+   d. the relaunch adopts the book if that file is <= IMM_RESTART_HANDOFF_
+      MAX_AGE_SECS (300) old -- ledger + TTL clock seeded from each order's
+      exchange created_time -- else cancels as before. The file is consumed
+      either way. The first cycle's refresh + diff re-prices, keeps or strays
+      every adopted order.
+   Log lines: "restart handoff: N order(s) left resting", "shutdown: left N
+   resting bot order(s)", "startup: adopted N resting imm- order(s)"; the
+   shutdown alert says "handed over to the relaunch (N kept)".
+   Kill: IMM_RESTART_KEEP_ORDERS=0.
+
+4. REALIZED FLOOR ANCHOR + NEAR-CLIFF ROOM PRIORITY
+   (IMM_FLOOR_PROJECTION_REALIZED, IMM_NEAR_CLIFF_ROOM_PRIORITY, both default 1).
+   The schedule-weighted projection scores HYPOTHETICAL ladders, but the loop's
+   real orders are also cut by the per-event room share (net cap / strikes),
+   inventory skew, the position cap and the per-side band: same-instant member
+   reads put the resting score at p25 0.76 of the hypothetical on Red Rocks,
+   0.54 on KXTRUMPMENTION, 0.69 on KXRBLX; and the near-cliff x1.5 boost was
+   mostly undeliverable -- boost-armed Red Rocks / KXRT members had room below
+   the boosted ladder in 88% / 91% of cycle rows (below the plain ladder 78% /
+   82%) while the projection counted the boost.
+   a. For an incumbent the schedule is scaled by (resting score / hypothetical
+      at the live multiplier), capped at 1 (`floor_realized_ratio` on
+      selection rows). Fresh candidates are untouched.
+   b. In the quote loop a near-cliff market (verdict or sticky size mode) leads
+      its event and may take the event's whole remaining room; siblings split
+      the rest. Event cap, position caps and skew unchanged.
+   Kill: IMM_FLOOR_PROJECTION_REALIZED=0 / IMM_NEAR_CLIFF_ROOM_PRIORITY=0.
+
+What this does not fix:
+- Handoff: nothing re-prices between the old process's last quote pass and the
+  new one's first (~4-5 min including the first full refresh); the kept book
+  is stale there instead of empty. Exchange TTL / cutoff expirations bind.
+- The admission clock delays every genuine admission by one refresh (~10 min)
+  and cannot help a market whose estimate is wrong on BOTH readings.
+- The realized anchor reads the refresh's resting orders from the local
+  ledger, whose remaining_count is not reduced by partial fills (the 20%
+  amend tolerance bounds the drift); a transient shortfall (placement
+  deferral, an hour-boundary resize) scales one refresh's projection down,
+  which the 30-minute clock absorbs.
+- Challengers still ignore the event-room share and the per-side band (the
+  estimator builds a side the top-in-band gate won't place; measured impact
+  small: one-sided admissions realize 0.68x vs 0.70x). Not in this change.
+Tests: TestAdmissionClock (11), TestHourlyWindowAutoArm (3), TestRestartHandoff
+(8), TestFloorRealizedAnchor (3), TestNearCliffRoomPriority (1); the suite runs
+with ADMIT_SUSTAIN_SECS=0 at import, as it runs HOURLY_ACTIVATION_WINDOW_SECS=0.
+
+## 2026-09-27 pm — Requote gaps interleaved; IMM_FORCE_EVENTS emptied (Jack)
+
+Jack, on two more scan items: "fix these".
+
+REQUOTE INTERLEAVE (IMM_REQUOTE_INTERLEAVE, default 1). The end of run_cycle
+ran every diff cancel, then every placement, so an order being REPLACED (TTL
+renewal, or a reprice the amend path can't take) was off the book for the
+rest of the cancel loop plus every placement queued ahead of its successor:
+23,013 cancel->replace gaps on 9/27 to 17Z (orders sink, same ticker + side),
+median 9.7s, p90 20.3s, mean 12.4s -- ~0.7% of all order-time. pair_requotes()
+now pairs each cancel with the placement replacing it (same ticker, side and
+pad-ness, in placement order); place_with_caps cancels the old order one call
+before its successor is placed, leaving it out of the cap totals as a
+one-for-one swap (counted back in, successor skipped, if the cancel fails --
+the cycle then raises at its end, the old failed-cancel semantics). Cancels
+with no successor still run first. When the per-cycle placement cap defers a
+successor, an old order IDENTICAL to it (pure TTL renewal: the post-restart
+synchronized waves -- "placement cap 250/cycle reached; 439 deferred") keeps
+resting until the next cycle; any other deferred swap cancels as before.
+Kill: IMM_REQUOTE_INTERLEAVE=0.
+
+IMM_FORCE_EVENTS EMPTIED (launcher). The 8/14 entries: KXEARNINGSMENTIONDKNG-
+26AUG07 (settled 8/7; the note said "prune it on the next touch"),
+KXNCLH-26OCTPAX (no live program since at least 9/20), KXFSLR-26OCTMWSOLD
+(forced 8/7 so the $2/day re-entry rate bar would not shut out sibling strikes
+of an event held only as orphaned inventory). The force also bypassed the
+hopeless exit, so at 17:37Z 9/27 KXFSLR had 11 selected strikes projecting
+under the $1.00 cliff for the period ending 9/28 03:02Z -- 3900/4000/4300/
+4400/4700 at $0.64-0.76, 4800/5000/5100/5200 at $0.02-0.06 -- quoting for no
+payout. Unforced: near-cliff holds 4100/4200 ($0.92 projected, banked $0.88-
+0.89) to completion, 4500/4600 are over $1, the rest leave after the
+30-minute clock with their positions riding. DEPLOY: the launcher builds
+$ProbeEnv once, so this needs restart_imm.ps1 -Task; the code sync alone does
+not pick it up.
+Tests: TestRequoteInterleave (7), TestForceEventsEmptied (2).
+
+## 2026-09-27 pm — Estimator fidelity: Carbon Arc cut scheduled, loop's side band in the estimate, schedule-weighted rate bar (Jack)
+
+Jack, on the three scan items explained but not built: "fix all 3". One
+block of knobs after KEEP_ACCRUAL_WHILE_PROGRAMMED; all three default ON.
+
+(1) FLOOR_PROJECTION_SIDES. The floor projection read side_size_mults (the
+Carbon Arc late-month cut: no bids, asks at half size from 00:00 ET fourteen
+days before the measurement month ends) once, at `now`, for the whole window.
+floor_size_profile() now splits the window at every side-rule change point
+(side_mult_change_points: ca_late_window_start) and walks each piece with
+size_mult_profile, so keys are (hour, bid, ask) multipliers and a step past
+the 14-day walk cap still lands. Real estimator on a 45x48 KXAMZNCC book at
+frozen October dates: the old projection for the Oct 12 -> Oct 19 15:02Z
+period was 16% phantom at the period start, 35% on Oct 16, 55% on Oct 17;
+identical once inside the window. First bites the October cycle (window
+start Oct 18 04:00Z); September-cycle CA markets already stopped 9/26.
+Profiles of every non-CA series are unchanged (462 random windows, max
+weight diff 1e-16). Logging: floor_by_mult rows with non-unit side mults
+carry [.., bid_mult, ask_mult]; floor_mult_profile tokens are tagged
+"1/b0a0.5:0.210". Kill: IMM_FLOOR_PROJECTION_SIDES=0.
+
+(2) ESTIMATE_SIDE_BAND. The estimator's probe ladder now builds a side only
+when the loop would place it (that side's EXTERNAL touch inside
+member_price_band(series, True) -- the band a selected market quotes in)
+and passes the loop's rung band (RUNG_DEEP_FLOOR on a healthy book, else
+the band floor, .. band top). quotable_sides reads the same test on the
+external touches (an incumbent's own orders stripped), so a challenger's
+91-93c ask now counts as a side. Replay 9/20-27 (1,251 fresh admissions):
+94 logged quotable_sides=0, 90 had no side the loop could place (52 on 1c x
+99c opens; KXYUMTBFT, KXMCDFT, KXDIESELD, KXBA ...); 89 logged one-sided were
+two-sided in the member band. Caveat, measured: those 90 books mostly filled
+in -- first-hour realized est_frac a median 2.4x the admission estimate
+(n=64) -- so for fresh markets the fix mostly moves admission to when the
+book is quotable (+ the admission clock). Members: the 38 that sat wholly
+out of band 30+ min on 9/27 were all curated (KXRAIN), finecon (KXCBD,
+KXSPRLVL), forced (KXFSLR) or banked >= $0.85, so none would have exited.
+Kill: IMM_ESTIMATE_SIDE_BAND=0.
+
+(3) RATE_FLOOR_SCHEDULE. The $2/day rate bar (68 series) compared the
+live-size est_dollars_per_day; it now compares floor_dollars_per_day
+(rate_floor_rate), the rate the payout floor and horizon escape already use.
+Consequence, measured on 9/26-27 snapshots: the schedule-weighted rate runs
+a median 1.39x normal size for long-dated series and 0.68x for the gas /
+diesel dailies, so the bar is now ~$1.44/day of normal-size earnings for
+the former (was $2 by day, $1 overnight, $1.33 Saturday) and ~$2.94 for the
+latter (was $2 by day, $4 in the evening) -- at every hour. No new-event
+candidate in the 9/26-27 snapshots changes verdict. selection rows add
+rate_est. Kill: IMM_RATE_FLOOR_SCHEDULE=0.
+Tests: TestFloorSideSchedule (10), TestEstimatorSideBand (8, incl. a
+dry-run mirror: the loop places exactly the sides the estimator counts on
+49x51 / 3x50 / 80x92 / 1x99 books), TestRateFloorSchedule (3). Every one of
+8 targeted mutations fails them. TestFloorRealizedAnchor.test_never_scales_up
+compared two reads ms apart on a sliding window at 9 places (flaky); now 6.
