@@ -1007,6 +1007,8 @@ def sides_can_qualify(series: str, target: float, depth_yes: float,
             return True
         if not pads:
             return False
+        if not is_bid and series_bid_only(series):
+            return False     # a bid-only family never pads its ask side
         if is_bid:
             if ext_bid is None or ext_bid - PAD_BID_CENTS < PAD_MIN_TICKS_BEHIND:
                 return False
@@ -3140,6 +3142,15 @@ _DEFAULT_POLITICS_SERIES = "KXTRUMPAPPROVE"
 # day is published (~4h before the 03:59Z close), a hold after each new
 # day. IMM_ALLOW_AI_USAGE_SERIES="" removes them.
 _DEFAULT_AI_USAGE_SERIES = "KXTOKENUSE,KXTOKENUSEM"
+# USGS EARTHQUAKES (Jack 2026-09-27: "yes build the USGS bid-only gate").
+# KXBIGGESTQUAKE settles on the biggest USGS-displayed magnitude of a UTC day
+# -- a live public feed the open-scan tier rejects on `usgs.gov`. This
+# normal-book entry exists only because the bot reads that feed itself (plus
+# GFZ's) and rests YES BIDS ONLY against it (the QUAKE_* gate); it is never
+# quoted without the gate: IMM_QUAKE_ENABLE=0 empties it, and so does
+# IMM_ALLOW_QUAKE_SERIES="".
+_QUAKE_LIVE = os.environ.get("IMM_QUAKE_ENABLE", "1") == "1"
+_DEFAULT_QUAKE_SERIES = "KXBIGGESTQUAKE"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -3317,6 +3328,10 @@ ALLOW_SERIES = frozenset(
                                        _DEFAULT_POLITICS_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_AI_USAGE_SERIES",
                                        _DEFAULT_AI_USAGE_SERIES)
+                # USGS earthquakes (2026-09-27): only while the quake gate is on
+                + "," + (os.environ.get("IMM_ALLOW_QUAKE_SERIES",
+                                        _DEFAULT_QUAKE_SERIES)
+                         if _QUAKE_LIVE else "")
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -5249,6 +5264,11 @@ _CONFIG_CODE_KNOBS = (
     "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",
     "GB_FAIR_SIGMA_LO_FRAC", "GB_FAIR_MAX_SIGMA_CENTS", "GB_FAIR_REFRESH_SECS",
     "GB_STATE_MIN_RATE",
+    # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
+    # (freeze, lags, staleness) ride in its status file's "knobs" block
+    "QUAKE_ENABLE", "QUAKE_SERIES", "QUAKE_MARGIN_CENTS", "QUAKE_USGS_POLL_SECS",
+    "QUAKE_GFZ_POLL_SECS", "QUAKE_CUTOFF_FROM_CLOSE_MIN", "QUAKE_RUNG",
+    "QUAKE_MAX_POSITION",
 )
 
 
@@ -6227,6 +6247,154 @@ def gb_gate_reason(ticker: str, now_ts: float,
                  "tol": GB_FAIR_TOL_CENTS, "bid_bad": bid_bad,
                  "ask_bad": ask_bad, "mu": e["mu"], "sigma": e["sigma"]})
     return "", {}
+
+
+# ----------------------------------------------------------------------------
+# USGS EARTHQUAKE BID-ONLY GATE (Jack 2026-09-27: "yes build the USGS bid-only
+# gate", then "also use GFZ data"). KXBIGGESTQUAKE-<DDMMMYY>-<K> resolves YES
+# when the highest USGS-displayed magnitude of that UTC day reaches K (ten
+# strikes 5.2-7.0; all 204 settled markets reproduce on the displayed daily
+# maximum). A quake can only make YES worth more, so the family rests YES
+# BIDS ONLY -- resting asks were lifted within ~12 s of USGS publishing on 24
+# of 62 crossed strikes, and before USGS on 22 more -- every rung capped at
+# QUAKE_MARGIN_CENTS under usgs_quake_fair's fair value (10-year daily-max
+# frequencies over the rest of the day plus the unpublished tail). The
+# refresher thread polls the USGS past-day M4.5+ feed and GFZ's FDSN event
+# service into an in-memory QuakeWatch (_quake_state). Per strike the gate
+#   - STANDS ASIDE (cancel) when the USGS read is stale or missing (fail
+#     CLOSED), the strike is already crossed on USGS, it has no rate model,
+#     or its fair leaves no bid of 1c or more;
+#   - HOLDS (resting bids left exactly as they are, never raised on news)
+#     while a new M4.8+ detection on either feed awaits NEIC's own solution,
+#     or GFZ is stale -- each bounded by the module's FREEZE_MAX_MIN;
+#   - otherwise quotes the bid ladder with every rung capped at fair - margin.
+# No ask rungs and no ask pad ever (series_bid_only feeds the per-side ladder
+# multipliers, both pad sites and the two-sided depth test), and the reward
+# estimate prices the same capped, bid-only ladder. Cutoff = close -
+# QUAKE_CUTOFF_FROM_CLOSE_MIN (the close-anchored rule: the DDMMMYY ticker
+# date would parse YY-first). Rung QUAKE_RUNG (100) and per-market cap
+# QUAKE_MAX_POSITION (150, the book-wide launcher cap) are hand-tuned -- the
+# modelled $40-48/day was at 100 contracts per strike -- and the per-event
+# net cap (IMM_MAX_EVENT) still binds across the ten strikes. Kill switch IMM_QUAKE_ENABLE=0 takes the series out
+# of the allowlist entirely (never quoted without the gate).
+QUAKE_ENABLE = _QUAKE_LIVE
+QUAKE_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_QUAKE_SERIES", "KXBIGGESTQUAKE").split(",") if s.strip())
+QUAKE_MARGIN_CENTS = _env_float("IMM_QUAKE_MARGIN_CENTS", 1.0)
+QUAKE_USGS_POLL_SECS = _env_float("IMM_QUAKE_USGS_POLL_SECS", 15)
+QUAKE_GFZ_POLL_SECS = _env_float("IMM_QUAKE_GFZ_POLL_SECS", 20)
+QUAKE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN", 10)
+QUAKE_RUNG = _env_int("IMM_QUAKE_RUNG", 100)
+QUAKE_MAX_POSITION = _env_float("IMM_QUAKE_MAX_POSITION", 150)
+QUAKE_STATUS_FILE = os.environ.get(
+    "IMM_QUAKE_STATUS_FILE", os.path.join(STATUS_DIR, "usgs_quake_state.json"))
+# the QuakeWatch the refresher thread owns; None = no feed (gate closed)
+_quake_state: dict = {"watch": None}
+_QUAKE_DAY_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})$")
+
+for _s in QUAKE_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        cutoff_from_close_min=QUAKE_CUTOFF_FROM_CLOSE_MIN,
+        levels=[(0, QUAKE_RUNG)], max_position=QUAKE_MAX_POSITION)
+
+
+def series_bid_only(series: str) -> bool:
+    """A family quoted with YES bids only (the quake gate): no ask rungs, no
+    ask pad, and the two-sided depth test never counts an ask pad."""
+    return QUAKE_ENABLE and series in QUAKE_SERIES
+
+
+def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
+    """(bid_mult, ask_mult) on this market's ladder right now: the Carbon Arc
+    late-month rule, with asks zeroed for a bid-only family."""
+    bm, am = ca_late_month_mults(ticker, now_utc)
+    if series_bid_only(series_of(ticker)):
+        am = 0.0
+    return bm, am
+
+
+def quake_event_day(event_ticker: str) -> Optional[datetime]:
+    """00:00Z of a quake event's UTC day from its DDMMMYY segment:
+    'KXBIGGESTQUAKE-27SEP26' -> 2026-09-27 00:00Z. None when it does not
+    parse (parse_event_date would read it YY-first)."""
+    parts = event_ticker.split("-")
+    if len(parts) < 2:
+        return None
+    m = _QUAKE_DAY_RE.match(parts[1])
+    if not m:
+        return None
+    dd, mon, yy = m.groups()
+    month = _MONTHS.get(mon)
+    if month is None:
+        return None
+    try:
+        return datetime(2000 + int(yy), month, int(dd), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def quake_gate(ticker: str, now_ts: float,
+               close_time: Optional[datetime] = None) -> dict:
+    """The quake gate's verdict for one strike: {'action': 'quote' | 'hold' |
+    'stand', 'why', 'reason', 'cap_c' (quote / hold), 'fair', ...}. Fails
+    CLOSED: no feed yet, an unparseable ticker, or a close that is not on
+    the ticker's day all stand aside."""
+    watch = _quake_state.get("watch")
+    if watch is None:
+        return {"action": "stand", "why": "quake feed not running",
+                "reason": "no_feed"}
+    event_ticker, _, ks = ticker.rpartition("-")
+    day = quake_event_day(event_ticker)
+    try:
+        k: Optional[float] = float(ks)
+    except ValueError:
+        k = None
+    if day is None or k is None or not math.isfinite(k):
+        return {"action": "stand", "why": f"unparseable quake ticker {ticker}",
+                "reason": "ticker"}
+    if close_time is not None \
+            and close_time.astimezone(timezone.utc).date() != day.date():
+        return {"action": "stand",
+                "why": (f"close {close_time.isoformat()} is not on the "
+                        f"ticker's day {day.date()}"), "reason": "close_day"}
+    return watch.verdict(k, day.timestamp(), now_ts, QUAKE_MARGIN_CENTS)
+
+
+def quake_probe_cap(ticker: str, now_ts: float,
+                    close_time: Optional[datetime] = None) -> Optional[int]:
+    """The bid cap the reward estimate assumes: the gate's cap when it quotes
+    or holds, None when it stands aside (the estimate is then zero)."""
+    v = quake_gate(ticker, now_ts, close_time)
+    if v.get("action") in ("quote", "hold") and v.get("cap_c") is not None:
+        return int(v["cap_c"])
+    return None
+
+
+def quake_past_cutoff(qk: dict, cutoff: Optional[datetime],
+                      now_utc: datetime) -> dict:
+    """A hold never outlives the market's cutoff: past it the verdict is
+    stand aside (cancel), because a held market skips the loop's own
+    past-cutoff block."""
+    if qk.get("action") == "hold" and cutoff is not None and now_utc >= cutoff:
+        return dict(qk, action="stand", reason="cutoff",
+                    why="past the cutoff while held")
+    return qk
+
+
+def quake_cap_quotes(quotes: List["Quote"], cap_c: int) -> List["Quote"]:
+    """Bid rungs only, each priced at most cap_c cents (a rung that would
+    fall under 1c is dropped); a moved rung loses any sub-penny price."""
+    out = []
+    for q in quotes:
+        if q.book_side != "bid":
+            continue
+        if q.price_cents > cap_c:
+            if cap_c < 1:
+                continue
+            q = replace(q, price_cents=int(cap_c), price_exact=None)
+        out.append(q)
+    return out
 
 
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
@@ -8196,6 +8364,8 @@ class IncentiveMarketMaker:
         self._ca_fair_stood: Set[str] = set()     # Carbon Arc fair stand-asides
         self._or_fair_stood: Set[str] = set()     # OpenRouter token-usage stand-asides
         self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
+        self._quake_stood: Set[str] = set()       # quake gate stand-asides
+        self._quake_held: Set[str] = set()        # quake gate holds (frozen bids)
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
@@ -10549,7 +10719,7 @@ class IncentiveMarketMaker:
             # atref rests up to 2x the spec size, so an unscaled reservation
             # under-charged the budget up to ~2x on mid-priced deep-ref books
             # (anchor pricing stays — actual rests at/below the anchor cost).
-            _cbm, _cam = ca_late_month_mults(meta.ticker, now_utc)
+            _cbm, _cam = side_size_mults(meta.ticker, now_utc)
             worst = (ladder_collateral_dollars(bid, None, scale_levels(lv, _cbm))
                      * meta.ref_mult_bid
                      + ladder_collateral_dollars(None, ask, scale_levels(lv, _cam))
@@ -11263,7 +11433,8 @@ class IncentiveMarketMaker:
         # Carbon Arc late-month rule: the hypothetical ladder is per side too,
         # so the reward estimate (and the $1 floor projection built on it)
         # see the size the quote loop will actually rest.
-        _cbm, _cam = ca_late_month_mults(meta.ticker, _now)
+        # (side_size_mults: the same rule plus the bid-only quake family)
+        _cbm, _cam = side_size_mults(meta.ticker, _now)
         def _probe_ladder(hm: float, lv: List[Tuple[int, int]],
                           rmb: float, rma: float,
                           eb: Optional[int], ea: Optional[int],
@@ -11295,6 +11466,11 @@ class IncentiveMarketMaker:
                 out += build_side_ladder(meta.ticker, "ask", ea, eb,
                                          sma, levels=lva, ref_px=rpa,
                                          hour_mult=hm)
+            if series_bid_only(meta.series):
+                # quake gate: the bids the loop will rest, capped at fair
+                _qcap = quake_probe_cap(meta.ticker, _now.timestamp(),
+                                        meta.close_time)
+                out = [] if _qcap is None else quake_cap_quotes(out, _qcap)
             return out
 
         def _overlay_with_pads(quotes: List[Quote],
@@ -11322,7 +11498,7 @@ class IncentiveMarketMaker:
                                          meta.target_size)
                         if n > 0:
                             overlay.append(("bid", PAD_BID_CENTS, float(n)))
-                    if ea is not None \
+                    if ea is not None and not series_bid_only(meta.series) \
                             and PAD_ASK_CENTS - ea >= PAD_MIN_TICKS_BEHIND:
                         n = pad_quantity(sum(sz for _px, sz in nlv) + nt_ask,
                                          meta.target_size)
@@ -12072,6 +12248,12 @@ class IncentiveMarketMaker:
 
         desired: List[Quote] = []
         blind: Set[str] = set()
+        # quake markets HELD this cycle (a fresh detection awaits NEIC): like
+        # blind markets their resting bids never enter `desired`, so the diff
+        # must preserve them. No up-front event-room charge is needed: a
+        # detection holds every strike of the family at once, so no sibling
+        # hands out room those bids could consume.
+        quake_held: Set[str] = set()
         marked: Set[str] = set()          # tickers marked from live books this cycle
         # live-event depth gate, per-cycle books: events seen thin this
         # cycle, and per-event count of gated markets that read healthy —
@@ -12663,6 +12845,37 @@ class IncentiveMarketMaker:
                 self._gb_fair_stood.discard(t)
                 log(f"{self.tag} gb-fair resume {t}")
 
+            # USGS EARTHQUAKE BID-ONLY GATE (Jack 2026-09-27, see
+            # QUAKE_ENABLE): stand aside (cancel) when the feed is stale, the
+            # strike crossed or its fair leaves no bid; HOLD -- resting bids
+            # left exactly as they are, never raised on the news -- while a
+            # fresh quake detection awaits NEIC; otherwise the bid ladder
+            # below is capped at the fair cap.
+            quake_cap: Optional[int] = None
+            if series_bid_only(meta.series):
+                qk = quake_past_cutoff(quake_gate(t, now_ts, meta.close_time),
+                                       meta.cutoff, now_utc)
+                if qk["action"] == "stand":
+                    self._quake_held.discard(t)
+                    if t not in self._quake_stood:
+                        self._quake_stood.add(t)
+                        log(f"{self.tag} quake stand-aside {t}: {qk['why']}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "quake", lambda: qk, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+                if qk["action"] == "hold":
+                    if t not in self._quake_held:
+                        self._quake_held.add(t)
+                        log(f"{self.tag} quake hold {t}: {qk['why']}")
+                    quake_held.add(t)
+                    self._gskip(t, "quake_hold", lambda: qk, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+                quake_cap = int(qk["cap_c"])
+            if t in self._quake_stood or t in self._quake_held:
+                self._quake_stood.discard(t)
+                self._quake_held.discard(t)
+                log(f"{self.tag} quake resume {t}")
+
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go
             # silent. Without this, a restored rain position kept reduce-only
@@ -12688,6 +12901,8 @@ class IncentiveMarketMaker:
             ca_bm, ca_am = ca_late_month_mults(t, now_utc)
             lv_bid = scale_levels(lv, ca_bm)
             lv_ask = scale_levels(lv, ca_am)
+            if series_bid_only(meta.series):
+                lv_ask = []          # bid-only family (quake gate): no ask rungs
             if (ca_bm, ca_am) != (1.0, 1.0):
                 self._ca_late_note(meta.event_ticker, ca_bm, ca_am)
             # deep-reference size multiplier feeds the side_max component of
@@ -12750,6 +12965,10 @@ class IncentiveMarketMaker:
                                                 levels=lv_ask, ref_px=ref_ask_px,
                                                 band=(rung_lo, pmax_s),
                                                 hour_mult=hm))
+
+            # quake gate: every bid rung at most the fair cap (no asks exist)
+            if quake_cap is not None:
+                mq = quake_cap_quotes(mq, quake_cap)
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
@@ -13092,9 +13311,9 @@ class IncentiveMarketMaker:
         # Fast tick: non-fast managed markets built no `desired` this tick —
         # preserve their resting orders through the diff or it would cancel
         # every one of them as unmatched.
-        preserve = blind if not fast_only else \
-            blind | {mt for mt, mm in managed.items()
-                     if not series_fast_lane(mm.series)}
+        preserve = (blind | quake_held) if not fast_only else \
+            blind | quake_held | {mt for mt, mm in managed.items()
+                                  if not series_fast_lane(mm.series)}
         to_place, to_cancel, to_amend = diff_orders(
             desired, resting, self.state.order_ages, now_ts,
             preserve_tickers=preserve, touch_by_ticker=touch_map)
@@ -13287,7 +13506,8 @@ class IncentiveMarketMaker:
             n = pad_quantity(basis, target)
             if n > 0:
                 pads.append(Quote(ticker, "bid", PAD_BID_CENTS, n, is_pad=True))
-        if ask_pad_safe and (nt_ask > 0 or (pad_missing_side and nt_bid > 0)):
+        if ask_pad_safe and (nt_ask > 0 or (pad_missing_side and nt_bid > 0)) \
+                and not series_bid_only(series_of(ticker)):
             basis = (no_depth - own_pad_ask) if self.live else (no_depth + nt_ask)
             n = pad_quantity(basis, target)
             if n > 0:
@@ -13700,6 +13920,73 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_gb_fair_refresh, daemon=True,
                              name="gb-fair").start()
+        if QUAKE_ENABLE and not once:
+            # USGS / GFZ quake refresher (2026-09-27): every network call off
+            # the trading thread, into the in-memory QuakeWatch the quote loop
+            # reads (the gate works in seconds, not a file round-trip): USGS
+            # every QUAKE_USGS_POLL_SECS, GFZ every QUAKE_GFZ_POLL_SECS, a
+            # status file once a minute. A failed read keeps the last state,
+            # which ages out -- USGS stale stands the quake markets aside, GFZ
+            # stale holds them (bounded, then USGS-only pricing).
+            def _quake_refresh():
+                try:
+                    import usgs_quake_fair as uqf
+                except Exception as e:
+                    log(f"{self.tag} ! quake refresher disabled: {e}")
+                    return
+                watch = uqf.QuakeWatch()
+                _quake_state["watch"] = watch
+                due_u = due_g = due_s = 0.0
+                last = {"usgs": None, "gfz": None}
+                seen_det: Set[str] = set()
+
+                def _read(src, fn):
+                    try:
+                        fn()
+                        if last[src] not in (None, "ok"):
+                            log(f"{self.tag} quake: {src.upper()} feed back")
+                        last[src] = "ok"
+                        return True
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last[src] != err:
+                            log(f"{self.tag} ! quake {src.upper()} read failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last[src] = err
+                        return False
+
+                while True:
+                    now = time.time()
+                    polled = False
+                    if now >= due_u:
+                        due_u = now + max(5.0, QUAKE_USGS_POLL_SECS)
+                        polled |= _read("usgs", lambda: watch.update_usgs(
+                            *uqf.fetch_usgs(), time.time()))
+                    if now >= due_g:
+                        due_g = now + max(5.0, QUAKE_GFZ_POLL_SECS)
+                        polled |= _read("gfz", lambda: watch.update_gfz(
+                            uqf.fetch_gfz(), time.time()))
+                    if polled:
+                        # one line per NEW detection (the per-market hold
+                        # lines follow from the quote loop)
+                        for d in watch.open_detections(time.time()):
+                            key = f"{d['src']}:{d['id']}"
+                            if key not in seen_det:
+                                seen_det.add(key)
+                                log(f"{self.tag} quake detection: {d['src']} "
+                                    f"M{d['mag']:g} {d['id']} -- quake bids "
+                                    f"held until NEIC confirms")
+                        if len(seen_det) > 500:
+                            seen_det.clear()
+                    if now >= due_s:
+                        due_s = now + 60.0
+                        try:
+                            uqf.write_status(QUAKE_STATUS_FILE, watch)
+                        except Exception:
+                            pass      # observability only
+                    time.sleep(1.0)
+            threading.Thread(target=_quake_refresh, daemon=True,
+                             name="quake").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
@@ -13724,6 +14011,15 @@ class IncentiveMarketMaker:
                 f"refresh {GB_FAIR_REFRESH_SECS}s, file {GB_FAIR_FILE}")
         else:
             log("gb-fair gate: OFF -- AAA state dailies stay pattern-blocked")
+        if QUAKE_ENABLE:
+            log(f"quake gate: {','.join(sorted(QUAKE_SERIES))} BID-ONLY "
+                f"fail-closed, bids <= fair - {QUAKE_MARGIN_CENTS:g}c, rung "
+                f"{QUAKE_RUNG} / cap {QUAKE_MAX_POSITION:g}, USGS every "
+                f"{QUAKE_USGS_POLL_SECS:g}s + GFZ every {QUAKE_GFZ_POLL_SECS:g}s, "
+                f"hold on a new quake until NEIC confirms, cutoff close-"
+                f"{QUAKE_CUTOFF_FROM_CLOSE_MIN}m, status {QUAKE_STATUS_FILE}")
+        else:
+            log("quake gate: OFF -- KXBIGGESTQUAKE not enrolled")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
             f"earnings x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT:g}), "

@@ -72,6 +72,10 @@ def setUpModule():
     # the GasBuddy state-gas fair file (2026-09-27), same reason
     imm.GB_FAIR_FILE = os.path.join(tmp, "gasbuddy_fair.json")
     imm._gb_fair_state.update(mtime=0.0, entries={})
+    # the quake gate's status file and in-memory watch (2026-09-27): only the
+    # refresher thread writes the file, but never let a test touch the live one
+    imm.QUAKE_STATUS_FILE = os.path.join(tmp, "usgs_quake_state.json")
+    imm._quake_state["watch"] = None
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -13861,6 +13865,170 @@ def _sink_rows(status_dir, name):
     return out
 
 
+import usgs_quake_fair as uqf    # noqa: E402  (the quake gate's feed module)
+
+_MON3 = "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split()
+
+
+class TestQuakeBidOnlyGate(unittest.TestCase):
+    """usgs_quake_fair.QuakeWatch -> quake_gate -> KXBIGGESTQUAKE quoted with
+    YES BIDS ONLY, capped at fair - margin (Jack 2026-09-27: "yes build the
+    USGS bid-only gate", "also use GFZ data"). Fixture = TOMORROW's event:
+    the whole UTC day is still ahead (fair = the full-day frequency, 28.4c at
+    M6.0 -> cap 27c) and the close/cutoff are more than a day away. Book
+    28x30, 1,500 contracts a side (the target, 500, is met without pads)."""
+
+    def setUp(self):
+        _clean_persist()
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        d = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+        self.day = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        self.EV = f"KXBIGGESTQUAKE-{d.day:02d}{_MON3[d.month - 1]}{d.year % 100:02d}"
+        self.T = f"{self.EV}-6.0"
+        self.close = self.day + timedelta(hours=23, minutes=59, seconds=59)
+        now = time.time()
+        self.watch = uqf.QuakeWatch()
+        self.watch.update_usgs(now - 30, [], now)
+        self.watch.update_gfz([], now)
+        imm._quake_state["watch"] = self.watch
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm._quake_state["watch"] = None
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "500.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.close.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.2800", "yes_ask_dollars": "0.3000",
+            "volume_fp": "500.00"}
+        yes = [["0.24", "300"], ["0.25", "300"], ["0.26", "300"],
+               ["0.27", "300"], ["0.28", "300"]]
+        no = [["0.66", "300"], ["0.67", "300"], ["0.68", "300"],
+              ["0.69", "300"], ["0.70", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": yes,
+                                                 "no_dollars": no}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _orders(self, bot):
+        return sorted((oid, o["book_side"], o["yes_price"])
+                      for oid, o in bot.state.sim_orders.items()
+                      if o["ticker"] == self.T)
+
+    def _quotes(self, bot):
+        return sorted((side, px) for _oid, side, px in self._orders(bot))
+
+    def test_enrolled_with_close_cutoff_and_hand_tuned_size(self):
+        self.assertIn("KXBIGGESTQUAKE", imm.ALLOW_SERIES)
+        ov = imm.SERIES_OVERRIDES["KXBIGGESTQUAKE"]
+        self.assertEqual(ov.cutoff_from_close_min, imm.QUAKE_CUTOFF_FROM_CLOSE_MIN)
+        self.assertEqual(ov.levels, [(0, imm.QUAKE_RUNG)])
+        self.assertEqual(ov.max_position, imm.QUAKE_MAX_POSITION)
+        self.assertTrue(imm.series_bid_only("KXBIGGESTQUAKE"))
+        self.assertFalse(imm.series_bid_only("KXBIGGESTQUAKEH"))
+        with mock.patch.object(imm, "QUAKE_ENABLE", False):
+            self.assertFalse(imm.series_bid_only("KXBIGGESTQUAKE"))
+
+    def test_event_day_is_ddmmmyy(self):
+        self.assertEqual(imm.quake_event_day("KXBIGGESTQUAKE-27SEP26"),
+                         datetime(2026, 9, 27, tzinfo=timezone.utc))
+        self.assertEqual(imm.quake_event_day("KXBIGGESTQUAKE-05OCT26"),
+                         datetime(2026, 10, 5, tzinfo=timezone.utc))
+        self.assertIsNone(imm.quake_event_day("KXBIGGESTQUAKE-31SEP26"))
+        self.assertIsNone(imm.quake_event_day("KXBIGGESTQUAKE-26SEP2712"))
+        self.assertIsNone(imm.quake_event_day("KXBIGGESTQUAKE"))
+
+    def test_asks_zeroed_pads_and_depth_test_bid_only(self):
+        now = datetime.now(timezone.utc)
+        self.assertEqual(imm.side_size_mults(self.T, now), (1.0, 0.0))
+        self.assertEqual(imm.side_size_mults("KXGOOD-68DEC04-T1", now), (1.0, 1.0))
+        # a thin ask side can never be padded up for a bid-only family
+        self.assertEqual(imm.sides_can_qualify("KXBIGGESTQUAKE", 500, 1500, 100, 28, 30),
+                         (True, False))
+        self.assertEqual(imm.sides_can_qualify("KXBIGGESTQUAKE", 500, 1500, 600, 28, 30),
+                         (True, True))
+
+    def test_a_hold_never_outlives_the_cutoff(self):
+        now = datetime.now(timezone.utc)
+        held = {"action": "hold", "why": "frozen", "reason": "detection", "cap_c": 27}
+        past = imm.quake_past_cutoff(held, now - timedelta(seconds=1), now)
+        self.assertEqual((past["action"], past["reason"]), ("stand", "cutoff"))
+        self.assertEqual(imm.quake_past_cutoff(held, now + timedelta(hours=1), now), held)
+        self.assertEqual(imm.quake_past_cutoff(held, None, now), held)
+        quote = {"action": "quote", "cap_c": 27}
+        self.assertEqual(imm.quake_past_cutoff(quote, now - timedelta(hours=1), now), quote)
+
+    def test_cap_quotes(self):
+        qs = [imm.Quote(self.T, "bid", 30, 50, price_exact=30.4),
+              imm.Quote(self.T, "bid", 25, 50),
+              imm.Quote(self.T, "ask", 60, 50),
+              imm.Quote(self.T, "bid", 1, 500, is_pad=True)]
+        out = imm.quake_cap_quotes(qs, 27)
+        self.assertEqual([(q.book_side, q.price_cents, q.price_exact) for q in out],
+                         [("bid", 27, None), ("bid", 25, None), ("bid", 1, None)])
+        self.assertEqual(imm.quake_cap_quotes(qs, 0), [])   # (the loop stands aside first)
+
+    def test_gate_fails_closed_and_stands_on_a_crossed_strike(self):
+        now = time.time()
+        imm._quake_state["watch"] = None
+        self.assertEqual(imm.quake_gate(self.T, now)["reason"], "no_feed")
+        imm._quake_state["watch"] = self.watch
+        self.assertEqual(imm.quake_gate(self.T, now, self.close)["action"], "quote")
+        self.assertEqual(imm.quake_gate(self.T, now, self.close + timedelta(days=1))["reason"],
+                         "close_day")
+        self.assertEqual(imm.quake_gate(self.EV + "-x", now)["reason"], "ticker")
+        # today's event, a quake already on USGS today
+        d = datetime.now(timezone.utc).date()
+        today = datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp()
+        ev = f"KXBIGGESTQUAKE-{d.day:02d}{_MON3[d.month - 1]}{d.year % 100:02d}"
+        t_q = max(today + 1, now - 60)
+        self.watch.update_usgs(now - 30, [{"id": "us1", "mag": 6.3, "mag_type": "mww",
+                                           "net": "us", "time": t_q, "place": "x"}], now)
+        self.assertEqual(imm.quake_gate(f"{ev}-6.2", now)["reason"], "crossed")
+        self.assertNotEqual(imm.quake_gate(f"{ev}-6.4", now)["reason"], "crossed")
+
+    def test_quotes_a_bid_capped_at_fair_and_no_ask(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [("bid", 27)])       # touch 28, cap 27
+        self.assertNotIn(self.T, bot._quake_stood)
+
+    def test_no_feed_quotes_nothing(self):
+        imm._quake_state["watch"] = None
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+
+    def test_detection_holds_the_resting_bid_and_stale_usgs_cancels(self):
+        bot = self._bot()
+        bot.run_cycle()
+        before = self._orders(bot)
+        self.assertEqual([(s, p) for _o, s, p in before], [("bid", 27)])
+        now = time.time()
+        self.watch.update_gfz([{"id": "g1", "mag": 5.9, "mag_type": "mb",
+                                "time": now - 60, "place": "x"}], now)
+        bot.run_cycle()
+        self.assertEqual(self._orders(bot), before)               # untouched
+        self.assertIn(self.T, bot._quake_held)
+        self.watch.usgs_ok = now - imm_usgs_stale_secs() - 10     # feed gone
+        bot.run_cycle()
+        self.assertEqual(self._orders(bot), [])
+        self.assertIn(self.T, bot._quake_stood)
+        self.assertNotIn(self.T, bot._quake_held)
+
+
+def imm_usgs_stale_secs():
+    return uqf.USGS_STALE_SECS
+
+
 class TestGuardSkipSink(unittest.TestCase):
     """guard_skips_*.jsonl (2026-09-26): a market an in-loop guard skips wrote
     no cycle_log row that cycle, so what the guard saw was lost. Change-driven:
@@ -14016,10 +14184,10 @@ class TestGuardSkipSink(unittest.TestCase):
                         if src[j].strip())
             if not prev.startswith("self._gskip("):
                 bare.append(prev)
-        # 26 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
+        # 28 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
         # token-usage gate (2026-09-27) + the GasBuddy state-gas gate
-        # (2026-09-27)
-        self.assertEqual(len(conts), 26)
+        # (2026-09-27) + the quake gate's stand-aside and hold (2026-09-27)
+        self.assertEqual(len(conts), 28)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

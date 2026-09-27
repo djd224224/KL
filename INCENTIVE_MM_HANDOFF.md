@@ -4071,3 +4071,104 @@ Text is ASCII (cp1252 task console). Kill switch IMM_PICKOFF_ENABLE=0;
 lookahead IMM_PICKOFF_LOOKAHEAD_DAYS (14). Blind spot: a same-day hour error
 smaller than the bar, which the data cannot tell from a normal release->call
 gap. Tests: test_imm_pickoff.
+
+## 2026-09-27 — USGS earthquake gate: KXBIGGESTQUAKE allowlisted, YES bids only, priced off USGS + GFZ (Jack)
+
+Jack: "yes build the USGS bid-only gate", then "also use GFZ data".
+
+WHY THIS FAMILY. KXBIGGESTQUAKE-<DDMMMYY>-<K> ("If the highest USGS-reported
+earthquake magnitude worldwide during Sep 27, 2026 from 12:00:00 AM through
+11:59:59 PM UTC is 5.2 or higher") -- ten strikes 5.2..7.0 in 0.2 steps, one
+event per UTC day, open 20:00Z the day before, close 23:59:59Z; program $50
+per market per period, daily since 9/13 (~$429/day over the ten). Measured
+9/27 (read-only study, session scratchpad vau/usgs/): all 204 settled
+markets reproduce on the USGS-DISPLAYED daily maximum at Kalshi's
+quarter-hour check (a crossed strike closes at the next :14/:29/:44/:59 and
+settles YES at once; NO strikes wait days-weeks). USGS first publishes a
+median 17.4 min after origin (M5.5+), GFZ GEOFON a median 5.3 min. On the 62
+crossed strikes the first informed YES buy came before GFZ 11 times, between
+GFZ and USGS 11, within 60 s of USGS 27 (24 within ~12 s): a resting 100-lot
+YES ask ladder lost ~$87/day even USGS-gated (~$41 GFZ+USGS-gated), one
+M6.4-6.6 day costing $400-600. A quake can only make YES worth more, so a
+resting YES BID is never on the wrong side of the news -- hence bid-only.
+
+MODEL (usgs_quake_fair.py, new). For a strike not crossed yet:
+P = 1 - exp(-lam(K) * W / 24), lam(K) = -ln(1 - P_DAY(K)) with P_DAY the
+empirical frequency of UTC days whose maximum reached K over 2016-2026
+(3,650 days, aftershock clustering included; 0.890 at 5.2 ... 0.035 at 7.0,
+log-linear between strikes, the end slope for up to 0.4 beyond, no model
+past that). W = the rest of the day plus the unpublished tail (0.15 h with a
+fresh GFZ feed, 0.3 h on USGS alone), clipped to the day; before 00:00Z the
+whole day. The live ladder sat within 1c of this model on 5.6-6.4 on 9/27;
+5.2 trades 5-8c rich (so the bot mostly rests behind it there).
+
+FEEDS. USGS past-day M4.5+ summary GeoJSON (public domain) every
+IMM_QUAKE_USGS_POLL_SECS (15), GFZ GEOFON FDSN event service text (earthquake
+products CC BY 4.0 -- attribution "GEOFON data centre, GFZ Helmholtz Centre
+for Geosciences") every IMM_QUAKE_GFZ_POLL_SECS (20), both from a refresher
+thread ("quake") into an in-memory QuakeWatch (_quake_state) -- the gate
+works in seconds, not through a file. A status snapshot (today's max, open
+detections, feed ages, the module's knobs) goes to
+run-logs/incentive-mm/usgs_quake_state.json once a minute.
+
+GATE (quake_gate, per strike, in the quote loop after the GasBuddy gate):
+  - STAND ASIDE (cancel): USGS read older than 180 s or the feed's own
+    generation stamp older than 300 s (fail CLOSED); no watch yet; an
+    unparseable ticker or a close not on the ticker's day; the strike already
+    crossed on USGS (any network's displayed magnitude, so a tsunami centre's
+    early high number also stands it down); no rate model; fair - margin < 1c.
+  - HOLD (resting bids left exactly as they are, never raised on the news;
+    the requote diff preserves them like a blind market's): a new M4.8+
+    detection on either feed not yet confirmed -- confirmed = USGS shows the
+    quake (origins within 90 s) with NEIC's own solution for 120 s, or, for a
+    regional network that stays authoritative, a stable magnitude for 120 s
+    once the quake is 25 min old; also a stale GFZ feed (> 120 s). Each hold
+    is bounded by FREEZE_MAX_MIN (45 min per detection; a stale GFZ then
+    falls back to USGS-only pricing). Only quakes under 105 min old are news,
+    so a restart does not freeze on the past day's feed.
+  - QUOTE: the bid ladder, every rung capped at floor(fair - 1c). No ask
+    rungs and no ask pad ever: series_bid_only zeroes the ask side in the
+    per-side ladder multipliers (side_size_mults: quote loop, reward probe,
+    collateral estimate), skips the ask pad at both pad sites, and stops the
+    two-sided depth test counting an ask pad (a thin ask side = no reward =
+    no quote). The reward probe prices the same capped, bid-only ladder.
+Guard-skip rows "quake" (stand) and "quake_hold"; log lines "quake
+stand-aside / hold / resume <t>: why" once per transition and "quake
+detection: <src> M<x> <id>" once per new detection.
+
+SIZE + CUTOFF. SeriesOverride: levels [(0, IMM_QUAKE_RUNG=100)] and
+max_position IMM_QUAKE_MAX_POSITION=150 (hand-tuned, so the launcher's 0:20
+ladder does not apply; the study's $40-48/day was at 100 contracts per
+strike), cutoff_from_close_min 10 -- the close-anchored rule, because
+parse_event_date would read 27SEP26 as 2027-09-26 and 05OCT26 as 2005. The
+per-event net cap (IMM_MAX_EVENT=1000) binds across the ten strikes: the
+worst day is ~1,000 YES contracts bought and no M5.2+ before the close.
+
+KILL SWITCHES. IMM_QUAKE_ENABLE=0 takes KXBIGGESTQUAKE out of the
+allowlist entirely (it is never quoted without the gate);
+IMM_ALLOW_QUAKE_SERIES="" does the same. Knobs: IMM_QUAKE_MARGIN_CENTS (1),
+IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN (10), IMM_QUAKE_RUNG, IMM_QUAKE_MAX_POSITION,
+the poll intervals, and the module's IMM_QUAKE_* (lags, freeze magnitude,
+confirm seconds, NEIC wait, freeze cap, staleness, news age).
+
+DRY CHECK 9/27 ~17:30Z (production env, live books, the bot's estimator):
+5.2 book 51x59 fair 50.3 -> bid 49 est $3.89/day; 5.4 34x42 -> 33 $6.42;
+5.6 21x27 -> 21 $3.46; 5.8 -> 14 $2.33; 6.0 9x12 -> 9 $3.70; 6.2 -> 5 $1.69;
+6.4 and 6.6 bid behind the reference ($0); 6.8 / 7.0 stood aside (fair
+under 2c). ~$21/day on that book with 6.5 h left -- the low end of the
+study's $40-48/day.
+
+WHAT THIS DOES NOT FIX. The reward share is modelled (two snapshots in the
+study, one dry check here); 25 days of study data with no M6.8+ quake; the
+low strikes trade rich, so the bid often sits behind the touch there; a GFZ
+detection USGS rates under 4.5 (not on the M4.5+ feed) holds the family for
+the full 45 min; the fills are one-directional (long YES across correlated
+strikes -- a quiet day loses every filled bid); KXEARTHQUAKEM (monthly,
+settles on the REVISED magnitude) and KXBIGGESTQUAKEH (never listed) are
+not enrolled.
+
+WATCH AFTER DEPLOY: startup "quake gate: KXBIGGESTQUAKE BID-ONLY
+fail-closed ..."; usgs_quake_state.json refreshing each minute with small
+usgs_ok_age_s / gfz_ok_age_s; KXBIGGESTQUAKE rungs are bids only, at or
+under fair - 1c; "quake detection" lines followed by holds and resumes; no
+ask orders on the family, ever.
