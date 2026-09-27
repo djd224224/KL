@@ -3761,3 +3761,27 @@ file, bearer header + payload shape). Guard-skip sink: the stand-aside is
 guard "ca_fair" in guard_skips_*.jsonl (inputs: hold_min, or fair / lo / hi /
 tol / bid_bad / ask_bad), so the sweep test counts 24 continues. 820 green
 after the rebase onto the data-capture merge.
+
+## 2026-09-26 late — KXTRUMPAPPROVE x3 family size (Jack)
+
+Jack: "give KXTRUMPAPPROVE markets a 3x multiplier, like
+LADDER/ESCALATOR". size_mult=3.0 on SERIES_OVERRIDES["KXTRUMPAPPROVE"]
+(env IMM_TRUMPAPPROVE_SIZE_MULT; 1.0 reverts) -- the ladders' wire, so
+applied_mention_mult scales the rungs, the per-market / per-event caps,
+the skew knees and the estimator's ladder (the payout-floor projection)
+together. Size only: not the ladders' 1-99c band or $1.20 entry bar.
+Checked against the committed code with the launcher's $ProbeEnv applied:
+60 on a weekday, 90 Saturday, 120 in quiet hours up to the 07:00 ET
+cutoff, 180 on a Saturday settlement morning (Saturday x quiet hours);
+caps 450 per market / 3,000 net per event (were 150 / 1,000).
+
+Deploy 8b2bc35, relaunch 03:47:51Z (run c0b1c656). Not yet seen in live
+orders: 26SEP27 is still yielded to the hand book (manual); the first x3
+quotes come on 26SEP28 (lists 10:01 ET 9/27) if it has no hand orders.
+
+WATCH: x3 triples what can ride through the settlement-morning RCP
+update -- up to 450 contracts per strike, 3,000 net per event.
+
+Tests: test_x3_family_size_like_the_ladders (mult 3.0; caps x3; day
+ladder and weekday ladder exactly x3; band / entry bar not copied;
+cutoff kept). 694 green.
