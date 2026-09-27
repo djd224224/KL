@@ -4915,6 +4915,18 @@ def book_log_dir() -> str:
     return (os.environ.get("IMM_BOOK_LOG_DIR")
             or os.path.join(STATUS_DIR, "book_depth"))
 
+
+# DECISION-INPUT LOGGING (2026-09-26). The rules changed most often -- payout
+# floor, near-cliff, hopeless exit, per-period accrual, and ~20 in-loop guards
+# -- recorded only their OUTCOME (or nothing: a market a guard skips leaves no
+# cycle_log row that cycle). Without the inputs a rule saw, no rule change can
+# be backtested. Analytics only; nothing reads these back.
+#   IMM_GUARD_LOG=0         no guard_skips_*.jsonl
+#   IMM_SELECTION_INPUTS=0  no floor-rule inputs on selection rows, no
+#                           floor_state_*.jsonl
+GUARD_LOG = os.environ.get("IMM_GUARD_LOG", "1") == "1"
+SELECTION_INPUTS = os.environ.get("IMM_SELECTION_INPUTS", "1") == "1"
+
 # Self-restart on code change (Jack 2026-08-24 "restart for me at that time",
 # generalized after the ps1 dispatch chain proved unobservable): sync-kl-main
 # fast-forwards the repo every 30 min, but nothing reliably bounced the bot
@@ -4962,17 +4974,20 @@ _CONFIG_CODE_KNOBS = (
     "MODEL_VERSION", "LADDER_MODE", "LEVELS", "FAST_LANE_SECS", "POLL_SECS",
     "ORDER_TTL_SECS", "PAD_BID_CENTS", "PAD_ASK_CENTS", "PAD_MIN_TICKS_BEHIND",
     "QUALIFY_PATIENCE_CYCLES", "BENCH_COOLDOWN_SECS", "MAX_MARKETS",
-    "MAX_POSITION_CONTRACTS", "MAX_EVENT_CONTRACTS", "MAX_TOTAL_RESTING",
+    "MAX_POSITION_CONTRACTS", "MAX_EVENT_CONTRACTS",
     "COLLATERAL_BUDGET", "DAILY_LOSS_LIMIT", "RATE_FLOOR_TOTAL_ALT",
     # both floors by their REAL global names (2026-09-12: "PAYOUT_FLOOR" had
     # never matched a global, so the exchange minimum was silently unhashed,
     # and the entry bar was never in the hash at all)
     "MIN_EST_TOTAL_DOLLARS", "PAYOUT_FLOOR_DOLLARS",
-    "PRICE_BAND_LO", "PRICE_BAND_HI", "STP_TYPE",
+    # the price band by its REAL global names (2026-09-26: PRICE_BAND_LO/HI,
+    # MAX_TOTAL_RESTING and FINECON_GROUP_CUT never matched a global -- same
+    # silent-skip class as PAYOUT_FLOOR above -- so the band was never hashed)
+    "PRICE_MIN_CENTS", "PRICE_MAX_CENTS", "STP_TYPE",
     "EVENT_LEVEL_STANDOFF", "SCAN_TOP_N", "SCAN_DAILY_OPENINGS",
     "SCAN_DAILY_LOSS_LIMIT", "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
-    "EVENT_DEPTH_STACK_CONTRACTS", "FINECON_GROUP_CUT",
+    "EVENT_DEPTH_STACK_CONTRACTS",
     "SERIES_BLOCK_PATTERNS", "MARKET_BLOCK_SUFFIXES", "EVENT_BLOCK_PATTERNS",
     "AUCTION_DATE_SERIES", "EVENT_TOP_N",
     "AWARDS_SERIES", "AWARDS_PRE_EVENT_DAYS", "AWARDS_EVENT_DATES",
@@ -4992,6 +5007,15 @@ _CONFIG_CODE_KNOBS = (
     # near-cliff quote-to-completion + size mode (2026-09-26)
     "NEAR_CLIFF_DOLLARS", "NEAR_CLIFF_MIN_BANKED_FRAC", "NEAR_CLIFF_SIZE_MULT",
     "NEAR_CLIFF_BOOST_MIN_BANKED",
+    # decision-input logging (2026-09-26): the thresholds the logged inputs
+    # are compared against, so a guard_skips / floor row can be read against
+    # the rule that was actually in force
+    "GUARD_LOG", "SELECTION_INPUTS", "HOPELESS_EXIT", "HOPELESS_SUSTAIN_SECS",
+    "EST_PEAK_TTL_SECS", "FLOOR_ACCRUAL_PER_PERIOD", "RATE_FLOOR_ESCAPE_DAYS",
+    "MAX_JOIN_SPREAD_CENTS", "BREAKERS_ENABLED", "EVENT_FILL_HALT_CONTRACTS",
+    "EVENT_FILL_HALT_STRIKES", "EVENT_DEPTH_RESUME_SECS", "RAIN_FAIR_ENABLE",
+    "RAIN_FAIR_TOL_CENTS", "STICKY_PRICE_MIN", "STICKY_PRICE_MAX",
+    "SCAN_HOPELESS_EXIT", "SCAN_HOPELESS_BAR", "BLIND_PRESERVE_CYCLES",
 )
 
 
@@ -7279,6 +7303,11 @@ class MarketMeta:
     floor_mult_profile: str = ""        # "1:0.583,2:0.417" -- the schedule mix behind it
     near_cliff: bool = False            # admitted / kept by the near-cliff rule this refresh
     near_cliff_boost: bool = False      # in near-cliff SIZE mode (ladder x NEAR_CLIFF_SIZE_MULT, sticky)
+    # decision-input logging (2026-09-26), analytics only:
+    est_hour_mult: float = 1.0          # hour_size_mult the estimate ran at
+    nc_size_mult: float = 1.0           # near-cliff mult on the probe ladder
+    floor_by_mult: List[List[float]] = field(default_factory=list)
+    #   [[mult, weight, $/day at that mult], ...]; [] = floor is the live estimate
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
     # set by _estimate_candidate_yield alongside est_frac; consumed by the
     # quote-gaps email's earnings-per-$-of-exposure ranking (Jack 2026-08-12)
@@ -7529,6 +7558,11 @@ class IncentiveMarketMaker:
         self._book_part = 0                        # bumped after a failed write
         self._book_cycle_ts = ""                   # joins cycle_log.ts
         self._book_own_ledger: Dict[str, List[Tuple[str, float, float]]] = {}
+        # ---- decision-input logging (see GUARD_LOG / SELECTION_INPUTS) ----
+        self._guard_now: Dict[str, dict] = {}     # THIS cycle: ticker -> guard record
+        self._guard_prev: Dict[str, str] = {}     # last FULL cycle: ticker -> guard
+        self._guard_snap_at = 0.0                 # hourly guard snapshot
+        self._floor_state_prev: Dict[str, tuple] = {}   # member floor-state trigger
         self._load_persist()
 
     # ---- restart persistence (which markets are OURS) ------------------------
@@ -7681,6 +7715,90 @@ class IncentiveMarketMaker:
                 self._sink_muted.add("book_depth")
                 self._book_buf = []
                 log(f"{self.tag} ! book-depth log muted for the rest of this run")
+
+    def _gskip(self, t: str, guard: str, inputs=None, book=None) -> None:
+        """Record that the managed loop leaves `t` at `guard` this cycle -- a
+        skip that otherwise writes no cycle_log row at all.
+
+        `inputs` and `book` are zero-argument CALLABLES (lambdas at the call
+        site), evaluated HERE inside the try. That is deliberate: keyword
+        arguments would be evaluated at the call site, BEFORE any try, so an
+        unbound name or a None subtraction would raise straight into the live
+        placement loop. A lambda defers evaluation to where it is caught, so
+        the call site cannot raise. (It does NOT protect against a STALE name
+        -- Python keeps the previous market's loop locals bound -- so each call
+        site passes only names assigned for THIS market on that path.)
+
+        Pure dict write; _flush_guard_skips emits change-driven rows after the
+        loop."""
+        if not (self.ANALYTICS_ON and GUARD_LOG):
+            return
+        try:
+            rec = {"guard": guard, "inputs": {}, "ext_bid": None,
+                   "ext_ask": None, "yes_depth": None, "no_depth": None}
+            if inputs is not None:
+                try:
+                    rec["inputs"] = inputs()
+                except Exception as e:
+                    rec["inputs"] = {"_input_error": type(e).__name__}
+            if book is not None:
+                try:
+                    eb, ea, yl, nl = book()
+                    rec["ext_bid"], rec["ext_ask"] = eb, ea
+                    rec["yes_depth"] = round(sum(q for _p, q in yl)) if yl is not None else None
+                    rec["no_depth"] = round(sum(q for _p, q in nl)) if nl is not None else None
+                except Exception:
+                    pass
+            self._guard_now[t] = rec
+        except Exception:
+            pass
+
+    def _flush_guard_skips(self, now_utc, now_ts, managed) -> None:
+        """guard_skips_YYYY-MM-DD.jsonl, change-driven like selection_events:
+          kind=enter     ticker newly held by a guard, or moved to another
+                         (prev = the old guard, None if newly held)
+          kind=clear     held last full cycle, evaluated clean now
+                         (managed=False: it left the book entirely)
+          kind=snapshot  hourly: every ticker a guard holds right now
+          kind=cycle     hourly: counts per guard + n_managed (the denominator)
+        The dedup key is (ticker, guard); inputs are NOT part of it, so input
+        drift while a guard holds shows only in the hourly snapshot. State is
+        per process: after a restart every held guard re-emits as enter with
+        prev=None. Without dedup this would be ~55k rows/day; with it,
+        ESTIMATED ~1.5-4k."""
+        if not (self.ANALYTICS_ON and GUARD_LOG):
+            return
+        try:
+            ts, now = now_utc.isoformat(), self._guard_now
+            for t, rec in now.items():
+                prev = self._guard_prev.get(t)
+                if prev != rec["guard"]:
+                    self._sink("guard_skips", {"ts": ts, "kind": "enter",
+                                               "ticker": t, "prev": prev, **rec})
+            for t, prev in self._guard_prev.items():
+                if t not in now:
+                    p = self._last_panel.get(t) or {}
+                    self._sink("guard_skips", {
+                        "ts": ts, "kind": "clear", "ticker": t, "guard": None,
+                        "prev": prev, "managed": t in managed, "inputs": {},
+                        "ext_bid": p.get("ext_bid"), "ext_ask": p.get("ext_ask"),
+                        "yes_depth": p.get("yes_depth"),
+                        "no_depth": p.get("no_depth")})
+            self._guard_prev = {t: r["guard"] for t, r in now.items()}
+            if now_ts - self._guard_snap_at >= 3600:
+                self._guard_snap_at = now_ts
+                counts: Dict[str, int] = {}
+                for t, rec in now.items():
+                    counts[rec["guard"]] = counts.get(rec["guard"], 0) + 1
+                    self._sink("guard_skips", {"ts": ts, "kind": "snapshot",
+                                               "ticker": t, "prev": None, **rec})
+                self._sink("guard_skips", {"ts": ts, "kind": "cycle",
+                                           "n_managed": len(managed),
+                                           "counts": counts})
+        except Exception as e:
+            if "guard_skips" not in self._sink_muted:
+                self._sink_muted.add("guard_skips")
+                log(f"{self.tag} ! guard-skip sink failed ({e}); muted this run")
 
     def _log_fill(self, f: dict, tkr: str, side: str, action: str,
                   count: float, px_cents: float, now_ts: float,
@@ -9310,6 +9428,12 @@ class IncentiveMarketMaker:
         # and "would the markets I cut have earned more" stop being
         # unanswerable. Analytics only — nothing reads it back.
         decisions: Dict[str, str] = {}
+        # Decision INPUTS (2026-09-26, SELECTION_INPUTS): what each floor rule
+        # actually looked at, per ticker. Analytics only -- nothing reads it.
+        floor_in: Dict[str, dict] = {}
+        # members kept despite a pass-1 screen / unreadable book (sticky), so
+        # the waiver that kept them is visible instead of silent
+        screen_waived: Dict[str, str] = {}
         for meta in metas:
             t = meta.ticker
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
@@ -9335,6 +9459,7 @@ class IncentiveMarketMaker:
                 # Sticky: ride out transient quality states on a market we
                 # already started quoting (see STICKY_DEATH_REASONS note).
                 screened.append(meta)
+                screen_waived[t] = reason
             elif reason:
                 skipped[reason] = skipped.get(reason, 0) + 1
                 decisions[t] = reason
@@ -9369,6 +9494,7 @@ class IncentiveMarketMaker:
             if not self._estimate_candidate_yield(meta, own_by_ticker.get(meta.ticker, [])):
                 if meta.ticker in prev_selected:
                     ranked.append(meta)   # sticky: transient book-read failure
+                    screen_waived[meta.ticker] = "book_unreadable"
                 else:
                     skipped["book_unreadable"] = skipped.get("book_unreadable", 0) + 1
                     decisions[meta.ticker] = "book_unreadable"
@@ -9453,6 +9579,44 @@ class IncentiveMarketMaker:
             else:
                 self.state.hopeless_since.setdefault(meta.ticker, now_ts)
             sub_bar_secs = now_ts - self.state.hopeless_since.get(meta.ticker, now_ts)
+            # DECISION INPUTS: stash what the floor rules below look at. Reads
+            # only; its own try so an analytics bug can never break selection.
+            if SELECTION_INPUTS:
+                try:
+                    _pk = self._est_peak.get(meta.ticker)
+                    floor_in[meta.ticker] = {
+                        "member": meta.ticker in prev_selected,
+                        "qdays": round(qdays, 4),
+                        "est_total": round(est_total, 4),
+                        "peak": round(peak, 4),
+                        "peak_age_s": round(now_ts - _pk[1]) if _pk else None,
+                        "proj_peak": round(proj_peak, 4),
+                        "banked": round(accrued, 4),
+                        "accrued_lifetime": round(
+                            self.state.accrued_est.get(meta.ticker, 0.0), 4),
+                        "period_base": self.state.period_base.get(meta.ticker),
+                        "period_start": self.state.period_start.get(meta.ticker),
+                        "floor_bar": floor_bar,
+                        "projected_total": round(projected_total, 4),
+                        # before the near-cliff override flips it True
+                        "reaches_min_raw": projected_total >= floor_bar,
+                        "reaches_min": reaches_min,
+                        "near_cliff_armed_ts": self._near_cliff_boost.get(meta.ticker),
+                        "hopeless_since": self.state.hopeless_since.get(meta.ticker),
+                        "sub_bar_secs": round(sub_bar_secs),
+                        "rate_bar": series_min_est_rate(meta.series),
+                        "rate_proj": round(rate_floor_projected(
+                            accrued, est_total, proj_peak, qdays), 4),
+                        "new_event": meta.event_ticker not in prev_events,
+                        "exempt": ("quote_all" if quote_all else
+                                   "force" if meta.event_ticker in FORCE_EVENTS else
+                                   "curated" if curated_event(meta.event_ticker,
+                                                              meta.series, now_utc) else
+                                   "finecon" if meta.series in FINECON_SERIES else
+                                   "no_new" if meta.series in NO_NEW_SERIES else ""),
+                    }
+                except Exception:
+                    pass
             if quote_all:
                 # user wants EVERY market of the event (2026-07-12): exempt
                 # from floors, the hopeless exit and the yield ranking.
@@ -9830,11 +9994,40 @@ class IncentiveMarketMaker:
         # per-market record anywhere. Two sinks fix that at different cadences.
         try:
             by_ticker = {m.ticker: m for m in metas}
+            # keys the selection rows already own; the decision-input merge
+            # below may never overwrite them (send_opportunistic_imm.py
+            # substring-filters on '"decision": "selected"' and '"is_scan": true')
+            _RESERVED = {"ticker", "decision", "prev", "ts", "is_scan", "series",
+                         "event_ticker", "near_cliff", "near_cliff_boost"}
+
+            def _input_fields(mt) -> dict:
+                """Decision INPUTS for one candidate (SELECTION_INPUTS). Its own
+                try: an exception anywhere in this block would mute the WHOLE
+                selection stream for the run, so a bug here must cost at most
+                these extra fields, never the rows."""
+                if not SELECTION_INPUTS or mt is None:
+                    return {}
+                try:
+                    out = {
+                        "est_frac": round(mt.est_frac, 6),
+                        "est_hour_mult": mt.est_hour_mult,
+                        "nc_size_mult": mt.nc_size_mult,
+                        "floor_by_mult": mt.floor_by_mult or None,
+                        "cutoff": mt.cutoff.isoformat() if mt.cutoff else None,
+                        "program_end": (mt.program_end.isoformat()
+                                        if mt.program_end else None),
+                        "screen_waived": screen_waived.get(mt.ticker),
+                    }
+                    out.update(floor_in.get(mt.ticker, {}))
+                    return {k: v for k, v in out.items() if k not in _RESERVED}
+                except Exception:
+                    return {}
 
             def _meta_fields(mt) -> dict:
                 if mt is None:
                     return {}
                 return {
+                    **_input_fields(mt),
                     "series": mt.series, "event_ticker": mt.event_ticker,
                     "est_dollars_per_day": round(mt.est_dollars_per_day, 4),
                     "floor_dollars_per_day": round(mt.floor_dollars_per_day, 4),
@@ -9876,6 +10069,38 @@ class IncentiveMarketMaker:
                 e["ts"] = now_utc.isoformat()
                 self._sink("selection_events", e)
             self._selection_prev = now_dec
+
+            # (a2) FLOOR STATE of MEMBERS (SELECTION_INPUTS). A member under
+            # the bar keeps decision "selected" while its hopeless clock runs,
+            # and selection_events fires only on a decision CHANGE -- so the
+            # clock starting, resetting, being carried by near-cliff, or the
+            # boost arming were all invisible. Emitted to its OWN sink, not
+            # selection_events, so that stream keeps meaning "one row per
+            # decision change". Own try: a bug here must not mute selection.
+            if SELECTION_INPUTS:
+                try:
+                    fs_now: Dict[str, tuple] = {}
+                    for tk in now_dec:
+                        fi = floor_in.get(tk)
+                        if not fi or not fi.get("member"):
+                            continue
+                        fs_now[tk] = (fi.get("reaches_min_raw"), fi.get("reaches_min"),
+                                      tk in self._near_cliff_boost)
+                    for tk, fs in fs_now.items():
+                        pfs = self._floor_state_prev.get(tk)
+                        if pfs != fs:
+                            self._sink("floor_state", {
+                                "ts": now_utc.isoformat(), "ticker": tk,
+                                "decision": now_dec.get(tk),
+                                "reaches_min_raw": fs[0], "reaches_min": fs[1],
+                                "near_cliff_boost_armed": fs[2],
+                                "prev_state": list(pfs) if pfs else None,
+                                **_meta_fields(by_ticker.get(tk))})
+                    self._floor_state_prev = fs_now
+                except Exception as e:
+                    if "floor_state" not in self._sink_muted:
+                        self._sink_muted.add("floor_state")
+                        log(f"{self.tag} ! floor-state sink failed ({e}); muted this run")
 
             # (b) Hourly full snapshot of every candidate. This is the only
             # thing that makes the counterfactual possible: realized credits
@@ -10317,6 +10542,7 @@ class IncentiveMarketMaker:
         # capped so hour x ref <= TOTAL_SIZE_MULT_CAP; consumers (side rooms,
         # collateral reservation) inherit the cap through these meta fields
         _hm = hour_size_mult(meta.series, datetime.now(timezone.utc))
+        meta.est_hour_mult = _hm       # decision-input logging (analytics only)
         meta.ref_mult_bid = capped_ref_mult(ext_b, rb, "bid", hour_mult=_hm,
                                             series=meta.series)
         meta.ref_mult_ask = capped_ref_mult(ext_a, ra, "ask", hour_mult=_hm,
@@ -10334,6 +10560,7 @@ class IncentiveMarketMaker:
         # near-cliff SIZE mode scales the hypothetical ladder too, so the
         # projection sees the size the quote loop will rest
         _ncm = self._near_cliff_size_mult(meta.ticker)
+        meta.nc_size_mult = _ncm       # decision-input logging (analytics only)
         _lv = scale_levels(hour_scaled_levels(meta.series, _now), _ncm)
         # Carbon Arc late-month rule: the hypothetical ladder is per side too,
         # so the reward estimate (and the $1 floor projection built on it)
@@ -10472,6 +10699,7 @@ class IncentiveMarketMaker:
         # incumbent that is the score of what actually rests).
         meta.floor_dollars_per_day = meta.est_dollars_per_day
         meta.floor_mult_profile = ""
+        meta.floor_by_mult = []       # [] = the floor IS the live estimate
         if FLOOR_PROJECTION_BASE_SIZE and meta.dollars_per_day > 0:
             if FLOOR_PROJECTION_SCHEDULE:
                 profile = size_mult_profile(meta.series, _now,
@@ -10501,6 +10729,11 @@ class IncentiveMarketMaker:
                             _overlay_with_pads(q_m, ext_yes, ext_no, xb, xa),
                             meta.target_size, meta.discount_factor, own_in_book=False)
                     total += w * f_m * meta.dollars_per_day
+                    try:          # decision-input logging: the per-mult split
+                        meta.floor_by_mult.append(
+                            [m, round(w, 4), round(f_m * meta.dollars_per_day, 4)])
+                    except Exception:
+                        pass
                 meta.floor_dollars_per_day = total
         return True
 
@@ -11134,6 +11367,7 @@ class IncentiveMarketMaker:
         # in diff_orders (keep aggressive-drifted rungs while not leading)
         touch_map: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
         cycle_rows: List[str] = []        # cycle-logger panel (η/J calibration data)
+        self._guard_now = {}              # guard skips seen THIS cycle (analytics)
         reward_frac_sum = 0.0
         cycle_rate: Dict[str, float] = {}   # ticker -> live est $/day this cycle
         quoted = 0
@@ -11196,6 +11430,7 @@ class IncentiveMarketMaker:
                         log(f"{self.tag} {t}: manual signal during wake grace "
                             f"(foreign={foreign_n}, manual pos {manual_pos:+.0f}); "
                             f"deferring judgement")
+                        self._gskip(t, "manual_grace", lambda: dict(foreign=foreign_n, manual_pos=round(manual_pos, 2), event_manual=event_manual, pos_manual=pos_manual))
                         continue
                     self.state.manual_standoff[t] = now_ts
                     why = ("elsewhere in event " + meta.event_ticker) if event_manual \
@@ -11210,9 +11445,11 @@ class IncentiveMarketMaker:
                     log(f"{self.tag} {t}: cancelled {n} quotes, yielding to manual")
                 self.state.selected.pop(t, None)
                 self.state.managed_extra.pop(t, None)
+                self._gskip(t, "manual_yield", lambda: dict(foreign=foreign_n, manual_pos=round(manual_pos, 2), pos=pos, own_pos=own_pos, event_manual=event_manual, pos_manual=pos_manual, quote_all=quote_all, n_cx=n))
                 continue
             self.state.manual_standoff.pop(t, None)
             if t in scan_evicted_now:
+                self._gskip(t, "scan_evicted")
                 continue
 
             reduce_only = t not in self.state.selected
@@ -11229,6 +11466,7 @@ class IncentiveMarketMaker:
                         log(f"{self.tag} {t}: event-start cutoff passed; cancelled {n}")
                     self.state.selected.pop(t, None)
                     self.state.managed_extra.pop(t, None)
+                    self._gskip(t, "cutoff_passed", lambda: dict(cutoff=meta.cutoff.isoformat(), n_cx=n))
                     continue
                 if (meta.cutoff - now_utc).total_seconds() \
                         < series_pre_cutoff_reduce_only_secs(meta.series):
@@ -11241,6 +11479,7 @@ class IncentiveMarketMaker:
                 n = self.cancel_market_orders(t, resting)
                 if n:
                     log(f"{self.tag} {t}: AAA print blackout; cancelled {n}")
+                self._gskip(t, "aaa_blackout", lambda: dict(n_cx=n))
                 continue
             if meta.close_time is not None and \
                     (meta.close_time - now_utc).total_seconds() \
@@ -11250,8 +11489,10 @@ class IncentiveMarketMaker:
                 self.cancel_market_orders(t, resting)
                 self.state.selected.pop(t, None)
                 self.state.managed_extra.pop(t, None)
+                self._gskip(t, "closing", lambda: dict(close_time=meta.close_time.isoformat(), hours_left=round((meta.close_time - now_utc).total_seconds() / 3600.0, 3), min_hours=series_min_hours_to_close(meta.series)))
                 continue
             if self.state.breaker_until.get(t, 0) > now_ts:
+                self._gskip(t, "breaker_cooldown", lambda: dict(until=self.state.breaker_until.get(t)))
                 continue
 
             # Fill-burst breaker BEFORE quoting: a large move of OUR OWN book
@@ -11292,6 +11533,7 @@ class IncentiveMarketMaker:
                        f"(burst {strikes}/{EVENT_FILL_HALT_STRIKES})")
                     + f"; cancelled {n_cx}", key=ev)
                 self.state.prev_pos[t] = own_pos
+                self._gskip(t, "event_fill_tripwire", lambda: dict(own_pos=own_pos, prev_pos=prev, strikes=strikes, confirmed=confirmed, n_cx=n_cx))
                 continue
             # OPEN-SCAN FILL TRIPWIRE (2026-09-05, see the SCAN_* block; OFF
             # unless IMM_SCAN_FILL_HALT > 0): being swept on a scan member
@@ -11307,6 +11549,7 @@ class IncentiveMarketMaker:
                     by_event, resting, desired, now_ts)
                 scan_evicted_now.update(m2.ticker for m2 in by_event.get(ev, [meta]))
                 self.state.prev_pos[t] = own_pos
+                self._gskip(t, "scan_fill_tripwire", lambda: dict(own_pos=own_pos, prev_pos=prev))
                 continue
             if (BREAKERS_ENABLED and prev is not None
                     and abs(own_pos - prev) >= FILL_BURST_CONTRACTS):
@@ -11317,6 +11560,7 @@ class IncentiveMarketMaker:
                     f"cycle; cancelled {n} orders, standing down "
                     f"{FILL_BURST_COOLDOWN_SECS // 60}min", key=t, urgent=False)
                 self.state.prev_pos[t] = own_pos
+                self._gskip(t, "fill_burst", lambda: dict(own_pos=own_pos, prev_pos=prev, n_cx=n))
                 continue
             self.state.prev_pos[t] = own_pos
 
@@ -11333,6 +11577,7 @@ class IncentiveMarketMaker:
                         f"{streak}/{BLIND_PRESERVE_CYCLES}, preserving quotes")
                 else:
                     log(f"{self.tag} ! blind on {t} {streak} cycles; cancelling quotes")
+                self._gskip(t, "blind", lambda: dict(streak=streak, preserved=streak <= BLIND_PRESERVE_CYCLES, err=str(e)[:120]))
                 continue
 
             own = own_by_ticker.get(t, [])
@@ -11426,6 +11671,7 @@ class IncentiveMarketMaker:
                                f"{d_no:.0f} < {EVENT_DEPTH_MIN_CONTRACTS:.0f}")
                             + f" — event likely LIVE; standing down the whole "
                             f"event (cancelled {n_cx})", key=ev, urgent=False)
+                    self._gskip(t, "event_depth_trip", lambda: dict(d_yes=d_yes, d_no=d_no, mid=mid_g, prev_mid=pm_g, mid_in_band=mid_in_band, prev_in_band=pm_in_band, armed=armed, thin=thin, one_sided=went_one_sided, jumped=jumped_out, stacked=stacked, live_halt=ev in self.state.event_live_halt, n_cx=n_cx), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
                 # Only a healthy IN-BAND, two-sided, at/over-target book
                 # argues for resume. An out-of-band pin or a history-less
@@ -11444,6 +11690,7 @@ class IncentiveMarketMaker:
                         self.state.prev_mid[t] = mid_g
                         self.state.last_mark[t] = mid_g
                         marked.add(t)
+                    self._gskip(t, "event_depth_hold", lambda: dict(d_yes=d_yes, d_no=d_no, mid_in_band=mid_in_band, halt_ts=self.state.event_depth_halt.get(ev)), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
 
             # A book that WAS two-sided and just lost a side is the classic
@@ -11458,6 +11705,7 @@ class IncentiveMarketMaker:
                         "one_sided", f"{t}: book went one-sided (was mid {pm:.0f}c); "
                         f"cancelled {n}, standing down "
                         f"{BREAKER_COOLDOWN_SECS // 60}min", key=t, urgent=False)
+                    self._gskip(t, "one_sided_breaker", lambda: dict(prev_mid=pm, n_cx=n), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
 
             # OPEN-SCAN MID TRIPWIRE (2026-09-05; OFF unless IMM_SCAN_MID_JUMP
@@ -11489,6 +11737,7 @@ class IncentiveMarketMaker:
                     self.state.prev_mid[t] = mid_s
                     self.state.last_mark[t] = mid_s
                     marked.add(t)
+                    self._gskip(t, "scan_mid_tripwire", lambda: dict(mid=mid_s, prev_mid=pm_s, entry_mid=entry_s, jumped=jumped, drifted=drifted), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
 
             # Mid-move circuit breaker (external mid, so our own churn can't trip it).
@@ -11505,12 +11754,15 @@ class IncentiveMarketMaker:
                     self.alerter.alert(
                         "move_breaker", f"{t}: mid {pm:.0f}c -> {mid:.0f}c; cancelled {n}, "
                         f"standing down {BREAKER_COOLDOWN_SECS // 60}min", key=t, urgent=False)
+                    self._gskip(t, "move_breaker", lambda: dict(mid=mid, prev_mid=pm, n_cx=n), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
                 if ext_bid >= ext_ask:      # crossed/locked external book: stay out
                     self.cancel_market_orders(t, resting)
+                    self._gskip(t, "crossed", book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
                 if ext_ask - ext_bid > MAX_JOIN_SPREAD_CENTS:
                     self.cancel_market_orders(t, resting)
+                    self._gskip(t, "wide_spread", lambda: dict(max_spread=MAX_JOIN_SPREAD_CENTS), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
             # TOP-IN-BAND (Jack 2026-07-21): if the top of book itself sits
             # outside the series price band, stand aside ENTIRELY — an in-band
@@ -11532,6 +11784,7 @@ class IncentiveMarketMaker:
             ask_in_band = ext_ask is None or pmin_s <= ext_ask <= pmax_s
             if not bid_in_band and not ask_in_band:
                 self.cancel_market_orders(t, resting)
+                self._gskip(t, "band_both_out", lambda: dict(lo=pmin_s, hi=pmax_s, member=t in self.state.selected), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
             # TWO-SIDED DEPTH GATE (Jack 2026-08-05: "dont quote, and remove
             # existing quotes, if either side has <1000 contracts"). A
@@ -11559,6 +11812,7 @@ class IncentiveMarketMaker:
                         f"no {depth_no:.0f} vs target {meta.target_size:.0f} "
                         f"(pad reaches: bid={bid_ok} ask={ask_ok}) "
                         f"— cancelled {n_cx}, standing down")
+                self._gskip(t, "cannot_qualify", lambda: dict(target=meta.target_size, depth_yes=round(depth_yes), depth_no=round(depth_no), bid_ok=bid_ok, ask_ok=ask_ok, pads=series_pad_to_target(meta.series), n_cx=n_cx), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
             # Deep-rung floor: on a HEALTHY book (both touches present and
             # in-band) rungs may follow the reference below 5c, down to
@@ -11602,6 +11856,7 @@ class IncentiveMarketMaker:
                         # reach here, so his own bets are never crossed.
                         self.rain_directional_take(
                             t, ext_bid, ext_ask, fair_c, bid_bad, ask_bad, now_ts)
+                        self._gskip(t, "rain_fair", lambda: dict(fair=round(fair_c, 2), tol=RAIN_FAIR_TOL_CENTS, bid_bad=bid_bad, ask_bad=ask_bad), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                         continue
             if t in self._rain_fair_stood:
                 self._rain_fair_stood.discard(t)
@@ -11613,6 +11868,7 @@ class IncentiveMarketMaker:
             # churn running past the 6pm early stop (2026-07-29, NYC).
             if meta.cutoff is not None and now_utc >= meta.cutoff:
                 self.cancel_market_orders(t, resting)
+                self._gskip(t, "cutoff_extra", lambda: dict(cutoff=meta.cutoff.isoformat()), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
             # Rooms: hard per-market cap, event share, then skew — all using
             # this market's SERIES ladder/cap (Love Island runs a bigger flat
@@ -11877,6 +12133,12 @@ class IncentiveMarketMaker:
                             f"{BENCH_COOLDOWN_SECS // 3600}h", key=t, urgent=False)
                 else:
                     self.state.zero_share_streak.pop(t, None)
+
+        # Guard-skip sink: full cycles evaluate every managed market, so a
+        # ticker missing from _guard_now reliably means its guard CLEARED.
+        # Fast ticks touch only fast-lane series and never flush.
+        if not fast_only:
+            self._flush_guard_skips(now_utc, now_ts, managed)
 
         # Live-event depth gate, resume pass: release a THIN-only halt on a
         # full cycle where NO market of it read thin, EVERY managed market

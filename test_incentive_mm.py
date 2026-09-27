@@ -12964,5 +12964,276 @@ class TestFullDepthBookLog(unittest.TestCase):
         self.assertEqual([r["source"] for r in rows], ["managed"])
 
 
+def _sink_rows(status_dir, name):
+    out = []
+    for p in sorted(glob.glob(os.path.join(status_dir, f"{name}_*.jsonl"))):
+        with open(p, encoding="utf-8") as f:
+            out.extend(json.loads(ln) for ln in f if ln.strip())
+    return out
+
+
+class TestGuardSkipSink(unittest.TestCase):
+    """guard_skips_*.jsonl (2026-09-26): a market an in-loop guard skips wrote
+    no cycle_log row that cycle, so what the guard saw was lost. Change-driven:
+    one `enter` when a guard starts holding a ticker, one `clear` when it
+    stops, hourly snapshot + counts. Analytics only; must never raise into the
+    placement loop."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        self.sd = tempfile.mkdtemp(prefix="imm_gs_")
+        for p in (mock.patch.object(imm, "STATUS_DIR", self.sd),
+                  mock.patch.object(imm, "PAD_TO_TARGET_GLOBAL", False)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _bot(self, yes=1200, no=1200):
+        _clean_persist()
+        self.addCleanup(_clean_persist)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self._book(bot, yes, no)
+        return bot
+
+    def _book(self, bot, yes, no, yes_px="0.49", no_px="0.49"):
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[yes_px, str(yes)]], "no_dollars": [[no_px, str(no)]]}}
+
+    def _held_cycle(self, bot):
+        bot.state.universe_at = time.time()          # no refresh: stays managed
+        bot.run_cycle()
+
+    def _rows(self, kind=None):
+        return [r for r in _sink_rows(self.sd, "guard_skips")
+                if (kind is None or r.get("kind") == kind)
+                and (r.get("ticker") == self.T or kind == "cycle")]
+
+    def test_cannot_qualify_enter_once_then_clear(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(self._rows(), [])            # healthy: no guard
+        bot._guard_snap_at = time.time()              # suppress hourly rows
+        self._book(bot, 200, 1200)                     # thin YES side
+        self._held_cycle(bot)
+        enter = self._rows("enter")
+        self.assertEqual(len(enter), 1)
+        self.assertEqual(enter[0]["guard"], "cannot_qualify")
+        self.assertIsNone(enter[0]["prev"])
+        self.assertFalse(enter[0]["inputs"]["bid_ok"])
+        self.assertEqual(enter[0]["inputs"]["depth_yes"], 200)
+        self.assertEqual(enter[0]["yes_depth"], 200)   # book context, THIS market
+        self._held_cycle(bot)                          # still thin: no new row
+        self.assertEqual(len(self._rows("enter")), 1)
+        self._book(bot, 1200, 1200)
+        self._held_cycle(bot)
+        clear = self._rows("clear")
+        self.assertEqual(len(clear), 1)
+        self.assertEqual(clear[0]["prev"], "cannot_qualify")
+        self.assertTrue(clear[0]["managed"])
+
+    def test_band_both_out_records_the_band(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot._guard_snap_at = time.time()
+        self._book(bot, 1200, 1200, yes_px="0.02", no_px="0.97")   # 2 x 3
+        self._held_cycle(bot)
+        (enter,) = self._rows("enter")
+        self.assertEqual(enter["guard"], "band_both_out")
+        self.assertTrue(enter["inputs"]["member"])
+        self.assertIn("lo", enter["inputs"])
+        self.assertIn("hi", enter["inputs"])
+        self.assertEqual((enter["ext_bid"], enter["ext_ask"]), (2, 3))
+
+    def test_hourly_snapshot_and_counts(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self._book(bot, 200, 1200)
+        bot._guard_snap_at = 0.0
+        self._held_cycle(bot)
+        self.assertEqual(len(self._rows("snapshot")), 1)
+        # the hourly clock starts armed, so the healthy first cycle wrote a
+        # cycle row too (empty counts); the held cycle's is the latest
+        cycles = [r for r in _sink_rows(self.sd, "guard_skips") if r["kind"] == "cycle"]
+        self.assertEqual(cycles[0]["counts"], {})
+        self.assertEqual(cycles[-1]["counts"], {"cannot_qualify": 1})
+        self.assertGreaterEqual(cycles[-1]["n_managed"], 1)
+
+    def test_kill_switch(self):
+        with mock.patch.object(imm, "GUARD_LOG", False):
+            bot = self._bot()
+            bot.run_cycle()
+            self._book(bot, 200, 1200)
+            self._held_cycle(bot)
+        self.assertEqual(glob.glob(os.path.join(self.sd, "guard_skips_*")), [])
+
+    def test_call_site_cannot_raise(self):
+        """Inputs are lambdas evaluated INSIDE the helper's try, so an unbound
+        name or a None subtraction at a call site cannot reach the loop."""
+        bot = self._bot()
+        bot._gskip(self.T, "g", lambda: undefined_name_xyz,          # noqa: F821
+                   book=lambda: (None, None, None, None))
+        self.assertEqual(bot._guard_now[self.T]["inputs"],
+                         {"_input_error": "NameError"})
+        bot._gskip(self.T, "g2", lambda: dict(x=None - 1),
+                   book=lambda: 1 / 0)
+        self.assertEqual(bot._guard_now[self.T]["guard"], "g2")
+        self.assertIsNone(bot._guard_now[self.T]["ext_bid"])
+
+    def test_sink_failure_never_breaks_the_cycle(self):
+        bot = self._bot()
+        bot.run_cycle()
+        real = bot._sink
+
+        def boom(name, rec):
+            if name == "guard_skips":
+                raise OSError("disk full")
+            return real(name, rec)
+        bot._sink = boom
+        self._book(bot, 200, 1200)
+        self._held_cycle(bot)                          # must not raise
+        self.assertIn("guard_skips", bot._sink_muted)
+
+    def test_every_guard_continue_is_instrumented(self):
+        """The class sweep: every `continue` in the managed loop except the
+        fast-lane filter has a _gskip directly above it. A new guard added
+        without one fails here instead of silently leaving no row."""
+        import inspect
+        src = inspect.getsource(IncentiveMarketMaker.run_cycle).split("\n")
+        start = next(i for i, l in enumerate(src)
+                     if l.strip() == "for meta in order_of_play:")
+        end = next(i for i, l in enumerate(src)
+                   if i > start and "Guard-skip sink: full cycles evaluate" in l)
+        conts = [i for i in range(start, end) if src[i].strip() == "continue"]
+        bare = []
+        for i in conts:
+            prev = next(src[j].strip() for j in range(i - 1, start, -1)
+                        if src[j].strip())
+            if not prev.startswith("self._gskip("):
+                bare.append(prev)
+        self.assertEqual(len(conts), 23)
+        self.assertEqual(len(bare), 1, bare)
+        self.assertIn("fast_only", bare[0])            # not a guard
+
+
+class TestSelectionDecisionInputs(unittest.TestCase):
+    """Selection rows carry the INPUTS each floor rule saw (2026-09-26), and
+    members' floor-state changes go to floor_state_*.jsonl. A failure in any
+    of it must cost only the extra fields, never the selection rows."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        self.sd = tempfile.mkdtemp(prefix="imm_si_")
+        p = mock.patch.object(imm, "STATUS_DIR", self.sd)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(_clean_persist)
+
+    def _selected_row(self):
+        rows = [r for r in _sink_rows(self.sd, "selection_events")
+                if r["ticker"] == self.T and r["decision"] == "selected"]
+        self.assertTrue(rows)
+        return rows[-1]
+
+    def test_selection_row_carries_floor_inputs(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        r = self._selected_row()
+        for k in ("floor_bar", "projected_total", "banked", "reaches_min_raw",
+                  "reaches_min", "member", "qdays", "est_total", "rate_proj",
+                  "est_hour_mult", "nc_size_mult", "est_frac", "exempt"):
+            self.assertIn(k, r, k)
+        self.assertFalse(r["member"])                  # fresh on its first refresh
+        self.assertEqual(r["floor_bar"], imm.MIN_EST_TOTAL_DOLLARS)
+
+    def test_scan_roster_substrings_survive(self):
+        """send_opportunistic_imm.py substring-filters raw selection lines."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        path = glob.glob(os.path.join(self.sd, "selection_events_*.jsonl"))[0]
+        with open(path, encoding="utf-8") as f:
+            line = next(ln for ln in f if f'"ticker": "{self.T}"' in ln
+                        and '"decision": "selected"' in ln)
+        self.assertIn('"is_scan": false', line)
+
+    def test_near_cliff_inputs_and_floor_state(self):
+        old = (imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS)
+        imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = 2e9, 1e9
+        self.addCleanup(lambda: setattr(imm, "MIN_EST_TOTAL_DOLLARS", old[0]))
+        self.addCleanup(lambda: setattr(imm, "PAYOUT_FLOOR_DOLLARS", old[1]))
+        with mock.patch.object(imm, "NEAR_CLIFF_DOLLARS", 0.15e9):
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            key = imm.parse_iso_utc(bot.client.programs[0]["start_date"]).isoformat()
+            bot.state.accrued_est[self.T] = 0.90e9
+            bot.state.period_start[self.T] = key
+            bot.run_cycle()
+            r = self._selected_row()
+            self.assertAlmostEqual(r["banked"], 0.90e9, delta=1e6)
+            self.assertEqual(r["floor_bar"], 1e9)       # re-entrant: the $1 cliff
+            self.assertFalse(r["reaches_min_raw"])       # under the bar on its own
+            self.assertTrue(r["reaches_min"])            # ...carried by near-cliff
+            self.assertTrue(r["near_cliff"])
+            # member floor state starts on the NEXT refresh (a member now)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            fs = [x for x in _sink_rows(self.sd, "floor_state") if x["ticker"] == self.T]
+            self.assertEqual(len(fs), 1)
+            self.assertFalse(fs[0]["reaches_min_raw"])
+            self.assertTrue(fs[0]["reaches_min"])
+            self.assertTrue(fs[0]["near_cliff_boost_armed"])
+            self.assertEqual(fs[0]["decision"], "selected")
+            bot.state.universe_at = 0.0                  # unchanged state: no new row
+            bot.run_cycle()
+            self.assertEqual(len([x for x in _sink_rows(self.sd, "floor_state")
+                                  if x["ticker"] == self.T]), 1)
+
+    def test_floor_state_does_not_pollute_selection_events(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        n = len(_sink_rows(self.sd, "selection_events"))
+        bot.state.universe_at = 0.0
+        bot.run_cycle()                                 # decisions unchanged
+        self.assertEqual(len(_sink_rows(self.sd, "selection_events")), n)
+
+    def test_input_failure_never_mutes_selection(self):
+        """Poison a dict that ONLY the analytics stash reads with a 1-arg
+        .get() (the real selection code calls .get(k, default)): the stash
+        fails, the selection rows are still written, nothing is muted, and
+        trading is unaffected."""
+        class OneArgGetRaises(dict):
+            def get(self, k, *default):
+                if not default:
+                    raise RuntimeError("analytics-only failure")
+                return super().get(k, *default)
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot._est_peak = OneArgGetRaises()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertNotIn("selection", bot._sink_muted)
+        r = self._selected_row()
+        self.assertNotIn("floor_bar", r)                # stash failed...
+        self.assertIn("est_dollars_per_day", r)         # ...the row did not
+
+    def test_trading_identical_with_inputs_on_or_off(self):
+        orders = {}
+        for on in (True, False):
+            with mock.patch.object(imm, "SELECTION_INPUTS", on), \
+                    mock.patch.object(imm, "GUARD_LOG", on):
+                _clean_persist()
+                bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+                bot.run_cycle()
+                orders[on] = sorted((o["ticker"], o["book_side"], o["yes_price"],
+                                     o["remaining_count"])
+                                    for o in bot.state.sim_orders.values())
+        self.assertTrue(orders[True])
+        self.assertEqual(orders[True], orders[False])
+
+
 if __name__ == "__main__":
     unittest.main()
