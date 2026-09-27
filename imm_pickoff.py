@@ -334,9 +334,14 @@ def real_when(r: dict) -> str:
 
 def real_how(r: dict) -> str:
     """How we know the real time: a release proxy is never passed off as the
-    call itself (the call can follow it by hours)."""
-    how = (_PROXY_HOW.get(r["kind"]) or r.get("label")
-           or ("call time" if r["kind"] == "call" else "our start time"))
+    call itself (the call can follow it by hours). An override taken from the
+    company's own announcement names the call, so its label is shown as is."""
+    label = r.get("label") or ""
+    if label.startswith("announced:"):
+        how = label
+    else:
+        how = (_PROXY_HOW.get(r["kind"]) or label
+               or ("call time" if r["kind"] == "call" else "our start time"))
     return "{}; {}".format(how, r["source"])
 
 

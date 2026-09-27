@@ -8,11 +8,14 @@ track the RELEASE, which can be a different day). Without a per-event
 override the bot falls back to midnight-ET-of-ticker-date and the event dies
 the night before its call (bit GOOGL/TSLA/ALK overnight 7/21->7/22).
 
-WHAT: for every ACTIVE KXEARNINGSMENTION event with no override yet,
-best-effort scrape the market's own settlement-source / IR pages for a
+WHAT: for every ACTIVE KXEARNINGSMENTION event with no override yet, find
+the company's own announcement of the call (earnings_announcements: the IR
+site's event feed, then its press releases via Nasdaq), else the Nasdaq
+earnings calendar, else scrape the settlement-source / IR page for a
 "conference call ... <time> ET on <date>" pattern; write resolved times to
 run-logs/incentive-mm/event_start_overrides.json (which incentive_mm
-hot-reloads each cycle — no restart). Emails on its own ONLY when something
+hot-reloads each cycle — no restart). An event nothing can date stops
+quoting IMM_EARNINGS_UNDATED_LEAD_DAYS before its ticker date. Emails on its own ONLY when something
 needs Jack (paste-ready `--set` commands); every run also appends a summary
 to overrides_last_runs.json, which the 7:20 combined "IMM quotes and
 overrides" email (imm_quote_gaps.py) folds in each morning.
@@ -52,6 +55,7 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
         if _val:
             os.environ[_v] = _val
 
+import earnings_announcements  # noqa: E402
 import incentive_mm as imm  # noqa: E402
 import imm_pickoff  # noqa: E402
 from incentive_mm import (Alerter, ET, EVENT_OVERRIDES_FILE,  # noqa: E402
@@ -433,6 +437,53 @@ def source_urls(client, event: str):
     except Exception as e:
         log(f"! series read failed for {series}: {e}")
     return urls[:3]
+
+
+# THE COMPANY'S OWN ANNOUNCEMENT (Jack 2026-09-27: "you were able to figure
+# out what the earnings call times were, so make sure the fallback can do
+# that"). ARITZIA and DPZ sat UNRESOLVED on 41 straight runs while both
+# companies had published their dates: Aritzia is on no Nasdaq calendar and its
+# IR page is JavaScript-only; Domino's IR site answers scripts with 403 and its
+# Oct 13 report sat one day past the Nasdaq window. earnings_announcements
+# reads the same notices a person finds -- the IR site's event feed and the
+# press releases -- and runs FIRST, because it also carries the real release
+# time (Domino's 6:05am, where the Nasdaq pre-market proxy says 7:00).
+# An announced date more than this many days past the ticker date is not
+# written (a different quarter's notice, or a misparse): LATE is the direction
+# that quotes through a call, so it goes to the ACTION email instead.
+ANNOUNCED_MAX_LATE_DAYS = int(os.environ.get("IMM_ANNOUNCED_MAX_LATE_DAYS", "45"))
+
+
+def announced_release(client, ev: str, now, rel=None):
+    """(datetime_ET, label, url, note) from the company's own notice of the
+    event's call, merged with Nasdaq's calendar reading `rel` when there is
+    one, or None. The EARLIER of the two wins; `note` is set when sources put
+    the event more than a day apart, for the ACTION email. Never raises."""
+    series = ev.split("-")[0]
+    sym = (series[len(_EARNINGS_PREFIX):]
+           if series.startswith(_EARNINGS_PREFIX) else "")
+    try:
+        found = earnings_announcements.find_announced(
+            sym, source_urls(client, ev), now)
+    except Exception as e:                       # noqa: BLE001 -- never fatal
+        log(f"! announcement lookup failed for {ev}: {e}")
+        return None
+    if not found:
+        return None
+    dt, label, url = found["anchor"], found["label"], found.get("url") or ""
+    note = ("the company's press release and its IR event feed disagree"
+            if found.get("conflict") else None)
+    td = parse_event_date(ev)
+    if td is not None and (dt - td).days > ANNOUNCED_MAX_LATE_DAYS:
+        log(f"! announced {dt.isoformat()} for {ev} is more than "
+            f"{ANNOUNCED_MAX_LATE_DAYS}d past its ticker date; not written "
+            f"[{label}] {url}")
+        return None
+    if rel is not None:
+        if abs((rel[0].date() - dt.date()).days) > 1:
+            note = f"Nasdaq's calendar says {rel[0]:%a %b %d} [{rel[1]}]"
+        dt = min(dt, rel[0])
+    return dt, label, url, note
 
 
 # ---- daily series auto-enrollment (Jack 2026-07-22) -------------------------
@@ -1052,11 +1103,14 @@ def main(argv=None) -> int:
     # the layoffs-mention market gap before the call). Also makes calls fully
     # automated: the exact call time has no reliable machine source (Kalshi
     # points these series at bloomberg.com, not the IR page), but Nasdaq gives
-    # the release. Falls back to the IR call-time scrape then --set on a miss.
+    # the release. Since 2026-09-27 the company's own announcement is read
+    # FIRST (announced_release) and merged with Nasdaq, earlier wins; then the
+    # IR call-time scrape, then --set on a miss.
     events = discover_events(client)
     log(f"active earnings events: {len(events)}")
 
     resolved, unresolved, covered = [], [], []
+    conflicts = []           # (event, announced_release tuple) for the ACTION email
     # PROVISIONAL RE-CHECK (Jack 2026-08-06, CELH). A fail-safe 7am guess is an
     # ADMISSION that nobody knows the time, so it is the one class of override
     # that must not be frozen by the `covered` short-circuit below. Everything
@@ -1072,12 +1126,28 @@ def main(argv=None) -> int:
                if series.startswith(_EARNINGS_PREFIX) else "")
         rel = (nasdaq_release_datetime(tkr, now, DISCLOSURE_LEAD_DAYS + 3)
                if tkr else None)
+        # The company's own notice first (see announced_release): it dates
+        # what Nasdaq cannot and carries the real release time.
+        ann = announced_release(client, ev, now, rel)
+        if ann and ann[3]:
+            conflicts.append((ev, ann))
         if ev in provisional:
             # ONLY a measured flag may replace a fail-safe guess. Anything else
             # (Nasdaq still has no time, or has dropped the row) leaves the
             # early cutoff exactly where it is — a re-check may push the bot's
-            # stand-down LATER only on evidence, never on a second guess.
-            if rel and provenance_of(rel[1]) == "read":
+            # stand-down LATER only on evidence, never on a second guess. The
+            # company's own announcement is such evidence.
+            if ann:
+                was = file_data.get(ev)
+                iso = ann[0].isoformat()
+                file_data[ev] = iso
+                upgraded.append((ev, was, iso, ann[1]))
+                resolved.append((ev, iso, ann[2],
+                                 f"fail-safe guess {was} REPLACED by the "
+                                 f"company's announcement [{ann[1]}]"))
+                log(f"PROVISIONAL UPGRADED {ev}: {was} -> {iso}  [{ann[1]}]  "
+                    f"{ann[2]}")
+            elif rel and provenance_of(rel[1]) == "read":
                 was = file_data.get(ev)
                 iso = rel[0].isoformat()
                 file_data[ev] = iso
@@ -1094,6 +1164,14 @@ def main(argv=None) -> int:
                 # nothing, because `covered` is emailed and never logged.
                 log(f"provisional (still unmeasured) {ev} = {file_data.get(ev)}"
                     f"  [Nasdaq has no time flag; fail-safe cutoff stands]")
+            continue
+        if ann:
+            iso = ann[0].isoformat()
+            file_data[ev] = iso
+            resolved.append((ev, iso, ann[2],
+                             f"call cutoff = earnings RELEASE per the company's "
+                             f"announcement [{ann[1]}]"))
+            log(f"call {ev} = {iso}  (company announcement [{ann[1]}]  {ann[2]})")
             continue
         if rel:
             dt_et, label = rel
@@ -1149,7 +1227,16 @@ def main(argv=None) -> int:
                if series.startswith(_EARNINGS_PREFIX) else "")
         rel = (nasdaq_release_datetime(tkr, now, STALE_LOOKAHEAD_DAYS)
                if tkr else None)
-        if rel:
+        ann = announced_release(client, ev, now, rel)
+        if ann and ann[3]:
+            conflicts.append((ev, ann))
+        if ann:
+            iso = ann[0].isoformat()
+            file_data[ev] = iso
+            stale_fixed.append((ev, iso, n_mkts, dpd, f"{ann[2]} [{ann[1]}]"))
+            log(f"STALE-TICKER FIXED {ev} = {iso}  ({n_mkts} mkts, "
+                f"${dpd:,.0f}/day pool)  [{ann[1]}]  {ann[2]}")
+        elif rel:
             dt_et, label = rel
             iso = dt_et.isoformat()
             file_data[ev] = iso
@@ -1280,13 +1367,32 @@ def main(argv=None) -> int:
     if resolved:
         for ev, iso, url, evidence in resolved:
             inf.append(f"call resolved: {ev} = {iso}")
+    if conflicts:
+        act.append("SOURCES DISAGREE on the date -- the EARLIER was written "
+                   "(standing down early only forfeits accrual). Check the "
+                   "company's IR page; --set if the later one is right:")
+        for ev, ann in conflicts:
+            act.append(f"  {ev}: wrote {ann[0]:%a %b %d %H:%M} ET "
+                       f"[{ann[1]}]; {ann[3]}")
+            if ann[2]:
+                act.append(f"    {ann[2]}")
+        act.append("")
     if unresolved:
-        act.append("UNRESOLVED calls — verify the call date AND time, then "
-                   "--set. The Nasdaq line is the RELEASE (anchor only): "
+        act.append("UNRESOLVED calls — no company announcement found (IR "
+                   "event feed, press releases) and nothing on Nasdaq's "
+                   "calendar within reach. Verify the call date AND time, "
+                   "then --set. The Nasdaq line is the RELEASE (anchor only): "
                    "the call is usually the same day shortly after, but "
                    "split reporters (e.g. airlines) call the next morning "
                    "— so confirm the date, don't assume it:")
         for ev in unresolved:
+            # What the bot is doing meanwhile: the undated-call fallback in
+            # incentive_mm.trade_cutoff_utc (ticker date - lead days).
+            cut = imm.trade_cutoff_utc(ev, None, None)
+            if cut is not None:
+                act.append(f"    # bot {'stood' if cut <= now else 'stands'} "
+                           f"down {cut.astimezone(ET):%a %b %d} (ticker date - "
+                           f"{imm.EARNINGS_UNDATED_LEAD_DAYS:g}d) until dated")
             series = ev.split("-")[0]
             tkr = (series[len(_EARNINGS_PREFIX):]
                    if series.startswith(_EARNINGS_PREFIX) else "")
@@ -1317,8 +1423,10 @@ def main(argv=None) -> int:
                             + "T07:00:00-04:00")
             act.append(f'  python imm_earnings_overrides.py --set {ev} '
                        f'"{hint_iso}"')
-        act.append("(unresolved events fall back to the conservative "
-                   "midnight-ET rule and stop quoting the night before)")
+        act.append(f"(an undated earnings event stops quoting "
+                   f"{imm.EARNINGS_UNDATED_LEAD_DAYS:g} days before Kalshi's "
+                   f"ticker date -- IMM_EARNINGS_UNDATED_LEAD_DAYS. Until "
+                   f"2026-09-27 it quoted to the market's Dec 31 expiry.)")
 
     # Feed-audit fold (Jack 2026-08-22 "isnt there a daily sweeper? fold into
     # that"): NEW findings — unearnable series (the KXTEMPMIAH class), an
@@ -1366,6 +1474,7 @@ def main(argv=None) -> int:
                + (f", {len(stale_fixed)} stale fixed" if stale_fixed else "")
                + (f", {len(stale_open)} STALE OPEN" if stale_open else "")
                + (f", audit {len(fa_act)} new" if fa_act else "")
+               + (f", {len(conflicts)} DATE CONFLICT" if conflicts else "")
                + (f", {len(pick_new)} NEW PICK-OFF" if pick_new else ""))
 
     # Run summary for the 7:20 combined email (kept for the last 8 runs, so

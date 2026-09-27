@@ -1078,7 +1078,9 @@ def _override_hour_label(ov_et: datetime, is_earnings: bool) -> str:
         return "after close (Nasdaq proxy 4pm ET)"
     if (ov_et.hour, ov_et.minute) == (7, 0):
         return "before open (Nasdaq proxy 7am ET)"
-    return "scraped call time"
+    # a stated release time from the company's announcement (2026-09-27), a
+    # scraped IR time, or a hand --set: a real clock time either way
+    return "announced / IR / hand-set time"
 
 
 # ---------------------------------------------------------------------------

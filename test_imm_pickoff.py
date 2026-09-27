@@ -388,6 +388,17 @@ class TestRendering(PickoffCase):
                   "EVENT IS", "OPEN NOW"):
             self.assertIn(s, h)
 
+    def test_an_announced_override_shows_the_call_it_names(self):
+        ev = EARN + "ARITZIA-26OCT14"
+        iso = et(2026, 10, 8, 16)
+        lab = "announced: after close, call 10-08 16:30 ET; IR event feed"
+        res = self.scan({ev: iso}, [milestone(ev, et(2026, 10, 14, 10))],
+                        meta={ev: {"iso": iso.isoformat(), "confidence": "read",
+                                   "label": lab}})
+        text = "\n".join(ip.text_lines(res, NOW))
+        self.assertIn(lab, text)
+        self.assertNotIn("call time not confirmed", text)
+
     def test_nothing_to_say_renders_nothing(self):
         empty = {"rows": [], "kalshi": {}, "checked": 3, "error": None}
         self.assertEqual(ip.text_lines(empty, NOW), [])

@@ -188,11 +188,44 @@ class TestListingDateCutoff(unittest.TestCase):
         cut = trade_cutoff_utc("KXMAMDANIMENTION-26AUG14", occ, exp)
         self.assertEqual(cut, occ)
 
-    def test_same_day_mention_keeps_ticker_cutoff(self):
-        # earnings-mention settles on call day: gap under the bar
-        exp = utc(2026, 8, 8, 20)
-        cut = trade_cutoff_utc("KXEARNINGSMENTIONDKNG-26AUG07", None, exp)
-        self.assertEqual(cut, parse_event_date("KXEARNINGSMENTIONDKNG-26AUG07"))
+    def test_undated_earnings_call_stands_down_before_the_ticker_date(self):
+        # 2026-09-27, KXEARNINGSMENTIONARITZIA-26OCT14. The old version of this
+        # test gave the market a synthetic expiration one day after the ticker
+        # date ("earnings-mention settles on call day"). Real earnings-mention
+        # markets are "next earnings call" contracts expiring Dec 31, so the
+        # listing-date rule fired and an undated event quoted to Dec 31, straight
+        # through its call. Now: ticker date minus the lead, whatever the expiry.
+        ev = "KXEARNINGSMENTIONARITZIA-26OCT14"
+        want = parse_event_date(ev) - timedelta(
+            days=imm.EARNINGS_UNDATED_LEAD_DAYS)
+        for exp in (utc(2026, 12, 31, 15), utc(2026, 10, 15, 20), None):
+            self.assertEqual(trade_cutoff_utc(ev, exp, exp), want, exp)
+        self.assertFalse(imm.ticker_date_is_listing_date(
+            ev, parse_event_date(ev), utc(2026, 12, 31, 15)))
+
+    def test_undated_earnings_lead_zero_is_the_ticker_date(self):
+        ev = "KXEARNINGSMENTIONDKNG-26AUG07"
+        old = imm.EARNINGS_UNDATED_LEAD_DAYS
+        imm.EARNINGS_UNDATED_LEAD_DAYS = 0
+        try:
+            self.assertEqual(trade_cutoff_utc(ev, None, utc(2026, 12, 31, 15)),
+                             parse_event_date(ev))
+        finally:
+            imm.EARNINGS_UNDATED_LEAD_DAYS = old
+
+    def test_dated_earnings_call_cuts_off_at_its_override(self):
+        # the orphan-restore path calls trade_cutoff_utc without the resolver:
+        # a dated call's reduce-only wind-down must run to the real call, not
+        # stop at the undated lead (or run to Dec 31 as it used to)
+        ev = "KXEARNINGSMENTIONCCL-26SEP28"
+        start = utc(2026, 9, 29, 11)
+        imm.EVENT_START_OVERRIDES[ev] = start
+        try:
+            cut = trade_cutoff_utc(ev, utc(2026, 12, 31, 15),
+                                   utc(2026, 12, 31, 15))
+        finally:
+            imm.EVENT_START_OVERRIDES.pop(ev, None)
+        self.assertEqual(cut, start - timedelta(minutes=imm.OVERRIDE_BUFFER_MIN))
 
     def test_non_mention_long_gap_keeps_ticker_cutoff(self):
         # only the mention family may flip: an event-dated series with a long

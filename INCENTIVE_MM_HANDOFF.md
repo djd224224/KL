@@ -4180,3 +4180,55 @@ fail-closed ..."; usgs_quake_state.json refreshing each minute with small
 usgs_ok_age_s / gfz_ok_age_s; KXBIGGESTQUAKE rungs are bids only, at or
 under fair - 1c; "quake detection" lines followed by holds and resumes; no
 ask orders on the family, ever.
+
+## 2026-09-27 pm — Undated earnings calls no longer quote to Dec 31; the resolver reads the company's own announcement (Jack)
+
+Found while answering "it is not able to date Aritzia or Dominos?". Both had
+sat UNRESOLVED on all 41 runs since 9/14, and the ACTION email's "(unresolved
+events ... stop quoting the night before)" was false: the 8/14 listing-date
+rule fires for any "MENTION" series whose market expires >5d past the ticker
+date, and every earnings-mention market is a "next earnings call" contract
+expiring Dec 31. So an undated earnings event's cutoff was Dec 31 -- it would
+have quoted Aritzia's 13 markets (150 contracts on the book) straight through
+its Oct 8 4:30pm ET call (Kalshi's ticker and milestone both said Oct 14).
+Hand-set the same afternoon from the companies' releases:
+ARITZIA-26OCT14 = Oct 8 16:00 (after close), DPZ-26OCT15 = Oct 13 06:05
+(results 6:05am, webcast 8:30am; the Nasdaq pre-market proxy would have said
+07:00).
+
+Bot (incentive_mm.py): ticker_date_is_listing_date() never fires for
+KXEARNINGSMENTION; trade_cutoff_utc() gives an earnings event its override
+when one exists (the orphan-restore path calls it without the resolver) and
+otherwise ticker date minus EARNINGS_UNDATED_LEAD_DAYS (14; Kalshi's ticker has
+run up to 6 days late: ARITZIA +6, LLY +2, DELL +2). IMM_EARNINGS_UNDATED_LEAD_DAYS
+=0 restores the midnight-of-ticker-date rule the resolver always assumed.
+imm_feed_audit mirrors it and no longer calls an undated earnings event
+"UNEARNABLE / close-anchored series missing its override". Checked against the
+336 live selected markets at deploy: 0 cutoffs changed (all dated).
+
+Resolver (Jack: "you were able to figure out what the earnings call times
+were, so make sure the fallback can do that"): new earnings_announcements.py,
+keyless, read FIRST for every undated event (and to upgrade a 7am guess):
+- the IR site's event feed: Q4-hosted sites serve /feed/Event.svc/GetEventList
+  as public JSON (Aritzia's JavaScript-only events page loads from it);
+- the company's press releases: Nasdaq's per-symbol feed
+  (api.nasdaq.com/api/news/topic/press_release) + nasdaq.com's copy of each
+  wire release (Domino's own IR site 403s scripts; Nasdaq's copy does not).
+The parser reads only the body after the wire dateline -- the page stamp
+"Published Sep 10, 2026 4:05pm EDT" is what fooled parse_call_time() into a
+4:05pm Domino's call -- classifies each time by the nearest keyword before it
+(call/webcast vs results released/distributed), skips archive/replay times,
+converts PT/CT/MT. Override = the RELEASE: stated time, else 16:00 after the
+close, else min(07:00, call - 2h). Merged with the Nasdaq calendar: the EARLIER
+wins, and sources more than a day apart go to the ACTION email as SOURCES
+DISAGREE. An announced date >45d past the ticker date is not written
+(IMM_ANNOUNCED_MAX_LATE_DAYS). Backtest on the 17 earnings events Kalshi has in
+the next 30 days: 7 found (CCL, NKE, STZ split-report, DPZ 06:05, JNJ, JPM,
+ARITZIA via IR feed), all matching the notices; the rest (big banks, PEP, UAL,
+ACI, INTC) are US-listed and still fall to the Nasdaq calendar.
+
+Not changed, noted: mention_cutoff_is_clear() only covers series ENDING in
+MENTION, so the no-cutoff depth gate never applied to KXEARNINGSMENTION<SYM>
+despite the 9/8 comment saying earnings were "deliberately IN scope". With the
+14-day lead an undated earnings event no longer quotes near its call anyway.
+Tests: test_earnings_announcements (26), TestListingDateCutoff (3 new).

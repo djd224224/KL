@@ -6991,10 +6991,26 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
 # MENTION-family series ON PURPOSE — everywhere else the ticker date IS the
 # event day (weather, gas, sports, treasuries), and a stray late expiration
 # placeholder there must keep failing toward quoting LESS, never through a
-# live event. Same-day mentions (KXWCMENTION match day, KXEARNINGSMENTION*
-# call day) sit far under the gap bar and keep the midnight rule; occurrence
-# and EVENT_START_OVERRIDES cutoffs still apply through min() regardless.
+# live event. Same-day mentions (KXWCMENTION match day) sit far under the gap
+# bar and keep the midnight rule; occurrence and EVENT_START_OVERRIDES
+# cutoffs still apply through min() regardless. KXEARNINGSMENTION* is NOT a
+# same-day mention and is excluded outright: see EARNINGS_UNDATED_LEAD_DAYS.
 MENTION_LISTING_GAP_DAYS = 5.0
+
+# UNDATED EARNINGS CALL (Jack 2026-09-27, KXEARNINGSMENTIONARITZIA-26OCT14).
+# An earnings-mention market is a "next earnings call" contract expiring Dec
+# 31, so the listing-date rule above ALWAYS fired for it (the comment above
+# once assumed earnings sat under the gap bar) and every event with no
+# event_start_overrides entry was quoted to Dec 31 -- through its call, with
+# nothing else standing it down. ARITZIA (not on Nasdaq's calendar,
+# JavaScript-only IR page) sat that way for two weeks: call Oct 8 16:30 ET,
+# ticker date Oct 14. The ticker date is Kalshi's GUESS at the call and has
+# run late by up to 6 days (ARITZIA +6, LLY +2, DELL +2), so an undated event
+# stands down this many days BEFORE it. imm_earnings_overrides.py dates events
+# from the company's own announcement (IR event feed, press releases) and the
+# Nasdaq calendar; this lead is only what applies when all of those miss.
+# 0 restores the midnight-of-ticker-date rule the resolver always assumed.
+EARNINGS_UNDATED_LEAD_DAYS = _env_float("IMM_EARNINGS_UNDATED_LEAD_DAYS", 14)
 
 
 def ticker_date_is_listing_date(event_ticker: str, td: datetime,
@@ -7002,8 +7018,11 @@ def ticker_date_is_listing_date(event_ticker: str, td: datetime,
     """True when a mention-family ticker's date segment is the day Kalshi
     LISTED the event rather than the day it resolves — the signal that td
     must not become a trade cutoff. No expiration to compare against means
-    no proof: keep the conservative reading."""
-    return ("MENTION" in series_of(event_ticker)
+    no proof: keep the conservative reading. Never for earnings mentions:
+    their Dec 31 expiration is the contract's, not the event's."""
+    series = series_of(event_ticker)
+    return ("MENTION" in series
+            and not series.startswith(_EARNINGS_PREFIX)
             and expected_expiration is not None
             and expected_expiration - td > timedelta(days=MENTION_LISTING_GAP_DAYS))
 
@@ -7017,9 +7036,21 @@ def trade_cutoff_utc(event_ticker: str, occurrence: Optional[datetime],
     whole listing window and cut off at expiration. An occurrence_datetime
     meaningfully before expiration marks a scheduled underlying event
     (earnings report, game) — cut off there too.
-    None = no known event start; breakers are the only protection."""
+    None = no known event start; breakers are the only protection.
+
+    Earnings mentions: the override when one exists (the orphan-restore path
+    calls this without consulting the resolver, and its reduce-only wind-down
+    must run to the real call, not stop 14 days early), else the ticker date
+    minus EARNINGS_UNDATED_LEAD_DAYS."""
     candidates = []
     td = parse_event_date(event_ticker)
+    if series_of(event_ticker).startswith(_EARNINGS_PREFIX):
+        start = EVENT_START_OVERRIDES.get(event_ticker)
+        if start is not None:
+            candidates.append(start - timedelta(minutes=OVERRIDE_BUFFER_MIN))
+            td = None
+        elif td is not None:
+            td = td - timedelta(days=EARNINGS_UNDATED_LEAD_DAYS)
     if td is not None and ticker_date_is_listing_date(event_ticker, td,
                                                       expected_expiration):
         # The whole listing window is the quotable period: be out at

@@ -147,15 +147,32 @@ def run_audit(client=None, progs=None) -> dict:
         if not pre_exempt and td is not None and now >= td + timedelta(hours=24):
             status.append("PRE-DROPPED(24h ticker rule)")
         resolved = res.resolve(series, ev_t)
-        cutoff = (resolved - timedelta(minutes=imm.EVENT_START_BUFFER_MIN)
-                  if resolved is not None else td)
+        # An undated earnings call uses the bot's own fallback (ticker date
+        # minus EARNINGS_UNDATED_LEAD_DAYS, 2026-09-27), which needs no
+        # expiration -- so the feed alone reproduces it exactly.
+        earnings = series.startswith(imm._EARNINGS_PREFIX)
+        if resolved is not None:
+            cutoff = resolved - timedelta(minutes=imm.EVENT_START_BUFFER_MIN)
+        elif earnings:
+            cutoff = imm.trade_cutoff_utc(ev_t, None, None)
+        else:
+            cutoff = td
         # UNEARNABLE: the program's whole period lies at/after the cutoff, so
         # the bot can never earn any of it. Scoped to the midnight-FALLBACK
         # cutoff only — a RESOLVED cutoff preceding a program period is a
         # deliberate stand-down (earnings call-time rule), not a miss — and
         # mention-family events keep their softer listing-date message below.
         pstart = imm.parse_iso_utc((progs.get(t0) or {}).get("start_date", ""))
-        if (cutoff is not None and resolved is None and not mention_family
+        # Undated earnings events are NOT "unearnable": the overrides task
+        # dates them (and its ACTION email lists the ones it cannot), and the
+        # close-anchored diagnosis below would send the reader the wrong way.
+        if earnings and resolved is None:
+            if cutoff is not None and cutoff <= now:
+                status.append(
+                    f"undated earnings call -- stood down {cutoff:%m-%d %H:%MZ} "
+                    f"({imm.EARNINGS_UNDATED_LEAD_DAYS:g}d before the ticker "
+                    f"date) until imm_earnings_overrides dates it")
+        elif (cutoff is not None and resolved is None and not mention_family
                 and pstart is not None and pstart >= cutoff):
             unearnable.add(series)
             status.append(
