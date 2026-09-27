@@ -15595,5 +15595,71 @@ class TestRateFloorSchedule(unittest.TestCase):
         self.assertFalse(self._admitted(1.0, 2.0, False)[2])
 
 
+class TestSignedFairReads(unittest.TestCase):
+    """The fair refreshers read Kalshi SIGNED (2026-09-27): unsigned /markets
+    list reads 429 from any IP, signed ones ride the account's bucket. One
+    lazily built reader per refresher; a failure raises so the fair module
+    falls back to its public read; IMM_FAIR_SIGNED_READS=0 hands the modules
+    no reader at all."""
+
+    def test_builds_once_and_passes_the_path_and_a_params_copy(self):
+        client = mock.Mock()
+        client.get.return_value = {"markets": []}
+        factory = mock.Mock(return_value=client)
+        reader = imm.SignedKalshiGet(factory)
+        factory.assert_not_called()                       # nothing until used
+        params = {"series_ticker": "KXTOKENUSE"}
+        self.assertEqual(reader("/markets", params), {"markets": []})
+        reader("/series")
+        factory.assert_called_once()
+        self.assertEqual(client.get.call_args_list,
+                         [mock.call("/markets", {"series_ticker": "KXTOKENUSE"}),
+                          mock.call("/series", {})])
+        self.assertIsNot(client.get.call_args_list[0][0][1], params)
+
+    def test_a_failed_build_raises_and_the_next_call_builds_again(self):
+        client = mock.Mock()
+        client.get.return_value = {}
+        factory = mock.Mock(side_effect=[FileNotFoundError("no key"), client])
+        reader = imm.SignedKalshiGet(factory)
+        with self.assertRaises(FileNotFoundError):
+            reader("/markets", {})
+        self.assertEqual(reader("/markets", {}), {})
+        self.assertEqual(factory.call_count, 2)
+
+    def test_a_read_error_raises_and_the_client_is_kept(self):
+        client = mock.Mock()
+        client.get.side_effect = [imm.HttpError("Too Many Requests", 429), {"ok": 1}]
+        factory = mock.Mock(return_value=client)
+        reader = imm.SignedKalshiGet(factory)
+        with self.assertRaises(imm.HttpError):
+            reader("/markets", {})
+        self.assertEqual(reader("/markets", {}), {"ok": 1})
+        factory.assert_called_once()
+
+    def test_kill_switch_default_on_and_hashed(self):
+        self.assertTrue(imm.FAIR_SIGNED_READS)            # armed by default
+        self.assertIn("FAIR_SIGNED_READS", imm._CONFIG_CODE_KNOBS)
+        with mock.patch.object(imm, "FAIR_SIGNED_READS", True):
+            self.assertIsInstance(imm.fair_reader(), imm.SignedKalshiGet)
+        with mock.patch.object(imm, "FAIR_SIGNED_READS", False):
+            self.assertIsNone(imm.fair_reader())
+
+    def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
+        """Wiring guard: the Carbon Arc, OpenRouter and GasBuddy refreshers
+        each build a reader with fair_reader() and pass it to their module's
+        write_fair_file (the threads live inside run(), so read its source)."""
+        import inspect
+        src = inspect.getsource(imm.IncentiveMarketMaker.run)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 3)
+        for mod, path in (("carbon_arc_fair", "CA_FAIR_FILE"),
+                          ("openrouter_fair", "OR_FAIR_FILE"),
+                          ("gasbuddy_fair", "GB_FAIR_FILE")):
+            i = src.index(f"{mod}.write_fair_file(")
+            call = src[i:src.index(")", i) + 1]
+            self.assertIn(path, call)
+            self.assertIn("get_json=kalshi_get", call)
+
+
 if __name__ == "__main__":
     unittest.main()

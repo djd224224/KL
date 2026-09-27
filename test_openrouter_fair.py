@@ -187,5 +187,71 @@ class TestWriteAndKey(unittest.TestCase):
         self.assertEqual(g.call_args.kwargs["headers"]["Authorization"], "Bearer sk-or-x")
 
 
+class TestSignedReads(unittest.TestCase):
+    """incentive_mm's signed Kalshi reader (2026-09-27): the window read goes
+    through it first, the public endpoint is only the fallback. No network."""
+
+    PAGE = {"markets": [
+        {"event_ticker": "KXTOKENUSE-26SEP28", "close_time": "2026-09-28T03:59:00Z",
+         "rules_primary": "for Sep 21-27, 2026 is above 164T"}]}
+
+    def setUp(self):
+        p = mock.patch.object(orf, "_signed_err", None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def public_ok(self):
+        ok = mock.Mock(status_code=200)
+        ok.json.return_value = self.PAGE
+        ok.raise_for_status.return_value = None
+        return ok
+
+    def test_signed_read_first_and_no_public_call(self):
+        seen = []
+
+        def get_json(path, params):
+            seen.append((path, params))
+            return self.PAGE
+
+        with mock.patch.object(orf.requests, "get",
+                               side_effect=AssertionError("public read")):
+            w = orf.fetch_windows(series=("KXTOKENUSE",), get_json=get_json)
+        self.assertEqual(seen, [("/markets", {"series_ticker": "KXTOKENUSE",
+                                              "status": "open", "limit": 200})])
+        self.assertEqual(w["KXTOKENUSE-26SEP28"]["start"], "2026-09-21")
+
+    def test_signed_failure_falls_back_and_each_error_is_logged_once(self):
+        boom = mock.Mock(side_effect=RuntimeError("HttpError(429 Too Many Requests)"))
+        with mock.patch.object(orf.requests, "get", return_value=self.public_ok()) as g, \
+                mock.patch.object(orf, "_log") as lg:
+            w = orf.fetch_windows(series=("KXTOKENUSE", "KXTOKENUSEM"), get_json=boom)
+            self.assertEqual(g.call_count, 2)                # both read publicly
+            self.assertEqual(lg.call_count, 1)               # the repeat is silent
+            self.assertIn("signed Kalshi read failed", lg.call_args[0][0])
+            orf.fetch_windows(series=("KXTOKENUSE",), get_json=lambda p, q: self.PAGE)
+            self.assertEqual(g.call_count, 2)
+            self.assertEqual(lg.call_count, 2)
+            self.assertIn("signed Kalshi reads back", lg.call_args[0][0])
+        self.assertEqual(w["KXTOKENUSE-26SEP28"]["end"], "2026-09-27")
+
+    def test_a_non_dict_signed_read_counts_as_a_failure(self):
+        with mock.patch.object(orf.requests, "get", return_value=self.public_ok()) as g, \
+                mock.patch.object(orf, "_log"):
+            w = orf.fetch_windows(series=("KXTOKENUSE",), get_json=lambda p, q: None)
+        g.assert_called_once()
+        self.assertIn("KXTOKENUSE-26SEP28", w)
+
+    def test_write_fair_file_hands_the_reader_to_the_window_read(self):
+        tmp = tempfile.mkdtemp(prefix="orf_signed_")
+        reader = mock.Mock()
+        with mock.patch.object(orf, "fetch_windows", return_value={}) as fw:
+            orf.write_fair_file(os.path.join(tmp, "f.json"),
+                                daily=flat_daily(date(2026, 9, 26), 40),
+                                now=datetime(2026, 9, 27, 5, 0, tzinfo=timezone.utc),
+                                vintage_path=os.path.join(tmp, "v.jsonl"),
+                                get_json=reader)
+        fw.assert_called_once_with(get_json=reader)
+
+
 if __name__ == "__main__":
     unittest.main()

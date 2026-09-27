@@ -34,8 +34,9 @@ month, a normal N(mu, sigma) for the first print:
 incentive_mm prices a strike K as P(first print > K) and stands a market
 down when its touch fights that fair (the rain-gate shape). Series ->
 (prism, entity) comes from each series' Kalshi settlement-source URL
-(".../prisms?prism=<id>&entity=<name>"), read from the public GET /series
-catalog at most once a day.
+(".../prisms?prism=<id>&entity=<name>"), read from Kalshi's GET /series
+catalog at most once a day -- signed when incentive_mm passes its reader,
+publicly otherwise.
 
 Feed, in CA_FEED_CONFIG (default ~/.carbonarc_feed.json, outside the repo
 because the repo is public) as {"token": ..., "url": ...}, or the env vars
@@ -78,7 +79,7 @@ import statistics
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -126,6 +127,36 @@ def _log(msg: str) -> None:
     # ASCII only: the IMM task console is cp1252
     print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} "
           f"[ca-fair] {msg}", flush=True)
+
+
+# the last signed-read failure, so each distinct one is logged once
+_signed_err: Optional[str] = None
+
+
+def _signed_read(get_json: Optional[Callable[[str, dict], dict]], path: str,
+                 params: dict) -> Optional[dict]:
+    """A SIGNED Kalshi read through `get_json(path, params)`, or None when
+    there is no reader or it failed -- the caller then reads the public
+    endpoint as before. incentive_mm passes the reader (2026-09-27): Kalshi
+    throttles unsigned list reads from any IP, while signed reads ride the
+    account's token bucket. Each distinct failure is logged once."""
+    global _signed_err
+    if get_json is None:
+        return None
+    try:
+        js = get_json(path, dict(params))
+        if not isinstance(js, dict):
+            raise ValueError(f"signed read returned {type(js).__name__}")
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:120]}"
+        if err != _signed_err:
+            _log(f"! signed Kalshi read failed ({err}); reading the public endpoint")
+        _signed_err = err
+        return None
+    if _signed_err is not None:
+        _log("signed Kalshi reads back")
+        _signed_err = None
+    return js
 
 
 def feed_settings() -> Tuple[str, str]:
@@ -257,12 +288,18 @@ def series_map_from_catalog(series_list: List[dict]) -> Dict[str, dict]:
     return out
 
 
-def fetch_series_map(timeout: float = HTTP_TIMEOUT) -> Dict[str, dict]:
-    """The Carbon Arc series map from Kalshi's public series catalog (one
-    unauthenticated call, ~14k series). Raises on failure."""
-    r = requests.get(KALSHI_SERIES_URL, timeout=timeout)
-    r.raise_for_status()
-    return series_map_from_catalog((r.json() or {}).get("series") or [])
+def fetch_series_map(timeout: float = HTTP_TIMEOUT,
+                     get_json: Optional[Callable[[str, dict], dict]] = None
+                     ) -> Dict[str, dict]:
+    """The Carbon Arc series map from Kalshi's series catalog (one call,
+    ~14k series): signed through `get_json` when given, else -- or when that
+    read fails -- the public endpoint. Raises on failure."""
+    js = _signed_read(get_json, "/series", {})
+    if js is None:
+        r = requests.get(KALSHI_SERIES_URL, timeout=timeout)
+        r.raise_for_status()
+        js = r.json() or {}
+    return series_map_from_catalog(js.get("series") or [])
 
 
 def _month_key(date_iso: str) -> str:
@@ -402,12 +439,15 @@ def _append_vintages(old: Dict[str, dict], new: Dict[str, dict],
 def write_fair_file(path: str, payload: Optional[dict] = None,
                     now: Optional[datetime] = None,
                     series_map: Optional[Dict[str, dict]] = None,
-                    vintage_path: Optional[str] = None) -> Tuple[int, int]:
+                    vintage_path: Optional[str] = None,
+                    get_json: Optional[Callable[[str, dict], dict]] = None
+                    ) -> Tuple[int, int]:
     """Fetch (unless `payload` is given), build and atomically write the
     fair file. Returns (series with an entry, mapped series without one);
     (0, 0) and no write when no feed is configured. The series map is
     reused from the previous file for SERIES_MAP_TTL_SECS; a failed catalog
-    read keeps the old map."""
+    read keeps the old map. `get_json` is incentive_mm's signed Kalshi
+    reader (fetch_series_map)."""
     now = now or datetime.now(timezone.utc)
     if payload is None and not feed_configured():
         return 0, 0
@@ -418,7 +458,7 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
         age = time.time() - float(prev.get("series_map_ts") or 0)
         if not smap or age > SERIES_MAP_TTL_SECS:
             try:
-                smap = fetch_series_map()
+                smap = fetch_series_map(get_json=get_json)
                 prev["series_map_ts"] = time.time()
             except Exception as e:   # keep the old map
                 _log(f"! series catalog read failed ({e}); "

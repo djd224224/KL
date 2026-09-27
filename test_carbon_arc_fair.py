@@ -316,5 +316,57 @@ class TestOfficialApi(unittest.TestCase):
                 caf.fetch_payload("https://x.invalid/p", "")
 
 
+class TestSignedSeriesCatalog(unittest.TestCase):
+    """incentive_mm's signed Kalshi reader (2026-09-27): the series catalog
+    read goes through it first, the public endpoint is only the fallback."""
+
+    URL = "https://www.carbonarc.co/prisms?prism=abc-123&entity=Amazon"
+    CATALOG = {"series": [
+        {"ticker": "KXAMZNCC", "settlement_sources": [{"name": "Carbon Arc", "url": URL}]},
+        {"ticker": "KXBAA", "settlement_sources": [{"url": "https://fiscal.ai"}]}]}
+
+    def setUp(self):
+        p = mock.patch.object(caf, "_signed_err", None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_signed_read_first(self):
+        seen = []
+
+        def get_json(path, params):
+            seen.append((path, params))
+            return self.CATALOG
+
+        with mock.patch.object(caf.requests, "get",
+                               side_effect=AssertionError("public read")):
+            m = caf.fetch_series_map(get_json=get_json)
+        self.assertEqual(seen, [("/series", {})])
+        self.assertEqual(m, {"KXAMZNCC": {"prism": "abc-123", "entity": "Amazon"}})
+
+    def test_signed_failure_falls_back_to_the_public_catalog(self):
+        resp = mock.Mock()
+        resp.json.return_value = self.CATALOG
+        resp.raise_for_status.return_value = None
+        with mock.patch.object(caf.requests, "get", return_value=resp) as g, \
+                mock.patch.object(caf, "_log") as lg:
+            m = caf.fetch_series_map(get_json=mock.Mock(side_effect=OSError("reset")))
+        g.assert_called_once()
+        lg.assert_called_once()
+        self.assertEqual(list(m), ["KXAMZNCC"])
+
+    def test_write_fair_file_hands_the_reader_to_the_catalog_read(self):
+        tmp = tempfile.mkdtemp(prefix="caf_signed_")
+        payload = {"prisms": [
+            _prism("P1", [_entity("Amazon", [("2026-09-23", 108.64)], HIST)])]}
+        reader = mock.Mock()
+        with mock.patch.object(caf, "fetch_series_map", return_value={
+                "KXAMZNCC": {"prism": "P1", "entity": "Amazon"}}) as fm:
+            ok, miss = caf.write_fair_file(
+                os.path.join(tmp, "carbon_arc_fair.json"), payload=payload, now=NOW,
+                vintage_path=os.path.join(tmp, "vint.jsonl"), get_json=reader)
+        fm.assert_called_once_with(get_json=reader)
+        self.assertEqual((ok, miss), (1, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

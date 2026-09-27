@@ -63,7 +63,8 @@ mu and sigma in dollars plus the inputs. A state gets no entry (the gate
 stands it aside) without a settled AAA anchor for today, a prior-day average,
 or a live update newer than GB_MAX_AGE_MIN; Monday trading (the Tuesday
 print) is skipped outright until it has been measured
-(GB_SKIP_PRINT_WEEKDAYS).
+(GB_SKIP_PRINT_WEEKDAYS). The anchor comes from Kalshi's markets endpoint,
+read SIGNED when incentive_mm passes its reader and publicly otherwise.
 
 DIESEL DAILY (Jack 2026-09-27: "ok do that for diesel daily"). KXDIESELD
 settles on AAA's NATIONAL diesel average (posted ~03:20 ET on the print date,
@@ -212,6 +213,37 @@ def _log(msg: str) -> None:
           f"[gb-fair] {msg}", flush=True)
 
 
+# the last signed-read failure, so each distinct one is logged once
+_signed_err: Optional[str] = None
+
+
+def _signed_read(get_json: Optional[Callable[[str, dict], dict]], path: str,
+                 params: dict) -> Optional[dict]:
+    """A SIGNED Kalshi read through `get_json(path, params)`, or None when
+    there is no reader or it failed -- the caller then reads the public
+    endpoint as before. incentive_mm passes the reader (2026-09-27): Kalshi
+    throttles UNSIGNED /markets list reads from any IP, while the same read
+    signed passed 20/20 in a paired probe. Each distinct failure is logged
+    once (a refresh can read 51 anchors)."""
+    global _signed_err
+    if get_json is None:
+        return None
+    try:
+        js = get_json(path, dict(params))
+        if not isinstance(js, dict):
+            raise ValueError(f"signed read returned {type(js).__name__}")
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:120]}"
+        if err != _signed_err:
+            _log(f"! signed Kalshi read failed ({err}); reading the public endpoint")
+        _signed_err = err
+        return None
+    if _signed_err is not None:
+        _log("signed Kalshi reads back")
+        _signed_err = None
+    return js
+
+
 def event_ticker(series: str, d: date) -> str:
     """KXAAAGASDCA + 2026-09-28 -> KXAAAGASDCA-26SEP28."""
     return f"{series}-{d.year % 100:02d}{_MONTHS[d.month - 1]}{d.day:02d}"
@@ -350,12 +382,17 @@ def fetch_history(abbr: str) -> Dict[str, float]:
     return out
 
 
-def fetch_anchor(series: str, d: date) -> Tuple[str, Optional[float]]:
+def fetch_anchor(series: str, d: date,
+                 get_json: Optional[Callable[[str, dict], dict]] = None
+                 ) -> Tuple[str, Optional[float]]:
     """Kalshi's settled AAA value for <series>-<d>: ('ok', value), ('pending',
     None) while the event is not settled yet, ('absent', None) when Kalshi
-    has no such event."""
-    js = _get(KALSHI_MARKETS_URL, {"event_ticker": event_ticker(series, d),
-                                   "limit": 1}, retries=2, backoff=2.0)
+    has no such event. Signed through `get_json` when given, else -- or when
+    that read fails -- the public endpoint."""
+    params = {"event_ticker": event_ticker(series, d), "limit": 1}
+    js = _signed_read(get_json, "/markets", params)
+    if js is None:
+        js = _get(KALSHI_MARKETS_URL, params, retries=2, backoff=2.0)
     ms = (js or {}).get("markets") or []
     if not ms:
         return "absent", None
@@ -423,7 +460,9 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     pace: float = CALL_PACE_SECS,
                     diesel_live: Optional[float] = None,
                     diesel_live_fn: Optional[Callable] = None,
-                    diesel_hist_fn: Optional[Callable] = None) -> Tuple[int, int]:
+                    diesel_hist_fn: Optional[Callable] = None,
+                    get_json: Optional[Callable[[str, dict], dict]] = None
+                    ) -> Tuple[int, int]:
     """Fetch (unless given), build and atomically write the fair file.
     Returns (events with an entry, series without one). Anchors, absent
     states, Full Day Averages ("finals") and each day's last live read
@@ -431,7 +470,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     costs two GasBuddy calls; each state's anchor and 1 Day Ago average are
     read once a day. Raises on a GasBuddy live-read error (the caller logs
     and keeps the previous file, whose entries then age out of the bot's
-    TTL)."""
+    TTL). `get_json` is incentive_mm's signed Kalshi reader, used by the
+    default anchor_fn (fetch_anchor)."""
     now = now or datetime.now(timezone.utc)
     now_et = now.astimezone(ET)
     today = now_et.date()
@@ -439,7 +479,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     d2 = (today - timedelta(days=2)).isoformat()
     print_day = today + timedelta(days=1)
     keep_from = (today - timedelta(days=10)).isoformat()
-    anchor_fn = anchor_fn or fetch_anchor
+    anchor_fn = anchor_fn or (lambda s, d: fetch_anchor(s, d, get_json=get_json))
     prev_fn = prev_fn or fetch_prev
     history_fn = history_fn or fetch_history
     diesel_hist_fn = diesel_hist_fn or fetch_diesel_history

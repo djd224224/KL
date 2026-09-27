@@ -4526,3 +4526,59 @@ WATCH AFTER DEPLOY: startup "vercel gate: ... PRE-D only, fail-closed ...",
 "vercel-fair refresh: 24 events with a read", run-logs/incentive-mm/
 vercel_fair.json refreshing every 15 min, "vercel stand-aside / resume"
 lines, and no Vercel orders at or after 23:00Z the day before D.
+
+## 2026-09-27 pm — Fair refreshers read Kalshi SIGNED: OpenRouter windows, GasBuddy anchors, Carbon Arc catalog (Jack)
+
+Jack, after the public-API 429 investigation: "yes build change A on a
+branch".
+
+WHY. Kalshi throttles UNSIGNED /markets (and /events) LIST reads from any
+IP; it is not this box's volume. 9/27: the OpenRouter window read (2 list
+calls per 10-minute refresh) failed about half its attempts 06-14Z while the
+box sent under one unsigned list call a minute and no other session was
+calling Kalshi; a lone list call at 00:41Z got a 429 before any collector
+ran; from a second IP (Anthropic's fetchers) 6/6 unique list URLs got 429
+while /exchange/status, a single market and an order book passed. Unsigned
+order-book reads are fine (yt_kalshi_books.py ran ~9k at ~1/s with few
+retries). Paired probe 20:44-20:47Z, the gate's exact call: unsigned 18/20
+(both 429s on CDN cache misses, 2 of 7), signed 20/20 on the first try,
+25-55 ms against 0.7-1.1 s. Damage so far: the 05:49-06:28Z OpenRouter
+stand-aside on 3 markets after the 05:47 restart (the cached-window fallback
+covers restarts now; a NEW event still needs one good read). The GasBuddy
+gate's exposure is the 07:00 ET anchor pass, 26 list reads re-asked every 5
+minutes until they land, plus the KXDIESELD anchor, re-asked every 5 minutes
+until Kalshi settles it (~09:00-09:40 ET).
+
+WHAT. FAIR_SIGNED_READS (IMM_FAIR_SIGNED_READS, default 1). The ca-fair,
+or-fair and gb-fair refresher threads each build a SignedKalshiGet through
+fair_reader(): its own ExchangeClient with the account key and its own
+keep-alive session (not the trading loop's), built on first use. Each
+thread passes it to its module's write_fair_file(get_json=...), and
+openrouter_fair.fetch_windows, gasbuddy_fair.fetch_anchor and
+carbon_arc_fair.fetch_series_map read through it first. A failed signed
+read (the client already retried a 429/5xx at 1s and 3s) falls back to the
+old public read with its old retries, so the worst case is today's
+behaviour. Each module logs a distinct signed failure once ("[or-fair] !
+signed Kalshi read failed (<error>); reading the public endpoint") and the
+recovery once ("signed Kalshi reads back"). Startup line: "fair refreshers:
+Kalshi reads SIGNED, public endpoint as the fallback". Hashed in the config.
+Cost: ~500 signed reads a day on the account's bucket (Advanced: 300 read
+tokens/s, 10 per read), about 0.02% of it.
+
+NOT CHANGED: the rain and quake refreshers (NWS / USGS; no Kalshi reads);
+the three modules' standalone CLIs (no reader, so public reads as before);
+the other session's collectors on this IP (yt_kalshi_books.py, the vercel
+logger), which do not cause these 429s.
+Kill: IMM_FAIR_SIGNED_READS=0 (public reads only). DEPLOY: code only, no
+launcher change; the sync and the incentive_mm.py mtime restart pick it up.
+Verified live on the branch: the real SignedKalshiGet fed all three module
+reads (both token windows, the KXAAAGASDCA-26SEP27 anchor 6.3528, the
+KXDIESELD-26SEP27 anchor 6.4709, 93 Carbon Arc series) with the public
+endpoint patched to raise: 0 public calls.
+Tests: TestSignedFairReads (5, including a source guard that all three
+refreshers pass their reader) and the modules' signed-read tests (4 / 3 / 3).
+Each of 6 targeted mutations fails them. Rebased onto the KXDIESELD entry
+above: its anchor goes through the same anchor_fn, so it is read signed too
+(the GasBuddy write test counts 51 state anchors + KXDIESELD through the
+reader). The Vercel pre-D gate above reads no Kalshi (vercel_fair.py reads
+only Vercel's export), so it takes no reader. Full suite 1424 green.

@@ -77,7 +77,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pytz
 import requests
@@ -5484,6 +5484,8 @@ _CONFIG_CODE_KNOBS = (
     "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",
     "GB_FAIR_SIGMA_LO_FRAC", "GB_FAIR_MAX_SIGMA_CENTS", "GB_FAIR_REFRESH_SECS",
     "GB_STATE_MIN_RATE", "GB_DIESEL_ENABLE",
+    # the three fair refreshers' Kalshi reads signed (2026-09-27)
+    "FAIR_SIGNED_READS",
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
     # (freeze, lags, staleness) ride in its status file's "knobs" block
     "QUAKE_ENABLE", "QUAKE_SERIES", "QUAKE_MARGIN_CENTS", "QUAKE_USGS_POLL_SECS",
@@ -6423,6 +6425,17 @@ GB_DIESEL_SERIES = "KXDIESELD"
 # strike segment: the states' "-6.3950", the diesel daily's "-T6.470"
 _GB_STRIKE_RE = re.compile(r"-T?(\d+(?:\.\d+)?)$")
 _gb_fair_state: dict = {"mtime": 0.0, "entries": {}}
+
+# The fair refreshers read Kalshi SIGNED (Jack 2026-09-27: "yes build change
+# A on a branch"). Kalshi throttles UNSIGNED /markets list reads from any IP
+# (measured 9/27 from this box and from a second IP): the OpenRouter window
+# read lost about half its 10-minute attempts 06-14Z, and the same read
+# signed passed 20/20 on the first try. The OpenRouter windows, the GasBuddy
+# anchors (the states' and KXDIESELD's, all through anchor_fn) and the Carbon
+# Arc series catalog go through SignedKalshiGet, with the public endpoint as
+# the fallback when a signed read fails. Kill switch IMM_FAIR_SIGNED_READS=0:
+# public reads only, as before.
+FAIR_SIGNED_READS = os.environ.get("IMM_FAIR_SIGNED_READS", "1") == "1"
 
 
 def gb_fair_series(series: str) -> bool:
@@ -14832,6 +14845,7 @@ class IncentiveMarketMaker:
                 except Exception as e:
                     log(f"{self.tag} ! ca-fair refresher disabled: {e}")
                     return
+                kalshi_get = fair_reader()
                 last = None
                 while True:
                     delay = max(30, CA_FAIR_REFRESH_SECS)
@@ -14843,7 +14857,7 @@ class IncentiveMarketMaker:
                             last, delay = "off", 600
                         else:
                             ok, miss = carbon_arc_fair.write_fair_file(
-                                CA_FAIR_FILE)
+                                CA_FAIR_FILE, get_json=kalshi_get)
                             if last != (ok, miss):
                                 log(f"{self.tag} ca-fair refresh: {ok} series "
                                     f"with a read"
@@ -14870,6 +14884,7 @@ class IncentiveMarketMaker:
                 except Exception as e:
                     log(f"{self.tag} ! or-fair refresher disabled: {e}")
                     return
+                kalshi_get = fair_reader()
                 last = None
                 while True:
                     now_u = datetime.now(timezone.utc)
@@ -14882,7 +14897,8 @@ class IncentiveMarketMaker:
                                     f"-- token-usage series stand aside")
                             last, delay = "off", 600
                         else:
-                            ok, miss = openrouter_fair.write_fair_file(OR_FAIR_FILE)
+                            ok, miss = openrouter_fair.write_fair_file(
+                                OR_FAIR_FILE, get_json=kalshi_get)
                             if last != (ok, miss):
                                 log(f"{self.tag} or-fair refresh: {ok} events "
                                     f"with a read"
@@ -14916,11 +14932,13 @@ class IncentiveMarketMaker:
                 except Exception as e:
                     log(f"{self.tag} ! gb-fair refresher disabled: {e}")
                     return
+                kalshi_get = fair_reader()
                 last = None
                 while True:
                     delay = max(60, GB_FAIR_REFRESH_SECS)
                     try:
-                        ok, miss = gasbuddy_fair.write_fair_file(GB_FAIR_FILE)
+                        ok, miss = gasbuddy_fair.write_fair_file(
+                            GB_FAIR_FILE, get_json=kalshi_get)
                         if last != (ok, miss):
                             log(f"{self.tag} gb-fair refresh: {ok} events "
                                 f"with a read"
@@ -15060,6 +15078,10 @@ class IncentiveMarketMaker:
                 f"refresh {GB_FAIR_REFRESH_SECS}s, file {GB_FAIR_FILE}")
         else:
             log("gb-fair gate: OFF -- AAA state dailies stay pattern-blocked")
+        if CA_FAIR_ENABLE or OR_FAIR_ENABLE or GB_FAIR_ENABLE:
+            log("fair refreshers: Kalshi reads "
+                + ("SIGNED, public endpoint as the fallback" if FAIR_SIGNED_READS
+                   else "PUBLIC only (IMM_FAIR_SIGNED_READS=0)"))
         if QUAKE_ENABLE:
             log(f"quake gate: {','.join(sorted(QUAKE_SERIES))} BID-ONLY "
                 f"fail-closed, bids <= fair - {QUAKE_MARGIN_CENTS:g}c, size "
@@ -15316,6 +15338,35 @@ def build_client() -> ExchangeClient:
     status = client.get_exchange_status()
     log(f"exchange status: {status}")
     return client
+
+
+def _fair_reader_client() -> ExchangeClient:
+    return ExchangeClient(exchange_api_base=KALSHI_API_BASE,
+                          key_id=KEY_ID, private_key=load_private_key())
+
+
+class SignedKalshiGet:
+    """A fair refresher's signed Kalshi reader, `get_json(path, params)` for
+    openrouter_fair / gasbuddy_fair / carbon_arc_fair (see FAIR_SIGNED_READS).
+    One per refresher thread -- its own client and keep-alive session, not
+    the trading loop's -- built on first use. A build or read failure raises
+    (the client already retried a 429 / 5xx at 1s and 3s); the fair module
+    then reads the public endpoint, and the next call builds again."""
+
+    def __init__(self, factory: Optional[Callable[[], Any]] = None):
+        self._factory = factory or _fair_reader_client
+        self._client: Any = None
+
+    def __call__(self, path: str, params: Optional[dict] = None) -> dict:
+        if self._client is None:
+            self._client = self._factory()
+        return self._client.get(path, dict(params or {}))
+
+
+def fair_reader() -> Optional[SignedKalshiGet]:
+    """A fair refresher's signed reader, or None under the kill switch
+    (IMM_FAIR_SIGNED_READS=0: the fair modules read the public endpoint)."""
+    return SignedKalshiGet() if FAIR_SIGNED_READS else None
 
 
 def main(argv: Optional[List[str]] = None) -> int:

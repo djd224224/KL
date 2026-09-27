@@ -37,8 +37,10 @@ day left and ~16T with a full week left.
 Writes OR_FAIR_FILE for incentive_mm (per EVENT ticker: mu, sigma in T,
 known / total days, complete) and appends each new completed day to
 OR_VINTAGE_FILE. Event windows come from the open markets' own rules text
-on Kalshi's public API (the month is NOT a calendar month); a weekly event
-whose text does not parse falls back to the 7 days before its ticker date.
+on Kalshi's markets endpoint (the month is NOT a calendar month), read
+SIGNED when incentive_mm passes its reader and publicly otherwise; a weekly
+event whose text does not parse falls back to the 7 days before its ticker
+date.
 
 The key lives OUTSIDE the repo (it is public): IMM_OR_API_KEY, else
 ~/.openrouter_key.json {"key": "sk-or-..."}. Never logged.
@@ -55,7 +57,7 @@ import statistics
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -103,6 +105,37 @@ def _log(msg: str) -> None:
     # ASCII only: the IMM task console is cp1252
     print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} "
           f"[or-fair] {msg}", flush=True)
+
+
+# the last signed-read failure, so each distinct one is logged once
+_signed_err: Optional[str] = None
+
+
+def _signed_read(get_json: Optional[Callable[[str, dict], dict]], path: str,
+                 params: dict) -> Optional[dict]:
+    """A SIGNED Kalshi read through `get_json(path, params)`, or None when
+    there is no reader or it failed -- the caller then reads the public
+    endpoint as before. incentive_mm passes the reader (2026-09-27): Kalshi
+    throttles UNSIGNED /markets list reads from any IP (the window read lost
+    about half its 10-minute attempts 06-14Z), while the same read signed
+    passed 20/20 in a paired probe. Each distinct failure is logged once."""
+    global _signed_err
+    if get_json is None:
+        return None
+    try:
+        js = get_json(path, dict(params))
+        if not isinstance(js, dict):
+            raise ValueError(f"signed read returned {type(js).__name__}")
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:120]}"
+        if err != _signed_err:
+            _log(f"! signed Kalshi read failed ({err}); reading the public endpoint")
+        _signed_err = err
+        return None
+    if _signed_err is not None:
+        _log("signed Kalshi reads back")
+        _signed_err = None
+    return js
 
 
 def api_key() -> str:
@@ -213,24 +246,28 @@ def windows_from_markets(markets: List[dict]) -> Dict[str, dict]:
 
 def fetch_windows(series: Tuple[str, ...] = OR_SERIES,
                   timeout: float = HTTP_TIMEOUT,
-                  retries: int = 3, backoff: float = 3.0) -> Dict[str, dict]:
-    """Event windows from Kalshi's public markets endpoint. A 429 or 5xx is
-    retried with a growing sleep (3s, 12s, 27s): the first refresh after a
-    bot restart met a 429 on 2026-09-27, while the bot's own startup reads
-    were hitting the same host."""
+                  retries: int = 3, backoff: float = 3.0,
+                  get_json: Optional[Callable[[str, dict], dict]] = None
+                  ) -> Dict[str, dict]:
+    """Event windows from Kalshi's markets endpoint: signed through
+    `get_json` when given (see _signed_read), else -- or when that read
+    fails -- the public endpoint, where a 429 or 5xx is retried with a
+    growing sleep (3s, 12s, 27s)."""
     markets: List[dict] = []
     for s in series:
-        for attempt in range(retries + 1):
-            r = requests.get(KALSHI_MARKETS_URL, params={"series_ticker": s,
-                                                         "status": "open",
-                                                         "limit": 200},
-                             timeout=timeout)
-            if (r.status_code == 429 or r.status_code >= 500) and attempt < retries:
-                time.sleep(backoff * (attempt + 1) ** 2)
-                continue
-            break
-        r.raise_for_status()
-        markets += (r.json() or {}).get("markets") or []
+        params = {"series_ticker": s, "status": "open", "limit": 200}
+        js = _signed_read(get_json, "/markets", params)
+        if js is None:
+            for attempt in range(retries + 1):
+                r = requests.get(KALSHI_MARKETS_URL, params=params,
+                                 timeout=timeout)
+                if (r.status_code == 429 or r.status_code >= 500) and attempt < retries:
+                    time.sleep(backoff * (attempt + 1) ** 2)
+                    continue
+                break
+            r.raise_for_status()
+            js = r.json() or {}
+        markets += js.get("markets") or []
     return windows_from_markets(markets)
 
 
@@ -294,11 +331,14 @@ def _read_json(path: str) -> dict:
 def write_fair_file(path: str, daily: Optional[Dict[date, float]] = None,
                     windows: Optional[Dict[str, dict]] = None,
                     now: Optional[datetime] = None,
-                    vintage_path: Optional[str] = None) -> Tuple[int, int]:
+                    vintage_path: Optional[str] = None,
+                    get_json: Optional[Callable[[str, dict], dict]] = None
+                    ) -> Tuple[int, int]:
     """Fetch (unless given), build and atomically write the fair file.
     Returns (events with an entry, events without one); (0, 0) and no write
     when there is no API key. Raises on fetch errors (the caller logs and
-    keeps the previous file, whose entries then age out of the bot's TTL)."""
+    keeps the previous file, whose entries then age out of the bot's TTL).
+    `get_json` is incentive_mm's signed Kalshi reader (fetch_windows)."""
     now = now or datetime.now(timezone.utc)
     today = now.astimezone(timezone.utc).date()
     if daily is None:
@@ -309,7 +349,7 @@ def write_fair_file(path: str, daily: Optional[Dict[date, float]] = None,
     prev = _read_json(path)
     if windows is None:
         try:
-            windows = fetch_windows()
+            windows = fetch_windows(get_json=get_json)
         except Exception as e:
             # an event's window never changes: keep refreshing the totals on
             # the windows already known, and only new events wait for Kalshi

@@ -315,5 +315,66 @@ class TestFetchParsing(unittest.TestCase):
         self.assertEqual(gb.fetch_prev("QQ"), ("", None))
 
 
+class TestSignedAnchorReads(unittest.TestCase):
+    """incentive_mm's signed Kalshi reader (2026-09-27): the anchor read goes
+    through it first, the public endpoint is only the fallback. No network."""
+
+    def setUp(self):
+        p = mock.patch.object(gb, "_signed_err", None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_signed_read_first(self):
+        seen = []
+
+        def get_json(path, params):
+            seen.append((path, params))
+            return {"markets": [{"expiration_value": "6.3528"}]}
+
+        with mock.patch.object(gb, "_get", side_effect=AssertionError("public read")):
+            self.assertEqual(gb.fetch_anchor("KXAAAGASDCA", date(2026, 9, 27),
+                                             get_json=get_json), ("ok", 6.3528))
+        self.assertEqual(seen, [("/markets", {"event_ticker": "KXAAAGASDCA-26SEP27",
+                                              "limit": 1})])
+
+    def test_signed_failure_falls_back_and_each_error_is_logged_once(self):
+        boom = mock.Mock(side_effect=RuntimeError("HttpError(401 Unauthorized)"))
+        with mock.patch.object(gb, "_get", return_value={"markets": []}) as g, \
+                mock.patch.object(gb, "_log") as lg:
+            for series in ("KXAAAGASDAK", "KXAAAGASDAL", "KXAAAGASDAR"):
+                self.assertEqual(gb.fetch_anchor(series, date(2026, 9, 27),
+                                                 get_json=boom), ("absent", None))
+        self.assertEqual(g.call_count, 3)            # every state read publicly
+        lg.assert_called_once()                      # one line, not one per state
+
+    def test_write_fair_file_reads_every_anchor_through_the_reader(self):
+        tmp = tempfile.mkdtemp(prefix="gbfair_signed_")
+        vals = {"KXAAAGASDCA-26OCT01": "6.38", "KXAAAGASDTX-26OCT01": "3.93"}
+        seen = []
+
+        def get_json(path, params):
+            seen.append(params["event_ticker"])
+            v = vals.get(params["event_ticker"])
+            return {"markets": [{"expiration_value": v}] if v else []}
+
+        prevs = {"CA": ("2026-09-30", 6.39), "TX": ("2026-09-30", 3.94)}
+        with mock.patch.object(gb, "_get", side_effect=AssertionError("public read")):
+            ok, miss = gb.write_fair_file(
+                os.path.join(tmp, "gasbuddy_fair.json"), now=utc(2026, 10, 1, 16, 0),
+                meta={"updated": "2026-10-01T11:55:00", "today": "2026-10-01",
+                      "prev": "2026-09-30"},
+                live={"CA": 6.40, "TX": 3.955},
+                prev_fn=lambda ab: prevs.get(ab, ("", None)),
+                history_fn=lambda ab: {},
+                live_log=os.path.join(tmp, "live.jsonl"), pace=0,
+                diesel_live_fn=lambda: None, diesel_hist_fn=lambda: {},
+                get_json=get_json)
+        self.assertEqual((ok, miss), (2, 0))
+        # every state's anchor AND the diesel daily's, all through the reader
+        self.assertEqual(len(seen), len(set(gb.STATES.values())) + 1)
+        self.assertIn("KXAAAGASDTX-26OCT01", seen)
+        self.assertIn("KXDIESELD-26OCT01", seen)
+
+
 if __name__ == "__main__":
     unittest.main()
