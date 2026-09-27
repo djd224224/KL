@@ -5267,8 +5267,7 @@ _CONFIG_CODE_KNOBS = (
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
     # (freeze, lags, staleness) ride in its status file's "knobs" block
     "QUAKE_ENABLE", "QUAKE_SERIES", "QUAKE_MARGIN_CENTS", "QUAKE_USGS_POLL_SECS",
-    "QUAKE_GFZ_POLL_SECS", "QUAKE_CUTOFF_FROM_CLOSE_MIN", "QUAKE_RUNG",
-    "QUAKE_MAX_POSITION",
+    "QUAKE_GFZ_POLL_SECS", "QUAKE_CUTOFF_FROM_CLOSE_MIN", "QUAKE_SIZE_MULT",
 )
 
 
@@ -6272,11 +6271,16 @@ def gb_gate_reason(ticker: str, now_ts: float,
 # multipliers, both pad sites and the two-sided depth test), and the reward
 # estimate prices the same capped, bid-only ladder. Cutoff = close -
 # QUAKE_CUTOFF_FROM_CLOSE_MIN (the close-anchored rule: the DDMMMYY ticker
-# date would parse YY-first). Rung QUAKE_RUNG (100) and per-market cap
-# QUAKE_MAX_POSITION (150, the book-wide launcher cap) are hand-tuned -- the
-# modelled $40-48/day was at 100 contracts per strike -- and the per-event
-# net cap (IMM_MAX_EVENT) still binds across the ten strikes. Kill switch IMM_QUAKE_ENABLE=0 takes the series out
-# of the allowlist entirely (never quoted without the gate).
+# date would parse YY-first).
+# SIZE (Jack 2026-09-27: "3x size KXTRUMPAPPROVE already uses (60)"): the
+# family size_mult wire at QUAKE_SIZE_MULT = 3 -- applied_mention_mult scales
+# the rungs, the per-market and per-event caps and the skew knees together,
+# and the estimator's hypothetical ladder. With the launcher geometry (20-lot
+# rung, 150 / 1,000 caps): 60 on a weekday, 90 on a Saturday, 120 in the
+# quiet 0-9 ET hours; caps 450 per strike / 3,000 net per event -- the worst
+# quiet day is up to 3,000 YES contracts bought and no quake at the strikes.
+# Kill switch IMM_QUAKE_ENABLE=0 takes the series out of the allowlist
+# entirely (never quoted without the gate).
 QUAKE_ENABLE = _QUAKE_LIVE
 QUAKE_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_QUAKE_SERIES", "KXBIGGESTQUAKE").split(",") if s.strip())
@@ -6284,8 +6288,7 @@ QUAKE_MARGIN_CENTS = _env_float("IMM_QUAKE_MARGIN_CENTS", 1.0)
 QUAKE_USGS_POLL_SECS = _env_float("IMM_QUAKE_USGS_POLL_SECS", 15)
 QUAKE_GFZ_POLL_SECS = _env_float("IMM_QUAKE_GFZ_POLL_SECS", 20)
 QUAKE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN", 10)
-QUAKE_RUNG = _env_int("IMM_QUAKE_RUNG", 100)
-QUAKE_MAX_POSITION = _env_float("IMM_QUAKE_MAX_POSITION", 150)
+QUAKE_SIZE_MULT = _env_float("IMM_QUAKE_SIZE_MULT", 3.0)
 QUAKE_STATUS_FILE = os.environ.get(
     "IMM_QUAKE_STATUS_FILE", os.path.join(STATUS_DIR, "usgs_quake_state.json"))
 # the QuakeWatch the refresher thread owns; None = no feed (gate closed)
@@ -6296,7 +6299,7 @@ for _s in QUAKE_SERIES:
     SERIES_OVERRIDES[_s] = replace(
         SERIES_OVERRIDES.get(_s) or SeriesOverride(),
         cutoff_from_close_min=QUAKE_CUTOFF_FROM_CLOSE_MIN,
-        levels=[(0, QUAKE_RUNG)], max_position=QUAKE_MAX_POSITION)
+        size_mult=QUAKE_SIZE_MULT)
 
 
 def series_bid_only(series: str) -> bool:
@@ -14013,8 +14016,8 @@ class IncentiveMarketMaker:
             log("gb-fair gate: OFF -- AAA state dailies stay pattern-blocked")
         if QUAKE_ENABLE:
             log(f"quake gate: {','.join(sorted(QUAKE_SERIES))} BID-ONLY "
-                f"fail-closed, bids <= fair - {QUAKE_MARGIN_CENTS:g}c, rung "
-                f"{QUAKE_RUNG} / cap {QUAKE_MAX_POSITION:g}, USGS every "
+                f"fail-closed, bids <= fair - {QUAKE_MARGIN_CENTS:g}c, size "
+                f"x{QUAKE_SIZE_MULT:g} (the family wire), USGS every "
                 f"{QUAKE_USGS_POLL_SECS:g}s + GFZ every {QUAKE_GFZ_POLL_SECS:g}s, "
                 f"hold on a new quake until NEIC confirms, cutoff close-"
                 f"{QUAKE_CUTOFF_FROM_CLOSE_MIN}m, status {QUAKE_STATUS_FILE}")

@@ -4136,27 +4136,35 @@ Guard-skip rows "quake" (stand) and "quake_hold"; log lines "quake
 stand-aside / hold / resume <t>: why" once per transition and "quake
 detection: <src> M<x> <id>" once per new detection.
 
-SIZE + CUTOFF. SeriesOverride: levels [(0, IMM_QUAKE_RUNG=100)] and
-max_position IMM_QUAKE_MAX_POSITION=150 (hand-tuned, so the launcher's 0:20
-ladder does not apply; the study's $40-48/day was at 100 contracts per
-strike), cutoff_from_close_min 10 -- the close-anchored rule, because
-parse_event_date would read 27SEP26 as 2027-09-26 and 05OCT26 as 2005. The
-per-event net cap (IMM_MAX_EVENT=1000) binds across the ten strikes: the
-worst day is ~1,000 YES contracts bought and no M5.2+ before the close.
+SIZE + CUTOFF. Jack: "3x size KXTRUMPAPPROVE already uses (60)" -- the
+family size_mult wire, SeriesOverride size_mult IMM_QUAKE_SIZE_MULT=3
+(rungs, per-market and per-event caps and the skew knees together, and the
+estimator's ladder). With the launcher geometry (20-lot rung, 150 / 1,000
+caps): 60 on a weekday, 90 on a Saturday, 120 in the quiet 0-9 ET hours;
+caps 450 per strike / 3,000 net per event -- the worst quiet day is up to
+3,000 YES contracts bought and no quake at the strikes. (A first cut used a
+hand-tuned 100-lot rung with the 150 / 1,000 caps; at the plain 20-lot size
+the dry check estimated ~$5.70/day with only 4 of 8 quotable strikes over
+the $1 payout floor.) cutoff_from_close_min 10 -- the close-anchored rule,
+because parse_event_date would read 27SEP26 as 2027-09-26 and 05OCT26 as
+2005.
 
 KILL SWITCHES. IMM_QUAKE_ENABLE=0 takes KXBIGGESTQUAKE out of the
 allowlist entirely (it is never quoted without the gate);
 IMM_ALLOW_QUAKE_SERIES="" does the same. Knobs: IMM_QUAKE_MARGIN_CENTS (1),
-IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN (10), IMM_QUAKE_RUNG, IMM_QUAKE_MAX_POSITION,
-the poll intervals, and the module's IMM_QUAKE_* (lags, freeze magnitude,
-confirm seconds, NEIC wait, freeze cap, staleness, news age).
+IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN (10), IMM_QUAKE_SIZE_MULT (3; 1.0 = the
+plain book size), the poll intervals, and the module's IMM_QUAKE_* (lags,
+freeze magnitude, confirm seconds, NEIC wait, freeze cap, staleness, news
+age).
 
-DRY CHECK 9/27 ~17:30Z (production env, live books, the bot's estimator):
-5.2 book 51x59 fair 50.3 -> bid 49 est $3.89/day; 5.4 34x42 -> 33 $6.42;
-5.6 21x27 -> 21 $3.46; 5.8 -> 14 $2.33; 6.0 9x12 -> 9 $3.70; 6.2 -> 5 $1.69;
-6.4 and 6.6 bid behind the reference ($0); 6.8 / 7.0 stood aside (fair
-under 2c). ~$21/day on that book with 6.5 h left -- the low end of the
-study's $40-48/day.
+DRY CHECK 9/27 16:44Z (production env, live books, the bot's estimator,
+~7.25 h left in the day), at the x3 size: 5.2 book 56x58 fair 49.5 -> bid
+48 x165 est $4.71/day; 5.4 32x40 -> 32 x60 $2.31; 5.6 20x26 -> 20 $2.35;
+5.8 14x16 -> 14 $3.02; 6.0 9x11 -> 8 $1.15; 6.2 6x7 -> 5 $1.09 (both just
+over the $1 per-period floor); 6.4 and 6.6 bid behind the reference ($0);
+6.8 / 7.0 stood aside (fair under 2c). ~$14.60/day on that book. Same books
+minutes earlier: ~$21/day at a 100-lot rung, ~$5.70/day at the plain
+20-lot size. The study's $40-48/day was at 100 lots on different books.
 
 WHAT THIS DOES NOT FIX. The reward share is modelled (two snapshots in the
 study, one dry check here); 25 days of study data with no M6.8+ quake; the

@@ -13930,8 +13930,16 @@ class TestQuakeBidOnlyGate(unittest.TestCase):
         self.assertIn("KXBIGGESTQUAKE", imm.ALLOW_SERIES)
         ov = imm.SERIES_OVERRIDES["KXBIGGESTQUAKE"]
         self.assertEqual(ov.cutoff_from_close_min, imm.QUAKE_CUTOFF_FROM_CLOSE_MIN)
-        self.assertEqual(ov.levels, [(0, imm.QUAKE_RUNG)])
-        self.assertEqual(ov.max_position, imm.QUAKE_MAX_POSITION)
+        # the KXTRUMPAPPROVE x3 wire: rungs AND caps scale (no hand-tuned
+        # ladder, which would switch the family multiplier off)
+        self.assertEqual(ov.size_mult, imm.QUAKE_SIZE_MULT)
+        self.assertIsNone(ov.levels)
+        self.assertIsNone(ov.max_position)
+        self.assertEqual(imm.applied_mention_mult("KXBIGGESTQUAKE"), imm.QUAKE_SIZE_MULT)
+        self.assertEqual(imm.series_max_position("KXBIGGESTQUAKE"),
+                         imm.MAX_POSITION_CONTRACTS * imm.QUAKE_SIZE_MULT)
+        self.assertEqual(imm.event_cap_contracts(self.EV),
+                         imm.MAX_EVENT_CONTRACTS * imm.QUAKE_SIZE_MULT)
         self.assertTrue(imm.series_bid_only("KXBIGGESTQUAKE"))
         self.assertFalse(imm.series_bid_only("KXBIGGESTQUAKEH"))
         with mock.patch.object(imm, "QUAKE_ENABLE", False):
@@ -13998,7 +14006,10 @@ class TestQuakeBidOnlyGate(unittest.TestCase):
     def test_quotes_a_bid_capped_at_fair_and_no_ask(self):
         bot = self._bot()
         bot.run_cycle()
-        self.assertEqual(self._quotes(bot), [("bid", 27)])       # touch 28, cap 27
+        q = self._quotes(bot)
+        self.assertTrue(q)
+        self.assertEqual({side for side, _px in q}, {"bid"})     # no asks, no ask pad
+        self.assertEqual(max(px for _s, px in q), 27)            # touch 28, cap 27
         self.assertNotIn(self.T, bot._quake_stood)
 
     def test_no_feed_quotes_nothing(self):
@@ -14011,7 +14022,9 @@ class TestQuakeBidOnlyGate(unittest.TestCase):
         bot = self._bot()
         bot.run_cycle()
         before = self._orders(bot)
-        self.assertEqual([(s, p) for _o, s, p in before], [("bid", 27)])
+        self.assertTrue(before)
+        self.assertEqual({s for _o, s, _p in before}, {"bid"})
+        self.assertEqual(max(p for _o, _s, p in before), 27)
         now = time.time()
         self.watch.update_gfz([{"id": "g1", "mag": 5.9, "mag_type": "mb",
                                 "time": now - 60, "place": "x"}], now)
