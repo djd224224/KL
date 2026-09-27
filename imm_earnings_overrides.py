@@ -74,13 +74,48 @@ MONTHS = {m: i + 1 for i, m in enumerate(
 TIME_RE = re.compile(
     r"(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\s*"
     r"(?:eastern\b|edt\b|est\b|et\b)", re.I)
+# Group 3 is a year printed right after the date ("January 28, 2027"), when the
+# page states one. Groups 1-2 are unchanged.
 DATE_RE = re.compile(
     r"(january|february|march|april|may|june|july|august|september|october|"
-    r"november|december)\s+(\d{1,2})", re.I)
+    r"november|december)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(20\d\d))?", re.I)
 KEYWORD_RE = re.compile(r"conference call|webcast|earnings call", re.I)
 
 
-def parse_call_time(page_text: str, year: int = 2026):
+def _year_for(month, day, stated=None, year=None, ref=None):
+    """Year for a 'Month DD' read off an IR / press page.
+
+    Order of evidence: a year printed next to the date on the page, then an
+    explicit caller year, then the year that puts Month DD CLOSEST to `ref` --
+    the event's own date (its ticker date or Kalshi occurrence), else now.
+
+    This replaces a hardcoded default of 2026. From ~mid-December 2026 that
+    default stamped every IR-resolved January call a year EARLY; the override
+    file is write-once for resolved entries, so the event would then have been
+    stood down for its whole life. Taking the year from the wall clock instead
+    would fail the other way across the Dec/Jan boundary."""
+    if stated:
+        return int(stated)
+    if year is not None:
+        return int(year)
+    if ref is None:
+        ref = datetime.now(timezone.utc)
+    if not isinstance(ref, datetime):            # a plain date
+        ref = datetime(ref.year, ref.month, ref.day)
+    if ref.tzinfo is not None:
+        ref = ref.astimezone(ET).replace(tzinfo=None)
+    best = None
+    for y in (ref.year - 1, ref.year, ref.year + 1):
+        try:
+            gap = abs((datetime(y, month, day) - ref).total_seconds())
+        except ValueError:                        # Feb 29 in a non-leap year
+            continue
+        if best is None or gap < best[0]:
+            best = (gap, y)
+    return best[1] if best else ref.year
+
+
+def parse_call_time(page_text: str, year=None, ref=None):
     """Best-effort (datetime_ET, evidence) from an IR/press page; None if the
     page doesn't contain BOTH a keyword-adjacent ET time and a nearby date."""
     text = re.sub(r"\s+", " ", page_text)
@@ -99,7 +134,8 @@ def parse_call_time(page_text: str, year: int = 2026):
         month = MONTHS[dm.group(1).lower()]
         day = int(dm.group(2))
         try:
-            dt_et = ET.localize(datetime(year, month, day, hour, minute))
+            dt_et = ET.localize(datetime(_year_for(month, day, dm.group(3), year, ref),
+                                         month, day, hour, minute))
         except ValueError:
             continue
         evidence = window[max(0, tm.start() - 60):tm.end() + 60].strip()
@@ -226,7 +262,7 @@ def nasdaq_release_datetime(ticker: str, now, days: int):
     return None
 
 
-def parse_release_time(page_text: str, year: int = 2026):
+def parse_release_time(page_text: str, year=None, ref=None):
     """(datetime_ET, label, evidence) for the earnings RELEASE, or None. A
     report+results context with a date, plus after-close (->4pm ET) /
     before-open (->7am ET) / a stated ET time not next to 'call'/'webcast'."""
@@ -259,7 +295,8 @@ def parse_release_time(page_text: str, year: int = 2026):
         else:
             continue
         try:
-            dt_et = ET.localize(datetime(year, month, day, hour, minute))
+            dt_et = ET.localize(datetime(_year_for(month, day, dm.group(3), year, ref),
+                                         month, day, hour, minute))
         except ValueError:
             continue
         span = amc or bmo or tm
@@ -938,7 +975,10 @@ def main(argv=None) -> int:
     rel_resolved, rel_unresolved = [], []
     for ev, occ_iso in disclosure:
         occ = parse_iso_utc(occ_iso or "")
-        yr = occ.year if occ else now.year
+        # Anchor for a year-less page date. Was `occ.year if occ else now.year`,
+        # which lands a year LATE when the page date and the anchor fall either
+        # side of Dec/Jan (a Dec 30 report read against a Jan occurrence).
+        release_ref = occ or parse_event_date(ev) or now
         found = None
         # (a) precise IR/press page, if Kalshi's settlement source is a real one
         for url in source_urls(client, ev):
@@ -947,7 +987,7 @@ def main(argv=None) -> int:
             except Exception as e:
                 log(f"! fetch failed {url}: {e}")
                 continue
-            hit = parse_release_time(page, year=yr)
+            hit = parse_release_time(page, ref=release_ref)
             if hit:
                 found = (url, *hit)
                 break
@@ -1044,7 +1084,7 @@ def main(argv=None) -> int:
             except Exception as e:
                 log(f"! fetch failed {url}: {e}")
                 continue
-            hit = parse_call_time(page)
+            hit = parse_call_time(page, ref=parse_event_date(ev) or now)
             if hit:
                 found = (url, *hit)
                 break

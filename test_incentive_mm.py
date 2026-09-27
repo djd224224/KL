@@ -4219,6 +4219,63 @@ class TestReleaseTimeParse(unittest.TestCase):
             "Shares closed after the market close up 3% on Tuesday."))
 
 
+class TestEarningsYearAcrossYearBoundary(unittest.TestCase):
+    """Year for a year-less 'Month DD' on an IR page. Both parsers defaulted to
+    a literal 2026: from ~mid-December 2026 an IR-resolved January call would
+    have been stamped a year EARLY, and resolved overrides are write-once, so
+    the event stays stood down for its whole life. The release path took the
+    year from the occurrence/wall clock, which lands a year LATE across Dec/Jan."""
+
+    CALL = ("The company will hold its quarterly conference call on Thursday, "
+            "January 28, at 8:30 a.m. ET to discuss fourth-quarter results.")
+
+    @staticmethod
+    def _ieo():
+        import imm_earnings_overrides as ieo
+        return ieo
+
+    def test_january_call_read_in_january_is_next_year(self):
+        hit = self._ieo().parse_call_time(
+            self.CALL, ref=datetime(2027, 1, 28, tzinfo=timezone.utc))
+        self.assertEqual(hit[0].year, 2027)
+
+    def test_january_call_read_in_december_is_next_year(self):
+        # the scenario that broke: a mid-December run resolving a Jan call
+        hit = self._ieo().parse_call_time(
+            self.CALL, ref=datetime(2026, 12, 20, tzinfo=timezone.utc))
+        self.assertEqual((hit[0].year, hit[0].month, hit[0].day), (2027, 1, 28))
+
+    def test_december_release_read_in_january_is_previous_year(self):
+        hit = self._ieo().parse_release_time(
+            "Acme will report fourth-quarter financial results on December 30 "
+            "after the market close.",
+            ref=datetime(2027, 1, 5, tzinfo=timezone.utc))
+        self.assertEqual((hit[0].year, hit[0].month, hit[0].day), (2026, 12, 30))
+
+    def test_year_printed_on_page_wins(self):
+        hit = self._ieo().parse_call_time(
+            "Earnings conference call on January 28, 2027 at 8:30 a.m. ET.",
+            ref=datetime(2026, 6, 1, tzinfo=timezone.utc))
+        self.assertEqual(hit[0].year, 2027)
+
+    def test_explicit_year_argument_still_honoured(self):
+        # backward compatible with the positional-year call in TestReleaseTimeParse
+        hit = self._ieo().parse_release_time(
+            "Acme will report quarterly financial results on March 3 after "
+            "the market close.", 2031)
+        self.assertEqual(hit[0].year, 2031)
+
+    def test_no_literal_2026_default_remains(self):
+        self.assertEqual(
+            self._ieo()._year_for(1, 12, ref=datetime(2030, 1, 10)), 2030)
+        self.assertEqual(
+            self._ieo()._year_for(12, 31, ref=datetime(2030, 1, 2)), 2029)
+
+    def test_feb_29_picks_a_leap_year_or_falls_back(self):
+        y = self._ieo()._year_for(2, 29, ref=datetime(2027, 3, 1))
+        self.assertEqual(y, 2028)
+
+
 class TestNasdaqRelease(unittest.TestCase):
     """Nasdaq-calendar release resolver: after-hours->4pm ET, pre-market->7am,
     scanning forward from now (robust to Kalshi's wrong occurrence)."""

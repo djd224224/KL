@@ -81,7 +81,10 @@ except Exception as _e:
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
 
-TICKER_RE = re.compile(r"^KXHIGH([A-Z]+)-26([A-Z]+)(\d+)-([BT])(\d+\.?\d*)$")
+# The two-digit year is a capture group, not a literal: Kalshi tickers carry the
+# year of the TARGET date, and a hardcoded "26" matched nothing from 2027 on.
+# Month/day groups are deliberately as permissive as before; only the year moved.
+TICKER_RE = re.compile(r"^KXHIGH([A-Z]+)-(\d{2})([A-Z]+)(\d+)-([BT])(\d+\.?\d*)$")
 
 
 def _load_private_key():
@@ -107,14 +110,15 @@ def _parse_ticker(ticker: str) -> Optional[Dict[str, Any]]:
     m = TICKER_RE.match(ticker)
     if not m:
         return None
-    abv, mon, dd, btype, bval = m.group(1), m.group(2), int(m.group(3)), m.group(4), float(m.group(5))
+    abv, yy, mon, dd, btype, bval = (m.group(1), m.group(2), m.group(3),
+                                     int(m.group(4)), m.group(5), float(m.group(6)))
     try:
-        ed = datetime.strptime(f"26{mon}{dd:02d}", "%y%b%d").date()
+        ed = datetime.strptime(f"{yy}{mon}{dd:02d}", "%y%b%d").date()
     except ValueError:
         return None
     return {
         "city_abv": abv,
-        "event_ticker": f"KXHIGH{abv}-26{mon}{dd:02d}",
+        "event_ticker": f"KXHIGH{abv}-{yy}{mon}{dd:02d}",
         "event_date": ed,
         "bucket_type": btype,
         "bucket_val": bval,
@@ -163,10 +167,12 @@ def list_open_kxhigh_markets(client: ExchangeClient) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen_tickers = set()
     for d in candidate_dates:
-        date_code = d.strftime("%y%b%d").upper().lstrip("0")
-        # event ticker format: KXHIGHCHI-26APR25 (no leading zero on day for some cities,
-        # but actually let's match the on-the-wire format used by the trading script)
-        date_code = "26" + d.strftime("%b").upper() + d.strftime("%d")
+        # Event ticker format KXHIGHCHI-26APR25: two-digit year + month + zero-padded
+        # day, where the year is that of the TARGET date d -- never the wall clock,
+        # never a literal. The Dec 31 poll lists Jan 1 markets, which Kalshi tickers
+        # as 27JAN01; the old literal "26" built 26JAN01 and logged nothing from
+        # ~2026-12-31 14:00 UTC onward. Same on-the-wire string as before otherwise.
+        date_code = d.strftime("%y%b%d").upper()
         for prefix in CITY_EVENT_PREFIXES:
             ev_ticker = f"{prefix}-{date_code}"
             try:

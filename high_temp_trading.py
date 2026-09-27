@@ -974,30 +974,36 @@ central_time = datetime.now(pytz.timezone('US/Central'))
 variable = 1 if central_time.hour >= 14 else 0
 
 day = central_time + timedelta(days=variable) #pulling tomorrow or today in central time
+# Two-digit year of the TARGET date, taken before `day` is rebound to a string
+# below. Kalshi tickers carry the target date's year: the Dec 31 evening run
+# trades Jan 1 as ...-27JAN01. The old literal '26' built -26JAN01, which
+# returns 404 for most cities; get_event below does not catch it, so that run
+# -- and every run after -- would abort with zero orders.
+yy = day.strftime("%y")
 month = day.strftime("%b").upper()
 day = day.strftime("%d")
 # print(day)
 
-event_ticker1 = ['KXHIGHCHI-26' + month + day, 'Chicago', 56, 1.7]
-event_ticker2 = ['KXHIGHNY-26' + month + day, 'New York City', 46, 1.5]
-event_ticker3 = ['KXHIGHDEN-26' + month + day, 'Denver', 57, 2.4]
-event_ticker4 = ['KXHIGHPHIL-26' + month + day, 'Philadelphia', 52, 1.6]
-event_ticker5 = ['KXHIGHAUS-26' + month + day, 'Austin', 63, 1.7]
-event_ticker6 = ['KXHIGHMIA-26' + month + day, 'Miami', 43, 1.1]
-event_ticker7 = ['KXHIGHTHOU-26' + month + day, 'Houston', 59, 2.0]
-event_ticker8 = ['KXHIGHLAX-26' + month + day, 'Los Angeles', 58, 2.0]
-event_ticker9 = ['KXHIGHTATL-26' + month + day, 'Atlanta', 55, 1.5]
-event_ticker10 = ['KXHIGHTDC-26' + month + day, 'Washington DC', 50, 1.5]
-event_ticker11 = ['KXHIGHTPHX-26' + month + day, 'Phoenix', 55, 1.5]
-event_ticker12 = ['KXHIGHTDAL-26' + month + day, 'Dallas', 55, 1.5]
-event_ticker13 = ['KXHIGHTLV-26' + month + day, 'Las Vegas', 55, 1.5]
-event_ticker14 = ['KXHIGHTOKC-26' + month + day, 'Oklahoma City', 55, 1.5]
-event_ticker15 = ['KXHIGHTSEA-26' + month + day, 'Seattle', 50, 1.5]
-event_ticker16 = ['KXHIGHTSFO-26' + month + day, 'San Francisco', 50, 1.5]
-event_ticker17 = ['KXHIGHTSATX-26' + month + day, 'San Antonio', 55, 1.5]
-event_ticker18 = ['KXHIGHTMIN-26' + month + day, 'Minneapolis', 55, 1.5]
-event_ticker19 = ['KXHIGHTNOLA-26' + month + day, 'New Orleans', 55, 1.5]
-event_ticker20 = ['KXHIGHTBOS-26' + month + day, 'Boston', 50, 1.5]
+event_ticker1 = ['KXHIGHCHI-' + yy + month + day, 'Chicago', 56, 1.7]
+event_ticker2 = ['KXHIGHNY-' + yy + month + day, 'New York City', 46, 1.5]
+event_ticker3 = ['KXHIGHDEN-' + yy + month + day, 'Denver', 57, 2.4]
+event_ticker4 = ['KXHIGHPHIL-' + yy + month + day, 'Philadelphia', 52, 1.6]
+event_ticker5 = ['KXHIGHAUS-' + yy + month + day, 'Austin', 63, 1.7]
+event_ticker6 = ['KXHIGHMIA-' + yy + month + day, 'Miami', 43, 1.1]
+event_ticker7 = ['KXHIGHTHOU-' + yy + month + day, 'Houston', 59, 2.0]
+event_ticker8 = ['KXHIGHLAX-' + yy + month + day, 'Los Angeles', 58, 2.0]
+event_ticker9 = ['KXHIGHTATL-' + yy + month + day, 'Atlanta', 55, 1.5]
+event_ticker10 = ['KXHIGHTDC-' + yy + month + day, 'Washington DC', 50, 1.5]
+event_ticker11 = ['KXHIGHTPHX-' + yy + month + day, 'Phoenix', 55, 1.5]
+event_ticker12 = ['KXHIGHTDAL-' + yy + month + day, 'Dallas', 55, 1.5]
+event_ticker13 = ['KXHIGHTLV-' + yy + month + day, 'Las Vegas', 55, 1.5]
+event_ticker14 = ['KXHIGHTOKC-' + yy + month + day, 'Oklahoma City', 55, 1.5]
+event_ticker15 = ['KXHIGHTSEA-' + yy + month + day, 'Seattle', 50, 1.5]
+event_ticker16 = ['KXHIGHTSFO-' + yy + month + day, 'San Francisco', 50, 1.5]
+event_ticker17 = ['KXHIGHTSATX-' + yy + month + day, 'San Antonio', 55, 1.5]
+event_ticker18 = ['KXHIGHTMIN-' + yy + month + day, 'Minneapolis', 55, 1.5]
+event_ticker19 = ['KXHIGHTNOLA-' + yy + month + day, 'New Orleans', 55, 1.5]
+event_ticker20 = ['KXHIGHTBOS-' + yy + month + day, 'Boston', 50, 1.5]
 
 ############ PULL MARKETS
 all_event_tickers = [event_ticker1, event_ticker2, event_ticker3, event_ticker4, event_ticker5, event_ticker6, event_ticker7, event_ticker8, event_ticker9, event_ticker10, event_ticker11, event_ticker12, event_ticker13, event_ticker14, event_ticker15, event_ticker16, event_ticker17, event_ticker18, event_ticker19, event_ticker20]

@@ -816,14 +816,20 @@ def run_monitoring(upload_to_bq=True):
             if _cli_path not in sys.path:
                 sys.path.insert(0, _cli_path)
             import fetch_cli as _cli  # noqa: WPS433
-            _cli_year = datetime.now(UTC).year
+            from datetime import timedelta as _td
+            _now_utc = datetime.now(UTC)
             _cli.ensure_table(bq_client)
-            _cli_df = _cli.backfill_iem(_cli_year)
-            if not _cli_df.empty:
-                _cli.upsert(bq_client, _cli_df)
-                print(f"  ✓ Upserted {len(_cli_df)} CLI rows for {_cli_year}")
-            else:
-                print("  (no CLI rows returned — check IEM API availability)")
+            # Years of the TARGET days, not just the wall clock. With the
+            # wall-clock year alone, the Jan 1 run fetched only the new year
+            # and Dec 31's final CLI row was never loaded. During Jan 1-7 this
+            # fetches both years; upsert is a MERGE, so the overlap is safe.
+            for _cli_year in sorted({(_now_utc - _td(days=7)).year, _now_utc.year}):
+                _cli_df = _cli.backfill_iem(_cli_year)
+                if not _cli_df.empty:
+                    _cli.upsert(bq_client, _cli_df)
+                    print(f"  ✓ Upserted {len(_cli_df)} CLI rows for {_cli_year}")
+                else:
+                    print(f"  (no CLI rows returned for {_cli_year} — check IEM API availability)")
         except Exception as _cli_e:
             # Non-fatal: monitoring should succeed even if CLI fetch fails
             print(f"  ⚠ CLI fetch failed (non-fatal): {_cli_e}")
