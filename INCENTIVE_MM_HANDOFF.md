@@ -3880,3 +3880,129 @@ and stale stand aside, gate-off plain quoting) and test_openrouter_fair.py
 fallback, flat / complete / thin-history / growth model cases, file +
 vintage writes, no-key, key sources incl. a Notepad BOM, Bearer fetch).
 840 green.
+
+## 2026-09-27 — GasBuddy state-gas gate: the AAA state dailies are back, quoted only against GasBuddy's live state averages (Jack)
+
+Jack: "i received permission to use fuelinsights.gasbuddy.com. use that".
+
+WHY THIS FAMILY. The AAA state dailies (KXAAAGASD<ST>, 26 states, 17 strikes
+$0.005 apart, ~$100 per strike-period, ~$44k/day posted) were pattern-blocked
+2026-09-14: Sep 6-11 they ran -$39.64/day net, fills -10c/ct, because
+anything that trades against our rung inside a 45c spread is informed -- the
+informed flow reads intraday station prices (OPIS is AAA's supplier;
+GasBuddy the crowd feed). The 9/27 replay showed a fair from the morning AAA
+print + momentum could not separate those fills. GasBuddy's Fuel Insights
+site (Jack has GasBuddy's permission) publishes exactly the missing input:
+  - Live Ticking Average per state = average of the last price received at
+    each station over the past 24h, refreshed every 5 minutes (observed
+    10:45 -> 10:50 ET);
+  - Full Day Average = average of each station's LAST price on the day,
+    published 03:00 ET the next morning -- the same hour AAA posts. The
+    "1 Day Ago" figure and the charts are these.
+
+TIMING. Event D trades 08:00-23:59 ET on D-1 (open 12:00Z, close 03:59Z),
+AAA posts D ~03:20 ET, Kalshi settles the state events ~07:06 ET (the
+national ~09:10). So the previous event's settled value is the anchor, known
+before the next event opens -- no AAA scraping.
+
+MEASURED (Kalshi expiration_value, 26 states, Aug 24 - Sep 26, against
+GasBuddy's daily chart): AAA(D) tracks GasBuddy's day D-1 -- correlation of
+daily changes 0.94 (day D 0.68, D-2 0.42); AAA(D) - AAA(D-1) = 0.30c + 0.81 x
+(GB(D-1) - GB(D-2)), residual 0.95c vs 3.34c for AAA carried forward (333
+state-days). WEEKDAY structure (print weekday, residual; leave-one-date-out):
+Mon b1 0.09 on Sunday's move + b2 0.47 on SATURDAY's, 0.41c (the Monday
+print is Saturday's prices; the Sunday dip in GasBuddy never reaches AAA);
+Thu 0.88 / 1.05c; Fri 0.80 / 0.83c; Sat 0.99 / 0.77c; Sun 0.63 / 0.30c;
+Tue and Wed UNMEASURED (GasBuddy's chart has no Monday values). National
+check (Mar-Sep): Mon beta 0.15, Thu-Sat ~0.8 -- same shape. Per-state bias
+and residual scale shrunk to the pool (K=8): FL 1.70x, WA 1.40x, CA 1.26x,
+NY 0.57x, TX 0.61x. Tails are fat: |z|>3 in 2.4% of state-days (normal 0.3%).
+
+REPLAY (the 397 September state-daily fills, 7,832 ct, as-filled prices vs
+the fair band; this measures separation, not the intraday feed): with
+GasBuddy's END-OF-DAY value known at fill time, TOL 0 lets 2,607 ct through
+at +0.3c/ct and blocks 3,182 at -15.2 (sigma x0.75: +4.9c/ct on 2,009 ct);
+with the day's move assumed to show up LINEARLY through the day, what gets
+through still loses -3 to -5c/ct. A wider tolerance only let losing fills
+back in at every setting -> TOL 0. Unit economics at the Sep 6-11 measure
+(credit ~$2.44 per market-period, 42 ct/market-day): positive in both bounds
+IF rewards hold (MODELLED ~+$30/day linear to ~+$150/day end-of-day at 26
+states x 3 strikes) -- the intraday curve decides which.
+
+MODEL (gasbuddy_fair.py, new). While event D trades (ET day T = D-1):
+  mu    = AAA(T) + alpha_w + alpha_s + b1_w x (live_T - GB(T-1))
+                                     + b2_w x (GB(T-1) - GB(T-2))
+  sigma = sqrt((e_w x scale_s)^2 + (b1_w x remain(t))^2)
+remain(t) = sd of (Full Day Average - live at t): NOT MEASURED YET, default
+linear from the trading weekday's sd of GasBuddy's daily move at midnight to
+0 at 24:00 (Wednesday 5.3c: the Midwest price-cycle day). Reads per refresh
+(IMM_GB_FAIR_REFRESH_SECS 300): GasBuddy HeatMap/GetMapData (every state's
+live average, one call) + the national LiveAvg (update time + dates); once a
+day per state: Kalshi's settled anchor (public markets endpoint, from 07:00
+ET, 0.3s apart) and the state's 1 Day Ago average; Sundays also GB(Fri) from
+the chart. States without a Kalshi event are re-asked every 6h (24 today).
+No entry (-> the gate stands aside) without: today's anchor, a live update
+younger than 30 min dated today, yesterday's average (GasBuddy's, else our
+own last live read of yesterday, kept as "closes"), or on a Monday (the
+Tuesday print is skipped: IMM_GB_SKIP_PRINT_WEEKDAYS=1). Writes
+run-logs/incentive-mm/gasbuddy_fair.json per EVENT and, every ~15 minutes,
+every state's live average to gasbuddy_live.jsonl -- the data remain(t) gets
+calibrated from.
+
+UNBLOCK. SERIES_BLOCK_PATTERNS' first entry is now
+_series_block_default(): "KXAAAGASD[A-Z][A-Z][A-Z]+" while the gate is on
+(the two-letter STATES come back; any longer suffix stays blocked) and the
+9/14 "KXAAAGASD[A-Z]+" when IMM_GB_FAIR_ENABLE=0. The states are normal-book
+members through the KXAAAGASD allow prefix and keep the national's guards
+(safe-join, the $2/day rate floor, KXAAAGAS:3 per event, the 4pm-1am ET
+halving, the day-dated midnight cutoff). The national KXAAAGASD, W and M
+are untouched.
+
+GATE (the OpenRouter gate's shape, fail CLOSED). A state market stands aside
+on BOTH sides while its event has no fresh read (older than
+IMM_GB_FAIR_TTL_MIN 20), its sigma exceeds IMM_GB_FAIR_MAX_SIGMA_CENTS
+(2.0 -- too early in the day to call; Wednesdays until mid-afternoon on the
+linear default), or its external touch fights the fair band (P at sigma and
+at sigma x 0.5) on the adverse side by more than IMM_GB_FAIR_TOL_CENTS (0).
+SELECTION: _screen returns "gb_no_read" / "gb_fair" (both sticky deaths) for
+a state market with no read or a listed touch the gate rejects, so the 3
+event slots go to strikes that can quote and a Monday or an outage frees
+them (IMM_MAX_MARKETS 200). Logs "gb-fair stand-aside <t>: <why>" /
+"gb-fair resume <t>", "gb-fair refresh: N events with a read", guard
+"gb_fair" in guard_skips_*.jsonl (the sweep test now counts 26 continues),
+startup "gb-fair gate: ...".
+
+DRY RUN 9/27 ~15:25Z (Monday events): 26 of 26 states with a read, sigma
+0.24-0.70c (a Sunday: only Saturday's known move matters); against the live
+books 110 of 442 strikes quotable, 332 stood aside -- mostly sure strikes
+whose touch sits on the wrong side (OR 5.07 at 2x87 with the fair at 100).
+
+KILL SWITCH: IMM_GB_FAIR_ENABLE=0 -> gate off AND the state dailies
+pattern-blocked again (the 9/14 state). Positions ride either way.
+
+WHAT THIS DOES NOT FIX / WATCH:
+- remain(t) is a guess until measured. The collector (session scratchpad
+  gb_live.jsonl, 5-min, all states, to 10/4) and gasbuddy_live.jsonl give
+  Full Day Average minus live by ET hour; recalibrate DAY_MOVE_SD / the
+  curve and re-run the September replay with it before judging the gate.
+- GasBuddy is not OPIS: the 0.95c residual is the informed flow's remaining
+  edge on near-money strikes (end-of-day replay: fills within 5c of fair
+  -7.2c/ct). TOL 0 + the 0.5-sigma band is the only defence there.
+- Fat tails: a "sure" strike is ~98%, not 99.9%. sigma is plain normal.
+- The Tuesday print (Monday trading) is skipped and the Wednesday print uses
+  the pooled fit with a 1.2c residual -- both unmeasured.
+- Settled state P&L: check fills_*.jsonl for KXAAAGASD<ST> daily (markout
+  to the settled value) for the first week; the 9/14 block reason was fill
+  cost, so that is the number that decides.
+
+Tests: TestGasBuddyFairGate (family shape + both kill-switch pattern sets,
+fail-closed / stale / vague / band reasons, strict tolerance, loader drops
+bad rows, no read = no slot, a disagreeing member freed at the refresh, a
+rejected fresh strike takes no slot, stale read, gate-off plain quoting),
+test_gasbuddy_fair.py (19: ticker dates, ET clock, remain curve, weekday
+math incl. the Monday b2 path, once-a-day anchors / absents / 6h re-ask,
+before-07:00, stale / wrong-day live, close fallback, Monday skip, Sunday
+history, pending / failing anchors, 15-min live log, fetch parsing); the
+four 9/14 pattern tests now assert the kill-switch form. 798 green
+(test_incentive_mm, test_gasbuddy_fair, test_carbon_arc_fair,
+test_openrouter_fair, test_send_imm_new_programs).

@@ -69,6 +69,9 @@ def setUpModule():
     # the OpenRouter token-usage fair file (2026-09-27), same reason
     imm.OR_FAIR_FILE = os.path.join(tmp, "openrouter_fair.json")
     imm._or_fair_state.update(mtime=0.0, entries={}, moved_at={})
+    # the GasBuddy state-gas fair file (2026-09-27), same reason
+    imm.GB_FAIR_FILE = os.path.join(tmp, "gasbuddy_fair.json")
+    imm._gb_fair_state.update(mtime=0.0, entries={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -3196,14 +3199,27 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # scan_universe_reason short-circuits on "allowlist_off" before it
         # reaches _blocked, and this class runs with the allowlist off, so
         # pin the real policy for the scan-tier half of the assertion.
+        # 2026-09-27 (Jack: "i received permission to use
+        # fuelinsights.gasbuddy.com. use that"): the two-letter STATES are
+        # live again behind the GasBuddy gate (TestGasBuddyFairGate), and this
+        # 9/14 pattern is what IMM_GB_FAIR_ENABLE=0 restores. A longer suffix
+        # (not a state shape) stays blocked either way.
+        off = [imm.re.compile(p) for p in imm._series_block_default(False).split(",")]
+        for st in ("OH", "CA", "TX", "NC", "ZZ"):      # ZZ = never-listed state
+            self.assertTrue(any(p.fullmatch(f"KXAAAGASD{st}") for p in off), st)
         prev_only = imm.ALLOWLIST_ONLY
         try:
             imm.ALLOWLIST_ONLY = True
-            for st in ("OH", "CA", "TX", "NC", "ZZ"):  # ZZ = never-listed state
+            for st in ("OH", "CA", "TX", "NC", "ZZ"):
                 t = f"KXAAAGASD{st}-26SEP02-3.1500"
-                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
-                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
-                self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
+                self.assertEqual(IncentiveMarketMaker._blocked(t),
+                                 not imm.GB_FAIR_ENABLE, t)
+                self.assertEqual(IncentiveMarketMaker._allowed(t),
+                                 imm.GB_FAIR_ENABLE, t)
+            t = "KXAAAGASDNYC-26SEP02-3.1500"          # not a state shape
+            self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+            self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
         finally:
             imm.ALLOWLIST_ONLY = prev_only
         # the national daily and the monthlies are deliberately KEPT
@@ -3213,10 +3229,10 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             self.assertTrue(IncentiveMarketMaker._allowed(keep), keep)
         # full-match, not prefix-match: the pattern must not reach the national
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
-        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDOH"))
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
         # the family-override clone machinery is unchanged and still resolves
-        # the national parent; a blocked state simply never reaches the
-        # candidate loop, because _allowed() is False above.
+        # the national parent for every state (the guards a live state runs
+        # under behind the GasBuddy gate).
         fake = "KXAAAGASDZZ"
         self.assertNotIn(fake, imm.SERIES_OVERRIDES)
         try:
@@ -3251,8 +3267,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # feed and stays quotable through the KXTEMP allow prefix
         self.assertFalse(imm.series_pattern_blocked("KXTEMPHELP"))
         self.assertTrue(IncentiveMarketMaker._allowed("KXTEMPHELP-26SEP17-X"))
-        # the gas-daily entry is untouched by the second pattern
-        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDCA"))
+        # the gas-daily entry is untouched by the second pattern (states are
+        # pattern-blocked only with the GasBuddy gate off, 2026-09-27)
+        self.assertEqual(imm.series_pattern_blocked("KXAAAGASDCA"),
+                         not imm.GB_FAIR_ENABLE)
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
         # ...and so is every other weather family the bot quotes
         for keep in ("KXHIGHNY", "KXLOWTNY", "KXAVGTNYC", "KXAQICITYNYC",
@@ -3283,14 +3302,16 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                          if not imm.SERIES_BLOCK_PATTERNS else False)
         # a pattern-blocked event can still be exempted to quote to completion,
         # exactly like a prefix-blocked one (BLOCKLIST_WIND_DOWN_EVENTS)
-        ev = "KXAAAGASDOH-26SEP15"
+        # (a longer-than-state gas suffix: pattern-blocked whatever the
+        # GasBuddy gate switch says, 2026-09-27)
+        ev = "KXAAAGASDNYC-26SEP15"
         self.assertTrue(IncentiveMarketMaker._blocked(f"{ev}-4.1450"))
         prev = imm.BLOCKLIST_WIND_DOWN_EVENTS
         try:
             imm.BLOCKLIST_WIND_DOWN_EVENTS = frozenset({ev})
             self.assertFalse(IncentiveMarketMaker._blocked(f"{ev}-4.1450"))
-            # a sibling state event is untouched by that exemption
-            self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASDCA-26SEP15-4.1450"))
+            # a sibling event is untouched by that exemption
+            self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASDLAX-26SEP15-4.1450"))
         finally:
             imm.BLOCKLIST_WIND_DOWN_EVENTS = prev
 
@@ -3298,7 +3319,9 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # the 6:45am classifier writes extra_allow_series.json; a pattern-blocked
         # family must never be readmitted through it (the whole point of
         # "including any future ones")
-        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDWY"))
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
+        self.assertEqual(imm.series_pattern_blocked("KXAAAGASDWY"),
+                         not imm.GB_FAIR_ENABLE)       # gated, 2026-09-27
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
         self.assertFalse(imm.series_pattern_blocked("KXDIESELD"))
 
@@ -3328,8 +3351,9 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         for keep in ("KXPCE", "KXPPI", "KXGDP", "KXJOLTS", "KXUST10Y", "KXFED",
                      "KXUSGBEEF", "KXTRUFEGGS"):
             self.assertFalse(imm.series_pattern_blocked(keep), keep)
-        # the earlier two entries still hold
-        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDCA"))
+        # the earlier two entries still hold (the gas one in its 2026-09-27
+        # form: states only while the GasBuddy gate is off)
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
         self.assertTrue(imm.series_pattern_blocked("KXTEMPMIAH"))
 
     def test_company_headcount_events_are_blocked(self):
@@ -7977,6 +8001,183 @@ class TestOpenRouterFairGate(unittest.TestCase):
             self.assertNotEqual(self._quotes(bot), [])
 
 
+class TestGasBuddyFairGate(unittest.TestCase):
+    """gasbuddy_fair.json -> load_gb_fair/gb_gate_reason -> the stand-aside on
+    the AAA state dailies (Jack 2026-09-27: "i received permission to use
+    fuelinsights.gasbuddy.com. use that"). Fails CLOSED like the OpenRouter
+    gate: the family is unblocked only because the feed exists. Fixture
+    event KXAAAGASDZZ-68DEC04 (a two-letter state shape, far from any
+    cutoff), strike 4.0000."""
+
+    T = "KXAAAGASDZZ-68DEC04-4.0000"
+    EV = "KXAAAGASDZZ-68DEC04"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._gb_fair_state.update(mtime=0.0, entries={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.GB_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        # the cycle clones the national KXAAAGASD guards onto the fixture
+        # series; do not leak that into the family-override tests
+        imm.SERIES_OVERRIDES.pop("KXAAAGASDZZ", None)
+
+    def _write(self, mu=4.0, sigma=0.005, age_secs=0.0, ev=None):
+        fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
+        with open(imm.GB_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {ev or self.EV: {
+                "mu": mu, "sigma": sigma, "fetched_at": fetched}}}, f)
+        os.utime(imm.GB_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestGasBuddyFairGate._bump += 1
+        return imm.load_gb_fair()
+
+    def _bot(self):
+        client = FakeClient()
+        now = datetime.now(timezone.utc)
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            # 10x the OpenRouter fixture: the family inherits the national
+            # KXAAAGASD $2/day rate floor
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 70000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV,
+            "status": "active", "close_time": far,
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_family_shape_and_kill_switch_patterns(self):
+        self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
+        self.assertFalse(imm.gb_fair_series("KXAAAGASD"))        # the national
+        self.assertFalse(imm.gb_fair_series("KXAAAGASDNYC"))     # not a state shape
+        self.assertFalse(imm.gb_fair_series("KXAAAGASW"))
+        # gate on (default): state dailies unblocked, anything longer blocked
+        self.assertFalse(imm.series_pattern_blocked("KXAAAGASDCA"))
+        self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
+        self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
+        self.assertTrue(imm.series_pattern_blocked("KXTEMPMIAH"))  # untouched
+        # IMM_GB_FAIR_ENABLE=0 puts the 9/14 pattern back exactly
+        off = [imm.re.compile(p) for p in imm._series_block_default(False).split(",")]
+        self.assertTrue(any(p.fullmatch("KXAAAGASDCA") for p in off))
+        self.assertFalse(any(p.fullmatch("KXAAAGASD") for p in off))
+        on = imm._series_block_default(True).split(",")
+        self.assertEqual(on[1:], imm._series_block_default(False).split(",")[1:])
+        self.assertTrue(all("{" not in p for p in on))            # comma-split safe
+
+    def test_reason_fail_closed_stale_vague_and_band(self):
+        now_ts = time.time()
+        self.assertEqual(imm.gb_gate_reason(self.T, now_ts, 49, 51)[1]["reason"], "no_read")
+        self.assertEqual(self._write(mu=4.0), 1)
+        self.assertEqual(imm.gb_gate_reason(self.T, time.time(), 49, 51), ("", {}))
+        self.assertEqual(imm.gb_gate_reason(self.EV, time.time(), 49, 51)[1]["reason"],
+                         "no_read")                              # no strike segment
+        self.assertEqual(imm.gb_gate_reason(
+            self.T, time.time() + imm.GB_FAIR_TTL_MIN * 60 + 5, 49, 51)[1]["reason"], "stale")
+        self._write(mu=4.0, sigma=0.025)                          # 2.5c > 2c cap
+        self.assertEqual(imm.gb_gate_reason(self.T, time.time(), 49, 51)[1]["reason"], "vague")
+        # AAA ~3.998: P(> 4.0000) 34% at sigma, 21% at half -> bid 49 fights it
+        self._write(mu=3.998, sigma=0.005)
+        why, inp = imm.gb_gate_reason(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], inp["bid_bad"], inp["ask_bad"]), ("band", True, False))
+        self.assertAlmostEqual(inp["hi"], 34.46, places=1)
+        # AAA ~4.002: the mirror -> the ask fights it
+        self._write(mu=4.002, sigma=0.005)
+        inp = imm.gb_gate_reason(self.T, time.time(), 49, 51)[1]
+        self.assertEqual((inp["bid_bad"], inp["ask_bad"]), (False, True))
+        # tolerance 0 is strict: a touch exactly on the band still quotes
+        self._write(mu=4.0, sigma=0.005)
+        self.assertEqual(imm.gb_gate_reason(self.T, time.time(), 50, 50), ("", {}))
+        self.assertEqual(imm.gb_gate_reason(self.T, time.time(), 51, 52)[1]["bid_bad"], True)
+
+    def test_loader_drops_bad_rows(self):
+        with open(imm.GB_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {
+                "A-68DEC04": {"mu": 4.0, "sigma": 0.0,
+                              "fetched_at": datetime.now(timezone.utc).isoformat()},
+                "B-68DEC04": {"mu": "x", "sigma": 0.01, "fetched_at": "now"},
+                "C-68DEC04": {"mu": 4.0, "sigma": 0.01},
+                self.EV: {"mu": 4.0, "sigma": 0.004,
+                          "fetched_at": datetime.now(timezone.utc).isoformat()}}}, f)
+        os.utime(imm.GB_FAIR_FILE, (time.time(), time.time() + 7777))
+        self.assertEqual(imm.load_gb_fair(), 1)
+        self.assertEqual(imm.load_gb_fair(), -1)                  # unchanged mtime
+        self.assertEqual(sorted(imm._gb_fair_state["entries"]), [self.EV])
+
+    def test_selection_needs_a_read_and_the_gate_stands_aside_on_disagreement(self):
+        bot = self._bot()
+        bot.run_cycle()                                           # no file
+        self.assertEqual(self._quotes(bot), [])
+        self.assertNotIn(self.T, bot.state.selected)              # takes no slot
+        self._write(mu=4.0)
+        bot.state.universe_at = 0.0                              # force a refresh
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertNotIn(self.T, bot._gb_fair_stood)
+        q = self._quotes(bot)
+        self.assertTrue(any(side == "bid" for side, _ in q), q)
+        self.assertTrue(any(side == "ask" for side, _ in q), q)
+        self._write(mu=3.998)                                     # bid 49 > 34
+        bot.run_cycle()                                           # no refresh: the quote loop
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._gb_fair_stood)
+        self.assertIn(self.T, bot.state.selected)                 # sticky between refreshes
+        bot.state.universe_at = 0.0                               # still fighting at a refresh
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)              # the slot is freed
+        self.assertEqual(self._quotes(bot), [])
+
+    def test_a_member_without_a_read_frees_its_slot(self):
+        self._write(mu=4.0)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self._write(mu=4.0, ev="KXAAAGASDQQ-68DEC04")             # a Monday / an outage
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(self._quotes(bot), [])
+
+    def test_a_fresh_strike_the_gate_rejects_takes_no_slot(self):
+        self._write(mu=3.998)                                     # listed 49x51 vs fair 34
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+        self._write(mu=4.0, sigma=0.03)                           # too early to call
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+
+    def test_stale_read_stands_aside_and_gate_off_quotes_plainly(self):
+        self._write(mu=4.0, age_secs=imm.GB_FAIR_TTL_MIN * 60 + 60)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        with mock.patch.object(imm, "GB_FAIR_ENABLE", False):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertNotEqual(self._quotes(bot), [])
+
+
 class TestPayoutFloorAccounting(unittest.TestCase):
     """The exchange pays NOTHING for a market whose program-period payout
     lands under $1.00 (2026-08-04 statement: 2,720 LIQUIDITY credits, minimum
@@ -10900,8 +11101,11 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(r("KXWCMENTION-26JUL11ARGSUI-VAR"), "allowed")
         # state gas dailies: pattern-blocked 2026-09-14, so they are NOT
         # scan universe either (the de-allowlist-only route would have made
-        # this None = scan candidate)
-        self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"), "blocked")
+        # this None = scan candidate). Since 2026-09-27 they are normal-book
+        # members behind the GasBuddy gate -- still never scan universe.
+        self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"),
+                         "allowed" if imm.GB_FAIR_ENABLE else "blocked")
+        self.assertEqual(r("KXAAAGASDNYC-26SEP08-4.14"), "blocked")
         self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "allowed")   # national kept
         # blocklist wins over everything (other bots' books)
         self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")
@@ -13788,9 +13992,10 @@ class TestGuardSkipSink(unittest.TestCase):
                         if src[j].strip())
             if not prev.startswith("self._gskip("):
                 bare.append(prev)
-        # 25 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
-        # token-usage gate (2026-09-27)
-        self.assertEqual(len(conts), 25)
+        # 26 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
+        # token-usage gate (2026-09-27) + the GasBuddy state-gas gate
+        # (2026-09-27)
+        self.assertEqual(len(conts), 26)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

@@ -2407,18 +2407,36 @@ MARKET_BLOCK_SUFFIXES = tuple(
 # KXMETAHEADCOUNT (events 26JUL / 26Q4, no KPI suffix), so the series form
 # is covered here for it and any future KX<CO>HEADCOUNT listing.
 #
+# FIRST ENTRY, REVISED -- GASBUDDY (Jack 2026-09-27: "i received permission to
+# use fuelinsights.gasbuddy.com. use that"). GasBuddy's live state averages
+# are the intraday station data the informed flow was reading, so the
+# two-letter STATE dailies (KXAAAGASD<ST>) come off this list while the
+# GasBuddy fair gate is on (GB_FAIR_ENABLE below) and are quoted only
+# against it -- the gate fails closed. IMM_GB_FAIR_ENABLE=0 restores
+# "KXAAAGASD[A-Z]+" here, i.e. the 9/14 block exactly. Any LONGER suffix (a
+# city or a new shape nobody has looked at) stays blocked either way.
+_GB_STATE_GAS_LIVE = os.environ.get("IMM_GB_FAIR_ENABLE", "1") == "1"
+#
 # Env IMM_BLOCK_SERIES_PATTERNS (comma list of regexes, FULL-match against the
 # series name); empty string disables. Full-match, not search: a bare
 # "KXAAAGASD" pattern must not silently take the national.
+def _series_block_default(gb_state_gas_live: bool) -> str:
+    """The default IMM_BLOCK_SERIES_PATTERNS. Comma-separated, so no regex
+    here may contain a comma ("{3,}" is spelled [A-Z][A-Z][A-Z]+)."""
+    return (("KXAAAGASD[A-Z][A-Z][A-Z]+," if gb_state_gas_live
+             else "KXAAAGASD[A-Z]+,")
+            + "KXTEMP[A-Z]+H,"
+            ".*CPI.*,KXCOREUND,KXUSEDCAR,USEDCAR,KX[A-Z0-9]+HEADCOUNT,"
+            # KXOSCARAWARDACTR is a SAG Award series filed under the Oscar
+            # prefix (2026-09-26 audit of the 66 KXOSCAR* names); the KXOSCAR
+            # prefix allow must never quote it under the Oscars' dates
+            "KXOSCARAWARD[A-Z]*")
+
+
 SERIES_BLOCK_PATTERNS = tuple(
     re.compile(p.strip()) for p in os.environ.get(
         "IMM_BLOCK_SERIES_PATTERNS",
-        "KXAAAGASD[A-Z]+,KXTEMP[A-Z]+H,"
-        ".*CPI.*,KXCOREUND,KXUSEDCAR,USEDCAR,KX[A-Z0-9]+HEADCOUNT,"
-        # KXOSCARAWARDACTR is a SAG Award series filed under the Oscar
-        # prefix (2026-09-26 audit of the 66 KXOSCAR* names); the KXOSCAR
-        # prefix allow must never quote it under the Oscars' dates
-        "KXOSCARAWARD[A-Z]*").split(",")
+        _series_block_default(_GB_STATE_GAS_LIVE)).split(",")
     if p.strip())
 
 
@@ -5047,7 +5065,11 @@ def _quotable_days(meta, now_utc: datetime) -> float:
 # (cutoff / closing / program_over / no_event_window) or a safety stop
 # (manual standoff, halt) stops it.
 STICKY_DEATH_REASONS = frozenset(
-    {"cutoff", "no_event_window", "closing", "program_over"})
+    {"cutoff", "no_event_window", "closing", "program_over",
+     # GasBuddy state gas (2026-09-27): no fresh read, or a book the gate
+     # rejects at a refresh -- the gate would stand it aside every cycle, so
+     # a member frees its KXAAAGAS:3 event slot for a strike that can quote
+     "gb_no_read", "gb_fair"})
 
 # THE BOT YIELDS TO THE HUMAN (user decision 2026-07-11). Jack trades some
 # mention markets by hand on the same account. If the account's position on a
@@ -5217,6 +5239,10 @@ _CONFIG_CODE_KNOBS = (
     # fair file's "model" block (openrouter_fair.py)
     "OR_FAIR_ENABLE", "OR_FAIR_SERIES", "OR_FAIR_TOL_CENTS", "OR_FAIR_TTL_MIN",
     "OR_FAIR_SIGMA_LO_FRAC", "OR_FAIR_REFRESH_HOLD_MIN",
+    # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
+    # fair file's "model" block (gasbuddy_fair.py)
+    "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",
+    "GB_FAIR_SIGMA_LO_FRAC", "GB_FAIR_MAX_SIGMA_CENTS", "GB_FAIR_REFRESH_SECS",
 )
 
 
@@ -6071,6 +6097,120 @@ def or_gate_reason(ticker: str, now_ts: float,
                  "lo": round(lo * 100, 2), "hi": round(hi * 100, 2),
                  "tol": OR_FAIR_TOL_CENTS, "bid_bad": bid_bad,
                  "ask_bad": ask_bad})
+    return "", {}
+
+
+# ----------------------------------------------------------------------------
+# GASBUDDY STATE-GAS FAIR GATE (Jack 2026-09-27: "i received permission to use
+# fuelinsights.gasbuddy.com. use that"). The AAA state dailies (KXAAAGASD<ST>,
+# blocked 9/14 at -10c/ct fills) settle on AAA's morning print, which tracks
+# GasBuddy's previous-day Full Day Average (daily-change correlation 0.94,
+# residual 0.95c against 3.34c for AAA carried forward -- 333 state-days,
+# Aug 24 - Sep 26). gasbuddy_fair.py reads GasBuddy's live state averages
+# (every 5 minutes) and Kalshi's settled anchor, and writes GB_FAIR_FILE: per
+# EVENT, N(mu, sigma) in dollars for the print. The OpenRouter gate's shape:
+# the family is live at all only because of the feed (see
+# _GB_STATE_GAS_LIVE at SERIES_BLOCK_PATTERNS), so the gate fails CLOSED. A
+# market stands aside on BOTH sides while
+#   - its event has no fresh read (no file, stale past GB_FAIR_TTL_MIN, the
+#     state missing a live average, yesterday's average or today's anchor,
+#     or a Monday -- the Tuesday print is not measured yet),
+#   - the read's sigma exceeds GB_FAIR_MAX_SIGMA_CENTS (too early in the
+#     day to know where it lands),
+#   - its external touch fights the fair band (P at sigma and at sigma x
+#     GB_FAIR_SIGMA_LO_FRAC) on the adverse side by more than
+#     GB_FAIR_TOL_CENTS. Default 0: in the replay of the 397 September
+#     state-daily fills a wider tolerance only let losing fills back in.
+# Kill switch IMM_GB_FAIR_ENABLE=0: the gate AND the family go (the state
+# dailies are pattern-blocked again, exactly as on 9/14).
+GB_FAIR_ENABLE = _GB_STATE_GAS_LIVE
+GB_FAIR_SERIES_RE = re.compile(os.environ.get(
+    "IMM_GB_FAIR_SERIES_RE", r"KXAAAGASD[A-Z][A-Z]"))
+GB_FAIR_TOL_CENTS = _env_int("IMM_GB_FAIR_TOL_CENTS", 0)
+GB_FAIR_TTL_MIN = _env_int("IMM_GB_FAIR_TTL_MIN", 20)
+GB_FAIR_REFRESH_SECS = _env_int("IMM_GB_FAIR_REFRESH_SECS", 300)
+GB_FAIR_SIGMA_LO_FRAC = _env_float("IMM_GB_FAIR_SIGMA_LO_FRAC", 0.5)
+GB_FAIR_MAX_SIGMA_CENTS = _env_float("IMM_GB_FAIR_MAX_SIGMA_CENTS", 2.0)
+GB_FAIR_FILE = os.environ.get(
+    "IMM_GB_FAIR_FILE", os.path.join(STATUS_DIR, "gasbuddy_fair.json"))
+_GB_STRIKE_RE = re.compile(r"-(\d+(?:\.\d+)?)$")
+_gb_fair_state: dict = {"mtime": 0.0, "entries": {}}
+
+
+def gb_fair_series(series: str) -> bool:
+    """True for a two-letter AAA state daily (KXAAAGASDCA), never the national
+    KXAAAGASD or anything longer."""
+    return GB_FAIR_SERIES_RE.fullmatch(series or "") is not None
+
+
+def load_gb_fair() -> int:
+    """Hot-reload GB_FAIR_FILE by mtime into _gb_fair_state. Returns the
+    number of events loaded on a reload, else -1."""
+    try:
+        mtime = os.path.getmtime(GB_FAIR_FILE)
+    except OSError:
+        return -1
+    if mtime == _gb_fair_state["mtime"]:
+        return -1
+    _gb_fair_state["mtime"] = mtime
+    try:
+        with open(GB_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! gasbuddy fair file unreadable: {e}")
+        return -1
+    fresh: Dict[str, dict] = {}
+    for ev, e in (data.get("entries") or {}).items():
+        try:
+            ts = parse_iso_utc(str(e["fetched_at"]))
+            mu, sigma = float(e["mu"]), float(e["sigma"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or not (math.isfinite(mu) and math.isfinite(sigma)) \
+                or sigma <= 0:
+            continue
+        fresh[str(ev)] = {"mu": mu, "sigma": sigma, "ts": ts.timestamp()}
+    _gb_fair_state["entries"] = fresh
+    return len(fresh)
+
+
+def gb_has_read(event_ticker: str, now_ts: float) -> bool:
+    """A fresh GasBuddy read exists for this event (selection-time check)."""
+    e = _gb_fair_state["entries"].get(event_ticker)
+    return e is not None and now_ts - e["ts"] <= GB_FAIR_TTL_MIN * 60
+
+
+def gb_gate_reason(ticker: str, now_ts: float,
+                   ext_bid: Optional[float], ext_ask: Optional[float]
+                   ) -> Tuple[str, dict]:
+    """('', {}) when an AAA state-daily market may quote, else (reason,
+    guard-skip inputs). Fails CLOSED on a missing / stale / vague read."""
+    ev = ticker.rsplit("-", 1)[0]
+    m = _GB_STRIKE_RE.search(ticker)
+    e = _gb_fair_state["entries"].get(ev)
+    if m is None or e is None:
+        return "no GasBuddy read for this event", {"reason": "no_read"}
+    if now_ts - e["ts"] > GB_FAIR_TTL_MIN * 60:
+        return "GasBuddy read is stale", {"reason": "stale"}
+    if GB_FAIR_MAX_SIGMA_CENTS > 0 and e["sigma"] * 100.0 > GB_FAIR_MAX_SIGMA_CENTS:
+        return (f"too early to call: sigma {e['sigma'] * 100:.2f}c > "
+                f"{GB_FAIR_MAX_SIGMA_CENTS:g}c",
+                {"reason": "vague", "mu": e["mu"], "sigma": e["sigma"]})
+    k = float(m.group(1))
+    pc = _p_above(k, e["mu"], e["sigma"])
+    pt = _p_above(k, e["mu"], max(1e-9, e["sigma"] * GB_FAIR_SIGMA_LO_FRAC))
+    lo, hi = min(pc, pt), max(pc, pt)
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo * 100.0,
+                                        GB_FAIR_TOL_CENTS, hi * 100.0)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {pc * 100:.0f}c "
+                f"[{lo * 100:.0f}-{hi * 100:.0f}] (tol {GB_FAIR_TOL_CENTS}c, "
+                f"{'bid' if bid_bad else 'ask'} side; AAA ~{e['mu']:.4f} "
+                f"+-{e['sigma'] * 100:.2f}c)",
+                {"reason": "band", "fair": round(pc * 100, 2),
+                 "lo": round(lo * 100, 2), "hi": round(hi * 100, 2),
+                 "tol": GB_FAIR_TOL_CENTS, "bid_bad": bid_bad,
+                 "ask_bad": ask_bad, "mu": e["mu"], "sigma": e["sigma"]})
     return "", {}
 
 
@@ -8040,6 +8180,7 @@ class IncentiveMarketMaker:
         self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
         self._ca_fair_stood: Set[str] = set()     # Carbon Arc fair stand-asides
         self._or_fair_stood: Set[str] = set()     # OpenRouter token-usage stand-asides
+        self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
@@ -9583,6 +9724,7 @@ class IncentiveMarketMaker:
         if _or_moved:
             log(f"{self.tag} or-fair reloaded: {_or_n} events, "
                 f"{_or_moved} with a new day")
+        load_gb_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
         # refresh reliably fires before Kalshi publishes now that keep-alive
@@ -11545,6 +11687,23 @@ class IncentiveMarketMaker:
             return "closing"
         if meta.program_end is not None and now_utc >= meta.program_end:
             return "program_over"
+        # GasBuddy state gas (2026-09-27): with no fresh read the gate stands
+        # the market aside every cycle, so it must not hold one of the
+        # MAX_MARKETS slots -- all of Monday (the Tuesday print is not
+        # modelled), and any GasBuddy / Kalshi-anchor outage.
+        if GB_FAIR_ENABLE and gb_fair_series(meta.series):
+            if not gb_has_read(meta.event_ticker, now_ts):
+                return "gb_no_read"
+            # ...and a strike whose listed touch the gate rejects right now
+            # (a sure strike with a stale touch, or too early in the day to
+            # call) must not take one of the event's 3 slots from one that
+            # can quote. Transient disagreement between refreshes is the
+            # quote loop's stand-aside; this only re-picks the slots.
+            if meta.mid_cents is not None and meta.spread_cents is not None:
+                half = meta.spread_cents / 2.0
+                if gb_gate_reason(meta.ticker, now_ts, meta.mid_cents - half,
+                                  meta.mid_cents + half)[0]:
+                    return "gb_fair"
         if meta.mid_cents is None or meta.spread_cents is None:
             return "one_sided"
         if meta.spread_cents > MAX_JOIN_SPREAD_CENTS:
@@ -12472,6 +12631,22 @@ class IncentiveMarketMaker:
             if t in self._or_fair_stood:
                 self._or_fair_stood.discard(t)
                 log(f"{self.tag} or-fair resume {t}")
+
+            # GASBUDDY STATE-GAS GATE (Jack 2026-09-27, see GB_FAIR_ENABLE):
+            # the same stand-aside on GasBuddy's live state averages, failing
+            # CLOSED -- the state dailies are quoted only against the feed.
+            if GB_FAIR_ENABLE and gb_fair_series(meta.series):
+                gb_why, gb_in = gb_gate_reason(t, now_ts, ext_bid, ext_ask)
+                if gb_why:
+                    if t not in self._gb_fair_stood:
+                        self._gb_fair_stood.add(t)
+                        log(f"{self.tag} gb-fair stand-aside {t}: {gb_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "gb_fair", lambda: gb_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._gb_fair_stood:
+                self._gb_fair_stood.discard(t)
+                log(f"{self.tag} gb-fair resume {t}")
 
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go
@@ -13475,6 +13650,41 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_or_fair_refresh, daemon=True,
                              name="or-fair").start()
+        if GB_FAIR_ENABLE and not once:
+            # GasBuddy state-gas refresher (2026-09-27): the OpenRouter
+            # refresher's contract -- every network call off the trading
+            # thread, the quote loop reads only GB_FAIR_FILE. GasBuddy's live
+            # averages refresh every 5 minutes; each state's Kalshi anchor and
+            # 1 Day Ago average are read once a day (from 07:00 ET, the first
+            # pass takes a minute or two at a polite pace). A failed refresh
+            # keeps the old file, whose entries age out of GB_FAIR_TTL_MIN --
+            # the gate fails closed.
+            def _gb_fair_refresh():
+                try:
+                    import gasbuddy_fair
+                except Exception as e:
+                    log(f"{self.tag} ! gb-fair refresher disabled: {e}")
+                    return
+                last = None
+                while True:
+                    delay = max(60, GB_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = gasbuddy_fair.write_fair_file(GB_FAIR_FILE)
+                        if last != (ok, miss):
+                            log(f"{self.tag} gb-fair refresh: {ok} events "
+                                f"with a read"
+                                + (f", {miss} series without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! gb-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 120)
+                    time.sleep(delay)
+            threading.Thread(target=_gb_fair_refresh, daemon=True,
+                             name="gb-fair").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
@@ -13492,6 +13702,13 @@ class IncentiveMarketMaker:
                 f"{OR_FAIR_REFRESH_HOLD_MIN:g}m, ttl {OR_FAIR_TTL_MIN}m, refresh "
                 f"{OR_FAIR_REFRESH_SECS}s ({OR_FAIR_FAST_SECS}s for "
                 f"{OR_FAIR_FAST_WINDOW_MIN}m after 00:00Z), file {OR_FAIR_FILE}")
+        if GB_FAIR_ENABLE:
+            log(f"gb-fair gate: AAA state dailies fail-closed at-touch, tol "
+                f"{GB_FAIR_TOL_CENTS}c, band sigma x{GB_FAIR_SIGMA_LO_FRAC:g}-1, "
+                f"max sigma {GB_FAIR_MAX_SIGMA_CENTS:g}c, ttl {GB_FAIR_TTL_MIN}m, "
+                f"refresh {GB_FAIR_REFRESH_SECS}s, file {GB_FAIR_FILE}")
+        else:
+            log("gb-fair gate: OFF -- AAA state dailies stay pattern-blocked")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
             f"earnings x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT:g}), "
