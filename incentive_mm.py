@@ -2203,6 +2203,19 @@ MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 2000)  # 450->1000-
 #   KXRT-BRIN-45/50. Advanced tier + 24/s throughput handle 2000 fine. NOTE:
 #   the $4000 collateral budget may become the next binding constraint.)
 MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
+# REQUOTE INTERLEAVE (Jack 2026-09-27, ROI scan: "fix these"). The diff's
+# cancels all ran before any placement, so an order being REPLACED (TTL
+# renewal or a reprice the amend path can't take) sat off the book for the
+# whole cancel loop plus every placement queued ahead of its replacement:
+# 23,013 cancel->replace gaps on 9/27 to 17Z, median 9.7s, mean 12.4s, ~0.7%
+# of all order-time. Each cancel that has a replacement (same market, side
+# and pad-ness -- pair_requotes) now runs immediately before that
+# replacement's placement; cancels with no replacement still run first, as
+# before. When the per-cycle placement cap defers a replacement, an old order
+# that is already IDENTICAL to it (a pure TTL renewal) stays resting until
+# the next cycle instead of leaving the book; any other deferred pair is
+# cancelled as before. IMM_REQUOTE_INTERLEAVE=0 restores all-cancels-first.
+REQUOTE_INTERLEAVE = os.environ.get("IMM_REQUOTE_INTERLEAVE", "1") == "1"
 QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-reward markets
 BENCH_COOLDOWN_SECS = _env_int("IMM_BENCH_COOLDOWN", 4 * 3600)
 # Post-2026-07-30 payouts scale by the ratio of non-excluded snapshots (a
@@ -5384,6 +5397,7 @@ _CONFIG_CODE_KNOBS = (
     "RESTART_KEEP_ORDERS", "RESTART_HANDOFF_MAX_AGE_SECS",
     "RESTART_KEEP_MIN_CUTOFF_SECS",
     "FLOOR_PROJECTION_REALIZED", "NEAR_CLIFF_ROOM_PRIORITY",
+    "REQUOTE_INTERLEAVE", "FORCE_EVENTS",
 )
 
 
@@ -8013,6 +8027,38 @@ def diff_orders(desired: List[Quote], resting: List[dict],
 
     to_place.extend(q for q in unmatched if q.ticker not in preserve_tickers)
     return to_place, to_cancel, to_amend
+
+
+def _order_is_pad(book_side: str, px: int) -> bool:
+    """Pad-ness of a RESTING order by price bound (diff_orders' test), so a
+    pad whose price knob moved while it rested still reads as a pad."""
+    return (book_side == "bid" and px <= PAD_BID_CENTS) or \
+           (book_side == "ask" and px >= PAD_ASK_CENTS)
+
+
+def pair_requotes(to_place: List[Quote], to_cancel: List[str],
+                  resting: List[dict]) -> Tuple[Dict[int, str], List[str]]:
+    """Pair every cancel from diff_orders with the placement that replaces it
+    (REQUOTE_INTERLEAVE): the first not-yet-paired placement on the same
+    (ticker, book_side, pad-ness), in placement order. Returns
+    ({index in to_place: order_id cancelled for it}, unpaired order ids in
+    their to_cancel order). An order that cannot be read is never paired."""
+    by_id = {o.get("order_id"): o for o in resting}
+    queues: Dict[Tuple[str, str, bool], List[str]] = {}
+    for oid in to_cancel:
+        o = by_id.get(oid)
+        parsed = order_yes_book_cents(o) if o else None
+        if parsed is None:
+            continue
+        key = (o.get("ticker", ""), parsed[0], _order_is_pad(parsed[0], parsed[1]))
+        queues.setdefault(key, []).append(oid)
+    pairs: Dict[int, str] = {}
+    for i, q in enumerate(to_place):
+        lst = queues.get((q.ticker, q.book_side, bool(q.is_pad)))
+        if lst:
+            pairs[i] = lst.pop(0)
+    paired = set(pairs.values())
+    return pairs, [oid for oid in to_cancel if oid not in paired]
 
 
 def ladder_collateral_dollars(bid_anchor: Optional[int], ask_anchor: Optional[int],
@@ -13635,9 +13681,16 @@ class IncentiveMarketMaker:
             log(f"{self.tag} amend cap: {len(to_amend) - MAX_PLACEMENTS_PER_CYCLE} "
                 f"deferred to next cycle")
 
+        # REQUOTE_INTERLEAVE (2026-09-27): a cancel whose order is being
+        # REPLACED runs inside place_with_caps, right before its replacement;
+        # only cancels with no replacement run here, first, as before.
+        if REQUOTE_INTERLEAVE:
+            replaces, first_cancels = pair_requotes(to_place, to_cancel, resting)
+        else:
+            replaces, first_cancels = {}, list(to_cancel)
         cancel_failures = 0
         cancelled_ids: Set[str] = set()
-        for oid in to_cancel:
+        for oid in first_cancels:
             if self.cancel_order(oid, reason="requote_diff"):
                 self.state.cancelled_today += 1
                 cancelled_ids.add(oid)
@@ -13646,7 +13699,10 @@ class IncentiveMarketMaker:
         if cancel_failures:
             raise RuntimeError(f"{cancel_failures} cancel(s) failed")
 
-        placed = self.place_with_caps(to_place, resting, cancelled_ids, now_ts)
+        swap_failures: List[str] = []
+        placed = self.place_with_caps(to_place, resting, cancelled_ids, now_ts,
+                                      replaces=replaces,
+                                      failed_cancels=swap_failures)
         if placed:
             # Persist order-ids NOW, right after placing — not at end-of-cycle.
             # A hard-kill in the window between placement and the end-of-cycle
@@ -13673,6 +13729,12 @@ class IncentiveMarketMaker:
             # estimate that the whole realization factor rests on. The
             # filename must also not match its cycle_log_*.csv glob.
             self._write_fast_log(cycle_rows)
+        if swap_failures:
+            # A replaced order whose cancel failed kept resting and its
+            # successor was not placed. Same consequence as a failed cancel
+            # always had: the cycle counts as errored for the failsafe (raised
+            # last, so this cycle's placements and logs are already saved).
+            raise RuntimeError(f"{len(swap_failures)} cancel(s) failed")
 
     # 13 original columns + 21 appended 2026-09-06. APPEND ONLY, never
     # reorder: imm_reward_recon.py reads this file positionally
@@ -13801,46 +13863,93 @@ class IncentiveMarketMaker:
                 pads.append(Quote(ticker, "ask", PAD_ASK_CENTS, n, is_pad=True))
         return pads
 
+    @staticmethod
+    def _identical_quote(o: dict, q: Quote) -> bool:
+        """Is resting order `o` already exactly quote `q` (a pure TTL
+        renewal)? Same side, cent bucket, exact sub-penny price, size."""
+        parsed = order_yes_book_cents(o)
+        if parsed is None or parsed != (q.book_side, q.price_cents):
+            return False
+        if q.price_exact is not None:
+            ox = order_yes_exact_cents(o)
+            if ox is None or abs(ox - q.price_exact) >= 0.005:
+                return False
+        return abs(order_remaining(o) - q.count) < 0.5
+
     def place_with_caps(self, to_place: List[Quote], resting: List[dict],
-                        cancelled_ids: Set[str], now_ts: float) -> int:
+                        cancelled_ids: Set[str], now_ts: float,
+                        replaces: Optional[Dict[int, str]] = None,
+                        failed_cancels: Optional[List[str]] = None) -> int:
         """Unconditional backstops: per-(market,side) resting cap, per-level
         cap, global resting-order cap, per-cycle placement cap. Side/level
         caps are per the quote's SERIES ladder (Love Island is bigger). Pad
-        orders (1c/99c depth fillers) are exempt from the ladder caps."""
+        orders (1c/99c depth fillers) are exempt from the ladder caps.
+
+        `replaces` (REQUOTE_INTERLEAVE, 2026-09-27): {index in to_place: id of
+        the resting order that placement replaces}. Each such order is
+        cancelled IMMEDIATELY before its replacement is placed (it is left out
+        of the cap totals up front -- a one-for-one swap -- and added back if
+        its cancel fails, in which case the replacement is not placed and the
+        id goes to `failed_cancels`). Replacements the cycle caps defer: an
+        order already identical to its replacement keeps resting until the
+        next cycle; any other is cancelled now, as before."""
+        replaces = replaces or {}
+        pending = set(replaces.values())
+        by_id = {o.get("order_id"): o for o in resting}
         side_totals: Dict[Tuple[str, str], float] = {}
         level_totals: Dict[Tuple[str, str, int], float] = {}
         total_resting = 0
-        for o in resting:
-            if o.get("order_id") in cancelled_ids:
-                continue
+
+        def _count(o: dict, sign: int) -> int:
             parsed = order_yes_book_cents(o)
             if parsed is None:
+                return 0
+            rem = order_remaining(o) * sign
+            if not self._is_pad_price(parsed[0], parsed[1]):
+                skey = (o.get("ticker", ""), parsed[0])
+                side_totals[skey] = side_totals.get(skey, 0.0) + rem
+                lkey = (o.get("ticker", ""), parsed[0], parsed[1])
+                level_totals[lkey] = level_totals.get(lkey, 0.0) + rem
+            return sign
+
+        for o in resting:
+            if o.get("order_id") in cancelled_ids or o.get("order_id") in pending:
                 continue
-            rem = order_remaining(o)
-            total_resting += 1
-            if self._is_pad_price(parsed[0], parsed[1]):
-                continue   # pad orders don't count against the ladder caps
-            skey = (o.get("ticker", ""), parsed[0])
-            side_totals[skey] = side_totals.get(skey, 0.0) + rem
-            lkey = (o.get("ticker", ""), parsed[0], parsed[1])
-            level_totals[lkey] = level_totals.get(lkey, 0.0) + rem
+            # pad orders don't count against the ladder caps (inside _count)
+            total_resting += _count(o, 1)
         # Drop expired place-uncertainty cooldowns.
         for key, ts in list(self.state.place_uncertain.items()):
             if now_ts - ts > 2 * POLL_SECS:
                 self.state.place_uncertain.pop(key, None)
         placed = 0
-        for q in to_place:
-            if (q.ticker, q.book_side, q.price_cents) in self.state.place_uncertain:
-                continue   # a lost-response order may already rest at this level
+        deferred_from: Optional[int] = None
+        for i, q in enumerate(to_place):
             if placed >= MAX_PLACEMENTS_PER_CYCLE:
                 log(f"{self.tag} placement cap {MAX_PLACEMENTS_PER_CYCLE}/cycle reached; "
-                    f"{len(to_place) - placed} deferred to next cycle")
+                    f"{len(to_place) - i} deferred to next cycle")
+                deferred_from = i
                 break
             if total_resting >= MAX_TOTAL_RESTING_ORDERS:
                 self.alerter.alert("order_cap", f"global resting-order cap "
                                    f"{MAX_TOTAL_RESTING_ORDERS} reached", key="order_cap",
                                    urgent=False)
+                deferred_from = i
                 break
+            old = replaces.get(i)
+            if old is not None:
+                # the swap: the order this placement replaces leaves the book
+                # only now, one call before its successor lands
+                if self.cancel_order(old, reason="requote_diff"):
+                    self.state.cancelled_today += 1
+                    cancelled_ids.add(old)
+                else:
+                    if failed_cancels is not None:
+                        failed_cancels.append(old)
+                    if old in by_id:
+                        total_resting += _count(by_id[old], 1)   # it still rests
+                    continue
+            if (q.ticker, q.book_side, q.price_cents) in self.state.place_uncertain:
+                continue   # a lost-response order may already rest at this level
             if q.is_pad:
                 # Depth filler: exempt from the ladder side/level caps (that's
                 # its whole purpose), but still counts toward the global
@@ -13891,6 +14000,27 @@ class IncentiveMarketMaker:
                 level_totals[lkey] = have_level + q.count
                 total_resting += 1
                 placed += 1
+        if deferred_from is not None and replaces:
+            # replacements the caps pushed to the next cycle: a pure renewal
+            # keeps its (identical) order resting meanwhile; any other swap
+            # loses the old order now, as before
+            kept = 0
+            for j in range(deferred_from, len(to_place)):
+                old = replaces.get(j)
+                if old is None:
+                    continue
+                o = by_id.get(old)
+                if o is not None and self._identical_quote(o, to_place[j]):
+                    kept += 1
+                    continue
+                if self.cancel_order(old, reason="requote_diff"):
+                    self.state.cancelled_today += 1
+                    cancelled_ids.add(old)
+                elif failed_cancels is not None:
+                    failed_cancels.append(old)
+            if kept:
+                log(f"{self.tag} placement cap: {kept} identical renewal(s) "
+                    f"left resting until the next cycle")
         return placed
 
     # ---- status / summary ----------------------------------------------------

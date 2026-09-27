@@ -4333,3 +4333,39 @@ What this does not fix:
 Tests: TestAdmissionClock (11), TestHourlyWindowAutoArm (3), TestRestartHandoff
 (8), TestFloorRealizedAnchor (3), TestNearCliffRoomPriority (1); the suite runs
 with ADMIT_SUSTAIN_SECS=0 at import, as it runs HOURLY_ACTIVATION_WINDOW_SECS=0.
+
+## 2026-09-27 pm — Requote gaps interleaved; IMM_FORCE_EVENTS emptied (Jack)
+
+Jack, on two more scan items: "fix these".
+
+REQUOTE INTERLEAVE (IMM_REQUOTE_INTERLEAVE, default 1). The end of run_cycle
+ran every diff cancel, then every placement, so an order being REPLACED (TTL
+renewal, or a reprice the amend path can't take) was off the book for the
+rest of the cancel loop plus every placement queued ahead of its successor:
+23,013 cancel->replace gaps on 9/27 to 17Z (orders sink, same ticker + side),
+median 9.7s, p90 20.3s, mean 12.4s -- ~0.7% of all order-time. pair_requotes()
+now pairs each cancel with the placement replacing it (same ticker, side and
+pad-ness, in placement order); place_with_caps cancels the old order one call
+before its successor is placed, leaving it out of the cap totals as a
+one-for-one swap (counted back in, successor skipped, if the cancel fails --
+the cycle then raises at its end, the old failed-cancel semantics). Cancels
+with no successor still run first. When the per-cycle placement cap defers a
+successor, an old order IDENTICAL to it (pure TTL renewal: the post-restart
+synchronized waves -- "placement cap 250/cycle reached; 439 deferred") keeps
+resting until the next cycle; any other deferred swap cancels as before.
+Kill: IMM_REQUOTE_INTERLEAVE=0.
+
+IMM_FORCE_EVENTS EMPTIED (launcher). The 8/14 entries: KXEARNINGSMENTIONDKNG-
+26AUG07 (settled 8/7; the note said "prune it on the next touch"),
+KXNCLH-26OCTPAX (no live program since at least 9/20), KXFSLR-26OCTMWSOLD
+(forced 8/7 so the $2/day re-entry rate bar would not shut out sibling strikes
+of an event held only as orphaned inventory). The force also bypassed the
+hopeless exit, so at 17:37Z 9/27 KXFSLR had 11 selected strikes projecting
+under the $1.00 cliff for the period ending 9/28 03:02Z -- 3900/4000/4300/
+4400/4700 at $0.64-0.76, 4800/5000/5100/5200 at $0.02-0.06 -- quoting for no
+payout. Unforced: near-cliff holds 4100/4200 ($0.92 projected, banked $0.88-
+0.89) to completion, 4500/4600 are over $1, the rest leave after the
+30-minute clock with their positions riding. DEPLOY: the launcher builds
+$ProbeEnv once, so this needs restart_imm.ps1 -Task; the code sync alone does
+not pick it up.
+Tests: TestRequoteInterleave (7), TestForceEventsEmptied (2).

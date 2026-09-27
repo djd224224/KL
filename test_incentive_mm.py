@@ -14895,5 +14895,171 @@ class TestNearCliffRoomPriority(unittest.TestCase):
         self.assertLessEqual(sum(bids.values()), 100)
 
 
+class TestRequoteInterleave(unittest.TestCase):
+    """Jack 2026-09-27 ("fix these"): the diff's cancels all ran before any
+    placement, so a REPLACED order was off the book for the whole cancel loop
+    plus every placement queued ahead of its successor -- 23,013 gaps on 9/27
+    to 17Z, median 9.7s. Each replaced order is now cancelled right before its
+    replacement is placed."""
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=None, live=False)
+        self.now = time.time()
+        self.calls = []
+        real_cancel, real_place = self.bot.cancel_order, self.bot.place_order
+
+        def cancel(oid, reason=""):
+            self.calls.append(("cancel", oid))
+            return real_cancel(oid, reason=reason)
+
+        def place(q, now_ts):
+            self.calls.append(("place", q.ticker, q.book_side, q.price_cents))
+            return real_place(q, now_ts)
+        self.bot.cancel_order = cancel
+        self.bot.place_order = place
+
+    def tearDown(self):
+        _clean_persist()
+
+    def _o(self, oid, t, side, px, n):
+        o = {"order_id": oid, "ticker": t, "book_side": side, "yes_price": px,
+             "remaining_count": n, "status": "resting"}
+        self.bot.state.sim_orders[oid] = dict(o)      # what a dry cancel pops
+        return o
+
+    def test_default_on(self):
+        self.assertTrue(imm.REQUOTE_INTERLEAVE)
+
+    def test_pairing(self):
+        resting = [self._o("a", "T", "bid", 49, 20), self._o("b", "T", "ask", 51, 20),
+                   self._o("p", "T", "bid", imm.PAD_BID_CENTS, 700),
+                   self._o("x", "U", "bid", 40, 5)]
+        to_place = [Quote("T", "ask", 52, 20), Quote("T", "bid", 48, 20),
+                    Quote("T", "bid", imm.PAD_BID_CENTS, 800, is_pad=True),
+                    Quote("V", "bid", 30, 5)]
+        pairs, unpaired = imm.pair_requotes(
+            to_place, ["a", "b", "p", "x", "gone"], resting)
+        self.assertEqual(pairs, {0: "b", 1: "a", 2: "p"})
+        self.assertEqual(unpaired, ["x", "gone"])    # no successor / unreadable
+        # a rung never pairs with a pad of the same side
+        pairs, unpaired = imm.pair_requotes([Quote("T", "bid", 48, 20)], ["p"], resting)
+        self.assertEqual((pairs, unpaired), ({}, ["p"]))
+
+    def test_each_cancel_lands_right_before_its_replacement(self):
+        resting = [self._o("a", "T", "bid", 49, 20), self._o("b", "U", "bid", 40, 20)]
+        placed = self.bot.place_with_caps(
+            [Quote("T", "bid", 48, 20), Quote("U", "bid", 41, 20)], resting, set(),
+            self.now, replaces={0: "a", 1: "b"}, failed_cancels=[])
+        self.assertEqual(placed, 2)
+        self.assertEqual(self.calls, [("cancel", "a"), ("place", "T", "bid", 48),
+                                      ("cancel", "b"), ("place", "U", "bid", 41)])
+
+    def test_the_replaced_order_does_not_count_against_its_successor(self):
+        # side cap 35 (offsets 5/10/20): 15 kept at 47 + the 20 being swapped
+        # from 49 to 48 fits only because the old 20 is leaving
+        resting = [self._o("a", "T", "bid", 49, 20), self._o("k", "T", "bid", 47, 15)]
+        placed = self.bot.place_with_caps([Quote("T", "bid", 48, 20)], resting,
+                                          set(), self.now, replaces={0: "a"})
+        self.assertEqual(placed, 1)
+        # ...and without the swap it is blocked, exactly as before
+        placed = self.bot.place_with_caps([Quote("T", "bid", 48, 20)],
+                                          [self._o("a2", "T", "bid", 49, 20),
+                                           self._o("k2", "T", "bid", 47, 15)],
+                                          set(), self.now)
+        self.assertEqual(placed, 0)
+
+    def test_failed_swap_cancel_keeps_the_old_order_counted(self):
+        resting = [self._o("a", "T", "bid", 49, 20)]
+        self.bot.cancel_order = lambda oid, reason="": (
+            self.calls.append(("cancel", oid)), False)[1]
+        failed = []
+        placed = self.bot.place_with_caps(
+            [Quote("T", "bid", 48, 20),      # a's successor: skipped
+             Quote("T", "bid", 47, 20)],     # fits only if a had left
+            resting, set(), self.now, replaces={0: "a"}, failed_cancels=failed)
+        self.assertEqual(placed, 0)
+        self.assertEqual(failed, ["a"])
+        self.assertNotIn("place", [c[0] for c in self.calls])
+
+    def test_cap_deferral_keeps_an_identical_renewal_resting(self):
+        resting = [self._o("a", "T", "bid", 49, 20), self._o("b", "U", "bid", 40, 20),
+                   self._o("c", "V", "bid", 30, 20)]
+        to_place = [Quote("T", "bid", 49, 20),    # renewal of a: within the cap
+                    Quote("U", "bid", 40, 20),    # identical to b: deferred, b rests
+                    Quote("V", "bid", 31, 20)]    # a reprice of c: deferred, c goes
+        with mock.patch.object(imm, "MAX_PLACEMENTS_PER_CYCLE", 1):
+            placed = self.bot.place_with_caps(to_place, resting, set(), self.now,
+                                              replaces={0: "a", 1: "b", 2: "c"})
+        self.assertEqual(placed, 1)
+        self.assertEqual([c[1] for c in self.calls if c[0] == "cancel"], ["a", "c"])
+        self.assertIn("b", self.bot.state.sim_orders)
+        self.assertNotIn("c", self.bot.state.sim_orders)
+
+    def test_ttl_renewals_interleave_in_a_cycle(self):
+        """End to end on the dry-run fixture: age every resting order past the
+        refresh age and the next cycle renews them cancel/place pairwise; the
+        kill switch restores all-cancels-first."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        n = len(bot.state.sim_orders)
+        self.assertGreater(n, 1)
+        calls = []
+        rc, rp = bot.cancel_order, bot.place_order
+        bot.cancel_order = lambda oid, reason="": (calls.append("c"),
+                                                   rc(oid, reason=reason))[1]
+        bot.place_order = lambda q, ts: (calls.append("p"), rp(q, ts))[1]
+        for interleave, expect in ((True, ["c", "p"] * n),
+                                   (False, ["c"] * n + ["p"] * n)):
+            calls.clear()
+            for oid in bot.state.sim_orders:
+                bot.state.order_ages[oid] -= imm.ORDER_REFRESH_SECS + 60
+            with mock.patch.object(imm, "REQUOTE_INTERLEAVE", interleave):
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+            self.assertEqual(calls, expect, interleave)
+            self.assertEqual(len(bot.state.sim_orders), n)
+
+
+class TestForceEventsEmptied(unittest.TestCase):
+    """Jack 2026-09-27: IMM_FORCE_EVENTS held a settled DKNG event, a KXNCLH
+    event with no live program, and KXFSLR-26OCTMWSOLD, whose force kept
+    strikes projecting under the $1.00 cliff quoting for no payout. The
+    launcher now sets it empty; a forced event keeps its members through the
+    hopeless exit, an unforced one does not."""
+
+    def test_launcher_sets_no_forced_events(self):
+        import re
+        with open(os.path.join(os.path.dirname(os.path.abspath(imm.__file__)),
+                               "run_incentive_mm.ps1"), encoding="utf-8") as f:
+            text = f.read()
+        chunks = re.findall(r'\$ProbeEnv\s*=\s*"(set .*?)"', text, re.S)
+        env = dict(re.findall(r"set ([A-Za-z_][A-Za-z0-9_]*)=([^&]*)&&", chunks[-1]))
+        self.assertEqual(env.get("IMM_FORCE_EVENTS"), "")
+
+    def test_unforced_member_under_the_bar_leaves(self):
+        T = "KXGOOD-99DEC31-A"
+        for forced in (True, False):
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.run_cycle()
+            self.assertIn(T, bot.state.selected)
+            old = imm.PAYOUT_FLOOR_DOLLARS
+            imm.PAYOUT_FLOOR_DOLLARS = 1e9
+            try:
+                with mock.patch.object(
+                        imm, "FORCE_EVENTS",
+                        frozenset({"KXGOOD-99DEC31"}) if forced else frozenset()):
+                    bot.state.hopeless_since[T] = (
+                        time.time() - imm.HOPELESS_SUSTAIN_SECS - 60)
+                    bot.state.universe_at = 0.0
+                    bot.run_cycle()
+            finally:
+                imm.PAYOUT_FLOOR_DOLLARS = old
+                _clean_persist()
+            self.assertEqual(T in bot.state.selected, forced, forced)
+
+
 if __name__ == "__main__":
     unittest.main()
