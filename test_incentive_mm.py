@@ -4281,6 +4281,52 @@ class TestEarningsYearAcrossYearBoundary(unittest.TestCase):
         self.assertEqual(y, 2028)
 
 
+class TestIrPageLateGuard(unittest.TestCase):
+    """An EARLY override only stands the bot down early (safe); a LATE one
+    quotes through the call (loses money). DATE_RE takes the first date in the
+    window, so an IR page can mis-parse -- and nearest-year resolution made
+    some mis-parses LATE. An IR-page date implausibly late versus the event's
+    own date is therefore NOT written (fail closed -> UNRESOLVED -> --set)."""
+
+    @staticmethod
+    def _ieo():
+        import imm_earnings_overrides as ieo
+        return ieo
+
+    def test_the_bond_maturity_misparse_is_rejected(self):
+        ieo = self._ieo()
+        ref = datetime(2026, 12, 3, 5, tzinfo=timezone.utc)
+        hit = ieo.parse_call_time(
+            "The company's Senior Notes due March 15, 2031 remain outstanding. "
+            "It will host a conference call at 8:30 a.m. ET on December 3.",
+            ref=ref)
+        self.assertEqual(hit[0].year, 2031)            # the parser mis-reads...
+        self.assertTrue(ieo.ir_date_too_late(hit[0], ref))   # ...the guard refuses
+
+    def test_on_time_and_early_readings_pass(self):
+        ieo = self._ieo()
+        ref = datetime(2026, 10, 14, 4, tzinfo=timezone.utc)
+        on_time = datetime(2026, 10, 14, 20, 30, tzinfo=timezone.utc)
+        self.assertFalse(ieo.ir_date_too_late(on_time, ref))
+        self.assertFalse(ieo.ir_date_too_late(on_time + timedelta(days=5), ref))
+        # EARLY is the safe direction: never blocked
+        self.assertFalse(ieo.ir_date_too_late(on_time - timedelta(days=200), ref))
+
+    def test_feb_29_a_year_out_is_rejected(self):
+        ieo = self._ieo()
+        ref = datetime(2027, 3, 1, tzinfo=timezone.utc)
+        hit = ieo.parse_call_time(
+            "Our earnings conference call is February 29 at 8:30 a.m. ET.", ref=ref)
+        self.assertEqual(hit[0].year, 2028)
+        self.assertTrue(ieo.ir_date_too_late(hit[0], ref))
+
+    def test_uncomparable_fails_closed(self):
+        ieo = self._ieo()
+        naive = datetime(2026, 10, 14)
+        aware = datetime(2026, 10, 14, tzinfo=timezone.utc)
+        self.assertTrue(ieo.ir_date_too_late(naive, aware))
+
+
 class TestNasdaqRelease(unittest.TestCase):
     """Nasdaq-calendar release resolver: after-hours->4pm ET, pre-market->7am,
     scanning forward from now (robust to Kalshi's wrong occurrence)."""
@@ -12870,8 +12916,10 @@ class TestFullDepthBookLog(unittest.TestCase):
     def test_book_row_own_size_per_exact_level(self):
         rec = (1.0, "2026-09-26T00:00:00Z", self.T, "managed", False,
                self.SUBPENNY, [("bid", 42.35, 10.0), ("bid", 42.35, 5.0),
-                               ("ask", 53.0, 7.0)], 1000.0, 0.5, 150.0)
+                               ("ask", 53.0, 7.0)], 1000.0, 0.5, 150.0,
+               "resting_read")
         row = json.loads(IncentiveMarketMaker._book_row(rec))
+        self.assertEqual(row["own_src"], "resting_read")
         self.assertEqual(row["own_yes_cents"], [[42.35, 15.0]])
         # our ask at YES 53c is a NO bid at 47c on the no side
         self.assertEqual(row["own_no_cents"], [[47.0, 7.0]])
@@ -12884,6 +12932,23 @@ class TestFullDepthBookLog(unittest.TestCase):
                "yes": [["0.4235", "1200"], ["0.4100", "300"]],
                "own_yes_cents": [[42.35, 200.0], [41.0, 900.0]]}
         self.assertEqual(rd.competitor_levels(row, "yes"), [[42.35, 1000.0]])
+
+    def test_rows_say_where_own_size_came_from(self):
+        bot = self._bot()
+        bot.run_cycle()
+        srcs = {(r[3], r[10]) for r in bot._book_buf if r[2] == self.T}
+        self.assertIn(("managed", "resting_read"), srcs)
+        self.assertIn(("candidate", "resting_prev_cycle"), srcs)
+
+    def test_reader_streams_many_members_in_order(self):
+        import imm_book_depth_read as rd
+        bot = self._bot()
+        for i in range(60):                            # 60 flushes = 60 members
+            bot._book_log_add(f"{self.T}{i}", "managed", self.SUBPENNY, [], None)
+            bot._book_log_flush()
+        (path,) = glob.glob(os.path.join(self.dir, "*.jsonl.gz"))
+        got = [r["ticker"] for r in rd.iter_rows(path, chunk=97)]   # tiny chunks
+        self.assertEqual(got, [f"{self.T}{i}" for i in range(60)])
 
     def test_candidates_can_be_turned_off(self):
         with mock.patch.object(imm, "BOOK_LOG_CANDIDATES", False):
@@ -13045,6 +13110,22 @@ class TestGuardSkipSink(unittest.TestCase):
         self.assertIn("hi", enter["inputs"])
         self.assertEqual((enter["ext_bid"], enter["ext_ask"]), (2, 3))
 
+    def test_clear_for_a_market_that_left_the_book_logs_no_stale_book(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bot._guard_snap_at = time.time()
+        self._book(bot, 200, 1200)
+        self._held_cycle(bot)                          # held: cannot_qualify
+        self.assertEqual(len(self._rows("enter")), 1)
+        bot.state.selected.pop(self.T, None)           # it leaves the book
+        bot.state.managed_extra.pop(self.T, None)
+        self._held_cycle(bot)
+        (clear,) = self._rows("clear")
+        self.assertFalse(clear["managed"])
+        self.assertIsNone(clear["ext_bid"])            # not the last panel's book
+        self.assertIsNone(clear["yes_depth"])
+        self.assertIsNone(clear["panel_ts"])
+
     def test_hourly_snapshot_and_counts(self):
         bot = self._bot()
         bot.run_cycle()
@@ -13187,6 +13268,16 @@ class TestSelectionDecisionInputs(unittest.TestCase):
             self.assertTrue(fs[0]["near_cliff_boost_armed"])
             self.assertEqual(fs[0]["decision"], "selected")
             bot.state.universe_at = 0.0                  # unchanged state: no new row
+            bot.run_cycle()
+            self.assertEqual(len([x for x in _sink_rows(self.sd, "floor_state")
+                                  if x["ticker"] == self.T]), 1)
+            # one refresh with an unreadable book (sticky: kept, but no floor
+            # computation) must not make the next refresh re-emit the SAME state
+            book = bot.client.books.pop(self.T)
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            bot.client.books[self.T] = book
+            bot.state.universe_at = 0.0
             bot.run_cycle()
             self.assertEqual(len([x for x in _sink_rows(self.sd, "floor_state")
                                   if x["ticker"] == self.T]), 1)

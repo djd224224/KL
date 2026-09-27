@@ -17,8 +17,16 @@ Row schema (one JSON object per book read):
   own_yes_cents / own_no_cents
                 our own resting size per exact level, in CENTS: yes side keyed
                 by YES cents, no side by NO cents (= 100 - our ask's YES price).
-                Taken from the cycle-top resting read, a few seconds before
-                the book read, so own can briefly exceed a level; clamp at 0.
+                Taken from an exchange resting read made before the book read,
+                so own can briefly exceed a level; competitor_levels clamps at 0.
+  own_src       where own size came from:
+                  "resting_read"       managed row: this cycle's read. Empty
+                                       for an event an earlier sibling's
+                                       event-wide cancel pulled this cycle.
+                  "resting_prev_cycle" candidate row: the PREVIOUS cycle's
+                                       read (~1 cycle old). For any market we
+                                       quote, prefer the managed row of the
+                                       same cycle_ts.
   target, discount, pool_per_day   the program terms the book was scored under
   run_id, config_hash
 
@@ -44,23 +52,36 @@ def day_files(day, status_dir=None):
                                          f"book_depth_{day}_*.jsonl.gz")))
 
 
-def iter_rows(path):
-    """Yield row dicts from one file, member by member. Stops cleanly at a
-    truncated or corrupt tail member instead of raising."""
+def iter_rows(path, chunk=1 << 20):
+    """Yield row dicts from one file, member by member, streaming in chunks.
+
+    Linear in file size, holding about one member in memory. (Re-slicing the
+    whole remaining buffer per member was quadratic: a day file has ~1,000+
+    members, one per flush.) A member's rows are yielded only once that
+    member is fully decompressed -- gzip end-of-stream reached -- so a
+    truncated or corrupt tail member (a hard kill mid-write) yields nothing
+    and the iteration stops cleanly instead of raising."""
     with open(path, "rb") as f:
-        data = f.read()
-    while data:
         dec = zlib.decompressobj(wbits=31)      # 31 = gzip wrapper
-        try:
-            out = dec.decompress(data)
-        except zlib.error:
-            return                              # corrupt tail member
-        if not dec.eof:
-            return                              # truncated tail (hard kill)
-        for ln in out.splitlines():
-            if ln:
-                yield json.loads(ln)
-        data = dec.unused_data
+        acc = b""                               # decompressed bytes of the member
+        buf = b""
+        while True:
+            if not buf:
+                buf = f.read(chunk)
+                if not buf:
+                    return                      # EOF; a member without eof = truncated tail
+            try:
+                acc += dec.decompress(buf)
+            except zlib.error:
+                return                          # corrupt tail member
+            buf = b""
+            if dec.eof:
+                for ln in acc.splitlines():
+                    if ln:
+                        yield json.loads(ln)
+                buf = dec.unused_data           # leftover of THIS chunk only
+                acc = b""
+                dec = zlib.decompressobj(wbits=31)
 
 
 def iter_day(day, status_dir=None, dedup=True):

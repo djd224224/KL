@@ -7304,8 +7304,10 @@ class MarketMeta:
     near_cliff: bool = False            # admitted / kept by the near-cliff rule this refresh
     near_cliff_boost: bool = False      # in near-cliff SIZE mode (ladder x NEAR_CLIFF_SIZE_MULT, sticky)
     # decision-input logging (2026-09-26), analytics only:
-    est_hour_mult: float = 1.0          # hour_size_mult the estimate ran at
-    nc_size_mult: float = 1.0           # near-cliff mult on the probe ladder
+    # None = the estimate never ran at a multiplier (it returned early); a
+    # default of 1.0 would pass that off as "ran at plain size"
+    est_hour_mult: Optional[float] = None   # hour_size_mult the estimate ran at
+    nc_size_mult: Optional[float] = None    # near-cliff mult on the probe ladder
     floor_by_mult: List[List[float]] = field(default_factory=list)
     #   [[mult, weight, $/day at that mult], ...]; [] = floor is the live estimate
     yield_per_contract: float = 0.0     # $/day per resting contract — the ranking metric
@@ -7557,7 +7559,9 @@ class IncentiveMarketMaker:
         self._book_fail = 0                        # consecutive failed flushes
         self._book_part = 0                        # bumped after a failed write
         self._book_cycle_ts = ""                   # joins cycle_log.ts
-        self._book_own_ledger: Dict[str, List[Tuple[str, float, float]]] = {}
+        # exchange-derived own orders from the last cycle's resting read, for
+        # candidate book rows (analytics only; never mutated)
+        self._book_own_exch: Dict[str, List[Tuple[str, float, float]]] = {}
         # ---- decision-input logging (see GUARD_LOG / SELECTION_INPUTS) ----
         self._guard_now: Dict[str, dict] = {}     # THIS cycle: ticker -> guard record
         self._guard_prev: Dict[str, str] = {}     # last FULL cycle: ticker -> guard
@@ -7618,7 +7622,8 @@ class IncentiveMarketMaker:
                     f"muted for the rest of this run")
 
     def _book_log_add(self, ticker: str, source: str, ob, own_exact,
-                      meta=None, fast: bool = False) -> None:
+                      meta=None, fast: bool = False,
+                      own_src: str = "") -> None:
         """Queue one book for the full-depth log. O(1): keeps a REFERENCE to
         the raw response; serialisation happens in _book_log_flush, off the
         placement path. Never raises."""
@@ -7634,7 +7639,8 @@ class IncentiveMarketMaker:
                 list(own_exact or ()),
                 getattr(meta, "target_size", None),
                 getattr(meta, "discount_factor", None),
-                getattr(meta, "dollars_per_day", None)))
+                getattr(meta, "dollars_per_day", None),
+                own_src))
         except Exception:
             pass
 
@@ -7645,7 +7651,7 @@ class IncentiveMarketMaker:
         `unit` says which. Our own size is keyed by exact YES cents on the yes
         side and by NO cents (100 - YES) on the no side, matching the book."""
         try:
-            ts, cyc, t, src, fast, ob, own, tgt, disc, pool = rec
+            ts, cyc, t, src, fast, ob, own, tgt, disc, pool, own_src = rec
             fp = ob.get("orderbook_fp")
             if fp is not None:
                 yes = fp.get("yes_dollars") or []
@@ -7668,6 +7674,9 @@ class IncentiveMarketMaker:
                 "fast": fast, "unit": unit, "yes": yes, "no": no,
                 "own_yes_cents": sorted([k, v] for k, v in oy.items()),
                 "own_no_cents": sorted([k, v] for k, v in on.items()),
+                # where own size came from: "resting_read" (managed, this
+                # cycle's exchange read) or "resting_prev_cycle" (candidate)
+                "own_src": own_src,
                 "target": tgt, "discount": disc, "pool_per_day": pool,
                 "run_id": RUN_ID, "config_hash": CONFIG_HASH,
             }, separators=(",", ":"), default=str)
@@ -7777,13 +7786,20 @@ class IncentiveMarketMaker:
                                                "ticker": t, "prev": prev, **rec})
             for t, prev in self._guard_prev.items():
                 if t not in now:
-                    p = self._last_panel.get(t) or {}
+                    # Book context only for a market still managed (its panel
+                    # is this cycle's). One that LEFT the book has no fresh
+                    # panel -- _last_panel would be from its last managed
+                    # cycle, possibly hours old -- so it logs nulls rather
+                    # than a stale book passed off as current.
+                    on_book = t in managed
+                    p = (self._last_panel.get(t) or {}) if on_book else {}
                     self._sink("guard_skips", {
                         "ts": ts, "kind": "clear", "ticker": t, "guard": None,
-                        "prev": prev, "managed": t in managed, "inputs": {},
+                        "prev": prev, "managed": on_book, "inputs": {},
                         "ext_bid": p.get("ext_bid"), "ext_ask": p.get("ext_ask"),
                         "yes_depth": p.get("yes_depth"),
-                        "no_depth": p.get("no_depth")})
+                        "no_depth": p.get("no_depth"),
+                        "panel_ts": p.get("ts")})
             self._guard_prev = {t: r["guard"] for t, r in now.items()}
             if now_ts - self._guard_snap_at >= 3600:
                 self._guard_snap_at = now_ts
@@ -9471,22 +9487,11 @@ class IncentiveMarketMaker:
         # $25/day pool with an empty near-touch beats a $145/day pool where
         # farmers already stack the qualification walk.
         own_by_ticker: Dict[str, List[Tuple[str, int, float]]] = {}
-        # Exact-price twin for the book log only (own_by_ticker is whole-cent
-        # and drives the estimate, so it stays untouched).
-        self._book_own_ledger = {}
         if self.live:
             for o in self.state.ledger.values():
                 own_by_ticker.setdefault(o.get("ticker", ""), []).append(
                     (o.get("book_side", "bid"), int(o.get("yes_price", 0)),
                      float(o.get("remaining_count", 0))))
-                try:
-                    _x = order_yes_exact_cents(o)
-                    self._book_own_ledger.setdefault(o.get("ticker", ""), []).append(
-                        (o.get("book_side", "bid"),
-                         _x if _x is not None else float(o.get("yes_price", 0)),
-                         float(o.get("remaining_count", 0))))
-                except Exception:
-                    pass
         self._prune_near_cliff_boost()
         ranked: List[MarketMeta] = []
         for meta in screened:
@@ -10086,6 +10091,15 @@ class IncentiveMarketMaker:
                             continue
                         fs_now[tk] = (fi.get("reaches_min_raw"), fi.get("reaches_min"),
                                       tk in self._near_cliff_boost)
+                    # A member kept sticky through an unreadable book skips the
+                    # floor computation this refresh, so it has no floor_in.
+                    # Carry its last known state forward: forgetting it would
+                    # re-emit an unchanged state as "new" next refresh, or
+                    # misreport the prior state of a real change.
+                    for tk, dec in now_dec.items():
+                        if dec == "selected" and tk not in fs_now \
+                                and tk in self._floor_state_prev:
+                            fs_now[tk] = self._floor_state_prev[tk]
                     for tk, fs in fs_now.items():
                         pfs = self._floor_state_prev.get(tk)
                         if pfs != fs:
@@ -10478,6 +10492,8 @@ class IncentiveMarketMaker:
         the default ladder joined to the current external best. Returns False
         when the book can't be read."""
         meta.floor_dollars_per_day = 0.0     # set with the estimate below
+        # decision-input logging: set below only if the estimate actually runs
+        meta.est_hour_mult = meta.nc_size_mult = None
         # Live-CONFIRMED events never come back (Jack 2026-08-31 #2): worth
         # nothing by decree, without even reading the book — so no market of
         # the event can be selected or hold an event slot again.
@@ -10490,8 +10506,13 @@ class IncentiveMarketMaker:
         except Exception:
             return False
         if BOOK_LOG_CANDIDATES:
+            # Own size from the PREVIOUS cycle's exchange resting read (the
+            # universe refresh runs before this cycle's read), not the local
+            # ledger, which fills never reduce. For any market we quote, the
+            # managed row of the same cycle carries the fresher own size.
             self._book_log_add(meta.ticker, "candidate", ob,
-                               self._book_own_ledger.get(meta.ticker, ()), meta)
+                               self._book_own_exch.get(meta.ticker, ()), meta,
+                               own_src="resting_prev_cycle")
         yes_levels, no_levels = orderbook_levels(ob)
         meta.book_depth_contracts = (sum(q for _px, q in yes_levels)
                                      + sum(q for _px, q in no_levels))
@@ -11282,6 +11303,10 @@ class IncentiveMarketMaker:
                 own_exact_by_ticker.setdefault(o.get("ticker", ""), []).append(
                     (parsed[0], _ox if _ox is not None else float(parsed[1]),
                      order_remaining(o)))
+        # book log: the next universe refresh's candidate rows read our own
+        # orders from THIS exchange read (a reference; the dict is rebuilt
+        # every cycle and never mutated after this loop)
+        self._book_own_exch = own_exact_by_ticker if self.live else {}
         # Events the user is trading by hand THIS cycle (foreign orders now
         # fresh). The per-market loop below yields every market of these.
         manual_evts = self.manual_events(positions)
@@ -11587,9 +11612,16 @@ class IncentiveMarketMaker:
             # above the quote-shape block further down, which rebinds `ob`
             # to a list of own-bid tuples. own_exact nets our orders out at
             # read time (competitor depth = level - own).
-            self._book_log_add(t, "managed", ob,
-                               own_exact_by_ticker.get(t, []) if self.live else [],
-                               meta, fast=fast_only)
+            # Own size comes from this cycle's cycle-top resting read, EXCEPT
+            # for an event whose orders an earlier sibling's event-wide cancel
+            # pulled THIS cycle (event_depth_thin): that read predates the
+            # cancel, so it would still list orders no longer in this book.
+            # Derived from the existing per-cycle set -- nothing on the
+            # trading path is mutated.
+            _own_log = ([] if (not self.live or meta.event_ticker in event_depth_thin)
+                        else own_exact_by_ticker.get(t, []))
+            self._book_log_add(t, "managed", ob, _own_log, meta,
+                               fast=fast_only, own_src="resting_read")
             # Dry-run sim orders were never sent, so they are NOT in the real
             # book — netting them out would erode phantom levels and walk our
             # anchor away from the true external best cycle after cycle.
@@ -12911,10 +12943,6 @@ class IncentiveMarketMaker:
                                 "failsafe", f"{self.state.consecutive_errors} consecutive "
                                 f"cycle errors (last: {e!r:.120}); cancelled all",
                                 key="failsafe")
-                # Full-depth book log: serialise + write this cycle's books
-                # AFTER placements, never on the placement path. Also picks up
-                # rows from a cycle that raised or returned early. Never raises.
-                self._book_log_flush()
                 now_utc = datetime.now(timezone.utc)
                 self.alerter.maybe_daily_summary(now_utc, self.build_daily_summary)
                 self.write_status(now_utc)
@@ -12933,6 +12961,15 @@ class IncentiveMarketMaker:
                 # during error backoff; fast-tick errors log without touching
                 # the consecutive-error failsafe (full cycles own that).
                 deadline = time.time() + sleep_total
+                # Full-depth book log: serialise + write this cycle's books
+                # HERE, inside the sleep window whose deadline is already set,
+                # so the flush time is absorbed by the sleep instead of
+                # stretching the cycle period (it measured 0.03-0.1s on plain
+                # cycles, 0.4-0.7s on universe-refresh cycles). Being below
+                # the `break`s also means a graceful stop or code-change exit
+                # never flushes before shutdown_cancel(): the finally block
+                # flushes AFTER the cancel. Never raises.
+                self._book_log_flush()
                 while True:
                     remain = deadline - time.time()
                     if remain <= 0:

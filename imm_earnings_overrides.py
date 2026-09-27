@@ -115,6 +115,30 @@ def _year_for(month, day, stated=None, year=None, ref=None):
     return best[1] if best else ref.year
 
 
+# IR-PAGE LATE GUARD (2026-09-26). The direction of an override error decides
+# whether it costs money: an EARLY override only stands the bot down early
+# (safe); a LATE one quotes straight through the call (loses money). DATE_RE
+# takes the FIRST date in a 600-char window, so a page can be mis-parsed
+# ("Senior Notes due March 15, 2031 ... conference call on December 3" reads
+# March 15, 2031). Resolving a year-less date to the year nearest the event
+# made some mis-parses land LATE where the old hardcoded 2026 landed them
+# early. So an IR-page date more than this many days AFTER the event's own
+# date is NOT written: the event stays UNRESOLVED -- keeping its default,
+# earlier cutoff -- and goes to the ACTION email for a --set. Fail closed;
+# never pick another year. IR-page resolutions have been rare (none from
+# 2026-07-23 to 2026-09-26), so the cost of caution is a manual --set.
+IR_LATE_GUARD_DAYS = int(os.environ.get("IMM_IR_LATE_GUARD_DAYS", "21"))
+
+
+def ir_date_too_late(dt_et, ref) -> bool:
+    """True if an IR-page datetime is implausibly LATE versus the event's own
+    date `ref`. Any comparison failure counts as too late (fail closed)."""
+    try:
+        return (dt_et - ref).total_seconds() > IR_LATE_GUARD_DAYS * 86400
+    except Exception:
+        return True
+
+
 def parse_call_time(page_text: str, year=None, ref=None):
     """Best-effort (datetime_ET, evidence) from an IR/press page; None if the
     page doesn't contain BOTH a keyword-adjacent ET time and a nearby date."""
@@ -988,6 +1012,11 @@ def main(argv=None) -> int:
                 log(f"! fetch failed {url}: {e}")
                 continue
             hit = parse_release_time(page, ref=release_ref)
+            if hit and ir_date_too_late(hit[0], release_ref):
+                log(f"! IR release date {hit[0].isoformat()} for {ev} is more than "
+                    f"{IR_LATE_GUARD_DAYS}d after the event date; not written "
+                    f"(fail closed) [{url}]")
+                hit = None
             if hit:
                 found = (url, *hit)
                 break
@@ -1084,7 +1113,13 @@ def main(argv=None) -> int:
             except Exception as e:
                 log(f"! fetch failed {url}: {e}")
                 continue
-            hit = parse_call_time(page, ref=parse_event_date(ev) or now)
+            call_ref = parse_event_date(ev) or now
+            hit = parse_call_time(page, ref=call_ref)
+            if hit and ir_date_too_late(hit[0], call_ref):
+                log(f"! IR call date {hit[0].isoformat()} for {ev} is more than "
+                    f"{IR_LATE_GUARD_DAYS}d after the event date; not written "
+                    f"(fail closed) [{url}]")
+                hit = None
             if hit:
                 found = (url, *hit)
                 break
