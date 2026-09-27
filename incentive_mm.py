@@ -13463,10 +13463,13 @@ class IncentiveMarketMaker:
                                     + (f", {miss} without one" if miss else ""))
                             last = (ok, miss)
                     except Exception as e:
-                        if last != "err":
+                        # each DISTINCT error is logged once (2026-09-27: a
+                        # repeat of the first 429 was silent for 20 minutes)
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
                             log(f"{self.tag} ! or-fair refresh failed: "
                                 f"{type(e).__name__}: {str(e)[:120]}")
-                        last = "err"
+                        last = err
                         # the gate is fail-closed: retry soon, not in 10 min
                         delay = min(delay, max(30, OR_FAIR_FAST_SECS))
                     time.sleep(delay)
