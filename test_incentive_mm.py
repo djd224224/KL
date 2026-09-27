@@ -8145,6 +8145,14 @@ class TestGasBuddyFairGate(unittest.TestCase):
         self.assertFalse(imm.gb_fair_series("KXAAAGASD"))        # the national
         self.assertFalse(imm.gb_fair_series("KXAAAGASDNYC"))     # not a state shape
         self.assertFalse(imm.gb_fair_series("KXAAAGASW"))
+        # the diesel daily joins (2026-09-27: "ok do that for diesel daily"),
+        # the weekly does not; IMM_GB_DIESEL_ENABLE=0 takes it back out
+        self.assertTrue(imm.gb_fair_series("KXDIESELD"))
+        self.assertFalse(imm.gb_fair_series("KXDIESELW"))
+        self.assertFalse(imm.gb_fair_series("KXDIESELMONAK"))
+        with mock.patch.object(imm, "GB_DIESEL_ENABLE", False):
+            self.assertFalse(imm.gb_fair_series("KXDIESELD"))
+            self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
         # gate on (default): state dailies unblocked, anything longer blocked
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASDCA"))
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
@@ -8203,6 +8211,16 @@ class TestGasBuddyFairGate(unittest.TestCase):
                 self.assertEqual(imm.series_min_est_rate(fake), 2.0)
         finally:
             imm.SERIES_OVERRIDES.pop(fake, None)
+
+    def test_diesel_strike_format(self):
+        # KXDIESELD strikes carry a T: KXDIESELD-26SEP28-T6.470
+        self._write(mu=4.0, sigma=0.005, ev="KXDIESELD-68DEC04")
+        self.assertEqual(imm.gb_gate_reason("KXDIESELD-68DEC04-T4.000", time.time(), 49, 51),
+                         ("", {}))
+        inp = imm.gb_gate_reason("KXDIESELD-68DEC04-T4.002", time.time(), 49, 51)[1]
+        self.assertEqual((inp["reason"], inp["bid_bad"]), ("band", True))
+        self.assertEqual(imm.gb_gate_reason("KXDIESELD-68DEC05-T4.000", time.time(), 49, 51)[1]["reason"],
+                         "no_read")
 
     def test_loader_drops_bad_rows(self):
         with open(imm.GB_FAIR_FILE, "w", encoding="utf-8") as f:

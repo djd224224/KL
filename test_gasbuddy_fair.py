@@ -73,7 +73,7 @@ class TestStateFair(unittest.TestCase):
         self.assertAlmostEqual(f["e"], round(gb.WEEKDAY_MODEL[4][3] * gb.NEW_STATE_SCALE, 5))
 
 
-class TestWriteFairFile(unittest.TestCase):
+class _WriterFixture(unittest.TestCase):
     """Thursday 2026-10-01 noon ET: the Friday-print events trade."""
 
     NOW = utc(2026, 10, 1, 16, 0)            # 12:00 EDT
@@ -86,6 +86,7 @@ class TestWriteFairFile(unittest.TestCase):
         self.anchors = {"KXAAAGASDCA": ("ok", 6.38), "KXAAAGASDTX": ("ok", 3.93)}
         self.prevs = {"CA": ("2026-09-30", 6.39), "TX": ("2026-09-30", 3.94)}
         self.hist = {"CA": {"2026-09-29": 6.37}, "TX": {"2026-09-29": 3.92}}
+        self.dhist = {"2026-09-29": 6.44, "2026-09-30": 6.46}
 
     def meta(self, updated="2026-10-01T11:55:00", today="2026-10-01"):
         return {"updated": updated, "today": today, "prev": "2026-09-30"}
@@ -102,16 +103,25 @@ class TestWriteFairFile(unittest.TestCase):
         self.calls["hist"].append(abbr)
         return self.hist.get(abbr, {})
 
-    def write(self, now=None, meta=None, live=None):
+    def write(self, now=None, meta=None, live=None, diesel=None):
         return gb.write_fair_file(
             self.path, now=now or self.NOW, meta=meta or self.meta(),
             live=live if live is not None else {"CA": 6.40, "TX": 3.955, "FL": 4.4},
             anchor_fn=self.anchor_fn, prev_fn=self.prev_fn, history_fn=self.hist_fn,
-            live_log=self.log, pace=0)
+            live_log=self.log, pace=0, diesel_live=diesel,
+            diesel_live_fn=lambda: None, diesel_hist_fn=self.diesel_hist_fn)
+
+    def diesel_hist_fn(self):
+        self.calls.setdefault("dhist", []).append(1)
+        return dict(self.dhist)
 
     def read(self):
         with open(self.path, encoding="utf-8") as f:
             return json.load(f)
+
+
+
+class TestWriteFairFile(_WriterFixture):
 
     def test_happy_path_and_once_a_day_reads(self):
         self.assertEqual(self.write(), (2, 0))
@@ -123,7 +133,7 @@ class TestWriteFairFile(unittest.TestCase):
         self.assertEqual((tx["mu"], tx["sigma"]), (want["mu"], want["sigma"]))
         self.assertEqual((tx["anchor"], tx["prev"], tx["prev_source"]), (3.93, 3.94, "gasbuddy"))
         self.assertEqual(tx["fetched_at"], self.NOW.isoformat())
-        self.assertEqual(len(d["absent"]), 49)                   # every other state
+        self.assertEqual(len(d["absent"]), 50)                   # other states + diesel
         self.assertEqual(self.calls["hist"], [])                 # Friday print: no b2
         n_anchor, n_prev = len(self.calls["anchor"]), len(self.calls["prev"])
         # five minutes later: anchors, absents and yesterday's averages are cached
@@ -136,7 +146,7 @@ class TestWriteFairFile(unittest.TestCase):
         self.write()
         n = len(self.calls["anchor"])
         self.write(now=utc(2026, 10, 1, 22, 5), meta=self.meta("2026-10-01T18:00:00"))
-        self.assertEqual(len(self.calls["anchor"]) - n, 49)
+        self.assertEqual(len(self.calls["anchor"]) - n, 50)     # 49 states + KXDIESELD
 
     def test_nothing_before_seven_et(self):
         early = utc(2026, 10, 1, 10, 30)                          # 06:30 EDT
@@ -188,7 +198,8 @@ class TestWriteFairFile(unittest.TestCase):
         ok, miss = gb.write_fair_file(self.path, now=self.NOW, meta=self.meta(),
                                       live={"CA": 6.4, "TX": 3.9}, anchor_fn=boom,
                                       prev_fn=self.prev_fn, history_fn=self.hist_fn,
-                                      live_log=self.log, pace=0)
+                                      live_log=self.log, pace=0,
+                                      diesel_live_fn=lambda: None)
         self.assertEqual((ok, miss), (0, 2))
         d = self.read()
         self.assertNotIn("KXAAAGASDTX", d["absent"])             # an error is not "absent"
@@ -206,6 +217,60 @@ class TestWriteFairFile(unittest.TestCase):
         self.assertEqual(rows[0]["live"]["CA"], 6.40)
 
 
+class TestDieselDaily(_WriterFixture):
+    """KXDIESELD (Jack 2026-09-27: "ok do that for diesel daily"): one
+    national entry per event from GasBuddy's live national diesel."""
+
+    def setUp(self):
+        super().setUp()
+        self.anchors["KXDIESELD"] = ("ok", 6.47)
+
+    def test_diesel_entry(self):
+        self.assertEqual(self.write(diesel=6.45), (3, 0))
+        e = self.read()["entries"]["KXDIESELD-26OCT02"]
+        alpha, b1, err = gb.DIESEL_MODEL
+        self.assertAlmostEqual(e["mu"], round(6.47 + alpha + b1 * (6.45 - 6.46), 5))
+        rem = gb.DIESEL_DAY_MOVE_SD * 0.5                        # noon ET
+        self.assertAlmostEqual(e["sigma"], round(math.sqrt(err ** 2 + (b1 * rem) ** 2), 5))
+        self.assertEqual((e["fuel"], e["prev"], e["prev_source"], e["anchor"]),
+                         ("diesel", 6.46, "gasbuddy", 6.47))
+        # the history is read once a day
+        self.write(now=utc(2026, 10, 1, 16, 5), meta=self.meta("2026-10-01T12:00:00"), diesel=6.45)
+        self.assertEqual(len(self.calls["dhist"]), 1)
+
+    def test_pending_anchor_no_live_and_close_fallback(self):
+        self.anchors["KXDIESELD"] = ("pending", None)             # settles ~09:00-09:40 ET
+        self.assertEqual(self.write(diesel=6.45), (2, 1))
+        self.assertIn("KXDIESELD", self.read()["missing"])
+        self.anchors["KXDIESELD"] = ("ok", 6.47)
+        self.assertEqual(self.write(diesel=None), (2, 1))       # no live diesel read
+        self.dhist = {}                                          # GasBuddy lacks yesterday
+        with open(self.path, encoding="utf-8") as f:
+            d = json.load(f)
+        d["diesel_closes"] = {"2026-09-30": {"US": 6.455}}
+        d.pop("diesel_finals", None)
+        d["tried_prev"] = {}
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        self.write(diesel=6.45)
+        e = self.read()["entries"]["KXDIESELD-26OCT02"]
+        self.assertEqual((e["prev"], e["prev_source"]), (6.455, "close"))
+
+    def test_monday_trading_skipped_for_diesel_too(self):
+        mon = utc(2026, 10, 5, 16, 0)
+        self.dhist = {"2026-10-04": 6.4}
+        self.write(now=mon, meta={"updated": "2026-10-05T11:55:00", "today": "2026-10-05",
+                                  "prev": "2026-10-04"}, diesel=6.41)
+        d = self.read()
+        self.assertEqual(d["entries"], {})
+        self.assertIn("KXDIESELD", d["missing"])
+
+    def test_live_log_carries_diesel(self):
+        self.write(diesel=6.45)
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["diesel_us"], 6.45)
+
+
 class TestFetchParsing(unittest.TestCase):
     def test_fetch_live_maps_names_and_learns_region_ids(self):
         payload = {"PriceRecords": [
@@ -216,6 +281,14 @@ class TestFetchParsing(unittest.TestCase):
         with mock.patch.object(gb, "_get", return_value=payload):
             self.assertEqual(gb.fetch_live(), {"CA": 6.356, "TX": 3.89})
         self.assertEqual(gb._REGION_IDS["CA"], 300005)
+
+    def test_fetch_live_diesel_reads_the_country_row(self):
+        with mock.patch.object(gb, "_get", return_value={"PriceRecords": [
+                {"RegionID": 500000, "RegionName": "USA", "Price": 6.445}]}) as g:
+            self.assertEqual(gb.fetch_live_diesel(), 6.445)
+            self.assertEqual((g.call_args[0][1]["fuelType"], g.call_args[0][1]["subRegionType"]), (1, 6))
+        with mock.patch.object(gb, "_get", return_value={"PriceRecords": []}):
+            self.assertIsNone(gb.fetch_live_diesel())
 
     def test_fetch_anchor_states(self):
         with mock.patch.object(gb, "_get", return_value={"markets": []}):

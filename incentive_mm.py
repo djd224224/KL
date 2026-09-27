@@ -5470,7 +5470,7 @@ _CONFIG_CODE_KNOBS = (
     # fair file's "model" block (gasbuddy_fair.py)
     "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",
     "GB_FAIR_SIGMA_LO_FRAC", "GB_FAIR_MAX_SIGMA_CENTS", "GB_FAIR_REFRESH_SECS",
-    "GB_STATE_MIN_RATE",
+    "GB_STATE_MIN_RATE", "GB_DIESEL_ENABLE",
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
     # (freeze, lags, staleness) ride in its status file's "knobs" block
     "QUAKE_ENABLE", "QUAKE_SERIES", "QUAKE_MARGIN_CENTS", "QUAKE_USGS_POLL_SECS",
@@ -6387,14 +6387,33 @@ GB_FAIR_FILE = os.environ.get(
 # ~$2/day of estimate too -- 4 of 68 gate-passing strikes cleared it on
 # 9/27. IMM_GB_STATE_MIN_RATE=2 restores the national bar.
 GB_STATE_MIN_RATE = _env_float("IMM_GB_STATE_MIN_RATE", 0.0)
-_GB_STRIKE_RE = re.compile(r"-(\d+(?:\.\d+)?)$")
+# DIESEL DAILY (Jack 2026-09-27: "ok do that for diesel daily"). KXDIESELD --
+# AAA's national diesel average, quoted since 2026-08-02 without a fair --
+# joins the gate: gasbuddy_fair.py writes a national diesel entry per event
+# into the same file (GasBuddy's live national diesel + Kalshi's settled
+# anchor; 0.24c + 0.76 x the day's GasBuddy move, residual 1.69c on 39 days
+# vs 2.9c carried forward), and the family is gated exactly like the states:
+# fail CLOSED, band at tol 0, the 2c sigma cap, no slot without a read. The
+# anchor settles ~09:00-09:40 ET, after the 08:00 open, and on the linear
+# remain default the sigma cap holds until mid-afternoon -- September's
+# KXDIESELD fills lost -3.8 to -7.0c/ct in 08:00-15:59 ET and made +0.4 to
+# +1.7c/ct after 16:00. KXDIESELW is NOT included (GasBuddy only sharpens
+# the forecast 1-3 prints out). IMM_GB_DIESEL_ENABLE=0 returns KXDIESELD to
+# plain quoting.
+GB_DIESEL_ENABLE = GB_FAIR_ENABLE and os.environ.get("IMM_GB_DIESEL_ENABLE", "1") == "1"
+GB_DIESEL_SERIES = "KXDIESELD"
+# strike segment: the states' "-6.3950", the diesel daily's "-T6.470"
+_GB_STRIKE_RE = re.compile(r"-T?(\d+(?:\.\d+)?)$")
 _gb_fair_state: dict = {"mtime": 0.0, "entries": {}}
 
 
 def gb_fair_series(series: str) -> bool:
-    """True for a two-letter AAA state daily (KXAAAGASDCA), never the national
-    KXAAAGASD or anything longer."""
-    return GB_FAIR_SERIES_RE.fullmatch(series or "") is not None
+    """True for a two-letter AAA state daily (KXAAAGASDCA) and, while
+    GB_DIESEL_ENABLE, the national diesel daily KXDIESELD -- never the
+    national gas KXAAAGASD, KXDIESELW or anything longer."""
+    s = series or ""
+    return (GB_FAIR_SERIES_RE.fullmatch(s) is not None
+            or (GB_DIESEL_ENABLE and s == GB_DIESEL_SERIES))
 
 
 def load_gb_fair() -> int:
@@ -14781,7 +14800,8 @@ class IncentiveMarketMaker:
                 f"{OR_FAIR_REFRESH_SECS}s ({OR_FAIR_FAST_SECS}s for "
                 f"{OR_FAIR_FAST_WINDOW_MIN}m after 00:00Z), file {OR_FAIR_FILE}")
         if GB_FAIR_ENABLE:
-            log(f"gb-fair gate: AAA state dailies fail-closed at-touch, tol "
+            log(f"gb-fair gate: AAA state dailies"
+                f"{' + KXDIESELD' if GB_DIESEL_ENABLE else ''} fail-closed at-touch, tol "
                 f"{GB_FAIR_TOL_CENTS}c, band sigma x{GB_FAIR_SIGMA_LO_FRAC:g}-1, "
                 f"max sigma {GB_FAIR_MAX_SIGMA_CENTS:g}c, ttl {GB_FAIR_TTL_MIN}m, "
                 f"refresh {GB_FAIR_REFRESH_SECS}s, file {GB_FAIR_FILE}")

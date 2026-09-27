@@ -65,6 +65,21 @@ or a live update newer than GB_MAX_AGE_MIN; Monday trading (the Tuesday
 print) is skipped outright until it has been measured
 (GB_SKIP_PRINT_WEEKDAYS).
 
+DIESEL DAILY (Jack 2026-09-27: "ok do that for diesel daily"). KXDIESELD
+settles on AAA's NATIONAL diesel average (posted ~03:20 ET on the print date,
+settled by Kalshi ~09:00-09:40 ET); each event trades 08:00 ET the day
+before until 01:59 ET on the print date. GasBuddy's diesel is fuel type 1:
+the national live average comes from the map endpoint at country level
+(subRegionType 6 -- LiveAvg ignores the fuel type), the Full Day Averages
+from the chart. Measured on 39 print days (Aug 3 - Sep 27):
+    AAA_d(D) - AAA_d(D-1) = 0.24c + 0.76 x (GB_d(D-1) - GB_d(D-2)) + e,
+    sd(e) 1.69c  (carried forward: 2.9c)
+AAA's diesel tracks GasBuddy's SAME-date diesel even closer (corr 0.98,
+0.66c): GasBuddy's diesel runs about a day behind, and that figure is only
+published after the close, so it cannot be used. No weekday structure is
+fitted (too few days); the Tuesday print is skipped as for gas. One entry
+per event, KXDIESELD-<print date>, same fields as a state's.
+
 Standalone:  python gasbuddy_fair.py [--out path]
 """
 
@@ -183,6 +198,10 @@ STATE_ADJ = {
 }
 NEW_STATE_SCALE = 1.25               # a state with no history yet
 
+DIESEL_SERIES = "KXDIESELD"
+DIESEL_MODEL = (0.0024, 0.76, 0.0169)     # alpha, b1, e in dollars (39 days)
+DIESEL_DAY_MOVE_SD = 0.0357               # sd of GasBuddy's daily diesel move
+
 _MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP",
            "OCT", "NOV", "DEC"]
 
@@ -235,6 +254,39 @@ def fetch_live() -> Dict[str, float]:
             continue
         if ab and math.isfinite(p) and p > 0:
             out[ab] = p
+    return out
+
+
+def fetch_live_diesel() -> Optional[float]:
+    """GasBuddy's live NATIONAL diesel average (map endpoint, country level)."""
+    d = _get(f"{GB_API}/HeatMap/GetMapData",
+             {"regionID": US, "subRegionType": 6, "fuelType": 1, "timeType": 1,
+              "masterRegionType": 6, "masterRegionIDForRanking": US,
+              "calculationType": 1})
+    for rec in (d or {}).get("PriceRecords") or []:
+        if str(rec.get("RegionName") or "").strip() in ("USA", "United States"):
+            try:
+                p = float(rec.get("Price"))
+            except (TypeError, ValueError):
+                return None
+            return p if math.isfinite(p) and p > 0 else None
+    return None
+
+
+def fetch_diesel_history() -> Dict[str, float]:
+    """National diesel Full Day Averages over the last month: date -> price."""
+    r = requests.post(f"{GB_API}/HighChart/GetHighChartRecords/",
+                      json={"regionID": [US], "fuelType": 1, "timeWindow": [4],
+                            "frequency": 1}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    out: Dict[str, float] = {}
+    for block in r.json() or []:
+        for row in block.get("USList") or []:
+            try:
+                d = datetime.strptime(str(row["datetime"]), "%m/%d/%Y").date()
+                out[d.isoformat()] = float(row["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
     return out
 
 
@@ -339,6 +391,19 @@ def state_fair(abbr: str, print_day: date, anchor: float, live: float,
             "e": round(e * scale, 5), "remain": round(rem, 5)}
 
 
+def diesel_fair(print_day: date, anchor: float, live: float, prev: float,
+                now_et: datetime) -> dict:
+    """N(mu, sigma) in dollars for AAA's national diesel print on print_day."""
+    alpha, b1, e = DIESEL_MODEL
+    hour = now_et.hour + now_et.minute / 60.0
+    rem = DIESEL_DAY_MOVE_SD * min(1.0, max(0.0, (24.0 - hour) / 24.0))
+    mu = anchor + alpha + b1 * (live - prev)
+    sigma = GB_SIGMA_MULT * math.sqrt(e ** 2 + (b1 * rem) ** 2)
+    return {"mu": round(mu, 5), "sigma": round(sigma, 5),
+            "weekday": print_day.weekday(), "alpha": alpha, "b1": b1, "b2": 0.0,
+            "e": e, "remain": round(rem, 5)}
+
+
 def _read_json(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
@@ -355,7 +420,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     prev_fn: Optional[Callable] = None,
                     history_fn: Optional[Callable] = None,
                     live_log: Optional[str] = None,
-                    pace: float = CALL_PACE_SECS) -> Tuple[int, int]:
+                    pace: float = CALL_PACE_SECS,
+                    diesel_live: Optional[float] = None,
+                    diesel_live_fn: Optional[Callable] = None,
+                    diesel_hist_fn: Optional[Callable] = None) -> Tuple[int, int]:
     """Fetch (unless given), build and atomically write the fair file.
     Returns (events with an entry, series without one). Anchors, absent
     states, Full Day Averages ("finals") and each day's last live read
@@ -374,11 +442,17 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     anchor_fn = anchor_fn or fetch_anchor
     prev_fn = prev_fn or fetch_prev
     history_fn = history_fn or fetch_history
+    diesel_hist_fn = diesel_hist_fn or fetch_diesel_history
     old = _read_json(path)
     if meta is None:
         meta = fetch_live_avg(US)
     if live is None:
         live = fetch_live()
+    if diesel_live is None:
+        try:
+            diesel_live = (diesel_live_fn or fetch_live_diesel)()
+        except Exception:
+            diesel_live = None                # the diesel entry just goes missing
     upd = live_updated_utc(meta)
     live_fresh = (upd is not None
                   and (now - upd).total_seconds() <= GB_MAX_AGE_MIN * 60
@@ -393,6 +467,9 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     finals, closes = _days("finals"), _days("closes")
     if live_fresh and live:
         closes[today.isoformat()] = dict(live)
+    dfinals, dcloses = _days("diesel_finals"), _days("diesel_closes")
+    if live_fresh and diesel_live:
+        dcloses[today.isoformat()] = {"US": diesel_live}
     anchors: Dict[str, dict] = {s: a for s, a in (old.get("anchors") or {}).items()
                                 if isinstance(a, dict)}
     absent: Dict[str, float] = {s: float(t) for s, t in (old.get("absent") or {}).items()
@@ -468,6 +545,51 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             print_day=print_day.isoformat(),
             live_updated=upd.isoformat() if upd else None,
             fetched_at=now.isoformat())
+    # ---- the national diesel daily (KXDIESELD): the anchor settles ~09:00-
+    # 09:40 ET, after the event opens, so it reads "pending" until then
+    if trading and absent.get(DIESEL_SERIES, 0.0) <= now.timestamp() - ABSENT_RECHECK_SECS:
+        series = DIESEL_SERIES
+        a = anchors.get(series) or {}
+        ok = a.get("date") == today.isoformat()
+        if not ok:
+            try:
+                status, val = anchor_fn(series, today)
+            except Exception:
+                status, val = "error", None
+                failed += 1
+            finally:
+                time.sleep(pace)
+            if status == "absent":
+                absent[series] = now.timestamp()
+            elif status == "ok":
+                absent.pop(series, None)
+                a = anchors[series] = {"date": today.isoformat(), "value": val}
+                ok = True
+            else:                                 # pending / read error
+                missing.append(series)
+        if ok:
+            if yday.isoformat() not in dfinals and tried_prev.get("diesel") != today.isoformat():
+                try:
+                    for d, p in diesel_hist_fn().items():
+                        if d >= keep_from:
+                            dfinals.setdefault(d, {})["US"] = p
+                    tried_prev["diesel"] = today.isoformat()
+                except Exception:
+                    pass
+            pv, src = (dfinals.get(yday.isoformat()) or {}).get("US"), "gasbuddy"
+            if pv is None:
+                pv, src = (dcloses.get(yday.isoformat()) or {}).get("US"), "close"
+            if (print_day.weekday() in GB_SKIP_PRINT_WEEKDAYS or not live_fresh
+                    or diesel_live is None or pv is None):
+                missing.append(series)
+            else:
+                f = diesel_fair(print_day, a["value"], diesel_live, pv, now_et)
+                entries[event_ticker(series, print_day)] = dict(
+                    f, series=series, fuel="diesel", anchor=a["value"],
+                    anchor_date=a["date"], live=diesel_live, prev=pv,
+                    prev_source=src, prev2=None, print_day=print_day.isoformat(),
+                    live_updated=upd.isoformat() if upd else None,
+                    fetched_at=now.isoformat())
     if failed:
         _log(f"! Kalshi anchor read failed for {failed} series; retrying next refresh")
     # the intraday record the remain() curve gets calibrated from, one row
@@ -482,7 +604,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
         with open(lp, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"ts": now.isoformat(), "updated": upd.isoformat(),
-                                 "day": meta.get("today"), "live": live},
+                                 "day": meta.get("today"), "live": live,
+                                 "diesel_us": diesel_live},
                                 sort_keys=True) + "\n")
         logged = upd.isoformat()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -494,6 +617,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                    "entries": entries, "missing": sorted(set(missing)),
                    "anchors": anchors, "absent": absent, "finals": finals,
                    "closes": closes, "tried_prev": tried_prev,
+                   "diesel_finals": dfinals, "diesel_closes": dcloses,
                    "live_logged": logged or None,
                    "model": {"sigma_mult": GB_SIGMA_MULT,
                              "max_age_min": GB_MAX_AGE_MIN,

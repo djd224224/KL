@@ -4423,3 +4423,39 @@ dry-run mirror: the loop places exactly the sides the estimator counts on
 49x51 / 3x50 / 80x92 / 1x99 books), TestRateFloorSchedule (3). Every one of
 8 targeted mutations fails them. TestFloorRealizedAnchor.test_never_scales_up
 compared two reads ms apart on a sliding window at 9 places (flaky); now 6.
+
+### 2026-09-27 pm — KXDIESELD joins the GasBuddy gate (Jack: "ok do that for diesel daily")
+
+KXDIESELD settles on AAA's NATIONAL diesel average (posted ~03:20 ET, settled
+~09:00-09:40 ET); each event trades 08:00 ET the day before to 01:59 ET on the
+print date. The bot has quoted it ungated since 2026-08-02: September's fills
+lost -$178 on 5,942 ct (-3.0c/ct; sell-YES -8.0c/ct in a rising market;
+08:00-15:59 ET -3.8/-7.0c/ct, after 16:00 +0.4/+1.7c/ct), credits ~$63 over
+9/6-9/22 in reward_credits.csv.
+
+GasBuddy diesel (fuel type 1): live national average from the map endpoint
+at country level (subRegionType 6; LiveAvg ignores the fuel type), Full Day
+Averages from the chart. Measured on 39 print days (Aug 3 - Sep 27): AAA_d(D)
+- AAA_d(D-1) = 0.24c + 0.76 x (GB_d(D-1) - GB_d(D-2)), residual 1.69c vs
+2.9c carried forward. AAA's diesel matches GasBuddy's SAME-date diesel more
+closely (corr 0.98, 0.66c) -- GasBuddy's diesel runs about a day behind --
+but that figure is published after the close. Replay of the September fills
+at tol 0: GasBuddy's end-of-day value known -> allowed +7.5c/ct (2,185 ct),
+blocked -32c/ct (1,204 ct); day's move revealed linearly -> no separation.
+
+gasbuddy_fair.py writes a KXDIESELD-<print date> entry beside the states
+(DIESEL_MODEL alpha 0.24c / b1 0.76 / e 1.69c, DIESEL_DAY_MOVE_SD 3.57c for
+the linear remain default; diesel_finals / diesel_closes in the file; the
+live log rows carry diesel_us). The anchor reads "pending" until Kalshi
+settles the day's print (~09:00-09:40 ET), so the first hour or two after the
+08:00 open stands aside; the 2c sigma cap then holds until mid-afternoon on
+the linear default -- the hours where September's fills lost. Mondays are
+skipped as for gas. incentive_mm: gb_fair_series() includes KXDIESELD while
+GB_DIESEL_ENABLE (IMM_GB_DIESEL_ENABLE, default 1; 0 = plain quoting as
+before); the strike regex takes the "-T6.470" form; the national gas daily,
+KXDIESELW and KXDIESELMONAK are untouched. Dry run 9/27 17:11 ET: Monday print
+AAA ~6.4566 +-1.86c (Sunday 6.4709, GasBuddy -2.2c today); against the live
+books 18 of 21 strikes quotable, 3 stood aside (a 99c bid on T6.435 vs fair
+88c, a 59c ask on T6.450 vs 64c, a 5c ask on T6.470 vs 23c). Tests:
+TestDieselDaily (4), the diesel fetch parser, gate strike format + series
+membership; 950 green across the IMM suites.
