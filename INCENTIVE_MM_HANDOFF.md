@@ -4369,3 +4369,57 @@ payout. Unforced: near-cliff holds 4100/4200 ($0.92 projected, banked $0.88-
 $ProbeEnv once, so this needs restart_imm.ps1 -Task; the code sync alone does
 not pick it up.
 Tests: TestRequoteInterleave (7), TestForceEventsEmptied (2).
+
+## 2026-09-27 pm — Estimator fidelity: Carbon Arc cut scheduled, loop's side band in the estimate, schedule-weighted rate bar (Jack)
+
+Jack, on the three scan items explained but not built: "fix all 3". One
+block of knobs after KEEP_ACCRUAL_WHILE_PROGRAMMED; all three default ON.
+
+(1) FLOOR_PROJECTION_SIDES. The floor projection read side_size_mults (the
+Carbon Arc late-month cut: no bids, asks at half size from 00:00 ET fourteen
+days before the measurement month ends) once, at `now`, for the whole window.
+floor_size_profile() now splits the window at every side-rule change point
+(side_mult_change_points: ca_late_window_start) and walks each piece with
+size_mult_profile, so keys are (hour, bid, ask) multipliers and a step past
+the 14-day walk cap still lands. Real estimator on a 45x48 KXAMZNCC book at
+frozen October dates: the old projection for the Oct 12 -> Oct 19 15:02Z
+period was 16% phantom at the period start, 35% on Oct 16, 55% on Oct 17;
+identical once inside the window. First bites the October cycle (window
+start Oct 18 04:00Z); September-cycle CA markets already stopped 9/26.
+Profiles of every non-CA series are unchanged (462 random windows, max
+weight diff 1e-16). Logging: floor_by_mult rows with non-unit side mults
+carry [.., bid_mult, ask_mult]; floor_mult_profile tokens are tagged
+"1/b0a0.5:0.210". Kill: IMM_FLOOR_PROJECTION_SIDES=0.
+
+(2) ESTIMATE_SIDE_BAND. The estimator's probe ladder now builds a side only
+when the loop would place it (that side's EXTERNAL touch inside
+member_price_band(series, True) -- the band a selected market quotes in)
+and passes the loop's rung band (RUNG_DEEP_FLOOR on a healthy book, else
+the band floor, .. band top). quotable_sides reads the same test on the
+external touches (an incumbent's own orders stripped), so a challenger's
+91-93c ask now counts as a side. Replay 9/20-27 (1,251 fresh admissions):
+94 logged quotable_sides=0, 90 had no side the loop could place (52 on 1c x
+99c opens; KXYUMTBFT, KXMCDFT, KXDIESELD, KXBA ...); 89 logged one-sided were
+two-sided in the member band. Caveat, measured: those 90 books mostly filled
+in -- first-hour realized est_frac a median 2.4x the admission estimate
+(n=64) -- so for fresh markets the fix mostly moves admission to when the
+book is quotable (+ the admission clock). Members: the 38 that sat wholly
+out of band 30+ min on 9/27 were all curated (KXRAIN), finecon (KXCBD,
+KXSPRLVL), forced (KXFSLR) or banked >= $0.85, so none would have exited.
+Kill: IMM_ESTIMATE_SIDE_BAND=0.
+
+(3) RATE_FLOOR_SCHEDULE. The $2/day rate bar (68 series) compared the
+live-size est_dollars_per_day; it now compares floor_dollars_per_day
+(rate_floor_rate), the rate the payout floor and horizon escape already use.
+Consequence, measured on 9/26-27 snapshots: the schedule-weighted rate runs
+a median 1.39x normal size for long-dated series and 0.68x for the gas /
+diesel dailies, so the bar is now ~$1.44/day of normal-size earnings for
+the former (was $2 by day, $1 overnight, $1.33 Saturday) and ~$2.94 for the
+latter (was $2 by day, $4 in the evening) -- at every hour. No new-event
+candidate in the 9/26-27 snapshots changes verdict. selection rows add
+rate_est. Kill: IMM_RATE_FLOOR_SCHEDULE=0.
+Tests: TestFloorSideSchedule (10), TestEstimatorSideBand (8, incl. a
+dry-run mirror: the loop places exactly the sides the estimator counts on
+49x51 / 3x50 / 80x92 / 1x99 books), TestRateFloorSchedule (3). Every one of
+8 targeted mutations fails them. TestFloorRealizedAnchor.test_never_scales_up
+compared two reads ms apart on a sliding window at 9 places (flaky); now 6.

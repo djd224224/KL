@@ -4909,6 +4909,13 @@ def rate_floor_projected(accrued: float, est_total: float, peak: float,
     projection."""
     cap = min(1.0, RATE_FLOOR_ESCAPE_DAYS / max(quotable_days, 1.0 / 24))
     return accrued + max(est_total, peak) * cap
+
+
+def rate_floor_rate(meta) -> float:
+    """The $/day the per-series rate bar compares: the schedule-weighted
+    floor rate (RATE_FLOOR_SCHEDULE), else the live-size estimate."""
+    return meta.floor_dollars_per_day if RATE_FLOOR_SCHEDULE \
+        else meta.est_dollars_per_day
 # The floor is a hard threshold on a NOISY estimate (thin books swing the
 # share estimate ±50% between refreshes), so borderline markets could flap
 # just under $1 at every sampling instant and never enter (observed
@@ -5110,8 +5117,10 @@ FLOOR_PROJECTION_REALIZED = os.environ.get("IMM_FLOOR_PROJECTION_REALIZED", "1")
 # peak and the rate-floor escape all read MarketMeta.floor_dollars_per_day:
 # the share the DAY ladder (hour/Saturday multiplier off; the family
 # multiplier and the Carbon Arc late-month rule kept -- those are not
-# time-of-day) would earn on the EXTERNAL book. Equal to est_dollars_per_day
-# whenever no multiplier is active. Ranking / yield keep the live estimate.
+# time-of-day, though the late-month rule IS clock-driven and follows its
+# own window start since FLOOR_PROJECTION_SIDES) would earn on the EXTERNAL
+# book. Equal to est_dollars_per_day whenever no multiplier is active.
+# Ranking / yield keep the live estimate.
 # IMM_FLOOR_PROJECTION_BASE_SIZE=0 restores the live-size projection.
 FLOOR_PROJECTION_BASE_SIZE = os.environ.get(
     "IMM_FLOOR_PROJECTION_BASE_SIZE", "1") == "1"
@@ -5145,6 +5154,66 @@ FLOOR_PROFILE_MAX_DAYS = _env_float("IMM_FLOOR_PROFILE_MAX_DAYS", 14.0)
 # restores the known_tickers-only prune.
 KEEP_ACCRUAL_WHILE_PROGRAMMED = os.environ.get(
     "IMM_KEEP_ACCRUAL_WHILE_PROGRAMMED", "1") == "1"
+# ESTIMATOR FIDELITY (Jack 2026-09-27, "fix all 3" -- ROI scan). Three places
+# where what the estimator scored was not what the loop would do.
+#
+# (1) THE FLOOR PROJECTION FOLLOWS THE PER-SIDE SCHEDULE TOO.
+# side_size_mults() is clock-driven like the hour schedule: the Carbon Arc
+# late-month rule takes a market from full size to NO bids and half-size
+# asks at ca_late_window_start (00:00 ET fourteen days before the
+# measurement month ends: Oct 18 for the October cycle). The projection read
+# it once, at `now`, for the whole window, so a weekly period that runs into
+# the window start (Oct 12 -> Oct 19) was projected at full size through its
+# last ~35 hours, when about a quarter of that share rests. On a 45x48 book,
+# 16% of the projection made at the period start did not exist, 35% of the
+# one made Oct 16 and 55% of Oct 17's -- exactly where the near-cliff and
+# hopeless verdicts get made. floor_size_profile() splits the window at
+# every side-rule change point and scores each hour at the (hour, bid, ask)
+# multipliers the loop will rest then. IMM_FLOOR_PROJECTION_SIDES=0 restores
+# the side multipliers read at `now` for the whole window.
+FLOOR_PROJECTION_SIDES = os.environ.get("IMM_FLOOR_PROJECTION_SIDES", "1") == "1"
+# (2) THE ESTIMATOR BUILDS ONLY THE SIDES THE LOOP PLACES. The quote loop
+# rests a side only while that side's own EXTERNAL touch sits inside the
+# band it quotes a selected market in (member_price_band: 5-93, sports
+# ladders 1-99), with at-ref rungs clamped to (2 on a healthy book, else the
+# band floor)..93. Under atref the estimator built any side with a reference
+# price, touch anywhere, and priced its rungs on the 5-90 series band:
+# KXAAAGASD-26SEP21-4.5050 opened 1c x 99c, the loop could rest nothing
+# (band_both_out), the estimator scored both sides at $2.94/day, and the
+# market took one of its event's slots. 9/20-27: 94 admissions logged no
+# quotable side, 90 had no side the loop could place (52 of them 1c x 99c
+# opens). Now each side must pass the loop's own test and its rungs get the
+# loop's own band: no placeable side scores $0 (fresh: not admitted;
+# member: the hopeless clock runs), a one-sided book scores one side.
+# quotable_sides reads the same test on the same EXTERNAL touches, so the
+# top-N two-sided tie-break and the estimate cannot disagree (a challenger's
+# 91-93c ask now counts: the loop places it once the market is selected).
+# What it changes in practice is mostly WHEN: those 90 books filled in and
+# earned a median 2.4x their admission estimate within the hour, so they now
+# enter once the book is quotable plus the admission clock; and the 38
+# members that sat wholly out of band 30+ min on 9/27 were all curated,
+# finecon, forced or banked >= $0.85, so none would have been exited.
+# IMM_ESTIMATE_SIDE_BAND=0 restores the unbanded estimate.
+ESTIMATE_SIDE_BAND = os.environ.get("IMM_ESTIMATE_SIDE_BAND", "1") == "1"
+# (3) THE $/DAY RATE BAR READS THE SCHEDULE-WEIGHTED RATE. The per-series
+# rate floor (series_min_est_rate: $2/day on 68 re-entry / Treasury /
+# gas-daily series) compared est_dollars_per_day, which carries the LIVE
+# size multiplier: x2 in the quiet 0-9 ET hours and x1.5 on Saturdays for
+# long-dated series, x0.5 from 16:00 ET for the gas and diesel dailies. In
+# normal-size terms the bar was $2.00/day on a weekday daytime refresh,
+# $1.00 overnight, $1.33 on Saturday daytime and $4.00 on a gas/diesel
+# evening, and it held whatever it decided (members are never re-tested).
+# It now reads floor_dollars_per_day -- the same schedule-weighted rate the
+# payout floor and the horizon escape already use -- so the verdict no
+# longer depends on the hour of the refresh. That rate ran a median 1.39x
+# the normal-size rate for long-dated series and 0.68x for the gas/diesel
+# dailies (9/26-27 snapshots, the half-size evening), so the bar now sits
+# near $1.44/day and $2.94/day of normal-size earnings respectively, at
+# every hour. Replayed on the 9/26-27 hourly snapshots, no new-event
+# candidate changes verdict (KXDIESELD's 120 readings topped out at $1.89,
+# KXUST30AD's 35 at $1.37; KXAAAGASD's 4 cleared at ~$13).
+# IMM_RATE_FLOOR_SCHEDULE=0 restores the live-size rate.
+RATE_FLOOR_SCHEDULE = os.environ.get("IMM_RATE_FLOOR_SCHEDULE", "1") == "1"
 
 
 def _quotable_days(meta, now_utc: datetime) -> float:
@@ -5398,6 +5467,9 @@ _CONFIG_CODE_KNOBS = (
     "RESTART_KEEP_MIN_CUTOFF_SECS",
     "FLOOR_PROJECTION_REALIZED", "NEAR_CLIFF_ROOM_PRIORITY",
     "REQUOTE_INTERLEAVE", "FORCE_EVENTS",
+    # ...and the estimator-fidelity trio: per-side floor schedule, the
+    # loop's side band in the estimate, the schedule-weighted rate bar
+    "FLOOR_PROJECTION_SIDES", "ESTIMATE_SIDE_BAND", "RATE_FLOOR_SCHEDULE",
 )
 
 
@@ -6445,6 +6517,60 @@ def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
     if series_bid_only(series_of(ticker)):
         am = 0.0
     return bm, am
+
+
+def side_mult_change_points(ticker: str) -> List[datetime]:
+    """UTC instants at which side_size_mults() can change value for this
+    market: the Carbon Arc late-month window start (the bid-only family is
+    constant). A new clock-driven per-side rule must list its change points
+    here, or floor_size_profile() scores it at one instant per piece."""
+    if not carbon_arc_settled(series_of(ticker)):
+        return []
+    ws = ca_late_window_start(ticker)
+    return [ws] if ws is not None else []
+
+
+def floor_size_profile(series: str, ticker: str, start_utc: datetime,
+                       horizon_days: float, hour_schedule: bool = True
+                       ) -> List[Tuple[Tuple[float, float, float], float]]:
+    """[((hour_mult, bid_mult, ask_mult), share of the window)], sorted: the
+    size_mult_profile() mix with the per-side multipliers (side_size_mults)
+    each hour will carry. The window is split at every side-rule change
+    point (FLOOR_PROJECTION_SIDES) and each piece walked on its own, so a
+    step the 14-day walk cap would never reach still lands at its instant.
+    `hour_schedule` False = the flat day size (FLOOR_PROJECTION_SCHEDULE
+    off) with the side split kept. An empty window reports the live
+    multipliers alone."""
+    if horizon_days <= 0:
+        return [((hour_size_mult(series, start_utc),)
+                 + side_size_mults(ticker, start_utc), 1.0)]
+    end = start_utc + timedelta(days=horizon_days)
+    cuts = sorted(c for c in side_mult_change_points(ticker)
+                  if start_utc < c < end) if FLOOR_PROJECTION_SIDES else []
+    bounds = [start_utc] + cuts + [end]
+    weights: Dict[Tuple[float, float, float], float] = {}
+    for a, b in zip(bounds, bounds[1:]):
+        days = (b - a).total_seconds() / 86400.0
+        if days <= 0:
+            continue
+        # constant inside a piece; with the split off, the `now` reading
+        sides = side_size_mults(ticker, a + (b - a) / 2 if cuts else start_utc)
+        hp = size_mult_profile(series, a, days) if hour_schedule else [(1.0, 1.0)]
+        for m, w in hp:
+            k = (m,) + sides
+            weights[k] = weights.get(k, 0.0) + w * days
+    total = sum(weights.values()) or 1.0
+    return sorted((k, w / total) for k, w in weights.items())
+
+
+def floor_profile_str(profile: List[Tuple[Tuple[float, float, float], float]]) -> str:
+    """'1:0.583,2:0.417' (the hour mix), a key whose side multipliers are not
+    (1, 1) tagged '/b<bid>a<ask>': '1:0.790,1/b0a0.5:0.210'."""
+    out = []
+    for (m, bm, am), w in profile:
+        tag = "" if (bm, am) == (1.0, 1.0) else f"/b{bm:g}a{am:g}"
+        out.append(f"{m:g}{tag}:{w:.3f}")
+    return ",".join(out)
 
 
 def quake_event_day(event_ticker: str) -> Optional[datetime]:
@@ -10746,6 +10872,8 @@ class IncentiveMarketMaker:
                         # the admission clock (2026-09-27): held-above time
                         "above_secs": round(above_secs),
                         "rate_bar": series_min_est_rate(meta.series),
+                        # the $/day the rate bar compares (RATE_FLOOR_SCHEDULE)
+                        "rate_est": round(rate_floor_rate(meta), 4),
                         "rate_proj": round(rate_floor_projected(
                             accrued, est_total, proj_peak, qdays), 4),
                         "new_event": meta.event_ticker not in prev_events,
@@ -10818,7 +10946,7 @@ class IncentiveMarketMaker:
             elif meta.ticker not in prev_selected \
                     and meta.event_ticker not in prev_events \
                     and meta.event_ticker not in FORCE_EVENTS \
-                    and meta.est_dollars_per_day < series_min_est_rate(meta.series) \
+                    and rate_floor_rate(meta) < series_min_est_rate(meta.series) \
                     and rate_floor_projected(accrued, est_total, proj_peak,
                                              qdays) \
                     < RATE_FLOOR_TOTAL_ALT:
@@ -11740,37 +11868,65 @@ class IncentiveMarketMaker:
         # see the size the quote loop will actually rest.
         # (side_size_mults: the same rule plus the bid-only quake family)
         _cbm, _cam = side_size_mults(meta.ticker, _now)
+        # The band the quote loop quotes a SELECTED market in -- which every
+        # candidate is by the time the loop reaches it (ESTIMATE_SIDE_BAND).
+        _qlo, _qhi = member_price_band(meta.series, True)
+
+        def _sides_in_band(eb: Optional[int],
+                           ea: Optional[int]) -> Tuple[bool, bool]:
+            """The quote loop's PER-SIDE TOP-IN-BAND test (Jack 2026-08-03):
+            may the bid / ask side rest, on these EXTERNAL touches?"""
+            return (eb is not None and _qlo <= eb <= _qhi,
+                    ea is not None and _qlo <= ea <= _qhi)
+
         def _probe_ladder(hm: float, lv: List[Tuple[int, int]],
                           rmb: float, rma: float,
                           eb: Optional[int], ea: Optional[int],
-                          rpb: Optional[int], rpa: Optional[int]) -> List[Quote]:
+                          rpb: Optional[int], rpa: Optional[int],
+                          sides: Optional[Tuple[float, float]] = None
+                          ) -> List[Quote]:
             """The buildable ladder at hour multiplier `hm` on rung sizes
             `lv`, per-side reference multipliers `rmb` / `rma`, external
             touches `eb` / `ea` and reference prices `rpb` / `rpa` -- pure
             local arithmetic on the book already read. Called at the live
             multiplier for the yield estimate and at 1.0 (day size) for the
-            floor projection (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25)."""
-            lvb, lva = scale_levels(lv, _cbm), scale_levels(lv, _cam)
+            floor projection (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25).
+            `sides` = the (bid, ask) side multipliers, default the live
+            side_size_mults; the floor projection passes each window
+            piece's own (FLOOR_PROJECTION_SIDES)."""
+            sbm, sam = (_cbm, _cam) if sides is None else sides
+            lvb, lva = scale_levels(lv, sbm), scale_levels(lv, sam)
             smb, sma = clamp_side_max_to_position_cap(
                 int(round(sum(s for _t, s in lvb) * rmb)),
                 int(round(sum(s for _t, s in lva) * rma)),
                 series_max_position(meta.series))
             out: List[Quote] = []
-            # atref: the band gates PLACEMENT no longer follows the touch, so
-            # a touch outside the band must not kill the side (rain books
-            # trade whole cities under 5c).
-            if eb is not None and (
+            band: Optional[Tuple[int, int]] = None
+            if ESTIMATE_SIDE_BAND:
+                # the quote loop's side test and rung band, verbatim: a side
+                # rests only while its own touch is in the band (which also
+                # satisfies the loop's px_ok), and its rungs clamp to the
+                # deep floor on a healthy book, else the band floor
+                bid_ok, ask_ok = _sides_in_band(eb, ea)
+                band = (RUNG_DEEP_FLOOR if (bid_ok and ask_ok) else _qlo, _qhi)
+            else:
+                # atref: the band gates PLACEMENT no longer follows the touch,
+                # so a touch outside the band must not kill the side (rain
+                # books trade whole cities under 5c).
+                bid_ok = eb is not None and (
                     (LADDER_MODE == "atref" and rpb is not None)
-                    or eb >= series_price_min(meta.series)):
+                    or eb >= series_price_min(meta.series))
+                ask_ok = ea is not None and (
+                    (LADDER_MODE == "atref" and rpa is not None)
+                    or ea <= series_price_max(meta.series))
+            if bid_ok:
                 out += build_side_ladder(meta.ticker, "bid", eb, ea,
                                          smb, levels=lvb, ref_px=rpb,
-                                         hour_mult=hm)
-            if ea is not None and (
-                    (LADDER_MODE == "atref" and rpa is not None)
-                    or ea <= series_price_max(meta.series)):
+                                         band=band, hour_mult=hm)
+            if ask_ok:
                 out += build_side_ladder(meta.ticker, "ask", ea, eb,
                                          sma, levels=lva, ref_px=rpa,
-                                         hour_mult=hm)
+                                         band=band, hour_mult=hm)
             if series_bid_only(meta.series):
                 # quake gate: the bids the loop will rest, capped at fair
                 _qcap = quake_probe_cap(meta.ticker, _now.timestamp(),
@@ -11823,12 +11979,23 @@ class IncentiveMarketMaker:
         # from the band (Jack 2026-08-01, "don't arbitrarily constrain to
         # 5c"), so it happily builds a bid rung at a 4c reference that the
         # loop then never places — KXTRUEV-26SEP07-T1263.42 measured
-        # two-sided while resting an ask and nothing else.
-        _pmin_s, _pmax_s = member_price_band(
-            meta.series, meta.ticker in self.state.selected)
-        meta.quotable_sides = (
-            int(ext_b is not None and _pmin_s <= ext_b <= _pmax_s)
-            + int(ext_a is not None and _pmin_s <= ext_a <= _pmax_s))
+        # two-sided while resting an ask and nothing else. (Since 2026-09-27
+        # the probe applies this same test too -- ESTIMATE_SIDE_BAND -- so
+        # the count and the estimate describe the same ladder.)
+        if ESTIMATE_SIDE_BAND:
+            # the probe's own test, on the touches the loop reads: EXTERNAL
+            # (an incumbent's resting orders stripped) against the band a
+            # selected market quotes in -- a 91-93c ask counts for a
+            # challenger too, since the loop places it once admitted
+            _qb, _qa = (external_best(yes_levels, no_levels, own_live)
+                        if (self.live and own_live) else (ext_b, ext_a))
+            meta.quotable_sides = sum(_sides_in_band(_qb, _qa))
+        else:
+            _pmin_s, _pmax_s = member_price_band(
+                meta.series, meta.ticker in self.state.selected)
+            meta.quotable_sides = (
+                int(ext_b is not None and _pmin_s <= ext_b <= _pmax_s)
+                + int(ext_a is not None and _pmin_s <= ext_a <= _pmax_s))
         if self.live and own_live:
             frac, sides = estimate_reward_share(
                 yes_levels, no_levels, own_live,
@@ -11876,17 +12043,23 @@ class IncentiveMarketMaker:
         # book's touches and reference prices. A window that carries the
         # live multiplier alone is the live estimate itself (for an
         # incumbent that is the score of what actually rests).
+        # 2026-09-27 (FLOOR_PROJECTION_SIDES): each hour also carries the
+        # per-side multipliers side_size_mults will apply THEN (the Carbon
+        # Arc late-month cut from its window start), not the `now` reading.
         meta.floor_dollars_per_day = meta.est_dollars_per_day
         meta.floor_mult_profile = ""
         meta.floor_by_mult = []       # [] = the floor IS the live estimate
         if FLOOR_PROJECTION_BASE_SIZE and meta.dollars_per_day > 0:
-            if FLOOR_PROJECTION_SCHEDULE:
-                profile = size_mult_profile(meta.series, _now,
-                                            _quotable_days(meta, _now))
-            else:
-                profile = [(1.0, 1.0)]
-            meta.floor_mult_profile = ",".join(f"{m:g}:{w:.3f}" for m, w in profile)
-            if not (len(profile) == 1 and abs(profile[0][0] - _hm) < 1e-9):
+            profile = floor_size_profile(
+                meta.series, meta.ticker, _now, _quotable_days(meta, _now),
+                hour_schedule=FLOOR_PROJECTION_SCHEDULE)
+            meta.floor_mult_profile = floor_profile_str(profile)
+            _live_key = (_hm, _cbm, _cam)
+
+            def _is_live(k: Tuple[float, float, float]) -> bool:
+                return all(abs(a - b) < 1e-9 for a, b in zip(k, _live_key))
+
+            if not (len(profile) == 1 and _is_live(profile[0][0])):
                 if self.live and own_live:
                     ext_yes, ext_no = external_levels(yes_levels, no_levels, own_live)
                     xb, xa = external_best(ext_yes, ext_no)
@@ -11894,13 +12067,14 @@ class IncentiveMarketMaker:
                 else:
                     ext_yes, ext_no = yes_levels, no_levels
                     xb, xa, xrb, xra = ext_b, ext_a, rb, ra
-                def _hyp_share(m: float) -> float:
-                    """The ladder at multiplier m, scored on the external book."""
+                def _hyp_share(m: float, bm: float, am: float) -> float:
+                    """The ladder at hour multiplier m and side multipliers
+                    bm / am, scored on the external book."""
                     q_m = _probe_ladder(
                         m, scale_levels(scaled_levels_at(meta.series, m), _ncm),
                         capped_ref_mult(xb, xrb, "bid", hour_mult=m, series=meta.series),
                         capped_ref_mult(xa, xra, "ask", hour_mult=m, series=meta.series),
-                        xb, xa, xrb, xra)
+                        xb, xa, xrb, xra, sides=(bm, am))
                     if not q_m:
                         return 0.0
                     return estimate_reward_share(
@@ -11910,14 +12084,15 @@ class IncentiveMarketMaker:
 
                 total = 0.0
                 f_live: Optional[float] = None
-                for m, w in profile:
-                    f_m = _hyp_share(m)
-                    if abs(m - _hm) < 1e-9:
+                for (m, bm, am), w in profile:
+                    f_m = _hyp_share(m, bm, am)
+                    if _is_live((m, bm, am)):
                         f_live = f_m
                     total += w * f_m * meta.dollars_per_day
                     try:          # decision-input logging: the per-mult split
                         meta.floor_by_mult.append(
-                            [m, round(w, 4), round(f_m * meta.dollars_per_day, 4)])
+                            [m, round(w, 4), round(f_m * meta.dollars_per_day, 4)]
+                            + ([] if (bm, am) == (1.0, 1.0) else [bm, am]))
                     except Exception:
                         pass
                 # REALIZED ANCHOR (2026-09-27, FLOOR_PROJECTION_REALIZED): the
@@ -11930,7 +12105,7 @@ class IncentiveMarketMaker:
                 # loop cannot place).
                 if FLOOR_PROJECTION_REALIZED and self.live and own_live:
                     if f_live is None:
-                        f_live = _hyp_share(_hm)
+                        f_live = _hyp_share(_hm, _cbm, _cam)
                     if f_live > 0:
                         meta.floor_realized_ratio = min(1.0, frac / f_live)
                         total *= meta.floor_realized_ratio

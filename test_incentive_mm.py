@@ -14821,8 +14821,9 @@ class TestFloorRealizedAnchor(unittest.TestCase):
         raw = self._estimate(own, realized=False)
         anchored = self._estimate(own)
         self.assertEqual(anchored.floor_realized_ratio, 1.0)
+        # two reads ~ms apart on a sliding 1-day window: equal to ~1e-8
         self.assertAlmostEqual(anchored.floor_dollars_per_day,
-                               raw.floor_dollars_per_day, places=9)
+                               raw.floor_dollars_per_day, places=6)
 
     def test_fresh_candidate_untouched(self):
         fresh = self._estimate([])
@@ -15059,6 +15060,372 @@ class TestForceEventsEmptied(unittest.TestCase):
                 imm.PAYOUT_FLOOR_DOLLARS = old
                 _clean_persist()
             self.assertEqual(T in bot.state.selected, forced, forced)
+
+
+class TestFloorSideSchedule(unittest.TestCase):
+    """ROI scan fix (Jack 2026-09-27, "fix all 3"): the Carbon Arc
+    late-month cut is clock-driven, so the floor projection scores each hour
+    at the side multipliers the loop will rest THEN (FLOOR_PROJECTION_SIDES)
+    instead of reading them once, at `now`, for the whole window."""
+
+    S = "KXTESTCC"
+    T = "KXTESTCC-99NOV07-T104"
+
+    def setUp(self):
+        p = mock.patch.dict(imm.FAMILY_VERDICTS, {self.S: {"carbon_arc": True}})
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertTrue(imm.carbon_arc_settled(self.S))
+        self.ws = imm.ca_late_window_start(self.T)
+        self.late = imm.ca_late_month_mults(self.T, self.ws)
+        self.assertNotEqual(self.late, (1.0, 1.0))
+        self.tag = f"/b{self.late[0]:g}a{self.late[1]:g}"
+
+    @staticmethod
+    def _flat(series, t):
+        return 1.0
+
+    @staticmethod
+    def _by_sides(prof):
+        out = {}
+        for (_m, bm, am), w in prof:
+            out[(bm, am)] = out.get((bm, am), 0.0) + w
+        return out
+
+    def test_split_lands_at_the_window_start(self):
+        with mock.patch.object(imm, "hour_size_mult", self._flat):
+            prof = imm.floor_size_profile(
+                self.S, self.T, self.ws - timedelta(hours=30), 2.0)
+        w = self._by_sides(prof)
+        self.assertAlmostEqual(w[self.late], 18 / 48, places=9)
+        self.assertAlmostEqual(w[(1.0, 1.0)], 30 / 48, places=9)
+        self.assertEqual({k[0] for k, _w in prof}, {1.0})
+
+    def test_split_lands_beyond_the_walk_cap(self):
+        # each walk stops at FLOOR_PROFILE_MAX_DAYS (14); a step 20 days out
+        # must still get its share of a 25-day window
+        with mock.patch.object(imm, "hour_size_mult", self._flat):
+            prof = imm.floor_size_profile(
+                self.S, self.T, self.ws - timedelta(days=20), 25.0)
+        self.assertAlmostEqual(self._by_sides(prof)[self.late], 0.2, places=9)
+
+    def test_each_piece_keeps_its_hour_mix(self):
+        start = self.ws - timedelta(days=3)
+        cut = self.ws - timedelta(days=1)
+
+        def hsm(series, t):            # x2 for the day before the window start
+            return 2.0 if cut <= t < self.ws else 1.0
+        with mock.patch.object(imm, "hour_size_mult", hsm):
+            got = dict(imm.floor_size_profile(self.S, self.T, start, 5.0))
+        self.assertAlmostEqual(got[(1.0, 1.0, 1.0)], 2 / 5, places=9)
+        self.assertAlmostEqual(got[(2.0, 1.0, 1.0)], 1 / 5, places=9)
+        self.assertAlmostEqual(got[(1.0,) + self.late], 2 / 5, places=9)
+
+    def test_off_switch_reads_now_for_the_whole_window(self):
+        with mock.patch.object(imm, "hour_size_mult", self._flat), \
+                mock.patch.object(imm, "FLOOR_PROJECTION_SIDES", False):
+            prof = imm.floor_size_profile(
+                self.S, self.T, self.ws - timedelta(hours=30), 2.0)
+        self.assertEqual([k for k, _w in prof], [(1.0, 1.0, 1.0)])
+        self.assertAlmostEqual(prof[0][1], 1.0, places=12)
+
+    def test_flat_day_size_keeps_the_side_split(self):
+        # FLOOR_PROJECTION_SCHEDULE=0: day size (x1) throughout, split kept
+        with mock.patch.object(imm, "hour_size_mult", lambda s, t: 2.0):
+            prof = imm.floor_size_profile(
+                self.S, self.T, self.ws - timedelta(hours=12), 1.0,
+                hour_schedule=False)
+        self.assertEqual({k[0] for k, _w in prof}, {1.0})
+        self.assertAlmostEqual(self._by_sides(prof)[self.late], 0.5, places=9)
+
+    def test_ordinary_ticker_is_the_plain_hour_profile(self):
+        start = datetime.now(timezone.utc)
+        for d in (0.2, 3.0, 20.0):
+            a = imm.size_mult_profile("KXGOOD", start, d)
+            b = imm.floor_size_profile("KXGOOD", "KXGOOD-99DEC31-A", start, d)
+            self.assertEqual([k for k, _w in b], [(m, 1.0, 1.0) for m, _w in a])
+            for (_m, w), (_k, w2) in zip(a, b):
+                self.assertAlmostEqual(w, w2, places=12)
+
+    def test_empty_window_is_the_live_reading(self):
+        at = self.ws + timedelta(hours=1)
+        self.assertEqual(imm.floor_size_profile(self.S, self.T, at, 0.0),
+                         [((imm.hour_size_mult(self.S, at),) + self.late, 1.0)])
+
+    def test_profile_string(self):
+        self.assertEqual(imm.floor_profile_str(
+            [((1.0, 0.0, 0.5), 0.667), ((1.0, 1.0, 1.0), 0.333),
+             ((2.0, 1.0, 1.0), 0.0)]), "1/b0a0.5:0.667,1:0.333,2:0.000")
+
+    def _estimate(self, sides_on, days_to_window, window_days=3.0):
+        """Fresh challenger read on a 45x48 book; the late window starts
+        `days_to_window` from now (CA_LATE_DAYS moved so it does)."""
+        _clean_persist()
+        fc = FakeClient()
+        fc.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.44", "400"], ["0.45", "700"]],
+            "no_dollars": [["0.50", "400"], ["0.52", "700"]]}}
+        bot = IncentiveMarketMaker(client=fc, live=False)
+        now = datetime.now(timezone.utc)
+        late_days = (imm.ca_month_end_utc(self.T)
+                     - (now + timedelta(days=days_to_window))).total_seconds() / 86400
+        meta = MarketMeta(ticker=self.T, event_ticker="KXTESTCC-99NOV07",
+                          series=self.S, dollars_per_day=100.0,
+                          program_end=now + timedelta(days=window_days),
+                          target_size=1000.0, discount_factor=0.5,
+                          cutoff=None, close_time=None)
+        with mock.patch.object(imm, "hour_size_mult", self._flat), \
+                mock.patch.object(imm, "CA_LATE_DAYS", late_days), \
+                mock.patch.object(imm, "FLOOR_PROJECTION_SIDES", sides_on):
+            self.assertTrue(bot._estimate_candidate_yield(meta, []))
+        return meta
+
+    def test_projection_counts_the_cut_from_its_start(self):
+        on = self._estimate(True, days_to_window=1.0)
+        off = self._estimate(False, days_to_window=1.0)
+        # before: the whole 3-day window read `now` (full size) = the live est
+        self.assertEqual(off.floor_by_mult, [])
+        self.assertAlmostEqual(off.floor_dollars_per_day,
+                               off.est_dollars_per_day, places=9)
+        # now: 1 day at full size, then 2 days at the late cut
+        self.assertIn(self.tag + ":", on.floor_mult_profile)
+        rows = {tuple(r[3:]) if len(r) == 5 else (1.0, 1.0): r
+                for r in on.floor_by_mult}
+        self.assertEqual(set(rows), {(1.0, 1.0), self.late})
+        self.assertAlmostEqual(rows[(1.0, 1.0)][1], 1 / 3, places=3)
+        self.assertAlmostEqual(rows[self.late][1], 2 / 3, places=3)
+        self.assertLess(rows[self.late][2], rows[(1.0, 1.0)][2])
+        self.assertAlmostEqual(on.floor_dollars_per_day,
+                               sum(r[1] * r[2] for r in on.floor_by_mult),
+                               delta=0.01)
+        self.assertLess(on.floor_dollars_per_day, 0.9 * off.floor_dollars_per_day)
+        # the live estimate (ranking / yield) is untouched
+        self.assertAlmostEqual(on.est_dollars_per_day, off.est_dollars_per_day,
+                               places=9)
+
+    def test_inside_the_window_both_read_the_cut(self):
+        on = self._estimate(True, days_to_window=-1.0)
+        off = self._estimate(False, days_to_window=-1.0)
+        self.assertEqual(on.floor_by_mult, [])       # the window IS the live key
+        self.assertEqual(on.floor_mult_profile, "1" + self.tag + ":1.000")
+        self.assertAlmostEqual(on.floor_dollars_per_day,
+                               off.floor_dollars_per_day, places=9)
+
+
+class TestEstimatorSideBand(unittest.TestCase):
+    """ROI scan fix (Jack 2026-09-27, "fix all 3"): the estimator builds a
+    side only when the quote loop would place it -- that side's own
+    EXTERNAL touch inside the band the loop quotes a selected market in --
+    and prices its rungs on the loop's rung band (ESTIMATE_SIDE_BAND).
+    KXAAAGASD-26SEP21-4.5050 opened 1c x 99c, rested nothing, and was
+    admitted on $2.94/day."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        mode = imm.LADDER_MODE
+        imm.LADDER_MODE = "atref"                  # the live mode
+        self.addCleanup(setattr, imm, "LADDER_MODE", mode)
+
+    @staticmethod
+    def _book(yes, no):
+        return {"orderbook_fp": {
+            "yes_dollars": [[f"{p / 100:.2f}", f"{q:.0f}"] for p, q in sorted(yes.items())],
+            "no_dollars": [[f"{p / 100:.2f}", f"{q:.0f}"] for p, q in sorted(no.items())]}}
+
+    def _estimate(self, yes, no, band_on=True, own=()):
+        """One estimator read; returns (meta, quotes the probe built)."""
+        _clean_persist()
+        fc = FakeClient()
+        fc.books[self.T] = self._book(yes, no)
+        bot = IncentiveMarketMaker(client=fc, live=False)
+        bot.live = bool(own)
+        meta = MarketMeta(ticker=self.T, event_ticker="KXGOOD-99DEC31",
+                          series="KXGOOD", dollars_per_day=100.0,
+                          program_end=datetime.now(timezone.utc) + timedelta(days=1),
+                          target_size=1000.0, discount_factor=0.5,
+                          cutoff=None, close_time=None)
+        built = []
+        real = imm.build_side_ladder
+
+        def spy(*a, **k):
+            out = real(*a, **k)
+            built.extend(out)
+            return out
+        with mock.patch.object(imm, "ESTIMATE_SIDE_BAND", band_on), \
+                mock.patch.object(imm, "build_side_ladder", spy):
+            self.assertTrue(bot._estimate_candidate_yield(meta, list(own)))
+        return meta, built
+
+    def test_open_book_with_no_placeable_side_scores_zero(self):
+        yes, no = {1: 2000}, {1: 2000}                     # 1c x 99c
+        on, built = self._estimate(yes, no)
+        self.assertEqual(on.quotable_sides, 0)
+        self.assertEqual(built, [])
+        self.assertEqual(on.est_dollars_per_day, 0.0)
+        self.assertEqual(on.floor_dollars_per_day, 0.0)
+        off, _ = self._estimate(yes, no, band_on=False)
+        self.assertGreater(off.est_dollars_per_day, 0.0)   # the phantom
+
+    def test_one_sided_book_scores_one_side(self):
+        yes, no = {3: 1500}, {50: 1500}                    # 3c x 50c
+        on, built = self._estimate(yes, no)
+        off, built_off = self._estimate(yes, no, band_on=False)
+        self.assertEqual(on.quotable_sides, 1)
+        self.assertEqual({q.book_side for q in built}, {"ask"})
+        self.assertIn("bid", {q.book_side for q in built_off})
+        self.assertGreater(on.est_dollars_per_day, 0.0)
+        self.assertLess(on.est_dollars_per_day, off.est_dollars_per_day)
+
+    def test_challenger_ask_at_92_counts(self):
+        # the loop quotes a SELECTED market in 5-93, which a challenger is
+        # once admitted; the old count used the 5-90 fresh band
+        yes, no = {80: 1500}, {8: 1500}                    # 80c x 92c
+        on, built = self._estimate(yes, no)
+        off, _ = self._estimate(yes, no, band_on=False)
+        self.assertEqual(on.quotable_sides, 2)
+        self.assertEqual(off.quotable_sides, 1)
+        self.assertEqual({q.book_side for q in built}, {"bid", "ask"})
+
+    def test_rungs_use_the_loops_rung_band(self):
+        # healthy book (both touches in band), bid reference 3c under a 6c
+        # touch: the loop's rung floor is RUNG_DEEP_FLOOR there, not 5c
+        yes, no = {6: 100, 3: 2000}, {50: 2000}
+        on, built = self._estimate(yes, no)
+        off, built_off = self._estimate(yes, no, band_on=False)
+        bids = sorted(q.price_cents for q in built if q.book_side == "bid")
+        bids_off = sorted(q.price_cents for q in built_off if q.book_side == "bid")
+        self.assertEqual(bids, [3])
+        self.assertEqual(bids_off, [imm.PRICE_MIN_CENTS])
+
+    def test_incumbent_counts_the_external_touch(self):
+        # our own 6c bid is the book's touch; the external best is 3c, which
+        # is what the loop tests -- the bid side is out
+        own = [("bid", 6, 40.0)]
+        yes, no = {3: 1500, 6: 40}, {50: 1500}
+        on, _ = self._estimate(yes, no, own=own)
+        off, _ = self._estimate(yes, no, band_on=False, own=own)
+        self.assertEqual(on.quotable_sides, 1)
+        self.assertEqual(off.quotable_sides, 2)
+
+    def _member_on(self, yes, no, band_on=True):
+        """Admitted on the fixture's 49x51 book, then refreshed on (yes, no)."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        bot.client.books[self.T] = self._book(yes, no)
+        bot.client.markets[self.T]["yes_bid_dollars"] = f"{max(yes) / 100:.4f}"
+        bot.client.markets[self.T]["yes_ask_dollars"] = f"{(100 - max(no)) / 100:.4f}"
+        bot.state.prev_mid.pop(self.T, None)       # not a mid-move breaker test
+        bot.state.universe_at = 0.0
+        with mock.patch.object(imm, "ESTIMATE_SIDE_BAND", band_on):
+            bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)  # sticky member
+        return bot
+
+    def test_loop_places_exactly_the_estimated_sides(self):
+        for yes, no, want in (({48: 500, 49: 600}, {49: 1200}, 2),
+                              ({3: 1500}, {50: 1500}, 1),
+                              ({80: 1500}, {8: 1500}, 2),
+                              ({1: 2000}, {1: 2000}, 0)):
+            bot = self._member_on(yes, no)
+            meta = bot.state.selected[self.T]
+            placed = {o["book_side"] for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T
+                      and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS}
+            self.assertEqual(len(placed), want, (yes, no))
+            self.assertEqual(meta.quotable_sides, want, (yes, no))
+            self.assertEqual(meta.est_dollars_per_day > 0, want > 0, (yes, no))
+            _clean_persist()
+
+    def test_member_out_of_band_starts_the_hopeless_clock(self):
+        for on in (True, False):
+            bot = self._member_on({1: 2000}, {1: 2000}, band_on=on)
+            self.assertEqual(self.T in bot.state.hopeless_since, on, on)
+            _clean_persist()
+
+    def test_fresh_open_book_is_not_admitted(self):
+        for on in (True, False):
+            _clean_persist()
+            fc = FakeClient()
+            fc.books[self.T] = self._book({1: 2000}, {1: 2000})
+            fc.markets[self.T]["yes_bid_dollars"] = "0.0100"
+            fc.markets[self.T]["yes_ask_dollars"] = "0.9900"
+            bot = IncentiveMarketMaker(client=fc, live=False)
+            with mock.patch.object(imm, "ESTIMATE_SIDE_BAND", on):
+                bot.run_cycle()
+            self.assertEqual(self.T in bot.state.selected, not on, on)
+            _clean_persist()
+
+
+class TestRateFloorSchedule(unittest.TestCase):
+    """ROI scan fix (Jack 2026-09-27, "fix all 3"): the per-series $/day rate
+    bar compares the schedule-weighted floor rate, not the live-size
+    estimate, so admission no longer depends on the hour of the refresh
+    (RATE_FLOOR_SCHEDULE)."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def test_rate_floor_rate_reads_the_floor(self):
+        m = MarketMeta(ticker=self.T, event_ticker="KXGOOD-99DEC31",
+                       series="KXGOOD", dollars_per_day=100.0, program_end=None,
+                       target_size=1000.0, discount_factor=0.5, cutoff=None,
+                       close_time=None)
+        m.est_dollars_per_day, m.floor_dollars_per_day = 2.4, 1.6
+        self.assertEqual(imm.rate_floor_rate(m), 1.6)
+        with mock.patch.object(imm, "RATE_FLOOR_SCHEDULE", False):
+            self.assertEqual(imm.rate_floor_rate(m), 2.4)
+
+    def _admitted(self, live_mult, later_mult, schedule_on):
+        """A fresh candidate in a new event of a rate-bar series, under a
+        schedule reading `live_mult` now and `later_mult` from an hour on,
+        with the bar halfway between its live and schedule-weighted rates
+        and no horizon escape. Returns (est, floor, admitted)."""
+        cut = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        def hsm(series, t):
+            return live_mult if t < cut else later_mult
+        old_ov = imm.SERIES_OVERRIDES.get("KXGOOD")
+        try:
+            with mock.patch.object(imm, "hour_size_mult", hsm), \
+                    mock.patch.object(imm, "RATE_FLOOR_TOTAL_ALT", 1e9), \
+                    mock.patch.object(imm, "RATE_FLOOR_SCHEDULE", schedule_on):
+                _clean_persist()
+                bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+                bot.run_cycle()
+                meta = bot.state.selected[self.T]
+                est, flo = meta.est_dollars_per_day, meta.floor_dollars_per_day
+                self.assertGreater(abs(est - flo), 0.05 * max(est, flo))
+                imm.SERIES_OVERRIDES["KXGOOD"] = imm.SeriesOverride(
+                    min_est_per_day=(est + flo) / 2)
+                bot.state.selected.pop(self.T, None)      # FRESH, new event
+                bot.state.sticky_prev.discard(self.T)
+                bot._est_peak.clear()
+                bot.state.universe_at = 0.0
+                bot.run_cycle()
+                return est, flo, self.T in bot.state.selected
+        finally:
+            if old_ov is None:
+                imm.SERIES_OVERRIDES.pop("KXGOOD", None)
+            else:
+                imm.SERIES_OVERRIDES["KXGOOD"] = old_ov
+            _clean_persist()
+
+    def test_quiet_hour_read_no_longer_opens_the_bar(self):
+        # x2 now, x1 for the rest of the window: the live estimate clears the
+        # bar, the rate the market will actually earn does not
+        est, flo, admitted = self._admitted(2.0, 1.0, True)
+        self.assertGreater(est, flo)
+        self.assertFalse(admitted)
+        self.assertTrue(self._admitted(2.0, 1.0, False)[2])   # the old gate
+
+    def test_daytime_read_no_longer_shuts_it(self):
+        # x1 now, x2 for the rest of the window: the reverse
+        est, flo, admitted = self._admitted(1.0, 2.0, True)
+        self.assertLess(est, flo)
+        self.assertTrue(admitted)
+        self.assertFalse(self._admitted(1.0, 2.0, False)[2])
 
 
 if __name__ == "__main__":
