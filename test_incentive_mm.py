@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import time
+import dataclasses
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -7618,6 +7619,12 @@ class TestRainFairAnchor(unittest.TestCase):
         # their own coverage lives in TestPerSeriesHourMultiplier.
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
+        # Same for the daily x1.5 family size (2026-09-27): these assertions
+        # are about the fair GATE, so the family size is pinned at 1.0 here;
+        # its own coverage lives in TestDailyRainSizeMult.
+        self._saved_rain_ov = imm.SERIES_OVERRIDES["KXRAIN"]
+        imm.SERIES_OVERRIDES["KXRAIN"] = dataclasses.replace(
+            self._saved_rain_ov, size_mult=None)
         try:
             os.remove(imm.RAIN_FAIR_FILE)
         except FileNotFoundError:
@@ -7625,6 +7632,7 @@ class TestRainFairAnchor(unittest.TestCase):
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm.SERIES_OVERRIDES["KXRAIN"] = self._saved_rain_ov
 
     def _write_fair(self, p, age_secs=0.0):
         fetched = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
@@ -9491,6 +9499,54 @@ class TestHopelessExitDipGuard(unittest.TestCase):
             _clean_persist()
 
 
+class TestDailyRainSizeMult(unittest.TestCase):
+    """Jack 2026-09-27: "1.5x multiplier on KXUST and daily RAIN since it's
+    consistently performed well". The daily city binaries (series KXRAIN)
+    only: the monthlies, the weekend contract and the rainstorm spans keep
+    the global size."""
+
+    def test_daily_rain_x1_5(self):
+        self.assertEqual(imm.RAIN_DAILY_SIZE_MULT, 1.5)
+        S = "KXRAIN"
+        ov = imm.SERIES_OVERRIDES[S]
+        self.assertEqual(ov.size_mult, 1.5)
+        self.assertEqual(imm.applied_mention_mult(S), 1.5)
+        self.assertEqual(imm.series_max_position(S),
+                         1.5 * imm.MAX_POSITION_CONTRACTS)
+        self.assertEqual(imm.event_cap_contracts("KXRAIN-26SEP29"),
+                         1.5 * imm.MAX_EVENT_CONTRACTS)
+        base = imm.series_levels(S)
+        self.assertEqual(imm.base_scaled_levels(S),
+                         [(t, max(1, int(z * 1.5 + 0.5))) for t, z in base])
+        # the rain band and the 10pm-the-day-before cutoff are untouched
+        self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90))
+        self.assertEqual(ov.cutoff_before_event_min, 120)
+
+    def test_the_evening_halving_composes(self):
+        # the code-default 19-01 ET halving sits on top: x1.5 x 0.5 = x0.75
+        S = "KXRAIN"
+        base = imm.series_levels(S)
+        with mock.patch.object(imm, "SERIES_HOUR_MULTS",
+                               imm._parse_series_hour_mults("KXRAIN:19-1:0.5")):
+            day = datetime(2026, 9, 29, 16, 0, tzinfo=timezone.utc)   # Tue noon EDT
+            eve = datetime(2026, 9, 29, 23, 30, tzinfo=timezone.utc)  # Tue 7:30pm EDT
+            self.assertEqual(imm.hour_size_mult(S, day), 1.0)
+            self.assertEqual(imm.hour_size_mult(S, eve), 0.5)
+            self.assertEqual(imm.hour_scaled_levels(S, day),
+                             [(t, max(1, int(z * 1.5 + 0.5))) for t, z in base])
+            self.assertEqual(imm.hour_scaled_levels(S, eve),
+                             [(t, max(1, int(z * 0.75 + 0.5))) for t, z in base])
+
+    def test_other_rain_shapes_keep_the_global_size(self):
+        for s in ("KXRAINNYCM", "KXRAINAUSM", "KXRAINWKND",
+                  imm.RAINSTORM_ARCHETYPE):
+            self.assertIn(s, imm.SERIES_OVERRIDES, s)
+            self.assertIsNone(imm.SERIES_OVERRIDES[s].size_mult, s)
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+            self.assertEqual(imm.series_max_position(s),
+                             imm.MAX_POSITION_CONTRACTS, s)
+
+
 class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
     """Jack 2026-08-04: allowlist the five daily Treasury-yield tenors."""
 
@@ -9542,6 +9598,29 @@ class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
                 self._cutoff(s, f"{s}-26AUG31",
                              close=self._et(31, 15, 30)),
                 "2026-08-31 07:30", s)
+
+    def test_x1_5_family_size(self):
+        """Jack 2026-09-27: "1.5x multiplier on KXUST and daily RAIN since
+        it's consistently performed well" -- all ten tenors on the size_mult
+        wire, so the rung, both caps and the floor projection's day ladder
+        scale together, and the guards stay as they were."""
+        self.assertEqual(imm.RATES_SIZE_MULT, 1.5)
+        for s in self.TENORS:
+            ov = imm.SERIES_OVERRIDES[s]
+            self.assertEqual(ov.size_mult, 1.5, s)
+            self.assertEqual(imm.applied_mention_mult(s), 1.5, s)
+            self.assertEqual(imm.series_max_position(s),
+                             1.5 * imm.MAX_POSITION_CONTRACTS, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-26SEP30"),
+                             1.5 * imm.MAX_EVENT_CONTRACTS, s)
+            base = imm.series_levels(s)
+            self.assertEqual(imm.base_scaled_levels(s),
+                             [(t, max(1, int(z * 1.5 + 0.5))) for t, z in base], s)
+            self.assertTrue(imm.series_safe_join(s), s)
+            self.assertEqual(ov.event_day_cutoff_et, (7, 30), s)
+        # nothing outside the enrolled tenors rides the prefix
+        for s in ("KXUST2AW", "KXUSTFOO"):
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
 
     def test_no_prefix_bleed_onto_unenrolled_ust_shapes(self):
         # exact-series matching: a hypothetical weekly must not ride in on the

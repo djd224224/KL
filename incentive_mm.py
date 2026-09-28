@@ -744,6 +744,23 @@ for _s in os.environ.get("IMM_AQI_SERIES", "KXAQICITY").split(","):
 # rule; monthly = continuous to close). NOTE: new rain cities must be added
 # here (or via IMM_RAIN_SERIES) as well as the allowlist, like IMM_TEMP_SERIES.
 _RAIN_LEVELS_SPEC = os.environ.get("IMM_RAIN_LEVELS", "").strip()
+# DAILY rain x1.5 (Jack 2026-09-27: "1.5x multiplier on KXUST and daily RAIN
+# since it's consistently performed well"). The family size_mult wire
+# (applied_mention_mult): the rung, the per-market and per-event caps and the
+# skew knees scale together, and so does the estimator's hypothetical ladder,
+# hence the payout-floor projection. EXACT series KXRAIN only -- the daily
+# city binaries; the monthlies (blocklisted in the launcher), the weekend
+# KXRAINWKND and the KXRAINS<CITY> rainstorm spans (their own archetype) stay
+# at 1.0. The 19-01 ET halving (IMM_SERIES_HOUR_MULT) composes on top: 20 ->
+# 30 by day, 15 in the evening, at the launcher's 20-lot rung. Measured 9/27
+# on the rewards statement (mark-to-market): +$538 lifetime, positive every
+# week since Aug 24 (+$927 over the last five, trading giving back 11% of the
+# credits); the bot holds ~6% of the scored book there, so x1.5 size is ~x1.45
+# reward on the modelled share, and fills scale with it. Not scaled: the NWS
+# directional take (RAIN_DIR_SIZE is its own fixed size). A hand-tuned
+# IMM_RAIN_LEVELS ladder stays literal (applied_mention_mult exempts it).
+# IMM_RAIN_DAILY_SIZE_MULT=1.0 reverts (env => task-level restart).
+RAIN_DAILY_SIZE_MULT = _env_float("IMM_RAIN_DAILY_SIZE_MULT", 1.5)
 for _s in os.environ.get(
         "IMM_RAIN_SERIES",
         "KXRAIN,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,"
@@ -753,8 +770,9 @@ for _s in os.environ.get(
             # IMM_RAIN_LEVELS (e.g. "0:3", Jack 2026-07-28: rain re-entry at
             # 3/0/0) — empty = global ladder. A hand-tuned ladder here also
             # exempts rain from family multipliers via applied_mention_mult
-            # (moot today: rain isn't mention).
+            # (the daily x1.5 below included).
             levels=_parse_levels(_RAIN_LEVELS_SPEC) if _RAIN_LEVELS_SPEC else None,
+            size_mult=RAIN_DAILY_SIZE_MULT if _s.strip() == "KXRAIN" else None,
             price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
             # Jack 2026-08-15: run until 10pm ET the day before the rain day
@@ -4648,6 +4666,17 @@ SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
 # and 00:00-07:30 ET is no more informed than the evening before. 7:30am ET
 # puts the bot out ahead of the 08:30 releases that do move rates. Widens the
 # quotable window from ~8h to ~15.5h of each 23.5h program.
+# x1.5 FAMILY SIZE (Jack 2026-09-27: "1.5x multiplier on KXUST and daily RAIN
+# since it's consistently performed well"): all ten tenors, dailies and
+# monthlies, on the size_mult wire -- the rung, the per-market and per-event
+# caps, the skew knees and the floor projection's ladder together (20 -> 30
+# at the launcher geometry; caps 225 per market / 1,500 net per event).
+# Measured 9/27 on the rewards statement (mark-to-market): +$1,229 lifetime
+# on $1,291 of credits (trading gave back 5%), positive 8 of 8 weeks; the bot
+# holds ~17% of the scored book, so x1.5 size is ~x1.39 reward on the
+# modelled share. Safe-join placement and the 07:30 ET event-day cutoff are
+# unchanged. IMM_RATES_SIZE_MULT=1.0 reverts (env => task-level restart).
+RATES_SIZE_MULT = _env_float("IMM_RATES_SIZE_MULT", 1.5)
 for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
@@ -4658,7 +4687,8 @@ for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
             safe_join=True,
             event_day_cutoff_et=(
                 _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
-                _env_int("IMM_RATES_CUTOFF_MIN_ET", 30)))
+                _env_int("IMM_RATES_CUTOFF_MIN_ET", 30)),
+            size_mult=RATES_SIZE_MULT)
 
 # KXTRUMPAPPROVE: out at 07:00 ET ON the settlement day (Jack 2026-09-26,
 # with the allowlist entry -- see _DEFAULT_POLITICS_SERIES). The event-day
@@ -5508,6 +5538,8 @@ _CONFIG_CODE_KNOBS = (
     # ...and the estimator-fidelity trio: per-side floor schedule, the
     # loop's side band in the estimate, the schedule-weighted rate bar
     "FLOOR_PROJECTION_SIDES", "ESTIMATE_SIDE_BAND", "RATE_FLOOR_SCHEDULE",
+    # family size x1.5 on the Treasury yields and the daily rain (2026-09-27)
+    "RATES_SIZE_MULT", "RAIN_DAILY_SIZE_MULT",
 )
 
 

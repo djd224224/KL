@@ -4651,3 +4651,46 @@ kill-switch test, test_national_gas_strike_format_and_guards; anchor/absent
 counts +1. 977 green (test_incentive_mm, test_gasbuddy_fair,
 test_carbon_arc_fair, test_openrouter_fair, test_send_imm_new_programs,
 test_usgs_quake_fair, test_imm_pickoff, test_earnings_announcements).
+
+## 2026-09-27 late — KXUST (all ten Treasury tenors) and daily KXRAIN x1.5 family size (Jack)
+
+Jack: "1.5x multiplier on KXUST and daily RAIN since it's consistently
+performed well". size_mult=1.5 on the ten rates overrides
+(RATES_SIZE_MULT, env IMM_RATES_SIZE_MULT) and on
+SERIES_OVERRIDES["KXRAIN"] only (RAIN_DAILY_SIZE_MULT, env
+IMM_RAIN_DAILY_SIZE_MULT) -- the KXTRUMPAPPROVE / ladders wire:
+applied_mention_mult scales the rungs, the per-market / per-event caps
+(225 / 1,500, were 150 / 1,000), the skew knees and the estimator's
+ladder (the payout-floor projection) together. 1.0 reverts either (env
+=> task-level restart). Not scaled: the rain monthlies (blocklisted in
+the launcher anyway), KXRAINWKND, the KXRAINS<CITY> spans (their own
+archetype) and the NWS directional take (RAIN_DIR_SIZE).
+
+Checked against the committed code with the launcher's $ProbeEnv
+applied: KXRAIN 30 by day, 15 in the 19-01 ET halving (a daily: no quiet
+hours, no Saturday). KXUST*AD / *AM 30 on a weekday, 60 in quiet hours
+(0-9 ET, up to the 07:30 cutoff), 45 Saturday, 90 Saturday quiet hours:
+the Treasuries are not in the structural daily class, so they already
+took the quiet-hours and Saturday multipliers and x1.5 rides on top.
+
+Evidence (rewards statement 9/27, mark-to-market, report_tools): KXUST
++$1,229 lifetime on $1,291 of credits (trading -$61, give-back 5%),
+positive 8 of 8 weeks since Aug 3. Daily rain +$538 lifetime ($1,601
+credits, -$1,063 trading) but positive every week since Aug 24, +$927
+over the last five (give-back 11%). Modelled share of the scored book
+(cycle log est_frac, 9/14-9/27, reward-weighted): rain ~6%, Treasury
+dailies ~17%, so x1.5 size is about x1.45 / x1.39 reward before anyone
+else adds size; fills scale about x1.5.
+
+WATCH: the Treasury programs have thinned -- the dailies paid on only a
+few days in the last two weeks (modelled $144 over 14 days, pool median
+$15/day per market against ~$102 at enrollment) and the monthlies not at
+all, so the dollar effect is small until the pools come back. Rain's
+lifetime give-back is 66% (the late-July weeks); if its trading line
+turns back, 1.0 via env.
+
+Tests: TestDailyRainSizeMult (x1.5, both caps, the day ladder; the 19-01
+halving composes to x0.75; monthlies / weekend / rainstorm archetype stay
+1.0), TestTreasuryYieldSeriesEnrolled.test_x1_5_family_size (ten tenors,
+guards kept, no prefix bleed); TestRainFairAnchor pins the family size
+at 1.0 (its assertions are on literal rung sizes). 1,453 green.
