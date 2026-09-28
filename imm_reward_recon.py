@@ -606,6 +606,158 @@ def _ts(iso_str):
 
 
 # ----------------------------------------------------------------------------
+# Earned, not yet credited -- the portfolio digest's "after rewards are paid"
+# ----------------------------------------------------------------------------
+# Kalshi credits a market's period 0-3 days after the period ENDS (credit date
+# vs end date, ET days, 704 credit-days on single-period events Aug 5 - Sep 27:
+# +0 10%, +1 75%, +2 14%, +3 1%). There is no credits endpoint, and the
+# programs' paid_out flag almost never flips (all 10,393 `closed` programs
+# read false on 9/28, back to March), so "unpaid" is decided by the clock: a
+# period still running, or one that ended since 00:00 ET UNPAID_SINCE_DAYS
+# days ago. At the 7am digest that counts some of yesterday's periods Kalshi
+# has already paid and misses the ~14% of the day before's still in flight;
+# the two roughly cancel.
+UNPAID_SINCE_DAYS = int(os.environ.get("IMM_UNPAID_SINCE_DAYS", "1"))
+# a family's realization factor is used only on this much settled evidence;
+# thinner families take the post-amendment overall factor
+UNPAID_FAMILY_MIN_EVENTS = 30
+
+
+def fetch_recent_program_records(client, since_ts, max_pages=60):
+    """{market_ticker: {(start_iso, end_iso): paid_out}} for liquidity
+    programs: every ACTIVE one, plus the closed / settled ones that STARTED at
+    or after since_ts. Both of those lists come newest-start first (checked
+    9/28), so paging stops at the first page that reaches back past
+    since_ts. Raises on a failed page -- a partial read would under-count."""
+    out = defaultdict(dict)
+    for status in ("active", "closed", "settled"):
+        cursor = None
+        for _page in range(max_pages):
+            params = {"limit": 1000, "status": status}
+            if cursor:
+                params["cursor"] = cursor
+            r = client.get("/incentive_programs", params=params)
+            batch = r.get("incentive_programs") or []
+            oldest = None
+            for p in batch:
+                a, b = p.get("start_date"), p.get("end_date")
+                if (p.get("incentive_type") or "liquidity") != "liquidity" \
+                        or not (a and b):
+                    continue
+                recs = out[p.get("market_ticker") or ""]
+                recs[(a, b)] = recs.get((a, b), False) or bool(p.get("paid_out"))
+                st = _ts(a)
+                if st is not None:
+                    oldest = st if oldest is None else min(oldest, st)
+            cursor = r.get("next_cursor")
+            if not cursor or not batch:
+                break
+            if status != "active" and oldest is not None and oldest < since_ts:
+                break
+    return out
+
+
+def _cache_periods(prog):
+    """A program-cache record's periods as [(start, end, paid)]: the merged
+    "periods" list, or the older single-window fields for a record written
+    before per-period caching (2026-09-27)."""
+    ps = (prog or {}).get("periods")
+    if ps:
+        return [(a, b, bool(p)) for a, b, p in ps]
+    if prog and prog.get("start") and prog.get("end"):
+        return [(prog["start"], prog["end"], bool(prog.get("paid")))]
+    return []
+
+
+def unpaid_estimate(client, now_utc=None, calib=None, hourly=None):
+    """Liquidity reward the IMM has EARNED that Kalshi has not yet credited,
+    modelled: the per-period floored accrual (floored_accrual's rule: $1.00
+    per market per program period) of every period still running or ended
+    since 00:00 ET UNPAID_SINCE_DAYS days ago, each market scaled by its
+    family's post-amendment realization factor (credited / modelled on
+    settled programs, reward_calibration.json; the overall factor for a
+    family with fewer than UNPAID_FAMILY_MIN_EVENTS settled events).
+
+    Periods: the program cache (refresh_programs, written at statement time)
+    merged with a fresh read of the active programs and of those started
+    since the cache was written. A period flagged paid_out is skipped, and
+    accrual in no known period is not counted. A running period under $1 so
+    far counts nothing yet (the floor as it stands now). Covers the IMM's own
+    accrual only (the cycle logs), ~97% of the account's credits.
+
+    Returns {"total", "raw", "market_periods", "markets", "since" (iso),
+    "overall_factor", "by_family": {family: [raw, scaled]}}."""
+    import pytz
+    et = pytz.timezone("America/New_York")
+    now = now_utc or datetime.now(timezone.utc)
+    day0 = now.astimezone(et).date() - timedelta(days=UNPAID_SINCE_DAYS)
+    since_ts = et.localize(datetime(day0.year, day0.month, day0.day)).timestamp()
+    progs = load_programs()
+    try:
+        cache_ts = os.path.getmtime(PROGRAM_CACHE)
+    except OSError:
+        cache_ts = now.timestamp() - 10 * 86400
+    fresh = fetch_recent_program_records(
+        client, min(cache_ts, since_ts, now.timestamp() - 3 * 86400) - 86400)
+
+    periods = {}
+    for t in set(progs) | set(fresh):
+        recs = {(a, b): p for a, b, p in _cache_periods(progs.get(t))}
+        for k, p in (fresh.get(t) or {}).items():
+            recs[k] = recs.get(k, False) or p
+        if any((_ts(b) or 0.0) >= since_ts for (_a, b) in recs):
+            periods[t] = merge_periods((a, b, p) for (a, b), p in recs.items())
+
+    if hourly is None:
+        hourly = rebuild_hourly()
+    if calib is None:
+        try:
+            with open(CALIB_PATH, encoding="utf-8") as f:
+                calib = json.load(f)
+        except (OSError, ValueError):
+            calib = {}
+    pa = (calib or {}).get("post_amendment") or {}
+    overall = pa.get("realization_factor") or 1.0
+    fams = pa.get("by_family") or {}
+
+    out = {"total": 0.0, "raw": 0.0, "market_periods": 0, "markets": 0,
+           "since": datetime.fromtimestamp(since_ts, timezone.utc).isoformat(),
+           "overall_factor": overall, "by_family": {}}
+    for t, merged in periods.items():
+        hours = hourly.get(t)
+        if not hours:
+            continue
+        bounds = [(_ts(a), _ts(b)) for a, b, _p in merged]
+        per, _outside = split_by_period(hours, bounds)
+        amt, n = 0.0, 0
+        for (_a, b, paid), acc in zip(merged, per):
+            if paid or (_ts(b) or 0.0) < since_ts or acc < PAYOUT_FLOOR:
+                continue
+            amt += acc
+            n += 1
+        if not n:
+            continue
+        fam = reward_family(series_of(t))
+        fv = fams.get(fam) or {}
+        fac = (fv.get("realization_factor")
+               if (fv.get("events") or 0) >= UNPAID_FAMILY_MIN_EVENTS
+               and fv.get("realization_factor") else overall)
+        out["raw"] += amt
+        out["total"] += amt * fac
+        out["market_periods"] += n
+        out["markets"] += 1
+        f = out["by_family"].setdefault(fam, [0.0, 0.0])
+        f[0] += amt
+        f[1] += amt * fac
+    out["raw"] = round(out["raw"], 2)
+    out["total"] = round(out["total"], 2)
+    out["by_family"] = {k: [round(a, 2), round(b, 2)]
+                        for k, (a, b) in sorted(out["by_family"].items(),
+                                                key=lambda kv: -kv[1][1])}
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Reconciliation
 # ----------------------------------------------------------------------------
 

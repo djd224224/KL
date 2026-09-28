@@ -151,5 +151,98 @@ class BuildEmailTests(unittest.TestCase):
         self.assertIn("Nothing moved since the prior morning", html)
 
 
+class _FakeMarginClient:
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    def get(self, path, params=None):
+        if self.fail:
+            raise RuntimeError("HTTP 503")
+        if path == "/margin/balance":
+            return {"settled_funds": "99.1490", "subaccount_balances": [
+                {"subaccount": 64, "account_equity": "99.8510", "position_value": "251.4120"},
+                {"subaccount": 0, "account_equity": "25.0943", "position_value": "0.0000"}]}
+        if path == "/margin/positions":
+            return {"positions": [{"market_ticker": "KXBTCPERP", "position": "30.00",
+                                   "unrealized_pnl": "54.6570"}]}
+        raise AssertionError(path)
+
+
+class PerpsAndRewardsTests(unittest.TestCase):
+    """Jack 2026-09-28: "include the value of perps as well in portfolio
+    value ... also include an estimated portfolio value after earnings are
+    paid out in parenthesis"."""
+
+    def test_perps_value_is_summed_subaccount_equity(self):
+        p = pf.fetch_perps(_FakeMarginClient())
+        self.assertAlmostEqual(p["equity"], 124.95)
+        self.assertEqual(p["positions"], [{"ticker": "KXBTCPERP", "position": 30.0,
+                                           "unrealized": 54.66}])
+
+    def test_perps_read_failure_is_none(self):
+        self.assertIsNone(pf.fetch_perps(_FakeMarginClient(fail=True)))
+
+    def _pf(self, prior_perps=100.0, unpaid=1829.4, stale=False):
+        prior = {"equity_kalshi": 23000.0}
+        if prior_perps is not None:
+            prior["perps_equity"] = prior_perps
+        return {"today": "2026-09-28", "rows": list(ROWS), "first_run": False,
+                "prior": prior, "equity_kalshi": 22500.0, "cash": 10000.0,
+                "kalshi_positions_value": 12500.0, "equity": 22900.0,
+                "positions_value": 12900.0, "perps_equity": 124.95,
+                "perps_stale": stale, "account_value": 22624.95,
+                "perps": {"equity": 124.95, "positions": [
+                    {"ticker": "KXBTCPERP", "position": 30.0, "unrealized": 54.66}]},
+                "unpaid": (None if unpaid is None else
+                           {"total": unpaid, "raw": 1577.1, "market_periods": 412,
+                            "markets": 390, "since": "2026-09-27T04:00:00+00:00"})}
+
+    def test_headline_has_perps_and_the_after_rewards_estimate(self):
+        subject, text, html = pf.build_email(self._pf(), [], chart_ok=False)
+        self.assertIn("Account value $22,624.95  (est. $24,454.35 after rewards are paid out)", text)
+        self.assertIn("(est. $24,454.35 after rewards are paid out)", html)
+        self.assertIn("perpetuals $124.95 (KXBTCPERP +30, unrealized +54.66)", text)
+        self.assertIn("412 program periods", text)
+        # the day change carries the perps move: -500 on event contracts plus
+        # +24.95 on perps
+        self.assertIn("vs yesterday: -475.05", text)
+        self.assertIn("perpetuals +24.95", text)
+        self.assertIn("day -475.05", subject)
+        # the movers residual stays on event contracts, where the table lives
+        self.assertIn("account value ex-perpetuals moved -500.00", text)
+        self.assertIn("-274.91", text)
+
+    def test_first_morning_with_perps_keeps_the_day_change_like_for_like(self):
+        _, text, _ = pf.build_email(self._pf(prior_perps=None), [], chart_ok=False)
+        self.assertIn("vs yesterday: -500.00", text)
+        self.assertIn("first counted today, so not in the day change", text)
+
+    def test_stale_perps_are_flagged(self):
+        _, text, _ = pf.build_email(self._pf(stale=True), [], chart_ok=False)
+        self.assertIn("yesterday's value: today's read failed", text)
+
+    def test_no_estimate_no_parenthesis(self):
+        _, text, html = pf.build_email(self._pf(unpaid=None), [], chart_ok=False)
+        self.assertNotIn("after rewards are paid out", text)
+        self.assertNotIn("after rewards are paid out", html)
+        self.assertIn("Account value $22,624.95", text)
+
+    def test_history_round_trips_the_new_columns(self):
+        import os
+        import tempfile
+        rows = pf.upsert_history([], "2026-09-28", 10000.0, 12900.0, 22900.0,
+                                 12500.0, 124.95, 1829.4)
+        tmp = tempfile.mkdtemp()
+        old = (pf.DATA_DIR, pf.HISTORY_CSV)
+        pf.DATA_DIR, pf.HISTORY_CSV = tmp, os.path.join(tmp, "h.csv")
+        try:
+            pf.write_history(rows)
+            back = pf.load_history()
+        finally:
+            pf.DATA_DIR, pf.HISTORY_CSV = old
+        self.assertEqual(back[0]["perps_equity"], 124.95)
+        self.assertEqual(back[0]["unpaid_rewards_est"], 1829.4)
+
+
 if __name__ == "__main__":
     unittest.main()

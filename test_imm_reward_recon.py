@@ -204,6 +204,123 @@ class TestPerPeriodFloor(unittest.TestCase):
         self.assertEqual(rec._scan_cycle_log.__defaults__, (None,))
 
 
+def _h(iso):
+    """UTC hour index of an ISO time (the hourly cache's key)."""
+    from datetime import datetime as _dt
+    return int(_dt.fromisoformat(iso.replace("Z", "+00:00")).timestamp() // 3600)
+
+
+class _FakePrograms:
+    """GET /incentive_programs by status, one list per page, cursor = page
+    number; records every call."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def get(self, path, params=None):
+        params = dict(params or {})
+        self.calls.append((path, params))
+        pages = self.pages.get(params.get("status")) or [[]]
+        i = int(params.get("cursor") or 0)
+        batch = pages[i] if i < len(pages) else []
+        return {"incentive_programs": batch,
+                "next_cursor": str(i + 1) if i + 1 < len(pages) else None}
+
+
+def _prog(ticker, start, end, paid=False):
+    return {"market_ticker": ticker, "incentive_type": "liquidity",
+            "start_date": start, "end_date": end, "paid_out": paid}
+
+
+class TestUnpaidEstimate(unittest.TestCase):
+    """Jack 2026-09-28: "also include an estimated portfolio value after
+    earnings are paid out". Earned-but-uncredited reward = the floored
+    accrual of periods still running or ended since 00:00 ET yesterday."""
+
+    NOW = None
+
+    def setUp(self):
+        from datetime import datetime as _dt, timezone as _tz
+        self.now = _dt(2026, 9, 28, 11, 0, tzinfo=_tz.utc)        # 7am EDT
+        # since = 00:00 EDT Sep 27 = 04:00Z
+        self.cache = {
+            "KXAAA-26SEP29-T1": {"periods": [["2026-09-27T10:00:00Z", "2026-09-29T00:00:00Z", False]]},
+            "KXBBB-26SEP27-T1": {"periods": [["2026-09-26T20:00:00Z", "2026-09-27T20:00:00Z", False]]},
+            "KXCCC-26SEP26-T1": {"periods": [["2026-09-25T00:00:00Z", "2026-09-26T23:00:00Z", False]]},
+            "KXDDD-26SEP30-T1": {"periods": [["2026-09-27T00:00:00Z", "2026-09-30T00:00:00Z", False]]},
+            "KXGGG-26SEP29-T1": {"periods": [["2026-09-20T00:00:00Z", "2026-09-21T00:00:00Z", False],
+                                              ["2026-09-27T06:00:00Z", "2026-09-29T00:00:00Z", False]]},
+            "KXFOOMENTION-26SEP29-A": {"start": "2026-09-27T00:00:00Z",
+                                       "end": "2026-09-29T00:00:00Z", "paid": False},
+        }
+        self.hourly = {
+            "KXAAA-26SEP29-T1": {_h("2026-09-27T12:00:00Z"): 1.0, _h("2026-09-27T13:00:00Z"): 1.0,
+                                 _h("2026-09-27T14:00:00Z"): 1.0},
+            "KXBBB-26SEP27-T1": {_h("2026-09-27T10:00:00Z"): 2.0},
+            "KXCCC-26SEP26-T1": {_h("2026-09-26T12:00:00Z"): 5.0},
+            "KXDDD-26SEP30-T1": {_h("2026-09-27T12:00:00Z"): 0.6},
+            "KXEEE-26SEP30-T1": {_h("2026-09-27T12:00:00Z"): 4.0},
+            "KXEARNINGSMENTIONZZZ-26OCT01-X": {_h("2026-09-27T20:00:00Z"): 1.5},
+            "KXGGG-26SEP29-T1": {_h("2026-09-20T12:00:00Z"): 10.0, _h("2026-09-27T12:00:00Z"): 1.2},
+            "KXFOOMENTION-26SEP29-A": {_h("2026-09-27T12:00:00Z"): 2.0},
+            "KXLATE-26SEP30-T1": {_h("2026-09-27T12:00:00Z"): 5.0},
+        }
+        self.calib = {"post_amendment": {"realization_factor": 1.1, "by_family": {
+            "EARNINGS-MENTION": {"events": 44, "realization_factor": 1.2},
+            "OTHER MENTION": {"events": 10, "realization_factor": 1.8}}}}
+        self.client = _FakePrograms({
+            "active": [[_prog("KXEEE-26SEP30-T1", "2026-09-27T00:00:00Z", "2026-09-30T00:00:00Z", paid=True),
+                        _prog("KXEARNINGSMENTIONZZZ-26OCT01-X", "2026-09-27T18:00:00Z", "2026-09-30T00:00:00Z")]],
+            "closed": [[]],
+            # newest start first: page 1 reaches back past the fetch horizon, so
+            # page 2 (a running program nobody should read) is never requested
+            "settled": [[_prog("KXBBB-26SEP27-T1", "2026-09-26T20:00:00Z", "2026-09-27T20:00:00Z")],
+                        [_prog("KXOLD-26SEP01-T1", "2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z")],
+                        [_prog("KXLATE-26SEP30-T1", "2026-08-20T00:00:00Z", "2026-09-30T00:00:00Z")]],
+        })
+
+    def _run(self):
+        with mock.patch.object(rec, "load_programs", return_value=self.cache), \
+                mock.patch.object(rec, "PROGRAM_CACHE", os.path.join(
+                    tempfile.gettempdir(), "no_such_program_cache.json")):
+            return rec.unpaid_estimate(self.client, now_utc=self.now,
+                                       calib=self.calib, hourly=self.hourly)
+
+    def test_running_and_recently_ended_periods_count(self):
+        est = self._run()
+        # counted: AAA 3.00 (running), BBB 2.00 (ended 9/27 20:00Z, after
+        # since), GGG 1.20 (its current period only), FOOMENTION 2.00 (older
+        # single-window cache record), EARNINGS 1.50 (fresh active read)
+        self.assertAlmostEqual(est["raw"], 9.70)
+        self.assertEqual(est["market_periods"], 5)
+        self.assertEqual(est["markets"], 5)
+        self.assertEqual(est["since"], "2026-09-27T04:00:00+00:00")
+
+    def test_family_factors_and_the_thin_family_fallback(self):
+        est = self._run()
+        # EARNINGS-MENTION has 44 settled events -> its own 1.2; OTHER
+        # MENTION has 10 -> the overall 1.1, not its 1.8; the rest -> 1.1
+        self.assertAlmostEqual(est["total"], round(8.2 * 1.1 + 1.5 * 1.2, 2))
+        self.assertAlmostEqual(est["by_family"]["EARNINGS-MENTION"][1], 1.80)
+        self.assertAlmostEqual(est["by_family"]["OTHER MENTION"][1], 2.20)
+
+    def test_excluded_periods(self):
+        est = self._run()
+        fams = est["by_family"]
+        # CCC ended before 00:00 ET yesterday, DDD is under the $1 floor, EEE
+        # is flagged paid_out, KXLATE sits past the paging horizon
+        self.assertAlmostEqual(sum(v[0] for v in fams.values()), 9.70)
+        settled_calls = [c for c in self.client.calls if c[1].get("status") == "settled"]
+        self.assertEqual(len(settled_calls), 2)
+
+    def test_since_moves_with_the_knob(self):
+        with mock.patch.object(rec, "UNPAID_SINCE_DAYS", 2):
+            est = self._run()
+        # 00:00 ET Sep 26 -> CCC's period (ended 9/26 23:00Z) now counts
+        self.assertAlmostEqual(est["raw"], 14.70)
+
+
 class TestEventRollup(unittest.TestCase):
     def test_market_ticker_rolls_to_its_event(self):
         self.assertEqual(rec.event_of("KXTEMPDCH-26AUG0213-T75.99"),

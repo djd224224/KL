@@ -15,6 +15,14 @@ E comes from Kalshi's positions endpoint (event rollups), so settlements,
 sells, and new fills are all captured; a settlement just moves money from
 the "open value" component into "realized" and the day P&L nets the truth.
 
+Account value = cash + Kalshi's valuation of the open event contracts +
+the perpetual-futures account's equity (the margin API, Jack 2026-09-28).
+The headline also carries, in parentheses, an ESTIMATE of the value once the
+liquidity rewards already earned are paid out (imm_reward_recon.
+unpaid_estimate: accrual in program periods still running or ended since
+midnight ET yesterday, $1 floor per market per period, x each family's
+paid/modelled ratio). Kalshi has no credits endpoint, so it is a model.
+
 State lives in portfolio_daily\:
     pf_snapshot_YYYY-MM-DD.json  - per-event E components (diff baseline)
     balance_history.csv          - date,cash,positions_value,equity (chart)
@@ -204,6 +212,52 @@ def fetch_recent_settlements(client, cutoff_utc: datetime):
     return out
 
 
+def fetch_perps(client):
+    """Kalshi perpetual futures ("perps": the margin API, /margin/*, same key
+    and signing as event contracts). Value = every subaccount's
+    account_equity summed -- its cash plus unsettled P&L; settled_funds is
+    the cash alone and already inside it (9/28: 99.85 + 25.09 of equity on
+    99.15 settled funds, one KXBTCPERP position). Kalshi's portfolio_value
+    covers event contracts only, so nothing is counted twice. None when the
+    balance read fails."""
+    try:
+        bal = client.get("/margin/balance")
+    except Exception as e:
+        log(f"! perps balance read failed: {e}")
+        return None
+    subs = bal.get("subaccount_balances") or []
+    out = {"equity": round(sum(_f(x.get("account_equity")) for x in subs), 2),
+           "settled_funds": round(_f(bal.get("settled_funds")), 2),
+           "positions": []}
+    try:
+        for p in client.get("/margin/positions").get("positions") or []:
+            q = _f(p.get("position"))
+            if abs(q) > 1e-9:
+                out["positions"].append({
+                    "ticker": p.get("market_ticker") or "?", "position": q,
+                    "unrealized": round(_f(p.get("unrealized_pnl")), 2)})
+    except Exception as e:
+        log(f"! perps positions read failed: {e}")
+    return out
+
+
+def estimate_unpaid_rewards(client, now_utc):
+    """imm_reward_recon.unpaid_estimate, never fatal: None on any failure,
+    and the headline then simply carries no after-rewards figure."""
+    try:
+        if KL_DIR not in sys.path:
+            sys.path.append(KL_DIR)     # the script's own dir wins
+        import imm_reward_recon as rr
+        est = rr.unpaid_estimate(client, now_utc)
+        log(f"unpaid rewards (est.): ${est['total']:,.2f} = model "
+            f"${est['raw']:,.2f} on {est['market_periods']} market-periods, "
+            f"{est['markets']} markets, since {est['since']}")
+        return est
+    except Exception as e:
+        log(f"! unpaid-rewards estimate failed: {e!r}")
+        return None
+
+
 def fetch_market_info(client, tickers):
     """ticker -> {"event": ..., "yes_bid": $, "yes_ask": $, "last": $} in
     chunks. Missing tickers just aren't in the result."""
@@ -254,7 +308,7 @@ def load_prior_snapshot(today_str: str):
 
 
 HISTORY_COLS = ["date", "cash", "positions_value", "equity",
-                "kalshi_positions_value"]
+                "kalshi_positions_value", "perps_equity", "unpaid_rewards_est"]
 
 
 def load_history():
@@ -273,17 +327,25 @@ def load_history():
                         r.get("kalshi_positions_value") or "")
                 except ValueError:
                     row["kalshi_positions_value"] = ""
+                for k in ("perps_equity", "unpaid_rewards_est"):   # 9/28 on
+                    try:
+                        row[k] = float(r.get(k) or "")
+                    except ValueError:
+                        row[k] = ""
                 rows.append(row)
     rows.sort(key=lambda r: r["date"])
     return rows
 
 
-def upsert_history(rows, today_str, cash, pos_value, equity, kalshi_pv):
+def upsert_history(rows, today_str, cash, pos_value, equity, kalshi_pv,
+                   perps_equity=None, unpaid=None):
     rows = [r for r in rows if r["date"] != today_str]
     rows.append({"date": today_str, "cash": round(cash, 2),
                  "positions_value": round(pos_value, 2),
                  "equity": round(equity, 2),
-                 "kalshi_positions_value": round(kalshi_pv, 2)})
+                 "kalshi_positions_value": round(kalshi_pv, 2),
+                 "perps_equity": "" if perps_equity is None else round(perps_equity, 2),
+                 "unpaid_rewards_est": "" if unpaid is None else round(unpaid, 2)})
     rows.sort(key=lambda r: r["date"])
     return rows
 
@@ -449,12 +511,31 @@ def build_portfolio(now_utc: datetime):
     positions_value = round(sum(e["value"] for e in events_today.values()), 2)
     equity = round(cash + positions_value, 2)
 
+    # Perpetuals (Jack 2026-09-28: "include the value of perps as well in
+    # portfolio value"). A failed read carries the prior morning's value,
+    # flagged, rather than dropping it out of the account value.
+    perps = fetch_perps(client)
+    perps_stale = False
+    if perps is not None:
+        perps_equity = perps["equity"]
+    elif (prior or {}).get("perps_equity") is not None:
+        perps_equity, perps_stale = _f(prior["perps_equity"]), True
+    else:
+        perps_equity = None
+    equity_kalshi = round(cash + kalshi_pv, 2)
+    account_value = round(equity_kalshi + (perps_equity or 0.0), 2)
+    unpaid = estimate_unpaid_rewards(client, now_utc)
+
     snapshot = {"date": today_str,
                 "created_utc": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "cash": round(cash, 2), "positions_value": positions_value,
                 "equity": equity,
                 "kalshi_positions_value": round(kalshi_pv, 2),
-                "equity_kalshi": round(cash + kalshi_pv, 2),
+                "equity_kalshi": equity_kalshi,
+                "perps_equity": perps_equity, "perps_stale": perps_stale,
+                "perps_positions": (perps or {}).get("positions"),
+                "account_value": account_value,
+                "unpaid_rewards_est": (unpaid or {}).get("total"),
                 "events": {ev: e for ev, e in events_today.items()
                            if ev not in carried_dead},
                 "tickers": ev_tickers,
@@ -498,7 +579,10 @@ def build_portfolio(now_utc: datetime):
     return {"today": today_str, "cash": round(cash, 2),
             "positions_value": positions_value, "equity": equity,
             "kalshi_positions_value": round(kalshi_pv, 2),
-            "equity_kalshi": round(cash + kalshi_pv, 2),
+            "equity_kalshi": equity_kalshi,
+            "perps_equity": perps_equity, "perps": perps,
+            "perps_stale": perps_stale, "account_value": account_value,
+            "unpaid": unpaid,
             "rows": rows, "snapshot": snapshot, "prior": prior,
             "mark_src": mark_src, "unreadable": unreadable,
             "n_settlements": len(settlements),
@@ -523,8 +607,10 @@ def render_chart(history, out_png: str) -> bool:
     dates = [datetime.strptime(r["date"], "%Y-%m-%d").date() for r in hist]
     # Account value on Kalshi's own positions valuation (Jack 8/14: "value it
     # based on Kalshi"); rows predating that column fall back to our marks.
-    eq = [r["cash"] + r["kalshi_positions_value"]
-          if isinstance(r.get("kalshi_positions_value"), float) else r["equity"]
+    # Perpetuals are in from 9/28 (earlier rows have none recorded).
+    eq = [(r["cash"] + r["kalshi_positions_value"]
+           if isinstance(r.get("kalshi_positions_value"), float) else r["equity"])
+          + (r["perps_equity"] if isinstance(r.get("perps_equity"), float) else 0.0)
           for r in hist]
 
     fig, ax = plt.subplots(figsize=(7.6, 3.1), dpi=180)
@@ -645,10 +731,41 @@ def build_email(pf, history, chart_ok: bool):
 
     first = pf["first_run"]
     prior = pf["prior"] or {}
-    # Account value on Kalshi's own valuation (cash + their portfolio_value).
-    d_equity = None if first else round(
-        pf["equity_kalshi"] - _f(prior.get("equity_kalshi") or prior.get("equity")), 2)
-    other = None if first else round(d_equity - tot_pnl, 2)
+    # Account value on Kalshi's own valuation (cash + their portfolio_value)
+    # plus the perpetuals account's equity (9/28 on). The day change compares
+    # like with like: perps enter it once both mornings have a value.
+    ek = pf["equity_kalshi"]
+    perps_eq = pf.get("perps_equity")
+    acct = pf.get("account_value", ek)
+    d_ek = None if first else round(
+        ek - _f(prior.get("equity_kalshi") or prior.get("equity")), 2)
+    prior_perps = prior.get("perps_equity")
+    d_perps = (None if first or perps_eq is None or prior_perps is None
+               else round(perps_eq - _f(prior_perps), 2))
+    d_equity = None if first else round(d_ek + (d_perps or 0.0), 2)
+    other = None if first else round(d_ek - tot_pnl, 2)
+    unpaid = pf.get("unpaid") or None
+    unpaid_total = unpaid.get("total") if unpaid else None
+    after_txt = ("" if unpaid_total is None else
+                 f"  (est. ${acct + unpaid_total:,.2f} after rewards are paid out)")
+    if perps_eq is None:
+        perps_note = ""
+    elif pf.get("perps_stale"):
+        perps_note = " (yesterday's value: today's read failed)"
+    elif not first and prior_perps is None:
+        perps_note = " (first counted today, so not in the day change)"
+    else:
+        pos = (pf.get("perps") or {}).get("positions") or []
+        perps_note = ("" if not pos else " (" + ", ".join(
+            f"{p['ticker']} {p['position']:+g}, unrealized {p['unrealized']:+,.2f}"
+            for p in pos[:3]) + (f", +{len(pos) - 3} more" if len(pos) > 3 else "") + ")")
+    unpaid_note = ("" if unpaid_total is None else
+                   f"Rewards earned, not yet paid (est.): ${unpaid_total:,.2f} = the "
+                   f"IMM's modelled accrual in {unpaid['market_periods']} program "
+                   f"periods still running or ended since midnight ET yesterday "
+                   f"(Kalshi pays 0-3 days after a period ends), $1 floor per "
+                   f"market per period, model ${unpaid['raw']:,.2f} x each family's "
+                   f"paid/modelled ratio.")
 
     # Biggest movers, settled AND unrealized. Every event row is in here; the
     # settled table below is the realized subset of the same rows. What this
@@ -656,7 +773,8 @@ def build_email(pf, history, chart_ok: bool):
     # deposits/withdrawals, and Kalshi marking positions at the bid where
     # these rows use mid.
     movers, mv_tot, (mv_hidden_n, mv_hidden_net) = family_movers(pf["rows"])
-    mv_residual = None if first else round(d_equity - mv_tot["day"], 2)
+    mv_residual = None if first else round(d_ek - mv_tot["day"], 2)
+    ex_perps = " ex-perpetuals" if perps_eq is not None else ""
 
     subject = (f"Kalshi portfolio {today} — first baseline" if first else
                f"Kalshi portfolio {today} — day {d_equity:+,.2f}, "
@@ -664,15 +782,21 @@ def build_email(pf, history, chart_ok: bool):
 
     # ---- plain text ---------------------------------------------------------
     lines = [f"Kalshi portfolio — {today} (7am ET)", ""]
-    lines.append(f"Account value ${pf['equity_kalshi']:,.2f}  =  cash "
-                 f"${pf['cash']:,.2f}  +  open positions "
-                 f"${pf['kalshi_positions_value']:,.2f}")
+    lines.append(f"Account value ${acct:,.2f}{after_txt}")
+    lines.append(f"  =  cash ${pf['cash']:,.2f}  +  open positions "
+                 f"${pf['kalshi_positions_value']:,.2f}"
+                 + ("" if perps_eq is None else
+                    f"  +  perpetuals ${perps_eq:,.2f}{perps_note}"))
+    if unpaid_note:
+        lines.append(unpaid_note)
     if first:
         lines.append("First run: baseline saved; day-over-day starts tomorrow.")
     else:
         lines.append(f"vs yesterday: {d_equity:+,.2f}  =  settled events "
                      f"{tot_pnl:+,.2f}  +  open positions, credits & deposits "
-                     f"{other:+,.2f}")
+                     f"{other:+,.2f}"
+                     + ("" if d_perps is None else
+                        f"  +  perpetuals {d_perps:+,.2f}"))
     lines.append("")
     lines.append(f"Biggest movers since yesterday, by family (settled + unrealized; "
                  f"top {len(movers)} of {mv_tot['n_families']} families):")
@@ -694,7 +818,7 @@ def build_email(pf, history, chart_ok: bool):
     if not movers:
         lines.append("(nothing moved since the prior morning)")
     if mv_residual is not None:
-        lines.append(f"(account value moved {d_equity:+,.2f}; the {mv_residual:+,.2f} "
+        lines.append(f"(account value{ex_perps} moved {d_ek:+,.2f}; the {mv_residual:+,.2f} "
                      f"not in this table is credits, deposits/withdrawals, and "
                      f"Kalshi marking at the bid where this table uses mid)")
     lines.append("")
@@ -717,19 +841,30 @@ def build_email(pf, history, chart_ok: bool):
     h.append(f'<div style="font-size:17px;font-weight:600">Kalshi portfolio'
              f' <span style="color:#888;font-weight:400">— {today} (7am ET)</span></div>')
     h.append(f'<div style="font-size:22px;font-weight:700;margin:8px 0 2px">'
-             f'Account value ${pf["equity_kalshi"]:,.2f}'
-             + ("" if first else
-                f' <span style="font-size:15px;font-weight:600">'
-                f'({_pnl_span(d_equity)} vs yesterday)</span>')
+             f'Account value ${acct:,.2f}'
+             + ("" if unpaid_total is None else
+                f' <span style="font-size:15px;font-weight:600;color:{C_INK2}">'
+                f'(est. ${acct + unpaid_total:,.2f} after rewards are paid out)</span>')
              + '</div>')
     h.append(f'<div style="color:{C_INK2};margin-bottom:6px">'
              f'cash <b>${pf["cash"]:,.2f}</b> &nbsp;&middot;&nbsp; '
              f'open positions <b>${pf["kalshi_positions_value"]:,.2f}</b>'
+             + ("" if perps_eq is None else
+                f' &nbsp;&middot;&nbsp; perpetuals <b>${perps_eq:,.2f}</b>'
+                f'<span style="color:{C_MUTED}">{perps_note}</span>')
+             + ("" if unpaid_total is None else
+                f' &nbsp;&middot;&nbsp; rewards earned, not yet paid '
+                f'<b>&asymp; ${unpaid_total:,.2f}</b>')
              + ("" if first else
-                f'<br>day change = settled events {_pnl_span(tot_pnl)}'
-                f' &nbsp;+&nbsp; open positions, credits &amp; deposits '
-                f'{_pnl_span(other)}')
+                f'<br>day change {_pnl_span(d_equity)} = settled events '
+                f'{_pnl_span(tot_pnl)} &nbsp;+&nbsp; open positions, credits '
+                f'&amp; deposits {_pnl_span(other)}'
+                + ("" if d_perps is None else
+                   f' &nbsp;+&nbsp; perpetuals {_pnl_span(d_perps)}'))
              + '</div>')
+    if unpaid_note:
+        h.append(f'<div style="color:{C_MUTED};font-size:12px;margin-bottom:6px">'
+                 f'{unpaid_note}</div>')
     if first:
         h.append(f'<div style="color:{C_INK2};margin-bottom:6px">First run — '
                  f'baseline saved; day-over-day starts tomorrow.</div>')
@@ -786,7 +921,7 @@ def build_email(pf, history, chart_ok: bool):
         h.append('</table>')
         if mv_residual is not None:
             h.append(f'<div style="color:{C_MUTED};font-size:12px;margin:4px 0 0">'
-                     f'Account value moved {_pnl_span(d_equity)}; the '
+                     f'Account value{ex_perps} moved {_pnl_span(d_ek)}; the '
                      f'{_pnl_span(mv_residual)} not in this table is liquidity '
                      f'credits, deposits/withdrawals, and Kalshi marking at the '
                      f'bid where this table uses mid.</div>')
@@ -907,7 +1042,9 @@ def main(argv=None) -> int:
     history = load_history()
     history_preview = upsert_history(history, today_str, pf["cash"],
                                      pf["positions_value"], pf["equity"],
-                                     pf["kalshi_positions_value"])
+                                     pf["kalshi_positions_value"],
+                                     pf.get("perps_equity"),
+                                     (pf.get("unpaid") or {}).get("total"))
     if not (args.test or args.dry_run):
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(snapshot_path(today_str), "w", encoding="utf-8") as f:
