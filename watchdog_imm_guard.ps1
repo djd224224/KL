@@ -34,14 +34,25 @@ if (-not $task) { Write-WdLog "! task '$TaskName' not found"; exit 1 }
 if ($task.State -ne 'Ready') { exit 0 }          # Running/Disabled = nothing to do
 
 # Disabled stays the deliberate pause switch; State -ne 'Ready' already covers it.
-$alive = @(Get-CimInstance Win32_Process -Filter "Name like '%python%'" |
-           Where-Object { $_.CommandLine -like '*incentive_mm.py*' })
+# Alive = ANY piece of the bot chain, not just python (2026-09-28): the task
+# now runs the launcher under a hidden wscript wrapper
+# (run_incentive_mm_hidden.vbs), so Ready can also mean only the wrapper
+# died while its launcher lives on -- and a launcher inside its 30s relaunch
+# sleep has no python yet, but will start one next to the task started here.
+$alive = @(Get-CimInstance Win32_Process -Filter ("Name like '%python%' or " +
+               "Name = 'powershell.exe' or Name = 'pwsh.exe' or Name = 'wscript.exe'") |
+           Where-Object {
+               ($_.Name -like 'python*' -and $_.CommandLine -like '*incentive_mm.py*') -or
+               ($_.Name -in @('powershell.exe', 'pwsh.exe') -and
+                $_.CommandLine -like '*run_incentive_mm.ps1*') -or
+               ($_.Name -eq 'wscript.exe' -and
+                $_.CommandLine -like '*run_incentive_mm_hidden.vbs*') })
 
 if ($alive.Count -gt 0) {
     # -f binds tighter than +, so formatting a CONCATENATED literal silently
     # leaves {0}/{1} unexpanded in the first half. Build the string first.
     $pids = ($alive.ProcessId) -join ','
-    Write-WdLog ("ORPHAN: task Ready but $($alive.Count) incentive_mm process(es) " +
+    Write-WdLog ("ORPHAN: task Ready but $($alive.Count) incentive_mm chain process(es) " +
                  "alive (pid $pids); NOT starting -- would duplicate the bot " +
                  "on a live account")
     exit 0

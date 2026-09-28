@@ -366,9 +366,15 @@ an anchor:
    `--live` with `IMM_MAX_MARKETS=1 IMM_LEVELS=0:1` — verifies Kalshi accepts the
    `imm-<run>-<hex>` client_order_id format (the orphan sweep keys on it), then
    `--cancel-all`.
-5. Register the task (at-logon, non-elevated, same pattern as the crypto fleet):
+5. Register the task (at-logon, non-elevated, same pattern as the crypto fleet).
+   Since 2026-09-28 the action is the hidden wrapper `run_incentive_mm_hidden.vbs`
+   (it runs `run_incentive_mm.ps1 -Probe` with no console window and waits on it):
+   the old visible console WAS the bot, and closing it by accident killed it with
+   no order cancel. Ending the task can orphan the launcher under the wrapper, so
+   bounce with `restart_imm.ps1 -Task` (it sweeps launcher, cmd, wrapper and
+   python), never a bare `Stop-ScheduledTask` / `Start-ScheduledTask`.
    ```powershell
-   $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\Users\jackd\Documents\KL\run_incentive_mm.ps1"
+   $act = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "//B ""C:\Users\jackd\Documents\KL\run_incentive_mm_hidden.vbs"""
    $trg = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERNAME"
    Register-ScheduledTask -TaskName "KL incentive_mm" -Action $act -Trigger $trg
    Start-ScheduledTask -TaskName "KL incentive_mm"

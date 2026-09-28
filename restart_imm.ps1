@@ -26,10 +26,18 @@
 # WHAT IT RESTARTS. Default: kill the incentive_mm.py python; the launcher
 # (run_incentive_mm.ps1) relaunches it ~30s later with freshly imported
 # code — the right tool after a sync-kl-main code pull. -Task: full
-# scheduled-task bounce (stop task, sweep surviving pythons, start task) —
+# scheduled-task bounce (stop task, sweep the surviving chain, start task) —
 # REQUIRED when the launcher's $ProbeEnv changed: a python kill keeps the
 # launcher's stale env (the 2026-08-01 gotcha), and Stop-ScheduledTask can
-# orphan the python child (observed same day), hence the sweep.
+# orphan the python child (observed same day), hence the sweep. Since
+# 2026-09-28 the task runs the launcher under a hidden wscript wrapper
+# (run_incentive_mm_hidden.vbs -- the visible console was closed by accident
+# and took the bot with it), so ending the task can orphan the LAUNCHER as
+# well, and an orphaned launcher relaunches python 30s after the sweep, next
+# to the fresh task's bot: two bots on one account. The sweep therefore
+# takes the whole chain -- launcher, cmd shim, wrapper, python, in that
+# order so nothing respawns mid-pass -- and refuses to start the task while
+# any of it survives.
 # -Now skips the window wait (emergencies).
 
 param(
@@ -55,6 +63,45 @@ function Write-RLog([string]$Message) {
 function Get-BotProcs {
     @(Get-CimInstance Win32_Process -Filter "Name like '%python%'" |
       Where-Object { $_.CommandLine -like '*incentive_mm.py*' })
+}
+
+function Get-ImmChain {
+    # Every live process of the bot chain, in kill order: the launcher
+    # powershell (rank 0: it relaunches python, so it dies first), the cmd
+    # shim it runs python through (1), the hidden wscript wrapper (2), the
+    # bot python (3). Matched on command lines -- a launcher inside its 30s
+    # relaunch sleep has no python child to walk up from -- plus each bot
+    # python's parent cmd. Never a process in this script's own ancestry.
+    $procs = @(Get-CimInstance Win32_Process -Filter ("Name like '%python%' or " +
+        "Name = 'cmd.exe' or Name = 'powershell.exe' or Name = 'pwsh.exe' or " +
+        "Name = 'wscript.exe'"))
+    $byId = @{}
+    foreach ($p in $procs) { $byId[[int]$p.ProcessId] = $p }
+    $mine = @()
+    $cur = $PID
+    for ($i = 0; $i -lt 8 -and $cur; $i++) {
+        $mine += $cur
+        $me = Get-CimInstance Win32_Process -Filter "ProcessId=$cur"
+        if (-not $me) { break }
+        $cur = [int]$me.ParentProcessId
+    }
+    $rank = @{}
+    foreach ($p in $procs) {
+        $cl = [string]$p.CommandLine
+        if ($p.Name -like 'python*' -and $cl -like '*incentive_mm.py*') {
+            $rank[[int]$p.ProcessId] = 3
+            $parent = $byId[[int]$p.ParentProcessId]
+            if ($parent -and $parent.Name -eq 'cmd.exe') { $rank[[int]$parent.ProcessId] = 1 }
+        } elseif ($p.Name -in @('powershell.exe', 'pwsh.exe') -and $cl -like '*run_incentive_mm.ps1*') {
+            $rank[[int]$p.ProcessId] = 0
+        } elseif ($p.Name -eq 'wscript.exe' -and $cl -like '*run_incentive_mm_hidden.vbs*') {
+            $rank[[int]$p.ProcessId] = 2
+        }
+    }
+    foreach ($m in $mine) { $rank.Remove([int]$m) }
+    $rank.GetEnumerator() | Sort-Object Value | ForEach-Object {
+        [pscustomobject]@{ ProcessId = $_.Key; Name = $byId[$_.Key].Name; Rank = $_.Value }
+    }
 }
 
 function Test-InWindow {
@@ -101,14 +148,27 @@ if ($Task) {
     Write-RLog "task restart: stopping '$TaskName'"
     Stop-ScheduledTask -TaskName $TaskName
     Start-Sleep -Seconds 2
-    # Stop-ScheduledTask can leave the python child orphaned and still
-    # trading (2026-08-01); sweep before starting or two bots collide on
-    # one account.
-    foreach ($p in Get-BotProcs) {
-        Write-RLog "  killing surviving incentive_mm python (pid $($p.ProcessId))"
-        Stop-Process -Id $p.ProcessId -Force
+    # Stop-ScheduledTask can leave the chain under the task's own process
+    # alive -- the python child, still trading (2026-08-01), and under the
+    # hidden wrapper the launcher itself, which would relaunch python next
+    # to the fresh task's bot. Sweep it all before starting or two bots
+    # collide on one account.
+    for ($pass = 1; $pass -le 4; $pass++) {
+        $chain = @(Get-ImmChain)
+        if ($chain.Count -eq 0) { break }
+        foreach ($p in $chain) {
+            Write-RLog "  killing surviving $($p.Name) (pid $($p.ProcessId))"
+            Stop-Process -Id $p.ProcessId -Force
+        }
+        Start-Sleep -Seconds 2
     }
-    Start-Sleep -Seconds 2
+    $left = @(Get-ImmChain)
+    if ($left.Count -gt 0) {
+        Write-RLog ("! bot chain still alive after the sweep (pid " +
+                    (($left | ForEach-Object { $_.ProcessId }) -join ',') +
+                    "); NOT starting '$TaskName' -- it would duplicate the bot")
+        exit 1
+    }
     Start-ScheduledTask -TaskName $TaskName
     Write-RLog "task restart: '$TaskName' started (fresh launcher env + code)"
 } else {
