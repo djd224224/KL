@@ -14226,6 +14226,107 @@ class TestQuakeBidOnlyGate(unittest.TestCase):
         self.assertIn(self.T, bot._quake_stood)
         self.assertNotIn(self.T, bot._quake_held)
 
+    # -- hold renewal (Jack 2026-09-28: held bids expired at their 30-min TTL
+    #    twenty minutes into a hold on KXBIGGESTQUAKE-28SEP26) --------------
+
+    def _held(self, bot):
+        """Quote once, then freeze the book on a fresh GFZ M5.9 (no USGS
+        solution yet): the young bids stay exactly as they were."""
+        bot.run_cycle()
+        before = self._orders(bot)
+        self.assertTrue(before)
+        now = time.time()
+        self.watch.update_gfz([{"id": "g1", "mag": 5.9, "mag_type": "mb",
+                                "time": now - 60, "place": "x"}], now)
+        bot.run_cycle()
+        self.assertIn(self.T, bot._quake_held)
+        self.assertEqual(self._orders(bot), before)
+        return before
+
+    def _sized(self, bot):
+        return sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_a_held_bid_due_for_refresh_renews_at_its_own_price_and_size(self):
+        bot = self._bot()
+        before = self._held(bot)
+        bot.state.sim_orders[before[0][0]]["remaining_count"] -= 7.0  # part-filled while held
+        sized = self._sized(bot)
+        old = time.time() - imm.ORDER_REFRESH_SECS - 5
+        for oid, _s, _p in before:
+            bot.state.order_ages[oid] = old
+        bot.run_cycle()
+        self.assertIn(self.T, bot._quake_held)                       # still held
+        self.assertEqual(self._sized(bot), sized)    # same prices, same REMAINING sizes
+        self.assertTrue({o for o, _s, _p in self._orders(bot)}.isdisjoint(
+            {o for o, _s, _p in before}))                            # every bid renewed
+        bot.run_cycle()                                              # renewed = young again
+        self.assertEqual(self._sized(bot), sized)
+
+    def test_the_exchange_expiry_backstops_a_lost_age(self):
+        bot = self._bot()
+        before = self._held(bot)
+        quotes = self._quotes(bot)
+        soon = time.time() + 30
+        for oid, _s, _p in before:
+            bot.state.order_ages[oid] = time.time()                  # reads as brand new
+            bot.state.sim_orders[oid]["expire_at"] = soon            # but expires in 30 s
+        with mock.patch.object(imm, "ORDER_TTL_SECS", 1800), \
+                mock.patch.object(imm, "ORDER_REFRESH_SECS", 1500):
+            bot.run_cycle()
+        self.assertEqual(self._quotes(bot), quotes)
+        live = [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+        self.assertTrue(live)
+        self.assertTrue(all(o["expire_at"] > soon + 600 for o in live))
+
+    def test_hold_renewal_kill_switch_lets_held_bids_ride(self):
+        bot = self._bot()
+        before = self._held(bot)
+        old = time.time() - imm.ORDER_REFRESH_SECS - 5
+        for oid, _s, _p in before:
+            bot.state.order_ages[oid] = old
+        with mock.patch.object(imm, "QUAKE_HOLD_RENEW", False):
+            bot.run_cycle()
+        self.assertEqual(self._orders(bot), before)                  # same ids, left as-is
+
+    def test_renewals_mirror_price_and_remaining_only_on_held_tickers(self):
+        now = 1_000_000.0
+        old = now - imm.ORDER_REFRESH_SECS - 1
+        resting = [
+            {"order_id": "a", "ticker": self.T, "book_side": "bid",
+             "yes_price": 27, "remaining_count": 60.0},
+            {"order_id": "b", "ticker": self.T, "book_side": "bid",
+             "yes_price": 19, "yes_price_exact": 19.15, "remaining_count": 12.6},
+            {"order_id": "c", "ticker": self.T, "book_side": "bid",
+             "yes_price": 26, "remaining_count": 60.0},              # young
+            {"order_id": "d", "ticker": "KXOTHER-26SEP28-X", "book_side": "bid",
+             "yes_price": 40, "remaining_count": 10.0},              # not held
+            {"order_id": "e", "ticker": self.T, "book_side": "bid",
+             "yes_price": 25, "remaining_count": 0.4},               # under one contract
+        ]
+        ages = {"a": old, "b": old, "c": now - 10, "d": old, "e": old}
+        place, cancel = imm.quake_hold_renewals(resting, {self.T}, ages, now)
+        self.assertEqual(cancel, ["a", "b"])
+        self.assertEqual(
+            [(q.ticker, q.book_side, q.price_cents, q.count, q.price_exact, q.is_pad)
+             for q in place],
+            [(self.T, "bid", 27, 60, None, False), (self.T, "bid", 19, 12, 19.15, False)])
+
+        # an API order: its expiration_time is the backstop clock
+        def api(oid, secs_left):
+            exp = datetime.fromtimestamp(now + secs_left, tz=timezone.utc)
+            return {"order_id": oid, "ticker": self.T, "side": "yes", "action": "buy",
+                    "yes_price_dollars": "0.8600", "remaining_count_fp": "60.00",
+                    "expiration_time": exp.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        with mock.patch.object(imm, "ORDER_TTL_SECS", 1800), \
+                mock.patch.object(imm, "ORDER_REFRESH_SECS", 1500):
+            place, cancel = imm.quake_hold_renewals(
+                [api("f", 60), api("g", 1000)], {self.T}, {"f": now, "g": now}, now)
+        self.assertEqual(cancel, ["f"])
+        self.assertEqual([(q.price_cents, q.count, q.price_exact) for q in place],
+                         [(86, 60, None)])
+
 
 def imm_usgs_stale_secs():
     return uqf.USGS_STALE_SECS

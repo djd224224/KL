@@ -6584,7 +6584,9 @@ def gb_gate_reason(ticker: str, now_ts: float,
 #     or its fair leaves no bid of 1c or more;
 #   - HOLDS (resting bids left exactly as they are, never raised on news)
 #     while a new M4.8+ detection on either feed awaits NEIC's own solution,
-#     or GFZ is stale -- each bounded by the module's FREEZE_MAX_MIN;
+#     or GFZ is stale -- each bounded by the module's FREEZE_MAX_MIN; a held
+#     bid due for the TTL refresh is renewed at its own price and remaining
+#     size (QUAKE_HOLD_RENEW) so a long hold never lets it expire;
 #   - otherwise quotes the bid ladder with every rung capped at fair - margin.
 # No ask rungs and no ask pad ever (series_bid_only feeds the per-side ladder
 # multipliers, both pad sites and the two-sided depth test), and the reward
@@ -6608,6 +6610,23 @@ QUAKE_USGS_POLL_SECS = _env_float("IMM_QUAKE_USGS_POLL_SECS", 15)
 QUAKE_GFZ_POLL_SECS = _env_float("IMM_QUAKE_GFZ_POLL_SECS", 20)
 QUAKE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN", 10)
 QUAKE_SIZE_MULT = _env_float("IMM_QUAKE_SIZE_MULT", 3.0)
+# HOLD RENEWAL (Jack 2026-09-28, "yes" to renewing held bids): a hold leaves
+# the resting bids exactly as they are, but every IMM order carries an
+# exchange-side expiration (ORDER_TTL_SECS; 1800 in the launcher) and a held
+# market's orders sit in the requote diff's preserve set, which skips the TTL
+# refresh. A hold that outlived a bid's TTL (holds run up to the module's
+# FREEZE_MAX_MIN, 45) therefore turned into a full stand-down:
+# KXBIGGESTQUAKE-28SEP26's eight bids, placed 01:22Z 9/28, expired at 01:52Z,
+# twenty minutes into a hold on a GFZ-only M5.0 (Luzon) that USGS had not
+# listed. A held order now renews on the same clock as every other order --
+# older than ORDER_REFRESH_SECS, or within ORDER_TTL_SECS - ORDER_REFRESH_SECS
+# of its exchange expiry -- as a cancel + re-place at the SAME price (sub-penny
+# kept) and the SAME remaining size (never raised, never topped up; only the
+# queue position is lost), through the ordinary swap path (pair_requotes /
+# place_with_caps: a renewal the per-cycle cap defers keeps its identical
+# order resting). IMM_QUAKE_HOLD_RENEW=0 restores the old behavior: held bids
+# ride to their expiry.
+QUAKE_HOLD_RENEW = os.environ.get("IMM_QUAKE_HOLD_RENEW", "1") == "1"
 QUAKE_STATUS_FILE = os.environ.get(
     "IMM_QUAKE_STATUS_FILE", os.path.join(STATUS_DIR, "usgs_quake_state.json"))
 # the QuakeWatch the refresher thread owns; None = no feed (gate closed)
@@ -6771,6 +6790,58 @@ def quake_cap_quotes(quotes: List["Quote"], cap_c: int) -> List["Quote"]:
             q = replace(q, price_cents=int(cap_c), price_exact=None)
         out.append(q)
     return out
+
+
+def order_expiry_ts(order: dict) -> Optional[float]:
+    """A resting order's exchange-side expiry in unix seconds: the dry run's
+    `expire_at`, else the API's `expiration_time`. None when unknown."""
+    v = order.get("expire_at")
+    if v is not None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    exp = parse_iso_utc(order.get("expiration_time") or "")
+    return exp.timestamp() if exp else None
+
+
+def quake_hold_renewals(resting: List[dict], held: Set[str],
+                        order_ages: Dict[str, float], now_ts: float
+                        ) -> Tuple[List["Quote"], List[str]]:
+    """(to_place, to_cancel) renewing the resting orders of quake-HELD
+    markets that are due for the TTL refresh (QUAKE_HOLD_RENEW): older than
+    ORDER_REFRESH_SECS, or within ORDER_TTL_SECS - ORDER_REFRESH_SECS of the
+    exchange expiry (the clock that survives a lost age). Each due order is
+    cancelled and re-placed at its own price (sub-penny kept) and its own
+    remaining size floored to whole contracts, the two lists in matching
+    order so pair_requotes swaps them one for one. Orders on other tickers,
+    or not yet due, are left alone."""
+    to_place: List["Quote"] = []
+    to_cancel: List[str] = []
+    lead = max(ORDER_TTL_SECS - ORDER_REFRESH_SECS, 0)
+    for o in resting:
+        tk = o.get("ticker", "")
+        oid = o.get("order_id", "")
+        if tk not in held or not oid:
+            continue
+        parsed = order_yes_book_cents(o)
+        if parsed is None:
+            continue
+        age = now_ts - order_ages.get(oid, now_ts)
+        exp = order_expiry_ts(o)
+        if age <= ORDER_REFRESH_SECS and (exp is None or exp - now_ts > lead):
+            continue
+        count = int(math.floor(order_remaining(o) + 1e-9))
+        if count < 1:
+            continue
+        book_side, px = parsed
+        ox = order_yes_exact_cents(o)
+        exact = ox if ox is not None and abs(ox - round(ox)) >= 0.005 else None
+        to_cancel.append(oid)
+        to_place.append(Quote(tk, book_side, px, count,
+                              is_pad=_order_is_pad(book_side, px),
+                              price_exact=exact))
+    return to_place, to_cancel
 
 
 # ----------------------------------------------------------------------------
@@ -8334,7 +8405,8 @@ def diff_orders(desired: List[Quote], resting: List[dict],
     - stale-by-TTL (ORDER_REFRESH_SECS) -> cancel + fresh place (amend
       cannot extend the exchange-side expiration).
     Orders on preserve_tickers (blind/fast-lane-skipped markets) are left
-    untouched."""
+    untouched (quake-held markets renew outside the diff, see
+    quake_hold_renewals)."""
     to_place: List[Quote] = []
     to_cancel: List[str] = []
     to_amend: List[Tuple[dict, Quote]] = []
@@ -14145,6 +14217,19 @@ class IncentiveMarketMaker:
         to_place, to_cancel, to_amend = diff_orders(
             desired, resting, self.state.order_ages, now_ts,
             preserve_tickers=preserve, touch_by_ticker=touch_map)
+        # held quake bids skip the diff (preserve) -- renew the ones due for
+        # the TTL refresh at their own price and size (QUAKE_HOLD_RENEW)
+        if QUAKE_HOLD_RENEW and quake_held:
+            renew_place, renew_cancel = quake_hold_renewals(
+                resting, quake_held, self.state.order_ages, now_ts)
+            for q in renew_place:
+                log(f"{self.tag} quake hold renew {q.ticker}: "
+                    f"{q.book_side.upper()} {q.count}x @ "
+                    + (f"{q.price_exact:.2f}c" if q.price_exact is not None
+                       else f"{q.price_cents}c")
+                    + " (same price and size, TTL renewal while held)")
+            to_place.extend(renew_place)
+            to_cancel.extend(renew_cancel)
         log(f"{self.tag} {quoted}/{len(managed)} mkts quoted, {len(resting)} resting, "
             f"{len(to_amend)} amend, {len(to_cancel)} cancel, {len(to_place)} place, "
             f"est ${reward_frac_sum:.2f}/day reward share, P&L today ${pnl_today:+.2f} "
