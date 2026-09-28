@@ -37,6 +37,17 @@ the first full statement was reconciled):
      Comparing an account-level statement total to an IMM-only estimate is
      what produced the fictional "$1,500 of non-IMM reward" figure.
 
+The floor is per market PER PROGRAM PERIOD (2026-09-27, Jack: "The $1 minimum
+payout is applied to each market's whole history rather than per program
+period ... fix this"). A period is one incentive-program record, with
+overlapping records on a market merged into one paying stretch -- the same
+rule incentive_mm's own per-period floor uses (fetch_programs). A market
+re-listed for a fresh period starts again from $0, so four $0.60 periods pay
+nothing, where the lifetime test counted $2.40. The accrual is rebuilt by UTC
+hour (rebuild_hourly) and split at each period's start and end; a market with
+no program metadata keeps the lifetime test. IMM_RECON_FLOOR_PER_PERIOD=0
+restores the lifetime test everywhere.
+
 Usage:
     python imm_reward_recon.py --statement "C:/.../incentive rewards.txt"
     python imm_reward_recon.py --report
@@ -62,6 +73,15 @@ LEDGER_PATH = os.path.join(STATUS_DIR, "reward_credits.csv")
 CALIB_PATH = os.path.join(STATUS_DIR, "reward_calibration.json")
 PROGRAM_CACHE = os.path.join(STATUS_DIR, "reward_programs.json")
 EST_CACHE = os.path.join(STATUS_DIR, "reward_est_cache.json")
+# the same accrual bucketed by UTC hour, for the per-period floor
+HOURLY_CACHE = os.path.join(STATUS_DIR, "reward_est_hourly_cache.json")
+FLOOR_PER_PERIOD = os.environ.get("IMM_RECON_FLOOR_PER_PERIOD", "1") == "1"
+# A caller that caps the estimate side at a statement date (the rewards
+# report) sets this so the hourly accrual stops at the same file ("YYYY-MM-DD")
+HOURLY_MAX_DATE = None
+# Per-market floor detail from the last reconcile(): ticker -> {"total",
+# "paid", "periods" [accrual per period], "outside", "paid_periods"}.
+LAST_FLOOR_DETAIL = {}
 
 # The bot's first live day. Credits dated before this cannot be IMM's, and the
 # digest must not count them (Jack 2026-08-04).
@@ -255,8 +275,10 @@ def rebuild_estimates(max_dt=900.0):
     return dict(out)
 
 
-def _scan_cycle_log(path, max_dt):
+def _scan_cycle_log(path, max_dt, hourly=None):
     """{ticker: [est, first_ts, last_ts, cycles, two_sided]} for one day file.
+    When `hourly` is a dict it is also filled with {ticker: {utc_hour_index:
+    est}} -- the same accrual, bucketed by the hour of the cycle it lands on.
 
     NOTE the cross-file seam: the first cycle of a day gets no dt because the
     previous cycle lives in yesterday's file. That drops one ~30s interval per
@@ -268,9 +290,13 @@ def _scan_cycle_log(path, max_dt):
 
     def flush(ts, rows, dt):
         dt_days = dt / 86400.0
+        hour = int(ts // 3600) if hourly is not None else None
         for tkr, frac, sides, pool in rows:
             r = res[tkr]
             r[0] += frac * pool * dt_days
+            if hourly is not None:
+                hb = hourly.setdefault(tkr, {})
+                hb[hour] = hb.get(hour, 0.0) + frac * pool * dt_days
             r[1] = ts if r[1] is None else min(r[1], ts)
             r[2] = ts if r[2] is None else max(r[2], ts)
             r[3] += 1
@@ -304,6 +330,115 @@ def _scan_cycle_log(path, max_dt):
     return {t: v for t, v in res.items()}
 
 
+def rebuild_hourly(max_dt=900.0, max_date=None):
+    """{market_ticker: {utc_hour_index: est}} -- rebuild_estimates' accrual
+    bucketed by UTC hour, so it can be split at program PERIOD boundaries.
+    Cached per source file on the same size:mtime signature (a full rebuild
+    reads every cycle log, ~10s per 100 MB; after that only changed files).
+    `max_date` ("YYYY-MM-DD") leaves later day files out of the result."""
+    cache = {}
+    if os.path.exists(HOURLY_CACHE):
+        try:
+            with open(HOURLY_CACHE, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+    files = sorted(glob.glob(os.path.join(STATUS_DIR, "cycle_log_*.csv")))
+    out = defaultdict(lambda: defaultdict(float))
+    dirty = False
+    for path in files:
+        key = os.path.basename(path)
+        st = os.stat(path)
+        sig = f"{st.st_size}:{int(st.st_mtime)}"
+        entry = cache.get(key)
+        if not entry or entry.get("sig") != sig:
+            hourly = {}
+            _scan_cycle_log(path, max_dt, hourly=hourly)
+            entry = {"sig": sig, "markets": {
+                t: {str(h): round(v, 6) for h, v in hs.items() if v > 0}
+                for t, hs in hourly.items()}}
+            cache[key] = entry
+            dirty = True
+            log(f"  scanned {key} by hour ({st.st_size / 1e6:.0f} MB)")
+        m = re.match(r"cycle_log_(\d{4}-\d{2}-\d{2})\.csv$", key)
+        if max_date and m and m.group(1) > max_date:
+            continue
+        for t, hs in entry["markets"].items():
+            d = out[t]
+            for h, v in hs.items():
+                d[int(h)] += v
+    if dirty:
+        try:
+            tmp = HOURLY_CACHE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f, separators=(",", ":"))
+            os.replace(tmp, HOURLY_CACHE)
+        except OSError as e:
+            log(f"  ! hourly cache write failed: {e}")
+    return {t: dict(hs) for t, hs in out.items()}
+
+
+def merge_periods(records):
+    """[(start_iso, end_iso, paid), ...] -> sorted [[start, end, paid], ...]
+    with OVERLAPPING records merged into one paying stretch (incentive_mm's
+    fetch_programs rule). A record that starts exactly where another ends is
+    a NEW period -- that is how Kalshi re-lists a market."""
+    iv = sorted((str(a), str(b), bool(p)) for a, b, p in records
+                if a and b and str(a) < str(b))
+    out = []
+    for a, b, p in iv:
+        if out and a < out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+            out[-1][2] = out[-1][2] or p
+        else:
+            out.append([a, b, p])
+    return out
+
+
+def split_by_period(hours, periods):
+    """Split a market's hourly accrual {hour_index: est} across its periods
+    [(start_ts, end_ts), ...] (sorted, non-overlapping, epoch seconds). The
+    accrual only runs while a program pays, so an hour a period only PARTLY
+    covers belongs to the period(s) that cover it, apportioned between them
+    by overlap when it straddles a re-listing. Only an hour no known period
+    touches is "outside" (a gap in the program metadata). Splitting a
+    boundary hour by clock time instead leaked a spurious sub-$1 fragment
+    out of 6,469 markets' first and last hours, which the floor then threw
+    away ($424 of accrual on the 9/27 data).
+    Returns (accrual per period, accrual inside no known period)."""
+    per = [0.0] * len(periods)
+    outside = 0.0
+    for h, v in hours.items():
+        h0 = h * 3600.0
+        h1 = h0 + 3600.0
+        ovs = [(i, min(h1, b) - max(h0, a)) for i, (a, b) in enumerate(periods)]
+        ovs = [(i, ov) for i, ov in ovs if ov > 0]
+        covered = sum(ov for _i, ov in ovs)
+        if covered <= 0:
+            outside += v
+            continue
+        for i, ov in ovs:
+            per[i] += v * ov / covered
+    return per, outside
+
+
+def floored_accrual(total, hours, periods, floor=PAYOUT_FLOOR):
+    """(what Kalshi would pay, paid market-periods, per-period accruals,
+    accrual outside any period) for one market's modelled accrual: the floor
+    per PROGRAM PERIOD. Without periods or hourly data the whole accrual is
+    one period (the lifetime test). Accrual that falls in no known period (a
+    gap in the program metadata) is floored as one more period of its own."""
+    if not FLOOR_PER_PERIOD or not periods or not hours:
+        return (total if total >= floor else 0.0), (1 if total >= floor else 0), [total], 0.0
+    per, outside = split_by_period(hours, periods)
+    paid = sum(a for a in per if a >= floor)
+    n = sum(1 for a in per if a >= floor)
+    if outside >= floor:
+        paid += outside
+        n += 1
+    return paid, n, per, outside
+
+
 # ----------------------------------------------------------------------------
 # Program metadata (paid_out + period), needed to tell "not paid" from
 # "not paid YET" — a long-dated program simply has not settled.
@@ -314,9 +449,10 @@ def refresh_programs():
     import incentive_mm as imm
     client = imm.build_client()
     by_market = {}
+    records = defaultdict(dict)          # ticker -> (start, end) -> paid
     for status in (None, "active", "settled", "closed"):
         cursor, got = None, 0
-        for _page in range(80):
+        for _page in range(200):
             params = {"limit": 1000}
             if status:
                 params["status"] = status
@@ -330,6 +466,10 @@ def refresh_programs():
             batch = r.get("incentive_programs") or []
             for p in batch:
                 t = p.get("market_ticker") or ""
+                if (p.get("incentive_type") or "liquidity") == "liquidity" \
+                        and p.get("start_date") and p.get("end_date"):
+                    k = (p["start_date"], p["end_date"])
+                    records[t][k] = records[t].get(k, False) or bool(p.get("paid_out"))
                 cur = by_market.get(t)
                 rec = {"start": p.get("start_date"), "end": p.get("end_date"),
                        "paid": bool(p.get("paid_out")),
@@ -347,6 +487,14 @@ def refresh_programs():
             if not cursor or not batch:
                 break
         log(f"  programs status={status!r}: {got} rows, {len(by_market)} markets")
+    # every liquidity PERIOD per market (the per-period floor), besides the
+    # merged window the older fields describe
+    for t, recs in records.items():
+        if t in by_market:
+            by_market[t]["periods"] = merge_periods(
+                (a, b, p) for (a, b), p in recs.items())
+    multi = sum(1 for v in by_market.values() if len(v.get("periods") or []) > 1)
+    log(f"  program periods: {multi} markets span more than one period")
     os.makedirs(STATUS_DIR, exist_ok=True)
     tmp = PROGRAM_CACHE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -461,11 +609,23 @@ def _ts(iso_str):
 # Reconciliation
 # ----------------------------------------------------------------------------
 
+def _period_bounds(prog):
+    """A program-cache record's periods as [(start_ts, end_ts)], or None."""
+    out = []
+    for a, b, _paid in (prog or {}).get("periods") or []:
+        s, e = _ts(a), _ts(b)
+        if s is not None and e is not None and e > s:
+            out.append((s, e))
+    return out or None
+
+
 def reconcile(since=None, floor=PAYOUT_FLOOR):
     ledger = load_ledger()
     est = rebuild_estimates()
     progs = load_programs()
+    hourly = rebuild_hourly(max_date=HOURLY_MAX_DATE) if FLOOR_PER_PERIOD else {}
     now = datetime.now(timezone.utc).timestamp()
+    LAST_FLOOR_DETAIL.clear()
 
     credits, credit_n, credit_last = defaultdict(float), defaultdict(int), {}
     for d, ev, amt, _kind in ledger:
@@ -477,11 +637,17 @@ def reconcile(since=None, floor=PAYOUT_FLOOR):
                                   "first": None, "last": None,
                                   "p_start": None, "p_end": None,
                                   "paid": 0, "unpaid": 0})
+    over = defaultdict(int)
     for t, v in est.items():
         e = ev_est[event_of(t)]
         e["est"] += v["est"]
-        # the exchange's per-market floor, applied per market as it is paid
-        e["est_floor"] += v["est"] if v["est"] >= floor else 0.0
+        # the exchange's floor, applied per market PER PROGRAM PERIOD
+        paid, n_paid, per, outside = floored_accrual(
+            v["est"], hourly.get(t), _period_bounds(progs.get(t)), floor)
+        e["est_floor"] += paid
+        over[event_of(t)] += n_paid
+        LAST_FLOOR_DETAIL[t] = {"total": v["est"], "paid": paid, "periods": per,
+                                "outside": outside, "paid_periods": n_paid}
         e["mkts"] += 1
         e["first"] = v["first"] if e["first"] is None else min(e["first"], v["first"])
         e["last"] = v["last"] if e["last"] is None else max(e["last"], v["last"])
@@ -515,8 +681,8 @@ def reconcile(since=None, floor=PAYOUT_FLOOR):
             "est": e["est"] if e else 0.0,
             "est_floor": e["est_floor"] if e else 0.0,
             "mkts": e["mkts"] if e else 0,
-            "over_floor": sum(1 for t, v in est.items()
-                              if event_of(t) == ev and v["est"] >= floor) if e else 0,
+            # market-PERIODS clearing the floor = the credit rows predicted
+            "over_floor": over.get(ev, 0) if e else 0,
             "settled": settled and in_window,
             "settled_any": settled,
             "first": e["first"] if e else None,

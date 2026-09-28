@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date, timedelta
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -124,6 +125,83 @@ class TestPayoutFloorModel(unittest.TestCase):
 
     def test_inception_matches_the_bot_going_live(self):
         self.assertEqual(rec.IMM_INCEPTION, "2026-07-12")
+
+
+class TestPerPeriodFloor(unittest.TestCase):
+    """The $1 floor is per market PER PROGRAM PERIOD (Jack 2026-09-27: "The $1
+    minimum payout is applied to each market's whole history rather than per
+    program period ... fix this")."""
+
+    def test_overlaps_merge_but_a_relisting_is_a_new_period(self):
+        got = rec.merge_periods([
+            ("2026-09-10T16:49:00Z", "2026-09-22T16:49:00Z", True),
+            ("2026-09-22T16:49:00Z", "2026-09-23T16:49:00Z", False),   # re-listed
+            ("2026-09-22T20:00:00Z", "2026-09-24T00:00:00Z", False),   # overlaps it
+            ("2026-09-25T00:00:00Z", "2026-09-25T00:00:00Z", False),   # empty: dropped
+        ])
+        self.assertEqual(got, [["2026-09-10T16:49:00Z", "2026-09-22T16:49:00Z", True],
+                               ["2026-09-22T16:49:00Z", "2026-09-24T00:00:00Z", False]])
+
+    def test_a_boundary_hour_is_apportioned(self):
+        h0 = 1000 * 3600.0
+        per, out = rec.split_by_period({1000: 1.2}, [(h0, h0 + 900.0), (h0 + 900.0, h0 + 7200.0)])
+        self.assertAlmostEqual(per[0], 0.3)
+        self.assertAlmostEqual(per[1], 0.9)
+        self.assertAlmostEqual(out, 0.0)
+        per, out = rec.split_by_period({1000: 1.0, 1005: 2.0}, [(h0, h0 + 3600.0)])
+        self.assertEqual((per, out), ([1.0], 2.0))
+
+    def test_an_hour_a_period_only_partly_covers_belongs_to_it(self):
+        # a program starting at :30 accrues only from :30, so the whole hour
+        # bucket is that period's -- splitting it by clock time left half of
+        # it "outside" as a sub-$1 fragment the floor then threw away
+        h0 = 1000 * 3600.0
+        per, out = rec.split_by_period({1000: 0.8, 1001: 0.9},
+                                       [(h0 + 1800.0, h0 + 5400.0)])
+        self.assertAlmostEqual(per[0], 1.7)
+        self.assertEqual(out, 0.0)
+        paid, n = rec.floored_accrual(1.7, {1000: 0.8, 1001: 0.9},
+                                      [(h0 + 1800.0, h0 + 5400.0)])[:2]
+        self.assertEqual((round(paid, 6), n), (1.7, 1))
+
+    def test_the_floor_applies_per_period(self):
+        periods = [(i * 7200.0, (i + 1) * 7200.0) for i in range(4)]
+        four_small = {2 * i: 0.60 for i in range(4)}          # $0.60 in each period
+        self.assertEqual(rec.floored_accrual(2.40, four_small, periods)[:2], (0.0, 0))
+        paid, n, per, out = rec.floored_accrual(1.90, {0: 1.50, 2: 0.40}, periods[:2])
+        self.assertEqual((round(paid, 6), n), (1.50, 1))
+        # without program metadata or hourly data: the lifetime test, as before
+        self.assertEqual(rec.floored_accrual(2.40, four_small, None)[:2], (2.40, 1))
+        self.assertEqual(rec.floored_accrual(0.90, None, periods)[:2], (0.0, 0))
+
+    def test_accrual_in_no_known_period_is_floored_on_its_own(self):
+        paid, n, per, out = rec.floored_accrual(3.0, {0: 0.5, 100: 2.5}, [(0.0, 3600.0)])
+        self.assertEqual((round(paid, 6), n, round(out, 6)), (2.5, 1, 2.5))
+
+    def test_kill_switch_restores_the_lifetime_test(self):
+        hours = {0: 0.6, 2: 0.6, 4: 0.6, 6: 0.6}
+        periods = [(i * 7200.0, (i + 1) * 7200.0) for i in range(4)]
+        with mock.patch.object(rec, "FLOOR_PER_PERIOD", False):
+            self.assertEqual(rec.floored_accrual(2.40, hours, periods)[:2], (2.40, 1))
+
+    def test_hourly_scan_adds_up_to_the_totals(self):
+        # four cycles 30s apart across an hour boundary; each interval accrues
+        # frac 0.1 x pool 86400/day x 30s = $3.00
+        fh = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False,
+                                         encoding="utf-8", newline="")
+        fh.write("ts,ticker,a,b,c,d,e,est_frac,sides,f,g,pool,h\n")
+        for ts in ("10:59:00", "10:59:30", "11:00:00", "11:00:30"):
+            fh.write(f"2026-09-27T{ts}Z,KXA-26SEP27-T1,0,0,0,0,0,0.1,2,0,0,86400,0\n")
+        fh.close()
+        hourly = {}
+        tot = rec._scan_cycle_log(fh.name, 900.0, hourly=hourly)
+        os.unlink(fh.name)
+        self.assertAlmostEqual(tot["KXA-26SEP27-T1"][0], 9.0)
+        hrs = hourly["KXA-26SEP27-T1"]
+        self.assertAlmostEqual(sum(hrs.values()), 9.0)
+        self.assertEqual(sorted(round(v, 6) for v in hrs.values()), [3.0, 6.0])
+        # without the dict the scan is exactly what it was
+        self.assertEqual(rec._scan_cycle_log.__defaults__, (None,))
 
 
 class TestEventRollup(unittest.TestCase):
