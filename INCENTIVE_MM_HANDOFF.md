@@ -4959,3 +4959,74 @@ moves never count, due time + fresh mark + too-late drop, window expiry,
 kill switch, persistence) and TestDryRunCycle.test_toxic_side_halt_
 cancels_only_the_picked_off_side (end to end: bids cancelled, asks
 re-quote, bids back after the halt). 1,485 green (unittest discover).
+
+### 2026-09-29 early — Event-wide toxic halt + the 7:15 ET "what was halted" email (Jack)
+
+Jack: "yes add event-wide halting too", "and give me a daily morning email
+on what was halted in the prior day". Commits 9d6f23d, 8faba89 (email
+formatting); live run 590456a8 (config ce77f450) from 03:02:56Z.
+
+EVENT RULE (TOXIC_EVENT_*): pick-offs on TOXIC_EVENT_MARKETS (2) DIFFERENT
+markets of one event inside TOXIC_EVENT_WINDOW_SECS (60 min) take the whole
+event -- every market, both sides -- out for TOXIC_EVENT_HALT_SECS (30
+min). Same pick-off definition as the side rule; both rules judge every
+pick-off. Unlike the side rule this one PAYS on the backtest
+(toxic_event_sim.py: on top of the side rule, net of the bot's own est/day
+over the event's selected markets from the selection snapshots): ~9.5
+event halts/day, $304 saved at 2h markouts vs $163 of reward, net +$141
+over 22.5 days; every 2-market setting from 15-180 min windows / 15-60 min
+halts nets positive. By family: state gas +$114, mentions +$80, diesel
++$18, hourly temp -$49 (blocked since 9/17). IMM_TOXIC_EVENT_MARKETS=0
+turns it off alone. A halted market (side or event) is exempt from the
+one-sided coverage page AND the zero-share bench (which would otherwise
+stretch a 30-min halt into an hour's deselection).
+
+RECORDS: every pick-off / side_halt / event_halt goes to the toxic_halts
+sink (STATUS_DIR/toxic_halts_<UTC date>.jsonl) with the est reward the
+halt forgoes. The 02:06Z side halts below happened under c4d618d, before
+the sink existed; they were BACKFILLED from the log + fills/marks sinks
+(rows carry "backfilled": true).
+
+EMAIL: send_imm_toxic_halts.py, task "KL imm toxic-halts" daily 7:15 AM ET
+(register_imm_toxic_halts.ps1: the quote-gaps task's own command line, 5
+min earlier). Prior ET day: event halts (markets picked + side, markets
+taken down, forgone reward), side halts (pick-offs fill->mark, forgone
+reward, what the price did DURING the halt -- still moving against =
+helped, moved back = cost rent), most picked-off markets incl. ones that
+never halted. Sends every morning, "none" included; --dry / --test /
+--day YYYY-MM-DD. Output ASCII (cp1252 console).
+
+FIRST LIVE HALTS (9/28 22:06 ET, side rule): KXLAHOUSE1R-26NOV03 LA05 and
+LA06 BIDS -- filled 20 @34c and 20 @64c at 01:57:52Z, re-joined lower and
+filled again @31c / @61c at 02:00:19Z; marks 20c / 51c. During the halt
+LA05 held ~19-20c and LA06 drifted to 48c; LA06 bought 10 more @46c at
+02:52Z after the halt ended. Two strikes of one event inside 3 minutes =
+exactly what the event rule (not yet live then) now halts whole.
+
+WOULD IT HAVE STOPPED THE FAMILIES THAT GOT THEIR OWN FIXES? (Jack asked;
+toxic_family_check.py, both live rules replayed over each family's fills,
+2h markouts):
+- KXRT (9/10-9/28): loss -$651; halts prevent $13 (2%). NO -- the loss is
+  slow drift as reviews land over days; the release-week cutoff is the
+  right tool.
+- state gas dailies (9/6-9/14): loss -$152 at 2h (the settled loss was
+  ~-$612 over 9/6-9/11); halts prevent nothing. NO -- the flow traded
+  against the intraday station data and the loss lands at the 3:20am
+  print, not in a 5-minute move on a 30-64c-wide book.
+- hourly temp (9/16-9/17): 54% of the 30-min markout loss prevented, but
+  the halts forgo more reward than they save (net -$87). PARTLY, at a loss
+  -- the block was right.
+- mentions (9/6-9/29): loss -$449; halts prevent $137 (31%) for $66 of
+  reward (net +$71), almost all KXTRUMPMENTION (-$312, $130 prevented);
+  MAMDANI (gate off by Jack's choice) $4 of $113. PARTLY.
+So the halts are a complement for sharp, cross-strike episodes, not a
+substitute for the family rules; slow or settlement-time adverse
+selection is invisible to a 5-minute pick-off detector.
+
+Tests: TestToxicSideHalt event cases (two markets -> whole event incl. an
+unpicked sibling, other events untouched, sink rows; same market twice =
+side halt only; window / rule-off; persistence), TestDryRunCycle.test_
+toxic_event_halt_cancels_every_market_of_the_event, test_send_imm_toxic_
+halts (ET-day window across UTC files, pick-offs per halt, price during
+halt from marks, forgone reward, quiet day, --dry sends nothing). 1,492
+green (unittest discover).
