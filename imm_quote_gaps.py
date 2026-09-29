@@ -174,6 +174,10 @@ def ticker_day_over(t: str, now_utc: datetime) -> bool:
         return False
     if imm.series_of(t) in imm.SCHEDULE_RESOLVED_SERIES:
         return False
+    # Elections: the verified ELECTION_DATES row decides, not the ticker
+    # string. Mirrors incentive_mm.
+    if imm.election_series(imm.series_of(t)):
+        return False
     # Mention-family tickers may embed a LISTING date (2026-08-14 fix):
     # never pre-drop on the string; trade_cutoff_utc decides from the
     # market's expected_expiration. Mirrors incentive_mm.

@@ -4723,18 +4723,24 @@ SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
 
 # ELECTION archetype (Jack 2026-09-28, see ELECTION_SERIES): "expand range to
 # quote between 1 and 99" -- price_min/max, which member_price_band, the quote
-# loop, the estimator's quotable sides and the extreme_mid screen all read --
-# plus safe-join, the guard every candidate / nominee binary family carries
-# (KXCMA, the award shows, KXVENUEPERFORM). Safe-join is free on the empty
-# 2c/98c books (a spread >= SAFE_JOIN_MIN_SPREAD is its own net) and on a
-# stacked touch (capped at the reference); it only bites on a thin, tight
-# book -- the shape where a scandal or a poll picks off the touch. No size
-# multiplier, no per-event cap, the ordinary $1.50 entry bar. Every member
-# clones this on first sight (FAMILY_OVERRIDE_PARENTS, "predicate" kind).
-# Knobs IMM_ELECTION_PRICE_MIN / _MAX, IMM_ELECTION_SAFE_JOIN=0.
+# loop, the estimator's quotable sides and the extreme_mid screen all read.
+# No size multiplier, no per-event cap, the ordinary $1.50 entry bar. Every
+# member clones this on first sight (FAMILY_OVERRIDE_PARENTS, "predicate").
+#
+# SAFE-JOIN OFF (Jack 2026-09-28: "make sure you're optimizing for rewards
+# like the IMM bot and resting within the 200 contracts"). The first cut
+# carried the KXCMA / awards nominee-binary safe-join. At-ref placement caps
+# it at the reference, so it never cost weight where a reference exists --
+# audited on the live book 00:53Z 9/29: 306/306 election orders at or above
+# their side's reference (< target/5 contracts ahead at better prices), 270
+# at the touch -- but on a side too thin to have a reference it rests the
+# rung 2 ticks off the touch, and it re-prices a kept rung away from a
+# tight touch. Off, the family places exactly like the default book:
+# at-ref, the deepest full-weight price. Knobs IMM_ELECTION_PRICE_MIN /
+# _MAX; IMM_ELECTION_SAFE_JOIN=1 puts safe-join back.
 ELECTION_ARCHETYPE = "KXBEXARCOUNTYJUDGE"
 SERIES_OVERRIDES[ELECTION_ARCHETYPE] = SeriesOverride(
-    safe_join=os.environ.get("IMM_ELECTION_SAFE_JOIN", "1") == "1",
+    safe_join=os.environ.get("IMM_ELECTION_SAFE_JOIN", "0") == "1",
     price_min_cents=_env_int("IMM_ELECTION_PRICE_MIN", 1),
     price_max_cents=_env_int("IMM_ELECTION_PRICE_MAX", 99))
 
@@ -7564,75 +7570,214 @@ for _s in AWARDS_SERIES:
 
 
 # ELECTION DAY (Jack 2026-09-28: "quote until election day", see
-# ELECTION_SERIES): out at 00:00 ET on the voting day -- the plain ticker-date
-# rule, for a day Kalshi does not always put in the ticker. The day is the
-# EARLIEST of:
-#   1. ELECTION_DATES, a hand table of event-ticker globs (the
-#      IMM_AWARDS_EVENT_DATES format) for events whose Kalshi dates all sit
-#      AFTER the vote: the House (KXHOUSEWINSTATE-NJD and the district
-#      winners KXHOUSETX32-26 carry occurrence Jan 3 2027, the day Congress
-#      convenes; KXHOUSEWINSTATE-SCD May 2027, -ALD Nov 2027), the attorneys
-#      general (Jan 5 2027, the swearing-in), KXUNDERHARRIS (27JAN04,
-#      certification) -- and, as a backstop, every year-only "-26" event:
-#      the US races, all decided on Tuesday Nov 3 2026. A row can only move
-#      the day EARLIER, so a special election before Nov 3 still wins on its
-#      own occurrence.
-#   2. the ticker date (KXBC3RD-26OCT24-3, KXSAARLAND-27APR18,
-#      KXTAIPEIMAYOR-26NOV28): Kalshi's own date for the vote.
-#   3. Kalshi's occurrence_datetime, which on these is the poll close (01:00Z
-#      Nov 4 for Texas, 23:00Z Nov 3 for Kentucky, 03:00Z Oct 25 for BC) or a
-#      10:00 ET stamp on the day: read ELECTION_OCC_BACK_HOURS back into its
-#      ET calendar day, so an Alaska / Hawaii close after midnight ET still
-#      lands on Nov 3, and an Asian close in the ET small hours lands on the
-#      day BEFORE (Taipei's Nov 28 vote opens 19:00 ET Nov 27).
-# A Dec 31 date is Kalshi's year-end placeholder (KXJOHANNESBURGMAYOR-26DEC31,
-# "the next Johannesburg mayoral election"), i.e. unknown; unknown or nothing
-# at all stands the market down (RELEASE_GUARD_UNKNOWN, fail closed, logged
-# once) unless the table has a row for it. Applied in
-# apply_series_cutoff_adjustments for both producers and the quote-gaps
-# mirror, never loosening. What this does NOT cover: an unscheduled vote
-# called for a day before Kalshi's (KXSERBIAPRES-26DEC27 is "the next Serbian
-# presidential election"; the call is its own market, KXSERBIAELECTIONCALL) --
-# add a table row the day the date is set.
-ELECTION_DATES = _parse_awards_dates(os.environ.get(
-    "IMM_ELECTION_DATES",
-    "*-26=2026-11-03,KXHOUSEWINSTATE-*=2026-11-03,"
-    "KXVOTEGENERAL-*-26*=2026-11-03,KXUNDERHARRIS-*=2026-11-03"))
+# ELECTION_SERIES; then, on the first cut's use of Kalshi's dates abroad:
+# "dont trust that, verify yourself"). An election market quotes until the
+# START of its voting day, and that day comes ONLY from ELECTION_DATES below:
+# a hand table of event-ticker globs, each row checked against the electoral
+# authority (sources beside each row). Kalshi's ticker date and
+# occurrence_datetime are not used at all -- they were wrong in both
+# directions on the 9/28 feed: the House seat counts and district winners
+# carry occurrence Jan 3 2027 (Congress convenes), the attorneys general
+# their swearing-in (Dec 15 2026 - Jan 18 2027), KXUNDERHARRIS its
+# certification (27JAN04), KXJOHANNESBURGMAYOR a Dec 31 placeholder. They are
+# only compared: a Kalshi date EARLIER than the verified day is logged once
+# (election_cutoff_utc), since that is how a stale row would show.
+#
+# Each row is '<glob>=<YYYY-MM-DD>@<IANA zone of the vote>'; the cutoff is the
+# earlier of 00:00 ET and 00:00 local on that day (_parse_election_dates), so
+# a European / Asian vote stops at its own midnight and a Pacific / Alaskan /
+# Hawaiian one at ET midnight. Two-round and multi-day votes carry their FIRST
+# voting day. No row -> stood down (fail closed, logged once): a newly listed
+# county, city or country stays dark until its date is checked and added.
+# Applied in apply_series_cutoff_adjustments, which REPLACES the incoming
+# Kalshi-derived cutoff for the family (both producers and the quote-gaps
+# mirror); the ticker-date pre-filter skips the family for the same reason.
+# IMM_ELECTION_DATES replaces the whole table.
+#
+# THE TABLE (checked 2026-09-28/29; an event glob names the event only --
+# the date beside it is the verified one, never Kalshi's):
+_ELECTION_DATES_DEFAULT = ",".join((
+    # --- CANADA (all read on the official pages 9/29) ---
+    # BC 44th provincial general election: a SNAP election -- the writ was
+    # issued Tue 2026-09-22 (Elections BC "Writ Day"), Final Voting Day Sat
+    # 2026-10-24, polls 8am-8pm Pacific; the fixed date would have been
+    # 2028-10-21. elections.bc.ca/2026-provincial-election
+    "KXBC2ND-26OCT24*=2026-10-24@America/Vancouver",
+    "KXBC3RD-26OCT24*=2026-10-24@America/Vancouver",
+    # Quebec general election: Mon 2026-10-05, the fixed date (Election Act
+    # s.129; Elections Quebec release of 2026-08-27), polls 9:30am-8pm ET.
+    "KXQUEBEC4TH-26OCT05*=2026-10-05@America/Toronto",
+    "KXQUEBEC5TH-26OCT05*=2026-10-05@America/Toronto",
+    # BC general local elections: Sat 2026-10-17 (Local Government Act s.52,
+    # third Saturday of October; gov.bc.ca 2026 FAQ), polls 8am-8pm Pacific.
+    "KXVANCOUVERMAYOR-26OCT17*=2026-10-17@America/Vancouver",
+    "KXSURREYMAYOR-26OCT17*=2026-10-17@America/Vancouver",
+    "KXRICHMONDMAYOR-26OCT17*=2026-10-17@America/Vancouver",
+    "KXSAANICHMAYOR-26OCT17*=2026-10-17@America/Vancouver",
+    "KXKAMLOOPSMAYOR-26OCT17*=2026-10-17@America/Vancouver",
+    "KXKELOWNAMAYOR-26OCT17*=2026-10-17@America/Vancouver",
+    "KXNANAIMOMAYOR-26OCT17*=2026-10-17@America/Vancouver",
+    "KXPRINCEGEORGEMAYOR-26OCT17*=2026-10-17@America/Vancouver",
+    # Ontario municipal elections: Mon 2026-10-26 (Municipal Elections Act
+    # s.4-5, fourth Monday of October; ontario.ca), polls 10am-8pm ET.
+    "KXTORONTOMAYOR-26OCT26*=2026-10-26@America/Toronto",
+    "KXOTTAWAMAYOR-26OCT26*=2026-10-26@America/Toronto",
+    "KXHAMILTONMAYOR-26OCT26*=2026-10-26@America/Toronto",
+    "KXMISSISSAUGAMAYOR-26OCT26*=2026-10-26@America/Toronto",
+    "KXMILTONMAYOR-26OCT26*=2026-10-26@America/Toronto",
+    "KXNOTLMAYOR-26OCT26*=2026-10-26@America/Toronto",
+    # Manitoba municipal elections (Winnipeg): Wed 2026-10-28, the fourth
+    # Wednesday of October (gov.mb.ca), polls 8am-8pm Central.
+    "KXWINNIPEGMAYOR-26OCT28*=2026-10-28@America/Winnipeg",
+    # --- GERMANY (each date fixed by the state cabinet) ---
+    # Saarland 18th Landtag: Sun 2027-04-18, Ministerrat 2026-03-03 (Interior
+    # Ministry release; City of St. Ingbert notice), polls 8-18 CEST.
+    "KXSAARLAND-27APR18*=2027-04-18@Europe/Berlin",
+    # NRW 19th Landtag: Sun 2027-04-25, Landeskabinett 2026-02-24 (land.nrw
+    # release; LWahlG NRW s.7), polls 8-18.
+    "KXNORDRHEINWESTFALEN-27APR25*=2027-04-25@Europe/Berlin",
+    # Schleswig-Holstein 21st Landtag: Sun 2027-04-18, cabinet 2026-03-24
+    # (Landtag news 2026-03-25), polls 8-18.
+    "KXSCHLESWIGHOLSTEIN-27APR18*=2027-04-18@Europe/Berlin",
+    # --- UNITED STATES: the 2026 general election, Tue 2026-11-03 (2 U.S.C.
+    # s.7 for the House; each state's general-election statute for its
+    # statewide and county offices) ---
+    "KXHOUSEWINSTATE-*=2026-11-03",
+    "KXHOUSE??[0-9]-26=2026-11-03",
+    "KXHOUSE??[0-9][0-9]-26=2026-11-03",
+    "KXATTYGEN??-26=2026-11-03",
+    "KXCAATTORNEYGENERAL-26=2026-11-03",
+    # Texas county judges: the Nov 3 general election (Texas Election Code
+    # s.41.002); El Paso votes on Mountain time, ET midnight is earlier.
+    "KX*COUNTYJUDGE-26=2026-11-03",
+    "KXWILCOJUDGE-26=2026-11-03",
+    # Louisiana U.S. House: the Nov 3 OPEN primary is real -- after Louisiana
+    # v. Callais (2026-04-29) Act 7 of the 2026 Regular Session cancelled
+    # the closed House primaries and set an open primary Nov 3 and an open
+    # general Dec 12 (Secretary of State release 2026-05-14).
+    "KXLAHOUSE1R-26NOV03*=2026-11-03@America/Chicago",
+    # Nov 3 general-election outcomes: vote shares (Alaska's first-round
+    # count keeps moving to the Nov 18 tabulation, but the voting is Nov 3),
+    # trifectas, underperforming Harris (certified 2026 general shares).
+    "KXVOTEGENERAL-*-26*=2026-11-03",
+    "KXDEMTRIFECTA-26NOV03*=2026-11-03",
+    "KXUNDERHARRIS-27JAN04*=2026-11-03",
+    # Local offices on the Nov 3 ballot (county / city election offices):
+    # Fulton chair (Georgia runoff Dec 1 only without a majority); Henderson
+    # (Romero 49.75% in the June primary -- short of the majority that ends
+    # a Nevada city race, so it is live Nov 3); Lexington (Gorton v Carter);
+    # Louisville, Oakland (ranked choice), Providence, Reno.
+    "KXFULTONCHAIR-26=2026-11-03",
+    "KXHENDERSONMAYOR-26=2026-11-03@America/Los_Angeles",
+    "KXLEXMAYOR-26=2026-11-03",
+    "KXLOUISVILLEMAYOR-26=2026-11-03",
+    "KXOAKLANDMAYOR-26=2026-11-03@America/Los_Angeles",
+    "KXPROVIDENCEMAYOR-26=2026-11-03",
+    "KXRENOMAYOR-26=2026-11-03@America/Los_Angeles",
+    # Chicago: municipal general Tue 2027-02-23, runoff 2027-04-06 (Chicago
+    # Board of Elections 2027 calendar).
+    "KXCHICAGOMAYOR-27=2027-02-23@America/Chicago",
+    # --- ELSEWHERE ---
+    # Brazil: first round Sun 2026-10-04, 8am-5pm Brasilia time (Senate
+    # voter guide; runoff Oct 25).
+    "KXBRAZILTURNOUT-26OCT04*=2026-10-04@America/Sao_Paulo",
+    # SERBIA: NOT the presidential day, which is not set. Vucic resigned
+    # 2026-09-27; the Speaker must call the vote >= 30 days ahead (RIK) and
+    # hold it within three months (by Dec 26/27 -- Kalshi's 26DEC27 is that
+    # DEADLINE, not a date), so no first round can come before Sat Oct 31.
+    # A snap PARLIAMENTARY election is Sun 2026-10-25 (Euronews / OSW
+    # 9/28) -- Vucic resigned to lead SNS in it -- and it is the first
+    # result the presidential market reprices on, so the stand-down is
+    # there. Move the row to the presidential date once it is called.
+    "KXSERBIAPRES-26DEC27*=2026-10-25@Europe/Belgrade",
+    # Punjab (India) assembly: NO ROW on purpose -- unscheduled (the ECI has
+    # announced nothing; the term ends 2027-03-16; Kalshi's 27FEB20 is the
+    # 2022 poll date copied forward), so it stays dark until the schedule.
+    # Taiwan local elections: Sat 2026-11-28, polls 8am-4pm (CEC decision
+    # 2025-10-31, via the Taipei / Tainan city notices).
+    "KXTAIPEIMAYOR-26NOV28*=2026-11-28@Asia/Taipei",
+    "KXNEWTAIPEIMAYOR-26NOV28*=2026-11-28@Asia/Taipei",
+    "KXTAICHUNGMAYOR-26NOV28*=2026-11-28@Asia/Taipei",
+    "KXKAOHSIUNGMAYOR-26NOV28*=2026-11-28@Asia/Taipei",
+    # Peru regional/municipal (Lima): Sun 2026-10-04 (Supreme Decree
+    # 001-2026-PCM); one round for mayor.
+    "KXLIMAMAYOR-26OCT04*=2026-10-04@America/Lima",
+    # Czech municipal (Prague): Fri 9 Oct 14:00-22:00 + Sat 10 Oct 8-14;
+    # the FIRST voting day counts (the assembly picks the mayor later).
+    "KXPRAGUEMAYOR-26OCT10*=2026-10-09@Europe/Prague",
+    # Slovak municipal (Presov): Sat 2026-10-24, 7am-8pm.
+    "KXPRESOVMAYOR-26OCT24*=2026-10-24@Europe/Bratislava",
+    # Tasmania councils (postal): voting closes 2pm Tue 2026-10-27, count
+    # from 9am Oct 28 (Tasmanian Electoral Commission).
+    "KXCLARENCEMAYOR-26OCT27*=2026-10-27@Australia/Hobart",
+    "KXHUONMAYOR-26OCT27*=2026-10-27@Australia/Hobart",
+    "KXLAUNCESTONMAYOR-26OCT27*=2026-10-27@Australia/Hobart",
+    # South Africa municipal (Johannesburg): Wed 2026-11-04, proclaimed by
+    # the CoGTA minister 2026-08-07 (SAnews) -- Kalshi still shows a Dec 31
+    # placeholder. The council elects the mayor afterwards.
+    "KXJOHANNESBURGMAYOR-26DEC31*=2026-11-04@Africa/Johannesburg",
+))
+def _parse_election_dates(spec: str) -> Tuple[Tuple[str, datetime, Any, Any], ...]:
+    """'<event-ticker glob>=<YYYY-MM-DD>[@<IANA zone>],...' -> ((glob,
+    cutoff_utc, voting_day, zone), ...), first matching glob wins. The cutoff is the
+    START of the voting day wherever it starts first: the earlier of 00:00 ET
+    and 00:00 in the voting jurisdiction's zone (default ET). West of ET
+    (Nevada, Alaska, Hawaii) that is ET midnight; east of it (Europe, India,
+    Taiwan) it is local midnight -- Taipei's Nov 28 begins 11:00 ET Nov 27."""
+    out = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        try:
+            glob_s, val = part.split("=")
+            day, _, zone = val.strip().partition("@")
+            naive = datetime.strptime(day.strip(), "%Y-%m-%d")
+            zone = zone.strip() or "America/New_York"
+            local = pytz.timezone(zone).localize(naive)
+        except (ValueError, pytz.UnknownTimeZoneError):
+            raise ValueError(f"bad IMM_ELECTION_DATES part: {part!r}")
+        et_mid = ET.localize(naive)
+        out.append((glob_s.strip(),
+                    min(et_mid, local).astimezone(timezone.utc), naive.date(),
+                    pytz.timezone(zone)))
+    return tuple(out)
+
+
+ELECTION_DATES = _parse_election_dates(os.environ.get(
+    "IMM_ELECTION_DATES", _ELECTION_DATES_DEFAULT))
 ELECTION_OCC_BACK_HOURS = 6
+_election_disagree_warned: Set[str] = set()
 
 
 def election_cutoff_utc(event_ticker: str,
                         market: Optional[dict] = None) -> Optional[datetime]:
-    """00:00 ET (as UTC) of an election event's voting day: the earliest of
-    the hand table, the ticker date and the occurrence's day (see
-    ELECTION_DATES). None when nothing usable says -- the caller stands the
-    market down."""
-    days: List[datetime] = []
-    table_hit = False
-    for glob_s, when in ELECTION_DATES:
+    """The verified start of an election event's voting day (as UTC) from
+    ELECTION_DATES, or None when the table has no row (the caller stands the
+    market down). Kalshi's own dates are never used; when the ticker date or
+    the occurrence's day is EARLIER than the verified day it is logged once,
+    so a stale row shows up."""
+    for glob_s, when, day, zone in ELECTION_DATES:
         if fnmatch.fnmatchcase(event_ticker, glob_s):
-            days.append(when)
-            table_hit = True
             break
+    else:
+        return None
+    kalshi = []
+    td = parse_event_date(event_ticker)
+    if td is not None:
+        kalshi.append(td.astimezone(ET).date())
     occ = (parse_iso_utc(market.get("occurrence_datetime") or "")
            if isinstance(market, dict) else None)
-    occ_day = None
     if occ is not None:
-        d = (occ - timedelta(hours=ELECTION_OCC_BACK_HOURS)).astimezone(ET).date()
-        occ_day = ET.localize(datetime(d.year, d.month, d.day)).astimezone(
-            timezone.utc)
-    placeholder = False
-    for day in (parse_event_date(event_ticker), occ_day):
-        if day is None:
-            continue
-        local = day.astimezone(ET)
-        if (local.month, local.day) == (12, 31):
-            placeholder = True
-        else:
-            days.append(day)
-    if placeholder and not table_hit:
-        return None
-    return min(days) if days else None
+        # Kalshi's occurrence is usually the poll close: its calendar day in
+        # the VOTE's zone, a few hours back so a close just after midnight
+        # still counts for the voting day
+        kalshi.append((occ - timedelta(hours=ELECTION_OCC_BACK_HOURS))
+                      .astimezone(zone).date())
+    early = [k for k in kalshi if k < day and (k.month, k.day) != (12, 31)]
+    if early and event_ticker not in _election_disagree_warned:
+        _election_disagree_warned.add(event_ticker)
+        log(f"[IMM] ! {event_ticker}: Kalshi dates the vote {min(early)} but "
+            f"the verified table says {day} -- quoting to the verified day; "
+            f"re-check the row")
+    return when
 
 
 def market_data_month(market: Optional[dict]) -> Optional[Tuple[int, int]]:
@@ -7737,20 +7882,26 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
             pre = start - timedelta(days=ov.pre_event_days)
         cutoff = pre if cutoff is None else min(cutoff, pre)
     if election_series(series):
-        # ELECTION DAY (2026-09-28, see ELECTION_DATES): out at 00:00 ET on
-        # the voting day. Keyed on the family, not its inherited override, so
-        # a producer that runs before the inheritance (orphan restore) still
-        # applies it. No usable day -> stood down (fail closed), logged once.
+        # ELECTION DAY (see ELECTION_DATES): out at the start of the VERIFIED
+        # voting day. It REPLACES what came in -- trade_cutoff_utc built that
+        # from Kalshi's ticker date / occurrence, which are not trusted here
+        # (Jack 2026-09-28: "dont trust that, verify yourself"); only a hand
+        # event_start_overrides entry may still pull it earlier. Keyed on the
+        # family, not its inherited override, so a producer that runs before
+        # the inheritance (orphan restore) applies it too. No verified row ->
+        # stood down (fail closed), logged once.
         eday = election_cutoff_utc(event_ticker, market)
         if eday is None:
             eday = RELEASE_GUARD_UNKNOWN
             if event_ticker not in _release_guard_warned:
                 _release_guard_warned.add(event_ticker)
-                log(f"[IMM] ! {series}: election-day cutoff needs the voting "
-                    f"day but {event_ticker} has no usable date (hand table, "
-                    f"ticker, occurrence; Dec 31 = placeholder) -- standing "
-                    f"it down (fail closed)")
-        cutoff = eday if cutoff is None else min(cutoff, eday)
+                log(f"[IMM] ! {series}: {event_ticker} has no verified "
+                    f"election day in ELECTION_DATES -- standing it down "
+                    f"(fail closed) until a checked row is added")
+        hand = EVENT_START_OVERRIDES.get(event_ticker)
+        if hand is not None:
+            eday = min(eday, hand - timedelta(minutes=OVERRIDE_BUFFER_MIN))
+        cutoff = eday
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
@@ -10919,6 +11070,10 @@ class IncentiveMarketMaker:
             # date while its programs keep paying — never pre-drop on the
             # string; the resolver's live schedule + _screen govern.
             if schedule_resolved_series(series_of(t)):
+                return False
+            # Elections: the verified ELECTION_DATES row is the date, not the
+            # ticker string (2026-09-28) -- the cutoff decides in _screen.
+            if election_series(series_of(t)):
                 return False
             # Mention-family tickers may embed a LISTING date (26AUG13
             # ran to Sep 4 — the 2026-08-14 listing-date fix): the string
