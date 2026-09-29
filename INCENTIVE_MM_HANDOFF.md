@@ -4818,3 +4818,80 @@ Taipei day-before; placeholder / no date fail closed unless tabled;
 guards cloned; the empty 2/98 book quoted at its touch where the global
 band places nothing; the screen). 1,476 green (unittest discover) at
 fc3f84e.
+
+### 2026-09-29 early — Verified election days replace Kalshi's; safe-join off (Jack)
+
+Jack, on the first cut's summary: "Abroad the bot uses Kalshi's date --
+dont trust that, verify yourself" and "Safe-join ... make sure you're
+optimizing for rewards like the IMM bot and resting within the 200
+contracts". Commit 10d8491.
+
+DATES. ELECTION_DATES is now the only source of an election's day. 54
+rows, each checked against the electoral authority, with the source
+beside the row in incentive_mm.py: Canada (Elections BC, Elections Quebec,
+ontario.ca, gov.bc.ca, gov.mb.ca), Germany (the NRW / Saarland /
+Schleswig-Holstein cabinet decisions), Serbia (RIK + the 9/27
+resignation), Brazil (Senate voter guide), South Africa (SAnews
+proclamation), Taiwan (CEC via the Taipei / Tainan city notices),
+Louisiana (Secretary of State, Act 7 of 2026), 2 U.S.C. s.7 and the state
+and county election offices for the rest. Four research agents gathered
+the sources; I re-read the deciding page myself for every programmed
+election. Each row carries the vote's IANA zone and the cutoff is the
+earlier of 00:00 ET and local midnight (Serbia 22:00Z Oct 24, Germany
+22:00Z the day before, Taipei 16:00Z Nov 27, Brazil 03:00Z Oct 4; US and
+Canadian votes 00:00 ET). The verified day REPLACES the Kalshi-derived
+cutoff (apply_series_cutoff_adjustments), a hand event_start_overrides
+entry may still pull it earlier, and the ticker-date pre-filter skips the
+family (refresh_universe + imm_quote_gaps). Kalshi's ticker / occurrence
+are only compared; an EARLIER Kalshi date is logged once ("Kalshi dates
+the vote ... re-check the row"). No row -> stood down.
+
+WHAT VERIFICATION CHANGED. Kalshi's dates matched for Canada, Germany,
+Brazil, Taiwan and the US races. They were wrong on:
+- KXSERBIAPRES-26DEC27: Vucic resigned 2026-09-27 to lead SNS in a snap
+  PARLIAMENTARY election on Sun 2026-10-25; the presidential vote is not
+  called, must follow its call by >= 30 days and be held by Dec 26/27.
+  26DEC27 is that deadline. The row stands down at 00:00 Belgrade Oct 25:
+  the parliamentary result is the first thing the presidential market
+  reprices on, and no presidential round can come before Sat Oct 31. Move
+  the row once the presidential date is called.
+- KXPUNJABASSEMBLY-27FEB20: unscheduled (term ends 2027-03-16; 27FEB20
+  is 2022's poll date). No row: dark until the ECI announces.
+- KXJOHANNESBURGMAYOR-26DEC31: proclaimed for Wed 2026-11-04 (a stale
+  Dec 31 placeholder on Kalshi).
+- KXPRAGUEMAYOR-26OCT10: the public vote is Fri 9 / Sat 10 Oct; the row
+  uses Oct 9 (the assembly picks the mayor later).
+- House seat / district and AG markets: Jan 2027 on Kalshi (the first
+  cut's `*-26` row already fixed these; now each family has its own row).
+Louisiana's Nov 3 OPEN House primary is real (Act 7 of 2026 after
+Louisiana v. Callais; open general Dec 12). Henderson is live Nov 3
+(Romero 49.75% in June, short of a majority).
+
+SAFE-JOIN OFF on the election archetype (IMM_ELECTION_SAFE_JOIN=1
+restores). Measured first: at 00:53Z all 306 resting election orders sat
+at or above their side's reward reference (the price where cumulative
+depth reaches target/5 -- 200 on a 1,000 target) with fewer than target/5
+contracts ahead at better prices; 270 at the touch. At-ref placement caps
+safe-join at the reference, so it was not costing weight; off, the
+family places exactly like the default book, and a thin tight side with
+no reference joins the touch instead of resting two ticks back.
+
+LIVE (run cf0ac55e, config 984f1238, 01:22:39Z 9/29; 718 orders handed
+over): the snapshot's election cutoffs are exactly the table's -- US
+2026-11-03 05:00Z, BC 10-24 04:00Z, Quebec 10-05 04:00Z, Brazil 10-04
+03:00Z, Serbia 10-24 22:00Z, Saarland / Schleswig-Holstein 2027-04-17
+22:00Z, NRW 2027-04-24 22:00Z; Punjab stood down (4 markets `cutoff`,
+orders pulled, no position). 153 selected, 72 payout_floor. No "Kalshi
+dates the vote earlier" line. Window audits: 01:24Z 301/302 and 01:28Z
+304/306 at full weight; each straggler was a book that had just moved and
+re-pinned within a cycle (NRW SPD 4 -> 5c at 01:26:09; Alaska DBRO-12 /
+-16 45 -> 50c / 49 -> 54c at 01:28:25). The global at-ref tolerance is
+already 0 (IMM_ATREF_PRICE_TOL), so any reference move re-pins.
+
+WATCH / CHORES:
+- Serbia: add the presidential date the day it is called.
+- Punjab: add a row when the ECI announces (expect early January).
+- A new county / city / country Kalshi lists is dark until a checked row
+  is added; the fail-closed line names it in the log.
+- KXVOTEGENERAL-CAWEALTHTAX26YES (California wealth-tax measure vote
+  share) has no row -- unverified, unprogrammed.
