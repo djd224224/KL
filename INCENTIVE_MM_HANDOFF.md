@@ -4895,3 +4895,67 @@ WATCH / CHORES:
   is added; the fail-closed line names it in the log.
 - KXVOTEGENERAL-CAWEALTHTAX26YES (California wealth-tax measure vote
   share) has no row -- unverified, unprogrammed.
+
+## 2026-09-29 early — Toxic-flow side halt: two confirmed pick-offs on one side halt that side for 30 min (Jack)
+
+Jack: "i need a mechanism to halt a side/market when there is toxic flow /
+adverse selection in the form of repeatedly getting picked off going in
+one direction (maybe the thing i already have on MENTION markets does
+this?)". Commit c4d618d.
+
+THE MENTION THING DOES NOT. EVENT_DEPTH_GATE (KXTRUMPMENTION + undated
+mention series via MENTION_NO_CUTOFF_GATE) detects a LIVE BROADCAST --
+thin side, one-sided book, a settle-grade jump, or our book moving 15+
+contracts in ONE cycle -- date-armed, and stands the whole event down.
+The old per-market fill-burst / mid-move breakers are off since 7/21
+(IMM_BREAKERS). The only general directional brake was the inventory
+skew (halve the accumulating side at 30 net, pull it at 60): keyed on
+position, not flow.
+
+THE RULE (TOXIC_*, _toxic_note_fill / _toxic_confirm / toxic_side_halted):
+every maker fill of ours that is not a 1c/99c pad and not a taker fill is
+queued; TOXIC_CONFIRM_SECS (300) later, on a full cycle, it is judged
+against last_mark -- only a mark refreshed THIS cycle (the market was
+quoted, or we hold it and _refresh_marks re-read it); no fresh mark within
+an hour of due -> dropped unjudged. A PICK-OFF = the mark >=
+TOXIC_PICKOFF_CENTS (5) against the fill. TOXIC_PICKOFFS (2) on the same
+side of a market inside TOXIC_WINDOW_SECS (24h) halt that side for
+TOXIC_HALT_SECS (30 min): its quotes (rungs AND pads) leave `desired`
+right before diff_orders, which cancels what rests; the other side keeps
+quoting; both halted = the market is out. Pending checks, pick-off
+counts and halts persist. Each halt logs "TOXIC <ticker> BID|ASK picked
+off Nx ..." and raises a non-urgent alert (daily summary). The one-sided
+coverage page skips a market with a halted side.
+
+MEASURED BEFORE BUILDING (scratchpad toxic_load/toxic_sim*.py): all 8,078
+non-pad maker fills 9/6-9/29, markouts off the marks log, 30m total
+-$2,657 (-1.6c/ct). One-direction runs: singles carry 47% of it; runs of
+3+ ~25% (-$20..-$50 per run, bounded by the skew caps). Net of the reward
+a halted side forgoes (half the market's est reward for the halt):
+- a raw "N same-side fills" rule: ~$390 saved at 30m for 914 halts on 650
+  markets, with +$1,155 of profitable fills blocked -- a loser;
+- the markout-confirmed rule shipped here: best at 5c / 2 / 24h / 30 min,
+  ~12 halts/day, $53 saved at 2h ($125 at 30m) vs ~$49 of reward --
+  break-even; 4h halts cost ~$455 of reward for ~$87 saved. Same on
+  tight books only (spread <= 6c).
+Where halting clearly paid -- state gas dailies (now GasBuddy-gated),
+hourly temp (blocked), KXRT release week (cutoff), live mentions (gate) --
+a family rule already exists. So this ships as a circuit breaker for the
+NEXT episode (new families like the 9/28 elections have no fill history),
+tuned not to cost rent.
+
+KNOBS (launcher env, task-level restart): IMM_TOXIC_HALT=0 kills;
+IMM_TOXIC_PICKOFF_CENTS, IMM_TOXIC_CONFIRM_SECS, IMM_TOXIC_PICKOFFS,
+IMM_TOXIC_WINDOW_H, IMM_TOXIC_HALT_MIN.
+
+WHAT THIS DOES NOT DO: event-wide propagation (a ladder picked off on
+several strikes halts each strike on its own evidence); a halt shorter
+than the move (30 min, then the side re-joins; a third pick-off re-halts);
+anything about the single isolated pick-off, which is most of the cost.
+
+Tests: TestToxicSideHalt (side mapping, pads / takers never count, the
+second pick-off halts that side only, asks mirror, sub-5c / favourable
+moves never count, due time + fresh mark + too-late drop, window expiry,
+kill switch, persistence) and TestDryRunCycle.test_toxic_side_halt_
+cancels_only_the_picked_off_side (end to end: bids cancelled, asks
+re-quote, bids back after the halt). 1,485 green (unittest discover).
