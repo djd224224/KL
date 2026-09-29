@@ -86,6 +86,20 @@ from cryptography.hazmat.primitives import serialization
 
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
+# UNENCODABLE OUTPUT NEVER KILLS A TASK (2026-09-29). Every "KL imm *" email
+# task runs under cmd.exe with stdout redirected to a log file in the
+# console's cp1252; only the bot's own launcher sets PYTHONIOENCODING=utf-8.
+# Kalshi-supplied titles carry glyphs cp1252 lacks: U+0159 in one killed
+# the new-programs email on 9/28 and 9/29 in log("new-programs body..."),
+# BEFORE the send. So any process importing this module escapes what its
+# streams cannot encode (ř) instead of raising -- the whole class,
+# print() and log() alike, not one call site. A UTF-8 stream is unaffected.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
+
 MODEL_VERSION = "incentive_mm_v1.2"
 RUN_ID = uuid.uuid4().hex[:8]
 CLIENT_ORDER_PREFIX = "imm"   # client_order_ids: imm-<run>-<hex>

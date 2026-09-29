@@ -16385,5 +16385,26 @@ class TestSignedFairReads(unittest.TestCase):
             self.assertIn("get_json=kalshi_get", call)
 
 
+class TestUnencodableOutputNeverKillsATask(unittest.TestCase):
+    """2026-09-28/29: the new-programs email died twice in log() on a U+0159
+    in a Kalshi title -- its task's stdout is a cp1252 file redirect -- before
+    it could send. Importing incentive_mm must make both print() and log()
+    escape what the stream cannot encode, as a cp1252 task would see it."""
+
+    def test_cp1252_stream_escapes_instead_of_raising(self):
+        import subprocess
+        import sys
+        code = ("import incentive_mm as imm\n"
+                "imm.log('player: Ji\\u0159\\u00ed')\n"
+                "print('title: \\u0159')\n")
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        r = subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(
+            os.path.abspath(imm.__file__)), env=env, capture_output=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("cp1252", "replace")[-800:])
+        out = r.stdout.decode("cp1252")
+        self.assertIn("player: Ji\\u0159\u00ed", out)     # i-acute is cp1252
+        self.assertIn("title: \\u0159", out)
+
+
 if __name__ == "__main__":
     unittest.main()
