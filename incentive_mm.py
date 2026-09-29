@@ -3256,8 +3256,11 @@ register_close_cutoff_days(
 # CPI PILOT (Jack 2026-09-28: "try the least bad version. keep size same as
 # normal IMM"). CPI stays blocked (".*CPI.*" in SERIES_BLOCK_PATTERNS)
 # except the events named here, which quote in the NORMAL book at normal
-# size under two stand-downs until CPI_PILOT_UNTIL; then the block closes
-# over them again with standard semantics (no new orders, resting quotes
+# size under two stand-downs. NO END DATE by default (Jack 2026-09-28 pm:
+# "keep it default running, dont block but give me a report on oct 13. ill
+# block if needed"): each event quotes to its own pre-release cutoff. An
+# optional IMM_CPI_PILOT_UNTIL (ISO time) closes the block over them again
+# at that moment with standard semantics (no new orders, resting quotes
 # cancelled next cycle, positions ride). The case for these guards, from
 # the 2026-09-28 review of the 9/14-9/24 open-scan stint ($95.71 credited
 # vs -$210 trading at mid over 39 fills; mark-outs -7.6c/ct at 1h and
@@ -3268,16 +3271,18 @@ register_close_cutoff_days(
 #     -18.3c/ct at 24h against -11.8c the rest of the day (the 8:30 data
 #     releases and the nowcast's ~10:00 update).
 #   - Out 7 days before close: each event closes at its own CPI release.
-# Judged at the end of the window on its own fills' mark-outs against its
-# credits. Kill switches: IMM_CPI_PILOT_EVENTS="" (env = task restart), or
-# let IMM_CPI_PILOT_UNTIL lapse. A sorted tuple, not a set: it is hashed
-# into the config snapshot by str(), which must not depend on set order.
+# Reviewed on 2026-10-13 (imm_cpi_pilot_report.py: its own fills'
+# mark-outs against its credits); blocking is Jack's call. Kill switches:
+# IMM_CPI_PILOT_EVENTS="" or IMM_CPI_PILOT_UNTIL (env = task restart). A
+# sorted tuple, not a set: it is hashed into the config snapshot by str(),
+# which must not depend on set order.
 CPI_PILOT_EVENTS = tuple(sorted(
     e.strip() for e in os.environ.get(
         "IMM_CPI_PILOT_EVENTS", "KXCPICORE-26NOV,KXCPICORE-26DEC").split(",")
     if e.strip()))
-CPI_PILOT_UNTIL = datetime.fromisoformat(os.environ.get(
-    "IMM_CPI_PILOT_UNTIL", "2026-10-13T04:00:00+00:00"))   # end of Mon 10/12 ET
+_cpi_until = os.environ.get("IMM_CPI_PILOT_UNTIL", "").strip()
+CPI_PILOT_UNTIL: Optional[datetime] = (
+    datetime.fromisoformat(_cpi_until) if _cpi_until else None)   # None = no end
 CPI_PILOT_BLACKOUT_ET = tuple(os.environ.get(
     "IMM_CPI_PILOT_BLACKOUT_ET", "08:25-11:05").split("-"))
 CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS = _env_float(
@@ -3287,9 +3292,12 @@ CPI_PILOT_SERIES = tuple(sorted({series_of(e) for e in CPI_PILOT_EVENTS}))
 
 def cpi_pilot_active(ticker: str, now_utc: Optional[datetime] = None) -> bool:
     """True if `ticker` (a market or its event) is in a CPI pilot event and
-    the pilot window is still open. The '<series>-X' probe never matches."""
+    the pilot has no end (the default) or its end has not passed. The
+    '<series>-X' probe never matches."""
     if event_ticker_of(ticker) not in CPI_PILOT_EVENTS:
         return False
+    if CPI_PILOT_UNTIL is None:
+        return True
     return (now_utc or datetime.now(timezone.utc)) < CPI_PILOT_UNTIL
 
 

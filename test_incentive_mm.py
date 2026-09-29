@@ -3778,17 +3778,25 @@ class TestSeriesAutoEnroll(unittest.TestCase):
     def test_cpi_pilot_quotes_two_core_events_in_the_normal_book(self):
         # Jack 2026-09-28: "try the least bad version. keep size same as
         # normal IMM" -- KXCPICORE-26NOV/-26DEC only, normal size, weekday
-        # 08:25-11:05 ET blackout, out 7 days before close, until the pilot
-        # window ends; every other CPI market stays blocked.
+        # 08:25-11:05 ET blackout, out 7 days before close; every other CPI
+        # market stays blocked. No end date by default (Jack 2026-09-28 pm:
+        # "keep it default running, dont block ... ill block if needed");
+        # IMM_CPI_PILOT_UNTIL can still set one.
         self.assertEqual(imm.CPI_PILOT_EVENTS,
                          ("KXCPICORE-26DEC", "KXCPICORE-26NOV"))
+        self.assertIsNone(imm.CPI_PILOT_UNTIL)
         prev_only, prev_until = imm.ALLOWLIST_ONLY, imm.CPI_PILOT_UNTIL
         try:
             imm.ALLOWLIST_ONLY = True
-            imm.CPI_PILOT_UNTIL = datetime.now(timezone.utc) + timedelta(days=1)
-            for t in ("KXCPICORE-26NOV-T0.3", "KXCPICORE-26DEC-T0.2"):
-                self.assertFalse(IncentiveMarketMaker._blocked(t), t)
-                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+            for until in (None, datetime.now(timezone.utc) + timedelta(days=1)):
+                imm.CPI_PILOT_UNTIL = until
+                for t in ("KXCPICORE-26NOV-T0.3", "KXCPICORE-26DEC-T0.2"):
+                    self.assertFalse(IncentiveMarketMaker._blocked(t), (t, until))
+                    self.assertTrue(IncentiveMarketMaker._allowed(t), (t, until))
+            # far in the future with no end date: still quoted
+            imm.CPI_PILOT_UNTIL = None
+            self.assertTrue(imm.cpi_pilot_active(
+                "KXCPICORE-26DEC-T0.2", datetime(2026, 12, 31, tzinfo=timezone.utc)))
             # the rest of CPI, core included, stays blocked
             for t in ("KXCPICORE-26OCT-T0.3", "KXCPICORE-26SEP-T0.3",
                       "KXCPI-26NOV-T0.3", "KXCPI-26DEC-T0.2",
