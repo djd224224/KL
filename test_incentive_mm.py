@@ -1228,6 +1228,197 @@ class TestScreen(unittest.TestCase):
                                        and not ov.safe_join
                                        and ov.cutoff_from_close_min is None))
 
+    def test_election_family_quoted_1_to_99_until_election_day(self):
+        # Jack 2026-09-28: "allowlist county judge markets e.g.
+        # KXBEXARCOUNTYJUDGE, KXCOLLINCOUNTYJUDGE / house election markets
+        # e.g. KXHOUSEWINSTATE, KXHOUSEWINSTATE-NJD / mayor elections e.g.
+        # KXHENDERSONMAYOR, KXLEXMAYOR / quote until election day. expand
+        # range to quote between 1 and 99", then "also allowlist general
+        # election markets e.g. KXSERBIAPRES, KXBC3RD, KXQUEBEC4TH,
+        # KXSAARLAND, KXNORDRHEINWESTFALEN". Dates as Kalshi served them 9/28.
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            for t in ("KXBEXARCOUNTYJUDGE-26-RNIR", "KXCOLLINCOUNTYJUDGE-26-JBRO",
+                      "KXWILCOJUDGE-26-SSNE", "KXHARRISCOUNTYJUDGE-26-OSAN",
+                      "KXHOUSEWINSTATE-NJD-E9", "KXHOUSETX32-26-R",
+                      "KXLAHOUSE1R-26NOV03-LA06", "KXHENDERSONMAYOR-26-MROM",
+                      "KXLEXMAYOR-26-RCAR", "KXTAIPEIMAYOR-26NOV28-HWK",
+                      "KXSERBIAPRES-26DEC27-STUD", "KXBC3RD-26OCT24-3-GRN",
+                      "KXQUEBEC4TH-26OCT05-4-QS", "KXSAARLAND-27APR18-SPD",
+                      "KXNORDRHEINWESTFALEN-27APR25-CDU", "KXATTYGENTX-26-R",
+                      "KXVOTEGENERAL-GOVAK-26BWIL-32"):
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+                self.assertEqual(imm.scan_universe_reason(t), "allowed", t)
+            # Elections-category neighbours that are not a vote's result, and
+            # the name-alikes the patterns must not take
+            for t in ("KXSENMIN-27-JTHU", "KXSERBIAELECTIONCALL-26NOV01-26OCT15",
+                      "KXGENERICBALLOTVOTEHUB-26OCT02-T8.3",
+                      "KXVPRESPERSON-29-WMOO", "KXISTANBULMAYOR-26-X",
+                      "KXACKMANMAYOR-26-X", "KXAPCALLLAMAYOR-26-X",
+                      "KXDIMAYORGAME-26SEP28AB-A", "KXMAYOROFKINGSTOWN-26-X",
+                      "KXIMPEACHJUDGE-26-X", "KXJUDGECOUNT-26OCT-T5",
+                      "KXHOUSEMIN27-27-X", "KXHOUSEBILL-26-X"):
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+            with mock.patch.object(imm, "ELECTION_ALLOW", False):
+                self.assertFalse(IncentiveMarketMaker._allowed(
+                    "KXBEXARCOUNTYJUDGE-26-RNIR"))
+            # the blocklist still wins
+            with mock.patch.object(imm, "SERIES_BLOCK_PATTERNS",
+                                   (imm.re.compile(r"KX[A-Z]+MAYOR"),)):
+                self.assertFalse(IncentiveMarketMaker._allowed("KXLEXMAYOR-26-RCAR"))
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+
+        def est(y, mo, d):
+            return utc(y, mo, d, 5, 0)                  # 00:00 EST
+
+        def edt(y, mo, d):
+            return utc(y, mo, d, 4, 0)                  # 00:00 EDT
+
+        def mkt(occ, exp="2026-12-15T15:00:00Z"):
+            return {"occurrence_datetime": occ, "expected_expiration_time": exp}
+        nov3 = est(2026, 11, 3)
+        jan = "2027-01-04T15:00:00Z"
+        for series, ev, m, want in (
+                # county judge / mayor: Kalshi's occurrence is the poll close
+                ("KXBEXARCOUNTYJUDGE", "KXBEXARCOUNTYJUDGE-26",
+                 mkt("2026-11-04T01:00:00Z"), nov3),
+                ("KXLEXMAYOR", "KXLEXMAYOR-26", mkt("2026-11-03T23:00:00Z"), nov3),
+                ("KXHENDERSONMAYOR", "KXHENDERSONMAYOR-26",
+                 mkt("2026-11-04T03:00:00Z"), nov3),
+                # House and the attorneys general: Kalshi dates them to the
+                # seating / swearing-in -- the hand table pulls them back
+                ("KXHOUSEWINSTATE", "KXHOUSEWINSTATE-NJD",
+                 mkt("2027-01-03T15:00:00Z", jan), nov3),
+                ("KXHOUSEWINSTATE", "KXHOUSEWINSTATE-ALD",
+                 mkt("2027-11-03T15:00:00Z", "2027-11-03T15:00:00Z"), nov3),
+                ("KXHOUSETX32", "KXHOUSETX32-26",
+                 mkt("2027-01-03T15:00:00Z", jan), nov3),
+                ("KXATTYGENTX", "KXATTYGENTX-26",
+                 mkt("2027-01-05T15:00:00Z", "2027-01-06T15:00:00Z"), nov3),
+                ("KXUNDERHARRIS", "KXUNDERHARRIS-27JAN04",
+                 mkt("2027-01-04T14:00:00Z", jan), nov3),
+                ("KXVOTEGENERAL", "KXVOTEGENERAL-GOVAK-26BWIL",
+                 mkt("2026-11-03T15:00:00Z", jan), nov3),
+                ("KXLAHOUSE1R", "KXLAHOUSE1R-26NOV03",
+                 mkt("2026-11-04T02:00:00Z", "2027-11-03T14:00:00Z"), nov3),
+                # abroad: the ticker date, and a poll close that agrees
+                ("KXBC3RD", "KXBC3RD-26OCT24-3",
+                 mkt("2026-10-25T03:00:00Z", "2026-11-24T15:00:00Z"),
+                 edt(2026, 10, 24)),
+                ("KXQUEBEC4TH", "KXQUEBEC4TH-26OCT05-4",
+                 mkt("2026-10-06T00:00:00Z", "2026-11-05T15:00:00Z"),
+                 edt(2026, 10, 5)),
+                ("KXSAARLAND", "KXSAARLAND-27APR18",
+                 mkt("2027-04-18T22:00:00Z", "2028-04-18T14:00:00Z"),
+                 edt(2027, 4, 18)),
+                ("KXNORDRHEINWESTFALEN", "KXNORDRHEINWESTFALEN-27APR25",
+                 mkt("2027-04-25T22:00:00Z", "2028-04-25T14:00:00Z"),
+                 edt(2027, 4, 25)),
+                ("KXSERBIAPRES", "KXSERBIAPRES-26DEC27",
+                 mkt("2026-12-27T14:00:00Z", "2027-12-27T15:00:00Z"),
+                 est(2026, 12, 27)),
+                # an Asian poll close (16:00 Taipei = 03:00 ET) lands the day
+                # before: Taipei's Nov 28 vote opens 19:00 ET Nov 27
+                ("KXTAIPEIMAYOR", "KXTAIPEIMAYOR-26NOV28",
+                 mkt("2026-11-28T08:00:00Z", "2027-02-26T15:00:00Z"),
+                 est(2026, 11, 27)),
+                # a year-only event of another year: its own occurrence
+                ("KXCHICAGOMAYOR", "KXCHICAGOMAYOR-27",
+                 mkt("2027-02-23T15:00:00Z", "2027-02-23T15:00:00Z"),
+                 est(2027, 2, 23))):
+            raw = imm.trade_cutoff_utc(
+                ev, imm.parse_iso_utc(m["occurrence_datetime"]),
+                imm.parse_iso_utc(m["expected_expiration_time"]))
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                series, ev, raw, market=m), want, ev)
+        # an Alaska / Hawaii close after midnight ET is still Nov 3
+        self.assertEqual(imm.election_cutoff_utc(
+            "KXHONOLULUMAYOR-X", mkt("2026-11-04T05:00:00Z")), nov3)
+        # the orphan-restore shape (no market object): the table / ticker
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXHOUSEWINSTATE", "KXHOUSEWINSTATE-NJD",
+            imm.trade_cutoff_utc("KXHOUSEWINSTATE-NJD", None, None)), nov3)
+        # never loosens an earlier cutoff
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXBEXARCOUNTYJUDGE", "KXBEXARCOUNTYJUDGE-26",
+            nov3 - timedelta(days=5), market=mkt("2026-11-04T01:00:00Z")),
+            nov3 - timedelta(days=5))
+        # Kalshi's Dec 31 placeholder, or nothing at all: stood down...
+        jnb = mkt("2026-12-31T15:00:00Z", "2027-12-31T15:00:00Z")
+        self.assertIsNone(imm.election_cutoff_utc("KXJOHANNESBURGMAYOR-26DEC31", jnb))
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXJOHANNESBURGMAYOR", "KXJOHANNESBURGMAYOR-26DEC31", None,
+            market=jnb), imm.RELEASE_GUARD_UNKNOWN)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXTORONTOMAYOR", "KXTORONTOMAYOR-X", None), imm.RELEASE_GUARD_UNKNOWN)
+        # ...unless the hand table has a row for it
+        with mock.patch.object(imm, "ELECTION_DATES", imm._parse_awards_dates(
+                "KXJOHANNESBURGMAYOR-*=2026-11-04")):
+            self.assertEqual(imm.election_cutoff_utc(
+                "KXJOHANNESBURGMAYOR-26DEC31", jnb), est(2026, 11, 4))
+        # series outside the family never see the rule
+        self.assertIsNone(imm.apply_series_cutoff_adjustments(
+            "KXSENMIN", "KXSENMIN-27", None,
+            market=mkt("2027-01-03T15:00:00Z", "2027-01-03T15:00:00Z")))
+        with mock.patch.object(imm, "ELECTION_ALLOW", False):
+            self.assertIsNone(imm.apply_series_cutoff_adjustments(
+                "KXTORONTOMAYOR", "KXTORONTOMAYOR-X", None))
+
+        # guards: a pattern member and a list member both clone the archetype
+        # on first sight -- the 1-99c band and safe-join, nothing else
+        for s in ("KXCOLLINCOUNTYJUDGE", "KXSAARLAND"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+        try:
+            for s in ("KXCOLLINCOUNTYJUDGE", "KXSAARLAND"):
+                imm.ensure_family_override(s)
+                self.assertEqual(imm.SERIES_OVERRIDES[s],
+                                 imm.SERIES_OVERRIDES[imm.ELECTION_ARCHETYPE])
+                self.assertEqual(imm.member_price_band(s, False), (1, 99))
+                self.assertEqual(imm.member_price_band(s, True), (1, 99))
+                self.assertTrue(imm.series_safe_join(s))
+                self.assertEqual(imm.applied_mention_mult(s), 1.0)
+                self.assertEqual(imm.series_min_est_total(s),
+                                 imm.MIN_EST_TOTAL_DOLLARS)
+                self.assertEqual(imm.event_top_n_for(s), 0)
+            # the empty 2c / 98c book is quoted AT its touch; the global band
+            # would have placed nothing
+            band = imm.member_price_band("KXCOLLINCOUNTYJUDGE", False)
+            t = "KXCOLLINCOUNTYJUDGE-26-JBRO"
+            with mock.patch.object(imm, "LADDER_MODE", "offsets"):
+                bid = build_side_ladder(t, "bid", 2, 98, 100, levels=[(0, 20)],
+                                        band=band)
+                ask = build_side_ladder(t, "ask", 98, 2, 100, levels=[(0, 20)],
+                                        band=band)
+                self.assertEqual([(q.price_cents, q.count) for q in bid], [(2, 20)])
+                self.assertEqual([(q.price_cents, q.count) for q in ask], [(98, 20)])
+                self.assertEqual(build_side_ladder(
+                    t, "bid", 2, 98, 100, levels=[(0, 20)],
+                    band=(imm.PRICE_MIN_CENTS, imm.PRICE_MAX_CENTS)), [])
+            # screen: that book and a 1c/3c longshot pass; ordinary series
+            # keep the 5-90 mid band
+            now = utc(2026, 10, 1, 16, 0)
+            ev = "KXCOLLINCOUNTYJUDGE-26"
+            for mid, spread in ((50.0, 96), (2.0, 2)):
+                self.assertIsNone(self.bot._screen(_meta(
+                    ticker=t, event_ticker=ev, series="KXCOLLINCOUNTYJUDGE",
+                    cutoff=nov3, mid_cents=mid, spread_cents=spread), now))
+            self.assertEqual(self.bot._screen(
+                _meta(mid_cents=2.0, spread_cents=2), now), "extreme_mid")
+            # out from 00:00 ET on election day, member or not
+            m = _meta(ticker=t, event_ticker=ev, series="KXCOLLINCOUNTYJUDGE",
+                      cutoff=nov3)
+            self.assertIsNone(self.bot._screen(m, nov3 - timedelta(hours=6),
+                                               member=True))
+            self.assertEqual(self.bot._screen(m, nov3 + timedelta(minutes=1)),
+                             "cutoff")
+            self.assertEqual(self.bot._screen(m, nov3 + timedelta(minutes=1),
+                                              member=True), "cutoff")
+        finally:
+            for s in ("KXCOLLINCOUNTYJUDGE", "KXSAARLAND"):
+                imm.SERIES_OVERRIDES.pop(s, None)
+
     def test_award_shows_three_per_event_and_one_month_stand_down(self):
         # Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY,
         # KXOSCAR, KXVMA. max 3 markets per event, and do not quote within

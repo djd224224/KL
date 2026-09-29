@@ -512,6 +512,10 @@ def classify_and_estimate(client, bot, now_utc: datetime):
         if not m or m.get("status") not in ("active", "open"):
             r["reason"] = "dead"
             continue
+        # family members clone their archetype's guards (band, safe-join)
+        # first, as refresh_universe's candidates loop does -- else a
+        # pattern family's 1-99c band reads as the global 5-90 here
+        imm.ensure_family_override(r["series"])
         meta = build_meta(bot, t, r["info"], m, now_utc)
         r["meta"] = meta
         if t in standoff or meta.event_ticker in manual_evts:

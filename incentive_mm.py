@@ -2924,6 +2924,69 @@ def schedule_resolved_series(series: str) -> bool:
     league that has an ESPN path."""
     return series in SCHEDULE_RESOLVED_SERIES \
         or sports_ladder_league(series) in ESPN_LEAGUE_PATHS
+
+
+# ELECTIONS (Jack 2026-09-28: "allowlist county judge markets e.g.
+# KXBEXARCOUNTYJUDGE, KXCOLLINCOUNTYJUDGE / house election markets e.g.
+# KXHOUSEWINSTATE, KXHOUSEWINSTATE-NJD / mayor elections e.g.
+# KXHENDERSONMAYOR, KXLEXMAYOR / quote until election day. expand range to
+# quote between 1 and 99", then "also allowlist general election markets e.g.
+# KXSERBIAPRES, KXBC3RD, KXQUEBEC4TH, KXSAARLAND, KXNORDRHEINWESTFALEN").
+# Kalshi lit an elections batch that evening (programs 20:02Z-23:02Z 9/28 ->
+# 10/04 03:59Z): eight Texas county judges, the Henderson and Lexington
+# mayors, four KXHOUSEWINSTATE states, Louisiana's six open primaries, 29
+# state attorney-general races and a dozen general elections at home and
+# abroad. One market per candidate / party / count, $285-$500 per market per
+# ~5-day period, and most books empty -- a 1-3c bid under a 97-99c ask --
+# which the global 5-90c band stands aside from entirely; hence the band.
+#
+# MEMBERSHIP. The "e.g." is the family (the 8/31 state-gas lesson), so the
+# three US families Jack named are NAME PATTERNS -- a county, city or district
+# Kalshi lists tomorrow is covered the day it lists -- and the general
+# elections, which share no naming shape, are an exact list of the 9/28
+# feed's election-OUTCOME series (winner, placement, seat count, vote share,
+# turnout). Filed under Elections by Kalshi but deliberately NOT here:
+# KXSENMIN (a leadership vote by senators, after the election),
+# KXSERBIAELECTIONCALL (when the election is called -- news timing, not a
+# result), KXGENERICBALLOTVOTEHUB (a daily polling average, the
+# KXTRUMPAPPROVE pick-off shape) and KXVPRESPERSON (2028: the running-mate
+# picks, not the vote, are its first reveal -- the awards "nominations, not
+# the ceremony" lesson). Carved out of the mayor pattern because they are not
+# election results: KXISTANBULMAYOR (a court case), KXACKMANMAYOR (will he
+# run), KXAPCALLLAMAYOR (when AP calls it), KXBBGMAYOR.
+#
+# THE CUTOFF IS ELECTION DAY: election_cutoff_utc, beside the other event-date
+# rules. The guards (1-99c band, safe-join) sit on the ELECTION_ARCHETYPE
+# override and every member clones it (FAMILY_OVERRIDE_PARENTS).
+# IMM_ELECTION_ALLOW=0 removes the whole family (task-level restart).
+ELECTION_ALLOW = os.environ.get("IMM_ELECTION_ALLOW", "1") == "1"
+ELECTION_SERIES = frozenset(
+    s.strip() for s in os.environ.get(
+        "IMM_ELECTION_SERIES",
+        "KXSERBIAPRES,KXBC2ND,KXBC3RD,KXQUEBEC4TH,KXQUEBEC5TH,KXSAARLAND,"
+        "KXNORDRHEINWESTFALEN,KXSCHLESWIGHOLSTEIN,KXPUNJABASSEMBLY,"
+        "KXBRAZILTURNOUT,KXDEMTRIFECTA,KXUNDERHARRIS,KXVOTEGENERAL,"
+        "KXCAATTORNEYGENERAL,KXFULTONCHAIR").split(",") if s.strip())
+# FULL-match regexes, comma-separated -- so none may contain a comma (\d\d?,
+# not \d{1,2}). County judges incl. Williamson's KXWILCOJUDGE; <city>MAYOR
+# less the four carve-outs; House seat counts, district winners
+# (KXHOUSETX32) and Louisiana's open-primary first round (KXLAHOUSE1R);
+# state attorneys general (KXATTYGENTX).
+ELECTION_SERIES_PATTERNS = tuple(
+    re.compile(p.strip()) for p in os.environ.get(
+        "IMM_ELECTION_SERIES_PATTERNS",
+        r"KX[A-Z]+CO(UNTY)?JUDGE,"
+        r"(?!KX(ISTANBUL|ACKMAN|APCALLLA|BBG)MAYOR$)KX[A-Z]+MAYOR,"
+        r"KXHOUSEWINSTATE,KXHOUSE[A-Z][A-Z]\d\d?,KX[A-Z][A-Z]HOUSE1R,"
+        r"KXATTYGEN[A-Z][A-Z]").split(",") if p.strip())
+
+
+def election_series(series: str) -> bool:
+    """The election family (see ELECTION_SERIES): the exact general-election
+    list or a name pattern; nothing while IMM_ELECTION_ALLOW=0."""
+    return ELECTION_ALLOW and (
+        series in ELECTION_SERIES
+        or any(p.fullmatch(series) for p in ELECTION_SERIES_PATTERNS))
 _DEFAULT_CRYPTO_SERIES = (
     # The yearly touch pairs (KX*MINY/KX*MAXY, allowlisted 2026-07-22 when no
     # fleet bot quoted them) moved to SERIES_BLOCKLIST_PREFIXES on 2026-08-13:
@@ -4658,6 +4721,23 @@ SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     price_max_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MAX", 99),
     size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 3.0))
 
+# ELECTION archetype (Jack 2026-09-28, see ELECTION_SERIES): "expand range to
+# quote between 1 and 99" -- price_min/max, which member_price_band, the quote
+# loop, the estimator's quotable sides and the extreme_mid screen all read --
+# plus safe-join, the guard every candidate / nominee binary family carries
+# (KXCMA, the award shows, KXVENUEPERFORM). Safe-join is free on the empty
+# 2c/98c books (a spread >= SAFE_JOIN_MIN_SPREAD is its own net) and on a
+# stacked touch (capped at the reference); it only bites on a thin, tight
+# book -- the shape where a scandal or a poll picks off the touch. No size
+# multiplier, no per-event cap, the ordinary $1.50 entry bar. Every member
+# clones this on first sight (FAMILY_OVERRIDE_PARENTS, "predicate" kind).
+# Knobs IMM_ELECTION_PRICE_MIN / _MAX, IMM_ELECTION_SAFE_JOIN=0.
+ELECTION_ARCHETYPE = "KXBEXARCOUNTYJUDGE"
+SERIES_OVERRIDES[ELECTION_ARCHETYPE] = SeriesOverride(
+    safe_join=os.environ.get("IMM_ELECTION_SAFE_JOIN", "1") == "1",
+    price_min_cents=_env_int("IMM_ELECTION_PRICE_MIN", 1),
+    price_max_cents=_env_int("IMM_ELECTION_PRICE_MAX", 99))
+
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
 # The default midnight-ET ticker rule cost the whole overnight half of each
@@ -4815,6 +4895,9 @@ FAMILY_OVERRIDE_PARENTS = (
     # The name regex also matches the KXRAINS*M monthlies, but only a
     # series that passed _allowed (the two-date ticker shape) reaches here.
     ("pattern", RAINSTORM_SERIES_RE, RAINSTORM_ARCHETYPE),
+    # elections (2026-09-28): a name pattern OR the exact general-election
+    # list, so the family is a predicate rather than one regex
+    ("predicate", election_series, ELECTION_ARCHETYPE),
 )
 _family_override_warned: Set[str] = set()
 
@@ -4831,6 +4914,9 @@ def ensure_family_override(series: str) -> None:
                 continue
         elif kind == "family_suffix":
             if not series.endswith(pat):
+                continue
+        elif kind == "predicate":
+            if not pat(series):
                 continue
         elif not series.endswith(pat) or (series not in ALLOW_SERIES
                                           and series not in EXTRA_ALLOW_SERIES):
@@ -5540,6 +5626,9 @@ _CONFIG_CODE_KNOBS = (
     "FLOOR_PROJECTION_SIDES", "ESTIMATE_SIDE_BAND", "RATE_FLOOR_SCHEDULE",
     # family size x1.5 on the Treasury yields and the daily rain (2026-09-27)
     "RATES_SIZE_MULT", "RAIN_DAILY_SIZE_MULT",
+    # election family: membership, the election-day table (2026-09-28)
+    "ELECTION_ALLOW", "ELECTION_SERIES", "ELECTION_SERIES_PATTERNS",
+    "ELECTION_DATES", "ELECTION_OCC_BACK_HOURS",
 )
 
 
@@ -7474,6 +7563,78 @@ for _s in AWARDS_SERIES:
         pre_event_dates_only=(_s in AWARDS_TABLE_ONLY_SERIES))
 
 
+# ELECTION DAY (Jack 2026-09-28: "quote until election day", see
+# ELECTION_SERIES): out at 00:00 ET on the voting day -- the plain ticker-date
+# rule, for a day Kalshi does not always put in the ticker. The day is the
+# EARLIEST of:
+#   1. ELECTION_DATES, a hand table of event-ticker globs (the
+#      IMM_AWARDS_EVENT_DATES format) for events whose Kalshi dates all sit
+#      AFTER the vote: the House (KXHOUSEWINSTATE-NJD and the district
+#      winners KXHOUSETX32-26 carry occurrence Jan 3 2027, the day Congress
+#      convenes; KXHOUSEWINSTATE-SCD May 2027, -ALD Nov 2027), the attorneys
+#      general (Jan 5 2027, the swearing-in), KXUNDERHARRIS (27JAN04,
+#      certification) -- and, as a backstop, every year-only "-26" event:
+#      the US races, all decided on Tuesday Nov 3 2026. A row can only move
+#      the day EARLIER, so a special election before Nov 3 still wins on its
+#      own occurrence.
+#   2. the ticker date (KXBC3RD-26OCT24-3, KXSAARLAND-27APR18,
+#      KXTAIPEIMAYOR-26NOV28): Kalshi's own date for the vote.
+#   3. Kalshi's occurrence_datetime, which on these is the poll close (01:00Z
+#      Nov 4 for Texas, 23:00Z Nov 3 for Kentucky, 03:00Z Oct 25 for BC) or a
+#      10:00 ET stamp on the day: read ELECTION_OCC_BACK_HOURS back into its
+#      ET calendar day, so an Alaska / Hawaii close after midnight ET still
+#      lands on Nov 3, and an Asian close in the ET small hours lands on the
+#      day BEFORE (Taipei's Nov 28 vote opens 19:00 ET Nov 27).
+# A Dec 31 date is Kalshi's year-end placeholder (KXJOHANNESBURGMAYOR-26DEC31,
+# "the next Johannesburg mayoral election"), i.e. unknown; unknown or nothing
+# at all stands the market down (RELEASE_GUARD_UNKNOWN, fail closed, logged
+# once) unless the table has a row for it. Applied in
+# apply_series_cutoff_adjustments for both producers and the quote-gaps
+# mirror, never loosening. What this does NOT cover: an unscheduled vote
+# called for a day before Kalshi's (KXSERBIAPRES-26DEC27 is "the next Serbian
+# presidential election"; the call is its own market, KXSERBIAELECTIONCALL) --
+# add a table row the day the date is set.
+ELECTION_DATES = _parse_awards_dates(os.environ.get(
+    "IMM_ELECTION_DATES",
+    "*-26=2026-11-03,KXHOUSEWINSTATE-*=2026-11-03,"
+    "KXVOTEGENERAL-*-26*=2026-11-03,KXUNDERHARRIS-*=2026-11-03"))
+ELECTION_OCC_BACK_HOURS = 6
+
+
+def election_cutoff_utc(event_ticker: str,
+                        market: Optional[dict] = None) -> Optional[datetime]:
+    """00:00 ET (as UTC) of an election event's voting day: the earliest of
+    the hand table, the ticker date and the occurrence's day (see
+    ELECTION_DATES). None when nothing usable says -- the caller stands the
+    market down."""
+    days: List[datetime] = []
+    table_hit = False
+    for glob_s, when in ELECTION_DATES:
+        if fnmatch.fnmatchcase(event_ticker, glob_s):
+            days.append(when)
+            table_hit = True
+            break
+    occ = (parse_iso_utc(market.get("occurrence_datetime") or "")
+           if isinstance(market, dict) else None)
+    occ_day = None
+    if occ is not None:
+        d = (occ - timedelta(hours=ELECTION_OCC_BACK_HOURS)).astimezone(ET).date()
+        occ_day = ET.localize(datetime(d.year, d.month, d.day)).astimezone(
+            timezone.utc)
+    placeholder = False
+    for day in (parse_event_date(event_ticker), occ_day):
+        if day is None:
+            continue
+        local = day.astimezone(ET)
+        if (local.month, local.day) == (12, 31):
+            placeholder = True
+        else:
+            days.append(day)
+    if placeholder and not table_hit:
+        return None
+    return min(days) if days else None
+
+
 def market_data_month(market: Optional[dict]) -> Optional[Tuple[int, int]]:
     """(year, month) of the DATA month a market's text names, or None."""
     if not isinstance(market, dict):
@@ -7575,6 +7736,21 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         else:
             pre = start - timedelta(days=ov.pre_event_days)
         cutoff = pre if cutoff is None else min(cutoff, pre)
+    if election_series(series):
+        # ELECTION DAY (2026-09-28, see ELECTION_DATES): out at 00:00 ET on
+        # the voting day. Keyed on the family, not its inherited override, so
+        # a producer that runs before the inheritance (orphan restore) still
+        # applies it. No usable day -> stood down (fail closed), logged once.
+        eday = election_cutoff_utc(event_ticker, market)
+        if eday is None:
+            eday = RELEASE_GUARD_UNKNOWN
+            if event_ticker not in _release_guard_warned:
+                _release_guard_warned.add(event_ticker)
+                log(f"[IMM] ! {series}: election-day cutoff needs the voting "
+                    f"day but {event_ticker} has no usable date (hand table, "
+                    f"ticker, occurrence; Dec 31 = placeholder) -- standing "
+                    f"it down (fail closed)")
+        cutoff = eday if cutoff is None else min(cutoff, eday)
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
@@ -10496,8 +10672,8 @@ class IncentiveMarketMaker:
         suffix + named crypto series), the finecon group, and the name-
         pattern families (prefixes; *CC/*ADS/*POS via ALLOW_FAMILY_SUFFIXES,
         source-verified -- family_series_allowed; the sports ladder /
-        escalator regexes, ALLOW_SERIES_PATTERNS) unless ALLOWLIST_ONLY is
-        off."""
+        escalator regexes, ALLOW_SERIES_PATTERNS; the election family,
+        election_series) unless ALLOWLIST_ONLY is off."""
         if cls._blocked(ticker):
             return False
         if not ALLOWLIST_ONLY:
@@ -10511,6 +10687,7 @@ class IncentiveMarketMaker:
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
             family_series_allowed(series) or \
             series_pattern_allowed(series) or \
+            election_series(series) or \
             rainstorm_span_allowed(ticker) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
