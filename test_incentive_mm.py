@@ -2887,6 +2887,61 @@ class TestToxicSideHalt(unittest.TestCase):
             b._toxic_note_fill({"order_id": "x", "ts": 1}, self.t, "yes", "buy", 50.0)
             self.assertEqual(b.state.toxic_pending, [])
 
+    # ---- event-wide (Jack 2026-09-29: "yes add event-wide halting too") ----
+
+    def _sink_rows(self):
+        path = os.path.join(imm.STATUS_DIR, "toxic_halts_"
+                            + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                            + ".jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(l) for l in fh]
+
+    def test_pick_offs_on_two_markets_halt_the_whole_event(self):
+        b = self.bot
+        ev = "KXGOOD-99DEC31"
+        a, c, other = f"{ev}-A", f"{ev}-B", "KXOTHER-99DEC31-A"
+        b.state.last_mark.update({a: 40.0, c: 60.0})
+        before = len(self._sink_rows())
+        # one pick-off on A's bid, one on B's ask, 20 minutes apart
+        b.state.toxic_pending = [[a, "bid", 50.0, self.now - 1600]]
+        self.assertEqual(b._toxic_confirm(self.now - 1200, {a, c}), [])
+        b.state.toxic_pending = [[c, "ask", 50.0, self.now - 400]]
+        self.assertEqual(b._toxic_confirm(self.now, {a, c}), [ev])
+        for t in (a, c, f"{ev}-C"):                 # every market of the event
+            self.assertTrue(b.toxic_market_halted(t, self.now + 60), t)
+        self.assertFalse(b.toxic_market_halted(other, self.now + 60))
+        self.assertFalse(b.toxic_event_halted(ev, self.now + imm.TOXIC_EVENT_HALT_SECS + 1))
+        # one pick-off per side is no SIDE halt
+        self.assertEqual(b.state.toxic_halt_until, {})
+        rows = self._sink_rows()[before:]
+        self.assertEqual([r["kind"] for r in rows], ["pickoff", "pickoff", "event_halt"])
+        self.assertEqual(rows[-1]["markets_picked"], [a, c])
+        self.assertEqual(rows[-1]["until"], round(self.now + imm.TOXIC_EVENT_HALT_SECS, 1))
+
+    def test_same_market_twice_is_a_side_halt_not_an_event_halt(self):
+        b = self.bot
+        b.state.last_mark[self.t] = 40.0
+        self._due("bid", 50.0)
+        self._due("bid", 50.0)
+        self.assertEqual(b._toxic_confirm(self.now, {self.t}), [f"{self.t}|bid"])
+        self.assertFalse(b.toxic_event_halted("KXGOOD-99DEC31", self.now + 60))
+        self.assertTrue(b.toxic_market_halted(self.t, self.now + 60))
+
+    def test_event_pick_offs_outside_the_window_or_rule_off_do_not_halt(self):
+        b = self.bot
+        ev = "KXGOOD-99DEC31"
+        a, c = f"{ev}-A", f"{ev}-B"
+        b.state.last_mark.update({a: 40.0, c: 40.0})
+        b.state.toxic_event_picks[ev] = [[self.now - imm.TOXIC_EVENT_WINDOW_SECS - 60, a]]
+        b.state.toxic_pending = [[c, "bid", 50.0, self.now - 400]]
+        self.assertEqual(b._toxic_confirm(self.now, {a, c}), [])
+        with mock.patch.object(imm, "TOXIC_EVENT_MARKETS", 0):
+            b.state.toxic_pending = [[a, "bid", 50.0, self.now - 400]]
+            self.assertEqual(b._toxic_confirm(self.now, {a, c}), [])
+        self.assertFalse(b.toxic_event_halted(ev, self.now))
+
     def test_halts_and_near_misses_survive_a_restart(self):
         b = self.bot
         now = time.time()
@@ -2896,12 +2951,20 @@ class TestToxicSideHalt(unittest.TestCase):
                                "OLD|bid": [now - imm.TOXIC_WINDOW_SECS - 60]}
         b.state.toxic_pending = [[self.t, "bid", 50.0, now - 30],
                                  ["STALE", "bid", 50.0, now - 99999]]
+        b.state.toxic_event_halt_until = {"KXGOOD-99DEC31": now + 900,
+                                          "KXGONE-99DEC31": now - 5}
+        b.state.toxic_event_picks = {
+            "KXGOOD-99DEC30": [[now - 60, "KXGOOD-99DEC30-A"]],
+            "KXGONE-99DEC30": [[now - imm.TOXIC_EVENT_WINDOW_SECS - 60, "X"]]}
         b._save_persist()
         b2 = IncentiveMarketMaker(client=None, live=False)
         self.assertEqual(set(b2.state.toxic_halt_until), {f"{self.t}|bid"})
         self.assertEqual(set(b2.state.toxic_picks), {f"{self.t}|ask"})
         self.assertEqual([p[0] for p in b2.state.toxic_pending], [self.t])
         self.assertTrue(b2.toxic_side_halted(self.t, "bid", now))
+        self.assertEqual(set(b2.state.toxic_event_halt_until), {"KXGOOD-99DEC31"})
+        self.assertEqual(set(b2.state.toxic_event_picks), {"KXGOOD-99DEC30"})
+        self.assertTrue(b2.toxic_event_halted("KXGOOD-99DEC31", now))
 
 
 class TestDryRunCycle(unittest.TestCase):
@@ -2933,6 +2996,35 @@ class TestDryRunCycle(unittest.TestCase):
         bot.state.toxic_halt_until[f"{t}|bid"] = time.time() - 1
         bot.run_cycle()
         self.assertIn("bid", {o["book_side"] for o in bot.state.sim_orders.values()})
+
+    def test_toxic_event_halt_cancels_every_market_of_the_event(self):
+        # end to end: a second market in the same event; pick-offs on both
+        # (A's bid, B's ask) -> the next cycle halts the EVENT and the diff
+        # cancels every order on both markets, both sides; an unrelated
+        # event keeps quoting; when the halt runs out both come back
+        bot = self._bot()
+        c = bot.client
+        a, b2 = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B"
+        c.programs.append(dict(c.programs[0], market_ticker=b2))
+        c.markets[b2] = dict(c.markets[a], ticker=b2)
+        c.books[b2] = c.books[a]
+        bot.run_cycle()
+        tick = {o["ticker"] for o in bot.state.sim_orders.values()}
+        self.assertTrue({a, b2} <= tick)
+        now = time.time()
+        # marks the cycle will read: A's book moves down, B's up
+        c.books[a] = {"orderbook_fp": {"yes_dollars": [["0.42", "500"], ["0.43", "600"]],
+                                       "no_dollars": [["0.55", "1200"]]}}   # mid 44
+        c.books[b2] = {"orderbook_fp": {"yes_dollars": [["0.54", "500"], ["0.55", "600"]],
+                                        "no_dollars": [["0.43", "1200"]]}}  # mid 56
+        bot.state.toxic_pending = [[a, "bid", 50.0, now - 400],
+                                   [b2, "ask", 50.0, now - 350]]
+        bot.run_cycle()
+        self.assertTrue(bot.toxic_event_halted("KXGOOD-99DEC31", time.time()))
+        self.assertEqual({o["ticker"] for o in bot.state.sim_orders.values()} & {a, b2}, set())
+        bot.state.toxic_event_halt_until["KXGOOD-99DEC31"] = time.time() - 1
+        bot.run_cycle()
+        self.assertTrue({a, b2} <= {o["ticker"] for o in bot.state.sim_orders.values()})
 
     def test_a_cut_market_never_burns_a_lifetime_event_slot(self):
         """Jack 2026-09-09: "fix the lifetime slot ordering too". The ledger
