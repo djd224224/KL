@@ -10,8 +10,10 @@ every 10 minutes by the `KL imm dashboard` task.
   app, the `imm-dashboard` preview config in `.claude/launch.json` serves it on
   http://127.0.0.1:8874/imm_dashboard.html.
 - **Build by hand:** `python imm_dashboard.py [--open] [--no-api] [--api-refresh]`.
-- **Task:** `register_imm_dashboard.ps1` (the 30-minute sync registers it the
-  first time the script is on main). Log: `run-logs\incentive-mm\dashboard\dashboard-task.log`.
+- **Task:** run `register_imm_dashboard.ps1` once, by hand, to create the
+  10-minute rebuild (nothing registers it automatically). Until then the page
+  refreshes only when `imm_dashboard.py` is run. Log:
+  `run-logs\incentive-mm\dashboard\dashboard-task.log`.
 
 ## What the headline numbers are
 

@@ -72,18 +72,6 @@ if (-not (Get-ScheduledTask -TaskName "KL imm new-programs" -ErrorAction Silentl
     }
 }
 
-# One-time bootstrap (2026-09-28): register the 10-minute IMM command-center
-# rebuild (register_imm_dashboard.ps1, which also starts its first run) once
-# it lands on main -- same pattern as above. No-op once the task exists.
-if (-not (Get-ScheduledTask -TaskName "KL imm dashboard" -ErrorAction SilentlyContinue)) {
-    $idReg = Join-Path $Repo "register_imm_dashboard.ps1"
-    if (Test-Path $idReg) {
-        $idOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $idReg 2>&1) -join ' | '
-        $idOk = [bool](Get-ScheduledTask -TaskName "KL imm dashboard" -ErrorAction SilentlyContinue)
-        "$stamp imm dashboard bootstrap: $(if ($idOk) { 'registered' } else { 'FAILED (run register_imm_dashboard.ps1 from PowerShell)' }) | $idOut" | Add-Content -Path $Log -Encoding utf8
-    }
-}
-
 # One-shot windowed IMM restart (Jack 2026-08-24 "restart for me at that
 # time"): bumping $RestartRequest in a main push makes the NEXT sync run
 # dispatch restart_imm.ps1 exactly once on this machine — the script itself
