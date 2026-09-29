@@ -2564,7 +2564,17 @@ def _series_block_default(gb_state_gas_live: bool) -> str:
             # KXOSCARAWARDACTR is a SAG Award series filed under the Oscar
             # prefix (2026-09-26 audit of the 66 KXOSCAR* names); the KXOSCAR
             # prefix allow must never quote it under the Oscars' dates
-            "KXOSCARAWARD[A-Z]*")
+            "KXOSCARAWARD[A-Z]*,"
+            # the WEEKLY 30Y mortgage rate (Jack 2026-09-28, "yes" to "block
+            # KX30YMORTW"): Freddie's Thursday print averages Thu-Wed and the
+            # market opens Thursday 13:00 ET, 13h into that window -- 1bp
+            # strikes, a median 6bp weekly move, and a daily lock index pins
+            # the print to 2.7bp by Monday. The open scan took it anyway
+            # (Kalshi's series page names the NY Fed SOFR page as the source,
+            # so the live-source keyword screen never saw Freddie Mac):
+            # -$55.90 on 242 contracts in two weeks. The long-dated mortgage
+            # families are quoted only through the MORT_* gate.
+            "KX30YMORTW")
 
 
 SERIES_BLOCK_PATTERNS = tuple(
@@ -3421,6 +3431,15 @@ _DEFAULT_QUAKE_SERIES = "KXBIGGESTQUAKE"
 _VERCEL_LIVE = os.environ.get("IMM_VERCEL_ENABLE", "1") == "1"
 _DEFAULT_VERCEL_SERIES = ("KXOPENVSPEND,KXMOONVSPEND,KXANTHVSPEND,KXGOOGVREQ,"
                           "KXOPENVREQ,KXDEEPVREQ,KXANTHVREQ,KXOPENSOURCESHARE")
+# LONG-DATED MORTGAGE RATES (Jack 2026-09-28: "yes" to "build a fair-value
+# gate for KXFM30YMTG and KXMORTGAGERATE"): Freddie Mac PMMS year-end and
+# how-high-in-a-year markets, $100 per strike per period from 9/28. Enrolled
+# here only with the MORT_* gate -- quoted against mortgage_fair's PMMS fair,
+# never within MORT_FAIR_TOL_CENTS of it, fail closed; IMM_MORT_ENABLE=0 or
+# IMM_ALLOW_MORT_SERIES="" takes them out. The WEEKLY KX30YMORTW is
+# pattern-blocked (SERIES_BLOCK_PATTERNS).
+_MORT_LIVE = os.environ.get("IMM_MORT_ENABLE", "1") == "1"
+_DEFAULT_MORT_SERIES = "KXFM30YMTG,KXMORTGAGERATE"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -3606,6 +3625,11 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_VERCEL_SERIES",
                                         _DEFAULT_VERCEL_SERIES)
                          if _VERCEL_LIVE else "")
+                # long-dated mortgage rates (2026-09-28): only while the
+                # mortgage gate is on
+                + "," + (os.environ.get("IMM_ALLOW_MORT_SERIES",
+                                        _DEFAULT_MORT_SERIES)
+                         if _MORT_LIVE else "")
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -5752,6 +5776,10 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_ENABLE", "VERCEL_SERIES", "VERCEL_CUTOFF_BEFORE_D_MIN",
     "VERCEL_FAIR_TOL_CENTS", "VERCEL_FAIR_MIN_P", "VERCEL_FAIR_TTL_MIN",
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
+    # long-dated mortgage gate (2026-09-28); mortgage_fair's model knobs
+    # ride in its status file's "model" block
+    "MORT_ENABLE", "MORT_SERIES", "MORT_FAIR_TOL_CENTS", "MORT_FAIR_TTL_MIN",
+    "MORT_FAIR_REFRESH_SECS", "MORT_CUTOFF_BUFFER_DAYS", "MORT_SIZE_MULT",
     # ROI scan (2026-09-27): admission clock, hourly-window auto-arm, the
     # planned-restart order handoff, the realized floor anchor and the
     # near-cliff room priority
@@ -7244,6 +7272,169 @@ def vercel_gate_reason(ticker: str, now_ts: float,
     return "", {}
 
 
+# ----------------------------------------------------------------------------
+# LONG-DATED MORTGAGE GATE (Jack 2026-09-28: "yes" to "block KX30YMORTW and
+# build a fair-value gate for KXFM30YMTG and KXMORTGAGERATE ... stop quoting
+# if its data went stale ... start from Freddie's latest weekly number and
+# use the weekly market's own implied rate as a free live reading").
+#   - FAIR: mortgage_fair.py (refresher thread "mort-fair", every
+#     MORT_FAIR_REFRESH_SECS) -- the PMMS as a Gaussian walk from X0, the
+#     median print implied by the open KX30YMORTW ladder (within 24h of a
+#     release, the print itself); FINAL (KXFM30YMTG-<YY>EOY: the year's last
+#     print) and MAX (KXMORTGAGERATE: any print of the year) closed forms,
+#     checked within ~3c of a block bootstrap of 2000-2026. Every other shape
+#     in the two series (the in-year touch markets) is not modelled.
+#   - The quote loop stands a market aside (cancel) with no read or a stale
+#     one (MORT_FAIR_TTL_MIN), no rate level (no fresh anchor and the print
+#     over a day old), a market the model does not cover, a ticker whose
+#     kind/year disagree with its rules, or a touch fighting the fair by
+#     more than MORT_FAIR_TOL_CENTS on the adverse side. Otherwise it quotes
+#     with every bid at most fair - MORT_FAIR_TOL_CENTS and every ask at
+#     least fair + MORT_FAIR_TOL_CENTS (a rung past its bound moves to it;
+#     a side with no room -- fair above 84c or under 16c -- is not quoted).
+#   - CUTOFF 00:00 ET MORT_CUTOFF_BUFFER_DAYS (7) before the measurement week
+#     of the first print that can settle the market: FINAL two weeks before
+#     the year's last Thursday, MAX two weeks before the year's first
+#     Thursday (inside the year every weekly print can settle a strike --
+#     the weekly market's problem). From the ticker in
+#     apply_series_cutoff_adjustments; unparseable -> stood down.
+# Family size MORT_SIZE_MULT (x3), price band 1-99c (the fair bound does the
+# band's job). Kill switch IMM_MORT_ENABLE=0 takes the family out of the
+# allowlist entirely.
+MORT_ENABLE = _MORT_LIVE
+MORT_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_MORT_SERIES", _DEFAULT_MORT_SERIES).split(",") if s.strip())
+MORT_FAIR_TOL_CENTS = _env_int("IMM_MORT_FAIR_TOL_CENTS", 15)
+MORT_FAIR_TTL_MIN = _env_int("IMM_MORT_FAIR_TTL_MIN", 20)
+MORT_FAIR_REFRESH_SECS = _env_int("IMM_MORT_FAIR_REFRESH_SECS", 120)
+MORT_CUTOFF_BUFFER_DAYS = _env_int("IMM_MORT_CUTOFF_BUFFER_D", 7)
+MORT_SIZE_MULT = _env_float("IMM_MORT_SIZE_MULT", 3.0)
+MORT_STATUS_FILE = os.environ.get(
+    "IMM_MORT_STATUS_FILE", os.path.join(STATUS_DIR, "mortgage_fair.json"))
+# the refresher's latest snapshot (mortgage_fair.build_snapshot)
+_mort_state: dict = {"snap": None}
+_MORT_FINAL_SEG_RE = re.compile(r"^(\d{2})EOY$")          # KXFM30YMTG-26EOY
+_MORT_MAX_SEG_RE = re.compile(r"^(\d{2})[A-Z]{3}(?:\d{2})?$")  # -27DEC30, -26DEC
+
+for _s in MORT_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        cutoff_from_close_min=0, size_mult=MORT_SIZE_MULT,
+        price_min_cents=1, price_max_cents=99)
+
+
+def mort_series(series: str) -> bool:
+    return MORT_ENABLE and series in MORT_SERIES
+
+
+def mort_event_kind(event_ticker: str) -> Optional[Tuple[str, int]]:
+    """('final', year) for KXFM30YMTG-<YY>EOY, ('max', year) for
+    KXMORTGAGERATE-<YY><MON>[DD]; None for any other shape (the in-year
+    touch markets such as KXFM30YMTG-26DEC31)."""
+    series, _, seg = (event_ticker or "").partition("-")
+    if series == "KXFM30YMTG":
+        m = _MORT_FINAL_SEG_RE.match(seg)
+        return ("final", 2000 + int(m.group(1))) if m else None
+    if series == "KXMORTGAGERATE":
+        m = _MORT_MAX_SEG_RE.match(seg)
+        if m and seg[2:5] in _MONTHS:
+            return ("max", 2000 + int(m.group(1)))
+    return None
+
+
+def mort_cutoff_utc(event_ticker: str) -> Optional[datetime]:
+    """00:00 ET, MORT_CUTOFF_BUFFER_DAYS before the measurement week (Thu-Wed)
+    of the first print that can settle the event: the year's last Thursday
+    for FINAL, its first Thursday for MAX. None when the shape is unknown."""
+    kind = mort_event_kind(event_ticker)
+    if kind is None:
+        return None
+    k, year = kind
+    if k == "final":
+        d = datetime(year, 12, 31)
+        d -= timedelta(days=(d.weekday() - 3) % 7)
+    else:
+        d = datetime(year, 1, 1)
+        d += timedelta(days=(3 - d.weekday()) % 7)
+    start = d - timedelta(days=7 + MORT_CUTOFF_BUFFER_DAYS)
+    return ET.localize(start).astimezone(timezone.utc)
+
+
+def mort_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+              ext_ask: Optional[float]
+              ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', inputs, (bid_cap, ask_floor)) when a mortgage market may quote --
+    bids at most bid_cap, asks at least ask_floor, None = that side not at
+    all -- else (why, guard-skip inputs, None). Fails CLOSED."""
+    snap = _mort_state.get("snap")
+    if snap is None:
+        return "no mortgage read yet", {"reason": "no_read"}, None
+    age = now_ts - float(snap.get("ts") or 0.0)
+    if age > MORT_FAIR_TTL_MIN * 60:
+        return (f"mortgage read is {age / 60:.0f}m old",
+                {"reason": "stale", "age_s": round(age)}, None)
+    if snap.get("x0") is None:
+        return (f"no rate level ({snap.get('x0_src')})",
+                {"reason": "no_rate", "why": str(snap.get("x0_src"))[:160]}, None)
+    e = (snap.get("markets") or {}).get(ticker)
+    if e is None:
+        return "market not in the mortgage read", {"reason": "no_market"}, None
+    if e.get("err") or e.get("p") is None:
+        why = str(e.get("err") or "no fair")[:160]
+        return f"not modelled: {why}", {"reason": "model", "why": why}, None
+    kind = mort_event_kind(ticker.rpartition("-")[0])
+    if kind is None or kind != (e.get("kind"), e.get("year")):
+        return (f"ticker says {kind}, rules say {e.get('kind')} "
+                f"{e.get('year')}", {"reason": "rules"}, None)
+    fair = float(e["p"]) * 100.0
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair,
+                                        MORT_FAIR_TOL_CENTS)
+    inputs = {"fair": round(fair, 2), "x0": snap.get("x0"),
+              "x0_src": str(snap.get("x0_src"))[:80],
+              "tol": MORT_FAIR_TOL_CENTS}
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
+                f"{MORT_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+                f"X0 {snap.get('x0')})",
+                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad),
+                None)
+    bid_cap = int(math.floor(fair - MORT_FAIR_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(fair + MORT_FAIR_TOL_CENTS - 1e-9))
+    caps = (bid_cap if bid_cap >= 1 else None,
+            ask_floor if ask_floor <= 99 else None)
+    if caps == (None, None):
+        return (f"no side {MORT_FAIR_TOL_CENTS}c clear of fair {fair:.0f}c",
+                dict(inputs, reason="decided"), None)
+    return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+def mort_cap_quotes(quotes: List["Quote"], bid_cap: Optional[int],
+                    ask_floor: Optional[int]) -> List["Quote"]:
+    """Every bid at most bid_cap, every ask at least ask_floor; a side whose
+    bound is None is dropped. A rung past its bound moves to it (losing any
+    sub-penny price); a pad past it is dropped -- pad size parks for depth
+    and is never repriced toward the fair."""
+    out = []
+    for q in quotes:
+        px = q.price_exact if q.price_exact is not None else q.price_cents
+        if q.book_side == "bid":
+            if bid_cap is None:
+                continue
+            if px > bid_cap:
+                if q.is_pad:
+                    continue
+                q = replace(q, price_cents=int(bid_cap), price_exact=None)
+        else:
+            if ask_floor is None:
+                continue
+            if px < ask_floor:
+                if q.is_pad:
+                    continue
+                q = replace(q, price_cents=int(ask_floor), price_exact=None)
+        out.append(q)
+    return out
+
+
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
 _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 
@@ -8059,6 +8250,20 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         else:
             pre = d0 - timedelta(minutes=VERCEL_CUTOFF_BEFORE_D_MIN)
         cutoff = pre if cutoff is None else min(cutoff, pre)
+    if mort_series(series):
+        # LONG-DATED MORTGAGE CUTOFF (2026-09-28, see MORT_ENABLE): out
+        # MORT_CUTOFF_BUFFER_DAYS before the measurement week of the first
+        # print that can settle the event. An unknown shape (the in-year
+        # touch markets) -> stood down, logged once.
+        mc = mort_cutoff_utc(event_ticker)
+        if mc is None:
+            mc = RELEASE_GUARD_UNKNOWN
+            if event_ticker not in _release_guard_warned:
+                _release_guard_warned.add(event_ticker)
+                log(f"[IMM] ! {series}: {event_ticker} is not a modelled "
+                    f"mortgage shape (year-end / how-high-in-a-year) -- "
+                    f"standing it down (fail closed)")
+        cutoff = mc if cutoff is None else min(cutoff, mc)
     # CARBON ARC LATE-MONTH STOP (Jack 2026-09-24 pm, see CA_LATE_STOP_DAYS):
     # keyed on the bot's own source verdict, not the name, so a *FT that is
     # not Carbon Arc (the Taylor Swift charts) keeps its ordinary cutoff.
@@ -9552,6 +9757,7 @@ class IncentiveMarketMaker:
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
         self._quake_held: Set[str] = set()        # quake gate holds (frozen bids)
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
+        self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
@@ -12978,6 +13184,11 @@ class IncentiveMarketMaker:
                 _qcap = quake_probe_cap(meta.ticker, _now.timestamp(),
                                         meta.close_time)
                 out = [] if _qcap is None else quake_cap_quotes(out, _qcap)
+            if mort_series(meta.series):
+                # mortgage gate: nothing while it stands aside, else the
+                # rungs held MORT_FAIR_TOL_CENTS clear of the fair
+                _mw, _mi, _mc = mort_gate(meta.ticker, _now.timestamp(), eb, ea)
+                out = [] if (_mw or _mc is None) else mort_cap_quotes(out, *_mc)
             return out
 
         def _overlay_with_pads(quotes: List[Quote],
@@ -14452,6 +14663,25 @@ class IncentiveMarketMaker:
                 self._vercel_stood.discard(t)
                 log(f"{self.tag} vercel resume {t}")
 
+            # LONG-DATED MORTGAGE GATE (Jack 2026-09-28, see MORT_ENABLE):
+            # stand aside (cancel) without a fresh PMMS fair, on a shape the
+            # model does not cover, or when the touch fights the fair;
+            # otherwise every rung below stays MORT_FAIR_TOL_CENTS on the
+            # safe side of the fair (mort_cap_quotes).
+            mort_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            if mort_series(meta.series):
+                mg_why, mg_in, mort_caps = mort_gate(t, now_ts, ext_bid, ext_ask)
+                if mg_why:
+                    if t not in self._mort_stood:
+                        self._mort_stood.add(t)
+                        log(f"{self.tag} mortgage stand-aside {t}: {mg_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "mort_fair", lambda: mg_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._mort_stood:
+                self._mort_stood.discard(t)
+                log(f"{self.tag} mortgage resume {t}")
+
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go
             # silent. Without this, a restored rain position kept reduce-only
@@ -14567,6 +14797,10 @@ class IncentiveMarketMaker:
                 _yx, _nx = orderbook_exact_levels(ob)
                 mq = subpenny_snap(mq, _yx, _nx,
                                    own_exact_by_ticker.get(t, []) if self.live else [])
+            # mortgage gate: LAST, after pads and the sub-penny snap, so
+            # nothing rests within MORT_FAIR_TOL_CENTS of the fair
+            if mort_caps is not None:
+                mq = mort_cap_quotes(mq, *mort_caps)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -15885,6 +16119,55 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_vercel_fair_refresh, daemon=True,
                              name="vercel-fair").start()
+        if MORT_ENABLE and not once:
+            # Long-dated mortgage refresher (2026-09-28): the quake
+            # refresher's shape -- Kalshi reads off the trading thread into
+            # the in-memory snapshot the gate reads (_mort_state), plus a
+            # status file for observability. The weekly ladder is read every
+            # MORT_FAIR_REFRESH_SECS, the last print and the family's markets
+            # every 15 minutes. A failed refresh keeps the old snapshot, which
+            # ages out of MORT_FAIR_TTL_MIN (the gate fails closed).
+            def _mort_fair_refresh():
+                try:
+                    import mortgage_fair
+                except Exception as e:
+                    log(f"{self.tag} ! mortgage refresher disabled: {e}")
+                    return
+                watch = mortgage_fair.MortgageWatch(fair_reader())
+                last = None
+                while True:
+                    delay = max(30, MORT_FAIR_REFRESH_SECS)
+                    try:
+                        snap = watch.refresh()
+                        _mort_state["snap"] = snap
+                        ents = snap.get("markets") or {}
+                        n_ok = sum(1 for e in ents.values() if "p" in e)
+                        src = str(snap.get("x0_src") or "")
+                        key = (snap.get("x0") is None, src.split(" ")[0],
+                               n_ok, len(snap.get("errors") or []))
+                        if last != key:
+                            x0 = snap.get("x0")
+                            log(f"{self.tag} mort-fair refresh: X0 "
+                                f"{'none' if x0 is None else f'{x0:.3f}'} "
+                                f"({src[:120]}), {n_ok}/{len(ents)} markets "
+                                f"priced"
+                                + (f"; {'; '.join(snap['errors'])[:200]}"
+                                   if snap.get("errors") else ""))
+                        last = key
+                        try:
+                            mortgage_fair.write_status(MORT_STATUS_FILE, snap)
+                        except Exception:
+                            pass      # observability only
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! mort-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 60)
+                    time.sleep(delay)
+            threading.Thread(target=_mort_fair_refresh, daemon=True,
+                             name="mort-fair").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
@@ -15933,6 +16216,16 @@ class IncentiveMarketMaker:
                 f"refresh {VERCEL_FAIR_REFRESH_SECS}s, file {VERCEL_FAIR_FILE}")
         else:
             log("vercel gate: OFF -- the Vercel series are not enrolled")
+        if MORT_ENABLE:
+            log(f"mortgage gate: {','.join(sorted(MORT_SERIES))} fail-closed, "
+                f"bids <= fair - {MORT_FAIR_TOL_CENTS}c, asks >= fair + "
+                f"{MORT_FAIR_TOL_CENTS}c, a touch fighting the fair by more "
+                f"stands aside, size x{MORT_SIZE_MULT:g}, 1-99c, out "
+                f"{7 + MORT_CUTOFF_BUFFER_DAYS}d before the first print that "
+                f"can settle, ttl {MORT_FAIR_TTL_MIN}m, refresh "
+                f"{MORT_FAIR_REFRESH_SECS}s, status {MORT_STATUS_FILE}")
+        else:
+            log("mortgage gate: OFF -- KXFM30YMTG/KXMORTGAGERATE not enrolled")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
             f"earnings x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT:g}), "

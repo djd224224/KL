@@ -88,6 +88,10 @@ def setUpModule():
     # the Vercel pre-D fair file (2026-09-27) is read by every run_cycle
     imm.VERCEL_FAIR_FILE = os.path.join(tmp, "vercel_fair.json")
     imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+    # the mortgage gate's status file and in-memory snapshot (2026-09-28):
+    # only the refresher thread writes either, but never the live file
+    imm.MORT_STATUS_FILE = os.path.join(tmp, "mortgage_fair.json")
+    imm._mort_state["snap"] = None
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -14975,6 +14979,181 @@ class TestVercelPreDGate(unittest.TestCase):
         self.assertIn(self.T, bot._vercel_stood)
 
 
+class TestMortgageFairGate(unittest.TestCase):
+    """mortgage_fair's snapshot -> mort_gate / mort_cap_quotes -> the
+    long-dated mortgage families quoted only against the PMMS fair, never
+    within MORT_FAIR_TOL_CENTS of it, failing closed; the weekly KX30YMORTW
+    pattern-blocked (Jack 2026-09-28). Fixture event KXFM30YMTG-67EOY (its
+    cutoff, December 2067, is far away), strike T7.00, book 50x90."""
+
+    T = "KXFM30YMTG-67EOY-T7.00"
+    EV = "KXFM30YMTG-67EOY"
+    CLOSE = datetime(2067, 12, 29, 16, 55, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        imm._mort_state["snap"] = None
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm._mort_state["snap"] = None
+
+    def _snap(self, p=0.70, age_secs=0.0, x0=7.2, err=None, kind="final",
+              year=2067, ticker=None):
+        e = {"kind": kind, "year": year, "k": 7.0, "last": "2067-12-29"}
+        if err:
+            e["err"] = err
+        else:
+            e["p"] = p
+        imm._mort_state["snap"] = {
+            "ts": time.time() - age_secs, "x0": x0,
+            "x0_src": ("anchor KX30YMORTW-67JAN06" if x0 is not None
+                       else "no fresh anchor"),
+            "markets": {ticker or self.T: e}, "errors": []}
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.5000", "yes_ask_dollars": "0.9000",
+            "volume_fp": "500.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.46", "400"], ["0.48", "400"], ["0.50", "400"]],
+            "no_dollars": [["0.06", "400"], ["0.08", "400"], ["0.10", "400"]]}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_enrolled_weekly_blocked_and_cut_off(self):
+        for s in ("KXFM30YMTG", "KXMORTGAGERATE"):
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.mort_series(s), s)
+            ov = imm.series_override(s)
+            self.assertEqual((ov.cutoff_from_close_min, ov.size_mult,
+                              ov.price_min_cents, ov.price_max_cents),
+                             (0, 3.0, 1, 99), s)
+        # the weekly: blocked by pattern (full match), positions ride
+        self.assertTrue(imm.series_pattern_blocked("KX30YMORTW"))
+        self.assertTrue(IncentiveMarketMaker._blocked("KX30YMORTW-26OCT01-T7.15"))
+        self.assertFalse(IncentiveMarketMaker._allowed("KX30YMORTW-26OCT01-T7.15"))
+        self.assertFalse(imm.series_pattern_blocked("KXFM30YMTG"))
+        # kinds from the ticker; the in-year touch markets are no kind at all
+        self.assertEqual(imm.mort_event_kind("KXFM30YMTG-26EOY"), ("final", 2026))
+        self.assertEqual(imm.mort_event_kind("KXMORTGAGERATE-27DEC30"), ("max", 2027))
+        self.assertEqual(imm.mort_event_kind("KXMORTGAGERATE-26DEC"), ("max", 2026))
+        self.assertIsNone(imm.mort_event_kind("KXFM30YMTG-26DEC31"))
+        self.assertIsNone(imm.mort_event_kind("KX30YMORTW-26OCT01"))
+        # out 00:00 ET two weeks before the first print that can settle:
+        # FINAL the year's last Thursday (12/31/2026, 12/30/2027), MAX its
+        # first (1/7/2027); inside the year (26DEC) already past
+        close = datetime(2026, 12, 31, 16, 55, tzinfo=timezone.utc)
+        cut = lambda s, ev, c=close: imm.apply_series_cutoff_adjustments(
+            s, ev, c, close_time=c)
+        self.assertEqual(cut("KXFM30YMTG", "KXFM30YMTG-26EOY"),
+                         datetime(2026, 12, 17, 5, 0, tzinfo=timezone.utc))
+        c27 = datetime(2027, 12, 30, 16, 55, tzinfo=timezone.utc)
+        self.assertEqual(cut("KXFM30YMTG", "KXFM30YMTG-27EOY", c27),
+                         datetime(2027, 12, 16, 5, 0, tzinfo=timezone.utc))
+        self.assertEqual(cut("KXMORTGAGERATE", "KXMORTGAGERATE-27DEC30", c27),
+                         datetime(2026, 12, 24, 5, 0, tzinfo=timezone.utc))
+        self.assertLess(cut("KXMORTGAGERATE", "KXMORTGAGERATE-26DEC"),
+                        datetime(2026, 1, 1, tzinfo=timezone.utc))
+        self.assertEqual(cut("KXFM30YMTG", "KXFM30YMTG-26DEC31"),
+                         imm.RELEASE_GUARD_UNKNOWN)
+
+    def test_gate_reasons_fail_closed(self):
+        now = time.time()
+        r = lambda t=self.T, ts=now, b=50, a=90: \
+            imm.mort_gate(t, ts, b, a)[1].get("reason")
+        self.assertEqual(r(), "no_read")
+        self._snap(age_secs=imm.MORT_FAIR_TTL_MIN * 60 + 30)
+        self.assertEqual(r(), "stale")
+        self._snap(x0=None)
+        self.assertEqual(r(), "no_rate")
+        self._snap()
+        self.assertEqual(r(t="KXFM30YMTG-67EOY-T7.25"), "no_market")
+        self._snap(err="rules: not a modelled shape")
+        self.assertEqual(r(), "model")
+        self._snap(kind="max")                                # ticker says final
+        self.assertEqual(r(), "rules")
+        self._snap(p=0.70)
+        self.assertEqual(r(b=86), "band")                     # bid over 70 + 15
+        self.assertEqual(r(a=54), "band")                     # ask under 70 - 15
+        self.assertIsNone(r(b=85, a=55))                      # at tol: quotes
+        why, inputs, caps = imm.mort_gate(self.T, now, 50, 90)
+        self.assertEqual((why, caps), ("", (55, 85)))
+        self.assertEqual(inputs["fair"], 70.0)
+        self._snap(p=0.90)                                    # no ask room
+        self.assertEqual(imm.mort_gate(self.T, now, 50, 99)[2], (75, None))
+        self._snap(p=0.10)                                    # no bid room
+        self.assertEqual(imm.mort_gate(self.T, now, 2, 50)[2], (None, 25))
+        with mock.patch.object(imm, "MORT_FAIR_TOL_CENTS", 60):
+            self._snap(p=0.50)
+            self.assertEqual(r(b=None, a=None), "decided")
+
+    def test_cap_quotes_hold_every_rung_clear_of_the_fair(self):
+        Q = imm.Quote
+        qs = [Q(self.T, "bid", 60, 20), Q(self.T, "bid", 50, 20),
+              Q(self.T, "bid", 1, 900, is_pad=True),
+              Q(self.T, "ask", 80, 20), Q(self.T, "ask", 90, 20),
+              Q(self.T, "ask", 99, 900, is_pad=True),
+              Q(self.T, "bid", 55, 20, price_exact=55.4)]
+        got = sorted((q.book_side, q.price_cents, q.is_pad, q.price_exact)
+                     for q in imm.mort_cap_quotes(qs, 55, 85))
+        self.assertEqual(got, sorted([
+            ("bid", 55, False, None), ("bid", 50, False, None),
+            ("bid", 1, True, None), ("ask", 85, False, None),
+            ("ask", 90, False, None), ("ask", 99, True, None),
+            ("bid", 55, False, None)]))
+        # no room on a side: that side goes, pads included
+        got = imm.mort_cap_quotes(qs, None, 85)
+        self.assertEqual({q.book_side for q in got}, {"ask"})
+        got = imm.mort_cap_quotes(qs, 55, None)
+        self.assertEqual({q.book_side for q in got}, {"bid"})
+        # a pad past its bound is dropped, never repriced toward the fair
+        got = imm.mort_cap_quotes([Q(self.T, "ask", 99, 900, is_pad=True)], 1, 100)
+        self.assertEqual(got, [])
+
+    def test_quotes_only_clear_of_the_fair(self):
+        bot = self._bot()
+        bot.run_cycle()         # no read: nothing -- the estimate is zero too
+        self.assertEqual(self._quotes(bot), [])
+        self.assertNotIn(self.T, bot.state.selected)
+
+        def cycle(p):
+            """(bid prices, ask prices) resting after a cycle at fair p (the
+            fixture's default ladder is three rungs a side, 50/49/48 and
+            90/91/92 at the touch)."""
+            self._snap(p=p)
+            bot.state.universe_at = 0.0                       # re-estimate
+            bot.run_cycle()
+            q = self._quotes(bot)
+            return ({px for s_, px in q if s_ == "bid"},
+                    {px for s_, px in q if s_ == "ask"})
+        self.assertEqual(cycle(0.70), ({48, 49, 50}, {90, 91, 92}))  # 55 / 85
+        self.assertNotIn(self.T, bot._mort_stood)
+        self.assertEqual(cycle(0.60), ({45}, {90, 91, 92}))   # bids capped at 45
+        self.assertEqual(cycle(0.80), ({48, 49, 50}, {95}))   # asks lifted to 95
+        # bid touch 50 over 30 + 15: the whole market stands aside (sticky
+        # selection keeps it; it is estimated at zero meanwhile)
+        self._snap(p=0.30)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._mort_stood)
+
+
 class TestGuardSkipSink(unittest.TestCase):
     """guard_skips_*.jsonl (2026-09-26): a market an in-loop guard skips wrote
     no cycle_log row that cycle, so what the guard saw was lost. Change-driven:
@@ -15130,11 +15309,12 @@ class TestGuardSkipSink(unittest.TestCase):
                         if src[j].strip())
             if not prev.startswith("self._gskip("):
                 bare.append(prev)
-        # 29 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
+        # 30 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
         # token-usage gate (2026-09-27) + the GasBuddy state-gas gate
         # (2026-09-27) + the quake gate's stand-aside and hold (2026-09-27)
-        # + the Vercel pre-D gate (2026-09-27)
-        self.assertEqual(len(conts), 29)
+        # + the Vercel pre-D gate (2026-09-27) + the mortgage gate
+        # (2026-09-28)
+        self.assertEqual(len(conts), 30)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

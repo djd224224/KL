@@ -5030,3 +5030,110 @@ toxic_event_halt_cancels_every_market_of_the_event, test_send_imm_toxic_
 halts (ET-day window across UTC files, pick-offs per halt, price during
 halt from marks, forgone reward, quiet day, --dry sends nothing). 1,492
 green (unittest discover).
+
+## 2026-09-28 late — Mortgage rates: weekly KX30YMORTW blocked; year-end / how-high-in-a-year quoted against a PMMS fair (Jack)
+
+Jack, on KX30YMORTW-26OCT01 / KXFM30YMTG-26EOY / KXFM30YMTG-27EOY /
+KXMORTGAGERATE-27DEC30: "should i quote mortgage markets in realtime", then
+"yes" to "block KX30YMORTW and build a fair-value gate for KXFM30YMTG and
+KXMORTGAGERATE? The gate would stop quoting if its data went stale. It would
+start from Freddie's latest weekly number and use the weekly market's own
+implied rate as a free live reading".
+
+THE WEEKLY IS BLOCKED (SERIES_BLOCK_PATTERNS += KX30YMORTW). Freddie Mac's
+Thursday-noon PMMS averages Thursday-Wednesday applications (Kalshi's rules)
+and the market opens Thursday 17:00Z, 13 hours INTO that window, so the
+answer is being written the whole time it trades -- no pre-window exists.
+Strikes are 1bp apart against a median 6bp weekly move (p90 16bp, since the
+Nov-2022 method change). Optimal Blue's daily lock index (FRED OBMMIC30YF,
+posted about a business day late) predicts the print change to 9.3bp RMSE
+with nothing, 4.1 by Friday, 2.7 by Monday, 1.7 by Wednesday (194 weeks);
+the informed side reads MBS live. Measured on our book (open-scan tier, the
+only way in -- Kalshi's series page names the NY Fed SOFR page as the
+source, so the live-source keyword screen never saw Freddie Mac): SEP24
+bought YES 7.05/7.07 at 17c/8c, printed 7.03 (-$8.40); OCT01 sold YES
+7.13-7.15 at avg 70.5c, ~96.6c on 9/28 (-$47.50 MTM, settles 10/1) =
+-$55.90 on 242 contracts vs ~$15.70 estimated rent. The OCT01 position rides
+to settlement (block semantics).
+
+THE LONG-DATED FAMILIES (KXFM30YMTG, KXMORTGAGERATE; listed 9/28 ~18Z, $100
+per strike for the first period to 10/04 03:59Z, target 1000, df 0.5) are
+allowlisted only with the gate (_MORT_LIVE; IMM_MORT_ENABLE=0 or
+IMM_ALLOW_MORT_SERIES="" takes them out). Two shapes are modelled, read from
+the rules text and cross-checked against the ticker:
+- FINAL KXFM30YMTG-<YY>EOY: the year's last PMMS release above K.
+- MAX KXMORTGAGERATE-<YYMMMDD>: any release published in the year above K.
+Everything else in those series is an in-year touch market (KXFM30YMTG-
+26DEC31 "below 5.75% ... between Issuance and Dec 31", KXMORTGAGERATE-26DEC
+"above 6.6% in 2026") whose weekly prints are live settlement events -- the
+weekly's problem -- and is stood down (fail closed).
+
+FAIR (mortgage_fair.py, new; refresher thread "mort-fair", in-memory
+snapshot + run-logs/incentive-mm/mortgage_fair.json). Kalshi-only data,
+signed through fair_reader() (public fallback): the open KX30YMORTW ladder
+every IMM_MORT_FAIR_REFRESH_SECS (120), the last print (a settled weekly
+market's expiration_value, e.g. '7.03') and the family's open markets every
+15 min.
+- X0 = the median print implied by the open weekly ladder (mids of strikes
+  two-sided within 20c, made non-increasing by isotonic fit, the 50c
+  crossing interpolated between strikes <= 6bp apart), dated at that
+  event's Thursday. Refused if more than 30bp from the last print or older
+  than 20 min. Fallback within 24h of a release: the print itself. A print
+  older than 8 days, or neither source: no X0 -> every market stands aside.
+- The weekly PMMS as a driftless Gaussian walk with the n-week sd fitted to
+  2000-2026 (10.5bp x n^0.536: 22/41/58/85/98bp at 4/13/26/52/65 weeks,
+  ~1.2x the sqrt(n) scaling -- weekly changes are autocorrelated) plus 3bp
+  for the anchor. FINAL: 1 - Phi((K + 0.005 - X0)/sd). MAX: the first
+  print's law plus the reflection principle for the rest of the year with
+  the barrier raised 15bp for weekly monitoring -- calibrated: the textbook
+  0.58-step shift read up to 7c high against a sign-symmetrized 13-week
+  block bootstrap of 2000-2026 changes; 15bp is within 2.5c on strikes
+  7.00-9.00 from three starting points. FINAL is within ~3c of the same
+  bootstrap. (The raw bootstrap carries the sample's -7bp/13 weeks drift;
+  the model takes no view.)
+
+GATE (mort_gate, quote loop after the Vercel gate, guard "mort_fair"; guard
+sweep 29 -> 30). Stand aside (cancel) on no read, a read older than
+IMM_MORT_FAIR_TTL_MIN (20), no X0, a market the model does not cover, a
+ticker kind/year that disagrees with its rules, or a touch fighting the fair
+by more than IMM_MORT_FAIR_TOL_CENTS (15) on the adverse side. Otherwise
+quote with EVERY bid <= fair - 15c and EVERY ask >= fair + 15c
+(mort_cap_quotes, applied last -- after pads and the sub-penny snap; a rung
+past its bound moves to it, a pad past it is dropped). A side with no room
+(fair above 84c / under 16c) is not quoted. The reward estimate runs the
+same gate (probe ladder), so a stood-aside market estimates at zero and is
+not admitted. Family size x3 (IMM_MORT_SIZE_MULT), band 1-99c,
+cutoff_from_close_min=0.
+
+CUTOFF (mort_cutoff_utc in apply_series_cutoff_adjustments, from the
+ticker): 00:00 ET IMM_MORT_CUTOFF_BUFFER_D (7) days before the measurement
+week of the first print that can settle -- FINAL 2026: 12/17/2026 05:00Z,
+FINAL 2027: 12/16/2027, MAX 2027: 12/24/2026 (inside the year every weekly
+print can settle a near strike; quoting there needs its own rule).
+
+DRY CHECK 9/29 01:40Z (production env: one 20-lot rung x3 = 60 a side, cap
+450/market): X0 7.218 (anchor OCT01), print 7.03. 26EOY T7.00 fair 69.6 on a
+66x89 book -> bid capped at 54, ask joins 89; 27EOY / MAX-27 bids join the
+placeholder touches (23-56c) 10-60c under fair, asks join 97-99; deep strikes
+one-sided (e.g. MAX-27 T7.00 fair 88.6: bid 40, no ask). All 11 in-year
+touch markets stand aside. Modelled rent at 9/28 books (the bot's own share
+formula, others static): ~$12/day at x3 across 23 strikes; x10 (200 lots)
+~$34/day.
+
+KILL SWITCHES: IMM_MORT_ENABLE=0 (family out); IMM_BLOCK_SERIES_PATTERNS
+(the weekly block lives in its default).
+
+WATCH AFTER DEPLOY: startup "mortgage gate: KXFM30YMTG,KXMORTGAGERATE
+fail-closed ...", "mort-fair refresh: X0 7.2xx (anchor KX30YMORTW-...), N/51
+markets priced", run-logs/incentive-mm/mortgage_fair.json refreshing,
+"mortgage stand-aside / resume" lines, no KX30YMORTW orders, no mortgage
+order within 15c of the status file's fair. Thursday 12:00-13:00 ET the
+weekly ladder rolls: X0 falls back to the fresh print, then the next ladder.
+
+Tests: TestMortgageFairGate (enrollment, the weekly block, cutoffs by shape,
+every fail-closed reason, the caps incl. pads and sub-penny, the loop
+quoting 50/90 at fair 70, capping bids at 45 at fair 60, lifting asks to 95
+at fair 80, standing aside at fair 30); test_mortgage_fair.py (20: rules,
+calendar, the sd fit, FINAL/MAX against the bootstrap, the anchor incl. the
+9/28 ladder -> 7.218, X0 fallbacks, entries, the watch end to end without
+the network). 1,500 green (unittest discover).
