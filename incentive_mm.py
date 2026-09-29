@@ -1914,11 +1914,15 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "=KXGGNOM:3,=KXNATBOOKAWARDS:3,"
                                                 "=KXGRAMMY:3,=KXVMA:3,KXOSCAR:3,"
                                                 # OpenRouter token usage
-                                                # (2026-09-27): every strike
-                                                # settles on one total; exact
-                                                # names (KXTOKENUSE prefixes
-                                                # KXTOKENUSEM / KXTOKENUSED)
-                                                "=KXTOKENUSE:3,=KXTOKENUSEM:3"
+                                                # UNCAPPED (Jack 2026-09-29:
+                                                # "remove the 3-strike cap on
+                                                # OpenRouter"; 3/event from
+                                                # 9/27). Every strike the OR
+                                                # fair gate clears quotes;
+                                                # exact names (KXTOKENUSE
+                                                # prefixes KXTOKENUSEM /
+                                                # KXTOKENUSED), 0 = no cap
+                                                "=KXTOKENUSE:0,=KXTOKENUSEM:0"
                                                 + _RAMP_EVENT_TOP_N_SPEC))
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.

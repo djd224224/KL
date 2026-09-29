@@ -5176,3 +5176,37 @@ The first x2 Saturday is 10/3; the earliest RAISE is the 10/19 email.
 Tests: StepUpWatchTests (OFF, WATCHING 1-2/3, RAISE pro rata, HOLD at 0.75,
 DEGRADED on one failed check, levels incl. a split Saturday and an x2.5
 comparison against x2, text/HTML/subject).
+
+## 2026-09-29 — OpenRouter token usage uncapped: every strike the OR fair gate clears quotes (Jack)
+
+Jack, on "why is KXTOKENUSE-26OCT05 only quoting 3 markets?": "remove the
+3-strike cap on OpenRouter".
+
+WHY IT WAS 3. EVENT_TOP_N =KXTOKENUSE:3,=KXTOKENUSEM:3 came with the gate on
+9/27 by analogy with the one-number families (gas, diesel, *CC), not on an
+instruction; sticky slots then kept the first three admitted (T146, T158,
+T170) while T166 ($3.56/day) and T156 ($2.73/day) ranked above them. The
+13:57Z 9/29 snapshot: 15 strikes, 3 selected at ~$6.95/day modelled, 10 cut
+by event_top_n at ~$22.93/day modelled, 2 extreme_mid (T142/T144 at 97-98c).
+The monthly KXTOKENUSEM-26OCT26 was not cap-bound (8 payout_floor, 1 zero
+yield, 1 selected at $0.06/day).
+
+CHANGE. =KXTOKENUSE:0,=KXTOKENUSEM:0 (0 = no cap, exact names so
+KXTOKENUSED stays untouched). The OR fair gate is unchanged: fail closed
+without a fresh read, out once the window is complete, the 10-minute hold
+after each new day, stand aside when a touch fights the fair band by >15c.
+
+RISK NOTED TO JACK BEFORE THE CHANGE. The market priced the Oct 5 week's
+total ~4T under the model (median ~160T vs mu 164.4T, sigma 16.9T, 1 of 7
+days known); the week's one fill was a YES buy on T170 40 @ 37c that marked
+23c (-$5.60). Pre-gate open-scan fills lost $37.93 on 26SEP28 T150/156/158
+(YES buys as the total came in low); the gate's one settled trade made
++$7.20 (T146 NO). The bot's per-market reward estimate has matched Kalshi's
+credits on the one paid week (KXTOKENUSE-26SEP21: est $9.35 + $4.01,
+credited $9.35 + $4.02); the 9/27 note's "~$9-10/day vs ~$80-100/day" was
+the pre-build projection against the live estimate, not against payouts.
+
+Watch after deploy: selection rows for KXTOKENUSE-26OCT05 move from
+event_top_n to selected over the next refresh or two (the admission clock
+applies); or-fair stand-asides by strike; fills by strike against the
+fair file's mu.

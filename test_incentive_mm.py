@@ -8550,11 +8550,15 @@ class TestOpenRouterFairGate(unittest.TestCase):
                       for o in bot.state.sim_orders.values()
                       if o["ticker"] == self.T)
 
-    def test_allowlisted_capped_and_exact(self):
+    def test_allowlisted_uncapped_and_exact(self):
         self.assertIn("KXTOKENUSE", imm.ALLOW_SERIES)
         self.assertIn("KXTOKENUSEM", imm.ALLOW_SERIES)
-        self.assertEqual(imm.event_top_n_for("KXTOKENUSE"), 3)
-        self.assertEqual(imm.event_top_n_for("KXTOKENUSEM"), 3)
+        # Jack 2026-09-29: "remove the 3-strike cap on OpenRouter" -- every
+        # strike the gate clears quotes (0 = no cap), pinned by exact name
+        self.assertEqual(imm.event_top_n_for("KXTOKENUSE"), 0)
+        self.assertEqual(imm.event_top_n_for("KXTOKENUSEM"), 0)
+        self.assertIn(("=KXTOKENUSE", 0), imm.EVENT_TOP_N)
+        self.assertIn(("=KXTOKENUSEM", 0), imm.EVENT_TOP_N)
         self.assertEqual(imm.event_top_n_for("KXTOKENUSED"), 0)   # exact names only
         self.assertIn("KXTOKENUSE", imm.OR_FAIR_SERIES)
 
