@@ -134,8 +134,34 @@ class BuildEmailTests(unittest.TestCase):
         # Kalshi's valuation vs -225.09 of trading in the table -> -274.91
         self.assertIn("account value moved -500.00", text)
         self.assertIn("-274.91", text)
-        # the settled table is still there, after the movers
-        self.assertLess(html.index("Biggest movers"), html.index("Settled since yesterday, by series"))
+        # the settled table is gone (Jack 2026-09-29); settled events stay in
+        # the movers table, tagged
+        self.assertNotIn("Settled since yesterday", text)
+        self.assertNotIn("Settled since yesterday", html)
+        self.assertNotIn("ALL SETTLED", html)
+
+    def test_day_change_splits_exactly_with_the_replay(self):
+        # trading -225.09 (the table) + reward credits +100.00 + Kalshi's
+        # pricing vs mid = the -500.00 move on Kalshi's valuation
+        p = self._pf()
+        p["no_trade_cash"], p["net_transfers"] = 100.0, 0.0
+        subject, text, html = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("vs yesterday: -500.00  =  trading (at mid) -225.09  +  "
+                      "reward credits +100.00  +  Kalshi's pricing vs mid -374.91", text)
+        self.assertIn("(account value moved -500.00 = this table -225.09  +  "
+                      "reward credits +100.00  +  Kalshi's pricing vs mid -374.91)", text)
+        self.assertIn("trading -225.09", subject)
+        self.assertNotIn("settled", subject)
+        self.assertIn("reward credits", html)
+        # a deposit is split out of the no-trade cash
+        p["net_transfers"] = 250.0
+        _, text, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("reward credits -150.00  +  deposits/withdrawals +250.00  +  "
+                      "Kalshi's pricing vs mid -374.91", text)
+        # transfers unreadable: one lumped line, still exact
+        p["net_transfers"] = None
+        _, text, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("reward credits & deposits +100.00  +  Kalshi's pricing vs mid -374.91", text)
 
     def test_first_run_has_no_residual_line(self):
         _, text, html = pf.build_email(self._pf(first=True), [], chart_ok=False)
@@ -149,6 +175,80 @@ class BuildEmailTests(unittest.TestCase):
         _, text, html = pf.build_email(p, [], chart_ok=False)
         self.assertIn("nothing moved since the prior morning", text)
         self.assertIn("Nothing moved since the prior morning", html)
+
+
+def _fill(ts, tk, book_side, n, yes_px, fee=0.0):
+    return {"ts": ts, "ticker": tk, "book_side": book_side,
+            "count_fp": f"{n:.2f}", "yes_price_dollars": f"{yes_px:.4f}",
+            "fee_cost": f"{fee:.6f}"}
+
+
+class ReplayDayTests(unittest.TestCase):
+    """Jack 2026-09-29: "double confirm that the 'Biggest movers since
+    yesterday, by family' is accurate. i dont trust it". The old event-rollup
+    diff double-counted events traded both ways that then settled (9/29: RT
+    -256.60 shown, -9.02 real). The replay starts from the prior snapshot's
+    positions and marks and books only what happened since."""
+
+    EV = staticmethod(lambda tk: tk.rsplit("-", 1)[0])
+
+    def test_two_way_traded_market_that_settles(self):
+        # 10 YES held at a 30c mark (worth 3.00); sold at 40c (+1.00 vs the
+        # mark), then 20 NO opened at 65c, 5 of them closed at 80c (+0.75),
+        # the last 15 NO pay $1 at a NO settlement (+5.25): +7.00, which is
+        # exactly the cash (4 - 13 + 4 + 15 = 10) minus the 3.00 it was worth
+        start = {"KXRT-HEA-80": (10.0, 3.0)}
+        fills = [_fill(1, "KXRT-HEA-80", "ask", 10, 0.40),
+                 _fill(2, "KXRT-HEA-80", "ask", 20, 0.35),
+                 _fill(3, "KXRT-HEA-80", "bid", 5, 0.20)]
+        setts = [{"ticker": "KXRT-HEA-80", "revenue": 1500, "fee_cost": "0",
+                  "market_result": "no", "settled_time": "1970-01-01T00:00:04Z"}]
+        evs, cash, mism, settled = pf.replay_day(start, fills, setts, {}, self.EV)
+        self.assertAlmostEqual(cash, 10.0)
+        self.assertAlmostEqual(evs["KXRT-HEA"]["realized"], 7.0)
+        self.assertAlmostEqual(evs["KXRT-HEA"]["value_d"], 0.0)
+        self.assertEqual(mism, [])
+        self.assertEqual(settled, {"KXRT-HEA": {"no"}})
+
+    def test_held_position_marks_from_its_prior_value(self):
+        # 5 NO held at cost 2.50 (no mark), now marked at a 40c YES mid:
+        # 5 x 60c = 3.00, so +0.50 unrealized and nothing realized
+        evs, cash, mism, _ = pf.replay_day({"KXA-26-T1": (-5.0, 2.5)}, [], [],
+                                           {"KXA-26-T1": (-5.0, 3.0)}, self.EV)
+        self.assertAlmostEqual(evs["KXA-26"]["realized"], 0.0)
+        self.assertAlmostEqual(evs["KXA-26"]["value_d"], 0.5)
+        self.assertAlmostEqual(cash, 0.0)
+        self.assertEqual(mism, [])
+
+    def test_new_position_with_a_fee(self):
+        # 10 YES bought at 50c with a 7c fee, marked at 55c: +0.50 on the
+        # mark, -0.07 realized fee, cash -5.07
+        evs, cash, _, _ = pf.replay_day(
+            {}, [_fill(1, "KXB-26-T2", "bid", 10, 0.50, fee=0.07)], [],
+            {"KXB-26-T2": (10.0, 5.5)}, self.EV)
+        self.assertAlmostEqual(cash, -5.07)
+        self.assertAlmostEqual(evs["KXB-26"]["realized"], -0.07)
+        self.assertAlmostEqual(evs["KXB-26"]["value_d"], 0.5)
+
+    def test_yes_bid_against_held_no_nets_pairs_for_a_dollar(self):
+        # 20 NO held (basis 5.80); a 20-lot YES bid fill at 71c closes them:
+        # cash +20 x 29c = +5.80 (the live 9/28 balance move), realized 0
+        evs, cash, mism, _ = pf.replay_day(
+            {"KXT-26-IRAN": (-20.0, 5.8)},
+            [_fill(1, "KXT-26-IRAN", "bid", 20, 0.71)], [], {}, self.EV)
+        self.assertAlmostEqual(cash, 5.8)
+        self.assertAlmostEqual(evs["KXT-26"]["realized"], 0.0)
+        self.assertEqual(mism, [])
+
+    def test_disagreement_with_the_positions_endpoint_is_reported(self):
+        _, _, mism, _ = pf.replay_day({"KXC-26-T3": (5.0, 1.0)}, [], [],
+                                      {"KXC-26-T3": (7.0, 1.4)}, self.EV)
+        self.assertEqual(mism, ["KXC-26-T3"])
+
+    def test_side_value(self):
+        self.assertAlmostEqual(pf.side_value(10.0, 0.3, 9.0), 3.0)
+        self.assertAlmostEqual(pf.side_value(-10.0, 0.3, 9.0), 7.0)
+        self.assertAlmostEqual(pf.side_value(-10.0, None, 9.0), 9.0)
 
 
 class _FakeMarginClient:

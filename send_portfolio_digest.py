@@ -5,15 +5,18 @@ send_portfolio_digest.py — 7:00 AM ET whole-account portfolio email.
 One email covering the ENTIRE Kalshi account (every bot + manual trades):
 a chart of daily account value (cash + open positions marked to mid), then
 the biggest movers since the prior morning by family (settled and unrealized
-alike, ranked by the size of the move, realized and mark-to-mid split out),
-then the events that settled, by series.
+alike, ranked by the size of the move, realized and mark-to-mid split out).
+(The "Settled since yesterday, by series" table was removed 2026-09-29.)
 
-Day P&L per event = change in E(event) between morning snapshots, where
-    E = value of open contracts (marked bid/ask mid, else last, else
-        carried/cost) + cumulative realized P&L - cumulative fees
-E comes from Kalshi's positions endpoint (event rollups), so settlements,
-sells, and new fills are all captured; a settlement just moves money from
-the "open value" component into "realized" and the day P&L nets the truth.
+Day P&L per event (since 2026-09-29, replay_day): every fill and settlement
+since the prior morning replayed per market, from the prior snapshot's own
+positions and marks to today's: the cash those produced plus today's value
+minus the prior value, split average-cost into realized (contracts that left
+the book) and unrealized (contracts still held). The day change splits
+exactly into that trading, the cash with no trade or settlement behind it
+(reward credits; deposits apart), and Kalshi's valuation vs our mids. The
+old event-rollup diff (positions endpoint realized + settlement lifetime
+totals) double-counted events traded both ways that then settled.
 
 Account value = cash + Kalshi's valuation of the open event contracts +
 the perpetual-futures account's equity (the margin API, Jack 2026-09-28).
@@ -258,6 +261,145 @@ def estimate_unpaid_rewards(client, now_utc):
         return None
 
 
+def fetch_fills(client, t0: datetime, t1: datetime):
+    """Every account fill in [t0, t1], all shards, oldest first."""
+    out, cursor = [], None
+    for _page in range(200):
+        p = {"min_ts": int(t0.timestamp()), "max_ts": int(t1.timestamp()),
+             "limit": 200}
+        if cursor:
+            p["cursor"] = cursor
+        resp = client.get("/portfolio/fills", params=p)
+        out += resp.get("fills") or []
+        cursor = resp.get("cursor") or None
+        if not cursor:
+            break
+    out.sort(key=lambda f: (int(f.get("ts") or 0), f.get("created_time") or ""))
+    log(f"fills: {len(out)} since the prior morning")
+    return out
+
+
+def fetch_net_transfers(client, t0: datetime, t1: datetime):
+    """Deposits minus withdrawals in (t0, t1] in dollars, or None when either
+    read fails (the day change then lumps them in with credits)."""
+    net = 0.0
+    for path, sign in (("/portfolio/deposits", 1.0), ("/portfolio/withdrawals", -1.0)):
+        try:
+            resp = client.get(path, params={"limit": 200})
+        except Exception as e:
+            log(f"! {path} read failed: {e!r}")
+            return None
+        items = next((v for v in resp.values() if isinstance(v, list)), [])
+        for it in items:
+            ts = it.get("finalized_ts") or it.get("created_ts") or 0
+            status = str(it.get("status") or "").lower()
+            if t0.timestamp() < float(ts) <= t1.timestamp() and \
+                    status not in ("failed", "cancelled", "canceled", "rejected", "pending"):
+                net += sign * _f(it.get("amount_cents")) / 100.0
+    return round(net, 2)
+
+
+def side_value(pos: float, mark, cost: float) -> float:
+    """What `pos` contracts are worth at a YES mark (pos > 0 = YES, < 0 =
+    NO), the way the snapshot values them; no mark = at cost."""
+    if mark is None:
+        return cost
+    m = _f(mark)
+    return pos * m if pos > 0 else -pos * (1.0 - m)
+
+
+def replay_day(start, fills, settlements, end, ev_of):
+    """Each event's P&L since the prior morning, from what actually happened
+    to each market (Jack 2026-09-29: "double confirm that the 'Biggest
+    movers since yesterday, by family' is accurate. i dont trust it").
+
+    start: ticker -> (pos, value) at the prior snapshot's marks (pos > 0 =
+    YES, < 0 = NO); fills: account fills since then, oldest first;
+    settlements: settlement records since then; end: ticker -> (pos, value)
+    now, at today's marks; ev_of: ticker -> event ticker.
+
+    Kalshi's semantics, verified 2026-09-28 by replaying a day of fills to
+    the positions endpoint with zero mismatches: `book_side` is relative to
+    the YES book (bid = +YES at yes_price, ask = -YES at yes_price, opening
+    NO at 1 - yes when no YES is held; the action/side labels are
+    misleading); YES/NO pairs pay $1 at the fill that nets them; a
+    settlement's `revenue` is the NET position's payout only. The old
+    method added lifetime settlement totals on top of the prior snapshot's
+    cumulative realized, so an event traded both ways and then settled
+    counted its earlier realized P&L twice (9/29: Rotten Tomatoes -256.60
+    shown against -9.02 real; -868.60 for the day against -536.28).
+
+    Average cost per market, starting from the prior mark: `realized` = the
+    contracts that left the book (sold, netted or settled) against that
+    basis, `value_d` = what is still held, valued now, against the same
+    basis, so realized + value_d is the day's P&L exactly and sums to
+    cash + value now - value at the prior morning.
+
+    Returns (events, cash, mismatches, settled): events maps event ->
+    {"realized", "value_d"}; cash = the day's trading + settlement cash;
+    mismatches = markets whose replayed position disagrees with `end`;
+    settled = event -> set of market results."""
+    st = {}
+    for tk, (q, v) in start.items():
+        st[tk] = {"q": q, "basis": v, "real": 0.0}
+    cash = 0.0
+    settled = {}
+    stream = [(int(f.get("ts") or 0), 0, f) for f in fills]
+    for s in settlements:
+        t = datetime.fromisoformat((s.get("settled_time") or "").replace("Z", "+00:00"))
+        stream.append((int(t.timestamp()), 1, s))
+    stream.sort(key=lambda x: (x[0], x[1]))
+    for _, kind, x in stream:
+        tk = x.get("ticker") or x.get("market_ticker") or ""
+        d = st.setdefault(tk, {"q": 0.0, "basis": 0.0, "real": 0.0})
+        if kind == 1:
+            pay = _f(x.get("revenue")) / 100.0 - _f(x.get("fee_cost"))
+            d["real"] += pay - d["basis"]
+            cash += pay
+            d["q"] = d["basis"] = 0.0
+            settled.setdefault(ev_of(tk), set()).add(x.get("market_result") or "?")
+            continue
+        n, p, q = _f(x.get("count_fp")), _f(x.get("yes_price_dollars")), d["q"]
+        if x.get("book_side") == "bid":                  # +YES at p
+            k = min(n, -q) if q < 0 else 0.0             # closes NO at 1 - p
+            if k > 0:
+                cb = d["basis"] * k / -q
+                d["real"] += k * (1.0 - p) - cb
+                d["basis"] -= cb
+                cash += k * (1.0 - p)
+                q += k
+            if n - k > 0:
+                d["basis"] += (n - k) * p
+                cash -= (n - k) * p
+                q += n - k
+        else:                                            # -YES at p
+            k = min(n, q) if q > 0 else 0.0              # sells YES held
+            if k > 0:
+                cb = d["basis"] * k / q
+                d["real"] += k * p - cb
+                d["basis"] -= cb
+                cash += k * p
+                q -= k
+            if n - k > 0:                                # opens NO at 1 - p
+                d["basis"] += (n - k) * (1.0 - p)
+                cash -= (n - k) * (1.0 - p)
+                q -= n - k
+        d["q"] = q
+        fee = _f(x.get("fee_cost"))
+        d["real"] -= fee
+        cash -= fee
+    events, mismatches = {}, []
+    for tk in set(st) | set(end):
+        d = st.get(tk) or {"q": 0.0, "basis": 0.0, "real": 0.0}
+        q_end, v_end = end.get(tk, (0.0, 0.0))
+        if abs(d["q"] - q_end) > 0.011:
+            mismatches.append(tk)
+        e = events.setdefault(ev_of(tk), {"realized": 0.0, "value_d": 0.0})
+        e["realized"] += d["real"]
+        e["value_d"] += v_end - d["basis"]
+    return events, round(cash, 2), mismatches, settled
+
+
 def fetch_market_info(client, tickers):
     """ticker -> {"event": ..., "yes_bid": $, "yes_ask": $, "last": $} in
     chunks. Missing tickers just aren't in the result."""
@@ -469,6 +611,7 @@ def build_portfolio(now_utc: datetime):
 
     # Group open value + cost basis by event.
     ev_value, ev_basis, ev_tickers = {}, {}, {}
+    tk_end, tk_event = {}, {}          # per market, for the day replay
     for tk, rec in mkt_pos.items():
         pos, cost = rec["pos"], rec["cost"]
         ev = (mark_info.get(tk) or {}).get("event") or event_from_ticker(tk)
@@ -477,6 +620,8 @@ def build_portfolio(now_utc: datetime):
             val = cost                     # marked at cost: unrealized 0
         else:
             val = pos * mark if pos > 0 else -pos * (1.0 - mark)
+        tk_end[tk] = (pos, val)
+        tk_event[tk] = ev
         ev_value[ev] = ev_value.get(ev, 0.0) + val
         ev_basis[ev] = ev_basis.get(ev, 0.0) + cost
         ev_tickers.setdefault(ev, {})[tk] = {
@@ -542,35 +687,94 @@ def build_portfolio(now_utc: datetime):
                 "marks": {tk: m for tk, m in ((t, marks.get(t)) for t in mkt_pos)
                           if m is not None}}
 
-    # Day-over-day rows.
-    def P(e):
-        return (e["value"] - e.get("basis", 0.0)) + e["realized"] - e["fees"]
+    # Day-over-day rows: replay_day over every fill and settlement since the
+    # prior morning (2026-09-29), starting from the prior snapshot's own
+    # per-market positions and marks and ending at today's. The legacy
+    # event-rollup diff below is kept only for a prior snapshot without
+    # per-market positions (none since 8/14).
+    rows, no_trade_cash, net_transfers, replay_info = [], None, None, None
+    prior_tickers = (prior or {}).get("tickers")
+    if prior and prior_created is not None and prior_tickers:
+        ev_map, start = {}, {}
+        for ev, tks in prior_tickers.items():
+            for tk, r in tks.items():
+                q = _f(r.get("pos"))
+                start[tk] = (q, side_value(q, r.get("mark"), _f(r.get("cost"))))
+                ev_map[tk] = ev
+        win_setts = []
+        for s in settlements:
+            ts = datetime.fromisoformat((s.get("settled_time") or "").replace("Z", "+00:00"))
+            if prior_created < ts <= now_utc:
+                win_setts.append(s)
+                if s.get("event_ticker"):
+                    ev_map.setdefault(s.get("ticker") or "", s["event_ticker"])
+        ev_map.update(tk_event)
+        fills = fetch_fills(client, prior_created, now_utc)
+        evs, trade_cash, mism, settled_now = replay_day(
+            start, fills, win_setts, tk_end,
+            lambda tk: ev_map.get(tk) or event_from_ticker(tk))
+        if mism:
+            log(f"! replay: {len(mism)} market(s) disagree with the positions "
+                f"endpoint: {', '.join(sorted(mism)[:8])}")
+        prior_names = set(prior_tickers) | set(prior_events)
+        prior_val = {}
+        for tk, (_q, v) in start.items():
+            prior_val[ev_map[tk]] = prior_val.get(ev_map[tk], 0.0) + v
+        for ev, e in evs.items():
+            realized, value_d = round(e["realized"], 2), round(e["value_d"], 2)
+            day = round(realized + value_d, 2)
+            if abs(day) < 0.005 and abs(realized) < 0.005 and abs(value_d) < 0.005:
+                continue
+            value_now = round(ev_value.get(ev, 0.0), 2)
+            if ev in settled_now:
+                note = "settled " + "/".join(sorted(settled_now[ev]))
+            elif ev not in prior_names:
+                note = "new"
+            elif abs(value_now) < 0.005 and abs(prior_val.get(ev, 0.0)) >= 0.005:
+                note = "closed"
+            else:
+                note = ""
+            rows.append({"event": ev, "day": day, "realized": realized,
+                         "value_d": value_d, "value_now": value_now, "note": note})
+        no_trade_cash = round(cash - _f(prior.get("cash")) - trade_cash, 2)
+        net_transfers = fetch_net_transfers(client, prior_created, now_utc)
+        check = (sum(r["day"] for r in rows) - trade_cash
+                 - (sum(v for _, v in tk_end.values()) - sum(v for _, v in start.values())))
+        replay_info = {"fills": len(fills), "settlements": len(win_setts),
+                       "mismatches": len(mism), "trade_cash": trade_cash}
+        log(f"replay: {len(fills)} fills, {len(win_setts)} settlements, "
+            f"{len(mism)} mismatches; trading cash {trade_cash:+,.2f}, cash with "
+            f"no trade behind it {no_trade_cash:+,.2f}, transfers "
+            f"{'n/a' if net_transfers is None else f'{net_transfers:+,.2f}'}; "
+            f"rows vs cash+value check {check:+.2f}")
+    else:
+        def P(e):
+            return (e["value"] - e.get("basis", 0.0)) + e["realized"] - e["fees"]
 
-    empty = {"realized": 0.0, "fees": 0.0, "value": 0.0, "basis": 0.0}
-    rows = []
-    for ev in set(events_today) | set(prior_events):
-        t = events_today.get(ev) or empty
-        y = prior_events.get(ev) or empty
-        if ev in unreadable:
-            continue
-        day = P(t) - P(y)
-        d_realized = (t["realized"] - t["fees"]) - (y["realized"] - y["fees"])
-        d_unreal = ((t["value"] - t.get("basis", 0.0))
-                    - (y["value"] - y.get("basis", 0.0)))
-        if abs(day) < 0.005 and abs(d_unreal) < 0.005 and abs(d_realized) < 0.005:
-            continue
-        if ev in settled_events:
-            results = {(s.get("market_result") or "?") for s in settled_events[ev]}
-            note = "settled " + "/".join(sorted(results))
-        elif ev not in prior_events:
-            note = "new"
-        elif abs(t["value"]) < 0.005 and abs(y["value"]) >= 0.005:
-            note = "closed"
-        else:
-            note = ""
-        rows.append({"event": ev, "day": round(day, 2),
-                     "realized": round(d_realized, 2), "value_d": round(d_unreal, 2),
-                     "value_now": t["value"], "note": note})
+        empty = {"realized": 0.0, "fees": 0.0, "value": 0.0, "basis": 0.0}
+        for ev in set(events_today) | set(prior_events):
+            t = events_today.get(ev) or empty
+            y = prior_events.get(ev) or empty
+            if ev in unreadable:
+                continue
+            day = P(t) - P(y)
+            d_realized = (t["realized"] - t["fees"]) - (y["realized"] - y["fees"])
+            d_unreal = ((t["value"] - t.get("basis", 0.0))
+                        - (y["value"] - y.get("basis", 0.0)))
+            if abs(day) < 0.005 and abs(d_unreal) < 0.005 and abs(d_realized) < 0.005:
+                continue
+            if ev in settled_events:
+                results = {(s.get("market_result") or "?") for s in settled_events[ev]}
+                note = "settled " + "/".join(sorted(results))
+            elif ev not in prior_events:
+                note = "new"
+            elif abs(t["value"]) < 0.005 and abs(y["value"]) >= 0.005:
+                note = "closed"
+            else:
+                note = ""
+            rows.append({"event": ev, "day": round(day, 2),
+                         "realized": round(d_realized, 2), "value_d": round(d_unreal, 2),
+                         "value_now": t["value"], "note": note})
     rows.sort(key=lambda r: -r["day"])
 
     log(f"marks: {mark_src} | Kalshi values positions ${kalshi_pv:,.2f} "
@@ -586,6 +790,8 @@ def build_portfolio(now_utc: datetime):
             "rows": rows, "snapshot": snapshot, "prior": prior,
             "mark_src": mark_src, "unreadable": unreadable,
             "n_settlements": len(settlements),
+            "no_trade_cash": no_trade_cash, "net_transfers": net_transfers,
+            "replay": replay_info,
             "first_run": prior is None}
 
 
@@ -706,29 +912,9 @@ def _mover_tag(r) -> str:
 
 def build_email(pf, history, chart_ok: bool):
     today = pf["today"]
-    settled_rows = [r for r in pf["rows"] if r["note"].startswith("settled")]
-
-    # One row per series family (Jack 8/14: per-event was too long). The P&L
-    # shown is the realized settlement result (net of fees) straight from
-    # Kalshi's records — the former Day-P&L column (realized plus the
-    # reversal of our own prior marks) collapsed into it (Jack 8/14: "whats
-    # the diff? if nothing then collapse"); mark drift sits in the summary
-    # line's open-positions bucket instead.
-    groups = {}
-    for r in settled_rows:
-        g = groups.setdefault(family_for(r["event"]),
-                              {"pnl": 0.0, "value_now": 0.0, "rows": []})
-        g["pnl"] += r["realized"]
-        g["value_now"] += r["value_now"]
-        g["rows"].append(r)
-    grows = sorted(groups.items(), key=lambda kv: -kv[1]["pnl"])
-    tot_pnl = round(sum(g["pnl"] for _, g in grows), 2)
-    tot_open = round(sum(g["value_now"] for _, g in grows), 2)
-    n_events = len(settled_rows)
-
-    def top_events(g, n=5):
-        return sorted(g["rows"], key=lambda r: -abs(r["realized"]))[:n]
-
+    # The "Settled since yesterday, by series" table is gone (Jack
+    # 2026-09-29: "remove 'Settled since yesterday, by series'"); settled
+    # events stay in the movers table, tagged "settled".
     first = pf["first_run"]
     prior = pf["prior"] or {}
     # Account value on Kalshi's own valuation (cash + their portfolio_value)
@@ -743,7 +929,6 @@ def build_email(pf, history, chart_ok: bool):
     d_perps = (None if first or perps_eq is None or prior_perps is None
                else round(perps_eq - _f(prior_perps), 2))
     d_equity = None if first else round(d_ek + (d_perps or 0.0), 2)
-    other = None if first else round(d_ek - tot_pnl, 2)
     unpaid = pf.get("unpaid") or None
     unpaid_total = unpaid.get("total") if unpaid else None
     after_txt = ("" if unpaid_total is None else
@@ -767,18 +952,35 @@ def build_email(pf, history, chart_ok: bool):
                    f"market per period, model ${unpaid['raw']:,.2f} x each family's "
                    f"paid/modelled ratio.")
 
-    # Biggest movers, settled AND unrealized. Every event row is in here; the
-    # settled table below is the realized subset of the same rows. What this
-    # table cannot see, and the residual line says so: liquidity credits,
-    # deposits/withdrawals, and Kalshi marking positions at the bid where
-    # these rows use mid.
+    # Biggest movers, settled AND unrealized: every event row, each replayed
+    # from its own fills and settlements since the prior morning
+    # (replay_day). The day change splits exactly into this table's trading,
+    # the cash that came in with no trade or settlement behind it (reward
+    # credits; deposits apart when the transfer reads work), and Kalshi's
+    # valuation of the open positions against the mids these rows use.
     movers, mv_tot, (mv_hidden_n, mv_hidden_net) = family_movers(pf["rows"])
-    mv_residual = None if first else round(d_ek - mv_tot["day"], 2)
     ex_perps = " ex-perpetuals" if perps_eq is not None else ""
+    trading = mv_tot["day"]
+    parts = None                        # [(label, $)] summing to d_ek exactly
+    if not first:
+        ntc = pf.get("no_trade_cash")
+        if ntc is None:                 # no replay (legacy prior snapshot)
+            parts = [("trading (at mid)", trading),
+                     ("credits, deposits & Kalshi's pricing vs mid",
+                      round(d_ek - trading, 2))]
+        else:
+            transfers = pf.get("net_transfers")
+            parts = [("trading (at mid)", trading),
+                     ("reward credits" if transfers is not None
+                      else "reward credits & deposits",
+                      round(ntc - (transfers or 0.0), 2))]
+            if transfers:
+                parts.append(("deposits/withdrawals", transfers))
+            parts.append(("Kalshi's pricing vs mid", round(d_ek - trading - ntc, 2)))
 
     subject = (f"Kalshi portfolio {today} — first baseline" if first else
                f"Kalshi portfolio {today} — day {d_equity:+,.2f}, "
-               f"settled {tot_pnl:+,.2f}")
+               f"trading {trading:+,.2f}")
 
     # ---- plain text ---------------------------------------------------------
     lines = [f"Kalshi portfolio — {today} (7am ET)", ""]
@@ -792,9 +994,8 @@ def build_email(pf, history, chart_ok: bool):
     if first:
         lines.append("First run: baseline saved; day-over-day starts tomorrow.")
     else:
-        lines.append(f"vs yesterday: {d_equity:+,.2f}  =  settled events "
-                     f"{tot_pnl:+,.2f}  +  open positions, credits & deposits "
-                     f"{other:+,.2f}"
+        lines.append(f"vs yesterday: {d_equity:+,.2f}  =  "
+                     + "  +  ".join(f"{k} {v:+,.2f}" for k, v in parts)
                      + ("" if d_perps is None else
                         f"  +  perpetuals {d_perps:+,.2f}"))
     lines.append("")
@@ -817,22 +1018,10 @@ def build_email(pf, history, chart_ok: bool):
                  f"  ({mv_tot['n_events']} events)")
     if not movers:
         lines.append("(nothing moved since the prior morning)")
-    if mv_residual is not None:
-        lines.append(f"(account value{ex_perps} moved {d_ek:+,.2f}; the {mv_residual:+,.2f} "
-                     f"not in this table is credits, deposits/withdrawals, and "
-                     f"Kalshi marking at the bid where this table uses mid)")
-    lines.append("")
-    lines.append(f"Settled since yesterday ({n_events} events):")
-    lines.append(f"{'SERIES':28s} {'P&L':>10s} {'STILL OPEN':>11s}  TOP EVENTS")
-    for name, g in grows:
-        lines.append(f"{name[:28]:28s} {g['pnl']:>+10.2f} {g['value_now']:>11.2f}"
-                     f"  ({len(g['rows'])} events)")
-        for r in top_events(g):
-            lines.append(f"    {r['event']:34s} {r['realized']:>+9.2f}")
-    lines.append(f"{'ALL SETTLED':28s} {tot_pnl:>+10.2f} {tot_open:>11.2f}"
-                 f"  ({n_events} events)")
-    if not settled_rows:
-        lines.append("(no events settled since the prior morning)")
+    if parts is not None:
+        lines.append(f"(account value{ex_perps} moved {d_ek:+,.2f} = this table "
+                     f"{trading:+,.2f}"
+                     + "".join(f"  +  {k} {v:+,.2f}" for k, v in parts[1:]) + ")")
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
@@ -856,9 +1045,9 @@ def build_email(pf, history, chart_ok: bool):
                 f' &nbsp;&middot;&nbsp; rewards earned, not yet paid '
                 f'<b>&asymp; ${unpaid_total:,.2f}</b>')
              + ("" if first else
-                f'<br>day change {_pnl_span(d_equity)} = settled events '
-                f'{_pnl_span(tot_pnl)} &nbsp;+&nbsp; open positions, credits '
-                f'&amp; deposits {_pnl_span(other)}'
+                f'<br>day change {_pnl_span(d_equity)} = '
+                + ' &nbsp;+&nbsp; '.join(f'{k.replace("&", "&amp;")} {_pnl_span(v)}'
+                                         for k, v in parts)
                 + ("" if d_perps is None else
                    f' &nbsp;+&nbsp; perpetuals {_pnl_span(d_perps)}'))
              + '</div>')
@@ -919,50 +1108,18 @@ def build_email(pf, history, chart_ok: bool):
                  f'<td style="{TDL}font-weight:400;color:{C_INK2}">'
                  f'{mv_tot["n_events"]} events</td></tr>')
         h.append('</table>')
-        if mv_residual is not None:
+        if parts is not None:
             h.append(f'<div style="color:{C_MUTED};font-size:12px;margin:4px 0 0">'
-                     f'Account value{ex_perps} moved {_pnl_span(d_ek)}; the '
-                     f'{_pnl_span(mv_residual)} not in this table is liquidity '
-                     f'credits, deposits/withdrawals, and Kalshi marking at the '
-                     f'bid where this table uses mid.</div>')
+                     f'Account value{ex_perps} moved {_pnl_span(d_ek)} = this table '
+                     f'{_pnl_span(trading)}'
+                     + "".join(f' &nbsp;+&nbsp; {k.replace("&", "&amp;")} {_pnl_span(v)}'
+                               for k, v in parts[1:])
+                     + '. Reward credits = cash that came in with no trade or '
+                       'settlement behind it; Kalshi values open positions near '
+                       'what they would sell for, this table at the mid.</div>')
     else:
         h.append(f'<div style="color:{C_INK2}">Nothing moved since the prior '
                  f'morning.</div>')
-
-    h.append(f'<div style="font-size:15px;font-weight:600;margin:12px 0 4px">'
-             f'Settled since yesterday, by series</div>')
-    if settled_rows:
-        h.append('<table style="border-collapse:collapse;font-size:13px">')
-        h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
-                 f'<td style="{TDL}">Series</td><td style="{TD}">P&amp;L $</td>'
-                 f'<td style="{TD}">Still open $</td>'
-                 f'<td style="{TDL}">Events (top 5 by P&amp;L)</td></tr>')
-        for i, (name, g) in enumerate(grows):
-            bg = "#fafafa" if i % 2 else "#fff"
-            evs = "<br>".join(f'{r["event"]}&nbsp; {_pnl_span(r["realized"])}'
-                              for r in top_events(g))
-            more = len(g["rows"]) - 5
-            if more > 0:
-                evs += f'<br><span style="color:{C_MUTED}">+{more} more</span>'
-            n = len(g["rows"])
-            h.append(f'<tr style="background:{bg}">'
-                     f'<td style="{TDL}vertical-align:top">{name}'
-                     f'<div style="color:{C_MUTED};font-size:11px">'
-                     f'{n} event{"s" if n != 1 else ""}</div></td>'
-                     f'<td style="{TD}font-weight:600;vertical-align:top">'
-                     f'{_pnl_span(g["pnl"])}</td>'
-                     f'<td style="{TD}vertical-align:top">{g["value_now"]:,.2f}</td>'
-                     f'<td style="{TDL}font-size:12px">{evs}</td></tr>')
-        h.append(f'<tr style="background:#f0f0f0;font-weight:700">'
-                 f'<td style="{TDL}">ALL SETTLED</td>'
-                 f'<td style="{TD}">{_pnl_span(tot_pnl)}</td>'
-                 f'<td style="{TD}">{tot_open:,.2f}</td>'
-                 f'<td style="{TDL}font-weight:400;color:{C_INK2}">'
-                 f'{n_events} events</td></tr>')
-        h.append('</table>')
-    else:
-        h.append(f'<div style="color:{C_INK2}">No events settled since the '
-                 f'prior morning.</div>')
 
     h.append('</div>')
     return subject, text, "".join(h)
