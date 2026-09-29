@@ -6,6 +6,13 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8873", "--bind", "127.0.0.1"],
       "port": 8873
+    },
+    {
+      "name": "imm-dashboard",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8874", "--bind", "127.0.0.1", "--directory", "run-logs/incentive-mm/dashboard"],
+      "port": 8874,
+      "url": "http://127.0.0.1:8874"
     }
   ]
 }

@@ -1,0 +1,1546 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>IMM Command Center</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f6f3;
+  --surface: #fcfcfb;
+  --surface-2: #efeee9;
+  --hover: #f0efea;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #7d7b75;
+  --grid: #e3e2db;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --accent: #2a78d6;
+  --s-net: #2a78d6;
+  --s-trade: #eb6834;
+  --s-rew: #1baf7a;
+  --s-cred: #4a3aa7;
+  --s-mark: #52514e;
+  --div-pos: #2a78d6;
+  --div-neg: #e34948;
+  --up: #006300;
+  --down: #c0302f;
+  --good: #0ca30c;
+  --warn: #fab219;
+  --serious: #ec835a;
+  --crit: #d03b3b;
+  --chip-crit: rgba(208, 59, 59, 0.10);
+  --chip-warn: rgba(250, 178, 25, 0.16);
+  --chip-good: rgba(12, 163, 12, 0.10);
+  --chip-info: rgba(42, 120, 214, 0.09);
+  --shadow: 0 1px 2px rgba(11, 11, 11, 0.05);
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0f0f0e;
+    --surface: #1a1a19;
+    --surface-2: #232321;
+    --hover: #242422;
+    --ink: #f4f4f1;
+    --ink-2: #c3c2b7;
+    --muted: #8e8c85;
+    --grid: #2c2c2a;
+    --axis: #43433f;
+    --border: rgba(255, 255, 255, 0.10);
+    --accent: #5b9ff0;
+    --s-net: #3987e5;
+    --s-trade: #d95926;
+    --s-rew: #199e70;
+    --s-cred: #9085e9;
+    --s-mark: #c3c2b7;
+    --div-pos: #3987e5;
+    --div-neg: #e66767;
+    --up: #2fbf4a;
+    --down: #f07575;
+    --chip-crit: rgba(230, 103, 103, 0.16);
+    --chip-warn: rgba(250, 178, 25, 0.14);
+    --chip-good: rgba(12, 163, 12, 0.16);
+    --chip-info: rgba(57, 135, 229, 0.16);
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0f0f0e;
+  --surface: #1a1a19;
+  --surface-2: #232321;
+  --hover: #242422;
+  --ink: #f4f4f1;
+  --ink-2: #c3c2b7;
+  --muted: #8e8c85;
+  --grid: #2c2c2a;
+  --axis: #43433f;
+  --border: rgba(255, 255, 255, 0.10);
+  --accent: #5b9ff0;
+  --s-net: #3987e5;
+  --s-trade: #d95926;
+  --s-rew: #199e70;
+  --s-cred: #9085e9;
+  --s-mark: #c3c2b7;
+  --div-pos: #3987e5;
+  --div-neg: #e66767;
+  --up: #2fbf4a;
+  --down: #f07575;
+  --chip-crit: rgba(230, 103, 103, 0.16);
+  --chip-warn: rgba(250, 178, 25, 0.14);
+  --chip-good: rgba(12, 163, 12, 0.16);
+  --chip-info: rgba(57, 135, 229, 0.16);
+  --shadow: none;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 14px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mono { font-family: var(--mono); font-size: 12.5px; letter-spacing: -0.01em; }
+.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.up { color: var(--up); }
+.down { color: var(--down); }
+.muted { color: var(--muted); }
+.ink2 { color: var(--ink-2); }
+.small { font-size: 12px; }
+.nowrap { white-space: nowrap; }
+
+/* ---------- top bar ---------- */
+.bar {
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 30;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.bar-in { max-width: 1480px; margin: 0 auto; padding: 10px 16px 0; display: flex; flex-direction: column; gap: 8px; }
+.bar-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.brand { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.brand h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: -0.01em; white-space: nowrap; }
+.asof { color: var(--ink-2); font-size: 12.5px; white-space: nowrap; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 8px 2px 7px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface); white-space: nowrap;
+}
+.pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
+.pill.bad .dot { background: var(--crit); }
+.pill.warn .dot { background: var(--warn); }
+.grow { flex: 1 1 auto; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.seg button {
+  border: 0; background: transparent; padding: 5px 11px; font-size: 13px; cursor: pointer;
+  color: var(--ink-2); border-right: 1px solid var(--border); white-space: nowrap;
+}
+.seg button:last-child { border-right: 0; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.search {
+  border: 1px solid var(--border); background: var(--surface); border-radius: 8px;
+  padding: 5px 10px; font: 13px var(--sans); color: var(--ink); width: 230px; max-width: 100%;
+}
+.nav { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; margin: 0 -4px; }
+.nav::-webkit-scrollbar { display: none; }
+.nav a {
+  color: var(--ink-2); font-size: 13px; padding: 6px 8px 8px; white-space: nowrap;
+  border-bottom: 2px solid transparent;
+}
+.nav a:hover { color: var(--ink); text-decoration: none; }
+.nav a.on { color: var(--ink); border-bottom-color: var(--ink); }
+.nav .badge {
+  display: inline-block; min-width: 16px; padding: 0 5px; margin-left: 4px; border-radius: 8px;
+  font-size: 11px; font-weight: 600; line-height: 16px; text-align: center;
+  background: var(--surface-2); color: var(--ink-2);
+}
+.nav .badge.crit { background: var(--crit); color: #fff; }
+.nav .badge.warn { background: var(--warn); color: #231b00; }
+
+/* ---------- layout ---------- */
+.wrap { max-width: 1480px; margin: 0 auto; padding-inline: 16px; padding-block: 16px 64px; display: flex; flex-direction: column; gap: 28px; }
+.summary { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 14px; }
+@media (max-width: 900px) { .summary { grid-template-columns: 1fr; } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
+.hero { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
+.hero .lbl { font-size: 12.5px; color: var(--ink-2); }
+.hero .big { font-size: 44px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.05; }
+.hero .sub { font-size: 12.5px; color: var(--ink-2); }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.split .v { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+.split .k { font-size: 12.5px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+.key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.keyline { display: inline-block; width: 14px; height: 2px; border-radius: 1px; flex: none; vertical-align: middle; }
+.split .s { font-size: 12px; color: var(--muted); }
+.chartcard { padding: 12px 14px 8px; min-width: 0; }
+.cardhead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.cardhead h3 { margin: 0; font-size: 13px; font-weight: 500; color: var(--ink-2); }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 1100px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .tiles { grid-template-columns: 1fr; } }
+.tile { padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tile .lbl { font-size: 12.5px; color: var(--ink-2); display: flex; justify-content: space-between; gap: 8px; }
+.tile .val { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+.tile .sub { font-size: 12px; color: var(--ink-2); }
+.tile .sub2 { font-size: 12px; color: var(--muted); }
+.spark { display: block; width: 100%; height: 28px; margin-top: 2px; }
+
+/* ---------- attention ---------- */
+.attn { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  display: inline-flex; align-items: flex-start; gap: 7px; padding: 6px 10px 6px 8px; border-radius: 8px;
+  font-size: 13px; line-height: 1.35; border: 1px solid var(--border); background: var(--surface);
+  cursor: pointer; text-align: left; max-width: 100%;
+}
+.chip:hover { background: var(--hover); }
+.chip svg { width: 14px; height: 14px; flex: none; margin-top: 2px; }
+.chip.crit { background: var(--chip-crit); border-color: transparent; }
+.chip.crit svg { color: var(--crit); }
+.chip.warn { background: var(--chip-warn); border-color: transparent; }
+.chip.warn svg { color: #b87d00; }
+.chip.good { background: var(--chip-good); border-color: transparent; }
+.chip.good svg { color: var(--good); }
+.chip.info svg { color: var(--accent); }
+.tag {
+  display: inline-block; font-size: 11px; font-weight: 500; padding: 0 6px; border-radius: 4px; line-height: 18px;
+  background: var(--surface-2); color: var(--ink-2); white-space: nowrap; vertical-align: 1px;
+}
+.tag.crit { background: var(--chip-crit); color: var(--ink); }
+.tag.warn { background: var(--chip-warn); color: var(--ink); }
+.tag.good { background: var(--chip-good); color: var(--ink); }
+.tag.info { background: var(--chip-info); color: var(--ink); }
+.tag.strong { background: var(--ink); color: var(--bg); }
+
+/* ---------- sections ---------- */
+section { scroll-margin-top: 110px; display: flex; flex-direction: column; gap: 12px; }
+.shead { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid var(--axis); padding-bottom: 6px; }
+.shead h2 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+.shead .note { color: var(--ink-2); font-size: 12.5px; }
+.shead .right { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+.grid2 > * { min-width: 0; }
+@media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
+.sub-h { font-size: 13px; font-weight: 600; margin: 4px 0 6px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.sub-h .note { font-weight: 400; color: var(--ink-2); font-size: 12px; }
+.explain { font-size: 12.5px; color: var(--ink-2); max-width: 110ch; margin: 0; }
+
+/* ---------- tables ---------- */
+.tw { overflow-x: auto; }
+table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.t th {
+  text-align: left; font-weight: 500; font-size: 12px; color: var(--ink-2); padding: 6px 8px;
+  border-bottom: 1px solid var(--axis); white-space: nowrap; user-select: none; vertical-align: bottom;
+}
+table.t th.num { text-align: right; }
+table.t th.sort { cursor: pointer; }
+table.t th.sort:hover { color: var(--ink); }
+table.t th .arr { font-size: 10px; margin-left: 3px; }
+table.t td { padding: 5px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+table.t tr.click { cursor: pointer; }
+table.t tbody tr:hover td { background: var(--hover); }
+table.t tr.l0 td { font-weight: 500; }
+table.t tr.l1 td:first-child { padding-left: 26px; }
+table.t tr.l2 td:first-child { padding-left: 46px; }
+table.t tr.l2 td { font-size: 12.5px; }
+table.t tr.tot td { font-weight: 600; border-top: 1px solid var(--axis); border-bottom: 0; }
+.car { display: inline-block; width: 12px; color: var(--muted); font-size: 10px; transition: transform .12s; }
+.car.open { transform: rotate(90deg); }
+.cell-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.cell-main .t2 { color: var(--muted); font-size: 11.5px; }
+.more { border: 1px solid var(--border); background: var(--surface); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12.5px; color: var(--ink-2); }
+.more:hover { color: var(--ink); }
+.empty { color: var(--muted); font-size: 13px; padding: 10px 2px; }
+.bar-inline { display: inline-block; height: 8px; border-radius: 2px; vertical-align: middle; }
+
+/* ---------- charts ---------- */
+svg.ch { display: block; width: 100%; overflow: visible; }
+svg.ch text { fill: var(--muted); font: 11px var(--sans); font-variant-numeric: tabular-nums; }
+svg.ch .grid { stroke: var(--grid); stroke-width: 1; }
+svg.ch .zero { stroke: var(--axis); stroke-width: 1; }
+svg.ch .cross { stroke: var(--ink-2); stroke-width: 1; }
+.tip {
+  position: fixed; z-index: 60; pointer-events: none; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12.5px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16); max-width: 340px;
+}
+.tip .th { color: var(--ink-2); font-size: 12px; margin-bottom: 4px; }
+.tip .tr { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.tip .tr b { font-variant-numeric: tabular-nums; font-weight: 600; }
+.tip .tr span { color: var(--ink-2); display: inline-flex; align-items: center; gap: 6px; }
+
+/* ---------- meters ---------- */
+.meter { display: flex; flex-direction: column; gap: 5px; }
+.meter .mtrack { height: 8px; border-radius: 4px; background: var(--surface-2); position: relative; overflow: hidden; }
+.meter .mfill { position: absolute; top: 0; bottom: 0; right: 0; border-radius: 4px; }
+.meter .mlab { display: flex; justify-content: space-between; font-size: 12.5px; gap: 8px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; }
+.kv dt { color: var(--ink-2); }
+.kv dd { margin: 0; }
+.statgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; }
+.stat { padding: 10px 12px; }
+.stat .k { font-size: 12px; color: var(--ink-2); }
+.stat .v { font-size: 17px; font-weight: 600; }
+.stat .s { font-size: 12px; color: var(--muted); }
+
+/* ---------- drawer ---------- */
+.scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.28); z-index: 40; }
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(640px, 100%); z-index: 50; background: var(--bg);
+  border-left: 1px solid var(--border); box-shadow: -10px 0 30px rgba(0, 0, 0, 0.18); overflow-y: auto;
+  padding: calc(14px + env(safe-area-inset-top, 0px)) 18px calc(24px + env(safe-area-inset-bottom, 0px));
+  display: flex; flex-direction: column; gap: 14px;
+}
+.drawer .dh { display: flex; align-items: flex-start; gap: 10px; }
+.drawer .dh h3 { margin: 0; font-size: 16px; word-break: break-all; }
+.drawer .x { margin-left: auto; border: 1px solid var(--border); background: var(--surface); border-radius: 6px; cursor: pointer; padding: 2px 9px; font-size: 16px; }
+.mini-title { font-size: 12px; color: var(--ink-2); margin: 2px 0; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+details.cfg summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+details.cfg pre { font: 12px var(--mono); white-space: pre-wrap; word-break: break-all; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+footer { color: var(--muted); font-size: 12px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+@media (max-width: 640px) {
+  .hero .big { font-size: 36px; }
+  .search { width: 100%; }
+  section { scroll-margin-top: 150px; }
+}
+</style>
+
+<header class="bar">
+  <div class="bar-in">
+    <div class="bar-row">
+      <div class="brand"><h1>IMM Command Center</h1><span id="live" class="pill"><span class="dot"></span><span id="liveTxt">Live</span></span></div>
+      <span id="asof" class="asof"></span>
+      <span class="grow"></span>
+      <div class="seg" id="winSeg" role="group" aria-label="Time window"></div>
+      <input id="q" class="search" type="search" placeholder="Filter ticker, event, family" aria-label="Filter">
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#drivers">Drivers</a>
+      <a href="#movers">Movers</a>
+      <a href="#quoting">Quoting</a>
+      <a href="#opps">Opportunities<span class="badge" id="bOpp" hidden></span></a>
+      <a href="#risk">Risk &amp; halts<span class="badge" id="bRisk" hidden></span></a>
+      <a href="#fills">Fills</a>
+      <a href="#history">History</a>
+      <a href="#health">Health<span class="badge" id="bHealth" hidden></span></a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap" id="app">
+  <div class="summary">
+    <div class="card hero" id="hero"></div>
+    <div class="card chartcard">
+      <div class="cardhead"><h3 id="curveTitle">Cumulative, this window</h3><div class="legend" id="curveLegend"></div></div>
+      <div id="curve"></div>
+    </div>
+  </div>
+  <div class="tiles" id="tiles"></div>
+  <div class="attn" id="attn" aria-label="Needs attention"></div>
+
+  <section id="drivers">
+    <div class="shead"><h2>What drove the window</h2><span class="note">Family, then event, then market. Click a row to open it; click a market for its detail.</span>
+      <div class="right"><div class="seg" id="drvSort" role="group" aria-label="Sort drivers"></div></div></div>
+    <div class="grid2" style="grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr);">
+      <div class="tw" id="drvTable"></div>
+      <div>
+        <div class="sub-h">Rewards against trading, by family<span class="note">bars from zero; the tick is net</span></div>
+        <div class="legend" id="famLegend"></div>
+        <div id="famChart"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="movers">
+    <div class="shead"><h2>Movers</h2><span class="note">Markets whose mark-to-market moved the most in the window, and where the rewards came from.</span></div>
+    <div class="grid2">
+      <div><div class="sub-h">Largest trading P&amp;L moves<span class="note">realized + change in open marks</span></div><div class="tw" id="movPnl"></div></div>
+      <div><div class="sub-h">Top reward earners<span class="note">modeled accrual, with the trading P&amp;L beside it</span></div><div class="tw" id="movRew"></div></div>
+    </div>
+  </section>
+
+  <section id="quoting">
+    <div class="shead"><h2>Quoting now</h2><span class="note" id="quoteNote"></span></div>
+    <div class="tw" id="covTable"></div>
+    <div class="grid2">
+      <div><div class="sub-h">Quoted events<span class="note">sorted by modeled $/day now</span></div><div class="tw" id="qEvents"></div></div>
+      <div><div class="sub-h">Why candidates are not quoted<span class="note" id="decNote"></span></div><div class="tw" id="decTable"></div></div>
+    </div>
+  </section>
+
+  <section id="opps">
+    <div class="shead"><h2>Opportunities</h2><span class="note" id="oppNote"></span>
+      <div class="right"><div class="seg" id="newSeg" role="group" aria-label="New events window"></div></div></div>
+    <div><div class="sub-h">New events launched<span class="note" id="newNote"></span></div><div class="tw" id="newTable"></div></div>
+    <div class="grid2">
+      <div><div class="sub-h">Best unquoted paying events<span class="note" id="gapNote"></span></div><div class="tw" id="gapTable"></div></div>
+      <div><div class="sub-h">Pick-off windows<span class="note">Kalshi's event start later than the real one</span></div><div class="tw" id="pickTable"></div></div>
+    </div>
+  </section>
+
+  <section id="risk">
+    <div class="shead"><h2>Risk &amp; halts</h2><span class="note">What is stood down, what is close to a limit, and where the inventory sits.</span></div>
+    <div class="grid2">
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div id="meters" class="card" style="padding:12px 14px;display:flex;flex-direction:column;gap:12px"></div>
+        <div><div class="sub-h">Active halts<span class="note">toxic-flow side and event halts, mention-gate holds, manual halt</span></div><div class="tw" id="haltTable"></div></div>
+        <div><div class="sub-h">Toxic-flow activity<span class="note" id="toxNote"></span></div><div class="tw" id="toxTable"></div></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div><div class="sub-h">Guards holding managed markets<span class="note">a held market rests no orders this cycle</span></div><div id="guardSummary" class="attn"></div><div class="tw" id="guardTable"></div></div>
+        <div><div class="sub-h">Inventory concentration<span class="note">open positions by event, marked to mid</span></div><div class="tw" id="invTable"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="fills">
+    <div class="shead"><h2>Fills &amp; adverse selection</h2><span class="note">Mark-out = the mid 30 minutes after the fill against the fill price, in dollars (negative = picked off). Pads and taker fills excluded.</span></div>
+    <div class="grid2" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);">
+      <div><div class="sub-h">By family</div><div class="tw" id="fillFam"></div></div>
+      <div><div class="sub-h">Fills in the window<span class="note">newest first</span></div><div class="tw" id="fillList"></div></div>
+    </div>
+  </section>
+
+  <section id="history">
+    <div class="shead"><h2>Daily history</h2><span class="note" id="histNote"></span></div>
+    <div class="grid2">
+      <div class="card chartcard"><div class="cardhead"><h3>Net per ET day</h3><div class="legend" id="histLegend1"></div></div><div id="histNet"></div></div>
+      <div class="card chartcard"><div class="cardhead"><h3>Modeled rewards and credits</h3><div class="legend" id="histLegend2"></div></div><div id="histRew"></div></div>
+    </div>
+    <div class="tw" id="histTable"></div>
+  </section>
+
+  <section id="health">
+    <div class="shead"><h2>Bot health</h2><span class="note">Heartbeat, cycle cadence, restarts, data freshness and the morning email lineup.</span></div>
+    <div class="statgrid" id="healthStats"></div>
+    <div class="grid2">
+      <div><div class="sub-h">Morning lineup (today)</div><div class="tw" id="lineup"></div></div>
+      <div><div class="sub-h">Runs today<span class="note">each code deploy or crash restarts the bot</span></div><div class="tw" id="runs"></div></div>
+    </div>
+    <div class="grid2">
+      <div><div class="sub-h">Data freshness</div><div class="tw" id="sinks"></div></div>
+      <div><div class="sub-h">How the numbers are built</div>
+        <p class="explain"><b>Modeled rewards</b> integrate the bot's own reward estimate (est_frac × pool $/day) over every gap between full cycles, capped at 15 minutes, from the cycle logs. It is a model and sits before Kalshi's $1-per-market-per-period floor; credits land 1–2 days after a period ends and show up in the history as <i>credited</i>.</p>
+        <p class="explain"><b>Trading P&amp;L</b> is mark-to-market on the bot's own book: realized in the window (closing fills and settlements) plus the change in open positions valued at mid, from the 5-minute position snapshots. Checked against an independent cash-flow rebuild (fills + settlements + marks) to within about 2%. A market handed to a manual trade is treated as transferred at its last mark.</p>
+        <p class="explain"><b>Net</b> is the two added together. Days are ET calendar days; the bot's own halt counter rolls at 5am CT and is shown under Risk.</p>
+      </div>
+    </div>
+    <details class="cfg"><summary>Launcher configuration ($ProbeEnv)</summary><pre id="cfg"></pre></details>
+    <footer id="foot"></footer>
+  </section>
+</main>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Market detail"></aside>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+"use strict";
+const D = /*__IMM_DATA__*/null;
+
+/* ======================= utilities ======================= */
+const $ = (id) => document.getElementById(id);
+const MINUS = "−";
+const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ESC[c]); }
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+function num(v) { return (typeof v === "number" && isFinite(v)) ? v : 0; }
+function fmtUSD(v, o) {
+  o = o || {};
+  if (v == null || !isFinite(v)) return "—";
+  const a = Math.abs(v);
+  let dp = o.dp != null ? o.dp : (a >= 100 ? 0 : 2);
+  let s;
+  if (o.compact && a >= 10000) s = "$" + (a / 1000).toFixed(a >= 100000 ? 0 : 1) + "k";
+  else s = "$" + a.toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
+  if (v < 0 && Math.round(a * Math.pow(10, dp)) !== 0) return MINUS + s;
+  if (o.sign && v > 0 && Math.round(a * Math.pow(10, dp)) !== 0) return "+" + s;
+  return s;
+}
+function fmtNum(v, dp) {
+  if (v == null || !isFinite(v)) return "—";
+  dp = dp == null ? 0 : dp;
+  const s = Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
+  return (v < 0 && Math.round(Math.abs(v) * Math.pow(10, dp)) !== 0 ? MINUS : "") + s;
+}
+function fmtC(v) { if (v == null || !isFinite(v)) return "—"; const r = Math.round(v * 10) / 10; const a = Math.abs(r); return (r < 0 ? MINUS : "") + (a % 1 === 0 ? a.toFixed(0) : a.toFixed(1)) + "¢"; }
+function fmtPct(v, dp) { if (v == null || !isFinite(v)) return "—"; return (v * 100).toFixed(dp == null ? 1 : dp) + "%"; }
+function cls(v, eps) { eps = eps == null ? 0.005 : eps; return v > eps ? "up" : (v < -eps ? "down" : ""); }
+function money(v, o) { return '<span class="' + cls(v) + '">' + fmtUSD(v, Object.assign({ sign: true }, o || {})) + "</span>"; }
+const ETF = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+const ETD = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", month: "short", day: "numeric" });
+const ETDW = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", month: "short", day: "numeric" });
+const ETH = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric" });
+function tET(ts) { return ts ? ETF.format(new Date(ts * 1000)) : "—"; }
+function dET(ts) { return ts ? ETD.format(new Date(ts * 1000)) : "—"; }
+function dtET(ts) {
+  if (!ts) return "—";
+  const now = Date.now() / 1000;
+  const sameDay = ETD.format(new Date(ts * 1000)) === ETD.format(new Date(now * 1000));
+  return (sameDay ? "" : dET(ts) + " ") + tET(ts);
+}
+function ago(ts) {
+  if (!ts) return "—";
+  const s = Date.now() / 1000 - ts;
+  if (s < 0) return "in " + dur(-s);
+  return dur(s) + " ago";
+}
+function dur(s) {
+  s = Math.abs(s);
+  if (s < 90) return Math.round(s) + "s";
+  if (s < 5400) return Math.round(s / 60) + " min";
+  if (s < 172800) return (s / 3600).toFixed(s < 36000 ? 1 : 0) + " h";
+  return Math.round(s / 86400) + " d";
+}
+function day(iso) { const d = new Date(iso + "T12:00:00Z"); return ETDW.format(d); }
+const ICON = {
+  crit: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M5.2 1h5.6L15 5.2v5.6L10.8 15H5.2L1 10.8V5.2z"/><path fill="#fff" d="M7.2 4h1.6v5H7.2zM7.2 10.3h1.6v1.6H7.2z"/></svg>',
+  warn: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1.2 15.4 14H.6z"/><path fill="#231b00" d="M7.25 5.5h1.5v4.3h-1.5zM7.25 10.9h1.5v1.5h-1.5z"/></svg>',
+  good: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="currentColor"/><path d="M4.6 8.2 7 10.5l4.4-4.6" fill="none" stroke="#fff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  info: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="currentColor"/><path fill="#fff" d="M7.25 7h1.5v5h-1.5zM7.25 4h1.5v1.5h-1.5z"/></svg>'
+};
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+/* ======================= state ======================= */
+const WKEYS = ["today", "yesterday", "24h", "7d"];
+let W = store("imm.win") || "today";
+if (WKEYS.indexOf(W) < 0) W = "today";
+let Q = "";
+let drvSort = store("imm.drvSort") || "net";
+let newWin = store("imm.newWin") || "72";
+const openRows = new Set((() => { try { return JSON.parse(sessionStorage.getItem("imm.open") || "[]"); } catch (e) { return []; } })());
+function saveOpen() { try { sessionStorage.setItem("imm.open", JSON.stringify([...openRows])); } catch (e) { /* private mode */ } }
+function matchQ() {
+  if (!Q) return true;
+  for (let i = 0; i < arguments.length; i++) { const s = arguments[i]; if (s && String(s).toLowerCase().indexOf(Q) >= 0) return true; }
+  return false;
+}
+function win() { return D.windows[W]; }
+function winDays() { const w = win(); return Math.max((w.end - w.start) / 86400, 1 / 24); }
+
+/* ======================= aggregation ======================= */
+const SUM_KEYS = ["rew", "pnl", "net", "real", "du", "fills", "cts", "usd", "mk", "mk_n", "mk_cts", "rest"];
+function blank() {
+  return { rew: 0, pnl: 0, net: 0, real: 0, du: 0, fills: 0, cts: 0, usd: 0, mk: 0, mk_n: 0, mk_cts: 0, rest: 0,
+    q2: 0, q1: 0, held: 0, sel: 0, restNow: 0, estNow: 0, poolNow: 0, u: 0, risk: 0, npos: 0, cred: 0, cred7: 0, n: 0 };
+}
+function addM(acc, m, key) {
+  const w = m.w[key];
+  if (w) for (const k of SUM_KEYS) acc[k] += num(w[k]);
+  const c = m.cur;
+  if (c) {
+    if (c.q === 2) acc.q2++; else if (c.q === 1) acc.q1++;
+    acc.restNow += num(c.usd); acc.estNow += num(c.est_day); acc.poolNow += num(c.pool_day);
+  }
+  if (m.sel && (!c || !c.q) && (m.guard || m.halt)) acc.held++;
+  if (m.sel) acc.sel++;
+  if (m.pos) { acc.u += num(m.u); acc.risk += num(m.risk); acc.npos++; }
+  acc.n++;
+}
+let AGG = null;
+function aggregate() {
+  const fams = {}, tot = blank();
+  const evSeen = {};
+  for (const t in D.markets) {
+    const m = D.markets[t];
+    const f = fams[m.fam] || (fams[m.fam] = Object.assign(blank(), { name: m.fam, events: {} }));
+    const e = f.events[m.ev] || (f.events[m.ev] = Object.assign(blank(), { name: m.ev, grp: m.grp, mkts: [] }));
+    addM(f, m, W); addM(e, m, W); addM(tot, m, W);
+    e.mkts.push(t);
+    if (!evSeen[m.ev]) {
+      evSeen[m.ev] = 1;
+      const ev = D.events[m.ev] || {};
+      e.cred = num(ev.cred); e.cred7 = num(ev.cred7);
+      f.cred7 += num(ev.cred7); tot.cred7 += num(ev.cred7);
+    }
+  }
+  AGG = { fams, tot };
+  return AGG;
+}
+function mw(m) { return m.w[W] || {}; }
+
+/* ======================= charts ======================= */
+function niceStep(span, n) {
+  const raw = span / Math.max(n, 1), mag = Math.pow(10, Math.floor(Math.log10(raw || 1))), r = raw / mag;
+  return (r <= 1 ? 1 : r <= 2 ? 2 : r <= 2.5 ? 2.5 : r <= 5 ? 5 : 10) * mag;
+}
+function niceDomain(lo, hi, n) {
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const st = niceStep(hi - lo, n);
+  const a = Math.floor(lo / st) * st, b = Math.ceil(hi / st) * st, ticks = [];
+  for (let v = a; v <= b + st / 2; v += st) ticks.push(Math.round(v / st) * st);
+  return { lo: a, hi: b, ticks };
+}
+function svgEl(tag, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+const tip = $("tip");
+function showTip(ev, head, rows) {
+  tip.textContent = "";
+  if (head) { const h = document.createElement("div"); h.className = "th"; h.textContent = head; tip.appendChild(h); }
+  for (const r of rows) {
+    const d = document.createElement("div"); d.className = "tr";
+    const s = document.createElement("span");
+    if (r.color) { const k = document.createElement("i"); k.className = r.line ? "keyline" : "key"; k.style.background = r.color; s.appendChild(k); }
+    s.appendChild(document.createTextNode(r.name));
+    const b = document.createElement("b"); b.textContent = r.value;
+    if (r.cls) b.className = r.cls;
+    d.appendChild(s); d.appendChild(b); tip.appendChild(d);
+  }
+  tip.hidden = false;
+  const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = ev.clientX + pad, y = ev.clientY + pad;
+  if (x + w > innerWidth - 8) x = ev.clientX - w - pad;
+  if (y + h > innerHeight - 8) y = ev.clientY - h - pad;
+  tip.style.left = Math.max(8, x) + "px"; tip.style.top = Math.max(8, y) + "px";
+}
+function hideTip() { tip.hidden = true; }
+
+/* line chart: series [{name, color, pts:[[x,y],...]}] sharing x */
+function lineChart(host, series, o) {
+  o = o || {};
+  host.textContent = "";
+  const W0 = Math.max(host.clientWidth || 600, 280), H = o.height || 230;
+  const m = { l: 56, r: 12, t: 10, b: 24 };
+  const xs = series[0] ? series[0].pts.map((p) => p[0]) : [];
+  if (!xs.length) { host.innerHTML = '<div class="empty">No data in this window.</div>'; return; }
+  let lo = 0, hi = 0;
+  for (const s of series) for (const p of s.pts) { if (p[1] == null) continue; lo = Math.min(lo, p[1]); hi = Math.max(hi, p[1]); }
+  const dom = niceDomain(lo, hi, 5);
+  const x0 = o.x0 != null ? o.x0 : xs[0], x1 = o.x1 != null ? o.x1 : xs[xs.length - 1];
+  const X = (v) => m.l + (W0 - m.l - m.r) * (x1 === x0 ? 0.5 : (v - x0) / (x1 - x0));
+  const Y = (v) => m.t + (H - m.t - m.b) * (1 - (v - dom.lo) / (dom.hi - dom.lo));
+  const svg = svgEl("svg", { class: "ch", viewBox: "0 0 " + W0 + " " + H, height: H, role: "img" });
+  if (o.label) svg.setAttribute("aria-label", o.label);
+  for (const tv of dom.ticks) {
+    svg.appendChild(svgEl("line", { x1: m.l, x2: W0 - m.r, y1: Y(tv), y2: Y(tv), class: tv === 0 ? "zero" : "grid" }));
+    const tx = svgEl("text", { x: m.l - 8, y: Y(tv) + 4, "text-anchor": "end" });
+    tx.textContent = (o.yfmt || ((v) => fmtUSD(v, { dp: 0 })))(tv); svg.appendChild(tx);
+  }
+  const xt = o.xticks ? o.xticks(x0, x1) : [];
+  for (const t of xt) {
+    const px = X(t.v); if (px < m.l - 1 || px > W0 - m.r + 1) continue;
+    const tx = svgEl("text", { x: px, y: H - 6, "text-anchor": "middle" }); tx.textContent = t.label; svg.appendChild(tx);
+  }
+  for (const s of series) {
+    let d = "", pen = false;
+    for (const p of s.pts) {
+      if (p[1] == null) { pen = false; continue; }
+      d += (pen ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1); pen = true;
+    }
+    svg.appendChild(svgEl("path", { d, fill: "none", stroke: s.color, "stroke-width": s.width || 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const last = [...s.pts].reverse().find((p) => p[1] != null);
+    if (last) svg.appendChild(svgEl("circle", { cx: X(last[0]), cy: Y(last[1]), r: 4, fill: s.color, stroke: css("--surface"), "stroke-width": 2 }));
+  }
+  const cross = svgEl("line", { y1: m.t, y2: H - m.b, class: "cross", visibility: "hidden" });
+  svg.appendChild(cross);
+  const dots = series.map((s) => { const c = svgEl("circle", { r: 4, fill: s.color, stroke: css("--surface"), "stroke-width": 2, visibility: "hidden" }); svg.appendChild(c); return c; });
+  const hit = svgEl("rect", { x: m.l, y: 0, width: W0 - m.l - m.r, height: H, fill: "transparent" });
+  svg.appendChild(hit);
+  function at(evt) {
+    const r = svg.getBoundingClientRect(), px = (evt.clientX - r.left) * (W0 / r.width);
+    const xv = x0 + (px - m.l) / (W0 - m.l - m.r) * (x1 - x0);
+    let bi = 0, bd = Infinity;
+    xs.forEach((v, i) => { const dd = Math.abs(v - xv); if (dd < bd) { bd = dd; bi = i; } });
+    cross.setAttribute("x1", X(xs[bi])); cross.setAttribute("x2", X(xs[bi])); cross.setAttribute("visibility", "visible");
+    const rows = [];
+    series.forEach((s, k) => {
+      const p = s.pts[bi];
+      if (!p || p[1] == null) { dots[k].setAttribute("visibility", "hidden"); return; }
+      dots[k].setAttribute("cx", X(p[0])); dots[k].setAttribute("cy", Y(p[1])); dots[k].setAttribute("visibility", "visible");
+      rows.push({ name: s.name, color: s.color, line: true, value: (s.fmt || o.vfmt || ((v) => fmtUSD(v, { sign: true })))(p[1]) });
+    });
+    showTip(evt, (o.xfmt || dtET)(xs[bi]), rows);
+  }
+  hit.addEventListener("pointermove", at);
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); dots.forEach((c) => c.setAttribute("visibility", "hidden")); hideTip(); });
+  host.appendChild(svg);
+}
+function timeTicks(x0, x1) {
+  const span = x1 - x0, out = [];
+  const step = span <= 30 * 3600 ? (span <= 14 * 3600 ? 2 * 3600 : 4 * 3600) : 86400;
+  // align to ET boundaries via the ET offset of x0
+  const off = (new Date(x0 * 1000).toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit" }) | 0);
+  let t = x0 - ((off % (step / 3600)) * 3600) - (x0 % 3600);
+  while (t <= x1) {
+    if (t >= x0) out.push({ v: t, label: step >= 86400 ? ETD.format(new Date(t * 1000)) : ETH.format(new Date(t * 1000)).replace(" ", " ") });
+    t += step;
+  }
+  return out;
+}
+/* sparkline (no axes) */
+function spark(values, color, highlightLast) {
+  const W0 = 200, H = 28, pts = values.filter((v) => v != null);
+  if (pts.length < 2) return "";
+  let lo = Math.min(0, ...pts), hi = Math.max(0, ...pts); if (hi === lo) hi = lo + 1;
+  const X = (i) => 2 + (W0 - 4) * i / (values.length - 1), Y = (v) => 2 + (H - 4) * (1 - (v - lo) / (hi - lo));
+  let d = "", pen = false;
+  values.forEach((v, i) => { if (v == null) { pen = false; return; } d += (pen ? "L" : "M") + X(i).toFixed(1) + " " + Y(v).toFixed(1); pen = true; });
+  const li = values.length - 1, lv = values[li];
+  return '<svg class="spark" viewBox="0 0 ' + W0 + " " + H + '" preserveAspectRatio="none" aria-hidden="true">' +
+    '<line x1="0" x2="' + W0 + '" y1="' + Y(0).toFixed(1) + '" y2="' + Y(0).toFixed(1) + '" stroke="' + css("--grid") + '" stroke-width="1" vector-effect="non-scaling-stroke"/>' +
+    '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.6" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>' +
+    (highlightLast && lv != null ? '<circle cx="' + X(li).toFixed(1) + '" cy="' + Y(lv).toFixed(1) + '" r="2.6" fill="' + color + '"/>' : "") + "</svg>";
+}
+/* columns from a zero baseline; rows [{x:label, v, tip:[...rows], color?}] */
+function columns(host, rows, o) {
+  o = o || {};
+  host.textContent = "";
+  if (!rows.length) { host.innerHTML = '<div class="empty">No history yet.</div>'; return; }
+  const W0 = Math.max(host.clientWidth || 600, 280), H = o.height || 210, m = { l: 56, r: 8, t: 10, b: 24 };
+  let lo = 0, hi = 0;
+  rows.forEach((r) => { (r.vals || [r.v]).forEach((v) => { if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); } }); });
+  const dom = niceDomain(lo, hi, 4);
+  const Y = (v) => m.t + (H - m.t - m.b) * (1 - (v - dom.lo) / (dom.hi - dom.lo));
+  const band = (W0 - m.l - m.r) / rows.length;
+  const nser = o.series ? o.series.length : 1;
+  const bw = Math.min(24, Math.max(3, (band - 4) / nser - 2));
+  const svg = svgEl("svg", { class: "ch", viewBox: "0 0 " + W0 + " " + H, height: H, role: "img" });
+  if (o.label) svg.setAttribute("aria-label", o.label);
+  for (const tv of dom.ticks) {
+    svg.appendChild(svgEl("line", { x1: m.l, x2: W0 - m.r, y1: Y(tv), y2: Y(tv), class: tv === 0 ? "zero" : "grid" }));
+    const tx = svgEl("text", { x: m.l - 8, y: Y(tv) + 4, "text-anchor": "end" }); tx.textContent = fmtUSD(tv, { dp: 0 }); svg.appendChild(tx);
+  }
+  const every = Math.max(1, Math.ceil(rows.length / Math.floor((W0 - m.l) / 58)));
+  rows.forEach((r, i) => {
+    const cx = m.l + band * (i + 0.5);
+    const vals = r.vals || [r.v];
+    vals.forEach((v, k) => {
+      if (v == null) return;
+      const x = cx - (nser * (bw + 2) - 2) / 2 + k * (bw + 2);
+      const y0 = Y(0), y1 = Y(v), top = Math.min(y0, y1), h = Math.max(1, Math.abs(y1 - y0));
+      const rr = Math.min(4, bw / 2, h);
+      const color = o.series ? o.series[k].color : (v >= 0 ? css("--div-pos") : css("--div-neg"));
+      let d;
+      if (v >= 0) d = "M" + x + " " + (top + h) + "V" + (top + rr) + "Q" + x + " " + top + " " + (x + rr) + " " + top + "H" + (x + bw - rr) + "Q" + (x + bw) + " " + top + " " + (x + bw) + " " + (top + rr) + "V" + (top + h) + "Z";
+      else d = "M" + x + " " + top + "V" + (top + h - rr) + "Q" + x + " " + (top + h) + " " + (x + rr) + " " + (top + h) + "H" + (x + bw - rr) + "Q" + (x + bw) + " " + (top + h) + " " + (x + bw) + " " + (top + h - rr) + "V" + top + "Z";
+      svg.appendChild(svgEl("path", { d, fill: color }));
+    });
+    if (i % every === 0) { const tx = svgEl("text", { x: cx, y: H - 6, "text-anchor": "middle" }); tx.textContent = r.x; svg.appendChild(tx); }
+    const hit = svgEl("rect", { x: cx - band / 2, y: 0, width: band, height: H, fill: "transparent" });
+    hit.addEventListener("pointermove", (e) => showTip(e, r.head || r.x, r.tip || []));
+    hit.addEventListener("pointerleave", hideTip);
+    svg.appendChild(hit);
+  });
+  host.appendChild(svg);
+}
+
+/* ======================= tables ======================= */
+/* cols: [{k, label, num, fmt(row)->html, sort(row)->value, title}] */
+function table(host, cols, rows, o) {
+  o = o || {};
+  const id = host.id;
+  const st = TSTATE[id] || (TSTATE[id] = { sk: o.sortKey || null, dir: o.dir || -1, limit: o.limit || 25 });
+  let rs = rows;
+  if (!st.sk && o.presort) rs = rows.slice().sort(o.presort);
+  if (st.sk) {
+    const c = cols.find((c) => c.k === st.sk);
+    if (c) {
+      const key = c.sort || ((r) => r[c.k]);
+      rs = rows.slice().sort((a, b) => {
+        const va = key(a), vb = key(b);
+        if (va == null && vb == null) return 0; if (va == null) return 1; if (vb == null) return -1;
+        return (va > vb ? 1 : va < vb ? -1 : 0) * st.dir;
+      });
+    }
+  }
+  const total = rs.length;
+  const shown = rs.slice(0, st.limit);
+  let h = '<table class="t"><thead><tr>';
+  for (const c of cols) {
+    const sortable = c.nosort ? "" : " sort";
+    const arr = st.sk === c.k ? '<span class="arr">' + (st.dir < 0 ? "▼" : "▲") + "</span>" : "";
+    h += '<th class="' + (c.num ? "num" : "") + sortable + '" data-k="' + c.k + '"' + (c.title ? ' title="' + esc(c.title) + '"' : "") + ">" + c.label + arr + "</th>";
+  }
+  h += "</tr></thead><tbody>";
+  if (!shown.length) h += '<tr><td colspan="' + cols.length + '" class="empty">' + esc(o.empty || "Nothing here.") + "</td></tr>";
+  shown.forEach((r, i) => {
+    h += "<tr" + (o.rowAttr ? o.rowAttr(r, i) : "") + ">";
+    for (const c of cols) h += '<td class="' + (c.num ? "num" : "") + (c.cls ? " " + c.cls : "") + '">' + (c.fmt ? c.fmt(r) : esc(r[c.k])) + "</td>";
+    h += "</tr>";
+  });
+  if (o.totalRow) { h += '<tr class="tot">'; for (const c of cols) h += '<td class="' + (c.num ? "num" : "") + '">' + (o.totalRow[c.k] != null ? o.totalRow[c.k] : "") + "</td>"; h += "</tr>"; }
+  h += "</tbody></table>";
+  if (total > shown.length) h += '<div style="margin-top:8px"><button class="more" data-more="1">Show ' + Math.min(total - shown.length, o.limit || 25) + " more (" + (total - shown.length) + " left)</button></div>";
+  host.innerHTML = h;
+  host.querySelectorAll("th.sort").forEach((th) => th.addEventListener("click", () => {
+    const k = th.dataset.k;
+    if (st.sk === k) st.dir = -st.dir; else { st.sk = k; st.dir = -1; }
+    table(host, cols, rows, o);
+  }));
+  const mb = host.querySelector("[data-more]");
+  if (mb) mb.addEventListener("click", () => { st.limit += (o.limit || 25); table(host, cols, rows, o); });
+  if (o.onRow) host.querySelectorAll("tbody tr[data-i]").forEach((tr) => tr.addEventListener("click", () => o.onRow(shown[+tr.dataset.i])));
+}
+const TSTATE = {};
+
+function mktCell(t, sub) {
+  const m = D.markets[t];
+  return '<div class="cell-main"><span class="mono">' + esc(t) + "</span>" + (sub ? '<span class="t2">' + sub + "</span>" : "") + "</div>";
+}
+function stateTags(m) {
+  const out = [];
+  const c = m.cur;
+  if (m.halt) out.push('<span class="tag crit">' + esc(m.halt[0]) + "</span>");
+  else if (m.guard) out.push('<span class="tag ' + (RISKG.has(m.guard) ? "warn" : "") + '">' + esc(m.guard) + "</span>");
+  if (c && c.q === 2) out.push('<span class="tag good">2-sided</span>');
+  else if (c && c.q === 1) out.push('<span class="tag info">' + (c.bid_ct > 0 ? "bid only" : "ask only") + "</span>");
+  else if (m.sel && !m.guard && !m.halt) out.push('<span class="tag">selected, no quote</span>');
+  if (c && c.ro) out.push('<span class="tag">reduce-only</span>');
+  if (m.scanm) out.push('<span class="tag">scan</span>');
+  const w = mw(m);
+  if (w.settled) out.push('<span class="tag strong">' + esc(w.settled) + "</span>");
+  return out.join(" ");
+}
+const RISKG = new Set(["event_fill_tripwire", "scan_fill_tripwire", "fill_burst", "blind", "event_depth_trip", "event_depth_hold", "one_sided_breaker", "scan_mid_tripwire", "move_breaker", "crossed", "breaker_cooldown"]);
+
+/* ======================= header / summary ======================= */
+function renderHeader() {
+  const h = D.health;
+  const live = $("live"), txt = $("liveTxt");
+  const age = (Date.now() / 1000 - (h.updated_at || 0)) / 60;
+  const dataAge = (Date.now() / 1000 - D.generated) / 60;
+  live.className = "pill" + (h.stale || age > 30 ? " bad" : "");
+  txt.textContent = (h.stale || age > 30) ? "Heartbeat stale" : (D.bot.halted_until * 1000 > Date.now() ? "Halted" : (h.mode || "Live"));
+  $("asof").textContent = "Data as of " + D.generated_et + " (" + dur(dataAge * 60) + " ago)" + (dataAge > 30 ? " — page not refreshed" : "");
+  const seg = $("winSeg");
+  seg.innerHTML = WKEYS.map((k) => '<button type="button" data-w="' + k + '" aria-pressed="' + (k === W) + '" title="' + esc(D.windows[k].desc) + '">' + esc(D.windows[k].label) + "</button>").join("");
+  seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { W = b.dataset.w; store("imm.win", W); renderAll(); }));
+}
+function sameTimeYesterday() {
+  if (W !== "today") return null;
+  const cy = D.curves.yesterday || [], off = D.generated - D.windows.today.start;
+  const target = D.windows.yesterday.start + off;
+  let best = null;
+  for (const p of cy) { if (p[0] <= target + 1) best = p; }
+  return best;
+}
+function renderSummary() {
+  const a = AGG.tot, w = win(), na = w.pnl_na;
+  const rew = a.rew, pnl = a.pnl, net = rew + pnl;
+  const hist = D.history || [];
+  const last14 = hist.slice(-14);
+  const yd = sameTimeYesterday();
+  let cmp = "";
+  if (yd) {
+    const ynet = yd[1] + yd[2];
+    cmp = '<div class="sub">At this time yesterday: net ' + money(ynet) + " (rewards " + fmtUSD(yd[1]) + ", trading " + fmtUSD(yd[2], { sign: true }) + ")</div>";
+  }
+  $("hero").innerHTML =
+    '<div><div class="lbl">Net impact · ' + esc(w.desc) + '</div><div class="big ' + (na ? "" : cls(net, 0.5)) + '">' + (na ? "n/a" : fmtUSD(net, { sign: true })) + "</div>" +
+    '<div class="sub">Modeled rewards plus mark-to-market trading P&amp;L</div></div>' +
+    '<div class="split">' +
+    '<div><div class="k"><i class="key" style="background:var(--s-rew)"></i>Modeled rewards</div><div class="v">' + fmtUSD(rew) + '</div><div class="s">now ' + fmtUSD(a.estNow) + "/day run-rate</div>" + spark(last14.map((r) => r.rew), css("--s-rew"), true) + "</div>" +
+    '<div><div class="k"><i class="key" style="background:var(--s-trade)"></i>Trading P&amp;L</div><div class="v ' + (na ? "" : cls(pnl, 0.5)) + '">' + (na ? "n/a" : fmtUSD(pnl, { sign: true })) + '</div><div class="s">realized ' + fmtUSD(a.real, { sign: true }) + " · marks " + fmtUSD(a.du, { sign: true }) + "</div>" + spark(last14.map((r) => r.pnl == null ? null : r.pnl), css("--s-trade"), true) + "</div>" +
+    "</div>" + cmp;
+  // tiles
+  const days = winDays();
+  const yieldC = a.rest > 0 ? rew / a.rest / days * 100 : null;
+  const mkc = a.mk_cts > 0 ? a.mk / a.mk_cts * 100 : null;
+  const halts = D.halts;
+  const nSide = halts.side.length, nEv = halts.event.length, nRiskG = halts.guards.filter((g) => g.risk).length;
+  const tiles = [
+    { lbl: "Fills", val: fmtNum(a.fills), sub: fmtNum(a.cts) + " contracts · " + fmtUSD(a.usd) + " traded",
+      sub2: a.mk_n ? "30m mark-out " + money(a.mk) + " (" + (mkc >= 0 ? "+" : MINUS) + Math.abs(mkc).toFixed(1) + "¢/ct on " + fmtNum(a.mk_n) + " fills)" : "mark-outs pending" },
+    { lbl: "Quoting now", val: fmtNum(a.q2 + a.q1) + " mkts", sub: fmtNum(a.q2) + " two-sided · " + fmtNum(a.q1) + " one-sided · " + fmtNum(a.held) + " held",
+      sub2: fmtUSD(a.restNow) + " resting · yield " + (yieldC != null ? yieldC.toFixed(1) + "¢ per $1 per day" : "—") },
+    { lbl: "Open inventory", val: fmtUSD(a.u, { sign: true }), valCls: cls(a.u, 0.5), sub: fmtNum(a.npos) + " positions · " + fmtUSD(a.risk) + " at cost",
+      sub2: "unrealized at mid, bot's own book" },
+    { lbl: "Halts & guards", val: (nSide + nEv + halts.depth.length) + (nSide + nEv + halts.depth.length === 1 ? " halt" : " halts"), sub: nSide + " toxic side · " + nEv + " toxic event · " + halts.depth.length + " mention-gate",
+      sub2: halts.guards.length + " markets guard-held (" + nRiskG + " risk guards)" },
+  ];
+  $("tiles").innerHTML = tiles.map((t) => '<div class="card tile"><div class="lbl"><span>' + t.lbl + '</span></div><div class="val ' + (t.valCls || "") + '">' + t.val + '</div><div class="sub">' + t.sub + '</div><div class="sub2">' + t.sub2 + "</div></div>").join("");
+  // curve
+  const c = D.curves[W] || [];
+  $("curveTitle").textContent = "Cumulative through the window · " + w.desc;
+  const series = [
+    { name: "Net", color: css("--s-net"), pts: c.map((p) => [p[0], na ? null : p[1] + p[2]]), width: 2.5 },
+    { name: "Trading P&L", color: css("--s-trade"), pts: c.map((p) => [p[0], na ? null : p[2]]) },
+    { name: "Modeled rewards", color: css("--s-rew"), pts: c.map((p) => [p[0], p[1]]) },
+  ];
+  const lp = c[c.length - 1] || [0, 0, 0];
+  $("curveLegend").innerHTML = series.map((s, i) => '<span><i class="keyline" style="background:' + s.color + '"></i>' + esc(s.name) + " <b>" + (i < 2 && na ? "n/a" : fmtUSD(i === 0 ? lp[1] + lp[2] : i === 1 ? lp[2] : lp[1], { sign: i < 2 })) + "</b></span>").join("");
+  lineChart($("curve"), series, { height: 250, x0: w.start, x1: w.end, xticks: timeTicks, label: "Cumulative net, trading P&L and modeled rewards" });
+}
+
+/* ======================= attention ======================= */
+function attentionItems() {
+  const out = [], h = D.health, b = D.bot, hl = D.halts, now = Date.now() / 1000;
+  if (h.stale) out.push({ s: "crit", t: "Bot heartbeat is " + (h.age_min != null ? Math.round(h.age_min) + " min" : "") + " old", go: "health" });
+  if (b.halted_until > now) out.push({ s: "crit", t: "Daily-loss halt active until " + dtET(b.halted_until), go: "risk" });
+  if (h.halt_file) out.push({ s: "crit", t: "Manual HALT file present in the status directory", go: "risk" });
+  for (const e of hl.event) out.push({ s: "crit", t: "Toxic event halt on " + e.ev + " until " + tET(e.until), go: "risk" });
+  const nowET = new Date().toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit", minute: "2-digit" });
+  for (const l of h.lineup) {
+    if (l.ok === false && l.ever && nowET > addMin(l.at, 30)) out.push({ s: "crit", t: l.label + " did not send today" + (l.note ? ": " + l.note : ""), go: "health" });
+  }
+  if (hl.side.length) out.push({ s: "warn", t: hl.side.length + " toxic side halt" + (hl.side.length > 1 ? "s" : "") + " active: " + hl.side.slice(0, 3).map((x) => x.t + " " + x.side).join(", "), go: "risk" });
+  const rg = {};
+  hl.guards.filter((g) => g.risk).forEach((g) => { rg[g.guard] = (rg[g.guard] || 0) + 1; });
+  for (const k in rg) out.push({ s: "warn", t: rg[k] + " markets held by " + k, go: "risk" });
+  if (b.pnl_today != null && b.loss_limit && b.pnl_today < -0.5 * b.loss_limit) out.push({ s: "warn", t: "Bot-day P&L " + fmtUSD(b.pnl_today, { sign: true }) + " is " + Math.round(-b.pnl_today / b.loss_limit * 100) + "% of the " + fmtUSD(-b.loss_limit) + " halt", go: "risk" });
+  if (h.runs_today && h.runs_today.length >= 6) out.push({ s: "warn", t: h.runs_today.length + " bot runs today (restarts cost quoting time)", go: "health" });
+  if (h.ledger_max) {
+    const lag = (Date.parse(new Date().toISOString().slice(0, 10)) - Date.parse(h.ledger_max)) / 864e5;
+    if (lag > 4) out.push({ s: "warn", t: "Credit ledger last runs to " + h.ledger_max + " (paste the statement)", go: "history" });
+  }
+  const opp = D.opp || {};
+  const g72 = (opp.new_groups || {})["72"] || [];
+  const prom = g72.filter((r) => r.flag === "promising");
+  if (prom.length) out.push({ s: "info", t: prom.length + " promising new launch" + (prom.length > 1 ? "es" : "") + " not quoted (72h): " + prom.slice(0, 3).map((r) => r.ser + " " + fmtUSD(r.g_est) + "/day").join(", "), go: "opps" });
+  const big = g72.filter((r) => r.flag === "unestimated pool" && !r.routine);
+  if (big.length) out.push({ s: "info", t: big.length + " new series with " + fmtUSD(big.reduce((a, r) => a + r.left, 0)) + " in unquoted pools (72h, not estimated yet)", go: "opps" });
+  const po = ((opp.pickoff || {}).rows || []).filter((r) => r.open_now);
+  if (po.length) out.push({ s: "info", t: po.length + " pick-off window" + (po.length > 1 ? "s" : "") + " open now: " + po.map((r) => r.event).join(", "), go: "opps" });
+  if (opp.errors) for (const k in opp.errors) out.push({ s: "warn", t: "Kalshi read for " + k + " failed; showing the last good copy", go: "opps" });
+  for (const w of D.warnings || []) out.push({ s: "warn", t: w, go: "health" });
+  // movers (info)
+  const mk = Object.values(D.markets).filter((m) => m.w[W]).sort((x, y) => Math.abs(mw(y).pnl || 0) - Math.abs(mw(x).pnl || 0));
+  if (mk[0] && Math.abs(mw(mk[0]).pnl) >= 20) out.push({ s: "info", t: "Biggest move: " + mk[0].t + " " + fmtUSD(mw(mk[0]).pnl, { sign: true }), go: "movers", t2: mk[0].t });
+  if (!out.some((x) => x.s === "crit" || x.s === "warn")) out.unshift({ s: "good", t: "No halts, limits or failed jobs need attention", go: "risk" });
+  return out;
+}
+function addMin(hhmm, n) { const p = hhmm.split(":"); let m = (+p[0]) * 60 + (+p[1]) + n; return String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0"); }
+function renderAttention() {
+  const items = attentionItems();
+  $("attn").innerHTML = items.map((x, i) => '<button type="button" class="chip ' + x.s + '" data-i="' + i + '">' + ICON[x.s] + "<span>" + esc(x.t) + "</span></button>").join("");
+  $("attn").querySelectorAll(".chip").forEach((b) => b.addEventListener("click", () => {
+    const it = items[+b.dataset.i];
+    if (it.t2 && D.markets[it.t2]) openMarket(it.t2); else location.hash = "#" + it.go;
+  }));
+  const cnt = (s, go) => items.filter((x) => (s.indexOf(x.s) >= 0) && x.go === go).length;
+  badge("bRisk", cnt(["crit", "warn"], "risk"), items.some((x) => x.s === "crit" && x.go === "risk") ? "crit" : "warn");
+  badge("bHealth", cnt(["crit", "warn"], "health"), items.some((x) => x.s === "crit" && x.go === "health") ? "crit" : "warn");
+  const prom = (((D.opp || {}).new_groups || {})["72"] || []).filter((r) => r.flag && !r.routine).length;
+  badge("bOpp", prom, "");
+}
+function badge(id, n, kind) { const b = $(id); b.hidden = !n; b.textContent = n; b.className = "badge " + (kind || ""); }
+
+/* ======================= drivers ======================= */
+const DRV_SORTS = { net: "Worst net", pnl: "Worst trading", rew: "Top rewards", abs: "Biggest moves" };
+function renderDrivers() {
+  const seg = $("drvSort");
+  seg.innerHTML = Object.keys(DRV_SORTS).map((k) => '<button type="button" data-s="' + k + '" aria-pressed="' + (k === drvSort) + '">' + DRV_SORTS[k] + "</button>").join("");
+  seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { drvSort = b.dataset.s; store("imm.drvSort", drvSort); renderDrivers(); }));
+  const na = win().pnl_na, days = winDays();
+  const fams = Object.values(AGG.fams).filter((f) => f.rew || f.pnl || f.fills || f.q1 || f.q2 || f.npos || f.sel);
+  const sorter = (a, b) => drvSort === "abs" ? Math.abs(b.pnl) - Math.abs(a.pnl) : drvSort === "net" ? (a.rew + a.pnl) - (b.rew + b.pnl) : (drvSort === "rew" ? b.rew - a.rew : a.pnl - b.pnl);
+  fams.sort(sorter);
+  const cols = ["Family / event / market", "Rewards", "Trading", "Net", "Fills", "Mark-out", "Quoting", "Resting $", "Est $/day", "Open MTM"];
+  let h = '<table class="t"><thead><tr>' + cols.map((c, i) => "<th" + (i ? ' class="num"' : "") + ">" + c + "</th>").join("") + "</tr></thead><tbody>";
+  const row = (lvl, key, label, x, extra) => {
+    const net = x.rew + x.pnl;
+    const open = openRows.has(key);
+    const caret = lvl < 2 ? '<span class="car' + (open ? " open" : "") + '">▶</span>' : "";
+    return '<tr class="l' + lvl + ' click" data-key="' + esc(key) + '" data-lvl="' + lvl + '">' +
+      "<td>" + caret + label + "</td>" +
+      '<td class="num">' + fmtUSD(x.rew) + "</td>" +
+      '<td class="num">' + (na ? "n/a" : money(x.pnl)) + "</td>" +
+      '<td class="num"><b>' + (na ? "n/a" : money(net)) + "</b></td>" +
+      '<td class="num">' + (x.fills ? fmtNum(x.fills) : '<span class="muted">0</span>') + "</td>" +
+      '<td class="num">' + (x.mk_n ? money(x.mk) : '<span class="muted">—</span>') + "</td>" +
+      '<td class="num">' + (extra && extra.quoting != null ? extra.quoting : (x.q2 + x.q1 ? fmtNum(x.q2 + x.q1) + (x.held ? ' <span class="muted">+' + x.held + " held</span>" : "") : (x.held ? '<span class="muted">' + x.held + " held</span>" : '<span class="muted">0</span>'))) + "</td>" +
+      '<td class="num">' + (x.restNow ? fmtUSD(x.restNow) : '<span class="muted">—</span>') + "</td>" +
+      '<td class="num">' + (x.estNow ? fmtUSD(x.estNow) : '<span class="muted">—</span>') + "</td>" +
+      '<td class="num">' + (x.npos ? money(x.u) : '<span class="muted">—</span>') + "</td></tr>";
+  };
+  let any = false;
+  for (const f of fams) {
+    const fKey = "f:" + f.name;
+    const evs = Object.values(f.events).filter((e) => e.rew || e.pnl || e.fills || e.q1 || e.q2 || e.npos || e.sel);
+    const famMatch = matchQ(f.name);
+    const evMatch = evs.filter((e) => famMatch || matchQ(e.name, e.grp) || e.mkts.some((t) => matchQ(t)));
+    if (Q && !evMatch.length) continue;
+    any = true;
+    h += row(0, fKey, esc(f.name) + ' <span class="muted small">' + evs.length + " events</span>", f);
+    if (!(openRows.has(fKey) || (Q && !famMatch))) continue;
+    evMatch.sort(sorter);
+    const lim = TSTATE[fKey] || 40;
+    evMatch.slice(0, lim).forEach((e) => {
+      const eKey = "e:" + e.name;
+      const cred = e.cred ? ' <span class="muted small">credited ' + fmtUSD(e.cred) + "</span>" : "";
+      h += row(1, eKey, '<span class="mono">' + esc(e.name) + "</span>" + (e.grp && e.grp !== e.name.split("-")[0] ? ' <span class="muted small">' + esc(e.grp) + "</span>" : "") + cred, e);
+      if (!(openRows.has(eKey) || (Q && !matchQ(e.name)))) return;
+      const ms = e.mkts.map((t) => D.markets[t]).filter((m) => !Q || matchQ(m.t, m.ev, m.fam));
+      ms.sort((a, b) => sorter(Object.assign(blank(), mw(a)), Object.assign(blank(), mw(b))));
+      for (const m of ms) {
+        const x = Object.assign(blank(), mw(m));
+        x.restNow = m.cur ? m.cur.usd : 0; x.estNow = m.cur ? m.cur.est_day : 0;
+        x.u = m.u || 0; x.npos = m.pos ? 1 : 0;
+        const q = m.cur && m.cur.q ? (m.cur.q === 2 ? "2-sided" : (m.cur.bid_ct > 0 ? "bid" : "ask")) : (m.guard ? '<span class="muted">' + esc(m.guard) + "</span>" : '<span class="muted">—</span>');
+        h += row(2, "m:" + m.t, '<span class="mono">' + esc(m.t.slice(m.ev.length + 1) || m.t) + "</span> " + stateTags(m), x, { quoting: q });
+      }
+    });
+    if (evMatch.length > lim) h += '<tr><td colspan="10"><button class="more" data-morefam="' + esc(fKey) + '">Show ' + (evMatch.length - lim) + " more events</button></td></tr>";
+  }
+  const t = AGG.tot;
+  h += '<tr class="tot"><td>All families</td><td class="num">' + fmtUSD(t.rew) + '</td><td class="num">' + (na ? "n/a" : money(t.pnl)) + '</td><td class="num">' + (na ? "n/a" : money(t.rew + t.pnl)) + '</td><td class="num">' + fmtNum(t.fills) + '</td><td class="num">' + (t.mk_n ? money(t.mk) : "—") + '</td><td class="num">' + fmtNum(t.q1 + t.q2) + '</td><td class="num">' + fmtUSD(t.restNow) + '</td><td class="num">' + fmtUSD(t.estNow) + '</td><td class="num">' + money(t.u) + "</td></tr>";
+  h += "</tbody></table>";
+  if (!any) h = '<div class="empty">No family, event or market matches "' + esc(Q) + '".</div>';
+  const host = $("drvTable");
+  host.innerHTML = h;
+  host.querySelectorAll("tr.click").forEach((tr) => tr.addEventListener("click", (e) => {
+    const k = tr.dataset.key;
+    if (k.startsWith("m:")) { openMarket(k.slice(2)); return; }
+    if (openRows.has(k)) openRows.delete(k); else openRows.add(k);
+    saveOpen();
+    renderDrivers();
+  }));
+  host.querySelectorAll("[data-morefam]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); TSTATE[b.dataset.morefam] = (TSTATE[b.dataset.morefam] || 40) + 60; renderDrivers(); }));
+  renderFamChart(fams);
+}
+function renderFamChart(fams) {
+  const host = $("famChart");
+  host.textContent = "";
+  const na = win().pnl_na;
+  const rows = fams.filter((f) => Math.abs(f.rew) + Math.abs(f.pnl) >= 0.5).slice().sort((a, b) => (b.rew + b.pnl) - (a.rew + a.pnl));
+  $("famLegend").innerHTML = '<span><i class="key" style="background:var(--s-rew)"></i>Modeled rewards</span><span><i class="key" style="background:var(--s-trade)"></i>Trading P&amp;L</span><span><i class="keyline" style="background:var(--s-net);width:3px;height:12px"></i>Net</span>';
+  if (!rows.length) { host.innerHTML = '<div class="empty">No activity in this window.</div>'; return; }
+  const W0 = Math.max(host.clientWidth || 380, 280), rowH = 30, m = { l: 132, r: 58, t: 6, b: 20 };
+  const H = m.t + m.b + rows.length * rowH;
+  let lo = 0, hi = 0;
+  rows.forEach((f) => { lo = Math.min(lo, f.rew, na ? 0 : f.pnl, na ? 0 : f.rew + f.pnl); hi = Math.max(hi, f.rew, na ? 0 : f.pnl, f.rew + (na ? 0 : f.pnl)); });
+  const dom = niceDomain(lo, hi, 4);
+  const X = (v) => m.l + (W0 - m.l - m.r) * (v - dom.lo) / (dom.hi - dom.lo);
+  const svg = svgEl("svg", { class: "ch", viewBox: "0 0 " + W0 + " " + H, height: H, role: "img", "aria-label": "Rewards and trading P&L by family" });
+  for (const tv of dom.ticks) {
+    svg.appendChild(svgEl("line", { x1: X(tv), x2: X(tv), y1: m.t, y2: H - m.b, class: tv === 0 ? "zero" : "grid" }));
+    const tx = svgEl("text", { x: X(tv), y: H - 5, "text-anchor": "middle" }); tx.textContent = fmtUSD(tv, { dp: 0, compact: true }); svg.appendChild(tx);
+  }
+  const bar = (v, y, h, color) => {
+    const x0 = X(0), x1 = X(v), left = Math.min(x0, x1), w = Math.max(1, Math.abs(x1 - x0)), r = Math.min(4, w, h / 2);
+    let d;
+    if (v >= 0) d = "M" + left + " " + y + "H" + (left + w - r) + "Q" + (left + w) + " " + y + " " + (left + w) + " " + (y + r) + "V" + (y + h - r) + "Q" + (left + w) + " " + (y + h) + " " + (left + w - r) + " " + (y + h) + "H" + left + "Z";
+    else d = "M" + (left + w) + " " + y + "H" + (left + r) + "Q" + left + " " + y + " " + left + " " + (y + r) + "V" + (y + h - r) + "Q" + left + " " + (y + h) + " " + (left + r) + " " + (y + h) + "H" + (left + w) + "Z";
+    svg.appendChild(svgEl("path", { d, fill: color }));
+  };
+  rows.forEach((f, i) => {
+    const y = m.t + i * rowH;
+    const lab = svgEl("text", { x: m.l - 8, y: y + rowH / 2 + 4, "text-anchor": "end" });
+    lab.textContent = f.name.length > 22 ? f.name.slice(0, 21) + "…" : f.name;
+    lab.setAttribute("style", "fill:" + css("--ink-2"));
+    svg.appendChild(lab);
+    bar(f.rew, y + 6, 8, css("--s-rew"));
+    if (!na) bar(f.pnl, y + 16, 8, css("--s-trade"));
+    const net = f.rew + (na ? 0 : f.pnl);
+    if (!na) {
+      svg.appendChild(svgEl("rect", { x: X(net) - 1.5, y: y + 3, width: 3, height: 24, rx: 1.5, fill: css("--s-net") }));
+      const vt = svgEl("text", { x: W0 - 4, y: y + rowH / 2 + 4, "text-anchor": "end" });
+      vt.textContent = fmtUSD(net, { sign: true, dp: 0 }); vt.setAttribute("style", "fill:" + css("--ink")); svg.appendChild(vt);
+    }
+    const hit = svgEl("rect", { x: 0, y, width: W0, height: rowH, fill: "transparent" });
+    hit.style.cursor = "pointer";
+    hit.addEventListener("pointermove", (e) => showTip(e, f.name, [
+      { name: "Net", value: na ? "n/a" : fmtUSD(net, { sign: true }), color: css("--s-net"), line: true },
+      { name: "Modeled rewards", value: fmtUSD(f.rew), color: css("--s-rew") },
+      { name: "Trading P&L", value: na ? "n/a" : fmtUSD(f.pnl, { sign: true }), color: css("--s-trade") },
+      { name: "Fills", value: fmtNum(f.fills) },
+    ]));
+    hit.addEventListener("pointerleave", hideTip);
+    hit.addEventListener("click", () => { openRows.add("f:" + f.name); renderDrivers(); $("drvTable").scrollIntoView({ block: "start" }); });
+    svg.appendChild(hit);
+  });
+  host.appendChild(svg);
+}
+
+/* ======================= movers ======================= */
+function marketRows(filterFn) {
+  const out = [];
+  for (const t in D.markets) {
+    const m = D.markets[t], w = m.w[W];
+    if (!w || !matchQ(m.t, m.ev, m.fam, m.grp)) continue;
+    if (filterFn && !filterFn(m, w)) continue;
+    out.push(Object.assign({ t, m, ev: m.ev, fam: m.fam }, w));
+  }
+  return out;
+}
+function cause(r) {
+  const bits = [];
+  if (r.settled) bits.push(r.settled);
+  if (r.fills) bits.push(r.fills + " fill" + (r.fills > 1 ? "s" : ""));
+  if (r.mk0 != null && r.mk1 != null && Math.abs(r.mk1 - r.mk0) >= 1) bits.push("mark " + fmtC(r.mk0) + " → " + fmtC(r.mk1));
+  else if (r.mk0 == null && r.mk1 != null) bits.push("opened, mark " + fmtC(r.mk1));
+  return bits.join(" · ");
+}
+function renderMovers() {
+  const na = win().pnl_na;
+  const rows = marketRows((m, w) => Math.abs(w.pnl || 0) >= 0.01);
+  table($("movPnl"), [
+    { k: "t", label: "Market", fmt: (r) => mktCell(r.t, esc(r.fam) + " · " + esc(cause(r))), sort: (r) => r.t },
+    { k: "pos", label: "Position", num: true, fmt: (r) => (r.pos0 != null && Math.round(r.pos0) !== Math.round(r.m.pos) ? fmtNum(r.pos0) + " → " : "") + fmtNum(r.m.pos), sort: (r) => Math.abs(r.m.pos) },
+    { k: "real", label: "Realized", num: true, fmt: (r) => money(r.real) },
+    { k: "du", label: "Marks Δ", num: true, fmt: (r) => money(r.du + (r.xfer || 0)) },
+    { k: "pnl", label: "Trading", num: true, fmt: (r) => "<b>" + (na ? "n/a" : money(r.pnl)) + "</b>", sort: (r) => r.pnl },
+    { k: "rew", label: "Rewards", num: true, fmt: (r) => fmtUSD(r.rew) },
+  ], rows, { presort: (a, b) => Math.abs(b.pnl) - Math.abs(a.pnl), limit: 15, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => openMarket(r.t), empty: "No position moved in this window." });
+  const rw = marketRows((m, w) => (w.rew || 0) >= 0.01);
+  table($("movRew"), [
+    { k: "t", label: "Market", fmt: (r) => mktCell(r.t, esc(r.fam) + (r.m.cur ? " · now " + fmtUSD(r.m.cur.est_day) + "/day" : " · not quoting now")), sort: (r) => r.t },
+    { k: "rew", label: "Rewards", num: true, fmt: (r) => "<b>" + fmtUSD(r.rew) + "</b>" },
+    { k: "pnl", label: "Trading", num: true, fmt: (r) => na ? "n/a" : money(r.pnl) },
+    { k: "net", label: "Net", num: true, fmt: (r) => na ? "n/a" : money(r.net) },
+    { k: "fills", label: "Fills", num: true, fmt: (r) => fmtNum(r.fills || 0) },
+  ], rw, { sortKey: "rew", limit: 15, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => openMarket(r.t), empty: "No rewards accrued in this window." });
+}
+
+/* ======================= quoting ======================= */
+function renderQuoting() {
+  const days = winDays();
+  const fams = Object.values(AGG.fams).filter((f) => f.q1 || f.q2 || f.sel || f.held);
+  const tot = AGG.tot;
+  $("quoteNote").textContent = (D.bot.markets_line || "") + (D.bot.max_events ? " · event cap " + D.bot.max_events : "") + (D.bot.scan_slots ? " · scan slots " + D.bot.scan_slots : "");
+  const rows = fams.map((f) => {
+    const evq = Object.values(f.events).filter((e) => e.q1 + e.q2 > 0).length;
+    return { name: f.name, evq, q2: f.q2, q1: f.q1, held: f.held, sel: f.sel, restNow: f.restNow, estNow: f.estNow, poolNow: f.poolNow,
+      cap: f.poolNow > 0 ? f.estNow / f.poolNow : null, yld: f.rest > 0 ? f.rew / f.rest / days * 100 : null, rew: f.rew };
+  }).filter((r) => matchQ(r.name) || !Q);
+  const evTot = Object.values(AGG.fams).reduce((s, f) => s + Object.values(f.events).filter((e) => e.q1 + e.q2 > 0).length, 0);
+  table($("covTable"), [
+    { k: "name", label: "Family", fmt: (r) => esc(r.name) },
+    { k: "evq", label: "Events quoting", num: true, fmt: (r) => fmtNum(r.evq) },
+    { k: "q2", label: "Two-sided", num: true, fmt: (r) => fmtNum(r.q2) },
+    { k: "q1", label: "One-sided", num: true, fmt: (r) => fmtNum(r.q1) },
+    { k: "held", label: "Held", num: true, title: "selected but not resting: guard or halt", fmt: (r) => r.held ? '<span class="down">' + r.held + "</span>" : '<span class="muted">0</span>' },
+    { k: "restNow", label: "Resting $", num: true, fmt: (r) => fmtUSD(r.restNow) },
+    { k: "estNow", label: "Est $/day now", num: true, fmt: (r) => fmtUSD(r.estNow) },
+    { k: "poolNow", label: "Pool $/day", num: true, title: "reward pool of the markets being quoted", fmt: (r) => fmtUSD(r.poolNow) },
+    { k: "cap", label: "Share of pool", num: true, fmt: (r) => fmtPct(r.cap) },
+    { k: "yld", label: "Yield ¢/$/day", num: true, title: "window rewards per $1 of average resting quotes per day", fmt: (r) => r.yld != null ? r.yld.toFixed(1) : "—" },
+  ], rows, { sortKey: "estNow", limit: 30, totalRow: { name: "All", evq: fmtNum(evTot), q2: fmtNum(tot.q2), q1: fmtNum(tot.q1), held: fmtNum(tot.held), restNow: fmtUSD(tot.restNow), estNow: fmtUSD(tot.estNow), poolNow: fmtUSD(tot.poolNow), cap: fmtPct(tot.poolNow ? tot.estNow / tot.poolNow : null), yld: tot.rest > 0 ? (tot.rew / tot.rest / days * 100).toFixed(1) : "—" } });
+  // events
+  const evs = [];
+  for (const f of Object.values(AGG.fams)) for (const e of Object.values(f.events)) {
+    if (!(e.q1 + e.q2 || e.sel)) continue;
+    if (!matchQ(e.name, f.name, e.grp)) continue;
+    evs.push(Object.assign({ fam: f.name }, e));
+  }
+  table($("qEvents"), [
+    { k: "name", label: "Event", fmt: (r) => '<div class="cell-main"><span class="mono">' + esc(r.name) + '</span><span class="t2">' + esc(r.fam) + (r.grp && r.grp !== r.name.split("-")[0] ? " · " + esc(r.grp) : "") + "</span></div>" },
+    { k: "q", label: "Quoting", num: true, sort: (r) => r.q1 + r.q2, fmt: (r) => fmtNum(r.q1 + r.q2) + '<span class="muted">/' + r.sel + "</span>" + (r.held ? ' <span class="down">' + r.held + " held</span>" : "") },
+    { k: "estNow", label: "Est $/day", num: true, fmt: (r) => fmtUSD(r.estNow) },
+    { k: "restNow", label: "Resting $", num: true, fmt: (r) => fmtUSD(r.restNow) },
+    { k: "rew", label: "Rewards", num: true, fmt: (r) => fmtUSD(r.rew) },
+    { k: "pnl", label: "Trading", num: true, fmt: (r) => win().pnl_na ? "n/a" : money(r.pnl) },
+    { k: "u", label: "Open MTM", num: true, fmt: (r) => r.npos ? money(r.u) : '<span class="muted">—</span>' },
+  ], evs, { sortKey: "estNow", limit: 20, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => { openRows.add("f:" + r.fam); openRows.add("e:" + r.name); renderDrivers(); location.hash = "#drivers"; } });
+  // decisions
+  const dm = D.decisions || {};
+  const agg = {};
+  for (const f in dm) {
+    if (Q && !matchQ(f)) continue;
+    for (const d in dm[f]) { const a = agg[d] || (agg[d] = { d, n: 0, est: 0, fams: {} }); a.n += dm[f][d][0]; a.est += dm[f][d][1]; a.fams[f] = (a.fams[f] || 0) + dm[f][d][0]; }
+  }
+  const drows = Object.values(agg).map((a) => Object.assign(a, { top: Object.entries(a.fams).sort((x, y) => y[1] - x[1]).slice(0, 3).map((x) => x[0] + " " + x[1]).join(", ") }));
+  $("decNote").textContent = D.snapshot_ts ? "bot's last hourly scoring, " + tET(D.snapshot_ts) : "";
+  table($("decTable"), [
+    { k: "d", label: "Decision", fmt: (r) => '<span class="' + (r.d === "selected" ? "" : "ink2") + '">' + esc(r.d.replace(/_/g, " ")) + "</span>" },
+    { k: "n", label: "Markets", num: true, fmt: (r) => fmtNum(r.n) },
+    { k: "est", label: "Modeled $/day", num: true, title: "what the bot's estimator gave these candidates", fmt: (r) => fmtUSD(r.est) },
+    { k: "top", label: "Mostly", fmt: (r) => '<span class="small ink2">' + esc(r.top) + "</span>", nosort: true },
+  ], drows, { sortKey: "n", limit: 14, empty: "No selection snapshot found." });
+}
+
+/* ======================= opportunities ======================= */
+function reasonTag(reason) {
+  if (!reason) return "";
+  const r = reason.toLowerCase();
+  let k = "";
+  if (r.startsWith("blocklisted") || r.startsWith("frozen")) k = "";
+  else if (r.indexOf("allowlist") >= 0 || r.indexOf("open-scan") >= 0 || r.indexOf("excluded family") >= 0) k = "info";
+  else if (r.indexOf("capacity") >= 0 || r.indexOf("candidate cap") >= 0) k = "warn";
+  return '<span class="tag ' + k + '">' + esc(reason) + "</span>";
+}
+function renderOpps() {
+  const o = D.opp || {};
+  const seg = $("newSeg");
+  const opts = { "24": "24h", "72": "72h", "168": "7 days" };
+  seg.innerHTML = Object.keys(opts).map((k) => '<button type="button" data-n="' + k + '" aria-pressed="' + (k === newWin) + '">New in ' + opts[k] + "</button>").join("");
+  seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { newWin = b.dataset.n; store("imm.newWin", newWin); renderOpps(); }));
+  if (o.off || o.error) {
+    const msg = o.off ? "Built with --no-api: the program feed, gap estimator and pick-off scan were skipped." : "Kalshi sections unavailable: " + o.error;
+    ["newTable", "gapTable", "pickTable"].forEach((id) => { $(id).innerHTML = '<div class="empty">' + esc(msg) + "</div>"; });
+    $("oppNote").textContent = "";
+    return;
+  }
+  const feed = o.feed || {};
+  $("oppNote").textContent = (feed.events ? fmtNum(feed.events) + " events with live programs, " + fmtUSD(feed.pool_day) + "/day in pools · " : "") +
+    "feed read " + ago(o.programs_at) + ", estimates " + ago(o.gaps_at);
+  const groups = ((o.new_groups || {})[newWin] || []).filter((g) => matchQ(g.ser, g.what, g.fam, g.reason) || g.events.some((e) => matchQ(e.ev, e.what)));
+  const showRoutine = store("imm.routine") === "1";
+  const fresh = groups.filter((g) => !g.routine), routine = groups.filter((g) => g.routine);
+  const prom = fresh.filter((g) => g.flag === "promising").length + routine.filter((g) => g.flag === "promising").length;
+  $("newNote").textContent = fresh.length + " new series (" + fresh.reduce((a, g) => a + g.n_ev, 0) + " events, " + fmtUSD(fresh.reduce((a, g) => a + g.left, 0)) + " left in their pools)" +
+    (prom ? " \u00b7 " + prom + " promising and not quoted" : "") + " \u00b7 " + routine.length + " established series re-listed";
+  renderNewGroups($("newTable"), showRoutine ? groups : fresh.concat(routine.filter((g) => g.flag === "promising")), routine.length, showRoutine);
+  const gaps = (o.gaps || []).filter((d) => matchQ(d.event, d.title, d.series, d.reason));
+  const ctx = o.gaps_ctx || {};
+  $("gapNote").textContent = ctx.est_missed_total != null ? "est " + fmtUSD(ctx.est_missed_total) + "/day across all unquoted markets" : "";
+  table($("gapTable"), [
+    { k: "yld", label: "ROI/day", num: true, fmt: (r) => r.yld != null ? fmtPct(r.yld) : '<span class="muted">—</span>' },
+    { k: "est", label: "Est $/day", num: true, fmt: (r) => r.est != null ? fmtUSD(r.est) + (r.partial ? "+" : "") : '<span class="muted">—</span>' },
+    { k: "pool", label: "Pool $/day", num: true, fmt: (r) => fmtUSD(r.pool) },
+    { k: "event", label: "Event", fmt: (r) => '<div class="cell-main"><span class="mono">' + esc(r.event) + '</span><span class="t2">' + esc(r.title || "") + "</span></div>" },
+    { k: "reason", label: "Why not quoted", fmt: (r) => reasonTag(r.reason) },
+    { k: "end", label: "Until", fmt: (r) => '<span class="nowrap small">' + dtET(r.end) + "</span>" },
+  ], gaps, { sortKey: "yld", limit: 12, empty: "No estimates yet." });
+  const pk = (o.pickoff || {}).rows || [];
+  table($("pickTable"), [
+    { k: "event", label: "Event", fmt: (r) => '<div class="cell-main"><span class="mono">' + esc(r.event) + '</span><span class="t2">' + esc(r.title || "") + "</span></div>" },
+    { k: "real", label: "Real start", fmt: (r) => '<span class="nowrap">' + dtET(r.real) + "</span>" + (r.open_now ? ' <span class="tag strong">open</span>' : "") },
+    { k: "kalshi_start", label: "Kalshi's start", fmt: (r) => '<span class="nowrap">' + dtET(r.kalshi_start) + "</span>" },
+    { k: "gap_h", label: "Gap", num: true, fmt: (r) => (r.gap_h || 0).toFixed(1) + " h" },
+    { k: "live_mkts", label: "Live mkts", num: true },
+  ], pk, { sortKey: "real", dir: 1, limit: 10, empty: (o.pickoff && o.pickoff.error) ? "Scan error: " + o.pickoff.error : "No pick-off windows: Kalshi's event starts match the real ones." });
+}
+
+function groupStatus(g) {
+  if (g.q || g.sel) return '<span class="tag good">quoting ' + Math.max(g.q, g.sel) + "/" + g.n + "</span>";
+  return reasonTag(g.reason);
+}
+function flagTag(f) {
+  return f === "promising" ? '<span class="tag strong">Promising</span>' : f ? '<span class="tag warn">Unestimated pool</span>' : "";
+}
+function renderNewGroups(host, groups, nRoutine, showRoutine) {
+  const lim = TSTATE.newGroups || 20;
+  let h = '<table class="t"><thead><tr><th>Launched</th><th>Series / event</th><th class="num">Events</th><th class="num">Mkts</th><th class="num">Pool $/day</th><th class="num" title="pool $/day x time left in the programs">Left in pools</th><th>Ends</th><th>Bot</th><th class="num">Est $/day</th><th class="num" title="modeled $/day per $ of exposure (the 7:20 email ROI)">ROI/day</th><th></th></tr></thead><tbody>';
+  if (!groups.length) h += '<tr><td colspan="11" class="empty">No new launches in this window.</td></tr>';
+  groups.slice(0, lim).forEach((g) => {
+    const key = "g:" + g.ser, open = openRows.has(key);
+    const est = (g.q || g.sel) ? fmtUSD(g.est_now) : (g.g_est != null ? fmtUSD(g.g_est) + (g.g_n_est < g.n_ev ? "+" : "") : '<span class="muted">\u2014</span>');
+    h += '<tr class="l0 click" data-g="' + esc(key) + '"><td class="nowrap">' + dtET(g.last_launch) + "</td>" +
+      '<td><span class="car' + (open ? " open" : "") + '">\u25b6</span><span class="mono">' + esc(g.ser) + "</span> " + (g.routine ? '<span class="tag">routine re-listing</span>' : '<span class="tag info">new series</span>') +
+      '<div class="small muted" style="padding-left:12px">' + esc(g.what || "") + " \u00b7 " + esc(g.fam) + "</div></td>" +
+      '<td class="num">' + g.n_ev + '</td><td class="num">' + g.n + '</td><td class="num">' + fmtUSD(g.pool) + '</td><td class="num"><b>' + fmtUSD(g.left) + "</b></td>" +
+      '<td class="nowrap small">' + dtET(g.end) + "</td><td>" + groupStatus(g) + '</td><td class="num">' + est + '</td><td class="num">' + (g.g_yld != null ? fmtPct(g.g_yld) : '<span class="muted">\u2014</span>') + "</td><td>" + flagTag(g.flag) + "</td></tr>";
+    if (!open) return;
+    g.events.forEach((e) => {
+      const eest = (e.q || e.sel) ? fmtUSD(e.est_now) : (e.g_est != null ? fmtUSD(e.g_est) : '<span class="muted">\u2014</span>');
+      h += '<tr class="l1"><td class="nowrap small">' + dtET(e.launched) + '</td><td><span class="mono">' + esc(e.ev) + '</span><div class="small muted">' + esc(e.what || "") + "</div></td>" +
+        '<td class="num"></td><td class="num">' + e.n + '</td><td class="num">' + fmtUSD(e.pool) + '</td><td class="num">' + fmtUSD(e.left) + '</td><td class="nowrap small">' + dtET(e.end) + "</td><td>" +
+        ((e.q || e.sel) ? '<span class="tag good">quoting ' + Math.max(e.q, e.sel) + "/" + e.n + "</span>" : reasonTag(e.g_reason || e.bot)) + '</td><td class="num">' + eest + '</td><td class="num">' + (e.g_yld != null ? fmtPct(e.g_yld) : "") + "</td><td></td></tr>";
+    });
+  });
+  h += "</tbody></table>";
+  const btns = [];
+  if (groups.length > lim) btns.push('<button class="more" data-act="more">Show ' + Math.min(20, groups.length - lim) + " more (" + (groups.length - lim) + " left)</button>");
+  if (nRoutine) btns.push('<button class="more" data-act="routine">' + (showRoutine ? "Hide" : "Show") + " " + nRoutine + " routine re-listings</button>");
+  if (btns.length) h += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">' + btns.join("") + "</div>";
+  host.innerHTML = h;
+  host.querySelectorAll("tr[data-g]").forEach((tr) => tr.addEventListener("click", () => { const k = tr.dataset.g; if (openRows.has(k)) openRows.delete(k); else openRows.add(k); renderOpps(); }));
+  const mb = host.querySelector('[data-act="more"]');
+  if (mb) mb.addEventListener("click", () => { TSTATE.newGroups = lim + 20; renderOpps(); });
+  const rb = host.querySelector('[data-act="routine"]');
+  if (rb) rb.addEventListener("click", () => { store("imm.routine", showRoutine ? "0" : "1"); renderOpps(); });
+}
+
+/* ======================= risk ======================= */
+function meter(label, val, limit, note) {
+  const frac = limit ? Math.min(Math.max(-val / limit, 0), 1) : 0;
+  const color = frac >= 0.75 ? "var(--crit)" : frac >= 0.5 ? "var(--warn)" : "var(--good)";
+  return '<div class="meter"><div class="mlab"><span>' + label + "</span><span>" + money(val) + ' <span class="muted">of ' + fmtUSD(-limit) + " halt</span></span></div>" +
+    '<div class="mtrack" role="meter" aria-valuemin="0" aria-valuemax="' + limit + '" aria-valuenow="' + Math.max(0, -val) + '"><div class="mfill" style="left:' + ((1 - frac) * 100).toFixed(1) + "%;background:" + color + '"></div></div>' +
+    (note ? '<div class="small muted">' + note + "</div>" : "") + "</div>";
+}
+function renderRisk() {
+  const b = D.bot, hl = D.halts, now = Date.now() / 1000;
+  $("meters").innerHTML =
+    meter("Bot-day P&amp;L (since 5am CT)", b.pnl_today, b.loss_limit, "The bot's own counter, which drives the halt. Rebuilt from the sinks for the same span: " + (b.roll_pnl_ours != null ? fmtUSD(b.roll_pnl_ours, { sign: true }) : "n/a") + " trading, " + fmtUSD(b.roll_rew_ours) + " rewards (bot says " + fmtUSD(b.reward_est_today) + "). The counter drops P&L across restarts.") +
+    meter("Open-scan tier P&amp;L today", b.scan_pnl, b.scan_loss_limit, b.scan_halted ? "Scan tier halted for the day." : "");
+  const hrows = [];
+  hl.side.forEach((x) => hrows.push({ type: "Toxic side", what: x.t, side: x.side, until: x.until, detail: "2 pick-offs on this side in 24h" }));
+  hl.event.forEach((x) => hrows.push({ type: "Toxic event", what: x.ev, side: "both", until: x.until, detail: "pick-offs across markets of the event" }));
+  hl.depth.forEach((x) => hrows.push({ type: x.kind === "live" ? "Mention live" : "Mention depth", what: x.ev, side: "event", since: x.ts, detail: x.strikes ? x.strikes + " fill strike(s)" : "" }));
+  if (hl.manual_halt_file) hrows.push({ type: "Manual", what: "HALT file", side: "all", detail: "delete the HALT file to resume" });
+  if (b.halted_until > now) hrows.push({ type: "Daily loss", what: "whole book", side: "all", until: b.halted_until, detail: "" });
+  table($("haltTable"), [
+    { k: "type", label: "Halt", fmt: (r) => '<span class="tag ' + (/Toxic|Manual|Daily/.test(r.type) ? "crit" : "warn") + '">' + esc(r.type) + "</span>" },
+    { k: "what", label: "Market / event", fmt: (r) => '<span class="mono">' + esc(r.what) + "</span>" },
+    { k: "side", label: "Side" },
+    { k: "until", label: "Until / since", fmt: (r) => r.until ? "until " + tET(r.until) : (r.since ? "since " + dtET(r.since) : "") },
+    { k: "detail", label: "Detail", fmt: (r) => '<span class="small ink2">' + esc(r.detail) + "</span>", nosort: true },
+  ], hrows.filter((r) => matchQ(r.what, r.type)), { limit: 20, empty: "Nothing halted right now." });
+  // toxic sink
+  const sink = hl.sink || [];
+  const t0 = D.windows.today.start;
+  const cnt = (k, a, b) => sink.filter((r) => r.kind === k && r.ts >= a && r.ts < b).length;
+  const y0 = D.windows.yesterday.start;
+  $("toxNote").textContent = hl.toxic_sink_present ? "from the toxic_halts log" : "the bot has not written a toxic_halts log yet (it starts on the next restart onto the event-halt code); strikes below come from its state";
+  const trows = [
+    { d: "Today", p: cnt("pickoff", t0, 1e12), s: cnt("side_halt", t0, 1e12), e: cnt("event_halt", t0, 1e12), f: sink.filter((r) => r.ts >= t0 && r.est_per_day).reduce((s, r) => s + r.est_per_day * ((r.until - r.ts) / 86400), 0) },
+    { d: "Yesterday", p: cnt("pickoff", y0, t0), s: cnt("side_halt", y0, t0), e: cnt("event_halt", y0, t0), f: sink.filter((r) => r.ts >= y0 && r.ts < t0 && r.est_per_day).reduce((s, r) => s + r.est_per_day * ((r.until - r.ts) / 86400), 0) },
+  ];
+  let th = '<table class="t"><thead><tr><th>Day</th><th class="num">Pick-offs</th><th class="num">Side halts</th><th class="num">Event halts</th><th class="num" title="est reward the halted time gave up">Reward forgone</th></tr></thead><tbody>';
+  trows.forEach((r) => { th += "<tr><td>" + r.d + '</td><td class="num">' + r.p + '</td><td class="num">' + r.s + '</td><td class="num">' + r.e + '</td><td class="num">' + fmtUSD(r.f) + "</td></tr>"; });
+  th += "</tbody></table>";
+  const strikes = hl.strikes || [];
+  if (strikes.length) th += '<div class="small ink2" style="margin-top:6px">One strike from a halt (a second pick-off halts the side): ' + strikes.map((s) => '<span class="mono">' + esc(s.t) + "</span> " + esc(s.side) + " (" + tET(s.last) + ")").join(", ") + "</div>";
+  th += '<div class="small muted" style="margin-top:4px">' + hl.pending + " fills waiting for their 5-minute pick-off check.</div>";
+  const recent = sink.filter((r) => r.kind !== "pickoff" || r.ts >= t0).slice(-12).reverse();
+  if (recent.length) {
+    th += '<table class="t" style="margin-top:8px"><thead><tr><th>Time</th><th>Kind</th><th>Market / event</th><th class="num">Detail</th></tr></thead><tbody>';
+    recent.forEach((r) => {
+      const det = r.kind === "pickoff" ? "filled " + fmtC(r.fill_px) + ", mark " + fmtC(r.mark) : (r.kind === "side_halt" ? r.pickoffs + " pick-offs, until " + tET(r.until) : (r.markets_halted || 0) + " mkts, until " + tET(r.until));
+      th += "<tr><td>" + tET(r.ts) + "</td><td>" + esc(r.kind.replace("_", " ")) + '</td><td class="mono">' + esc(r.ticker || r.event) + (r.side ? " " + esc(r.side) : "") + '</td><td class="num small">' + esc(det) + "</td></tr>";
+    });
+    th += "</tbody></table>";
+  }
+  $("toxTable").innerHTML = th;
+  // guards
+  const gcount = {};
+  hl.guards.forEach((g) => { const a = gcount[g.guard] || (gcount[g.guard] = { n: 0, risk: g.risk }); a.n++; });
+  const ent = hl.guard_entered_today || {};
+  $("guardSummary").innerHTML = Object.entries(gcount).sort((a, b) => b[1].n - a[1].n).map(([g, a]) => '<span class="chip ' + (a.risk ? "warn" : "") + '" style="cursor:default">' + (a.risk ? ICON.warn : "") + "<span><b>" + a.n + "</b> " + esc(g.replace(/_/g, " ")) + (ent[g] ? ' <span class="muted">(' + ent[g] + " entered today)</span>" : "") + "</span></span>").join("") || '<span class="muted small">No guard is holding a managed market.</span>';
+  table($("guardTable"), [
+    { k: "t", label: "Market", fmt: (r) => '<span class="mono">' + esc(r.t) + "</span>" },
+    { k: "guard", label: "Guard", fmt: (r) => '<span class="tag ' + (r.risk ? "warn" : "") + '">' + esc(r.guard) + "</span>" },
+    { k: "since", label: "Since", fmt: (r) => dtET(r.since) },
+    { k: "book", label: "Book", num: true, sort: (r) => r.bid, fmt: (r) => (r.bid != null ? r.bid : "—") + "×" + (r.ask != null ? r.ask : "—") },
+    { k: "inputs", label: "Inputs", nosort: true, fmt: (r) => '<span class="small ink2 mono">' + esc(Object.entries(r.inputs || {}).slice(0, 4).map((e) => e[0] + "=" + (typeof e[1] === "number" && e[1] > 1e9 ? tET(e[1]) : (typeof e[1] === "number" ? Math.round(e[1] * 100) / 100 : e[1]))).join(" ")) + "</span>" },
+  ], hl.guards.filter((g) => matchQ(g.t, g.guard)), { sortKey: "since", limit: 12, rowAttr: (r, i) => D.markets[r.t] ? ' class="click" data-i="' + i + '"' : "", onRow: (r) => D.markets[r.t] && openMarket(r.t) });
+  // inventory by event
+  const inv = {};
+  for (const t in D.markets) {
+    const m = D.markets[t];
+    if (!m.pos) continue;
+    const e = inv[m.ev] || (inv[m.ev] = { ev: m.ev, fam: m.fam, n: 0, net: 0, risk: 0, u: 0, du: 0 });
+    e.n++; e.net += m.pos; e.risk += num(m.risk); e.u += num(m.u); e.du += num(mw(m).du);
+  }
+  const irows = Object.values(inv).filter((e) => matchQ(e.ev, e.fam));
+  table($("invTable"), [
+    { k: "ev", label: "Event", fmt: (r) => '<div class="cell-main"><span class="mono">' + esc(r.ev) + '</span><span class="t2">' + esc(r.fam) + "</span></div>" },
+    { k: "n", label: "Mkts", num: true },
+    { k: "risk", label: "At cost", num: true, title: "what the open contracts cost (max loss if every one goes to zero)", fmt: (r) => fmtUSD(r.risk) },
+    { k: "u", label: "Unrealized", num: true, fmt: (r) => money(r.u) },
+    { k: "du", label: "Δ in window", num: true, fmt: (r) => money(r.du) },
+  ], irows, { sortKey: "risk", limit: 12, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => { openRows.add("f:" + r.fam); openRows.add("e:" + r.ev); renderDrivers(); location.hash = "#drivers"; } });
+}
+
+/* ======================= fills ======================= */
+function renderFills() {
+  const w = win();
+  const fl = (D.fills || []).filter((f) => f.ts >= w.start && f.ts < w.end + 1 && !f.pad && !f.taker && matchQ(f.t, (D.markets[f.t] || {}).fam));
+  const fam = {};
+  for (const f of fl) {
+    const m = D.markets[f.t] || { fam: "?" };
+    const a = fam[m.fam] || (fam[m.fam] = { fam: m.fam, n: 0, cts: 0, usd: 0, mk: 0, mkn: 0, mkcts: 0, neg: 0 });
+    a.n++; a.cts += f.n; a.usd += f.n * (f.side === "bid" ? f.px : 100 - f.px) / 100;
+    if (f.mk != null) { a.mk += f.mk; a.mkn++; a.mkcts += f.n; if (f.mkc <= -5) a.neg++; }
+  }
+  table($("fillFam"), [
+    { k: "fam", label: "Family", fmt: (r) => esc(r.fam) },
+    { k: "n", label: "Fills", num: true },
+    { k: "cts", label: "Contracts", num: true, fmt: (r) => fmtNum(r.cts) },
+    { k: "usd", label: "$ traded", num: true, fmt: (r) => fmtUSD(r.usd) },
+    { k: "mk", label: "Mark-out", num: true, fmt: (r) => r.mkn ? money(r.mk) : '<span class="muted">pending</span>' },
+    { k: "mkc", label: "¢/ct", num: true, sort: (r) => r.mkcts ? r.mk / r.mkcts : null, fmt: (r) => r.mkcts ? fmtC(r.mk / r.mkcts * 100) : "—" },
+    { k: "neg", label: "Picked off", num: true, title: "fills whose 30-min mark moved 5c+ against them", sort: (r) => r.mkn ? r.neg / r.mkn : null, fmt: (r) => r.mkn ? r.neg + ' <span class="muted">/' + r.mkn + "</span>" : "—" },
+  ], Object.values(fam), { sortKey: "mk", dir: 1, limit: 20, empty: "No maker fills in this window." });
+  table($("fillList"), [
+    { k: "ts", label: "Time", fmt: (r) => '<span class="nowrap">' + dtET(r.ts) + "</span>" },
+    { k: "t", label: "Market", fmt: (r) => '<span class="mono">' + esc(r.t) + "</span>" },
+    { k: "side", label: "Side", fmt: (r) => r.side === "bid" ? "bought" : "sold" },
+    { k: "px", label: "Price", num: true, fmt: (r) => fmtC(r.px) },
+    { k: "n", label: "Qty", num: true, fmt: (r) => fmtNum(r.n, r.n % 1 ? 1 : 0) },
+    { k: "mk", label: "Mark-out", num: true, fmt: (r) => r.mk != null ? money(r.mk) + ' <span class="muted small">' + (r.mkc >= 0 ? "+" : MINUS) + fmtC(Math.abs(r.mkc)) + "</span>" : (r.mk_pending ? '<span class="muted">pending</span>' : '<span class="muted">—</span>') },
+    { k: "pos1", label: "Pos after", num: true, fmt: (r) => fmtNum(r.pos1) },
+  ], fl, { sortKey: "ts", limit: 25, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => D.markets[r.t] && openMarket(r.t), empty: "No maker fills in this window." });
+}
+
+/* ======================= history ======================= */
+function renderHistory() {
+  const hs = D.history || [];
+  const rows = hs.map((r) => ({
+    x: day(r.d).replace(/^\w+, /, ""), head: day(r.d), v: r.net != null ? r.net : null,
+    tip: [
+      { name: "Net", value: r.net != null ? fmtUSD(r.net, { sign: true }) : "n/a", color: css("--s-net"), line: true },
+      { name: "Modeled rewards", value: fmtUSD(r.rew), color: css("--s-rew") },
+      { name: "Trading P&L", value: r.pnl != null ? fmtUSD(r.pnl, { sign: true }) : "n/a", color: css("--s-trade") },
+      { name: "Credited that day", value: r.cred != null ? fmtUSD(r.cred) : "not in ledger yet", color: css("--s-cred") },
+      { name: "Fills", value: fmtNum(r.fills) },
+    ],
+  }));
+  $("histLegend1").innerHTML = '<span><i class="key" style="background:var(--div-pos)"></i>Positive</span><span><i class="key" style="background:var(--div-neg)"></i>Negative</span>';
+  columns($("histNet"), rows.filter((r) => r.v != null), { height: 220, label: "Net per day" });
+  $("histLegend2").innerHTML = '<span><i class="key" style="background:var(--s-rew)"></i>Modeled</span><span><i class="key" style="background:var(--s-cred)"></i>Credited (ledger)</span>';
+  columns($("histRew"), hs.map((r) => ({ x: day(r.d).replace(/^\w+, /, ""), head: day(r.d), vals: [r.rew, r.cred], tip: [
+    { name: "Modeled rewards", value: fmtUSD(r.rew), color: css("--s-rew") },
+    { name: "Credited that day", value: r.cred != null ? fmtUSD(r.cred) : "not in ledger yet", color: css("--s-cred") }] })),
+    { height: 220, series: [{ color: css("--s-rew") }, { color: css("--s-cred") }], label: "Modeled rewards and credits per day" });
+  const withP = hs.filter((r) => r.pnl != null);
+  const sum = (k, arr) => arr.reduce((s, r) => s + num(r[k]), 0);
+  $("histNote").textContent = "Trading P&L from " + (withP[0] ? day(withP[0].d) : "—") + " (the position-snapshot log starts then). Credits land 1–2 days after the liquidity that earned them, per program period, so a day's credit pays for earlier days. Ledger through " + (D.ledger_max || "—") + ".";
+  const t7 = hs.slice(-7);
+  table($("histTable"), [
+    { k: "d", label: "Day", fmt: (r) => day(r.d) },
+    { k: "rew", label: "Modeled rewards", num: true, fmt: (r) => fmtUSD(r.rew) },
+    { k: "cred", label: "Credited", num: true, fmt: (r) => r.cred != null ? fmtUSD(r.cred) : '<span class="muted">—</span>' },
+    { k: "real", label: "Realized", num: true, fmt: (r) => r.real != null ? money(r.real) : '<span class="muted">n/a</span>' },
+    { k: "pnl", label: "Trading P&L", num: true, fmt: (r) => r.pnl != null ? money(r.pnl) : '<span class="muted">n/a</span>' },
+    { k: "net", label: "Net", num: true, fmt: (r) => r.net != null ? "<b>" + money(r.net) + "</b>" : '<span class="muted">n/a</span>' },
+    { k: "fills", label: "Fills", num: true, fmt: (r) => fmtNum(r.fills) },
+    { k: "cts", label: "Contracts", num: true, fmt: (r) => fmtNum(r.cts) },
+  ], hs.slice().reverse(), { limit: 14, totalRow: { d: "Last 7 days", rew: fmtUSD(sum("rew", t7)), cred: fmtUSD(sum("cred", t7)), real: money(sum("real", t7.filter((r) => r.real != null))), pnl: money(sum("pnl", t7.filter((r) => r.pnl != null))), net: "<b>" + money(sum("net", t7.filter((r) => r.net != null))) + "</b>", fills: fmtNum(sum("fills", t7)), cts: fmtNum(sum("cts", t7)) } });
+}
+
+/* ======================= health ======================= */
+function renderHealth() {
+  const h = D.health, b = D.bot, now = Date.now() / 1000;
+  const stats = [
+    { k: "Heartbeat", v: h.updated_at ? ago(h.updated_at) : "—", s: (h.mode || "") + (h.stale ? " · STALE" : ""), bad: h.stale },
+    { k: "Cycle period (last hour)", v: h.cycle_period != null ? h.cycle_period + " s" : "—", s: h.max_gap != null ? "longest gap " + dur(h.max_gap) : "" },
+    { k: "Runs today", v: (h.runs_today || []).length, s: "current " + ((h.runs_today || []).slice(-1)[0] || {}).run },
+    { k: "Errors today", v: h.errors_today != null ? h.errors_today : "—", s: "current run's counter" },
+    { k: "Position snapshot", v: ago(h.marks_last), s: "5-minute marks log" },
+    { k: "Selection snapshot", v: ago(h.snapshot_ts), s: "hourly candidate scoring" },
+    { k: "Credit ledger", v: h.ledger_max || "—", s: "latest credit pasted in" },
+    { k: "Est. rewards, lifetime", v: fmtUSD(D.credits.est_lifetime), s: "credited " + fmtUSD(D.credits.lifetime_imm) + " (IMM, ledger)" },
+  ];
+  $("healthStats").innerHTML = stats.map((s) => '<div class="card stat"><div class="k">' + esc(s.k) + '</div><div class="v' + (s.bad ? " down" : "") + '">' + esc(s.v) + '</div><div class="s">' + esc(s.s) + "</div></div>").join("");
+  const nowET = new Date().toLocaleString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit", minute: "2-digit" });
+  table($("lineup"), [
+    { k: "at", label: "ET", fmt: (r) => esc(r.at) },
+    { k: "label", label: "Job" },
+    { k: "ok", label: "Status", fmt: (r) => r.ok === true ? '<span class="tag good">sent</span>' : r.ok === false ? (!r.ever ? '<span class="tag">never sent yet</span>' : nowET > addMin(r.at, 30) ? '<span class="tag crit">not sent</span>' : '<span class="tag">scheduled</span>') : '<span class="tag">' + (r.log_mtime ? "ran " + ago(r.log_mtime) : "—") + "</span>" },
+    { k: "note", label: "Last error", nosort: true, fmt: (r) => '<span class="small ink2 mono">' + esc(r.note || "") + "</span>" },
+  ], h.lineup || [], { limit: 10 });
+  const runs = (h.runs_today || []).slice().reverse();
+  table($("runs"), [
+    { k: "run", label: "Run", fmt: (r) => '<span class="mono">' + esc(r.run) + "</span>" },
+    { k: "start", label: "First cycle", fmt: (r) => dtET(r.start) },
+    { k: "end", label: "Last cycle", fmt: (r) => dtET(r.end) },
+    { k: "len", label: "Length", num: true, sort: (r) => r.end - r.start, fmt: (r) => dur(r.end - r.start) },
+  ], runs, { limit: 12, empty: "No cycles today." });
+  const sk = Object.entries(h.sinks || {}).map(([k, v]) => ({ k, v }));
+  table($("sinks"), [
+    { k: "k", label: "Log", fmt: (r) => '<span class="mono">' + esc(r.k) + "</span>" },
+    { k: "v", label: "Last write", fmt: (r) => r.v ? ago(r.v) : '<span class="muted">none</span>' },
+    { k: "st", label: "", nosort: true, fmt: (r) => !r.v ? "" : (now - r.v > 1800 && r.k !== "toxic_halts" && r.k !== "realized" && r.k !== "fills" ? '<span class="tag warn">stale</span>' : '<span class="tag good">fresh</span>') },
+  ], sk, { limit: 20 });
+  const cfg = D.config || {};
+  $("cfg").textContent = Object.keys(cfg).map((k) => k + "=" + cfg[k]).join("\n") || "launcher not readable";
+  const tm = D.timing || {};
+  $("foot").textContent = "Built in " + (tm.total || "?") + " s (" + Object.entries(tm).filter((e) => e[0] !== "total").map((e) => e[0] + " " + e[1] + "s").join(", ") + "). Regenerate: python imm_dashboard.py. Every figure is read-only against the bot's own logs; nothing here places or cancels orders.";
+}
+
+/* ======================= market drawer ======================= */
+function openMarket(t) {
+  const m = D.markets[t];
+  if (!m) return;
+  const dr = $("drawer");
+  const c = m.cur, p0 = (D.paths && D.paths.m) ? D.paths.m[t] : null;
+  const p = p0 ? { p: p0.p.slice(), r: p0.r.slice(), k: p0.k.slice(), q: p0.q.slice() } : null;
+  let h = '<div class="dh"><div><h3 class="mono">' + esc(t) + '</h3><div class="small ink2">' + esc(m.fam) + " · " + esc(m.grp) + ' · event <span class="mono">' + esc(m.ev) + "</span></div></div>" +
+    '<button class="x" type="button" id="dx" aria-label="Close">×</button></div>';
+  h += '<div class="attn">' + stateTags(m) + (m.dec ? ' <span class="tag">decision: ' + esc(m.dec) + "</span>" : "") + "</div>";
+  h += '<dl class="kv">';
+  h += "<dt>Position</dt><dd>" + (m.pos ? fmtNum(m.pos, 1) + " @ " + fmtC(m.avg) + (m.mark != null ? ", mark " + fmtC(m.mark) + " · unrealized " + money(m.u) + " · at cost " + fmtUSD(m.risk) : "") : "flat") + "</dd>";
+  if (c) {
+    h += "<dt>Quoting</dt><dd>" + (c.bid_ct > 0 ? fmtNum(c.bid_ct) + " bid @ " + fmtC(c.bid_top) : "no bid") + " · " + (c.ask_ct > 0 ? fmtNum(c.ask_ct) + " ask @ " + fmtC(c.ask_top) : "no ask") + ' <span class="muted">(book ' + (c.xb != null ? c.xb : "—") + "×" + (c.xa != null ? c.xa : "—") + ")</span></dd>";
+    h += "<dt>Rewards now</dt><dd>" + fmtUSD(c.est_day) + "/day of a " + fmtUSD(c.pool_day) + "/day pool (" + fmtPct(c.pool_day ? c.est_day / c.pool_day : null) + ") · " + fmtUSD(c.usd) + " resting" + (c.hm && c.hm !== 1 ? " · size ×" + c.hm : "") + "</dd>";
+  }
+  if (m.guard) h += "<dt>Guard</dt><dd>" + esc(m.guard) + " since " + dtET(m.guard_since) + "</dd>";
+  if (m.halt) h += "<dt>Halt</dt><dd>" + esc(m.halt.join("; ")) + "</dd>";
+  if (m.cutoff || m.pend) h += "<dt>Cutoff</dt><dd>" + (m.cutoff ? dtET(m.cutoff) : "—") + (m.pend ? " · program ends " + dtET(m.pend) : "") + "</dd>";
+  if (m.acc) h += "<dt>Accrued (bot)</dt><dd>" + fmtUSD(m.acc) + " this program, per the bot's persisted counter</dd>";
+  h += "</dl>";
+  // windows table
+  h += '<table class="t"><thead><tr><th>Window</th><th class="num">Rewards</th><th class="num">Realized</th><th class="num">Marks Δ</th><th class="num">Trading</th><th class="num">Net</th><th class="num">Fills</th></tr></thead><tbody>';
+  for (const k of WKEYS) {
+    const w = m.w[k] || {};
+    const na = D.windows[k].pnl_na;
+    h += "<tr" + (k === W ? ' style="font-weight:600"' : "") + "><td>" + esc(D.windows[k].label) + '</td><td class="num">' + fmtUSD(w.rew || 0) + '</td><td class="num">' + money(w.real || 0) + '</td><td class="num">' + money((w.du || 0) + (w.xfer || 0)) + '</td><td class="num">' + (na ? "n/a" : money(w.pnl || 0)) + '</td><td class="num">' + (na ? "n/a" : money(w.net || 0)) + '</td><td class="num">' + fmtNum(w.fills || 0) + "</td></tr>";
+  }
+  h += "</tbody></table>";
+  if (p) {
+    h += '<div><div class="mini-title">Last 7 days, hourly<span><i class="keyline" style="background:var(--s-trade)"></i> cumulative trading P&amp;L</span><span><i class="keyline" style="background:var(--s-rew)"></i> cumulative modeled rewards</span></div><div id="dChart1"></div></div>';
+    h += '<div><div class="mini-title">Mark (mid), cents</div><div id="dChart2"></div></div>';
+    h += '<div><div class="mini-title">Position, contracts</div><div id="dChart3"></div></div>';
+  } else {
+    h += '<div class="small muted">No hourly history for this market: only the biggest movers and open positions carry one.</div>';
+  }
+  const fl = (D.fills || []).filter((f) => f.t === t);
+  h += '<div><div class="mini-title">Fills, last 7 days (' + fl.length + ")</div>";
+  if (fl.length) {
+    h += '<table class="t"><thead><tr><th>Time</th><th>Side</th><th class="num">Price</th><th class="num">Qty</th><th class="num">Mark-out</th><th class="num">Pos after</th></tr></thead><tbody>';
+    fl.slice(0, 60).forEach((f) => { h += "<tr><td>" + dtET(f.ts) + "</td><td>" + (f.side === "bid" ? "bought" : "sold") + (f.pad ? " (pad)" : "") + '</td><td class="num">' + fmtC(f.px) + '</td><td class="num">' + fmtNum(f.n, f.n % 1 ? 1 : 0) + '</td><td class="num">' + (f.mk != null ? money(f.mk) : '<span class="muted">' + (f.mk_pending ? "pending" : "—") + "</span>") + '</td><td class="num">' + fmtNum(f.pos1) + "</td></tr>"; });
+    h += "</tbody></table>";
+  } else h += '<div class="small muted">No fills.</div>';
+  h += "</div>";
+  dr.innerHTML = h;
+  dr.hidden = false; $("scrim").hidden = false;
+  $("dx").addEventListener("click", closeDrawer);
+  if (p) {
+    let hrs = D.paths.hours.map((hh) => hh * 3600);
+    // start an hour before the market's first position, P&L or reward
+    let i0 = p.q.findIndex((q, i) => q || p.p[i] || p.r[i]);
+    i0 = i0 < 0 ? 0 : Math.max(0, i0 - 1);
+    if (i0 > 0) { hrs = hrs.slice(i0); p.p = p.p.slice(i0); p.r = p.r.slice(i0); p.k = p.k.slice(i0); p.q = p.q.slice(i0); }
+    const x0 = hrs[0], x1 = hrs[hrs.length - 1];
+    lineChart($("dChart1"), [
+      { name: "Trading P&L", color: css("--s-trade"), pts: hrs.map((x, i) => [x, p.p[i]]) },
+      { name: "Modeled rewards", color: css("--s-rew"), pts: hrs.map((x, i) => [x, p.r[i]]) },
+    ], { height: 170, x0, x1, xticks: timeTicks });
+    lineChart($("dChart2"), [{ name: "Mark", color: css("--s-mark"), pts: hrs.map((x, i) => [x, p.k[i]]) }], { height: 120, x0, x1, xticks: timeTicks, yfmt: (v) => v + "¢", vfmt: (v) => fmtC(v) });
+    lineChart($("dChart3"), [{ name: "Position", color: css("--s-net"), pts: hrs.map((x, i) => [x, p.q[i]]) }], { height: 110, x0, x1, xticks: timeTicks, yfmt: (v) => fmtNum(v), vfmt: (v) => fmtNum(v) });
+  }
+  dr.focus && dr.focus();
+}
+function closeDrawer() { $("drawer").hidden = true; $("scrim").hidden = true; hideTip(); }
+$("scrim").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+
+/* ======================= wiring ======================= */
+function renderAll() {
+  aggregate();
+  renderHeader();
+  renderSummary();
+  renderAttention();
+  renderDrivers();
+  renderMovers();
+  renderQuoting();
+  renderOpps();
+  renderRisk();
+  renderFills();
+  renderHistory();
+  renderHealth();
+}
+if (!D) {
+  document.getElementById("app").innerHTML = '<div class="empty">No data embedded. Build this page with python imm_dashboard.py.</div>';
+} else {
+  renderAll();
+  let qt = null;
+  $("q").addEventListener("input", (e) => { clearTimeout(qt); qt = setTimeout(() => { Q = e.target.value.trim().toLowerCase(); for (const k in TSTATE) if (TSTATE[k] && TSTATE[k].limit) TSTATE[k].limit = Math.max(TSTATE[k].limit, 25); renderAll(); }, 160); });
+  let rt = null;
+  addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { renderSummary(); renderFamChart(Object.values(AGG.fams).filter((f) => f.rew || f.pnl || f.fills)); renderHistory(); }, 200); });
+  // nav highlight
+  const links = [...document.querySelectorAll("#nav a")];
+  const secs = links.map((a) => document.querySelector(a.getAttribute("href")));
+  addEventListener("scroll", () => {
+    let cur = 0;
+    secs.forEach((s, i) => { if (s && s.getBoundingClientRect().top < 140) cur = i; });
+    links.forEach((a, i) => a.classList.toggle("on", i === cur && scrollY > 200));
+  }, { passive: true });
+  // keep the "as of" age honest while the page sits open; a local copy
+  // (file:// or the localhost preview) reloads every 10 minutes to pick up
+  // the scheduled rebuild -- never while a market's detail is open
+  setInterval(renderHeader, 60000);
+  const local = location.protocol === "file:" || /^(127\.0\.0\.1|localhost)$/.test(location.hostname);
+  if (local) setInterval(() => { if (!$("drawer").hidden) return; saveOpen(); location.reload(); }, 10 * 60000);
+  // charts take their colours from the theme when drawn: redraw on a switch
+  try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => renderAll()); } catch (e) { /* old engines */ }
+}
+</script>
