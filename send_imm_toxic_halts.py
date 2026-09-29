@@ -219,12 +219,18 @@ def _rule_lines() -> list:
         f"{imm.TOXIC_HALT_SECS / 60:g} min."]
 
 
+def _c(v) -> str:
+    """A price in cents, half cents kept: 51 -> '51', 50.5 -> '50.5'."""
+    return f"{float(v):.1f}".rstrip("0").rstrip(".")
+
+
 def _move_txt(r) -> str:
     if r["move"] is None:
         return "n/a"
-    word = "kept moving against" if r["move"] > 0 else (
-        "moved back" if r["move"] < 0 else "flat")
-    return f"{r['m0']:.0f}->{r['m1']:.0f} ({word} {abs(r['move']):.0f}c)"
+    if abs(r["move"]) < 0.05:
+        return f"{_c(r['m0'])}->{_c(r['m1'])} (flat)"
+    word = "kept moving against" if r["move"] > 0 else "moved back"
+    return f"{_c(r['m0'])}->{_c(r['m1'])} ({word} {_c(abs(r['move']))}c)"
 
 
 def render_text(ctx) -> str:
@@ -252,7 +258,7 @@ def render_text(ctx) -> str:
               f"  {'ET':5s}  {'market':40s} {'side':4s} {'forgone':>8s}  "
               f"pick-offs (fill->mark)  price during halt"]
         for r in ctx["side_rows"][:MAX_ROWS]:
-            pk = ", ".join(f"{a:.0f}->{b:.0f}" for a, b in r["picks"]) or "n/a"
+            pk = ", ".join(f"{_c(a)}->{_c(b)}" for a, b in r["picks"]) or "n/a"
             L.append(f"  {_et(r['ts']):5s}  {r['ticker'][:40]:40s} "
                      f"{r['side'].upper():4s} {'$%.2f' % r['forgone']:>8s}  "
                      f"{pk}  {_move_txt(r)}")
@@ -261,7 +267,7 @@ def render_text(ctx) -> str:
         for t, s, ps in ctx["top"]:
             worst = max(ps, key=lambda p: abs(p["mark"] - p["fill_px"]))
             L.append(f"  {len(ps):3d}x  {t[:44]:44s} {s.upper():4s} worst "
-                     f"{worst['fill_px']:.0f}->{worst['mark']:.0f}")
+                     f"{_c(worst['fill_px'])}->{_c(worst['mark'])}")
     L += ["", "Knobs: IMM_TOXIC_HALT=0 kills both rules; IMM_TOXIC_EVENT_MARKETS=0 "
           "the event rule alone; IMM_TOXIC_PICKOFF_CENTS / _PICKOFFS / "
           "_HALT_MIN / _EVENT_WINDOW_MIN / _EVENT_HALT_MIN tune them."]
@@ -300,7 +306,7 @@ def render_html(ctx) -> str:
         parts.append(table(["ET", "market", "side", "forgone", "pick-offs (fill->mark)",
                             "price during halt"], [
             (_et(r["ts"]), r["ticker"], r["side"].upper(), f"${r['forgone']:.2f}",
-             ", ".join(f"{a:.0f}->{b:.0f}" for a, b in r["picks"]) or "n/a",
+             ", ".join(f"{_c(a)}->{_c(b)}" for a, b in r["picks"]) or "n/a",
              _move_txt(r)) for r in ctx["side_rows"][:MAX_ROWS]]))
     if not ctx["side_rows"] and not ctx["event_rows"]:
         parts.append("<p style='font:13px sans-serif'>Nothing was halted.</p>")
@@ -311,7 +317,7 @@ def render_html(ctx) -> str:
         for t, s, ps in ctx["top"]:
             worst = max(ps, key=lambda p: abs(p["mark"] - p["fill_px"]))
             rows.append((len(ps), t, s.upper(),
-                         f"{worst['fill_px']:.0f}->{worst['mark']:.0f}"))
+                         f"{_c(worst['fill_px'])}->{_c(worst['mark'])}"))
         parts.append(table(["count", "market", "side", "worst"], rows))
     return "\n".join(parts)
 
