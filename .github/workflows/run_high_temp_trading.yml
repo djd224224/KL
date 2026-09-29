@@ -5,8 +5,23 @@ name: High temp trading
 # cron values. The 04:02 UTC slot is the 23 CDT evening run; firing earlier
 # (e.g. 02:02 UTC = 21 CDT) hits WU's pre-refresh window where
 # temperatureMax[0] is null.
+#
+# One extra slot runs on GitHub's own schedule: the west late-morning
+# re-quote (2026-09-29 test), 14:07 UTC = 09:07 CDT / 08:07 CST. It only
+# touches LAX/SFO/SEA/LV/SD/PHX/DEN and keeps quoting them until 10:05 local.
+# GH cron drift only shortens its window (cities <20 min from their cutoff are
+# skipped), so it does not need cron-job.org precision. Kill switch without a
+# deploy: repo variable KXHIGH_WEST_LATE_ENABLED=false (Settings > Secrets and
+# variables > Actions > Variables) -- the late run then exits untouched.
 on:
   workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "Empty = slot from the clock. 'west_late' = west late-morning re-quote."
+        required: false
+        default: ""
+  schedule:
+    - cron: '7 14 * * *'
 jobs:
   run-kalshi-script:
     runs-on: ubuntu-latest
@@ -47,6 +62,10 @@ jobs:
         AB_TEST_ENABLED: "false"
         AB_TREATMENT_PROPORTION: "0.5"
         AB_SAFETY_MARGIN_CENTS: "3"
+        # West late-morning test (see header). The scheduled trigger is always
+        # the late slot; cron-job.org dispatches leave it empty.
+        KXHIGH_RUN_SLOT: ${{ github.event_name == 'schedule' && 'west_late' || inputs.run_slot }}
+        WEST_LATE_ENABLED: ${{ vars.KXHIGH_WEST_LATE_ENABLED || 'true' }}
       run: |
         set -o pipefail
         python high_temp_trading.py 2>&1 | tee run.log

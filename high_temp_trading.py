@@ -342,7 +342,9 @@ def compute_rolling_bias():
       SELECT 'TOKC', 'Oklahoma City' UNION ALL SELECT 'TSEA', 'Seattle' UNION ALL
       SELECT 'TSFO', 'San Francisco' UNION ALL SELECT 'TSATX', 'San Antonio' UNION ALL
       SELECT 'TMIN', 'Minneapolis' UNION ALL SELECT 'TNOLA', 'New Orleans' UNION ALL
-      SELECT 'TBOS', 'Boston'
+      SELECT 'TBOS', 'Boston' UNION ALL
+      SELECT 'TSAN', 'San Diego' UNION ALL SELECT 'TSDF', 'Louisville' UNION ALL
+      SELECT 'TTTN', 'Trenton' UNION ALL SELECT 'TEWR', 'Newark'
     ),
     first_snap AS (
       SELECT city, forecast_date, forecast_avg,
@@ -477,7 +479,125 @@ cities = {
     "Minneapolis":    (44.88306, -93.22889),   # KMSP
     "New Orleans":    (29.99278, -90.25083),   # KMSY
     "Boston":         (42.36056, -71.01056),   # KBOS Logan
+    # Added 2026-09-29. Kalshi settles each on the NWS CLI report for the
+    # station (CLISAN / CLISDF / CLITTN / CLIEWR per the market rules).
+    "San Diego":      (32.73361, -117.18306),  # KSAN Lindbergh Field
+    "Louisville":     (38.17406, -85.73650),   # KSDF Muhammad Ali Intl
+    "Trenton":        (40.27639, -74.81639),   # KTTN Trenton-Mercer
+    "Newark":         (40.68250, -74.16944),   # KEWR Newark Liberty
 }
+# Every city the bot knows. `cities` itself is narrowed to the cities this
+# run trades (see RUN SLOT below) and re-derived from this further down.
+CITY_COORDS = dict(cities)
+
+# =====================================================================
+# RUN SLOT + DAY-OF CUTOFFS                                  (2026-09-29)
+# ---------------------------------------------------------------------
+# Day-run orders (variable == 0) sit on TODAY's market, so they have to be
+# gone before the local morning is: after that the temperature itself
+# tells informed traders which bucket wins. Cutoff is 10:05 local for the
+# East (09:05 CT) and 10:05 CT for everyone else -- which is only 08:05 in
+# the Pacific and 09:05 in Denver.
+#
+# The day-run expiry used to come from get_unix_time_for_tomorrow(), which
+# ROLLS A PASSED TARGET FORWARD A DAY. On today's market that is backwards:
+# the 05:02 CT run's orders carried tomorrow-01:59 expiries (only the 07:02
+# run's cancel sweep removed them), and any day run after 09:00 CT would
+# have left East orders resting through the afternoon high. Day-run orders
+# now expire at the city's own cutoff, and a city whose cutoff is under
+# DAYOF_MIN_LEAD_MIN away is not traded at all. Evening runs are unchanged.
+#
+# WEST LATE-MORNING TEST. Jul 7 - Sep 27 fills: East/Central cities earned
+# +8 to +16c/contract in their 8-10 AM local window; the West never quotes
+# it. A late run (GH schedule 14:07 UTC = 09:07 CDT / 08:07 CST) re-quotes
+# ONLY the west cities, with fresh obs/peak filters and the cutoff moved to
+# 10:05 LOCAL -- the rule East/Central already run under. Read it out on
+# fills after the old 10:05 CT cutoff (analysis/kxhigh/sql/91_*).
+# Kill switch: WEST_LATE_ENABLED=false (the workflow reads the repo variable
+# KXHIGH_WEST_LATE_ENABLED, so it flips without a deploy) -- late runs then
+# exit without touching anything.
+# =====================================================================
+CT_TZ = pytz.timezone('US/Central')
+
+# Regular day-of cutoff, as a CT hour at :05. East = 09:05 CT = 10:05 ET.
+_CITY_CUTOFF_HOUR = {
+    "New York City": 9, "Philadelphia": 9, "Miami": 9, "Atlanta": 9,
+    "Washington DC": 9, "Boston": 9,
+    "Newark": 9, "Trenton": 9, "Louisville": 9,
+}  # everything else defaults to 10
+
+WEST_LATE_ENABLED = os.environ.get("WEST_LATE_ENABLED", "true").lower() == "true"
+WEST_LATE_TZ = {
+    "Los Angeles": "America/Los_Angeles", "San Francisco": "America/Los_Angeles",
+    "Seattle": "America/Los_Angeles", "Las Vegas": "America/Los_Angeles",
+    "San Diego": "America/Los_Angeles",
+    "Phoenix": "America/Phoenix",   # MST all year: 2h behind CT in summer, 1h in winter
+    "Denver": "America/Denver",
+}
+WEST_LATE_CUTOFF_LOCAL = (10, 5)
+# A day run starting at or after this CT hour is a late run whatever
+# triggered it: it may only touch west cities, under the late cutoff.
+WEST_LATE_START_HOUR_CT = 9
+DAYOF_MIN_LEAD_MIN = int(os.environ.get("DAYOF_MIN_LEAD_MIN", "20"))
+
+_slot_env = os.environ.get("KXHIGH_RUN_SLOT", "").strip().lower()
+if _slot_env == "west_late":
+    RUN_SLOT = "west_late"          # the scheduled late run, however late it fires
+elif variable == 1:
+    RUN_SLOT = "evening"
+elif central_time.hour >= WEST_LATE_START_HOUR_CT:
+    RUN_SLOT = "west_late"
+else:
+    RUN_SLOT = "morning"
+
+# The market date this run trades (today for day runs).
+_TARGET_DATE = (central_time + timedelta(days=variable)).date()
+
+
+def _dayof_cutoff(city):
+    """Aware datetime at which this run's orders on `city` must be gone.
+    Day runs only; evening runs keep their 01:59 CT expiry."""
+    if RUN_SLOT == "west_late" and city in WEST_LATE_TZ:
+        tz = pytz.timezone(WEST_LATE_TZ[city])
+        h, m = WEST_LATE_CUTOFF_LOCAL
+    else:
+        tz = CT_TZ
+        h, m = _CITY_CUTOFF_HOUR.get(city, 10), 5
+    d = _TARGET_DATE
+    return tz.localize(datetime(d.year, d.month, d.day, h, m))
+
+
+def _city_trades_this_run(city):
+    if RUN_SLOT == "evening":
+        return True
+    if RUN_SLOT == "west_late":
+        # variable == 1 here means a late run delayed past 14:00 CT: that
+        # would be an unscheduled evening run, so it trades nothing.
+        if variable != 0 or not WEST_LATE_ENABLED or city not in WEST_LATE_TZ:
+            return False
+    lead_min = (_dayof_cutoff(city) - datetime.now(CT_TZ)).total_seconds() / 60.0
+    return lead_min >= DAYOF_MIN_LEAD_MIN
+
+
+ACTIVE_CITIES = [c for c in CITY_COORDS if _city_trades_this_run(c)]
+cities = {c: CITY_COORDS[c] for c in ACTIVE_CITIES}
+
+print(f"\n[SLOT] {RUN_SLOT} (variable={variable}, {central_time.strftime('%H:%M')} CT"
+      f"{', KXHIGH_RUN_SLOT=' + _slot_env if _slot_env else ''}) - "
+      f"trading {len(ACTIVE_CITIES)}/{len(CITY_COORDS)} cities")
+if RUN_SLOT != "evening":
+    for _c in ACTIVE_CITIES:
+        _co = _dayof_cutoff(_c)
+        print(f"  {_c:<15} orders expire {_co.strftime('%H:%M %Z')} "
+              f"({_co.astimezone(CT_TZ).strftime('%H:%M')} CT)")
+if not ACTIVE_CITIES:
+    print(f"  nothing to trade (west_late enabled={WEST_LATE_ENABLED}); "
+          f"exiting without cancelling or placing anything")
+    write_run_row("start", variable=int(variable), central_time_hour=int(central_time.hour),
+                  run_slot=RUN_SLOT)
+    write_run_row("end", finished_at=datetime.now(pytz.UTC), n_orders_placed=0,
+                  exit_status="noop", run_slot=RUN_SLOT)
+    sys.exit(0)
 
 def get_accuweather_forecast(coords):
     try:
@@ -584,6 +704,10 @@ CITY_TO_KALSHI_STATION = {
     "Minneapolis":    "KMSP",
     "New Orleans":    "KMSY",
     "Boston":         "KBOS",  # Logan (Kalshi rules: "Boston (Logan Airport), MA")
+    "San Diego":      "KSAN",  # Kalshi rules: "San Diego (CLISAN)"
+    "Louisville":     "KSDF",  # "Louisville (CLISDF)"
+    "Trenton":        "KTTN",  # "Trenton (CLITTN)"
+    "Newark":         "KEWR",  # "Newark (CLIEWR)"
 }
 
 
@@ -787,29 +911,9 @@ from datetime import datetime, timedelta
 
 # City data with their corresponding location information for NWS API.
 # Coordinates match each city's exact Kalshi settlement station (see comment
-# on the first `cities` dict above for the mapping).
-cities = {
-    "Austin":         {"lat": 30.18304, "lon":  -97.67987},
-    "Miami":          {"lat": 25.79056, "lon":  -80.31639},
-    "Houston":        {"lat": 29.63750, "lon":  -95.28250},
-    "Denver":         {"lat": 39.84658, "lon": -104.65622},
-    "New York City":  {"lat": 40.78333, "lon":  -73.96667},
-    "Philadelphia":   {"lat": 39.87327, "lon":  -75.22678},
-    "Chicago":        {"lat": 41.78417, "lon":  -87.75528},
-    "Los Angeles":    {"lat": 33.93806, "lon": -118.38889},
-    "Atlanta":        {"lat": 33.64028, "lon":  -84.42694},
-    "Washington DC":  {"lat": 38.84833, "lon":  -77.03417},
-    "Phoenix":        {"lat": 33.42780, "lon": -112.00347},
-    "Dallas":         {"lat": 32.89743, "lon":  -97.02196},
-    "Las Vegas":      {"lat": 36.07188, "lon": -115.16340},
-    "Oklahoma City":  {"lat": 35.38861, "lon":  -97.60028},
-    "Seattle":        {"lat": 47.44472, "lon": -122.31361},
-    "San Francisco":  {"lat": 37.61961, "lon": -122.36558},
-    "San Antonio":    {"lat": 29.53278, "lon":  -98.46361},
-    "Minneapolis":    {"lat": 44.88306, "lon":  -93.22889},
-    "New Orleans":    {"lat": 29.99278, "lon":  -90.25083},
-    "Boston":         {"lat": 42.36056, "lon":  -71.01056},
-}
+# on the first `cities` dict above for the mapping). Same cities as this
+# run trades, in dict form.
+cities = {c: {"lat": CITY_COORDS[c][0], "lon": CITY_COORDS[c][1]} for c in ACTIVE_CITIES}
 
 # Prepare the date for today
 today = datetime.now(pytz.timezone('US/Central')).strftime("%Y-%m-%d")
@@ -891,28 +995,7 @@ def fetch_midnight_forecast(coords):
     return None
 
 # Coordinates for cities (station-exact, same as first cities dict)
-cities = {
-    "Austin":         {"lat": 30.18304, "lon":  -97.67987},
-    "Miami":          {"lat": 25.79056, "lon":  -80.31639},
-    "Houston":        {"lat": 29.63750, "lon":  -95.28250},
-    "Denver":         {"lat": 39.84658, "lon": -104.65622},
-    "New York City":  {"lat": 40.78333, "lon":  -73.96667},
-    "Philadelphia":   {"lat": 39.87327, "lon":  -75.22678},
-    "Chicago":        {"lat": 41.78417, "lon":  -87.75528},
-    "Los Angeles":    {"lat": 33.93806, "lon": -118.38889},
-    "Atlanta":        {"lat": 33.64028, "lon":  -84.42694},
-    "Washington DC":  {"lat": 38.84833, "lon":  -77.03417},
-    "Phoenix":        {"lat": 33.42780, "lon": -112.00347},
-    "Dallas":         {"lat": 32.89743, "lon":  -97.02196},
-    "Las Vegas":      {"lat": 36.07188, "lon": -115.16340},
-    "Oklahoma City":  {"lat": 35.38861, "lon":  -97.60028},
-    "Seattle":        {"lat": 47.44472, "lon": -122.31361},
-    "San Francisco":  {"lat": 37.61961, "lon": -122.36558},
-    "San Antonio":    {"lat": 29.53278, "lon":  -98.46361},
-    "Minneapolis":    {"lat": 44.88306, "lon":  -93.22889},
-    "New Orleans":    {"lat": 29.99278, "lon":  -90.25083},
-    "Boston":         {"lat": 42.36056, "lon":  -71.01056},
-}
+cities = {c: {"lat": CITY_COORDS[c][0], "lon": CITY_COORDS[c][1]} for c in ACTIVE_CITIES}
 
 # Fetch forecasts for all cities
 forecasts = []
@@ -1004,9 +1087,16 @@ event_ticker17 = ['KXHIGHTSATX-' + yy + month + day, 'San Antonio', 55, 1.5]
 event_ticker18 = ['KXHIGHTMIN-' + yy + month + day, 'Minneapolis', 55, 1.5]
 event_ticker19 = ['KXHIGHTNOLA-' + yy + month + day, 'New Orleans', 55, 1.5]
 event_ticker20 = ['KXHIGHTBOS-' + yy + month + day, 'Boston', 50, 1.5]
+# Added 2026-09-29: thin books ($0.6-1.6k/day vs $5-92k for the 20 above),
+# so they trade at probe size -- see CITY_SIZE_MULT / CITY_MAX_CONTRACTS.
+event_ticker21 = ['KXHIGHTSAN-' + yy + month + day, 'San Diego', 50, 1.5]
+event_ticker22 = ['KXHIGHTSDF-' + yy + month + day, 'Louisville', 50, 1.5]
+event_ticker23 = ['KXHIGHTTTN-' + yy + month + day, 'Trenton', 50, 1.5]
+event_ticker24 = ['KXHIGHTEWR-' + yy + month + day, 'Newark', 50, 1.5]
 
 ############ PULL MARKETS
-all_event_tickers = [event_ticker1, event_ticker2, event_ticker3, event_ticker4, event_ticker5, event_ticker6, event_ticker7, event_ticker8, event_ticker9, event_ticker10, event_ticker11, event_ticker12, event_ticker13, event_ticker14, event_ticker15, event_ticker16, event_ticker17, event_ticker18, event_ticker19, event_ticker20]
+all_event_tickers = [event_ticker1, event_ticker2, event_ticker3, event_ticker4, event_ticker5, event_ticker6, event_ticker7, event_ticker8, event_ticker9, event_ticker10, event_ticker11, event_ticker12, event_ticker13, event_ticker14, event_ticker15, event_ticker16, event_ticker17, event_ticker18, event_ticker19, event_ticker20, event_ticker21, event_ticker22, event_ticker23, event_ticker24]
+all_event_tickers = [e for e in all_event_tickers if e[1] in ACTIVE_CITIES]
 event_tickers = pd.DataFrame(all_event_tickers, columns=['Ticker', 'City', 'hi_no_price', 'var'])
 event_tickers['var_sqrt'] = np.sqrt(event_tickers['var'])
 markets_table = pd.DataFrame(columns=['event_ticker', 'market_ticker', 'market_ticker_prev', 'City', 'low_range', 'high_range', 'hi_no_price'])
@@ -1014,9 +1104,16 @@ markets_table = pd.DataFrame(columns=['event_ticker', 'market_ticker', 'market_t
 for event_ticker in event_tickers['Ticker']:
   event_params = {'event_ticker': event_ticker}
   print(event_ticker)
-  event_response = exchange_client.get_event(**event_params)
+  # One city's missing or failed event must not abort the run for all of
+  # them -- the newer series are thin and could list late or skip a day.
+  try:
+    event_response = exchange_client.get_event(**event_params)
+  except Exception as _ee:
+    alert("EVENT_FETCH_FAILED", f"get_event failed for {event_ticker}; city skipped this run",
+          {"error": str(_ee)[:200]})
+    continue
 
-  for market in event_response['markets']:
+  for market in event_response.get('markets') or []:
       city = event_tickers.loc[event_tickers['Ticker'] == event_ticker, 'City'].iloc[0]
       hi_no_price = event_tickers.loc[event_tickers['Ticker'] == event_ticker, 'hi_no_price'].iloc[0]
       historical_variance = event_tickers.loc[event_tickers['Ticker'] == event_ticker, 'var'].iloc[0]
@@ -1408,12 +1505,8 @@ PRE_TRADE_SKIP_CITIES = set()
 PRE_TRADE_OBSERVED = {}
 PRE_TRADE_STATE = {}
 
-# Per-city cutoff hour (CT) for order cancels. Must stay in sync with the
-# mapping at the order-placement site below.
-_CITY_CUTOFF_HOUR = {
-    "New York City": 9, "Philadelphia": 9, "Miami": 9, "Atlanta": 9,
-    "Washington DC": 9, "Boston": 9,
-}  # everything else defaults to 10
+# Per-city order cutoff: _dayof_cutoff() (RUN SLOT block near the top) is
+# the single source for both this check and the order expiry.
 
 if variable == 0:
     print("\n========== PRE-TRADE RISK CHECKS (day run) ==========")
@@ -1421,7 +1514,8 @@ if variable == 0:
     _today_ct = _now_ct.date()
     _forecast_max_by_city = dict(zip(combined_table['City'], combined_table['Average']))
     for _city, _coords in cities.items():
-        _cutoff = _CITY_CUTOFF_HOUR.get(_city, 10)
+        # CT hour of the cutoff: 9/10 normally, 11-12 for a west-late run.
+        _cutoff = _dayof_cutoff(_city).astimezone(CT_TZ).hour
         # cities dict gets redefined 3x in this file. By the time we reach
         # here, _coords can be either a tuple (lat, lon) or a dict
         # {"lat": x, "lon": y}. Unpacking the dict with * gives the string
@@ -1778,6 +1872,13 @@ CITY_SIZE_MULT = {
     "Philadelphia": 0.5,
     "Denver": 0.5,
     "Minneapolis": 0.5,
+    # Added 2026-09-29 at probe size: thin books, no fill history, no
+    # measured sigma (they price off MEASURED_SIGMA_DEFAULT_F). Also capped
+    # at 50 contracts in CITY_MAX_CONTRACTS. Raise both once they have fills.
+    "San Diego": 0.5,
+    "Louisville": 0.5,
+    "Trenton": 0.5,
+    "Newark": 0.5,
 }
 
 # Per-city minimum NO bid price (cents). Don't place any rung whose NO bid is
@@ -1847,8 +1948,9 @@ SIZE_EXP_ENABLED = os.environ.get("SIZE_EXP_ENABLED", "true").lower() == "true"
 SIZE_EXP_TREATMENT_CONTRACTS = int(os.environ.get("SIZE_EXP_TREATMENT_CONTRACTS", "25"))
 SIZE_EXP_PROPORTION = float(os.environ.get("SIZE_EXP_PROPORTION", "0.5"))
 
-# Per-city max contracts override — cities listed here can carry a larger cap
-# than the global max_contracts. Cities not listed default to max_contracts.
+# Per-city max contracts override — cities listed here carry their own cap
+# instead of the global max_contracts (larger for the deep books, smaller
+# for the probe cities). Cities not listed default to max_contracts.
 CITY_MAX_CONTRACTS = {
     "Austin": 150,
     "Los Angeles": 150,
@@ -1860,6 +1962,10 @@ CITY_MAX_CONTRACTS = {
     "Houston": 150,
     "Philadelphia": 150,
     "Minneapolis": 150,
+    "San Diego": 50,
+    "Louisville": 50,
+    "Trenton": 50,
+    "Newark": 50,
 }
 market_cutoff_probability = .2
 # print('hi')
@@ -1982,6 +2088,7 @@ write_run_row(
     size_exp_proportion=float(SIZE_EXP_PROPORTION),
     sigma_model=SIGMA_MODEL,
     n_markets_wet=int(combined_table['Is Wet'].sum()),
+    run_slot=RUN_SLOT,
 )
 
 orders_placed = 0
@@ -2063,6 +2170,12 @@ for index, row in combined_table.iterrows():
   # Filter 0b: city-level pre-trade skip (peak hour or forecast busted)
   if row['City'] in PRE_TRADE_SKIP_CITIES:
     print(f"    SKIP: city-level pre-trade filter active for {row['City']}")
+    continue
+
+  # Filter 0d: a day run that reaches this market within 2 min of the city's
+  # cutoff stops (the orders would expire on arrival, or be rejected).
+  if variable == 0 and (_dayof_cutoff(row['City']) - datetime.now(CT_TZ)).total_seconds() < 120:
+    print(f"    SKIP: {row['City']} cutoff {_dayof_cutoff(row['City']).strftime('%H:%M %Z')} reached")
     continue
 
   # Filter 0c: observed temp already at/above bucket's lower bound.
@@ -2438,40 +2551,43 @@ for index, row in combined_table.iterrows():
 
     i1 = i1 + 1
 
-    # Detect city abbreviation and cancel time — check longer abbreviations first
+    # City abbreviation for the order record — check longer abbreviations first
     abv = ''
-    cancel_hour = 10
-    cancel_minute = 5
     ticker_str = row['market_ticker']
-    if 'THOU' in ticker_str: abv = 'THOU'; cancel_hour = 10
-    elif 'SATX' in ticker_str: abv = 'SATX'; cancel_hour = 10
-    elif 'TMIN' in ticker_str: abv = 'TMIN'; cancel_hour = 10
-    elif 'NOLA' in ticker_str: abv = 'NOLA'; cancel_hour = 10
-    elif 'CHI' in ticker_str: abv = 'CHI'; cancel_hour = 10
-    elif 'AUS' in ticker_str: abv = 'AUS'; cancel_hour = 10
-    elif 'HOU' in ticker_str: abv = 'HOU'; cancel_hour = 10
-    elif 'DEN' in ticker_str: abv = 'DEN'; cancel_hour = 10
-    elif 'NY-' in ticker_str: abv = 'NY-'; cancel_hour = 9
-    elif 'PHI' in ticker_str: abv = 'PHI'; cancel_hour = 9
-    elif 'MIA' in ticker_str: abv = 'MIA'; cancel_hour = 9
-    elif 'LAX' in ticker_str: abv = 'LAX'; cancel_hour = 10
-    elif 'ATL' in ticker_str: abv = 'ATL'; cancel_hour = 9
-    elif 'TDC' in ticker_str: abv = 'TDC'; cancel_hour = 9
-    elif 'TBOS' in ticker_str: abv = 'TBOS'; cancel_hour = 9
-    elif 'PHX' in ticker_str: abv = 'PHX'; cancel_hour = 10
-    elif 'DAL' in ticker_str: abv = 'DAL'; cancel_hour = 10
-    elif 'TLV' in ticker_str: abv = 'TLV'; cancel_hour = 10
-    elif 'OKC' in ticker_str: abv = 'OKC'; cancel_hour = 10
-    elif 'SEA' in ticker_str: abv = 'SEA'; cancel_hour = 10
-    elif 'SFO' in ticker_str: abv = 'SFO'; cancel_hour = 10
+    if 'TSAN' in ticker_str: abv = 'TSAN'
+    elif 'TSDF' in ticker_str: abv = 'TSDF'
+    elif 'TTTN' in ticker_str: abv = 'TTTN'
+    elif 'TEWR' in ticker_str: abv = 'TEWR'
+    elif 'THOU' in ticker_str: abv = 'THOU'
+    elif 'SATX' in ticker_str: abv = 'SATX'
+    elif 'TMIN' in ticker_str: abv = 'TMIN'
+    elif 'NOLA' in ticker_str: abv = 'NOLA'
+    elif 'CHI' in ticker_str: abv = 'CHI'
+    elif 'AUS' in ticker_str: abv = 'AUS'
+    elif 'HOU' in ticker_str: abv = 'HOU'
+    elif 'DEN' in ticker_str: abv = 'DEN'
+    elif 'NY-' in ticker_str: abv = 'NY-'
+    elif 'PHI' in ticker_str: abv = 'PHI'
+    elif 'MIA' in ticker_str: abv = 'MIA'
+    elif 'LAX' in ticker_str: abv = 'LAX'
+    elif 'ATL' in ticker_str: abv = 'ATL'
+    elif 'TDC' in ticker_str: abv = 'TDC'
+    elif 'TBOS' in ticker_str: abv = 'TBOS'
+    elif 'PHX' in ticker_str: abv = 'PHX'
+    elif 'DAL' in ticker_str: abv = 'DAL'
+    elif 'TLV' in ticker_str: abv = 'TLV'
+    elif 'OKC' in ticker_str: abv = 'OKC'
+    elif 'SEA' in ticker_str: abv = 'SEA'
+    elif 'SFO' in ticker_str: abv = 'SFO'
 
     central_time = datetime.now(pytz.timezone('US/Central'))
-    if central_time.hour > 10 or central_time.hour < 6:
-      cancel_hour = 1
-      cancel_minute = 59
-
     client_oid = str(uuid.uuid4())
-    exp_ts = get_unix_time_for_tomorrow(cancel_hour, cancel_minute)
+    if variable == 1:
+      # Evening: rest until 01:59 CT on the target date.
+      exp_ts = get_unix_time_for_tomorrow(1, 59)
+    else:
+      # Day run: this city's cutoff today (see RUN SLOT), never rolled to tomorrow.
+      exp_ts = int(_dayof_cutoff(row['City']).timestamp())
     order_params = {'ticker':row['market_ticker'],
                       'client_order_id':client_oid,
                       'type':'limit',
@@ -2588,6 +2704,9 @@ for index, row in combined_table.iterrows():
           'sigma_source': str(_sigma_src) if _sigma_src else None,
           'is_wet': bool(_is_wet),
           'yes_prob_legacy_sigma': _safe_float(row.get('yes_prob_legacy_sigma')),
+          # 'evening' | 'morning' | 'west_late' — the west late-morning
+          # test reads out on run_slot = 'west_late'.
+          'run_slot': RUN_SLOT,
       })
       row['resting_order_count'] = row['resting_order_count'] + contracts
       _run_placed_contracts += contracts
@@ -2741,6 +2860,7 @@ for index, row in combined_table.iterrows():
       'effective_hi_no': float(_effective_hi_no),
       'yes_prob': round(float(yes_prob), 4),
       'effective_sigma': _safe_float(_eff_sigma),
+      'run_slot': RUN_SLOT,
     })
   except Exception as _lre:
     print(f"    (ladder telemetry row skipped: {_lre})")
@@ -2803,6 +2923,7 @@ if all_ladder_records:
         bigquery.SchemaField("effective_hi_no", "FLOAT"),
         bigquery.SchemaField("yes_prob", "FLOAT"),
         bigquery.SchemaField("effective_sigma", "FLOAT"),
+        bigquery.SchemaField("run_slot", "STRING"),
     ]
     try:
         df_ladder = pd.DataFrame(all_ladder_records)
@@ -2843,6 +2964,7 @@ if orders_placed == 0 and ZERO_ORDER_RUN_THRESHOLD > 0:
                 SELECT n_orders_placed
                 FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_PREFIX}runs`
                 WHERE event = 'end' AND script_name = 'high_temp_trading.py'
+                  AND IFNULL(exit_status, '') != 'noop'  -- disabled late runs
                 ORDER BY event_at DESC
                 LIMIT {ZERO_ORDER_RUN_THRESHOLD - 1}
             """
@@ -2897,6 +3019,7 @@ try:
         n_contracts_blocked_by_position_cap=int(
             sum(_r.get('blocked_ct_position_cap', 0) for _r in all_ladder_records)),
         exit_status="success",
+        run_slot=RUN_SLOT,
     )
 except Exception as _re:
     print(f"  RUNS end-row write failed: {_re}")

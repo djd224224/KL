@@ -130,6 +130,7 @@ CITY_ABV_TO_NAME = {
     "TOKC": "Oklahoma City", "TSEA": "Seattle", "TSFO": "San Francisco",
     "THOU": "Houston", "TSATX": "San Antonio", "TMIN": "Minneapolis",
     "TNOLA": "New Orleans",
+    "TSAN": "San Diego", "TSDF": "Louisville", "TTTN": "Trenton", "TEWR": "Newark",
 }
 
 def parse_kxhigh_ticker(ticker: str) -> Dict[str, str]:

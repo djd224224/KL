@@ -49,6 +49,12 @@ CITIES: dict[str, dict] = {
     "TMIN":  {"city": "Minneapolis",    "icao": "KMSP", "cli_code": "MSP", "wfo": "MPX", "tz": "America/Chicago",      "lat": 44.88306, "lon":  -93.22889},
     "TNOLA": {"city": "New Orleans",    "icao": "KMSY", "cli_code": "MSY", "wfo": "LIX", "tz": "America/Chicago",      "lat": 29.99278, "lon":  -90.25083},
     "TBOS":  {"city": "Boston",         "icao": "KBOS", "cli_code": "BOS", "wfo": "BOX", "tz": "America/New_York",     "lat": 42.36056, "lon":  -71.01056},
+    # Added 2026-09-29. CLI products per the Kalshi market rules (CLISAN etc.);
+    # coords, WFO and tz from api.weather.gov/stations + /points.
+    "TSAN":  {"city": "San Diego",      "icao": "KSAN", "cli_code": "SAN", "wfo": "SGX", "tz": "America/Los_Angeles",  "lat": 32.73361, "lon": -117.18306},
+    "TSDF":  {"city": "Louisville",     "icao": "KSDF", "cli_code": "SDF", "wfo": "LMK", "tz": "America/Kentucky/Louisville", "lat": 38.17406, "lon": -85.73650},
+    "TTTN":  {"city": "Trenton",        "icao": "KTTN", "cli_code": "TTN", "wfo": "PHI", "tz": "America/New_York",     "lat": 40.27639, "lon":  -74.81639},
+    "TEWR":  {"city": "Newark",         "icao": "KEWR", "cli_code": "EWR", "wfo": "OKX", "tz": "America/New_York",     "lat": 40.68250, "lon":  -74.16944},
 }
 
 CITY_NAME_TO_KEY = {v["city"]: k for k, v in CITIES.items()}

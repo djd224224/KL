@@ -354,12 +354,12 @@ def run_analysis(settlement_file, trade_file=None, volume_cache_path='kxhigh_vol
 
     # Regional correlation — group cities into U.S. regions, aggregate daily P&L per region, correlate
     CITY_REGIONS = {
-        'NY':'Northeast','PHIL':'Northeast','TDC':'Northeast','TBOS':'Northeast',
-        'MIA':'Southeast','TATL':'Southeast','TNOLA':'Southeast','TCHAR':'Southeast','TNASH':'Southeast','TTAMPA':'Southeast',
+        'NY':'Northeast','PHIL':'Northeast','TDC':'Northeast','TBOS':'Northeast','TEWR':'Northeast','TTTN':'Northeast',
+        'MIA':'Southeast','TATL':'Southeast','TNOLA':'Southeast','TCHAR':'Southeast','TNASH':'Southeast','TTAMPA':'Southeast','TSDF':'Southeast',
         'CHI':'Midwest','TMIN':'Midwest',
         'AUS':'South Central','HOU':'South Central','THOU':'South Central','TDAL':'South Central','TSATX':'South Central','TOKC':'South Central',
         'DEN':'Mountain','TDEN':'Mountain','TPHX':'Mountain','TLV':'Mountain',
-        'LAX':'West Coast','TSEA':'West Coast','TSFO':'West Coast'}
+        'LAX':'West Coast','TSEA':'West Coast','TSFO':'West Coast','TSAN':'West Coast'}
     region_of={c:CITY_REGIONS.get(c,'Other') for c in cities}
     regions=sorted({region_of[c] for c in cities})
     region_daily={r:{} for r in regions}
@@ -768,7 +768,8 @@ def generate_html(data, out_path):
                    'THOU':'Houston','TDAL':'Dallas','TNOLA':'New Orleans','TPHX':'Phoenix',
                    'TLV':'Las Vegas','TSATX':'San Antonio','TATL':'Atlanta','TSEA':'Seattle',
                    'TDC':'Washington DC','TOKC':'Oklahoma City','TMIN':'Minneapolis','TSFO':'San Francisco',
-                   'TDEN':'Denver','TBOS':'Boston','TCHAR':'Charlotte','TNASH':'Nashville','TTAMPA':'Tampa'}
+                   'TDEN':'Denver','TBOS':'Boston','TCHAR':'Charlotte','TNASH':'Nashville','TTAMPA':'Tampa',
+                   'TSAN':'San Diego','TSDF':'Louisville','TTTN':'Trenton','TEWR':'Newark'}
     CN = {c: KNOWN_NAMES.get(c, c) for c in cities}
 
     sh = f'{o["sharpe"]:.2f}' if o['sharpe'] else '—'

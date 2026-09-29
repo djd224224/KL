@@ -38,7 +38,8 @@ CITY_NAMES={'NY':'New York','AUS':'Austin','PHIL':'Philadelphia','MIA':'Miami',
     'THOU':'Houston','TDAL':'Dallas','TNOLA':'New Orleans','TPHX':'Phoenix',
     'TLV':'Las Vegas','TSATX':'San Antonio','TATL':'Atlanta','TSEA':'Seattle',
     'TDC':'DC','TOKC':'OKC','TMIN':'Minneapolis','TSFO':'San Francisco',
-    'TDEN':'Denver','TBOS':'Boston','TCHAR':'Charlotte','TNASH':'Nashville','TTAMPA':'Tampa'}
+    'TDEN':'Denver','TBOS':'Boston','TCHAR':'Charlotte','TNASH':'Nashville','TTAMPA':'Tampa',
+    'TSAN':'San Diego','TSDF':'Louisville','TTTN':'Trenton','TEWR':'Newark'}
 FC_COLORS={'NBA':'#60a5fa','NCAAB':'#c084fc','MLB':'#4ade80','Fight':'#f87171',
     'UFC Props':'#f472b6','Weather':'#22d3ee','NFL':'#fb923c','Politics':'#fbbf24',
     'Performance':'#2dd4bf','Entertainment':'#94a3b8','Crypto':'#e879f9','Other':'#6b7280'}
