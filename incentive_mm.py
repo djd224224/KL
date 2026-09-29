@@ -2200,6 +2200,47 @@ BREAKERS_ENABLED = os.environ.get("IMM_BREAKERS", "0") == "1"
 SKEW_SOFT_CONTRACTS = _env_float("IMM_SKEW_SOFT", 30)   # halve accumulating side
 SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
+# TOXIC-FLOW SIDE HALT (Jack 2026-09-29: "i need a mechanism to halt a
+# side/market when there is toxic flow / adverse selection in the form of
+# repeatedly getting picked off going in one direction"). A maker fill is a
+# PICK-OFF when, TOXIC_CONFIRM_SECS later, the mid has moved
+# TOXIC_PICKOFF_CENTS or more against it (we bought and the mark fell, we
+# sold and it rose). TOXIC_PICKOFFS pick-offs on the SAME side of a market
+# within TOXIC_WINDOW_SECS halt that side -- rungs and pads -- for
+# TOXIC_HALT_SECS; the other side keeps quoting. Both sides tripped = the
+# market is out. Pads and taker fills (the rain directional take) never
+# count. Every book, every family, independent of IMM_BREAKERS.
+#
+# The mention gate (EVENT_DEPTH_GATE_PREFIXES) does NOT cover this: it is a
+# live-broadcast detector -- thin / one-sided / settle-jump / a 15-contract
+# burst in ONE cycle -- scoped to KXTRUMPMENTION and undated mention events,
+# and it stands the whole event down. The inventory skew (SKEW_SOFT/HARD)
+# is the other existing brake: position-keyed, not flow-keyed.
+#
+# Defaults from a backtest on every non-pad maker fill 9/6-9/29 (8,078
+# fills, 30m markout -$2,657; markouts off the marks log, the same
+# last_mark this rule reads), net of the reward a halted side gives up
+# (half the market's est reward for the halt): the rule as stated is about
+# break-even on that history at its best setting -- 5c / 2 pick-offs / 24h
+# / 30 min: ~12 halts a day, saves $53 at 2h markouts ($125 at 30m) against
+# ~$49 of reward -- and LOSES at longer halts (4h: ~$455 of reward for
+# ~$87 saved) and looser pick-off bars. The adverse selection in this book
+# is diffuse (single fills carry 47% of it; runs of 3+ one-directional
+# fills ~25%, and the skew caps bound each run at ~$20-50). Where halting
+# clearly paid (state gas dailies, hourly temp, KXRT release week, live
+# mentions) a family rule already exists. So this is a circuit breaker for
+# the NEXT episode (a new family, a news day), tuned not to cost rent.
+# IMM_TOXIC_HALT=0 kills it.
+TOXIC_HALT = os.environ.get("IMM_TOXIC_HALT", "1") == "1"
+TOXIC_PICKOFF_CENTS = _env_float("IMM_TOXIC_PICKOFF_CENTS", 5.0)
+TOXIC_CONFIRM_SECS = _env_int("IMM_TOXIC_CONFIRM_SECS", 300)
+TOXIC_PICKOFFS = _env_int("IMM_TOXIC_PICKOFFS", 2)
+TOXIC_WINDOW_SECS = _env_float("IMM_TOXIC_WINDOW_H", 24.0) * 3600.0
+TOXIC_HALT_SECS = _env_float("IMM_TOXIC_HALT_MIN", 30.0) * 60.0
+# A fill whose check comes due more than this late (the bot was down or
+# the market went unmarked) is dropped unjudged -- the backtest gave up on a
+# fill with no mark within an hour of its check time.
+TOXIC_MAX_LATE_SECS = 3600.0
 # DROPPED MARKETS CARRY NO ORDERS (Jack 2026-09-07: "fine for market to get
 # dropped, but quotes on the dropped market should all be canceled").
 #
@@ -5689,6 +5730,9 @@ _CONFIG_CODE_KNOBS = (
     # election family: membership, the election-day table (2026-09-28)
     "ELECTION_ALLOW", "ELECTION_SERIES", "ELECTION_SERIES_PATTERNS",
     "ELECTION_DATES", "ELECTION_OCC_BACK_HOURS",
+    # toxic-flow side halt (2026-09-29)
+    "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
+    "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
 )
 
 
@@ -9270,6 +9314,13 @@ class BotState:
     # restarts/day must not reset the two-strikes-and-out escalation).
     event_fill_strikes: Dict[str, int] = field(default_factory=dict)
     bench_until: Dict[str, float] = field(default_factory=dict)
+    # Toxic-flow side halt (TOXIC_*): maker fills awaiting their pick-off
+    # check [ticker, book_side, yes_px_cents, fill_ts]; confirmed pick-off
+    # times per "ticker|book_side"; halted sides "ticker|book_side" -> until.
+    # All persisted (~20 restarts a day).
+    toxic_pending: List[list] = field(default_factory=list)
+    toxic_picks: Dict[str, List[float]] = field(default_factory=dict)
+    toxic_halt_until: Dict[str, float] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
     order_ages: Dict[str, float] = field(default_factory=dict)
@@ -9808,6 +9859,81 @@ class IncentiveMarketMaker:
                 self._sink_muted.add("fills")
                 log(f"{self.tag} ! fill sink failed ({e}); muted for this run")
 
+    # ---- toxic-flow side halt (TOXIC_*, Jack 2026-09-29) ---------------------
+
+    @staticmethod
+    def _toxic_key(ticker: str, book_side: str) -> str:
+        return f"{ticker}|{book_side}"
+
+    def _toxic_note_fill(self, f: dict, tkr: str, side: str, action: str,
+                         px_cents: float) -> None:
+        """Queue one of OUR maker fills for its pick-off check. Taker fills
+        (the rain directional take) and 1c/99c pads never count -- the same
+        ledger join _log_fill makes."""
+        if not TOXIC_HALT or f.get("is_taker"):
+            return
+        led = self.state.ledger.get(f.get("order_id") or "") or {}
+        our_px = led.get("yes_price")
+        if led.get("book_side") and our_px is not None \
+                and self._is_pad_price(led["book_side"], our_px):
+            return
+        # buying YES (or selling NO) = our BID was hit; else our ask was
+        book_side = "bid" if (side, action) in (("yes", "buy"),
+                                                ("no", "sell")) else "ask"
+        self.state.toxic_pending.append(
+            [tkr, book_side, float(px_cents),
+             float(self._fill_ts(f) or time.time())])
+
+    def _toxic_confirm(self, now_ts: float, fresh: Set[str]) -> List[str]:
+        """Judge every queued fill whose check is due against the market's
+        mark, record the pick-offs, and halt a side on its TOXIC_PICKOFFS-th
+        pick-off inside TOXIC_WINDOW_SECS. Only a mark refreshed THIS cycle
+        (`fresh`) judges a fill; one with no fresh mark waits, and is dropped
+        unjudged once TOXIC_MAX_LATE_SECS past due. Returns the side keys
+        halted by this call."""
+        keep: List[list] = []
+        halted: List[str] = []
+        for p in self.state.toxic_pending:
+            t, side, px, fts = p[0], p[1], float(p[2]), float(p[3])
+            due = fts + TOXIC_CONFIRM_SECS
+            if now_ts < due:
+                keep.append(p)
+                continue
+            if now_ts - due > TOXIC_MAX_LATE_SECS:
+                continue
+            mark = self.state.last_mark.get(t)
+            if mark is None or t not in fresh:
+                keep.append(p)
+                continue
+            d = 1.0 if side == "bid" else -1.0
+            if d * (float(mark) - px) > -TOXIC_PICKOFF_CENTS:
+                continue                              # not picked off
+            key = self._toxic_key(t, side)
+            picks = [x for x in self.state.toxic_picks.get(key, [])
+                     if now_ts - x <= TOXIC_WINDOW_SECS] + [now_ts]
+            if (len(picks) >= TOXIC_PICKOFFS
+                    and self.state.toxic_halt_until.get(key, 0.0) <= now_ts):
+                self.state.toxic_halt_until[key] = now_ts + TOXIC_HALT_SECS
+                halted.append(key)
+                msg = (f"{t} {side.upper()} picked off {len(picks)}x in "
+                       f"{TOXIC_WINDOW_SECS / 3600:g}h (latest: filled "
+                       f"{px:.0f}c, mark {float(mark):.1f}c "
+                       f"{(now_ts - fts) / 60:.0f}min later) -- halting that "
+                       f"side {TOXIC_HALT_SECS / 60:g}min")
+                log(f"{self.tag} TOXIC {msg}")
+                self.alerter.alert("toxic_halt", msg, key=key, urgent=False,
+                                   now_ts=now_ts)
+                picks = []
+            self.state.toxic_picks[key] = picks
+        self.state.toxic_pending = keep
+        return halted
+
+    def toxic_side_halted(self, ticker: str, book_side: str,
+                          now_ts: float) -> bool:
+        """True while `book_side` of `ticker` is halted by the toxic rule."""
+        return TOXIC_HALT and self.state.toxic_halt_until.get(
+            self._toxic_key(ticker, book_side), 0.0) > now_ts
+
     def _log_order(self, kind: str, ticker: str, book_side: str,
                    price_cents: Optional[int], count: Optional[float],
                    order_id: str = "", now_ts: float = 0.0, **extra) -> None:
@@ -10097,6 +10223,17 @@ class IncentiveMarketMaker:
             self.state.prev_mid.update(
                 {str(t): float(v) for t, v in
                  (data.get("prev_mid_gated") or {}).items()})
+            # toxic-flow side halt: a restart must not forget a halted side
+            # or the pick-offs that are one short of halting it
+            self.state.toxic_pending = [
+                [str(p[0]), str(p[1]), float(p[2]), float(p[3])]
+                for p in (data.get("toxic_pending") or []) if len(p) >= 4]
+            self.state.toxic_picks = {
+                str(k): [float(x) for x in v]
+                for k, v in (data.get("toxic_picks") or {}).items()}
+            self.state.toxic_halt_until = {
+                str(k): float(v)
+                for k, v in (data.get("toxic_halt_until") or {}).items()}
             # Halt continuity (same roll-day only): a restart must NOT hand
             # the bot a fresh loss budget or clear an active halt. Use
             # --clear-halt (bot stopped) for a deliberate un-halt.
@@ -10354,7 +10491,23 @@ class IncentiveMarketMaker:
                            "prev_mid_gated": {
                                t: round(v, 1)
                                for t, v in self.state.prev_mid.items()
-                               if series_event_depth_gated(series_of(t))}}, f)
+                               if series_event_depth_gated(series_of(t))},
+                           # toxic-flow side halt (TOXIC_*): pending checks,
+                           # confirmed pick-offs inside the window, live halts
+                           "toxic_pending": [
+                               p for p in self.state.toxic_pending
+                               if time.time() - p[3] <= TOXIC_CONFIRM_SECS
+                               + TOXIC_MAX_LATE_SECS],
+                           "toxic_picks": {
+                               k: [round(x, 1) for x in v
+                                   if time.time() - x <= TOXIC_WINDOW_SECS]
+                               for k, v in self.state.toxic_picks.items()
+                               if any(time.time() - x <= TOXIC_WINDOW_SECS
+                                      for x in v)},
+                           "toxic_halt_until": {
+                               k: round(v, 1)
+                               for k, v in self.state.toxic_halt_until.items()
+                               if v > time.time()}}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.
@@ -13325,6 +13478,7 @@ class IncentiveMarketMaker:
                     self.state.fills_today += count
                     self._log_fill(f, tkr, side, action, count, px_cents,
                                    now_ts, pos_before, avg_before)
+                    self._toxic_note_fill(f, tkr, side, action, px_cents)
             except Exception as e:
                 log(f"{self.tag} ! unparseable fill skipped: {e}")
 
@@ -14313,8 +14467,13 @@ class IncentiveMarketMaker:
             # Coverage alert (2026-08-02): a member quoting into a snapshot
             # that can't count is the worst rent-per-risk state — page after
             # N consecutive FULL cycles (pads should make this ~impossible).
+            # (A side stood down by the toxic-flow halt is one-sided ON
+            # PURPOSE -- if our pad was what lifted it to target, that side
+            # stops qualifying -- so it neither counts nor pages.)
             if not fast_only and t in self.state.selected and mq \
-                    and pad_band_ok(meta.series, ext_bid, ext_ask):
+                    and pad_band_ok(meta.series, ext_bid, ext_ask) \
+                    and not self.toxic_side_halted(t, "bid", now_ts) \
+                    and not self.toxic_side_halted(t, "ask", now_ts):
                 if sides < 2:
                     streak = self.state.coverage_zero_streak.get(t, 0) + 1
                     self.state.coverage_zero_streak[t] = streak
@@ -14600,6 +14759,19 @@ class IncentiveMarketMaker:
                     f"until the next ET day (inventory winds down reduce-only)",
                     key="scan_halt")
                 self._save_persist()
+
+        # TOXIC-FLOW SIDE HALT (Jack 2026-09-29, see TOXIC_HALT): judge the
+        # fills that came due against this cycle's marks (quoted markets were
+        # marked from their books, every open position by _refresh_marks),
+        # then drop each halted side's quotes -- rungs and pads -- from
+        # `desired`, so the diff cancels whatever rests there.
+        if TOXIC_HALT:
+            if not fast_only:
+                self._toxic_confirm(
+                    now_ts, marked | {t_ for t_, p_ in self.pnl.pos.items()
+                                      if abs(p_) > 1e-9})
+            desired = [q for q in desired if not self.toxic_side_halted(
+                q.ticker, q.book_side, now_ts)]
 
         # Fast tick: non-fast managed markets built no `desired` this tick —
         # preserve their resting orders through the diff or it would cancel

@@ -2789,11 +2789,150 @@ class FakeClient:
         return {}
 
 
+class TestToxicSideHalt(unittest.TestCase):
+    """Jack 2026-09-29: "i need a mechanism to halt a side/market when there
+    is toxic flow / adverse selection in the form of repeatedly getting
+    picked off going in one direction". A maker fill is a pick-off when the
+    mark TOXIC_CONFIRM_SECS later is TOXIC_PICKOFF_CENTS+ against it;
+    TOXIC_PICKOFFS of them on one side inside TOXIC_WINDOW_SECS halt that
+    side for TOXIC_HALT_SECS."""
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=None, live=False)
+        self.now = 1_800_000_000.0
+        self.t = "KXGOOD-99DEC31-A"
+
+    def _due(self, side, px, ago=400.0):
+        self.bot.state.toxic_pending.append([self.t, side, px, self.now - ago])
+
+    def test_fills_queue_by_the_side_that_was_hit_pads_and_takers_never(self):
+        b = self.bot
+        for i, (side, action, want) in enumerate((
+                ("yes", "buy", "bid"), ("no", "sell", "bid"),
+                ("yes", "sell", "ask"), ("no", "buy", "ask"))):
+            b._toxic_note_fill({"order_id": f"o{i}", "ts": 1000 + i},
+                               self.t, side, action, 50.0)
+            self.assertEqual(b.state.toxic_pending[-1],
+                             [self.t, want, 50.0, float(1000 + i)])
+        n = len(b.state.toxic_pending)
+        b._toxic_note_fill({"order_id": "tk", "ts": 1, "is_taker": True},
+                           self.t, "yes", "buy", 50.0)          # rain take
+        b.state.ledger["pad"] = {"book_side": "bid",
+                                 "yes_price": imm.PAD_BID_CENTS}
+        b._toxic_note_fill({"order_id": "pad", "ts": 1}, self.t, "yes", "buy",
+                           float(imm.PAD_BID_CENTS))           # a 1c pad
+        self.assertEqual(len(b.state.toxic_pending), n)
+
+    def test_second_pick_off_on_a_side_halts_that_side_only(self):
+        b = self.bot
+        b.state.last_mark[self.t] = 44.0                  # 6c under both buys
+        self._due("bid", 50.0)
+        self.assertEqual(b._toxic_confirm(self.now, {self.t}), [])
+        self.assertEqual(len(b.state.toxic_picks[f"{self.t}|bid"]), 1)
+        self._due("bid", 50.0)
+        self.assertEqual(b._toxic_confirm(self.now, {self.t}), [f"{self.t}|bid"])
+        self.assertEqual(b.state.toxic_halt_until[f"{self.t}|bid"],
+                         self.now + imm.TOXIC_HALT_SECS)
+        self.assertTrue(b.toxic_side_halted(self.t, "bid", self.now + 60))
+        self.assertFalse(b.toxic_side_halted(self.t, "ask", self.now + 60))
+        self.assertFalse(b.toxic_side_halted(
+            self.t, "bid", self.now + imm.TOXIC_HALT_SECS + 1))
+        self.assertEqual(b.state.toxic_pending, [])
+        # asks mirror it: sold at 50, the mark 6c higher
+        b.state.last_mark[self.t] = 56.0
+        self._due("ask", 50.0)
+        self._due("ask", 50.0)
+        self.assertEqual(b._toxic_confirm(self.now, {self.t}), [f"{self.t}|ask"])
+
+    def test_small_or_favourable_moves_are_not_pick_offs(self):
+        b = self.bot
+        for mark in (46.0, 50.0, 60.0):                   # 4c against, flat, in favour
+            b.state.last_mark[self.t] = mark
+            self._due("bid", 50.0)
+            self._due("bid", 50.0)
+            self.assertEqual(b._toxic_confirm(self.now, {self.t}), [])
+        self.assertEqual(b.state.toxic_picks.get(f"{self.t}|bid", []), [])
+
+    def test_checks_wait_for_their_time_and_a_fresh_mark(self):
+        b = self.bot
+        b.state.last_mark[self.t] = 40.0
+        self._due("bid", 50.0, ago=100)                   # not due yet
+        self.assertEqual(b._toxic_confirm(self.now, {self.t}), [])
+        self.assertEqual(len(b.state.toxic_pending), 1)
+        b.state.toxic_pending = []
+        self._due("bid", 50.0)                            # due, mark not fresh
+        b._toxic_confirm(self.now, set())
+        self.assertEqual(len(b.state.toxic_pending), 1)
+        b.state.toxic_pending = []
+        self._due("bid", 50.0, ago=imm.TOXIC_CONFIRM_SECS
+                  + imm.TOXIC_MAX_LATE_SECS + 10)          # too late: dropped
+        b._toxic_confirm(self.now, {self.t})
+        self.assertEqual(b.state.toxic_pending, [])
+        self.assertEqual(b.state.toxic_picks.get(f"{self.t}|bid", []), [])
+
+    def test_pick_offs_outside_the_window_do_not_add_up(self):
+        b = self.bot
+        b.state.last_mark[self.t] = 40.0
+        b.state.toxic_picks[f"{self.t}|bid"] = [self.now - imm.TOXIC_WINDOW_SECS - 60]
+        self._due("bid", 50.0)
+        self.assertEqual(b._toxic_confirm(self.now, {self.t}), [])
+        self.assertEqual(b.state.toxic_picks[f"{self.t}|bid"], [self.now])
+
+    def test_kill_switch(self):
+        b = self.bot
+        b.state.toxic_halt_until[f"{self.t}|bid"] = self.now + 600
+        with mock.patch.object(imm, "TOXIC_HALT", False):
+            self.assertFalse(b.toxic_side_halted(self.t, "bid", self.now))
+            b._toxic_note_fill({"order_id": "x", "ts": 1}, self.t, "yes", "buy", 50.0)
+            self.assertEqual(b.state.toxic_pending, [])
+
+    def test_halts_and_near_misses_survive_a_restart(self):
+        b = self.bot
+        now = time.time()
+        b.state.toxic_halt_until = {f"{self.t}|bid": now + 900,
+                                    f"{self.t}|ask": now - 5}       # expired
+        b.state.toxic_picks = {f"{self.t}|ask": [now - 60],
+                               "OLD|bid": [now - imm.TOXIC_WINDOW_SECS - 60]}
+        b.state.toxic_pending = [[self.t, "bid", 50.0, now - 30],
+                                 ["STALE", "bid", 50.0, now - 99999]]
+        b._save_persist()
+        b2 = IncentiveMarketMaker(client=None, live=False)
+        self.assertEqual(set(b2.state.toxic_halt_until), {f"{self.t}|bid"})
+        self.assertEqual(set(b2.state.toxic_picks), {f"{self.t}|ask"})
+        self.assertEqual([p[0] for p in b2.state.toxic_pending], [self.t])
+        self.assertTrue(b2.toxic_side_halted(self.t, "bid", now))
+
+
 class TestDryRunCycle(unittest.TestCase):
     def _bot(self):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         return bot
+
+    def test_toxic_side_halt_cancels_only_the_picked_off_side(self):
+        # end to end: two bid fills at 50c, the book then 43/45 (mark 44,
+        # 6c against each) -> the next cycle judges them, halts the BID side
+        # and the diff cancels every resting bid; asks keep quoting; when
+        # the halt runs out the bids come back
+        bot = self._bot()
+        t = "KXGOOD-99DEC31-A"
+        bot.run_cycle()
+        self.assertEqual({o["book_side"] for o in bot.state.sim_orders.values()},
+                         {"bid", "ask"})
+        now = time.time()
+        bot.state.toxic_pending = [[t, "bid", 50.0, now - 400],
+                                   [t, "bid", 50.0, now - 350]]
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.42", "500"], ["0.43", "600"]],
+            "no_dollars": [["0.55", "1200"]]}}
+        bot.run_cycle()
+        self.assertTrue(bot.toxic_side_halted(t, "bid", time.time()))
+        self.assertEqual({o["book_side"] for o in bot.state.sim_orders.values()},
+                         {"ask"})
+        bot.state.toxic_halt_until[f"{t}|bid"] = time.time() - 1
+        bot.run_cycle()
+        self.assertIn("bid", {o["book_side"] for o in bot.state.sim_orders.values()})
 
     def test_a_cut_market_never_burns_a_lifetime_event_slot(self):
         """Jack 2026-09-09: "fix the lifetime slot ordering too". The ledger
