@@ -5210,3 +5210,27 @@ Watch after deploy: selection rows for KXTOKENUSE-26OCT05 move from
 event_top_n to selected over the next refresh or two (the admission clock
 applies); or-fair stand-asides by strike; fills by strike against the
 fair file's mu.
+
+## 2026-09-29 — Sports ladders / escalators x3 -> x4 (Jack)
+
+Jack: "increase LADDER and ESCALATOR families to 4x multiplier, from the 3x".
+
+CHANGE. The archetype KXNFLLADDERREC's size_mult default 3.0 -> 4.0 (env
+IMM_SPORTS_LADDER_SIZE_MULT; the launcher does not set it, so the code sync
+and the bot's own restart carry it; every pattern sibling clones the
+archetype). Through applied_mention_mult, at the launcher's IMM_LEVELS=0:20 /
+MAX_POSITION 150 / MAX_EVENT 1,000 (checked with $ProbeEnv and the live
+Saturday verdict):
+- weekday 80 a side, 160 in the 0-9 ET quiet hours (x2);
+- Saturday from 10/3 (the gated x2 step-up) 160 daytime, 320 in 0-9 ET;
+- per-market cap 600 (was 450), per-event cap 4,000 (was 3,000);
+- the estimator's hypothetical ladder and the floor projection scale with it.
+Unchanged: KXTRUMPAPPROVE's own x3 (IMM_TRUMPAPPROVE_SIZE_MULT), the family's
+1-99c band, safe-join and $1.20 fresh-entry bar, TOTAL_SIZE_MULT_CAP (x5 on
+hour x deep-reference only; hour x Saturday x family is not capped).
+
+Collateral at the 14:18Z 9/29 refresh: ~$8.2k ladder + $16.9k inventory
+reserve of the $50k budget (all families).
+
+Tests: the ladder-family enrollment test reads x4 rungs and caps and pins
+KXTRUMPAPPROVE at x3. 1,550 green (unittest discover).

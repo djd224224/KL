@@ -4756,8 +4756,10 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             self.assertEqual(imm.member_price_band("KXNBALADDERPTS", False), (1, 99))
             self.assertEqual(imm.member_price_band("KXNBALADDERPTS", True), (1, 99))
             # 2026-09-26 pm: x3 ("so should be 90" on a Saturday) and a $1.20
-            # fresh-entry bar for the family; the cliff for banked / members
-            self.assertEqual(imm.applied_mention_mult("KXNBALADDERPTS"), 3.0)
+            # fresh-entry bar for the family; the cliff for banked / members.
+            # 2026-09-29: x4 ("increase LADDER and ESCALATOR families to 4x
+            # multiplier, from the 3x")
+            self.assertEqual(imm.applied_mention_mult("KXNBALADDERPTS"), 4.0)
             self.assertEqual(imm.series_min_est_total("KXNBALADDERPTS"), 1.2)
             self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=False), 1.2)
             self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=True),
@@ -4766,11 +4768,13 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             noon = utc(2026, 9, 30, 15, 0)              # a weekday, no hour mult
             base = imm.series_levels("KXNBALADDERPTS")
             self.assertEqual(imm.hour_scaled_levels("KXNBALADDERPTS", noon),
-                             [(t_, 3 * s_) for t_, s_ in base])
+                             [(t_, 4 * s_) for t_, s_ in base])
             self.assertEqual(imm.series_max_position("KXNBALADDERPTS"),
-                             3 * imm.MAX_POSITION_CONTRACTS)
+                             4 * imm.MAX_POSITION_CONTRACTS)
             self.assertEqual(imm.event_cap_contracts("KXNBALADDERPTS-26OCT21BOSNYK"),
-                             3 * imm.MAX_EVENT_CONTRACTS)
+                             4 * imm.MAX_EVENT_CONTRACTS)
+            # KXTRUMPAPPROVE copied the ladders' x3 on 9/26 but keeps its own
+            self.assertEqual(imm.applied_mention_mult("KXTRUMPAPPROVE"), 3.0)
             bot = IncentiveMarketMaker(client=None, live=False)
             now = datetime.now(timezone.utc)
             lad_meta = _meta(series="KXNBALADDERPTS",

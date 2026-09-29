@@ -4874,13 +4874,19 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # family FRESH-entry bar of $1.20 (min_est_total; the $1.00 cliff still
 # governs members and banked re-entrants via floor_bar_dollars). Env
 # IMM_SPORTS_LADDER_SIZE_MULT / IMM_SPORTS_LADDER_MIN_EST_TOTAL.
+# 2026-09-29 (Jack: "increase LADDER and ESCALATOR families to 4x
+# multiplier, from the 3x"): size_mult 3 -> 4 -- 20 x 4 = 80 a side on a
+# weekday; on a Saturday x2 (the gated step-up from 10/3) = 160, and 320 in
+# the 0-9 ET quiet hours; per-market cap 600 / per-event 4,000 at the
+# launcher's 150 / 1,000. KXTRUMPAPPROVE keeps its own x3
+# (IMM_TRUMPAPPROVE_SIZE_MULT).
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
     min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.2),
     safe_join=True,
     price_min_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MIN", 1),
     price_max_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MAX", 99),
-    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 3.0))
+    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 4.0))
 
 # ELECTION archetype (Jack 2026-09-28, see ELECTION_SERIES): "expand range to
 # quote between 1 and 99" -- price_min/max, which member_price_band, the quote
