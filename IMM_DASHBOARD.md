@@ -26,13 +26,18 @@ every 10 minutes by the `KL imm dashboard` task.
 
 **Exits the bot does not book** are valued at Kalshi's actual settlement:
 scalar settlements (NFL ladders and escalators settle at a fractional value;
-the bot only books yes/no and logs the rest as `manual_offset` -- all 34 such
-rows on 9/6-9/29 were scalar settlements, +$299 the bot never booked) and
-positions that leave its book with no record at all (4 on 9/6-9/29). Only an
-exit Kalshi has not settled counts as a transfer at the last mark. Results are
-cached in `cache/exit_results.json`. Days are **ET calendar days**; the bot's
-own halt counter rolls at 5am CT and is shown under Risk next to the
-daily-loss meter.
+until 2026-09-29 the bot booked only yes/no and logged the rest as
+`manual_offset` -- all 34 such rows on 9/6-9/29 were scalar settlements, +$299
+measured from the dashboard's last mark; the bot's own ledger, which dropped
+them at cost, was short +$29.95) and positions that leave its book with no
+record at all (4 on 9/6-9/29: markets that settled while the bot restarted,
+zeroed by its startup reconcile; ledger short +$62.38). Since 2026-09-29 the
+bot books both itself (scalar at `settlement_value`, void at cost; the
+reconcile settles instead of zeroing), so new exits of either kind should not
+appear. Only an exit Kalshi has not settled counts as a transfer at the last
+mark. Results are cached in `cache/exit_results.json`. Days are **ET calendar
+days**; the bot's own halt counter rolls at 5am CT and is shown under Risk
+next to the daily-loss meter.
 
 **Audited 2026-09-29** against sources the dashboard does not use:
 
@@ -55,7 +60,8 @@ daily-loss meter.
   apart), pick-off windows and the credit history all tie out.
 
 The bot's own `pnl_today_carry` differs from the dashboard for two reasons: it
-drops P&L across restarts, and it never books scalar settlements.
+drops P&L across restarts, and before 2026-09-29 it never booked scalar
+settlements.
 
 ## Sections
 

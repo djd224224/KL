@@ -392,6 +392,31 @@ class BuilderIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(mk["KXV-1"]["pnl"], -40 * (0 - 2) / 100 - 0.0, places=6)
         self.assertEqual(mk["KXV-1"]["settled"], "settled NO")
 
+    def test_scalar_settlement_booked_by_the_bot_counts_once(self):
+        # since 2026-09-29 the bot books a scalar settlement itself: a
+        # realized delta plus a "scalar" settlements row, which is no exit
+        d = "2026-09-28"
+
+        def add(name, rows):
+            with open(os.path.join(self.dir, f"{name}_{d}.jsonl"), "a", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r) + "\n")
+        for ts in ("2026-09-28T04:03:00+00:00", "2026-09-28T10:33:00+00:00"):
+            add("marks", [{"ts": ts, "ticker": "KXS-1", "series": "KXS", "event_ticker": "KXS",
+                           "pos": -90, "avg_cents": 16, "mark_cents": 82, "realized_dollars": 0.0}])
+        add("realized", [{"ts": "2026-09-28T12:05:00+00:00", "ticker": "KXS-1", "event_ticker": "KXS",
+                          "realized_delta_dollars": 3.6}])
+        add("settlements", [{"ts": "2026-09-28T12:05:00+00:00", "ticker": "KXS-1", "event_ticker": "KXS",
+                             "result": "scalar", "settle_price_cents": 12.0, "own_pos_at_settle": -90,
+                             "own_avg_cents": 16, "market_realized_dollars": 3.6, "via": "settle_loop"}])
+        b = self._exits(None)
+        self.assertNotIn("KXS-1", {e["t"] for e in b.exits})
+        mk, _e = b.window_markets(b.windows["today"]["start"], b.windows["today"]["end"])
+        # short 90 from an 82c mark to a 12c settlement, counted once
+        self.assertAlmostEqual(mk["KXS-1"]["pnl"], -90 * (12 - 82) / 100, places=6)
+        self.assertAlmostEqual(mk["KXS-1"]["real"], 3.6, places=6)
+        self.assertEqual(mk["KXS-1"]["settled"], "settled scalar 12.0c")
+
 
 if __name__ == "__main__":
     unittest.main()

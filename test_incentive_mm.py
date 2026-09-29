@@ -7121,6 +7121,255 @@ class TestMtmAndSettlement(unittest.TestCase):
         self.assertEqual(bot.state.sim_orders, {})
 
 
+class TestScalarVoidSettlement(unittest.TestCase):
+    """2026-09-29: Kalshi settles the sports ladders / escalators (and the
+    early-closed KXBKNUGGETS strikes on 9/10) as result "scalar" at a
+    fractional settlement_value_dollars. _settle_or_drop knew only yes/no, so
+    every one took the manual-offset branch -- 34 of 34 offset rows on
+    9/6-9/29 -- and was dropped at cost with the settlement leg unbooked."""
+    T = "KXGOOD-99DEC31-A"
+
+    def _bot(self, **market):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.state.universe_at = time.time()          # nothing selected
+        bot.client.markets[self.T].update(market)
+        self.rows = []
+        bot._sink = lambda name, rec: self.rows.append((name, dict(rec)))
+        return bot
+
+    def _settlements(self):
+        return [r for n, r in self.rows if n == "settlements"]
+
+    def test_settlement_value_parsed_exactly(self):
+        f = imm.settlement_value_cents
+        self.assertAlmostEqual(f({"settlement_value_dollars": "0.1200"}), 12.0)
+        self.assertAlmostEqual(f({"settlement_value_dollars": "0.2160"}), 21.6)
+        self.assertEqual(f({"settlement_value_dollars": "1.0000"}), 100.0)
+        self.assertEqual(f({"settlement_value_dollars": "0.0000"}), 0.0)
+        for bad in ({}, {"settlement_value_dollars": None},
+                    {"settlement_value_dollars": ""},
+                    {"settlement_value_dollars": "n/a"},
+                    {"settlement_value_dollars": "1.5000"},
+                    {"settlement_value_dollars": "-0.0100"}):
+            self.assertIsNone(f(bad), bad)
+
+    def test_scalar_booked_at_settlement_value(self):
+        """KXNFLFFPTSLADDER-26SEP27LVNO-LVAJEANTY2: short 90 @ 16c, settled
+        scalar 0.1200 -> +$3.60 realized, through the cycle's settle loop."""
+        bot = self._bot(result="scalar", status="finalized",
+                        settlement_value_dollars="0.1200",
+                        settlement_ts="2026-09-28T00:03:26.398535Z")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -90.0, 16.0
+        bot.state.last_mark[self.T] = 82.0
+        bot.run_cycle()
+        self.assertAlmostEqual(bot.pnl.realized[self.T], 90 * (16 - 12) / 100.0)
+        self.assertAlmostEqual(bot.pnl.pos.get(self.T, 0.0), 0.0)
+        self.assertNotIn(self.T, bot.state.last_mark)
+        [row] = self._settlements()
+        self.assertEqual(row["result"], "scalar")
+        self.assertAlmostEqual(row["settle_price_cents"], 12.0)
+        self.assertEqual(row["own_pos_at_settle"], -90.0)
+        self.assertEqual(row["own_avg_cents"], 16.0)
+        self.assertAlmostEqual(row["market_realized_dollars"], 3.6)
+        self.assertEqual(row["market_status"], "finalized")
+        self.assertEqual(row["settlement_ts"], "2026-09-28T00:03:26.398535Z")
+        self.assertEqual(row["via"], "settle_loop")
+
+    def test_day_pnl_moves_from_the_mark_to_the_settlement(self):
+        """The loss halt reads realized + MTM. Marked at 82c (the last trade
+        on an empty book), the short 90 @ 16c that settles at 12c must move
+        the day's P&L by the whole 82 -> 12 leg, +$63.00; dropping it as an
+        offset at cost moved it 82 -> 16 only, +$59.40."""
+        bot = self._bot(yes_bid_dollars="0.8100", yes_ask_dollars="0.8300")
+        bot.client.positions[self.T] = -90.0
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -90.0, 16.0
+        bot.run_cycle()                              # held, marked at 82
+        self.assertAlmostEqual(bot.state.last_mark[self.T], 82.0)
+        self.assertAlmostEqual(bot.state.pnl_today_last, 0.0)
+        bot.client.positions.clear()
+        bot.client.markets[self.T].update(
+            result="scalar", status="finalized", settlement_value_dollars="0.1200",
+            yes_bid_dollars="0.0000", yes_ask_dollars="1.0000")
+        bot.run_cycle()
+        self.assertAlmostEqual(bot.state.pnl_today_last, 90 * (82 - 12) / 100.0)
+        self.assertAlmostEqual(bot.pnl.total_realized(), 3.6)
+
+    def test_fractional_scalar_value_not_rounded(self):
+        """Escalators settle in 0.0001 steps: 0.2160 is 21.6c, not 22c
+        (KXNFLESCALATORRECYDS-26SEP27SEAWAS-SEAJSMITHNJIGBA11, short 36.4
+        @ 18.08c)."""
+        bot = self._bot(result="scalar", status="finalized",
+                        settlement_value_dollars="0.2160")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -36.4, 18.08
+        bot._settle_or_drop(self.T)
+        self.assertAlmostEqual(bot.pnl.realized[self.T], 36.4 * (18.08 - 21.6) / 100.0)
+        self.assertAlmostEqual(self._settlements()[0]["settle_price_cents"], 21.6)
+
+    def test_scalar_waits_for_final_status(self):
+        """Result set but not finalized: the payout is not fixed yet. Keep
+        the entry and retry; book once Kalshi finalizes."""
+        bot = self._bot(result="scalar", status="determined",
+                        settlement_value_dollars="0.1200")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -90.0, 16.0
+        bot.state.last_mark[self.T] = 14.0
+        bot._settle_or_drop(self.T)
+        self.assertEqual(bot.pnl.pos[self.T], -90.0)
+        self.assertEqual(bot.pnl.avg[self.T], 16.0)
+        self.assertEqual(bot.pnl.total_realized(), 0.0)
+        self.assertEqual(bot.state.last_mark[self.T], 14.0)
+        self.assertEqual(self._settlements(), [])
+        bot.client.markets[self.T]["status"] = "settled"      # the older name
+        bot._settle_or_drop(self.T)
+        self.assertAlmostEqual(bot.pnl.realized[self.T], 3.6)
+        self.assertEqual([r["result"] for r in self._settlements()], ["scalar"])
+
+    def test_scalar_without_a_value_is_kept(self):
+        bot = self._bot(result="scalar", status="finalized")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -90.0, 16.0
+        bot._settle_or_drop(self.T)
+        self.assertEqual(bot.pnl.pos[self.T], -90.0)
+        self.assertEqual(bot.pnl.total_realized(), 0.0)
+        self.assertEqual(self._settlements(), [])
+
+    def test_void_refunds_cost(self):
+        bot = self._bot(result="void", status="finalized")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 25.0, 37.0
+        bot._settle_or_drop(self.T)
+        self.assertAlmostEqual(bot.pnl.pos.get(self.T, 0.0), 0.0)
+        self.assertAlmostEqual(bot.pnl.total_realized(), 0.0)
+        [row] = self._settlements()
+        self.assertEqual(row["result"], "void")
+        self.assertAlmostEqual(row["settle_price_cents"], 37.0)
+
+    def test_unknown_result_is_kept_not_offset(self):
+        """Kalshi decided the market with a result this code cannot value:
+        not a manual offset, so the entry stays (marked, in the halt)."""
+        bot = self._bot(result="mystery", status="finalized")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -90.0, 16.0
+        bot._settle_or_drop(self.T)
+        self.assertEqual(bot.pnl.pos[self.T], -90.0)
+        self.assertEqual(self._settlements(), [])
+
+    def test_yes_no_rows(self):
+        for result, px in (("yes", 100.0), ("no", 0.0)):
+            bot = self._bot(result=result, status="finalized")
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 10.0, 40.0
+            bot.run_cycle()
+            self.assertAlmostEqual(bot.pnl.realized[self.T], 10 * (px - 40) / 100.0)
+            self.assertAlmostEqual(bot.pnl.pos.get(self.T, 0.0), 0.0)
+            [row] = self._settlements()
+            self.assertEqual(row["result"], result)
+            self.assertEqual(row["settle_price_cents"], px)
+            self.assertEqual(row["via"], "settle_loop")
+
+    def test_genuine_offset_is_still_a_manual_offset(self):
+        """Account flat, market NOT settled (result "", still active): the
+        lot was taken out by hand -- dropped at cost, no P&L, and the row
+        says manual_offset."""
+        bot = self._bot()
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 10.0, 40.0
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.pnl.pos)
+        self.assertEqual(bot.pnl.total_realized(), 0.0)
+        [row] = self._settlements()
+        self.assertEqual(row["result"], "manual_offset")
+        self.assertIsNone(row["settle_price_cents"])
+        self.assertEqual(row["market_status"], "active")
+        self.assertEqual(row["via"], "settle_loop")
+
+    def test_market_read_failure_retries(self):
+        bot = self._bot(result="scalar", status="finalized",
+                        settlement_value_dollars="0.1200")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -90.0, 16.0
+
+        def boom(ticker):
+            raise RuntimeError("503")
+        bot.client.get_market = boom
+        bot._settle_or_drop(self.T)
+        self.assertEqual(bot.pnl.pos[self.T], -90.0)
+        self.assertEqual(self._settlements(), [])
+
+
+class TestStartupReconcileSettles(unittest.TestCase):
+    """2026-09-29: the positions that left the own book with no settlement,
+    offset or realized row -- KXWORLDNEWSMENTION-26SEP09-IRAN (9/10),
+    KXTRUMPENDORSEMENTS-26SEP25-A10/A20 (9/26), an NFL escalator (9/27) and
+    five KXDIESELD-26SEP03 strikes (9/03) -- had all settled while the bot
+    restarted. The first trusted cycle's _reconcile_orphaned_fills runs
+    BEFORE the settle loop, read "account flat" as an orphaned fill and
+    adopted 0, dropping the settlement with no P&L and no record."""
+    T = "KXGOOD-99DEC31-A"
+
+    def _live_bot(self, **market):
+        _clean_persist()
+        client = FakeClient()
+        client.markets[self.T].update(market)
+        bot = IncentiveMarketMaker(client=client, live=True)
+        bot.state.known_tickers = {self.T}
+        self.rows = []
+        bot._sink = lambda name, rec: self.rows.append((name, dict(rec)))
+        return bot
+
+    def _settlements(self):
+        return [r for n, r in self.rows if n == "settlements"]
+
+    def test_market_settled_during_restart_is_booked(self):
+        """KXTRUMPENDORSEMENTS-26SEP25-A10: short 40 @ 56c, settled NO at
+        14:45Z, zeroed by the 14:47Z restart reconcile: +$22.40."""
+        bot = self._live_bot(result="no", status="finalized",
+                             settlement_value_dollars="0.0000")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -40.0, 56.0
+        bot._reconcile_orphaned_fills({})
+        self.assertAlmostEqual(bot.pnl.realized[self.T], 40 * 56 / 100.0)
+        self.assertAlmostEqual(bot.pnl.pos.get(self.T, 0.0), 0.0)
+        [row] = self._settlements()
+        self.assertEqual((row["result"], row["via"]), ("no", "startup_reconcile"))
+
+    def test_scalar_settled_during_restart_is_booked(self):
+        bot = self._live_bot(result="scalar", status="finalized",
+                             settlement_value_dollars="0.2160")
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -36.4, 18.08
+        bot._reconcile_orphaned_fills({})
+        self.assertAlmostEqual(bot.pnl.realized[self.T], 36.4 * (18.08 - 21.6) / 100.0)
+        [row] = self._settlements()
+        self.assertEqual((row["result"], row["via"]), ("scalar", "startup_reconcile"))
+        self.assertAlmostEqual(row["settle_price_cents"], 21.6)
+
+    def test_unsettled_flat_account_is_a_recorded_offset(self):
+        """Account flat, Kalshi has not settled: the same book effect as the
+        old adopt-0 (no P&L), but no longer without a record."""
+        bot = self._live_bot()
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -40.0, 56.0
+        bot._reconcile_orphaned_fills({})
+        self.assertNotIn(self.T, bot.pnl.pos)
+        self.assertEqual(bot.pnl.total_realized(), 0.0)
+        [row] = self._settlements()
+        self.assertEqual((row["result"], row["via"]), ("manual_offset", "startup_reconcile"))
+
+    def test_orphaned_fill_still_adopted_at_the_mid(self):
+        """The case the reconcile exists for is unchanged: the account holds
+        a position the own book does not know."""
+        bot = self._live_bot()
+        bot._reconcile_orphaned_fills({self.T: 10.0})
+        self.assertAlmostEqual(bot.pnl.pos[self.T], 10.0)
+        self.assertAlmostEqual(bot.pnl.avg[self.T], 50.0)    # (49 + 51) / 2
+        self.assertEqual(self._settlements(), [])
+
+    def test_first_live_cycle_books_it(self):
+        """Through run_cycle, where the reconcile runs on the first trusted
+        cycle ahead of the settle loop (KXWORLDNEWSMENTION-26SEP09-IRAN:
+        short 42.4 @ 86.69c, settled NO 20 s before the reconcile)."""
+        bot = self._live_bot(result="no", status="finalized")
+        bot.state.universe_at = time.time()
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -42.4, 86.69
+        bot.run_cycle()
+        self.assertAlmostEqual(bot.pnl.realized[self.T], 42.4 * 86.69 / 100.0)
+        self.assertAlmostEqual(bot.pnl.pos.get(self.T, 0.0), 0.0)
+        [row] = self._settlements()
+        self.assertEqual(row["via"], "startup_reconcile")
+
+
 class TestCycleLog(unittest.TestCase):
     def test_panel_row_written(self):
         _clean_persist()

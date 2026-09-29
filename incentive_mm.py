@@ -8466,6 +8466,23 @@ def market_cents(m: dict, base: str) -> Optional[int]:
     return c if c else None   # 0 == side absent
 
 
+# Market statuses at which Kalshi has paid a settlement out ("settled" is the
+# older API's name for "finalized").
+SETTLED_STATUSES = ("finalized", "settled")
+
+
+def settlement_value_cents(m: dict) -> Optional[float]:
+    """The YES payout of a settled market in cents, read exactly from
+    settlement_value_dollars -- a scalar escalator pays "0.2160" = 21.6c, so
+    this is never rounded to the penny (dollars_to_cents would say 22).
+    None when absent, unparseable or outside 0-100."""
+    try:
+        c = round(float(m.get("settlement_value_dollars")) * 100.0, 4)
+    except (TypeError, ValueError):
+        return None
+    return c if 0.0 <= c <= 100.0 else None
+
+
 def orderbook_levels(orderbook_response: dict) -> Tuple[List[List[float]], List[List[float]]]:
     """(yes_levels, no_levels) as [price_cents, qty], ascending by price.
     Sub-penny aware (2026-09-26): each book's prices are FLOORED to the cent
@@ -13379,11 +13396,14 @@ class IncentiveMarketMaker:
                 meta.floor_dollars_per_day = total
         return True
 
-    def _settle_or_drop(self, t: str) -> None:
+    def _settle_or_drop(self, t: str, via: str = "settle_loop") -> None:
         """Own book says we hold `t`, the account's unsettled positions don't.
-        Either the market settled (book the settlement trade at 0/100 through
-        the P&L tracker) or the user manually offset our lot after a standoff
-        (drop the stale accounting entry)."""
+        Either the market settled (book the settlement trade through the P&L
+        tracker at what Kalshi paid: 0/100 for yes/no, settlement_value for a
+        scalar, our own cost for a void) or the user manually offset our lot
+        after a standoff (drop the stale accounting entry). `via` names the
+        caller on the sink row: the cycle's settle loop or the startup
+        reconcile."""
         own = self.pnl.pos.get(t, 0.0)
         try:
             m = (self.client.get_market(t) or {}).get("market") or {}
@@ -13391,13 +13411,44 @@ class IncentiveMarketMaker:
             log(f"{self.tag} ! settle check failed for {t} ({e}); retry next cycle")
             return
         result = str(m.get("result") or "").lower()
+        status = str(m.get("status") or "").lower()
         # Captured before the pops below: this is the entry price the
         # settlement is scored against, and the else-branch destroys it.
         own_avg = self.pnl.avg.get(t, 0.0)
+        px: Optional[float] = None
         if result in ("yes", "no"):
             px = 100.0 if result == "yes" else 0.0
+        elif result in ("scalar", "void"):
+            # SCALAR / VOID (2026-09-29). The sports ladders and escalators
+            # (KXNFLFFPTSLADDER, KXNFLESCALATOR*, KXNFLLADDER*) settle
+            # "scalar" at a fractional settlement_value_dollars, and so did
+            # the early-closed KXBKNUGGETS strikes on 9/10. This used to fall
+            # through to the manual-offset branch: all 34 offset rows on
+            # 9/6-9/29 were Kalshi scalar settlements, dropped at cost with
+            # the settlement leg (pos x (value - avg)) never booked. A void
+            # refunds cost, so it books at our own entry price for zero
+            # realized. Both wait for Kalshi's final status: the payout is
+            # only fixed once the market is finalized.
+            if status not in SETTLED_STATUSES:
+                log(f"{self.tag} {t}: {result} result but market "
+                    f"{status or '?'}; settlement not final, retry next cycle")
+                return
+            px = own_avg if result == "void" else settlement_value_cents(m)
+            if px is None:
+                log(f"{self.tag} ! {t}: settled scalar without a readable "
+                    f"settlement_value_dollars "
+                    f"({m.get('settlement_value_dollars')!r}); retry next cycle")
+                return
+        elif result:
+            # Kalshi decided the market with a result this code cannot value.
+            # It is not a manual offset, so keep the entry (still marked and
+            # still in the loss halt) and say so each cycle until it can be.
+            log(f"{self.tag} ! {t}: unknown settlement result {result!r} "
+                f"(market {status or '?'}); own {own:+.0f} kept, retry next cycle")
+            return
+        if px is not None:
             self.pnl.on_fill(t, "yes", "sell" if own > 0 else "buy", abs(own), px)
-            log(f"{self.tag} {t}: settled {result.upper()}; booked {own:+.0f} @ {px:.0f}c "
+            log(f"{self.tag} {t}: settled {result.upper()}; booked {own:+.0f} @ {px:g}c "
                 f"(market realized ${self.pnl.realized.get(t, 0.0):+.2f})")
             # Nearly all of this bot's trading P&L lands here — it is a maker
             # that almost never closes a position, so settlement IS the exit.
@@ -13413,6 +13464,9 @@ class IncentiveMarketMaker:
                 "own_pos_at_settle": own,
                 "own_avg_cents": own_avg,
                 "market_realized_dollars": self.pnl.realized.get(t, 0.0),
+                "market_status": status,
+                "settlement_ts": m.get("settlement_ts"),
+                "via": via,
             })
         else:
             log(f"{self.tag} {t}: own book {own:+.0f} but account flat and market "
@@ -13428,6 +13482,8 @@ class IncentiveMarketMaker:
                 "own_pos_at_settle": own,
                 "own_avg_cents": own_avg,
                 "market_realized_dollars": self.pnl.realized.get(t, 0.0),
+                "market_status": status,
+                "via": via,
             })
             self.pnl.pos.pop(t, None)
             self.pnl.avg.pop(t, None)
@@ -13712,7 +13768,13 @@ class IncentiveMarketMaker:
         window) and big crypto by hand, none of which are quoted; (2) only
         within the per-market position cap — a >cap position can't be ours.
         Runs once, on the first trusted (non-grace) cycle; afterwards the normal
-        yield-to-human standoff handles genuinely NEW manual activity."""
+        yield-to-human standoff handles genuinely NEW manual activity.
+
+        A market the account holds NOTHING in is not adopted as 0: it goes
+        through _settle_or_drop, which books Kalshi's settlement or records a
+        manual offset (2026-09-29). Every "->+0" adoption on record (9
+        positions over 4 restarts, 9/03-9/27) was a market that settled while
+        the bot was down, and adopting 0 dropped it with no P&L and no row."""
         adopted = []
         for t in sorted(self.state.known_tickers):
             acct = positions.get(t, 0.0)
@@ -13721,6 +13783,9 @@ class IncentiveMarketMaker:
                 continue                      # below standoff threshold: harmless
             if abs(acct) > series_max_position(series_of(t)):
                 continue                      # too big to be ours -> it's manual
+            if t not in positions:
+                self._settle_or_drop(t, via="startup_reconcile")
+                continue
             # Entry cost of the orphaned delta is unrecoverable, so mark the
             # whole adopted position at the current YES mid: ~0 unrealized now,
             # clean forward P&L. Skips (leaves as-is) if the book can't be read.

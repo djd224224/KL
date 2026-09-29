@@ -22,12 +22,14 @@ WHAT EACH HEADLINE NUMBER IS (the page repeats these next to the numbers):
                     shown separately from reward_credits.csv (the ledger).
   Trading P&L       MARK-TO-MARKET on the bot's own book: realized in the
                     window (the realized_*.jsonl deltas: closing fills and
-                    settlements booked at 0/100) plus the change in unrealized
-                    (sum of pos x (mark - avg) over the marks_*.jsonl 5-minute
-                    snapshots at the window's two edges), plus the exits the
-                    bot does not book itself (build_exits): scalar settlements
-                    it logs as "manual_offset" and positions that leave its
-                    book with no record, valued at Kalshi's settlement price;
+                    settlements booked at 0/100 -- scalar at its settlement
+                    value and void at cost since 2026-09-29) plus the change
+                    in unrealized (sum of pos x (mark - avg) over the
+                    marks_*.jsonl 5-minute snapshots at the window's two
+                    edges), plus the exits the bot does not book itself
+                    (build_exits): scalar settlements it logged as
+                    "manual_offset" before 2026-09-29 and positions that leave
+                    its book with no record, valued at Kalshi's settlement price;
                     only an exit Kalshi has not settled is a transfer out at
                     its last mark. Audited 2026-09-29 against a replay of
                     Kalshi's own fills and settlement results: equal to the
@@ -1263,11 +1265,15 @@ class Builder:
         writes these when the account no longer holds a market that Kalshi
         has not settled yes/no -- which on 9/6-9/29 was, 34 times of 34, a
         SCALAR settlement (NFL fantasy-point ladders and escalators settle at
-        a fractional value), not a manual trade. (2) "vanished" positions: in
+        a fractional value), not a manual trade. Since 2026-09-29 the bot
+        books scalar / void itself and writes "manual_offset" only for a
+        market Kalshi has not settled. (2) "vanished" positions: in
         one 5-minute snapshot and gone from every snapshot for the next
         VANISH_REAPPEAR_SECS with no settlement row within an hour and no
-        closing fill (4 on 9/6-9/29, e.g. two dropped by the 9/26 state
-        restore). Each exit is resolved against Kalshi's market record: a
+        closing fill (4 on 9/6-9/29: settled while the bot restarted, then
+        zeroed by its startup reconcile -- e.g. two at the 9/26 14:47Z
+        restart; that path settles them too since 2026-09-29). Each exit is
+        resolved against Kalshi's market record: a
         market Kalshi has settled (yes / no / scalar at settlement_value; a
         void refunds cost) is booked as realized at that price; anything else
         is a transfer out at the last mark (no P&L from the last mark on).
@@ -1461,8 +1467,15 @@ class Builder:
             if e0 <= ts < e1:
                 m[t]["real"] += d
         for s in self.settlements:
-            if e0 <= s["ts"] < e1 and s["result"] in ("yes", "no"):
+            if not (e0 <= s["ts"] < e1):
+                continue
+            if s["result"] in ("yes", "no"):
                 m[s["t"]]["settled"] = f"settled {str(s['result']).upper()}"
+            elif s["result"] in ("scalar", "void") and s["px"] is not None:
+                # booked by the bot itself since 2026-09-29 (its realized
+                # delta is already in "real"); labelled as build_exits labels
+                # the older offset rows it resolves
+                m[s["t"]]["settled"] = f"settled {s['result']} {float(s['px']):.1f}c"
         for e in self.exits_in(e0, e1):
             mm = m[e["t"]]
             if e["realized"]:
