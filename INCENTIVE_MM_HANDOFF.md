@@ -4700,3 +4700,121 @@ halving composes to x0.75; monthlies / weekend / rainstorm archetype stay
 1.0), TestTreasuryYieldSeriesEnrolled.test_x1_5_family_size (ten tenors,
 guards kept, no prefix bleed); TestRainFairAnchor pins the family size
 at 1.0 (its assertions are on literal rung sizes). 1,453 green.
+
+## 2026-09-28 late — Elections allowlisted: county judges, mayors, House, state AGs and the general elections, quoted 1-99c until 00:00 ET on election day (Jack)
+
+Jack: "allowlist county judge markets e.g. KXBEXARCOUNTYJUDGE,
+KXCOLLINCOUNTYJUDGE / house election markets e.g. KXHOUSEWINSTATE,
+KXHOUSEWINSTATE-NJD / mayor elections e.g. KXHENDERSONMAYOR, KXLEXMAYOR /
+quote until election day. expand range to quote between 1 and 99", then
+"also allowlist general election markets e.g. KXSERBIAPRES, KXBC3RD,
+KXQUEBEC4TH, KXSAARLAND, KXNORDRHEINWESTFALEN". Commit fc3f84e.
+
+THE FEED. Kalshi lit an elections batch 20:02Z-23:02Z 9/28, programs to
+10/04 03:59Z: 60 Elections-category series. One market per candidate /
+party / count, $285-$500 per market per ~5-day period ($20-55/market/day),
+and most books empty -- a 1-3c bid under a 97-99c ask -- which the global
+5-90c band stood aside from entirely.
+
+MEMBERSHIP (election_series; allowed in _allowed). The "e.g." is the
+family, so the three US families are NAME PATTERNS (ELECTION_SERIES_
+PATTERNS, full-match): KX[A-Z]+CO(UNTY)?JUDGE (incl. KXWILCOJUDGE),
+<city>MAYOR less KXISTANBULMAYOR / KXACKMANMAYOR / KXAPCALLLAMAYOR /
+KXBBGMAYOR (a court case, "will he run", AP-call timing, unattributed),
+KXHOUSEWINSTATE, KXHOUSE<ST><N> district winners, KX<ST>HOUSE1R
+(Louisiana's open primaries) and KXATTYGEN<ST> (29 states). The general
+elections share no naming shape, so they are an exact list of the 9/28
+feed's election-OUTCOME series (ELECTION_SERIES): SERBIAPRES, BC2ND /
+BC3RD, QUEBEC4TH / QUEBEC5TH, SAARLAND, NORDRHEINWESTFALEN,
+SCHLESWIGHOLSTEIN, PUNJABASSEMBLY, BRAZILTURNOUT, DEMTRIFECTA,
+UNDERHARRIS, VOTEGENERAL, CAATTORNEYGENERAL, FULTONCHAIR. Filed under
+Elections but left OUT: KXSENMIN (a leadership vote by senators after the
+election), KXSERBIAELECTIONCALL (when the vote is called: news timing),
+KXGENERICBALLOTVOTEHUB (a daily polling average, the KXTRUMPAPPROVE
+pick-off shape), KXVPRESPERSON (2028: the running-mate picks, not the
+vote, are the first reveal). Checked against the live feed: 56 of the 60
+programmed Elections series allowed, exactly those four not, and no
+election_series() hit outside the Elections category.
+
+THE CUTOFF (election_cutoff_utc, applied in apply_series_cutoff_
+adjustments for both producers and the quote-gaps mirror, keyed on the
+family so orphan restore gets it too): 00:00 ET on the voting day, the
+EARLIEST of the hand table ELECTION_DATES, the ticker date, and the ET day
+of Kalshi's occurrence less 6h. Kalshi's occurrence is the poll close on
+the county judges / mayors / CA AG / Fulton (01:00Z Nov 4 Texas, 23:00Z
+Nov 3 Kentucky, 03:00Z Nov 4 Nevada) and the ticker date is the vote
+abroad (26OCT24 BC, 26OCT05 Quebec, 27APR18 Saarland) -- but on the House
+seat counts and district winners the occurrence is Jan 3 2027 (Congress
+convenes; KXHOUSEWINSTATE-SCD May 2027, -ALD Nov 2027), on the attorneys
+general the swearing-in (Dec 15 2026 - Jan 18 2027) and KXUNDERHARRIS's ticker is
+certification (27JAN04). Every one of those would have quoted THROUGH the
+election; the table pulls them to Nov 3: `*-26` (every year-only 2026
+event -- the US races), KXHOUSEWINSTATE-*, KXVOTEGENERAL-*-26*,
+KXUNDERHARRIS-*. A row can only move the day earlier. The 6h read-back
+keeps an Alaska / Hawaii close after midnight ET on Nov 3 and moves an
+Asian close (Taipei 08:00Z Nov 28) to the day before -- Taipei's vote opens
+19:00 ET Nov 27. A Dec 31 date is Kalshi's placeholder (KXJOHANNESBURG
+MAYOR-26DEC31); placeholder or no date at all -> RELEASE_GUARD_UNKNOWN
+(stood down, logged once) unless the table has a row.
+
+Resulting cutoffs on the programmed events: every US race 2026-11-03
+05:00Z (00:00 EST), Brazil turnout 10-04 04:00Z, Quebec 10-05, BC 10-24,
+Serbia 12-27 05:00Z, Punjab 2027-02-20, Saarland / Schleswig-Holstein
+2027-04-18, North Rhine-Westphalia 2027-04-25.
+
+GUARDS. ELECTION_ARCHETYPE (KXBEXARCOUNTYJUDGE) override: price band
+1-99c (price_min/max: member_price_band, the quote loop, the estimator's
+quotable sides and the extreme_mid screen) and safe-join (the KXCMA /
+awards / KXVENUEPERFORM nominee-binary guard; free on the empty 2/98
+books and on a stacked touch). Every member clones it on first sight via
+a new "predicate" kind in FAMILY_OVERRIDE_PARENTS. No size multiplier, no
+per-event cap, the ordinary $1.50 entry bar. imm_quote_gaps now runs
+ensure_family_override before build_meta, as refresh_universe does --
+without it every pattern family (ladders / escalators too) read the
+global 5-90c band in the email.
+
+LIVE (run 7be453a4, config 793ed6b8): the source-mtime exit at 00:22:20Z
+handed 426 resting orders to the relaunch. First refresh 00:24:08Z:
+candidates 1,996 -> 2,216 (231 election markets, every cutoff as listed
+above), 131 of them admit_pending on the 10-minute admission clock.
+Second refresh 00:34:29Z admitted 130: 491 selected across 101/200
+events (345 / 73 before the deploy). Election family: 153 selected (72
+general-election, 50 KXVOTEGENERAL, 16 House, 13 county judge, 1 mayor,
+1 AG), 78 payout_floor (59 AGs -- deep books already trading -- plus 3 of
+the 4 mayor markets and 3 county judges). First cycle: 250 placements
+(the per-cycle cap; 10 deferred) on 125 election markets, 0 rejects; 52
+bids at 1-4c and 30 asks at 96-99c, the orders the 5-90c band stood aside
+from (KXCOLLINCOUNTYJUDGE-26-JBRO 3c / 97c, KXFULTONCHAIR-26-ETAT 2c / 98c,
+KXBC2ND-26OCT24-2-CEN 2c / 3c). KXVOTEGENERAL had been an open-scan series
+(23 members): it left the scan tier ("guard set released") and inherited
+the election archetype. imm_quote_gaps --dry builds clean on the new code.
+
+KILL SWITCHES (launcher env, task-level restart): IMM_ELECTION_ALLOW=0
+drops the family; IMM_ELECTION_SERIES / IMM_ELECTION_SERIES_PATTERNS
+replace the lists (comma-separated, so no regex may contain a comma);
+IMM_ELECTION_DATES replaces the WHOLE table (the IMM_AWARDS_EVENT_DATES
+format); IMM_ELECTION_PRICE_MIN / _MAX; IMM_ELECTION_SAFE_JOIN=0.
+
+WHAT THIS DOES NOT FIX / WATCH:
+- Unscheduled votes: KXSERBIAPRES-26DEC27 is "the next Serbian
+  presidential election" (whether it is called by Oct 15 / Nov 1 is its
+  own market) and KXPUNJABASSEMBLY-27FEB20 carries 2022's date. If a vote
+  is set EARLIER than Kalshi's date, add a table row that day.
+- The `*-26` row covers the 2026 US races only; a 2027 / 2028 listing
+  (KXCHICAGOMAYOR-27 reads its own Feb 23 occurrence) needs its own row
+  where Kalshi's dates are post-election.
+- ET midnight of the local election date is inside the voting day east of
+  Europe when no poll-close occurrence exists (India: 10:30 IST); Punjab
+  has one at 14:00Z, which lands on the same day.
+- Inventory taken before the cutoff rides through the vote to settlement
+  (standard cutoff semantics).
+- 1-99c means the bot will sell a 98c ask into a near-certain race; the
+  per-market cap bounds it (~150 x 2c).
+
+Tests: TestScreen.test_election_family_quoted_1_to_99_until_election_day
+(membership and exclusions, kill switch, blocklist wins; 17 events'
+cutoffs as Kalshi served them incl. the Jan-2027 House / AG dates and the
+Taipei day-before; placeholder / no date fail closed unless tabled;
+guards cloned; the empty 2/98 book quoted at its touch where the global
+band places nothing; the screen). 1,476 green (unittest discover) at
+fc3f84e.
