@@ -20,21 +20,42 @@ every 10 minutes by the `KL imm dashboard` task.
 | Number | Definition | Source |
 |---|---|---|
 | Modeled rewards | the bot's reward estimate (`est_frac x pool_per_day`) integrated over each gap between full cycles, gaps capped at 900 s; exactly `imm_reward_recon._scan_cycle_log`, bucketed by UTC hour | `cycle_log_*.csv` |
-| Trading P&L | mark-to-market on the bot's own book: realized in the window + change in unrealized between the 5-minute position snapshots at the window's edges | `realized_*`, `marks_*`, `settlements_*` |
+| Trading P&L | mark-to-market on the bot's own book: realized in the window + change in unrealized between the 5-minute position snapshots at the window's edges + exits the bot does not book (below) | `realized_*`, `marks_*`, `settlements_*`, Kalshi market results |
 | Net | modeled rewards + trading P&L | |
 | Credited | Kalshi credits by credit date (IMM-attributable when the calibration has it) | `reward_credits.csv` |
 
-A market that leaves the book by a **manual offset** is treated as transferred
-at its last mark, never as a trading loss. Days are **ET calendar days**; the
-bot's own halt counter rolls at 5am CT and is shown under Risk next to the
+**Exits the bot does not book** are valued at Kalshi's actual settlement:
+scalar settlements (NFL ladders and escalators settle at a fractional value;
+the bot only books yes/no and logs the rest as `manual_offset` -- all 34 such
+rows on 9/6-9/29 were scalar settlements, +$299 the bot never booked) and
+positions that leave its book with no record at all (4 on 9/6-9/29). Only an
+exit Kalshi has not settled counts as a transfer at the last mark. Results are
+cached in `cache/exit_results.json`. Days are **ET calendar days**; the bot's
+own halt counter rolls at 5am CT and is shown under Risk next to the
 daily-loss meter.
 
-**Checked 2026-09-28** on live data: modeled rewards over the bot's roll day
-$483.97 vs the bot's own `reward_est_today` $482.02 (0.4%); trading P&L by
-this method vs an independent cash-flow rebuild (fills + settlements + marks)
-within ~2% (today -$423 vs -$435, yesterday -$533 vs -$527). The bot's own
-`pnl_today_carry` reads less negative (-$310 vs -$370 that day) because it
-drops P&L across restarts (9 runs that day).
+**Audited 2026-09-29** against sources the dashboard does not use:
+
+- Trading P&L equals a replay of Kalshi's own records (the account's fills on
+  the bot's order ids, Kalshi settlement results incl. scalar values, start
+  positions from the snapshot) to the cent: 9/16 -$637.10, 9/22 -$776.20,
+  9/27 -$278.51, 9/28 -$450.48, 9/29 intraday, and the 7-day window. The
+  replay reproduces the bot's end-of-day positions on every market, and the
+  bot's own book equals the account's positions API on all 926 open markets.
+- Marks are Kalshi's top-of-book mid (1-minute candles at the snapshot minute:
+  median gap 0.0c), or the last trade when the book is empty.
+- Modeled rewards equal `imm_reward_recon`'s hourly cache on every market-hour
+  of 80 cycle-log files, and the bot's own `reward_history` within 0.2%.
+- Quoting now equals Kalshi's resting orders: 367 two-sided / 55 one-sided on
+  all 422 markets, resting $8,923 vs $8,916 (top-rung pricing); run-rate equals
+  the bot's status line.
+- Fills (after de-duplicating the sink's double-written rows), $ traded,
+  30-minute mark-outs (25 of 25 recomputed by hand), toxic-halt counts, guard
+  holds, the decision mix, the program feed (680 vs 678 events, minutes
+  apart), pick-off windows and the credit history all tie out.
+
+The bot's own `pnl_today_carry` differs from the dashboard for two reasons: it
+drops P&L across restarts, and it never books scalar settlements.
 
 ## Sections
 

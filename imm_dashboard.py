@@ -24,9 +24,14 @@ WHAT EACH HEADLINE NUMBER IS (the page repeats these next to the numbers):
                     window (the realized_*.jsonl deltas: closing fills and
                     settlements booked at 0/100) plus the change in unrealized
                     (sum of pos x (mark - avg) over the marks_*.jsonl 5-minute
-                    snapshots at the window's two edges). A market that leaves
-                    the book by a manual offset is treated as transferred at
-                    its last mark, never as a loss.
+                    snapshots at the window's two edges), plus the exits the
+                    bot does not book itself (build_exits): scalar settlements
+                    it logs as "manual_offset" and positions that leave its
+                    book with no record, valued at Kalshi's settlement price;
+                    only an exit Kalshi has not settled is a transfer out at
+                    its last mark. Audited 2026-09-29 against a replay of
+                    Kalshi's own fills and settlement results: equal to the
+                    cent on 9/16, 9/22, 9/27, 9/28, 9/29 and the 7-day window.
   Net               modeled rewards + trading P&L.
 
 Days are ET calendar days (midnight to midnight). The bot's own halt/carry
@@ -106,7 +111,9 @@ PROMISING_EST = float(os.environ.get("IMM_DASH_PROMISING_EST", "3.0"))
 PROMISING_LEFT = float(os.environ.get("IMM_DASH_PROMISING_LEFT", "500"))
 TITLE_BUDGET = int(os.environ.get("IMM_DASH_TITLE_BUDGET", "80"))
 PAD_BID, PAD_ASK = 1, 99  # incentive_mm PAD_BID_CENTS / PAD_ASK_CENTS
-CACHE_VERSION = 3
+CACHE_VERSION = 4
+VANISH_REAPPEAR_SECS = 6 * 3600   # a position back within this long was only a blip
+EXIT_RESULTS_TTL = 3600           # re-ask Kalshi about an unsettled exit hourly
 
 # Guards that mean "something went wrong / risk stood us down" rather than a
 # structural reason (band, cutoff, qualify). Names from IMM_LOGGING.md.
@@ -192,7 +199,7 @@ _KPI = frozenset(("KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM",
 _CO_RE = re.compile(
     r"KX(AAL|ALK|AMZN|AXP|BA|CART|CCL|CMG|COINBASE|CVNA|DPZ|FSLR|GOOG|GOOGL|HOOD|"
     r"INTC|LMND|LUV|META|MELI|MELIA|NCLH|NFLX|PM|RACE|RBLX|RDDT|RIVN|SBUX|SG|TLN|TTAN|"
-    r"VZ|WH|WING|YOU|YUM|DKS|ZM|URBN|LOW|DG|AFRM|BBY|WSM|OKTA|CTC)A?")
+    r"VZ|WH|WING|YOU|YUM|DKS|ZM|URBN|LOW|DG|AFRM|BBY|WSM|OKTA|CTC|VSX)[AY]?")
 # the bot's election membership (incentive_mm.ELECTION_SERIES / _PATTERNS);
 # election_series() below prefers the live module when it is importable
 _ELECTION_EXACT = frozenset((
@@ -214,6 +221,20 @@ _AWARDS_PREFIX = ("KXGGNOM", "KXGRAMMY", "KXOSCAR", "KXCMA", "KXART", "KXTOP10BB
                   "KXNETFLIXTOP", "KXWEEKSNUM", "KXNATBOOK", "KXVMA", "KXEMMY",
                   "KXSPOTIFY", "KXBILLBOARD", "KXBOXOFFICE")
 _imm_mod = None      # set by _import_imm() when incentive_mm is importable
+# the rewards report's exact "Politics & policy" members (_QP_RULES)
+_POLICY_EXACT = frozenset(("KXBCNDPSEATS", "KXCANALBERTAREMAIN", "KXMAMDANIEO",
+                           "KXDEFRANCHISETAX", "KXCAFAIRPLAN", "KXCASESSION",
+                           "KXPAMAILMARGIN", "KXPAMAILREQ"))
+# Kalshi's own series category, for a series no rule above recognises
+_CATEGORY_FAMILY = {
+    "economics": "Econ & rates", "financials": "Company KPIs", "companies": "Company KPIs",
+    "politics": "Politics & approval", "elections": "Politics & approval",
+    "world": "Politics & approval", "science and technology": "AI & tech",
+    "entertainment": "Sports & awards", "sports": "Sports & awards",
+    "climate and weather": "Weather & quakes", "crypto": "Crypto",
+    "commodities": "Commodities & shipping", "transportation": "Other prints",
+    "health": "Other prints",
+}
 
 
 def election_series(series: str) -> bool:
@@ -238,8 +259,9 @@ def _election_group(series: str) -> str:
     return "General elections"
 
 
-def family_of(series: str):
-    """(family, group) for a series ticker."""
+def family_of(series: str, category: str = ""):
+    """(family, group) for a series ticker. `category` (Kalshi's series
+    category, when known) places a series none of the rules recognise."""
     s = series or ""
     if s.startswith("KXEARNINGSMENTION"):
         return "Earnings mentions", s[len("KXEARNINGSMENTION"):] or "earnings"
@@ -250,6 +272,10 @@ def family_of(series: str):
         return "Other mentions", s
     if election_series(s):
         return "Elections", _election_group(s)
+    if s in _POLICY_EXACT:
+        return "Politics & approval", s
+    if s.startswith("KXTEMPHELP"):                # temporary-help employment, not weather
+        return "Econ & rates", "Jobs & economy"
     if s.startswith(("KXTRUMP", "KXGENERICBALLOT", "KXEOWEEK", "KXVANCE", "KXHARRIS",
                      "KXGABBARD", "KXRFK", "KXMAMDANI", "KXNEWSOM", "KXSCOTUS", "KXNEXT")) \
             or any(k in s for k in ("APPROVE", "BALLOT", "SENATE", "TARIFF", "MINWAGE", "VOTE",
@@ -299,7 +325,8 @@ def family_of(series: str):
         return "Company KPIs", s
     if s.startswith(("KXCBD", "KXFED", "KXRBNZ", "KXBOI", "KXECB")):
         return "Econ & rates", "Central banks"
-    if s.startswith("KXCPI") or "INFL" in s or s in ("KXOER", "KXIBONDFIX", "KXPCE", "KXCOREPCE"):
+    if s.startswith("KXCPI") or "INFL" in s or s in ("KXOER", "KXIBONDFIX", "KXPCE", "KXCOREPCE",
+                                                        "KXSAMOMINF"):
         return "Econ & rates", "CPI & inflation"
     if s.startswith("KXUST"):
         return "Econ & rates", "Treasury yields"
@@ -312,15 +339,16 @@ def family_of(series: str):
                             "TEU", "SCFI", "FREIGHT")):
         return "Commodities & shipping", "Straits, ports & freight"
     if any(k in s for k in ("CRUDE", "OIL", "SPRLVL", "COAL", "TACONITE", "MARCELLUS",
-                            "NUCLEAR", "RESPOWER", "NATGAS", "DATACENT")):
+                            "NUCLEAR", "RESPOWER", "NATGAS")):
         return "Commodities & shipping", "Energy & mining"
     if any(k in s for k in ("CORN", "WHEAT", "COTTON", "CATTLE", "ETHANOL", "FARMLAND", "MAPLE",
-                            "MILK", "LOBSTER", "QUAHOG", "HARVEST", "SOYBEAN", "SCREWWORM")):
+                            "MILK", "LOBSTER", "QUAHOG", "HARVEST", "SOYBEAN", "SCREWWORM")) \
+            or s == "KXNECOF":                      # Nebraska cattle on feed
         return "Commodities & shipping", "Agriculture"
     if s.startswith(("KXAI", "KXANTHV", "KXOPENV", "KXMOONV", "KXDEEPV", "KXLLM", "KXOAI",
                      "KXANTHROPIC", "KXOPENAI", "KXGEMINI", "KXGOOGSHARE", "KXANTHSHARE",
                      "KXWAYMO", "KXTESLA", "KXMODEL", "KXARENA", "KXTOPMODEL", "KXCHINAAI")) \
-            or "ADOPT" in s or s.startswith("KXTOKENUSE") \
+            or "ADOPT" in s or s.startswith("KXTOKENUSE") or "DATACENT" in s \
             or s in ("KXOPENSOURCESHARE", "KXXIAOMISHARE", "KXOPENSHARE",
                      "KXDEEPSHARE", "KXB200WS", "KXGPU"):
         return "AI & tech", s
@@ -329,6 +357,9 @@ def family_of(series: str):
         return "Crypto", s
     if any(k in s for k in ("VISIT", "HOTEL", "SUBWAY", "ONTIME", "TSA", "ATTENDANCE", "AIRPORT")):
         return "Other prints", "Travel & visits"
+    fam = _CATEGORY_FAMILY.get((category or "").strip().lower())
+    if fam:
+        return fam, s
     return "Other prints", s
 
 
@@ -590,6 +621,9 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None):
          hours   {utc_hour: (snap_ts, {ticker: (pos, avg_c, mark_c)})} -- the FIRST
                  snapshot at or after each hour boundary (keep_hours only)
          last    (snap_ts, {ticker: (pos, avg, mark)}) -- the newest snapshot
+         first   the oldest snapshot, same shape (the file-boundary diff)
+         gone    [(ticker, pos, avg, mark, last_seen_ts, first_missing_ts)]
+         came    [(ticker, first_seen_ts)] between consecutive snapshots
     `queries` {key: (ticker, target_ts)} is answered in place with the first
     snapshot mark at or after target_ts (within MARKOUT_MAX_LAG): the fill
     mark-outs, resolved while the rows are in memory."""
@@ -618,6 +652,18 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None):
         if keep_hours and h not in hours:
             hours[h] = (ts, book)
     last = (order[-1], snaps[order[-1]]) if order else (0.0, {})
+    first = (order[0], snaps[order[0]]) if order else (0.0, {})
+    # positions leaving / entering the book between consecutive snapshots:
+    # the raw material for spotting a position that left with no record
+    gone, came = [], []
+    for a, b in zip(order, order[1:]):
+        pa, pb = snaps[a], snaps[b]
+        for t, (p, avg, mk) in pa.items():
+            if t not in pb:
+                gone.append((t, p, avg, mk, a, b))
+        for t in pb:
+            if t not in pa:
+                came.append((t, b))
     if queries:
         # per ticker: sorted [(ts, mark)] only for tickers queried
         want = defaultdict(list)
@@ -634,7 +680,8 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None):
                         if ts - target <= MARKOUT_MAX_LAG:
                             queries[key] = ("ok", mk, ts)
                         break
-    return {"totals": totals, "hours": hours if keep_hours else {}, "last": last}
+    return {"totals": totals, "hours": hours if keep_hours else {}, "last": last,
+            "first": first, "gone": gone, "came": came}
 
 
 # ----------------------------------------------------------------------------
@@ -656,7 +703,7 @@ def load_realized(first_day: str):
 
 
 def load_fills(first_day: str):
-    out = []
+    out, seen = [], set()
     for _d, p in day_files("fills", "jsonl", first_day):
         for r in iter_jsonl(p):
             ts = _f(r.get("ts"))
@@ -669,8 +716,14 @@ def load_fills(first_day: str):
                 side = "bid" if sa in (("yes", "buy"), ("no", "sell")) else "ask"
             px = _f(r.get("yes_price_cents"))
             cnt = _f(r.get("count"))
+            fid = r.get("fill_id") or f"{t}:{ts}:{cnt}"
+            # the sink writes a fill twice now and then around the UTC file
+            # roll (14 of 8,236 rows 9/6-9/29); Kalshi's fill id is unique
+            if fid in seen:
+                continue
+            seen.add(fid)
             out.append({
-                "id": r.get("fill_id") or f"{t}:{ts}:{cnt}", "ts": ts, "t": t,
+                "id": fid, "ts": ts, "t": t,
                 "ev": r.get("event_ticker") or event_of(t), "side": side, "px": px,
                 "n": cnt, "taker": bool(r.get("is_taker")), "pad": bool(r.get("is_pad")),
                 "scan": bool(r.get("is_scan")),
@@ -819,6 +872,18 @@ def launcher_env() -> dict:
 # ----------------------------------------------------------------------------
 # API sections (cached): programs feed, quote-gaps estimator, pick-off windows
 # ----------------------------------------------------------------------------
+
+def _kalshi_markets(tickers):
+    """{ticker: market record} via kalshi_reads (signed, paced)."""
+    sys.path.insert(0, HERE)
+    from kalshi_reads import kalshi_get
+    out = {}
+    for i in range(0, len(tickers), 50):
+        js = kalshi_get("/markets", {"tickers": ",".join(tickers[i:i + 50]), "limit": 50})
+        for m in js.get("markets") or []:
+            out[m.get("ticker")] = m
+    return out
+
 
 def _import_imm():
     """(imm_quote_gaps, incentive_mm) with the launcher env mirrored first, or
@@ -1038,6 +1103,8 @@ class Builder:
         self.detail_from = now - DETAIL_DAYS * 86400
         self.warnings = []
         self.timing = {}
+        self.exits = []
+        self.market_lookup = None     # tests inject {ticker: market} lookups
 
     def _t(self, name, t0):
         self.timing[name] = round(time.time() - t0, 2)
@@ -1119,6 +1186,8 @@ class Builder:
         self.snap_totals = []            # [(ts, U, n, gross)]
         self.hour_snaps = {}             # {utc_hour: (ts, book)}
         self.last_snap = (0.0, {})
+        self.gone, self.came = [], []    # position exits / entries between snapshots
+        prev_last = None
         files = day_files("marks", "jsonl", self.first_day)
         live_path = files[-1][1] if files else None
         keep_names = set()
@@ -1153,6 +1222,19 @@ class Builder:
             self.snap_totals.extend(val["totals"])
             if keep_hours:
                 self.hour_snaps.update(val["hours"])
+            self.gone.extend(val.get("gone") or [])
+            self.came.extend(val.get("came") or [])
+            first = val.get("first") or (0.0, {})
+            if prev_last and prev_last[0] and first[0]:
+                pa, pb = prev_last[1], first[1]
+                for t, (p_, a_, mk_) in pa.items():
+                    if t not in pb:
+                        self.gone.append((t, p_, a_, mk_, prev_last[0], first[0]))
+                for t in pb:
+                    if t not in pa:
+                        self.came.append((t, first[0]))
+            if val["last"][0]:
+                prev_last = val["last"]
             if path == live_path or val["last"][0] > self.last_snap[0]:
                 if val["last"][0] >= self.last_snap[0]:
                     self.last_snap = val["last"]
@@ -1170,6 +1252,129 @@ class Builder:
             pass
         self.markouts = mk_cache
         self.snap_totals.sort()
+
+
+    # ---- position exits the realized log does not book ------------------------
+    def build_exits(self):
+        """Every position that left the bot's book without the realized log
+        booking its value, valued the way the account actually experienced it.
+
+        Two sources. (1) settlement rows with result "manual_offset": the bot
+        writes these when the account no longer holds a market that Kalshi
+        has not settled yes/no -- which on 9/6-9/29 was, 34 times of 34, a
+        SCALAR settlement (NFL fantasy-point ladders and escalators settle at
+        a fractional value), not a manual trade. (2) "vanished" positions: in
+        one 5-minute snapshot and gone from every snapshot for the next
+        VANISH_REAPPEAR_SECS with no settlement row within an hour and no
+        closing fill (4 on 9/6-9/29, e.g. two dropped by the 9/26 state
+        restore). Each exit is resolved against Kalshi's market record: a
+        market Kalshi has settled (yes / no / scalar at settlement_value; a
+        void refunds cost) is booked as realized at that price; anything else
+        is a transfer out at the last mark (no P&L from the last mark on).
+        Without the API the transfer rule applies and the exit is flagged."""
+        fills_by = defaultdict(list)
+        for f in self.fills:
+            fills_by[f["t"]].append(f)
+        setl_by = defaultdict(list)
+        for s_ in self.settlements:
+            setl_by[s_["t"]].append(s_)
+        came_by = defaultdict(list)
+        for t, ts in self.came:
+            came_by[t].append(ts)
+        gone_by = defaultdict(list)
+        for g in self.gone:
+            gone_by[g[0]].append(g)
+        exits = []
+        # (1) offset rows
+        for s_ in self.settlements:
+            if s_["result"] != "manual_offset":
+                continue
+            g = [x for x in gone_by.get(s_["t"], []) if x[4] <= s_["ts"] + 60 and x[5] >= s_["ts"] - 3600]
+            if g:
+                g = max(g, key=lambda x: x[4])
+                pos, avg, mk = g[1], g[2], g[3]
+            else:
+                pos, avg, mk = s_["pos"], s_["avg"], None
+            exits.append({"ts": s_["ts"], "t": s_["t"], "pos": pos, "avg": avg,
+                          "mark": mk if mk is not None else avg, "kind": "offset"})
+        # (2) vanished positions
+        for (t, pos, avg, mk, last_ts, gone_ts) in self.gone:
+            if any(last_ts - 3600 <= x["ts"] <= gone_ts + VANISH_REAPPEAR_SECS for x in setl_by.get(t, [])):
+                continue                                  # a settlement / offset row covers it
+            before = [f for f in fills_by.get(t, []) if f["ts"] <= gone_ts + 60]
+            if before and abs(before[-1]["pos1"]) < 0.05:
+                continue                                  # closed by a fill
+            if any(gone_ts <= c <= gone_ts + VANISH_REAPPEAR_SECS for c in came_by.get(t, [])):
+                continue                                  # a blip: back within hours
+            exits.append({"ts": gone_ts, "t": t, "pos": pos, "avg": avg,
+                          "mark": mk if mk is not None else avg, "kind": "vanish"})
+        self.exits = sorted(exits, key=lambda e: e["ts"])
+        self._resolve_exits()
+
+    def _resolve_exits(self):
+        """Kalshi's market record for each exit (result, settlement value and
+        time), cached in DASH_DIR/cache/exit_results.json -- final results
+        forever, unsettled ones re-read hourly. Then value each exit."""
+        path = os.path.join(CACHE_DIR, "exit_results.json")
+        cache = load_json(path, {})
+        want = sorted({e["t"] for e in self.exits
+                       if e["t"] not in cache or (not cache[e["t"]].get("final")
+                                                  and self.now - cache[e["t"]].get("at", 0) > EXIT_RESULTS_TTL)})
+        if want and self.api:
+            try:
+                got = (self.market_lookup or _kalshi_markets)(want)
+                for t in want:
+                    m = got.get(t)
+                    if m is None:
+                        continue
+                    res = str(m.get("result") or "").lower()
+                    val = m.get("settlement_value_dollars")
+                    cache[t] = {"result": res, "status": m.get("status"),
+                                "value": (float(val) * 100.0 if val not in (None, "") else None),
+                                "settled_ts": iso_ts(m.get("settlement_ts")) or None,
+                                "final": res in ("yes", "no", "scalar", "void"), "at": self.now}
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(cache, f)
+                os.replace(path + ".tmp", path)
+            except Exception as e:
+                log(f"! exit results read failed ({e!r}); unresolved exits count as transfers")
+        n_set = n_xfer = n_unres = 0
+        for e in self.exits:
+            c = cache.get(e["t"])
+            px = None
+            if c and c.get("final"):
+                r = c["result"]
+                if r == "yes":
+                    px = 100.0
+                elif r == "no":
+                    px = 0.0
+                elif r == "scalar" and c.get("value") is not None:
+                    px = c["value"]
+                elif r == "void":
+                    px = e["avg"]                        # a void refunds the cost
+            if px is not None:
+                e["settle_px"] = px
+                e["amount"] = e["pos"] * (px - e["avg"]) / 100.0
+                e["realized"] = True
+                e["label"] = ("settled " + (c["result"].upper() if c["result"] in ("yes", "no")
+                                            else f"{c['result']} {px:.1f}c"))
+                n_set += 1
+            else:
+                e["amount"] = e["pos"] * (e["mark"] - e["avg"]) / 100.0
+                e["realized"] = False
+                e["label"] = ("manual offset" if e["kind"] == "offset" else "left the book")
+                if not c:
+                    e["label"] += " (result unknown)"
+                    n_unres += 1
+                n_xfer += 1
+        if self.exits:
+            log(f"exits: {len(self.exits)} ({sum(1 for e in self.exits if e['kind'] == 'vanish')} vanished), "
+                f"{n_set} valued at Kalshi's settlement, {n_xfer} as transfers at the last mark"
+                + (f", {n_unres} unresolved" if n_unres else ""))
+
+    def exits_in(self, a: float, b: float):
+        return [e for e in self.exits if a <= e["ts"] < b]
 
     # ---- snapshot helpers -------------------------------------------------
     def snap_at(self, t: float):
@@ -1256,15 +1461,15 @@ class Builder:
             if e0 <= ts < e1:
                 m[t]["real"] += d
         for s in self.settlements:
-            if e0 <= s["ts"] < e1:
-                mm = m[s["t"]]
-                if s["result"] == "manual_offset":
-                    # transferred out at its last mark, not a trading loss
-                    prev = self._last_u_before(s["t"], s["ts"])
-                    mm["xfer"] += prev
-                    mm["settled"] = "manual offset"
-                else:
-                    mm["settled"] = f"settled {str(s['result']).upper()}"
+            if e0 <= s["ts"] < e1 and s["result"] in ("yes", "no"):
+                m[s["t"]]["settled"] = f"settled {str(s['result']).upper()}"
+        for e in self.exits_in(e0, e1):
+            mm = m[e["t"]]
+            if e["realized"]:
+                mm["real"] += e["amount"]            # a settlement the bot did not book
+            else:
+                mm["xfer"] += e["amount"]            # out at its last mark
+            mm["settled"] = e["label"]
         for f in self.fills:
             if not (w0 <= f["ts"] < w1):
                 continue
@@ -1332,9 +1537,7 @@ class Builder:
             return []
         e0, u0 = base
         events = [(ts, d) for ts, _t, _e, d in self.realized if ts >= e0]
-        for s in self.settlements:
-            if s["result"] == "manual_offset" and s["ts"] >= e0:
-                events.append((s["ts"], self._last_u_before(s["t"], s["ts"])))
+        events += [(e["ts"], e["amount"]) for e in self.exits if e["ts"] >= e0]
         events.sort()
         h0 = int(w0 // 3600)
         pts, ei, cum_real = [], 0, 0.0
@@ -1400,10 +1603,11 @@ class Builder:
                       else (self.snap_totals[-1][0], self.snap_totals[-1][1]))
                 if u0 and u1 and u1[0] >= u0[0]:
                     real = sum(dd for ts, _t, _e, dd in self.realized if u0[0] <= ts < u1[0])
-                    xf = sum(self._last_u_before(s["t"], s["ts"]) for s in self.settlements
-                             if s["result"] == "manual_offset" and u0[0] <= s["ts"] < u1[0])
+                    ex = self.exits_in(u0[0], u1[0])
+                    real += sum(e["amount"] for e in ex if e["realized"])
+                    xf = sum(e["amount"] for e in ex if not e["realized"])
                     row["pnl"] = round(real + xf + u1[1] - u0[1], 2)
-                    row["real"] = round(real + xf, 2)
+                    row["real"] = round(real, 2)
                     row["net"] = round(row["rew"] + row["pnl"], 2)
             day_fills = [f for f in self.fills if a <= f["ts"] < b]
             row["fills"] = len(day_fills)
@@ -1415,6 +1619,7 @@ class Builder:
     def build(self):
         self.load()
         t0 = time.time()
+        self.build_exits()
         st, stat = self.state, self.status
         selected = set(st.get("selected_tickers") or [])
         scan_members = set(st.get("scan_members") or [])
@@ -1467,10 +1672,12 @@ class Builder:
             if t:
                 snap_by_t[t] = r
 
+        cats = {k: str((v or {}).get("category") or "")
+                for k, v in (st.get("scan_series_meta") or {}).items()}
         markets = {}
         for t in market_union:
             ser = series_of(t)
-            fam, grp = family_of(ser)
+            fam, grp = family_of(ser, cats.get(ser, ""))
             rec = {"t": t, "ev": event_of(t), "ser": ser, "fam": fam, "grp": grp,
                    "sel": t in selected, "scanm": t in scan_members,
                    "pos": round(own_pos.get(t, 0.0), 2), "avg": round(own_avg.get(t, 0.0), 2),
@@ -1583,6 +1790,11 @@ class Builder:
             "markets": markets, "events": events, "paths": per_market_paths,
             "curves": curves, "history": hist, "ledger_max": ledger_max,
             "fills": fills_out, "halts": halts, "health": health, "opp": opp,
+            "exits": [{"ts": round(e["ts"]), "t": e["t"], "pos": round(e["pos"], 2),
+                       "avg": round(e["avg"], 2), "mark": round(e["mark"], 2),
+                       "kind": e["kind"], "label": e["label"], "amount": round(e["amount"], 2),
+                       "realized": e["realized"], "px": e.get("settle_px")}
+                      for e in self.exits if e["ts"] >= self.windows["7d"]["start"]],
             "bot": {
                 "reward_est_today": _f(st.get("reward_est_today")),
                 "reward_paid_today": _f(st.get("reward_paid_today")),
@@ -1715,6 +1927,11 @@ class Builder:
         for ts, t, _e, d in self.realized:
             if t in pick and ts >= self.windows["7d"]["start"] - 3600:
                 real_by_t[t].append((ts, d))
+        for e in self.exits:
+            if e["t"] in pick and e["ts"] >= self.windows["7d"]["start"] - 3600:
+                real_by_t[e["t"]].append((e["ts"], e["amount"]))
+        for t in real_by_t:
+            real_by_t[t].sort()
         for t in pick:
             P, R, K, Q = [], [], [], []
             cum_real = 0.0
@@ -1876,7 +2093,9 @@ class Builder:
                 if fs:
                     series_first[ser] = min(series_first.get(ser, fs), fs)
             for ev, rec in progs.items():
-                launched = reg.get(ev, rec["start"])
+                # an event the morning email saw first carries the email's run
+                # time; its program start is the earlier, truer launch
+                launched = min(reg.get(ev, rec["start"]), rec["start"])
                 if launched < horizon or rec["end"] <= self.now:
                     continue
                 q_cur = sum(1 for t in rec["tickers"] if t in cur and cur[t]["q"] > 0)
@@ -1935,8 +2154,8 @@ def new_event_groups(rows, cut: float, now: float):
     programs, pool $/day x days remaining -- a 15-minute program at $480/day
     has $5 in it, so ranking by $/day would bury real launches under noise.
 
-    Flags (only for groups where nothing is quoted or selected, not off by a
-    standing decision, with 2h+ of program left):
+    Flags (only for NEW series -- not routine re-listings -- where nothing is
+    quoted or selected, not off by a standing decision, with 2h+ left):
       promising        the bot's estimator says its ladder would earn
                        >= PROMISING_EST $/day there (or half that at >= 2%/day
                        ROI), and >= $3 over the time left in the programs
@@ -1980,7 +2199,9 @@ def new_event_groups(rows, cut: float, now: float):
     for g in groups.values():
         flag = ""
         unquoted = g["q"] == 0 and g["sel"] == 0
-        if unquoted and not g["deliberate"] and g["remain_h"] >= 2.0:
+        # a routine re-listing (tomorrow's KXTRUMPAPPROVE, the next state-gas
+        # day) is picked up by the bot's own refresh: never flag it
+        if unquoted and not g["deliberate"] and not g["routine"] and g["remain_h"] >= 2.0:
             est = g["g_est"]
             if est is not None and (est >= PROMISING_EST
                                     or (est >= PROMISING_EST / 2 and (g["g_yld"] or 0.0) >= 0.02)) \

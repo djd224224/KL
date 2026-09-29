@@ -433,7 +433,7 @@ footer { color: var(--muted); font-size: 12px; }
       <div><div class="sub-h">Data freshness</div><div class="tw" id="sinks"></div></div>
       <div><div class="sub-h">How the numbers are built</div>
         <p class="explain"><b>Modeled rewards</b> integrate the bot's own reward estimate (est_frac × pool $/day) over every gap between full cycles, capped at 15 minutes, from the cycle logs. It is a model and sits before Kalshi's $1-per-market-per-period floor; credits land 1–2 days after a period ends and show up in the history as <i>credited</i>.</p>
-        <p class="explain"><b>Trading P&amp;L</b> is mark-to-market on the bot's own book: realized in the window (closing fills and settlements) plus the change in open positions valued at mid, from the 5-minute position snapshots. Checked against an independent cash-flow rebuild (fills + settlements + marks) to within about 2%. A market handed to a manual trade is treated as transferred at its last mark.</p>
+        <p class="explain"><b>Trading P&amp;L</b> is mark-to-market on the bot's own book: realized in the window (closing fills and settlements) plus the change in open positions valued at mid (the last trade when a book is empty), from the 5-minute position snapshots. Exits the bot does not book itself are valued at Kalshi's actual settlement: scalar settlements (sports ladders and escalators, which the bot logs as "manual offsets") and positions that leave its book with no record. Only an exit Kalshi has not settled counts as a transfer at its last mark. Audited 9/29 against a replay of Kalshi's own fills and settlement results: equal to the cent for 9/16, 9/22, 9/27, 9/28, 9/29 and the 7-day window.</p>
         <p class="explain"><b>Net</b> is the two added together. Days are ET calendar days; the bot's own halt counter rolls at 5am CT and is shown under Risk.</p>
       </div>
     </div>
@@ -859,7 +859,7 @@ function renderSummary() {
     { lbl: "Quoting now", val: fmtNum(a.q2 + a.q1) + " mkts", sub: fmtNum(a.q2) + " two-sided · " + fmtNum(a.q1) + " one-sided · " + fmtNum(a.held) + " held",
       sub2: fmtUSD(a.restNow) + " resting · yield " + (yieldC != null ? yieldC.toFixed(1) + "¢ per $1 per day" : "—") },
     { lbl: "Open inventory", val: fmtUSD(a.u, { sign: true }), valCls: cls(a.u, 0.5), sub: fmtNum(a.npos) + " positions · " + fmtUSD(a.risk) + " at cost",
-      sub2: "unrealized at mid, bot's own book" },
+      sub2: "unrealized at mid (last trade on an empty book), bot's own book" },
     { lbl: "Halts & guards", val: (nSide + nEv + halts.depth.length) + (nSide + nEv + halts.depth.length === 1 ? " halt" : " halts"), sub: nSide + " toxic side · " + nEv + " toxic event · " + halts.depth.length + " mention-gate",
       sub2: halts.guards.length + " markets guard-held (" + nRiskG + " risk guards)" },
   ];
@@ -1258,7 +1258,7 @@ function meter(label, val, limit, note) {
 function renderRisk() {
   const b = D.bot, hl = D.halts, now = Date.now() / 1000;
   $("meters").innerHTML =
-    meter("Bot-day P&amp;L (since 5am CT)", b.pnl_today, b.loss_limit, "The bot's own counter, which drives the halt. Rebuilt from the sinks for the same span: " + (b.roll_pnl_ours != null ? fmtUSD(b.roll_pnl_ours, { sign: true }) : "n/a") + " trading, " + fmtUSD(b.roll_rew_ours) + " rewards (bot says " + fmtUSD(b.reward_est_today) + "). The counter drops P&L across restarts.") +
+    meter("Bot-day P&amp;L (since 5am CT)", b.pnl_today, b.loss_limit, "The bot's own counter, which drives the halt. Rebuilt for the same span: " + (b.roll_pnl_ours != null ? fmtUSD(b.roll_pnl_ours, { sign: true }) : "n/a") + " trading, " + fmtUSD(b.roll_rew_ours) + " rewards (bot says " + fmtUSD(b.reward_est_today) + "). The counter drops P&L across restarts and never books scalar settlements.") +
     meter("Open-scan tier P&amp;L today", b.scan_pnl, b.scan_loss_limit, b.scan_halted ? "Scan tier halted for the day." : "");
   const hrows = [];
   hl.side.forEach((x) => hrows.push({ type: "Toxic side", what: x.t, side: x.side, until: x.until, detail: "2 pick-offs on this side in 24h" }));

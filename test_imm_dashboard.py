@@ -64,6 +64,24 @@ class FamilyTests(unittest.TestCase):
         self.assertEqual(dash.family_of("KXBA")[0], "Company KPIs")
         self.assertEqual(dash.family_of("KXZZZUNKNOWN"), ("Other prints", "KXZZZUNKNOWN"))
 
+    def test_audit_misfits(self):
+        # found by the 9/29 audit: these were filed under the wrong family
+        self.assertEqual(dash.family_of("KXTEMPHELP"), ("Econ & rates", "Jobs & economy"))
+        self.assertEqual(dash.family_of("KXNECOF"), ("Commodities & shipping", "Agriculture"))
+        self.assertEqual(dash.family_of("KXVSXY")[0], "Company KPIs")
+        self.assertEqual(dash.family_of("KXCTCA")[0], "Company KPIs")
+        self.assertEqual(dash.family_of("KXPADATACENTERS")[0], "AI & tech")
+        self.assertEqual(dash.family_of("KXCASESSION")[0], "Politics & approval")
+        self.assertEqual(dash.family_of("KXSAMOMINF"), ("Econ & rates", "CPI & inflation"))
+        # hourly temperature keeps its family
+        self.assertEqual(dash.family_of("KXTEMPNYCH"), ("Weather & quakes", "Hourly temp"))
+
+    def test_kalshi_category_places_unknown_series(self):
+        self.assertEqual(dash.family_of("KXZZZUNKNOWN", "Economics")[0], "Econ & rates")
+        self.assertEqual(dash.family_of("KXZZZUNKNOWN", "Science and Technology")[0], "AI & tech")
+        # a rule always beats the category
+        self.assertEqual(dash.family_of("KXRAIN", "Economics")[0], "Weather & quakes")
+
 
 class WindowTests(unittest.TestCase):
     def test_et_days_and_roll(self):
@@ -188,6 +206,23 @@ class NewEventGroupTests(unittest.TestCase):
         self.assertEqual(dash.new_event_groups(rows, self.NOW - 24 * 3600, self.NOW), [])
 
 
+class FillsDedupeTests(unittest.TestCase):
+    def test_duplicate_fill_ids_count_once(self):
+        d = tempfile.mkdtemp()
+        old = dash.STATUS_DIR
+        try:
+            dash.STATUS_DIR = d
+            row = {"ts": 1790640067, "fill_id": "abc", "ticker": "KXA-1", "our_book_side": "bid",
+                   "yes_price_cents": 50, "count": 3, "pos_before": 0, "pos_after": 3}
+            for day in ("2026-09-28", "2026-09-29"):          # written into both day files
+                with open(os.path.join(d, f"fills_{day}.jsonl"), "w", encoding="utf-8") as f:
+                    f.write(json.dumps(row) + "\n")
+            self.assertEqual(len(dash.load_fills("2026-09-01")), 1)
+        finally:
+            dash.STATUS_DIR = old
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class RenderTests(unittest.TestCase):
     def test_data_cannot_close_the_script_tag(self):
         page = dash.render({"x": "</script><script>alert(1)</script>", "timing": {}})
@@ -224,8 +259,19 @@ class BuilderIntegrationTests(unittest.TestCase):
             mark("2026-09-28T04:03:00+00:00", "KXA-1", 10, 40, 55),
             mark("2026-09-28T04:03:00+00:00", "KXB-1", 5, 20, 30),     # later offset manually
             mark("2026-09-28T04:03:00+00:00", "KXC-1", -4, 30, 50),    # later settles YES
+            mark("2026-09-28T04:03:00+00:00", "KXV-1", -40, 56, 2),    # vanishes at 12:02, no record
             mark("2026-09-28T10:33:00+00:00", "KXA-1", 15, 43.33, 45),
+            mark("2026-09-28T10:33:00+00:00", "KXB-1", 5, 20, 31),
+            mark("2026-09-28T10:33:00+00:00", "KXC-1", -4, 30, 55),
+            mark("2026-09-28T10:33:00+00:00", "KXV-1", -40, 56, 2),
+            mark("2026-09-28T10:33:00+00:00", "KXP-1", 7, 10, 12),     # a blip: gone 12:02, back 14:00
+            mark("2026-09-28T12:02:00+00:00", "KXA-1", 15, 43.33, 50),
+            mark("2026-09-28T12:02:00+00:00", "KXC-1", -4, 30, 60),
+            mark("2026-09-28T14:00:00+00:00", "KXA-1", 15, 43.33, 52),
+            mark("2026-09-28T14:00:00+00:00", "KXC-1", -4, 30, 62),
+            mark("2026-09-28T14:00:00+00:00", "KXP-1", 7, 10, 13),
             mark("2026-09-28T19:58:00+00:00", "KXA-1", 15, 43.33, 60),
+            mark("2026-09-28T19:58:00+00:00", "KXP-1", 7, 10, 14),
         ]
         self._jsonl(f"marks_{d}.jsonl", marks)
         self._jsonl(f"realized_{d}.jsonl", [
@@ -240,12 +286,12 @@ class BuilderIntegrationTests(unittest.TestCase):
              "result": "yes", "settle_price_cents": 100.0, "own_pos_at_settle": -4,
              "own_avg_cents": 30, "market_realized_dollars": -2.8},
         ])
-        self._jsonl(f"fills_{d}.jsonl", [
-            {"ts": _ts("2026-09-28T10:00:00Z"), "fill_id": "f1", "ticker": "KXA-1",
-             "event_ticker": "KXA", "side": "yes", "action": "buy", "count": 5,
-             "yes_price_cents": 50, "is_taker": False, "our_book_side": "bid", "is_pad": False,
-             "pos_before": 10, "pos_after": 15},
-        ])
+        f1 = {"ts": _ts("2026-09-28T10:00:00Z"), "fill_id": "f1", "ticker": "KXA-1",
+              "event_ticker": "KXA", "side": "yes", "action": "buy", "count": 5,
+              "yes_price_cents": 50, "is_taker": False, "our_book_side": "bid", "is_pad": False,
+              "pos_before": 10, "pos_after": 15}
+        # the sink sometimes writes a fill twice around the UTC file roll
+        self._jsonl(f"fills_{d}.jsonl", [f1, dict(f1)])
         self._jsonl(f"guard_skips_{d}.jsonl", [
             {"ts": "2026-09-28T19:00:00+00:00", "kind": "enter", "ticker": "KXA-1", "prev": None,
              "guard": "band_both_out", "inputs": {}, "run_id": "r1"},
@@ -278,13 +324,16 @@ class BuilderIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(a["rew"], 2 * 0.1 * 864 * 30 / 86400, places=3)
         # KXA: start snapshot 04:03 (u = 10 x 15c), end 19:58 (u = 15 x 16.67c)
         self.assertAlmostEqual(a["pnl"], 15 * (60 - 43.33) / 100 - 10 * (55 - 40) / 100, places=3)
-        # KXB left by manual offset: a transfer at its last mark, not a loss
-        self.assertAlmostEqual(bb["pnl"], 0.0, places=6)
+        # KXB left by an offset row, no API to resolve it: a transfer at its
+        # last mark -- the only P&L is the mark move 04:03 -> 10:33 (30 -> 31)
+        self.assertAlmostEqual(bb["pnl"], 5 * (31 - 30) / 100, places=6)
         # KXC settled YES short 4 from a 50c mark: -4 x (100 - 50) / 100
         self.assertAlmostEqual(c["pnl"], -2.0, places=6)
         self.assertEqual(c.get("settled"), "settled YES")
-        # the fill's 30-min mark-out: bought 5 @ 50, mark 45 at 10:33
+        # the fill's 30-min mark-out: bought 5 @ 50, mark 45 at 10:33 (the
+        # duplicated sink row counts once)
         self.assertAlmostEqual(a["mk"], 5 * (45 - 50) / 100, places=6)
+        self.assertEqual(a["fills"], 1)
         # the curve ends on the window total
         self.assertAlmostEqual(m["curves"]["today"][-1][2],
                                sum(v["w"].get("today", {}).get("pnl", 0) for v in m["markets"].values()),
@@ -301,6 +350,47 @@ class BuilderIntegrationTests(unittest.TestCase):
         dash.Builder(self.NOW, api=False, api_force=False).build()
         m2 = dash.Builder(self.NOW, api=False, api_force=False).build()
         self.assertAlmostEqual(m2["markets"]["KXC-1"]["w"]["today"]["pnl"], -2.0, places=6)
+
+    def _exits(self, lookup):
+        b = dash.Builder(self.NOW, api=lookup is not None, api_force=False)
+        b.load()
+        if lookup is not None:
+            b.market_lookup = lambda tickers: {t: lookup[t] for t in tickers if t in lookup}
+        b.build_exits()
+        return b
+
+    def test_vanished_position_is_an_exit_and_a_blip_is_not(self):
+        b = self._exits(None)
+        kinds = {(e["t"], e["kind"]) for e in b.exits}
+        self.assertIn(("KXV-1", "vanish"), kinds)
+        self.assertIn(("KXB-1", "offset"), kinds)
+        self.assertNotIn("KXP-1", {e["t"] for e in b.exits})       # back 90 min later
+        self.assertNotIn("KXC-1", {e["t"] for e in b.exits})       # a yes/no settlement row
+        # no API: out at the last mark -- the P&L stops at the 10:33 mark
+        v = [e for e in b.exits if e["t"] == "KXV-1"][0]
+        self.assertFalse(v["realized"])
+        self.assertAlmostEqual(v["amount"], -40 * (2 - 56) / 100, places=6)
+        mk, _e = b.window_markets(*[b.windows["today"][k] for k in ("start", "end")])
+        self.assertAlmostEqual(mk["KXV-1"]["pnl"], 0.0, places=6)
+
+    def test_scalar_settlement_behind_an_offset_row_is_realized(self):
+        # Kalshi: KXB-1 settled SCALAR at 12c; KXV-1 settled NO
+        b = self._exits({
+            "KXB-1": {"ticker": "KXB-1", "status": "finalized", "result": "scalar",
+                      "settlement_value_dollars": "0.1200", "settlement_ts": "2026-09-28T11:59:00Z"},
+            "KXV-1": {"ticker": "KXV-1", "status": "finalized", "result": "no",
+                      "settlement_ts": "2026-09-28T11:00:00Z"}})
+        ex = {e["t"]: e for e in b.exits}
+        self.assertTrue(ex["KXB-1"]["realized"])
+        self.assertAlmostEqual(ex["KXB-1"]["amount"], 5 * (12 - 20) / 100, places=6)
+        self.assertEqual(ex["KXB-1"]["label"], "settled scalar 12.0c")
+        mk, _e = b.window_markets(b.windows["today"]["start"], b.windows["today"]["end"])
+        # long 5 from a 30c mark at 04:03 to a 12c settlement
+        self.assertAlmostEqual(mk["KXB-1"]["pnl"], 5 * (12 - 30) / 100, places=6)
+        self.assertAlmostEqual(mk["KXB-1"]["real"], 5 * (12 - 20) / 100, places=6)
+        # short 40 from a 2c mark (it opened before the window at 56c) to a NO settlement
+        self.assertAlmostEqual(mk["KXV-1"]["pnl"], -40 * (0 - 2) / 100 - 0.0, places=6)
+        self.assertEqual(mk["KXV-1"]["settled"], "settled NO")
 
 
 if __name__ == "__main__":
