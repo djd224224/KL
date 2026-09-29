@@ -5137,3 +5137,42 @@ at fair 80, standing aside at fair 30); test_mortgage_fair.py (20: rules,
 calendar, the sd fit, FINAL/MAX against the bootstrap, the anchor incl. the
 9/28 ladder -> 7.218, X0 fallbacks, entries, the watch end to end without
 the network). 1,500 green (unittest discover).
+
+## 2026-09-28 late — Saturday x2 is armed (gate PASS); the Monday email now watches for the next step (Jack)
+
+Jack: "based on your email earlier, sounds like i should move the saturday
+multiplier to 2x? if so, do it", then "and keep an eye on if i should
+increase it even further, after a few saturdays at 2x".
+
+NOTHING TO MOVE FOR 2x. The 9/28 07:40 ET tracker run wrote
+sat_mult_gate.json = PASS, mult 2.0, effective 2026-10-03 (every check green
+on 9/12, 9/19, 9/26: G1 net above same-week weekdays in every block, G2
+positive, G3 mark-out within 2c, G4 pooled settled +9.26c/fill on 3,981
+settled contracts). The live bot logs "Saturday gate: verdict PASS: x2 on
+Saturdays from 2026-10-03" on every refresh; no launcher change (the gated
+level is the code default IMM_SAT_SIZE_MULT_GATED=2.0).
+
+STEP-UP WATCH (imm_saturday_tracker.evaluate_stepup; report only -- nothing
+moves the bot's knob). While a step-up is in force (the verdict the bot will
+run next Saturday), each Monday scores the Saturdays that ran AT it (day-block
+cycle-log hour_mult to the nearest 0.25: x1.5 logs ~1.49, x2 ~1.98; a
+Saturday split between levels matches neither) with the gate's G1-G4 against
+their own weeks' weekdays, plus DILUTION: rent per resting contract-hour,
+Saturday / its weekdays, pooled over the step-up Saturdays, divided by the
+same ratio at the level below (x1.5: 0.91 over 9/12-9/26). 1.0 = the extra
+size earned pro rata, 0.75 = it earned nothing; the bar is 0.85 (rent
+elasticity ~0.44 vs the ~0.2 break-even of the 9/26 analysis). Verdicts, in
+the email body and the subject:
+- WATCHING "n of 3 Saturdays at x2 judged, none degrading" (subject "x2 watch n/3");
+- DEGRADED any x2 check failed -- consider x1.5 back ("verdict": "FAIL" in
+  the gate file; the bot re-reads it on its next refresh);
+- HOLD three pass but the rent kept < 0.85 (the size is crowding its own share);
+- RAISE three pass and the rent held: x2.5 worth trying (IMM_SAT_SIZE_MULT_GATED=2.5
+  in the launcher + "mult": 2.5 in the gate file + restart_imm.ps1 -Task). At
+  x2.5 the Saturday quiet hours (0-9 ET x2) run x5, where TOTAL_SIZE_MULT_CAP
+  leaves no deep-reference boost.
+The first x2 Saturday is 10/3; the earliest RAISE is the 10/19 email.
+
+Tests: StepUpWatchTests (OFF, WATCHING 1-2/3, RAISE pro rata, HOLD at 0.75,
+DEGRADED on one failed check, levels incl. a split Saturday and an x2.5
+comparison against x2, text/HTML/subject).

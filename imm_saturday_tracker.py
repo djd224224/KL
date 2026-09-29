@@ -51,6 +51,13 @@ no-send preview of the email).
 no sign of edge degradation"): every run also scores the boosted Saturdays
 (evaluate_gate, G1-G4); the SCHEDULED run writes the bot's verdict file
 STATUS_DIR/sat_mult_gate.json once, and --gate-rewrite rewrites it by hand.
+
+Step-up watch (Jack 2026-09-28, after the 2x PASS: "keep an eye on if i
+should increase it even further, after a few saturdays at 2x"): REPORT ONLY.
+While a step-up is in force, the Saturdays that ran at it get the same G1-G4
+plus a dilution test (rent per resting contract vs the level below), and the
+email says WATCHING / RAISE / HOLD / DEGRADED (evaluate_stepup; the verdict
+rides in the subject).
 Credentials: ALERT_EMAIL_FROM /
 ALERT_EMAIL_PASSWORD from the
 environment, falling back to HKCU\\Environment like the other IMM reports.
@@ -661,6 +668,148 @@ def write_gate_verdict(gate: dict, now_utc: datetime, through_et: str, base_mult
     return True
 
 
+# ---------------------------------------------------------------------------
+# STEP-UP WATCH (Jack 2026-09-28, the day the 2x gate PASSed for Sat 10/3:
+# "keep an eye on if i should increase it even further, after a few saturdays
+# at 2x"). REPORT ONLY -- nothing here moves the bot's multiplier. While the
+# gated step-up is in force, every run scores the Saturdays that actually ran
+# at it (day-block cycle-log hour_mult at or above the midpoint between the
+# base x1.5 and the step-up) with the gate's own G1-G4 against their own
+# weeks' weekdays, plus one test the gate does not have:
+#   DILUTION  rent per resting contract-hour, Saturday over its weekdays,
+#             pooled over the step-up Saturdays, divided by the same ratio
+#             over the base (x1.5) Saturdays. 1.0 = the extra size earned pro
+#             rata; base/step-up (0.75 at x1.5 -> x2) = it earned nothing.
+#             Under STEP_MIN_RENT_KEEP (0.85: a rent elasticity of ~0.44,
+#             against the ~0.2 break-even of the 9/26 analysis) the size is
+#             crowding its own share.
+# Verdicts: OFF (no step-up in force), WATCHING (fewer than
+# STEP_MIN_SATURDAYS judged step-up Saturdays, none failing), PENDING (the
+# newest not yet a day + 24h old), DEGRADED (a step-up Saturday failed a
+# check: consider the base back), HOLD (all pass but the size is diluting,
+# or nothing to compare against), RAISE (STEP_MIN_SATURDAYS pass G1-G4 and
+# the dilution test: the next rung, +STEP_NEXT_DELTA, is worth trying). At
+# x2.5 the Saturday quiet hours (0-9 ET x2) run x5, where TOTAL_SIZE_MULT_CAP
+# leaves no deep-reference boost.
+# ---------------------------------------------------------------------------
+
+STEP_MIN_SATURDAYS = 3
+STEP_MIN_RENT_KEEP = 0.85
+STEP_NEXT_DELTA = 0.5
+STEP_RULE = ('Jack 2026-09-28: "keep an eye on if i should increase it even further, '
+             'after a few saturdays at 2x"')
+
+
+def saturday_day_mults(blocks: pd.DataFrame) -> dict:
+    """ET Saturday -> its day block's mean cycle-log hour_mult (NaN if none)."""
+    if blocks is None or blocks.empty:
+        return {}
+    d = blocks[(blocks["day_type"] == "Saturday") & (blocks["block"] == "day")]
+    return {r["et_date"]: float(r["hm"]) for _, r in d.iterrows()}
+
+
+def _level(m: float) -> float:
+    """A Saturday's multiplier level: its day-block hour_mult to the nearest
+    0.25 (x1.5 logs ~1.49, x2 ~1.98); a Saturday that ran part at one level
+    and part at another lands between levels and matches neither."""
+    return round(float(m) * 4.0) / 4.0
+
+
+def _rent_ratio(rows: list) -> float:
+    """Pooled rent per resting ct-h of the Saturdays' boosted blocks over the
+    same blocks on their anchor weekdays (NaN when either side is empty)."""
+    s_r = s_c = w_r = w_c = 0.0
+    for r in rows:
+        s, w = r["sat"], r["wk"]
+        if s["ct_h"] > 0 and not _isnan(s["rent_k"]):
+            s_r += s["rent_k"] * s["ct_h"]
+            s_c += s["ct_h"]
+        if w["ct_h"] > 0 and not _isnan(w["rent_k"]):
+            w_r += w["rent_k"] * w["ct_h"]
+            w_c += w["ct_h"]
+    if s_c <= 0 or w_c <= 0 or w_r <= 0:
+        return float("nan")
+    return (s_r / s_c) / (w_r / w_c)
+
+
+def evaluate_stepup(blocks: pd.DataFrame, now_utc: datetime, through_et: str, base_mult: float,
+                    cur_mult: float) -> dict:
+    """The step-up watch over gate_blocks-shaped rows: {"status", "reason",
+    "base_mult" (the ungated Saturday knob), "cur_mult" (the step-up in
+    force), "prev_mult" (the level it is compared with: the highest below it
+    that ran), "next_mult", "saturdays" (judged at cur), "mature",
+    "prev_saturdays", "rows", "checks", "ratio_cur", "ratio_prev",
+    "rent_keep"}."""
+    out = dict(status="OFF", reason="", base_mult=base_mult, cur_mult=cur_mult, prev_mult=base_mult,
+               next_mult=round(cur_mult + STEP_NEXT_DELTA, 2) if cur_mult else 0.0,
+               saturdays=[], mature=[], prev_saturdays=[], rows=[], checks=[],
+               ratio_cur=None, ratio_prev=None, rent_keep=None)
+    if not cur_mult or cur_mult <= base_mult:
+        out["reason"] = "no step-up in force"
+        return out
+    lv = {s: _level(m) for s, m in saturday_day_mults(blocks).items() if s <= through_et and not _isnan(m)}
+    cur_lv = _level(cur_mult)
+    lower = sorted({v for v in lv.values() if 1.0 < v < cur_lv})
+    prev_lv = lower[-1] if lower else _level(base_mult)
+    out["prev_mult"] = prev_lv
+    cur_sats = sorted(s for s, v in lv.items() if v == cur_lv)
+    prev_sats = sorted(s for s, v in lv.items() if v == prev_lv)
+
+    def only(sats):
+        return blocks[(blocks["day_type"] != "Saturday") | blocks["et_date"].isin(sats)]
+
+    none = dict(status="PENDING", reason="", saturdays=[], rows=[], checks=[])
+    g = evaluate_gate(only(cur_sats), now_utc, through_et, 1.0) if cur_sats else none
+    gp = evaluate_gate(only(prev_sats), now_utc, through_et, 1.0) if prev_sats else none
+    out.update(saturdays=list(g["saturdays"]), rows=g["rows"], checks=g["checks"],
+               prev_saturdays=list(gp["saturdays"]))
+    out["mature"] = [s for s in g["saturdays"] if now_utc >= _saturday_end_utc(s) + timedelta(hours=24)]
+    rc, rp = _rent_ratio(g["rows"]), _rent_ratio(gp["rows"])
+    keep = rc / rp if not (_isnan(rc) or _isnan(rp)) and rp > 0 else float("nan")
+    out.update(ratio_cur=_nan_none(rc), ratio_prev=_nan_none(rp), rent_keep=_nan_none(keep))
+    x, xp, xn = f"x{cur_mult:g}", f"x{prev_lv:g}", f"x{out['next_mult']:g}"
+    n, need = len(out["mature"]), STEP_MIN_SATURDAYS
+    failed = [c for c in g["checks"] if c["ok"] is False]
+    if not g["saturdays"]:
+        out["status"], out["reason"] = "WATCHING", f"no Saturday at {x} yet"
+    elif failed:
+        out["status"] = "DEGRADED"
+        out["reason"] = ("; ".join(f"{c['saturday']} {c['check']} ({c['detail']})" for c in failed)
+                         + f" -- consider {xp} back")
+    elif n < need:
+        out["status"] = "WATCHING"
+        out["reason"] = (f"{n} of {need} Saturdays at {x} judged, none degrading"
+                         + (f"; {g['reason']}" if g["status"] == "PENDING" and g.get("reason") else ""))
+    elif g["status"] == "PENDING":
+        out["status"], out["reason"] = "PENDING", g["reason"]
+    elif _isnan(keep):
+        out["status"] = "HOLD"
+        out["reason"] = f"{n} Saturdays at {x} pass G1-G4, but no {xp} Saturday ran to measure dilution against"
+    elif keep < STEP_MIN_RENT_KEEP:
+        out["status"] = "HOLD"
+        out["reason"] = (f"{n} Saturdays at {x} pass G1-G4, but rent per resting contract kept only {keep:.2f} of "
+                         f"the {xp} Saturdays' (bar {STEP_MIN_RENT_KEEP:g}): the extra size is crowding its own share")
+    else:
+        out["status"] = "RAISE"
+        out["reason"] = (f"{n} Saturdays at {x} pass G1-G4 and rent per resting contract kept {keep:.2f} of the "
+                         f"{xp} Saturdays' (bar {STEP_MIN_RENT_KEEP:g}): {xn} is worth trying")
+    return out
+
+
+def stepup_how(st: dict) -> str:
+    """How to act on the verdict (ASCII)."""
+    if st["status"] == "RAISE":
+        return (f"to raise: IMM_SAT_SIZE_MULT_GATED={st['next_mult']:g} in run_incentive_mm.ps1 ($ProbeEnv) and "
+                f"\"mult\": {st['next_mult']:g} in sat_mult_gate.json, then restart_imm.ps1 -Task (or ask Claude)")
+    if st["status"] == "DEGRADED":
+        if st["prev_mult"] <= st["base_mult"]:
+            return (f"to go back to x{st['prev_mult']:g}: \"verdict\": \"FAIL\" in sat_mult_gate.json (the bot "
+                    f"re-reads it on its next refresh; deleting the file re-arms the gate instead)")
+        return (f"to go back to x{st['prev_mult']:g}: \"mult\": {st['prev_mult']:g} in sat_mult_gate.json (the bot "
+                f"re-reads it on its next refresh)")
+    return ""
+
+
 def _g(v, f: str = "{:7.1f}") -> str:
     """Gate text number: '-' for a missing value (the report's convention)."""
     return "-".rjust(len(f.format(0.0))) if _isnan(v) else f.format(v)
@@ -691,6 +840,34 @@ def gate_text(gate: dict, written: bool) -> list:
                   f"mark {_g(w['mark'], '{:+6.2f}')} net {_g(w['net_k'])}" if w else "not quoted on the anchor weekdays")
             lines.append(f"    {r['fam'][:26]:26} {r['share']:5.1f}% of ct-h  rent {_g(s['rent_k'], '{:6.1f}')} "
                          f"fills/1k {_g(s['fills_k'], '{:5.2f}')} mark {_g(s['mark'], '{:+6.2f}')} net {_g(s['net_k'])}  |  {wk}")
+    return lines
+
+
+def stepup_text(st: dict) -> list:
+    """ASCII lines for the step-up watch (cp1252 console)."""
+    if not st or st.get("status") == "OFF":
+        return []
+    lines = ["", f"== step-up watch: x{st['cur_mult']:g} -> x{st['next_mult']:g}? ({STEP_RULE}) =="]
+    lines.append(f"status: {st['status']}" + (f" - {st['reason']}" if st.get("reason") else ""))
+    lines.append(f"  Saturdays at x{st['cur_mult']:g}: {', '.join(st['saturdays']) or 'none yet'}"
+                 f"  |  at x{st['prev_mult']:g} (the comparison): {', '.join(st['prev_saturdays']) or 'none'}")
+    rc, rb, k = st.get("ratio_cur"), st.get("ratio_prev"), st.get("rent_keep")
+    f2 = lambda v: "-" if v is None else f"{v:.2f}"
+    lines.append(f"  rent per resting ct-h, Saturday / its weekdays: x{st['cur_mult']:g} {f2(rc)} | "
+                 f"x{st['prev_mult']:g} {f2(rb)} -> kept {f2(k)} (bar {STEP_MIN_RENT_KEEP:g}; "
+                 f"{st['prev_mult'] / st['cur_mult']:.2f} = the extra size earned nothing)")
+    for r in st.get("rows", []):
+        s, w = r["sat"], r["wk"]
+        lines.append(f"  {r['saturday']} {BLOCK_LABEL[r['block']]:8} ({r['hours']}h)  "
+                     f"Sat net {_g(s['net_k'])} rent {_g(s['rent_k'], '{:6.1f}')} mark {_g(s['mark'], '{:+6.2f}')}  |  "
+                     f"weekdays net {_g(w['net_k'])} rent {_g(w['rent_k'], '{:6.1f}')} mark {_g(w['mark'], '{:+6.2f}')}"
+                     f"  [{r['anchor']}]")
+    for c in st.get("checks", []):
+        mark = "ok  " if c["ok"] is True else ("FAIL" if c["ok"] is False else "n/a ")
+        lines.append(f"  [{mark}] {c['saturday']} {c['check']}: {c['detail']}")
+    how = stepup_how(st)
+    if how:
+        lines.append(f"  {how}")
     return lines
 
 
@@ -817,7 +994,7 @@ LEGEND = (
 
 # ---- plain text (console, task log, email text part) ------------------------
 
-def render(g: pd.DataFrame, through_et: str, gate: dict = None, written: bool = False):
+def render(g: pd.DataFrame, through_et: str, gate: dict = None, written: bool = False, stepup: dict = None):
     pd.set_option("display.width", 250)
 
     def table(df: pd.DataFrame) -> str:
@@ -835,6 +1012,8 @@ def render(g: pd.DataFrame, through_et: str, gate: dict = None, written: bool = 
                  "~2x on mention); loss/fill = settlement loss on the settled subset; mo24 = 24h mark-out (all fills).")
     if gate:
         lines.extend(gate_text(gate, written))
+    if stepup:
+        lines.extend(stepup_text(stepup))
     per_day, pooled_m, base = _tables(g)
     if per_day.empty:
         lines.append("\n(no cycle-log rows in the window yet)")
@@ -1004,7 +1183,73 @@ def _gate_html(gate: dict, written: bool) -> str:
     return "".join(h)
 
 
-def render_html(g: pd.DataFrame, through_et: str, gate: dict = None, written: bool = False) -> str:
+def _stepup_html(st: dict) -> str:
+    """The step-up watch: verdict, the dilution ratio, the step-up Saturdays'
+    blocks against their weekdays, every check, and how to act."""
+    if not st or st.get("status") == "OFF":
+        return ""
+    colour = {"RAISE": "#0a7a2f", "DEGRADED": "#c0392b"}.get(st["status"], "#b36b00")
+    num = lambda v, f="{:.1f}": _esc("–" if (v is None or _isnan(v)) else f.format(v))
+    x, xb, xn = f"×{st['cur_mult']:g}", f"×{st['prev_mult']:g}", f"×{st['next_mult']:g}"
+    h = [f'<div style="font-size:15px;font-weight:600;margin-top:10px">Step-up watch: {x} → {xn}?</div>',
+         f'<div style="color:{_MUTED};margin:2px 0 4px">{_esc(STEP_RULE)}. Report only — the bot\'s multiplier '
+         f'never moves on this. Each Saturday at {x} gets the 2× gate\'s checks against its own weekdays; after '
+         f'{STEP_MIN_SATURDAYS} of them, RAISE also needs rent per resting contract to hold at ≥ '
+         f'{STEP_MIN_RENT_KEEP:g} of the {xb} Saturdays\' (Saturday ÷ its weekdays).</div>',
+         f'<div style="margin:2px 0 6px"><span style="color:{colour};font-weight:600">{_esc(st["status"])}</span>'
+         + (f' <span style="color:{_MUTED}">— {_esc(st["reason"])}</span>' if st.get("reason") else "") + "</div>"]
+    kv = [(f"Saturdays at {x}", ", ".join(st["saturdays"]) or "none yet"),
+          (f"Saturdays at {xb} (comparison)", ", ".join(st["prev_saturdays"]) or "none"),
+          ("Rent per resting ct-h, Saturday ÷ weekdays",
+           f"{x} {num(st.get('ratio_cur'), '{:.2f}')} · {xb} {num(st.get('ratio_prev'), '{:.2f}')} → kept "
+           f"{num(st.get('rent_keep'), '{:.2f}')} (bar {STEP_MIN_RENT_KEEP:g}; "
+           f"{st['prev_mult'] / st['cur_mult']:.2f} = the extra size earned nothing)")]
+    h.append('<table style="border-collapse:collapse;margin:4px 0 10px">')
+    for label, value in kv:
+        h.append(f'<tr><td style="{_TDL};color:{_MUTED}">{_esc(label)}</td>'
+                 f'<td style="{_TDL};white-space:normal">{value if label.startswith("Rent") else _esc(value)}</td></tr>')
+    h.append("</table>")
+    if st.get("rows"):
+        head = [("Saturday", True), ("Block", True), ("Hours", False), ("Sat net", False), ("Weekday net", False),
+                ("Sat rent", False), ("Weekday rent", False), ("Sat mark-out ¢", False), ("Weekday mark-out ¢", False)]
+        rows = []
+        for r in st["rows"]:
+            s, w = r["sat"], r["wk"]
+            rows.append((f"background:{_SAT_BG}", [
+                f'<td style="{_TDL}">{r["saturday"]}</td>', f'<td style="{_TDL}">{BLOCK_LABEL[r["block"]]}</td>',
+                f'<td style="{_TD}">{r["hours"]}</td>', f'<td style="{_TD};font-weight:600">{num(s["net_k"])}</td>',
+                f'<td style="{_TD}">{num(w["net_k"])}</td>', f'<td style="{_TD}">{num(s["rent_k"])}</td>',
+                f'<td style="{_TD}">{num(w["rent_k"])}</td>', f'<td style="{_TD}">{num(s["mark"], "{:+.2f}")}</td>',
+                f'<td style="{_TD}">{num(w["mark"], "{:+.2f}")}</td>']))
+        h.append(_html_table(head, rows))
+    if st.get("checks"):
+        rows = []
+        for c in st["checks"]:
+            res, col = (("ok", "#0a7a2f") if c["ok"] is True else (("FAIL", "#c0392b") if c["ok"] is False
+                                                                   else ("not judged", _MUTED)))
+            rows.append(("", [f'<td style="{_TDL}">{_esc(c["check"])}</td>', f'<td style="{_TDL}">{_esc(c["saturday"])}</td>',
+                              f'<td style="{_TDL};color:{col};font-weight:600">{res}</td>',
+                              f'<td style="{_TDL};white-space:normal">{_esc(c["detail"])}</td>']))
+        h.append(_html_table([("Check", True), ("Saturday", True), ("Result", True), ("Detail", True)], rows))
+    how = stepup_how(st)
+    if how:
+        h.append(f'<div style="margin:2px 0 10px;font-weight:600">{_esc(how)}</div>')
+    return "".join(h)
+
+
+def stepup_subject(st: dict) -> str:
+    """The subject suffix: the verdict whenever a step-up is in force."""
+    if not st or st.get("status") == "OFF":
+        return ""
+    x, n = f"x{st['cur_mult']:g}", len(st.get("mature") or [])
+    return {"RAISE": f" - step-up: x{st['next_mult']:g} worth trying",
+            "DEGRADED": f" - {x} DEGRADED: consider x{st['prev_mult']:g}",
+            "HOLD": f" - {x} HOLD (no further step)",
+            "PENDING": f" - {x} watch pending"}.get(st["status"], f" - {x} watch {n}/{STEP_MIN_SATURDAYS}")
+
+
+def render_html(g: pd.DataFrame, through_et: str, gate: dict = None, written: bool = False,
+                stepup: dict = None) -> str:
     per_day, pooled_m, base = _tables(g)
     h = [f'<div style="{_FONT}">']
     h.append(f'<div style="font-size:17px;font-weight:600">IMM Saturday ×{imm.SAT_SIZE_MULT:g} tracker'
@@ -1016,6 +1261,8 @@ def render_html(g: pd.DataFrame, through_et: str, gate: dict = None, written: bo
     h.append("</table>")
     if gate:
         h.append(_gate_html(gate, written))
+    if stepup:
+        h.append(_stepup_html(stepup))
     if per_day.empty:
         h.append(f'<div style="color:{_MUTED}">(no cycle-log rows in the window yet)</div></div>')
         return "".join(h)
@@ -1071,9 +1318,11 @@ def main() -> int:
     # scheduled run only while none exists (or by hand, --gate-rewrite)
     now_utc = datetime.now(timezone.utc)
     gate, written = dict(status="PENDING", reason="", saturdays=[], rows=[], checks=[]), False
+    blocks = None
     try:
         scored = score_fills(fills, mid_tab, results) if not fills.empty else pd.DataFrame()
-        gate = evaluate_gate(gate_blocks(ser, cyc, scored, through_et), now_utc, through_et, imm.SAT_SIZE_MULT)
+        blocks = gate_blocks(ser, cyc, scored, through_et)
+        gate = evaluate_gate(blocks, now_utc, through_et, imm.SAT_SIZE_MULT)
         try:
             gate["families"] = gate_family_table(ser, cyc, scored, gate)
         except Exception as e:                      # explanatory only; never costs the verdict
@@ -1091,8 +1340,18 @@ def main() -> int:
     except Exception as e:                          # the gate must never cost the weekly email
         gate = dict(status="ERROR", reason=f"{type(e).__name__}: {e}", saturdays=[], rows=[], checks=[])
         log(f"[SAT] ! 2x gate evaluation failed: {type(e).__name__}: {e}")
-    text = render(g, through_et, gate, written)
-    html = render_html(g, through_et, gate, written)
+    # the step-up watch (report only): the step-up in force is the one the
+    # bot will run next Saturday
+    stepup = None
+    try:
+        if blocks is not None:
+            cur = imm.gated_sat_mult(next_saturday_after(now_utc.astimezone(ET).date()))
+            stepup = evaluate_stepup(blocks, now_utc, through_et, imm.SAT_SIZE_MULT, cur)
+    except Exception as e:                          # nor may the watch
+        stepup = None
+        log(f"[SAT] ! step-up watch failed: {type(e).__name__}: {e}")
+    text = render(g, through_et, gate, written, stepup)
+    html = render_html(g, through_et, gate, written, stepup)
     print(text)
     if args.html_out:
         with open(args.html_out, "w", encoding="utf-8") as f:
@@ -1108,6 +1367,7 @@ def main() -> int:
                     else f" - 2x gate {gate['status']}: Saturday stays x{imm.SAT_SIZE_MULT:g}")
     elif gate["status"] == "ERROR":
         subject += " - 2x gate ERROR"
+    subject += stepup_subject(stepup)
     ok = imm.Alerter("IMM-SAT", live=True).send_message(text, subject=subject, html=html)
     log(f"[SAT] email {'sent' if ok else 'FAILED'}: {subject}")
     if ok and not args.test:

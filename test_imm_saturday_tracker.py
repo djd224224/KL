@@ -250,6 +250,106 @@ class GateEvaluateTests(unittest.TestCase):
         self.assertEqual(sat.evaluate_gate(pd.DataFrame(), DONE, "2026-09-20", 1.5)["status"], "PENDING")
 
 
+X2_WEEKS = (("2026-10-03", ("2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02")),
+            ("2026-10-10", ("2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09")),
+            ("2026-10-17", ("2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16")))
+AFTER_X2 = _utc(2026, 10, 19, 12)     # the Monday run after the third x2 Saturday
+# an x2 Saturday that earns pro rata: the x1.5 default's rent per ct-h at 4/3 the size
+X2_PRO_RATA = dict(sat_quiet=dict(ct_h=800_000, rent_usd=387, fills=2_400, mark=0.7),
+                   sat_day=dict(ct_h=787_000, rent_usd=347, fills=5_300, mark=-3.2, hm=1.98))
+# the same size earning the x1.5 rent: the extra contracts earned nothing
+X2_DILUTED = dict(sat_quiet=dict(ct_h=800_000, rent_usd=290, fills=1_800, mark=0.7),
+                  sat_day=dict(ct_h=787_000, rent_usd=260, fills=4_000, mark=-3.2, hm=1.98))
+
+
+def _x2(n=3, **sat_blocks):
+    """The 9/19 x1.5 week plus n x2 weeks (each Saturday's blocks from
+    `sat_blocks`, default X2_PRO_RATA)."""
+    frames = [_week()]
+    for d, wk in X2_WEEKS[:n]:
+        frames.append(_week(sat_date=d, weekdays=wk, **(sat_blocks or X2_PRO_RATA)))
+    return pd.concat(frames, ignore_index=True)
+
+
+class StepUpWatchTests(unittest.TestCase):
+    """Jack 2026-09-28: "keep an eye on if i should increase it even further,
+    after a few saturdays at 2x" -- report only, never the bot's knob."""
+
+    def test_off_without_a_step_up_in_force(self):
+        st = sat.evaluate_stepup(_x2(), AFTER_X2, "2026-10-18", 1.5, 0.0)
+        self.assertEqual(st["status"], "OFF")
+        self.assertEqual(sat.stepup_text(st), [])
+        self.assertEqual(sat.stepup_subject(st), "")
+        self.assertEqual(sat.evaluate_stepup(_x2(), AFTER_X2, "2026-10-18", 1.5, 1.5)["status"], "OFF")
+
+    def test_watching_until_three_x2_saturdays(self):
+        st = sat.evaluate_stepup(_week(), _utc(2026, 9, 28, 11, 40), "2026-09-27", 1.5, 2.0)
+        self.assertEqual((st["status"], st["reason"]), ("WATCHING", "no Saturday at x2 yet"))
+        for n in (1, 2):
+            st = sat.evaluate_stepup(_x2(n), AFTER_X2, "2026-10-18", 1.5, 2.0)
+            self.assertEqual(st["status"], "WATCHING")
+            self.assertEqual(st["prev_saturdays"], ["2026-09-19"])
+            self.assertIn(f"{n} of 3 Saturdays at x2 judged, none degrading", st["reason"])
+            self.assertEqual(sat.stepup_subject(st), f" - x2 watch {n}/3")
+
+    def test_raise_after_three_clean_x2_saturdays_earning_pro_rata(self):
+        st = sat.evaluate_stepup(_x2(), AFTER_X2, "2026-10-18", 1.5, 2.0)
+        self.assertEqual(st["status"], "RAISE", st["reason"])
+        self.assertEqual(st["saturdays"], ["2026-10-03", "2026-10-10", "2026-10-17"])
+        self.assertEqual((st["prev_mult"], st["next_mult"]), (1.5, 2.5))
+        self.assertAlmostEqual(st["rent_keep"], 1.0, delta=0.02)
+        self.assertIn("x2.5 is worth trying", st["reason"])
+        self.assertIn("IMM_SAT_SIZE_MULT_GATED=2.5", sat.stepup_how(st))
+        self.assertEqual(sat.stepup_subject(st), " - step-up: x2.5 worth trying")
+
+    def test_hold_when_the_extra_size_earns_nothing(self):
+        st = sat.evaluate_stepup(_x2(**X2_DILUTED), AFTER_X2, "2026-10-18", 1.5, 2.0)
+        self.assertEqual(st["status"], "HOLD", st["reason"])
+        self.assertAlmostEqual(st["rent_keep"], 0.75, delta=0.02)        # x1.5/x2: zero marginal rent
+        self.assertIn("crowding its own share", st["reason"])
+        self.assertTrue(all(c["ok"] is not False for c in st["checks"]))  # G1-G4 still pass
+        self.assertEqual(sat.stepup_how(st), "")
+
+    def test_degraded_on_any_failed_x2_check_even_early(self):
+        bad = dict(sat_quiet=dict(ct_h=800_000, rent_usd=387, fills=2_400, mark=0.7),
+                   sat_day=dict(ct_h=787_000, rent_usd=100, fills=5_300, mark=-3.2, hm=1.98))
+        st = sat.evaluate_stepup(_x2(1, **bad), AFTER_X2, "2026-10-18", 1.5, 2.0)
+        self.assertEqual(st["status"], "DEGRADED")
+        self.assertIn("G1 net vs weekdays", st["reason"])
+        self.assertIn('"verdict": "FAIL"', sat.stepup_how(st))
+        self.assertEqual(sat.stepup_subject(st), " - x2 DEGRADED: consider x1.5")
+
+    def test_levels_and_mixed_saturdays(self):
+        # a Saturday that ran part x1.5, part x2 (1.75) is neither level
+        mixed = dict(sat_quiet=X2_PRO_RATA["sat_quiet"], sat_day=dict(X2_PRO_RATA["sat_day"], hm=1.75))
+        rows = pd.concat([_x2(2), _week(sat_date="2026-10-17", weekdays=X2_WEEKS[2][1], **mixed)],
+                         ignore_index=True)
+        st = sat.evaluate_stepup(rows, AFTER_X2, "2026-10-18", 1.5, 2.0)
+        self.assertEqual(st["saturdays"], ["2026-10-03", "2026-10-10"])
+        # at x2.5 the comparison is the x2 Saturdays, and going back means x2
+        x25 = dict(sat_quiet=dict(ct_h=1_000_000, rent_usd=480, fills=3_000, mark=0.7),
+                   sat_day=dict(ct_h=985_000, rent_usd=434, fills=6_600, mark=-3.2, hm=2.47))
+        rows = pd.concat([_x2(2), _week(sat_date="2026-10-17", weekdays=X2_WEEKS[2][1], **x25)],
+                         ignore_index=True)
+        st = sat.evaluate_stepup(rows, AFTER_X2, "2026-10-18", 1.5, 2.5)
+        self.assertEqual((st["saturdays"], st["prev_mult"], st["next_mult"]), (["2026-10-17"], 2.0, 3.0))
+        self.assertEqual(st["prev_saturdays"], ["2026-10-03", "2026-10-10"])
+
+    def test_the_section_renders_in_text_html_and_subject(self):
+        st = sat.evaluate_stepup(_x2(), AFTER_X2, "2026-10-18", 1.5, 2.0)
+        text = sat.render(_frame(), "2026-10-18", sat.evaluate_gate(_x2(), AFTER_X2, "2026-10-18", 1.5), False, st)
+        text.encode("cp1252")
+        self.assertIn("== step-up watch: x2 -> x2.5?", text)
+        self.assertIn("status: RAISE", text)
+        self.assertNotIn("nan", text)
+        html = sat.render_html(_frame(), "2026-10-18", None, False, st)
+        self.assertIn("Step-up watch: ×2 → ×2.5?", html)
+        self.assertIn(">RAISE<", html)
+        self.assertIn("IMM_SAT_SIZE_MULT_GATED=2.5", html)
+        self.assertNotIn("Step-up watch", sat.render_html(_frame(), "2026-10-18", None, False,
+                                                          dict(st, status="OFF")))
+
+
 class GateVerdictFileTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
