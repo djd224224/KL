@@ -3614,7 +3614,8 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         prev_only = imm.ALLOWLIST_ONLY
         try:
             imm.ALLOWLIST_ONLY = True
-            for t in ("KXCPI-26DEC-T0.2", "KXCPICORE-26DEC-T0.2",
+            # (core 26OCT: 26NOV/26DEC are the 2026-09-28 pilot's, below)
+            for t in ("KXCPI-26DEC-T0.2", "KXCPICORE-26OCT-T0.2",
                       "KXCPIYOY-26NOV-T3.5", "KXCPICOREYOY-26DEC-T2.3",
                       "KXCPICOMBO-26OCT-X", "KXECONSTATCPI-26OCT-T0.3",
                       "KXECONSTATCORECPIYOY-26OCT-T3", "KXUSGASCPI-26OCT-T1",
@@ -3634,6 +3635,61 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # form: states only while the GasBuddy gate is off)
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
         self.assertTrue(imm.series_pattern_blocked("KXTEMPMIAH"))
+
+    def test_cpi_pilot_quotes_two_core_events_in_the_normal_book(self):
+        # Jack 2026-09-28: "try the least bad version. keep size same as
+        # normal IMM" -- KXCPICORE-26NOV/-26DEC only, normal size, weekday
+        # 08:25-11:05 ET blackout, out 7 days before close, until the pilot
+        # window ends; every other CPI market stays blocked.
+        self.assertEqual(imm.CPI_PILOT_EVENTS,
+                         ("KXCPICORE-26DEC", "KXCPICORE-26NOV"))
+        prev_only, prev_until = imm.ALLOWLIST_ONLY, imm.CPI_PILOT_UNTIL
+        try:
+            imm.ALLOWLIST_ONLY = True
+            imm.CPI_PILOT_UNTIL = datetime.now(timezone.utc) + timedelta(days=1)
+            for t in ("KXCPICORE-26NOV-T0.3", "KXCPICORE-26DEC-T0.2"):
+                self.assertFalse(IncentiveMarketMaker._blocked(t), t)
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+            # the rest of CPI, core included, stays blocked
+            for t in ("KXCPICORE-26OCT-T0.3", "KXCPICORE-26SEP-T0.3",
+                      "KXCPI-26NOV-T0.3", "KXCPI-26DEC-T0.2",
+                      "KXCPICOREYOY-26NOV-T2.5", "KXCPIYOY-26DEC-T3.5"):
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+            # the family probe never opens the series, so no auto-enroll
+            # path can write KXCPICORE into an allow file
+            self.assertTrue(IncentiveMarketMaker._blocked("KXCPICORE-X"))
+            self.assertTrue(imm.series_pattern_blocked("KXCPICORE"))
+            # past the window the block closes over them again
+            imm.CPI_PILOT_UNTIL = datetime.now(timezone.utc) - timedelta(seconds=1)
+            for t in ("KXCPICORE-26NOV-T0.3", "KXCPICORE-26DEC-T0.2"):
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        finally:
+            imm.ALLOWLIST_ONLY, imm.CPI_PILOT_UNTIL = prev_only, prev_until
+        # normal size: no family multiplier, no hand-tuned ladder or cap
+        ov = imm.series_override("KXCPICORE")
+        self.assertIsNone(ov.size_mult)
+        self.assertIsNone(ov.levels)
+        self.assertIsNone(ov.max_position)
+
+        def at(y, mo, d, hh, mm):
+            return imm.ET.localize(datetime(y, mo, d, hh, mm)).astimezone(timezone.utc)
+        # weekday-only 08:25-11:05 ET blackout (Tue 9/29; Sat 10/3, Sun 10/4)
+        self.assertFalse(imm.series_in_blackout("KXCPICORE", at(2026, 9, 29, 8, 24)))
+        self.assertTrue(imm.series_in_blackout("KXCPICORE", at(2026, 9, 29, 8, 25)))
+        self.assertTrue(imm.series_in_blackout("KXCPICORE", at(2026, 9, 29, 10, 0)))
+        self.assertTrue(imm.series_in_blackout("KXCPICORE", at(2026, 9, 29, 11, 4)))
+        self.assertFalse(imm.series_in_blackout("KXCPICORE", at(2026, 9, 29, 11, 5)))
+        self.assertFalse(imm.series_in_blackout("KXCPICORE", at(2026, 10, 3, 9, 0)))
+        self.assertFalse(imm.series_in_blackout("KXCPICORE", at(2026, 10, 4, 9, 0)))
+        # weekday-only is opt-in: the AAA print blackout still runs Saturdays
+        self.assertTrue(imm.series_in_blackout("KXAAAGASW", at(2026, 10, 3, 3, 20)))
+        # out 7 days before close, i.e. a week before the event's own release
+        close = datetime(2026, 12, 10, 13, 30, tzinfo=timezone.utc)
+        cut = imm.apply_series_cutoff_adjustments(
+            "KXCPICORE", "KXCPICORE-26NOV", None, close_time=close)
+        self.assertEqual(cut, close - timedelta(days=7))
 
     def test_company_headcount_events_are_blocked(self):
         # Jack 2026-09-24: "blocklist ... company headcount markets". The

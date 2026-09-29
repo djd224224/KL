@@ -292,6 +292,9 @@ class SeriesOverride:
     #   book (AAA gas/diesel prints, observed 03:18-03:36 ET). Distinct from
     #   `cutoff`, which is a one-time end; a blackout recurs every day and the
     #   market resumes quoting afterwards.
+    blackout_weekdays_only: bool = False                # the blackout runs
+    #   Mon-Fri ET only (the CPI pilot: 8:30 releases + the Cleveland Fed
+    #   nowcast's ~10:00 update are business-day events)
     min_est_per_day: Optional[float] = None             # RATE floor: skip fresh
     #   candidates whose est $/day is below this (re-entry quality bar; on TOP
     #   of the total-accrual payout floor). None/0 = off.
@@ -1731,6 +1734,8 @@ def series_in_blackout(series: str, now_utc: datetime) -> bool:
     except (ValueError, AttributeError):
         return False
     et = now_utc.astimezone(ET)
+    if ov.blackout_weekdays_only and et.weekday() >= 5:
+        return False
     cur = et.hour * 60 + et.minute
     start, end = sh * 60 + sm, eh * 60 + em
     return start <= cur < end if start <= end else (cur >= start or cur < end)
@@ -3206,6 +3211,53 @@ def register_close_cutoff_days(days: float, series_csv: str) -> None:
 register_close_cutoff_days(
     KXRT_CUTOFF_BEFORE_CLOSE_DAYS,
     os.environ.get("IMM_KXRT_CUTOFF_SERIES", "KXRT,KXRTTV"))
+
+# CPI PILOT (Jack 2026-09-28: "try the least bad version. keep size same as
+# normal IMM"). CPI stays blocked (".*CPI.*" in SERIES_BLOCK_PATTERNS)
+# except the events named here, which quote in the NORMAL book at normal
+# size under two stand-downs until CPI_PILOT_UNTIL; then the block closes
+# over them again with standard semantics (no new orders, resting quotes
+# cancelled next cycle, positions ride). The case for these guards, from
+# the 2026-09-28 review of the 9/14-9/24 open-scan stint ($95.71 credited
+# vs -$210 trading at mid over 39 fills; mark-outs -7.6c/ct at 1h and
+# -14.3c at 24h, the worst family measured):
+#   - CORE only. The one live read on CPI, the Cleveland Fed nowcast, moves
+#     headline daily with oil and gasoline; core barely moves on daily data.
+#   - Weekday 08:25-11:05 ET blackout: fills in that window marked out
+#     -18.3c/ct at 24h against -11.8c the rest of the day (the 8:30 data
+#     releases and the nowcast's ~10:00 update).
+#   - Out 7 days before close: each event closes at its own CPI release.
+# Judged at the end of the window on its own fills' mark-outs against its
+# credits. Kill switches: IMM_CPI_PILOT_EVENTS="" (env = task restart), or
+# let IMM_CPI_PILOT_UNTIL lapse. A sorted tuple, not a set: it is hashed
+# into the config snapshot by str(), which must not depend on set order.
+CPI_PILOT_EVENTS = tuple(sorted(
+    e.strip() for e in os.environ.get(
+        "IMM_CPI_PILOT_EVENTS", "KXCPICORE-26NOV,KXCPICORE-26DEC").split(",")
+    if e.strip()))
+CPI_PILOT_UNTIL = datetime.fromisoformat(os.environ.get(
+    "IMM_CPI_PILOT_UNTIL", "2026-10-13T04:00:00+00:00"))   # end of Mon 10/12 ET
+CPI_PILOT_BLACKOUT_ET = tuple(os.environ.get(
+    "IMM_CPI_PILOT_BLACKOUT_ET", "08:25-11:05").split("-"))
+CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS = _env_float(
+    "IMM_CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS", 7.0)
+CPI_PILOT_SERIES = tuple(sorted({series_of(e) for e in CPI_PILOT_EVENTS}))
+
+
+def cpi_pilot_active(ticker: str, now_utc: Optional[datetime] = None) -> bool:
+    """True if `ticker` (a market or its event) is in a CPI pilot event and
+    the pilot window is still open. The '<series>-X' probe never matches."""
+    if event_ticker_of(ticker) not in CPI_PILOT_EVENTS:
+        return False
+    return (now_utc or datetime.now(timezone.utc)) < CPI_PILOT_UNTIL
+
+
+for _s in CPI_PILOT_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        blackout_et=CPI_PILOT_BLACKOUT_ET, blackout_weekdays_only=True)
+register_close_cutoff_days(CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS,
+                           ",".join(CPI_PILOT_SERIES))
 # Weather series allowed IN CODE (Jack 2026-09-10 "allowlist KXRAINWKND in
 # IMM bot, but only quote until the cutoff"): the weekend rain family — see
 # its SERIES_OVERRIDES entry beside the rain loop for the ticker-date
@@ -5560,6 +5612,8 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS",
     "SERIES_BLOCK_PATTERNS", "MARKET_BLOCK_SUFFIXES", "EVENT_BLOCK_PATTERNS",
+    "CPI_PILOT_EVENTS", "CPI_PILOT_UNTIL", "CPI_PILOT_BLACKOUT_ET",
+    "CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS",
     "AUCTION_DATE_SERIES", "EVENT_TOP_N",
     "AWARDS_SERIES", "AWARDS_PRE_EVENT_DAYS", "AWARDS_EVENT_DATES",
     "AWARDS_TABLE_ONLY_SERIES",
@@ -10805,9 +10859,11 @@ class IncentiveMarketMaker:
             # A wind-down event (BLOCKLIST_WIND_DOWN_EVENTS) is the one
             # exception to a prefix block. Accept the market ticker or the
             # event ticker itself: the freeze paths pass markets, the
-            # family probe passes "<series>-X".
+            # family probe passes "<series>-X". A CPI pilot event is exempt
+            # the same way while its window is open (cpi_pilot_active).
             if ticker not in BLOCKLIST_WIND_DOWN_EVENTS and \
-                    ticker.rsplit("-", 1)[0] not in BLOCKLIST_WIND_DOWN_EVENTS:
+                    ticker.rsplit("-", 1)[0] not in BLOCKLIST_WIND_DOWN_EVENTS \
+                    and not cpi_pilot_active(ticker):
                 return True
         # Strike-suffix block (MARKET_BLOCK_SUFFIXES, the -NQE leg): only a
         # MARKET ticker has a strike segment -- two dashes or more. Event
@@ -10840,6 +10896,7 @@ class IncentiveMarketMaker:
             series_pattern_allowed(series) or \
             election_series(series) or \
             rainstorm_span_allowed(ticker) or \
+            cpi_pilot_active(ticker) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -13590,12 +13647,16 @@ class IncentiveMarketMaker:
             # AAA PRINT BLACKOUT: a recurring scheduled release reprices this
             # book, so stand fully aside across it and resume after. Unlike
             # the cutoff this does NOT deselect — the market is still ours,
-            # it just holds no orders while the print lands.
+            # it just holds no orders while the print lands. The CPI pilot's
+            # weekday 08:25-11:05 ET window runs through the same path.
             if series_in_blackout(meta.series, now_utc):
                 n = self.cancel_market_orders(t, resting)
+                cpi = meta.series in CPI_PILOT_SERIES
                 if n:
-                    log(f"{self.tag} {t}: AAA print blackout; cancelled {n}")
-                self._gskip(t, "aaa_blackout", lambda: dict(n_cx=n))
+                    log(f"{self.tag} {t}: "
+                        f"{'CPI pilot release blackout' if cpi else 'AAA print blackout'}"
+                        f"; cancelled {n}")
+                self._gskip(t, "cpi_blackout" if cpi else "aaa_blackout", lambda: dict(n_cx=n))
                 continue
             if meta.close_time is not None and \
                     (meta.close_time - now_utc).total_seconds() \
