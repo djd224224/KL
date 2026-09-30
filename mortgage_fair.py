@@ -28,8 +28,10 @@ side reads MBS live. Measured: -$55.90 on 242 open-scan contracts.
 MODEL -- the weekly PMMS 30Y as a driftless Gaussian walk:
   X0      today's level: the MEDIAN print implied by the open KX30YMORTW
           ladder (its traders price rates live), dated at that event's
-          Thursday. Fallback, within PRINT_ONLY_HOURS of a release: the print
-          itself (Kalshi's settled `expiration_value`, e.g. '7.03').
+          Thursday; past the ladder's end (no mid crosses 50c) the edge
+          strike's mid read through Phi^-1 at ANCHOR_EXTRAP_SD_BP (2026-09-30).
+          Fallback, within PRINT_ONLY_HOURS of a release: the print itself
+          (Kalshi's settled `expiration_value`, e.g. '7.03').
   sd(n)   the n-week sd, SD_A_BP * n ** SD_H: fit to 2000-2026 weekly PMMS
           changes, sd 22 / 41 / 58 / 85 / 98 bp at 4 / 13 / 26 / 52 / 65
           weeks -- ~1.2x the sqrt(n) scaling of the 9.6bp weekly sd (weekly
@@ -60,6 +62,7 @@ import math
 import os
 import re
 import time
+from statistics import NormalDist
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -92,6 +95,17 @@ ANCHOR_MAX_GAP_BP = _env_float("IMM_MORT_ANCHOR_MAX_GAP_BP", 6)
 # an anchor further than this from the last print is refused (a weekly move
 # of 28bp is the largest since the 2022 method change)
 ANCHOR_MAX_DEV_BP = _env_float("IMM_MORT_ANCHOR_MAX_DEV_BP", 30)
+# PAST THE END OF THE LADDER (Jack 2026-09-30, "yes want that"): when rates
+# run past Kalshi's last strike no mid crosses 50c (9/29: the OCT01 ladder
+# topped out at T7.23 bid 85 / ask 88 and the gate stood the family aside
+# for a day). The median is then read off the edge strike: m = K + s *
+# Phi^-1(P(print > K)), s = ANCHOR_EXTRAP_SD_BP -- the spread of this week's
+# print as the market sees it mid-week (a daily lock index pins it to 2-4bp
+# RMSE by Monday; 9/29 T7.23 at 86.5c -> 7.26). Only while the edge strike's
+# fitted mid is inside [100 - EDGE, EDGE] (at 95c it is at most 1.6 sd away;
+# past that the ladder says only "higher") -- else fail closed as before.
+ANCHOR_EXTRAP_SD_BP = _env_float("IMM_MORT_ANCHOR_EXTRAP_SD_BP", 3.0)
+ANCHOR_EXTRAP_EDGE_C = _env_float("IMM_MORT_ANCHOR_EXTRAP_EDGE_C", 95.0)
 ANCHOR_TTL_SECS = _env_float("IMM_MORT_ANCHOR_TTL_SECS", 1200)
 PRINT_MAX_AGE_DAYS = _env_float("IMM_MORT_PRINT_MAX_AGE_D", 8)
 PRINT_ONLY_HOURS = _env_float("IMM_MORT_PRINT_ONLY_H", 24)
@@ -216,11 +230,20 @@ def _isotonic_decreasing(ys: List[float]) -> List[float]:
 
 
 def anchor_from_ladder(markets: List[dict]) -> Tuple[Optional[float], str]:
-    """(median print implied by one weekly event's ladder, why-not). Each
-    strike's mid is P(print > K); counted strikes are two-sided with a spread
-    of at most ANCHOR_MAX_SPREAD_C; the mids are made non-increasing in K and
-    the 50c crossing interpolated between neighbours at most
-    ANCHOR_MAX_GAP_BP apart. None when the ladder does not bracket 50c."""
+    """(median print, why-not) -- ladder_anchor without the detail."""
+    d = ladder_anchor(markets)
+    return d["x"], d["why"]
+
+
+def ladder_anchor(markets: List[dict]) -> dict:
+    """{"x": median print implied by one weekly event's ladder or None,
+    "why": why-not, "extrap": None or {"k", "p", "side"}}. Each strike's mid
+    is P(print > K); counted strikes are two-sided with a spread of at most
+    ANCHOR_MAX_SPREAD_C; the mids are made non-increasing in K and the 50c
+    crossing interpolated between neighbours at most ANCHOR_MAX_GAP_BP apart.
+    A ladder that does not bracket 50c is read past its end strike while
+    that strike's fitted mid is inside the ANCHOR_EXTRAP_EDGE_C band."""
+    out = {"x": None, "why": "", "extrap": None}
     pts = []
     for m in markets:
         k = m.get("floor_strike")
@@ -235,19 +258,26 @@ def anchor_from_ladder(markets: List[dict]) -> Tuple[Optional[float], str]:
             continue
         pts.append((k, (a + b) / 2.0))
     if len(pts) < 2:
-        return None, f"{len(pts)} two-sided strikes"
+        return dict(out, why=f"{len(pts)} two-sided strikes")
     pts.sort()
     ks = [k for k, _ in pts]
     fit = _isotonic_decreasing([p for _, p in pts])
     for i in range(len(ks) - 1):
         if fit[i] >= 50.0 > fit[i + 1]:
             if (ks[i + 1] - ks[i]) * 100.0 > ANCHOR_MAX_GAP_BP + 1e-9:
-                return None, (f"50c crossing between {ks[i]:.2f} and "
-                              f"{ks[i + 1]:.2f} is too wide")
+                return dict(out, why=(f"50c crossing between {ks[i]:.2f} and "
+                                      f"{ks[i + 1]:.2f} is too wide"))
             x = ks[i] + (fit[i] - 50.0) / (fit[i] - fit[i + 1]) * (ks[i + 1] - ks[i])
-            return round(x, 4), ""
-    return None, (f"ladder {ks[0]:.2f}-{ks[-1]:.2f} does not bracket 50c "
-                  f"(fitted {fit[0]:.0f}c..{fit[-1]:.0f}c)")
+            return dict(out, x=round(x, 4))
+    # no crossing: the print sits past one end of the ladder
+    side, k, p = ("top", ks[-1], fit[-1]) if fit[-1] >= 50.0 else ("bottom", ks[0], fit[0])
+    edge = ANCHOR_EXTRAP_EDGE_C
+    if 100.0 - edge <= p <= edge:
+        x = k + ANCHOR_EXTRAP_SD_BP / 100.0 * NormalDist().inv_cdf(p / 100.0)
+        return dict(out, x=round(x, 4), extrap={"k": k, "p": round(p, 2), "side": side})
+    return dict(out, why=(f"ladder {ks[0]:.2f}-{ks[-1]:.2f} does not bracket 50c "
+                          f"(fitted {fit[0]:.0f}c..{fit[-1]:.0f}c) and its {side} strike "
+                          f"is past the {edge:g}c extrapolation edge"))
 
 
 # ------------------------------------------------------------------- reads
@@ -389,10 +419,11 @@ class MortgageWatch:
             if ev is None:
                 why = "no open weekly event"
             else:
-                x, why = anchor_from_ladder(mk)
+                d = ladder_anchor(mk)
+                x, why = d["x"], d["why"]
                 if x is not None:
                     self.anchor = {"x": x, "event": ev, "day": day.isoformat(),
-                                   "ts": now_ts}
+                                   "ts": now_ts, "extrap": d["extrap"]}
             if why:
                 errors.append(f"anchor: {why}")
         except Exception as e:                      # noqa: BLE001
@@ -421,7 +452,10 @@ def choose_x0(now_ts: float, anchor: Optional[dict],
         elif aday <= pday:
             why = f"anchor event {anchor['event']} is not after the print {pday}"
         else:
-            return anchor["x"], aday, f"anchor {anchor['event']}"
+            ex = anchor.get("extrap")
+            return anchor["x"], aday, (f"anchor {anchor['event']}"
+                                       + (f" (past the {ex['side']} strike {ex['k']:.2f} at "
+                                          f"{ex['p']:.1f}c)" if ex else ""))
     else:
         why = "no fresh anchor"
     if now - release_utc(pday) <= timedelta(hours=PRINT_ONLY_HOURS):
@@ -498,6 +532,8 @@ def build_snapshot(now_ts: float, anchor: Optional[dict],
                   "anchor_max_spread_c": ANCHOR_MAX_SPREAD_C,
                   "anchor_max_gap_bp": ANCHOR_MAX_GAP_BP,
                   "anchor_max_dev_bp": ANCHOR_MAX_DEV_BP,
+                  "anchor_extrap_sd_bp": ANCHOR_EXTRAP_SD_BP,
+                  "anchor_extrap_edge_c": ANCHOR_EXTRAP_EDGE_C,
                   "anchor_ttl_secs": ANCHOR_TTL_SECS,
                   "print_max_age_d": PRINT_MAX_AGE_DAYS,
                   "print_only_h": PRINT_ONLY_HOURS},

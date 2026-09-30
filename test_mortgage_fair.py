@@ -112,14 +112,34 @@ class TestAnchor(unittest.TestCase):
                                         rung(7.12, 45, 100)])
         self.assertIsNone(x)
         self.assertIn("two-sided", why)
-        # all above 50c: the print is off the top of the ladder
-        x, why = mf.anchor_from_ladder([rung(7.10, 90, 92), rung(7.11, 80, 84)])
+        # all above 50c and the top strike past the 95c edge: only "higher"
+        x, why = mf.anchor_from_ladder([rung(7.10, 97, 99), rung(7.11, 96, 98)])
         self.assertIsNone(x)
         self.assertIn("does not bracket", why)
+        self.assertIn("extrapolation edge", why)
         # the crossing sits between strikes 10bp apart
         x, why = mf.anchor_from_ladder([rung(7.00, 70, 72), rung(7.10, 30, 32)])
         self.assertIsNone(x)
         self.assertIn("too wide", why)
+
+    def test_read_past_the_end_of_the_ladder(self):
+        # 9/29 evening: the OCT01 ladder topped out at T7.23 bid 85 / ask 88
+        top = [rung(7.20, 96, 97), rung(7.21, 94, 95), rung(7.22, 87, 90), rung(7.23, 85, 88)]
+        d = mf.ladder_anchor(top)
+        self.assertEqual(d["why"], "")
+        self.assertEqual(d["extrap"], {"k": 7.23, "p": 86.5, "side": "top"})
+        self.assertAlmostEqual(d["x"], 7.23 + 0.03 * 1.1031, places=3)    # ~7.263
+        self.assertAlmostEqual(mf.anchor_from_ladder(top)[0], d["x"])
+        # the bottom end reads the other way: 32c at 7.10 -> below it
+        d = mf.ladder_anchor([rung(7.10, 30, 34), rung(7.11, 20, 24)])
+        self.assertEqual(d["extrap"]["side"], "bottom")
+        self.assertAlmostEqual(d["x"], 7.10 - 0.03 * 0.4677, places=3)    # ~7.086
+        # the edge is inclusive at 95c / 5c
+        self.assertIsNotNone(mf.ladder_anchor([rung(7.10, 96, 98), rung(7.11, 94, 96)])["x"])
+        self.assertIsNotNone(mf.ladder_anchor([rung(7.10, 4, 6), rung(7.11, 2, 4)])["x"])
+        self.assertIsNone(mf.ladder_anchor([rung(7.10, 3, 5), rung(7.11, 2, 4)])["x"])
+        # a crossing still wins over extrapolation, and carries no extrap
+        self.assertIsNone(mf.ladder_anchor(LADDER_0928)["extrap"])
 
     def test_latest_print_and_open_event(self):
         settled = [{"close_time": "2026-09-17T15:59:00Z", "expiration_value": "6.95"},
@@ -145,6 +165,12 @@ class TestX0(unittest.TestCase):
         x0, d, src = mf.choose_x0(NOW, self.anchor(), PRINT)
         self.assertEqual((x0, d), (7.218, date(2026, 10, 1)))
         self.assertTrue(src.startswith("anchor"), src)
+
+    def test_an_extrapolated_anchor_says_so(self):
+        a = dict(self.anchor(x=7.263), extrap={"k": 7.23, "p": 86.5, "side": "top"})
+        x0, d, src = mf.choose_x0(NOW, a, PRINT)
+        self.assertEqual((x0, d), (7.263, date(2026, 10, 1)))
+        self.assertIn("past the top strike 7.23 at 86.5c", src)
 
     def test_a_stale_anchor_and_an_old_print_fail_closed(self):
         x0, d, src = mf.choose_x0(NOW, self.anchor(age=mf.ANCHOR_TTL_SECS + 5),
@@ -250,8 +276,8 @@ class TestWatch(unittest.TestCase):
         calls = []
         w = mf.MortgageWatch(self.fake(calls))
         w.refresh(now_ts=NOW)
-        w.get_json = self.fake(calls, ladder=[rung(7.30, 90, 92),
-                                              rung(7.31, 80, 84)])
+        w.get_json = self.fake(calls, ladder=[rung(7.30, 97, 99),
+                                              rung(7.31, 96, 98)])
         snap = w.refresh(now_ts=NOW + 120)
         self.assertAlmostEqual(snap["x0"], 7.218, places=3)       # within TTL
         self.assertTrue(any("does not bracket" in e for e in snap["errors"]))

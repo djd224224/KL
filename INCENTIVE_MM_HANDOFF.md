@@ -5234,3 +5234,36 @@ reserve of the $50k budget (all families).
 
 Tests: the ladder-family enrollment test reads x4 rungs and caps and pins
 KXTRUMPAPPROVE at x3. 1,550 green (unittest discover).
+
+## 2026-09-30 — Mortgage gate reads the rate past the end of the weekly ladder (Jack)
+
+Jack, after the live check showed the mortgage gate standing the whole
+family aside: "yes want that".
+
+WHAT HAPPENED. From the 9/29 14:17Z deploy the gate quoted nothing: rates
+rose past the OCT01 weekly ladder's top strike (T7.23 bid 85 / ask 88, T7.22
+87 / 90 -- Kalshi listed nothing higher), so no mid crossed 50c, the anchor
+failed ("ladder 7.04-7.22 does not bracket 50c"), and the print fallback
+only covers 24h after a release (9/24's was 5 days old). Fail closed, as
+designed, but dark until Thursday's print.
+
+CHANGE (mortgage_fair.ladder_anchor; anchor_from_ladder keeps its (x, why)
+shape). No crossing -> read the edge strike: median = K + s *
+Phi^-1(P(print > K)), s = IMM_MORT_ANCHOR_EXTRAP_SD_BP (3bp: the spread of
+the week's print as a mid-week market sees it -- a daily lock index pins it
+to 2-4bp RMSE by Monday), only while the edge strike's fitted mid is within
+[5c, 95c] (IMM_MORT_ANCHOR_EXTRAP_EDGE_C; at 95c the read is at most 1.6 sd
+out, beyond it the ladder only says "higher") -- else fail closed as before.
+The 30bp max-deviation-from-the-print check still applies. The X0 source
+says so: "anchor KX30YMORTW-26OCT01 (past the top strike 7.23 at 86.5c)";
+the anchor dict and the status file carry `extrap` {k, p, side}.
+
+LIVE READ 9/30 ~03:10Z: X0 7.263 (was none), 39 of 50 markets priced (the
+11 in-year touch markets stay unmodelled); 26EOY T7.00 fair 73.2c, T7.25
+50.8c; 27EOY T7.00 60.3c; MAX-27 T7.25 79.6c. An X0 error of a few bp moves
+these long-dated fairs ~1c/bp at most, inside the 15c margin.
+
+Tests: test_mortgage_fair (22): the 9/29 ladder -> 7.263, the bottom end,
+the inclusive 95c/5c edge, a crossing still wins, the X0 source note, the
+last-good-anchor test on a ladder past the edge. 1,568 green (unittest
+discover).
