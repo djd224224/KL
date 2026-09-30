@@ -260,7 +260,19 @@ def load_fills(first_file_day: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# load_results() value for a voided market: a void refunds cost, so each fill
+# settles at its own price (zero settlement P&L); there is no YES value.
+VOID = "void"
+
+
 def load_results() -> dict:
+    """ticker -> what one YES contract settled at, in cents, from the
+    settlements sink: 100 / 0 for a yes / no result, settle_price_cents for a
+    scalar (the exact value, e.g. 21.6c on an NFL ladder), VOID for a void.
+    The bot writes scalar / void rows since its 2026-09-29 scalar-settlement
+    fix (incentive_mm _settle_or_drop). Before it, every scalar settlement
+    was logged as "manual_offset" with no price; those rows, like a real
+    manual offset, are not a settlement here."""
     res = {}
     for path in sorted(glob.glob(os.path.join(STATUS_DIR, "settlements_*.jsonl"))):
         with open(path, encoding="utf-8") as f:
@@ -269,8 +281,13 @@ def load_results() -> dict:
                     r = json.loads(line)
                 except ValueError:
                     continue
-                if r.get("result") in ("yes", "no"):
-                    res[r["ticker"]] = r["result"]
+                result = r.get("result")
+                if result in ("yes", "no"):
+                    res[r["ticker"]] = 100.0 if result == "yes" else 0.0
+                elif result == "void":
+                    res[r["ticker"]] = VOID
+                elif result == "scalar" and r.get("settle_price_cents") is not None:
+                    res[r["ticker"]] = float(r["settle_price_cents"])
     return res
 
 
@@ -309,17 +326,23 @@ def score_fills(fills: pd.DataFrame, mid_tab: dict, results: dict) -> pd.DataFra
     fills closest to the news are priced, not skipped."""
     f = fills.copy()
     f["group"] = f["series"].map(group_of)
-    f["result"] = f["ticker"].map(results)
-    f["settle_pnl"] = np.where(f["result"].isna(), np.nan,
-                               f["cnt"] * ((f["result"] == f["eff_side"]).astype(float) * 100.0 - f["px"]) / 100.0)
+    f["result"] = f["ticker"].map(results)                   # load_results(): cents, VOID, NaN = unsettled
+    yes_val = pd.to_numeric(f["result"], errors="coerce")    # NaN for a void too
+    paid = np.where(f["eff_side"] == "yes", yes_val, 100.0 - yes_val)
+    paid = np.where(f["result"].eq(VOID), f["px"], paid)     # a void refunds the fill's cost
+    f["settle_pnl"] = np.where(f["result"].isna(), np.nan, f["cnt"] * (paid - f["px"]) / 100.0)
     mo, mk = [], []
     for r in f.itertuples():
         m = mid_at(mid_tab, r.ticker, r.t, 86400)
         mo.append(np.nan if np.isnan(m) else ((m - r.px) if r.eff_side == "yes" else ((100.0 - m) - r.px)))
         if np.isnan(m):
             res = results.get(r.ticker)
-            m = (100.0 if res == "yes" else 0.0) if res in ("yes", "no") else \
-                last_mid_within(mid_tab, r.ticker, r.t, r.t + 86400)
+            if res == VOID:                                  # refunded at the fill's own price
+                m = r.px if r.eff_side == "yes" else 100.0 - r.px
+            elif res is not None:
+                m = res
+            else:
+                m = last_mid_within(mid_tab, r.ticker, r.t, r.t + 86400)
         mk.append(np.nan if np.isnan(m) else ((m - r.px) if r.eff_side == "yes" else ((100.0 - m) - r.px)))
     f["mo24"] = mo
     f["mo24_w"] = f["mo24"] * f["cnt"]
