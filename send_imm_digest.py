@@ -136,10 +136,36 @@ def own_book(state: dict):
     return pos, avg
 
 
+# results[t] for a voided market. A void refunds cost, so the position settles
+# at its own entry price for zero settlement P&L; there is no YES value.
+VOID = "void"
+
+
+def settlement_cents(m: dict):
+    """What one YES contract of market `m` settled at, in cents, or None while
+    Kalshi has not settled it. A yes / no result pays 100 / 0. A scalar pays
+    imm.settlement_value_cents, read exactly: the NFL ladders and escalators
+    settle at values like "0.2160", which is 21.6c, never rounded to the
+    penny. A void returns VOID. As in incentive_mm's _settle_or_drop, a
+    scalar or void counts only once the market is finalized
+    (imm.SETTLED_STATUSES), and a scalar without a readable value is not
+    settled. Before 2026-09-29 a scalar-settled position was marked at the
+    last trade: a ladder that settled at 12c was carried at 82c."""
+    res = str(m.get("result") or "").lower()
+    if res in ("yes", "no"):
+        return 100.0 if res == "yes" else 0.0
+    if res not in ("scalar", "void") or \
+            str(m.get("status") or "").lower() not in imm.SETTLED_STATUSES:
+        return None
+    return VOID if res == "void" else imm.settlement_value_cents(m)
+
+
 def current_mids(client, tickers):
     """(mids, results): ticker -> mid YES price in CENTS (bid/ask mid, else
-    last), and ticker -> settlement result ('yes'/'no') for settled markets
-    so the caller can book settlement P&L."""
+    last), and ticker -> settlement_cents() (cents, or VOID) for settled
+    markets so the caller can book settlement P&L. A settled market's book
+    reads 0 / 100, so its entry in `mids` is the last trade, never the
+    settlement value; value a settled position from `results`."""
     mids, results = {}, {}
     tickers = list(tickers)
     for i in range(0, len(tickers), 50):
@@ -151,9 +177,9 @@ def current_mids(client, tickers):
             continue
         for m in (resp.get("markets") or []):
             t = m.get("ticker", "")
-            res = str(m.get("result") or "").lower()
-            if res in ("yes", "no"):
-                results[t] = res
+            px = settlement_cents(m)
+            if px is not None:
+                results[t] = px
             bid, ask = market_cents(m, "yes_bid"), market_cents(m, "yes_ask")
             if bid and ask:
                 mids[t] = (bid + ask) / 2.0
@@ -435,8 +461,8 @@ def raw_pnl_for_fills(client, fills, mids=None, results=None):
         if abs(p) < 0.01:
             continue
         a = pnl.avg.get(t, 0.0)
-        if t in results:                       # settled: book the real outcome
-            val = 100.0 if results[t] == "yes" else 0.0
+        if t in results:                       # settled: book what Kalshi paid
+            val = a if results[t] == VOID else results[t]   # a void refunds cost
             settle[t] = p * (val - a) / 100.0
         elif mids.get(t) is not None:          # still open: mark to mid
             unreal[t] = p * (mids[t] - a) / 100.0

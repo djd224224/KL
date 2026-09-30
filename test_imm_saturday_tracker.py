@@ -410,13 +410,59 @@ class GateInputsTests(unittest.TestCase):
                 "C": ([t, t + 3 * 3600], [40.0, 30.0])}     # unsettled, logged 3h after only
         fills = pd.DataFrame([dict(t=t, et_date="2026-09-19", et_hour=12, ticker=k, series="KXFOO",
                                    eff_side="yes", px=40.0, cnt=1.0) for k in ("A", "B", "C")])
-        f = sat.score_fills(fills, mids, {"B": "no"}).set_index("ticker")
+        f = sat.score_fills(fills, mids, {"B": 0.0}).set_index("ticker")     # load_results(): settled NO
         self.assertEqual(f.loc["A", "mo24"], 15.0)
         self.assertEqual(f.loc["A", "mk"], 15.0)
         self.assertTrue(np.isnan(f.loc["B", "mo24"]))
         self.assertEqual(f.loc["B", "mk"], -40.0)           # settled NO: a YES bought at 40 marks to 0
         self.assertTrue(np.isnan(f.loc["C", "mo24"]))
         self.assertEqual(f.loc["C", "mk"], -10.0)           # last logged mid inside the 24h
+
+
+class SettlementTests(unittest.TestCase):
+    """Scalar / void settlements (2026-09-29): the NFL ladders / escalators
+    settle "scalar" at a fractional value and a void refunds cost; load_results
+    kept only yes / no rows, so those fills never counted as settled."""
+
+    def _sink(self, rows):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with open(os.path.join(tmp.name, "settlements_2026-09-28.jsonl"), "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+            f.write("not json\n")
+        old = sat.STATUS_DIR
+        sat.STATUS_DIR = tmp.name
+        self.addCleanup(setattr, sat, "STATUS_DIR", old)
+
+    def test_load_results_reads_scalar_and_void_rows(self):
+        self._sink([{"ticker": "Y", "result": "yes", "settle_price_cents": 100.0},
+                    {"ticker": "N", "result": "no", "settle_price_cents": 0.0},
+                    {"ticker": "S", "result": "scalar", "settle_price_cents": 21.6},
+                    {"ticker": "Z", "result": "scalar", "settle_price_cents": 0.0},
+                    {"ticker": "V", "result": "void", "settle_price_cents": 37.5},
+                    {"ticker": "U", "result": "scalar", "settle_price_cents": None},
+                    {"ticker": "M", "result": "manual_offset", "settle_price_cents": None}])
+        self.assertEqual(sat.load_results(), {"Y": 100.0, "N": 0.0, "S": 21.6, "Z": 0.0, "V": sat.VOID})
+
+    def test_settle_pnl_per_side_at_the_scalar_value_and_void_at_cost(self):
+        t = 1_789_000_200
+        fills = pd.DataFrame([dict(t=t, et_date="2026-09-27", et_hour=12, ticker=k, series="KXNFLFFPTSLADDER",
+                                   eff_side=s, px=px, cnt=10.0)
+                              for k, s, px in (("S", "yes", 16.0), ("S", "no", 84.0), ("V", "no", 60.0),
+                                               ("Y", "yes", 30.0), ("O", "yes", 30.0))])
+        f = sat.score_fills(fills, {}, {"S": 12.0, "V": sat.VOID, "Y": 100.0})
+        pnl = f["settle_pnl"].tolist()
+        self.assertAlmostEqual(pnl[0], 10 * (12.0 - 16.0) / 100)      # YES pays the value
+        self.assertAlmostEqual(pnl[1], 10 * (88.0 - 84.0) / 100)      # NO pays 100 minus it
+        self.assertEqual(pnl[2], 0.0)                                  # void: refunded at cost
+        self.assertAlmostEqual(pnl[3], 7.0)                            # yes / no unchanged
+        self.assertTrue(np.isnan(pnl[4]))                              # unsettled
+        self.assertEqual(f["settled_cts"].tolist(), [10.0, 10.0, 10.0, 10.0, 0.0])
+        # no 24h mid logged: the gate's mark falls back to the settlement
+        self.assertEqual(f["mk"].tolist()[:4], [-4.0, 4.0, 0.0, 70.0])
+        self.assertTrue(np.isnan(f["mk"].tolist()[4]))
+        self.assertTrue(f["mo24"].isna().all())
 
 
 class GateRenderTests(unittest.TestCase):

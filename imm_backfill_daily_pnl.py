@@ -37,6 +37,23 @@ OUT_PATH = os.path.join(STATUS_DIR, "daily_pnl.json")
 PLACED_RE = re.compile(r"placed \S+ \w+\s+[\d.]+x @ \d+c -> ([0-9a-f-]{36})")
 
 
+def settle_price_cents(m: dict, cost: float):
+    """The YES price, in cents, that a position entered at `cost` cents settled
+    at, or None while Kalshi has not settled market `m`. A yes / no result
+    pays 100 / 0. A finalized scalar pays imm.settlement_value_cents, read
+    exactly ("0.2160" is 21.6c, never rounded). A finalized void refunds cost,
+    so it settles at `cost`. This is send_imm_digest's settlement_cents rule
+    (2026-09-29). Before it, a scalar-settled ladder got neither a settle nor
+    a mark (its book reads 0 / 100) and dropped out of the day's RAW."""
+    res = str(m.get("result") or "").lower()
+    if res in ("yes", "no"):
+        return 100.0 if res == "yes" else 0.0
+    if res not in ("scalar", "void") or \
+            str(m.get("status") or "").lower() not in imm.SETTLED_STATUSES:
+        return None
+    return cost if res == "void" else imm.settlement_value_cents(m)
+
+
 def recover_order_ids() -> set:
     """Every order id the bot ever logged placing, plus the live state map."""
     ids = set()
@@ -72,6 +89,47 @@ def fetch_fills(client, our_ids: set, since_ts: int) -> list:
         if not cursor or not batch:
             break
     return out
+
+
+def day_pnl(fills: list, mk: dict) -> dict:
+    """One ET day's daily_pnl.json record from that day's bot fills; `mk` is
+    ticker -> Kalshi market record. The residual position of each market is
+    booked at what Kalshi paid (settle_price_cents) once it has settled, and
+    marked to the bid/ask mid while it is open."""
+    pnl = PnlTracker()
+    fees = 0.0
+    for f in sorted(fills, key=lambda x: x.get("ts") or 0):
+        cnt = float(f.get("count_fp") or f.get("count") or 0)
+        pxc = float(f.get("yes_price_dollars") or 0) * 100
+        side, action = f.get("side"), f.get("action")
+        if side in ("yes", "no") and action in ("buy", "sell") and cnt > 0:
+            pnl.on_fill(f.get("ticker", "?"), side, action, cnt, pxc)
+        fees += float(f.get("fee_cost") or 0)
+    settle = mtm = 0.0
+    for t, p in pnl.pos.items():
+        if abs(p) < 0.01:
+            continue
+        a = pnl.avg.get(t, 0.0)
+        m = mk.get(t, {})
+        px = settle_price_cents(m, a)
+        if px is not None:
+            settle += p * (px - a) / 100.0
+        else:
+            bid = float(m.get("yes_bid_dollars") or 0) * 100
+            ask = float(m.get("yes_ask_dollars") or 0) * 100
+            if bid and ask:
+                mtm += p * ((bid + ask) / 2 - a) / 100.0
+    raw = sum(pnl.realized.values()) + settle + mtm - fees
+    return {
+        "raw": round(raw, 2),
+        "realized": round(sum(pnl.realized.values()), 2),
+        "settle": round(settle, 2),
+        "mtm": round(mtm, 2),
+        "fees": round(fees, 2),
+        "contracts": round(sum(float(f.get("count_fp") or f.get("count") or 0)
+                               for f in fills), 0),
+        "fills": len(fills),
+    }
 
 
 def main(argv=None) -> int:
@@ -112,42 +170,7 @@ def main(argv=None) -> int:
         day = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET).date()
         by_day[day].append(f)
 
-    out = {}
-    for day in sorted(by_day):
-        pnl = PnlTracker()
-        fees = 0.0
-        for f in sorted(by_day[day], key=lambda x: x.get("ts") or 0):
-            cnt = float(f.get("count_fp") or f.get("count") or 0)
-            pxc = float(f.get("yes_price_dollars") or 0) * 100
-            side, action = f.get("side"), f.get("action")
-            if side in ("yes", "no") and action in ("buy", "sell") and cnt > 0:
-                pnl.on_fill(f.get("ticker", "?"), side, action, cnt, pxc)
-            fees += float(f.get("fee_cost") or 0)
-        settle = mtm = 0.0
-        for t, p in pnl.pos.items():
-            if abs(p) < 0.01:
-                continue
-            a = pnl.avg.get(t, 0.0)
-            m = mk.get(t, {})
-            res = str(m.get("result") or "").lower()
-            if res in ("yes", "no"):
-                settle += p * ((100.0 if res == "yes" else 0.0) - a) / 100.0
-            else:
-                bid = float(m.get("yes_bid_dollars") or 0) * 100
-                ask = float(m.get("yes_ask_dollars") or 0) * 100
-                if bid and ask:
-                    mtm += p * ((bid + ask) / 2 - a) / 100.0
-        raw = sum(pnl.realized.values()) + settle + mtm - fees
-        out[day.isoformat()] = {
-            "raw": round(raw, 2),
-            "realized": round(sum(pnl.realized.values()), 2),
-            "settle": round(settle, 2),
-            "mtm": round(mtm, 2),
-            "fees": round(fees, 2),
-            "contracts": round(sum(float(f.get("count_fp") or f.get("count") or 0)
-                                   for f in by_day[day]), 0),
-            "fills": len(by_day[day]),
-        }
+    out = {day.isoformat(): day_pnl(by_day[day], mk) for day in sorted(by_day)}
 
     print(f"\n{'DATE':12s} {'RAW$':>11s} {'realized':>10s} {'settle':>10s} "
           f"{'mtm':>9s} {'contracts':>10s}")
