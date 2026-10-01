@@ -57,7 +57,9 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
             os.environ[_v] = _val
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from incentive_mm import STATUS_DIR, Alerter, log  # noqa: E402
+from incentive_mm import (STATUS_DIR, Alerter, log,  # noqa: E402
+                          RESTART_HANDOFF_FILE, RESTART_HANDOFF_MAX_AGE_SECS,
+                          RESTART_REQUEST_FILE)
 
 STATUS_PATH = os.path.join(STATUS_DIR, "status_incentive_mm.json")
 STATE_PATH = os.path.join(STATUS_DIR, "imm_health_alert_state.json")
@@ -71,6 +73,33 @@ STALE_MIN = float(os.environ.get("IMM_HEALTH_STALE_MIN", "6"))
 # three and still alerts, only ~2s later.
 READ_TRIES = int(os.environ.get("IMM_HEALTH_READ_TRIES", "3"))
 READ_RETRY_SECS = float(os.environ.get("IMM_HEALTH_READ_RETRY_SECS", "1.0"))
+# A DELIBERATE RESTART IS NOT AN OUTAGE (2026-10-01). restart_imm.ps1 -Task
+# now stops the launcher first (task Ready) and waits up to a cycle for the
+# bot to hand its book over and exit; the relaunch then takes ~1-2 min to
+# bring python back. A planned code-change exit leaves python down ~30-90s
+# the same way. While a fresh request or handoff file says a restart is
+# under way, "task not Running" and "process gone" read as "restarting"
+# instead of paging DOWN and then UP. Bounded: past RESTARTING_MAX_SECS on the
+# request (the script's own 600s wait plus slack) or
+# RESTART_HANDOFF_MAX_AGE_SECS on the handoff, a restart that never completed
+# alerts as usual. A stale heartbeat on a live process is never excused.
+RESTART_REQUEST_PATH = os.path.join(STATUS_DIR, RESTART_REQUEST_FILE)
+RESTART_HANDOFF_PATH = os.path.join(STATUS_DIR, RESTART_HANDOFF_FILE)
+RESTARTING_MAX_SECS = float(os.environ.get("IMM_HEALTH_RESTARTING_MAX_SECS", "660"))
+
+
+def restart_in_progress(now_ts=None) -> bool:
+    """A planned restart's request or handoff file, fresh enough to explain
+    a missing process or a task that is not Running."""
+    now_ts = time.time() if now_ts is None else now_ts
+    for path, limit in ((RESTART_REQUEST_PATH, RESTARTING_MAX_SECS),
+                        (RESTART_HANDOFF_PATH, RESTART_HANDOFF_MAX_AGE_SECS)):
+        try:
+            if 0 <= now_ts - os.path.getmtime(path) <= limit:
+                return True
+        except OSError:
+            pass
+    return False
 
 
 def _ps(cmd: str) -> str:
@@ -114,6 +143,8 @@ def probe():
                 f"pid={pid or 'NONE'}")
 
     base = f"pid={pid or 'NONE'} task={state or '?'} heartbeat={age:.1f}m"
+    if (not pid or state != "Running") and restart_in_progress():
+        return True, "restarting", base + " (planned restart under way)"
     if not pid:
         return False, "PROCESS GONE", base
     if state != "Running":

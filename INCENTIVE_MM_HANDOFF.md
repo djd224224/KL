@@ -5713,3 +5713,68 @@ studied. Inventory taken overnight rides to the 11:00 read.
 
 Tests: test_aprpotus_twin_rides_the_same_rules (allowed exactly, same
 override object, x3, uncapped, the four cutoff shapes); 1710 green.
+
+## 2026-10-01 — Restarts keep the book; placements paced at 12/s, cap 1000; renewal jitter (Jack: "both")
+
+WHY. Two things made the book go thin, both measured on 10/1:
+- The 14:59Z `restart_imm.ps1 -Task` bounce (to apply IMM_MAX_MARKETS 1000
+  and the $100k budget) hard-killed the bot, so the relaunch cancelled 1,391
+  leftover orders at 15:00:50 and rebuilt at 250 placements a cycle: first
+  placements 15:05, book back ~15:19Z. Code-change restarts already handed the
+  book over (13:20Z and 13:47Z adopted 1,115 / 1,265 orders, ~40s gaps); task
+  restarts never did.
+- The 250/cycle cap was the only thing spreading writes out. A capped cycle
+  fired its 250 in ~10s (~25/s), and the write budget is the ACCOUNT's: both
+  429 storms that day hit in exactly those seconds and rejected the crypto
+  fleets too -- 13:25-26Z, a renewal wave (IMM 14, crypto-touch 23,
+  crypto-annual 7) and 15:14Z, the rebuild (IMM 9, crypto-touch 6,
+  crypto-annual 9). With the bigger book (~1,700 orders) the renewals also
+  came back in waves that bound the cap on their own: 15:45 (329 deferred),
+  16:09-16:21 (300-440 deferred for ~12 min), 16:47.
+
+WHAT.
+1. Operator restarts hand the book over. `restart_imm.ps1` (both modes)
+   writes `run-logs/incentive-mm/restart_handoff_request.json` (atomic) and
+   waits up to -HandoffWaitSecs (600) for the bot to exit; -Task first kills
+   the launcher, cmd shim and wrapper (python keeps trading) so nothing can
+   relaunch python on the old env, then starts the task once python is gone.
+   The bot checks for the request at the top of every loop and after every
+   cycle (`_restart_requested`), runs the same `_prepare_restart_handoff` as
+   the code-change exit and leaves; the relaunch adopts the book
+   (RESTART_HANDOFF_MAX_AGE_SECS 300). A request counts only for a process
+   that was already running when it was written and for
+   IMM_RESTART_REQUEST_MAX_AGE_SECS (900); a stale or unreadable one is
+   deleted unread. A handoff that cannot arm (halted, failed import
+   preflight) still exits, cancelling as before. A bot still running at the
+   deadline is killed exactly as before. `-NoHandoff` = the old hard kill.
+2. Paced writes. `WritePacer` spaces place_with_caps' writes at
+   IMM_PLACE_RATE_PER_SEC (12; 0 = unpaced): a fresh placement books one
+   slot, a swap (REQUOTE_INTERLEAVE cancel + replacement) books two so the
+   pair still goes out back to back. The amend loop is paced the same way
+   (it shares the cap). Live only; stray / halt / fail-safe / shutdown
+   cancels are never paced. Launcher IMM_MAX_PLACEMENTS_PER_CYCLE 250 ->
+   1000: a full cycle now spreads over ~85s at half the old peak.
+   "placement pacing: N placed at <= 12 writes/s (Ns paced)" logs any cycle
+   that waited >= 1s.
+3. Renewal jitter. Each order renews up to IMM_ORDER_REFRESH_JITTER_SECS
+   (300) EARLY, by a fixed amount from crc32(order id) (`order_refresh_secs`):
+   never later than ORDER_REFRESH_SECS, stable while the order rests,
+   redrawn per new id, so a cohort placed together spreads out over
+   successive renewals. ~11% more renewals at 1500s refresh. 0 = one clock.
+4. imm_health_alert: while a fresh request (<= 660s) or handoff (<= 300s)
+   file exists, "task not Running" / "process gone" read as "restarting"
+   (OK) instead of paging DOWN then UP. A stale heartbeat on a live process
+   is never excused.
+
+DEPLOY. The code reaches the bot through the normal code-change exit (which
+already hands over). The launcher's 1000 cap needs one task restart, which is
+the first live run of the new -Task handoff:
+`restart_imm.ps1 -Task`. Watch restart-imm.log for "handoff: bot exited and
+handed its book over", then the bot log for "startup: adopted N resting imm-
+order(s)" instead of "startup: cancelled N leftover imm- orders".
+
+Kill switches: IMM_PLACE_RATE_PER_SEC=0, IMM_ORDER_REFRESH_JITTER_SECS=0,
+`restart_imm.ps1 -NoHandoff`. Tests: TestWritePacer, TestPacedPlacements,
+TestRefreshJitter, TestRestartRequest, ProbeRestartWindow (the suite header
+turns pacing/jitter off for the older tests; the full suite also passes with
+both on).

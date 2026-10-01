@@ -66,6 +66,14 @@ if ($Probe) {
     # (not the throttle) becomes the real floor = quote as fast as the wire
     # allows. Env-scoped: the 16 crypto bots keep 100ms and don't starve the
     # shared write budget.
+    # placements/cycle 250 -> 1000 (Jack 2026-10-01, "both"), now PACED in
+    # code at IMM_PLACE_RATE_PER_SEC (12 writes/s; amends share the cap and
+    # the pace). A capped cycle used to fire its 250 in ~10s, and both
+    # account-wide 429 storms of 10/1 -- 13:25Z (a renewal wave) and 15:14Z
+    # (the restart rebuild) -- landed in exactly those seconds, with
+    # crypto-touch / crypto-annual / updown rejected alongside the IMM; the
+    # "~13% of budget" above did not hold in practice. A full 1000-order cycle
+    # now spreads over ~85s at half the old peak rate.
     # Quiet-hours ladder boost (Jack 2026-07-25): non-KXTEMP rungs x2 during
     # ET 3-7am — 1/3.3 the traded flow, half the fill turnover, ~breakeven
     # non-temp fill P&L (KXTEMP excluded in code: IMM_HOUR_MULT_EXCLUDE).
@@ -277,7 +285,7 @@ if ($Probe) {
     # leave after the 30-minute clock (positions ride). The rate bar only
     # binds an event with no quoting member left, which is the right answer
     # for strikes earning ~$0.04-0.17/day. Env knob => task-level restart.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=100000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
+    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=100000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 
 while ($true) {

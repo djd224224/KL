@@ -73,6 +73,7 @@ import threading
 import sys
 import time
 import uuid
+import zlib
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -2210,6 +2211,32 @@ HOURLY_ACTIVATION_AUTO = os.environ.get("IMM_HOURLY_ACTIVATION_AUTO", "1") == "1
 HOURLY_PROGRAM_MAX_HOURS = _env_float("IMM_HOURLY_PROGRAM_MAX_HOURS", 2.0)
 ORDER_TTL_SECS = _env_int("IMM_ORDER_TTL_SECS", 600)
 ORDER_REFRESH_SECS = _env_int("IMM_ORDER_REFRESH_SECS", 420)
+# RENEWAL JITTER (Jack 2026-10-01, "both"). Every order renewed on the one
+# clock, so a book placed in one burst renewed in that same burst every
+# refresh: after the 10/1 task restart rebuilt ~1,400 orders (15:05-15:19Z)
+# the 250/cycle placement cap bound again at 15:45 (329 deferred), 16:09-
+# 16:21 (300-440 deferred for ~12 min) and 16:47. A deferred re-price leaves
+# its rung empty for a cycle, and a renewal deferred past its slack
+# (ORDER_TTL_SECS - ORDER_REFRESH_SECS, 300s live) expires off the book. Each
+# order now renews up to ORDER_REFRESH_JITTER_SECS EARLY, by an amount fixed
+# by its own order id: never later than ORDER_REFRESH_SECS (the TTL margin is
+# untouched), stable while it rests (no cycle-to-cycle flapping), redrawn
+# with every new id -- so a cohort spreads out over successive renewals
+# instead of marching in step. ~11% more renewals at 1500s / 300s. 0 = the
+# single clock.
+ORDER_REFRESH_JITTER_SECS = _env_int("IMM_ORDER_REFRESH_JITTER_SECS", 300)
+
+
+def order_refresh_secs(order_id: str) -> float:
+    """The age at which THIS order is due for its TTL renewal:
+    ORDER_REFRESH_SECS less a stable per-order jitter (crc32 of the id, so it
+    survives a restart) of up to ORDER_REFRESH_JITTER_SECS, never more than
+    half the refresh."""
+    jit = min(max(ORDER_REFRESH_JITTER_SECS, 0), ORDER_REFRESH_SECS // 2)
+    if jit <= 0 or not order_id:
+        return float(ORDER_REFRESH_SECS)
+    return float(ORDER_REFRESH_SECS
+                 - zlib.crc32(str(order_id).encode("utf-8")) % (jit + 1))
 
 # GLOBAL band 5..90 (Jack 2026-07-26: "i want 5-90 to be global not just
 # weather" — supersedes the 7/13 widening to 1/95). Applies BOTH sides BOTH
@@ -2368,6 +2395,48 @@ MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 2000)  # 450->1000-
 #   KXRT-BRIN-45/50. Advanced tier + 24/s throughput handle 2000 fine. NOTE:
 #   the $4000 collateral budget may become the next binding constraint.)
 MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
+# PACED PLACEMENTS (Jack 2026-10-01, "both"). The per-cycle cap was the only
+# thing spreading writes out: a capped cycle fired its 250 placements in
+# ~10s (~25/s), and the write budget is the ACCOUNT's, shared with every bot
+# on the key. Both 429 storms of 10/1 landed in exactly those seconds and hit
+# the crypto fleets as well: 13:25-26Z, a renewal wave (IMM 14 rejects,
+# crypto-touch 23, crypto-annual 7), and 15:14Z, a restart rebuild (IMM 9,
+# crypto-touch 6, crypto-annual 9). place_with_caps now spaces its writes --
+# a placement, or a swap's cancel + replacement as one back-to-back pair --
+# at PLACE_RATE_PER_SEC, and the amend loop (capped by the same knob) its
+# amends, so the launcher can raise the per-cycle cap (250 -> 1000) without
+# the burst: more placements per cycle at half the old peak rate. Live only
+# (a dry run never sleeps). Cancels outside the swap pairs (strays, halts,
+# the fail-safe, shutdown) are never paced. 0 = the old unpaced burst.
+PLACE_RATE_PER_SEC = _env_float("IMM_PLACE_RATE_PER_SEC", 12.0)
+
+
+class WritePacer:
+    """Spaces writes at most `rate` per second. wait(n) blocks until the next
+    free slot and then books n slots, so a swap's cancel and its replacement
+    still go out back to back while the average rate holds. rate <= 0 never
+    waits. `clock` / `sleep` exist for tests."""
+
+    def __init__(self, rate: float,
+                 clock: Optional[Callable[[], float]] = None,
+                 sleep: Optional[Callable[[float], None]] = None):
+        self.gap = 1.0 / rate if rate > 0 else 0.0
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or time.sleep
+        self.next_ok: Optional[float] = None
+        self.slept = 0.0
+
+    def wait(self, n: int = 1) -> None:
+        if self.gap <= 0:
+            return
+        now = self.clock()
+        if self.next_ok is not None and now < self.next_ok:
+            self.sleep(self.next_ok - now)
+            self.slept += self.next_ok - now
+            now = self.next_ok
+        self.next_ok = now + n * self.gap
+
+
 # REQUOTE INTERLEAVE (Jack 2026-09-27, ROI scan: "fix these"). The diff's
 # cancels all ran before any placement, so an order being REPLACED (TTL
 # renewal or a reprice the amend path can't take) sat off the book for the
@@ -5883,6 +5952,60 @@ def restart_handoff_path() -> str:
     return os.path.join(STATUS_DIR, RESTART_HANDOFF_FILE)
 
 
+# OPERATOR RESTART HANDOFF (Jack 2026-10-01, "both"). The handoff above armed
+# only on the code-change exit. A `restart_imm.ps1 -Task` bounce -- required
+# for any launcher env change -- hard-killed the chain, so the next process
+# cancelled every leftover order and rebuilt at the placement cap: 10/1
+# 14:59Z, 1,391 orders cancelled at 15:00:50, book back ~15:19Z. Now the
+# script drops RESTART_REQUEST_FILE and waits; the bot, between cycles, hands
+# the book over exactly as the code-change exit does and leaves, and the
+# relaunch adopts the book. -Task first stops the launcher chain (nothing can
+# relaunch python on the old env) and starts the task once python is gone;
+# the plain mode lets the launcher relaunch python as always. A request
+# binds only a process that was ALREADY RUNNING when it was written, and only
+# for RESTART_REQUEST_MAX_AGE_SECS: a file left behind by a failed restart is
+# deleted unread instead of making a later process exit.
+RESTART_REQUEST_FILE = "restart_handoff_request.json"
+RESTART_REQUEST_MAX_AGE_SECS = _env_int("IMM_RESTART_REQUEST_MAX_AGE_SECS", 900)
+_PROCESS_START_TS = time.time()
+
+
+def restart_request_path() -> str:
+    """Resolved at call time: tests re-point STATUS_DIR after import."""
+    return os.path.join(STATUS_DIR, RESTART_REQUEST_FILE)
+
+
+def restart_request_pending(started_ts: float,
+                            now_ts: Optional[float] = None) -> Optional[dict]:
+    """The operator's handoff request (restart_imm.ps1) if it applies to a
+    process started at `started_ts`: written after that start and at
+    most RESTART_REQUEST_MAX_AGE_SECS old. A stale, pre-start or unreadable
+    request is removed and ignored. None = nothing to act on."""
+    path = restart_request_path()
+    if not os.path.exists(path):
+        return None
+    now_ts = time.time() if now_ts is None else now_ts
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        ts = float(data.get("ts"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        data, ts = None, None
+    if data is None or ts < started_ts \
+            or now_ts - ts > RESTART_REQUEST_MAX_AGE_SECS:
+        log(f"restart request {RESTART_REQUEST_FILE} ignored and removed: "
+            + ("unreadable" if data is None else
+               "written before this process started" if ts < started_ts
+               else f"{now_ts - ts:.0f}s old (limit "
+                    f"{RESTART_REQUEST_MAX_AGE_SECS}s)"))
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    return data
+
+
 _SOURCE_PATH = os.path.abspath(__file__)
 try:
     _SOURCE_MTIME = os.path.getmtime(_SOURCE_PATH)
@@ -6011,7 +6134,8 @@ _CONFIG_CODE_KNOBS = (
     "HOURLY_ACTIVATION_WINDOW_SECS", "HOURLY_ACTIVATION_AUTO",
     "HOURLY_PROGRAM_MAX_HOURS",
     "RESTART_KEEP_ORDERS", "RESTART_HANDOFF_MAX_AGE_SECS",
-    "RESTART_KEEP_MIN_CUTOFF_SECS",
+    "RESTART_KEEP_MIN_CUTOFF_SECS", "RESTART_REQUEST_MAX_AGE_SECS",
+    "PLACE_RATE_PER_SEC", "ORDER_REFRESH_JITTER_SECS",
     "FLOOR_PROJECTION_REALIZED", "NEAR_CLIFF_ROOM_PRIORITY",
     "REQUOTE_INTERLEAVE", "FORCE_EVENTS",
     # ...and the estimator-fidelity trio: per-side floor schedule, the
@@ -7568,7 +7692,8 @@ def quake_hold_renewals(resting: List[dict], held: Set[str],
                         ) -> Tuple[List["Quote"], List[str]]:
     """(to_place, to_cancel) renewing the resting orders of quake-HELD
     markets that are due for the TTL refresh (QUAKE_HOLD_RENEW): older than
-    ORDER_REFRESH_SECS, or within ORDER_TTL_SECS - ORDER_REFRESH_SECS of the
+    order_refresh_secs (ORDER_REFRESH_SECS less the order's own jitter), or
+    within ORDER_TTL_SECS - ORDER_REFRESH_SECS of the
     exchange expiry (the clock that survives a lost age). Each due order is
     cancelled and re-placed at its own price (sub-penny kept) and its own
     remaining size floored to whole contracts, the two lists in matching
@@ -7587,7 +7712,7 @@ def quake_hold_renewals(resting: List[dict], held: Set[str],
             continue
         age = now_ts - order_ages.get(oid, now_ts)
         exp = order_expiry_ts(o)
-        if age <= ORDER_REFRESH_SECS and (exp is None or exp - now_ts > lead):
+        if age <= order_refresh_secs(oid) and (exp is None or exp - now_ts > lead):
             continue
         count = int(math.floor(order_remaining(o) + 1e-9))
         if count < 1:
@@ -9613,8 +9738,9 @@ def diff_orders(desired: List[Quote], resting: List[dict],
       ticker+side whose price/size drifted the wrong way is amended IN
       PLACE (V2 endpoint, same order_id) instead of cancel+placed — the
       requote-downtime fix: the rung never leaves the book.
-    - stale-by-TTL (ORDER_REFRESH_SECS) -> cancel + fresh place (amend
-      cannot extend the exchange-side expiration).
+    - stale-by-TTL (order_refresh_secs: ORDER_REFRESH_SECS less the order's
+      own jitter) -> cancel + fresh place (amend cannot extend the
+      exchange-side expiration).
     Orders on preserve_tickers (blind/fast-lane-skipped markets) are left
     untouched (quake-held markets renew outside the diff, see
     quake_hold_renewals)."""
@@ -9708,7 +9834,7 @@ def diff_orders(desired: List[Quote], resting: List[dict],
         remaining = order_remaining(o)
         ox = order_yes_exact_cents(o)
         age = now_ts - order_ages.get(oid, now_ts)
-        stale = age > ORDER_REFRESH_SECS
+        stale = age > order_refresh_secs(oid)
         tk = o.get("ticker")
         match = next((q for q in unmatched
                       if matches(q, tk, book_side, px, remaining, ox)), None)
@@ -15929,8 +16055,13 @@ class IncentiveMarketMaker:
             self.state.watchdog_streak = 0
 
         # Amends FIRST (they're the urgent repricing and never free/consume
-        # cap room), then cancels, then fresh placements.
+        # cap room), then cancels, then fresh placements. Paced like the
+        # placements (PLACE_RATE_PER_SEC): the cap they share went 250 ->
+        # 1000 on 10/1, and an amend bounced by an account-wide 429 storm
+        # leaves the stale price resting, which is worse than a short wait.
+        am_pacer = WritePacer(PLACE_RATE_PER_SEC if self.live else 0.0)
         for o_am, q_am in to_amend[:MAX_PLACEMENTS_PER_CYCLE]:
+            am_pacer.wait()
             self.amend_order_inplace(o_am, q_am, now_ts)
         if len(to_amend) > MAX_PLACEMENTS_PER_CYCLE:
             log(f"{self.tag} amend cap: {len(to_amend) - MAX_PLACEMENTS_PER_CYCLE} "
@@ -16178,6 +16309,9 @@ class IncentiveMarketMaker:
                 self.state.place_uncertain.pop(key, None)
         placed = 0
         deferred_from: Optional[int] = None
+        # PACED (PLACE_RATE_PER_SEC): each write below waits for its slot; a
+        # swap books two so its cancel + replacement stay back to back
+        pacer = WritePacer(PLACE_RATE_PER_SEC if self.live else 0.0)
         for i, q in enumerate(to_place):
             if placed >= MAX_PLACEMENTS_PER_CYCLE:
                 log(f"{self.tag} placement cap {MAX_PLACEMENTS_PER_CYCLE}/cycle reached; "
@@ -16194,6 +16328,7 @@ class IncentiveMarketMaker:
             if old is not None:
                 # the swap: the order this placement replaces leaves the book
                 # only now, one call before its successor lands
+                pacer.wait(2)
                 if self.cancel_order(old, reason="requote_diff"):
                     self.state.cancelled_today += 1
                     cancelled_ids.add(old)
@@ -16209,6 +16344,8 @@ class IncentiveMarketMaker:
                 # Depth filler: exempt from the ladder side/level caps (that's
                 # its whole purpose), but still counts toward the global
                 # resting-order and per-cycle placement caps above.
+                if old is None:
+                    pacer.wait()
                 if self.place_order(q, now_ts):
                     total_resting += 1
                     placed += 1
@@ -16257,11 +16394,16 @@ class IncentiveMarketMaker:
                                    f"blocked at {have_level:.0f}/{max_level_size}",
                                    key=f"{q.ticker}-{q.price_cents}", urgent=False)
                 continue
+            if old is None:
+                pacer.wait()
             if self.place_order(q, now_ts):
                 side_totals[skey] = have_side + q.count
                 level_totals[lkey] = have_level + q.count
                 total_resting += 1
                 placed += 1
+        if pacer.slept >= 1.0:
+            log(f"{self.tag} placement pacing: {placed} placed at <= "
+                f"{PLACE_RATE_PER_SEC:g} writes/s ({pacer.slept:.0f}s paced)")
         if deferred_from is not None and replaces:
             # replacements the caps pushed to the next cycle: a pure renewal
             # keeps its (identical) order resting meanwhile; any other swap
@@ -16510,6 +16652,27 @@ class IncentiveMarketMaker:
         log(f"{self.tag} restart handoff: {len(keep)} order(s) left resting for "
             f"the relaunch; cancelled {n_cx} on gated / fast-lane / "
             f"near-cutoff / unselected markets")
+        return True
+
+    def _restart_requested(self) -> bool:
+        """Between cycles: act on an operator handoff request (see
+        RESTART_REQUEST_FILE). Hands the book over exactly as the code-change
+        exit does and returns True for run() to leave. A handoff that cannot
+        arm still exits -- cancelling as before -- because the operator is
+        restarting the task either way. A dry-run process never acts on it."""
+        if not self.live:
+            return False
+        req = restart_request_pending(_PROCESS_START_TS)
+        if req is None:
+            return False
+        try:
+            os.remove(restart_request_path())
+        except OSError:
+            pass
+        log(f"{self.tag} restart requested by {req.get('by') or 'an operator'}: "
+            f"handing the book over and exiting for the relaunch")
+        if self._prepare_restart_handoff():
+            self._save_persist()
         return True
 
     def _adopt_restart_handoff(self) -> Optional[int]:
@@ -17195,6 +17358,10 @@ class IncentiveMarketMaker:
 
         try:
             while True:
+                # an operator restart (restart_imm.ps1 -Task) that landed
+                # during the sleep: hand over before starting another cycle
+                if not once and self._restart_requested():
+                    break
                 top = time.time()
                 _keep_awake()   # re-assert every cycle (wakes can clear it)
                 if prev_top is not None and top - prev_top > WAKE_GAP_SECS:
@@ -17228,6 +17395,9 @@ class IncentiveMarketMaker:
                 now_utc = datetime.now(timezone.utc)
                 self.alerter.maybe_daily_summary(now_utc, self.build_daily_summary)
                 self.write_status(now_utc)
+                # ...or during the cycle that just ran (RESTART_REQUEST_FILE)
+                if not once and not stopping["flag"] and self._restart_requested():
+                    break
                 if (not once and not stopping["flag"]
                         and code_change_exit_due(self.state.selected, now_utc)):
                     log(f"{self.tag} source file changed on disk (synced "

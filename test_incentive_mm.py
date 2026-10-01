@@ -37,6 +37,18 @@ imm.HOURLY_ACTIVATION_WINDOW_SECS = 0
 _ADMIT_SUSTAIN_CODE_DEFAULT = imm.ADMIT_SUSTAIN_SECS
 imm.ADMIT_SUSTAIN_SECS = 0
 
+# Placement pacing and renewal jitter (2026-10-01) are wall-clock features:
+# the pacer SLEEPS between live writes and the jitter moves each order's
+# renewal up to 300s early. The suite's placement / requote tests are about
+# WHAT is placed and when an order is stale on the single clock, so both are
+# off by default here (IMM_PLACE_RATE_PER_SEC=0 / IMM_ORDER_REFRESH_JITTER_SECS
+# =0 do the same live); TestWritePacer, TestPacedPlacements and
+# TestRefreshJitter re-arm them.
+_PLACE_RATE_CODE_DEFAULT = imm.PLACE_RATE_PER_SEC
+_REFRESH_JITTER_CODE_DEFAULT = imm.ORDER_REFRESH_JITTER_SECS
+imm.PLACE_RATE_PER_SEC = 0.0
+imm.ORDER_REFRESH_JITTER_SECS = 0
+
 
 def setUpModule():
     """Sandbox all file side effects (HALT file, persisted state, status
@@ -17526,6 +17538,270 @@ class TestUnencodableOutputNeverKillsATask(unittest.TestCase):
         out = r.stdout.decode("cp1252")
         self.assertIn("player: Ji\\u0159\u00ed", out)     # i-acute is cp1252
         self.assertIn("title: \\u0159", out)
+
+
+class TestWritePacer(unittest.TestCase):
+    """Jack 2026-10-01 ("both"): a capped cycle fired its 250 placements in
+    ~10s and both 429 storms that day landed in those seconds, crypto fleets
+    included. The pacer spaces the placement path's writes."""
+
+    def _pacer(self, rate):
+        self.t, self.sleeps = 100.0, []
+
+        def sleep(s):
+            self.sleeps.append(round(s, 6))
+            self.t += s
+        return imm.WritePacer(rate, clock=lambda: self.t, sleep=sleep)
+
+    def test_code_defaults(self):
+        self.assertEqual(_PLACE_RATE_CODE_DEFAULT, 12.0)
+        for k in ("PLACE_RATE_PER_SEC", "ORDER_REFRESH_JITTER_SECS",
+                  "RESTART_REQUEST_MAX_AGE_SECS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_writes_are_spaced_at_the_rate(self):
+        p = self._pacer(10.0)
+        for _ in range(4):
+            p.wait()
+        self.assertEqual(self.sleeps, [0.1, 0.1, 0.1])   # the first is free
+        self.assertAlmostEqual(p.slept, 0.3)
+
+    def test_a_pair_books_two_slots_and_goes_out_together(self):
+        p = self._pacer(10.0)
+        p.wait(2)                  # a swap: cancel + replacement, now
+        p.wait()                   # the next write waits out both slots
+        self.assertEqual(self.sleeps, [0.2])
+
+    def test_time_already_spent_counts(self):
+        p = self._pacer(10.0)
+        p.wait()
+        self.t += 0.5              # e.g. a slow API round trip
+        p.wait()
+        self.assertEqual(self.sleeps, [])
+
+    def test_zero_rate_never_waits(self):
+        p = self._pacer(0.0)
+        for _ in range(5):
+            p.wait(2)
+        self.assertEqual(self.sleeps, [])
+
+
+class TestPacedPlacements(unittest.TestCase):
+    """place_with_caps paces a LIVE bot's writes; a swap's cancel and its
+    replacement stay back to back (the REQUOTE_INTERLEAVE promise)."""
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=None, live=False)
+        self.now = time.time()
+        self.events, self.t = [], [1000.0]
+
+        def cancel(oid, reason=""):
+            self.events.append(("cancel", oid))
+            return True
+
+        def place(q, now_ts):
+            self.events.append(("place", q.ticker))
+            return True
+        self.bot.cancel_order, self.bot.place_order = cancel, place
+
+    def tearDown(self):
+        _clean_persist()
+
+    def _run(self, quotes, resting=(), replaces=None, live=True, rate=10.0):
+        self.bot.live = live            # writes are stubbed above either way
+
+        def sleep(s):
+            self.events.append(("sleep", round(s, 6)))
+            self.t[0] += s
+        with mock.patch.object(imm, "PLACE_RATE_PER_SEC", rate), \
+                mock.patch.object(imm.time, "monotonic", lambda: self.t[0]), \
+                mock.patch.object(imm.time, "sleep", sleep):
+            return self.bot.place_with_caps(list(quotes), list(resting), set(),
+                                            self.now, replaces=replaces or {},
+                                            failed_cancels=[])
+
+    def test_fresh_placements_are_spaced(self):
+        placed = self._run([Quote("A", "bid", 40, 5), Quote("B", "bid", 40, 5),
+                            Quote("C", "bid", 40, 5)])
+        self.assertEqual(placed, 3)
+        self.assertEqual(self.events, [("place", "A"), ("sleep", 0.1),
+                                       ("place", "B"), ("sleep", 0.1),
+                                       ("place", "C")])
+
+    def test_a_swap_goes_out_back_to_back(self):
+        old = {"order_id": "a", "ticker": "T", "book_side": "bid",
+               "yes_price": 49, "remaining_count": 5, "status": "resting"}
+        placed = self._run([Quote("T", "bid", 48, 5), Quote("U", "bid", 40, 5)],
+                           resting=[old], replaces={0: "a"})
+        self.assertEqual(placed, 2)
+        self.assertEqual(self.events, [("cancel", "a"), ("place", "T"),
+                                       ("sleep", 0.2), ("place", "U")])
+
+    def test_pads_are_paced_too(self):
+        self._run([Quote("A", "bid", imm.PAD_BID_CENTS, 500, is_pad=True),
+                   Quote("A", "bid", 40, 5)])
+        self.assertEqual(self.events, [("place", "A"), ("sleep", 0.1),
+                                       ("place", "A")])
+
+    def test_dry_run_and_zero_rate_never_sleep(self):
+        quotes = [Quote(f"T{i}", "bid", 40, 1) for i in range(5)]
+        self._run(quotes, live=False)
+        self._run(quotes, rate=0.0)
+        self.assertNotIn("sleep", [e[0] for e in self.events])
+        self.assertEqual(len(self.events), 10)
+
+    def test_cycle_cap_still_binds(self):
+        quotes = [Quote(f"T{i}", "bid", 40, 1) for i in range(30)]
+        with mock.patch.object(imm, "MAX_PLACEMENTS_PER_CYCLE", 20):
+            placed = self._run(quotes, rate=1000.0)
+        self.assertEqual(placed, 20)
+
+
+class TestRefreshJitter(unittest.TestCase):
+    """Each order renews up to ORDER_REFRESH_JITTER_SECS early, by a stable
+    amount from its own id -- never later than ORDER_REFRESH_SECS -- so a book
+    placed in one burst stops renewing in one burst (10/1: 300-440 renewals
+    deferred for ~12 min after the restart rebuild)."""
+
+    def _ids(self, n=400):
+        return [f"01a0f7{i:06d}-c0de" for i in range(n)]
+
+    def test_code_default(self):
+        self.assertEqual(_REFRESH_JITTER_CODE_DEFAULT, 300)
+
+    def test_bounded_early_stable_and_spread(self):
+        with mock.patch.object(imm, "ORDER_REFRESH_SECS", 1500), \
+                mock.patch.object(imm, "ORDER_REFRESH_JITTER_SECS", 300):
+            vals = [imm.order_refresh_secs(o) for o in self._ids()]
+            self.assertTrue(all(1200 <= v <= 1500 for v in vals))
+            self.assertGreater(max(vals) - min(vals), 250)      # it spreads
+            self.assertEqual(imm.order_refresh_secs("01a0f7000007-c0de"),
+                             imm.order_refresh_secs("01a0f7000007-c0de"))
+
+    def test_off_capped_and_idless(self):
+        with mock.patch.object(imm, "ORDER_REFRESH_SECS", 1500):
+            with mock.patch.object(imm, "ORDER_REFRESH_JITTER_SECS", 0):
+                self.assertEqual(imm.order_refresh_secs("x"), 1500)
+            with mock.patch.object(imm, "ORDER_REFRESH_JITTER_SECS", 99999):
+                vals = [imm.order_refresh_secs(o) for o in self._ids()]
+                self.assertGreaterEqual(min(vals), 750)          # half, at most
+            with mock.patch.object(imm, "ORDER_REFRESH_JITTER_SECS", 300):
+                self.assertEqual(imm.order_refresh_secs(""), 1500)
+
+    def test_the_diff_renews_each_order_on_its_own_clock(self):
+        with mock.patch.object(imm, "ORDER_REFRESH_SECS", 1500), \
+                mock.patch.object(imm, "ORDER_REFRESH_JITTER_SECS", 300):
+            ids = self._ids()
+            early = next(o for o in ids if imm.order_refresh_secs(o) < 1300)
+            late = next(o for o in ids if imm.order_refresh_secs(o) > 1300)
+            now = 10_000.0
+            resting = [{"order_id": oid, "ticker": tk, "book_side": "bid",
+                        "yes_price": 40, "remaining_count": 20,
+                        "status": "resting"}
+                       for oid, tk in ((early, "T"), (late, "U"))]
+            ages = {early: now - 1300, late: now - 1300}
+            desired = [Quote("T", "bid", 40, 20), Quote("U", "bid", 40, 20)]
+            to_place, to_cancel, _am = diff_orders(desired, resting, ages, now)
+            self.assertEqual(to_cancel, [early])      # due on its own clock
+            self.assertEqual([q.ticker for q in to_place], ["T"])
+            # past the full refresh, both are due -- never later than 1500
+            _p, to_cancel, _a = diff_orders(desired, resting, ages, now + 201)
+            self.assertEqual(sorted(to_cancel), sorted([early, late]))
+
+
+class TestRestartRequest(unittest.TestCase):
+    """Jack 2026-10-01 ("both"): restart_imm.ps1 -Task hard-killed the bot, so
+    the relaunch cancelled 1,391 orders and rebuilt the book for ~18 min. The
+    script now asks for the code-change handoff instead."""
+
+    OK = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        _clean_persist()
+        for p in (imm.restart_handoff_path(), imm.restart_request_path()):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    tearDown = setUp
+
+    def _request(self, ts, raw=None):
+        with open(imm.restart_request_path(), "w", encoding="utf-8") as f:
+            f.write(raw if raw is not None
+                    else json.dumps({"ts": ts, "by": "restart_imm.ps1"}))
+
+    def _bot(self, live=True):
+        now = datetime.now(timezone.utc)
+        order = {"order_id": "o0", "ticker": self.OK, "status": "resting",
+                 "client_order_id": "imm-abc-o0", "book_side": "bid",
+                 "yes_price": 40, "remaining_count": 20,
+                 "created_time": (now - timedelta(minutes=10)).strftime(
+                     "%Y-%m-%dT%H:%M:%SZ")}
+        bot = IncentiveMarketMaker(client=_HandoffClient([order]), live=live)
+        bot.state.selected[self.OK] = MarketMeta(
+            ticker=self.OK, event_ticker="KXGOOD-99DEC31", series="KXGOOD",
+            dollars_per_day=10.0, program_end=now + timedelta(days=3),
+            target_size=1000.0, discount_factor=0.5,
+            cutoff=now + timedelta(days=2), close_time=now + timedelta(days=4))
+        return bot
+
+    def test_nothing_to_act_on(self):
+        self.assertIsNone(imm.restart_request_pending(0.0))
+
+    def test_a_fresh_request_binds_a_running_process(self):
+        now = time.time()
+        self._request(now)
+        req = imm.restart_request_pending(now - 3600, now_ts=now + 5)
+        self.assertEqual(req["by"], "restart_imm.ps1")
+        self.assertTrue(os.path.exists(imm.restart_request_path()))
+
+    def test_powershell_bom_is_readable(self):
+        now = time.time()
+        self._request(None, raw='\ufeff{"ts": %.3f, "by": "restart_imm.ps1"}' % now)
+        self.assertIsNotNone(imm.restart_request_pending(now - 60, now_ts=now))
+
+    def test_stale_pre_start_or_unreadable_requests_are_dropped(self):
+        now = time.time()
+        for ts, raw, started in ((now - 100, None, now - 10),        # pre-start
+                                 (now - imm.RESTART_REQUEST_MAX_AGE_SECS - 5,
+                                  None, now - 99999),                 # expired
+                                 (None, "{not json", 0.0),            # unreadable
+                                 (None, '{"by": "x"}', 0.0)):         # no ts
+            self._request(ts, raw=raw)
+            self.assertIsNone(imm.restart_request_pending(started, now_ts=now))
+            self.assertFalse(os.path.exists(imm.restart_request_path()))
+
+    def test_live_bot_hands_over_and_exits(self):
+        bot = self._bot()
+        self._request(time.time())
+        with mock.patch.object(imm, "_PROCESS_START_TS", time.time() - 3600), \
+                mock.patch.object(bot, "_restart_preflight", return_value=(True, "ok")):
+            self.assertTrue(bot._restart_requested())
+        self.assertFalse(os.path.exists(imm.restart_request_path()))   # consumed
+        with open(imm.restart_handoff_path(), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["order_ids"], ["o0"])
+        bot.shutdown_cancel()
+        self.assertFalse(getattr(bot.client, "cancelled", []))         # kept
+
+    def test_a_handoff_that_cannot_arm_still_exits_and_cancels(self):
+        bot = self._bot()
+        self._request(time.time())
+        with mock.patch.object(imm, "_PROCESS_START_TS", time.time() - 3600), \
+                mock.patch.object(bot, "_restart_preflight",
+                                  return_value=(False, "exit 1: SyntaxError")):
+            self.assertTrue(bot._restart_requested())
+        self.assertFalse(os.path.exists(imm.restart_handoff_path()))
+        bot.shutdown_cancel()
+        self.assertEqual(bot.client.cancelled, ["o0"])
+
+    def test_no_request_or_a_dry_bot_carries_on(self):
+        with mock.patch.object(imm, "_PROCESS_START_TS", time.time() - 3600):
+            self.assertFalse(self._bot()._restart_requested())
+            self._request(time.time())
+            self.assertFalse(self._bot(live=False)._restart_requested())
+        self.assertTrue(os.path.exists(imm.restart_request_path()))    # untouched
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -28,7 +29,9 @@ def _status(age_min: float = 0.1) -> str:
     return json.dumps({"updated_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ")})
 
 
-class ProbeReadRetry(unittest.TestCase):
+class _ProbeFixture(unittest.TestCase):
+    """A healthy status file, process and task; no tests of its own."""
+
     def setUp(self):
         fd, self.path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
@@ -48,7 +51,18 @@ class ProbeReadRetry(unittest.TestCase):
         r.start()
         self.addCleanup(r.stop)
         self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+        # the planned-restart files live next to the LIVE status: point them
+        # at paths that do not exist, or a real restart on the trading box
+        # would excuse the DOWN cases below
+        d = tempfile.mkdtemp(prefix="imm_health_")
+        for name, fn in (("RESTART_REQUEST_PATH", "restart_handoff_request.json"),
+                         ("RESTART_HANDOFF_PATH", "restart_handoff.json")):
+            pr = mock.patch.object(ha, name, os.path.join(d, fn))
+            pr.start()
+            self.addCleanup(pr.stop)
 
+
+class ProbeReadRetry(_ProbeFixture):
     def _open_failing(self, n_failures, exc=PermissionError):
         """Real open(), but the first n_failures calls on STATUS_PATH raise --
         exactly what an os.replace() collision looks like to a reader."""
@@ -122,6 +136,57 @@ class ProbeReadRetry(unittest.TestCase):
             ok, headline, _ = ha.probe()
         self.assertFalse(ok)
         self.assertEqual(headline, "PROCESS GONE")
+
+
+class ProbeRestartWindow(_ProbeFixture):
+    """2026-10-01: restart_imm.ps1 -Task now stops the launcher (task Ready)
+    and waits up to a cycle for the bot to hand its book over; the relaunch
+    then needs ~1-2 min. A fresh request or handoff file explains that window
+    -- a planned restart must not page DOWN then UP -- but only for a bounded
+    time, and never a stale heartbeat on a live process."""
+
+    def _touch(self, attr, age_secs):
+        path = getattr(ha, attr)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{}")
+        t = time.time() - age_secs
+        os.utime(path, (t, t))
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+
+    def _ps_as(self, pid, state):
+        return mock.patch.object(ha, "_ps", side_effect=lambda c: pid
+                                 if "Win32_Process" in c else state)
+
+    def test_handoff_wait_reads_as_restarting(self):
+        self._touch("RESTART_REQUEST_PATH", 30)
+        with self._ps_as("10972", "Ready"):
+            ok, headline, detail = ha.probe()
+        self.assertTrue(ok)
+        self.assertEqual(headline, "restarting")
+        self.assertIn("planned restart", detail)
+
+    def test_relaunch_gap_reads_as_restarting(self):
+        self._touch("RESTART_HANDOFF_PATH", 60)
+        with self._ps_as("", "Running"):
+            ok, headline, _ = ha.probe()
+        self.assertTrue(ok)
+        self.assertEqual(headline, "restarting")
+
+    def test_a_restart_that_never_finished_alerts(self):
+        self._touch("RESTART_REQUEST_PATH", ha.RESTARTING_MAX_SECS + 60)
+        self._touch("RESTART_HANDOFF_PATH", ha.RESTART_HANDOFF_MAX_AGE_SECS + 60)
+        with self._ps_as("", "Ready"):
+            ok, headline, _ = ha.probe()
+        self.assertFalse(ok)
+        self.assertEqual(headline, "PROCESS GONE")
+
+    def test_a_stale_heartbeat_is_never_excused(self):
+        self._touch("RESTART_REQUEST_PATH", 30)
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(_status(age_min=ha.STALE_MIN + 5))
+        ok, headline, _ = ha.probe()          # pid alive, task Running
+        self.assertFalse(ok)
+        self.assertIn("HEARTBEAT STALE", headline)
 
 
 if __name__ == "__main__":
