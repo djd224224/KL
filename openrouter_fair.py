@@ -182,20 +182,27 @@ def _month(tok: str) -> Optional[int]:
 
 def parse_window(text: str, year: int) -> Optional[Tuple[date, date]]:
     """The measured window named in a market's rules: 'measured August 31 -
-    September 27', 'for Sep 21-27, 2026' (en dash or hyphen) or 'Sep 28-Oct
-    4, 2026'. `year` is the year of the window's END (the close's year)."""
+    September 27', 'for Sep 21-27, 2026' (en dash or hyphen), 'Sep 28-Oct
+    4, 2026', or a bracketed range with no year, 'October 2026 (Sep 28-Oct
+    25)' -- the October month's wording (2026-09-30: the parser missed it,
+    so the event got no window and every KXTOKENUSEM strike stood aside
+    fail-closed). `year` is the year of the window's END (the close's year)."""
     t = (text or "").replace("\u2013", "-").replace("\u2014", "-")
     m = re.search(r"measured\s+([A-Za-z]+)\s+(\d{1,2})\s*-\s*([A-Za-z]+)\s+(\d{1,2})", t)
     if m:
         m1, d1, m2, d2 = _month(m.group(1)), int(m.group(2)), _month(m.group(3)), int(m.group(4))
     else:
         m = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2})\s*-\s*(?:([A-Za-z]{3,9})\s+)?(\d{1,2}),\s*(\d{4})", t)
-        if not m:
-            return None
+        if m:
+            year = int(m.group(5))
+        else:
+            m = re.search(r"\(\s*([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*-\s*"
+                          r"(?:([A-Za-z]{3,9})\.?\s+)?(\d{1,2})\s*\)", t)
+            if not m:
+                return None
         m1, d1 = _month(m.group(1)), int(m.group(2))
         m2 = _month(m.group(3)) if m.group(3) else m1
         d2 = int(m.group(4))
-        year = int(m.group(5))
     if not m1 or not m2:
         return None
     try:
@@ -219,9 +226,13 @@ def _ticker_date(event_ticker: str) -> Optional[date]:
         return None
 
 
-def windows_from_markets(markets: List[dict]) -> Dict[str, dict]:
-    """event ticker -> {"series", "start", "end"} from open markets."""
+def windows_from_markets(markets: List[dict],
+                         unparsed: Optional[List[str]] = None) -> Dict[str, dict]:
+    """event ticker -> {"series", "start", "end"} from open markets. An event
+    whose window does not parse is appended to `unparsed` when a list is
+    given, so the fair file can name it instead of dropping it silently."""
     out: Dict[str, dict] = {}
+    bad: List[str] = []
     for m in markets or []:
         ev = str(m.get("event_ticker") or "")
         if not ev or ev in out:
@@ -241,13 +252,18 @@ def windows_from_markets(markets: List[dict]) -> Dict[str, dict]:
         if w:
             out[ev] = {"series": series, "start": w[0].isoformat(),
                        "end": w[1].isoformat()}
+        elif ev not in bad:
+            bad.append(ev)
+    if unparsed is not None:
+        unparsed.extend(e for e in bad if e not in out and e not in unparsed)
     return out
 
 
 def fetch_windows(series: Tuple[str, ...] = OR_SERIES,
                   timeout: float = HTTP_TIMEOUT,
                   retries: int = 3, backoff: float = 3.0,
-                  get_json: Optional[Callable[[str, dict], dict]] = None
+                  get_json: Optional[Callable[[str, dict], dict]] = None,
+                  unparsed: Optional[List[str]] = None
                   ) -> Dict[str, dict]:
     """Event windows from Kalshi's markets endpoint: signed through
     `get_json` when given (see _signed_read), else -- or when that read
@@ -268,7 +284,7 @@ def fetch_windows(series: Tuple[str, ...] = OR_SERIES,
             r.raise_for_status()
             js = r.json() or {}
         markets += js.get("markets") or []
-    return windows_from_markets(markets)
+    return windows_from_markets(markets, unparsed)
 
 
 def weekday_factor(daily: Dict[date, float], d: date, asof: date,
@@ -347,9 +363,10 @@ def write_fair_file(path: str, daily: Optional[Dict[date, float]] = None,
             return 0, 0
         daily = fetch_daily(key, today - timedelta(days=HISTORY_DAYS), today)
     prev = _read_json(path)
+    unparsed: List[str] = []
     if windows is None:
         try:
-            windows = fetch_windows(get_json=get_json)
+            windows = fetch_windows(get_json=get_json, unparsed=unparsed)
         except Exception as e:
             # an event's window never changes: keep refreshing the totals on
             # the windows already known, and only new events wait for Kalshi
@@ -371,6 +388,8 @@ def write_fair_file(path: str, daily: Optional[Dict[date, float]] = None,
             continue
         entries[ev] = dict(f, series=w["series"], start=w["start"],
                            end=w["end"], fetched_at=now.isoformat())
+    # an open event whose window text did not parse has no read -- name it
+    missing += [ev for ev in unparsed if ev not in entries and ev not in missing]
     last_day = max(daily).isoformat() if daily else ""
     if last_day and last_day != prev.get("last_day"):
         vp = vintage_path or OR_VINTAGE_FILE

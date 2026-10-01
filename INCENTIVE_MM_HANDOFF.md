@@ -5267,3 +5267,28 @@ Tests: test_mortgage_fair (22): the 9/29 ladder -> 7.263, the bottom end,
 the inclusive 95c/5c edge, a crossing still wins, the X0 source note, the
 last-good-anchor test on a ladder past the edge. 1,568 green (unittest
 discover).
+
+### 2026-09-30 — KXTOKENUSEM: the October month's window parses (Jack: "allowlist KXTOKENUSEM and use the openrouter algorithm to quote it")
+
+KXTOKENUSEM was already allowlisted (_DEFAULT_AI_USAGE_SERIES), in
+OR_FAIR_SERIES and uncapped (4136824) -- but it had not quoted since the
+October event listed. KXTOKENUSEM-26OCT26 words its window "October 2026
+(Sep 28–Oct 25)": no "measured", no year inside the range. parse_window()
+knew only "measured August 31 - September 27" and "Sep 21–27, 2026", so the
+event got NO window, openrouter_fair.json carried only the weekly
+(KXTOKENUSE-26OCT05), and the six selected October strikes (T625-T800) stood
+aside "no OpenRouter read" -- silently: an unparsed event was not even
+listed as missing.
+
+Fix (openrouter_fair.py): a third pattern for a bracketed range without a
+year, "(Sep 28–Oct 25)", the year taken from the close (a Dec–Jan wrap
+works); windows_from_markets/fetch_windows take an optional `unparsed` list
+and write_fair_file puts those events in "missing", so the refresher's
+"or-fair refresh: N events with a read, M without one" shows any future
+wording change. Live dry run 10/01 02Z: KXTOKENUSEM-26OCT26 mu 807.3T sigma
+151.6T (3 of 28 days known, 73.2T; base 22.6T/day) -> fair 99% at T450 ...
+52% at T800, 39% at T850; the October books are 70-88c wide, so the 15c
+band gate passes the selected strikes. No incentive_mm change. Tests: the
+October wording (rules_primary and rules_secondary), a Dec–Jan wrap, a
+bracketed weekly, a single-date bracket rejected, the unparsed list, and an
+end-to-end write with one parsed and one unparsed monthly; 915 green.

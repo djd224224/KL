@@ -37,6 +37,27 @@ class TestWindows(unittest.TestCase):
         self.assertIsNone(orf.parse_window("observed at 10:00 AM ET on Sep 28, 2026", 2026))
         self.assertIsNone(orf.parse_window("", 2026))
 
+    def test_parse_the_october_month_wording(self):
+        # 2026-09-30: KXTOKENUSEM-26OCT26 says "October 2026 (Sep 28–Oct 25)"
+        # -- no "measured", no year inside the range -- and got no window, so
+        # every selected strike stood aside "no OpenRouter read"
+        self.assertEqual(
+            orf.parse_window("If the OpenRouter AI token usage for October 2026 "
+                             "(Sep 28–Oct 25) is above 850T tokens, then the "
+                             "market resolves to Yes.", 2026),
+            (date(2026, 9, 28), date(2026, 10, 25)))
+        self.assertEqual(
+            orf.parse_window("This event will resolve based on the value for the UTC "
+                             "calendar days from October 2026 (Sep 28–Oct 25), as "
+                             "observed at 10:00 AM ET on Oct 26, 2026.", 2026),
+            (date(2026, 9, 28), date(2026, 10, 25)))
+        self.assertEqual(                                         # a year wrap
+            orf.parse_window("usage for January 2027 (Dec 28–Jan 24) is above", 2027),
+            (date(2026, 12, 28), date(2027, 1, 24)))
+        self.assertEqual(orf.parse_window("week (Oct 5-11) total", 2026),
+                         (date(2026, 10, 5), date(2026, 10, 11)))
+        self.assertIsNone(orf.parse_window("as observed (Oct 26) at 10:00 AM ET", 2026))
+
     def test_windows_from_markets_with_weekly_fallback(self):
         mk = [
             {"event_ticker": "KXTOKENUSE-26SEP28", "close_time": "2026-09-28T03:59:00Z",
@@ -54,6 +75,10 @@ class TestWindows(unittest.TestCase):
                          ("2026-09-28", "2026-10-04"))           # ticker-date fallback
         self.assertEqual(w["KXTOKENUSEM-26SEP28"]["end"], "2026-09-27")
         self.assertNotIn("KXTOKENUSEM-26OCT26", w)               # no monthly fallback
+        unparsed = []
+        w = orf.windows_from_markets(mk, unparsed)
+        self.assertEqual(unparsed, ["KXTOKENUSEM-26OCT26"])      # named, not dropped
+        self.assertNotIn("KXTOKENUSE-26OCT05", unparsed)         # the fallback counts
 
 
 class TestModel(unittest.TestCase):
@@ -250,7 +275,32 @@ class TestSignedReads(unittest.TestCase):
                                 now=datetime(2026, 9, 27, 5, 0, tzinfo=timezone.utc),
                                 vintage_path=os.path.join(tmp, "v.jsonl"),
                                 get_json=reader)
-        fw.assert_called_once_with(get_json=reader)
+        fw.assert_called_once()
+        self.assertIs(fw.call_args.kwargs["get_json"], reader)
+
+    def test_october_month_gets_an_entry_and_an_unparsed_event_is_missing(self):
+        tmp = tempfile.mkdtemp(prefix="orf_month_")
+        month = [{"event_ticker": "KXTOKENUSEM-26OCT26", "close_time": "2026-10-26T03:59:00Z",
+                  "title": "Will OpenRouter AI token usage for October 2026 (Sep 28–Oct 25) "
+                           "be above 850T tokens?",
+                  "rules_primary": "If the OpenRouter AI token usage for October 2026 "
+                                   "(Sep 28–Oct 25) is above 850T tokens, then the market "
+                                   "resolves to Yes."},
+                 {"event_ticker": "KXTOKENUSEM-26NOV23", "close_time": "2026-11-23T04:59:00Z",
+                  "rules_primary": "no dates here"}]
+        reader = lambda path, params: {"markets": month if params["series_ticker"] == "KXTOKENUSEM" else []}
+        ok, miss = orf.write_fair_file(os.path.join(tmp, "f.json"),
+                                       daily=flat_daily(date(2026, 9, 30), 40),
+                                       now=datetime(2026, 10, 1, 2, 0, tzinfo=timezone.utc),
+                                       vintage_path=os.path.join(tmp, "v.jsonl"),
+                                       get_json=reader)
+        self.assertEqual((ok, miss), (1, 1))
+        with open(os.path.join(tmp, "f.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        e = d["entries"]["KXTOKENUSEM-26OCT26"]
+        self.assertEqual((e["start"], e["end"], e["known"], e["days"]),
+                         ("2026-09-28", "2026-10-25", 3, 28))
+        self.assertEqual(d["missing"], ["KXTOKENUSEM-26NOV23"])
 
 
 if __name__ == "__main__":
