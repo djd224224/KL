@@ -10929,6 +10929,38 @@ class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
             self.assertGreaterEqual(imm.series_min_est_total(s),
                                     imm.PAYOUT_FLOOR_DOLLARS, s)
 
+    def test_every_treasury_family_is_allowlisted(self):
+        """Jack 2026-09-30: 'KXUST10YRRATE27 / KXUST30YRRATE27 and all
+        treasury families should be on the treasury allowlist'. Same guards
+        as the ten, minus the horizon-blind $2/day rate bar; the 15-minute
+        tenors and the test series stay out."""
+        extra = imm._DEFAULT_RATES_EXTRA_SERIES.split(",")
+        for s in ("KXUST10YRRATE27", "KXUST30YRRATE27", "KXUST10AW", "KXNOTE10W",
+                  "KXTNOTED", "KX10YRDIRHM", "KX10Y2Y", "KXYINVERT", "KX3MTBILL"):
+            self.assertIn(s, extra, s)
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.series_safe_join(s), s)
+            self.assertEqual(imm.series_min_est_rate(s), 0.0, s)
+            self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, imm.RATES_SIZE_MULT, s)
+            self.assertGreaterEqual(imm.series_min_est_total(s),
+                                    imm.PAYOUT_FLOOR_DOLLARS, s)
+        self.assertTrue(imm.IncentiveMarketMaker._allowed("KXUST10YRRATE27-27DEC31-T4.24"))
+        self.assertTrue(imm.IncentiveMarketMaker._allowed("KXUST30YRRATE27-27DEC31-T4.24"))
+        self.assertEqual(imm.scan_universe_reason("KXUST10YRRATE27-27DEC31-T4.24"), "allowed")
+        for s in ("KX10YRRATE15M", "KX2YRRATE15M", "KX5YRRATE15M", "KX30YRRATE15M",
+                  "KX2YTEST", "KXSECTREASURY", "KXUSTHOLDERS"):
+            self.assertNotIn(s, extra, s)
+            self.assertNotIn(s, imm.ALLOW_SERIES, s)
+        self.assertTrue(set(extra).isdisjoint(self.TENORS))
+        for s in self.TENORS:                                    # the ten unchanged
+            self.assertEqual(imm.series_min_est_rate(s), 2.0, s)
+
+    def test_year_end_cutoff_is_the_print_day_morning(self):
+        self.assertEqual(
+            self._cutoff("KXUST10YRRATE27", "KXUST10YRRATE27-27DEC31",
+                         close=imm.ET.localize(datetime(2027, 12, 31, 15, 30))),
+            "2027-12-31 07:30")
+
     def test_monthlies_enrolled_too(self):
         """Jack 2026-08-04, second pass: 'also allowlist the treasury
         monthlies like KXUST2AM'. Same contract, ~4 weeks out."""
@@ -10966,14 +10998,18 @@ class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
                              [(t, max(1, int(z * 1.5 + 0.5))) for t, z in base], s)
             self.assertTrue(imm.series_safe_join(s), s)
             self.assertEqual(ov.event_day_cutoff_et, (7, 30), s)
-        # nothing outside the enrolled tenors rides the prefix
-        for s in ("KXUST2AW", "KXUSTFOO"):
+        # nothing outside the enrolled Treasury families rides the prefix
+        # (the weeklies joined 2026-09-30 by name; the 15-minute tenors and
+        # the test series stay out)
+        for s in ("KXUSTFOO", "KX10YRRATE15M", "KX2YTEST"):
             self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+        self.assertEqual(imm.applied_mention_mult("KXUST2AW"), 1.5)
 
     def test_no_prefix_bleed_onto_unenrolled_ust_shapes(self):
-        # exact-series matching: a hypothetical weekly must not ride in on the
-        # KXUST prefix just because the dailies and monthlies are enrolled
-        for s in ("KXUST2AW", "KXUST3AD", "KXUSTFOO"):
+        # exact-series matching: an unenrolled shape must not ride in on the
+        # KXUST prefix just because other Treasury families are enrolled (the
+        # real weeklies were enrolled BY NAME on 2026-09-30)
+        for s in ("KXUST3AD", "KXUSTFOO", "KX10YRRATE15M", "KX2YTEST"):
             self.assertNotIn(s, imm.ALLOW_SERIES, s)
             self.assertFalse(
                 imm.IncentiveMarketMaker._allowed(f"{s}-26AUG31-T4.25"), s)

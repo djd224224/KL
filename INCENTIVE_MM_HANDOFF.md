@@ -5536,3 +5536,46 @@ writer finals/preds/lag/leaderboard caching, signed event reads, fail-closed
 chart read). TestNoLivePathUnderTest fails the suite if any incentive_mm
 path still points at the live status dir under test (the first cut missed
 SHARE_FAIR_FILE and a full-suite run left the share fixture there).
+
+## 2026-09-30 — Every Treasury yield family on the Treasury allowlist (Jack)
+
+Jack: "KXUST10YRRATE27 / KXUST30YRRATE27 and all treasury families should be
+on the treasury allowlist."
+
+WHY. The allowlist was exactly ten names (KXUST{2,5,7,10,30}A{D,M}). The 2027
+year-end pair (KXUST10YRRATE27 / KXUST30YRRATE27, Dec 31 2027, $1,500 per
+period over 25 strikes each = $18/day per strike, 3.3-day periods) reached
+the bot only as OPEN-SCAN candidates: ~28-33k contracts already rest on each
+book and most strikes are one-sided for us, so the estimate was $0.03-0.32
+per strike per day -> $0.17-0.98 per period, under the scan's $1.50 bar
+(two 4.24% strikes at $1.71 sat in admit_pending).
+
+WHAT. _DEFAULT_RATES_EXTRA_SERIES (enumerated from the full 14,518-series
+catalog: every series whose contract is a US Treasury yield, yield move or
+curve spread): the KXUST weeklies (A W) and older KXUST names (A, 2/5/10/30,
+*M, M), the 2027 year-end pair and KXUST10Y27, KXNOTE10/10M/10W/10Y/30/30W,
+KXTNOTE/D/W and TNOTE/D/W, the how-high/how-low tenors (KX{2,5,7,10,30}YRDIR*),
+KXTREASURYMAX/5, KX30YUSTW, KXUSTYLD, KX3MTBILL, TBILL, KX2YFOMC, and the
+10Y-2Y / 10Y-3M spreads and inversion (KX10Y2Y, KX10Y2YDATE, KX10Y3M, 10Y2Y,
+10Y3M, KXYINVERT, YINVERT). Joined into IMM_ALLOW_RATES_SERIES's default, and
+SERIES_OVERRIDES gives them the ten's guards -- safe-join, the 07:30 ET
+event-day cutoff, the x1.5 family size -- with the $2/day re-entry rate bar
+OFF (IMM_RATES_EXTRA_MIN_RATE, default 0): a per-day bar is horizon-blind and
+on an $18/day pool it is exactly what kept them dark; the $1-per-period
+payout floor still decides entry. The ten keep their $2/day bar.
+
+LEFT OUT: the 15-minute tenors (KX{2,5,10,30}YRRATE15M -- settle every
+quarter hour on a live yield, the hourly-temp shape blocked 9/17), the
+KX2YTEST test series, and the non-yield "Treasury" series (Secretary
+nominations, sanctions, the coin, debt, TIC holdings, corn "yield").
+
+LIVE PROGRAMS 9/30: only KXUST10AD (today's daily) and the 2027 year-end
+pair among all of these; the rest are enrolled for when programs list. At
+the x1.5 size the year-end estimates scale ~x1.5, so roughly the two-sided
+strikes near the money (e.g. 10Y T3.24/T4.24, 30Y T4.24/T6.74-T7.24) clear
+$1 per period; the one-sided ones ($0.17 -> ~$0.25) still do not.
+
+Tests: test_every_treasury_family_is_allowlisted,
+test_year_end_cutoff_is_the_print_day_morning; the two prefix-bleed tests now
+use the 15-minute / test / hypothetical shapes (the weeklies are enrolled by
+name). 1,160 green across the IMM suites.

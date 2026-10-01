@@ -3556,6 +3556,38 @@ _SHARE_LIVE = os.environ.get("IMM_SHARE_FAIR_ENABLE", "1") == "1"
 # weeks, so the per-market cap is what bounds them, not the clock.
 _DEFAULT_RATES_SERIES = ("KXUST2AD,KXUST5AD,KXUST7AD,KXUST10AD,KXUST30AD,"
                          "KXUST2AM,KXUST5AM,KXUST7AM,KXUST10AM,KXUST30AM")
+# EVERY OTHER TREASURY YIELD FAMILY (Jack 2026-09-30: "KXUST10YRRATE27 /
+# KXUST30YRRATE27 and all treasury families should be on the treasury
+# allowlist"). The 2027 year-end pair was reaching the bot only through the
+# open-scan tier (est $0.03-0.32/day per strike on $18/day pools against
+# ~30k-contract books, under the scan's $1.50 bar). Enumerated 2026-09-30
+# from the full 14,518-series catalog: every series whose contract is a US
+# Treasury YIELD, yield move or curve spread -- the KXUST weeklies and older
+# KXUST names, the 2027 year-end pair, KXNOTE*/KXTNOTE*/TNOTE*, the
+# how-high/how-low monthly and weekly tenors (KX*YRDIR*), the year max,
+# the 3-month bill, the 2Y FOMC-day move, and the 10Y-2Y / 10Y-3M spreads
+# and inversion. Left OUT on purpose: the 15-minute tenors (KX*YRRATE15M --
+# they settle every quarter hour on a live yield, the hourly-temp shape that
+# was blocked 9/17) and the KX2YTEST test series; the non-yield "Treasury"
+# series (Secretary nominations, sanctions, the coin, debt, TIC holdings)
+# are not rates markets. On 9/30 only KXUST10YRRATE27 / KXUST30YRRATE27 carry
+# live programs among these; the rest are enrolled for when they do.
+# Same guard set as the ten (safe-join, the 07:30 ET event-day cutoff, the
+# x1.5 family size) EXCEPT the $2/day re-entry rate bar: it is horizon-
+# blind, and on a long window with an $18/day pool it is the whole reason
+# nothing quoted -- the $1-per-period payout floor still decides entry
+# (IMM_RATES_EXTRA_MIN_RATE restores a bar).
+_DEFAULT_RATES_EXTRA_SERIES = (
+    "KXUST2AW,KXUST5AW,KXUST7AW,KXUST10AW,KXUST30AW,"
+    "KXUST2A,KXUST5A,KXUST7A,KXUST10A,KXUST30A,"
+    "KXUST10YRRATE27,KXUST30YRRATE27,KXUST10Y27,"
+    "KXUST2,KXUST5,KXUST10,KXUST30,KXUST5M,KXUST10M,KXUST30M,KXUSTM,"
+    "KXNOTE10,KXNOTE10M,KXNOTE10W,KXNOTE10Y,KXNOTE30,KXNOTE30W,"
+    "KXTNOTE,KXTNOTED,KXTNOTEW,TNOTE,TNOTED,TNOTEW,"
+    "KX2YRDIRHM,KX2YRDIRLM,KX5YRDIRHM,KX5YRDIRLM,KX7YRDIRHM,KX7YRDIRLM,"
+    "KX10YRDIRHM,KX10YRDIRHW,KX10YRDIRLM,KX10YRDIRLW,KX30YRDIRHM,KX30YRDIRLM,"
+    "KXTREASURYMAX,KXTREASURYMAX5,KX30YUSTW,KXUSTYLD,KX3MTBILL,TBILL,KX2YFOMC,"
+    "KX10Y2Y,KX10Y2YDATE,KX10Y3M,10Y2Y,10Y3M,KXYINVERT,YINVERT")
 # Finance/Economics quiet-print sweep (Jack 2026-09-02: "in Finance/Economics
 # sections that are unquoted in normal IMM bot, quote the top 10 markets
 # based on ROI (with no more than 3 on a single event). dont include any
@@ -3700,7 +3732,8 @@ ALLOW_SERIES = frozenset(
                 + os.environ.get("IMM_ALLOW_COMPANY_SERIES", _DEFAULT_COMPANY_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_ECON_SERIES", _DEFAULT_ECON_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_RATES_SERIES",
-                                       _DEFAULT_RATES_SERIES)
+                                       _DEFAULT_RATES_SERIES + ","
+                                       + _DEFAULT_RATES_EXTRA_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_ENTERTAINMENT_SERIES",
                                        _DEFAULT_ENTERTAINMENT_SERIES)
                 + "," + os.environ.get("IMM_ALLOW_WEATHER_SERIES",
@@ -5046,6 +5079,17 @@ for _s in os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES).split(","):
             # step with the re-entry block above, or a change there silently
             # misses the Treasuries (that happened on 2026-08-05).
             min_est_per_day=_env_float("IMM_REENTRY_MIN_RATE", 2.0),
+            safe_join=True,
+            event_day_cutoff_et=(
+                _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
+                _env_int("IMM_RATES_CUTOFF_MIN_ET", 30)),
+            size_mult=RATES_SIZE_MULT)
+# ...and every other Treasury yield family (Jack 2026-09-30, see
+# _DEFAULT_RATES_EXTRA_SERIES): the same guards with NO $2/day rate bar.
+for _s in os.environ.get("IMM_RATES_EXTRA_SERIES", _DEFAULT_RATES_EXTRA_SERIES).split(","):
+    if _s.strip():
+        SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            min_est_per_day=_env_float("IMM_RATES_EXTRA_MIN_RATE", 0.0),
             safe_join=True,
             event_day_cutoff_et=(
                 _env_int("IMM_RATES_CUTOFF_HOUR_ET", 7),
