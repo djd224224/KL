@@ -276,7 +276,8 @@ def _family_suffix() -> str:
 
 def _family_event_top_n() -> int:
     """The per-event ROI cut that actually binds the family, read from the
-    bot's own EVENT_TOP_N rather than restated here (it is "*CC:3" today)."""
+    bot's own EVENT_TOP_N rather than restated here (0 = uncapped, the
+    default since 2026-10-01; it was "*CC:3" before)."""
     return max((imm.event_top_n_for("KX" + suf)
                 for suf in (getattr(imm, "ALLOW_FAMILY_SUFFIXES", ()) or ())),
                default=0)
@@ -1085,9 +1086,13 @@ def build_report(now_utc):
          "spend, ad spend, point-of-sale, foot traffic, app downloads) "
          "— quoted by the normal book, reported here",
          f"{len(fam_rows)} event(s) / {len(fam_members)} markets; no tier "
-         f"slot cap — *{_family_suffix()} capped at "
-         f"{_family_event_top_n()} markets per event by ROI, foot traffic / "
-         f"app downloads uncapped, inside the global "
+         f"slot cap — "
+         + (f"*{_family_suffix()} capped at {_family_event_top_n()} markets "
+            f"per event by ROI, foot traffic / app downloads uncapped"
+            if _family_event_top_n() else
+            # 0 since 2026-10-01 (Jack: "remove the 3 max cap on carbon arc")
+            "no per-event cap")
+         + f", inside the global "
          f"{getattr(imm, 'MAX_MARKETS', 0)}-event ceiling",
          fam_rows),
     ]

@@ -5647,3 +5647,37 @@ Tests: test_every_treasury_family_is_allowlisted,
 test_year_end_cutoff_is_the_print_day_morning; the two prefix-bleed tests now
 use the 15-minute / test / hypothetical shapes (the weeklies are enrolled by
 name). 1,160 green across the IMM suites.
+
+## 2026-10-01 — Carbon Arc and Ramp AI Index: the 3-per-event cap removed (Jack)
+
+Jack: "remove the 3 max cap on carbon arc, ramp AI index".
+
+CHANGE (code defaults; the code sync + self-restart carry it, no launcher
+edit):
+- Carbon Arc families (*CC since 9/10, *ADS / *POS since 9/22): the
+  "*CC:3,*ADS:3,*POS:3" entries leave the EVENT_TOP_N default.
+  CA_FAMILY_EVENT_TOP_N (IMM_CA_FAMILY_EVENT_TOP_N, default 0) rebuilds them
+  at any N > 0. No explicitly allowlisted series ends in CC/ADS/POS, so the
+  suffix rules only ever capped Carbon Arc family members (suffix + source
+  verdict).
+- Ramp AI Index (13 series, 3/event since 9/12): RAMP_EVENT_TOP_N default
+  3 -> 0 (IMM_RAMP_EVENT_TOP_N=3 restores).
+- send_opportunistic_imm: the Carbon Arc line says "no per-event cap" when
+  the cap is 0 instead of "capped at 0".
+Every other cap is unchanged (gas, diesel, TrueV, Oscars, award shows,
+KXART, OpenRouter share, data center counts, finecon, the scan tier).
+
+SIZE OF IT. The 10/01 selection log had 180 Carbon Arc strikes selected and
+258 more cut by event_top_n across ~60 events (Ramp: 3 selected, 3 cut);
+those 261 become eligible, still subject to the payout floor, the admission
+clock and the $100k budget (~$26k of ladder collateral in use).
+
+WATCH: the Carbon Arc adverse-selection read of 9/24 (fills mark out -4 to
+-7c/ct, buying YES the toxic side) now applies to roughly twice as many
+strikes; the late-month rules and the CA fair gate (dormant until the
+October cycle reads) are the protections, as before.
+
+Tests: the Ramp class (no cap by default, knob in the config hash), the
+event-cap test (Carbon Arc suffixes uncapped by default; the suffix rule,
+the not-a-substring rule and the 9 -> 3 ROI cut pinned under the restored
+spec), the CC-family membership test (no cap); 1699 green.

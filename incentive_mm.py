@@ -967,7 +967,10 @@ RAMP_AI_SERIES: Tuple[str, ...] = tuple(
                                       _DEFAULT_RAMP_AI_SERIES).split(",")
     if s.strip())
 RAMP_RELEASE_GUARD_DAY = _env_int("IMM_RAMP_RELEASE_GUARD_DAY", 6)
-RAMP_EVENT_TOP_N = _env_int("IMM_RAMP_EVENT_TOP_N", 3)
+# 3 -> 0 (Jack 2026-10-01: "remove the 3 max cap on carbon arc, ramp AI
+# index"): every strike of a Ramp event may quote; IMM_RAMP_EVENT_TOP_N=3
+# puts the per-event cap back.
+RAMP_EVENT_TOP_N = _env_int("IMM_RAMP_EVENT_TOP_N", 0)
 for _s in RAMP_AI_SERIES:
     SERIES_OVERRIDES[_s] = SeriesOverride(
         safe_join=True, release_guard_day=RAMP_RELEASE_GUARD_DAY)
@@ -1911,8 +1914,16 @@ def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
 # Carbon Arc print -- the *CC shape, so the same 3-highest-ROI rule.
 # Ramp AI Index family (Jack 2026-09-12 "top 3 markets per event"): every
 # strike of an event settles on the ONE monthly print -- the gas/CC shape.
-# Exact series names rather than a KXAI prefix, so nothing else rides in;
-# IMM_RAMP_EVENT_TOP_N=0 lifts the family cap without restating the spec.
+# Exact series names rather than a KXAI prefix, so nothing else rides in.
+# BOTH CAPS REMOVED 2026-10-01 (Jack: "remove the 3 max cap on carbon arc,
+# ramp AI index"): every strike of a Carbon Arc (*CC / *ADS / *POS) or Ramp
+# event may quote, inside the global event ceiling and collateral budget.
+# The knobs put them back without restating the spec:
+# IMM_CA_FAMILY_EVENT_TOP_N=3 and IMM_RAMP_EVENT_TOP_N=3.
+CA_FAMILY_EVENT_TOP_N = _env_int("IMM_CA_FAMILY_EVENT_TOP_N", 0)
+_CA_FAMILY_EVENT_TOP_N_SPEC = (
+    "," + ",".join(f"*{_suf}:{CA_FAMILY_EVENT_TOP_N}" for _suf in ("CC", "ADS", "POS"))
+    if CA_FAMILY_EVENT_TOP_N > 0 else "")
 _RAMP_EVENT_TOP_N_SPEC = (
     "," + ",".join(f"{_s}:{RAMP_EVENT_TOP_N}" for _s in RAMP_AI_SERIES)
     if RAMP_EVENT_TOP_N > 0 and RAMP_AI_SERIES else "")
@@ -1941,8 +1952,11 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 # over the KXDIESEL prefix
                                                 # (0 = no cap)
                                                 "=KXDIESELMONAK:0,"
-                                                "KXTRUEV:3,*CC:3,"
-                                                "*ADS:3,*POS:3,"
+                                                "KXTRUEV:3,"
+                                                # Carbon Arc *CC / *ADS /
+                                                # *POS: uncapped since
+                                                # 2026-10-01 (the
+                                                # _CA_FAMILY spec below)
                                                 # data center counts
                                                 # (2026-10-01, "max 3
                                                 # markets per event")
@@ -1965,6 +1979,7 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 # prefixes KXTOKENUSEM /
                                                 # KXTOKENUSED), 0 = no cap
                                                 "=KXTOKENUSE:0,=KXTOKENUSEM:0"
+                                                + _CA_FAMILY_EVENT_TOP_N_SPEC
                                                 + _RAMP_EVENT_TOP_N_SPEC
                                                 + _SHARE_EVENT_TOP_N_SPEC))
 # Members hold their slots against challengers (see the note above). 0 =
@@ -5955,6 +5970,8 @@ _CONFIG_CODE_KNOBS = (
     "SHARE_FAIR_ENABLE", "SHARE_FAIR_TOL_CENTS", "SHARE_FAIR_TTL_MIN",
     "SHARE_FAIR_SIGMA_LO_FRAC", "SHARE_FAIR_REFRESH_HOLD_MIN",
     "SHARE_CUTOFF_FROM_CLOSE_MIN", "SHARE_EVENT_TOP_N",
+    # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
+    "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
     # fair file's "model" block (gasbuddy_fair.py)
     "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",

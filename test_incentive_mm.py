@@ -2140,13 +2140,18 @@ class TestRampAIIndexAllowlist(unittest.TestCase):
             imm._SCAN_PRIOR_OVERRIDES.pop(s, None)
             imm.SERIES_OVERRIDES[s] = before
 
-    def test_top_three_per_event(self):
+    def test_no_per_event_cap_since_oct_1(self):
+        # 9/12 "top 3 markets per event", lifted 10/01 (Jack: "remove the 3
+        # max cap on carbon arc, ramp AI index"); the knob puts it back
+        self.assertEqual(imm.RAMP_EVENT_TOP_N, 0)
+        self.assertEqual(imm._RAMP_EVENT_TOP_N_SPEC, "")
+        self.assertIn("RAMP_EVENT_TOP_N", imm._CONFIG_CODE_KNOBS)
         for s in self.SERIES:
-            self.assertEqual(imm.event_top_n_for(s), 3, s)
+            self.assertEqual(imm.event_top_n_for(s), 0, s)
         self.assertEqual(imm.event_top_n_for("KXGOOD"), 0)
-        # the pre-existing caps are untouched by the appended spec
+        # the other caps are untouched
         self.assertEqual(imm.event_top_n_for("KXAAAGASD"), 3)
-        self.assertEqual(imm.event_top_n_for("KXAMZNCC"), 3)
+        self.assertEqual(imm.event_top_n_for("KXANTHSHARE"), 3)
 
     def test_data_month_parses_from_title_then_rules(self):
         self.assertEqual(imm.market_data_month(self.SEP), (2026, 9))
@@ -4197,20 +4202,32 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                          (("KXAAAGAS", 3), ("*CC", 3)))
         with self.assertRaises(ValueError):
             imm._parse_event_top_n("*:3")
+        # the Carbon Arc suffix caps were LIFTED 2026-10-01 (Jack: "remove
+        # the 3 max cap on carbon arc, ramp AI index"): every strike of a
+        # *CC / *ADS / *POS event may quote by default
+        self.assertEqual(imm.CA_FAMILY_EVENT_TOP_N, 0)
+        self.assertEqual(imm._CA_FAMILY_EVENT_TOP_N_SPEC, "")
+        self.assertIn("CA_FAMILY_EVENT_TOP_N", imm._CONFIG_CODE_KNOBS)
         for s in ("KXURBNCC", "KXAMZNCC", "KXCOSTCC", "KXDGCC",
-                  "KXNEVERSEENCC"):
-            self.assertEqual(imm.event_top_n_for(s), 3, s)
-        # a series that merely CONTAINS 'CC' is not the family
-        for s in ("KXCCL", "KXCCMONTHLY", "KXSBUX"):
+                  "KXNEVERSEENCC", "KXCASINOADS", "KXDRPEPPERPOS"):
             self.assertEqual(imm.event_top_n_for(s), 0, s)
-        # and the cut itself works on a CC event: 9 strikes -> 3 by ROI
         cc = [m(f"KXURBNCC-26OCT07-T{90 + 3 * i}", float(9 - i))
               for i in range(9)]
-        cut = imm.event_top_n_cut(cc, incumbent=set())
-        self.assertEqual(len(cut), 6)
-        self.assertEqual({t for t in {x.ticker for x in cc} - cut},
-                         {"KXURBNCC-26OCT07-T90", "KXURBNCC-26OCT07-T93",
-                          "KXURBNCC-26OCT07-T96"})
+        self.assertEqual(imm.event_top_n_cut(cc, incumbent=set()), set())
+        # ...and IMM_CA_FAMILY_EVENT_TOP_N=3 restores the suffix rule: a
+        # series ENDING in CC is capped, one merely CONTAINING it is not,
+        # and the cut works on a CC event: 9 strikes -> 3 by ROI
+        with mock.patch.object(imm, "EVENT_TOP_N",
+                               imm._parse_event_top_n("*CC:3,*ADS:3,*POS:3")):
+            for s in ("KXURBNCC", "KXAMZNCC", "KXCASINOADS", "KXDRPEPPERPOS"):
+                self.assertEqual(imm.event_top_n_for(s), 3, s)
+            for s in ("KXCCL", "KXCCMONTHLY", "KXSBUX"):
+                self.assertEqual(imm.event_top_n_for(s), 0, s)
+            cut = imm.event_top_n_cut(cc, incumbent=set())
+            self.assertEqual(len(cut), 6)
+            self.assertEqual({t for t in {x.ticker for x in cc} - cut},
+                             {"KXURBNCC-26OCT07-T90", "KXURBNCC-26OCT07-T93",
+                              "KXURBNCC-26OCT07-T96"})
 
     def test_event_top_n_members_hold_their_slots(self):
         # Jack 2026-09-06 "the quoted markets are moving around, it should
@@ -4802,8 +4819,9 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                 # ...and it is NOT walked/capped as finecon
                 self.assertNotIn(s, imm.FINECON_SERIES, s)
                 self.assertNotIn(s, imm._FINECON_BASE, s)
-                # ...and it carries the 3-per-event ROI cap
-                self.assertEqual(imm.event_top_n_for(s), 3, s)
+                # ...and since 2026-10-01 no per-event cap (Jack: "remove
+                # the 3 max cap on carbon arc"; it carried *SUF:3 before)
+                self.assertEqual(imm.event_top_n_for(s), 0, s)
             # a suffix match that is NOT Carbon Arc (the 2026-09-22 catalog
             # sweep: KXAMAZONADS is a PACER-settled lawsuit binary, KXINXPOS
             # a Trading View-settled live index, KXFCC the next commissioner)
