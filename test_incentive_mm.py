@@ -9233,7 +9233,7 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
     market share markets", then "i got permission"). Fails CLOSED like the
-    token gate, and also stands aside while OpenRouter's daily update is due.
+    token gate, and also stands aside while an OpenRouter feed has stalled.
     Fixture event KXANTHSHARE-68DEC04 (far from any cutoff), strike 2.7 --
     YES from a published 2.8, i.e. a share >= 2.75."""
 
@@ -9260,7 +9260,7 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
         with open(imm.SHARE_FAIR_FILE, "w", encoding="utf-8") as f:
             json.dump({"entries": {self.EV: {
                 "mu": mu, "sigma": sigma, "p_ident": p_ident, "complete": complete,
-                "lag": lag, "lag_reason": "leaderboard still on 2068-12-01" if lag else "",
+                "lag": lag, "lag_reason": "the chart last moved 12-01 02:15Z, 225m ago" if lag else "",
                 "data_version": version, "fetched_at": fetched}}}, f)
         os.utime(imm.SHARE_FAIR_FILE, (time.time(), time.time() + self._bump))
         TestOpenRouterShareFairGate._bump += 1
@@ -9299,11 +9299,18 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
             self.assertIn(s, imm.ALLOW_SERIES, s)
             self.assertTrue(imm.share_fair_series(s), s)
             self.assertEqual(imm.SERIES_OVERRIDES[s].cutoff_from_close_min, 840, s)
-            self.assertEqual(imm.event_top_n_for(s), 0, s)       # every strike
+            # Jack 2026-10-01: "set max 3 markets per event", by exact name
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+            self.assertIn((f"={s}", 3), imm.EVENT_TOP_N)
             self.assertTrue(imm.IncentiveMarketMaker._allowed(f"{s}-26OCT05-3.1"), s)
             self.assertFalse(imm.IncentiveMarketMaker._blocked(f"{s}-26OCT05-3.1"), s)
-        # the Vercel open-weights series is a different feed and gate
+        # the Vercel open-weights series is a different feed and gate, and
+        # KXOPENSHARE's cap is not a prefix of it
         self.assertFalse(imm.share_fair_series("KXOPENSOURCESHARE"))
+        self.assertEqual(imm.event_top_n_for("KXOPENSOURCESHARE"), 0)
+        self.assertIn("SHARE_EVENT_TOP_N", imm._CONFIG_CODE_KNOBS)
+        self.assertIn("share_fair", imm.STICKY_DEATH_REASONS)
+        self.assertIn("share_no_read", imm.STICKY_DEATH_REASONS)
         # close 14:00Z Monday (10:00 ET) -> cutoff 00:00Z, the week's end
         close = datetime(2026, 10, 5, 14, 0, tzinfo=timezone.utc)
         self.assertEqual(close - timedelta(minutes=imm.SHARE_CUTOFF_FROM_CLOSE_MIN),
@@ -9333,10 +9340,10 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
                          "no_read")                              # no strike segment
         self.assertEqual(imm.share_gate_reason(
             self.T, time.time() + imm.SHARE_FAIR_TTL_MIN * 60 + 5, 49, 51)[1]["reason"], "stale")
-        self._write(lag=True)                                     # the daily update is due
+        self._write(lag=True)                                     # the chart stalled
         why, inp = imm.share_gate_reason(self.T, time.time(), 49, 51)
         self.assertEqual(inp["reason"], "lag")
-        self.assertIn("leaderboard still on", why)
+        self.assertIn("OpenRouter feed stalled (the chart last moved", why)
         self._write(version="v2")                                 # a new day landed
         self.assertEqual(imm.share_gate_reason(self.T, time.time(), 49, 51)[1]["reason"], "hold")
         imm._share_fair_state["moved_at"][self.EV] -= 3600
@@ -9354,22 +9361,44 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
         self.assertEqual(imm.share_gate_reason(self.T, time.time(), 99, 100)[1]["reason"],
                          "complete")
 
-    def test_quotes_on_an_agreeing_read_and_stands_aside_without_one(self):
+    def test_no_read_takes_no_slot_and_a_stalled_feed_stands_aside(self):
         bot = self._bot()
-        bot.run_cycle()                                           # no file: closed
+        bot.run_cycle()                                           # no file
         self.assertEqual(self._quotes(bot), [])
-        self.assertIn(self.T, bot._share_fair_stood)
+        self.assertNotIn(self.T, bot.state.selected)              # takes no slot
         self._write()                                             # first load: no hold
+        bot.state.universe_at = 0.0                               # force a refresh
         bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
         self.assertNotIn(self.T, bot._share_fair_stood)
         q = self._quotes(bot)
         self.assertIn(("bid", 49), q)
         self.assertIn(("ask", 51), q)
-        self._write(lag=True)                                     # 00:00Z: update due
+        self._write(lag=True)                                     # a feed stalled
         bot.run_cycle()
         self.assertEqual(self._quotes(bot), [])
         self.assertIn(self.T, bot._share_fair_stood)
-        self.assertIn(self.T, bot.state.selected)                 # sticky
+        bot.state.universe_at = 0.0                               # and at a refresh
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)                 # transient: keeps the slot
+        self.assertEqual(self._quotes(bot), [])
+
+    def test_a_touch_the_gate_rejects_frees_its_slot_at_a_refresh(self):
+        # 3 per event (Jack 2026-10-01): a strike the gate would stand aside
+        # every cycle must not hold one of the three
+        self._write()
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self._write(mu=2.5)                                       # listed 49x51 vs fair ~11
+        bot.run_cycle()                                           # the quote loop first
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._share_fair_stood)
+        self.assertIn(self.T, bot.state.selected)                 # sticky between refreshes
+        bot.state.universe_at = 0.0                               # still fighting at a refresh
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)              # the slot is freed
+        self.assertEqual(self._quotes(bot), [])
 
     def test_gate_off_quotes_plainly(self):
         with mock.patch.object(imm, "SHARE_FAIR_ENABLE", False):

@@ -5429,16 +5429,21 @@ deepseek 24.39 -> 24.4, google 20.51 -> 20.5, openai 17.87 -> 17.9, stealth
 (tokens only) is NOT this quantity: Google was 4.0% of tokens but 20.5% of
 requests that week. The per-model leaderboard (/api/frontend/v1/rankings/
 models?view=day|week, `count`; text-output models via the catalog) gives the
-run rate and the share of authors folded into Others. Everything is whole
-UTC days (views day / week / month / trending, no intraday view); on 10/01
-the chart's week-to-date was cached 02:25Z with 9/30 in it. The measured
+run rate and the share of authors folded into Others. The chart is LIVE:
+polled every 10 minutes 10/01 03-13Z, its week-to-date took in the day in
+progress at 16 cachedAt steps 7-60 minutes apart (2.871B requests at 02:25Z,
+3.226B at 12:21Z). The leaderboard is whole days (views day / week / month /
+trending, no intraday one); its day view had rolled to 9/30 by 03:00Z. The measured
 week is the ticker date (the settling Monday) minus 7: the rules' "week of"
 label was a week off on the August events, the ticker matched settlement.
 
 MODEL. Per event, week W: mu = 100 (K_a + r R s_a) / (K_T + r R), K = the
-chart's week-to-date (e complete days), r = 7 - e, s_a / R = the plain
-average of three run-rate estimators (the leaderboard's last day, the
-chart's week-to-date, the leaderboard's trailing 7 days). sigma = sqrt((vol_a
+chart's week-to-date through its own timestamp (cachedAt), r = clock days
+from that timestamp to the week's end, s_a / R = the plain
+average of up to four run-rate estimators (the leaderboard's last day and
+trailing 7 days, the chart's week-to-date, and the chart's last ~24 hours
+from the snapshots the writer keeps -- 48h of them in the fair file, so the
+24h estimator joins a day after a fresh file). sigma = sqrt((vol_a
 (r + gap)/7)^2 + (spread_a r/7)^2 + 0.1^2): vol_a = the author's winsorized
 RMS week-over-week change of chart share, last 20 changes (deepseek 1.77pp,
 google 1.43, openai 1.04, qwen 0.59, z-ai 0.54, anthropic 0.43, mistralai
@@ -5454,29 +5459,44 @@ record.
 
 GATE (the OR token gate's shape, fail CLOSED). A share market stands aside
 on BOTH sides while: no fresh read (no file, older than
-IMM_SHARE_FAIR_TTL_MIN 30); the week is complete (00:00Z Monday); OpenRouter's
-daily update is due -- from 00:00Z until BOTH the leaderboard's day view
-shows yesterday AND the chart's week-to-date has changed since 00:00Z (first
-seen by the writer); its read moved within IMM_SHARE_FAIR_REFRESH_HOLD_MIN
-(10) (a new day landed; not on first load); or its touch fights the band (P
+IMM_SHARE_FAIR_TTL_MIN 30); the week is complete (00:00Z Monday); a feed has
+stalled -- the chart older than IMM_SHARE_CHART_MAX_AGE_MIN (180) or the
+leaderboard a whole day behind (its day view is a day old for a few hours
+after 00:00Z every day: that is normal and quotes); its read moved within
+IMM_SHARE_FAIR_REFRESH_HOLD_MIN (10) -- keyed to the leaderboard's day, so
+once a day, never on the live chart's moves; not on first load; or its
+touch fights the band (P
 at sigma and at sigma x 0.5) on the adverse side by more than
 IMM_SHARE_FAIR_TOL_CENTS (15). Joins the touch unchanged otherwise (no
-safe-join, no size multiplier, every strike: no event cap). Cutoff = close -
+safe-join, no size multiplier). 3 STRIKES PER EVENT (Jack 2026-10-01: "set
+max 3 markets per event"): EVENT_TOP_N gains =KX<AUTHOR>SHARE:3 for the ten
+names (exact -- KXOPENSHARE must not cap Vercel's KXOPENSOURCESHARE;
+IMM_SHARE_EVENT_TOP_N=0 lifts it), picked by ROI with sticky members; and,
+as for the GasBuddy states, two selection screens keep a strike the gate
+would stand aside every cycle out of the three -- "share_no_read" (no fresh
+read for its event) and "share_fair" (its listed touch fights the band),
+both sticky deaths that free a member's slot at the next refresh. A stalled
+feed or the daily-roll hold stays the quote loop's (transient). Cutoff = close -
 IMM_SHARE_CUTOFF_FROM_CLOSE_MIN (840) = 00:00Z Monday while the read is 14:00Z
 (EDT). Logs "share-fair stand-aside <t>: <why>" / "share-fair resume <t>",
-"share-fair refresh: N events with a read [-- daily update due, family
-stands aside]", guard "share_fair" (the sweep test counts 31 continues).
-Refresher thread "share-fair": every IMM_SHARE_FAIR_REFRESH_SECS (300), every
-IMM_SHARE_FAIR_FAST_SECS (120) while the update is due; the chart every call,
+"share-fair refresh: N events with a read [-- a feed has stalled, family
+stands aside]", guard "share_fair" (the sweep test counts 32 continues with
+the data center gate). Refresher thread "share-fair": every
+IMM_SHARE_FAIR_REFRESH_SECS (300), every IMM_SHARE_FAIR_FAST_SECS (120) while
+a feed has stalled; the chart every call,
 the leaderboard every 30 min (every call while behind), the catalog every 6h,
 Kalshi's open events hourly through the signed reader. No key.
 
-DRY RUN 10/01 03Z (books ~02:40Z): 32 of the 34 rewarded strikes inside the
-band; out: KXGOOGSHARE-26OCT05-19.9 (book 27x31 vs fair 49c [48-49]) and
-KXOPENSHARE-26OCT05-17.6 (49x52 vs 71c [71-87]) -- the market prices both
-authors ~0.45pp under the model (google mu 19.93 sigma 0.86; openai 18.08 /
-0.77; deepseek 21.21 / 1.19, matching the book; anthropic 2.69 / 0.27,
-p_ident 0.89 against tencent at 1.6%).
+DRY RUNS. 10/01 03Z (books ~02:40Z, first cut): 32 of the 34 rewarded
+strikes inside the band; out GOOG 19.9 (27x31 vs fair 49c) and OPEN 17.6
+(49x52 vs 71c). By 13Z the books had moved to the model (GOOG 19.9 60x63 vs
+58c, OPEN 17.6 78x81 vs 86c) while the live chart showed OpenAI and Google
+at ~22% of the day so far. Final model, 13Z: 33 of 34 inside with no
+snapshots yet (out: OPEN 19.3, 31x35 vs 7c; openai mu 18.37 sigma 0.67) and
+33 of 34 with the overnight snapshots standing in for the 24h window over
+the 10h that existed (out: GOOG 20.5, 15x16 vs 41c [33-41]; openai mu 18.82
+sigma 1.24, google 20.35 / 0.92, deepseek 21.10 / 1.04, anthropic 2.67 /
+0.24, p_ident 0.91 against tencent at 1.6%).
 
 KILL SWITCHES: IMM_SHARE_FAIR_ENABLE=0 takes the ten series out of the
 allowlist (never quoted without the gate); IMM_ALLOW_OR_SHARE_SERIES=""
@@ -5485,23 +5505,34 @@ does the same while leaving the gate code armed.
 WHAT THIS DOES NOT FIX / WATCH:
 - Model launches. A new model (Stealth 3.1% -> 12% in one week) moves shares
   faster than any weekly vol; the gate sees it only as each day lands.
-- The run rate. On 9/30 the market sat ~0.45pp under the model for google
-  and openai; the three-way estimator may be too trusting of a strong last
-  day. Compare openrouter_share_preds.jsonl against the 10/5 settlement.
+- The run rate. No single window is right (10/01: the last 10 hours ran
+  OpenAI at 22.0% against 17.5-19.2 on the slower windows, and the book sat
+  between); the plain four-way average is a choice, not a fit. Compare
+  openrouter_share_preds.jsonl against the 10/5 settlement before trusting
+  the band's width.
 - p_ident uses the rival's vol; tencent's (1.48, launch-driven) makes
   Anthropic's 0.89 look low next to the market's ~0.97.
 - Grouping: the leaderboard groups by the permaslug's author; one DeepSeek
   model (deepseek-chat-v3, 0.13% of requests) carries catalog author
   "deepseek-ai". The chart's own week-to-date is unaffected; only the run
   rate is.
-- The daily-update timing (~02:25Z) is one observation; the stand-aside keys
-  off the data itself, not the clock.
+- The chart's own lag behind real traffic is unmeasured: r runs from its
+  cachedAt, so a chart trailing by an hour makes r an hour short (mu leans
+  a little on the known part, sigma a touch small).
+- The first cut (pushed 10/01, rejected because main had moved -- never
+  deployed) took the chart for a daily feed: it would have held the family
+  10 minutes after every chart move (15-30% of the day) and stood it aside
+  ~2.5h after each midnight.
 
 Tests: TestOpenRouterShareFairGate (allowlist + cutoff + no cap, kill switch
 in a subprocess, fail-closed / stale / lag / hold / band / p_ident /
 complete reasons, quote-then-lag end to end, gate-off plain quoting), the
 refresher wiring guard (4 signed readers) and test_openrouter_share_fair.py
 (15: settled weeks to the rounding, rounding edge, rules/ticker week, text
-filter, winsorized vol, coverage, data_current, mu/sigma arithmetic,
-complete/future weeks, identification, writer finals/preds/lag/leaderboard
-caching, signed event reads, fail-closed chart read). 1630 green.
+filter, winsorized vol, known days from the chart time, stalled-feed lag,
+mu/sigma arithmetic incl. a half day, the 24h snapshot window, complete/future
+weeks, identification,
+writer finals/preds/lag/leaderboard caching, signed event reads, fail-closed
+chart read). TestNoLivePathUnderTest fails the suite if any incentive_mm
+path still points at the live status dir under test (the first cut missed
+SHARE_FAIR_FILE and a full-suite run left the share fixture there).

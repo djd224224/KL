@@ -21,11 +21,13 @@ authors the chart folds into Others.
 
 Model, per event (week W = Monday..Sunday UTC; the event is dated the Monday
 after):
-  K_a, K_T  week-to-date requests from the chart, covering e days of W
+  K_a, K_T  week-to-date requests from the chart, through its own timestamp
+  r         days from the chart's timestamp (cachedAt) to the end of W
   s_a, R    run-rate share and requests/day: the plain average of the
-            leaderboard's last complete day, the chart's week-to-date (once
-            it covers a day) and the leaderboard's trailing 7 days
-  mu_a    = 100 (K_a + r R s_a) / (K_T + r R),   r = 7 - e
+            leaderboard's last complete day and trailing 7 days, the chart's
+            week-to-date (once it holds a day's worth) and the chart's last
+            ~24 hours (from the snapshots this writer keeps)
+  mu_a    = 100 (K_a + r R s_a) / (K_T + r R)
   sigma_a = SHARE_SIGMA_MULT sqrt((vol_a (r + gap) / 7)^2
                                   + (spread_a r / 7)^2 + SHARE_SIGMA_FLOOR^2)
 vol_a = the author's week-over-week change of chart share over its last 20
@@ -33,20 +35,26 @@ changes, winsorized RMS (9/30: deepseek 1.77pp, google 1.43, openai 1.04,
 qwen 0.59, z-ai 0.54, anthropic 0.43, mistralai 0.36); fewer than 4 changes
 -> SHARE_DEFAULT_VOL. Linear in r/7: a whole week ahead is one
 week-over-week change, the last day moves the week by a seventh of that
-day's surprise. spread_a = half the range of the three run-rate estimators
-(they part while an author is on the move). gap = days between the data and
+day's surprise. spread_a = half the range of the run-rate estimators (they
+part while an author is on the move). gap = days between the data and
 the start of a week not yet begun. p_ident = P(the author finishes among the
 SHARE_NAMED the chart names), normal on the margin to the boundary
 competitor. `complete` once W has ended (00:00Z Monday): from then on anyone
 can read the answer.
 
-Coverage e: the complete days of W through the leaderboard's last day; when
-that and K_T / R (the week-to-date in run-rate days) disagree by more than
-SHARE_COVERAGE_TOL days, the ratio wins and the entry says so.
+The chart is LIVE: polled every 10 minutes through 10/01, its week-to-date
+included the day in progress and moved 16 times between 02:25Z and 12:21Z
+(cachedAt steps of 7-60 minutes). The leaderboard's day view is whole days,
+rolled once a day (9/30 was in by 03:00Z). So the known part runs to the
+chart's own timestamp, r is clock time from there to the week's end (K_T / R,
+the week-to-date in run-rate days, rides along as `ratio_days`), and an
+entry is `lag` -- the gate stands aside -- only while the chart is older than
+SHARE_CHART_MAX_AGE_MIN or the leaderboard has missed a whole day.
 
 Writes SHARE_FAIR_FILE for incentive_mm: per EVENT ticker mu / sigma in
-percentage points, p_ident, known (e) / complete, data_version (moves when the
-chart does), plus the inputs. Every complete week's chart shares go to
+percentage points, p_ident, known (days of W in the data) / complete / lag,
+data_version (moves once a day, with the leaderboard's day), plus the inputs.
+Every complete week's chart shares go to
 SHARE_FINALS_FILE when first seen and on any revision; the per-event
 forecasts go to SHARE_PRED_FILE hourly, for calibrating sigma.
 
@@ -88,7 +96,9 @@ SHARE_SIGMA_FLOOR = _env_float("IMM_SHARE_SIGMA_FLOOR", 0.1)     # pp
 SHARE_DEFAULT_VOL = _env_float("IMM_SHARE_DEFAULT_VOL", 2.0)     # pp per week
 SHARE_VOL_WEEKS = int(_env_float("IMM_SHARE_VOL_WEEKS", 20))
 SHARE_NAMED = int(_env_float("IMM_SHARE_NAMED", 9))              # authors the chart names
-SHARE_COVERAGE_TOL = _env_float("IMM_SHARE_COVERAGE_TOL", 0.75)  # days
+SHARE_CHART_MAX_AGE_MIN = _env_float("IMM_SHARE_CHART_MAX_AGE_MIN", 180)
+SHARE_RECENT_HOURS = _env_float("IMM_SHARE_RECENT_HOURS", 24)       # run-rate window
+SHARE_HIST_HOURS = 48                                               # snapshots kept
 SHARE_LEADERBOARD_EVERY_SECS = _env_float("IMM_SHARE_LEADERBOARD_EVERY_SECS", 1800)
 SHARE_CATALOG_EVERY_SECS = _env_float("IMM_SHARE_CATALOG_EVERY_SECS", 6 * 3600)
 SHARE_PRED_EVERY_SECS = 3600
@@ -265,84 +275,120 @@ def _phi(z: float) -> float:
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
 
-def coverage(week: date, wtd_total: float, last_day: Optional[date],
-             rate_total: float) -> Tuple[float, str]:
-    """Days of `week` the chart's week-to-date covers, and how it was set:
-    the complete days through the leaderboard's last day (the gate only
-    quotes while the chart and the leaderboard both show yesterday -- see
-    data_current), with K_T / R, the week-to-date in run-rate days, as the
-    fallback when there is no last day and as a logged cross-check."""
-    e_ratio = min(7.0, max(0.0, wtd_total / rate_total)) if rate_total > 0 else None
-    if last_day is None:
-        return (e_ratio, "ratio") if e_ratio is not None else (0.0, "none")
-    e_days = float(min(7, max(0, (last_day - week).days + 1)))
-    if e_ratio is None or abs(e_ratio - e_days) <= SHARE_COVERAGE_TOL:
-        return e_days, "days"
-    return e_days, f"days (ratio says {e_ratio:.2f})"
+def _week_start(week: date) -> datetime:
+    return datetime(week.year, week.month, week.day, tzinfo=timezone.utc)
+
+
+def known_days(week: date, chart_time: Optional[datetime], wtd_total: float,
+               rate_total: float) -> Tuple[float, str, Optional[float]]:
+    """Days of `week` behind the chart's week-to-date, how that was set, and
+    K_T / R -- the week-to-date in run-rate days -- as a cross-check. The
+    chart is live, so the known part runs to its own timestamp: cachedAt - W
+    in days (0..7). Without a timestamp the ratio stands in."""
+    ratio = (min(7.0, max(0.0, wtd_total / rate_total))
+             if rate_total > 0 and wtd_total > 0 else None)
+    if chart_time is not None:
+        e = (chart_time - _week_start(week)).total_seconds() / 86400.0
+        return min(7.0, max(0.0, e)), "chart time", ratio
+    if ratio is not None:
+        return ratio, "ratio", ratio
+    return 0.0, "none", None
 
 
 def data_current(now: datetime, last_day: Optional[date],
-                 chart_first_seen: Optional[float]) -> Tuple[bool, str]:
-    """Both feeds show the last complete UTC day. OpenRouter publishes whole
-    days once a day (the leaderboard has day / week / month views, no
-    intraday one; the chart's week-to-date moves with it, ~02:25Z on 10/01),
-    so from 00:00Z until the new day lands everyone's read is a day old and
-    the update that reprices the book is due: the gate stands aside. The
-    chart counts as updated once its latest week-to-date changed after
-    00:00Z today (first seen by this writer)."""
+                 chart_time: Optional[datetime]) -> Tuple[bool, str]:
+    """The feeds are fresh enough to quote against: the chart (live, moving
+    every 7-60 minutes on 10/01) is younger than SHARE_CHART_MAX_AGE_MIN, and
+    the leaderboard has not missed a whole day (its day view rolls once a
+    day, within ~3h of 00:00Z). Otherwise the gate stands aside: a feed
+    stalled for us alone is the book's edge over us."""
+    if chart_time is None:
+        return False, "the chart has no timestamp"
+    age = (now - chart_time).total_seconds() / 60.0
+    if age > SHARE_CHART_MAX_AGE_MIN:
+        return False, f"the chart last moved {chart_time:%m-%d %H:%MZ}, {age:.0f}m ago"
     today = now.astimezone(timezone.utc).date()
-    if last_day is None or last_day < today - timedelta(days=1):
-        return False, (f"leaderboard still on {last_day}" if last_day
+    if last_day is None or last_day < today - timedelta(days=2):
+        return False, (f"the leaderboard is stuck on {last_day}" if last_day
                        else "no leaderboard day")
-    midnight = datetime(today.year, today.month, today.day, tzinfo=timezone.utc).timestamp()
-    if chart_first_seen is None or chart_first_seen < midnight:
-        return False, "chart not updated since 00:00Z"
     return True, ""
+
+
+def recent_delta(hist: List[dict], week: date, chart_time: Optional[datetime],
+                 ys_now: Dict[str, float]) -> Optional[Tuple[Dict[str, float], float, float]]:
+    """The chart's last ~SHARE_RECENT_HOURS of week W: requests by named
+    author and in total since the stored snapshot nearest that far back (same
+    week, within 0.75-1.25x the window), and the days between. None without
+    one -- the first day of each week and of a fresh fair file. An author
+    named at only one end, or whose count fell (a revision), has no entry."""
+    if chart_time is None or not ys_now:
+        return None
+    now_t = chart_time.timestamp()
+    span = SHARE_RECENT_HOURS * 3600.0
+    cands = [h for h in hist or [] if str(h.get("x"))[:10] == week.isoformat()
+             and now_t - 1.25 * span <= float(h.get("t") or 0) <= now_t - 0.75 * span]
+    if not cands:
+        return None
+    then = min(cands, key=lambda h: abs(float(h["t"]) - (now_t - span)))
+    ys_then = {k: float(v) for k, v in (then.get("ys") or {}).items()
+               if isinstance(v, (int, float))}
+    tot = sum(ys_now.values()) - sum(ys_then.values())
+    days = (now_t - float(then["t"])) / 86400.0
+    if tot <= 0 or days <= 0:
+        return None
+    by = {k: ys_now[k] - ys_then[k] for k in ys_now
+          if k != OTHERS and k in ys_then and ys_now[k] >= ys_then[k]}
+    return by, tot, days
 
 
 def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
                last_day: Optional[date],
                day_counts: Tuple[Dict[str, float], float],
                week_counts: Tuple[Dict[str, float], float],
-               vol: Dict[str, float]) -> Optional[dict]:
+               vol: Dict[str, float],
+               chart_time: Optional[datetime] = None,
+               hist: Optional[List[dict]] = None) -> Optional[dict]:
     """N(mu, sigma) in pp for the author's chart share of week W, p_ident and
     the bookkeeping; None without a run rate.
 
-    The run rate for the days still to come is the plain average of up to
-    three estimators: the leaderboard's last complete day, the chart's own
-    week-to-date (once it covers a day) and the leaderboard's trailing 7
-    days. They disagree most while an author is on the move (9/30 openai:
-    19.18 / 17.92 / 17.51), so half their range, over the days to come,
-    joins sigma."""
+    The run rate for the days still to come is the plain average of the
+    estimators at hand: the leaderboard's last complete day and trailing 7
+    days, the chart's week-to-date once it holds a day, and the chart's last
+    ~24 hours (from the stored snapshots). The chart is live and the book
+    trades it, but no one window is right: on 10/01 13Z OpenAI read 19.18 /
+    17.51 / 18.38 on the first three and 22.0 over the last 10 hours, while
+    the book centred near 18.5 -- the plain average of all four lands there,
+    any one alone misses by a point. The estimators part while an author is
+    on the move, so half their range, over the days to come, joins sigma."""
     d_by, d_tot = day_counts
     w_by, w_tot = week_counts
     wk = next((w for w in weeks if str(w["x"])[:10] == week.isoformat()), None)
     ys = {k: float(v) for k, v in (wk or {}).get("ys", {}).items()
           if isinstance(v, (int, float))}
     k_tot = sum(ys.values())
-    parts = []                  # (requests by author, total, days covered)
-    if d_tot > 0:
-        parts.append((d_by, d_tot, 1.0))
-    if w_tot > 0:
-        parts.append((w_by, w_tot, 7.0))
-    if not parts:
+    lb = [(d_by, d_tot, 1.0), (w_by, w_tot, 7.0)]
+    lb = [p for p in lb if p[1] > 0]
+    if not lb:
         return None
-    rate_lb = sum(t / n for _, t, n in parts) / len(parts)
+    rate_lb = sum(t / n for _, t, n in lb) / len(lb)
     today = now.astimezone(timezone.utc).date()
     complete = today >= week + timedelta(days=7)
-    if k_tot > 0:
-        e, how = coverage(week, k_tot, last_day, rate_lb)
-    else:
-        e, how = 0.0, ("not started" if week > today else "no week-to-date")
-    if e >= 1.0:                # the chart's week-to-date joins the run rate
-        parts.append((ys, k_tot, e))
-    rate_t = sum(t / n for _, t, n in parts) / len(parts)
+    e, how, ratio = known_days(week, chart_time, k_tot, rate_lb)
+    if k_tot <= 0:
+        how = "not started" if week > today else "no week-to-date"
+    # (requests by author, total, days covered, counts every author)
+    parts = [(by, t, n, True) for by, t, n in lb]
+    recent = recent_delta(hist or [], week, chart_time, ys) if k_tot > 0 else None
+    if recent is not None:
+        parts.append((recent[0], recent[1], recent[2], False))
+    if k_tot > 0 and e >= 1.0:  # the chart's week-to-date joins the run rate
+        parts.append((ys, k_tot, e, False))
+    rate_t = sum(t / n for _, t, n, _ in parts) / len(parts)
     authors = set(d_by) | set(w_by) | {k for k in ys if k != OTHERS}
 
     def ests(a: str) -> List[float]:
-        # an author the chart folds into Others has no week-to-date of its own
-        return [by[a] / t if a in by else 0.0 for by, t, _ in parts
-                if not (by is ys and a not in ys)]
+        # the chart's parts know only the authors it names
+        return [by.get(a, 0.0) / t for by, t, _, every in parts if every or a in by]
     s_rate, spread = {}, {}
     for a in authors:
         xs = ests(a)
@@ -350,7 +396,9 @@ def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
         spread[a] = 100.0 * (max(xs) - min(xs)) / 2.0 if xs else 0.0
     r = 7.0 - e
     gap = 0.0
-    if week > today:          # a week not yet begun: the data ends at last_day
+    if chart_time is not None:  # a week not yet begun: the data ends at the chart
+        gap = max(0.0, (_week_start(week) - chart_time).total_seconds() / 86400.0)
+    elif week > today:
         ref = (last_day + timedelta(days=1)) if last_day else today
         gap = float(max(0, (week - ref).days))
     named = {k for k in ys if k != OTHERS}
@@ -382,13 +430,19 @@ def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
         boundary = {"author": other, "mu": round(other_mu, 3)}
     return {"mu": round(mu, 4), "sigma": round(sigma, 4), "p_ident": round(p_ident, 4),
             "known": round(e, 3), "coverage": how, "complete": complete,
+            "ratio_days": round(ratio, 3) if ratio is not None else None,
             "week": week.isoformat(), "named_wtd": author in named,
             "wtd_share": (round(100.0 * ys[author] / k_tot, 4)
                           if author in ys and k_tot > 0 else None),
             "rate_share": round(100.0 * s_rate.get(author, 0.0), 4),
             "rate_spread": round(spread.get(author, 0.0), 4),
+            "recent_share": (round(100.0 * recent[0][author] / recent[1], 4)
+                             if recent is not None and author in recent[0] else None),
+            "recent_hours": round(recent[2] * 24.0, 2) if recent is not None else None,
             "vol": round(vol.get(author, SHARE_DEFAULT_VOL), 3), "boundary": boundary,
-            "data_version": f"{week.isoformat()}:{int(k_tot)}"}
+            # moves once a day, when the leaderboard's day rolls (the chart
+            # moves every few minutes and would hold the gate all day)
+            "data_version": f"{week.isoformat()}:{last_day}"}
 
 
 def p_yes(strike: float, mu: float, sigma: float, p_ident: float) -> float:
@@ -474,19 +528,22 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     then age out of the bot's TTL). The leaderboard and the catalog are
     re-read every SHARE_LEADERBOARD_EVERY_SECS / SHARE_CATALOG_EVERY_SECS,
     and the leaderboard on every call while its last day is older than
-    yesterday (the daily update is due); between reads the file's copy of the
+    yesterday (its daily roll is due); between reads the file's copy of the
     run rate is used. Sets LAST["data_current"] for the caller's polling."""
     now = now or datetime.now(timezone.utc)
     ts = now.timestamp()
     old = _read_json(path)
     weeks, cached_at = chart if chart is not None else fetch_market_share()
-    # when the chart's latest week-to-date was first seen (data_current)
-    cur = weeks[-1] if weeks else {}
-    seen_key = (f"{str(cur.get('x'))[:10]}:"
-                f"{int(sum(v for v in (cur.get('ys') or {}).values() if isinstance(v, (int, float))))}")
-    seen = old.get("chart_seen") if isinstance(old.get("chart_seen"), dict) else {}
-    if seen.get("key") != seen_key:
-        seen = {"key": seen_key, "first_seen": ts}
+    chart_time = datetime.fromtimestamp(cached_at, timezone.utc) if cached_at else None
+    # the chart's snapshots, one per cachedAt, for the last-24h run rate
+    hist = [h for h in (old.get("chart_hist") or [])
+            if isinstance(h, dict) and isinstance(h.get("ys"), dict)]
+    if cached_at and weeks and (not hist or float(hist[-1].get("t") or 0) != float(cached_at)):
+        hist.append({"t": float(cached_at), "x": str(weeks[-1]["x"])[:10],
+                     "ys": {k: float(v) for k, v in weeks[-1]["ys"].items()
+                            if isinstance(v, (int, float))}})
+    hist = [h for h in hist if float(h.get("t") or 0)
+            >= float(cached_at or ts) - SHARE_HIST_HOURS * 3600]
     lb = old.get("leaderboard") if isinstance(old.get("leaderboard"), dict) else {}
     cat_store = old.get("catalog") if isinstance(old.get("catalog"), dict) else {}
     cat_at = float(old.get("catalog_at") or 0)
@@ -519,7 +576,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     day_counts = ({k: float(v) for k, v in lb["day"]["by"].items()}, float(lb["day"]["total"]))
     week_counts = ({k: float(v) for k, v in lb["week"]["by"].items()}, float(lb["week"]["total"]))
     last_day = date.fromisoformat(lb["last_day"]) if lb.get("last_day") else None
-    current, lag_why = data_current(now, last_day, float(seen["first_seen"]))
+    current, lag_why = data_current(now, last_day, chart_time)
     LAST["data_current"] = current
     vol = author_vol(weeks, now.date())
     ev_cache = old.get("events") or {}
@@ -546,7 +603,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         except (KeyError, ValueError, TypeError):
             missing.append(ev)
             continue
-        f = event_fair(author, wk, now, weeks, last_day, day_counts, week_counts, vol)
+        f = event_fair(author, wk, now, weeks, last_day, day_counts, week_counts, vol,
+                       chart_time=chart_time, hist=hist)
         if f is None:
             missing.append(ev)
             continue
@@ -586,9 +644,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         json.dump({"generated_at": now.isoformat(), "entries": entries,
                    "missing": missing, "events": events, "events_at": events_at,
                    "data_current": current, "lag_reason": lag_why,
-                   "chart_seen": seen,
-                   "chart_cached_at": (datetime.fromtimestamp(cached_at, timezone.utc).isoformat()
-                                       if cached_at else None),
+                   "chart_cached_at": chart_time.isoformat() if chart_time else None,
+                   "chart_hist": hist,
                    "chart_week": cur_sh[0][0] if cur_sh else None,
                    "chart_week_shares": ({k: round(v, 3) for k, v in
                                           sorted(cur_sh[0][1].items(), key=lambda kv: -kv[1])}
@@ -598,7 +655,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                    "finals": finals, "pred_at": pred_at,
                    "model": {"sigma_mult": SHARE_SIGMA_MULT, "sigma_floor": SHARE_SIGMA_FLOOR,
                              "default_vol": SHARE_DEFAULT_VOL, "vol_weeks": SHARE_VOL_WEEKS,
-                             "named": SHARE_NAMED, "coverage_tol": SHARE_COVERAGE_TOL}},
+                             "named": SHARE_NAMED,
+                             "chart_max_age_min": SHARE_CHART_MAX_AGE_MIN}},
                   fh, indent=1, sort_keys=True)
     os.replace(tmp, path)
     return len(entries), len(missing)

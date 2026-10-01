@@ -130,25 +130,33 @@ class TestModel(unittest.TestCase):
                          {"a": 20.0, "b": 10.0, "Others": 70.0})
         return h + ([week(self.W.isoformat(), cur)] if cur else [])
 
-    def test_coverage_days_and_ratio(self):
-        self.assertEqual(osf.coverage(self.W, 3e9, date(2026, 9, 30), 1e9), (3.0, "days"))
-        e, how = osf.coverage(self.W, 2e9, date(2026, 9, 30), 1e9)
-        self.assertEqual(e, 3.0)
-        self.assertIn("ratio says 2.00", how)
-        self.assertEqual(osf.coverage(self.W, 2e9, None, 1e9), (2.0, "ratio"))
-        self.assertEqual(osf.coverage(self.W, 2e9, None, 0.0), (0.0, "none"))
+    def test_known_days_run_to_the_chart_time(self):
+        # the chart is live: Thursday noon = 3.5 days of the week known
+        thu_noon = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(osf.known_days(self.W, thu_noon, 3.5e9, 1e9), (3.5, "chart time", 3.5))
+        self.assertEqual(osf.known_days(self.W, datetime(2026, 9, 27, 23, tzinfo=timezone.utc),
+                                        0.0, 1e9), (0.0, "chart time", None))   # not begun
+        self.assertEqual(osf.known_days(self.W, datetime(2026, 10, 6, tzinfo=timezone.utc),
+                                        7.2e9, 1e9), (7.0, "chart time", 7.0))
+        self.assertEqual(osf.known_days(self.W, None, 2e9, 1e9), (2.0, "ratio", 2.0))
+        self.assertEqual(osf.known_days(self.W, None, 2e9, 0.0), (0.0, "none", None))
 
-    def test_data_current_needs_both_feeds_on_yesterday(self):
-        now = datetime(2026, 10, 1, 3, 0, tzinfo=timezone.utc)
-        today0 = datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp()
-        self.assertEqual(osf.data_current(now, date(2026, 9, 30), today0 + 60), (True, ""))
-        ok, why = osf.data_current(now, date(2026, 9, 29), today0 + 60)
+    def test_lag_only_when_a_feed_stalls(self):
+        now = datetime(2026, 10, 2, 0, 30, tzinfo=timezone.utc)
+        fresh = now - timedelta(minutes=20)
+        # just after midnight the leaderboard is a day behind -- its normal
+        # state until the daily roll -- and the gate keeps quoting
+        self.assertEqual(osf.data_current(now, date(2026, 9, 30), fresh), (True, ""))
+        self.assertEqual(osf.data_current(now, date(2026, 10, 1), fresh), (True, ""))
+        ok, why = osf.data_current(now, date(2026, 9, 29), fresh)      # missed a day
         self.assertFalse(ok)
-        self.assertIn("2026-09-29", why)
-        ok, why = osf.data_current(now, date(2026, 9, 30), today0 - 60)
+        self.assertIn("stuck on 2026-09-29", why)
+        stale = now - timedelta(minutes=osf.SHARE_CHART_MAX_AGE_MIN + 1)
+        ok, why = osf.data_current(now, date(2026, 10, 1), stale)
         self.assertFalse(ok)
-        self.assertIn("chart not updated", why)
-        self.assertFalse(osf.data_current(now, None, today0 + 60)[0])
+        self.assertIn("the chart last moved 10-01 21:29Z", why)
+        self.assertFalse(osf.data_current(now, date(2026, 10, 1), None)[0])
+        self.assertFalse(osf.data_current(now, None, fresh)[0])
 
     def test_mu_blends_week_to_date_and_run_rate(self):
         # 3 days known at a = 21% of 3e9; the leaderboard says a = 18% (day)
@@ -156,19 +164,78 @@ class TestModel(unittest.TestCase):
         cur = {"a": 0.21 * 3e9, "b": 0.10 * 3e9, "Others": 0.69 * 3e9}
         day = ({"a": 0.18e9, "b": 0.10e9, "c": 0.72e9}, 1e9)
         wk = ({"a": 1.4e9, "b": 0.7e9, "c": 4.9e9}, 7e9)
+        thu0 = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)   # chart time
         f = osf.event_fair("a", self.W, datetime(2026, 10, 1, 3, tzinfo=timezone.utc),
-                           self._hist(cur), date(2026, 9, 30), day, wk, {"a": 1.0, "b": 0.5})
+                           self._hist(cur), date(2026, 9, 30), day, wk, {"a": 1.0, "b": 0.5},
+                           chart_time=thu0)
         s_rate = (0.18 + 0.20 + 0.21) / 3.0
         want_mu = 100 * (0.21 * 3e9 + 4 * 1e9 * s_rate) / (3e9 + 4 * 1e9)
         self.assertAlmostEqual(f["mu"], want_mu, places=3)
-        self.assertEqual((f["known"], f["coverage"], f["complete"]), (3.0, "days", False))
+        self.assertEqual((f["known"], f["coverage"], f["complete"], f["ratio_days"]),
+                         (3.0, "chart time", False, 3.0))
         spread = 100 * (0.21 - 0.18) / 2
         want_sigma = math.sqrt((1.0 * 4 / 7) ** 2 + (spread * 4 / 7) ** 2
                                + osf.SHARE_SIGMA_FLOOR ** 2)
         self.assertAlmostEqual(f["sigma"], want_sigma, places=3)
         self.assertEqual(f["wtd_share"], 21.0)
         self.assertEqual(f["p_ident"], 1.0)                  # < 9 rivals: named
-        self.assertEqual(f["data_version"], f"2026-09-28:{int(3e9)}")
+        # the hold key moves with the leaderboard's day, not the live chart
+        self.assertEqual(f["data_version"], "2026-09-28:2026-09-30")
+        # twelve hours later the same week-to-date plus half a day: r = 3.5
+        cur2 = {k: v * 3.5 / 3 for k, v in cur.items()}
+        g = osf.event_fair("a", self.W, datetime(2026, 10, 1, 13, tzinfo=timezone.utc),
+                           self._hist(cur2), date(2026, 9, 30), day, wk, {"a": 1.0, "b": 0.5},
+                           chart_time=thu0 + timedelta(hours=12))
+        rate_t = (1e9 + 1e9 + 3.5e9 / 3.5) / 3
+        want_mu = 100 * (0.21 * 3.5e9 + 3.5 * rate_t * s_rate) / (3.5e9 + 3.5 * rate_t)
+        self.assertEqual(g["known"], 3.5)
+        self.assertAlmostEqual(g["mu"], want_mu, places=3)
+        self.assertEqual(g["data_version"], f["data_version"])
+
+    def test_recent_delta_from_the_snapshots(self):
+        now = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+        ys_now = {"a": 900.0, "b": 400.0, "c": 50.0, "Others": 650.0}
+        hist = [
+            {"t": (now - timedelta(hours=40)).timestamp(), "x": "2026-09-28",
+             "ys": {"a": 100.0, "b": 100.0, "Others": 300.0}},            # too old
+            {"t": (now - timedelta(hours=25)).timestamp(), "x": "2026-09-28",
+             "ys": {"a": 500.0, "b": 300.0, "Others": 400.0}},            # nearest 24h
+            {"t": (now - timedelta(hours=20)).timestamp(), "x": "2026-09-28",
+             "ys": {"a": 600.0, "b": 310.0, "Others": 450.0}},
+            {"t": (now - timedelta(hours=24)).timestamp(), "x": "2026-09-21",
+             "ys": {"a": 1.0, "Others": 1.0}}]                            # other week
+        by, tot, days = osf.recent_delta(hist, self.W, now, ys_now)
+        self.assertEqual(by, {"a": 400.0, "b": 100.0})   # "c" named at one end only
+        self.assertEqual(tot, 2000.0 - 1200.0)
+        self.assertAlmostEqual(days, 25 / 24)
+        self.assertIsNone(osf.recent_delta(hist[:1], self.W, now, ys_now))   # none in window
+        self.assertIsNone(osf.recent_delta(hist, self.W, None, ys_now))
+        self.assertIsNone(osf.recent_delta(hist, date(2026, 10, 5), now, ys_now))
+
+    def test_the_last_24h_joins_the_run_rate(self):
+        # week-to-date 3.5 days at a = 21%; the last 24h of the chart ran
+        # a = 24%; the leaderboard's last day 18%, trailing 7 days 20%
+        thu_noon = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+        cur = {"a": 0.21 * 3.5e9, "b": 0.10 * 3.5e9, "Others": 0.69 * 3.5e9}
+        then = {"a": 0.21 * 3.5e9 - 0.24e9, "b": 0.10 * 3.5e9 - 0.10e9,
+                "Others": 0.69 * 3.5e9 - 0.66e9}
+        hist = [{"t": (thu_noon - timedelta(hours=24)).timestamp(), "x": "2026-09-28",
+                 "ys": then}]
+        day = ({"a": 0.18e9, "b": 0.10e9, "c": 0.72e9}, 1e9)
+        wk = ({"a": 1.4e9, "b": 0.7e9, "c": 4.9e9}, 7e9)
+        f = osf.event_fair("a", self.W, thu_noon, self._hist(cur), date(2026, 9, 30), day,
+                           wk, {"a": 1.0}, chart_time=thu_noon, hist=hist)
+        s_rate = (0.18 + 0.20 + 0.24 + 0.21) / 4.0           # all four
+        rate_t = (1e9 + 1e9 + 1e9 + 3.5e9 / 3.5) / 4.0
+        want = 100 * (0.21 * 3.5e9 + 3.5 * rate_t * s_rate) / (3.5e9 + 3.5 * rate_t)
+        self.assertAlmostEqual(f["mu"], want, places=3)
+        self.assertEqual((f["recent_share"], f["recent_hours"]), (24.0, 24.0))
+        self.assertAlmostEqual(f["rate_spread"], 100 * (0.24 - 0.18) / 2, places=3)
+        # without the snapshot the other three carry it
+        g = osf.event_fair("a", self.W, thu_noon, self._hist(cur), date(2026, 9, 30), day,
+                           wk, {"a": 1.0}, chart_time=thu_noon)
+        self.assertIsNone(g["recent_share"])
+        self.assertAlmostEqual(g["rate_share"], 100 * (0.18 + 0.20 + 0.21) / 3, places=3)
 
     def test_complete_week_and_future_week(self):
         cur = {"a": 0.2 * 7e9, "Others": 0.8 * 7e9}
@@ -184,6 +251,12 @@ class TestModel(unittest.TestCase):
         self.assertEqual((g["known"], g["coverage"]), (0.0, "not started"))
         self.assertAlmostEqual(g["mu"], 20.0, places=3)
         self.assertAlmostEqual(g["sigma"], math.sqrt((11 / 7) ** 2 + osf.SHARE_SIGMA_FLOOR ** 2), places=3)
+        # with the chart's timestamp the gap is clock time: 10/5 - 10/1 03:00
+        g2 = osf.event_fair("a", date(2026, 10, 5), datetime(2026, 10, 1, 3, tzinfo=timezone.utc),
+                            self._hist(), date(2026, 9, 30), day, day, {"a": 1.0},
+                            chart_time=datetime(2026, 10, 1, 3, tzinfo=timezone.utc))
+        self.assertAlmostEqual(g2["sigma"], math.sqrt(((7 + 3.875) / 7) ** 2
+                                                      + osf.SHARE_SIGMA_FLOOR ** 2), places=3)
         self.assertIsNone(osf.event_fair("a", self.W, datetime(2026, 10, 1, tzinfo=timezone.utc),
                                          [], None, ({}, 0.0), ({}, 0.0), {}))
 
@@ -236,9 +309,11 @@ class TestWriter(unittest.TestCase):
                                                "week": "2026-09-28"},
                        "KXBADSHARE-26OCT05": {"series": "KXBADSHARE"}}
 
-    def _write(self, now=None, chart_cur=None, **kw):
+    CACHED = 1790821510.5                     # 2026-10-01 02:25:10.5Z
+
+    def _write(self, now=None, chart_cur=None, cached=CACHED, **kw):
         weeks = self.hist + [week("2026-09-28", chart_cur or self.cur)]
-        args = dict(now=now or self.NOW, chart=(weeks, 1790821510.5), catalog={},
+        args = dict(now=now or self.NOW, chart=(weeks, cached), catalog={},
                     day_rows=self.day, week_rows=self.wk, events=self.events,
                     finals_path=self.finals, pred_path=self.preds)
         args.update(kw)
@@ -253,8 +328,10 @@ class TestWriter(unittest.TestCase):
         d = self._read()
         self.assertEqual(d["missing"], ["KXBADSHARE-26OCT05"])
         e = d["entries"]["KXANTHSHARE-26OCT05"]
-        self.assertEqual((e["author"], e["week"], e["known"], e["complete"], e["lag"]),
-                         ("anthropic", "2026-09-28", 3.0, False, False))
+        self.assertEqual((e["author"], e["week"], e["complete"], e["lag"]),
+                         ("anthropic", "2026-09-28", False, False))
+        self.assertAlmostEqual(e["known"], 3 + (2 * 3600 + 25 * 60 + 10.5) / 86400, places=3)
+        self.assertEqual(d["chart_cached_at"], "2026-10-01T02:25:10.500000+00:00")
         self.assertTrue(d["data_current"])
         self.assertTrue(osf.LAST["data_current"])
         self.assertAlmostEqual(e["wtd_share"], 100 * 77.2e6 / sum(self.cur.values()), places=3)
@@ -267,15 +344,17 @@ class TestWriter(unittest.TestCase):
         self.assertEqual(rows[1]["shares"]["deepseek"], 24.39)
         with open(self.preds, encoding="utf-8") as f:
             self.assertEqual(len(f.readlines()), 2)
-        # a second write 10 min later: no new finals, no new preds, chart
-        # unchanged -> first_seen kept
-        first = d["chart_seen"]["first_seen"]
-        self._write(now=self.NOW + timedelta(minutes=10))
+        # a second write 10 min later on a chart that moved: no new finals,
+        # no new preds, and the hold key stays put
+        self._write(now=self.NOW + timedelta(minutes=10),
+                    chart_cur={k: v * 1.01 for k, v in self.cur.items()},
+                    cached=self.CACHED + 600)
         with open(self.finals, encoding="utf-8") as f:
             self.assertEqual(len(f.readlines()), 2)
         with open(self.preds, encoding="utf-8") as f:
             self.assertEqual(len(f.readlines()), 2)
-        self.assertEqual(self._read()["chart_seen"]["first_seen"], first)
+        self.assertEqual(self._read()["entries"]["KXANTHSHARE-26OCT05"]["data_version"],
+                         e["data_version"])
         # a revision of a complete week is logged again
         self.hist[-1] = week("2026-09-21", dict(SEP21, deepseek=SEP21["deepseek"] + 50e6))
         self._write(now=self.NOW + timedelta(minutes=20))
@@ -283,30 +362,54 @@ class TestWriter(unittest.TestCase):
             rows = [json.loads(x) for x in f]
         self.assertEqual((rows[-1]["week"], rows[-1]["revision"]), ("2026-09-21", True))
 
-    def test_lag_after_midnight_until_both_feeds_move(self):
-        self._write()                                         # 10/01 03:00, current
-        # 10/02 00:30Z: leaderboard still on 9/30 -> lag
-        self.assertEqual(self._write(now=datetime(2026, 10, 2, 0, 30, tzinfo=timezone.utc))[0], 2)
-        d = self._read()
-        self.assertFalse(d["data_current"])
-        self.assertTrue(d["entries"]["KXANTHSHARE-26OCT05"]["lag"])
-        self.assertIn("leaderboard still on 2026-09-30", d["lag_reason"])
-        # 02:20Z: the leaderboard shows 10/01 but the chart has not moved
-        day2 = lb_rows(date(2026, 10, 1), {"deepseek": 192e6, "google": 194e6,
-                                           "openai": 181e6, "anthropic": 26e6, "zz": 338e6})
-        self._write(now=datetime(2026, 10, 2, 2, 20, tzinfo=timezone.utc), day_rows=day2)
-        d = self._read()
-        self.assertFalse(d["data_current"])
-        self.assertIn("chart not updated", d["lag_reason"])
-        # 02:30Z: the chart adds 10/01 -> current, 4 days known
-        cur2 = {k: v * 4 / 3 for k, v in self.cur.items()}
-        self._write(now=datetime(2026, 10, 2, 2, 30, tzinfo=timezone.utc), day_rows=day2,
-                    chart_cur=cur2)
+    def test_lag_only_while_the_chart_stalls(self):
+        t1 = datetime(2026, 10, 2, 0, 30, tzinfo=timezone.utc)
+        # 10/02 00:30Z, chart 10 minutes old, leaderboard still on 9/30 (its
+        # daily roll not yet in): quotes, keyed to the 9/30 day
+        self._write(now=t1, cached=(t1 - timedelta(minutes=10)).timestamp())
         d = self._read()
         self.assertTrue(d["data_current"])
         e = d["entries"]["KXANTHSHARE-26OCT05"]
-        self.assertEqual((e["known"], e["lag"]), (4.0, False))
-        self.assertEqual(e["data_version"], f"2026-09-28:{int(sum(cur2.values()))}")
+        self.assertEqual((e["lag"], e["data_version"]), (False, "2026-09-28:2026-09-30"))
+        self.assertAlmostEqual(e["known"], 4 + 20 / 1440, places=3)
+        # 02:20Z: the leaderboard rolls to 10/01 -> the hold key moves once
+        day2 = lb_rows(date(2026, 10, 1), {"deepseek": 192e6, "google": 194e6,
+                                           "openai": 181e6, "anthropic": 26e6, "zz": 338e6})
+        t2 = datetime(2026, 10, 2, 2, 20, tzinfo=timezone.utc)
+        self._write(now=t2, day_rows=day2, cached=(t2 - timedelta(minutes=5)).timestamp())
+        e = self._read()["entries"]["KXANTHSHARE-26OCT05"]
+        self.assertEqual((e["lag"], e["data_version"]), (False, "2026-09-28:2026-10-01"))
+        # 06:00Z with the chart stuck at 02:15Z: lag, the gate stands aside
+        t3 = datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc)
+        self._write(now=t3, day_rows=day2, cached=(t2 - timedelta(minutes=5)).timestamp())
+        d = self._read()
+        self.assertFalse(d["data_current"])
+        self.assertFalse(osf.LAST["data_current"])
+        self.assertTrue(d["entries"]["KXANTHSHARE-26OCT05"]["lag"])
+        self.assertIn("the chart last moved 10-02 02:15Z", d["lag_reason"])
+
+    def test_snapshots_kept_once_per_chart_time_for_48h(self):
+        self._write()
+        self._write(now=self.NOW + timedelta(minutes=5))           # same cachedAt
+        d = self._read()
+        self.assertEqual([h["t"] for h in d["chart_hist"]], [self.CACHED])
+        self.assertIsNone(d["entries"]["KXANTHSHARE-26OCT05"]["recent_share"])
+        # a day later the chart moved: the 24h run rate comes from the delta
+        later = {k: v * 4.5 / 3.1 for k, v in self.cur.items() if k != "anthropic"}
+        d_others = sum(later.values()) - (sum(self.cur.values()) - self.cur["anthropic"])
+        later["anthropic"] = self.cur["anthropic"] + 0.03 * d_others / 0.97   # 3% of the day
+        self._write(now=self.NOW + timedelta(hours=24), chart_cur=later,
+                    cached=self.CACHED + 86400)
+        d = self._read()
+        self.assertEqual(len(d["chart_hist"]), 2)
+        e = d["entries"]["KXANTHSHARE-26OCT05"]
+        self.assertAlmostEqual(e["recent_share"], 3.0, places=2)
+        self.assertEqual(e["recent_hours"], 24.0)
+        # 49h on, the first snapshot has aged out
+        self._write(now=self.NOW + timedelta(hours=49), chart_cur=later,
+                    cached=self.CACHED + 49 * 3600)
+        self.assertEqual([h["t"] for h in self._read()["chart_hist"]],
+                         [self.CACHED + 86400, self.CACHED + 49 * 3600])
 
     def test_leaderboard_cached_between_reads_and_reread_while_behind(self):
         self._write()
