@@ -3499,7 +3499,12 @@ _DEFAULT_SPORTS_SERIES = "KXMLBPLAYOFFS,KXMLBSEASONGAMES"
 # settlement-day cutoff (SERIES_OVERRIDES["KXTRUMPAPPROVE"] below), which
 # keeps ~21 of each program's 24 hours. IMM_ALLOW_POLITICS_SERIES=""
 # removes it.
-_DEFAULT_POLITICS_SERIES = "KXTRUMPAPPROVE"
+# KXAPRPOTUS (Jack 2026-10-01: "yes, same rules as KXTRUMPAPPROVE"): the
+# SAME RCP approval average, read at 11:00 AM ET on the ticker date (a
+# Friday; weekly, listed the Friday before), in 0.2-0.3 point range buckets
+# -- the scan rejected it on `realclearpolling` like its twin. Same entry,
+# same 07:00 ET settlement-day cutoff, same x3 size, on the same knobs.
+_DEFAULT_POLITICS_SERIES = "KXTRUMPAPPROVE,KXAPRPOTUS"
 # AI USAGE (Jack 2026-09-27: "yes build the OpenRouter token usage gate").
 # KXTOKENUSE ("OpenRouter total token usage for Sep 21-27 above 164T") and
 # KXTOKENUSEM (the same over a 4-week "month") settle on OpenRouter's
@@ -5139,6 +5144,10 @@ SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
         _env_int("IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET", 7),
         _env_int("IMM_TRUMPAPPROVE_CUTOFF_MIN_ET", 0)),
     size_mult=_env_float("IMM_TRUMPAPPROVE_SIZE_MULT", 3.0))
+# KXAPRPOTUS, the same RCP number read at 11:00 AM ET (Jack 2026-10-01:
+# "yes, same rules as KXTRUMPAPPROVE"): the same override on the same knobs,
+# so the twins move together.
+SERIES_OVERRIDES["KXAPRPOTUS"] = SERIES_OVERRIDES["KXTRUMPAPPROVE"]
 
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market

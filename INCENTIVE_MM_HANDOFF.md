@@ -5681,3 +5681,35 @@ Tests: the Ramp class (no cap by default, knob in the config hash), the
 event-cap test (Carbon Arc suffixes uncapped by default; the suffix rule,
 the not-a-substring rule and the 9 -> 3 ROI cut pinned under the restored
 spec), the CC-family membership test (no cap); 1699 green.
+
+## 2026-10-01 — KXAPRPOTUS allowlisted on KXTRUMPAPPROVE's rules (Jack)
+
+Jack, asked why KXAPRPOTUS-26OCT02 was not quoting, then: "yes, same rules
+as KXTRUMPAPPROVE".
+
+WHY IT WAS DARK. KXAPRPOTUS ("President RCP approval rating this week") is
+the SAME RealClearPolitics approval average as KXTRUMPAPPROVE, read at
+11:00 AM ET on its ticker date (a Friday; weekly, listed the Friday before,
+close 15:00Z) in 0.2-0.3 point range buckets. It was on no allowlist, so
+only the open scan could reach it, and the scan rejects realclearpolling.com
+as a live feed (the 9/24 rule) with the reward window running to the close
+-- silently, before any selection decision is logged. Rewards on 26OCT02:
+$100 per strike x 8, from 10/01 17:46Z to the 11:00 ET read.
+
+CHANGE. "KXAPRPOTUS" joins _DEFAULT_POLITICS_SERIES (exact name) and
+SERIES_OVERRIDES["KXAPRPOTUS"] IS KXTRUMPAPPROVE's override object: the
+07:00 ET settlement-day cutoff and x3 size, on the same
+IMM_TRUMPAPPROVE_CUTOFF_* / IMM_TRUMPAPPROVE_SIZE_MULT knobs, so the twins
+move together. Checked with the bot's own cutoff functions on the live
+shapes: occurrence at the 15:00Z read, an irregular occurrence (26SEP25),
+one after the close (26JUL31) and standard time all cut at 07:00 ET on the
+ticker date. No per-event cap. IMM_ALLOW_POLITICS_SERIES="KXTRUMPAPPROVE"
+takes it back out.
+
+WATCH: the 9/26 tape study that set the 07:00 cutoff was KXTRUMPAPPROVE's
+(1:00 PM read); KXAPRPOTUS reads at 11:00, inside the same 07:00-12:59 ET
+update window, so the same cutoff covers it, but its own book has not been
+studied. Inventory taken overnight rides to the 11:00 read.
+
+Tests: test_aprpotus_twin_rides_the_same_rules (allowed exactly, same
+override object, x3, uncapped, the four cutoff shapes); 1710 green.

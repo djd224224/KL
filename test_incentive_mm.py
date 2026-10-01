@@ -1936,6 +1936,39 @@ class TestTrumpApproveAllowlist(unittest.TestCase):
             imm.trade_cutoff_utc("KXTRUMPAPPROVE-26DEC15", occ, exp),
             datetime(2026, 12, 15, 12, 0, tzinfo=timezone.utc))
 
+    def test_aprpotus_twin_rides_the_same_rules(self):
+        # Jack 2026-10-01: "yes, same rules as KXTRUMPAPPROVE" -- KXAPRPOTUS
+        # is the same RCP average read at 11:00 AM ET on its Friday ticker
+        # date, in range buckets; the scan had rejected it on
+        # `realclearpolling`
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        for t in ("KXAPRPOTUS-26OCT02-38.3", "KXAPRPOTUS-26OCT02-40.0"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+        self.assertIn("KXAPRPOTUS", imm.ALLOW_SERIES)
+        self.assertFalse(a("KXAPRPOTUSX-26OCT02-38.3"))         # exact series
+        self.assertIs(imm.SERIES_OVERRIDES["KXAPRPOTUS"],
+                      imm.SERIES_OVERRIDES["KXTRUMPAPPROVE"])  # same knobs
+        self.assertEqual(imm.applied_mention_mult("KXAPRPOTUS"), 3.0)
+        self.assertEqual(imm.event_top_n_for("KXAPRPOTUS"), 0)
+        U = timezone.utc
+        # the live shapes: occurrence at the 11:00 ET read (15:00Z), an
+        # irregular occurrence (26SEP25), one after the close (26JUL31) and
+        # standard time -- every cutoff is 07:00 ET on the settlement day
+        for ev, occ, exp, want in (
+                ("KXAPRPOTUS-26OCT02", datetime(2026, 10, 2, 15, 0, tzinfo=U),
+                 datetime(2026, 10, 2, 16, 0, tzinfo=U), datetime(2026, 10, 2, 11, 0, tzinfo=U)),
+                ("KXAPRPOTUS-26SEP25", datetime(2026, 9, 25, 15, 18, 20, tzinfo=U),
+                 datetime(2026, 9, 25, 16, 0, tzinfo=U), datetime(2026, 9, 25, 11, 0, tzinfo=U)),
+                ("KXAPRPOTUS-26JUL31", datetime(2026, 8, 1, 15, 0, tzinfo=U),
+                 datetime(2026, 7, 31, 15, 0, tzinfo=U), datetime(2026, 7, 31, 11, 0, tzinfo=U)),
+                ("KXAPRPOTUS-26DEC04", datetime(2026, 12, 4, 16, 0, tzinfo=U),
+                 datetime(2026, 12, 4, 17, 0, tzinfo=U), datetime(2026, 12, 4, 12, 0, tzinfo=U))):
+            cut = imm.trade_cutoff_utc(ev, occ, exp)
+            self.assertEqual(cut, want, ev)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXAPRPOTUS", ev, cut, exp - timedelta(hours=1)), want, ev)
+
     def test_x3_family_size_like_the_ladders(self):
         # Jack 2026-09-26 pm: "give KXTRUMPAPPROVE markets a 3x multiplier,
         # like LADDER/ESCALATOR" -- the same size_mult wire, so rungs, both
