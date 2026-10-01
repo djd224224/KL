@@ -4031,9 +4031,10 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         prev_only = imm.ALLOWLIST_ONLY
         try:
             imm.ALLOWLIST_ONLY = True
-            # (core 26OCT: 26NOV/26DEC are the 2026-09-28 pilot's, below)
+            # (core 26OCT: 26NOV/26DEC are the 2026-09-28 pilot's, below;
+            # KXCPICOREYOY joined the pilot as a family on 2026-10-01)
             for t in ("KXCPI-26DEC-T0.2", "KXCPICORE-26OCT-T0.2",
-                      "KXCPIYOY-26NOV-T3.5", "KXCPICOREYOY-26DEC-T2.3",
+                      "KXCPIYOY-26NOV-T3.5",
                       "KXCPICOMBO-26OCT-X", "KXECONSTATCPI-26OCT-T0.3",
                       "KXECONSTATCORECPIYOY-26OCT-T3", "KXUSGASCPI-26OCT-T1",
                       "KXCHINACPI-26OCT-T1", "KXCPINDEX-26OCT-T330",
@@ -4075,10 +4076,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             imm.CPI_PILOT_UNTIL = None
             self.assertTrue(imm.cpi_pilot_active(
                 "KXCPICORE-26DEC-T0.2", datetime(2026, 12, 31, tzinfo=timezone.utc)))
-            # the rest of CPI, core included, stays blocked
+            # the rest of CPI stays blocked (the YoY core family is its own
+            # test below)
             for t in ("KXCPICORE-26OCT-T0.3", "KXCPICORE-26SEP-T0.3",
                       "KXCPI-26NOV-T0.3", "KXCPI-26DEC-T0.2",
-                      "KXCPICOREYOY-26NOV-T2.5", "KXCPIYOY-26DEC-T3.5"):
+                      "KXCPIYOY-26DEC-T3.5"):
                 self.assertTrue(IncentiveMarketMaker._blocked(t), t)
                 self.assertFalse(IncentiveMarketMaker._allowed(t), t)
             # the family probe never opens the series, so no auto-enroll
@@ -4115,6 +4117,53 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         cut = imm.apply_series_cutoff_adjustments(
             "KXCPICORE", "KXCPICORE-26NOV", None, close_time=close)
         self.assertEqual(cut, close - timedelta(days=7))
+
+    def test_cpi_pilot_takes_the_whole_yoy_core_family(self):
+        # Jack 2026-10-01: "yes add this family" (KXCPICOREYOY-26DEC's
+        # program opened that day): every KXCPICOREYOY event, present and
+        # future, quotes in the pilot under its guards; the series probe and
+        # the other CPI families stay blocked.
+        self.assertEqual(imm.CPI_PILOT_FAMILIES, ("KXCPICOREYOY",))
+        self.assertIn("KXCPICOREYOY", imm.CPI_PILOT_SERIES)
+        self.assertIn("KXCPICORE", imm.CPI_PILOT_SERIES)
+        prev_only, prev_until = imm.ALLOWLIST_ONLY, imm.CPI_PILOT_UNTIL
+        try:
+            imm.ALLOWLIST_ONLY = True
+            imm.CPI_PILOT_UNTIL = None
+            for t in ("KXCPICOREYOY-26DEC-T3.0", "KXCPICOREYOY-26NOV-T2.5",
+                      "KXCPICOREYOY-27MAR-T2.8", "KXCPICOREYOY-26DEC"):
+                self.assertTrue(imm.cpi_pilot_active(t), t)
+                self.assertFalse(IncentiveMarketMaker._blocked(t), t)
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+            # the normal book owns it, so the open scan never takes it
+            self.assertEqual(imm.scan_universe_reason("KXCPICOREYOY-26DEC-T3.0"),
+                             "allowed")
+            # the probe, a bare series and look-alike series stay blocked
+            for t in ("KXCPICOREYOY-X", "KXCPICOREYOY", "KXCPICOREYOYX-26DEC-T3.0",
+                      "KXCPIYOY-26DEC-T3.5"):
+                self.assertFalse(imm.cpi_pilot_active(t), t)
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+            self.assertEqual(imm.scan_universe_reason("KXCPIYOY-26DEC-T3.5"), "blocked")
+            # an end date closes the family too
+            imm.CPI_PILOT_UNTIL = datetime.now(timezone.utc) - timedelta(seconds=1)
+            self.assertTrue(IncentiveMarketMaker._blocked("KXCPICOREYOY-26DEC-T3.0"))
+        finally:
+            imm.ALLOWLIST_ONLY, imm.CPI_PILOT_UNTIL = prev_only, prev_until
+        # the same guards: weekday 08:25-11:05 ET blackout, out 7 days
+        # before close, normal size
+        def at(y, mo, d, hh, mm):
+            return imm.ET.localize(datetime(y, mo, d, hh, mm)).astimezone(timezone.utc)
+        self.assertTrue(imm.series_in_blackout("KXCPICOREYOY", at(2026, 10, 2, 9, 0)))
+        self.assertFalse(imm.series_in_blackout("KXCPICOREYOY", at(2026, 10, 2, 11, 5)))
+        self.assertFalse(imm.series_in_blackout("KXCPICOREYOY", at(2026, 10, 3, 9, 0)))
+        close = datetime(2027, 1, 13, 13, 30, tzinfo=timezone.utc)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXCPICOREYOY", "KXCPICOREYOY-26DEC", None, close_time=close),
+            close - timedelta(days=7))
+        ov = imm.series_override("KXCPICOREYOY")
+        self.assertIsNone(ov.size_mult)
+        self.assertIsNone(ov.levels)
+        self.assertIsNone(ov.max_position)
 
     def test_company_headcount_events_are_blocked(self):
         # Jack 2026-09-24: "blocklist ... company headcount markets". The

@@ -8,6 +8,7 @@ dont block but give me a report on oct 13. ill block if needed").
 
     python imm_cpi_pilot_report.py [--since 2026-09-29T02:00:00Z]
                                    [--events KXCPICORE-26NOV,KXCPICORE-26DEC]
+                                   [--families KXCPICOREYOY]
 
 Prints Markdown and writes run-logs/incentive-mm/cpi_pilot_report_<date>.md.
 Places, amends and cancels nothing.
@@ -40,6 +41,12 @@ F = lambda v: float(v or 0.0)                                   # noqa: E731
 # the stint this pilot is judged against (9/14-9/24 open-scan CPI quoting)
 BASELINE = {"markout_1h": -7.64, "markout_24h": -14.33, "credits": 95.71,
             "trading": -210.31, "fills": 39, "contracts": 1110}
+# accrued_est is a lifetime counter: what the KXCPICOREYOY tickers carried
+# from that stint when the family joined the pilot (imm_state.json,
+# 2026-10-01 17:30Z, before the deploy -- blocked, so frozen) is not the
+# pilot's and comes off their estimate
+PRE_PILOT_ACCRUED = {"KXCPICOREYOY-26DEC-T2.5": 4.0907, "KXCPICOREYOY-26DEC-T2.8": 4.9402,
+                     "KXCPICOREYOY-26DEC-T2.9": 7.2366, "KXCPICOREYOY-26NOV-T2.5": 5.0404}
 
 
 def parse_ts(s):
@@ -50,6 +57,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2026-09-29T02:00:00Z")
     ap.add_argument("--events", default="KXCPICORE-26NOV,KXCPICORE-26DEC")
+    # whole families in the pilot (Jack 2026-10-01: "yes add this family"):
+    # their open events plus any event the IMM's ledgers show a fill in
+    ap.add_argument("--families", default="KXCPICOREYOY")
     ap.add_argument("--out", default=None,
                     help="report path (default run-logs/incentive-mm/cpi_pilot_report_<ET date>.md)")
     a = ap.parse_args(argv)
@@ -72,6 +82,22 @@ def main(argv=None):
                     continue
                 raise
         raise RuntimeError(path)
+
+    for fam in [s.strip() for s in a.families.split(",") if s.strip()]:
+        fam_events = set()
+        for fp in glob.glob(os.path.join(STATUS, "fills_*.jsonl")):
+            with open(fp, encoding="utf-8") as fh:
+                for line in fh:
+                    if f'"series": "{fam}"' in line:
+                        try:
+                            fam_events.add(json.loads(line)["event_ticker"])
+                        except (ValueError, KeyError):
+                            pass
+        for e in get("/events", {"series_ticker": fam, "status": "open",
+                                 "limit": 200}).get("events") or []:
+            if e.get("event_ticker"):
+                fam_events.add(e["event_ticker"])
+        events += sorted(ev for ev in fam_events if ev not in events)
 
     state = {}
     try:
@@ -171,7 +197,7 @@ def main(argv=None):
                     "m24": None if m24 is None else sg * (m24 - py),
                     "mnow": sg * (mid - py),
                     "blackout": et.weekday() < 5 and (8 * 60 + 25) <= et.hour * 60 + et.minute < (11 * 60 + 5)})
-            est = F(accrued.get(t))
+            est = max(0.0, F(accrued.get(t)) - PRE_PILOT_ACCRUED.get(t, 0.0))
             rows.append((t, len(fs), sum(F(f["count_fp"]) for f in fs), Y - N,
                          cash, val, cash + val, est, mid))
             tot["cash"] += cash

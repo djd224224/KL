@@ -3469,7 +3469,8 @@ register_close_cutoff_days(
 
 # CPI PILOT (Jack 2026-09-28: "try the least bad version. keep size same as
 # normal IMM"). CPI stays blocked (".*CPI.*" in SERIES_BLOCK_PATTERNS)
-# except the events named here, which quote in the NORMAL book at normal
+# except the events named here and every event of the families named here
+# (KXCPICOREYOY since 2026-10-01), which quote in the NORMAL book at normal
 # size under two stand-downs. NO END DATE by default (Jack 2026-09-28 pm:
 # "keep it default running, dont block but give me a report on oct 13. ill
 # block if needed"): each event quotes to its own pre-release cutoff. An
@@ -3494,6 +3495,16 @@ CPI_PILOT_EVENTS = tuple(sorted(
     e.strip() for e in os.environ.get(
         "IMM_CPI_PILOT_EVENTS", "KXCPICORE-26NOV,KXCPICORE-26DEC").split(",")
     if e.strip()))
+# Whole FAMILIES in the pilot (Jack 2026-10-01: "yes add this family", the
+# day KXCPICOREYOY-26DEC's program opened): every EVENT of these series
+# joins it under the same guards (normal book, normal size, the weekday
+# blackout, out 7 days before close). The "<series>-X" probe still never
+# matches, so no auto-enroll / scan path opens the series. Kill switch:
+# IMM_CPI_PILOT_FAMILIES="" (env = task restart).
+CPI_PILOT_FAMILIES = tuple(sorted(
+    s.strip() for s in os.environ.get(
+        "IMM_CPI_PILOT_FAMILIES", "KXCPICOREYOY").split(",")
+    if s.strip()))
 _cpi_until = os.environ.get("IMM_CPI_PILOT_UNTIL", "").strip()
 CPI_PILOT_UNTIL: Optional[datetime] = (
     datetime.fromisoformat(_cpi_until) if _cpi_until else None)   # None = no end
@@ -3501,14 +3512,19 @@ CPI_PILOT_BLACKOUT_ET = tuple(os.environ.get(
     "IMM_CPI_PILOT_BLACKOUT_ET", "08:25-11:05").split("-"))
 CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS = _env_float(
     "IMM_CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS", 7.0)
-CPI_PILOT_SERIES = tuple(sorted({series_of(e) for e in CPI_PILOT_EVENTS}))
+CPI_PILOT_SERIES = tuple(sorted(
+    {series_of(e) for e in CPI_PILOT_EVENTS} | set(CPI_PILOT_FAMILIES)))
 
 
 def cpi_pilot_active(ticker: str, now_utc: Optional[datetime] = None) -> bool:
-    """True if `ticker` (a market or its event) is in a CPI pilot event and
-    the pilot has no end (the default) or its end has not passed. The
-    '<series>-X' probe never matches."""
-    if event_ticker_of(ticker) not in CPI_PILOT_EVENTS:
+    """True if `ticker` (a market or its event) is in a CPI pilot event, or
+    in any event of a CPI pilot family, and the pilot has no end (the
+    default) or its end has not passed. The '<series>-X' probe and a bare
+    series never match."""
+    ev = event_ticker_of(ticker)
+    series, _, seg = ev.partition("-")
+    if ev not in CPI_PILOT_EVENTS and not (
+            series in CPI_PILOT_FAMILIES and seg and seg != "X"):
         return False
     if CPI_PILOT_UNTIL is None:
         return True
@@ -6077,7 +6093,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_DRIFT_CENTS", "EVENT_DEPTH_MIN_CONTRACTS", "EVENT_DEPTH_JUMP_CENTS",
     "EVENT_DEPTH_STACK_CONTRACTS",
     "SERIES_BLOCK_PATTERNS", "MARKET_BLOCK_SUFFIXES", "EVENT_BLOCK_PATTERNS",
-    "CPI_PILOT_EVENTS", "CPI_PILOT_UNTIL", "CPI_PILOT_BLACKOUT_ET",
+    "CPI_PILOT_EVENTS", "CPI_PILOT_FAMILIES", "CPI_PILOT_UNTIL", "CPI_PILOT_BLACKOUT_ET",
     "CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS",
     "AUCTION_DATE_SERIES", "EVENT_TOP_N",
     "AWARDS_SERIES", "AWARDS_PRE_EVENT_DAYS", "AWARDS_EVENT_DATES",

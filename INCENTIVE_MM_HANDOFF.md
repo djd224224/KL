@@ -5872,3 +5872,42 @@ DAL 7" 47x49 vs 60); five stations wet (AUS, CHI, CLL, MIA, MKE); MKE 1"
 on the boundary (MTD 0.96"); LAX/SEA/SFO had no October CLI yet
 (obs-only MTD, as rain_monthly does on a month's first day). First write
 111s (ACIS history downloads, cached 7 days), later ones cached.
+
+## 2026-10-01 — CPI pilot takes the whole YoY core family, KXCPICOREYOY (Jack)
+
+Jack: "yes add this family" -- after asking why KXCPICOREYOY-26DEC was not
+quoting ("i thought core CPI markets were quoted"). The 9/28 CPI pilot named
+two EVENTS, KXCPICORE-26NOV / -26DEC (core month-over-month); the YoY core
+series stayed under the 9/24 ".*CPI.*" block and never reached selection.
+Its 26DEC program opened 16:03Z 10/01: 15 strikes x $100 over 7 days
+(~$14.29/day each), to 10/08.
+
+MECHANISM. CPI_PILOT_FAMILIES (env IMM_CPI_PILOT_FAMILIES, default
+"KXCPICOREYOY", in the config hash): every EVENT of a listed series is
+cpi_pilot_active, so _blocked exempts it and _allowed admits it -- the
+normal book at normal size, exactly like the pilot events. The family's
+series joins CPI_PILOT_SERIES, so it gets the same guards: the weekday
+08:25-11:05 ET blackout ("CPI pilot release blackout", guard cpi_blackout)
+and out 7 days before close (26DEC closes 2027-01-13 13:25Z -> out
+2027-01-06 13:25Z). The "<series>-X" probe and a bare series never match,
+so no auto-enroll / finecon / scan path opens the series; the scan screen
+reads the family "allowed" (the book owns it). Every other CPI series,
+KXCPIYOY included, stays blocked. IMM_CPI_PILOT_UNTIL closes the family too.
+
+PARITY (launcher $ProbeEnv, live books 17:30Z 10/01): all 15 26DEC strikes
+allowed; T2.3-T3.3 have mids in band, T2.1/T2.2 (97x99) and T3.4/T3.5 (2x5)
+are extreme.
+
+REPORT. imm_cpi_pilot_report.py gains --families (default KXCPICOREYOY): the
+family's open events plus any event with an IMM fill join the review
+(10/01: 26SEP, 26NOV, 26DEC). accrued_est is a lifetime counter, so the four
+KXCPICOREYOY tickers' $21.31 from the 9/14-9/24 open-scan stint
+(PRE_PILOT_ACCRUED, snapshotted before the deploy while the family was
+blocked) comes off their estimate. The Oct 13 review covers the family.
+
+KILL SWITCHES. IMM_CPI_PILOT_FAMILIES="" (task restart) drops the family and
+leaves the two named events; IMM_CPI_PILOT_EVENTS="" drops those.
+
+WATCH: KXCPICOREYOY-26DEC strikes in selection_snapshot ("selected" /
+"extreme_mid"), "CPI pilot release blackout" lines on weekday mornings, no
+orders in 08:25-11:05 ET.
