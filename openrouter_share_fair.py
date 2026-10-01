@@ -241,19 +241,21 @@ def author_vol(weeks: List[dict], current: date, n: int = SHARE_VOL_WEEKS) -> Di
 
 
 def week_of(event_ticker: str, rules: str = "") -> Optional[date]:
-    """The Monday a share event measures: 'week of Sep 28, 2026' in the rules,
-    else the ticker date (the Monday after) minus 7 days."""
-    m = re.search(r"week of ([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s*(\d{4})", rules or "")
-    if m and _MONTHS.get(m.group(1).lower()[:3]):
-        try:
-            return date(int(m.group(3)), _MONTHS[m.group(1).lower()[:3]], int(m.group(2)))
-        except ValueError:
-            pass
-    m = re.match(r"^[A-Z0-9]+-(\d{2})([A-Z]{3})(\d{2})", event_ticker)
+    """The Monday a share event measures: the ticker date (the settling
+    Monday) minus 7 days, else 'week of Sep 28, 2026' in the rules. The
+    ticker wins: on the August events the rules' "week of" label was a week
+    off, while ticker - 7 matched every settlement (checked 2026-09-27)."""
+    m = re.match(r"^[A-Z0-9]+-(\d{2})([A-Z]{3})(\d{2})$", event_ticker)
     if m and _MONTHS.get(m.group(2).lower()):
         try:
             return date(2000 + int(m.group(1)), _MONTHS[m.group(2).lower()],
                         int(m.group(3))) - timedelta(days=7)
+        except ValueError:
+            pass
+    m = re.search(r"week of ([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s*(\d{4})", rules or "")
+    if m and _MONTHS.get(m.group(1).lower()[:3]):
+        try:
+            return date(int(m.group(3)), _MONTHS[m.group(1).lower()[:3]], int(m.group(2)))
         except ValueError:
             return None
     return None

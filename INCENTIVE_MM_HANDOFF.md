@@ -5431,7 +5431,9 @@ requests that week. The per-model leaderboard (/api/frontend/v1/rankings/
 models?view=day|week, `count`; text-output models via the catalog) gives the
 run rate and the share of authors folded into Others. Everything is whole
 UTC days (views day / week / month / trending, no intraday view); on 10/01
-the chart's week-to-date was cached 02:25Z with 9/30 in it.
+the chart's week-to-date was cached 02:25Z with 9/30 in it. The measured
+week is the ticker date (the settling Monday) minus 7: the rules' "week of"
+label was a week off on the August events, the ticker matched settlement.
 
 MODEL. Per event, week W: mu = 100 (K_a + r R s_a) / (K_T + r R), K = the
 chart's week-to-date (e complete days), r = 7 - e, s_a / R = the plain

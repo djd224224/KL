@@ -77,12 +77,16 @@ class TestChartReproducesSettlement(unittest.TestCase):
 
 class TestParsing(unittest.TestCase):
 
-    def test_week_from_rules_then_ticker(self):
+    def test_week_from_the_ticker_then_rules(self):
         rules = ("If Anthropic scores above 3.1% on OpenRouter text market share by "
                  "model author week of Sep 28, 2026, then the market resolves to Yes.")
         self.assertEqual(osf.week_of("KXANTHSHARE-26OCT05", rules), date(2026, 9, 28))
         self.assertEqual(osf.week_of("KXANTHSHARE-26OCT05", ""), date(2026, 9, 28))
         self.assertEqual(osf.week_of("KXANTHSHARE-27JAN04", ""), date(2026, 12, 28))
+        # the August events' rules named the wrong week; the ticker settled
+        self.assertEqual(osf.week_of("KXOPENSHARE-26AUG24", "week of Aug 10, 2026"),
+                         date(2026, 8, 17))
+        self.assertEqual(osf.week_of("KXANTHSHARE-ANTH", rules), date(2026, 9, 28))
         self.assertIsNone(osf.week_of("KXANTHSHARE-ANTH", ""))
 
     def test_author_counts_text_only(self):
