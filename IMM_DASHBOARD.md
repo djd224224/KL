@@ -98,6 +98,23 @@ measures P&L between the same snapshots its history row uses.
 A build fixes "now" when it starts and ignores log rows written after it, so
 a slow build cannot pull a window's end edge back to an older snapshot.
 
+**Window edges line up with the snapshots.** A 5-minute position snapshot is
+stamped at its cycle's start but written after that cycle booked its fills
+and settlements, while the bot writes the matching realized row only at its
+next state save (37s later on median, 2+ minutes at the 90th percentile). So
+each realized row is dated by the cycle that booked it (the fills log's
+`cycle_ts`; a settlement's or offset's own cycle), and a vanished position by
+the first snapshot without it. Without this, a window ending on that snapshot
+held the position change but not the realized P&L (9/30: -$5.80 shown for a
+true -$12.80 on one gas market).
+
+`imm_dashboard_verify.py` lists apart any market whose end position Kalshi's
+fills on the bot's orders cannot reproduce: there the bot's own book was
+edited without a fill (a state restore, a reconcile adopting someone else's
+fill), and the dashboard follows the bot's book. First seen 9/30 on
+KXMLBSEASONGAMES-27-2425 (book -47.36 vs fills -25.00 until the 0077bd5
+restore), worth about $1-2 a day.
+
 ## New launches and "promising"
 
 Events are grouped by series. A series that already had events before the

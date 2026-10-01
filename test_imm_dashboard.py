@@ -223,6 +223,29 @@ class FillsDedupeTests(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class RetimeTests(unittest.TestCase):
+    """A realized row is written at the bot's next save, minutes after the
+    cycle whose snapshot already shows the fill or settlement."""
+
+    def test_rows_move_to_the_cycle_that_booked_them(self):
+        b = dash.Builder(_ts("2026-09-30T03:00:00Z"), api=False, api_force=False)
+        c = _ts("2026-10-01T02:04:43Z")                 # a full cycle's start
+        b.cycles = [c - 43, c, c + 43]
+        b.fills = [{"t": "KXA-1", "ts": c - 117, "cyc": c + 1.0},       # booked 1s into cycle c
+                   {"t": "KXF-1", "ts": c + 50, "cyc": c + 60.0}]       # a fast-lane booking
+        b.settlements = [{"t": "KXS-1", "ts": c + 20.0, "result": "yes"}]  # booked mid-cycle
+        b.realized = [(c + 133.0, "KXA-1", "KXA", -7.0),                  # saved 2 min later
+                      (c + 95.0, "KXF-1", "KXF", 1.0),
+                      (c + 61.0, "KXS-1", "KXS", 2.0),
+                      (c + 30.0, "KXN-1", "KXN", 3.0)]                    # nothing to anchor on
+        b._retime_realized()
+        eff = {t: ts for ts, t, _e, _d in b.realized}
+        self.assertLess(eff["KXA-1"], c)            # inside the window that ends at cycle c's snapshot
+        self.assertGreater(eff["KXF-1"], c)         # a fast-lane fill lands after that snapshot
+        self.assertLess(eff["KXS-1"], c)            # the settlement too
+        self.assertEqual(eff["KXN-1"], c + 30.0)
+
+
 class RenderTests(unittest.TestCase):
     def test_data_cannot_close_the_script_tag(self):
         page = dash.render({"x": "</script><script>alert(1)</script>", "timing": {}})

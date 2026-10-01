@@ -63,6 +63,7 @@ Output lines are ASCII (the IMM task consoles are cp1252).
 """
 
 import argparse
+import bisect
 import csv
 import glob
 import html as _html
@@ -753,6 +754,9 @@ def load_fills(first_day: str):
                 "pos0": _f(r.get("pos_before")), "pos1": _f(r.get("pos_after")),
                 "bid": r.get("ext_bid"), "ask": r.get("ext_ask"),
                 "age": r.get("order_age_secs"),
+                # when the bot BOOKED it (fills are polled ~1s into a cycle);
+                # a snapshot stamped at that cycle's start already holds it
+                "cyc": _f(r.get("cycle_ts"), None),
             })
     out.sort(key=lambda x: x["ts"])
     return out
@@ -1180,6 +1184,7 @@ class Builder:
         self.fills = load_fills(self.first_day)
         self.realized = load_realized(self.first_day)
         self.settlements = load_settlements(self.first_day)
+        self._retime_realized()
         self.toxic = load_toxic(datetime.fromtimestamp(self.now - 3 * 86400, timezone.utc)
                                 .strftime("%Y-%m-%d"))
         self._t("small_sinks", t0)
@@ -1281,6 +1286,60 @@ class Builder:
         self.snap_totals.sort()
 
 
+    # ---- when a realized row really happened ------------------------------------
+    FILL_BOOK_LAG = 5.0      # fills are polled within ~1s of a cycle's start
+
+    def _cycle_start(self, t: float):
+        """Start of the full cycle in which time `t` fell (cycle_log stamps,
+        whole seconds), or None outside the logged cycles."""
+        cyc = self._cycle_sorted
+        i = bisect.bisect_right(cyc, t) - 1
+        if i < 0 or t - cyc[i] > 120:
+            return None
+        return cyc[i]
+
+    def _retime_realized(self):
+        """Re-stamp each realized row with the moment its P&L entered the
+        book rather than when the bot next saved state. The bot writes a
+        realized row at its next save (37s after the booking on median, 2+
+        min at the 90th percentile), but the 5-minute position snapshot is
+        stamped at its cycle's START and written after that cycle booked its
+        fills and settlements -- so a snapshot can already show a fill whose
+        realized row comes minutes later, and a window ending at that
+        snapshot would hold the position change without the realized P&L
+        (9/30: KXAAAGASM-26OCT31-4.10 read -$5.80 for a true -$12.80).
+        A fill-driven row moves to its booking time less FILL_BOOK_LAG (a
+        fast-lane booking stays after the previous full cycle's snapshot); a
+        settlement-driven row, booked mid-cycle, moves to just before its
+        cycle's start."""
+        self._cycle_sorted = sorted(set(self.cycles))
+        fills_b = defaultdict(list)
+        for f in self.fills:
+            fills_b[f["t"]].append(f["cyc"] if f.get("cyc") else f["ts"])
+        setl_b = defaultdict(list)
+        for s_ in self.settlements:
+            setl_b[s_["t"]].append(s_["ts"])
+        for d in (fills_b, setl_b):
+            for v in d.values():
+                v.sort()
+
+        def latest(lst, x):
+            i = bisect.bisect_right(lst, x) - 1
+            return lst[i] if i >= 0 else None
+        out = []
+        for ts, t, ev, d in self.realized:
+            fb = latest(fills_b.get(t, []), ts + 1.0)
+            sb = latest(setl_b.get(t, []), ts + 1.0)
+            eff = ts
+            if sb is not None and (fb is None or sb >= fb) and ts - sb < 900:
+                c0 = self._cycle_start(sb)
+                eff = (c0 - 0.5) if c0 is not None else sb
+            elif fb is not None and ts - fb < 900:
+                eff = fb - self.FILL_BOOK_LAG
+            out.append((min(eff, ts), t, ev, d))
+        out.sort()
+        self.realized = out
+
     # ---- position exits the realized log does not book ------------------------
     def build_exits(self):
         """Every position that left the bot's book without the realized log
@@ -1326,7 +1385,9 @@ class Builder:
                 pos, avg, mk = g[1], g[2], g[3]
             else:
                 pos, avg, mk = s_["pos"], s_["avg"], None
-            exits.append({"ts": s_["ts"], "t": s_["t"], "pos": pos, "avg": avg,
+            c0 = self._cycle_start(s_["ts"])
+            exits.append({"ts": (c0 - 0.5) if c0 is not None else s_["ts"], "t": s_["t"],
+                          "pos": pos, "avg": avg,
                           "mark": mk if mk is not None else avg, "kind": "offset"})
         # (2) vanished positions
         for (t, pos, avg, mk, last_ts, gone_ts) in self.gone:
@@ -1337,7 +1398,7 @@ class Builder:
                 continue                                  # closed by a fill
             if any(gone_ts <= c <= gone_ts + VANISH_REAPPEAR_SECS for c in came_by.get(t, [])):
                 continue                                  # a blip: back within hours
-            exits.append({"ts": gone_ts, "t": t, "pos": pos, "avg": avg,
+            exits.append({"ts": gone_ts - 0.001, "t": t, "pos": pos, "avg": avg,
                           "mark": mk if mk is not None else avg, "kind": "vanish"})
         self.exits = sorted(exits, key=lambda e: e["ts"])
         self._resolve_exits()

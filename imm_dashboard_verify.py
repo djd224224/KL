@@ -13,8 +13,12 @@ window independently of the bot's realized/avg-cost bookkeeping:
                        Kalshi has not settled is a transfer at its last mark
   * P&L              = cash from fills + settlement payouts + V1 - V0
 
-and checks three things: the fills log holds exactly Kalshi's fills, the
-replay reproduces the bot's end positions, and the two P&L figures match.
+and checks that the fills log holds exactly Kalshi's fills and that the two
+P&L figures match market by market. A market whose end position the replay
+cannot reproduce had the bot's own book edited without a fill (a restore, a
+reconcile adoption); it is listed apart, since the dashboard follows the
+bot's book. Fills are placed by the cycle that booked them (the fills log's
+cycle_ts), as the dashboard places realized P&L.
 Read-only. Found on 2026-09-29: scalar settlements the bot logs as manual
 offsets (+$299 unbooked 9/6-9/29), positions dropped with no record, and
 double-written fill rows -- all now handled by the dashboard.
@@ -65,14 +69,19 @@ def verify(b: "dash.Builder", key: str) -> bool:
         return True
     s0, s1 = b.snap_at(e0), b.snap_at(e1)
     ids = bot_order_ids(e0, e1)
-    kf = kalshi_get_all("/portfolio/fills", {"min_ts": int(e0) - 60, "max_ts": int(e1) + 60, "limit": 1000},
+    kf = kalshi_get_all("/portfolio/fills", {"min_ts": int(e0) - 900, "max_ts": int(e1) + 900, "limit": 1000},
                         items_key="fills", max_pages=400)
-    bot = [f for f in kf if e0 <= f["ts"] < e1 and f.get("order_id") in ids]
-    sink = {f["id"] for f in b.fills if e0 <= f["ts"] < e1}
+    # a fill belongs to the window whose end snapshot first holds it: by the
+    # cycle that booked it (the fills log's cycle_ts), as the dashboard does
+    booked = {f["id"]: (f["cyc"] - b.FILL_BOOK_LAG if f.get("cyc") else f["ts"]) for f in b.fills}
+    def when(f):
+        return booked.get(f["fill_id"], f["ts"])
+    bot = [f for f in kf if e0 <= when(f) < e1 and f.get("order_id") in ids]
+    sink = {f["id"] for f in b.fills if e0 <= booked.get(f["id"], f["ts"]) < e1}
     kid = {f["fill_id"] for f in bot}
     pos = {t: v[0] for t, v in s0[1].items()}
     cash = defaultdict(float)
-    for f in sorted(bot, key=lambda x: x["ts"]):
+    for f in sorted(bot, key=when):
         q = float(f["count_fp"])
         dq = q if f["book_side"] == "bid" else -q
         pos[f["ticker"]] = pos.get(f["ticker"], 0.0) + dq
@@ -103,16 +112,24 @@ def verify(b: "dash.Builder", key: str) -> bool:
         per[t] += v
     replay = sum(per.values())
     shown = sum(v["pnl"] for v in mk.values())
-    pos_miss = [t for t in s1[1] if abs(pos.get(t, 0.0) - s1[1][t][0]) > 0.05]
+    # a market whose end position the replay cannot reproduce had its OWN BOOK
+    # changed without a fill on the bot's orders (a state restore, a reconcile
+    # adopting someone else's fill): the dashboard follows the bot's book, so
+    # it is reported apart from method errors
+    edited = {t for t in set(pos) | set(s1[1])
+              if abs(pos.get(t, 0.0) - (s1[1][t][0] if t in s1[1] else 0.0)) > 0.05}
     worst = sorted(set(per) | set(mk), key=lambda t: -abs(per.get(t, 0.0) - mk.get(t, {}).get("pnl", 0.0)))
-    bad = [t for t in worst if abs(per.get(t, 0.0) - mk.get(t, {}).get("pnl", 0.0)) > TOL]
-    good = abs(replay - shown) <= max(TOL, 0.0001 * abs(replay)) and not bad and not pos_miss \
-        and kid == sink
+    diff = [t for t in worst if abs(per.get(t, 0.0) - mk.get(t, {}).get("pnl", 0.0)) > TOL]
+    bad = [t for t in diff if t not in edited]
+    good = not bad and kid == sink
     print(f"{key:9s} {'OK  ' if good else 'DIFF'} dashboard {shown:+,.2f} vs Kalshi replay {replay:+,.2f} | "
-          f"fills {len(sink)} logged / {len(kid)} on Kalshi (missing {len(kid - sink)}, extra {len(sink - kid)}) | "
-          f"end-position mismatches {len(pos_miss)}")
+          f"fills {len(sink)} logged / {len(kid)} on Kalshi (missing {len(kid - sink)}, extra {len(sink - kid)})"
+          + (f" | bot book edited without a fill on {len(edited)} market(s)" if edited else ""))
     for t in bad[:8]:
         print(f"          {t:50s} dashboard {mk.get(t, {}).get('pnl', 0.0):+9.2f}  replay {per.get(t, 0.0):+9.2f}")
+    for t in sorted(edited)[:8]:
+        print(f"          edited: {t:42s} dashboard {mk.get(t, {}).get('pnl', 0.0):+9.2f}  replay {per.get(t, 0.0):+9.2f}"
+              f"  (bot book {s1[1][t][0] if t in s1[1] else 0.0:+.2f} vs fills {pos.get(t, 0.0):+.2f})")
     return good
 
 
