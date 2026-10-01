@@ -198,8 +198,18 @@ if ($Probe) {
     # 100 -> 150 (Jack 2026-09-10 pm "increase 100 event cap to 150"): the
     # *CC credit-card family (30 events, 3 strikes each after the ROI cap)
     # took the book to 100/100 the moment it was allowed in, with three CC
-    # events left out as not_ranked. Launcher env change => task-level
-    # restart (restart_imm.ps1 -Task), a python kill keeps the stale env.
+    # events left out as not_ranked. 150 -> 200 (Jack 2026-09-22, 8707d5e):
+    # the *ADS/*POS family events were not_ranked behind a full 150.
+    # 200 -> 1000 (Jack 2026-10-01 "increase event cap to 1000"): the October
+    # Carbon Arc programs opened 00:00 ET 10/1 into a full 200/200 book; 12
+    # of their events (41 strikes: TGTCC, WMTCC, LULUCC, DKSCC, VELOPOS,
+    # REDBULLPOS, MOUNTAINDEWPOS, ROGUEPOS, STREAMINGADS, SPORTSBOOKADS,
+    # TEENCLOTHADS, NFLXAPP) sat not_ranked -- silently skipped, logged as
+    # "gone" in selection_events. 1000 takes the cap out of play; the
+    # collateral budget below is the breadth governor again (~$45k of $50k
+    # in use at the change, ladder + inventory reserve). Launcher env change
+    # => task-level restart (restart_imm.ps1 -Task), a python kill keeps the
+    # stale env.
     # KXAAAGASW paused (Jack 2026-08-31 "pause KXAAAGASW": lifetime net
     # -$298, negative in every window; dailies + diesel stay live). The
     # entry was lost once on 9/1 when the pause sat uncommitted through a
@@ -262,7 +272,7 @@ if ($Probe) {
     # leave after the 30-minute clock (positions ride). The rate bar only
     # binds an event with no quoting member left, which is the right answer
     # for strikes earning ~$0.04-0.17/day. Env knob => task-level restart.
-    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=200&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
+    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=50000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=250&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 
 while ($true) {
