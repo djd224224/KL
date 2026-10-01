@@ -3507,6 +3507,18 @@ _DEFAULT_VERCEL_SERIES = ("KXOPENVSPEND,KXMOONVSPEND,KXANTHVSPEND,KXGOOGVREQ,"
 # pattern-blocked (SERIES_BLOCK_PATTERNS).
 _MORT_LIVE = os.environ.get("IMM_MORT_ENABLE", "1") == "1"
 _DEFAULT_MORT_SERIES = "KXFM30YMTG,KXMORTGAGERATE"
+# OPENROUTER MARKET SHARE (Jack 2026-09-30: "scrape OpenRouter for market
+# share markets", then "i got permission"). KX<AUTHOR>SHARE settle on the
+# Market Share chart of openrouter.ai/rankings -- an author's share of the
+# week's text requests, 10:00 ET the Monday after -- a live public feed the
+# open-scan tier rejects on `openrouter`. Enrolled here only with the SHARE_*
+# gate: quoted against openrouter_share_fair's read of the chart's own data,
+# fail closed; IMM_SHARE_FAIR_ENABLE=0 or IMM_ALLOW_OR_SHARE_SERIES="" takes
+# them out.
+_SHARE_LIVE = os.environ.get("IMM_SHARE_FAIR_ENABLE", "1") == "1"
+_DEFAULT_OR_SHARE_SERIES = ("KXANTHSHARE,KXOPENSHARE,KXGOOGSHARE,KXDEEPSHARE,"
+                            "KXBABASHARE,KXXIAOMISHARE,KXZAISHARE,KXMISTRALSHARE,"
+                            "KXTENCENTSHARE,KXSTEALTHSHARE")
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -3697,6 +3709,11 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_MORT_SERIES",
                                         _DEFAULT_MORT_SERIES)
                          if _MORT_LIVE else "")
+                # OpenRouter market share (2026-09-30): only while the share
+                # gate is on
+                + "," + (os.environ.get("IMM_ALLOW_OR_SHARE_SERIES",
+                                        _DEFAULT_OR_SHARE_SERIES)
+                         if _SHARE_LIVE else "")
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -5872,6 +5889,11 @@ _CONFIG_CODE_KNOBS = (
     # fair file's "model" block (openrouter_fair.py)
     "OR_FAIR_ENABLE", "OR_FAIR_SERIES", "OR_FAIR_TOL_CENTS", "OR_FAIR_TTL_MIN",
     "OR_FAIR_SIGMA_LO_FRAC", "OR_FAIR_REFRESH_HOLD_MIN",
+    # OpenRouter market-share gate (2026-09-30); model knobs ride in the
+    # fair file's "model" block (openrouter_share_fair.py)
+    "SHARE_FAIR_ENABLE", "SHARE_FAIR_TOL_CENTS", "SHARE_FAIR_TTL_MIN",
+    "SHARE_FAIR_SIGMA_LO_FRAC", "SHARE_FAIR_REFRESH_HOLD_MIN",
+    "SHARE_CUTOFF_FROM_CLOSE_MIN",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
     # fair file's "model" block (gasbuddy_fair.py)
     "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",
@@ -6770,6 +6792,159 @@ def or_gate_reason(ticker: str, now_ts: float,
                  "lo": round(lo * 100, 2), "hi": round(hi * 100, 2),
                  "tol": OR_FAIR_TOL_CENTS, "bid_bad": bid_bad,
                  "ask_bad": ask_bad})
+    return "", {}
+
+
+# ----------------------------------------------------------------------------
+# OPENROUTER MARKET-SHARE FAIR GATE (Jack 2026-09-30: "scrape OpenRouter for
+# market share markets", then "i got permission"). KX<AUTHOR>SHARE-<Monday>
+# -<K> ("Anthropic above 3.1% ... week of Sep 28") settles on the Market
+# Share chart of openrouter.ai/rankings at 10:00 ET the Monday after: the
+# author's share of the week's TEXT REQUESTS, rounded to one decimal, every
+# strike No when the chart folds the author into Others (it names nine).
+# openrouter_share_fair.py reads the chart's own data (the week-to-date by
+# author; it reproduces every settled value checked, weeks of Sep 7-21) and
+# the per-model leaderboard for the run rate, and writes SHARE_FAIR_FILE: per
+# EVENT, N(mu, sigma) in pp for the week's share, p_ident (named by the
+# chart), `complete` once the week has ended, `lag` while the day just ended
+# is not yet published. P(YES) = p_ident x P(share >= K + 0.05). Like the
+# token gate it fails CLOSED -- the series are allowed only with the feed
+# (_DEFAULT_OR_SHARE_SERIES). A market stands aside on BOTH sides while
+#   - its event has no fresh read (missing file, stale past SHARE_FAIR_TTL_MIN),
+#   - the week is complete (00:00Z Monday; the cutoff is set there too),
+#   - OpenRouter's daily update is due: from 00:00Z until both the chart and
+#     the leaderboard show the day just ended (~02:25Z on 10/01) everyone's
+#     read is a day old and the update that reprices the book is coming,
+#   - the read moved within SHARE_FAIR_REFRESH_HOLD_MIN (a new day landed;
+#     not on the first load after a restart),
+#   - its external touch fights the fair band (P at sigma and at sigma x
+#     SHARE_FAIR_SIGMA_LO_FRAC) on the adverse side by more than
+#     SHARE_FAIR_TOL_CENTS.
+# Kill switch IMM_SHARE_FAIR_ENABLE=0 takes the family out of the allowlist
+# (never quoted without the gate).
+SHARE_FAIR_ENABLE = _SHARE_LIVE
+SHARE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_SHARE_FAIR_SERIES", _DEFAULT_OR_SHARE_SERIES).split(",") if s.strip())
+SHARE_FAIR_TOL_CENTS = _env_int("IMM_SHARE_FAIR_TOL_CENTS", 15)
+SHARE_FAIR_TTL_MIN = _env_int("IMM_SHARE_FAIR_TTL_MIN", 30)
+SHARE_FAIR_REFRESH_SECS = _env_int("IMM_SHARE_FAIR_REFRESH_SECS", 300)
+# while the daily update is due the refresher polls this often
+SHARE_FAIR_FAST_SECS = _env_int("IMM_SHARE_FAIR_FAST_SECS", 120)
+SHARE_FAIR_SIGMA_LO_FRAC = _env_float("IMM_SHARE_FAIR_SIGMA_LO_FRAC", 0.5)
+SHARE_FAIR_REFRESH_HOLD_MIN = _env_float("IMM_SHARE_FAIR_REFRESH_HOLD_MIN", 10)
+# cutoff = close - 14h = 00:00Z Monday, the end of the measured week, while
+# the 10:00 ET read is 14:00Z (EDT); in EST the gate's `complete` covers the
+# extra hour
+SHARE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_SHARE_CUTOFF_FROM_CLOSE_MIN", 840)
+SHARE_FAIR_FILE = os.environ.get(
+    "IMM_SHARE_FAIR_FILE", os.path.join(STATUS_DIR, "openrouter_share_fair.json"))
+# event -> entry; event -> epoch its read last moved (refresh hold)
+_share_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}}
+# strikes are written plain (KXANTHSHARE-26OCT05-3.1)
+_SHARE_STRIKE_RE = re.compile(r"-T?(\d+(?:\.\d+)?)$")
+
+for _s in SHARE_FAIR_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        cutoff_from_close_min=SHARE_CUTOFF_FROM_CLOSE_MIN)
+
+
+def share_fair_series(series: str) -> bool:
+    return SHARE_FAIR_ENABLE and series in SHARE_FAIR_SERIES
+
+
+def load_share_fair() -> Tuple[int, int]:
+    """Hot-reload SHARE_FAIR_FILE by mtime into _share_fair_state. Returns
+    (events loaded, events whose read moved) on a reload, else (0, 0). A
+    move -- a new day in the chart's week-to-date -- starts that event's
+    refresh hold, except on the first load."""
+    try:
+        mtime = os.path.getmtime(SHARE_FAIR_FILE)
+    except OSError:
+        return 0, 0
+    if mtime == _share_fair_state["mtime"]:
+        return 0, 0
+    _share_fair_state["mtime"] = mtime
+    try:
+        with open(SHARE_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! openrouter share fair file unreadable: {e}")
+        return 0, 0
+    old = _share_fair_state["entries"]
+    fresh: Dict[str, dict] = {}
+    for ev, e in (data.get("entries") or {}).items():
+        try:
+            ts = parse_iso_utc(str(e["fetched_at"]))
+            mu, sigma = float(e["mu"]), float(e["sigma"])
+            p_ident = float(e["p_ident"])
+            complete, lag = bool(e["complete"]), bool(e["lag"])
+            version = str(e["data_version"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or not all(math.isfinite(x) for x in (mu, sigma, p_ident)) \
+                or sigma < 0 or not 0.0 <= p_ident <= 1.0:
+            continue
+        fresh[str(ev)] = {"mu": mu, "sigma": sigma, "p_ident": p_ident,
+                          "complete": complete, "lag": lag,
+                          "lag_reason": str(e.get("lag_reason") or ""),
+                          "version": version, "ts": ts.timestamp()}
+    moved = [ev for ev, e in fresh.items()
+             if (old.get(ev) or {}).get("version") != e["version"]
+             or (old.get(ev) or {}).get("complete") != e["complete"]]
+    if old:
+        now_ts = time.time()
+        for ev in moved:
+            _share_fair_state["moved_at"][ev] = now_ts
+    _share_fair_state["entries"] = fresh
+    return len(fresh), len(moved)
+
+
+def share_p_yes(strike: float, mu: float, sigma: float, p_ident: float) -> float:
+    """P(the chart's share, rounded to one decimal, is above `strike`) and
+    the author is named: p_ident x P(share >= strike + 0.05)."""
+    return p_ident * _p_above(strike + 0.05, mu, max(1e-9, sigma))
+
+
+def share_gate_reason(ticker: str, now_ts: float,
+                      ext_bid: Optional[float], ext_ask: Optional[float]
+                      ) -> Tuple[str, dict]:
+    """('', {}) when an OpenRouter market-share market may quote, else
+    (reason, guard-skip inputs). Fails CLOSED on a missing / stale read."""
+    ev = ticker.rsplit("-", 1)[0]
+    m = _SHARE_STRIKE_RE.search(ticker)
+    e = _share_fair_state["entries"].get(ev)
+    if m is None or e is None or ev == ticker:
+        return "no OpenRouter share read for this event", {"reason": "no_read"}
+    if now_ts - e["ts"] > SHARE_FAIR_TTL_MIN * 60:
+        return "OpenRouter share read is stale", {"reason": "stale"}
+    if e["complete"]:
+        return ("week complete, the answer is public",
+                {"reason": "complete", "mu": e["mu"]})
+    if e["lag"]:
+        return (f"OpenRouter's daily update is due ({e['lag_reason']})",
+                {"reason": "lag"})
+    moved = _share_fair_state["moved_at"].get(ev)
+    if SHARE_FAIR_REFRESH_HOLD_MIN > 0 and moved is not None \
+            and now_ts - moved <= SHARE_FAIR_REFRESH_HOLD_MIN * 60:
+        return (f"new OpenRouter day, holding {SHARE_FAIR_REFRESH_HOLD_MIN:g}m "
+                f"while the book reprices", {"reason": "hold"})
+    k = float(m.group(1))
+    pc = share_p_yes(k, e["mu"], e["sigma"], e["p_ident"])
+    pt = share_p_yes(k, e["mu"], e["sigma"] * SHARE_FAIR_SIGMA_LO_FRAC, e["p_ident"])
+    lo, hi = min(pc, pt), max(pc, pt)
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo * 100.0,
+                                        SHARE_FAIR_TOL_CENTS, hi * 100.0)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {pc * 100:.0f}c "
+                f"[{lo * 100:.0f}-{hi * 100:.0f}] (tol {SHARE_FAIR_TOL_CENTS}c, "
+                f"{'bid' if bid_bad else 'ask'} side; share ~{e['mu']:.2f}% "
+                f"+-{e['sigma']:.2f}, named {e['p_ident']:.2f})",
+                {"reason": "band", "fair": round(pc * 100, 2),
+                 "lo": round(lo * 100, 2), "hi": round(hi * 100, 2),
+                 "tol": SHARE_FAIR_TOL_CENTS, "bid_bad": bid_bad,
+                 "ask_bad": ask_bad, "mu": e["mu"], "sigma": e["sigma"],
+                 "p_ident": e["p_ident"]})
     return "", {}
 
 
@@ -10004,6 +10179,7 @@ class IncentiveMarketMaker:
         self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
         self._ca_fair_stood: Set[str] = set()     # Carbon Arc fair stand-asides
         self._or_fair_stood: Set[str] = set()     # OpenRouter token-usage stand-asides
+        self._share_fair_stood: Set[str] = set()  # OpenRouter market-share stand-asides
         self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
         self._dc_stood: Set[str] = set()          # data center count stand-asides
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
@@ -11825,6 +12001,10 @@ class IncentiveMarketMaker:
         if _or_moved:
             log(f"{self.tag} or-fair reloaded: {_or_n} events, "
                 f"{_or_moved} with a new day")
+        _sh_n, _sh_moved = load_share_fair()
+        if _sh_moved:
+            log(f"{self.tag} share-fair reloaded: {_sh_n} events, "
+                f"{_sh_moved} with a new day")
         _vc_n, _vc_moved = load_vercel_fair()
         if _vc_moved:
             log(f"{self.tag} vercel-fair reloaded: {_vc_n} events, "
@@ -14993,6 +15173,23 @@ class IncentiveMarketMaker:
                 self._or_fair_stood.discard(t)
                 log(f"{self.tag} or-fair resume {t}")
 
+            # OPENROUTER MARKET-SHARE GATE (Jack 2026-09-30, see
+            # SHARE_FAIR_ENABLE): the same stand-aside on the Market Share
+            # chart's own data, failing CLOSED, and out while OpenRouter's
+            # daily update is due.
+            if share_fair_series(meta.series):
+                sh_why, sh_in = share_gate_reason(t, now_ts, ext_bid, ext_ask)
+                if sh_why:
+                    if t not in self._share_fair_stood:
+                        self._share_fair_stood.add(t)
+                        log(f"{self.tag} share-fair stand-aside {t}: {sh_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "share_fair", lambda: sh_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._share_fair_stood:
+                self._share_fair_stood.discard(t)
+                log(f"{self.tag} share-fair resume {t}")
+
             # GASBUDDY STATE-GAS GATE (Jack 2026-09-27, see GB_FAIR_ENABLE):
             # the same stand-aside on GasBuddy's live state averages, failing
             # CLOSED -- the state dailies are quoted only against the feed.
@@ -16408,6 +16605,47 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_or_fair_refresh, daemon=True,
                              name="or-fair").start()
+        if SHARE_FAIR_ENABLE and not once:
+            # OpenRouter market-share refresher (2026-09-30): the token
+            # refresher's contract. Polls every SHARE_FAIR_REFRESH_SECS, and
+            # every SHARE_FAIR_FAST_SECS while the daily update is due (the
+            # gate stands the family aside until it lands). No key needed:
+            # the rankings page's own data, read with OpenRouter's permission.
+            def _share_fair_refresh():
+                try:
+                    import openrouter_share_fair
+                except Exception as e:
+                    log(f"{self.tag} ! share-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(30, SHARE_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = openrouter_share_fair.write_fair_file(
+                            SHARE_FAIR_FILE, get_json=kalshi_get)
+                        current = openrouter_share_fair.LAST.get("data_current")
+                        if last != (ok, miss, current):
+                            log(f"{self.tag} share-fair refresh: {ok} events "
+                                f"with a read"
+                                + (f", {miss} without one" if miss else "")
+                                + ("" if current else
+                                   " -- daily update due, family stands aside"))
+                        last = (ok, miss, current)
+                        if not current:
+                            delay = min(delay, max(30, SHARE_FAIR_FAST_SECS))
+                    except Exception as e:
+                        # each DISTINCT error is logged once
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! share-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        # the gate is fail-closed: retry soon
+                        delay = min(delay, max(30, SHARE_FAIR_FAST_SECS))
+                    time.sleep(delay)
+            threading.Thread(target=_share_fair_refresh, daemon=True,
+                             name="share-fair").start()
         if GB_FAIR_ENABLE and not once:
             # GasBuddy state-gas refresher (2026-09-27): the OpenRouter
             # refresher's contract -- every network call off the trading
@@ -16661,6 +16899,17 @@ class IncentiveMarketMaker:
                 f"{OR_FAIR_REFRESH_HOLD_MIN:g}m, ttl {OR_FAIR_TTL_MIN}m, refresh "
                 f"{OR_FAIR_REFRESH_SECS}s ({OR_FAIR_FAST_SECS}s for "
                 f"{OR_FAIR_FAST_WINDOW_MIN}m after 00:00Z), file {OR_FAIR_FILE}")
+        if SHARE_FAIR_ENABLE:
+            log(f"share-fair gate: {len(SHARE_FAIR_SERIES)} OpenRouter share "
+                f"series fail-closed at-touch, tol {SHARE_FAIR_TOL_CENTS}c, band "
+                f"sigma x{SHARE_FAIR_SIGMA_LO_FRAC:g}-1, out while the daily "
+                f"update is due, refresh hold {SHARE_FAIR_REFRESH_HOLD_MIN:g}m, "
+                f"ttl {SHARE_FAIR_TTL_MIN}m, cutoff close-"
+                f"{SHARE_CUTOFF_FROM_CLOSE_MIN}m, refresh "
+                f"{SHARE_FAIR_REFRESH_SECS}s ({SHARE_FAIR_FAST_SECS}s while "
+                f"due), file {SHARE_FAIR_FILE}")
+        else:
+            log("share-fair gate: OFF -- OpenRouter share series not enrolled")
         if GB_FAIR_ENABLE:
             gated = ([] if not GB_STATE_QUOTE else ["AAA state dailies"]) \
                 + (["KXDIESELD"] if GB_DIESEL_ENABLE else []) \
@@ -16680,7 +16929,7 @@ class IncentiveMarketMaker:
                 f"{'GATED' if (GB_NATGAS_ENABLE or GB_DIESEL_ENABLE) else 'plain'} "
                 f"outside the no-quote window {GAS_TRIAL_BLACKOUT_ET} ET; state "
                 f"dailies {'gated' if GB_STATE_QUOTE else 'blocked'}")
-        if CA_FAIR_ENABLE or OR_FAIR_ENABLE or GB_FAIR_ENABLE:
+        if CA_FAIR_ENABLE or OR_FAIR_ENABLE or GB_FAIR_ENABLE or SHARE_FAIR_ENABLE:
             log("fair refreshers: Kalshi reads "
                 + ("SIGNED, public endpoint as the fallback" if FAIR_SIGNED_READS
                    else "PUBLIC only (IMM_FAIR_SIGNED_READS=0)"))

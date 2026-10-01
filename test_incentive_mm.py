@@ -9201,6 +9201,155 @@ class TestOpenRouterFairGate(unittest.TestCase):
             self.assertNotEqual(self._quotes(bot), [])
 
 
+class TestOpenRouterShareFairGate(unittest.TestCase):
+    """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
+    stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
+    market share markets", then "i got permission"). Fails CLOSED like the
+    token gate, and also stands aside while OpenRouter's daily update is due.
+    Fixture event KXANTHSHARE-68DEC04 (far from any cutoff), strike 2.7 --
+    YES from a published 2.8, i.e. a share >= 2.75."""
+
+    T = "KXANTHSHARE-68DEC04-2.7"
+    EV = "KXANTHSHARE-68DEC04"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._share_fair_state.update(mtime=0.0, entries={}, moved_at={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.SHARE_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, mu=2.75, sigma=0.2, p_ident=1.0, complete=False, lag=False,
+               version="v1", age_secs=0.0):
+        fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
+        with open(imm.SHARE_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {self.EV: {
+                "mu": mu, "sigma": sigma, "p_ident": p_ident, "complete": complete,
+                "lag": lag, "lag_reason": "leaderboard still on 2068-12-01" if lag else "",
+                "data_version": version, "fetched_at": fetched}}}, f)
+        os.utime(imm.SHARE_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestOpenRouterShareFairGate._bump += 1
+        return imm.load_share_fair()
+
+    def _bot(self):
+        client = FakeClient()
+        now = datetime.now(timezone.utc)
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV,
+            "status": "active", "close_time": far,
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_allowlisted_with_the_week_end_cutoff(self):
+        for s in ("KXANTHSHARE", "KXOPENSHARE", "KXGOOGSHARE", "KXDEEPSHARE",
+                  "KXBABASHARE", "KXXIAOMISHARE", "KXZAISHARE", "KXMISTRALSHARE",
+                  "KXTENCENTSHARE", "KXSTEALTHSHARE"):
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.share_fair_series(s), s)
+            self.assertEqual(imm.SERIES_OVERRIDES[s].cutoff_from_close_min, 840, s)
+            self.assertEqual(imm.event_top_n_for(s), 0, s)       # every strike
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(f"{s}-26OCT05-3.1"), s)
+            self.assertFalse(imm.IncentiveMarketMaker._blocked(f"{s}-26OCT05-3.1"), s)
+        # the Vercel open-weights series is a different feed and gate
+        self.assertFalse(imm.share_fair_series("KXOPENSOURCESHARE"))
+        # close 14:00Z Monday (10:00 ET) -> cutoff 00:00Z, the week's end
+        close = datetime(2026, 10, 5, 14, 0, tzinfo=timezone.utc)
+        self.assertEqual(close - timedelta(minutes=imm.SHARE_CUTOFF_FROM_CLOSE_MIN),
+                         datetime(2026, 10, 5, 0, 0, tzinfo=timezone.utc))
+        self.assertIn("SHARE_FAIR_ENABLE", imm._CONFIG_CODE_KNOBS)
+
+    def test_kill_switch_takes_the_family_out(self):
+        import subprocess
+        import sys
+        code = ("import incentive_mm as imm\n"
+                "print(sorted(s for s in imm.ALLOW_SERIES if s.endswith('SHARE')))\n"
+                "print(imm.SHARE_FAIR_ENABLE, imm.share_fair_series('KXANTHSHARE'))\n")
+        env = dict(os.environ, IMM_SHARE_FAIR_ENABLE="0")
+        r = subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(
+            os.path.abspath(imm.__file__)), env=env, capture_output=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-800:])
+        out = r.stdout.decode("utf-8").strip().splitlines()
+        self.assertEqual(out[-2], "['KXOPENSOURCESHARE']")      # Vercel's, not ours
+        self.assertEqual(out[-1], "False False")
+
+    def test_reason_fail_closed_complete_lag_hold_and_band(self):
+        now_ts = time.time()
+        self.assertEqual(imm.share_gate_reason(self.T, now_ts, 49, 51)[1]["reason"], "no_read")
+        self.assertEqual(self._write(), (1, 1))                  # first load: no hold
+        self.assertEqual(imm.share_gate_reason(self.T, time.time(), 49, 51), ("", {}))
+        self.assertEqual(imm.share_gate_reason(self.EV, time.time(), 49, 51)[1]["reason"],
+                         "no_read")                              # no strike segment
+        self.assertEqual(imm.share_gate_reason(
+            self.T, time.time() + imm.SHARE_FAIR_TTL_MIN * 60 + 5, 49, 51)[1]["reason"], "stale")
+        self._write(lag=True)                                     # the daily update is due
+        why, inp = imm.share_gate_reason(self.T, time.time(), 49, 51)
+        self.assertEqual(inp["reason"], "lag")
+        self.assertIn("leaderboard still on", why)
+        self._write(version="v2")                                 # a new day landed
+        self.assertEqual(imm.share_gate_reason(self.T, time.time(), 49, 51)[1]["reason"], "hold")
+        imm._share_fair_state["moved_at"][self.EV] -= 3600
+        self.assertEqual(imm.share_gate_reason(self.T, time.time(), 49, 51), ("", {}))
+        self._write(mu=2.5, version="v2")                         # same day, lower read
+        why, inp = imm.share_gate_reason(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], inp["bid_bad"], inp["ask_bad"]), ("band", True, False))
+        # P(YES) = p_ident x P(share >= 2.75): a fair 50c read named 30% of
+        # the time is a 15c market
+        self._write(mu=2.75, p_ident=0.3, version="v2")
+        why, inp = imm.share_gate_reason(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], inp["fair"]), ("band", 15.0))
+        self.assertAlmostEqual(imm.share_p_yes(2.7, 2.75, 0.2, 1.0), 0.5)
+        self._write(mu=3.0, sigma=0.0, complete=True, version="v3")
+        self.assertEqual(imm.share_gate_reason(self.T, time.time(), 99, 100)[1]["reason"],
+                         "complete")
+
+    def test_quotes_on_an_agreeing_read_and_stands_aside_without_one(self):
+        bot = self._bot()
+        bot.run_cycle()                                           # no file: closed
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._share_fair_stood)
+        self._write()                                             # first load: no hold
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._share_fair_stood)
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertIn(("ask", 51), q)
+        self._write(lag=True)                                     # 00:00Z: update due
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._share_fair_stood)
+        self.assertIn(self.T, bot.state.selected)                 # sticky
+
+    def test_gate_off_quotes_plainly(self):
+        with mock.patch.object(imm, "SHARE_FAIR_ENABLE", False):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertNotEqual(self._quotes(bot), [])
+
+
 class TestGasBuddyFairGate(unittest.TestCase):
     """gasbuddy_fair.json -> load_gb_fair/gb_gate_reason -> the stand-aside on
     the AAA state dailies (Jack 2026-09-27: "i received permission to use
@@ -15915,12 +16064,13 @@ class TestGuardSkipSink(unittest.TestCase):
                         if src[j].strip())
             if not prev.startswith("self._gskip("):
                 bare.append(prev)
-        # 30 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
+        # 32 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
         # token-usage gate (2026-09-27) + the GasBuddy state-gas gate
         # (2026-09-27) + the quake gate's stand-aside and hold (2026-09-27)
         # + the Vercel pre-D gate (2026-09-27) + the mortgage gate
-        # (2026-09-28) + the data center count gate (2026-10-01)
-        self.assertEqual(len(conts), 31)
+        # (2026-09-28) + the data center count gate (2026-10-01) + the
+        # OpenRouter market-share gate (2026-09-30)
+        self.assertEqual(len(conts), 32)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -17156,14 +17306,16 @@ class TestSignedFairReads(unittest.TestCase):
             self.assertIsNone(imm.fair_reader())
 
     def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
-        """Wiring guard: the Carbon Arc, OpenRouter and GasBuddy refreshers
-        each build a reader with fair_reader() and pass it to their module's
-        write_fair_file (the threads live inside run(), so read its source)."""
+        """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share
+        and GasBuddy refreshers each build a reader with fair_reader() and
+        pass it to their module's write_fair_file (the threads live inside
+        run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 3)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 4)
         for mod, path in (("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
+                          ("openrouter_share_fair", "SHARE_FAIR_FILE"),
                           ("gasbuddy_fair", "GB_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
