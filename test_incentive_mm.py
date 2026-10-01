@@ -3723,10 +3723,12 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             imm.ALLOWLIST_ONLY = True
             for st in ("OH", "CA", "TX", "NC", "ZZ"):
                 t = f"KXAAAGASD{st}-26SEP02-3.1500"
+                # 2026-10-01 (the gas trial): blocked again by default,
+                # GasBuddy logging on; IMM_GB_STATE_QUOTE=1 re-gates them
                 self.assertEqual(IncentiveMarketMaker._blocked(t),
-                                 not imm.GB_FAIR_ENABLE, t)
+                                 not imm.GB_STATE_QUOTE, t)
                 self.assertEqual(IncentiveMarketMaker._allowed(t),
-                                 imm.GB_FAIR_ENABLE, t)
+                                 imm.GB_STATE_QUOTE, t)
             t = "KXAAAGASDNYC-26SEP02-3.1500"          # not a state shape
             self.assertTrue(IncentiveMarketMaker._blocked(t), t)
             self.assertFalse(IncentiveMarketMaker._allowed(t), t)
@@ -3782,9 +3784,10 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         self.assertFalse(imm.series_pattern_blocked("KXTEMPHELP"))
         self.assertTrue(IncentiveMarketMaker._allowed("KXTEMPHELP-26SEP17-X"))
         # the gas-daily entry is untouched by the second pattern (states are
-        # pattern-blocked only with the GasBuddy gate off, 2026-09-27)
+        # pattern-blocked unless the gated state quoting is on -- 2026-09-27,
+        # off again for the 2026-10-01 gas trial)
         self.assertEqual(imm.series_pattern_blocked("KXAAAGASDCA"),
-                         not imm.GB_FAIR_ENABLE)
+                         not imm.GB_STATE_QUOTE)
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
         # ...and so is every other weather family the bot quotes
@@ -3835,7 +3838,7 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # "including any future ones")
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
         self.assertEqual(imm.series_pattern_blocked("KXAAAGASDWY"),
-                         not imm.GB_FAIR_ENABLE)       # gated, 2026-09-27
+                         not imm.GB_STATE_QUOTE)   # gated 9/27, blocked 10/01
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
         self.assertFalse(imm.series_pattern_blocked("KXDIESELD"))
 
@@ -5854,14 +5857,25 @@ class TestStickySelection(unittest.TestCase):
         def at(hh, mm):
             return imm.ET.localize(
                 datetime(2026, 8, 5, hh, mm)).astimezone(timezone.utc)
-        for s in ("KXAAAGASD", "KXAAAGASW", "KXAAAGASM",
-                  "KXDIESELD", "KXDIESELW"):
+        for s in ("KXAAAGASW", "KXAAAGASM", "KXDIESELW"):
             self.assertEqual(imm.series_override(s).blackout_et,
                              ("03:05", "04:00"), s)
             self.assertFalse(imm.series_in_blackout(s, at(2, 50)), s)
             self.assertTrue(imm.series_in_blackout(s, at(3, 18)), s)
             self.assertTrue(imm.series_in_blackout(s, at(3, 36)), s)
             self.assertFalse(imm.series_in_blackout(s, at(4, 5)), s)
+        # 2026-10-01, the gas trial (Jack: "adjust all three to trade
+        # 1pm-midnight", then "National + diesel only"): the national gas
+        # and diesel DAILIES quote 13:00 ET to the close; their no-quote
+        # window 00:00-13:00 ET contains the print blackout
+        self.assertEqual(imm.GAS_TRIAL_SERIES, ("KXAAAGASD", "KXDIESELD"))
+        for s in ("KXAAAGASD", "KXDIESELD"):
+            self.assertEqual(imm.series_override(s).blackout_et,
+                             ("00:00", "13:00"), s)
+            for hh, mm in ((0, 0), (3, 18), (8, 0), (12, 59)):
+                self.assertTrue(imm.series_in_blackout(s, at(hh, mm)), (s, hh, mm))
+            for hh, mm in ((13, 0), (18, 30), (23, 59)):
+                self.assertFalse(imm.series_in_blackout(s, at(hh, mm)), (s, hh, mm))
         # KXDIESELW keeps its $0 rate floor: the blackout must not have
         # clobbered the series override it was merged into
         self.assertEqual(imm.series_min_est_rate("KXDIESELW"), 0.0)
@@ -9084,6 +9098,15 @@ class TestGasBuddyFairGate(unittest.TestCase):
 
     def setUp(self):
         _clean_persist()
+        # since the 2026-10-01 gas trial the state dailies are BLOCKED by
+        # default; this class exercises the gated state quoting that
+        # IMM_GB_STATE_QUOTE=1 brings back, so it runs under that config
+        for p in (mock.patch.object(imm, "GB_STATE_QUOTE", True),
+                  mock.patch.object(imm, "SERIES_BLOCK_PATTERNS", tuple(
+                      imm.re.compile(x) for x in
+                      imm._series_block_default(True).split(",") if x))):
+            p.start()
+            self.addCleanup(p.stop)
         imm._gb_fair_state.update(mtime=0.0, entries={})
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
@@ -9139,24 +9162,31 @@ class TestGasBuddyFairGate(unittest.TestCase):
         self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
         self.assertFalse(imm.gb_fair_series("KXAAAGASDNYC"))     # not a state shape
         self.assertFalse(imm.gb_fair_series("KXAAAGASW"))
-        # the diesel daily joins (2026-09-27: "ok do that for diesel daily"),
-        # the weekly does not; IMM_GB_DIESEL_ENABLE=0 takes it back out
-        self.assertTrue(imm.gb_fair_series("KXDIESELD"))
-        self.assertFalse(imm.gb_fair_series("KXDIESELW"))
-        self.assertFalse(imm.gb_fair_series("KXDIESELMONAK"))
-        with mock.patch.object(imm, "GB_DIESEL_ENABLE", False):
-            self.assertFalse(imm.gb_fair_series("KXDIESELD"))
-            self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
-        # the national gas daily joins (2026-09-27: "yes gate KXAAAGASD
-        # national on gasbuddy"); the weekly/monthly do not;
-        # IMM_GB_NATGAS_ENABLE=0 takes it back out
-        self.assertTrue(imm.gb_fair_series("KXAAAGASD"))
-        self.assertFalse(imm.gb_fair_series("KXAAAGASM"))
-        with mock.patch.object(imm, "GB_NATGAS_ENABLE", False):
-            self.assertFalse(imm.gb_fair_series("KXAAAGASD"))
-            self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
+        # the diesel daily (2026-09-27: "ok do that for diesel daily") and the
+        # national gas daily (2026-09-27: "yes gate KXAAAGASD national on
+        # gasbuddy") join behind their switches -- both default OFF since the
+        # 2026-10-01 gas trial (plain quoting, 13:00-24:00 ET); the weeklies,
+        # monthlies and Alaska diesel never join
+        self.assertFalse(imm.GB_DIESEL_ENABLE)
+        self.assertFalse(imm.GB_NATGAS_ENABLE)
+        self.assertFalse(imm.gb_fair_series("KXDIESELD"))
+        self.assertFalse(imm.gb_fair_series("KXAAAGASD"))
+        with mock.patch.object(imm, "GB_DIESEL_ENABLE", True):
             self.assertTrue(imm.gb_fair_series("KXDIESELD"))
-        # gate on (default): state dailies unblocked, anything longer blocked
+            self.assertFalse(imm.gb_fair_series("KXDIESELW"))
+            self.assertFalse(imm.gb_fair_series("KXDIESELMONAK"))
+            self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
+        with mock.patch.object(imm, "GB_NATGAS_ENABLE", True):
+            self.assertTrue(imm.gb_fair_series("KXAAAGASD"))
+            self.assertFalse(imm.gb_fair_series("KXAAAGASM"))
+            self.assertTrue(imm.gb_fair_series("KXAAAGASDCA"))
+        # the DEFAULT since the gas trial: GasBuddy refresher on, the state
+        # dailies blocked by the 9/14 pattern
+        self.assertTrue(imm.GB_FAIR_ENABLE)
+        default = [imm.re.compile(p) for p in imm._series_block_default(False).split(",")]
+        self.assertTrue(any(p.fullmatch("KXAAAGASDCA") for p in default))
+        # the gated config this class runs under (IMM_GB_STATE_QUOTE=1):
+        # state dailies unblocked, anything longer blocked
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASDCA"))
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
@@ -12304,8 +12334,9 @@ class TestOpenScanTier(unittest.TestCase):
         # scan universe either (the de-allowlist-only route would have made
         # this None = scan candidate). Since 2026-09-27 they are normal-book
         # members behind the GasBuddy gate -- still never scan universe.
+        # (2026-10-01, the gas trial: blocked again unless IMM_GB_STATE_QUOTE=1)
         self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"),
-                         "allowed" if imm.GB_FAIR_ENABLE else "blocked")
+                         "allowed" if imm.GB_STATE_QUOTE else "blocked")
         self.assertEqual(r("KXAAAGASDNYC-26SEP08-4.14"), "blocked")
         self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "allowed")   # national kept
         # blocklist wins over everything (other bots' books)

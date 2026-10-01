@@ -2576,6 +2576,16 @@ MARKET_BLOCK_SUFFIXES = tuple(
 # "KXAAAGASD[A-Z]+" here, i.e. the 9/14 block exactly. Any LONGER suffix (a
 # city or a new shape nobody has looked at) stays blocked either way.
 _GB_STATE_GAS_LIVE = os.environ.get("IMM_GB_FAIR_ENABLE", "1") == "1"
+# GAS TRIAL (Jack 2026-10-01, "National + diesel only" for the 1pm-midnight
+# trial): the state dailies are BLOCKED again -- the 9/14 pattern -- while
+# the GasBuddy refresher (GB_FAIR_ENABLE) keeps writing gasbuddy_live.jsonl.
+# The 10/01 review: the gate's fair lost to the market's own price (state
+# Brier 0.084 vs 0.011; error 1.76c RMS at 13 ET against a 0.95c sigma),
+# zero gated state fills since 9/27, and September's plain state quoting
+# lost in every hour band, worst 13-17 ET (-14.2c/ct).
+# IMM_GB_STATE_QUOTE=1 brings the gated state quoting back.
+GB_STATE_QUOTE = _GB_STATE_GAS_LIVE and \
+    os.environ.get("IMM_GB_STATE_QUOTE", "0") == "1"
 #
 # Env IMM_BLOCK_SERIES_PATTERNS (comma list of regexes, FULL-match against the
 # series name); empty string disables. Full-match, not search: a bare
@@ -2606,7 +2616,7 @@ def _series_block_default(gb_state_gas_live: bool) -> str:
 SERIES_BLOCK_PATTERNS = tuple(
     re.compile(p.strip()) for p in os.environ.get(
         "IMM_BLOCK_SERIES_PATTERNS",
-        _series_block_default(_GB_STATE_GAS_LIVE)).split(",")
+        _series_block_default(GB_STATE_QUOTE)).split(",")
     if p.strip())
 
 
@@ -5060,6 +5070,29 @@ for _s in os.environ.get(
             blackout_et=tuple(os.environ.get(
                 "IMM_AAA_BLACKOUT_ET", "03:05-04:00").split("-")))
 
+# GAS TRIAL: 1PM-MIDNIGHT ET (Jack 2026-10-01: "adjust all three to trade
+# 1pm-midnight. and report on results at the 1 week and 2 week marks", then
+# "National + diesel only"). The national gas daily and the diesel daily
+# quote PLAIN (their GasBuddy gates default off, GB_NATGAS_ENABLE /
+# GB_DIESEL_ENABLE) and only from 13:00 ET to the close: the daily no-quote
+# window becomes 00:00-13:00 ET (it contains the 03:05-04:00 print blackout,
+# and resting orders are cancelled at 00:00 by the same blackout path); the
+# state dailies are blocked (GB_STATE_QUOTE). September, plain quoting,
+# settled fills: 08-13 ET lost (national -$197 at -2.5c/ct, diesel -$215 at
+# -7.8c/ct) while 13-24 ET made +$126 (national, +2.0c/ct) and +$13
+# (diesel) -- in-sample, and the national's half faded (+$150 Sep 1-15, -$24
+# Sep 16-27). imm_gas_trial_report.py emails the result at the 1- and 2-week
+# marks. IMM_GAS_TRIAL_BLACKOUT_ET="" restores the print blackout alone.
+GAS_TRIAL_SERIES = tuple(s.strip() for s in os.environ.get(
+    "IMM_GAS_TRIAL_SERIES", "KXAAAGASD,KXDIESELD").split(",") if s.strip())
+GAS_TRIAL_BLACKOUT_ET = os.environ.get("IMM_GAS_TRIAL_BLACKOUT_ET", "00:00-13:00")
+if GAS_TRIAL_BLACKOUT_ET:
+    for _s in GAS_TRIAL_SERIES:
+        if _s in SERIES_OVERRIDES:
+            SERIES_OVERRIDES[_s] = replace(
+                SERIES_OVERRIDES[_s],
+                blackout_et=tuple(GAS_TRIAL_BLACKOUT_ET.split("-")))
+
 
 # ---- family guard inheritance (Jack 2026-09-01 "fix this going forward",
 # after Kalshi lit five new state gas dailies + 12 new *APP series overnight
@@ -5803,6 +5836,8 @@ _CONFIG_CODE_KNOBS = (
     "GB_FAIR_ENABLE", "GB_FAIR_TOL_CENTS", "GB_FAIR_TTL_MIN",
     "GB_FAIR_SIGMA_LO_FRAC", "GB_FAIR_MAX_SIGMA_CENTS", "GB_FAIR_REFRESH_SECS",
     "GB_STATE_MIN_RATE", "GB_DIESEL_ENABLE", "GB_NATGAS_ENABLE",
+    # the 1pm-midnight gas trial (2026-10-01)
+    "GB_STATE_QUOTE", "GAS_TRIAL_SERIES", "GAS_TRIAL_BLACKOUT_ET",
     # the three fair refreshers' Kalshi reads signed (2026-09-27)
     "FAIR_SIGNED_READS",
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
@@ -6752,7 +6787,11 @@ GB_STATE_MIN_RATE = _env_float("IMM_GB_STATE_MIN_RATE", 0.0)
 # +1.7c/ct after 16:00. KXDIESELW is NOT included (GasBuddy only sharpens
 # the forecast 1-3 prints out). IMM_GB_DIESEL_ENABLE=0 returns KXDIESELD to
 # plain quoting.
-GB_DIESEL_ENABLE = GB_FAIR_ENABLE and os.environ.get("IMM_GB_DIESEL_ENABLE", "1") == "1"
+# 2026-10-01 (the gas trial, see GAS_TRIAL_SERIES): default OFF -- KXDIESELD
+# quotes PLAIN, 13:00-24:00 ET only. GasBuddy's diesel number updates once a
+# day at 07:00 ET (no intraday information) and the gated diesel had no
+# fills; IMM_GB_DIESEL_ENABLE=1 puts the gate back.
+GB_DIESEL_ENABLE = GB_FAIR_ENABLE and os.environ.get("IMM_GB_DIESEL_ENABLE", "0") == "1"
 GB_DIESEL_SERIES = "KXDIESELD"
 # NATIONAL GAS DAILY (Jack 2026-09-27: "yes gate KXAAAGASD national on
 # gasbuddy"). KXAAAGASD -- AAA's national regular average, the parent of the
@@ -6767,7 +6806,12 @@ GB_DIESEL_SERIES = "KXDIESELD"
 # trading) skipped. Its own guards stay as they are -- the $2/day rate floor
 # included: ensure_family_override never re-clones the parent.
 # IMM_GB_NATGAS_ENABLE=0 returns KXAAAGASD to plain quoting.
-GB_NATGAS_ENABLE = GB_FAIR_ENABLE and os.environ.get("IMM_GB_NATGAS_ENABLE", "1") == "1"
+# 2026-10-01 (the gas trial, see GAS_TRIAL_SERIES): default OFF -- KXAAAGASD
+# quotes PLAIN, 13:00-24:00 ET only. Gated since 9/28 it took 12 fills for
+# -$6.62 marked to mid, its fair scored worse than the market's mid (Brier
+# 0.095 vs 0.044), and its stand-asides fell where the blocked side would
+# have made +6.1c/ct; IMM_GB_NATGAS_ENABLE=1 puts the gate back.
+GB_NATGAS_ENABLE = GB_FAIR_ENABLE and os.environ.get("IMM_GB_NATGAS_ENABLE", "0") == "1"
 GB_NATGAS_SERIES = "KXAAAGASD"
 # strike segment: the states' "-6.3950", the diesel daily's "-T6.470"
 _GB_STRIKE_RE = re.compile(r"-T?(\d+(?:\.\d+)?)$")
@@ -16394,14 +16438,24 @@ class IncentiveMarketMaker:
                 f"{OR_FAIR_REFRESH_SECS}s ({OR_FAIR_FAST_SECS}s for "
                 f"{OR_FAIR_FAST_WINDOW_MIN}m after 00:00Z), file {OR_FAIR_FILE}")
         if GB_FAIR_ENABLE:
-            log(f"gb-fair gate: AAA state dailies"
-                f"{' + KXDIESELD' if GB_DIESEL_ENABLE else ''}"
-                f"{' + KXAAAGASD' if GB_NATGAS_ENABLE else ''} fail-closed at-touch, tol "
+            gated = ([] if not GB_STATE_QUOTE else ["AAA state dailies"]) \
+                + (["KXDIESELD"] if GB_DIESEL_ENABLE else []) \
+                + (["KXAAAGASD"] if GB_NATGAS_ENABLE else [])
+            log(f"gb-fair gate: {' + '.join(gated) or 'NOTHING gated'}"
+                f"{'' if GB_STATE_QUOTE else ' (state dailies blocked)'}; "
+                f"refresher logging gasbuddy_live.jsonl; fail-closed at-touch, tol "
                 f"{GB_FAIR_TOL_CENTS}c, band sigma x{GB_FAIR_SIGMA_LO_FRAC:g}-1, "
                 f"max sigma {GB_FAIR_MAX_SIGMA_CENTS:g}c, ttl {GB_FAIR_TTL_MIN}m, "
                 f"refresh {GB_FAIR_REFRESH_SECS}s, file {GB_FAIR_FILE}")
         else:
             log("gb-fair gate: OFF -- AAA state dailies stay pattern-blocked")
+        if GAS_TRIAL_BLACKOUT_ET:
+            # imm_gas_trial_report.py dates the trial from this line's
+            # first appearance -- keep its "gas trial:" prefix
+            log(f"gas trial: {','.join(GAS_TRIAL_SERIES)} quoted "
+                f"{'GATED' if (GB_NATGAS_ENABLE or GB_DIESEL_ENABLE) else 'plain'} "
+                f"outside the no-quote window {GAS_TRIAL_BLACKOUT_ET} ET; state "
+                f"dailies {'gated' if GB_STATE_QUOTE else 'blocked'}")
         if CA_FAIR_ENABLE or OR_FAIR_ENABLE or GB_FAIR_ENABLE:
             log("fair refreshers: Kalshi reads "
                 + ("SIGNED, public endpoint as the fallback" if FAIR_SIGNED_READS

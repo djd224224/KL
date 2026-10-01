@@ -5292,3 +5292,55 @@ band gate passes the selected strikes. No incentive_mm change. Tests: the
 October wording (rules_primary and rules_secondary), a Dec–Jan wrap, a
 bracketed weekly, a single-date bracket rejected, the unparsed list, and an
 end-to-end write with one parsed and one unparsed monthly; 915 green.
+
+## 2026-10-01 — Gas trial: national + diesel dailies plain, 1pm-midnight ET only; state dailies blocked; reports at 1 and 2 weeks (Jack)
+
+Jack: "adjust all three to trade 1pm-midnight. and report on results at the
+1 week and 2 week marks", then (asked plain vs gated, and whether to keep
+the states, given they did WORST in the afternoon) "National + diesel only".
+
+WHY. The 10/01 review (scratch scripts saved to Documents/KL-data/
+gas-analysis-2026-10-01/): the GasBuddy gate's fair forecast the AAA print
+worse than the market's own price (states Brier 0.084 vs 0.011, national
+0.095 vs 0.044, diesel 0.36 vs 0.044); state errors ran 1.3-1.9x the gate's
+sigma; the gated bot since 9/27 had 0 state fills, 12 national fills
+(-$6.62 at mid) and 0 diesel fills, with every market's estimated reward
+under the $1 floor. September's PLAIN quoting by ET band (settled fills):
+national 08-13 -$197 (-2.5c/ct) vs 13-24 +$126 (+2.0c/ct, +$112 of it
+21-24 ET; +$150 Sep 1-15, -$24 Sep 16-27); diesel 08-13 -$215 (-7.8c/ct)
+vs 13-24 +$13; states 08-13 -$296 vs 13-24 -$467 (13-17 ET -14.2c/ct, the
+worst band). In-sample: the window was picked on the same data.
+
+CHANGE (all defaults; no launcher edit, the code sync + restart carry it):
+- GB_STATE_QUOTE (IMM_GB_STATE_QUOTE, default 0): the state dailies are
+  pattern-blocked again (the 9/14 pattern) while IMM_GB_FAIR_ENABLE stays 1,
+  so the GasBuddy refresher keeps writing gasbuddy_live.jsonl and the fair
+  file. IMM_GB_STATE_QUOTE=1 re-gates them.
+- GB_NATGAS_ENABLE / GB_DIESEL_ENABLE default 1 -> 0: KXAAAGASD and KXDIESELD
+  quote PLAIN (no GasBuddy gate). =1 puts each gate back.
+- GAS_TRIAL_SERIES (KXAAAGASD,KXDIESELD) get blackout_et 00:00-13:00 ET
+  (IMM_GAS_TRIAL_BLACKOUT_ET; it contains the 03:05-04:00 print blackout,
+  and the blackout path cancels resting orders): they quote 13:00 ET to the
+  close. The weeklies, monthlies and KXDIESELMONAK keep 03:05-04:00 only.
+  IMM_GAS_TRIAL_BLACKOUT_ET="" = full-day plain quoting again.
+- Startup line "gas trial: KXAAAGASD,KXDIESELD quoted plain outside the
+  no-quote window 00:00-13:00 ET; state dailies blocked" -- the report dates
+  the trial from its first appearance. The gb-fair gate line now names what
+  is gated ("NOTHING gated (state dailies blocked)").
+
+REPORTS. imm_gas_trial_report.py (read-only; tests test_imm_gas_trial_report):
+per family -- ET hours and markets quoted, placements before 13:00 ET and on
+state dailies (both must be 0), fills by ET band and side, trading P&L
+(settled at Kalshi's result, open at mid, signed reads), the bot's reward
+estimate rebuilt from the cycle logs with the $1/market floor, Kalshi's
+credits where a statement has been pasted, net, September's same-hours
+baseline, and an advisory KEEP / STOP (STOP = trading loss larger than the
+reward). Task "KL imm gas-trial" (register_imm_gas_trial.ps1): daily 07:45 ET;
+emails only on the first run at/after day 7 and day 14 (markers
+gas_trial_sent_1w / _2w; a missed 1-week folds into the 2-week). --dry
+prints; --test sends now. Unregister after the 2-week report.
+
+Tests: 9 existing gas tests moved to the new defaults (state blocking reads
+GB_STATE_QUOTE; TestGasBuddyFairGate runs under IMM_GB_STATE_QUOTE=1; the
+print-blackout test pins 00:00-13:00 for the two trial dailies);
+test_imm_gas_trial_report (7).
