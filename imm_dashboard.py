@@ -203,6 +203,15 @@ _FOOD = frozenset(("KXCHIPBURRITO", "KXDDCOLDBREW", "KXWENBACONATOR",
                    "KXPOPCHICKSAND"))
 _KPI = frozenset(("KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM",
                   "KXBBY", "KXWSM", "KXOKTA"))
+# Treasury yields beyond the KXUST names -- the bot's rates allowlist
+# (incentive_mm _DEFAULT_RATES_EXTRA_SERIES): the how-high / how-low tenors
+# KX<n>YRDIR*, notes, bills, the year max, the 2Y FOMC move, curve spreads and
+# inversion. Kalshi files the KX<n>YRDIR* tenors under "Financials", which the
+# category fallback read as Company KPIs (10/1: KX10YRDIRLM -$44 in that row).
+_TREASURY_PREFIX = ("KXUST", "KXNOTE", "KXTNOTE", "TNOTE", "KXTREASURYMAX", "KX3MTBILL",
+                    "TBILL", "KX2YFOMC", "KX10Y2Y", "KX10Y3M", "10Y2Y", "10Y3M",
+                    "KXYINVERT", "YINVERT", "KX30YUSTW")
+_TREASURY_RE = re.compile(r"KX\d+YR(DIR|RATE)[A-Z0-9]*")
 _CO_RE = re.compile(
     r"KX(AAL|ALK|AMZN|AXP|BA|CART|CCL|CMG|COINBASE|CVNA|DPZ|FSLR|GOOG|GOOGL|HOOD|"
     r"INTC|LMND|LUV|META|MELI|MELIA|NCLH|NFLX|PM|RACE|RBLX|RDDT|RIVN|SBUX|SG|TLN|TTAN|"
@@ -335,7 +344,7 @@ def family_of(series: str, category: str = ""):
     if s.startswith("KXCPI") or "INFL" in s or s in ("KXOER", "KXIBONDFIX", "KXPCE", "KXCOREPCE",
                                                         "KXSAMOMINF"):
         return "Econ & rates", "CPI & inflation"
-    if s.startswith("KXUST"):
+    if s.startswith(_TREASURY_PREFIX) or _TREASURY_RE.fullmatch(s):
         return "Econ & rates", "Treasury yields"
     if any(k in s for k in ("MORT", "MTG", "HOME", "HPI", "HOUSING", "NHSALES", "OFFVAC", "PERMITS")):
         return "Econ & rates", "Housing & mortgage"

@@ -73,6 +73,12 @@ class FamilyTests(unittest.TestCase):
         self.assertEqual(dash.family_of("KXPADATACENTERS")[0], "AI & tech")
         self.assertEqual(dash.family_of("KXCASESSION")[0], "Politics & approval")
         self.assertEqual(dash.family_of("KXSAMOMINF"), ("Econ & rates", "CPI & inflation"))
+        # 10/1: the Treasury how-high / how-low tenors fell through to Kalshi's
+        # "Financials" category and were filed under Company KPIs
+        for s in ("KX10YRDIRLM", "KX30YRDIRHM", "KX2YRDIRLM", "KX10YRDIRHW", "KX10YRRATE15M",
+                  "KXTNOTED", "TNOTEW", "KX10Y2Y", "KXTREASURYMAX5", "KX3MTBILL", "KXYINVERT"):
+            self.assertEqual(dash.family_of(s, "Financials"), ("Econ & rates", "Treasury yields"), s)
+        self.assertEqual(dash.family_of("KXDPZ", "Financials")[0], "Company KPIs")
         # hourly temperature keeps its family
         self.assertEqual(dash.family_of("KXTEMPNYCH"), ("Weather & quakes", "Hourly temp"))
 
