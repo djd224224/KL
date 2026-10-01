@@ -1478,5 +1478,402 @@ class TestMonthlyRulesCycle(unittest.TestCase):
         self.assertEqual(st["risk_short_dollars"], 80.0)
         self.assertIn("sigma_median", st)
 
+
+# ---------------------------------------------------------------------------
+# Shard-cash guard + accepted-order accounting (2026-10-01). Shard 2's cash ran
+# out on 9/30 and every new-risk crypto order bounced HTTP 400 for most of a
+# day while the status line read "8/8 mkts quoted". These pin: refusals are
+# counted and logged WITH Kalshi's reason, the book line counts what is on the
+# book, and new-risk orders are held (reducing ones still go) while the shard
+# can't fund them.
+# ---------------------------------------------------------------------------
+import json as _json
+import tempfile
+
+NO_CASH = {"balance_breakdown": [{"exchange_index": 0, "balance": "8260.2596"},
+                                 {"exchange_index": 2, "balance": "0.0001"}]}
+FUNDED = {"balance_breakdown": [{"exchange_index": 0, "balance": "6204.6732"},
+                                {"exchange_index": 2, "balance": "2000.0001"}]}
+INSUFFICIENT = '{"error":{"code":"insufficient_balance","message":"Insufficient balance"}}'
+UNEXPLAINED = '{"code":"bad_request","message":"bad request"}'
+
+
+def _http(status, body):
+    e = HttpError("Bad Request" if status == 400 else "err", status)
+    e.body = body
+    return e
+
+
+class GuardClient(RulesFakeClient):
+    """RulesFakeClient that reports shard balances and refuses orders on
+    demand: refuse(create_kwargs) returns the HttpError to raise, or None."""
+
+    def __init__(self, balance=FUNDED, refuse=None, markets=(), positions=None, books=None):
+        super().__init__(list(markets), positions or {}, books or {})
+        self.balance = balance
+        self.refuse = refuse or (lambda kw: None)
+        self.balance_calls = 0
+        self.attempts = []
+
+    def get_balance(self):
+        self.balance_calls += 1
+        if isinstance(self.balance, Exception):
+            raise self.balance
+        return self.balance
+
+    def create_order(self, **kwargs):
+        self.attempts.append(kwargs)
+        err = self.refuse(kwargs)
+        if err is not None:
+            raise err
+        return super().create_order(**kwargs)
+
+
+class _GuardBase(unittest.TestCase):
+    """Points the fleet file cache (where the shard balance is shared) at a
+    temp dir: the real one is the live fleet's."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.object(mm, "STATUS_DIR", tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(tmp.cleanup)
+
+    def bot(self, client, live=True, shards=None):
+        b = mm.TouchMarketMaker(SOL_MAX, client, live=live)
+        b.alerter.enabled = False
+        b.state.shard_by_ticker = dict({"T1": 2, "T2": 2} if shards is None else shards)
+        return b
+
+    def forget_balance(self):
+        try:
+            os.remove(mm._cache_path("balance", "shards"))
+        except OSError:
+            pass
+
+
+class TestRefusalAccounting(_GuardBase):
+    def test_http_error_detail_carries_kalshi_reason(self):
+        d = mm.http_error_detail(_http(400, INSUFFICIENT))
+        self.assertTrue(d.startswith("HttpError(400 Bad Request): "), d)
+        self.assertIn("insufficient_balance", d)
+        self.assertEqual(mm.http_error_detail(HttpError("Not Found", 404)),
+                         "HttpError(404 Not Found)")
+        self.assertLess(len(mm.http_error_detail(_http(400, "x" * 1000), max_chars=50)), 90)
+
+    def test_insufficient_balance_markers(self):
+        for body in (INSUFFICIENT, '{"code":"available_balance_too_low"}', "INSUFFICIENT_BALANCE"):
+            self.assertTrue(mm.is_insufficient_balance(_http(400, body)), body)
+        for body in (UNEXPLAINED, "", '{"code":"post_only_cross"}'):
+            self.assertFalse(mm.is_insufficient_balance(_http(400, body)), body)
+        self.assertFalse(mm.is_insufficient_balance(HttpError("Conflict", 409)))   # no body
+
+    def test_collateral_is_the_side_bought(self):
+        self.assertAlmostEqual(mm.quote_collateral_dollars(mm.Quote("T", "bid", 45, 5)), 2.25)
+        self.assertAlmostEqual(mm.quote_collateral_dollars(mm.Quote("T", "ask", 80, 5)), 1.00)
+
+    def test_new_risk_flags(self):
+        q = mm.Quote
+        to_place = [q("T1", "bid", 40, 5), q("T1", "bid", 38, 5), q("T1", "ask", 60, 5),
+                    q("T2", "ask", 60, 5), q("T3", "bid", 40, 5)]
+        # T1 short 7: the first 5-lot bid reduces, the second would overshoot;
+        # the T1 ask adds to the short; T2 long 5: its ask reduces; T3 is flat
+        self.assertEqual(mm.new_risk_flags(to_place, [], set(), {"T1": -7, "T2": 5}),
+                         [False, True, True, False, True])
+
+    def test_resting_reducers_use_up_the_room_unless_cancelled(self):
+        resting = [{"order_id": "r1", "ticker": "T1", "book_side": "bid", "yes_price": 41,
+                    "remaining_count": 5.0, "status": "resting"}]
+        to_place = [mm.Quote("T1", "bid", 39, 5)]
+        self.assertEqual(mm.new_risk_flags(to_place, resting, set(), {"T1": -5}), [True])
+        self.assertEqual(mm.new_risk_flags(to_place, resting, {"r1"}, {"T1": -5}), [False])
+
+    def test_place_order_reports_and_logs_refusals(self):
+        b = self.bot(GuardClient(refuse=lambda kw: _http(400, INSUFFICIENT)))
+        with mock.patch.object(mm, "log") as lg:
+            ok = b.place_order(mm.Quote("T1", "bid", 45, 5), 1000.0)
+        self.assertFalse(ok)
+        self.assertEqual(b.state.rejected_today, 1)
+        self.assertIn("insufficient_balance", b.state.last_reject)
+        self.assertTrue(any("insufficient_balance" in c.args[0] for c in lg.call_args_list))
+        self.assertEqual(b._last_place_error.status, 400)
+        self.assertEqual(b.state.ledger, {})
+
+    def test_accepted_dry_and_envelope_outcomes(self):
+        b = self.bot(GuardClient())
+        self.assertTrue(b.place_order(mm.Quote("T1", "bid", 45, 5), 1000.0))
+        self.assertFalse(b.place_order(mm.Quote("T1", "bid", 95, 5), 1000.0))   # envelope
+        self.assertIsNone(b._last_place_error)
+        self.assertEqual(b.state.rejected_today, 0)
+        dry = mm.TouchMarketMaker(SOL_MAX, None, live=False)
+        self.assertTrue(dry.place_order(mm.Quote("T1", "bid", 45, 5), 1000.0))
+
+    def test_side_cap_returns_only_accepted_orders(self):
+        n = {"i": 0}
+
+        def every_other(kw):
+            n["i"] += 1
+            return _http(400, '{"code":"post_only_cross"}') if n["i"] % 2 == 0 else None
+        client = GuardClient(refuse=every_other)
+        b = self.bot(client, shards={})
+        to_place = [mm.Quote("T1", "bid", 45 - 2 * i, 5) for i in range(3)]
+        self.assertEqual(b.place_with_side_cap(to_place, [], set(), 1000.0), 2)
+        self.assertEqual((b.state.rejected_today, b.state.last_cycle_rejected), (1, 1))
+        self.assertEqual(client.balance_calls, 0)        # shard unknown: guard idle
+
+    def test_quiet_summary_keeps_the_old_format(self):
+        b = mm.TouchMarketMaker(SOL_MAX, None, live=False)
+        b.state.placed_today = 40
+        body = b.build_daily_summary()
+        self.assertIn("placed 40, cxl 0, errs 0", body)
+        self.assertNotIn("rej", body)
+        self.assertNotIn("CASH GUARD", body)
+
+
+class TestCashGuard(_GuardBase):
+    def wave(self):
+        # T1 short 10: its 5-lot bid only reduces; the T1 ask and the T2 bid add risk
+        q = mm.Quote
+        return ([q("T1", "bid", 40, 5), q("T1", "ask", 60, 5), q("T2", "bid", 30, 5)],
+                {"T1": -10.0})
+
+    def sent(self, client):
+        return [(a["ticker"], a["side"]) for a in client.attempts]
+
+    def test_dry_shard_holds_new_risk_and_still_reduces(self):
+        client = GuardClient(balance=NO_CASH)
+        b = self.bot(client)
+        to_place, pos = self.wave()
+        self.assertEqual(b.place_with_side_cap(to_place, [], set(), 1000.0, pos), 1)
+        self.assertEqual(self.sent(client), [("T1", "yes")])       # the reducing bid only
+        self.assertEqual((b.state.held_today, b.state.last_cycle_held), (2, 2))
+        self.assertEqual(b.state.cash_guard["kind"], "dry")
+        self.assertIn("shard 2 cash $0.00", b.state.cash_guard["reason"])
+        self.assertEqual([c for c, _m in b.alerter.today], ["shard_cash"])
+
+    def test_funded_shard_sends_everything_and_clears_a_dry_guard(self):
+        client = GuardClient(balance=NO_CASH)
+        b = self.bot(client)
+        to_place, pos = self.wave()
+        b.place_with_side_cap(to_place, [], set(), 1000.0, pos)
+        client.balance = FUNDED
+        self.forget_balance()
+        self.assertEqual(b.place_with_side_cap(to_place, [], set(), 1060.0, pos), 3)
+        self.assertIsNone(b.state.cash_guard)
+        self.assertEqual(len(b.alerter.today), 1)                  # alerted on the way IN only
+
+    def test_insufficient_balance_refusal_pauses_new_risk(self):
+        # The balance still reads $2,000 (Kalshi's balance does not net out
+        # resting orders) and Kalshi refuses anyway: the rest of the wave and
+        # every cycle inside the pause hold new risk; the reducing bid still goes.
+        client = GuardClient(refuse=lambda kw: (None if kw["side"] == "yes" and kw["ticker"] == "T1"
+                                                else _http(400, INSUFFICIENT)))
+        b = self.bot(client)
+        to_place, pos = self.wave()
+        self.assertEqual(b.place_with_side_cap(to_place, [], set(), 1000.0, pos), 1)
+        self.assertEqual(self.sent(client), [("T1", "yes"), ("T1", "no")])   # T2 never sent
+        self.assertEqual(b.state.last_cycle_held, 1)
+        self.assertEqual(b.state.cash_guard["kind"], "rejected")
+        self.assertEqual(b.state.cash_pause_until, 1000.0 + mm.CASH_GUARD_PAUSE_SECS)
+        client.attempts.clear()
+        b.place_with_side_cap(to_place, [], set(), 1060.0, pos)
+        self.assertEqual(self.sent(client), [("T1", "yes")])
+        # pause over and Kalshi accepts again: the first new-risk accept clears it
+        client.refuse = lambda kw: None
+        self.assertEqual(b.place_with_side_cap(to_place, [], set(),
+                                               1001.0 + mm.CASH_GUARD_PAUSE_SECS, pos), 3)
+        self.assertIsNone(b.state.cash_guard)
+
+    def test_unexplained_400_burst_trips_after_the_threshold(self):
+        client = GuardClient(refuse=lambda kw: _http(400, UNEXPLAINED))
+        b = self.bot(client)
+        to_place = ([mm.Quote("T2", "bid", 30 - 2 * i, 5) for i in range(3)]
+                    + [mm.Quote("T1", "bid", 30 - 2 * i, 5) for i in range(3)])
+        self.assertEqual(b.place_with_side_cap(to_place, [], set(), 1000.0, {}), 0)
+        self.assertEqual(len(client.attempts), mm.CASH_GUARD_REJECT_TRIP)
+        self.assertEqual(b.state.last_cycle_held, len(to_place) - mm.CASH_GUARD_REJECT_TRIP)
+        self.assertEqual(b.state.cash_guard["kind"], "rejected")
+        self.assertIn("bad_request", b.state.cash_guard["reason"])
+
+    def test_crosses_and_an_accepted_order_do_not_trip(self):
+        client = GuardClient(refuse=lambda kw: _http(400, '{"code":"post_only_cross"}'))
+        b = self.bot(client)
+        b.place_with_side_cap([mm.Quote("T2", "bid", 30 - 2 * i, 5) for i in range(3)],
+                              [], set(), 1000.0, {})
+        self.assertEqual(len(client.attempts), 3)
+        self.assertIsNone(b.state.cash_guard)
+        n = {"i": 0}
+
+        def first_ok(kw):
+            n["i"] += 1
+            return None if n["i"] == 1 else _http(400, UNEXPLAINED)
+        client.refuse = first_ok
+        client.attempts.clear()
+        to_place = ([mm.Quote("T1", "bid", 30 - 2 * i, 5) for i in range(3)]
+                    + [mm.Quote("T1", "ask", 70 + 2 * i, 5) for i in range(3)])
+        b.place_with_side_cap(to_place, [], set(), 1000.0, {})
+        self.assertEqual(len(client.attempts), 6)
+        self.assertIsNone(b.state.cash_guard)
+
+    def test_balance_read_failure_fails_open(self):
+        client = GuardClient(balance=RuntimeError("read timeout"))
+        b = self.bot(client)
+        to_place, pos = self.wave()
+        self.assertEqual(b.place_with_side_cap(to_place, [], set(), 1000.0, pos), 3)
+        self.assertIsNone(b.state.cash_guard)
+
+    def test_unknown_shard_never_reads_the_balance(self):
+        client = GuardClient(balance=NO_CASH)
+        b = self.bot(client, shards={})
+        to_place, pos = self.wave()
+        self.assertEqual(b.place_with_side_cap(to_place, [], set(), 1000.0, pos), 3)
+        self.assertEqual(client.balance_calls, 0)
+
+    def test_kill_switch_and_dry_run_skip_the_guard(self):
+        class Off(mm.TouchMarketMaker):
+            cash_guard_enabled = False
+        client = GuardClient(balance=NO_CASH)
+        off = Off(SOL_MAX, client, live=True)
+        off.alerter.enabled = False
+        off.state.shard_by_ticker = {"T1": 2, "T2": 2}
+        to_place, pos = self.wave()
+        self.assertEqual(off.place_with_side_cap(to_place, [], set(), 1000.0, pos), 3)
+        dry = self.bot(client, live=False)
+        self.assertEqual(dry.place_with_side_cap(to_place, [], set(), 1000.0, pos), 3)
+        self.assertEqual(client.balance_calls, 0)
+        self.assertTrue(mm.TouchMarketMaker.cash_guard_enabled)    # ON in every fleet
+
+    def test_balance_read_is_shared_through_the_fleet_cache(self):
+        c1, c2 = GuardClient(), GuardClient()
+        to_place, pos = self.wave()
+        self.bot(c1).place_with_side_cap(to_place, [], set(), 1000.0, pos)
+        self.bot(c2).place_with_side_cap(to_place, [], set(), 1000.0, pos)
+        self.assertEqual((c1.balance_calls, c2.balance_calls), (1, 0))
+
+    def test_note_market_shards(self):
+        b = self.bot(GuardClient())
+        b.note_market_shards([{"ticker": "A", "exchange_index": 2}, {"ticker": "B"},
+                              {"ticker": "C", "exchange_index": "0"}])
+        self.assertEqual(b.state.shard_by_ticker, {"A": 2, "C": 0})
+
+
+class TestCashGuardCycle(_GuardBase):
+    """The monthly fleet's real cycle as it stood on the morning of 10/1."""
+    CHEAP, MID = 116.0, 108.0
+
+    def cycle(self, balance, refuse=None):
+        markets = [dict(_mk(self.CHEAP), exchange_index=2), dict(_mk(self.MID), exchange_index=2)]
+        books = {self.CHEAP: (30, 34), self.MID: (35, 45)}
+        fairs = {self.CHEAP: 32, self.MID: 40}
+        client = GuardClient(balance=balance, refuse=refuse, markets=markets,
+                             books={m["ticker"]: books[m["floor_strike"]] for m in markets})
+        bot = mm.MonthlyTouchMarketMaker(SOL_MAX, client, live=True)
+        bot.alerter.enabled = False
+        bot.state.sigma_daily = 0.03
+        bot.state.vol_fetched_at = time.time()
+        bot.state.mtd_hourly_at = time.time()
+        with mock.patch.object(mm, "fetch_live_price", return_value=100.0), \
+             mock.patch.object(mm, "fair_value_cents",
+                               side_effect=lambda spot, strike, sigma, t, d: fairs[strike]), \
+             mock.patch.object(bot, "window_end_utc",
+                               return_value=datetime.now(timezone.utc) + timedelta(days=10)):
+            bot.run_cycle()
+        return bot, client
+
+    def test_dry_shard_sends_nothing_and_says_so(self):
+        bot, client = self.cycle(NO_CASH)
+        self.assertEqual(client.attempts, [])
+        self.assertEqual(set(bot.state.shard_by_ticker.values()), {2})
+        line = bot.state.last_markets_line
+        self.assertTrue(line.startswith("0/2 mkts quoted (0 resting, "), line)
+        self.assertIn("held by cash guard", line)
+        self.assertEqual(bot.state.placed_today, 0)
+        self.assertEqual(bot.state.held_today, 12)
+
+    def test_refused_wave_reads_as_refused_not_quoted(self):
+        bot, client = self.cycle(FUNDED, refuse=lambda kw: _http(400, INSUFFICIENT))
+        self.assertEqual(len(client.attempts), 1)          # the first refusal trips it
+        self.assertEqual(client.created, [])
+        self.assertTrue(bot.state.last_markets_line.startswith(
+            "0/2 mkts quoted (0 resting, 1 rejected, 11 held by cash guard)"),
+            bot.state.last_markets_line)
+        self.assertEqual((bot.state.placed_today, bot.state.rejected_today), (0, 1))
+
+    def test_funded_cycle_counts_the_book(self):
+        bot, client = self.cycle(FUNDED)
+        self.assertEqual(len(client.created), 12)
+        self.assertEqual(bot.state.last_markets_line, "2/2 mkts quoted (12 resting)")
+        self.assertEqual(bot.state.placed_today, 12)
+        self.assertIsNone(bot.state.cash_guard)
+
+    def test_status_and_summary_carry_the_guard(self):
+        bot, _client = self.cycle(NO_CASH)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(bot, "status_dir", d):
+                bot.write_status(datetime.now(timezone.utc))
+            with open(os.path.join(d, f"status_{SOL_MAX.key}.json"), encoding="utf-8") as f:
+                st = _json.load(f)
+        self.assertEqual(st["cash_guard"]["kind"], "dry")
+        self.assertEqual((st["held_today"], st["rejected_today"], st["placed_today"]), (12, 0, 0))
+        body = bot.build_daily_summary()
+        self.assertIn("placed 0, held 12, cxl 0", body)
+        self.assertIn("CASH GUARD: shard 2 cash $0.00", body)
+        self.assertEqual((bot.state.held_today, bot.state.rejected_today), (0, 0))
+
+
+def _digest_module():
+    # Importing send_daily_digest copies ALERT_EMAIL_* from the registry into
+    # os.environ (for its Task Scheduler runs); keep that out of the test run.
+    with mock.patch.dict(os.environ, {}):
+        import send_daily_digest
+    return send_daily_digest
+
+
+class TestDigestCashFlags(unittest.TestCase):
+    def setUp(self):
+        self.sdd = _digest_module()
+
+    def write(self, d, name, **fields):
+        st = {"market": name,
+              "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        st.update(fields)
+        with open(os.path.join(d, f"status_{name}.json"), "w", encoding="utf-8") as f:
+            _json.dump(st, f)
+
+    def test_health_line_flags_the_guard_and_refusals(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "BTC-MAX",
+                       cash_guard={"kind": "dry", "since": "2026-10-01T04:16:20Z",
+                                   "reason": "shard 2 cash $0.00 < $73.10 of new-risk orders"},
+                       summary_body="BTC-MAX daily (LIVE): x | cycles 2511, placed 0, "
+                                    "rej 25836, cxl 0, errs 1 | alerts: none")
+            self.write(d, "ETH-MAX", summary_body="ETH-MAX daily (LIVE): x | cycles 2511, "
+                                                  "placed 900, rej 3, cxl 10, errs 0 | alerts: none")
+            line = self.sdd.fleet_health(d, "Monthly bots")
+            guards = self.sdd.active_cash_guards([d])
+        self.assertIn("2/2 alive, 1 errors", line)
+        self.assertIn("BTC-MAX CASH GUARD since 2026-10-01T04:16:20Z", line)
+        self.assertIn("BTC-MAX 25836 orders refused vs 0 accepted", line)
+        self.assertNotIn("ETH-MAX", line)
+        self.assertEqual([name for name, _g in guards], ["BTC-MAX"])
+
+    def test_balance_split_and_warnings(self):
+        shards = self.sdd.shard_balances(
+            {"balance_breakdown": [{"exchange_index": 0, "balance": "8260.2596"},
+                                   {"exchange_index": 1, "balance": "0.0000"},
+                                   {"exchange_index": 2, "balance": "0.0001"}]})
+        self.assertEqual(shards, {0: 8260.2596, 1: 0.0, 2: 0.0001})
+        self.assertEqual(self.sdd.balance_label(8260.26, shards),
+                         "$8,260.26 (shard 0 $8,260.26 + crypto shard 2 $0.00)")
+        warn = self.sdd.cash_warnings(shards, [])
+        self.assertEqual(len(warn), 1)
+        self.assertIn("Crypto shard 2 cash is $0.00", warn[0])
+        self.assertEqual(self.sdd.cash_warnings({0: 6204.67, 2: 2000.0}, []), [])
+        guards = [("BTC-MAX", {"reason": "shard 2 cash $0.00 < $73.10 of new-risk orders"})]
+        self.assertIn("on 1 bot (BTC-MAX): shard 2 cash $0.00",
+                      self.sdd.cash_warnings({2: 2000.0}, guards)[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -243,6 +243,59 @@ Post-restart verify: `placed` lines on current events; real `cancelled <id>` lin
 no `already gone (404)` spam after the first TTL-refresh wave (~7 min in); stable
 `orders: N resting` (no cancel/re-place churn).
 
+## INCIDENT 2026-09-30→10-01: shard 2 ran out of cash (all crypto fleets) + the guard
+
+**What happened.** The $3,000 moved to shard 2 on 9/1 was all in positions by
+9/30 ~18Z (shard 2 cash $0.0001; $1,565 of cost sat in SEP30 monthlies that
+Kalshi still had not settled 9h after their 10/1 04:00Z close). From then on
+every crypto order that needed fresh collateral came back **HTTP 400**, while
+position-REDUCING orders kept going through (no collateral needed). The updown
+fleet bounced ~15k orders an hour from 18Z; the touch fleet barely quoted in
+the last days of September, so it only showed at the OCT31 rollover: 0 of
+~26k BTC-MAX orders accepted between 04:16Z and the top-up. Nothing looked wrong:
+the bots logged only "400 Bad Request" (never Kalshi's reason), `placed_today`
+counted attempts, and the status line read "8/8 mkts quoted (40 quotes)". The
+futile writes (~14/s fleet-wide) also coincided with IMM 429s rising from 0/day
+to 133 in four hours. Jack moved $2,000 0→2 at ~13:26Z on 10/1; 330 touch
+orders were resting on the next cycle.
+
+**Hardening (`claude/crypto-hardening`, every fleet via the base class):**
+- `place_order` returns accepted/refused, logs Kalshi's reason with the status
+  (`http_error_detail`: `HttpError(400 Bad Request): {...}`), and counts refusals
+  in `rejected_today`; `placed_today` now counts ACCEPTED orders only.
+- The book line (`last_markets_line`, status `markets_line`) counts what is ON
+  the book after the cycle — kept resting orders plus accepted placements —
+  e.g. `0/8 mkts quoted (0 resting, 1 rejected, 39 held by cash guard)`.
+- **Shard-cash guard** in `place_with_side_cap`: quotes that would ADD exposure
+  (`new_risk_flags`: anything but a bid against a short / an ask against a long,
+  up to the position less resting reducers) are held (a) while their shard's
+  cash (`/portfolio/balance` breakdown, cached fleet-wide 30s as
+  `cache_balance_shards.json`) can't cover this cycle's new-risk collateral, and
+  (b) for 300s after Kalshi refuses a new-risk order for balance, or refuses 3
+  with a 400/422 and accepts none (post-only crosses excluded). Reducing orders
+  always go. Kalshi's balance does NOT net out resting orders (it read $2,000.00
+  with 330 orders resting), so (a) only catches a dry shard and (b) the rest.
+  Fails OPEN on unknown shards or a failed balance read. Logs `CASH GUARD ON/OFF`
+  on transitions, a digest-only `shard_cash` alert on the way in, and status
+  fields `cash_guard` / `rejected_today` / `held_today` / `last_reject`.
+  Banner: `cash guard ON: ...`. Kill switch `CMM_CASH_GUARD=0`; tunables
+  `CMM_CASH_GUARD_PAUSE_SECS` (300), `CMM_CASH_GUARD_REJECT_TRIP` (3).
+- Digest: the balance shows the shard split, `!!` lines up top when crypto
+  shard 2 is under `CMM_DIGEST_CASH_WARN` ($500) or any bot's guard is holding,
+  and each fleet's health line names guarded bots and bots that had more
+  refused than accepted orders yesterday (>= 20).
+- The exact REST code of the 9/30 refusals was never captured (no body logged);
+  `INSUFFICIENT_BALANCE_MARKERS` covers the documented spellings, the generic
+  400 trip covers anything else. The next refusal's reason is in the logs.
+
+**Top-up recipe (Jack runs it — a funds transfer):** `POST
+/portfolio/intra_exchange_instance_transfer` with body
+`{"source":"event_contract","destination":"event_contract","amount":<CENTICENTS>,
+"source_exchange_shard":0,"destination_exchange_shard":2}`. `ExchangeClient.post`
+sends `data=body` verbatim, so pass `json.dumps(body)`: a dict goes out
+form-encoded and Kalshi answers 400 "invalid character 's' looking for beginning
+of value" (nothing moves).
+
 ## INCIDENT 2026-08-09: concurrent bot GENERATIONS (all crypto fleets)
 
 Standby wakes had been MINTING fleets: three generations of the monthly bots (spawned by

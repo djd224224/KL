@@ -27,6 +27,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 
 
 def _env_from_registry(name: str) -> str:
@@ -50,12 +51,71 @@ from crypto_touch_mm import (CT, MARKETS, STATUS_DIR, Alerter, build_client,  # 
 
 STALE_AFTER_MINUTES = 30
 
+# Kalshi keeps cash per exchange shard and lists every crypto event on shard 2.
+# When that shard's cash ran out (9/30 ~18Z) every fleet's new orders bounced
+# HTTP 400 for most of a day with nothing in this email to say so. The balance
+# line now shows the split, and the top of the email warns when the crypto
+# shard runs low or a bot's cash guard is holding orders.
+CRYPTO_SHARD = 2
+CRYPTO_CASH_WARN_DOLLARS = float(os.environ.get("CMM_DIGEST_CASH_WARN", 500))
+REJECTS_FLAG_MIN = 20     # flag a bot whose refusals outnumber its accepted orders
+
 
 def _f(v) -> float:
     try:
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def shard_balances(balance_resp: dict) -> dict:
+    """{exchange_index: cash dollars} from a GET /portfolio/balance response."""
+    out = {}
+    for b in balance_resp.get("balance_breakdown") or []:
+        try:
+            out[int(b["exchange_index"])] = float(b["balance"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def balance_label(total: float, shards: dict) -> str:
+    """'$8,272.80 (shard 0 $6,272.80 + crypto shard 2 $2,000.00)': every
+    shard holding cash, and the crypto shard always."""
+    parts = [f"{'crypto ' if i == CRYPTO_SHARD else ''}shard {i} ${v:,.2f}"
+             for i, v in sorted(shards.items()) if v >= 0.005 or i == CRYPTO_SHARD]
+    return f"${total:,.2f}" + (f" ({' + '.join(parts)})" if parts else "")
+
+
+def active_cash_guards(status_dirs) -> list:
+    """[(bot, guard)] for every heartbeat whose cash guard is holding orders."""
+    out = []
+    for d in status_dirs:
+        for path in sorted(glob.glob(os.path.join(d, "status_*.json"))):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    st = json.load(f)
+            except Exception:
+                continue
+            if st.get("cash_guard"):
+                out.append((st.get("market", os.path.basename(path)), st["cash_guard"]))
+    return out
+
+
+def cash_warnings(shards: dict, guards: list) -> list:
+    """Top-of-email warnings: crypto-shard cash below the warn line, and bots
+    whose cash guard is holding new-risk orders. [] when all is well."""
+    out = []
+    cash = shards.get(CRYPTO_SHARD)
+    if cash is not None and cash < CRYPTO_CASH_WARN_DOLLARS:
+        out.append(f"Crypto shard {CRYPTO_SHARD} cash is ${cash:,.2f} (warn below "
+                   f"${CRYPTO_CASH_WARN_DOLLARS:,.0f}): new crypto orders need cash ON that "
+                   f"shard -- move some over from shard 0 (intra-exchange transfer)")
+    if guards:
+        names = ", ".join(name for name, _g in guards[:6]) + (" ..." if len(guards) > 6 else "")
+        out.append(f"Cash guard holding new-risk orders on {len(guards)} bot"
+                   f"{'s' if len(guards) != 1 else ''} ({names}): {guards[0][1].get('reason', '?')}")
+    return out
 
 
 def market_mids(client, event_ticker: str) -> dict:
@@ -149,7 +209,8 @@ def pnl_deltas(today_ct, snap: dict) -> tuple:
 
 
 def fleet_health(status_dir: str = STATUS_DIR, label: str = "Bots") -> str:
-    """One line: only problems (stale bots, error counts from stored summaries)."""
+    """One line: only problems (stale bots, error counts from stored summaries,
+    an active cash guard, more refused than accepted orders yesterday)."""
     problems = []
     errs = 0
     seen = 0
@@ -169,9 +230,18 @@ def fleet_health(status_dir: str = STATUS_DIR, label: str = "Bots") -> str:
             age_min = float("inf")
         if age_min > STALE_AFTER_MINUTES:
             problems.append(f"{name} STALE since {st.get('updated_at', '?')}")
-        m = re.search(r"errs (\d+)", st.get("summary_body") or "")
+        body = st.get("summary_body") or ""
+        m = re.search(r"errs (\d+)", body)
         if m:
             errs += int(m.group(1))
+        guard = st.get("cash_guard")
+        if guard:
+            problems.append(f"{name} CASH GUARD since {guard.get('since', '?')}")
+        rej = re.search(r"rej (\d+)", body)
+        placed = re.search(r"placed (\d+)", body)
+        n_rej, n_placed = (int(rej.group(1)) if rej else 0), (int(placed.group(1)) if placed else 0)
+        if n_rej >= REJECTS_FLAG_MIN and n_rej > n_placed:
+            problems.append(f"{name} {n_rej} orders refused vs {n_placed} accepted")
     line = f"{label}: {seen - len([p for p in problems if 'STALE' in p])}/{seen} alive, " \
            f"{errs} errors in yesterday's summaries"
     if problems:
@@ -790,11 +860,15 @@ def build_digest(now_utc: datetime):
     a_rows, a_tot, a_failed, a_quiet, a_by = collect_rows(
         client, fleet_entries(ANNUAL_STATUS_DIR))
 
+    shards = {}
     try:
-        balance = _f(client.get_balance().get("balance_dollars"))
-        bal_str = f"${balance:,.2f}"
+        bal_resp = client.get_balance()
+        shards = shard_balances(bal_resp)
+        bal_str = balance_label(_f(bal_resp.get("balance_dollars")), shards)
     except Exception:
         bal_str = "?"
+    warnings = cash_warnings(shards, active_cash_guards(
+        (STATUS_DIR, WEEKLY_STATUS_DIR, ANNUAL_STATUS_DIR)))
 
     # Bottom table: all-time realized per tenor + the sections' current
     # unrealized. A failed sweep degrades to a note — never kills the digest.
@@ -862,6 +936,7 @@ def build_digest(now_utc: datetime):
                      f"fees {grand['fees']:,.2f})")
     lines.append(f"Net position {grand['net_pos']:+,.0f} contracts | "
                  f"$ exposure ${grand['exposure']:,.2f} | balance {bal_str}")
+    lines += [f"!! {w}" for w in warnings]
     lines.append("")
     lines += text_section("MONTHLY one-touch (KX*MAXMON/*MINMON)",
                           m_rows, m_tot, m_quiet, m_failed, m_health, dd("monthly"))
@@ -913,6 +988,9 @@ def build_digest(now_utc: datetime):
              f'net position <b>{grand["net_pos"]:+,.0f}</b> contracts &nbsp;&middot;&nbsp; '
              f'exposure <b>${grand["exposure"]:,.2f}</b> &nbsp;&middot;&nbsp; '
              f'balance <b>{bal_str}</b></div>')
+    for w in warnings:
+        h.append(f'<div style="color:#c0392b;font-weight:600;margin:6px 0">'
+                 f'&#9888; {html_escape(w)}</div>')
     h += html_section("Monthly one-touch (KX*MAXMON / *MINMON)",
                       m_rows, m_tot, m_quiet, m_failed, m_health, dd("monthly"))
     h += html_section("Weekly above/below (KX*D)",

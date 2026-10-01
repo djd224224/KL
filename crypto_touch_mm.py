@@ -234,6 +234,27 @@ EWMA_LAMBDA = 0.94
 VOL_BLEND_EWMA_WEIGHT = 0.6      # blend: 0.6*EWMA + 0.4*simple 90d stdev
 HTTP_TIMEOUT = 10
 
+# Shard-cash guard (2026-10-01), shared by every crypto fleet through
+# place_with_side_cap. Kalshi keeps a separate cash balance per exchange shard
+# and lists every crypto event on shard 2. On 9/30 ~18Z that shard's cash ran
+# out (the $3,000 moved over on 9/1 was all in positions) and every order that
+# needed fresh collateral came back HTTP 400: the touch fleet re-sent ~40
+# doomed orders per bot per cycle until the shard was topped up, while its
+# status line read "8/8 mkts quoted". The guard holds back quotes that would
+# ADD exposure (orders that only reduce a position need no cash and always go)
+#   (a) while the shard's cash can't cover this cycle's new-risk quotes, and
+#   (b) for CASH_GUARD_PAUSE_SECS after Kalshi refuses a new-risk order for
+#       balance, or refuses CASH_GUARD_REJECT_TRIP of them with a 400/422 and
+#       accepts none (the 9/30 bodies were never logged, so the exact code is
+#       unconfirmed).
+# Kalshi's balance does not net out resting orders (it read $2,000.00 with 330
+# orders resting), so (a) only catches a dry shard and (b) catches the rest.
+# CMM_CASH_GUARD=0 turns the guard off in any fleet's launcher env.
+CASH_GUARD_ENABLED = os.environ.get("CMM_CASH_GUARD", "1") != "0"
+CASH_GUARD_PAUSE_SECS = int(os.environ.get("CMM_CASH_GUARD_PAUSE_SECS", 300))
+CASH_GUARD_REJECT_TRIP = int(os.environ.get("CMM_CASH_GUARD_REJECT_TRIP", 3))
+BALANCE_CACHE_SECS = 30          # fleet-shared shard-balance read (see shard_cash)
+
 # Alerting (same Gmail-SMTP convention as the other bots). Recipients are a
 # comma list; a recipient with an all-digit local part (1234567890@carrier) is
 # treated as an SMS gateway: body truncated to 300 chars, no subject line.
@@ -843,6 +864,70 @@ def diff_orders(desired: List[Quote],
 
 
 # ----------------------------------------------------------------------------
+# Placement accounting + shard-cash guard (pure functions)
+# ----------------------------------------------------------------------------
+
+# How Kalshi spells an insufficient-balance refusal across its REST docs and
+# FIX spec (insufficient_balance, available_balance_too_low,
+# INSUFFICIENT_BALANCE). The generic 400/422 trip in place_with_side_cap
+# backs this list up in case the live API words it differently.
+INSUFFICIENT_BALANCE_MARKERS = ("insufficient", "balance_too_low", "available_balance")
+
+
+def http_error_detail(e: Exception, max_chars: int = 200) -> str:
+    """'HttpError(400 Bad Request): <Kalshi's reason>' on one line. str() of
+    an HttpError is only status + reason; WHY Kalshi refused rides on .body."""
+    body = " ".join(str(getattr(e, "body", "") or "").split())
+    return f"{e}: {body[:max_chars]}" if body else str(e)
+
+
+def is_insufficient_balance(e: Exception) -> bool:
+    """True when Kalshi refused an order for lack of cash on its shard."""
+    body = str(getattr(e, "body", "") or "").lower()
+    return any(m in body for m in INSUFFICIENT_BALANCE_MARKERS)
+
+
+def quote_collateral_dollars(q: Quote) -> float:
+    """Cash Kalshi reserves for an order that adds exposure: a YES bid pays
+    its price, a YES ask is a NO buy at (100 - price)."""
+    px = q.price_cents if q.book_side == "bid" else 100 - q.price_cents
+    return q.count * px / 100.0
+
+
+def new_risk_flags(to_place: List[Quote], resting: List[dict], cancelled_ids: Set[str],
+                   positions: Dict[str, float]) -> List[bool]:
+    """Per quote in `to_place`: True if it ADDS exposure (needs fresh cash on
+    its shard), False if it only reduces a position we hold -- a bid against
+    a short (pos < 0) or an ask against a long, up to |pos| less what our
+    resting orders on that side (those kept this cycle) would already close.
+    Reducing orders need no collateral: they kept filling through the 9/30
+    storm, and the cash guard never holds them."""
+    room: Dict[Tuple[str, str], float] = {}
+    for ticker, pos in positions.items():
+        if pos < 0:
+            room[(ticker, "bid")] = -pos
+        elif pos > 0:
+            room[(ticker, "ask")] = pos
+    for o in resting:
+        if o.get("order_id") in cancelled_ids:
+            continue
+        parsed = order_yes_book_cents(o)
+        key = (o.get("ticker", ""), parsed[0]) if parsed else None
+        if key in room:
+            room[key] -= order_remaining(o)
+    flags: List[bool] = []
+    for q in to_place:
+        key = (q.ticker, q.book_side)
+        left = room.get(key, 0.0)
+        if left >= q.count - 1e-9:
+            room[key] = left - q.count
+            flags.append(False)
+        else:
+            flags.append(True)
+    return flags
+
+
+# ----------------------------------------------------------------------------
 # Credentials / client
 # ----------------------------------------------------------------------------
 
@@ -993,11 +1078,23 @@ class BotState:
     consecutive_errors: int = 0
     # daily-summary counters (reset when the summary sends)
     cycles_today: int = 0
-    placed_today: int = 0
+    placed_today: int = 0          # orders Kalshi ACCEPTED (refusals are rejected_today)
+    rejected_today: int = 0        # orders Kalshi refused
+    held_today: int = 0            # new-risk quotes the cash guard did not send
     cancelled_today: int = 0
     errors_today: int = 0
     last_markets_line: str = ""    # most recent per-market snapshot for the summary
     last_event_net: float = 0.0
+    last_reject: str = ""          # latest refusal: status + Kalshi's reason
+    # Shard-cash guard (see CASH_GUARD_*): why new-risk quotes are held (None
+    # = clear), the reactive pause's end, and each listed ticker's shard.
+    cash_guard: Optional[dict] = None
+    cash_pause_until: float = 0.0
+    shard_by_ticker: Dict[str, int] = field(default_factory=dict)
+    # this cycle's placement outcome, for the "N mkts quoted" book line
+    last_cycle_accepted: List[Quote] = field(default_factory=list)
+    last_cycle_rejected: int = 0
+    last_cycle_held: int = 0
 
 
 class TouchMarketMaker:
@@ -1036,6 +1133,9 @@ class TouchMarketMaker:
     skew_full_at = 1.0                       # net contracts at which skew saturates
     skew_edge_floor_cents = SKEW_EDGE_FLOOR_CENTS
     reduce_only_at = float("inf")            # |event net| beyond which we only reduce
+    # Shard-cash guard: ON for every fleet (the updown and annual bots place
+    # through this class's place_with_side_cap); CMM_CASH_GUARD=0 disables.
+    cash_guard_enabled = CASH_GUARD_ENABLED
 
     def status_extra(self) -> Dict[str, object]:
         """Extra fields merged into the heartbeat by variants."""
@@ -1073,10 +1173,15 @@ class TouchMarketMaker:
         self.tag = f"[{cfg.key}]"
         self.alerter = Alerter(cfg.key, live)
         self._shutdown_done = False
+        self._last_place_error: Optional[Exception] = None
 
     # ---- exchange wrappers (all writes gated on self.live) -----------------
 
-    def place_order(self, q: Quote, now_ts: float) -> None:
+    def place_order(self, q: Quote, now_ts: float) -> bool:
+        """Send one post-only order. True when it is on the book (dry run:
+        simulated); False when refused -- here by the price envelope, or by
+        Kalshi, in which case _last_place_error holds the exchange's error."""
+        self._last_place_error = None
         # last line of defense for the price envelope (see BID_MAX_CENTS):
         # nothing that buys a side above 90c reaches the exchange, whatever
         # built the quote
@@ -1085,7 +1190,7 @@ class TouchMarketMaker:
             log(f"{self.tag} ! envelope: NOT placing {q.book_side} {q.count}x "
                 f"@ {q.price_cents}c on {q.ticker} (bids <= {BID_MAX_CENTS}c, "
                 f"asks >= {ASK_MIN_CENTS}c)")
-            return
+            return False
         client_order_id = f"{self.client_order_prefix}-{RUN_ID}-{uuid.uuid4().hex[:12]}"
         # Stamp expiration at SEND time, not cycle start: a slow placement
         # wave (dozens of orders x ~2s) would otherwise burn minutes of TTL
@@ -1108,7 +1213,7 @@ class TouchMarketMaker:
             }
             self.state.order_ages[oid] = now_ts
             log(f"{self.tag} [DRY] place {label}")
-            return
+            return True
         try:
             # exchange_index=-1: auto-route by ticker across exchange shards —
             # crypto events created since 2026-08-24 live on shard 2.
@@ -1125,11 +1230,18 @@ class TouchMarketMaker:
                 "_placed_at": now_ts, "_confirmed": False,
             }
             log(f"{self.tag} placed {label} -> {oid}")
+            return True
         except HttpError as e:
-            # Post-only orders that would cross are rejected — expected occasionally.
-            log(f"{self.tag} ! place rejected ({e}): {label}")
+            # Post-only orders that would cross are rejected — expected
+            # occasionally. Kalshi's reason (the body) is logged with it: the
+            # status alone hid a day of insufficient-balance 400s on 9/30.
+            self._last_place_error = e
+            self.state.rejected_today += 1
+            self.state.last_reject = http_error_detail(e)
+            log(f"{self.tag} ! place rejected ({self.state.last_reject}): {label}")
         except Exception as e:
             log(f"{self.tag} ! place failed ({e}): {label}")
+        return False
 
     def cancel_order(self, order_id: str, ticker: Optional[str] = None) -> bool:
         """Returns True when the order is verifiably no longer resting."""
@@ -1388,6 +1500,7 @@ class TouchMarketMaker:
         if not markets:
             log(f"{self.tag} no active markets on {self.state.event_ticker}")
             return
+        self.note_market_shards(markets)
 
         positions = self.fetch_positions()   # raises DataError on failure (fail safe)
         event_net = sum(positions.values())
@@ -1566,15 +1679,13 @@ class TouchMarketMaker:
         if cancel_failures:
             # A cancel we can't confirm is live risk; let the fail-safe machinery see it.
             raise DataError(f"{cancel_failures} cancel(s) failed")
-        placed = self.place_with_side_cap(to_place, resting, cancelled_ids, now_ts)
+        placed = self.place_with_side_cap(to_place, resting, cancelled_ids, now_ts, positions)
         self.state.placed_today += placed
         self.state.cycles_today += 1
 
-        # Snapshot for the daily summary.
-        quoted = len({q.ticker for q in desired})
-        self.state.last_markets_line = (
-            f"{quoted}/{len(markets)} mkts quoted ({len(desired)} quotes)"
-            if markets else "no active markets")
+        # Snapshot for the daily summary: what is ON the book, not what we tried.
+        self.state.last_markets_line = (self.book_line(resting, cancelled_ids, len(markets))
+                                        if markets else "no active markets")
 
     def write_status(self, now_utc: datetime) -> None:
         """Heartbeat for the fleet digest: current stats + the stored daily
@@ -1600,6 +1711,10 @@ class TouchMarketMaker:
             "markets_line": s.last_markets_line,
             "cycles_today": s.cycles_today,
             "placed_today": s.placed_today,
+            "rejected_today": s.rejected_today,
+            "held_today": s.held_today,
+            "last_reject": s.last_reject,
+            "cash_guard": s.cash_guard,     # None, or why new-risk orders are held
             "cancelled_today": s.cancelled_today,
             "errors_today": s.errors_today,
             "alerts_today": cats,
@@ -1617,12 +1732,140 @@ class TouchMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! status write failed: {e}")
 
+    # ---- shard-cash guard (see CASH_GUARD_*) ---------------------------------
+
+    def note_market_shards(self, markets: List[dict]) -> None:
+        """Remember each listed market's exchange shard: the guard checks the
+        cash of the shard an order lands on. Replaced on every fetch, so it
+        only ever covers markets this cycle can quote."""
+        shards: Dict[str, int] = {}
+        for m in markets:
+            try:
+                shards[m["ticker"]] = int(m["exchange_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.state.shard_by_ticker = shards
+
+    def shard_cash(self) -> Optional[Dict[int, float]]:
+        """Cash per exchange shard, {index: dollars}, from GET
+        /portfolio/balance's balance_breakdown. Shared by every crypto bot
+        through the market-data file cache, so ~30 processes cost about two
+        account reads a minute. None when the read fails or has no breakdown:
+        the guard then fails OPEN (Kalshi still enforces collateral, and the
+        reactive pause still works)."""
+        cached = cache_get("balance", "shards", BALANCE_CACHE_SECS)
+        if cached is not None:
+            try:
+                return {int(k): float(v) for k, v in cached.items()}
+            except (AttributeError, TypeError, ValueError):
+                pass
+        try:
+            resp = self.client.get_balance()
+            out = {int(b["exchange_index"]): float(b["balance"])
+                   for b in (resp.get("balance_breakdown") or [])}
+        except Exception as e:
+            log(f"{self.tag} ! shard balance read failed ({e}); cash guard skipped")
+            return None
+        if not out:
+            return None
+        cache_put("balance", "shards", {str(k): v for k, v in out.items()})
+        return out
+
+    def _set_cash_guard(self, kind: str, reason: str, now_ts: float) -> None:
+        """Hold new-risk quotes. Logs and alerts (digest-only) only on the way
+        IN; per-cycle detail rides the cycle's placement line."""
+        g = self.state.cash_guard
+        if g is None:
+            log(f"{self.tag} ! CASH GUARD ON: {reason} -- holding new-risk orders "
+                f"(reducing orders still go)")
+            self.alerter.alert("shard_cash", reason, key="shard_cash", urgent=False,
+                               now_ts=now_ts)
+            since = now_ts
+        else:
+            since = g.get("since_ts", now_ts)
+        self.state.cash_guard = {
+            "kind": kind, "reason": reason, "since_ts": since,
+            "since": datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+    def _clear_cash_guard(self, why: str) -> None:
+        if self.state.cash_guard is not None:
+            log(f"{self.tag} cash guard OFF: {why}")
+            self.state.cash_guard = None
+        self.state.cash_pause_until = 0.0
+
+    def cash_guard_hold(self, to_place: List[Quote], adds: List[bool],
+                        now_ts: float) -> Optional[str]:
+        """Why this cycle's new-risk quotes (adds[i] True) must not be sent,
+        or None to send them. Holds through a reactive pause; otherwise
+        compares each shard's cash with the collateral of the new-risk quotes
+        bound for it. Live bots only; unknown shards and a failed balance read
+        fail OPEN. A 'dry' guard clears once the cash covers the cycle; a
+        'rejected' one waits for Kalshi to accept a new-risk order."""
+        if not (self.live and self.cash_guard_enabled) or not any(adds):
+            return None
+        g = self.state.cash_guard
+        if g is not None and now_ts < self.state.cash_pause_until:
+            return g["reason"]
+        need: Dict[int, float] = {}
+        for q, add in zip(to_place, adds):
+            shard = self.state.shard_by_ticker.get(q.ticker)
+            if add and shard is not None:
+                need[shard] = need.get(shard, 0.0) + quote_collateral_dollars(q)
+        cash = self.shard_cash() if need else None
+        if cash is None:
+            return None
+        short = [(s, cash[s], n) for s, n in sorted(need.items()) if s in cash and cash[s] < n]
+        if short:
+            s, have, n = short[0]
+            reason = f"shard {s} cash ${have:,.2f} < ${n:,.2f} of new-risk orders"
+            self._set_cash_guard("dry", reason, now_ts)
+            return reason
+        if g is not None and g.get("kind") == "dry":
+            self._clear_cash_guard("shard cash covers this cycle's new-risk orders")
+        return None
+
+    def trip_cash_guard(self, q: Quote, err: Exception, now_ts: float) -> str:
+        """Kalshi refused new-risk orders for cash: hold new-risk quotes --
+        the rest of this wave included -- for CASH_GUARD_PAUSE_SECS."""
+        self.state.cash_pause_until = now_ts + CASH_GUARD_PAUSE_SECS
+        shard = self.state.shard_by_ticker.get(q.ticker)
+        what = ("insufficient balance" if is_insufficient_balance(err) else
+                f"{CASH_GUARD_REJECT_TRIP}+ refused, none accepted")
+        reason = (f"Kalshi refused new-risk orders{f' on shard {shard}' if shard is not None else ''}"
+                  f" ({what}): {http_error_detail(err, 120)}")
+        self._set_cash_guard("rejected", reason, now_ts)
+        return reason
+
+    def book_line(self, resting: List[dict], cancelled_ids: Set[str],
+                  n_markets: Optional[int] = None) -> str:
+        """'7/8 mkts quoted (38 resting)': markets and orders actually ON the
+        book after this cycle, i.e. the resting orders we kept plus the
+        placements Kalshi accepted. Until 2026-10-01 this counted DESIRED
+        quotes and read '8/8 mkts quoted (40 quotes)' through a day of 100%
+        rejections."""
+        live = [o.get("ticker") for o in resting if o.get("order_id") not in cancelled_ids]
+        live += [q.ticker for q in self.state.last_cycle_accepted]
+        s = self.state
+        extra = ((f", {s.last_cycle_rejected} rejected" if s.last_cycle_rejected else "")
+                 + (f", {s.last_cycle_held} held by cash guard" if s.last_cycle_held else ""))
+        mkts = len(set(live))
+        return (f"{mkts}{f'/{n_markets}' if n_markets is not None else ''} mkts quoted "
+                f"({len(live)} resting{extra})")
+
     def place_with_side_cap(self, to_place: List[Quote], resting: List[dict],
-                            cancelled_ids: Set[str], now_ts: float) -> int:
+                            cancelled_ids: Set[str], now_ts: float,
+                            positions: Optional[Dict[str, float]] = None) -> int:
         """Place orders behind two unconditional backstops (beyond the ledger
         merge): a (market, side) never exceeds NUM_LEVELS x
         CONTRACTS_PER_LEVEL resting contracts, and a single price LEVEL on a
-        market never exceeds CONTRACTS_PER_LEVEL. Returns orders placed."""
+        market never exceeds CONTRACTS_PER_LEVEL. Returns orders Kalshi
+        ACCEPTED (refusals count in rejected_today).
+
+        Shard-cash guard: quotes that would add exposure (new_risk_flags over
+        `positions`, ticker -> signed YES position) are held while
+        cash_guard_hold() says their shard can't fund them, and a balance
+        refusal mid-wave holds the rest of the wave."""
         cap = self.num_levels * self.contracts_per_level
         side_totals: Dict[Tuple[str, str], float] = {}
         level_totals: Dict[Tuple[str, str, int], float] = {}
@@ -1637,8 +1880,13 @@ class TouchMarketMaker:
             side_totals[skey] = side_totals.get(skey, 0.0) + rem
             lkey = (o.get("ticker", ""), parsed[0], parsed[1])
             level_totals[lkey] = level_totals.get(lkey, 0.0) + rem
-        placed = 0
-        for q in to_place:
+        adds = new_risk_flags(to_place, resting, cancelled_ids, positions or {})
+        hold = self.cash_guard_hold(to_place, adds, now_ts)
+        guard_live = self.live and self.cash_guard_enabled
+        placed = rejected = held = 0
+        new_risk_refused = new_risk_accepted = 0
+        accepted: List[Quote] = []
+        for q, add in zip(to_place, adds):
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)
@@ -1660,10 +1908,41 @@ class TouchMarketMaker:
                                    f"{self.contracts_per_level} contracts",
                                    key=f"{q.ticker}-{q.price_cents}", urgent=False)
                 continue
-            self.place_order(q, now_ts)
-            side_totals[skey] = have_side + q.count
-            level_totals[lkey] = have_level + q.count
-            placed += 1
+            if add and hold:
+                held += 1
+                continue
+            if self.place_order(q, now_ts):
+                side_totals[skey] = have_side + q.count
+                level_totals[lkey] = have_level + q.count
+                placed += 1
+                accepted.append(q)
+                if add:
+                    new_risk_accepted += 1
+                    if self.state.cash_guard is not None:
+                        self._clear_cash_guard("Kalshi accepted a new-risk order")
+                continue
+            err = self._last_place_error
+            if err is None:       # refused locally (envelope) or a transport failure
+                continue
+            rejected += 1
+            if not (add and guard_live):
+                continue
+            if is_insufficient_balance(err):
+                hold = self.trip_cash_guard(q, err, now_ts)
+            elif (getattr(err, "status", None) in (400, 422)
+                  and "cross" not in str(getattr(err, "body", "") or "").lower()):
+                # Unrecognized refusal: trip only on a burst with nothing
+                # accepted (a post-only cross is an expected one-off).
+                new_risk_refused += 1
+                if new_risk_refused >= CASH_GUARD_REJECT_TRIP and new_risk_accepted == 0:
+                    hold = self.trip_cash_guard(q, err, now_ts)
+        self.state.held_today += held
+        self.state.last_cycle_accepted = accepted
+        self.state.last_cycle_rejected = rejected
+        self.state.last_cycle_held = held
+        if rejected or held:
+            log(f"{self.tag} placement: {placed}/{len(to_place)} accepted, {rejected} rejected"
+                + (f", {held} new-risk held ({hold})" if held else ""))
         return placed
 
     # ---- daily summary -------------------------------------------------------
@@ -1683,12 +1962,17 @@ class TouchMarketMaker:
             alert_str = " ".join(f"{c}x{n}" for c, n in sorted(cats.items()))
         else:
             alert_str = "none"
+        # rej/held only when nonzero; send_daily_digest reads them (absent = 0)
+        refused = ((f", rej {s.rejected_today}" if s.rejected_today else "")
+                   + (f", held {s.held_today}" if s.held_today else ""))
         body = (f"{self.cfg.key} daily ({'LIVE' if self.live else 'DRY'}): "
                 f"{self.cfg.asset} {price} vol {sigma}{mtd} | "
                 f"{s.last_markets_line}, net pos {s.last_event_net:+.0f} | "
-                f"cycles {s.cycles_today}, placed {s.placed_today}, "
-                f"cxl {s.cancelled_today}, errs {s.errors_today} | alerts: {alert_str}")
+                f"cycles {s.cycles_today}, placed {s.placed_today}{refused}, "
+                f"cxl {s.cancelled_today}, errs {s.errors_today} | alerts: {alert_str}"
+                + (f" | CASH GUARD: {s.cash_guard['reason']}" if s.cash_guard else ""))
         s.cycles_today = s.placed_today = s.cancelled_today = s.errors_today = 0
+        s.rejected_today = s.held_today = 0
         return body
 
     # ---- main loop ----------------------------------------------------------
@@ -1729,6 +2013,10 @@ class TouchMarketMaker:
             f"TTL {ORDER_TTL_SECS}s, per-market cap {self.max_position:g}, "
             f"event cap {self.max_event:g}")
         log(self.risk_rules_line())
+        log(f"cash guard {'ON' if self.cash_guard_enabled else 'OFF'}: new-risk orders held "
+            f"while their shard's cash can't fund them, and for {CASH_GUARD_PAUSE_SECS}s after "
+            f"Kalshi refuses them for balance (or {CASH_GUARD_REJECT_TRIP}+ unexplained "
+            f"400/422s with none accepted); reducing orders always go")
 
         self.startup_event_and_sweep()
 

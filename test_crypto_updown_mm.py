@@ -1350,5 +1350,29 @@ class TestWeeklyRiskRules(unittest.TestCase):
         self.assertEqual(short_a[a], [59, 61, 63])   # asks back off 4c
         self.assertEqual(short_b[a], [47, 45, 43])   # bids come in 2c
 
+
+class TestCashGuardWiring(unittest.TestCase):
+    """The updown (and annual) cycle feeds the base class's shard-cash guard:
+    the listing's shards, the cycle's positions, and a book line that counts
+    what is resting rather than what was wanted (2026-10-01)."""
+
+    def test_shards_positions_and_book_line(self):
+        ms = [dict(m, exchange_index=2) for m in daily_event()]
+        b = bot(FakeClient(markets=ms), cadences=("daily",))
+        seen = {}
+        real = b.place_with_side_cap
+
+        def spy(to_place, resting, cancelled_ids, now_ts, positions=None):
+            seen["positions"] = positions
+            return real(to_place, resting, cancelled_ids, now_ts, positions)
+        with priced(), mock.patch.object(b, "place_with_side_cap", side_effect=spy):
+            b.run_cycle()
+        self.assertEqual(b.state.shard_by_ticker, {m["ticker"]: 2 for m in ms})
+        self.assertEqual(seen["positions"], {})
+        self.assertRegex(b.state.last_markets_line,
+                         r"^\d+ mkts quoted \(\d+ resting\) across 1 events \[daily:")
+        self.assertEqual(len(b.state.sim_orders),
+                         int(b.state.last_markets_line.split("(")[1].split(" ")[0]))
+
 if __name__ == "__main__":
     unittest.main()

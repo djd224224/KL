@@ -990,7 +990,9 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
         now_utc = datetime.now(timezone.utc)
         now_ts = now_utc.timestamp()
 
-        views = build_event_views(self.fetch_series_markets(), now_utc)
+        series_markets = self.fetch_series_markets()
+        self.note_market_shards(series_markets)   # the cash guard's shard map
+        views = build_event_views(series_markets, now_utc)
         selected = select_events(views, self.cadences, now_utc)
         dropped = [v for v in views if v.cadence in self.cadences and v not in selected]
         selected_tickers = {v.ticker for v in selected}
@@ -1233,14 +1235,15 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                 cancel_failures += 1
         if cancel_failures:
             raise DataError(f"{cancel_failures} cancel(s) failed")
+        all_positions = {t: p for pos in per_event_positions.values() for t, p in pos.items()}
         self.state.placed_today += self.place_with_side_cap(
-            to_place, resting, cancelled_ids, now_ts)
+            to_place, resting, cancelled_ids, now_ts, all_positions)
         self.state.cycles_today += 1
         self.u.last_summary_events = ", ".join(
             f"{v.cadence}:{v.ticker.rsplit('-', 1)[-1]}" for v in selected)
+        # what is ON the book after this cycle, not what we tried to place
         self.state.last_markets_line = (
-            f"{len({q.ticker for q in desired})} mkts quoted "
-            f"({len(desired)} quotes) across {len(selected)} events "
+            f"{self.book_line(resting, cancelled_ids)} across {len(selected)} events "
             f"[{self.u.last_summary_events}]")
 
 
