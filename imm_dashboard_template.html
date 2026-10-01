@@ -211,6 +211,7 @@ table.t tr.sel td { background: var(--chip-info); }
 .tile { padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .tile .lbl { font-size: 12.5px; color: var(--ink-2); display: flex; justify-content: space-between; gap: 8px; }
 .tile .val { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+.tile .val .vs { font-size: 15px; font-weight: 500; color: var(--ink-2); letter-spacing: 0; }
 .tile .sub { font-size: 12px; color: var(--ink-2); }
 .tile .sub2 { font-size: 12px; color: var(--muted); }
 .spark { display: block; width: 100%; height: 28px; margin-top: 2px; }
@@ -609,7 +610,7 @@ function winDays() { const w = win(); return Math.max((w.end - w.start) / 86400,
 const SUM_KEYS = ["rew", "pnl", "net", "real", "du", "fills", "cts", "usd", "mk", "mk_n", "mk_cts", "rest"];
 function blank() {
   return { rew: 0, pnl: 0, net: 0, real: 0, du: 0, fills: 0, cts: 0, usd: 0, mk: 0, mk_n: 0, mk_cts: 0, rest: 0,
-    q2: 0, q1: 0, held: 0, sel: 0, restNow: 0, estNow: 0, poolNow: 0, u: 0, risk: 0, npos: 0, cred: 0, cred7: 0, n: 0 };
+    q2: 0, q1: 0, qev: 0, held: 0, sel: 0, restNow: 0, estNow: 0, poolNow: 0, u: 0, risk: 0, npos: 0, cred: 0, cred7: 0, n: 0 };
 }
 function addM(acc, m) {
   const w = mw(m);
@@ -640,6 +641,11 @@ function aggregate() {
       e.cred = num(ev.cred); e.cred7 = num(ev.cred7);
       f.cred7 += num(ev.cred7); tot.cred7 += num(ev.cred7);
     }
+  }
+  // events quoting now: at least one market resting a quote
+  for (const f of Object.values(fams)) {
+    f.qev = Object.values(f.events).filter((e) => e.q1 + e.q2 > 0).length;
+    tot.qev += f.qev;
   }
   AGG = { fams, tot };
   return AGG;
@@ -967,7 +973,7 @@ function renderSummary() {
   const tiles = [
     { lbl: "Fills", val: fmtNum(a.fills), sub: fmtNum(a.cts) + " contracts · " + fmtUSD(a.usd) + " traded",
       sub2: a.mk_n ? "30m mark-out " + money(a.mk) + " (" + (mkc >= 0 ? "+" : MINUS) + Math.abs(mkc).toFixed(1) + "¢/ct on " + fmtNum(a.mk_n) + " fills)" : "mark-outs pending" },
-    { lbl: "Quoting now", val: fmtNum(a.q2 + a.q1) + " mkts", sub: fmtNum(a.q2) + " two-sided · " + fmtNum(a.q1) + " one-sided · " + fmtNum(a.held) + " held",
+    { lbl: "Quoting now", val: fmtNum(a.q2 + a.q1) + ' mkts <span class="vs">in ' + fmtNum(a.qev) + (a.qev === 1 ? " event" : " events") + "</span>", sub: fmtNum(a.q2) + " two-sided · " + fmtNum(a.q1) + " one-sided · " + fmtNum(a.held) + " held",
       sub2: fmtUSD(a.restNow) + " resting · yield " + (yieldC != null ? yieldC.toFixed(1) + "¢ per $1 per day" : "—") },
     { lbl: "Open inventory", val: fmtUSD(a.u, { sign: true }), valCls: cls(a.u, 0.5), sub: fmtNum(a.npos) + " positions · " + fmtUSD(a.risk) + " at cost",
       sub2: "unrealized at mid (last trade on an empty book), bot's own book" },
@@ -1216,11 +1222,9 @@ function renderQuoting() {
   const tot = AGG.tot;
   $("quoteNote").textContent = (D.bot.markets_line || "") + (D.bot.max_events ? " · event cap " + D.bot.max_events : "") + (D.bot.scan_slots ? " · scan slots " + D.bot.scan_slots : "");
   const rows = fams.map((f) => {
-    const evq = Object.values(f.events).filter((e) => e.q1 + e.q2 > 0).length;
-    return { name: f.name, evq, q2: f.q2, q1: f.q1, held: f.held, sel: f.sel, restNow: f.restNow, estNow: f.estNow, poolNow: f.poolNow,
+    return { name: f.name, evq: f.qev, q2: f.q2, q1: f.q1, held: f.held, sel: f.sel, restNow: f.restNow, estNow: f.estNow, poolNow: f.poolNow,
       cap: f.poolNow > 0 ? f.estNow / f.poolNow : null, yld: f.rest > 0 ? f.rew / f.rest / days * 100 : null, rew: f.rew };
   }).filter((r) => matchQ(r.name) || !Q);
-  const evTot = Object.values(AGG.fams).reduce((s, f) => s + Object.values(f.events).filter((e) => e.q1 + e.q2 > 0).length, 0);
   table($("covTable"), [
     { k: "name", label: "Family", fmt: (r) => esc(r.name) },
     { k: "evq", label: "Events quoting", num: true, fmt: (r) => fmtNum(r.evq) },
@@ -1232,7 +1236,7 @@ function renderQuoting() {
     { k: "poolNow", label: "Pool $/day", num: true, title: "reward pool of the markets being quoted", fmt: (r) => fmtUSD(r.poolNow) },
     { k: "cap", label: "Share of pool", num: true, fmt: (r) => fmtPct(r.cap) },
     { k: "yld", label: "Yield ¢/$/day", num: true, title: "window rewards per $1 of average resting quotes per day", fmt: (r) => r.yld != null ? r.yld.toFixed(1) : "—" },
-  ], rows, { sortKey: "estNow", limit: 30, totalRow: { name: "All", evq: fmtNum(evTot), q2: fmtNum(tot.q2), q1: fmtNum(tot.q1), held: fmtNum(tot.held), restNow: fmtUSD(tot.restNow), estNow: fmtUSD(tot.estNow), poolNow: fmtUSD(tot.poolNow), cap: fmtPct(tot.poolNow ? tot.estNow / tot.poolNow : null), yld: tot.rest > 0 ? (tot.rew / tot.rest / days * 100).toFixed(1) : "—" } });
+  ], rows, { sortKey: "estNow", limit: 30, totalRow: { name: "All", evq: fmtNum(tot.qev), q2: fmtNum(tot.q2), q1: fmtNum(tot.q1), held: fmtNum(tot.held), restNow: fmtUSD(tot.restNow), estNow: fmtUSD(tot.estNow), poolNow: fmtUSD(tot.poolNow), cap: fmtPct(tot.poolNow ? tot.estNow / tot.poolNow : null), yld: tot.rest > 0 ? (tot.rew / tot.rest / days * 100).toFixed(1) : "—" } });
   // events
   const evs = [];
   for (const f of Object.values(AGG.fams)) for (const e of Object.values(f.events)) {
