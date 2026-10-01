@@ -95,6 +95,12 @@ def setUpModule():
     # the data center count file (2026-10-01) is reloaded by every run_cycle
     imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
     imm._dc_state.update(mtime=0.0, entries={})
+    # the OpenRouter market-share fair file (2026-09-30) is reloaded by every
+    # run_cycle (missed in the first cut: a full-suite run left the share
+    # gate's fixture in the live run-logs/incentive-mm -- see
+    # TestNoLivePathUnderTest)
+    imm.SHARE_FAIR_FILE = os.path.join(tmp, "openrouter_share_fair.json")
+    imm._share_fair_state.update(mtime=0.0, entries={}, moved_at={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -9201,6 +9207,28 @@ class TestOpenRouterFairGate(unittest.TestCase):
             self.assertNotEqual(self._quotes(bot), [])
 
 
+class TestNoLivePathUnderTest(unittest.TestCase):
+    """setUpModule must redirect EVERY path incentive_mm bakes from the live
+    status dir at import. 2026-10-01: SHARE_FAIR_FILE was missed, and a full
+    suite run left TestOpenRouterShareFairGate's fixture in the live
+    run-logs/incentive-mm (setUp also DELETES each gate's file, so a missed
+    redirect of a live gate's file would blank it under the running bot).
+    The class sweep: any upper-case string constant still pointing into the
+    live dir fails here, whichever gate adds it next."""
+
+    def test_every_baked_path_is_redirected(self):
+        live = os.path.normcase(os.path.abspath(os.environ.get(
+            "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")))
+        self.assertNotEqual(os.path.normcase(os.path.abspath(imm.STATUS_DIR)), live)
+        bad = [f"{owner}.{name}"
+               for owner, ns in (("imm", vars(imm)),
+                                 ("IncentiveMarketMaker", vars(imm.IncentiveMarketMaker)))
+               for name, v in ns.items()
+               if name.isupper() and isinstance(v, str) and v
+               and os.path.normcase(os.path.abspath(v)).startswith(live)]
+        self.assertEqual(bad, [])
+
+
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
@@ -9367,10 +9395,21 @@ class TestGasBuddyFairGate(unittest.TestCase):
         # since the 2026-10-01 gas trial the state dailies are BLOCKED by
         # default; this class exercises the gated state quoting that
         # IMM_GB_STATE_QUOTE=1 brings back, so it runs under that config
+        # The gas trial (2026-10-01) gave the national daily -- and so, by
+        # family cloning, this state fixture -- a 00:00-13:00 ET no-quote
+        # window (03:05-04:00, the print blackout, before it). This class
+        # tests the GasBuddy gate, not the blackouts (their own tests pin
+        # those), so the parent's blackout is lifted here; otherwise two of
+        # its tests fail by wall clock 13 hours a day (found 10/01 09:05 ET,
+        # identically on main 6e5f58c). patch.dict also drops the clone the
+        # cycle adds.
+        import dataclasses
         for p in (mock.patch.object(imm, "GB_STATE_QUOTE", True),
                   mock.patch.object(imm, "SERIES_BLOCK_PATTERNS", tuple(
                       imm.re.compile(x) for x in
-                      imm._series_block_default(True).split(",") if x))):
+                      imm._series_block_default(True).split(",") if x)),
+                  mock.patch.dict(imm.SERIES_OVERRIDES, {"KXAAAGASD": dataclasses.replace(
+                      imm.SERIES_OVERRIDES["KXAAAGASD"], blackout_et=None)})):
             p.start()
             self.addCleanup(p.stop)
         imm._gb_fair_state.update(mtime=0.0, entries={})
