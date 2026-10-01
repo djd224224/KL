@@ -7347,15 +7347,6 @@ class TestStartupReconcileSettles(unittest.TestCase):
         [row] = self._settlements()
         self.assertEqual((row["result"], row["via"]), ("manual_offset", "startup_reconcile"))
 
-    def test_orphaned_fill_still_adopted_at_the_mid(self):
-        """The case the reconcile exists for is unchanged: the account holds
-        a position the own book does not know."""
-        bot = self._live_bot()
-        bot._reconcile_orphaned_fills({self.T: 10.0})
-        self.assertAlmostEqual(bot.pnl.pos[self.T], 10.0)
-        self.assertAlmostEqual(bot.pnl.avg[self.T], 50.0)    # (49 + 51) / 2
-        self.assertEqual(self._settlements(), [])
-
     def test_first_live_cycle_books_it(self):
         """Through run_cycle, where the reconcile runs on the first trusted
         cycle ahead of the settle loop (KXWORLDNEWSMENTION-26SEP09-IRAN:
@@ -7368,6 +7359,152 @@ class TestStartupReconcileSettles(unittest.TestCase):
         self.assertAlmostEqual(bot.pnl.pos.get(self.T, 0.0), 0.0)
         [row] = self._settlements()
         self.assertEqual(row["via"], "startup_reconcile")
+
+
+class _FillsClient(FakeClient):
+    """FakeClient whose fills read honors ticker / min_ts the way Kalshi's
+    does (the base fake returns every fill on every read)."""
+
+    def get_fills(self, **kw):
+        self.fills_reads = getattr(self, "fills_reads", 0) + 1
+        return {"fills": [f for f in getattr(self, "fills", [])
+                          if (not kw.get("ticker") or f.get("ticker") == kw["ticker"])
+                          and f.get("ts", 0) >= (kw.get("min_ts") or 0)],
+                "cursor": None}
+
+
+class TestReconcileOwnershipGate(unittest.TestCase):
+    """2026-09-30: the startup reconcile adopted ANY divergence on a quoted
+    market within the cap, at the mid. The 9/30 03:17Z restart claimed 22.36
+    contracts of Jack's own 400-lot pair on KXMLBSEASONGAMES-27-2425 (placed
+    by hand, no client_order_id) as the bot's: -25 @ 38 -> -47.36 @ 42.5. It
+    now books only the unbooked fills on OUR orders (our_order_ids or the
+    imm- client prefix), each at its own price."""
+    T = "KXGOOD-99DEC31-A"
+
+    def _live_bot(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=_FillsClient(), live=True)
+        bot.state.known_tickers = {self.T}
+        bot._inherited_fill_ts = int(time.time()) - 120
+        bot.client.order_lookup = {}
+        return bot
+
+    def _fill(self, fid, oid, count, yes, side="yes", action="buy", age=60):
+        return TestFillsPipeline._fill(fid, int(time.time()) - age, ticker=self.T,
+                                       side=side, action=action, count=count,
+                                       yes=yes, order_id=oid)
+
+    def test_a_manual_fill_is_not_adopted(self):
+        bot = self._live_bot()
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -25.0, 38.0
+        bot.client.fills = [self._fill("jack-f1", "jack-o1", "22.36", "0.43",
+                                       side="no", action="buy")]
+        bot.client.order_lookup = {"jack-o1": {"client_order_id": ""}}
+        bot._reconcile_orphaned_fills({self.T: -47.36})
+        self.assertEqual((bot.pnl.pos[self.T], bot.pnl.avg[self.T]), (-25.0, 38.0))
+        self.assertNotIn("jack-f1", bot.state.seen_fill_ids)
+        self.assertNotIn("jack-o1", bot.state.our_order_ids)
+
+    def test_orphaned_own_fill_booked_at_its_price(self):
+        """An imm- order whose id the killed run never saved: booked through
+        the normal fill path at 37c (not the 50c mid), claimed for later
+        fills, kept out of the pick-off queue, and never booked twice."""
+        bot = self._live_bot()
+        bot.client.fills = [self._fill("f1", "lost-o1", "10.00", "0.37")]
+        bot.client.order_lookup = {"lost-o1": {"client_order_id": "imm-dead0001-0123456789ab"}}
+        with mock.patch.object(imm, "TOXIC_HALT", True):
+            bot._reconcile_orphaned_fills({self.T: 10.0})
+        self.assertAlmostEqual(bot.pnl.pos[self.T], 10.0)
+        self.assertAlmostEqual(bot.pnl.avg[self.T], 37.0)
+        self.assertIn("f1", bot.state.seen_fill_ids)
+        self.assertIn("lost-o1", bot.state.our_order_ids)
+        self.assertEqual(bot.state.toxic_pending, [])
+        self.assertEqual(bot.fetch_new_fills(), [])
+
+    def test_known_order_fill_missed_by_the_read_needs_no_lookup(self):
+        bot = self._live_bot()
+        bot.state.our_order_ids["ours-1"] = time.time()
+        bot.client.fills = [self._fill("f2", "ours-1", "6.00", "0.41")]
+
+        def no_lookup(order_id):
+            raise AssertionError("looked up an order already in our_order_ids")
+        bot.client.get_order = no_lookup
+        bot._reconcile_orphaned_fills({self.T: 6.0})
+        self.assertAlmostEqual(bot.pnl.pos[self.T], 6.0)
+        self.assertAlmostEqual(bot.pnl.avg[self.T], 41.0)
+
+    def test_mixed_divergence_books_only_our_part(self):
+        """+5 on a lost imm- order, +10 on a manual one: book the 5, leave
+        the 10 to the manual standoff."""
+        bot = self._live_bot()
+        bot.client.fills = [self._fill("f1", "lost-o1", "5.00", "0.40"),
+                            self._fill("j1", "jack-o1", "10.00", "0.40")]
+        bot.client.order_lookup = {"lost-o1": {"client_order_id": "imm-dead0001-aa"},
+                                   "jack-o1": {"client_order_id": ""}}
+        bot._reconcile_orphaned_fills({self.T: 15.0})
+        self.assertAlmostEqual(bot.pnl.pos[self.T], 5.0)
+        self.assertNotIn("j1", bot.state.seen_fill_ids)
+
+    def test_a_booked_fill_is_not_booked_again(self):
+        bot = self._live_bot()
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 10.0, 40.0
+        bot.state.seen_fill_ids["f1"] = int(time.time()) - 60
+        bot.state.our_order_ids["ours-1"] = time.time()
+        bot.client.fills = [self._fill("f1", "ours-1", "10.00", "0.40"),
+                            self._fill("j1", "jack-o1", "10.00", "0.40")]
+        bot.client.order_lookup = {"jack-o1": {"client_order_id": "cmm-fleet-1"}}
+        bot._reconcile_orphaned_fills({self.T: 20.0})
+        self.assertEqual((bot.pnl.pos[self.T], bot.pnl.avg[self.T]), (10.0, 40.0))
+
+    def test_fill_older_than_the_window_is_left_alone(self):
+        """The window opens an hour before the inherited fill high-water
+        mark; an older divergence fails closed to the standoff."""
+        bot = self._live_bot()
+        bot.client.fills = [self._fill("f1", "lost-o1", "10.00", "0.37", age=4 * 3600)]
+        bot.client.order_lookup = {"lost-o1": {"client_order_id": "imm-dead0001-aa"}}
+        bot._reconcile_orphaned_fills({self.T: 10.0})
+        self.assertEqual(bot.pnl.pos.get(self.T, 0.0), 0.0)
+
+    def test_window_never_reaches_past_seen_fill_ids(self):
+        bot = self._live_bot()
+        bot._inherited_fill_ts = 1_000_000
+        bot.state.seen_fill_ids = {}
+        self.assertEqual(bot._reconcile_since(), 1_000_000 - 3600)
+        bot.state.seen_fill_ids = {"a": 999_000, "b": 1_000_500}
+        self.assertEqual(bot._reconcile_since(), 999_000)
+        bot._inherited_fill_ts = 0                # no high-water mark: look nowhere
+        self.assertAlmostEqual(bot._reconcile_since(), time.time(), delta=5)
+
+    def test_inherited_fill_ts_is_the_persisted_one(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=_FillsClient(), live=True)
+        bot.state.last_fill_ts = 1_790_000_000
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=_FillsClient(), live=True)
+        self.assertEqual(bot2._inherited_fill_ts, 1_790_000_000)
+        _clean_persist()
+
+    def test_read_failure_adopts_nothing(self):
+        bot = self._live_bot()
+
+        def boom(**kw):
+            raise RuntimeError("503")
+        bot.client.get_fills = boom
+        bot._reconcile_orphaned_fills({self.T: 10.0})
+        self.assertEqual(bot.pnl.pos.get(self.T, 0.0), 0.0)
+
+    def test_first_live_cycle_leaves_the_manual_fill_out(self):
+        """End to end through run_cycle, the KXMLBSEASONGAMES shape."""
+        bot = self._live_bot()
+        bot.state.universe_at = time.time()
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -25.0, 38.0
+        bot.client.positions[self.T] = -47.36
+        bot.client.fills = [self._fill("jack-f1", "jack-o1", "22.36", "0.43",
+                                       side="no", action="buy")]
+        bot.client.order_lookup = {"jack-o1": {"client_order_id": ""}}
+        bot.run_cycle()
+        self.assertEqual((bot.pnl.pos[self.T], bot.pnl.avg[self.T]), (-25.0, 38.0))
 
 
 class TestCycleLog(unittest.TestCase):

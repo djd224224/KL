@@ -9818,6 +9818,10 @@ class IncentiveMarketMaker:
         self._guard_snap_at = 0.0                 # hourly guard snapshot
         self._floor_state_prev: Dict[str, tuple] = {}   # member floor-state trigger
         self._load_persist()
+        # The fill high-water mark this process inherited, before its first
+        # fills read moves it: the startup reconcile looks for unbooked fills
+        # from an hour before it.
+        self._inherited_fill_ts = self.state.last_fill_ts
 
     # ---- restart persistence (which markets are OURS) ------------------------
     # Realized P&L and breakers reset on restart (accepted); the set of tickers
@@ -10065,6 +10069,30 @@ class IncentiveMarketMaker:
             if "guard_skips" not in self._sink_muted:
                 self._sink_muted.add("guard_skips")
                 log(f"{self.tag} ! guard-skip sink failed ({e}); muted this run")
+
+    def _book_fill(self, f: dict, now_ts: float, toxic: bool = True) -> None:
+        """Book one of OUR fills: own book, fills counter, fills sink and --
+        when `toxic` -- the pick-off queue. The one path every own fill
+        takes: the cycle's fills read, and the startup reconcile's orphaned
+        fills (toxic=False: a pick-off check needs the mark shortly after
+        the fill, which an old fill no longer has)."""
+        side, action = f.get("side"), f.get("action")
+        count = float(f.get("count_fp") or f.get("count") or 0)
+        px = f.get("yes_price_dollars")
+        px_cents = float(px) * 100 if px is not None else float(f.get("yes_price") or 0)
+        if side in ("yes", "no") and action in ("buy", "sell") and count > 0:
+            tkr = f.get("ticker", "?")
+            # Read position BEFORE booking; log AFTER. Ordering is
+            # deliberate: the fill must be booked into P&L even if
+            # anything about the analytics row is broken.
+            pos_before = self.pnl.pos.get(tkr, 0.0)
+            avg_before = self.pnl.avg.get(tkr, 0.0)
+            self.pnl.on_fill(tkr, side, action, count, px_cents)
+            self.state.fills_today += count
+            self._log_fill(f, tkr, side, action, count, px_cents,
+                           now_ts, pos_before, avg_before)
+            if toxic:
+                self._toxic_note_fill(f, tkr, side, action, px_cents)
 
     def _log_fill(self, f: dict, tkr: str, side: str, action: str,
                   count: float, px_cents: float, now_ts: float,
@@ -13754,6 +13782,60 @@ class IncentiveMarketMaker:
 
     # ---- one polling cycle ---------------------------------------------------
 
+    def _reconcile_since(self) -> int:
+        """Where the startup reconcile starts looking for unbooked fills: an
+        hour before the fill high-water mark this process inherited (a fill
+        the killed run read but could not claim sits just under it), and
+        never before the oldest fill seen_fill_ids still holds, since a fill
+        that WAS booked and then pruned from it would read as unbooked. A
+        state file without a high-water mark looks nowhere (fail closed)."""
+        if not self._inherited_fill_ts:
+            return int(time.time())
+        since = self._inherited_fill_ts - 3600
+        if self.state.seen_fill_ids:
+            since = max(since, min(self.state.seen_fill_ids.values()))
+        return int(since)
+
+    def _unbooked_fills(self, t: str, since_ts: int) -> Tuple[List[dict], float]:
+        """(own, foreign_net): the fills on `t` since `since_ts` that this bot
+        has not booked (fill id not in seen_fill_ids), split by whose order
+        they hit. A fill is OURS when its order is in our_order_ids or carries
+        our client_order_id prefix -- stamped at placement, so it survives the
+        hard kill that loses an order id, and the same test
+        _get_resting_orders_global applies to resting orders. foreign_net is
+        the signed YES contracts filled on everyone else's orders. Raises on
+        a failed read."""
+        fills: List[dict] = []
+        cursor = None
+        for _page in range(10):
+            resp = self.client.get_fills(ticker=t, min_ts=since_ts, limit=200,
+                                         cursor=cursor)
+            batch = resp.get("fills") or []
+            fills.extend(batch)
+            cursor = resp.get("cursor")
+            if not cursor or not batch:
+                break
+        ours: Dict[str, bool] = {}
+        own: List[dict] = []
+        foreign = 0.0
+        for f in fills:
+            fid = f.get("fill_id") or f.get("trade_id") or ""
+            if not fid or fid in self.state.seen_fill_ids or f.get("ticker", t) != t:
+                continue
+            oid = str(f.get("order_id") or "")
+            if oid not in ours:
+                ours[oid] = bool(oid) and (
+                    oid in self.state.our_order_ids
+                    or str(((self.client.get_order(oid) or {}).get("order") or {})
+                           .get("client_order_id") or "")
+                    .startswith(CLIENT_ORDER_PREFIX + "-"))
+            if ours[oid]:
+                own.append(f)
+            else:
+                n = float(f.get("count_fp") or f.get("count") or 0)
+                foreign += n if (f.get("action") == "buy") == (f.get("side") == "yes") else -n
+        return own, foreign
+
     def _reconcile_orphaned_fills(self, positions: Dict[str, float]) -> None:
         """One-time post-restart cleanup for fills orphaned by an unclean
         shutdown: the bot placed an order, the process was hard-killed before
@@ -13762,20 +13844,27 @@ class IncentiveMarketMaker:
         and yields the whole event forever (observed 2026-07-14: an orphaned
         +5 LENO fill kept the entire ENGARG event yielded).
 
-        Adopt those positions as the bot's own, scoped HARD so it can NEVER
-        claim the user's manual book: (1) only markets the bot actually quotes
-        (known_tickers) — the user trades MENWORLDCUP (tournament-wide, no
-        window) and big crypto by hand, none of which are quoted; (2) only
-        within the per-market position cap — a >cap position can't be ours.
-        Runs once, on the first trusted (non-grace) cycle; afterwards the normal
-        yield-to-human standoff handles genuinely NEW manual activity.
+        Book those fills as the bot's own, scoped HARD so it can NEVER claim
+        the user's manual book: (1) only markets the bot actually quotes
+        (known_tickers); (2) only within the per-market position cap — a >cap
+        position can't be ours; (3) only fills on OUR orders (OWNERSHIP GATE,
+        2026-09-30): a fill not yet booked whose order carries our
+        client_order_id prefix is booked at its own price through the normal
+        fill path. A divergence with no such fill behind it is left to the
+        yield-to-human standoff. Until this gate the reconcile adopted the
+        whole account position at the mid: on 9/30 that claimed 22.36 of
+        Jack's own contracts on KXMLBSEASONGAMES-27-2425 (a 400-lot pair he
+        placed by hand, no client id) as the bot's. Runs on the first trusted
+        (non-grace) cycle and once more ~4 min later.
 
         A market the account holds NOTHING in is not adopted as 0: it goes
         through _settle_or_drop, which books Kalshi's settlement or records a
-        manual offset (2026-09-29). Every "->+0" adoption on record (9
-        positions over 4 restarts, 9/03-9/27) was a market that settled while
-        the bot was down, and adopting 0 dropped it with no P&L and no row."""
-        adopted = []
+        manual offset (2026-09-29). Every "->+0" adoption on record (73 itemized
+        7/18-9/27) was a market that settled while the bot was down, and
+        adopting 0 dropped it with no P&L and no row."""
+        adopted, left = [], []
+        since = self._reconcile_since()
+        now_ts = time.time()
         for t in sorted(self.state.known_tickers):
             acct = positions.get(t, 0.0)
             own = self.pnl.pos.get(t, 0.0)
@@ -13786,28 +13875,35 @@ class IncentiveMarketMaker:
             if t not in positions:
                 self._settle_or_drop(t, via="startup_reconcile")
                 continue
-            # Entry cost of the orphaned delta is unrecoverable, so mark the
-            # whole adopted position at the current YES mid: ~0 unrealized now,
-            # clean forward P&L. Skips (leaves as-is) if the book can't be read.
             try:
-                m = (self.client.get_market(t) or {}).get("market") or {}
-                bid = market_cents(m, "yes_bid")
-                ask = market_cents(m, "yes_ask")
-                mid = (bid + ask) / 2.0 if (bid and ask) else None
-            except Exception:
-                mid = None
-            if mid is None:
-                mid = self.pnl.avg.get(t) or 50.0
-            adopted.append(f"{t} {own:+.1f}->{acct:+.0f}@{mid:.0f}c")
-            self.pnl.pos[t] = acct
-            self.pnl.avg[t] = mid
+                own_fills, foreign = self._unbooked_fills(t, since)
+            except Exception as e:
+                log(f"{self.tag} ! startup reconcile: fills read failed for {t} "
+                    f"({e}); nothing adopted")
+                continue
+            if not own_fills:
+                left.append(f"{t} own {own:+.1f} vs account {acct:+.1f} "
+                            f"({foreign:+.1f} on other orders)")
+                continue
+            for f in sorted(own_fills, key=self._fill_ts):
+                fts = self._fill_ts(f)
+                self.state.seen_fill_ids[f.get("fill_id") or f.get("trade_id")] = fts
+                if f.get("order_id"):
+                    self.state.our_order_ids.setdefault(f["order_id"], float(fts))
+                self._book_fill(f, now_ts, toxic=False)
+            adopted.append(f"{t} {own:+.1f}->{self.pnl.pos.get(t, 0.0):+.1f} "
+                           f"({len(own_fills)} fill(s))")
+        if left:
+            log(f"{self.tag} startup reconcile: {len(left)} divergence(s) with no "
+                f"unbooked fill on our orders, left to the manual standoff: "
+                f"{', '.join(left[:8])}" + (" ..." if len(left) > 8 else ""))
         if adopted:
-            log(f"{self.tag} startup reconcile: adopted {len(adopted)} orphaned "
-                f"own-fill position(s) (unclean-shutdown cleanup): "
+            log(f"{self.tag} startup reconcile: booked orphaned own fills on "
+                f"{len(adopted)} market(s) (unclean-shutdown cleanup): "
                 f"{', '.join(adopted[:8])}" + (" ..." if len(adopted) > 8 else ""))
             self.alerter.alert(
-                "reconcile", f"adopted {len(adopted)} orphaned own-fill "
-                f"position(s) on restart: {', '.join(adopted[:6])}",
+                "reconcile", f"booked orphaned own fills on {len(adopted)} "
+                f"market(s) on restart: {', '.join(adopted[:6])}",
                 key="reconcile", urgent=False)
             self._save_persist()
 
@@ -13878,22 +13974,7 @@ class IncentiveMarketMaker:
         # LATENIGHT markets and stray-cancelled 59 resting orders).
         for f in self.fetch_new_fills():
             try:
-                side, action = f.get("side"), f.get("action")
-                count = float(f.get("count_fp") or f.get("count") or 0)
-                px = f.get("yes_price_dollars")
-                px_cents = float(px) * 100 if px is not None else float(f.get("yes_price") or 0)
-                if side in ("yes", "no") and action in ("buy", "sell") and count > 0:
-                    tkr = f.get("ticker", "?")
-                    # Read position BEFORE booking; log AFTER. Ordering is
-                    # deliberate: the fill must be booked into P&L even if
-                    # anything about the analytics row is broken.
-                    pos_before = self.pnl.pos.get(tkr, 0.0)
-                    avg_before = self.pnl.avg.get(tkr, 0.0)
-                    self.pnl.on_fill(tkr, side, action, count, px_cents)
-                    self.state.fills_today += count
-                    self._log_fill(f, tkr, side, action, count, px_cents,
-                                   now_ts, pos_before, avg_before)
-                    self._toxic_note_fill(f, tkr, side, action, px_cents)
+                self._book_fill(f, now_ts)
             except Exception as e:
                 log(f"{self.tag} ! unparseable fill skipped: {e}")
 
