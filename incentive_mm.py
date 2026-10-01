@@ -3126,10 +3126,10 @@ def election_series(series: str) -> bool:
 # tier from 9/9 under the scan guard set (safe-join, no rate bar, global
 # ladder): 11 fills, -$14.45 marked to mid against ~$29.5 of rewards, ~+$15
 # net. The family keeps that guard set (DATACENTER_ARCHETYPE) and quotes 3
-# strikes per event (EVENT_TOP_N "*DATACENTERS:3"). No live count: Data
-# Center Map's terms forbid programmatic reads, so the count-change gate Jack
-# also asked for waits on their permission. The name must carry a real
-# state code. IMM_DATACENTER_ALLOW=0 removes the family.
+# strikes per event (EVENT_TOP_N "*DATACENTERS:3") and quotes against the
+# live count Data Center Map gave permission to read (DC_GATE_ENABLE). The
+# name must carry a real state code. IMM_DATACENTER_ALLOW=0 removes the
+# family.
 DATACENTER_ALLOW = os.environ.get("IMM_DATACENTER_ALLOW", "1") == "1"
 DATACENTER_SERIES_RE = re.compile(r"KX([A-Z]{2})DATACENTERS")
 US_STATE_CODES = frozenset(
@@ -6953,6 +6953,108 @@ def gb_gate_reason(ticker: str, now_ts: float,
 
 
 # ----------------------------------------------------------------------------
+# DATA CENTER COUNT GATE (Jack 2026-10-01: "use the live feed to quote
+# realtime. and start the logger so we can hone the fair value"; Data Center
+# Map gave permission the same day). The family (datacenter_series) settles
+# on the count Data Center Map's state page shows at 11:59:59 PM ET Dec 31.
+# The refresher thread reads each state's page every DC_REFRESH_SECS through
+# datacenter_fair.py into DC_FAIR_FILE (and logs every read; the year-end fair
+# value will be fitted from that growth history -- there is none yet, so this
+# gate has NO fair-value band). Per strike the gate STANDS ASIDE (cancel):
+#   - without a read of the state, or one older than DC_TTL_SECS (fail
+#     CLOSED -- the bot never quotes the family blind);
+#   - for DC_HOLD_SECS after the state's count changes: a new listing is when
+#     a stale quote gets picked off, and the book needs a moment to re-price;
+#   - once the count has reached the strike (YES all but decided; only a
+#     listing removal could undo it) -- also screened out in selection, so a
+#     decided strike never takes one of the event's 3 slots.
+# Otherwise the strike quotes like the rest of the family. Kill switch
+# IMM_DC_GATE_ENABLE=0 (the family then quotes blind, as Pennsylvania did in
+# the open-scan tier).
+DC_GATE_ENABLE = os.environ.get("IMM_DC_GATE_ENABLE", "1") == "1"
+DC_FAIR_FILE = os.environ.get(
+    "IMM_DC_FAIR_FILE", os.path.join(STATUS_DIR, "datacenter_fair.json"))
+DC_REFRESH_SECS = _env_int("IMM_DC_REFRESH_SECS", 180)
+DC_TTL_SECS = _env_int("IMM_DC_TTL_SECS", 900)
+DC_HOLD_SECS = _env_int("IMM_DC_HOLD_SECS", 900)
+# States read every pass, plus any state whose series has a live program.
+DC_STATES = tuple(s.strip().upper() for s in os.environ.get(
+    "IMM_DC_STATES", "AZ,CA,FL,GA,NY,OH,PA,TX,VA").split(",") if s.strip())
+_DC_STRIKE_RE = re.compile(r"-T(\d+)$")
+_dc_state: dict = {"mtime": 0.0, "entries": {}}
+
+
+def load_dc_fair() -> int:
+    """Hot-reload DC_FAIR_FILE by mtime into _dc_state. Returns the number of
+    states loaded on a reload, else -1."""
+    try:
+        mtime = os.path.getmtime(DC_FAIR_FILE)
+    except OSError:
+        return -1
+    if mtime == _dc_state["mtime"]:
+        return -1
+    _dc_state["mtime"] = mtime
+    try:
+        with open(DC_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! data center count file unreadable: {e}")
+        return -1
+    fresh: Dict[str, dict] = {}
+    for st, e in (data.get("states") or {}).items():
+        try:
+            read = parse_iso_utc(str(e["read_at"]))
+            count = int(e["count"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if read is None:
+            continue
+        chg = parse_iso_utc(str(e.get("changed_at") or ""))
+        fresh[str(st)] = {"count": count, "ts": read.timestamp(),
+                          "changed": chg.timestamp() if chg else None,
+                          "prev": e.get("prev_count")}
+    _dc_state["entries"] = fresh
+    return len(fresh)
+
+
+def dc_state_of(series: str) -> Optional[str]:
+    m = DATACENTER_SERIES_RE.fullmatch(series or "")
+    return m.group(1) if m else None
+
+
+def dc_screen_reason(ticker: str, now_ts: float) -> str:
+    """Selection-time screen: '' or why the strike may not hold a slot
+    (no fresh read of its state, or the count already reached the strike).
+    The transient count-change hold is the quote loop's alone."""
+    return dc_gate_reason(ticker, now_ts, hold=False)[0]
+
+
+def dc_gate_reason(ticker: str, now_ts: float,
+                   hold: bool = True) -> Tuple[str, dict]:
+    """('', {}) when a data center strike may quote, else (reason,
+    guard-skip inputs). Fails CLOSED on a missing or stale read."""
+    st = dc_state_of(ticker.split("-")[0])
+    m = _DC_STRIKE_RE.search(ticker)
+    if not st or not m:
+        return "dc_ticker", {"reason": "ticker"}
+    e = _dc_state["entries"].get(st)
+    if e is None:
+        return "dc_no_read", {"reason": "no_read", "state": st}
+    age = now_ts - e["ts"]
+    if age > DC_TTL_SECS:
+        return "dc_stale", {"reason": "stale", "state": st, "age_s": round(age)}
+    strike = int(m.group(1))
+    if e["count"] >= strike:
+        return "dc_decided", {"reason": "decided", "state": st,
+                              "count": e["count"], "strike": strike}
+    if hold and e["changed"] is not None and now_ts - e["changed"] < DC_HOLD_SECS:
+        return "dc_hold", {"reason": "hold", "state": st, "count": e["count"],
+                           "prev": e["prev"],
+                           "since_s": round(now_ts - e["changed"])}
+    return "", {}
+
+
+# ----------------------------------------------------------------------------
 # USGS EARTHQUAKE BID-ONLY GATE (Jack 2026-09-27: "yes build the USGS bid-only
 # gate", then "also use GFZ data"). KXBIGGESTQUAKE-<DDMMMYY>-<K> resolves YES
 # when the highest USGS-displayed magnitude of that UTC day reaches K (ten
@@ -9903,6 +10005,7 @@ class IncentiveMarketMaker:
         self._ca_fair_stood: Set[str] = set()     # Carbon Arc fair stand-asides
         self._or_fair_stood: Set[str] = set()     # OpenRouter token-usage stand-asides
         self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
+        self._dc_stood: Set[str] = set()          # data center count stand-asides
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
         self._quake_held: Set[str] = set()        # quake gate holds (frozen bids)
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
@@ -11727,6 +11830,7 @@ class IncentiveMarketMaker:
             log(f"{self.tag} vercel-fair reloaded: {_vc_n} events, "
                 f"{_vc_moved} with a new complete day")
         load_gb_fair()
+        load_dc_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
         # but LATE (absent ~hh:01, present ~hh:11): a single hour-crossed
         # refresh reliably fires before Kalshi publishes now that keep-alive
@@ -13870,6 +13974,13 @@ class IncentiveMarketMaker:
                 if gb_gate_reason(meta.ticker, now_ts, meta.mid_cents - half,
                                   meta.mid_cents + half)[0]:
                     return "gb_fair"
+        # Data center counts (2026-10-01, DC_GATE_ENABLE): a strike with no
+        # fresh read of its state, or one the count has already reached,
+        # must not take one of the event's 3 slots.
+        if DC_GATE_ENABLE and datacenter_series(meta.series):
+            dc_why = dc_screen_reason(meta.ticker, now_ts)
+            if dc_why:
+                return dc_why
         if meta.mid_cents is None or meta.spread_cents is None:
             return "one_sided"
         if meta.spread_cents > MAX_JOIN_SPREAD_CENTS:
@@ -14144,6 +14255,10 @@ class IncentiveMarketMaker:
         if not fast_only:
             self.restore_orphan_metas(positions)
 
+        # The data center counts gate a market within a cycle of a count
+        # change, not a universe refresh later (cheap mtime check).
+        if DC_GATE_ENABLE:
+            load_dc_fair()
         # Managed set = selected + (only when the wind-down is armed) any
         # market we still hold inventory in. With WINDDOWN_DROPPED off — the
         # default since 2026-09-07 — a dropped market is simply unmanaged,
@@ -14893,6 +15008,22 @@ class IncentiveMarketMaker:
             if t in self._gb_fair_stood:
                 self._gb_fair_stood.discard(t)
                 log(f"{self.tag} gb-fair resume {t}")
+
+            # DATA CENTER COUNT GATE (Jack 2026-10-01, see DC_GATE_ENABLE):
+            # stand aside without a fresh read of the state, for the hold
+            # after its count changes, and once the count reached the strike.
+            if DC_GATE_ENABLE and datacenter_series(meta.series):
+                dc_why, dc_in = dc_gate_reason(t, now_ts)
+                if dc_why:
+                    if t not in self._dc_stood:
+                        self._dc_stood.add(t)
+                        log(f"{self.tag} dc-count stand-aside {t}: {dc_why} {dc_in}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "dc_count", lambda: dc_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._dc_stood:
+                self._dc_stood.discard(t)
+                log(f"{self.tag} dc-count resume {t}")
 
             # USGS EARTHQUAKE BID-ONLY GATE (Jack 2026-09-27, see
             # QUAKE_ENABLE): stand aside (cancel) when the feed is stale, the
@@ -16314,6 +16445,57 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_gb_fair_refresh, daemon=True,
                              name="gb-fair").start()
+        if DC_GATE_ENABLE and DATACENTER_ALLOW and not once:
+            # Data Center Map refresher (2026-10-01, see DC_GATE_ENABLE): the
+            # same contract -- every network call off the trading thread,
+            # the quote loop reads only DC_FAIR_FILE. One pass reads the
+            # DC_STATES pages plus any state whose series has a live program,
+            # ~1 s apart, and logs every read (datacenter_counts_*.jsonl --
+            # the growth history the fair value will be fitted from). A
+            # failed read keeps the old entry, which ages out of DC_TTL_SECS:
+            # the gate fails closed.
+            log(f"dc-count gate: refresh {DC_REFRESH_SECS}s, stale after "
+                f"{DC_TTL_SECS}s, hold {DC_HOLD_SECS}s after a count change, "
+                f"decided once count >= strike; states {','.join(DC_STATES)} "
+                f"+ any with a program; file {DC_FAIR_FILE}")
+
+            def _dc_fair_refresh():
+                try:
+                    import datacenter_fair
+                except Exception as e:
+                    log(f"{self.tag} ! dc-count refresher disabled: {e}")
+                    return
+                last = None
+                while True:
+                    delay = max(60, DC_REFRESH_SECS)
+                    states = set(DC_STATES)
+                    try:
+                        for t in list(self.state.programmed):
+                            if datacenter_series(series_of(t)):
+                                states.add(dc_state_of(series_of(t)))
+                    except Exception:
+                        pass                  # the configured states still read
+                    try:
+                        ok, failed, changes = datacenter_fair.write_fair_file(
+                            DC_FAIR_FILE, STATUS_DIR, states)
+                        for c in changes:
+                            log(f"{self.tag} dc-count change: {c} -- the "
+                                f"state's strikes stand aside "
+                                f"{DC_HOLD_SECS // 60} min")
+                        if last != (ok, tuple(failed)):
+                            log(f"{self.tag} dc-count refresh: {ok} states read"
+                                + (f", failed {','.join(failed)}" if failed else ""))
+                        last = (ok, tuple(failed))
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! dc-count refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 120)
+                    time.sleep(delay)
+            threading.Thread(target=_dc_fair_refresh, daemon=True,
+                             name="dc-count").start()
         if QUAKE_ENABLE and not once:
             # USGS / GFZ quake refresher (2026-09-27): every network call off
             # the trading thread, into the in-memory QuakeWatch the quote loop

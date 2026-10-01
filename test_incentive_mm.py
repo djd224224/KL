@@ -92,6 +92,9 @@ def setUpModule():
     # only the refresher thread writes either, but never the live file
     imm.MORT_STATUS_FILE = os.path.join(tmp, "mortgage_fair.json")
     imm._mort_state["snap"] = None
+    # the data center count file (2026-10-01) is reloaded by every run_cycle
+    imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
+    imm._dc_state.update(mtime=0.0, entries={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -1989,6 +1992,82 @@ class TestDatacenterFamily(unittest.TestCase):
     def test_three_markets_per_event(self):
         for st in self.STATES:
             self.assertEqual(imm.event_top_n_for(f"KX{st}DATACENTERS"), 3)
+
+
+class TestDatacenterCountGate(unittest.TestCase):
+    """Jack 2026-10-01: "use the live feed to quote realtime" (Data Center Map
+    gave permission). A strike stands aside without a fresh read of its
+    state, for DC_HOLD_SECS after the state's count changes, and once the
+    count has reached the strike (screened out of selection too)."""
+    T = "KXTXDATACENTERS-99DEC31-T580"
+
+    @staticmethod
+    def _iso(ago: float) -> str:
+        return datetime.fromtimestamp(time.time() - ago, timezone.utc).isoformat()
+
+    def _write(self, **tx):
+        e = {"count": 537, "read_at": self._iso(0), "changed_at": None,
+             "prev_count": None}
+        e.update(tx)
+        with open(imm.DC_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"states": {"TX": e}}, f)
+        imm._dc_state.update(mtime=0.0, entries={})
+        imm.load_dc_fair()
+
+    def tearDown(self):
+        try:
+            os.remove(imm.DC_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        imm._dc_state.update(mtime=0.0, entries={})
+
+    def test_reasons(self):
+        self.assertEqual(imm.dc_state_of("KXTXDATACENTERS"), "TX")
+        self.assertEqual(imm.dc_gate_reason(self.T, time.time())[0], "dc_no_read")
+        self._write()
+        self.assertEqual(imm.dc_gate_reason(self.T, time.time()), ("", {}))
+        self._write(read_at=self._iso(imm.DC_TTL_SECS + 60))
+        self.assertEqual(imm.dc_gate_reason(self.T, time.time())[0], "dc_stale")
+        self._write(count=538, changed_at=self._iso(60), prev_count=537)
+        why, inputs = imm.dc_gate_reason(self.T, time.time())
+        self.assertEqual((why, inputs["prev"], inputs["count"]), ("dc_hold", 537, 538))
+        self.assertEqual(imm.dc_screen_reason(self.T, time.time()), "")   # the quote loop's alone
+        self._write(count=538, changed_at=self._iso(imm.DC_HOLD_SECS + 60), prev_count=537)
+        self.assertEqual(imm.dc_gate_reason(self.T, time.time()), ("", {}))
+        self._write(count=580)
+        self.assertEqual(imm.dc_gate_reason(self.T, time.time())[0], "dc_decided")
+        self.assertEqual(imm.dc_screen_reason(self.T, time.time()), "dc_decided")
+        self.assertEqual(imm.dc_gate_reason("KXTXDATACENTERS-99DEC31-B580",
+                                            time.time())[0], "dc_ticker")
+
+    def test_cycle_follows_the_feed(self):
+        # atref, as live: the family's safe-join is capped at the reference
+        # there, while the offsets ladder would rest it 2 ticks behind this
+        # fixture's tight 49/51 book and estimate nothing
+        p = mock.patch.object(imm, "LADDER_MODE", "atref")
+        p.start()
+        self.addCleanup(p.stop)
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        c = bot.client
+        c.programs.append(dict(c.programs[0], market_ticker=self.T))
+        c.markets[self.T] = dict(c.markets["KXGOOD-99DEC31-A"], ticker=self.T,
+                                 event_ticker="KXTXDATACENTERS-99DEC31")
+        c.books[self.T] = c.books["KXGOOD-99DEC31-A"]
+
+        def sides():
+            return {o["book_side"] for o in bot.state.sim_orders.values()
+                    if o["ticker"] == self.T}
+        self._write()                                   # 537 read now, strike 580
+        bot.run_cycle()
+        self.assertTrue(sides())
+        self._write(count=538, changed_at=self._iso(30), prev_count=537)
+        bot.run_cycle()
+        self.assertEqual(sides(), set())                # held after the change
+        self._write(count=538, changed_at=self._iso(imm.DC_HOLD_SECS + 30),
+                    prev_count=537)
+        bot.run_cycle()
+        self.assertTrue(sides())                        # quoting again
 
 
 class TestRampAIIndexAllowlist(unittest.TestCase):
@@ -15840,8 +15919,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # token-usage gate (2026-09-27) + the GasBuddy state-gas gate
         # (2026-09-27) + the quake gate's stand-aside and hold (2026-09-27)
         # + the Vercel pre-D gate (2026-09-27) + the mortgage gate
-        # (2026-09-28)
-        self.assertEqual(len(conts), 30)
+        # (2026-09-28) + the data center count gate (2026-10-01)
+        self.assertEqual(len(conts), 31)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

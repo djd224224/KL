@@ -5375,14 +5375,29 @@ the launcher env): all nine events allowed; eight enter once the 10-minute
 admission clock holds (est ~$54/day for the eight at 3 strikes, a MODEL);
 deep strikes screened extreme_mid; NY zero est (empty books).
 
-NOT BUILT -- the live count feed and its logger. Data Center Map's terms
-(terms.html): "You must not scrape, data mine, crawl, cache, or
-programmatically retrieve or index content from the Site. Only direct, human
-access via standard web browsers is permitted unless otherwise authorized by
-a licensing agreement." robots.txt does not block /usa/, but the terms do.
-Same position as GasBuddy before Jack got its permission. With permission or
-a license, the plan is a refresher thread that reads the nine state pages
-every few minutes, logs every read (the growth history the fair value needs;
-the Wayback CDX was down on 10/1), and gates the family: fail closed on a
-stale read, stand aside for a hold window after any count change, stand
-aside on strikes the count has already reached.
+LIVE COUNT GATE + LOGGER (Data Center Map gave permission 10/1 -- their
+terms.html otherwise forbids programmatic reads: "only direct, human access
+via standard web browsers is permitted unless otherwise authorized by a
+licensing agreement"; keep the pace polite):
+- datacenter_fair.py reads each state page (one pass ~1 s apart, browser UA
+  + "KL-datacenter-fair/1.0"). The count is the page's "We currently have N
+  data centers listed" line (the page title carries the same N; the
+  per-market breakdown does NOT always sum to it -- Texas 533 vs 537 on 10/1).
+  Writes run-logs/incentive-mm/datacenter_fair.json (count, read_at,
+  changed_at, prev_count per state) and datacenter_counts_YYYY-MM-DD.jsonl:
+  a "read" row per state per pass, plus a "detail" row (per-market counts +
+  the page's MW stats: live / planned / pipeline / built-out) on the first
+  read of a UTC day and whenever the count or breakdown changes. That log is
+  the growth history the year-end fair value will be fitted from.
+- Refresher thread "dc-count" every IMM_DC_REFRESH_SECS (180), states
+  IMM_DC_STATES (the nine) + any state with a live program.
+- Gate (dc_gate_reason, guard "dc_count"): stand aside with no read or one
+  older than IMM_DC_TTL_SECS (900, fail closed); for IMM_DC_HOLD_SECS (900)
+  after the state's count changes; and once count >= strike ("dc_decided",
+  also a _screen reason so it never takes one of the event's 3 slots, as are
+  dc_no_read / dc_stale). NO fair-value band yet: with no growth history any
+  fair would be a guess, and the 10/1 gas review found a guessed fair worse
+  than the market's own price. Kill switch IMM_DC_GATE_ENABLE=0 (the family
+  then quotes blind, as Pennsylvania did in the open-scan tier).
+- WATCH: startup line "dc-count gate: ...", "dc-count refresh: 9 states
+  read", "dc-count change: TX 537 -> 538 ..." lines, stand-aside/resume lines.
