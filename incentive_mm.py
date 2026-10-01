@@ -1927,6 +1927,10 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "=KXDIESELMONAK:0,"
                                                 "KXTRUEV:3,*CC:3,"
                                                 "*ADS:3,*POS:3,"
+                                                # data center counts
+                                                # (2026-10-01, "max 3
+                                                # markets per event")
+                                                "*DATACENTERS:3,"
                                                 # exact: KXART is a prefix
                                                 # of 20 unrelated series
                                                 "=KXART:3,"
@@ -3111,6 +3115,33 @@ def election_series(series: str) -> bool:
     return ELECTION_ALLOW and (
         series in ELECTION_SERIES
         or any(p.fullmatch(series) for p in ELECTION_SERIES_PATTERNS))
+
+
+# DATA CENTER COUNTS (Jack 2026-10-01: "allowlist the datacenter family ...
+# max 3 markets per event"). KX<state>DATACENTERS -- "will <state> have at
+# least N data centers this year?", settled on the count Data Center Map's
+# directory page shows for the state at 11:59:59 PM ET Dec 31; nine states
+# listed 2026-09-30 (AZ CA FL GA NY OH PA TX VA), $100 per strike per 4-day
+# period (Pennsylvania $500 per 2 weeks). Pennsylvania ran in the open-scan
+# tier from 9/9 under the scan guard set (safe-join, no rate bar, global
+# ladder): 11 fills, -$14.45 marked to mid against ~$29.5 of rewards, ~+$15
+# net. The family keeps that guard set (DATACENTER_ARCHETYPE) and quotes 3
+# strikes per event (EVENT_TOP_N "*DATACENTERS:3"). No live count: Data
+# Center Map's terms forbid programmatic reads, so the count-change gate Jack
+# also asked for waits on their permission. The name must carry a real
+# state code. IMM_DATACENTER_ALLOW=0 removes the family.
+DATACENTER_ALLOW = os.environ.get("IMM_DATACENTER_ALLOW", "1") == "1"
+DATACENTER_SERIES_RE = re.compile(r"KX([A-Z]{2})DATACENTERS")
+US_STATE_CODES = frozenset(
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS "
+    "MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV "
+    "WI WY DC".split())
+
+
+def datacenter_series(series: str) -> bool:
+    """The data center count family (see DATACENTER_ALLOW)."""
+    m = DATACENTER_SERIES_RE.fullmatch(series)
+    return DATACENTER_ALLOW and bool(m) and m.group(1) in US_STATE_CODES
 _DEFAULT_CRYPTO_SERIES = (
     # The yearly touch pairs (KX*MINY/KX*MAXY, allowlisted 2026-07-22 when no
     # fleet bot quoted them) moved to SERIES_BLOCKLIST_PREFIXES on 2026-08-13:
@@ -4949,6 +4980,14 @@ SERIES_OVERRIDES[ELECTION_ARCHETYPE] = SeriesOverride(
     price_min_cents=_env_int("IMM_ELECTION_PRICE_MIN", 1),
     price_max_cents=_env_int("IMM_ELECTION_PRICE_MAX", 99))
 
+# DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
+# Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
+# global ladder and caps. Every member clones it (FAMILY_OVERRIDE_PARENTS).
+DATACENTER_ARCHETYPE = "KXTXDATACENTERS"
+SERIES_OVERRIDES[DATACENTER_ARCHETYPE] = SeriesOverride(
+    safe_join=True,
+    min_est_per_day=0.0)
+
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
 # The default midnight-ET ticker rule cost the whole overnight half of each
@@ -5132,6 +5171,8 @@ FAMILY_OVERRIDE_PARENTS = (
     # elections (2026-09-28): a name pattern OR the exact general-election
     # list, so the family is a predicate rather than one regex
     ("predicate", election_series, ELECTION_ARCHETYPE),
+    # data center counts (2026-10-01): KX<state code>DATACENTERS
+    ("predicate", datacenter_series, DATACENTER_ARCHETYPE),
 )
 _family_override_warned: Set[str] = set()
 
@@ -11519,6 +11560,7 @@ class IncentiveMarketMaker:
             family_series_allowed(series) or \
             series_pattern_allowed(series) or \
             election_series(series) or \
+            datacenter_series(series) or \
             rainstorm_span_allowed(ticker) or \
             cpi_pilot_active(ticker) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)

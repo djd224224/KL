@@ -1953,6 +1953,44 @@ class TestTrumpApproveAllowlist(unittest.TestCase):
         self.assertEqual(ov.event_day_cutoff_et, (7, 0))
 
 
+class TestDatacenterFamily(unittest.TestCase):
+    """Jack 2026-10-01: "allowlist the datacenter family ... max 3 markets per
+    event". KX<state>DATACENTERS settle on Data Center Map's count for the
+    state at year end; the family keeps the scan guard set Pennsylvania
+    quoted under."""
+    STATES = ("AZ", "CA", "FL", "GA", "NY", "OH", "PA", "TX", "VA")
+
+    def test_membership(self):
+        for st in self.STATES:
+            self.assertTrue(imm.datacenter_series(f"KX{st}DATACENTERS"), st)
+        for s in ("KXUSDATACENTERS", "KXDATACENTERS", "KXTXDATACENTERSX",
+                  "KXTXDATACENTER", "KXXXDATACENTERS"):
+            self.assertFalse(imm.datacenter_series(s), s)
+        with mock.patch.object(imm, "DATACENTER_ALLOW", False):
+            self.assertFalse(imm.datacenter_series("KXTXDATACENTERS"))
+
+    def test_allowed_in_the_normal_book(self):
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(IncentiveMarketMaker._allowed("KXTXDATACENTERS-26DEC31-T580"))
+            self.assertTrue(IncentiveMarketMaker._allowed("KXPADATACENTERS-26DEC31-T200"))
+            self.assertFalse(IncentiveMarketMaker._allowed("KXUSDATACENTERS-26DEC31-T5000"))
+            with mock.patch.object(imm, "DATACENTER_ALLOW", False):
+                self.assertFalse(IncentiveMarketMaker._allowed("KXTXDATACENTERS-26DEC31-T580"))
+
+    def test_members_clone_the_scan_guard_set(self):
+        with mock.patch.dict(imm.SERIES_OVERRIDES):
+            imm.ensure_family_override("KXVADATACENTERS")
+            ov = imm.SERIES_OVERRIDES["KXVADATACENTERS"]
+            self.assertTrue(ov.safe_join)
+            self.assertEqual(ov.min_est_per_day, 0.0)
+            self.assertIsNone(ov.levels)              # global ladder
+            self.assertIsNone(ov.max_position)        # global net cap
+
+    def test_three_markets_per_event(self):
+        for st in self.STATES:
+            self.assertEqual(imm.event_top_n_for(f"KX{st}DATACENTERS"), 3)
+
+
 class TestRampAIIndexAllowlist(unittest.TestCase):
     """Jack 2026-09-12: "allowlist the Ramp AI Index events into the IMM
     bot. set a release guard at midnight ET on the 6th day of the following

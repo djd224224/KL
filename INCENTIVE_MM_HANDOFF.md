@@ -5344,3 +5344,45 @@ Tests: 9 existing gas tests moved to the new defaults (state blocking reads
 GB_STATE_QUOTE; TestGasBuddyFairGate runs under IMM_GB_STATE_QUOTE=1; the
 print-blackout test pins 00:00-13:00 for the two trial dailies);
 test_imm_gas_trial_report (7).
+
+## 2026-10-01 — Data center count family allowlisted, 3 strikes per event (Jack)
+
+Jack: "allowlist the datacenter family, use the live feed to quote realtime.
+and start the logger so we can hone the fair value. max 3 markets per event."
+
+WHAT THEY ARE. KX<state>DATACENTERS: "will <state> have at least N data
+centers this year?", settled on the whole-number count Data Center Map's
+directory page shows for the state at 11:59:59 PM ET 2026-12-31. Nine states
+listed 9/30 (AZ CA FL GA NY OH PA TX VA), six strikes each just above the
+10/1 counts (TX 537 vs 540-650, VA 674 vs 680-800, PA 174 vs 180-205, ...);
+$100 per strike per 4-day period, Pennsylvania $500 per 2 weeks.
+
+WHY. Pennsylvania has quoted in the open-scan tier since 9/9 under the scan
+guard set (safe-join, no rate bar, global ladder): 11 fills, -$14.45 marked to
+mid (Kalshi replay of the bot's order ids == dashboard, to the cent) against
+$11.02 credited for 9/9-9/20 (model $10.83) + ~$18.51 modeled since: ~+$15 net,
+the rewards about twice the pick-off losses.
+
+CHANGE (defaults; no launcher edit):
+- datacenter_series(): KX + a real US state code + DATACENTERS, admitted by
+  _allowed. IMM_DATACENTER_ALLOW=0 removes the family.
+- DATACENTER_ARCHETYPE KXTXDATACENTERS = the scan guard set PA ran under
+  (safe_join, min_est_per_day 0, global ladder and caps); every member clones
+  it through FAMILY_OVERRIDE_PARENTS ("predicate").
+- EVENT_TOP_N gains "*DATACENTERS:3".
+Dry check 10/1 02:50Z (imm_quote_gaps.classify_and_estimate on this code with
+the launcher env): all nine events allowed; eight enter once the 10-minute
+admission clock holds (est ~$54/day for the eight at 3 strikes, a MODEL);
+deep strikes screened extreme_mid; NY zero est (empty books).
+
+NOT BUILT -- the live count feed and its logger. Data Center Map's terms
+(terms.html): "You must not scrape, data mine, crawl, cache, or
+programmatically retrieve or index content from the Site. Only direct, human
+access via standard web browsers is permitted unless otherwise authorized by
+a licensing agreement." robots.txt does not block /usa/, but the terms do.
+Same position as GasBuddy before Jack got its permission. With permission or
+a license, the plan is a refresher thread that reads the nine state pages
+every few minutes, logs every read (the growth history the fair value needs;
+the Wayback CDX was down on 10/1), and gates the family: fail closed on a
+stale read, stand aside for a hold window after any count change, stand
+aside on strikes the count has already reached.
