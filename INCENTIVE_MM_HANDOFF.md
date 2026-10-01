@@ -5778,3 +5778,79 @@ Kill switches: IMM_PLACE_RATE_PER_SEC=0, IMM_ORDER_REFRESH_JITTER_SECS=0,
 TestRefreshJitter, TestRestartRequest, ProbeRestartWindow (the suite header
 turns pacing/jitter off for the older tests; the full suite also passes with
 both on).
+
+## 2026-10-01 — Monthly rain (KXRAINCHIM, KXRAINAUSM) back, quoted only through a monthly fair gate (Jack)
+
+Jack: "quote these monthly rain markets, with an algorithm like how you
+quote the dailies KXRAINCHIM-26OCT, KXRAINAUSM-26OCT".
+
+WHY THEY WERE DARK. Every KXRAIN<CITY>M has sat in the launcher's
+IMM_BLOCKLIST since the 7/26 rain removal (frozen: no orders, positions
+ride); the daily KXRAIN came back behind the NWS fair gate, the monthlies
+never did. October programs: 14 monthly cities x 7 strikes at $55 per
+strike for 10/01 19:05Z -> 10/04 03:59Z (~$23/day/strike); this entry takes
+the two Jack named.
+
+THE DAILIES' ALGORITHM, AND THE MONTHLY VERSION. The daily gate: a fair
+from the NWS forecast decides WHETHER the bot joins the touch, never WHERE
+(stand aside when the touch fights it by more than 10c on the adverse
+side), and the bot never quotes the day the rain is measured (the
+midnight / 10 pm rule). A monthly is measured on every day of its month,
+so (rain_monthly_fair.py, new, on rain_monthly.py's model):
+- FAIR = P(month-to-date + rest of month > K): MTD from the CLI + IEM daily
+  obs + today's running total (rain_monthly.effective_mtd); the rest by
+  Monte Carlo over 28-46 years of the station's ACIS history with the NWS
+  gridpoint QPF/PoP injected over its horizon (simulate_remaining; Brier
+  skill 62% on 43,080 walk-forward predictions, climatology backbone; the
+  forecast layer is not backtestable).
+- STATION from each event's own rules ("at CLIORD"): October's KXRAINCHIM
+  settles at O'HARE (CLIORD), not the Midway rain_monthly.py was verified
+  on in July. CLI_STATIONS = rain_monthly's stations + ORD; an unknown code
+  = no fair (stood aside).
+- RAIN-DAY RULE: the event stands aside while the station's latest
+  observation (IEM currents, younger than 90 min) shows precipitation in
+  the last hour or a precipitation weather code (RA/DZ/SN/TS/SH..., VC
+  included), and for IMM_RAIN_MONTHLY_DRY_MIN (60) after the last wet one;
+  and it stops for good at 22:00 ET the day before the month's last day
+  (cutoff_from_close_min 1560 -- the dailies' "10 pm the day before").
+- Also out: strikes within 0.05" of the MTD (obs-vs-CLI rounding), every
+  strike when the last CLI is older than 40h, and any market without a
+  fair younger than IMM_RAIN_MONTHLY_TTL_MIN (30). FAIL CLOSED (the daily
+  gate fails open -- but the dailies are never quoted while rain falls).
+- Joins the touch unchanged otherwise: the rain family's 5-90c band and
+  global ladder; as KXRAIN-prefix "daily" series they skip the quiet-hours
+  x2 and the Saturday step-up and take the 7 pm-01:59 ET halving. No
+  per-event cap. No directional takes (rain_monthly.py's own taker stays
+  dry).
+Refresher thread "rain-monthly" every IMM_RAIN_MONTHLY_REFRESH_SECS (600),
+signed Kalshi reads for the events (hourly); ACIS history cached 7 days and
+the NWS grid hourly inside rain_monthly (first run ~17s, cached after).
+Logs "rain-monthly stand-aside <t>: <why>" / "rain-monthly resume <t>",
+guard "rain_monthly" (the sweep test counts 33 continues).
+
+LAUNCHER. KXRAINAUSM and KXRAINCHIM leave IMM_BLOCKLIST (the other seven
+monthly cities stay frozen); env => `restart_imm.ps1 -Task`, not just the
+code sync. test_launcher_unfreezes_exactly_the_two pins code + launcher
+together.
+
+DRY RUN 10/01 22:00Z: both stations RAINING (O'Hare 0.53" today, 0.13" in
+the last hour; Austin 1.10", 0.20", a thunderstorm) -> both events would
+stand aside. Fair vs book, every strike inside the 10c tolerance: CHI MTD
+0.53" -> 3" 65c vs 56x62, 4" 40c vs 32x33, 5" 25c vs 10x17; AUS MTD 1.10"
+-> 4" 79c vs 72x80, 5" 65c vs 50x70, 7" 43c vs 31x46.
+
+KILL SWITCHES: IMM_RAIN_MONTHLY_ENABLE=0 or IMM_ALLOW_RAIN_MONTHLY_SERIES=""
+(the series leave the allowlist; positions ride).
+
+WATCH: the forecast layer is uncalibrated (no archived forecasts); the
+station's hourly METAR is the rain detector, so a storm that starts between
+observations is seen up to an hour late -- the dry window and the touch
+tolerance are the cover. Adding a city = its CLI code in CLI_STATIONS + the
+series in IMM_RAIN_MONTHLY_SERIES + out of the launcher blocklist.
+
+Tests: TestRainMonthlyGate (allowlist / band / cutoff, the launcher pin,
+every reason incl. wet / drying / no_obs / boundary / stale CLI / band,
+quote-then-rain end to end, kill switch in a subprocess) and
+test_rain_monthly_fair.py (9: station from rules, table, signed events,
+wet/dry/stale/down observations, rung pricing + boundary, unknown station,
+writer memory of the last wet observation, failing fair, event cache).

@@ -113,6 +113,9 @@ def setUpModule():
     # TestNoLivePathUnderTest)
     imm.SHARE_FAIR_FILE = os.path.join(tmp, "openrouter_share_fair.json")
     imm._share_fair_state.update(mtime=0.0, entries={}, moved_at={})
+    # the monthly rain fair file (2026-10-01), same reason
+    imm.RAIN_MONTHLY_FILE = os.path.join(tmp, "rain_monthly_fair.json")
+    imm._rain_monthly_state.update(mtime=0.0, markets={}, events={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -9292,6 +9295,184 @@ class TestNoLivePathUnderTest(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+class TestRainMonthlyGate(unittest.TestCase):
+    """rain_monthly_fair.json -> load_rain_monthly/rain_monthly_gate_reason
+    -> the stand-aside on KXRAINCHIM / KXRAINAUSM (Jack 2026-10-01: "quote
+    these monthly rain markets, with an algorithm like how you quote the
+    dailies"). The daily rain gate's at-touch shape, but fail CLOSED and out
+    while it rains at the station. Fixture event KXRAINCHIM-68DEC (far from
+    any cutoff), strike 3 inches."""
+
+    T = "KXRAINCHIM-68DEC-3"
+    EV = "KXRAINCHIM-68DEC"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._rain_monthly_state.update(mtime=0.0, markets={}, events={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.RAIN_MONTHLY_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, p=0.5, wet=False, last_wet_mins=None, stale_cli=False,
+               boundary=False, age_secs=0.0):
+        now = datetime.now(timezone.utc)
+        fetched = (now - timedelta(seconds=age_secs)).isoformat()
+        lw = ((now - timedelta(minutes=last_wet_mins)).isoformat()
+              if last_wet_mins is not None else None)
+        with open(imm.RAIN_MONTHLY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"event": self.EV, "p": p,
+                                            "boundary": boundary,
+                                            "fetched_at": fetched}},
+                       "event_state": {self.EV: {
+                           "wet": wet, "last_wet_at": lw, "stale_cli": stale_cli,
+                           "mtd": 2.2, "obs_time": fetched}}}, f)
+        os.utime(imm.RAIN_MONTHLY_FILE, (time.time(), time.time() + self._bump))
+        TestRainMonthlyGate._bump += 1
+        return imm.load_rain_monthly()
+
+    def _bot(self):
+        client = FakeClient()
+        now = datetime.now(timezone.utc)
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV,
+            "status": "active", "close_time": far,
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_two_series_allowlisted_with_the_day_before_cutoff(self):
+        for s in ("KXRAINCHIM", "KXRAINAUSM"):
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.rain_monthly_series(s), s)
+            ov = imm.SERIES_OVERRIDES[s]
+            self.assertEqual(ov.cutoff_from_close_min, 1560, s)
+            self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90), s)
+            self.assertEqual(imm.event_top_n_for(s), 0, s)
+        # the other monthly cities stay out (the launcher still blocklists
+        # them, and the code does not allow them)
+        for s in ("KXRAINDALM", "KXRAINNYCM", "KXRAINMIAM"):
+            self.assertNotIn(s, imm.ALLOW_SERIES, s)
+            self.assertFalse(imm.rain_monthly_series(s), s)
+        # close 23:59:59 ET on Oct 31 -> out at 22:00 ET on Oct 30 (the
+        # dailies' "10pm the day before the rain day"); EST in November
+        U = timezone.utc
+        for ev, close, want in (
+                ("KXRAINCHIM-26OCT", datetime(2026, 11, 1, 3, 59, 59, tzinfo=U),
+                 datetime(2026, 10, 31, 1, 59, 59, tzinfo=U)),
+                ("KXRAINAUSM-26NOV", datetime(2026, 12, 1, 4, 59, 59, tzinfo=U),
+                 datetime(2026, 11, 30, 2, 59, 59, tzinfo=U))):
+            occ = close + timedelta(days=1)
+            cut = imm.trade_cutoff_utc(ev, occ, occ)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                ev.split("-")[0], ev, cut, close), want, ev)
+        self.assertIn("RAIN_MONTHLY_ENABLE", imm._CONFIG_CODE_KNOBS)
+
+    def test_reason_fail_closed_wet_drying_stale_cli_boundary_band(self):
+        now_ts = time.time()
+        self.assertEqual(imm.rain_monthly_gate_reason(self.T, now_ts, 49, 51)[1]["reason"],
+                         "no_read")
+        self.assertEqual(self._write(), 1)
+        self.assertEqual(imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51), ("", {}))
+        self.assertEqual(imm.rain_monthly_gate_reason(
+            self.T, time.time() + imm.RAIN_MONTHLY_TTL_MIN * 60 + 5, 49, 51)[1]["reason"],
+            "stale")
+        self._write(wet=None)
+        self.assertEqual(imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51)[1]["reason"],
+                         "no_obs")
+        self._write(wet=True, last_wet_mins=0)
+        why, inp = imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51)
+        self.assertEqual(inp["reason"], "raining")
+        self._write(wet=False, last_wet_mins=20)                 # stopped 20m ago
+        self.assertEqual(imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51)[1]["reason"],
+                         "drying")
+        self._write(wet=False, last_wet_mins=imm.RAIN_MONTHLY_DRY_MIN + 5)
+        self.assertEqual(imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51), ("", {}))
+        self._write(stale_cli=True)
+        self.assertEqual(imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51)[1]["reason"],
+                         "stale_cli")
+        self._write(boundary=True)
+        self.assertEqual(imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51)[1]["reason"],
+                         "boundary")
+        self._write(p=0.30)                                       # bid 49 > 30 + 10
+        why, inp = imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], inp["bid_bad"], inp["ask_bad"]), ("band", True, False))
+        self._write(p=0.70)                                       # ask 51 < 70 - 10
+        why, inp = imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], inp["bid_bad"], inp["ask_bad"]), ("band", False, True))
+        self._write(p=0.59)                                       # inside the tolerance
+        self.assertEqual(imm.rain_monthly_gate_reason(self.T, time.time(), 49, 51), ("", {}))
+
+    def test_quotes_dry_and_stands_aside_while_it_rains(self):
+        bot = self._bot()
+        bot.run_cycle()                                           # no file: closed
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self._write()
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertIn(("ask", 51), q)
+        self._write(wet=True, last_wet_mins=0)                    # rain starts
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self.assertIn(self.T, bot.state.selected)                 # sticky
+
+    def test_launcher_unfreezes_exactly_the_two(self):
+        # the launcher's IMM_BLOCKLIST froze every monthly city since 7/26;
+        # code and launcher must agree, or the allowed pair stays frozen
+        import re
+        with open(os.path.join(os.path.dirname(os.path.abspath(imm.__file__)),
+                               "run_incentive_mm.ps1"), encoding="utf-8") as f:
+            text = f.read()
+        chunks = re.findall(r'\$ProbeEnv\s*=\s*"(set .*?)"', text, re.S)
+        env = dict(re.findall(r"set ([A-Za-z_][A-Za-z0-9_]*)=([^&]*)&&", chunks[-1]))
+        blocked = set(env["IMM_BLOCKLIST"].split(","))
+        self.assertTrue(blocked.isdisjoint(imm.RAIN_MONTHLY_SERIES), blocked)
+        for s in ("KXRAINDALM", "KXRAINDENM", "KXRAINHOUM", "KXRAINMIAM",
+                  "KXRAINNYCM", "KXRAINSEAM", "KXRAINSTPM"):
+            self.assertIn(s, blocked, s)
+
+    def test_gate_off_takes_the_family_out(self):
+        import subprocess
+        import sys
+        code = ("import incentive_mm as imm\n"
+                "print(sorted(s for s in imm.ALLOW_SERIES if s.startswith('KXRAIN')))\n"
+                "print(imm.RAIN_MONTHLY_ENABLE)\n")
+        env = dict(os.environ, IMM_RAIN_MONTHLY_ENABLE="0")
+        r = subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(
+            os.path.abspath(imm.__file__)), env=env, capture_output=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-800:])
+        out = r.stdout.decode("utf-8").strip().splitlines()
+        self.assertNotIn("KXRAINCHIM", out[-2])
+        self.assertNotIn("KXRAINAUSM", out[-2])
+        self.assertEqual(out[-1], "False")
+
+
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
@@ -16260,13 +16441,14 @@ class TestGuardSkipSink(unittest.TestCase):
                         if src[j].strip())
             if not prev.startswith("self._gskip("):
                 bare.append(prev)
-        # 32 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
+        # 33 = 23 + the Carbon Arc fair gate (2026-09-26) + the OpenRouter
         # token-usage gate (2026-09-27) + the GasBuddy state-gas gate
         # (2026-09-27) + the quake gate's stand-aside and hold (2026-09-27)
         # + the Vercel pre-D gate (2026-09-27) + the mortgage gate
         # (2026-09-28) + the data center count gate (2026-10-01) + the
-        # OpenRouter market-share gate (2026-09-30)
-        self.assertEqual(len(conts), 32)
+        # OpenRouter market-share gate (2026-09-30) + the monthly rain gate
+        # (2026-10-01)
+        self.assertEqual(len(conts), 33)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -17502,16 +17684,17 @@ class TestSignedFairReads(unittest.TestCase):
             self.assertIsNone(imm.fair_reader())
 
     def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
-        """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share
-        and GasBuddy refreshers each build a reader with fair_reader() and
-        pass it to their module's write_fair_file (the threads live inside
-        run(), so read its source)."""
+        """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
+        monthly rain and GasBuddy refreshers each build a reader with
+        fair_reader() and pass it to their module's write_fair_file (the
+        threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 4)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 5)
         for mod, path in (("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
                           ("openrouter_share_fair", "SHARE_FAIR_FILE"),
+                          ("rain_monthly_fair", "RAIN_MONTHLY_FILE"),
                           ("gasbuddy_fair", "GB_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]

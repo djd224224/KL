@@ -3623,6 +3623,16 @@ _DEFAULT_MORT_SERIES = "KXFM30YMTG,KXMORTGAGERATE"
 # them out. The ten names (_DEFAULT_OR_SHARE_SERIES) are defined with their
 # 3-per-event cap, above EVENT_TOP_N.
 _SHARE_LIVE = os.environ.get("IMM_SHARE_FAIR_ENABLE", "1") == "1"
+# MONTHLY RAIN (Jack 2026-10-01: "quote these monthly rain markets, with an
+# algorithm like how you quote the dailies KXRAINCHIM-26OCT,
+# KXRAINAUSM-26OCT"). KXRAIN<CITY>M settle on the station's CLI month total
+# and have been frozen in the launcher's IMM_BLOCKLIST since the 7/26 rain
+# removal; these two come back only with the RAIN_MONTHLY_* gate (fail
+# closed, out while it rains at the station). IMM_RAIN_MONTHLY_ENABLE=0 or
+# IMM_ALLOW_RAIN_MONTHLY_SERIES="" takes them out; the launcher blocklist
+# still has the other seven monthly cities.
+_RAIN_MONTHLY_LIVE = os.environ.get("IMM_RAIN_MONTHLY_ENABLE", "1") == "1"
+_DEFAULT_RAIN_MONTHLY_SERIES = "KXRAINCHIM,KXRAINAUSM"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -3851,6 +3861,10 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_OR_SHARE_SERIES",
                                         _DEFAULT_OR_SHARE_SERIES)
                          if _SHARE_LIVE else "")
+                # monthly rain (2026-10-01): only while its gate is on
+                + "," + (os.environ.get("IMM_ALLOW_RAIN_MONTHLY_SERIES",
+                                        _DEFAULT_RAIN_MONTHLY_SERIES)
+                         if _RAIN_MONTHLY_LIVE else "")
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -6102,6 +6116,9 @@ _CONFIG_CODE_KNOBS = (
     "SHARE_FAIR_ENABLE", "SHARE_FAIR_TOL_CENTS", "SHARE_FAIR_TTL_MIN",
     "SHARE_FAIR_SIGMA_LO_FRAC", "SHARE_FAIR_REFRESH_HOLD_MIN",
     "SHARE_CUTOFF_FROM_CLOSE_MIN", "SHARE_EVENT_TOP_N",
+    # monthly rain gate (2026-10-01); model knobs ride in its file's "model"
+    "RAIN_MONTHLY_ENABLE", "RAIN_MONTHLY_TOL_CENTS", "RAIN_MONTHLY_TTL_MIN",
+    "RAIN_MONTHLY_DRY_MIN", "RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN",
     # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
     "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
@@ -7165,6 +7182,139 @@ def share_gate_reason(ticker: str, now_ts: float,
                  "tol": SHARE_FAIR_TOL_CENTS, "bid_bad": bid_bad,
                  "ask_bad": ask_bad, "mu": e["mu"], "sigma": e["sigma"],
                  "p_ident": e["p_ident"]})
+    return "", {}
+
+
+# ----------------------------------------------------------------------------
+# MONTHLY RAIN FAIR GATE (Jack 2026-10-01: "quote these monthly rain markets,
+# with an algorithm like how you quote the dailies KXRAINCHIM-26OCT,
+# KXRAINAUSM-26OCT"). The daily rain gate's shape -- a fair decides WHETHER
+# the bot joins the touch, never WHERE (TOL on the adverse side, the
+# dailies' 10c) -- on rain_monthly.py's calibrated model:
+# rain_monthly_fair.py writes RAIN_MONTHLY_FILE with P(month-to-date + rest
+# of month > K) per strike (MTD from the CLI + IEM obs + today's running
+# total; the rest by Monte Carlo over the station's history with the NWS
+# forecast injected), the station read from each event's own rules
+# (October's KXRAINCHIM is O'Hare, CLIORD, not the Midway the model was
+# verified on), and the station's latest observation. The dailies never
+# quote their rain day; a monthly is measured every day of its month, so
+# the event stands aside while it rains at the station and for
+# RAIN_MONTHLY_DRY_MIN after the last wet observation, and stops for good
+# at 22:00 ET the day before the month's last day (cutoff = close -
+# RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN). Unlike the daily gate it fails
+# CLOSED: a market stands aside on BOTH sides while
+#   - it has no fresh read (missing file, older than RAIN_MONTHLY_TTL_MIN),
+#   - the station has no observation younger than the writer's
+#     OBS_MAX_AGE_MIN, or the latest one is wet, or the last wet one is
+#     younger than RAIN_MONTHLY_DRY_MIN,
+#   - the event's last CLI is stale (rain_monthly.STALE_CLI_HOURS),
+#   - its strike sits within the writer's BOUNDARY_IN of the month-to-date,
+#   - its touch fights the fair on the adverse side by more than
+#     RAIN_MONTHLY_TOL_CENTS.
+# Size and band stay the rain family's (5-90c, global ladder, the KXRAIN
+# evening halving); no per-event cap. Kill switch IMM_RAIN_MONTHLY_ENABLE=0.
+RAIN_MONTHLY_ENABLE = _RAIN_MONTHLY_LIVE
+RAIN_MONTHLY_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_RAIN_MONTHLY_SERIES", _DEFAULT_RAIN_MONTHLY_SERIES).split(",") if s.strip())
+RAIN_MONTHLY_TOL_CENTS = _env_int("IMM_RAIN_MONTHLY_TOL_CENTS", 10)
+RAIN_MONTHLY_TTL_MIN = _env_int("IMM_RAIN_MONTHLY_TTL_MIN", 30)
+RAIN_MONTHLY_REFRESH_SECS = _env_int("IMM_RAIN_MONTHLY_REFRESH_SECS", 600)
+RAIN_MONTHLY_DRY_MIN = _env_float("IMM_RAIN_MONTHLY_DRY_MIN", 60)
+# close is 23:59:59 ET on the month's last day; 26h before it is 22:00 ET
+# the day before -- the dailies' "10pm the day before the rain day"
+RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN", 1560)
+RAIN_MONTHLY_FILE = os.environ.get(
+    "IMM_RAIN_MONTHLY_FILE", os.path.join(STATUS_DIR, "rain_monthly_fair.json"))
+# market -> entry; event -> state (both from the last reload)
+_rain_monthly_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+for _s in RAIN_MONTHLY_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        cutoff_from_close_min=RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN)
+
+
+def rain_monthly_series(series: str) -> bool:
+    return RAIN_MONTHLY_ENABLE and series in RAIN_MONTHLY_SERIES
+
+
+def load_rain_monthly() -> int:
+    """Hot-reload RAIN_MONTHLY_FILE by mtime. Returns the number of markets
+    loaded on a reload, else -1."""
+    try:
+        mtime = os.path.getmtime(RAIN_MONTHLY_FILE)
+    except OSError:
+        return -1
+    if mtime == _rain_monthly_state["mtime"]:
+        return -1
+    _rain_monthly_state["mtime"] = mtime
+    try:
+        with open(RAIN_MONTHLY_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! monthly rain fair file unreadable: {e}")
+        return -1
+    markets: Dict[str, dict] = {}
+    for t, e in (data.get("markets") or {}).items():
+        try:
+            ts = parse_iso_utc(str(e["fetched_at"]))
+            p = float(e["p"])
+            ev = str(e["event"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or not 0.0 <= p <= 1.0:
+            continue
+        markets[str(t)] = {"p": p, "event": ev, "boundary": bool(e.get("boundary")),
+                           "ts": ts.timestamp()}
+    events: Dict[str, dict] = {}
+    for ev, st in (data.get("event_state") or {}).items():
+        if not isinstance(st, dict):
+            continue
+        lw = parse_iso_utc(str(st.get("last_wet_at") or "")) if st.get("last_wet_at") else None
+        events[str(ev)] = {"wet": st.get("wet"), "stale_cli": bool(st.get("stale_cli")),
+                           "last_wet_ts": lw.timestamp() if lw else None,
+                           "mtd": st.get("mtd"), "obs_time": st.get("obs_time")}
+    _rain_monthly_state["markets"] = markets
+    _rain_monthly_state["events"] = events
+    return len(markets)
+
+
+def rain_monthly_gate_reason(ticker: str, now_ts: float,
+                             ext_bid: Optional[float], ext_ask: Optional[float]
+                             ) -> Tuple[str, dict]:
+    """('', {}) when a monthly rain market may quote, else (reason,
+    guard-skip inputs). Fails CLOSED."""
+    e = _rain_monthly_state["markets"].get(ticker)
+    if e is None:
+        return "no monthly rain fair for this market", {"reason": "no_read"}
+    if now_ts - e["ts"] > RAIN_MONTHLY_TTL_MIN * 60:
+        return "monthly rain fair is stale", {"reason": "stale"}
+    st = _rain_monthly_state["events"].get(e["event"]) or {}
+    if st.get("wet") is None:
+        return ("no current observation at the station",
+                {"reason": "no_obs", "obs_time": st.get("obs_time")})
+    if st.get("wet"):
+        return ("raining at the station", {"reason": "raining",
+                                           "obs_time": st.get("obs_time")})
+    lw = st.get("last_wet_ts")
+    if lw is not None and RAIN_MONTHLY_DRY_MIN > 0 \
+            and now_ts - lw < RAIN_MONTHLY_DRY_MIN * 60:
+        return (f"rained {int((now_ts - lw) // 60)}m ago, drying "
+                f"{RAIN_MONTHLY_DRY_MIN:g}m", {"reason": "drying"})
+    if st.get("stale_cli"):
+        return "the station's CLI is stale", {"reason": "stale_cli"}
+    if e["boundary"]:
+        return (f"strike within the boundary of the month-to-date "
+                f"{st.get('mtd')}", {"reason": "boundary", "mtd": st.get("mtd")})
+    fair_c = e["p"] * 100.0
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair_c, RAIN_MONTHLY_TOL_CENTS)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair_c:.0f}c (tol "
+                f"{RAIN_MONTHLY_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+                f"MTD {st.get('mtd')}\")",
+                {"reason": "band", "fair": round(fair_c, 2),
+                 "tol": RAIN_MONTHLY_TOL_CENTS, "bid_bad": bid_bad,
+                 "ask_bad": ask_bad, "mtd": st.get("mtd")})
     return "", {}
 
 
@@ -10420,6 +10570,7 @@ class IncentiveMarketMaker:
         self._ca_fair_stood: Set[str] = set()     # Carbon Arc fair stand-asides
         self._or_fair_stood: Set[str] = set()     # OpenRouter token-usage stand-asides
         self._share_fair_stood: Set[str] = set()  # OpenRouter market-share stand-asides
+        self._rain_monthly_stood: Set[str] = set()  # monthly rain stand-asides
         self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
         self._dc_stood: Set[str] = set()          # data center count stand-asides
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
@@ -12241,6 +12392,7 @@ class IncentiveMarketMaker:
         if _or_moved:
             log(f"{self.tag} or-fair reloaded: {_or_n} events, "
                 f"{_or_moved} with a new day")
+        load_rain_monthly()
         _sh_n, _sh_moved = load_share_fair()
         if _sh_moved:
             log(f"{self.tag} share-fair reloaded: {_sh_n} events, "
@@ -15444,6 +15596,22 @@ class IncentiveMarketMaker:
                 self._share_fair_stood.discard(t)
                 log(f"{self.tag} share-fair resume {t}")
 
+            # MONTHLY RAIN GATE (Jack 2026-10-01, see RAIN_MONTHLY_ENABLE): the
+            # daily rain gate's stand-aside on the monthly model, failing
+            # CLOSED, and out while it rains at the station.
+            if rain_monthly_series(meta.series):
+                rm_why, rm_in = rain_monthly_gate_reason(t, now_ts, ext_bid, ext_ask)
+                if rm_why:
+                    if t not in self._rain_monthly_stood:
+                        self._rain_monthly_stood.add(t)
+                        log(f"{self.tag} rain-monthly stand-aside {t}: {rm_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "rain_monthly", lambda: rm_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._rain_monthly_stood:
+                self._rain_monthly_stood.discard(t)
+                log(f"{self.tag} rain-monthly resume {t}")
+
             # GASBUDDY STATE-GAS GATE (Jack 2026-09-27, see GB_FAIR_ENABLE):
             # the same stand-aside on GasBuddy's live state averages, failing
             # CLOSED -- the state dailies are quoted only against the feed.
@@ -16937,6 +17105,42 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_share_fair_refresh, daemon=True,
                              name="share-fair").start()
+        if RAIN_MONTHLY_ENABLE and not once:
+            # Monthly rain refresher (2026-10-01): the share refresher's
+            # contract -- every network call off the trading thread, the
+            # quote loop reads only RAIN_MONTHLY_FILE. Every
+            # RAIN_MONTHLY_REFRESH_SECS: the station's latest observation, the
+            # month-to-date and the Monte Carlo (history and forecast cached
+            # inside rain_monthly). A failed refresh keeps the old file, whose
+            # entries age out of RAIN_MONTHLY_TTL_MIN (the gate fails closed).
+            def _rain_monthly_refresh():
+                try:
+                    import rain_monthly_fair
+                except Exception as e:
+                    log(f"{self.tag} ! rain-monthly refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, RAIN_MONTHLY_REFRESH_SECS)
+                    try:
+                        ok, miss = rain_monthly_fair.write_fair_file(
+                            RAIN_MONTHLY_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} rain-monthly refresh: {ok} events "
+                                f"with a fair"
+                                + (f", {miss} without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! rain-monthly refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 120)
+                    time.sleep(delay)
+            threading.Thread(target=_rain_monthly_refresh, daemon=True,
+                             name="rain-monthly").start()
         if GB_FAIR_ENABLE and not once:
             # GasBuddy state-gas refresher (2026-09-27): the OpenRouter
             # refresher's contract -- every network call off the trading
@@ -17202,6 +17406,15 @@ class IncentiveMarketMaker:
                 f"stalled), file {SHARE_FAIR_FILE}")
         else:
             log("share-fair gate: OFF -- OpenRouter share series not enrolled")
+        if RAIN_MONTHLY_ENABLE:
+            log(f"rain-monthly gate: {','.join(sorted(RAIN_MONTHLY_SERIES))} "
+                f"fail-closed at-touch, tol {RAIN_MONTHLY_TOL_CENTS}c, out while "
+                f"it rains at the station + {RAIN_MONTHLY_DRY_MIN:g}m, cutoff "
+                f"close-{RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN}m, ttl "
+                f"{RAIN_MONTHLY_TTL_MIN}m, refresh {RAIN_MONTHLY_REFRESH_SECS}s, "
+                f"file {RAIN_MONTHLY_FILE}")
+        else:
+            log("rain-monthly gate: OFF -- monthly rain not enrolled")
         if GB_FAIR_ENABLE:
             gated = ([] if not GB_STATE_QUOTE else ["AAA state dailies"]) \
                 + (["KXDIESELD"] if GB_DIESEL_ENABLE else []) \
@@ -17221,7 +17434,8 @@ class IncentiveMarketMaker:
                 f"{'GATED' if (GB_NATGAS_ENABLE or GB_DIESEL_ENABLE) else 'plain'} "
                 f"outside the no-quote window {GAS_TRIAL_BLACKOUT_ET} ET; state "
                 f"dailies {'gated' if GB_STATE_QUOTE else 'blocked'}")
-        if CA_FAIR_ENABLE or OR_FAIR_ENABLE or GB_FAIR_ENABLE or SHARE_FAIR_ENABLE:
+        if CA_FAIR_ENABLE or OR_FAIR_ENABLE or GB_FAIR_ENABLE or SHARE_FAIR_ENABLE \
+                or RAIN_MONTHLY_ENABLE:
             log("fair refreshers: Kalshi reads "
                 + ("SIGNED, public endpoint as the fallback" if FAIR_SIGNED_READS
                    else "PUBLIC only (IMM_FAIR_SIGNED_READS=0)"))
