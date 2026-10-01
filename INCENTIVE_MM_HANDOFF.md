@@ -4533,6 +4533,74 @@ WATCH AFTER DEPLOY: startup "vercel gate: ... PRE-D only, fail-closed ...",
 vercel_fair.json refreshing every 15 min, "vercel stand-aside / resume"
 lines, and no Vercel orders at or after 23:00Z the day before D.
 
+### 2026-10-01 addendum — the fair anchors on TODAY's running share (Jack)
+
+Jack: "yes anchor the fair on D-1's running share" (after the "what does
+this not fix" line above: the export shows today's running share live, and
+the 9/27 fair, anchored on the latest COMPLETE day, could not see it).
+
+MODEL (vercel_fair.py). From IMM_VERCEL_RUN_START_MIN (60) after 00:00Z,
+with T = today and k = D - T days ahead:
+    X_D = R_T(tau) + delta + e_k
+R_T(tau) = today's running share now; delta = final - running for the same
+series at the same minute of day (+-10) on each logged complete day (the KL
+vercel-logger's data/export_*.jsonl[.gz], a pass every 2 min; the final =
+the next day's 02:00-14:00Z read, before the D+2 revisions settlement never
+sees), widened x1.5 about its mean; e_k = the empirical k-day changes as
+before (x1.5 labs / x1.0 open-weights). delta keeps the strong hour-of-day
+biases (DeepSeek requests read ~9 pp high at 01Z and ~2 pp high at 12Z,
+Anthropic spend ~5 pp low early, open-weights ~4 pp high mid-day). It
+applies to every horizon (k = 1..3), not only D-1: the running day is the
+freshest public number for all of them. Before 01:00Z (today's block is
+degenerate for the first 10-50 min) the 9/27 complete anchor stands.
+
+FAIL CLOSED. Past 01:00Z a missing / degenerate running block (mode
+fail:block) or fewer than IMM_VERCEL_RUN_MIN_DAYS (3) calibration days for
+a series (fail:calib) writes no entry for it -- the D-2 anchor is never a
+fallback once the running share is public. So the KL vercel-logger task is
+now a LIVE dependency of the gate: if it stops, the calibration days age
+out after IMM_VERCEL_RUN_CALIB_MAX_AGE (30) days and the family stands
+aside. IMM_VERCEL_INTRADAY_DIR points elsewhere.
+
+IMM SIDE. Entries carry anchor "run" / "complete"; running entries go stale
+after IMM_VERCEL_RUN_TTL_MIN (20) (complete ones keep 90); the refresher
+runs every IMM_VERCEL_FAIR_REFRESH_SECS = 300 (was 900) and logs the mode;
+a switch of anchor (01:00Z, 00:00Z) starts the usual 10-min hold. Reads:
+the 70-day history (1.4 MB) once a day / every 6 h, plus a fresh
+yesterday + today read (~40 KB) per refresh.
+
+EVIDENCE (read-only, Documents/KL-data/vercel-logger/
+analysis-2026-10-01-anchor/). (1) Leave-one-out backtest on the three logged
+D-1 days (9/27 partial, 9/28, 9/29; 776 series x half-hour cases): CRPS
+3.23 -> 2.13, median |center - final| 2.58 -> 1.63 pp, the new fair better
+in 569/776 and in every hour block; better for 6 of 8 series, a tie on
+KXGOOGVREQ, WORSE on KXMOONVSPEND (its 9/28 dip to 10.2 reverted to 18.7
+on 9/29; Moonshot's daily changes mean-revert, corr -0.31). (2) Over 68 days
+of finals, X_{D-1} beats X_{D-2} as a predictor of X_D for all 8 series
+(MAE, e.g. open-weights 3.41 vs 5.45, Moonshot 2.54 vs 3.06). (3) Pre-D
+tape of the D = 9/30 markets (19.8k ct, makers -$1,425 at settlement):
+makers lost -$392 on trades where the OLD gate would have been open, -$156
+where the NEW one would. The 9/29 losses (-$880) were stood aside by BOTH
+gates (Sep 28's complete day already showed the weekday drop); the new
+anchor's gain came on 9/28, when the running share showed the Monday drop
+and the stale Sunday anchor did not (KXOPENSOURCESHARE-26OCT01-T69: an 80c
+bid makers lost $240 on; old fair 85c, new 3c = decided).
+
+WHAT THIS DOES NOT FIX. Three calibration days (it grows by one a day; the
+early-hour deltas are the noisiest). No mean reversion (Moonshot) and no
+weekday term (open-weights ~76% on weekends vs ~57-62% on weekdays) in the
+change sample. The gate still only joins the touch: the fair decides
+stand-asides, it does not price.
+
+KILL SWITCHES. IMM_VERCEL_RUN_ANCHOR=0 restores the 9/27 complete anchor all
+day (no logger dependency); IMM_VERCEL_ENABLE=0 takes the family out.
+
+WATCH AFTER DEPLOY: "vercel gate: ... anchor today's running share (ttl
+20m; X_L before 01:00Z)", "vercel-fair refresh: N events with a read,
+anchor run" (complete before 01:00Z), vercel_fair.json's "anchor" block
+(mode, tau_min, calib_days, delta_n), and "decided: fair Xc (running ...)"
+stand-asides.
+
 ## 2026-09-27 pm — Fair refreshers read Kalshi SIGNED: OpenRouter windows, GasBuddy anchors, Carbon Arc catalog (Jack)
 
 Jack, after the public-API 429 investigation: "yes build change A on a

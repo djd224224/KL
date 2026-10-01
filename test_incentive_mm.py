@@ -15741,14 +15741,17 @@ class TestVercelPreDGate(unittest.TestCase):
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
 
-    def _write(self, x_l=20.0, errs=None, last="2068-12-03", age_secs=0.0):
+    def _write(self, x_l=20.0, errs=None, last="2068-12-03", age_secs=0.0,
+               anchor=None):
         errs = errs if errs is not None else [-1.0, -0.5, 0.0, 0.5, 1.0] * 12
         fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
+        entry = {"x_l": x_l, "errs": errs, "last": last, "d": "2068-12-05",
+                 "h": 2, "n": len(errs), "series": "KXOPENVREQ",
+                 "fetched_at": fetched}
+        if anchor:
+            entry["anchor"] = anchor
         with open(imm.VERCEL_FAIR_FILE, "w", encoding="utf-8") as f:
-            json.dump({"entries": {self.EV: {
-                "x_l": x_l, "errs": errs, "last": last, "d": "2068-12-05",
-                "h": 2, "n": len(errs), "series": "KXOPENVREQ",
-                "fetched_at": fetched}}}, f)
+            json.dump({"entries": {self.EV: entry}}, f)
         os.utime(imm.VERCEL_FAIR_FILE, (time.time(), time.time() + self._bump))
         TestVercelPreDGate._bump += 1
         return imm.load_vercel_fair()
@@ -15821,6 +15824,32 @@ class TestVercelPreDGate(unittest.TestCase):
         self.assertEqual(r(), "hold")
         imm._vercel_state["moved_at"][self.EV] -= 3600
         self.assertIsNone(r())
+
+    def test_running_anchor_entries(self):
+        # Jack 2026-10-01: "yes anchor the fair on D-1's running share" --
+        # vercel_fair writes anchor "run" entries off today's running share
+        now = time.time()
+        r = lambda ts=now: imm.vercel_gate_reason(
+            self.T, ts, 49, 51, self.CLOSE)
+        self.assertEqual(self._write(anchor="run", last="2068-12-04@run"), (1, 0))
+        self.assertEqual(imm._vercel_state["entries"][self.EV]["anchor"], "run")
+        self.assertEqual(r(), ("", {}))
+        # a running read goes stale after VERCEL_RUN_TTL_MIN, well inside the
+        # complete anchor's VERCEL_FAIR_TTL_MIN
+        self.assertLess(imm.VERCEL_RUN_TTL_MIN, imm.VERCEL_FAIR_TTL_MIN)
+        late = now + imm.VERCEL_RUN_TTL_MIN * 60 + 10
+        self.assertEqual(r(late)[1].get("reason"), "stale")
+        self._write(last="2068-12-03")                        # back to complete:
+        self.assertEqual(r(now)[1].get("reason"), "hold")     # a new anchor holds
+        imm._vercel_state["moved_at"][self.EV] -= 3600
+        self.assertEqual(imm._vercel_state["entries"][self.EV]["anchor"], "complete")
+        self.assertIsNone(r(late)[1].get("reason"))           # old TTL applies
+        # the reason text names the anchor
+        self._write(x_l=17.0, anchor="run", last="2068-12-04@run")
+        imm._vercel_state["moved_at"][self.EV] -= 3600
+        why, inp = r()
+        self.assertEqual(inp.get("reason"), "decided")
+        self.assertIn("running 17.00", why)
 
     def test_quotes_before_d_only_against_an_agreeing_fair(self):
         bot = self._bot()

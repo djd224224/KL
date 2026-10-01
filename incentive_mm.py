@@ -5973,6 +5973,7 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_ENABLE", "VERCEL_SERIES", "VERCEL_CUTOFF_BEFORE_D_MIN",
     "VERCEL_FAIR_TOL_CENTS", "VERCEL_FAIR_MIN_P", "VERCEL_FAIR_TTL_MIN",
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
+    "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
     # long-dated mortgage gate (2026-09-28); mortgage_fair's model knobs
     # ride in its status file's "model" block
     "MORT_ENABLE", "MORT_SERIES", "MORT_FAIR_TOL_CENTS", "MORT_FAIR_TTL_MIN",
@@ -7590,12 +7591,21 @@ def quake_hold_renewals(resting: List[dict], held: Set[str],
 #     reads both wrong, so cutoff_from_close_min=0 takes the ticker-date rule
 #     out and this tightener sets the real cutoff); unparseable -> stood down.
 #   - FAIR: vercel_fair.py (refresher thread "vercel-fair", every
-#     VERCEL_FAIR_REFRESH_SECS) -- X_D = X_L + e, L the latest complete day,
-#     e the empirical h-day changes of the last 60 days (widened x1.5 for
-#     the labs, whose backtest was overconfident).
+#     VERCEL_FAIR_REFRESH_SECS). Since 2026-10-01 (Jack: "yes anchor the
+#     fair on D-1's running share") it anchors on TODAY's running share,
+#     which the export shows live (on the D = 9/30 pre-D tape makers lost
+#     $392 on trades the X_L gate left open, $156 under this one):
+#     X_D = R_T(tau) + delta + e_k, delta the logged running-to-final error
+#     of the series at the same hour, e_k the empirical k-day changes of
+#     the last 60 days (widened x1.5 for the labs). Before 01:00Z (today's
+#     block is still degenerate) or with IMM_VERCEL_RUN_ANCHOR=0 it falls
+#     back to the 9/27 model, X_D = X_L + e, L the latest complete day.
+#     Running entries carry anchor "run" and go stale after
+#     VERCEL_RUN_TTL_MIN; no running read or calibration = no entry.
 #   - The quote loop stands a market aside (cancel) with no fresh read
-#     (fail CLOSED), a stale read (VERCEL_FAIR_TTL_MIN), a new complete day
-#     within VERCEL_FAIR_HOLD_MIN, a close not on D+1, a decided strike
+#     (fail CLOSED), a stale read (VERCEL_FAIR_TTL_MIN, VERCEL_RUN_TTL_MIN
+#     for running entries), a new anchor within VERCEL_FAIR_HOLD_MIN, a
+#     close not on D+1, a decided strike
 #     (fair < VERCEL_FAIR_MIN_P or > 1 - it) or a touch fighting the fair by
 #     more than VERCEL_FAIR_TOL_CENTS on the adverse side.
 # Whether a program's pre-D window is long enough to clear the $1 floor is
@@ -7610,10 +7620,15 @@ VERCEL_FAIR_TOL_CENTS = _env_int("IMM_VERCEL_FAIR_TOL_CENTS", 15)
 VERCEL_FAIR_MIN_P = _env_float("IMM_VERCEL_FAIR_MIN_P", 0.05)
 VERCEL_FAIR_TTL_MIN = _env_int("IMM_VERCEL_FAIR_TTL_MIN", 90)
 VERCEL_FAIR_HOLD_MIN = _env_float("IMM_VERCEL_FAIR_HOLD_MIN", 10)
-VERCEL_FAIR_REFRESH_SECS = _env_int("IMM_VERCEL_FAIR_REFRESH_SECS", 900)
+# 300 s since the running anchor (2026-10-01): the export's running share
+# moves every ~18 min (median), so a read is stale after VERCEL_RUN_TTL_MIN
+VERCEL_FAIR_REFRESH_SECS = _env_int("IMM_VERCEL_FAIR_REFRESH_SECS", 300)
+VERCEL_RUN_TTL_MIN = _env_int("IMM_VERCEL_RUN_TTL_MIN", 20)
+# read by vercel_fair itself; mirrored here for the startup line + config hash
+VERCEL_RUN_ANCHOR = os.environ.get("IMM_VERCEL_RUN_ANCHOR", "1") == "1"
 VERCEL_FAIR_FILE = os.environ.get(
     "IMM_VERCEL_FAIR_FILE", os.path.join(STATUS_DIR, "vercel_fair.json"))
-# event -> entry; event -> epoch its read last moved (new complete day)
+# event -> entry; event -> epoch its read last moved (new anchor)
 _vercel_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}}
 # lab tickers write 5.5 as T5P5, KXOPENSOURCESHARE as T67.5
 _VERCEL_STRIKE_RE = re.compile(r"^T(\d+)(?:[P.](\d+))?$")
@@ -7649,8 +7664,9 @@ def vercel_measured_day(event_ticker: str) -> Optional[datetime]:
 
 def load_vercel_fair() -> Tuple[int, int]:
     """Hot-reload VERCEL_FAIR_FILE by mtime into _vercel_state. Returns
-    (events loaded, events whose latest complete day moved) on a reload,
-    else (0, 0). A move starts that event's hold, except on the first load."""
+    (events loaded, events whose anchor moved -- a new complete day, or the
+    switch to / from today's running share) on a reload, else (0, 0). A
+    move starts that event's hold, except on the first load."""
     try:
         mtime = os.path.getmtime(VERCEL_FAIR_FILE)
     except OSError:
@@ -7677,7 +7693,8 @@ def load_vercel_fair() -> Tuple[int, int]:
         if ts is None or not errs or not math.isfinite(x_l):
             continue
         fresh[str(ev)] = {"x_l": x_l, "errs": errs, "last": last,
-                          "ts": ts.timestamp()}
+                          "ts": ts.timestamp(),
+                          "anchor": str(e.get("anchor") or "complete")}
     moved = [ev for ev, e in fresh.items()
              if ev in old and old[ev].get("last") != e["last"]]
     if old:
@@ -7717,24 +7734,26 @@ def vercel_gate_reason(ticker: str, now_ts: float,
     e = _vercel_state["entries"].get(ev)
     if e is None:
         return "no Vercel read for this event", {"reason": "no_read"}
-    if now_ts - e["ts"] > VERCEL_FAIR_TTL_MIN * 60:
+    run = e.get("anchor") == "run"
+    if now_ts - e["ts"] > (VERCEL_RUN_TTL_MIN if run else VERCEL_FAIR_TTL_MIN) * 60:
         return "Vercel read is stale", {"reason": "stale"}
     moved = _vercel_state["moved_at"].get(ev)
     if VERCEL_FAIR_HOLD_MIN > 0 and moved is not None \
             and now_ts - moved <= VERCEL_FAIR_HOLD_MIN * 60:
-        return (f"new complete Vercel day, holding {VERCEL_FAIR_HOLD_MIN:g}m "
+        return (f"new Vercel anchor, holding {VERCEL_FAIR_HOLD_MIN:g}m "
                 f"while the book reprices", {"reason": "hold"})
     k = float(f"{m.group(1)}.{m.group(2) or 0}")
     p = vercel_fair_p(e, k)
+    x_lbl = f"{'running' if run else 'X_L'} {e['x_l']:.2f}"
     if p < VERCEL_FAIR_MIN_P or p > 1.0 - VERCEL_FAIR_MIN_P:
-        return (f"decided: fair {p * 100:.0f}c (X_L {e['x_l']:.2f} vs K {k:g})",
+        return (f"decided: fair {p * 100:.0f}c ({x_lbl} vs K {k:g})",
                 {"reason": "decided", "fair": round(p * 100, 2)})
     bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, p * 100.0,
                                         VERCEL_FAIR_TOL_CENTS, p * 100.0)
     if bid_bad or ask_bad:
         return (f"book {ext_bid}x{ext_ask} vs fair {p * 100:.0f}c (tol "
                 f"{VERCEL_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
-                f"X_L {e['x_l']:.2f} vs K {k:g})",
+                f"{x_lbl} vs K {k:g})",
                 {"reason": "band", "fair": round(p * 100, 2),
                  "tol": VERCEL_FAIR_TOL_CENTS, "bid_bad": bid_bad,
                  "ask_bad": ask_bad})
@@ -12077,7 +12096,7 @@ class IncentiveMarketMaker:
         _vc_n, _vc_moved = load_vercel_fair()
         if _vc_moved:
             log(f"{self.tag} vercel-fair reloaded: {_vc_n} events, "
-                f"{_vc_moved} with a new complete day")
+                f"{_vc_moved} with a new anchor")
         load_gb_fair()
         load_dc_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
@@ -16900,12 +16919,13 @@ class IncentiveMarketMaker:
                 while True:
                     delay = max(120, VERCEL_FAIR_REFRESH_SECS)
                     try:
-                        ok, miss = vercel_fair.write_fair_file(VERCEL_FAIR_FILE)
-                        if last != (ok, miss):
+                        ok, miss, mode = vercel_fair.write_fair_file(
+                            VERCEL_FAIR_FILE)
+                        if last != (ok, miss, mode):
                             log(f"{self.tag} vercel-fair refresh: {ok} events "
-                                f"with a read"
+                                f"with a read, anchor {mode}"
                                 + (f", {miss} series without one" if miss else ""))
-                        last = (ok, miss)
+                        last = (ok, miss, mode)
                     except Exception as e:
                         err = f"err:{type(e).__name__}:{str(e)[:80]}"
                         if last != err:
@@ -17031,7 +17051,11 @@ class IncentiveMarketMaker:
                 f"measured day, tol {VERCEL_FAIR_TOL_CENTS}c, decided outside "
                 f"{VERCEL_FAIR_MIN_P * 100:g}-{100 - VERCEL_FAIR_MIN_P * 100:g}c, "
                 f"ttl {VERCEL_FAIR_TTL_MIN}m, hold {VERCEL_FAIR_HOLD_MIN:g}m, "
-                f"refresh {VERCEL_FAIR_REFRESH_SECS}s, file {VERCEL_FAIR_FILE}")
+                f"refresh {VERCEL_FAIR_REFRESH_SECS}s, anchor "
+                + (f"today's running share (ttl {VERCEL_RUN_TTL_MIN}m; X_L "
+                   f"before 01:00Z)" if VERCEL_RUN_ANCHOR
+                   else "X_L only (IMM_VERCEL_RUN_ANCHOR=0)")
+                + f", file {VERCEL_FAIR_FILE}")
         else:
             log("vercel gate: OFF -- the Vercel series are not enrolled")
         if MORT_ENABLE:
