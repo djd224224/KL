@@ -340,6 +340,9 @@ class SeriesOverride:
     pre_event_dates_only: bool = False                  # only the hand table
     #   (AWARDS_EVENT_DATES) may supply the start -- for families whose
     #   Kalshi expiration is a Dec 31 placeholder (the Oscars)
+    unwind_full_position: bool = False                  # FULL UNWIND: the
+    #   side that REDUCES the bot's position may rest the whole position
+    #   instead of only its ladder (see unwind_side_sizes)
 
 
 # Depth-padding (pad_to_target): fill a thin side up to the reward target with
@@ -1770,6 +1773,25 @@ def series_min_est_rate(series: str) -> float:
 def series_safe_join(series: str) -> bool:
     ov = SERIES_OVERRIDES.get(series)
     return bool(ov and ov.safe_join)
+
+
+def series_unwind_full(series: str) -> bool:
+    ov = SERIES_OVERRIDES.get(series)
+    return bool(ov and ov.unwind_full_position)
+
+
+def unwind_side_sizes(series: str, pos: float, maxpos: float) -> Tuple[int, int]:
+    """(bid, ask) size floors under FULL UNWIND (Jack 2026-10-01, on
+    KXNFLESCALATORRSHYDS-26OCT01PITCLE-PITJWARREN30: short 240 at the skew
+    limit, the reducing bid resting only the ladder's 80 -- "happy to unload
+    the whole position on the other side so can quote 240"). The side that
+    reduces `pos` may rest the whole position, in whole contracts and never
+    more than the market's position cap, so one fill can flatten it; the
+    other side gets no floor. (0, 0) when flat or off the family."""
+    if not series_unwind_full(series) or abs(pos) < 1:
+        return 0, 0
+    n = int(min(abs(pos), maxpos))
+    return (n, 0) if pos < 0 else (0, n)
 
 
 def series_pre_cutoff_reduce_only_secs(series: str) -> int:
@@ -4880,13 +4902,19 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # the 0-9 ET quiet hours; per-market cap 600 / per-event 4,000 at the
 # launcher's 150 / 1,000. KXTRUMPAPPROVE keeps its own x3
 # (IMM_TRUMPAPPROVE_SIZE_MULT).
+# 2026-10-01 (Jack, on KXNFLESCALATORRSHYDS-26OCT01PITCLE-PITJWARREN30, short
+# 240 at the x4 skew limit with the reducing bid resting the ladder's 80:
+# "happy to unload the whole position on the other side so can quote 240"):
+# FULL UNWIND -- the reducing side rests max(ladder, whole position) up to
+# the 600 cap (unwind_side_sizes). Kill: IMM_SPORTS_LADDER_UNWIND_FULL=0.
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
     min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.2),
     safe_join=True,
     price_min_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MIN", 1),
     price_max_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MAX", 99),
-    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 4.0))
+    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 4.0),
+    unwind_full_position=os.environ.get("IMM_SPORTS_LADDER_UNWIND_FULL", "1") == "1")
 
 # ELECTION archetype (Jack 2026-09-28, see ELECTION_SERIES): "expand range to
 # quote between 1 and 99" -- price_min/max, which member_price_band, the quote
@@ -8943,12 +8971,16 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
                       levels: Optional[List[Tuple[int, int]]] = None,
                       ref_px: Optional[int] = None,
                       band: Optional[Tuple[int, int]] = None,
-                      hour_mult: float = 1.0) -> List[Quote]:
+                      hour_mult: float = 1.0,
+                      min_total: int = 0) -> List[Quote]:
     """Ladder behind (never improving) the join anchor. `anchor` is the best
     EXTERNAL price on our side; `opposite_best` the best external price on the
     other side (post-only: never cross it). Sizes come from `levels` (the
     market's series ladder; global LEVELS if omitted), shaved to `room`
     (contracts we may still acquire on this side if everything fills).
+    `min_total` (FULL UNWIND, see unwind_side_sizes) lifts the side's total
+    to at least that many contracts -- still shaved to `room` -- on the one
+    atref rung, or on the first rung of an offsets ladder.
 
     `ref_px` (side's own price space: YES cents for bids, YES-ask cents for
     asks): the amended-rules reference level. In LADDER_MODE 'atref' the whole
@@ -9016,6 +9048,7 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
         total = int(round(total * capped_ref_mult(anchor, ref_px, book_side,
                                                   hour_mult=hour_mult,
                                                   series=series_of(ticker))))
+        total = max(total, int(min_total))
         count = min(total, int(room))
         if count <= 0:
             return quotes
@@ -9052,6 +9085,10 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
             break
         quotes.append(Quote(ticker, book_side, px, count))
         room -= count
+    if quotes and min_total:
+        extra = min(room, int(min_total) - sum(q.count for q in quotes))
+        if extra > 0:
+            quotes[0] = replace(quotes[0], count=quotes[0].count + extra)
     return quotes
 
 
@@ -14884,6 +14921,14 @@ class IncentiveMarketMaker:
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
             cap_pos = own_pos if quote_all else pos
+            # FULL UNWIND (unwind_side_sizes): the reducing side's ladder bound
+            # becomes the whole position; the position cap, the event share
+            # and the skew below still bind. A side with no ladder stays dark.
+            unwind_bid, unwind_ask = unwind_side_sizes(meta.series, cap_pos, maxpos)
+            unwind_bid = unwind_bid if lv_bid else 0
+            unwind_ask = unwind_ask if lv_ask else 0
+            side_max_bid = max(side_max_bid, unwind_bid)
+            side_max_ask = max(side_max_ask, unwind_ask)
             room_buy = min(maxpos - cap_pos, share_buy, side_max_bid)
             room_sell = min(maxpos + cap_pos, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
@@ -14918,7 +14963,7 @@ class IncentiveMarketMaker:
                     mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
                                                 levels=lv_bid, ref_px=ref_bid_px,
                                                 band=(rung_lo, pmax_s),
-                                                hour_mult=hm))
+                                                hour_mult=hm, min_total=unwind_bid))
             if ext_ask is not None and room_sell > 0 and ask_in_band:
                 px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
                     or ext_ask <= pmax_s
@@ -14926,7 +14971,7 @@ class IncentiveMarketMaker:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
                                                 levels=lv_ask, ref_px=ref_ask_px,
                                                 band=(rung_lo, pmax_s),
-                                                hour_mult=hm))
+                                                hour_mult=hm, min_total=unwind_ask))
 
             # quake gate: every bid rung at most the fair cap (no asks exist)
             if quake_cap is not None:
@@ -15649,6 +15694,13 @@ class IncentiveMarketMaker:
             # level_cap-blocked overnight.)
             max_level_size = side_cap if LADDER_MODE == "atref" \
                 else max(s for _t, s in lv_now)
+            # FULL UNWIND: the side that reduces the bot's own position may
+            # rest the whole position (the quote loop sized it the same way)
+            _ub, _ua = unwind_side_sizes(series, self.pnl.pos.get(q.ticker, 0.0),
+                                         series_max_position(series))
+            _u = _ub if q.book_side == "bid" else _ua
+            side_cap = max(side_cap, _u)
+            max_level_size = max(max_level_size, _u)
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)

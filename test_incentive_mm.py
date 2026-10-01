@@ -7507,6 +7507,70 @@ class TestReconcileOwnershipGate(unittest.TestCase):
         self.assertEqual((bot.pnl.pos[self.T], bot.pnl.avg[self.T]), (-25.0, 38.0))
 
 
+class TestFullUnwind(unittest.TestCase):
+    """Jack 2026-10-01, on KXNFLESCALATORRSHYDS-26OCT01PITCLE-PITJWARREN30
+    (short 240 at the x4 skew limit, the reducing bid resting the ladder's
+    80): "happy to unload the whole position on the other side so can quote
+    240". The sports ladder / escalator family's reducing side rests
+    max(ladder, whole position) up to the position cap."""
+    T = "KXGOOD-99DEC31-A"
+
+    def test_sizes(self):
+        with mock.patch.dict(imm.SERIES_OVERRIDES):
+            imm.ensure_family_override("KXNFLESCALATORRSHYDS")
+            f = imm.unwind_side_sizes
+            self.assertTrue(imm.series_unwind_full("KXNFLESCALATORRSHYDS"))
+            self.assertEqual(f("KXNFLESCALATORRSHYDS", -240.0, 600.0), (240, 0))
+            self.assertEqual(f("KXNFLESCALATORRSHYDS", 100.0, 600.0), (0, 100))
+            self.assertEqual(f("KXNFLESCALATORRSHYDS", -36.4, 600.0), (36, 0))
+            self.assertEqual(f("KXNFLESCALATORRSHYDS", -700.0, 600.0), (600, 0))   # the cap binds
+            self.assertEqual(f("KXNFLESCALATORRSHYDS", -0.5, 600.0), (0, 0))       # flat
+            self.assertEqual(f("KXGOOD", -240.0, 600.0), (0, 0))                   # off the family
+            imm.SERIES_OVERRIDES["KXNFLESCALATORRSHYDS"] = dataclasses.replace(
+                imm.SERIES_OVERRIDES["KXNFLESCALATORRSHYDS"], unwind_full_position=False)
+            self.assertEqual(f("KXNFLESCALATORRSHYDS", -240.0, 600.0), (0, 0))     # kill switch
+
+    def test_atref_rung_carries_the_whole_position(self):
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            q = build_side_ladder(self.T, "bid", 8, 9, 840, levels=[(0, 80)], ref_px=8,
+                                  band=(1, 99), min_total=240)
+            self.assertEqual([(x.price_cents, x.count) for x in q], [(8, 240)])
+            q = build_side_ladder(self.T, "bid", 8, 9, 840, levels=[(0, 80)], ref_px=8,
+                                  band=(1, 99))
+            self.assertEqual([x.count for x in q], [80])
+            q = build_side_ladder(self.T, "bid", 8, 9, 100, levels=[(0, 80)], ref_px=8,
+                                  band=(1, 99), min_total=240)
+            self.assertEqual([x.count for x in q], [100])                       # room binds
+
+    def test_offsets_ladder_tops_up_the_first_rung(self):
+        with mock.patch.object(imm, "LADDER_MODE", "offsets"):
+            q = build_side_ladder(self.T, "ask", 52, 50, 200,
+                                  levels=[(0, 5), (1, 10), (2, 20)], band=(1, 99),
+                                  min_total=60)
+            self.assertEqual([(x.price_cents, x.count) for x in q], [(52, 30), (53, 10), (54, 20)])
+
+    def _short_bot(self, unwind: bool):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.positions[self.T] = -100.0
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -100.0, 50.0
+        with mock.patch.dict(imm.SERIES_OVERRIDES,
+                             {"KXGOOD": imm.SeriesOverride(unwind_full_position=unwind)}), \
+                mock.patch.object(imm, "LADDER_MODE", "offsets"):
+            bot.run_cycle()
+        return {side: sum(o["remaining_count"] for o in bot.state.sim_orders.values()
+                          if o["ticker"] == self.T and o["book_side"] == side)
+                for side in ("bid", "ask")}
+
+    def test_cycle_rests_the_whole_position_on_the_reducing_side(self):
+        """Short 100 at the default 100 cap: the skew pulls the selling side
+        either way; the buying side rests the ladder's 35 without the flag
+        and the whole 100 with it -- past the placement guard, which lifts
+        its side cap for the reducing side only."""
+        self.assertEqual(self._short_bot(unwind=False), {"bid": 35.0, "ask": 0})
+        self.assertEqual(self._short_bot(unwind=True), {"bid": 100.0, "ask": 0})
+
+
 class TestCycleLog(unittest.TestCase):
     def test_panel_row_written(self):
         _clean_persist()
