@@ -351,6 +351,33 @@ class BuilderIntegrationTests(unittest.TestCase):
         m2 = dash.Builder(self.NOW, api=False, api_force=False).build()
         self.assertAlmostEqual(m2["markets"]["KXC-1"]["w"]["today"]["pnl"], -2.0, places=6)
 
+    def test_rows_after_now_are_ignored(self):
+        # the bot keeps writing while a (slow) build runs: a snapshot stamped
+        # after the build's "now" must not push the window's end edge back to
+        # an older snapshot (9/30: today read +$6.76 here vs +$71.05 in history)
+        with open(os.path.join(self.dir, "marks_2026-09-28.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "2026-09-28T20:03:00+00:00", "ticker": "KXA-1", "pos": 15,
+                                "avg_cents": 43.33, "mark_cents": 90}) + "\n")
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        self.assertEqual(m["edges"]["today"][1], _ts("2026-09-28T19:58:00Z"))
+        self.assertFalse(m["warnings"])
+        a = m["markets"]["KXA-1"]["w"]["today"]
+        self.assertAlmostEqual(a["pnl"], 15 * (60 - 43.33) / 100 - 10 * (55 - 40) / 100, places=3)
+        h = {r["d"]: r for r in m["history"]}["2026-09-28"]
+        self.assertAlmostEqual(h["pnl"], sum(v["w"].get("today", {}).get("pnl", 0)
+                                             for v in m["markets"].values()), places=1)
+
+    def test_every_history_day_matches_its_window(self):
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        d = m["days"]["2026-09-28"]
+        f = m["day_fields"]
+        self.assertTrue(d["ok"])
+        for t, row in d["m"].items():
+            w = m["markets"][t]["w"]["today"]
+            self.assertAlmostEqual(row[f.index("pnl")], w["pnl"], places=3)
+            self.assertAlmostEqual(row[f.index("rew")], w["rew"], places=3)
+            self.assertEqual(row[f.index("fills")], w.get("fills", 0))
+
     def _exits(self, lookup):
         b = dash.Builder(self.NOW, api=lookup is not None, api_force=False)
         b.load()

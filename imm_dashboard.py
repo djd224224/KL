@@ -113,7 +113,11 @@ PROMISING_EST = float(os.environ.get("IMM_DASH_PROMISING_EST", "3.0"))
 PROMISING_LEFT = float(os.environ.get("IMM_DASH_PROMISING_LEFT", "500"))
 TITLE_BUDGET = int(os.environ.get("IMM_DASH_TITLE_BUDGET", "80"))
 PAD_BID, PAD_ASK = 1, 99  # incentive_mm PAD_BID_CENTS / PAD_ASK_CENTS
-CACHE_VERSION = 4
+CACHE_VERSION = 5
+DAY_CURVE_STEP = 900              # per-day intraday curves at 15-minute steps
+# per-market day arrays on the page: D.days[day].m[ticker] = [...] in this order
+DAY_FIELDS = ("rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n",
+              "mk_cts", "rest", "pos0", "pos1", "mk0", "mk1", "settled")
 VANISH_REAPPEAR_SECS = 6 * 3600   # a position back within this long was only a blip
 EXIT_RESULTS_TTL = 3600           # re-ask Kalshi about an unsettled exit hourly
 
@@ -523,7 +527,8 @@ _CYCLE_FIELDS = ("ts", "ticker", "ext_bid", "ext_ask", "yes_depth", "no_depth", 
                  "is_sticky", "reduce_only", "fast", "run_id", "config_hash")
 
 
-def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT) -> dict:
+def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
+                     max_ts: float = None) -> dict:
     """One cycle_log day file ->
          hourly  {ticker: {utc_hour: est $}}       reward accrual
          rest    {ticker: {utc_hour: $-seconds}}   resting-dollar time
@@ -555,9 +560,15 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT)
         return {"hourly": {}, "rest": {}, "cycles": [], "runs": {}, "last": {}}
     with f:
         rdr = csv.reader(f)
+        # rows the bot writes while this build runs are after the build's "now":
+        # leave them for the next build, or windows ending "now" disagree
+        max_str = (datetime.fromtimestamp(max_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                   if max_ts else None)
         for row in rdr:
             if len(row) < 13 or row[0] == "ts":
                 continue
+            if max_str and row[0] > max_str:
+                break
             s = row[0]
             if s != cur_str:
                 try:
@@ -617,7 +628,7 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT)
 # marks: 5-minute snapshots of every open own-book position
 # ----------------------------------------------------------------------------
 
-def parse_marks_file(path: str, keep_hours: bool, queries=None):
+def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = None):
     """One marks day file ->
          totals  [(snap_ts, unrealized $, n_positions, gross $ at risk)]
          hours   {utc_hour: (snap_ts, {ticker: (pos, avg_c, mark_c)})} -- the FIRST
@@ -626,6 +637,7 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None):
          first   the oldest snapshot, same shape (the file-boundary diff)
          gone    [(ticker, pos, avg, mark, last_seen_ts, first_missing_ts)]
          came    [(ticker, first_seen_ts)] between consecutive snapshots
+         edges   {et_midnight_ts: (snap_ts, book)} -- first snapshot of each ET day
     `queries` {key: (ticker, target_ts)} is answered in place with the first
     snapshot mark at or after target_ts (within MARKOUT_MAX_LAG): the fill
     mark-outs, resolved while the rows are in memory."""
@@ -633,7 +645,7 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None):
     for r in iter_jsonl(path):
         ts = iso_ts(r.get("ts"))
         t = r.get("ticker")
-        if not ts or not t:
+        if not ts or not t or (max_ts and ts > max_ts):
             continue
         pos = _f(r.get("pos"))
         if abs(pos) <= 1e-9:
@@ -655,6 +667,15 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None):
             hours[h] = (ts, book)
     last = (order[-1], snaps[order[-1]]) if order else (0.0, {})
     first = (order[0], snaps[order[0]]) if order else (0.0, {})
+    # the first snapshot after each ET midnight in the file: the day edges every
+    # past day's P&L is measured between (kept for the whole history, unlike
+    # the hourly detail)
+    edges = {}
+    for a, b in zip(order, order[1:]):
+        da = datetime.fromtimestamp(a, ET).date()
+        db = datetime.fromtimestamp(b, ET).date()
+        if db > da:
+            edges[et_midnight(db)] = (b, snaps[b])
     # positions leaving / entering the book between consecutive snapshots:
     # the raw material for spotting a position that left with no record
     gone, came = [], []
@@ -683,7 +704,7 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None):
                             queries[key] = ("ok", mk, ts)
                         break
     return {"totals": totals, "hours": hours if keep_hours else {}, "last": last,
-            "first": first, "gone": gone, "came": came}
+            "first": first, "gone": gone, "came": came, "edges": edges}
 
 
 # ----------------------------------------------------------------------------
@@ -1130,7 +1151,8 @@ class Builder:
             complete = file_complete(day, path, self.now)
             val = cache.get(path) if complete else None
             if val is None:
-                val = parse_cycle_file(path, keep_last=(path == live_path))
+                val = parse_cycle_file(path, keep_last=(path == live_path),
+                                       max_ts=None if complete else self.now)
                 if complete:
                     val = dict(val, last={})
                     cache.put(path, val)
@@ -1205,7 +1227,8 @@ class Builder:
                 # queries whose target falls in (or before the end of) this file
                 end = dt_day + 86400 + MARKOUT_MAX_LAG
                 q = {k: v for k, v in queries.items() if dt_day - 86400 <= v[1] <= end}
-                val = parse_marks_file(path, keep_hours=True, queries=q)
+                val = parse_marks_file(path, keep_hours=True, queries=q,
+                                       max_ts=None if complete else self.now)
                 for k, v in q.items():
                     if isinstance(v, tuple) and v and v[0] == "ok":
                         mk_cache[k] = [round(v[1], 3), round(v[2], 1)]
@@ -1224,6 +1247,8 @@ class Builder:
             self.snap_totals.extend(val["totals"])
             if keep_hours:
                 self.hour_snaps.update(val["hours"])
+            for m_ts, snap in (val.get("edges") or {}).items():
+                self.hour_snaps.setdefault(int(m_ts // 3600), snap)
             self.gone.extend(val.get("gone") or [])
             self.came.extend(val.get("came") or [])
             first = val.get("first") or (0.0, {})
@@ -1427,27 +1452,35 @@ class Builder:
         return self.snap_totals[lo][0], self.snap_totals[lo][1]
 
     # ---- per-window market aggregation -------------------------------------
-    def window_markets(self, w0: float, w1: float) -> dict:
-        """{ticker: metrics} for one window."""
+    def window_markets(self, w0: float, w1: float, sums=None) -> dict:
+        """{ticker: metrics} for one window. `sums` = ({ticker: rewards},
+        {ticker: resting $-seconds}) precomputed for the window (the per-day
+        pass buckets every market-hour once instead of once per day)."""
         h0, h1 = int(w0 // 3600), int(math.ceil(w1 / 3600.0))
         m = defaultdict(lambda: {"rew": 0.0, "rest_s": 0.0, "real": 0.0, "u0": 0.0,
                                  "u1": 0.0, "xfer": 0.0, "fills": 0, "cts": 0.0,
                                  "usd": 0.0, "mk": 0.0, "mk_n": 0, "mk_cts": 0.0,
                                  "buy": 0.0, "sell": 0.0, "settled": None})
-        for t, hs in self.hourly.items():
-            s = 0.0
-            for h, v in hs.items():
-                if h0 <= h < h1:
-                    s += v
-            if s:
-                m[t]["rew"] += s
-        for t, hs in self.rest.items():
-            s = 0.0
-            for h, v in hs.items():
-                if h0 <= h < h1:
-                    s += v
-            if s:
-                m[t]["rest_s"] += s
+        if sums is not None:
+            for t, v in sums[0].items():
+                m[t]["rew"] += v
+            for t, v in sums[1].items():
+                m[t]["rest_s"] += v
+        else:
+            for t, hs in self.hourly.items():
+                s_ = 0.0
+                for h, v in hs.items():
+                    if h0 <= h < h1:
+                        s_ += v
+                if s_:
+                    m[t]["rew"] += s_
+            for t, hs in self.rest.items():
+                s_ = 0.0
+                for h, v in hs.items():
+                    if h0 <= h < h1:
+                        s_ += v
+                if s_:
+                    m[t]["rest_s"] += s_
         s0 = self.snap_at(w0)
         s1 = self.snap_at(w1)
         e0 = s0[0] if s0 else w0
@@ -1513,6 +1546,73 @@ class Builder:
                 continue
             out[t] = v
         return out, (e0, e1, pnl_ok)
+
+    def day_list(self):
+        """[(iso day, start, end)] for every ET day the cycle history covers
+        in full, oldest first; today ends at `now`."""
+        today = datetime.fromtimestamp(self.now, ET).date()
+        first_cycle = min(self.cycles) if self.cycles else self.now
+        out = []
+        for i in range(HISTORY_DAYS, -1, -1):
+            d = today - timedelta(days=i)
+            a = et_midnight(d)
+            b = min(et_midnight(d + timedelta(days=1)), self.now)
+            if a < first_cycle - 3600 or b <= a:
+                continue
+            out.append((d.isoformat(), a, b))
+        return out
+
+    def daily_markets(self):
+        """{iso day: {"s", "e", "ok", "m": {ticker: [DAY_FIELDS...]}, "c": curve}}
+        -- every history day computed exactly as a window, so a past day on
+        the page reads the same as "Yesterday" did on the day after."""
+        days = self.day_list()
+        hour_day = {}
+        for iso, a, b in days:
+            for h in range(int(a // 3600), int(math.ceil(b / 3600.0))):
+                hour_day[h] = iso
+        rew = defaultdict(lambda: defaultdict(float))
+        rest = defaultdict(lambda: defaultdict(float))
+        for src, dst in ((self.hourly, rew), (self.rest, rest)):
+            for t, hs in src.items():
+                for h, v in hs.items():
+                    k = hour_day.get(h)
+                    if k is not None:
+                        dst[k][t] += v
+        out = {}
+        for iso, a, b in days:
+            mk, (e0, e1, ok) = self.window_markets(a, b, sums=(rew.get(iso, {}), rest.get(iso, {})))
+            span = max(b - a, 1.0)
+            rows = {}
+            for t, v in mk.items():
+                if not (abs(v["rew"]) >= 0.0005 or abs(v["pnl"]) >= 0.0005 or v["fills"] or v["settled"]):
+                    continue
+                rows[t] = [round(v["rew"], 4), round(v["pnl"], 4), round(v["real"], 4),
+                           round(v["u1"] - v["u0"], 4), round(v["xfer"], 4), v["fills"],
+                           round(v["cts"], 1), round(v["usd"], 2), round(v["mk"], 3), v["mk_n"],
+                           round(v["mk_cts"], 1), round(v["rest_s"] / span, 2),
+                           (round(v["pos0"], 2) if "pos0" in v else None),
+                           (round(v["pos1"], 2) if "pos1" in v else None),
+                           v.get("mk0"), v.get("mk1"), v["settled"] or 0]
+            out[iso] = {"s": a, "e": b, "ok": bool(ok), "e0": e0, "e1": e1, "m": rows,
+                        "c": self.curve(a, b, DAY_CURVE_STEP) if ok else
+                        [[p[0], p[1], None] for p in self.curve_rewards_only(a, b, DAY_CURVE_STEP)]}
+        return out
+
+    def curve_rewards_only(self, w0: float, w1: float, step: float):
+        """[[ts, cum modeled rewards]] for a day the position log does not cover."""
+        rew_h = self.rew_by_hour()
+        pts, t = [], w0
+        h0 = int(w0 // 3600)
+        while True:
+            tt = min(t, w1)
+            h_end = int(tt // 3600)
+            r = sum(rew_h.get(h, 0.0) for h in range(h0, h_end))
+            pts.append([round(tt), round(r, 2)])
+            if tt >= w1:
+                break
+            t += step
+        return pts
 
     def _last_u_before(self, t: str, ts: float) -> float:
         best = None
@@ -1619,9 +1719,10 @@ class Builder:
                     ex = self.exits_in(u0[0], u1[0])
                     real += sum(e["amount"] for e in ex if e["realized"])
                     xf = sum(e["amount"] for e in ex if not e["realized"])
-                    row["pnl"] = round(real + xf + u1[1] - u0[1], 2)
+                    pnl = real + xf + u1[1] - u0[1]
+                    row["pnl"] = round(pnl, 2)
                     row["real"] = round(real, 2)
-                    row["net"] = round(row["rew"] + row["pnl"], 2)
+                    row["net"] = round(rew + pnl, 2)     # from the unrounded parts
             day_fills = [f for f in self.fills if a <= f["ts"] < b]
             row["fills"] = len(day_fills)
             row["cts"] = round(sum(f["n"] for f in day_fills), 1)
@@ -1677,6 +1778,10 @@ class Builder:
         # toxic + other halts
         halts = self._halts(selected, cur)
         market_union |= set(cur) | set(own_pos) | set(self.guard_holds) | set(halts["by_market"])
+        # every history day, drillable on the page
+        days = self.daily_markets()
+        for dd in days.values():
+            market_union |= set(dd["m"])
 
         # snapshot candidates (why not quoted)
         snap_by_t = {}
@@ -1720,9 +1825,9 @@ class Builder:
                 v = mk.get(t)
                 if not v:
                     continue
-                o = {"rew": round(v["rew"], 3), "pnl": round(v["pnl"], 3),
-                     "net": round(v["net"], 3), "real": round(v["real"], 3),
-                     "du": round(v["u1"] - v["u0"], 3)}
+                o = {"rew": round(v["rew"], 4), "pnl": round(v["pnl"], 4),
+                     "net": round(v["net"], 4), "real": round(v["real"], 4),
+                     "du": round(v["u1"] - v["u0"], 4)}
                 if v["fills"]:
                     o.update(fills=v["fills"], cts=round(v["cts"], 1), usd=round(v["usd"], 2),
                              buy=round(v["buy"], 1), sell=round(v["sell"], 1))
@@ -1735,6 +1840,8 @@ class Builder:
                     o["pos0"] = round(v.get("pos0", 0.0), 2)
                 if "mk1" in v:
                     o["mk1"] = v["mk1"]
+                if "pos1" in v:
+                    o["pos1"] = round(v["pos1"], 2)
                 if v["settled"]:
                     o["settled"] = v["settled"]
                 if abs(v["xfer"]) > 1e-6:
@@ -1767,10 +1874,11 @@ class Builder:
             step = 300.0 if span <= 26 * 3600 else 3600.0
             curves[key] = self.curve(w["start"], w["end"], step)
 
-        # recent fills (for the fills table), newest first
+        # fills for the fills table, newest first, as far back as the day history
+        fills_from = min([d["s"] for d in days.values()] + [self.windows["7d"]["start"]])
         fills_out = []
         for f in reversed(self.fills):
-            if f["ts"] < self.windows["7d"]["start"]:
+            if f["ts"] < fills_from:
                 break
             mo = self.markouts.get(f["id"])
             fr = {"ts": round(f["ts"]), "t": f["t"], "side": f["side"], "px": round(f["px"], 2),
@@ -1802,6 +1910,7 @@ class Builder:
             "decisions": self._decision_mix(),
             "markets": markets, "events": events, "paths": per_market_paths,
             "curves": curves, "history": hist, "ledger_max": ledger_max,
+            "days": days, "day_fields": list(DAY_FIELDS),
             "fills": fills_out, "halts": halts, "health": health, "opp": opp,
             "exits": [{"ts": round(e["ts"]), "t": e["t"], "pos": round(e["pos"], 2),
                        "avg": round(e["avg"], 2), "mark": round(e["mark"], 2),

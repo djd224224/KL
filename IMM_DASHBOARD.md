@@ -81,6 +81,23 @@ settlements.
 - **Market drawer:** position, live quote, reward share, per-window P&L split,
   7-day hourly P&L / mark / position, fills with mark-outs.
 
+## Any past day
+
+Every ET day the cycle history covers (30 days) can be opened as its own
+window, computed exactly as "Yesterday" is: rewards, trading P&L, net, the
+intraday curve (15-minute steps), drivers, movers (with start and end-of-day
+positions) and fills. Open a day by clicking it in the Daily history table or
+either history chart, from the day picker beside the window buttons, with the
+◀ ▶ buttons or the left/right arrow keys, or with a link such as
+`imm_dashboard.html#2026-09-28`. Quoting, inventory, halts, opportunities and
+health always show the book now; a banner says so. Days before the position
+log (2026-09-06) show rewards only. The ET-midnight position snapshots are
+kept for the whole history (`edges` in the marks cache), so a month-old day
+measures P&L between the same snapshots its history row uses.
+
+A build fixes "now" when it starts and ignores log rows written after it, so
+a slow build cannot pull a window's end edge back to an older snapshot.
+
 ## New launches and "promising"
 
 Events are grouped by series. A series that already had events before the
