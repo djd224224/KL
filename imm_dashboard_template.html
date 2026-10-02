@@ -38,6 +38,7 @@
   --shadow: 0 1px 2px rgba(11, 11, 11, 0.05);
   --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --hm-mid: #f0efec;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -67,6 +68,7 @@
     --chip-good: rgba(12, 163, 12, 0.16);
     --chip-info: rgba(57, 135, 229, 0.16);
     --shadow: none;
+    --hm-mid: #383835;
   }
 }
 :root[data-theme="dark"] {
@@ -96,6 +98,7 @@
   --chip-good: rgba(12, 163, 12, 0.16);
   --chip-info: rgba(57, 135, 229, 0.16);
   --shadow: none;
+  --hm-mid: #383835;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -283,6 +286,41 @@ table.t tr.tot td { font-weight: 600; border-top: 1px solid var(--axis); border-
 .empty { color: var(--muted); font-size: 13px; padding: 10px 2px; }
 .bar-inline { display: inline-block; height: 8px; border-radius: 2px; vertical-align: middle; }
 
+/* ---------- drivers ---------- */
+.drvcharts { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.drvtw table.t { min-width: 1240px; }
+.drvtw table.t th, .drvtw table.t td { padding: 5px 7px; }
+.drvtw table.t th:first-child, .drvtw table.t td:first-child {
+  position: sticky; left: 0; z-index: 1; background: var(--bg); min-width: 250px; max-width: 360px;
+}
+.drvtw table.t tbody tr:hover td:first-child { background: var(--hover); }
+.drvtw table.t tr.grp th { font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); text-align: center; border-bottom: 0; padding: 4px 4px 0; }
+.drvtw table.t tr.grp th span { display: block; border-bottom: 1px solid var(--axis); padding-bottom: 3px; }
+.drvtw table.t .gs { border-left: 1px solid var(--grid); }
+.drvtw table.t tr.tot td:first-child { background: var(--bg); }
+.why { font-size: 11.5px; line-height: 1.35; color: var(--ink-2); font-weight: 400; margin-top: 2px; white-space: normal; }
+.why .chg { border-bottom: 1px dotted var(--ink-2); cursor: help; }
+.sub2n { display: block; font-size: 11px; color: var(--muted); font-weight: 400; }
+.sig { display: inline-block; font-size: 10.5px; font-weight: 600; padding: 0 4px; border-radius: 4px; margin-left: 4px; line-height: 16px; vertical-align: 1px; color: var(--ink); }
+.sig.dn { background: var(--chip-crit); }
+.sig.upx { background: var(--chip-good); }
+svg.sparkc { display: block; margin-left: auto; overflow: visible; }
+td.shape { cursor: default; }
+.bridge-note { font-size: 12px; color: var(--ink-2); margin-top: 4px; }
+/* mark-out heatmap: diverging blue (made money) / red (lost) around a gray midpoint */
+table.hm { width: 100%; border-collapse: separate; border-spacing: 2px; font-size: 12.5px; }
+table.hm th { font-weight: 500; font-size: 12px; color: var(--ink-2); padding: 3px 6px; text-align: center; border-radius: 4px; white-space: nowrap; cursor: pointer; }
+table.hm th:first-child { text-align: left; cursor: default; }
+table.hm th.on { background: var(--ink); color: var(--bg); }
+table.hm td { padding: 4px 6px; text-align: center; border-radius: 4px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.hm td.hmn { text-align: left; color: var(--ink); background: transparent; max-width: 210px; overflow: hidden; text-overflow: ellipsis; }
+table.hm td.hmn .muted { font-size: 11px; }
+table.hm tr.all td { font-weight: 600; }
+table.hm td.c { cursor: pointer; }
+table.hm td.c:hover { box-shadow: inset 0 0 0 2px var(--ink-2); }
+.hmleg { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--ink-2); }
+.hmleg i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; }
+
 /* ---------- charts ---------- */
 svg.ch { display: block; width: 100%; overflow: visible; }
 svg.ch text { fill: var(--muted); font: 11px var(--sans); font-variant-numeric: tabular-nums; }
@@ -298,6 +336,7 @@ svg.ch .cross { stroke: var(--ink-2); stroke-width: 1; }
 .tip .tr { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .tip .tr b { font-variant-numeric: tabular-nums; font-weight: 600; }
 .tip .tr span { color: var(--ink-2); display: inline-flex; align-items: center; gap: 6px; }
+.tip .tb { font-size: 12px; margin-top: 3px; line-height: 1.35; }
 
 /* ---------- meters ---------- */
 .meter { display: flex; flex-direction: column; gap: 5px; }
@@ -372,16 +411,17 @@ footer { color: var(--muted); font-size: 12px; }
   <div class="attn" id="attn" aria-label="Needs attention"></div>
 
   <section id="drivers">
-    <div class="shead"><h2>What drove the window</h2><span class="note">Family, then event, then market. Click a row to open it; click a market for its detail.</span>
-      <div class="right"><div class="seg" id="drvSort" role="group" aria-label="Sort drivers"></div></div></div>
-    <div class="grid2" style="grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr);">
-      <div class="tw" id="drvTable"></div>
-      <div>
-        <div class="sub-h">Rewards against trading, by family<span class="note">bars from zero; the tick is net</span></div>
-        <div class="legend" id="famLegend"></div>
-        <div id="famChart"></div>
-      </div>
+    <div class="shead"><h2>What drove the window</h2><span class="note">Trading P&amp;L split into the window's own fills and the inventory carried in. Click a row to open it, a market for its detail, a header to sort.</span>
+      <div class="right">
+        <div class="seg" id="drvH" role="group" aria-label="Mark-out horizon"></div>
+        <div class="seg" id="drvRew" role="group" aria-label="Rewards basis"></div>
+      </div></div>
+    <div class="grid2 drvcharts">
+      <div class="card chartcard"><div class="cardhead"><h3 id="bridgeTitle">P&amp;L bridge</h3><div class="legend" id="bridgeLegend"></div></div><div id="bridge"></div><div class="bridge-note" id="bridgeNote"></div></div>
+      <div class="card chartcard"><div class="cardhead"><h3>Fill mark-outs by horizon, ¢ per contract</h3><div class="legend" id="hmLegend"></div></div><div id="moHeat"></div></div>
     </div>
+    <div class="tw drvtw" id="drvTable"></div>
+    <p class="explain" id="drvFoot"></p>
   </section>
 
   <section id="movers">
@@ -421,17 +461,15 @@ footer { color: var(--muted); font-size: 12px; }
       </div>
       <div style="display:flex;flex-direction:column;gap:14px">
         <div><div class="sub-h">Guards holding managed markets<span class="note">a held market rests no orders this cycle</span></div><div id="guardSummary" class="attn"></div><div class="tw" id="guardTable"></div></div>
-        <div><div class="sub-h">Inventory concentration<span class="note">open positions by event, marked to mid</span></div><div class="tw" id="invTable"></div></div>
+        <div><div class="sub-h">Inventory concentration<span class="note">open positions by event: what they can still lose, what they cost, where they are marked</span></div><div class="tw" id="invTable"></div></div>
       </div>
     </div>
   </section>
 
   <section id="fills">
-    <div class="shead"><h2>Fills &amp; adverse selection</h2><span class="note">Mark-out = the mid 30 minutes after the fill against the fill price, in dollars (negative = picked off). Pads and taker fills excluded.</span></div>
-    <div class="grid2" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);">
-      <div><div class="sub-h">By family</div><div class="tw" id="fillFam"></div></div>
-      <div><div class="sub-h">Fills in the window<span class="note">newest first</span></div><div class="tw" id="fillList"></div></div>
-    </div>
+    <div class="shead"><h2>Fills &amp; adverse selection</h2><span class="note">Mark-out = the market's mark at a horizon against the fill price, per contract on our side (negative = picked off). Edge = the fill price against the mid of the book the bot priced on. Maker fills only: pads and taker fills excluded.</span></div>
+    <div><div class="sub-h">By family<span class="note">¢ per contract; the edge at the fill decays into the later mark-outs</span></div><div class="tw" id="fillFam"></div></div>
+    <div><div class="sub-h">Fills in the window<span class="note">newest first</span></div><div class="tw" id="fillList"></div></div>
   </section>
 
   <section id="history">
@@ -456,7 +494,12 @@ footer { color: var(--muted); font-size: 12px; }
       <div><div class="sub-h">How the numbers are built</div>
         <p class="explain"><b>Modeled rewards</b> integrate the bot's own reward estimate (est_frac × pool $/day) over every gap between full cycles, capped at 15 minutes, from the cycle logs. It is a model and sits before Kalshi's $1-per-market-per-period floor; credits land 1–2 days after a period ends and show up in the history as <i>credited</i>.</p>
         <p class="explain"><b>Trading P&amp;L</b> is mark-to-market on the bot's own book: realized in the window (closing fills and settlements) plus the change in open positions valued at mid (the last trade when a book is empty), from the 5-minute position snapshots. Exits the bot does not book itself are valued at Kalshi's actual settlement: scalar settlements (sports ladders and escalators, which the bot logs as "manual offsets") and positions that leave its book with no record. Only an exit Kalshi has not settled counts as a transfer at its last mark. Audited 9/29 against a replay of Kalshi's own fills and settlement results: equal to the cent for 9/16, 9/22, 9/27, 9/28, 9/29 and the 7-day window.</p>
-        <p class="explain"><b>Net</b> is the two added together. Days are ET calendar days; the bot's own halt counter rolls at 5am CT and is shown under Risk.</p>
+        <p class="explain"><b>Net</b> is the two added together. Days are ET calendar days; the bot's own halt counter rolls at 5am CT and is shown under Risk. Kalshi fees are not deducted; the IMM digest's fee total runs $0–0.60 a day.</p>
+        <p class="explain"><b>P&amp;L explain</b> (Drivers). Trading P&amp;L splits exactly into three parts. <i>Carry: marks</i> is the position held at the window's start, re-marked from its start mark to its end mark (or to its last mark before it left the book). <i>Carry: settled</i> is that start position in a market Kalshi settled during the window, from its start mark to the settlement. <i>New fills</i> is the rest: the window's own fills, marked to the window's end or to the settlement.</p>
+        <p class="explain"><b>Mark-outs</b> cover maker fills only (no pads, no taker fills). They are per contract and signed for our side. <i>At fill</i> is the edge: the fill price against the mid of the external book the bot read the cycle before the fill (none on a book 50¢+ wide). <i>5m</i>, <i>30m</i> and <i>4h</i> use the first 5-minute position snapshot at least that long after the fill; a mark must land within 5 minutes for 5m and within 15 minutes otherwise, so a fill that closed the position has none. <i>To date</i> uses Kalshi's settlement, else the bot's mark while it holds the market, else the external mid it quotes against, else Kalshi's touch under the bot's mark rule. <i>Coverage</i> is rewards ÷ what the new fills lost: under 1× the pool does not pay for the flow.</p>
+        <p class="explain"><b>Exp. net/day</b> is a model: the rewards the bot's estimator gives the quotes resting now, plus the family's average trading P&amp;L per day over the last 7 days. <b>Typical day</b> is the family's mean net per complete ET day over the 7 and 30 days before the window. The σ mark flags a window 1.5+ standard deviations from that mean, pro-rated to the window's length.</p>
+        <p class="explain"><b>Worst case</b> is the loss from today's marks to settlement if everything goes against the book. It is netted inside an event: across its strikes when every market prices the same number (greater / less / between), and across names when Kalshi marks the event mutually exclusive. Mention words and anything whose structure has not been read count in full. Summed across events, it assumes every event goes wrong at once. On a past day it is the book at that day's close.</p>
+        <p class="explain"><b>Paid rate</b> is what Kalshi credited per dollar of modeled reward on settled events (imm_reward_recon's calibration). The <i>raw</i> basis covers the $1 per-market-per-period floor and the model error together. The older <i>floored</i> basis covers the model error only. Account credits include other bots quoting the same markets, which can push a family above 1×.</p>
       </div>
     </div>
     <details class="cfg"><summary>Launcher configuration ($ProbeEnv)</summary><pre id="cfg"></pre></details>
@@ -539,6 +582,7 @@ function css(name) { return getComputedStyle(document.documentElement).getProper
 const WKEYS = ["today", "yesterday", "24h", "7d"];
 const DAYS = Object.keys((D && D.days) || {}).sort();          // ET days, oldest first
 const DF = (D && D.day_fields) || [];
+const FXK = (D && D.fx_keys) || [];
 function isDay(k) { return typeof k === "string" && k.slice(0, 2) === "d:" && !!(D && D.days && D.days[k.slice(2)]); }
 let W = store("imm.win") || "today";
 (function () {                       // a bookmarked #2026-09-28 opens that day
@@ -547,7 +591,6 @@ let W = store("imm.win") || "today";
 })();
 if (WKEYS.indexOf(W) < 0 && !isDay(W)) W = "today";
 let Q = "";
-let drvSort = store("imm.drvSort") || "net";
 let newWin = store("imm.newWin") || "72";
 const openRows = new Set((() => { try { return JSON.parse(sessionStorage.getItem("imm.open") || "[]"); } catch (e) { return []; } })());
 function saveOpen() { try { sessionStorage.setItem("imm.open", JSON.stringify([...openRows])); } catch (e) { /* private mode */ } }
@@ -577,6 +620,7 @@ function dayRec(iso, t) {
       const v = row[i];
       if (v === null || v === undefined) return;
       if (k === "settled") { if (v) o.settled = v; return; }
+      if (k === "fx") { if (Array.isArray(v)) FXK.forEach((kk, j) => { o[kk] = v[j]; }); return; }
       o[k] = v;
     });
     o.net = num(o.rew) + num(o.pnl);
@@ -607,14 +651,24 @@ function stepDay(delta) {
 function winDays() { const w = win(); return Math.max((w.end - w.start) / 86400, 1 / 24); }
 
 /* ======================= aggregation ======================= */
-const SUM_KEYS = ["rew", "pnl", "net", "real", "du", "fills", "cts", "usd", "mk", "mk_n", "mk_cts", "rest"];
+const SUM_KEYS = ["rew", "pnl", "net", "real", "du", "fills", "cts", "usd", "mk", "mk_n", "mk_cts", "rest",
+  "cr", "cs", "fe", "fe_cts", "m5", "m5_cts", "m4", "m4_cts", "mt", "mt_cts"];
 function blank() {
   return { rew: 0, pnl: 0, net: 0, real: 0, du: 0, fills: 0, cts: 0, usd: 0, mk: 0, mk_n: 0, mk_cts: 0, rest: 0,
-    q2: 0, q1: 0, qev: 0, held: 0, sel: 0, restNow: 0, estNow: 0, poolNow: 0, u: 0, risk: 0, npos: 0, cred: 0, cred7: 0, n: 0 };
+    cr: 0, cs: 0, fe: 0, fe_cts: 0, m5: 0, m5_cts: 0, m4: 0, m4_cts: 0, mt: 0, mt_cts: 0,
+    q2: 0, q1: 0, qev: 0, held: 0, sel: 0, restNow: 0, estNow: 0, poolNow: 0, u: 0, risk: 0, npos: 0, cred: 0, cred7: 0, n: 0,
+    wc: 0, wcg: 0, nset: 0, pset: 0, nq: 0, pnl7: 0, flb: 0, flu: 0, fln: 0 };
 }
 function addM(acc, m) {
   const w = mw(m);
-  if (w) for (const k of SUM_KEYS) acc[k] += num(w[k]);
+  if (w) {
+    for (const k of SUM_KEYS) acc[k] += num(w[k]);
+    if (w.settled) { acc.nset++; acc.pset += num(w.pnl); }
+    if (num(w.rest) > 0) acc.nq++;
+  }
+  const w7 = m.w["7d"];
+  if (w7) acc.pnl7 += num(w7.pnl);
+  if (m.fl) { acc.flb += num(m.fl[0]); if (!m.fl[1]) { acc.flu += num(m.fl[0]); acc.fln++; } }
   const c = m.cur;
   if (c) {
     if (c.q === 2) acc.q2++; else if (c.q === 1) acc.q1++;
@@ -629,6 +683,10 @@ let AGG = null;
 function aggregate() {
   const fams = {}, tot = blank();
   const evSeen = {};
+  // the worst case comes from the book at the window's close on a past day,
+  // from the book now otherwise (per event: it is netted inside an event)
+  const iso = eodIso();
+  const wcSrc = iso ? ((D.days[iso] || {}).wc || {}) : null;
   for (const t in D.markets) {
     const m = D.markets[t];
     const f = fams[m.fam] || (fams[m.fam] = Object.assign(blank(), { name: m.fam, events: {} }));
@@ -640,6 +698,11 @@ function aggregate() {
       const ev = D.events[m.ev] || {};
       e.cred = num(ev.cred); e.cred7 = num(ev.cred7);
       f.cred7 += num(ev.cred7); tot.cred7 += num(ev.cred7);
+      const wc = wcSrc ? wcSrc[m.ev] : ev.wc;
+      if (wc) {
+        e.wc = num(wc[0]); e.wcg = num(wc[1]); e.wch = wc[2];
+        f.wc += e.wc; f.wcg += e.wcg; tot.wc += e.wc; tot.wcg += e.wcg;
+      }
     }
   }
   // events quoting now: at least one market resting a quote
@@ -678,6 +741,12 @@ function showTip(ev, head, rows) {
   tip.textContent = "";
   if (head) { const h = document.createElement("div"); h.className = "th"; h.textContent = head; tip.appendChild(h); }
   for (const r of rows) {
+    if (r.block != null) {         // a free text line (a change, a note)
+      const d = document.createElement("div"); d.className = "tb"; d.textContent = r.block;
+      if (r.muted) d.style.color = "var(--ink-2)";
+      tip.appendChild(d);
+      continue;
+    }
     const d = document.createElement("div"); d.className = "tr";
     const s = document.createElement("span");
     if (r.color) { const k = document.createElement("i"); k.className = r.line ? "keyline" : "key"; k.style.background = r.color; s.appendChild(k); }
@@ -930,7 +999,7 @@ function renderHeader() {
     const w = win();
     bn.hidden = false;
     bn.innerHTML = "<span><b>" + esc(w.label) + "</b> \u00b7 " + esc(w.desc.replace(/ [A-Z][a-z]{2}, .*$/, "")) +
-      ". Rewards, trading, drivers, movers and fills are that day's; quoting, inventory, halts, opportunities and health show the book now." +
+      ". Rewards, trading, drivers, movers and fills are that day's, and the drivers' book columns show the book at that day's close; quoting, inventory, halts, opportunities and health show the book now." +
       (w.pnl_na ? " Trading P&amp;L is not available for this day: the position log starts later." : "") + "</span>" +
       '<button type="button" id="bnToday">Back to today</button>';
     $("bnToday").addEventListener("click", () => setWin("today"));
@@ -967,16 +1036,18 @@ function renderSummary() {
   // tiles
   const days = winDays();
   const yieldC = a.rest > 0 ? rew / a.rest / days * 100 : null;
-  const mkc = a.mk_cts > 0 ? a.mk / a.mk_cts * 100 : null;
   const halts = D.halts;
   const nSide = halts.side.length, nEv = halts.event.length, nRiskG = halts.guards.filter((g) => g.risk).length;
+  const cpc = (v, n) => n > 0 ? (v / n * 100 >= 0 ? "+" : "") + fmtC(v / n * 100) : "—";
+  let bookWC = 0;
+  for (const ev in D.events) if (D.events[ev].wc) bookWC += num(D.events[ev].wc[0]);
   const tiles = [
     { lbl: "Fills", val: fmtNum(a.fills), sub: fmtNum(a.cts) + " contracts · " + fmtUSD(a.usd) + " traded",
-      sub2: a.mk_n ? "30m mark-out " + money(a.mk) + " (" + (mkc >= 0 ? "+" : MINUS) + Math.abs(mkc).toFixed(1) + "¢/ct on " + fmtNum(a.mk_n) + " fills)" : "mark-outs pending" },
+      sub2: a.mk_n ? "30m mark-out " + money(a.mk) + " · per contract: edge " + cpc(a.fe, a.fe_cts) + ", 30m " + cpc(a.mk, a.mk_cts) + ", to date " + cpc(a.mt, a.mt_cts) : "mark-outs pending" },
     { lbl: "Quoting now", val: fmtNum(a.q2 + a.q1) + ' mkts <span class="vs">in ' + fmtNum(a.qev) + (a.qev === 1 ? " event" : " events") + "</span>", sub: fmtNum(a.q2) + " two-sided · " + fmtNum(a.q1) + " one-sided · " + fmtNum(a.held) + " held",
       sub2: fmtUSD(a.restNow) + " resting · yield " + (yieldC != null ? yieldC.toFixed(1) + "¢ per $1 per day" : "—") },
     { lbl: "Open inventory", val: fmtUSD(a.u, { sign: true }), valCls: cls(a.u, 0.5), sub: fmtNum(a.npos) + " positions · " + fmtUSD(a.risk) + " at cost",
-      sub2: "unrealized at mid (last trade on an empty book), bot's own book" },
+      sub2: "worst case to settlement " + money(bookWC) + " (netted per event) · unrealized at mid, bot's own book" },
     { lbl: "Halts & guards", val: (nSide + nEv + halts.depth.length) + (nSide + nEv + halts.depth.length === 1 ? " halt" : " halts"), sub: nSide + " toxic side · " + nEv + " toxic event · " + halts.depth.length + " mention-gate",
       sub2: halts.guards.length + " markets guard-held (" + nRiskG + " risk guards)" },
   ];
@@ -1048,130 +1119,541 @@ function renderAttention() {
 function badge(id, n, kind) { const b = $(id); b.hidden = !n; b.textContent = n; b.className = "badge " + (kind || ""); }
 
 /* ======================= drivers ======================= */
-const DRV_SORTS = { net: "Worst net", pnl: "Worst trading", rew: "Top rewards", abs: "Biggest moves" };
+// mark-out horizons [key, label, contracts key]: "fe" is the edge at the fill
+const HZ = [["fe", "At fill", "fe_cts"], ["m5", "5m", "m5_cts"], ["mk", "30m", "mk_cts"], ["m4", "4h", "m4_cts"], ["mt", "To date", "mt_cts"]];
+const HZL = {}, HZC = {};
+HZ.forEach((h) => { HZL[h[0]] = h[1]; HZC[h[0]] = h[2]; });
+let drvH = HZL[store("imm.drvH")] ? store("imm.drvH") : "mk";
+let rewBasis = store("imm.rewBasis") === "paid" ? "paid" : "model";
+let drvSort = (() => { try { const s = JSON.parse(store("imm.drvSort2") || "null"); return s && s.k ? s : null; } catch (e) { return null; } })() || { k: "net", dir: 1 };
+let DRV_LAST = { fams: [], tot: null };
+const WCH = { strikes: "netted across the event's strikes", exclusive: "netted: one name wins (Kalshi: mutually exclusive)",
+  independent: "independent markets, not netted", unknown: "structure not read yet, not netted", mixed: "partly netted", flat: "" };
+
+/* what a dollar of modeled reward has paid, from imm_reward_recon's settled events */
+function paidFactor(fam) {
+  const R = D.realize || {}, f = (R.fams || {})[fam], a = R.all || [0, 0, 0];
+  const ok = (v) => v && v[1] >= 10 && v[2] >= 5;
+  if (ok(f)) return { k: f[0] / f[1], src: fam, n: f[2], c: f[0], e: f[1] };
+  if (ok(a)) return { k: a[0] / a[1], src: "the whole book", n: a[2], c: a[0], e: a[1] };
+  return { k: 1, src: "", n: 0 };
+}
+function rewAdj(fam, v) { return rewBasis === "paid" ? num(v) * paidFactor(fam).k : num(v); }
+/* the ET day whose close the book columns show (a past day, or yesterday), else null = the book now */
+function eodIso() {
+  if (isDay(W)) return W.slice(2);
+  if (W === "yesterday" && D.windows && D.windows.yesterday) {
+    const s = D.windows.yesterday.start;
+    return DAYS.find((d) => Math.abs(D.days[d].s - s) < 2) || null;
+  }
+  return null;
+}
+function marketWorst(pos, mark) {
+  if (mark == null || !pos) return 0;
+  return pos > 0 ? -pos * mark / 100 : pos * (100 - mark) / 100;
+}
+function days7() { const w = (D.windows || {})["7d"]; return w ? Math.max((w.end - w.start) / 86400, 1) : 7; }
+function derive(x, fam) {
+  x.rewA = rewAdj(fam, x.rew);
+  x.nf = x.pnl - x.cr - x.cs;
+  x.netA = x.rewA + x.pnl;
+  x.cov = x.nf < -0.005 ? x.rewA / -x.nf : null;
+  x.estA = rewAdj(fam, x.estNow);
+  x.exp = x.estA + x.pnl7 / days7();
+  return x;
+}
+
+/* per-family net per complete ET day: the "typical day" baselines */
+let FAMDAY = null;
+function famDaily() {
+  if (FAMDAY) return FAMDAY;
+  FAMDAY = {};
+  const iR = DF.indexOf("rew"), iP = DF.indexOf("pnl");
+  for (const iso of DAYS) {
+    const d = D.days[iso], o = { ok: !!d.ok, s: d.s, e: d.e, f: {} };
+    for (const t in d.m) {
+      const m = D.markets[t];
+      if (!m) continue;
+      const a = o.f[m.fam] || (o.f[m.fam] = [0, 0]);
+      a[0] += num(d.m[t][iR]); a[1] += num(d.m[t][iP]);
+    }
+    FAMDAY[iso] = o;
+  }
+  return FAMDAY;
+}
+/* mean / sd of a family's (null = the whole book's) daily net over the up-to-30
+   complete days with P&L that ended before the window started */
+function baseline(fam, w) {
+  const B = famDaily(), vals = [];
+  for (let i = DAYS.length - 1; i >= 0 && vals.length < 30; i--) {
+    const b = B[DAYS[i]];
+    if (!b.ok || b.e > w.start + 1 || b.e - b.s < 22 * 3600) continue;
+    let v = 0;
+    for (const f in b.f) if (fam == null || f === fam) v += rewAdj(f, b.f[f][0]) + b.f[f][1];
+    vals.push(v);
+  }
+  if (vals.length < 3) return null;
+  const mean = (arr) => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const m30 = mean(vals), m7 = mean(vals.slice(0, 7));
+  const sd = Math.sqrt(vals.reduce((s, v) => s + (v - m30) * (v - m30), 0) / (vals.length - 1));
+  return { m7, m30, sd, n: vals.length, n7: Math.min(7, vals.length) };
+}
+/* how unusual the window's net is against that baseline, pro-rated to its length */
+function zOf(x) {
+  const t = x.typ;
+  if (!t || t.n < 5 || !(t.sd > 0)) return null;
+  const days = winDays();
+  return (x.netA - t.m30 * days) / (t.sd * Math.sqrt(days));
+}
+
+/* a family's (null = the book's) cumulative rewards / trading through the window, hourly */
+function famCurve(fam) {
+  const src = isDay(W) ? (D.days[W.slice(2)] || {}).fc : (D.fcurves || {})[W];
+  if (!src || !src.f) return null;
+  if (fam != null) {
+    const f = src.f[fam];
+    return f ? { x: src.x, r: f.r, p: f.p, fam } : null;
+  }
+  const r = src.x.map(() => 0), p = src.x.map(() => 0);
+  for (const k in src.f) src.f[k].r.forEach((v, i) => { r[i] += rewAdj(k, v); p[i] += src.f[k].p[i]; });
+  return { x: src.x, r, p, fam: null, adjusted: true };
+}
+/* jump (one hour holds half the trading move) or steady drift */
+function shapeOf(c) {
+  if (!c || c.p.length < 3) return null;
+  const net = c.p.map((p, i) => (c.adjusted ? c.r[i] : rewAdj(c.fam, c.r[i])) + p);
+  let tot = 0, big = null;
+  for (let i = 1; i < c.p.length; i++) {
+    const d = c.p[i] - c.p[i - 1];
+    tot += Math.abs(d);
+    if (!big || Math.abs(d) > Math.abs(big.d)) big = { d, a: c.x[i - 1], b: c.x[i] };
+  }
+  let kind = "";
+  if (big && tot > 0 && Math.abs(big.d) >= 15 && Math.abs(big.d) / tot >= 0.5) kind = "jump";
+  else if (tot >= 20 && big && Math.abs(big.d) / tot < 0.3) kind = c.p[c.p.length - 1] < 0 ? "steady bleed" : "steady gain";
+  return { net, big, tot, kind };
+}
+function sparkCell(x) {
+  const s = x.shape, c = x.curve;
+  if (!s) return "";
+  const vals = s.net, n = vals.length, W0 = 96, H = 24;
+  let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
+  if (hi === lo) hi = lo + 1;
+  const X = (i) => 1 + (W0 - 6) * i / (n - 1), Y = (v) => 3 + (H - 6) * (1 - (v - lo) / (hi - lo));
+  let d = "";
+  vals.forEach((v, i) => { d += (i ? "L" : "M") + X(i).toFixed(1) + " " + Y(v).toFixed(1); });
+  const x0 = c.x[0], x1 = c.x[n - 1];
+  const marks = (x.chg || []).map((ch) => {
+    const px = 1 + (W0 - 6) * (ch.ts - x0) / Math.max(1, x1 - x0);
+    return '<line x1="' + px.toFixed(1) + '" x2="' + px.toFixed(1) + '" y1="' + (H - 6) + '" y2="' + H + '" stroke="' + css("--ink-2") + '" stroke-width="1.5"/>';
+  }).join("");
+  const col = css("--s-net");
+  return '<svg class="sparkc" viewBox="0 0 ' + W0 + " " + H + '" width="' + W0 + '" height="' + H + '" aria-hidden="true">' +
+    '<line x1="0" x2="' + W0 + '" y1="' + Y(0).toFixed(1) + '" y2="' + Y(0).toFixed(1) + '" stroke="' + css("--axis") + '" stroke-width="1"/>' + marks +
+    '<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>' +
+    '<circle cx="' + X(n - 1).toFixed(1) + '" cy="' + Y(vals[n - 1]).toFixed(1) + '" r="2.4" fill="' + col + '"/></svg>';
+}
+
+/* toxic-flow halts and pick-offs per family (the sink keeps yesterday and today) */
+function haltsByFam(w) {
+  const out = {}, sink = (D.halts || {}).sink || [];
+  for (const r of sink) {
+    if (r.ts < w.start || r.ts > w.end + 1) continue;
+    const m = r.ticker ? D.markets[r.ticker] : null;
+    const fam = m ? m.fam : (r.event && D.events[r.event] ? D.events[r.event].fam : null);
+    if (!fam) continue;
+    const a = out[fam] || (out[fam] = { halts: 0, picks: 0 });
+    if (r.kind === "pickoff") a.picks++;
+    else if (r.kind === "side_halt" || r.kind === "event_halt") a.halts++;
+  }
+  return out;
+}
+function sinkCovers(w) { return !!(D.windows && D.windows.yesterday) && w.start >= D.windows.yesterday.start - 1; }
+function changesIn(w, fam) {
+  return (D.changes || []).filter((c) => c.ts >= w.start && c.ts <= w.end + 1 && (fam === undefined || (c.fams || []).indexOf(fam) >= 0));
+}
+function changeTipRows(chs) {
+  const rows = [];
+  chs.slice(-8).forEach((c) => {
+    const what = c.sha && c.sha !== c.prev ? "deploy " + c.sha : "config";
+    rows.push({ name: dtET(c.ts), value: what });
+    (c.subj || []).slice(0, 3).forEach((s) => rows.push({ block: s.replace(/^\w+ /, "· "), muted: true }));
+    const ks = (c.keys || []).map((k) => k + (c.vals && c.vals[k] ? " " + c.vals[k][0] + " → " + c.vals[k][1] : "")).slice(0, 4);
+    if (ks.length) rows.push({ block: "· " + ks.join("; ") + (c.nkeys > 4 ? " (+" + (c.nkeys - 4) + " more)" : ""), muted: true });
+  });
+  if (chs.length > 8) rows.unshift({ block: chs.length + " changes; the last 8:", muted: true });
+  return rows;
+}
+/* the market with the largest net per family and per event */
+function topMarkets() {
+  const fam = {}, ev = {};
+  for (const t in D.markets) {
+    const m = D.markets[t], w = mw(m);
+    if (!w || (w.rew == null && w.pnl == null)) continue;
+    const v = rewAdj(m.fam, w.rew) + num(w.pnl);
+    if (Math.abs(v) < 0.005) continue;
+    if (!fam[m.fam] || Math.abs(v) > Math.abs(fam[m.fam].v)) fam[m.fam] = { t, v, ev: m.ev };
+    if (!ev[m.ev] || Math.abs(v) > Math.abs(ev[m.ev].v)) ev[m.ev] = { t, v };
+  }
+  return { fam, ev };
+}
+function shortT(t, ev) {
+  if (ev && t.indexOf(ev + "-") === 0) return t.slice(ev.length + 1);
+  return t.length > 30 ? t.slice(0, 15) + "…" + t.slice(-12) : t;
+}
+
+function sigChip(x) {
+  if (x.z == null || Math.abs(x.z) < 1.5) return "";
+  const t = x.typ;
+  const title = (x.z < 0 ? "below" : "above") + " a typical day by " + Math.abs(x.z).toFixed(1) + " standard deviations: mean " +
+    fmtUSD(t.m30, { sign: true }) + "/day, sd " + fmtUSD(t.sd) + " over " + t.n + " complete days, pro-rated to this window";
+  return '<span class="sig ' + (x.z < 0 ? "dn" : "upx") + '" title="' + esc(title) + '">' + (x.z < 0 ? "▼" : "▲") + Math.abs(x.z).toFixed(1) + "σ</span>";
+}
+function covCell(x) {
+  if (x.cov == null) return x.fills && x.nf >= 0.005 ? '<span class="muted" title="the new fills made money">fills +</span>' : '<span class="muted">—</span>';
+  const s = x.cov >= 10 ? "≥10×" : x.cov.toFixed(1) + "×";
+  return x.cov < 1 ? '<span class="tag crit">' + s + "</span>" : x.cov < 2 ? '<span class="tag warn">' + s + "</span>" : s;
+}
+function wcCell(x) {
+  if (!x.wc || Math.abs(x.wc) < 0.005) return '<span class="muted">—</span>';
+  const t = "gross " + fmtUSD(x.wcg || x.wc, { sign: true }) + (x.wch ? " · " + (WCH[x.wch] || x.wch) : "");
+  return '<span title="' + esc(t) + '">' + money(x.wc) + "</span>";
+}
+function quotingCell(x) {
+  if (x._q != null) return x._q;
+  const n = x.q2 + x.q1;
+  if (n) return fmtNum(n) + (x.held ? ' <span class="muted">+' + x.held + " held</span>" : "");
+  return x.held ? '<span class="muted">' + x.held + " held</span>" : '<span class="muted">0</span>';
+}
+
+function drvCols(eod, na) {
+  const h = drvH, hc = HZC[h], paid = rewBasis === "paid";
+  const dash = '<span class="muted">—</span>';
+  const pnl = (v) => na ? '<span class="muted">n/a</span>' : money(v);
+  const cols = [
+    { k: "rew", g: 1, label: paid ? "Rewards*" : "Rewards", dir: -1,
+      title: paid ? "modeled rewards × the family's paid rate (credited ÷ modeled on its settled events)" : "modeled rewards: the bot's estimator, before Kalshi's $1-per-market-per-period floor",
+      v: (x) => x.rewA, fmt: (x) => fmtUSD(x.rewA) },
+    { k: "nf", g: 1, label: "New fills", dir: 1, title: "the window's own fills, marked to its end (or to the settlement)",
+      v: (x) => na ? null : x.nf, fmt: (x) => pnl(x.nf) },
+    { k: "cr", g: 1, label: "Carry: marks", dir: 1, title: "the position held at the window's start, re-marked to the end (or to its last mark before it left the book)",
+      v: (x) => na ? null : x.cr, fmt: (x) => na ? pnl(0) : (Math.abs(x.cr) >= 0.005 ? money(x.cr) : dash) },
+    { k: "cs", g: 1, label: "Carry: settled", dir: 1, title: "that start position in markets Kalshi settled in the window, from the start mark to the settlement",
+      v: (x) => na ? null : x.cs, fmt: (x) => na ? pnl(0) : (Math.abs(x.cs) >= 0.005 ? money(x.cs) : dash) },
+    { k: "net", g: 1, label: paid ? "Net*" : "Net", dir: 1, title: "rewards + new fills + carry",
+      v: (x) => na ? null : x.netA, fmt: (x) => na ? pnl(0) : "<b>" + money(x.netA) + "</b>" + sigChip(x) },
+    { k: "fills", g: 2, sep: 1, label: "Fills", dir: -1, title: "every fill in the window, pads and taker fills included (the mark-outs and the Fills section use maker fills only)",
+      v: (x) => x.fills, fmt: (x) => x.fills ? fmtNum(x.fills) : '<span class="muted">0</span>' },
+    { k: "mo", g: 2, label: "Mark-out " + HZL[h], dir: 1,
+      title: h === "fe" ? "edge at the fill: the fill price against the mid of the book the bot priced on, $ (¢ per contract below)" : "maker fills marked " + HZL[h] + (h === "mt" ? " (now, or the settlement)" : " after the fill") + ", $ (¢ per contract below); pick another horizon above",
+      v: (x) => x[hc] > 0 ? x[h] : null, fmt: (x) => x[hc] > 0 ? money(x[h]) + '<span class="sub2n">' + fmtC(x[h] / x[hc] * 100) + "/ct</span>" : dash },
+    { k: "cov", g: 2, label: "Coverage", dir: 1, title: "rewards ÷ what the new fills lost: under 1× the pool does not pay for the flow",
+      v: (x) => x.cov, fmt: covCell },
+    { k: "typ", g: 3, sep: 1, label: "Typical day", dir: 1, title: "mean net per complete ET day before the window: last 7 days (30 below)",
+      v: (x) => x.typ ? x.typ.m7 : null, fmt: (x) => x.typ ? fmtUSD(x.typ.m7, { sign: true }) + '<span class="sub2n">30d ' + fmtUSD(x.typ.m30, { sign: true }) + "</span>" : "" },
+    { k: "shape", g: 3, label: "Shape", nosort: 1, cls: "shape", title: "cumulative net through the window, hourly; ticks = code or config changes that name the family",
+      fmt: (x) => x.shape ? sparkCell(x) : "" },
+  ];
+  if (eod) cols.push(
+    { k: "nq", g: 4, sep: 1, label: "Quoted", dir: -1, title: "markets that rested quotes at some point that day",
+      v: (x) => x.nq, fmt: (x) => x.nq ? fmtNum(x.nq) : '<span class="muted">0</span>' },
+    { k: "rest", g: 4, label: "Resting $", dir: -1, title: "average resting quote dollars over the day",
+      v: (x) => x.rest, fmt: (x) => x.rest > 0.005 ? fmtUSD(x.rest) : dash },
+    { k: "wc", g: 4, label: "Worst case", dir: 1, title: "loss to settlement from that day's closing marks if everything goes against the book, netted inside each event",
+      v: (x) => x.wc ? x.wc : null, fmt: wcCell });
+  else cols.push(
+    { k: "q", g: 4, sep: 1, label: "Quoting", dir: -1, title: "markets resting quotes now (+ held: selected but stood down by a guard or halt)",
+      v: (x) => x.q1 + x.q2, fmt: quotingCell },
+    { k: "est", g: 4, label: paid ? "Est $/day*" : "Est $/day", dir: -1, title: "rewards the bot's estimator gives the quotes resting now, per day" + (paid ? ", at the paid rate" : ""),
+      v: (x) => x.estNow ? x.estA : null, fmt: (x) => x.estNow ? fmtUSD(x.estA) : dash },
+    { k: "exp", g: 4, label: "Exp. net/day", dir: 1, title: "a model: est $/day now + the average trading P&L per day over the last 7 days",
+      v: (x) => (x.estNow || x.pnl7) ? x.exp : null, fmt: (x) => (x.estNow || x.pnl7) ? money(x.exp) : dash },
+    { k: "wc", g: 4, label: "Worst case", dir: 1, title: "loss to settlement from today's marks if everything goes against the book, netted inside each event",
+      v: (x) => x.wc ? x.wc : null, fmt: wcCell });
+  return cols;
+}
+
+function whyFam(f, top, hb, w, eod) {
+  const bits = [];
+  if (f.nset) bits.push('<span title="markets Kalshi settled in the window, and their whole trading P&amp;L in it (carry and new fills)">' + f.nset + " settled, P&amp;L " + fmtUSD(f.pset, { sign: true }) + "</span>");
+  const tp = top.fam[f.name];
+  if (tp && Math.abs(tp.v) >= 1) bits.push('top <span class="mono">' + esc(shortT(tp.t)) + "</span> " + fmtUSD(tp.v, { sign: true }));
+  const s = f.shape;
+  if (s && s.kind === "jump") bits.push("jump " + tET(s.big.a) + "–" + tET(s.big.b) + " " + fmtUSD(s.big.d, { sign: true }));
+  else if (s && s.kind) bits.push(s.kind);
+  const hh = hb && hb[f.name];
+  if (hh && (hh.halts || hh.picks)) bits.push((hh.halts ? hh.halts + " halt" + (hh.halts > 1 ? "s" : "") : "") + (hh.halts && hh.picks ? ", " : "") + (hh.picks ? hh.picks + " pick-off" + (hh.picks > 1 ? "s" : "") : ""));
+  if (!eod && f.held) bits.push(f.held + " held by guards");
+  if (!eod && f.flu >= 0.5) bits.push(fmtUSD(f.flu) + " in " + f.fln + " mkt" + (f.fln > 1 ? "s" : "") + " under the $1 floor");
+  if (f.chg && f.chg.length) bits.push('<span class="chg" data-chg="' + esc(f.name) + '">' + f.chg.length + " change" + (f.chg.length > 1 ? "s" : "") + "</span>");
+  return bits.join(" · ");
+}
+function whyEv(e, top) {
+  const bits = [];
+  if (e.cred) bits.push("credited " + fmtUSD(e.cred));
+  if (e.nset) bits.push(e.nset + " settled, P&amp;L " + fmtUSD(e.pset, { sign: true }));
+  const tp = top.ev[e.name];
+  if (tp && Math.abs(tp.v) >= 1 && e.mkts.length > 1) bits.push('top <span class="mono">' + esc(shortT(tp.t, e.name)) + "</span> " + fmtUSD(tp.v, { sign: true }));
+  return bits.join(" · ");
+}
+
 function renderDrivers() {
-  const seg = $("drvSort");
-  seg.innerHTML = Object.keys(DRV_SORTS).map((k) => '<button type="button" data-s="' + k + '" aria-pressed="' + (k === drvSort) + '">' + DRV_SORTS[k] + "</button>").join("");
-  seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { drvSort = b.dataset.s; store("imm.drvSort", drvSort); renderDrivers(); }));
-  const na = win().pnl_na, days = winDays();
-  const fams = Object.values(AGG.fams).filter((f) => f.rew || f.pnl || f.fills || f.q1 || f.q2 || f.npos || f.sel);
-  const sorter = (a, b) => drvSort === "abs" ? Math.abs(b.pnl) - Math.abs(a.pnl) : drvSort === "net" ? (a.rew + a.pnl) - (b.rew + b.pnl) : (drvSort === "rew" ? b.rew - a.rew : a.pnl - b.pnl);
+  const w = win(), na = w.pnl_na, eod = !!eodIso();
+  // controls
+  const hseg = $("drvH");
+  hseg.innerHTML = HZ.map((h) => '<button type="button" data-h="' + h[0] + '" aria-pressed="' + (h[0] === drvH) + '" title="mark-out horizon">' + h[1] + "</button>").join("");
+  hseg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { drvH = b.dataset.h; store("imm.drvH", drvH); renderDrivers(); }));
+  const rseg = $("drvRew");
+  rseg.innerHTML = [["model", "Modeled rewards"], ["paid", "At paid rate"]].map((r) => '<button type="button" data-r="' + r[0] + '" aria-pressed="' + (r[0] === rewBasis) + '">' + r[1] + "</button>").join("");
+  rseg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { rewBasis = b.dataset.r; store("imm.rewBasis", rewBasis); renderDrivers(); }));
+
+  const top = topMarkets();
+  const hb = sinkCovers(w) ? haltsByFam(w) : null;
+  const fams = Object.values(AGG.fams).filter((f) => f.rew || f.pnl || f.fills || f.q1 || f.q2 || f.npos || f.sel || f.wc);
+  for (const f of fams) {
+    derive(f, f.name);
+    f.typ = baseline(f.name, w);
+    f.z = zOf(f);
+    f.curve = famCurve(f.name);
+    f.shape = shapeOf(f.curve);
+    f.chg = f.curve ? changesIn(w, f.name) : [];
+  }
+  const cols = drvCols(eod, na);
+  const col = cols.find((c) => c.k === drvSort.k && !c.nosort) || cols.find((c) => c.k === "net");
+  const sorter = (a, b) => {
+    const va = col.v(a), vb = col.v(b);
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return (va - vb) * (drvSort.k === col.k ? drvSort.dir : col.dir);
+  };
   fams.sort(sorter);
-  const cols = ["Family / event / market", "Rewards", "Trading", "Net", "Fills", "Mark-out", "Quoting now", "Resting $ now", "Est $/day now", "Open MTM now"];
-  let h = '<table class="t"><thead><tr>' + cols.map((c, i) => "<th" + (i ? ' class="num"' : "") + ">" + c + "</th>").join("") + "</tr></thead><tbody>";
-  const row = (lvl, key, label, x, extra) => {
-    const net = x.rew + x.pnl;
+  const ncol = cols.length + 1;
+  // header: groups, then sortable columns
+  const groups = [[1, esc(w.label)], [2, "Flow"], [3, "vs typical"], [4, eod ? "Book at the close" : "Book now"]];
+  let h = '<table class="t drv"><thead><tr class="grp"><th></th>';
+  for (const [g, lab] of groups) h += '<th colspan="' + cols.filter((c) => c.g === g).length + '" class="' + (g > 1 ? "gs" : "") + '"><span>' + lab + "</span></th>";
+  h += "</tr><tr><th>Family / event / market</th>";
+  for (const c of cols) {
+    const on = !c.nosort && drvSort.k === c.k;
+    h += '<th class="num' + (c.nosort ? "" : " sort") + (c.sep ? " gs" : "") + '"' + (c.nosort ? "" : ' data-sk="' + c.k + '"') + (c.title ? ' title="' + esc(c.title) + '"' : "") + ">" + c.label +
+      (on ? '<span class="arr">' + (drvSort.dir > 0 ? "▲" : "▼") + "</span>" : "") + "</th>";
+  }
+  h += "</tr></thead><tbody>";
+  const row = (lvl, key, label, why, x) => {
     const open = openRows.has(key);
     const caret = lvl < 2 ? '<span class="car' + (open ? " open" : "") + '">▶</span>' : "";
-    return '<tr class="l' + lvl + ' click" data-key="' + esc(key) + '" data-lvl="' + lvl + '">' +
-      "<td>" + caret + label + "</td>" +
-      '<td class="num">' + fmtUSD(x.rew) + "</td>" +
-      '<td class="num">' + (na ? "n/a" : money(x.pnl)) + "</td>" +
-      '<td class="num"><b>' + (na ? "n/a" : money(net)) + "</b></td>" +
-      '<td class="num">' + (x.fills ? fmtNum(x.fills) : '<span class="muted">0</span>') + "</td>" +
-      '<td class="num">' + (x.mk_n ? money(x.mk) : '<span class="muted">—</span>') + "</td>" +
-      '<td class="num">' + (extra && extra.quoting != null ? extra.quoting : (x.q2 + x.q1 ? fmtNum(x.q2 + x.q1) + (x.held ? ' <span class="muted">+' + x.held + " held</span>" : "") : (x.held ? '<span class="muted">' + x.held + " held</span>" : '<span class="muted">0</span>'))) + "</td>" +
-      '<td class="num">' + (x.restNow ? fmtUSD(x.restNow) : '<span class="muted">—</span>') + "</td>" +
-      '<td class="num">' + (x.estNow ? fmtUSD(x.estNow) : '<span class="muted">—</span>') + "</td>" +
-      '<td class="num">' + (x.npos ? money(x.u) : '<span class="muted">—</span>') + "</td></tr>";
+    let r = '<tr class="l' + lvl + ' click" data-key="' + esc(key) + '" data-lvl="' + lvl + '"><td>' + caret + label + (why ? '<div class="why">' + why + "</div>" : "") + "</td>";
+    for (const c of cols) r += '<td class="num' + (c.sep ? " gs" : "") + (c.cls ? " " + c.cls : "") + '"' + (c.k === "shape" && x.shape ? ' data-fam="' + esc(x.name || "") + '"' : "") + ">" + c.fmt(x) + "</td>";
+    return r + "</tr>";
   };
-  let any = false;
+  const shown = [];
   for (const f of fams) {
     const fKey = "f:" + f.name;
-    const evs = Object.values(f.events).filter((e) => e.rew || e.pnl || e.fills || e.q1 || e.q2 || e.npos || e.sel);
+    const evs = Object.values(f.events).filter((e) => e.rew || e.pnl || e.fills || e.q1 || e.q2 || e.npos || e.sel || e.wc);
     const famMatch = matchQ(f.name);
     const evMatch = evs.filter((e) => famMatch || matchQ(e.name, e.grp) || e.mkts.some((t) => matchQ(t)));
     if (Q && !evMatch.length) continue;
-    any = true;
-    h += row(0, fKey, esc(f.name) + ' <span class="muted small">' + evs.length + " events</span>", f);
+    shown.push(f);
+    h += row(0, fKey, esc(f.name) + ' <span class="muted small">' + evs.length + (evs.length === 1 ? " event" : " events") + "</span>", whyFam(f, top, hb, w, eod), f);
     if (!(openRows.has(fKey) || (Q && !famMatch))) continue;
+    evMatch.forEach((e) => derive(e, f.name));
     evMatch.sort(sorter);
     const lim = TSTATE[fKey] || 40;
     evMatch.slice(0, lim).forEach((e) => {
       const eKey = "e:" + e.name;
-      const cred = e.cred ? ' <span class="muted small">credited ' + fmtUSD(e.cred) + "</span>" : "";
-      h += row(1, eKey, '<span class="mono">' + esc(e.name) + "</span>" + (e.grp && e.grp !== e.name.split("-")[0] ? ' <span class="muted small">' + esc(e.grp) + "</span>" : "") + cred, e);
+      h += row(1, eKey, '<span class="mono">' + esc(e.name) + "</span>" + (e.grp && e.grp !== e.name.split("-")[0] ? ' <span class="muted small">' + esc(e.grp) + "</span>" : ""), whyEv(e, top), e);
       if (!(openRows.has(eKey) || (Q && !matchQ(e.name)))) return;
-      const ms = e.mkts.map((t) => D.markets[t]).filter((m) => !Q || matchQ(m.t, m.ev, m.fam));
-      ms.sort((a, b) => sorter(Object.assign(blank(), mw(a)), Object.assign(blank(), mw(b))));
-      for (const m of ms) {
+      const ms = e.mkts.map((t) => D.markets[t]).filter((m) => !Q || matchQ(m.t, m.ev, m.fam)).map((m) => {
         const x = Object.assign(blank(), mw(m));
-        x.restNow = m.cur ? m.cur.usd : 0; x.estNow = m.cur ? m.cur.est_day : 0;
-        x.u = m.u || 0; x.npos = m.pos ? 1 : 0;
-        const q = m.cur && m.cur.q ? (m.cur.q === 2 ? "2-sided" : (m.cur.bid_ct > 0 ? "bid" : "ask")) : (m.guard ? '<span class="muted">' + esc(m.guard) + "</span>" : '<span class="muted">—</span>');
-        h += row(2, "m:" + m.t, '<span class="mono">' + esc(m.t.slice(m.ev.length + 1) || m.t) + "</span> " + stateTags(m), x, { quoting: q });
+        x.q1 = m.cur && m.cur.q === 1 ? 1 : 0; x.q2 = m.cur && m.cur.q === 2 ? 1 : 0;
+        x.estNow = m.cur ? num(m.cur.est_day) : 0;
+        x.pnl7 = num((m.w["7d"] || {}).pnl);
+        x.nq = num(x.rest) > 0 ? 1 : 0;
+        x.wc = eod ? marketWorst(x.pos1, x.mk1) : num(m.wc);
+        x.wcg = x.wc;
+        x._q = m.cur && m.cur.q ? (m.cur.q === 2 ? "2-sided" : (m.cur.bid_ct > 0 ? "bid" : "ask")) : (m.guard ? '<span class="muted">' + esc(m.guard) + "</span>" : '<span class="muted">—</span>');
+        x._m = m;
+        return derive(x, f.name);
+      });
+      ms.sort(sorter);
+      for (const x of ms) {
+        const m = x._m, why = cause(x);
+        h += row(2, "m:" + m.t, '<span class="mono">' + esc(m.t.slice(m.ev.length + 1) || m.t) + "</span> " + stateTags(m), why ? esc(why) : "", x);
       }
     });
-    if (evMatch.length > lim) h += '<tr><td colspan="10"><button class="more" data-morefam="' + esc(fKey) + '">Show ' + (evMatch.length - lim) + " more events</button></td></tr>";
+    if (evMatch.length > lim) h += '<tr><td colspan="' + ncol + '"><button class="more" data-morefam="' + esc(fKey) + '">Show ' + (evMatch.length - lim) + " more events</button></td></tr>";
   }
-  const t = AGG.tot;
-  h += '<tr class="tot"><td>All families</td><td class="num">' + fmtUSD(t.rew) + '</td><td class="num">' + (na ? "n/a" : money(t.pnl)) + '</td><td class="num">' + (na ? "n/a" : money(t.rew + t.pnl)) + '</td><td class="num">' + fmtNum(t.fills) + '</td><td class="num">' + (t.mk_n ? money(t.mk) : "—") + '</td><td class="num">' + fmtNum(t.q1 + t.q2) + '</td><td class="num">' + fmtUSD(t.restNow) + '</td><td class="num">' + fmtUSD(t.estNow) + '</td><td class="num">' + money(t.u) + "</td></tr>";
-  h += "</tbody></table>";
-  if (!any) h = '<div class="empty">No family, event or market matches "' + esc(Q) + '".</div>';
+  // total over what is shown
+  const t = blank();
+  const add = ["rew", "pnl", "cr", "cs", "fills", "cts", "usd", "fe", "fe_cts", "m5", "m5_cts", "mk", "mk_cts", "m4", "m4_cts", "mt", "mt_cts",
+    "q1", "q2", "held", "estNow", "pnl7", "wc", "wcg", "nq", "rest", "nset", "pset", "rewA", "estA"];
+  for (const f of shown) for (const k of add) t[k] = num(t[k]) + num(f[k]);
+  t.nf = t.pnl - t.cr - t.cs; t.netA = t.rewA + t.pnl; t.cov = t.nf < -0.005 ? t.rewA / -t.nf : null; t.exp = t.estA + t.pnl7 / days7();
+  if (!Q) { t.typ = baseline(null, w); t.z = zOf(t); t.curve = famCurve(null); t.shape = shapeOf(t.curve); t.chg = []; t.name = ""; }
+  h += '<tr class="tot"><td>' + (Q ? "Shown" : "All families") + "</td>";
+  for (const c of cols) h += '<td class="num' + (c.sep ? " gs" : "") + (c.cls ? " " + c.cls : "") + '"' + (c.k === "shape" && t.shape ? ' data-fam=""' : "") + ">" + c.fmt(t) + "</td>";
+  h += "</tr></tbody></table>";
+  if (!shown.length) h = '<div class="empty">No family, event or market matches "' + esc(Q) + '".</div>';
   const host = $("drvTable");
   host.innerHTML = h;
-  host.querySelectorAll("tr.click").forEach((tr) => tr.addEventListener("click", (e) => {
+  host.querySelectorAll("tr.click").forEach((tr) => tr.addEventListener("click", () => {
     const k = tr.dataset.key;
     if (k.startsWith("m:")) { openMarket(k.slice(2)); return; }
     if (openRows.has(k)) openRows.delete(k); else openRows.add(k);
     saveOpen();
     renderDrivers();
   }));
+  host.querySelectorAll("th[data-sk]").forEach((th) => th.addEventListener("click", () => {
+    const k = th.dataset.sk, c = cols.find((cc) => cc.k === k);
+    drvSort = drvSort.k === k ? { k, dir: -drvSort.dir } : { k, dir: c ? c.dir : 1 };
+    store("imm.drvSort2", JSON.stringify(drvSort));
+    renderDrivers();
+  }));
   host.querySelectorAll("[data-morefam]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); TSTATE[b.dataset.morefam] = (TSTATE[b.dataset.morefam] || 40) + 60; renderDrivers(); }));
-  renderFamChart(fams);
+  const byName = {};
+  shown.forEach((f) => { byName[f.name] = f; });
+  host.querySelectorAll("td.shape[data-fam]").forEach((td) => {
+    const f = td.dataset.fam ? byName[td.dataset.fam] : t;
+    if (!f || !f.shape) return;
+    td.addEventListener("pointermove", (e) => {
+      const s = f.shape, c = f.curve, n = s.net.length;
+      const rows = [
+        { name: "Net at the end", value: fmtUSD(s.net[n - 1], { sign: true }), color: css("--s-net"), line: true },
+        { name: "of which trading", value: fmtUSD(c.p[n - 1], { sign: true }) },
+      ];
+      if (s.big) rows.push({ name: "Biggest hour " + tET(s.big.a) + "–" + tET(s.big.b), value: fmtUSD(s.big.d, { sign: true }) });
+      if (s.kind) rows.push({ block: s.kind === "jump" ? "One hour holds half or more of the trading move: an event (a settlement, a print, news)." : "No single hour dominates: a " + s.kind.replace("steady ", "") + " spread over the window.", muted: true });
+      showTip(e, (f.name || "All families") + " · " + w.desc, rows.concat(f.chg && f.chg.length ? changeTipRows(f.chg) : []));
+    });
+    td.addEventListener("pointerleave", hideTip);
+  });
+  host.querySelectorAll(".chg[data-chg]").forEach((sp) => {
+    const f = byName[sp.dataset.chg];
+    if (!f) return;
+    sp.addEventListener("pointermove", (e) => { e.stopPropagation(); showTip(e, "Changes naming " + f.name + " · matched by name", changeTipRows(f.chg)); });
+    sp.addEventListener("pointerleave", hideTip);
+  });
+  DRV_LAST = { fams: shown, tot: t };
+  renderDriverCharts();
+  // footnote: coverage of the worst case, the paid-rate basis
+  const sc = D.struct_cover || {}, R = D.realize || {};
+  const all = changesIn(w);
+  $("drvFoot").innerHTML = "Mark-outs and coverage use maker fills (no pads, no taker fills). " +
+    (eod ? "Book columns show the book at that day's close. " : "Worst case nets " + fmtNum(sc.known || 0) + " of " + fmtNum(sc.held || 0) + " open positions with Kalshi's strike structure; the rest count in full. ") +
+    (R.basis ? "Paid rate: credited ÷ modeled on settled events (" + (R.basis === "raw" ? "raw estimate: floor and model error" : "floored estimate: model error only; the raw basis arrives with the next imm_reward_recon run") + (R.generated_at ? ", calibration of " + esc(String(R.generated_at).slice(0, 10)) : "") + "). " : "") +
+    (all.length ? all.length + " code or config change" + (all.length > 1 ? "s" : "") + " landed in this window (ticks on the shape lines when a change names the family). " : "") +
+    "Definitions: Health → How the numbers are built.";
 }
-function renderFamChart(fams) {
-  const host = $("famChart");
+
+function renderDriverCharts() {
+  renderBridge(DRV_LAST.fams, DRV_LAST.tot);
+  renderMoHeat(DRV_LAST.fams, DRV_LAST.tot);
+}
+
+/* the window's P&L as a bridge: rewards, then the three trading parts, to net */
+function renderBridge(fams, t) {
+  const host = $("bridge");
   host.textContent = "";
-  const na = win().pnl_na;
-  const rows = fams.filter((f) => Math.abs(f.rew) + Math.abs(f.pnl) >= 0.5).slice().sort((a, b) => (b.rew + b.pnl) - (a.rew + a.pnl));
-  $("famLegend").innerHTML = '<span><i class="key" style="background:var(--s-rew)"></i>Modeled rewards</span><span><i class="key" style="background:var(--s-trade)"></i>Trading P&amp;L</span><span><i class="keyline" style="background:var(--s-net);width:3px;height:12px"></i>Net</span>';
-  if (!rows.length) { host.innerHTML = '<div class="empty">No activity in this window.</div>'; return; }
-  const W0 = Math.max(host.clientWidth || 380, 280), rowH = 30, m = { l: 132, r: 58, t: 6, b: 20 };
-  const H = m.t + m.b + rows.length * rowH;
+  const w = win(), na = w.pnl_na, paid = rewBasis === "paid";
+  $("bridgeTitle").textContent = "P&L bridge · " + w.desc + (paid ? " · rewards at the paid rate" : "");
+  $("bridgeLegend").innerHTML = '<span><i class="key" style="background:var(--s-rew)"></i>Rewards</span><span><i class="key" style="background:var(--s-trade)"></i>Trading</span><span><i class="key" style="background:var(--s-net)"></i>Net</span>';
+  if (!t) { host.innerHTML = '<div class="empty">No activity in this window.</div>'; return; }
+  if (na) { host.innerHTML = '<div class="empty">Trading P&amp;L is not available for this window: the position log starts later.</div>'; $("bridgeNote").textContent = ""; return; }
+  const steps = [
+    { k: "rewA", label: paid ? "Rewards*" : "Rewards", v: t.rewA, color: css("--s-rew") },
+    { k: "nf", label: "New fills", v: t.nf, color: css("--s-trade") },
+    { k: "cr", label: "Carry: marks", v: t.cr, color: css("--s-trade") },
+    { k: "cs", label: "Carry: settled", v: t.cs, color: css("--s-trade") },
+  ];
+  let run = 0;
+  const bars = steps.map((s) => { const b = Object.assign({ a: run, b: run + s.v }, s); run += s.v; return b; });
+  bars.push({ k: "netA", label: paid ? "Net*" : "Net", v: run, a: 0, b: run, color: css("--s-net"), total: true });
+  const W0 = Math.max(host.clientWidth || 460, 300), H = 236, m = { l: 56, r: 10, t: 22, b: 28 };
   let lo = 0, hi = 0;
-  rows.forEach((f) => { lo = Math.min(lo, f.rew, na ? 0 : f.pnl, na ? 0 : f.rew + f.pnl); hi = Math.max(hi, f.rew, na ? 0 : f.pnl, f.rew + (na ? 0 : f.pnl)); });
+  bars.forEach((b) => { lo = Math.min(lo, b.a, b.b); hi = Math.max(hi, b.a, b.b); });
   const dom = niceDomain(lo, hi, 4);
-  const X = (v) => m.l + (W0 - m.l - m.r) * (v - dom.lo) / (dom.hi - dom.lo);
-  const svg = svgEl("svg", { class: "ch", viewBox: "0 0 " + W0 + " " + H, height: H, role: "img", "aria-label": "Rewards and trading P&L by family" });
+  const Y = (v) => m.t + (H - m.t - m.b) * (1 - (v - dom.lo) / (dom.hi - dom.lo));
+  const band = (W0 - m.l - m.r) / bars.length, bw = Math.min(24, band * 0.5);
+  const svg = svgEl("svg", { class: "ch", viewBox: "0 0 " + W0 + " " + H, height: H, role: "img", "aria-label": "P&L bridge: rewards, new fills, carry, net" });
   for (const tv of dom.ticks) {
-    svg.appendChild(svgEl("line", { x1: X(tv), x2: X(tv), y1: m.t, y2: H - m.b, class: tv === 0 ? "zero" : "grid" }));
-    const tx = svgEl("text", { x: X(tv), y: H - 5, "text-anchor": "middle" }); tx.textContent = fmtUSD(tv, { dp: 0, compact: true }); svg.appendChild(tx);
+    svg.appendChild(svgEl("line", { x1: m.l, x2: W0 - m.r, y1: Y(tv), y2: Y(tv), class: tv === 0 ? "zero" : "grid" }));
+    const tx = svgEl("text", { x: m.l - 8, y: Y(tv) + 4, "text-anchor": "end" }); tx.textContent = fmtUSD(tv, { dp: 0, compact: true }); svg.appendChild(tx);
   }
-  const bar = (v, y, h, color) => {
-    const x0 = X(0), x1 = X(v), left = Math.min(x0, x1), w = Math.max(1, Math.abs(x1 - x0)), r = Math.min(4, w, h / 2);
+  bars.forEach((b, i) => {
+    const cx = m.l + band * (i + 0.5), x = cx - bw / 2;
+    const y0 = Y(Math.max(b.a, b.b)), y1 = Y(Math.min(b.a, b.b)), hgt = Math.max(1, y1 - y0);
+    const up = b.b >= b.a, r = Math.min(4, bw / 2, hgt);
+    // rounded at the data end (the end the step moved to), square where it starts
     let d;
-    if (v >= 0) d = "M" + left + " " + y + "H" + (left + w - r) + "Q" + (left + w) + " " + y + " " + (left + w) + " " + (y + r) + "V" + (y + h - r) + "Q" + (left + w) + " " + (y + h) + " " + (left + w - r) + " " + (y + h) + "H" + left + "Z";
-    else d = "M" + (left + w) + " " + y + "H" + (left + r) + "Q" + left + " " + y + " " + left + " " + (y + r) + "V" + (y + h - r) + "Q" + left + " " + (y + h) + " " + (left + r) + " " + (y + h) + "H" + (left + w) + "Z";
-    svg.appendChild(svgEl("path", { d, fill: color }));
-  };
-  rows.forEach((f, i) => {
-    const y = m.t + i * rowH;
-    const lab = svgEl("text", { x: m.l - 8, y: y + rowH / 2 + 4, "text-anchor": "end" });
-    lab.textContent = f.name.length > 22 ? f.name.slice(0, 21) + "…" : f.name;
-    lab.setAttribute("style", "fill:" + css("--ink-2"));
-    svg.appendChild(lab);
-    bar(f.rew, y + 6, 8, css("--s-rew"));
-    if (!na) bar(f.pnl, y + 16, 8, css("--s-trade"));
-    const net = f.rew + (na ? 0 : f.pnl);
-    if (!na) {
-      svg.appendChild(svgEl("rect", { x: X(net) - 1.5, y: y + 3, width: 3, height: 24, rx: 1.5, fill: css("--s-net") }));
-      const vt = svgEl("text", { x: W0 - 4, y: y + rowH / 2 + 4, "text-anchor": "end" });
-      vt.textContent = fmtUSD(net, { sign: true, dp: 0 }); vt.setAttribute("style", "fill:" + css("--ink")); svg.appendChild(vt);
+    if (up) d = "M" + x + " " + (y0 + hgt) + "V" + (y0 + r) + "Q" + x + " " + y0 + " " + (x + r) + " " + y0 + "H" + (x + bw - r) + "Q" + (x + bw) + " " + y0 + " " + (x + bw) + " " + (y0 + r) + "V" + (y0 + hgt) + "Z";
+    else d = "M" + x + " " + y0 + "V" + (y0 + hgt - r) + "Q" + x + " " + (y0 + hgt) + " " + (x + r) + " " + (y0 + hgt) + "H" + (x + bw - r) + "Q" + (x + bw) + " " + (y0 + hgt) + " " + (x + bw) + " " + (y0 + hgt - r) + "V" + y0 + "Z";
+    svg.appendChild(svgEl("path", { d, fill: b.color }));
+    if (i < bars.length - 1 && !bars[i + 1].total) {
+      svg.appendChild(svgEl("line", { x1: x + bw, x2: m.l + band * (i + 1.5) - bw / 2, y1: Y(b.b), y2: Y(b.b), class: "zero" }));
     }
-    const hit = svgEl("rect", { x: 0, y, width: W0, height: rowH, fill: "transparent" });
-    hit.style.cursor = "pointer";
-    hit.addEventListener("pointermove", (e) => showTip(e, f.name, [
-      { name: "Net", value: na ? "n/a" : fmtUSD(net, { sign: true }), color: css("--s-net"), line: true },
-      { name: "Modeled rewards", value: fmtUSD(f.rew), color: css("--s-rew") },
-      { name: "Trading P&L", value: na ? "n/a" : fmtUSD(f.pnl, { sign: true }), color: css("--s-trade") },
-      { name: "Fills", value: fmtNum(f.fills) },
-    ]));
+    const lab = svgEl("text", { x: cx, y: up ? y0 - 6 : y0 + hgt + 14, "text-anchor": "middle" });
+    lab.textContent = fmtUSD(b.v, { sign: true, dp: Math.abs(b.v) >= 100 ? 0 : 2 });
+    lab.setAttribute("style", "fill:" + css("--ink"));
+    svg.appendChild(lab);
+    const cat = svgEl("text", { x: cx, y: H - 8, "text-anchor": "middle" }); cat.textContent = b.label; svg.appendChild(cat);
+    const hit = svgEl("rect", { x: cx - band / 2, y: 0, width: band, height: H, fill: "transparent" });
+    hit.addEventListener("pointermove", (e) => {
+      const lead = fams.slice().sort((p, q) => Math.abs(num(q[b.k])) - Math.abs(num(p[b.k]))).filter((f) => Math.abs(num(f[b.k])) >= 0.5).slice(0, 4);
+      showTip(e, b.label + " · " + w.desc, [{ name: b.total ? "Net" : "Step", value: fmtUSD(b.v, { sign: true }), color: b.color }]
+        .concat(lead.map((f) => ({ name: f.name, value: fmtUSD(num(f[b.k]), { sign: true }) }))));
+    });
     hit.addEventListener("pointerleave", hideTip);
-    hit.addEventListener("click", () => { openRows.add("f:" + f.name); renderDrivers(); $("drvTable").scrollIntoView({ block: "start" }); });
     svg.appendChild(hit);
   });
   host.appendChild(svg);
+  // the reading in words
+  const parts = [["new fills", t.nf], ["carry re-marked", t.cr], ["carry settled", t.cs]].filter((p) => Math.abs(p[1]) >= 0.5).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  $("bridgeNote").textContent = parts.length ? "Trading " + fmtUSD(t.pnl, { sign: true }) + ": " + parts.map((p) => p[0] + " " + fmtUSD(p[1], { sign: true })).join(", ") + "." : "";
+}
+
+/* maker-fill mark-outs per family at each horizon: blue made money, red lost */
+function hmColor(c) {
+  if (c == null || !isFinite(c)) return "";
+  const k = Math.min(1, Math.abs(c) / 5);
+  if (k < 0.02) return "background:var(--hm-mid);color:var(--ink)";
+  return "background:color-mix(in oklab, var(" + (c > 0 ? "--div-pos" : "--div-neg") + ") " + Math.round(18 + 72 * k) + "%, var(--hm-mid));color:" + (k > 0.6 ? "#fff" : "var(--ink)");
+}
+function renderMoHeat(fams, t) {
+  const host = $("moHeat");
+  const rows = fams.filter((f) => f.fe_cts + f.mk_cts + f.mt_cts > 0).sort((a, b) => b.cts - a.cts).slice(0, 10);
+  $("hmLegend").innerHTML = '<span class="hmleg">lost <i style="' + hmColor(-5) + '"></i><i style="' + hmColor(-2) + '"></i><i style="' + hmColor(0) + '"></i><i style="' + hmColor(2) + '"></i><i style="' + hmColor(5) + '"></i> made · ±5¢ and beyond</span>';
+  if (!rows.length) { host.innerHTML = '<div class="empty">No maker fills in this window.</div>'; return; }
+  let h = '<table class="hm" aria-label="Mark-outs by family and horizon, cents per contract"><thead><tr><th>Family</th>' +
+    HZ.map((z) => '<th data-h="' + z[0] + '" class="' + (z[0] === drvH ? "on" : "") + '" title="show this horizon in the table">' + z[1] + "</th>").join("") + "</tr></thead><tbody>";
+  const line = (name, x, cls) => {
+    let r = '<tr class="' + (cls || "") + '"><td class="hmn" title="' + esc(name) + '">' + esc(name) + ' <span class="muted">' + fmtNum(x.cts) + " ct</span></td>";
+    for (const z of HZ) {
+      const n = num(x[z[2]]), c = n > 0 ? x[z[0]] / n * 100 : null;
+      r += '<td class="c" data-h="' + z[0] + '" data-n="' + esc(name) + '" style="' + hmColor(c) + '">' + (c == null ? '<span class="muted">—</span>' : fmtC(c)) + "</td>";
+    }
+    return r + "</tr>";
+  };
+  rows.forEach((f) => { h += line(f.name, f); });
+  if (t) h += line("All maker fills", t, "all");
+  h += "</tbody></table>";
+  host.innerHTML = h;
+  const byName = {};
+  rows.forEach((f) => { byName[f.name] = f; });
+  if (t) byName["All maker fills"] = t;
+  host.querySelectorAll("th[data-h], td.c").forEach((el) => el.addEventListener("click", () => { drvH = el.dataset.h; store("imm.drvH", drvH); renderDrivers(); }));
+  host.querySelectorAll("td.c").forEach((td) => {
+    const x = byName[td.dataset.n], z = HZ.find((q) => q[0] === td.dataset.h);
+    td.addEventListener("pointermove", (e) => {
+      const n = num(x[z[2]]);
+      showTip(e, td.dataset.n + " · " + z[1], n > 0 ? [
+        { name: "per contract", value: fmtC(x[z[0]] / n * 100) },
+        { name: "in dollars", value: fmtUSD(x[z[0]], { sign: true }) },
+        { name: "contracts with a mark", value: fmtNum(n) + " of " + fmtNum(x.cts) },
+      ] : [{ name: "no maker fill has a mark at this horizon", value: "" }]);
+    });
+    td.addEventListener("pointerleave", hideTip);
+  });
 }
 
 /* ======================= movers ======================= */
@@ -1432,17 +1914,22 @@ function renderRisk() {
   for (const t in D.markets) {
     const m = D.markets[t];
     if (!m.pos) continue;
-    const e = inv[m.ev] || (inv[m.ev] = { ev: m.ev, fam: m.fam, n: 0, net: 0, risk: 0, u: 0, du: 0 });
+    const e = inv[m.ev] || (inv[m.ev] = { ev: m.ev, fam: m.fam, n: 0, net: 0, risk: 0, u: 0, du: 0, wc: 0, wcg: 0, wch: "" });
     e.n++; e.net += m.pos; e.risk += num(m.risk); e.u += num(m.u); e.du += num(mw(m).du);
+  }
+  for (const ev in inv) {
+    const w = (D.events[ev] || {}).wc;
+    if (w) { inv[ev].wc = num(w[0]); inv[ev].wcg = num(w[1]); inv[ev].wch = w[2]; }
   }
   const irows = Object.values(inv).filter((e) => matchQ(e.ev, e.fam));
   table($("invTable"), [
     { k: "ev", label: "Event", fmt: (r) => '<div class="cell-main"><span class="mono">' + esc(r.ev) + '</span><span class="t2">' + esc(r.fam) + "</span></div>" },
     { k: "n", label: "Mkts", num: true },
+    { k: "wc", label: "Worst case", num: true, title: "loss to settlement from today's marks if the event goes against the book, netted across its strikes or exclusive names", fmt: (r) => r.wc ? '<span title="' + esc("gross " + fmtUSD(r.wcg, { sign: true }) + " · " + (WCH[r.wch] || r.wch)) + '">' + money(r.wc) + "</span>" : '<span class="muted">—</span>' },
     { k: "risk", label: "At cost", num: true, title: "what the open contracts cost (max loss if every one goes to zero)", fmt: (r) => fmtUSD(r.risk) },
     { k: "u", label: "Unrealized", num: true, fmt: (r) => money(r.u) },
     { k: "du", label: "Δ in window", num: true, fmt: (r) => money(r.du) },
-  ], irows, { sortKey: "risk", limit: 12, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => { openRows.add("f:" + r.fam); openRows.add("e:" + r.ev); renderDrivers(); location.hash = "#drivers"; } });
+  ], irows, { sortKey: "wc", dir: 1, limit: 12, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => { openRows.add("f:" + r.fam); openRows.add("e:" + r.ev); renderDrivers(); location.hash = "#drivers"; } });
 }
 
 /* ======================= fills ======================= */
@@ -1450,28 +1937,40 @@ function renderFills() {
   const w = win();
   const fl = (D.fills || []).filter((f) => f.ts >= w.start && f.ts < w.end + 1 && !f.pad && !f.taker && matchQ(f.t, (D.markets[f.t] || {}).fam));
   const fam = {};
+  // per family: contracts x cents at each horizon, over the fills that have it
+  const HK = [["ec", "e"], ["m5c", "m5"], ["mkc", "m30"], ["m4c", "m4"], ["mtc", "mt"]];
   for (const f of fl) {
     const m = D.markets[f.t] || { fam: "?" };
-    const a = fam[m.fam] || (fam[m.fam] = { fam: m.fam, n: 0, cts: 0, usd: 0, mk: 0, mkn: 0, mkcts: 0, neg: 0 });
+    const a = fam[m.fam] || (fam[m.fam] = { fam: m.fam, n: 0, cts: 0, usd: 0, mk: 0, mkn: 0, mkcts: 0, neg: 0, e: [0, 0], m5: [0, 0], m30: [0, 0], m4: [0, 0], mt: [0, 0] });
     a.n++; a.cts += f.n; a.usd += f.n * (f.side === "bid" ? f.px : 100 - f.px) / 100;
     if (f.mk != null) { a.mk += f.mk; a.mkn++; a.mkcts += f.n; if (f.mkc <= -5) a.neg++; }
+    for (const [src, dst] of HK) if (f[src] != null) { a[dst][0] += f[src] * f.n; a[dst][1] += f.n; }
   }
+  const cpc = (p) => p[1] > 0 ? p[0] / p[1] : null;
+  const ccell = (p) => p[1] > 0 ? '<span class="' + cls(p[0] / p[1], 0.05) + '">' + fmtC(p[0] / p[1]) + "</span>" : '<span class="muted">—</span>';
   table($("fillFam"), [
     { k: "fam", label: "Family", fmt: (r) => esc(r.fam) },
-    { k: "n", label: "Fills", num: true },
+    { k: "n", label: "Maker fills", num: true },
     { k: "cts", label: "Contracts", num: true, fmt: (r) => fmtNum(r.cts) },
     { k: "usd", label: "$ traded", num: true, fmt: (r) => fmtUSD(r.usd) },
-    { k: "mk", label: "Mark-out", num: true, fmt: (r) => r.mkn ? money(r.mk) : '<span class="muted">pending</span>' },
-    { k: "mkc", label: "¢/ct", num: true, sort: (r) => r.mkcts ? r.mk / r.mkcts : null, fmt: (r) => r.mkcts ? fmtC(r.mk / r.mkcts * 100) : "—" },
+    { k: "e", label: "Edge", num: true, title: "fill price against the mid of the book the bot priced on, ¢ per contract", sort: (r) => cpc(r.e), fmt: (r) => ccell(r.e) },
+    { k: "m5", label: "5m", num: true, sort: (r) => cpc(r.m5), fmt: (r) => ccell(r.m5) },
+    { k: "m30", label: "30m", num: true, sort: (r) => cpc(r.m30), fmt: (r) => ccell(r.m30) },
+    { k: "m4", label: "4h", num: true, sort: (r) => cpc(r.m4), fmt: (r) => ccell(r.m4) },
+    { k: "mt", label: "To date", num: true, title: "against the market's value now, or its settlement", sort: (r) => cpc(r.mt), fmt: (r) => ccell(r.mt) },
+    { k: "mk", label: "30m $", num: true, fmt: (r) => r.mkn ? money(r.mk) : '<span class="muted">pending</span>' },
     { k: "neg", label: "Picked off", num: true, title: "fills whose 30-min mark moved 5c+ against them", sort: (r) => r.mkn ? r.neg / r.mkn : null, fmt: (r) => r.mkn ? r.neg + ' <span class="muted">/' + r.mkn + "</span>" : "—" },
   ], Object.values(fam), { sortKey: "mk", dir: 1, limit: 20, empty: "No maker fills in this window." });
+  const cent = (v) => v != null ? '<span class="' + cls(v, 0.05) + '">' + (v >= 0 ? "+" : "") + fmtC(v) + "</span>" : '<span class="muted">—</span>';
   table($("fillList"), [
     { k: "ts", label: "Time", fmt: (r) => '<span class="nowrap">' + dtET(r.ts) + "</span>" },
     { k: "t", label: "Market", fmt: (r) => '<span class="mono">' + esc(r.t) + "</span>" },
     { k: "side", label: "Side", fmt: (r) => r.side === "bid" ? "bought" : "sold" },
     { k: "px", label: "Price", num: true, fmt: (r) => fmtC(r.px) },
     { k: "n", label: "Qty", num: true, fmt: (r) => fmtNum(r.n, r.n % 1 ? 1 : 0) },
-    { k: "mk", label: "Mark-out", num: true, fmt: (r) => r.mk != null ? money(r.mk) + ' <span class="muted small">' + (r.mkc >= 0 ? "+" : MINUS) + fmtC(Math.abs(r.mkc)) + "</span>" : (r.mk_pending ? '<span class="muted">pending</span>' : '<span class="muted">—</span>') },
+    { k: "ec", label: "Edge", num: true, title: "¢ per contract against the mid of the book the bot priced on", fmt: (r) => cent(r.ec) },
+    { k: "mk", label: "30m", num: true, fmt: (r) => r.mk != null ? money(r.mk) + ' <span class="muted small">' + (r.mkc >= 0 ? "+" : MINUS) + fmtC(Math.abs(r.mkc)) + "</span>" : (r.mk_pending ? '<span class="muted">pending</span>' : '<span class="muted">—</span>') },
+    { k: "mtc", label: "To date", num: true, title: "¢ per contract against the market's value now" + " (s = settled)", fmt: (r) => cent(r.mtc) + (r.mts ? ' <span class="muted small">s</span>' : "") },
     { k: "pos1", label: "Pos after", num: true, fmt: (r) => fmtNum(r.pos1) },
   ], fl, { sortKey: "ts", limit: 25, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => D.markets[r.t] && openMarket(r.t), empty: "No maker fills in this window." });
 }
@@ -1567,6 +2066,10 @@ function openMarket(t) {
   h += '<div class="attn">' + stateTags(m) + (m.dec ? ' <span class="tag">decision: ' + esc(m.dec) + "</span>" : "") + "</div>";
   h += '<dl class="kv">';
   h += "<dt>Position</dt><dd>" + (m.pos ? fmtNum(m.pos, 1) + " @ " + fmtC(m.avg) + (m.mark != null ? ", mark " + fmtC(m.mark) + " · unrealized " + money(m.u) + " · at cost " + fmtUSD(m.risk) : "") : "flat") + "</dd>";
+  if (m.wc) {
+    const ev = D.events[m.ev] || {};
+    h += "<dt>Worst case</dt><dd>" + money(m.wc) + " to settlement from the mark" + (ev.wc && (D.events[m.ev].mkts || []).length > 1 ? " · event " + money(ev.wc[0]) + ' <span class="muted">(' + esc(WCH[ev.wc[2]] || ev.wc[2]) + ")</span>" : "") + "</dd>";
+  }
   if (c) {
     h += "<dt>Quoting</dt><dd>" + (c.bid_ct > 0 ? fmtNum(c.bid_ct) + " bid @ " + fmtC(c.bid_top) : "no bid") + " · " + (c.ask_ct > 0 ? fmtNum(c.ask_ct) + " ask @ " + fmtC(c.ask_top) : "no ask") + ' <span class="muted">(book ' + (c.xb != null ? c.xb : "—") + "×" + (c.xa != null ? c.xa : "—") + ")</span></dd>";
     h += "<dt>Rewards now</dt><dd>" + fmtUSD(c.est_day) + "/day of a " + fmtUSD(c.pool_day) + "/day pool (" + fmtPct(c.pool_day ? c.est_day / c.pool_day : null) + ") · " + fmtUSD(c.usd) + " resting" + (c.hm && c.hm !== 1 ? " · size ×" + c.hm : "") + "</dd>";
@@ -1577,15 +2080,17 @@ function openMarket(t) {
   if (m.acc) h += "<dt>Accrued (bot)</dt><dd>" + fmtUSD(m.acc) + " this program, per the bot's persisted counter</dd>";
   h += "</dl>";
   // windows table
-  h += '<table class="t"><thead><tr><th>Window</th><th class="num">Rewards</th><th class="num">Realized</th><th class="num">Marks Δ</th><th class="num">Trading</th><th class="num">Net</th><th class="num">Fills</th></tr></thead><tbody>';
+  h += '<table class="t"><thead><tr><th>Window</th><th class="num">Rewards</th><th class="num" title="the window\'s own fills, marked to its end or the settlement">New fills</th><th class="num" title="the start position: re-marked, or settled">Carry</th><th class="num">Trading</th><th class="num">Net</th><th class="num">Fills</th></tr></thead><tbody>';
   const wrows = WKEYS.map((k) => ({ label: D.windows[k].label, w: m.w[k] || {}, na: D.windows[k].pnl_na, on: k === W }));
   if (isDay(W)) {
     const iso = W.slice(2);
     wrows.unshift({ label: day(iso), w: dayRec(iso, t) || {}, na: !D.days[iso].ok, on: true });
   }
   for (const r of wrows) {
-    const w = r.w, na = r.na;
-    h += "<tr" + (r.on ? ' style="font-weight:600"' : "") + "><td>" + esc(r.label) + '</td><td class="num">' + fmtUSD(w.rew || 0) + '</td><td class="num">' + money(w.real || 0) + '</td><td class="num">' + money((w.du || 0) + (w.xfer || 0)) + '</td><td class="num">' + (na ? "n/a" : money(w.pnl || 0)) + '</td><td class="num">' + (na ? "n/a" : money((w.rew || 0) + (w.pnl || 0))) + '</td><td class="num">' + fmtNum(w.fills || 0) + "</td></tr>";
+    const w = r.w, na = r.na, carry = num(w.cr) + num(w.cs), nf = num(w.pnl) - carry;
+    const acct = "realized " + fmtUSD(num(w.real), { sign: true }) + " · marks " + fmtUSD(num(w.du) + num(w.xfer), { sign: true }) + (num(w.cs) ? " · settled carry " + fmtUSD(num(w.cs), { sign: true }) : "");
+    h += "<tr" + (r.on ? ' style="font-weight:600"' : "") + "><td>" + esc(r.label) + '</td><td class="num">' + fmtUSD(w.rew || 0) + '</td><td class="num">' + (na ? "n/a" : money(nf)) + '</td><td class="num">' + (na ? "n/a" : money(carry)) +
+      '</td><td class="num" title="' + esc(acct) + '">' + (na ? "n/a" : money(w.pnl || 0)) + '</td><td class="num">' + (na ? "n/a" : money((w.rew || 0) + (w.pnl || 0))) + '</td><td class="num">' + fmtNum(w.fills || 0) + "</td></tr>";
   }
   h += "</tbody></table>";
   if (p) {
@@ -1598,8 +2103,9 @@ function openMarket(t) {
   const fl = (D.fills || []).filter((f) => f.t === t);
   h += '<div><div class="mini-title">Fills, last 30 days (' + fl.length + ")</div>";
   if (fl.length) {
-    h += '<table class="t"><thead><tr><th>Time</th><th>Side</th><th class="num">Price</th><th class="num">Qty</th><th class="num">Mark-out</th><th class="num">Pos after</th></tr></thead><tbody>';
-    fl.slice(0, 60).forEach((f) => { h += "<tr><td>" + dtET(f.ts) + "</td><td>" + (f.side === "bid" ? "bought" : "sold") + (f.pad ? " (pad)" : "") + '</td><td class="num">' + fmtC(f.px) + '</td><td class="num">' + fmtNum(f.n, f.n % 1 ? 1 : 0) + '</td><td class="num">' + (f.mk != null ? money(f.mk) : '<span class="muted">' + (f.mk_pending ? "pending" : "—") + "</span>") + '</td><td class="num">' + fmtNum(f.pos1) + "</td></tr>"; });
+    h += '<table class="t"><thead><tr><th>Time</th><th>Side</th><th class="num">Price</th><th class="num">Qty</th><th class="num" title="¢ per contract against the arrival mid">Edge</th><th class="num">30m</th><th class="num" title="¢ per contract against the value now (s = settled)">To date</th><th class="num">Pos after</th></tr></thead><tbody>';
+    const cc = (v) => v != null ? '<span class="' + cls(v, 0.05) + '">' + (v >= 0 ? "+" : "") + fmtC(v) + "</span>" : '<span class="muted">—</span>';
+    fl.slice(0, 60).forEach((f) => { h += "<tr><td>" + dtET(f.ts) + "</td><td>" + (f.side === "bid" ? "bought" : "sold") + (f.pad ? " (pad)" : f.taker ? " (taker)" : "") + '</td><td class="num">' + fmtC(f.px) + '</td><td class="num">' + fmtNum(f.n, f.n % 1 ? 1 : 0) + '</td><td class="num">' + cc(f.ec) + '</td><td class="num">' + (f.mk != null ? money(f.mk) : '<span class="muted">' + (f.mk_pending ? "pending" : "—") + "</span>") + '</td><td class="num">' + cc(f.mtc) + (f.mts ? ' <span class="muted small">s</span>' : "") + '</td><td class="num">' + fmtNum(f.pos1) + "</td></tr>"; });
     h += "</tbody></table>";
   } else h += '<div class="small muted">No fills.</div>';
   h += "</div>";
@@ -1654,7 +2160,7 @@ if (!D) {
   let qt = null;
   $("q").addEventListener("input", (e) => { clearTimeout(qt); qt = setTimeout(() => { Q = e.target.value.trim().toLowerCase(); for (const k in TSTATE) if (TSTATE[k] && TSTATE[k].limit) TSTATE[k].limit = Math.max(TSTATE[k].limit, 25); renderAll(); }, 160); });
   let rt = null;
-  addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { renderSummary(); renderFamChart(Object.values(AGG.fams).filter((f) => f.rew || f.pnl || f.fills)); renderHistory(); }, 200); });
+  addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { renderSummary(); renderDriverCharts(); renderHistory(); }, 200); });
   // nav highlight
   const links = [...document.querySelectorAll("#nav a")];
   const secs = links.map((a) => document.querySelector(a.getAttribute("href")));

@@ -488,5 +488,37 @@ class TestDigestCapacity(unittest.TestCase):
             self.dg.LAUNCHER_ENV.update(saved)
 
 
+class TestCalibrationSeries(unittest.TestCase):
+    """The dashboard's paid rate per family is credited / RAW estimate on
+    settled post-amendment events, rolled up from these per-series rows."""
+
+    def test_post_amendment_series_carry_the_raw_estimate(self):
+        d = tempfile.mkdtemp()
+        cut = rec._ts(rec.AMENDMENT_CUTOVER + "+00:00")
+        rows = [
+            {"event": "KXA-1", "series": "KXA", "credited": 6.0, "est": 10.0, "est_floor": 8.0,
+             "settled_any": True, "first": cut + 60, "imm": True},
+            {"event": "KXA-2", "series": "KXA", "credited": 2.0, "est": 3.0, "est_floor": 2.5,
+             "settled_any": True, "first": cut + 120, "imm": True},
+            # quoted before the estimator rewrite: not calibration evidence
+            {"event": "KXA-0", "series": "KXA", "credited": 50.0, "est": 1.0, "est_floor": 1.0,
+             "settled_any": True, "first": cut - 3600, "imm": True},
+            # not settled yet: no evidence either
+            {"event": "KXB-1", "series": "KXB", "credited": 0.0, "est": 9.0, "est_floor": 9.0,
+             "settled_any": False, "first": cut + 60, "imm": True},
+        ]
+        summary = {"lifetime": 58.0, "since_imm": 58.0, "imm_credit": 58.0,
+                   "settled_credited": 58.0, "settled_est_floor": 11.5, "series": {}}
+        with mock.patch.object(rec, "STATUS_DIR", d), \
+                mock.patch.object(rec, "CALIB_PATH", os.path.join(d, "reward_calibration.json")):
+            pay = rec.write_calibration(summary, rows, [])
+        ser = pay["post_amendment"]["series"]
+        self.assertEqual(ser["KXA"], {"credited": 8.0, "est": 13.0, "est_floor": 10.5, "n": 2})
+        self.assertNotIn("KXB", ser)
+        # the existing keys the digest reads are unchanged
+        self.assertIn("by_family", pay["post_amendment"])
+        self.assertAlmostEqual(pay["post_amendment"]["realization_factor"], round(8.0 / 10.5, 4))
+
+
 if __name__ == "__main__":
     unittest.main()

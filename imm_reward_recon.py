@@ -962,6 +962,16 @@ def write_calibration(summary, rows, ledger):
         a[0] += r["credited"]
         a[1] += r["est_floor"]
         a[2] += 1
+    # the same events per series, with the RAW estimate beside the floored
+    # one: credited / est is what a dollar of modeled accrual has paid (the
+    # $1 floor and the model error together) -- the dashboard's paid rate
+    ser_agg = defaultdict(lambda: [0.0, 0.0, 0.0, 0])
+    for r in post:
+        a = ser_agg[r["series"]]
+        a[0] += r["credited"]
+        a[1] += r["est"]
+        a[2] += r["est_floor"]
+        a[3] += 1
     payload = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "imm_inception": IMM_INCEPTION,
@@ -994,6 +1004,10 @@ def write_calibration(summary, rows, ledger):
                     "estimate_floored": round(v[1], 2),
                     "realization_factor": round(v[0] / v[1], 4) if v[1] > 0.01 else None}
                 for k, v in sorted(fam_agg.items())},
+            "series": {
+                k: {"credited": round(v[0], 2), "est": round(v[1], 2),
+                    "est_floor": round(v[2], 2), "n": v[3]}
+                for k, v in sorted(ser_agg.items())},
         },
     }
     os.makedirs(STATUS_DIR, exist_ok=True)

@@ -73,6 +73,7 @@ import os
 import pickle
 import re
 import statistics
+import subprocess
 import sys
 import time
 import traceback
@@ -110,15 +111,34 @@ PROGRAMS_TTL_MIN = float(os.environ.get("IMM_DASH_PROGRAMS_TTL_MIN", "30"))
 HEARTBEAT_STALE_MIN = 30
 MARKOUT_SECS = 1800       # fill mark-out horizon (the toxic backtest's 30m)
 MARKOUT_MAX_LAG = 900     # the mark used must land within 15 min of it
+# every snapshot horizon a fill is marked out at: (key, seconds after the fill,
+# how late the first snapshot at/after it may land). "mk" is the 30-minute one
+# the page has always shown; the 5-minute snapshots make "m5" a 5-10 min read.
+# Edge at the fill (vs the book's mid one cycle before it) and "to date" (vs
+# the market's value now, or its settlement) bracket them.
+MARKOUT_HORIZONS = (("m5", 300, 300), ("mk", MARKOUT_SECS, MARKOUT_MAX_LAG),
+                    ("m4", 4 * 3600, 900))
+MARKOUT_FINAL_AFTER = 36 * 3600   # a query older than this with no mark never gets one
+EDGE_MAX_SPREAD = 50              # an arrival book this wide has no mid (incentive_mm MARK_WIDE_SPREAD_CENTS)
+MARKET_NOW_TTL = 1800             # re-read an unsettled market's touch every 30 min
+MARKET_READ_BUDGET = 1500         # tickers per build for market records (50 per call)
+EVENT_READ_BUDGET = 60            # GET /events/{e} per build (exclusivity of word/name events)
+FAMILY_CURVE_STEP = 3600          # per-family sparklines: hourly points
+NUMERIC_STRIKES = frozenset(("greater", "greater_or_equal", "less", "less_or_equal", "between"))
 PROMISING_EST = float(os.environ.get("IMM_DASH_PROMISING_EST", "3.0"))
 PROMISING_LEFT = float(os.environ.get("IMM_DASH_PROMISING_LEFT", "500"))
 TITLE_BUDGET = int(os.environ.get("IMM_DASH_TITLE_BUDGET", "80"))
 PAD_BID, PAD_ASK = 1, 99  # incentive_mm PAD_BID_CENTS / PAD_ASK_CENTS
 CACHE_VERSION = 5
 DAY_CURVE_STEP = 900              # per-day intraday curves at 15-minute steps
-# per-market day arrays on the page: D.days[day].m[ticker] = [...] in this order
+# per-market day arrays on the page: D.days[day].m[ticker] = [...] in this order.
+# "cr" / "cs" split trading P&L: the start-of-day position re-marked (cr) or
+# settled (cs); the rest is the day's own fills. "fx" is 0 for a market with
+# no maker fills, else [edge $, edge cts, m5 $, m5 cts, m4 $, m4 cts, to-date $,
+# to-date cts] -- the multi-horizon mark-outs (the 30-minute one is mk).
 DAY_FIELDS = ("rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n",
-              "mk_cts", "rest", "pos0", "pos1", "mk0", "mk1", "settled")
+              "mk_cts", "rest", "pos0", "pos1", "mk0", "mk1", "settled", "cr", "cs", "fx")
+FX_KEYS = ("fe", "fe_cts", "m5", "m5_cts", "m4", "m4_cts", "mt", "mt_cts")
 VANISH_REAPPEAR_SECS = 6 * 3600   # a position back within this long was only a blip
 EXIT_RESULTS_TTL = 3600           # re-ask Kalshi about an unsettled exit hourly
 
@@ -183,6 +203,14 @@ def load_json(path: str, default=None):
             return json.load(f)
     except (OSError, ValueError):
         return {} if default is None else default
+
+
+def fx_array(v: dict):
+    """A day row's multi-horizon mark-out block in FX_KEYS order, or 0 for a
+    market with no maker fill that day (keeps the page small)."""
+    if not (v.get("fe_cts") or v.get("m5_cts") or v.get("m4_cts") or v.get("mt_cts")):
+        return 0
+    return [round(v.get(k, 0.0), 1 if k.endswith("_cts") else 3) for k in FX_KEYS]
 
 
 # ----------------------------------------------------------------------------
@@ -421,6 +449,237 @@ def bot_roll_start(now: float) -> float:
 
 
 # ----------------------------------------------------------------------------
+# Pure helpers for the drivers view: the mark rule, worst cases, the change
+# log and the paid-vs-modeled roll-up (each tested on its own)
+# ----------------------------------------------------------------------------
+
+def touch_mark_cents(bid, ask, last, wide=50):
+    """incentive_mm.touch_mark_cents: the YES mark of a touch (None = an EMPTY
+    side) and the last trade. Two-sided: the mid, or the last trade clamped
+    inside the touch when the book is `wide`c or wider. One-sided: the last
+    trade clamped to the live side. Nothing live: the last trade."""
+    if bid is not None and ask is not None:
+        if last is not None and wide and ask - bid >= wide:
+            return float(min(max(last, bid), ask))
+        return (bid + ask) / 2.0
+    if last is None:
+        return None
+    if bid is not None:
+        return float(max(last, bid))
+    if ask is not None:
+        return float(min(last, ask))
+    return float(last)
+
+
+def _live_dollars(m, base):
+    """A side's raw dollar price when it is a real level (strictly inside
+    (0, 1)), else None: Kalshi shows an empty bid as $0 and an empty ask as $1."""
+    try:
+        v = m.get(base + "_dollars")
+        x = float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        x = None
+    return x if x is not None and 0.0 < x < 1.0 else None
+
+
+def market_value_cents(m, wide=50):
+    """(YES value in cents or None, final) for a Kalshi market record: its
+    settlement once Kalshi has one (yes 100, no 0, scalar at its exact
+    settlement_value; a void has no value), else the bot's mark rule on the
+    touch (bid floored, ask ceiled) and the last trade."""
+    res = str(m.get("result") or "").lower()
+    if res in ("yes", "no"):
+        return (100.0 if res == "yes" else 0.0), True
+    if res == "scalar":
+        try:
+            return round(float(m.get("settlement_value_dollars")) * 100.0, 4), True
+        except (TypeError, ValueError):
+            return None, True
+    if res == "void":
+        return None, True
+    b, a = _live_dollars(m, "yes_bid"), _live_dollars(m, "yes_ask")
+    bid = math.floor(b * 100.0 + 1e-9) if b is not None else None
+    ask = math.ceil(a * 100.0 - 1e-9) if a is not None else None
+    lv = _f(m.get("last_price_dollars"), 0.0)
+    last = math.floor(lv * 100.0 + 1e-9) if lv > 0 else None
+    return touch_mark_cents(bid, ask, last, wide), False
+
+
+def strike_pays(st: str, lo, hi, v: float) -> bool:
+    """Does a numeric-strike market settle YES at outcome value v?"""
+    if st == "greater":
+        return v > lo
+    if st == "greater_or_equal":
+        return v >= lo
+    if st == "less":
+        return v < hi
+    if st == "less_or_equal":
+        return v <= hi
+    if st == "between":
+        return lo <= v <= hi
+    return False
+
+
+def _strike_usable(s) -> bool:
+    st, lo, hi = s[0], s[1], s[2]
+    if st in ("greater", "greater_or_equal"):
+        return lo is not None
+    if st in ("less", "less_or_equal"):
+        return hi is not None
+    if st == "between":
+        return lo is not None and hi is not None
+    return False
+
+
+def market_worst(pos: float, mark) -> float:
+    """One market's worst P&L from its mark to settlement (<= 0): a long
+    loses its mark, a short loses 100 - mark."""
+    if mark is None or abs(pos) < 1e-9:
+        return 0.0
+    return -pos * mark / 100.0 if pos > 0 else pos * (100.0 - mark) / 100.0
+
+
+def event_worst_case(holdings, struct, me=None, n_event=None):
+    """Worst P&L from the current marks to settlement for one event's
+    positions: (worst, gross, method), both <= 0.
+
+    `holdings` [(ticker, pos, mark_cents)], pos > 0 long YES (the caller
+    marks a position with no mark at its cost). `struct` {ticker: (strike
+    type, floor, cap, market type)} from Kalshi. gross adds every market's
+    own worst case, with no netting. worst nets markets that cannot all lose
+    at once:
+      strikes      every market prices the same number (greater / less /
+                   between strikes): each outcome region is a scenario
+      exclusive    Kalshi marks the event mutually exclusive (one name wins):
+                   each held market winning alone, plus none of them unless
+                   the book holds every market of the event
+      independent  not exclusive (mention words): worst = gross
+      unknown      no structure read yet: worst = gross (conservative)
+    A scalar market (fractional settlement) is never netted."""
+    gross = 0.0
+    live = []
+    for t, pos, mk in holdings:
+        w = market_worst(pos, mk)
+        if mk is None or abs(pos) < 1e-9:
+            continue
+        gross += w
+        live.append((t, pos, mk, w))
+    if not live:
+        return 0.0, 0.0, "flat"
+    binaries, scalars = [], 0.0
+    for t, pos, mk, w in live:
+        s = struct.get(t)
+        if s is not None and len(s) > 3 and s[3] == "scalar":
+            scalars += w
+        else:
+            binaries.append((t, pos, mk, s))
+    g = round(gross, 4)
+    if not binaries:
+        return g, g, "independent"
+    if any(s is None for _t, _p, _m, s in binaries):
+        return g, g, "unknown"
+
+    def pnl(paid):
+        return sum(pos * ((100.0 if t in paid else 0.0) - mk) / 100.0
+                   for t, pos, mk, _s in binaries)
+
+    if all(s[0] in NUMERIC_STRIKES and _strike_usable(s) for _t, _p, _m, s in binaries):
+        vals = sorted({x for _t, _p, _m, s in binaries for x in (s[1], s[2]) if x is not None})
+        pts = [vals[0] - 1.0, vals[-1] + 1.0]
+        for x in vals:
+            eps = 1e-6 * max(1.0, abs(x))
+            pts += [x - eps, x, x + eps]
+        worst = min(pnl({t for t, _p, _m, s in binaries if strike_pays(s[0], s[1], s[2], v)})
+                    for v in pts)
+        return round(min(worst, 0.0) + scalars, 4), g, "strikes"
+    if me:
+        names = [t for t, _p, _m, _s in binaries]
+        scen = [pnl({t}) for t in names]
+        if not (n_event and len(names) >= n_event):
+            scen.append(pnl(set()))
+        return round(min(min(scen), 0.0) + scalars, 4), g, "exclusive"
+    if me is False:
+        return g, g, "independent"
+    return g, g, "unknown"
+
+
+# which family a code / config change is about, by name: a commit subject or
+# an IMM_* knob mentioning these words. Crude on purpose and labelled as such
+# on the page ("matched by name"); every change is listed there regardless.
+_CHANGE_FAMILY_WORDS = (
+    ("Gas & diesel", ("GAS", "DIESEL", "AAA")),
+    ("Carbon Arc consumer", ("CARBON ARC", "CARBONARC", "IMM_CA_", "CARBON_ARC")),
+    ("Weather & quakes", ("RAIN", "QUAKE", "USGS", "HOURLY TEMP", "KXTEMP", "WEATHER", "HURRICANE")),
+    ("Econ & rates", ("TREASURY", "CPI", "MORTGAGE", "_MORT", " MORT", "RATES", "FOMC", "YIELD",
+                      "KXUST", "PAYROLL", "INFLATION")),
+    ("Sports & awards", ("SPORTS", "LADDER", "ESCALATOR", "NFL", "MLB", "NBA", "NHL", "AWARD",
+                         "VENUE", "OSCAR", "GRAMMY", "TABLE TENNIS")),
+    ("TRUMP mentions", ("TRUMPMENTION", "TRUMP MENTION", "MENTION GATE", "DEPTH_GATE", "DEPTH GATE")),
+    ("Earnings mentions", ("EARNINGS",)),
+    ("Politics & approval", ("APPROVE", "APPROVAL", "APRPOTUS", "POLITIC")),
+    ("Elections", ("ELECTION",)),
+    ("AI & tech", ("VERCEL", "OPENROUTER", "TOKENUSE", "LM ARENA", "GPU", "DATACENTER", "B200")),
+    ("Rotten Tomatoes", ("KXRT", "ROTTEN")),
+    ("Company KPIs", ("KPI", "FOOD PRICE", "CHIPBURRITO", "SPICE")),
+    ("Commodities & shipping", ("CRUDE", "SHIPPING", "STRAIT", "FREIGHT", "SPRLVL")),
+    ("Crypto", ("CRYPTO", "KXBTC")),
+)
+
+
+def change_families(text: str):
+    """Families a change's subject / knob names mention (sorted)."""
+    u = (text or "").upper()
+    return sorted({fam for fam, words in _CHANGE_FAMILY_WORDS if any(w in u for w in words)})
+
+
+def parse_changes(rows):
+    """[{ts, sha, prev, keys, nkeys, vals}]: one entry per bot run whose code
+    (git_sha) or IMM_* launcher config differs from the run before it, from
+    config_history rows in any order. A restart onto the same code and config
+    is not a change."""
+    out, prev = [], None
+    for r in sorted(rows, key=lambda x: iso_ts(x.get("ts"))):
+        cfg = {k: str(v) for k, v in (r.get("config") or {}).items() if str(k).startswith("IMM_")}
+        sha = str(r.get("git_sha") or "")
+        ts = iso_ts(r.get("ts"))
+        if prev is not None and ts:
+            pcfg, psha = prev
+            keys = sorted(k for k in set(cfg) | set(pcfg) if cfg.get(k) != pcfg.get(k))
+            if keys or (sha and psha and sha != psha):
+                out.append({"ts": ts, "sha": sha, "prev": psha, "keys": keys[:12], "nkeys": len(keys),
+                            "vals": {k: [(pcfg.get(k) or "")[:60], (cfg.get(k) or "")[:60]]
+                                     for k in keys[:6]}})
+        prev = (cfg, sha)
+    return out
+
+
+def rollup_realization(calib, fam_of):
+    """Kalshi-paid vs modeled per dashboard family, from imm_reward_recon's
+    calibration (settled events only, so periods match): the post-amendment
+    series on the RAW estimate when the calibration carries them
+    (credited / est: the $1 floor and model error together), else every
+    settled series on the FLOORED estimate (credited / est_floor).
+    -> {"basis", "generated_at", "fams": {fam: [credited, est, events]}, "all"}."""
+    calib = calib or {}
+    pa = (calib.get("post_amendment") or {}).get("series")
+    basis, src = ("raw", pa) if pa else ("floored", calib.get("series") or {})
+    fams = defaultdict(lambda: [0.0, 0.0, 0])
+    for ser, v in src.items():
+        if not isinstance(v, dict):
+            continue
+        est = _f(v.get("est")) if basis == "raw" else _f(v.get("est_floor"))
+        a = fams[fam_of(ser)]
+        a[0] += _f(v.get("credited"))
+        a[1] += est
+        a[2] += int(_f(v.get("n")))
+    tot = [sum(a[0] for a in fams.values()), sum(a[1] for a in fams.values()),
+           sum(a[2] for a in fams.values())]
+    return {"basis": basis, "generated_at": calib.get("generated_at"),
+            "fams": {k: [round(a[0], 2), round(a[1], 2), a[2]] for k, a in sorted(fams.items())},
+            "all": [round(tot[0], 2), round(tot[1], 2), tot[2]]}
+
+
+# ----------------------------------------------------------------------------
 # Cache
 # ----------------------------------------------------------------------------
 
@@ -648,9 +907,10 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = 
          gone    [(ticker, pos, avg, mark, last_seen_ts, first_missing_ts)]
          came    [(ticker, first_seen_ts)] between consecutive snapshots
          edges   {et_midnight_ts: (snap_ts, book)} -- first snapshot of each ET day
-    `queries` {key: (ticker, target_ts)} is answered in place with the first
-    snapshot mark at or after target_ts (within MARKOUT_MAX_LAG): the fill
-    mark-outs, resolved while the rows are in memory."""
+    `queries` {key: (ticker, target_ts[, max_lag])} is answered in place with
+    the first snapshot mark at or after target_ts (within max_lag, default
+    MARKOUT_MAX_LAG): the fill mark-outs, resolved while the rows are in
+    memory."""
     snaps = defaultdict(dict)
     for r in iter_jsonl(path):
         ts = iso_ts(r.get("ts"))
@@ -700,19 +960,18 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = 
     if queries:
         # per ticker: sorted [(ts, mark)] only for tickers queried
         want = defaultdict(list)
-        for key, (t, target) in queries.items():
-            want[t].append((target, key))
+        for key, q in queries.items():
+            want[q[0]].append((q[1], q[2] if len(q) > 2 else MARKOUT_MAX_LAG, key))
         for t, lst in want.items():
             series = [(ts, snaps[ts][t][2]) for ts in order if t in snaps[ts]
                       and snaps[ts][t][2] is not None]
             if not series:
                 continue
-            for target, key in lst:
-                for ts, mk in series:
-                    if ts >= target:
-                        if ts - target <= MARKOUT_MAX_LAG:
-                            queries[key] = ("ok", mk, ts)
-                        break
+            stamps = [s[0] for s in series]
+            for target, lag, key in lst:
+                i = bisect.bisect_left(stamps, target)
+                if i < len(series) and series[i][0] - target <= lag:
+                    queries[key] = ("ok", series[i][1], series[i][0])
     return {"totals": totals, "hours": hours if keep_hours else {}, "last": last,
             "first": first, "gone": gone, "came": came, "edges": edges}
 
@@ -755,13 +1014,21 @@ def load_fills(first_day: str):
             if fid in seen:
                 continue
             seen.add(fid)
+            # the external book the bot read the cycle before the fill (the
+            # context the order was priced on): its mid is the edge's
+            # reference. Only a live two-sided book has one (99% of maker
+            # fills), and -- the bot's own mark rule -- not a book 50c+ wide
+            # (KXSPRLVL 37 x 88 on 10/1 put a 91c sale "28c over mid")
+            xb, xa = _f(r.get("ext_bid"), None), _f(r.get("ext_ask"), None)
+            mid = ((xb + xa) / 2.0 if (xb is not None and xa is not None and 0 < xb < xa < 100
+                                        and xa - xb < EDGE_MAX_SPREAD) else None)
             out.append({
                 "id": fid, "ts": ts, "t": t,
                 "ev": r.get("event_ticker") or event_of(t), "side": side, "px": px,
                 "n": cnt, "taker": bool(r.get("is_taker")), "pad": bool(r.get("is_pad")),
                 "scan": bool(r.get("is_scan")),
                 "pos0": _f(r.get("pos_before")), "pos1": _f(r.get("pos_after")),
-                "bid": r.get("ext_bid"), "ask": r.get("ext_ask"),
+                "bid": r.get("ext_bid"), "ask": r.get("ext_ask"), "mid": mid,
                 "age": r.get("order_age_secs"),
                 # when the bot BOOKED it (fills are polled ~1s into a cycle);
                 # a snapshot stamped at that cycle's start already holds it
@@ -919,6 +1186,24 @@ def _kalshi_markets(tickers):
         for m in js.get("markets") or []:
             out[m.get("ticker")] = m
     return out
+
+
+def _kalshi_event(ev):
+    """{"mutually_exclusive", "markets"} for one Kalshi event (signed GET
+    /events/{ev} with its markets), or None when Kalshi has no such event."""
+    sys.path.insert(0, HERE)
+    from kalshi_reads import kalshi_get
+    try:
+        js = kalshi_get(f"/events/{ev}", {"with_nested_markets": "true"})
+    except Exception as e:
+        if getattr(e, "status", None) == 404:
+            return None
+        raise
+    e = js.get("event") or {}
+    if not e:
+        return None
+    return {"mutually_exclusive": e.get("mutually_exclusive"),
+            "markets": e.get("markets") or js.get("markets") or []}
 
 
 def _import_imm():
@@ -1141,6 +1426,11 @@ class Builder:
         self.timing = {}
         self.exits = []
         self.market_lookup = None     # tests inject {ticker: market} lookups
+        self.event_lookup = None      # ... and an event -> {mutually_exclusive, markets} one
+        self.mrec, self.evmeta = {}, {}
+        self.now_values = {}
+        self.markouts_h = {}
+        self.env = {}
 
     def _t(self, name, t0):
         self.timing[name] = round(time.time() - t0, 2)
@@ -1211,16 +1501,30 @@ class Builder:
 
     def _load_marks(self):
         cache = FileCache("marks")
-        mk_cache_path = os.path.join(CACHE_DIR, "markouts.json")
-        mk_cache = load_json(mk_cache_path, {})
+        # {fill id: {horizon key: [mark, snapshot ts] or None (no mark in time)}};
+        # the 30-minute marks of the single-horizon cache carry over unchanged
+        mk_cache_path = os.path.join(CACHE_DIR, "markouts_h.json")
+        if os.path.exists(mk_cache_path):
+            mk_cache = load_json(mk_cache_path, {})
+        else:
+            old = load_json(os.path.join(CACHE_DIR, "markouts.json"), {})
+            mk_cache = {k: {"mk": v} for k, v in old.items()}
         # mark-out queries for fills that do not have one yet and are due
         queries = {}
         for f in self.fills:
-            if f["pad"] or f["taker"] or f["id"] in mk_cache:
+            if f["pad"] or f["taker"]:
                 continue
-            target = f["ts"] + MARKOUT_SECS
-            if target <= self.now - 60:
-                queries[f["id"]] = (f["t"], target)
+            have = mk_cache.get(f["id"]) or {}
+            for hk, secs, lag in MARKOUT_HORIZONS:
+                if hk in have:
+                    continue
+                target = f["ts"] + secs
+                if target <= self.now - 60:
+                    queries[f["id"] + "|" + hk] = (f["t"], target, lag)
+
+        def store(key, v):
+            fid, _, hk = key.rpartition("|")
+            mk_cache.setdefault(fid, {})[hk] = v
         self.snap_totals = []            # [(ts, U, n, gross)]
         self.hour_snaps = {}             # {utc_hour: (ts, book)}
         self.last_snap = (0.0, {})
@@ -1237,25 +1541,28 @@ class Builder:
             val = cache.get(path) if complete else None
             if val is not None and keep_hours and not val.get("hours") and val.get("totals"):
                 val = None            # cached without detail: re-parse
+            # queries whose target falls in (or before the end of) this file
+            end = dt_day + 86400 + MARKOUT_MAX_LAG
+            q = {k: v for k, v in queries.items() if dt_day - 86400 <= v[1] <= end}
+            if val is not None and any(v[1] < dt_day + 86400 for v in q.values()):
+                val = None            # a completed file still owes mark-outs (a new horizon)
             if val is None:
-                # queries whose target falls in (or before the end of) this file
-                end = dt_day + 86400 + MARKOUT_MAX_LAG
-                q = {k: v for k, v in queries.items() if dt_day - 86400 <= v[1] <= end}
                 val = parse_marks_file(path, keep_hours=True, queries=q,
                                        max_ts=None if complete else self.now)
                 for k, v in q.items():
                     if isinstance(v, tuple) and v and v[0] == "ok":
-                        mk_cache[k] = [round(v[1], 3), round(v[2], 1)]
+                        store(k, [round(v[1], 3), round(v[2], 1)])
                         queries.pop(k, None)
                 if complete:
-                    # every query targeting a completed file is final now
+                    # every query this completed file was the last chance for is final
                     for k, v in list(queries.items()):
-                        if dt_day <= v[1] < dt_day + 86400 - MARKOUT_MAX_LAG:
-                            mk_cache[k] = None
+                        if v[1] < dt_day + 86400 - v[2]:
+                            store(k, None)
                             queries.pop(k, None)
                     stored = val if keep_hours else dict(val, hours={})
                     cache.put(path, stored)
-                log(f"parsed {os.path.basename(path)}{'' if complete else ' [live]'}")
+                log(f"parsed {os.path.basename(path)}{'' if complete else ' [live]'}"
+                    + (f" ({len(q)} mark-out queries)" if q else ""))
             elif not keep_hours and val.get("hours"):
                 cache.put(path, dict(val, hours={}))
             self.snap_totals.extend(val["totals"])
@@ -1281,6 +1588,11 @@ class Builder:
                     self.last_snap = val["last"]
         cache.prune(keep_names)
         cache.save()
+        # a query no file answered (the bot was down for its whole day) is
+        # final once it is well past
+        for k, v in list(queries.items()):
+            if v[1] + v[2] < self.now - MARKOUT_FINAL_AFTER:
+                store(k, None)
         # keep the mark-out cache bounded to the fills still on the books
         live_ids = {f["id"] for f in self.fills}
         mk_cache = {k: v for k, v in mk_cache.items() if k in live_ids}
@@ -1291,7 +1603,9 @@ class Builder:
             os.replace(mk_cache_path + ".tmp", mk_cache_path)
         except OSError:
             pass
-        self.markouts = mk_cache
+        self.markouts_h = mk_cache
+        # the 30-minute mark-outs as before: absent = pending, None = no mark
+        self.markouts = {k: v["mk"] for k, v in mk_cache.items() if "mk" in v}
         self.snap_totals.sort()
 
 
@@ -1477,6 +1791,169 @@ class Builder:
     def exits_in(self, a: float, b: float):
         return [e for e in self.exits if a <= e["ts"] < b]
 
+    # ---- Kalshi's market records: strike structure and value now ----------------
+    def _wide_mark(self) -> int:
+        try:
+            return int(_f(self.env.get("IMM_MARK_WIDE_SPREAD"), 50))
+        except (TypeError, ValueError, AttributeError):
+            return 50
+
+    def fetch_market_meta(self):
+        """self.mrec {ticker: rec} and self.evmeta {kalshi event: {me, n}}.
+
+        rec = {ev, st, lo, hi, mt} (Kalshi's event ticker, strike type, floor
+        and cap strikes, market type: static, kept forever) + {v, fin, at}
+        (YES value now in cents by the bot's mark rule, or the settlement once
+        final; re-read every MARKET_NOW_TTL until final). Cached in
+        DASH_DIR/cache/markets_meta.json; at most MARKET_READ_BUDGET tickers
+        are read per build, the current book first, then markets traded in
+        the history, then markets held at past ET midnights. The event flag
+        (mutually exclusive, number of markets) is read only for events whose
+        markets carry no numeric strike, EVENT_READ_BUDGET per build."""
+        path = os.path.join(CACHE_DIR, "markets_meta.json")
+        epath = os.path.join(CACHE_DIR, "events_meta.json")
+        rec = load_json(path, {})
+        evm = load_json(epath, {})
+        self.mrec, self.evmeta = rec, evm
+        if not self.api:
+            return
+        held = set(self.last_snap[1])
+        traded, last_fill = [], {}
+        for f in reversed(self.fills):
+            if f["t"] not in last_fill:
+                last_fill[f["t"]] = f["ts"]
+                traded.append(f["t"])
+        past = sorted({t for _h, (_ts, book) in self.hour_snaps.items() for t in book} - held)
+        settled = {s["t"] for s in self.settlements if s["result"] in ("yes", "no", "scalar", "void")}
+
+        def stale(t):
+            r = rec.get(t)
+            if r is None:
+                return True
+            if r.get("fin"):
+                return False
+            # a market traded today moves the to-date mark-outs; an older one
+            # only needs its value now and then
+            ttl = MARKET_NOW_TTL if self.now - last_fill.get(t, 0) < 86400 else 6 * MARKET_NOW_TTL
+            return self.now - _f(r.get("at")) > ttl
+        want, wset = [], set()
+        for group, need in ((sorted(held), lambda t: t not in rec or "st" not in rec[t]),
+                            (traded, lambda t: t not in held and t not in settled and stale(t)),
+                            (past, lambda t: t not in rec)):
+            for t in group:
+                if t not in wset and need(t):
+                    wset.add(t)
+                    want.append(t)
+        want = want[:MARKET_READ_BUDGET]
+        wide = self._wide_mark()
+        changed = False
+        if want:
+            try:
+                got = (self.market_lookup or _kalshi_markets)(want)
+                for t in want:
+                    m = got.get(t)
+                    if m is None:
+                        rec[t] = dict(rec.get(t) or {}, at=self.now, miss=1)
+                        continue
+                    v, fin = market_value_cents(m, wide)
+                    rec[t] = {"ev": m.get("event_ticker") or event_of(t), "st": m.get("strike_type"),
+                              "lo": m.get("floor_strike"), "hi": m.get("cap_strike"),
+                              "mt": m.get("market_type") or "binary", "v": v, "fin": fin,
+                              "at": self.now}
+                changed = True
+                log(f"market records: read {len(want)} (cache {len(rec)})")
+            except Exception as e:
+                log(f"! market records read failed ({e!r}); worst cases and to-date marks use the cache")
+        # word / name events: is exactly one market paid?
+        need_ev = {}
+        for t in held | {t for _h, (_ts, b) in self.hour_snaps.items() for t in b}:
+            r = rec.get(t)
+            if not r or "st" not in r:
+                continue
+            if r.get("st") in NUMERIC_STRIKES and (r.get("lo") is not None or r.get("hi") is not None):
+                continue
+            ev = r.get("ev")
+            if ev and ev not in evm:
+                need_ev[ev] = need_ev.get(ev, 0) + (2 if t in held else 1)
+        todo = sorted(need_ev, key=lambda e: -need_ev[e])[:EVENT_READ_BUDGET]
+        if todo:
+            n_ok = 0
+            for ev in todo:
+                try:
+                    js = (self.event_lookup or _kalshi_event)(ev)
+                except Exception as e:
+                    log(f"! event read {ev} failed ({e!r})")
+                    continue
+                if not js:
+                    evm[ev] = {"me": None, "n": None, "at": self.now}
+                    continue
+                evm[ev] = {"me": bool(js.get("mutually_exclusive")),
+                           "n": len(js.get("markets") or []) or None, "at": self.now}
+                n_ok += 1
+            changed = True
+            log(f"event records: read {n_ok} of {len(todo)}")
+        if changed:
+            try:
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                for p_, obj in ((path, rec), (epath, evm)):
+                    with open(p_ + ".tmp", "w", encoding="utf-8") as f:
+                        json.dump(obj, f)
+                    os.replace(p_ + ".tmp", p_)
+            except OSError:
+                pass
+
+    def struct_of(self, t: str):
+        """(strike type, floor, cap, market type) or None (not read yet)."""
+        r = (getattr(self, "mrec", None) or {}).get(t)
+        if not r or "st" not in r:
+            return None
+        return (r.get("st"), _f(r.get("lo"), None), _f(r.get("hi"), None), r.get("mt") or "binary")
+
+    def _struct_cover(self, held):
+        """How much of the current book the worst case could net: positions
+        whose strike structure has been read, of all held."""
+        return {"held": len(held), "known": sum(1 for t, _p, _m in held if self.struct_of(t) is not None)}
+
+    def build_now_values(self):
+        """self.now_values {ticker: (YES value cents, source)} for every
+        market with a maker fill: what the fill's position is worth today --
+        Kalshi's settlement when it has settled (the bot's settlement rows, the
+        exits resolved against Kalshi, the market record), else the bot's own
+        mark while it holds the market, else the external mid it quotes
+        against, else the market record's touch (the bot's mark rule)."""
+        out = {}
+        for s_ in self.settlements:
+            if s_["result"] in ("yes", "no"):
+                out[s_["t"]] = (100.0 if s_["result"] == "yes" else 0.0, "settled")
+            elif s_["result"] == "scalar" and s_["px"] is not None:
+                out[s_["t"]] = (float(s_["px"]), "settled")
+        for e in self.exits:
+            if e.get("realized") and e.get("settle_px") is not None and e["t"] not in out:
+                out[e["t"]] = (float(e["settle_px"]), "settled")
+        rec = getattr(self, "mrec", None) or {}
+        traded = {f["t"] for f in self.fills}
+        book = self.last_snap[1]
+        for t in traded:
+            if t in out:
+                continue
+            r = rec.get(t) or {}
+            if r.get("fin") and r.get("v") is not None:
+                out[t] = (float(r["v"]), "settled")
+                continue
+            b = book.get(t)
+            if b and b[2] is not None:
+                out[t] = (float(b[2]), "held")
+                continue
+            c = self.last_cycle.get(t)
+            if c:
+                xb, xa = _f(c.get("ext_bid"), None), _f(c.get("ext_ask"), None)
+                if xb is not None and xa is not None and 0 < xb < xa < 100:
+                    out[t] = ((xb + xa) / 2.0, "quoted")
+                    continue
+            if r.get("v") is not None:
+                out[t] = (float(r["v"]), "market")
+        self.now_values = out
+
     # ---- snapshot helpers -------------------------------------------------
     def snap_at(self, t: float):
         """(ts, book) of the first snapshot at or after t -- or the newest
@@ -1522,15 +1999,50 @@ class Builder:
         return self.snap_totals[lo][0], self.snap_totals[lo][1]
 
     # ---- per-window market aggregation -------------------------------------
+    def _last_held_mark(self, t: str, e0: float, e1: float):
+        """The mark of the last snapshot that held `t` before it left the
+        book inside [e0, e1) (its cost when that snapshot had no mark), or
+        None when it did not leave in the window."""
+        idx = getattr(self, "_gone_by", None)
+        if idx is None:
+            idx = defaultdict(list)
+            for g in self.gone:
+                idx[g[0]].append(g)
+            for v in idx.values():
+                v.sort(key=lambda g: g[4])
+            self._gone_by = idx
+        best = None
+        for g in idx.get(t, ()):
+            if e0 <= g[4] < e1 and g[5] <= e1:
+                best = g
+        if best is None:
+            return None
+        return best[3] if best[3] is not None else best[2]
+
     def window_markets(self, w0: float, w1: float, sums=None) -> dict:
         """{ticker: metrics} for one window. `sums` = ({ticker: rewards},
         {ticker: resting $-seconds}) precomputed for the window (the per-day
-        pass buckets every market-hour once instead of once per day)."""
+        pass buckets every market-hour once instead of once per day).
+
+        Trading P&L is split three ways (the parts add up to "pnl" exactly):
+          cr  the position held at the window's start, re-marked from its
+              start mark to its end mark (or to the last mark before it left
+              the book) -- inventory carried in
+          cs  the same start position, from its start mark to Kalshi's
+              settlement, for a market that settled in the window
+          (new fills = pnl - cr - cs: the window's own fills, marked to the
+              window's end or to the settlement)
+        Every maker fill (not a pad, not a taker) is also marked out against
+        its arrival book (fe: edge vs the external mid the cycle before the
+        fill) and at each horizon: m5, mk (30 min), m4 (4 h), mt (to date:
+        the market's value now, or its settlement)."""
         h0, h1 = int(w0 // 3600), int(math.ceil(w1 / 3600.0))
         m = defaultdict(lambda: {"rew": 0.0, "rest_s": 0.0, "real": 0.0, "u0": 0.0,
                                  "u1": 0.0, "xfer": 0.0, "fills": 0, "cts": 0.0,
                                  "usd": 0.0, "mk": 0.0, "mk_n": 0, "mk_cts": 0.0,
-                                 "buy": 0.0, "sell": 0.0, "settled": None})
+                                 "buy": 0.0, "sell": 0.0, "settled": None,
+                                 "fe": 0.0, "fe_cts": 0.0, "m5": 0.0, "m5_cts": 0.0,
+                                 "m4": 0.0, "m4_cts": 0.0, "mt": 0.0, "mt_cts": 0.0})
         if sums is not None:
             for t, v in sums[0].items():
                 m[t]["rew"] += v
@@ -1561,6 +2073,7 @@ class Builder:
                 m[t]["u0"] = u
                 m[t]["pos0"] = s0[1][t][0]
                 m[t]["mk0"] = s0[1][t][2]
+                m[t]["avg0"] = s0[1][t][1]
         if s1:
             for t, u in self.book_u(s1[1]).items():
                 m[t]["u1"] = u
@@ -1574,18 +2087,24 @@ class Builder:
                 continue
             if s["result"] in ("yes", "no"):
                 m[s["t"]]["settled"] = f"settled {str(s['result']).upper()}"
+                m[s["t"]]["_sv"] = 100.0 if s["result"] == "yes" else 0.0
             elif s["result"] in ("scalar", "void") and s["px"] is not None:
                 # booked by the bot itself since 2026-09-29 (its realized
                 # delta is already in "real"); labelled as build_exits labels
                 # the older offset rows it resolves
                 m[s["t"]]["settled"] = f"settled {s['result']} {float(s['px']):.1f}c"
+                m[s["t"]]["_sv"] = float(s["px"])
         for e in self.exits_in(e0, e1):
             mm = m[e["t"]]
             if e["realized"]:
                 mm["real"] += e["amount"]            # a settlement the bot did not book
+                mm["_sv"] = e["settle_px"]
             else:
                 mm["xfer"] += e["amount"]            # out at its last mark
+                mm["_xm"] = e["mark"]
             mm["settled"] = e["label"]
+        mkh = getattr(self, "markouts_h", None) or {}
+        nowv = getattr(self, "now_values", None) or {}
         for f in self.fills:
             if not (w0 <= f["ts"] < w1):
                 continue
@@ -1598,18 +2117,51 @@ class Builder:
                 mm["buy"] += f["n"]
             else:
                 mm["sell"] += f["n"]
+            d = 1.0 if f["side"] == "bid" else -1.0
             mo = self.markouts.get(f["id"])
             if mo:
-                d = 1.0 if f["side"] == "bid" else -1.0
                 mm["mk"] += d * (mo[0] - f["px"]) * f["n"] / 100.0
                 mm["mk_n"] += 1
                 mm["mk_cts"] += f["n"]
+            if f["pad"] or f["taker"]:
+                continue
+            if f.get("mid") is not None:
+                mm["fe"] += d * (f["mid"] - f["px"]) * f["n"] / 100.0
+                mm["fe_cts"] += f["n"]
+            h = mkh.get(f["id"]) or {}
+            for hk in ("m5", "m4"):
+                mo = h.get(hk)
+                if mo:
+                    mm[hk] += d * (mo[0] - f["px"]) * f["n"] / 100.0
+                    mm[hk + "_cts"] += f["n"]
+            nv = nowv.get(f["t"])
+            if nv is not None:
+                mm["mt"] += d * (nv[0] - f["px"]) * f["n"] / 100.0
+                mm["mt_cts"] += f["n"]
         out = {}
         span = max(w1 - w0, 1.0)
         for t, v in m.items():
             v["pnl"] = v["real"] + v["u1"] - v["u0"] + v["xfer"]
             v["net"] = v["rew"] + v["pnl"]
             v["rest_avg"] = v["rest_s"] / span
+            # the start position's share of the P&L: carried in, re-marked to
+            # the window's end (or to its last mark before leaving the book),
+            # or settled by Kalshi; the rest is the window's own fills
+            v["cr"] = v["cs"] = 0.0
+            p0 = v.get("pos0", 0.0)
+            if abs(p0) > 1e-9:
+                m0 = v["mk0"] if v.get("mk0") is not None else v.get("avg0", 0.0)
+                if v.get("_sv") is not None:
+                    v["cs"] = p0 * (v["_sv"] - m0) / 100.0
+                else:
+                    if "pos1" in v:
+                        end = v["mk1"] if v.get("mk1") is not None else v.get("avg1", m0)
+                    elif v.get("_xm") is not None:
+                        end = v["_xm"]
+                    else:
+                        end = self._last_held_mark(t, e0, e1)
+                        end = m0 if end is None else end
+                    v["cr"] = p0 * (end - m0) / 100.0
             if (abs(v["rew"]) < 1e-4 and abs(v["pnl"]) < 1e-4 and not v["fills"]
                     and abs(v.get("pos1", 0.0)) < 1e-9 and abs(v.get("pos0", 0.0)) < 1e-9
                     and v["rest_s"] <= 0 and not v["settled"]):
@@ -1663,10 +2215,39 @@ class Builder:
                            round(v["mk_cts"], 1), round(v["rest_s"] / span, 2),
                            (round(v["pos0"], 2) if "pos0" in v else None),
                            (round(v["pos1"], 2) if "pos1" in v else None),
-                           v.get("mk0"), v.get("mk1"), v["settled"] or 0]
+                           v.get("mk0"), v.get("mk1"), v["settled"] or 0,
+                           round(v["cr"], 4), round(v["cs"], 4), fx_array(v)]
             out[iso] = {"s": a, "e": b, "ok": bool(ok), "e0": e0, "e1": e1, "m": rows,
                         "c": self.curve(a, b, DAY_CURVE_STEP) if ok else
                         [[p[0], p[1], None] for p in self.curve_rewards_only(a, b, DAY_CURVE_STEP)]}
+            if ok:
+                # the book as the day ended: worst case per event at the end
+                # marks, and how many markets rested quotes that day
+                held = [(t, v["pos1"], v["mk1"] if v.get("mk1") is not None else v.get("avg1"))
+                        for t, v in mk.items() if abs(v.get("pos1", 0.0)) > 1e-9]
+                out[iso]["wc"] = self.worst_by_event(held)
+                out[iso]["nq"] = sum(1 for v in mk.values() if v["rest_s"] > 0)
+        return out
+
+    def worst_by_event(self, held):
+        """{dashboard event: [worst, gross, method]} for positions
+        [(ticker, pos, mark)] -- event_worst_case per Kalshi event, summed
+        into the page's event (event_of) when the two ever differ."""
+        groups = defaultdict(list)
+        for t, pos, mk in held:
+            r = (getattr(self, "mrec", None) or {}).get(t) or {}
+            groups[(event_of(t), r.get("ev") or event_of(t))].append((t, pos, mk))
+        out = {}
+        for (ev, kev), hold in groups.items():
+            struct = {t: self.struct_of(t) for t, _p, _m in hold}
+            meta = (getattr(self, "evmeta", None) or {}).get(kev) or {}
+            w, g, how = event_worst_case(hold, {t: s for t, s in struct.items() if s},
+                                         meta.get("me"), meta.get("n"))
+            o = out.setdefault(ev, [0.0, 0.0, how])
+            o[0] = round(o[0] + w, 2)
+            o[1] = round(o[1] + g, 2)
+            if o[2] != how:
+                o[2] = "mixed"
         return out
 
     def curve_rewards_only(self, w0: float, w1: float, step: float):
@@ -1749,6 +2330,129 @@ class Builder:
             t += step
         return pts
 
+    def family_curves(self, w0: float, w1: float, fam_of, step: float = FAMILY_CURVE_STEP):
+        """{"x": [ts], "f": {family: {"r": [cum rewards], "p": [cum trading]}}}
+        every `step` through the window, for the per-family sparklines.
+
+        A point takes the first 5-minute snapshot of its hour (the hourly
+        index), the realized P&L and exits booked before that snapshot, and
+        the rewards of the hours before it; the first and last points use the
+        window's own edge snapshots, so each family's last point equals its
+        window total. None when the hourly snapshot detail (the last
+        DETAIL_DAYS) does not cover the window."""
+        if w0 < self.detail_from:
+            return None
+        s0, s1 = self.snap_at(w0), self.snap_at(w1)
+        if not s0 or not s1:
+            return None
+        xs, books = [w0], [s0]
+        t = (int(w0 // step) + 1) * step
+        while t < w1 - 60:
+            s = self.hour_snaps.get(int(t // 3600))
+            xs.append(t)
+            books.append(s if (s and t <= s[0] <= t + 3600) else None)
+            t += step
+        xs.append(w1)
+        books.append(s1)
+        fam_cache = {}
+
+        def fam(tk):
+            f = fam_cache.get(tk)
+            if f is None:
+                f = fam_cache[tk] = fam_of(tk)
+            return f
+
+        rew_h = getattr(self, "_rew_fam_h", None)
+        if rew_h is None:
+            rew_h = defaultdict(lambda: defaultdict(float))
+            for tk, hs in self.hourly.items():
+                ff = fam(tk)
+                for h, v in hs.items():
+                    rew_h[ff][h] += v
+            self._rew_fam_h = rew_h
+        events = [(ts, fam(tk), d) for ts, tk, _e, d in self.realized if ts >= s0[0]]
+        events += [(e["ts"], fam(e["t"]), e["amount"]) for e in self.exits if e["ts"] >= s0[0]]
+        events.sort()
+        u0 = defaultdict(float)
+        for tk, u in self.book_u(s0[1]).items():
+            u0[fam(tk)] += u
+        out = defaultdict(lambda: {"r": [], "p": []})
+        cum, ei, last_u = defaultdict(float), 0, dict(u0)
+        h0, h_last = int(w0 // 3600), int(math.ceil(w1 / 3600.0))
+        fams = set(rew_h) | set(u0) | {f for _ts, f, _d in events}
+        hv = {f_: sorted((h, v) for h, v in (rew_h.get(f_) or {}).items() if h0 <= h < h_last)
+              for f_ in fams}
+        racc, rptr = defaultdict(float), defaultdict(int)
+        for k, (x, snap) in enumerate(zip(xs, books)):
+            edge = snap[0] if snap else None
+            if snap is not None:
+                uk = defaultdict(float)
+                for tk, u in self.book_u(snap[1]).items():
+                    uk[fam(tk)] += u
+                last_u = uk
+            stop = edge if edge is not None else x
+            while ei < len(events) and events[ei][0] < stop:
+                cum[events[ei][1]] += events[ei][2]
+                ei += 1
+            h_end = h_last if k == len(xs) - 1 else int(x // 3600)
+            for f_ in fams:
+                lst = hv[f_]
+                while rptr[f_] < len(lst) and lst[rptr[f_]][0] < h_end:
+                    racc[f_] += lst[rptr[f_]][1]
+                    rptr[f_] += 1
+                out[f_]["r"].append(round(racc[f_], 2))
+                out[f_]["p"].append(round(cum[f_] + last_u.get(f_, 0.0) - u0.get(f_, 0.0), 2))
+        keep = {f_: v for f_, v in out.items() if any(v["r"]) or any(v["p"])}
+        return {"x": [round(x) for x in xs], "f": keep}
+
+    def load_changes(self, since: float):
+        """Code deploys and launcher-config changes since `since` (parse_changes
+        over config_history_*.jsonl), each with the commits it brought (git log
+        prev..sha, cached) and the families its subject / knobs name."""
+        rows = []
+        first = datetime.fromtimestamp(since - 3 * 86400, timezone.utc).strftime("%Y-%m-%d")
+        for _d, p in day_files("config_history", "jsonl", first):
+            rows.extend(iter_jsonl(p))
+        ch = [c for c in parse_changes(rows) if c["ts"] >= since]
+        subj = self._commit_subjects({(c["prev"], c["sha"]) for c in ch
+                                      if c["sha"] and c["sha"] != c["prev"]})
+        for c in ch:
+            c["subj"] = (subj.get(f"{c['prev']}..{c['sha']}") or []) if c["sha"] != c["prev"] else []
+            c["fams"] = change_families(" ".join(c["subj"] + c["keys"]))
+        return ch
+
+    def _commit_subjects(self, pairs):
+        """{"prev..sha": ["<sha> <subject>", ...]} via `git log`, cached in
+        DASH_DIR/cache/commit_subjects.json (a range git cannot resolve is not
+        cached, so it is retried after the next fetch)."""
+        path = os.path.join(CACHE_DIR, "commit_subjects.json")
+        cache = load_json(path, {})
+        changed = False
+        for prev, sha in sorted(pairs):
+            key = f"{prev}..{sha}"
+            if key in cache:
+                continue
+            rng = [key] if prev else ["-1", sha]
+            try:
+                res = subprocess.run(["git", "-C", HERE, "log", "--format=%h %s", "-n", "12"] + rng,
+                                     capture_output=True, text=True, timeout=15,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception:
+                continue
+            if res.returncode != 0:
+                continue
+            cache[key] = [ln.strip()[:140] for ln in res.stdout.splitlines() if ln.strip()][:8]
+            changed = True
+        if changed:
+            try:
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(cache, f)
+                os.replace(path + ".tmp", path)
+            except OSError:
+                pass
+        return cache
+
     # ---- daily history --------------------------------------------------------
     def daily_history(self):
         today = datetime.fromtimestamp(self.now, ET).date()
@@ -1818,6 +2522,13 @@ class Builder:
             cred_ev[ev] += a
             if d >= d7:
                 cred_ev7[ev] += a
+
+        # Kalshi's market records (strike structure, value now): the worst
+        # cases and the to-date mark-outs need them before any window is cut
+        t1 = time.time()
+        self.fetch_market_meta()
+        self.build_now_values()
+        self._t("market_meta", t1)
 
         # per window
         wins = {}
@@ -1889,6 +2600,11 @@ class Builder:
                 rec["dec"] = sr.get("decision")
                 rec["cutoff"] = iso_ts(sr.get("cutoff")) or None
                 rec["pend"] = iso_ts(sr.get("program_end")) or None
+                if sr.get("decision") == "selected" and sr.get("banked") is not None:
+                    # this program period's modeled accrual, and whether the
+                    # bot projects it to clear Kalshi's $1 per-market floor
+                    rec["fl"] = [round(_f(sr.get("banked")), 3), 1 if sr.get("reaches_min") else 0,
+                                 round(_f(sr.get("projected_total")), 3)]
             for key, (mk, _e) in wins.items():
                 if key == "roll":
                     continue
@@ -1903,6 +2619,13 @@ class Builder:
                              buy=round(v["buy"], 1), sell=round(v["sell"], 1))
                     if v["mk_n"]:
                         o.update(mk=round(v["mk"], 3), mk_n=v["mk_n"], mk_cts=round(v["mk_cts"], 1))
+                    for k in FX_KEYS:
+                        if v[k]:
+                            o[k] = round(v[k], 1 if k.endswith("_cts") else 3)
+                if abs(v["cr"]) > 1e-6:
+                    o["cr"] = round(v["cr"], 4)
+                if abs(v["cs"]) > 1e-6:
+                    o["cs"] = round(v["cs"], 4)
                 if v["rest_avg"] > 0.005:
                     o["rest"] = round(v["rest_avg"], 2)
                 if "mk0" in v:
@@ -1930,6 +2653,35 @@ class Builder:
                                   "cred7": round(cred_ev7.get(ev, 0.0), 2)}
             e["mkts"].append(t)
 
+        # forward risk at the current marks: each market's own worst case and
+        # each event's, netted across strikes / exclusive names
+        book = self.last_snap[1]
+        held = [(t, p, mk if mk is not None else a) for t, (p, a, mk) in book.items()]
+        for t, p, mk in held:
+            if t in markets:
+                markets[t]["wc"] = round(market_worst(p, mk), 2)
+        for ev, v in self.worst_by_event(held).items():
+            if ev in events:
+                events[ev]["wc"] = v
+
+        # per-family intraday curves (the drivers sparklines), the code and
+        # config changes that land on them, and paid-vs-modeled by family
+        t1 = time.time()
+
+        def fam_of_t(tk):
+            r = markets.get(tk)
+            return r["fam"] if r else family_of(series_of(tk), cats.get(series_of(tk), ""))[0]
+        fcurves = {k: self.family_curves(w["start"], w["end"], fam_of_t)
+                   for k, w in self.windows.items() if k in ("today", "yesterday", "24h", "7d")}
+        for dd in days.values():
+            if dd.get("ok"):
+                fc = self.family_curves(dd["s"], dd["e"], fam_of_t)
+                if fc:
+                    dd["fc"] = fc
+        changes = self.load_changes(min(self.windows["7d"]["start"], self.detail_from))
+        realize = rollup_realization(self.calib, lambda s: family_of(s, cats.get(s, ""))[0])
+        self._t("drivers", t1)
+
         per_market_paths = self._market_paths(markets, wins)
 
         # families summary is computed client-side from markets (all windows)
@@ -1954,14 +2706,28 @@ class Builder:
             fr = {"ts": round(f["ts"]), "t": f["t"], "side": f["side"], "px": round(f["px"], 2),
                   "n": round(f["n"], 2), "pad": f["pad"], "taker": f["taker"],
                   "pos1": round(f["pos1"], 1)}
+            d = 1.0 if f["side"] == "bid" else -1.0
             if mo:
-                d = 1.0 if f["side"] == "bid" else -1.0
                 fr["mk"] = round(d * (mo[0] - f["px"]) * f["n"] / 100.0, 3)
                 fr["mkc"] = round(d * (mo[0] - f["px"]), 2)
             elif f["id"] in self.markouts:
                 fr["mk_na"] = 1
             elif f["ts"] + MARKOUT_SECS > self.now:
                 fr["mk_pending"] = 1
+            if not (f["pad"] or f["taker"]):
+                # cents per contract, signed for our side: the edge at the fill
+                # (vs the arrival book's mid) and the other horizons
+                if f.get("mid") is not None:
+                    fr["ec"] = round(d * (f["mid"] - f["px"]), 2)
+                h = self.markouts_h.get(f["id"]) or {}
+                for hk in ("m5", "m4"):
+                    if h.get(hk):
+                        fr[hk + "c"] = round(d * (h[hk][0] - f["px"]), 2)
+                nv = self.now_values.get(f["t"])
+                if nv is not None:
+                    fr["mtc"] = round(d * (nv[0] - f["px"]), 2)
+                    if nv[1] == "settled":
+                        fr["mts"] = 1
             fills_out.append(fr)
 
         health = self._health(cycle_ts)
@@ -1980,7 +2746,9 @@ class Builder:
             "decisions": self._decision_mix(),
             "markets": markets, "events": events, "paths": per_market_paths,
             "curves": curves, "history": hist, "ledger_max": ledger_max,
-            "days": days, "day_fields": list(DAY_FIELDS),
+            "days": days, "day_fields": list(DAY_FIELDS), "fx_keys": list(FX_KEYS),
+            "fcurves": fcurves, "changes": changes, "realize": realize,
+            "struct_cover": self._struct_cover(held),
             "fills": fills_out, "halts": halts, "health": health, "opp": opp,
             "exits": [{"ts": round(e["ts"]), "t": e["t"], "pos": round(e["pos"], 2),
                        "avg": round(e["avg"], 2), "mark": round(e["mark"], 2),

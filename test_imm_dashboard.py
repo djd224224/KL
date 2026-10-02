@@ -252,6 +252,126 @@ class RetimeTests(unittest.TestCase):
         self.assertEqual(eff["KXN-1"], c + 30.0)
 
 
+class MarkRuleTests(unittest.TestCase):
+    """The dashboard's copy of incentive_mm's mark rule (touch_mark_cents)."""
+
+    def test_two_sided_mid_and_wide_book(self):
+        self.assertEqual(dash.touch_mark_cents(40, 44, 41), 42.0)
+        # 50c+ wide: the last trade, clamped inside the touch
+        self.assertEqual(dash.touch_mark_cents(1, 70, 20), 20.0)
+        self.assertEqual(dash.touch_mark_cents(10, 70, 90), 70.0)
+        self.assertEqual(dash.touch_mark_cents(1, 70, None), 35.5)      # no trade: the mid
+
+    def test_one_sided_and_empty(self):
+        self.assertEqual(dash.touch_mark_cents(5, None, 97), 97.0)      # max(last, bid)
+        self.assertEqual(dash.touch_mark_cents(5, None, 3), 5.0)
+        self.assertEqual(dash.touch_mark_cents(None, 30, 45), 30.0)     # min(last, ask)
+        self.assertEqual(dash.touch_mark_cents(None, None, 61), 61.0)
+        self.assertIsNone(dash.touch_mark_cents(5, None, None))
+
+    def test_market_record_value(self):
+        m = {"yes_bid_dollars": "0.0500", "yes_ask_dollars": "1.0000", "last_price_dollars": "0.9700"}
+        self.assertEqual(dash.market_value_cents(m), (97.0, False))     # the $1.00 ask is no offer
+        self.assertEqual(dash.market_value_cents({"result": "yes"}), (100.0, True))
+        self.assertEqual(dash.market_value_cents({"result": "no"}), (0.0, True))
+        self.assertEqual(dash.market_value_cents({"result": "scalar", "settlement_value_dollars": "0.2160"}),
+                         (21.6, True))
+        self.assertEqual(dash.market_value_cents({"result": "void"}), (None, True))
+        self.assertEqual(dash.market_value_cents({"yes_bid_dollars": "0.4100", "yes_ask_dollars": "0.4300",
+                                                  "last_price_dollars": "0.4300"}), (42.0, False))
+
+
+class WorstCaseTests(unittest.TestCase):
+    """event_worst_case: the worst P&L from the marks to settlement."""
+
+    def test_threshold_ladder_nets_across_strikes(self):
+        st = {"A": ("greater", 10.0, None, "binary"), "B": ("greater", 20.0, None, "binary"),
+              "C": ("greater", 30.0, None, "binary")}
+        hold = [("A", 10, 70), ("B", -10, 50), ("C", 5, 20)]
+        w, g, how = dash.event_worst_case(hold, st)
+        # outcomes: below 10 -3.00, 10-20 +7.00, 20-30 -3.00, above 30 +2.00
+        self.assertAlmostEqual(w, -3.0)
+        self.assertAlmostEqual(g, -7.0 - 5.0 - 1.0)
+        self.assertEqual(how, "strikes")
+
+    def test_strict_and_inclusive_boundaries(self):
+        # long "> 10" and short ">= 10": they differ only AT 10 exactly
+        st = {"A": ("greater", 10.0, None, "binary"), "B": ("greater_or_equal", 10.0, None, "binary")}
+        w, _g, _h = dash.event_worst_case([("A", 10, 50), ("B", -10, 50)], st)
+        self.assertAlmostEqual(w, -10.0)          # at exactly 10: B pays, A does not
+
+    def test_point_brackets_short_both(self):
+        st = {"E5": ("between", 38.5, 38.5, "binary"), "E6": ("between", 38.6, 38.6, "binary")}
+        w, g, how = dash.event_worst_case([("E5", -10, 40), ("E6", -10, 40)], st)
+        self.assertAlmostEqual(w, -2.0)           # one bracket pays: -6 + 4
+        self.assertAlmostEqual(g, -12.0)
+        w2, _g2, _h2 = dash.event_worst_case([("E5", 10, 40), ("E6", 10, 40)], st)
+        self.assertAlmostEqual(w2, -8.0)          # neither pays
+
+    def test_exclusive_names(self):
+        st = {t: ("custom", None, None, "binary") for t in "ABC"}
+        short = [("A", -10, 30), ("B", -10, 30)]
+        self.assertAlmostEqual(dash.event_worst_case(short, st, me=True, n_event=3)[0], -4.0)
+        self.assertAlmostEqual(dash.event_worst_case(short, st, me=True, n_event=3)[1], -14.0)
+        long_all = [("A", 10, 30), ("B", 10, 30), ("C", 10, 30)]
+        # holding every name: one of them wins, so nothing is lost
+        self.assertAlmostEqual(dash.event_worst_case(long_all, st, me=True, n_event=3)[0], 0.0)
+        # the event's size unknown: "none of them" stays a scenario
+        self.assertAlmostEqual(dash.event_worst_case(long_all, st, me=True)[0], -9.0)
+
+    def test_independent_unknown_and_scalar(self):
+        st = {"A": ("custom", None, None, "binary"), "B": ("custom", None, None, "binary")}
+        hold = [("A", -10, 30), ("B", -10, 30)]
+        self.assertEqual(dash.event_worst_case(hold, st, me=False), (-14.0, -14.0, "independent"))
+        self.assertEqual(dash.event_worst_case(hold, {"A": st["A"]}, me=True)[2], "unknown")
+        lad = {"A": ("greater", 10.0, None, "binary"), "S": ("greater", 20.0, None, "scalar")}
+        w, g, _h = dash.event_worst_case([("A", 10, 50), ("S", -10, 40)], lad)
+        self.assertAlmostEqual(w, -5.0 - 6.0)     # the scalar is never netted
+        self.assertAlmostEqual(g, -11.0)
+        self.assertEqual(dash.event_worst_case([], {}), (0.0, 0.0, "flat"))
+
+
+class ChangeLogTests(unittest.TestCase):
+    def test_runs_that_change_code_or_imm_config(self):
+        rows = [
+            {"ts": "2026-09-30T10:00:00+00:00", "git_sha": "aaa", "config": {"IMM_X": "1", "OTHER": "a"}},
+            {"ts": "2026-09-30T11:00:00+00:00", "git_sha": "aaa", "config": {"IMM_X": "1", "OTHER": "b"}},
+            {"ts": "2026-09-30T12:00:00+00:00", "git_sha": "bbb", "config": {"IMM_X": "1"}},
+            {"ts": "2026-09-30T13:00:00+00:00", "git_sha": "bbb", "config": {"IMM_X": "0", "IMM_GAS_TRIAL": "1"}},
+        ]
+        ch = dash.parse_changes(list(reversed(rows)))
+        self.assertEqual(len(ch), 2)              # a non-IMM key or a plain restart is no change
+        self.assertEqual((ch[0]["prev"], ch[0]["sha"], ch[0]["keys"]), ("aaa", "bbb", []))
+        self.assertEqual(ch[1]["keys"], ["IMM_GAS_TRIAL", "IMM_X"])
+        self.assertEqual(ch[1]["vals"]["IMM_X"], ["1", "0"])
+
+    def test_family_by_name(self):
+        self.assertEqual(dash.change_families("2958d2f imm Treasury gate: every Treasury market"),
+                         ["Econ & rates"])
+        self.assertIn("Gas & diesel", dash.change_families("IMM_GAS_TRIAL"))
+        self.assertEqual(dash.change_families("imm dashboard: tile copy"), [])
+
+
+class RealizationRollupTests(unittest.TestCase):
+    FAM = staticmethod(lambda s: dash.family_of(s)[0])
+
+    def test_raw_basis_when_the_calibration_has_it(self):
+        cal = {"post_amendment": {"series": {
+            "KXAAAGASD": {"credited": 50.0, "est": 80.0, "est_floor": 60.0, "n": 10},
+            "KXDIESELW": {"credited": 10.0, "est": 20.0, "est_floor": 15.0, "n": 2}}},
+            "series": {"KXAAAGASD": {"credited": 99.0, "est_floor": 1.0, "n": 1}}}
+        r = dash.rollup_realization(cal, self.FAM)
+        self.assertEqual(r["basis"], "raw")
+        self.assertEqual(r["fams"]["Gas & diesel"], [60.0, 100.0, 12])
+
+    def test_floored_basis_falls_back_to_the_lifetime_series(self):
+        r = dash.rollup_realization({"series": {"KXRT": {"credited": 5.0, "est_floor": 4.0, "n": 3,
+                                                         "factor": 1.25}}}, self.FAM)
+        self.assertEqual(r["basis"], "floored")
+        self.assertEqual(r["fams"]["Rotten Tomatoes"], [5.0, 4.0, 3])
+        self.assertEqual(dash.rollup_realization(None, self.FAM)["fams"], {})
+
+
 class RenderTests(unittest.TestCase):
     def test_data_cannot_close_the_script_tag(self):
         page = dash.render({"x": "</script><script>alert(1)</script>", "timing": {}})
@@ -447,6 +567,142 @@ class BuilderIntegrationTests(unittest.TestCase):
         # short 40 from a 2c mark (it opened before the window at 56c) to a NO settlement
         self.assertAlmostEqual(mk["KXV-1"]["pnl"], -40 * (0 - 2) / 100 - 0.0, places=6)
         self.assertEqual(mk["KXV-1"]["settled"], "settled NO")
+
+    # ---- the drivers view: P&L explain, mark-outs, worst cases, curves ----------
+    def _assert_explain_adds_up(self, w):
+        new = w["pnl"] - w.get("cr", 0.0) - w.get("cs", 0.0)
+        self.assertAlmostEqual(w.get("cr", 0.0) + w.get("cs", 0.0) + new, w["pnl"], places=9)
+        return new
+
+    def test_trading_pnl_explain(self):
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        w = {t: m["markets"][t]["w"]["today"] for t in ("KXA-1", "KXB-1", "KXC-1", "KXV-1", "KXP-1")}
+        # KXA: 10 carried from a 55c start mark to the 60c end mark; the day's
+        # own fill (bought 5 @ 50) is worth 5 x 10c at the end
+        self.assertAlmostEqual(w["KXA-1"]["cr"], 10 * (60 - 55) / 100, places=6)
+        self.assertNotIn("cs", w["KXA-1"])
+        self.assertAlmostEqual(self._assert_explain_adds_up(w["KXA-1"]), 5 * (60 - 50) / 100, places=2)
+        # KXB: carried 30 -> 31 then out at that last mark (no API): all carry
+        self.assertAlmostEqual(w["KXB-1"]["cr"], 5 * (31 - 30) / 100, places=6)
+        self.assertAlmostEqual(self._assert_explain_adds_up(w["KXB-1"]), 0.0, places=9)
+        # KXC: short 4 from a 50c start mark, settled YES: all settlement carry
+        self.assertAlmostEqual(w["KXC-1"]["cs"], -4 * (100 - 50) / 100, places=6)
+        self.assertAlmostEqual(self._assert_explain_adds_up(w["KXC-1"]), 0.0, places=9)
+        # KXV: out at its unchanged 2c mark; KXP: no start position, all "new"
+        self.assertAlmostEqual(w["KXV-1"]["pnl"], 0.0, places=9)
+        self.assertNotIn("cr", w["KXP-1"])
+        self.assertAlmostEqual(self._assert_explain_adds_up(w["KXP-1"]), w["KXP-1"]["pnl"], places=9)
+
+    def test_explain_on_settlements_resolved_by_kalshi(self):
+        b = self._exits({
+            "KXB-1": {"ticker": "KXB-1", "status": "finalized", "result": "scalar",
+                      "settlement_value_dollars": "0.1200", "settlement_ts": "2026-09-28T11:59:00Z"},
+            "KXV-1": {"ticker": "KXV-1", "status": "finalized", "result": "no",
+                      "settlement_ts": "2026-09-28T11:00:00Z"}})
+        mk, _e = b.window_markets(b.windows["today"]["start"], b.windows["today"]["end"])
+        self.assertAlmostEqual(mk["KXB-1"]["cs"], 5 * (12 - 30) / 100, places=6)
+        self.assertAlmostEqual(mk["KXB-1"]["cs"], mk["KXB-1"]["pnl"], places=9)
+        self.assertAlmostEqual(mk["KXV-1"]["cs"], -40 * (0 - 2) / 100, places=6)
+        self.assertEqual(mk["KXV-1"]["cr"], 0.0)
+
+    def test_multi_horizon_markouts(self):
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        a = m["markets"]["KXA-1"]["w"]["today"]
+        # bought 5 @ 50 at 10:00: the first KXA-1 snapshot after 10:05 is
+        # 10:33 -- too late for the 5-minute read; 4h = the 14:00 mark (52c);
+        # to date = the 60c mark the bot holds it at now
+        self.assertNotIn("m5", a)
+        self.assertAlmostEqual(a["m4"], 5 * (52 - 50) / 100, places=6)
+        self.assertAlmostEqual(a["mt"], 5 * (60 - 50) / 100, places=6)
+        self.assertEqual(a["mt_cts"], 5)
+        self.assertNotIn("fe", a)                  # no arrival book on this fill row
+        f = [x for x in m["fills"] if x["t"] == "KXA-1"][0]
+        self.assertEqual((f["mkc"], f["m4c"], f["mtc"]), (-5.0, 2.0, 10.0))
+        self.assertNotIn("m5c", f)
+        # a second build answers nothing twice and keeps every horizon
+        m2 = dash.Builder(self.NOW, api=False, api_force=False).build()
+        self.assertEqual(m2["markets"]["KXA-1"]["w"]["today"].get("m4"), a["m4"])
+
+    def _closed_market_fill(self):
+        with open(os.path.join(self.dir, "fills_2026-09-28.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": _ts("2026-09-28T11:00:00Z"), "fill_id": "f9", "ticker": "KXE-1",
+                                "event_ticker": "KXE", "side": "yes", "action": "sell", "count": 3,
+                                "yes_price_cents": 41, "is_taker": False, "our_book_side": "ask",
+                                "is_pad": False, "pos_before": 0, "pos_after": -3,
+                                "ext_bid": 38, "ext_ask": 42}) + "\n")
+
+    def _with_records(self, records, events=None):
+        b = dash.Builder(self.NOW, api=True, api_force=False)
+        b.load()
+        b.market_lookup = lambda tickers: {t: records[t] for t in tickers if t in records}
+        b.event_lookup = lambda ev: (events or {}).get(ev)
+        b.build_exits()
+        b.fetch_market_meta()
+        b.build_now_values()
+        return b
+
+    def test_edge_and_to_date_on_a_market_no_longer_held(self):
+        self._closed_market_fill()
+        b = self._with_records({"KXE-1": {"ticker": "KXE-1", "event_ticker": "KXE", "strike_type": "greater",
+                                          "floor_strike": 5, "market_type": "binary", "yes_bid_dollars": "0.3500",
+                                          "yes_ask_dollars": "0.3700", "last_price_dollars": "0.3600"}})
+        self.assertEqual(b.now_values["KXE-1"], (36.0, "market"))
+        mk, _e = b.window_markets(b.windows["today"]["start"], b.windows["today"]["end"])
+        e = mk["KXE-1"]
+        # sold 3 @ 41 into a 38 x 42 book: 1c of edge; the market is 36 now
+        self.assertAlmostEqual(e["fe"], 3 * 1 / 100, places=6)
+        self.assertEqual(e["fe_cts"], 3)
+        self.assertAlmostEqual(e["mt"], 3 * (41 - 36) / 100, places=6)
+        # the market records are cached: a second build reads nothing new
+        calls = []
+        b2 = dash.Builder(self.NOW, api=True, api_force=False)
+        b2.load()
+        b2.market_lookup = lambda tickers: calls.append(list(tickers)) or {}
+        b2.event_lookup = lambda ev: None
+        b2.fetch_market_meta()
+        self.assertFalse(any("KXE-1" in c for c in calls))
+
+    def test_worst_case_now_uses_kalshi_structure(self):
+        recs = {"KXA-1": {"ticker": "KXA-1", "event_ticker": "KXA", "strike_type": "greater",
+                          "floor_strike": 10, "market_type": "binary"},
+                "KXP-1": {"ticker": "KXP-1", "event_ticker": "KXP", "strike_type": "custom",
+                          "custom_strike": {"Word": "x"}, "market_type": "binary"}}
+        b = self._with_records(recs, {"KXP": {"mutually_exclusive": False, "markets": [{}, {}]}})
+        self.assertEqual(b.struct_of("KXA-1"), ("greater", 10.0, None, "binary"))
+        self.assertEqual(b.evmeta["KXP"]["me"], False)
+        held = [(t, p, mk) for t, (p, _a, mk) in b.last_snap[1].items()]
+        wc = b.worst_by_event(held)
+        self.assertEqual(wc["KXA"], [-9.0, -9.0, "strikes"])          # long 15 @ 60
+        self.assertEqual(wc["KXP"], [-0.98, -0.98, "independent"])    # long 7 @ 14
+
+    def test_family_curves_end_on_the_window_totals(self):
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        fc = m["fcurves"]["today"]
+        self.assertEqual(fc["x"][0], round(m["windows"]["today"]["start"]))
+        self.assertEqual(fc["x"][-1], round(m["windows"]["today"]["end"]))
+        fam = fc["f"]["Other prints"]
+        tot_p = sum(v["w"]["today"]["pnl"] for v in m["markets"].values() if "today" in v["w"])
+        tot_r = sum(v["w"]["today"]["rew"] for v in m["markets"].values() if "today" in v["w"])
+        self.assertAlmostEqual(fam["p"][-1], tot_p, places=1)
+        self.assertAlmostEqual(fam["r"][-1], tot_r, places=2)
+        self.assertEqual(len(fam["p"]), len(fc["x"]))
+        # the day view's curve is the same
+        self.assertEqual(m["days"]["2026-09-28"]["fc"]["f"]["Other prints"]["p"][-1], fam["p"][-1])
+
+    def test_day_rows_carry_the_explain_and_the_book_at_the_close(self):
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        d, f = m["days"]["2026-09-28"], m["day_fields"]
+        for t, row in d["m"].items():
+            w = m["markets"][t]["w"]["today"]
+            self.assertAlmostEqual(row[f.index("cr")], w.get("cr", 0.0), places=4)
+            self.assertAlmostEqual(row[f.index("cs")], w.get("cs", 0.0), places=4)
+        fx = d["m"]["KXA-1"][f.index("fx")]
+        self.assertEqual(dict(zip(m["fx_keys"], fx))["m4"], round(5 * (52 - 50) / 100, 3))
+        self.assertEqual(d["m"]["KXC-1"][f.index("fx")], 0)            # no fills that day
+        # held at the close: KXA-1 and KXP-1, no structure read (no API) -> gross
+        self.assertEqual(set(d["wc"]), {"KXA", "KXP"})
+        self.assertEqual(d["wc"]["KXA"][2], "unknown")
+        self.assertGreaterEqual(d["nq"], 1)
 
     def test_scalar_settlement_booked_by_the_bot_counts_once(self):
         # since 2026-09-29 the bot books a scalar settlement itself: a
