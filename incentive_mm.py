@@ -86,6 +86,7 @@ import requests
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
+import imm_account
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
 
 # UNENCODABLE OUTPUT NEVER KILLS A TASK (2026-09-29). Every "KL imm *" email
@@ -111,7 +112,11 @@ CLIENT_ORDER_PREFIX = "imm"   # client_order_ids: imm-<run>-<hex>
 # ----------------------------------------------------------------------------
 
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
+# The IMM's own Kalshi account when IMM_KALSHI_API_KEY_ID +
+# IMM_KALSHI_PRIVATE_KEY_PATH are set (2026-10-02, imm_account.py); else the
+# fleet key every other bot signs with, exactly as before.
+IMM_ACCOUNT = imm_account.resolve()
+KEY_ID = IMM_ACCOUNT.key_id
 
 ET = pytz.timezone("US/Eastern")
 CT = pytz.timezone("US/Central")
@@ -10355,6 +10360,9 @@ class PnlTracker:
 # ----------------------------------------------------------------------------
 
 def load_private_key():
+    if IMM_ACCOUNT.is_imm:
+        # the IMM's own account: its key or nothing, never the fleet's
+        return imm_account.load_imm_key(IMM_ACCOUNT)
     pem_b64 = os.environ.get("KALSHI_PRIVATE_KEY")
     if pem_b64:
         try:
@@ -10829,6 +10837,9 @@ class IncentiveMarketMaker:
         self._guard_prev: Dict[str, str] = {}     # last FULL cycle: ticker -> guard
         self._guard_snap_at = 0.0                 # hourly guard snapshot
         self._floor_state_prev: Dict[str, tuple] = {}   # member floor-state trigger
+        # Whose account imm_state.json describes (see state_account_mismatch):
+        # a fresh state is this process's; _load_persist reads a file's own.
+        self._state_owner = KEY_ID
         self._load_persist()
         # The fill high-water mark this process inherited, before its first
         # fills read moves it: the startup reconcile looks for unbooked fills
@@ -10844,6 +10855,26 @@ class IncentiveMarketMaker:
     PERSIST_PATH = os.path.join(STATUS_DIR, "imm_state.json")
 
     ORDER_JOURNAL_PATH = os.path.join(STATUS_DIR, "imm_order_journal.jsonl")
+
+    def state_account_mismatch(self) -> Optional[str]:
+        """Why this process must not trade on the persisted state, or None.
+
+        imm_state.json describes ONE account (2026-10-02): its positions, its
+        order ids, the reward accrual banked there, the P&L carry and the
+        balance-floor anchor. Read against another account it would manage
+        inventory that is not there, protect accrual never earned there and
+        anchor the balance floor to the wrong balance. main() refuses a live
+        start and --cancel-all on a mismatch; dry runs and tests never ask."""
+        if self._state_owner == KEY_ID:
+            return None
+        return (f"{self.PERSIST_PATH} belongs to Kalshi key "
+                f"{self._state_owner[:8]}..., but this process signs as "
+                f"{KEY_ID[:8]}... ({IMM_ACCOUNT.source}). Either sign as the "
+                f"account that owns it (the IMM_KALSHI_* user variables, see "
+                f"imm_account.py) or, to move to this account: stop the bot, "
+                f"--cancel-all while still signing as the old account, then "
+                f"archive imm_state.json, imm_order_journal.jsonl and "
+                f"{RESTART_HANDOFF_FILE} before starting it here.")
 
     # ------------------------------------------------------------------
     # Structured analytics sinks
@@ -11412,6 +11443,10 @@ class IncentiveMarketMaker:
         try:
             with open(self.PERSIST_PATH, encoding="utf-8") as f:
                 data = json.load(f)
+            # A file from before 2026-10-02 names no owner: it can only be the
+            # fleet account's, the one account the IMM traded until then.
+            self._state_owner = str(data.get("account_key_id")
+                                    or imm_account.fleet_key_id())
             self.state.known_tickers = set(data.get("known_tickers") or [])
             self.state.last_fill_ts = int(data.get("last_fill_ts") or 0)
             self.state.seen_fill_ids = {str(k): int(v) for k, v in
@@ -11718,7 +11753,8 @@ class IncentiveMarketMaker:
             self.state.our_order_ids = {k: v for k, v in self.state.our_order_ids.items()
                                         if v >= horizon}
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"known_tickers": sorted(self.state.known_tickers),
+                json.dump({"account_key_id": self._state_owner,
+                           "known_tickers": sorted(self.state.known_tickers),
                            "selected_tickers": sorted(set(self.state.selected)
                                                       | self.state.sticky_prev),
                            "last_fill_ts": self.state.last_fill_ts,
@@ -18049,6 +18085,10 @@ def build_client() -> ExchangeClient:
                             key_id=KEY_ID, private_key=private_key)
     status = client.get_exchange_status()
     log(f"exchange status: {status}")
+    # Which account, by the key id's first 8 characters -- enough to tell
+    # accounts apart. No balance here: GitHub Actions call build_client too,
+    # and their logs are public (main() logs the bot's balance locally).
+    log(f"kalshi account: key {KEY_ID[:8]}... ({IMM_ACCOUNT.source})")
     return client
 
 
@@ -18128,6 +18168,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if ok else 1
 
     client = build_client()
+    try:
+        log(f"[IMM] account balance ${float(client.get_balance().get('balance_dollars') or 0.0):,.2f} "
+            f"(key {KEY_ID[:8]}...)")
+    except Exception as e:
+        log(f"[IMM] ! account balance read failed ({e})")
 
     if HOUR_SIZE_MULTS:
         log(f"[IMM] hour-size multipliers (ET hour -> x, long-dated only): "
@@ -18176,6 +18221,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cancel_all:
         bot = IncentiveMarketMaker(client, live=True)
+        why = bot.state_account_mismatch()
+        if why:
+            log(f"[IMM] ! --cancel-all REFUSED: {why}")
+            return 2
         n = bot.cancel_all_bot_orders()
         log(f"cancelled {n} real resting imm- orders")
         return 0
@@ -18184,6 +18233,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.status:
         bot.print_status_table()
         return 0
+    why = bot.state_account_mismatch() if args.live else None
+    if why:
+        log(f"[IMM] ! live start REFUSED: {why}")
+        return 2
     bot.run(once=args.once)
     return 0
 

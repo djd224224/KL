@@ -12,6 +12,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+import imm_account
 import incentive_mm as imm
 
 # The Saturday step-up verdict is a LIVE runtime file (run-logs/incentive-mm/
@@ -18482,6 +18483,126 @@ class TestRestartRequest(unittest.TestCase):
             self._request(time.time())
             self.assertFalse(self._bot(live=False)._restart_requested())
         self.assertTrue(os.path.exists(imm.restart_request_path()))    # untouched
+
+
+class TestImmOwnAccount(unittest.TestCase):
+    """2026-10-02: the IMM can sign as its own Kalshi account (imm_account.py),
+    and imm_state.json names the account it describes -- a live start or
+    --cancel-all on another account's state is refused."""
+
+    OTHER = "0a1b2c3d-0000-4000-8000-000000000000"
+
+    def setUp(self):
+        _clean_persist()
+
+    def tearDown(self):
+        _clean_persist()
+
+    def _bot(self):
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def _state(self):
+        with open(IncentiveMarketMaker.PERSIST_PATH, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _main(self, argv, key_id):
+        run, cancel = mock.MagicMock(), mock.MagicMock(return_value=0)
+        with mock.patch.object(imm, "KEY_ID", key_id), \
+                mock.patch.object(imm, "build_client", return_value=FakeClient()), \
+                mock.patch.object(imm, "load_daily_series_file", return_value=0), \
+                mock.patch.object(IncentiveMarketMaker, "run", run), \
+                mock.patch.object(IncentiveMarketMaker, "cancel_all_bot_orders", cancel):
+            rc = imm.main(argv)
+        return rc, run, cancel
+
+    def test_a_fresh_state_is_this_accounts_and_says_so(self):
+        bot = self._bot()
+        self.assertIsNone(bot.state_account_mismatch())
+        bot._save_persist()
+        self.assertEqual(self._state()["account_key_id"], imm.KEY_ID)
+
+    def test_a_pre_switch_file_belongs_to_the_fleet_account(self):
+        self._bot()._save_persist()
+        data = self._state()
+        del data["account_key_id"]
+        with open(IncentiveMarketMaker.PERSIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        fleet = imm_account.fleet_key_id()
+        with mock.patch.object(imm, "KEY_ID", fleet):
+            self.assertIsNone(self._bot().state_account_mismatch())
+        with mock.patch.object(imm, "KEY_ID", self.OTHER):
+            why = self._bot().state_account_mismatch()
+        self.assertIn(fleet[:8], why)
+        self.assertIn(self.OTHER[:8], why)
+        self.assertIn("archive imm_state.json", why)
+
+    def test_a_save_on_another_account_keeps_the_owner(self):
+        # a dry run signed as the new account must not launder the old state
+        self._bot()._save_persist()
+        with mock.patch.object(imm, "KEY_ID", self.OTHER):
+            bot = self._bot()
+            bot._save_persist()
+            self.assertIsNotNone(bot.state_account_mismatch())
+        self.assertEqual(self._state()["account_key_id"], imm.KEY_ID)
+
+    def test_a_live_start_on_another_accounts_state_is_refused(self):
+        self._bot()._save_persist()
+        rc, run, _ = self._main(["--live"], self.OTHER)
+        self.assertEqual(rc, 2)
+        run.assert_not_called()
+        rc, run, _ = self._main(["--live"], imm.KEY_ID)
+        self.assertEqual(rc, 0)
+        run.assert_called_once()
+
+    def test_cancel_all_on_another_accounts_state_is_refused(self):
+        self._bot()._save_persist()
+        rc, _, cancel = self._main(["--cancel-all"], self.OTHER)
+        self.assertEqual(rc, 2)
+        cancel.assert_not_called()
+        rc, _, cancel = self._main(["--cancel-all"], imm.KEY_ID)
+        self.assertEqual(rc, 0)
+        cancel.assert_called_once()
+
+    def test_dry_runs_and_status_are_never_refused(self):
+        self._bot()._save_persist()
+        rc, run, _ = self._main(["--once"], self.OTHER)
+        self.assertEqual(rc, 0)
+        run.assert_called_once()
+        with mock.patch.object(IncentiveMarketMaker, "print_status_table") as table:
+            rc, _, _ = self._main(["--live", "--status"], self.OTHER)
+        self.assertEqual(rc, 0)
+        table.assert_called_once()
+
+    def test_a_fresh_start_on_the_new_account_runs(self):
+        # the cutover: state archived, process signs as the new account
+        rc, run, _ = self._main(["--live"], self.OTHER)
+        self.assertEqual(rc, 0)
+        run.assert_called_once()
+
+    def test_load_private_key_is_the_imm_key_or_nothing(self):
+        half = imm_account.resolve({imm_account.KEY_ID_VAR: self.OTHER},
+                                   lambda name: None)
+        with mock.patch.object(imm, "IMM_ACCOUNT", half), \
+                mock.patch.dict(os.environ, {"KALSHI_PRIVATE_KEY": "not-used"}):
+            with self.assertRaisesRegex(RuntimeError, "misconfigured"):
+                imm.load_private_key()
+
+    def test_build_client_names_the_account_but_never_the_balance(self):
+        # GitHub Actions call build_client and their logs are public
+        lines = []
+        fake = mock.MagicMock()
+        fake.get_exchange_status.return_value = {"trading_active": True}
+        with mock.patch.object(imm, "load_private_key", return_value="KEY"), \
+                mock.patch.object(imm, "ExchangeClient", return_value=fake), \
+                mock.patch.object(imm, "log", side_effect=lines.append):
+            self.assertIs(imm.build_client(), fake)
+        acct = [s for s in lines if s.startswith("kalshi account:")]
+        self.assertEqual(len(acct), 1)
+        self.assertIn(imm.KEY_ID[:8], acct[0])
+        self.assertIn(imm.IMM_ACCOUNT.source, acct[0])
+        self.assertNotIn(imm.KEY_ID, acct[0])
+        fake.get_balance.assert_not_called()
+        self.assertFalse(any("balance" in s for s in lines))
 
 
 if __name__ == "__main__":

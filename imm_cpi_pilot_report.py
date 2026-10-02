@@ -37,7 +37,8 @@ import pytz
 KL = os.path.dirname(os.path.abspath(__file__))
 if KL not in sys.path:
     sys.path.insert(0, KL)
-from crypto_touch_mm import build_client  # noqa: E402
+# the IMM's account (imm_account.py), not the fleet's: these are its fills
+from kalshi_reads import signed_client  # noqa: E402
 
 STATUS = os.environ.get("IMM_STATUS_DIR", os.path.join(KL, "run-logs", "incentive-mm"))
 ET = pytz.timezone("US/Eastern")
@@ -118,7 +119,7 @@ def main(argv=None):
     since = parse_ts(a.since)
     events = [e.strip() for e in a.events.split(",") if e.strip()]
     now = datetime.now(timezone.utc)
-    c = build_client()
+    c = signed_client()
 
     def get(path, params=None):
         for i in range(6):

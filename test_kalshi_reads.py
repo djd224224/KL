@@ -9,7 +9,11 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import imm_account
 import kalshi_reads as kr
+
+# the fleet key, whatever IMM_KALSHI_* this box holds (imm_account.py)
+FLEET = imm_account.resolve({}, lambda name: None)
 
 
 class _Resp:
@@ -140,17 +144,23 @@ class TestClientAndKey(unittest.TestCase):
             lk.assert_called_once()
             self.assertEqual(os.environ.get("KALSHI_HTTP_KEEPALIVE"), "1")
 
-    def test_key_from_a_path_and_a_missing_key(self):
+    @staticmethod
+    def _pem(d):
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         pem = key.private_bytes(serialization.Encoding.PEM,
                                 serialization.PrivateFormat.PKCS8,
                                 serialization.NoEncryption())
-        d = tempfile.mkdtemp(prefix="kr_key_")
         path = os.path.join(d, "k.pem")
         with open(path, "wb") as f:
             f.write(pem)
+        return path
+
+    @mock.patch.object(kr, "IMM_ACCOUNT", FLEET)
+    def test_key_from_a_path_and_a_missing_key(self):
+        d = tempfile.mkdtemp(prefix="kr_key_")
+        path = self._pem(d)
         with mock.patch.dict(os.environ, {"KALSHI_PRIVATE_KEY_PATH": path}):
             os.environ.pop("KALSHI_PRIVATE_KEY", None)
             self.assertEqual(kr.load_private_key().key_size, 2048)
@@ -159,6 +169,23 @@ class TestClientAndKey(unittest.TestCase):
                 mock.patch.object(kr, "LOCAL_KEY_DEFAULT", os.path.join(d, "nope.pem")):
             os.environ.pop("KALSHI_PRIVATE_KEY", None)
             with self.assertRaises(FileNotFoundError):
+                kr.load_private_key()
+
+    def test_the_imm_account_key_never_falls_back_to_the_fleet_key(self):
+        d = tempfile.mkdtemp(prefix="kr_key_")
+        path = self._pem(d)
+        own = imm_account.resolve({imm_account.KEY_ID_VAR: "imm-id",
+                                   imm_account.KEY_PATH_VAR: path},
+                                  lambda name: None)
+        with mock.patch.object(kr, "IMM_ACCOUNT", own), \
+                mock.patch.dict(os.environ, {"KALSHI_PRIVATE_KEY_PATH":
+                                             os.path.join(d, "fleet-missing.pem")}):
+            self.assertEqual(kr.load_private_key().key_size, 2048)
+        half = imm_account.resolve({imm_account.KEY_ID_VAR: "imm-id"},
+                                   lambda name: None)
+        with mock.patch.object(kr, "IMM_ACCOUNT", half), \
+                mock.patch.dict(os.environ, {"KALSHI_PRIVATE_KEY_PATH": path}):
+            with self.assertRaisesRegex(RuntimeError, "misconfigured"):
                 kr.load_private_key()
 
 
