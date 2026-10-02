@@ -9075,8 +9075,12 @@ def _merge_levels(pairs) -> List[List[float]]:
 def market_cents(m: dict, base: str) -> Optional[int]:
     """Read a price off a market object: prefers '<base>_dollars' (V2 string),
     falls back to legacy integer-cent '<base>'. Returns None when absent or 0
-    (Kalshi reports an empty side as 0). Sub-penny aware: a *_bid is floored
-    to the cent, a *_ask ceiled (see _floor_cents)."""
+    (Kalshi reports an empty BID as 0). An empty ASK is NOT 0: Kalshi reports
+    it as $1.00, and this returns it as 100. The quoting callers rely on that
+    (a 100c ask is outside every band, so a no-offer book reads as wide or out
+    of band), but a 100c ask is not a price: anything that VALUES a position
+    takes its touch from yes_touch_cents / bulk_mark_cents. Sub-penny aware: a
+    *_bid is floored to the cent, a *_ask ceiled (see _floor_cents)."""
     v = m.get(base + "_dollars")
     c = None
     if v is not None:
@@ -9093,6 +9097,60 @@ def market_cents(m: dict, base: str) -> Optional[int]:
         except (TypeError, ValueError):
             c = None
     return c if c else None   # 0 == side absent
+
+
+def _side_live(m: dict, base: str) -> bool:
+    """True when the market object shows a real resting level on this side.
+    Kalshi reads an empty YES bid as $0 and an empty YES ask as $1.00, and
+    nobody can trade at either, so only a raw price strictly inside (0, 1) is a
+    side. Read raw rather than through market_cents, whose ceil turns a real
+    $0.9999 escalator offer into the same 100 as the placeholder."""
+    v = m.get(base + "_dollars")
+    if v is not None:
+        try:
+            return 0.0 < float(v) < 1.0
+        except (TypeError, ValueError):
+            pass
+    v = m.get(base)
+    try:
+        return v is not None and 0 < float(v) < 100
+    except (TypeError, ValueError):
+        return False
+
+
+def yes_touch_cents(m: dict) -> Tuple[Optional[int], Optional[int]]:
+    """(bid, ask) in whole cents off a market object, with None for an EMPTY
+    side: the market_cents convention (bid floored, ask ceiled), minus Kalshi's
+    $0 / $1.00 placeholders."""
+    bid = market_cents(m, "yes_bid") if _side_live(m, "yes_bid") else None
+    ask = market_cents(m, "yes_ask") if _side_live(m, "yes_ask") else None
+    return bid, ask
+
+
+def bulk_mark_cents(m: dict) -> Optional[float]:
+    """The YES mark (cents) of a held position off a bulk market read, or None
+    when the read carries no usable price (the caller keeps its previous mark).
+
+    Two-sided book: the touch mid. One-sided: the LAST TRADE clamped to the
+    live side -- max(last, bid) with only a bid, min(last, ask) with only an
+    offer. A missing side is never a price. Until 2026-10-01 the empty ask's
+    $1.00 placeholder was averaged in: KXDDCOLDBREW-26OCT02-T4.45 (bot short
+    58.64 @ 91.5c) marked 52.5 = (5 + 100) / 2 at the 10/1 ET midnight on a
+    stray 5c bid with no offer, against a last trade of 97 and a YES settlement;
+    KXSBUXSAR-26OCT02-T5.08 sat at 64.5-66 for ~35h the same way (last trade
+    96). Both sides empty (a closed or settled book reads 0 / 100): the last
+    trade, as before."""
+    bid, ask = yes_touch_cents(m)
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2.0
+    last = market_cents(m, "last_price")
+    if last is None:
+        return None
+    if bid is not None:
+        return float(max(last, bid))
+    if ask is not None:
+        return float(min(last, ask))
+    return float(last)
 
 
 # Market statuses at which Kalshi has paid a settlement out ("settled" is the
@@ -14165,9 +14223,12 @@ class IncentiveMarketMaker:
         self.state.last_mark.pop(t, None)
 
     def _refresh_marks(self, marked_this_cycle: Set[str]) -> None:
-        """Ensure every open own-book position has a usable YES-mid mark.
-        Managed markets were marked from their orderbooks this cycle; anything
-        else with inventory gets a bulk market read."""
+        """Ensure every open own-book position has a usable YES mark.
+        Managed markets were marked from their orderbooks this cycle (two-sided
+        external books only); anything else with inventory gets a bulk market
+        read, marked by bulk_mark_cents: the mid of a two-sided book, else the
+        last trade clamped to the live side. A read with no usable price keeps
+        the previous mark."""
         stale = [t for t, p in self.pnl.pos.items()
                  if abs(p) > 1e-9 and t not in marked_this_cycle]
         for i in range(0, len(stale), 50):
@@ -14179,13 +14240,9 @@ class IncentiveMarketMaker:
                 return
             for m in (resp.get("markets") or []):
                 t = m.get("ticker", "")
-                bid, ask = market_cents(m, "yes_bid"), market_cents(m, "yes_ask")
-                if bid and ask:
-                    self.state.last_mark[t] = (bid + ask) / 2.0
-                else:
-                    lp = market_cents(m, "last_price")
-                    if lp:
-                        self.state.last_mark[t] = float(lp)
+                mk = bulk_mark_cents(m)
+                if mk is not None:
+                    self.state.last_mark[t] = mk
 
     def _live_event_slots(self, ev: str, entry: dict,
                           unquotable_now: Set[str]) -> List[str]:

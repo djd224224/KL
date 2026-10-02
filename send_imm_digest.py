@@ -85,7 +85,7 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
 import incentive_mm as imm                                          # noqa: E402
 import imm_pickoff                                                  # noqa: E402
 from incentive_mm import (CT, ET, STATUS_DIR, Alerter, PnlTracker,  # noqa: E402
-                          build_client, log, market_cents)
+                          build_client, bulk_mark_cents, log, market_cents)
 
 STALE_AFTER_MINUTES = 30
 STATE_PATH = os.path.join(STATUS_DIR, "imm_state.json")
@@ -161,10 +161,12 @@ def settlement_cents(m: dict):
 
 
 def current_mids(client, tickers):
-    """(mids, results): ticker -> mid YES price in CENTS (bid/ask mid, else
-    last), and ticker -> settlement_cents() (cents, or VOID) for settled
-    markets so the caller can book settlement P&L. A settled market's book
-    reads 0 / 100, so its entry in `mids` is the last trade, never the
+    """(mids, results): ticker -> YES mark in CENTS, the bot's own
+    incentive_mm.bulk_mark_cents (the bid/ask mid of a two-sided book, else
+    the last trade clamped to the live side: an empty ask reads $1.00 and is
+    never averaged in), and ticker -> settlement_cents() (cents, or VOID) for
+    settled markets so the caller can book settlement P&L. A settled market's
+    book reads 0 / 100, so its entry in `mids` is the last trade, never the
     settlement value; value a settled position from `results`."""
     mids, results = {}, {}
     tickers = list(tickers)
@@ -180,13 +182,9 @@ def current_mids(client, tickers):
             px = settlement_cents(m)
             if px is not None:
                 results[t] = px
-            bid, ask = market_cents(m, "yes_bid"), market_cents(m, "yes_ask")
-            if bid and ask:
-                mids[t] = (bid + ask) / 2.0
-            else:
-                lp = market_cents(m, "last_price")
-                if lp:
-                    mids[t] = float(lp)
+            mk = bulk_mark_cents(m)
+            if mk is not None:
+                mids[t] = mk
     return mids, results
 
 
