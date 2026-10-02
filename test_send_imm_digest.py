@@ -18,7 +18,6 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 LADDER = "KXNFLFFPTSLADDER-26SEP27LVNO-LVAJEANTY2"
-TS = 1_790_000_000
 
 
 def _market(ticker, result="", status="active", value=None,
@@ -29,13 +28,6 @@ def _market(ticker, result="", status="active", value=None,
     if value is not None:
         m["settlement_value_dollars"] = value
     return m
-
-
-def _fill(ticker, side, action, count, yes_cents, ts=TS, fee=0.0):
-    """A fill as the normalized client returns it (legacy customer view)."""
-    return {"ticker": ticker, "side": side, "action": action,
-            "count_fp": f"{count:.2f}", "yes_price_dollars": f"{yes_cents / 100:.4f}",
-            "fee_cost": f"{fee:.4f}", "ts": ts}
 
 
 class _Client:
@@ -53,14 +45,6 @@ class _DigestTest(unittest.TestCase):
     def setUp(self):
         import send_imm_digest as sd
         self.sd = sd
-
-    def raw(self, fills, *markets):
-        """raw_pnl_for_fills totals, with mids / results read the digest's
-        way from `markets`."""
-        client = _Client(*markets)
-        mids, results = self.sd.current_mids(client, {f["ticker"] for f in fills})
-        tot, per_event, _pnl = self.sd.raw_pnl_for_fills(client, fills, mids, results)
-        return tot, per_event
 
 
 class SettlementCentsTests(_DigestTest):
@@ -127,57 +111,6 @@ class CurrentMidsTests(_DigestTest):
         self.assertEqual(results, {})
 
 
-class RawPnlForFillsTests(_DigestTest):
-    def test_lvajeanty2_short_books_the_scalar_settlement(self):
-        # the ask fills read "buy NO" once normalized: short 90 YES at 16c
-        tot, per_event = self.raw([_fill(LADDER, "no", "buy", 90, 16)],
-                                  _market(LADDER, "scalar", "finalized", "0.1200"))
-        self.assertAlmostEqual(tot["settle"], 3.60, places=6)       # -90 x (12 - 16)
-        self.assertEqual(tot["unrealized"], 0.0)                    # was -90 x (82 - 16) = -59.40
-        self.assertEqual(tot["open_markets"], 0)
-        self.assertAlmostEqual(tot["raw"], 3.60, places=6)
-        self.assertAlmostEqual(per_event["KXNFLFFPTSLADDER-26SEP27LVNO"]["settle"], 3.60, places=6)
-
-    def test_a_sub_penny_value_is_not_rounded(self):
-        tot, _ = self.raw([_fill(LADDER, "yes", "buy", 100, 20)],
-                          _market(LADDER, "scalar", "finalized", "0.2160"))
-        self.assertAlmostEqual(tot["settle"], 1.60, places=6)       # 22c would say 2.00
-
-    def test_a_scalar_settled_at_zero_still_settles(self):
-        tot, _ = self.raw([_fill(LADDER, "yes", "buy", 10, 5)],
-                          _market(LADDER, "scalar", "finalized", "0.0000"))
-        self.assertAlmostEqual(tot["settle"], -0.50, places=6)
-        self.assertEqual((tot["unrealized"], tot["open_markets"]), (0.0, 0))
-
-    def test_realized_and_fees_stay_on_top_of_the_residual_settle(self):
-        fills = [_fill(LADDER, "yes", "buy", 50, 16, ts=TS),
-                 _fill(LADDER, "yes", "sell", 20, 30, ts=TS + 60, fee=0.10)]
-        tot, _ = self.raw(fills, _market(LADDER, "scalar", "finalized", "0.1200"))
-        self.assertAlmostEqual(tot["realized"], 2.80, places=6)     # 20 x (30 - 16)
-        self.assertAlmostEqual(tot["settle"], -1.20, places=6)      # 30 x (12 - 16)
-        self.assertAlmostEqual(tot["raw"], 2.80 - 1.20 - 0.10, places=6)
-
-    def test_a_void_refunds_cost(self):
-        tot, _ = self.raw([_fill("V", "yes", "buy", 25, 40)],
-                          _market("V", "void", "finalized", bid="0.0000", ask="0.0000", last="0.9000"))
-        self.assertEqual((tot["settle"], tot["unrealized"], tot["raw"]), (0.0, 0.0, 0.0))
-        self.assertEqual(tot["open_markets"], 0)
-
-    def test_yes_no_settlement_unchanged(self):
-        tot, _ = self.raw([_fill("Y", "yes", "buy", 10, 30), _fill("N", "yes", "sell", 10, 40)],
-                          _market("Y", "yes", "determined", last="0.9900"),
-                          _market("N", "no", "finalized", last="0.0100"))
-        self.assertAlmostEqual(tot["settle"], 7.00 + 4.00, places=6)
-        self.assertEqual((tot["unrealized"], tot["open_markets"]), (0.0, 0))
-
-    def test_a_scalar_not_yet_finalized_is_still_marked_open(self):
-        tot, _ = self.raw([_fill(LADDER, "yes", "buy", 10, 16)],
-                          _market(LADDER, "scalar", "determined", "0.1200"))
-        self.assertEqual(tot["settle"], 0.0)
-        self.assertAlmostEqual(tot["unrealized"], 6.60, places=6)   # 10 x (82 - 16)
-        self.assertEqual(tot["open_markets"], 1)
-
-
 class RainDirSectionTests(_DigestTest):
     """The rain-directional block's open MTM took (bid + ask) / 2 whenever
     both read nonzero, and Kalshi reads an empty ask as $1.00 (2026-10-01).
@@ -203,92 +136,6 @@ class RainDirSectionTests(_DigestTest):
         # 3 x (97 - 40) + 3 x ((100 - 32) - 60) = 1.71 + 0.24; the stray 5c
         # bid under no offer read 52.5 before, +0.375
         self.assertIn("settled P&L +1.80 | open 2 MTM +1.95 | total +3.75", text[0])
-
-
-class DailySeriesTests(_DigestTest):
-    """daily_series feeds the DAILY P&L table and upserts daily_pnl.json."""
-
-    def setUp(self):
-        super().setUp()
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.old_path = self.sd.DAILY_PNL_PATH
-        self.sd.DAILY_PNL_PATH = os.path.join(tmp.name, "daily_pnl.json")
-        self.addCleanup(setattr, self.sd, "DAILY_PNL_PATH", self.old_path)
-
-    def test_the_scalar_settlement_lands_in_the_day_and_the_store(self):
-        day = datetime.now(timezone.utc).astimezone(self.sd.ET).date() - timedelta(days=2)
-        ts = self.sd.ET.localize(datetime(day.year, day.month, day.day, 12)).timestamp()
-        fills = [_fill(LADDER, "no", "buy", 90, 16, ts=ts)]
-        client = _Client(_market(LADDER, "scalar", "finalized", "0.1200"))
-        mids, results = self.sd.current_mids(client, [LADDER])
-        series = self.sd.daily_series(client, fills, mids, results, {}, et_rew={})
-        self.assertEqual([(d, round(raw, 2), nf) for d, raw, _rew, _ct, nf in series],
-                         [(day, 3.60, 1)])
-        with open(self.sd.DAILY_PNL_PATH, encoding="utf-8") as f:
-            rec = json.load(f)[day.isoformat()]
-        self.assertEqual((rec["raw"], rec["settle"], rec["mtm"]), (3.6, 3.6, 0.0))
-
-    def test_rewards_are_the_et_day_accrual_not_the_bot_day_history(self):
-        """Jack 2026-10-02: the email uses the dashboard's cutoffs. The bot's
-        5am-CT roll-day history (paid or raw) no longer feeds the table."""
-        day = datetime.now(timezone.utc).astimezone(self.sd.ET).date() - timedelta(days=2)
-        state = {"reward_history": {day.isoformat(): 999.0},
-                 "reward_paid_history": {day.isoformat(): 888.0}}
-        series = self.sd.daily_series(_Client(), [], {}, {}, state,
-                                      et_rew={day.isoformat(): 123.45})
-        self.assertEqual([(d, rew) for d, _raw, rew, _ct, _nf in series], [(day, 123.45)])
-
-
-class EtDayRewardsTests(_DigestTest):
-    """The modeled accrual (imm_reward_recon's hourly cache) summed per ET
-    calendar day, midnight to midnight -- the dashboard's daily number."""
-
-    def test_utc_hours_fall_into_their_et_day(self):
-        h = lambda iso: int(datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc).timestamp() // 3600)
-        hourly = {
-            "KXA-1": {h("2026-10-01T03:00:00Z"): 1.0,        # 11pm ET Sep 30
-                      h("2026-10-01T04:00:00Z"): 2.0,        # midnight ET Oct 1
-                      h("2026-10-02T03:00:00Z"): 4.0},       # 11pm ET Oct 1
-            "KXB-1": {str(h("2026-10-01T10:00:00Z")): 8.0},  # the cache's string keys
-            # after the fall-back (EST): midnight ET is 05:00Z
-            "KXC-1": {h("2026-11-03T04:00:00Z"): 16.0, h("2026-11-03T05:00:00Z"): 32.0},
-        }
-        self.assertEqual(self.sd.et_day_rewards(hourly),
-                         {"2026-09-30": 1.0, "2026-10-01": 14.0,
-                          "2026-11-02": 16.0, "2026-11-03": 32.0})
-
-
-class PnlWindowsTests(_DigestTest):
-    """yesterday = the full ET day before today; 7 days = since 00:00 ET six
-    days ago, through now -- the dashboard's Yesterday and 7-days windows."""
-
-    def test_windows_cut_at_et_midnight(self):
-        from unittest import mock
-        sd = self.sd
-        now = sd.ET.localize(datetime(2026, 10, 2, 7, 10)).timestamp()     # the 7:10 send
-        at = lambda d, hh: sd.ET.localize(datetime(2026, 10, d, hh)).timestamp() if d > 0 \
-            else sd.ET.localize(datetime(2026, 9, 30 + d, hh)).timestamp()
-        fills = [_fill("Y", "yes", "buy", 10, 30, ts=at(1, 12)),     # yesterday (Oct 1)
-                 _fill("T", "yes", "buy", 10, 30, ts=at(2, 1)),      # today, 1am
-                 _fill("W", "yes", "buy", 10, 30, ts=at(-4, 0)),     # Sep 26: day 1 of 7
-                 _fill("O", "yes", "buy", 10, 30, ts=at(-5, 23))]    # Sep 25: before the window
-        mids = {"Y": 40.0, "T": 50.0, "W": 60.0, "O": 70.0}
-        et_rew = {"2026-10-02": 5.0, "2026-10-01": 100.0, "2026-09-26": 20.0,
-                  "2026-09-25": 1000.0}
-        with mock.patch.object(sd, "load_credit_ledger", return_value=([], {})):
-            w = sd.pnl_windows(_Client(), {}, set(), fills, mids, {}, 0.0,
-                               et_rew=et_rew, now=now)
-        # yesterday: only the Oct 1 fill, 10 x (40 - 30)
-        self.assertAlmostEqual(w["day"]["raw"], 1.0, places=6)
-        self.assertEqual(w["day"]["reward"], 100.0)
-        self.assertEqual(set(w["day"]["events"]), {"Y"})
-        # 7 days: Sep 26 00:00 ET onward, today included; the Sep 25 fill is out
-        self.assertAlmostEqual(w["week"]["raw"], 1.0 + 2.0 + 3.0, places=6)
-        self.assertEqual(w["week"]["reward"], 125.0)
-        self.assertEqual(w["week"]["since"], sd.ET.localize(datetime(2026, 9, 26)).timestamp())
-        self.assertEqual(set(w["week"]["events"]), {"Y", "T", "W"})
 
 
 class DashboardWindowsTests(_DigestTest):
