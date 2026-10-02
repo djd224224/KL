@@ -1120,6 +1120,53 @@ HOUR_MULT_EXCLUDE = tuple(
     p for p in os.environ.get("IMM_HOUR_MULT_EXCLUDE", "KXTEMP").split(",") if p)
 
 
+def _env_et_day(name: str):
+    """An IMM_*_FROM knob: 'YYYY-MM-DD', an ET calendar day -> date, or None
+    when unset. A malformed value raises at import, like a malformed hour
+    spec does."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"bad {name}: {raw!r} (want YYYY-MM-DD, an ET day)")
+
+
+def _et_day_start_ts(day) -> Optional[float]:
+    """00:00 ET on ET calendar day `day`, as a UTC epoch (None for None)."""
+    if day is None:
+        return None
+    return ET.localize(datetime(day.year, day.month, day.day)).timestamp()
+
+
+# SCHEDULED successor window (Jack 2026-10-02: "make both changes for
+# monday"). IMM_HOUR_SIZE_MULT_NEXT replaces IMM_HOUR_SIZE_MULT from 00:00 ET
+# on IMM_HOUR_SIZE_MULT_FROM (an ET day). It is read off the instant being
+# sized, so the change lands on its day without a restart, and the floor
+# projection's hour walk (size_mult_profile) crosses it hour by hour. Both
+# knobs must be set: half a pair is ignored (startup warns) rather than
+# switching the quiet hours OFF on a typo; to end the window from a date,
+# NEXT=0-23:1.0. The launcher's pair is the 10/5 step: 0-9 ET x2 -> 0-8 ET
+# x3, hour 9 back to x1 (weekdays 9/15-10/1, long-dated ex-ladders, rent
+# minus 24h mark-out per 1k resting contract-hours: 0-8 ET at x2 +23c,
+# 10-23 ET at x1 +17c, hour 9 at x2 -25c with the night's worst mark-out).
+# imm_saturday_tracker reads the window per ET day through global_hour_mults.
+HOUR_SIZE_MULTS_NEXT = _parse_hour_mults(os.environ.get("IMM_HOUR_SIZE_MULT_NEXT", ""))
+HOUR_SIZE_MULT_FROM = _env_et_day("IMM_HOUR_SIZE_MULT_FROM")
+
+
+def global_hour_mults(et_day) -> Dict[int, float]:
+    """The GLOBAL ET-hour window {hour: mult} in force on ET calendar day
+    `et_day`: IMM_HOUR_SIZE_MULT_NEXT from IMM_HOUR_SIZE_MULT_FROM on, else
+    IMM_HOUR_SIZE_MULT. Per-series windows, exclusions and the Saturday
+    multiplier are applied on top by _hour_window_mult / hour_size_mult."""
+    if HOUR_SIZE_MULTS_NEXT and HOUR_SIZE_MULT_FROM is not None \
+            and et_day >= HOUR_SIZE_MULT_FROM:
+        return HOUR_SIZE_MULTS_NEXT
+    return HOUR_SIZE_MULTS
+
+
 def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
     """'PREFIX:LO-HI:MULT,...' -> [(prefix, {hour: mult})], longest prefix
     first so the most specific rule wins. LO-HI carries the same semantics as
@@ -1165,7 +1212,8 @@ SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
 def _hour_window_mult(series: str, now_utc: datetime) -> float:
     """The hour-of-day part of hour_size_mult(): 1.0 outside configured
     windows and for excluded series prefixes."""
-    hour = now_utc.astimezone(ET).hour
+    et = now_utc.astimezone(ET)
+    hour = et.hour
     # A per-series rule wins ONLY for the hours it actually names. Returning
     # its default for every other hour would silently cancel the global
     # window: adding the 4pm halving to KXDIESELD/KXAAAGASD would have taken
@@ -1186,11 +1234,12 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     # MULT=1 restores the global window for them.
     if not SCAN_HOUR_MULT and series in SCAN_GUARDED_SERIES:
         return 1.0
-    if not HOUR_SIZE_MULTS:
+    mults = global_hour_mults(et.date())
+    if not mults:
         return 1.0
     if any(series.startswith(p) for p in HOUR_MULT_EXCLUDE):
         return 1.0
-    return HOUR_SIZE_MULTS.get(hour, 1.0)
+    return mults.get(hour, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1556,6 +1605,30 @@ MENTION_SIZE_MULT = _env_float("IMM_MENTION_SIZE_MULT", 1.0)
 # earnings series carries a SeriesOverride today; the exemption is structural,
 # not a guess). Env IMM_EARNINGS_SIZE_MULT; 1.0 reverts to family-only.
 EARNINGS_SIZE_MULT = _env_float("IMM_EARNINGS_SIZE_MULT", 1.5)
+# SCHEDULED successor (Jack 2026-10-02: "make both changes for monday"):
+# IMM_EARNINGS_SIZE_MULT_NEXT replaces IMM_EARNINGS_SIZE_MULT from 00:00 ET
+# on IMM_EARNINGS_SIZE_MULT_FROM (an ET day); the launcher sets x2 from
+# 2026-10-05. Checked against the clock on every call (an epoch compare), so
+# the rung, the per-market / per-event caps and the skew knees step up
+# together at midnight without a restart. NEXT 0 / unset = no change. The
+# floor projection prices the family part at the CURRENT value (only the
+# hour part is walked per hour), which under-projects earnings accrual for
+# the last day before the switch; nothing else reads ahead.
+# Evidence (9/18-10/1): +$81/day net at the paid rate, positive 13 of 14
+# days; since the x1.5 (9/17) net per resting contract-hour rose 25 -> 33
+# -> 66c per 1k and settled P&L per filled contract went -9c -> +9c.
+EARNINGS_SIZE_MULT_NEXT = _env_float("IMM_EARNINGS_SIZE_MULT_NEXT", 0.0)
+EARNINGS_SIZE_MULT_FROM = _env_et_day("IMM_EARNINGS_SIZE_MULT_FROM")
+EARNINGS_SIZE_MULT_FROM_TS = _et_day_start_ts(EARNINGS_SIZE_MULT_FROM)
+
+
+def earnings_size_mult(now_utc: Optional[datetime] = None) -> float:
+    """The earnings family multiplier in force now (or at `now_utc`)."""
+    if EARNINGS_SIZE_MULT_NEXT > 0 and EARNINGS_SIZE_MULT_FROM_TS is not None:
+        ts = now_utc.timestamp() if now_utc is not None else time.time()
+        if ts >= EARNINGS_SIZE_MULT_FROM_TS:
+            return EARNINGS_SIZE_MULT_NEXT
+    return EARNINGS_SIZE_MULT
 
 
 def mention_size_mult(series: str) -> float:
@@ -1563,7 +1636,7 @@ def mention_size_mult(series: str) -> float:
     # company symbol is the tail), but the bare stem does, so the order
     # matters for the stem and is harmless for every real series.
     if series.startswith("KXEARNINGSMENTION"):
-        return MENTION_SIZE_MULT * EARNINGS_SIZE_MULT
+        return MENTION_SIZE_MULT * earnings_size_mult()
     if series.endswith("MENTION"):
         return MENTION_SIZE_MULT
     return 1.0
@@ -5169,13 +5242,21 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # "happy to unload the whole position on the other side so can quote 240"):
 # FULL UNWIND -- the reducing side rests max(ladder, whole position) up to
 # the 600 cap (unwind_side_sizes). Kill: IMM_SPORTS_LADDER_UNWIND_FULL=0.
+# 2026-10-02 (Jack: "increase LADDER/ESCALATOR to 5x immediately"): size_mult
+# 4 -> 5 -- 20 x 5 = 100 a side on a weekday, 200 in the 0-9 ET quiet hours
+# (x2); Saturday x2 = 200 daytime, 400 in 0-9 ET; from 10/5 the quiet hours
+# are 0-8 ET x3 (IMM_HOUR_SIZE_MULT_NEXT) = 300 weekday nights, 600 Saturday
+# nights. Per-market cap 750 / per-event 5,000 at the launcher's 150 /
+# 1,000, and the full unwind rests up to the 750. Reward is still linear in
+# size here (median est_frac 0.1-0.3% of the scored book on 9/28-10/2).
+# Paid rate NOT yet confirmed: no ladder credit is on the 9/27 statement.
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
     min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.2),
     safe_join=True,
     price_min_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MIN", 1),
     price_max_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MAX", 99),
-    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 4.0),
+    size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 5.0),
     unwind_full_position=os.environ.get("IMM_SPORTS_LADDER_UNWIND_FULL", "1") == "1")
 
 # ELECTION archetype (Jack 2026-09-28, see ELECTION_SERIES): "expand range to
@@ -17843,7 +17924,7 @@ class IncentiveMarketMaker:
             log("mortgage gate: OFF -- KXFM30YMTG/KXMORTGAGERATE not enrolled")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
-            f"earnings x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT:g}), "
+            f"earnings x{MENTION_SIZE_MULT * earnings_size_mult():g}), "
             f"caps: market ±{MAX_POSITION_CONTRACTS:g}, event ±{MAX_EVENT_CONTRACTS:g} "
             f"(mention-scaled), "
             f"budget ${COLLATERAL_BUDGET:g}, "
@@ -18178,6 +18259,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"[IMM] hour-size multipliers (ET hour -> x, long-dated only): "
             f"{dict(sorted(HOUR_SIZE_MULTS.items()))}; excluded prefixes: "
             f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'} + daily families")
+    for _knob, _has_next, _from in (
+            ("IMM_HOUR_SIZE_MULT", bool(HOUR_SIZE_MULTS_NEXT), HOUR_SIZE_MULT_FROM),
+            ("IMM_EARNINGS_SIZE_MULT", EARNINGS_SIZE_MULT_NEXT > 0, EARNINGS_SIZE_MULT_FROM)):
+        if _has_next != (_from is not None):
+            log(f"[IMM] ! {_knob}_NEXT / {_knob}_FROM half set -- the scheduled "
+                f"change is IGNORED; set both or neither")
+    if HOUR_SIZE_MULTS_NEXT and HOUR_SIZE_MULT_FROM is not None:
+        log(f"[IMM] hour-size multipliers SCHEDULED from 00:00 ET "
+            f"{HOUR_SIZE_MULT_FROM.isoformat()}: {dict(sorted(HOUR_SIZE_MULTS_NEXT.items()))}"
+            f" (in force now: {dict(sorted(global_hour_mults(datetime.now(ET).date()).items()))})")
+    if EARNINGS_SIZE_MULT_NEXT > 0 and EARNINGS_SIZE_MULT_FROM is not None:
+        log(f"[IMM] earnings size SCHEDULED: x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT_NEXT:g} "
+            f"from 00:00 ET {EARNINGS_SIZE_MULT_FROM.isoformat()} "
+            f"(in force now: x{MENTION_SIZE_MULT * earnings_size_mult():g})")
     log("[IMM] floor credit (2026-09-25): exit / banked re-entry bar = "
         + ("$%.2f payout cliff" % PAYOUT_FLOOR_DOLLARS if EXIT_FLOOR_IS_PAYOUT
            else "series entry bar")

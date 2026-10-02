@@ -6123,3 +6123,94 @@ the archived fleet one) first.
 
 Tests: test_imm_account.py (14), TestImmOwnAccount in test_incentive_mm (9),
 two key tests in test_kalshi_reads.
+
+## 2026-10-02 — Sports ladders / escalators x4 -> x5 now; from Monday 10/5 the quiet hours are 0-8 ET x3 (hour 9 back to x1) and earnings x2, scheduled (Jack)
+
+Jack, after the multiplier review: "yes, make both changes for monday. also
+increase LADDER/ESCALATOR to 5x immediately". The two Monday changes were the
+review's recommendations; for the ladders the review said hold x4 until a
+rewards statement shows ladder credits (see PAID RATE below).
+
+LADDERS x5, NOW. The archetype KXNFLLADDERREC's size_mult default 4.0 -> 5.0
+(env IMM_SPORTS_LADDER_SIZE_MULT; the launcher does not set it). Checked with
+$ProbeEnv applied and the live Saturday verdict (x2 from 10/3): 100 a side on
+a weekday, 200 in 0-9 ET; Saturday 10/3 200 by day, 400 in 0-9 ET; from
+10/5 300 on weekday nights (0-8 ET x3) and 600 on Saturday nights; per-market
+cap 750 / per-event 5,000 at the launcher's 150 / 1,000, and the full unwind
+rests up to the 750. Reward is still linear in size: the median est_frac on
+ladder rows 9/28-10/2 was 0.1-0.3% of the scored book (designated makers
+rest 55k-330k contracts per side). Since 9/25 (modelled): $434 rewards,
++$12 trading MTM on 9,746 contracts, 24h mark-out -0.6c per contract,
+positive 7 of 7 days. Rent per resting contract-hour at x4 (one midweek game,
+PIT@CLE, $429/day pool, ~300k depth) was about half of x2/x3's on the 9/27-28
+slate (escalators 55 -> 30c, ladders 39 -> 19c per 1k), a pool/depth
+confound until the 10/4 slate is measured at x4/x5.
+
+PAID RATE NOT YET CONFIRMED. reward_credits.csv ends at the 9/27 statement,
+before any ladder program paid out (credits land 0-1 days after a period
+ends). The 9/29 calibration's "credited 0.0 on 14 events" for the seven NFL
+series is the recon judging "settled" against now rather than against the
+last pasted statement (fix in flight, "Stop recon counting not-yet-credited
+events as unpaid"); it is also why the dashboard's Sports & awards paid rate
+reads 0.28. Paste a statement after the 10/4 games and compare.
+
+SCHEDULED KNOBS (new). IMM_HOUR_SIZE_MULT_NEXT / IMM_HOUR_SIZE_MULT_FROM and
+IMM_EARNINGS_SIZE_MULT_NEXT / IMM_EARNINGS_SIZE_MULT_FROM: the NEXT value
+takes over from 00:00 ET on the FROM day (YYYY-MM-DD, an ET day), read off
+the clock, so Monday needs no restart. The hour window goes through
+global_hour_mults(et_day) at the instant being sized, so the floor
+projection's hour walk (size_mult_profile) crosses the switch hour by hour;
+earnings goes through earnings_size_mult() (an epoch compare per call), which
+the floor projection prices at the current value -- earnings accrual is
+under-projected for the last day before the switch, nothing else reads
+ahead. Both halves of a pair are required: half a pair is ignored with a
+startup warning rather than turning the quiet hours off on a typo (to end a
+window from a date, NEXT=0-23:1.0). Startup logs each scheduled value and
+what is in force now. The launcher sets both pairs FROM 2026-10-05;
+IMM_HOUR_SIZE_MULT=0-9:2.0 stays in force until then.
+
+QUIET HOURS 0-9 ET x2 -> 0-8 ET x3 FROM 10/5. Weekdays 9/15-10/1, long-dated
+families ex-ladders, cycle-log rent minus 24h mark-out (the Saturday
+tracker's measure, sat_tracker_cache rebuilt without its partial days), per
+1k resting contract-hours: 0-8 ET at x2 +23.4c ($95/day, positive 11 of 13
+weekdays; broad -- earnings, Carbon Arc, KXRT, elections, econ all net
+positive), 10-23 ET at x1 +16.8c ($68/day), hour 9 at x2 -25.1c (-$11/day:
+8.3 fills per 1k at a -9.0c mark-out, mostly KXRT -11.5c per fill at 9am and
+econ / rates). The 9/12 extension read as a natural experiment: hours 0-2
+and 8-9 went x1 -> x2 and kept their rent per contract (50.5 -> 50.1c per 1k)
+while the unchanged hours fell 11-19% over the same weeks, and fills per
+contract and mark-out did not worsen. Reward share is small (rent-weighted
+est_frac 12% or less, Treasury nights ~19%), so +50% size buys ~+45% rent.
+Expected ~+$40-45 per weekday, modelled. It composes with every family and
+with Saturday: from 10/10 Saturday 0-8 ET is x6 on the global ladder,
+ladders 600, KXTRUMPAPPROVE 360 and KXUST*AD 180 up to their cutoffs;
+TOTAL_SIZE_MULT_CAP (x5 on hour x deep-reference) leaves the deep-reference
+boost at x1.67 on weekday nights and none on Saturday nights.
+
+EARNINGS x1.5 -> x2 FROM 10/5. +$81/day net 9/18-10/1 (rewards at the
+family's paid rate + trading MTM), positive 13 of 14 days, the best family on
+the book. Since the x1.5 (9/17) net per resting contract-hour rose 25 -> 33
+-> 66c per 1k and settled P&L per filled contract went -9.2c -> +8.6c.
+Through applied_mention_mult: 40 a side by day, 120 on weekday nights (x2 x
+x3), caps 300 per market / 2,000 per event.
+
+WATCH. Saturday 10/3 is the first x2 Saturday (0-9 ET x4 on the global
+ladder) on a book ~4x the size of the x1.5 Saturdays' (10/2 09:36 ET: $60.5k
+resting on 1,509 markets at x2). The selection budget (IMM_COLLATERAL_BUDGET
+100,000 on the x0.65 estimate plus the inventory reserve) will start skipping
+NEW markets overnight; sticky ones keep their size.
+
+Saturday tracker: QUIET_HOURS / BLOCK_LABEL are still the static 0-9 window;
+they must read global_hour_mults(et_date) before the 10/12 run (the first
+with 0-8 weekdays). Follow-up after the cache fix ("Fix Saturday tracker
+caching partial cycle-log days") lands.
+
+Revert: delete a NEXT/FROM pair from $ProbeEnv + restart_imm.ps1 -Task;
+ladders back to x4 with IMM_SPORTS_LADDER_SIZE_MULT=4 in the launcher.
+
+Tests: TestScheduledKnobs (FROM-day parsing, the window and earnings switch
+at ET midnight, hour 9 back to x1, exclusions and Saturday composition, half
+a pair ignored, the floor projection across the switch, caps); the ladder
+enrollment test reads x5; the suite neutralises the scheduled knobs at
+import (a wall-clock hazard in a process that mirrored the launcher env).
+1,890 green (unittest discover).

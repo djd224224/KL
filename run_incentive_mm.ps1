@@ -292,7 +292,19 @@ if ($Probe) {
     # out while it rains at the station, cutoff 22:00 ET the day before the
     # month's last day). Takes effect on a task-level restart
     # (restart_imm.ps1 -Task).
-    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=100000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
+    # MONDAY 10/5 STEP, SCHEDULED (Jack 2026-10-02: "make both changes for
+    # monday"): from 00:00 ET 2026-10-05 the quiet hours become 0-8 ET x3
+    # (hour 9 back to x1) and the earnings family x2 (was x1.5). The _NEXT /
+    # _FROM pairs switch on the clock inside the bot, so Monday needs no
+    # restart; IMM_HOUR_SIZE_MULT=0-9:2.0 stays in force until then. Weekdays
+    # 9/15-10/1, long-dated ex-ladders, rent minus 24h mark-out per 1k
+    # resting contract-hours: 0-8 ET at x2 +23c (positive 11 of 13 days),
+    # 10-23 ET at x1 +17c, hour 9 at x2 -25c (worst mark-out of the night,
+    # mostly KXRT and econ). Composes with Saturday x2: Saturday 0-8 ET runs
+    # x6 from 10/10. Earnings: +$81/day net, positive 13 of 14 days, net per
+    # contract-hour up since the x1.5. Revert either by deleting its pair +
+    # restart_imm.ps1 -Task. imm_saturday_tracker reads the window per day.
+    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=4000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=100000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BALANCE_DROP_HALT=5000&& set IMM_BENCH_COOLDOWN=3600&&"
 }
 
 while ($true) {

@@ -50,6 +50,17 @@ _REFRESH_JITTER_CODE_DEFAULT = imm.ORDER_REFRESH_JITTER_SECS
 imm.PLACE_RATE_PER_SEC = 0.0
 imm.ORDER_REFRESH_JITTER_SECS = 0
 
+# Scheduled knob changes (IMM_*_NEXT / IMM_*_FROM, 2026-10-02) switch on the
+# WALL CLOCK. A process that imported the bot under the launcher's env (the
+# tracker tests mirror it before importing) would otherwise size earnings by
+# the real date, so the suite runs on the base knobs; TestScheduledKnobs
+# arms them explicitly.
+imm.HOUR_SIZE_MULTS_NEXT = {}
+imm.HOUR_SIZE_MULT_FROM = None
+imm.EARNINGS_SIZE_MULT_NEXT = 0.0
+imm.EARNINGS_SIZE_MULT_FROM = None
+imm.EARNINGS_SIZE_MULT_FROM_TS = None
+
 
 def setUpModule():
     """Sandbox all file side effects (HALT file, persisted state, status
@@ -5207,8 +5218,9 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             # 2026-09-26 pm: x3 ("so should be 90" on a Saturday) and a $1.20
             # fresh-entry bar for the family; the cliff for banked / members.
             # 2026-09-29: x4 ("increase LADDER and ESCALATOR families to 4x
-            # multiplier, from the 3x")
-            self.assertEqual(imm.applied_mention_mult("KXNBALADDERPTS"), 4.0)
+            # multiplier, from the 3x"); 2026-10-02: x5 ("increase
+            # LADDER/ESCALATOR to 5x immediately")
+            self.assertEqual(imm.applied_mention_mult("KXNBALADDERPTS"), 5.0)
             self.assertEqual(imm.series_min_est_total("KXNBALADDERPTS"), 1.2)
             self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=False), 1.2)
             self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=True),
@@ -5217,11 +5229,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             noon = utc(2026, 9, 30, 15, 0)              # a weekday, no hour mult
             base = imm.series_levels("KXNBALADDERPTS")
             self.assertEqual(imm.hour_scaled_levels("KXNBALADDERPTS", noon),
-                             [(t_, 4 * s_) for t_, s_ in base])
+                             [(t_, 5 * s_) for t_, s_ in base])
             self.assertEqual(imm.series_max_position("KXNBALADDERPTS"),
-                             4 * imm.MAX_POSITION_CONTRACTS)
+                             5 * imm.MAX_POSITION_CONTRACTS)
             self.assertEqual(imm.event_cap_contracts("KXNBALADDERPTS-26OCT21BOSNYK"),
-                             4 * imm.MAX_EVENT_CONTRACTS)
+                             5 * imm.MAX_EVENT_CONTRACTS)
             # KXTRUMPAPPROVE copied the ladders' x3 on 9/26 but keeps its own
             self.assertEqual(imm.applied_mention_mult("KXTRUMPAPPROVE"), 3.0)
             bot = IncentiveMarketMaker(client=None, live=False)
@@ -8710,6 +8722,123 @@ class TestHourSizeMult(unittest.TestCase):
         self.assertEqual(got, [(t, max(1, int(s * 0.5 + 0.5)))
                                for t, s in base])
         self.assertTrue(all(s >= 1 for _t, s in got))
+
+
+class TestScheduledKnobs(unittest.TestCase):
+    """Jack 2026-10-02: "make both changes for monday". IMM_HOUR_SIZE_MULT_NEXT
+    and IMM_EARNINGS_SIZE_MULT_NEXT take over from 00:00 ET on their _FROM day
+    (the launcher: 0-9 ET x2 -> 0-8 ET x3, earnings x1.5 -> x2 from
+    2026-10-05), read off the clock, no restart. 2026-10-05 is a Monday;
+    October => EDT (UTC-4)."""
+    FROM = datetime(2026, 10, 5).date()
+
+    def setUp(self):
+        self._saved = {k: getattr(imm, k) for k in (
+            "HOUR_SIZE_MULTS", "HOUR_SIZE_MULTS_NEXT", "HOUR_SIZE_MULT_FROM",
+            "SAT_SIZE_MULT", "EARNINGS_SIZE_MULT", "EARNINGS_SIZE_MULT_NEXT",
+            "EARNINGS_SIZE_MULT_FROM", "EARNINGS_SIZE_MULT_FROM_TS", "MENTION_SIZE_MULT")}
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0")
+        imm.HOUR_SIZE_MULT_FROM = self.FROM
+        imm.SAT_SIZE_MULT = 1.0
+        imm.MENTION_SIZE_MULT = 1.0
+        imm.EARNINGS_SIZE_MULT = 1.5
+        imm.EARNINGS_SIZE_MULT_NEXT = 2.0
+        imm.EARNINGS_SIZE_MULT_FROM = self.FROM
+        imm.EARNINGS_SIZE_MULT_FROM_TS = imm._et_day_start_ts(self.FROM)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(imm, k, v)
+
+    @staticmethod
+    def et(y, mo, d, h, mi=0):
+        return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
+
+    def test_env_day_parsing(self):
+        with mock.patch.dict(os.environ, {"IMM_X_FROM": "2026-10-05"}):
+            self.assertEqual(imm._env_et_day("IMM_X_FROM"), self.FROM)
+        with mock.patch.dict(os.environ, {"IMM_X_FROM": " "}):
+            self.assertIsNone(imm._env_et_day("IMM_X_FROM"))
+        for bad in ("10/05/2026", "2026-13-01", "monday"):
+            with mock.patch.dict(os.environ, {"IMM_X_FROM": bad}):
+                with self.assertRaises(ValueError):
+                    imm._env_et_day("IMM_X_FROM")
+        # 00:00 ET Monday = 04:00Z (EDT); None stays None
+        self.assertEqual(imm._et_day_start_ts(self.FROM), utc(2026, 10, 5, 4, 0).timestamp())
+        self.assertIsNone(imm._et_day_start_ts(None))
+
+    def test_window_switches_at_et_midnight(self):
+        s = "KXGOOD"
+        # before: 0-9 ET x2 (Friday 9:30am is IN the old window)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 2, 9, 30)), 2.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 4, 3)), 2.0)    # Sunday 3am
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 4, 23, 59)), 1.0)
+        # from 00:00 ET Monday: 0-8 ET x3, hour 9 back to x1
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 5, 0)), 3.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 5, 8, 59)), 3.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 5, 9, 30)), 1.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 9, 4)), 3.0)    # and after
+        self.assertEqual(imm.global_hour_mults(datetime(2026, 10, 4).date()), imm.HOUR_SIZE_MULTS)
+        self.assertEqual(imm.global_hour_mults(self.FROM), imm.HOUR_SIZE_MULTS_NEXT)
+        # the ladder scales with it
+        base = imm.series_levels(s)
+        self.assertEqual(imm.hour_scaled_levels(s, self.et(2026, 10, 5, 3)),
+                         [(t, 3 * sz) for t, sz in base])
+
+    def test_exclusions_and_saturday_still_compose(self):
+        mon_3am = self.et(2026, 10, 5, 3)
+        self.assertEqual(imm.hour_size_mult("KXAAAGASD", mon_3am), 1.0)     # daily family
+        self.assertEqual(imm.hour_size_mult("KXTEMPNYCH", mon_3am), 1.0)    # prefix-excluded
+        imm.SAT_SIZE_MULT = 2.0
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 10, 4)), 6.0)   # Sat 4am
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 10, 9)), 2.0)   # Sat 9am
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 3, 9)), 4.0)    # this Sat 9am
+
+    def test_half_set_pair_is_ignored(self):
+        imm.HOUR_SIZE_MULTS_NEXT = {}                   # FROM without NEXT
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 5, 3)), 2.0)
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0")
+        imm.HOUR_SIZE_MULT_FROM = None                  # NEXT without FROM
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 5, 3)), 2.0)
+        imm.EARNINGS_SIZE_MULT_FROM_TS = None
+        self.assertEqual(imm.earnings_size_mult(self.et(2026, 10, 6, 12)), 1.5)
+        imm.EARNINGS_SIZE_MULT_FROM_TS = imm._et_day_start_ts(self.FROM)
+        imm.EARNINGS_SIZE_MULT_NEXT = 0.0
+        self.assertEqual(imm.earnings_size_mult(self.et(2026, 10, 6, 12)), 1.5)
+
+    def test_floor_projection_walks_across_the_switch(self):
+        # Sunday 20:00 ET for one day: Sun 20-24 x1 (4h), Mon 0-8 x3 (9h),
+        # Mon 9-19 x1 (11h) -- the old window's hour 9 never appears
+        prof = dict(imm.size_mult_profile("KXGOOD", self.et(2026, 10, 4, 20), 1.0))
+        self.assertAlmostEqual(prof[3.0], 9 / 24, places=9)
+        self.assertAlmostEqual(prof[1.0], 15 / 24, places=9)
+        self.assertNotIn(2.0, prof)
+
+    def test_earnings_switches_at_et_midnight(self):
+        f = imm.earnings_size_mult
+        self.assertEqual(f(self.et(2026, 10, 4, 23, 59)), 1.5)
+        self.assertEqual(f(self.et(2026, 10, 5, 0)), 2.0)
+        self.assertEqual(f(self.et(2026, 11, 1, 12)), 2.0)
+        # the wall-clock path (every geometry consumer) moves the rung, both
+        # caps and leaves the rest of the mention family alone
+        noon = self.et(2026, 10, 5, 12)
+        base = imm.series_levels("KXEARNINGSMENTIONUAL")
+        with mock.patch.object(imm.time, "time", return_value=self.et(2026, 10, 4, 12).timestamp()):
+            self.assertEqual(imm.applied_mention_mult("KXEARNINGSMENTIONUAL"), 1.5)
+        with mock.patch.object(imm.time, "time", return_value=noon.timestamp()):
+            self.assertEqual(imm.applied_mention_mult("KXEARNINGSMENTIONUAL"), 2.0)
+            self.assertEqual(imm.hour_scaled_levels("KXEARNINGSMENTIONUAL", noon),
+                             [(t, 2 * sz) for t, sz in base])
+            self.assertAlmostEqual(imm.series_max_position("KXEARNINGSMENTIONUAL"),
+                                   2 * imm.MAX_POSITION_CONTRACTS)
+            self.assertAlmostEqual(imm.event_cap_contracts("KXEARNINGSMENTIONUAL-26OCT16"),
+                                   2 * imm.MAX_EVENT_CONTRACTS)
+            self.assertEqual(imm.applied_mention_mult("KXTRUMPMENTION"), 1.0)
+            self.assertEqual(imm.applied_mention_mult("KXGOOD"), 1.0)
+            # and the quiet hours compose on top: Mon 3am = x2 earnings x3 hour
+            self.assertEqual(imm.hour_scaled_levels("KXEARNINGSMENTIONUAL", self.et(2026, 10, 5, 3)),
+                             [(t, 6 * sz) for t, sz in base])
 
 
 class TestSaturdaySizeMult(unittest.TestCase):
