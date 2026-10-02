@@ -5912,3 +5912,70 @@ leaves the two named events; IMM_CPI_PILOT_EVENTS="" drops those.
 WATCH: KXCPICOREYOY-26DEC strikes in selection_snapshot ("selected" /
 "extreme_mid"), "CPI pilot release blackout" lines on weekday mornings, no
 orders in 08:25-11:05 ET.
+
+## 2026-10-01 late — Treasury how-high / how-low ladders quote only against CNBC's live yield (Jack)
+
+Jack: "is treasury feed not realtime updating my quoting? i got sniped on
+KX10YRDIRLM-26OCT30L, and KX30YRDIRLM-26OCT30L" ... "i got permission on cnbc"
+(CNBC's permission for this automated read is Jack's, told in chat 10/02
+~01:00Z; its terms otherwise forbid automated collection -- NBCUniversal
+prohibited actions K/F).
+
+WHAT HAPPENED. The 9/30 Treasury allowlist enrolled the touch ladders plain:
+no yield feed anywhere in the bot. They resolve YES when Treasury's Daily Par
+Yield (NY Fed quotes at/near 3:30pm ET, first published value, 2 dp) is below
+(L) / above (H) the strike on ANY business day of the window, so the live
+Treasury market decides strikes hours before the fix. 10/1 par: 2Y 4.88 ->
+4.78, 5Y 5.09 -> 5.01, 7Y 5.19 -> 5.12, 10Y 5.29 -> 5.24, 30Y 5.64 -> 5.61. A
+taker swept our 10Y-low asks one strike every ~6 s at 11:38:40-11:39:08 ET
+(T5.28 82c, T5.29 88, T5.27 79, T5.26 76, T5.24 66, T5.20 53), the same flow
+hit the 2Y/5Y/30Y lows 11:29-11:47 and 12:25 ET: -$76 marked on 23 fills
+(several settled YES) against ~$26 modelled reward. Programs: ~$5,563/day
+across the ten OCT30 ladders, 10/01 04:02Z -> 10/04 03:59Z.
+
+FEED (treasury_fair.py, new). CNBC's quote service: real-time Tradeweb
+on-the-run yields, one request for US2Y/5Y/7Y/10Y/30Y, every
+IMM_TREASURY_POLL_SECS=10 (60 while the market is shut), refresher thread
+"treasury-yield" into an in-memory YieldWatch (the quake gate's contract).
+CNBC's 10/1 closes sat within ~1bp of the published par.
+
+FAIR. Driftless Gaussian random walk from the live yield; daily sd per tenor
+= the last 60 par-yield changes (treasury.gov, the settlement source, read
+once a day) x1.25, floor 4bp (10/2: 2Y 6.8, 5Y 6.4, 7Y 6.2, 10Y 5.8, 30Y
+5.2 bp/day); a fix at 15:30 ET each business day through the close (SIFMA
+full closes skipped), each with 1bp of CNBC-vs-par noise; 4,000-path Monte
+Carlo, fixed seed. From 15:30 ET to midnight the day's fix is PENDING at the
+read nearest 15:30. Past fixes are not modelled: a strike they crossed has
+resolved (99c) and the band filters already skip it.
+
+GATE (treasury_gate_reason -> YieldWatch.verdict, quote loop after the
+Vercel gate, guard "treasury_yield"): stand aside (cancel) with no feed, a
+read older than 60 s, a tenor quote older than 10 min in the NY session (90
+min other weekday hours; no limit while the market is shut), in the weekday
+release windows 08:25-08:45 / 09:55-10:10 ET, while the tenor is MOVING (a
+>= 3bp range in 10 min freezes it 10 min), within 2bp of the live yield,
+DECIDED (fair < 3c or > 97c), or when the touch fights the fair by > 10c on
+the adverse side. Otherwise the ordinary safe-join ladder at the x1.5
+Treasury size, the 07:30 ET event-day cutoff unchanged. Knobs: IMM_TREASURY_*
+(treasury_fair.py); status run-logs/incentive-mm/treasury_yield_state.json
+every minute.
+
+DRY RUN 10/02 01:13Z (launcher env, live books): 268 of 278 ladder strikes
+quote, 9 near the money, 1 decided. On 10/1's sweep the gate would have
+stood T5.24-T5.29 aside (near / decided) and failed T5.20's 53c ask on the
+band (fair ~75c).
+
+KILL SWITCH. IMM_TREASURY_GATE_ENABLE=0 BLOCKS the ladders (series pattern;
+the open scan would otherwise quote them plain), never quoted without the
+gate.
+
+WHAT THIS DOES NOT FIX. A 10 s poll is slower than takers on direct feeds:
+the release windows and the move freeze carry the scheduled prints; an
+unscheduled jump inside the poll gap can still fill a stale strike. The
+model has no drift and no event-day vol; it decides stand-asides, it does
+not price. The point-in-time Treasury markets (KXUST*AD/AM/...) keep their
+07:30 ET event-day cutoff and no feed. Positions from 10/1 ride.
+
+WATCH: startup "treasury gate: ...", "treasury: sigma {...}", "treasury
+stand-aside / resume" lines, "treasury: US10Y moved 4.1bp in 10m --
+freezing" around 08:30, no ladder orders 08:25-08:45 / 09:55-10:10 ET.

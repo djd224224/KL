@@ -100,6 +100,9 @@ def setUpModule():
     # the Vercel pre-D fair file (2026-09-27) is read by every run_cycle
     imm.VERCEL_FAIR_FILE = os.path.join(tmp, "vercel_fair.json")
     imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+    # the Treasury touch gate's status file + in-memory feed (2026-10-01)
+    imm.TREASURY_STATUS_FILE = os.path.join(tmp, "treasury_yield_state.json")
+    imm._treasury_state["watch"] = None
     # the mortgage gate's status file and in-memory snapshot (2026-09-28):
     # only the refresher thread writes either, but never the live file
     imm.MORT_STATUS_FILE = os.path.join(tmp, "mortgage_fair.json")
@@ -16243,6 +16246,111 @@ class TestVercelPreDGate(unittest.TestCase):
         self.assertIn(self.T, bot._vercel_stood)
 
 
+class TestTreasuryTouchGate(unittest.TestCase):
+    """Jack 2026-10-01 ("i got sniped on KX10YRDIRLM-26OCT30L ... i got
+    permission on cnbc"): the how-high / how-low ladders quote only against
+    the live CNBC yield's touch fair (treasury_fair.YieldWatch, injected
+    here), failing closed without the feed. The fixture event closes ten
+    days out (the fair is calendar-aware), its strike picked so the fair
+    sits near 50c against a 49x51 book; release windows pinned off so the
+    test never depends on the hour."""
+
+    def setUp(self):
+        import treasury_fair
+        self.tf = treasury_fair
+        _clean_persist()
+        imm._treasury_state["watch"] = None
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        self._p = mock.patch.object(treasury_fair, "RELEASE_WINDOWS_ET", "")
+        self._p.start()
+        close = (datetime.now(timezone.utc) + timedelta(days=10)).replace(
+            hour=19, minute=30, second=0, microsecond=0)
+        self.CLOSE = close
+        self.EV = f"KX10YRDIRLM-{close:%y}{close.strftime('%b').upper()}{close:%d}L"
+
+    def tearDown(self):
+        self._p.stop()
+        imm._treasury_state["watch"] = None
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _watch(self, y=5.26):
+        w = self.tf.YieldWatch()
+        w.set_sigma({10: 0.0467}, "test")
+        now = time.time()
+        w.update({10: {"y": y, "ts": now, "status": "REG_MKT", "realtime": True}}, now)
+        return w
+
+    def _strike_near_50(self, w):
+        last = self.tf.last_day_of(self.EV, self.CLOSE)
+        now = datetime.now(timezone.utc)
+        best = min((abs(w.fair(10, "L", k / 100, last, now) - 0.5), k / 100)
+                   for k in range(480, 526))
+        return best[1]
+
+    def _bot(self, t):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": t, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[t] = {
+            "ticker": t, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot, t):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values() if o["ticker"] == t)
+
+    def test_enrolled_only_through_the_gate(self):
+        for s in ("KX2YRDIRLM", "KX5YRDIRHM", "KX7YRDIRLM", "KX10YRDIRLM",
+                  "KX10YRDIRHW", "KX10YRDIRLW", "KX30YRDIRHM", "KX30YRDIRLM"):
+            self.assertTrue(imm.treasury_touch_series(s), s)
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertFalse(imm.series_pattern_blocked(s), s)
+        for s in ("KXUST10AD", "KXUST10AM", "KX10YRRATE15M", "KX10Y2Y"):
+            self.assertFalse(imm.treasury_touch_series(s), s)
+        # the kill switch's block pattern covers exactly the ladders
+        self.assertTrue(imm._TREASURY_TOUCH_RE.fullmatch("KX30YRDIRHM"))
+        self.assertFalse(imm._TREASURY_TOUCH_RE.fullmatch("KXUST30AD"))
+        self.assertEqual(imm.treasury_gate_reason(
+            "KX10YRDIRLM", f"{self.EV}-T5.00", time.time(), 49, 51,
+            self.CLOSE)[1]["reason"], "no_feed")
+
+    def test_quotes_only_against_an_agreeing_live_fair(self):
+        w = self._watch()
+        k = self._strike_near_50(w)
+        t = f"{self.EV}-T{k:.2f}"
+        bot = self._bot(t)
+        bot.run_cycle()                                       # no feed: nothing
+        self.assertEqual(self._quotes(bot, t), [])
+        self.assertIn(t, bot._treasury_stood)
+        imm._treasury_state["watch"] = w                      # fair ~50c, book 49x51
+        why, _ = imm.treasury_gate_reason("KX10YRDIRLM", t, time.time(), 49, 51,
+                                          self.CLOSE)
+        self.assertEqual(why, "")
+        bot.run_cycle()
+        q = self._quotes(bot, t)
+        self.assertIn("bid", {s_ for s_, _p in q})
+        self.assertIn("ask", {s_ for s_, _p in q})
+        self.assertNotIn(t, bot._treasury_stood)
+        # the live yield runs down to the strike: near the money, cancelled
+        now = time.time()
+        w.update({10: {"y": k - 0.005 + 0.01, "ts": now, "status": "REG_MKT",
+                       "realtime": True}}, now)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot, t), [])
+        self.assertIn(t, bot._treasury_stood)
+
+
 class TestMortgageFairGate(unittest.TestCase):
     """mortgage_fair's snapshot -> mort_gate / mort_cap_quotes -> the
     long-dated mortgage families quoted only against the PMMS fair, never
@@ -16579,8 +16687,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the Vercel pre-D gate (2026-09-27) + the mortgage gate
         # (2026-09-28) + the data center count gate (2026-10-01) + the
         # OpenRouter market-share gate (2026-09-30) + the monthly rain gate
-        # (2026-10-01)
-        self.assertEqual(len(conts), 33)
+        # (2026-10-01) + the Treasury touch gate (2026-10-01)
+        self.assertEqual(len(conts), 34)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

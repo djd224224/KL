@@ -2728,6 +2728,15 @@ SERIES_BLOCK_PATTERNS = tuple(
         "IMM_BLOCK_SERIES_PATTERNS",
         _series_block_default(GB_STATE_QUOTE)).split(",")
     if p.strip())
+# TREASURY TOUCH LADDERS (Jack 2026-10-01, see TREASURY_GATE_ENABLE): the
+# how-high / how-low families quote ONLY through the live-yield gate. With
+# the gate off (IMM_TREASURY_GATE_ENABLE=0) they are BLOCKED, not merely
+# dropped from the allowlist -- the open scan would otherwise take them back
+# and quote them plain.
+_TREASURY_TOUCH_LIVE = os.environ.get("IMM_TREASURY_GATE_ENABLE", "1") == "1"
+_TREASURY_TOUCH_RE = re.compile(r"KX(2|5|7|10|30)YRDIR[HL][MW]")
+if not _TREASURY_TOUCH_LIVE:
+    SERIES_BLOCK_PATTERNS = SERIES_BLOCK_PATTERNS + (_TREASURY_TOUCH_RE,)
 
 
 def series_pattern_blocked(series: str) -> bool:
@@ -6166,6 +6175,9 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_FAIR_TOL_CENTS", "VERCEL_FAIR_MIN_P", "VERCEL_FAIR_TTL_MIN",
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
+    # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
+    # status file's "knobs" block
+    "TREASURY_GATE_ENABLE",
     # long-dated mortgage gate (2026-09-28); mortgage_fair's model knobs
     # ride in its status file's "model" block
     "MORT_ENABLE", "MORT_SERIES", "MORT_FAIR_TOL_CENTS", "MORT_FAIR_TTL_MIN",
@@ -7919,6 +7931,49 @@ def quake_hold_renewals(resting: List[dict], held: Set[str],
 
 
 # ----------------------------------------------------------------------------
+# TREASURY TOUCH GATE (Jack 2026-10-01: "is treasury feed not realtime
+# updating my quoting? i got sniped on KX10YRDIRLM-26OCT30L, and
+# KX30YRDIRLM-26OCT30L" ... "i got permission on cnbc"). The how-high /
+# how-low ladders (KX{2,5,7,10,30}YRDIR{H,L}M, the 10Y weeklies {H,L}W)
+# resolve YES when Treasury's 3:30pm-ET par yield crosses the strike on ANY
+# business day of the window, so the live Treasury market decides strikes
+# hours before the fix. They had been quoted plain since the 9/30 Treasury
+# allowlist and were swept 11:29-12:25 ET on 10/1 as yields fell 5-10bp
+# (-$76 on 23 fills, marked). Now the refresher thread "treasury-yield" polls
+# CNBC's real-time Tradeweb yields (treasury_fair.fetch_cnbc, every
+# IMM_TREASURY_POLL_SECS) into an in-memory YieldWatch, and the quote loop
+# asks it per strike (treasury_fair.YieldWatch.verdict). It stands a strike
+# aside -- failing CLOSED -- with no feed, a stale read or tenor quote, in
+# the weekday 08:30 / 10:00 ET release windows, while the tenor is moving
+# (>= 3bp in 10 min freezes it 10 min), within 2bp of the live yield,
+# decided (touch fair < 3c or > 97c) or when the touch fights the fair by
+# more than 10c. The fair: a Monte Carlo of the remaining 15:30 ET fixes
+# from the live yield, daily sd from the last 60 par-yield changes x1.25.
+# Kill switch IMM_TREASURY_GATE_ENABLE=0 BLOCKS the family (see
+# _TREASURY_TOUCH_LIVE), never quoted plain again. Module knobs ride in
+# TREASURY_STATUS_FILE.
+TREASURY_GATE_ENABLE = _TREASURY_TOUCH_LIVE
+TREASURY_STATUS_FILE = os.environ.get(
+    "IMM_TREASURY_STATUS_FILE", os.path.join(STATUS_DIR, "treasury_yield_state.json"))
+# the YieldWatch the refresher thread owns; None = no feed (gate closed)
+_treasury_state: dict = {"watch": None}
+
+
+def treasury_touch_series(series: str) -> bool:
+    return TREASURY_GATE_ENABLE and bool(_TREASURY_TOUCH_RE.fullmatch(series or ""))
+
+
+def treasury_gate_reason(series: str, ticker: str, now_ts: float,
+                         ext_bid: Optional[float], ext_ask: Optional[float],
+                         close_time: Optional[datetime] = None) -> Tuple[str, dict]:
+    """('', {}) when a Treasury touch strike may quote, else (reason,
+    guard-skip inputs). Fails CLOSED without the refresher's feed."""
+    watch = _treasury_state.get("watch")
+    if watch is None:
+        return "Treasury yield feed not running", {"reason": "no_feed"}
+    return watch.verdict(series, ticker, now_ts, ext_bid, ext_ask, close_time)
+
+
 # VERCEL PRE-D GATE (Jack 2026-09-27: "build the pre-D Vercel gate"). The
 # Vercel families settle on one UTC day D of Vercel's official AI Gateway
 # leaderboard export (a lab's share of spend / requests: KXOPENVSPEND,
@@ -10617,6 +10672,7 @@ class IncentiveMarketMaker:
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
         self._quake_held: Set[str] = set()        # quake gate holds (frozen bids)
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
+        self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
@@ -15739,6 +15795,23 @@ class IncentiveMarketMaker:
                 self._vercel_stood.discard(t)
                 log(f"{self.tag} vercel resume {t}")
 
+            # TREASURY TOUCH GATE (Jack 2026-10-01, see TREASURY_GATE_ENABLE):
+            # the how-high / how-low ladders quote only against the live
+            # CNBC yield's touch fair; fails CLOSED without a fresh read.
+            if treasury_touch_series(meta.series):
+                tr_why, tr_in = treasury_gate_reason(
+                    meta.series, t, now_ts, ext_bid, ext_ask, meta.close_time)
+                if tr_why:
+                    if t not in self._treasury_stood:
+                        self._treasury_stood.add(t)
+                        log(f"{self.tag} treasury stand-aside {t}: {tr_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "treasury_yield", lambda: tr_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._treasury_stood:
+                self._treasury_stood.discard(t)
+                log(f"{self.tag} treasury resume {t}")
+
             # LONG-DATED MORTGAGE GATE (Jack 2026-09-28, see MORT_ENABLE):
             # stand aside (cancel) without a fresh PMMS fair, on a shape the
             # model does not cover, or when the touch fights the fair;
@@ -17375,6 +17448,73 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_vercel_fair_refresh, daemon=True,
                              name="vercel-fair").start()
+        if TREASURY_GATE_ENABLE and not once:
+            # Treasury live-yield refresher (2026-10-01): the quake
+            # refresher's contract -- every network call off the trading
+            # thread, into the in-memory YieldWatch the quote loop reads
+            # (seconds matter here, not a file round-trip): CNBC every
+            # treasury_fair.poll_secs(), the par-yield sigma once a day, a
+            # status file once a minute. A failed read keeps the last state,
+            # which ages out of READ_TTL_SECS -- the gate then stands aside.
+            def _treasury_refresh():
+                try:
+                    import treasury_fair as tf
+                except Exception as e:
+                    log(f"{self.tag} ! treasury refresher disabled: {e}")
+                    return
+                watch = tf.YieldWatch()
+                _treasury_state["watch"] = watch
+                last, due_status, sigma_due = None, 0.0, 0.0
+                sigma_day = None
+                while True:
+                    now = time.time()
+                    try:
+                        for note in watch.update(tf.fetch_cnbc(), time.time()):
+                            log(f"{self.tag} treasury: {note} -- freezing "
+                                f"{tf.FREEZE_MIN:g}m")
+                        if last not in (None, "ok"):
+                            log(f"{self.tag} treasury: CNBC feed back")
+                        last = "ok"
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! treasury CNBC read failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                    day = datetime.now(timezone.utc).date().isoformat()
+                    if sigma_day != day and now >= sigma_due:
+                        try:
+                            watch.set_sigma(tf.fetch_sigma(), day)
+                            sigma_day = day
+                            log(f"{self.tag} treasury: sigma "
+                                f"{watch.status()['sigma_bp']} bp/day (par "
+                                f"changes, {tf.SIGMA_DAYS}d x{tf.SIGMA_WIDEN:g})")
+                        except Exception as e:
+                            sigma_due = now + 1800        # defaults until then
+                            log(f"{self.tag} ! treasury sigma read failed "
+                                f"(defaults stand): {type(e).__name__}: "
+                                f"{str(e)[:120]}")
+                    if now >= due_status:
+                        due_status = now + 60
+                        try:
+                            st = dict(watch.status(), knobs={
+                                k: getattr(tf, k) for k in (
+                                    "POLL_SECS", "READ_TTL_SECS",
+                                    "QUOTE_TTL_SESSION_MIN", "QUOTE_TTL_OFF_MIN",
+                                    "RELEASE_WINDOWS_ET", "MOVE_BP",
+                                    "MOVE_WINDOW_MIN", "FREEZE_MIN", "NEAR_BP",
+                                    "FAIR_TOL_CENTS", "MIN_P", "SIGMA_DAYS",
+                                    "SIGMA_WIDEN", "SIGMA_FLOOR_BP", "BASIS_SD_BP",
+                                    "MC_PATHS")})
+                            tmp = TREASURY_STATUS_FILE + ".tmp"
+                            with open(tmp, "w", encoding="utf-8") as f:
+                                json.dump(st, f)
+                            os.replace(tmp, TREASURY_STATUS_FILE)
+                        except (OSError, TypeError, ValueError):
+                            pass
+                    time.sleep(max(2.0, tf.poll_secs()))
+            threading.Thread(target=_treasury_refresh, daemon=True,
+                             name="treasury-yield").start()
         if MORT_ENABLE and not once:
             # Long-dated mortgage refresher (2026-09-28): the quake
             # refresher's shape -- Kalshi reads off the trading thread into
@@ -17507,6 +17647,12 @@ class IncentiveMarketMaker:
                 + f", file {VERCEL_FAIR_FILE}")
         else:
             log("vercel gate: OFF -- the Vercel series are not enrolled")
+        if TREASURY_GATE_ENABLE:
+            log("treasury gate: how-high / how-low ladders (KX{2,5,7,10,30}YRDIR"
+                "{H,L}{M,W}) quote only against CNBC's live yield (touch fair), "
+                f"fail-closed, status {TREASURY_STATUS_FILE}")
+        else:
+            log("treasury gate: OFF -- the how-high / how-low ladders are BLOCKED")
         if MORT_ENABLE:
             log(f"mortgage gate: {','.join(sorted(MORT_SERIES))} fail-closed, "
                 f"bids <= fair - {MORT_FAIR_TOL_CENTS}c, asks >= fair + "
