@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 
@@ -133,6 +134,75 @@ class ProjectionTests(unittest.TestCase):
         late = datetime(2026, 10, 2, 23, 30, tzinfo=dash.ET).timestamp()
         rows = [("KXA-26-X", 0.1, 240.0, 1.0, None), ("KXB-26-Y", 0.0, 500.0, 1.0, None)]
         self.assertAlmostEqual(dash.project_rest_of_day(rows, late, self.quiet), 0.5, places=6)
+
+
+class EventStartCacheTests(unittest.TestCase):
+    """2026-10-02: the programs refresh went from ~7 s to ~2 minutes once
+    ~98 NFL ladder events needed ESPN kickoffs -- a bare requests.get per
+    lookup, and a fresh resolver every refresh. One session, answers kept."""
+
+    class _Resolver:                      # incentive_mm.EventStartResolver's surface
+        def __init__(self, http_get_json=None):
+            self._get = http_get_json
+            self.cache = {}
+
+    class _Imm:
+        pass
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._old = dash.CACHE_DIR
+        dash.CACHE_DIR = self.dir
+        self.imm = self._Imm()
+        self.imm.EventStartResolver = self._Resolver
+
+    def tearDown(self):
+        dash.CACHE_DIR = self._old
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_answers_survive_to_the_next_build_until_they_expire(self):
+        now = time.time()
+        kick = datetime(2026, 10, 4, 17, 0, tzinfo=timezone.utc)
+        res = dash.event_start_resolver(self.imm)
+        self.assertIs(res._get, dash._http_get_json)          # the shared session
+        res.cache.update({"KXNFLFFPTSLADDER-26OCT04BUFNE": (now + 6 * 3600, kick),
+                          "KXNFLESCALATORREC-26OCT11DALNYG": (now + 1800, None),
+                          "KXOLD-1": (now - 5, kick)})
+        dash.save_event_starts(res)
+        nxt = dash.event_start_resolver(self.imm)
+        self.assertEqual(nxt.cache["KXNFLFFPTSLADDER-26OCT04BUFNE"][1], kick)
+        self.assertIsNone(nxt.cache["KXNFLESCALATORREC-26OCT11DALNYG"][1])
+        self.assertNotIn("KXOLD-1", nxt.cache)                 # expired: asked again
+        self.assertFalse(os.path.exists(os.path.join(self.dir, dash.EVENT_STARTS_CACHE + ".tmp")))
+
+    def test_an_unreadable_cache_just_asks_again(self):
+        with open(os.path.join(self.dir, dash.EVENT_STARTS_CACHE), "wb") as f:
+            f.write(b"not a pickle")
+        self.assertEqual(dash.event_start_resolver(self.imm).cache, {})
+
+    def test_one_session_for_every_lookup(self):
+        calls = []
+
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"events": []}
+
+        class _Session:
+            def get(self, url, timeout=None):
+                calls.append((url, timeout))
+                return _Resp()
+
+        old = dash._http_session
+        dash._http_session = _Session()
+        try:
+            self.assertEqual(dash._http_get_json("https://x/a"), {"events": []})
+            self.assertEqual(dash._http_get_json("https://x/b"), {"events": []})
+        finally:
+            dash._http_session = old
+        self.assertEqual(calls, [("https://x/a", 10), ("https://x/b", 10)])
 
 
 class WindowTests(unittest.TestCase):

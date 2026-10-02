@@ -1338,6 +1338,60 @@ def _api_cached(name: str, ttl_min: float, force: bool, fn):
         return None, 0.0, repr(e)
 
 
+EVENT_STARTS_CACHE = "event_starts.pkl"
+_http_session = None
+
+
+def _http_get_json(url: str):
+    """EventStartResolver's GET on one kept-alive session. The bot's default
+    is a bare requests.get: a new TLS context per call, which loads the CA
+    bundle each time (~0.44 s here) -- 55 of the 62 s a programs refresh took
+    once ~98 NFL ladder / escalator events needed ESPN kickoffs (2026-10-02).
+    The bot's own headers (Nasdaq 403s a minimal UA), timeout and errors."""
+    global _http_session
+    if _http_session is None:
+        import requests
+        _http_session = requests.Session()
+        _http_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0 Safari/537.36",
+            "Accept": "application/json"})
+    r = _http_session.get(url, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def event_start_resolver(imm):
+    """incentive_mm.EventStartResolver on the shared session, with the answers
+    of earlier builds: a fresh resolver per refresh re-asked ESPN for every
+    sports event every 30 minutes. Entries keep the resolver's own expiry (6 h
+    found, 30 min not found), and hand-set overrides are still read before
+    the cache (resolve() checks them first)."""
+    res = imm.EventStartResolver(http_get_json=_http_get_json)
+    try:
+        with open(os.path.join(CACHE_DIR, EVENT_STARTS_CACHE), "rb") as f:
+            kept = pickle.load(f)
+        now = time.time()
+        res.cache.update({k: v for k, v in kept.items() if v[0] > now})
+    except Exception:
+        pass                              # no cache yet, or unreadable: ask again
+    return res
+
+
+def save_event_starts(res) -> None:
+    now = time.time()
+    keep = {k: v for k, v in res.cache.items() if v[0] > now}
+    path = os.path.join(CACHE_DIR, EVENT_STARTS_CACHE)
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+            pickle.dump(keep, f)
+        os.replace(path + ".tmp", path)
+    except OSError as e:
+        log(f"! event-start cache not saved: {e!r}")
+
+
 def fetch_programs(gaps, imm, now_utc):
     """{event: rec} of every active liquidity program, rolled up per event
     (send_imm_new_programs.roll_up_events), with pool/day, window, target."""
@@ -1351,7 +1405,7 @@ def fetch_programs(gaps, imm, now_utc):
         imm.load_finecon_extra_series()
     except Exception:
         pass
-    resolver = imm.EventStartResolver()
+    resolver = event_start_resolver(imm)
     state = load_json(os.path.join(STATUS_DIR, "imm_state.json"))
     quoted = set(state.get("selected_tickers") or [])
     # Kalshi's own event title, fetched once per event (GET /events/{ticker}),
@@ -1398,6 +1452,7 @@ def fetch_programs(gaps, imm, now_utc):
             "end": rec["end"].timestamp(), "target": rec["target"], "bot": bot,
             "what": what, "tickers": sorted(rec["tickers"]),
         }
+    save_event_starts(resolver)
     return out
 
 
