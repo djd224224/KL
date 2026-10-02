@@ -7,11 +7,13 @@ number that looks authoritative and is wrong. Most of what is asserted here is
 that behaviour, not the happy path.
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -518,6 +520,99 @@ class TestCalibrationSeries(unittest.TestCase):
         # the existing keys the digest reads are unchanged
         self.assertIn("by_family", pay["post_amendment"])
         self.assertAlmostEqual(pay["post_amendment"]["realization_factor"], round(8.0 / 10.5, 4))
+
+
+class TestLedgerHorizon(unittest.TestCase):
+    """Credits exist only as pasted statements. The 9/29 calibration counted
+    the 9/27-28 NFL ladders as settled -- programs ended, paid_out set -- on a
+    ledger last pasted 9/27, so they read $0 credited against $144 modelled
+    and took the dashboard's Sports & awards paid rate from ~0.9 to 0.28."""
+
+    NOW = datetime(2026, 10, 2, 13, 0, tzinfo=timezone.utc)   # ledger still at 9/27
+    LEDGER = [("2026-09-27", "KXWEEK-26SEP26", 2.50, "Liquidity"),
+              ("2026-09-25", "KXRAIN-26SEP24", 3.00, "Liquidity"),
+              ("2026-09-20", "KXMLBGAME-26SEP20", 9.00, "Liquidity")]  # another bot's
+
+    def setUp(self):
+        p = mock.patch.object(rec, "CREDIT_LAG_DAYS", 1.0)   # the default, whatever the env
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def _prog(start, end):
+        return {"start": start, "end": end, "paid": True, "periods": [[start, end, True]]}
+
+    @staticmethod
+    def _est(first, last, est):
+        return {"est": est, "first": rec._ts(first), "last": rec._ts(last),
+                "cycles": 100, "two_sided": 100}
+
+    def _reconcile(self, ledger=None):
+        est = {
+            # ended 00:00 ET 9/25, credited 9/25
+            "KXRAIN-26SEP24-T1": self._est("2026-09-24T12:00:00Z", "2026-09-25T03:00:00Z", 3.2),
+            # the bug: Sunday night's ladder, paid out, its credit not pasted yet
+            "KXNFLLADDERREC-26SEP27BUFMIA-T50": self._est(
+                "2026-09-25T16:00:00Z", "2026-09-28T00:20:00Z", 6.0),
+            # ended 16:00 ET 9/26, credited the next day: inside the 1-day lag
+            "KXWEEK-26SEP26-T1": self._est("2026-09-25T12:00:00Z", "2026-09-26T19:00:00Z", 2.4),
+            # no program record: judged on its last quote, 9/28
+            "KXAPP-26SEP28-T1": self._est("2026-09-24T12:00:00Z", "2026-09-28T12:00:00Z", 5.0),
+        }
+        progs = {
+            "KXRAIN-26SEP24-T1": self._prog("2026-09-24T04:00:00Z", "2026-09-25T04:00:00Z"),
+            "KXNFLLADDERREC-26SEP27BUFMIA-T50": self._prog(
+                "2026-09-25T16:00:00Z", "2026-09-28T00:30:00Z"),
+            "KXWEEK-26SEP26-T1": self._prog("2026-09-25T12:00:00Z", "2026-09-26T20:00:00Z"),
+        }
+        with mock.patch.object(rec, "load_ledger",
+                               return_value=self.LEDGER if ledger is None else ledger),                 mock.patch.object(rec, "rebuild_estimates", return_value=est),                 mock.patch.object(rec, "load_programs", return_value=progs),                 mock.patch.object(rec, "rebuild_hourly", return_value={}):
+            rows, led = rec.reconcile(now_utc=self.NOW)
+        return {r["event"]: r for r in rows}, led
+
+    def test_cutoff_is_the_end_of_the_day_a_lag_before_the_last_credit(self):
+        # ledger through 9/27, 1-day lag -> programs ended by 00:00 EDT 9/27
+        self.assertEqual(rec.ledger_cutoff(self.LEDGER), rec._ts("2026-09-27T04:00:00Z"))
+        self.assertEqual(rec.ledger_cutoff(self.LEDGER, lag_days=2),
+                         rec._ts("2026-09-26T04:00:00Z"))
+        self.assertIsNone(rec.ledger_cutoff([]))
+
+    def test_a_program_that_ended_after_the_last_paste_is_not_settled(self):
+        rows, _ = self._reconcile()
+        nfl = rows["KXNFLLADDERREC-26SEP27BUFMIA"]
+        self.assertEqual(nfl["credited"], 0.0)
+        self.assertFalse(nfl["settled_any"])
+        self.assertTrue(nfl["after_ledger"])
+        self.assertTrue(rows["KXRAIN-26SEP24"]["settled_any"])
+        self.assertTrue(rows["KXWEEK-26SEP26"]["settled_any"])
+        self.assertFalse(rows["KXWEEK-26SEP26"]["after_ledger"])
+        # the clock-only branch (3 days since the last quote) obeys it too
+        self.assertFalse(rows["KXAPP-26SEP28"]["settled_any"])
+        self.assertTrue(rows["KXAPP-26SEP28"]["after_ledger"])
+        # credits on an event IMM never quoted are attribution, as before
+        self.assertTrue(rows["KXMLBGAME-26SEP20"]["settled_any"])
+
+    def test_the_lag_is_a_knob(self):
+        with mock.patch.object(rec, "CREDIT_LAG_DAYS", 2.0):
+            rows, _ = self._reconcile()
+        self.assertFalse(rows["KXWEEK-26SEP26"]["settled_any"])
+        self.assertTrue(rows["KXRAIN-26SEP24"]["settled_any"])
+
+    def test_an_empty_ledger_settles_nothing_imm_quoted(self):
+        rows, _ = self._reconcile(ledger=[])
+        self.assertFalse(any(r["settled_any"] for r in rows.values()))
+
+    def test_the_calibration_the_dashboard_reads_leaves_them_out(self):
+        rows, led = self._reconcile()
+        d = tempfile.mkdtemp()
+        with mock.patch.object(rec, "STATUS_DIR", d),                 mock.patch.object(rec, "CALIB_PATH", os.path.join(d, "reward_calibration.json")),                 contextlib.redirect_stdout(io.StringIO()) as out:
+            pay = rec.write_calibration(rec.report(list(rows.values()), led),
+                                        list(rows.values()), led)
+        self.assertEqual(set(pay["post_amendment"]["series"]), {"KXRAIN", "KXWEEK"})
+        self.assertNotIn("KXNFLLADDERREC", pay["series"])
+        self.assertEqual((pay["ledger_through"], pay["settled_cutoff"]),
+                         ("2026-09-27", "2026-09-27T04:00:00Z"))
+        self.assertIn("2 events ended later", out.getvalue())
 
 
 if __name__ == "__main__":

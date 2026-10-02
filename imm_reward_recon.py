@@ -48,6 +48,13 @@ hour (rebuild_hourly) and split at each period's start and end; a market with
 no program metadata keeps the lifetime test. IMM_RECON_FLOOR_PER_PERIOD=0
 restores the lifetime test everywhere.
 
+"Settled" is judged against the LEDGER as well as the clock (2026-10-02):
+credits exist only as pasted, so a program that ended after the last
+statement reads $0 credited however Kalshi has paid it. An event enters the
+calibration only once its program ended IMM_RECON_CREDIT_LAG_DAYS (default
+1) days before the ledger's latest credit_date (ET dates); later ones wait
+for the next statement.
+
 Usage:
     python imm_reward_recon.py --statement "C:/.../incentive rewards.txt"
     python imm_reward_recon.py --report
@@ -771,12 +778,40 @@ def _period_bounds(prog):
     return out or None
 
 
-def reconcile(since=None, floor=PAYOUT_FLOOR):
+# Credits exist only as pasted statements, so the ledger knows nothing past
+# its latest credit_date: a program that ended later reads $0 credited however
+# Kalshi has paid it (the 9/29 calibration: the 9/27-28 NFL ladders, $144
+# modelled against $0, took Sports & awards' paid rate from ~0.9 to 0.28).
+# CREDIT_LAG_DAYS is how many days after its program ends (ET dates) an
+# event's credits may still post, so an event is settled only if its program
+# ended that many days before the ledger's latest credit_date. An event's last
+# credit vs its program end, 483 single-end events Aug 5 - Sep 27: +0 5%,
+# +1 82%, +2 12%, +3 <1%. Re-cut at each paste day Sep 1-24, 1 day left
+# credit out of the ledger once (9/10, a 27-credit day: Kalshi paid the 9/09
+# cohort on 9/11, 1.7% of the settled credit); 2 days never did.
+CREDIT_LAG_DAYS = float(os.environ.get("IMM_RECON_CREDIT_LAG_DAYS", "1"))
+
+
+def ledger_cutoff(ledger, lag_days=None):
+    """Epoch seconds: the latest program end whose credits the ledger can
+    hold -- the end of the ET day CREDIT_LAG_DAYS before its latest
+    credit_date -- or None for an empty ledger, which can settle nothing."""
+    if not ledger:
+        return None
+    import pytz
+    et = pytz.timezone("America/New_York")
+    last = datetime.strptime(max(r[0] for r in ledger), "%Y-%m-%d")
+    lag = CREDIT_LAG_DAYS if lag_days is None else lag_days
+    return et.localize(last + timedelta(days=1 - lag)).timestamp()
+
+
+def reconcile(since=None, floor=PAYOUT_FLOOR, now_utc=None):
     ledger = load_ledger()
     est = rebuild_estimates()
     progs = load_programs()
     hourly = rebuild_hourly(max_date=HOURLY_MAX_DATE) if FLOOR_PER_PERIOD else {}
-    now = datetime.now(timezone.utc).timestamp()
+    now = (now_utc or datetime.now(timezone.utc)).timestamp()
+    cutoff = ledger_cutoff(ledger)
     LAST_FLOOR_DETAIL.clear()
 
     credits, credit_n, credit_last = defaultdict(float), defaultdict(int), {}
@@ -827,6 +862,11 @@ def reconcile(since=None, floor=PAYOUT_FLOOR):
             settled = e["p_end"] < now - 12 * 3600 and e["unpaid"] <= e["paid"]
         elif e and e["last"] is not None:
             settled = e["last"] < now - 3 * 86400
+        # ...nor one that ended past the ledger's reach: its credits are not
+        # pasted yet (no program record: the last quote stands in for the end)
+        end = (e["p_end"] if e["p_end"] is not None else e["last"]) if e else None
+        after_ledger = settled and end is not None and (cutoff is None or end > cutoff)
+        settled = settled and not after_ledger
         rows.append({
             "event": ev, "series": series_of(ev),
             "credited": credits.get(ev, 0.0), "credits": credit_n.get(ev, 0),
@@ -837,6 +877,8 @@ def reconcile(since=None, floor=PAYOUT_FLOOR):
             "over_floor": over.get(ev, 0) if e else 0,
             "settled": settled and in_window,
             "settled_any": settled,
+            # ended, but after the ledger's reach: waits for a newer statement
+            "after_ledger": after_ledger,
             "first": e["first"] if e else None,
             "imm": bool(e and e["est"] > 0.0),
             "credit_date": credit_last.get(ev, ""),
@@ -879,6 +921,15 @@ def report(rows, ledger, floor=PAYOUT_FLOOR, verbose=False):
     print("=" * 74)
     print(f"ESTIMATE vs CREDIT — settled programs only ({len(settled)} events)")
     print("  ratio > 1 means the estimator UNDERSTATES what Kalshi paid.")
+    cut = ledger_cutoff(ledger)
+    if cut is not None:
+        import pytz
+        late = [r for r in rows if r.get("after_ledger")]
+        print(f"  ledger through {max(d for d, *_ in ledger)}: programs ended by "
+              f"{datetime.fromtimestamp(cut, pytz.timezone('America/New_York')):%Y-%m-%d %H:%M} ET"
+              f" (CREDIT_LAG_DAYS {CREDIT_LAG_DAYS:g})")
+        print(f"  {len(late)} events ended later (est+floor "
+              f"${sum(r['est_floor'] for r in late):,.2f}): they wait for a newer statement")
     print("=" * 74)
     c = sum(r["credited"] for r in settled)
     s = sum(r["est"] for r in settled)
@@ -972,10 +1023,16 @@ def write_calibration(summary, rows, ledger):
         a[1] += r["est"]
         a[2] += r["est_floor"]
         a[3] += 1
+    cut = ledger_cutoff(ledger)
     payload = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "imm_inception": IMM_INCEPTION,
         "payout_floor": PAYOUT_FLOOR,
+        # the ledger's reach: no settled figure here covers a program that
+        # ended after settled_cutoff (CREDIT_LAG_DAYS before the last credit)
+        "ledger_through": max((r[0] for r in ledger), default=None),
+        "settled_cutoff": (datetime.fromtimestamp(cut, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ") if cut is not None else None),
         "credited_lifetime_account": round(summary["lifetime"], 2),
         "credited_since_inception": round(summary["since_imm"], 2),
         "credited_imm_attributable": round(summary["imm_credit"], 2),
