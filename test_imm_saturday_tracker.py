@@ -468,6 +468,26 @@ class DatedQuietWindowTests(unittest.TestCase):
         self.assertAlmostEqual(out[0]["sat"]["ct_h"], 1_000.0)          # 8am only: 9am is day from 10/5
         self.assertAlmostEqual(out[0]["wk"]["ct_h"], 1_000.0)
 
+    def test_evening_hours_sit_out_of_the_saturday_level_read(self):
+        # 2026-10-05: ET 18-21 x1.5 on the long-dated book. Its hours would
+        # read a x2 Saturday as x2.25 and a weekday as x1.1 -- drop them.
+        with mock.patch.object(sat.imm, "EVENING_SIZE_MULTS", {h: 1.5 for h in range(18, 22)}), \
+                mock.patch.object(sat.imm, "EVENING_SIZE_MULT_FROM", datetime(2026, 10, 5).date()):
+            rows = []
+            for d, sat_m in (("2026-10-03", 2.0), ("2026-10-10", 2.0), ("2026-10-07", 1.0)):
+                for h, ev in ((12, 1.0), (19, 1.5)):
+                    m = sat_m * (ev if d >= "2026-10-05" else 1.0)
+                    rows.append(dict(et_date=d, et_hour=h, series="KXTRUMPMENTION", sum_est_usd=240.0,
+                                     sum_quoted=50_000.0, n_rows=50, q_rows=50, hm_sum=50 * m))
+            ser = pd.DataFrame(rows)
+            cyc = pd.DataFrame([dict(et_date=r["et_date"], et_hour=r["et_hour"], n_cycles=50) for r in rows])
+            b = sat.gate_blocks(ser, cyc, None, "2026-10-11").set_index(["et_date", "block"])
+            self.assertAlmostEqual(b.loc[("2026-10-03", "day"), "hm"], 2.0)    # before 10/5: both hours count
+            self.assertAlmostEqual(b.loc[("2026-10-10", "day"), "hm"], 2.0)    # 19:00 (x3) sits out
+            self.assertAlmostEqual(b.loc[("2026-10-07", "day"), "hm"], 1.0)    # a weekday reads x1
+            self.assertEqual(sat._level(b.loc[("2026-10-10", "day"), "hm"]), 2.0)
+            self.assertAlmostEqual(b.loc[("2026-10-10", "day"), "ct_h"], 2_000.0)   # contract-hours kept
+
     def test_knob_line_states_the_switch(self):
         before = sat._quiet_hours_line("2026-10-04")
         self.assertTrue(before.startswith("0-9 ET x2"), before)

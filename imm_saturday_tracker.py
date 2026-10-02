@@ -434,6 +434,7 @@ def build_rows(ser, cyc, mid_tab, fills, results, through_et: str):
     day_cycles = cyc.groupby("et_date")["n_cycles"].sum()
     day_hours = cyc.groupby("et_date")["et_hour"].nunique()
     ser["group"] = ser["series"].map(group_of)
+    ser = drop_evening_hm(ser)
     g = ser.groupby(["et_date", "group"]).agg(sum_est=("sum_est_usd", "sum"), sum_q=("sum_quoted", "sum"),
                                               q_rows=("q_rows", "sum"), hm_sum=("hm_sum", "sum")).reset_index()
     g["cycles"] = g["et_date"].map(day_cycles)
@@ -560,6 +561,26 @@ def block_label(block: str, et_date: str) -> str:
     return f"{_hour_span(q if block == 'quiet' else frozenset(range(24)) - q)} ET"
 
 
+def drop_evening_hm(df: pd.DataFrame) -> pd.DataFrame:
+    """df with q_rows / hm_sum zeroed on each day's EVENING hours
+    (imm.evening_hour_mults: ET 18-21 x1.5 from 2026-10-05). The parser's
+    hour_mult (outside 0-9) is the Saturday-level read -- the gate's
+    knob-live test, the step-up watch's _level, the per-day mult column --
+    and an evening x1.5 would turn a x2 Saturday into ~x2.25 (and a
+    weekday into ~x1.1), so those hours sit out of it. Rent, fills and
+    contract-hours are untouched."""
+    if df.empty or not {"q_rows", "hm_sum"} <= set(df.columns):
+        return df
+    ev = {d: set(imm.evening_hour_mults(datetime.strptime(d, "%Y-%m-%d").date()))
+          for d in set(df["et_date"])}
+    mask = np.array([h in ev[d] for d, h in zip(df["et_date"], df["et_hour"])], dtype=bool)
+    if not mask.any():
+        return df
+    df = df.copy()
+    df.loc[mask, ["q_rows", "hm_sum"]] = 0.0
+    return df
+
+
 def gate_blocks(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, through_et: str) -> pd.DataFrame:
     """Long-dated sums per (et_date, block) from the tracker's own loaders:
     resting contract-hours, modelled $ accrued, fills, mark-out and
@@ -573,6 +594,7 @@ def gate_blocks(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, thro
     c["block"] = block_of(c["et_date"], c["et_hour"])
     s = ser[(ser["et_date"] >= SINCE) & (ser["et_date"] <= through_et)]
     s = s[s["series"].map(group_of) == "long-dated"].merge(c, on=["et_date", "et_hour"], how="inner")
+    s = drop_evening_hm(s)
     s["ct_h"] = s["sum_quoted"] / s["n_cycles"]
     s["rent_usd"] = s["sum_est_usd"] / s["n_cycles"] / 24.0
     a = s.groupby(["et_date", "block"]).agg(ct_h=("ct_h", "sum"), rent_usd=("rent_usd", "sum"),
@@ -1113,6 +1135,10 @@ def _knob_lines(through_et: str, html: bool = False):
         ("Saturday multiplier", f"{times}{imm.SAT_SIZE_MULT:g} on Saturdays (ET), long-dated families only"),
         ("Saturday step-up", imm.sat_gate_summary()),
         ("Quiet hours", _quiet_hours_line(through_et, html)),
+        ("Evening window", (f"{_hours_summary(dict(imm.EVENING_SIZE_MULTS), html)} (long-dated, not sports ladders)"
+                            + (f" from {imm.EVENING_SIZE_MULT_FROM.isoformat()}"
+                               if imm.EVENING_SIZE_MULT_FROM is not None else "")
+                            + "; kept out of the Saturday-level hour_mult read")),
         ("No multiplier", f"daily families: prefixes {', '.join(EXCL)} + {len(structural)} structural"
                           + (f" ({', '.join(structural)})" if structural else " (none yet)")),
         ("Window", f"ET days {SINCE} {arrow} {through_et}; baseline 2026-08-08 {arrow} 2026-09-11 (before the multiplier)"),

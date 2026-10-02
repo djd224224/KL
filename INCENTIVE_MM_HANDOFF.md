@@ -6231,3 +6231,86 @@ parse cache (4421783) needs no CACHE_VERSION bump.
 
 Tests: DatedQuietWindowTests (hours and labels by day, hour 9 by its own
 day in gate_blocks, the family table, the knob line). 1,902 green.
+
+## 2026-10-02 — From Monday 10/5: an evening window (ET 18-21 x1.5) and a yield size mode (x1.5 on markets yielding >= $0.011/contract/day) (Jack)
+
+Jack, after the "where else can I add a multiplier" review: "1 and 2 for
+monday". Both are dated CODE DEFAULTS (no launcher change, no -Task restart:
+the sync and the bot's code-change restart deploy them, and they switch on
+off the clock at 00:00 ET 2026-10-05).
+
+THE REVIEW (9/15-10/1, long-dated families ex-ladders; modelled rent at each
+family's paid rate from the 13:51Z calibration -- 1.08x overall -- minus the
+24h mark-out of the fills, and separately minus the dashboard's actual
+trading P&L; per 1k resting contract-hours; gains assume fills scale 1:1
+with size, as the 9/12 overnight doubling showed, and reward dilutes by our
+share of the scored book):
+- hour blocks, weekdays: 0-8 ET (x2) +23c, hour 9 (x2) -25c, 10-12 -10c,
+  13-17 +22c, 18-21 +36c, 22-23 +2c. Evening minus the other day hours
+  bootstrap 90% CI [+7, +51]c; 18-21 is the best or near-best block every
+  week (18 -> 49 -> 61c), positive 12 of 13 weekdays, and broad: TRUMP
+  mentions, econ, AI, Carbon Arc, earnings, KXRT all net positive there.
+- yield quintiles (market-day level, paid rent per 1k contract-hours):
+  Q1 <19c nets ~0 (-1.5 / -0.3c) on 19% of the long-dated book; Q4 44-69c
+  +35 / +20c; Q5 >69c +49 / +82c; positive every week for Q4-Q5. KXRT is a
+  third of Q5 and nets -8c on mark-outs; gas / diesel, econ & rates and
+  elections lose money even in their high-yield markets.
+- other levers measured: Carbon Arc *CC x1.5 +$9-10/day; commodities, AI,
+  politics, Carbon Arc *FT / *ADS, weather x1.5 ~+$15/day together (largely
+  the same markets the yield mode reaches); TRUMPMENTION as a family ~$0 on
+  trading P&L; floor rescue (x2 on payout_floor skips) 174 of 615 clear,
+  ~$37/day net at best, needs its own design; cuts: 10-12 ET x0.5 +$2.5/day,
+  the lowest-yield fifth x0.5 +$1-3/day (and ~80k contract-hours of collateral).
+
+EVENING WINDOW. EVENING_SIZE_MULTS = IMM_EVENING_SIZE_MULT ("18-21:1.5", the
+IMM_HOUR_SIZE_MULT syntax, "" = off) from IMM_EVENING_SIZE_MULT_FROM
+("2026-10-05", "" = at once); evening_hour_mults(et_day). Applied in
+_hour_window_mult after the global window: never on a quiet hour, never on
+sports ladders / escalators (their pre-kickoff window -- inactives post
+~90 min before kickoff, the cutoff is kickoff - 30 min -- and the study left
+them out), never on daily families, open-scan members or
+IMM_HOUR_MULT_EXCLUDE prefixes; a per-series window wins for its hours
+(KXRAIN 19-1 x0.5, gas 16-1 x0.5); Saturday multiplies on top (x3); the
+floor projection's hour walk sees it. Modelled +$20/day at x1.5.
+
+YIELD SIZE MODE. YIELD_SIZE_MULT 1.5 (IMM_YIELD_SIZE_MULT, 1 = off) from
+YIELD_SIZE_MULT_FROM 2026-10-05, on markets whose meta.yield_per_contract
+(the estimator's modelled $/contract/day, pads excluded) is >= YIELD_SIZE_MIN
+$0.011 (~44c per 1k contract-hours paid, the Q4 floor), held down to
+YIELD_SIZE_EXIT_FRAC 0.85 of it (own-size dilution of the per-contract yield
+is up to 1 / (1 + 0.5 x share)). yield_size_eligible: long-dated only; no
+family multiplier and no hand-tuned ladder / cap / quote_all; not open-scan,
+finecon, elections, sports ladders; not the excluded families by prefix
+(IMM_YIELD_SIZE_EXCLUDE: KXRT, gas & diesel, Treasuries and econ by prefix,
+sports & venues, awards) or word (IMM_YIELD_SIZE_EXCLUDE_WORDS: econ words,
+NOBEL / ALBUM); a *MENTION series skips the prefix / word lists (KXWCMENTION).
+Per ticker, sticky, decided on each refresh's estimate (_yield_size_verdict
+right after yield_per_contract), dropped when the market leaves the
+selection (_prune_yield_boost at the top of the yield pass). Composed with
+the near-cliff size mode as _market_size_mult at every reader of the shape:
+the estimator's probe ladder and floor projection, the collateral
+reservation, the quote loop, the placement guard's bracket. Caps and skew
+knees unscaled (like near-cliff). Logged: the startup line, "yield size: N of
+M selected markets" when N changes, ys_size_mult in the selection snapshot.
+For the rule as built: +$17-22/day modelled, net +47c (mark-out) / +39c
+(trading P&L) per 1k contract-hours in the tier, positive every week.
+
+SATURDAY TRACKER. Evening hours sit out of the hour_mult it reads the
+Saturday level from (drop_evening_hm, in build_rows and gate_blocks): with
+the evening x1.5 a x2 Saturday's day block would read ~x2.25 and the
+step-up watch's _level would never match x2. Quiet / day blocks unchanged
+(the evening hours are day-block hours; Saturday and its weekdays both carry
+them). The email's knob lines name the evening window.
+
+SIZES (launcher geometry, 20-lot rung): a generic long-dated market 30 by day
+in 18-21 ET from Monday, 60 Saturday evenings; earnings (x2) 60 Monday
+evenings; a yield-mode market x1.5 on top of whatever its hour says (e.g. 90 a
+side in Monday's 0-8 ET quiet hours, 180 Saturday nights). Collateral rises
+on the boosted markets; the $100k selection budget (x0.65 estimate + the
+inventory reserve) will skip more NEW markets on Saturday nights.
+
+Tests: TestEveningWindow, TestYieldSizeMode (eligibility, activation,
+hysteresis, near-cliff composition, the end-to-end cycle resting x1.5 and
+back), the tracker's evening hm test; the suite neutralises both dated
+defaults at import. 1,913 green; with both forced on (FROM "" and the
+evening over all 24 hours) only the two code-default assertions differ.

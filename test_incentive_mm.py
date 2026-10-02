@@ -60,6 +60,15 @@ imm.HOUR_SIZE_MULT_FROM = None
 imm.EARNINGS_SIZE_MULT_NEXT = 0.0
 imm.EARNINGS_SIZE_MULT_FROM = None
 imm.EARNINGS_SIZE_MULT_FROM_TS = None
+# ...and the two dated code defaults of 2026-10-05: the evening window (an
+# hour-of-day size change on every real-clock cycle from 10/5) and the yield
+# size mode (a per-market size change). TestEveningWindow and
+# TestYieldSizeMode arm them explicitly.
+_EVENING_CODE_DEFAULT = (dict(imm.EVENING_SIZE_MULTS), imm.EVENING_SIZE_MULT_FROM)
+_YIELD_CODE_DEFAULT = (imm.YIELD_SIZE_MULT, imm.YIELD_SIZE_MULT_FROM, imm.YIELD_SIZE_MIN,
+                       imm.YIELD_SIZE_EXIT_FRAC)
+imm.EVENING_SIZE_MULTS = {}
+imm.YIELD_SIZE_MULT = 1.0
 
 
 def setUpModule():
@@ -8839,6 +8848,199 @@ class TestScheduledKnobs(unittest.TestCase):
             # and the quiet hours compose on top: Mon 3am = x2 earnings x3 hour
             self.assertEqual(imm.hour_scaled_levels("KXEARNINGSMENTIONUAL", self.et(2026, 10, 5, 3)),
                              [(t, 6 * sz) for t, sz in base])
+
+
+class TestEveningWindow(unittest.TestCase):
+    """Jack 2026-10-02 ("1 and 2 for monday"): ET 18-21 x1.5 on the long-dated
+    book from 00:00 ET 2026-10-05 -- never on a quiet hour, never on the
+    sports ladders / escalators (pre-kickoff), never on daily families.
+    October => EDT (UTC-4)."""
+
+    def setUp(self):
+        self._saved = {k: getattr(imm, k) for k in (
+            "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM", "HOUR_SIZE_MULTS",
+            "HOUR_SIZE_MULTS_NEXT", "HOUR_SIZE_MULT_FROM", "SAT_SIZE_MULT", "HOUR_MULT_EXCLUDE")}
+        imm.EVENING_SIZE_MULTS = imm._parse_hour_mults("18-21:1.5")
+        imm.EVENING_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0")
+        imm.HOUR_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
+        imm.SAT_SIZE_MULT = 1.0
+        imm.HOUR_MULT_EXCLUDE = ("KXTEMP",)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(imm, k, v)
+
+    @staticmethod
+    def et(y, mo, d, h, mi=0):
+        return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
+
+    def test_code_default(self):
+        self.assertEqual(_EVENING_CODE_DEFAULT,
+                         ({18: 1.5, 19: 1.5, 20: 1.5, 21: 1.5}, datetime(2026, 10, 5).date()))
+
+    def test_window_from_monday(self):
+        s = "KXGOOD"
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 2, 19)), 1.0)      # Friday: not yet
+        self.assertEqual(imm.evening_hour_mults(datetime(2026, 10, 4).date()), {})
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 5, 17, 59)), 1.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 5, 18)), 1.5)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 5, 21, 59)), 1.5)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 5, 22)), 1.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 3)), 3.0)       # quiet hours untouched
+        base = imm.series_levels(s)
+        self.assertEqual(imm.hour_scaled_levels(s, self.et(2026, 10, 5, 19)),
+                         [(t, int(sz * 1.5 + 0.5)) for t, sz in base])
+
+    def test_exclusions(self):
+        mon_7pm = self.et(2026, 10, 5, 19)
+        for s in ("KXNFLLADDERREC", "KXNFLESCALATORRECYDS", "KXNBALADDERPTS"):
+            self.assertEqual(imm._hour_window_mult(s, mon_7pm), 1.0, s)              # pre-kickoff
+        self.assertEqual(imm.hour_size_mult("KXTEMPNYCH", mon_7pm), 1.0)              # daily / excluded
+        self.assertEqual(imm.hour_size_mult("KXRAIN", mon_7pm), 0.5)                  # its own 19-1 halving
+        with mock.patch.object(imm, "SCAN_HOUR_MULT", False), \
+                mock.patch.object(imm, "SCAN_GUARDED_SERIES", {"KXSCANNED"}):
+            self.assertEqual(imm.hour_size_mult("KXSCANNED", mon_7pm), 1.0)           # open-scan member
+        # a quiet hour is never also an evening hour
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0,19:2.0")
+        self.assertEqual(imm.hour_size_mult("KXGOOD", mon_7pm), 2.0)
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 5, 20)), 1.5)
+        # "" switches it off
+        imm.EVENING_SIZE_MULTS = {}
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 5, 20)), 1.0)
+
+    def test_saturday_and_floor_projection_compose(self):
+        imm.SAT_SIZE_MULT = 2.0
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 10, 19)), 3.0)
+        imm.SAT_SIZE_MULT = 1.0
+        # a Tuesday: 0-8 x3 (9h), 18-21 x1.5 (4h), the rest x1 (11h)
+        prof = dict(imm.size_mult_profile("KXGOOD", self.et(2026, 10, 6, 0), 1.0))
+        self.assertAlmostEqual(prof[3.0], 9 / 24, places=9)
+        self.assertAlmostEqual(prof[1.5], 4 / 24, places=9)
+        self.assertAlmostEqual(prof[1.0], 11 / 24, places=9)
+
+
+class TestYieldSizeMode(unittest.TestCase):
+    """Jack 2026-10-02 ("1 and 2 for monday"): from 00:00 ET 2026-10-05 a
+    long-dated market with no family multiplier whose modelled reward per
+    resting contract is >= $0.011/day rests x1.5, held down to 0.85 of the
+    bar, composed with the near-cliff size mode at every reader of the shape."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        self._saved = {k: getattr(imm, k) for k in (
+            "YIELD_SIZE_MULT", "YIELD_SIZE_MULT_FROM", "YIELD_SIZE_MULT_FROM_TS",
+            "YIELD_SIZE_MIN", "YIELD_SIZE_EXIT_FRAC")}
+        imm.YIELD_SIZE_MULT = 1.5
+        imm.YIELD_SIZE_MULT_FROM = imm.YIELD_SIZE_MULT_FROM_TS = None    # in force
+        imm.YIELD_SIZE_MIN, imm.YIELD_SIZE_EXIT_FRAC = 0.011, 0.85
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(imm, k, v)
+
+    def test_code_default(self):
+        self.assertEqual(_YIELD_CODE_DEFAULT, (1.5, datetime(2026, 10, 5).date(), 0.011, 0.85))
+        self.assertEqual(imm._et_day_start_ts(_YIELD_CODE_DEFAULT[1]),
+                         utc(2026, 10, 5, 4, 0).timestamp())
+
+    def test_activation(self):
+        imm.YIELD_SIZE_MULT_FROM_TS = utc(2026, 10, 5, 4, 0).timestamp()
+        self.assertFalse(imm.yield_size_active(utc(2026, 10, 5, 3, 59).timestamp()))
+        self.assertTrue(imm.yield_size_active(utc(2026, 10, 5, 4, 0).timestamp()))
+        imm.YIELD_SIZE_MULT = 1.0
+        self.assertFalse(imm.yield_size_active(utc(2026, 10, 6).timestamp()))
+
+    def test_eligibility(self):
+        e = imm.yield_size_eligible
+        for s in ("KXGOOD", "KXTRUMPMENTION", "KXWCMENTION", "KXAMZNCC", "KXSUEZWEEKLY"):
+            self.assertTrue(e(s), s)
+        for s in ("KXRT", "KXAAAGASD", "KXAAAGASW", "KXDIESELW", "KXUSGASCPI",       # RT, gas
+                  "KXCPICOREYOY", "KXCBDECISIONNZ", "KXFEDDECISION", "KXUST10AD",     # econ / rates
+                  "KX7YRDIRLM", "KXCTMFPERMITS", "KXJOBLESSCLAIMS", "KXGDP",
+                  "KXNFLGAME", "KXVENUEPERFORM", "KXOSCARPIC", "KXGRAMMYAOTY",        # sports / awards
+                  "KXEARNINGSMENTIONAAPL", "KXNFLLADDERREC", "KXCFBLADDERREC",        # family mults
+                  "KXTRUMPAPPROVE", "KXTEMPNYCH", "KXRAIN",                           # family / daily
+                  imm.ELECTION_ARCHETYPE, "KXSPRLVL"):                                # election, finecon
+            self.assertFalse(e(s), s)
+        with mock.patch.object(imm, "SCAN_GUARDED_SERIES", {"KXGOOD"}):
+            self.assertFalse(e("KXGOOD"))                                           # unreviewed
+        with mock.patch.dict(imm.SERIES_OVERRIDES, {"KXGOOD": imm.SeriesOverride(levels=[(0, 5)])}):
+            self.assertFalse(e("KXGOOD"))                                           # hand-tuned ladder
+
+    def test_verdict_and_hysteresis(self):
+        bot = IncentiveMarketMaker(client=None, live=False)
+        m = _meta(series="KXGOOD", ticker=self.T, event_ticker="KXGOOD-99DEC31")
+        now = time.time()
+        m.yield_per_contract = 0.0105                       # under the bar: not armed
+        bot._yield_size_verdict(m, now)
+        self.assertNotIn(self.T, bot._yield_boost)
+        self.assertEqual((m.ys_size_mult, bot._yield_size_mult(self.T)), (1.0, 1.0))
+        m.yield_per_contract = 0.011                        # at the bar: armed
+        bot._yield_size_verdict(m, now)
+        self.assertEqual((m.ys_size_mult, bot._yield_size_mult(self.T)), (1.5, 1.5))
+        m.yield_per_contract = 0.0094                       # >= 0.85 x bar (0.00935): held
+        bot._yield_size_verdict(m, now)
+        self.assertIn(self.T, bot._yield_boost)
+        m.yield_per_contract = 0.0093                       # under it: dropped
+        bot._yield_size_verdict(m, now)
+        self.assertNotIn(self.T, bot._yield_boost)
+        # an ineligible series is never armed, whatever it yields
+        r = _meta(series="KXRT", ticker="KXRT-ONE-90", event_ticker="KXRT-ONE")
+        r.yield_per_contract = 0.5
+        bot._yield_size_verdict(r, now)
+        self.assertNotIn(r.ticker, bot._yield_boost)
+        # before the start: the verdict drops it and the reader returns 1.0
+        bot._yield_boost[self.T] = now
+        imm.YIELD_SIZE_MULT_FROM_TS = now + 3600
+        self.assertEqual(bot._yield_size_mult(self.T), 1.0)
+        m.yield_per_contract = 0.05
+        bot._yield_size_verdict(m, now)
+        self.assertNotIn(self.T, bot._yield_boost)
+
+    def test_composes_with_near_cliff_and_prunes(self):
+        bot = IncentiveMarketMaker(client=None, live=False)
+        now = time.time()
+        bot._yield_boost[self.T] = now
+        self.assertEqual(bot._market_size_mult(self.T), 1.5)
+        bot._near_cliff_boost[self.T] = now
+        self.assertAlmostEqual(bot._market_size_mult(self.T), imm.NEAR_CLIFF_SIZE_MULT * 1.5)
+        bot.state.selected = {}
+        bot._prune_yield_boost()                            # left the selection
+        self.assertNotIn(self.T, bot._yield_boost)
+
+    def test_quote_loop_and_collateral_rest_the_boosted_ladder(self):
+        def plain_sizes(b):
+            return {int(o["remaining_count"]) for o in b.state.sim_orders.values()
+                    if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
+        _clean_persist()
+        imm.YIELD_SIZE_MULT = 1.0                           # control: mode off
+        ctl = IncentiveMarketMaker(client=FakeClient(), live=False)
+        ctl.run_cycle()
+        self.assertIn(self.T, ctl.state.selected)
+        plain = plain_sizes(ctl)
+        self.assertTrue(plain)
+        y = ctl.state.selected[self.T].yield_per_contract
+        self.assertGreater(y, 0.0)
+        # on: the bar just under this market's yield -> armed in the refresh's
+        # estimate, and the quote loop rests x1.5 on the same cycle
+        imm.YIELD_SIZE_MULT = 1.5
+        imm.YIELD_SIZE_MIN = y * 0.99
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        self.assertIn(self.T, bot._yield_boost)
+        self.assertEqual(bot.state.selected[self.T].ys_size_mult, 1.5)
+        self.assertEqual(plain_sizes(bot), {int(c * 1.5 + 0.5) for c in plain})
+        # the bar well over the (diluted) yield: dropped on the next refresh,
+        # the ladder back to plain size
+        imm.YIELD_SIZE_MIN = y * 10.0
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._yield_boost)
+        self.assertEqual(plain_sizes(bot), plain)
 
 
 class TestSaturdaySizeMult(unittest.TestCase):
