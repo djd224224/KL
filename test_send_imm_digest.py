@@ -118,9 +118,12 @@ class CurrentMidsTests(_DigestTest):
         client = _Client(_market("C", bid="0.0500", ask="1.0000", last="0.9700"),
                          _market("B", bid="0.3200", ask="1.0000", last="0.2000"),
                          _market("A", bid="0.0000", ask="0.4000", last="0.5500"),
-                         _market("Z", bid="0.0500", ask="1.0000", last="0.0000"))
-        mids, results = self.sd.current_mids(client, ["C", "B", "A", "Z"])
-        self.assertEqual(mids, {"C": 97.0, "B": 32.0, "A": 40.0})
+                         _market("Z", bid="0.0500", ask="1.0000", last="0.0000"),
+                         # 50c+ wide (Jack 2026-10-01): the last trade inside
+                         # the touch, not the 35.5 mid (KXDKNGAPP-26OCT08-T185)
+                         _market("W", bid="0.0100", ask="0.7000", last="0.0100"))
+        mids, results = self.sd.current_mids(client, ["C", "B", "A", "Z", "W"])
+        self.assertEqual(mids, {"C": 97.0, "B": 32.0, "A": 40.0, "W": 1.0})
         self.assertEqual(results, {})
 
 

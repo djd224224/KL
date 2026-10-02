@@ -162,9 +162,10 @@ def settlement_cents(m: dict):
 
 def current_mids(client, tickers):
     """(mids, results): ticker -> YES mark in CENTS, the bot's own
-    incentive_mm.bulk_mark_cents (the bid/ask mid of a two-sided book, else
-    the last trade clamped to the live side: an empty ask reads $1.00 and is
-    never averaged in), and ticker -> settlement_cents() (cents, or VOID) for
+    incentive_mm.bulk_mark_cents (the bid/ask mid of a two-sided book; the
+    last trade clamped inside a book MARK_WIDE_SPREAD_CENTS or wider, or to
+    the live side of a one-sided one: an empty ask reads $1.00 and is never
+    averaged in), and ticker -> settlement_cents() (cents, or VOID) for
     settled markets so the caller can book settlement P&L. A settled market's
     book reads 0 / 100, so its entry in `mids` is the last trade, never the
     settlement value; value a settled position from `results`."""

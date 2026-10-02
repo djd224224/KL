@@ -395,6 +395,44 @@ class TestBulkMarkCents(unittest.TestCase):
         self.assertEqual(imm.bulk_mark_cents(m), 97.0)
         self.assertEqual(imm.bulk_mark_cents({"yes_bid": 40, "yes_ask": 44}), 42.0)
 
+    # ---- wide two-sided books (Jack 2026-10-01: "Yes, at 50c+") ----
+
+    def test_a_wide_book_marks_the_last_trade_inside_the_touch(self):
+        # KXDKNGAPP-26OCT08-T185: 1/70, last trade 1 -- the mid said 35.5
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.0100", "0.7000", "0.0100")), 1.0)
+        # KX10YRDIRLM-26OCT30L-T5.20: 28/99, last trade 60 -- the mid said 63.5
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2800", "0.9900", "0.6000")), 60.0)
+        # a last trade outside the touch is clamped to it
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.9000", "0.9700")), 90.0)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.9000", "0.0500")), 20.0)
+        # never traded: the mid
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.9000")), 55.0)
+
+    def test_the_wide_threshold_and_its_kill_switch(self):
+        self.assertEqual(imm.MARK_WIDE_SPREAD_CENTS, 50)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.6900", "0.3000")), 44.5)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.7000", "0.3000")), 30.0)
+        with mock.patch.object(imm, "MARK_WIDE_SPREAD_CENTS", 0):     # IMM_MARK_WIDE_SPREAD=0
+            self.assertEqual(imm.bulk_mark_cents(self._m("0.0100", "0.9900", "0.2000")), 50.0)
+            self.assertFalse(imm.wide_mark_book(1, 99))
+        self.assertTrue(imm.wide_mark_book(1, 99))
+        self.assertFalse(imm.wide_mark_book(None, 99))
+
+    def test_a_flickering_99c_offer_no_longer_flips_the_mark(self):
+        # KXCMGFT-26OCT08-T108: a 1c bid, last trade 20, and an offer that
+        # comes and goes at 99c. One-sided alone would mark 20 with no offer
+        # and the 1/99 mid of 50 with one; the wide rule marks 20 both ways.
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.0100", "1.0000", "0.2000")), 20.0)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.0100", "0.9900", "0.2000")), 20.0)
+
+    def test_an_external_touch_replaces_the_market_objects_touch(self):
+        # a managed market: Kalshi's 40/60 touch includes our own quotes
+        m = self._m("0.4000", "0.6000", "0.3000")
+        self.assertEqual(imm.bulk_mark_cents(m), 50.0)
+        self.assertEqual(imm.bulk_mark_cents(m, (40, None)), 40.0)   # the 60 offer was ours
+        self.assertEqual(imm.bulk_mark_cents(m, (10, 90)), 30.0)     # wide outside our quotes
+        self.assertEqual(imm.bulk_mark_cents(m, (30, 60)), 45.0)     # 30c: the mid
+
 
 class TestOrderbook(unittest.TestCase):
     def test_fp_shape(self):
@@ -3218,6 +3256,28 @@ class TestDryRunCycle(unittest.TestCase):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         return bot
+
+    def test_a_wide_managed_book_marks_at_the_last_trade_inside_its_touch(self):
+        # Jack 2026-10-01 ("Yes, at 50c+"): a quoted market whose EXTERNAL
+        # book goes 10/90 marks the held position at the last trade (30)
+        # clamped inside 10/90 -- through _refresh_marks, since the order
+        # book carries no last trade -- while prev_mid (the breakers) stays
+        # on the 50 mid. The bulk read's own 49/51 touch must not be used.
+        bot = self._bot()
+        t = "KXGOOD-99DEC31-A"
+        bot.run_cycle()
+        self.assertEqual(bot.state.last_mark[t], 50.0)
+        bot.pnl.pos[t], bot.pnl.avg[t] = 20.0, 40.0
+        bot.client.positions[t] = 20.0
+        bot.client.markets[t]["last_price_dollars"] = "0.3000"
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.10", "500"]], "no_dollars": [["0.10", "500"]]}}
+        bot.run_cycle()
+        self.assertEqual(bot.state.prev_mid[t], 50.0)
+        self.assertEqual(bot.state.last_mark[t], 30.0)
+        with mock.patch.object(imm, "MARK_WIDE_SPREAD_CENTS", 0):
+            bot.run_cycle()
+        self.assertEqual(bot.state.last_mark[t], 50.0)
 
     def test_toxic_side_halt_cancels_only_the_picked_off_side(self):
         # end to end: two bid fills at 50c, the book then 43/45 (mark 44,
@@ -7615,6 +7675,15 @@ class TestRefreshMarksOneSided(unittest.TestCase):
         self._book("0.0500", "1.0000", "0.9700")
         self.bot._refresh_marks({self.T})
         self.assertEqual(self.bot.state.last_mark[self.T], 50.0)
+
+    def test_a_book_read_this_cycle_is_judged_on_its_external_touch(self):
+        # Kalshi's 94/98 touch has our own 98c ask in it; externally there is
+        # no offer, so the mark is max(last 97, bid 94) -- not the 96 mid
+        self._book("0.9400", "0.9800", "0.9700")
+        self.bot._refresh_marks(set(), {self.T: (94, None)})
+        self.assertEqual(self.bot.state.last_mark[self.T], 97.0)
+        self.bot._refresh_marks(set(), {"KXOTHER-99DEC31-Z": (94, None)})
+        self.assertEqual(self.bot.state.last_mark[self.T], 96.0)
 
     def test_day_pnl_holds_when_the_offer_disappears(self):
         """Through the loss meter: marked 97 on a 96/98 book, then the offer
