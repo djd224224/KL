@@ -943,10 +943,12 @@ def project_rest_of_day(rows, now: float, mult_at=None, end: float = None) -> fl
     run-rate"). Every market of the bot's last cycle earns its pool at its
     current share, re-scaled each ET hour to the size the bot quotes then
     (share_at, k = mult_at(series, epoch) / its multiplier now), until its
-    stop (cutoff or program end). mult_at None, or a market whose multiplier
-    now the schedule does not reproduce (the bot's runtime state: open-scan
-    members, structural dailies), keeps its current size all day.
-      rows: [(ticker, est_frac, pool $/day, hour_mult now, stop epoch or None)]"""
+    stop (cutoff or program end). A `fixed` market (open-scan: the bot never
+    gives it an hour window), mult_at None, or a market whose multiplier now
+    the schedule does not reproduce (other runtime state of the bot) keeps
+    its current size all day.
+      rows: [(ticker, est_frac, pool $/day, hour_mult now, stop epoch or None,
+              fixed)]"""
     if end is None:
         end = et_midnight(datetime.fromtimestamp(now, ET).date() + timedelta(days=1))
     slots, t = [], now
@@ -963,11 +965,12 @@ def project_rest_of_day(rows, now: float, mult_at=None, end: float = None) -> fl
         return cache[key]
 
     total = 0.0
-    for tkr, frac, pool, hm, stop in rows:
+    for tkr, frac, pool, hm, stop, fixed in rows:
         if frac <= 0 or pool <= 0:
             continue
         ser = series_of(tkr)
-        scaled = mult_at is not None and hm > 0 and abs(mult(ser, now) - hm) < 1e-9
+        scaled = (not fixed and mult_at is not None and hm > 0
+                  and abs(mult(ser, now) - hm) < 1e-9)
         for a, b in slots:
             if stop is not None:
                 if a >= stop:
@@ -3135,6 +3138,15 @@ class Builder:
         imm = _imm_mod if hasattr(_imm_mod, "hour_size_mult") else None
         mult_at = None if imm is None else (
             lambda ser, ts: imm.hour_size_mult(ser, datetime.fromtimestamp(ts, timezone.utc)))
+        if imm is not None and hasattr(imm, "load_daily_series_file"):
+            try:                        # the bot's structural dailies take no hour window
+                imm.load_daily_series_file()
+            except Exception:
+                pass
+        # open-scan members take no hour window unless IMM_SCAN_HOUR_MULT, and
+        # which series are open-scan is the bot's runtime state: the cycle
+        # row's is_scan says it per market
+        scan_follows = bool(getattr(imm, "SCAN_HOUR_MULT", False))
         end = et_midnight(datetime.fromtimestamp(self.now, ET).date() + timedelta(days=1))
         rows, rate, stopping = [], 0.0, 0
         for t, r in self.last_cycle.items():
@@ -3145,14 +3157,15 @@ class Builder:
             if frac > 0 and stop is not None and stop < end:
                 stopping += 1
             rate += frac * pool
-            rows.append((t, frac, pool, _f(r.get("hour_mult"), 1.0), stop))
+            rows.append((t, frac, pool, _f(r.get("hour_mult"), 1.0), stop,
+                         r.get("is_scan") == "1" and not scan_follows))
         try:
             rest = project_rest_of_day(rows, self.now, mult_at, end)
         except Exception as e:                  # a schedule error must not cost the page
             log(f"! projection with the size schedule failed ({e!r}); current size kept")
             rest, mult_at = project_rest_of_day(rows, self.now, None, end), None
         return {"rest": round(rest, 2), "rate": round(rate, 2),
-                "markets": sum(1 for _t, f, _p, _h, _s in rows if f > 0),
+                "markets": sum(1 for row in rows if row[1] > 0),
                 "stopping": stopping, "sched": mult_at is not None}
 
     # ---- opportunities (API) -----------------------------------------------------

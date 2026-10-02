@@ -110,29 +110,44 @@ class ProjectionTests(unittest.TestCase):
     def test_the_day_hours_run_at_day_size(self):
         # $24/day at a 10% share = $1/hour: 08:30-10:00 at today's x2, then
         # 14 hours at x1, where the share is 0.05 / 0.95
-        rows = [("KXA-26-X", 0.1, 240.0, 2.0, None)]
+        rows = [("KXA-26-X", 0.1, 240.0, 2.0, None, False)]
         day = 240.0 * (0.05 / 0.95) / 24.0
         self.assertAlmostEqual(dash.project_rest_of_day(rows, self.NOW, self.quiet),
                                1.5 + 14 * day, places=6)
 
     def test_a_market_stops_at_its_cutoff(self):
         stop = datetime(2026, 10, 2, 12, 0, tzinfo=dash.ET).timestamp()
-        rows = [("KXA-26-X", 0.1, 240.0, 2.0, stop)]
+        rows = [("KXA-26-X", 0.1, 240.0, 2.0, stop, False)]
         day = 240.0 * (0.05 / 0.95) / 24.0
         self.assertAlmostEqual(dash.project_rest_of_day(rows, self.NOW, self.quiet),
                                1.5 + 2 * day, places=6)
 
     def test_without_the_schedule_the_current_size_holds(self):
-        rows = [("KXA-26-X", 0.1, 240.0, 2.0, None)]
+        rows = [("KXA-26-X", 0.1, 240.0, 2.0, None, False)]
         self.assertAlmostEqual(dash.project_rest_of_day(rows, self.NOW, None), 15.5, places=6)
-        # the bot logged x1 where the schedule says x2 (an open-scan member, a
-        # structural daily): the schedule does not know this market
-        rows = [("KXA-26-X", 0.1, 240.0, 1.0, None)]
+        # the bot logged x1 where the schedule says x2 (state the dashboard's
+        # copy of the bot does not have): the schedule does not know it
+        rows = [("KXA-26-X", 0.1, 240.0, 1.0, None, False)]
         self.assertAlmostEqual(dash.project_rest_of_day(rows, self.NOW, self.quiet), 15.5, places=6)
+
+    def test_an_open_scan_market_keeps_its_size(self):
+        # the evening window from 10/5 (18-21 ET x1.5) never reaches open-scan
+        # members; at 17:00 the schedule and the bot agree on x1, so only the
+        # row's own flag keeps the scan market off it
+        five = datetime(2026, 10, 5, 17, 0, tzinfo=dash.ET).timestamp()
+
+        def evening(ser, ts):
+            return 1.5 if 18 <= datetime.fromtimestamp(ts, dash.ET).hour < 22 else 1.0
+        rows = [("KXA-26-X", 0.1, 240.0, 1.0, None, True)]
+        self.assertAlmostEqual(dash.project_rest_of_day(rows, five, evening), 7.0, places=6)
+        rows = [("KXA-26-X", 0.1, 240.0, 1.0, None, False)]
+        up = 240.0 * dash.share_at(0.1, 1.5) / 24.0
+        self.assertAlmostEqual(dash.project_rest_of_day(rows, five, evening), 3.0 + 4 * up, places=6)
 
     def test_the_day_ends_at_et_midnight(self):
         late = datetime(2026, 10, 2, 23, 30, tzinfo=dash.ET).timestamp()
-        rows = [("KXA-26-X", 0.1, 240.0, 1.0, None), ("KXB-26-Y", 0.0, 500.0, 1.0, None)]
+        rows = [("KXA-26-X", 0.1, 240.0, 1.0, None, False),
+                ("KXB-26-Y", 0.0, 500.0, 1.0, None, False)]
         self.assertAlmostEqual(dash.project_rest_of_day(rows, late, self.quiet), 0.5, places=6)
 
 
