@@ -332,6 +332,113 @@ class TestMarketCents(unittest.TestCase):
         self.assertIsNone(dollars_to_cents("junk"))
         self.assertEqual(dollars_to_cents("0.99"), 99)
 
+    def test_empty_ask_placeholder_still_reads_100_for_quoting(self):
+        # unchanged on purpose: the quoting callers see a no-offer book as
+        # ask 100 (out of band / maximally wide); valuation uses
+        # yes_touch_cents / bulk_mark_cents instead
+        self.assertEqual(market_cents({"yes_ask_dollars": "1.0000"}, "yes_ask"), 100)
+
+
+class TestBulkMarkCents(unittest.TestCase):
+    """2026-10-01: the bulk mark refresh (held positions not marked from an
+    order book this cycle) averaged Kalshi's $1.00 empty-ask placeholder into
+    the mid, so a stray bid under no offer marked at (bid + 100) / 2. A
+    missing side is never a price: one-sided books mark at the last trade
+    clamped to the live side."""
+
+    @staticmethod
+    def _m(bid="0.0000", ask="1.0000", last=None):
+        m = {"ticker": "KXT-26OCT02-T1", "yes_bid_dollars": bid,
+             "yes_ask_dollars": ask}
+        if last is not None:
+            m["last_price_dollars"] = last
+        return m
+
+    def test_two_sided_book_is_the_mid(self):
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.4900", "0.5100", "0.2000")), 50.0)
+        self.assertEqual(imm.yes_touch_cents(self._m("0.4900", "0.5100")), (49, 51))
+
+    def test_no_offer_marks_the_last_trade_not_halfway_to_100(self):
+        # KXDDCOLDBREW-26OCT02-T4.45 at 00:00 ET 10/1: bid 5, no offer, last
+        # trade 97 -- marked 52.5 before the fix
+        m = self._m("0.0500", "1.0000", "0.9700")
+        self.assertEqual(imm.yes_touch_cents(m), (5, None))
+        self.assertEqual(imm.bulk_mark_cents(m), 97.0)
+        # KXSBUXSAR-26OCT02-T5.08: bid 32, no offer, last 96 -- was 66
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.3200", "1.0000", "0.9600")), 96.0)
+
+    def test_no_offer_with_the_last_trade_under_the_bid_marks_the_bid(self):
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.3200", "1.0000", "0.2000")), 32.0)
+
+    def test_no_bid_marks_the_last_trade_capped_at_the_offer(self):
+        m = self._m("0.0000", "0.0400", "0.3000")
+        self.assertEqual(imm.yes_touch_cents(m), (None, 4))
+        self.assertEqual(imm.bulk_mark_cents(m), 4.0)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.0000", "0.4000", "0.3000")), 30.0)
+
+    def test_both_sides_empty_marks_the_last_trade(self):
+        # a closed or settled book reads 0 / 100: unchanged
+        m = self._m("0.0000", "1.0000", "0.9600")
+        self.assertEqual(imm.yes_touch_cents(m), (None, None))
+        self.assertEqual(imm.bulk_mark_cents(m), 96.0)
+
+    def test_no_last_trade_and_one_sided_has_no_mark(self):
+        # the caller keeps its previous mark
+        for m in (self._m("0.0500", "1.0000"), self._m("0.0500", "1.0000", "0.0000"),
+                  self._m("0.0000", "0.4000"), self._m(), {}):
+            self.assertIsNone(imm.bulk_mark_cents(m), m)
+
+    def test_a_real_sub_penny_offer_is_a_side(self):
+        # escalators trade in 0.0001 steps: a $0.9999 offer is real (ceiled
+        # to 100 like any ask), only the $1.00 placeholder is no offer
+        self.assertEqual(imm.yes_touch_cents(self._m("0.9800", "0.9999")), (98, 100))
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.9800", "0.9999", "0.5000")), 99.0)
+        self.assertEqual(imm.yes_touch_cents(self._m("0.9800", "1.0000")), (98, None))
+
+    def test_legacy_integer_cent_fields(self):
+        m = {"yes_bid": 5, "yes_ask": 100, "last_price": 97}
+        self.assertEqual(imm.yes_touch_cents(m), (5, None))
+        self.assertEqual(imm.bulk_mark_cents(m), 97.0)
+        self.assertEqual(imm.bulk_mark_cents({"yes_bid": 40, "yes_ask": 44}), 42.0)
+
+    # ---- wide two-sided books (Jack 2026-10-01: "Yes, at 50c+") ----
+
+    def test_a_wide_book_marks_the_last_trade_inside_the_touch(self):
+        # KXDKNGAPP-26OCT08-T185: 1/70, last trade 1 -- the mid said 35.5
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.0100", "0.7000", "0.0100")), 1.0)
+        # KX10YRDIRLM-26OCT30L-T5.20: 28/99, last trade 60 -- the mid said 63.5
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2800", "0.9900", "0.6000")), 60.0)
+        # a last trade outside the touch is clamped to it
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.9000", "0.9700")), 90.0)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.9000", "0.0500")), 20.0)
+        # never traded: the mid
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.9000")), 55.0)
+
+    def test_the_wide_threshold_and_its_kill_switch(self):
+        self.assertEqual(imm.MARK_WIDE_SPREAD_CENTS, 50)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.6900", "0.3000")), 44.5)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.2000", "0.7000", "0.3000")), 30.0)
+        with mock.patch.object(imm, "MARK_WIDE_SPREAD_CENTS", 0):     # IMM_MARK_WIDE_SPREAD=0
+            self.assertEqual(imm.bulk_mark_cents(self._m("0.0100", "0.9900", "0.2000")), 50.0)
+            self.assertFalse(imm.wide_mark_book(1, 99))
+        self.assertTrue(imm.wide_mark_book(1, 99))
+        self.assertFalse(imm.wide_mark_book(None, 99))
+
+    def test_a_flickering_99c_offer_no_longer_flips_the_mark(self):
+        # KXCMGFT-26OCT08-T108: a 1c bid, last trade 20, and an offer that
+        # comes and goes at 99c. One-sided alone would mark 20 with no offer
+        # and the 1/99 mid of 50 with one; the wide rule marks 20 both ways.
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.0100", "1.0000", "0.2000")), 20.0)
+        self.assertEqual(imm.bulk_mark_cents(self._m("0.0100", "0.9900", "0.2000")), 20.0)
+
+    def test_an_external_touch_replaces_the_market_objects_touch(self):
+        # a managed market: Kalshi's 40/60 touch includes our own quotes
+        m = self._m("0.4000", "0.6000", "0.3000")
+        self.assertEqual(imm.bulk_mark_cents(m), 50.0)
+        self.assertEqual(imm.bulk_mark_cents(m, (40, None)), 40.0)   # the 60 offer was ours
+        self.assertEqual(imm.bulk_mark_cents(m, (10, 90)), 30.0)     # wide outside our quotes
+        self.assertEqual(imm.bulk_mark_cents(m, (30, 60)), 45.0)     # 30c: the mid
+
 
 class TestOrderbook(unittest.TestCase):
     def test_fp_shape(self):
@@ -3158,6 +3265,28 @@ class TestDryRunCycle(unittest.TestCase):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         return bot
+
+    def test_a_wide_managed_book_marks_at_the_last_trade_inside_its_touch(self):
+        # Jack 2026-10-01 ("Yes, at 50c+"): a quoted market whose EXTERNAL
+        # book goes 10/90 marks the held position at the last trade (30)
+        # clamped inside 10/90 -- through _refresh_marks, since the order
+        # book carries no last trade -- while prev_mid (the breakers) stays
+        # on the 50 mid. The bulk read's own 49/51 touch must not be used.
+        bot = self._bot()
+        t = "KXGOOD-99DEC31-A"
+        bot.run_cycle()
+        self.assertEqual(bot.state.last_mark[t], 50.0)
+        bot.pnl.pos[t], bot.pnl.avg[t] = 20.0, 40.0
+        bot.client.positions[t] = 20.0
+        bot.client.markets[t]["last_price_dollars"] = "0.3000"
+        bot.client.books[t] = {"orderbook_fp": {
+            "yes_dollars": [["0.10", "500"]], "no_dollars": [["0.10", "500"]]}}
+        bot.run_cycle()
+        self.assertEqual(bot.state.prev_mid[t], 50.0)
+        self.assertEqual(bot.state.last_mark[t], 30.0)
+        with mock.patch.object(imm, "MARK_WIDE_SPREAD_CENTS", 0):
+            bot.run_cycle()
+        self.assertEqual(bot.state.last_mark[t], 50.0)
 
     def test_toxic_side_halt_cancels_only_the_picked_off_side(self):
         # end to end: two bid fills at 50c, the book then 43/45 (mark 44,
@@ -7623,6 +7752,89 @@ class TestScalarVoidSettlement(unittest.TestCase):
         bot._settle_or_drop(self.T)
         self.assertEqual(bot.pnl.pos[self.T], -90.0)
         self.assertEqual(self._settlements(), [])
+
+
+class TestRefreshMarksOneSided(unittest.TestCase):
+    """2026-10-01: _refresh_marks marked a held position on a book with no
+    offer at (bid + 100) / 2 -- Kalshi reads an empty ask as $1.00. The 10/1
+    case: short 58.64 YES @ 91.5c on KXDDCOLDBREW-26OCT02-T4.45, last trade
+    97, a stray 5c bid and no offer at the ET midnight, marked 52.5: +$26 of
+    fake gain in the dashboard's 9/30 that reversed on 10/1 when the market
+    settled YES."""
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.bot.pnl.pos[self.T], self.bot.pnl.avg[self.T] = -58.64, 91.5
+
+    def _book(self, bid, ask, last=None):
+        m = self.bot.client.markets[self.T]
+        m.update(yes_bid_dollars=bid, yes_ask_dollars=ask)
+        m.pop("last_price_dollars", None)
+        if last is not None:
+            m["last_price_dollars"] = last
+
+    def test_no_offer_marks_the_last_trade(self):
+        self._book("0.0500", "1.0000", "0.9700")
+        self.bot._refresh_marks(set())
+        self.assertEqual(self.bot.state.last_mark[self.T], 97.0)        # was 52.5
+
+    def test_no_offer_last_trade_under_the_bid_marks_the_bid(self):
+        self._book("0.3200", "1.0000", "0.2000")
+        self.bot._refresh_marks(set())
+        self.assertEqual(self.bot.state.last_mark[self.T], 32.0)        # was 66
+
+    def test_no_bid_marks_the_last_trade_capped_at_the_offer(self):
+        self._book("0.0000", "0.9300", "0.9700")
+        self.bot._refresh_marks(set())
+        self.assertEqual(self.bot.state.last_mark[self.T], 93.0)        # was 97
+
+    def test_two_sided_marks_the_mid(self):
+        self._book("0.9500", "0.9800", "0.9700")
+        self.bot._refresh_marks(set())
+        self.assertEqual(self.bot.state.last_mark[self.T], 96.5)
+
+    def test_one_sided_with_no_last_trade_keeps_the_previous_mark(self):
+        self.bot.state.last_mark[self.T] = 96.5
+        self._book("0.0500", "1.0000")
+        self.bot._refresh_marks(set())
+        self.assertEqual(self.bot.state.last_mark[self.T], 96.5)
+        del self.bot.state.last_mark[self.T]
+        self.bot._refresh_marks(set())
+        self.assertNotIn(self.T, self.bot.state.last_mark)
+
+    def test_marked_from_its_book_this_cycle_is_left_alone(self):
+        self.bot.state.last_mark[self.T] = 50.0
+        self._book("0.0500", "1.0000", "0.9700")
+        self.bot._refresh_marks({self.T})
+        self.assertEqual(self.bot.state.last_mark[self.T], 50.0)
+
+    def test_a_book_read_this_cycle_is_judged_on_its_external_touch(self):
+        # Kalshi's 94/98 touch has our own 98c ask in it; externally there is
+        # no offer, so the mark is max(last 97, bid 94) -- not the 96 mid
+        self._book("0.9400", "0.9800", "0.9700")
+        self.bot._refresh_marks(set(), {self.T: (94, None)})
+        self.assertEqual(self.bot.state.last_mark[self.T], 97.0)
+        self.bot._refresh_marks(set(), {"KXOTHER-99DEC31-Z": (94, None)})
+        self.assertEqual(self.bot.state.last_mark[self.T], 96.0)
+
+    def test_day_pnl_holds_when_the_offer_disappears(self):
+        """Through the loss meter: marked 97 on a 96/98 book, then the offer
+        goes and a stray 5c bid is left with the last trade still 97. The
+        mark and the day's P&L must not move; the old mid moved them to 52.5
+        and +$26.09."""
+        bot = self.bot
+        bot.state.universe_at = time.time()          # nothing selected
+        bot.client.positions[self.T] = -58.64
+        self._book("0.9600", "0.9800", "0.9700")
+        bot.run_cycle()
+        self.assertAlmostEqual(bot.state.last_mark[self.T], 97.0)
+        self.assertAlmostEqual(bot.state.pnl_today_last, 0.0)
+        self._book("0.0500", "1.0000", "0.9700")
+        bot.run_cycle()
+        self.assertAlmostEqual(bot.state.last_mark[self.T], 97.0)
+        self.assertAlmostEqual(bot.state.pnl_today_last, 0.0)
 
 
 class TestStartupReconcileSettles(unittest.TestCase):

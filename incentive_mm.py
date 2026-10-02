@@ -2288,6 +2288,19 @@ MID_BAND_MEMBER_HI = _env_int("IMM_MID_BAND_MEMBER_HI", STICKY_PRICE_MAX)
 # through; the separate crossed/locked check (ext_bid >= ext_ask) and the
 # top-in-band price-bound check still stand. IMM_MAX_JOIN_SPREAD to restore.
 MAX_JOIN_SPREAD_CENTS = _env_int("IMM_MAX_JOIN_SPREAD", 99)
+# WIDE-BOOK MARKS (Jack 2026-10-01, "Yes, at 50c+"): a held position on a
+# two-sided book at least this many cents wide is marked at the LAST TRADE
+# clamped inside the touch, not the mid. The mid of a 1/99 or 1/70 book is no
+# more a price than the $1.00 empty-ask placeholder (bulk_mark_cents), and
+# without this a book whose only offer flickers at 99c flips its mark between
+# the last trade (no offer) and the 1/99 mid -- KXCMGFT-26OCT08-T108, short 40
+# under a 1c bid and a 20c last trade, swung 20 <-> 50 with the 99c offer.
+# Measured 9/16-10/1: ~26 held positions per ET midnight sat on books this wide
+# (KXDKNGAPP-26OCT08-T185: long 80 on a 1/70 book, mid 35.5, last trade 1).
+# Marks only: order-book (managed) markets are judged on their EXTERNAL touch,
+# and prev_mid, the breakers and the depth gate keep reading the mid.
+# 0 turns it off (every two-sided book marks at its mid).
+MARK_WIDE_SPREAD_CENTS = _env_int("IMM_MARK_WIDE_SPREAD", 50)
 # Volume screen REMOVED (Jack 2026-07-22): a book with no volume can't fill
 # you — resting there is incentive rent with ~zero P&L risk, which is the
 # whole point. Set IMM_MIN_VOLUME > 0 to restore the old anti-junk screen.
@@ -6205,6 +6218,8 @@ _CONFIG_CODE_KNOBS = (
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
     "TOXIC_EVENT_MARKETS", "TOXIC_EVENT_WINDOW_SECS", "TOXIC_EVENT_HALT_SECS",
+    # wide-book marks (2026-10-01)
+    "MARK_WIDE_SPREAD_CENTS",
 )
 
 
@@ -9321,8 +9336,12 @@ def _merge_levels(pairs) -> List[List[float]]:
 def market_cents(m: dict, base: str) -> Optional[int]:
     """Read a price off a market object: prefers '<base>_dollars' (V2 string),
     falls back to legacy integer-cent '<base>'. Returns None when absent or 0
-    (Kalshi reports an empty side as 0). Sub-penny aware: a *_bid is floored
-    to the cent, a *_ask ceiled (see _floor_cents)."""
+    (Kalshi reports an empty BID as 0). An empty ASK is NOT 0: Kalshi reports
+    it as $1.00, and this returns it as 100. The quoting callers rely on that
+    (a 100c ask is outside every band, so a no-offer book reads as wide or out
+    of band), but a 100c ask is not a price: anything that VALUES a position
+    takes its touch from yes_touch_cents / bulk_mark_cents. Sub-penny aware: a
+    *_bid is floored to the cent, a *_ask ceiled (see _floor_cents)."""
     v = m.get(base + "_dollars")
     c = None
     if v is not None:
@@ -9339,6 +9358,82 @@ def market_cents(m: dict, base: str) -> Optional[int]:
         except (TypeError, ValueError):
             c = None
     return c if c else None   # 0 == side absent
+
+
+def _side_live(m: dict, base: str) -> bool:
+    """True when the market object shows a real resting level on this side.
+    Kalshi reads an empty YES bid as $0 and an empty YES ask as $1.00, and
+    nobody can trade at either, so only a raw price strictly inside (0, 1) is a
+    side. Read raw rather than through market_cents, whose ceil turns a real
+    $0.9999 escalator offer into the same 100 as the placeholder."""
+    v = m.get(base + "_dollars")
+    if v is not None:
+        try:
+            return 0.0 < float(v) < 1.0
+        except (TypeError, ValueError):
+            pass
+    v = m.get(base)
+    try:
+        return v is not None and 0 < float(v) < 100
+    except (TypeError, ValueError):
+        return False
+
+
+def yes_touch_cents(m: dict) -> Tuple[Optional[int], Optional[int]]:
+    """(bid, ask) in whole cents off a market object, with None for an EMPTY
+    side: the market_cents convention (bid floored, ask ceiled), minus Kalshi's
+    $0 / $1.00 placeholders."""
+    bid = market_cents(m, "yes_bid") if _side_live(m, "yes_bid") else None
+    ask = market_cents(m, "yes_ask") if _side_live(m, "yes_ask") else None
+    return bid, ask
+
+
+def wide_mark_book(bid: Optional[int], ask: Optional[int]) -> bool:
+    """A two-sided touch too wide for its mid to be a mark
+    (MARK_WIDE_SPREAD_CENTS; never when that is 0)."""
+    return (MARK_WIDE_SPREAD_CENTS > 0 and bid is not None and ask is not None
+            and ask - bid >= MARK_WIDE_SPREAD_CENTS)
+
+
+def touch_mark_cents(bid: Optional[int], ask: Optional[int],
+                     last: Optional[int]) -> Optional[float]:
+    """The YES mark (cents) for a touch (None = an EMPTY side) and the last
+    trade (None = never traded), or None when nothing in it is usable.
+
+    Two-sided: the mid -- unless the book is MARK_WIDE_SPREAD_CENTS or wider,
+    then the last trade clamped inside the touch. One-sided: the LAST TRADE
+    clamped to the live side -- max(last, bid) with only a bid, min(last, ask)
+    with only an offer. A missing side is never a price. Until 2026-10-01 the
+    bulk refresh averaged in the empty ask's $1.00 placeholder:
+    KXDDCOLDBREW-26OCT02-T4.45 (bot short 58.64 @ 91.5c) marked 52.5 =
+    (5 + 100) / 2 at the 10/1 ET midnight on a stray 5c bid with no offer,
+    against a last trade of 97 and a YES settlement; KXSBUXSAR-26OCT02-T5.08
+    sat at 64.5-66 for ~35h the same way (last trade 96). Both sides empty (a
+    closed or settled book reads 0 / 100): the last trade, as before."""
+    if bid is not None and ask is not None:
+        if last is not None and wide_mark_book(bid, ask):
+            return float(min(max(last, bid), ask))
+        return (bid + ask) / 2.0
+    if last is None:
+        return None
+    if bid is not None:
+        return float(max(last, bid))
+    if ask is not None:
+        return float(min(last, ask))
+    return float(last)
+
+
+def bulk_mark_cents(m: dict,
+                    touch: Optional[Tuple[Optional[int], Optional[int]]] = None
+                    ) -> Optional[float]:
+    """The YES mark (cents) of a held position off a bulk market read -- the
+    touch_mark_cents rule on the market's touch and last trade -- or None when
+    the read carries no usable price (the caller keeps its previous mark).
+    `touch` overrides the market object's touch with the EXTERNAL (bid, ask)
+    of a market whose order book was read this cycle: Kalshi's touch includes
+    our own resting quotes, which are no price for our own position."""
+    bid, ask = yes_touch_cents(m) if touch is None else touch
+    return touch_mark_cents(bid, ask, market_cents(m, "last_price"))
 
 
 # Market statuses at which Kalshi has paid a settlement out ("settled" is the
@@ -14413,10 +14508,30 @@ class IncentiveMarketMaker:
             self.pnl.avg.pop(t, None)
         self.state.last_mark.pop(t, None)
 
-    def _refresh_marks(self, marked_this_cycle: Set[str]) -> None:
-        """Ensure every open own-book position has a usable YES-mid mark.
-        Managed markets were marked from their orderbooks this cycle; anything
-        else with inventory gets a bulk market read."""
+    def _mark_from_book(self, t: str, ext_bid: int, ext_ask: int,
+                        marked: Set[str]) -> None:
+        """The order-book mark of a two-sided EXTERNAL touch: its mid. A book
+        MARK_WIDE_SPREAD_CENTS or wider is left out of `marked` instead, so
+        _refresh_marks marks it (if held) off the bulk read's last trade
+        clamped inside this same external touch -- the order book carries no
+        last trade. The caller keeps prev_mid on the mid either way."""
+        if not wide_mark_book(ext_bid, ext_ask):
+            self.state.last_mark[t] = (ext_bid + ext_ask) / 2.0
+            marked.add(t)
+
+    def _refresh_marks(self, marked_this_cycle: Set[str],
+                       ext_touch: Optional[Dict[str, Tuple[Optional[int], Optional[int]]]] = None
+                       ) -> None:
+        """Ensure every open own-book position has a usable YES mark.
+        Managed markets with a two-sided external book narrower than
+        MARK_WIDE_SPREAD_CENTS were marked at its mid this cycle; anything
+        else with inventory gets a bulk market read, marked by bulk_mark_cents
+        (the mid of a two-sided book, the last trade clamped inside a wide one
+        or to the live side of a one-sided one). A market whose order book was
+        read this cycle is judged on that EXTERNAL touch (`ext_touch`, own
+        quotes excluded) with the bulk read's last trade. A read with no usable
+        price keeps the previous mark."""
+        ext_touch = ext_touch or {}
         stale = [t for t, p in self.pnl.pos.items()
                  if abs(p) > 1e-9 and t not in marked_this_cycle]
         for i in range(0, len(stale), 50):
@@ -14428,13 +14543,9 @@ class IncentiveMarketMaker:
                 return
             for m in (resp.get("markets") or []):
                 t = m.get("ticker", "")
-                bid, ask = market_cents(m, "yes_bid"), market_cents(m, "yes_ask")
-                if bid and ask:
-                    self.state.last_mark[t] = (bid + ask) / 2.0
-                else:
-                    lp = market_cents(m, "last_price")
-                    if lp:
-                        self.state.last_mark[t] = float(lp)
+                mk = bulk_mark_cents(m, ext_touch.get(t))
+                if mk is not None:
+                    self.state.last_mark[t] = mk
 
     def _live_event_slots(self, ev: str, entry: dict,
                           unquotable_now: Set[str]) -> List[str]:
@@ -15421,8 +15532,7 @@ class IncentiveMarketMaker:
                     desired = [q for q in desired if q.ticker not in ev_ticks]
                     if two_sided:   # keep P&L marks honest through the halt
                         self.state.prev_mid[t] = mid_g
-                        self.state.last_mark[t] = mid_g
-                        marked.add(t)
+                        self._mark_from_book(t, ext_bid, ext_ask, marked)
                     if first and (thin or went_one_sided):
                         self.alerter.alert(
                             "event_depth",
@@ -15449,8 +15559,7 @@ class IncentiveMarketMaker:
                     self.cancel_market_orders(t, resting)
                     if two_sided:
                         self.state.prev_mid[t] = mid_g
-                        self.state.last_mark[t] = mid_g
-                        marked.add(t)
+                        self._mark_from_book(t, ext_bid, ext_ask, marked)
                     self._gskip(t, "event_depth_hold", lambda: dict(d_yes=d_yes, d_no=d_no, mid_in_band=mid_in_band, halt_ts=self.state.event_depth_halt.get(ev)), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
 
@@ -15496,8 +15605,7 @@ class IncentiveMarketMaker:
                     scan_evicted_now.update(
                         m2.ticker for m2 in by_event.get(ev, [meta]))
                     self.state.prev_mid[t] = mid_s
-                    self.state.last_mark[t] = mid_s
-                    marked.add(t)
+                    self._mark_from_book(t, ext_bid, ext_ask, marked)
                     self._gskip(t, "scan_mid_tripwire", lambda: dict(mid=mid_s, prev_mid=pm_s, entry_mid=entry_s, jumped=jumped, drifted=drifted), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
 
@@ -15506,8 +15614,7 @@ class IncentiveMarketMaker:
                 mid = (ext_bid + ext_ask) / 2.0
                 pm = self.state.prev_mid.get(t)
                 self.state.prev_mid[t] = mid
-                self.state.last_mark[t] = mid
-                marked.add(t)
+                self._mark_from_book(t, ext_bid, ext_ask, marked)
                 if (BREAKERS_ENABLED and pm is not None
                         and abs(mid - pm) >= MID_MOVE_BREAKER_CENTS):
                     self.state.breaker_until[t] = now_ts + BREAKER_COOLDOWN_SECS
@@ -16190,7 +16297,9 @@ class IncentiveMarketMaker:
 
         # LOSS HALT on TOTAL P&L today (realized + mark-to-market), so gapped
         # inventory counts even before it settles. Runs before any placement.
-        self._refresh_marks(marked)
+        # touch_map: the external touch of every book read this cycle, so a
+        # one-sided or wide managed book is marked without our own quotes.
+        self._refresh_marks(marked, touch_map)
         # Mark series for every open position, every 5 minutes.
         #
         # This is what makes adverse selection measurable. A mark-out needs the
