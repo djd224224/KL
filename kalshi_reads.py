@@ -27,8 +27,11 @@ Signed reads spend the ACCOUNT's token bucket (Advanced: 300 read tokens/s,
 10 per read), which every live bot shares. So signed reads are paced to one
 per KALSHI_READS_MIN_GAP seconds per process (default 0.25, at most 4/s);
 bulk single-market or order-book scans should pass prefer="public". The key
-is the bots' key (KALSHI_PRIVATE_KEY / KALSHI_PRIVATE_KEY_PATH /
-Lisa_Kalshi.txt), loaded from disk and never printed. Read-only.
+is the IMM's (imm_account.py): its own account's when IMM_KALSHI_API_KEY_ID +
+IMM_KALSHI_PRIVATE_KEY_PATH are set -- every account read here (fills,
+positions) is an IMM report's -- else the bots' key (KALSHI_PRIVATE_KEY /
+KALSHI_PRIVATE_KEY_PATH / Lisa_Kalshi.txt). Loaded from disk and never
+printed. Read-only.
 """
 
 import argparse
@@ -44,9 +47,12 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+import imm_account
+
 BASE = os.environ.get("KALSHI_READS_BASE",
                       "https://api.elections.kalshi.com/trade-api/v2")
-KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "c3204983-77fc-491b-99f7-136600698178")
+IMM_ACCOUNT = imm_account.resolve()
+KEY_ID = IMM_ACCOUNT.key_id
 LOCAL_KEY_DEFAULT = "C:/Users/jackd/Downloads/Lisa_Kalshi.txt"
 TIMEOUT = 20.0
 SIGNED_MIN_GAP = float(os.environ.get("KALSHI_READS_MIN_GAP", "0.25"))
@@ -77,7 +83,9 @@ class PublicHTTPError(RuntimeError):
 
 
 def load_private_key():
-    """The bots' key, found the way incentive_mm.load_private_key finds it."""
+    """The IMM's key, found the way incentive_mm.load_private_key finds it."""
+    if IMM_ACCOUNT.is_imm:
+        return imm_account.load_imm_key(IMM_ACCOUNT)   # never the fleet's
     from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives import serialization
     pem_b64 = os.environ.get("KALSHI_PRIVATE_KEY")

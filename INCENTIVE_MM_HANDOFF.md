@@ -43,6 +43,8 @@ bid/ask (join, never lead), so the bot is a pure liquidity provider, not a view-
 
 Shared: `KalshiClientsBaseV2ApiKey_FIXED.py` (same client as every repo bot),
 PEM at `C:\Users\jackd\Downloads\Lisa_Kalshi.txt`, alert creds in HKCU env.
+Since 2026-10-02 `imm_account.py` can point the IMM (and only the IMM) at its
+own Kalshi account -- see that day's "own Kalshi account" section.
 
 ## v1.1 (2026-07-11): MENTION + CRYPTO universe, per-contract-minute objective
 
@@ -6045,3 +6047,79 @@ IMM_TREASURY_GATE_ENABLE=0 additionally BLOCKS the ladders.
 WATCH: startup "treasury gate: ALL 69 Treasury series quote only against
 CNBC's live yield ...", "treasury stand-aside KXUST..." lines in the 08:25 /
 09:55 windows, and the daily KXUST*AD book on the day before each print.
+
+## 2026-10-02 — The IMM can sign as its own Kalshi account (Jack)
+
+Jack: "if i want to switch my IMM bot to a different kalshi account, what
+would need to do" -> "set up 2" (the IMM-only key switch). Nothing changes
+until the two variables below are set.
+
+WHY A SEPARATE SWITCH. Every fleet bot signs with one key:
+KALSHI_API_KEY_ID is set nowhere (all fall back to the c3204983... default)
+and KALSHI_PRIVATE_KEY_PATH (HKCU) points at Downloads\Lisa_Kalshi.txt.
+Changing either moves the crypto / weather / gas / rain bots too.
+
+THE SWITCH (imm_account.py). Set BOTH user variables:
+    IMM_KALSHI_API_KEY_ID        the new account's API key id
+    IMM_KALSHI_PRIVATE_KEY_PATH  its private key (PEM) file
+incentive_mm.py and kalshi_reads.py resolve them at import -- process env
+first, then HKCU\Environment directly (a Task Scheduler session or an old
+shell may not carry a new user variable) -- so the bot and every IMM report
+follow: the "KL imm *" and DIGEST tasks import one of the two, and
+imm_cpi_pilot_report.py moved off crypto_touch_mm's fleet client onto
+kalshi_reads. Neither set = the fleet key, unchanged. ONE set =
+misconfigured: load_private_key raises and nothing signs -- never a
+half-and-half pair, never a silent fall back to the fleet key. Startup
+logs `kalshi account: key xxxxxxxx... (<source>)` from build_client (no
+balance there: GitHub Actions call it and their logs are public) and
+`[IMM] account balance $... (key xxxxxxxx...)` from main (local only).
+
+STATE OWNER. imm_state.json now records `account_key_id`; a file written
+before 10/02 is the fleet account's. A live start or --cancel-all signing as
+a different key is REFUSED (exit 2; the launcher retries every ~30s and the
+health alert pages PROCESS GONE / HEARTBEAT STALE): positions, order ids,
+banked accrual, the P&L carry and the balance-floor anchor all describe one
+account. The owner is stamped when the file is created and never rewritten,
+so a dry run signed as the other account cannot launder it. Dry runs and
+--status never check.
+
+CUTOVER, in this order. Do NOT set the variables while the old-account bot
+runs: its next restart comes up refused, with any handed-off book resting
+until TTL.
+1. Disable-ScheduledTask 'KL incentive_mm' (the watchdog starts a Ready
+   task within 15 min; Disabled is the pause switch).
+2. Stop the chain: Stop-ScheduledTask, then make sure no incentive_mm.py
+   python, run_incentive_mm.ps1 or run_incentive_mm_hidden.vbs process
+   survives (restart_imm.ps1's sweep shows how).
+3. `python incentive_mm.py --cancel-all`, still signing as the OLD account.
+   Killing python never cancels resting orders.
+4. Archive run-logs\incentive-mm\imm_state.json, imm_order_journal.jsonl and
+   restart_handoff.json (if present). Everything else there is market data.
+5. Set the two user variables.
+6. From a NEW shell: `python incentive_mm.py --status` -- the startup lines
+   must name the new key and its balance.
+7. Enable-ScheduledTask, Start-ScheduledTask. Consider -Probe sizing for the
+   first paid period.
+The old account's IMM inventory (1,027 markets, ~38k contracts on 10/01)
+cannot move: it settles there unmanaged (no hopeless exits, toxic halts or
+floor logic) unless closed by hand.
+
+RE-CHECK BEFORE GO-LIVE. Settings sized to the old account
+(IMM_BALANCE_DROP_HALT 5000, IMM_DAILY_LOSS_LIMIT 1200,
+IMM_COLLATERAL_BUDGET 100000) and to its Advanced API tier
+(KALSHI_RATE_LIMIT_MS 25, 1000 placements/cycle at 12/s).
+
+WHAT SPLITS. Fleet readers stay on the fleet account: fetch_settlements_csv /
+fetch_trades_csv (the 5:45 exports behind the Kalshi dashboards),
+send_portfolio_digest, send_daily_digest, lowtemp_status. IMM history splits
+at the cutover: the dashboard, digest, reward recon and the Oct 13 CPI pilot
+report read the new account only, and lifetime counters restart with the
+fresh state file. manual_events and STP=maker only see the IMM's own
+account, so manual trading on the old account is invisible to it.
+
+ROLLBACK. Remove the two user variables and the fleet key comes back; the
+new account's state file then refuses it -- archive that file (or restore
+the archived fleet one) first.
+
+Tests: test_imm_account.py (14), TestImmOwnAccount in test_incentive_mm (9),
+two key tests in test_kalshi_reads.
