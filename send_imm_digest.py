@@ -496,11 +496,70 @@ def raw_pnl_for_fills(client, fills, mids=None, results=None):
     return totals, per_event, pnl
 
 
-def daily_series(client, fills, mids, results, state, days=60):
-    """[(date_et, raw, contracts, fills_n)] for the last `days` ET days.
+def et_day_rewards(hourly=None) -> dict:
+    """{ET date "YYYY-MM-DD": modeled reward $} -- the dashboard's "Modeled
+    rewards": the bot's reward estimator integrated over the cycle logs
+    (est_frac x pool $/day over each gap between full cycles, gaps capped at
+    15 min; imm_reward_recon's hourly cache, which the 7:00 portfolio digest
+    keeps warm), summed over each ET calendar day, midnight to midnight.
+
+    Jack 2026-10-02: "update the email to be the same cutoffs as the
+    dashboard". The bot's own reward_history / reward_paid_history are cut at
+    its 5am-CT roll (6am-6am ET) and cannot be re-cut, so the email's daily
+    and window rewards come from here instead. That is the raw accrual, before
+    Kalshi's $1-per-market-per-period floor: the paid basis exists only per
+    bot day. An ET offset is a whole number of hours, so no UTC hour straddles
+    ET midnight."""
+    if hourly is None:
+        import imm_reward_recon as rr
+        # the recon finds the logs relative to its own file; this digest reads
+        # incentive_mm's STATUS_DIR. Run from another checkout (a worktree)
+        # they differ, and the recon would scan an empty folder: point it at
+        # the bot's logs
+        if os.path.normcase(os.path.abspath(rr.STATUS_DIR)) != \
+                os.path.normcase(os.path.abspath(STATUS_DIR)):
+            rr.STATUS_DIR = STATUS_DIR
+            rr.HOURLY_CACHE = os.path.join(STATUS_DIR, "reward_est_hourly_cache.json")
+        hourly = rr.rebuild_hourly()
+        if not hourly:
+            log(f"! no cycle-log reward accrual found under {STATUS_DIR}; reward columns n/a")
+    out = collections.defaultdict(float)
+    day_of = {}
+    for hs in hourly.values():
+        for h, v in hs.items():
+            h = int(h)
+            key = day_of.get(h)
+            if key is None:
+                key = day_of[h] = datetime.fromtimestamp(
+                    h * 3600, timezone.utc).astimezone(ET).date().isoformat()
+            out[key] += _f(v)
+    return {k: round(v, 2) for k, v in out.items()}
+
+
+def et_midnight_ts(day) -> float:
+    """Epoch of 00:00 ET on `day` (a date)."""
+    return ET.localize(datetime(day.year, day.month, day.day)).timestamp()
+
+
+def _et_label(ts) -> str:
+    """'00:00 ET Fri Sep 26' for an epoch."""
+    t = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET)
+    return t.strftime("%H:%M ET %a %b ") + str(t.day)
+
+
+WINDOW_NOTE = "windows are ET calendar days, midnight to midnight: yesterday = the full ET day"
+REWARD_NOTE = ("REWARD = modeled accrual per ET calendar day: the bot's reward "
+               "estimator over the cycle logs, before Kalshi's $1-per-market floor "
+               "-- the dashboard's 'Modeled rewards'")
+
+
+def daily_series(client, fills, mids, results, state, days=60, et_rew=None):
+    """[(date_et, raw, reward, contracts, fills_n)] for the last `days` ET days.
     A fill is attributed to the ET day it occurred; the P&L of the position
     it leaves behind is evaluated at settlement/mark. This is a per-day
-    TRADING result, so a day's number can move until its positions settle."""
+    TRADING result, so a day's number can move until its positions settle.
+    `reward` is that ET day's modeled accrual (et_day_rewards: the
+    dashboard's number, same midnight-to-midnight ET cutoffs)."""
     by_day = collections.defaultdict(list)
     for f in fills:
         ts = f.get("ts")
@@ -508,14 +567,11 @@ def daily_series(client, fills, mids, results, state, days=60):
             continue
         day = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET).date()
         by_day[day].append(f)
-    hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
-    # PAID basis where available: the raw accrual bills for markets that never
-    # clear the exchange's $1-per-market program floor and are paid nothing.
-    paid_hist = {str(k): _f(v) for k, v
-                 in (state.get("reward_paid_history") or {}).items()}
+    if et_rew is None:
+        et_rew = et_day_rewards()
     # Rewards before IMM's go-live are not IMM's (Jack 2026-08-04); the table
     # starts at inception regardless of what history happens to be persisted.
-    hist = {k: v for k, v in hist.items() if k >= IMM_INCEPTION}
+    hist = {k: v for k, v in et_rew.items() if k >= IMM_INCEPTION}
     # Backfilled per-day RAW P&L (imm_backfill_daily_pnl.py) reaches back to
     # the bot's first fill, well past the fill-attribution window available
     # live. Prefer it for any day it covers.
@@ -537,7 +593,7 @@ def daily_series(client, fills, mids, results, state, days=60):
             continue
         if day >= today or key < IMM_INCEPTION:
             continue                       # only PRIOR days, only since go-live
-        reward = paid_hist.get(key, hist.get(key))
+        reward = hist.get(key)
         dfills = by_day.get(day, [])
         bf = backfill.get(key)
         # Live in-window recompute wins (marks/settles move until final) and
@@ -591,16 +647,25 @@ def daily_series(client, fills, mids, results, state, days=60):
     return out
 
 
-def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime):
-    """RAW (trading-only) and NET (raw + rewards) for past day / past week /
-    lifetime. Lifetime RAW comes from the bot's PERSISTED realized_lifetime
-    (the only source that survives restarts AND captures settlements of
-    multi-week holds) plus current own-book MTM."""
-    now = time.time()
-    day_fills = [f for f in fills if _f(f.get("ts")) >= now - 86400]
-    week_fills = fills
+def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime,
+                et_rew=None, now=None):
+    """RAW (trading-only) and NET (raw + rewards) for yesterday / 7 days /
+    lifetime, on the dashboard's cutoffs (Jack 2026-10-02): "day" is
+    yesterday's full ET calendar day and "week" runs from 00:00 ET six days
+    ago to now -- the dashboard's Yesterday and 7-days windows. RAW is the
+    window's fills valued at settlement / mark; REWARD is the modeled accrual
+    over the same span (et_day_rewards). Lifetime RAW comes from the bot's
+    PERSISTED realized_lifetime (the only source that survives restarts AND
+    captures settlements of multi-week holds) plus current own-book MTM."""
+    now = time.time() if now is None else now
+    today_et = datetime.fromtimestamp(now, timezone.utc).astimezone(ET).date()
+    t0 = et_midnight_ts(today_et)
+    y0 = et_midnight_ts(today_et - timedelta(days=1))
+    w0 = et_midnight_ts(today_et - timedelta(days=6))
+    day_fills = [f for f in fills if y0 <= _f(f.get("ts")) < t0]
+    week_fills = [f for f in fills if _f(f.get("ts")) >= w0]
     day_tot, day_ev, _ = raw_pnl_for_fills(client, day_fills, mids, results)
-    week_tot, _, _ = raw_pnl_for_fills(client, week_fills, mids, results)
+    week_tot, week_ev, _ = raw_pnl_for_fills(client, week_fills, mids, results)
 
     # lifetime: persisted realized + MTM on the persisted own-book
     pos, avg = own_book(state)
@@ -612,7 +677,6 @@ def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime):
             life_unreal += p * (m - avg.get(t, 0.0)) / 100.0
     life_raw = life_realized + life_unreal
 
-    today_et = datetime.now(timezone.utc).astimezone(ET).date()
     ledger, calib = load_credit_ledger()
     cred = credited_windows(ledger, calib, today_et)
     # LIFETIME reward is the BOT ESTIMATE (Jack 2026-08-04). It briefly read
@@ -631,29 +695,27 @@ def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime):
     # per day wherever it exists.
     rew_life = reward_lifetime
     rew_basis = "bot estimate"
-    # Sub-window rewards come from the persisted per-day history; days before
-    # the 2026-08-03 fix are missing and are reported as such rather than
-    # silently summed to a wrong number. These stay on the ACCRUAL basis on
-    # purpose — credits land 1-2 days after the liquidity that earned them, so
-    # a credited "yesterday" would not line up with yesterday's RAW P&L.
-    hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
-    paid_hist = {str(k): _f(v) for k, v
-                 in (state.get("reward_paid_history") or {}).items()}
+    # Sub-window rewards: the modeled accrual per ET day (et_day_rewards), the
+    # dashboard's number and cutoffs. These stay on the ACCRUAL basis on
+    # purpose -- credits land 1-2 days after the liquidity that earned them,
+    # so a credited "yesterday" would not line up with yesterday's RAW P&L.
+    # Until 2026-10-02 they were the bot's PAID basis per 5am-CT roll day
+    # (reward_paid_history), which no ET-day window can be cut from.
+    if et_rew is None:
+        et_rew = et_day_rewards()
     day_key = (today_et - timedelta(days=1)).isoformat()
-    # Prefer the PAID basis (the raw integral with the exchange's $1-per-market
-    # floor applied) — the raw one bills for the ~30% of quoted markets that
-    # provably pay nothing. Falls back to raw for days recorded before the
-    # 2026-08-04 change.
-    rew_day = paid_hist.get(day_key, hist.get(day_key))
-    week_keys = [(today_et - timedelta(days=i)).isoformat() for i in range(1, 8)]
-    have = [paid_hist.get(k, hist[k]) for k in week_keys if k in hist]
+    rew_day = et_rew.get(day_key)
+    week_keys = [(today_et - timedelta(days=i)).isoformat() for i in range(0, 7)]
+    have = [et_rew[k] for k in week_keys if k in et_rew]
     rew_week = sum(have) if have else None
     return {
         "day": {"raw": day_tot["raw"], "reward": rew_day, "detail": day_tot,
                 "events": day_ev, "have_reward": rew_day is not None,
-                "reward_days": 1 if rew_day is not None else 0},
+                "reward_days": 1 if rew_day is not None else 0,
+                "label": "yesterday", "since": y0, "until": t0},
         "week": {"raw": week_tot["raw"], "reward": rew_week, "detail": week_tot,
-                 "have_reward": rew_week is not None, "reward_days": len(have)},
+                 "events": week_ev, "have_reward": rew_week is not None,
+                 "reward_days": len(have), "label": "7 days", "since": w0, "until": now},
         "life": {"raw": life_raw, "reward": rew_life, "have_reward": True,
                  "realized": life_realized, "unrealized": life_unreal,
                  "basis": rew_basis},
@@ -1870,7 +1932,7 @@ def finecon_section(state, w, today_ct):
                 t[:36], _f(accrued.get(t)), _f(own_pos.get(t))))
     else:
         L.append("  (no members quoting right now)")
-    L.append("Group trading P&L: past day {:+,.2f} ({} events), past week "
+    L.append("Group trading P&L: yesterday {:+,.2f} ({} events), 7 days "
              "{:+,.2f} ({} events).".format(day_pnl, day_n, week_pnl, week_n))
     L.append("Kalshi-CREDITED rewards on group events: past 7d ${:,.2f}, "
              "all-time ${:,.2f}{}.".format(
@@ -1883,8 +1945,8 @@ def finecon_section(state, w, today_ct):
          '&mdash; top-{} by ROI, quote-to-completion</span></div>'.format(top_n)]
     h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
              'quoting <b>{}/{}</b> slots &nbsp;&middot;&nbsp; est accrued '
-             'this period ${:,.2f} &nbsp;&middot;&nbsp; trading P&amp;L day '
-             '{} / week {} &nbsp;&middot;&nbsp; Kalshi-credited 7d '
+             'this period ${:,.2f} &nbsp;&middot;&nbsp; trading P&amp;L yesterday '
+             '{} / 7 days {} &nbsp;&middot;&nbsp; Kalshi-credited 7d '
              '<b>${:,.2f}</b> / all-time <b>${:,.2f}</b></div>'.format(
                  len(members), top_n, acc_sum, _pnl_span(day_pnl),
                  _pnl_span(week_pnl), cred_week, cred_life))
@@ -1988,9 +2050,17 @@ def build_digest(now_utc: datetime):
     pos, avg = own_book(state)
     touched = {f.get("ticker", "") for f in fills} | set(pos)
     mids, results = current_mids(client, touched)
+    # Modeled rewards per ET day (the dashboard's cutoffs and number). Never
+    # fatal: without them the reward columns read n/a, the P&L still sends.
+    try:
+        et_rew = et_day_rewards()
+    except Exception as e:
+        log(f"! ET-day rewards unavailable ({e!r}); reward columns n/a")
+        et_rew = {}
     w = pnl_windows(client, state, our_ids, fills, mids, results,
-                    ss["reward_lifetime"])
-    series = daily_series(client, fills, mids, results, state)
+                    ss["reward_lifetime"], et_rew=et_rew,
+                    now=now_utc.timestamp())
+    series = daily_series(client, fills, mids, results, state, et_rew=et_rew)
     rows, tot, resting = event_rows(client)     # open book + resting quotes
     cap_rows = capacity_rows(state, status, resting,
                              _f(status.get("pnl_today")) if status else None)
@@ -2037,11 +2107,13 @@ def build_digest(now_utc: datetime):
     L.append("P&L  (RAW = trading only; NET = RAW + incentive rewards)")
     L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
         "WINDOW", "RAW$", "REWARD$", "NET$"))
-    for key, lbl in (("day", "past day"), ("week", "past week"),
+    for key, lbl in (("day", "yesterday"), ("week", "7 days"),
                      ("life", "lifetime")):
         L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
             lbl, money(w[key]["raw"]), money(w[key]["reward"]),
             money(net_of(key))))
+    L.append("  ({}; 7 days = since {} -- the dashboard's windows)".format(
+        WINDOW_NOTE, _et_label(w["week"]["since"])))
     # The credited-rewards block that used to sit here was removed at Jack's
     # request 2026-08-04. The ledger still BACKS the lifetime REWARD figure
     # above (see pnl_windows) and the health line still warns when it goes
@@ -2071,6 +2143,7 @@ def build_digest(now_utc: datetime):
         "{:+,.2f}".format(d_raw + d_rew)))
     L.append("  (RAW shows n/a for days older than the {}h fill-attribution "
              "window)".format(FILL_LOOKBACK_HOURS))
+    L.append("  (" + REWARD_NOTE + ")")
     L.append("  (REWARD is accrual-dated and does NOT line up with a credit "
              "date — Kalshi pays at each program's period end, 1-2 days later)")
     L.extend(_calibration_caveat_text())
@@ -2096,7 +2169,7 @@ def build_digest(now_utc: datetime):
         if r["note"]:
             L.append("{:34s} {}".format("", r["note"]))
     L.append("")
-    L.append("EVENTS TRADED IN THE PAST DAY ({})".format(len(ev_rows)))
+    L.append("EVENTS TRADED YESTERDAY, ET ({})".format(len(ev_rows)))
     if ev_rows:
         L.append("{:28s} {:>9s} {:>9s} {:>9s} {:>9s} {:>7s} {:>5s}".format(
             "EVENT", "P&L$", "REAL$", "SETTLE$", "MTM$", "CTS", "MKTS"))
@@ -2117,7 +2190,7 @@ def build_digest(now_utc: datetime):
                      + e_tot["unrealized"], e_tot["realized"], e_tot["settle"],
                      e_tot["unrealized"], e_tot["contracts"], e_tot["mkts"]))
     else:
-        L.append("  (no fills in the past 24h)")
+        L.append("  (no fills yesterday)")
     fin_L, fin_html = finecon_section(state, w, today_ct)
     if fin_L:
         L.append("")
@@ -2147,7 +2220,7 @@ def build_digest(now_utc: datetime):
              '<td style="{0}">WINDOW</td><td style="{1}">RAW (trading)</td>'
              '<td style="{1}">REWARD</td><td style="{1}">NET</td></tr>'
              .format(TDL, TD))
-    for i, (key, lbl) in enumerate((("day", "Past day"), ("week", "Past week"),
+    for i, (key, lbl) in enumerate((("day", "Yesterday"), ("week", "7 days"),
                                     ("life", "Lifetime"))):
         bg = "#fafafa" if i % 2 else "#fff"
         r = w[key]["reward"]
@@ -2158,6 +2231,9 @@ def build_digest(now_utc: datetime):
                      bg, TDL, lbl, TD, _pnl_span(w[key]["raw"]),
                      money(r), _pnl_span(n) if n is not None else "n/a"))
     h.append("</table>")
+    h.append('<div style="color:#888;font-size:12px;margin:-6px 0 6px">{}; 7 days = '
+             'since {} &mdash; the dashboard\'s windows.</div>'.format(
+                 WINDOW_NOTE, _et_label(w["week"]["since"])))
     # The "Rewards credited by Kalshi" table and the "reward basis" line that
     # used to sit here were removed at Jack's request 2026-08-04. The ledger
     # still BACKS the lifetime REWARD figure in the table above (pnl_windows
@@ -2193,10 +2269,10 @@ def build_digest(now_utc: datetime):
                  TDL, TD, _pnl_span(h_raw), h_rew, _pnl_span(h_raw + h_rew)))
     h.append("</table>")
     h.append('<div style="color:#888;font-size:12px;margin-top:4px">RAW is n/a '
-             'for days older than the {}h fill-attribution window. REWARD is '
+             'for days older than the {}h fill-attribution window. {}. REWARD is '
              'accrual-dated, so it does NOT line up with a credit date &mdash; '
              'Kalshi pays at each program\'s period end, 1&ndash;2 days later.'
-             '</div>'.format(FILL_LOOKBACK_HOURS))
+             '</div>'.format(FILL_LOOKBACK_HOURS, REWARD_NOTE))
     h.append(_calibration_caveat_html())
 
     h.append(_cutoff_audit_html(audit))
@@ -2240,7 +2316,7 @@ def build_digest(now_utc: datetime):
              .format(capacity_note()))
 
     h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
-             'Events traded in the past day ({})</div>'.format(len(ev_rows)))
+             'Events traded yesterday, ET ({})</div>'.format(len(ev_rows)))
     if ev_rows:
         h.append('<table style="border-collapse:collapse">')
         h.append('<tr style="background:#f0f0f0;font-weight:600">'
@@ -2276,7 +2352,7 @@ def build_digest(now_utc: datetime):
                      _pnl_span(et["unrealized"]), et["contracts"], et["mkts"]))
         h.append("</table>")
     else:
-        h.append("<div>No fills in the past 24h.</div>")
+        h.append("<div>No fills yesterday.</div>")
     if fin_html:
         h.append(fin_html)
     h.append('<div style="color:#777;font-size:12px;margin-top:12px;'
