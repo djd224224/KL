@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for imm_reward_recon.py and the digest's credit-ledger reporting.
+"""Tests for imm_reward_recon.py and the digest's capacity section.
 
 The reconciliation is only worth having if it fails LOUDLY: a parser that
 silently drops rows, or a merge that silently duplicates them, produces a
@@ -13,7 +13,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -332,68 +332,6 @@ class TestEventRollup(unittest.TestCase):
 
     def test_strikes_containing_dashes_still_roll_up(self):
         self.assertEqual(rec.event_of("KXA-26AUG01-T5.315-X"), "KXA-26AUG01")
-
-
-class TestDigestCreditWindows(unittest.TestCase):
-    """The digest must report IMM's reward, not the account's."""
-
-    def setUp(self):
-        import send_imm_digest as dg
-        self.dg = dg
-        self.today = date(2026, 8, 4)
-
-    def _rows(self):
-        return [
-            ("2026-05-06", "KXHIGHTNOLA-26MAY06", 1.06),   # pre-inception
-            ("2026-07-05", "KXBNBMAXMON-BNB", 11.31),      # pre-inception
-            ("2026-08-03", "KXTEMPDCH-26AUG0213", 13.68),
-            ("2026-08-02", "KXTEMPNYCH-26AUG0111", 6.75),
-            ("2026-07-20", "KXWCMENTION-MENWORLDCUP", 152.94),
-        ]
-
-    def test_credits_before_inception_are_excluded(self):
-        w = self.dg.credited_windows(self._rows(), {}, self.today)
-        # 13.68 + 6.75 + 152.94; the May and July-5 rows are dropped
-        self.assertAlmostEqual(w["lifetime"], 173.37)
-
-    def test_day_and_mtd_windows(self):
-        w = self.dg.credited_windows(self._rows(), {}, self.today)
-        self.assertAlmostEqual(w["day"], 13.68)          # 2026-08-03
-        self.assertAlmostEqual(w["mtd"], 20.43)          # Aug 2 + Aug 3
-        self.assertEqual(w["latest"], "2026-08-03")
-
-    def test_calibration_attribution_wins_when_present(self):
-        """With a calibration file the lifetime figure is the per-event
-        IMM-attributable total, which strips the other bots on this key."""
-        calib = {"credited_imm_attributable": 20.43,
-                 "credited_lifetime_account": 185.74,
-                 "credited_non_imm": 165.31,
-                 # the World Cup event is another bot's, so it is absent here
-                 "credited_by_date_imm": {"2026-08-03": 13.68, "2026-08-02": 6.75}}
-        w = self.dg.credited_windows(self._rows(), calib, self.today)
-        self.assertAlmostEqual(w["lifetime"], 20.43)
-        self.assertTrue(w["attributed"])
-        self.assertAlmostEqual(w["account_lifetime"], 185.74)
-        # every window is attribution-filtered, not just lifetime
-        self.assertAlmostEqual(w["mtd"], 20.43)
-        self.assertAlmostEqual(w["day"], 13.68)
-        self.assertAlmostEqual(w["week"], 20.43)
-
-    def test_windows_fall_back_to_raw_ledger_without_a_calibration(self):
-        """No calibration file: report the date-filtered ledger and say the
-        figure is NOT attribution-filtered rather than implying it is."""
-        w = self.dg.credited_windows(self._rows(), {}, self.today)
-        self.assertFalse(w["attributed"])
-        self.assertAlmostEqual(w["lifetime"], 173.37)   # includes the WC event
-
-    def test_no_ledger_returns_none(self):
-        self.assertIsNone(self.dg.credited_windows([], {}, self.today))
-
-    def test_week_window_is_seven_prior_days(self):
-        rows = [((self.today - timedelta(days=i)).isoformat(), "KXA-26AUG01", 1.0)
-                for i in range(0, 10)]
-        w = self.dg.credited_windows(rows, {}, self.today)
-        self.assertAlmostEqual(w["week"], 7.0)   # days -1..-7, not today
 
 
 class TestDigestCapacity(unittest.TestCase):

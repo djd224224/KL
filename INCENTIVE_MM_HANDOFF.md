@@ -406,6 +406,19 @@ gone. The `KL incentive_mm DIGEST` 7:10 task now lands on a logged no-op
 section as its own email, `--print` prints it. The history below is how it got
 here.
 
+**The digest's own P&L path is retired (2026-10-02).** Once the windows came off
+the dashboard, `daily_series`, `pnl_windows`, `raw_pnl_for_fills`,
+`et_day_rewards`, `credited_windows`, `fetch_own_fills`, `replay_realized` and
+`_yes_delta_and_price` had no callers left; they are gone, with their tests.
+The opportunistic email's `pnl_windows` call (its result unread since
+2026-09-11) and its 168h fill fetch went with them. Nothing writes or reads
+`run-logs\incentive-mm\daily_pnl.json` any more: it stays on disk as a FROZEN
+record of per-day RAW, 2026-07-12 to 2026-10-01 (82 days, the only per-day RAW
+before the dashboard's position log starts 2026-09-06). `imm_backfill_daily_pnl.py`
+rebuilt that file wholesale from the live fills API, whose ~67-day reach means
+a re-run would now drop the oldest weeks; it is deleted (Jack), recoverable
+from git history.
+
 `send_imm_digest.py` — one HTML morning email, structured like the crypto fleet's
 `send_daily_digest.py`: headline **estimated reward** (contract-minutes + c/1k-
 contract-min efficiency), P&L breakdown, per-EVENT table sorted best→worst
@@ -766,7 +779,8 @@ with EARN EST$ (bot accrued-reward estimate, period-to-date), P&L$
 NET$ (P&L + EARN EST), plus MKTS and a plain-English label; TOTAL row;
 footer = actual Kalshi-credited on opportunistic events to date (recon
 ledger). Numbers reuse send_imm_digest's validated helpers
-(pnl_windows/own_book/current_mids/credit ledger) — imported, not
+(own_book/current_mids/credit ledger; pnl_windows until it was retired
+2026-10-02) — imported, not
 reimplemented, so a row can't disagree with the digest. Picks up Carbon
 Arc self-extensions via imm.load_finecon_extra_series(). Flags:
 --test (send now, no marker) / --dry / --print (build + print only);

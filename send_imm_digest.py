@@ -24,7 +24,6 @@ environment, falling back to HKCU\Environment (Task Scheduler's stripped env).
 
 import argparse
 import ast
-import collections
 import csv
 import glob
 import json
@@ -84,19 +83,12 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
 # Import AFTER the env fixup so the module-level cred constants pick them up.
 import incentive_mm as imm                                          # noqa: E402
 import imm_pickoff                                                  # noqa: E402
-from incentive_mm import (CT, ET, STATUS_DIR, Alerter, PnlTracker,  # noqa: E402
+from incentive_mm import (CT, ET, STATUS_DIR, Alerter,  # noqa: E402
                           build_client, bulk_mark_cents, log, market_cents)
 
 STALE_AFTER_MINUTES = 30
 STATE_PATH = os.path.join(STATUS_DIR, "imm_state.json")
 STATUS_PATH = os.path.join(STATUS_DIR, "status_incentive_mm.json")
-# 96 -> 168 (Jack 2026-08-03: "i do hold multi-week inventory"). 168h is the
-# HARD ceiling for fill-based attribution: fills carry no client_order_id and
-# the bot's our_order_ids map prunes at 7 days, so nothing older can be
-# attributed to the bot at all. Multi-week positions are therefore handled by
-# the bot's PERSISTED realized_lifetime counter (which captures settlements of
-# arbitrarily old holds) plus own-book MTM — not by this window.
-FILL_LOOKBACK_HOURS = int(os.environ.get("IMM_DIGEST_FILL_HOURS", 168))
 # NOTE on reconciling estimates vs Kalshi credits (Jack 2026-07-21): a naive
 # same-day comparison is WRONG — programs run multiple days and a day's
 # accrual can pay out across the program's life, so an "est $536 vs paid $300"
@@ -189,47 +181,10 @@ def current_mids(client, tickers):
     return mids, results
 
 
-def replay_realized(client, our_ids: set):
-    """(realized, positions, avg_cost) replayed from the bot's OWN fills only
-    (matched by order id). Isolated from the user's manual fills and the other
-    cloud bots. Positions/avg are returned so the caller can book SETTLEMENT
-    P&L: a position that settled is gone from the persisted own-book, so
-    realized-from-fills alone silently dropped the entire settlement result
-    (audit finding 2026-07-23, fixed 2026-08-03 — it hid $920 of temp
-    settlement losses on 8/3). Best-effort — returns empties on read failure."""
-    pnl = PnlTracker()
-    cursor = None
-    min_ts = int(time.time()) - FILL_LOOKBACK_HOURS * 3600
-    seen = set()
-    try:
-        for _page in range(400):   # page to exhaustion; fleet shares this stream
-            resp = client.get_fills(min_ts=min_ts, limit=200, cursor=cursor)
-            batch = resp.get("fills") or []
-            for f in batch:
-                fid = f.get("fill_id") or f.get("trade_id") or ""
-                if f.get("order_id") not in our_ids or fid in seen:
-                    continue
-                seen.add(fid)
-                side, action = f.get("side"), f.get("action")
-                count = _f(f.get("count_fp") or f.get("count"))
-                px = f.get("yes_price_dollars")
-                px_c = _f(px) * 100 if px is not None else _f(f.get("yes_price"))
-                if side in ("yes", "no") and action in ("buy", "sell") and count > 0:
-                    pnl.on_fill(f.get("ticker", "?"), side, action, count, px_c)
-            cursor = resp.get("cursor")
-            if not cursor or not batch:
-                break
-    except Exception as e:
-        log(f"! fill replay failed ({e}); realized shown as 0")
-        return {}, {}, {}
-    return dict(pnl.realized), dict(pnl.pos), dict(pnl.avg)
-
-
 def event_rows(client):
     """Per-event rollup of the bot's own book. Returns (rows, totals, resting)."""
     state = load_json(STATE_PATH)
     pos, avg = own_book(state)
-    our_ids = set(state.get("our_order_ids") or {})
 
     # Resting imm- orders: which events are actively quoted + capital deployed.
     resting_by_event = {}
@@ -266,9 +221,9 @@ def event_rows(client):
     except Exception as e:
         log(f"! resting-order read failed: {e}")
 
-    # P&L now comes from pnl_windows() (raw_pnl_for_fills handles settlement
-    # booking per window); this function only reports the CURRENT open book
-    # and resting quotes, so it no longer replays fills.
+    # This function only reports the CURRENT open book and resting quotes, so
+    # it no longer replays fills (the section's P&L windows are the
+    # dashboard's: dashboard_windows).
     realized = {}
     mids, _results = current_mids(client, set(pos))
 
@@ -327,9 +282,6 @@ def event_rows(client):
 # hand-set offset is needed at all.
 CALIB_PATH = os.path.join(STATUS_DIR, "reward_calibration.json")
 CREDITS_PATH = os.path.join(STATUS_DIR, "reward_credits.csv")
-# IMM went live on this date; the digest reports NO credit dated before it
-# (Jack 2026-08-04) — earlier credit belongs to other strategies by definition.
-IMM_INCEPTION = "2026-07-12"
 # Credits arrive 1-2 days after the liquidity that earned them (measured lag:
 # median 1.3d, p90 1.7d, max 3.0d), so a ledger more than this many days
 # behind is genuinely missing money rather than merely waiting on settlement.
@@ -339,7 +291,6 @@ LEDGER_STALE_DAYS = int(os.environ.get("IMM_LEDGER_STALE_DAYS", "4"))
 # reported reward is the bot estimate and the ledger is per-event. The digest
 # scheduled task still exports them — harmless, but delete them from the task
 # when convenient so a stale value can never look meaningful again.
-DAILY_PNL_PATH = os.path.join(STATUS_DIR, "daily_pnl.json")
 
 
 def load_credit_ledger():
@@ -358,185 +309,6 @@ def load_credit_ledger():
     return rows, calib
 
 
-def credited_windows(rows, calib, today_et):
-    """Credited reward by window, IMM-attributable and inception-filtered.
-
-    Kalshi credits a program at its PERIOD END, so these windows are NOT
-    comparable to an accrual over the same dates — a day's credits pay for
-    liquidity resting over the preceding day or two (measured lag: median
-    1.3d, p90 1.7d). They are reported as a settlement fact, not as "what the
-    bot earned that day"; the daily table keeps using the accrual for that."""
-    if not rows:
-        return None
-    imm_only = bool(calib.get("credited_imm_attributable"))
-    # Per-date IMM-attributable credit, so every window is filtered the same
-    # way. Without it "month to date" silently includes the MLB / fight-mention
-    # credits earned by the other bots sharing this API key.
-    by_date = calib.get("credited_by_date_imm") or {}
-    if not by_date:
-        by_date = {}
-        for d, _e, a in rows:
-            if d >= IMM_INCEPTION:
-                by_date[d] = by_date.get(d, 0.0) + a
-        imm_only = False
-    life = calib.get("credited_imm_attributable") if imm_only \
-        else sum(by_date.values())
-    d1 = (today_et - timedelta(days=1)).isoformat()
-    week = {(today_et - timedelta(days=i)).isoformat() for i in range(1, 8)}
-    month = today_et.strftime("%Y-%m")
-    return {
-        "lifetime": life,
-        "day": by_date.get(d1, 0.0),
-        "week": sum(a for d, a in by_date.items() if d in week),
-        "mtd": sum(a for d, a in by_date.items() if d[:7] == month),
-        "latest": max((d for d, _e, _a in rows), default=""),
-        "account_lifetime": calib.get("credited_lifetime_account"),
-        "non_imm": calib.get("credited_non_imm"),
-        "attributed": imm_only,
-    }
-
-
-def fetch_own_fills(client, our_ids: set, hours: int) -> list:
-    """The bot's own fills over `hours`, newest-first pagination exhausted.
-    Attribution is by order id — the account is shared with the crypto fleet,
-    the cloud bots and Jack's manual trading."""
-    out, cursor, seen = [], None, set()
-    min_ts = int(time.time()) - hours * 3600
-    try:
-        for _page in range(600):
-            resp = client.get_fills(min_ts=min_ts, limit=200, cursor=cursor)
-            batch = resp.get("fills") or []
-            for f in batch:
-                fid = f.get("fill_id") or f.get("trade_id") or ""
-                if f.get("order_id") not in our_ids or fid in seen:
-                    continue
-                seen.add(fid)
-                out.append(f)
-            cursor = resp.get("cursor")
-            if not cursor or not batch:
-                break
-    except Exception as e:
-        log(f"! fill fetch failed ({e})")
-    return out
-
-
-def _yes_delta_and_price(f):
-    """(yes_delta_contracts, price_in_yes_cents, fee). A NO buy is a SHORT
-    yes position priced at yes_price_dollars — the sign trap in this data."""
-    cnt = _f(f.get("count_fp") or f.get("count"))
-    px = f.get("yes_price_dollars")
-    pxc = _f(px) * 100 if px is not None else _f(f.get("yes_price"))
-    side, action = f.get("side"), f.get("action")
-    if (side, action) == ("yes", "buy"):
-        yd = cnt
-    elif (side, action) == ("yes", "sell"):
-        yd = -cnt
-    elif (side, action) == ("no", "buy"):
-        yd = -cnt
-    else:
-        yd = cnt
-    return yd, pxc, _f(f.get("fee_cost"))
-
-
-def raw_pnl_for_fills(client, fills, mids=None, results=None):
-    """RAW (trading-only) P&L for a set of fills: realized from offsetting
-    fills + settlement on the residual position + MTM on what is still open,
-    minus fees. Returns (totals, per_event, per_ticker_positions)."""
-    pnl = PnlTracker()
-    fees = 0.0
-    for f in sorted(fills, key=lambda x: x.get("ts") or 0):
-        cnt = _f(f.get("count_fp") or f.get("count"))
-        side, action = f.get("side"), f.get("action")
-        px = f.get("yes_price_dollars")
-        pxc = _f(px) * 100 if px is not None else _f(f.get("yes_price"))
-        if side in ("yes", "no") and action in ("buy", "sell") and cnt > 0:
-            pnl.on_fill(f.get("ticker", "?"), side, action, cnt, pxc)
-        fees += _f(f.get("fee_cost"))
-    tickers = set(pnl.pos) | set(pnl.realized)
-    if mids is None or results is None:
-        mids, results = current_mids(client, tickers)
-    settle, unreal = {}, {}
-    for t, p in pnl.pos.items():
-        if abs(p) < 0.01:
-            continue
-        a = pnl.avg.get(t, 0.0)
-        if t in results:                       # settled: book what Kalshi paid
-            val = a if results[t] == VOID else results[t]   # a void refunds cost
-            settle[t] = p * (val - a) / 100.0
-        elif mids.get(t) is not None:          # still open: mark to mid
-            unreal[t] = p * (mids[t] - a) / 100.0
-    per_event = collections.defaultdict(
-        lambda: {"realized": 0.0, "settle": 0.0, "unrealized": 0.0,
-                 "net_pos": 0.0, "mkts": set(), "contracts": 0.0})
-    for t, v in pnl.realized.items():
-        per_event[_event_of(t)]["realized"] += v
-        per_event[_event_of(t)]["mkts"].add(t)
-    for t, v in settle.items():
-        per_event[_event_of(t)]["settle"] += v
-        per_event[_event_of(t)]["mkts"].add(t)
-    for t, v in unreal.items():
-        per_event[_event_of(t)]["unrealized"] += v
-        per_event[_event_of(t)]["mkts"].add(t)
-    for t, p in pnl.pos.items():
-        per_event[_event_of(t)]["net_pos"] += p
-    for f in fills:
-        per_event[_event_of(f.get("ticker", "?"))]["contracts"] += \
-            _f(f.get("count_fp") or f.get("count"))
-    totals = {
-        "realized": sum(pnl.realized.values()),
-        "settle": sum(settle.values()),
-        "unrealized": sum(unreal.values()),
-        "fees": fees,
-        "contracts": sum(_f(f.get("count_fp") or f.get("count")) for f in fills),
-        "open_markets": sum(1 for t, p in pnl.pos.items()
-                            if abs(p) >= 0.01 and t not in results),
-    }
-    totals["raw"] = (totals["realized"] + totals["settle"]
-                     + totals["unrealized"] - fees)
-    return totals, per_event, pnl
-
-
-def et_day_rewards(hourly=None) -> dict:
-    """{ET date "YYYY-MM-DD": modeled reward $} -- the dashboard's "Modeled
-    rewards": the bot's reward estimator integrated over the cycle logs
-    (est_frac x pool $/day over each gap between full cycles, gaps capped at
-    15 min; imm_reward_recon's hourly cache, which the 7:00 portfolio digest
-    keeps warm), summed over each ET calendar day, midnight to midnight.
-
-    Jack 2026-10-02: "update the email to be the same cutoffs as the
-    dashboard". The bot's own reward_history / reward_paid_history are cut at
-    its 5am-CT roll (6am-6am ET) and cannot be re-cut, so ET-day rewards come
-    from here (pnl_windows; the morning section reads the dashboard's own
-    figures since 2026-10-02 -- dashboard_windows). That is the raw accrual, before
-    Kalshi's $1-per-market-per-period floor: the paid basis exists only per
-    bot day. An ET offset is a whole number of hours, so no UTC hour straddles
-    ET midnight."""
-    if hourly is None:
-        import imm_reward_recon as rr
-        # the recon finds the logs relative to its own file; this digest reads
-        # incentive_mm's STATUS_DIR. Run from another checkout (a worktree)
-        # they differ, and the recon would scan an empty folder: point it at
-        # the bot's logs
-        if os.path.normcase(os.path.abspath(rr.STATUS_DIR)) != \
-                os.path.normcase(os.path.abspath(STATUS_DIR)):
-            rr.STATUS_DIR = STATUS_DIR
-            rr.HOURLY_CACHE = os.path.join(STATUS_DIR, "reward_est_hourly_cache.json")
-        hourly = rr.rebuild_hourly()
-        if not hourly:
-            log(f"! no cycle-log reward accrual found under {STATUS_DIR}; reward columns n/a")
-    out = collections.defaultdict(float)
-    day_of = {}
-    for hs in hourly.values():
-        for h, v in hs.items():
-            h = int(h)
-            key = day_of.get(h)
-            if key is None:
-                key = day_of[h] = datetime.fromtimestamp(
-                    h * 3600, timezone.utc).astimezone(ET).date().isoformat()
-            out[key] += _f(v)
-    return {k: round(v, 2) for k, v in out.items()}
-
-
 def et_midnight_ts(day) -> float:
     """Epoch of 00:00 ET on `day` (a date)."""
     return ET.localize(datetime(day.year, day.month, day.day)).timestamp()
@@ -546,176 +318,6 @@ def _et_label(ts) -> str:
     """'00:00 ET Fri Sep 26' for an epoch."""
     t = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET)
     return t.strftime("%H:%M ET %a %b ") + str(t.day)
-
-
-def daily_series(client, fills, mids, results, state, days=60, et_rew=None):
-    """[(date_et, raw, reward, contracts, fills_n)] for the last `days` ET days.
-    A fill is attributed to the ET day it occurred; the P&L of the position
-    it leaves behind is evaluated at settlement/mark. This is a per-day
-    TRADING result, so a day's number can move until its positions settle.
-    `reward` is that ET day's modeled accrual (et_day_rewards: the
-    dashboard's number, same midnight-to-midnight ET cutoffs)."""
-    by_day = collections.defaultdict(list)
-    for f in fills:
-        ts = f.get("ts")
-        if not ts:
-            continue
-        day = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET).date()
-        by_day[day].append(f)
-    if et_rew is None:
-        et_rew = et_day_rewards()
-    # Rewards before IMM's go-live are not IMM's (Jack 2026-08-04); the table
-    # starts at inception regardless of what history happens to be persisted.
-    hist = {k: v for k, v in et_rew.items() if k >= IMM_INCEPTION}
-    # Backfilled per-day RAW P&L (imm_backfill_daily_pnl.py) reaches back to
-    # the bot's first fill, well past the fill-attribution window available
-    # live. Prefer it for any day it covers.
-    backfill = load_json(DAILY_PNL_PATH)
-    out = []
-    today = datetime.now(timezone.utc).astimezone(ET).date()
-    # Every prior day that EARNED rewards (Jack 2026-08-03) — union of the
-    # reward-history days and the days we have attributable fills for. Fill
-    # attribution only reaches back FILL_LOOKBACK_HOURS, so older days show
-    # their reward with raw P&L marked unavailable rather than a false 0.
-    days_set = set(hist)
-    for day in by_day:
-        days_set.add(day.isoformat())
-    fresh = {}
-    for key in sorted(days_set):
-        try:
-            day = datetime.strptime(key, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if day >= today or key < IMM_INCEPTION:
-            continue                       # only PRIOR days, only since go-live
-        reward = hist.get(key)
-        dfills = by_day.get(day, [])
-        bf = backfill.get(key)
-        # Live in-window recompute wins (marks/settles move until final) and
-        # is upserted into the store — UNLESS the stored record saw MORE
-        # fills: the oldest in-window day is only partially covered by the
-        # fill window, and freezing it would clobber a fuller measurement.
-        if dfills and not (bf and int(bf.get("fills") or 0) > len(dfills)):
-            tot, _ev, _p = raw_pnl_for_fills(client, dfills, mids, results)
-            raw, contracts, nf = tot["raw"], tot["contracts"], len(dfills)
-            fresh[key] = {"raw": round(raw, 2),
-                          "realized": round(_f(tot.get("realized")), 2),
-                          "settle": round(_f(tot.get("settle")), 2),
-                          "mtm": round(_f(tot.get("unrealized")), 2),
-                          "fees": round(_f(tot.get("fees")), 2),
-                          "contracts": round(contracts, 2), "fills": nf}
-        elif bf:                            # frozen: backfill or prior upsert
-            raw = _f(bf.get("raw"))
-            contracts, nf = _f(bf.get("contracts")), int(bf.get("fills") or 0)
-        elif reward is not None:
-            raw, contracts, nf = None, 0.0, 0
-        else:
-            continue
-        out.append((day, raw, reward, contracts, nf))
-    for key, bf in backfill.items():        # days with P&L but no reward record
-        if key in hist:
-            continue
-        try:
-            day = datetime.strptime(key, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if day >= today or any(r[0] == day for r in out):
-            continue
-        out.append((day, _f(bf.get("raw")), None, _f(bf.get("contracts")),
-                    int(bf.get("fills") or 0)))
-    # Persist the live-computed days: each day keeps refreshing while inside
-    # the fill window, then stays FROZEN at its last (fullest) measurement
-    # instead of dropping to n/a once it ages past FILL_LOOKBACK_HOURS. The
-    # 8/4-8/28 n/a hole was this store going stale after its one-time 8/3
-    # backfill; wholesale rebuilds remain imm_backfill_daily_pnl.py's job.
-    if fresh:
-        merged = dict(backfill)
-        merged.update(fresh)
-        try:
-            tmp = DAILY_PNL_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(merged, f, indent=1, sort_keys=True)
-            os.replace(tmp, DAILY_PNL_PATH)
-        except OSError as e:
-            log(f"! daily_pnl.json upsert failed: {e}")
-    out.sort(key=lambda r: r[0])
-    return out
-
-
-def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime,
-                et_rew=None, now=None):
-    """RAW (trading-only) and NET (raw + rewards) for yesterday / 7 days /
-    lifetime, on the dashboard's cutoffs (Jack 2026-10-02): "day" is
-    yesterday's full ET calendar day and "week" runs from 00:00 ET six days
-    ago to now -- the dashboard's Yesterday and 7-days windows. RAW is the
-    window's fills valued at settlement / mark; REWARD is the modeled accrual
-    over the same span (et_day_rewards). Lifetime RAW comes from the bot's
-    PERSISTED realized_lifetime (the only source that survives restarts AND
-    captures settlements of multi-week holds) plus current own-book MTM."""
-    now = time.time() if now is None else now
-    today_et = datetime.fromtimestamp(now, timezone.utc).astimezone(ET).date()
-    t0 = et_midnight_ts(today_et)
-    y0 = et_midnight_ts(today_et - timedelta(days=1))
-    w0 = et_midnight_ts(today_et - timedelta(days=6))
-    day_fills = [f for f in fills if y0 <= _f(f.get("ts")) < t0]
-    week_fills = [f for f in fills if _f(f.get("ts")) >= w0]
-    day_tot, day_ev, _ = raw_pnl_for_fills(client, day_fills, mids, results)
-    week_tot, week_ev, _ = raw_pnl_for_fills(client, week_fills, mids, results)
-
-    # lifetime: persisted realized + MTM on the persisted own-book
-    pos, avg = own_book(state)
-    life_realized = _f(state.get("realized_lifetime"))
-    life_unreal = 0.0
-    for t, p in pos.items():
-        m = mids.get(t)
-        if m is not None:
-            life_unreal += p * (m - avg.get(t, 0.0)) / 100.0
-    life_raw = life_realized + life_unreal
-
-    ledger, calib = load_credit_ledger()
-    cred = credited_windows(ledger, calib, today_et)
-    # LIFETIME reward is the BOT ESTIMATE (Jack 2026-08-04). It briefly read
-    # off the credit ledger, which is the only figure that is a fact rather
-    # than a model — but it is a fact about a DIFFERENT quantity: credits are
-    # paid at each program's period end, so the ledger always trails what the
-    # book has earned and never includes the in-flight programs. Sitting in a
-    # column next to same-instant RAW P&L, that lag reads as underperformance
-    # rather than as settlement timing.
-    #
-    # The raw counter is used rather than reward_paid_lifetime because the
-    # paid-basis counter only started accumulating 2026-08-04 and was migrated
-    # WITHOUT back-crediting, so it is near zero and cannot represent lifetime
-    # yet. Once it has real history it is the better source here (it applies
-    # the exchange's $1/market floor); the sub-windows below already prefer it
-    # per day wherever it exists.
-    rew_life = reward_lifetime
-    rew_basis = "bot estimate"
-    # Sub-window rewards: the modeled accrual per ET day (et_day_rewards), the
-    # dashboard's number and cutoffs. These stay on the ACCRUAL basis on
-    # purpose -- credits land 1-2 days after the liquidity that earned them,
-    # so a credited "yesterday" would not line up with yesterday's RAW P&L.
-    # Until 2026-10-02 they were the bot's PAID basis per 5am-CT roll day
-    # (reward_paid_history), which no ET-day window can be cut from.
-    if et_rew is None:
-        et_rew = et_day_rewards()
-    day_key = (today_et - timedelta(days=1)).isoformat()
-    rew_day = et_rew.get(day_key)
-    week_keys = [(today_et - timedelta(days=i)).isoformat() for i in range(0, 7)]
-    have = [et_rew[k] for k in week_keys if k in et_rew]
-    rew_week = sum(have) if have else None
-    return {
-        "day": {"raw": day_tot["raw"], "reward": rew_day, "detail": day_tot,
-                "events": day_ev, "have_reward": rew_day is not None,
-                "reward_days": 1 if rew_day is not None else 0,
-                "label": "yesterday", "since": y0, "until": t0},
-        "week": {"raw": week_tot["raw"], "reward": rew_week, "detail": week_tot,
-                 "events": week_ev, "have_reward": rew_week is not None,
-                 "reward_days": len(have), "label": "7 days", "since": w0, "until": now},
-        "life": {"raw": life_raw, "reward": rew_life, "have_reward": True,
-                 "realized": life_realized, "unrealized": life_unreal,
-                 "basis": rew_basis},
-        "credited": cred,
-    }
 
 
 def status_summary(status: dict) -> dict:
@@ -2136,6 +1738,12 @@ def build_digest(now_utc: datetime):
     audit = cutoff_audit(client, now_utc, pos, kalshi=pick["kalshi"],
                          pick_events=[r["event"] for r in pick["rows"]])
     health = health_line(status, ss, dw["note"])
+    # LIFETIME reward is the BOT ESTIMATE (Jack 2026-08-04), not the credit
+    # ledger: credits are paid at each program's period end, so the ledger
+    # trails what the book has earned and never includes in-flight programs,
+    # and beside same-instant RAW that lag reads as underperformance. Nor
+    # reward_paid_lifetime: that counter began 2026-08-04 without
+    # back-crediting, so it cannot stand for lifetime.
     w = {"day": dw["day"], "week": dw["week"],
          "life": {"raw": life_raw, "reward": ss["reward_lifetime"]}}
 

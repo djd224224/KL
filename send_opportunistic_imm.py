@@ -46,9 +46,9 @@ One row per currently-quoted opportunistic EVENT:
              tracking NOW (NOT period-to-date: see the EST note below —
              the accrual is not reset at a period end, but it IS deleted
              when a market goes unquoted and flat)
-  P&L        trading P&L on the event's markets (realized + settlement +
-             open-book MTM) over the digest's attribution window — the cost
-             of holding the inventory that earns the reward
+  P&L        trading P&L on the event's markets (lifetime realized, see
+             realized_for, + open-book MTM) — the cost of holding the
+             inventory that earns the reward
   NET        P&L + EARN EST — the position's true economics
 
 The per-tier tables are the ACTIVE book: what is quoted or held right now.
@@ -96,12 +96,15 @@ durable per-event set cached in opportunistic_roster.json. Measured on
 2026-09-11: 7 credited scan events worth $118.40 had already left
 scan_book, against $21.83 the two-tier footer was reporting as the book's
 whole lifetime.
-Numbers come from the SAME validated path as the whole-account digest: this
-script imports send_imm_digest and calls its pnl_windows() / own_book() /
-credit-ledger helpers, so a row here can never disagree with the digest.
+The book, its marks and the credit ledger come from send_imm_digest's own
+helpers (own_book() / current_mids() / load_credit_ledger()), imported, not
+reimplemented. Until 2026-10-02 this script also ran the digest's
+pnl_windows(); nothing here had read its result since 2026-09-11, and the
+digest itself now takes its windows from the IMM dashboard.
 
 STRICTLY READ-ONLY. Scheduled daily 7:25 AM ET ("KL imm opportunistic"),
-after the 7:10 digest and 7:20 quote-gaps. --test sends now ignoring the
+after the 7:00 portfolio email (which carries the IMM digest) and 7:20
+quote-gaps. --test sends now ignoring the
 sent-marker; --dry / --print build and print only.
 """
 import argparse
@@ -120,10 +123,8 @@ import send_imm_digest as sd
 import incentive_mm as imm
 from incentive_mm import log
 from send_imm_digest import (TD, TDL, _f, _event_of, _short_event, _pnl_span,
-                             load_json, own_book, fetch_own_fills,
-                             current_mids, pnl_windows, status_summary,
-                             load_credit_ledger, STATE_PATH, STATUS_PATH,
-                             FILL_LOOKBACK_HOURS)
+                             load_json, own_book, current_mids,
+                             load_credit_ledger, STATE_PATH)
 
 # Compact family labels; anything unmatched falls back to the Kalshi event
 # title (fetched + cached below), so new Carbon Arc self-extensions read
@@ -801,22 +802,10 @@ def build_report(now_utc):
     imm.load_finecon_extra_series()
     fin = imm.FINECON_SERIES
 
-    status = load_json(STATUS_PATH)
     state = load_json(STATE_PATH)
-    ss = status_summary(status)
-    our_ids = set(state.get("our_order_ids") or {})
-
-    fills = fetch_own_fills(client, our_ids, FILL_LOOKBACK_HOURS)
     pos, avg = own_book(state)
-    touched = {f.get("ticker", "") for f in fills} | set(pos)
-    mids, results = current_mids(client, touched)
-    # pnl_windows keeps this email's basis identical to the digest's; its
-    # per-event past-day window is NO LONGER the row P&L's realized term
-    # (see realized_for) but the call stays, so the two reports still walk
-    # the same validated path.
-    w = pnl_windows(client, state, our_ids, fills, mids, results,
-                    ss["reward_lifetime"])
-    day_ev = w["day"]["events"]
+    # marks for the open book: every MTM below reads held tickers only
+    mids, _results = current_mids(client, set(pos))
     try:
         acct_real, acct_pos = account_realized(client)
     except Exception as e:                                  # noqa: BLE001
@@ -929,8 +918,8 @@ def build_report(now_utc):
         earn = sum(_f(accrued.get(t)) for t in tickers)
         # P&L per event: open-book MTM on held inventory (this book almost
         # never sells, so MTM is the P&L; the sum over all held markets
-        # equals the digest's lifetime unrealized) + any realized/settlement
-        # booked for the event in the past-day window.
+        # equals the digest's lifetime unrealized) + lifetime realized
+        # (realized_for, below).
         mtm = 0.0
         for t in tickers:
             p = _f(pos.get(t))
