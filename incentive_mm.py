@@ -42,8 +42,9 @@ Guards (all deliberate, see INCENTIVE_MM_HANDOFF.md):
     cancel both sides, stand down 60 min, urgent alert (insider sweep).
   - Price band 3..97c, mid band 5..95c, max join spread 25c, min volume.
   - Inventory skew: |pos|>=30 halves the accumulating side, >=60 pulls it.
-  - Daily realized-loss halt (default -$50) cancels everything until the
-    next ET day. A HALT file in the status dir does the same on demand.
+  - Daily loss halt (realized + MTM, IMM_DAILY_LOSS_LIMIT) cancels everything
+    until the next 5am-CT roll, when its counter resets. A HALT file in the
+    status dir does the same on demand.
   - Fail-safe: 4 consecutive errored cycles cancel every resting order.
     TTL (600s) bounds orphan risk if the process dies uncleanly.
 
@@ -2392,7 +2393,7 @@ WINDDOWN_DROPPED = os.environ.get("IMM_WINDDOWN_DROPPED", "0") == "1"
 # window (per-series via SeriesOverride.pre_cutoff_reduce_only_secs).
 PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 0)
 
-DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 1200.0)  # realized+unrealized $, halts to next ET day (user raises: 50->150 7/14; ->500 7/19; ->800 7/20; ->1200 7/21)
+DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 1200.0)  # realized+unrealized $, halts until the next 5am-CT roll (user raises: 50->150 7/14; ->500 7/19; ->800 7/20; ->1200 7/21)
 MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 2000)  # 450->1000->2000
 #   (Jack 2026-07-23: universe grew to ~263 mkts/50 events wanting >1300 orders;
 #   1000 pinned + order_cap alerts every cycle starved the low-yield tail like
@@ -6286,6 +6287,21 @@ def _halt_day_key(now_utc: datetime) -> str:
     """The 5am-CT roll day the halt/carry/balance anchors belong to."""
     return (now_utc.astimezone(CT)
             - timedelta(hours=SUMMARY_HOUR_CT)).date().isoformat()
+
+
+def _next_roll_utc(now_utc: datetime) -> datetime:
+    """The next 5am-CT roll after now_utc: the moment _halt_day_key changes
+    and the daily counters reset. The daily-loss, balance-floor and open-scan
+    halts last until here (Jack 2026-10-01). They used to lift at ET
+    midnight, five hours before their counters reset, so a halted bot woke
+    into the same roll day's loss and halted again until the NEXT midnight:
+    a trip at 2pm ET idled the bot ~34 hours, through all of the next day."""
+    ct = now_utc.astimezone(CT)
+    day = ct.date() if ct.hour < SUMMARY_HOUR_CT else ct.date() + timedelta(days=1)
+    # localize, not replace(): a pytz zone keeps the old UTC offset through
+    # replace() and timedelta math, an hour off across a DST change
+    return CT.localize(datetime(day.year, day.month, day.day, SUMMARY_HOUR_CT)) \
+        .astimezone(timezone.utc)
 
 
 def log(msg: str) -> None:
@@ -10484,7 +10500,7 @@ class BotState:
     #   -> {ts, ok, why, bars, range, jump, vol} (TTL SCAN_HISTORY_TTL_SECS)
     scan_series_meta: Dict[str, dict] = field(default_factory=dict)  # series
     #   -> {ts, ok, why, category} (TTL SCAN_SERIES_META_TTL_SECS)
-    scan_halt_day: str = ""         # ET date the tier's loss budget tripped
+    scan_halt_day: str = ""         # roll day (_halt_day_key) the tier's loss budget tripped
     scan_pnl_baseline: Optional[float] = None   # NOT persisted: anchored on
     #   the first measurement of each process (like day_baseline)
     scan_pnl_carry: float = 0.0     # tier P&L today carried across restarts
@@ -12729,7 +12745,7 @@ class IncentiveMarketMaker:
         # drops its members from the candidate list (they were deselected
         # when the budget tripped).
         if scan_metas:
-            _et_today = now_utc.astimezone(ET).date().isoformat()
+            _roll_day = _halt_day_key(now_utc)
             # AVERAGE 24h volume per market on the event (Jack 2026-09-06),
             # over the bulk-read siblings — pinned/one-sided strikes
             # included, which is the point: they are part of how busy the
@@ -12744,7 +12760,7 @@ class IncentiveMarketMaker:
             ev_vol24 = {ev: _ev_sum[ev] / _ev_n[ev] for ev in _ev_sum}
             budget = {"series": SCAN_MAX_SERIES_FETCHES,
                       "history": SCAN_MAX_HISTORY_FETCHES}
-            scan_halted = self.state.scan_halt_day == _et_today
+            scan_halted = self.state.scan_halt_day == _roll_day
             scan_metas.sort(key=lambda mm: -mm[0].dollars_per_day)
             # MEMBER POLICY RE-TEST FIRST (2026-09-24): the series-read
             # budget goes to the book the bot is actually quoting before any
@@ -13550,7 +13566,7 @@ class IncentiveMarketMaker:
                 + (f"(+{self.state.scan_admits_today}/{SCAN_DAILY_OPENINGS} "
                    f"openings used today" if SCAN_DAILY_OPENINGS > 0
                    else f"(hard cap {scan_ceiling()}")
-                + (", HALTED today" if self.state.scan_halt_day == et_today else "")
+                + (", HALTED today" if self.state.scan_halt_day == _halt_day_key(now_utc) else "")
                 + f"); rejects {dict(sorted(scan_skips.items()))}")
 
     # ---- Carbon Arc name-pattern families (2026-09-22) ---------------------
@@ -14768,16 +14784,15 @@ class IncentiveMarketMaker:
         drop = self.state.balance_day_start - bal
         if drop < BALANCE_DROP_HALT:
             return False
-        next_day_et = (now_utc.astimezone(ET) + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0)
-        self.state.halted_until = next_day_et.astimezone(timezone.utc).timestamp()
+        # until the roll that re-anchors balance_day_start (_next_roll_utc)
+        self.state.halted_until = _next_roll_utc(now_utc).timestamp()
         n = self.cancel_all_bot_orders()
         self._save_persist()
         self.alerter.alert(
             "balance_floor", f"ACCOUNT balance dropped ${drop:.0f} since the "
             f"daily anchor (${self.state.balance_day_start:.0f} -> ${bal:.0f}) "
             f">= ${BALANCE_DROP_HALT:.0f}; cancelled {n} IMM orders and halted "
-            f"to next ET day. NOTE: the account is shared — the cause may be "
+            f"until the {SUMMARY_HOUR_CT}am CT roll. NOTE: the account is shared — the cause may be "
             f"another bot, manual trading, or a withdrawal. --clear-halt to "
             f"resume deliberately.", key="balance_floor")
         return True
@@ -14793,6 +14808,13 @@ class IncentiveMarketMaker:
         # Book-log rows from this cycle join cycle_log on (cycle_ts, ticker):
         # same format as the cycle_log `ts` column.
         self._book_cycle_ts = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        # The 5am-CT roll (summary, counters, loss budgets, balance anchor)
+        # runs FIRST, so the first cycle of a roll day -- full or fast-lane --
+        # measures the fresh day before any halt or loss check. Run after the
+        # cycle, a halt lasting until the roll woke into yesterday's counters
+        # and tripped again (2026-10-01).
+        self.alerter.maybe_daily_summary(now_utc, self.build_daily_summary)
 
         if os.path.exists(HALT_FILE):
             n = self.cancel_all_bot_orders()
@@ -16138,16 +16160,15 @@ class IncentiveMarketMaker:
         pnl_today = total_pnl - self.state.day_baseline + self.state.pnl_carry
         self.state.pnl_today_last = pnl_today
         if pnl_today <= -DAILY_LOSS_LIMIT:
-            next_day_et = (now_utc.astimezone(ET) + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0)
-            self.state.halted_until = next_day_et.astimezone(timezone.utc).timestamp()
+            # until the roll that resets this counter (_next_roll_utc)
+            self.state.halted_until = _next_roll_utc(now_utc).timestamp()
             n = self.cancel_all_bot_orders()
             self.alerter.alert(
                 "loss_halt", f"P&L today ${pnl_today:.2f} (realized ${realized:.2f}, "
                 f"unrealized ${unrealized:+.2f} on "
                 f"{self.pnl.inventory_contracts():.0f} carried) <= "
                 f"-${DAILY_LOSS_LIMIT:.0f}; cancelled {n} orders, halted until "
-                f"next ET day", key="loss_halt")
+                f"the {SUMMARY_HOUR_CT}am CT roll", key="loss_halt")
             if not fast_only:
                 self._write_cycle_log(cycle_rows)
             return
@@ -16156,7 +16177,8 @@ class IncentiveMarketMaker:
         # MTM today over every market it ever admitted (scan_book), carried
         # across restarts like pnl_today. Tripping it deselects every scan
         # member (inventory winds down reduce-only) and blocks admissions
-        # until the next ET day. The whole-book halt above is untouched —
+        # until the 5am-CT roll that resets it (keyed by _halt_day_key, not
+        # the ET date, since 2026-10-01). The whole-book halt above is untouched —
         # this bounds the blast radius of an unreviewed universe on its own.
         if SCAN_DAILY_LOSS_LIMIT > 0 and self.state.scan_book and not fast_only:
             scan_total = self._scan_book_pnl()
@@ -16165,11 +16187,11 @@ class IncentiveMarketMaker:
             scan_today = (scan_total - self.state.scan_pnl_baseline
                           + self.state.scan_pnl_carry)
             self.state.scan_pnl_today_last = scan_today
-            _et_day = now_utc.astimezone(ET).date().isoformat()
+            _roll_day = _halt_day_key(now_utc)
             if scan_today <= -SCAN_DAILY_LOSS_LIMIT \
-                    and self.state.scan_halt_day != _et_day \
+                    and self.state.scan_halt_day != _roll_day \
                     and self.state.scan_members:
-                self.state.scan_halt_day = _et_day
+                self.state.scan_halt_day = _roll_day
                 halted_ids = set(self.state.scan_members)
                 n_cx = 0
                 for t_h in sorted(halted_ids):
@@ -16183,7 +16205,7 @@ class IncentiveMarketMaker:
                     f"open-scan tier P&L today ${scan_today:+.2f} <= "
                     f"-${SCAN_DAILY_LOSS_LIMIT:.0f}; cancelled {n_cx} orders on "
                     f"{len(halted_ids)} scan member(s) and closed the tier "
-                    f"until the next ET day (inventory winds down reduce-only)",
+                    f"until the {SUMMARY_HOUR_CT}am CT roll (inventory winds down reduce-only)",
                     key="scan_halt")
                 self._save_persist()
 
@@ -16643,8 +16665,7 @@ class IncentiveMarketMaker:
                 else 0),
             "scan_evicted_events": len(s.scan_evicted_events),
             "scan_hopeless_barred": len(s.scan_hopeless_barred),
-            "scan_halted_today": (
-                s.scan_halt_day == now_utc.astimezone(ET).date().isoformat()),
+            "scan_halted_today": s.scan_halt_day == _halt_day_key(now_utc),
             "scan_pnl_today": round(s.scan_pnl_today_last, 2),
             "programs_seen": s.programs_count,
             "markets_line": s.last_markets_line,
@@ -17632,7 +17653,7 @@ class IncentiveMarketMaker:
                                 f"cycle errors (last: {e!r:.120}); cancelled all",
                                 key="failsafe")
                 now_utc = datetime.now(timezone.utc)
-                self.alerter.maybe_daily_summary(now_utc, self.build_daily_summary)
+                # (the daily roll runs at the top of run_cycle, before the halts)
                 self.write_status(now_utc)
                 # ...or during the cycle that just ran (RESTART_REQUEST_FILE)
                 if not once and not stopping["flag"] and self._restart_requested():

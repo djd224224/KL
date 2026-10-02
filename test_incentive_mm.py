@@ -3819,6 +3819,78 @@ class TestBalanceFloor(unittest.TestCase):
         self.assertEqual(bot.state.halted_until, 0.0)
 
 
+class TestHaltUntilRoll(unittest.TestCase):
+    """Jack 2026-10-01: the daily-loss, balance-floor and open-scan halts last
+    until the 5am-CT roll that resets their counters. They used to lift at ET
+    midnight, five hours early, wake into the same roll day's breach and halt
+    again until the next midnight -- through the whole next day."""
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    @staticmethod
+    def _ct(y, mo, d, h, mi=0):
+        return imm.CT.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
+
+    def test_next_roll_is_the_next_5am_ct(self):
+        ct = self._ct
+        self.assertEqual(imm._next_roll_utc(ct(2026, 10, 1, 14)), ct(2026, 10, 2, 5))
+        self.assertEqual(imm._next_roll_utc(ct(2026, 10, 2, 4, 59)), ct(2026, 10, 2, 5))
+        self.assertEqual(imm._next_roll_utc(ct(2026, 10, 2, 5)), ct(2026, 10, 3, 5))
+        # the halt-day key turns over at that same instant
+        r = imm._next_roll_utc(ct(2026, 10, 1, 14))
+        self.assertNotEqual(imm._halt_day_key(r - timedelta(seconds=1)),
+                            imm._halt_day_key(r))
+        # 5am on the wall clock across both DST changes (2am Mar 8 / Nov 1)
+        self.assertEqual(imm._next_roll_utc(ct(2026, 3, 7, 12)),
+                         datetime(2026, 3, 8, 10, tzinfo=timezone.utc))     # CDT
+        self.assertEqual(imm._next_roll_utc(ct(2026, 10, 31, 12)),
+                         datetime(2026, 11, 1, 11, tzinfo=timezone.utc))    # CST
+
+    def test_loss_halt_lasts_until_the_roll(self):
+        bot = self._bot()
+        bot.state.pnl_carry = -(imm.DAILY_LOSS_LIMIT + 5)
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        until = datetime.fromtimestamp(bot.state.halted_until, timezone.utc).astimezone(imm.CT)
+        self.assertEqual((until.hour, until.minute), (imm.SUMMARY_HOUR_CT, 0))
+        self.assertTrue(0 < bot.state.halted_until - time.time() <= 25 * 3600)
+
+    def test_balance_floor_halt_lasts_until_the_roll(self):
+        bot = self._bot()
+        now = datetime.now(timezone.utc)
+        bot.client.get_balance = lambda: {"balance_dollars": "6000.00"}
+        bot._check_balance_floor(now)
+        bot.client.get_balance = lambda: {"balance_dollars":
+                                          str(6000.0 - imm.BALANCE_DROP_HALT)}
+        self.assertTrue(bot._check_balance_floor(now))
+        self.assertEqual(bot.state.halted_until, imm._next_roll_utc(now).timestamp())
+
+    def test_halted_bot_wakes_into_a_fresh_day_at_the_roll(self):
+        bot = self._bot()
+        bot.state.universe_at = time.time()
+        bot.run_cycle()                               # anchors the alerter's roll day
+        now_ct = datetime.now(timezone.utc).astimezone(imm.CT)
+        hour = imm.SUMMARY_HOUR_CT
+        imm.SUMMARY_HOUR_CT = now_ct.hour             # a roll falls due this hour
+        try:
+            # yesterday's breach, its halt just expired, today's roll not run yet
+            bot.alerter.last_summary_date = now_ct.date() - timedelta(days=1)
+            bot.state.pnl_carry = -(imm.DAILY_LOSS_LIMIT + 5)
+            bot.state.halted_until = time.time() - 1
+            bot.run_cycle()
+            self.assertLess(bot.state.halted_until, time.time())     # quoting again
+            self.assertEqual(bot.state.pnl_carry, 0.0)                # fresh counter
+            self.assertNotIn("loss_halt", [c for c, _m in bot.alerter.today])
+            # within a roll day the same breach still halts
+            bot.state.pnl_carry = -(imm.DAILY_LOSS_LIMIT + 5)
+            bot.run_cycle()
+            self.assertGreater(bot.state.halted_until, time.time())
+        finally:
+            imm.SUMMARY_HOUR_CT = hour
+
+
 class TestWatchdog(unittest.TestCase):
     def test_selected_but_not_resting_pages(self):
         _clean_persist()
@@ -12618,7 +12690,7 @@ class TestOpportunisticEmail(unittest.TestCase):
                          "eligible (slots/ROI/live screens)")
         bot.state.scan_series_strikes["KXNOVEL"] = [time.time(), time.time()]
         self.assertEqual(qg.scan_gap_label(bot, t, now), "series_struck")
-        bot.state.scan_halt_day = now.astimezone(imm.ET).date().isoformat()
+        bot.state.scan_halt_day = imm._halt_day_key(now)
         self.assertEqual(qg.scan_gap_label(bot, t, now), "tier halted today")
         bot.state.scan_evicted_events["KXNOVEL-99DEC31"] = time.time()
         self.assertEqual(qg.scan_gap_label(bot, t, now), "evicted")
@@ -14582,8 +14654,8 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(bot.state.scan_pnl_baseline, 0.0)
         bot.pnl.realized[self.A] = -(imm.SCAN_DAILY_LOSS_LIMIT + 1)
         bot.run_cycle()
-        today_et = datetime.now(timezone.utc).astimezone(imm.ET).date().isoformat()
-        self.assertEqual(bot.state.scan_halt_day, today_et)
+        roll_day = imm._halt_day_key(datetime.now(timezone.utc))
+        self.assertEqual(bot.state.scan_halt_day, roll_day)
         self.assertEqual(bot.state.scan_members, set())
         self.assertNotIn(self.A, bot.state.selected)
         self.assertNotIn(self.B, bot.state.selected)
@@ -14603,8 +14675,8 @@ class TestOpenScanTier(unittest.TestCase):
         # the halt day persists across a restart
         bot._save_persist()
         bot2 = IncentiveMarketMaker(client=bot.client, live=False)
-        self.assertEqual(bot2.state.scan_halt_day, today_et)
-        # next ET day: the tier re-opens and admits again
+        self.assertEqual(bot2.state.scan_halt_day, roll_day)
+        # next roll day: the tier re-opens and admits again
         bot.state.scan_halt_day = "2000-01-01"
         bot.state.scan_pnl_baseline = None
         bot.state.universe_at = 0.0

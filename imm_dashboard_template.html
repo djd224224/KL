@@ -1374,8 +1374,8 @@ function meter(label, val, limit, note) {
 function renderRisk() {
   const b = D.bot, hl = D.halts, now = Date.now() / 1000;
   $("meters").innerHTML =
-    meter("Bot-day P&amp;L (since 5am CT)", b.pnl_today, b.loss_limit, "The bot's own counter, which drives the halt. Rebuilt for the same span: " + (b.roll_pnl_ours != null ? fmtUSD(b.roll_pnl_ours, { sign: true }) : "n/a") + " trading, " + fmtUSD(b.roll_rew_ours) + " rewards (bot says " + fmtUSD(b.reward_est_today) + "). The counter drops P&L across restarts and never books scalar settlements.") +
-    meter("Open-scan tier P&amp;L today", b.scan_pnl, b.scan_loss_limit, b.scan_halted ? "Scan tier halted for the day." : "");
+    meter("Bot-day P&amp;L (since 5am CT)", b.pnl_today, b.loss_limit, "The bot's own count of trading P&amp;L (realized plus marks, no rewards). At the limit it cancels every order and stops quoting until the 5am CT reset. Rebuilt for the same span: " + (b.roll_pnl_ours != null ? fmtUSD(b.roll_pnl_ours, { sign: true }) : "n/a") + " trading, " + fmtUSD(b.roll_rew_ours) + " rewards (bot says " + fmtUSD(b.reward_est_today) + "). The counter misses P&amp;L that moves while the bot restarts.") +
+    meter("Open-scan tier P&amp;L today", b.scan_pnl, b.scan_loss_limit, b.scan_halted ? "Scan tier halted until the 5am CT reset; the rest of the book keeps quoting." : "Realized plus marks on the markets the scan tier took on. At the limit only that tier stops, until the 5am CT reset.");
   const hrows = [];
   hl.side.forEach((x) => hrows.push({ type: "Toxic side", what: x.t, side: x.side, until: x.until, detail: "2 pick-offs on this side in 24h" }));
   hl.event.forEach((x) => hrows.push({ type: "Toxic event", what: x.ev, side: "both", until: x.until, detail: "pick-offs across markets of the event" }));

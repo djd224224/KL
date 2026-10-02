@@ -380,7 +380,7 @@ def scan_gap_label(bot, t: str, now_utc: datetime, meta=None) -> str:
     ev = _event_of(t)
     if ev in st.scan_evicted_events:
         return "evicted"
-    if st.scan_halt_day == now_utc.astimezone(imm.ET).date().isoformat():
+    if st.scan_halt_day == imm._halt_day_key(now_utc):
         return "tier halted today"
     strikes = [x for x in st.scan_series_strikes.get(imm.series_of(t), [])
                if now_utc.timestamp() - x < imm.SCAN_SERIES_STRIKE_TTL_SECS]

@@ -232,7 +232,7 @@ not $200. Deliberate.
 | Reduce-only tail | market deselected but \|pos\| ≥5 | keep quoting *only* the reducing side, ≤\|pos\| |
 | Crossed/locked or >25c external book | — | cancel market this cycle |
 | Zero-reward bench | est. reward share 0 for 30 cycles (book below target size) | bench 4h |
-| **Daily loss halt** | realized P&L **today** ≤ −$50 (this bot's fills only; baseline rolls at the 6 AM ET summary, so banked profit can't mask a bad day and yesterday's breach can't re-halt today) | cancel everything, idle until next ET day, urgent email |
+| **Daily loss halt** | realized + MTM P&L **today** ≤ −`IMM_DAILY_LOSS_LIMIT` ($1,200; this bot's book only, rewards excluded; baseline rolls at the 5 AM CT / 6 AM ET summary, so banked profit can't mask a bad day and yesterday's breach can't re-halt today) | cancel everything, idle until that 5 AM CT roll (`_next_roll_utc`; until 2026-10-01 it lifted at ET midnight, re-tripped on the same day's counter and idled through the next day), urgent email |
 | `HALT` file | `run-logs\incentive-mm\HALT` exists | cancel everything, idle until removed |
 | **Rain-fair gate** (2026-07-28) | KXRAIN daily whose touch fights the NWS fair: bid touch > fair+10c or ask touch < fair−10c | cancel market both sides, sticky-selected, auto-resumes when book and forecast re-agree; quotes are never re-priced (at-touch or nothing) |
 | Fail-safe | 4 consecutive cycle errors | cancel all resting, exponential backoff; wake-grace 120s after suspend/resume |
@@ -1025,7 +1025,8 @@ The backstop that is ON: the **tier loss budget** — the tier's own
 realized + MTM today over every market it ever admitted (`scan_book`;
 flat, departed markets leave it only at the daily roll, so a settlement
 loss booked mid-day stays in that day's figure) <= -$75 -> every scan
-member deselected, tier closed until the next ET day (`scan_halt_day`),
+member deselected, tier closed until the 5am-CT roll (`scan_halt_day`, a
+`_halt_day_key` roll day since 2026-10-01, the ET date before),
 urgent alert `scan_halt`. Carried across restarts like pnl_today
 (`scan_pnl_carry`, same 5am-CT roll). The whole-book $1,200 halt is
 untouched — this bounds the blast radius of an unreviewed universe on its

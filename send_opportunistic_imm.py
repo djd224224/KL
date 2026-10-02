@@ -1061,7 +1061,7 @@ def build_report(now_utc):
     scan_openings_cap = getattr(imm, "SCAN_DAILY_OPENINGS", 0)
     scan_used = (int(_f(state.get("scan_admits_today")))
                  if state.get("scan_admit_day") == today_et.isoformat() else 0)
-    scan_halted = state.get("scan_halt_day") == today_et.isoformat()
+    scan_halted = state.get("scan_halt_day") == imm._halt_day_key(now_utc)
     scan_evicted = len(state.get("scan_evicted_events") or {})
     # One section per tier, same table format (Jack 2026-09-06).
     tiers = [

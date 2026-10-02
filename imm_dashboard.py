@@ -1998,7 +1998,9 @@ class Builder:
                 "loss_limit": _f(self.env.get("IMM_DAILY_LOSS_LIMIT"), 1200.0),
                 "scan_loss_limit": _f(self.env.get("IMM_SCAN_DAILY_LOSS_LIMIT"), 200.0),
                 "scan_pnl": _f(st.get("scan_pnl_carry")),
-                "scan_halted": bool(st.get("scan_halt_day")),
+                # the bot's own verdict (roll-day keyed); scan_halt_day keeps
+                # the last trip's day forever, so its mere presence is no halt
+                "scan_halted": bool(stat.get("scan_halted_today")),
                 "halted_until": _f(st.get("halted_until")),
                 "markets_line": stat.get("markets_line", ""),
                 "selected": len(selected), "scan_slots": stat.get("scan_slots"),
