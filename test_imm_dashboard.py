@@ -89,6 +89,52 @@ class FamilyTests(unittest.TestCase):
         self.assertEqual(dash.family_of("KXRAIN", "Economics")[0], "Weather & quakes")
 
 
+class ProjectionTests(unittest.TestCase):
+    """Jack 2026-10-02: "show the projected full-day total on the card, not
+    run-rate". The rest of the day at the size the bot will quote each hour."""
+
+    NOW = datetime(2026, 10, 2, 8, 30, tzinfo=dash.ET).timestamp()     # Friday, quiet hours
+
+    @staticmethod
+    def quiet(ser, ts):                       # 0-9 ET at x2, day size after
+        return 2.0 if datetime.fromtimestamp(ts, dash.ET).hour < 10 else 1.0
+
+    def test_share_at(self):
+        self.assertEqual(dash.share_at(0.3, 1.0), 0.3)
+        self.assertEqual(dash.share_at(0.0, 2.0), 0.0)
+        self.assertAlmostEqual(dash.share_at(0.5, 2.0), 2 / 3)
+        self.assertAlmostEqual(dash.share_at(0.1, 0.5), 0.05 / 0.95)
+        self.assertAlmostEqual(dash.share_at(1e-6, 3.0), 3e-6, places=9)
+
+    def test_the_day_hours_run_at_day_size(self):
+        # $24/day at a 10% share = $1/hour: 08:30-10:00 at today's x2, then
+        # 14 hours at x1, where the share is 0.05 / 0.95
+        rows = [("KXA-26-X", 0.1, 240.0, 2.0, None)]
+        day = 240.0 * (0.05 / 0.95) / 24.0
+        self.assertAlmostEqual(dash.project_rest_of_day(rows, self.NOW, self.quiet),
+                               1.5 + 14 * day, places=6)
+
+    def test_a_market_stops_at_its_cutoff(self):
+        stop = datetime(2026, 10, 2, 12, 0, tzinfo=dash.ET).timestamp()
+        rows = [("KXA-26-X", 0.1, 240.0, 2.0, stop)]
+        day = 240.0 * (0.05 / 0.95) / 24.0
+        self.assertAlmostEqual(dash.project_rest_of_day(rows, self.NOW, self.quiet),
+                               1.5 + 2 * day, places=6)
+
+    def test_without_the_schedule_the_current_size_holds(self):
+        rows = [("KXA-26-X", 0.1, 240.0, 2.0, None)]
+        self.assertAlmostEqual(dash.project_rest_of_day(rows, self.NOW, None), 15.5, places=6)
+        # the bot logged x1 where the schedule says x2 (an open-scan member, a
+        # structural daily): the schedule does not know this market
+        rows = [("KXA-26-X", 0.1, 240.0, 1.0, None)]
+        self.assertAlmostEqual(dash.project_rest_of_day(rows, self.NOW, self.quiet), 15.5, places=6)
+
+    def test_the_day_ends_at_et_midnight(self):
+        late = datetime(2026, 10, 2, 23, 30, tzinfo=dash.ET).timestamp()
+        rows = [("KXA-26-X", 0.1, 240.0, 1.0, None), ("KXB-26-Y", 0.0, 500.0, 1.0, None)]
+        self.assertAlmostEqual(dash.project_rest_of_day(rows, late, self.quiet), 0.5, places=6)
+
+
 class WindowTests(unittest.TestCase):
     def test_et_days_and_roll(self):
         now = _ts("2026-09-28T20:00:00Z")          # 4 PM EDT
@@ -511,6 +557,20 @@ class BuilderIntegrationTests(unittest.TestCase):
         m = dash.Builder(self.NOW, api=False, api_force=False).build()
         # KXA-1 is both selected and in the last cycle
         self.assertEqual(m["halts"]["by_market"]["KXA-1"].count("toxic event halt"), 1)
+
+    def test_no_projection_while_the_bot_is_not_cycling(self):
+        # the fixture's last cycle is 04:01Z, sixteen hours before NOW
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        self.assertIn("not cycling since 00:01 ET", m["proj"]["na"])
+        from unittest import mock
+        b = dash.Builder(_ts("2026-09-28T04:05:00Z"), api=False, api_force=False)
+        with mock.patch.object(dash, "_imm_mod", None):
+            p = b.build()["proj"]
+        # no bot module (the API sections import it): current size all day
+        self.assertFalse(p["sched"])
+        self.assertEqual(p["markets"], 1)
+        # KXA-1 at 0.1 x $864/day from 00:05 ET to midnight
+        self.assertAlmostEqual(p["rest"], 0.1 * 864 * (86400 - 300) / 86400, places=2)
 
     def test_summary_is_the_cards_own_sums(self):
         # the morning email reads this file (Jack 2026-10-02: "yesterday RAW

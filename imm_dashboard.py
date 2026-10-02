@@ -920,6 +920,65 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
 
 
 # ----------------------------------------------------------------------------
+# The Modeled-rewards card's projected full day: the bot's current book
+# carried to midnight ET
+# ----------------------------------------------------------------------------
+
+PROJ_MAX_CYCLE_AGE_S = 900.0     # no cycle this recent: the bot is not quoting
+
+
+def share_at(frac: float, k: float) -> float:
+    """Our share of a pool at k times our resting size, the rest of the book
+    unchanged: k f / (1 + (k - 1) f). On 2026-10-02 it put the 10:00 ET size
+    drop (x2 -> x1) at $751/day against the $788/day the bot then logged;
+    halving said $733."""
+    if frac <= 0 or k == 1.0:
+        return frac
+    return k * frac / (1.0 + (k - 1.0) * frac)
+
+
+def project_rest_of_day(rows, now: float, mult_at=None, end: float = None) -> float:
+    """Modeled rewards from `now` to 00:00 ET tomorrow if the book holds
+    (Jack 2026-10-02: "show the projected full-day total on the card, not
+    run-rate"). Every market of the bot's last cycle earns its pool at its
+    current share, re-scaled each ET hour to the size the bot quotes then
+    (share_at, k = mult_at(series, epoch) / its multiplier now), until its
+    stop (cutoff or program end). mult_at None, or a market whose multiplier
+    now the schedule does not reproduce (the bot's runtime state: open-scan
+    members, structural dailies), keeps its current size all day.
+      rows: [(ticker, est_frac, pool $/day, hour_mult now, stop epoch or None)]"""
+    if end is None:
+        end = et_midnight(datetime.fromtimestamp(now, ET).date() + timedelta(days=1))
+    slots, t = [], now
+    while t < end:
+        nxt = min((math.floor(t / 3600.0) + 1) * 3600.0, end)
+        slots.append((t, nxt))
+        t = nxt
+    cache = {}
+
+    def mult(ser, ts):
+        key = (ser, int(ts // 3600))
+        if key not in cache:
+            cache[key] = _f(mult_at(ser, ts), 1.0)
+        return cache[key]
+
+    total = 0.0
+    for tkr, frac, pool, hm, stop in rows:
+        if frac <= 0 or pool <= 0:
+            continue
+        ser = series_of(tkr)
+        scaled = mult_at is not None and hm > 0 and abs(mult(ser, now) - hm) < 1e-9
+        for a, b in slots:
+            if stop is not None:
+                if a >= stop:
+                    break
+                b = min(b, stop)
+            k = mult(ser, (a + b) / 2.0) / hm if scaled else 1.0
+            total += pool * share_at(frac, k) * (b - a) / 86400.0
+    return total
+
+
+# ----------------------------------------------------------------------------
 # marks: 5-minute snapshots of every open own-book position
 # ----------------------------------------------------------------------------
 
@@ -2758,6 +2817,7 @@ class Builder:
 
         health = self._health(cycle_ts)
         opp = self._opportunities(selected, cur) if self.api else {"off": True}
+        proj = self.projection(snap_by_t, cycle_ts)     # after the API import: the size schedule
         self._t("assemble", t0)
 
         roll = wins["roll"]
@@ -2773,7 +2833,7 @@ class Builder:
             "markets": markets, "events": events, "paths": per_market_paths,
             "curves": curves, "history": hist, "ledger_max": ledger_max,
             "days": days, "day_fields": list(DAY_FIELDS), "fx_keys": list(FX_KEYS),
-            "fcurves": fcurves, "changes": changes, "realize": realize,
+            "fcurves": fcurves, "changes": changes, "realize": realize, "proj": proj,
             "struct_cover": self._struct_cover(held),
             "fills": fills_out, "halts": halts, "health": health, "opp": opp,
             "exits": [{"ts": round(e["ts"]), "t": e["t"], "pos": round(e["pos"], 2),
@@ -3002,6 +3062,43 @@ class Builder:
             "snapshot_ts": self.snapshot_ts, "guard_run": self.guard_run,
             "marks_last": self.last_snap[0], "halt_file": os.path.exists(os.path.join(STATUS_DIR, "HALT")),
         }
+
+    # ---- projected full day ----------------------------------------------------
+    def projection(self, snap_by_t, cycle_ts) -> dict:
+        """The Modeled-rewards card's projection (project_rest_of_day) from
+        the bot's last full cycle: {"rest": $ still to come today, "rate":
+        $/day at this cycle's size, "markets", "stopping": markets that stop
+        before midnight, "sched": the bot's size schedule applied} or
+        {"na": why}. The schedule is incentive_mm.hour_size_mult, loaded with
+        the launcher env by the API sections; without it every market keeps
+        its current size."""
+        if not self.last_cycle:
+            return {"na": "no quoting cycle logged"}
+        if self.now - cycle_ts > PROJ_MAX_CYCLE_AGE_S:
+            return {"na": "bot not cycling since "
+                    + datetime.fromtimestamp(cycle_ts, ET).strftime("%H:%M ET")}
+        imm = _imm_mod if hasattr(_imm_mod, "hour_size_mult") else None
+        mult_at = None if imm is None else (
+            lambda ser, ts: imm.hour_size_mult(ser, datetime.fromtimestamp(ts, timezone.utc)))
+        end = et_midnight(datetime.fromtimestamp(self.now, ET).date() + timedelta(days=1))
+        rows, rate, stopping = [], 0.0, 0
+        for t, r in self.last_cycle.items():
+            frac, pool = _f(r.get("est_frac")), _f(r.get("pool_per_day"))
+            sr = snap_by_t.get(t) or {}
+            stops = [x for x in (iso_ts(sr.get("cutoff")), iso_ts(sr.get("program_end"))) if x > 0]
+            stop = min(stops) if stops else None
+            if frac > 0 and stop is not None and stop < end:
+                stopping += 1
+            rate += frac * pool
+            rows.append((t, frac, pool, _f(r.get("hour_mult"), 1.0), stop))
+        try:
+            rest = project_rest_of_day(rows, self.now, mult_at, end)
+        except Exception as e:                  # a schedule error must not cost the page
+            log(f"! projection with the size schedule failed ({e!r}); current size kept")
+            rest, mult_at = project_rest_of_day(rows, self.now, None, end), None
+        return {"rest": round(rest, 2), "rate": round(rate, 2),
+                "markets": sum(1 for _t, f, _p, _h, _s in rows if f > 0),
+                "stopping": stopping, "sched": mult_at is not None}
 
     # ---- opportunities (API) -----------------------------------------------------
     def _opportunities(self, selected, cur):

@@ -1014,6 +1014,21 @@ function sameTimeYesterday() {
   for (const p of cy) { if (p[0] <= target + 1) best = p; }
   return best;
 }
+// The Modeled-rewards card's line under the value (Jack 2026-10-02: "show the
+// projected full-day total on the card, not run-rate"): today only, accrued so
+// far plus the builder's projection to midnight ET (Builder.projection).
+function projLine(w, rew) {
+  const today = W === "today" || (isDay(W) && w.end >= D.generated - 1);
+  if (!today) return '<div class="s">&nbsp;</div>';
+  const p = D.proj || {};
+  if (p.rest == null) return '<div class="s">projected full day n/a' + (p.na ? " (" + esc(p.na) + ")" : "") + "</div>";
+  const tip = "Modeled rewards so far " + fmtUSD(rew) + " + " + fmtUSD(p.rest) + " still to come if the book holds: each of the " +
+    fmtNum(p.markets) + " markets the bot quotes now keeps its share of its pool (" + fmtUSD(p.rate) + "/day at this cycle's size), " +
+    (p.sched ? "rescaled hour by hour to the size the bot quotes then (the quiet-hours and Saturday multipliers), "
+      : "at its current size (the bot's size schedule was not loaded), ") +
+    "until its cutoff or program end (" + fmtNum(p.stopping) + " stop before midnight). A model, before Kalshi's $1-per-market floor; new markets and changes in competition are not in it.";
+  return '<div class="s" title="' + esc(tip) + '">projected full day ' + fmtUSD(rew + p.rest) + "</div>";
+}
 function renderSummary() {
   const a = AGG.tot, w = win(), na = w.pnl_na;
   const rew = a.rew, pnl = a.pnl, net = rew + pnl;
@@ -1029,7 +1044,7 @@ function renderSummary() {
     '<div><div class="lbl">Net impact · ' + esc(w.desc) + '</div><div class="big ' + (na ? "" : cls(net, 0.5)) + '">' + (na ? "n/a" : fmtUSD(net, { sign: true })) + "</div>" +
     '<div class="sub">Modeled rewards plus mark-to-market trading P&amp;L</div></div>' +
     '<div class="split">' +
-    '<div><div class="k"><i class="key" style="background:var(--s-rew)"></i>Modeled rewards</div><div class="v">' + fmtUSD(rew) + '</div><div class="s">now ' + fmtUSD(a.estNow) + "/day run-rate</div>" + spark(last14.map((r) => r.rew), css("--s-rew"), true) + "</div>" +
+    '<div><div class="k"><i class="key" style="background:var(--s-rew)"></i>Modeled rewards</div><div class="v">' + fmtUSD(rew) + "</div>" + projLine(w, rew) + spark(last14.map((r) => r.rew), css("--s-rew"), true) + "</div>" +
     '<div><div class="k"><i class="key" style="background:var(--s-trade)"></i>Trading P&amp;L</div><div class="v ' + (na ? "" : cls(pnl, 0.5)) + '">' + (na ? "n/a" : fmtUSD(pnl, { sign: true })) + '</div><div class="s">realized ' + fmtUSD(a.real, { sign: true }) + " · marks " + fmtUSD(a.du, { sign: true }) + "</div>" + spark(last14.map((r) => r.pnl == null ? null : r.pnl), css("--s-trade"), true) + "</div>" +
     "</div>" + cmp;
   // tiles

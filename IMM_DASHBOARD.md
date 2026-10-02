@@ -28,6 +28,7 @@ every 10 minutes by the `KL imm dashboard` task.
 | Number | Definition | Source |
 |---|---|---|
 | Modeled rewards | the bot's reward estimate (`est_frac x pool_per_day`) integrated over each gap between full cycles, gaps capped at 900 s; exactly `imm_reward_recon._scan_cycle_log`, bucketed by UTC hour | `cycle_log_*.csv` |
+| Projected full day (Today only; replaced the "now $X/day run-rate" line 2026-10-02) | modeled rewards so far + the bot's last full cycle carried to 00:00 ET: each market keeps its share of its pool (`est_frac x pool_per_day`), rescaled every ET hour to the size the bot quotes then (`share_at`: k f / (1 + (k-1) f), k = `incentive_mm.hour_size_mult` then / now; it put 10/2's 10:00 ET drop from x2 to x1 at $751/day against $788 logged), until the market's cutoff or program end. n/a when no cycle in 15 min. A model: before the $1 floor; new markets and competition changes are not in it | `cycle_log_*.csv`, the decision snapshot, the bot's size schedule |
 | Trading P&L | mark-to-market on the bot's own book: realized in the window + change in unrealized between the 5-minute position snapshots at the window's edges + exits the bot does not book (below) | `realized_*`, `marks_*`, `settlements_*`, Kalshi market results |
 | Net | modeled rewards + trading P&L | |
 | Credited | Kalshi credits by credit date (IMM-attributable when the calibration has it) | `reward_credits.csv` |
