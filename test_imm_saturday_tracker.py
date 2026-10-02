@@ -420,6 +420,63 @@ class GateInputsTests(unittest.TestCase):
         self.assertEqual(f.loc["C", "mk"], -10.0)           # last logged mid inside the 24h
 
 
+class DatedQuietWindowTests(unittest.TestCase):
+    """Jack 2026-10-02: the quiet hours go 0-9 ET x2 -> 0-8 ET x3 from
+    2026-10-05 (IMM_HOUR_SIZE_MULT_NEXT / _FROM, read off the clock by the
+    bot). Every block follows its own day's window; hour 9 is day from 10/5."""
+
+    def setUp(self):
+        for p in (mock.patch.object(sat.imm, "HOUR_SIZE_MULTS", sat.imm._parse_hour_mults("0-9:2.0")),
+                  mock.patch.object(sat.imm, "HOUR_SIZE_MULTS_NEXT", sat.imm._parse_hour_mults("0-8:3.0")),
+                  mock.patch.object(sat.imm, "HOUR_SIZE_MULT_FROM", datetime(2026, 10, 5).date())):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_quiet_hours_and_labels_follow_the_day(self):
+        self.assertEqual(sat.quiet_hours("2026-10-04"), frozenset(range(10)))
+        self.assertEqual(sat.quiet_hours("2026-10-05"), frozenset(range(9)))
+        self.assertEqual(sat.block_label("quiet", "2026-10-03"), "0-9 ET")
+        self.assertEqual(sat.block_label("day", "2026-10-03"), "10-23 ET")
+        self.assertEqual(sat.block_label("quiet", "2026-10-10"), "0-8 ET")
+        self.assertEqual(sat.block_label("day", "2026-10-10"), "9-23 ET")
+        # nothing boosted configured -> the blocks keep their historical 0-9
+        with mock.patch.object(sat.imm, "HOUR_SIZE_MULTS", {}), \
+                mock.patch.object(sat.imm, "HOUR_SIZE_MULTS_NEXT", {}):
+            self.assertEqual(sat.quiet_hours("2026-10-10"), sat.QUIET_HOURS)
+
+    def test_gate_blocks_put_hour_9_by_its_own_day(self):
+        days = ("2026-10-02", "2026-10-05")
+        ser = pd.DataFrame([dict(et_date=d, et_hour=h, series="KXTRUMPMENTION", sum_est_usd=240.0,
+                                 sum_quoted=50_000.0, n_rows=50, q_rows=0, hm_sum=0.0)
+                            for d in days for h in (8, 9, 10)])
+        cyc = pd.DataFrame([dict(et_date=d, et_hour=h, n_cycles=50) for d in days for h in (8, 9, 10)])
+        b = sat.gate_blocks(ser, cyc, None, "2026-10-06").set_index(["et_date", "block"])
+        self.assertEqual(b.loc[("2026-10-02", "quiet"), "hours"], 2)     # 8, 9
+        self.assertEqual(b.loc[("2026-10-02", "day"), "hours"], 1)       # 10
+        self.assertEqual(b.loc[("2026-10-05", "quiet"), "hours"], 1)     # 8
+        self.assertEqual(b.loc[("2026-10-05", "day"), "hours"], 2)       # 9, 10
+
+    def test_family_table_uses_each_days_window(self):
+        days = ("2026-10-05", "2026-10-10")
+        ser = pd.DataFrame([dict(et_date=d, et_hour=h, series="KXTRUMPMENTION", sum_est_usd=240.0,
+                                 sum_quoted=(50_000.0 if h == 8 else 999_000.0), n_rows=50, q_rows=0, hm_sum=0.0)
+                            for d in days for h in (8, 9)])
+        cyc = pd.DataFrame([dict(et_date=d, et_hour=h, n_cycles=50) for d in days for h in (8, 9)])
+        gate = {"rows": [dict(saturday="2026-10-10", block="quiet", anchor_dates=["2026-10-05"])]}
+        out = sat.gate_family_table(ser, cyc, None, gate)
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(out[0]["sat"]["ct_h"], 1_000.0)          # 8am only: 9am is day from 10/5
+        self.assertAlmostEqual(out[0]["wk"]["ct_h"], 1_000.0)
+
+    def test_knob_line_states_the_switch(self):
+        before = sat._quiet_hours_line("2026-10-04")
+        self.assertTrue(before.startswith("0-9 ET x2"), before)
+        self.assertIn("from 2026-10-05: 0-8 ET x3", before)
+        after = sat._quiet_hours_line("2026-10-11")
+        self.assertTrue(after.startswith("0-8 ET x3"), after)
+        self.assertIn("since 2026-10-05 (was 0-9 ET x2)", after)
+
+
 class SettlementTests(unittest.TestCase):
     """Scalar / void settlements (2026-09-29): the NFL ladders / escalators
     settle "scalar" at a fractional value and a void refunds cost; load_results

@@ -27,8 +27,9 @@ daily_series.json):
   net/fill    rent/fill - loss/fill (cents)
   net/ct-day  rent per resting contract-day - turnover x loss/fill (cents):
               what a size multiplier actually scales
-  mult        mean cycle-log hour_mult on the group's quoted rows OUTSIDE
-              the 0-9am ET quiet window — proof the multiplier was live
+  mult        mean cycle-log hour_mult on the group's quoted rows from
+              10:00 ET on, outside every quiet window (0-9 ET through
+              10/4, 0-8 ET since) — proof the multiplier was live
               (Saturday long-dated 1.5, everything else 1.0)
 
 grouped per day, pooled by day type (Saturday / Sunday / Weekday) since
@@ -482,8 +483,10 @@ def _derive(a: pd.DataFrame) -> pd.DataFrame:
 # modelled rent minus the 24h mark-out cost of the fills it draws -- above
 # what a weekday contract earns. Every boosted Saturday (9/12 from 10:00 ET:
 # the knob went live ~09:10 ET, so its 0-9 block is not a boosted
-# observation; 9/19; 9/26) is scored per ET block (quiet 0-9 = x2 weekday /
-# x3 Saturday; day 10-23 = x1 / x1.5) against the weekdays of its own Mon-Fri
+# observation; 9/19; 9/26) is scored per ET block (quiet = the hours the
+# bot's global window boosts THAT day, quiet_hours(): 0-9 ET x2 through
+# 2026-10-04, 0-8 ET x3 from 10-05 -- Saturday multiplies on top; day = the
+# rest of the day) against the weekdays of its own Mon-Fri
 # (that week's regime: listing waves, blocklists), or every weekday in the
 # window when its own week has fewer than two. Signs of degradation, any
 # one of which fails the gate:
@@ -508,11 +511,53 @@ GATE_KNOB_LIVE = ("2026-09-12", 10)     # first full ET hour the x1.5 was live
 GATE_MARKOUT_TOL_C = 2.0
 GATE_MIN_SETTLED_CTS = 500.0
 GATE_RULE = "Jack 2026-09-26: 2x next saturday if today + prior saturdays show no sign of edge degradation"
-QUIET_HOURS = frozenset(range(0, 10))   # the live IMM_HOUR_SIZE_MULT=0-9:2.0 window
+QUIET_HOURS = frozenset(range(0, 10))   # the 0-9 ET window the gate was built on (fallback)
 BLOCKS = ("quiet", "day")
-BLOCK_START = {"quiet": 0, "day": 10}
-BLOCK_LABEL = {"quiet": "0-9 ET", "day": "10-23 ET"}
+BLOCK_START = {"quiet": 0, "day": 10}   # only read against GATE_KNOB_LIVE (9/12)
 _SUMS = ("ct_h", "rent_usd", "fills", "mk_w", "mk_n", "settled_cts", "settle_pnl")
+
+
+def quiet_hours(et_date: str) -> frozenset:
+    """The ET hours of the long-dated QUIET block on ET day `et_date`: the
+    hours the bot's GLOBAL window boosts that day. imm.global_hour_mults
+    follows the launcher's dated switch (IMM_HOUR_SIZE_MULT_NEXT / _FROM,
+    Jack 2026-10-02): 0-9 ET x2 through 2026-10-04, 0-8 ET x3 from 10-05,
+    where hour 9 is back to x1 and belongs to the day block. A day with no
+    boosted hour configured keeps QUIET_HOURS, the blocks' historical meaning.
+    The cycle-log parser's hour_mult exclusion stays a fixed 0-9: it only
+    feeds the day block's hm, which reads 10-23 either way, so the parse
+    cache never depends on the window."""
+    d = datetime.strptime(et_date, "%Y-%m-%d").date()
+    hrs = frozenset(h for h, m in imm.global_hour_mults(d).items() if m > 1.0)
+    return hrs or QUIET_HOURS
+
+
+def block_of(dates, hours) -> list:
+    """'quiet' / 'day' per (ET date, ET hour) row, each by its own day's window."""
+    qh = {d: quiet_hours(d) for d in set(dates)}
+    return ["quiet" if h in qh[d] else "day" for d, h in zip(dates, hours)]
+
+
+def _hour_span(hours) -> str:
+    """{0,...,8} -> '0-8'; separate runs joined by ','."""
+    hs = sorted(hours)
+    if not hs:
+        return "none"
+    runs, start, prev = [], hs[0], hs[0]
+    for h in hs[1:]:
+        if h == prev + 1:
+            prev = h
+            continue
+        runs.append((start, prev))
+        start = prev = h
+    runs.append((start, prev))
+    return ",".join(f"{a}-{b}" if a != b else f"{a}" for a, b in runs)
+
+
+def block_label(block: str, et_date: str) -> str:
+    """'0-9 ET' / '10-23 ET' on the old window, '0-8 ET' / '9-23 ET' from 10/5."""
+    q = quiet_hours(et_date)
+    return f"{_hour_span(q if block == 'quiet' else frozenset(range(24)) - q)} ET"
 
 
 def gate_blocks(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, through_et: str) -> pd.DataFrame:
@@ -525,7 +570,7 @@ def gate_blocks(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, thro
     if ser.empty or cyc.empty:
         return pd.DataFrame(columns=cols)
     c = cyc[(cyc["et_date"] >= SINCE) & (cyc["et_date"] <= through_et)].copy()
-    c["block"] = np.where(c["et_hour"].isin(QUIET_HOURS), "quiet", "day")
+    c["block"] = block_of(c["et_date"], c["et_hour"])
     s = ser[(ser["et_date"] >= SINCE) & (ser["et_date"] <= through_et)]
     s = s[s["series"].map(group_of) == "long-dated"].merge(c, on=["et_date", "et_hour"], how="inner")
     s["ct_h"] = s["sum_quoted"] / s["n_cycles"]
@@ -538,7 +583,7 @@ def gate_blocks(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, thro
         f = scored[(scored["group"] == "long-dated") & (scored["et_date"] >= SINCE) & (scored["et_date"] <= through_et)]
         logged = set(zip(c["et_date"], c["et_hour"]))
         f = f[[k in logged for k in zip(f["et_date"], f["et_hour"])]].copy()
-        f["block"] = np.where(f["et_hour"].isin(QUIET_HOURS), "quiet", "day")
+        f["block"] = block_of(f["et_date"], f["et_hour"])
         fa = f.groupby(["et_date", "block"]).agg(fills=("cnt", "sum"), mk_w=("mk_w", "sum"),
                                                  mk_n=("mk_n", "sum"), settled_cts=("settled_cts", "sum"),
                                                  settle_pnl=("settle_pnl", "sum"))
@@ -624,7 +669,7 @@ def evaluate_gate(blocks: pd.DataFrame, now_utc: datetime, through_et: str, base
             ok = (not _isnan(sm["net_k"])) and (not _isnan(am["net_k"])) and sm["net_k"] >= am["net_k"]
             out["checks"].append(dict(saturday=sat, check="G1 net vs weekdays", block=b, ok=ok,
                                       value=_nan_none(sm["net_k"]), threshold=_nan_none(am["net_k"]),
-                                      detail=f"{BLOCK_LABEL[b]}: net {_g(sm['net_k'], '{:.1f}')} vs weekdays "
+                                      detail=f"{block_label(b, sat)}: net {_g(sm['net_k'], '{:.1f}')} vs weekdays "
                                              f"{_g(am['net_k'], '{:.1f}')} c per 1k resting ct-h ({anchor_kind})"))
             for c in _SUMS:
                 sat_sum[c] += float(sb.loc[b, c])
@@ -697,11 +742,13 @@ def gate_family_table(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame
     sat = rows[-1]["saturday"]
     blocks = {r["block"] for r in rows if r["saturday"] == sat}
     anchor_dates = rows[-1]["anchor_dates"]
-    hours = {h for h in range(24) if ("quiet" if h in QUIET_HOURS else "day") in blocks}
 
     def agg(dates):
-        c = cyc[cyc["et_date"].isin(dates) & cyc["et_hour"].isin(hours)]
-        s = ser[ser["et_date"].isin(dates) & ser["et_hour"].isin(hours)]
+        # each day's hours by that day's own window (an "all weekdays"
+        # anchor can straddle the 10/5 switch)
+        c = cyc[cyc["et_date"].isin(dates)]
+        c = c[np.array([b in blocks for b in block_of(c["et_date"], c["et_hour"])], dtype=bool)]
+        s = ser[ser["et_date"].isin(dates)]
         s = s[s["series"].map(group_of) == "long-dated"].merge(c, on=["et_date", "et_hour"], how="inner")
         s = s.assign(ct_h=s["sum_quoted"] / s["n_cycles"], rent_usd=s["sum_est_usd"] / s["n_cycles"] / 24.0,
                      fam=s["series"].map(gate_family))
@@ -910,7 +957,7 @@ def gate_text(gate: dict, written: bool) -> list:
                  + (f" - {gate['reason']}" if gate.get("reason") else ""))
     for r in gate.get("rows", []):
         s, w = r["sat"], r["wk"]
-        lines.append(f"  {r['saturday']} {BLOCK_LABEL[r['block']]:8} ({r['hours']}h)  "
+        lines.append(f"  {r['saturday']} {block_label(r['block'], r['saturday']):8} ({r['hours']}h)  "
                      f"Sat net {_g(s['net_k'])} rent {_g(s['rent_k'], '{:6.1f}')} fills/1k {_g(s['fills_k'], '{:5.2f}')} "
                      f"mark {_g(s['mark'], '{:+6.2f}')}  |  weekdays net {_g(w['net_k'])} rent {_g(w['rent_k'], '{:6.1f}')} "
                      f"fills/1k {_g(w['fills_k'], '{:5.2f}')} mark {_g(w['mark'], '{:+6.2f}')}  [{r['anchor']}]")
@@ -946,7 +993,7 @@ def stepup_text(st: dict) -> list:
                  f"{st['prev_mult'] / st['cur_mult']:.2f} = the extra size earned nothing)")
     for r in st.get("rows", []):
         s, w = r["sat"], r["wk"]
-        lines.append(f"  {r['saturday']} {BLOCK_LABEL[r['block']]:8} ({r['hours']}h)  "
+        lines.append(f"  {r['saturday']} {block_label(r['block'], r['saturday']):8} ({r['hours']}h)  "
                      f"Sat net {_g(s['net_k'])} rent {_g(s['rent_k'], '{:6.1f}')} mark {_g(s['mark'], '{:+6.2f}')}  |  "
                      f"weekdays net {_g(w['net_k'])} rent {_g(w['rent_k'], '{:6.1f}')} mark {_g(w['mark'], '{:+6.2f}')}"
                      f"  [{r['anchor']}]")
@@ -1045,6 +1092,18 @@ def _hours_summary(hours: dict, html: bool = False) -> str:
     return "; ".join((f"{a}{dash}{b} ET {times}{v:g}" if a != b else f"{a} ET {times}{v:g}") for a, b, v in runs)
 
 
+def _quiet_hours_line(through_et: str, html: bool = False) -> str:
+    """The global quiet-hours window in force on `through_et`, plus the dated
+    switch (IMM_HOUR_SIZE_MULT_NEXT / _FROM) when one is configured."""
+    d = datetime.strptime(through_et, "%Y-%m-%d").date()
+    line = f"{_hours_summary(dict(imm.global_hour_mults(d)), html)} (long-dated only)"
+    nxt, frm = imm.HOUR_SIZE_MULTS_NEXT, imm.HOUR_SIZE_MULT_FROM
+    if nxt and frm is not None:
+        line += (f"; from {frm.isoformat()}: {_hours_summary(dict(nxt), html)}" if d < frm else
+                 f" since {frm.isoformat()} (was {_hours_summary(dict(imm.HOUR_SIZE_MULTS), html)})")
+    return line
+
+
 def _knob_lines(through_et: str, html: bool = False):
     """The live-config facts the email states, as (label, value) pairs.
     ASCII unless html -- see _hours_summary for why."""
@@ -1053,7 +1112,7 @@ def _knob_lines(through_et: str, html: bool = False):
     return [
         ("Saturday multiplier", f"{times}{imm.SAT_SIZE_MULT:g} on Saturdays (ET), long-dated families only"),
         ("Saturday step-up", imm.sat_gate_summary()),
-        ("Quiet hours", f"{_hours_summary(dict(imm.HOUR_SIZE_MULTS), html)} (long-dated only)"),
+        ("Quiet hours", _quiet_hours_line(through_et, html)),
         ("No multiplier", f"daily families: prefixes {', '.join(EXCL)} + {len(structural)} structural"
                           + (f" ({', '.join(structural)})" if structural else " (none yet)")),
         ("Window", f"ET days {SINCE} {arrow} {through_et}; baseline 2026-08-08 {arrow} 2026-09-11 (before the multiplier)"),
@@ -1075,8 +1134,8 @@ LEGEND = (
     ("Net/fill ¢", "Rent/fill − Loss/fill"),
     ("Net/ct-day ¢", "rent per resting contract-day − Turnover × Loss/fill: what a size multiplier "
                           "actually scales"),
-    ("Mult", "mean cycle-log hour_mult on the group's quoted rows outside the 0–9 ET quiet window — proof "
-             "the multiplier was live (Saturday long-dated 1.5, everything else 1.0)"),
+    ("Mult", "mean cycle-log hour_mult on the group's quoted rows from 10:00 ET on, outside every quiet "
+             "window — proof the multiplier was live (Saturday long-dated 1.5, everything else 1.0)"),
 )
 
 
@@ -1234,7 +1293,7 @@ def _gate_html(gate: dict, written: bool) -> str:
         for r in gate["rows"]:
             s, w = r["sat"], r["wk"]
             num = lambda v, f="{:.1f}": _esc("–" if _isnan(v) else f.format(v))
-            cells = [f'<td style="{_TDL}">{r["saturday"]}</td>', f'<td style="{_TDL}">{BLOCK_LABEL[r["block"]]}</td>',
+            cells = [f'<td style="{_TDL}">{r["saturday"]}</td>', f'<td style="{_TDL}">{block_label(r["block"], r["saturday"])}</td>',
                      f'<td style="{_TD}">{r["hours"]}</td>',
                      f'<td style="{_TD};font-weight:600">{num(s["net_k"])}</td>', f'<td style="{_TD}">{num(w["net_k"])}</td>',
                      f'<td style="{_TD}">{num(s["rent_k"])}</td>', f'<td style="{_TD}">{num(w["rent_k"])}</td>',
@@ -1304,7 +1363,7 @@ def _stepup_html(st: dict) -> str:
         for r in st["rows"]:
             s, w = r["sat"], r["wk"]
             rows.append((f"background:{_SAT_BG}", [
-                f'<td style="{_TDL}">{r["saturday"]}</td>', f'<td style="{_TDL}">{BLOCK_LABEL[r["block"]]}</td>',
+                f'<td style="{_TDL}">{r["saturday"]}</td>', f'<td style="{_TDL}">{block_label(r["block"], r["saturday"])}</td>',
                 f'<td style="{_TD}">{r["hours"]}</td>', f'<td style="{_TD};font-weight:600">{num(s["net_k"])}</td>',
                 f'<td style="{_TD}">{num(w["net_k"])}</td>', f'<td style="{_TD}">{num(s["rent_k"])}</td>',
                 f'<td style="{_TD}">{num(w["rent_k"])}</td>', f'<td style="{_TD}">{num(s["mark"], "{:+.2f}")}</td>',

@@ -6214,3 +6214,20 @@ a pair ignored, the floor projection across the switch, caps); the ladder
 enrollment test reads x5; the suite neutralises the scheduled knobs at
 import (a wall-clock hazard in a process that mirrored the launcher env).
 1,890 green (unittest discover).
+
+### 2026-10-02 — The Saturday tracker reads the dated quiet window (follow-up to the 10/5 step)
+
+imm_saturday_tracker's quiet / day blocks now follow each ET day's own
+global window, imm.global_hour_mults(et_date) (quiet_hours / block_of /
+block_label): 0-9 ET through 10/4, 0-8 ET from 10/5, so from the 10/12 run
+hour 9 (back to x1) sits in the day block for both the x2 Saturdays and
+their anchor weekdays. gate_family_table classifies each day by its own
+window (an "all weekdays" anchor can straddle the switch). Labels follow
+the day ("0-8 ET" / "9-23 ET" from 10/5), and the email's "Quiet hours"
+line states the switch ("0-9 ET x2 ...; from 2026-10-05: 0-8 ET x3"). The
+cycle-log parser is untouched -- its hour_mult column still excludes 0-9
+and only feeds the day block's hm (10-23 either way) -- so the per-day
+parse cache (4421783) needs no CACHE_VERSION bump.
+
+Tests: DatedQuietWindowTests (hours and labels by day, hour 9 by its own
+day in gate_blocks, the family table, the knob line). 1,902 green.
