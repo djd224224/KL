@@ -62,8 +62,11 @@ STATUS_DIR = os.environ.get(
 KALSHI_MARKETS_URL = os.environ.get(
     "IMM_RAIN_MONTHLY_MARKETS_URL",
     "https://api.elections.kalshi.com/trade-api/v2/markets")
+ALL_SERIES = ("KXRAINAUSM,KXRAINCHIM,KXRAINCLLM,KXRAINCMHM,KXRAINDALM,KXRAINDENM,"
+              "KXRAINHOUM,KXRAINLAXM,KXRAINLEXM,KXRAINMIAM,KXRAINMKEM,KXRAINNYCM,"
+              "KXRAINPVDM,KXRAINSEAM,KXRAINSFOM,KXRAINSTPM")
 SERIES = tuple(s.strip() for s in os.environ.get(
-    "IMM_RAIN_MONTHLY_SERIES", "KXRAINCHIM,KXRAINAUSM").split(",") if s.strip())
+    "IMM_RAIN_MONTHLY_SERIES", ALL_SERIES).split(",") if s.strip())
 N_SAMPLES = int(_env_float("IMM_RAIN_MONTHLY_SAMPLES", rm.N_SAMPLES))
 OBS_MAX_AGE_MIN = _env_float("IMM_RAIN_MONTHLY_OBS_MAX_AGE_MIN", 90)
 BOUNDARY_IN = _env_float("IMM_RAIN_MONTHLY_BOUNDARY_IN", rm.BOUNDARY_IN)
@@ -80,6 +83,23 @@ CLI_STATIONS: Dict[str, dict] = {
 CLI_STATIONS["ORD"] = {"icao": "KORD", "iem": "ORD", "net": "IL_ASOS",
                        "name": "Chicago O'Hare", "lat": 41.995, "lon": -87.934,
                        "tz": "US/Central"}
+# the cities added 2026-10-01 (Jack: "yes add all the cities"): every code
+# the October rules name, checked live that day on all three feeds -- IEM
+# currents ({state}_ASOS), IEM's CLI (K + code, a full September) and ACIS
+# (K + code) -- coordinates from ACIS, zones from IEM's local-vs-UTC stamps
+for _code, _net, _name, _lat, _lon, _tz in (
+        ("CLL", "TX_ASOS", "College Station Easterwood", 30.588, -96.364, "US/Central"),
+        ("CMH", "OH_ASOS", "Columbus John Glenn", 39.991, -82.881, "US/Eastern"),
+        ("LAX", "CA_ASOS", "Los Angeles Intl", 33.938, -118.387, "US/Pacific"),
+        ("LEX", "KY_ASOS", "Lexington Bluegrass", 38.041, -84.606, "US/Eastern"),
+        ("MKE", "WI_ASOS", "Milwaukee Mitchell", 42.947, -87.897, "US/Central"),
+        ("PVD", "RI_ASOS", "Providence T.F. Green", 41.722, -71.433, "US/Eastern"),
+        ("SFO", "CA_ASOS", "San Francisco Intl", 37.619, -122.375, "US/Pacific")):
+    CLI_STATIONS[_code] = {"icao": f"K{_code}", "iem": _code, "net": _net,
+                           "name": _name, "lat": _lat, "lon": _lon, "tz": _tz}
+# rules that name the place rather than a CLI product ("at Central Park, New
+# York City" on KXRAINNYCM)
+STATION_ALIASES = {"Central Park": "NYC"}
 
 # METAR present-weather tokens that mean precipitation at or near the station
 _WET_RE = re.compile(r"(RA|DZ|SN|SG|PL|GR|GS|UP|TS|SH)")
@@ -93,9 +113,15 @@ def _log(msg: str) -> None:
 
 
 def station_code(rules: str) -> Optional[str]:
-    """The settlement station's CLI code from a market's rules text."""
+    """The settlement station's CLI code from a market's rules text: "at
+    CLIxxx", else a named place in STATION_ALIASES."""
     m = _CLI_RE.search(rules or "")
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    for place, code in STATION_ALIASES.items():
+        if re.search(rf"\bat\s+{re.escape(place)}\b", rules or ""):
+            return code
+    return None
 
 
 def _signed_or_public(get_json: Optional[Callable], params: dict) -> dict:

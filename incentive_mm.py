@@ -785,7 +785,11 @@ RAIN_DAILY_SIZE_MULT = _env_float("IMM_RAIN_DAILY_SIZE_MULT", 1.5)
 for _s in os.environ.get(
         "IMM_RAIN_SERIES",
         "KXRAIN,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,"
-        "KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM").split(","):
+        "KXRAINMIAM,KXRAINNYCM,KXRAINSEAM,KXRAINSTPM,"
+        # the monthly cities Kalshi added since July (2026-10-01, with the
+        # monthly gate's "add all the cities")
+        "KXRAINCLLM,KXRAINCMHM,KXRAINLAXM,KXRAINLEXM,KXRAINMKEM,KXRAINPVDM,"
+        "KXRAINSFOM").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             # IMM_RAIN_LEVELS (e.g. "0:3", Jack 2026-07-28: rain re-entry at
@@ -3627,12 +3631,17 @@ _SHARE_LIVE = os.environ.get("IMM_SHARE_FAIR_ENABLE", "1") == "1"
 # algorithm like how you quote the dailies KXRAINCHIM-26OCT,
 # KXRAINAUSM-26OCT"). KXRAIN<CITY>M settle on the station's CLI month total
 # and have been frozen in the launcher's IMM_BLOCKLIST since the 7/26 rain
-# removal; these two come back only with the RAIN_MONTHLY_* gate (fail
-# closed, out while it rains at the station). IMM_RAIN_MONTHLY_ENABLE=0 or
-# IMM_ALLOW_RAIN_MONTHLY_SERIES="" takes them out; the launcher blocklist
-# still has the other seven monthly cities.
+# removal; they come back only with the RAIN_MONTHLY_* gate (fail closed,
+# out while it rains at the station). First the two Jack named, then the
+# same day "yes add all the cities": all sixteen KXRAIN<CITY>M series in
+# the catalog (14 had October programs; STP had no open event). Every one
+# leaves the launcher blocklist. IMM_RAIN_MONTHLY_ENABLE=0 or
+# IMM_ALLOW_RAIN_MONTHLY_SERIES="" takes them out.
 _RAIN_MONTHLY_LIVE = os.environ.get("IMM_RAIN_MONTHLY_ENABLE", "1") == "1"
-_DEFAULT_RAIN_MONTHLY_SERIES = "KXRAINCHIM,KXRAINAUSM"
+_DEFAULT_RAIN_MONTHLY_SERIES = (
+    "KXRAINAUSM,KXRAINCHIM,KXRAINCLLM,KXRAINCMHM,KXRAINDALM,KXRAINDENM,"
+    "KXRAINHOUM,KXRAINLAXM,KXRAINLEXM,KXRAINMIAM,KXRAINMKEM,KXRAINNYCM,"
+    "KXRAINPVDM,KXRAINSEAM,KXRAINSFOM,KXRAINSTPM")
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15

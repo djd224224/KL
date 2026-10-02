@@ -30,6 +30,10 @@ class TestStations(unittest.TestCase):
         self.assertEqual(rmf.station_code("total precipitation at CLIAUS in Austin"), "AUS")
         self.assertIsNone(rmf.station_code("total precipitation in Chicago"))
         self.assertIsNone(rmf.station_code(""))
+        # KXRAINNYCM names the place, not a CLI product
+        self.assertEqual(rmf.station_code(
+            "If the total precipitation at Central Park, New York City in Oct 2026 "
+            "is strictly greater than 2 inches"), "NYC")
 
     def test_station_table(self):
         # O'Hare for October's KXRAINCHIM; the verified July stations stay
@@ -41,6 +45,15 @@ class TestStations(unittest.TestCase):
         for spec in rmf.CLI_STATIONS.values():
             for k in ("icao", "iem", "net", "lat", "lon", "tz"):
                 self.assertIn(k, spec)
+        # every code the October rules name (2026-10-01, "add all the
+        # cities"), plus Central Park for KXRAINNYCM
+        for code in ("AUS", "ORD", "CLL", "CMH", "DFW", "DEN", "HOU", "LAX", "LEX",
+                     "MIA", "MKE", "PVD", "SEA", "SFO", "SPG", "NYC"):
+            self.assertIn(code, rmf.CLI_STATIONS, code)
+            self.assertEqual(rmf.CLI_STATIONS[code]["icao"], "K" + code, code)
+        self.assertEqual(rmf.CLI_STATIONS["LAX"]["tz"], "US/Pacific")
+        self.assertEqual(rmf.CLI_STATIONS["CLL"]["net"], "TX_ASOS")
+        self.assertEqual(len(rmf.SERIES), 16)
 
     def test_events_from_the_signed_reader(self):
         books = {"KXRAINCHIM": [market("KXRAINCHIM-26OCT", 3), market("KXRAINCHIM-26OCT", 4),

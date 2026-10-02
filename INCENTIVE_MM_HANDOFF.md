@@ -5854,3 +5854,21 @@ quote-then-rain end to end, kill switch in a subprocess) and
 test_rain_monthly_fair.py (9: station from rules, table, signed events,
 wet/dry/stale/down observations, rung pricing + boundary, unknown station,
 writer memory of the last wet observation, failing fair, event cache).
+
+ALL CITIES (same day, Jack: "yes add all the cities"). All sixteen
+KXRAIN<CITY>M series in the catalog are now in the gate:
+AUS CHI CLL CMH DAL DEN HOU LAX LEX MIA MKE NYC PVD SEA SFO STP (14 had
+October programs; STP had no open event). The October rules name, as
+CLI codes: AUS, ORD, CLL (College Station), CMH, DFW, DEN, HOU (Hobby),
+LAX, LEX, MIA, MKE, PVD, SEA, SFO, SPG -- and KXRAINNYCM names the place
+("at Central Park, New York City"), so STATION_ALIASES maps it to NYC. The
+seven stations new to the model (CLL, CMH, LAX, LEX, MKE, PVD, SFO) were
+checked live on IEM currents ({state}_ASOS), IEM's CLI (K + code, a full
+September) and ACIS (K + code). The launcher blocklist keeps only
+KXCRYPTOSTRUCTURE and KXAAAGASW; IMM_RAIN_SERIES gains the seven new
+series (the rain band). Dry run 10/01 ~00Z: 15 events, 108 strikes, 106
+inside the 10c tolerance (out: CHI 4" 25x30 vs fair 44 while it rained,
+DAL 7" 47x49 vs 60); five stations wet (AUS, CHI, CLL, MIA, MKE); MKE 1"
+on the boundary (MTD 0.96"); LAX/SEA/SFO had no October CLI yet
+(obs-only MTD, as rain_monthly does on a month's first day). First write
+111s (ACIS history downloads, cached 7 days), later ones cached.

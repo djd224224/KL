@@ -2453,7 +2453,10 @@ class TestAllowlist(unittest.TestCase):
                   "KXRAINSBOS-26SEP26-T1", "KXRAINSBOS-X",
                   "KXRAINWKND-26SEP26-NYC"):
             self.assertFalse(imm.rainstorm_span_allowed(t), t)
-        self.assertFalse(a("KXRAINSFOM-26OCT-5"))
+        # the SF monthly is allowed since 2026-10-01 -- by the monthly rain
+        # gate's exact list, never by the span shape (checked just above)
+        self.assertIn("KXRAINSFOM", imm.RAIN_MONTHLY_SERIES)
+        self.assertTrue(a("KXRAINSFOM-26OCT-5"))
         self.assertFalse(any(p.startswith("KXRAIN")
                              for p in imm.ALLOW_SERIES_PREFIXES))
         # the blocklist still wins over the shape rule
@@ -5767,10 +5770,14 @@ class TestTempSeriesTuning(unittest.TestCase):
         # band trims the ladder exactly like temp
         bids = imm.build_side_ladder("KXRAINHOUM-26JUL-6", "bid", 6, 10, 100)
         self.assertEqual([q.price_cents for q in bids], [6, 5])
-        # cutoffs/ladder stay global (band-only override)
-        ov = imm.series_override("KXRAINHOUM")
-        self.assertIsNone(ov.cutoff_from_close_min)
-        self.assertIsNone(ov.levels)
+        # the ladder stays global (band override); the daily keeps the
+        # ticker-date cutoff, and since 2026-10-01 the monthlies carry the
+        # monthly rain gate's 22:00 ET day-before-the-last-day cutoff
+        for s in ("KXRAIN", "KXRAINHOUM"):
+            self.assertIsNone(imm.series_override(s).levels, s)
+        self.assertIsNone(imm.series_override("KXRAIN").cutoff_from_close_min)
+        self.assertEqual(imm.series_override("KXRAINHOUM").cutoff_from_close_min,
+                         imm.RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN)
 
     def test_out_of_band_top_stands_aside_entirely(self):
         # Jack 2026-07-21: if the TOP of book is outside the band, no quotes
@@ -9363,19 +9370,24 @@ class TestRainMonthlyGate(unittest.TestCase):
                       for o in bot.state.sim_orders.values()
                       if o["ticker"] == self.T)
 
-    def test_two_series_allowlisted_with_the_day_before_cutoff(self):
-        for s in ("KXRAINCHIM", "KXRAINAUSM"):
+    ALL = ("KXRAINAUSM", "KXRAINCHIM", "KXRAINCLLM", "KXRAINCMHM", "KXRAINDALM",
+           "KXRAINDENM", "KXRAINHOUM", "KXRAINLAXM", "KXRAINLEXM", "KXRAINMIAM",
+           "KXRAINMKEM", "KXRAINNYCM", "KXRAINPVDM", "KXRAINSEAM", "KXRAINSFOM",
+           "KXRAINSTPM")
+
+    def test_every_city_allowlisted_with_the_day_before_cutoff(self):
+        # the two Jack named, then "yes add all the cities": the sixteen
+        # KXRAIN<CITY>M series in the catalog on 2026-10-01
+        self.assertEqual(imm.RAIN_MONTHLY_SERIES, frozenset(self.ALL))
+        for s in self.ALL:
             self.assertIn(s, imm.ALLOW_SERIES, s)
             self.assertTrue(imm.rain_monthly_series(s), s)
             ov = imm.SERIES_OVERRIDES[s]
             self.assertEqual(ov.cutoff_from_close_min, 1560, s)
             self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90), s)
             self.assertEqual(imm.event_top_n_for(s), 0, s)
-        # the other monthly cities stay out (the launcher still blocklists
-        # them, and the code does not allow them)
-        for s in ("KXRAINDALM", "KXRAINNYCM", "KXRAINMIAM"):
-            self.assertNotIn(s, imm.ALLOW_SERIES, s)
-            self.assertFalse(imm.rain_monthly_series(s), s)
+        # the daily KXRAIN is not a monthly (its own NWS gate)
+        self.assertFalse(imm.rain_monthly_series("KXRAIN"))
         # close 23:59:59 ET on Oct 31 -> out at 22:00 ET on Oct 30 (the
         # dailies' "10pm the day before the rain day"); EST in November
         U = timezone.utc
@@ -9442,20 +9454,19 @@ class TestRainMonthlyGate(unittest.TestCase):
         self.assertIn(self.T, bot._rain_monthly_stood)
         self.assertIn(self.T, bot.state.selected)                 # sticky
 
-    def test_launcher_unfreezes_exactly_the_two(self):
+    def test_launcher_freezes_no_monthly_rain(self):
         # the launcher's IMM_BLOCKLIST froze every monthly city since 7/26;
-        # code and launcher must agree, or the allowed pair stays frozen
+        # code and launcher must agree, or an allowed city stays frozen (the
+        # list is PREFIX-matched, so no KXRAIN entry of any length may stay)
         import re
         with open(os.path.join(os.path.dirname(os.path.abspath(imm.__file__)),
                                "run_incentive_mm.ps1"), encoding="utf-8") as f:
             text = f.read()
         chunks = re.findall(r'\$ProbeEnv\s*=\s*"(set .*?)"', text, re.S)
         env = dict(re.findall(r"set ([A-Za-z_][A-Za-z0-9_]*)=([^&]*)&&", chunks[-1]))
-        blocked = set(env["IMM_BLOCKLIST"].split(","))
-        self.assertTrue(blocked.isdisjoint(imm.RAIN_MONTHLY_SERIES), blocked)
-        for s in ("KXRAINDALM", "KXRAINDENM", "KXRAINHOUM", "KXRAINMIAM",
-                  "KXRAINNYCM", "KXRAINSEAM", "KXRAINSTPM"):
-            self.assertIn(s, blocked, s)
+        blocked = [b for b in env["IMM_BLOCKLIST"].split(",") if b]
+        self.assertEqual([b for b in blocked if b.startswith("KXRAIN")], [], blocked)
+        self.assertEqual(set(blocked), {"KXCRYPTOSTRUCTURE", "KXAAAGASW"})
 
     def test_gate_off_takes_the_family_out(self):
         import subprocess
