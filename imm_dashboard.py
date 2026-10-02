@@ -36,16 +36,25 @@ WHAT EACH HEADLINE NUMBER IS (the page repeats these next to the numbers):
                     cent on 9/16, 9/22, 9/27, 9/28, 9/29 and the 7-day window.
   Net               modeled rewards + trading P&L.
 
+The DRIVERS view splits trading P&L exactly into the window's own fills and
+the inventory carried in (re-marked, or settled by Kalshi); marks out maker
+fills at the fill (edge vs the arrival book's mid), 5m, 30m, 4h and to date;
+and nets each event's worst case to settlement across its strikes or
+exclusive names (IMM_DASHBOARD.md, "Drivers").
+
 Days are ET calendar days (midnight to midnight). The bot's own halt/carry
 counters roll at 5am CT; the page shows those beside the daily-loss meter.
 
 SOURCES (all read-only): run-logs/incentive-mm/ -- imm_state.json,
 status_incentive_mm.json, cycle_log_*.csv, marks_*, realized_*, fills_*,
 settlements_*, guard_skips_*, toxic_halts_*, selection_snapshot_* (the
-latest hourly block), reward_credits.csv. With the API on (default), also
-Kalshi's incentive-program feed (new events), the 7:20 quote-gaps estimator
-(imm_quote_gaps.classify_and_estimate: what unquoted events would earn) and
-imm_pickoff.scan (pick-off windows), each cached for API_TTL minutes. Every
+latest hourly block), reward_credits.csv, reward_calibration.json,
+config_history_* (with `git log` for the deploys' subjects). With the API on
+(default), also Kalshi's incentive-program feed (new events), the 7:20
+quote-gaps estimator (imm_quote_gaps.classify_and_estimate: what unquoted
+events would earn), imm_pickoff.scan (pick-off windows), each cached for
+API_TTL minutes, and market / event records (strike structure, value now;
+cached, a bounded number of reads per build). Every
 Kalshi read goes through the same code the morning emails use; nothing here
 places, amends or cancels anything, and nothing writes outside DASH_DIR.
 
@@ -622,7 +631,7 @@ _CHANGE_FAMILY_WORDS = (
     ("Rotten Tomatoes", ("KXRT", "ROTTEN")),
     ("Company KPIs", ("KPI", "FOOD PRICE", "CHIPBURRITO", "SPICE")),
     ("Commodities & shipping", ("CRUDE", "SHIPPING", "STRAIT", "FREIGHT", "SPRLVL")),
-    ("Crypto", ("CRYPTO", "KXBTC")),
+    ("Crypto", ("KXBTC", "KXETH", "KXINXVSBTC")),
 )
 
 
@@ -630,6 +639,20 @@ def change_families(text: str):
     """Families a change's subject / knob names mention (sorted)."""
     u = (text or "").upper()
     return sorted({fam for fam, words in _CHANGE_FAMILY_WORDS if any(w in u for w in words)})
+
+
+def imm_subjects(subjects):
+    """The commit subjects ("<sha> <subject>") that are about the IMM: the
+    repo's "imm ..." prefix, or a merge naming it. A deploy carries every
+    commit since the last one; the crypto fleets' or other bots' commits in
+    it change nothing the IMM trades, so they must not tag an IMM family."""
+    out = []
+    for s in subjects or []:
+        text = s.split(" ", 1)[1] if " " in s else s
+        low = text.lower()
+        if low.startswith("imm") or " imm" in low or "incentive" in low:
+            out.append(s)
+    return out
 
 
 def parse_changes(rows):
@@ -2418,7 +2441,7 @@ class Builder:
                                       if c["sha"] and c["sha"] != c["prev"]})
         for c in ch:
             c["subj"] = (subj.get(f"{c['prev']}..{c['sha']}") or []) if c["sha"] != c["prev"] else []
-            c["fams"] = change_families(" ".join(c["subj"] + c["keys"]))
+            c["fams"] = change_families(" ".join(imm_subjects(c["subj"]) + c["keys"]))
         return ch
 
     def _commit_subjects(self, pairs):
@@ -2819,7 +2842,7 @@ class Builder:
             if until <= now:
                 continue
             event_rows.append({"ev": ev, "until": until})
-            for t in list(selected) + list(cur):
+            for t in set(selected) | set(cur):          # a quoted member is in both
                 if event_of(t) == ev:
                     by_market.setdefault(t, []).append("toxic event halt")
         strikes = []

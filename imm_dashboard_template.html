@@ -287,17 +287,16 @@ table.t tr.tot td { font-weight: 600; border-top: 1px solid var(--axis); border-
 .bar-inline { display: inline-block; height: 8px; border-radius: 2px; vertical-align: middle; }
 
 /* ---------- drivers ---------- */
-.drvcharts { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+#moHeat { overflow-x: auto; }
 .drvtw table.t { min-width: 1240px; }
 .drvtw table.t th, .drvtw table.t td { padding: 5px 7px; }
 .drvtw table.t th:first-child, .drvtw table.t td:first-child {
-  position: sticky; left: 0; z-index: 1; background: var(--bg); min-width: 250px; max-width: 360px;
+  position: sticky; left: 0; z-index: 1; background: var(--bg); min-width: 250px; max-width: 380px;
 }
 .drvtw table.t tbody tr:hover td:first-child { background: var(--hover); }
 .drvtw table.t tr.grp th { font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); text-align: center; border-bottom: 0; padding: 4px 4px 0; }
 .drvtw table.t tr.grp th span { display: block; border-bottom: 1px solid var(--axis); padding-bottom: 3px; }
 .drvtw table.t .gs { border-left: 1px solid var(--grid); }
-.drvtw table.t tr.tot td:first-child { background: var(--bg); }
 .why { font-size: 11.5px; line-height: 1.35; color: var(--ink-2); font-weight: 400; margin-top: 2px; white-space: normal; }
 .why .chg { border-bottom: 1px dotted var(--ink-2); cursor: help; }
 .sub2n { display: block; font-size: 11px; color: var(--muted); font-weight: 400; }
@@ -1299,7 +1298,8 @@ function topMarkets() {
 }
 function shortT(t, ev) {
   if (ev && t.indexOf(ev + "-") === 0) return t.slice(ev.length + 1);
-  return t.length > 30 ? t.slice(0, 15) + "…" + t.slice(-12) : t;
+  const p = t.split("-");
+  return t.length > 24 && p.length > 1 ? p[0] + "…" + p[p.length - 1] : t;   // series…strike
 }
 
 function sigChip(x) {
@@ -1366,8 +1366,8 @@ function drvCols(eod, na) {
       v: (x) => x.q1 + x.q2, fmt: quotingCell },
     { k: "est", g: 4, label: paid ? "Est $/day*" : "Est $/day", dir: -1, title: "rewards the bot's estimator gives the quotes resting now, per day" + (paid ? ", at the paid rate" : ""),
       v: (x) => x.estNow ? x.estA : null, fmt: (x) => x.estNow ? fmtUSD(x.estA) : dash },
-    { k: "exp", g: 4, label: "Exp. net/day", dir: 1, title: "a model: est $/day now + the average trading P&L per day over the last 7 days",
-      v: (x) => (x.estNow || x.pnl7) ? x.exp : null, fmt: (x) => (x.estNow || x.pnl7) ? money(x.exp) : dash },
+    { k: "exp", g: 4, label: "Exp. net/day", dir: 1, title: "a model: est $/day now + the average trading P&L per day over the last 7 days (blank once nothing quotes or is held)",
+      v: (x) => (x.estNow || x.npos || x.q1 + x.q2) ? x.exp : null, fmt: (x) => (x.estNow || x.npos || x.q1 + x.q2) ? money(x.exp) : dash },
     { k: "wc", g: 4, label: "Worst case", dir: 1, title: "loss to settlement from today's marks if everything goes against the book, netted inside each event",
       v: (x) => x.wc ? x.wc : null, fmt: wcCell });
   return cols;
@@ -1377,14 +1377,14 @@ function whyFam(f, top, hb, w, eod) {
   const bits = [];
   if (f.nset) bits.push('<span title="markets Kalshi settled in the window, and their whole trading P&amp;L in it (carry and new fills)">' + f.nset + " settled, P&amp;L " + fmtUSD(f.pset, { sign: true }) + "</span>");
   const tp = top.fam[f.name];
-  if (tp && Math.abs(tp.v) >= 1) bits.push('top <span class="mono">' + esc(shortT(tp.t)) + "</span> " + fmtUSD(tp.v, { sign: true }));
+  if (tp && Math.abs(tp.v) >= 1) bits.push('top <span class="mono" title="' + esc(tp.t) + '">' + esc(shortT(tp.t)) + "</span> " + fmtUSD(tp.v, { sign: true }));
+  // the sparkline shows a steady drift; a jump is worth a word
   const s = f.shape;
-  if (s && s.kind === "jump") bits.push("jump " + tET(s.big.a) + "–" + tET(s.big.b) + " " + fmtUSD(s.big.d, { sign: true }));
-  else if (s && s.kind) bits.push(s.kind);
+  if (s && s.kind === "jump") bits.push("<b>jump</b> " + tET(s.big.a) + "–" + tET(s.big.b) + " " + fmtUSD(s.big.d, { sign: true }));
   const hh = hb && hb[f.name];
   if (hh && (hh.halts || hh.picks)) bits.push((hh.halts ? hh.halts + " halt" + (hh.halts > 1 ? "s" : "") : "") + (hh.halts && hh.picks ? ", " : "") + (hh.picks ? hh.picks + " pick-off" + (hh.picks > 1 ? "s" : "") : ""));
   if (!eod && f.held) bits.push(f.held + " held by guards");
-  if (!eod && f.flu >= 0.5) bits.push(fmtUSD(f.flu) + " in " + f.fln + " mkt" + (f.fln > 1 ? "s" : "") + " under the $1 floor");
+  if (!eod && f.flu >= 1) bits.push(fmtUSD(f.flu) + " in " + f.fln + " mkt" + (f.fln > 1 ? "s" : "") + " under the $1 floor");
   if (f.chg && f.chg.length) bits.push('<span class="chg" data-chg="' + esc(f.name) + '">' + f.chg.length + " change" + (f.chg.length > 1 ? "s" : "") + "</span>");
   return bits.join(" · ");
 }
@@ -1468,6 +1468,7 @@ function renderDrivers() {
         const x = Object.assign(blank(), mw(m));
         x.q1 = m.cur && m.cur.q === 1 ? 1 : 0; x.q2 = m.cur && m.cur.q === 2 ? 1 : 0;
         x.estNow = m.cur ? num(m.cur.est_day) : 0;
+        x.npos = m.pos ? 1 : 0;
         x.pnl7 = num((m.w["7d"] || {}).pnl);
         x.nq = num(x.rest) > 0 ? 1 : 0;
         x.wc = eod ? marketWorst(x.pos1, x.mk1) : num(m.wc);
@@ -1478,7 +1479,7 @@ function renderDrivers() {
       });
       ms.sort(sorter);
       for (const x of ms) {
-        const m = x._m, why = cause(x);
+        const m = x._m, why = cause(Object.assign({}, x, { settled: null }));   // the tag already says settled
         h += row(2, "m:" + m.t, '<span class="mono">' + esc(m.t.slice(m.ev.length + 1) || m.t) + "</span> " + stateTags(m), why ? esc(why) : "", x);
       }
     });
@@ -1487,7 +1488,7 @@ function renderDrivers() {
   // total over what is shown
   const t = blank();
   const add = ["rew", "pnl", "cr", "cs", "fills", "cts", "usd", "fe", "fe_cts", "m5", "m5_cts", "mk", "mk_cts", "m4", "m4_cts", "mt", "mt_cts",
-    "q1", "q2", "held", "estNow", "pnl7", "wc", "wcg", "nq", "rest", "nset", "pset", "rewA", "estA"];
+    "q1", "q2", "held", "estNow", "pnl7", "wc", "wcg", "nq", "rest", "nset", "pset", "rewA", "estA", "npos"];
   for (const f of shown) for (const k of add) t[k] = num(t[k]) + num(f[k]);
   t.nf = t.pnl - t.cr - t.cs; t.netA = t.rewA + t.pnl; t.cov = t.nf < -0.005 ? t.rewA / -t.nf : null; t.exp = t.estA + t.pnl7 / days7();
   if (!Q) { t.typ = baseline(null, w); t.z = zOf(t); t.curve = famCurve(null); t.shape = shapeOf(t.curve); t.chg = []; t.name = ""; }

@@ -66,20 +66,68 @@ settlements.
 ## Sections
 
 - **Summary:** net (hero), rewards and trading tiles with 14-day sparklines,
-  pace against the same time yesterday, the cumulative intraday chart, fills and
-  30-minute mark-outs, quoting now, open inventory, halts.
+  pace against the same time yesterday, the cumulative intraday chart, fills
+  with per-contract edge / 30-minute / to-date mark-outs, quoting now, open
+  inventory with the book's worst case, halts.
 - **Needs attention:** stale heartbeat, daily-loss / manual halts, toxic event
   and side halts, risk guards, a morning email that did not send, a stale credit
   ledger, restarts, promising new launches, open pick-off windows.
-- **Drivers:** family -> event -> market tree (rewards, trading, net, fills,
-  mark-out, quoting, resting $, est $/day now, open MTM) and a rewards-vs-trading
-  chart per family. Families promote the rewards report's "Quiet-print & scan"
-  subjects to top level (`family_of`), because that bucket is most of the book.
-- **Movers**, **Quoting now** (coverage, share of pool, yield in cents per $1
-  resting per day, why candidates are not quoted), **Opportunities**, **Risk &
-  halts**, **Fills**, **History** (daily net, modeled vs credited), **Health**.
-- **Market drawer:** position, live quote, reward share, per-window P&L split,
-  7-day hourly P&L / mark / position, fills with mark-outs.
+- **Drivers** (below), **Movers**, **Quoting now** (coverage, share of pool,
+  yield in cents per $1 resting per day, why candidates are not quoted),
+  **Opportunities**, **Risk & halts** (inventory by event, sorted by worst
+  case), **Fills** (edge and every mark-out horizon per family and per fill),
+  **History** (daily net, modeled vs credited), **Health**.
+- **Market drawer:** position and worst case, live quote, reward share,
+  per-window P&L as new fills vs carry, 7-day hourly P&L / mark / position,
+  fills with edge, 30-minute and to-date mark-outs.
+
+## Drivers: what drove the window, and what to do about it
+
+A family -> event -> market tree. Families promote the rewards report's
+"Quiet-print & scan" subjects to top level (`family_of`), because that bucket
+is most of the book. Every header sorts (default: worst net first); the
+horizon buttons pick the mark-out column; "At paid rate" swaps modeled
+rewards for what Kalshi has paid per modeled dollar.
+
+| Column | What it is | Source |
+|---|---|---|
+| New fills | the window's own fills, marked to its end (or to the settlement) | `pnl - cr - cs` |
+| Carry: marks (`cr`) | the position held at the window's start x (end mark - start mark); for a position that left the book, its last mark before leaving | 5-minute snapshots, `gone` |
+| Carry: settled (`cs`) | that start position in a market Kalshi settled in the window, start mark -> settlement | settlement rows, resolved exits |
+| Mark-out | maker fills (no pads, no taker fills), $ and cents per contract, at the chosen horizon: *at fill* = edge vs the mid of the external book the bot read the cycle before the fill (none on a 50c+ book); *5m / 30m / 4h* = the first 5-minute snapshot that long after (within 5 / 15 / 15 min); *to date* = Kalshi's settlement, else the bot's mark while held, else the external mid it quotes against, else Kalshi's touch under the bot's mark rule | `fills_*` ext_bid/ext_ask, `marks_*`, market records |
+| Coverage | rewards / what the new fills lost (under 1x: the pool does not pay for the flow) | |
+| Typical day | mean net per complete ET day over the 7 (and 30) days before the window; the net cell carries a sigma mark at 1.5+ sd, pro-rated to the window | `days` |
+| Shape | cumulative net, hourly; "jump" when one hour holds half the trading move; ticks = code / config changes whose IMM commit subject or IMM_* knob names the family | `fcurves`, `config_history_*`, `git log` |
+| Quoting / Est $/day | resting now / the estimator's rewards on what rests now | last cycle |
+| Exp. net/day | a model: est $/day now + the last 7 days' average trading P&L per day | |
+| Worst case | loss from today's marks to settlement if everything goes against the book, netted per event: across its strikes when every market prices one number, across names when Kalshi marks it mutually exclusive; mention words and unread structure count in full. On a past day: the book at that day's close | Kalshi market / event records |
+
+The three trading parts add up to trading P&L exactly; the tie-out to Kalshi
+(`imm_dashboard_verify.py`) is unchanged. Above the table: the window's P&L
+bridge (rewards -> new fills -> carry -> net) and the mark-out heatmap
+(family x horizon, blue made money, red lost, capped at +/-5c). Row notes say
+what settled, the biggest market, a jump, halts and pick-offs (yesterday and
+today), guard holds, accrual projected under the $1 floor this period, and the
+changes that name the family.
+
+**Paid rate** = credited / modeled per family from `imm_reward_recon`'s
+calibration (settled events only). The calibration's post-amendment
+`series` (written by `write_calibration` since 2026-10-01) carries the RAW
+estimate, so the rate covers the $1 floor and the model error together;
+until the next recon run the page falls back to the lifetime series on the
+FLOORED estimate (model error only) and says so. Account credits include other
+bots quoting the same markets.
+
+**Kalshi reads.** Market records (strike type / floor / cap, value now) are
+cached in `cache/markets_meta.json` forever for the structure and for 30 min
+(a market traded in the last day) or 3 h (older) for the value, at most
+`MARKET_READ_BUDGET` (1,500) tickers per build; event exclusivity in
+`cache/events_meta.json` (`EVENT_READ_BUDGET` 60 per build). A cold cache
+fills in over a few builds; until then the worst case counts unread markets in
+full. Multi-horizon mark-outs are cached per fill in `cache/markouts_h.json`
+(seeded from the old 30-minute `markouts.json`); a completed marks file is
+re-parsed only while it still owes a mark-out, so the first build after the
+upgrade re-reads the history once (~30 s).
 
 ## Any past day
 

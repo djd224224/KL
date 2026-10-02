@@ -351,6 +351,12 @@ class ChangeLogTests(unittest.TestCase):
         self.assertIn("Gas & diesel", dash.change_families("IMM_GAS_TRIAL"))
         self.assertEqual(dash.change_families("imm dashboard: tile copy"), [])
 
+    def test_only_imm_commits_tag_a_family(self):
+        subj = ["f1df38b imm vercel gate: anchor the pre-D fair", "aaa1111 crypto fleets: shard-cash guard",
+                "bbb2222 reports: CPI report marks", "ccc3333 Merge claude/x: IMM marks on wide books"]
+        self.assertEqual(dash.imm_subjects(subj), [subj[0], subj[3]])
+        self.assertEqual(dash.change_families(" ".join(dash.imm_subjects(subj[1:3]))), [])
+
 
 class RealizationRollupTests(unittest.TestCase):
     FAM = staticmethod(lambda s: dash.family_of(s)[0])
@@ -494,6 +500,17 @@ class BuilderIntegrationTests(unittest.TestCase):
         self.assertEqual({g["t"] for g in m["halts"]["guards"]}, {"KXD-1"})    # KXA-1 cleared
         self.assertTrue(m["halts"]["guards"][0]["risk"])
         self.assertIn("KXA-1", m["halts"]["by_market"])
+
+    def test_event_halt_is_listed_once_for_a_quoted_member(self):
+        p = os.path.join(self.dir, "imm_state.json")
+        with open(p, encoding="utf-8") as f:
+            st = json.load(f)
+        st["toxic_event_halt_until"] = {"KXA": self.NOW + 600}
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        # KXA-1 is both selected and in the last cycle
+        self.assertEqual(m["halts"]["by_market"]["KXA-1"].count("toxic event halt"), 1)
 
     def test_second_run_uses_nothing_stale(self):
         dash.Builder(self.NOW, api=False, api_force=False).build()
