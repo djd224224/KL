@@ -1120,11 +1120,11 @@ HOUR_MULT_EXCLUDE = tuple(
     p for p in os.environ.get("IMM_HOUR_MULT_EXCLUDE", "KXTEMP").split(",") if p)
 
 
-def _env_et_day(name: str):
+def _env_et_day(name: str, default: str = ""):
     """An IMM_*_FROM knob: 'YYYY-MM-DD', an ET calendar day -> date, or None
-    when unset. A malformed value raises at import, like a malformed hour
-    spec does."""
-    raw = os.environ.get(name, "").strip()
+    when unset / empty (`default` when the variable is absent). A malformed
+    value raises at import, like a malformed hour spec does."""
+    raw = os.environ.get(name, default).strip()
     if not raw:
         return None
     try:
@@ -1165,6 +1165,40 @@ def global_hour_mults(et_day) -> Dict[int, float]:
             and et_day >= HOUR_SIZE_MULT_FROM:
         return HOUR_SIZE_MULTS_NEXT
     return HOUR_SIZE_MULTS
+
+
+# EVENING WINDOW (Jack 2026-10-02, "1 and 2 for monday", from the multiplier
+# review): ET 18-21 x1.5 on the long-dated book from 00:00 ET 2026-10-05.
+# Weekdays 9/15-10/1, long-dated families ex-ladders, modelled rent at each
+# family's paid rate minus the 24h mark-out of the fills, per 1k resting
+# contract-hours at x1: 18-21 ET +39c against +22c for 13-17, +2c for 22-23
+# and -10c for 10-12; the best or near-best block every week (18 -> 49 -> 61c),
+# positive 12 of 13 weekdays, broad across families (TRUMP mentions, econ,
+# AI, Carbon Arc, earnings, KXRT all net positive there). Modelled +$20/day.
+# A knob of its own rather than more hours on the quiet-hours window:
+#   * sports ladders / escalators never take it -- 18-21 ET is their pre-
+#     kickoff window (inactives post ~90 min before kickoff, the cutoff is
+#     kickoff - 30 min) and the study left them out;
+#   * the quiet hours keep their meaning for imm_saturday_tracker's quiet /
+#     day blocks (the tracker reads evening_hour_mults to keep these hours
+#     out of its day-block hour_mult, the Saturday-level read).
+# Everything else follows the global window: daily families, open-scan
+# members and IMM_HOUR_MULT_EXCLUDE prefixes never take it, a per-series
+# window wins for the hours it names, a quiet hour is never also an evening
+# hour, Saturday multiplies on top (Saturday 18-21 ET = x3), and the floor
+# projection's hour walk sees it (it is part of hour_size_mult).
+# IMM_EVENING_SIZE_MULT = the IMM_HOUR_SIZE_MULT syntax ("" = off);
+# IMM_EVENING_SIZE_MULT_FROM = the first ET day ("" = at once).
+EVENING_SIZE_MULTS = _parse_hour_mults(os.environ.get("IMM_EVENING_SIZE_MULT", "18-21:1.5"))
+EVENING_SIZE_MULT_FROM = _env_et_day("IMM_EVENING_SIZE_MULT_FROM", "2026-10-05")
+
+
+def evening_hour_mults(et_day) -> Dict[int, float]:
+    """The evening window {hour: mult} in force on ET calendar day `et_day`:
+    {} before IMM_EVENING_SIZE_MULT_FROM."""
+    if EVENING_SIZE_MULT_FROM is not None and et_day < EVENING_SIZE_MULT_FROM:
+        return {}
+    return EVENING_SIZE_MULTS
 
 
 def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
@@ -1235,11 +1269,18 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     if not SCAN_HOUR_MULT and series in SCAN_GUARDED_SERIES:
         return 1.0
     mults = global_hour_mults(et.date())
-    if not mults:
+    evening = evening_hour_mults(et.date())
+    if not mults and not evening:
         return 1.0
     if any(series.startswith(p) for p in HOUR_MULT_EXCLUDE):
         return 1.0
-    return mults.get(hour, 1.0)
+    if hour in mults:
+        return mults[hour]
+    # the evening window (2026-10-05): never on a quiet hour, never on the
+    # sports ladders / escalators (their pre-kickoff window)
+    if hour in evening and not sports_ladder_league(series):
+        return evening[hour]
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -5823,6 +5864,86 @@ NEAR_CLIFF_SIZE_MULT = _env_float("IMM_NEAR_CLIFF_SIZE_MULT", 1.5)
 # quote-to-completion verdict is unaffected: a near-cliff market with
 # $0.50 or less banked keeps quoting at plain size.
 NEAR_CLIFF_BOOST_MIN_BANKED = _env_float("IMM_NEAR_CLIFF_BOOST_MIN_BANKED", 0.50)
+# YIELD SIZE MODE (Jack 2026-10-02, "1 and 2 for monday", from the multiplier
+# review): from 00:00 ET 2026-10-05 a market whose modelled reward per resting
+# contract (meta.yield_per_contract, $/contract/day -- the estimator's own
+# number, pads excluded) is at least YIELD_SIZE_MIN rests its ladder at
+# YIELD_SIZE_MULT. Market-days 9/15-10/1, long-dated families with no family
+# multiplier, less the exclusions below: yield >= $0.011 (~the top two-fifths)
+# netted 47c per 1k resting contract-hours on the 24h mark-out (39c on the
+# dashboard's trading P&L), positive every week, while the bottom fifth
+# netted ~0. x1.5 there: modelled +$17-22/day (reward diluted by our share of
+# the scored book, fills scaled 1:1).
+# Wired like the near-cliff size mode (the 2026-07-14 lesson): per ticker,
+# composed with it, at every reader of the shape -- the estimator's probe
+# ladder and the floor projection, the collateral reservation, the quote
+# loop and the placement guard's bracket (_market_size_mult). Caps and skew
+# knees are NOT scaled: the per-market cap bounds a boosted ladder exactly as
+# it bounds a near-cliff one. Decided on every refresh's estimate and STICKY
+# with hysteresis: a boosted market keeps the mode down to
+# YIELD_SIZE_EXIT_FRAC of the bar (its own extra size dilutes its per-contract
+# yield by up to 1 / (1 + 0.5 x its share)) and loses it when it leaves the
+# selection. Not eligible (yield_size_eligible): daily families; series with
+# a family multiplier or a hand-tuned ladder (applied_mention_mult != 1 --
+# earnings, sports ladders, Treasuries, daily rain, KXTRUMPAPPROVE ...);
+# open-scan members (unreviewed); the finecon tier (company KPIs, food
+# trackers, central banks); elections; and the families that lost money even
+# in their high-yield markets or are paid well under the model -- KXRT, gas
+# and diesel, econ & rates, sports & venues and awards (Kalshi pays them
+# 0.41x the model). IMM_YIELD_SIZE_MULT=1 switches it off.
+YIELD_SIZE_MULT = _env_float("IMM_YIELD_SIZE_MULT", 1.5)
+YIELD_SIZE_MULT_FROM = _env_et_day("IMM_YIELD_SIZE_MULT_FROM", "2026-10-05")
+YIELD_SIZE_MULT_FROM_TS = _et_day_start_ts(YIELD_SIZE_MULT_FROM)
+YIELD_SIZE_MIN = _env_float("IMM_YIELD_SIZE_MIN", 0.011)
+YIELD_SIZE_EXIT_FRAC = _env_float("IMM_YIELD_SIZE_EXIT_FRAC", 0.85)
+# prefixes: KXRT; gas & diesel; Treasuries and econ & rates; sports & venues;
+# awards, charts & media (imm_dashboard.family_of's lists)
+YIELD_SIZE_EXCLUDE_PREFIXES = tuple(p for p in os.environ.get(
+    "IMM_YIELD_SIZE_EXCLUDE",
+    "KXRT,KXAAAGAS,KXDIESEL,KXUSGASCPI,KXPAGAS,"
+    "KXUST,KXNOTE,KXTNOTE,TNOTE,KXTREASURYMAX,KX3MTBILL,"
+    "KXCBD,KXFED,KXRBNZ,KXBOI,KXECB,KXCPI,KXPCE,KXCOREPCE,KXOER,KXIBONDFIX,KXTEMPHELP,"
+    "KXNFL,KXMLB,KXNBA,KXNHL,KXWNBA,KXNCAA,KXUFC,KXVENUEPERFORM,KXMLS,KXWC,KXF1,"
+    "KXTTELITE,KXPGA,KXATP,KXWTA,"
+    "KXGGNOM,KXGRAMMY,KXOSCAR,KXCMA,KXART,KXTOP10BB,KXNETFLIXTOP,KXWEEKSNUM,"
+    "KXNATBOOK,KXVMA,KXEMMY,KXSPOTIFY,KXBILLBOARD,KXBOXOFFICE,KXYT,KXMUSIC,KXDWTS"
+).split(",") if p)
+# ...and by word: the unambiguous econ & rates words of family_of, plus awards
+YIELD_SIZE_EXCLUDE_WORDS = tuple(p for p in os.environ.get(
+    "IMM_YIELD_SIZE_EXCLUDE_WORDS",
+    "INFL,MORT,MTG,HPI,HOUSING,NHSALES,PERMITS,JOBS,JOBLESS,PAYROLL,JOLTS,UNEMP,GDP,CFNAI,NOBEL,ALBUM"
+).split(",") if p)
+_YIELD_TREASURY_RE = re.compile(r"KX\d+YR(DIR|RATE)")
+
+
+def yield_size_active(now_ts: Optional[float] = None) -> bool:
+    """Is the yield size mode switched on at `now_ts` (default: now)?"""
+    if YIELD_SIZE_MULT <= 0 or YIELD_SIZE_MULT == 1.0:
+        return False
+    if YIELD_SIZE_MULT_FROM_TS is None:
+        return True
+    return (now_ts if now_ts is not None else time.time()) >= YIELD_SIZE_MULT_FROM_TS
+
+
+def yield_size_eligible(series: str) -> bool:
+    """May a market of this series take the yield size mode at all?"""
+    if is_daily_series(series) or series in SCAN_GUARDED_SERIES:
+        return False
+    if series in FINECON_SERIES or series in FINECON_FAMILY:
+        return False
+    # a family multiplier, or a hand-tuned ladder / cap / quote-all spec
+    # (literal by design -- applied_mention_mult reads 1.0 for those)
+    ov = SERIES_OVERRIDES.get(series)
+    if ov and (ov.levels or ov.max_position is not None or ov.quote_all):
+        return False
+    if applied_mention_mult(series) != 1.0 or election_series(series) \
+            or sports_ladder_league(series):
+        return False
+    if "MENTION" in series:
+        return True        # a mention is none of the families below (KXWCMENTION)
+    if series.startswith(YIELD_SIZE_EXCLUDE_PREFIXES) or _YIELD_TREASURY_RE.match(series):
+        return False
+    return not any(w in series for w in YIELD_SIZE_EXCLUDE_WORDS)
 # ...and FIRST CALL ON ITS EVENT'S ROOM (2026-09-27, ROI scan item 4). The
 # quote loop splits each event's net cap evenly across its strikes
 # (share = remaining room / markets left), so on a many-strike event the
@@ -6237,6 +6358,10 @@ _CONFIG_CODE_KNOBS = (
     # gated Saturday step-up (2026-09-26); the verdict itself is a runtime
     # file, so the cycle log's hour_mult is where a PASS shows
     "SAT_SIZE_MULT_GATED",
+    # evening window + yield size mode (2026-10-05, code defaults)
+    "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM", "YIELD_SIZE_MULT",
+    "YIELD_SIZE_MULT_FROM", "YIELD_SIZE_MIN", "YIELD_SIZE_EXIT_FRAC",
+    "YIELD_SIZE_EXCLUDE_PREFIXES", "YIELD_SIZE_EXCLUDE_WORDS",
     # Carbon Arc fair-value gate (2026-09-26); the model's knobs live in
     # carbon_arc_fair.py and ride along in the fair file's "model" block
     "CA_FAIR_ENABLE", "CA_FAIR_TOL_CENTS", "CA_FAIR_TTL_MIN",
@@ -10621,6 +10746,7 @@ class MarketMeta:
     # default of 1.0 would pass that off as "ran at plain size"
     est_hour_mult: Optional[float] = None   # hour_size_mult the estimate ran at
     nc_size_mult: Optional[float] = None    # near-cliff mult on the probe ladder
+    ys_size_mult: Optional[float] = None    # yield size mode after this refresh's verdict
     floor_by_mult: List[List[float]] = field(default_factory=list)
     #   [[mult, weight, $/day at that mult], ...]; [] = floor is the live estimate
     floor_realized_ratio: Optional[float] = None   # incumbent: resting score /
@@ -10862,6 +10988,10 @@ class IncentiveMarketMaker:
         # the banked accrual crosses the cliff or the market leaves the selection
         self._near_cliff_boost: Dict[str, float] = {}
         self._near_cliff_noted: Dict[str, float] = {}   # ticker -> ts of the last verdict log
+        # yield size mode (2026-10-05): ticker -> armed ts; sticky with
+        # hysteresis until the yield falls under YIELD_SIZE_EXIT_FRAC of the
+        # bar or the market leaves the selection
+        self._yield_boost: Dict[str, float] = {}
         # hourly-window auto-arm (2026-09-27): did the last live feed carry a
         # candidate on an hourly program? Set by every refresh; the first
         # refresh runs regardless (universe_at starts at 0).
@@ -12631,6 +12761,41 @@ class IncentiveMarketMaker:
             return 1.0
         return NEAR_CLIFF_SIZE_MULT if ticker in self._near_cliff_boost else 1.0
 
+    def _yield_size_mult(self, ticker: str) -> float:
+        """YIELD_SIZE_MULT while `ticker` is in the yield size mode, else 1.0."""
+        if not yield_size_active():
+            return 1.0
+        return YIELD_SIZE_MULT if ticker in self._yield_boost else 1.0
+
+    def _market_size_mult(self, ticker: str) -> float:
+        """Every PER-MARKET ladder multiplier: near-cliff size mode x yield size
+        mode. The one number each reader of the shape applies (estimator probe
+        and floor projection, collateral reservation, quote loop, placement
+        guard), so all of them see the ladder the quote loop rests."""
+        return self._near_cliff_size_mult(ticker) * self._yield_size_mult(ticker)
+
+    def _yield_size_verdict(self, meta: "MarketMeta", now_ts: float) -> None:
+        """Arm / keep / drop the yield size mode on this refresh's estimate.
+        Arms at YIELD_SIZE_MIN, holds down to YIELD_SIZE_EXIT_FRAC of it."""
+        t = meta.ticker
+        if not (yield_size_active(now_ts) and yield_size_eligible(meta.series)):
+            self._yield_boost.pop(t, None)
+        else:
+            y = meta.yield_per_contract or 0.0
+            if t in self._yield_boost:
+                if y < YIELD_SIZE_MIN * YIELD_SIZE_EXIT_FRAC:
+                    del self._yield_boost[t]
+            elif y >= YIELD_SIZE_MIN:
+                self._yield_boost[t] = now_ts
+        meta.ys_size_mult = YIELD_SIZE_MULT if t in self._yield_boost else 1.0
+
+    def _prune_yield_boost(self) -> None:
+        """Drop the yield size mode for markets that left the selection (a
+        challenger armed last refresh and not taken is re-judged when next
+        estimated)."""
+        for t in [t for t in self._yield_boost if t not in self.state.selected]:
+            del self._yield_boost[t]
+
     def _prune_near_cliff_boost(self) -> None:
         """End near-cliff mode for markets that crossed the cliff (banked >=
         PAYOUT_FLOOR_DOLLARS this period) or left the selection. Runs at the
@@ -13191,6 +13356,7 @@ class IncentiveMarketMaker:
                     (o.get("book_side", "bid"), int(o.get("yes_price", 0)),
                      float(o.get("remaining_count", 0))))
         self._prune_near_cliff_boost()
+        self._prune_yield_boost()
         ranked: List[MarketMeta] = []
         for meta in screened:
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
@@ -13586,7 +13752,7 @@ class IncentiveMarketMaker:
             bid = int(meta.mid_cents - meta.spread_cents / 2)
             ask = int(meta.mid_cents + meta.spread_cents / 2)
             lv = scale_levels(hour_scaled_levels(meta.series, now_utc),
-                              self._near_cliff_size_mult(meta.ticker))
+                              self._market_size_mult(meta.ticker))
             # per-side deep-reference size multipliers (2026-08-02 audit):
             # atref rests up to 2x the spec size, so an unscaled reservation
             # under-charged the budget up to ~2x on mid-priced deep-ref books
@@ -13707,6 +13873,13 @@ class IncentiveMarketMaker:
             f"({len(forced)} forced quote-all @ ~${forced_collateral:.0f}, "
             f"total ~${collateral:.0f} ladder collateral, "
             f"${inv_reserve:.0f} inventory reserve); skips {skipped}")
+        if yield_size_active(now_ts):
+            n_ys = sum(1 for t in selected if t in self._yield_boost)
+            if n_ys != getattr(self, "_ys_logged_n", None):
+                self._ys_logged_n = n_ys
+                log(f"{self.tag} yield size: {n_ys} of {len(selected)} selected markets at "
+                    f"x{YIELD_SIZE_MULT:g} (yield >= ${YIELD_SIZE_MIN:g}/contract/day, "
+                    f"held to ${YIELD_SIZE_MIN * YIELD_SIZE_EXIT_FRAC:g})")
         if added:
             log(f"{self.tag} + selected: {', '.join(sorted(added)[:8])}"
                 + (" ..." if len(added) > 8 else ""))
@@ -13736,6 +13909,7 @@ class IncentiveMarketMaker:
                         "est_frac": round(mt.est_frac, 6),
                         "est_hour_mult": mt.est_hour_mult,
                         "nc_size_mult": mt.nc_size_mult,
+                        "ys_size_mult": mt.ys_size_mult,
                         "floor_by_mult": mt.floor_by_mult or None,
                         "floor_realized_ratio": (
                             round(mt.floor_realized_ratio, 4)
@@ -14215,7 +14389,7 @@ class IncentiveMarketMaker:
         when the book can't be read."""
         meta.floor_dollars_per_day = 0.0     # set with the estimate below
         # decision-input logging: set below only if the estimate actually runs
-        meta.est_hour_mult = meta.nc_size_mult = None
+        meta.est_hour_mult = meta.nc_size_mult = meta.ys_size_mult = None
         meta.floor_realized_ratio = None
         # Live-CONFIRMED events never come back (Jack 2026-08-31 #2): worth
         # nothing by decree, without even reading the book — so no market of
@@ -14305,7 +14479,10 @@ class IncentiveMarketMaker:
         # projection sees the size the quote loop will rest
         _ncm = self._near_cliff_size_mult(meta.ticker)
         meta.nc_size_mult = _ncm       # decision-input logging (analytics only)
-        _lv = scale_levels(hour_scaled_levels(meta.series, _now), _ncm)
+        # ...and the yield size mode (2026-10-05) on top: every per-market
+        # multiplier the quote loop will apply (_market_size_mult)
+        _msm = _ncm * self._yield_size_mult(meta.ticker)
+        _lv = scale_levels(hour_scaled_levels(meta.series, _now), _msm)
         # Carbon Arc late-month rule: the hypothetical ladder is per side too,
         # so the reward estimate (and the $1 floor projection built on it)
         # see the size the quote loop will actually rest.
@@ -14478,6 +14655,10 @@ class IncentiveMarketMaker:
         meta.est_dollars_per_day = frac * meta.dollars_per_day
         meta.yield_per_contract = \
             (meta.est_dollars_per_day / n_contracts) if n_contracts else 0.0
+        # yield size mode verdict (2026-10-05) on this estimate: the size it
+        # sets reaches the collateral reservation and the quote loop at once,
+        # this estimate and its floor projection next refresh (conservative)
+        self._yield_size_verdict(meta, time.time())
         # FLOOR PROJECTION. 2026-09-25 (FLOOR_PROJECTION_BASE_SIZE): judged at
         # DAY size so a market is not admitted on doubled size and evicted
         # on normal size. 2026-09-26 (FLOOR_PROJECTION_SCHEDULE, Jack: "the
@@ -14519,7 +14700,7 @@ class IncentiveMarketMaker:
                     """The ladder at hour multiplier m and side multipliers
                     bm / am, scored on the external book."""
                     q_m = _probe_ladder(
-                        m, scale_levels(scaled_levels_at(meta.series, m), _ncm),
+                        m, scale_levels(scaled_levels_at(meta.series, m), _msm),
                         capped_ref_mult(xb, xrb, "bid", hour_mult=m, series=meta.series),
                         capped_ref_mult(xa, xra, "ask", hour_mult=m, series=meta.series),
                         xb, xa, xrb, xra, sides=(bm, am))
@@ -16101,7 +16282,8 @@ class IncentiveMarketMaker:
             # near-cliff SIZE mode (2026-09-26): x NEAR_CLIFF_SIZE_MULT until
             # the banked accrual crosses the cliff (same shape everywhere:
             # collateral reservation and placement guard scale with it)
-            lv = scale_levels(lv, self._near_cliff_size_mult(t))
+            # ...and the yield size mode (2026-10-05): _market_size_mult
+            lv = scale_levels(lv, self._market_size_mult(t))
             hm = hour_size_mult(meta.series, now_utc)
             # Carbon Arc late-month rule (Jack 2026-09-24, ca_late_month_mults):
             # from here the ladder is PER SIDE -- no bid rungs and asks at
@@ -16905,7 +17087,7 @@ class IncentiveMarketMaker:
             # room/ladder layer, this is the runaway backstop.
             lv_now = scale_levels(
                 hour_scaled_levels(series, datetime.fromtimestamp(now_ts, tz=timezone.utc)),
-                self._near_cliff_size_mult(q.ticker))
+                self._market_size_mult(q.ticker))
             cap_mult = REF_DEPTH_MAX_MULT if LADDER_MODE == "atref" else 1.0
             side_cap = sum(s for _t, s in lv_now) * cap_mult
             # atref collapses the side's WHOLE ladder to one price level by
@@ -18273,6 +18455,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"[IMM] earnings size SCHEDULED: x{MENTION_SIZE_MULT * EARNINGS_SIZE_MULT_NEXT:g} "
             f"from 00:00 ET {EARNINGS_SIZE_MULT_FROM.isoformat()} "
             f"(in force now: x{MENTION_SIZE_MULT * earnings_size_mult():g})")
+    if EVENING_SIZE_MULTS:
+        _ev_now = bool(evening_hour_mults(datetime.now(ET).date()))
+        log(f"[IMM] evening window (long-dated, not sports ladders): "
+            f"{dict(sorted(EVENING_SIZE_MULTS.items()))}"
+            + (f" from 00:00 ET {EVENING_SIZE_MULT_FROM.isoformat()}"
+               if EVENING_SIZE_MULT_FROM is not None else "")
+            + f" ({'in force' if _ev_now else 'not yet in force'})")
+    if YIELD_SIZE_MULT > 0 and YIELD_SIZE_MULT != 1.0:
+        log(f"[IMM] yield size mode: x{YIELD_SIZE_MULT:g} on markets yielding >= "
+            f"${YIELD_SIZE_MIN:g}/contract/day (held to x{YIELD_SIZE_EXIT_FRAC:g} of it), "
+            f"long-dated, no family multiplier, excl. finecon / elections / "
+            f"{len(YIELD_SIZE_EXCLUDE_PREFIXES)} prefixes / {len(YIELD_SIZE_EXCLUDE_WORDS)} words"
+            + (f"; from 00:00 ET {YIELD_SIZE_MULT_FROM.isoformat()}" if YIELD_SIZE_MULT_FROM else "")
+            + f" ({'in force' if yield_size_active() else 'not yet in force'})")
     log("[IMM] floor credit (2026-09-25): exit / banked re-entry bar = "
         + ("$%.2f payout cliff" % PAYOUT_FLOOR_DOLLARS if EXIT_FLOOR_IS_PAYOUT
            else "series entry bar")
