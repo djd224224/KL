@@ -63,8 +63,11 @@ class TestParsing(unittest.TestCase):
             v = 5.0 + (0.05 if i % 2 else 0.0)          # alternate +-5bp
             lines.append(f"{(d + timedelta(days=i)).strftime('%m/%d/%Y')},4,{v},{v},{v},{v},{v}")
         sig = tf.sigma_from_par_csv(["\n".join(lines)], days=60)
-        self.assertEqual(sorted(sig), [2, 5, 7, 10, 30])
+        self.assertEqual(sorted(k for k in sig if isinstance(k, int)), [2, 5, 7, 10, 30])
         self.assertAlmostEqual(sig[10], 0.05, places=2)
+        # the 10Y-2Y spread from the same rows (both legs moved together: 0)
+        self.assertAlmostEqual(sig[(10, 2)], 0.0, places=6)
+        self.assertNotIn((10, 0), sig)                   # no 3 Mo column here
         self.assertEqual(tf.sigma_from_par_csv(["Date,10 Yr\n01/02/2026,5"]), {})
 
 
@@ -147,7 +150,7 @@ class TestVerdict(unittest.TestCase):
     def test_reasons(self):
         w = self._watch()
         self.assertEqual(self._r(w, 5.25)[1]["reason"], "near")      # 5.26 vs 5.245
-        self.assertEqual(self._r(w, 5.40)[1]["reason"], "decided")   # 5.26 already below
+        self.assertEqual(self._r(w, 5.40)[1]["reason"], "crossed")   # 5.26 already below
         why, inp = self._r(w, 5.10, bid=40, ask=60)
         self.assertEqual((why, inp), ("", {}))                         # fair ~45c, book agrees
         why, inp = self._r(w, 5.10, bid=30, ask=32)                   # ask far under fair
@@ -194,6 +197,101 @@ class TestVerdict(unittest.TestCase):
         self.assertGreater(p, 0.95)
         # too long a window has no fair
         self.assertIsNone(w.fair(10, "L", 5.21, date(2027, 6, 30), et(2026, 10, 2, 16, 0)))
+
+
+class TestAllTreasuryMarkets(unittest.TestCase):
+    """Jack 2026-10-02: "should use this for all treasury markets"."""
+
+    NOW = et(2026, 10, 2, 13, 0)                       # a Friday
+
+    def test_classify(self):
+        for s, inst in (("KXUST10AM", 10), ("KXUST2AD", 2), ("KXUST30AW", 30),
+                        ("KXUST10A", 10), ("KXUST10", 10), ("KXUST10M", 10),
+                        ("KXUST10YRRATE27", 10), ("KXUST30YRRATE27", 30),
+                        ("KXUST10Y27", 10)):
+            self.assertEqual(tf.classify(s), {"kind": "point", "inst": inst, "dir": "G"}, s)
+        self.assertEqual(tf.classify("KX10YRDIRLM"), {"kind": "touch", "inst": 10, "dir": "L"})
+        self.assertEqual(tf.classify("KX10Y2Y"), {"kind": "touch", "inst": (10, 2), "dir": "H"})
+        self.assertEqual(tf.classify("KX10Y3M")["inst"], (10, 0))
+        for s in ("KX2YFOMC", "KXTREASURYMAX", "KXNOTE10", "TNOTE", "KXUSTYLD",
+                  "KX3MTBILL", "KXYINVERT", "KX10Y2YDATE", "KXUSTM", "KX30YUSTW", ""):
+            self.assertIsNone(tf.classify(s), s)
+
+    def test_point_fair(self):
+        last = date(2026, 10, 30)
+        # 10Y at 5.26, 20 fixes of ~5.84bp/day to Oct 30: above 5.15 ~ 65%
+        p = tf.p_point(5.26, 5.15, last, self.NOW, 0.0584)
+        self.assertAlmostEqual(p, 0.66, delta=0.02)
+        self.assertAlmostEqual(tf.p_point(5.26, 5.255, last, self.NOW, 0.0584), 0.5, delta=0.02)
+        self.assertLess(tf.p_point(5.26, 6.50, last, self.NOW, 0.0584), 0.001)
+        # the market date's own fix pending after 15:30: the 15:30 read decides
+        at4 = et(2026, 10, 30, 16, 0)
+        self.assertGreater(tf.p_point(5.10, 5.15, last, at4, 0.0584, pending_y=5.20), 0.99)
+        self.assertIsNone(tf.p_point(5.26, 5.15, date(2026, 10, 31), self.NOW, 0.0584))  # Sat
+        self.assertIsNone(tf.p_point(5.26, 5.15, last, et(2026, 10, 31, 9, 0), 0.0584))
+
+    def _watch(self, quotes):
+        w = tf.YieldWatch()
+        w.set_sigma({10: 0.0467, 2: 0.0546, (10, 2): 0.036}, "t")
+        now_ts = self.NOW.timestamp()
+        w.update({t: {"y": y, "ts": now_ts - 30, "status": "REG_MKT", "realtime": True}
+                  for t, y in quotes.items()}, now_ts)
+        return w
+
+    def test_point_verdicts_by_horizon(self):
+        w = self._watch({10: 5.26})
+        ts = self.NOW.timestamp()
+        oct30 = datetime(2026, 10, 30, 19, 30, tzinfo=timezone.utc)
+        # month-end, 28 days out: fair ~66c for T5.15; book 60x70 agrees
+        self.assertEqual(w.verdict("KXUST10AM", "KXUST10AM-26OCT30-T5.15", ts, 60, 70, oct30),
+                         ("", {}))
+        self.assertEqual(w.verdict("KXUST10AM", "KXUST10AM-26OCT30-T5.15", ts, 80, 85,
+                                   oct30)[1]["reason"], "band")
+        # 28 days out a strike 1bp from the live yield is NOT "near" (point,
+        # > NEAR_MAX_DAYS_POINT) -- tomorrow's daily is
+        self.assertEqual(w.verdict("KXUST10AM", "KXUST10AM-26OCT30-T5.25", ts, 45, 55,
+                                   oct30), ("", {}))
+        mon = datetime(2026, 10, 5, 19, 30, tzinfo=timezone.utc)
+        self.assertEqual(w.verdict("KXUST10AD", "KXUST10AD-26OCT05-T5.25", ts, 45, 55,
+                                   mon)[1]["reason"], "near")
+        # year-end 2027: past FAIR_MAX_DAYS -- no fair checks, a wild book quotes
+        dec27 = datetime(2027, 12, 31, 20, 30, tzinfo=timezone.utc)
+        self.assertEqual(w.verdict("KXUST10YRRATE27", "KXUST10YRRATE27-27DEC31-T1.99",
+                                   ts, 68, 99, dec27), ("", {}))
+        # ...but the release window and the feed checks still apply
+        w8 = self._watch({10: 5.26})
+        w8.update({10: {"y": 5.26, "ts": et(2026, 10, 2, 8, 30).timestamp(),
+                        "status": "REG_MKT", "realtime": True}},
+                  et(2026, 10, 2, 8, 30).timestamp())
+        self.assertEqual(w8.verdict("KXUST10YRRATE27", "KXUST10YRRATE27-27DEC31-T1.99",
+                                    et(2026, 10, 2, 8, 30).timestamp(), 68, 99,
+                                    dec27)[1]["reason"], "release")
+        self.assertEqual(w.verdict("KXUST10YRRATE27", "KXUST10YRRATE27-27DEC31-T1.99",
+                                   ts + tf.READ_TTL_SECS + 5, 68, 99,
+                                   dec27)[1]["reason"], "stale_read")
+        # an unmodelled Treasury series stands aside
+        self.assertEqual(w.verdict("KX2YFOMC", "KX2YFOMC-26OCT28-T10", ts, 40, 60,
+                                   oct30)[1]["reason"], "unmodelled")
+
+    def test_spread_touch(self):
+        w = self._watch({10: 5.26, 2: 4.80})               # spread 0.46%
+        ts = self.NOW.timestamp()
+        dec31 = datetime(2026, 12, 31, 21, 59, tzinfo=timezone.utc)
+        # 0.46 already above 0.40: crossed; 0.70 far away: quotes (long window)
+        self.assertEqual(w.verdict("KX10Y2Y", "KX10Y2Y-26DEC31-T.40", ts, 40, 60,
+                                   dec31)[1]["reason"], "crossed")
+        self.assertEqual(w.verdict("KX10Y2Y", "KX10Y2Y-26DEC31-T.70", ts, 22, 99, dec31),
+                         ("", {}))
+        self.assertEqual(w.verdict("KX10Y2Y", "KX10Y2Y-26DEC31-T.47", ts, 40, 60,
+                                   dec31)[1]["reason"], "near")
+        # a missing leg fails closed
+        w2 = self._watch({10: 5.26})
+        self.assertEqual(w2.verdict("KX10Y2Y", "KX10Y2Y-26DEC31-T.70", ts, 22, 99,
+                                    dec31)[1]["reason"], "no_quote")
+        # the spread freezes when either leg moves
+        w.update({2: {"y": 4.77, "ts": ts + 60, "status": "REG_MKT", "realtime": True}}, ts + 60)
+        self.assertEqual(w.verdict("KX10Y2Y", "KX10Y2Y-26DEC31-T.70", ts + 61, 22, 99,
+                                   dec31)[1]["reason"], "moving")
 
 
 if __name__ == "__main__":

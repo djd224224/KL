@@ -5979,3 +5979,53 @@ not price. The point-in-time Treasury markets (KXUST*AD/AM/...) keep their
 WATCH: startup "treasury gate: ...", "treasury: sigma {...}", "treasury
 stand-aside / resume" lines, "treasury: US10Y moved 4.1bp in 10m --
 freezing" around 08:30, no ladder orders 08:25-08:45 / 09:55-10:10 ET.
+
+## 2026-10-02 — The live-yield gate covers EVERY Treasury market (Jack)
+
+Jack, after the touch-ladder gate (9aab273) went to main: "should use this for
+all treasury markets".
+
+SCOPE. treasury_gated_series: the whole Treasury allowlist
+(TREASURY_GATED_SERIES = IMM_RATES_SERIES + IMM_RATES_EXTRA_SERIES, 69 series)
+quotes only through treasury_gate_reason -> YieldWatch.verdict. CNBC now also
+reads US3M (one request, six symbols).
+
+MODELS (treasury_fair.classify):
+- POINT ("par yield ABOVE K on date D", strike_type greater, T strikes):
+  KXUST{2,5,7,10,30}A{D,W,M}, KXUST{2,5,10,30}A, KXUST{2,5,10,30},
+  KXUST{5,10,30}M, KXUST{10,30}YRRATE<yy>, KXUST10Y<yy>. Fair = the normal
+  tail at D's 15:30 fix: live yield, sigma^2 x the business-day variance to
+  D, +1bp basis; D's own fix pending after 15:30 at the 15:30 read.
+- TOUCH: the DIR ladders as before, plus KX10Y2Y / 10Y2Y (10Y-2Y) and
+  KX10Y3M / 10Y3M (10Y-3M) as touch-ABOVE on the live spread (FRED's T10Y2Y /
+  T10Y3M are the par curve's differences); sigma from the spread's own par
+  changes (10/2: 4.1 / 5.6 bp/day).
+- UNMODELLED -> stand aside ("unmodelled"): KX2YFOMC (FOMC-day move), the
+  bills (KX3MTBILL, TBILL), KXTREASURYMAX/5 (year max), KXUSTYLD (tenor only
+  in the rules), KXUSTM, KX30YUSTW, the KXNOTE*/KXTNOTE*/TNOTE* names and
+  KXYINVERT/YINVERT/KX10Y2YDATE. None has an open program on 10/2; each needs
+  its rules read before it can be modelled.
+
+HORIZON RULES. Feed (no feed / stale read / stale quote), release windows
+(08:25-08:45, 09:55-10:10 ET weekdays) and the move freeze (>= 3bp in 10 min)
+apply to everything. A touch strike the live value has already CROSSED
+stands aside at any horizon. NEAR (within 2bp of the live value): touch
+always, point only within IMM_TREASURY_NEAR_MAX_DAYS_POINT (7) days -- a
+month-end strike 1bp from the yield moves ~1.5c per bp, a daily's ~7c. The
+fair checks (decided < 3c / > 97c, the 10c band) apply only within
+IMM_TREASURY_FAIR_MAX_DAYS (45) of the market date: past it (the 2027
+year-end pair) the live yield barely moves the fair, and a driftless random
+walk over 15 months would only create false stand-asides.
+
+DRY RUN 10/02 ~01:27Z (launcher env, live books, every Treasury market with
+a program): 393 of 403 strikes quote -- all 75 month-end (KXUST*AM-26OCT30)
+and 50 year-end strikes, the ladders less 6 near and 4 crossed (10Y-low
+T5.27-T5.29, already resolved on 10/1's 5.24 fix).
+
+KILL SWITCHES. IMM_TREASURY_GATE_ALL=0 restores the 2026-10-01 scope (only
+the ladders gated; the rest quoted plain, as they were for months);
+IMM_TREASURY_GATE_ENABLE=0 additionally BLOCKS the ladders.
+
+WATCH: startup "treasury gate: ALL 69 Treasury series quote only against
+CNBC's live yield ...", "treasury stand-aside KXUST..." lines in the 08:25 /
+09:55 windows, and the daily KXUST*AD book on the day before each print.

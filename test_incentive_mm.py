@@ -16562,6 +16562,51 @@ class TestTreasuryTouchGate(unittest.TestCase):
         self.assertEqual(self._quotes(bot, t), [])
         self.assertIn(t, bot._treasury_stood)
 
+    def test_every_treasury_series_goes_through_the_gate(self):
+        # Jack 2026-10-02: "should use this for all treasury markets"
+        self.assertTrue(imm.TREASURY_GATE_ALL)
+        for s in ("KXUST10AD", "KXUST10AM", "KXUST2AW", "KXUST10YRRATE27",
+                  "KXUST30YRRATE27", "KX10Y2Y", "KX2YFOMC", "KXTREASURYMAX",
+                  "KXNOTE10", "TNOTE", "KX10YRDIRLM"):
+            self.assertTrue(imm.treasury_gated_series(s), s)
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+        for s in ("KXCPICORE", "KXFED", "KXAAAGASD", "KX10YRRATE15M", ""):
+            self.assertFalse(imm.treasury_gated_series(s), s)
+        # a series the fair cannot price stands aside once the feed is up
+        imm._treasury_state["watch"] = self._watch()
+        self.assertEqual(imm.treasury_gate_reason(
+            "KX2YFOMC", "KX2YFOMC-26OCT28-T10", time.time(), 40, 60,
+            self.CLOSE)[1]["reason"], "unmodelled")
+
+    def test_point_market_quotes_against_the_live_fair(self):
+        # a point market settles on ONE business day's fix: step the fixture
+        # close forward to one (a weekend / SIFMA close has no fix)
+        close = self.CLOSE
+        while not self.tf.business_day(close.astimezone(self.tf.ET).date()):
+            close += timedelta(days=1)
+        ev = f"KXUST10AM-{close:%y}{close.strftime('%b').upper()}{close:%d}"
+        w = self._watch()
+        last = self.tf.last_day_of(ev, close)
+        now = datetime.now(timezone.utc)
+        k = min((abs(w.fair(10, "G", kk / 100, last, now) - 0.5), kk / 100)
+                for kk in range(500, 552))[1]
+        t = f"{ev}-T{k:.2f}"
+        self.EV, saved = ev, self.EV
+        self.CLOSE, saved_close = close, self.CLOSE
+        try:
+            bot = self._bot(t)
+        finally:
+            self.EV, self.CLOSE = saved, saved_close
+        bot.run_cycle()                                       # no feed: nothing
+        self.assertEqual(self._quotes(bot, t), [])
+        self.assertIn(t, bot._treasury_stood)
+        imm._treasury_state["watch"] = w                      # fair ~50c, book 49x51
+        bot.run_cycle()
+        q = self._quotes(bot, t)
+        self.assertIn("bid", {s_ for s_, _p in q})
+        self.assertIn("ask", {s_ for s_, _p in q})
+        self.assertNotIn(t, bot._treasury_stood)
+
 
 class TestMortgageFairGate(unittest.TestCase):
     """mortgage_fair's snapshot -> mort_gate / mort_cap_quotes -> the

@@ -6190,7 +6190,7 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
-    "TREASURY_GATE_ENABLE",
+    "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
     # long-dated mortgage gate (2026-09-28); mortgage_fair's model knobs
     # ride in its status file's "model" block
     "MORT_ENABLE", "MORT_SERIES", "MORT_FAIR_TOL_CENTS", "MORT_FAIR_TTL_MIN",
@@ -7976,6 +7976,34 @@ _treasury_state: dict = {"watch": None}
 
 def treasury_touch_series(series: str) -> bool:
     return TREASURY_GATE_ENABLE and bool(_TREASURY_TOUCH_RE.fullmatch(series or ""))
+
+
+# EVERY TREASURY MARKET (Jack 2026-10-02: "should use this for all treasury
+# markets"): the whole Treasury allowlist -- the ten dailies / monthlies and
+# every _DEFAULT_RATES_EXTRA_SERIES family -- goes through the same gate.
+# treasury_fair.classify models the point markets (the par yield ON a date
+# above K: KXUST*A{D,W,M}, the older KXUST names, the year-end KXUST{10,30}
+# YRRATE<yy> / KXUST10Y<yy>), the touch ladders and the 10Y-2Y / 10Y-3M
+# spread touches; every other shape (bucket strikes, the FOMC move, the bill,
+# inversion, year-max and note series) stands aside as "unmodelled". Within
+# FAIR_MAX_DAYS (45) of the market date the fair checks apply; past it only
+# the feed / release / move checks. IMM_TREASURY_GATE_ALL=0 restores the
+# 2026-10-01 scope: the ladders gated, the rest quoted plain as before.
+TREASURY_GATE_ALL = os.environ.get("IMM_TREASURY_GATE_ALL", "1") == "1"
+TREASURY_GATED_SERIES = frozenset(
+    s.strip() for s in (
+        os.environ.get("IMM_RATES_SERIES", _DEFAULT_RATES_SERIES) + ","
+        + os.environ.get("IMM_RATES_EXTRA_SERIES", _DEFAULT_RATES_EXTRA_SERIES)
+    ).split(",") if s.strip())
+
+
+def treasury_gated_series(series: str) -> bool:
+    """True if the Treasury gate decides this series' quoting: the touch
+    ladders always (while the gate is on), every other Treasury allowlist
+    series while TREASURY_GATE_ALL."""
+    return treasury_touch_series(series) or (
+        TREASURY_GATE_ENABLE and TREASURY_GATE_ALL
+        and (series or "") in TREASURY_GATED_SERIES)
 
 
 def treasury_gate_reason(series: str, ticker: str, now_ts: float,
@@ -15902,10 +15930,11 @@ class IncentiveMarketMaker:
                 self._vercel_stood.discard(t)
                 log(f"{self.tag} vercel resume {t}")
 
-            # TREASURY TOUCH GATE (Jack 2026-10-01, see TREASURY_GATE_ENABLE):
-            # the how-high / how-low ladders quote only against the live
-            # CNBC yield's touch fair; fails CLOSED without a fresh read.
-            if treasury_touch_series(meta.series):
+            # TREASURY GATE (Jack 2026-10-01, see TREASURY_GATE_ENABLE; every
+            # Treasury series since 2026-10-02, TREASURY_GATE_ALL): quoted
+            # only against the live CNBC yield's fair; fails CLOSED without a
+            # fresh read or a model for the series.
+            if treasury_gated_series(meta.series):
                 tr_why, tr_in = treasury_gate_reason(
                     meta.series, t, now_ts, ext_bid, ext_ask, meta.close_time)
                 if tr_why:
@@ -17757,9 +17786,13 @@ class IncentiveMarketMaker:
         else:
             log("vercel gate: OFF -- the Vercel series are not enrolled")
         if TREASURY_GATE_ENABLE:
-            log("treasury gate: how-high / how-low ladders (KX{2,5,7,10,30}YRDIR"
-                "{H,L}{M,W}) quote only against CNBC's live yield (touch fair), "
-                f"fail-closed, status {TREASURY_STATUS_FILE}")
+            log("treasury gate: "
+                + (f"ALL {len(TREASURY_GATED_SERIES)} Treasury series"
+                   if TREASURY_GATE_ALL else
+                   "the how-high / how-low ladders (KX{2,5,7,10,30}YRDIR{H,L}{M,W})")
+                + " quote only against CNBC's live yield (touch / point fair; "
+                "unmodelled shapes stand aside), fail-closed, status "
+                f"{TREASURY_STATUS_FILE}")
         else:
             log("treasury gate: OFF -- the how-high / how-low ladders are BLOCKED")
         if MORT_ENABLE:
