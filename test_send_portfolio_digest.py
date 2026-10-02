@@ -430,5 +430,75 @@ class PerpsAndRewardsTests(unittest.TestCase):
         self.assertEqual(back[0]["unpaid_rewards_est"], 1829.4)
 
 
+class ImmSectionTests(unittest.TestCase):
+    """Jack 2026-10-02: "cut it as a standalone email and add it into the
+    Kalshi portfolio ... email" -- the IMM digest is a section of this one."""
+
+    def _pf(self):
+        return BuildEmailTests._pf(self)
+
+    def test_section_follows_the_movers_and_flags_the_subject(self):
+        imm = {"text": "INCENTIVE MM body", "html": "<div>IMM-HTML</div>",
+               "subject_flag": " - PICK-OFF WINDOW"}
+        subject, text, html = pf.build_email(self._pf(), [], chart_ok=False, imm=imm)
+        self.assertTrue(subject.endswith("trading -225.09 - PICK-OFF WINDOW"))
+        self.assertLess(text.index("ALL FAMILIES"), text.index("INCENTIVE MM body"))
+        self.assertLess(html.index("ALL FAMILIES"), html.index("<div>IMM-HTML</div>"))
+        self.assertTrue(html.endswith("<div>IMM-HTML</div></div>"))
+
+    def test_a_failed_section_is_one_line_not_a_held_email(self):
+        subject, text, html = pf.build_email(self._pf(), [], chart_ok=False,
+                                             imm={"error": "exit 1, see <log>"})
+        self.assertIn("INCENTIVE MM: section unavailable (exit 1, see <log>)", text)
+        self.assertIn("Incentive MM section unavailable: exit 1, see &lt;log>", html)
+        self.assertNotIn("PICK-OFF", subject)
+
+    def test_no_section_leaves_the_email_as_it_was(self):
+        self.assertEqual(pf.build_email(self._pf(), [], chart_ok=False),
+                         pf.build_email(self._pf(), [], chart_ok=False, imm=None))
+
+    def test_the_section_is_built_in_a_child_process(self):
+        import os
+        import tempfile
+        d = tempfile.mkdtemp()
+        old = (pf.LOG_DIR, pf.IMM_SECTION_LOG)
+        pf.LOG_DIR, pf.IMM_SECTION_LOG = d, os.path.join(d, "imm-section.log")
+
+        def script(name, body):
+            p = os.path.join(d, name)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(body)
+            return p
+        try:
+            # stands in for send_imm_digest.py --section-out PATH; the child
+            # writes UTF-8 whatever the task console's code page
+            ok = script("ok.py", "import json, os, sys\n"
+                                 "assert os.environ['PYTHONIOENCODING'] == 'utf-8'\n"
+                                 "print('\\u2014 building')\n"
+                                 "with open(sys.argv[2], 'w', encoding='utf-8') as f:\n"
+                                 "    json.dump({'text': 'T \\u2014', 'html': 'H',"
+                                 " 'subject_flag': ''}, f)\n")
+            sec = pf.imm_section("2026-10-02", script=ok, timeout=60)
+            self.assertEqual((sec.get("text"), sec.get("html")), ("T \u2014", "H"), sec)
+            self.assertTrue(os.path.exists(os.path.join(d, "imm_section_2026-10-02.json")))
+            sec = pf.imm_section("2026-10-02", timeout=60,
+                                 script=script("bad.py", "print('boom')\nraise SystemExit(3)\n"))
+            self.assertIn("exit 3", sec["error"])
+            with open(pf.IMM_SECTION_LOG, encoding="utf-8") as f:
+                log_text = f.read()
+            self.assertIn("boom", log_text)
+            self.assertIn("\u2014 building", log_text)
+            sec = pf.imm_section("2026-10-02", timeout=1,
+                                 script=script("slow.py", "import time\ntime.sleep(30)\n"))
+            self.assertIn("timed out", sec["error"])
+            sec = pf.imm_section("2026-10-02", timeout=60,
+                                 script=script("empty.py", "raise SystemExit(0)\n"))
+            self.assertIn("unreadable output", sec["error"])
+        finally:
+            pf.LOG_DIR, pf.IMM_SECTION_LOG = old
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

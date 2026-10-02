@@ -35,10 +35,10 @@ Set-Location $Repo
 New-Item -ItemType Directory -Force (Join-Path $Repo "run-logs\incentive-mm") | Out-Null
 
 $env:PYTHONIOENCODING = "utf-8"
-# The rich HTML morning email is sent by the separate "KL incentive_mm DIGEST"
-# task (send_imm_digest.py), mirroring the crypto fleet. Suppress the bot's own
-# plain-text one-liner email so there's no duplicate; it still STORES the daily
-# summary in status_incentive_mm.json (the digest reads reward figures from it).
+# The rich HTML morning digest (send_imm_digest.py) is a section of the 7:00
+# portfolio email since 2026-10-02. Suppress the bot's own plain-text
+# one-liner email so there's no duplicate; it still STORES the daily summary
+# in status_incentive_mm.json (the digest reads activity figures from it).
 $env:IMM_SUMMARY_EMAIL = "0"
 # Task Scheduler sessions can lack APPDATA (hides pip --user installs).
 $UserSite = "C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages"

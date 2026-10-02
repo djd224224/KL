@@ -388,6 +388,22 @@ or `python incentive_mm.py --cancel-all`.
 
 ## Daily email digest (2026-07-13)
 
+**Since 2026-10-02 it is not an email of its own** (Jack: "cut it as a standalone
+email and add it into the Kalshi portfolio ... email"). The 7:00 portfolio email
+(`send_portfolio_digest.py`) runs `send_imm_digest.py --section-out <json>` in a
+child process and appends the section after its movers table; the PICK-OFF
+WINDOW flag rides on the portfolio subject. A failed section is one line in that
+email, never a held email; child output goes to
+`run-logs\portfolio-digest\imm-section.log`; kill `PF_IMM_SECTION=0`. The
+section's yesterday / 7-day rows and its 30-day daily table are the IMM
+dashboard's own figures (`imm_dashboard_summary.json`, written beside the page
+each build): trading P&L marked to market and modeled rewards per ET calendar
+day, so the email equals the dashboard to the cent. The "Events traded" table is
+gone. The `KL incentive_mm DIGEST` 7:10 task now lands on a logged no-op
+(delete it at leisure); `python send_imm_digest.py --test` still sends the
+section as its own email, `--print` prints it. The history below is how it got
+here.
+
 `send_imm_digest.py` — one HTML morning email, structured like the crypto fleet's
 `send_daily_digest.py`: headline **estimated reward** (contract-minutes + c/1k-
 contract-min efficiency), P&L breakdown, per-EVENT table sorted best→worst

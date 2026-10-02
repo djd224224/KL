@@ -159,11 +159,14 @@ RISK_GUARDS = frozenset((
     "scan_mid_tripwire", "move_breaker", "crossed", "breaker_cooldown",
     "toxic_halt"))
 
-# Morning lineup: (label, marker prefix or None, task log, scheduled ET time)
+# Morning lineup: (label, marker prefix or None, task log, scheduled ET time);
+# marker and log are relative to STATUS_DIR. The IMM digest ships inside the
+# 7:00 portfolio email since 2026-10-02, so its row watches that email.
 LINEUP = (
     ("Earnings overrides", None, "overrides_last_runs.json", "06:45"),
     ("New programs email", "imm_new_programs_sent", "new-programs-task.log", "06:45"),
-    ("IMM digest", "imm_digest_sent", "digest-task.log", "07:10"),
+    ("Portfolio + IMM digest", os.path.join("..", "portfolio-digest", "digest_sent"),
+     os.path.join("..", "portfolio-digest", "digest-task.log"), "07:00"),
     ("Toxic-halts email", "imm_toxic_halts_sent", "toxic-halts-task.log", "07:15"),
     ("Quotes & overrides", "imm_quote_gaps_sent", "quote-gaps-task.log", "07:20"),
     ("Opportunistic email", "opportunistic_imm_sent", "opportunistic-task.log", "07:25"),
@@ -3211,6 +3214,69 @@ def new_event_groups(rows, cut: float, now: float):
 # Render
 # ----------------------------------------------------------------------------
 
+SUMMARY_NAME = "imm_dashboard_summary.json"
+SUMMARY_WINDOWS = ("today", "yesterday", "24h", "7d")
+SUMMARY_EVENT_WINDOWS = ("yesterday", "7d")
+
+
+def summary_of(model: dict) -> dict:
+    """The morning email's slice of the page (send_imm_digest reads it, so the
+    email shows the page's own numbers -- Jack 2026-10-02: "yesterday RAW
+    will equal the dashboard's total trading P&L"). Every figure is a card's
+    own sum over the per-market rows, as the page adds them up (aggregate()):
+      windows  each window's modeled rewards / trading P&L / realized / change
+               in marks, plus each event's [rewards, P&L] for yesterday and
+               the 7 days; pnl_na = the position log does not cover it
+      days     each ET day as its day card shows it (click the day on the
+               page); pnl None where "ok" is false, live = the day was still
+               running at this build"""
+    wins = {}
+    for key in SUMMARY_WINDOWS:
+        w = (model.get("windows") or {}).get(key)
+        if not w:
+            continue
+        tot = dict.fromkeys(("rew", "pnl", "real", "du", "fills", "cts"), 0.0)
+        evs = defaultdict(lambda: [0.0, 0.0])
+        for rec in (model.get("markets") or {}).values():
+            o = (rec.get("w") or {}).get(key)
+            if not o:
+                continue
+            for k in tot:
+                tot[k] += _f(o.get(k))
+            if key in SUMMARY_EVENT_WINDOWS:
+                e = evs[rec["ev"]]
+                e[0] += _f(o.get("rew"))
+                e[1] += _f(o.get("pnl"))
+        out = {"start": w.get("start"), "end": w.get("end"), "desc": w.get("desc"),
+               "pnl_na": bool(w.get("pnl_na")), **{k: round(v, 2) for k, v in tot.items()}}
+        if key in SUMMARY_EVENT_WINDOWS:
+            out["e"] = {ev: [round(a, 4), round(b, 4)] for ev, (a, b) in sorted(evs.items())}
+        wins[key] = out
+    f = model.get("day_fields") or list(DAY_FIELDS)
+    ix = {k: f.index(k) for k in ("rew", "pnl", "fills", "cts")}
+    gen = _f(model.get("generated"))
+    days = []
+    for iso in sorted(model.get("days") or {}):
+        dd = model["days"][iso]
+        tot = dict.fromkeys(ix, 0.0)
+        for row in (dd.get("m") or {}).values():
+            for k, i in ix.items():
+                tot[k] += _f(row[i])
+        ok = bool(dd.get("ok"))
+        days.append({"d": iso, "ok": ok, "live": _f(dd.get("e")) >= gen - 1,
+                     "rew": round(tot["rew"], 2), "pnl": round(tot["pnl"], 2) if ok else None,
+                     "fills": int(tot["fills"]), "cts": round(tot["cts"], 1)})
+    return {"generated": model.get("generated"), "generated_et": model.get("generated_et"),
+            "windows": wins, "days": days}
+
+
+def write_summary(model: dict, path: str) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(summary_of(model), fh, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
 def render(model: dict) -> str:
     with open(TEMPLATE_PATH, encoding="utf-8") as f:
         tpl = f.read()
@@ -3266,6 +3332,10 @@ def main(argv=None) -> int:
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(page)
     os.replace(tmp, args.out)
+    try:                                      # the morning email reads this
+        write_summary(model, os.path.join(os.path.dirname(os.path.abspath(args.out)), SUMMARY_NAME))
+    except Exception as e:
+        log(f"! summary write failed: {e!r}")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(model, f, default=str)

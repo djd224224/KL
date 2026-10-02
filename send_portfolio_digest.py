@@ -8,6 +8,12 @@ the biggest movers since the prior morning by family (settled and unrealized
 alike, ranked by the size of the move, realized and mark-to-mid split out).
 (The "Settled since yesterday, by series" table was removed 2026-09-29.)
 
+Then the IMM bot's section (since 2026-10-02, when its own 7:10 email was
+cut): send_imm_digest.py --section-out, run as a child process (imm_section),
+with the dashboard's yesterday / 7-day / 30-day figures; its PICK-OFF WINDOW
+flag goes onto this subject. A failed section is one line saying so, never a
+held email. Kill: PF_IMM_SECTION=0 or --no-imm.
+
 Day P&L per event (since 2026-09-29, replay_day): every fill and settlement
 since the prior morning replayed per market, from the prior snapshot's own
 positions and marks to today's: the cash those produced plus today's value
@@ -47,6 +53,7 @@ import json
 import os
 import re
 import smtplib
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -977,7 +984,10 @@ def _mover_tag(r) -> str:
     return "realized" if realized else "mark"
 
 
-def build_email(pf, history, chart_ok: bool):
+def build_email(pf, history, chart_ok: bool, imm=None):
+    """(subject, text, html). `imm` is imm_section()'s result: the IMM bot's
+    section goes after the movers table, and its PICK-OFF flag onto the
+    subject; None leaves the email as it was before 2026-10-02."""
     today = pf["today"]
     # The "Settled since yesterday, by series" table is gone (Jack
     # 2026-09-29: "remove 'Settled since yesterday, by series'"); settled
@@ -1048,6 +1058,8 @@ def build_email(pf, history, chart_ok: bool):
     subject = (f"Kalshi portfolio {today} — first baseline" if first else
                f"Kalshi portfolio {today} — day {d_equity:+,.2f}, "
                f"trading {trading:+,.2f}")
+    if imm and imm.get("subject_flag"):
+        subject += imm["subject_flag"]
 
     # ---- plain text ---------------------------------------------------------
     lines = [f"Kalshi portfolio — {today} (7am ET)", ""]
@@ -1089,6 +1101,10 @@ def build_email(pf, history, chart_ok: bool):
         lines.append(f"(account value{ex_perps} moved {d_ek:+,.2f} = this table "
                      f"{trading:+,.2f}"
                      + "".join(f"  +  {k} {v:+,.2f}" for k, v in parts[1:]) + ")")
+    if imm is not None:
+        lines.append("")
+        lines.append(imm.get("text") or
+                     f"INCENTIVE MM: section unavailable ({imm.get('error', '?')})")
     text = "\n".join(lines)
 
     # ---- html ---------------------------------------------------------------
@@ -1188,6 +1204,14 @@ def build_email(pf, history, chart_ok: bool):
         h.append(f'<div style="color:{C_INK2}">Nothing moved since the prior '
                  f'morning.</div>')
 
+    if imm is not None:
+        if imm.get("html"):
+            h.append(imm["html"])
+        else:
+            why = str(imm.get("error", "?")).replace("&", "&amp;").replace("<", "&lt;")
+            h.append(f'<div style="border-top:2px solid #ddd;margin-top:22px;'
+                     f'padding-top:12px;color:{C_NEG};font-weight:600">'
+                     f'Incentive MM section unavailable: {why}</div>')
     h.append('</div>')
     return subject, text, "".join(h)
 
@@ -1224,6 +1248,51 @@ def send_email(subject: str, text: str, html: str, chart_png) -> bool:
         return False
 
 
+# The IMM bot's section (Jack 2026-10-02: "cut it as a standalone email and
+# add it into the Kalshi portfolio ... email"). send_imm_digest.py builds it
+# in a child process: importing it mirrors the IMM launcher's env into
+# os.environ, which must not leak into this one. Kill: PF_IMM_SECTION=0.
+IMM_SECTION_ENABLED = os.environ.get("PF_IMM_SECTION", "1") != "0"
+IMM_SECTION_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "send_imm_digest.py")
+IMM_SECTION_TIMEOUT_S = int(os.environ.get("PF_IMM_SECTION_TIMEOUT", "900"))
+IMM_SECTION_LOG = os.path.join(LOG_DIR, "imm-section.log")
+
+
+def imm_section(today_str: str, script: str = IMM_SECTION_SCRIPT,
+                timeout: int = IMM_SECTION_TIMEOUT_S) -> dict:
+    """{"text", "html", "subject_flag"} from `send_imm_digest.py
+    --section-out`, or {"error": why}: the portfolio email goes out either
+    way, saying the section is missing. The child's output goes to
+    imm-section.log (UTF-8; the task log's console encoding is not)."""
+    out = os.path.join(LOG_DIR, f"imm_section_{today_str}.json")
+    t0 = time.time()
+    try:
+        if os.path.exists(out):
+            os.remove(out)
+        with open(IMM_SECTION_LOG, "ab") as lf:
+            rc = subprocess.run(
+                [sys.executable, script, "--section-out", out],
+                stdout=lf, stderr=subprocess.STDOUT, timeout=timeout,
+                cwd=os.path.dirname(os.path.abspath(script)),
+                env=dict(os.environ, PYTHONIOENCODING="utf-8")).returncode
+    except subprocess.TimeoutExpired:
+        return {"error": f"timed out after {timeout}s"}
+    except OSError as e:
+        return {"error": f"could not run it: {e}"}
+    if rc != 0:
+        return {"error": f"exit {rc}, see {IMM_SECTION_LOG}"}
+    try:
+        with open(out, encoding="utf-8") as f:
+            sec = json.load(f)
+    except (OSError, ValueError) as e:
+        return {"error": f"unreadable output: {e}"}
+    if not sec.get("text") or not sec.get("html"):
+        return {"error": "empty section"}
+    log(f"IMM section built in {time.time() - t0:.0f}s")
+    return sec
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -1235,6 +1304,8 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="build + write the HTML/PNG to run-logs, send nothing, "
                          "write no snapshot")
+    ap.add_argument("--no-imm", action="store_true",
+                    help="leave out the IMM bot's section (as PF_IMM_SECTION=0)")
     args = ap.parse_args(argv)
 
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -1279,7 +1350,13 @@ def main(argv=None) -> int:
     chart_png = os.path.join(LOG_DIR, f"chart_{today_str}.png")
     chart_ok = render_chart(history_preview, chart_png)
 
-    subject, text, html = build_email(pf, history_preview, chart_ok)
+    imm = None
+    if IMM_SECTION_ENABLED and not args.no_imm:
+        imm = imm_section(today_str)
+        if imm.get("error"):
+            log(f"! IMM section unavailable: {imm['error']}")
+
+    subject, text, html = build_email(pf, history_preview, chart_ok, imm)
     if args.test:
         subject = "[TEST] " + subject
     html_path = os.path.join(LOG_DIR, f"digest_{today_str}.html")
@@ -1312,8 +1389,9 @@ def main(argv=None) -> int:
             except (ValueError, OSError):
                 pass
         for old in glob.glob(os.path.join(LOG_DIR, "chart_*.png")) + \
-                glob.glob(os.path.join(LOG_DIR, "digest_*.html")):
-            m = re.search(r"(\d{4}-\d{2}-\d{2})\.(?:png|html)$", old)
+                glob.glob(os.path.join(LOG_DIR, "digest_*.html")) + \
+                glob.glob(os.path.join(LOG_DIR, "imm_section_*.json")):
+            m = re.search(r"(\d{4}-\d{2}-\d{2})\.(?:png|html|json)$", old)
             try:
                 if m and (datetime.strptime(m.group(1), "%Y-%m-%d").date()
                           < cutoff - timedelta(days=7)):

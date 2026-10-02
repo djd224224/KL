@@ -291,5 +291,169 @@ class PnlWindowsTests(_DigestTest):
         self.assertEqual(set(w["week"]["events"]), {"Y", "T", "W"})
 
 
+class DashboardWindowsTests(_DigestTest):
+    """Jack 2026-10-02: "yesterday RAW will equal the dashboard's total
+    trading P&L". The section's yesterday / 7 days / daily table are the
+    dashboard's own card totals (imm_dashboard.summary_of), read, not
+    re-derived."""
+
+    def setUp(self):
+        super().setUp()
+        sd = self.sd
+        self.mid = lambda m, d: sd.ET.localize(datetime(2026, m, d)).timestamp()
+        self.now = sd.ET.localize(datetime(2026, 10, 2, 7, 0)).timestamp()    # the 7:00 send
+        self.gen = self.now - 300                                               # its 6:55 build
+        days = []
+        for i in range(32):                                                     # Sep 1 .. Oct 2
+            d = (datetime(2026, 9, 1) + timedelta(days=i)).date()
+            ok = d >= datetime(2026, 9, 6).date()
+            days.append({"d": d.isoformat(), "ok": ok, "live": d.isoformat() == "2026-10-02",
+                         "rew": float(d.day), "pnl": -float(d.day) if ok else None,
+                         "fills": 1, "cts": 10.0 * d.day})
+        self.summary = {
+            "generated": self.gen, "generated_et": "Fri Oct 2, 6:55 AM ET",
+            "windows": {
+                "yesterday": {"start": self.mid(10, 1), "end": self.mid(10, 2), "pnl_na": False,
+                              "rew": 897.48, "pnl": -317.39,
+                              "e": {"KXA-1": [500.0, -300.0], "KXB-1": [397.48, -17.39]}},
+                "7d": {"start": self.mid(9, 26), "end": self.gen, "pnl_na": False,
+                       "rew": 3940.24, "pnl": -1574.46, "e": {"KXA-1": [1.0, -1000.0]}},
+                "today": {"start": self.mid(10, 2), "end": self.gen, "pnl_na": False,
+                          "rew": 50.0, "pnl": -5.0}},
+            "days": days}
+
+    def test_yesterday_and_7_days_are_the_dashboard_cards(self):
+        dw = self.sd.dashboard_windows(self.summary, self.now)
+        self.assertEqual((dw["day"]["raw"], dw["day"]["reward"]), (-317.39, 897.48))
+        self.assertEqual((dw["week"]["raw"], dw["week"]["reward"]), (-1574.46, 3940.24))
+        self.assertEqual(dw["week"]["since"], self.mid(9, 26))
+        self.assertEqual(dw["day"]["events"], {"KXA-1": -300.0, "KXB-1": -17.39})
+        self.assertEqual(dw["note"], "")
+
+    def test_daily_table_is_the_last_30_complete_days_newest_first(self):
+        daily = self.sd.dashboard_windows(self.summary, self.now)["daily"]
+        self.assertEqual(len(daily), 30)
+        self.assertEqual(daily[0][0].isoformat(), "2026-10-01")     # today, still running, is out
+        self.assertEqual(daily[-1][0].isoformat(), "2026-09-02")    # Sep 1 is day 31
+        self.assertEqual(daily[0][1:], (-1.0, 1.0, 10.0))
+        # before the position log: RAW n/a, the rewards still shown
+        self.assertEqual(daily[-1][1:], (None, 2.0, 20.0))
+
+    def test_an_older_build_cuts_no_window(self):
+        # built 23:55 ET the night before: its "yesterday" is Sep 30
+        s = json.loads(json.dumps(self.summary))
+        s["generated"] = self.mid(10, 2) - 300
+        s["windows"]["yesterday"].update(start=self.mid(9, 30), end=self.mid(10, 1))
+        s["windows"]["7d"]["start"] = self.mid(9, 25)
+        s["days"] = [dict(r, live=(r["d"] == "2026-10-01")) for r in s["days"]
+                     if r["d"] != "2026-10-02"]
+        dw = self.sd.dashboard_windows(s, self.now)
+        self.assertEqual((dw["day"]["raw"], dw["day"]["reward"], dw["day"]["events"]),
+                         (None, None, None))
+        self.assertEqual((dw["week"]["raw"], dw["week"]["reward"]), (None, None))
+        self.assertIn("NOT REBUILT", dw["note"])
+        self.assertEqual(dw["daily"][0][0].isoformat(), "2026-09-30")   # Oct 1 was still running
+
+    def test_a_window_without_marks_keeps_its_rewards(self):
+        s = json.loads(json.dumps(self.summary))
+        s["windows"]["yesterday"]["pnl_na"] = True
+        dw = self.sd.dashboard_windows(s, self.now)
+        self.assertIsNone(dw["day"]["raw"])
+        self.assertEqual(dw["day"]["reward"], 897.48)
+        self.assertIsNone(dw["day"]["events"])
+
+    def test_missing_and_late_summaries_say_so(self):
+        dw = self.sd.dashboard_windows({}, self.now)
+        self.assertIn("MISSING", dw["note"])
+        self.assertEqual(dw["daily"], [])
+        self.assertIsNone(dw["day"]["raw"])
+        late = dict(self.summary, generated=self.now - 3600)        # built 6:00, still today
+        dw = self.sd.dashboard_windows(late, self.now)
+        self.assertIn("60 min ago", dw["note"])
+        self.assertEqual(dw["day"]["raw"], -317.39)                  # the figures still stand
+
+    def test_the_section_shows_the_dashboard_figures_and_no_events_table(self):
+        # Jack 2026-10-02: yesterday RAW = the dashboard's trading P&L, the
+        # "Events traded" table gone, the daily table one month long
+        from unittest import mock
+        sd = self.sd
+        now = datetime.fromtimestamp(self.now, timezone.utc)
+        stubs = {"build_client": mock.Mock(return_value=object()),
+                 "load_dashboard_summary": mock.Mock(return_value=self.summary),
+                 "load_json": mock.Mock(return_value={}),
+                 "current_mids": mock.Mock(return_value=({}, {})),
+                 "event_rows": mock.Mock(return_value=([], {}, {})),
+                 "capacity_rows": mock.Mock(return_value=[]),
+                 "capacity_note": mock.Mock(return_value=""),
+                 "cutoff_audit": mock.Mock(return_value={}),
+                 "cutoff_banner": mock.Mock(return_value=""),
+                 "_cutoff_audit_text": mock.Mock(return_value=[]),
+                 "_cutoff_audit_html": mock.Mock(return_value=""),
+                 "_calibration_caveat_text": mock.Mock(return_value=[]),
+                 "_calibration_caveat_html": mock.Mock(return_value=""),
+                 "health_line": mock.Mock(return_value="Bot: alive"),
+                 "finecon_section": mock.Mock(return_value=([], ""))}
+        pick = {"kalshi": {}, "rows": []}
+        with mock.patch.multiple(sd, **stubs), \
+                mock.patch.object(sd.imm_pickoff, "scan", return_value=pick), \
+                mock.patch.object(sd.imm_pickoff, "text_lines", return_value=[]), \
+                mock.patch.object(sd.imm_pickoff, "html_block", return_value=""), \
+                mock.patch.object(sd.imm_pickoff, "error_text", return_value=""):
+            text, html = sd.build_digest(now)
+        row = "{:10s} {:>11s} {:>11s} {:>11s}"
+        self.assertIn(row.format("yesterday", "-317.39", "+897.48", "+580.09"), text)
+        self.assertIn(row.format("7 days", "-1,574.46", "+3,940.24", "+2,365.78"), text)
+        self.assertNotIn("EVENTS TRADED", text)
+        self.assertNotIn("Events traded", html)
+        dated = [ln for ln in text.splitlines() if ln[:5] == "2026-"]
+        self.assertEqual(len(dated), 30)
+        self.assertTrue(dated[0].startswith("2026-10-01"))
+        self.assertIn("-317.39", html)
+        # TOTAL over the 26 days with a RAW: Sep 6 .. Oct 1
+        n = [d for d in range(6, 31)] + [1]
+        self.assertIn("{:12s} {:>11s}".format("TOTAL", "{:+,.2f}".format(-sum(n))), text)
+        self.assertIn("TOTAL = the 26 of 30 days with a RAW", text)
+        # the health line hears about a late dashboard
+        self.assertEqual(stubs["health_line"].call_args[0][2], "")
+
+
+class SectionTests(_DigestTest):
+    """Jack 2026-10-02: "cut it as a standalone email and add it into the
+    Kalshi portfolio ... email"."""
+
+    def test_the_old_7_10_task_run_sends_nothing(self):
+        from unittest import mock
+        with mock.patch.object(self.sd, "build_digest", side_effect=AssertionError("built")), \
+                mock.patch.object(self.sd, "Alerter", side_effect=AssertionError("sent")):
+            self.assertEqual(self.sd.main([]), 0)
+
+    def test_section_out_writes_the_section_and_its_subject_flag(self):
+        from unittest import mock
+        body = ">> " + self.sd.imm_pickoff.HEADER + ": KXFOO\nrest"
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(self.sd, "build_digest", return_value=(body, "<div>x</div>")):
+            p = os.path.join(d, "s.json")
+            self.assertEqual(self.sd.main(["--section-out", p]), 0)
+            with open(p, encoding="utf-8") as f:
+                sec = json.load(f)
+        self.assertEqual((sec["text"], sec["html"]), (body, "<div>x</div>"))
+        self.assertEqual(sec["subject_flag"], " - " + self.sd.imm_pickoff.HEADER)
+        self.assertEqual(self.sd.subject_flag("no window today"), "")
+
+    def test_finecon_line_reads_n_a_without_a_window(self):
+        from unittest import mock
+        today = datetime(2026, 10, 2).date()
+        state = {"selected_tickers": ["KXSPRLVL-26SEP09-T286"]}
+        w = {"day": {"events": None},
+             "week": {"events": {"KXSPRLVL-26SEP09": {"realized": -1.5, "settle": 0.0,
+                                                      "unrealized": 0.0}}}}
+        with mock.patch.object(self.sd.imm, "FINECON_SERIES", frozenset({"KXSPRLVL"})), \
+                mock.patch.object(self.sd, "load_credit_ledger", return_value=([], {})):
+            L, html = self.sd.finecon_section(state, w, today)
+        self.assertIn("Group trading P&L: yesterday n/a (0 events), 7 days -1.50 (1 events).",
+                      "\n".join(L))
+        self.assertIn("trading P&amp;L yesterday n/a", html)
+
+
 if __name__ == "__main__":
     unittest.main()

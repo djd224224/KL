@@ -14,6 +14,14 @@ every 10 minutes by the `KL imm dashboard` task.
   10-minute rebuild (nothing registers it automatically). Until then the page
   refreshes only when `imm_dashboard.py` is run. Log:
   `run-logs\incentive-mm\dashboard\dashboard-task.log`.
+- **Summary for the morning email:** each build also writes
+  `imm_dashboard_summary.json` beside the page (`summary_of`): every window's
+  card totals (modeled rewards, trading P&L, realized, change in marks), each
+  event's share of Yesterday and 7 days, and each ET day as its day card shows
+  it. The IMM section of the 7:00 portfolio email reads its yesterday / 7-day /
+  30-day figures from this file rather than re-deriving them (Jack 2026-10-02:
+  "yesterday RAW will equal the dashboard's total trading P&L"), and says so
+  when the file is missing or was not rebuilt since midnight ET.
 
 ## What the headline numbers are
 
@@ -190,6 +198,6 @@ response.
 
 Read-only: GETs against Kalshi through the same code the morning emails use;
 nothing places, amends or cancels. Writes only under `DASH_DIR` (the page,
-`cache/`, `programs_seen.json`). Completed UTC-day sink files are parsed once
+`imm_dashboard_summary.json`, `cache/`, `programs_seen.json`). Completed UTC-day sink files are parsed once
 and cached on size:mtime; the live day's files are re-parsed each run.
 Output lines are ASCII-safe (stdout is reconfigured with `errors="replace"`).

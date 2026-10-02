@@ -512,6 +512,43 @@ class BuilderIntegrationTests(unittest.TestCase):
         # KXA-1 is both selected and in the last cycle
         self.assertEqual(m["halts"]["by_market"]["KXA-1"].count("toxic event halt"), 1)
 
+    def test_summary_is_the_cards_own_sums(self):
+        # the morning email reads this file (Jack 2026-10-02: "yesterday RAW
+        # will equal the dashboard's total trading P&L"): each window total is
+        # the page's own sum over its market rows, each day its day card's
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        s = dash.summary_of(m)
+        for key in ("today", "7d"):
+            w = s["windows"][key]
+            for k in ("rew", "pnl", "real", "du"):
+                self.assertAlmostEqual(
+                    w[k], sum(v["w"].get(key, {}).get(k, 0) for v in m["markets"].values()),
+                    places=2, msg=(key, k))
+            self.assertEqual(w["start"], m["windows"][key]["start"])
+            self.assertEqual(w["pnl_na"], m["windows"][key]["pnl_na"])
+        self.assertEqual(s["windows"]["today"]["fills"], 1)
+        self.assertNotIn("e", s["windows"]["today"])         # per event: yesterday, 7 days
+        e7, ev = s["windows"]["7d"]["e"], m["markets"]["KXC-1"]["ev"]
+        self.assertAlmostEqual(e7[ev][1], sum(v["w"].get("7d", {}).get("pnl", 0)
+                                              for v in m["markets"].values() if v["ev"] == ev),
+                               places=4)
+        self.assertAlmostEqual(sum(p for _r, p in e7.values()), s["windows"]["7d"]["pnl"], places=2)
+        day = {r["d"]: r for r in s["days"]}["2026-09-28"]
+        self.assertTrue(day["live"])                          # 16:00 ET: still running
+        f, rows = m["day_fields"], m["days"]["2026-09-28"]["m"].values()
+        self.assertEqual(day["ok"], m["days"]["2026-09-28"]["ok"])
+        self.assertAlmostEqual(day["rew"], sum(r[f.index("rew")] for r in rows), places=2)
+        if day["ok"]:
+            self.assertAlmostEqual(day["pnl"], sum(r[f.index("pnl")] for r in rows), places=2)
+        else:
+            self.assertIsNone(day["pnl"])
+        # written beside the page, whole or not at all
+        p = os.path.join(self.dir, dash.SUMMARY_NAME)
+        dash.write_summary(m, p)
+        with open(p, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), json.loads(json.dumps(s)))
+        self.assertFalse(os.path.exists(p + ".tmp"))
+
     def test_second_run_uses_nothing_stale(self):
         dash.Builder(self.NOW, api=False, api_force=False).build()
         m2 = dash.Builder(self.NOW, api=False, api_force=False).build()

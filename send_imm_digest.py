@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 r"""
-send_imm_digest.py — one clear morning email for the incentive-rewards MM bot,
-structured like the crypto fleet digest (send_daily_digest.py).
+send_imm_digest.py — the incentive-rewards MM bot's morning section: since
+2026-10-02 (Jack: "cut it as a standalone email and add it into the Kalshi
+portfolio ... email") it rides inside the 7:00 portfolio email, which runs
+this script with --section-out. Run with no arguments (the old 7:10 task) it
+does nothing; --test still sends the section as an email of its own.
 
-Layout: headline estimated reward (the point of the bot) + P&L, then one row per
-EVENT the bot is working — realized$, unrealized$, net position, and $ exposure —
-sorted best to worst, with a TOTAL row, balance, capital-at-work, and a one-line
-health check. Events with nothing going on are omitted.
+Layout: lifetime net, the PICK-OFF block, the P&L windows (yesterday, 7 days,
+lifetime), the last 30 days' daily P&L, the cutoff audit, capacity, the
+finecon / open-scan tracker and a one-line health check.
 
-Everything is the INCENTIVE BOT's own book, not the raw account: positions come
-from the bot's persisted own-book (run-logs/incentive-mm/imm_state.json, which is
-isolated from the user's manual trades and the other cloud bots by order-ownership
-fill matching); realized P&L is replayed from the bot's own fills; unrealized marks
-each open position to the current market mid. Reward figures and health come from
-the bot's heartbeat (status_incentive_mm.json) and last stored daily summary.
+Everything is the INCENTIVE BOT's own book, not the raw account. Yesterday, 7
+days and the daily table are the IMM dashboard's own figures, read from the
+summary it writes beside its page (imm_dashboard_summary.json): trading P&L
+marked to market and modeled rewards per ET calendar day, so the email and the
+page cannot disagree. Lifetime comes from the bot's persisted counters
+(imm_state.json realized_lifetime + its own book at mid; status reward
+estimate).
 
-Scheduled daily shortly after the bot's 6 AM ET summary roll. Idempotent via a
-sent-marker; --test sends immediately and skips the marker.
-
-Credentials: ALERT_EMAIL_FROM / ALERT_EMAIL_PASSWORD from the environment, falling
-back to HKCU\Environment (works under Task Scheduler's stripped env).
+Credentials (--test): ALERT_EMAIL_FROM / ALERT_EMAIL_PASSWORD from the
+environment, falling back to HKCU\Environment (Task Scheduler's stripped env).
 """
 
 import argparse
@@ -505,8 +505,9 @@ def et_day_rewards(hourly=None) -> dict:
 
     Jack 2026-10-02: "update the email to be the same cutoffs as the
     dashboard". The bot's own reward_history / reward_paid_history are cut at
-    its 5am-CT roll (6am-6am ET) and cannot be re-cut, so the email's daily
-    and window rewards come from here instead. That is the raw accrual, before
+    its 5am-CT roll (6am-6am ET) and cannot be re-cut, so ET-day rewards come
+    from here (pnl_windows; the morning section reads the dashboard's own
+    figures since 2026-10-02 -- dashboard_windows). That is the raw accrual, before
     Kalshi's $1-per-market-per-period floor: the paid basis exists only per
     bot day. An ET offset is a whole number of hours, so no UTC hour straddles
     ET midnight."""
@@ -545,12 +546,6 @@ def _et_label(ts) -> str:
     """'00:00 ET Fri Sep 26' for an epoch."""
     t = datetime.fromtimestamp(float(ts), timezone.utc).astimezone(ET)
     return t.strftime("%H:%M ET %a %b ") + str(t.day)
-
-
-WINDOW_NOTE = "windows are ET calendar days, midnight to midnight: yesterday = the full ET day"
-REWARD_NOTE = ("REWARD = modeled accrual per ET calendar day: the bot's reward "
-               "estimator over the cycle logs, before Kalshi's $1-per-market floor "
-               "-- the dashboard's 'Modeled rewards'")
 
 
 def daily_series(client, fills, mids, results, state, days=60, et_rew=None):
@@ -723,33 +718,10 @@ def pnl_windows(client, state, our_ids, fills, mids, results, reward_lifetime,
     }
 
 
-def last_full_day_reward(state: dict, status: dict, today_ct):
-    """(amount, label) for the headline. Source of truth is the persisted
-    reward_history written at each 5am-CT roll (2026-08-03): the previous
-    sources — the in-process reward_est_today counter and the summary_body
-    text — both reset on every restart, and this bot restarts many times a
-    day, so the digest was reporting a small fraction of reality ($45.81
-    against a measured $959.47 on 8/3). Falls back to the old sources only
-    when no history exists (first run after this fix)."""
-    hist = {str(k): _f(v) for k, v in (state.get("reward_history") or {}).items()}
-    for back in (1, 2):
-        key = (today_ct - timedelta(days=back)).isoformat()
-        if key in hist:
-            return hist[key], key
-    if hist:
-        key = sorted(hist)[-1]
-        return hist[key], key
-    body = status.get("summary_body") or ""
-    m = re.search(r"est reward today \$([\-\d.,]+)", body)
-    if m:
-        return _f(m.group(1).replace(",", "")), "last summary"
-    return _f(status.get("reward_est_today")), "today so far (partial)"
-
-
 def status_summary(status: dict) -> dict:
     """Activity figures from the last stored daily summary (yesterday's
-    completed roll), falling back to the live heartbeat counters. Reward is
-    supplied separately by last_full_day_reward()."""
+    completed roll), falling back to the live heartbeat counters. The
+    section's day and week rewards are the dashboard's (dashboard_windows)."""
     body = status.get("summary_body") or ""
 
     def grab(pat, default=0.0):
@@ -770,9 +742,9 @@ def status_summary(status: dict) -> dict:
     }
 
 
-def health_line(status: dict, ss: dict) -> str:
+def health_line(status: dict, ss: dict, dash_note: str = "") -> str:
     now = datetime.now(timezone.utc)
-    problems = []
+    problems = [dash_note] if dash_note else []
     try:
         age = (now - datetime.strptime(status.get("updated_at", ""), "%Y-%m-%dT%H:%M:%SZ")
                .replace(tzinfo=timezone.utc)).total_seconds() / 60.0
@@ -1876,9 +1848,9 @@ def finecon_section(state, w, today_ct):
     """(text_lines, html) — the Finance/Econ sweep tracker (Jack 2026-09-04
     "make sure im able to track performance of these"). Three layers, most
     trustworthy last: current members with the bot's period-to-date accrual
-    ESTIMATE and net inventory; the group's past-day/week TRADING result
-    (fill-attributed, from the same per-event windows the events table
-    uses); and Kalshi-CREDITED rewards on group events from the recon
+    ESTIMATE and net inventory; the group's yesterday / 7-days TRADING result
+    (w[key]["events"]: the dashboard's per-event P&L since 2026-10-02, None
+    = n/a); and Kalshi-CREDITED rewards on group events from the recon
     ledger — the only number that is actual paid money."""
     fin = getattr(imm, "FINECON_SERIES", frozenset())
     if not fin:
@@ -1894,13 +1866,21 @@ def finecon_section(state, w, today_ct):
     top_n = getattr(imm, "FINECON_TOP_N", 0)
 
     def _win_pnl(key):
-        evs = (w.get(key) or {}).get("events") or {}
+        evs = (w.get(key) or {}).get("events")
+        if evs is None:                 # no such window (a stale dashboard)
+            return None, 0
         tot, n = 0.0, 0
         for ev, e in evs.items():
             if _is_fin(ev):
                 tot += e["realized"] + e["settle"] + e["unrealized"]
                 n += 1
         return tot, n
+
+    def _txt(v):
+        return "n/a" if v is None else "{:+,.2f}".format(v)
+
+    def _span(v):
+        return "n/a" if v is None else _pnl_span(v)
 
     day_pnl, day_n = _win_pnl("day")
     week_pnl, week_n = _win_pnl("week")
@@ -1932,8 +1912,8 @@ def finecon_section(state, w, today_ct):
                 t[:36], _f(accrued.get(t)), _f(own_pos.get(t))))
     else:
         L.append("  (no members quoting right now)")
-    L.append("Group trading P&L: yesterday {:+,.2f} ({} events), 7 days "
-             "{:+,.2f} ({} events).".format(day_pnl, day_n, week_pnl, week_n))
+    L.append("Group trading P&L: yesterday {} ({} events), 7 days "
+             "{} ({} events).".format(_txt(day_pnl), day_n, _txt(week_pnl), week_n))
     L.append("Kalshi-CREDITED rewards on group events: past 7d ${:,.2f}, "
              "all-time ${:,.2f}{}.".format(
                  cred_week, cred_life,
@@ -1948,8 +1928,8 @@ def finecon_section(state, w, today_ct):
              'this period ${:,.2f} &nbsp;&middot;&nbsp; trading P&amp;L yesterday '
              '{} / 7 days {} &nbsp;&middot;&nbsp; Kalshi-credited 7d '
              '<b>${:,.2f}</b> / all-time <b>${:,.2f}</b></div>'.format(
-                 len(members), top_n, acc_sum, _pnl_span(day_pnl),
-                 _pnl_span(week_pnl), cred_week, cred_life))
+                 len(members), top_n, acc_sum, _span(day_pnl),
+                 _span(week_pnl), cred_week, cred_life))
     if members:
         h.append('<table style="border-collapse:collapse">')
         h.append('<tr style="background:#f0f0f0;font-weight:600">'
@@ -2033,35 +2013,118 @@ def finecon_section(state, w, today_ct):
     return L, "".join(h)
 
 
+# The dashboard's numbers (Jack 2026-10-02: "adjust email so 'yesterday RAW'
+# will equal the dashboard's total trading P&L"). imm_dashboard.py writes its
+# cards' totals beside the page on every build (~10 min); the email reads
+# those figures instead of re-deriving them, so the two cannot disagree.
+DASH_DIR = os.environ.get("IMM_DASH_DIR", os.path.join(STATUS_DIR, "dashboard"))
+DASH_SUMMARY_PATH = os.path.join(DASH_DIR, "imm_dashboard_summary.json")
+DASH_SUMMARY_STALE_MIN = 45
+DAILY_TABLE_DAYS = 30           # "show Daily P&L (raw) going back 1 month" (Jack 2026-10-02)
+DAILY_NOTE = ("RAW = the dashboard's trading P&L: the bot's own book marked to "
+              "market (realized + the change in open marks + settlements) per ET "
+              "calendar day, n/a where the dashboard's position log does not "
+              "reach; REWARD = its modeled rewards, accrual per ET day before "
+              "Kalshi's $1-per-market floor")
+
+
+def load_dashboard_summary(path=None) -> dict:
+    """imm_dashboard.py's card totals ({} when missing or unreadable)."""
+    return load_json(path or DASH_SUMMARY_PATH)
+
+
+def dashboard_windows(summary: dict, now_ts: float, days: int = DAILY_TABLE_DAYS) -> dict:
+    """The email's yesterday / 7-days rows and its daily table, read off the
+    dashboard's summary (imm_dashboard.summary_of):
+
+      day    the dashboard's Yesterday card: the full ET day
+      week   its 7-days card: 00:00 ET six days ago through its last build
+      daily  [(date, raw, reward, contracts)], newest first: each of the
+             last `days` complete ET days as its day card shows it
+
+    A window counts only when the build that cut it ran today (ET): an older
+    build's "yesterday" is a different day. RAW is None where the dashboard
+    shows n/a (the position log does not cover it). Per-event trading P&L for
+    both windows feeds the finecon line; `note` says why figures are missing."""
+    gen = _f(summary.get("generated"))
+    wins = summary.get("windows") or {}
+    today = datetime.fromtimestamp(now_ts, timezone.utc).astimezone(ET).date()
+    built = _et_label(gen) if gen else ""
+
+    def window(key, first_day):
+        w = wins.get(key)
+        start = et_midnight_ts(first_day)
+        if not w or abs(_f(w.get("start")) - start) > 1:
+            return {"raw": None, "reward": None, "events": None, "since": start}
+        na = bool(w.get("pnl_na"))
+        return {"raw": None if na else _f(w.get("pnl")), "reward": _f(w.get("rew")),
+                "events": None if na else {ev: _f(v[1]) for ev, v in (w.get("e") or {}).items()},
+                "since": start, "until": _f(w.get("end"))}
+
+    day = window("yesterday", today - timedelta(days=1))
+    week = window("7d", today - timedelta(days=6))
+    first = today - timedelta(days=days)
+    daily = []
+    for r in summary.get("days") or []:
+        try:
+            d = datetime.strptime(str(r.get("d")), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if first <= d < today and not r.get("live"):
+            daily.append((d, None if r.get("pnl") is None else _f(r.get("pnl")),
+                          _f(r.get("rew")), _f(r.get("cts"))))
+    daily.sort(key=lambda x: x[0], reverse=True)
+    if not gen:
+        note = ("DASHBOARD SUMMARY MISSING ({}) -- yesterday, 7 days and the daily "
+                "table are n/a".format(DASH_SUMMARY_PATH))
+    elif gen < et_midnight_ts(today):
+        note = "DASHBOARD NOT REBUILT SINCE {} -- yesterday and 7 days n/a".format(built)
+    elif (now_ts - gen) / 60.0 > DASH_SUMMARY_STALE_MIN:
+        note = "dashboard last built {} ({:.0f} min ago)".format(built, (now_ts - gen) / 60.0)
+    else:
+        note = ""
+    return {"day": day, "week": week, "daily": daily, "built": built, "note": note}
+
+
+def lifetime_raw(state: dict, mids: dict):
+    """(raw, realized, unrealized) for the lifetime row: the bot's PERSISTED
+    realized_lifetime (the only source that survives restarts AND captures
+    settlements of multi-week holds) plus its own book marked to mid now."""
+    pos, avg = own_book(state)
+    life_realized = _f(state.get("realized_lifetime"))
+    life_unreal = 0.0
+    for t, p in pos.items():
+        m = mids.get(t)
+        if m is not None:
+            life_unreal += p * (m - avg.get(t, 0.0)) / 100.0
+    return life_realized + life_unreal, life_realized, life_unreal
+
+
+def _as_window_events(evs):
+    """{event: P&L} -> the {event: {realized, settle, unrealized}} shape
+    finecon_section reads; None (no such window) stays None."""
+    if evs is None:
+        return None
+    return {ev: {"realized": p, "settle": 0.0, "unrealized": 0.0} for ev, p in evs.items()}
+
+
 def build_digest(now_utc: datetime):
-    """Returns (plain_text, html)."""
+    """Returns (plain_text, html): the IMM section of the 7:00 portfolio email
+    (send_portfolio_digest runs this script with --section-out; the IMM's own
+    7:10 email was cut 2026-10-02). Yesterday, 7 days and the daily table are
+    the dashboard's own figures (dashboard_windows); lifetime is the bot's."""
     today_ct = now_utc.astimezone(CT).date()
+    today_et = now_utc.astimezone(ET).date()
     client = build_client()
     status = load_json(STATUS_PATH)
     state = load_json(STATE_PATH)
     ss = status_summary(status)
-    reward_amt, reward_label = last_full_day_reward(state, status, today_ct)
-    ss["reward"] = reward_amt
-    ss["reward_label"] = reward_label
-    our_ids = set(state.get("our_order_ids") or {})
-
-    # One fill pull + one market read drives every window below.
-    fills = fetch_own_fills(client, our_ids, FILL_LOOKBACK_HOURS)
     pos, avg = own_book(state)
-    touched = {f.get("ticker", "") for f in fills} | set(pos)
-    mids, results = current_mids(client, touched)
-    # Modeled rewards per ET day (the dashboard's cutoffs and number). Never
-    # fatal: without them the reward columns read n/a, the P&L still sends.
-    try:
-        et_rew = et_day_rewards()
-    except Exception as e:
-        log(f"! ET-day rewards unavailable ({e!r}); reward columns n/a")
-        et_rew = {}
-    w = pnl_windows(client, state, our_ids, fills, mids, results,
-                    ss["reward_lifetime"], et_rew=et_rew,
-                    now=now_utc.timestamp())
-    series = daily_series(client, fills, mids, results, state, et_rew=et_rew)
-    rows, tot, resting = event_rows(client)     # open book + resting quotes
+    # marks for the lifetime row: the bot's own book, now
+    mids, _results = current_mids(client, set(pos))
+    life_raw, _life_real, _life_unreal = lifetime_raw(state, mids)
+    dw = dashboard_windows(load_dashboard_summary(), now_utc.timestamp())
+    _rows, _tot, resting = event_rows(client)     # resting quotes, for capacity
     cap_rows = capacity_rows(state, status, resting,
                              _f(status.get("pnl_today")) if status else None)
     # Kalshi's event starts vs ours, for the PICK-OFF block (never raises).
@@ -2072,27 +2135,31 @@ def build_digest(now_utc: datetime):
     # everything else it reports is reward pool. never raises — see docstring.
     audit = cutoff_audit(client, now_utc, pos, kalshi=pick["kalshi"],
                          pick_events=[r["event"] for r in pick["rows"]])
-
-    try:
-        bal_str = "${:,.2f}".format(_f(client.get_balance().get("balance_dollars")))
-    except Exception:
-        bal_str = "?"
-    health = health_line(status, ss)
+    health = health_line(status, ss, dw["note"])
+    w = {"day": dw["day"], "week": dw["week"],
+         "life": {"raw": life_raw, "reward": ss["reward_lifetime"]}}
 
     def net_of(k):
-        r = w[k]["reward"]
-        return (w[k]["raw"] + r) if r is not None else None
+        r, x = w[k]["reward"], w[k]["raw"]
+        return (x + r) if (r is not None and x is not None) else None
 
     def money(v, dash="n/a"):
         return "{:+,.2f}".format(v) if v is not None else dash
 
-    d = w["day"]["detail"]
-    ev_rows = sorted(w["day"]["events"].items(),
-                     key=lambda kv: -(kv[1]["realized"] + kv[1]["settle"]
-                                      + kv[1]["unrealized"]))
+    win_note = ("yesterday and 7 days are the dashboard's own cards: ET calendar "
+                "days, 7 days = since {} through its {} build; lifetime is the "
+                "bot's own counters".format(_et_label(w["week"]["since"]),
+                                            dw["built"] or "last"))
+    # TOTAL only over the days with a RAW, so the row adds up
+    tot_days = [r for r in dw["daily"] if r[1] is not None]
+    t_raw = sum(r[1] for r in tot_days)
+    t_rew = sum(r[2] for r in tot_days)
+    tot_note = ("TOTAL = the {} of {} days with a RAW; the dashboard's position "
+                "log starts 2026-09-06".format(len(tot_days), len(dw["daily"]))
+                if len(tot_days) < len(dw["daily"]) else "")
 
     # ---- plain text ---------------------------------------------------------
-    L = ["Kalshi incentive MM \u2014 {}".format(today_ct), ""]
+    L = ["=" * 66, "INCENTIVE MM — {} (the IMM bot's own book)".format(today_et), ""]
     # An opportunity, not a risk: its own marker, above the red banner,
     # because a window can be open right now.
     _pick = imm_pickoff.text_lines(pick, now_utc)
@@ -2104,7 +2171,7 @@ def build_digest(now_utc: datetime):
     if _banner:
         L.append("!! " + _banner)
         L.append("")
-    L.append("P&L  (RAW = trading only; NET = RAW + incentive rewards)")
+    L.append("P&L  (RAW = trading P&L, marked to market; NET = RAW + modeled rewards)")
     L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
         "WINDOW", "RAW$", "REWARD$", "NET$"))
     for key, lbl in (("day", "yesterday"), ("week", "7 days"),
@@ -2112,38 +2179,25 @@ def build_digest(now_utc: datetime):
         L.append("{:10s} {:>11s} {:>11s} {:>11s}".format(
             lbl, money(w[key]["raw"]), money(w[key]["reward"]),
             money(net_of(key))))
-    L.append("  ({}; 7 days = since {} -- the dashboard's windows)".format(
-        WINDOW_NOTE, _et_label(w["week"]["since"])))
-    # The credited-rewards block that used to sit here was removed at Jack's
-    # request 2026-08-04. The ledger still BACKS the lifetime REWARD figure
-    # above (see pnl_windows) and the health line still warns when it goes
-    # stale — only the standalone breakdown is gone.
+    L.append("  (" + win_note + ")")
+    if dw["note"]:
+        L.append("  !! " + dw["note"])
     L.append("")
-    L.append("")
-    L.append("DAILY P&L — every prior day that earned (raw; a day moves until "
-             "its positions settle)")
+    L.append("DAILY P&L — the last {} days, as on the dashboard".format(DAILY_TABLE_DAYS))
     L.append("{:12s} {:>11s} {:>11s} {:>11s} {:>10s}".format(
         "DATE", "RAW$", "REWARD$", "NET$", "CONTRACTS"))
-    d_raw = d_rew = 0.0
-    # most recent first (Jack 2026-08-04)
-    for day, raw, reward, contracts, nf in reversed(series):
+    for day, raw, reward, contracts in dw["daily"]:          # newest first
         net = (raw + reward) if (raw is not None and reward is not None) else None
-        if raw is not None:
-            d_raw += raw
-        if reward is not None:
-            d_rew += reward
         L.append("{:12s} {:>11s} {:>11s} {:>11s} {:>10,.0f}".format(
-            day.isoformat(),
-            "{:+,.2f}".format(raw) if raw is not None else "n/a",
-            "{:+,.2f}".format(reward) if reward is not None else "n/a",
-            "{:+,.2f}".format(net) if net is not None else "n/a",
-            contracts))
-    L.append("{:12s} {:>11s} {:>11s} {:>11s}".format(
-        "TOTAL", "{:+,.2f}".format(d_raw), "{:+,.2f}".format(d_rew),
-        "{:+,.2f}".format(d_raw + d_rew)))
-    L.append("  (RAW shows n/a for days older than the {}h fill-attribution "
-             "window)".format(FILL_LOOKBACK_HOURS))
-    L.append("  (" + REWARD_NOTE + ")")
+            day.isoformat(), money(raw), money(reward), money(net), contracts))
+    if dw["daily"]:
+        L.append("{:12s} {:>11s} {:>11s} {:>11s}".format(
+            "TOTAL", money(t_raw), money(t_rew), money(t_raw + t_rew)))
+    else:
+        L.append("  (no days: " + (dw["note"] or "the dashboard summary has none") + ")")
+    if tot_note:
+        L.append("  (" + tot_note + ")")
+    L.append("  (" + DAILY_NOTE + ")")
     L.append("  (REWARD is accrual-dated and does NOT line up with a credit "
              "date — Kalshi pays at each program's period end, 1-2 days later)")
     L.extend(_calibration_caveat_text())
@@ -2168,30 +2222,10 @@ def build_digest(now_utc: datetime):
             ("  <- close" if (r["pct"] or 0) >= 80 else "")))
         if r["note"]:
             L.append("{:34s} {}".format("", r["note"]))
-    L.append("")
-    L.append("EVENTS TRADED YESTERDAY, ET ({})".format(len(ev_rows)))
-    if ev_rows:
-        L.append("{:28s} {:>9s} {:>9s} {:>9s} {:>9s} {:>7s} {:>5s}".format(
-            "EVENT", "P&L$", "REAL$", "SETTLE$", "MTM$", "CTS", "MKTS"))
-        e_tot = {"realized": 0.0, "settle": 0.0, "unrealized": 0.0,
-                 "contracts": 0.0, "mkts": 0}
-        for ev, e in ev_rows:
-            tot_e = e["realized"] + e["settle"] + e["unrealized"]
-            for k in ("realized", "settle", "unrealized", "contracts"):
-                e_tot[k] += e[k]
-            e_tot["mkts"] += len(e["mkts"])
-            L.append("{:28s} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>7,.0f} "
-                     "{:>5d}".format(_short_event(ev)[:28], tot_e, e["realized"],
-                                     e["settle"], e["unrealized"],
-                                     e["contracts"], len(e["mkts"])))
-        L.append("{:28s} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>+9.2f} {:>7,.0f} "
-                 "{:>5d}".format(
-                     "TOTAL", e_tot["realized"] + e_tot["settle"]
-                     + e_tot["unrealized"], e_tot["realized"], e_tot["settle"],
-                     e_tot["unrealized"], e_tot["contracts"], e_tot["mkts"]))
-    else:
-        L.append("  (no fills yesterday)")
-    fin_L, fin_html = finecon_section(state, w, today_ct)
+    # the finecon group's trading P&L, from the same dashboard windows
+    w_fin = {"day": {"events": _as_window_events(dw["day"]["events"])},
+             "week": {"events": _as_window_events(dw["week"]["events"])}}
+    fin_L, fin_html = finecon_section(state, w_fin, today_ct)
     if fin_L:
         L.append("")
         L.extend(fin_L)
@@ -2200,12 +2234,13 @@ def build_digest(now_utc: datetime):
     text = "\n".join(L)
 
     # ---- html ---------------------------------------------------------------
-    h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">']
-    h.append('<div style="font-size:17px;font-weight:600">Kalshi incentive MM'
-             ' <span style="color:#888;font-weight:400">\u2014 {}</span></div>'
-             .format(today_ct))
+    h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;'
+         'border-top:2px solid #ddd;margin-top:22px;padding-top:12px">']
+    h.append('<div style="font-size:17px;font-weight:600">Incentive MM'
+             ' <span style="color:#888;font-weight:400">— the IMM bot&rsquo;s '
+             'own book, {}</span></div>'.format(today_et))
     nl = net_of("life")
-    h.append('<div style="font-size:24px;font-weight:800;margin:8px 0 2px">'
+    h.append('<div style="font-size:18px;font-weight:700;margin:6px 0 2px">'
              'Lifetime net: {}<span style="font-size:13px;font-weight:400;'
              'color:#999"> &nbsp;= trading {:+,.2f} + rewards {:,.2f}</span>'
              '</div>'.format(_pnl_span(nl) if nl is not None else "n/a",
@@ -2223,56 +2258,51 @@ def build_digest(now_utc: datetime):
     for i, (key, lbl) in enumerate((("day", "Yesterday"), ("week", "7 days"),
                                     ("life", "Lifetime"))):
         bg = "#fafafa" if i % 2 else "#fff"
-        r = w[key]["reward"]
-        n = net_of(key)
+        x, n = w[key]["raw"], net_of(key)
         h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
                  '<td style="{3}">{4}</td><td style="{3}">{5}</td>'
                  '<td style="{3};font-weight:700">{6}</td></tr>'.format(
-                     bg, TDL, lbl, TD, _pnl_span(w[key]["raw"]),
-                     money(r), _pnl_span(n) if n is not None else "n/a"))
+                     bg, TDL, lbl, TD, _pnl_span(x) if x is not None else "n/a",
+                     money(w[key]["reward"]), _pnl_span(n) if n is not None else "n/a"))
     h.append("</table>")
-    h.append('<div style="color:#888;font-size:12px;margin:-6px 0 6px">{}; 7 days = '
-             'since {} &mdash; the dashboard\'s windows.</div>'.format(
-                 WINDOW_NOTE, _et_label(w["week"]["since"])))
-    # The "Rewards credited by Kalshi" table and the "reward basis" line that
-    # used to sit here were removed at Jack's request 2026-08-04. The ledger
-    # still BACKS the lifetime REWARD figure in the table above (pnl_windows
-    # prefers it over the bot estimate) and health_line still warns when it
-    # goes stale — only the standalone breakdown is gone.
+    h.append('<div style="color:#888;font-size:12px;margin:-6px 0 6px">{}.</div>'
+             .format(win_note))
+    if dw["note"]:
+        h.append('<div style="color:#c0392b;font-size:12px;font-weight:600;'
+                 'margin:-2px 0 6px">{}</div>'.format(dw["note"]))
     h.append('<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
-             'Daily P&amp;L (raw)</div>')
+             'Daily P&amp;L &mdash; the last {} days, as on the dashboard</div>'
+             .format(DAILY_TABLE_DAYS))
     h.append('<table style="border-collapse:collapse">')
     h.append('<tr style="background:#f0f0f0;font-weight:600">'
              '<td style="{0}">DATE</td><td style="{1}">RAW$</td>'
              '<td style="{1}">REWARD$</td><td style="{1}">NET$</td>'
              '<td style="{1}">CONTRACTS</td></tr>'.format(TDL, TD))
-    h_raw = h_rew = 0.0
-    for i, (day, raw, reward, contracts, nf) in enumerate(reversed(series)):
+    for i, (day, raw, reward, contracts) in enumerate(dw["daily"]):
         bg = "#fafafa" if i % 2 else "#fff"
         net = (raw + reward) if (raw is not None and reward is not None) else None
-        if raw is not None:
-            h_raw += raw
-        if reward is not None:
-            h_rew += reward
         h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
                  '<td style="{3}">{4}</td><td style="{3}">{5}</td>'
                  '<td style="{3};font-weight:600">{6}</td>'
                  '<td style="{3}">{7:,.0f}</td></tr>'.format(
                      bg, TDL, day, TD,
                      _pnl_span(raw) if raw is not None else "n/a",
-                     "{:+,.2f}".format(reward) if reward is not None else "n/a",
+                     money(reward),
                      _pnl_span(net) if net is not None else "n/a", contracts))
-    h.append('<tr style="background:#f0f0f0;font-weight:700">'
-             '<td style="{0}">TOTAL</td><td style="{1}">{2}</td>'
-             '<td style="{1}">{3:+,.2f}</td><td style="{1}">{4}</td>'
-             '<td style="{1}"></td></tr>'.format(
-                 TDL, TD, _pnl_span(h_raw), h_rew, _pnl_span(h_raw + h_rew)))
+    if dw["daily"]:
+        h.append('<tr style="background:#f0f0f0;font-weight:700">'
+                 '<td style="{0}">TOTAL</td><td style="{1}">{2}</td>'
+                 '<td style="{1}">{3}</td><td style="{1}">{4}</td>'
+                 '<td style="{1}"></td></tr>'.format(
+                     TDL, TD, _pnl_span(t_raw), money(t_rew), _pnl_span(t_raw + t_rew)))
     h.append("</table>")
-    h.append('<div style="color:#888;font-size:12px;margin-top:4px">RAW is n/a '
-             'for days older than the {}h fill-attribution window. {}. REWARD is '
+    if not dw["daily"]:
+        h.append('<div style="color:#c0392b;font-size:12px">No days: {}.</div>'.format(
+            dw["note"] or "the dashboard summary has none"))
+    h.append('<div style="color:#888;font-size:12px;margin-top:4px">{}{}. REWARD is '
              'accrual-dated, so it does NOT line up with a credit date &mdash; '
              'Kalshi pays at each program\'s period end, 1&ndash;2 days later.'
-             '</div>'.format(FILL_LOOKBACK_HOURS, REWARD_NOTE))
+             '</div>'.format(tot_note + ". " if tot_note else "", DAILY_NOTE))
     h.append(_calibration_caveat_html())
 
     h.append(_cutoff_audit_html(audit))
@@ -2314,45 +2344,6 @@ def build_digest(now_utc: datetime):
     h.append("</table>")
     h.append('<div style="color:#888;font-size:12px;margin-top:4px">{}</div>'
              .format(capacity_note()))
-
-    h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
-             'Events traded yesterday, ET ({})</div>'.format(len(ev_rows)))
-    if ev_rows:
-        h.append('<table style="border-collapse:collapse">')
-        h.append('<tr style="background:#f0f0f0;font-weight:600">'
-                 '<td style="{0}">EVENT</td><td style="{1}">P&amp;L$</td>'
-                 '<td style="{1}">REAL$</td><td style="{1}">SETTLE$</td>'
-                 '<td style="{1}">MTM$</td><td style="{1}">CTS</td>'
-                 '<td style="{1}">MKTS</td></tr>'.format(TDL, TD))
-        et = {"realized": 0.0, "settle": 0.0, "unrealized": 0.0,
-              "contracts": 0.0, "mkts": 0}
-        for i, (ev, e) in enumerate(ev_rows):
-            bg = "#fafafa" if i % 2 else "#fff"
-            tot_e = e["realized"] + e["settle"] + e["unrealized"]
-            for k in ("realized", "settle", "unrealized", "contracts"):
-                et[k] += e[k]
-            et["mkts"] += len(e["mkts"])
-            h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
-                     '<td style="{3};font-weight:600">{4}</td>'
-                     '<td style="{3}">{5}</td><td style="{3}">{6}</td>'
-                     '<td style="{3}">{7}</td><td style="{3}">{8:,.0f}</td>'
-                     '<td style="{3}">{9}</td></tr>'.format(
-                         bg, TDL, _short_event(ev), TD, _pnl_span(tot_e),
-                         _pnl_span(e["realized"]), _pnl_span(e["settle"]),
-                         _pnl_span(e["unrealized"]), e["contracts"],
-                         len(e["mkts"])))
-        h.append('<tr style="background:#f0f0f0;font-weight:700">'
-                 '<td style="{0}">TOTAL</td><td style="{1}">{2}</td>'
-                 '<td style="{1}">{3}</td><td style="{1}">{4}</td>'
-                 '<td style="{1}">{5}</td><td style="{1}">{6:,.0f}</td>'
-                 '<td style="{1}">{7}</td></tr>'.format(
-                     TDL, TD,
-                     _pnl_span(et["realized"] + et["settle"] + et["unrealized"]),
-                     _pnl_span(et["realized"]), _pnl_span(et["settle"]),
-                     _pnl_span(et["unrealized"]), et["contracts"], et["mkts"]))
-        h.append("</table>")
-    else:
-        h.append("<div>No fills yesterday.</div>")
     if fin_html:
         h.append(fin_html)
     h.append('<div style="color:#777;font-size:12px;margin-top:12px;'
@@ -2361,14 +2352,50 @@ def build_digest(now_utc: datetime):
     return text, "".join(h)
 
 
+def subject_flag(text: str) -> str:
+    """The PICK-OFF tag for the email's subject line ("" when no window is in
+    the text): the portfolio email carries it since the IMM section moved in."""
+    return (" - " + imm_pickoff.HEADER) if (">> " + imm_pickoff.HEADER) in text else ""
+
+
+def write_section(path: str, now_utc: datetime) -> None:
+    """--section-out: build the section and write {text, html, subject_flag,
+    built_at} as JSON for send_portfolio_digest. A few retries, as the old
+    standalone send had: a Kalshi read can fail on the first try."""
+    for attempt in range(1, 4):
+        try:
+            text, html = build_digest(now_utc)
+            break
+        except Exception as e:
+            log(f"imm section build attempt {attempt}/3 failed: {e!r}")
+            if attempt == 3:
+                raise
+            time.sleep(60)
+    out = {"text": text, "html": html, "subject_flag": subject_flag(text),
+           "built_at": datetime.now(timezone.utc).isoformat()}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(out, f)
+    os.replace(tmp, path)
+    log(f"imm section written: {path}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--section-out", metavar="PATH",
+                    help="build the IMM section and write it to PATH as JSON "
+                         "(send_portfolio_digest runs this); sends nothing")
     ap.add_argument("--test", action="store_true",
-                    help="send now regardless of the sent-marker; do not write it")
+                    help="send the section now as a standalone email (the "
+                         "pre-2026-10-02 digest); writes no marker")
     ap.add_argument("--print", dest="print_only", action="store_true",
-                    help="build and print the digest; send nothing, write no marker")
+                    help="build and print the section; send nothing")
     ap.add_argument("--html-out", help="with --print, also write the HTML here")
     args = ap.parse_args(argv)
+
+    if args.section_out:
+        write_section(args.section_out, datetime.now(timezone.utc))
+        return 0
 
     if args.print_only:
         body, html = build_digest(datetime.now(timezone.utc))
@@ -2379,55 +2406,25 @@ def main(argv=None) -> int:
             log(f"wrote {args.html_out}")
         return 0
 
-    now_utc = datetime.now(timezone.utc)
-    today_ct = now_utc.astimezone(CT).date()
-    marker = os.path.join(STATUS_DIR, f"imm_digest_sent_{today_ct}.marker")
-
-    if not args.test and os.path.exists(marker):
-        log(f"imm digest already sent for {today_ct}; exiting")
+    if not args.test:
+        # Jack 2026-10-02: "cut it as a standalone email and add it into the
+        # Kalshi portfolio email". The 7:10 task still lands here; it is a
+        # no-op until the task is deleted.
+        log("standalone IMM digest retired 2026-10-02: the IMM section rides in "
+            "the 7:00 portfolio email (send_portfolio_digest.py); --test sends "
+            "one by hand")
         return 0
 
-    # The 7am trigger can fire while the laptop is in Modern Standby with the
-    # network radio off — retry for ~40 minutes so it goes out after wake.
-    body = html = None
-    for attempt in range(1, 9):
-        try:
-            body, html = build_digest(now_utc)
-            break
-        except Exception as e:
-            log(f"imm digest build attempt {attempt}/8 failed: {e!r}; retry in 5min")
-            if attempt == 8:
-                log("giving up for today")
-                return 1
-            time.sleep(300)
-    log("imm digest body:\n" + body)
-
+    now_utc = datetime.now(timezone.utc)
+    body, html = build_digest(now_utc)
     alerter = Alerter("IMM-DIGEST", live=True)
     if not alerter.enabled:
         log("cannot send imm digest: alert credentials not configured")
         return 1
-    subject = f"Kalshi incentive MM digest {today_ct}"
-    if (">> " + imm_pickoff.HEADER) in body:    # a window is in the text
-        subject += " - " + imm_pickoff.HEADER
-    ok = False
-    for attempt in range(1, 9):
-        ok = alerter.send_message(body, subject=subject, html=html)
-        if ok:
-            break
-        log(f"imm digest send attempt {attempt}/8 failed; retry in 5min")
-        time.sleep(300)
+    subject = "Kalshi incentive MM digest {}{}".format(
+        now_utc.astimezone(ET).date(), subject_flag(body))
+    ok = alerter.send_message(body, subject=subject, html=html)
     log(f"imm digest send: {'ok' if ok else 'FAILED'}")
-    if ok and not args.test:
-        with open(marker, "w") as f:
-            f.write(now_utc.isoformat())
-        cutoff = today_ct - timedelta(days=7)
-        for old in glob.glob(os.path.join(STATUS_DIR, "imm_digest_sent_*.marker")):
-            name = os.path.basename(old)[len("imm_digest_sent_"):-len(".marker")]
-            try:
-                if datetime.strptime(name, "%Y-%m-%d").date() < cutoff:
-                    os.remove(old)
-            except (ValueError, OSError):
-                pass
     return 0 if ok else 1
 
 
