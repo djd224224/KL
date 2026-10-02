@@ -11,6 +11,7 @@ import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -463,6 +464,80 @@ class SettlementTests(unittest.TestCase):
         self.assertEqual(f["mk"].tolist()[:4], [-4.0, 4.0, 0.0, 70.0])
         self.assertTrue(np.isnan(f["mk"].tolist()[4]))
         self.assertTrue(f["mo24"].isna().all())
+
+
+class CycleCacheTests(unittest.TestCase):
+    """The per-day parse cache (2026-10-02): it cached the live UTC day too and
+    served that partial parse as complete once the day was past, so 9/12,
+    9/14, 9/21 and 9/29 read as partial days. Only a complete log is cached
+    now, keyed on its size + mtime."""
+    DAY = "2026-09-29"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name, val in (("STATUS_DIR", tmp.name), ("CACHE_DIR", os.path.join(tmp.name, "sat_tracker_cache")),
+                          ("log", lambda msg: None)):
+            p = mock.patch.object(sat, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(sat, "_parse_cycle_file", wraps=sat._parse_cycle_file)
+        self.parse = p.start()
+        self.addCleanup(p.stop)
+        self.path = os.path.join(tmp.name, f"cycle_log_{self.DAY}.csv")
+        self.sig_path = os.path.join(sat.CACHE_DIR, f"{self.DAY}_sig.json")
+
+    def _append(self, hours, mtime, minutes=(0, 30)):
+        """The bot's rows for UTC `hours` of DAY, one cycle per minute in
+        `minutes` (one quoted long-dated market), then the mtime it leaves."""
+        fresh = not os.path.exists(self.path)
+        with open(self.path, "a", encoding="utf-8") as f:
+            if fresh:
+                f.write(",".join(sat.COLS) + "\n")
+            for h in hours:
+                for mi in minutes:
+                    r = dict.fromkeys(sat.COLS, "0")
+                    r.update(ts=f"{self.DAY}T{h:02d}:{mi:02d}:00Z", ticker="KXTRUMPMENTION-26OCT31-WORD",
+                             ext_bid="40", ext_ask="42", est_frac="0.01", pool_per_day="240", quoted="50",
+                             hour_mult="1.00")
+                    f.write(",".join(r[c] for c in sat.COLS) + "\n")
+        os.utime(self.path, (mtime.timestamp(), mtime.timestamp()))
+
+    def _cycles(self, now) -> int:
+        """Cycles load_cycle_data sees for DAY when it runs at `now`."""
+        _ser, cyc, _mids = sat.load_cycle_data(self.DAY, now=now.timestamp())
+        return int(cyc["n_cycles"].sum())
+
+    def test_a_growing_log_is_never_served_from_a_stale_cache(self):
+        # the 2026-09-29 03:09Z run: three hours logged so far, so nothing is cached
+        self._append(range(3), _utc(2026, 9, 29, 3, 8))
+        self.assertEqual(self._cycles(_utc(2026, 9, 29, 3, 9)), 6)
+        self.assertFalse(os.path.exists(self.sig_path))
+        # ...but the old loader cached exactly that parse, and its triple is still on disk
+        for part, df in zip(sat.CACHE_PARTS, sat._parse_cycle_file(self.path)):
+            df.to_csv(os.path.join(sat.CACHE_DIR, f"{self.DAY}_{part}.csv"), index=False)
+        # the bot logs the rest of the day; the Monday run reads it a week later
+        self._append(range(3, 24), _utc(2026, 9, 29, 23, 59))
+        self.assertEqual(self._cycles(_utc(2026, 10, 5, 11, 40)), 48)
+        self.assertTrue(os.path.exists(self.sig_path))           # the complete log is cached now
+
+    def test_a_cached_log_that_changes_is_parsed_again(self):
+        self._append(range(24), _utc(2026, 9, 29, 23, 59))
+        monday = _utc(2026, 10, 5, 11, 40)
+        self.assertEqual((self._cycles(monday), self._cycles(monday)), (48, 48))
+        self.assertEqual(self.parse.call_count, 1)                    # the second run read the cache
+        self._append([23], _utc(2026, 10, 2, 9, 0), minutes=(45,))   # e.g. restored from a fuller copy
+        self.assertEqual(self._cycles(monday), 49)
+        self.assertEqual(self.parse.call_count, 2)
+
+    def test_complete_once_its_day_is_over_and_the_log_has_settled(self):
+        end = _utc(2026, 9, 30).timestamp()
+        last = {"mtime_ns": int((end - 30) * 1e9)}                    # last write 23:59:30Z
+        self.assertFalse(sat._log_complete(self.DAY, last, end + 599))
+        self.assertTrue(sat._log_complete(self.DAY, last, end + 600))
+        touched = {"mtime_ns": int((end + 300) * 1e9)}                # written to after its day
+        self.assertFalse(sat._log_complete(self.DAY, touched, end + 899))
+        self.assertTrue(sat._log_complete(self.DAY, touched, end + 901))
 
 
 class GateRenderTests(unittest.TestCase):

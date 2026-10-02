@@ -38,8 +38,9 @@ SINCE, and set against the pre-change baseline (2026-08-08..09-11, measured
 The bot's OWN sinks are the source (IMM_LOGGING.md): fills_*.jsonl is exactly
 the bot's fills (no account-sharing ambiguity), settlements_*.jsonl carries
 the result of every market it held at settle. Cycle-log parsing (~100 MB/day)
-is cached per file day under STATUS_DIR/sat_tracker_cache/; the two newest
-files are always re-parsed because they are still growing.
+is cached per file day under STATUS_DIR/sat_tracker_cache/, for complete logs
+only and keyed on the log's size + mtime (load_cycle_data); the live UTC day
+is parsed every run.
 
 Scheduled "KL imm saturday-tracker" WEEKLY Monday 07:40 ET (after the 07:10
 digest / 07:20 gaps / 07:25 opportunistic). --print builds and prints only;
@@ -185,36 +186,100 @@ def _parse_cycle_file(path: str):
     return ser, cyc, mids
 
 
-def load_cycle_data(first_file_day: str):
+# The parse cache, one entry per COMPLETE cycle log: CACHE_DIR/<day>_series,
+# _cycles and _mids.csv, then <day>_sig.json (the log's size + mtime and
+# CACHE_VERSION), written last. An entry is served only while its signature
+# matches the log as it is now; a log that changed since, or a triple with no
+# signature, is parsed again. Until 2026-10-02 the live UTC day was cached too
+# and served as complete once the day was past: 9/12, 9/14, 9/21 and 9/29 read
+# as partial days. Bump CACHE_VERSION whenever _parse_cycle_file's output
+# changes.
+CACHE_VERSION = 1
+CACHE_PARTS = ("series", "cycles", "mids")
+LOG_SETTLE_SECS = 600
+
+
+def _log_sig(path: str) -> dict:
+    st = os.stat(path)
+    return {"v": CACHE_VERSION, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _log_complete(day: str, sig: dict, now: float) -> bool:
+    """The bot names every cycle-log write after the UTC date at write time,
+    so cycle_log_<day>.csv stops growing when its UTC day ends. Final once
+    the day is LOG_SETTLE_SECS over and the file has sat still that long
+    (imm_dashboard.file_complete's rule)."""
+    end = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 86400
+    return now >= end + LOG_SETTLE_SECS and now - sig["mtime_ns"] / 1e9 >= LOG_SETTLE_SECS
+
+
+def _cache_paths(day: str):
+    return ([os.path.join(CACHE_DIR, f"{day}_{k}.csv") for k in CACHE_PARTS],
+            os.path.join(CACHE_DIR, f"{day}_sig.json"))
+
+
+def _read_cache(day: str, sig: dict):
+    """(series, cycles, mids) for `day` from the cache, or None unless the
+    entry was parsed from the log exactly as it is now."""
+    parts, sig_path = _cache_paths(day)
+    try:
+        with open(sig_path, encoding="utf-8") as f:
+            if json.load(f) != sig:
+                return None
+        ps, pc, pm = parts
+        return pd.read_csv(ps, dtype={"et_date": str}), pd.read_csv(pc, dtype={"et_date": str}), pd.read_csv(pm)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_cache(day: str, sig: dict, frames) -> None:
+    """The three frames, then the signature: an interrupted write leaves no
+    entry that can be served."""
+    parts, sig_path = _cache_paths(day)
+    if os.path.exists(sig_path):
+        os.remove(sig_path)
+    for p, df in zip(parts, frames):
+        df.to_csv(p, index=False)
+    tmp = sig_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sig, f)
+    os.replace(tmp, sig_path)
+
+
+def load_cycle_data(first_file_day: str, now: float = None):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    fresh_floor = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    now = time.time() if now is None else now
+    today_utc = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
     sers, cycs, mids = [], [], []
     for path in sorted(glob.glob(os.path.join(STATUS_DIR, "cycle_log_*.csv"))):
         day = os.path.basename(path)[10:20]
         if day < first_file_day or day > today_utc:
             continue
-        ps = os.path.join(CACHE_DIR, f"{day}_series.csv")
-        pc = os.path.join(CACHE_DIR, f"{day}_cycles.csv")
-        pm = os.path.join(CACHE_DIR, f"{day}_mids.csv")
-        if day < fresh_floor and all(os.path.exists(p) for p in (ps, pc, pm)):
-            sers.append(pd.read_csv(ps, dtype={"et_date": str}))
-            cycs.append(pd.read_csv(pc, dtype={"et_date": str}))
-            mids.append(pd.read_csv(pm))
-            continue
-        t0 = time.time()
         try:
-            s, c, m = _parse_cycle_file(path)
-        except Exception as e:                      # a torn file must not kill the report
-            log(f"[SAT] ! cycle log {day} unreadable: {e}")
+            sig = _log_sig(path)
+        except OSError:
             continue
-        s.to_csv(ps, index=False)
-        c.to_csv(pc, index=False)
-        m.to_csv(pm, index=False)
+        frames = _read_cache(day, sig)
+        if frames is None:
+            t0 = time.time()
+            try:
+                frames = _parse_cycle_file(path)
+            except Exception as e:                      # a torn file must not kill the report
+                log(f"[SAT] ! cycle log {day} unreadable: {e}")
+                continue
+            complete = _log_complete(day, sig, now)
+            if complete:
+                try:
+                    if _log_sig(path) == sig:           # it did not change under the parse
+                        _write_cache(day, sig, frames)
+                except OSError as e:                    # the cache only saves time
+                    log(f"[SAT] ! cache write for {day} failed: {e}")
+            log(f"[SAT] parsed cycle_log_{day}.csv ({len(frames[0])} series-hours) in {time.time() - t0:.0f}s"
+                + ("" if complete else " [live]"))
+        s, c, m = frames
         sers.append(s)
         cycs.append(c)
         mids.append(m)
-        log(f"[SAT] parsed cycle_log_{day}.csv ({len(s)} series-hours) in {time.time() - t0:.0f}s")
     if not sers:
         return pd.DataFrame(), pd.DataFrame(), {}
     ser = pd.concat(sers, ignore_index=True)
