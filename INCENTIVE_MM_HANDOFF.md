@@ -6029,3 +6029,36 @@ IMM_TREASURY_GATE_ENABLE=0 additionally BLOCKS the ladders.
 WATCH: startup "treasury gate: ALL 69 Treasury series quote only against
 CNBC's live yield ...", "treasury stand-aside KXUST..." lines in the 08:25 /
 09:55 windows, and the daily KXUST*AD book on the day before each print.
+
+## 2026-10-02 — Mortgage gate: the live 10Y folded into the anchor (Jack)
+
+Jack: "yes fold the live 10Y into the mortgage anchor" (after "confirm are CPI
+and Mortgage markets also quoting based on a realtime feed?" -- CPI: no feed by
+design, time blackouts only; mortgage: Kalshi's own weekly ladder as the live
+read, no external feed).
+
+WHAT. mortgage_fair.fold_x0 wraps choose_x0. The refresher passes CNBC's live
+10Y (the Treasury gate's YieldWatch; read within IMM_MORT_Y10_MAX_AGE_SECS=120)
+into MortgageWatch.refresh(y10=...):
+  (1) a FRESH ladder anchor moves FOLD_BETA (0.9) bp per bp of 10Y since the
+      anchor last repriced (a move of 0.25bp resets the reference) -- a stale
+      weekly book still tracks rates;
+  (2) NO fresh anchor (the ladder too wide / no open weekly event / its
+      sanity checks failing): the last print + 0.9 x (live 10Y - the 10Y par
+      average over that print's Thu-Wed survey window, treasury.gov, read once
+      per print), dated today, anchor sd IMM_MORT_FOLD_SD_BP=5 (3 for the
+      ladder) -- instead of the old "no rate level" a day after the print.
+A fold past IMM_MORT_FOLD_MAX_BP (30) stands aside rather than guess; no live
+10Y (the Treasury gate off / CNBC stale) or no window average = the 9/28
+behaviour exactly. p_final / p_max take the anchor sd as a_bp.
+
+FIT (2022-2026 PMMS weekly vs the survey-window 10Y average change): beta
+1.02 (2024-26: 0.82), R^2 0.77, residual 6.1bp (2024-26: 3.9bp). Next-print
+check 2024-26: last print + 0.9 x (Wednesday 10Y - last window average) RMSE
+6.9bp vs 8.1bp for the last print alone.
+
+DRY RUN 10/02 01:44Z: live 10Y 5.258, the 10/01 print 7.28 with window 10Y
+5.228, ladder anchor 7.328 (fold +0.0bp at first read); with the ladder gone
+X0 would be 7.307 (was: no rate level); 39/50 markets priced either way.
+
+KILL SWITCH. IMM_MORT_FOLD_10Y=0 (task restart) restores the 9/28 anchor.

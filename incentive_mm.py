@@ -17672,7 +17672,18 @@ class IncentiveMarketMaker:
                 while True:
                     delay = max(30, MORT_FAIR_REFRESH_SECS)
                     try:
-                        snap = watch.refresh()
+                        # the live 10Y fold (Jack 2026-10-02: "yes fold the
+                        # live 10Y into the mortgage anchor"): CNBC's 10Y
+                        # from the Treasury gate's feed; none = no fold
+                        y10 = None
+                        tw = _treasury_state.get("watch")
+                        if tw is not None:
+                            with tw.lock:
+                                q10 = tw.quotes.get(10)
+                                read_at = tw.read_at
+                            if q10 is not None and read_at:
+                                y10 = (q10["y"], read_at)
+                        snap = watch.refresh(y10=y10)
                         _mort_state["snap"] = snap
                         ents = snap.get("markets") or {}
                         n_ok = sum(1 for e in ents.values() if "p" in e)
@@ -17802,7 +17813,11 @@ class IncentiveMarketMaker:
                 f"stands aside, size x{MORT_SIZE_MULT:g}, 1-99c, out "
                 f"{7 + MORT_CUTOFF_BUFFER_DAYS}d before the first print that "
                 f"can settle, ttl {MORT_FAIR_TTL_MIN}m, refresh "
-                f"{MORT_FAIR_REFRESH_SECS}s, status {MORT_STATUS_FILE}")
+                f"{MORT_FAIR_REFRESH_SECS}s, live 10Y fold "
+                + ("on (CNBC via the Treasury feed)"
+                   if os.environ.get("IMM_MORT_FOLD_10Y", "1") == "1"
+                   and TREASURY_GATE_ENABLE else "off")
+                + f", status {MORT_STATUS_FILE}")
         else:
             log("mortgage gate: OFF -- KXFM30YMTG/KXMORTGAGERATE not enrolled")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "

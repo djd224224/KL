@@ -57,6 +57,8 @@ as the fallback): the open KX30YMORTW ladder (anchor), its settled markets
 (the last print) and the open family markets (rules, strike, close).
 """
 
+import csv
+import io
 import json
 import math
 import os
@@ -110,6 +112,26 @@ ANCHOR_TTL_SECS = _env_float("IMM_MORT_ANCHOR_TTL_SECS", 1200)
 PRINT_MAX_AGE_DAYS = _env_float("IMM_MORT_PRINT_MAX_AGE_D", 8)
 PRINT_ONLY_HOURS = _env_float("IMM_MORT_PRINT_ONLY_H", 24)
 META_REFRESH_SECS = _env_float("IMM_MORT_META_REFRESH_SECS", 900)
+# LIVE 10Y FOLD (Jack 2026-10-02: "yes fold the live 10Y into the mortgage
+# anchor"). incentive_mm passes CNBC's live 10Y (the Treasury gate's feed);
+# X0 then moves FOLD_BETA bp per bp of 10Y: (1) a fresh ladder anchor by the
+# 10Y's move since the anchor last repriced (a stale weekly book still
+# tracks rates); (2) with no fresh anchor, the last print by the 10Y's move
+# since that print's survey window (Thu-Wed, Treasury par average) instead of
+# standing aside -- dated at the next print, anchor sd FOLD_SD_BP. Fit
+# 2022-2026: weekly print change vs the window-average 10Y change, beta 1.02
+# (2024-26: 0.82), R^2 0.77, residual 4-6bp. A fold past FOLD_MAX_BP, a 10Y
+# read older than Y10_MAX_AGE_SECS, or no window average = no fold (the
+# 2026-09-28 behaviour). IMM_MORT_FOLD_10Y=0 turns it off.
+FOLD_ENABLE = os.environ.get("IMM_MORT_FOLD_10Y", "1") == "1"
+FOLD_BETA = _env_float("IMM_MORT_FOLD_BETA", 0.9)
+FOLD_SD_BP = _env_float("IMM_MORT_FOLD_SD_BP", 5.0)
+FOLD_MAX_BP = _env_float("IMM_MORT_FOLD_MAX_BP", 30.0)
+Y10_MAX_AGE_SECS = _env_float("IMM_MORT_Y10_MAX_AGE_SECS", 120)
+ANCHOR_MOVE_BP = 0.25           # the ladder anchor "repriced" when it moves this much
+TREASURY_CSV = ("https://home.treasury.gov/resource-center/data-chart-center/"
+                "interest-rates/daily-treasury-rates.csv/{year}/all?type="
+                "daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv")
 FAMILY_SERIES = tuple(s.strip() for s in os.environ.get(
     "IMM_MORT_SERIES", "KXFM30YMTG,KXMORTGAGERATE").split(",") if s.strip())
 
@@ -176,17 +198,21 @@ def sd_weeks(n: float) -> float:
     return 0.0 if n <= 0 else SD_A_BP * (n ** SD_H) / 100.0
 
 
-def p_final(x0: float, n_weeks: float, k: float) -> float:
-    s = math.hypot(sd_weeks(n_weeks), ANCHOR_SD_BP / 100.0)
+def p_final(x0: float, n_weeks: float, k: float,
+            a_bp: Optional[float] = None) -> float:
+    a = ANCHOR_SD_BP if a_bp is None else a_bp
+    s = math.hypot(sd_weeks(n_weeks), a / 100.0)
     return 1.0 - _phi((k + 0.005 - x0) / s)
 
 
-def p_max(x0: float, n1: float, m: float, k: float, steps: int = 240) -> float:
+def p_max(x0: float, n1: float, m: float, k: float, steps: int = 240,
+          a_bp: Optional[float] = None) -> float:
     """P(any weekly print from F to L is above K): n1 weeks anchor -> F, m
     weeks F -> L. The first print by its own normal law; below K there, the
     rest of the year by the reflection principle, barrier + MAX_SHIFT_BP."""
     thr = k + 0.005
-    s1 = math.hypot(sd_weeks(n1), ANCHOR_SD_BP / 100.0)
+    a = ANCHOR_SD_BP if a_bp is None else a_bp
+    s1 = math.hypot(sd_weeks(n1), a / 100.0)
     p = 1.0 - _phi((thr - x0) / s1)
     if m <= 0:
         return p
@@ -391,8 +417,16 @@ class MortgageWatch:
         self.family: List[dict] = []
         self.anchor: Optional[dict] = None           # last GOOD anchor
         self.snap: Optional[dict] = None
+        # the 10Y fold's references: (anchor x when it last repriced, the
+        # live 10Y then) and (print day, its survey window's 10Y average)
+        self.anchor_y10: Optional[Tuple[float, Optional[float]]] = None
+        self.y10_ref: Optional[Tuple[str, Optional[float]]] = None
+        self.y10_ref_retry = 0.0
 
-    def refresh(self, now_ts: Optional[float] = None) -> dict:
+    def refresh(self, now_ts: Optional[float] = None,
+                y10: Optional[Tuple[float, float]] = None) -> dict:
+        """y10: (CNBC's live 10Y in %, the epoch it was read) from
+        incentive_mm's Treasury feed, or None (no fold)."""
         now_ts = time.time() if now_ts is None else now_ts
         now = datetime.fromtimestamp(now_ts, timezone.utc)
         errors: List[str] = []
@@ -428,8 +462,35 @@ class MortgageWatch:
                 errors.append(f"anchor: {why}")
         except Exception as e:                      # noqa: BLE001
             errors.append(f"anchor: {type(e).__name__}: {str(e)[:100]}")
-        self.snap = build_snapshot(now_ts, self.anchor, self.print_,
-                                   self.family, errors)
+        live = None
+        if FOLD_ENABLE and y10 is not None and now_ts - y10[1] <= Y10_MAX_AGE_SECS:
+            live = y10[0]
+        # the 10Y when the ladder anchor last repriced (a move of
+        # ANCHOR_MOVE_BP resets it; an unchanged anchor keeps its reference)
+        if self.anchor is not None:
+            x = self.anchor["x"]
+            if self.anchor_y10 is None \
+                    or abs(x - self.anchor_y10[0]) * 100.0 >= ANCHOR_MOVE_BP:
+                self.anchor_y10 = (x, live)
+            elif self.anchor_y10[1] is None and live is not None:
+                self.anchor_y10 = (x, live)
+        # the last print's survey-window 10Y average, read once per print
+        ref = None
+        if live is not None and self.print_ is not None:
+            pday = self.print_[1].isoformat()
+            if (self.y10_ref is None or self.y10_ref[0] != pday) \
+                    and now_ts >= self.y10_ref_retry:
+                try:
+                    self.y10_ref = (pday, fetch_par10_window_avg(self.print_[1]))
+                except Exception as e:              # noqa: BLE001
+                    self.y10_ref_retry = now_ts + 600
+                    errors.append(f"10Y window: {type(e).__name__}: {str(e)[:100]}")
+            if self.y10_ref is not None and self.y10_ref[0] == pday:
+                ref = self.y10_ref[1]
+        self.snap = build_snapshot(
+            now_ts, self.anchor, self.print_, self.family, errors, y10=live,
+            y10_at_anchor=self.anchor_y10[1] if self.anchor_y10 else None,
+            y10_ref=ref)
         return self.snap
 
 
@@ -463,9 +524,73 @@ def choose_x0(now_ts: float, anchor: Optional[dict],
     return None, None, why
 
 
-def market_entry(m: dict, x0: Optional[float], x0_day: Optional[date]) -> dict:
+def par10_window_avg(pday: date, texts: List[str]) -> Optional[float]:
+    """The 10Y par yield averaged over a print's survey window -- Thursday
+    pday-7 through Wednesday pday-1 -- from treasury.gov's yearly CSVs (at
+    least three business days, else None)."""
+    want = {pday - timedelta(days=i) for i in range(1, 8)}
+    vals: Dict[date, float] = {}
+    for text in texts:
+        for r in csv.DictReader(io.StringIO(text)):
+            try:
+                d = datetime.strptime(r["Date"], "%m/%d/%Y").date()
+                if d in want:
+                    vals[d] = float(r["10 Yr"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return sum(vals.values()) / len(vals) if len(vals) >= 3 else None
+
+
+def fetch_par10_window_avg(pday: date, timeout: float = HTTP_TIMEOUT) -> Optional[float]:
+    texts = []
+    for year in sorted({(pday - timedelta(days=7)).year, pday.year}):
+        r = requests.get(TREASURY_CSV.format(year=year), timeout=timeout,
+                         headers={"User-Agent": "KL-IMM-mortgage-gate/1.0"})
+        r.raise_for_status()
+        texts.append(r.text)
+    return par10_window_avg(pday, texts)
+
+
+def fold_x0(now_ts: float, anchor: Optional[dict],
+            print_: Optional[Tuple[float, date]], y10: Optional[float],
+            y10_at_anchor: Optional[float], y10_ref: Optional[float]
+            ) -> Tuple[Optional[float], Optional[date], str, float]:
+    """choose_x0 with the live 10Y folded in: (X0, the day it is dated at,
+    source or why-not, the anchor's sd in bp). y10 the live 10Y (None = no
+    fold); y10_at_anchor the 10Y when the ladder anchor last repriced;
+    y10_ref the 10Y par average over the last print's survey window."""
+    x0, day, src = choose_x0(now_ts, anchor, print_)
+    if not FOLD_ENABLE or y10 is None:
+        return x0, day, src, ANCHOR_SD_BP
+    if x0 is not None and src.startswith("anchor"):
+        if y10_at_anchor is None:
+            return x0, day, src, ANCHOR_SD_BP
+        shift = FOLD_BETA * (y10 - y10_at_anchor) * 100.0
+        if abs(shift) > FOLD_MAX_BP:
+            return None, None, (f"10Y fold {shift:+.1f}bp is past "
+                                f"{FOLD_MAX_BP:g}bp ({src})"), ANCHOR_SD_BP
+        return (x0 + shift / 100.0, day, f"{src} +10Y fold {shift:+.1f}bp",
+                ANCHOR_SD_BP)
+    # no fresh anchor: the last print, carried by the 10Y since its window
+    if print_ is None or y10_ref is None:
+        return x0, day, src, ANCHOR_SD_BP
+    pv, pday = print_
+    today = et_date(datetime.fromtimestamp(now_ts, timezone.utc))
+    if (today - pday).days > PRINT_MAX_AGE_DAYS:
+        return x0, day, src, ANCHOR_SD_BP            # choose_x0 refused it
+    shift = FOLD_BETA * (y10 - y10_ref) * 100.0
+    if abs(shift) > FOLD_MAX_BP:
+        return None, None, (f"10Y fold {shift:+.1f}bp is past "
+                            f"{FOLD_MAX_BP:g}bp ({src})"), ANCHOR_SD_BP
+    # dated TODAY: the n-week sd then counts every week from now
+    return (pv + shift / 100.0, today,
+            f"print {pday} +10Y fold {shift:+.1f}bp [{src}]", FOLD_SD_BP)
+
+
+def market_entry(m: dict, x0: Optional[float], x0_day: Optional[date],
+                 a_bp: Optional[float] = None) -> dict:
     """One family market's gate entry: {'p', 'kind', 'year', 'k', ...} or
-    {'err': why}."""
+    {'err': why}. a_bp: the anchor's own sd (default ANCHOR_SD_BP)."""
     t = m.get("ticker") or ""
     spec = parse_rules(m.get("rules_primary") or "")
     if spec is None:
@@ -498,34 +623,40 @@ def market_entry(m: dict, x0: Optional[float], x0_day: Optional[date]) -> dict:
         n = (last - x0_day).days / 7.0
         if n < 1:
             return dict(e, err=f"the deciding print {last} is under a week out")
-        e.update(n=round(n, 3), p=p_final(x0, n, spec["k"]))
+        e.update(n=round(n, 3), p=p_final(x0, n, spec["k"], a_bp=a_bp))
     else:
         first = first_thursday(spec["year"])
         n1 = (first - x0_day).days / 7.0
         if n1 < 1:
             return dict(e, err=f"inside the counting year (first print {first})")
         mw = (last - first).days / 7.0
-        e.update(n1=round(n1, 3), m=round(mw, 3), p=p_max(x0, n1, mw, spec["k"]))
+        e.update(n1=round(n1, 3), m=round(mw, 3),
+                 p=p_max(x0, n1, mw, spec["k"], a_bp=a_bp))
     return e
 
 
 def build_snapshot(now_ts: float, anchor: Optional[dict],
                    print_: Optional[Tuple[float, date]], family: List[dict],
-                   errors: Optional[List[str]] = None) -> dict:
-    x0, x0_day, src = choose_x0(now_ts, anchor, print_)
+                   errors: Optional[List[str]] = None,
+                   y10: Optional[float] = None,
+                   y10_at_anchor: Optional[float] = None,
+                   y10_ref: Optional[float] = None) -> dict:
+    x0, x0_day, src, a_bp = fold_x0(now_ts, anchor, print_, y10,
+                                    y10_at_anchor, y10_ref)
     entries = {}
     for m in family:
         t = m.get("ticker")
         if t:
-            entries[t] = market_entry(m, x0, x0_day)
+            entries[t] = market_entry(m, x0, x0_day, a_bp)
     return {
         "ts": now_ts,
         "fetched_at": datetime.fromtimestamp(now_ts, timezone.utc).isoformat(),
         "x0": x0, "x0_day": x0_day.isoformat() if x0_day else None,
-        "x0_src": src,
+        "x0_src": src, "x0_sd_bp": a_bp,
         "print": ({"value": print_[0], "day": print_[1].isoformat()}
                   if print_ else None),
         "anchor": anchor, "errors": list(errors or []),
+        "fold": {"y10": y10, "y10_at_anchor": y10_at_anchor, "y10_ref": y10_ref},
         "markets": entries,
         "model": {"sd_a_bp": SD_A_BP, "sd_h": SD_H, "anchor_sd_bp": ANCHOR_SD_BP,
                   "max_shift_bp": MAX_SHIFT_BP,
@@ -536,7 +667,10 @@ def build_snapshot(now_ts: float, anchor: Optional[dict],
                   "anchor_extrap_edge_c": ANCHOR_EXTRAP_EDGE_C,
                   "anchor_ttl_secs": ANCHOR_TTL_SECS,
                   "print_max_age_d": PRINT_MAX_AGE_DAYS,
-                  "print_only_h": PRINT_ONLY_HOURS},
+                  "print_only_h": PRINT_ONLY_HOURS,
+                  "fold_10y": FOLD_ENABLE, "fold_beta": FOLD_BETA,
+                  "fold_sd_bp": FOLD_SD_BP, "fold_max_bp": FOLD_MAX_BP,
+                  "y10_max_age_secs": Y10_MAX_AGE_SECS},
     }
 
 

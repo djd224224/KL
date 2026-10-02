@@ -298,5 +298,94 @@ class TestWatch(unittest.TestCase):
         self.assertEqual(len(snap["errors"]), 2)                  # meta + anchor
 
 
+def par_csv(rows):
+    return "Date,1 Mo,2 Yr,10 Yr\n" + "\n".join(
+        f"{d.strftime('%m/%d/%Y')},4.1,4.8,{v}" for d, v in rows)
+
+
+class TestFold10Y(unittest.TestCase):
+    """Jack 2026-10-02: "yes fold the live 10Y into the mortgage anchor"."""
+
+    def anchor(self, x=7.218, age=0.0, now=NOW):
+        return {"x": x, "event": "KX30YMORTW-26OCT01", "day": "2026-10-01",
+                "ts": now - age}
+
+    def test_par_window_average(self):
+        # the 9/24 print's window: Thu 9/17 .. Wed 9/23 (five business days)
+        rows = [(date(2026, 9, 16), 9.0), (date(2026, 9, 17), 5.20),
+                (date(2026, 9, 18), 5.22), (date(2026, 9, 21), 5.24),
+                (date(2026, 9, 22), 5.26), (date(2026, 9, 23), 5.28),
+                (date(2026, 9, 24), 9.0)]
+        self.assertAlmostEqual(mf.par10_window_avg(date(2026, 9, 24), [par_csv(rows)]), 5.24)
+        self.assertIsNone(mf.par10_window_avg(date(2026, 9, 24), [par_csv(rows[:3])]))
+
+    def test_a_fresh_anchor_moves_with_the_10y_since_it_repriced(self):
+        x0, d, src, a = mf.fold_x0(NOW, self.anchor(), PRINT, 5.30, 5.26, None)
+        self.assertAlmostEqual(x0, 7.218 + 0.9 * 0.04, places=6)    # +3.6bp
+        self.assertEqual((d, a), (date(2026, 10, 1), mf.ANCHOR_SD_BP))
+        self.assertIn("+10Y fold +3.6bp", src)
+        # no reference for this anchor yet: unchanged
+        self.assertEqual(mf.fold_x0(NOW, self.anchor(), PRINT, 5.30, None, None)[0], 7.218)
+
+    def test_no_anchor_the_print_carried_by_the_10y(self):
+        # no fresh anchor and the print 4 days old: was "no rate level"
+        self.assertIsNone(mf.choose_x0(NOW, None, PRINT)[0])
+        x0, d, src, a = mf.fold_x0(NOW, None, PRINT, 5.24, None, 5.14)
+        self.assertAlmostEqual(x0, 7.03 + 0.9 * 0.10, places=6)     # +9bp
+        self.assertEqual(d, mf.et_date(datetime.fromtimestamp(NOW, timezone.utc)))
+        self.assertEqual(a, mf.FOLD_SD_BP)
+        self.assertTrue(src.startswith("print 2026-09-24 +10Y fold +9.0bp"), src)
+        # the fold's wider anchor sd reaches the probabilities
+        self.assertNotAlmostEqual(mf.p_final(7.1, 13, 7.0, a_bp=5.0),
+                                  mf.p_final(7.1, 13, 7.0), places=6)
+
+    def test_what_does_not_fold(self):
+        # past the cap: no rate level rather than a guess
+        x0, _, src, _a = mf.fold_x0(NOW, None, PRINT, 5.70, None, 5.24)
+        self.assertIsNone(x0)
+        self.assertIn("past 30bp", src)
+        self.assertIsNone(mf.fold_x0(NOW, self.anchor(), PRINT, 5.70, 5.26, None)[0])
+        # no live 10Y / no window average / the switch off: choose_x0 as was
+        self.assertEqual(mf.fold_x0(NOW, None, PRINT, None, None, 5.24)[:3],
+                         mf.choose_x0(NOW, None, PRINT))
+        self.assertIsNone(mf.fold_x0(NOW, None, PRINT, 5.20, None, None)[0])
+        with mock.patch.object(mf, "FOLD_ENABLE", False):
+            self.assertIsNone(mf.fold_x0(NOW, None, PRINT, 5.20, None, 5.24)[0])
+        # a print over eight days old stays refused
+        late = datetime(2026, 10, 3, 16, 0, tzinfo=timezone.utc).timestamp()
+        self.assertIsNone(mf.fold_x0(late, None, PRINT, 5.20, None, 5.24)[0])
+
+    def test_refresh_tracks_the_anchor_reference(self):
+        calls = []
+        tw = TestWatch()
+        w = mf.MortgageWatch(tw.fake(calls))
+        with mock.patch.object(mf, "fetch_par10_window_avg", return_value=5.24) as fp:
+            snap = w.refresh(now_ts=NOW, y10=(5.26, NOW - 5))
+            self.assertAlmostEqual(snap["x0"], 7.218, places=3)    # reference set here
+            self.assertEqual(snap["fold"], {"y10": 5.26, "y10_at_anchor": 5.26,
+                                            "y10_ref": 5.24})
+            # same ladder, the 10Y up 5bp: the anchor follows by 4.5bp
+            snap = w.refresh(now_ts=NOW + 120, y10=(5.31, NOW + 115))
+            self.assertAlmostEqual(snap["x0"], 7.218 + 0.045, places=3)
+            self.assertIn("+10Y fold +4.5bp", snap["x0_src"])
+            # a stale 10Y read: no fold
+            snap = w.refresh(now_ts=NOW + 240, y10=(5.40, NOW + 240 - mf.Y10_MAX_AGE_SECS - 5))
+            self.assertAlmostEqual(snap["x0"], 7.218, places=3)
+            # the ladder reprices 3bp higher: the reference resets to the
+            # 10Y then, so the fold starts again from zero
+            moved = [rung(k + 0.03, b, a) for k, b, a in (
+                (7.17, 94, 97), (7.18, 89, 97), (7.19, 81, 94), (7.20, 69, 84),
+                (7.21, 54, 70), (7.22, 42, 52), (7.23, 38, 39))]
+            w.get_json = tw.fake(calls, ladder=moved)
+            snap = w.refresh(now_ts=NOW + 360, y10=(5.31, NOW + 355))
+            self.assertAlmostEqual(w.anchor_y10[0], 7.248, places=3)
+            self.assertEqual(w.anchor_y10[1], 5.31)
+            self.assertAlmostEqual(snap["x0"], 7.248, places=3)
+            self.assertNotIn("+10Y fold", snap["x0_src"].replace("+10Y fold +0.0bp", ""))
+            self.assertEqual(fp.call_count, 1)                      # once per print
+        self.assertIn("fold_beta", snap["model"])
+        self.assertEqual(snap["x0_sd_bp"], mf.ANCHOR_SD_BP)
+
+
 if __name__ == "__main__":
     unittest.main()
