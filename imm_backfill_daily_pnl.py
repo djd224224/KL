@@ -95,7 +95,14 @@ def day_pnl(fills: list, mk: dict) -> dict:
     """One ET day's daily_pnl.json record from that day's bot fills; `mk` is
     ticker -> Kalshi market record. The residual position of each market is
     booked at what Kalshi paid (settle_price_cents) once it has settled, and
-    marked to the bid/ask mid while it is open."""
+    marked by imm.bulk_mark_cents while it is open, as the digest's own
+    daily_pnl.json upsert marks it: the bid/ask mid of a two-sided book,
+    else the last trade clamped inside a 50c+ wide book or to the live side
+    of a one-sided one, else unmarked. Until
+    2026-10-01 this took the mid whenever both sides read nonzero, and
+    Kalshi reads an empty ask as $1.00, so a stray bid under no offer marked
+    at (bid + 100) / 2; an empty book went unmarked here while the digest
+    marked it at the last trade."""
     pnl = PnlTracker()
     fees = 0.0
     for f in sorted(fills, key=lambda x: x.get("ts") or 0):
@@ -115,10 +122,9 @@ def day_pnl(fills: list, mk: dict) -> dict:
         if px is not None:
             settle += p * (px - a) / 100.0
         else:
-            bid = float(m.get("yes_bid_dollars") or 0) * 100
-            ask = float(m.get("yes_ask_dollars") or 0) * 100
-            if bid and ask:
-                mtm += p * ((bid + ask) / 2 - a) / 100.0
+            mk_c = imm.bulk_mark_cents(m)
+            if mk_c is not None:
+                mtm += p * (mk_c - a) / 100.0
     raw = sum(pnl.realized.values()) + settle + mtm - fees
     return {
         "raw": round(raw, 2),

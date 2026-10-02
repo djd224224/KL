@@ -178,6 +178,33 @@ class RawPnlForFillsTests(_DigestTest):
         self.assertEqual(tot["open_markets"], 1)
 
 
+class RainDirSectionTests(_DigestTest):
+    """The rain-directional block's open MTM took (bid + ask) / 2 whenever
+    both read nonzero, and Kalshi reads an empty ask as $1.00 (2026-10-01).
+    It now marks with the bot's bulk_mark_cents, like current_mids."""
+
+    def test_a_one_sided_book_marks_at_the_last_trade(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = self.sd.STATUS_PATH
+        self.sd.STATUS_PATH = os.path.join(tmp.name, "status_incentive_mm.json")
+        self.addCleanup(setattr, self.sd, "STATUS_PATH", old)
+        with open(os.path.join(tmp.name, "rain_directional_ledger.csv"), "w",
+                  encoding="utf-8", newline="") as f:
+            f.write("ts,ticker,take_side,contracts,price_cents,fair_cents,"
+                    "ext_bid,ext_ask,edge_cents,order_id\n"
+                    "2026-09-30T16:00:00Z,KXRAINNYC-26OCT01,yes,3,40,60,38,40,20,a\n"
+                    "2026-09-30T16:00:00Z,KXRAINCHI-26OCT01,no,3,60,30,30,34,10,b\n"
+                    "2026-09-29T16:00:00Z,KXRAINDC-26SEP30,yes,3,40,60,38,40,20,c\n")
+        client = _Client(_market("KXRAINNYC-26OCT01", bid="0.0500", ask="1.0000", last="0.9700"),
+                         _market("KXRAINCHI-26OCT01", bid="0.3000", ask="0.3400", last="0.3100"),
+                         _market("KXRAINDC-26SEP30", "yes", "finalized"))
+        text, _html = self.sd.rain_dir_section(client)
+        # 3 x (97 - 40) + 3 x ((100 - 32) - 60) = 1.71 + 0.24; the stray 5c
+        # bid under no offer read 52.5 before, +0.375
+        self.assertIn("settled P&L +1.80 | open 2 MTM +1.95 | total +3.75", text[0])
+
+
 class DailySeriesTests(_DigestTest):
     """daily_series feeds the DAILY P&L table and upserts daily_pnl.json."""
 

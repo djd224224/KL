@@ -251,6 +251,92 @@ class ReplayDayTests(unittest.TestCase):
         self.assertAlmostEqual(pf.side_value(-10.0, None, 9.0), 9.0)
 
 
+class YesMarkTests(unittest.TestCase):
+    """2026-10-01: Kalshi reads an empty YES ask as $1.00, and the morning
+    marks took (bid + ask) / 2 whenever both read above 0. A stray bid under
+    no offer marked half way to $1. The rule is now incentive_mm.
+    bulk_mark_cents's, in dollars."""
+
+    def test_two_sided_book_is_the_mid(self):
+        self.assertAlmostEqual(pf.yes_mark(0.30, 0.34, 0.20), 0.32)
+
+    def test_no_offer_marks_the_last_trade_not_halfway_to_a_dollar(self):
+        # KXDDCOLDBREW-26OCT02-T4.45 at 00:00 ET 10/1: bid 5c, no offer, last
+        # trade 97c, settled YES -- (0.05 + 1.00) / 2 = 0.525 before the fix
+        self.assertAlmostEqual(pf.yes_mark(0.05, 1.00, 0.97), 0.97)
+        # the last trade under the bid: the bid
+        self.assertAlmostEqual(pf.yes_mark(0.32, 1.00, 0.20), 0.32)
+
+    def test_no_bid_marks_the_last_trade_capped_at_the_offer(self):
+        self.assertAlmostEqual(pf.yes_mark(0.0, 0.40, 0.55), 0.40)
+        self.assertAlmostEqual(pf.yes_mark(0.0, 0.40, 0.30), 0.30)
+
+    def test_empty_book_marks_the_last_trade(self):
+        # a closed or settled market reads 0 / 1.00
+        self.assertAlmostEqual(pf.yes_mark(0.0, 1.00, 0.82), 0.82)
+
+    def test_no_two_sided_book_and_no_last_trade_has_no_mark(self):
+        for bid, ask in ((0.05, 1.00), (0.0, 0.40), (0.0, 1.00), (0.0, 0.0)):
+            self.assertIsNone(pf.yes_mark(bid, ask, 0.0), (bid, ask))
+
+    def test_a_real_sub_penny_offer_is_a_side(self):
+        # escalators trade in 0.0001 steps: only the $1.00 placeholder is no offer
+        self.assertAlmostEqual(pf.yes_mark(0.98, 0.9999, 0.50), 0.98995)
+        self.assertTrue(pf.side_live(0.9999))
+        self.assertFalse(pf.side_live(1.0))
+        self.assertFalse(pf.side_live(0.0))
+
+    def test_a_50c_wide_book_marks_the_last_trade_inside_the_touch(self):
+        # Jack 2026-10-01, "Yes, at 50c+". KXDKNGAPP-26OCT08-T185: a 1/70 book
+        # under a 1c last trade marked at its 35.5c mid
+        self.assertAlmostEqual(pf.yes_mark(0.01, 0.70, 0.01), 0.01)
+        self.assertAlmostEqual(pf.yes_mark(0.20, 0.70, 0.90), 0.70)     # clamped to the ask
+        self.assertAlmostEqual(pf.yes_mark(0.20, 0.70, 0.05), 0.20)     # ... and the bid
+        self.assertAlmostEqual(pf.yes_mark(0.20, 0.69, 0.90), 0.445)    # 49c: still the mid
+        self.assertAlmostEqual(pf.yes_mark(0.01, 0.99, 0.0), 0.50)      # never traded: the mid
+        # KXCMGFT-26OCT08-T108: 1c bid, 20c last, an offer flickering at 99c
+        # no longer flips the mark between 20 and 50
+        self.assertAlmostEqual(pf.yes_mark(0.01, 0.99, 0.20), 0.20)
+        self.assertAlmostEqual(pf.yes_mark(0.01, 1.00, 0.20), 0.20)
+
+    def test_the_wide_rule_follows_the_bot_s_kill_switch(self):
+        self.addCleanup(setattr, pf, "MARK_WIDE_SPREAD_CENTS", pf.MARK_WIDE_SPREAD_CENTS)
+        pf.MARK_WIDE_SPREAD_CENTS = 0               # IMM_MARK_WIDE_SPREAD=0
+        self.assertAlmostEqual(pf.yes_mark(0.01, 0.70, 0.01), 0.355)
+        self.assertAlmostEqual(pf.yes_mark(0.05, 1.00, 0.97), 0.97)     # one-sided unchanged
+        pf.MARK_WIDE_SPREAD_CENTS = 30
+        self.assertAlmostEqual(pf.yes_mark(0.20, 0.50, 0.90), 0.50)
+
+
+class MarkPositionsTests(unittest.TestCase):
+    INFO = {"KXDDCOLDBREW-26OCT02-T4.45": {"yes_bid": 0.05, "yes_ask": 1.00, "last": 0.97},
+            "M": {"yes_bid": 0.30, "yes_ask": 0.34, "last": 0.20},
+            "W": {"yes_bid": 0.01, "yes_ask": 0.70, "last": 0.01},
+            "E": {"yes_bid": 0.0, "yes_ask": 1.00, "last": 0.82},
+            "K": {"yes_bid": 0.05, "yes_ask": 1.00, "last": 0.0},
+            "Z": {"yes_bid": 0.0, "yes_ask": 0.40, "last": 0.0}}
+
+    def test_marks_and_sources(self):
+        tickers = ["KXDDCOLDBREW-26OCT02-T4.45", "M", "W", "E", "K", "Z", "X"]
+        marks, src = pf.mark_positions(tickers, self.INFO, {"K": 0.06, "X": 0.5})
+        self.assertAlmostEqual(marks["KXDDCOLDBREW-26OCT02-T4.45"], 0.97)
+        self.assertAlmostEqual(marks["M"], 0.32)
+        self.assertAlmostEqual(marks["W"], 0.01)
+        self.assertAlmostEqual(marks["E"], 0.82)
+        self.assertAlmostEqual(marks["K"], 0.06)      # no last trade: yesterday's mark
+        self.assertIsNone(marks["Z"])                 # nor that: at cost
+        self.assertAlmostEqual(marks["X"], 0.5)       # unread: yesterday's mark
+        self.assertEqual(src, {"mid": 1, "wide": 1, "one_sided": 1, "last": 1,
+                               "carried": 2, "at_cost": 1})
+
+    def test_the_cold_brew_short_is_valued_off_the_last_trade(self):
+        # 58.64 NO (the IMM's short YES at 91.5c, cost 4.98) is worth
+        # 58.64 x (1 - 0.97) = 1.76, not the 27.85 that the 52.5c mid said
+        marks, _ = pf.mark_positions(["KXDDCOLDBREW-26OCT02-T4.45"], self.INFO, {})
+        self.assertAlmostEqual(
+            pf.side_value(-58.64, marks["KXDDCOLDBREW-26OCT02-T4.45"], 4.98), 1.7592)
+
+
 class _FakeMarginClient:
     def __init__(self, fail=False):
         self.fail = fail

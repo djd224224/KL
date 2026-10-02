@@ -1014,10 +1014,11 @@ def rain_dir_section(client):
         else:
             open_n += 1
             try:
-                bid = _f(m.get("yes_bid_dollars")) * 100
-                ask = _f(m.get("yes_ask_dollars")) * 100
-                if bid and ask:
-                    mid = (bid + ask) / 2
+                # the bot's mark, as current_mids: a one-sided or 50c+ wide
+                # book is the last trade clamped to its touch, never
+                # (bid + the $1.00 empty ask) / 2
+                mid = bulk_mark_cents(m)
+                if mid is not None:
                     mark = mid if side == "yes" else 100 - mid
                     mtm_open += (mark - px) / 100.0 * n
             except Exception:

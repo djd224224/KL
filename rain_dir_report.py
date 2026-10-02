@@ -4,7 +4,9 @@
 Joins run-logs/incentive-mm/rain_directional_ledger.csv against Kalshi
 market results and prints per-bet outcomes, daily rollups, hit rate and
 NWS-fair calibration. Open positions (unsettled markets) are marked OPEN
-with mark-to-market against the current mid.
+with mark-to-market against the bot's own mark (imm.bulk_mark_cents: the
+mid of a two-sided book, else the last trade clamped inside a 50c+ wide
+book or to the live side of a one-sided one).
 
 Run anytime:  python rain_dir_report.py
 """
@@ -70,9 +72,11 @@ def main() -> int:
             win_sum += 1.0 if win else 0.0
             status, pnl_s = result.upper(), f"{pnl:+7.2f}"
         else:
-            bid = imm.market_cents(m, "yes_bid")
-            ask = imm.market_cents(m, "yes_ask")
-            mid = (bid + ask) / 2 if bid and ask else None
+            # the bot's mark: market_cents reads an empty ask as 100, so
+            # (bid + ask) / 2 valued a stray bid under no offer at half way
+            # to $1; a one-sided or 50c+ wide book is the last trade clamped
+            # to its touch
+            mid = imm.bulk_mark_cents(m)
             if mid is not None:
                 mark = mid if side == "yes" else 100 - mid
                 mtm = (mark - px) / 100.0 * n

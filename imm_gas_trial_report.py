@@ -18,7 +18,8 @@ WHAT IT REPORTS, per family, from the trial start to now:
     be 0);
   * fills: count and contracts, by ET band and by side;
   * trading P&L: settled fills at Kalshi's result, open fills at the current
-    mid (signed reads through kalshi_reads.py);
+    mid -- a one-sided or 50c+ wide book at the last trade clamped to its
+    touch, see yes_mark (signed reads through kalshi_reads.py);
   * reward: the bot's estimate rebuilt from its cycle logs (est_frac x
     pool_per_day over each cycle, as imm_reward_recon.py does), with the
     exchange's $1-per-market floor applied, and Kalshi's CREDITS beside it
@@ -67,6 +68,10 @@ BANDS = (("13-17 ET", 13, 18), ("18-20 ET", 18, 21), ("21-24 ET", 21, 24))
 MARKS = ((7.0, "1w", "1-week"), (14.0, "2w", "2-week"))
 PAYOUT_FLOOR = 1.00
 MAX_DT = 900.0                                   # the recon's cycle-gap cap
+# incentive_mm.MARK_WIDE_SPREAD_CENTS, off the bot's own knob: a two-sided
+# book this many cents wide or wider marks at the last trade clamped inside
+# its touch, not the mid (Jack 2026-10-01, "Yes, at 50c+"); 0 = off.
+MARK_WIDE_SPREAD_CENTS = int(os.environ.get("IMM_MARK_WIDE_SPREAD", "50"))
 # September 2026, plain quoting before the GasBuddy gates (settled fills;
 # reward = the bot's estimate -- Kalshi credited about two thirds of it on
 # the national). The numbers the trial was chosen on: IN-SAMPLE.
@@ -141,8 +146,44 @@ def fill_pnl(fill: dict, outcome) -> float:
     return (outcome - p) * n if fill["side"] == "yes" else (p - outcome) * n
 
 
+def _dollars(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def yes_mark(bid: float, ask: float, last: float):
+    """The YES mark (0..1) off one market read (yes_bid, yes_ask, last_price
+    in dollars), or None when the read carries no price. incentive_mm.
+    touch_mark_cents's rule, kept local so these pure functions import no
+    bot. A side is live only strictly inside (0, $1): Kalshi reads an empty
+    bid as $0 and an empty ask as $1.00. A two-sided book marks at the mid,
+    or, MARK_WIDE_SPREAD_CENTS or wider, at the last trade clamped inside
+    the touch (the mid if it never traded); a one-sided book at the last
+    trade clamped to the live side, max(last, bid) with only a bid and
+    min(last, ask) with only an offer; an empty book at the last trade.
+    Until 2026-10-01 this took (bid + ask) / 2 whenever the ask read above
+    0, so a stray bid under no offer marked half way to $1, a lone offer
+    half way to $0, and an empty book at 50c."""
+    has_bid, has_ask = 0.0 < bid < 1.0, 0.0 < ask < 1.0
+    if has_bid and has_ask:
+        if (last > 0.0 and MARK_WIDE_SPREAD_CENTS > 0
+                and round(100.0 * (ask - bid), 6) >= MARK_WIDE_SPREAD_CENTS):
+            return min(max(last, bid), ask)
+        return (bid + ask) / 2.0
+    if not last > 0.0:
+        return None
+    if has_bid:
+        return max(last, bid)
+    if has_ask:
+        return min(last, ask)
+    return last
+
+
 def outcomes(events, get_all=None) -> dict:
-    """{ticker: (value, settled)}: 1.0 / 0.0 on a result, else the mid."""
+    """{ticker: (value, settled)}: 1.0 / 0.0 on a result, else the YES mark
+    (yes_mark); a market with no price at all is left out."""
     if get_all is None:
         sys.path.insert(0, KL)
         from kalshi_reads import kalshi_get_all as get_all
@@ -153,15 +194,10 @@ def outcomes(events, get_all=None) -> dict:
             if r in ("yes", "no"):
                 out[m["ticker"]] = (1.0 if r == "yes" else 0.0, True)
                 continue
-            try:
-                b, a = float(m.get("yes_bid_dollars")), float(m.get("yes_ask_dollars"))
-                mid = (b + a) / 2.0 if a > 0 else b
-            except (TypeError, ValueError):
-                try:
-                    mid = float(m.get("last_price_dollars"))
-                except (TypeError, ValueError):
-                    continue
-            out[m["ticker"]] = (mid, False)
+            mark = yes_mark(_dollars(m.get("yes_bid_dollars")), _dollars(m.get("yes_ask_dollars")),
+                            _dollars(m.get("last_price_dollars")))
+            if mark is not None:
+                out[m["ticker"]] = (mark, False)
     return out
 
 

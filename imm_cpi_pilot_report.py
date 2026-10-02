@@ -1,7 +1,11 @@
 """CPI core pilot report (read-only): does quoting KXCPICORE-26NOV/-26DEC
 pay? Rewards (credited, else the bot's own estimate) against the pilot's
 own trading: every fill since the pilot went live, mark-outs at +1h / +24h
-/ now from hourly candle mids, and the mid-marked P&L of what it holds.
+/ now from hourly candle mids, and the mid-marked P&L of what it holds. A
+one-sided book (Kalshi reads an empty ask as $1.00, an empty bid as $0) is
+marked at the last trade clamped to its live side, never at a mid with the
+placeholder, and a 50c+ wide one at the last trade clamped inside its touch
+(yes_mark / candle_mark).
 
 Written 2026-09-28 for the Oct 13 review (Jack: "keep it default running,
 dont block but give me a report on oct 13. ill block if needed").
@@ -47,10 +51,54 @@ BASELINE = {"markout_1h": -7.64, "markout_24h": -14.33, "credits": 95.71,
 # pilot's and comes off their estimate
 PRE_PILOT_ACCRUED = {"KXCPICOREYOY-26DEC-T2.5": 4.0907, "KXCPICOREYOY-26DEC-T2.8": 4.9402,
                      "KXCPICOREYOY-26DEC-T2.9": 7.2366, "KXCPICOREYOY-26NOV-T2.5": 5.0404}
+# incentive_mm.MARK_WIDE_SPREAD_CENTS, off the bot's own knob: a two-sided
+# book this many cents wide or wider marks at the last trade clamped inside
+# its touch, not the mid (Jack 2026-10-01, "Yes, at 50c+"); 0 = off.
+MARK_WIDE_SPREAD_CENTS = int(os.environ.get("IMM_MARK_WIDE_SPREAD", "50"))
 
 
 def parse_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def yes_mark(bid, ask, last):
+    """The YES mark ($) off one read of a book (yes_bid, yes_ask, last trade
+    in dollars), or None when it carries no price. incentive_mm.
+    touch_mark_cents's rule (this report imports no bot): a side is live
+    only strictly inside (0, $1), because Kalshi reads an empty bid as $0
+    and an empty ask as $1.00. A two-sided book marks at the mid, or,
+    MARK_WIDE_SPREAD_CENTS or wider, at the last trade clamped inside the
+    touch (the mid if it never traded); a one-sided book at the last trade
+    clamped to the live side, max(last, bid) with only a bid and min(last,
+    ask) with only an offer; an empty book at the last trade. Until
+    2026-10-01 the empty ask's $1.00 was averaged in: a stray 5c bid under a
+    97c last trade (KXDDCOLDBREW-26OCT02-T4.45, settled YES) marked 52.5c."""
+    has_bid, has_ask = 0.0 < bid < 1.0, 0.0 < ask < 1.0
+    if has_bid and has_ask:
+        if (last > 0.0 and MARK_WIDE_SPREAD_CENTS > 0
+                and round(100.0 * (ask - bid), 6) >= MARK_WIDE_SPREAD_CENTS):
+            return min(max(last, bid), ask)
+        return (bid + ask) / 2
+    if not last > 0.0:
+        return None
+    if has_bid:
+        return max(last, bid)
+    if has_ask:
+        return min(last, ask)
+    return last
+
+
+def candle_mark(x):
+    """yes_mark at the close of one candlestick, or None. Its yes_ask close
+    reads 1.0000 when there is no offer and its yes_bid close 0 when there
+    is no bid; the last trade is the candle's own price close, else
+    price.previous (the last trade before the period)."""
+    pr = x.get("price") or {}
+    last = pr.get("close_dollars")
+    if last is None:
+        last = pr.get("previous_dollars")
+    return yes_mark(F((x.get("yes_bid") or {}).get("close_dollars")),
+                    F((x.get("yes_ask") or {}).get("close_dollars")), F(last))
 
 
 def main(argv=None):
@@ -156,15 +204,15 @@ def main(argv=None):
                 Y -= pr
                 N -= pr
                 cash += pr
-            b, ask = F(m.get("yes_bid_dollars")), F(m.get("yes_ask_dollars"))
             res = (m.get("result") or "").lower()
             if res in ("yes", "no"):
                 mid = 1.0 if res == "yes" else 0.0
-            elif b > 0 and ask > 0:
-                mid = (b + ask) / 2
             else:
-                mid = F(m.get("last_price_dollars"))
-            val = Y * mid + N * (1 - mid)
+                mid = yes_mark(F(m.get("yes_bid_dollars")), F(m.get("yes_ask_dollars")),
+                               F(m.get("last_price_dollars")))
+            # no two-sided book and no trade ever: nothing filled here, so
+            # nothing is held to value
+            val = 0.0 if mid is None else Y * mid + N * (1 - mid)
             pts = []
             if fs:
                 ser = t.split("-")[0]
@@ -173,10 +221,9 @@ def main(argv=None):
                           "end_ts": int(now.timestamp()),
                           "period_interval": 60}).get("candlesticks") or []
                 for x in cs:
-                    bb = F((x.get("yes_bid") or {}).get("close_dollars"))
-                    aa = F((x.get("yes_ask") or {}).get("close_dollars"))
-                    if bb > 0 and aa > 0:
-                        pts.append((int(x["end_period_ts"]), (bb + aa) / 2))
+                    v = candle_mark(x)
+                    if v is not None:          # else mid_at keeps the prior hour's
+                        pts.append((int(x["end_period_ts"]), v))
 
             def mid_at(ts, pts=pts):
                 best = None
@@ -195,7 +242,7 @@ def main(argv=None):
                     "imm": f["fill_id"] in imm_ids if imm_ids else None,
                     "m1": None if m1 is None else sg * (m1 - py),
                     "m24": None if m24 is None else sg * (m24 - py),
-                    "mnow": sg * (mid - py),
+                    "mnow": None if mid is None else sg * (mid - py),
                     "blackout": et.weekday() < 5 and (8 * 60 + 25) <= et.hour * 60 + et.minute < (11 * 60 + 5)})
             est = max(0.0, F(accrued.get(t)) - PRE_PILOT_ACCRUED.get(t, 0.0))
             rows.append((t, len(fs), sum(F(f["count_fp"]) for f in fs), Y - N,
@@ -260,11 +307,12 @@ def main(argv=None):
     L.append("")
     L.append("## By market")
     L.append("")
-    L.append("| market | fills | contracts | net pos | mid now | trading P&L | est reward |")
+    L.append("| market | fills | contracts | net pos | mark now | trading P&L | est reward |")
     L.append("|---|---|---|---|---|---|---|")
     for t, n, q, pos, cash, val, pnl, est, mid in rows:
         if n or est:
-            L.append(f"| {t} | {n} | {q:,.0f} | {pos:+,.0f} | {100 * mid:.1f}¢ | ${pnl:+,.2f} | ${est:,.2f} |")
+            mk = "—" if mid is None else f"{100 * mid:.1f}¢"
+            L.append(f"| {t} | {n} | {q:,.0f} | {pos:+,.0f} | {mk} | ${pnl:+,.2f} | ${est:,.2f} |")
     L.append("")
     m24, _ = wavg("m24", fl)
     L.append("## Bar set at launch")

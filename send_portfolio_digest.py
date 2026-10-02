@@ -422,6 +422,86 @@ def fetch_market_info(client, tickers):
     return info
 
 
+# incentive_mm.MARK_WIDE_SPREAD_CENTS, off the bot's own knob: a two-sided
+# book this many cents wide or wider marks at the last trade clamped inside
+# its touch, not the mid (Jack 2026-10-01, "Yes, at 50c+"); 0 = off.
+MARK_WIDE_SPREAD_CENTS = int(os.environ.get("IMM_MARK_WIDE_SPREAD", "50"))
+
+
+def side_live(px: float) -> bool:
+    """True when a YES bid or ask off a market read (dollars) is a real
+    resting level. Kalshi reads an empty bid as $0 and an empty ask as
+    $1.00, and nobody can trade at either, so only a price strictly inside
+    (0, $1) is a side."""
+    return 0.0 < px < 1.0
+
+
+def wide_book(bid: float, ask: float) -> bool:
+    """A two-sided touch (dollars) MARK_WIDE_SPREAD_CENTS or wider: its mid
+    is no more a price than the $1.00 placeholder."""
+    return (MARK_WIDE_SPREAD_CENTS > 0
+            and round(100.0 * (ask - bid), 6) >= MARK_WIDE_SPREAD_CENTS)
+
+
+def _yes_mark_src(bid: float, ask: float, last: float):
+    """(yes_mark, the rule that set it): "mid", "wide", "one_sided" or
+    "last" (an empty book); (None, None) when there is no price."""
+    has_bid, has_ask = side_live(bid), side_live(ask)
+    if has_bid and has_ask:
+        if last > 0.0 and wide_book(bid, ask):
+            return min(max(last, bid), ask), "wide"
+        return (bid + ask) / 2.0, "mid"
+    if not last > 0.0:
+        return None, None
+    if has_bid:
+        return max(last, bid), "one_sided"
+    if has_ask:
+        return min(last, ask), "one_sided"
+    return last, "last"
+
+
+def yes_mark(bid: float, ask: float, last: float):
+    """The YES mark ($) of a held position off one market read (yes_bid,
+    yes_ask, last_price in dollars), or None when the read carries no price.
+    incentive_mm.touch_mark_cents's rule, kept local because importing the
+    bot reads its config from the environment. A two-sided book marks at the
+    mid, or, MARK_WIDE_SPREAD_CENTS or wider, at the last trade clamped
+    inside the touch (the mid if it never traded). A one-sided book marks at
+    the last trade clamped to the live side: max(last, bid) with only a bid,
+    min(last, ask) with only an offer. An empty book (a closed or settled
+    market reads 0 / 1.00) marks at the last trade. Until 2026-10-01 the
+    empty ask's $1.00 was averaged in -- KXDDCOLDBREW-26OCT02-T4.45 had a
+    stray 5c bid, no offer and a 97c last trade, marked (0.05 + 1.00) / 2 =
+    52.5c, and settled YES -- and a 1/70 book under a 1c last trade
+    (KXDKNGAPP-26OCT08-T185) marked at its 35.5c mid."""
+    return _yes_mark_src(bid, ask, last)[0]
+
+
+def mark_positions(tickers, mark_info, prior_marks):
+    """(marks, mark_src): each open position's YES mark ($) off today's
+    market read (yes_mark), else the prior snapshot's mark, else None = at
+    cost (unrealized 0 for that leg -- neutral, never a fake loss).
+    mark_src counts the rule behind each mark: "wide" (a 50c+ book),
+    "one_sided" and "last" (an empty book) are all off the last trade."""
+    marks = {}
+    mark_src = {"mid": 0, "wide": 0, "one_sided": 0, "last": 0,
+                "carried": 0, "at_cost": 0}
+    for tk in tickers:
+        mi = mark_info.get(tk) or {}
+        mark, src = _yes_mark_src(mi.get("yes_bid", 0.0), mi.get("yes_ask", 0.0),
+                                  mi.get("last", 0.0))
+        if mark is not None:
+            marks[tk] = mark
+            mark_src[src] += 1
+        elif tk in prior_marks:
+            marks[tk] = _f(prior_marks[tk])
+            mark_src["carried"] += 1
+        else:
+            marks[tk] = None
+            mark_src["at_cost"] += 1
+    return marks, mark_src
+
+
 # ----------------------------------------------------------------------------
 # Snapshot store
 # ----------------------------------------------------------------------------
@@ -589,25 +669,12 @@ def build_portfolio(now_utc: datetime):
             carried_dead.add(ev)
 
 
-    # Mark every open position: mid, else last, else yesterday's mark, else
-    # at cost (unrealized 0 for that leg — neutral, never a fake loss).
+    # Mark every open position: the mid of a two-sided book, else the last
+    # trade clamped inside a 50c+ book or to the live side of a one-sided
+    # one, else yesterday's mark, else at cost (unrealized 0 for that leg —
+    # neutral, never a fake loss).
     mark_info = fetch_market_info(client, list(mkt_pos))
-    marks, mark_src = {}, {"mid": 0, "last": 0, "carried": 0, "at_cost": 0}
-    for tk in mkt_pos:
-        mi = mark_info.get(tk) or {}
-        bid, ask, last = mi.get("yes_bid", 0.0), mi.get("yes_ask", 0.0), mi.get("last", 0.0)
-        if bid > 0 and ask > 0:
-            marks[tk] = (bid + ask) / 2.0
-            mark_src["mid"] += 1
-        elif last > 0:
-            marks[tk] = last
-            mark_src["last"] += 1
-        elif tk in prior_marks:
-            marks[tk] = _f(prior_marks[tk])
-            mark_src["carried"] += 1
-        else:
-            marks[tk] = None
-            mark_src["at_cost"] += 1
+    marks, mark_src = mark_positions(mkt_pos, mark_info, prior_marks)
 
     # Group open value + cost basis by event.
     ev_value, ev_basis, ev_tickers = {}, {}, {}

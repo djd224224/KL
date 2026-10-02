@@ -71,6 +71,48 @@ class TestPieces(unittest.TestCase):
         # nothing before the trial start counts
         self.assertEqual(g.scan_rewards(d, START + timedelta(days=2), START + timedelta(days=3)), {})
 
+    def test_yes_mark_never_averages_in_an_empty_side(self):
+        # 2026-10-01: Kalshi reads an empty ask as $1.00 and an empty bid as
+        # $0; the old (b + a) / 2 if a > 0 took either one in
+        self.assertAlmostEqual(g.yes_mark(0.60, 0.64, 0.10), 0.62)
+        self.assertAlmostEqual(g.yes_mark(0.05, 1.00, 0.97), 0.97)       # was 0.525
+        self.assertAlmostEqual(g.yes_mark(0.32, 1.00, 0.20), 0.32)
+        self.assertAlmostEqual(g.yes_mark(0.0, 0.40, 0.55), 0.40)        # was 0.20
+        self.assertAlmostEqual(g.yes_mark(0.0, 0.40, 0.30), 0.30)
+        self.assertAlmostEqual(g.yes_mark(0.0, 1.00, 0.62), 0.62)        # was 0.50
+        self.assertAlmostEqual(g.yes_mark(0.98, 0.9999, 0.50), 0.98995)  # a real sub-penny offer
+        for bid, ask in ((0.05, 1.00), (0.0, 0.40), (0.0, 1.00)):
+            self.assertIsNone(g.yes_mark(bid, ask, 0.0), (bid, ask))
+
+    def test_a_50c_wide_book_marks_the_last_trade_inside_the_touch(self):
+        # Jack 2026-10-01, "Yes, at 50c+" (incentive_mm.MARK_WIDE_SPREAD_CENTS)
+        self.assertAlmostEqual(g.yes_mark(0.01, 0.70, 0.01), 0.01)       # not the 35.5c mid
+        self.assertAlmostEqual(g.yes_mark(0.20, 0.70, 0.90), 0.70)
+        self.assertAlmostEqual(g.yes_mark(0.20, 0.69, 0.90), 0.445)      # 49c wide: the mid
+        self.assertAlmostEqual(g.yes_mark(0.01, 0.99, 0.0), 0.50)        # never traded: the mid
+        self.addCleanup(setattr, g, "MARK_WIDE_SPREAD_CENTS", g.MARK_WIDE_SPREAD_CENTS)
+        g.MARK_WIDE_SPREAD_CENTS = 0                                     # the bot's kill switch
+        self.assertAlmostEqual(g.yes_mark(0.01, 0.70, 0.01), 0.355)
+
+    def test_outcomes_marks_one_sided_books_off_the_last_trade(self):
+        books = [{"ticker": "R", "result": "yes"},
+                 {"ticker": "M", "result": "", "yes_bid_dollars": "0.6000",
+                  "yes_ask_dollars": "0.6400", "last_price_dollars": "0.1000"},
+                 {"ticker": "B", "result": "", "yes_bid_dollars": "0.0500",
+                  "yes_ask_dollars": "1.0000", "last_price_dollars": "0.9700"},
+                 {"ticker": "A", "result": "", "yes_bid_dollars": "0.0000",
+                  "yes_ask_dollars": "0.4000", "last_price_dollars": "0.5500"},
+                 {"ticker": "E", "result": "", "yes_bid_dollars": "0.0000",
+                  "yes_ask_dollars": "1.0000", "last_price_dollars": "0.6200"},
+                 {"ticker": "Z", "result": "", "yes_bid_dollars": "0.0500",
+                  "yes_ask_dollars": "1.0000", "last_price_dollars": "0.0000"},
+                 {"ticker": "N", "result": "", "yes_bid_dollars": None,
+                  "yes_ask_dollars": "n/a", "last_price_dollars": "0.4500"}]
+        out = g.outcomes({"KXAAAGASD-26OCT02"}, lambda path, params, key: books)
+        self.assertEqual(out["R"], (1.0, True))
+        self.assertEqual({t: round(v, 4) for t, (v, s) in out.items() if not s},
+                         {"M": 0.62, "B": 0.97, "A": 0.40, "E": 0.62, "N": 0.45})
+
     def test_due_mark(self):
         self.assertIsNone(g.due_mark(3.0, set()))
         self.assertEqual(g.due_mark(7.2, set()), ("1w", "1-week", ["1w"]))

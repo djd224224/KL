@@ -9,8 +9,9 @@ only problems (stale heartbeats, error counts).
 
 Realized P&L, exposure, and positions come from Kalshi's positions endpoint
 (event rollups include early-settled strikes). Unrealized marks each open
-position to the current market mid: YES value = pos x mid, NO value =
-|pos| x (1 - mid), minus Kalshi's cost basis (market_exposure).
+position to the current market mid (a one-sided or 50c+ wide book: the
+last trade clamped to its touch, see yes_mark): YES value = pos x mid, NO
+value = |pos| x (1 - mid), minus Kalshi's cost basis (market_exposure).
 
 Scheduled daily shortly after the bots' 8:00 AM CT summary hour. Idempotent
 via a sent-marker; --test sends immediately and skips the marker.
@@ -118,17 +119,52 @@ def cash_warnings(shards: dict, guards: list) -> list:
     return out
 
 
+# incentive_mm.MARK_WIDE_SPREAD_CENTS, off the bot's own knob: a two-sided
+# book this many cents wide or wider marks at the last trade clamped inside
+# its touch, not the mid (Jack 2026-10-01, "Yes, at 50c+"); 0 = off.
+MARK_WIDE_SPREAD_CENTS = int(os.environ.get("IMM_MARK_WIDE_SPREAD", "50"))
+
+
+def yes_mark(bid: float, ask: float, last: float):
+    """The YES mark ($) of a held position off one market read (yes_bid,
+    yes_ask, last_price in dollars), or None when the read carries no price.
+    incentive_mm.touch_mark_cents's rule, kept local because importing the
+    bot reads its config from the environment. A side is live only strictly
+    inside (0, $1): Kalshi reads an empty bid as $0 and an empty ask as
+    $1.00. A two-sided book marks at the mid, or, MARK_WIDE_SPREAD_CENTS or
+    wider, at the last trade clamped inside the touch (the mid if it never
+    traded); a one-sided book at the last trade clamped to the live side,
+    max(last, bid) with only a bid and min(last, ask) with only an offer; an
+    empty book at the last trade. Until 2026-10-01 the empty ask's $1.00 was
+    averaged in: a stray 5c bid under a 97c last trade
+    (KXDDCOLDBREW-26OCT02-T4.45, settled YES) read 52.5c."""
+    has_bid, has_ask = 0.0 < bid < 1.0, 0.0 < ask < 1.0
+    if has_bid and has_ask:
+        if (last > 0.0 and MARK_WIDE_SPREAD_CENTS > 0
+                and round(100.0 * (ask - bid), 6) >= MARK_WIDE_SPREAD_CENTS):
+            return min(max(last, bid), ask)
+        return (bid + ask) / 2.0
+    if not last > 0.0:
+        return None
+    if has_bid:
+        return max(last, bid)
+    if has_ask:
+        return min(last, ask)
+    return last
+
+
 def market_mids(client, event_ticker: str) -> dict:
-    """ticker -> mid YES price in dollars (bid/ask mid, else last price)."""
+    """ticker -> YES mark in dollars (yes_mark: the bid/ask mid of a
+    two-sided book, else the last trade clamped inside a 50c+ book or to
+    the live side of a one-sided one)."""
     mids = {}
     try:
         resp = client.get_markets(event_ticker=event_ticker, limit=200)
         for m in resp.get("markets") or []:
-            bid, ask = _f(m.get("yes_bid_dollars")), _f(m.get("yes_ask_dollars"))
-            if bid > 0 and ask > 0:
-                mids[m["ticker"]] = (bid + ask) / 2.0
-            elif _f(m.get("last_price_dollars")) > 0:
-                mids[m["ticker"]] = _f(m.get("last_price_dollars"))
+            mk = yes_mark(_f(m.get("yes_bid_dollars")), _f(m.get("yes_ask_dollars")),
+                          _f(m.get("last_price_dollars")))
+            if mk is not None:
+                mids[m["ticker"]] = mk
     except Exception as e:
         log(f"! quotes for {event_ticker} failed: {e}")
     return mids
