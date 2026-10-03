@@ -45,6 +45,10 @@ from datetime import datetime, timezone
 
 WINDOW_SECS = 24 * 3600.0
 CLOSE_FRAC = 0.80        # CLOSE from 80% of a limit
+# A cap reads BINDING only if it bound in the window's last 2h. Earlier
+# binding is reported in its impact text, so a limit raised mid-window (the
+# 10/3 budget raise) does not read BINDING until the next day's email.
+RECENT_SECS = 2 * 3600.0
 AT_CAP_FRAC = 0.95       # a position this close to its cap holds that side
 
 STATUS_ORDER = ("TRIPPED", "BINDING", "CLOSE", "SLACK", "FIRED", "QUIET", "OFF")
@@ -109,6 +113,7 @@ def _ts(stamp: str) -> float:
 def _empty_evidence(since: float, until: float) -> dict:
     return {"since": since, "until": until, "lines": 0, "alerts": defaultdict(list),
             "cycles": 0, "resting_max": None, "pnl_min": None, "acct_worst": None,
+            "pnl_last": None, "scan_last": None, "acct_last": None,
             "acct_lines": 0, "scan_min": None, "universe": [], "place_cap": [],
             "renewals_kept": 0, "amend_cap": [], "cycle_errors_max": 0,
             "failsafe": [], "idle": [], "halt_file": [],
@@ -145,11 +150,15 @@ def scan_log_lines(lines, ev: dict) -> None:
                 drop = _num(r.group(4)) * (1 if r.group(3) == "down" else -1)
                 if ev["acct_worst"] is None or drop > ev["acct_worst"][0]:
                     ev["acct_worst"] = (drop, ts, _num(r.group(1)), _num(r.group(2)))
+                if ev["acct_last"] is None or ts >= ev["acct_last"][1]:
+                    ev["acct_last"] = (drop, ts, _num(r.group(1)), _num(r.group(2)))
             r = RISK_SCAN_RE.search(msg)
             if r:
                 v = _num(r.group(1))
                 if ev["scan_min"] is None or v < ev["scan_min"][0]:
                     ev["scan_min"] = (v, ts)
+                if ev["scan_last"] is None or ts >= ev["scan_last"][1]:
+                    ev["scan_last"] = (v, ts)
             continue
         c = CYCLE_RE.match(msg)
         if c:
@@ -160,6 +169,8 @@ def scan_log_lines(lines, ev: dict) -> None:
                 ev["resting_max"] = (n_rest, ts)
             if ev["pnl_min"] is None or pnl < ev["pnl_min"][0]:
                 ev["pnl_min"] = (pnl, ts)
+            if ev["pnl_last"] is None or ts >= ev["pnl_last"][1]:
+                ev["pnl_last"] = (pnl, ts)
             continue
         if msg.startswith("universe: "):
             u = UNIVERSE_RE.match(msg)
@@ -366,8 +377,9 @@ def halt_rows(ev: dict, ctx: dict, tz) -> list:
         worst = ev["acct_worst"]
         value, anchor = now.get("acct_value"), now.get("acct_anchor")
         now_drop = (anchor - value) if (value is not None and anchor) else None
-        w_txt = (f"down {_money(max(worst[0], 0))} at {_when(worst[1], tz)} ET"
-                 if worst else "not logged yet")
+        w_txt = ("not logged yet" if not worst else
+                 "never below the anchor" if worst[0] <= 0 else
+                 f"down {_money(worst[0])} at {_when(worst[1], tz)} ET")
         n_txt = (f"{'down' if now_drop >= 0 else 'up'} {_money(abs(now_drop))}"
                  if now_drop is not None else "n/a")
         if trips:
@@ -397,7 +409,10 @@ def halt_rows(ev: dict, ctx: dict, tz) -> list:
         trips = ev["alerts"].get("loss_halt", [])
         pmin = ev["pnl_min"]
         worst = max(-pmin[0], 0.0) if pmin else None
-        pnl_now = now.get("pnl_today")
+        # The halt's own P&L (the cycle line's, carry included) beats the
+        # status file's pnl_today, which omits the restart carry and reads
+        # ~0 after every restart (-$14 vs the halt's -$820 on 10/3).
+        pnl_now = ev["pnl_last"][0] if ev["pnl_last"] else now.get("pnl_today")
         w_txt = (f"{pmin[0]:+,.0f} at {_when(pmin[1], tz)} ET" if pmin else "n/a")
         n_txt = f"{pnl_now:+,.0f}" if pnl_now is not None else "n/a"
         if trips:
@@ -419,7 +434,7 @@ def halt_rows(ev: dict, ctx: dict, tz) -> list:
         trips = ev["alerts"].get("scan_halt", [])
         smin = ev["scan_min"]
         worst = max(-smin[0], 0.0) if smin else None
-        s_now = now.get("scan_pnl")
+        s_now = ev["scan_last"][0] if ev["scan_last"] else now.get("scan_pnl")
         if trips or now.get("scan_halted"):
             status = "TRIPPED"
             impact = "; ".join(_trip_text(ev, ts, msg, tz, "TRIPPED: tier closed")
@@ -461,23 +476,29 @@ def halt_rows(ev: dict, ctx: dict, tz) -> list:
     return rows
 
 
+def _earlier(ev, last_ts, tz) -> str:
+    return f"bound earlier (last {_when(last_ts, tz)} ET), not in the last {RECENT_SECS / 3600:.0f}h"
+
+
 def capacity_rows(ev: dict, ctx: dict, tz) -> list:
     caps, now = ctx["caps"], ctx["now"]
     rows = []
     uni = ev["universe"]
     last = uni[-1] if uni else None
     n_ref = len(uni)
+    recent = ev["until"] - RECENT_SECS
 
     # -- events -----------------------------------------------------------------
     lim = caps.get("MAX_MARKETS") or 0
     if uni and lim:
         worst = max(u["events"] for u in uni)
-        status = "BINDING" if worst >= lim else _pct_status(worst, lim)
+        at_cap = [u["ts"] for u in uni if u["events"] >= lim]
+        status = "BINDING" if any(t >= recent for t in at_cap) else _pct_status(worst, lim)
+        impact = ("new events refused at the cap; open events keep quoting"
+                  if status == "BINDING" else
+                  _earlier(ev, at_cap[-1], tz) if at_cap else "distinct events the gate may open")
         rows.append(_row("CAPACITY", "Events quoted", status, _int(lim) + " events",
-                         _int(worst), _int(last["events"]),
-                         "new events refused at the cap; open events keep quoting"
-                         if status == "BINDING" else "distinct events the gate may open",
-                         worst / lim))
+                         _int(worst), _int(last["events"]), impact, worst / lim))
 
     # -- collateral budget --------------------------------------------------------
     lim = caps.get("COLLATERAL_BUDGET") or 0.0
@@ -485,12 +506,18 @@ def capacity_rows(ev: dict, ctx: dict, tz) -> list:
         worst = max(u["reserved"] for u in uni)
         refused = [u["skips"].get("budget", 0) or 0 for u in uni]
         hit = sum(1 for n in refused if n)
-        if hit:
+        hit_ts = [u["ts"] for u in uni if u["skips"].get("budget", 0)]
+        if hit and hit_ts[-1] >= recent:
             status = "BINDING"
             impact = (f"{refused[-1]:,} new markets refused at the last refresh; refused in "
                       f"{hit} of {n_ref} refreshes (up to {max(refused):,}). A modelled "
                       f"reservation (ladder + inventory reserve), not cash: markets "
                       f"already quoting keep their place")
+        elif hit:
+            status = _pct_status(worst, lim)
+            impact = (_earlier(ev, hit_ts[-1], tz) + f": refused new markets in {hit} of "
+                      f"{n_ref} refreshes (up to {max(refused):,}). Modelled reservation, "
+                      f"not cash")
         else:
             status = _pct_status(worst, lim)
             impact = "modelled reservation (ladder + inventory reserve), not cash"
@@ -501,13 +528,13 @@ def capacity_rows(ev: dict, ctx: dict, tz) -> list:
     lim = caps.get("MAX_CANDIDATE_BOOKS") or 0
     if uni and lim:
         worst = max(u["candidates"] for u in uni)
-        status = "BINDING" if worst >= lim else _pct_status(worst, lim)
+        at_cap = [u["ts"] for u in uni if u["candidates"] >= lim]
+        status = "BINDING" if any(t >= recent for t in at_cap) else _pct_status(worst, lim)
+        impact = ("the lowest-$ candidates are dropped unread at the cap"
+                  if status == "BINDING" else _earlier(ev, at_cap[-1], tz) if at_cap else
+                  "candidates read per refresh; past the cap the lowest-$ go unread")
         rows.append(_row("CAPACITY", "Candidate books read", status, _int(lim),
-                         _int(worst), _int(last["candidates"]),
-                         "the lowest-$ candidates are dropped unread at the cap"
-                         if status == "BINDING" else
-                         "candidates read per refresh; past the cap the lowest-$ go unread",
-                         worst / lim))
+                         _int(worst), _int(last["candidates"]), impact, worst / lim))
     # -- slot caps: strikes per event, and the two opportunistic tiers -----------
     if uni:
         # scan_top_n also counts candidates under the tier's ROI floor
@@ -516,16 +543,22 @@ def capacity_rows(ev: dict, ctx: dict, tz) -> list:
                  ("scan_top_n", "open-scan slots or ROI floor"),
                  ("finecon_top_n", "finecon slots"))
         last_n = [(lbl, last["skips"].get(k, 0) or 0) for k, lbl in slots]
-        hit = sum(1 for u in uni if any(u["skips"].get(k, 0) for k, _l in slots))
+        hit_ts = [u["ts"] for u in uni if any(u["skips"].get(k, 0) for k, _l in slots)]
+        hit = len(hit_ts)
         if any(n for _l, n in last_n):
             status = "BINDING"
             impact = ("refused at the last refresh: "
                       + ", ".join(f"{lbl} {n:,}" for lbl, n in last_n if n)
                       + f" (in {hit} of {n_ref} refreshes)")
+        elif hit and hit_ts[-1] >= recent:
+            status = "BINDING"
+            impact = f"refused markets in {hit} of {n_ref} refreshes, none at the last"
+        elif hit:
+            status = "SLACK"
+            impact = _earlier(ev, hit_ts[-1], tz) + f": refused markets in {hit} of {n_ref} refreshes"
         else:
-            status = "BINDING" if hit else "SLACK"
-            impact = (f"refused markets in {hit} of {n_ref} refreshes, none at the last"
-                      if hit else "never refused a market")
+            status = "SLACK"
+            impact = "never refused a market"
         lim_txt = " / ".join(f"{lbl} {caps[k]}" for k, lbl in (("SCAN_TOP_N", "scan"),
                                                                 ("FINECON_TOP_N", "finecon"))
                              if caps.get(k) is not None)
@@ -543,13 +576,14 @@ def capacity_rows(ev: dict, ctx: dict, tz) -> list:
         rmax = ev["resting_max"]
         r_now = now.get("resting_orders")
         worst = max(rmax[0] if rmax else 0, r_now or 0) if (rmax or r_now is not None) else None
-        if hits:
+        if hits and hits[-1][0] >= recent:
             status = "BINDING"
             impact = (f"cap hit {len(hits)}x (first {_when(hits[0][0], tz)} ET): new "
                       f"placements blocked until orders fill or cancel")
         else:
             status = _pct_status(worst, lim) or "SLACK"
-            impact = "past the cap no new order is placed anywhere"
+            impact = (_earlier(ev, hits[-1][0], tz) + f": cap hit {len(hits)}x" if hits
+                      else "past the cap no new order is placed anywhere")
         note = now.get("resting_notional")
         if note:
             impact += f"; resting notional {_money(note)} if every order filled"
@@ -566,7 +600,7 @@ def capacity_rows(ev: dict, ctx: dict, tz) -> list:
         lim_txt = f"{_int(lim)}/cycle"
         if hits:
             cyc = ev["cycles"]
-            status = "BINDING"
+            status = "BINDING" if hits[-1][0] >= recent else "SLACK"
             pushed = sum(d for _t, _c, d in hits)
             mins = (ev["until"] - ev["since"]) / 60.0 / cyc if cyc else None
             impact = (f"hit in {len(hits)}" + (f" of {cyc:,}" if cyc >= len(hits) else "")
@@ -576,6 +610,8 @@ def capacity_rows(ev: dict, ctx: dict, tz) -> list:
                       + (f" (~{mins:.0f} min)" if mins else "")
                       + (f"; {ev['renewals_kept'] / pushed:.0%} were renewals whose old "
                          f"order kept resting" if pushed and ev["renewals_kept"] else ""))
+            if status == "SLACK":
+                impact = _earlier(ev, hits[-1][0], tz) + ": " + impact
         else:
             status = "SLACK"
             impact = "never hit: every wanted order went out the same cycle"

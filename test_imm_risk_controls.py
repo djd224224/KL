@@ -147,8 +147,8 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(rows["Daily loss halt"]["pct"], 0.0)
 
     def test_budget_and_placements_bind_when_they_refused_or_deferred(self):
-        lines = [_line("2026-10-03 06:10:00", UNIVERSE.replace("{budget}", "87")),
-                 _line("2026-10-03 06:11:00", "placement cap 1000/cycle reached; 332 deferred "
+        lines = [_line("2026-10-03 10:10:00", UNIVERSE.replace("{budget}", "87")),
+                 _line("2026-10-03 10:11:00", "placement cap 1000/cycle reached; 332 deferred "
                        "to next cycle")]
         rows = _by(rc.build_rows(_ev(lines), _ctx()))
         self.assertEqual(rows["Collateral budget (modelled)"]["status"], "BINDING")
@@ -158,7 +158,7 @@ class VerdictTests(unittest.TestCase):
                          "BINDING")
         self.assertEqual(rows["Events quoted"]["status"], "SLACK")         # 392 of 1000
         # a refresh that refused nothing and no placement-cap line: not binding
-        rows = _by(rc.build_rows(_ev([_line("2026-10-03 06:10:00",
+        rows = _by(rc.build_rows(_ev([_line("2026-10-03 10:10:00",
                                             UNIVERSE.replace("{budget}", "0")
                                             .replace("'event_top_n': 28, 'finecon_top_n': 3, "
                                                      "'scan_top_n': 8, ", ""))]), _ctx()))
@@ -171,7 +171,7 @@ class VerdictTests(unittest.TestCase):
         rows = _by(rc.build_rows(_ev(lines), _ctx(resting_orders=3010)))
         self.assertEqual(rows["Resting orders"]["status"], "CLOSE")
         self.assertEqual(rows["Resting orders"]["worst"], "3,743")
-        lines.append(_line("2026-10-03 07:05:00", "ALERT [order_cap] global resting-order cap "
+        lines.append(_line("2026-10-03 10:05:00", "ALERT [order_cap] global resting-order cap "
                            "4000 reached"))
         rows = _by(rc.build_rows(_ev(lines), _ctx(resting_orders=3010)))
         self.assertEqual(rows["Resting orders"]["status"], "BINDING")
@@ -192,6 +192,39 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(pm["status"], "BINDING")
         self.assertIn("1 OVER it", pm["impact"])
         self.assertIn("KXTEMPAUSH", pm["impact"])
+
+    def test_a_cap_that_bound_only_hours_ago_is_not_binding_now(self):
+        """10/3: the budget refused markets until the 13:40 raise to $300k; the
+        next morning's email must not call it BINDING."""
+        lines = [_line("2026-10-03 06:10:00", UNIVERSE.replace("{budget}", "87")),
+                 _line("2026-10-03 06:11:00", "placement cap 1000/cycle reached; 332 deferred "
+                       "to next cycle"),
+                 _line("2026-10-03 10:40:00", UNIVERSE.replace("{budget}", "0")
+                       .replace("'event_top_n': 28, 'finecon_top_n': 3, 'scan_top_n': 8, ", ""))]
+        rows = _by(rc.build_rows(_ev(lines), _ctx()))
+        b = rows["Collateral budget (modelled)"]
+        self.assertNotEqual(b["status"], "BINDING")
+        self.assertIn("bound earlier", b["impact"])
+        p = rows["Placements per cycle"]
+        self.assertEqual(p["status"], "SLACK")
+        self.assertIn("bound earlier", p["impact"])
+        self.assertNotEqual(rows["Slot caps (strikes per event, scan, finecon)"]["status"],
+                            "BINDING")
+
+    def test_now_is_the_halts_own_pnl_not_the_status_file(self):
+        """status.pnl_today omits the restart carry: it read -$14 while the
+        halt's own figure (the cycle line's) was -$820."""
+        lines = [_line("2026-10-03 10:50:00", "1/2 mkts quoted, 10 resting, 0 amend, 0 cancel, "
+                       "0 place, est $1.00/day reward share, P&L today $-820.04 (r/u) "),
+                 _line("2026-10-03 10:50:00", "risk: account value $27,195 (anchor $24,387, up "
+                       "$2,808 of $2,000 halt) | P&L today $-820.04 of -$2,000 halt | open-scan "
+                       "$-29.43 of -$200 budget")]
+        rows = _by(rc.build_rows(_ev(lines), _ctx(pnl_today=-14.23, scan_pnl=-1.0)))
+        self.assertEqual(rows["Daily loss halt"]["now"], "-820")
+        self.assertEqual(rows["Open-scan tier loss budget"]["now"], "-29")
+        # never below the anchor reads as such, not "down $0"
+        self.assertEqual(rows["Account-value guard (balance guard)"]["worst"],
+                         "never below the anchor")
 
     def test_guards_fire_count_or_say_off(self):
         toxic = [{"kind": "pickoff", "ts": T0 - 100, "ticker": "A"},
