@@ -75,11 +75,12 @@ import sys
 import time
 import uuid
 import zlib
+from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import pytz
 import requests
@@ -2711,6 +2712,42 @@ WAKE_GAP_SECS = 600
 CYCLE_HANG_EXIT_SECS = _env_int("IMM_CYCLE_HANG_EXIT", 600)
 WAKE_GRACE_SECS = 120
 BLIND_PRESERVE_CYCLES = 3
+
+# WEBSOCKET BOOKS -- SHADOW (Jack 2026-10-03: "i only want to turn on the
+# websocket shadow"). One background connection (kalshi_ws.py, stdlib only:
+# the box's Python has no websocket library) keeps every managed book
+# current -- orderbook_delta snapshot + sequence-checked deltas -- plus our
+# fills. Why: every managed book is one REST read inside the quote cycle; at
+# ~1,500-1,900 markets that is most of a 270-460s cycle, so a resting quote
+# can sit minutes behind a moved market. Verified live read-only 2026-10-02/03
+# (nothing placed or cancelled): 1,512 managed markets, every book in 1.0s,
+# ~154 msgs/s, 0 gaps, 2.5% of one core; 102/102 REST spot checks EXACT.
+#    IMM_WS=shadow -- THE DEFAULT. The feed runs; trading reads REST exactly
+#                     as before. Every REST book read is compared with the WS
+#                     book (status `latency.ws.shadow`, top-of-book mismatches
+#                     sampled in the log), and the stale-quote check counts
+#                     the cancels a fast path WOULD send (`would_cancel`) --
+#                     it never cancels. No trading decision reads the feed.
+#    IMM_WS=off    -- nothing runs (the bot exactly as before).
+#    IMM_WS=on     -- the quote loop reads the WS book whenever it is
+#                     trustworthy, REST otherwise. NOT enabled.
+#    IMM_WS_FAST=1 -- (with on) cancel a rung the external touch left strictly
+#                     ahead of the book between cycles. NOT enabled.
+WS_MODE = os.environ.get("IMM_WS", "shadow").strip().lower()
+if WS_MODE not in ("off", "shadow", "on"):
+    WS_MODE = "off"
+WS_URL = os.environ.get("IMM_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+WS_FAST = os.environ.get("IMM_WS_FAST", "0") == "1"
+WS_SUB_CHUNK = _env_int("IMM_WS_SUB_CHUNK", 100)
+# the feed pings every 10s and Kalshi answers every ping, so 20s without a
+# single frame means the connection is dead: books go untrusted
+WS_STALE_SECS = _env_float("IMM_WS_STALE_SECS", 20.0)
+WS_FAST_MAX_CANCELS_PER_MIN = _env_int("IMM_WS_FAST_MAX_CANCELS_PER_MIN", 120)
+WS_MIN_CYCLE_GAP_SECS = _env_float("IMM_WS_MIN_CYCLE_GAP_SECS", 3.0)
+WS_SHADOW_LOG_PER_HOUR = _env_int("IMM_WS_SHADOW_LOG_PER_HOUR", 20)
+# between cycles the feed's changes are looked at in batches, at most this
+# many times a second (they accumulate in the feed meanwhile)
+WS_IDLE_BATCHES_PER_SEC = max(1.0, _env_float("IMM_WS_IDLE_BATCHES_PER_SEC", 4.0))
 
 # Series other repo bots trade (self-trade / infighting exclusion) + anything
 # broadcast-reactive the user wants out entirely. Prefix match on the ticker.
@@ -6768,6 +6805,9 @@ _CONFIG_CODE_KNOBS = (
     "TOXIC_EVENT_MARKETS", "TOXIC_EVENT_WINDOW_SECS", "TOXIC_EVENT_HALT_SECS",
     # wide-book marks (2026-10-01)
     "MARK_WIDE_SPREAD_CENTS",
+    # WebSocket books, shadow (2026-10-03)
+    "WS_MODE", "WS_URL", "WS_FAST", "WS_SUB_CHUNK", "WS_STALE_SECS",
+    "WS_FAST_MAX_CANCELS_PER_MIN", "WS_MIN_CYCLE_GAP_SECS",
 )
 
 
@@ -12001,6 +12041,24 @@ class IncentiveMarketMaker:
         # Whose account imm_state.json describes (see state_account_mismatch):
         # a fresh state is this process's; _load_persist reads a file's own.
         self._state_owner = KEY_ID
+        # ---- WebSocket books (2026-10-03, see WS_MODE) ----
+        self._ws: Any = None                       # kalshi_ws.KalshiFeed
+        self._ws_shadow = {"compared": 0, "exact": 0, "top": 0, "ws_missing": 0}
+        self._ws_shadow_logged: Deque[float] = deque()
+        self._ws_books_used = 0                    # books served by WS (on mode)
+        self._ws_rest_fallback = 0                 # ...and REST fallbacks
+        # this cycle's cancels / amends (ids -> new cents): the stale-quote
+        # check's view of our resting orders is rebuilt from them each cycle
+        self._cycle_cancelled: Set[str] = set()
+        self._cycle_amended: Dict[str, int] = {}
+        self._resting_view: Dict[str, List[dict]] = {}
+        self._ws_suspect: Dict[str, float] = {}    # order id -> first seen ahead
+        self._ws_would: Set[str] = set()           # shadow: ids already counted
+        self._ws_fast = {"cancels": 0, "events": 0, "wakes": 0, "fills": 0,
+                         "skipped_budget": 0, "would_cancel": 0}
+        self._ws_cancel_times: Deque[float] = deque()
+        self._ws_wake = False
+        self._last_cycle_start = 0.0
         self._load_persist()
         # the ladder-asks cash latch lives in module state for series_bid_only
         _LADDER_ASKS_STATE["on_at"] = self.state.ladder_asks_on_at or None
@@ -13234,6 +13292,7 @@ class IncentiveMarketMaker:
         if not self.live:
             self.state.sim_orders.pop(order_id, None)
             self.state.order_ages.pop(order_id, None)
+            self._cycle_cancelled.add(order_id)
             log(f"{self.tag} [DRY] cancel {order_id}")
             return True
         # Snapshot the ledger entry before either path pops it — it carries
@@ -13243,6 +13302,7 @@ class IncentiveMarketMaker:
         placed_at = led.get("_placed_at")
         try:
             self.client.cancel_order(order_id)
+            self._cycle_cancelled.add(order_id)
             self.state.order_ages.pop(order_id, None)
             self.state.ledger.pop(order_id, None)
             self._log_order(
@@ -13254,6 +13314,7 @@ class IncentiveMarketMaker:
             return True
         except HttpError as e:
             if e.status in (404, 409):
+                self._cycle_cancelled.add(order_id)
                 self.state.order_ages.pop(order_id, None)
                 self.state.ledger.pop(order_id, None)
                 # Already gone — filled, expired or cancelled elsewhere.
@@ -13305,6 +13366,7 @@ class IncentiveMarketMaker:
             self.client.amend_order(
                 order_id=oid, ticker=q.ticker, book_side=q.book_side,
                 yes_price_cents=q.price_cents, total_count=total)
+            self._cycle_amended[oid] = int(q.price_cents)
             led = self.state.ledger.get(oid)
             # Read the previous price/size BEFORE the overwrite below, and
             # keep the FULL order id: the prose line truncates it to 8 chars,
@@ -13334,6 +13396,300 @@ class IncentiveMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! amend failed {label}: {e}")
             return False
+
+    # ---- WebSocket books (2026-10-03, see WS_MODE) ----------------------------
+
+    def _read_book(self, ticker: str) -> dict:
+        """The market's order book for the quote loop. IMM_WS=shadow (the
+        default) and off: the REST read exactly as before -- in shadow it is
+        then compared with the WS book, which is never used. IMM_WS=on: the
+        WS book when it is trustworthy, else REST. A REST failure raises as
+        it always did (the blind path is unchanged)."""
+        ws = self._ws
+        if ws is not None and WS_MODE == "on":
+            ob = ws.book_fp(ticker)
+            if ob is not None:
+                self._ws_books_used += 1
+                return ob
+            self._ws_rest_fallback += 1
+        ob = self.client.get_orderbook(ticker=ticker)
+        if ws is not None and WS_MODE == "shadow":
+            self._ws_shadow_compare(ticker, ob)
+        return ob
+
+    def _ws_shadow_compare(self, ticker: str, rest_ob: dict) -> None:
+        """Shadow mode: count how often the WS book equals the REST read
+        (whole book / top of book), log a sample of mismatches. Analytics
+        only -- never raises, never touches trading."""
+        try:
+            import kalshi_ws
+            lv = self._ws.book_levels(ticker)
+            st = self._ws_shadow
+            if lv is None:
+                st["ws_missing"] += 1
+                return
+            st["compared"] += 1
+            ry, rn = kalshi_ws.rest_book_levels(rest_ob)
+            wy, wn = lv
+
+            def r2(d):
+                return {k: round(v, 2) for k, v in d.items() if round(v, 2) > 0}
+            exact = r2(ry) == r2(wy) and r2(rn) == r2(wn)
+            top_r = (max(ry, default=None), max(rn, default=None))
+            top_w = (max(wy, default=None), max(wn, default=None))
+            st["exact"] += int(exact)
+            st["top"] += int(top_r == top_w)
+            if top_r != top_w:
+                now = time.time()
+                while self._ws_shadow_logged and \
+                        self._ws_shadow_logged[0] < now - 3600:
+                    self._ws_shadow_logged.popleft()
+                if len(self._ws_shadow_logged) < WS_SHADOW_LOG_PER_HOUR:
+                    self._ws_shadow_logged.append(now)
+                    log(f"{self.tag} WS shadow: top mismatch {ticker} "
+                        f"rest {top_r} ws {top_w}")
+        except Exception:
+            pass
+
+    def _ws_start(self) -> None:
+        """Start the WebSocket feed thread (IMM_WS=shadow|on). Any failure
+        leaves self._ws None: the bot runs exactly as with IMM_WS=off."""
+        if WS_MODE == "off" or self._ws is not None:
+            return
+        client = self.client
+        if client is None or not hasattr(client, "sign_pss_text"):
+            log(f"{self.tag} ! WS {WS_MODE} requested but no signing client; off")
+            return
+        try:
+            import kalshi_ws
+            from urllib.parse import urlparse
+            path = urlparse(WS_URL).path or "/trade-api/ws/v2"
+            key_id = getattr(client, "key_id", None) or KEY_ID
+
+            def headers() -> Dict[str, str]:
+                ts = str(int(time.time() * 1000))
+                return {"KALSHI-ACCESS-KEY": key_id,
+                        "KALSHI-ACCESS-SIGNATURE":
+                            client.sign_pss_text(ts + "GET" + path),
+                        "KALSHI-ACCESS-TIMESTAMP": ts}
+
+            prefix = CLIENT_ORDER_PREFIX + "-"
+            feed = kalshi_ws.KalshiFeed(
+                WS_URL, headers, log=lambda s: log(f"{self.tag} {s}"),
+                fill_filter=lambda f: str(f.get("client_order_id") or "").startswith(prefix),
+                want_fills=True, want_order_groups=False,
+                chunk=WS_SUB_CHUNK, stale_secs=WS_STALE_SECS)
+            feed.start()
+            self._ws = feed
+            log(f"{self.tag} WebSocket feed started ({WS_MODE}"
+                f"{', fast path' if WS_FAST and WS_MODE == 'on' else ''}) "
+                f"-> {WS_URL}")
+        except Exception as e:
+            self._ws = None
+            log(f"{self.tag} ! WS feed failed to start ({e}); running REST-only")
+
+    def _ws_stop(self) -> None:
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                ws.stop()
+            except Exception:
+                pass
+
+    def _ws_process_events(self, now_ts: float, in_cycle: bool = False) -> None:
+        """Drain the feed: our fills (start the next cycle early, fast mode
+        only) and -- between cycles -- the books that changed, for the
+        stale-quote check: live in fast mode, DRY (counting only) otherwise."""
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            dirty, events, dropped = ws.drain()
+        except Exception:
+            return
+        fast = WS_FAST and WS_MODE == "on"
+        # with the fast path off, the same check runs DRY: it counts (and
+        # samples in the log) the cancels it would have sent -- the evidence
+        # for a fast path, gathered on the live book
+        fast_dry = not fast and WS_MODE in ("on", "shadow")
+        for kind, body in events:
+            self._ws_fast["events"] += 1
+            if kind == "fill":
+                self._ws_fast["fills"] += 1
+                if fast and not in_cycle:
+                    self._ws_wake = True
+        if (fast or fast_dry) and not in_cycle:
+            if dropped:
+                dirty = set(dirty) | set(self._resting_view)
+            self._ws_fast_check(set(dirty), now_ts, dry=fast_dry)
+
+    def _ws_fast_check(self, dirty: Set[str], now_ts: float,
+                       dry: bool = False) -> int:
+        """Between cycles: find any resting rung the external touch has left
+        STRICTLY AHEAD of the book -- the stale quote a sweep picks off
+        (join-never-lead means it is never intended). It must read ahead on
+        two looks >= 1s apart (our own new order can reach the book a moment
+        after a delta) and be >= 2s old; pads are never touched. DRY (shadow,
+        or on without IMM_WS_FAST): count it once in `would_cancel` and log a
+        sample. LIVE (on + IMM_WS_FAST=1): cancel it and start the next cycle
+        early. Returns cancels sent."""
+        ws = self._ws
+        if ws is None:
+            return 0
+        cancels = 0
+        check = set(dirty) | {o_t for o_t, lst in self._resting_view.items()
+                              if any(o["order_id"] in self._ws_suspect for o in lst)}
+        for t in sorted(check):
+            orders = self._resting_view.get(t)
+            if not orders:
+                continue
+            lv = ws.book_levels(t)
+            if lv is None:
+                continue
+            yes, no = lv
+            own_yes: Dict[float, float] = {}
+            own_no: Dict[float, float] = {}
+            for o in orders:
+                if o["side"] == "bid":
+                    k = round(o["px"] / 100.0, 4)
+                    own_yes[k] = own_yes.get(k, 0.0) + o["rem"]
+                else:
+                    k = round((100.0 - o["px"]) / 100.0, 4)
+                    own_no[k] = own_no.get(k, 0.0) + o["rem"]
+            ext_bid = max((p for p, q in yes.items()
+                           if q - own_yes.get(p, 0.0) > 0.01), default=None)
+            ext_no = max((p for p, q in no.items()
+                          if q - own_no.get(p, 0.0) > 0.01), default=None)
+            ext_ask = None if ext_no is None else round(1.0 - ext_no, 4)
+            for o in list(orders):
+                oid = o["order_id"]
+                if o["pad"] or now_ts - o["placed"] < 2.0:
+                    self._ws_suspect.pop(oid, None)
+                    continue
+                p = round(o["px"] / 100.0, 4)
+                ahead = ((ext_bid is None or p > ext_bid + 1e-6)
+                         if o["side"] == "bid"
+                         else (ext_ask is None or p < ext_ask - 1e-6))
+                if not ahead:
+                    self._ws_suspect.pop(oid, None)
+                    continue
+                first = self._ws_suspect.setdefault(oid, now_ts)
+                if now_ts - first < 1.0:
+                    continue
+                if dry:
+                    # count each order once; never cancel, never spend budget
+                    if oid not in self._ws_would:
+                        self._ws_would.add(oid)
+                        self._ws_fast["would_cancel"] = \
+                            self._ws_fast.get("would_cancel", 0) + 1
+                        while self._ws_shadow_logged and \
+                                self._ws_shadow_logged[0] < now_ts - 3600:
+                            self._ws_shadow_logged.popleft()
+                        if len(self._ws_shadow_logged) < WS_SHADOW_LOG_PER_HOUR:
+                            self._ws_shadow_logged.append(now_ts)
+                            log(f"{self.tag} WS fast (dry): would cancel {t} "
+                                f"{o['side'].upper()} @ {o['px']:g}c -- the "
+                                f"external touch left it ahead (bid {ext_bid}, "
+                                f"ask {ext_ask})")
+                    continue
+                while self._ws_cancel_times and \
+                        self._ws_cancel_times[0] < now_ts - 60.0:
+                    self._ws_cancel_times.popleft()
+                if len(self._ws_cancel_times) >= WS_FAST_MAX_CANCELS_PER_MIN:
+                    self._ws_fast["skipped_budget"] += 1
+                    continue
+                self._ws_cancel_times.append(now_ts)
+                self._ws_suspect.pop(oid, None)
+                if self.cancel_order(oid, reason="ws_stale"):
+                    self.state.cancelled_today += 1
+                    cancels += 1
+                    self._ws_fast["cancels"] += 1
+                    orders.remove(o)
+                    log(f"{self.tag} WS fast: cancelled {t} "
+                        f"{o['side'].upper()} @ {o['px']:g}c -- the external "
+                        f"touch left it ahead (bid {ext_bid}, ask {ext_ask})")
+        if cancels:
+            self._ws_wake = True
+        return cancels
+
+    def _build_resting_view(self, resting: List[dict], now_ts: float) -> None:
+        """Our resting orders per ticker as this cycle leaves them -- the
+        cycle-top read less this cycle's cancels, at this cycle's amended
+        prices, plus this cycle's placements (ledger) -- for _ws_fast_check."""
+        view: Dict[str, List[dict]] = {}
+        seen: Set[str] = set()
+
+        def add(oid: str, t: str, side: str, px: float, rem: float,
+                placed: float) -> None:
+            if not oid or oid in seen or not t or rem <= 0:
+                return
+            seen.add(oid)
+            view.setdefault(t, []).append({
+                "order_id": oid, "side": side, "px": float(px),
+                "rem": float(rem), "placed": float(placed),
+                "pad": _order_is_pad(side, int(round(px)))})
+
+        for o in resting:
+            oid = str(o.get("order_id") or "")
+            if oid in self._cycle_cancelled:
+                continue
+            parsed = order_yes_book_cents(o)
+            if parsed is None:
+                continue
+            side, px = parsed
+            ox = order_yes_exact_cents(o)
+            pxe = float(self._cycle_amended[oid]) if oid in self._cycle_amended \
+                else (ox if ox is not None else float(px))
+            add(oid, str(o.get("ticker") or ""), side, pxe, order_remaining(o),
+                self.state.order_ages.get(oid, 0.0))
+        for oid, led in list(self.state.ledger.items()):
+            if oid in self._cycle_cancelled or oid in seen:
+                continue
+            px = led.get("yes_price_exact")
+            px = float(px) if px is not None else float(led.get("yes_price") or 0)
+            add(oid, str(led.get("ticker") or ""), str(led.get("book_side") or ""),
+                px, float(led.get("remaining_count") or 0.0),
+                float(led.get("_placed_at") or now_ts))
+        self._resting_view = view
+        self._ws_suspect = {k: v for k, v in self._ws_suspect.items() if k in seen}
+        self._ws_would &= seen
+
+    def _idle(self, secs: float, stopping: dict) -> bool:
+        """Sleep up to `secs` between cycles. With the WebSocket feed running
+        it waits on the feed instead and handles its events as they arrive;
+        it returns True early only in fast mode (a stale rung was cancelled
+        or one of our orders filled), never sooner than WS_MIN_CYCLE_GAP_SECS
+        after the last cycle started. In shadow it always runs to `secs`."""
+        ws = self._ws
+        if ws is None or secs <= 0:
+            if secs > 0:
+                time.sleep(secs)
+            return False
+        end = time.time() + secs
+        next_ok = 0.0
+        while not stopping.get("flag"):
+            remain = end - time.time()
+            if remain <= 0:
+                return False
+            ws.event_flag.wait(min(remain, 0.5))
+            now_ts = time.time()
+            # at most WS_IDLE_BATCHES_PER_SEC looks a second: a busy feed
+            # (~150 book changes/s) would otherwise wake this loop on every
+            # message; the changes accumulate in the feed until the next look
+            if now_ts < next_ok:
+                time.sleep(max(0.0, min(next_ok, end) - now_ts))
+                now_ts = time.time()
+            next_ok = now_ts + 1.0 / WS_IDLE_BATCHES_PER_SEC
+            try:
+                self._ws_process_events(now_ts)
+            except Exception as e:
+                log(f"{self.tag} ! WS event handling failed: {e}")
+            if self._ws_wake and \
+                    now_ts - self._last_cycle_start >= WS_MIN_CYCLE_GAP_SECS:
+                self._ws_wake = False
+                self._ws_fast["wakes"] += 1
+                return True
+        return False
 
     def _get_resting_orders_global(self) -> List[dict]:
         """All resting orders on the account with our client prefix, paginated.
@@ -16401,11 +16757,19 @@ class IncentiveMarketMaker:
         # fill for the user trading and dumped the whole event's quotes
         # (observed live 2026-07-14: a 5-lot TRUM fill deselected all 14
         # LATENIGHT markets and stray-cancelled 59 resting orders).
+        self._cycle_cancelled = set()      # this cycle's cancels (WS view)
+        self._cycle_amended = {}           # this cycle's amends: id -> new cents
         for f in self.fetch_new_fills():
             try:
                 self._book_fill(f, now_ts)
             except Exception as e:
                 log(f"{self.tag} ! unparseable fill skipped: {e}")
+        # WebSocket feed events since the last look (2026-10-03): drained so
+        # they do not pile up; never a cycle error
+        try:
+            self._ws_process_events(now_ts, in_cycle=True)
+        except Exception as e:
+            log(f"{self.tag} ! WS event handling failed: {e}")
 
         positions = self.fetch_positions()
         # Post-wake grace: reads right after a sleep can SUCCEED with garbage
@@ -16494,6 +16858,12 @@ class IncentiveMarketMaker:
         self.state.known_tickers |= set(managed)
         # Prune dead entries (unmanaged, flat) so the set stays bounded.
         self.state.known_tickers &= (set(managed) | set(positions))
+        # WebSocket books follow the managed set (IMM_WS != off, 2026-10-03)
+        if self._ws is not None:
+            try:
+                self._ws.set_markets(managed)
+            except Exception as e:
+                log(f"{self.tag} ! WS market sync failed: {e}")
         # Settle-or-drop own-book entries whose market vanished from the
         # unsettled-positions read. A settlement is REAL P&L that the fill
         # stream never reports — without booking it, a gapped position riding
@@ -16825,7 +17195,9 @@ class IncentiveMarketMaker:
             self.state.prev_pos[t] = own_pos
 
             try:
-                ob = self.client.get_orderbook(ticker=t)
+                # REST exactly as before in shadow / off; in shadow the WS
+                # book is compared with it (2026-10-03, _read_book)
+                ob = self._read_book(t)
                 yes_levels, no_levels = orderbook_levels(ob)
                 self.state.blind_streak.pop(t, None)
             except Exception as e:
@@ -18023,6 +18395,12 @@ class IncentiveMarketMaker:
             # near zero; the startup reconcile mops up anything still missed.
             self._save_persist()
         self.state.placed_today += placed
+        # the stale-quote check's view of what rests now (shadow: counting)
+        if self._ws is not None and WS_MODE in ("on", "shadow"):
+            try:
+                self._build_resting_view(resting, now_ts)
+            except Exception as e:
+                log(f"{self.tag} ! WS resting view failed: {e}")
         if not fast_only:
             self.state.cycles_today += 1
             self.state.last_markets_line = (
@@ -18404,6 +18782,9 @@ class IncentiveMarketMaker:
             "errors_today": s.errors_today,
             "alerts_today": cats,
             "halted_until": s.halted_until,
+            # WebSocket books (2026-10-03): feed health, shadow compare and
+            # the stale-quote counts
+            "latency": self._latency_status(),
             "summary_date": str(self.alerter.last_summary_date or ""),
             "summary_body": self.alerter.last_summary_body or "",
         }
@@ -18418,6 +18799,20 @@ class IncentiveMarketMaker:
             log(f"{self.tag} ! status write failed: {e}")
         if self.live:   # dry-run markets must not contaminate the live "ours" set
             self._save_persist()
+
+    def _latency_status(self) -> dict:
+        """The status file's `latency` block (WebSocket books). Never raises."""
+        try:
+            out = {"ws": {"mode": WS_MODE, "fast": WS_FAST,
+                          "books_used": self._ws_books_used,
+                          "rest_fallback": self._ws_rest_fallback,
+                          "shadow": dict(self._ws_shadow),
+                          "fast_stats": dict(self._ws_fast)}}
+            if self._ws is not None:
+                out["ws"]["feed"] = self._ws.status()
+            return out
+        except Exception as e:
+            return {"error": str(e)[:200]}
 
     def build_daily_summary(self) -> str:
         s = self.state
@@ -19457,6 +19852,13 @@ class IncentiveMarketMaker:
             f"budget ${COLLATERAL_BUDGET:g}, "
             f"{('max ' + str(MAX_MARKETS) + ' events') if MAX_MARKETS > 0 else 'events uncapped'}, "
             f"TTL {ORDER_TTL_SECS}s, poll {POLL_SECS}s")
+        log(f"WebSocket books (2026-10-03): {WS_MODE}"
+            + {"shadow": " -- the feed is compared with every REST book read "
+                         "and stale quotes are COUNTED; trading reads REST",
+               "on": " -- trusted WS books feed the quote loop, REST otherwise"
+                     + (" + fast stale-quote cancels" if WS_FAST else
+                        "; stale quotes counted only"),
+               "off": " -- no feed"}.get(WS_MODE, ""))
         if SCAN_TOP_N > 0:
             log(f"open-scan tier: {SCAN_TOP_N} slots "
                 f"(ceiling {scan_ceiling()}), {SCAN_EVENT_TOP_N}/event, "
@@ -19547,6 +19949,8 @@ class IncentiveMarketMaker:
                 except (OSError, ValueError):
                     pass
         atexit.register(self.shutdown_cancel)
+        if not once:
+            self._ws_start()       # no-op under IMM_WS=off
 
         try:
             while True:
@@ -19555,6 +19959,7 @@ class IncentiveMarketMaker:
                 if not once and self._restart_requested():
                     break
                 top = time.time()
+                self._last_cycle_start = top      # _idle's early-wake floor
                 _keep_awake()   # re-assert every cycle (wakes can clear it)
                 if prev_top is not None and top - prev_top > WAKE_GAP_SECS:
                     self.wake_grace_until = top + WAKE_GRACE_SECS
@@ -19628,10 +20033,14 @@ class IncentiveMarketMaker:
                                and not stopping["flag"]
                                and any(series_fast_lane(m.series)
                                        for m in self.state.selected.values()))
+                    # _idle = time.sleep unless the WebSocket feed runs; then
+                    # it handles the feed's events while it waits (in shadow
+                    # it always waits the full time)
                     if not fast_ok:
-                        time.sleep(remain)
+                        self._idle(remain, stopping)
                         break
-                    time.sleep(min(FAST_LANE_SECS, remain))
+                    if self._idle(min(FAST_LANE_SECS, remain), stopping):
+                        break
                     if stopping["flag"] or time.time() >= deadline:
                         break
                     try:
@@ -19641,6 +20050,7 @@ class IncentiveMarketMaker:
                     self._book_log_flush()
         finally:
             self.shutdown_cancel()
+            self._ws_stop()        # read-only feed: after the cancel
             # After the cancel, deliberately: a flush must never delay pulling
             # live orders on shutdown. Catches the final partial cycle.
             self._book_log_flush()

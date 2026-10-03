@@ -7429,3 +7429,54 @@ ship".
 
 Tests: TestNflPropGate.test_recent_form_widens_the_band, test_nfl_prop_fair
 TestSnapshot.test_recent_form_band.
+
+## 2026-10-03 — WebSocket books in SHADOW (Jack: "i only want to turn on the websocket shadow")
+
+WHAT. kalshi_ws.py (new, stdlib only -- the box's Python has no websocket
+library) runs one daemon thread with one Kalshi WebSocket connection
+(wss://api.elections.kalshi.com/trade-api/ws/v2, signed with the bot's own
+client: timestamp + GET + /trade-api/ws/v2). It keeps every managed book
+(orderbook_delta: a snapshot per market, then deltas; every message's
+per-subscription seq checked -- the `ok` answering update_subscription takes
+a seq in the same sequence -- and a gap re-snapshots the subscription) plus
+our fills (`fill`, filtered to imm- client ids). A book is trusted only with
+a snapshot on the live connection, no gap since, and a frame inside
+IMM_WS_STALE_SECS (20; the feed pings every 10s). Reconnects with backoff;
+the thread never raises.
+
+SHADOW = NO TRADING EFFECT. The quote loop reads REST exactly as before
+(`_read_book`); each read is then compared with the WS book. Between
+cycles the bot waits on the feed instead of time.sleep (`_idle`, same
+deadline, never early in shadow) and runs the stale-quote check DRY: a
+resting rung the external touch has left strictly ahead of the book, on
+two looks >= 1s apart, >= 2s old, pads never -- counted once in
+`would_cancel`, a sample logged ("WS fast (dry): would cancel ..."),
+never cancelled. The idle loop looks at the feed at most
+IMM_WS_IDLE_BATCHES_PER_SEC (4) times a second.
+
+DEFAULT AND SWITCHES. IMM_WS=shadow is the CODE default (so a plain code
+deploy -- the bot's own code-change restart, book handed over -- turns it
+on) and is also set in the launcher. IMM_WS=off: no feed at all (+
+restart_imm.ps1 -Task). IMM_WS=on (trusted WS books feed the quote loop,
+REST otherwise) and IMM_WS_FAST=1 (live stale-quote cancels, next cycle
+early) are in the code but NOT enabled.
+
+VERIFIED LIVE, READ-ONLY (10/2-10/3, nothing placed or cancelled): 1,512
+managed markets, every book in 1.0s, ~154 msgs/s, 0 gaps, 2.5% of one core;
+102/102 REST spot checks EXACT (whole depth); with the production client
+(build_client) through the bot's own _ws_start + _read_book: 40/40 books in
+0.3s, 15/15 equal to REST. The stale-quote check run on the live bot's real
+orders for 4 min flagged ~15-20 distinct orders ahead of the touch; the two
+checked by hand were real (a 7Y-high bid left at 46c for minutes after the
+bids fell to 29-30c; a 5Y ask placed 1c ahead off a minutes-old read).
+
+WATCH. Startup: "WebSocket books (2026-10-03): shadow -- ...", "[IMM]
+WebSocket feed started (shadow)", "[IMM] [WS] connected ...". Status
+status_incentive_mm.json `latency.ws`: feed {connected, healthy, books_ok,
+want, gaps, resnapshots, errors, msgs}, shadow {compared, exact, top,
+ws_missing}, fast_stats {would_cancel, fills, events}. Healthy shadow =
+exact/compared ~1.0, gaps ~0, books_ok ~ want.
+
+NOT IN THIS DEPLOY: the cycle governor, TTL margin, order groups, by-date
+decay and the 10/1 breadth rollback (branch claude/imm-latency-risk,
+unmerged).

@@ -20166,5 +20166,378 @@ class TestImmOwnAccount(unittest.TestCase):
         self.assertFalse(any("balance" in s for s in lines))
 
 
+# ============================================================================
+# WEBSOCKET BOOKS -- SHADOW (Jack 2026-10-03: "i only want to turn on the
+# websocket shadow"). The book source, the shadow compare, the stale-quote
+# check (dry in shadow, live only with on + IMM_WS_FAST), the idle loop and
+# the status block. Each test pins the mode it is about.
+# ============================================================================
+
+import threading as _threading
+
+import kalshi_ws as _kw
+
+
+class _FakeFeed:
+    """Just enough of kalshi_ws.KalshiFeed for the bot."""
+
+    def __init__(self):
+        self.books = {}            # ticker -> ({px: qty} yes, {px: qty} no)
+        self.markets = set()
+        self.events = []
+        self.dirty = set()
+        self.event_flag = _threading.Event()
+        self.stopped = False
+
+    def set_markets(self, tickers):
+        self.markets = set(tickers)
+
+    def book_levels(self, t):
+        lv = self.books.get(t)
+        return None if lv is None else (dict(lv[0]), dict(lv[1]))
+
+    def book_fp(self, t):
+        lv = self.book_levels(t)
+        return None if lv is None else _kw.book_to_rest_shape(*lv)
+
+    def drain(self):
+        d, e = self.dirty, self.events
+        self.dirty, self.events = set(), []
+        self.event_flag.clear()
+        return d, e, 0
+
+    def status(self):
+        return {"healthy": True, "books_ok": len(self.books)}
+
+    def stop(self):
+        self.stopped = True
+
+
+_GOOD_WS_BOOK = ({0.48: 500.0, 0.49: 600.0}, {0.49: 1200.0})   # == FakeClient's REST book
+
+
+class TestWSBookSource(unittest.TestCase):
+    T = "KXGOOD-99DEC31-A"
+
+    def _bot(self, mode):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        p = mock.patch.object(imm, "WS_MODE", mode)
+        p.start()
+        self.addCleanup(p.stop)
+        bot.run_cycle()                                   # select + quote via REST
+        reads = []
+        base = bot.client.get_orderbook
+
+        def counted(ticker, depth=None):
+            reads.append(ticker)
+            return base(ticker, depth)
+        bot.client.get_orderbook = counted
+        bot.state.universe_at = time.time()               # no refresh this cycle
+        return bot, reads
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                      for o in bot.state.sim_orders.values())
+
+    def test_shadow_trades_on_rest_and_compares(self):
+        bot, reads = self._bot("shadow")
+        before = self._quotes(bot)
+        feed = _FakeFeed()
+        feed.books[self.T] = _GOOD_WS_BOOK
+        bot._ws = feed
+        bot.run_cycle()
+        self.assertIn(self.T, reads)                      # REST is what trades
+        self.assertEqual(self._quotes(bot), before)
+        self.assertEqual(bot._ws_shadow["compared"], 1)
+        self.assertEqual(bot._ws_shadow["exact"], 1)
+        self.assertEqual(bot._ws_shadow["top"], 1)
+        self.assertEqual(bot._ws_books_used, 0)
+        self.assertEqual(feed.markets, set(bot.state.selected))
+        # a WS book that disagrees changes nothing but the counters
+        feed.books[self.T] = ({0.47: 500.0}, {0.49: 1200.0})
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), before)
+        self.assertEqual(bot._ws_shadow["compared"], 2)
+        self.assertEqual(bot._ws_shadow["top"], 1)
+        feed.books.clear()                                # no WS book yet
+        bot.run_cycle()
+        self.assertEqual(bot._ws_shadow["ws_missing"], 1)
+
+    def test_off_never_touches_a_feed(self):
+        bot, reads = self._bot("off")
+        bot._ws = None
+        bot.run_cycle()
+        self.assertIn(self.T, reads)
+        self.assertEqual(bot._ws_shadow["compared"], 0)
+
+    def test_on_mode_reads_the_ws_book_and_quotes_the_same(self):
+        bot, reads = self._bot("on")
+        before = self._quotes(bot)
+        feed = _FakeFeed()
+        feed.books[self.T] = _GOOD_WS_BOOK
+        bot._ws = feed
+        bot.run_cycle()
+        self.assertNotIn(self.T, reads)
+        self.assertEqual(bot._ws_books_used, 1)
+        self.assertEqual(self._quotes(bot), before)
+
+    def test_on_mode_falls_back_to_rest_without_a_trusted_book(self):
+        bot, reads = self._bot("on")
+        bot._ws = _FakeFeed()                             # no book yet
+        bot.run_cycle()
+        self.assertIn(self.T, reads)
+        self.assertEqual(bot._ws_rest_fallback, 1)
+
+
+class TestWSStaleQuoteCheck(unittest.TestCase):
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append(oid) or True
+
+    def _mode(self, mode, fast=False):
+        for name, v in (("WS_MODE", mode), ("WS_FAST", fast)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _view(self, side="bid", px=49.0, rem=20.0, placed_ago=100.0, pad=False,
+              oid="o1"):
+        self.bot._resting_view = {self.T: [{
+            "order_id": oid, "side": side, "px": px, "rem": rem,
+            "placed": self.now - placed_ago, "pad": pad}]}
+
+    # our 20 is the only size at 49c; the next external bid is 47c
+    _AHEAD = ({0.47: 500.0, 0.49: 20.0}, {0.49: 1200.0})
+
+    def test_shadow_counts_each_stale_order_once_and_never_cancels(self):
+        self._mode("shadow")
+        self._view()
+        self.feed.books[self.T] = self._AHEAD
+        for dt in (0.0, 1.5, 3.0, 6.0):
+            self.feed.dirty = {self.T}
+            self.bot._ws_process_events(self.now + dt)
+        self.assertEqual(self.cancelled, [])
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+        self.assertFalse(self.bot._ws_wake)
+        self.assertEqual(len(self.bot._resting_view[self.T]), 1)
+
+    def test_shadow_fills_never_wake_the_loop(self):
+        self._mode("shadow")
+        self.feed.events = [("fill", {"client_order_id": "imm-x"})]
+        self.bot._ws_process_events(self.now)
+        self.assertEqual(self.bot._ws_fast["fills"], 1)
+        self.assertFalse(self.bot._ws_wake)
+
+    def test_live_fast_mode_cancels_on_the_second_look(self):
+        self._mode("on", fast=True)
+        self._view()
+        self.feed.books[self.T] = self._AHEAD
+        self.assertEqual(self.bot._ws_fast_check({self.T}, self.now), 0)
+        self.assertEqual(self.bot._ws_fast_check(set(), self.now + 1.5), 1)
+        self.assertEqual(self.cancelled, ["o1"])
+        self.assertTrue(self.bot._ws_wake)
+
+    def test_joined_pads_young_and_recovered_orders_are_left_alone(self):
+        self._mode("shadow")
+        self._view()
+        self.feed.books[self.T] = ({0.49: 520.0}, {0.49: 1200.0})   # others at 49
+        self.bot._ws_fast_check({self.T}, self.now, dry=True)
+        self.bot._ws_fast_check({self.T}, self.now + 2, dry=True)
+        self.feed.books[self.T] = self._AHEAD
+        self._view(pad=True)
+        self.bot._ws_fast_check({self.T}, self.now, dry=True)
+        self.bot._ws_fast_check({self.T}, self.now + 2, dry=True)
+        self._view(placed_ago=0.5)
+        self.bot._ws_fast_check({self.T}, self.now, dry=True)
+        self.bot._ws_fast_check({self.T}, self.now + 1.2, dry=True)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 0)
+        self._view()                                      # ahead, then recovers
+        self.bot._ws_fast_check({self.T}, self.now, dry=True)
+        self.feed.books[self.T] = ({0.49: 520.0}, {0.49: 1200.0})
+        self.bot._ws_fast_check({self.T}, self.now + 2, dry=True)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 0)
+        self.assertNotIn("o1", self.bot._ws_suspect)
+
+    def test_an_ask_left_ahead_mirrors_the_bid(self):
+        self._mode("shadow")
+        # our ask at 51c is a NO bid at 49c, alone there; next NO bid 47c
+        self._view(side="ask", px=51.0)
+        self.feed.books[self.T] = ({0.48: 500.0}, {0.47: 900.0, 0.49: 20.0})
+        self.bot._ws_fast_check({self.T}, self.now, dry=True)
+        self.bot._ws_fast_check({self.T}, self.now + 1.2, dry=True)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+
+    def test_resting_view_follows_this_cycles_cancels_amends_and_places(self):
+        b = self.bot
+        b._cycle_cancelled = {"o2"}
+        b._cycle_amended = {"o3": 47}
+        b.state.order_ages["o1"] = self.now - 50
+        resting = [
+            {"order_id": "o1", "ticker": self.T, "book_side": "bid", "yes_price": 48,
+             "remaining_count": 10},
+            {"order_id": "o2", "ticker": self.T, "book_side": "bid", "yes_price": 46,
+             "remaining_count": 10},
+            {"order_id": "o3", "ticker": self.T, "book_side": "ask", "yes_price": 52,
+             "remaining_count": 10}]
+        b.state.ledger["o4"] = {"order_id": "o4", "ticker": self.T, "book_side": "bid",
+                                "yes_price": 45, "yes_price_exact": None,
+                                "remaining_count": 5.0, "_placed_at": self.now}
+        b._build_resting_view(resting, self.now)
+        got = {o["order_id"]: (o["side"], o["px"], o["rem"])
+               for o in b._resting_view[self.T]}
+        self.assertEqual(got, {"o1": ("bid", 48.0, 10.0), "o3": ("ask", 47.0, 10.0),
+                               "o4": ("bid", 45.0, 5.0)})
+
+    def test_a_dry_cycle_builds_the_view_from_its_own_orders(self):
+        # a dry run's placements are sim orders, not ledger entries, so the
+        # view sees them on the NEXT cycle's resting read (live placements are
+        # in the ledger and join the view the cycle they are placed)
+        self._mode("shadow")
+        self.bot.cancel_order = IncentiveMarketMaker.cancel_order.__get__(self.bot)
+        self.bot.run_cycle()
+        self.bot.run_cycle()
+        view = self.bot._resting_view.get(self.T, [])
+        self.assertEqual({o["side"] for o in view}, {"bid", "ask"})
+        self.assertEqual({o["order_id"] for o in view},
+                         {oid for oid, o in self.bot.state.sim_orders.items()
+                          if o["ticker"] == self.T})
+
+
+class TestWSIdle(unittest.TestCase):
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def test_without_a_feed_it_just_sleeps(self):
+        t0 = time.time()
+        self.assertFalse(self.bot._idle(0.05, {"flag": False}))
+        self.assertGreaterEqual(time.time() - t0, 0.04)
+
+    def test_shadow_waits_the_full_time(self):
+        feed = _FakeFeed()
+        self.bot._ws = feed
+        with mock.patch.object(imm, "WS_MODE", "shadow"):
+            t0 = time.time()
+            self.assertFalse(self.bot._idle(0.6, {"flag": False}))
+        self.assertGreaterEqual(time.time() - t0, 0.55)
+
+    def test_a_busy_feed_is_looked_at_in_batches_not_per_message(self):
+        feed = _FakeFeed()
+        feed.event_flag.set()                         # always something new
+        self.bot._ws = feed
+        calls = []
+        self.bot._ws_process_events = lambda now_ts, in_cycle=False: calls.append(now_ts)
+        with mock.patch.object(imm, "WS_IDLE_BATCHES_PER_SEC", 4.0):
+            self.bot._idle(1.0, {"flag": False})
+        self.assertLessEqual(len(calls), 6)
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_fast_mode_returns_early_on_a_wake_after_the_min_gap(self):
+        self.bot._ws = _FakeFeed()
+        self.bot._ws_wake = True
+        self.bot._last_cycle_start = time.time() - 60
+        t0 = time.time()
+        self.assertTrue(self.bot._idle(5.0, {"flag": False}))
+        self.assertLess(time.time() - t0, 2.0)
+        self.bot._ws_wake = True
+        self.bot._last_cycle_start = time.time()
+        with mock.patch.object(imm, "WS_MIN_CYCLE_GAP_SECS", 60.0):
+            self.assertFalse(self.bot._idle(0.3, {"flag": False}))
+
+    def test_a_stop_ends_the_wait(self):
+        self.bot._ws = _FakeFeed()
+        t0 = time.time()
+        self.assertFalse(self.bot._idle(5.0, {"flag": True}))
+        self.assertLess(time.time() - t0, 1.0)
+
+
+class TestWSStart(unittest.TestCase):
+    def test_off_mode_starts_nothing(self):
+        with mock.patch.object(imm, "WS_MODE", "off"):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot._ws_start()
+        self.assertIsNone(bot._ws)
+
+    def test_without_a_signing_client_it_stays_off(self):
+        with mock.patch.object(imm, "WS_MODE", "shadow"):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot._ws_start()
+        self.assertIsNone(bot._ws)
+
+    def test_shadow_starts_a_signed_feed_for_our_fills(self):
+        made = {}
+
+        class _Feed:
+            def __init__(self, url, headers, **kw):
+                made.update(url=url, headers=headers, kw=kw)
+
+            def start(self):
+                made["started"] = True
+
+        client = FakeClient()
+        client.key_id = "kid"
+        client.sign_pss_text = lambda text: "sig:" + text
+        with mock.patch.object(imm, "WS_MODE", "shadow"), \
+                mock.patch.object(_kw, "KalshiFeed", _Feed):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot._ws_start()
+        self.assertIsNotNone(bot._ws)
+        self.assertTrue(made["started"])
+        h = made["headers"]()
+        self.assertEqual(h["KALSHI-ACCESS-KEY"], "kid")
+        self.assertEqual(h["KALSHI-ACCESS-SIGNATURE"],
+                         "sig:" + h["KALSHI-ACCESS-TIMESTAMP"] + "GET/trade-api/ws/v2")
+        self.assertTrue(made["kw"]["fill_filter"]({"client_order_id": "imm-run-x"}))
+        self.assertFalse(made["kw"]["fill_filter"]({"client_order_id": "other"}))
+        self.assertFalse(made["kw"]["want_order_groups"])
+
+    def test_a_feed_that_fails_to_start_leaves_the_bot_rest_only(self):
+        class _Boom:
+            def __init__(self, *a, **kw):
+                raise RuntimeError("no socket")
+
+        client = FakeClient()
+        client.sign_pss_text = lambda text: "sig"
+        with mock.patch.object(imm, "WS_MODE", "shadow"), \
+                mock.patch.object(_kw, "KalshiFeed", _Boom):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot._ws_start()
+        self.assertIsNone(bot._ws)
+
+    def test_stop_is_idempotent(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        feed = _FakeFeed()
+        bot._ws = feed
+        bot._ws_stop()
+        bot._ws_stop()
+        self.assertTrue(feed.stopped)
+        self.assertIsNone(bot._ws)
+
+
+class TestWSStatus(unittest.TestCase):
+    def test_status_file_carries_the_ws_block(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot._ws = _FakeFeed()
+        bot.write_status(datetime.now(timezone.utc))
+        with open(os.path.join(imm.STATUS_DIR, "status_incentive_mm.json"),
+                  encoding="utf-8") as f:
+            ws = json.load(f)["latency"]["ws"]
+        self.assertEqual(ws["mode"], imm.WS_MODE)
+        self.assertEqual(ws["feed"], {"healthy": True, "books_ok": 0})
+        self.assertEqual(ws["shadow"],
+                         {"compared": 0, "exact": 0, "top": 0, "ws_missing": 0})
+        self.assertIn("would_cancel", ws["fast_stats"])
+
+
 if __name__ == "__main__":
     unittest.main()

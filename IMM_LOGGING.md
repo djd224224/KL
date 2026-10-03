@@ -180,6 +180,16 @@ places; `test_imm_risk_controls.BotRiskLineContractTests` fails if they drift.
 The account part is missing when the floor check did not run that cycle or
 read nothing. The open-scan part is missing while the tier holds no book.
 
+### status `latency.ws` block
+
+Not a sink: since 2026-10-03 `status_incentive_mm.json` carries
+`latency.ws` -- the WebSocket feed (kalshi_ws.py) in shadow: feed health
+(connected, healthy, books_ok, want, gaps, resnapshots, errors, msgs), the
+shadow compare of every REST book read against the WS book (compared,
+exact, top, ws_missing) and the dry stale-quote counts (would_cancel). A
+live fast-path cancel (IMM_WS=on + IMM_WS_FAST=1, not enabled) would carry
+the orders-row cancel reason `ws_stale`.
+
 ## Two compatibility traps, both tested
 
 **Cycle-log columns are APPEND-ONLY.** `imm_reward_recon.py` reads the file
