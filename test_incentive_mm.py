@@ -3941,35 +3941,132 @@ class TestHaltRestartContinuity(unittest.TestCase):
         self.assertGreater(bot.state.halted_until, time.time())
 
 
+def _bal(cash: float, positions: float) -> dict:
+    """A /portfolio/balance response: cash in dollars, positions in CENTS."""
+    return {"balance_dollars": f"{cash:.4f}", "portfolio_value": int(round(positions * 100))}
+
+
 class TestBalanceFloor(unittest.TestCase):
+    """The account floor measures ACCOUNT VALUE -- cash + Kalshi's valuation of
+    the positions -- since 2026-10-03 (Jack: "make the balance guard use
+    account value. drop of $2k in a day should halt."). The cash version
+    halted at 01:40 ET 10/3 on inventory: cash $8,978 -> $3,882 while the
+    marked-to-market loss was ~$700."""
+
     def _bot(self):
         _clean_persist()
         return IncentiveMarketMaker(client=FakeClient(), live=False)
 
-    def test_anchor_then_halt_on_drop(self):
-        bot = self._bot()
-        now = datetime.now(timezone.utc)
-        bot.client.get_balance = lambda: {"balance_dollars": "6000.00"}
-        self.assertFalse(bot._check_balance_floor(now))       # anchors
-        self.assertEqual(bot.state.balance_day_start, 6000.0)
-        bot.client.get_balance = lambda: {"balance_dollars":
-                                          str(6000.0 - imm.BALANCE_DROP_HALT)}
-        self.assertTrue(bot._check_balance_floor(now))        # halts
-        self.assertGreater(bot.state.halted_until, time.time())
-        self.assertTrue(any(c == "balance_floor" for c, _m in bot.alerter.today))
+    def test_the_knob(self):
+        self.assertEqual(imm.ACCOUNT_DROP_HALT, 2000.0)
+        self.assertFalse(hasattr(imm, "BALANCE_DROP_HALT"))      # the cash knob is gone
+        self.assertEqual(imm.account_value_dollars(_bal(4302.0662, 20089.56)), 4302.0662 + 20089.56)
+        self.assertEqual(imm.account_value_dollars(
+            {"balance_dollars": "100.00", "portfolio_value_dollars": "50.25"}), 150.25)
+        self.assertIsNone(imm.account_value_dollars({"balance_dollars": "100.00"}))
 
-    def test_small_drop_and_read_failure_are_fine(self):
+    def test_anchor_then_halt_on_a_real_drop(self):
         bot = self._bot()
         now = datetime.now(timezone.utc)
-        bot.client.get_balance = lambda: {"balance_dollars": "6000.00"}
+        bot.client.get_balance = lambda: _bal(9000.0, 15000.0)
+        self.assertFalse(bot._check_balance_floor(now))       # anchors on value
+        self.assertEqual(bot.state.account_value_day_start, 24000.0)
+        bot.client.get_balance = lambda: _bal(9000.0, 15000.0 - imm.ACCOUNT_DROP_HALT)
+        self.assertTrue(bot._check_balance_floor(now))        # positions lost $2k: halts
+        self.assertGreater(bot.state.halted_until, time.time())
+        msgs = [m for c, m in bot.alerter.today if c == "balance_floor"]
+        self.assertTrue(msgs and "ACCOUNT VALUE dropped $2000" in msgs[0] and "positions" in msgs[0])
+
+    def test_buying_inventory_does_not_halt(self):
+        # the 10/3 01:40 ET case: cash -$5,097 into positions, ~-$700 marked
+        bot = self._bot()
+        now = datetime.now(timezone.utc)
+        bot.client.get_balance = lambda: _bal(8978.0, 15000.0)
         bot._check_balance_floor(now)
-        bot.client.get_balance = lambda: {"balance_dollars": "5500.00"}
+        bot.client.get_balance = lambda: _bal(3882.0, 15000.0 + 5097.0 - 700.0)
+        self.assertFalse(bot._check_balance_floor(now))
+        self.assertEqual(bot.state.halted_until, 0.0)
+        # ...while cash ALONE through a withdrawal / another bot's loss still trips it
+        bot.client.get_balance = lambda: _bal(8978.0 - 2000.0, 15000.0)
+        self.assertTrue(bot._check_balance_floor(now))
+
+    def test_small_drop_partial_read_and_read_failure_are_fine(self):
+        bot = self._bot()
+        now = datetime.now(timezone.utc)
+        bot.client.get_balance = lambda: _bal(6000.0, 4000.0)
+        bot._check_balance_floor(now)
+        bot.client.get_balance = lambda: _bal(5000.0, 3100.0)       # -$1,900
+        self.assertFalse(bot._check_balance_floor(now))
+        bot.client.get_balance = lambda: {"balance_dollars": "1.00"}  # no positions value
         self.assertFalse(bot._check_balance_floor(now))
         def boom():
             raise RuntimeError("api down")
         bot.client.get_balance = boom
         self.assertFalse(bot._check_balance_floor(now))
         self.assertEqual(bot.state.halted_until, 0.0)
+
+    def test_an_old_cash_anchor_is_not_carried(self):
+        # a state file written by the cash version carries balance_day_start;
+        # the value floor ignores it and anchors fresh
+        bot = self._bot()
+        bot._save_persist()
+        with open(bot.PERSIST_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        data["balance_day_start"] = 3882.0
+        data.pop("account_value_day_start", None)
+        with open(bot.PERSIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot2.state.account_value_day_start, 0.0)
+        bot2.client.get_balance = lambda: _bal(4302.0, 20089.56)
+        self.assertFalse(bot2._check_balance_floor(datetime.now(timezone.utc)))
+        self.assertAlmostEqual(bot2.state.account_value_day_start, 24391.56)
+        # the 5am-CT roll (the daily summary's counter reset) re-arms the anchor
+        bot2.build_daily_summary()
+        self.assertEqual(bot2.state.account_value_day_start, 0.0)
+
+    def test_halt_sends_one_clear_email(self):
+        # Jack 2026-10-03: "i also need a clear email alert if halts due to
+        # balance guard" -- its own subject, the numbers, the way back
+        bot = self._bot()
+        now = datetime.now(timezone.utc)
+        sent = []
+        bot.alerter.enabled = True
+        bot.alerter.send_message = \
+            lambda body, subject="", html=None: sent.append((subject, body)) or True
+        bot.state.pnl_today_last = -300.0
+        bot.client.get_balance = lambda: _bal(9000.0, 15000.0)
+        bot._check_balance_floor(now)
+        bot.client.get_balance = lambda: _bal(7000.0, 14500.0)           # -$2,500
+        self.assertTrue(bot._check_balance_floor(now))
+        self.assertEqual(len(sent), 1)                                    # the dedicated email only
+        subject, body = sent[0]
+        self.assertTrue(subject.startswith(
+            "IMM HALTED: account value down $2,500 today (limit $2,000)"), subject)
+        self.assertLessEqual(len(body.split("\n")[0]), imm.SMS_MAX_CHARS)  # stands alone on SMS
+        for s in ("IMM HALTED by the account-value guard", "today's anchor:  $24,000.00",
+                  "(cash $7,000.00 + positions $14,500.00)", "IMM's own P&L today",
+                  "-$300.00", "$2,200.00", "another bot", "--clear-halt",
+                  "positions are NOT closed"):
+            self.assertIn(s, body)
+        # the halt is still on the daily summary's list
+        self.assertTrue(any(c == "balance_floor" for c, _m in bot.alerter.today))
+
+    def test_email_attribution_when_the_imm_explains_it(self):
+        _s, body = imm.balance_halt_email(2500.0, 24000.0, 21500.0, 4000.0, 10,
+                                          time.time() + 3600, -2400.0, True)
+        self.assertIn("$100.00", body)
+        self.assertNotIn("another bot", body)
+
+    def test_clear_halt_also_reanchors(self):
+        bot = self._bot()
+        bot.state.halted_until = time.time() + 3600
+        bot.state.account_value_day_start = 24000.0
+        bot._save_persist()
+        self.assertEqual(imm.main(["--clear-halt"]), 0)
+        with open(bot.PERSIST_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual((data["halted_until"], data["account_value_day_start"]), (0.0, 0.0))
 
 
 class TestHaltUntilRoll(unittest.TestCase):
@@ -4013,10 +4110,9 @@ class TestHaltUntilRoll(unittest.TestCase):
     def test_balance_floor_halt_lasts_until_the_roll(self):
         bot = self._bot()
         now = datetime.now(timezone.utc)
-        bot.client.get_balance = lambda: {"balance_dollars": "6000.00"}
+        bot.client.get_balance = lambda: _bal(6000.0, 4000.0)
         bot._check_balance_floor(now)
-        bot.client.get_balance = lambda: {"balance_dollars":
-                                          str(6000.0 - imm.BALANCE_DROP_HALT)}
+        bot.client.get_balance = lambda: _bal(6000.0 - imm.ACCOUNT_DROP_HALT, 4000.0)
         self.assertTrue(bot._check_balance_floor(now))
         self.assertEqual(bot.state.halted_until, imm._next_roll_utc(now).timestamp())
 

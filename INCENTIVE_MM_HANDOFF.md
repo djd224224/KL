@@ -6105,7 +6105,7 @@ cannot move: it settles there unmanaged (no hopeless exits, toxic halts or
 floor logic) unless closed by hand.
 
 RE-CHECK BEFORE GO-LIVE. Settings sized to the old account
-(IMM_BALANCE_DROP_HALT 5000, IMM_DAILY_LOSS_LIMIT 1200,
+(IMM_ACCOUNT_DROP_HALT 2000 -- account value since 10/3 --, IMM_DAILY_LOSS_LIMIT 1200,
 IMM_COLLATERAL_BUDGET 100000) and to its Advanced API tier
 (KALSHI_RATE_LIMIT_MS 25, 1000 placements/cycle at 12/s).
 
@@ -6314,3 +6314,50 @@ hysteresis, near-cliff composition, the end-to-end cycle resting x1.5 and
 back), the tracker's evening hm test; the suite neutralises both dated
 defaults at import. 1,913 green; with both forced on (FROM "" and the
 evening over all 24 hours) only the two code-default assertions differ.
+
+## 2026-10-03 — The account floor measures ACCOUNT VALUE and halts on a $2,000 daily drop, with its own email (Jack)
+
+Jack: "make the balance guard use account value. drop of $2k in a day
+should halt." and "i also need a clear email alert if halts due to balance
+guard".
+
+WHAT HAPPENED. 01:40 ET 10/3 the cash guard (IMM_BALANCE_DROP_HALT=5000 in
+the launcher, on balance_dollars) halted the bot until the 06:00 ET roll:
+"ACCOUNT balance dropped $5097 since the daily anchor ($8978 -> $3882)";
+3,590 orders cancelled. It was inventory, not loss: 502 fills since the
+Friday 06:00 ET anchor spent $9,565 of cash (the Saturday-stacked 400-lot
+ladder fills just after midnight among them) while the bot's marked-to-
+market trading P&L over the span was about -$700; the daily-loss halt never
+came close. The halt idled 4.3 hours of the week's most boosted window
+(flat modelled rewards 02:00-06:00 on the dashboard) and its dip clocks
+pushed members such as KXNFLESCALATORREC-26OCT05ATLNO-ATLDLONDON5 into the
+hopeless exit at 06:08, after which the over-budget selection kept them out.
+
+CHANGE.
+- account_value_dollars(balance) = balance_dollars + portfolio_value / 100
+  (Kalshi's own valuation of every position; send_portfolio_digest's
+  equity_kalshi). A response without a positions value skips the check
+  rather than falling back to cash.
+- ACCOUNT_DROP_HALT = IMM_ACCOUNT_DROP_HALT, $2,000 in code (a new name
+  because the measure changed; the launcher's IMM_BALANCE_DROP_HALT=5000 is
+  removed -- the running launcher's copy is ignored). 0 = off.
+- state.account_value_day_start replaces balance_day_start (persisted the
+  same way, zeroed at the 5am-CT roll); an old cash anchor in the state file
+  is ignored, so the first check on the new code anchors on value.
+- --clear-halt also zeroes the anchor: before, a deliberate resume re-read
+  the same drop against the old anchor and halted again at once.
+- THE EMAIL. balance_halt_email: subject "IMM HALTED: account value down $X
+  today (limit $2,000) - orders cancelled until <roll, ET>"; body: a first
+  line that stands alone on an SMS gateway, anchor / now / cash + positions,
+  the IMM's own P&L today against the part of the drop it does not explain
+  (another bot, manual trading, a withdrawal, Kalshi re-pricing), what the
+  bot did (orders cancelled, positions ride, resumes at the roll) and how to
+  resume sooner. Sent directly; the generic alert is kept for the log and
+  the daily summary only (urgent=False), so one email per halt.
+- Startup logs cash and account value with the floor.
+
+Tests: TestBalanceFloor (the knob and the value read; a real $2,000 drop
+halts; the 10/3 inventory case does not, while a $2,000 cash withdrawal
+does; small drops, partial and failed reads; an old cash anchor is not
+carried; the roll re-arms; one clear email with the numbers; attribution;
+--clear-halt re-anchors) and TestHaltUntilRoll on value.

@@ -6309,7 +6309,7 @@ _CONFIG_CODE_KNOBS = (
     "ORDER_TTL_SECS", "PAD_BID_CENTS", "PAD_ASK_CENTS", "PAD_MIN_TICKS_BEHIND",
     "QUALIFY_PATIENCE_CYCLES", "BENCH_COOLDOWN_SECS", "MAX_MARKETS",
     "MAX_POSITION_CONTRACTS", "MAX_EVENT_CONTRACTS",
-    "COLLATERAL_BUDGET", "DAILY_LOSS_LIMIT", "RATE_FLOOR_TOTAL_ALT",
+    "COLLATERAL_BUDGET", "DAILY_LOSS_LIMIT", "ACCOUNT_DROP_HALT", "RATE_FLOOR_TOTAL_ALT",
     # both floors by their REAL global names (2026-09-12: "PAYOUT_FLOOR" had
     # never matched a global, so the exchange minimum was silently unhashed,
     # and the entry bar was never in the hash at all)
@@ -6514,11 +6514,84 @@ WATCHDOG_CYCLES = _env_int("IMM_WATCHDOG_CYCLES", 3)
 # pad_missing_side should make this ~impossible; page if it persists anyway.
 COVERAGE_ALERT_CYCLES = _env_int("IMM_COVERAGE_ALERT_CYCLES", 5)
 
-# Account-balance hard floor: the bot's risk math sees only its OWN book, but
-# the account is shared (crypto fleet, cloud bots, manual). If the balance
-# drops this much below the daily anchor — whatever the source — halt and
-# page. Deposits/withdrawals move the balance too; the alert says so. 0 = off.
-BALANCE_DROP_HALT = _env_float("IMM_BALANCE_DROP_HALT", 2500.0)
+# Account hard floor: the bot's risk math sees only its OWN book, but the
+# account is shared (crypto fleet, cloud bots, manual). If the ACCOUNT VALUE
+# drops this much below the daily anchor -- whatever the source -- halt and
+# page. Deposits/withdrawals move it too; the alert says so. 0 = off.
+# ACCOUNT VALUE, not cash (Jack 2026-10-03: "make the balance guard use
+# account value. drop of $2k in a day should halt."): cash plus Kalshi's own
+# valuation of every position (balance_dollars + portfolio_value), the
+# equity send_portfolio_digest reports. The cash version tripped at 01:40 ET
+# 10/3 on INVENTORY -- cash $8,978 -> $3,882 as the Saturday-stacked
+# 400-lot fills turned cash into positions, while the bot's marked-to-market
+# trading P&L over the span was only about -$700 -- cancelled all 3,590
+# orders and idled the most boosted 4.3 hours of the week. Buying inventory
+# moves value from cash into positions and leaves this sum alone; losses,
+# other bots, manual trading and withdrawals still move it. A new knob name
+# (was IMM_BALANCE_DROP_HALT, cash, 5000 in the launcher) because the
+# measure changed; the anchor (account_value_day_start) re-arms on the first
+# check and at every 5am-CT roll.
+ACCOUNT_DROP_HALT = _env_float("IMM_ACCOUNT_DROP_HALT", 2000.0)
+
+
+def account_value_dollars(balance: dict) -> Optional[float]:
+    """Cash + Kalshi's valuation of the positions from one /portfolio/balance
+    response, in dollars; None when the positions value is missing (cash
+    alone is exactly the measure that misfires on inventory)."""
+    cash = float(balance.get("balance_dollars") or 0.0)
+    if balance.get("portfolio_value_dollars") is not None:
+        return cash + float(balance["portfolio_value_dollars"])
+    if balance.get("portfolio_value") is not None:
+        return cash + float(balance["portfolio_value"]) / 100.0     # cents
+    return None
+
+
+def balance_halt_email(drop: float, anchor: float, value: float, cash: float,
+                       n_cancelled: int, halted_until: float, imm_pnl_today: float,
+                       live: bool) -> Tuple[str, str]:
+    """(subject, plain-text body) of the account-value halt email (Jack
+    2026-10-03: "i also need a clear email alert if halts due to balance
+    guard"). Its own subject line, never the generic "balance_floor alert"
+    of 10/3 01:40 ET; the first body line stands alone (an SMS gateway gets
+    the first 300 characters and no subject)."""
+    until = datetime.fromtimestamp(halted_until, timezone.utc).astimezone(ET)
+    until_s = until.strftime("%a %b %d, %I:%M %p ET").replace(" 0", " ")
+    positions = value - cash
+    imm_loss = max(0.0, -imm_pnl_today)
+    elsewhere = max(0.0, drop - imm_loss)
+    sign = "+" if imm_pnl_today >= 0 else "-"
+    subject = (f"IMM HALTED: account value down ${drop:,.0f} today "
+               f"(limit ${ACCOUNT_DROP_HALT:,.0f}) - orders cancelled until {until_s}")
+    body = "\n".join([
+        f"IMM HALTED by the account-value guard: down ${drop:,.0f} since today's anchor "
+        f"(limit ${ACCOUNT_DROP_HALT:,.0f}). {n_cancelled:,} IMM orders cancelled; "
+        f"no quoting until {until_s}.",
+        "",
+        "ACCOUNT VALUE = cash + Kalshi's value of every position on the account",
+        f"  today's anchor:  ${anchor:,.2f}",
+        f"  now:             ${value:,.2f}  (cash ${cash:,.2f} + positions ${positions:,.2f})",
+        f"  change:          -${drop:,.2f}",
+        "",
+        "WHERE IT CAME FROM",
+        f"  IMM's own P&L today (realized + marked): {sign}${abs(imm_pnl_today):,.2f}",
+        f"  not explained by the IMM's P&L:           ${elsewhere:,.2f}"
+        + ("  <- another bot, manual trading, a withdrawal, or Kalshi re-pricing "
+           "positions" if elsewhere >= 0.25 * drop else ""),
+        "",
+        "WHAT THE BOT DID",
+        f"  - cancelled {n_cancelled:,} resting IMM orders; positions are NOT closed (they ride)",
+        f"  - quotes nothing until {until_s} (the {SUMMARY_HOUR_CT}am CT roll), then resumes",
+        "    on its own against a fresh anchor",
+        "",
+        "TO RESUME SOONER (deliberately)",
+        "  stop the 'KL incentive_mm' task, run  python incentive_mm.py --clear-halt",
+        "  in C:\\Users\\jackd\\Documents\\KL, then start the task again. --clear-halt",
+        "  also re-anchors today's account value at the restart.",
+        "",
+        f"[{'LIVE' if live else 'DRY'}] Buying inventory only moves money from cash into "
+        "positions and never trips this guard (the cash version did, 10/3 01:40 ET).",
+    ])
+    return subject, body
 
 
 def _halt_day_key(now_utc: datetime) -> str:
@@ -10910,7 +10983,7 @@ class BotState:
     #   roll-day only) — realized resets on restart, so baselines alone can't
     #   survive one; the halt used to hand every restart a fresh loss budget
     pnl_today_last: float = 0.0          # last measured pnl_today (for persist)
-    balance_day_start: float = 0.0       # account balance at the daily anchor
+    account_value_day_start: float = 0.0  # account value (cash + positions) at the daily anchor
     watchdog_streak: int = 0             # consecutive selected-but-not-resting cycles
     consecutive_errors: int = 0
     # daily counters (reset when the summary sends)
@@ -11878,7 +11951,8 @@ class IncentiveMarketMaker:
             if data.get("halt_day_key") == _halt_day_key(datetime.now(timezone.utc)):
                 self.state.pnl_carry = float(data.get("pnl_today_carry") or 0.0)
                 self.state.halted_until = float(data.get("halted_until") or 0.0)
-                self.state.balance_day_start = float(data.get("balance_day_start") or 0.0)
+                self.state.account_value_day_start = float(
+                    data.get("account_value_day_start") or 0.0)
                 # open-scan tier P&L carry (same roll-day rule as pnl_carry)
                 self.state.scan_pnl_carry = float(data.get("scan_pnl_carry") or 0.0)
                 if self.state.halted_until > time.time():
@@ -12002,7 +12076,7 @@ class IncentiveMarketMaker:
                            "halt_day_key": _halt_day_key(datetime.now(timezone.utc)),
                            "pnl_today_carry": round(self.state.pnl_today_last, 2),
                            "halted_until": self.state.halted_until,
-                           "balance_day_start": round(self.state.balance_day_start, 2),
+                           "account_value_day_start": round(self.state.account_value_day_start, 2),
                            # peak-entry memory, pruned to TTL so it stays bounded
                            "est_peak": {t: [round(v[0], 4), round(v[1], 1)]
                                         for t, v in self._est_peak.items()
@@ -15262,32 +15336,48 @@ class IncentiveMarketMaker:
             self._save_persist()
 
     def _check_balance_floor(self, now_utc: datetime) -> bool:
-        """True = floor breached and the bot halted. Anchors the day's
-        starting balance on first sight; failure to read = no action."""
+        """True = floor breached and the bot halted. ACCOUNT VALUE (cash +
+        Kalshi's valuation of the positions, account_value_dollars) against
+        the day's anchor, set on first sight; a failed or partial read (no
+        positions value) = no action."""
         try:
-            bal = float(self.client.get_balance().get("balance_dollars") or 0.0)
+            b = self.client.get_balance()
+            value = account_value_dollars(b)
+            cash = float(b.get("balance_dollars") or 0.0)
         except Exception as e:
             log(f"{self.tag} ! balance read failed ({e}); floor check skipped")
             return False
-        if bal <= 0:
+        if value is None:
+            log(f"{self.tag} ! balance read carried no portfolio_value; floor check skipped")
             return False
-        if self.state.balance_day_start <= 0:
-            self.state.balance_day_start = bal
+        if value <= 0:
             return False
-        drop = self.state.balance_day_start - bal
-        if drop < BALANCE_DROP_HALT:
+        if self.state.account_value_day_start <= 0:
+            self.state.account_value_day_start = value
             return False
-        # until the roll that re-anchors balance_day_start (_next_roll_utc)
+        drop = self.state.account_value_day_start - value
+        if drop < ACCOUNT_DROP_HALT:
+            return False
+        # until the roll that re-anchors account_value_day_start (_next_roll_utc)
         self.state.halted_until = _next_roll_utc(now_utc).timestamp()
         n = self.cancel_all_bot_orders()
         self._save_persist()
+        anchor = self.state.account_value_day_start
+        # logged + kept for the daily summary; the EMAIL is the dedicated one below
         self.alerter.alert(
-            "balance_floor", f"ACCOUNT balance dropped ${drop:.0f} since the "
-            f"daily anchor (${self.state.balance_day_start:.0f} -> ${bal:.0f}) "
-            f">= ${BALANCE_DROP_HALT:.0f}; cancelled {n} IMM orders and halted "
+            "balance_floor", f"ACCOUNT VALUE dropped ${drop:.0f} since the "
+            f"daily anchor (${anchor:.0f} -> ${value:.0f}: "
+            f"cash ${cash:.0f} + positions ${value - cash:.0f}) "
+            f">= ${ACCOUNT_DROP_HALT:.0f}; cancelled {n} IMM orders and halted "
             f"until the {SUMMARY_HOUR_CT}am CT roll. NOTE: the account is shared — the cause may be "
             f"another bot, manual trading, or a withdrawal. --clear-halt to "
-            f"resume deliberately.", key="balance_floor")
+            f"resume deliberately.", key="balance_floor", urgent=False)
+        if self.alerter.enabled:
+            subject, body = balance_halt_email(
+                drop, anchor, value, cash, n, self.state.halted_until,
+                self.state.pnl_today_last, self.live)
+            if self.alerter.send_message(body, subject=subject):
+                log(f"{self.tag} balance-guard halt email sent: {subject}")
         return True
 
     def run_cycle(self, fast_only: bool = False) -> None:
@@ -15317,10 +15407,10 @@ class IncentiveMarketMaker:
             log(f"{self.tag} daily-loss halt active until "
                 f"{datetime.fromtimestamp(self.state.halted_until, timezone.utc)}; idle")
             return
-        # Account-balance hard floor: shared-account backstop against ANY
+        # Account-value hard floor: shared-account backstop against ANY
         # bot's malfunction (or this one's blind spots). Anchored at the
         # daily roll; deposits/withdrawals also move it — the alert says so.
-        if BALANCE_DROP_HALT > 0 and self.live and self._check_balance_floor(now_utc):
+        if ACCOUNT_DROP_HALT > 0 and self.live and self._check_balance_floor(now_utc):
             return
 
         # Fills -> own book FIRST, before the positions read. Matched by ORDER
@@ -17265,7 +17355,7 @@ class IncentiveMarketMaker:
         s.day_baseline = self.pnl.total_realized() + unrealized
         s.pnl_carry = 0.0
         s.pnl_today_last = 0.0
-        s.balance_day_start = 0.0          # re-anchors on the next cycle
+        s.account_value_day_start = 0.0    # re-anchors on the next cycle
         # open-scan tier loss budget: same roll (baseline re-anchors on the
         # next cycle's measurement, carry cleared), and the loss-budget book
         # sheds markets that are flat AND no longer members — only here, so
@@ -18413,6 +18503,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"pnl carry={data.get('pnl_today_carry')})")
         data["halted_until"] = 0.0
         data["pnl_today_carry"] = 0.0
+        # ...and the account-value anchor: left alone, the first check after
+        # the restart sees the same drop and halts again at once
+        data["account_value_day_start"] = 0.0
         with open(path + ".tmp", "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(path + ".tmp", path)
@@ -18432,8 +18525,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     client = build_client()
     try:
-        log(f"[IMM] account balance ${float(client.get_balance().get('balance_dollars') or 0.0):,.2f} "
-            f"(key {KEY_ID[:8]}...)")
+        _bal = client.get_balance()
+        _val = account_value_dollars(_bal)
+        log(f"[IMM] account balance ${float(_bal.get('balance_dollars') or 0.0):,.2f} cash"
+            + (f", ${_val:,.2f} account value (cash + positions; halts on a "
+               f"${ACCOUNT_DROP_HALT:,.0f} drop from the daily anchor)"
+               if _val is not None and ACCOUNT_DROP_HALT > 0 else "")
+            + f" (key {KEY_ID[:8]}...)")
     except Exception as e:
         log(f"[IMM] ! account balance read failed ({e})")
 
