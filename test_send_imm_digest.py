@@ -229,7 +229,7 @@ class DashboardWindowsTests(_DigestTest):
                  "load_dashboard_summary": mock.Mock(return_value=self.summary),
                  "load_json": mock.Mock(return_value={}),
                  "current_mids": mock.Mock(return_value=({}, {})),
-                 "event_rows": mock.Mock(return_value=([], {}, {})),
+                 "resting_quotes": mock.Mock(return_value={}),
                  "capacity_rows": mock.Mock(return_value=[]),
                  "capacity_note": mock.Mock(return_value=""),
                  "cutoff_audit": mock.Mock(return_value={}),

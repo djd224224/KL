@@ -181,11 +181,12 @@ def current_mids(client, tickers):
     return mids, results
 
 
-def event_rows(client):
-    """Per-event rollup of the bot's own book. Returns (rows, totals, resting)."""
-    state = load_json(STATE_PATH)
-    pos, avg = own_book(state)
-
+def resting_quotes(client):
+    """The bot's resting imm- quotes, for the capacity table: {"collateral":
+    dollars they reserve, "orders": how many, "events": how many events they
+    quote}. Until 2026-10-03 this was event_rows(), which also rolled the
+    open book up per event and read its marks to do it; build_digest has
+    read only these resting totals since 2026-08-04."""
     # Resting imm- orders: which events are actively quoted + capital deployed.
     resting_by_event = {}
     resting_collateral = 0.0
@@ -220,45 +221,9 @@ def event_rows(client):
                 break
     except Exception as e:
         log(f"! resting-order read failed: {e}")
-
-    # This function only reports the CURRENT open book and resting quotes, so
-    # it no longer replays fills (the section's P&L windows are the
-    # dashboard's: dashboard_windows).
-    realized = {}
-    mids, _results = current_mids(client, set(pos))
-
-    events = {}
-    for t, p in pos.items():
-        ev = _event_of(t)
-        d = events.setdefault(ev, {"realized": 0.0, "unrealized": 0.0,
-                                   "net_pos": 0.0, "exposure": 0.0, "mkts": 0})
-        d["net_pos"] += p
-        d["mkts"] += 1
-        a = avg.get(t, 0.0)
-        mid = mids.get(t)
-        if mid is not None:
-            d["unrealized"] += p * (mid - a) / 100.0
-        d["exposure"] += (p * a if p > 0 else -p * (100 - a)) / 100.0
-    for t, r in realized.items():
-        ev = _event_of(t)
-        events.setdefault(ev, {"realized": 0.0, "unrealized": 0.0,
-                               "net_pos": 0.0, "exposure": 0.0, "mkts": 0})
-        events[ev]["realized"] += r
-
-    rows = []
-    tot = {"realized": 0.0, "unrealized": 0.0, "net_pos": 0.0, "exposure": 0.0}
-    for ev, d in events.items():
-        for k in tot:
-            tot[k] += d[k]
-        d["pnl"] = d["realized"] + d["unrealized"]
-        d["quoted"] = resting_by_event.get(ev, 0)
-        if (abs(d["realized"]) > 0.005 or abs(d["unrealized"]) > 0.005
-                or abs(d["net_pos"]) > 0.5 or d["quoted"] > 0):
-            rows.append((ev, d))
-    rows.sort(key=lambda r: -r[1]["pnl"])
-    return rows, tot, {"collateral": resting_collateral,
-                       "orders": sum(resting_by_event.values()),
-                       "events": len(resting_by_event)}
+    return {"collateral": resting_collateral,
+            "orders": sum(resting_by_event.values()),
+            "events": len(resting_by_event)}
 
 
 # Rewards actually CREDITED by Kalshi. There is no credits endpoint (verified
@@ -1726,7 +1691,7 @@ def build_digest(now_utc: datetime):
     mids, _results = current_mids(client, set(pos))
     life_raw, _life_real, _life_unreal = lifetime_raw(state, mids)
     dw = dashboard_windows(load_dashboard_summary(), now_utc.timestamp())
-    _rows, _tot, resting = event_rows(client)     # resting quotes, for capacity
+    resting = resting_quotes(client)     # for the capacity table
     cap_rows = capacity_rows(state, status, resting,
                              _f(status.get("pnl_today")) if status else None)
     # Kalshi's event starts vs ours, for the PICK-OFF block (never raises).
