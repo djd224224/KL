@@ -10429,6 +10429,45 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
             bot.run_cycle()
             self.assertNotEqual(self._quotes(bot), [])
 
+    def test_x1_at_every_hour_and_a_net_cap_per_event(self):
+        # 2026-10-03 (Jack: "make the share market change"): the family takes
+        # no quiet-hours / Saturday / evening / yield-mode size, and an event
+        # nets at most SHARE_EVENT_CAP (every strike is one author's share)
+        sat_3am = imm.ET.localize(datetime(2026, 10, 3, 3, 0)).astimezone(timezone.utc)
+        mon_7pm = imm.ET.localize(datetime(2026, 10, 5, 19, 0)).astimezone(timezone.utc)
+        shares = ("KXANTHSHARE", "KXOPENSHARE", "KXGOOGSHARE", "KXDEEPSHARE",
+                  "KXBABASHARE", "KXXIAOMISHARE", "KXZAISHARE", "KXMISTRALSHARE",
+                  "KXTENCENTSHARE", "KXSTEALTHSHARE")
+        with mock.patch.object(imm, "HOUR_SIZE_MULTS", imm._parse_hour_mults("0-9:2.0")), \
+                mock.patch.object(imm, "HOUR_SIZE_MULTS_NEXT", {}), \
+                mock.patch.object(imm, "SAT_SIZE_MULT", 1.5), \
+                mock.patch.object(imm, "EVENING_SIZE_MULTS", {h: 1.5 for h in range(18, 22)}):
+            self.assertEqual(imm.hour_size_mult("KXGOOD", sat_3am), 3.0)   # the long-dated book
+            for s in shares:
+                self.assertEqual(imm.hour_size_mult(s, sat_3am), 1.0, s)
+                self.assertEqual(imm.hour_size_mult(s, mon_7pm), 1.0, s)
+                self.assertEqual(imm.hour_scaled_levels(s, sat_3am), imm.base_scaled_levels(s))
+                self.assertFalse(imm.yield_size_eligible(s), s)
+                self.assertEqual(imm.event_cap_contracts(f"{s}-26OCT05"), imm.SHARE_EVENT_CAP)
+        self.assertEqual(imm.SHARE_EVENT_CAP, 100)
+        # Vercel's open-weights series is not this family
+        self.assertEqual(imm.event_cap_contracts("KXOPENSOURCESHARE-26OCT05"),
+                         imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult("KXOPENSOURCESHARE"))
+        self.assertIn("SHARE_EVENT_CAP", imm._CONFIG_CODE_KNOBS)
+        # the cap binds the quote loop: an event net long past it bids no
+        # strike and still offers (a small cap here keeps the per-market
+        # cap and the skew knees out of it)
+        self._write(mu=2.75, sigma=0.2)
+        for cap, bids in ((imm.SHARE_EVENT_CAP, True), (20.0, False)):
+            with mock.patch.object(imm, "SHARE_EVENT_CAP", cap):
+                bot = self._bot()
+                bot.client.positions[self.T] = 25.0
+                bot.pnl.pos[self.T] = 25.0                     # ours, not manual
+                bot.run_cycle()
+                sides = {b for b, _ in self._quotes(bot)}
+                self.assertEqual("bid" in sides, bids, cap)
+                self.assertIn("ask", sides, cap)
+
 
 class TestGasBuddyFairGate(unittest.TestCase):
     """gasbuddy_fair.json -> load_gb_fair/gb_gate_reason -> the stand-aside on

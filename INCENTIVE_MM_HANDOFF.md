@@ -6533,3 +6533,98 @@ the Saturday 0-8 ET x6 may push the reservation past $300k on those nights.
 Also watch resting orders above 4,000 (untested on Kalshi) and placement-cap
 deferrals rising with the book. The gas / diesel x6 event caps double the
 correlated strikes per print.
+
+## 2026-10-03 — OpenRouter share: the fair runs on the chart's last 3 hours; the family quotes x1 and nets at most 100 per event (Jack)
+
+Jack: "am i getting sniped on the AI market share markets?", then "Can market
+share not quote in more real time?", then "Yes make the share market change
+and check it later".
+
+WHY. 10/01-10/03 (first 2.5 days live): ~$17.7 modeled rewards against
+-$79 of trading at Kalshi marks on the four 26OCT05 events (OpenAI -$59).
+Not latency sniping -- fills were +3.3c/ct at the fill and still +0.8c five
+minutes later -- but slow adverse selection: mark-outs went -1.2c at 30m and
+-2.4c at 2h. The run rate (plain average of the leaderboard's last day and
+trailing 7 days, the chart's week-to-date and its last 24h) lagged the live
+chart by hours. On 10/02 13-15Z OpenAI's share of the chart's last 3h fell
+from ~19% to ~16% while the model held mu 18.9. The bot bought 100 YES @17
+on 19.3 and 62 @81-82 on 18.1 (-$44 of the -$79), all at the quiet-hours
+x2 size. The 00:16Z daily leaderboard roll pushed the model UP (OpenAI mu
+18.53 -> 18.82) and the bot then bought ANTH 2.5 @59 (marked 17).
+
+EVIDENCE (the 48h of chart_hist snapshots, scratch backtest):
+- Forecast: the chart's last 3h / 6h predicted each author's share of the
+  next 12h to 0.85 / 0.86pp mean error, against 1.32 for the live blend
+  (OpenAI and Google about 1.2 vs 1.8-2.7).
+- The OpenAI drop was a regime change, not time of day: the same 3h UTC
+  block was 19.5% on Thursday and 16.5% on Friday.
+- The live gate rule replayed on every logged cycle (touch vs band +-
+  tol, both sides out):
+
+  | fair from | tol | fills stopped | their P&L | cycles out |
+  |---|---|---|---|---|
+  | live blend | 15c | 0 | $0 | 1% |
+  | chart 6h | 15c | 10 | -$43 | 26% |
+  | chart 3h | 15c | 12 | -$78 | 26% |
+  | chart 3h | 6c | 18 | -$72 | 51% |
+
+  The base is 31 testable fills, -$101 at the 17:28Z marks. Tightening the
+  LIVE blend only blocked winners. A tighter band on the 3h fair stopped no
+  more losers and doubled the time out, so the tolerance stays 15c.
+
+WHAT:
+- openrouter_share_fair: a named author's run-rate share is the chart's own
+  last SHARE_RUN_HOURS (IMM_SHARE_RUN_HOURS, 3) whenever the stored
+  snapshots cover the window (recent_delta now takes `hours`). The blend is
+  the fallback: the first hours of a week or of a fresh file, a week not yet
+  begun, and authors the chart folds into Others. Its spread is half the
+  range of the chart's shares over SHARE_SPREAD_HOURS
+  (IMM_SHARE_SPREAD_HOURS, 3,6,24). The total request rate keeps the blend,
+  because volume swings by hour of day.
+- New entry and pred fields: run_mode ("chart 3h" / "blend"), fast_share,
+  fast_hours and blend_share. The preds log carries run_mode, fast_share and
+  blend_share, for scoring the old blend against the new rate at
+  settlement.
+- incentive_mm `_share_x1`: the ten KX<AUTHOR>SHARE series take no
+  quiet-hours, Saturday or evening size (hour_size_mult 1.0) and no yield
+  mode (yield_size_eligible False).
+- `event_cap_contracts` is SHARE_EVENT_CAP (IMM_SHARE_EVENT_CAP, 100) for
+  them instead of the launcher's IMM_MAX_EVENT=1000. The quote loop's event
+  room is net YES, so a +127 OpenAI event bids no strike and still offers
+  every one.
+- SHARE_EVENT_CAP is in the config hash.
+- The same day IMM_EVENT_TOP_N_MULT=2 (the caps-doubled change above)
+  lets an event quote 6 strikes instead of 3. The 100 net cap bounds
+  the six together.
+
+DRY RUN on the 17:33Z inputs (old -> new mu, pp):
+- DeepSeek 21.58 -> 22.08. The 22.0 strike goes from ~10c to ~53c fair,
+  with the book at 26 and the bot short 75 YES. The gate now stands aside
+  instead of selling more.
+- OpenAI 18.18 -> 17.84. 18.1 goes to ~9c fair, book 26: no more YES bids.
+- Google 21.84 -> 22.50.
+- Anthropic 2.49 -> 2.38.
+
+KILL SWITCHES (env in run_incentive_mm.ps1, then restart_imm.ps1 -Task --
+the writer runs in the bot's own refresher thread): IMM_SHARE_RUN_HOURS=0
+restores the blend; IMM_SHARE_EVENT_CAP raises the cap;
+IMM_SHARE_FAIR_ENABLE=0 takes the family out.
+
+WATCH:
+- The fair file's run_mode "chart 3h" on all four events.
+- "share-fair stand-aside" lines on DEEP 22.0 / OPEN 18.1.
+- hour_mult 1.00 on every *SHARE row of the cycle log.
+- No new YES bids on KXOPENSHARE while its net is over 100.
+- A 3h window is noisy, so expect more stand-asides (about a quarter of
+  cycles on the replay). Rewards here were about $7/day.
+- Score the preds against the week of Sep 28 final in
+  openrouter_share_finals.jsonl, written once the week completes at 00:00Z
+  10/5. A check is scheduled for Monday 10/5 after the 10:00 ET settlement.
+
+Tests: test_openrouter_share_fair.py has 2 new tests (20 green). One covers
+the 3h rate, its spread from 3/6/24h, and the blend's volume and sigma. The
+other covers the fallbacks: no 3h snapshot, the knob at 0, an author folded
+into Others. TestOpenRouterShareFairGate.test_x1_at_every_hour_and_a_net_cap_per_event
+covers no hour, Saturday or evening mult; no yield mode; the cap 100 and
+Vercel's series untouched; and the quote loop bidding at cap 100 but not
+at cap 20 with +25 held.

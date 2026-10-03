@@ -1608,10 +1608,23 @@ def saturday_size_mult(series: str, now_utc: datetime) -> float:
     return gated_sat_mult(et.date()) or SAT_SIZE_MULT
 
 
+def _share_x1(series: str) -> bool:
+    """An OpenRouter market-share series (KX<AUTHOR>SHARE). Since 2026-10-03
+    (Jack: "make the share market change") the family quotes x1 at every
+    hour -- no quiet-hours, Saturday, evening or yield-mode size -- and nets
+    at most SHARE_EVENT_CAP per event. The worst fills of 10/01-10/03 were
+    100-lots at the quiet-hours x2 while the book ran over a lagging fair.
+    Read at call time: SHARE_FAIR_SERIES is defined with the gate below."""
+    return series in globals().get("SHARE_FAIR_SERIES", ())
+
+
 def hour_size_mult(series: str, now_utc: datetime) -> float:
     """Active ladder multiplier for this series at this instant: the
     hour-of-day window (global or per-series) times the Saturday multiplier;
-    1.0 when neither applies."""
+    1.0 when neither applies, and always for the OpenRouter market-share
+    family (_share_x1)."""
+    if _share_x1(series):
+        return 1.0
     return _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
 
 
@@ -1935,12 +1948,21 @@ def series_of(ticker: str) -> str:
 
 MAX_POSITION_CONTRACTS = _env_float("IMM_MAX_POSITION", 100)   # per market (user spec)
 MAX_EVENT_CONTRACTS = _env_float("IMM_MAX_EVENT", 500)         # net per event (user spec)
+# OpenRouter market-share events (2026-10-03): every strike is one author's
+# share, so the event's net YES is one bet. On 10/02 the bot built +222 YES
+# across three OpenAI strikes while OpenAI's share fell; the launcher's
+# IMM_MAX_EVENT=1000 never bound.
+SHARE_EVENT_CAP = _env_float("IMM_SHARE_EVENT_CAP", 100)
 
 
 def event_cap_contracts(event_ticker: str) -> float:
     """Per-event net cap, scaled commensurately with the family ladder
-    multiplier (mention x1.5 -> event cap 750; Jack 2026-07-28)."""
-    return MAX_EVENT_CONTRACTS * applied_mention_mult(series_of(event_ticker))
+    multiplier (mention x1.5 -> event cap 750; Jack 2026-07-28); the
+    OpenRouter market-share family's is SHARE_EVENT_CAP (_share_x1)."""
+    series = series_of(event_ticker)
+    if _share_x1(series):
+        return SHARE_EVENT_CAP
+    return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
 # per market, but skew / one-sided books / churn / partial fills mean only a
@@ -5956,6 +5978,8 @@ def yield_size_eligible(series: str) -> bool:
     """May a market of this series take the yield size mode at all?"""
     if is_daily_series(series) or series in SCAN_GUARDED_SERIES:
         return False
+    if _share_x1(series):
+        return False       # the OpenRouter share family stays x1 (2026-10-03)
     if series in FINECON_SERIES or series in FINECON_FAMILY:
         return False
     # a family multiplier, or a hand-tuned ladder / cap / quote-all spec
@@ -6401,7 +6425,7 @@ _CONFIG_CODE_KNOBS = (
     # fair file's "model" block (openrouter_share_fair.py)
     "SHARE_FAIR_ENABLE", "SHARE_FAIR_TOL_CENTS", "SHARE_FAIR_TTL_MIN",
     "SHARE_FAIR_SIGMA_LO_FRAC", "SHARE_FAIR_REFRESH_HOLD_MIN",
-    "SHARE_CUTOFF_FROM_CLOSE_MIN", "SHARE_EVENT_TOP_N",
+    "SHARE_CUTOFF_FROM_CLOSE_MIN", "SHARE_EVENT_TOP_N", "SHARE_EVENT_CAP",
     # monthly rain gate (2026-10-01); model knobs ride in its file's "model"
     "RAIN_MONTHLY_ENABLE", "RAIN_MONTHLY_TOL_CENTS", "RAIN_MONTHLY_TTL_MIN",
     "RAIN_MONTHLY_DRY_MIN", "RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN",
@@ -7436,6 +7460,11 @@ def or_gate_reason(ticker: str, now_ts: float,
 #     SHARE_FAIR_TOL_CENTS.
 # Kill switch IMM_SHARE_FAIR_ENABLE=0 takes the family out of the allowlist
 # (never quoted without the gate).
+# 2026-10-03 (Jack: "make the share market change"): the fair's run rate is
+# the chart's own last 3 hours (openrouter_share_fair.SHARE_RUN_HOURS), the
+# family quotes x1 at every hour and nets at most SHARE_EVENT_CAP per event
+# (_share_x1). The tolerance stays 15c: on the 10/01-10/03 replay a tighter
+# band stopped no more losing fills and stood aside half the time.
 SHARE_FAIR_ENABLE = _SHARE_LIVE
 SHARE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_SHARE_FAIR_SERIES", _DEFAULT_OR_SHARE_SERIES).split(",") if s.strip())

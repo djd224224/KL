@@ -237,6 +237,68 @@ class TestModel(unittest.TestCase):
         self.assertIsNone(g["recent_share"])
         self.assertAlmostEqual(g["rate_share"], 100 * (0.18 + 0.20 + 0.21) / 3, places=3)
 
+    def _trend_hist(self, thu_noon, cur):
+        # 1e9 requests a day; author a ran 15% over the last 3h, 17% over
+        # the last 6h and 20% over the last 24h (falling); b 10% throughout
+        def back(hours, a_reqs):
+            tot = 1e9 * hours / 24.0
+            b = 0.10 * tot
+            return {"t": (thu_noon - timedelta(hours=hours)).timestamp(), "x": "2026-09-28",
+                    "ys": {"a": cur["a"] - a_reqs, "b": cur["b"] - b,
+                           "Others": cur["Others"] - (tot - a_reqs - b)}}
+        return [back(24, 0.20e9), back(6, 0.17 * 0.25e9), back(3, 0.15 * 0.125e9)]
+
+    def test_the_chart_last_hours_set_the_run_rate(self):
+        # 2026-10-03: a named author's run-rate share is the chart's last
+        # SHARE_RUN_HOURS (3h: 15%), its spread half the range over the
+        # 3/6/24h windows (15/17/20%); the total rate keeps the blend
+        thu_noon = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+        cur = {"a": 0.21 * 3.5e9, "b": 0.10 * 3.5e9, "Others": 0.69 * 3.5e9}
+        day = ({"a": 0.18e9, "b": 0.10e9, "c": 0.72e9}, 1e9)
+        wk = ({"a": 1.4e9, "b": 0.7e9, "c": 4.9e9}, 7e9)
+        f = osf.event_fair("a", self.W, thu_noon, self._hist(cur), date(2026, 9, 30), day,
+                           wk, {"a": 1.0}, chart_time=thu_noon,
+                           hist=self._trend_hist(thu_noon, cur))
+        self.assertEqual((f["run_mode"], f["fast_share"], f["fast_hours"]),
+                         ("chart 3h", 15.0, 3.0))
+        self.assertAlmostEqual(f["rate_share"], 15.0, places=3)
+        self.assertAlmostEqual(f["blend_share"], 100 * (0.18 + 0.20 + 0.20 + 0.21) / 4, places=3)
+        self.assertAlmostEqual(f["rate_spread"], (20.0 - 15.0) / 2, places=3)
+        rate_t = (1e9 + 1e9 + 1e9 + 3.5e9 / 3.5) / 4.0        # the blend's volume
+        want = 100 * (0.21 * 3.5e9 + 3.5 * rate_t * 0.15) / (3.5e9 + 3.5 * rate_t)
+        self.assertAlmostEqual(f["mu"], want, places=3)       # 18.0, not the blend's 20.4
+        want_sigma = math.sqrt((1.0 * 3.5 / 7) ** 2 + (2.5 * 3.5 / 7) ** 2
+                               + osf.SHARE_SIGMA_FLOOR ** 2)
+        self.assertAlmostEqual(f["sigma"], want_sigma, places=3)
+
+    def test_blend_without_the_last_hours(self):
+        thu_noon = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+        cur = {"a": 0.21 * 3.5e9, "b": 0.10 * 3.5e9, "Others": 0.69 * 3.5e9}
+        day = ({"a": 0.18e9, "b": 0.10e9, "c": 0.72e9}, 1e9)
+        wk = ({"a": 1.4e9, "b": 0.7e9, "c": 4.9e9}, 7e9)
+        hist = self._trend_hist(thu_noon, cur)
+        blend = 100 * (0.18 + 0.20 + 0.20 + 0.21) / 4
+        # only the 24h snapshot stored (a fresh file, the start of a week)
+        f = osf.event_fair("a", self.W, thu_noon, self._hist(cur), date(2026, 9, 30), day,
+                           wk, {"a": 1.0}, chart_time=thu_noon, hist=hist[:1])
+        self.assertEqual((f["run_mode"], f["fast_share"]), ("blend", None))
+        self.assertAlmostEqual(f["rate_share"], blend, places=3)
+        # the knob at 0 restores the blend everywhere
+        old = osf.SHARE_RUN_HOURS
+        osf.SHARE_RUN_HOURS = 0
+        try:
+            g = osf.event_fair("a", self.W, thu_noon, self._hist(cur), date(2026, 9, 30), day,
+                               wk, {"a": 1.0}, chart_time=thu_noon, hist=hist)
+        finally:
+            osf.SHARE_RUN_HOURS = old
+        self.assertEqual((g["run_mode"], g["fast_share"]), ("blend", None))
+        self.assertAlmostEqual(g["rate_share"], blend, places=3)
+        self.assertAlmostEqual(g["rate_spread"], 100 * (0.21 - 0.18) / 2, places=3)
+        # an author the chart folds into Others keeps the blend
+        h = osf.event_fair("c", self.W, thu_noon, self._hist(cur), date(2026, 9, 30), day,
+                           wk, {"a": 1.0}, chart_time=thu_noon, hist=hist)
+        self.assertEqual(h["run_mode"], "blend")
+
     def test_complete_week_and_future_week(self):
         cur = {"a": 0.2 * 7e9, "Others": 0.8 * 7e9}
         day = ({"a": 0.2e9, "c": 0.8e9}, 1e9)

@@ -26,7 +26,10 @@ after):
   s_a, R    run-rate share and requests/day: the plain average of the
             leaderboard's last complete day and trailing 7 days, the chart's
             week-to-date (once it holds a day's worth) and the chart's last
-            ~24 hours (from the snapshots this writer keeps)
+            ~24 hours (from the snapshots this writer keeps). Since
+            2026-10-03 s_a is the chart's own last SHARE_RUN_HOURS (3)
+            whenever the snapshots cover them, the blend only the fallback;
+            R keeps the blend.
   mu_a    = 100 (K_a + r R s_a) / (K_T + r R)
   sigma_a = SHARE_SIGMA_MULT sqrt((vol_a (r + gap) / 7)^2
                                   + (spread_a r / 7)^2 + SHARE_SIGMA_FLOOR^2)
@@ -36,7 +39,9 @@ qwen 0.59, z-ai 0.54, anthropic 0.43, mistralai 0.36); fewer than 4 changes
 -> SHARE_DEFAULT_VOL. Linear in r/7: a whole week ahead is one
 week-over-week change, the last day moves the week by a seventh of that
 day's surprise. spread_a = half the range of the run-rate estimators (they
-part while an author is on the move). gap = days between the data and
+part while an author is on the move) -- with the chart's last-hours rate,
+half the range of its shares over the last 3 / 6 / 24 hours
+(SHARE_SPREAD_HOURS). gap = days between the data and
 the start of a week not yet begun. p_ident = P(the author finishes among the
 SHARE_NAMED the chart names), normal on the margin to the boundary
 competitor. `complete` once W has ended (00:00Z Monday): from then on anyone
@@ -97,7 +102,25 @@ SHARE_DEFAULT_VOL = _env_float("IMM_SHARE_DEFAULT_VOL", 2.0)     # pp per week
 SHARE_VOL_WEEKS = int(_env_float("IMM_SHARE_VOL_WEEKS", 20))
 SHARE_NAMED = int(_env_float("IMM_SHARE_NAMED", 9))              # authors the chart names
 SHARE_CHART_MAX_AGE_MIN = _env_float("IMM_SHARE_CHART_MAX_AGE_MIN", 180)
-SHARE_RECENT_HOURS = _env_float("IMM_SHARE_RECENT_HOURS", 24)       # run-rate window
+SHARE_RECENT_HOURS = _env_float("IMM_SHARE_RECENT_HOURS", 24)       # the blend's chart window
+# The run rate's share comes from the chart's own last SHARE_RUN_HOURS once
+# the stored snapshots cover them (Jack 2026-10-03, after the book ran over
+# the blend: "make the share market change"); 0 = the four-way blend alone.
+# Its uncertainty is half the range of the chart's shares over
+# SHARE_SPREAD_HOURS. Backtest on 10/01-10/03: the last 3h predicted the
+# next 12h of each author's share to 0.85pp (blend 1.32pp), and under the
+# live gate it would have stopped fills worth -$78 of -$101.
+SHARE_RUN_HOURS = _env_float("IMM_SHARE_RUN_HOURS", 3)
+
+
+def _env_hours(name: str, default: str) -> Tuple[float, ...]:
+    try:
+        return tuple(float(x) for x in os.environ.get(name, default).split(",") if x.strip())
+    except ValueError:
+        return tuple(float(x) for x in default.split(","))
+
+
+SHARE_SPREAD_HOURS = _env_hours("IMM_SHARE_SPREAD_HOURS", "3,6,24")
 SHARE_HIST_HOURS = 48                                               # snapshots kept
 SHARE_LEADERBOARD_EVERY_SECS = _env_float("IMM_SHARE_LEADERBOARD_EVERY_SECS", 1800)
 SHARE_CATALOG_EVERY_SECS = _env_float("IMM_SHARE_CATALOG_EVERY_SECS", 6 * 3600)
@@ -315,16 +338,18 @@ def data_current(now: datetime, last_day: Optional[date],
 
 
 def recent_delta(hist: List[dict], week: date, chart_time: Optional[datetime],
-                 ys_now: Dict[str, float]) -> Optional[Tuple[Dict[str, float], float, float]]:
-    """The chart's last ~SHARE_RECENT_HOURS of week W: requests by named
-    author and in total since the stored snapshot nearest that far back (same
-    week, within 0.75-1.25x the window), and the days between. None without
-    one -- the first day of each week and of a fresh fair file. An author
-    named at only one end, or whose count fell (a revision), has no entry."""
+                 ys_now: Dict[str, float], hours: Optional[float] = None
+                 ) -> Optional[Tuple[Dict[str, float], float, float]]:
+    """The chart's last ~`hours` (default SHARE_RECENT_HOURS) of week W:
+    requests by named author and in total since the stored snapshot nearest
+    that far back (same week, within 0.75-1.25x the window), and the days
+    between. None without one -- the start of each week and of a fresh fair
+    file. An author named at only one end, or whose count fell (a revision),
+    has no entry."""
     if chart_time is None or not ys_now:
         return None
     now_t = chart_time.timestamp()
-    span = SHARE_RECENT_HOURS * 3600.0
+    span = (hours if hours else SHARE_RECENT_HOURS) * 3600.0
     cands = [h for h in hist or [] if str(h.get("x"))[:10] == week.isoformat()
              and now_t - 1.25 * span <= float(h.get("t") or 0) <= now_t - 0.75 * span]
     if not cands:
@@ -359,7 +384,18 @@ def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
     17.51 / 18.38 on the first three and 22.0 over the last 10 hours, while
     the book centred near 18.5 -- the plain average of all four lands there,
     any one alone misses by a point. The estimators part while an author is
-    on the move, so half their range, over the days to come, joins sigma."""
+    on the move, so half their range, over the days to come, joins sigma.
+
+    Since 2026-10-03 a named author's share of the run rate is the chart's
+    own last SHARE_RUN_HOURS instead, whenever the stored snapshots cover
+    that window (the blend stays the fallback: the first hours of a week or
+    of a fresh file, a week not yet begun, an author the chart folds into
+    Others). The book traded the live chart's last hours while the blend's
+    day-old windows lagged: on 10/02 OpenAI's last 3h fell from 19% to 16%
+    while the blend held 18.9%, and the bot bought its strikes from the
+    sellers. Its spread is then half the range of the chart's shares over
+    SHARE_SPREAD_HOURS (3/6/24h part while an author is on the move). The
+    total request rate keeps the blend: volume swings by hour of day."""
     d_by, d_tot = day_counts
     w_by, w_tot = week_counts
     wk = next((w for w in weeks if str(w["x"])[:10] == week.isoformat()), None)
@@ -394,6 +430,20 @@ def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
         xs = ests(a)
         s_rate[a] = sum(xs) / len(xs) if xs else 0.0
         spread[a] = 100.0 * (max(xs) - min(xs)) / 2.0 if xs else 0.0
+    # the chart's own last hours, for the authors it names (see docstring)
+    fast = None
+    if SHARE_RUN_HOURS > 0 and k_tot > 0:
+        fast = recent_delta(hist or [], week, chart_time, ys, SHARE_RUN_HOURS)
+    fast_set = set()
+    if fast is not None:
+        wins = [recent_delta(hist or [], week, chart_time, ys, h) for h in SHARE_SPREAD_HOURS]
+        wins = [w for w in wins if w is not None]
+        for a, n in fast[0].items():
+            s_rate[a] = n / fast[1]
+            fast_set.add(a)
+            xs = [w[0][a] / w[1] for w in wins if a in w[0]]
+            if len(xs) >= 2:
+                spread[a] = 100.0 * (max(xs) - min(xs)) / 2.0
     r = 7.0 - e
     gap = 0.0
     if chart_time is not None:  # a week not yet begun: the data ends at the chart
@@ -439,6 +489,12 @@ def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
             "recent_share": (round(100.0 * recent[0][author] / recent[1], 4)
                              if recent is not None and author in recent[0] else None),
             "recent_hours": round(recent[2] * 24.0, 2) if recent is not None else None,
+            "run_mode": (f"chart {SHARE_RUN_HOURS:g}h" if author in fast_set else "blend"),
+            "fast_share": (round(100.0 * fast[0][author] / fast[1], 4)
+                           if fast is not None and author in fast[0] else None),
+            "fast_hours": round(fast[2] * 24.0, 2) if fast is not None else None,
+            "blend_share": round(100.0 * (sum(ests(author)) / len(ests(author))), 4)
+            if ests(author) else None,
             "vol": round(vol.get(author, SHARE_DEFAULT_VOL), 3), "boundary": boundary,
             # moves once a day, when the leaderboard's day rolls (the chart
             # moves every few minutes and would hold the gate all day)
@@ -634,7 +690,9 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         _append(pred_path or SHARE_PRED_FILE,
                 [{"at": now.isoformat(), "event": ev, "mu": e["mu"], "sigma": e["sigma"],
                   "p_ident": e["p_ident"], "known": e["known"],
-                  "wtd_share": e["wtd_share"], "rate_share": e["rate_share"]}
+                  "wtd_share": e["wtd_share"], "rate_share": e["rate_share"],
+                  "run_mode": e.get("run_mode"), "fast_share": e.get("fast_share"),
+                  "blend_share": e.get("blend_share")}
                  for ev, e in live])
         pred_at = ts
     cur_sh = chart_shares(weeks[-1:])
@@ -656,7 +714,9 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                    "model": {"sigma_mult": SHARE_SIGMA_MULT, "sigma_floor": SHARE_SIGMA_FLOOR,
                              "default_vol": SHARE_DEFAULT_VOL, "vol_weeks": SHARE_VOL_WEEKS,
                              "named": SHARE_NAMED,
-                             "chart_max_age_min": SHARE_CHART_MAX_AGE_MIN}},
+                             "chart_max_age_min": SHARE_CHART_MAX_AGE_MIN,
+                             "run_hours": SHARE_RUN_HOURS,
+                             "spread_hours": list(SHARE_SPREAD_HOURS)}},
                   fh, indent=1, sort_keys=True)
     os.replace(tmp, path)
     return len(entries), len(missing)
