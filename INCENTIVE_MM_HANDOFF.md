@@ -6463,8 +6463,18 @@ X2 (10/3 ~14Z, Jack: "Raise to 2x multiplier"): POKE_SIZE_MULT 1.0 -> 2.0 in
 code -- 40 a side, net cap 300 per market. Scaling the x1 shares (~3% of
 the book) by ~1.9: a full-day period projects about $1.6 (Charizard, still
 marginal) to $3.5 (Mew R/RGB) for the six cards and ~$6.6 for the ETB, so
-most should be selected from the 04:00Z renewal; the rest of 10/3's period
-is too short for most of them.
+most should clear the floor from the 04:00Z renewal; the rest of 10/3's
+period is too short for most of them.
+
+BUDGET (10/3 14:29Z): at x2 Mew R/RGB ($2.00), Mew ex ($1.62) and the ETB
+($1.55) cleared the floor and the admission clock, then hit `budget`: the
+bot is over IMM_COLLATERAL_BUDGET ($100k) on sticky members alone (~$106k
+ladders + ~$24k inventory reserve), so NO newcomer from any family is
+admitted until members finish. Newcomers then enter by yield_per_contract,
+where the Pokemon markets (0.02-0.05) rank above the median member
+(0.007). No budget-only exemption exists (quote_all also skips the floors
+and manual-yield; FORCE_EVENTS keeps the budget). Jack 10/3, offered a
+KXPOKEMON budget exemption: "Wait for room".
 
 RISKS. Settlement: 26SEPCHA (Charmander, K 39.87) settled YES at 190.24
 while Collectr's Charmander promo 038 -- the product its July/August markets
