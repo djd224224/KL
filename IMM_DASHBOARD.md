@@ -188,6 +188,45 @@ freeze, open-scan family exclusion). **Unestimated pool** = no estimate yet but
 >= $500 left. These are models: standard ladder, full coverage, no competitor
 response.
 
+## IMM Pocket (the phone page)
+
+Jack 2026-10-03: "how can i ensure ... #drivers can be seen on mobile?",
+then "abbreviated to just the top section and families table", then
+"Scheduled Claude task every 30min". The full page cannot reach a phone (a
+file on this PC, 12 MB), so **IMM Pocket** is a private claude.ai page at
+https://claude.ai/artifact/4qqWauCV23mEMCUT1g8Lj9 (Claude app or claude.ai,
+signed in as Jack).
+
+- **Contents.** The summary hero (net, rewards, trading, at this time
+  yesterday), the cumulative curve, the four tiles, and one row per family,
+  with tap-to-expand detail:
+  - new fills, carry: marks, carry: settled
+  - fills and the 30m mark-out, edge, to date
+  - coverage, worst case
+  - quoting now, est and exp $/day, typical full day
+
+  Windows: Today / Yesterday / 24h / 7 days.
+- **Numbers.** `imm_pocket.py` reads the `const D` model out of the built
+  `imm_dashboard.html` and adds it up the way the page does (aggregate /
+  addM / derive / baseline). It ties to the page: 9:55 ET 10/03, net +$618,
+  rewards $1,009, trading -$391, fills 69, 1,771 markets quoting, worst
+  case -$14,882.
+- **Writes.** `imm_pocket.json` (~40 KB) and `imm_pocket.html` (the template
+  with the data embedded), both beside the dashboard.
+- **Refresh.** The page subscribes to its own database document
+  `pocket/latest`. The desktop app's scheduled Claude task
+  "imm-pocket-refresh" runs every 30 minutes:
+  1. `python imm_pocket.py --summary`
+  2. ArtifactData `set` of `pocket/latest` from `imm_pocket.json`
+  3. an open page redraws without a reload
+
+  It runs only while the Claude app is open on this PC. The chip at the top
+  says Live, Stale (over 45 min) or Snapshot (the copy built into the page,
+  shown when the database cannot be read).
+- **Template changes.** Edit `imm_pocket_template.html`, run the script,
+  read the whole `imm_pocket.html`, and republish to the same URL with
+  `url`. The data refresh never republishes the page.
+
 ## Knobs (environment)
 
 `IMM_DASH_DIR`, `IMM_DASH_HISTORY_DAYS` (30), `IMM_DASH_API_TTL_MIN` (60),
