@@ -6361,3 +6361,115 @@ halts; the 10/3 inventory case does not, while a $2,000 cash withdrawal
 does; small drops, partial and failed reads; an old cash anchor is not
 carried; the roll re-arms; one clear email with the numbers; attribution;
 --clear-halt re-anchors) and TestHaltUntilRoll on value.
+
+## 2026-10-03 — Pokemon (KXPOKEMON) allowlisted, quoted only against a TCGplayer fair (Jack)
+
+Jack: "are you able to quote KXPOKEMON-26OCTCHA based on Collectr realtime
+data", then "yes build the gate to quote all pokemon events".
+
+THE FAMILY. KXPOKEMON lists one "Up or Down" market per item per month around
+the 2nd, 22:00 ET: "If the Ungraded Price of the <item> on Collectr is above
+$<K> on Oct 31, 2026" -- K is Collectr's price at listing, strike_type
+greater, close 23:59 ET on the date; Kalshi settles on the Collectr price it
+reads just after (September: 04:31Z Oct 1). October: Charizard, Mew ex,
+Pikachu ex - 109 (30th Celebration), Mew - R/G/B RGB, the 30th Celebration
+Pokemon Center ETB -- $55/day each from 10/3 (the feed audit's "KXPOKEMON
+$370/day pool"). Before this the open scan treated KXPOKEMON as a candidate
+with no fair at all.
+
+THE FEED -- TCGplayer, never Collectr. Collectr has no public API: its
+backend (api-v2.getcollectr.com) 403s curl/python, and after ~30 calls from
+a real browser it served an AWS WAF "Human Verification" CAPTCHA. But
+Collectr's product ids ARE TCGplayer's, and its ungraded price is TCGplayer's
+Market Price for the printing -- or, with no Market Price, TCGplayer's listed
+median (26OCTMEWBRG's strike 5010.87 is exactly 717609's listed median). On
+10/3 Collectr matched TCGplayer within 1% on 11 of 13 cards; the two outliers
+were October underlyings that had just dropped on TCGplayer (Charizard 194.14
+on Collectr vs 171.77, Mew ex 84.40 vs 70.65). TCGplayer leads the settlement
+source by Collectr's refresh lag. Endpoints (undocumented, plain requests;
+flagged as a terms-of-use question before Jack's "yes build the gate" --
+no permission from TCGplayer itself): mpapi.tcgplayer.com/v2/product/<id>/pricepoints (market
++ listed median per printing), mp-search-api.tcgplayer.com/v2/product/<id>/
+details (sellers), and the site search (/v1/search/request, --suggest only).
+TCGplayer's latest-sales and price-history endpoints answer 403: not used.
+
+PRODUCT MAP (pokemon_products.json, tracked). Event ticker -> {item,
+tcgplayer_id, printing, kind}, keyed by EVENT because Kalshi reuses codes
+(26SEPCHA was Charmander, 26OCTCHA is Charizard), and the map's item must
+equal the rules' item. The refresher re-reads the file when its mtime
+changes, so mapping a new month is a data push: the KL sync lands it within
+30 minutes, with no restart. An unmapped event is stood aside and named in
+the "poke-fair refresh: ... unmapped" log line. `python pokemon_fair.py
+--suggest` lists TCGplayer candidates per unmapped event (exact names first,
+" - 158/128" stripped as Collectr strips it) with their price against the
+strike; the strike equals the right product's price at listing, often to the
+cent. EVERY MONTH (~the 2nd, 22:00 ET) the new events need entries.
+
+FAIR (pokemon_fair.py; refresher thread "poke-fair", in-memory snapshot +
+run-logs/incentive-mm/pokemon_fair.json). Kalshi's open KXPOKEMON markets
+(signed via fair_reader()) and TCGplayer seller counts every 15 min, each
+mapped item's pricepoints every IMM_POKE_FAIR_REFRESH_SECS (180).
+- V0 = TCGplayer's market price for the mapped printing, else the listed
+  median (Collectr's rule). |ln(V0/K)| > 0.7 reads as a wrong product.
+- ln(V/V0) ~ N(mu tau, sigma^2 tau), tau = months to the close;
+  P = Phi((ln(V0/(K + 0.005)) + mu tau) / (sigma sqrt(tau))). Calibrated on
+  the 53 settled Jul-Sep KXPOKEMON markets (strike -> settlement; the
+  26SEPCHA mis-settlement dropped): cards mean -9.0% sd 15.0% a month (n 25),
+  sealed -4.4% sd 7.1% (n 28), 11/53 at-the-money strikes YES. Defaults
+  shrink the drift a third toward zero and widen sigma: cards mu -6% sigma
+  18%, sealed -3% / 8% (IMM_POKE_MU_* / IMM_POKE_SIGMA_*).
+- THIN items (under 15 sellers, or no market price) move only on a sale:
+  q = exp(-1 x tau) the chance nothing sells, P = q [V0 > K] + (1 - q)
+  P(sigma 25%). The October RGB Mews and the 30th Pikachu sit AT their
+  strikes (one seller for the Pikachu), so an unmoved price is a NO.
+- A read that moves V0 5%+ stamps moved_at.
+
+GATE (poke_gate, quote loop after the mortgage gate, guard "poke_fair";
+guard sweep 34 -> 35; the probe ladder runs it too, so a stood-aside market
+estimates at zero). Stand aside (cancel) on no read, a snapshot or an item
+price older than IMM_POKE_FAIR_TTL_MIN (20), an err entry (unmapped, rules
+naming another item, strike/date mismatch, no TCGplayer price or seller
+count, a price ~2x from K), for IMM_POKE_MOVE_HOLD_MIN (15) after a 5% jump,
+or a touch fighting the fair by more than IMM_POKE_BAND_TOL_CENTS (30) on
+the adverse side. Otherwise every bid <= fair - IMM_POKE_FAIR_TOL_CENTS
+(15) and every ask >= fair + 15 (mort_cap_quotes, applied last). The band
+is wider than the caps on purpose (the mortgage gate uses 15 for both):
+these books anchor on Collectr's stale print while the fair reads TCGplayer
+ahead of it, so a 15-30c gap is the expected disagreement, and the side the
+caps leave is the side it favours (10/3: ETB bid 32 vs fair 13, Mew ex 24 vs
+7 -- both stood aside under a 15c band). Size x1 (IMM_POKE_SIZE_MULT), band
+1-99c. CUTOFF close - IMM_POKE_CUTOFF_FROM_CLOSE_MIN (4320 = 72h),
+close-anchored, which also keeps the ticker-date rule from reading
+26OCT30TCELPO as Oct 30 or 26AUG151ULTCO as Aug 15.
+
+DRY CHECK 10/3 12:53Z (live books, the bot's own gate): ETB fair 13.3 on
+32x70 -> asks >= 29 only; Charizard 15.3 on 22x82 -> asks >= 31 only; Mew ex
+7.4 (TCGplayer 69.40) on 24x78 -> asks >= 23 only; the three RGB Mews and
+the Pikachu 24.9 (thin) on ~20x80 -> bids <= 9, asks >= 40. All seven quote,
+mostly the NO side.
+
+RISKS. Settlement: 26SEPCHA (Charmander, K 39.87) settled YES at 190.24
+while Collectr's Charmander promo 038 -- the product its July/August markets
+tracked to the cent -- was ~$26.7; the October Charizard reuses the code.
+Manipulation: on the thin items one TCGplayer sale sets the price, so the
+last days (the 72h cutoff) and the x1 size are deliberate. The endpoints are
+undocumented and can change; every failure fails closed.
+
+KILL SWITCHES: IMM_POKE_ENABLE=0 (family out); IMM_ALLOW_POKE_SERIES="".
+
+WATCH AFTER DEPLOY: startup "pokemon gate: KXPOKEMON fail-closed on
+pokemon_fair's TCGplayer read ...", "poke-fair refresh: 7/7 markets priced",
+pokemon_fair.json refreshing every 3 min, "pokemon stand-aside / resume"
+lines, no KXPOKEMON order within 15c of the status file's fair. Around Nov 2
+22:00 ET: the November events list unmapped and stand aside until mapped.
+
+Tests: TestPokemonFairGate (enrollment, the close-anchored cutoff beating a
+ticker date, every fail-closed reason incl. stale prices and the jump hold,
+the band vs the caps, the 10/3 Charizard and ETB books, the loop capping and
+lifting rungs, holding after a jump and standing aside past the band);
+test_pokemon_fair.py (20: the October rules as listed, Collectr's
+market-else-median read, the model and the thin mass, every entry doubt
+incl. the CHA code reuse, the watch end to end without the network --
+cadence, a live map reload, jump stamps, failed reads aging out, --suggest,
+and the shipped map against the listed rules). 1,952 green (unittest
+discover); the baked-path sweep caught POKE_STATUS_FILE before the fix.

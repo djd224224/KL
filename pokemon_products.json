@@ -1,0 +1,68 @@
+{
+  "_doc": [
+    "KXPOKEMON event -> the TCGplayer product its Collectr price mirrors (pokemon_fair.py).",
+    "Keyed by EVENT: Kalshi reuses codes across months (26SEPCHA was Charmander, 26OCTCHA is Charizard).",
+    "item = the name in the market's rules ('Ungraded Price of the <item> on Collectr'); a mismatch stands the event aside.",
+    "tcgplayer_id = Collectr's catalog id = TCGplayer's product id. printing = TCGplayer pricepoints printingType (Foil for holo cards, Normal for sealed).",
+    "kind = card | sealed (picks the model's drift and sigma). Re-read on change: no bot restart needed.",
+    "New month: python pokemon_fair.py --suggest lists TCGplayer candidates for the unmapped events; check the strike against the item's price at listing."
+  ],
+  "events": {
+    "KXPOKEMON-26OCTCHA": {
+      "item": "Charizard",
+      "tcgplayer_id": 714372,
+      "printing": "Foil",
+      "kind": "card",
+      "product": "Charizard - 4/102, ME: 30th Celebration Classic Collection",
+      "verified": "2026-10-03: Collectr #714372 ungraded Holofoil 194.14 = the strike"
+    },
+    "KXPOKEMON-26OCTMEWEX": {
+      "item": "Mew ex",
+      "tcgplayer_id": 696688,
+      "printing": "Foil",
+      "kind": "card",
+      "product": "Mew ex - 158/128, ME: 30th Celebration",
+      "verified": "2026-10-03: Collectr #696688 ungraded 84.40 = the strike"
+    },
+    "KXPOKEMON-26OCTPIKEX109": {
+      "item": "Pikachu ex - 109 (30th Celebration)",
+      "tcgplayer_id": 713256,
+      "printing": "Foil",
+      "kind": "card",
+      "product": "Pikachu ex - 109 (30th Celebration), ME: Mega Evolution Promo",
+      "verified": "2026-10-03: Collectr #713256 ungraded 299.99 = the strike (one TCGplayer listing, 299.99)"
+    },
+    "KXPOKEMON-26OCTMEWRRG": {
+      "item": "Mew - R/RGB",
+      "tcgplayer_id": 717607,
+      "printing": "Foil",
+      "kind": "card",
+      "product": "Mew - R/RGB, ME: 30th Celebration",
+      "verified": "2026-10-03: TCGplayer market 6000.27 = the strike"
+    },
+    "KXPOKEMON-26OCTMEWGRG": {
+      "item": "Mew - G/RGB",
+      "tcgplayer_id": 717608,
+      "printing": "Foil",
+      "kind": "card",
+      "product": "Mew - G/RGB, ME: 30th Celebration",
+      "verified": "2026-10-03: TCGplayer market 3738.75 = the strike"
+    },
+    "KXPOKEMON-26OCTMEWBRG": {
+      "item": "Mew - B/RGB",
+      "tcgplayer_id": 717609,
+      "printing": "Foil",
+      "kind": "card",
+      "product": "Mew - B/RGB, ME: 30th Celebration",
+      "verified": "2026-10-03: no TCGplayer market price; listed median 5010.87 = the strike"
+    },
+    "KXPOKEMON-26OCT30TCELPO": {
+      "item": "30th Celebration Pokemon Center Elite Trainer Box",
+      "tcgplayer_id": 704144,
+      "printing": "Normal",
+      "kind": "sealed",
+      "product": "30th Celebration Pokemon Center Elite Trainer Box, ME: 30th Celebration",
+      "verified": "2026-10-03: the set's only Pokemon Center ETB on TCGplayer (exact name); market 295.73 vs the 313.44 strike"
+    }
+  }
+}

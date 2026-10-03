@@ -128,6 +128,10 @@ def setUpModule():
     # only the refresher thread writes either, but never the live file
     imm.MORT_STATUS_FILE = os.path.join(tmp, "mortgage_fair.json")
     imm._mort_state["snap"] = None
+    # the Pokemon gate's status file and in-memory snapshot (2026-10-03):
+    # the same -- only its refresher thread writes them
+    imm.POKE_STATUS_FILE = os.path.join(tmp, "pokemon_fair.json")
+    imm._poke_state["snap"] = None
     # the data center count file (2026-10-01) is reloaded by every run_cycle
     imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
     imm._dc_state.update(mtime=0.0, entries={})
@@ -17211,6 +17215,159 @@ class TestMortgageFairGate(unittest.TestCase):
         self.assertIn(self.T, bot._mort_stood)
 
 
+class TestPokemonFairGate(unittest.TestCase):
+    """pokemon_fair's snapshot -> poke_gate / mort_cap_quotes -> KXPOKEMON
+    quoted only against the TCGplayer fair, never within POKE_FAIR_TOL_CENTS
+    of it (out entirely past POKE_BAND_TOL_CENTS), failing closed, out 72h
+    before the close (Jack 2026-10-03). The
+    fixture's event segment 67OCT151ULTCO parses as a ticker DATE (Oct 15,
+    like 26AUG151ULTCO did) -- the close-anchored cutoff must replace it.
+    Book 50x90."""
+
+    T = "KXPOKEMON-67OCT151ULTCO-932.18"
+    EV = "KXPOKEMON-67OCT151ULTCO"
+    CLOSE = datetime(2067, 11, 1, 3, 59, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        imm._poke_state["snap"] = None
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm._poke_state["snap"] = None
+
+    def _snap(self, p=0.70, age_secs=0.0, price_age_secs=0.0, err=None,
+              moved_secs_ago=None, ticker=None):
+        now = time.time()
+        e = {"event": self.EV, "item": "151 Ultra-Premium Collection",
+             "k": 932.18, "pid": 502000, "v0": 900.0, "src": "market",
+             "thin": False, "price_ts": now - price_age_secs,
+             "moved_at": None if moved_secs_ago is None else now - moved_secs_ago,
+             "last_move": None if moved_secs_ago is None else -0.08}
+        if err:
+            e = {"event": self.EV, "err": err}
+        else:
+            e["p"] = p
+        imm._poke_state["snap"] = {"ts": now - age_secs,
+                                   "markets": {ticker or self.T: e},
+                                   "unmapped": [], "errors": []}
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.5000", "yes_ask_dollars": "0.9000",
+            "volume_fp": "500.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.46", "400"], ["0.48", "400"], ["0.50", "400"]],
+            "no_dollars": [["0.06", "400"], ["0.08", "400"], ["0.10", "400"]]}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_enrolled_and_cut_off_from_the_close(self):
+        self.assertIn("KXPOKEMON", imm.ALLOW_SERIES)
+        self.assertTrue(imm.poke_series("KXPOKEMON"))
+        self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+        ov = imm.series_override("KXPOKEMON")
+        self.assertEqual((ov.cutoff_from_close_min, ov.size_mult,
+                          ov.price_min_cents, ov.price_max_cents),
+                         (4320, 1.0, 1, 99))
+        # the trap: the ticker-date rule reads 67OCT151ULTCO as Oct 15
+        self.assertEqual(imm.parse_event_date(self.EV),
+                         imm.ET.localize(datetime(2067, 10, 15)).astimezone(timezone.utc))
+        want = self.CLOSE - timedelta(hours=72)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXPOKEMON", self.EV, None, close_time=self.CLOSE), want)
+        # ...and the universe path takes the close-anchored cutoff instead
+        self._snap(p=0.70)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(bot.state.selected[self.T].cutoff, want)
+
+    def test_gate_reasons_fail_closed(self):
+        now = time.time()
+        r = lambda t=self.T, ts=now, b=50, a=90: \
+            imm.poke_gate(t, ts, b, a)[1].get("reason")
+        self.assertEqual(r(), "no_read")
+        self._snap(age_secs=imm.POKE_FAIR_TTL_MIN * 60 + 30)
+        self.assertEqual(r(), "stale")
+        self._snap()
+        self.assertEqual(r(t="KXPOKEMON-67OCT151ULTCO-932.19"), "no_market")
+        self._snap(err="unmapped event (pokemon_products.json)")
+        self.assertEqual(r(), "model")
+        self._snap(price_age_secs=imm.POKE_FAIR_TTL_MIN * 60 + 30)
+        self.assertEqual(r(), "stale_price")         # a fresh snapshot, an old price
+        self._snap(moved_secs_ago=60)
+        self.assertEqual(r(), "moved")
+        self._snap(moved_secs_ago=imm.POKE_MOVE_HOLD_MIN * 60 + 30)
+        self.assertIsNone(r())                       # the hold has run out
+        self._snap(p=0.50)
+        self.assertEqual(r(b=81), "band")            # bid over 50 + 30
+        self.assertEqual(r(a=19), "band")            # ask under 50 - 30
+        self.assertIsNone(r(b=80, a=20))             # at the band: quotes
+        self.assertEqual(imm.poke_gate(self.T, now, 79, 21)[2], (35, 65))
+        self._snap(p=0.70)
+        why, inputs, caps = imm.poke_gate(self.T, now, 50, 90)
+        self.assertEqual((why, caps), ("", (55, 85)))
+        self.assertEqual((inputs["fair"], inputs["pid"], inputs["k"],
+                          inputs["tol"], inputs["band_tol"]),
+                         (70.0, 502000, 932.18, 15, 30))
+        self._snap(p=0.90)                           # no ask room
+        self.assertEqual(imm.poke_gate(self.T, now, 50, 99)[2], (75, None))
+        self._snap(p=0.153)                          # Charizard on 10/3: NO side only
+        self.assertEqual(imm.poke_gate(self.T, now, 22, 82)[2], (None, 31))
+        self._snap(p=0.133)                          # the ETB on 10/3: bid 32 is
+        self.assertEqual(imm.poke_gate(self.T, now, 32, 71)[2], (None, 29))  # inside 30
+        with mock.patch.object(imm, "POKE_FAIR_TOL_CENTS", 60):
+            self._snap(p=0.50)
+            self.assertEqual(r(b=None, a=None), "decided")
+
+    def test_quotes_only_clear_of_the_fair(self):
+        bot = self._bot()
+        bot.run_cycle()         # no read: nothing -- the estimate is zero too
+        self.assertEqual(self._quotes(bot), [])
+        self.assertNotIn(self.T, bot.state.selected)
+
+        def cycle(p, **kw):
+            """(bid prices, ask prices) resting after a cycle at fair p (the
+            fixture's ladder is three rungs a side, 50/49/48 and 90/91/92)."""
+            self._snap(p=p, **kw)
+            bot.state.universe_at = 0.0                       # re-estimate
+            bot.run_cycle()
+            q = self._quotes(bot)
+            return ({px for s_, px in q if s_ == "bid"},
+                    {px for s_, px in q if s_ == "ask"})
+        self.assertEqual(cycle(0.70), ({48, 49, 50}, {90, 91, 92}))  # 55 / 85
+        self.assertNotIn(self.T, bot._poke_stood)
+        self.assertEqual(cycle(0.60), ({45}, {90, 91, 92}))   # bids capped at 45
+        self.assertEqual(cycle(0.80), ({48, 49, 50}, {95}))   # asks lifted to 95
+        # a TCGplayer jump: stand aside for the hold, then back
+        self._snap(p=0.70, moved_secs_ago=60)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._poke_stood)
+        self.assertEqual(cycle(0.70), ({48, 49, 50}, {90, 91, 92}))
+        self.assertNotIn(self.T, bot._poke_stood)
+        # bid touch 50 over 15 + 30: the whole market stands aside
+        self._snap(p=0.15)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._poke_stood)
+
+
 class TestGuardSkipSink(unittest.TestCase):
     """guard_skips_*.jsonl (2026-09-26): a market an in-loop guard skips wrote
     no cycle_log row that cycle, so what the guard saw was lost. Change-driven:
@@ -17372,8 +17529,9 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the Vercel pre-D gate (2026-09-27) + the mortgage gate
         # (2026-09-28) + the data center count gate (2026-10-01) + the
         # OpenRouter market-share gate (2026-09-30) + the monthly rain gate
-        # (2026-10-01) + the Treasury touch gate (2026-10-01)
-        self.assertEqual(len(conts), 34)
+        # (2026-10-01) + the Treasury touch gate (2026-10-01) + the Pokemon
+        # gate (2026-10-03)
+        self.assertEqual(len(conts), 35)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

@@ -3800,6 +3800,15 @@ _DEFAULT_RAIN_MONTHLY_SERIES = (
     "KXRAINAUSM,KXRAINCHIM,KXRAINCLLM,KXRAINCMHM,KXRAINDALM,KXRAINDENM,"
     "KXRAINHOUM,KXRAINLAXM,KXRAINLEXM,KXRAINMIAM,KXRAINMKEM,KXRAINNYCM,"
     "KXRAINPVDM,KXRAINSEAM,KXRAINSFOM,KXRAINSTPM")
+# POKEMON (Jack 2026-10-03: "yes build the gate to quote all pokemon events").
+# KXPOKEMON -- one "Up or Down" market per item per month on Collectr's
+# ungraded price, $55/day per market from 10/3 -- is enrolled here only with
+# the POKE_* gate: quoted against pokemon_fair's TCGplayer read (Collectr's
+# ungraded price IS TCGplayer's Market Price, read later), never within
+# POKE_FAIR_TOL_CENTS of the fair, fail closed; IMM_POKE_ENABLE=0 or
+# IMM_ALLOW_POKE_SERIES="" takes it out.
+_POKE_LIVE = os.environ.get("IMM_POKE_ENABLE", "1") == "1"
+_DEFAULT_POKE_SERIES = "KXPOKEMON"
 # US Treasury yield prints (Jack 2026-08-04: "allowlist KXUST10AD, KXUST2AD,
 # KXUST30AD, KXUST5AD, KXUST7AD"). These have sat at the TOP of the
 # quote-gaps ranking for days — $1,534/day pool per event x 5 tenors, 15
@@ -4032,6 +4041,10 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_RAIN_MONTHLY_SERIES",
                                         _DEFAULT_RAIN_MONTHLY_SERIES)
                          if _RAIN_MONTHLY_LIVE else "")
+                # Pokemon (2026-10-03): only while the Pokemon gate is on
+                + "," + (os.environ.get("IMM_ALLOW_POKE_SERIES",
+                                        _DEFAULT_POKE_SERIES)
+                         if _POKE_LIVE else "")
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
@@ -6406,6 +6419,11 @@ _CONFIG_CODE_KNOBS = (
     # ride in its status file's "model" block
     "MORT_ENABLE", "MORT_SERIES", "MORT_FAIR_TOL_CENTS", "MORT_FAIR_TTL_MIN",
     "MORT_FAIR_REFRESH_SECS", "MORT_CUTOFF_BUFFER_DAYS", "MORT_SIZE_MULT",
+    # Pokemon gate (2026-10-03); pokemon_fair's model knobs ride in its
+    # status file's "model" block
+    "POKE_ENABLE", "POKE_SERIES", "POKE_FAIR_TOL_CENTS", "POKE_BAND_TOL_CENTS",
+    "POKE_FAIR_TTL_MIN", "POKE_FAIR_REFRESH_SECS", "POKE_MOVE_HOLD_MIN",
+    "POKE_CUTOFF_FROM_CLOSE_MIN", "POKE_SIZE_MULT",
     # ROI scan (2026-09-27): admission clock, hourly-window auto-arm, the
     # planned-restart order handoff, the realized floor anchor and the
     # near-cliff room priority
@@ -8645,6 +8663,124 @@ def mort_cap_quotes(quotes: List["Quote"], bid_cap: Optional[int],
                 q = replace(q, price_cents=int(ask_floor), price_exact=None)
         out.append(q)
     return out
+
+
+# ----------------------------------------------------------------------------
+# POKEMON GATE (Jack 2026-10-03: "yes build the gate to quote all pokemon
+# events", after "are you able to quote KXPOKEMON-26OCTCHA based on Collectr
+# realtime data"). KXPOKEMON settles on Collectr's ungraded price the day
+# after the month's last day; Collectr's ungraded price is TCGplayer's
+# Market Price (or, with none, its listed median) read some hours later, so
+# the fair reads TCGplayer -- Collectr itself has no API and CAPTCHAs bots.
+#   - FAIR: pokemon_fair.py (refresher thread "poke-fair", every
+#     POKE_FAIR_REFRESH_SECS): per market P(V > K), V log-normal from today's
+#     TCGplayer value over the months to the close (cards mu -6% sigma 18%,
+#     sealed -3% / 8% a month, from the 53 settled Jul-Sep markets); a thin
+#     item (under 15 sellers, or no Market Price) also carries the chance
+#     that nothing sells and the price stays put. Products come from
+#     pokemon_products.json, keyed by EVENT (26SEPCHA was Charmander,
+#     26OCTCHA is Charizard) and re-read when it changes -- a new month's
+#     events stand aside until they are mapped.
+#   - The quote loop stands a market aside (cancel) with no read or a stale
+#     one (POKE_FAIR_TTL_MIN: the snapshot, or the item's own TCGplayer
+#     price), an unmapped event or one whose rules name another item, a
+#     price more than ~2x from the strike (a wrong product, not a move), for
+#     POKE_MOVE_HOLD_MIN after the item's price jumps 5%+, or when the touch
+#     fights the fair by more than POKE_BAND_TOL_CENTS (30) on the adverse
+#     side. Otherwise every bid is at most fair - POKE_FAIR_TOL_CENTS (15)
+#     and every ask at least fair + POKE_FAIR_TOL_CENTS (mort_cap_quotes,
+#     the mortgage gate's capper). The stand-aside band is wider than the
+#     caps, unlike the mortgage gate's single 15c: these books anchor on
+#     Collectr's stale print while the fair reads TCGplayer ahead of it, so
+#     a 15-30c gap is the expected disagreement (10/3: ETB bid 32 vs fair
+#     13, Mew ex bid 24 vs fair 7) -- the side the caps leave is the side
+#     that gap favours. Past 30c the book may know something: out.
+#   - CUTOFF close - POKE_CUTOFF_FROM_CLOSE_MIN (72h, close-anchored, so the
+#     ticker-date rule never reads 26OCT30TCELPO as Oct 30): the last days
+#     are a few TCGplayer sales from the answer, and a seller can print one.
+# Family size POKE_SIZE_MULT (x1), price band 1-99c (the fair bound does the
+# band's job). Kill switch IMM_POKE_ENABLE=0 takes the family out of the
+# allowlist entirely.
+POKE_ENABLE = _POKE_LIVE
+POKE_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_POKE_SERIES", _DEFAULT_POKE_SERIES).split(",") if s.strip())
+POKE_FAIR_TOL_CENTS = _env_int("IMM_POKE_FAIR_TOL_CENTS", 15)
+POKE_BAND_TOL_CENTS = _env_int("IMM_POKE_BAND_TOL_CENTS", 30)
+POKE_FAIR_TTL_MIN = _env_int("IMM_POKE_FAIR_TTL_MIN", 20)
+POKE_FAIR_REFRESH_SECS = _env_int("IMM_POKE_FAIR_REFRESH_SECS", 180)
+POKE_MOVE_HOLD_MIN = _env_int("IMM_POKE_MOVE_HOLD_MIN", 15)
+POKE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_POKE_CUTOFF_FROM_CLOSE_MIN", 4320)
+POKE_SIZE_MULT = _env_float("IMM_POKE_SIZE_MULT", 1.0)
+POKE_STATUS_FILE = os.environ.get(
+    "IMM_POKE_STATUS_FILE", os.path.join(STATUS_DIR, "pokemon_fair.json"))
+# the refresher's latest snapshot (pokemon_fair.build_snapshot)
+_poke_state: dict = {"snap": None}
+
+for _s in POKE_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        cutoff_from_close_min=POKE_CUTOFF_FROM_CLOSE_MIN,
+        size_mult=POKE_SIZE_MULT, price_min_cents=1, price_max_cents=99)
+
+
+def poke_series(series: str) -> bool:
+    return POKE_ENABLE and series in POKE_SERIES
+
+
+def poke_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+              ext_ask: Optional[float]
+              ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', inputs, (bid_cap, ask_floor)) when a Pokemon market may quote --
+    bids at most bid_cap, asks at least ask_floor, None = that side not at
+    all -- else (why, guard-skip inputs, None). Fails CLOSED."""
+    snap = _poke_state.get("snap")
+    if snap is None:
+        return "no pokemon read yet", {"reason": "no_read"}, None
+    age = now_ts - float(snap.get("ts") or 0.0)
+    if age > POKE_FAIR_TTL_MIN * 60:
+        return (f"pokemon read is {age / 60:.0f}m old",
+                {"reason": "stale", "age_s": round(age)}, None)
+    e = (snap.get("markets") or {}).get(ticker)
+    if e is None:
+        return "market not in the pokemon read", {"reason": "no_market"}, None
+    if e.get("err") or e.get("p") is None:
+        why = str(e.get("err") or "no fair")[:160]
+        return f"not priced: {why}", {"reason": "model", "why": why}, None
+    pts = e.get("price_ts")
+    page = now_ts - float(pts) if pts is not None else None
+    if page is None or page > POKE_FAIR_TTL_MIN * 60:
+        return (f"TCGplayer price for {e.get('pid')} is "
+                f"{'missing' if page is None else f'{page / 60:.0f}m old'}",
+                {"reason": "stale_price", "pid": e.get("pid"),
+                 "age_s": None if page is None else round(page)}, None)
+    mv = e.get("moved_at")
+    if mv is not None and now_ts - float(mv) < POKE_MOVE_HOLD_MIN * 60:
+        return (f"TCGplayer {e.get('pid')} moved {e.get('last_move')} "
+                f"{(now_ts - float(mv)) / 60:.0f}m ago (hold "
+                f"{POKE_MOVE_HOLD_MIN}m)",
+                {"reason": "moved", "pid": e.get("pid"),
+                 "move": e.get("last_move"), "age_s": round(now_ts - float(mv))},
+                None)
+    fair = float(e["p"]) * 100.0
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair,
+                                        POKE_BAND_TOL_CENTS)
+    inputs = {"fair": round(fair, 2), "v0": e.get("v0"), "src": e.get("src"),
+              "k": e.get("k"), "pid": e.get("pid"), "thin": e.get("thin"),
+              "tol": POKE_FAIR_TOL_CENTS, "band_tol": POKE_BAND_TOL_CENTS}
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (band "
+                f"{POKE_BAND_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+                f"TCGplayer {e.get('v0')} vs K {e.get('k')})",
+                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad),
+                None)
+    bid_cap = int(math.floor(fair - POKE_FAIR_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(fair + POKE_FAIR_TOL_CENTS - 1e-9))
+    caps = (bid_cap if bid_cap >= 1 else None,
+            ask_floor if ask_floor <= 99 else None)
+    if caps == (None, None):
+        return (f"no side {POKE_FAIR_TOL_CENTS}c clear of fair {fair:.0f}c",
+                dict(inputs, reason="decided"), None)
+    return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
 
 
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
@@ -11089,6 +11225,7 @@ class IncentiveMarketMaker:
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
+        self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
@@ -14631,6 +14768,10 @@ class IncentiveMarketMaker:
                 # rungs held MORT_FAIR_TOL_CENTS clear of the fair
                 _mw, _mi, _mc = mort_gate(meta.ticker, _now.timestamp(), eb, ea)
                 out = [] if (_mw or _mc is None) else mort_cap_quotes(out, *_mc)
+            if poke_series(meta.series):
+                # Pokemon gate: the same, POKE_FAIR_TOL_CENTS clear
+                _pw, _pi, _pc = poke_gate(meta.ticker, _now.timestamp(), eb, ea)
+                out = [] if (_pw or _pc is None) else mort_cap_quotes(out, *_pc)
             return out
 
         def _overlay_with_pads(quotes: List[Quote],
@@ -16355,6 +16496,26 @@ class IncentiveMarketMaker:
                 self._mort_stood.discard(t)
                 log(f"{self.tag} mortgage resume {t}")
 
+            # POKEMON GATE (Jack 2026-10-03, see POKE_ENABLE): stand aside
+            # (cancel) without a fresh TCGplayer fair, on an unmapped event
+            # or one whose rules name another item, just after the item's
+            # price jumped, or when the touch fights the fair; otherwise every
+            # rung below stays POKE_FAIR_TOL_CENTS on the safe side of it
+            # (stand-aside band POKE_BAND_TOL_CENTS).
+            poke_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            if poke_series(meta.series):
+                pk_why, pk_in, poke_caps = poke_gate(t, now_ts, ext_bid, ext_ask)
+                if pk_why:
+                    if t not in self._poke_stood:
+                        self._poke_stood.add(t)
+                        log(f"{self.tag} pokemon stand-aside {t}: {pk_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "poke_fair", lambda: pk_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._poke_stood:
+                self._poke_stood.discard(t)
+                log(f"{self.tag} pokemon resume {t}")
+
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go
             # silent. Without this, a restored rain position kept reduce-only
@@ -16483,6 +16644,9 @@ class IncentiveMarketMaker:
             # nothing rests within MORT_FAIR_TOL_CENTS of the fair
             if mort_caps is not None:
                 mq = mort_cap_quotes(mq, *mort_caps)
+            # Pokemon gate: likewise last, POKE_FAIR_TOL_CENTS clear
+            if poke_caps is not None:
+                mq = mort_cap_quotes(mq, *poke_caps)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -18091,6 +18255,54 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_mort_fair_refresh, daemon=True,
                              name="mort-fair").start()
+        if POKE_ENABLE and not once:
+            # Pokemon refresher (2026-10-03): the mortgage refresher's shape
+            # -- Kalshi (signed) and TCGplayer reads off the trading thread
+            # into the in-memory snapshot the gate reads (_poke_state), plus
+            # a status file. Prices every POKE_FAIR_REFRESH_SECS; the
+            # family's markets and seller counts every 15 minutes; the
+            # product map whenever pokemon_products.json changes (a main
+            # sync maps a new month without a restart). A failed refresh
+            # keeps the old snapshot, which ages out of POKE_FAIR_TTL_MIN
+            # (the gate fails closed).
+            def _poke_fair_refresh():
+                try:
+                    import pokemon_fair
+                except Exception as e:
+                    log(f"{self.tag} ! pokemon refresher disabled: {e}")
+                    return
+                watch = pokemon_fair.PokemonWatch(fair_reader())
+                last = None
+                while True:
+                    delay = max(30, POKE_FAIR_REFRESH_SECS)
+                    try:
+                        snap = watch.refresh()
+                        _poke_state["snap"] = snap
+                        ents = snap.get("markets") or {}
+                        n_ok = sum(1 for e in ents.values() if "p" in e)
+                        unm = snap.get("unmapped") or []
+                        errs = snap.get("errors") or []
+                        key = (n_ok, len(ents), tuple(unm), len(errs))
+                        if last != key:
+                            log(f"{self.tag} poke-fair refresh: {n_ok}/"
+                                f"{len(ents)} markets priced"
+                                + (f", unmapped {','.join(unm)}" if unm else "")
+                                + (f"; {'; '.join(errs)[:200]}" if errs else ""))
+                        last = key
+                        try:
+                            pokemon_fair.write_status(POKE_STATUS_FILE, snap)
+                        except Exception:
+                            pass      # observability only
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! poke-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 60)
+                    time.sleep(delay)
+            threading.Thread(target=_poke_fair_refresh, daemon=True,
+                             name="poke-fair").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
@@ -18194,6 +18406,18 @@ class IncentiveMarketMaker:
                 f"{MORT_FAIR_REFRESH_SECS}s, status {MORT_STATUS_FILE}")
         else:
             log("mortgage gate: OFF -- KXFM30YMTG/KXMORTGAGERATE not enrolled")
+        if POKE_ENABLE:
+            log(f"pokemon gate: {','.join(sorted(POKE_SERIES))} fail-closed on "
+                f"pokemon_fair's TCGplayer read, bids <= fair - "
+                f"{POKE_FAIR_TOL_CENTS}c, asks >= fair + {POKE_FAIR_TOL_CENTS}c, "
+                f"a touch fighting the fair by over {POKE_BAND_TOL_CENTS}c "
+                f"stands aside, hold {POKE_MOVE_HOLD_MIN}m after a price "
+                f"jump, size x{POKE_SIZE_MULT:g}, 1-99c, out "
+                f"{POKE_CUTOFF_FROM_CLOSE_MIN / 60:g}h before close, ttl "
+                f"{POKE_FAIR_TTL_MIN}m, refresh {POKE_FAIR_REFRESH_SECS}s, "
+                f"status {POKE_STATUS_FILE}")
+        else:
+            log("pokemon gate: OFF -- KXPOKEMON not enrolled")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
             f"earnings x{MENTION_SIZE_MULT * earnings_size_mult():g}), "
