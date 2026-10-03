@@ -6490,6 +6490,19 @@ where the Pokemon markets (0.02-0.05) rank above the median member
 and manual-yield; FORCE_EVENTS keeps the budget). Jack 10/3, offered a
 KXPOKEMON budget exemption: "Wait for room".
 
+BUDGET RAISED (later 10/3, 1f4b334, another session): IMM_COLLATERAL_BUDGET
+$100k -> $300k, live from the ~17:50Z restart, ~$137k used -- the budget no
+longer binds Pokemon. Pikachu ex 109 was selected 20:33Z and quoted to
+22:35Z (YES bid 200 @ 9c, ask 200 @ 74-77c vs fair ~25c, no fills) until
+`hopeless` near the 04:00Z period end. The payout floor is the only gate
+left: per-day estimates at 22:19Z (x2) Mew G/RGB $3.9, Pikachu $2.0, Mew
+R/RGB $1.8, Mew ex $1.6, Mew B/RGB $1.54, Charizard $1.2, ETB $1.1.
+SIZE NOTE: the x2 family size is the BASE (20 x 2 = 40 a side); the
+Saturday x2 / quiet-hour multipliers and the deep-reference multiplier
+(the gate parks rungs far behind the touch; TOTAL_SIZE_MULT_CAP 5) stack
+on it -- Pikachu rested 20 x 2 x 2 x 2.5 = 200 a side. The net cap stays
+300 per market (150 x 2); none of those multipliers raise it.
+
 RISKS. Settlement: 26SEPCHA (Charmander, K 39.87) settled YES at 190.24
 while Collectr's Charmander promo 038 -- the product its July/August markets
 tracked to the cent -- was ~$26.7; the October Charizard reuses the code.
