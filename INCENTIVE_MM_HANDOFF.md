@@ -6119,8 +6119,8 @@ cannot move: it settles there unmanaged (no hopeless exits, toxic halts or
 floor logic) unless closed by hand.
 
 RE-CHECK BEFORE GO-LIVE. Settings sized to the old account
-(IMM_ACCOUNT_DROP_HALT 2000 -- account value since 10/3 --, IMM_DAILY_LOSS_LIMIT 1200,
-IMM_COLLATERAL_BUDGET 100000) and to its Advanced API tier
+(IMM_ACCOUNT_DROP_HALT 2000 -- account value since 10/3 --, IMM_DAILY_LOSS_LIMIT 2000 -- since 10/3 --,
+IMM_COLLATERAL_BUDGET 300000 -- since 10/3 --) and to its Advanced API tier
 (KALSHI_RATE_LIMIT_MS 25, 1000 placements/cycle at 12/s).
 
 WHAT SPLITS. Fleet readers stay on the fleet account: fetch_settlements_csv /
@@ -6717,3 +6717,15 @@ What happens to markets admitted during the ~2h at the doubled caps:
   ride.
 - Scan and finecon members above the cap are quote-to-completion and stay.
   Nothing new enters until attrition brings each tier under its cap.
+
+## 2026-10-03 evening — Daily loss halt $1,200 -> $2,000 (Jack)
+
+Jack: "Increase daily halt to $2000". `set IMM_DAILY_LOSS_LIMIT=2000` in
+the launcher; the code default stays 1200. imm_dashboard takes the limit
+from the launcher env with a 1200 fallback, so the env is the one place
+that keeps the bot, the dashboard and the 7:00 email in agreement.
+
+The halt is unchanged in kind: IMM P&L today (realized + marked, since the
+5am-CT roll, carried across restarts) at or below -$2,000 cancels every
+order and idles the bot until the roll. At the change P&L today was -$826,
+69% of the old limit and 41% of the new.
