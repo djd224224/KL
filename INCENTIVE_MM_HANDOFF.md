@@ -6459,6 +6459,13 @@ a market quotes only when its own estimate clears the floor -- a full-day
 period (04:00Z renewals) roughly x1.6 the numbers above -- and the ETB
 when budget frees. IMM_POKE_SIZE_MULT is the lever if that changes.
 
+X2 (10/3 ~14Z, Jack: "Raise to 2x multiplier"): POKE_SIZE_MULT 1.0 -> 2.0 in
+code -- 40 a side, net cap 300 per market. Scaling the x1 shares (~3% of
+the book) by ~1.9: a full-day period projects about $1.6 (Charizard, still
+marginal) to $3.5 (Mew R/RGB) for the six cards and ~$6.6 for the ETB, so
+most should be selected from the 04:00Z renewal; the rest of 10/3's period
+is too short for most of them.
+
 RISKS. Settlement: 26SEPCHA (Charmander, K 39.87) settled YES at 190.24
 while Collectr's Charmander promo 038 -- the product its July/August markets
 tracked to the cent -- was ~$26.7; the October Charizard reuses the code.

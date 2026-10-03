@@ -17284,7 +17284,7 @@ class TestPokemonFairGate(unittest.TestCase):
         ov = imm.series_override("KXPOKEMON")
         self.assertEqual((ov.cutoff_from_close_min, ov.size_mult,
                           ov.price_min_cents, ov.price_max_cents),
-                         (4320, 1.0, 1, 99))
+                         (4320, 2.0, 1, 99))
         # the trap: the ticker-date rule reads 67OCT151ULTCO as Oct 15
         self.assertEqual(imm.parse_event_date(self.EV),
                          imm.ET.localize(datetime(2067, 10, 15)).astimezone(timezone.utc))

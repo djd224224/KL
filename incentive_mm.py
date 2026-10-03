@@ -8698,9 +8698,10 @@ def mort_cap_quotes(quotes: List["Quote"], bid_cap: Optional[int],
 #   - CUTOFF close - POKE_CUTOFF_FROM_CLOSE_MIN (72h, close-anchored, so the
 #     ticker-date rule never reads 26OCT30TCELPO as Oct 30): the last days
 #     are a few TCGplayer sales from the answer, and a seller can print one.
-# Family size POKE_SIZE_MULT (x1), price band 1-99c (the fair bound does the
-# band's job). Kill switch IMM_POKE_ENABLE=0 takes the family out of the
-# allowlist entirely.
+# Family size POKE_SIZE_MULT (x2 -- Jack 2026-10-03 "Raise to 2x multiplier":
+# at x1 every October market projected under the $1.50 payout floor), price
+# band 1-99c (the fair bound does the band's job). Kill switch
+# IMM_POKE_ENABLE=0 takes the family out of the allowlist entirely.
 POKE_ENABLE = _POKE_LIVE
 POKE_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_POKE_SERIES", _DEFAULT_POKE_SERIES).split(",") if s.strip())
@@ -8710,7 +8711,7 @@ POKE_FAIR_TTL_MIN = _env_int("IMM_POKE_FAIR_TTL_MIN", 20)
 POKE_FAIR_REFRESH_SECS = _env_int("IMM_POKE_FAIR_REFRESH_SECS", 180)
 POKE_MOVE_HOLD_MIN = _env_int("IMM_POKE_MOVE_HOLD_MIN", 15)
 POKE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_POKE_CUTOFF_FROM_CLOSE_MIN", 4320)
-POKE_SIZE_MULT = _env_float("IMM_POKE_SIZE_MULT", 1.0)
+POKE_SIZE_MULT = _env_float("IMM_POKE_SIZE_MULT", 2.0)
 POKE_STATUS_FILE = os.environ.get(
     "IMM_POKE_STATUS_FILE", os.path.join(STATUS_DIR, "pokemon_fair.json"))
 # the refresher's latest snapshot (pokemon_fair.build_snapshot)
