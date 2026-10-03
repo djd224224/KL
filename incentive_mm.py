@@ -2107,6 +2107,12 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 + _CA_FAMILY_EVENT_TOP_N_SPEC
                                                 + _RAMP_EVENT_TOP_N_SPEC
                                                 + _SHARE_EVENT_TOP_N_SPEC))
+# Scales EVERY per-event cap above (event_top_n_for); 0 entries stay
+# uncapped. A multiplier rather than a launcher copy of the spec, so a family
+# cap added to the defaults later is scaled too instead of silently masked.
+# 2 since 2026-10-03 (Jack: "Double ... slot caps ... I don't want the caps
+# to trip"), set in the launcher.
+EVENT_TOP_N_MULT = _env_float("IMM_EVENT_TOP_N_MULT", 1.0)
 # Members hold their slots against challengers (see the note above). 0 =
 # the original evictable semantics: re-rank the whole event every refresh.
 EVENT_TOP_N_STICKY = os.environ.get("IMM_EVENT_TOP_N_STICKY", "1") == "1"
@@ -2192,13 +2198,21 @@ def event_top_n_for(series: str) -> int:
     for _pat, _n in EVENT_TOP_N:
         if _pat.startswith("*"):
             if not mention and series.endswith(_pat[1:]):
-                return max(0, _n)
+                return _scaled_top_n(_n)
         elif _pat.startswith("="):
             if series == _pat[1:]:
-                return max(0, _n)
+                return _scaled_top_n(_n)
         elif not mention and series.startswith(_pat):
-            return max(0, _n)
+            return _scaled_top_n(_n)
     return 0
+
+
+def _scaled_top_n(n: int) -> int:
+    """A spec entry x EVENT_TOP_N_MULT; 0 (uncapped) stays 0, a capped
+    family never rounds down to uncapped."""
+    if n <= 0:
+        return 0
+    return max(1, int(round(n * EVENT_TOP_N_MULT)))
 
 
 def _raw_roi(m: "MarketMeta") -> float:

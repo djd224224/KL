@@ -6501,3 +6501,35 @@ incl. the CHA code reuse, the watch end to end without the network --
 cadence, a live map reload, jump stamps, failed reads aging out, --suggest,
 and the shipped map against the listed rules). 1,952 green (unittest
 discover); the baked-path sweep caught POKE_STATUS_FILE before the fix.
+
+## 2026-10-03 — Caps doubled so they stop binding: budget $300k, resting 8,000, candidates 10,000, slot caps x2 (Jack)
+
+Jack: "Double collateral budget, slot caps, resting order cap, and candidate
+book cap. I don't want the caps to trip." The risk-controls table built the
+same day had them binding or close.
+
+Launcher changes (see its comment block for the measurements):
+- IMM_COLLATERAL_BUDGET 100000 -> 300000. Jack picked $300k over a literal
+  $200k, because sticky members alone reserved ~$224k at the Saturday-night
+  x4, so $200k would still have refused every newcomer.
+- IMM_MAX_TOTAL_RESTING 4000 -> 8000.
+- IMM_MAX_CANDIDATE_BOOKS=10000 (was the 5000 code default).
+- IMM_SCAN_TOP_N=120, IMM_SCAN_EVENT_TOP_N=6.
+- IMM_FINECON_TOP_N=50, IMM_FINECON_EVENT_TOP_N=6.
+- IMM_EVENT_TOP_N_MULT=2.
+
+IMM_MAX_PLACEMENTS_PER_CYCLE stays 1000 (Jack: leave it).
+
+CODE: EVENT_TOP_N_MULT scales every per-event strike cap at lookup
+(event_top_n_for / _scaled_top_n): 3 -> 6 for gas, diesel, TRUEV, data
+centers, awards and OpenRouter share. Uncapped entries stay 0 and a capped
+family never rounds to 0. It is a multiplier rather than a launcher copy of
+the spec, so a cap added to the defaults later is scaled rather than masked.
+Default 1.0, so tests and other importers see the spec as written. Tests:
+test_imm_event_top_n_mult.py (4).
+
+WATCH: budget skips should go to 0 outside the multiplier peaks. From 10/10
+the Saturday 0-8 ET x6 may push the reservation past $300k on those nights.
+Also watch resting orders above 4,000 (untested on Kalshi) and placement-cap
+deferrals rising with the book. The gas / diesel x6 event caps double the
+correlated strikes per print.
