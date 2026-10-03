@@ -360,31 +360,6 @@ class TestDigestCapacity(unittest.TestCase):
         self.assertEqual(float(m.group(7)), 9412)   # ladder collateral
         self.assertEqual(float(m.group(8)), 5177)   # inventory reserve
 
-    def test_percentages_and_flags(self):
-        rows = self.dg.capacity_rows(
-            {"own_pos": {"KXTEMPAUSH-26AUG0409-T79.99": -70.0}},
-            {}, {"events": 40, "orders": 979, "collateral": 12435.0}, -8.88)
-        by = {r["label"]: r for r in rows}
-        # the worst per-market position is reported against ITS series cap
-        pm = by["Per-market position (worst)"]
-        self.assertEqual(pm["actual"], 70.0)
-        self.assertEqual(pm["cap"], 50.0)           # KXTEMP cap, not the global 150
-        self.assertGreater(pm["pct"], 100)          # over cap -> flagged
-        self.assertIn("KXTEMPAUSH", pm["note"])
-
-    def test_a_loss_is_reported_against_the_halt_not_a_gain(self):
-        rows = self.dg.capacity_rows({}, {}, {"events": 1, "orders": 1,
-                                              "collateral": 0.0}, -600.0)
-        halt = {r["label"]: r for r in rows}["Daily loss vs halt"]
-        self.assertEqual(halt["actual"], 600.0)
-        self.assertAlmostEqual(halt["pct"], 50.0)
-
-    def test_a_profitable_day_shows_zero_against_the_halt(self):
-        rows = self.dg.capacity_rows({}, {}, {"events": 1, "orders": 1,
-                                              "collateral": 0.0}, +900.0)
-        halt = {r["label"]: r for r in rows}["Daily loss vs halt"]
-        self.assertEqual(halt["actual"], 0.0)
-
     def test_launcher_env_parses(self):
         self.assertTrue(self.dg.LAUNCHER_ENV,
                         "launcher $ProbeEnv did not parse — caps would be wrong")

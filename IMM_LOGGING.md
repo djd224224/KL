@@ -165,6 +165,21 @@ written when `(reaches_min_raw, reaches_min, near_cliff_boost_armed)` changes,
 with `prev_state` and the full decision inputs. Its own file, so
 `selection_events` still means one row per decision change.
 
+### The `risk:` log line (2026-10-03)
+
+Not a sink: one bot-log line per FULL cycle, right after the cycle summary,
+written by `incentive_mm.risk_line`:
+
+    risk: account value $27,862 (anchor $24,387, up $3,475 of $2,000 halt) | P&L today $-85.66 of -$1,200 halt | open-scan $+7.03 of -$200 budget
+
+It records where the three daily halts stand, so the 7:00 email can report
+each one's worst point in the day rather than its value at 7:00, an hour after
+the roll re-anchors them all. `imm_risk_controls.py` parses it with
+`RISK_ACCT_RE` / `RISK_PNL_RE` / `RISK_SCAN_RE`. Change the wording in both
+places; `test_imm_risk_controls.BotRiskLineContractTests` fails if they drift.
+The account part is missing when the floor check did not run that cycle or
+read nothing. The open-scan part is missing while the tier holds no book.
+
 ## Two compatibility traps, both tested
 
 **Cycle-log columns are APPEND-ONLY.** `imm_reward_recon.py` reads the file

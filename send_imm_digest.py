@@ -7,8 +7,10 @@ this script with --section-out. Run with no arguments (the old 7:10 task) it
 does nothing; --test still sends the section as an email of its own.
 
 Layout: lifetime net, the PICK-OFF block, the P&L windows (yesterday, 7 days,
-lifetime), the last 30 days' daily P&L, the cutoff audit, capacity, the
-finecon / open-scan tracker and a one-line health check.
+lifetime), the last 30 days' daily P&L, the cutoff audit, the risk controls
+(every halt, cap and guard: what fired, what binds, what has slack — see
+imm_risk_controls), the finecon / open-scan tracker and a one-line health
+check.
 
 Everything is the INCENTIVE BOT's own book, not the raw account. Yesterday, 7
 days and the daily table are the IMM dashboard's own figures, read from the
@@ -384,113 +386,68 @@ def health_line(status: dict, ss: dict, dash_note: str = "") -> str:
     return line
 
 
-_UNIVERSE_RE = re.compile(
-    r"universe: (\d+) program markets -> (\d+) candidates -> (\d+) selected "
-    r"across (\d+)/(\d+) events.*?~\$(\d+), total ~\$(\d+) ladder collateral, "
-    r"\$(\d+) inventory reserve\); skips (\{.*\})")
+import imm_risk_controls as risk                                    # noqa: E402
+
+# The selection gate's "universe:" line; imm_risk_controls owns the shape now.
+_UNIVERSE_RE = risk.UNIVERSE_RE
 
 
-def last_universe_line():
-    """The SELECTION GATE's own view, parsed from the newest bot log.
+def risk_context(client, state, status, resting):
+    """What imm_risk_controls needs from the live bot: its limits (the
+    mirrored launcher env, see _apply_launcher_env), where it stands now, and
+    its positions against their OWN caps.
 
-    This matters because the gate does not compare against deployed capital:
-    market_cost() reserves worst-case-ladder x 0.65 for every selected market,
-    forward-looking, and THAT total is what gets tested against the budget.
-    The live resting book reads lower, so a digest showing only resting
-    collateral would report headroom the bot does not believe it has. The
-    'budget' skip count is the direct answer to 'am I capped' — non-zero means
-    markets were refused for capital this cycle."""
+    Caps go through imm.ensure_family_override first. The bot clones a
+    family's override onto each member at refresh, so a fresh import sees
+    the global 150 for a sports ladder whose cap is 750: the old capacity
+    table flagged a 400-lot NFL ladder "267% AT CAP" on 10/3 for exactly
+    that reason."""
+    pos = {t: _f(p) for t, p in (state.get("own_pos") or {}).items() if abs(_f(p)) > 0.5}
+    positions, by_ev = [], {}
+    for t, p in pos.items():
+        series = t.split("-")[0]
+        try:
+            imm.ensure_family_override(series)
+        except Exception:                                   # noqa: BLE001
+            pass
+        positions.append((t, p, imm.series_max_position(series)))
+        ev = _event_of(t)
+        by_ev[ev] = by_ev.get(ev, 0.0) + p
+    events = [(ev, n, imm.event_cap_contracts(ev)) for ev, n in by_ev.items()]
     try:
-        logs = sorted(glob.glob(os.path.join(STATUS_DIR, "incentive-mm-*.log")))
-        if not logs:
-            return None
-        with open(logs[-1], encoding="utf-8", errors="replace") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - 4_000_000))
-            tail = f.read()
-    except OSError:
-        return None
-    m = None
-    for m in _UNIVERSE_RE.finditer(tail):
-        pass
-    if not m:
-        return None
-    try:
-        skips = ast.literal_eval(m.group(9))
-    except (ValueError, SyntaxError):
-        skips = {}
-    return {"programs": int(m.group(1)), "candidates": int(m.group(2)),
-            "markets": int(m.group(3)), "events": int(m.group(4)),
-            "event_cap": int(m.group(5)), "ladder": float(m.group(7)),
-            "reserve": float(m.group(8)), "skips": skips}
+        value = imm.account_value_dollars(client.get_balance())
+    except Exception as e:                                  # noqa: BLE001
+        log(f"risk controls: balance read failed ({e!r}); account value n/a")
+        value = None
+    st = status or {}
+    caps = {k: getattr(imm, k, None) for k in (
+        "ACCOUNT_DROP_HALT", "DAILY_LOSS_LIMIT", "SCAN_DAILY_LOSS_LIMIT", "SCAN_TOP_N",
+        "FINECON_TOP_N",
+        "FAILSAFE_CANCEL_AFTER", "MAX_MARKETS", "COLLATERAL_BUDGET", "MAX_CANDIDATE_BOOKS",
+        "MAX_TOTAL_RESTING_ORDERS", "MAX_PLACEMENTS_PER_CYCLE", "PLACE_RATE_PER_SEC",
+        "TOXIC_HALT", "TOXIC_PICKOFFS", "BREAKERS_ENABLED", "EVENT_FILL_HALT_CONTRACTS",
+        "SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS", "SCAN_DRIFT_CENTS")}
+    caps["TOXIC_HALT_MIN"] = (getattr(imm, "TOXIC_HALT_SECS", 1800.0) or 0) / 60.0
+    return {"caps": caps, "now": {
+        "pnl_today": _f(st["pnl_today"]) if "pnl_today" in st else None,
+        "scan_pnl": _f(st["scan_pnl_today"]) if "scan_pnl_today" in st else None,
+        "scan_halted": bool(st.get("scan_halted_today")),
+        "errors_today": int(_f(st.get("errors_today"))),
+        "halt_file": os.path.exists(imm.HALT_FILE),
+        "manual_standoff": list(st.get("manual_standoff") or []),
+        "acct_value": value,
+        "acct_anchor": _f(state.get("account_value_day_start")) or None,
+        "resting_orders": resting.get("orders") if resting else None,
+        "resting_notional": resting.get("collateral") if resting else None,
+        "positions": positions, "events": events}}
 
 
-def capacity_rows(state, status, resting, pnl_today):
-    """[(label, actual, cap, unit, note)] — every governor that can stop the
-    bot quoting, with what it is actually running at (Jack 2026-08-04: "so I
-    know how close I am to getting capped").
-
-    Actuals come from the LIVE resting book and own positions rather than the
-    bot's internal counters, so this stays honest across restarts. Caps come
-    from the mirrored launcher env — see _apply_launcher_env."""
-    rows = []
-
-    def add(label, actual, cap, unit="", note=""):
-        rows.append({"label": label, "actual": actual, "cap": cap,
-                     "unit": unit, "note": note,
-                     "pct": (100.0 * actual / cap) if cap else None})
-
-    # --- the SELECTION GATE's own numbers, when the log gives them up ----
-    u = last_universe_line()
-    if u:
-        add("Events selected", u["events"], u["event_cap"],
-            note="the gate's own count; new events refused at the cap, "
-                 "members keep quoting")
-        add("Collateral reserved (gate)", u["ladder"] + u["reserve"],
-            imm.COLLATERAL_BUDGET, "$",
-            note="ladder ${:,.0f} + inventory reserve ${:,.0f} — reserved "
-                 "worst-case, NOT capital deployed".format(u["ladder"], u["reserve"]))
-        add("Candidate books", u["candidates"], imm.MAX_CANDIDATE_BOOKS)
-        nb = int(u["skips"].get("budget", 0) or 0)
-        rows.append({"label": "Markets refused for CAPITAL last cycle",
-                     "actual": nb, "cap": 0, "unit": "", "pct": None,
-                     "note": ("none — the budget is not binding" if not nb else
-                              "budget IS binding: {} market(s) skipped".format(nb))})
-    else:
-        add("Events quoted (live book)", resting.get("events", 0),
-            imm.MAX_MARKETS, note="gate numbers unavailable — parsed from the "
-                                  "live resting book instead")
-
-    # --- what is actually deployed, as a cross-check ---------------------
-    collat = resting.get("collateral", 0.0)
-    add("Collateral deployed (resting)", collat, imm.COLLATERAL_BUDGET, "$",
-        note="actual collateral locked by resting orders")
-
-    # --- order-count / universe governors --------------------------------
-    add("Resting orders", resting.get("orders", 0), imm.MAX_TOTAL_RESTING_ORDERS)
-
-    # --- position caps: report the WORST market / event, not the total ----
-    pos = {t: float(p) for t, p in (state.get("own_pos") or {}).items()
-           if abs(float(p)) > 0.5}
-    if pos:
-        wt, wv = max(pos.items(), key=lambda kv: abs(kv[1]) / max(
-            imm.series_max_position(kv[0].split("-")[0]), 1))
-        cap = imm.series_max_position(wt.split("-")[0])
-        add("Per-market position (worst)", abs(wv), cap, "cts", note=wt)
-        by_ev = {}
-        for t, p in pos.items():
-            by_ev["-".join(t.split("-")[:2])] = by_ev.get("-".join(t.split("-")[:2]), 0.0) + p
-        we, wev = max(by_ev.items(), key=lambda kv: abs(kv[1]) / max(
-            imm.event_cap_contracts(kv[0]), 1))
-        add("Per-event net (worst)", abs(wev), imm.event_cap_contracts(we),
-            "cts", note=we)
-
-    # --- the halts -------------------------------------------------------
-    if pnl_today is not None and imm.DAILY_LOSS_LIMIT:
-        add("Daily loss vs halt", max(-pnl_today, 0.0), imm.DAILY_LOSS_LIMIT, "$",
-            note="halt cancels everything until the next roll")
-    return rows
+def risk_section(client, state, status, resting, now_utc):
+    """(evidence, rows) for the risk-controls block: the last 24h of the
+    bot's own logs and sinks (imm_risk_controls.gather) judged against the
+    live limits."""
+    ev = risk.gather(STATUS_DIR, now_utc.timestamp())
+    return ev, risk.build_rows(ev, risk_context(client, state, status, resting), ET)
 
 
 # Caps whose live value we can check against the launcher string. Verifying the
@@ -502,7 +459,8 @@ _CAP_CHECKS = (("IMM_COLLATERAL_BUDGET", lambda: imm.COLLATERAL_BUDGET),
                ("IMM_MAX_MARKETS", lambda: imm.MAX_MARKETS),
                ("IMM_MAX_TOTAL_RESTING", lambda: imm.MAX_TOTAL_RESTING_ORDERS),
                ("IMM_MAX_POSITION", lambda: imm.MAX_POSITION_CONTRACTS),
-               ("IMM_MAX_EVENT", lambda: imm.MAX_EVENT_CONTRACTS))
+               ("IMM_MAX_EVENT", lambda: imm.MAX_EVENT_CONTRACTS),
+               ("IMM_MAX_PLACEMENTS_PER_CYCLE", lambda: imm.MAX_PLACEMENTS_PER_CYCLE))
 
 
 def capacity_config_mismatches():
@@ -1727,8 +1685,7 @@ def build_digest(now_utc: datetime):
     life_raw, _life_real, _life_unreal = lifetime_raw(state, mids)
     dw = dashboard_windows(load_dashboard_summary(), now_utc.timestamp())
     _rows, _tot, resting = event_rows(client)     # resting quotes, for capacity
-    cap_rows = capacity_rows(state, status, resting,
-                             _f(status.get("pnl_today")) if status else None)
+    risk_ev, risk_rows = risk_section(client, state, status, resting, now_utc)
     # Kalshi's event starts vs ours, for the PICK-OFF block (never raises).
     # First, so the audit rows below can print Kalshi's start beside ours.
     pick = imm_pickoff.scan(client, now_utc,
@@ -1816,20 +1773,9 @@ def build_digest(now_utc: datetime):
     if _perr:
         L.append(_perr)
     L.append("")
-    L.append("CAPACITY — how close the bot is to each ceiling ({})".format(
-        capacity_note()))
-    L.append("{:34s} {:>12s} {:>12s} {:>7s}".format(
-        "GOVERNOR", "ACTUAL", "CAP", "USED"))
-    for r in cap_rows:
-        u = "{:.0f}%".format(r["pct"]) if r["pct"] is not None else "-"
-        fmt = "{:,.0f}" if r["unit"] != "$" else "{:,.2f}"
-        cap = fmt.format(r["cap"]) if r["pct"] is not None else "-"
-        L.append("{:34s} {:>12s} {:>12s} {:>7s}{}".format(
-            r["label"], fmt.format(r["actual"]), cap, u,
-            "  <== AT CAP" if (r["pct"] or 0) >= 95 else
-            ("  <- close" if (r["pct"] or 0) >= 80 else "")))
-        if r["note"]:
-            L.append("{:34s} {}".format("", r["note"]))
+    # every risk control: what fired, what binds, what has slack (Jack
+    # 2026-10-03); replaces the old capacity-only table
+    L.extend(risk.text_lines(risk_rows, risk_ev, ET, capacity_note()))
     # the finecon group's trading P&L, from the same dashboard windows
     w_fin = {"day": {"events": _as_window_events(dw["day"]["events"])},
              "week": {"events": _as_window_events(dw["week"]["events"])}}
@@ -1918,40 +1864,7 @@ def build_digest(now_utc: datetime):
         h.append('<div style="color:#888;font-size:11px;margin-top:4px">{}'
                  '</div>'.format(imm_pickoff._esc(_perr)))
 
-    h.append('<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
-             'Capacity &mdash; how close to each ceiling</div>')
-    h.append('<table style="border-collapse:collapse">')
-    h.append('<tr style="background:#f0f0f0;font-weight:600">'
-             '<td style="{0}">GOVERNOR</td><td style="{1}">ACTUAL</td>'
-             '<td style="{1}">CAP</td><td style="{1}">USED</td>'
-             '<td style="{0}"></td></tr>'.format(TDL, TD))
-    for i, r in enumerate(cap_rows):
-        pct = r["pct"] or 0
-        colour = "#c0392b" if pct >= 95 else ("#d9821b" if pct >= 80 else "#0a7a2f")
-        if r["pct"] is None:
-            colour = "#c0392b" if r["actual"] else "#777"
-        bar = min(int(pct), 100)
-        fmt = "{:,.0f}" if r["unit"] != "$" else "{:,.2f}"
-        h.append(
-            '<tr style="background:{bg}"><td style="{tdl}">{label}'
-            '{note}</td>'
-            '<td style="{td}">{act}</td><td style="{td}">{cap}</td>'
-            '<td style="{td};color:{col};font-weight:700">{pct}</td>'
-            '<td style="{tdl};width:120px">'
-            '<div style="background:#eee;height:9px;width:110px">'
-            '<div style="background:{col};height:9px;width:{bar}px"></div>'
-            '</div></td></tr>'.format(
-                bg="#fafafa" if i % 2 else "#fff", tdl=TDL, td=TD, col=colour,
-                label=r["label"],
-                note=('<div style="color:#999;font-size:11px">{}</div>'.format(
-                    r["note"]) if r["note"] else ""),
-                act=fmt.format(r["actual"]),
-                cap=fmt.format(r["cap"]) if r["pct"] is not None else "&mdash;",
-                pct="{:.0f}%".format(pct) if r["pct"] is not None else "&mdash;",
-                bar=int(bar * 1.1)))
-    h.append("</table>")
-    h.append('<div style="color:#888;font-size:12px;margin-top:4px">{}</div>'
-             .format(capacity_note()))
+    h.append(risk.html(risk_rows, risk_ev, ET, capacity_note(), TD, TDL))
     if fin_html:
         h.append(fin_html)
     h.append('<div style="color:#777;font-size:12px;margin-top:12px;'

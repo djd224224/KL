@@ -230,7 +230,8 @@ class DashboardWindowsTests(_DigestTest):
                  "load_json": mock.Mock(return_value={}),
                  "current_mids": mock.Mock(return_value=({}, {})),
                  "event_rows": mock.Mock(return_value=([], {}, {})),
-                 "capacity_rows": mock.Mock(return_value=[]),
+                 "risk_section": mock.Mock(return_value=(
+                     sd.risk._empty_evidence(self.now, self.now), [])),
                  "capacity_note": mock.Mock(return_value=""),
                  "cutoff_audit": mock.Mock(return_value={}),
                  "cutoff_banner": mock.Mock(return_value=""),

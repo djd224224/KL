@@ -6650,6 +6650,28 @@ def balance_halt_email(drop: float, anchor: float, value: float, cash: float,
     return subject, body
 
 
+def risk_line(account: Optional[Tuple[float, float]], pnl_today: float,
+              scan_pnl: Optional[float]) -> str:
+    """The once-per-full-cycle "risk:" log line: where the three daily
+    halts stand against their limits (Jack 2026-10-03: the 7:00 email shows
+    how close each risk control came to breaching). `account` is (value,
+    anchor) from the last account-value check, None when the check did not
+    run or read nothing. send_imm_digest / imm_risk_controls parse this line
+    for the day's worst reading, so change the wording there too."""
+    parts = []
+    if account is not None and account[1] > 0:
+        value, anchor = account
+        drop = anchor - value
+        parts.append(f"account value ${value:,.0f} (anchor ${anchor:,.0f}, "
+                     f"{'down' if drop >= 0 else 'up'} ${abs(drop):,.0f} of "
+                     f"${ACCOUNT_DROP_HALT:,.0f} halt)")
+    parts.append(f"P&L today ${pnl_today:+,.2f} of -${DAILY_LOSS_LIMIT:,.0f} halt")
+    if scan_pnl is not None and SCAN_TOP_N > 0 and SCAN_DAILY_LOSS_LIMIT > 0:
+        parts.append(f"open-scan ${scan_pnl:+,.2f} of "
+                     f"-${SCAN_DAILY_LOSS_LIMIT:,.0f} budget")
+    return "risk: " + " | ".join(parts)
+
+
 def _halt_day_key(now_utc: datetime) -> str:
     """The 5am-CT roll day the halt/carry/balance anchors belong to."""
     return (now_utc.astimezone(CT)
@@ -11271,6 +11293,8 @@ class IncentiveMarketMaker:
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
+        # (account value, anchor) from the last floor check, for risk_line
+        self._acct_reading: Optional[Tuple[float, float]] = None
         # ---- analytics sink state (see _sink) ----
         self._sink_muted: Set[str] = set()    # sinks that failed and went quiet
         # open-scan discovery rotation (2026-09-13), deliberately not
@@ -15539,7 +15563,10 @@ class IncentiveMarketMaker:
             return False
         if self.state.account_value_day_start <= 0:
             self.state.account_value_day_start = value
+            self._acct_reading = (value, value)
             return False
+        # for the cycle's "risk:" line (risk_line)
+        self._acct_reading = (value, self.state.account_value_day_start)
         drop = self.state.account_value_day_start - value
         if drop < ACCOUNT_DROP_HALT:
             return False
@@ -15595,6 +15622,7 @@ class IncentiveMarketMaker:
         # Account-value hard floor: shared-account backstop against ANY
         # bot's malfunction (or this one's blind spots). Anchored at the
         # daily roll; deposits/withdrawals also move it — the alert says so.
+        self._acct_reading = None       # this cycle's reading only (risk_line)
         if ACCOUNT_DROP_HALT > 0 and self.live and self._check_balance_floor(now_utc):
             return
 
@@ -17059,6 +17087,10 @@ class IncentiveMarketMaker:
             f"est ${reward_frac_sum:.2f}/day reward share, P&L today ${pnl_today:+.2f} "
             f"(real {realized:+.2f}/unreal {unrealized:+.2f}) "
             f"{'[fast] ' if fast_only else ''}{'' if self.live else '[DRY RUN]'}")
+        if not fast_only:
+            log(f"{self.tag} " + risk_line(
+                self._acct_reading, pnl_today,
+                self.state.scan_pnl_today_last if self.state.scan_book else None))
 
         # Watchdog: markets selected but the book nearly empty for several
         # consecutive cycles — the silent-death signature (dead cutoffs,

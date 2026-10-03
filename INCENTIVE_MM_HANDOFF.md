@@ -6642,3 +6642,59 @@ into Others. TestOpenRouterShareFairGate.test_x1_at_every_hour_and_a_net_cap_per
 covers no hour, Saturday or evening mult; no yield mode; the cap 100 and
 Vercel's series untouched; and the quote loop bidding at cap 100 but not
 at cap 20 with +25 held.
+
+## 2026-10-03 — The 7:00 email's Capacity table becomes a risk-controls table: what fired, what binds, what has slack (Jack)
+
+Jack: "in 'Capacity — how close to each ceiling' in my daily email, show all
+risk controls and if any have been breached e.g. the balance guard, or other.
+or are close to breaching. make it clear which risk controls are actually
+constraining /have real impact vs not".
+
+THE OLD TABLE MISLED IN TWO PLACES on the morning of 10/3. It never showed
+the balance guard, which had halted the bot from 01:40 to 06:00 ET. It also
+flagged the per-market cap "400 vs 150, 267% AT CAP" on an NFL ladder whose
+family cap is 750: a fresh import sees the global 150 because the bot clones
+family overrides onto members at refresh. The "collateral deployed (resting)
+$290k vs $100k budget" row compared resting-order notional with the modelled
+budget, two different quantities.
+
+NOW (imm_risk_controls.py; send_imm_digest builds the context and renders):
+every halt, capacity cap, position cap and per-market guard gets one verdict
+over the last 24h.
+- TRIPPED: a halt fired.
+- BINDING: it refused markets, deferred placements or held positions at a cap.
+- CLOSE: it reached 80% of its limit at the worst point.
+- SLACK: not constraining.
+- Per-market guards read FIRED, QUIET or OFF.
+Rows sort worst first, under a one-line headline. Evidence is the bot's own:
+ALERT lines, cycle summaries, universe lines, placement-cap and idle lines
+from the logs (picked by mtime, filtered to the window), plus the toxic_halts
+and guard_skips sinks. Caps resolve through ensure_family_override.
+capacity_rows / last_universe_line are gone; _UNIVERSE_RE aliases the
+module's regex.
+
+BOT CHANGE (log only, no trading effect): one `risk:` line per full cycle
+(incentive_mm.risk_line): account value vs anchor, P&L today and open-scan
+P&L against their limits. At 7:00 every daily halt has been re-anchored an
+hour earlier, so the email needs the day's WORST reading, and only a
+per-cycle record gives it. Until this deploys, the account-value and
+open-scan "worst 24h" read "not logged yet". See IMM_LOGGING.md.
+
+FIRST READING (live, 10/3 09:30 ET):
+- TRIPPED: the account-value guard (the cash rule at 01:40: 3,590 orders
+  cancelled, 4.3h idle).
+- BINDING:
+  - the collateral budget refused 87 markets at the last refresh (28 of 101
+    refreshes);
+  - the slot caps refused in 99 of 101;
+  - the 1,000-placement cap was hit in 134 of 187 cycles, ~600 placements
+    waiting a cycle each time.
+- CLOSE: candidate books 4,647 of 5,000; resting orders 3,743 of 4,000;
+  worst position 125 of 150 (KXANFCC).
+- SLACK: daily loss (worst -$594 of -$1,200, at 01:35), events (417 of
+  1,000), per-event net (62%), fail-safe.
+
+Tests: test_imm_risk_controls.py (15, including the 10/3 cash trip end to
+end, the family-cap false alarm, and a contract test that the bot's risk line
+parses). test_send_imm_digest stubs risk_section. TestDigestCapacity lost its
+three capacity_rows cases, now ported.
