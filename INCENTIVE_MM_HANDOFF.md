@@ -6448,6 +6448,17 @@ DRY CHECK 10/3 12:53Z (live books, the bot's own gate): ETB fair 13.3 on
 the Pikachu 24.9 (thin) on ~20x80 -> bids <= 9, asks >= 40. All seven quote,
 mostly the NO side.
 
+LIVE 10/3 13:19Z (sync 09:15 ET, safe-window restart): "poke-fair refresh:
+7/7 markets priced", pokemon_fair.json every 3 min. SELECTION at x1 (one
+20-lot a side, the gate leaving mostly the NO side): six markets
+payout_floor -- $0.52-1.13 projected over the period's last 0.61 days vs
+the $1.50 floor (Kalshi pays nothing under $1 a period; ~3% of books
+9,000 contracts deep) -- and the ETB ($2.22) budget (members keep their
+slots). Jack 10/3, offered x3 (the mortgage gate's) or x5: "Keep x1". So
+a market quotes only when its own estimate clears the floor -- a full-day
+period (04:00Z renewals) roughly x1.6 the numbers above -- and the ETB
+when budget frees. IMM_POKE_SIZE_MULT is the lever if that changes.
+
 RISKS. Settlement: 26SEPCHA (Charmander, K 39.87) settled YES at 190.24
 while Collectr's Charmander promo 038 -- the product its July/August markets
 tracked to the cent -- was ~$26.7; the October Charizard reuses the code.
