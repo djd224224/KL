@@ -3,16 +3,20 @@ r"""
 send_portfolio_digest.py — 7:00 AM ET whole-account portfolio email.
 
 One email covering the ENTIRE Kalshi account (every bot + manual trades):
-a chart of daily account value (cash + open positions marked to mid), then
-the biggest movers since the prior morning by family (settled and unrealized
-alike, ranked by the size of the move, realized and mark-to-mid split out).
+a chart of daily account value (cash + open positions marked to mid), the
+IMM's risk-controls table right under it (since 2026-10-03), then the
+biggest movers since the prior morning by family / event / market, grouped
+exactly as the IMM dashboard's Drivers table groups them (imm_dashboard.
+family_of, since 2026-10-03; settled and unrealized alike, ranked by the
+size of the move, realized and mark-to-mid split out).
 (The "Settled since yesterday, by series" table was removed 2026-09-29.)
 
 Then the IMM bot's section (since 2026-10-02, when its own 7:10 email was
 cut): send_imm_digest.py --section-out, run as a child process (imm_section),
 with the dashboard's yesterday / 7-day / 30-day figures; its PICK-OFF WINDOW
-flag goes onto this subject. A failed section is one line saying so, never a
-held email. Kill: PF_IMM_SECTION=0 or --no-imm.
+flag goes onto this subject, and its risk block (risk_text / risk_html) is
+the one placed under the chart. A failed section is one line saying so,
+never a held email. Kill: PF_IMM_SECTION=0 or --no-imm.
 
 Day P&L per event (since 2026-09-29, replay_day): every fill and settlement
 since the prior morning replayed per market, from the prior snapshot's own
@@ -80,6 +84,7 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
 # Import AFTER the env fixup so the module-level cred constants pick them up.
 import pytz  # noqa: E402
 from crypto_touch_mm import build_client, log  # noqa: E402
+import imm_dashboard as dash  # noqa: E402  (family_of: stdlib-only import)
 
 ET = pytz.timezone("US/Eastern")
 KL_DIR = r"C:\Users\jackd\Documents\KL"
@@ -114,6 +119,11 @@ def _f(v) -> float:
         return 0.0
 
 
+def _esc(v) -> str:
+    return (str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("·", "&middot;"))
+
+
 def _pnl_span(v: float) -> str:
     color = C_POS if v > 0.005 else (C_NEG if v < -0.005 else "#777")
     return f'<span style="color:{color}">{v:+,.2f}</span>'
@@ -126,40 +136,44 @@ def event_from_ticker(ticker: str) -> str:
     return ticker.rsplit("-", 1)[0] if ticker.count("-") >= 2 else ticker
 
 
-# Table grouping (Jack 8/14: "table is too long, maybe just group by series").
-# Strict series tickers barely compress (every city/tenor is its own series),
-# so known fleets roll up into families; anything unrecognized shows as its
-# series ticker.
-FAMILY_RULES = [
-    (re.compile(r"^KXHIGH"), "High temps (KXHIGH*)"),
-    (re.compile(r"^KXLOW"), "Low temps (KXLOW*)"),
-    (re.compile(r"^KXTEMP"), "Hourly temps (KXTEMP*)"),
-    (re.compile(r"^KXUST"), "Treasury rates (KXUST*)"),
-    (re.compile(r"^KX(BTC|ETH|SOL|XRP|DOGE|BNB|HYPE|ZEC)D$"), "Crypto up/down (KX*D)"),
-    (re.compile(r"^KX(BTC|ETH|SOL|XRP|DOGE|BNB|HYPE|ZEC)(MAXMON|MINMON)$"),
-     "Crypto monthly touch"),
-    (re.compile(r"^KX(BTC|ETH|SOL|XRP|DOGE|BNB|HYPE|ZEC)(MAXY|MINY|Y)$"),
-     "Crypto annual"),
-    (re.compile(r"^KX(AAAGAS|DIESEL)"), "Gas & diesel (AAA)"),
-    (re.compile(r"^KXRAIN"), "Rain (KXRAIN*)"),
-    (re.compile(r"MENTION"), "Mention markets"),
-    (re.compile(r"^KXAQI"), "Air quality (KXAQI*)"),
-    # 2026-09-22: the movers table made the long tail visible — fleets and
-    # vendor families that had been showing as one line per series.
-    # (?!X): KXNFLX* is Netflix, not football — it belongs to the APP rule
-    (re.compile(r"^KXNFL(?!X)"), "NFL (KXNFL*)"),
-    (re.compile(r"^KXRT$"), "Rotten Tomatoes (KXRT)"),
-    (re.compile(r"CC$"), "Carbon Arc cards (KX*CC)"),
-    (re.compile(r"APP$"), "App downloads (KX*APP)"),
-]
+# Families as the IMM dashboard's Drivers table files them (Jack 2026-10-03:
+# "mirror the family/event/market in the table in imm_dashboard.html#drivers
+# when grouping families in the table in the email e.g. AI & tech, Company
+# KPIs, Crypto, Elections"). The same function, imm_dashboard.family_of, fed
+# the same inputs: Kalshi's series category from the bot's scan_series_meta
+# places a series no name rule knows, exactly as the dashboard reads it. It
+# replaces the fleet roll-ups ("High temps (KXHIGH*)", "NFL (KXNFL*)", ...)
+# this table used since 8/14. The dashboard's fallback election list matched
+# incentive_mm.election_series on all 362 series in the bot's book on 10/3,
+# so the bot itself is not imported here.
+IMM_STATE_PATH = os.path.join(KL_DIR, "run-logs", "incentive-mm", "imm_state.json")
+_SERIES_CATS = None                # series -> Kalshi category, loaded once
+
+
+def series_categories() -> dict:
+    global _SERIES_CATS
+    if _SERIES_CATS is None:
+        try:
+            with open(IMM_STATE_PATH, encoding="utf-8") as f:
+                meta = json.load(f).get("scan_series_meta") or {}
+            _SERIES_CATS = {k: str((v or {}).get("category") or "")
+                            for k, v in meta.items()}
+        except (OSError, ValueError, AttributeError):
+            _SERIES_CATS = {}
+    return _SERIES_CATS
+
+
+def family_and_group(event_ticker: str):
+    """(family, group) of an event ticker, the dashboard's two labels: the
+    family is the table's top level (Econ & rates, Crypto, ...), the group
+    the label the dashboard prints beside an event (CPI & inflation, Treasury
+    yields, ...; the series itself where no group applies)."""
+    series = event_ticker.split("-", 1)[0]
+    return dash.family_of(series, series_categories().get(series, ""))
 
 
 def family_for(event_ticker: str) -> str:
-    series = event_ticker.split("-", 1)[0]
-    for rx, label in FAMILY_RULES:
-        if rx.search(series):
-            return label
-    return series
+    return family_and_group(event_ticker)[0]
 
 
 # ----------------------------------------------------------------------------
@@ -343,7 +357,8 @@ def replay_day(start, fills, settlements, end, ev_of):
     cash + value now - value at the prior morning.
 
     Returns (events, cash, mismatches, settled): events maps event ->
-    {"realized", "value_d"}; cash = the day's trading + settlement cash;
+    {"realized", "value_d", "markets"}, markets mapping each ticker to its
+    own {"realized", "value_d", "value_now", "settled"}; cash = the day's trading + settlement cash;
     mismatches = markets whose replayed position disagrees with `end`;
     settled = event -> set of market results."""
     st = {}
@@ -364,7 +379,8 @@ def replay_day(start, fills, settlements, end, ev_of):
             d["real"] += pay - d["basis"]
             cash += pay
             d["q"] = d["basis"] = 0.0
-            settled.setdefault(ev_of(tk), set()).add(x.get("market_result") or "?")
+            d["settled"] = x.get("market_result") or "?"
+            settled.setdefault(ev_of(tk), set()).add(d["settled"])
             continue
         n, p, q = _f(x.get("count_fp")), _f(x.get("yes_price_dollars")), d["q"]
         if x.get("book_side") == "bid":                  # +YES at p
@@ -401,10 +417,38 @@ def replay_day(start, fills, settlements, end, ev_of):
         q_end, v_end = end.get(tk, (0.0, 0.0))
         if abs(d["q"] - q_end) > 0.011:
             mismatches.append(tk)
-        e = events.setdefault(ev_of(tk), {"realized": 0.0, "value_d": 0.0})
+        e = events.setdefault(ev_of(tk), {"realized": 0.0, "value_d": 0.0,
+                                          "markets": {}})
         e["realized"] += d["real"]
         e["value_d"] += v_end - d["basis"]
+        # the market level of the family / event / market table
+        e["markets"][tk] = {"realized": d["real"], "value_d": v_end - d["basis"],
+                            "value_now": v_end, "settled": d.get("settled")}
     return events, round(cash, 2), mismatches, settled
+
+
+def market_rows(event: str, markets: dict) -> list:
+    """An event's markets as the movers table's third level (the dashboard's
+    family / event / market): each market's own day = realized + value_d,
+    its value now and a settled note, largest move first. Markets that did
+    not move are left out."""
+    out = []
+    for tk, m in markets.items():
+        realized, value_d = round(m["realized"], 2), round(m["value_d"], 2)
+        day = round(realized + value_d, 2)
+        if abs(day) < 0.005 and abs(realized) < 0.005 and abs(value_d) < 0.005:
+            continue
+        out.append({"ticker": tk, "day": day, "realized": realized,
+                    "value_d": value_d, "value_now": round(m["value_now"], 2),
+                    "note": f"settled {m['settled']}" if m.get("settled") else ""})
+    out.sort(key=lambda r: -abs(r["day"]))
+    return out
+
+
+def market_label(event: str, ticker: str) -> str:
+    """A market as the dashboard prints it under its event: the strike
+    suffix (KXCPIYOY-26NOV-T3.6 -> T3.6)."""
+    return ticker[len(event) + 1:] if ticker.startswith(event + "-") else ticker
 
 
 def fetch_market_info(client, tickers):
@@ -809,7 +853,8 @@ def build_portfolio(now_utc: datetime):
             else:
                 note = ""
             rows.append({"event": ev, "day": day, "realized": realized,
-                         "value_d": value_d, "value_now": value_now, "note": note})
+                         "value_d": value_d, "value_now": value_now, "note": note,
+                         "markets": market_rows(ev, e.get("markets") or {})})
         no_trade_cash = round(cash - _f(prior.get("cash")) - trade_cash, 2)
         net_transfers = fetch_net_transfers(client, prior_created, now_utc)
         check = (sum(r["day"] for r in rows) - trade_cash
@@ -964,6 +1009,34 @@ def family_movers(rows, top_n: int = 25, per_family: int = 3):
     return shown, totals, (len(hidden), hidden_net)
 
 
+MARKETS_PER_EVENT = 2
+
+
+def mover_lines(r) -> list:
+    """[(level, label, sub, numbers, tag)] for one event row of the movers
+    table and, under it, its markets: the dashboard's family / event /
+    market, levels 1 and 2. `sub` is the dashboard's group label beside an
+    event (CPI & inflation, Treasury yields, ...; none where the group is
+    just the series). An event whose moves came from two or more markets
+    lists its top MARKETS_PER_EVENT; a single moving market's strike rides
+    on the event line rather than repeating its numbers. A trailing
+    (2, "+N more markets", "", None, "") line counts the rest."""
+    _fam, grp = family_and_group(r["event"])
+    series = r["event"].split("-", 1)[0]
+    sub = grp if grp and grp != series else ""
+    mk = r.get("markets") or []
+    if len(mk) == 1:
+        sub = (sub + " · " if sub else "") + market_label(r["event"], mk[0]["ticker"])
+    out = [(1, r["event"], sub, r, _mover_tag(r))]
+    if len(mk) >= 2:
+        for m in mk[:MARKETS_PER_EVENT]:
+            out.append((2, market_label(r["event"], m["ticker"]), "", m, m.get("note") or ""))
+        rest = len(mk) - MARKETS_PER_EVENT
+        if rest > 0:
+            out.append((2, f"+{rest} more market{'s' if rest != 1 else ''}", "", None, ""))
+    return out
+
+
 def _mover_tag(r) -> str:
     """Why an event moved: the settlement/new/closed note when there is one,
     otherwise whether the move was realized (a sell), a pure mark change, or
@@ -1078,21 +1151,39 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                      + ("" if d_perps is None else
                         f"  +  perpetuals {d_perps:+,.2f}"))
     lines.append("")
-    lines.append(f"Biggest movers since yesterday, by family (settled + unrealized; "
-                 f"top {len(movers)} of {mv_tot['n_families']} families):")
-    lines.append(f"{'FAMILY':28s} {'DAY P&L':>9s} {'REALIZED':>9s} "
+    # the risk-controls block under the account summary, as in the html
+    # (Jack 2026-10-03: "move the risk controls section right under the
+    # chart at the top")
+    if imm and imm.get("risk_text"):
+        lines.append("")
+        lines.append(imm["risk_text"])
+    lines.append("")
+    lines.append(f"Biggest movers since yesterday, by family / event / market, grouped "
+                 f"as on the IMM dashboard (settled + unrealized; top {len(movers)} of "
+                 f"{mv_tot['n_families']} families):")
+    lines.append(f"{'FAMILY / EVENT / MARKET':56s} {'DAY P&L':>9s} {'REALIZED':>9s} "
                  f"{'UNREALIZED':>10s} {'OPEN NOW':>9s}")
     for name, g in movers:
         n = len(g["rows"])
-        lines.append(f"{name[:28]:28s} {g['day']:>+9.2f} {g['realized']:>+9.2f} "
-                     f"{g['unreal']:>+10.2f} {g['value_now']:>9.2f}"
-                     f"  ({n} event{'s' if n != 1 else ''})")
+        lines.append(f"{(name + f' ({n} event' + ('s' if n != 1 else '') + ')')[:56]:56s} "
+                     f"{g['day']:>+9.2f} {g['realized']:>+9.2f} "
+                     f"{g['unreal']:>+10.2f} {g['value_now']:>9.2f}")
         for r in g["top"]:
-            lines.append(f"    {r['event']:34s} {r['day']:>+9.2f}  {_mover_tag(r)}")
+            for lvl, lbl, sub, x, tag in mover_lines(r):
+                lbl = "  " * lvl + lbl + (f"  {sub}" if sub else "")
+                if x is None:
+                    lines.append(lbl)
+                    continue
+                lines.append(f"{lbl[:56]:56s} {x['day']:>+9.2f} {x['realized']:>+9.2f} "
+                             f"{x['value_d']:>+10.2f} {x['value_now']:>9.2f}"
+                             + (f"  {tag}" if tag else ""))
+        more = n - len(g["top"])
+        if more > 0:
+            lines.append(f"  +{more} more event{'s' if more != 1 else ''}")
     if mv_hidden_n:
-        lines.append(f"{'+' + str(mv_hidden_n) + ' more families':28s} "
+        lines.append(f"{'+' + str(mv_hidden_n) + ' more families':56s} "
                      f"{mv_hidden_net:>+9.2f}")
-    lines.append(f"{'ALL FAMILIES':28s} {mv_tot['day']:>+9.2f} {mv_tot['realized']:>+9.2f} "
+    lines.append(f"{'ALL FAMILIES':56s} {mv_tot['day']:>+9.2f} {mv_tot['realized']:>+9.2f} "
                  f"{mv_tot['unreal']:>+10.2f} {mv_tot['value_now']:>9.2f}"
                  f"  ({mv_tot['n_events']} events)")
     if not movers:
@@ -1145,38 +1236,57 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                  'alt="Daily account balance" width="760" '
                  'style="width:100%;max-width:760px;height:auto"></div>')
 
-    h.append(f'<div style="font-size:15px;font-weight:600;margin:12px 0 4px">'
-             f'Biggest movers since yesterday, by family'
+    # the risk-controls block right under the chart (Jack 2026-10-03: "move
+    # the risk controls section right under the chart at the top"); the IMM
+    # section builds it and hands it over on its own
+    if imm and imm.get("risk_html"):
+        h.append(imm["risk_html"])
+
+    h.append(f'<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
+             f'Biggest movers since yesterday, by family / event / market'
              f' <span style="color:{C_MUTED};font-weight:400;font-size:13px">'
-             f'settled + unrealized &middot; top {len(movers)} of '
-             f'{mv_tot["n_families"]} families</span></div>')
+             f'grouped as on the IMM dashboard &middot; settled + unrealized '
+             f'&middot; top {len(movers)} of {mv_tot["n_families"]} families</span></div>')
     if movers:
+        mono = "font-family:Consolas,Menlo,monospace;font-size:12px"
         h.append('<table style="border-collapse:collapse;font-size:13px">')
         h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
-                 f'<td style="{TDL}">Family</td><td style="{TD}">Day P&amp;L $</td>'
+                 f'<td style="{TDL}">Family / event / market</td>'
+                 f'<td style="{TD}">Day P&amp;L $</td>'
                  f'<td style="{TD}">Realized $</td><td style="{TD}">Unrealized $</td>'
-                 f'<td style="{TD}">Open now $</td>'
-                 f'<td style="{TDL}">Top events (by size of move)</td></tr>')
-        for i, (name, g) in enumerate(movers):
-            bg = "#fafafa" if i % 2 else "#fff"
-            evs = "<br>".join(
-                f'{r["event"]}&nbsp; {_pnl_span(r["day"])} '
-                f'<span style="color:{C_MUTED}">{_mover_tag(r)}</span>'
-                for r in g["top"])
-            more = len(g["rows"]) - len(g["top"])
-            if more > 0:
-                evs += f'<br><span style="color:{C_MUTED}">+{more} more</span>'
+                 f'<td style="{TD}">Open now $</td><td style="{TDL}">Why</td></tr>')
+        for name, g in movers:
             n = len(g["rows"])
-            h.append(f'<tr style="background:{bg}">'
-                     f'<td style="{TDL}vertical-align:top">{name}'
-                     f'<div style="color:{C_MUTED};font-size:11px">'
-                     f'{n} event{"s" if n != 1 else ""}</div></td>'
-                     f'<td style="{TD}font-weight:600;vertical-align:top">'
-                     f'{_pnl_span(g["day"])}</td>'
-                     f'<td style="{TD}vertical-align:top">{_pnl_span(g["realized"])}</td>'
-                     f'<td style="{TD}vertical-align:top">{_pnl_span(g["unreal"])}</td>'
-                     f'<td style="{TD}vertical-align:top">{g["value_now"]:,.2f}</td>'
-                     f'<td style="{TDL}font-size:12px">{evs}</td></tr>')
+            h.append(f'<tr style="background:#f6f6f4">'
+                     f'<td style="{TDL}font-weight:700">{_esc(name)} '
+                     f'<span style="color:{C_MUTED};font-weight:400;font-size:11px">'
+                     f'{n} event{"s" if n != 1 else ""}</span></td>'
+                     f'<td style="{TD}font-weight:700">{_pnl_span(g["day"])}</td>'
+                     f'<td style="{TD}">{_pnl_span(g["realized"])}</td>'
+                     f'<td style="{TD}">{_pnl_span(g["unreal"])}</td>'
+                     f'<td style="{TD}">{g["value_now"]:,.2f}</td>'
+                     f'<td style="{TDL}"></td></tr>')
+            for r in g["top"]:
+                for lvl, lbl, sub, x, tag in mover_lines(r):
+                    pad = "padding-left:22px;" if lvl == 1 else "padding-left:42px;"
+                    lab = (f'<span style="{mono}">{_esc(lbl)}</span>' if x is not None
+                           else f'<span style="color:{C_MUTED};font-size:11px">{_esc(lbl)}</span>')
+                    if sub:
+                        lab += f' <span style="color:{C_MUTED};font-size:11px">{_esc(sub)}</span>'
+                    if x is None:
+                        h.append(f'<tr><td style="{TDL}{pad}" colspan="6">{lab}</td></tr>')
+                        continue
+                    h.append(f'<tr>'
+                             f'<td style="{TDL}{pad}">{lab}</td>'
+                             f'<td style="{TD}">{_pnl_span(x["day"])}</td>'
+                             f'<td style="{TD}">{_pnl_span(x["realized"])}</td>'
+                             f'<td style="{TD}">{_pnl_span(x["value_d"])}</td>'
+                             f'<td style="{TD}">{x["value_now"]:,.2f}</td>'
+                             f'<td style="{TDL}color:{C_MUTED};font-size:12px">{_esc(tag)}</td></tr>')
+            more = n - len(g["top"])
+            if more > 0:
+                h.append(f'<tr><td style="{TDL}padding-left:22px;color:{C_MUTED};font-size:11px" '
+                         f'colspan="6">+{more} more event{"s" if more != 1 else ""}</td></tr>')
         if mv_hidden_n:
             h.append(f'<tr style="color:{C_MUTED}">'
                      f'<td style="{TDL}">+{mv_hidden_n} more families</td>'

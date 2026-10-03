@@ -13381,33 +13381,6 @@ class TestOpportunisticEmail(unittest.TestCase):
         bot.state.scan_evicted_events["KXNOVEL-99DEC31"] = time.time()
         self.assertEqual(qg.scan_gap_label(bot, t, now), "evicted")
 
-    def test_digest_finecon_section_reports_open_scan(self):
-        import send_imm_digest as sd
-        today = datetime.now(timezone.utc).astimezone(imm.CT).date()
-        state = {"selected_tickers": ["KXNOVEL-99DEC31-T5", "KXSPRLVL-26SEP09-T286"],
-                 "scan_members": ["KXNOVEL-99DEC31-T5"],
-                 "scan_admit_day": today.isoformat(), "scan_admits_today": 2,
-                 "scan_evicted_events": {"KXDEAD-26SEP09": 1.0},
-                 "accrued_est": {"KXNOVEL-99DEC31-T5": 1.25,
-                                 "KXSPRLVL-26SEP09-T286": 0.5},
-                 "own_pos": {"KXNOVEL-99DEC31-T5": -7}}
-        w = {"day": {"events": {}}, "week": {"events": {}}}
-        L, html = sd.finecon_section(state, w, today)
-        text = "\n".join(L)
-        self.assertIn("OPEN SCAN", text)
-        self.assertIn(f"Quoting 1/{imm.SCAN_TOP_N} slots (hard cap "
-                      f"{imm.SCAN_TOP_N}, no daily openings)", text)
-        self.assertIn("1 event(s) evicted", text)
-        self.assertIn("KXNOVEL-99DEC31-T5", text)
-        self.assertNotIn("HALTED", text)
-        self.assertIn("Open scan", html)
-        # the finecon half still reports its own member
-        self.assertIn("KXSPRLVL-26SEP09-T286", text)
-        state["scan_halt_day"] = today.isoformat()
-        L, html = sd.finecon_section(state, w, today)
-        self.assertIn("HALTED today", "\n".join(L))
-        self.assertIn("HALTED today", html)
-
 
 class TestFineconFamilyRule(unittest.TestCase):
     """Jack 2026-09-09: "add a family rule for central banks, they are

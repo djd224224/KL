@@ -239,20 +239,27 @@ class DashboardWindowsTests(_DigestTest):
                  "_cutoff_audit_html": mock.Mock(return_value=""),
                  "_calibration_caveat_text": mock.Mock(return_value=[]),
                  "_calibration_caveat_html": mock.Mock(return_value=""),
-                 "health_line": mock.Mock(return_value="Bot: alive"),
-                 "finecon_section": mock.Mock(return_value=([], ""))}
+                 "health_line": mock.Mock(return_value="Bot: alive")}
         pick = {"kalshi": {}, "rows": []}
         with mock.patch.multiple(sd, **stubs), \
                 mock.patch.object(sd.imm_pickoff, "scan", return_value=pick), \
                 mock.patch.object(sd.imm_pickoff, "text_lines", return_value=[]), \
                 mock.patch.object(sd.imm_pickoff, "html_block", return_value=""), \
                 mock.patch.object(sd.imm_pickoff, "error_text", return_value=""):
-            text, html = sd.build_digest(now)
+            text, html, risk_text, risk_html = sd.build_digest(now)
         row = "{:10s} {:>11s} {:>11s} {:>11s}"
         self.assertIn(row.format("yesterday", "-317.39", "+897.48", "+580.09"), text)
         self.assertIn(row.format("7 days", "-1,574.46", "+3,940.24", "+2,365.78"), text)
         self.assertNotIn("EVENTS TRADED", text)
         self.assertNotIn("Events traded", html)
+        # Jack 2026-10-03: the risk block rides on its own (the portfolio
+        # email puts it under its chart); finecon / open scan are gone
+        self.assertNotIn("RISK CONTROLS", text)
+        self.assertIn("RISK CONTROLS", risk_text)
+        self.assertIn("Risk controls", risk_html)
+        for gone in ("FINECON", "OPEN SCAN", "Finecon sweep", "Open scan"):
+            self.assertNotIn(gone, text)
+            self.assertNotIn(gone, html)
         dated = [ln for ln in text.splitlines() if ln[:5] == "2026-"]
         self.assertEqual(len(dated), 30)
         self.assertTrue(dated[0].startswith("2026-10-01"))
@@ -279,28 +286,17 @@ class SectionTests(_DigestTest):
         from unittest import mock
         body = ">> " + self.sd.imm_pickoff.HEADER + ": KXFOO\nrest"
         with tempfile.TemporaryDirectory() as d, \
-                mock.patch.object(self.sd, "build_digest", return_value=(body, "<div>x</div>")):
+                mock.patch.object(self.sd, "build_digest",
+                                  return_value=(body, "<div>x</div>", "RISK", "<div>r</div>")):
             p = os.path.join(d, "s.json")
             self.assertEqual(self.sd.main(["--section-out", p]), 0)
             with open(p, encoding="utf-8") as f:
                 sec = json.load(f)
         self.assertEqual((sec["text"], sec["html"]), (body, "<div>x</div>"))
+        # the risk block travels on its own, for the portfolio email's chart
+        self.assertEqual((sec["risk_text"], sec["risk_html"]), ("RISK", "<div>r</div>"))
         self.assertEqual(sec["subject_flag"], " - " + self.sd.imm_pickoff.HEADER)
         self.assertEqual(self.sd.subject_flag("no window today"), "")
-
-    def test_finecon_line_reads_n_a_without_a_window(self):
-        from unittest import mock
-        today = datetime(2026, 10, 2).date()
-        state = {"selected_tickers": ["KXSPRLVL-26SEP09-T286"]}
-        w = {"day": {"events": None},
-             "week": {"events": {"KXSPRLVL-26SEP09": {"realized": -1.5, "settle": 0.0,
-                                                      "unrealized": 0.0}}}}
-        with mock.patch.object(self.sd.imm, "FINECON_SERIES", frozenset({"KXSPRLVL"})), \
-                mock.patch.object(self.sd, "load_credit_ledger", return_value=([], {})):
-            L, html = self.sd.finecon_section(state, w, today)
-        self.assertIn("Group trading P&L: yesterday n/a (0 events), 7 days -1.50 (1 events).",
-                      "\n".join(L))
-        self.assertIn("trading P&amp;L yesterday n/a", html)
 
 
 if __name__ == "__main__":

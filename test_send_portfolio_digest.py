@@ -7,6 +7,9 @@ import unittest
 
 import send_portfolio_digest as pf
 
+# families must not depend on the live bot's state file
+pf._SERIES_CATS = {}
+
 
 def _row(event, realized=0.0, value_d=0.0, value_now=0.0, note=""):
     return {"event": event, "day": round(realized + value_d, 2),
@@ -34,8 +37,8 @@ class FamilyMoversTests(unittest.TestCase):
     def test_ranked_by_size_of_move_with_exact_split(self):
         shown, tot, (hidden_n, hidden_net) = pf.family_movers(ROWS, top_n=10)
         names = [n for n, _ in shown]
-        self.assertEqual(names[0], "Crypto monthly touch")       # |-432.86| biggest
-        self.assertEqual(names[1], "High temps (KXHIGH*)")      # |+109.33|
+        self.assertEqual(names[0], "Crypto")                    # |-432.86| biggest
+        self.assertEqual(names[1], "Weather & quakes")          # |+109.33|
         crypto = shown[0][1]
         self.assertAlmostEqual(crypto["day"], -432.86, places=2)
         self.assertAlmostEqual(crypto["realized"], 11.37, places=2)
@@ -57,7 +60,7 @@ class FamilyMoversTests(unittest.TestCase):
 
     def test_top_events_within_a_family_by_size_of_move(self):
         shown, _, _ = pf.family_movers(ROWS, per_family=1)
-        crypto = dict(shown)["Crypto monthly touch"]
+        crypto = dict(shown)["Crypto"]
         self.assertEqual([r["event"] for r in crypto["top"]], ["KXBTCMAXMON-BTC-26SEP30"])
 
     def test_hidden_tail_reconciles_to_the_total(self):
@@ -77,13 +80,17 @@ class FamilyMoversTests(unittest.TestCase):
                          "mostly mark (settled yes)")
         self.assertEqual(pf._mover_tag(_row("X", value_d=1.0, note="new")), "new")
 
-    def test_default_shows_25_families(self):
-        # Jack 2026-09-22: "show up to 25 families, not 10"
+    def test_default_shows_every_dashboard_family(self):
+        # Jack 2026-09-22: "show up to 25 families, not 10"; the dashboard's
+        # taxonomy has fewer than that, so every family shows
+        shown, tot, (hidden_n, _) = pf.family_movers(ROWS)
+        self.assertEqual(len(shown), tot["n_families"])
+        self.assertEqual(hidden_n, 0)
+        # unknown series share the dashboard's "Other prints" family
         rows = [_row(f"KXSERIES{i:02d}-26DEC31", value_d=float(40 - i)) for i in range(40)]
-        shown, tot, (hidden_n, _) = pf.family_movers(rows)
-        self.assertEqual(len(shown), 25)
-        self.assertEqual(hidden_n, 15)
-        self.assertEqual(tot["n_families"], 40)
+        shown, tot, _ = pf.family_movers(rows)
+        self.assertEqual([n for n, _ in shown], ["Other prints"])
+        self.assertEqual(len(shown[0][1]["rows"]), 40)
 
     def test_empty(self):
         shown, tot, hidden = pf.family_movers([])
@@ -93,19 +100,34 @@ class FamilyMoversTests(unittest.TestCase):
 
 
 class FamilyRulesTests(unittest.TestCase):
-    def test_new_families_roll_up(self):
-        self.assertEqual(pf.family_for("KXNFLTD-26SEP21-A"), "NFL (KXNFL*)")
-        self.assertEqual(pf.family_for("KXNFLSPREAD-26SEP21-B"), "NFL (KXNFL*)")
-        self.assertEqual(pf.family_for("KXRT-PRI"), "Rotten Tomatoes (KXRT)")
-        self.assertEqual(pf.family_for("KXANFCC-26OCT07"), "Carbon Arc cards (KX*CC)")
-        self.assertEqual(pf.family_for("KXDKNGAPP-26OCT08"), "App downloads (KX*APP)")
-        # Netflix is not football: the NFL prefix must not swallow KXNFLX*
-        self.assertEqual(pf.family_for("KXNFLXAPP-26OCT08"), "App downloads (KX*APP)")
-        # earlier rules still win where they overlap
-        self.assertEqual(pf.family_for("KXEARNINGSMENTIONCOST-26SEP24"), "Mention markets")
-        self.assertEqual(pf.family_for("KXBTCMAXMON-BTC-26SEP30"), "Crypto monthly touch")
-        # unknown series still shows as itself
-        self.assertEqual(pf.family_for("KXLARGECUT-26"), "KXLARGECUT")
+    """Jack 2026-10-03: "mirror the family/event/market in the table in
+    imm_dashboard.html#drivers when grouping families in the table in the
+    email e.g. AI & tech, Company KPIs, Crypto, Elections"."""
+
+    def test_families_are_the_dashboards(self):
+        import imm_dashboard
+        for ev in ("KXNFLTD-26SEP21-A", "KXRT-PRI", "KXANFCC-26OCT07", "KXDKNGAPP-26OCT08",
+                   "KXNFLXAPP-26OCT08", "KXEARNINGSMENTIONCOST-26SEP24",
+                   "KXBTCMAXMON-BTC-26SEP30", "KXCPIYOY-26NOV", "KXVOTEGENERAL-GOVAK-26JKRE",
+                   "KXOPENSHARE-26OCT05", "KXHOOD-26NOVFUNDED", "KXLARGECUT-26"):
+            series = ev.split("-", 1)[0]
+            self.assertEqual(pf.family_and_group(ev), imm_dashboard.family_of(series), ev)
+        self.assertEqual(pf.family_for("KXCPIYOY-26NOV"), "Econ & rates")
+        self.assertEqual(pf.family_for("KXBTCMAXMON-BTC-26SEP30"), "Crypto")
+        self.assertEqual(pf.family_for("KXVOTEGENERAL-GOVAK-26JKRE"), "Elections")
+        self.assertEqual(pf.family_for("KXOPENSHARE-26OCT05"), "AI & tech")
+        self.assertEqual(pf.family_for("KXHOOD-26NOVFUNDED"), "Company KPIs")
+        # Netflix is not football, as on the dashboard
+        self.assertEqual(pf.family_for("KXNFLXAPP-26OCT08"), "Carbon Arc consumer")
+        self.assertEqual(pf.family_for("KXLARGECUT-26"), "Other prints")
+
+    def test_kalshi_category_places_an_unknown_series(self):
+        saved = pf._SERIES_CATS
+        try:
+            pf._SERIES_CATS = {"KXLARGECUT": "Economics"}
+            self.assertEqual(pf.family_for("KXLARGECUT-26"), "Econ & rates")
+        finally:
+            pf._SERIES_CATS = saved
 
 
 class BuildEmailTests(unittest.TestCase):
@@ -118,11 +140,11 @@ class BuildEmailTests(unittest.TestCase):
 
     def test_section_present_in_text_and_html(self):
         subject, text, html = pf.build_email(self._pf(), [], chart_ok=False)
-        self.assertIn("Biggest movers since yesterday, by family", text)
-        self.assertIn("Biggest movers since yesterday, by family", html)
-        # ranked: crypto first, temps second, in both parts
-        self.assertLess(text.index("Crypto monthly touch"), text.index("High temps (KXHIGH*)"))
-        self.assertLess(html.index("Crypto monthly touch"), html.index("High temps (KXHIGH*)"))
+        self.assertIn("Biggest movers since yesterday, by family / event / market", text)
+        self.assertIn("Biggest movers since yesterday, by family / event / market", html)
+        # ranked: crypto first, weather second, in both parts
+        self.assertLess(text.index("Crypto"), text.index("Weather & quakes"))
+        self.assertLess(html.index("Crypto"), html.index("Weather &amp; quakes"))
         # the split and the total row
         self.assertIn("-444.23", text)
         self.assertIn("ALL FAMILIES", text)
@@ -162,6 +184,48 @@ class BuildEmailTests(unittest.TestCase):
         p["net_transfers"] = None
         _, text, _ = pf.build_email(p, [], chart_ok=False)
         self.assertIn("reward credits & deposits +100.00  +  Kalshi's pricing vs mid -374.91", text)
+
+    def test_events_list_their_markets(self):
+        """The dashboard's third level: an event whose move came from two or
+        more markets lists its biggest; a single moving market's strike rides
+        on the event line."""
+        p = self._pf()
+        mk = [{"ticker": "KXCPIYOY-26NOV-T3.6", "day": -26.2, "realized": 0.0,
+               "value_d": -26.2, "value_now": 15.0, "note": ""},
+              {"ticker": "KXCPIYOY-26NOV-T3.7", "day": -11.07, "realized": -4.2,
+               "value_d": -6.87, "value_now": 7.4, "note": ""},
+              {"ticker": "KXCPIYOY-26NOV-T3.5", "day": 3.45, "realized": 0.0,
+               "value_d": 3.45, "value_now": 27.7, "note": "settled yes"}]
+        cpi = _row("KXCPIYOY-26NOV", realized=-4.2, value_d=-29.62, value_now=50.1)
+        cpi["markets"] = mk
+        one = _row("KXRT-YOUC", value_d=5.0, value_now=9.0)
+        one["markets"] = [{"ticker": "KXRT-YOUC-96", "day": 5.0, "realized": 0.0,
+                           "value_d": 5.0, "value_now": 9.0, "note": ""}]
+        p["rows"] = list(ROWS) + [cpi, one]
+        _, text, html = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("Econ & rates", text)
+        self.assertIn("CPI & inflation", text)             # the dashboard's group label
+        self.assertIn("    T3.6", text)                    # top two markets, indented
+        self.assertIn("    T3.7", text)
+        self.assertIn("+1 more market", text)
+        self.assertIn("KXRT-YOUC  96", text)               # one market: on the event line
+        self.assertNotIn("    96", text)
+        self.assertIn(">T3.6<", html)
+        self.assertIn("CPI &amp; inflation", html)
+
+    def test_risk_block_sits_under_the_chart(self):
+        """Jack 2026-10-03: "move the risk controls section right under the
+        chart at the top"; the IMM section hands it over on its own."""
+        imm = {"text": "INCENTIVE MM body", "html": "<div>IMM BODY</div>",
+               "risk_text": "RISK CONTROLS & CAPACITY ...",
+               "risk_html": "<div>RISK BLOCK</div>"}
+        _, text, html = pf.build_email(self._pf(), [], chart_ok=True, imm=imm)
+        self.assertLess(html.index("cid:balancechart"), html.index("RISK BLOCK"))
+        self.assertLess(html.index("RISK BLOCK"), html.index("Biggest movers"))
+        self.assertLess(html.index("Biggest movers"), html.index("IMM BODY"))
+        self.assertEqual(html.count("RISK BLOCK"), 1)
+        self.assertLess(text.index("RISK CONTROLS"), text.index("Biggest movers"))
+        self.assertLess(text.index("Biggest movers"), text.index("INCENTIVE MM body"))
 
     def test_first_run_has_no_residual_line(self):
         _, text, html = pf.build_email(self._pf(first=True), [], chart_ok=False)

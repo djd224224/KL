@@ -7,10 +7,11 @@ this script with --section-out. Run with no arguments (the old 7:10 task) it
 does nothing; --test still sends the section as an email of its own.
 
 Layout: lifetime net, the PICK-OFF block, the P&L windows (yesterday, 7 days,
-lifetime), the last 30 days' daily P&L, the cutoff audit, the risk controls
-(every halt, cap and guard: what fired, what binds, what has slack — see
-imm_risk_controls), the finecon / open-scan tracker and a one-line health
-check.
+lifetime), the last 30 days' daily P&L, the cutoff audit and a one-line
+health check. The risk controls (every halt, cap and guard: what fired, what
+binds, what has slack — see imm_risk_controls) are built here but placed by
+the portfolio email under its chart; the finecon / open-scan tracker was
+removed 2026-10-03.
 
 Everything is the INCENTIVE BOT's own book, not the raw account. Yesterday, 7
 days and the daily table are the IMM dashboard's own figures, read from the
@@ -1404,179 +1405,6 @@ def _cutoff_audit_html(a: dict) -> str:
                 'failed ({}).</div>'.format(repr(e)))
 
 
-def finecon_section(state, w, today_ct):
-    """(text_lines, html) — the Finance/Econ sweep tracker (Jack 2026-09-04
-    "make sure im able to track performance of these"). Three layers, most
-    trustworthy last: current members with the bot's period-to-date accrual
-    ESTIMATE and net inventory; the group's yesterday / 7-days TRADING result
-    (w[key]["events"]: the dashboard's per-event P&L since 2026-10-02, None
-    = n/a); and Kalshi-CREDITED rewards on group events from the recon
-    ledger — the only number that is actual paid money."""
-    fin = getattr(imm, "FINECON_SERIES", frozenset())
-    if not fin:
-        return [], ""
-
-    def _is_fin(ticker_or_event):
-        return ticker_or_event.split("-")[0] in fin
-
-    members = sorted(t for t in (state.get("selected_tickers") or [])
-                     if _is_fin(t))
-    accrued = state.get("accrued_est") or {}
-    own_pos = state.get("own_pos") or {}
-    top_n = getattr(imm, "FINECON_TOP_N", 0)
-
-    def _win_pnl(key):
-        evs = (w.get(key) or {}).get("events")
-        if evs is None:                 # no such window (a stale dashboard)
-            return None, 0
-        tot, n = 0.0, 0
-        for ev, e in evs.items():
-            if _is_fin(ev):
-                tot += e["realized"] + e["settle"] + e["unrealized"]
-                n += 1
-        return tot, n
-
-    def _txt(v):
-        return "n/a" if v is None else "{:+,.2f}".format(v)
-
-    def _span(v):
-        return "n/a" if v is None else _pnl_span(v)
-
-    day_pnl, day_n = _win_pnl("day")
-    week_pnl, week_n = _win_pnl("week")
-    rows, _calib = load_credit_ledger()
-    fin_credits = [(d, ev, a) for d, ev, a in rows if _is_fin(ev)]
-    cred_life = sum(a for _d, _e, a in fin_credits)
-    week_dates = {(today_ct - timedelta(days=i)).isoformat()
-                  for i in range(0, 8)}
-    cred_week = sum(a for d, _e, a in fin_credits if d in week_dates)
-    acc_sum = sum(_f(accrued.get(t)) for t in members)
-
-    # Daily over-cap openings (Jack 2026-09-05): show today's burn when the
-    # state's counter day is current — after a quiet midnight the bot may
-    # not have rolled the day yet, so a stale day reads as 0 used.
-    openings_cap = getattr(imm, "FINECON_DAILY_OPENINGS", 0)
-    used = (int(_f(state.get("finecon_admits_today")))
-            if state.get("finecon_admit_day") == today_ct.isoformat() else 0)
-
-    L = []
-    L.append("FINECON SWEEP (Finance/Econ, top-{} by ROI, "
-             "quote-to-completion)".format(top_n))
-    L.append("Quoting {}/{} slots (+{}/{} daily openings used); est accrued "
-             "this period ${:,.2f} across members.".format(
-                 len(members), top_n, used, openings_cap, acc_sum))
-    if members:
-        L.append("{:36s} {:>9s} {:>7s}".format("MEMBER", "ACCRUED$", "POS"))
-        for t in members:
-            L.append("{:36s} {:>9.2f} {:>+7.0f}".format(
-                t[:36], _f(accrued.get(t)), _f(own_pos.get(t))))
-    else:
-        L.append("  (no members quoting right now)")
-    L.append("Group trading P&L: yesterday {} ({} events), 7 days "
-             "{} ({} events).".format(_txt(day_pnl), day_n, _txt(week_pnl), week_n))
-    L.append("Kalshi-CREDITED rewards on group events: past 7d ${:,.2f}, "
-             "all-time ${:,.2f}{}.".format(
-                 cred_week, cred_life,
-                 "" if fin_credits else " (none in ledger yet — credits land "
-                 "1-2d after each period ends)"))
-
-    h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
-         'Finecon sweep <span style="color:#888;font-weight:400">'
-         '&mdash; top-{} by ROI, quote-to-completion</span></div>'.format(top_n)]
-    h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
-             'quoting <b>{}/{}</b> slots &nbsp;&middot;&nbsp; est accrued '
-             'this period ${:,.2f} &nbsp;&middot;&nbsp; trading P&amp;L yesterday '
-             '{} / 7 days {} &nbsp;&middot;&nbsp; Kalshi-credited 7d '
-             '<b>${:,.2f}</b> / all-time <b>${:,.2f}</b></div>'.format(
-                 len(members), top_n, acc_sum, _span(day_pnl),
-                 _span(week_pnl), cred_week, cred_life))
-    if members:
-        h.append('<table style="border-collapse:collapse">')
-        h.append('<tr style="background:#f0f0f0;font-weight:600">'
-                 '<td style="{0}">MEMBER</td><td style="{1}">ACCRUED$ (est)</td>'
-                 '<td style="{1}">POS</td></tr>'.format(TDL, TD))
-        for i, t in enumerate(members):
-            h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
-                     '<td style="{3}">{4:,.2f}</td>'
-                     '<td style="{3}">{5:+,.0f}</td></tr>'.format(
-                         "#fafafa" if i % 2 else "#fff", TDL, t, TD,
-                         _f(accrued.get(t)), _f(own_pos.get(t))))
-        h.append('</table>')
-    else:
-        h.append('<div style="color:#666;font-size:13px">no members quoting '
-                 'right now.</div>')
-    h.append('<div style="color:#888;font-size:12px;margin-top:4px">ACCRUED '
-             'is the bot&rsquo;s estimator, period-to-date; CREDITED is '
-             'actual Kalshi money from the recon ledger (lands 1&ndash;2d '
-             'after each period ends). Members ride to natural completion, '
-             'so a slot only frees at settlement/cutoff.</div>')
-
-    # OPEN SCAN tier (Jack 2026-09-05 "extend the opportunistic IMM with 15
-    # slots and 5 to scan all markets"): the machine-screened all-market
-    # tier, same walk/openings/quote-to-completion; membership + counters
-    # come straight from the bot's persisted state.
-    scan_top = getattr(imm, "SCAN_TOP_N", 0)
-    if scan_top > 0:
-        scan_members = sorted(state.get("scan_members") or [])
-        s_cap = getattr(imm, "SCAN_DAILY_OPENINGS", 0)
-        s_used = (int(_f(state.get("scan_admits_today")))
-                  if state.get("scan_admit_day") == today_ct.isoformat() else 0)
-        s_halted = state.get("scan_halt_day") == today_ct.isoformat()
-        s_evicted = len(state.get("scan_evicted_events") or {})
-        s_acc = sum(_f(accrued.get(t)) for t in scan_members)
-        s_open = ("+{}/{} daily openings used".format(s_used, s_cap)
-                  if s_cap > 0 else
-                  "hard cap {}, no daily openings".format(scan_top))
-        L.append("OPEN SCAN (all-market tier, top-{} by ROI, machine-screened "
-                 "for adverse selection, quote-to-completion)".format(scan_top))
-        L.append("Quoting {}/{} slots ({}){}; {} "
-                 "event(s) evicted by tripwires to date; est accrued this "
-                 "period ${:,.2f} across members.".format(
-                     len(scan_members), scan_top, s_open,
-                     " — HALTED today (loss budget)" if s_halted else "",
-                     s_evicted, s_acc))
-        if scan_members:
-            L.append("{:36s} {:>9s} {:>7s}".format("MEMBER", "ACCRUED$", "POS"))
-            for t in scan_members:
-                L.append("{:36s} {:>9.2f} {:>+7.0f}".format(
-                    t[:36], _f(accrued.get(t)), _f(own_pos.get(t))))
-        else:
-            L.append("  (no scan members quoting right now)")
-        h.append('<div style="font-size:15px;font-weight:600;margin:14px 0 4px">'
-                 'Open scan <span style="color:#888;font-weight:400">&mdash; '
-                 'all-market tier, top-{} by ROI, machine-screened, '
-                 'quote-to-completion</span></div>'.format(scan_top))
-        h.append('<div style="color:#555;font-size:13px;margin-bottom:4px">'
-                 'quoting <b>{}/{}</b> slots &nbsp;&middot;&nbsp; {}'
-                 '{} &nbsp;&middot;&nbsp; {} event(s) evicted by '
-                 'tripwires &nbsp;&middot;&nbsp; est accrued this period '
-                 '${:,.2f}</div>'.format(
-                     len(scan_members), scan_top, s_open,
-                     ' &nbsp;&middot;&nbsp; <b style="color:#b00">HALTED today'
-                     ' (loss budget)</b>' if s_halted else "",
-                     s_evicted, s_acc))
-        if scan_members:
-            h.append('<table style="border-collapse:collapse">')
-            h.append('<tr style="background:#f0f0f0;font-weight:600">'
-                     '<td style="{0}">MEMBER</td><td style="{1}">ACCRUED$ (est)'
-                     '</td><td style="{1}">POS</td></tr>'.format(TDL, TD))
-            for i, t in enumerate(scan_members):
-                h.append('<tr style="background:{0}"><td style="{1}">{2}</td>'
-                         '<td style="{3}">{4:,.2f}</td>'
-                         '<td style="{3}">{5:+,.0f}</td></tr>'.format(
-                             "#fafafa" if i % 2 else "#fff", TDL, t, TD,
-                             _f(accrued.get(t)), _f(own_pos.get(t))))
-            h.append('</table>')
-        else:
-            h.append('<div style="color:#666;font-size:13px">no scan members '
-                     'quoting right now.</div>')
-    return L, "".join(h)
-
-
-# The dashboard's numbers (Jack 2026-10-02: "adjust email so 'yesterday RAW'
-# will equal the dashboard's total trading P&L"). imm_dashboard.py writes its
-# cards' totals beside the page on every build (~10 min); the email reads
-# those figures instead of re-deriving them, so the two cannot disagree.
 DASH_DIR = os.environ.get("IMM_DASH_DIR", os.path.join(STATUS_DIR, "dashboard"))
 DASH_SUMMARY_PATH = os.path.join(DASH_DIR, "imm_dashboard_summary.json")
 DASH_SUMMARY_STALE_MIN = 45
@@ -1660,20 +1488,13 @@ def lifetime_raw(state: dict, mids: dict):
     return life_realized + life_unreal, life_realized, life_unreal
 
 
-def _as_window_events(evs):
-    """{event: P&L} -> the {event: {realized, settle, unrealized}} shape
-    finecon_section reads; None (no such window) stays None."""
-    if evs is None:
-        return None
-    return {ev: {"realized": p, "settle": 0.0, "unrealized": 0.0} for ev, p in evs.items()}
-
-
 def build_digest(now_utc: datetime):
-    """Returns (plain_text, html): the IMM section of the 7:00 portfolio email
-    (send_portfolio_digest runs this script with --section-out; the IMM's own
-    7:10 email was cut 2026-10-02). Yesterday, 7 days and the daily table are
-    the dashboard's own figures (dashboard_windows); lifetime is the bot's."""
-    today_ct = now_utc.astimezone(CT).date()
+    """Returns (plain_text, html, risk_text, risk_html): the IMM section of
+    the 7:00 portfolio email (send_portfolio_digest runs this script with
+    --section-out; the IMM's own 7:10 email was cut 2026-10-02), and its
+    risk-controls block on its own, which the portfolio email places under
+    its chart. Yesterday, 7 days and the daily table are the dashboard's own
+    figures (dashboard_windows); lifetime is the bot's."""
     today_et = now_utc.astimezone(ET).date()
     client = build_client()
     status = load_json(STATUS_PATH)
@@ -1773,19 +1594,14 @@ def build_digest(now_utc: datetime):
     if _perr:
         L.append(_perr)
     L.append("")
-    # every risk control: what fired, what binds, what has slack (Jack
-    # 2026-10-03); replaces the old capacity-only table
-    L.extend(risk.text_lines(risk_rows, risk_ev, ET, capacity_note()))
-    # the finecon group's trading P&L, from the same dashboard windows
-    w_fin = {"day": {"events": _as_window_events(dw["day"]["events"])},
-             "week": {"events": _as_window_events(dw["week"]["events"])}}
-    fin_L, fin_html = finecon_section(state, w_fin, today_ct)
-    if fin_L:
-        L.append("")
-        L.extend(fin_L)
-    L.append("")
     L.append(health)
     text = "\n".join(L)
+    # The risk-controls block is returned on its own (Jack 2026-10-03: "move
+    # the risk controls section right under the chart at the top"): the
+    # portfolio email places it under its balance chart. The finecon /
+    # open-scan tracker that used to close this section is gone (same day:
+    # "remove open scan and finecon tables and sections").
+    risk_text = "\n".join(risk.text_lines(risk_rows, risk_ev, ET, capacity_note()))
 
     # ---- html ---------------------------------------------------------------
     h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;'
@@ -1864,13 +1680,11 @@ def build_digest(now_utc: datetime):
         h.append('<div style="color:#888;font-size:11px;margin-top:4px">{}'
                  '</div>'.format(imm_pickoff._esc(_perr)))
 
-    h.append(risk.html(risk_rows, risk_ev, ET, capacity_note(), TD, TDL))
-    if fin_html:
-        h.append(fin_html)
     h.append('<div style="color:#777;font-size:12px;margin-top:12px;'
              'border-top:1px solid #eee;padding-top:8px">{}</div>'.format(health))
     h.append("</div>")
-    return text, "".join(h)
+    risk_html = risk.html(risk_rows, risk_ev, ET, capacity_note(), TD, TDL)
+    return text, "".join(h), risk_text, risk_html
 
 
 def subject_flag(text: str) -> str:
@@ -1880,19 +1694,22 @@ def subject_flag(text: str) -> str:
 
 
 def write_section(path: str, now_utc: datetime) -> None:
-    """--section-out: build the section and write {text, html, subject_flag,
-    built_at} as JSON for send_portfolio_digest. A few retries, as the old
-    standalone send had: a Kalshi read can fail on the first try."""
+    """--section-out: build the section and write {text, html, risk_text,
+    risk_html, subject_flag, built_at} as JSON for send_portfolio_digest,
+    which puts the risk block under its chart and the rest after its movers
+    table. A few retries, as the old standalone send had: a Kalshi read can
+    fail on the first try."""
     for attempt in range(1, 4):
         try:
-            text, html = build_digest(now_utc)
+            text, html, risk_text, risk_html = build_digest(now_utc)
             break
         except Exception as e:
             log(f"imm section build attempt {attempt}/3 failed: {e!r}")
             if attempt == 3:
                 raise
             time.sleep(60)
-    out = {"text": text, "html": html, "subject_flag": subject_flag(text),
+    out = {"text": text, "html": html, "risk_text": risk_text,
+           "risk_html": risk_html, "subject_flag": subject_flag(text),
            "built_at": datetime.now(timezone.utc).isoformat()}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1919,11 +1736,11 @@ def main(argv=None) -> int:
         return 0
 
     if args.print_only:
-        body, html = build_digest(datetime.now(timezone.utc))
-        print(body)
+        body, html, risk_text, risk_html = build_digest(datetime.now(timezone.utc))
+        print(risk_text + "\n\n" + body)
         if args.html_out:
             with open(args.html_out, "w", encoding="utf-8") as f:
-                f.write(html)
+                f.write(risk_html + html)
             log(f"wrote {args.html_out}")
         return 0
 
@@ -1937,7 +1754,9 @@ def main(argv=None) -> int:
         return 0
 
     now_utc = datetime.now(timezone.utc)
-    body, html = build_digest(now_utc)
+    body, html, risk_text, risk_html = build_digest(now_utc)
+    # standalone, the risk block leads, as it does under the portfolio chart
+    body, html = risk_text + "\n\n" + body, risk_html + html
     alerter = Alerter("IMM-DIGEST", live=True)
     if not alerter.enabled:
         log("cannot send imm digest: alert credentials not configured")
