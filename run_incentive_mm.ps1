@@ -306,7 +306,7 @@ if ($Probe) {
     # x6 from 10/10. Earnings: +$81/day net, positive 13 of 14 days, net per
     # contract-hour up since the x1.5. Revert either by deleting its pair +
     # restart_imm.ps1 -Task. imm_saturday_tracker reads the window per day.
-    # CAPS DOUBLED SO THEY STOP BINDING (Jack 2026-10-03: "Double collateral
+    # CAPACITY CAPS DOUBLED SO THEY STOP BINDING (Jack 2026-10-03: "Double collateral
     # budget, slot caps, resting order cap, and candidate book cap. I don't
     # want the caps to trip"). The 7:00 email's new risk-controls table had
     # these binding or close over the 24h to 09:40 ET:
@@ -321,17 +321,19 @@ if ($Probe) {
     #   above 4,000 resting on Kalshi.
     # - MAX_CANDIDATE_BOOKS 5000 -> 10000 (was the code default): peaked at
     #   4,647. More books read per refresh only once the universe grows.
-    # - Slot caps x2: every per-event strike cap (IMM_EVENT_TOP_N_MULT=2
-    #   scales the code spec: gas / diesel / TRUEV / data centers / awards /
-    #   OpenRouter share 3 -> 6, uncapped families stay uncapped), open scan
-    #   60 -> 120 slots and 3 -> 6 per event, finecon 25 -> 50 and 3 -> 6.
-    #   They refused 27 + 8 + 3 markets at the last refresh, and some
-    #   market in 99 of 101 refreshes.
+    # - Slot caps were doubled the same afternoon, then REVERTED (Jack
+    #   2026-10-03: "revert Open-scan slots, finecon slots, per-event strike
+    #   caps"): open scan back to 60 slots / 3 per event, finecon 25 / 3,
+    #   per-event strike caps back to the code spec (IMM_EVENT_TOP_N_MULT
+    #   unset = 1). Strikes admitted past 3 per event are trimmed back by the
+    #   lifetime ledger (earliest 3 keep their slots, positions ride); scan
+    #   and finecon members admitted above the cap ride to completion and
+    #   nothing new enters until attrition brings the tier under it.
     # - NOT changed: IMM_MAX_PLACEMENTS_PER_CYCLE stays 1000 (Jack: leave
     #   it). Placements are paced at 12/s for the shared API budget, so a
     #   bigger book defers more placements a cycle instead.
     # Env change => task-level restart (restart_imm.ps1 -Task).
-    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_SCAN_TOP_N=120&& set IMM_SCAN_EVENT_TOP_N=6&& set IMM_FINECON_TOP_N=50&& set IMM_FINECON_EVENT_TOP_N=6&& set IMM_EVENT_TOP_N_MULT=2&&"
+    $ProbeEnv = "set IMM_FORCE_EVENTS=&& set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&&"
 }
 
 while ($true) {

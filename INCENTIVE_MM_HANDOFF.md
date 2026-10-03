@@ -6698,3 +6698,22 @@ Tests: test_imm_risk_controls.py (15, including the 10/3 cash trip end to
 end, the family-cap false alarm, and a contract test that the bot's risk line
 parses). test_send_imm_digest stubs risk_section. TestDigestCapacity lost its
 three capacity_rows cases, now ported.
+
+## 2026-10-03 pm — Slot caps reverted; the budget, resting and candidate caps stay doubled (Jack)
+
+Jack: "revert Open-scan slots, finecon slots, per-event strike caps". The
+launcher drops IMM_SCAN_TOP_N=120, IMM_SCAN_EVENT_TOP_N=6,
+IMM_FINECON_TOP_N=50, IMM_FINECON_EVENT_TOP_N=6 and IMM_EVENT_TOP_N_MULT=2.
+The code defaults are back: scan 60 / 3 per event, finecon 25 / 3, and the
+per-event spec as written (gas, diesel, TRUEV, data centers, awards,
+OpenRouter share at 3). The EVENT_TOP_N_MULT knob stays in code at 1.0.
+
+These stay as set earlier the same day: IMM_COLLATERAL_BUDGET 300000,
+IMM_MAX_TOTAL_RESTING 8000, IMM_MAX_CANDIDATE_BOOKS 10000.
+
+What happens to markets admitted during the ~2h at the doubled caps:
+- Per-event strikes past 3 are trimmed by the lifetime slot ledger: the
+  earliest 3 keep their slots, the rest are deselected and their positions
+  ride.
+- Scan and finecon members above the cap are quote-to-completion and stay.
+  Nothing new enters until attrition brings each tier under its cap.
