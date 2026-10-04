@@ -420,6 +420,67 @@ def family_of(series: str, category: str = ""):
 
 
 # ----------------------------------------------------------------------------
+# Fills through the day (Jack 2026-10-03: "add a section that shows me a
+# timeseries of fills throughout the day, and any relevant info so i can
+# understand the shape of fills throughout the day")
+# ----------------------------------------------------------------------------
+
+# The size multipliers come from the bot's CURRENT schedule. The 0-9 ET x2
+# quiet window it describes started 2026-09-12 (3-7am x2 before), so earlier
+# days carry no multiplier rather than a wrong one.
+FILL_DAY_MULT_FROM = datetime(2026, 9, 12).date()
+
+
+def long_dated_hour_mults(imm, et_day) -> list:
+    """The size multiplier a long-dated market carried in each ET hour of
+    `et_day` (a date): the global quiet window, else the evening window, times
+    the Saturday multiplier -- incentive_mm._hour_window_mult x
+    saturday_size_mult for a series no per-series window, daily class or
+    exclusion touches. 24 floats."""
+    g = imm.global_hour_mults(et_day) or {}
+    ev = imm.evening_hour_mults(et_day) or {}
+    sat = 1.0
+    if et_day.weekday() == 5 and imm.SAT_SIZE_MULT > 0 and imm.SAT_SIZE_MULT != 1.0:
+        sat = imm.gated_sat_mult(et_day) or imm.SAT_SIZE_MULT
+    return [round((g[h] if h in g else ev.get(h, 1.0)) * sat, 2) for h in range(24)]
+
+
+def fill_day_payload(rest, fam_of, h0: int, h1: int, now: float, mult_of=None) -> dict:
+    """Hourly context for the "Fills through the day" section.
+
+    rest: {ticker: {utc_hour: resting $-seconds}} (parse_cycle_file's
+    `rest`); fam_of: ticker -> family; [h0, h1): the UTC hours to cover;
+    mult_of: ET date -> 24 multipliers (long_dated_hour_mults), or None.
+    Returns {"h0": h0, "rest": {family: [average $ resting in each hour]},
+    "mult": {"YYYY-MM-DD": [24 multipliers]}}. The hour still running is
+    averaged over its elapsed seconds."""
+    n = max(0, h1 - h0)
+    out = defaultdict(lambda: [0.0] * n)
+    for t, hs in rest.items():
+        fam = None
+        for h, v in hs.items():
+            if h0 <= h < h1 and v:
+                if fam is None:
+                    fam = fam_of(t)
+                out[fam][h - h0] += v
+    for arr in out.values():
+        for i in range(n):
+            span = min(3600.0, max(1.0, now - (h0 + i) * 3600.0))
+            arr[i] = round(arr[i] / span, 1)
+    mult = {}
+    if mult_of is not None and n:
+        d = max(datetime.fromtimestamp(h0 * 3600, ET).date(), FILL_DAY_MULT_FROM)
+        d1 = datetime.fromtimestamp((h1 - 1) * 3600, ET).date()
+        while d <= d1:
+            try:
+                mult[d.isoformat()] = mult_of(d)
+            except Exception:
+                pass
+            d += timedelta(days=1)
+    return {"h0": h0, "rest": dict(out), "mult": mult}
+
+
+# ----------------------------------------------------------------------------
 # Time windows (ET calendar days, hour-aligned)
 # ----------------------------------------------------------------------------
 
@@ -2876,6 +2937,12 @@ class Builder:
         health = self._health(cycle_ts)
         opp = self._opportunities(selected, cur) if self.api else {"off": True}
         proj = self.projection(snap_by_t, cycle_ts)     # after the API import: the size schedule
+        # fills through the day: resting $ per family per hour + the size schedule
+        fday = fill_day_payload(
+            self.rest, lambda tk: family_of(series_of(tk), cats.get(series_of(tk), ""))[0],
+            int((self.now - HISTORY_DAYS * 86400) // 3600), int(self.now // 3600) + 1,
+            self.now,
+            mult_of=(lambda d: long_dated_hour_mults(_imm_mod, d)) if _imm_mod is not None else None)
         self._t("assemble", t0)
 
         roll = wins["roll"]
@@ -2893,7 +2960,7 @@ class Builder:
             "days": days, "day_fields": list(DAY_FIELDS), "fx_keys": list(FX_KEYS),
             "fcurves": fcurves, "changes": changes, "realize": realize, "proj": proj,
             "struct_cover": self._struct_cover(held),
-            "fills": fills_out, "halts": halts, "health": health, "opp": opp,
+            "fills": fills_out, "fday": fday, "halts": halts, "health": health, "opp": opp,
             "exits": [{"ts": round(e["ts"]), "t": e["t"], "pos": round(e["pos"], 2),
                        "avg": round(e["avg"], 2), "mark": round(e["mark"], 2),
                        "kind": e["kind"], "label": e["label"], "amount": round(e["amount"], 2),

@@ -84,8 +84,30 @@ settlements.
 - **Drivers** (below), **Movers**, **Quoting now** (coverage, share of pool,
   yield in cents per $1 resting per day, why candidates are not quoted),
   **Opportunities**, **Risk & halts** (inventory by event, sorted by worst
-  case), **Fills** (edge and every mark-out horizon per family and per fill),
-  **History** (daily net, modeled vs credited), **Health**.
+  case), **Fill timing** (below), **Fills** (edge and every mark-out horizon
+  per family and per fill), **History** (daily net, modeled vs credited),
+  **Health**.
+- **Fill timing** (Jack 2026-10-03: "a timeseries of fills throughout the day,
+  and any relevant info so i can understand the shape of fills throughout the
+  day"). Maker fills only, ET, following the window and the filter.
+  - The window as three panels on one time axis (15-minute buckets up to a
+    day, hourly for 7 days): contracts filled, the dollars resting in quotes
+    (hourly average, from the cycle logs' `rest`), and the mark-out at the
+    chosen horizon (¢ per contract, drawn from 20 contracts up). Hours where a
+    long-dated market carried a size multiplier above 1 are shaded and labelled
+    (×2 quiet hours, Saturday, the evening window).
+  - The same panels for a typical day by ET hour, averaged over the last 7
+    complete days. The shaded hours use each hour's median multiplier, so one
+    Saturday does not mark a weekday's ×1 hour as larger size.
+  - Tiles: contracts, the busiest hour, the larger-size hours' share of
+    contracts against their share of resting dollars (above the window's own
+    base size), the mark-out, the worst hour. A generated reading and an
+    hour-by-hour table (fill rate = contracts per $1,000 resting per hour).
+  - Data: `fday` = {"h0": first UTC hour, "rest": {family: [$ per hour]},
+    "mult": {ET day: [24 multipliers]}}. Multipliers come from
+    `incentive_mm`'s current schedule (`long_dated_hour_mults`): global window,
+    else the evening window, times Saturday. That schedule describes days
+    from 2026-09-12 (the 0-9 ET ×2 start), so earlier days carry none.
 - **Market drawer:** position and worst case, live quote, reward share,
   per-window P&L as new fills vs carry, 7-day hourly P&L / mark / position,
   fills with edge, 30-minute and to-date mark-outs.

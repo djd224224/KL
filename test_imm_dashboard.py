@@ -509,6 +509,60 @@ class RealizationRollupTests(unittest.TestCase):
         self.assertEqual(dash.rollup_realization(None, self.FAM)["fams"], {})
 
 
+class FillDayTests(unittest.TestCase):
+    """The "Fills through the day" section's hourly context (2026-10-03)."""
+
+    def test_resting_dollars_average_per_family_per_hour(self):
+        h = int(_ts("2026-10-02T14:00:00Z") // 3600)
+        rest = {"KXA-26OCT-T1": {h: 3600 * 100.0, h + 5: 1.0},      # $100 all hour
+                "KXA-26OCT-T2": {h: 1800 * 50.0},                    # $50 for half of it
+                "KXB-26OCT-T1": {h - 1: 3600 * 40.0}}
+        fam = {"KXA": "Fam A", "KXB": "Fam B"}
+        out = dash.fill_day_payload(rest, lambda t: fam[t.split("-")[0]], h - 1, h + 2,
+                                    now=(h + 2) * 3600.0)
+        self.assertEqual(out["h0"], h - 1)
+        self.assertEqual(out["rest"]["Fam A"], [0.0, 125.0, 0.0])   # h + 5 is out of range
+        self.assertEqual(out["rest"]["Fam B"], [40.0, 0.0, 0.0])
+        self.assertEqual(out["mult"], {})                          # no schedule given
+        # the hour still running averages over its elapsed seconds
+        out = dash.fill_day_payload({"KXA-1": {h: 900 * 80.0}}, lambda t: "Fam A", h, h + 1,
+                                    now=h * 3600.0 + 900)
+        self.assertEqual(out["rest"]["Fam A"], [80.0])
+
+    def test_size_multiplier_follows_the_bot_rules(self):
+        from datetime import date
+
+        class FakeImm:
+            SAT_SIZE_MULT = 1.5
+
+            @staticmethod
+            def global_hour_mults(d):
+                return {h: (3.0 if d >= date(2026, 10, 5) else 2.0)
+                        for h in range(9 if d >= date(2026, 10, 5) else 10)}
+
+            @staticmethod
+            def evening_hour_mults(d):
+                return {h: 1.5 for h in range(18, 22)} if d >= date(2026, 10, 5) else {}
+
+            @staticmethod
+            def gated_sat_mult(d):
+                return 2.0 if d >= date(2026, 10, 3) else 0.0
+
+        fri = dash.long_dated_hour_mults(FakeImm, date(2026, 10, 2))
+        self.assertEqual(fri[:10], [2.0] * 10)
+        self.assertEqual(fri[10:], [1.0] * 14)
+        self.assertEqual(dash.long_dated_hour_mults(FakeImm, date(2026, 9, 26))[0], 3.0)  # x2 x Sat x1.5
+        sat = dash.long_dated_hour_mults(FakeImm, date(2026, 10, 3))
+        self.assertEqual((sat[0], sat[12]), (4.0, 2.0))                                  # gated Sat x2
+        mon = dash.long_dated_hour_mults(FakeImm, date(2026, 10, 5))
+        self.assertEqual((mon[8], mon[9], mon[18], mon[22]), (3.0, 1.0, 1.5, 1.0))
+        # the payload carries one row per ET day from FILL_DAY_MULT_FROM on
+        h0 = int(_ts("2026-09-10T04:00:00Z") // 3600)
+        out = dash.fill_day_payload({}, lambda t: "x", h0, h0 + 72, now=(h0 + 72) * 3600.0,
+                                    mult_of=lambda d: dash.long_dated_hour_mults(FakeImm, d))
+        self.assertEqual(sorted(out["mult"]), ["2026-09-12"])
+
+
 class RenderTests(unittest.TestCase):
     def test_data_cannot_close_the_script_tag(self):
         page = dash.render({"x": "</script><script>alert(1)</script>", "timing": {}})
@@ -873,6 +927,16 @@ class BuilderIntegrationTests(unittest.TestCase):
         wc = b.worst_by_event(held)
         self.assertEqual(wc["KXA"], [-9.0, -9.0, "strikes"])          # long 15 @ 60
         self.assertEqual(wc["KXP"], [-0.98, -0.98, "independent"])    # long 7 @ 14
+
+    def test_the_model_carries_the_fill_day_context(self):
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        fd = m["fday"]
+        self.assertEqual(fd["h0"], int((self.NOW - dash.HISTORY_DAYS * 86400) // 3600))
+        self.assertIsInstance(fd["rest"], dict)
+        self.assertIsInstance(fd["mult"], dict)
+        n = int(self.NOW // 3600) + 1 - fd["h0"]
+        for arr in fd["rest"].values():
+            self.assertEqual(len(arr), n)
 
     def test_family_curves_end_on_the_window_totals(self):
         m = dash.Builder(self.NOW, api=False, api_force=False).build()
