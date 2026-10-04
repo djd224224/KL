@@ -7226,3 +7226,40 @@ Tests: TestSportsLadderAsksOff (default and scope, bids only end to end with
 no ask pad, a long gets no unwind ask), TestSportsLadderBlock.
 test_block_switch; the suite turns the ask-off default off at import for
 the two-sided fixtures. 2,000 green.
+
+## 2026-10-04 — Carbon Arc gate rests the sides that earn instead of parking the market (Jack)
+
+Jack, after 45 of 136 October point-of-sale markets sat parked on the
+day-3 read: "the bot should sit on the bid if it's earning money on it, but
+not if it wouldnt earn" -- the NFL props' rule from the same morning ("only
+quote a market if you're earning", drop_unearning_sides).
+
+CHANGE (incentive_mm.py, CA_FAIR_CAP / IMM_CA_FAIR_CAP, default on): a touch
+that fights the Carbon Arc read no longer parks BOTH sides. The side that
+fights it is capped at the limit the breach is judged by -- bids at most
+the band top + CA_FAIR_TOL_CENTS (15), asks at least the band bottom - 15
+(ca_fair_caps; a floor at or under zero is no floor) -- and the caps and
+drop_unearning_sides run last in the quote build, exactly as the NFL caps
+do (exact levels on sub-penny books): a side whose capped rungs the
+program's scored walk no longer reaches does not rest; the side the read
+favours quotes at the (safe-)join as usual. The refresh hold (a new read
+parks both sides for 10 minutes) is unchanged. Logs: "ca-fair capped <t>:
+<book vs fair>; bids capped at Xc ..." once per episode, "ca-fair not
+earning <t>: bid side(s) out of the scored walk ..." when a side drops,
+"ca-fair uncapped <t>" when the book is back inside the band (or the read
+goes away). A capped market writes its normal cycle_log row (no guard skip).
+
+DRY RUN on the live books (14:28Z, the 46 markets parked under the old
+rule): 22 bid breaches rest the ask only (the bid capped behind a deep
+touch earns nothing), 14 rest the ask plus a bid at the cap (thin front:
+the walk still reaches it), 8 ask breaches rest the bid plus an ask at the
+floor, 2 no longer breach. None stays parked.
+
+KILL: IMM_CA_FAIR_CAP=0 (launcher env, restart_imm.ps1 -Task) restores the
+both-sides stand-aside.
+
+Tests (TestCarbonArcFairGate): test_caps_are_the_breach_limits,
+test_bid_touch_over_fair_rests_only_the_earning_side_then_resumes,
+test_a_capped_bid_that_still_earns_rests_at_its_cap,
+test_ask_touch_under_fair_rests_only_the_bid,
+test_cap_off_parks_both_sides_as_before. 2,003 green.

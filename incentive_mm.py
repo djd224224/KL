@@ -6594,6 +6594,7 @@ _CONFIG_CODE_KNOBS = (
     # carbon_arc_fair.py and ride along in the fair file's "model" block
     "CA_FAIR_ENABLE", "CA_FAIR_TOL_CENTS", "CA_FAIR_TTL_MIN",
     "CA_FAIR_SIGMA_LO_FRAC", "CA_FAIR_MAX_REL_SIGMA", "CA_FAIR_REFRESH_HOLD_MIN",
+    "CA_FAIR_CAP",
     # OpenRouter token-usage gate (2026-09-27); model knobs ride in the
     # fair file's "model" block (openrouter_fair.py)
     "OR_FAIR_ENABLE", "OR_FAIR_SERIES", "OR_FAIR_TOL_CENTS", "OR_FAIR_TTL_MIN",
@@ -7340,11 +7341,13 @@ def rain_fair_p(ticker: str, now_ts: float) -> Optional[float]:
 # sigma) for the FIRST print (the value these contracts settle on) and
 # writes CA_FAIR_FILE; a daemon thread started in run() refreshes it every
 # CA_FAIR_REFRESH_SECS and the quote loop hot-reloads it by mtime. A strike
-# K is worth P(first print > K). The gate stands a Carbon Arc-settled market
-# down on BOTH sides while its external touch fights that fair on the side
-# that would fill us badly (bid touch > fair+TOL: joining pays over fair;
-# ask touch < fair-TOL: joining sells under it) and resumes when they agree
-# again. What it is for: the stretch after a Carbon Arc refresh before the
+# K is worth P(first print > K). While a Carbon Arc-settled market's
+# external touch fights that fair on the side that would fill us badly (bid
+# touch > fair+TOL: joining pays over fair; ask touch < fair-TOL: joining
+# sells under it) that side is capped at fair+-TOL and rests only if it
+# still earns there (CA_FAIR_CAP, 2026-10-04; until then BOTH sides stood
+# aside) until they agree again. What it is for: the stretch after a Carbon
+# Arc refresh before the
 # book reprices, when our resting touch quotes were the ones picked off
 # (fills 9/06-9/26 marked out -7.8c/contract, bids -14.6c), and strikes the
 # book prices far from the read. Missing, stale (per-entry TTL) or
@@ -7376,6 +7379,33 @@ CA_FAIR_FILE = os.environ.get(
 # series -> entry; series -> epoch its read last moved (refresh hold)
 _ca_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}}
 _CA_STRIKE_RE = re.compile(r"-T(-?\d+(?:\.\d+)?)$")
+# REST THE SIDES THAT EARN, NOT A PARKED MARKET (Jack 2026-10-04: "the bot
+# should sit on the bid if it's earning money on it, but not if it wouldnt
+# earn"). A touch that fights the read used to park BOTH sides: on 10/4,
+# 45 of 136 October point-of-sale markets earned nothing while the side the
+# read favoured sat idle. Now the side that fights the read is capped at the
+# limit a breach is judged by (bids at most the band top + CA_FAIR_TOL_CENTS,
+# asks at least the band bottom - it) and rests only if it still earns there
+# (drop_unearning_sides -- the NFL props' rule from the same morning, "only
+# quote a market if you're earning"); the other side quotes at the touch as
+# usual. A capped rung behind a deep touch earns nothing and fills only when
+# the book moves through it, so it does not rest. The refresh hold still
+# parks both sides. IMM_CA_FAIR_CAP=0 restores the both-sides stand-aside.
+CA_FAIR_CAP = os.environ.get("IMM_CA_FAIR_CAP", "1") == "1"
+
+
+def ca_fair_caps(lo_c: float, hi_c: float
+                 ) -> Tuple[Optional[int], Optional[int]]:
+    """(bid_cap, ask_floor) in whole cents for a Carbon Arc market whose
+    touch fights its read: bids at most the band top + CA_FAIR_TOL_CENTS,
+    asks at least the band bottom - CA_FAIR_TOL_CENTS -- the limits
+    fair_gate_breach judges the touch by, so a touch inside them is never
+    moved. A floor at or under zero is no floor (mort_cap_quotes never moves
+    an ask under 0); None = that side not at all."""
+    bid_cap = int(math.floor(hi_c + CA_FAIR_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(lo_c - CA_FAIR_TOL_CENTS - 1e-9))
+    return (bid_cap if bid_cap >= 1 else None,
+            max(0, ask_floor) if ask_floor <= 99 else None)
 
 
 def load_ca_fair() -> Tuple[int, int]:
@@ -11674,6 +11704,8 @@ class IncentiveMarketMaker:
         self._loaded_credit: Set[str] = set()
         self._rain_fair_stood: Set[str] = set()   # rain-fair stand-asides (for edge logs)
         self._ca_fair_stood: Set[str] = set()     # Carbon Arc fair stand-asides
+        self._ca_fair_capped: Set[str] = set()    # ...and capped markets
+        self._ca_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._or_fair_stood: Set[str] = set()     # OpenRouter token-usage stand-asides
         self._share_fair_stood: Set[str] = set()  # OpenRouter market-share stand-asides
         self._rain_monthly_stood: Set[str] = set()  # monthly rain stand-asides
@@ -16766,12 +16798,16 @@ class IncentiveMarketMaker:
 
             # CARBON ARC FAIR GATE (Jack 2026-09-26, see CA_FAIR_ENABLE): the
             # rain gate's shape on Carbon Arc's month-to-date read. Quotes
-            # still join the touch unchanged; a touch that fights the read on
-            # the adverse side parks BOTH sides until they agree again
-            # (sticky selection keeps the market meanwhile).
+            # still join the touch; a new read parks BOTH sides for the
+            # refresh hold (sticky selection keeps the market meanwhile), and
+            # a touch that fights the read on the adverse side caps that side
+            # -- ca_caps, applied last below, where only a side that still
+            # earns rests (CA_FAIR_CAP; off, the breach parks both sides).
+            ca_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
             if CA_FAIR_ENABLE and carbon_arc_settled(meta.series):
                 ca_why = ""
                 ca_in: dict = {}     # guard-skip inputs, built on THIS path
+                band = None
                 if ca_refresh_held(t, now_ts):
                     ca_why = (f"new Carbon Arc read, holding "
                               f"{CA_FAIR_REFRESH_HOLD_MIN:g}m while the book "
@@ -16785,17 +16821,29 @@ class IncentiveMarketMaker:
                             ext_bid, ext_ask, plo * 100.0, CA_FAIR_TOL_CENTS,
                             phi * 100.0)
                         if ca_bid_bad or ca_ask_bad:
-                            ca_why = (f"book {ext_bid}x{ext_ask} vs fair "
-                                      f"{pc * 100:.0f}c [{plo * 100:.0f}-"
-                                      f"{phi * 100:.0f}] (tol "
-                                      f"{CA_FAIR_TOL_CENTS}c, "
-                                      f"{'bid' if ca_bid_bad else 'ask'} side)")
-                            ca_in = dict(fair=round(pc * 100, 2),
-                                         lo=round(plo * 100, 2),
-                                         hi=round(phi * 100, 2),
-                                         tol=CA_FAIR_TOL_CENTS,
-                                         bid_bad=ca_bid_bad,
-                                         ask_bad=ca_ask_bad)
+                            ca_desc = (f"book {ext_bid}x{ext_ask} vs fair "
+                                       f"{pc * 100:.0f}c [{plo * 100:.0f}-"
+                                       f"{phi * 100:.0f}] (tol "
+                                       f"{CA_FAIR_TOL_CENTS}c, "
+                                       f"{'bid' if ca_bid_bad else 'ask'} side)")
+                            if CA_FAIR_CAP:
+                                ca_caps = ca_fair_caps(plo * 100.0, phi * 100.0)
+                                if t not in self._ca_fair_capped:
+                                    self._ca_fair_capped.add(t)
+                                    log(f"{self.tag} ca-fair capped {t}: "
+                                        f"{ca_desc}; "
+                                        + (f"bids capped at {ca_caps[0]}c"
+                                           if ca_bid_bad else
+                                           f"asks floored at {ca_caps[1]}c")
+                                        + ", resting only while it earns")
+                            else:
+                                ca_why = ca_desc
+                                ca_in = dict(fair=round(pc * 100, 2),
+                                             lo=round(plo * 100, 2),
+                                             hi=round(phi * 100, 2),
+                                             tol=CA_FAIR_TOL_CENTS,
+                                             bid_bad=ca_bid_bad,
+                                             ask_bad=ca_ask_bad)
                 if ca_why:
                     if t not in self._ca_fair_stood:
                         self._ca_fair_stood.add(t)
@@ -16803,6 +16851,12 @@ class IncentiveMarketMaker:
                     self.cancel_market_orders(t, resting)
                     self._gskip(t, "ca_fair", lambda: ca_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
+                if ca_caps is None and t in self._ca_fair_capped:
+                    self._ca_fair_capped.discard(t)
+                    self._ca_unearning.pop(t, None)
+                    log(f"{self.tag} ca-fair uncapped {t}: "
+                        + ("book back inside the read's band" if band is not None
+                           else "no usable read"))
             if t in self._ca_fair_stood:
                 self._ca_fair_stood.discard(t)
                 log(f"{self.tag} ca-fair resume {t}")
@@ -17168,6 +17222,31 @@ class IncentiveMarketMaker:
                             f"scored walk after the caps {nfl_caps} "
                             f"(book {ext_bid}x{ext_ask}) -- not resting them")
                     self._nfl_unearning[t] = _dropped
+            # Carbon Arc gate (CA_FAIR_CAP): likewise last -- the side whose
+            # touch fights the read rests at most at its cap, and only while
+            # the scored walk still reaches it ("sit on the bid if it's
+            # earning money on it, but not if it wouldnt earn")
+            if ca_caps is not None:
+                mq = mort_cap_quotes(mq, *ca_caps)
+                _c_before = {q.book_side for q in mq if not q.is_pad}
+                if meta.price_step < 0.01:
+                    _ey, _en = orderbook_exact_levels(ob)
+                    mq = drop_unearning_sides(
+                        mq, _ey, _en,
+                        own_exact_by_ticker.get(t, []) if self.live else [],
+                        meta.target_size, meta.discount_factor)
+                else:
+                    mq = drop_unearning_sides(mq, yes_levels, no_levels,
+                                              own_in_book, meta.target_size,
+                                              meta.discount_factor)
+                _c_dropped = _c_before - {q.book_side for q in mq if not q.is_pad}
+                if _c_dropped != self._ca_unearning.get(t, set()):
+                    if _c_dropped:
+                        log(f"{self.tag} ca-fair not earning {t}: "
+                            f"{'/'.join(sorted(_c_dropped))} side(s) out of "
+                            f"the scored walk after the caps {ca_caps} "
+                            f"(book {ext_bid}x{ext_ask}) -- not resting them")
+                    self._ca_unearning[t] = _c_dropped
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -18885,7 +18964,10 @@ class IncentiveMarketMaker:
                 f"{CA_FAIR_TOL_CENTS}c, band sigma x{CA_FAIR_SIGMA_LO_FRAC:g}-1, "
                 f"max sigma {CA_FAIR_MAX_REL_SIGMA:g} of mu, refresh hold "
                 f"{CA_FAIR_REFRESH_HOLD_MIN:g}m, ttl {CA_FAIR_TTL_MIN}m, "
-                f"refresh {CA_FAIR_REFRESH_SECS}s, file {CA_FAIR_FILE}")
+                f"refresh {CA_FAIR_REFRESH_SECS}s, a breach "
+                + ("caps the side (rests only while it earns)" if CA_FAIR_CAP
+                   else "parks both sides")
+                + f", file {CA_FAIR_FILE}")
         if OR_FAIR_ENABLE:
             log(f"or-fair gate: {','.join(sorted(OR_FAIR_SERIES))} fail-closed "
                 f"at-touch, tol {OR_FAIR_TOL_CENTS}c, band sigma "

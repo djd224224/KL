@@ -9926,35 +9926,96 @@ class TestCarbonArcFairGate(unittest.TestCase):
             self._write_fair({"KXFAKECC": self._entry(100.9)})
             self.assertFalse(imm.ca_refresh_held(self.T, time.time()))
 
-    def test_bid_touch_over_fair_stands_aside_then_resumes(self):
-        # mu 98.95 / sigma 2 -> P(> 100) = 0.30: bid touch 49 > 30 + 15
+    def test_caps_are_the_breach_limits(self):
+        # bids at most the band top + 15, asks at least the bottom - 15; a
+        # floor at or under zero is no floor
+        self.assertEqual(imm.ca_fair_caps(14.69, 29.97), (44, 0))
+        self.assertEqual(imm.ca_fair_caps(70.03, 85.3), (100, 56))
+        self.assertEqual(imm.ca_fair_caps(0.0, 0.4), (15, 0))
+        # a touch exactly at a cap is no breach, so it is never moved
+        self.assertEqual(imm.fair_gate_breach(44, 51, 14.69, 15, 29.97),
+                         (False, False))
+        self.assertEqual(imm.fair_gate_breach(45, 51, 14.69, 15, 29.97),
+                         (True, False))
+
+    def test_bid_touch_over_fair_rests_only_the_earning_side_then_resumes(self):
+        # mu 98.95 / sigma 2 -> P(> 100) = 0.30: bid touch 49 > 30 + 15.
+        # Jack 2026-10-04: "the bot should sit on the bid if it's earning
+        # money on it, but not if it wouldnt earn". The bid is capped at 44,
+        # behind 1,900 contracts at 45-49 against a 1,000 target: the walk
+        # never reaches it, so it does not rest. The ask (the side the read
+        # favours) still quotes at the (safe-)join.
         self._write_fair({"KXFAKECC": self._entry(98.95)})
         bot = self._bot()
         bot.run_cycle()
-        self.assertEqual(self._quotes(bot), [])
-        self.assertIn(self.T, bot._ca_fair_stood)
-        self.assertIn(self.T, bot.state.selected)     # sticky: still selected
-        # the read moves back to the book: first the refresh hold keeps the
-        # market out while the book reprices...
+        q = self._quotes(bot)
+        self.assertFalse(any(s == "bid" for s, _p in q), q)
+        self.assertTrue(any(s == "ask" for s, _p in q), q)
+        self.assertIn(self.T, bot._ca_fair_capped)
+        self.assertNotIn(self.T, bot._ca_fair_stood)
+        self.assertEqual(bot._ca_unearning.get(self.T), {"bid"})
+        self.assertIn(self.T, bot.state.selected)
+        # the read moves back to the book: first the refresh hold parks both
+        # sides while the book reprices...
         self._write_fair({"KXFAKECC": self._entry(100.0)})
         bot.run_cycle()
         self.assertEqual(self._quotes(bot), [])
         self.assertIn(self.T, bot._ca_fair_stood)
-        # ...then it resumes at the (safe-)join
+        # ...then both sides resume at the (safe-)join, uncapped
         imm._ca_fair_state["moved_at"]["KXFAKECC"] -= 3600
         bot.run_cycle()
         self.assertNotIn(self.T, bot._ca_fair_stood)
+        self.assertNotIn(self.T, bot._ca_fair_capped)
+        self.assertNotIn(self.T, bot._ca_unearning)
         q = self._quotes(bot)
         self.assertTrue(any(s == "bid" for s, _p in q), q)
         self.assertTrue(any(s == "ask" for s, _p in q), q)
 
-    def test_ask_touch_under_fair_stands_aside(self):
-        # mu 101.05 -> P(> 100) = 0.70: ask touch 51 < 70 - 15
+    def test_a_capped_bid_that_still_earns_rests_at_its_cap(self):
+        # only 200 contracts in front of the 44c cap (48 x 100, 49 x 100;
+        # the side still qualifies on 1,000 at 20-21c): the walk reaches the
+        # capped bid, so it sits there -- at most fair_hi + 15, never at 49
+        self._write_fair({"KXFAKECC": self._entry(98.95)})
+        bot = self._bot()
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.20", "800"], ["0.21", "200"],
+                            ["0.48", "100"], ["0.49", "100"]],
+            "no_dollars": [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+                           ["0.48", "400"], ["0.49", "300"]]}}
+        bot.run_cycle()
+        q = self._quotes(bot)
+        bids = [p for s, p in q if s == "bid"]
+        self.assertTrue(bids, q)
+        self.assertLessEqual(max(bids), 44)
+        self.assertTrue(any(s == "ask" for s, _p in q), q)
+        self.assertEqual(bot._ca_unearning.get(self.T, set()), set())
+
+    def test_ask_touch_under_fair_rests_only_the_bid(self):
+        # mu 101.05 -> P(> 100) = 0.70: ask touch 51 < 70 - 15. The ask is
+        # floored at 56, behind the whole NO side, and does not rest; the
+        # bid quotes at the (safe-)join
         self._write_fair({"KXFAKECC": self._entry(101.05)})
         bot = self._bot()
         bot.run_cycle()
-        self.assertEqual(self._quotes(bot), [])
-        self.assertIn(self.T, bot._ca_fair_stood)
+        q = self._quotes(bot)
+        self.assertTrue(any(s == "bid" for s, _p in q), q)
+        self.assertFalse(any(s == "ask" for s, _p in q), q)
+        self.assertEqual(bot._ca_unearning.get(self.T), {"ask"})
+        self.assertNotIn(self.T, bot._ca_fair_stood)
+
+    def test_cap_off_parks_both_sides_as_before(self):
+        # IMM_CA_FAIR_CAP=0: the pre-2026-10-04 both-sides stand-aside
+        self._write_fair({"KXFAKECC": self._entry(98.95)})
+        with mock.patch.object(imm, "CA_FAIR_CAP", False):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+            self.assertIn(self.T, bot._ca_fair_stood)
+            self.assertNotIn(self.T, bot._ca_fair_capped)
+            self._write_fair({"KXFAKECC": self._entry(101.05)})
+            imm._ca_fair_state["moved_at"].pop("KXFAKECC", None)
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
 
     def test_stale_or_disabled_or_not_carbon_arc_quotes_plainly(self):
         self._write_fair({"KXFAKECC": self._entry(98.95)},
