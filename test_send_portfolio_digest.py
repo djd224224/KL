@@ -569,7 +569,22 @@ class TotalProfitTests(unittest.TestCase):
         self.assertLess(html.index("Account value $22,624.95"), html.index("Total profit"))
         self.assertLess(html.index("Total profit"), html.index("cash <b>"))
         self.assertLess(html.index("Total profit"), html.index("cid:balancechart"))
-        self.assertNotIn("profit", subject)
+
+    def test_subject_leads_with_total_profit(self):
+        # Jack 2026-10-04: "add total profit to the subject line too"
+        subject, _, _ = pf.build_email(self._pf(), [], chart_ok=False)
+        self.assertEqual(subject, "Kalshi portfolio 2026-09-28 — total profit +6,624.95, "
+                                  "day -475.05, trading -225.09")
+        subject, _, _ = pf.build_email(self._pf(profit=-1234.5), [], chart_ok=False,
+                                       imm={"text": "T", "html": "H",
+                                            "subject_flag": " - PICK-OFF WINDOW"})
+        self.assertEqual(subject, "Kalshi portfolio 2026-09-28 — total profit -1,234.50, "
+                                  "day -475.05, trading -225.09 - PICK-OFF WINDOW")
+        p = self._pf()
+        p.update(first_run=True, prior=None)
+        subject, _, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertEqual(subject, "Kalshi portfolio 2026-09-28 — total profit +6,624.95, "
+                                  "first baseline")
 
     def test_a_loss_and_withdrawals(self):
         _, text, html = pf.build_email(
@@ -581,8 +596,9 @@ class TotalProfitTests(unittest.TestCase):
         self.assertNotIn("after rewards are paid out", html)
 
     def test_unreadable_transfers_say_so(self):
-        _, text, html = pf.build_email(self._pf(profit=None, deposited=None), [],
-                                       chart_ok=False)
+        subject, text, html = pf.build_email(self._pf(profit=None, deposited=None), [],
+                                             chart_ok=False)
+        self.assertEqual(subject, "Kalshi portfolio 2026-09-28 — day -475.05, trading -225.09")
         self.assertIn("Total profit n/a today: Kalshi's deposit / withdrawal history "
                       "did not load", text)
         self.assertIn("Total profit n/a today", html)

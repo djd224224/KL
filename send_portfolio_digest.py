@@ -35,10 +35,11 @@ liquidity rewards already earned are paid out (imm_reward_recon.
 unpaid_estimate: accrual in program periods still running or ended since
 midnight ET yesterday, $1 floor per market per period, x each family's
 paid/modelled ratio). Kalshi has no credits endpoint, so it is a model.
-Under it, the TOTAL PROFIT (since 2026-10-04): the account value less every
-dollar deposited plus every dollar withdrawn since the account opened
-(fetch_transfers: /portfolio/deposits and /portfolio/withdrawals, read in
-full each morning), with the same after-rewards estimate.
+Under it and first in the subject, the TOTAL PROFIT (since 2026-10-04): the
+account value less every dollar deposited plus every dollar withdrawn since
+the account opened (fetch_transfers: /portfolio/deposits and
+/portfolio/withdrawals, read in full each morning), with the same
+after-rewards estimate in the body.
 
 State lives in portfolio_daily\:
     pf_snapshot_YYYY-MM-DD.json  - per-event E components (diff baseline)
@@ -1193,9 +1194,12 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                 parts.append(("deposits/withdrawals", transfers))
             parts.append(("Kalshi's pricing vs mid", round(d_ek - trading - ntc, 2)))
 
-    subject = (f"Kalshi portfolio {today} — first baseline" if first else
-               f"Kalshi portfolio {today} — day {d_equity:+,.2f}, "
-               f"trading {trading:+,.2f}")
+    # total profit leads the subject (Jack 2026-10-04: "add total profit to
+    # the subject line too"); left out when the transfer reads failed
+    head = [] if profit is None else [f"total profit {profit:+,.2f}"]
+    head += (["first baseline"] if first else
+             [f"day {d_equity:+,.2f}", f"trading {trading:+,.2f}"])
+    subject = f"Kalshi portfolio {today} — " + ", ".join(head)
     if imm and imm.get("subject_flag"):
         subject += imm["subject_flag"]
 
