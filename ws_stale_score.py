@@ -661,6 +661,7 @@ def score_sweeps(trips: List[dict], efills: Dict[str, List[dict]],
             if p and p[5] is not None and p[6] is not None:
                 rate += p[5] * p[6]                    # pool_per_day x est_frac
         res.append({"ts": t0, "event": ev, "family": _family(tr["ticker"]),
+                    "mode": tr.get("mode") or "dry",
                     "ticker": tr["ticker"], "pulled": len(tr.get("pull") or []),
                     "hold": hold, "avoid_n": len(avoid),
                     "avoid_ct": sum(float(f["count"]) for f in avoid),
@@ -669,16 +670,14 @@ def score_sweeps(trips: List[dict], efills: Dict[str, List[dict]],
     return res
 
 
-def render_sweeps(res: List[dict], hours: float) -> str:
-    if not res:
-        return ""
+def _render_dry(res: List[dict], hours: float, title: str) -> List[str]:
     h5, h30 = HORIZONS
     k = 24.0 / max(hours, 1e-9)
     cost = sum(r["cost"] for r in res)
     a5 = -sum(r["pnl"][h5] for r in res)
     a30 = -sum(r["pnl"][h30] for r in res)
     hit = sum(1 for r in res if r["avoid_n"])
-    out = ["", f"# Event sweep breaker (dry), scored ({hours:.1f}h)", "",
+    out = ["", f"# {title} ({hours:.1f}h)", "",
            f"{len(res)} trips ({len(res) * k:.0f}/day); {hit} saw our fills in the "
            f"event inside its hold, {sum(r['avoid_ct'] for r in res):.0f} contracts. "
            f"Each would have pulled a median "
@@ -702,6 +701,70 @@ def render_sweeps(res: List[dict], hours: float) -> str:
                      sum(r["avoid_ct"] for r in rs), a, c))
     for net, f, n, hh, ct, a, c in sorted(rows):
         out.append(f"| {f} | {n} | {hh} | {ct:.0f} | ${a:+.2f} | ${-c:+.2f} | ${net:+.2f} |")
+    return out
+
+
+def net_live(res: List[dict], hours: float) -> Optional[dict]:
+    """The LIVE breaker's estimated net, per day: the pull's avoided loss per
+    trip, measured on the CONTROL trips (SWEEP_HOLDOUT -- nothing pulled, so
+    the losses a pull prevents are still visible), times the live trips, less
+    what still filled inside the live holds and the reward the live holds
+    gave up. None without both kinds of trip."""
+    live = [r for r in res if r["mode"] == "on"]
+    ctrl = [r for r in res if r["mode"] == "control"]
+    if not live or not ctrl:
+        return None
+    k = 24.0 / max(hours, 1e-9)
+    out = {"live": len(live), "control": len(ctrl),
+           "control_hit": sum(1 for r in ctrl if r["avoid_n"]),
+           "live_per_day": len(live) * k,
+           "pulled_median": statistics.median([r["pulled"] for r in live]),
+           "leak_ct": sum(r["avoid_ct"] for r in live),
+           "cost_day": sum(r["cost"] for r in live) * k}
+    for h in HORIZONS:
+        per = -sum(r["pnl"][h] for r in ctrl) / len(ctrl)      # avoided per trip
+        leak = -sum(r["pnl"][h] for r in live) * k             # loss that still landed
+        out[f"avoid_per_trip_{h}"] = per
+        out[f"avoided_day_{h}"] = per * len(live) * k
+        out[f"leak_day_{h}"] = leak
+        out[f"net_day_{h}"] = per * len(live) * k - leak - out["cost_day"]
+    return out
+
+
+def render_sweeps(res: List[dict], hours: float) -> str:
+    if not res:
+        return ""
+    h5, h30 = HORIZONS
+    live = [r for r in res if r["mode"] == "on"]
+    ctrl = [r for r in res if r["mode"] == "control"]
+    dry = [r for r in res if r["mode"] == "dry"]
+    out: List[str] = []
+    n = net_live(res, hours)
+    if n:
+        out += ["", f"# Event sweep breaker -- LIVE, netted against its control trips ({hours:.1f}h)", "",
+                f"{n['live']} live trips ({n['live_per_day']:.0f}/day), a median "
+                f"{n['pulled_median']:.0f} order(s) pulled each; {n['leak_ct']:.0f} contracts "
+                f"still filled inside a live hold. {n['control']} control trips "
+                f"({n['control_hit']} with fills inside the hold) give the pull's "
+                f"avoided loss per trip: ${n[f'avoid_per_trip_{h5}']:+.3f} (5m) / "
+                f"${n[f'avoid_per_trip_{h30}']:+.3f} (30m)."
+                + (" FEW control trips with fills -- noisy until ~30."
+                   if n["control_hit"] < 30 else ""), "",
+                "| per day | 5m mark-out | 30m mark-out |", "|---|---|---|",
+                f"| avoided (control rate x live trips) | ${n[f'avoided_day_{h5}']:+.2f} | ${n[f'avoided_day_{h30}']:+.2f} |",
+                f"| still filled inside live holds | ${-n[f'leak_day_{h5}']:+.2f} | ${-n[f'leak_day_{h30}']:+.2f} |",
+                f"| reward given up (live holds) | ${-n['cost_day']:+.2f} | ${-n['cost_day']:+.2f} |",
+                f"| **net of the live breaker** | **${n[f'net_day_{h5}']:+.2f}** | **${n[f'net_day_{h30}']:+.2f}** |"]
+    elif live:
+        out += ["", f"# Event sweep breaker -- LIVE ({hours:.1f}h)", "",
+                f"{len(live)} live trips and no control trips (IMM_SWEEP_HOLDOUT=0): "
+                f"what a pull prevents is not visible, so no net. Reward given up "
+                f"${sum(r['cost'] for r in live):+.2f}; {sum(r['avoid_ct'] for r in live):.0f} "
+                f"contracts still filled inside a live hold."]
+    if ctrl:
+        out += _render_dry(ctrl, hours, "Control trips (nothing pulled) -- what a pull would have done")
+    if dry:
+        out += _render_dry(dry, hours, "Event sweep breaker (dry), scored")
     return "\n".join(out) + "\n"
 
 

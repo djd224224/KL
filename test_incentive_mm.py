@@ -21740,6 +21740,41 @@ class TestSweepBreaker(unittest.TestCase):
         self.assertEqual((len(self.cancelled), self.bot._sweep["skipped_budget"]),
                          (1, 1))
 
+    def test_the_holdout_keeps_a_random_share_of_trips_as_a_dry_control(self):
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"), \
+                mock.patch.object(imm, "SWEEP_HOLDOUT", 0.2):
+            self.bot._ws_rng = mock.Mock(random=lambda: 0.1)    # drawn: control
+            self._fill("o1", 20)
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 10))
+            self.bot._ws_rng = mock.Mock(random=lambda: 0.5)    # live
+            self._fill("o4", 20, ticker=self.C)
+            self.assertTrue(self.bot.sweep_held("KXOTHER-26OCT05", self.now + 10))
+        self.assertEqual([t["mode"] for t in self._trips()], ["control", "on"])
+        self.assertEqual(self.cancelled, [])                    # C had nothing else
+        s = self.bot._sweep
+        self.assertEqual((s["trips"], s["trips_live"], s["trips_control"]), (2, 1, 1))
+        # a second sweep inside a control trip's window does not re-trip
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"), \
+                mock.patch.object(imm, "SWEEP_HOLDOUT", 0.2):
+            self._fill("o3", 10, ticker=self.B, dt=30.0)
+        self.assertEqual(len(self._trips()), 2)
+
+    def test_the_pull_takes_orders_placed_since_the_last_rebuild(self):
+        self.bot.state.ledger["oL"] = {"order_id": "oL", "ticker": self.B,
+                                       "book_side": "ask", "yes_price": 33,
+                                       "yes_price_exact": None,
+                                       "remaining_count": 12.0}
+        self.bot.state.ledger["oX"] = {"order_id": "oX", "ticker": self.B,
+                                       "book_side": "bid", "yes_price": 20,
+                                       "yes_price_exact": None,
+                                       "remaining_count": 5.0}
+        self.bot._cycle_cancelled = {"oX"}                      # already gone
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"):
+            self._fill("o1", 20)
+        self.assertEqual(sorted(x[1] for x in self._trips()[0]["pull"]),
+                         ["o2", "o3", "oL"])
+        self.assertEqual(sorted(oid for oid, _r in self.cancelled), ["o2", "o3", "oL"])
+
     def test_off_does_nothing(self):
         with mock.patch.object(imm, "SWEEP_BREAKER", "off"):
             self._fill("o1", 20)
@@ -21825,20 +21860,41 @@ class TestSweepBreakerCycle(unittest.TestCase):
     def test_on_holds_the_event_out_and_rejoins_after(self):
         bot = self._bot("on")
         self.assertTrue(self._mine(bot))
-        bot._sweep_until[bot._event_of(self.T)] = time.time() + 300.0
+        bot._sweep_hold[bot._event_of(self.T)] = time.time() + 300.0
         bot.run_cycle()
         self.assertEqual(self._mine(bot), [])         # pulled for the hold
-        bot._sweep_until[bot._event_of(self.T)] = time.time() - 1.0
+        bot._sweep_hold[bot._event_of(self.T)] = time.time() - 1.0
         bot.run_cycle()
         self.assertTrue(self._mine(bot))               # back after it
+
+    def test_a_control_trip_window_never_holds_quoting(self):
+        bot = self._bot("on")
+        before = sorted((o["book_side"], o["yes_price"]) for o in self._mine(bot))
+        bot._sweep_until[bot._event_of(self.T)] = time.time() + 300.0   # trip window only
+        bot.run_cycle()
+        self.assertEqual(sorted((o["book_side"], o["yes_price"])
+                                for o in self._mine(bot)), before)
 
     def test_dry_never_changes_the_quotes(self):
         bot = self._bot("dry")
         before = sorted((o["book_side"], o["yes_price"]) for o in self._mine(bot))
         bot._sweep_until[bot._event_of(self.T)] = time.time() + 300.0
+        bot._sweep_hold[bot._event_of(self.T)] = time.time() + 300.0
         bot.run_cycle()
         self.assertEqual(sorted((o["book_side"], o["yes_price"])
                                 for o in self._mine(bot)), before)
+
+    def test_a_placement_into_a_held_event_is_skipped_but_its_swap_cancels(self):
+        bot = self._bot("on")
+        placed, cancels = [], []
+        bot.place_order = lambda q, now_ts: placed.append(q.ticker) or True
+        bot.cancel_order = lambda oid, reason="": cancels.append((oid, reason)) or True
+        bot._sweep_hold[bot._event_of(self.T)] = time.time() + 300.0
+        q = Quote(ticker=self.T, book_side="bid", price_cents=40, count=10)
+        n = bot.place_with_caps([q], [], set(), time.time(), replaces={0: "old1"},
+                                failed_cancels=[])
+        self.assertEqual((n, placed, cancels), (0, [], [("old1", "sweep_breaker")]))
+        self.assertEqual(bot._sweep["skipped_writes"], 1)
 
 
 class TestLatencyCycleAndSweepStatus(unittest.TestCase):
@@ -21850,7 +21906,9 @@ class TestLatencyCycleAndSweepStatus(unittest.TestCase):
             s = t0 + 140.0 * k
             bot._cycle_times.append((s, s + 60.0, s + 130.0))
         bot._sweep["trips"] = 3
-        bot._sweep_until = {"E1": time.time() + 100, "E2": time.time() - 5}
+        bot._sweep_until = {"E1": time.time() + 100, "E2": time.time() - 5,
+                            "E3": time.time() + 100}      # E3: a control trip
+        bot._sweep_hold = {"E1": time.time() + 100, "E2": time.time() - 5}
         lat = bot._latency_status()
         self.assertEqual(lat["cycle"], {"n": 4, "reads_s": 60.0, "run_s": 130.0,
                                         "period_s": 140.0, "last_reads_s": 60.0,

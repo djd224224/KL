@@ -2898,14 +2898,31 @@ WS_TICK_SECS = max(0.2, _env_float("IMM_WS_TICK_SECS", 1.0))
 #                   (ws_sweep_<date>.jsonl: the fill, and the event's resting
 #                   orders it would pull); nothing is cancelled.
 #    IMM_SWEEP_BREAKER=on  -- the event's resting orders are cancelled at
-#                   once (on the fast-cancel budget), and the cycle quotes
-#                   nothing in the event until the hold ends. Needs the feed.
+#                   once (on the fast-cancel budget), including any placed
+#                   since the last view rebuild (from the ledger). For the
+#                   rest of that cycle no placement or amend goes into the
+#                   event, and the cycle quotes nothing there until the hold
+#                   ends. Needs the feed.
 #    IMM_SWEEP_BREAKER=off -- nothing.
+# SCOPE TRADE-OFF (Jack 2026-10-04 picked "whole event, both sides, 2 min" as
+# less punitive than 5). Backtest net, $/day at 5m / 30m mark-outs:
+#   whole event, both sides:  2 min +$21 / +$30 (~$4 of reward)
+#                             5 min +$25 / +$40 (~$9)
+#   hit side only, 2 min:     +$17 / +$26 (~$2)
+#   linked group only, 5 min: +$18 / +$22
+#   swept market alone:       +$9 / +$8
+# Of the event rule's avoided loss, ~60% is in the event's OTHER players /
+# words / cities: one game, one speech, one weather system.
+# IMM_SWEEP_HOLDOUT (on only): this share of trips, drawn at random, stays a
+# DRY CONTROL (logged as mode "control", nothing pulled). A live pull hides
+# the losses it prevents; the control trips show them, so ws_stale_score.py
+# can net the live breaker against them. 0 = every trip live.
 SWEEP_BREAKER = os.environ.get("IMM_SWEEP_BREAKER", "dry").strip().lower()
 if SWEEP_BREAKER not in ("off", "dry", "on"):
     SWEEP_BREAKER = "off"
 SWEEP_HOLD_SECS = max(0.0, _env_float("IMM_SWEEP_HOLD_SECS", 300.0))
 SWEEP_MIN_CT = max(0.0, _env_float("IMM_SWEEP_MIN_CT", 1.0))
+SWEEP_HOLDOUT = min(1.0, max(0.0, _env_float("IMM_SWEEP_HOLDOUT", 0.0)))
 
 # Series other repo bots trade (self-trade / infighting exclusion) + anything
 # broadcast-reactive the user wants out entirely. Prefix match on the ticker.
@@ -7025,7 +7042,7 @@ _CONFIG_CODE_KNOBS = (
     "WS_AUDIT_TRIP_EXACT", "WS_AUDIT_COOLDOWN_SECS", "WS_STALE_LOG",
     # ...the in-cycle check and the event sweep breaker (2026-10-04)
     "WS_CHECK_IN_CYCLE", "WS_TICK_SECS", "SWEEP_BREAKER", "SWEEP_HOLD_SECS",
-    "SWEEP_MIN_CT",
+    "SWEEP_MIN_CT", "SWEEP_HOLDOUT",
 )
 
 
@@ -12396,14 +12413,19 @@ class IncentiveMarketMaker:
         # book read, end) -- what IMM_WS=on would shorten
         self._cycle_last_read = 0.0
         self._cycle_times: Deque[Tuple[float, float, float]] = deque(maxlen=30)
-        # event sweep breaker (2026-10-04, SWEEP_BREAKER): event -> hold end
+        # event sweep breaker (2026-10-04, SWEEP_BREAKER): event -> trip
+        # window end (no second trip inside it, any mode), and -- live trips
+        # only -- event -> hold end, the only thing that keeps an event out of
+        # quoting (a control trip must not)
         self._sweep_until: Dict[str, float] = {}
+        self._sweep_hold: Dict[str, float] = {}
         # our WS fills (exchange time, order id, contracts) and when the cycle
         # last read its resting orders: the view rebuild subtracts the fills
         # that landed after that read, which the read cannot hold
         self._ws_fill_log: Deque[Tuple[float, str, float]] = deque(maxlen=2000)
         self._resting_read_at = 0.0
-        self._sweep = {"trips": 0, "cancels": 0, "skipped_budget": 0,
+        self._sweep = {"trips": 0, "trips_live": 0, "trips_control": 0,
+                       "cancels": 0, "skipped_budget": 0, "skipped_writes": 0,
                        "fills_seen": 0, "unparsed": 0, "unknown_order": 0}
         self._load_persist()
         # the ladder-asks cash latch lives in module state for series_bid_only
@@ -14349,8 +14371,9 @@ class IncentiveMarketMaker:
         self._sink("ws_stale", rec)
 
     def sweep_held(self, event: str, now_ts: float) -> bool:
-        """True while the sweep breaker (on) holds `event` out of quoting."""
-        return SWEEP_BREAKER == "on" and self._sweep_until.get(event, 0.0) > now_ts
+        """True while a LIVE sweep-breaker trip holds `event` out of quoting
+        (a control trip, SWEEP_HOLDOUT, never does)."""
+        return SWEEP_BREAKER == "on" and self._sweep_hold.get(event, 0.0) > now_ts
 
     def _sweep_note_fill(self, body: dict, now_ts: float) -> None:
         """One of our WS fills. Every maker fill is logged (for the next view
@@ -14403,26 +14426,53 @@ class IncentiveMarketMaker:
                 return                                  # partial: no sweep
             ev = self._event_of(t)
             if self._sweep_until.get(ev, 0.0) > now_ts:
-                return                                  # already held
-            for e_old in [e for e, u in self._sweep_until.items() if u < now_ts - 3600]:
-                del self._sweep_until[e_old]
+                return                                  # already tripped
+            for d in (self._sweep_until, self._sweep_hold):
+                for e_old in [e for e, u in d.items() if u < now_ts - 3600]:
+                    del d[e_old]
             self._sweep_until[ev] = now_ts + SWEEP_HOLD_SECS
             self._sweep["trips"] += 1
+            # on: live, unless drawn into the control (SWEEP_HOLDOUT)
+            live = SWEEP_BREAKER == "on" and \
+                not (SWEEP_HOLDOUT > 0 and self._ws_rng.random() < SWEEP_HOLDOUT)
+            mode = "on" if live else ("control" if SWEEP_BREAKER == "on" else "dry")
+            if live:
+                self._sweep_hold[ev] = now_ts + SWEEP_HOLD_SECS
+                self._sweep["trips_live"] += 1
+            elif SWEEP_BREAKER == "on":
+                self._sweep["trips_control"] += 1
             pull = [(tk, o) for tk, lst in self._resting_view.items()
                     if self._event_of(tk) == ev for o in lst
                     if o["order_id"] != oid and o["rem"] > 0]
+            # ...and the event's orders placed since the last rebuild, which
+            # only the ledger holds yet
+            in_view = {o["order_id"] for _tk, o in pull} | {oid}
+            for l_oid, led in list(self.state.ledger.items()):
+                l_t = str(led.get("ticker") or "")
+                l_rem = float(led.get("remaining_count") or 0.0)
+                if l_oid in in_view or l_oid in self._cycle_cancelled or \
+                        l_rem <= 0 or self._event_of(l_t) != ev:
+                    continue
+                if any(o["order_id"] == l_oid for o in self._resting_view.get(l_t, ())):
+                    continue
+                l_px = led.get("yes_price_exact")
+                pull.append((l_t, {"order_id": l_oid,
+                                   "side": str(led.get("book_side") or ""),
+                                   "px": float(l_px) if l_px is not None
+                                   else float(led.get("yes_price") or 0),
+                                   "rem": l_rem}))
             self._sink("ws_sweep", {
-                "ev": "trip", "ts": round(now_ts, 3), "mode": SWEEP_BREAKER,
+                "ev": "trip", "ts": round(now_ts, 3), "mode": mode,
                 "event": ev, "ticker": t, "order_id": oid, "side": side,
                 "px": px, "count": n, "rem_before": rem, "fill_ts": fts,
                 "trade_id": body.get("trade_id"), "hold_s": SWEEP_HOLD_SECS,
                 "pull": [[tk, o["order_id"], o["side"], o["px"], o["rem"]]
                          for tk, o in pull]})
-            log(f"{self.tag} sweep breaker ({SWEEP_BREAKER}): {t} "
+            log(f"{self.tag} sweep breaker ({mode}): {t} "
                 f"{side.upper()} @ {px:g}c filled out ({n:g}) -> "
-                f"{'pulling' if SWEEP_BREAKER == 'on' else 'would pull'} "
+                f"{'pulling' if live else 'would pull'} "
                 f"{len(pull)} order(s) in {ev} for {SWEEP_HOLD_SECS:.0f}s")
-            if SWEEP_BREAKER != "on":
+            if not live:
                 return
             for _tk, o in pull:
                 while self._ws_cancel_times and \
@@ -19235,7 +19285,7 @@ class IncentiveMarketMaker:
         # EVENT SWEEP BREAKER (on, 2026-10-04, see SWEEP_BREAKER): an event a
         # sweep tripped quotes nothing until its hold ends, so the diff
         # cancels whatever of ours still rests there
-        if SWEEP_BREAKER == "on" and self._sweep_until:
+        if SWEEP_BREAKER == "on" and self._sweep_hold:
             desired = [q for q in desired
                        if not self.sweep_held(self._event_of(q.ticker), now_ts)]
 
@@ -19297,6 +19347,9 @@ class IncentiveMarketMaker:
         for o_am, q_am in to_amend[:MAX_PLACEMENTS_PER_CYCLE]:
             am_pacer.wait()
             self._ws_cycle_tick()          # the in-cycle stale check / breaker
+            if self.sweep_held(self._event_of(q_am.ticker), time.time()):
+                self._sweep["skipped_writes"] += 1
+                continue                   # the breaker pulled it this cycle
             self.amend_order_inplace(o_am, q_am, now_ts)
         if len(to_amend) > MAX_PLACEMENTS_PER_CYCLE:
             log(f"{self.tag} amend cap: {len(to_amend) - MAX_PLACEMENTS_PER_CYCLE} "
@@ -19556,6 +19609,20 @@ class IncentiveMarketMaker:
         pacer = WritePacer(PLACE_RATE_PER_SEC if self.live else 0.0)
         for i, q in enumerate(to_place):
             self._ws_cycle_tick()          # the in-cycle stale check / breaker
+            if self.sweep_held(self._event_of(q.ticker), time.time()):
+                # the breaker tripped this event after the cycle's diff:
+                # nothing new goes in before its hold ends, but an order this
+                # placement would have replaced still leaves the book
+                old_h = replaces.get(i)
+                if old_h is not None:
+                    pacer.wait()
+                    if self.cancel_order(old_h, reason="sweep_breaker"):
+                        self.state.cancelled_today += 1
+                        cancelled_ids.add(old_h)
+                    elif old_h in by_id:
+                        total_resting += _count(by_id[old_h], 1)   # it still rests
+                self._sweep["skipped_writes"] += 1
+                continue
             if placed >= MAX_PLACEMENTS_PER_CYCLE:
                 log(f"{self.tag} placement cap {MAX_PLACEMENTS_PER_CYCLE}/cycle reached; "
                     f"{len(to_place) - i} deferred to next cycle")
@@ -19762,8 +19829,8 @@ class IncentiveMarketMaker:
             # the event sweep breaker (2026-10-04, SWEEP_BREAKER)
             now = time.time()
             out["sweep"] = dict(self._sweep, mode=SWEEP_BREAKER,
-                                hold_s=SWEEP_HOLD_SECS,
-                                held_now=sum(1 for u in self._sweep_until.values()
+                                hold_s=SWEEP_HOLD_SECS, holdout=SWEEP_HOLDOUT,
+                                held_now=sum(1 for u in self._sweep_hold.values()
                                              if u > now))
             # cycle timing (2026-10-04): the REST book reads IMM_WS=on would
             # serve from the feed, inside each full cycle
@@ -20868,7 +20935,9 @@ class IncentiveMarketMaker:
                       f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",
                "on": f" -- a maker fill that clears our order pulls every quote "
                      f"we have in its event for {SWEEP_HOLD_SECS:.0f}s"
-                     f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",
+                     + (f"; {SWEEP_HOLDOUT:.0%} of trips stay a dry CONTROL "
+                        f"(the monitoring)" if SWEEP_HOLDOUT > 0 else "")
+                     + f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",
                "off": ""}.get(SWEEP_BREAKER, ""))
         if SCAN_TOP_N > 0:
             log(f"open-scan tier: {SCAN_TOP_N} slots "

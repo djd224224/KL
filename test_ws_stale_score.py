@@ -248,6 +248,25 @@ class TestScore(unittest.TestCase):
         with open(out) as f:
             self.assertEqual(len(json.load(f)["sweeps"]), 2)
 
+    def test_a_live_breaker_is_netted_against_its_control_trips(self):
+        trips = wss.load_sweeps(self.d, None, None)
+        trips[0]["mode"], trips[1]["mode"] = "control", "on"
+        cyc = wss.load_cycle_rows(self.d, {A, B}, T - 3600, T + 9000)
+        res = wss.score_sweeps(trips, wss.load_event_fills(self.d, {EV}), cyc)
+        n = wss.net_live(res, 1.0)                    # 1h window -> x24 a day
+        # control trip 1 shows the pull avoiding $0.60 (5m); live trip 2 still
+        # took f5's -$0.80 inside its hold, and gave up A's 4.32 $/day x 300s
+        self.assertEqual((n["live"], n["control"], n["control_hit"]), (1, 1, 1))
+        self.assertAlmostEqual(n["avoid_per_trip_300"], 0.60, places=9)
+        self.assertAlmostEqual(n["leak_day_300"], 0.80 * 24, places=9)
+        self.assertAlmostEqual(n["cost_day"], 4.32 / 86400 * 300 * 24, places=9)
+        self.assertAlmostEqual(n["net_day_300"],
+                               0.60 * 24 - 0.80 * 24 - 4.32 / 86400 * 300 * 24, places=9)
+        text = wss.render_sweeps(res, 1.0)
+        self.assertIn("LIVE, netted against its control trips", text)
+        self.assertIn("noisy until ~30", text)
+        self.assertIsNone(wss.net_live([r for r in res if r["mode"] == "on"], 1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

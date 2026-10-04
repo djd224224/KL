@@ -7836,3 +7836,38 @@ should be ~0 outside the first restart gap. our_book_side null should be 0.
 
 Kill: IMM_ANALYTICS=0 (it already turns off the fills sink). Tests:
 TestFillLedgerJoin (12).
+
+## 2026-10-04 (late) -- event sweep breaker ON: whole event, both sides, 2 min, 20% control (Jack: "do Whole event, both sides, 2 min. but monitor to make sure it's effective and net positive")
+
+WHY THIS SETTING. Jack found the 5-min whole-event pull punitive. Scope
+backtest 9/6-10/4 (corrected sides; per day at 5m / 30m mark-outs):
+- whole event, both sides: 2 min +$21/+$30 (reward ~$4); 5 min +$25/+$40 (~$9)
+- hit side only, 2 min: +$17/+$26 (~$2)
+- linked group (same player/word/city, or the whole ladder), 5 min: +$18/+$22
+- swept market alone: +$9/+$8
+About 60% of the whole-event rule's avoided loss is in the event's OTHER
+players / words / cities: one game, one speech, one weather system.
+
+LIVE PATH. A trip:
+- cancels the event's resting orders (view + any placed since the last
+  rebuild, from the ledger), on the fast-cancel budget;
+- sets _sweep_hold[event];
+- skips every placement / amend into the event for the rest of that
+  cycle (a swap's old order is still cancelled);
+- leaves `desired` without the event's quotes until the hold ends.
+_sweep_until is only the trip window (no second trip inside it, any
+mode).
+
+MONITORING. IMM_SWEEP_HOLDOUT=0.2: a random 20% of trips are logged
+mode "control" and pull nothing. ws_stale_score.py then nets the live
+breaker (net_live):
+  avoided per control trip x live trips
+  - fills that still landed inside live holds
+  - reward the live holds gave up
+It flags the estimate as noisy until ~30 control trips have fills. A daily
+scheduled task (imm-sweep-breaker-check) reports it for a week. Status
+latency.sweep: trips, trips_live, trips_control, cancels, skipped_budget,
+skipped_writes, held_now, holdout.
+
+BACK OUT: IMM_SWEEP_BREAKER=dry in run_incentive_mm.ps1, then
+restart_imm.ps1 -Task.
