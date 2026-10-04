@@ -476,6 +476,28 @@ class TestFeed(unittest.TestCase):
         self.assertEqual(self.feed.book_fp("A")["orderbook_fp"]["yes_dollars"],
                          [["0.4200", "3.00"]])
 
+    def test_resync_distrusts_at_once_then_reconnects_as_a_request(self):
+        c = self._start(["A"])
+        sid = self._book_sub()[0]["id"]
+        c.send_json(_snap(sid, 1, "A", [("0.40", "1")], [("0.50", "1")]))
+        self.assertTrue(_wait(lambda: self.feed.book_fp("A") is not None))
+        n_before = len(self._book_sub())
+        self.feed.resync("audit")
+        self.assertIsNone(self.feed.book_fp("A"))          # untrusted at once
+        self.assertTrue(_wait(lambda: self.feed.status()["connects"] >= 2, 5))
+        st = self.feed.status()
+        self.assertEqual((st["resyncs"], st["errors"], st["last_error"]),
+                         (1, 0, ""))                       # not a failure
+        self.assertTrue(any("resync (audit)" in s for s in self.logs))
+        self.assertTrue(_wait(lambda: len(self._book_sub()) > n_before, 5))
+        c2 = self.k.conns[-1]
+        sid2 = self._book_sub()[-1]["id"]
+        c2.send_json(_snap(sid2, 1, "A", [("0.43", "2")], [("0.50", "1")]))
+        self.assertTrue(_wait(lambda: self.feed.book_fp("A") is not None))
+        self.assertEqual(self.feed.book_fp("A")["orderbook_fp"]["yes_dollars"],
+                         [["0.4300", "2.00"]])
+        self.assertEqual(self.feed.status()["resyncs"], 1)  # acted on once
+
     def test_market_limit_error_halves_chunk_and_retries(self):
         # the server rejects the first book subscribe with code 26
         self.k.reject_book_subs = 1

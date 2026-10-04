@@ -73,6 +73,10 @@ class WSClosed(WSError):
     """The peer closed the connection (or the socket hit EOF)."""
 
 
+class _Resync(Exception):
+    """resync() asked for a fresh connection -- a request, not a failure."""
+
+
 def accept_key(key: str) -> str:
     """Sec-WebSocket-Accept for a Sec-WebSocket-Key (RFC 6455 4.2.2)."""
     return base64.b64encode(
@@ -414,10 +418,11 @@ class KalshiFeed(threading.Thread):
         self._conn: Optional[WSConnection] = None
         self._connected = False
         self._sub_chunk = self.chunk
+        self._resync_req = ""            # resync(): reason, until acted on
         self.stats = {"connects": 0, "disconnects": 0, "msgs": 0,
                       "snapshots": 0, "deltas": 0, "gaps": 0, "fills": 0,
                       "og_events": 0, "errors": 0, "last_error": "",
-                      "resnapshots": 0}
+                      "resnapshots": 0, "resyncs": 0}
 
     # ---- main-thread API ----------------------------------------------------
 
@@ -470,6 +475,16 @@ class KalshiFeed(threading.Thread):
                        subs=len(self._subs), sub_chunk=self._sub_chunk)
         return out
 
+    def resync(self, reason: str = "") -> None:
+        """Rebuild every book from fresh snapshots on a new connection, for a
+        caller with reason to distrust them (the bot's REST audit). The books
+        go untrusted at once (book_levels -> None until their new snapshot);
+        the feed thread reconnects within ~1s, without the failure backoff."""
+        with self._lock:
+            self._resync_req = (reason or "requested")[:120]
+            for b in self._books.values():
+                b.ok = False
+
     def stop(self) -> None:
         self._stop_evt.set()
         c = self._conn
@@ -482,8 +497,12 @@ class KalshiFeed(threading.Thread):
         backoff = 1.0
         while not self._stop_evt.is_set():
             started = time.monotonic()
+            resync = False
             try:
                 self._session()
+            except _Resync as e:     # asked for, not a failure: no backoff
+                resync = True
+                self.log(f"[WS] resync ({e}): reconnecting for fresh snapshots")
             except Exception as e:   # every failure: invalidate + reconnect
                 with self._lock:
                     self.stats["errors"] += 1
@@ -495,6 +514,10 @@ class KalshiFeed(threading.Thread):
                 self._teardown()
             if time.monotonic() - started > 300:
                 backoff = 1.0            # a long healthy session resets backoff
+            if resync:
+                if self._stop_evt.wait(0.2):
+                    break
+                continue
             if self._stop_evt.wait(backoff * (0.8 + 0.4 * random.random())):
                 break
             backoff = min(backoff * 2.0, self.backoff_max)
@@ -532,6 +555,7 @@ class KalshiFeed(threading.Thread):
             self._conn = conn
             self._connected = True
             self.stats["connects"] += 1
+            self._resync_req = ""       # a new connection IS the resync
             # account channels: no market list = every market (docs)
             if self.want_fills:
                 self._queue_cmd("subscribe", {"channels": ["fill"]}, "base", [])
@@ -542,6 +566,11 @@ class KalshiFeed(threading.Thread):
         conn.settimeout(1.0)            # wake every second for upkeep
         last_ping = time.monotonic()
         while not self._stop_evt.is_set():
+            if self._resync_req:
+                with self._lock:
+                    why, self._resync_req = self._resync_req, ""
+                    self.stats["resyncs"] += 1
+                raise _Resync(why)
             self._apply_market_set()
             self._flush_outbox(conn)
             now = time.monotonic()

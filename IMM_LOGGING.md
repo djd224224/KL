@@ -42,6 +42,7 @@ Every row carries `run_id` and `config_hash`.
 | `book_depth/book_depth_*.jsonl.gz` | every book read | re-scoring ANY alternative ladder (since 2026-09-27) |
 | `guard_skips_*.jsonl` | on guard change + hourly | why a managed market went quiet, and on what book |
 | `floor_state_*.jsonl` | on member floor-state change | the hopeless clock and near-cliff, visible |
+| `ws_stale_*.jsonl` | per stale-quote episode event | would a fast WS cancel have paid (2026-10-04) |
 
 ### fills
 
@@ -165,6 +166,35 @@ written when `(reaches_min_raw, reaches_min, near_cliff_boost_armed)` changes,
 with `prev_state` and the full decision inputs. Its own file, so
 `selection_events` still means one row per decision change.
 
+### ws_stale (2026-10-04)
+
+One row per event of a stale-quote episode: a resting rung the WebSocket
+stale-quote check found strictly ahead of the external touch, on two looks
+at least 1s apart (dry in shadow; the cancel itself with IMM_WS=on +
+IMM_WS_FAST=1). `ev` is one of:
+
+- `flag`: the episode opens, once per order and price. It carries `mode`
+  (dry/live), `ticker`, `order_id`, `side` (bid/ask), `px` (our YES cents),
+  `rem`, `age_s` (since placed), `ahead_s` (since first seen ahead),
+  `ext_bid` / `ext_ask` (the external touch in cents, our own size taken
+  out), `gap_c` (cents ahead of it), `yes` / `no` (the WS book's best 60
+  levels as [cents, qty], deep enough to re-run the reward model) and `ours` (our orders on the market, as [side,
+  cents, remaining]).
+- `clear`: the touch came back level with or past the rung, so a fast
+  cancel would have pulled it for nothing. It carries the new `ext_bid` /
+  `ext_ask`.
+- `amend` (`new_px`) / `cancel`: the cycle repriced or pulled it. A fast-path
+  cancel carries `by: "fast"`.
+- `gone`: it left the book with no cancel or amend of ours: filled out, or
+  expired. Its fills are in `fills_*.jsonl`, by `order_id`.
+
+Every end row carries `stale_s` (seconds since the flag). An episode can stay
+open across a restart, because the new process starts with none. The check
+runs only between cycles (the ~10s idle), so a rung that went stale
+mid-cycle is flagged at the next idle. `ws_stale_score.py` turns a day of
+rows plus the fills and cycle logs into the verdict on a fast path.
+`IMM_WS_STALE_LOG=0` turns this file off.
+
 ### The `risk:` log line (2026-10-03)
 
 Not a sink: one bot-log line per FULL cycle, right after the cycle summary,
@@ -184,11 +214,16 @@ read nothing. The open-scan part is missing while the tier holds no book.
 
 Not a sink: since 2026-10-03 `status_incentive_mm.json` carries
 `latency.ws` -- the WebSocket feed (kalshi_ws.py) in shadow: feed health
-(connected, healthy, books_ok, want, gaps, resnapshots, errors, msgs), the
-shadow compare of every REST book read against the WS book (compared,
-exact, top, ws_missing) and the dry stale-quote counts (would_cancel). A
-live fast-path cancel (IMM_WS=on + IMM_WS_FAST=1, not enabled) would carry
-the orders-row cancel reason `ws_stale`.
+(connected, healthy, books_ok, want, gaps, resnapshots, resyncs, errors,
+msgs), the shadow compare of every REST book read against the WS book
+(compared, exact, top, ws_missing), the dry stale-quote counts
+(would_cancel, in episodes since 2026-10-04) and `stale_open` (episodes
+open in `ws_stale_*.jsonl`). Since 2026-10-04 also `audit`, the REST
+audit of the WS books: audits, rest_errors, trips, rearms, tripped,
+tripped_at, last_trip, every, and the trip window's size and mismatch
+counts (window, window_bad_top, window_bad_book). A live fast-path cancel
+(IMM_WS=on + IMM_WS_FAST=1, not enabled) would carry the orders-row cancel
+reason `ws_stale`.
 
 ## Two compatibility traps, both tested
 
@@ -225,7 +260,7 @@ already skips rows whose first field is `ts`. Files from 09-07 on are clean.
 
 `IMM_ANALYTICS=0` (every JSONL sink), `IMM_CYCLE_LOG=0` (the two CSVs),
 `IMM_BOOK_LOG=0`, `IMM_BOOK_LOG_CANDIDATES=0`, `IMM_GUARD_LOG=0`,
-`IMM_SELECTION_INPUTS=0`. Setting any of them in the launcher changes
+`IMM_SELECTION_INPUTS=0`, `IMM_WS_STALE_LOG=0`. Setting any of them in the launcher changes
 `CONFIG_HASH`, like every `IMM_*` variable. Tests prove order placement is
 identical with the logging on or off.
 

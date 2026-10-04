@@ -20173,6 +20173,7 @@ class TestImmOwnAccount(unittest.TestCase):
 # the status block. Each test pins the mode it is about.
 # ============================================================================
 
+import random as _random
 import threading as _threading
 
 import kalshi_ws as _kw
@@ -20188,6 +20189,10 @@ class _FakeFeed:
         self.dirty = set()
         self.event_flag = _threading.Event()
         self.stopped = False
+        self.resyncs = []
+
+    def resync(self, reason=""):
+        self.resyncs.append(reason)
 
     def set_markets(self, tickers):
         self.markets = set(tickers)
@@ -20222,6 +20227,8 @@ class TestWSBookSource(unittest.TestCase):
     def _bot(self, mode):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        # no REST audit draw (TestWSRestAudit covers it): `on` reads stay WS
+        bot._ws_rng = mock.Mock(random=lambda: 0.99)
         p = mock.patch.object(imm, "WS_MODE", mode)
         p.start()
         self.addCleanup(p.stop)
@@ -20537,6 +20544,337 @@ class TestWSStatus(unittest.TestCase):
         self.assertEqual(ws["shadow"],
                          {"compared": 0, "exact": 0, "top": 0, "ws_missing": 0})
         self.assertIn("would_cancel", ws["fast_stats"])
+        self.assertEqual({k: ws["audit"][k] for k in
+                          ("tripped", "trips", "every", "window", "window_bad_top")},
+                         {"tripped": False, "trips": 0, "every": imm.WS_AUDIT_EVERY,
+                          "window": 0, "window_bad_top": 0})
+        self.assertEqual(ws["stale_open"], 0)
+
+
+class TestWSRestAudit(unittest.TestCase):
+    """IMM_WS=on also reads 1 book in WS_AUDIT_EVERY from REST and trades on
+    it; too many mismatches send every read back to REST until a clean
+    window after the cooldown (Jack 2026-10-04)."""
+    T = "KXGOOD-99DEC31-A"
+    _OFF_TOP = ({0.47: 500.0}, {0.49: 1200.0})                  # REST's top is 49c
+    _OFF_DEPTH = ({0.48: 400.0, 0.49: 600.0}, {0.49: 1200.0})   # same top
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        self.bot._ws = self.feed
+        self.reads = []
+        base = self.bot.client.get_orderbook
+
+        def counted(ticker, depth=None):
+            self.reads.append(ticker)
+            return base(ticker, depth)
+        self.bot.client.get_orderbook = counted
+        for name, v in (("WS_MODE", "on"), ("WS_FAST", False)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _rng(self, x):
+        self.bot._ws_rng = mock.Mock(random=lambda: x)
+
+    def _trip(self):
+        self.feed.books[self.T] = self._OFF_TOP
+        self._rng(0.0)
+        for _ in range(imm.WS_AUDIT_TRIP_TOP):
+            self.bot._read_book(self.T)
+
+    def test_a_sampled_read_trades_on_rest_and_is_compared(self):
+        self.feed.books[self.T] = self._OFF_DEPTH         # tell the two apart
+        self._rng(0.0)                                    # audit this read
+        ob = self.bot._read_book(self.T)
+        self.assertEqual(self.reads, [self.T])
+        self.assertEqual(_kw.rest_book_levels(ob)[0], {0.48: 500.0, 0.49: 600.0})
+        self.assertEqual(self.bot._ws_audit["audits"], 1)
+        self.assertEqual(self.bot._ws_books_used, 0)
+        sh = self.bot._ws_shadow
+        self.assertEqual((sh["compared"], sh["exact"], sh["top"]), (1, 0, 1))
+        self._rng(0.99)                                   # the other 19 in 20
+        ob = self.bot._read_book(self.T)
+        self.assertEqual(self.reads, [self.T])
+        self.assertEqual(_kw.rest_book_levels(ob)[0], {0.48: 400.0, 0.49: 600.0})
+        self.assertEqual((self.bot._ws_books_used, self.bot._ws_audit["audits"]),
+                         (1, 1))
+
+    def test_one_read_in_every_is_audited_at_random(self):
+        self.bot._ws_rng = _random.Random(7)
+        for _ in range(4000):
+            self.bot._read_book(self.T)
+        n = self.bot._ws_audit["audits"]
+        self.assertEqual(n, len(self.reads))
+        self.assertEqual(self.bot._ws_books_used + n, 4000)
+        self.assertGreater(n, 4000 / imm.WS_AUDIT_EVERY * 0.7)
+        self.assertLess(n, 4000 / imm.WS_AUDIT_EVERY * 1.3)
+        self.assertFalse(self.bot._ws_audit["tripped"])
+
+    def test_a_failed_audit_read_trades_on_the_ws_book(self):
+        self._rng(0.0)
+
+        def boom(ticker, depth=None):
+            raise RuntimeError("429")
+        self.bot.client.get_orderbook = boom
+        self.assertEqual(self.bot._read_book(self.T), self.feed.book_fp(self.T))
+        self.assertEqual((self.bot._ws_audit["rest_errors"], self.bot._ws_books_used),
+                         (1, 1))
+
+    def test_top_mismatches_trip_every_read_to_rest_until_a_clean_cooldown(self):
+        self.feed.books[self.T] = self._OFF_TOP
+        self._rng(0.0)
+        for _ in range(imm.WS_AUDIT_TRIP_TOP - 1):
+            self.bot._read_book(self.T)
+        self.assertFalse(self.bot._ws_audit["tripped"])
+        self.bot._read_book(self.T)
+        a = self.bot._ws_audit
+        self.assertEqual((a["tripped"], a["trips"]), (True, 1))
+        self.assertIn("5 top-of-book", a["last_trip"])
+        self.assertEqual(self.feed.resyncs, ["REST audit tripped"])
+        self.assertIn("ws_audit", [c for c, _m in self.bot.alerter.today])
+        # tripped: an unsampled read goes to REST too, and is compared
+        self._rng(0.99)
+        n, used, cmp_ = len(self.reads), self.bot._ws_books_used, \
+            self.bot._ws_shadow["compared"]
+        self.bot._read_book(self.T)
+        self.assertEqual((len(self.reads), self.bot._ws_books_used,
+                          self.bot._ws_shadow["compared"]), (n + 1, used, cmp_ + 1))
+        self.assertEqual(len(self.bot._ws_audit_win), 0)  # not an audit draw
+        # the feed is right again: a full clean window inside the cooldown
+        # is not enough...
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        self._rng(0.0)
+        for _ in range(imm.WS_AUDIT_WINDOW + 5):
+            self.bot._read_book(self.T)
+        self.assertTrue(self.bot._ws_audit["tripped"])
+        # ...after it, the next audited compare re-arms, and an unaudited
+        # read is served by the WS book again
+        self.bot._ws_audit["tripped_at"] -= imm.WS_AUDIT_COOLDOWN_SECS + 1
+        self.bot._read_book(self.T)
+        self.assertEqual((self.bot._ws_audit["tripped"], self.bot._ws_audit["rearms"]),
+                         (False, 1))
+        self._rng(0.99)
+        n = len(self.reads)
+        self.bot._read_book(self.T)
+        self.assertEqual(len(self.reads), n)
+
+    def test_only_the_sampled_shadow_compares_feed_the_window(self):
+        # a burst of racing books, every one mismatching, none of them drawn
+        self.feed.books[self.T] = self._OFF_TOP
+        self._rng(0.99)
+        with mock.patch.object(imm, "WS_MODE", "shadow"):
+            for _ in range(50):
+                self.bot._read_book(self.T)
+        sh, a = self.bot._ws_shadow, self.bot._ws_audit
+        self.assertEqual((sh["compared"], sh["top"]), (50, 0))
+        self.assertEqual((a["audits"], a["tripped"], len(self.bot._ws_audit_win)),
+                         (0, False, 0))
+
+    def test_a_feed_still_wrong_after_the_cooldown_stays_tripped_quietly(self):
+        self._trip()
+        self.bot._ws_audit["tripped_at"] -= imm.WS_AUDIT_COOLDOWN_SECS + 1
+        for _ in range(imm.WS_AUDIT_WINDOW + 5):
+            self.bot._read_book(self.T)
+        a = self.bot._ws_audit
+        self.assertEqual((a["tripped"], a["trips"], a["rearms"]), (True, 1, 0))
+        self.assertEqual(len(self.feed.resyncs), 1)
+
+    def test_whole_book_mismatches_trip_at_their_own_limit(self):
+        self.feed.books[self.T] = self._OFF_DEPTH
+        self._rng(0.0)
+        for _ in range(imm.WS_AUDIT_TRIP_EXACT - 1):
+            self.bot._read_book(self.T)
+        self.assertFalse(self.bot._ws_audit["tripped"])
+        self.bot._read_book(self.T)
+        self.assertTrue(self.bot._ws_audit["tripped"])
+
+    def test_a_trip_emails_only_when_the_books_trade(self):
+        calls = []
+        self.bot.alerter.alert = lambda cat, msg, key="", urgent=True, now_ts=None: \
+            calls.append((cat, urgent))
+        self._trip()
+        self.assertEqual(calls, [("ws_audit", True)])
+        # shadow compares trip the same way, without an email
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        feed2 = _FakeFeed()
+        feed2.books[self.T] = self._OFF_TOP
+        bot2._ws = feed2
+        bot2._ws_rng = mock.Mock(random=lambda: 0.0)       # every compare drawn
+        calls2 = []
+        bot2.alerter.alert = lambda cat, msg, key="", urgent=True, now_ts=None: \
+            calls2.append((cat, urgent))
+        with mock.patch.object(imm, "WS_MODE", "shadow"):
+            for _ in range(imm.WS_AUDIT_TRIP_TOP):
+                bot2._read_book(self.T)
+        self.assertEqual(calls2, [("ws_audit", False)])
+        self.assertTrue(bot2._ws_audit["tripped"])
+        self.assertEqual(feed2.resyncs, ["REST audit tripped"])
+
+    def test_a_trip_pauses_the_stale_quote_check_and_its_cancels(self):
+        now = time.time()
+        cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": cancelled.append(oid) or True
+        self.bot._resting_view = {self.T: [{
+            "order_id": "o1", "side": "bid", "px": 49.0, "rem": 20.0,
+            "placed": now - 100, "pad": False}]}
+        self.feed.books[self.T] = ({0.47: 500.0, 0.49: 20.0}, {0.49: 1200.0})
+        self.bot._ws_audit["tripped"] = True
+        for mode, fast in (("shadow", False), ("on", True)):
+            with mock.patch.object(imm, "WS_MODE", mode), \
+                    mock.patch.object(imm, "WS_FAST", fast):
+                for dt in (0.0, 1.5, 3.0):
+                    self.feed.dirty = {self.T}
+                    self.bot._ws_process_events(now + dt)
+        self.assertEqual((self.bot._ws_fast["would_cancel"], cancelled), (0, []))
+        self.bot._ws_audit["tripped"] = False            # re-armed: counts again
+        with mock.patch.object(imm, "WS_MODE", "shadow"):
+            for dt in (5.0, 6.5):
+                self.feed.dirty = {self.T}
+                self.bot._ws_process_events(now + dt)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+
+
+class TestWSStaleEpisodes(unittest.TestCase):
+    """Each stale-quote episode -> ws_stale_<date>.jsonl: its flag (book,
+    touch, our orders) and how it ended (Jack 2026-10-04)."""
+    T = "KXGOOD-99DEC31-A"
+    _AHEAD = ({0.47: 500.0, 0.49: 20.0}, {0.49: 1200.0})   # our 20 alone at 49c
+    _JOINED = ({0.49: 520.0}, {0.49: 1200.0})
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append(oid) or True
+        p = mock.patch.object(imm, "WS_MODE", "shadow")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _view(self, oid="o1", side="bid", px=49.0, rem=20.0):
+        self.bot._resting_view = {self.T: [{
+            "order_id": oid, "side": side, "px": px, "rem": rem,
+            "placed": self.now - 100.0, "pad": False}]}
+
+    def _look(self, *dts):
+        for dt in dts:
+            self.feed.dirty = {self.T}
+            self.bot._ws_process_events(self.now + dt)
+
+    def _evs(self):
+        return [r["ev"] for name, r in self.recs if name == "ws_stale"]
+
+    def test_a_flag_line_carries_the_book_the_touch_and_our_orders(self):
+        self._view()
+        self.feed.books[self.T] = self._AHEAD
+        self._look(0.0, 1.5, 3.0, 6.0)
+        self.assertEqual(self._evs(), ["flag"])
+        rec = self.recs[0][1]
+        self.assertEqual(
+            {k: rec[k] for k in ("mode", "ticker", "order_id", "side", "px", "rem",
+                                 "ext_bid", "ext_ask", "gap_c", "ahead_s", "age_s")},
+            {"mode": "dry", "ticker": self.T, "order_id": "o1", "side": "bid",
+             "px": 49.0, "rem": 20.0, "ext_bid": 47.0, "ext_ask": 51.0,
+             "gap_c": 2.0, "ahead_s": 1.5, "age_s": 101.5})
+        self.assertEqual(rec["yes"], [[49.0, 20.0], [47.0, 500.0]])
+        self.assertEqual(rec["no"], [[49.0, 1200.0]])
+        self.assertEqual(rec["ours"], [["bid", 49.0, 20.0]])
+        self.assertAlmostEqual(rec["ts"], self.now + 1.5, places=2)
+        self.assertEqual(json.loads(json.dumps(rec)), rec)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+
+    def test_the_touch_returning_clears_it_and_a_relapse_is_a_new_episode(self):
+        self._view()
+        self.feed.books[self.T] = self._AHEAD
+        self._look(0.0, 1.5)
+        self.feed.books[self.T] = self._JOINED
+        self._look(4.0)
+        self.assertEqual(self._evs(), ["flag", "clear"])
+        clear = self.recs[1][1]
+        self.assertEqual((clear["order_id"], clear["px"], clear["stale_s"],
+                          clear["ext_bid"]), ("o1", 49.0, 2.5, 49.0))
+        self.assertEqual(self.bot._ws_flagged, {})
+        self.feed.books[self.T] = self._AHEAD
+        self._look(6.0, 7.5)
+        self.assertEqual(self._evs(), ["flag", "clear", "flag"])
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 2)
+
+    def test_the_cycle_ends_episodes_by_amend_cancel_or_gone(self):
+        b = self.bot
+        for oid, px in (("o1", 49.0), ("o2", 48.0), ("o3", 47.0), ("o4", 46.0)):
+            b._ws_flagged[oid] = {"t": self.T, "side": "bid", "px": px,
+                                  "at": self.now - 30}
+        b._ws_suspect = {"o1": self.now - 31, "o4": self.now - 31}
+        b._cycle_amended = {"o1": 45}
+        b._cycle_cancelled = {"o2"}
+        resting = [{"order_id": oid, "ticker": self.T, "book_side": "bid",
+                    "yes_price": px, "remaining_count": 10}
+                   for oid, px in (("o1", 49), ("o2", 48), ("o4", 46))]
+        b._build_resting_view(resting, self.now)
+        ends = {r["order_id"]: (r["ev"], r.get("new_px")) for _n, r in self.recs}
+        self.assertEqual(ends, {"o1": ("amend", 45.0), "o2": ("cancel", None),
+                                "o3": ("gone", None)})
+        self.assertTrue(all(r["stale_s"] == 30.0 for _n, r in self.recs))
+        self.assertEqual(set(b._ws_flagged), {"o4"})      # same price, still open
+        # the amended order's two looks start over at its new price
+        self.assertEqual(set(b._ws_suspect), {"o4"})
+
+    def test_live_fast_mode_logs_the_flag_then_its_cancel(self):
+        with mock.patch.object(imm, "WS_MODE", "on"), \
+                mock.patch.object(imm, "WS_FAST", True):
+            self._view()
+            self.feed.books[self.T] = self._AHEAD
+            self._look(0.0, 1.5)
+        self.assertEqual(self.cancelled, ["o1"])
+        self.assertEqual(self._evs(), ["flag", "cancel"])
+        self.assertEqual((self.recs[0][1]["mode"], self.recs[1][1]["by"]),
+                         ("live", "fast"))
+        self.assertEqual(self.bot._ws_flagged, {})
+
+    def test_the_log_switch_stops_the_lines_not_the_count(self):
+        with mock.patch.object(imm, "WS_STALE_LOG", False):
+            self._view()
+            self.feed.books[self.T] = self._AHEAD
+            self._look(0.0, 1.5)
+            self.feed.books[self.T] = self._JOINED
+            self._look(3.0)
+        self.assertEqual(self.recs, [])
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+        self.assertEqual(self.bot._ws_flagged, {})
+
+    def test_the_real_sink_writes_one_jsonl_line(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)   # real _sink
+        bot._ws = self.feed
+        # our ask at 51c is a NO bid at 49c, alone; the next NO bid is 47c
+        bot._resting_view = {self.T: [{
+            "order_id": "oX", "side": "ask", "px": 51.0, "rem": 20.0,
+            "placed": self.now - 50.0, "pad": False}]}
+        self.feed.books[self.T] = ({0.48: 500.0}, {0.47: 900.0, 0.49: 20.0})
+        path = os.path.join(imm.STATUS_DIR, "ws_stale_%s.jsonl"
+                            % datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        before = 0
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                before = sum(1 for _ in f)
+        for dt in (0.0, 1.5):
+            self.feed.dirty = {self.T}
+            bot._ws_process_events(self.now + dt)
+        with open(path, encoding="utf-8") as f:
+            lines = [json.loads(x) for x in f][before:]
+        self.assertEqual(len(lines), 1)
+        r = lines[0]
+        self.assertEqual((r["ev"], r["order_id"], r["side"], r["ext_bid"],
+                          r["ext_ask"], r["gap_c"], r["run_id"]),
+                         ("flag", "oX", "ask", 48.0, 53.0, 2.0, imm.RUN_ID))
 
 
 if __name__ == "__main__":

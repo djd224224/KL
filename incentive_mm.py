@@ -67,6 +67,7 @@ import math
 import os
 import fnmatch
 import gzip
+import random
 import re
 import signal
 import smtplib
@@ -2730,7 +2731,8 @@ BLIND_PRESERVE_CYCLES = 3
 #                     it never cancels. No trading decision reads the feed.
 #    IMM_WS=off    -- nothing runs (the bot exactly as before).
 #    IMM_WS=on     -- the quote loop reads the WS book whenever it is
-#                     trustworthy, REST otherwise. NOT enabled.
+#                     trustworthy, REST otherwise; 1 read in 20 is audited
+#                     against REST (WS_AUDIT_EVERY, below). NOT enabled.
 #    IMM_WS_FAST=1 -- (with on) cancel a rung the external touch left strictly
 #                     ahead of the book between cycles. NOT enabled.
 WS_MODE = os.environ.get("IMM_WS", "shadow").strip().lower()
@@ -2748,6 +2750,50 @@ WS_SHADOW_LOG_PER_HOUR = _env_int("IMM_WS_SHADOW_LOG_PER_HOUR", 20)
 # between cycles the feed's changes are looked at in batches, at most this
 # many times a second (they accumulate in the feed meanwhile)
 WS_IDLE_BATCHES_PER_SEC = max(1.0, _env_float("IMM_WS_IDLE_BATCHES_PER_SEC", 4.0))
+
+# REST AUDIT OF THE WS BOOKS (Jack 2026-10-04: "yes do both" -- a sampled
+# REST check with automatic fallback before IMM_WS=on). With the feed driving
+# the quote loop (on), 1 book read in WS_AUDIT_EVERY, picked at random so no
+# market is skipped for good, ALSO reads REST, trades on the REST book and
+# compares the two. Shadow compares every read already; the same random 1 in
+# WS_AUDIT_EVERY of those feeds the trip window, so shadow rehearses exactly
+# the audit `on` runs, and a data release's burst of books racing their REST
+# reads cannot crowd the window. It TRIPS at WS_AUDIT_TRIP_TOP top-of-book or
+# WS_AUDIT_TRIP_EXACT whole-book mismatches among the last WS_AUDIT_WINDOW
+# audited compares (the live base rate, 5,054 shadow compares on 10/4: 0.06%
+# top, 0.18% whole book).
+# A trip sends every read back to REST (each compared, as in shadow), stops
+# the stale-quote check, reconnects the feed for fresh snapshots and alerts
+# (by email when on). It re-arms after WS_AUDIT_COOLDOWN_SECS once a full
+# window of compares since the trip is under both limits.
+WS_AUDIT_EVERY = max(1, _env_int("IMM_WS_AUDIT_EVERY", 20))
+WS_AUDIT_WINDOW = max(10, _env_int("IMM_WS_AUDIT_WINDOW", 100))
+WS_AUDIT_TRIP_TOP = max(1, _env_int("IMM_WS_AUDIT_TRIP_TOP", 5))
+WS_AUDIT_TRIP_EXACT = max(1, _env_int("IMM_WS_AUDIT_TRIP_EXACT", 15))
+WS_AUDIT_COOLDOWN_SECS = _env_float("IMM_WS_AUDIT_COOLDOWN_SECS", 900.0)
+# STALE-QUOTE EPISODE LOG (same day): each rung the stale-quote check flags,
+# dry or live, is one `flag` line in ws_stale_<UTC date>.jsonl (the book,
+# the external touch, our orders on the market), and its end another: the
+# touch came back (`clear`), the cycle amended or cancelled it (`amend` /
+# `cancel`), or it left the book (`gone`: filled out or expired; the fills
+# are in fills_*.jsonl by order_id). ws_stale_score.py scores the episodes:
+# was the rung hit while stale, at what mark-out, against the reward a
+# cancel would have given up. IMM_WS_STALE_LOG=0 turns the file off.
+WS_STALE_LOG = os.environ.get("IMM_WS_STALE_LOG", "1") == "1"
+
+
+def _ws_cents(dollars: Optional[float]) -> Optional[float]:
+    """A WS book price in dollars -> cents for the episode log (None stays)."""
+    return None if dollars is None else round(dollars * 100.0, 2)
+
+
+def _ws_top(levels: Dict[float, float], n: int = 60) -> List[List[float]]:
+    """One side of a WS book ({dollars: qty}): its best `n` levels, best
+    first, as [cents, qty] -- deep enough for the reward model's qualifying
+    walk to reach the target size, so a scorer can re-run
+    estimate_reward_share with and without the flagged rung."""
+    live = sorted(((p, q) for p, q in levels.items() if q > 1e-9), reverse=True)
+    return [[round(p * 100.0, 2), round(q, 2)] for p, q in live[:n]]
 
 # Series other repo bots trade (self-trade / infighting exclusion) + anything
 # broadcast-reactive the user wants out entirely. Prefix match on the ticker.
@@ -6808,6 +6854,9 @@ _CONFIG_CODE_KNOBS = (
     # WebSocket books, shadow (2026-10-03)
     "WS_MODE", "WS_URL", "WS_FAST", "WS_SUB_CHUNK", "WS_STALE_SECS",
     "WS_FAST_MAX_CANCELS_PER_MIN", "WS_MIN_CYCLE_GAP_SECS",
+    # ...their REST audit and stale-quote episode log (2026-10-04)
+    "WS_AUDIT_EVERY", "WS_AUDIT_WINDOW", "WS_AUDIT_TRIP_TOP",
+    "WS_AUDIT_TRIP_EXACT", "WS_AUDIT_COOLDOWN_SECS", "WS_STALE_LOG",
 )
 
 
@@ -12053,12 +12102,23 @@ class IncentiveMarketMaker:
         self._cycle_amended: Dict[str, int] = {}
         self._resting_view: Dict[str, List[dict]] = {}
         self._ws_suspect: Dict[str, float] = {}    # order id -> first seen ahead
-        self._ws_would: Set[str] = set()           # shadow: ids already counted
+        # open stale-quote episodes (2026-10-04, WS_STALE_LOG): order id ->
+        # the flagged rung (ticker, side, cents, flagged at); `would_cancel`
+        # counts episodes, so a rung that clears and goes stale again counts
+        # twice -- each is a cancel a fast path would send
+        self._ws_flagged: Dict[str, dict] = {}
         self._ws_fast = {"cancels": 0, "events": 0, "wakes": 0, "fills": 0,
                          "skipped_budget": 0, "would_cancel": 0}
         self._ws_cancel_times: Deque[float] = deque()
         self._ws_wake = False
         self._last_cycle_start = 0.0
+        # REST audit (2026-10-04, see WS_AUDIT_EVERY): the trip window holds
+        # (whole book equal, top of book equal) for the latest compares
+        self._ws_audit = {"audits": 0, "rest_errors": 0, "trips": 0,
+                          "rearms": 0, "tripped": False, "tripped_at": 0.0,
+                          "last_trip": ""}
+        self._ws_audit_win: Deque[Tuple[bool, bool]] = deque(maxlen=WS_AUDIT_WINDOW)
+        self._ws_rng = random.Random()
         self._load_persist()
         # the ladder-asks cash latch lives in module state for series_bid_only
         _LADDER_ASKS_STATE["on_at"] = self.state.ladder_asks_on_at or None
@@ -13403,24 +13463,46 @@ class IncentiveMarketMaker:
         """The market's order book for the quote loop. IMM_WS=shadow (the
         default) and off: the REST read exactly as before -- in shadow it is
         then compared with the WS book, which is never used. IMM_WS=on: the
-        WS book when it is trustworthy, else REST. A REST failure raises as
-        it always did (the blind path is unchanged)."""
+        WS book when it is trustworthy, else REST; 1 read in WS_AUDIT_EVERY
+        also reads REST, trades on the REST book and compares the two, and a
+        tripped audit sends every read to REST (compared) until it re-arms.
+        A REST failure raises as it always did (the blind path is unchanged),
+        except on an audit read, which then trades on the WS book."""
         ws = self._ws
-        if ws is not None and WS_MODE == "on":
+        if ws is not None and WS_MODE == "on" and not self._ws_audit["tripped"]:
             ob = ws.book_fp(ticker)
             if ob is not None:
-                self._ws_books_used += 1
-                return ob
+                if not self._ws_audit_draw():
+                    self._ws_books_used += 1
+                    return ob
+                try:
+                    rest = self.client.get_orderbook(ticker=ticker)
+                except Exception:
+                    self._ws_audit["rest_errors"] += 1
+                    self._ws_books_used += 1
+                    return ob
+                self._ws_compare(ticker, rest, audit=True)
+                return rest
             self._ws_rest_fallback += 1
         ob = self.client.get_orderbook(ticker=ticker)
-        if ws is not None and WS_MODE == "shadow":
-            self._ws_shadow_compare(ticker, ob)
+        if ws is not None and WS_MODE in ("shadow", "on"):
+            self._ws_compare(ticker, ob, audit=self._ws_audit_draw())
         return ob
 
-    def _ws_shadow_compare(self, ticker: str, rest_ob: dict) -> None:
-        """Shadow mode: count how often the WS book equals the REST read
-        (whole book / top of book), log a sample of mismatches. Analytics
-        only -- never raises, never touches trading."""
+    def _ws_audit_draw(self) -> bool:
+        """True for 1 book read in WS_AUDIT_EVERY, at random. Only these
+        compares feed the audit's trip window, in every mode: shadow then
+        rehearses exactly the audit `on` would run, and a burst of racing
+        books (a data release moves 20-50 markets the cycle reads back to
+        back) cannot crowd the window with timing mismatches."""
+        return self._ws_rng.random() * WS_AUDIT_EVERY < 1.0
+
+    def _ws_compare(self, ticker: str, rest_ob: dict, audit: bool = False) -> None:
+        """Compare the WS book with a REST read of the same market: count
+        whole-book / top-of-book agreement (status latency.ws.shadow), log a
+        sample of top mismatches, and -- an audit draw -- feed the audit's
+        trip window. Never raises; trading sees the outcome only through a
+        trip."""
         try:
             import kalshi_ws
             lv = self._ws.book_levels(ticker)
@@ -13448,8 +13530,50 @@ class IncentiveMarketMaker:
                     self._ws_shadow_logged.append(now)
                     log(f"{self.tag} WS shadow: top mismatch {ticker} "
                         f"rest {top_r} ws {top_w}")
+            if audit:
+                self._ws_audit["audits"] += 1
+                self._ws_audit_note(exact, top_r == top_w)
         except Exception:
             pass
+
+    def _ws_audit_note(self, exact: bool, top: bool,
+                       now_ts: Optional[float] = None) -> None:
+        """One WS-vs-REST compare into the audit window; trip on too many
+        mismatches, re-arm after the cooldown on a clean window."""
+        now_ts = time.time() if now_ts is None else now_ts
+        win = self._ws_audit_win
+        win.append((bool(exact), bool(top)))
+        bad_top = sum(1 for _e, tp in win if not tp)
+        bad_book = sum(1 for e, _tp in win if not e)
+        st = self._ws_audit
+        clean = bad_top < WS_AUDIT_TRIP_TOP and bad_book < WS_AUDIT_TRIP_EXACT
+        if not st["tripped"]:
+            if clean:
+                return
+            st.update(tripped=True, tripped_at=now_ts, trips=st["trips"] + 1,
+                      last_trip=f"{bad_top} top-of-book / {bad_book} whole-book "
+                                f"mismatches in the last {len(win)} compares")
+            win.clear()
+            what = ("every book read is back on REST" if WS_MODE == "on"
+                    else "the stale-quote check is paused (trading reads REST)")
+            self.alerter.alert(
+                "ws_audit", f"WebSocket books disagree with REST: "
+                f"{st['last_trip']}; {what}; the feed reconnects for fresh "
+                f"snapshots; re-arms after {WS_AUDIT_COOLDOWN_SECS / 60:.0f} min "
+                f"on a clean window", key="trip", urgent=(WS_MODE == "on"),
+                now_ts=now_ts)
+            try:
+                if self._ws is not None:
+                    self._ws.resync("REST audit tripped")
+            except Exception:
+                pass
+            return
+        if (clean and len(win) >= WS_AUDIT_WINDOW
+                and now_ts - st["tripped_at"] >= WS_AUDIT_COOLDOWN_SECS):
+            st.update(tripped=False, rearms=st["rearms"] + 1)
+            log(f"{self.tag} WS audit re-armed: {len(win)} compares since the "
+                f"trip, {bad_top} top / {bad_book} whole-book mismatches"
+                + ("; WS books back in use" if WS_MODE == "on" else ""))
 
     def _ws_start(self) -> None:
         """Start the WebSocket feed thread (IMM_WS=shadow|on). Any failure
@@ -13507,11 +13631,13 @@ class IncentiveMarketMaker:
             dirty, events, dropped = ws.drain()
         except Exception:
             return
-        fast = WS_FAST and WS_MODE == "on"
+        # a tripped REST audit distrusts the books: no stale-quote check at all
+        ok = not self._ws_audit["tripped"]
+        fast = WS_FAST and WS_MODE == "on" and ok
         # with the fast path off, the same check runs DRY: it counts (and
         # samples in the log) the cancels it would have sent -- the evidence
         # for a fast path, gathered on the live book
-        fast_dry = not fast and WS_MODE in ("on", "shadow")
+        fast_dry = not fast and WS_MODE in ("on", "shadow") and ok
         for kind, body in events:
             self._ws_fast["events"] += 1
             if kind == "fill":
@@ -13572,14 +13698,19 @@ class IncentiveMarketMaker:
                          else (ext_ask is None or p < ext_ask - 1e-6))
                 if not ahead:
                     self._ws_suspect.pop(oid, None)
+                    if oid in self._ws_flagged:     # the touch came back
+                        self._ws_episode_end(oid, "clear", now_ts,
+                                             ext_bid=_ws_cents(ext_bid),
+                                             ext_ask=_ws_cents(ext_ask))
                     continue
                 first = self._ws_suspect.setdefault(oid, now_ts)
                 if now_ts - first < 1.0:
                     continue
+                new = self._ws_episode_flag(t, o, now_ts, first, ext_bid,
+                                            ext_ask, yes, no, orders, dry)
                 if dry:
-                    # count each order once; never cancel, never spend budget
-                    if oid not in self._ws_would:
-                        self._ws_would.add(oid)
+                    # count each episode once; never cancel, never spend budget
+                    if new:
                         self._ws_fast["would_cancel"] = \
                             self._ws_fast.get("would_cancel", 0) + 1
                         while self._ws_shadow_logged and \
@@ -13605,12 +13736,61 @@ class IncentiveMarketMaker:
                     cancels += 1
                     self._ws_fast["cancels"] += 1
                     orders.remove(o)
+                    self._ws_episode_end(oid, "cancel", now_ts, by="fast")
                     log(f"{self.tag} WS fast: cancelled {t} "
                         f"{o['side'].upper()} @ {o['px']:g}c -- the external "
                         f"touch left it ahead (bid {ext_bid}, ask {ext_ask})")
         if cancels:
             self._ws_wake = True
         return cancels
+
+    def _ws_episode_flag(self, t: str, o: dict, now_ts: float, first: float,
+                         ext_bid: Optional[float], ext_ask: Optional[float],
+                         yes: Dict[float, float], no: Dict[float, float],
+                         orders: List[dict], dry: bool) -> bool:
+        """Open a stale-quote episode for a rung the check just confirmed
+        ahead -- once per order and price -- and log its `flag` line (the
+        book, the external touch, our orders on the market). True if new."""
+        oid = o["order_id"]
+        ep = self._ws_flagged.get(oid)
+        if ep is not None and abs(ep["px"] - o["px"]) < 1e-9:
+            return False
+        if ep is not None:                  # the same order at a new price
+            self._ws_episode_end(oid, "amend", now_ts, new_px=o["px"])
+        self._ws_flagged[oid] = {"t": t, "side": o["side"], "px": o["px"],
+                                 "at": now_ts}
+        if WS_STALE_LOG:
+            px = o["px"]
+            if o["side"] == "bid":
+                gap = None if ext_bid is None else px - ext_bid * 100.0
+            else:
+                gap = None if ext_ask is None else ext_ask * 100.0 - px
+            self._sink("ws_stale", {
+                "ev": "flag", "ts": round(now_ts, 3),
+                "mode": "dry" if dry else "live",
+                "ticker": t, "order_id": oid, "side": o["side"], "px": px,
+                "rem": o["rem"],
+                "age_s": round(now_ts - o["placed"], 1) if o["placed"] else None,
+                "ahead_s": round(now_ts - first, 2),
+                "ext_bid": _ws_cents(ext_bid), "ext_ask": _ws_cents(ext_ask),
+                "gap_c": None if gap is None else round(gap, 2),
+                "yes": _ws_top(yes), "no": _ws_top(no),
+                "ours": [[x["side"], x["px"], x["rem"]] for x in orders]})
+        return True
+
+    def _ws_episode_end(self, oid: str, ev: str, now_ts: float,
+                        **extra: Any) -> None:
+        """Close an open stale-quote episode with its `ev` line: clear (the
+        touch came back), amend / cancel (by the cycle, or by="fast"), gone
+        (it left the book: filled out or expired)."""
+        ep = self._ws_flagged.pop(oid, None)
+        if ep is None or not WS_STALE_LOG:
+            return
+        rec = {"ev": ev, "ts": round(now_ts, 3), "ticker": ep["t"],
+               "order_id": oid, "side": ep["side"], "px": ep["px"],
+               "stale_s": round(now_ts - ep["at"], 1)}
+        rec.update(extra)
+        self._sink("ws_stale", rec)
 
     def _build_resting_view(self, resting: List[dict], now_ts: float) -> None:
         """Our resting orders per ticker as this cycle leaves them -- the
@@ -13651,8 +13831,22 @@ class IncentiveMarketMaker:
                 px, float(led.get("remaining_count") or 0.0),
                 float(led.get("_placed_at") or now_ts))
         self._resting_view = view
-        self._ws_suspect = {k: v for k, v in self._ws_suspect.items() if k in seen}
-        self._ws_would &= seen
+        # an order the cycle amended keeps no first-seen-ahead time from its
+        # old price: the two looks start over at the new one
+        self._ws_suspect = {k: v for k, v in self._ws_suspect.items()
+                            if k in seen and k not in self._cycle_amended}
+        # the stale-quote episodes this cycle closed: amended to a new price,
+        # cancelled, or gone from the book (filled out / expired)
+        if self._ws_flagged:
+            cur = {o["order_id"]: o for lst in view.values() for o in lst}
+            for oid in list(self._ws_flagged):
+                o = cur.get(oid)
+                if o is None:
+                    self._ws_episode_end(
+                        oid, "cancel" if oid in self._cycle_cancelled else "gone",
+                        now_ts)
+                elif abs(o["px"] - self._ws_flagged[oid]["px"]) > 1e-9:
+                    self._ws_episode_end(oid, "amend", now_ts, new_px=o["px"])
 
     def _idle(self, secs: float, stopping: dict) -> bool:
         """Sleep up to `secs` between cycles. With the WebSocket feed running
@@ -18803,11 +18997,20 @@ class IncentiveMarketMaker:
     def _latency_status(self) -> dict:
         """The status file's `latency` block (WebSocket books). Never raises."""
         try:
+            win = list(self._ws_audit_win)
             out = {"ws": {"mode": WS_MODE, "fast": WS_FAST,
                           "books_used": self._ws_books_used,
                           "rest_fallback": self._ws_rest_fallback,
                           "shadow": dict(self._ws_shadow),
-                          "fast_stats": dict(self._ws_fast)}}
+                          "fast_stats": dict(self._ws_fast),
+                          # the REST audit and its trip window (2026-10-04)
+                          "audit": dict(self._ws_audit, every=WS_AUDIT_EVERY,
+                                        window=len(win),
+                                        window_bad_top=sum(1 for _e, tp in win
+                                                           if not tp),
+                                        window_bad_book=sum(1 for e, _tp in win
+                                                            if not e)),
+                          "stale_open": len(self._ws_flagged)}}
             if self._ws is not None:
                 out["ws"]["feed"] = self._ws.status()
             return out
@@ -19859,6 +20062,17 @@ class IncentiveMarketMaker:
                      + (" + fast stale-quote cancels" if WS_FAST else
                         "; stale quotes counted only"),
                "off": " -- no feed"}.get(WS_MODE, ""))
+        if WS_MODE != "off":
+            log(f"WS REST audit (2026-10-04): "
+                + (f"1 read in {WS_AUDIT_EVERY} also reads REST and trades on it; "
+                   if WS_MODE == "on" else
+                   f"1 shadow compare in {WS_AUDIT_EVERY} is audited; ")
+                + f"trips at {WS_AUDIT_TRIP_TOP} top / {WS_AUDIT_TRIP_EXACT} "
+                f"whole-book mismatches in {WS_AUDIT_WINDOW} compares (REST "
+                f"only, stale check paused, feed re-snapshots), re-arms after "
+                f"{WS_AUDIT_COOLDOWN_SECS / 60:.0f} min clean; stale-quote "
+                f"episodes -> "
+                + ("ws_stale_<date>.jsonl" if WS_STALE_LOG else "not logged"))
         if SCAN_TOP_N > 0:
             log(f"open-scan tier: {SCAN_TOP_N} slots "
                 f"(ceiling {scan_ceiling()}), {SCAN_EVENT_TOP_N}/event, "

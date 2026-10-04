@@ -7480,3 +7480,58 @@ exact/compared ~1.0, gaps ~0, books_ok ~ want.
 NOT IN THIS DEPLOY: the cycle governor, TTL margin, order groups, by-date
 decay and the 10/1 breadth rollback (branch claude/imm-latency-risk,
 unmerged).
+
+## 2026-10-04 — WS REST audit + stale-quote episode log (Jack: "yes do both")
+
+WHY. The two safeguards before IMM_WS=on / IMM_WS_FAST=1. (1) Once the WS
+book drives the quote loop, nothing re-checked it against REST: a stream
+that is complete but wrong (an exchange glitch, or a message-format change
+that parses into empty books) would hit every market at once. (2) Whether a
+fast stale-quote cancel pays needs every would-cancel scored: was the rung
+hit while stale, at what mark-out, against the reward the cancel gives up.
+The counter alone can't answer that, and the log sample is capped at 20 an
+hour.
+
+AUDIT (`_read_book`, `_ws_compare`, `_ws_audit_note`). IMM_WS=on: 1 read in
+IMM_WS_AUDIT_EVERY (20, a random draw) ALSO reads REST, trades on the REST
+book and compares the two; a failed audit read trades on the WS book
+(`rest_errors`). Only these draws feed the trip window, in every mode. So
+shadow (which compares every read anyway) rehearses exactly the audit `on`
+would run, and a data release's burst of books racing their REST reads
+can't crowd the window. TRIP at IMM_WS_AUDIT_TRIP_TOP (5) top-of-book or
+IMM_WS_AUDIT_TRIP_EXACT (15) whole-book mismatches among the last
+IMM_WS_AUDIT_WINDOW (100) audited compares. The live base rate on 10/4 was
+0.06% top and 0.18% whole over 5,054 compares, so 5 in 100 means broken.
+A trip:
+- sends every read to REST (each compared);
+- pauses the stale-quote check (dry and live);
+- calls `KalshiFeed.resync()`: every book is untrusted at once, and the
+  feed reconnects without the failure backoff, taking fresh snapshots;
+- raises an ALERT `ws_audit`, which emails only with IMM_WS=on.
+
+RE-ARM after IMM_WS_AUDIT_COOLDOWN_SECS (900) once a full window of audited
+compares since the trip is under both limits. A feed that stays wrong stays
+tripped and does not alert again.
+
+EPISODE LOG (`_ws_episode_flag` / `_ws_episode_end`). Each episode the
+stale-quote check flags writes `ws_stale_<UTC date>.jsonl` lines: `flag`,
+then `clear` / `amend` / `cancel` / `gone` (schema in IMM_LOGGING.md).
+`would_cancel` now counts EPISODES: a rung that clears and goes stale again
+counts twice, as each would be a fast-path cancel. Also fixed: an order the
+cycle amends drops its first-seen-ahead time, so the two looks start over at
+its new price (before, it carried the old price's clock).
+
+SCORING. ws_stale_score.py: the episodes plus fills_*.jsonl (by order_id),
+cycle_log_*.csv (mid mark-outs) and the reward estimate (pool_per_day x
+est_frac). The one-time scheduled task imm-ws-stale-score runs it on
+2026-10-05 at 16:00 ET, over the first full day of episodes.
+
+WATCH. Startup: "WS REST audit (2026-10-04): 1 shadow compare in 20 is
+audited; trips at 5 top / 15 whole-book ...". Status `latency.ws.audit`:
+{audits, rest_errors, trips, rearms, tripped, tripped_at, last_trip, every,
+window, window_bad_top, window_bad_book}; `latency.ws.stale_open` (open
+episodes). Feed status gains `resyncs`. A trip in the log reads "ALERT
+[ws_audit] WebSocket books disagree with REST: ...".
+
+UNCHANGED. Trading still reads REST (IMM_WS=shadow). IMM_WS=on and
+IMM_WS_FAST=1 are still not enabled.
