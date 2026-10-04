@@ -43,9 +43,9 @@ That is exactly when the bot quoted: the September book stopped on 9/26
 book quoted from 10/01 on no read at all -- the gate never stood a single
 market aside, and the October fills were the worst-marked Carbon Arc fills
 yet (-9.4c/contract at 24h, -$462 on 5,426 contracts by 10/04, point of
-sale -$231). Replayed, point of sale's day-1 read at the formula's own
-sigma would have prevented 19-20 of those fills, ~$142 of the loss, for
-~$34-46 of reward. So a read is an entry from its first day, with sigma
+sale -$231). Replayed, point of sale's day-1 read would have prevented
+6-20 of those fills, $86-142 of the loss, for $16-46 of reward (sigma x3.4
+to x1). So a read is an entry from its first day, with sigma
 widened where the early days are known to be noisy (CA_EARLY_SIGMA_A,
 CA_MIN_OBS_DAYS); the 20%-of-mu noise cap in incentive_mm still turns the
 gate off for a read too vague to overrule the book.
@@ -146,12 +146,17 @@ CA_MIN_OBS_FRAC = _env_float("IMM_CA_MIN_OBS_FRAC", 0.0)
 # spend stayed inside it (0.6-1.35x; the noise cap already turns most of
 # them off early). sigma is multiplied by max(1, A / sqrt(days observed)),
 # which brings card spend's days 2-5 to 0.95-1.0x and foot traffic's days
-# 1-3 to 0.7x. Point of sale has no early path on file (its prism rolled to
-# October before one was kept) and its day-1 read at the formula's sigma is
-# what the replay scored, so it stays at 1 until calibrated. Keys are the
-# prism's category, lowercased; an unknown category takes the widest A.
+# 1-3 to 0.7x. Point of sale had no early path on file (its prism rolled to
+# October before one was kept) and shipped at 1; its first October path,
+# minutes after deploy, swung with the weekday mix like card spend's --
+# Miller Lite 97.7 -> 108.7 -> 95.0 over Oct 1-3, every brand in step (C4
+# 131 -> 121, Rogue 74 -> 66), a ~1.2-sigma RMS move in two days -- so it
+# takes card spend's A until its own path calibrates it. The replay of its
+# day-1 read still nets +$70 at that width ($86 avoided, $16 forgone). Keys
+# are the prism's category, lowercased; an unknown category takes the
+# widest A.
 CA_EARLY_SIGMA_A = {"credit card": 3.4, "foot traffic": 2.5,
-                    "advertising": 1.8, "app": 1.8, "point of sale": 1.0}
+                    "advertising": 1.8, "app": 1.8, "point of sale": 3.4}
 CA_EARLY_SIGMA_A_DEFAULT = 3.4
 CA_EARLY_SIGMA_ENABLE = os.environ.get("IMM_CA_EARLY_SIGMA", "1") == "1"
 # a card-spend read of ONE day is past repair (7.7x sigma): two days first

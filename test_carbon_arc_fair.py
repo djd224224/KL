@@ -113,8 +113,8 @@ class TestModel(unittest.TestCase):
     def test_a_read_is_an_entry_from_its_first_day(self):
         # Jack 2026-10-04 "yes ship it": the October book quoted on no read
         # for days because a month waited for 10% observed. Point of sale's
-        # day-1 read (rolled 10/02 23:00Z) is an entry at the formula's own
-        # sigma -- the sigma the replay scored.
+        # day-1 read (rolled 10/02 23:00Z) is an entry, widened like card
+        # spend's (its Oct 1-3 path swung with the weekday mix)
         now = datetime(2026, 10, 3, 13, 0, tzinfo=timezone.utc)
         pos = _prism("P", [], data_through="2026-10-01",
                      category="Point of Sale")
@@ -122,9 +122,9 @@ class TestModel(unittest.TestCase):
                                             [("2026-10-01", 131.03)], HIST), now)
         self.assertEqual(out["month"], "2026-10")
         self.assertAlmostEqual(out["mu"], 131.03)
-        self.assertEqual(out["early_mult"], 1.0)
+        self.assertAlmostEqual(out["early_mult"], 3.4)
         self.assertAlmostEqual(out["sigma"],
-                               round(self._base_sigma(1, 31, 131.03), 4))
+                               round(self._base_sigma(1, 31, 131.03) * 3.4, 4))
 
     def test_early_reads_are_widened_by_category(self):
 
@@ -151,9 +151,12 @@ class TestModel(unittest.TestCase):
         self.assertAlmostEqual(entry("App", 1)["early_mult"], 1.8)
         self.assertAlmostEqual(entry("advertising ", 1)["early_mult"], 1.8)
         self.assertEqual(entry("App", 4)["early_mult"], 1.0)
-        # point of sale stays at the formula; an unknown category takes the
-        # widest A
-        self.assertEqual(entry("Point of Sale", 1)["early_mult"], 1.0)
+        # point of sale takes card spend's A but needs no second day; an
+        # unknown category takes the widest A
+        self.assertAlmostEqual(entry("Point of Sale", 1)["early_mult"], 3.4)
+        self.assertAlmostEqual(entry("Point of Sale", 3)["early_mult"],
+                               round(3.4 / math.sqrt(3), 4))
+        self.assertEqual(entry("Point of Sale", 12)["early_mult"], 1.0)
         self.assertAlmostEqual(entry("Something New", 1)["early_mult"], 3.4)
         self.assertAlmostEqual(entry(None, 1)["early_mult"], 3.4)
 

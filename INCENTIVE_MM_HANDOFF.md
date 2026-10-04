@@ -7129,9 +7129,9 @@ CHANGE (carbon_arc_fair.py; incentive_mm.py untouched):
   its first day.
 - sigma x early_sigma_mult = max(1, A / sqrt(days observed)), A per prism
   category (CA_EARLY_SIGMA_A): card 3.4, foot traffic 2.5, apps / ads 1.8,
-  point of sale 1.0 (uncalibrated -- its prism rolled before a path was
-  kept -- and 1.0 is what the replay scored); unknown category 3.4. Card
-  days 2-5 come to 0.95-1.0x, foot traffic days 1-3 to 0.7x.
+  point of sale 3.4 (shipped at 1.0 in 0c38351, raised the same hour --
+  see POST-DEPLOY); unknown category 3.4. Card days 2-5 come to
+  0.95-1.0x, foot traffic days 1-3 to 0.7x.
 - CA_MIN_OBS_DAYS {"credit card": 2}: a one-day card read is past repair.
 - Entries carry "early_mult"; the fair file's model block carries
   min_obs_days and early_sigma_a.
@@ -7143,14 +7143,31 @@ under its Oct-1 read (C4 131, ON! 124, Coors 98 ...). That is the
 behaviour the replay scored; if the day-1 reads carry a weekday bias (Oct
 1 was a Thursday, 2025's a Wednesday) it fades as the month fills in.
 
+POST-DEPLOY (live 13:39Z via the code-change restart the NFL commits
+triggered; 93 series with a read, 0 missing). The POS prism had refreshed
+at 12:58Z with Oct 1-3, and the reads fell 5-10% from the Oct-1 values:
+Miller Lite's MTD went 97.7 (Oct 1) -> 108.7 (Oct 2) -> 95.0 (Oct 3),
+every brand in step (C4 131 -> 121, Rogue 74 -> 66, Mountain Dew 94 ->
+87). That is the weekday mix (or a thin latest day -- Oct 1's own value
+was revised only +0.2 a day later), a ~1.2-sigma RMS move in two days, so
+the A=1.0 gate flipped sides: 63 of 136 POS markets stood aside, 51 on
+the BID side (book ~September levels, read 5-10% under). POS takes card
+spend's A=3.4 (days 1-11 only): 47 stand aside at today's day-3 read (38
+bid, 9 ask), 22 more drop under the noise cap. The day-1 replay still nets
++$70 at x3.4 ($86 avoided, $16 forgone) vs +$96 at x1.0.
+
 KILL / REVERT: IMM_CA_MIN_OBS_FRAC=0.10 and IMM_CA_EARLY_SIGMA=0 in the
 launcher env (restart_imm.ps1 -Task) restore the old model; the gate
 itself is still IMM_CA_FAIR_ENABLE=0. carbon_arc_fair is imported by the
 refresher thread, so any change to it loads only on a bot restart.
 
-WATCH: POS stand-asides vs its rewards through ~10/10; card spend gates
-from its day-2 read (~10/06), foot traffic / apps / ads as their prisms
-roll. Calibrate POS's A from October's own path once it is ~10 days long.
+WATCH: POS stand-asides vs its rewards through ~10/10 -- ~1/3 of the POS
+book is parked on the day-3 read; whether the read or the book was right
+shows in the POS marks over the week. Watch whether the latest POS day is
+revised up the next morning (a thin last day would bias every early read
+low). Card spend gates from its day-2 read (~10/06), foot traffic / apps
+/ ads as their prisms roll. Calibrate POS's A from October's own path once
+it is ~10 days long.
 
 Tests (test_carbon_arc_fair): test_a_read_is_an_entry_from_its_first_day,
 test_early_reads_are_widened_by_category,
