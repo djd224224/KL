@@ -6964,3 +6964,35 @@ every cutoff.
 Tests: TestNflFantasyLadderCutoff (only the NFL fantasy ladder takes the 90,
 every other guard still the family's; the knob; a cycle's selection cutoff
 kickoff - 90 vs - 30 for a receptions ladder). 1,982 green.
+
+## 2026-10-04 — Opportunistic email: finecon and open scan only, Carbon Arc out (Jack)
+
+Jack, on the 10/04 email ("est $2,351 accrued, net $-29 ($2,975 paid to
+date)"): "email should only have finecon and open scan, remove carbon arc".
+
+CHANGE (send_opportunistic_imm.py, reporting only -- quoting is unchanged):
+tier_of returns None for every Carbon Arc-settled market, ahead of the
+finecon and scan tests. excluded_carbon_arc decides: the settlement-source
+verdict where one exists (the script's carbon_arc_series.json cache, else
+imm.FAMILY_VERDICTS), the CC/ADS/POS suffix rule only while none does, so a
+CC-named series with a not-Carbon-Arc verdict stays reportable. The CARBON
+ARC table and cumulative row are gone; the headline, the subject, the "N
+tiers" count and the Kalshi-credited footer cover finecon + scan only. The
+settlement-source lookups stay -- they now decide what is left out.
+_family_suffix / _family_event_top_n (the old tier line) are deleted.
+
+The 12 September point-of-sale events the open scan admitted before point
+of sale became a normal-book family (9/22) leave the scan's cumulative line
+with the rest of Carbon Arc: credited $79.82, realized -$217.53.
+
+DRY RENDER 13:04Z 10/4 (live state): 75 events / 35 markets across 2 tiers;
+subject "est $430 accrued, net $-221 ($947 paid to date)". Cumulative OPEN
+SCAN 155 -> 143 events, credited $900.07 -> $820.25, realized -$673.21 ->
+-$455.68. No Carbon Arc event in the text, the HTML or the shown-events
+record.
+
+Tests (TestOpportunisticEmail): test_carbon_arc_is_left_out_of_the_email,
+test_tier_precedence_matches_the_bot (Carbon Arc first; a not-Carbon-Arc
+verdict keeps a CC-named series), test_no_family_series_the_bot_allows_
+reaches_the_email (replaces "every family series has a tier"),
+test_carbon_arc_exclusion_is_by_settlement_source. 1,984 green.

@@ -3,7 +3,7 @@ r"""send_opportunistic_imm.py — the daily "Opportunistic IMM" email
 (Jack 2026-09-05: "add daily email called 'opportunistic IMM' showing a
 table of the events quoted, earning est, P&L, and net").
 
-The "opportunistic" book is THREE tiers:
+The "opportunistic" book is TWO tiers:
   finecon   the hand-curated Finance/Economics quiet-print families
             (incentive_mm.FINECON_SERIES) — top-N-by-ROI group walk,
             quote-to-completion, daily over-cap openings
@@ -11,6 +11,15 @@ The "opportunistic" book is THREE tiers:
             with 15 slots and 5 to scan all markets"): every other live-
             program market, machine-screened for adverse selection
             (incentive_mm SCAN_*; membership persisted as scan_members)
+CARBON ARC IS OUT (Jack 2026-10-04: "email should only have finecon and open
+scan, remove carbon arc"). Every Carbon Arc-settled market is excluded from
+every table, the headline, the subject and the credited footer, whatever
+admitted it -- including the 12 September point-of-sale events the open scan
+admitted before point of sale became a normal-book family on 9/22 (credited
+$79.82, realized -$217.53 on 10/04), so the scan's history is the scan's
+alone. The family is quoted by the normal book and measured on the IMM
+dashboard ("Carbon Arc consumer"). Its 2026-09-11..10-03 run as this
+email's third tier, for the record:
   carbon arc  every Carbon Arc-settled series (Jack 2026-09-11: "AmazonCC
             and StarbucksCC arent in the opportunistic daily email
             anymore"). REPORTING ONLY — the family is quoted by the NORMAL
@@ -33,7 +42,8 @@ The "opportunistic" book is THREE tiers:
             this script's cached GET /series lookup (carbon_arc_series.json)
             for every series in the book, so any Carbon Arc family lands
             here whatever route admits it; the suffix rule stays as a
-            fallback.
+            fallback. Settlement-source membership now decides what the
+            email LEAVES OUT (tier_of), so the lookup machinery stays.
 This email is that book's own scorecard, separate from the whole-account
 digest: a combined headline, then ONE TABLE PER TIER in the same format
 (Jack 2026-09-06: "a similarly formatted table for non-finecon
@@ -52,7 +62,7 @@ One row per currently-quoted opportunistic EVENT:
   NET        P&L + EARN EST — the position's true economics
 
 The per-tier tables are the ACTIVE book: what is quoted or held right now.
-The CUMULATIVE table is the same three tiers measured over every event each
+The CUMULATIVE table is the same two tiers measured over every event each
 one ever touched, settled-and-gone included, on the most trustworthy basis
 available per column:
   CREDITED  actual Kalshi money, all-time, from the recon ledger. Per EVENT
@@ -87,8 +97,9 @@ available per column:
             history it does not have.
   MTM       open-book mark-to-market right now, same own_book()/mids path
             as the active tables.
-Tier attribution has to survive the event going away. finecon and *CC are
-series-name rules, so they are durable by construction. The scan tier is a
+Tier attribution has to survive the event going away. finecon and the
+Carbon Arc exclusion are series rules, so they are durable by construction.
+The scan tier is a
 per-TICKER membership the bot prunes (scan_book sheds flat non-members at
 each daily roll), so a settled scan event would silently stop being ours:
 the roster below folds the `selection_events` sink's is_scan flag into a
@@ -268,22 +279,6 @@ def family_label(series: str) -> str:
     return ""
 
 
-def _family_suffix() -> str:
-    """The family suffixes this email reports as ONE tier (CC, and since
-    2026-09-22 ADS and POS): they share the tier and the label joins them
-    rather than silently naming only the first."""
-    return "/".join(getattr(imm, "ALLOW_FAMILY_SUFFIXES", ()) or ()) or "?"
-
-
-def _family_event_top_n() -> int:
-    """The per-event ROI cut that actually binds the family, read from the
-    bot's own EVENT_TOP_N rather than restated here (0 = uncapped, the
-    default since 2026-10-01; it was "*CC:3" before)."""
-    return max((imm.event_top_n_for("KX" + suf)
-                for suf in (getattr(imm, "ALLOW_FAMILY_SUFFIXES", ()) or ())),
-               default=0)
-
-
 def event_label(client, event_ticker: str) -> str:
     series = event_ticker.split("-")[0]
     if series in _LABEL:
@@ -313,39 +308,54 @@ def is_family(ticker_or_event: str) -> bool:
                for suf in (getattr(imm, "ALLOW_FAMILY_SUFFIXES", ()) or ()))
 
 
+def excluded_carbon_arc(ticker_or_event: str) -> bool:
+    """True for a Carbon Arc-settled market, which this email leaves out
+    (Jack 2026-10-04). The settlement-source verdict decides wherever one
+    exists -- this script's cache, else the bot's -- so a CC/ADS/POS-named
+    series that is NOT Carbon Arc stays reportable; the suffix rule only
+    stands in while no verdict does, so a family member is never let in
+    while its lookup is pending."""
+    series = ticker_or_event.split("-")[0]
+    v = CARBON_ARC_SERIES.get(series)
+    if v is None:
+        v = getattr(imm, "family_verdict", lambda _s: None)(series)
+    if v is not None:
+        return bool(v)
+    return is_family(ticker_or_event)
+
+
 def tier_of(ticker_or_event: str, fin, scan_set) -> str:
-    """"finecon" | "scan" | "family" | None — which opportunistic tier owns
-    this market (or event), or None for the rest of the normal book.
+    """"finecon" | "scan" | None — which opportunistic tier owns this market
+    (or event), or None for everything this email leaves out: the rest of
+    the normal book and, since 2026-10-04, every Carbon Arc-settled market.
 
     MODULE LEVEL ON PURPOSE. This lived as a closure inside build_report
     until 2026-09-11, and that is exactly how 30 *CC series left the email
     without a single one of 538 green tests noticing: the tests could only
     reach the pure formatters. It is the one piece of this script with a
-    real invariant — every tier the bot quotes must map to a tier this email
-    reports — so it has to be callable from a test.
+    real invariant -- the email reports finecon and the scan, and no Carbon
+    Arc market reaches any table -- so it has to be callable from a test.
 
-    Precedence is finecon, then scan, then the name-pattern family. finecon
-    first because a series in both sets is walked and capped as finecon
-    (incentive_mm._allowed checks FINECON_SERIES before ALLOW_FAMILY_SUFFIXES);
-    scan before family because scan membership is an explicit per-ticker fact
-    the bot persisted, and a member admitted before the family rule existed
-    must keep reporting where the bot put it. In practice the three cannot
-    overlap at all — an allowlisted market is never scanned
-    (scan_universe_reason -> "allowed") — so this order only decides the
-    stale-membership edge.
+    Carbon Arc goes FIRST (Jack 2026-10-04: "email should only have finecon
+    and open scan, remove carbon arc"): it is out even where finecon or the
+    scan admitted it, which takes the 12 September point-of-sale events the
+    scan quoted before point of sale became a normal-book family out of the
+    scan's history. Then finecon before scan, because a series in both sets
+    is walked and capped as finecon (incentive_mm._allowed checks
+    FINECON_SERIES first). In practice the two cannot overlap -- an
+    allowlisted market is never scanned (scan_universe_reason ->
+    "allowed") -- so that order only decides the stale-membership edge.
 
     `scan_set` is tickers for the active book (state["scan_members"]) and
     EVENTS for the cumulative one (the durable roster); both are plain
     membership tests, so one function serves both.
     """
+    if excluded_carbon_arc(ticker_or_event):
+        return None
     if ticker_or_event.split("-")[0] in fin:
         return "finecon"
     if ticker_or_event in scan_set:
         return "scan"
-    # Carbon Arc by SETTLEMENT SOURCE (2026-09-23) -- the suffix rule stays
-    # as the fallback so a member is never lost while a lookup is pending.
-    if is_carbon_arc(ticker_or_event) or is_family(ticker_or_event):
-        return "family"
     return None
 
 
@@ -822,9 +832,10 @@ def build_report(now_utc):
     scan_book = set(state.get("scan_book") or []) | scan_members
     scan_events = {_event_of(t) for t in scan_book}
     # Carbon Arc by settlement source (Jack 2026-09-23): resolve every
-    # series in the book BEFORE the tier assignment below reads it. The
-    # bot's verdicts cover the suffix families; the exact-list families
-    # (*FT / *APP) are looked up once and cached for 30 days.
+    # series in the book BEFORE the tier assignment below reads it -- since
+    # 2026-10-04 to leave those markets OUT (tier_of). The bot's verdicts
+    # cover the suffix families; the exact-list families (*FT / *APP) are
+    # looked up once and cached for 30 days.
     load_carbon_arc_cache()
     _now_ts = now_utc.timestamp()
     _n_reads = resolve_carbon_arc(
@@ -865,7 +876,6 @@ def build_report(now_utc):
 
     members = [t for t in selected if _tier(t)]
     fin_members = [t for t in members if _tier(t) == "finecon"]
-    fam_members = [t for t in members if _tier(t) == "family"]
     scan_sel = [t for t in members if t in scan_members]
     # THE TIER'S BOOK, not just what it is quoting right now (Jack
     # 2026-09-07: "scope the email's P&L to every market in the tier's book
@@ -953,7 +963,6 @@ def build_report(now_utc):
             "net": pnl + earn, "pos": netpos})
     rows.sort(key=lambda r: -r["net"])
     fin_rows = [r for r in rows if r["tier"] == "finecon"]
-    fam_rows = [r for r in rows if r["tier"] == "family"]
     scan_rows = [r for r in rows if r["tier"] == "scan"]
 
     tot = tier_totals(rows)
@@ -990,7 +999,8 @@ def build_report(now_utc):
     cum_universe = (set(cred_by_event) | set(realized_by_event)
                     | set(cum_mtm) | set(cum_est) | {r["event"] for r in rows})
     # departed events in the cumulative universe may be Carbon Arc series
-    # the active book no longer holds -- resolve them too (cached)
+    # the active book no longer holds -- resolve them too (cached), so they
+    # are left out like the live ones
     resolve_carbon_arc(client, [ev.split("-")[0] for ev in cum_universe],
                        _now_ts)
     cum_by_tier: dict = {}
@@ -1006,8 +1016,7 @@ def build_report(now_utc):
         b["realized"] += realized_by_event.get(ev, 0.0)
         b["mtm"] += cum_mtm.get(ev, 0.0)
     cum_rows = []
-    for key, name in (("finecon", "FINECON"), ("scan", "OPEN SCAN"),
-                      ("family", "CARBON ARC")):
+    for key, name in (("finecon", "FINECON"), ("scan", "OPEN SCAN")):
         b = cum_by_tier.get(key)
         if not b:
             continue
@@ -1066,24 +1075,6 @@ def build_report(now_utc):
          + (", HALTED today (loss budget)" if scan_halted else "")
          + (f", {scan_evicted} event(s) evicted" if scan_evicted else ""),
          scan_rows),
-        # No tier slot budget to report: the family is quoted by the NORMAL
-        # book, so its only caps are the per-event ROI cut and the global
-        # event ceiling. Saying "N/M slots" here would invent a budget that
-        # does not exist, so the line states the caps that DO bind.
-        ("CARBON ARC",
-         "every series Kalshi settles on Carbon Arc data (credit-card "
-         "spend, ad spend, point-of-sale, foot traffic, app downloads) "
-         "— quoted by the normal book, reported here",
-         f"{len(fam_rows)} event(s) / {len(fam_members)} markets; no tier "
-         f"slot cap — "
-         + (f"*{_family_suffix()} capped at {_family_event_top_n()} markets "
-            f"per event by ROI, foot traffic / app downloads uncapped"
-            if _family_event_top_n() else
-            # 0 since 2026-10-01 (Jack: "remove the 3 max cap on carbon arc")
-            "no per-event cap")
-         + f", inside the global "
-         f"{getattr(imm, 'MAX_MARKETS', 0)}-event ceiling",
-         fam_rows),
     ]
 
     # Deliberately does NOT put the estimate and the credited figure side by

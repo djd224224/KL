@@ -12813,29 +12813,28 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertTrue(opp.text_table([])[-1].startswith("TOTAL"))
         self.assertEqual(opp.tier_totals([])["net"], 0.0)
 
-    def test_cc_family_is_its_own_reporting_tier(self):
-        # Jack 2026-09-11: "AmazonCC and StarbucksCC arent in the
-        # opportunistic daily email anymore". The 2026-09-10 family rule
-        # (ALLOW_FAMILY_SUFFIXES) took KXAMZNCC out of FINECON_SERIES and
-        # KXSBUXCC out of the finecon extra file, and the email's two-tier
-        # test then matched neither -- 30 series left the report in silence.
-        # REPORTING only: nothing here changes which book quotes them, so
-        # test_cc_family_suffix_allows_into_normal_book still holds.
+    def test_carbon_arc_is_left_out_of_the_email(self):
+        # Jack 2026-10-04: "email should only have finecon and open scan,
+        # remove carbon arc". The *CC family (this email's third tier from
+        # 2026-09-11) and every other Carbon Arc-settled market map to NO
+        # tier, so no table, headline, subject or credited footer can carry
+        # them. REPORTING only: test_cc_family_suffix_allows_into_normal_book
+        # still holds -- the normal book quotes them as before.
         import send_opportunistic_imm as opp
         fin = {"KXSPRLVL", "KXJOLTSOPEN"}
         scan = {"KXNOVEL-26OCT13-T5"}
         for t in ("KXAMZNCC-26OCT07-T108", "KXSBUXCC-26OCT07-T98",
                   "KXURBNCC-26OCT07-T94", "KXNEVERSEENCC-26OCT07-T1"):
-            self.assertEqual(opp.tier_of(t, fin, scan), "family", t)
+            self.assertIsNone(opp.tier_of(t, fin, scan), t)
             self.assertTrue(opp.is_family(t), t)
-        # the EVENT ticker resolves the same way -- the cumulative table
-        # attributes settled-and-gone events, not tickers
-        self.assertEqual(opp.tier_of("KXSBUXCC-26OCT07", fin, scan), "family")
-        # the other two tiers are unchanged
+            self.assertTrue(opp.excluded_carbon_arc(t), t)
+        # the EVENT ticker too -- the cumulative table works on events
+        self.assertIsNone(opp.tier_of("KXSBUXCC-26OCT07", fin, scan))
+        # the two reported tiers are unchanged
         self.assertEqual(opp.tier_of("KXSPRLVL-26SEP16-T1", fin, scan),
                          "finecon")
         self.assertEqual(opp.tier_of("KXNOVEL-26OCT13-T5", fin, scan), "scan")
-        # and the normal book is still not opportunistic
+        # and the rest of the normal book is still not opportunistic
         for t in ("KXTRUMPMENTION-26SEP12-WALL", "KXBTCD-26SEP11-T100"):
             self.assertIsNone(opp.tier_of(t, fin, scan), t)
         # a series that merely CONTAINS the suffix is not the family (the
@@ -12843,22 +12842,38 @@ class TestOpportunisticEmail(unittest.TestCase):
         self.assertFalse(opp.is_family("KXCCOUNTY-26OCT07-T1"))
 
     def test_tier_precedence_matches_the_bot(self):
-        # finecon first: a series in BOTH sets is walked and capped as
-        # finecon by incentive_mm._allowed, so the email must say finecon.
-        # scan before family: scan membership is an explicit per-ticker fact
-        # the bot persisted, and a member admitted before the family rule
-        # existed keeps reporting where the bot put it.
+        # Carbon Arc first (Jack 2026-10-04): out even where finecon or the
+        # scan admitted it, which is how the 12 September point-of-sale
+        # events the scan quoted before the 9/22 family rule leave the
+        # scan's history. Then finecon before scan: a series in BOTH sets is
+        # walked and capped as finecon by incentive_mm._allowed.
         import send_opportunistic_imm as opp
-        t = "KXWEIRDCC-26OCT07-T1"
-        self.assertEqual(opp.tier_of(t, {"KXWEIRDCC"}, set()), "finecon")
-        self.assertEqual(opp.tier_of(t, set(), {t}), "scan")
-        self.assertEqual(opp.tier_of(t, set(), set()), "family")
+        t = "KXWEIRDCC-26OCT07-T1"            # no verdict: the suffix decides
+        self.assertIsNone(opp.tier_of(t, {"KXWEIRDCC"}, set()))
+        self.assertIsNone(opp.tier_of(t, set(), {t}))
+        self.assertIsNone(opp.tier_of(t, set(), set()))
+        p = "KXPLAIN-26OCT07-T1"
+        self.assertEqual(opp.tier_of(p, {"KXPLAIN"}, {p}), "finecon")
+        self.assertEqual(opp.tier_of(p, set(), {p}), "scan")
+        # the settlement source decides, not the name: a verdict that a
+        # CC-named series is NOT Carbon Arc keeps it reportable
+        saved = dict(opp.CARBON_ARC_SERIES)
+        try:
+            opp.CARBON_ARC_SERIES["KXWEIRDCC"] = False
+            self.assertEqual(opp.tier_of(t, {"KXWEIRDCC"}, set()), "finecon")
+            self.assertEqual(opp.tier_of(t, set(), {t}), "scan")
+            opp.CARBON_ARC_SERIES["KXWEIRDCC"] = True
+            self.assertIsNone(opp.tier_of(t, {"KXWEIRDCC"}, {t}))
+        finally:
+            opp.CARBON_ARC_SERIES.clear()
+            opp.CARBON_ARC_SERIES.update(saved)
 
-    def test_every_family_series_the_bot_allows_has_a_tier(self):
-        # The invariant the 2026-09-10 regression broke: a market the bot
-        # quotes through a family suffix must map to a tier this email
-        # reports. Driven off the bot's own constant, so adding a suffix to
-        # ALLOW_FAMILY_SUFFIXES can never silently drop it from the email.
+    def test_no_family_series_the_bot_allows_reaches_the_email(self):
+        # The invariant since 2026-10-04 (it was the opposite one, "every
+        # family market has a tier", after the 2026-09-10 regression): a
+        # market the bot quotes through a Carbon Arc family suffix maps to
+        # NO tier of this email. Driven off the bot's own constant, so a
+        # suffix added to ALLOW_FAMILY_SUFFIXES can never slip into it.
         import send_opportunistic_imm as opp
         self.assertTrue(imm.ALLOW_FAMILY_SUFFIXES)
         saved_only = imm.ALLOWLIST_ONLY
@@ -12868,11 +12883,13 @@ class TestOpportunisticEmail(unittest.TestCase):
             for suf in imm.ALLOW_FAMILY_SUFFIXES:
                 t = "KXPROBE{}-26OCT07-T1".format(suf)
                 # the bot's membership needs its Carbon Arc source verdict
-                # (2026-09-22); the email's tier test is the name pattern
+                # (2026-09-22)
                 imm.FAMILY_VERDICTS["KXPROBE" + suf] = {
                     "carbon_arc": True, "ts": time.time(), "title": ""}
                 self.assertTrue(IncentiveMarketMaker._allowed(t), t)
-                self.assertIsNotNone(opp.tier_of(t, set(), set()), t)
+                self.assertIsNone(opp.tier_of(t, set(), set()), t)
+                # not even under a stale scan membership
+                self.assertIsNone(opp.tier_of(t, set(), {t}), t)
         finally:
             imm.ALLOWLIST_ONLY = saved_only
             imm.FAMILY_VERDICTS.clear()
@@ -12893,14 +12910,15 @@ class TestOpportunisticEmail(unittest.TestCase):
         lbl = opp.event_label(None, "KXNEVERSEENCC-26OCT07")
         self.assertTrue(lbl and not lbl.startswith("KX"), lbl)
 
-    def test_carbon_arc_tier_is_by_settlement_source(self):
+    def test_carbon_arc_exclusion_is_by_settlement_source(self):
         # Jack 2026-09-23: "why doesnt carbon arc group include all carbon
         # arc events including foottraffic markets like KXBROSFT-26OCT08
         # and KXCAVAFT-26OCT08. and app download markets like
         # KXDKNGAPP-26OCT08 and KXNFLXAPP-26OCT08?" -- all four are Carbon
-        # Arc-settled but admitted by the exact company allowlist, so the
-        # suffix-only tier never saw them. Membership is the settlement
-        # source now: the bot's verdict, else this script's cached lookup.
+        # Arc-settled but admitted by the exact company allowlist, so a
+        # suffix-only rule never saw them. Membership is the settlement
+        # source: the bot's verdict, else this script's cached lookup. Since
+        # 2026-10-04 that membership decides what the email LEAVES OUT.
         import send_opportunistic_imm as opp
         saved = dict(opp.CARBON_ARC_SERIES)
         saved_ts = dict(opp._carbon_arc_ts)
@@ -12912,9 +12930,13 @@ class TestOpportunisticEmail(unittest.TestCase):
         opp._carbon_arc_ts.clear()
         try:
             fin, scan = {"KXSPRLVL"}, set()
-            # unknown source -> the normal book, not the tier
+            # unknown source: an *FT / *APP name proves nothing, so nothing
+            # is excluded yet -- a finecon member would still report
             for t in ("KXBROSFT-26OCT08-T5", "KXDKNGAPP-26OCT08-T1.2M"):
+                self.assertFalse(opp.excluded_carbon_arc(t), t)
                 self.assertIsNone(opp.tier_of(t, fin, scan), t)
+            self.assertEqual(opp.tier_of("KXBROSFT-26OCT08-T5", {"KXBROSFT"},
+                                         set()), "finecon")
             # the bot's own verdict (a suffix family) counts, no read spent
             imm.FAMILY_VERDICTS["KXURBNCC"] = {"carbon_arc": True, "ts": 1.0,
                                                "title": ""}
@@ -12936,12 +12958,16 @@ class TestOpportunisticEmail(unittest.TestCase):
             self.assertEqual(n, 5)          # KXURBNCC: the bot's verdict
             for t in ("KXBROSFT-26OCT08-T5", "KXCAVAFT-26OCT08-T5",
                       "KXDKNGAPP-26OCT08-T1.2M", "KXNFLXAPP-26OCT08-T30M"):
-                self.assertEqual(opp.tier_of(t, fin, scan), "family", t)
+                self.assertTrue(opp.excluded_carbon_arc(t), t)
+                # out of every tier, finecon and scan included
+                self.assertIsNone(opp.tier_of(t, {t.split("-")[0]}, {t}), t)
                 # the EVENT ticker resolves the same way (cumulative table)
-                self.assertEqual(opp.tier_of(t.rsplit("-", 1)[0], fin, scan),
-                                 "family", t)
-            # a *FT that is NOT Carbon Arc stays out of the tier
-            self.assertIsNone(opp.tier_of("KXNFLDRAFT-27-QB", fin, scan))
+                ev = t.rsplit("-", 1)[0]
+                self.assertIsNone(opp.tier_of(ev, set(), {ev}), t)
+            # a *FT that is NOT Carbon Arc stays reportable
+            self.assertFalse(opp.excluded_carbon_arc("KXNFLDRAFT-27-QB"))
+            self.assertEqual(opp.tier_of("KXNFLDRAFT-27-QB", {"KXNFLDRAFT"},
+                                         scan), "finecon")
             # a second resolve inside the TTL reads nothing
             _C.reads = 0
             self.assertEqual(opp.resolve_carbon_arc(
@@ -12954,11 +12980,9 @@ class TestOpportunisticEmail(unittest.TestCase):
             self.assertEqual(opp.load_carbon_arc_cache(), 6)
             self.assertTrue(opp.is_carbon_arc("KXCAVAFT-26OCT08"))
             self.assertFalse(opp.is_carbon_arc("KXNFLDRAFT-27"))
-            # finecon and scan still take precedence
-            self.assertEqual(opp.tier_of("KXBROSFT-26OCT08-T5", {"KXBROSFT"},
-                                         set()), "finecon")
-            self.assertEqual(opp.tier_of("KXBROSFT-26OCT08-T5", set(),
-                                         {"KXBROSFT-26OCT08-T5"}), "scan")
+            # the cached verdict still excludes after a reload
+            self.assertIsNone(opp.tier_of("KXBROSFT-26OCT08-T5", {"KXBROSFT"},
+                                          {"KXBROSFT-26OCT08-T5"}))
             # labels for the two families that have no per-series entry
             self.assertEqual(opp.family_label("KXBROSFT"),
                              "Foot traffic (Carbon Arc)")
@@ -12972,6 +12996,7 @@ class TestOpportunisticEmail(unittest.TestCase):
                     raise RuntimeError("429")
             self.assertEqual(opp.resolve_carbon_arc(_Bad(), ["KXNEWFT"],
                                                     3000.0), 1)
+            self.assertFalse(opp.excluded_carbon_arc("KXNEWFT-26OCT08-T1"))
             self.assertIsNone(opp.tier_of("KXNEWFT-26OCT08-T1", fin, scan))
         finally:
             opp.CARBON_ARC_SERIES.clear()
