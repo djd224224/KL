@@ -296,17 +296,21 @@ def obs_state(spec: dict, now: datetime) -> dict:
     return {"wet": wet, "obs_time": t.isoformat(), "phour": phour, "wx": wx}
 
 
-def period_history(key: str, now: datetime) -> Dict[str, Optional[float]]:
+def period_history(key: str, now: datetime,
+                   elem: str = "pcpn") -> Dict[str, Optional[float]]:
     """ACIS daily precipitation at the station from rm.HIST_YEARS back
     through yesterday: {YYYY-MM-DD: inches, None = missing}. One cached
-    read a day per station."""
+    read a day per station. `elem` "snow" reads snowfall (the snow gate),
+    and a station's "acis" id replaces its ICAO where the airport's own
+    record is short (Denver's threaded DENthr)."""
     st = rm.STATIONS[key]
     last = (now - timedelta(days=1)).date()
     data = rm.cached_get_json(
-        f"acis_period_{key}", 86400,
+        f"acis_period_{key}" if elem == "pcpn" else f"acis_{elem}_{key}", 86400,
         lambda: rm.http_json("https://data.rcc-acis.org/StnData", post_body={
-            "sid": st["icao"], "sdate": f"{last.year - rm.HIST_YEARS}-01-01",
-            "edate": last.isoformat(), "elems": [{"name": "pcpn"}]}))
+            "sid": st.get("acis") or st["icao"],
+            "sdate": f"{last.year - rm.HIST_YEARS}-01-01",
+            "edate": last.isoformat(), "elems": [{"name": elem}]}))
     return {str(d): rm.parse_precip(v) for d, v in data.get("data") or []}
 
 
@@ -407,13 +411,17 @@ def period_to_date(key: str, start: date, end: date, now: datetime,
 def simulate_period(key: str, start: date, end: date, now: datetime,
                     n_samples: int = N_SAMPLES,
                     rng: Optional[random.Random] = None,
-                    hist: Optional[Dict[str, Optional[float]]] = None) -> dict:
+                    hist: Optional[Dict[str, Optional[float]]] = None,
+                    element: str = "quantitativePrecipitation",
+                    kernel_sigma: Optional[float] = None) -> dict:
     """Monte Carlo of the rest of the period (inches): today's remaining
     hours on the forecast while today is in it; every later day of the
     period from one whole historical window, each forecast-horizon day
     replaced w.p. rm.FORECAST_WEIGHT by a forecast draw (the shared regime
     multiplier correlates them), and the window's historical part scaled by
-    a mean-one log-normal kernel (PERIOD_KERNEL_SIGMA)."""
+    a mean-one log-normal kernel (PERIOD_KERNEL_SIGMA). The snow gate
+    passes its snowfall history, element "snowfallAmount" and its own
+    kernel."""
     rng = rng or random.Random()
     tz = pytz.timezone(rm.STATIONS[key]["tz"])
     today = now.astimezone(tz).date()
@@ -425,7 +433,7 @@ def simulate_period(key: str, start: date, end: date, now: datetime,
     segs = period_segments(hist, days)
     if not segs:
         raise ValueError("no history window covers the period")
-    fc = rm.fetch_forecast_days(key, now)
+    fc = rm.fetch_forecast_days(key, now, element=element)
 
     def fc_for(day_iso: str) -> Optional[dict]:
         f = fc.get(day_iso)
@@ -436,7 +444,7 @@ def simulate_period(key: str, start: date, end: date, now: datetime,
     fc_idx = [i for i, f in enumerate(day_fc) if f is not None]
     in_fc = set(fc_idx)
     base = [sum(v for i, v in enumerate(s) if i not in in_fc) for s in segs]
-    sig = PERIOD_KERNEL_SIGMA
+    sig = PERIOD_KERNEL_SIGMA if kernel_sigma is None else kernel_sigma
     totals = []
     for _ in range(n_samples):
         regime = math.exp(rng.gauss(0.0, rm.REGIME_SIGMA))

@@ -1410,6 +1410,10 @@ def is_daily_series(series: str) -> bool:
         return False
     if any(series.startswith(p) for p in DAILY_PREFIXES):
         return True
+    # the snow monthlies (2026-10-04) sit with the rain monthlies, which the
+    # KXRAIN floor covers: x1 at every hour, no Saturday or yield size
+    if snow_monthly_series(series):
+        return True
     return series in DAILY_SERIES_DYNAMIC
 
 
@@ -4238,6 +4242,34 @@ _DEFAULT_RAIN_MONTHLY_SERIES = (
     "KXRAINAUSM,KXRAINCHIM,KXRAINCLLM,KXRAINCMHM,KXRAINDALM,KXRAINDENM,"
     "KXRAINHOUM,KXRAINLAXM,KXRAINLEXM,KXRAINMIAM,KXRAINMKEM,KXRAINNYCM,"
     "KXRAINPVDM,KXRAINSEAM,KXRAINSFOM,KXRAINSTPM")
+# MONTHLY SNOW (Jack 2026-10-04: "build the snow feed"). KX<CITY>SNOWM settle
+# on The Weather Company's snowfall dashboard = the NWS climate report's
+# daily snowfall at the city's station, summed over the month. The ten in
+# the 10/1-10/3 programs feed (Chicago $2,003/day, Detroit $148/day, all on
+# 26DEC) are allowed here, and any other KX<CITY>SNOWM by name, ONLY while
+# the SNOW_MONTHLY_* gate is on: quoted against snow_monthly_fair's model,
+# failing closed (a city without a mapped station stands aside).
+# IMM_SNOW_MONTHLY_ENABLE=0 or IMM_ALLOW_SNOW_MONTHLY_SERIES="" (with the
+# pattern IMM_SNOW_MONTHLY_SERIES_RE="") takes them out.
+_SNOW_MONTHLY_LIVE = os.environ.get("IMM_SNOW_MONTHLY_ENABLE", "1") == "1"
+_DEFAULT_SNOW_MONTHLY_SERIES = (
+    "KXBOSSNOWM,KXCHISNOWM,KXDCSNOWM,KXDENSNOWM,KXDETSNOWM,KXMKESNOWM,"
+    "KXMSPSNOWM,KXNYCSNOWM,KXPHILSNOWM,KXPITSNOWM")
+SNOW_MONTHLY_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_ALLOW_SNOW_MONTHLY_SERIES", _DEFAULT_SNOW_MONTHLY_SERIES).split(",")
+    if s.strip())
+_SNOW_RE_SPEC = os.environ.get("IMM_SNOW_MONTHLY_SERIES_RE", r"KX[A-Z]{2,6}SNOWM")
+SNOW_MONTHLY_SERIES_RE = re.compile(_SNOW_RE_SPEC) if _SNOW_RE_SPEC else None
+SNOW_MONTHLY_ARCHETYPE = "KXCHISNOWM"
+
+
+def snow_monthly_series(series: str) -> bool:
+    """A monthly snowfall series quoted only through the snow gate: the
+    named ten, or KX<CITY>SNOWM by name (KXDENSNOWMB, Big Sky's
+    KXTSNOWFALLBIGSKYM and the KXSNOW* lines are other contracts)."""
+    return _SNOW_MONTHLY_LIVE and (
+        series in SNOW_MONTHLY_SERIES
+        or bool(SNOW_MONTHLY_SERIES_RE and SNOW_MONTHLY_SERIES_RE.fullmatch(series)))
 # POKEMON (Jack 2026-10-03: "yes build the gate to quote all pokemon events").
 # KXPOKEMON -- one "Up or Down" market per item per month on Collectr's
 # ungraded price, $55/day per market from 10/3 -- is enrolled here only with
@@ -4479,6 +4511,10 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_RAIN_MONTHLY_SERIES",
                                         _DEFAULT_RAIN_MONTHLY_SERIES)
                          if _RAIN_MONTHLY_LIVE else "")
+                # monthly snow (2026-10-04): only while its gate is on (the
+                # KX<CITY>SNOWM pattern rides _allowed, snow_monthly_series)
+                + "," + (",".join(sorted(SNOW_MONTHLY_SERIES))
+                         if _SNOW_MONTHLY_LIVE else "")
                 # Pokemon (2026-10-03): only while the Pokemon gate is on
                 + "," + (os.environ.get("IMM_ALLOW_POKE_SERIES",
                                         _DEFAULT_POKE_SERIES)
@@ -6012,6 +6048,8 @@ FAMILY_OVERRIDE_PARENTS = (
     # period rain totals (2026-10-04): any other KXRAIN series that reached
     # here did so through the period shape, archetype KXRAINNAPAM
     ("predicate", rain_period_family_series, RAIN_PERIOD_ARCHETYPE),
+    # monthly snow (2026-10-04): a KX<CITY>SNOWM beyond the named ten
+    ("predicate", snow_monthly_series, SNOW_MONTHLY_ARCHETYPE),
     # elections (2026-09-28): a name pattern OR the exact general-election
     # list, so the family is a predicate rather than one regex
     ("predicate", election_series, ELECTION_ARCHETYPE),
@@ -6976,6 +7014,9 @@ _CONFIG_CODE_KNOBS = (
     # period rain totals (2026-10-04) on the same file and gate
     "RAIN_PERIOD_ENABLE", "RAIN_PERIOD_TOL_CENTS", "RAIN_PERIOD_CAP",
     "RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN",
+    # monthly snow gate (2026-10-04); model knobs ride in its file's "model"
+    "SNOW_MONTHLY_ENABLE", "SNOW_MONTHLY_TOL_CENTS", "SNOW_MONTHLY_TTL_MIN",
+    "SNOW_MONTHLY_DRY_MIN", "SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN", "SNOW_MONTHLY_CAP",
     # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
     "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
@@ -8261,18 +8302,25 @@ def rain_monthly_series(series: str) -> bool:
 def load_rain_monthly() -> int:
     """Hot-reload RAIN_MONTHLY_FILE by mtime. Returns the number of markets
     loaded on a reload, else -1."""
+    return _load_weather_fair(RAIN_MONTHLY_FILE, _rain_monthly_state, "monthly rain")
+
+
+def _load_weather_fair(path: str, state: dict, label: str) -> int:
+    """The rain and snow writers' file (markets: p / event / boundary /
+    fetched_at; event_state: wet, last_wet_at, stale_cli, stale_why, mtd,
+    obs_time) into `state` when its mtime moved; the market count, else -1."""
     try:
-        mtime = os.path.getmtime(RAIN_MONTHLY_FILE)
+        mtime = os.path.getmtime(path)
     except OSError:
         return -1
-    if mtime == _rain_monthly_state["mtime"]:
+    if mtime == state["mtime"]:
         return -1
-    _rain_monthly_state["mtime"] = mtime
+    state["mtime"] = mtime
     try:
-        with open(RAIN_MONTHLY_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f) or {}
     except (OSError, ValueError) as e:
-        log(f"[IMM] ! monthly rain fair file unreadable: {e}")
+        log(f"[IMM] ! {label} fair file unreadable: {e}")
         return -1
     markets: Dict[str, dict] = {}
     for t, e in (data.get("markets") or {}).items():
@@ -8292,10 +8340,11 @@ def load_rain_monthly() -> int:
             continue
         lw = parse_iso_utc(str(st.get("last_wet_at") or "")) if st.get("last_wet_at") else None
         events[str(ev)] = {"wet": st.get("wet"), "stale_cli": bool(st.get("stale_cli")),
+                           "stale_why": st.get("stale_why"),
                            "last_wet_ts": lw.timestamp() if lw else None,
                            "mtd": st.get("mtd"), "obs_time": st.get("obs_time")}
-    _rain_monthly_state["markets"] = markets
-    _rain_monthly_state["events"] = events
+    state["markets"] = markets
+    state["events"] = events
     return len(markets)
 
 
@@ -8305,26 +8354,39 @@ def rain_monthly_gate_reason(ticker: str, now_ts: float,
     """('', {}) when a monthly rain market may quote, else (reason,
     guard-skip inputs). Fails CLOSED. `tol` overrides
     RAIN_MONTHLY_TOL_CENTS (the period markets' RAIN_PERIOD_TOL_CENTS)."""
-    tol = RAIN_MONTHLY_TOL_CENTS if tol is None else tol
-    e = _rain_monthly_state["markets"].get(ticker)
+    return weather_fair_gate_reason(
+        _rain_monthly_state, ticker, now_ts, ext_bid, ext_ask,
+        tol=RAIN_MONTHLY_TOL_CENTS if tol is None else tol,
+        ttl_min=RAIN_MONTHLY_TTL_MIN, dry_min=RAIN_MONTHLY_DRY_MIN,
+        label="monthly rain", wet=("raining", "rained"))
+
+
+def weather_fair_gate_reason(state: dict, ticker: str, now_ts: float,
+                             ext_bid: Optional[float], ext_ask: Optional[float],
+                             tol: float, ttl_min: float, dry_min: float,
+                             label: str, wet: Tuple[str, str]) -> Tuple[str, dict]:
+    """The rain and snow gates' checks on a loaded fair file (`state`):
+    ('', {}) to quote, else (reason, guard-skip inputs). Fails CLOSED. `wet`
+    names the weather ("raining", "rained" / "snowing", "snowed")."""
+    e = state["markets"].get(ticker)
     if e is None:
-        return "no monthly rain fair for this market", {"reason": "no_read"}
-    if now_ts - e["ts"] > RAIN_MONTHLY_TTL_MIN * 60:
-        return "monthly rain fair is stale", {"reason": "stale"}
-    st = _rain_monthly_state["events"].get(e["event"]) or {}
+        return f"no {label} fair for this market", {"reason": "no_read"}
+    if now_ts - e["ts"] > ttl_min * 60:
+        return f"{label} fair is stale", {"reason": "stale"}
+    st = state["events"].get(e["event"]) or {}
     if st.get("wet") is None:
         return ("no current observation at the station",
                 {"reason": "no_obs", "obs_time": st.get("obs_time")})
     if st.get("wet"):
-        return ("raining at the station", {"reason": "raining",
-                                           "obs_time": st.get("obs_time")})
+        return (f"{wet[0]} at the station", {"reason": wet[0],
+                                             "obs_time": st.get("obs_time")})
     lw = st.get("last_wet_ts")
-    if lw is not None and RAIN_MONTHLY_DRY_MIN > 0 \
-            and now_ts - lw < RAIN_MONTHLY_DRY_MIN * 60:
-        return (f"rained {int((now_ts - lw) // 60)}m ago, drying "
-                f"{RAIN_MONTHLY_DRY_MIN:g}m", {"reason": "drying"})
+    if lw is not None and dry_min > 0 and now_ts - lw < dry_min * 60:
+        return (f"{wet[1]} {int((now_ts - lw) // 60)}m ago, drying "
+                f"{dry_min:g}m", {"reason": "drying"})
     if st.get("stale_cli"):
-        return "the station's CLI is stale", {"reason": "stale_cli"}
+        return (st.get("stale_why") or "the station's CLI is stale",
+                {"reason": "stale_cli"})
     if e["boundary"]:
         return (f"strike within the boundary of the month-to-date "
                 f"{st.get('mtd')}", {"reason": "boundary", "mtd": st.get("mtd")})
@@ -8379,12 +8441,78 @@ def rain_period_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     inputs, None) -- stand aside. Fails CLOSED like the monthly gate."""
     why, inp = rain_monthly_gate_reason(ticker, now_ts, ext_bid, ext_ask,
                                         tol=RAIN_PERIOD_TOL_CENTS)
-    if not why or inp.get("reason") != "band" or not RAIN_PERIOD_CAP:
+    return _cap_band_breach(why, inp, RAIN_PERIOD_TOL_CENTS, RAIN_PERIOD_CAP)
+
+
+def _cap_band_breach(why: str, inp: dict, tol: float, cap: bool
+                     ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """A weather gate's verdict with a band breach turned into side caps
+    (when `cap`): ('', inputs + caps, caps); any other verdict as is."""
+    if not why or inp.get("reason") != "band" or not cap:
         return why, inp, None
-    caps = rain_period_caps(inp["fair"], RAIN_PERIOD_TOL_CENTS)
+    caps = rain_period_caps(inp["fair"], tol)
     if caps == (None, None):
         return why, inp, None
     return "", dict(inp, why=why, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+# ----------------------------------------------------------------------------
+# MONTHLY SNOW GATE (Jack 2026-10-04: "build the snow feed"; see
+# _SNOW_MONTHLY_LIVE for the family). snow_monthly_fair.py writes
+# SNOW_MONTHLY_FILE in the rain writer's shape: P(month to date + rest > K),
+# the to-date from the NWS climate report's month-to-date snowfall (what
+# TWC's dashboard sums), the rest from the station's ACIS snowfall history
+# with the NWS grid's snowfallAmount injected, smoothed by a log-normal
+# kernel. The rain gate's checks on it (weather_fair_gate_reason), failing
+# CLOSED: no fresh read, no observation, snowing at the station (snow,
+# sleet, ice or unknown precipitation, or any at 35F or colder) and
+# SNOW_MONTHLY_DRY_MIN after, a stale report -- which includes snow seen
+# after the latest report was issued, until a later one counts it (ASOS
+# measures no snowfall) -- and strikes within 0.1" of the to-date. A
+# month that has not started reads dry: December quotes through October's
+# and November's snow. A touch that fights the fair by more than
+# SNOW_MONTHLY_TOL_CENTS caps that side (SNOW_MONTHLY_CAP, the period rain
+# rule); the other side joins the touch. Band 5-90c (the rain family's);
+# cutoff 22:00 the day before the month's last day (the monthlies' rule).
+# As "daily" weather they quote x1 at every hour (is_daily_series).
+# 10/4 23:00Z, December fair vs book: no touch fights its fair by 10c.
+SNOW_MONTHLY_ENABLE = _SNOW_MONTHLY_LIVE
+SNOW_MONTHLY_TOL_CENTS = _env_int("IMM_SNOW_MONTHLY_TOL_CENTS", 10)
+SNOW_MONTHLY_TTL_MIN = _env_int("IMM_SNOW_MONTHLY_TTL_MIN", 30)
+SNOW_MONTHLY_REFRESH_SECS = _env_int("IMM_SNOW_MONTHLY_REFRESH_SECS", 600)
+SNOW_MONTHLY_DRY_MIN = _env_float("IMM_SNOW_MONTHLY_DRY_MIN", 60)
+SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN = _env_int(
+    "IMM_SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN", 1560)
+SNOW_MONTHLY_CAP = os.environ.get("IMM_SNOW_MONTHLY_CAP", "1") == "1"
+SNOW_MONTHLY_FILE = os.environ.get(
+    "IMM_SNOW_MONTHLY_FILE", os.path.join(STATUS_DIR, "snow_monthly_fair.json"))
+_snow_monthly_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+SERIES_OVERRIDES[SNOW_MONTHLY_ARCHETYPE] = SeriesOverride(
+    price_min_cents=_env_int("IMM_SNOW_PRICE_MIN", 5),
+    price_max_cents=_env_int("IMM_SNOW_PRICE_MAX", 90),
+    cutoff_from_close_min=SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN)
+for _s in SNOW_MONTHLY_SERIES:
+    SERIES_OVERRIDES[_s] = SERIES_OVERRIDES[SNOW_MONTHLY_ARCHETYPE]
+
+
+def load_snow_monthly() -> int:
+    """Hot-reload SNOW_MONTHLY_FILE by mtime (the rain loader)."""
+    return _load_weather_fair(SNOW_MONTHLY_FILE, _snow_monthly_state, "monthly snow")
+
+
+def snow_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                      ext_ask: Optional[float]
+                      ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """rain_period_gate's contract for a monthly snow market: ('', {},
+    None) to quote at the touch, ('', inputs, caps) when a side is capped,
+    else (why, guard-skip inputs, None) -- stand aside. Fails CLOSED."""
+    why, inp = weather_fair_gate_reason(
+        _snow_monthly_state, ticker, now_ts, ext_bid, ext_ask,
+        tol=SNOW_MONTHLY_TOL_CENTS, ttl_min=SNOW_MONTHLY_TTL_MIN,
+        dry_min=SNOW_MONTHLY_DRY_MIN, label="monthly snow",
+        wet=("snowing", "snowed"))
+    return _cap_band_breach(why, inp, SNOW_MONTHLY_TOL_CENTS, SNOW_MONTHLY_CAP)
 
 
 # ----------------------------------------------------------------------------
@@ -12318,6 +12446,8 @@ class IncentiveMarketMaker:
         # KXRAIN period series seen in the programs feed (the writer prices
         # them beside its own list, rain_monthly_fair.PERIOD_SERIES)
         self._rain_period_series: Set[str] = set()
+        # ...and the snow monthlies seen there (snow_monthly_fair.SERIES)
+        self._snow_series: Set[str] = set()
         self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
         self._dc_stood: Set[str] = set()          # data center count stand-asides
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
@@ -14930,6 +15060,7 @@ class IncentiveMarketMaker:
             datacenter_series(series) or \
             rainstorm_span_allowed(ticker) or \
             rain_period_gated(ticker) or \
+            snow_monthly_series(series) or \
             cpi_pilot_active(ticker) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
@@ -15126,6 +15257,7 @@ class IncentiveMarketMaker:
             log(f"{self.tag} or-fair reloaded: {_or_n} events, "
                 f"{_or_moved} with a new day")
         load_rain_monthly()
+        load_snow_monthly()
         _sh_n, _sh_moved = load_share_fair()
         if _sh_moved:
             log(f"{self.tag} share-fair reloaded: {_sh_n} events, "
@@ -15179,6 +15311,12 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} rain-period series in the feed: "
                     f"{','.join(sorted(_rp))}")
             self._rain_period_series = _rp
+            # ...and the snow monthlies (2026-10-04), the same way
+            _sn = {series_of(t) for t in by_market if snow_monthly_series(series_of(t))}
+            if _sn - self._snow_series:
+                log(f"{self.tag} snow-monthly series in the feed: "
+                    f"{','.join(sorted(_sn))}")
+            self._snow_series = _sn
             # Daily-family classification from the live feed (Jack 2026-09-12):
             # feeds hour_size_mult / saturday_size_mult; persisted each refresh.
             _added, _dropped = refresh_daily_series(by_market, now_utc)
@@ -18535,10 +18673,17 @@ class IncentiveMarketMaker:
             # the same file; a band breach there caps the side that fights
             # the fair -- rain_caps, applied last below, where only a side
             # that still earns rests (RAIN_PERIOD_CAP).
+            # The snow monthlies (2026-10-04, SNOW_MONTHLY_ENABLE) take the
+            # same gate on their own file, with the period markets' caps.
             rain_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
             rain_period = rain_period_gated(t)
-            if rain_monthly_series(meta.series) or rain_period:
-                if rain_period:
+            snow = snow_monthly_series(meta.series)
+            wx = "snow-monthly" if snow else "rain-period" if rain_period else "rain-monthly"
+            if rain_monthly_series(meta.series) or rain_period or snow:
+                if snow:
+                    rm_why, rm_in, rain_caps = snow_monthly_gate(
+                        t, now_ts, ext_bid, ext_ask)
+                elif rain_period:
                     rm_why, rm_in, rain_caps = rain_period_gate(
                         t, now_ts, ext_bid, ext_ask)
                 else:
@@ -18546,25 +18691,23 @@ class IncentiveMarketMaker:
                 if rm_why:
                     if t not in self._rain_monthly_stood:
                         self._rain_monthly_stood.add(t)
-                        log(f"{self.tag} {'rain-period' if rain_period else 'rain-monthly'}"
-                            f" stand-aside {t}: {rm_why}")
+                        log(f"{self.tag} {wx} stand-aside {t}: {rm_why}")
                     self.cancel_market_orders(t, resting)
-                    self._gskip(t, "rain_period" if rain_period else "rain_monthly", lambda: rm_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    self._gskip(t, wx.replace("-", "_"), lambda: rm_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
                 if rain_caps is not None and t not in self._rain_period_capped:
                     self._rain_period_capped.add(t)
-                    log(f"{self.tag} rain-period capped {t}: {rm_in['why']}; "
+                    log(f"{self.tag} {wx} capped {t}: {rm_in['why']}; "
                         + (f"bids capped at {rain_caps[0]}c" if rm_in.get("bid_bad")
                            else f"asks floored at {rain_caps[1]}c")
                         + ", resting only while it earns")
             if rain_caps is None and t in self._rain_period_capped:
                 self._rain_period_capped.discard(t)
                 self._rain_period_unearning.pop(t, None)
-                log(f"{self.tag} rain-period uncapped {t}")
+                log(f"{self.tag} {wx} uncapped {t}")
             if t in self._rain_monthly_stood:
                 self._rain_monthly_stood.discard(t)
-                log(f"{self.tag} {'rain-period' if rain_period else 'rain-monthly'}"
-                    f" resume {t}")
+                log(f"{self.tag} {wx} resume {t}")
 
             # GASBUDDY STATE-GAS GATE (Jack 2026-09-27, see GB_FAIR_ENABLE):
             # the same stand-aside on GasBuddy's live state averages, failing
@@ -18936,7 +19079,7 @@ class IncentiveMarketMaker:
                 _r_dropped = _r_before - {q.book_side for q in mq if not q.is_pad}
                 if _r_dropped != self._rain_period_unearning.get(t, set()):
                     if _r_dropped:
-                        log(f"{self.tag} rain-period not earning {t}: "
+                        log(f"{self.tag} {wx} not earning {t}: "
                             f"{'/'.join(sorted(_r_dropped))} side(s) out of "
                             f"the scored walk after the caps {rain_caps} "
                             f"(book {ext_bid}x{ext_ask}) -- not resting them")
@@ -20348,6 +20491,40 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_rain_monthly_refresh, daemon=True,
                              name="rain-monthly").start()
+        if SNOW_MONTHLY_ENABLE and not once:
+            # Monthly snow refresher (2026-10-04): the rain refresher's
+            # contract on snow_monthly_fair.py and SNOW_MONTHLY_FILE, pricing
+            # its own series plus every KX<CITY>SNOWM the programs feed shows
+            # (refresh_universe's _snow_series).
+            def _snow_monthly_refresh():
+                try:
+                    import snow_monthly_fair
+                except Exception as e:
+                    log(f"{self.tag} ! snow-monthly refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, SNOW_MONTHLY_REFRESH_SECS)
+                    try:
+                        ok, miss = snow_monthly_fair.write_fair_file(
+                            SNOW_MONTHLY_FILE, get_json=kalshi_get,
+                            extra_series=sorted(self._snow_series))
+                        if last != (ok, miss):
+                            log(f"{self.tag} snow-monthly refresh: {ok} events "
+                                f"with a fair"
+                                + (f", {miss} without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! snow-monthly refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 120)
+                    time.sleep(delay)
+            threading.Thread(target=_snow_monthly_refresh, daemon=True,
+                             name="snow-monthly").start()
         if GB_FAIR_ENABLE and not once:
             # GasBuddy state-gas refresher (2026-09-27): the OpenRouter
             # refresher's contract -- every network call off the trading

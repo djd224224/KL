@@ -350,6 +350,8 @@ def family_of(series: str, category: str = ""):
     if s.startswith(_AWARDS_PREFIX) or s == "KXMC" or "NOBEL" in s or "ALBUM" in s \
             or s.startswith(("KXYT", "KXMUSIC", "KXDWTS")):
         return "Sports & awards", "Awards, charts & media"
+    if re.fullmatch(r"KX[A-Z]{2,6}SNOWM", s):
+        return "Weather & quakes", "Snow monthlies"
     if s.startswith("KXRAIN"):
         return "Weather & quakes", ("Rain dailies" if s == "KXRAIN" else
                                     "Weekend rain" if s.startswith("KXRAINWKND") else "Rain spans")

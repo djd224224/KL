@@ -7871,3 +7871,68 @@ skipped_writes, held_now, holdout.
 
 BACK OUT: IMM_SWEEP_BREAKER=dry in run_incentive_mm.ps1, then
 restart_imm.ps1 -Task.
+
+## 2026-10-04 night — Monthly snow (KX<CITY>SNOWM) quoted only through a snow fair (Jack)
+
+Jack: "build the snow feed" (after the period-rain entry above named the
+snow monthlies as uncovered: KXCHISNOWM $2,003/day, KXDETSNOWM $148/day in
+the 10/2 new-programs email).
+
+THE MARKETS. KX<CITY>SNOWM-<YYMON>-<K>, "total snowfall in Chicago (O'Hare)
+in December 2026 strictly greater than 8 inches", contract SNOWOVERTIME,
+TWC first in the source hierarchy. TWC's Kalshi dashboard, Snowfall tab:
+"Official daily snowfall from the NWS climate report, for the city's own
+local calendar day" -- the CLI's daily snowfall, summed. The rules name the
+city only, so the station is the dashboard's: BOS, ORD (the rules say
+O'Hare), DCA, DEN, DTW, MKE, MSP, NYC (Central Park), PHL, PIT. The 10/1-10/3
+programs feed carried these ten, all on 26DEC (strikes 2-12, MKE/MSP 4-24),
+programs ended 10/3 23:59 ET; none active on 10/4. Not covered: Big Sky
+(KXTSNOWFALLBIGSKYM, OnTheSnow's resort report), KXDENSNOWMB (NWS NOWData
+line), the old KXSNOW* lines.
+
+FAMILY. The ten in ALLOW_SERIES and any other KX<CITY>SNOWM by name
+(snow_monthly_series, IMM_SNOW_MONTHLY_SERIES_RE), ONLY while the gate is
+on; a city the writer cannot map stands aside. Archetype KXCHISNOWM: band
+5-90c, cutoff close - 1560 min (22:00 local the day before the month's last
+day). is_daily_series counts them with the rain monthlies: x1 at every hour,
+no Saturday or yield size.
+
+THE FAIR (snow_monthly_fair.py -> snow_monthly_fair.json, refresher thread
+"snow-monthly" every IMM_SNOW_MONTHLY_REFRESH_SECS 600; the rain gate's
+loader and checks, weather_fair_gate_reason):
+- to date: the latest CLI's snow_month (IEM json/cli.py; T counts 0, as
+  the dashboard's totals do) and the report's issue time from its product id.
+- ASOS measures no snowfall, so the hours after a report are unknown: snow
+  seen at the station after it was issued makes the event STALE ("snow
+  since the last climate report") until a later report counts it; a CLI
+  over 40h old is stale too.
+- the rest: rain_monthly_fair.simulate_period on ACIS daily SNOWFALL since
+  1980 (Denver from the threaded DENthr record -- DIA measures snow only
+  since 2006), NWS grid snowfallAmount injected over the horizon (new
+  `element` parameter in rain_monthly.fetch_forecast_days), log-normal kernel
+  sigma 0.25. Leave-one-out over 1980-2025 Decembers at the ten stations,
+  2,688 predictions: Brier 0.1827 raw, 0.1820 at 0.25 (coin: 0.25).
+- snowing = SN/SG/PL/GS/UP in the present weather, or precipitation at 35F
+  or colder; stand aside while it snows and SNOW_MONTHLY_DRY_MIN (60) after.
+  A month that has not started reads dry (no observation needed).
+- strikes within 0.1" of the to-date stand aside.
+- a touch that fights the fair by more than SNOW_MONTHLY_TOL_CENTS (10)
+  caps that side, resting only while it earns (SNOW_MONTHLY_CAP, the
+  period-rain rule); the other side joins the touch.
+
+10/4 23:00Z, December fair vs book (no touch breaches): CHI 2" 71 vs 60x99,
+6" 41 vs 31x99, 12" 20 vs 12x86; MSP 8" 59 vs 48x99, 24" 8 vs 4x5; NYC 2"
+50 vs 40x67; DC 2" 22 vs 14x85; DEN 12" 26 vs 1x21.
+
+KILL SWITCHES: IMM_SNOW_MONTHLY_ENABLE=0; IMM_SNOW_MONTHLY_CAP=0 (a breach
+parks both sides). Env => restart_imm.ps1 -Task.
+
+WATCH: first refresh logs "snow-monthly refresh: 10 events with a fair"
+(first write ~50s: ten ACIS downloads, cached a day). When programs return,
+"snow-monthly stand-aside / capped / resume <t>". In December, how often the
+"snow since the last climate report" rule holds a market out.
+
+Tests: TestSnowMonthlyGate (allowlist + pattern + other snow contracts out,
+guards, cutoff, every reason incl. snowing / drying / the stale reason / caps,
+end to end), test_snow_monthly_fair.py (13), dashboard family "Snow
+monthlies".

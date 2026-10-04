@@ -58,6 +58,10 @@ class FamilyTests(unittest.TestCase):
         self.assertEqual(dash.family_of("KXAAAGASDTX"), ("Gas & diesel", "AAA state dailies"))
         self.assertEqual(dash.family_of("KXDIESELW"), ("Gas & diesel", "Diesel weekly"))
         self.assertEqual(dash.family_of("KXRAIN"), ("Weather & quakes", "Rain dailies"))
+        # the snow monthlies (2026-10-04), not the crab catch or Big Sky
+        self.assertEqual(dash.family_of("KXCHISNOWM"), ("Weather & quakes", "Snow monthlies"))
+        self.assertNotEqual(dash.family_of("KXSNOWCRABCATCH")[1], "Snow monthlies")
+        self.assertNotEqual(dash.family_of("KXTSNOWFALLBIGSKYM")[1], "Snow monthlies")
         self.assertEqual(dash.family_of("KXCPICORE"), ("Econ & rates", "CPI & inflation"))
         self.assertEqual(dash.family_of("KXUST10AM"), ("Econ & rates", "Treasury yields"))
         self.assertEqual(dash.family_of("KXBABELMANDEBWEEKLY")[0], "Commodities & shipping")

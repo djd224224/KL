@@ -89,7 +89,8 @@ CANCELLED_RE = re.compile(r"cancelled (\d+)")
 
 # guard_skips "guard" names, grouped into the rows below. Anything not named
 # here lands in "Other stand-downs" so nothing the bot does goes unreported.
-GATE_GUARDS = ("treasury_yield", "rain_monthly", "rain_period", "rain_fair", "quake", "quake_hold",
+GATE_GUARDS = ("treasury_yield", "rain_monthly", "rain_period", "snow_monthly", "rain_fair",
+               "quake", "quake_hold",
                "vercel_fair", "or_fair", "share_fair", "mort_fair", "gb_fair",
                "ca_fair", "dc_count", "poke_fair", "manual_yield")
 BLACKOUT_GUARDS = ("cpi_blackout", "aaa_blackout")

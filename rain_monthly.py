@@ -267,11 +267,14 @@ def fetch_history(city: str, month: int) -> Dict[int, List[Optional[float]]]:
     return hist
 
 
-def fetch_forecast_days(city: str, now_utc: datetime) -> Dict[str, dict]:
+def fetch_forecast_days(city: str, now_utc: datetime,
+                        element: str = "quantitativePrecipitation") -> Dict[str, dict]:
     """NWS gridpoint QPF+PoP aggregated to LOCAL days:
     {YYYY-MM-DD: {qpf_in, pop, complete}} — for today only periods that end
     after `now` count (rain already fallen is in the obs, not the forecast).
-    `complete` False on the horizon's ragged last day."""
+    `complete` False on the horizon's ragged last day. `element` picks the
+    grid's amount series (snowfallAmount for the snow gate, 2026-10-04);
+    the day's amount still reads qpf_in."""
     st = STATIONS[city]
     tz = pytz.timezone(st["tz"])
 
@@ -279,10 +282,12 @@ def fetch_forecast_days(city: str, now_utc: datetime) -> Dict[str, dict]:
         pts = http_json(f"https://api.weather.gov/points/{st['lat']:.4f},{st['lon']:.4f}")
         grid_url = pts["properties"]["forecastGridData"]
         g = http_json(grid_url)
-        return {"qpf": g["properties"].get("quantitativePrecipitation", {}),
+        return {"qpf": g["properties"].get(element, {}),
                 "pop": g["properties"].get("probabilityOfPrecipitation", {})}
 
-    data = cached_get_json(f"qpf_{city}", 3600, _fetch)
+    data = cached_get_json(
+        f"qpf_{city}" if element == "quantitativePrecipitation" else f"{element}_{city}",
+        3600, _fetch)
 
     def _periods(block):
         out = []

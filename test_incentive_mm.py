@@ -168,6 +168,9 @@ def setUpModule():
     # the monthly rain fair file (2026-10-01), same reason
     imm.RAIN_MONTHLY_FILE = os.path.join(tmp, "rain_monthly_fair.json")
     imm._rain_monthly_state.update(mtime=0.0, markets={}, events={})
+    # ...and the monthly snow one (2026-10-04)
+    imm.SNOW_MONTHLY_FILE = os.path.join(tmp, "snow_monthly_fair.json")
+    imm._snow_monthly_state.update(mtime=0.0, markets={}, events={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -10958,6 +10961,170 @@ class TestRainPeriodGate(unittest.TestCase):
         self.assertFalse([p for s, p in q if s == "bid" and p > 40], q)
 
 
+class TestSnowMonthlyGate(unittest.TestCase):
+    """snow_monthly_fair.json -> load_snow_monthly/snow_monthly_gate -> the
+    KX<CITY>SNOWM markets (Jack 2026-10-04: "build the snow feed"): the rain
+    gate's checks on the snow file, failing closed, out while it snows, and a
+    touch that fights the fair caps that side. Fixture event
+    KXCHISNOWM-68DEC (far from any cutoff), strike 8 inches."""
+
+    T = "KXCHISNOWM-68DEC-8"
+    EV = "KXCHISNOWM-68DEC"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._snow_monthly_state.update(mtime=0.0, markets={}, events={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.SNOW_MONTHLY_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm.SNOW_MONTHLY_CAP = True
+
+    def _write(self, p=0.5, wet=False, last_wet_mins=None, stale_cli=False,
+               stale_why=None, boundary=False):
+        now = datetime.now(timezone.utc)
+        lw = ((now - timedelta(minutes=last_wet_mins)).isoformat()
+              if last_wet_mins is not None else None)
+        with open(imm.SNOW_MONTHLY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"event": self.EV, "p": p, "boundary": boundary,
+                                            "fetched_at": now.isoformat()}},
+                       "event_state": {self.EV: {
+                           "wet": wet, "last_wet_at": lw, "stale_cli": stale_cli,
+                           "stale_why": stale_why, "mtd": 1.2,
+                           "obs_time": now.isoformat()}}}, f)
+        os.utime(imm.SNOW_MONTHLY_FILE, (time.time(), time.time() + self._bump))
+        TestSnowMonthlyGate._bump += 1
+        return imm.load_snow_monthly()
+
+    def _bot(self):
+        client = FakeClient()
+        far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 5000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": far, "yes_bid_dollars": "0.4900",
+            "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    TEN = ("KXBOSSNOWM", "KXCHISNOWM", "KXDCSNOWM", "KXDENSNOWM", "KXDETSNOWM",
+           "KXMKESNOWM", "KXMSPSNOWM", "KXNYCSNOWM", "KXPHILSNOWM", "KXPITSNOWM")
+
+    def test_family_allowlist_guards_and_cutoff(self):
+        self.assertEqual(imm.SNOW_MONTHLY_SERIES, frozenset(self.TEN))
+        old = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+        try:
+            a = IncentiveMarketMaker._allowed
+            for s in self.TEN + ("KXBUFSNOWM",):              # a new city by name
+                self.assertTrue(imm.snow_monthly_series(s), s)
+                self.assertTrue(a(f"{s}-26DEC-8"), s)
+            # other snow contracts: the Denver NWS line, Big Sky's resort
+            # report, the old KXSNOW* lines, the crab catch
+            for s in ("KXDENSNOWMB", "KXTSNOWFALLBIGSKYM", "KXSNOWNYM", "KXSNOWCRABCATCH"):
+                self.assertFalse(imm.snow_monthly_series(s), s)
+                self.assertFalse(a(f"{s}-26DEC-8"), s)
+        finally:
+            imm.ALLOWLIST_ONLY = old
+        for s in self.TEN:
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            ov = imm.series_override(s)
+            self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90), s)
+            self.assertEqual(ov.cutoff_from_close_min, 1560, s)
+            # with the rain monthlies: x1 at every hour, no Saturday/yield
+            self.assertTrue(imm.is_daily_series(s), s)
+            self.assertFalse(imm.yield_size_eligible(s), s)
+        imm.SERIES_OVERRIDES.pop("KXBUFSNOWM", None)
+        try:
+            imm.ensure_family_override("KXBUFSNOWM")
+            self.assertEqual(imm.series_override("KXBUFSNOWM").cutoff_from_close_min, 1560)
+        finally:
+            imm.SERIES_OVERRIDES.pop("KXBUFSNOWM", None)
+        # close 23:59 CST Dec 31 -> out 21:59 CST Dec 30
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXCHISNOWM", "KXCHISNOWM-26DEC", None, utc(2027, 1, 1, 5, 59)),
+            utc(2026, 12, 31, 3, 59))
+        for k in ("SNOW_MONTHLY_ENABLE", "SNOW_MONTHLY_TOL_CENTS", "SNOW_MONTHLY_CAP"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        import imm_risk_controls
+        self.assertIn("snow_monthly", imm_risk_controls.GATE_GUARDS)
+
+    def test_gate_reasons_and_caps(self):
+        g = imm.snow_monthly_gate
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, inp["reason"], caps),
+                         ("no monthly snow fair for this market", "no_read", None))
+        self._write()
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self.assertEqual(g(self.T, time.time() + imm.SNOW_MONTHLY_TTL_MIN * 60 + 5,
+                           49, 51)[1]["reason"], "stale")
+        self._write(wet=None)
+        self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "no_obs")
+        self._write(wet=True, last_wet_mins=0)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, inp["reason"]), ("snowing at the station", "snowing"))
+        self._write(last_wet_mins=20)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual(inp["reason"], "drying")
+        self.assertTrue(why.startswith("snowed 2"), why)
+        self._write(stale_cli=True, stale_why="snow since the last climate report")
+        self.assertEqual(g(self.T, time.time(), 49, 51)[:2],
+                         ("snow since the last climate report", {"reason": "stale_cli"}))
+        self._write(boundary=True)
+        self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "boundary")
+        # bid 49 > 30 + 10: the bid is capped at 40, the ask keeps the touch
+        self._write(p=0.30)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, caps, inp["bid_bad"]), ("", (40, 20), True))
+        imm.SNOW_MONTHLY_CAP = False
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], caps), ("band", None))
+        self.assertTrue(why)
+        # the rain gate's own messages are untouched by the refactor
+        self.assertEqual(imm.rain_monthly_gate_reason("KXRAINCHIM-68DEC-3", time.time(),
+                                                      49, 51)[0],
+                         "no monthly rain fair for this market")
+
+    def test_quotes_through_the_gate_and_stands_aside_while_it_snows(self):
+        bot = self._bot()
+        bot.run_cycle()                                       # no file: closed
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self.assertEqual(bot._snow_series, {"KXCHISNOWM"})
+        self._write()
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertIn(("ask", 51), q)
+        # the fair drops to 30: the bid behind 1,900 contracts earns nothing
+        self._write(p=0.30)
+        bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"ask"})
+        self.assertEqual(bot._rain_period_unearning[self.T], {"bid"})
+        self._write(wet=True, last_wet_mins=0)                # snow starts
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot.state.selected)                 # sticky
+
+
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
@@ -14496,9 +14663,12 @@ class TestOpenScanTier(unittest.TestCase):
         # other bots' families, politics and non-price crypto are scan
         # universe — the per-series/per-market screens judge them
         for t in ("KXNFLGAME-26SEP08-T1", "KXPGATOUR-26SEP13-T270",
-                  "KXNYCSNOWM-26DEC31-T10", "KXNYTTRUMPAPPROVAL-26SEP30-T45",
+                  "KXDENSNOWMB-26DEC31-T10", "KXNYTTRUMPAPPROVAL-26SEP30-T45",
                   "KXHARDFORKBTC-26DEC31-T1", "KXBOXOFFICE-26SEP13-T50"):
             self.assertIsNone(r(t), t)
+        # the snow monthlies left the scan universe for the normal book on
+        # 2026-10-04 (the snow gate, snow_monthly_series)
+        self.assertEqual(r("KXNYCSNOWM-26DEC31-T10"), "allowed")
         # knobs: tier off / allowlist off -> no scan universe at all
         old = imm.SCAN_TOP_N
         imm.SCAN_TOP_N = 0
@@ -20330,16 +20500,17 @@ class TestSignedFairReads(unittest.TestCase):
 
     def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
         """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
-        monthly rain and GasBuddy refreshers each build a reader with
-        fair_reader() and pass it to their module's write_fair_file (the
-        threads live inside run(), so read its source)."""
+        monthly rain, monthly snow and GasBuddy refreshers each build a
+        reader with fair_reader() and pass it to their module's
+        write_fair_file (the threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 5)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 6)
         for mod, path in (("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
                           ("openrouter_share_fair", "SHARE_FAIR_FILE"),
                           ("rain_monthly_fair", "RAIN_MONTHLY_FILE"),
+                          ("snow_monthly_fair", "SNOW_MONTHLY_FILE"),
                           ("gasbuddy_fair", "GB_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
