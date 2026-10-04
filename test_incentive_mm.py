@@ -20808,6 +20808,33 @@ class TestWSStaleEpisodes(unittest.TestCase):
         self.assertEqual(self._evs(), ["flag", "clear", "flag"])
         self.assertEqual(self.bot._ws_fast["would_cancel"], 2)
 
+    def test_an_order_already_out_of_the_book_is_never_flagged(self):
+        # 10/4 18:51Z: our 25 @16c ask was lifted mid-cycle, so the view still
+        # held it but the book had no NO size at 84c -- nothing to cancel
+        self._view(oid="oH", side="ask", px=16.0, rem=25.0)
+        self.feed.books[self.T] = ({0.14: 1000.0}, {0.70: 1000.0})
+        self._look(0.0, 1.5, 3.0)
+        self.assertEqual((self.recs, self.bot._ws_fast["would_cancel"]), ([], 0))
+        self.assertNotIn("oH", self.bot._ws_suspect)
+
+    def test_a_flagged_order_leaving_the_book_ends_gone(self):
+        self._view()
+        self.feed.books[self.T] = self._AHEAD
+        self._look(0.0, 1.5)
+        self.feed.books[self.T] = ({0.47: 500.0}, {0.49: 1200.0})   # filled out
+        self._look(3.0)
+        self.assertEqual(self._evs(), ["flag", "gone"])
+        self.assertEqual(self.recs[1][1]["stale_s"], 1.5)
+        self.assertEqual(self.bot._ws_flagged, {})
+
+    def test_a_partly_filled_remainder_left_alone_still_flags(self):
+        # the view says 20, a sweep took 12 and every other bid at 49c
+        self._view()
+        self.feed.books[self.T] = ({0.47: 500.0, 0.49: 8.0}, {0.49: 1200.0})
+        self._look(0.0, 1.5)
+        self.assertEqual(self._evs(), ["flag"])
+        self.assertEqual(self.recs[0][1]["yes"], [[49.0, 8.0], [47.0, 500.0]])
+
     def test_the_cycle_ends_episodes_by_amend_cancel_or_gone(self):
         b = self.bot
         for oid, px in (("o1", 49.0), ("o2", 48.0), ("o3", 47.0), ("o4", 46.0)):

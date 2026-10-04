@@ -7521,6 +7521,14 @@ counts twice, as each would be a fast-path cancel. Also fixed: an order the
 cycle amends drops its first-seen-ahead time, so the two looks start over at
 its new price (before, it carried the old price's clock).
 
+PRESENCE CHECK (same evening, after the first live hour). A rung is only
+flagged while the WS book still shows size at its price. The view is the
+cycle's read, so an order filled out or pulled mid-cycle used to be flagged
+with nothing left to cancel: KXHORMUZWEEKLY-26OCT11-T30 ask 25 @16c, lifted
+at 18:51:01Z, was flagged at 18:51:53Z. A flagged rung that leaves the book
+now ends `gone` at once. A partly filled remainder still shows, so it still
+flags. ws_stale_score.py drops such flags logged before the fix ("phantom").
+
 SCORING. ws_stale_score.py: the episodes plus fills_*.jsonl (by order_id),
 cycle_log_*.csv (mid mark-outs) and the reward estimate (pool_per_day x
 est_frac). The one-time scheduled task imm-ws-stale-score runs it on

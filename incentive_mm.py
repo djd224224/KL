@@ -13692,6 +13692,17 @@ class IncentiveMarketMaker:
                 if o["pad"] or now_ts - o["placed"] < 2.0:
                     self._ws_suspect.pop(oid, None)
                     continue
+                # the view is the cycle's read: an order filled out or pulled
+                # since leaves no size at its price in the book, and there is
+                # nothing to cancel (10/4: an ask lifted mid-cycle was flagged
+                # 52s after its fill). A partly filled remainder still shows.
+                lvl = (yes.get(round(o["px"] / 100.0, 4), 0.0) if o["side"] == "bid"
+                       else no.get(round((100.0 - o["px"]) / 100.0, 4), 0.0))
+                if lvl <= 0.01:
+                    self._ws_suspect.pop(oid, None)
+                    if oid in self._ws_flagged:
+                        self._ws_episode_end(oid, "gone", now_ts)
+                    continue
                 p = round(o["px"] / 100.0, 4)
                 ahead = ((ext_bid is None or p > ext_bid + 1e-6)
                          if o["side"] == "bid"

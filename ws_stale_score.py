@@ -266,6 +266,16 @@ def reward_rate(flag: dict, target: Optional[float], df: Optional[float],
     return pool_per_day / 86400.0 * max(0.0, f_with - f_without)
 
 
+def _in_book(flag: dict) -> bool:
+    """Was the flagged rung in the book it was flagged on? Before the bot's
+    presence check (10/4 evening) it could flag an order already filled out or
+    pulled mid-cycle: nothing to cancel, so not an episode."""
+    px = float(flag["px"])
+    lv, at = ((flag.get("yes") or [], px) if flag["side"] == "bid"
+              else (flag.get("no") or [], 100.0 - px))
+    return any(abs(float(c) - at) < 0.005 and float(q) > 0.01 for c, q in lv)
+
+
 def _row_at_or_before(rows: List[tuple], tss: List[float], t: float
                       ) -> Optional[tuple]:
     if not rows:
@@ -315,6 +325,9 @@ def score(eps: List[dict], fills: Dict[str, List[dict]],
         if fl.get("mode") == "live" or (end and end.get("by") == "fast"):
             res.append({"ticker": t, "order_id": oid, "end": ev, "live": True})
             continue
+        if not _in_book(fl):
+            res.append({"ticker": t, "order_id": oid, "end": ev, "phantom": True})
+            continue
         if oid in window_until and t0 < window_until[oid]:
             res.append({"ticker": t, "order_id": oid, "end": ev, "folded": True})
             continue
@@ -362,7 +375,8 @@ def score(eps: List[dict], fills: Dict[str, List[dict]],
 
 
 def summarize(sc: dict, t_lo: float, t_hi: float) -> dict:
-    eps = [r for r in sc["episodes"] if not r.get("live") and not r.get("folded")]
+    eps = [r for r in sc["episodes"]
+           if not (r.get("live") or r.get("folded") or r.get("phantom"))]
     hours = max((t_hi - t_lo) / 3600.0, 1e-9)
 
     def agg(rs: List[dict]) -> dict:
@@ -396,6 +410,7 @@ def summarize(sc: dict, t_lo: float, t_hi: float) -> dict:
         "by_end": dict(by_end),
         "live": sum(1 for r in sc["episodes"] if r.get("live")),
         "folded": sum(1 for r in sc["episodes"] if r.get("folded")),
+        "phantom": sum(1 for r in sc["episodes"] if r.get("phantom")),
         "fills_before_ct": sum(r["fills_before"] for r in eps),
         "by_family": {k: agg(v) for k, v in fam.items()},
         "by_gap": {k: agg(v) for k, v in gap.items()},
@@ -414,7 +429,9 @@ def render(s: dict) -> str:
            f"{T['episodes']} episodes; the cycle took a median {s['D']:.0f}s to act "
            f"on its own (D, the re-place time for clears / open ones)."
            + (f" {s['folded']} re-flags folded into an earlier window." if s["folded"] else "")
-           + (f" {s['live']} live fast-path episodes not scored." if s["live"] else ""),
+           + (f" {s['live']} live fast-path episodes not scored." if s["live"] else "")
+           + (f" {s['phantom']} flags on orders already out of the book dropped."
+              if s["phantom"] else ""),
            "", "How the episodes ended: " + ", ".join(
                f"{k} {v} ({100.0 * v / n:.0f}%)" for k, v in sorted(
                    s["by_end"].items(), key=lambda kv: -kv[1])), "",

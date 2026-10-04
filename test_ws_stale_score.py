@@ -67,6 +67,10 @@ def _write_day(d):
               ours=[["bid", 30.0, 15.0]]),                      # never ends: open
         _flag(T + 2000, "o5", "bid", 49.0, 20.0, **BOOK_A),
         _end(T + 2030, "gone", "o5", "bid", 49.0, 30.0),
+        # an ask already lifted mid-cycle: no NO size at 84c in its book
+        _flag(T + 2400, "o7", "ask", 16.0, 25.0, yes=[[14.0, 1000.0]],
+              no=[[70.0, 1000.0]], ours=[["ask", 16.0, 25.0]]),
+        _end(T + 2460, "gone", "o7", "ask", 16.0, 60.0),
         _flag(T + 2500, "o6", "bid", 49.0, 20.0, mode="live", **BOOK_A),
         _end(T + 2500, "cancel", "o6", "bid", 49.0, 0.0, by="fast"),
     ]
@@ -118,7 +122,7 @@ class TestScore(unittest.TestCase):
         s = self._summary()
         t = s["total"]
         self.assertEqual(s["D"], 60.0)                    # o1's amend
-        self.assertEqual((s["folded"], s["live"]), (1, 1))
+        self.assertEqual((s["folded"], s["live"], s["phantom"]), (1, 1, 1))
         self.assertEqual(s["by_end"], {"amend": 1, "clear": 1, "open": 1, "gone": 1})
         self.assertEqual((t["episodes"], t["hit"], t["avoid_ct"], t["while_stale_ct"]),
                          (4, 3, 45.0, 45.0))
@@ -138,7 +142,7 @@ class TestScore(unittest.TestCase):
         cyc = wss.load_cycle_rows(self.d, {A, B}, T - 3600, T + 9000)
         got = {r["order_id"]: (r["end"], r.get("replace_s"))
                for r in wss.score(eps, fills, cyc)["episodes"]
-               if not r.get("folded") and not r.get("live")}
+               if not (r.get("folded") or r.get("live") or r.get("phantom"))}
         self.assertEqual(got, {"o1": ("amend", 60.0), "o2": ("clear", 60.0),
                                "o3": ("open", 60.0), "o5": ("gone", 30.0)})
 
@@ -161,7 +165,8 @@ class TestScore(unittest.TestCase):
 
     def test_a_since_window_and_main(self):
         eps = wss.load_episodes(self.d, T + 1000, None)
-        self.assertEqual(sorted(e["flag"]["order_id"] for e in eps), ["o3", "o5", "o6"])
+        self.assertEqual(sorted(e["flag"]["order_id"] for e in eps),
+                         ["o3", "o5", "o6", "o7"])
         out = os.path.join(self.d, "s.json")
         self.assertEqual(wss.main(["--dir", self.d, "--json", out]), 0)
         with open(out) as f:
