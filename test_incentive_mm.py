@@ -18222,43 +18222,45 @@ class TestLadderAsksCashLatch(unittest.TestCase):
         self.addCleanup(lambda: imm._LADDER_ASKS_STATE.update(on_at=None))
 
     def test_latch(self):
-        self.assertEqual(imm.SPORTS_LADDER_ASKS_ON_CASH, 4000.0)
+        # Jack: "adjust to 1.5 and 3.5k instead of 2k and 4k"
+        self.assertEqual((imm.SPORTS_LADDER_ASKS_ON_CASH,
+                          imm.SPORTS_LADDER_ASKS_OFF_CASH), (3500.0, 1500.0))
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         now = datetime.now(timezone.utc)
         self.assertTrue(imm.series_bid_only(self.S))          # bids only
-        bot.client.get_balance = lambda: _bal(3999.0, 20000.0)
+        bot.client.get_balance = lambda: _bal(3499.0, 20000.0)
         bot._check_balance_floor(now)
         self.assertTrue(imm.series_bid_only(self.S))          # $1 short
         self.assertEqual(bot.state.ladder_asks_on_at, 0.0)
-        bot.client.get_balance = lambda: _bal(4000.0, 20000.0)
+        bot.client.get_balance = lambda: _bal(3500.0, 20000.0)
         bot._check_balance_floor(now)
         self.assertFalse(imm.series_bid_only(self.S))         # asks back on
         self.assertAlmostEqual(bot.state.ladder_asks_on_at, now.timestamp())
         msgs = [m for c, m in bot.alerter.today if c == "ladder_asks_on"]
         self.assertEqual(len(msgs), 1)
         self.assertIn("ASKS BACK ON", msgs[0])
-        self.assertIn("$4,000", msgs[0])
-        # TWO-WAY (Jack: "below $2k turn off the ask side"): a dip inside
-        # the $2k-$4k band keeps them on, no new alert ...
-        bot.client.get_balance = lambda: _bal(2000.0, 20000.0)
+        self.assertIn("$3,500", msgs[0])
+        # TWO-WAY (Jack: "below $2k turn off the ask side", then $1.5k): a
+        # dip inside the $1.5k-$3.5k band keeps them on, no new alert ...
+        bot.client.get_balance = lambda: _bal(1500.0, 20000.0)
         bot._check_balance_floor(now)
         self.assertFalse(imm.series_bid_only(self.S))
         self.assertEqual(len([1 for c, _m in bot.alerter.today
                               if c == "ladder_asks_on"]), 1)
-        # ... under $2k turns them off, persisted and alerted ...
-        bot.client.get_balance = lambda: _bal(1999.0, 20000.0)
+        # ... under $1.5k turns them off, persisted and alerted ...
+        bot.client.get_balance = lambda: _bal(1499.0, 20000.0)
         bot._check_balance_floor(now)
         self.assertTrue(imm.series_bid_only(self.S))
         self.assertEqual(bot.state.ladder_asks_on_at, 0.0)
         offs = [m for c, m in bot.alerter.today if c == "ladder_asks_off"]
         self.assertEqual(len(offs), 1)
         self.assertIn("ASKS OFF", offs[0])
-        self.assertIn("$2,000", offs[0])
-        # ... and back over $4k turns them on again
-        bot.client.get_balance = lambda: _bal(3999.0, 20000.0)
+        self.assertIn("$1,500", offs[0])
+        # ... and back at $3.5k turns them on again
+        bot.client.get_balance = lambda: _bal(3499.0, 20000.0)
         bot._check_balance_floor(now)
         self.assertTrue(imm.series_bid_only(self.S))          # the band holds
-        bot.client.get_balance = lambda: _bal(4100.0, 20000.0)
+        bot.client.get_balance = lambda: _bal(3600.0, 20000.0)
         bot._check_balance_floor(now)
         self.assertFalse(imm.series_bid_only(self.S))
         self.assertEqual(len([1 for c, _m in bot.alerter.today

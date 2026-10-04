@@ -3453,7 +3453,9 @@ SPORTS_LADDER_PRICE_MAX_EXACT = _env_float("IMM_SPORTS_LADDER_PRICE_MAX_EXACT", 
 # built as a one-way latch, made two-way the same evening (below). Persisted
 # as state.ladder_asks_on_at so a restart keeps it; IMM_SPORTS_LADDER_ASKS_
 # ON_CASH=0 ignores the switch (asks stay off). Logged and in the digest.
-SPORTS_LADDER_ASKS_ON_CASH = _env_float("IMM_SPORTS_LADDER_ASKS_ON_CASH", 4000.0)
+# $3,500 / $1,500 (Jack, minutes later: "adjust to 1.5 and 3.5k instead of
+# 2k and 4k")
+SPORTS_LADDER_ASKS_ON_CASH = _env_float("IMM_SPORTS_LADDER_ASKS_ON_CASH", 3500.0)
 # TWO-WAY, WITH A BAND (Jack 2026-10-04, the same evening: "above $4k open up
 # all ESCALATOR/LADDERS, below $2k turn off the ask side just like you did
 # today"). Free cash at or over SPORTS_LADDER_ASKS_ON_CASH turns the asks on;
@@ -3466,7 +3468,7 @@ SPORTS_LADDER_ASKS_ON_CASH = _env_float("IMM_SPORTS_LADDER_ASKS_ON_CASH", 4000.0
 # cross-shard total only when the read carries no breakdown. Each switch is
 # persisted (state.ladder_asks_on_at, 0 = off), logged and in the digest.
 # IMM_SPORTS_LADDER_ASKS_OFF_CASH=0 makes it the old one-way latch.
-SPORTS_LADDER_ASKS_OFF_CASH = _env_float("IMM_SPORTS_LADDER_ASKS_OFF_CASH", 2000.0)
+SPORTS_LADDER_ASKS_OFF_CASH = _env_float("IMM_SPORTS_LADDER_ASKS_OFF_CASH", 1500.0)
 # when the asks last came on (epoch; None = off), mirrored from
 # state.ladder_asks_on_at
 _LADDER_ASKS_STATE: dict = {"on_at": None}
@@ -12808,7 +12810,7 @@ class IncentiveMarketMaker:
             self.state.toxic_event_halt_until = {
                 str(e): float(v)
                 for e, v in (data.get("toxic_event_halt_until") or {}).items()}
-            # the $4k-cash latch for the ladder asks (SPORTS_LADDER_ASKS_ON_CASH)
+            # the ladder asks' cash switch (SPORTS_LADDER_ASKS_ON_CASH / _OFF_CASH)
             self.state.ladder_asks_on_at = float(data.get("ladder_asks_on_at") or 0.0)
             # Halt continuity (same roll-day only): a restart must NOT hand
             # the bot a fresh loss budget or clear an active halt. Use

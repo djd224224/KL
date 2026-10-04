@@ -7402,3 +7402,6 @@ netted: its positions are not in the primary's read.
 Tests: TestLadderAsksCashLatch (band both ways, the shard's cash, the 0
 knob), TestSnipeBookNetOut (a subaccount's book), test_nfl_snipe_bot
 TestBookFile. 2,046 green.
+
+REVISED minutes later (Jack: "adjust to 1.5 and 3.5k instead of 2k and
+4k"): ON at $3,500, OFF under $1,500 (the env knobs unchanged).
