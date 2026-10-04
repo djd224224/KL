@@ -7263,3 +7263,28 @@ test_bid_touch_over_fair_rests_only_the_earning_side_then_resumes,
 test_a_capped_bid_that_still_earns_rests_at_its_cap,
 test_ask_touch_under_fair_rests_only_the_bid,
 test_cap_off_parks_both_sides_as_before. 2,003 green.
+
+### 2026-10-04 — Ladder / escalator asks come back on at $4,000 free cash (Jack)
+
+Jack: "once cash is over $4k, turn on the full ladder/escalator again".
+
+CHANGE. SPORTS_LADDER_ASKS_ON_CASH (IMM_SPORTS_LADDER_ASKS_ON_CASH, 4000;
+0 = never). _check_balance_floor already reads /portfolio/balance every
+full live cycle; right after a good read, _ladder_asks_latch fires the
+first time free cash (balance_dollars, the figure the startup line logs as
+"cash") is at or over the threshold: it sets state.ladder_asks_on_at
+(persisted, NOT tied to the roll day) and the module mirror
+_LADDER_ASKS_STATE, logs and alerts ("ladder_asks_on", not urgent) once,
+and series_bid_only stops counting the family -- both sides quote from that
+cycle. ONE-WAY, as asked: a later dip does not turn the asks off again;
+IMM_SPORTS_LADDER_ASKS_ON_CASH=0 ignores the latch (bids only again), or
+clear ladder_asks_on_at from imm_state.json with the bot stopped. Startup
+logs which state it is in ("YES BIDS ONLY ... until free cash reaches
+$4,000" / "asks back ON since ...").
+
+At deploy: free cash $1,914 (14:30Z); bids only verified on the live book
+(14:27Z cycle: 446 NFL prop markets, 50,245 bid contracts resting, 0 asks).
+
+Tests: TestLadderAsksCashLatch (fires at $4,000 not $3,999, one alert, a dip
+keeps it on, quakes stay bid-only, persists across a restart, the 0 knob
+ignores an old latch). 2,006 green.

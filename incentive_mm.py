@@ -3439,6 +3439,24 @@ if SPORTS_LADDER_BLOCK:
 # quake gate's own logic keys on quake_gated, not on bid-only. Kill:
 # IMM_SPORTS_LADDER_ASKS_OFF=0.
 SPORTS_LADDER_ASKS_OFF = os.environ.get("IMM_SPORTS_LADDER_ASKS_OFF", "1") == "1"
+# ASKS BACK ON AT $4,000 CASH (Jack 2026-10-04: "once cash is over $4k, turn
+# on the full ladder/escalator again"). The bids-only mode was for cash: the
+# account's free cash ran $1.5-3.8k that morning against ~$83k of planned
+# ladder collateral, and 42k of the day's 52k rejects were asks. The first
+# balance read (_check_balance_floor, every full live cycle) that finds
+# free cash (balance_dollars) at or over SPORTS_LADDER_ASKS_ON_CASH turns
+# the asks back on -- a ONE-WAY latch, as asked: persisted as
+# state.ladder_asks_on_at so a restart keeps it, never undone by a later dip
+# (asks off again: IMM_SPORTS_LADDER_ASKS_ON_CASH=0, which ignores the
+# latch, or clear the field). Logged and emailed when it fires.
+SPORTS_LADDER_ASKS_ON_CASH = _env_float("IMM_SPORTS_LADDER_ASKS_ON_CASH", 4000.0)
+# when the latch fired (epoch), mirrored from state.ladder_asks_on_at
+_LADDER_ASKS_STATE: dict = {"on_at": None}
+
+
+def ladder_asks_relatched() -> bool:
+    """True once free cash reached SPORTS_LADDER_ASKS_ON_CASH (the latch)."""
+    return SPORTS_LADDER_ASKS_ON_CASH > 0 and _LADDER_ASKS_STATE.get("on_at") is not None
 # ESPN scoreboard path per league prefix. site.web.api.espn.com: the
 # site.api host started answering 403 "Access Denied" to the browser UA in
 # 2026-09 (measured 2026-09-24 for nfl / wnba / cfb alike), this host serves
@@ -8324,7 +8342,8 @@ def series_bid_only(series: str) -> bool:
     two-sided depth test never counts an ask pad. The quake gate's family,
     and the sports ladders / escalators while SPORTS_LADDER_ASKS_OFF."""
     return quake_gated(series) or (
-        SPORTS_LADDER_ASKS_OFF and sports_ladder_league(series) is not None)
+        SPORTS_LADDER_ASKS_OFF and not ladder_asks_relatched()
+        and sports_ladder_league(series) is not None)
 
 
 def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
@@ -11609,6 +11628,7 @@ class BotState:
     #   survive one; the halt used to hand every restart a fresh loss budget
     pnl_today_last: float = 0.0          # last measured pnl_today (for persist)
     account_value_day_start: float = 0.0  # account value (cash + positions) at the daily anchor
+    ladder_asks_on_at: float = 0.0       # ladder / escalator asks back on (epoch; 0 = not yet)
     watchdog_streak: int = 0             # consecutive selected-but-not-resting cycles
     consecutive_errors: int = 0
     # daily counters (reset when the summary sends)
@@ -11757,6 +11777,8 @@ class IncentiveMarketMaker:
         # a fresh state is this process's; _load_persist reads a file's own.
         self._state_owner = KEY_ID
         self._load_persist()
+        # the ladder-asks cash latch lives in module state for series_bid_only
+        _LADDER_ASKS_STATE["on_at"] = self.state.ladder_asks_on_at or None
         # The fill high-water mark this process inherited, before its first
         # fills read moves it: the startup reconcile looks for unbooked fills
         # from an hour before it.
@@ -12577,6 +12599,8 @@ class IncentiveMarketMaker:
             self.state.toxic_event_halt_until = {
                 str(e): float(v)
                 for e, v in (data.get("toxic_event_halt_until") or {}).items()}
+            # the $4k-cash latch for the ladder asks (SPORTS_LADDER_ASKS_ON_CASH)
+            self.state.ladder_asks_on_at = float(data.get("ladder_asks_on_at") or 0.0)
             # Halt continuity (same roll-day only): a restart must NOT hand
             # the bot a fresh loss budget or clear an active halt. Use
             # --clear-halt (bot stopped) for a deliberate un-halt.
@@ -12709,6 +12733,7 @@ class IncentiveMarketMaker:
                            "pnl_today_carry": round(self.state.pnl_today_last, 2),
                            "halted_until": self.state.halted_until,
                            "account_value_day_start": round(self.state.account_value_day_start, 2),
+                           "ladder_asks_on_at": self.state.ladder_asks_on_at,
                            # peak-entry memory, pruned to TTL so it stays bounded
                            "est_peak": {t: [round(v[0], 4), round(v[1], 1)]
                                         for t, v in self._est_peak.items()
@@ -15981,6 +16006,30 @@ class IncentiveMarketMaker:
                 key="reconcile", urgent=False)
             self._save_persist()
 
+    def _ladder_asks_latch(self, cash: float, now_utc: datetime) -> bool:
+        """Turn the ladder / escalator asks back on the first time free cash
+        reaches SPORTS_LADDER_ASKS_ON_CASH (Jack 2026-10-04: "once cash is
+        over $4k, turn on the full ladder/escalator again"). One-way and
+        persisted; True when it fires this call."""
+        if not (SPORTS_LADDER_ASKS_OFF and SPORTS_LADDER_ASKS_ON_CASH > 0):
+            return False
+        if _LADDER_ASKS_STATE.get("on_at") is not None:
+            return False
+        if cash < SPORTS_LADDER_ASKS_ON_CASH:
+            return False
+        ts = now_utc.timestamp()
+        _LADDER_ASKS_STATE["on_at"] = ts
+        self.state.ladder_asks_on_at = ts
+        self._save_persist()
+        msg = (f"sports ladders / escalators: ASKS BACK ON -- free cash "
+               f"${cash:,.0f} reached ${SPORTS_LADDER_ASKS_ON_CASH:,.0f}; the "
+               f"family quotes both sides again from this cycle (one-way: "
+               f"IMM_SPORTS_LADDER_ASKS_ON_CASH=0 turns them off again)")
+        log(f"{self.tag} {msg}")
+        self.alerter.alert("ladder_asks_on", msg, key="ladder_asks_on",
+                           urgent=False)
+        return True
+
     def _check_balance_floor(self, now_utc: datetime) -> bool:
         """True = floor breached and the bot halted. ACCOUNT VALUE (cash +
         Kalshi's valuation of the positions, account_value_dollars) against
@@ -15993,6 +16042,7 @@ class IncentiveMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! balance read failed ({e}); floor check skipped")
             return False
+        self._ladder_asks_latch(cash, now_utc)
         if value is None:
             log(f"{self.tag} ! balance read carried no portfolio_value; floor check skipped")
             return False
@@ -19076,10 +19126,19 @@ class IncentiveMarketMaker:
         if SPORTS_LADDER_BLOCK:
             log("sports ladders / escalators: OFF (pattern-blocked, "
                 "IMM_SPORTS_LADDER_BLOCK=1) -- no orders, positions ride")
+        elif SPORTS_LADDER_ASKS_OFF and ladder_asks_relatched():
+            log("sports ladders / escalators: asks back ON since "
+                + datetime.fromtimestamp(_LADDER_ASKS_STATE["on_at"],
+                                         timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+                + f" (free cash reached ${SPORTS_LADDER_ASKS_ON_CASH:,.0f})")
         elif SPORTS_LADDER_ASKS_OFF:
             log("sports ladders / escalators: YES BIDS ONLY (asks off, "
                 "IMM_SPORTS_LADDER_ASKS_OFF=1) -- no ask rungs, no ask pad, "
-                "no full-unwind ask")
+                "no full-unwind ask -- until free cash reaches "
+                f"${SPORTS_LADDER_ASKS_ON_CASH:,.0f}"
+                if SPORTS_LADDER_ASKS_ON_CASH > 0 else
+                "sports ladders / escalators: YES BIDS ONLY (asks off, "
+                "IMM_SPORTS_LADDER_ASKS_OFF=1)")
         if NFL_FAIR_ENABLE:
             log(f"nfl prop gate: every NFL ladder / escalator fail-closed on "
                 f"nfl_prop_fair's player-history fair (band mu x"

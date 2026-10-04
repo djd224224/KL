@@ -87,6 +87,7 @@ imm.SERIES_BLOCK_PATTERNS = tuple(
 # AsksOff arms it.
 _LADDER_ASKS_OFF_CODE_DEFAULT = imm.SPORTS_LADDER_ASKS_OFF
 imm.SPORTS_LADDER_ASKS_OFF = False
+imm._LADDER_ASKS_STATE["on_at"] = None
 
 
 def setUpModule():
@@ -17975,6 +17976,8 @@ class TestSportsLadderAsksOff(unittest.TestCase):
         p = mock.patch.object(imm, "SPORTS_LADDER_ASKS_OFF", True)
         p.start()
         self.addCleanup(p.stop)
+        imm._LADDER_ASKS_STATE["on_at"] = None
+        self.addCleanup(lambda: imm._LADDER_ASKS_STATE.update(on_at=None))
         overrides = dict(imm.SERIES_OVERRIDES)
         self.addCleanup(lambda: (imm.SERIES_OVERRIDES.clear(),
                                  imm.SERIES_OVERRIDES.update(overrides)))
@@ -18047,6 +18050,70 @@ class TestSportsLadderAsksOff(unittest.TestCase):
         bot.client.positions[self.T] = 300
         bot.run_cycle()
         self.assertFalse(any(sd == "ask" for sd, _pad in self._sides(bot)))
+
+
+class TestLadderAsksCashLatch(unittest.TestCase):
+    """Jack 2026-10-04: "once cash is over $4k, turn on the full
+    ladder/escalator again" -- the first balance read with free cash at or
+    over SPORTS_LADDER_ASKS_ON_CASH turns the bids-only family's asks back
+    on: one-way, persisted, logged and alerted."""
+
+    S = "KXNFLESCALATORREC"
+
+    def setUp(self):
+        _clean_persist()
+        self.addCleanup(_clean_persist)
+        p = mock.patch.object(imm, "SPORTS_LADDER_ASKS_OFF", True)
+        p.start()
+        self.addCleanup(p.stop)
+        imm._LADDER_ASKS_STATE["on_at"] = None
+        self.addCleanup(lambda: imm._LADDER_ASKS_STATE.update(on_at=None))
+
+    def test_latch(self):
+        self.assertEqual(imm.SPORTS_LADDER_ASKS_ON_CASH, 4000.0)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = datetime.now(timezone.utc)
+        self.assertTrue(imm.series_bid_only(self.S))          # bids only
+        bot.client.get_balance = lambda: _bal(3999.0, 20000.0)
+        bot._check_balance_floor(now)
+        self.assertTrue(imm.series_bid_only(self.S))          # $1 short
+        self.assertEqual(bot.state.ladder_asks_on_at, 0.0)
+        bot.client.get_balance = lambda: _bal(4000.0, 20000.0)
+        bot._check_balance_floor(now)
+        self.assertFalse(imm.series_bid_only(self.S))         # asks back on
+        self.assertAlmostEqual(bot.state.ladder_asks_on_at, now.timestamp())
+        msgs = [m for c, m in bot.alerter.today if c == "ladder_asks_on"]
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("ASKS BACK ON", msgs[0])
+        self.assertIn("$4,000", msgs[0])
+        # one-way: a dip does not turn them off, nor alert again
+        bot.client.get_balance = lambda: _bal(150.0, 20000.0)
+        bot._check_balance_floor(now)
+        self.assertFalse(imm.series_bid_only(self.S))
+        self.assertEqual(len([1 for c, _m in bot.alerter.today
+                              if c == "ladder_asks_on"]), 1)
+        # the quake family stays bid-only whatever the latch says
+        with mock.patch.object(imm, "QUAKE_ENABLE", True):
+            self.assertTrue(imm.series_bid_only(next(iter(imm.QUAKE_SERIES))))
+
+    def test_persists_across_a_restart(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.get_balance = lambda: _bal(5200.0, 20000.0)
+        bot._check_balance_floor(datetime.now(timezone.utc))
+        self.assertFalse(imm.series_bid_only(self.S))
+        imm._LADDER_ASKS_STATE["on_at"] = None              # a new process
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertGreater(bot2.state.ladder_asks_on_at, 0.0)
+        self.assertFalse(imm.series_bid_only(self.S))
+
+    def test_knob_zero_keeps_bids_only(self):
+        with mock.patch.object(imm, "SPORTS_LADDER_ASKS_ON_CASH", 0.0):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.client.get_balance = lambda: _bal(9000.0, 20000.0)
+            bot._check_balance_floor(datetime.now(timezone.utc))
+            self.assertTrue(imm.series_bid_only(self.S))     # never fires
+            imm._LADDER_ASKS_STATE["on_at"] = 1.0           # an old latch
+            self.assertTrue(imm.series_bid_only(self.S))     # ...is ignored
 
 
 class TestGuardSkipSink(unittest.TestCase):
