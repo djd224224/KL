@@ -3420,10 +3420,25 @@ SPORTS_LADDER_LEAGUE_RE = re.compile("^" + _SPORTS_LADDER_PATTERN + "$")
 # adjustment, the news hold, only-what-earns, the x5 size -- stays in code,
 # so turning it back on is IMM_SPORTS_LADDER_BLOCK=0 (launcher, then
 # restart_imm.ps1 -Task) or this default.
-SPORTS_LADDER_BLOCK = os.environ.get("IMM_SPORTS_LADDER_BLOCK", "1") == "1"
+# REVISED the same hour (Jack: "actually turn off the ASK sides only, bid
+# sides can stay on"): the full block's default is now 0 and the family
+# quotes YES BIDS ONLY (SPORTS_LADDER_ASKS_OFF, below). The block stays a
+# one-line switch.
+SPORTS_LADDER_BLOCK = os.environ.get("IMM_SPORTS_LADDER_BLOCK", "0") == "1"
 _SPORTS_LADDER_BLOCK_RE = re.compile(_SPORTS_LADDER_PATTERN)
 if SPORTS_LADDER_BLOCK:
     SERIES_BLOCK_PATTERNS = SERIES_BLOCK_PATTERNS + (_SPORTS_LADDER_BLOCK_RE,)
+# LADDER / ESCALATOR ASKS OFF (Jack 2026-10-04: "actually turn off the ASK
+# sides only, bid sides can stay on"). The family joins series_bid_only --
+# the bid-only machinery the quake family runs on: no ask rungs (lv_ask
+# empty, so no full-unwind ask either: a long rides), no ask pad, the
+# two-sided depth test never counts an ask pad, and the estimator projects
+# the bid side alone (side_size_mults zeroes asks). An ask on a cheap
+# contract is the expensive side -- selling YES at 5c locks 95c of cash a
+# contract -- and 42k of the day's 52k cash-bound rejects were asks. The
+# quake gate's own logic keys on quake_gated, not on bid-only. Kill:
+# IMM_SPORTS_LADDER_ASKS_OFF=0.
+SPORTS_LADDER_ASKS_OFF = os.environ.get("IMM_SPORTS_LADDER_ASKS_OFF", "1") == "1"
 # ESPN scoreboard path per league prefix. site.web.api.espn.com: the
 # site.api host started answering 403 "Access Denied" to the browser UA in
 # 2026-09 (measured 2026-09-24 for nfl / wnba / cfb alike), this host serves
@@ -8269,10 +8284,17 @@ for _s in QUAKE_SERIES:
         size_mult=QUAKE_SIZE_MULT)
 
 
-def series_bid_only(series: str) -> bool:
-    """A family quoted with YES bids only (the quake gate): no ask rungs, no
-    ask pad, and the two-sided depth test never counts an ask pad."""
+def quake_gated(series: str) -> bool:
+    """A series run through the USGS quake gate (QUAKE_ENABLE)."""
     return QUAKE_ENABLE and series in QUAKE_SERIES
+
+
+def series_bid_only(series: str) -> bool:
+    """A family quoted with YES bids only: no ask rungs, no ask pad, and the
+    two-sided depth test never counts an ask pad. The quake gate's family,
+    and the sports ladders / escalators while SPORTS_LADDER_ASKS_OFF."""
+    return quake_gated(series) or (
+        SPORTS_LADDER_ASKS_OFF and sports_ladder_league(series) is not None)
 
 
 def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
@@ -15199,7 +15221,7 @@ class IncentiveMarketMaker:
                 out += build_side_ladder(meta.ticker, "ask", ea, eb,
                                          sma, levels=lva, ref_px=rpa,
                                          band=band, hour_mult=hm)
-            if series_bid_only(meta.series):
+            if quake_gated(meta.series):
                 # quake gate: the bids the loop will rest, capped at fair
                 _qcap = quake_probe_cap(meta.ticker, _now.timestamp(),
                                         meta.close_time)
@@ -16873,7 +16895,7 @@ class IncentiveMarketMaker:
             # fresh quake detection awaits NEIC; otherwise the bid ladder
             # below is capped at the fair cap.
             quake_cap: Optional[int] = None
-            if series_bid_only(meta.series):
+            if quake_gated(meta.series):
                 qk = quake_past_cutoff(quake_gate(t, now_ts, meta.close_time),
                                        meta.cutoff, now_utc)
                 if qk["action"] == "stand":
@@ -18072,7 +18094,7 @@ class IncentiveMarketMaker:
             return False
         if (series_event_depth_gated(meta.series)
                 or series_fast_lane(meta.series)
-                or series_bid_only(meta.series)):
+                or quake_gated(meta.series)):
             return False
         if meta.event_ticker in self.state.event_depth_halt \
                 or meta.event_ticker in self.state.event_live_halt:
@@ -18972,6 +18994,10 @@ class IncentiveMarketMaker:
         if SPORTS_LADDER_BLOCK:
             log("sports ladders / escalators: OFF (pattern-blocked, "
                 "IMM_SPORTS_LADDER_BLOCK=1) -- no orders, positions ride")
+        elif SPORTS_LADDER_ASKS_OFF:
+            log("sports ladders / escalators: YES BIDS ONLY (asks off, "
+                "IMM_SPORTS_LADDER_ASKS_OFF=1) -- no ask rungs, no ask pad, "
+                "no full-unwind ask")
         if NFL_FAIR_ENABLE:
             log(f"nfl prop gate: every NFL ladder / escalator fail-closed on "
                 f"nfl_prop_fair's player-history fair (band mu x"

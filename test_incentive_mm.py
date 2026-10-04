@@ -82,6 +82,11 @@ imm.NFL_FAIR_ENABLE = False
 _LADDER_BLOCK_CODE_DEFAULT = imm.SPORTS_LADDER_BLOCK
 imm.SERIES_BLOCK_PATTERNS = tuple(
     p for p in imm.SERIES_BLOCK_PATTERNS if p is not imm._SPORTS_LADDER_BLOCK_RE)
+# ...revised the same hour to YES BIDS ONLY (SPORTS_LADDER_ASKS_OFF): the
+# fixtures quote both sides, so the suite turns it off; TestSportsLadder
+# AsksOff arms it.
+_LADDER_ASKS_OFF_CODE_DEFAULT = imm.SPORTS_LADDER_ASKS_OFF
+imm.SPORTS_LADDER_ASKS_OFF = False
 
 
 def setUpModule():
@@ -17868,8 +17873,10 @@ class TestSportsLadderBlock(unittest.TestCase):
                "KXNFLFFPTSLADDER-26OCT05ATLNO-NOCOLAVE12",
                "KXNBALADDERPTS-26OCT21BOSNYK-BOSJTATUM25")
 
-    def test_off_by_default(self):
-        self.assertTrue(_LADDER_BLOCK_CODE_DEFAULT)
+    def test_block_switch(self):
+        # revised the same hour to bids only: the full block is a switch,
+        # off by default (TestSportsLadderAsksOff covers the default)
+        self.assertFalse(_LADDER_BLOCK_CODE_DEFAULT)
         saved = imm.ALLOWLIST_ONLY
         imm.ALLOWLIST_ONLY = True
         try:
@@ -17890,6 +17897,95 @@ class TestSportsLadderBlock(unittest.TestCase):
                 self.assertTrue(IncentiveMarketMaker._allowed(t), t)
         finally:
             imm.ALLOWLIST_ONLY = saved
+
+
+class TestSportsLadderAsksOff(unittest.TestCase):
+    """Jack 2026-10-04: "actually turn off the ASK sides only, bid sides can
+    stay on" -- the ladder / escalator family is YES-bids-only by default:
+    no ask rungs, no ask pad, no full-unwind ask; the quake gate's own logic
+    keys on quake_gated, not on bid-only."""
+
+    T = "KXNFLLADDERREC-67OCT05ATLNO-ATLBROBINSON7"
+    EV = "KXNFLLADDERREC-67OCT05ATLNO"
+    KICKOFF = datetime(2067, 10, 6, 0, 15, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        p = mock.patch.object(imm, "SPORTS_LADDER_ASKS_OFF", True)
+        p.start()
+        self.addCleanup(p.stop)
+        overrides = dict(imm.SERIES_OVERRIDES)
+        self.addCleanup(lambda: (imm.SERIES_OVERRIDES.clear(),
+                                 imm.SERIES_OVERRIDES.update(overrides)))
+        saved = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        self.addCleanup(lambda: setattr(imm, "SERIES_HOUR_MULTS", saved))
+
+    def test_default_and_scope(self):
+        self.assertTrue(_LADDER_ASKS_OFF_CODE_DEFAULT)
+        for s_ in ("KXNFLLADDERREC", "KXNFLESCALATORRECYDS", "KXNFLFFPTSLADDER",
+                   "KXNBALADDERPTS"):
+            self.assertTrue(imm.series_bid_only(s_), s_)
+            self.assertFalse(imm.quake_gated(s_), s_)
+        for s_ in ("KXNFLGAME", "KXTRUMPAPPROVE", "KXGOOD"):
+            self.assertFalse(imm.series_bid_only(s_), s_)
+        self.assertEqual(imm.side_size_mults(self.T, utc(2026, 10, 4, 15))[1], 0.0)
+        with mock.patch.object(imm, "SPORTS_LADDER_ASKS_OFF", False):
+            self.assertFalse(imm.series_bid_only("KXNFLLADDERREC"))
+
+    def _bot(self, positions=None):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": "2067-10-08T00:15:00Z",
+            "yes_bid_dollars": "0.2400", "yes_ask_dollars": "0.2500",
+            "volume_fp": "500.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.2200", "400"], ["0.2300", "400"], ["0.2400", "400"]],
+            "no_dollars": [["0.7300", "400"], ["0.7400", "400"], ["0.7500", "400"]]}}
+        if positions:
+            client.positions.update(positions)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        kick = {"events": [{
+            "date": self.KICKOFF.strftime("%Y-%m-%dT%H:%MZ"),
+            "shortName": "ATL @ NO",
+            "status": {"type": {"name": "STATUS_SCHEDULED"}},
+            "competitions": [{"competitors": [
+                {"team": {"abbreviation": "NO", "location": "New Orleans"},
+                 "homeAway": "home"},
+                {"team": {"abbreviation": "ATL", "location": "Atlanta"},
+                 "homeAway": "away"}]}]}]}
+        bot.resolver = imm.EventStartResolver(http_get_json=lambda url: kick)
+        return bot
+
+    def _sides(self, bot):
+        return {(o["book_side"], o["yes_price"] in (imm.PAD_BID_CENTS, imm.PAD_ASK_CENTS))
+                for o in bot.state.sim_orders.values() if o["ticker"] == self.T}
+
+    def test_quotes_bids_only(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        sides = self._sides(bot)
+        self.assertIn(("bid", False), sides)                 # bid rungs rest
+        self.assertFalse(any(sd == "ask" for sd, _pad in sides))  # no ask, no ask pad
+        # the estimator saw the bid side alone, and it still earns
+        self.assertGreater(bot.state.selected[self.T].est_dollars_per_day, 0.0)
+
+    def test_a_long_position_gets_no_unwind_ask(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        bot.pnl.pos[self.T] = 300.0                          # long 300
+        bot.client.positions[self.T] = 300
+        bot.run_cycle()
+        self.assertFalse(any(sd == "ask" for sd, _pad in self._sides(bot)))
 
 
 class TestGuardSkipSink(unittest.TestCase):

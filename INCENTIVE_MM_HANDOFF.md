@@ -7201,3 +7201,28 @@ Tests: TestSportsLadderBlock (the default blocks every ladder / escalator
 series, NFL and NBA, and nothing else; with the pattern out they are allowed
 again); the suite takes the pattern out at import so the family's fixtures
 still run. 1,997 green.
+
+### 2026-10-04 — Revised: ladders / escalators quote YES BIDS ONLY instead (Jack)
+
+Jack, before the full block had loaded (the bot was waiting for its :50
+safe window): "actually turn off the ASK sides only, bid sides can stay on".
+
+CHANGE. SPORTS_LADDER_BLOCK's default is now 0 (the switch stays).
+SPORTS_LADDER_ASKS_OFF (IMM_SPORTS_LADDER_ASKS_OFF, default 1) puts every
+ladder / escalator series into series_bid_only -- the quake family's
+bid-only machinery: lv_ask empty in the quote loop (so no full-unwind ask
+either: a long position rides, a short is still reduced by bids), no ask
+pad, the two-sided depth test never counts an ask pad, side_size_mults
+zeroes asks so the estimator projects the bid side alone. The quake gate's
+own branches (the quote-loop gate, the probe's fair cap, the restart-order
+exclusion) now key on quake_gated(), so the ladders run none of the quake
+logic. Startup logs "sports ladders / escalators: YES BIDS ONLY".
+
+WHY ASKS: on a cheap contract the ask is the expensive side -- selling YES
+at 5c locks 95c of cash a contract against 5c for a 5c bid -- and 42k of
+the day's 52k cash-bound rejects were asks.
+
+Tests: TestSportsLadderAsksOff (default and scope, bids only end to end with
+no ask pad, a long gets no unwind ask), TestSportsLadderBlock.
+test_block_switch; the suite turns the ask-off default off at import for
+the two-sided fixtures. 2,000 green.
