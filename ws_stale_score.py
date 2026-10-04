@@ -340,12 +340,34 @@ def _mid_after(rows: List[tuple], tss: List[float], t: float) -> Optional[float]
     return None
 
 
+_SIDE = {("yes", "buy"): "bid", ("no", "buy"): "ask",
+         ("yes", "sell"): "ask", ("no", "sell"): "bid"}
+
+
+def our_side(f: dict) -> Optional[str]:
+    """Our book side for a fill: the row's own ledger join, else Kalshi's
+    side / action. 29-47% of fills_*.jsonl rows a day carry no ledger join
+    (9/6-10/4) -- the order had left the ledger, filled out, before the
+    fill was logged -- and the side / action map agrees with the join on
+    every row that has both."""
+    s = f.get("our_book_side")
+    return s if s else _SIDE.get((f.get("side"), f.get("action")))
+
+
+def is_full(f: dict) -> bool:
+    """Did the fill take all that was left of our order? A row without the
+    ledger join counts as full: its order had already left the ledger (on
+    10/4, 85% of them show no later amend, cancel or fill)."""
+    rb = f.get("our_remaining_before")
+    return True if rb is None else float(rb) <= float(f.get("count") or 0) + 1e-9
+
+
 def _fill_pnl(f: dict, mid: Optional[float]) -> Optional[float]:
     """$ mark-out of one of our fills against a later mid."""
     if mid is None:
         return None
     px, n = float(f.get("yes_price_cents") or 0), float(f.get("count") or 0)
-    sign = 1.0 if f.get("our_book_side") == "bid" else -1.0
+    sign = 1.0 if our_side(f) == "bid" else -1.0
     return sign * (mid - px) * n / 100.0
 
 

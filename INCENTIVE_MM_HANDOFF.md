@@ -7547,13 +7547,22 @@ IMM_WS_FAST=1 are still not enabled.
 ## 2026-10-04 (evening) — in-cycle stale check, event sweep breaker (dry), cycle timing (Jack: "Build these 3")
 
 CONTEXT. First live hour of the episode log: 99 stale rungs flagged, and 1 hit
-before the cycle fixed it itself (median 73s). That hit was a winner. Over the
-4 days to 10/4, full-rung fills lost $141-450/day at 5 min. Most of that was on
-quotes LEVEL with the touch at the bot's last read (-$215/day at 5m: sweeps,
-which no cancel speed fixes). Quotes already AHEAD of the touch cost -$19/day
-at 5m and -$80 at 30m; that is the part a fast cancel can reach. The check
-only ran in the ~10s idle of each 2-4 min cycle. Three builds followed.
-Nothing here changes trading.
+before the cycle fixed it itself (median 73s). That hit was a winner.
+
+CORRECTED the same evening: 29-47% of fills_*.jsonl rows a day carry no ledger
+join. Their order had left the ledger, filled out, before the fill was logged
+(spun off as its own fix). The first pass read those rows as asks.
+ws_stale_score.our_side / is_full now take Kalshi's side/action (exact on
+every joined row) and count an unjoined row as full-rung. With that:
+- Over the 4 days to 10/4, fills lost $246-830/day at 5 min (not $141-436).
+- Full-rung fills on quotes LEVEL with the touch at the bot's last read lost
+  -$266/day at 5m. These are sweeps, which no cancel speed fixes.
+- Quotes already AHEAD of the touch lost -$121/day at 5m and -$200 at 30m
+  (not -$19 / -$80). That is the part a fast cancel can reach. Those fills
+  came a median 64s after the read.
+
+The check only ran in the ~10s idle of each 2-4 min cycle. Three builds
+followed. Nothing here changes trading.
 
 1. WS BOOKS ON: READY, NOT FLIPPED. book_depth timing (17:52-18:45Z): a plain
    cycle spends ~60s of its ~137s median period reading ~1,025 books over
@@ -7579,14 +7588,17 @@ Nothing here changes trading.
      (WS_FAST_MAX_CANCELS_PER_MIN; the cycle's diff pulls any it skips), and
      `desired` drops the event's quotes until the hold ends (sweep_held(),
      next to the toxic-halt filter).
-   - Backtest (fills 9/6-10/4, 10,741 maker fills, 2s reaction, net of the
-     event's modelled reward for the hold; per day, 5m / 30m mark-outs):
-     30s +$9/+$10, 2 min +$12/+$18, 5 min +$13/+$26, 10 min +$13/+$25.
-     At 5 min: ~206 trips a day, avoiding ~36% of the book's adverse
-     selection for ~$9 of reward.
-   - Variants: one side only nets ~half. An order-group-style trigger (>= 20
-     contracts in 15s) nets about the same. A 0s exchange-side reaction adds
-     nothing over 2s, so Kalshi order groups aren't needed for this.
+   - Backtest, corrected sides (fills 9/6-10/4, 10,761 maker fills marking out
+     -$116/day at 5m and -$171 at 30m; 2s reaction; net of the event's
+     modelled reward for the hold; per day, 5m / 30m mark-outs):
+     30s +$12/+$16, 2 min +$21/+$31, 5 min +$25/+$41, 10 min +$26/+$42.
+     At 5 min: ~206 trips a day, avoiding ~29% of the book's adverse
+     selection for ~$9 of reward. On 10/3-10/4 alone (-$635/day at 5m):
+     +$42 / +$85.
+   - Variants: one side only nets ~80% of the event. An order-group-style
+     trigger (>= 20 contracts in 15s) nets about the same. A 0s
+     exchange-side reaction adds nothing over 2s, so Kalshi order groups
+     aren't needed for this.
    - The reward cost uses the event's day-average rate, which runs low while
      the event is active; double it and 30m is still +$17/day.
    - Script: imm_sweep_backtest.py.
@@ -7615,6 +7627,10 @@ Nothing here changes trading.
      of it fails soft, so the next cycle re-places.
    - Episodes carry phase "cycle" / "idle". ws_stale_score.py splits them,
      and also scores the sweep trips.
+   - RECHECK (same evening): each view rebuild sets _ws_recheck_all, so the
+     next check covers every market, not only the books that changed. Without
+     it, a quote ahead from its placement on a book that then went quiet was
+     never examined.
 
 WATCH.
 - Startup lines: "WS stale-quote check (2026-10-04): between cycles AND

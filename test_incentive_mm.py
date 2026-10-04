@@ -20969,6 +20969,19 @@ class TestWSInCycleCheck(unittest.TestCase):
         self.assertEqual(self.cancelled, [("o1", "ws_stale")])
         self.assertTrue(self.bot._ws_wake)
 
+    def test_a_rebuilt_view_is_checked_whole_even_on_quiet_books(self):
+        # ahead from its placement, on a book that never changes again: the
+        # dirty set never names it, the post-rebuild recheck does
+        self.bot._build_resting_view([{
+            "order_id": "o1", "ticker": self.T, "book_side": "bid",
+            "yes_price": 49, "remaining_count": 20}], self.now)
+        self.assertTrue(self.bot._ws_recheck_all)
+        for dt in (0.0, 1.5):
+            self.feed.dirty = set()                       # a quiet book
+            self.bot._ws_process_events(self.now + dt)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+        self.assertFalse(self.bot._ws_recheck_all)
+
     def test_the_tick_is_throttled_and_never_reenters(self):
         calls = []
         self.bot._ws_process_events = lambda now_ts, in_cycle=False: \

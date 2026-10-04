@@ -2802,7 +2802,9 @@ def _ws_top(levels: Dict[float, float], n: int = 60) -> List[List[float]]:
 # each 2-4 min cycle, so a rung that went stale mid-cycle waited for the idle.
 # That is where the reachable loss is: over the 4 days to 10/4, full-rung
 # fills on quotes already ahead of the touch at the bot's last read came a
-# median 71s after it and lost $19/day at 5m, $80 at 30m. With this on, the
+# median 64s after it and lost $121/day at 5m, $200 at 30m. Those fills sit on
+# a book that may not move again, so after each view rebuild the next check
+# covers every market, not only the books that changed. With this on, the
 # check also runs INSIDE the cycle, at most every WS_TICK_SECS, from the book
 # reads and the write loops. An order this cycle has already amended or
 # cancelled is skipped: its view entry is stale until the cycle ends.
@@ -2822,17 +2824,19 @@ WS_TICK_SECS = max(0.2, _env_float("IMM_WS_TICK_SECS", 1.0))
 # WS_CHECK_IN_CYCLE) inside them. The toxic event halt, by contrast, waits
 # for pick-offs confirmed 5 min later on 2 markets.
 #
-# Backtest on every maker fill 9/6-10/4: 10,741 fills; the book marked out
-# -$59/day at 5m and -$100 at 30m. With a 2s reaction, net of the event's
-# modelled reward for the hold, per day (5m / 30m mark-outs):
-#   hold 30s     +$9 / +$10
-#   hold 2 min  +$12 / +$18
-#   hold 5 min  +$13 / +$26  (~206 trips/day; avoids ~36% of the book's
+# Backtest on every maker fill 9/6-10/4: 10,761 fills; the book marked out
+# -$116/day at 5m and -$171 at 30m. Our side comes from Kalshi's side/action
+# where a fill row lacks its ledger join, as ~40% do. With a 2s reaction, net
+# of the event's modelled reward for the hold, per day (5m / 30m mark-outs):
+#   hold 30s    +$12 / +$16
+#   hold 2 min  +$21 / +$31
+#   hold 5 min  +$25 / +$41  (~206 trips/day; avoids ~29% of the book's
 #                             adverse selection for ~$9 of reward)
-#   hold 10 min +$13 / +$25
-# Pulling one side only nets about half. An order-group-style trigger (>= 20
-# contracts in 15s) nets about the same. Reacting at once (0s, exchange-
-# side) adds nothing over 2s.
+#   hold 10 min +$26 / +$42
+# On 10/3-10/4 alone (-$635/day at 5m) the 5-min hold nets +$42 / +$85.
+# Pulling one side only nets ~80% of the event. An order-group-style trigger
+# (>= 20 contracts in 15s) nets about the same. Reacting at once (0s,
+# exchange-side) adds nothing over 2s.
 #    IMM_SWEEP_BREAKER=dry -- THE DEFAULT. Each trip is logged and counted
 #                   (ws_sweep_<date>.jsonl: the fill, and the event's resting
 #                   orders it would pull); nothing is cancelled.
@@ -12180,6 +12184,8 @@ class IncentiveMarketMaker:
         # a guard against a tick re-entering itself through a cancel
         self._ws_tick_last = 0.0
         self._ws_ticking = False
+        # set by each view rebuild: the next stale check covers every market
+        self._ws_recheck_all = False
         # cycle timing for latency.cycle: per full cycle (start, last managed
         # book read, end) -- what IMM_WS=on would shorten
         self._cycle_last_read = 0.0
@@ -13725,8 +13731,12 @@ class IncentiveMarketMaker:
                 if fast and not in_cycle:
                     self._ws_wake = True
         if (fast or fast_dry) and (not in_cycle or WS_CHECK_IN_CYCLE):
-            if dropped:
+            if dropped or self._ws_recheck_all:
+                # a fresh view: every market once, not just the books that
+                # changed -- an order can be ahead from its placement on a
+                # book that then goes quiet
                 dirty = set(dirty) | set(self._resting_view)
+                self._ws_recheck_all = False
             self._ws_fast_check(set(dirty), now_ts, dry=fast_dry,
                                 in_cycle=in_cycle)
 
@@ -14060,6 +14070,7 @@ class IncentiveMarketMaker:
                 px, float(led.get("remaining_count") or 0.0),
                 float(led.get("_placed_at") or now_ts))
         self._resting_view = view
+        self._ws_recheck_all = True        # the next check looks at all of it
         # an order the cycle amended keeps no first-seen-ahead time from its
         # old price: the two looks start over at the new one
         self._ws_suspect = {k: v for k, v in self._ws_suspect.items()

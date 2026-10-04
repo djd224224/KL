@@ -135,7 +135,7 @@ for day in days(START, END):
     for r in raw:
         px = float(r["yes_price_cents"])
         n = float(r["count"])
-        sgn = 1.0 if r.get("our_book_side") == "bid" else -1.0
+        sgn = 1.0 if wss.our_side(r) == "bid" else -1.0
         pnl = {}
         for h in (300, 1800):
             m = mid_after(mids.get(r["ticker"]), float(r["ts"]) + h)
@@ -143,8 +143,8 @@ for day in days(START, END):
         fills.append({
             "day": day, "ts": float(r["ts"]), "ticker": r["ticker"],
             "event": r.get("event_ticker") or event_of(r["ticker"]),
-            "side": r.get("our_book_side"), "n": n,
-            "full": float(r.get("our_remaining_before") or 0) <= n + 1e-9,
+            "side": wss.our_side(r), "n": n,
+            "full": wss.is_full(r),
             "pnl": pnl})
     print(f"{day}: {len(raw)} fills, {ncyc} cycles", file=sys.stderr)
 

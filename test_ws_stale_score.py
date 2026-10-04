@@ -188,6 +188,18 @@ class TestScore(unittest.TestCase):
                                places=15)
         self.assertIsNone(wss.reward_rate(thin, None, 0.5, 86.4))
 
+    def test_a_fill_without_the_ledger_join_takes_kalshis_side(self):
+        bare = {"side": "yes", "action": "buy", "count": 10,
+                "yes_price_cents": 49.0}           # our bid, no join
+        self.assertEqual((wss.our_side(bare), wss.is_full(bare)), ("bid", True))
+        self.assertAlmostEqual(wss._fill_pnl(bare, 45.0), -0.40)
+        sold = {"side": "no", "action": "buy", "count": 10, "yes_price_cents": 49.0}
+        self.assertEqual(wss.our_side(sold), "ask")
+        self.assertAlmostEqual(wss._fill_pnl(sold, 45.0), 0.40)
+        joined = {"our_book_side": "ask", "side": "yes", "action": "buy",
+                  "our_remaining_before": 30, "count": 10}
+        self.assertEqual((wss.our_side(joined), wss.is_full(joined)), ("ask", False))
+
     def test_own_cents_floor_like_the_book(self):
         self.assertEqual([wss._own_cents("bid", 4.29), wss._own_cents("ask", 4.29),
                           wss._own_cents("bid", 49.0), wss._own_cents("ask", 53.0)],
