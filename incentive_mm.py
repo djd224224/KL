@@ -9039,14 +9039,15 @@ NFL_FAIR_TTL_MIN = _env_int("IMM_NFL_FAIR_TTL_MIN", 30)
 NFL_ROSTER_TTL_MIN = _env_int("IMM_NFL_ROSTER_TTL_MIN", 45)
 NFL_FAIR_REFRESH_SECS = _env_int("IMM_NFL_FAIR_REFRESH_SECS", 120)
 # NEWS HOLD (Jack 2026-10-04: "build the teammate adjustment and news
-# hold"): every prop of a team stands aside for this long after a QB / WR /
+# hold"; "stand aside for 30min, not an hour"): every prop of a team stands
+# aside for this long after a QB / WR /
 # TE / RB on it is designated, re-designated or cleared (ESPN's designation
 # time, or the refresher seeing the status change) -- the book reprices on
 # the news and a quote left at the old touch is what gets picked off.
 # nfl_prop_fair also moves the teammates' means for the absence itself
 # (TEAMMATE_ALPHA), so once the hold lapses the band is centred on it.
 # 0 = off.
-NFL_NEWS_HOLD_MIN = _env_int("IMM_NFL_NEWS_HOLD_MIN", 60)
+NFL_NEWS_HOLD_MIN = _env_int("IMM_NFL_NEWS_HOLD_MIN", 30)
 NFL_STATUS_FILE = os.environ.get(
     "IMM_NFL_STATUS_FILE", os.path.join(STATUS_DIR, "nfl_prop_fair.json"))
 # the refresher's latest snapshot (nfl_prop_fair.build_snapshot)
@@ -9130,46 +9131,69 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # (the NFL props' designated makers rest 5k-1M contracts there) the program's
 # scoring walk -- the first target_size contracts from the best price -- never
 # reaches it, so it earns nothing and fills only when the book moves through
-# it: all adverse selection, no rent. After the caps, each side's rungs are
-# scored on the EXTERNAL book (our resting orders netted out, the side's
-# rungs and pads overlaid) by the program's own walk (_side_share); a side
-# whose rungs would score zero is dropped, and with neither side earning
-# nothing rests at all (pads included -- they exist to qualify the snapshot
-# for our rungs). On the 10/4 slate: Downs' receptions escalator (15 / 17,
-# bid capped at 14 behind ~5,500 at 15) rests only its 16.99 ask; the RB
-# receiving-yards escalators' 1c capped bids behind the makers' 2c go.
+# it: all adverse selection, no rent. After the caps, each side is judged on
+# the EXTERNAL book (our resting orders netted out, our rungs and pads
+# overlaid): a rung earns iff the side qualifies (its depth reaches the
+# target, or the snapshot pays nobody) and the depth STRICTLY in front of the
+# rung is under the target -- exactly when the walk reaches its level (any
+# level the walk reaches carries a positive weight; _side_share). A side
+# with no earning rung is dropped; with neither side earning nothing rests
+# at all (pads included -- they exist to qualify the snapshot for our rungs).
+# TO THE CENT AND BELOW: the quote loop passes the sub-penny books' EXACT
+# levels (orderbook_exact_levels) and our orders' exact prices, because the
+# walk runs over exact levels -- a rung capped at 14.00 behind a maker at
+# 14.60 is outside a walk that ends at 14.60, though both sit in the 14c
+# bucket. Whole-cent books (and the estimator's probe) pass whole cents.
+# On the 10/4 slate: Tuten's receptions ladder (9 / 11, bid capped at 8
+# behind the 9c pile) and Dobbins' receiving-yards escalator (a 1c bid behind
+# the 2c pile) rest only their asks.
 def drop_unearning_sides(quotes: List["Quote"], yes_levels: List[List[float]],
                          no_levels: List[List[float]],
-                         own_in_book: List[Tuple[str, int, float]],
-                         target: float, df: float) -> List["Quote"]:
+                         own_in_book: List[Tuple[str, float, float]],
+                         target: float, df: float = 0.5) -> List["Quote"]:
     """The quotes minus every side whose non-pad rungs would earn no reward
-    share (see above); [] when neither side earns."""
+    share (see above); [] when neither side earns. yes_levels / no_levels:
+    [price in cents, size] (whole cents or exact); own_in_book: (book side,
+    YES price in cents, size) of our resting orders inside those levels.
+    Prices are compared to 1/100 of a cent. `df` is unused: the decay sets
+    how much a reached rung earns, never whether it earns."""
     if not quotes:
         return quotes
-    ext = {"bid": {int(px): float(q) for px, q in yes_levels},
-           "ask": {int(px): float(q) for px, q in no_levels}}
-    for side, px, q in own_in_book:
-        lv = ext["bid" if side == "bid" else "ask"]
-        k = int(px) if side == "bid" else 100 - int(px)
-        lv[k] = max(0.0, lv.get(k, 0.0) - float(q))
-    earns = {}
+
+    def key(side: str, yes_px: float) -> float:
+        # the walk's own price axis: a YES bid as is, an ask as its NO bid
+        return round(yes_px if side == "bid" else 100.0 - yes_px, 2)
+
+    ext: Dict[str, Dict[float, float]] = {"bid": {}, "ask": {}}
+    for side, levels in (("bid", yes_levels), ("ask", no_levels)):
+        for px, q in levels:
+            k = round(float(px), 2)
+            ext[side][k] = ext[side].get(k, 0.0) + float(q)
+    for side, yes_px, q in own_in_book:
+        s_ = "bid" if side == "bid" else "ask"
+        k = key(s_, float(yes_px))
+        ext[s_][k] = max(0.0, ext[s_].get(k, 0.0) - float(q))
+    earns: Dict[str, Optional[bool]] = {}
     for side in ("bid", "ask"):
-        rungs: Dict[int, float] = {}
         depth = dict(ext[side])
+        rungs: List[float] = []
         for q in quotes:
             if q.book_side != side:
                 continue
-            k = q.price_cents if side == "bid" else 100 - q.price_cents
+            px = q.price_exact if q.price_exact is not None else float(q.price_cents)
+            k = key(side, px)
             depth[k] = depth.get(k, 0.0) + float(q.count)
             if not q.is_pad:
-                rungs[k] = rungs.get(k, 0.0) + float(q.count)
+                rungs.append(k)
         if not rungs:
             earns[side] = None             # no rungs on this side to judge
             continue
-        levels = sorted(((px, n) for px, n in depth.items() if n > 0),
-                        key=lambda kv: -kv[0])
-        share, _qual = _side_share(levels, rungs, target, df)
-        earns[side] = share > 1e-9
+        if sum(depth.values()) < target:
+            earns[side] = False            # the side cannot qualify
+            continue
+        earns[side] = any(
+            sum(n for k2, n in depth.items() if k2 > k + 1e-9) < target
+            for k in rungs)
     if not any(earns.values()):
         return []                          # nothing earns: stand aside
     return [q for q in quotes
@@ -17083,8 +17107,17 @@ class IncentiveMarketMaker:
             if nfl_caps is not None:
                 mq = mort_cap_quotes(mq, *nfl_caps)
                 _n_before = {q.book_side for q in mq if not q.is_pad}
-                mq = drop_unearning_sides(mq, yes_levels, no_levels, own_in_book,
-                                          meta.target_size, meta.discount_factor)
+                if meta.price_step < 0.01:
+                    # the walk runs over exact levels (see drop_unearning_sides)
+                    _ey, _en = orderbook_exact_levels(ob)
+                    mq = drop_unearning_sides(
+                        mq, _ey, _en,
+                        own_exact_by_ticker.get(t, []) if self.live else [],
+                        meta.target_size, meta.discount_factor)
+                else:
+                    mq = drop_unearning_sides(mq, yes_levels, no_levels,
+                                              own_in_book, meta.target_size,
+                                              meta.discount_factor)
                 _dropped = _n_before - {q.book_side for q in mq if not q.is_pad}
                 if _dropped != self._nfl_unearning.get(t, set()):
                     if _dropped:

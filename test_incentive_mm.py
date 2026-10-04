@@ -17544,13 +17544,15 @@ class TestNflPropGate(unittest.TestCase):
         self.assertIsNone(r(b=10, a=17))
 
     def test_news_hold(self):
+        # Jack 2026-10-04: "stand aside for 30min, not an hour"
+        self.assertEqual(imm.NFL_NEWS_HOLD_MIN, 30)
         now = time.time()
         self._snap()
         e = imm._nfl_state["snap"]["markets"][self.T]
         e.update(news_at=now - 600, news="Keenan Allen WR Out")
         why, inputs, caps = imm.nfl_gate(self.T, now, 6, 7)
         self.assertEqual((inputs["reason"], caps), ("news_hold", None))
-        self.assertIn("Keenan Allen WR Out 10m ago", why)
+        self.assertIn("Keenan Allen WR Out 10m ago (hold 30m)", why)
         e["news_at"] = now + 120                       # a little ahead: holds
         self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[1]["reason"], "news_hold")
         e["news_at"] = now + 7200                      # far ahead: junk, ignored
@@ -17704,6 +17706,27 @@ class TestNflPropGate(unittest.TestCase):
         # a rung AT the deep touch shares it -- earns
         self.assertEqual(len(f([Q(T, "bid", 15, 200)], deep_yes, deep_no)), 1)
         self.assertEqual(f([], deep_yes, deep_no), [])
+        # TO THE CENT AND BELOW: a maker at 14.60 x 600 under 15.20 x 100;
+        # our bid capped at 14.00. Whole-cent buckets put both in "14" and
+        # call it earning; the exact walk (target 500) ends at 14.60
+        g = lambda qs, y, n, own=(): imm.drop_unearning_sides(
+            qs, y, n, list(own), 500.0)
+        ex_yes, ex_no = [[14.6, 600.0], [15.2, 100.0]], [[83.0, 5000.0]]
+        bucket_yes = [[14, 600.0], [15, 100.0]]
+        capped = [Q(T, "bid", 14, 200), Q(T, "ask", 17, 200)]
+        self.assertEqual(sorted(q.book_side for q in g(capped, bucket_yes, ex_no)),
+                         ["ask", "bid"])                 # the bucket view
+        self.assertEqual([q.book_side for q in g(capped, ex_yes, ex_no)],
+                         ["ask"])                        # the exact walk
+        # an exact-priced rung joining the maker at 14.60 earns again
+        joined = [Q(T, "bid", 14, 200, price_exact=14.6)]
+        self.assertEqual(len(g(joined, ex_yes, ex_no)), 1)
+        # our own resting order netted out at its exact price
+        out = g([Q(T, "bid", 14, 200, price_exact=14.6)],
+                [[14.6, 800.0], [15.2, 450.0]], ex_no, [("bid", 15.2, 400.0)])
+        self.assertEqual(len(out), 1)                    # 50 external in front
+        # a side whose whole book is under the target never qualifies
+        self.assertEqual(g([Q(T, "bid", 15, 100)], [[15.0, 100.0]], [[83.0, 50.0]]), [])
 
     def test_downs_book_rests_only_the_earning_side(self):
         # admitted on a shallow book (members stay selected), then the
