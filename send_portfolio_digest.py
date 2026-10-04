@@ -40,8 +40,9 @@ dollar deposited plus every dollar withdrawn since the account opened
 (fetch_transfers: /portfolio/deposits and /portfolio/withdrawals, read in
 full each morning), with the same after-rewards estimate. The day change
 leaves deposits and withdrawals out too: it is the day's change in total
-profit. The subject carries both: "portfolio 2026-10-04: profit +$18.2k
-(day +$1.6k, trading -$0.7k)".
+profit. The subject carries both, with the day's trading and reward
+credits: "portfolio 2026-10-05: profit +$18.1k (day +$1.1k: trading
+-$0.8k, rewards +$2.4k)".
 
 State lives in portfolio_daily\:
     pf_snapshot_YYYY-MM-DD.json  - per-event E components (diff baseline)
@@ -1187,8 +1188,8 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     trading = mv_tot["day"]
     parts = None                        # [(label, $)] summing to d_ek exactly
     transfers = None if first else pf.get("net_transfers")
+    ntc = None if first else pf.get("no_trade_cash")
     if not first:
-        ntc = pf.get("no_trade_cash")
         if ntc is None:                 # no replay (legacy prior snapshot)
             parts = [("trading (at mid)", trading),
                      ("credits, deposits & Kalshi's pricing vs mid",
@@ -1210,13 +1211,22 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     day_parts = [(k, v) for k, v in parts or [] if k != "deposits/withdrawals"]
 
     # Jack 2026-10-04: "shorten like this: portfolio 2026-10-04: profit
-    # +$18.2k (day +$1.6k, trading -$0.7K)"
+    # +$18.2k (day +$1.6k, trading -$0.7K)", then "yes add rewards to the
+    # subject": the split's reward credits, "portfolio 2026-10-05: profit
+    # +$18.1k (day +$1.1k: trading -$0.8k, rewards +$2.4k)". Kalshi's
+    # pricing vs mid and the perps are the rest of the day. With the
+    # transfers unread, the day and the credits may hold a deposit.
+    if first:
+        tail = "first baseline"
+    else:
+        tail = (f"day {_signed_k(d_day)}"
+                + ("" if transfers is not None else " incl. any deposits")
+                + f": trading {_signed_k(trading)}")
+        if ntc is not None:
+            tail += (", rewards" + ("" if transfers is not None else " & deposits")
+                     + f" {_signed_k(ntc - (transfers or 0.0))}")
     subject = (f"portfolio {today}: profit "
-               + ("n/a" if profit is None else _signed_k(profit))
-               + (" (first baseline)" if first else
-                  f" (day {_signed_k(d_day)}"
-                  + ("" if transfers is not None else " incl. any deposits")
-                  + f", trading {_signed_k(trading)})"))
+               + ("n/a" if profit is None else _signed_k(profit)) + f" ({tail})")
     if imm and imm.get("subject_flag"):
         subject += imm["subject_flag"]
 

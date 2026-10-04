@@ -172,7 +172,7 @@ class BuildEmailTests(unittest.TestCase):
                       "reward credits +100.00  +  Kalshi's pricing vs mid -374.91", text)
         self.assertIn("(account value moved -500.00 = this table -225.09  +  "
                       "reward credits +100.00  +  Kalshi's pricing vs mid -374.91)", text)
-        self.assertIn("trading -$0.2k)", subject)
+        self.assertIn("(day -$0.5k: trading -$0.2k, rewards +$0.1k)", subject)
         self.assertNotIn("settled", subject)
         self.assertIn("reward credits", html)
         # a deposit is split out of the no-trade cash, and left out of the
@@ -187,14 +187,15 @@ class BuildEmailTests(unittest.TestCase):
                       "-150.00  +  deposits/withdrawals +250.00  +  Kalshi's pricing vs mid "
                       "-374.91)", text)
         self.assertIn("(excludes deposits/withdrawals +250.00)", html)
-        self.assertIn("(day -$0.8k, trading -$0.2k)", subject)
+        self.assertIn("(day -$0.8k: trading -$0.2k, rewards -$0.1k)", subject)
         # transfers unreadable: one lumped line, still exact, and the day
         # figure says what it may hold
         p["net_transfers"] = None
         subject, text, _ = pf.build_email(p, [], chart_ok=False)
         self.assertIn("vs yesterday: -500.00  =  trading (at mid) -225.09  +  reward credits "
                       "& deposits +100.00  +  Kalshi's pricing vs mid -374.91\n", text)
-        self.assertIn("(day -$0.5k incl. any deposits, trading -$0.2k)", subject)
+        self.assertIn("(day -$0.5k incl. any deposits: trading -$0.2k, "
+                      "rewards & deposits +$0.1k)", subject)
 
     def test_events_list_their_markets(self):
         """The dashboard's third level: an event whose move came from two or
@@ -592,7 +593,7 @@ class TotalProfitTests(unittest.TestCase):
                  net_transfers=5000.0, total_profit=11624.95, deposited=16000.0)
         subject, text, html = pf.build_email(p, [], chart_ok=False)
         self.assertEqual(subject, "portfolio 2026-09-28: profit +$11.6k "
-                                  "(day -$0.5k, trading -$0.2k)")
+                                  "(day -$0.5k: trading -$0.2k, rewards +$0.1k)")
         self.assertIn("vs yesterday: -475.05  =  trading (at mid) -225.09  +  reward credits "
                       "+100.00  +  Kalshi's pricing vs mid -374.91  +  perpetuals +24.95  "
                       "(excludes deposits/withdrawals +5,000.00)", text)
@@ -602,11 +603,33 @@ class TotalProfitTests(unittest.TestCase):
         subject, _, _ = pf.build_email(p, [], chart_ok=False,
                                        imm={"text": "T", "html": "H",
                                             "subject_flag": " - PICK-OFF WINDOW"})
-        self.assertEqual(subject, "portfolio 2026-09-28: profit +$11.6k "
-                                  "(day -$0.5k, trading -$0.2k) - PICK-OFF WINDOW")
+        self.assertEqual(subject, "portfolio 2026-09-28: profit +$11.6k (day -$0.5k: "
+                                  "trading -$0.2k, rewards +$0.1k) - PICK-OFF WINDOW")
         p.update(first_run=True, prior=None)
         subject, _, _ = pf.build_email(p, [], chart_ok=False)
         self.assertEqual(subject, "portfolio 2026-09-28: profit +$11.6k (first baseline)")
+
+    def test_subject_rewards_on_the_10_4_dry_run(self):
+        # Jack 2026-10-04: "yes add rewards to the subject", after asking
+        # whether day +1.1k and trading -$0.8k meant rewards +1.9k. The live
+        # dry run vs the 10/3 snapshot: +1,064.13 = trading -799.67 + reward
+        # credits +2,366.16 + Kalshi's pricing vs mid -507.25 + perps +4.89,
+        # with $8,500 of deposits left out
+        p = {"today": "2026-10-04", "rows": [_row("KXA-26", value_d=-799.67)],
+             "first_run": False,
+             "prior": {"equity_kalshi": 24409.13, "perps_equity": 127.23},
+             "equity_kalshi": 33968.37, "cash": 10379.84,
+             "kalshi_positions_value": 23588.53, "equity": 35579.0,
+             "positions_value": 25199.16, "perps_equity": 132.12, "perps_stale": False,
+             "account_value": 34100.49, "perps": {"equity": 132.12, "positions": []},
+             "unpaid": None, "no_trade_cash": 10866.16, "net_transfers": 8500.0,
+             "total_profit": 18100.49, "deposited": 16000.0, "withdrawn": 0.0}
+        subject, text, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertEqual(subject, "portfolio 2026-10-04: profit +$18.1k "
+                                  "(day +$1.1k: trading -$0.8k, rewards +$2.4k)")
+        self.assertIn("vs yesterday: +1,064.13  =  trading (at mid) -799.67  +  reward "
+                      "credits +2,366.16  +  Kalshi's pricing vs mid -507.25  +  perpetuals "
+                      "+4.89  (excludes deposits/withdrawals +8,500.00)", text)
 
     def test_a_loss_and_withdrawals(self):
         _, text, html = pf.build_email(
@@ -621,7 +644,7 @@ class TotalProfitTests(unittest.TestCase):
         subject, text, html = pf.build_email(self._pf(profit=None, deposited=None), [],
                                              chart_ok=False)
         self.assertEqual(subject, "portfolio 2026-09-28: profit n/a "
-                                  "(day -$0.5k incl. any deposits, trading -$0.2k)")
+                                  "(day -$0.5k incl. any deposits: trading -$0.2k)")
         self.assertIn("Total profit n/a today: Kalshi's deposit / withdrawal history "
                       "did not load", text)
         self.assertIn("Total profit n/a today", html)
