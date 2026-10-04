@@ -7288,3 +7288,44 @@ At deploy: free cash $1,914 (14:30Z); bids only verified on the live book
 Tests: TestLadderAsksCashLatch (fires at $4,000 not $3,999, one alert, a dip
 keeps it on, quakes stay bid-only, persists across a restart, the 0 knob
 ignores an old latch). 2,006 green.
+
+## 2026-10-04 — NFL props: injury tags stand aside only the fantasy ladder; exact caps; the family quotes 0.05-99.5c (Jack)
+
+Jack, on why KXNFLESCALATORRECYDS-26OCT04TENBAL was not all quoting (Flowers
+stood aside as Questionable; Pollard's capped 1.00c bid sat behind 1,050
+contracts at 1.02-1.03c; Henry's book is 0.03c / 0.99c, under the 1c band):
+"for questionable, etc its ok to quote non-fantasy ladders because injury
+risk being picked off is less risk", "caps sohld keep exact values",
+"Ladders and escalators only quote from 1c to 99c -- change this to .05 to
+.995".
+
+1. INJURY. nfl_gate stands a designated player aside only on the FANTASY
+   ladder (nfl_ffpts_series): a player who never takes a snap pays a
+   fantasy YES $0 (FFPTSSCALAR), while the receptions / yards contracts
+   resolve at the Exchange's last fair price (FOOTBALLENTITYSCALARSTAT).
+   The designation still rides in the gate inputs; the team news hold and
+   the stale-roster check are unchanged.
+2. EXACT CAPS. The gate's caps are on the 0.01c grid (band top + 1c =
+   1.47c, not 1c; floor band bottom - 1c, 0 = none) and nfl_cap_quotes
+   moves a rung past its bound TO it -- exactly on a sub-penny market
+   (price_cents its bucket), to the whole cent inside it otherwise.
+   Pollard's 1.03c touch bid now stays (under 1.47c) and earns.
+3. 0.05-99.5c. SPORTS_LADDER_PRICE_MIN_EXACT / _MAX_EXACT (env
+   IMM_SPORTS_LADDER_PRICE_MIN_EXACT / _MAX_EXACT). The whole-cent band (1 /
+   99) still drives the integer ladder; subcent_edge_quotes adds ONE rung
+   AT the exact external touch on a sub-penny ladder / escalator side the
+   integer ladder left empty when that touch is a bid in [0.05, 1c) or an
+   ask in (99, 99.5c] (price_cents 0 / 100 is its bucket; the wire price
+   is exact -- the client sends price_dollars and only reads yes/no_price
+   for the side). Sized like the side (min of its ladder total and room),
+   never crossing, our own orders netted out. Wired into the quote loop
+   (after the sub-penny snap, before the caps), the estimator probe,
+   quotable_sides, the meta's mid / spread (subcent_bid_cents: market_cents
+   reads a bid under 1c as "no bid") and the extreme_mid screen (the
+   family's band 0.05-99.5c). Henry's 0.03c bid is still under the floor.
+
+Tests: TestNflPropGate -- reasons (a non-fantasy designation quotes, the
+fantasy one stands aside), test_caps (13.78 / 1.07), test_news_hold, the
+Robinson e2e (Questionable keeps quoting), test_nfl_cap_quotes_keeps_exact
+_prices, test_subcent_edge_quotes, test_a_book_under_one_cent_quotes_at_
+its_exact_touch (selected, bids AT 0.30c). 2,009 green.

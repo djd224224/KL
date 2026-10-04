@@ -3439,6 +3439,11 @@ if SPORTS_LADDER_BLOCK:
 # quake gate's own logic keys on quake_gated, not on bid-only. Kill:
 # IMM_SPORTS_LADDER_ASKS_OFF=0.
 SPORTS_LADDER_ASKS_OFF = os.environ.get("IMM_SPORTS_LADDER_ASKS_OFF", "1") == "1"
+# the family's EXACT quoting band in cents (Jack 2026-10-04: "change this to
+# .05 to .995"): the whole-cent band (price_min/max_cents 1 / 99) still
+# drives the integer ladder; subcent_edge_quotes covers 0.05-1c and 99-99.5c
+SPORTS_LADDER_PRICE_MIN_EXACT = _env_float("IMM_SPORTS_LADDER_PRICE_MIN_EXACT", 0.05)
+SPORTS_LADDER_PRICE_MAX_EXACT = _env_float("IMM_SPORTS_LADDER_PRICE_MAX_EXACT", 99.5)
 # ASKS BACK ON AT $4,000 CASH (Jack 2026-10-04: "once cash is over $4k, turn
 # on the full ladder/escalator again"). The bids-only mode was for cash: the
 # account's free cash ran $1.5-3.8k that morning against ~$83k of planned
@@ -9173,7 +9178,14 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                 f"{'missing' if rage is None else f'{rage / 60:.0f}m old'}",
                 {"reason": "stale_roster", "team": e.get("team"),
                  "age_s": None if rage is None else round(rage)}, None)
-    if e.get("injury"):
+    # INJURY: a designated player stands aside on the FANTASY ladder only
+    # (Jack 2026-10-04: "for questionable, etc its ok to quote non-fantasy
+    # ladders because injury risk being picked off is less risk"). A player
+    # who never takes a snap pays a fantasy YES $0 (FFPTSSCALAR: deemed 0.0
+    # points), while the receptions / yards contracts resolve at the
+    # Exchange's last fair price before the news (FOOTBALLENTITYSCALARSTAT),
+    # so a quote picked off on the news is far cheaper there.
+    if e.get("injury") and nfl_ffpts_series(ticker.split("-", 1)[0]):
         return (f"{e.get('player')}: {e['injury']}",
                 {"reason": "injury", "player": e.get("player"),
                  "injury": e["injury"]}, None)
@@ -9193,6 +9205,7 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
               "fair_hi": round(hi, 3), "mu": e.get("mu"),
               "n_games": e.get("n_games"), "player": e.get("player"),
               "mu_base": e.get("mu_base"), "team_mult": e.get("team_mult"),
+              "injury": e.get("injury"),
               "tol": NFL_FAIR_TOL_CENTS, "band_tol": NFL_BAND_TOL_CENTS}
     bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo,
                                         NFL_BAND_TOL_CENTS, hi)
@@ -9203,18 +9216,136 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                 f"{e.get('mu')})",
                 dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad),
                 None)
-    bid_cap = int(math.floor(hi + NFL_FAIR_TOL_CENTS + 1e-9))
-    ask_floor = int(math.ceil(lo - NFL_FAIR_TOL_CENTS - 1e-9))
-    # a floor at or under zero is NO floor (0: mort_cap_quotes never moves an
-    # ask under it). It was clamped to 1c, which on a sub-penny book is a
-    # real floor: an ask snapped to the maker's 0.95 was lifted to 1.00,
-    # behind him, and dropped as unearning (Prescott / Montgomery 10/4)
-    caps = (bid_cap if bid_cap >= 1 else None,
-            max(0, ask_floor) if ask_floor <= 99 else None)
+    # EXACT CAPS (Jack 2026-10-04: "caps should keep exact values"): on the
+    # 0.01c grid -- band top + 1c = 1.47c, not 1c -- and nfl_cap_quotes
+    # keeps a sub-penny market's capped rung at that exact price (a whole-
+    # cent market rounds inside it). Pollard's 10/4 escalator (fair 0.24c,
+    # top 0.47c) had its 1.03c touch bid capped to 1.00c, behind the 1,050
+    # contracts at 1.02-1.03c, and dropped as unearning.
+    bid_cap = math.floor((hi + NFL_FAIR_TOL_CENTS) * 100.0 + 1e-6) / 100.0
+    ask_floor = math.ceil((lo - NFL_FAIR_TOL_CENTS) * 100.0 - 1e-6) / 100.0
+    # a floor at or under zero is NO floor (0: the capper never moves an ask
+    # under it); it was clamped to 1c once, a real floor on a sub-penny book
+    # (an ask snapped to the maker's 0.95 lifted to 1.00, behind him)
+    caps = (bid_cap if bid_cap >= SPORTS_LADDER_PRICE_MIN_EXACT else None,
+            max(0.0, ask_floor) if ask_floor <= SPORTS_LADDER_PRICE_MAX_EXACT
+            else None)
     if caps == (None, None):
         return (f"no side within the band {lo:.2f}-{hi:.2f}c",
                 dict(inputs, reason="decided"), None)
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+def nfl_cap_quotes(quotes: List["Quote"], bid_cap: Optional[float],
+                   ask_floor: Optional[float],
+                   price_step: float = 0.01) -> List["Quote"]:
+    """mort_cap_quotes on the market's own price grid, for the NFL gate's
+    EXACT caps (cents, 2 dp): every bid at most bid_cap, every ask at least
+    ask_floor, None = that side not at all. A rung past its bound moves TO
+    it -- exactly on a sub-penny market (price_step < 0.01: 1.47c stays
+    1.47c, price_cents its bucket), to the whole cent inside it otherwise
+    (dropped if that leaves 1-99c). A pad past its bound is dropped."""
+    sub_penny = price_step < 0.01
+    out = []
+    for q in quotes:
+        px = q.price_exact if q.price_exact is not None else float(q.price_cents)
+        if q.book_side == "bid":
+            if bid_cap is None:
+                continue
+            if px > bid_cap + 1e-9:
+                if q.is_pad:
+                    continue
+                c = int(math.floor(bid_cap + 1e-9))
+                if sub_penny:
+                    q = replace(q, price_cents=c, price_exact=round(bid_cap, 2))
+                elif c >= 1:
+                    q = replace(q, price_cents=c, price_exact=None)
+                else:
+                    continue
+        else:
+            if ask_floor is None:
+                continue
+            if px < ask_floor - 1e-9:
+                if q.is_pad:
+                    continue
+                c = int(math.ceil(ask_floor - 1e-9))
+                if sub_penny:
+                    q = replace(q, price_cents=c, price_exact=round(ask_floor, 2))
+                elif c <= 99:
+                    q = replace(q, price_cents=c, price_exact=None)
+                else:
+                    continue
+        out.append(q)
+    return out
+
+
+# SUB-CENT EDGE (Jack 2026-10-04: "Ladders and escalators only quote from 1c
+# to 99c -- change this to .05 to .995"). The bot prices in whole cents
+# (orderbook_levels floors a bid to its cent, build_side_ladder never builds
+# a rung under 1c or over 99c), so a sub-penny ladder / escalator whose best
+# bid sits UNDER 1c (Henry's receiving-yards escalator 10/4: 0.03c / 0.99c)
+# or whose best ask sits OVER 99c could not be quoted at all. The exact band
+# is SPORTS_LADDER_PRICE_MIN_EXACT / _MAX_EXACT (0.05c / 99.5c); inside it,
+# a side the integer ladder left empty gets ONE rung AT the exact external
+# touch (subcent_edge_quotes; price_cents 0 / 100 is its bucket, the wire
+# price is the exact one), sized like the side's ladder, never crossing.
+# The selection screen and the estimator probe read the same band, and the
+# NFL caps and only-what-earns judge the rung like any other.
+def subcent_bid_cents(m: dict) -> Optional[float]:
+    """A market object's best YES bid in exact cents when it lies in the
+    family's sub-cent edge [SPORTS_LADDER_PRICE_MIN_EXACT, 1c) -- the bid
+    market_cents reads as "no bid" (it floors to 0) -- else None."""
+    try:
+        v = float(m.get("yes_bid_dollars")) * 100.0
+    except (TypeError, ValueError):
+        return None
+    if SPORTS_LADDER_PRICE_MIN_EXACT - 1e-9 <= v < 1.0 - 1e-9:
+        return round(v, 2)
+    return None
+
+
+def subcent_edge_quotes(ticker: str, yes_exact: List[List[float]],
+                        no_exact: List[List[float]],
+                        own_exact: List[Tuple[str, float, float]],
+                        bid_size: int, ask_size: int,
+                        lo: Optional[float] = None,
+                        hi: Optional[float] = None) -> List["Quote"]:
+    """The rungs the whole-cent ladder cannot build on a sub-penny book: a
+    bid AT the exact external best bid when it lies in [lo, 1c), an ask AT
+    the exact external best ask when it lies in (99c, hi]. yes_exact /
+    no_exact: orderbook_exact_levels; own_exact: our resting orders (book
+    side, exact YES cents, size), netted out first. A size <= 0 means that
+    side may not rest."""
+    lo = SPORTS_LADDER_PRICE_MIN_EXACT if lo is None else lo
+    hi = SPORTS_LADDER_PRICE_MAX_EXACT if hi is None else hi
+    ext_y: Dict[float, float] = {}
+    ext_n: Dict[float, float] = {}
+    for px, q in yes_exact:
+        k = round(float(px), 2)
+        ext_y[k] = ext_y.get(k, 0.0) + float(q)
+    for px, q in no_exact:
+        k = round(float(px), 2)
+        ext_n[k] = ext_n.get(k, 0.0) + float(q)
+    for side, yx, q in own_exact:
+        if side == "bid":
+            k = round(float(yx), 2)
+            ext_y[k] = ext_y.get(k, 0.0) - float(q)
+        else:
+            k = round(100.0 - float(yx), 2)
+            ext_n[k] = ext_n.get(k, 0.0) - float(q)
+    best_bid = max((k for k, q in ext_y.items() if q > 1e-9), default=None)
+    best_no = max((k for k, q in ext_n.items() if q > 1e-9), default=None)
+    best_ask = round(100.0 - best_no, 2) if best_no is not None else None
+    out: List["Quote"] = []
+    if (bid_size > 0 and best_bid is not None
+            and lo - 1e-9 <= best_bid < 1.0 - 1e-9
+            and (best_ask is None or best_bid < best_ask - 1e-9)):
+        out.append(Quote(ticker, "bid", 0, int(bid_size), price_exact=best_bid))
+    if (ask_size > 0 and best_ask is not None
+            and 99.0 + 1e-9 < best_ask <= hi + 1e-9
+            and (best_bid is None or best_ask > best_bid + 1e-9)):
+        out.append(Quote(ticker, "ask", 100, int(ask_size), price_exact=best_ask))
+    return out
 
 
 # ONLY QUOTE WHAT EARNS (Jack 2026-10-04: "only quote a market if you're
@@ -13892,6 +14023,14 @@ class IncentiveMarketMaker:
                     program_end=info["end"])
             bid = market_cents(m, "yes_bid")
             ask = market_cents(m, "yes_ask")
+            _mid = (bid + ask) / 2.0 if bid and ask else None
+            _spr = (ask - bid) if bid and ask else None
+            if _mid is None and ask and sports_ladder_league(series) is not None:
+                # SUB-CENT EDGE (subcent_edge_quotes): market_cents reads a
+                # bid under 1c as "no bid"; for this family it is the touch
+                _bx = subcent_bid_cents(m)
+                if _bx is not None and _bx < ask:
+                    _mid, _spr = (_bx + ask) / 2.0, ask      # its bucket is 0
             try:
                 volume = float(m.get("volume_fp") or m.get("volume") or 0)
             except (TypeError, ValueError):
@@ -13901,8 +14040,8 @@ class IncentiveMarketMaker:
                 dollars_per_day=info["dollars_per_day"], program_end=info["end"],
                 target_size=info["target"], discount_factor=info["df"],
                 cutoff=cutoff, close_time=close_time,
-                mid_cents=((bid + ask) / 2.0 if bid and ask else None),
-                spread_cents=((ask - bid) if bid and ask else None),
+                mid_cents=_mid,
+                spread_cents=_spr,
                 volume=volume, status=m.get("status", ""),
                 open_time=parse_iso_utc(m.get("open_time", "")),
                 program_start=info.get("start"),
@@ -15278,6 +15417,15 @@ class IncentiveMarketMaker:
                 out += build_side_ladder(meta.ticker, "ask", ea, eb,
                                          sma, levels=lva, ref_px=rpa,
                                          band=band, hour_mult=hm)
+            if (SUBPENNY_JOIN and meta.price_step < 0.01
+                    and sports_ladder_league(meta.series) is not None):
+                # the loop's sub-cent edge rungs (subcent_edge_quotes)
+                _has = {q.book_side for q in out if not q.is_pad}
+                _yx, _nx = orderbook_exact_levels(ob)
+                out += subcent_edge_quotes(
+                    meta.ticker, _yx, _nx, [],
+                    bid_size=smb if "bid" not in _has else 0,
+                    ask_size=sma if "ask" not in _has else 0)
             if quake_gated(meta.series):
                 # quake gate: the bids the loop will rest, capped at fair
                 _qcap = quake_probe_cap(meta.ticker, _now.timestamp(),
@@ -15297,7 +15445,8 @@ class IncentiveMarketMaker:
                 # rungs held inside the player-history band -- and only the
                 # sides that still earn (drop_unearning_sides)
                 _nw, _ni, _nc = nfl_gate(meta.ticker, _now.timestamp(), eb, ea)
-                out = [] if (_nw or _nc is None) else mort_cap_quotes(out, *_nc)
+                out = [] if (_nw or _nc is None) else nfl_cap_quotes(
+                    out, *_nc, price_step=meta.price_step)
                 out = drop_unearning_sides(
                     out, yes_levels, no_levels,
                     own_live if self.live else [],
@@ -15360,6 +15509,14 @@ class IncentiveMarketMaker:
             _qb, _qa = (external_best(yes_levels, no_levels, own_live)
                         if (self.live and own_live) else (ext_b, ext_a))
             meta.quotable_sides = sum(_sides_in_band(_qb, _qa))
+            if (SUBPENNY_JOIN and meta.price_step < 0.01
+                    and sports_ladder_league(meta.series) is not None):
+                _yx, _nx = orderbook_exact_levels(ob)
+                _edge = {q.book_side for q in subcent_edge_quotes(
+                    meta.ticker, _yx, _nx, [], 1, 1)}
+                _qbo, _qao = _sides_in_band(_qb, _qa)
+                meta.quotable_sides += int("bid" in _edge and not _qbo) \
+                    + int("ask" in _edge and not _qao)
         else:
             _pmin_s, _pmax_s = member_price_band(
                 meta.series, meta.ticker in self.state.selected)
@@ -15860,6 +16017,10 @@ class IncentiveMarketMaker:
         # book. A narrower series band never tightens this screen (unchanged).
         band_lo = min(band_lo, series_price_min(meta.series))
         band_hi = max(band_hi, series_price_max(meta.series))
+        if sports_ladder_league(meta.series) is not None:
+            # the family's EXACT band (0.05-99.5c, subcent_edge_quotes)
+            band_lo = min(band_lo, SPORTS_LADDER_PRICE_MIN_EXACT)
+            band_hi = max(band_hi, SPORTS_LADDER_PRICE_MAX_EXACT)
         if not (band_lo <= meta.mid_cents <= band_hi):
             return "extreme_mid"
         if MIN_VOLUME_CONTRACTS > 0 and meta.volume < MIN_VOLUME_CONTRACTS:
@@ -17240,6 +17401,20 @@ class IncentiveMarketMaker:
                 _yx, _nx = orderbook_exact_levels(ob)
                 mq = subpenny_snap(mq, _yx, _nx,
                                    own_exact_by_ticker.get(t, []) if self.live else [])
+            # SUB-CENT EDGE (Jack 2026-10-04, see subcent_edge_quotes): a
+            # sports ladder / escalator side the whole-cent ladder left
+            # empty, with its exact touch in 0.05-1c (bid) or 99-99.5c (ask)
+            if (SUBPENNY_JOIN and meta.price_step < 0.01
+                    and sports_ladder_league(meta.series) is not None):
+                _has = {q.book_side for q in mq if not q.is_pad}
+                _yx, _nx = orderbook_exact_levels(ob)
+                mq.extend(subcent_edge_quotes(
+                    t, _yx, _nx,
+                    own_exact_by_ticker.get(t, []) if self.live else [],
+                    bid_size=(int(min(side_max_bid, room_buy))
+                              if (lv_bid and "bid" not in _has) else 0),
+                    ask_size=(int(min(side_max_ask, room_sell))
+                              if (lv_ask and "ask" not in _has) else 0)))
             # mortgage gate: LAST, after pads and the sub-penny snap, so
             # nothing rests within MORT_FAIR_TOL_CENTS of the fair
             if mort_caps is not None:
@@ -17251,7 +17426,7 @@ class IncentiveMarketMaker:
             # and a side the caps left out of the scored walk does not rest
             # at all ("only quote a market if you're earning")
             if nfl_caps is not None:
-                mq = mort_cap_quotes(mq, *nfl_caps)
+                mq = nfl_cap_quotes(mq, *nfl_caps, price_step=meta.price_step)
                 _n_before = {q.book_side for q in mq if not q.is_pad}
                 if meta.price_step < 0.01:
                     # the walk runs over exact levels (see drop_unearning_sides)

@@ -17600,12 +17600,21 @@ class TestNflPropGate(unittest.TestCase):
         self.assertEqual(r(), "stale_roster")         # never read: out
         self._snap(roster_age_secs=imm.NFL_ROSTER_TTL_MIN * 60 + 30)
         self.assertEqual(r(), "stale_roster")
+        # INJURY (Jack 2026-10-04): a non-fantasy prop quotes through a
+        # designation (it resolves at the last fair price if he sits) ...
         self._snap(injury="Doubtful")                  # McLaurin, 10/3 14:42Z
         why, inputs, caps = imm.nfl_gate(self.T, now, 6, 7)
+        self.assertEqual(why, "")
+        self.assertEqual(inputs["injury"], "Doubtful")
+        self.assertIsNotNone(caps)
+        # ... while the fantasy ladder (YES pays $0 if he sits) stands aside
+        ff = "KXNFLFFPTSLADDER-67OCT05ATLNO-ATLBROBINSON7"
+        self._snap(injury="Doubtful", ticker=ff)
+        why, inputs, caps = imm.nfl_gate(ff, now, 6, 7)
         self.assertEqual((inputs["reason"], caps), ("injury", None))
         self.assertIn("Doubtful", why)
-        self._snap(injury="not on roster")
-        self.assertEqual(r(), "injury")
+        self._snap(injury="not on roster", ticker=ff)
+        self.assertEqual(r(t=ff), "injury")
         # the 05:02Z book, 45 / 60, and the 40 / 51 the fill came from
         self._snap()
         self.assertEqual(r(b=45, a=60), "band")
@@ -17636,21 +17645,23 @@ class TestNflPropGate(unittest.TestCase):
         e["news_at"] = now - 60
         with mock.patch.object(imm, "NFL_NEWS_HOLD_MIN", 0):  # off
             self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[0], "")
-        # an injury designation on the player himself still wins
+        # a designation on a non-fantasy prop no longer stands it aside:
+        # the team's news hold still does
         e["injury"] = "Questionable"
-        self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[1]["reason"], "injury")
+        self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[1]["reason"], "news_hold")
 
     def test_caps(self):
         now = time.time()
         self._snap()
         why, inputs, caps = imm.nfl_gate(self.T, now, 6, 7)
-        self.assertEqual((why, caps), ("", (13, 2)))   # 12.78 + 1, 2.06 - 1
+        # EXACT (Jack 2026-10-04: "caps should keep exact values")
+        self.assertEqual((why, caps), ("", (13.78, 1.07)))   # 12.78 + 1, 2.06 - 1
         self.assertEqual((inputs["fair"], inputs["player"], inputs["n_games"]),
                          (4.753, "Bijan Robinson", 37))
         # an RB receiving-yards escalator worth ~0.2c: the book's 2c bid is
         # not joined (bids <= 1c), the ask side is free
         self._snap(fair=0.0018, lo=0.0011, hi=0.0034)
-        self.assertEqual(imm.nfl_gate(self.T, now, 2, 3)[2], (1, 0))
+        self.assertEqual(imm.nfl_gate(self.T, now, 2, 3)[2], (1.34, 0.0))
         # ...and the 0 floor is no floor: a sub-penny ask at the maker's
         # 0.95 keeps its exact price (a 1c floor lifted it behind him)
         ask = imm.Quote(self.T, "ask", 1, 100, price_exact=0.95)
@@ -17658,7 +17669,7 @@ class TestNflPropGate(unittest.TestCase):
         self.assertEqual([(q.price_cents, q.price_exact) for q in kept], [(1, 0.95)])
         # a ladder near the top: no ask floor above 99
         self._snap(fair=0.97, lo=0.95, hi=0.995)
-        self.assertEqual(imm.nfl_gate(self.T, now, 95, 99)[2], (100, 94))
+        self.assertEqual(imm.nfl_gate(self.T, now, 95, 99)[2], (100.5, 94.0))
 
     def _bot(self, yes_px="0.0600", no_px="0.9300"):
         client = FakeClient()
@@ -17745,11 +17756,13 @@ class TestNflPropGate(unittest.TestCase):
         self.assertEqual(max(bids), 13)
         self.assertEqual(asks, near[1])
         self.assertNotIn(self.T, bot._nfl_stood)
-        # the player goes Questionable: out
+        # the player goes Questionable: a non-fantasy prop keeps quoting
+        # (Jack 2026-10-04 -- it resolves at the last fair price if he sits)
+        before = self._quotes(bot)
         self._snap(injury="Questionable")
         bot.run_cycle()
-        self.assertEqual(self._quotes(bot), (set(), set()))
-        self.assertIn(self.T, bot._nfl_stood)
+        self.assertEqual(self._quotes(bot), before)
+        self.assertNotIn(self.T, bot._nfl_stood)
 
     def test_drop_unearning_sides(self):
         """Jack 2026-10-04: "only quote a market if you're earning"."""
@@ -17832,6 +17845,82 @@ class TestNflPropGate(unittest.TestCase):
         self.assertEqual(min(asks), 17)                # the ask at the touch
         self.assertEqual(bot._nfl_unearning.get(self.T), {"bid"})
         self.assertNotIn(self.T, bot._nfl_stood)
+
+    def test_nfl_cap_quotes_keeps_exact_prices(self):
+        Q = imm.Quote
+        T = self.T
+        # sub-penny market: a rung past the 1.47 cap moves to 1.47 EXACTLY
+        out = imm.nfl_cap_quotes([Q(T, "bid", 1, 100, price_exact=1.5),
+                                  Q(T, "bid", 1, 100, price_exact=1.03)],
+                                 1.47, 0.0, price_step=0.0001)
+        self.assertEqual([(q.price_cents, q.price_exact) for q in out],
+                         [(1, 1.47), (1, 1.03)])          # 1.03 untouched
+        # the ask floor likewise, its bucket rounding up
+        out = imm.nfl_cap_quotes([Q(T, "ask", 1, 100, price_exact=0.95)],
+                                 None, 1.07, price_step=0.0001)
+        self.assertEqual([(q.price_cents, q.price_exact) for q in out], [(2, 1.07)])
+        # a whole-cent market rounds inside the exact cap
+        out = imm.nfl_cap_quotes([Q(T, "bid", 14, 100), Q(T, "ask", 1, 100)],
+                                 13.78, 1.07, price_step=0.01)
+        self.assertEqual(sorted((q.book_side, q.price_cents, q.price_exact) for q in out),
+                         [("ask", 2, None), ("bid", 13, None)])
+        # ...and drops a bid whose whole-cent cap falls under 1c
+        self.assertEqual(imm.nfl_cap_quotes([Q(T, "bid", 1, 100)], 0.6, 0.0), [])
+        # a pad past its bound is dropped, None drops the side
+        out = imm.nfl_cap_quotes([Q(T, "bid", 1, 50, is_pad=True),
+                                  Q(T, "ask", 99, 50, is_pad=True)],
+                                 0.5, None, price_step=0.0001)
+        self.assertEqual(out, [])
+
+    def test_subcent_edge_quotes(self):
+        T = self.T
+        f = imm.subcent_edge_quotes
+        # Henry 10/4: 0.03c bid is under the 0.05c floor -- no bid; the
+        # 0.99c ask is not over 99c -- no edge ask
+        henry_y = [[0.01, 25000.0], [0.02, 9458.0], [0.03, 1010.0]]
+        henry_n = [[99.01, 500.0], [99.0, 22194.0]]
+        self.assertEqual(f(T, henry_y, henry_n, [], 200, 200), [])
+        # a 0.30c bid is inside 0.05-1c: one rung AT it, bucket 0
+        out = f(T, [[0.3, 2000.0], [0.1, 5000.0]], [[99.2, 3000.0]], [], 200, 0)
+        self.assertEqual([(q.book_side, q.price_cents, q.price_exact, q.count)
+                          for q in out], [("bid", 0, 0.3, 200)])
+        # an ask at 99.3c (NO bid 0.70c) is inside 99-99.5c
+        out = f(T, [[50.0, 10.0]], [[0.7, 800.0]], [], 0, 150)
+        self.assertEqual([(q.book_side, q.price_cents, q.price_exact)
+                          for q in out], [("ask", 100, 99.3)])
+        # 99.7c is past 99.5c; size 0 means the side may not rest
+        self.assertEqual(f(T, [[50.0, 10.0]], [[0.3, 800.0]], [], 0, 150), [])
+        self.assertEqual(f(T, [[0.3, 2000.0]], [[99.2, 3000.0]], [], 0, 0), [])
+        # our own 0.30c order netted out: the external best is 0.10c
+        out = f(T, [[0.3, 2000.0], [0.1, 5000.0]], [[99.2, 3000.0]],
+                [("bid", 0.3, 2000.0)], 200, 0)
+        self.assertEqual([q.price_exact for q in out], [0.1])
+        # never crossing: a bid at/over the exact ask is not built
+        self.assertEqual(f(T, [[0.8, 100.0]], [[99.2, 100.0]], [], 200, 0), [])
+
+    def test_a_book_under_one_cent_quotes_at_its_exact_touch(self):
+        # Jack 2026-10-04: "change this to .05 to .995" -- a sub-penny
+        # escalator whose whole book sits under 1c (0.30c / 0.80c) is
+        # selected and bids AT 0.30c
+        p = mock.patch.object(imm, "LADDER_MODE", "atref")
+        p.start()
+        self.addCleanup(p.stop)
+        bot = self._bot()
+        bot.client.markets[self.T].update({
+            "yes_bid_dollars": "0.0030", "yes_ask_dollars": "0.0080",
+            "price_ranges": [{"start": "0.0000", "end": "1.0000",
+                              "step": "0.0001"}]})
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.0010", "5000"], ["0.0030", "2000"]],
+            "no_dollars": [["0.9920", "3000"]]}}
+        self._snap(fair=0.005, lo=0.002, hi=0.012)       # cap 2.2c, floor 0
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        bids = [o for o in bot.state.sim_orders.values()
+                if o["ticker"] == self.T and o["book_side"] == "bid"]
+        self.assertTrue(bids)
+        self.assertEqual({o.get("yes_price_exact") for o in bids}, {0.3})
 
     def test_kill_switch_quotes_as_before(self):
         bids, _asks = self._ungated("0.4000", "0.4900")  # the 40 / 51 book
