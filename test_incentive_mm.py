@@ -75,6 +75,13 @@ imm.YIELD_SIZE_MULT = 1.0
 # allowlist ...) would stop quoting. TestNflPropGate arms it explicitly.
 _NFL_GATE_CODE_DEFAULT = imm.NFL_FAIR_ENABLE
 imm.NFL_FAIR_ENABLE = False
+# ...and the family itself is OFF by default from 2026-10-04 (Jack: "turn off
+# LADDER/ESCALATOR events for now", SPORTS_LADDER_BLOCK): the suite takes the
+# block pattern back out so the ladder / escalator fixtures still exercise
+# the family's code; TestSportsLadderBlock checks the default.
+_LADDER_BLOCK_CODE_DEFAULT = imm.SPORTS_LADDER_BLOCK
+imm.SERIES_BLOCK_PATTERNS = tuple(
+    p for p in imm.SERIES_BLOCK_PATTERNS if p is not imm._SPORTS_LADDER_BLOCK_RE)
 
 
 def setUpModule():
@@ -17848,6 +17855,41 @@ class TestNflFantasyLadderCutoff(unittest.TestCase):
         self.assertEqual(
             self._selected_cutoff("KXNFLLADDERREC-67OCT05ATLNO-ATLBROBINSON7"),
             self.KICKOFF - timedelta(minutes=imm.EVENT_START_BUFFER_MIN))
+
+
+class TestSportsLadderBlock(unittest.TestCase):
+    """Jack 2026-10-04: "turn off LADDER/ESCALATOR events for now" -- every
+    series the ladder pattern allows is pattern-blocked by default: no
+    orders, positions ride (not reduce-only); IMM_SPORTS_LADDER_BLOCK=0
+    turns the family back on."""
+
+    LADDERS = ("KXNFLLADDERREC-26OCT05ATLNO-ATLBROBINSON7",
+               "KXNFLESCALATORRECYDS-26OCT05ATLNO-ATLBROBINSON7",
+               "KXNFLFFPTSLADDER-26OCT05ATLNO-NOCOLAVE12",
+               "KXNBALADDERPTS-26OCT21BOSNYK-BOSJTATUM25")
+
+    def test_off_by_default(self):
+        self.assertTrue(_LADDER_BLOCK_CODE_DEFAULT)
+        saved = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+        try:
+            with mock.patch.object(imm, "SERIES_BLOCK_PATTERNS",
+                                   imm.SERIES_BLOCK_PATTERNS
+                                   + (imm._SPORTS_LADDER_BLOCK_RE,)):
+                for t in self.LADDERS:
+                    self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+                    self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+                    self.assertTrue(imm.series_pattern_blocked(t.split("-")[0]), t)
+                # the rest of the book is untouched
+                for s_ in ("KXNFLGAME", "KXTRUMPAPPROVE", "KXGOOD",
+                           "KXEARNINGSMENTIONAAPL"):
+                    self.assertFalse(imm.series_pattern_blocked(s_), s_)
+            # with the block taken out (the suite's state) the family is
+            # allowed again, as IMM_SPORTS_LADDER_BLOCK=0 would leave it
+            for t in self.LADDERS:
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+        finally:
+            imm.ALLOWLIST_ONLY = saved
 
 
 class TestGuardSkipSink(unittest.TestCase):

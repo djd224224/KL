@@ -3408,6 +3408,22 @@ ALLOW_SERIES_PATTERNS = tuple(
         "IMM_ALLOW_SERIES_PATTERNS", _SPORTS_LADDER_PATTERN).split(",")
     if p.strip())
 SPORTS_LADDER_LEAGUE_RE = re.compile("^" + _SPORTS_LADDER_PATTERN + "$")
+# SPORTS LADDERS / ESCALATORS OFF (Jack 2026-10-04: "turn off
+# LADDER/ESCALATOR events for now"), after a weekend of the family's fills
+# (the Robinson 40c escalator, -$544 open at 10/3 marks) and ~40k of the
+# day's 52k cash-bound placement rejects being NFL prop orders. Every series
+# the pattern allowlist admits is also pattern-BLOCKED (SERIES_BLOCK_PATTERNS
+# -- the blocklist wins in _allowed, and restore_orphan_metas skips blocked
+# tickers): no new orders, resting quotes cancelled next cycle, NOT
+# reduce-only, positions ride to settlement. Everything else about the
+# family -- the NFL fair gate, the 90-minute fantasy cutoff, the teammate
+# adjustment, the news hold, only-what-earns, the x5 size -- stays in code,
+# so turning it back on is IMM_SPORTS_LADDER_BLOCK=0 (launcher, then
+# restart_imm.ps1 -Task) or this default.
+SPORTS_LADDER_BLOCK = os.environ.get("IMM_SPORTS_LADDER_BLOCK", "1") == "1"
+_SPORTS_LADDER_BLOCK_RE = re.compile(_SPORTS_LADDER_PATTERN)
+if SPORTS_LADDER_BLOCK:
+    SERIES_BLOCK_PATTERNS = SERIES_BLOCK_PATTERNS + (_SPORTS_LADDER_BLOCK_RE,)
 # ESPN scoreboard path per league prefix. site.web.api.espn.com: the
 # site.api host started answering 403 "Access Denied" to the browser UA in
 # 2026-09 (measured 2026-09-24 for nfl / wnba / cfb alike), this host serves
@@ -18953,6 +18969,9 @@ class IncentiveMarketMaker:
                 f"status {POKE_STATUS_FILE}")
         else:
             log("pokemon gate: OFF -- KXPOKEMON not enrolled")
+        if SPORTS_LADDER_BLOCK:
+            log("sports ladders / escalators: OFF (pattern-blocked, "
+                "IMM_SPORTS_LADDER_BLOCK=1) -- no orders, positions ride")
         if NFL_FAIR_ENABLE:
             log(f"nfl prop gate: every NFL ladder / escalator fail-closed on "
                 f"nfl_prop_fair's player-history fair (band mu x"

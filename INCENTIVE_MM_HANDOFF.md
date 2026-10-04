@@ -7173,3 +7173,31 @@ Tests (test_carbon_arc_fair): test_a_read_is_an_entry_from_its_first_day,
 test_early_reads_are_widened_by_category,
 test_early_sigma_knob_off_and_the_old_model; the thin-read refusal now
 runs under the 0.10 knob. 1,996 green.
+
+## 2026-10-04 — Sports ladders / escalators OFF for now (Jack)
+
+Jack: "turn off LADDER/ESCALATOR events for now" -- after the weekend's
+fills (the Robinson 40c escalator; -$544 open at the 10/3 23:52Z marks) and
+the read that ~40k of the day's 52k placement rejects were NFL prop orders
+(the account had $1.5-3.8k of free cash against ~$83k of planned ladder
+collateral; the $300k budget never binds).
+
+CHANGE. SPORTS_LADDER_BLOCK (IMM_SPORTS_LADDER_BLOCK, default 1) appends the
+ladder allowlist's own pattern (_SPORTS_LADDER_PATTERN: every league's
+LADDER / ESCALATOR series) to SERIES_BLOCK_PATTERNS. The blocklist wins in
+_allowed and restore_orphan_metas skips blocked tickers, so the standard
+block semantics apply: no new orders, resting quotes cancelled the next
+cycle, NOT reduce-only, positions ride to settlement. Startup logs "sports
+ladders / escalators: OFF".
+
+KEPT IN CODE, unchanged: the NFL fair gate (nfl_prop_fair, nfl_gate), the
+90-minute fantasy cutoff, the teammate adjustment, the 30-minute news hold,
+only-what-earns, the x5 family size. The nfl-fair refresher keeps running
+(nfl_prop_fair.json stays fresh for the CLI / nfl_prop_snipe.py). Turning
+the family back on: IMM_SPORTS_LADDER_BLOCK=0 in the launcher +
+restart_imm.ps1 -Task, or flip the default.
+
+Tests: TestSportsLadderBlock (the default blocks every ladder / escalator
+series, NFL and NBA, and nothing else; with the pattern out they are allowed
+again); the suite takes the pattern out at import so the family's fixtures
+still run. 1,997 green.
