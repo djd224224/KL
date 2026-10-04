@@ -49,16 +49,42 @@ Every row carries `run_id` and `config_hash`.
 
 One row per fill, carrying three joins that cannot be reconstructed later:
 
-- **ledger** — `our_price_cents`, `our_remaining_before`, `is_pad`,
-  `order_age_secs`, `client_order_id`, from the order's entry in
-  `state.ledger`. **Only ~60% of fills get it**, and the missing ones are not
-  random: `_merge_ledger` pops an entry the cycle the fill removes the order
-  from the resting read, which is before the fills poll books it. Missing rows
-  are biased toward fills that took the whole rung (88% vs 76%) -- exactly the
-  large fills adverse-selection work cares about. Do not read
-  `our_price_cents` directly: every fill's `order_id` joins to a `place` row
-  in `orders_*.jsonl` (100%, using day N and N-1), and replaying that order's
-  `place` + `amend` rows recovers its resting price for ~99% of them.
+- **ledger** — `our_book_side`, `our_price_cents`, `our_remaining_before`,
+  `is_pad`, `order_age_secs`, `client_order_id`: the order the fill hit, **as
+  it stood when the fill hit**. Since 2026-10-04 they come from
+  `_fill_join`, which keeps every version the ledger gave the order
+  (placement, amend, restart adoption) for `FILL_JOIN_KEEP_SECS` (1800)
+  after the order leaves the ledger, and is handed over at a restart. The
+  row takes the version in force at Kalshi's fill stamp, with the fill's
+  price (a maker fill trades at our resting price) settling an amend inside
+  the stamp's second. Two columns ride along:
+  - `join_src`: `ledger` (this run's record), `handoff` (the run before a
+    restart handoff), `derived` (no record of the order -- a restart that
+    handed nothing over, a taker order: `our_book_side` from Kalshi's
+    side/action, every other join column null).
+  - `our_left_before`: what was left of the order just before this fill,
+    i.e. `our_remaining_before` (the size as we last set it, not reduced by
+    fills) less the order's earlier fills on that version. `count >=
+    our_left_before` = the fill took the rung. A poll's batch arrives newest
+    first and is registered whole before any row is written, so the order is
+    right. Null when the version was set after the fill (an adopted order's
+    gap fill with nothing handed over); `our_remaining_before` is then null
+    too.
+
+  **Rows before 2026-10-04 (from 9/6):** 29-48% of maker fill rows a day
+  carry no join. The ledger let the order go before the next fills poll
+  booked its fill: `_merge_ledger` dropped an order the resting read no
+  longer held (it filled out), a cancel or amend of it got 404/409, our own
+  cancel pulled what a partial fill left, or a restart started the ledger
+  empty. On 10/4 to ~22:00Z: 87 / 26 / 23 / 93 of 231 unjoined rows (the 93 = 51
+  adopted orders dropped the same ways + 42 restart-gap fills). They are
+  mostly the fills that took the whole rung, so use Kalshi's side/action for
+  the side (exact on every joined row) and count an unjoined row as
+  full-rung. ~8% of the JOINED rows (37 of 489 on 10/3-10/4) carry a price
+  and size set by an amend AFTER the fill. Every fill's `order_id` joins to
+  a `place` row in `orders_*.jsonl` (100%, using day N and N-1), and
+  replaying that order's `place` + `amend` rows up to the fill's `ts`
+  recovers its resting price.
 - **panel** — the book from the last cycle read (`ext_bid`, `ext_ask`,
   `yes_depth`, `no_depth`, `target`, `est_frac`, `qual_sides`,
   `pool_per_day`). A fill arrives one cycle *after* the read that produced the
@@ -282,7 +308,8 @@ already skips rows whose first field is `ts`. Files from 09-07 on are clean.
 
 ## Kill switches
 
-`IMM_ANALYTICS=0` (every JSONL sink), `IMM_CYCLE_LOG=0` (the two CSVs),
+`IMM_ANALYTICS=0` (every JSONL sink, and the fills join's memory),
+`IMM_CYCLE_LOG=0` (the two CSVs),
 `IMM_BOOK_LOG=0`, `IMM_BOOK_LOG_CANDIDATES=0`, `IMM_GUARD_LOG=0`,
 `IMM_SELECTION_INPUTS=0`, `IMM_WS_STALE_LOG=0`, `IMM_SWEEP_BREAKER=off`. Setting any of them in the launcher changes
 `CONFIG_HASH`, like every `IMM_*` variable. Tests prove order placement is

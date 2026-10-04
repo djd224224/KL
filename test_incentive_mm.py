@@ -8571,6 +8571,382 @@ class TestLedgerMerge(unittest.TestCase):
         self.assertTrue(bot.state.ledger["o1"]["_confirmed"])
 
 
+class _FillJoinClient(FakeClient):
+    """FakeClient with a resting book (get_orders serves `resting`, a cancel
+    takes an order off it) and Kalshi's answer for an order that already
+    filled out: a cancel or amend of an id in `dead` raises its status."""
+
+    def __init__(self, resting=()):
+        super().__init__()
+        self.resting = [dict(o) for o in resting]
+        self.dead = {}          # order id -> HTTP status
+
+    def get_orders(self, **kw):
+        return {"orders": [dict(o) for o in self.resting], "cursor": None}
+
+    def cancel_order(self, order_id):
+        if order_id in self.dead:
+            raise HttpError("Not Found", self.dead[order_id])
+        super().cancel_order(order_id)
+        self.resting = [o for o in self.resting if o["order_id"] != order_id]
+        return {}
+
+    def amend_order(self, **kw):
+        if kw["order_id"] in self.dead:
+            raise HttpError("Conflict", self.dead[kw["order_id"]])
+        self.amended = getattr(self, "amended", []) + [kw]
+        return {"order": {"order_id": kw["order_id"]}}
+
+
+class TestFillLedgerJoin(unittest.TestCase):
+    """2026-10-04. Each fills_*.jsonl row joins the order its fill hit (side,
+    price, size, client id, age, pad). The join read state.ledger when the
+    fill was booked, but the ledger lets an order go BEFORE the next poll
+    books its fill: _merge_ledger drops one the resting read no longer holds
+    (it filled out), a cancel or amend answered 404/409 drops it, our own
+    cancel after a partial fill drops it, and a restart starts empty -- 231
+    of 482 maker fill rows on 10/4 (to ~22:00Z) had no join. An amend
+    overwrote the price too (37 joined rows on 10/3-10/4). The row now
+    joins _fill_join: every version the ledger gave the order, kept past
+    the ledger and handed over at a restart."""
+
+    T = "KXGOOD-99DEC31-A"
+    JOIN = ("our_book_side", "our_price_cents", "our_remaining_before",
+            "our_left_before", "join_src")
+
+    def setUp(self):
+        _clean_persist()
+        self.dir = tempfile.mkdtemp(prefix="imm_fill_join_")
+        p = mock.patch.object(imm, "STATUS_DIR", self.dir)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _bot(self, client=None):
+        bot = IncentiveMarketMaker(client=client or _FillJoinClient(), live=True)
+        bot.state.universe_at = time.time()          # no universe refresh
+        return bot
+
+    def _rows(self):
+        out = []
+        for p in sorted(glob.glob(os.path.join(self.dir, "fills_*.jsonl"))):
+            with open(p, encoding="utf-8") as f:
+                out.extend(json.loads(ln) for ln in f if ln.strip())
+        return out
+
+    def _by_id(self):
+        return {r["fill_id"]: r for r in self._rows()}
+
+    def _join(self, row):
+        return tuple(row[k] for k in self.JOIN)
+
+    def _fill(self, fid, oid, count, cents, ts, side="no", action="buy"):
+        """One of our maker fills as Kalshi's fills read returns it (an ask
+        of ours lifted is a NO buy)."""
+        return {"fill_id": fid, "trade_id": fid, "order_id": oid,
+                "ticker": self.T, "side": side, "action": action,
+                "count_fp": f"{count:.2f}",
+                "yes_price_dollars": f"{cents / 100:.4f}",
+                "ts": int(ts), "is_taker": False}
+
+    @staticmethod
+    def _at(ts):
+        """Pin the bot's wall clock (the version stamps) to `ts`."""
+        return mock.patch.object(imm.time, "time", return_value=ts)
+
+    # -- a fill that clears its order ---------------------------------------
+
+    def test_a_fill_that_clears_its_order_keeps_the_join(self):
+        """The bulk of 10/4 (87 rows, and 40 more on adopted orders): the
+        order fills out after one cycle's fills poll, that cycle's resting
+        read no longer holds it, _merge_ledger drops it, and the NEXT poll
+        books the fill. That poll comes newest first: the 15 that cleared the
+        order reads 15 left -- a full-rung fill."""
+        bot = self._bot()
+        t0 = time.time()
+        self.assertTrue(bot.place_order(Quote(self.T, "ask", 41, 20), t0 - 60))
+        oid = "real-1"
+        coid = bot.state.ledger[oid]["client_order_id"]
+        bot._merge_ledger([{"order_id": oid, "ticker": self.T,
+                            "status": "resting"}], t0)       # confirmed
+        bot.run_cycle()                  # the resting read no longer holds it
+        self.assertNotIn(oid, bot.state.ledger)
+        bot.client.fills = [self._fill("t2", oid, 15, 41, t0 + 10),
+                            self._fill("t1", oid, 5, 41, t0 + 5)]
+        bot.client.positions[self.T] = -20.0      # the account holds them too
+        bot.run_cycle()
+        rows = self._by_id()
+        self.assertEqual(self._join(rows["t1"]), ("ask", 41, 20.0, 20.0, "ledger"))
+        self.assertEqual(self._join(rows["t2"]), ("ask", 41, 20.0, 15.0, "ledger"))
+        r = rows["t2"]
+        self.assertEqual((r["client_order_id"], r["is_pad"]), (coid, False))
+        self.assertGreaterEqual(r["order_age_secs"], 60.0)
+        # the fills are booked exactly as before
+        self.assertAlmostEqual(bot.pnl.pos[self.T], -20.0)
+        self.assertAlmostEqual(bot.state.fills_today, 20.0)
+
+    def test_a_cancel_or_amend_that_finds_the_order_gone_keeps_the_join(self):
+        """The order filled out and our cancel (26 rows on 10/4) or amend got
+        404/409, which drops it from the ledger before the poll books the
+        fill."""
+        for path, status in (("cancel", 404), ("cancel", 409), ("amend", 404),
+                             ("amend", 409)):
+            with self.subTest(path=path, status=status):
+                _clean_persist()
+                for p in glob.glob(os.path.join(self.dir, "fills_*.jsonl")):
+                    os.remove(p)
+                bot = self._bot()
+                t0 = time.time()
+                bot.place_order(Quote(self.T, "bid", 40, 30), t0)
+                oid = "real-1"
+                bot.client.dead[oid] = status
+                if path == "cancel":
+                    self.assertTrue(bot.cancel_order(oid, reason="requote_diff"))
+                else:
+                    self.assertFalse(bot.amend_order_inplace(
+                        dict(bot.state.ledger[oid]), Quote(self.T, "bid", 39, 30), t0))
+                self.assertNotIn(oid, bot.state.ledger)
+                bot.client.fills = [self._fill("t1", oid, 30, 40, t0 + 5,
+                                               side="yes", action="buy")]
+                bot.run_cycle()
+                (row,) = self._rows()
+                self.assertEqual(self._join(row), ("bid", 40, 30.0, 30.0, "ledger"))
+
+    # -- a partial fill ----------------------------------------------------
+
+    def test_partial_fills_keep_the_join_and_say_what_was_left(self):
+        """A partial fill while the order rests is joined, and so is the next
+        one after our own cancel pulled the rest before the poll (23 rows on
+        10/4). our_remaining_before is the size as we set it (60);
+        our_left_before nets the order's earlier fills, so neither partial
+        reads as taking the rung."""
+        bot = self._bot()
+        t0 = time.time()
+        bot.place_order(Quote(self.T, "ask", 41, 60), t0)
+        oid = "real-1"
+        bot.client.fills = [self._fill("t1", oid, 20, 41, t0 + 5)]
+        # the poll books the partial; then (an unmanaged market here, a
+        # requote or TTL renewal live) the cycle cancels what is left
+        bot.run_cycle()
+        self.assertIn(oid, bot.client.cancelled)
+        self.assertNotIn(oid, bot.state.ledger)
+        # a second partial landed before that cancel; the next poll books it
+        bot.client.fills = [self._fill("t2", oid, 15, 41, t0 + 8)]
+        bot.run_cycle()
+        rows = self._by_id()
+        self.assertEqual(self._join(rows["t1"]), ("ask", 41, 60.0, 60.0, "ledger"))
+        self.assertEqual(self._join(rows["t2"]), ("ask", 41, 60.0, 40.0, "ledger"))
+        for r in rows.values():
+            self.assertLess(r["count"], r["our_left_before"])
+
+    def test_a_fill_booked_after_an_amend_joins_the_price_it_hit(self):
+        """10/4 KXTRUMPAPPROVE-26OCT04-E38.1: 79.11 filled at 35, the order was
+        amended to 40 x 120 a minute later, and the poll after that logged the
+        fill at 40 / 120. The row takes the version in force at the fill."""
+        bot = self._bot()
+        t0 = time.time()
+        with self._at(t0 - 300):
+            bot.place_order(Quote(self.T, "ask", 35, 90), t0 - 300)
+        oid = "real-1"
+        with self._at(t0 - 100):
+            self.assertTrue(bot.amend_order_inplace(
+                dict(bot.state.ledger[oid]), Quote(self.T, "ask", 40, 120), t0 - 100))
+        self.assertEqual(bot.state.ledger[oid]["yes_price"], 40)
+        bot.client.fills = [self._fill("t2", oid, 30, 40, t0 - 50),
+                            self._fill("t1", oid, 79.11, 35, t0 - 200)]
+        bot.run_cycle()
+        rows = self._by_id()
+        self.assertEqual(self._join(rows["t1"]), ("ask", 35, 90.0, 90.0, "ledger"))
+        self.assertEqual(self._join(rows["t2"]), ("ask", 40, 120.0, 120.0, "ledger"))
+
+    def test_the_version_pick_trusts_the_fills_price_inside_the_stamp(self):
+        """Kalshi stamps whole seconds: an amend set 1.5s after the stamp may
+        be the one the fill hit -- its price says so. A fill older than every
+        version takes the first, and knows no size before it."""
+        vs = [[100.0, 41, None, 60.0, "ledger"], [201.5, 42, None, 30.0, "ledger"]]
+        self.assertEqual(imm._join_pick(vs, 150, 41.0), 0)
+        self.assertEqual(imm._join_pick(vs, 200, 42.0), 1)     # amend 1.5s on
+        self.assertEqual(imm._join_pick(vs, 200, 41.0), 0)     # fill before it
+        self.assertEqual(imm._join_pick(vs, 250, 41.0), 0)     # price over clock
+        self.assertEqual(imm._join_pick(vs, 250, 45.0), 1)     # no price: clock
+        self.assertEqual(imm._join_pick(vs, 50, 41.0), 0)      # predates both
+        sub = [[100.0, 42, 41.5, 20.0, "ledger"]]               # sub-penny ask
+        self.assertTrue(imm._join_px_ok(sub[0], 41.5))
+        self.assertFalse(imm._join_px_ok(sub[0], 42.0))
+        ent = {"v": vs, "f": {}}
+        self.assertIsNone(IncentiveMarketMaker._join_left(ent, 0, 50, "x"))
+
+    # -- a fill on an order adopted at a restart handoff ---------------------
+
+    def _old_run_hands_over(self, t0):
+        """A run that placed X (ask 41 x 20) and Y (ask 43 x 30) at t0, booked
+        a 5-lot on X, and handed both over at a planned restart."""
+        old = self._bot()
+        with self._at(t0):
+            old.place_order(Quote(self.T, "ask", 41, 20), t0)
+            old.place_order(Quote(self.T, "ask", 43, 30), t0)
+        coid = {o: old.state.ledger[o]["client_order_id"] for o in ("real-1", "real-2")}
+        old._book_fill(self._fill("t1", "real-1", 5, 41, t0 + 10), t0 + 15)
+        born = datetime.fromtimestamp(t0, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old.client.resting = [
+            {"order_id": o, "ticker": self.T, "status": "resting",
+             "client_order_id": coid[o], "book_side": "ask", "yes_price": px,
+             "remaining_count": n, "created_time": born}
+            for o, px, n in (("real-1", 41, 15), ("real-2", 43, 30))]
+        now = datetime.now(timezone.utc)
+        old.state.selected[self.T] = MarketMeta(
+            ticker=self.T, event_ticker="KXGOOD-99DEC31", series="KXGOOD",
+            dollars_per_day=10.0, program_end=now + timedelta(days=3),
+            target_size=1000.0, discount_factor=0.5,
+            cutoff=now + timedelta(days=2), close_time=now + timedelta(days=4))
+        with mock.patch.object(old, "_restart_preflight", return_value=(True, "ok")):
+            self.assertTrue(old._prepare_restart_handoff())
+        return old, coid
+
+    def test_a_fill_on_an_order_adopted_at_a_restart_handoff_keeps_the_join(self):
+        """On 10/4 (22 runs), 93 unjoined rows were on orders an earlier run
+        placed: 51 adopted and then dropped like any other, 42 filled in the
+        restart gap, which the old run's last poll missed and the new run's
+        ledger never held. The old run now hands its join over with the book.
+        In the gap Y filled out (never adopted) and X took 5 more; after
+        adoption X filled out."""
+        t0 = time.time() - 120
+        old, coid = self._old_run_hands_over(t0)
+        with open(imm.restart_handoff_path(), encoding="utf-8") as f:
+            self.assertEqual(sorted(json.load(f)["fill_join"]), ["real-1", "real-2"])
+        # the relaunch: Y is gone, X rests with 10 left
+        new = self._bot(_FillJoinClient([dict(old.client.resting[0],
+                                              remaining_count=10)]))
+        for o in ("real-1", "real-2"):        # persisted across restarts live
+            new.state.our_order_ids.setdefault(o, t0)
+        self.assertEqual(new._adopt_restart_handoff(), 1)
+        self.assertEqual(new.state.ledger["real-1"]["remaining_count"], 10.0)
+        self.assertNotIn("real-2", new.state.ledger)
+        now = time.time()
+        new.client.fills = [self._fill("t4", "real-1", 10, 41, now + 30),
+                            self._fill("t3", "real-1", 5, 41, t0 + 95),
+                            self._fill("t2", "real-2", 30, 43, t0 + 90)]
+        new.run_cycle()
+        rows = self._by_id()
+        # Y, filled out in the gap: the old run's record
+        self.assertEqual(self._join(rows["t2"]), ("ask", 43, 30.0, 30.0, "handoff"))
+        self.assertEqual(rows["t2"]["client_order_id"], coid["real-2"])
+        # X's gap fill: the old run's version, net of the 5 that run booked
+        self.assertEqual(self._join(rows["t3"]), ("ask", 41, 20.0, 15.0, "handoff"))
+        # X after adoption: the adopted version (10 left), which it cleared
+        self.assertEqual(self._join(rows["t4"]), ("ask", 41, 10.0, 10.0, "ledger"))
+        self.assertEqual(rows["t4"]["client_order_id"], coid["real-1"])
+        self.assertGreater(rows["t4"]["order_age_secs"], 100.0)
+
+    def test_an_adopted_order_without_a_handed_over_join_keeps_what_it_knows(self):
+        """The first restart onto this code: the old run's handoff carries no
+        join. A gap fill on an adopted order predates the adopted version,
+        so it keeps the side, price and client id but no size; a fill after
+        adoption has all of it."""
+        t0 = time.time() - 120
+        with open(imm.restart_handoff_path(), "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time() - 30, "run_id": "old", "kept": 1,
+                       "order_ids": ["o9"]}, f)
+        born = datetime.fromtimestamp(t0, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        bot = self._bot(_FillJoinClient([{
+            "order_id": "o9", "ticker": self.T, "status": "resting",
+            "client_order_id": "imm-old-o9", "book_side": "bid",
+            "yes_price_dollars": "0.3800", "remaining_count": 25,
+            "created_time": born}]))
+        self.assertEqual(bot._adopt_restart_handoff(), 1)
+        now = time.time()
+        bot.client.fills = [
+            self._fill("a2", "o9", 25, 38, now + 30, side="yes", action="buy"),
+            self._fill("a1", "o9", 5, 38, now - 60, side="yes", action="buy")]
+        bot.run_cycle()
+        rows = self._by_id()
+        self.assertEqual(self._join(rows["a1"]), ("bid", 38, None, None, "ledger"))
+        self.assertEqual(rows["a1"]["client_order_id"], "imm-old-o9")
+        self.assertEqual(self._join(rows["a2"]), ("bid", 38, 25.0, 25.0, "ledger"))
+
+    # -- the fallback, the bounds, and the guarantees ------------------------
+
+    def test_no_record_of_the_order_derives_the_side_from_kalshis(self):
+        """A fill on an order no run recorded (a crash restart, a taker
+        order): our_book_side from Kalshi's side / action, marked derived."""
+        bot = self._bot()
+        now = time.time()
+        for i, (side, action) in enumerate((("yes", "buy"), ("no", "sell"),
+                                            ("yes", "sell"), ("no", "buy"))):
+            bot._book_fill(self._fill(f"d{i}", f"x{i}", 5, 50, now,
+                                      side=side, action=action), now)
+        rows = self._rows()
+        self.assertEqual([r["our_book_side"] for r in rows],
+                         ["bid", "bid", "ask", "ask"])
+        for r in rows:
+            self.assertEqual(r["join_src"], "derived")
+            for k in ("our_price_cents", "our_remaining_before", "our_left_before",
+                      "client_order_id", "order_age_secs", "is_pad"):
+                self.assertIsNone(r[k], k)
+
+    def test_an_order_is_kept_a_while_after_it_leaves_the_ledger(self):
+        bot = self._bot()
+        now = time.time()
+        bot.place_order(Quote(self.T, "bid", 40, 10), now)
+        bot.place_order(Quote(self.T, "bid", 39, 10), now)
+        bot._join_prune(now + 10 * imm.FILL_JOIN_KEEP_SECS)   # in the ledger
+        self.assertEqual(sorted(bot._fill_join), ["real-1", "real-2"])
+        bot.state.ledger.pop("real-1")
+        bot._join_prune(now)                                  # first seen gone
+        bot._join_prune(now + imm.FILL_JOIN_KEEP_SECS)
+        self.assertIn("real-1", bot._fill_join)
+        bot._join_prune(now + imm.FILL_JOIN_KEEP_SECS + 1)
+        self.assertEqual(sorted(bot._fill_join), ["real-2"])
+        # the ceiling drops gone orders, oldest first
+        bot.state.ledger.clear()
+        bot._fill_join.clear()
+        for i in range(3):
+            bot._fill_join[f"g{i}"] = {"t": self.T, "side": "bid", "coid": None,
+                                       "placed": None, "v": [], "f": {},
+                                       "gone": now + i}
+        with mock.patch.object(imm, "FILL_JOIN_MAX_ORDERS", 2):
+            bot._join_prune(now + 5)
+        self.assertEqual(sorted(bot._fill_join), ["g1", "g2"])
+
+    def test_analytics_off_keeps_no_join(self):
+        with mock.patch.object(IncentiveMarketMaker, "ANALYTICS_ON", False):
+            bot = self._bot()
+            self.assertTrue(bot.place_order(Quote(self.T, "bid", 40, 10), time.time()))
+            self.assertEqual(bot._fill_join, {})
+            self.assertEqual(bot._join_import({"o": {"v": [[1.0, 40, None, 5.0]]}}), 0)
+
+    def test_a_broken_join_never_stops_an_order_or_a_row(self):
+        """The join sits in the order paths: a failure inside it costs one log
+        line, never an order, a booked fill or the row (the ledger answers
+        as it did before 2026-10-04)."""
+        bot = self._bot()
+        bot._fill_join = None                # every join call now fails inside
+        now = time.time()
+        self.assertTrue(bot.place_order(Quote(self.T, "bid", 40, 10), now))
+        self.assertIn("real-1", bot.state.ledger)
+        bot._join_note_fills([self._fill("t1", "real-1", 10, 40, now, side="yes")])
+        bot._book_fill(self._fill("t1", "real-1", 10, 40, now, side="yes",
+                                  action="buy"), now)
+        (row,) = self._rows()
+        self.assertEqual((row["our_book_side"], row["our_price_cents"],
+                          row["join_src"]), ("bid", 40, "ledger"))
+        self.assertAlmostEqual(bot.pnl.pos[self.T], 10.0)
+        self.assertEqual(bot._join_export(), {})
+        self.assertIn("fill_join", bot._sink_muted)
+        self.assertNotIn("fills", bot._sink_muted)
+
+    def test_a_malformed_handoff_join_is_skipped(self):
+        bot = self._bot()
+        n = bot._join_import({
+            "ok": {"t": self.T, "side": "bid", "coid": "c", "placed": 1.0,
+                   "v": [[1.0, 40, None, 5.0]], "f": {"x": [2.0, 1.0, 0]}},
+            "bad_v": {"v": [["nan?", "x"]]},
+            "empty": {"v": []},
+            "bad_f": {"v": [[1.0, 40, None, 5.0]], "f": {"y": [2.0, 1.0, 7]}}})
+        self.assertEqual(n, 2)
+        self.assertEqual(bot._fill_join["ok"]["v"][0][4], "handoff")
+        self.assertEqual(bot._fill_join["bad_f"]["f"], {})
+
+
 class TestPlaceUncertain(unittest.TestCase):
     def test_uncertain_level_skipped_then_expires(self):
         _clean_persist()

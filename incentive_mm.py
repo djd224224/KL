@@ -6696,6 +6696,54 @@ def book_log_dir() -> str:
 GUARD_LOG = os.environ.get("IMM_GUARD_LOG", "1") == "1"
 SELECTION_INPUTS = os.environ.get("IMM_SELECTION_INPUTS", "1") == "1"
 
+# FILL JOIN (2026-10-04). Each fills_*.jsonl row joins the order the fill hit
+# (our_book_side, our_price_cents, our_remaining_before, client_order_id,
+# order_age_secs, is_pad). The join read state.ledger when the fill was
+# booked, but the ledger drops an order BEFORE the next cycle's fills poll
+# books its fill: the resting read no longer holds an order that filled out
+# (_merge_ledger), a cancel or amend of it gets 404/409, our own cancel pulls
+# what a partial fill left, and a restart starts the ledger empty. 29-48% of
+# maker fill rows a day had no join, 9/6-10/4, mostly fills that took the
+# whole rung. An amend overwrote the rest: ~8% of joined rows on 10/3-10/4
+# carried a price set AFTER the fill. Now every ledger write (placement,
+# amend, restart adoption) is also kept as a version in _fill_join, held
+# FILL_JOIN_KEEP_SECS after the order leaves the ledger and handed over at a
+# restart, and the row joins the version in force when the fill hit.
+# Analytics only: nothing reads it to trade.
+FILL_JOIN_KEEP_SECS = max(300.0, _env_float("IMM_FILL_JOIN_KEEP_SECS", 1800.0))
+# Kalshi stamps a fill in whole seconds: a version set up to this long after
+# the stamp may still be the one the fill hit (the fill's price decides)
+FILL_JOIN_SKEW_SECS = 2.0
+# a ceiling on orders held, gone ones oldest first, in case pruning stalls
+FILL_JOIN_MAX_ORDERS = 60000
+# Kalshi's side / action -> our book side (buying YES or selling NO = the bid)
+_FILL_BOOK_SIDE = {("yes", "buy"): "bid", ("no", "sell"): "bid",
+                   ("yes", "sell"): "ask", ("no", "buy"): "ask"}
+
+
+def _join_px_ok(v: list, px_cents: float) -> bool:
+    """Does fill-join version `v` rest at `px_cents`? A maker fill executes
+    at our resting price: the exact sub-penny one when the version has it."""
+    ref = v[2] if v[2] is not None else v[1]
+    return ref is not None and abs(float(ref) - px_cents) < 0.005
+
+
+def _join_pick(vs: List[list], fts: float, px_cents: float) -> int:
+    """Index of the fill-join version (`vs`, oldest first) in force when a
+    fill stamped `fts` hit at `px_cents`: the latest one set within the
+    stamp's second at the fill's price, then within FILL_JOIN_SKEW_SECS at
+    that price, else the latest set within the second, else the first (a
+    fill older than every version we hold)."""
+    end = fts + 1.0
+    for lim in (end, fts + FILL_JOIN_SKEW_SECS):
+        for i in range(len(vs) - 1, -1, -1):
+            if vs[i][0] <= lim and _join_px_ok(vs[i], px_cents):
+                return i
+    for i in range(len(vs) - 1, -1, -1):
+        if vs[i][0] <= end:
+            return i
+    return 0
+
 # Self-restart on code change (Jack 2026-08-24 "restart for me at that time",
 # generalized after the ps1 dispatch chain proved unobservable): sync-kl-main
 # fast-forwards the repo every 30 min, but nothing reliably bounced the bot
@@ -12278,6 +12326,12 @@ class IncentiveMarketMaker:
         # read that produced the order it hit, so the cached panel is the
         # right context, not a fresh read.
         self._last_panel: Dict[str, dict] = {}
+        # The fills sink's ledger join (FILL_JOIN_*): order id -> {"t", "side",
+        # "coid", "placed", "v": versions [set at, YES cents, exact cents,
+        # remaining as set, "ledger" / "handoff"], "f": fill id -> [Kalshi's
+        # stamp, count, version index], "gone": first prune that found the
+        # order out of the ledger}. Outlives the ledger entry on purpose.
+        self._fill_join: Dict[str, dict] = {}
         self._realized_by_ticker: Dict[str, float] = {}   # per-market delta base
         self._cycle_hdr_ok = False                 # cycle-log header checked once
         self._marks_at = 0.0                       # 5-min mark series throttle
@@ -12658,12 +12712,19 @@ class IncentiveMarketMaker:
 
         Three joins are taken here that are impossible to reconstruct later:
 
-        `ledger`  the order this fill hit is still in self.state.ledger at
-                  this moment, carrying the price WE quoted, the rung's
-                  remaining size, whether it was a 1c/99c pad, and when it
-                  was placed. One dict lookup away, and previously dropped.
-                  Past 7 days our_order_ids prunes and even OWNERSHIP of a
-                  historical fill becomes unprovable on a shared account.
+        `ledger`  the order this fill hit AS IT STOOD WHEN THE FILL HIT: the
+                  price WE quoted, the rung's remaining size as we last set
+                  it and what was left of it, whether it was a 1c/99c pad,
+                  and when it was placed. Read from _fill_join (FILL_JOIN_*),
+                  which keeps every version the ledger gave the order --
+                  the ledger itself drops an order that filled out before
+                  this poll books the fill, and an amend overwrites it.
+                  `join_src` says where it came from: "ledger" (this run),
+                  "handoff" (the run before a restart handoff) or "derived"
+                  (no record of the order: our_book_side from Kalshi's side /
+                  action, the rest null). Past 7 days our_order_ids prunes
+                  and even OWNERSHIP of a historical fill becomes unprovable
+                  on a shared account.
 
         `panel`   the book/reward state from the last cycle read — ext bid/ask,
                   depth, target, est_frac, pool. This is what makes
@@ -12673,9 +12734,37 @@ class IncentiveMarketMaker:
         `pos_*`   inventory before and after, so a fill can be classified as
                   opening, adding or reducing without replaying the tape."""
         try:
-            led = self.state.ledger.get(f.get("order_id") or "") or {}
+            oid = str(f.get("order_id") or "")
+            book_side = our_px = rem = left = coid = placed = src = None
+            try:
+                hit = self._join_fill(f, px_cents, count)
+            except Exception as ex:          # the row still goes out
+                self._join_fail(ex)
+                hit = None
+            if hit is not None:
+                ent, vi = hit
+                v = ent["v"][vi]
+                book_side, our_px, coid, placed, src = (
+                    ent["side"], v[1], ent["coid"], ent["placed"], v[4])
+                left = self._join_left(ent, vi, float(self._fill_ts(f)),
+                                       str(f.get("trade_id") or f.get("fill_id") or ""))
+                # a version set after the fill (an adopted order's gap fill
+                # with nothing handed over) does not know the size before it
+                rem = v[3] if left is not None else None
+            else:
+                led = self.state.ledger.get(oid)
+                if led:
+                    book_side, our_px, rem = (led.get("book_side"),
+                                              led.get("yes_price"),
+                                              led.get("remaining_count"))
+                    coid, placed, src = (led.get("client_order_id"),
+                                         led.get("_placed_at"), "ledger")
+                else:
+                    # no record of the order (a restart that handed nothing
+                    # over, a taker order): Kalshi's side / action, which
+                    # matches the join on every row that has both
+                    book_side, src = _FILL_BOOK_SIDE.get((side, action)), "derived"
             panel = self._last_panel.get(tkr) or {}
-            our_px = led.get("yes_price")
             self._sink("fills", {
                 "ts": self._fill_ts(f),
                 "cycle_ts": now_ts,
@@ -12690,14 +12779,14 @@ class IncentiveMarketMaker:
                 "yes_price_cents": px_cents,
                 "is_taker": f.get("is_taker"),
                 # --- the order we had resting (ledger join) ---
-                "our_book_side": led.get("book_side"),
+                "our_book_side": book_side,
                 "our_price_cents": our_px,
-                "our_remaining_before": led.get("remaining_count"),
-                "client_order_id": led.get("client_order_id"),
-                "order_age_secs": (round(now_ts - led["_placed_at"], 1)
-                                   if led.get("_placed_at") else None),
-                "is_pad": (self._is_pad_price(led["book_side"], our_px)
-                           if led.get("book_side") and our_px is not None
+                "our_remaining_before": rem,
+                "client_order_id": coid,
+                "order_age_secs": (round(now_ts - placed, 1)
+                                   if placed else None),
+                "is_pad": (self._is_pad_price(book_side, our_px)
+                           if book_side and our_px is not None
                            else None),
                 # --- inventory context ---
                 "pos_before": pos_before,
@@ -12715,11 +12804,188 @@ class IncentiveMarketMaker:
                 "pool_per_day": panel.get("pool_per_day"),
                 "panel_ts": panel.get("ts"),
                 "is_scan": panel.get("is_scan"),
+                # --- the join's source, and what was left (2026-10-04) ---
+                "join_src": src,
+                # our_remaining_before less the order's earlier fills on the
+                # same version: count >= this means the fill took the rung
+                "our_left_before": left,
             })
         except Exception as e:
             if "fills" not in self._sink_muted:
                 self._sink_muted.add("fills")
                 log(f"{self.tag} ! fill sink failed ({e}); muted for this run")
+
+    # ---- fills-sink ledger join (FILL_JOIN_*, 2026-10-04) --------------------
+
+    def _join_fail(self, ex: Exception) -> None:
+        """One log line per run for a join bookkeeping failure; the order
+        paths and the fills row carry on without it."""
+        if "fill_join" not in self._sink_muted:
+            self._sink_muted.add("fill_join")
+            log(f"{self.tag} ! fill-join bookkeeping failed ({ex}); fills rows "
+                f"may lack their ledger join this run")
+
+    def _join_set(self, oid: str, ticker: str, book_side: str, yes_price,
+                  exact, remaining, coid=None, placed=None) -> None:
+        """Keep one ledger write (placement, amend, restart adoption) as a new
+        version of the order for the fills sink's join. Called from the order
+        paths, so it never raises."""
+        if not (self.ANALYTICS_ON and oid):
+            return
+        try:
+            ent = self._fill_join.get(oid)
+            if ent is None:
+                ent = self._fill_join[oid] = {
+                    "t": ticker, "side": book_side, "coid": coid,
+                    "placed": placed, "v": [], "f": {}, "gone": None}
+            else:
+                ent["coid"] = ent.get("coid") or coid
+                ent["placed"] = ent.get("placed") or placed
+            ent["v"].append([time.time(),
+                             None if yes_price is None else int(yes_price),
+                             None if exact is None else float(exact),
+                             None if remaining is None else float(remaining),
+                             "ledger"])
+            ent["gone"] = None
+        except Exception as ex:
+            self._join_fail(ex)
+
+    def _join_fill(self, f: dict, px_cents: float, count: float):
+        """(entry, version index) of the order one of our fills hit, the fill
+        registered on that version once (by fill id) so the order's later
+        fills count it; None when there is no record of the order."""
+        ent = self._fill_join.get(str(f.get("order_id") or ""))
+        if ent is None or not ent["v"]:
+            return None
+        fid = str(f.get("trade_id") or f.get("fill_id") or "")
+        got = ent["f"].get(fid) if fid else None
+        if got is not None:
+            return ent, int(got[2])
+        fts = float(self._fill_ts(f))
+        vi = _join_pick(ent["v"], fts, px_cents)
+        if fid:
+            ent["f"][fid] = [fts, float(count), vi]
+        return ent, vi
+
+    @staticmethod
+    def _join_left(ent: dict, vi: int, fts: float, fid: str) -> Optional[float]:
+        """What was left of the order just before this fill: version `vi`'s
+        remaining less the fills registered on it earlier (Kalshi's stamp,
+        then fill id). None when the version was set after the fill. A fill
+        older than the version (an adopted order's gap fill) is already
+        netted out of the remaining the version was read with, so it never
+        counts against a later one."""
+        v = ent["v"][vi]
+        if v[3] is None or v[0] > fts + FILL_JOIN_SKEW_SECS:
+            return None
+        key = (fts, fid)
+        prior = sum(x[1] for k, x in ent["f"].items()
+                    if int(x[2]) == vi and k != fid
+                    and x[0] + FILL_JOIN_SKEW_SECS >= v[0] and (x[0], k) < key)
+        return round(max(0.0, v[3] - prior), 4)
+
+    def _join_note_fills(self, fills: List[dict]) -> None:
+        """Register a fills poll's whole batch on its orders' versions BEFORE
+        any of it is booked: Kalshi returns a batch newest first, and what was
+        left of an order before a fill counts that order's EARLIER fills.
+        Never raises."""
+        if not self._fill_join:
+            return
+        for f in fills:
+            try:
+                # parsed as _book_fill parses it
+                count = float(f.get("count_fp") or f.get("count") or 0)
+                px = f.get("yes_price_dollars")
+                px_cents = float(px) * 100 if px is not None else float(f.get("yes_price") or 0)
+                if count > 0:
+                    self._join_fill(f, px_cents, count)
+            except Exception as ex:
+                self._join_fail(ex)
+
+    def _join_prune(self, now_ts: float) -> None:
+        """Once a cycle, after the fills poll is booked: an order out of the
+        ledger is kept FILL_JOIN_KEEP_SECS from the first prune that finds it
+        gone (its last fills are booked by the next poll), then forgotten.
+        Never raises."""
+        if not self._fill_join:
+            return
+        try:
+            led = self.state.ledger
+            drop = []
+            for oid, ent in self._fill_join.items():
+                if oid in led:
+                    ent["gone"] = None
+                elif ent["gone"] is None:
+                    ent["gone"] = now_ts
+                elif now_ts - ent["gone"] > FILL_JOIN_KEEP_SECS:
+                    drop.append(oid)
+            for oid in drop:
+                del self._fill_join[oid]
+            over = len(self._fill_join) - FILL_JOIN_MAX_ORDERS
+            if over > 0:
+                for _g, oid in sorted((ent["gone"], oid) for oid, ent
+                                      in self._fill_join.items()
+                                      if ent["gone"] is not None)[:over]:
+                    del self._fill_join[oid]
+        except Exception as ex:
+            self._join_fail(ex)
+
+    def _join_export(self) -> Dict[str, dict]:
+        """The join's records, JSON-safe, for the relaunch to book the fills
+        that land after this run's last poll (restart handoff). Never raises:
+        empty on failure."""
+        def num(x):
+            return None if x is None else float(x)
+
+        def txt(x):
+            return None if x is None else str(x)
+        try:
+            # coerced field by field: the handoff's json.dump must never trip
+            # on a value the export carries
+            return {str(oid): {
+                "t": txt(ent["t"]), "side": txt(ent["side"]),
+                "coid": txt(ent["coid"]), "placed": num(ent["placed"]),
+                "v": [[float(v[0]), None if v[1] is None else int(v[1]),
+                       num(v[2]), num(v[3])] for v in ent["v"]],
+                "f": {str(k): [float(x[0]), float(x[1]), int(x[2])]
+                      for k, x in ent["f"].items()}}
+                for oid, ent in self._fill_join.items() if ent["v"]}
+        except Exception as ex:
+            self._join_fail(ex)
+            return {}
+
+    def _join_import(self, data) -> int:
+        """Load the records a restart handoff carried; their versions are
+        marked "handoff". A malformed record is skipped, an order this run
+        already holds is kept as is. Returns the number loaded; never
+        raises."""
+        if not (self.ANALYTICS_ON and isinstance(data, dict)):
+            return 0
+        n = 0
+        for oid, ent in data.items():
+            try:
+                oid = str(oid)
+                if not oid or oid in self._fill_join:
+                    continue
+                vs = [[float(v[0]), None if v[1] is None else int(v[1]),
+                       None if v[2] is None else float(v[2]),
+                       None if v[3] is None else float(v[3]), "handoff"]
+                      for v in ent["v"]]
+                if not vs:
+                    continue
+                fs = {str(k): [float(x[0]), float(x[1]), int(x[2])]
+                      for k, x in (ent.get("f") or {}).items()
+                      if 0 <= int(x[2]) < len(vs)}
+                placed = ent.get("placed")
+                self._fill_join[oid] = {
+                    "t": ent.get("t"), "side": ent.get("side"),
+                    "coid": ent.get("coid"),
+                    "placed": None if placed is None else float(placed),
+                    "v": vs, "f": fs, "gone": None}
+                n += 1
+            except Exception:
+                continue
+        return n
 
     # ---- toxic-flow side halt (TOXIC_*, Jack 2026-09-29) ---------------------
 
@@ -13526,6 +13792,8 @@ class IncentiveMarketMaker:
                 "status": "resting", "client_order_id": client_order_id,
                 "_placed_at": now_ts, "_confirmed": False,
             }
+            self._join_set(oid, q.ticker, q.book_side, q.price_cents,
+                           q.price_exact, float(q.count), client_order_id, now_ts)
             log(f"{self.tag} placed {label} -> {oid}")
             self._log_order("place", q.ticker, q.book_side, q.price_cents,
                             q.count, oid, now_ts,
@@ -13670,6 +13938,12 @@ class IncentiveMarketMaker:
             if led is not None:
                 led["yes_price"] = q.price_cents
                 led["remaining_count"] = float(q.count)
+            # the fills sink joins a fill to the version it hit: one landing
+            # before this amend is booked after it. An amend sends whole
+            # cents, so the new version has no sub-penny price.
+            self._join_set(oid, q.ticker, q.book_side, q.price_cents, None,
+                           float(q.count), o.get("client_order_id"),
+                           self.state.order_ages.get(oid))
             log(f"{self.tag} amended {label}")
             self._log_order("amend", q.ticker, q.book_side, q.price_cents,
                             q.count, oid, now_ts,
@@ -17359,11 +17633,16 @@ class IncentiveMarketMaker:
         self._cycle_cancelled = set()      # this cycle's cancels (WS view)
         self._cycle_amended = {}           # this cycle's amends: id -> new cents
         self._cycle_amended_ct = {}        # ...and the size each one set
-        for f in self.fetch_new_fills():
+        new_fills = self.fetch_new_fills()
+        # the fills sink's join sees the whole batch (newest first) before
+        # any of it is logged; analytics only, never raises
+        self._join_note_fills(new_fills)
+        for f in new_fills:
             try:
                 self._book_fill(f, now_ts)
             except Exception as e:
                 log(f"{self.tag} ! unparseable fill skipped: {e}")
+        self._join_prune(now_ts)
         # WebSocket feed events since the last look (2026-10-03): drained so
         # they do not pile up; never a cycle error
         try:
@@ -19647,7 +19926,10 @@ class IncentiveMarketMaker:
         payload = {"ts": round(now_ts, 3), "run_id": RUN_ID,
                    "source_mtime": _SOURCE_MTIME, "kept": len(keep),
                    "cancelled": n_cx,
-                   "order_ids": sorted(str(i) for i in keep_ids if i)}
+                   "order_ids": sorted(str(i) for i in keep_ids if i),
+                   # the fills sink's join (FILL_JOIN_*): the relaunch books
+                   # every fill that lands after this run's last poll
+                   "fill_join": self._join_export()}
         try:
             os.makedirs(STATUS_DIR, exist_ok=True)
             tmp = restart_handoff_path() + ".tmp"
@@ -19705,6 +19987,13 @@ class IncentiveMarketMaker:
             os.remove(path)
         except OSError:
             pass
+        if isinstance(data, dict):
+            # the last run's fills-sink join, whatever becomes of its book:
+            # this run's first poll books the fills of the restart gap
+            n_join = self._join_import(data.get("fill_join"))
+            if n_join:
+                log(f"{self.tag} startup: fill join for {n_join} order(s) "
+                    f"handed over by run {data.get('run_id')}")
         if not RESTART_KEEP_ORDERS or not isinstance(data, dict):
             return None
         try:
@@ -19744,6 +20033,9 @@ class IncentiveMarketMaker:
                 "client_order_id": o.get("client_order_id"),
                 "_placed_at": placed, "_confirmed": True,
             }
+            self._join_set(oid, o.get("ticker", ""), parsed[0], parsed[1],
+                           order_yes_exact_cents(o), order_remaining(o),
+                           o.get("client_order_id"), placed)
             n += 1
         log(f"{self.tag} startup: adopted {n} resting imm- order(s) handed over "
             f"by run {data.get('run_id')} {age:.0f}s ago (restart handoff); the "

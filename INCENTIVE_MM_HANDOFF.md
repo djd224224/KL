@@ -7756,3 +7756,83 @@ test_rain_monthly_fair.py (+11: period rules and station codes, events,
 segments across the new year and Feb 29, to-date incl. ACIS fill and
 the stale rules, the kernel, forecast injection, the writer's period
 weather rule and event re-read).
+
+## 2026-10-04 (late) — fills rows keep their ledger join (spun off from "Build these 3")
+
+WHY. Every day since 9/6, 29-48% of maker rows in fills_*.jsonl had no
+ledger join (our_book_side, our_price_cents, our_remaining_before,
+client_order_id, order_age_secs, is_pad all null), and they were mostly the
+full-rung fills. _log_fill read state.ledger when the fills poll booked the
+fill, and the ledger had already let the order go. A replay of 10/4's sinks
+through ~22:00Z (231 unjoined of 482 maker rows) splits them by path:
+- 87: _merge_ledger. The order filled out after a cycle's fills poll, the
+  same cycle's resting read (after the universe refresh, often a minute or
+  more later) no longer held it, and the entry was dropped. The next poll
+  booked the fill.
+- 26: a cancel of the order got 404/409 (it had filled out). An amend
+  answered 404/409 drops it the same way and leaves no orders row.
+- 23: a partial fill, then our own cancel (requote, renewal, stray) pulled
+  the rest before the poll.
+- 93: orders an earlier run placed (22 runs that day). 51 were adopted and
+  then dropped in the ways above. 42 filled in the restart gap: the old
+  run's last poll missed them and the new run's ledger never held them.
+An amend also overwrote what was left: 37 of 489 joined rows on 10/3-10/4
+carried a price and size set AFTER the fill (KXTRUMPAPPROVE-26OCT04-E38.1:
+79.11 filled at 35, then amended to 40 x 120, then logged at 40 / 120).
+
+WHAT (analytics only; the ledger and every trading path are unchanged).
+- _fill_join keeps each ledger write (place_order, amend_order_inplace,
+  _adopt_restart_handoff) as a version of the order:
+  [set at, YES cents, exact cents, remaining as set, source]. An order is
+  forgotten FILL_JOIN_KEEP_SECS (IMM_FILL_JOIN_KEEP_SECS, 1800) after the
+  first prune that finds it out of the ledger. Pruning runs once a cycle,
+  after the fills poll is booked; FILL_JOIN_MAX_ORDERS (60,000) caps it.
+  10/4 placed ~5,200 orders an hour, so expect ~10-15k orders held.
+- _log_fill takes the version in force at Kalshi's fill stamp. Kalshi
+  stamps whole seconds, so the fill's price (a maker fill trades at our
+  resting price) settles an amend inside the stamp's second (+2s).
+- A poll's batch is registered on its orders before any row is written
+  (Kalshi returns it newest first: 455 of 455 multi-stamp batches 10/1-10/4),
+  so each row knows the order's earlier fills.
+- The restart handoff carries the join (restart_handoff.json "fill_join").
+  The relaunch loads it whatever becomes of the book, so a gap fill joins
+  the old run's version.
+- The row keeps every column and gains two: `join_src` (ledger / handoff /
+  derived) and `our_left_before` (what was left of the order just before
+  this fill; count >= it = the fill took the rung). With no record of the
+  order (a crash restart, a taker order), our_book_side comes from Kalshi's
+  side/action and the row is marked derived. IMM_LOGGING.md "### fills" has
+  the semantics and the caveats for rows written before this.
+
+Replayed through the bot on the base commit vs this branch: a merge drop,
+a cancel 404 and a partial-then-cancel logged (None, None, None) before and
+(side, price, size) now. The amend case logged 40 / 120 before and 35 / 90
+now. On production data (versions rebuilt from 10/2-10/4 orders rows, the
+branch's own _join_pick / _join_left): all 888 maker fills of 10/3-10/4
+pick a version resting at the fill's price, every old join reproduces
+exactly except the 37 amend cases, and our_left_before equals the WS sweep
+breaker's rem_before on all 25 trips.
+
+NOT CHANGED, for Jack's call:
+- _toxic_note_fill still reads state.ledger to skip 1c/99c pads. A pad fill
+  whose entry was already dropped counts toward the toxic side halt. That
+  happened 5 times 9/6-10/4 (24 pad fills were joined). Pointing it at
+  _fill_join would change trading.
+- A restart that hands nothing over (crash, hard kill, halt exit) still
+  starts empty. Its gap fills log derived.
+- ws_stale_score.is_full reads our_remaining_before <= count. It can switch
+  to our_left_before when the row has it. Rows before this carry no such
+  key, so the 10/5 scoring of 10/4 is unaffected either way.
+
+DEPLOY. A plain code deploy (the code-change exit hands the book over). The
+first restart onto this code reads a handoff file without "fill_join": that
+one gap logs as before for orders that filled out, and adopted orders' gap
+fills keep side / price / client id with a null size. Every later restart
+hands the join over. Startup line: "startup: fill join for N order(s)
+handed over by run <id>".
+
+WATCH. In fills_*.jsonl after the deploy, maker rows with join_src derived
+should be ~0 outside the first restart gap. our_book_side null should be 0.
+
+Kill: IMM_ANALYTICS=0 (it already turns off the fills sink). Tests:
+TestFillLedgerJoin (12).
