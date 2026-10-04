@@ -35,11 +35,13 @@ liquidity rewards already earned are paid out (imm_reward_recon.
 unpaid_estimate: accrual in program periods still running or ended since
 midnight ET yesterday, $1 floor per market per period, x each family's
 paid/modelled ratio). Kalshi has no credits endpoint, so it is a model.
-Under it and first in the subject, the TOTAL PROFIT (since 2026-10-04): the
-account value less every dollar deposited plus every dollar withdrawn since
-the account opened (fetch_transfers: /portfolio/deposits and
-/portfolio/withdrawals, read in full each morning), with the same
-after-rewards estimate in the body.
+Under it, the TOTAL PROFIT (since 2026-10-04): the account value less every
+dollar deposited plus every dollar withdrawn since the account opened
+(fetch_transfers: /portfolio/deposits and /portfolio/withdrawals, read in
+full each morning), with the same after-rewards estimate. The day change
+leaves deposits and withdrawals out too: it is the day's change in total
+profit. The subject carries both: "portfolio 2026-10-04: profit +$18.2k
+(day +$1.6k, trading -$0.7k)".
 
 State lives in portfolio_daily\:
     pf_snapshot_YYYY-MM-DD.json  - per-event E components (diff baseline)
@@ -137,6 +139,12 @@ def _pnl_span(v: float) -> str:
 def _signed_usd(v: float) -> str:
     """+$1,234.56 / -$1,234.56."""
     return f"{'-' if v < -0.005 else '+'}${abs(v):,.2f}"
+
+
+def _signed_k(v: float) -> str:
+    """+$18.2k / -$0.7k: the subject line's dollars, in thousands."""
+    k = round(v / 1000.0, 1)
+    return "$0.0k" if k == 0 else f"{'-' if k < 0 else '+'}${abs(k):,.1f}k"
 
 
 def event_from_ticker(ticker: str) -> str:
@@ -1178,6 +1186,7 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     ex_perps = " ex-perpetuals" if perps_eq is not None else ""
     trading = mv_tot["day"]
     parts = None                        # [(label, $)] summing to d_ek exactly
+    transfers = None if first else pf.get("net_transfers")
     if not first:
         ntc = pf.get("no_trade_cash")
         if ntc is None:                 # no replay (legacy prior snapshot)
@@ -1185,7 +1194,6 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                      ("credits, deposits & Kalshi's pricing vs mid",
                       round(d_ek - trading, 2))]
         else:
-            transfers = pf.get("net_transfers")
             parts = [("trading (at mid)", trading),
                      ("reward credits" if transfers is not None
                       else "reward credits & deposits",
@@ -1194,12 +1202,21 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                 parts.append(("deposits/withdrawals", transfers))
             parts.append(("Kalshi's pricing vs mid", round(d_ek - trading - ntc, 2)))
 
-    # total profit leads the subject (Jack 2026-10-04: "add total profit to
-    # the subject line too"); left out when the transfer reads failed
-    head = [] if profit is None else [f"total profit {profit:+,.2f}"]
-    head += (["first baseline"] if first else
-             [f"day {d_equity:+,.2f}", f"trading {trading:+,.2f}"])
-    subject = f"Kalshi portfolio {today} — " + ", ".join(head)
+    # The day figure, in the subject and the body, leaves deposits and
+    # withdrawals out (Jack 2026-10-04: "make the day figure exclude
+    # deposits"): it is the day's change in total profit. Unread transfers
+    # stay in it, and the subject says so.
+    d_day = None if first else round(d_equity - (transfers or 0.0), 2)
+    day_parts = [(k, v) for k, v in parts or [] if k != "deposits/withdrawals"]
+
+    # Jack 2026-10-04: "shorten like this: portfolio 2026-10-04: profit
+    # +$18.2k (day +$1.6k, trading -$0.7K)"
+    subject = (f"portfolio {today}: profit "
+               + ("n/a" if profit is None else _signed_k(profit))
+               + (" (first baseline)" if first else
+                  f" (day {_signed_k(d_day)}"
+                  + ("" if transfers is not None else " incl. any deposits")
+                  + f", trading {_signed_k(trading)})"))
     if imm and imm.get("subject_flag"):
         subject += imm["subject_flag"]
 
@@ -1218,10 +1235,12 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     if first:
         lines.append("First run: baseline saved; day-over-day starts tomorrow.")
     else:
-        lines.append(f"vs yesterday: {d_equity:+,.2f}  =  "
-                     + "  +  ".join(f"{k} {v:+,.2f}" for k, v in parts)
+        lines.append(f"vs yesterday: {d_day:+,.2f}  =  "
+                     + "  +  ".join(f"{k} {v:+,.2f}" for k, v in day_parts)
                      + ("" if d_perps is None else
-                        f"  +  perpetuals {d_perps:+,.2f}"))
+                        f"  +  perpetuals {d_perps:+,.2f}")
+                     + ("" if not transfers else
+                        f"  (excludes deposits/withdrawals {transfers:+,.2f})"))
     lines.append("")
     # the risk-controls block under the account summary, as in the html
     # (Jack 2026-10-03: "move the risk controls section right under the
@@ -1305,11 +1324,14 @@ def build_email(pf, history, chart_ok: bool, imm=None):
              + ("" if not profit_basis else
                 f'<br>total profit = {_esc(profit_basis).replace(" - ", " &minus; ")}')
              + ("" if first else
-                f'<br>day change {_pnl_span(d_equity)} = '
+                f'<br>day change {_pnl_span(d_day)} = '
                 + ' &nbsp;+&nbsp; '.join(f'{k.replace("&", "&amp;")} {_pnl_span(v)}'
-                                         for k, v in parts)
+                                         for k, v in day_parts)
                 + ("" if d_perps is None else
-                   f' &nbsp;+&nbsp; perpetuals {_pnl_span(d_perps)}'))
+                   f' &nbsp;+&nbsp; perpetuals {_pnl_span(d_perps)}')
+                + ("" if not transfers else
+                   f' <span style="color:{C_MUTED}">(excludes deposits/withdrawals '
+                   f'{transfers:+,.2f})</span>'))
              + '</div>')
     if unpaid_note:
         h.append(f'<div style="color:{C_MUTED};font-size:12px;margin-bottom:6px">'
