@@ -7590,10 +7590,18 @@ Nothing here changes trading.
    - The reward cost uses the event's day-average rate, which runs low while
      the event is active; double it and 30m is still +$17/day.
    - Script: imm_sweep_backtest.py.
-   - KNOWN GAP: a partial fill that lands between a cycle's resting read and
-     its view rebuild is lost from the rebuilt view. A later fill that clears
-     the rest can then miss its trip, so dry trips may run a little under the
-     backtest. Never a false trip.
+   - VIEW SIZES (fixed the same evening, after the first live fill missed its
+     trip: KXRAIN-26OCT05-NOLA ask read at 38, amended to 30 this cycle,
+     filled out for 30 at 20:42:40Z):
+     - The rebuild takes an amended order's new size (_cycle_amended_ct).
+     - It then takes off our WS fills (_ws_fill_log, exchange time) that
+       landed more than 1s after the cycle's resting read
+       (_resting_read_at, stamped when the paged read ends). So a fill at
+       the boundary can only cause a missed trip, never a false one.
+     - An order placed since the last rebuild nets its earlier WS fills
+       off the ledger size.
+     - Every maker fill is logged and booked into the view whatever the
+       breaker's mode.
 
 3. IN-CYCLE STALE CHECK (WS_CHECK_IN_CYCLE, default on; WS_TICK_SECS 1).
    _ws_cycle_tick runs the stale check and the sweep breaker inside the

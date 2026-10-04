@@ -21124,6 +21124,57 @@ class TestSweepBreaker(unittest.TestCase):
             self._fill("o1", 20)
         self.assertEqual((self._trips(), self.bot._sweep["fills_seen"]), ([], 0))
 
+    def test_an_order_resized_by_this_cycles_amend_trips_at_its_new_size(self):
+        # 10/4 20:42Z: KXRAIN-26OCT05-NOLA ask read at 38, amended to 30 this
+        # cycle, then filled out for 30 -- the view must hold 30, not 38
+        b = self.bot
+        b._cycle_cancelled = set()
+        b._cycle_amended = {"oN": 45}
+        b._cycle_amended_ct = {"oN": 30.0}
+        b._build_resting_view([{"order_id": "oN", "ticker": self.A,
+                                "book_side": "ask", "yes_price": 45,
+                                "remaining_count": 38}], self.now)
+        self.assertEqual([o["rem"] for o in b._resting_view[self.A]], [30.0])
+        self._fill("oN", 30)
+        self.assertEqual([t["order_id"] for t in self._trips()], ["oN"])
+
+    def test_the_rebuild_takes_off_fills_that_landed_after_the_read(self):
+        b = self.bot
+        b._resting_read_at = self.now - 60.0
+        b._cycle_cancelled = set()
+        b._cycle_amended = {"o2": 45}
+        b._cycle_amended_ct = {"o2": 15.0}
+        b._ws_fill_log.extend([
+            (self.now - 120.0, "o1", 5.0),      # before the read: already in it
+            (self.now - 59.5, "o1", 3.0),       # inside the 1s guard: kept
+            (self.now - 30.0, "o1", 8.0),       # after the read: comes off
+            (self.now - 20.0, "o2", 5.0)])      # off the amended size too
+        b._build_resting_view([
+            {"order_id": "o1", "ticker": self.A, "book_side": "bid",
+             "yes_price": 40, "remaining_count": 20},
+            {"order_id": "o2", "ticker": self.A, "book_side": "ask",
+             "yes_price": 45, "remaining_count": 38}], self.now)
+        self.assertEqual({o["order_id"]: o["rem"] for o in b._resting_view[self.A]},
+                         {"o1": 12.0, "o2": 10.0})
+
+    def test_a_just_placed_order_partly_filled_twice_still_trips(self):
+        self.bot.state.ledger["o9"] = {"order_id": "o9", "ticker": self.B,
+                                       "book_side": "bid", "yes_price": 30,
+                                       "yes_price_exact": None,
+                                       "remaining_count": 20.0}
+        self._fill("o9", 8, ticker=self.B)
+        self.assertEqual(self._trips(), [])
+        self._fill("o9", 12, ticker=self.B, dt=3.0)
+        self.assertEqual([t["order_id"] for t in self._trips()], ["o9"])
+        self.assertEqual(self._trips()[0]["rem_before"], 12.0)
+
+    def test_off_still_books_the_fill_into_the_view(self):
+        with mock.patch.object(imm, "SWEEP_BREAKER", "off"):
+            self._fill("o1", 8)
+        self.assertEqual(self.bot._resting_view[self.A][0]["rem"], 12.0)
+        self.assertEqual([x[1:] for x in self.bot._ws_fill_log], [("o1", 8.0)])
+        self.assertEqual(self.bot._sweep["fills_seen"], 0)
+
     def test_a_trip_inside_the_cycle_comes_from_the_tick(self):
         with mock.patch.object(imm, "WS_CHECK_IN_CYCLE", True):
             self.feed.events = [("fill", {"order_id": "o1", "market_ticker": self.A,

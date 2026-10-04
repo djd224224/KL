@@ -12154,6 +12154,9 @@ class IncentiveMarketMaker:
         # check's view of our resting orders is rebuilt from them each cycle
         self._cycle_cancelled: Set[str] = set()
         self._cycle_amended: Dict[str, int] = {}
+        # ...and the remaining size each amend set (an amend that resizes is
+        # common; the cycle-top read still holds the old size)
+        self._cycle_amended_ct: Dict[str, float] = {}
         self._resting_view: Dict[str, List[dict]] = {}
         self._ws_suspect: Dict[str, float] = {}    # order id -> first seen ahead
         # open stale-quote episodes (2026-10-04, WS_STALE_LOG): order id ->
@@ -12183,6 +12186,11 @@ class IncentiveMarketMaker:
         self._cycle_times: Deque[Tuple[float, float, float]] = deque(maxlen=30)
         # event sweep breaker (2026-10-04, SWEEP_BREAKER): event -> hold end
         self._sweep_until: Dict[str, float] = {}
+        # our WS fills (exchange time, order id, contracts) and when the cycle
+        # last read its resting orders: the view rebuild subtracts the fills
+        # that landed after that read, which the read cannot hold
+        self._ws_fill_log: Deque[Tuple[float, str, float]] = deque(maxlen=2000)
+        self._resting_read_at = 0.0
         self._sweep = {"trips": 0, "cancels": 0, "skipped_budget": 0,
                        "fills_seen": 0, "unparsed": 0, "unknown_order": 0}
         self._load_persist()
@@ -13493,6 +13501,7 @@ class IncentiveMarketMaker:
                 order_id=oid, ticker=q.ticker, book_side=q.book_side,
                 yes_price_cents=q.price_cents, total_count=total)
             self._cycle_amended[oid] = int(q.price_cents)
+            self._cycle_amended_ct[oid] = float(q.count)
             led = self.state.ledger.get(oid)
             # Read the previous price/size BEFORE the overwrite below, and
             # keep the FULL order id: the prose line truncates it to 8 chars,
@@ -13908,40 +13917,49 @@ class IncentiveMarketMaker:
         return SWEEP_BREAKER == "on" and self._sweep_until.get(event, 0.0) > now_ts
 
     def _sweep_note_fill(self, body: dict, now_ts: float) -> None:
-        """EVENT SWEEP BREAKER (SWEEP_BREAKER), on one of our WS fills. A maker
-        fill that takes ALL that was left of its order trips the order's
-        event:
+        """One of our WS fills. Every maker fill is logged (for the next view
+        rebuild) and booked down in the resting view, whatever the mode.
+        Then the EVENT SWEEP BREAKER (SWEEP_BREAKER): a maker fill that takes
+        ALL that was left of its order trips the order's event:
           - dry: the trip is logged and counted;
           - on: every other resting order of ours in the event is cancelled
             at once (on the fast-cancel budget), and the cycle quotes nothing
             there until the hold ends.
-        A partial fill only books the order's remaining size down in the view,
-        so a later fill that clears the rest counts as the sweep. Never
-        raises."""
-        if SWEEP_BREAKER == "off":
-            return
+        A partial fill only books the order down, so a later fill that clears
+        the rest counts as the sweep. Never raises."""
         try:
-            self._sweep["fills_seen"] += 1
             oid = str(body.get("order_id") or "")
             t = str(body.get("market_ticker") or body.get("ticker") or "")
             raw = body.get("count_fp")
             n = float(raw if raw not in (None, "") else (body.get("count") or 0.0))
+            fts = body.get("ts_ms")
+            fts = float(fts) / 1000.0 if fts else float(body.get("ts") or now_ts)
+            maker = bool(oid and t and n > 0 and not body.get("is_taker"))
+            mine = next((o for o in self._resting_view.get(t, ())
+                         if o["order_id"] == oid), None) if maker else None
+            prior = 0.0
+            if maker:
+                if mine is None:   # placed since the last rebuild: its fills so far
+                    prior = sum(f_n for _ft, f_oid, f_n in self._ws_fill_log
+                                if f_oid == oid)
+                self._ws_fill_log.append((fts, oid, n))
+            if mine is not None:
+                rem, side, px = mine["rem"], mine["side"], mine["px"]
+                mine["rem"] = max(0.0, rem - n)        # the view books the fill
+            if SWEEP_BREAKER == "off":
+                return
+            self._sweep["fills_seen"] += 1
             if not oid or not t or n <= 0:
                 self._sweep["unparsed"] += 1
                 return
             if body.get("is_taker"):
                 return
-            mine = next((o for o in self._resting_view.get(t, ())
-                         if o["order_id"] == oid), None)
-            if mine is not None:
-                rem, side, px = mine["rem"], mine["side"], mine["px"]
-                mine["rem"] = max(0.0, rem - n)        # the view books the fill
-            else:
+            if mine is None:
                 led = self.state.ledger.get(oid)
                 if not led:
                     self._sweep["unknown_order"] += 1
                     return
-                rem = float(led.get("remaining_count") or 0.0)
+                rem = max(0.0, float(led.get("remaining_count") or 0.0) - prior)
                 side = str(led.get("book_side") or "")
                 pxe = led.get("yes_price_exact")
                 px = float(pxe) if pxe is not None else float(led.get("yes_price") or 0)
@@ -13957,8 +13975,6 @@ class IncentiveMarketMaker:
             pull = [(tk, o) for tk, lst in self._resting_view.items()
                     if self._event_of(tk) == ev for o in lst
                     if o["order_id"] != oid and o["rem"] > 0]
-            fts = body.get("ts_ms")
-            fts = float(fts) / 1000.0 if fts else body.get("ts")
             self._sink("ws_sweep", {
                 "ev": "trip", "ts": round(now_ts, 3), "mode": SWEEP_BREAKER,
                 "event": ev, "ticker": t, "order_id": oid, "side": side,
@@ -13997,9 +14013,19 @@ class IncentiveMarketMaker:
         prices, plus this cycle's placements (ledger) -- for _ws_fast_check."""
         view: Dict[str, List[dict]] = {}
         seen: Set[str] = set()
+        # our WS fills that landed after the cycle's resting read (more than
+        # 1s after, so a fill at the boundary is never taken off twice): the
+        # read cannot hold them, and an amend's new size nets out only the
+        # fills before that read
+        after: Dict[str, float] = {}
+        cut = self._resting_read_at + 1.0
+        for f_ts, f_oid, f_n in self._ws_fill_log:
+            if f_ts > cut:
+                after[f_oid] = after.get(f_oid, 0.0) + f_n
 
         def add(oid: str, t: str, side: str, px: float, rem: float,
                 placed: float) -> None:
+            rem -= after.get(oid, 0.0)
             if not oid or oid in seen or not t or rem <= 0:
                 return
             seen.add(oid)
@@ -14019,7 +14045,11 @@ class IncentiveMarketMaker:
             ox = order_yes_exact_cents(o)
             pxe = float(self._cycle_amended[oid]) if oid in self._cycle_amended \
                 else (ox if ox is not None else float(px))
-            add(oid, str(o.get("ticker") or ""), side, pxe, order_remaining(o),
+            # an amend this cycle may have resized it (10/4: an ask amended
+            # 38 -> 30 and then filled out for 30 read as a partial fill)
+            rem = self._cycle_amended_ct.get(oid)
+            add(oid, str(o.get("ticker") or ""), side, pxe,
+                rem if rem is not None else order_remaining(o),
                 self.state.order_ages.get(oid, 0.0))
         for oid, led in list(self.state.ledger.items()):
             if oid in self._cycle_cancelled or oid in seen:
@@ -17152,6 +17182,7 @@ class IncentiveMarketMaker:
         # LATENIGHT markets and stray-cancelled 59 resting orders).
         self._cycle_cancelled = set()      # this cycle's cancels (WS view)
         self._cycle_amended = {}           # this cycle's amends: id -> new cents
+        self._cycle_amended_ct = {}        # ...and the size each one set
         for f in self.fetch_new_fills():
             try:
                 self._book_fill(f, now_ts)
@@ -17273,6 +17304,10 @@ class IncentiveMarketMaker:
         realized = self.pnl.total_realized() - self.state.realized_baseline
 
         resting = self.fetch_resting_orders(now_ts)   # populates _foreign_resting
+        # when that read finished (WS view rebuild: fills after it come off;
+        # stamped at the END of a paged read, so a fill during it can only be
+        # under-subtracted -- a missed sweep trip, never a false one)
+        self._resting_read_at = time.time()
         own_by_ticker: Dict[str, List[Tuple[str, int, float]]] = {}
         own_exact_by_ticker: Dict[str, List[Tuple[str, float, float]]] = {}
         for o in resting:
