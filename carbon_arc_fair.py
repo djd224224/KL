@@ -17,6 +17,7 @@ month, a normal N(mu, sigma) for the first print:
 
     mu      = latest MTD value + CA_DRIFT_PTS (default 0)
     sigma   = CA_SIGMA_MULT * sqrt(((1 - w) * sigma_m) ** 2 + floor ** 2)
+              * early_sigma_mult(category, days observed)
     w       = days observed / days in the month (the data_through day)
     sigma_m = stdev of the entity's month-over-month changes (hist_yoy):
               the scale of what the unobserved rest of the month can move
@@ -30,6 +31,24 @@ month, a normal N(mu, sigma) for the first print:
               formula without it on 2026-09-26 (card 1.71, POS 1.51, foot
               traffic 1.77, ads 1.76, apps 1.56), so a gate built on it
               fires on real divergence rather than on model overconfidence.
+    early_sigma_mult = max(1, A / sqrt(days observed)) per category (see
+              CA_EARLY_SIGMA_A): the first days' reads miss by more than
+              the formula says on card spend and foot traffic.
+
+READ FROM THE FIRST DAY (Jack 2026-10-04, "yes ship it"). Until then a month
+had no entry before 10% of it was observed, and with the feed's 2-6 day lag
+every market's measurement month went unread for its first ~6-10 days.
+That is exactly when the bot quoted: the September book stopped on 9/26
+(the late-month rule), a day before the feed came online, and the October
+book quoted from 10/01 on no read at all -- the gate never stood a single
+market aside, and the October fills were the worst-marked Carbon Arc fills
+yet (-9.4c/contract at 24h, -$462 on 5,426 contracts by 10/04, point of
+sale -$231). Replayed, point of sale's day-1 read at the formula's own
+sigma would have prevented 19-20 of those fills, ~$142 of the loss, for
+~$34-46 of reward. So a read is an entry from its first day, with sigma
+widened where the early days are known to be noisy (CA_EARLY_SIGMA_A,
+CA_MIN_OBS_DAYS); the 20%-of-mu noise cap in incentive_mm still turns the
+gate off for a read too vague to overrule the book.
 
 incentive_mm prices a strike K as P(first print > K) and stands a market
 down when its touch fights that fair (the rain-gate shape). Series ->
@@ -114,8 +133,29 @@ CA_SIGMA_FLOOR_REL = _env_float("IMM_CA_SIGMA_FLOOR_REL", 0.01)
 # than 3 usable month-over-month changes
 CA_SIGMA_M_DEFAULT_REL = _env_float("IMM_CA_SIGMA_M_DEFAULT_REL", 0.05)
 CA_DRIFT_PTS = _env_float("IMM_CA_DRIFT_PTS", 0.0)
-# no entry until this fraction of the month is observed (~3 days)
-CA_MIN_OBS_FRAC = _env_float("IMM_CA_MIN_OBS_FRAC", 0.10)
+# no entry until this fraction of the month is observed. 0.10 (~3 days)
+# until 2026-10-04, which left every month unread for its first ~6-10 days
+# once the feed lag is added (READ FROM THE FIRST DAY, above);
+# IMM_CA_MIN_OBS_FRAC=0.10 with IMM_CA_EARLY_SIGMA=0 restores the old model.
+CA_MIN_OBS_FRAC = _env_float("IMM_CA_MIN_OBS_FRAC", 0.0)
+# EARLY-MONTH SIGMA (2026-10-04). Measured on September's daily paths (75
+# entities; each day-k read against the month's last read, divided by the
+# sigma above): card spend missed by 7.7x sigma on day 1 and 1.4-2.4x on
+# days 2-5 (23-26% of misses past 2 sigma), foot traffic by 1.2-1.9x on
+# days 1-2 (plus a Labor Day calendar shift on days 4-5), while apps and ad
+# spend stayed inside it (0.6-1.35x; the noise cap already turns most of
+# them off early). sigma is multiplied by max(1, A / sqrt(days observed)),
+# which brings card spend's days 2-5 to 0.95-1.0x and foot traffic's days
+# 1-3 to 0.7x. Point of sale has no early path on file (its prism rolled to
+# October before one was kept) and its day-1 read at the formula's sigma is
+# what the replay scored, so it stays at 1 until calibrated. Keys are the
+# prism's category, lowercased; an unknown category takes the widest A.
+CA_EARLY_SIGMA_A = {"credit card": 3.4, "foot traffic": 2.5,
+                    "advertising": 1.8, "app": 1.8, "point of sale": 1.0}
+CA_EARLY_SIGMA_A_DEFAULT = 3.4
+CA_EARLY_SIGMA_ENABLE = os.environ.get("IMM_CA_EARLY_SIGMA", "1") == "1"
+# a card-spend read of ONE day is past repair (7.7x sigma): two days first
+CA_MIN_OBS_DAYS = {"credit card": 2}
 # an MTD read whose data_through is older than this is not a read of the
 # month in progress (feed stalled) -> no entry
 CA_MAX_DATA_AGE_DAYS = _env_float("IMM_CA_MAX_DATA_AGE_DAYS", 10)
@@ -306,6 +346,19 @@ def _month_key(date_iso: str) -> str:
     return str(date_iso)[:7]
 
 
+def _category_key(category) -> str:
+    return str(category or "").strip().lower()
+
+
+def early_sigma_mult(category, days: int) -> float:
+    """max(1, A / sqrt(days observed)) for the read's category (see
+    CA_EARLY_SIGMA_A); 1 when the knob is off."""
+    if not CA_EARLY_SIGMA_ENABLE or days <= 0:
+        return 1.0
+    a = CA_EARLY_SIGMA_A.get(_category_key(category), CA_EARLY_SIGMA_A_DEFAULT)
+    return max(1.0, a / math.sqrt(days))
+
+
 def month_spread(hist: List[dict]) -> Optional[float]:
     """Population stdev of month-over-month changes of the COMPLETE months
     in hist_yoy (the last entry is the month in progress -- a partial-month
@@ -353,16 +406,22 @@ def entity_entry(prism: dict, entity: dict,
     w = d_obs.day / float(n_days)
     if w < CA_MIN_OBS_FRAC:
         return None
+    category = (prism or {}).get("category")
+    if d_obs.day < CA_MIN_OBS_DAYS.get(_category_key(category), 1):
+        return None
     sig_m = month_spread(entity.get("hist_yoy") or [])
     if sig_m is None:
         sig_m = CA_SIGMA_M_DEFAULT_REL * mu0
     floor = max(CA_SIGMA_FLOOR_PTS, CA_SIGMA_FLOOR_REL * mu0)
-    sigma = CA_SIGMA_MULT * math.sqrt(((1.0 - w) * sig_m) ** 2 + floor ** 2)
+    early = early_sigma_mult(category, d_obs.day)
+    sigma = (CA_SIGMA_MULT * math.sqrt(((1.0 - w) * sig_m) ** 2 + floor ** 2)
+             * early)
     return {
         "month": d_obs.strftime("%Y-%m"),
         "mu": round(mu0 + CA_DRIFT_PTS, 4),
         "mtd": round(mu0, 4),
         "sigma": round(sigma, 4),
+        "early_mult": round(early, 4),
         "w": round(w, 4),
         "sigma_m": round(sig_m, 4),
         "data_through": d_obs.strftime("%Y-%m-%d"),
@@ -493,7 +552,10 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
                   "sigma_floor_pts": CA_SIGMA_FLOOR_PTS,
                   "sigma_floor_rel": CA_SIGMA_FLOOR_REL,
                   "drift_pts": CA_DRIFT_PTS,
-                  "min_obs_frac": CA_MIN_OBS_FRAC},
+                  "min_obs_frac": CA_MIN_OBS_FRAC,
+                  "min_obs_days": CA_MIN_OBS_DAYS,
+                  "early_sigma_a": (CA_EARLY_SIGMA_A if CA_EARLY_SIGMA_ENABLE
+                                    else {})},
     })
     return len(entries), len(missing)
 

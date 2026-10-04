@@ -7086,3 +7086,73 @@ capped side, a thin touch keeps it, nothing earning rests nothing, our own
 orders netted out, a rung at the touch earns) and
 .test_downs_book_rests_only_the_earning_side (atref, the live ladder mode).
 1,993 green.
+
+## 2026-10-04 — Carbon Arc fair reads a month from its first day; early reads widened where they are noisy (Jack)
+
+Jack asked to check that the Carbon Arc markets quote off realtime data,
+then "yes ship it" on the fix.
+
+FINDING. The fair gate (2026-09-26) had never stood a market aside: 0
+"ca_fair" guard skips and 0 stand-aside log lines 9/27-10/04, and none of
+the 567 Carbon Arc fills since 9/13 had a read of their measurement month.
+- The September book stopped quoting 9/26 04:00Z (CA_LATE_STOP_DAYS), a
+  day before the feed came online (9/27 04:06Z).
+- The October book has quoted since 10/01, but carbon_arc_fair held a month
+  back until 10% of it was observed. With the feed's 2-6 day lag that is
+  ~6-10 days of no read. Point of sale rolled to October on 10/02 23:00Z
+  with 1 day of data, so all 18 POS series read "missing"; card / app /
+  foot traffic / ads were still on September.
+- October fills 10/01-10/04 were the worst-marked Carbon Arc fills yet:
+  -6.9c/contract at 1h, -9.4c at 24h, -$462 on 5,426 contracts, POS -$231.
+  At 10/03 20:14Z every C4POS ask (T112-116, 12-44c) was lifted while the
+  Oct-1 read on disk said 131; the mid rose 28-48c within the hour. The
+  family still netted positive (dashboard 10/03: $600 rewards, -$400
+  trading), so standing the book down was not the fix.
+
+REPLAY of the 147 October fills and every October cycle (stand-aside cost =
+each ticker-hour's estimated reward x the share of its cycles gated):
+- POS read from day 1 at the formula's sigma: 19-20 fills prevented, ~$142
+  of the loss, for $34-46 of reward. Flat to the POS sigma: x1.3 +$99 net,
+  x1.6 +$82, x2.0 +$75 (x1.0 +$96).
+- September's read carried into October: $31 avoided for $181 of reward.
+- Not quoting until a read exists: all $462 for ~$1.4k est of reward.
+
+CALIBRATION (September's daily paths, 75 entities: each day-k read against
+the month's last read, over the sigma the formula gives that day): card
+spend missed by 7.7x sigma on day 1 and 1.4-2.4x on days 2-5; foot traffic
+1.2-1.9x on days 1-2 (plus a Labor Day shift on days 4-5); apps and ads
+stayed inside sigma (0.6-1.35x) -- the 20%-of-mu noise cap already turns
+most of them off early.
+
+CHANGE (carbon_arc_fair.py; incentive_mm.py untouched):
+- CA_MIN_OBS_FRAC 0.10 -> 0 (IMM_CA_MIN_OBS_FRAC): a read is an entry from
+  its first day.
+- sigma x early_sigma_mult = max(1, A / sqrt(days observed)), A per prism
+  category (CA_EARLY_SIGMA_A): card 3.4, foot traffic 2.5, apps / ads 1.8,
+  point of sale 1.0 (uncalibrated -- its prism rolled before a path was
+  kept -- and 1.0 is what the replay scored); unknown category 3.4. Card
+  days 2-5 come to 0.95-1.0x, foot traffic days 1-3 to 0.7x.
+- CA_MIN_OBS_DAYS {"credit card": 2}: a one-day card read is past repair.
+- Entries carry "early_mult"; the fair file's model block carries
+  min_obs_days and early_sigma_a.
+
+AT DEPLOY (dry run on the 13:00Z feed and today's book): 93 entries, 0
+missing (18 POS series on October). 44 of 136 October POS markets stand
+aside, every one on the ASK side: the book prices every POS series well
+under its Oct-1 read (C4 131, ON! 124, Coors 98 ...). That is the
+behaviour the replay scored; if the day-1 reads carry a weekday bias (Oct
+1 was a Thursday, 2025's a Wednesday) it fades as the month fills in.
+
+KILL / REVERT: IMM_CA_MIN_OBS_FRAC=0.10 and IMM_CA_EARLY_SIGMA=0 in the
+launcher env (restart_imm.ps1 -Task) restore the old model; the gate
+itself is still IMM_CA_FAIR_ENABLE=0. carbon_arc_fair is imported by the
+refresher thread, so any change to it loads only on a bot restart.
+
+WATCH: POS stand-asides vs its rewards through ~10/10; card spend gates
+from its day-2 read (~10/06), foot traffic / apps / ads as their prisms
+roll. Calibrate POS's A from October's own path once it is ~10 days long.
+
+Tests (test_carbon_arc_fair): test_a_read_is_an_entry_from_its_first_day,
+test_early_reads_are_widened_by_category,
+test_early_sigma_knob_off_and_the_old_model; the thin-read refusal now
+runs under the 0.10 knob. 1,996 green.

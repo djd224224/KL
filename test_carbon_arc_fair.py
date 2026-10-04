@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import carbon_arc_fair as caf
@@ -79,6 +79,8 @@ class TestModel(unittest.TestCase):
         self.assertAlmostEqual(out["sigma"], round(
             caf.CA_SIGMA_MULT * math.sqrt(((1 - w) * sig_m) ** 2
                                           + floor ** 2), 4))
+        # day 23: past the early-month widening
+        self.assertEqual(out["early_mult"], 1.0)
         # the last MTD point defines the observed stretch, whatever order
         # the feed lists them in
         e2 = _entity("Amazon", [("2026-09-23", 108.64), ("2026-09-22", 1.0)],
@@ -87,9 +89,11 @@ class TestModel(unittest.TestCase):
 
     def test_entry_refuses_thin_or_stale_reads(self):
         p = _prism("P", [])
-        # 2 days of a 30-day month < CA_MIN_OBS_FRAC
+        # the fraction floor still refuses a thin read when it is set (the
+        # pre-2026-10-04 0.10: 2 days of a 30-day month is under it)
         thin = _entity("X", [("2026-09-02", 101.0)], HIST)
-        self.assertIsNone(caf.entity_entry(p, thin, NOW))
+        with mock.patch.object(caf, "CA_MIN_OBS_FRAC", 0.10):
+            self.assertIsNone(caf.entity_entry(p, thin, NOW))
         # a read 11+ days old is not the month in progress
         old = _entity("X", [("2026-09-14", 101.0)], HIST)
         self.assertIsNone(caf.entity_entry(p, old, NOW))
@@ -98,6 +102,75 @@ class TestModel(unittest.TestCase):
         short = _entity("X", [("2026-09-23", 100.0)], HIST[-2:])
         out = caf.entity_entry(p, short, NOW)
         self.assertAlmostEqual(out["sigma_m"], caf.CA_SIGMA_M_DEFAULT_REL * 100.0)
+
+    def _base_sigma(self, day, n_days, mu):
+        w = day / float(n_days)
+        sig_m = caf.month_spread([{"month": m, "value": v} for m, v in HIST])
+        floor = max(caf.CA_SIGMA_FLOOR_PTS, caf.CA_SIGMA_FLOOR_REL * mu)
+        return caf.CA_SIGMA_MULT * math.sqrt(((1 - w) * sig_m) ** 2
+                                             + floor ** 2)
+
+    def test_a_read_is_an_entry_from_its_first_day(self):
+        # Jack 2026-10-04 "yes ship it": the October book quoted on no read
+        # for days because a month waited for 10% observed. Point of sale's
+        # day-1 read (rolled 10/02 23:00Z) is an entry at the formula's own
+        # sigma -- the sigma the replay scored.
+        now = datetime(2026, 10, 3, 13, 0, tzinfo=timezone.utc)
+        pos = _prism("P", [], data_through="2026-10-01",
+                     category="Point of Sale")
+        out = caf.entity_entry(pos, _entity("C4 Energy",
+                                            [("2026-10-01", 131.03)], HIST), now)
+        self.assertEqual(out["month"], "2026-10")
+        self.assertAlmostEqual(out["mu"], 131.03)
+        self.assertEqual(out["early_mult"], 1.0)
+        self.assertAlmostEqual(out["sigma"],
+                               round(self._base_sigma(1, 31, 131.03), 4))
+
+    def test_early_reads_are_widened_by_category(self):
+
+        def entry(category, day, mu=100.0):
+            p = _prism("P", [], category=category)
+            e = _entity("X", [("2026-10-%02d" % day, mu)], HIST)
+            # read two days after its data day, as the feed lags
+            now = datetime(2026, 10, day, 13, 0, tzinfo=timezone.utc) \
+                + timedelta(days=2)
+            return caf.entity_entry(p, e, now)
+
+        # card spend: one day is past repair, then A = 3.4 / sqrt(days)
+        self.assertIsNone(entry("Credit Card", 1))
+        cc2 = entry("Credit Card", 2)
+        self.assertAlmostEqual(cc2["early_mult"], round(3.4 / math.sqrt(2), 4))
+        self.assertAlmostEqual(cc2["sigma"], round(
+            self._base_sigma(2, 31, 100.0) * 3.4 / math.sqrt(2), 4))
+        self.assertAlmostEqual(entry("Credit Card", 5)["early_mult"],
+                               round(3.4 / math.sqrt(5), 4))
+        # widening ends where A / sqrt(days) reaches 1 (card day 12 -> 0.98)
+        self.assertEqual(entry("Credit Card", 12)["early_mult"], 1.0)
+        # foot traffic 2.5, apps and ad spend 1.8, from day 1
+        self.assertAlmostEqual(entry("Foot Traffic", 1)["early_mult"], 2.5)
+        self.assertAlmostEqual(entry("App", 1)["early_mult"], 1.8)
+        self.assertAlmostEqual(entry("advertising ", 1)["early_mult"], 1.8)
+        self.assertEqual(entry("App", 4)["early_mult"], 1.0)
+        # point of sale stays at the formula; an unknown category takes the
+        # widest A
+        self.assertEqual(entry("Point of Sale", 1)["early_mult"], 1.0)
+        self.assertAlmostEqual(entry("Something New", 1)["early_mult"], 3.4)
+        self.assertAlmostEqual(entry(None, 1)["early_mult"], 3.4)
+
+    def test_early_sigma_knob_off_and_the_old_model(self):
+        now = datetime(2026, 10, 9, 13, 0, tzinfo=timezone.utc)
+        p = _prism("P", [], category="Foot Traffic")
+        e = _entity("X", [("2026-10-02", 100.0)], HIST)
+        with mock.patch.object(caf, "CA_EARLY_SIGMA_ENABLE", False):
+            out = caf.entity_entry(p, e, now)
+        self.assertEqual(out["early_mult"], 1.0)
+        self.assertAlmostEqual(out["sigma"],
+                               round(self._base_sigma(2, 31, 100.0), 4))
+        # IMM_CA_MIN_OBS_FRAC=0.10 brings back the 10%-observed wait
+        with mock.patch.object(caf, "CA_MIN_OBS_FRAC", 0.10):
+            self.assertIsNone(caf.entity_entry(p, e, now))
+            e4 = _entity("X", [("2026-10-04", 100.0)], HIST)
+            self.assertIsNotNone(caf.entity_entry(p, e4, now))
 
     def test_p_above(self):
         self.assertAlmostEqual(caf.p_above(100.0, 100.0, 2.0), 0.5)
@@ -138,6 +211,9 @@ class TestBuildAndWrite(unittest.TestCase):
         self.assertEqual(data["entries"]["KXAMZNCC"]["fetched_at"],
                          NOW.isoformat())
         self.assertEqual(data["series_map"], self.smap)
+        # the early-month knobs ride along in the model block
+        self.assertEqual(data["model"]["min_obs_days"], {"credit card": 2})
+        self.assertEqual(data["model"]["early_sigma_a"]["credit card"], 3.4)
         with open(self.vint, encoding="utf-8") as f:
             self.assertEqual(len(f.readlines()), 2)
         # same read again: file rewritten, no new vintage lines
