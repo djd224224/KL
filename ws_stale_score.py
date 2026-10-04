@@ -130,8 +130,11 @@ def load_episodes(d: str, since: Optional[float], until: Optional[float]
 
 
 def load_fills(d: str, order_ids) -> Dict[str, List[dict]]:
+    """Our maker fills on the given orders, once per fill_id (the sink can
+    write a fill twice)."""
     want = set(order_ids)
     out: Dict[str, List[dict]] = defaultdict(list)
+    seen = set()
     for p in _day_files(d, "fills", ".jsonl"):
         with open(p, encoding="utf-8") as f:
             for line in f:
@@ -141,8 +144,14 @@ def load_fills(d: str, order_ids) -> Dict[str, List[dict]]:
                     r = json.loads(line)
                 except ValueError:
                     continue
-                if r.get("order_id") in want and not r.get("is_taker"):
-                    out[r["order_id"]].append(r)
+                if r.get("order_id") not in want or r.get("is_taker"):
+                    continue
+                fid = r.get("fill_id")
+                if fid:
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
+                out[r["order_id"]].append(r)
     for v in out.values():
         v.sort(key=lambda r: float(r.get("ts") or 0))
     return out

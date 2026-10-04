@@ -79,6 +79,7 @@ def _write_day(d):
         _fill(T + 90, "f2", "o1", A, "bid", 47.0, 10),   # after the amend, new price
         _fill(T + 1230, "f3", "o3", B, "bid", 30.0, 15),  # avoidable (open episode)
         _fill(T + 2010, "f5", "o5", A, "bid", 49.0, 20),  # avoidable, then gone
+        _fill(T + 2010, "f5", "o5", A, "bid", 49.0, 20),  # the sink wrote it twice
     ]
     with open(os.path.join(d, "fills_2026-10-04.jsonl"), "w") as f:
         for r in fills:
