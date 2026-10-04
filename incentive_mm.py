@@ -6381,6 +6381,53 @@ STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
 HALT_FILE = os.path.join(STATUS_DIR, "HALT")
 
+# THE SNIPER'S BOOK IS NOT MANUAL (Jack 2026-10-04: "Build the sniper taker
+# bot separately"). nfl_snipe_bot.py, run on this account (its subaccount 0
+# default), takes NFL prop books outside the player-history band with
+# immediate-or-cancel orders and keeps its own net position per market --
+# from its own fills -- in run-logs/nfl-snipe/snipe_book.json. Read as the
+# account's, those positions would look like manual trading: the standoff
+# would cancel this bot's quotes on the whole EVENT, and the skew and the
+# caps would lean against them. fetch_positions nets the book out. A market
+# the account shows flat (the sniper short against our long) comes back as
+# our long; one neither the account nor this bot holds (settled since) is
+# left alone. A numbered subaccount needs none of this (the positions read
+# is the primary's), and a missing or unreadable file nets nothing.
+SNIPE_BOOK_FILE = os.environ.get(
+    "IMM_SNIPE_BOOK_FILE",
+    os.path.join(os.path.dirname(STATUS_DIR), "nfl-snipe", "snipe_book.json"))
+
+
+def load_snipe_book(path: Optional[str] = None) -> Dict[str, float]:
+    """ticker -> the sniper's signed YES position ({} when there is none)."""
+    try:
+        with open(path or SNIPE_BOOK_FILE, encoding="utf-8") as f:
+            js = json.load(f)
+        return {str(t): float(v) for t, v in (js.get("positions") or {}).items()
+                if abs(float(v)) > 1e-9}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def net_out_snipe_book(positions: Dict[str, float], book: Dict[str, float],
+                       own: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    """The account's positions less the sniper's. A ticker the account does
+    not show is netted only when this bot's own book holds it (the sniper's
+    position offsets ours exactly); otherwise it settled, nothing to net."""
+    if not book:
+        return positions
+    own = own or {}
+    out = dict(positions)
+    for t, n in book.items():
+        if t not in out and abs(own.get(t, 0.0)) < 1e-9:
+            continue
+        v = out.get(t, 0.0) - n
+        if abs(v) > 1e-9:
+            out[t] = v
+        else:
+            out.pop(t, None)
+    return out
+
 # FULL-DEPTH BOOK LOG (2026-09-26). Kalshi scores rent level by level against
 # the full resting book and serves NO historical orderbook, so any book not
 # recorded now is gone for good. The bot already reads every book it needs
@@ -13099,7 +13146,13 @@ class IncentiveMarketMaker:
             return True
         except HttpError as e:
             # A definitive rejection (post-only would cross, etc.) — no order exists.
-            log(f"{self.tag} ! place rejected ({e}): {label}")
+            # KALSHI'S REASON (2026-10-04, Jack: "why is this happening? I have
+            # enough cash"): the client keeps the response body on the error
+            # (e.body) -- "post only cross" and a short balance are both a
+            # bare 400 without it, and the day's 52k rejects had to be told
+            # apart from the reject rate at vs behind the touch.
+            body = str(getattr(e, "body", "") or "")[:300]
+            log(f"{self.tag} ! place rejected ({e}){' ' + body if body else ''}: {label}")
             # Rejections are signal, not noise: a post-only reject means the
             # touch moved between the book read and the send, which is the
             # measurable form of "our quotes are stale".
@@ -13107,6 +13160,7 @@ class IncentiveMarketMaker:
                             q.count, "", now_ts,
                             client_order_id=client_order_id,
                             quote_is_pad=q.is_pad, error=str(e),
+                            error_body=body,
                             http_status=getattr(e, "status", None))
             return False
         except Exception as e:
@@ -13414,7 +13468,8 @@ class IncentiveMarketMaker:
             cursor = resp.get("cursor")
             if not cursor:
                 break
-        return positions
+        # the NFL sniper's own book is not manual trading (SNIPE_BOOK_FILE)
+        return net_out_snipe_book(positions, load_snipe_book(), self.pnl.pos)
 
     @staticmethod
     def _fill_ts(f: dict) -> int:

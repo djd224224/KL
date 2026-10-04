@@ -97,6 +97,8 @@ def setUpModule():
     tmp = tempfile.mkdtemp(prefix="imm_test_")
     imm.STATUS_DIR = tmp
     imm.HALT_FILE = os.path.join(tmp, "HALT")
+    # a live sniper book on this machine must not net into the fixtures
+    imm.SNIPE_BOOK_FILE = os.path.join(tmp, "nfl-snipe", "snipe_book.json")
     imm.IncentiveMarketMaker.PERSIST_PATH = os.path.join(tmp, "imm_state.json")
     # baked-at-import file paths must ALL be redirected or run_cycle-driven
     # tests write into production run-logs (bit us 2026-07-28: gate-test dry
@@ -18011,6 +18013,64 @@ class TestNflFantasyLadderCutoff(unittest.TestCase):
         self.assertEqual(
             self._selected_cutoff("KXNFLLADDERREC-67OCT05ATLNO-ATLBROBINSON7"),
             self.KICKOFF - timedelta(minutes=imm.EVENT_START_BUFFER_MIN))
+
+
+class TestRejectReason(unittest.TestCase):
+    """A refused placement logs Kalshi's reason (the client's e.body)."""
+
+    def test_reject_row_carries_the_body(self):
+        bot = imm.IncentiveMarketMaker(client=FakeClient(), live=True)
+        err = imm.HttpError("Bad Request", 400)
+        err.body = ('{"error":{"code":"invalid_order","message":"invalid order",'
+                    '"details":"post only cross"}}')
+        rows = []
+        with mock.patch.object(bot.client, "create_order", side_effect=err), \
+                mock.patch.object(bot, "_log_order",
+                                  side_effect=lambda *a, **k: rows.append((a, k))), \
+                mock.patch.object(imm, "log") as lg:
+            ok = bot.place_order(imm.Quote("KXT-1", "bid", 13, 100), time.time())
+        self.assertFalse(ok)
+        self.assertEqual(rows[0][0][0], "reject")
+        self.assertIn("post only cross", rows[0][1]["error_body"])
+        self.assertIn("post only cross", lg.call_args_list[-1][0][0])
+
+
+class TestSnipeBookNetOut(unittest.TestCase):
+    """Jack 2026-10-04: "Build the sniper taker bot separately" -- on the same
+    account its positions are netted out before the manual standoff reads
+    them (SNIPE_BOOK_FILE)."""
+
+    T = "KXNFLLADDERREC-26OCT04MIAMIN-MIAMWASHINGTON6"
+
+    def test_net_out(self):
+        f = imm.net_out_snipe_book
+        T = self.T
+        self.assertEqual(f({T: -60.0}, {T: -60.0}), {})            # all the sniper's
+        self.assertEqual(f({T: 140.0}, {T: -60.0}), {T: 200.0})    # sold into our long
+        # the account flat: the sniper's short offsets our long exactly
+        self.assertEqual(f({}, {T: -60.0}, own={T: 60.0}), {T: 60.0})
+        # neither holds it any more: settled, nothing to net
+        self.assertEqual(f({}, {T: -60.0}, own={}), {})
+        self.assertEqual(f({"X": 5.0}, {}), {"X": 5.0})
+
+    def test_load_and_fetch_positions(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        p = os.path.join(td.name, "snipe_book.json")
+        self.assertEqual(imm.load_snipe_book(p), {})               # missing
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(imm.load_snipe_book(p), {})               # unreadable
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"positions": {self.T: -60, "Z": 0}}, fh)
+        self.assertEqual(imm.load_snipe_book(p), {self.T: -60.0})
+        bot = imm.IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.positions = {self.T: 140.0, "KXOTHER-1": 3.0}
+        with mock.patch.object(imm, "SNIPE_BOOK_FILE", p):
+            self.assertEqual(bot.fetch_positions(),
+                             {self.T: 200.0, "KXOTHER-1": 3.0})
+        # no file: the account's positions as read
+        self.assertEqual(bot.fetch_positions(), {self.T: 140.0, "KXOTHER-1": 3.0})
 
 
 class TestSportsLadderBlock(unittest.TestCase):

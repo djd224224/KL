@@ -7329,3 +7329,47 @@ fantasy one stands aside), test_caps (13.78 / 1.07), test_news_hold, the
 Robinson e2e (Questionable keeps quoting), test_nfl_cap_quotes_keeps_exact
 _prices, test_subcent_edge_quotes, test_a_book_under_one_cent_quotes_at_
 its_exact_touch (selected, bids AT 0.30c). 2,009 green.
+
+## 2026-10-04 — the NFL prop SNIPER, a separate taker bot (nfl_snipe_bot.py); the IMM nets its book out (Jack)
+
+Jack: "Build the sniper taker bot separately." nfl_snipe_bot.py automates
+the nfl_prop_snipe.py scanner as its own process: it TAKES a book outside
+the player-history band (sells YES into a bid past the band top, buys YES
+from an ask under the band bottom) with immediate-or-cancel orders, so
+nothing it sends rests. Its module docstring holds the rules; in short:
+
+- The band it must clear is the WIDER of nfl_prop_fair's and the same band
+  on the player's last 4 games (recent form -- the EWMA is slow to see a
+  role that grew: Golden's yards book at 96 vs model 51, last four 84 / 95
+  / 58 / 100), edge vs the less favourable fair. The limit is past the
+  band top + 1c, strictly over the IMM's own bid cap (and a tick over any
+  resting bid of ours), worth 2c and 3% of the money at risk per contract
+  after the taker fee. Self-trade prevention taker_at_cross.
+- Skips: any designation on the player, team news in 12h (its own watch,
+  persisted across restarts, and the IMM's nfl_prop_fair.json -- a
+  designation CLEARED is only seen by a watch that saw it set), a sibling
+  contract that agrees with the book, a book implying >2.5x / <0.4x the
+  model's mean, the IMM's run of the model >15% apart, a stale model /
+  roster, inside 15 min of kickoff (ESPN scoreboard), a 15-min cooldown.
+- Risk: $40 a market / $80 a player / $250 total at risk (100 - P a
+  contract sold), free cash on the shard over $500, 3 orders a scan, 40 a
+  day. DRY RUN by default (paper fills in snipe_book_paper.json); --live
+  trades; --subaccount N runs in a numbered Kalshi subaccount (own cash and
+  positions, invisible to the IMM's reads). Halt: run-logs/nfl-snipe/HALT.
+
+IMM side (only matters on subaccount 0): fetch_positions nets the
+sniper's live book (run-logs/nfl-snipe/snipe_book.json, IMM_SNIPE_BOOK_FILE)
+out of the account's positions -- read as the account's, a snipe would trip
+the manual standoff on the whole EVENT. A market the account shows flat
+(the sniper's short against our long) comes back as our long; one neither
+holds is left alone; no file nets nothing.
+
+Found on the way (10/4 16:00Z dry run, 506 props): the ladder books' BIDS
+sit at ~1.6-2.4x the players' output across the board (Malik Washington's
+receptions ladder 34c = 6.8 catches after 3/3/4/5; Pickens' yards 34c =
+136 yds after 9/28/40/82) -- the ask side is nearly empty since the makers
+stopped selling YES (collateral), and the bidders compete for the reward
+queue. 42 books outside the band; recent form, news, siblings and the
+ratio guard leave ~2-16 to take.
+
+Tests: test_nfl_snipe_bot (28), TestSnipeBookNetOut (2).
