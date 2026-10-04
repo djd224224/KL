@@ -6996,3 +6996,52 @@ test_tier_precedence_matches_the_bot (Carbon Arc first; a not-Carbon-Arc
 verdict keeps a CC-named series), test_no_family_series_the_bot_allows_
 reaches_the_email (replaces "every family series has a tier"),
 test_carbon_arc_exclusion_is_by_settlement_source. 1,984 green.
+
+## 2026-10-04 — NFL props: teammate absences move the fair, and a team news hold (Jack) -- BRANCH imm-nfl-teammate-news, NOT MERGED
+
+Jack: "build the teammate adjustment and news hold, dont merge it yet
+though" -- after the read that Downs' ladder went 24 -> 34 when Keenan Allen
+was ruled out and the gate could only stand aside.
+
+THE FIT (nflverse 2024-26, the definitions the code uses). A teammate's
+share = his targets (carries) / the team's over its last 4 games, games he
+missed counted as zero (one out for weeks has little left: the EWMAs already
+carry his absence); absent = played in one of the team's last 2 games, no
+line in this one. With V the absent teammates' summed share, a remaining
+player's stat ran x (1 + alpha x V / (1 - V)) of his history's prediction
+(WLS, weights mu; bootstrap 90%): receptions 0.18 [0.13, 0.24], receiving
+yards 0.14 [0.08, 0.21], PPR WR/TE 0.08 [0.01, 0.17], RB rushing (carries)
+0.33 [0.23, 0.48], RB PPR (carries) 0.23 [0.14, 0.35]. That is ~30% of a
+proportional hand-out of the vacated targets. By size: a vacated target
+share of 0.2-0.3 -> +5% catches, 0.3+ -> +20%; a lead back out -> +37% to
+the backup's rushing. A starting QB out (>= 70% of the window's attempts):
+receptions -5%, yards -2.5%, RB rushing -9%.
+
+MODEL (nfl_prop_fair.py). PlayerIndex.team_shares (targets / carries /
+attempts per team-game from nflverse, now parsed); roster_status keeps each
+player's position and designation time; team_context per team: designated
+contributors who played in one of the last 2 games, weighted by P_MISS (Out /
+IR / suspended 1, Doubtful 0.8, Questionable 0.25, day-to-day 0.1),
+teammate_mult per stat and position (QBs untouched, V clamped at 0.6). The
+entry's mu is the adjusted one; mu_base, team_mult and teammates show the
+working. Knobs IMM_NFL_TEAMMATE_ENABLE (1), IMM_NFL_TEAM_WINDOW_GAMES (4).
+
+NEWS HOLD (incentive_mm.nfl_gate, NFL_NEWS_HOLD_MIN 60, 0 = off): every prop
+of a team stands aside for an hour after a CONTRIBUTOR (>= 8% of targets,
+15% of carries or 50% of attempts over the window) is designated, changes
+designation or is cleared -- ESPN's designation time, or the refresher
+seeing the status change between reads (first sighting stamps nothing). A
+fringe player's news holds nothing. Game-day inactives land ~90 minutes
+before kickoff, so a team with inactive news is out from the news to its
+cutoff.
+
+LIVE DRY RUN 12:53Z 10/4 (511 props, not deployed): 260 adjusted, mostly
+small (Questionable teammates x0.25); Downs x1.066 (Allen out + Pierce IR),
+Diggs x1.082 (McLaurin + White out), Wicks x1.15 (Smith + Goedert out), the
+Tampa receivers x0.95 (Mayfield out); news holds on TB (Mayfield, 0.2h) and
+WSH (White's entry, 0.8h -- the London inactive list).
+
+Tests: TestTeammates (P_MISS, window shares with misses as zero, the context
+and multipliers, lead back + QB out with the clamp, news needs a
+contributor and tracks changes, the snapshot carries it), TestNflPropGate
+.test_news_hold.

@@ -9038,6 +9038,15 @@ NFL_BAND_TOL_CENTS = _env_float("IMM_NFL_BAND_TOL_CENTS", 3.0)
 NFL_FAIR_TTL_MIN = _env_int("IMM_NFL_FAIR_TTL_MIN", 30)
 NFL_ROSTER_TTL_MIN = _env_int("IMM_NFL_ROSTER_TTL_MIN", 45)
 NFL_FAIR_REFRESH_SECS = _env_int("IMM_NFL_FAIR_REFRESH_SECS", 120)
+# NEWS HOLD (Jack 2026-10-04: "build the teammate adjustment and news
+# hold"): every prop of a team stands aside for this long after a QB / WR /
+# TE / RB on it is designated, re-designated or cleared (ESPN's designation
+# time, or the refresher seeing the status change) -- the book reprices on
+# the news and a quote left at the old touch is what gets picked off.
+# nfl_prop_fair also moves the teammates' means for the absence itself
+# (TEAMMATE_ALPHA), so once the hold lapses the band is centred on it.
+# 0 = off.
+NFL_NEWS_HOLD_MIN = _env_int("IMM_NFL_NEWS_HOLD_MIN", 60)
 NFL_STATUS_FILE = os.environ.get(
     "IMM_NFL_STATUS_FILE", os.path.join(STATUS_DIR, "nfl_prop_fair.json"))
 # the refresher's latest snapshot (nfl_prop_fair.build_snapshot)
@@ -9080,12 +9089,22 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         return (f"{e.get('player')}: {e['injury']}",
                 {"reason": "injury", "player": e.get("player"),
                  "injury": e["injury"]}, None)
+    nat = e.get("news_at")
+    if NFL_NEWS_HOLD_MIN > 0 and nat is not None:
+        nage = now_ts - float(nat)
+        # a stamp a little ahead of our clock still holds; far ahead is junk
+        if -600.0 <= nage < NFL_NEWS_HOLD_MIN * 60:
+            return (f"team news: {e.get('news')} {max(0.0, nage) / 60:.0f}m ago "
+                    f"(hold {NFL_NEWS_HOLD_MIN}m)",
+                    {"reason": "news_hold", "news": e.get("news"),
+                     "age_s": round(nage)}, None)
     fair = float(e["fair"]) * 100.0
     lo = float(e["fair_lo"]) * 100.0
     hi = float(e["fair_hi"]) * 100.0
     inputs = {"fair": round(fair, 3), "fair_lo": round(lo, 3),
               "fair_hi": round(hi, 3), "mu": e.get("mu"),
               "n_games": e.get("n_games"), "player": e.get("player"),
+              "mu_base": e.get("mu_base"), "team_mult": e.get("team_mult"),
               "tol": NFL_FAIR_TOL_CENTS, "band_tol": NFL_BAND_TOL_CENTS}
     bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo,
                                         NFL_BAND_TOL_CENTS, hi)
@@ -18835,7 +18854,7 @@ class IncentiveMarketMaker:
                 f"{NFL_FAIR_TOL_CENTS:g}c, asks >= band bottom - "
                 f"{NFL_FAIR_TOL_CENTS:g}c, a touch over {NFL_BAND_TOL_CENTS:g}c "
                 f"outside the band or an ESPN injury designation stands "
-                f"aside, ttl {NFL_FAIR_TTL_MIN}m (roster "
+                f"aside, a team news hold {NFL_NEWS_HOLD_MIN}m, ttl {NFL_FAIR_TTL_MIN}m (roster "
                 f"{NFL_ROSTER_TTL_MIN}m), refresh {NFL_FAIR_REFRESH_SECS}s, "
                 f"status {NFL_STATUS_FILE}")
         else:

@@ -55,6 +55,13 @@ player's earlier games only; "starters" = prior mean over 2.5 catches /
     the 273 prop fills 9/30-10/3: the 32 outside the band lost $384 at
     settlement / fair (Robinson 40c, Diggs 51c, Johnston 48c ...), the 241
     inside made $97.
+  - TEAMMATES (2026-10-04, see TEAMMATE_ALPHA): a designated teammate's
+    share of the team's last 4 games' targets / carries, weighted by his
+    chance to sit (P_MISS), moves the player's mean by alpha x V / (1 - V)
+    -- a key pass-catcher out adds ~+7-16% to his teammates' catches, a lead
+    back out ~+37% to his backup's rushing, a starting QB out -5% to the
+    receivers. Entries carry mu_base, team_mult, teammates and the team's
+    news / news_at, which the gate's news hold reads.
   - INJURIES: ESPN's team roster carries each player's designation
     (Questionable / Doubtful / Out / IR); the gate stands any designated
     player aside. 10/3: McLaurin went Doubtful at 14:42Z and the bot bought
@@ -174,6 +181,65 @@ TEAM_CODES = frozenset(
     "LAR LA LV MIA MIN NE NO NYG NYJ PHI PIT SEA SF TB TEN WAS WSH".split())
 # an ESPN designation that is NOT one: anything else stands the player aside
 CLEAR_STATUSES = frozenset({"", "active"})
+
+# TEAMMATE NEWS (Jack 2026-10-04: "build the teammate adjustment and news
+# hold"). Fit on nflverse 2024-26 the way it runs here: a teammate's share
+# is his targets (carries) / the team's over its last TEAM_WINDOW_GAMES
+# games, games he missed counted as zero -- so one already out for weeks
+# has little share left and his absence is not counted twice (the EWMA has
+# absorbed it); "absent" = played in one of the team's last 2 games and has
+# no line in this one. With V the absent teammates' summed share, a
+# remaining player's stat runs x (1 + alpha x V / (1 - V)) of his own
+# history's prediction (weighted least squares, weights mu; bootstrap 90%):
+#   receptions          targets  alpha 0.18 [0.13, 0.24]  (V > 0.3: +20%)
+#   receiving yards     targets  alpha 0.14 [0.08, 0.21]
+#   PPR, WR / TE        targets  alpha 0.08 [0.01, 0.17]
+#   rushing yards, RB   carries  alpha 0.33 [0.23, 0.48]  (lead back out: +37%)
+#   PPR, RB             carries  alpha 0.23 [0.14, 0.35]
+# i.e. ~30% of a proportional hand-out of the vacated targets: the rest goes
+# to the replacement and elsewhere. A starting QB out (>= 70% of the
+# window's attempts; 339 receiver-games): receptions -5%, yards -2.5%, RB
+# rushing -9%. ESPN's designation sets the chance he misses (P_MISS).
+TEAMMATE_ENABLE = os.environ.get("IMM_NFL_TEAMMATE_ENABLE", "1") == "1"
+TEAM_WINDOW_GAMES = int(_env_float("IMM_NFL_TEAM_WINDOW_GAMES", 4))
+TEAMMATE_ALPHA: Dict[Tuple[str, str], float] = {
+    ("rec", "t"): 0.18, ("recyds", "t"): 0.14, ("ffpts", "t"): 0.08,
+    ("rshyds", "c"): 0.33, ("ffpts", "c"): 0.23}
+QB_OUT_MULT = {"rec": 0.95, "recyds": 0.975, "rshyds": 0.91, "ffpts": 0.93}
+QB_STARTER_SHARE = 0.7
+MAX_VACATED = 0.6           # V is clamped here (V / (1 - V) explodes near 1)
+PASS_CATCHERS = frozenset({"WR", "TE", "RB", "FB"})
+RUSHERS = frozenset({"RB", "FB"})
+ESPN_TO_NFLV = {v: k for k, v in NFLV_TO_ESPN.items()}
+# a player whose news starts the gate's team hold: this much of the team's
+# targets / carries / pass attempts over the window
+NEWS_MIN_TARGET_SHARE = _env_float("IMM_NFL_NEWS_MIN_TARGET_SHARE", 0.08)
+NEWS_MIN_CARRY_SHARE = _env_float("IMM_NFL_NEWS_MIN_CARRY_SHARE", 0.15)
+NEWS_MIN_ATTEMPT_SHARE = _env_float("IMM_NFL_NEWS_MIN_ATTEMPT_SHARE", 0.5)
+
+
+def material(share: dict) -> bool:
+    """A contributor whose news moves the team's props (team_shares row)."""
+    return (share.get("t", 0.0) >= NEWS_MIN_TARGET_SHARE
+            or share.get("c", 0.0) >= NEWS_MIN_CARRY_SHARE
+            or share.get("a", 0.0) >= NEWS_MIN_ATTEMPT_SHARE)
+
+
+def p_miss(status: str) -> float:
+    """The chance a designated player sits, by ESPN's designation."""
+    s = (status or "").strip().lower()
+    if s in CLEAR_STATUSES:
+        return 0.0
+    if "doubtful" in s:
+        return 0.8
+    if "questionable" in s:
+        return 0.25
+    if "day-to-day" in s or "day to day" in s:
+        return 0.1
+    if ("out" in s or "reserve" in s or "suspen" in s or "physically" in s
+            or "non-football" in s):
+        return 1.0
+    return 0.5
 
 _NAME_SUFFIX_RE = re.compile(r"\b(jr|sr|ii|iii|iv|v)\b\.?")
 _SUFFIX_RE = re.compile(r"^(?P<team>[A-Z]{2,3}?)(?P<name>[A-Z]+?)(?P<jersey>\d*)$")
@@ -388,7 +454,8 @@ def fair_band(spec: dict, mu: float, n_games: int) -> Tuple[float, float, float]
 
 _NFLV_COLS = ("player_id", "player_display_name", "position", "season", "week",
               "season_type", "team", "receptions", "receiving_yards",
-              "rushing_yards", "fantasy_points_ppr")
+              "rushing_yards", "fantasy_points_ppr", "targets", "carries",
+              "attempts")
 
 
 def parse_nflverse(text: str) -> List[dict]:
@@ -421,14 +488,43 @@ class PlayerIndex:
 
     def __init__(self, rows: List[dict]):
         self.games: Dict[str, List[dict]] = {}
+        # team -> (season, week) -> that game's rows, for the teammate shares
+        self.team_games: Dict[str, Dict[Tuple[int, int], List[dict]]] = {}
         for r in rows:
             self.games.setdefault(r["player_id"], []).append(r)
+            self.team_games.setdefault(r.get("team") or "", {}).setdefault(
+                (r["season"], r["week"]), []).append(r)
         self.by_name: Dict[str, List[str]] = {}
+        self.position: Dict[str, str] = {}
         for pid, gs in self.games.items():
             # POST weeks are numbered after REG in nflverse (19-22)
             gs.sort(key=lambda g: (g["season"], g["week"]))
             key = norm_name(gs[-1]["name"])
             self.by_name.setdefault(key, []).append(pid)
+            self.position[pid] = gs[-1].get("position") or ""
+
+    def team_shares(self, team: str, k: int = TEAM_WINDOW_GAMES
+                    ) -> Dict[str, dict]:
+        """pid -> {t, c, a: his share of the team's targets / carries / pass
+        attempts over its last k games (a missed game counts as zero),
+        recent: he has a line in one of the last 2} -- nflverse team code."""
+        games = self.team_games.get(team) or {}
+        keys = sorted(games)[-k:]
+        tot = {"targets": 0.0, "carries": 0.0, "attempts": 0.0}
+        per: Dict[str, Dict[str, float]] = {}
+        for key in keys:
+            for r in games[key]:
+                d = per.setdefault(r["player_id"], dict.fromkeys(tot, 0.0))
+                for c in tot:
+                    v = float(r.get(c) or 0.0)
+                    d[c] += v
+                    tot[c] += v
+        recent = {r["player_id"] for key in keys[-2:] for r in games[key]}
+        return {pid: {"t": d["targets"] / tot["targets"] if tot["targets"] else 0.0,
+                      "c": d["carries"] / tot["carries"] if tot["carries"] else 0.0,
+                      "a": d["attempts"] / tot["attempts"] if tot["attempts"] else 0.0,
+                      "recent": pid in recent}
+                for pid, d in per.items()}
 
     def find(self, name: str, team: Optional[str]) -> Tuple[Optional[str], str]:
         """(player_id, '') or (None, why). Ties break on the latest team."""
@@ -486,8 +582,18 @@ def open_markets(get_json=None) -> List[dict]:
     return out
 
 
+def _espn_ts(s) -> Optional[float]:
+    """'2026-10-03T14:42Z' -> epoch seconds (None when unreadable)."""
+    try:
+        return datetime.strptime(str(s)[:16], "%Y-%m-%dT%H:%M").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def roster_status(js: dict) -> Dict[int, List[dict]]:
-    """jersey -> [{name, key, status}] from an ESPN team roster."""
+    """jersey -> [{name, key, status, roster, position, injury_date}] from an
+    ESPN team roster (injury_date: when the designation was set, epoch)."""
     out: Dict[int, List[dict]] = {}
     for grp in js.get("athletes") or []:
         for a in grp.get("items") or []:
@@ -496,13 +602,96 @@ def roster_status(js: dict) -> Dict[int, List[dict]]:
             except (TypeError, ValueError):
                 continue
             inj = a.get("injuries") or []
-            status = str((inj[0] or {}).get("status") or "") if inj else ""
+            first = (inj[0] or {}) if inj else {}
+            status = str(first.get("status") or "")
             out.setdefault(jersey, []).append({
                 "name": a.get("fullName") or a.get("displayName") or "",
                 "key": norm_name(a.get("fullName") or ""),
                 "status": status,
-                "roster": str(((a.get("status") or {}).get("type")) or "")})
+                "roster": str(((a.get("status") or {}).get("type")) or ""),
+                "position": str(((a.get("position") or {}).get("abbreviation"))
+                                or ""),
+                "injury_date": _espn_ts(first.get("date")) if inj else None})
     return out
+
+
+def team_context(espn_team: str, ros: Optional[dict],
+                 index: Optional[PlayerIndex],
+                 changed_at: Optional[Dict[Tuple[str, str], float]] = None
+                 ) -> dict:
+    """A team's designated contributors and latest news, from its ESPN roster
+    read ({ts, roster}) and nflverse: absent = [{pid, name, position,
+    status, p (= P_MISS), t, c, a (window shares)}] for every QB / WR / TE /
+    RB with a designation who has a share in the team's window; news_at =
+    the latest designation time or observed status change (a player cleared
+    counts too); news = what it was."""
+    ctx: dict = {"absent": [], "news_at": None, "news": None}
+    if ros is None or index is None:
+        return ctx
+    nt = ESPN_TO_NFLV.get(espn_team, espn_team.upper())
+    shares = index.team_shares(nt)
+    changed_at = changed_at or {}
+    for entries in (ros.get("roster") or {}).values():
+        for a in entries:
+            pos = a.get("position") or ""
+            if pos not in POSITIONS:
+                continue
+            st = (a.get("status") or "").strip()
+            designated = st.lower() not in CLEAR_STATUSES
+            pid, _why = index.find(a["name"], nt)
+            sh = shares.get(pid) if pid else None
+            if sh is not None and material(sh):
+                # news on a contributor holds the team; a fringe player's
+                # (no share, or under NEWS_MIN_*) does not
+                stamps = [changed_at.get((espn_team, a["key"]))]
+                if designated:
+                    stamps.append(a.get("injury_date"))
+                stamps = [x for x in stamps if x is not None]
+                if stamps and (ctx["news_at"] is None or max(stamps) > ctx["news_at"]):
+                    ctx["news_at"] = max(stamps)
+                    ctx["news"] = f"{a['name']} {pos} {st or 'cleared'}"
+            if not designated or sh is None or not sh["recent"]:
+                # absent = played in one of the team's last 2 games (the
+                # fit's definition): one out longer is already in the EWMAs
+                continue
+            ctx["absent"].append({"pid": pid, "name": a["name"], "position": pos,
+                                  "status": st, "p": p_miss(st),
+                                  "t": round(sh["t"], 4), "c": round(sh["c"], 4),
+                                  "a": round(sh["a"], 4)})
+    return ctx
+
+
+def teammate_mult(stat: str, pos: str, pid: Optional[str], ctx: Optional[dict]
+                  ) -> Tuple[float, dict]:
+    """(multiplier on the player's mean, detail) from his teammates' absences
+    (the player's own designation is the gate's business, not this). QBs and
+    unknown positions are left alone (the fit covered WR / TE / RB)."""
+    if not TEAMMATE_ENABLE or not ctx or pos not in PASS_CATCHERS:
+        return 1.0, {}
+    others = [x for x in ctx.get("absent") or [] if x["pid"] != pid]
+    if not others:
+        return 1.0, {}
+    v_t = min(MAX_VACATED, sum(x["p"] * x["t"] for x in others
+                               if x["position"] in PASS_CATCHERS))
+    v_c = min(MAX_VACATED, sum(x["p"] * x["c"] for x in others
+                               if x["position"] in RUSHERS))
+    qb = max((x["p"] for x in others
+              if x["position"] == "QB" and x["a"] >= QB_STARTER_SHARE), default=0.0)
+    if stat == "rshyds":
+        chan, v = ("c", v_c) if pos in RUSHERS else (None, 0.0)
+    elif stat == "ffpts":
+        chan, v = ("c", v_c) if pos in RUSHERS else ("t", v_t)
+    else:
+        chan, v = "t", v_t
+    m = 1.0
+    if chan is not None and v > 0:
+        m *= 1.0 + TEAMMATE_ALPHA[(stat, chan)] * v / (1.0 - v)
+    if qb > 0:
+        m *= 1.0 - qb * (1.0 - QB_OUT_MULT[stat])
+    detail = {"v_t": round(v_t, 4), "v_c": round(v_c, 4), "qb_out": qb,
+              "absent": [f"{x['name']} {x['position']} {x['status']} "
+                         f"(t {x['t']:.0%}, c {x['c']:.0%})" for x in others]}
+    return m, detail
 
 
 def last_name_key(name: str) -> str:
@@ -550,6 +739,9 @@ class NflPropWatch:
         self.nflv_rows: Dict[int, List[dict]] = {}
         self.index: Optional[PlayerIndex] = None
         self.rosters: Dict[str, dict] = {}       # espn team -> {ts, roster}
+        # (espn team, player key) -> last status seen / when it last changed
+        self.status_seen: Dict[Tuple[str, str], str] = {}
+        self.status_changed_at: Dict[Tuple[str, str], float] = {}
         self.fair_cache: Dict[tuple, Tuple[float, float, float]] = {}
         self.snap: Optional[dict] = None
 
@@ -633,10 +825,30 @@ class NflPropWatch:
             try:
                 r = self.session.get(ESPN_ROSTER.format(team=t), timeout=HTTP_TIMEOUT)
                 r.raise_for_status()
-                self.rosters[t] = {"ts": now_ts, "roster": roster_status(r.json())}
+                ros = roster_status(r.json())
+                self._track_status(t, ros, now_ts)
+                self.rosters[t] = {"ts": now_ts, "roster": ros}
             except Exception as e:                   # noqa: BLE001
                 # the last good read stays; its ts ages out in the gate
                 errors.append(f"roster {t}: {type(e).__name__}: {str(e)[:80]}")
+
+    def _track_status(self, team: str, roster: Dict[int, List[dict]],
+                      now_ts: float) -> None:
+        """Stamp a QB / WR / TE / RB whose designation changed since the last
+        read (ESPN's own injury date can lag or miss a clearing); the first
+        sighting of a player stamps nothing."""
+        for entries in roster.values():
+            for a in entries:
+                if a.get("position") not in POSITIONS:
+                    continue
+                k = (team, a["key"])
+                cur = (a.get("status") or "").strip().lower()
+                prev = self.status_seen.get(k)
+                if prev is not None and prev != cur:
+                    self.status_changed_at[k] = now_ts
+                    _log(f"{team}: {a['name']} {prev or 'clear'} -> "
+                         f"{cur or 'clear'}")
+                self.status_seen[k] = cur
 
     def refresh(self, now_ts: Optional[float] = None) -> dict:
         now_ts = time.time() if now_ts is None else now_ts
@@ -659,13 +871,14 @@ class NflPropWatch:
                 teams.append(NFLV_TO_ESPN.get(nt, nt.lower()))
         self._refresh_rosters(teams, now_ts, errors)
         self.snap = build_snapshot(now_ts, season, self.family, self.index,
-                                   self.rosters, self.fair_cache, errors)
+                                   self.rosters, self.fair_cache, errors,
+                                   changed_at=self.status_changed_at)
         return self.snap
 
 
 def market_entry(m: dict, season: int, index: Optional[PlayerIndex],
-                 rosters: Dict[str, dict], fair_cache: Dict[tuple, tuple]
-                 ) -> dict:
+                 rosters: Dict[str, dict], fair_cache: Dict[tuple, tuple],
+                 ctx: Optional[dict] = None) -> dict:
     t = m.get("ticker") or ""
     series = t.split("-", 1)[0]
     stat, kind = SERIES[series]
@@ -680,6 +893,8 @@ def market_entry(m: dict, season: int, index: Optional[PlayerIndex],
     nt = KALSHI_TO_NFLV.get(team, team)
     et = NFLV_TO_ESPN.get(nt, nt.lower())
     ros = rosters.get(et)
+    if ctx and ctx.get("news_at") is not None:
+        e["news_at"], e["news"] = ctx["news_at"], ctx["news"]
     if ros is not None:
         e["roster_ts"] = ros["ts"]
         a = find_on_roster(ros["roster"], name, jersey)
@@ -702,8 +917,15 @@ def market_entry(m: dict, season: int, index: Optional[PlayerIndex],
         e["err"] = "no games"
         return e
     mu, raw, n, n_cur = pred
-    e.update(mu=round(mu, 4), ewma=round(raw, 4), n_games=n, n_season=n_cur,
+    # teammates' absences scale the player's own mean (TEAMMATE_ALPHA)
+    tm, detail = teammate_mult(stat, index.position.get(pid, ""), pid, ctx)
+    e.update(mu=round(mu * tm, 4), mu_base=round(mu, 4), ewma=round(raw, 4),
+             n_games=n, n_season=n_cur,
              last_game=f"{games[-1]['season']}w{games[-1]['week']}")
+    mu = mu * tm
+    if tm != 1.0:
+        e["team_mult"] = round(tm, 4)
+        e["teammates"] = detail
     if n < MIN_GAMES:
         e["err"] = f"only {n} games of history (min {MIN_GAMES})"
         return e
@@ -721,14 +943,27 @@ def market_entry(m: dict, season: int, index: Optional[PlayerIndex],
 def build_snapshot(now_ts: float, season: int, family: List[dict],
                    index: Optional[PlayerIndex], rosters: Dict[str, dict],
                    fair_cache: Dict[tuple, tuple],
-                   errors: Optional[List[str]] = None) -> dict:
+                   errors: Optional[List[str]] = None,
+                   changed_at: Optional[Dict[Tuple[str, str], float]] = None
+                   ) -> dict:
     entries: Dict[str, dict] = {}
+    contexts: Dict[str, dict] = {}
     for m in family:
         t = m.get("ticker")
         if not t or t.split("-", 1)[0] not in SERIES:
             continue
         try:
-            entries[t] = market_entry(m, season, index, rosters, fair_cache)
+            team, _j = parse_player_suffix(t, split_event_teams(
+                m.get("event_ticker") or t.rsplit("-", 1)[0]))
+            ctx = None
+            if team:
+                nt = KALSHI_TO_NFLV.get(team, team)
+                et = NFLV_TO_ESPN.get(nt, nt.lower())
+                if et not in contexts:
+                    contexts[et] = team_context(et, rosters.get(et), index,
+                                                changed_at)
+                ctx = contexts[et]
+            entries[t] = market_entry(m, season, index, rosters, fair_cache, ctx)
         except Exception as e:                       # noqa: BLE001
             entries[t] = {"err": f"{type(e).__name__}: {str(e)[:120]}"}
     return {
@@ -737,12 +972,20 @@ def build_snapshot(now_ts: float, season: int, family: List[dict],
         "season": season,
         "markets": entries,
         "rosters": {k: v["ts"] for k, v in sorted(rosters.items())},
+        "teams": {k: v for k, v in sorted(contexts.items())
+                  if v["absent"] or v["news_at"] is not None},
         "errors": list(errors or []),
         "model": {"half_life_games": HALF_LIFE_GAMES,
                   "prior_season_weight": PRIOR_SEASON_WEIGHT,
                   "band": [BAND_LO, BAND_HI], "wide_band": [WIDE_LO, WIDE_HI],
                   "min_games": MIN_GAMES, "full_games": FULL_GAMES,
-                  "stats": STAT_MODEL},
+                  "stats": STAT_MODEL,
+                  "teammates": {"enable": TEAMMATE_ENABLE,
+                                "window_games": TEAM_WINDOW_GAMES,
+                                "alpha": {f"{k[0]}/{k[1]}": v
+                                          for k, v in TEAMMATE_ALPHA.items()},
+                                "qb_out": QB_OUT_MULT,
+                                "max_vacated": MAX_VACATED}},
     }
 
 
@@ -795,6 +1038,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 flag = "BID ABOVE BAND"
             elif a is not None and a < lo * 100 - 1:
                 flag = "ASK BELOW BAND"
+        if e.get("team_mult"):
+            flag += f" team x{e['team_mult']:.3f}"
+        if e.get("news_at") and time.time() - e["news_at"] < 3600:
+            flag += (f" NEWS {e.get('news')} "
+                     f"{(time.time() - e['news_at']) / 60:.0f}m ago")
         fs = f"{f * 100:6.2f}" if f is not None else "     -"
         bs = f"{lo * 100:5.2f}-{hi * 100:5.2f}" if f is not None else ""
         bk = (f"{b:5.2f}/{a:5.2f}" if b is not None and a is not None

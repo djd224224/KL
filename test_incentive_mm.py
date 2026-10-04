@@ -17543,6 +17543,27 @@ class TestNflPropGate(unittest.TestCase):
         self.assertEqual(r(b=10, a=16), "band")        # 16 < 20 - 3
         self.assertIsNone(r(b=10, a=17))
 
+    def test_news_hold(self):
+        now = time.time()
+        self._snap()
+        e = imm._nfl_state["snap"]["markets"][self.T]
+        e.update(news_at=now - 600, news="Keenan Allen WR Out")
+        why, inputs, caps = imm.nfl_gate(self.T, now, 6, 7)
+        self.assertEqual((inputs["reason"], caps), ("news_hold", None))
+        self.assertIn("Keenan Allen WR Out 10m ago", why)
+        e["news_at"] = now + 120                       # a little ahead: holds
+        self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[1]["reason"], "news_hold")
+        e["news_at"] = now + 7200                      # far ahead: junk, ignored
+        self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[0], "")
+        e["news_at"] = now - imm.NFL_NEWS_HOLD_MIN * 60 - 1   # lapsed
+        self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[0], "")
+        e["news_at"] = now - 60
+        with mock.patch.object(imm, "NFL_NEWS_HOLD_MIN", 0):  # off
+            self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[0], "")
+        # an injury designation on the player himself still wins
+        e["injury"] = "Questionable"
+        self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[1]["reason"], "injury")
+
     def test_caps(self):
         now = time.time()
         self._snap()

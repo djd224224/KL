@@ -6,6 +6,7 @@ import math
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import nfl_prop_fair as nf
 
@@ -260,6 +261,164 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(
             snap["markets"]["KXNFLESCALATORREC-26OCT05ATLNO-ATLBROBINSON7"]["injury"],
             "not on roster")
+
+
+def team_rows(team, season, games):
+    """nflverse-shaped rows for one team: games = [{pid: (pos, targets,
+    carries, attempts)}] in week order; every stat column filled."""
+    out = []
+    for w, g in enumerate(games, start=1):
+        for pid, (pos, tg, ca, at) in g.items():
+            out.append({"player_id": pid, "name": f"P {pid}", "position": pos,
+                        "season": season, "week": w, "season_type": "REG",
+                        "team": team, "receptions": tg * 0.6,
+                        "receiving_yards": tg * 7.0, "rushing_yards": ca * 4.0,
+                        "fantasy_points_ppr": tg + ca * 0.5, "targets": float(tg),
+                        "carries": float(ca), "attempts": float(at)})
+    return out
+
+
+def roster_js(*athletes):
+    """ESPN roster JSON: athletes = (name, jersey, pos, status or "", date)."""
+    items = []
+    for name, jersey, pos, status, date in athletes:
+        items.append({"fullName": name, "jersey": str(jersey),
+                      "position": {"abbreviation": pos},
+                      "injuries": ([{"status": status, "date": date}]
+                                   if status else []),
+                      "status": {"type": "active"}})
+    return {"athletes": [{"items": items}]}
+
+
+class TestTeammates(unittest.TestCase):
+    """The teammate adjustment (Jack 2026-10-04): absent teammates' window
+    shares x P(miss) move a player's mean by alpha x V / (1 - V)."""
+
+    # IND-like: WR1 a (30% of targets), WR2 b, TE c, RB d (all the carries),
+    # QB q; WR e left after week 1 (already absorbed); 5 games, window 4
+    G = {"a": ("WR", 9, 0, 0), "b": ("WR", 6, 0, 0), "c": ("TE", 6, 0, 0),
+         "d": ("RB", 9, 20, 0), "q": ("QB", 0, 2, 30)}
+
+    def _index(self, week5_missing=()):
+        games = [dict(self.G, e=("WR", 10, 0, 0))]
+        for w in range(2, 6):
+            g = dict(self.G)
+            if w == 5:
+                for pid in week5_missing:
+                    g.pop(pid)
+            games.append(g)
+        rows = team_rows("IND", 2026, games)
+        for r in rows:            # names the roster can find
+            r["name"] = {"a": "Keenan Allen", "b": "Josh Downs", "c": "Tyler Warren",
+                         "d": "Jonathan Taylor", "q": "Daniel Jones",
+                         "e": "Old Guy"}[r["player_id"]]
+        return nf.PlayerIndex(rows)
+
+    def test_p_miss(self):
+        self.assertEqual([nf.p_miss(s) for s in ("Out", "Injured Reserve",
+                          "Doubtful", "Questionable", "", "Active",
+                          "Day-To-Day", "Suspension", "Weird")],
+                         [1.0, 1.0, 0.8, 0.25, 0.0, 0.0, 0.1, 1.0, 0.5])
+
+    def test_team_shares_count_misses_as_zero(self):
+        idx = self._index()
+        sh = idx.team_shares("IND", 4)          # weeks 2-5
+        self.assertAlmostEqual(sh["a"]["t"], 9 / 30)
+        self.assertAlmostEqual(sh["d"]["c"], 20 / 22)
+        self.assertAlmostEqual(sh["q"]["a"], 1.0)
+        self.assertNotIn("e", sh)               # outside the window
+        self.assertTrue(sh["a"]["recent"])
+        # a player missing week 5 still has his share, counted with a zero
+        sh2 = self._index(week5_missing=("a",)).team_shares("IND", 4)
+        self.assertAlmostEqual(sh2["a"]["t"], 27 / (3 * 30 + 21))
+        self.assertTrue(sh2["a"]["recent"])     # played week 4
+
+    def test_context_and_multipliers(self):
+        idx = self._index()
+        ros = {"ts": 1.0, "roster": nf.roster_status(roster_js(
+            ("Keenan Allen", 10, "WR", "Out", "2026-10-03T14:37Z"),
+            ("Josh Downs", 1, "WR", "", None),
+            ("Tyler Warren", 84, "TE", "Questionable", "2026-10-01T21:25Z"),
+            ("Jonathan Taylor", 28, "RB", "", None),
+            ("Daniel Jones", 17, "QB", "", None),
+            ("Old Guy", 80, "WR", "Injured Reserve", "2026-09-01T00:00Z"),
+            ("Kicker Guy", 3, "K", "Out", "2026-10-03T20:00Z")))}
+        ctx = nf.team_context("ind", ros, idx)
+        names = sorted(x["name"] for x in ctx["absent"])
+        self.assertEqual(names, ["Keenan Allen", "Tyler Warren"])  # not Old Guy
+        self.assertEqual(ctx["news"], "Keenan Allen WR Out")       # latest, material
+        self.assertEqual(ctx["news_at"], nf._espn_ts("2026-10-03T14:37Z"))
+        # Downs: V = 1.0 x 0.30 + 0.25 x 0.20
+        v = 9 / 30 + 0.25 * 6 / 30
+        m, d = nf.teammate_mult("rec", "WR", "b", ctx)
+        self.assertAlmostEqual(m, 1 + 0.18 * v / (1 - v))
+        self.assertAlmostEqual(d["v_t"], round(v, 4))
+        self.assertAlmostEqual(nf.teammate_mult("recyds", "WR", "b", ctx)[0],
+                               1 + 0.14 * v / (1 - v))
+        # Allen's own markets: his own designation is the gate's, not this
+        m_a, _ = nf.teammate_mult("rec", "WR", "a", ctx)
+        va = 0.25 * 6 / 30
+        self.assertAlmostEqual(m_a, 1 + 0.18 * va / (1 - va))
+        # the RB's rushing: no rusher out -> 1; QBs untouched
+        self.assertEqual(nf.teammate_mult("rshyds", "RB", "d", ctx)[0], 1.0)
+        self.assertEqual(nf.teammate_mult("ffpts", "QB", "q", ctx)[0], 1.0)
+        with mock.patch.object(nf, "TEAMMATE_ENABLE", False):
+            self.assertEqual(nf.teammate_mult("rec", "WR", "b", ctx)[0], 1.0)
+
+    def test_lead_back_and_quarterback_out(self):
+        idx = self._index()
+        ros = {"ts": 1.0, "roster": nf.roster_status(roster_js(
+            ("Jonathan Taylor", 28, "RB", "Out", "2026-10-03T10:00Z"),
+            ("Daniel Jones", 17, "QB", "Out", "2026-10-03T11:00Z")))}
+        ctx = nf.team_context("ind", ros, idx)
+        self.assertEqual(ctx["news"], "Daniel Jones QB Out")
+        # the clamp: Taylor's 20/22 of the carries -> V capped at MAX_VACATED
+        backup = {"pid": "z", "position": "RB"}
+        m, d = nf.teammate_mult("rshyds", "RB", backup["pid"], ctx)
+        vc = nf.MAX_VACATED
+        self.assertAlmostEqual(d["v_c"], vc)
+        self.assertAlmostEqual(m, (1 + 0.33 * vc / (1 - vc)) * 0.91)
+        # a WR: Taylor's 9/30 of the targets, then the QB
+        m_w, _ = nf.teammate_mult("rec", "WR", "b", ctx)
+        vt = 9 / 30
+        self.assertAlmostEqual(m_w, (1 + 0.18 * vt / (1 - vt)) * 0.95)
+
+    def test_news_needs_a_contributor_and_tracks_changes(self):
+        idx = self._index()
+        js = roster_js(("Keenan Allen", 10, "WR", "Questionable", "2026-10-02T12:00Z"),
+                       ("Nobody", 99, "WR", "Out", "2026-10-03T23:00Z"))
+        w = nf.NflPropWatch(session=mock.Mock(), cache_dir=tempfile.mkdtemp())
+        ros1 = nf.roster_status(js)
+        w._track_status("ind", ros1, 1000.0)
+        self.assertEqual(w.status_changed_at, {})       # first sighting
+        js2 = roster_js(("Keenan Allen", 10, "WR", "", None),
+                        ("Nobody", 99, "WR", "Out", "2026-10-03T23:00Z"))
+        ros2 = nf.roster_status(js2)
+        w._track_status("ind", ros2, 2000.0)            # Allen cleared
+        self.assertEqual(w.status_changed_at, {("ind", "keenanallen"): 2000.0})
+        ctx = nf.team_context("ind", {"ts": 2000.0, "roster": ros2}, idx,
+                              w.status_changed_at)
+        # the cleared contributor is the news; Nobody (no share) is not
+        self.assertEqual((ctx["news_at"], ctx["news"]),
+                         (2000.0, "Keenan Allen WR cleared"))
+        self.assertEqual(ctx["absent"], [])
+
+    def test_snapshot_carries_the_adjustment(self):
+        idx = self._index()
+        ros = {"ind": {"ts": 5.0, "roster": nf.roster_status(roster_js(
+            ("Keenan Allen", 10, "WR", "Out", "2026-10-03T14:37Z"),
+            ("Josh Downs", 1, "WR", "", None)))}}
+        fam = [market("KXNFLLADDERREC-26OCT04INDWAS-INDJDOWNS1", "Josh Downs")]
+        snap = nf.build_snapshot(10.0, 2026, fam, idx, ros, {})
+        e = snap["markets"]["KXNFLLADDERREC-26OCT04INDWAS-INDJDOWNS1"]
+        v = 9 / 30
+        self.assertAlmostEqual(e["team_mult"], round(1 + 0.18 * v / (1 - v), 4))
+        self.assertAlmostEqual(e["mu"], round(e["mu_base"] * e["team_mult"], 3),
+                               places=3)
+        self.assertAlmostEqual(e["fair"], e["mu"] / 20.0, places=4)
+        self.assertEqual(e["news"], "Keenan Allen WR Out")
+        self.assertIn("ind", snap["teams"])
+        self.assertIn("Keenan Allen WR Out", e["teammates"]["absent"][0])
 
 
 class FakeResp:
