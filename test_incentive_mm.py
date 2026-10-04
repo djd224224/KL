@@ -69,6 +69,12 @@ _YIELD_CODE_DEFAULT = (imm.YIELD_SIZE_MULT, imm.YIELD_SIZE_MULT_FROM, imm.YIELD_
                        imm.YIELD_SIZE_EXIT_FRAC)
 imm.EVENING_SIZE_MULTS = {}
 imm.YIELD_SIZE_MULT = 1.0
+# ...and the NFL player-prop gate (2026-10-03), default ON and fail-closed:
+# no refresher thread runs under test, so every NFL ladder / escalator would
+# stand aside and the ladder fixtures (sub-penny join, full unwind, the
+# allowlist ...) would stop quoting. TestNflPropGate arms it explicitly.
+_NFL_GATE_CODE_DEFAULT = imm.NFL_FAIR_ENABLE
+imm.NFL_FAIR_ENABLE = False
 
 
 def setUpModule():
@@ -132,6 +138,9 @@ def setUpModule():
     # the same -- only its refresher thread writes them
     imm.POKE_STATUS_FILE = os.path.join(tmp, "pokemon_fair.json")
     imm._poke_state["snap"] = None
+    # the NFL prop gate's status file and in-memory snapshot (2026-10-03)
+    imm.NFL_STATUS_FILE = os.path.join(tmp, "nfl_prop_fair.json")
+    imm._nfl_state["snap"] = None
     # the data center count file (2026-10-01) is reloaded by every run_cycle
     imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
     imm._dc_state.update(mtime=0.0, entries={})
@@ -17417,6 +17426,208 @@ class TestPokemonFairGate(unittest.TestCase):
         self.assertIn(self.T, bot._poke_stood)
 
 
+class TestNflPropGate(unittest.TestCase):
+    """nfl_prop_fair's snapshot -> nfl_gate / mort_cap_quotes: every NFL
+    ladder / escalator quoted only inside its player-history fair band,
+    standing aside on an injury designation or a touch far outside the band,
+    failing closed (Jack 2026-10-03, after the Robinson escalator filled 400
+    at 40c against a ~5c fair). Numbers are the live ones for
+    KXNFLESCALATORREC-26OCT05ATLNO-ATLBROBINSON7 that day: mu 3.95
+    receptions over 37 games, fair 4.75c, band 2.06-12.78c (x0.7 / x1.5)."""
+
+    T = "KXNFLESCALATORREC-67OCT05ATLNO-ATLBROBINSON7"
+    EV = "KXNFLESCALATORREC-67OCT05ATLNO"
+    KICKOFF = datetime(2067, 10, 6, 0, 15, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        imm._nfl_state["snap"] = None
+        p = mock.patch.object(imm, "NFL_FAIR_ENABLE", True)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(lambda: imm._nfl_state.update(snap=None))
+        saved = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        self.addCleanup(lambda: setattr(imm, "SERIES_HOUR_MULTS", saved))
+        # a cycle clones the ladder archetype into SERIES_OVERRIDES for the
+        # escalator series (ensure_family_override); later tests read the
+        # unregistered series' plain ladder, so put the table back
+        overrides = dict(imm.SERIES_OVERRIDES)
+        self.addCleanup(lambda: (imm.SERIES_OVERRIDES.clear(),
+                                 imm.SERIES_OVERRIDES.update(overrides)))
+
+    def _snap(self, fair=0.047530, lo=0.020647, hi=0.127802, age_secs=0.0,
+              roster_age_secs=0.0, injury=None, err=None, ticker=None,
+              roster=True):
+        now = time.time()
+        e = {"stat": "rec", "kind": "escalator", "player": "Bijan Robinson",
+             "team": "ATL", "jersey": 7, "injury": injury}
+        if roster:
+            e["roster_ts"] = now - roster_age_secs
+        if err:
+            e["err"] = err
+        else:
+            e.update(fair=fair, fair_lo=lo, fair_hi=hi, mu=3.951941,
+                     n_games=37)
+        imm._nfl_state["snap"] = {"ts": now - age_secs,
+                                  "markets": {ticker or self.T: e},
+                                  "errors": []}
+
+    def test_default_on_and_covers_every_nfl_prop(self):
+        self.assertTrue(_NFL_GATE_CODE_DEFAULT)
+        for s in ("KXNFLLADDERREC", "KXNFLLADDERRECYDS", "KXNFLLADDERRSHYDS",
+                  "KXNFLFFPTSLADDER", "KXNFLESCALATORREC",
+                  "KXNFLESCALATORRECYDS", "KXNFLESCALATORRSHYDS",
+                  "KXNFLLADDERPASSYDS"):     # a future stat: gated, unmodelled
+            self.assertTrue(imm.nfl_series(s), s)
+        for s in ("KXNBALADDERPTS", "KXCFBLADDERREC", "KXNFLGAME", "KXGOOD"):
+            self.assertFalse(imm.nfl_series(s), s)
+        with mock.patch.object(imm, "NFL_FAIR_ENABLE", False):
+            self.assertFalse(imm.nfl_series("KXNFLESCALATORREC"))
+
+    def test_gate_reasons_fail_closed(self):
+        now = time.time()
+
+        def r(t=None, b=6, a=7):
+            return imm.nfl_gate(t or self.T, now, b, a)[1].get("reason")
+        self.assertEqual(r(), "no_read")
+        self._snap(age_secs=imm.NFL_FAIR_TTL_MIN * 60 + 30)
+        self.assertEqual(r(), "stale")
+        self._snap()
+        self.assertEqual(r(t=self.T + "1"), "no_market")
+        self._snap(err="only 2 games of history (min 3)")
+        self.assertEqual(r(), "model")
+        self._snap(roster=False)
+        self.assertEqual(r(), "stale_roster")         # never read: out
+        self._snap(roster_age_secs=imm.NFL_ROSTER_TTL_MIN * 60 + 30)
+        self.assertEqual(r(), "stale_roster")
+        self._snap(injury="Doubtful")                  # McLaurin, 10/3 14:42Z
+        why, inputs, caps = imm.nfl_gate(self.T, now, 6, 7)
+        self.assertEqual((inputs["reason"], caps), ("injury", None))
+        self.assertIn("Doubtful", why)
+        self._snap(injury="not on roster")
+        self.assertEqual(r(), "injury")
+        # the 05:02Z book, 45 / 60, and the 40 / 51 the fill came from
+        self._snap()
+        self.assertEqual(r(b=45, a=60), "band")
+        self.assertEqual(r(b=40, a=51), "band")
+        self.assertIsNone(r(b=15, a=20))               # 15 <= 12.78 + 3
+        self.assertEqual(r(b=16, a=20), "band")
+        # an ask far under the band (a collapse the model does not know)
+        self._snap(fair=0.30, lo=0.20, hi=0.45)
+        self.assertEqual(r(b=10, a=16), "band")        # 16 < 20 - 3
+        self.assertIsNone(r(b=10, a=17))
+
+    def test_caps(self):
+        now = time.time()
+        self._snap()
+        why, inputs, caps = imm.nfl_gate(self.T, now, 6, 7)
+        self.assertEqual((why, caps), ("", (13, 2)))   # 12.78 + 1, 2.06 - 1
+        self.assertEqual((inputs["fair"], inputs["player"], inputs["n_games"]),
+                         (4.753, "Bijan Robinson", 37))
+        # an RB receiving-yards escalator worth ~0.2c: the book's 2c bid is
+        # not joined (bids <= 1c), the ask side is free
+        self._snap(fair=0.0018, lo=0.0011, hi=0.0034)
+        self.assertEqual(imm.nfl_gate(self.T, now, 2, 3)[2], (1, 1))
+        # a ladder near the top: no ask floor above 99
+        self._snap(fair=0.97, lo=0.95, hi=0.995)
+        self.assertEqual(imm.nfl_gate(self.T, now, 95, 99)[2], (100, 94))
+
+    def _bot(self, yes_px="0.0600", no_px="0.9300"):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": "2067-10-08T00:15:00Z",
+            "yes_bid_dollars": yes_px, "yes_ask_dollars": "0.0700",
+            "volume_fp": "500.00"}
+        self._book(client, yes_px, no_px)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        kick = {"events": [{
+            "date": self.KICKOFF.strftime("%Y-%m-%dT%H:%MZ"),
+            "shortName": "ATL @ NO",
+            "status": {"type": {"name": "STATUS_SCHEDULED"}},
+            "competitions": [{"competitors": [
+                {"team": {"abbreviation": "NO", "location": "New Orleans"},
+                 "homeAway": "home"},
+                {"team": {"abbreviation": "ATL", "location": "Atlanta"},
+                 "homeAway": "away"}]}]}]}
+        bot.resolver = imm.EventStartResolver(http_get_json=lambda url: kick)
+        return bot
+
+    def _book(self, client, yes_px, no_px):
+        """Three 400-lot levels a side down from each touch (yes_px is the
+        YES bid, no_px the NO bid = 1 - the YES ask)."""
+        def lv(px):
+            c = round(float(px) * 100)
+            return [[f"{(c - i) / 100:.4f}", "400"] for i in (2, 1, 0)]
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": lv(yes_px), "no_dollars": lv(no_px)}}
+
+    def _quotes(self, bot):
+        q = [(o["book_side"], o["yes_price"])
+             for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+        return ({px for s_, px in q if s_ == "bid" and 1 < px < 99},
+                {px for s_, px in q if s_ == "ask" and 1 < px < 99})
+
+    def _ungated(self, yes_px, no_px):
+        """What the same book rests with the gate off (the baseline)."""
+        with mock.patch.object(imm, "NFL_FAIR_ENABLE", False):
+            _clean_persist()
+            bot = self._bot(yes_px, no_px)
+            bot.run_cycle()
+            q = self._quotes(bot)
+        _clean_persist()
+        return q
+
+    def test_the_robinson_night_end_to_end(self):
+        calm = self._ungated("0.0600", "0.9300")         # the 6 / 7 book
+        self.assertTrue(calm[0] and calm[1])
+        near = self._ungated("0.1400", "0.8000")         # 14 / 20
+        bot = self._bot()
+        bot.run_cycle()                    # no read: nothing, not selected
+        self.assertEqual(self._quotes(bot), (set(), set()))
+        self.assertNotIn(self.T, bot.state.selected)
+        # a fresh read and the 6 / 7 book: inside the band, quoted exactly
+        # as without the gate
+        self._snap()
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(self._quotes(bot), calm)
+        self.assertNotIn(self.T, bot._nfl_stood)
+        # 05:02Z: the touch jumps to 45 / 60 -- before, the bid followed it
+        # to 40 and filled 400; now the market stands aside, nothing rests
+        self._book(bot.client, "0.4500", "0.4000")
+        self._snap()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), (set(), set()))
+        self.assertIn(self.T, bot._nfl_stood)
+        # a touch just inside the stand-aside band (14 <= 12.78 + 3): quoted
+        # again, the bids held at the 13c cap, the asks as without the gate
+        self._book(bot.client, "0.1400", "0.8000")
+        self._snap()
+        bot.run_cycle()
+        bids, asks = self._quotes(bot)
+        self.assertGreater(max(near[0]), 13)             # ungated: over it
+        self.assertEqual(max(bids), 13)
+        self.assertEqual(asks, near[1])
+        self.assertNotIn(self.T, bot._nfl_stood)
+        # the player goes Questionable: out
+        self._snap(injury="Questionable")
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), (set(), set()))
+        self.assertIn(self.T, bot._nfl_stood)
+
+    def test_kill_switch_quotes_as_before(self):
+        bids, _asks = self._ungated("0.4000", "0.4900")  # the 40 / 51 book
+        self.assertGreaterEqual(max(bids), 38)           # the old behaviour
+
 class TestGuardSkipSink(unittest.TestCase):
     """guard_skips_*.jsonl (2026-09-26): a market an in-loop guard skips wrote
     no cycle_log row that cycle, so what the guard saw was lost. Change-driven:
@@ -17579,8 +17790,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # (2026-09-28) + the data center count gate (2026-10-01) + the
         # OpenRouter market-share gate (2026-09-30) + the monthly rain gate
         # (2026-10-01) + the Treasury touch gate (2026-10-01) + the Pokemon
-        # gate (2026-10-03)
-        self.assertEqual(len(conts), 35)
+        # gate (2026-10-03) + the NFL player-prop gate (2026-10-03)
+        self.assertEqual(len(conts), 36)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

@@ -6858,3 +6858,78 @@ Code-only change: the bot's code-change exit applies it (handoff, no -Task).
 
 Tests: test_imm_scan_graduates.py gains test_the_four_unblocked_kpi_series_
 quote_again; 1,957 green.
+
+## 2026-10-03 night — NFL player props quoted only inside a player-history fair band, injured players out (Jack)
+
+Jack: "how to avoid getting blown up on the NFL markets like
+KXNFLESCALATORREC-26OCT05ATLNO? can you model what it should be, based on
+past data of the player to protect from the market going super out of wack
+like the 400-lot overnight fill: the ATL@NO Robinson escalator."
+
+WHAT HAPPENED (orders / fills logs). The Bijan Robinson receptions
+escalator (pays floor(1e4 x (min(rec,14)/14)^3)/1e4) listed 00:24Z 10/3 and
+traded 3-6c until 05:02Z, when the touch jumped 6 / 97 -> 45 / 60. The quote
+loop follows the touch: bid 6 -> 8 -> 12, amended to the 40c touch at
+05:15Z with 400 lots (Saturday quiet hours), filled 400 @ 40 at 05:36Z; book
+6 / 7 again by 10:14Z (6.8c at 23:52Z), -$134. Same evening his receptions
+ladder ran 17 -> 44 -> 24 and filled 200 @ 42 (fair ~20), Diggs' @ 51 (fair
+~21), Johnston's yards ladder @ 48 (fair ~9). The open NFL prop book marked
+-$544 at 23:52Z. Two more patterns: McLaurin went Doubtful on ESPN at 14:42Z
+and the bot bought his yards ladder 250 @ 12 at 16:43Z (3 / 4 by evening);
+Keenan Allen went Out at 14:37Z and Downs' ladder repriced 24 -> 34 against
+the bot's short 400. And the RB receiving-yards escalators trade ~2c against
+a 0.1-0.5c fair; the bot kept buying 200-lots of them at 2c.
+
+THE MODEL -- nfl_prop_fair.py (docstring has the detail). Calibrated
+2026-10-03 out of sample on nflverse weekly stats (every 2025-26 game of a
+QB/WR/TE/RB predicted from that player's earlier games only, ~2,200 starter
+games per stat):
+- mean = EWMA of the player's games, half-life 8 games, earlier seasons
+  x0.5 (best of 21 combinations on all four stats), shrunk mu = a x ewma + b
+  (receptions 0.902 / 0.066, rec yds 0.867 / 2.94, rush yds 0.833 / 6.59,
+  PPR 0.894 / 0.63). Targets / carries add nothing.
+- shape: var / mean is flat across levels -- receptions NB1 var 1.3 mu,
+  yards / PPR gamma var 23 / 21 / 5 x mu. Escalator payouts predicted vs
+  paid: rec 4.71 vs 4.63c, rec yds 3.23 vs 3.14c, rush yds 4.02 vs 4.10c, by
+  quintile within ~0.5c, and down to 0.1c fairs (RB rec yds 8-13: 0.20 vs
+  0.11c -- the 2c market is the mispricing, not the tail).
+- payouts read from custom_strike; reproduce all 596 settlements to 10/1
+  exactly (60-69 yards pays 0.0270: a float trap in floor()).
+- vs the market: on 368 settled props with a pre-game book, model MSE 59.5
+  vs the pre-game mid's 59.1 (correlation 0.89-0.95).
+- band [fair_lo, fair_hi] = the payout at mu x 0.7 / x 1.5 (x 0.5 / x 2
+  under 8 games; under 3 games no fair).
+
+THE GATE -- nfl_gate in incentive_mm.py, every NFL ladder / escalator
+(sports_ladder_league == NFL, so a new stat stands aside until modelled),
+the Pokemon gate's shape: refresher thread "nfl-fair" (Kalshi family 15m,
+nflverse current season 6h / older weekly, cached run-logs/incentive-mm/
+nfl_stats; ESPN rosters 10m, ~28 KB gzipped per team), status file
+nfl_prop_fair.json, quote loop + estimator probe. Stands aside (cancel) on:
+no read / stale (30m), market not priced, roster read missing / stale (45m),
+ANY ESPN designation (Questionable, Doubtful, Out, IR, not on roster), a
+touch over NFL_BAND_TOL_CENTS (3) outside the band on the side that would
+fill us. Otherwise bids <= floor(fair_hi + 1c), asks >= ceil(fair_lo - 1c)
+(mort_cap_quotes, last). Positions ride while stood aside (as every gate).
+Kill switch IMM_NFL_FAIR_ENABLE=0. CLI: `python nfl_prop_fair.py
+[--event E | --ticker T]` prints every open prop's mu / fair / band / book.
+
+MEASURED IMPACT. 517k logged tight-book cycles 9/24-10/3: the touch sat
+above fair_hi + 1c 1.3% of the time, never under fair_lo. Fills 9/30-10/3
+replayed: the 32 outside the band lost $384 at settlement / model fair
+(-$280 at marks), the 241 inside made $97. Live dry run 00:25Z 10/4 (511
+open props): 485 quote untouched, 12 bid-capped below the touch (the 2c RB
+escalators), 10 injury stand-asides (McLaurin, Zay Flowers), 4 band
+stand-asides (Downs x2, Nacua's 60c bid, Robinson's yards ladder 18 / 20 vs
+9.3).
+
+NOT DONE: other leagues' ladders (NBA from late October) are still
+unguarded; teammate news (Allen out -> Downs up) is only caught once the
+book has moved past the band; the inactive list (~90 min before kickoff) vs
+the kickoff - 30 min cutoff is unchanged; per-market caps are in contracts,
+so a 400-lot at 40c risks $160 where one at 6c risks $24.
+
+Tests: test_nfl_prop_fair.py (14: payout tables, distributions, the EWMA,
+tickers / names / rosters, the snapshot, the watch end to end with caching),
+TestNflPropGate (fail-closed reasons, caps, the Robinson night end to end,
+kill switch); the suite neutralises the gate at import. 1,968 green.

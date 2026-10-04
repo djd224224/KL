@@ -8971,6 +8971,117 @@ def poke_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
 
 
+# ----------------------------------------------------------------------------
+# NFL PLAYER-PROP GATE (Jack 2026-10-03: "how to avoid getting blown up on
+# the NFL markets like KXNFLESCALATORREC-26OCT05ATLNO? can you model what it
+# should be, based on past data of the player to protect from the market
+# going super out of wack like the 400-lot overnight fill"). The ladders and
+# escalators had no fair at all: the quote loop joined whatever touch
+# existed, so when the Robinson receptions escalator's book jumped 6 / 97 ->
+# 45 / 60 at 05:02Z on 10/3 the bid followed to 40c and filled 400 there at
+# 05:36Z (fair ~5c, book 6.8c again by 10:14Z: -$134); his receptions ladder
+# filled 200 at 42 (fair ~20) that evening, Diggs' at 51 (fair ~21).
+#   - FAIR: nfl_prop_fair.py (refresher thread "nfl-fair", every
+#     NFL_FAIR_REFRESH_SECS): the player's own games (nflverse weekly stats,
+#     half-life 8 games, earlier seasons x0.5, shrunk ~10% to the mean) give
+#     the stat's mean; receptions NB1 (var 1.3 mu), yards / PPR gamma (var
+#     23 / 21 / 5 x mu); the payout read from the market's custom_strike.
+#     Out of sample on ~2,200 games per stat the escalator payouts are
+#     calibrated within ~0.5c a quintile; on the 368 settled Kalshi props its
+#     error equals the pre-game book's. The band [fair_lo, fair_hi] is the
+#     payout at mu x 0.7 / x 1.5 (x 0.5 / x 2 under 8 games).
+#   - The quote loop stands a market aside (cancel) without a fresh read, on
+#     a market the read does not price (unmapped player, under 3 games, a
+#     series with no model -- every NFL ladder / escalator is gated, so a new
+#     stat stands aside until it has one), on a player with ANY ESPN injury
+#     designation (or a stale / missing roster read: ESPN's roster carries
+#     Questionable / Doubtful / Out / IR; 10/3 McLaurin went Doubtful at
+#     14:42Z and the bot bought his yards ladder at 12c at 16:43Z), or when
+#     the touch sits more than NFL_BAND_TOL_CENTS (3) outside the band on the
+#     side that would fill us -- the book may know something (Keenan Allen
+#     out -> Downs' ladder 24 -> 34), or it is the Robinson spike. Otherwise
+#     bids rest at most fair_hi + NFL_FAIR_TOL_CENTS (1) and asks at least
+#     fair_lo - 1 (mort_cap_quotes): the ~2c bids on RB receiving-yards
+#     escalators worth 0.1-0.5c (calibrated there too) stop being joined.
+#   - On 517k logged tight-book cycles the touch sat above fair_hi + 1c 1.3%
+#     of the time and never under fair_lo; replaying the 273 prop fills
+#     9/30-10/3, the 32 outside the band lost $384 (settlement / fair), the
+#     241 inside made $97.
+# Kill switch IMM_NFL_FAIR_ENABLE=0 (plain quoting, as before).
+NFL_FAIR_ENABLE = os.environ.get("IMM_NFL_FAIR_ENABLE", "1") == "1"
+NFL_FAIR_TOL_CENTS = _env_float("IMM_NFL_FAIR_TOL_CENTS", 1.0)
+NFL_BAND_TOL_CENTS = _env_float("IMM_NFL_BAND_TOL_CENTS", 3.0)
+NFL_FAIR_TTL_MIN = _env_int("IMM_NFL_FAIR_TTL_MIN", 30)
+NFL_ROSTER_TTL_MIN = _env_int("IMM_NFL_ROSTER_TTL_MIN", 45)
+NFL_FAIR_REFRESH_SECS = _env_int("IMM_NFL_FAIR_REFRESH_SECS", 120)
+NFL_STATUS_FILE = os.environ.get(
+    "IMM_NFL_STATUS_FILE", os.path.join(STATUS_DIR, "nfl_prop_fair.json"))
+# the refresher's latest snapshot (nfl_prop_fair.build_snapshot)
+_nfl_state: dict = {"snap": None}
+
+
+def nfl_series(series: str) -> bool:
+    """Every NFL ladder / escalator series (the pattern allowlist's NFL
+    members), modelled or not -- an unmodelled one stands aside."""
+    return NFL_FAIR_ENABLE and sports_ladder_league(series) == "NFL"
+
+
+def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+             ext_ask: Optional[float]
+             ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', inputs, (bid_cap, ask_floor)) when an NFL prop may quote -- bids
+    at most bid_cap, asks at least ask_floor, None = that side not at all --
+    else (why, guard-skip inputs, None). Fails CLOSED."""
+    snap = _nfl_state.get("snap")
+    if snap is None:
+        return "no nfl read yet", {"reason": "no_read"}, None
+    age = now_ts - float(snap.get("ts") or 0.0)
+    if age > NFL_FAIR_TTL_MIN * 60:
+        return (f"nfl read is {age / 60:.0f}m old",
+                {"reason": "stale", "age_s": round(age)}, None)
+    e = (snap.get("markets") or {}).get(ticker)
+    if e is None:
+        return "market not in the nfl read", {"reason": "no_market"}, None
+    if e.get("err") or e.get("fair") is None:
+        why = str(e.get("err") or "no fair")[:160]
+        return f"not priced: {why}", {"reason": "model", "why": why}, None
+    rts = e.get("roster_ts")
+    rage = now_ts - float(rts) if rts is not None else None
+    if rage is None or rage > NFL_ROSTER_TTL_MIN * 60:
+        return (f"ESPN roster for {e.get('team')} is "
+                f"{'missing' if rage is None else f'{rage / 60:.0f}m old'}",
+                {"reason": "stale_roster", "team": e.get("team"),
+                 "age_s": None if rage is None else round(rage)}, None)
+    if e.get("injury"):
+        return (f"{e.get('player')}: {e['injury']}",
+                {"reason": "injury", "player": e.get("player"),
+                 "injury": e["injury"]}, None)
+    fair = float(e["fair"]) * 100.0
+    lo = float(e["fair_lo"]) * 100.0
+    hi = float(e["fair_hi"]) * 100.0
+    inputs = {"fair": round(fair, 3), "fair_lo": round(lo, 3),
+              "fair_hi": round(hi, 3), "mu": e.get("mu"),
+              "n_games": e.get("n_games"), "player": e.get("player"),
+              "tol": NFL_FAIR_TOL_CENTS, "band_tol": NFL_BAND_TOL_CENTS}
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo,
+                                        NFL_BAND_TOL_CENTS, hi)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.2f}c (band "
+                f"{lo:.2f}-{hi:.2f} +-{NFL_BAND_TOL_CENTS:g}c, "
+                f"{'bid' if bid_bad else 'ask'} side; {e.get('player')} mu "
+                f"{e.get('mu')})",
+                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad),
+                None)
+    bid_cap = int(math.floor(hi + NFL_FAIR_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(lo - NFL_FAIR_TOL_CENTS - 1e-9))
+    caps = (bid_cap if bid_cap >= 1 else None,
+            max(1, ask_floor) if ask_floor <= 99 else None)
+    if caps == (None, None):
+        return (f"no side within the band {lo:.2f}-{hi:.2f}c",
+                dict(inputs, reason="decided"), None)
+    return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
 _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 
@@ -11414,6 +11525,7 @@ class IncentiveMarketMaker:
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
+        self._nfl_stood: Set[str] = set()         # NFL prop gate stand-asides
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # (account value, anchor) from the last floor check, for risk_line
         self._acct_reading: Optional[Tuple[float, float]] = None
@@ -14962,6 +15074,11 @@ class IncentiveMarketMaker:
                 # Pokemon gate: the same, POKE_FAIR_TOL_CENTS clear
                 _pw, _pi, _pc = poke_gate(meta.ticker, _now.timestamp(), eb, ea)
                 out = [] if (_pw or _pc is None) else mort_cap_quotes(out, *_pc)
+            if nfl_series(meta.series):
+                # NFL prop gate: nothing while it stands aside, else the
+                # rungs held inside the player-history band
+                _nw, _ni, _nc = nfl_gate(meta.ticker, _now.timestamp(), eb, ea)
+                out = [] if (_nw or _nc is None) else mort_cap_quotes(out, *_nc)
             return out
 
         def _overlay_with_pads(quotes: List[Quote],
@@ -16710,6 +16827,25 @@ class IncentiveMarketMaker:
                 self._poke_stood.discard(t)
                 log(f"{self.tag} pokemon resume {t}")
 
+            # NFL PLAYER-PROP GATE (Jack 2026-10-03, see NFL_FAIR_ENABLE):
+            # stand aside (cancel) without a fresh player-history fair, on an
+            # injury-designated player, or when the touch sits outside the
+            # fair band by more than NFL_BAND_TOL_CENTS; otherwise every rung
+            # below stays inside the band (+-NFL_FAIR_TOL_CENTS).
+            nfl_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            if nfl_series(meta.series):
+                nf_why, nf_in, nfl_caps = nfl_gate(t, now_ts, ext_bid, ext_ask)
+                if nf_why:
+                    if t not in self._nfl_stood:
+                        self._nfl_stood.add(t)
+                        log(f"{self.tag} nfl stand-aside {t}: {nf_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "nfl_fair", lambda: nf_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._nfl_stood:
+                self._nfl_stood.discard(t)
+                log(f"{self.tag} nfl resume {t}")
+
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go
             # silent. Without this, a restored rain position kept reduce-only
@@ -16841,6 +16977,9 @@ class IncentiveMarketMaker:
             # Pokemon gate: likewise last, POKE_FAIR_TOL_CENTS clear
             if poke_caps is not None:
                 mq = mort_cap_quotes(mq, *poke_caps)
+            # NFL prop gate: likewise last, inside the player-history band
+            if nfl_caps is not None:
+                mq = mort_cap_quotes(mq, *nfl_caps)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -18501,6 +18640,54 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_poke_fair_refresh, daemon=True,
                              name="poke-fair").start()
+        if NFL_FAIR_ENABLE and not once:
+            # NFL prop refresher (2026-10-03): the Pokemon refresher's shape
+            # -- Kalshi (signed), nflverse and ESPN reads off the trading
+            # thread into the in-memory snapshot the gate reads
+            # (_nfl_state), plus a status file. Rosters (injuries) every
+            # 10 minutes, the family's markets every 15, nflverse's current
+            # season every 6 hours; fairs recompute only when the history
+            # changes. A failed refresh keeps the old snapshot, which ages
+            # out of NFL_FAIR_TTL_MIN (the gate fails closed).
+            def _nfl_fair_refresh():
+                try:
+                    import nfl_prop_fair
+                except Exception as e:
+                    log(f"{self.tag} ! nfl refresher disabled: {e}")
+                    return
+                watch = nfl_prop_fair.NflPropWatch(fair_reader())
+                last = None
+                while True:
+                    delay = max(30, NFL_FAIR_REFRESH_SECS)
+                    try:
+                        snap = watch.refresh()
+                        _nfl_state["snap"] = snap
+                        ents = snap.get("markets") or {}
+                        n_ok = sum(1 for e in ents.values()
+                                   if e.get("fair") is not None and not e.get("err"))
+                        n_inj = sum(1 for e in ents.values() if e.get("injury"))
+                        errs = snap.get("errors") or []
+                        key = (n_ok, len(ents), n_inj, len(errs))
+                        if last != key:
+                            log(f"{self.tag} nfl-fair refresh: {n_ok}/"
+                                f"{len(ents)} props priced, {n_inj} injury-"
+                                f"designated"
+                                + (f"; {'; '.join(errs)[:200]}" if errs else ""))
+                        last = key
+                        try:
+                            nfl_prop_fair.write_status(NFL_STATUS_FILE, snap)
+                        except Exception:
+                            pass      # observability only
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! nfl-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 60)
+                    time.sleep(delay)
+            threading.Thread(target=_nfl_fair_refresh, daemon=True,
+                             name="nfl-fair").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
@@ -18616,6 +18803,19 @@ class IncentiveMarketMaker:
                 f"status {POKE_STATUS_FILE}")
         else:
             log("pokemon gate: OFF -- KXPOKEMON not enrolled")
+        if NFL_FAIR_ENABLE:
+            log(f"nfl prop gate: every NFL ladder / escalator fail-closed on "
+                f"nfl_prop_fair's player-history fair (band mu x"
+                f"{_env_float('IMM_NFL_BAND_LO', 0.7):g}-x"
+                f"{_env_float('IMM_NFL_BAND_HI', 1.5):g}), bids <= band top + "
+                f"{NFL_FAIR_TOL_CENTS:g}c, asks >= band bottom - "
+                f"{NFL_FAIR_TOL_CENTS:g}c, a touch over {NFL_BAND_TOL_CENTS:g}c "
+                f"outside the band or an ESPN injury designation stands "
+                f"aside, ttl {NFL_FAIR_TTL_MIN}m (roster "
+                f"{NFL_ROSTER_TTL_MIN}m), refresh {NFL_FAIR_REFRESH_SECS}s, "
+                f"status {NFL_STATUS_FILE}")
+        else:
+            log("nfl prop gate: OFF -- NFL ladders / escalators quote unguarded")
         log(f"ladder {LEVELS} per side ({SIDE_MAX_CONTRACTS}/side, "
             f"mention x{MENTION_SIZE_MULT:g}, "
             f"earnings x{MENTION_SIZE_MULT * earnings_size_mult():g}), "
