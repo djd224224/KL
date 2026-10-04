@@ -155,6 +155,11 @@ button { font: inherit; color: inherit; }
   padding: 4px 6px; font: 13px var(--sans); max-width: 170px;
 }
 .daypick.on select { border-color: var(--ink); font-weight: 600; }
+select.fdsel {
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink); border-radius: 8px;
+  padding: 4px 6px; font: 13px var(--sans); max-width: 210px;
+}
+select.fdsel.on { border-color: var(--ink); font-weight: 600; }
 .daypick .dbtn {
   border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 3px 9px;
   cursor: pointer; color: var(--ink-2); font-size: 12px; line-height: 20px;
@@ -472,14 +477,15 @@ footer { color: var(--muted); font-size: 12px; }
   </section>
 
   <section id="fillday">
-    <div class="shead"><h2>Fills through the day</h2><span class="note">When the book fills, against how much it was resting and what the fills were worth afterwards. Maker fills only (no pads, no taker fills); ET; follows the window and the filter above.</span>
+    <div class="shead"><h2>Fills through the day</h2><span class="note">When the book fills, against how much it was resting, what the fills were worth afterwards and what each hour earned and netted. Fills are maker fills only (no pads, no taker fills); earnings and net are every trade of the family, from the hourly family curves. ET; follows the window and the filter above.</span>
       <div class="right">
+        <select id="fdFam" class="fdsel" aria-label="Family"></select>
         <div class="seg" id="fdHz" role="group" aria-label="Mark-out horizon"></div>
       </div></div>
     <div class="statgrid" id="fdStats"></div>
     <p class="explain" id="fdRead"></p>
-    <div class="card chartcard"><div class="cardhead"><h3 id="fdTitle">Through the window</h3><div class="legend" id="fdLegend"></div></div><div id="fdSeries"></div></div>
-    <div class="card chartcard"><div class="cardhead"><h3 id="fdProfTitle">A typical day, by hour</h3><div class="legend" id="fdLegend2"></div></div><div id="fdProfile"></div></div>
+    <div class="card chartcard"><div class="cardhead"><h3 id="fdTitle">Through the window</h3><div class="legend" id="fdLegend"></div></div><div id="fdSeries"></div><div id="fdSeriesM"></div></div>
+    <div class="card chartcard"><div class="cardhead"><h3 id="fdProfTitle">A typical day, by hour</h3><div class="legend" id="fdLegend2"></div></div><div id="fdProfile"></div><div id="fdProfileM"></div></div>
     <div><div class="sub-h">By hour of day<span class="note" id="fdTableNote"></span></div><div class="tw" id="fdTable"></div></div>
   </section>
 
@@ -1438,7 +1444,7 @@ function renderDrivers() {
   hseg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { drvH = b.dataset.h; store("imm.drvH", drvH); renderDrivers(); }));
   const rseg = $("drvRew");
   rseg.innerHTML = [["model", "Modeled rewards"], ["paid", "At paid rate"]].map((r) => '<button type="button" data-r="' + r[0] + '" aria-pressed="' + (r[0] === rewBasis) + '">' + r[1] + "</button>").join("");
-  rseg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { rewBasis = b.dataset.r; store("imm.rewBasis", rewBasis); renderDrivers(); }));
+  rseg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { rewBasis = b.dataset.r; store("imm.rewBasis", rewBasis); renderDrivers(); renderFillDay(); }));
 
   const top = topMarkets();
   const hb = sinkCovers(w) ? haltsByFam(w) : null;
@@ -2057,7 +2063,7 @@ function fdMult(ts) {             // the long-dated size multiplier at epoch ts,
   return a ? a[e.h] : null;
 }
 function fdBucket(x0, x1, hrs) {
-  return { x0, x1, hrs, n: 0, cts: 0, usd: 0, bid: 0, ask: 0, mk: 0, mkn: 0, fams: {}, rest: null, mult: null,
+  return { x0, x1, hrs, n: 0, cts: 0, usd: 0, bid: 0, ask: 0, mk: 0, mkn: 0, fams: {}, sers: {}, rest: null, mult: null,
     hz: { ec: [0, 0], m5c: [0, 0], mkc: [0, 0], m4c: [0, 0], mtc: [0, 0] } };
 }
 function fdAdd(b, f) {
@@ -2067,7 +2073,11 @@ function fdAdd(b, f) {
   if (f.mk != null) { b.mk += f.mk; b.mkn++; }
   const fam = (D.markets[f.t] || {}).fam || "?";
   b.fams[fam] = (b.fams[fam] || 0) + f.n;
+  const ser = String(f.t).split("-")[0];
+  b.sers[ser] = (b.sers[ser] || 0) + f.n;
 }
+// what "Most filled" ranks: families, or the series inside the family picked
+const fdTop = (b) => (fdFam ? b.sers : b.fams);
 const fdCpc = (p) => (p && p[1] >= FD_MIN_CTS ? p[0] / p[1] : null);
 const fdRate = (b) => (b.rest ? b.cts / (b.rest / 1000) / b.hrs : null);   // contracts per $1k resting-hour
 function fdWindowBuckets(w, fl, famOk) {
@@ -2131,37 +2141,32 @@ function fdTipRows(b, per) {
     rows.push({ name: "Mark-out " + lab, value: (v >= 0 ? "+" : "") + fmtC(v) + "/ct" + (p[1] < FD_MIN_CTS ? " (" + one(p[1] / per) + " ct)" : ""), cls: cls(v, 0.05) });
   }
   if (b.mkn) rows.push({ name: "30m mark-out $" + pd, value: fmtUSD(b.mk / per, { sign: true }), cls: cls(b.mk) });
-  const top = Object.entries(b.fams).sort((a, c) => c[1] - a[1]).slice(0, 3);
+  const top = Object.entries(fdTop(b)).sort((a, c) => c[1] - a[1]).slice(0, 3);
   if (top.length) rows.push({ block: "Most filled: " + top.map(([f, n]) => f + " " + fmtNum(n / per, n / per < 10 && (n / per) % 1 ? 1 : 0)).join(" · "), muted: true });
   return rows;
 }
-/* three panels on one x axis: contracts filled (columns), resting $ (line) and
-   mark-out ¢/ct at the chosen horizon (diverging columns); hours where the size
-   multiplier is above 1 are shaded across all three */
+/* panels on one x axis, each with its own y scale (never two scales on one
+   plot): columns, diverging columns or a line, per o.panels. Hours where the
+   size multiplier is above 1 are shaded across all of them. */
 function fdPanels(host, B, o) {
   host.textContent = "";
-  if (!B.length || !B.some((b) => b.cts || b.rest)) { host.innerHTML = '<div class="empty">No maker fills or resting data here.</div>'; return; }
-  const per = o.per || 1;
+  if (!B.length || !B.some(o.has)) { host.innerHTML = '<div class="empty">' + esc(o.empty || "No data here.") + "</div>"; return; }
   const W0 = Math.max(host.clientWidth || 600, 300), m = { l: 56, r: 12, t: 2, b: 22 };
-  const val = { cts: (b) => b.cts / per, rest: (b) => b.rest, mo: (b) => fdCpc(b.hz[fdHz]) };
-  const P = [
-    { k: "cts", h: 118, title: "Contracts filled" + (per > 1 ? " a day" : "") },
-    { k: "rest", h: 62, title: "Resting $, hourly average" },
-    { k: "mo", h: 92, title: "Mark-out " + fdHzLabel() + ", ¢ per contract (" + FD_MIN_CTS + "+ contracts)" },
-  ];
+  const P = o.panels.map((p) => Object.assign({}, p));
   let y = m.t;
   P.forEach((p) => { p.y0 = y + 16; p.y1 = p.y0 + p.h; y = p.y1 + 12; });
   const H = y - 12 + m.b + 6;
-  const x0 = B[0].x0, x1 = B[B.length - 1].x1;
+  const x0 = o.x0 != null ? o.x0 : B[0].x0, x1 = o.x1 != null ? o.x1 : B[B.length - 1].x1;
   const X = (v) => m.l + (W0 - m.l - m.r) * (v - x0) / (x1 - x0);
   const svg = svgEl("svg", { class: "ch", viewBox: "0 0 " + W0 + " " + H, height: H, role: "img" });
   if (o.label) svg.setAttribute("aria-label", o.label);
+  const top = P[0].y0, bot = P[P.length - 1].y1;
   let run = null;
   const flush = () => {
     if (!run) return;
     const xa = X(run.a), xb = X(run.b);
-    svg.appendChild(svgEl("rect", { x: xa, y: P[0].y0, width: Math.max(0, xb - xa), height: P[2].y1 - P[0].y0, class: "fdband" }));
-    if (xb - xa >= 28) { const t = svgEl("text", { x: xa + 4, y: P[0].y0 + 12, class: "fdbl" }); t.textContent = fdX(run.m); svg.appendChild(t); }
+    svg.appendChild(svgEl("rect", { x: xa, y: top, width: Math.max(0, xb - xa), height: bot - top, class: "fdband" }));
+    if (xb - xa >= 28) { const t = svgEl("text", { x: xa + 4, y: top + 12, class: "fdbl" }); t.textContent = fdX(run.m); svg.appendChild(t); }
     run = null;
   };
   for (const b of B) {
@@ -2170,37 +2175,37 @@ function fdPanels(host, B, o) {
     else { flush(); if (mm != null) run = { a: b.x0, b: b.x1, m: mm }; }
   }
   flush();
-  const bw = (W0 - m.l - m.r) / B.length;
   for (const p of P) {
-    const vs = B.map(val[p.k]).filter((v) => v != null);
+    const vs = B.map(p.val).filter((v) => v != null);
     let lo = 0, hi = 0;
     vs.forEach((v) => { lo = Math.min(lo, v); hi = Math.max(hi, v); });
-    if (p.k === "mo") { const a = Math.max(Math.abs(lo), Math.abs(hi), 1); lo = -a; hi = a; }
+    if (p.kind === "div") { const a = Math.max(Math.abs(lo), Math.abs(hi), p.minSpan || 1); lo = -a; hi = a; }
     if (hi === lo) hi = lo + 1;
-    const dom = niceDomain(lo, hi, p.k === "rest" ? 2 : 3);
+    const dom = niceDomain(lo, hi, p.kind === "line" ? 2 : 3);
     const Y = (v) => p.y0 + p.h * (1 - (v - dom.lo) / (dom.hi - dom.lo));
     const tt = svgEl("text", { x: m.l, y: p.y0 - 5, class: "fdpt" });
     tt.textContent = p.title; svg.appendChild(tt);
     for (const tv of dom.ticks) {
       svg.appendChild(svgEl("line", { x1: m.l, x2: W0 - m.r, y1: Y(tv), y2: Y(tv), class: tv === 0 ? "zero" : "grid" }));
       const tx = svgEl("text", { x: m.l - 8, y: Y(tv) + 4, "text-anchor": "end" });
-      tx.textContent = p.k === "cts" ? fmtNum(tv) : p.k === "rest" ? fdK(tv) : (tv > 0 ? "+" : "") + fmtC(tv);
-      svg.appendChild(tx);
+      tx.textContent = p.tick(tv); svg.appendChild(tx);
     }
-    if (p.k === "rest") {
+    if (p.kind === "line") {
       let d = "", pen = false;
       B.forEach((b) => {
-        if (b.rest == null) { pen = false; return; }
-        d += (pen ? "L" : "M") + X((b.x0 + b.x1) / 2).toFixed(1) + " " + Y(b.rest).toFixed(1); pen = true;
+        const v = p.val(b);
+        if (v == null) { pen = false; return; }
+        d += (pen ? "L" : "M") + X((b.x0 + b.x1) / 2).toFixed(1) + " " + Y(v).toFixed(1); pen = true;
       });
-      svg.appendChild(svgEl("path", { d, fill: "none", stroke: css("--s-mark"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      svg.appendChild(svgEl("path", { d, fill: "none", stroke: p.color(), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
       continue;
     }
     B.forEach((b) => {
-      const v = val[p.k](b);
+      const v = p.val(b);
       if (v == null || v === 0) return;
-      const fill = p.k === "cts" ? css("--s-net") : (v >= 0 ? css("--div-pos") : css("--div-neg"));
-      svg.appendChild(svgEl("path", { d: fdColPath(X(b.x0) + 1, Y(0), Math.max(1, bw - 2), Y(v)), fill }));
+      const xa = X(b.x0), w = X(b.x1) - xa;
+      const fill = p.kind === "col" ? p.color() : (v >= 0 ? css("--div-pos") : css("--div-neg"));
+      svg.appendChild(svgEl("path", { d: fdColPath(xa + 1, Y(0), Math.max(1, w - 2), Y(v)), fill }));
     });
   }
   for (const t of o.xticks(x0, x1)) {
@@ -2210,36 +2215,152 @@ function fdPanels(host, B, o) {
     tx.textContent = t.label; svg.appendChild(tx);
   }
   B.forEach((b) => {
-    const r = svgEl("rect", { x: X(b.x0), y: P[0].y0, width: Math.max(1, bw), height: P[2].y1 - P[0].y0, class: "fdhit" });
-    r.addEventListener("pointermove", (ev) => showTip(ev, o.head(b), fdTipRows(b, per)));
+    const xa = X(b.x0);
+    const r = svgEl("rect", { x: xa, y: top, width: Math.max(1, X(b.x1) - xa), height: bot - top, class: "fdhit" });
+    r.addEventListener("pointermove", (ev) => showTip(ev, o.head(b), o.tip(b)));
     r.addEventListener("pointerleave", hideTip);
     svg.appendChild(r);
   });
   host.appendChild(svg);
 }
+// money ticks: $0.25 / $3.5 / $40 / $1.2k; signed on the diverging panel
+const fdM = (v) => { const a = Math.abs(v); return a >= 1000 ? "$" + (a / 1000).toFixed(a >= 10000 ? 0 : 1) + "k" : a >= 10 || a === 0 ? "$" + Math.round(a) : "$" + a.toFixed(a >= 1 ? 1 : 2); };
+const fdMs = (v) => (v > 0 ? "+" : v < 0 ? MINUS : "") + fdM(v);
+function fdFillPanels(per) {
+  return [
+    { kind: "col", h: 118, title: "Contracts filled" + (per > 1 ? " a day" : ""), val: (b) => b.cts / per, color: () => css("--s-net"), tick: (v) => fmtNum(v) },
+    { kind: "line", h: 62, title: "Resting $, hourly average", val: (b) => b.rest, color: () => css("--s-mark"), tick: fdK },
+    { kind: "div", h: 92, title: "Mark-out " + fdHzLabel() + ", ¢ per contract (" + FD_MIN_CTS + "+ contracts)", val: (b) => fdCpc(b.hz[fdHz]), tick: (v) => (v > 0 ? "+" : "") + fmtC(v) },
+  ];
+}
+// Jack 2026-10-04: "also show chart for earnings by hour, and net by hour".
+// From the family curves (D.fcurves / D.days[d].fc: cumulative modeled rewards
+// and marked-to-market trading per family, one point an hour): earnings follow
+// the Drivers rewards basis (modeled, or at the paid rate) and net = earnings
+// + trading, every trade of the family rather than the maker fills alone.
+// Hourly whatever the fill bucket, and only where the hourly detail reaches
+// (the last DETAIL_DAYS); a missing hourly snapshot moves that hour's marks
+// into the next one, as on the Drivers sparklines.
+function fdMoneyPanels(per) {
+  const pd = per > 1 ? " a day" : "";
+  return [
+    { kind: "col", h: 92, title: "Earnings per hour" + pd + (rewBasis === "paid" ? ", paid rate" : ", modeled"), val: (b) => b.rew / per, color: () => css("--s-rew"), tick: fdM },
+    { kind: "div", h: 104, title: "Net per hour" + pd + " (earnings + trading)", val: (b) => (b.rew + b.pnl) / per, minSpan: 0.5, tick: fdMs },
+  ];
+}
+function fdMoneyBucket(x0, x1, hrs) { return { x0, x1, hrs, rew: 0, pnl: 0, fams: {}, mult: null, has: false }; }
+function fdMoneyAdd(k, curve, i, famOk) {
+  for (const fam in curve.f) {
+    if (!famOk(fam)) continue;
+    const c = curve.f[fam];
+    if (c.r[i] == null || c.r[i - 1] == null || c.p[i] == null || c.p[i - 1] == null) continue;
+    const dr = rewAdj(fam, c.r[i] - c.r[i - 1]), dp = c.p[i] - c.p[i - 1];
+    k.rew += dr; k.pnl += dp; k.has = true;
+    const a = k.fams[fam] || (k.fams[fam] = [0, 0]);
+    a[0] += dr; a[1] += dp;
+  }
+}
+function fdWindowMoney(famOk) {   // one bucket per curve step: hourly, partial at the window's edges
+  const curve = isDay(W) ? (D.days[W.slice(2)] || {}).fc : (D.fcurves || {})[W];
+  if (!curve || !curve.x || !curve.f) return [];
+  const B = [];
+  for (let i = 1; i < curve.x.length; i++) {
+    const a = curve.x[i - 1], b = curve.x[i];
+    if (b <= a) continue;
+    const k = fdMoneyBucket(a, b, (b - a) / 3600);
+    fdMoneyAdd(k, curve, i, famOk);
+    k.mult = fdMult(a);
+    B.push(k);
+  }
+  return B;
+}
+function fdProfileMoney(famOk, days) {   // 24 ET-hour buckets summed over the days that carry a curve
+  const B = [];
+  for (let h = 0; h < 24; h++) B.push(fdMoneyBucket(h, h + 1, 1));
+  let n = 0;
+  for (const d of days) {
+    const curve = (D.days[d] || {}).fc;
+    if (!curve || !curve.x || !curve.f) continue;
+    n++;
+    for (let i = 1; i < curve.x.length; i++) {
+      if (curve.x[i] > curve.x[i - 1]) fdMoneyAdd(B[fdEt(curve.x[i - 1]).h], curve, i, famOk);
+    }
+  }
+  return { B, n };
+}
+function fdMoneyTip(b, per) {
+  const pd = per > 1 ? " a day" : "";
+  const rows = [
+    { name: "Earnings" + pd + (rewBasis === "paid" ? ", paid rate" : ", modeled"), value: fmtUSD(b.rew / per), color: css("--s-rew") },
+    { name: "Trading" + pd, value: fmtUSD(b.pnl / per, { sign: true }), cls: cls(b.pnl / per) },
+    { name: "Net" + pd, value: fmtUSD((b.rew + b.pnl) / per, { sign: true }), cls: cls((b.rew + b.pnl) / per) },
+    { name: "Size multiplier (long-dated)", value: b.mult != null ? fdX(b.mult) : "—" },
+  ];
+  const top = Object.entries(b.fams).filter((e) => Math.abs(e[1][0] + e[1][1]) >= 0.005)
+    .sort((a, c) => Math.abs(c[1][0] + c[1][1]) - Math.abs(a[1][0] + a[1][1])).slice(0, 3);
+  if (!fdFam && top.length) rows.push({ block: "Biggest net: " + top.map(([f, v]) => f + " " + fmtUSD((v[0] + v[1]) / per, { sign: true })).join(" · "), muted: true });
+  return rows;
+}
+// Jack 2026-10-04: "let me dropdown to view by event family": all families or
+// one of the dashboard's, kept per browser. It narrows every view here; the
+// search box still applies on top (resting $ and the curves are per family,
+// so a ticker search narrows the fills only).
+let fdFam = store("imm.fdFam") || "";
+function fdFamilies() {
+  const s = new Set();
+  for (const t in D.markets) if (D.markets[t].fam) s.add(D.markets[t].fam);
+  for (const f in ((D.fday || {}).rest || {})) s.add(f);
+  for (const k in (D.fcurves || {})) for (const f in (((D.fcurves || {})[k] || {}).f || {})) s.add(f);
+  return [...s].sort();
+}
 function renderFillDay() {
   const hz = $("fdHz");
   hz.innerHTML = FD_HZ.map((h) => '<button type="button" data-h="' + h[0] + '" aria-pressed="' + (h[0] === fdHz) + '" title="mark-out horizon">' + h[1] + "</button>").join("");
   hz.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { fdHz = b.dataset.h; store("imm.fdHz", fdHz); renderFillDay(); }));
+  const fams = fdFamilies();
+  if (fdFam && fams.indexOf(fdFam) < 0) fdFam = "";
+  const sel = $("fdFam");
+  sel.innerHTML = '<option value="">All families</option>' + fams.map((f) => '<option value="' + esc(f) + '"' + (f === fdFam ? " selected" : "") + ">" + esc(f) + "</option>").join("");
+  sel.classList.toggle("on", !!fdFam);
+  sel.onchange = () => { fdFam = sel.value; store("imm.fdFam", fdFam); renderFillDay(); };
   const w = win();
-  const famOk = (f) => !Q || matchQ(f);
-  const maker = (D.fills || []).filter((f) => !f.pad && !f.taker && matchQ(f.t, (D.markets[f.t] || {}).fam));
+  const famOk = (f) => (!fdFam || f === fdFam) && (!Q || matchQ(f));
+  const famHit = fams.some(famOk);
+  const maker = (D.fills || []).filter((f) => {
+    if (f.pad || f.taker) return false;
+    const fam = (D.markets[f.t] || {}).fam;
+    return (!fdFam || fam === fdFam) && matchQ(f.t, fam);
+  });
+  const scope = fdFam ? " · " + fdFam : "";
+  const noMoney = famHit ? null : "Earnings and net are kept per family, and the search matches no family name.";
   const legend = '<span><i class="key" style="background:var(--s-net)"></i>Contracts filled</span>' +
     '<span><i class="keyline" style="background:var(--s-mark)"></i>Resting $</span>' +
-    '<span><i class="key" style="background:var(--div-pos)"></i>Mark-out gained</span>' +
-    '<span><i class="key" style="background:var(--div-neg)"></i>Mark-out lost</span>' +
+    '<span><i class="key" style="background:var(--s-rew)"></i>Earnings</span>' +
+    '<span><i class="key" style="background:var(--div-pos)"></i>Mark-out / net gained</span>' +
+    '<span><i class="key" style="background:var(--div-neg)"></i>Mark-out / net lost</span>' +
     '<span><i class="key" style="background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--border)"></i>Larger quote size (×)</span>';
   $("fdLegend").innerHTML = legend;
   $("fdLegend2").innerHTML = legend;
-  // 1) the selected window, in time
+  const hourTicks = () => [0, 3, 6, 9, 12, 15, 18, 21].map((h) => ({ v: h + 0.5, label: fdHour(h) }));
+  // 1) the selected window, in time: fills, then earnings and net by hour
   const fl = maker.filter((f) => f.ts >= w.start && f.ts < w.end + 1);
   const ws = fdWindowBuckets(w, fl, famOk);
-  $("fdTitle").textContent = "Through the window · " + w.desc + " · " + (ws.step === 900 ? "15-minute" : "hourly") + " buckets";
+  const wx0 = ws.B[0].x0, wx1 = ws.B[ws.B.length - 1].x1;
+  $("fdTitle").textContent = "Through the window · " + w.desc + scope + " · " + (ws.step === 900 ? "15-minute" : "hourly") + " fill buckets";
   fdPanels($("fdSeries"), ws.B, {
-    xticks: timeTicks, label: "Maker fills, resting dollars and mark-outs through the window",
-    head: (b) => ws.step === 900 ? dtET(b.x0) + " – " + tET(b.x1) : dtET(b.x0) + " – " + tET(b.x1),
+    panels: fdFillPanels(1), x0: wx0, x1: wx1, xticks: timeTicks,
+    label: "Maker fills, resting dollars and mark-outs through the window",
+    head: (b) => dtET(b.x0) + " – " + tET(b.x1), tip: (b) => fdTipRows(b, 1),
+    has: (b) => b.cts || b.rest, empty: "No maker fills or resting data here.",
   });
-  // stats for the window: totals, busiest and worst ET hour, the size window's share
+  const WM = fdWindowMoney(famOk);
+  fdPanels($("fdSeriesM"), WM, {
+    panels: fdMoneyPanels(1), x0: wx0, x1: wx1, xticks: timeTicks,
+    label: "Earnings and net per hour through the window",
+    head: (b) => dtET(b.x0) + " – " + tET(b.x1), tip: (b) => fdMoneyTip(b, 1),
+    has: (b) => b.has, empty: noMoney || "No hourly earnings for this window: the hourly detail covers the last 8 days.",
+  });
+  // stats for the window: totals, money, busiest and worst ET hour, the size window's share
   const tot = fdBucket(0, 0, 1), byH = {};
   ws.B.forEach((b) => {
     for (const k of ["n", "cts", "usd", "bid", "ask", "mk", "mkn"]) tot[k] += b[k];
@@ -2252,13 +2373,16 @@ function renderFillDay() {
   // "larger size" against the window's own base: on a Saturday the base is x2
   // and the quiet hours x4, so every hour above 1 would say nothing
   const wm = ws.B.map((b) => b.mult).filter((v) => v != null);
-  const base = wm.length ? Math.min(...wm) : null, top = wm.length ? Math.max(...wm) : null;
+  const base = wm.length ? Math.min(...wm) : null, topM = wm.length ? Math.max(...wm) : null;
   let inC = 0, inR = 0, allR = 0;
   ws.B.forEach((b) => { const big = base != null && b.mult != null && b.mult > base + 0.001; if (big) inC += b.cts; if (b.rest != null) { allR += b.rest * b.hrs; if (big) inR += b.rest * b.hrs; } });
-  const sized = base != null && top > base + 0.001;
+  const sized = base != null && topM > base + 0.001;
   const mo = tot.hz[fdHz], moV = mo[1] ? mo[0] / mo[1] : null;
+  const wHas = WM.some((b) => b.has), wr = WM.reduce((a, b) => a + b.rew, 0), wp = WM.reduce((a, b) => a + b.pnl, 0);
   const stats = [
     { k: "Contracts filled", v: fmtNum(tot.cts), s: fmtNum(tot.n) + " maker fills · " + fmtUSD(tot.usd) + " traded" },
+    { k: "Earnings", v: wHas ? fmtUSD(wr) : "—", s: wHas ? (rewBasis === "paid" ? "rewards at the paid rate" : "modeled rewards") : famHit ? "no hourly detail for this window" : "kept per family: the search names none" },
+    { k: "Net", v: wHas ? fmtUSD(wr + wp, { sign: true }) : "—", s: wHas ? "after trading " + fmtUSD(wp, { sign: true }) + " (marked to market)" : "", bad: wHas && wr + wp < -0.005 },
     { k: "Busiest hour", v: busiest ? fdHour(busiest.h) : "—", s: busiest ? fmtNum(busiest.b.cts) + " contracts" + (tot.cts ? ", " + Math.round(100 * busiest.b.cts / tot.cts) + "% of the window" : "") + (hrs.length > 24 ? " (" + day(busiest.iso) + ")" : "") : "" },
     { k: "In the larger-size hours", v: sized && tot.cts ? Math.round(100 * inC / tot.cts) + "% of contracts" : "—", s: !sized ? (base != null ? "one size all window (" + fdX(base) + ")" : "no size schedule for these days") : (allR ? "against " + Math.round(100 * inR / allR) + "% of the resting $" : "no resting data") + " · above the " + fdX(base) + " base" },
     { k: "Mark-out " + fdHzLabel(), v: moV != null ? (moV >= 0 ? "+" : "") + fmtC(moV) + " per contract" : "—", s: (mo[1] ? "on " + fmtNum(mo[1]) + " contracts" : "") + (fdHz === "mkc" && tot.mkn ? " · " + fmtUSD(tot.mk, { sign: true }) : ""), bad: moV != null && moV < -0.05 },
@@ -2268,15 +2392,25 @@ function renderFillDay() {
   // 2) a typical day: the last FD_DAYS complete ET days, by ET hour
   const days = fdProfileDays(), nd = days.length;
   const PB = fdProfile(maker, famOk, days);
-  $("fdProfTitle").textContent = nd ? "A typical day, by hour · average of " + nd + " complete days (" + day(days[0]) + " – " + day(days[nd - 1]) + ")" : "A typical day, by hour";
+  const PM = fdProfileMoney(famOk, days), pm = Math.max(1, PM.n);
+  PM.B.forEach((b, h) => { b.mult = PB[h].mult; });
+  $("fdProfTitle").textContent = nd ? "A typical day, by hour · average of " + nd + " complete days (" + day(days[0]) + " – " + day(days[nd - 1]) + ")" + scope : "A typical day, by hour";
   fdPanels($("fdProfile"), PB, {
-    per: Math.max(1, nd), label: "Maker fills, resting dollars and mark-outs by hour of day",
-    xticks: () => [0, 3, 6, 9, 12, 15, 18, 21].map((h) => ({ v: h + 0.5, label: fdHour(h) })),
+    panels: fdFillPanels(Math.max(1, nd)), x0: 0, x1: 24, xticks: hourTicks,
+    label: "Maker fills, resting dollars and mark-outs by hour of day",
     head: (b) => fdHour(b.x0) + " – " + fdHour(b.x1) + " ET · average of " + nd + " days",
+    tip: (b) => fdTipRows(b, Math.max(1, nd)), has: (b) => b.cts || b.rest, empty: "No maker fills or resting data here.",
+  });
+  fdPanels($("fdProfileM"), PM.B, {
+    panels: fdMoneyPanels(pm), x0: 0, x1: 24, xticks: hourTicks,
+    label: "Earnings and net by hour of day",
+    head: (b) => fdHour(b.x0) + " – " + fdHour(b.x1) + " ET · average of " + PM.n + " days",
+    tip: (b) => fdMoneyTip(b, pm), has: (b) => b.has, empty: noMoney || "No hourly earnings for these days.",
   });
   // 3) the reading, from the typical day
   const P = PB.reduce((a, b) => { a.cts += b.cts; a.rest += b.rest || 0; return a; }, { cts: 0, rest: 0 });
-  const inB = PB.filter((b) => b.mult != null && b.mult > 1.001), outB = PB.filter((b) => !(b.mult != null && b.mult > 1.001));
+  const isBig = (b) => b.mult != null && b.mult > 1.001;
+  const inB = PB.filter(isBig), outB = PB.filter((b) => !isBig(b));
   const sumHz = (bs, k) => bs.reduce((a, b) => [a[0] + b.hz[k][0], a[1] + b.hz[k][1]], [0, 0]);
   const share = (bs, f) => bs.reduce((a, b) => a + f(b), 0);
   const cIn = share(inB, (b) => b.cts), rIn = share(inB, (b) => b.rest || 0);
@@ -2287,22 +2421,32 @@ function renderFillDay() {
   const hoursTxt = (bs) => { if (!bs.length) return ""; const hs = bs.map((b) => b.x0); return fdHour(hs[0]) + "–" + fdHour((hs[hs.length - 1] + 1) % 24); };
   let read = "";
   if (nd && P.cts) {
-    read = "Over the last " + nd + " complete days the book filled " + fmtNum(P.cts / nd) + " contracts a day (maker fills" + (Q ? ", filtered" : "") + "). ";
+    read = "Over the last " + nd + " complete days the book filled " + fmtNum(P.cts / nd) + " contracts a day (maker fills" + (fdFam ? ", " + fdFam : "") + (Q ? ", filtered" : "") + "). ";
     if (inB.length && P.rest) read += "The larger-size hours (" + hoursTxt(inB) + " ET, " + fdX(share(inB, (b) => b.mult) / inB.length) + " on average) held " + Math.round(100 * rIn / P.rest) + "% of the resting dollars and took " + Math.round(100 * cIn / P.cts) + "% of the contracts, at " + cpc(moIn) + " a contract (" + fdHzLabel() + ") against " + cpc(moOut) + " for the other hours. ";
     if (busy) read += "Busiest hour: " + fdHour(busy.x0) + " (" + fmtNum(busy.cts / nd) + " contracts a day). ";
     if (ranked.length) {
       const wv = ranked[0], bv = ranked[ranked.length - 1];
-      read += "Worst " + fdHzLabel() + " mark-out: " + fdHour(wv.x0) + " (" + cpc(wv.hz[fdHz]) + " on " + fmtNum(wv.hz[fdHz][1] / nd) + " contracts a day); best: " + fdHour(bv.x0) + " (" + cpc(bv.hz[fdHz]) + ").";
+      read += "Worst " + fdHzLabel() + " mark-out: " + fdHour(wv.x0) + " (" + cpc(wv.hz[fdHz]) + " on " + fmtNum(wv.hz[fdHz][1] / nd) + " contracts a day); best: " + fdHour(bv.x0) + " (" + cpc(bv.hz[fdHz]) + "). ";
     }
-  } else read = "No complete days with maker fills to profile yet.";
-  $("fdRead").textContent = read;
+  } else read = "No complete days with maker fills to profile yet. ";
+  const hb = PM.B.filter((b) => b.has);
+  if (PM.n && hb.length) {
+    const R = share(hb, (b) => b.rew) / pm, N = share(hb, (b) => b.rew + b.pnl) / pm;
+    const bigM = hb.filter(isBig), rB = share(bigM, (b) => b.rew) / pm, nB = share(bigM, (b) => b.rew + b.pnl) / pm;
+    const byNet = hb.slice().sort((a, c) => (a.rew + a.pnl) - (c.rew + c.pnl)), hi = byNet[byNet.length - 1], lo = byNet[0];
+    read += "A typical day" + (PM.n < nd ? " (the " + PM.n + " of them with hourly detail)" : "") + " earned " + fmtUSD(R) + (rewBasis === "paid" ? " at the paid rate" : " in modeled rewards") + " and netted " + fmtUSD(N, { sign: true }) + " after trading";
+    if (bigM.length) read += "; the larger-size hours earned " + fmtUSD(rB) + " of it (" + (R > 0.005 ? Math.round(100 * rB / R) : 0) + "%) and netted " + fmtUSD(nB, { sign: true });
+    read += ". Best net hour: " + fdHour(hi.x0) + " (" + fmtUSD((hi.rew + hi.pnl) / pm, { sign: true }) + "); worst: " + fdHour(lo.x0) + " (" + fmtUSD((lo.rew + lo.pnl) / pm, { sign: true }) + ").";
+  }
+  $("fdRead").textContent = read.trim();
   // 4) the table view of the typical day
-  $("fdTableNote").textContent = nd ? "average of the " + nd + " complete days above · fill rate = contracts per $1,000 resting per hour" : "";
+  $("fdTableNote").textContent = nd ? "average of the " + nd + " complete days above" + scope + " · fill rate = contracts per $1,000 resting per hour · earnings and net from the hourly family curves" : "";
   const ccell = (p) => (p[1] >= FD_MIN_CTS ? '<span class="' + cls(p[0] / p[1], 0.05) + '">' + (p[0] / p[1] >= 0 ? "+" : "") + fmtC(p[0] / p[1]) + "</span>" : '<span class="muted">' + (p[1] ? "thin" : "—") + "</span>");
   const per = Math.max(1, nd);
+  PB.forEach((b, h) => { b.h = b.x0; b.rew = PM.B[h].rew / pm; b.net = (PM.B[h].rew + PM.B[h].pnl) / pm; b.mhas = PM.B[h].has; });
   table($("fdTable"), [
     { k: "h", label: "Hour (ET)", fmt: (r) => fdHour(r.x0) },
-    { k: "mult", label: "Size", num: true, title: "size multiplier a long-dated market carried in this hour (average of the days)", fmt: (r) => r.mult != null ? fdX(r.mult) : '<span class="muted">—</span>' },
+    { k: "mult", label: "Size", num: true, title: "size multiplier a long-dated market carried in this hour (median of the days)", fmt: (r) => r.mult != null ? fdX(r.mult) : '<span class="muted">—</span>' },
     { k: "n", label: "Fills/day", num: true, fmt: (r) => fmtNum(r.n / per, r.n / per < 10 ? 1 : 0) },
     { k: "cts", label: "Contracts/day", num: true, fmt: (r) => fmtNum(r.cts / per) },
     { k: "ctsh", label: "% of contracts", num: true, sort: (r) => r.cts, fmt: (r) => P.cts ? Math.round(100 * r.cts / P.cts) + "%" : "—" },
@@ -2313,8 +2457,10 @@ function renderFillDay() {
     { k: "mkc", label: "30m", num: true, sort: (r) => fdCpc(r.hz.mkc), fmt: (r) => ccell(r.hz.mkc) },
     { k: "mtc", label: "To date", num: true, sort: (r) => fdCpc(r.hz.mtc), fmt: (r) => ccell(r.hz.mtc) },
     { k: "mk", label: "30m $/day", num: true, sort: (r) => r.mk, fmt: (r) => r.mkn ? money(r.mk / per) : '<span class="muted">—</span>' },
-    { k: "top", label: "Most filled", sort: (r) => r.cts, fmt: (r) => { const t = Object.entries(r.fams).sort((a, c) => c[1] - a[1])[0]; return t ? esc(t[0]) + ' <span class="muted small">' + Math.round(100 * t[1] / r.cts) + "%</span>" : '<span class="muted">—</span>'; } },
-  ], PB.map((b) => Object.assign(b, { h: b.x0 })), { sortKey: "h", dir: 1, limit: 24, empty: "No complete days to profile yet." });
+    { k: "rew", label: "Earnings/day", num: true, title: (rewBasis === "paid" ? "rewards at the paid rate" : "modeled rewards") + " earned in this hour, average of the days with hourly detail", sort: (r) => r.rew, fmt: (r) => r.mhas ? fmtUSD(r.rew) : '<span class="muted">—</span>' },
+    { k: "net", label: "Net/day", num: true, title: "earnings + trading (marked to market) in this hour, average of the days with hourly detail", sort: (r) => r.net, fmt: (r) => r.mhas ? money(r.net) : '<span class="muted">—</span>' },
+    { k: "top", label: "Most filled", title: fdFam ? "the series of " + fdFam + " with the most contracts in this hour" : "the family with the most contracts in this hour", sort: (r) => r.cts, fmt: (r) => { const t = Object.entries(fdTop(r)).sort((a, c) => c[1] - a[1])[0]; return t ? esc(t[0]) + ' <span class="muted small">' + Math.round(100 * t[1] / r.cts) + "%</span>" : '<span class="muted">—</span>'; } },
+  ], PB, { sortKey: "h", dir: 1, limit: 24, empty: "No complete days to profile yet." });
 }
 
 /* ======================= history ======================= */

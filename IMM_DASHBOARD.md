@@ -90,19 +90,39 @@ settlements.
 - **Fill timing** (Jack 2026-10-03: "a timeseries of fills throughout the day,
   and any relevant info so i can understand the shape of fills throughout the
   day"). Maker fills only, ET, following the window and the filter.
+  - A family dropdown (Jack 2026-10-04: "let me dropdown to view by event
+    family"): all families or one of the dashboard's, kept per browser
+    (`imm.fdFam`). It narrows every panel, tile, the reading and the table;
+    with a family picked, "Most filled" names its series instead. The search
+    box still applies on top, but resting $ and the money curves are per
+    family, so a ticker search narrows the fills only.
   - The window as three panels on one time axis (15-minute buckets up to a
     day, hourly for 7 days): contracts filled, the dollars resting in quotes
     (hourly average, from the cycle logs' `rest`), and the mark-out at the
     chosen horizon (¢ per contract, drawn from 20 contracts up). Hours where a
     long-dated market carried a size multiplier above 1 are shaded and labelled
     (×2 quiet hours, Saturday, the evening window).
+  - Under them, earnings and net per hour (Jack 2026-10-04: "show chart for
+    earnings by hour, and net by hour") on the same time axis. They are
+    differences of the hourly family curves the Drivers sparklines use
+    (`fcurves` / `days[d].fc`): earnings follow the Drivers rewards toggle
+    (modeled, or at the paid rate), and net = earnings + trading, marked to
+    market. Trading counts every trade of the family, not just the maker
+    fills above. They are hourly at most, and only reach as far as the
+    hourly detail (the last 8 days). A missing hourly snapshot moves that
+    hour's marks into the next. The window totals equal the Drivers totals
+    (checked 10/4 on today, 24h, 7d, yesterday, a past day and the paid rate).
   - The same panels for a typical day by ET hour, averaged over the last 7
-    complete days. The shaded hours use each hour's median multiplier, so one
-    Saturday does not mark a weekday's ×1 hour as larger size.
-  - Tiles: contracts, the busiest hour, the larger-size hours' share of
-    contracts against their share of resting dollars (above the window's own
-    base size), the mark-out, the worst hour. A generated reading and an
-    hour-by-hour table (fill rate = contracts per $1,000 resting per hour).
+    complete days. The money panels average the days that carry a curve. The
+    shaded hours use each hour's median multiplier, so one Saturday does not
+    mark a weekday's ×1 hour as larger size.
+  - Tiles: contracts, earnings, net, the busiest hour, and the larger-size
+    hours' share of contracts against their share of resting dollars (above
+    the window's own base size). Then the mark-out and the worst hour. A
+    generated reading covers the typical day's earnings and net, the
+    larger-size hours' part, and the best and worst net hour. An hour-by-hour
+    table follows (fill rate = contracts per $1,000 resting per hour,
+    earnings/day, net/day).
   - Data: `fday` = {"h0": first UTC hour, "rest": {family: [$ per hour]},
     "mult": {ET day: [24 multipliers]}}. Multipliers come from
     `incentive_mm`'s current schedule (`long_dated_hour_mults`): global window,
