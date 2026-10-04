@@ -7663,3 +7663,96 @@ the sweep breaker stays dry. Jack chose to flip it before the 10/5 scoring
 task (imm-ws-stale-score), which still scores the dry experiments.
 
 BACK OUT: IMM_WS=shadow in run_incentive_mm.ps1, then restart_imm.ps1 -Task.
+
+## 2026-10-04 evening — Period rain totals (KXRAINNAPAM and the family) quoted through the rain fair (Jack)
+
+Jack: "quote KXRAINNAPAM and similar families based on rain feed".
+
+WHAT IT IS. KXRAINNAPAM "Napa rainfall totals" (contract RAINGLOBALPERIOD,
+new 10/2): KXRAINNAPAM-<DDMONYY>-<DDMONYY>-T<inches>, "total precipitation
+at KAPC in Napa ... strictly greater than K", the sum of The Weather
+Company's daily values at Napa County Airport over the period, both days
+inclusive. Events: Oct, Nov and Dec 2026, and the Nov 1-Mar 31 season.
+Programs: only the season's six strikes (T10-T35), $500 each, 10/4 20:46Z ->
+10/6 03:59Z, target 1000 (~$578/day the new-programs email showed). It was
+never quoted: not allowlisted ("review: KXRAINNAPAM (unclassified)" in the
+earnings-overrides log since 10/2). The same shape is KXRAINNYCW (the NYC
+week, no programs now) and the rainstorm spans KXRAINS<CITY>.
+
+THE FAMILY RULE. rain_period_gated(ticker): a KXRAIN series, then two
+DDMONYY day segments (day FIRST: KXRAINNYCW-28SEP26-04OCT26 can only read
+that way), minus the rainstorm spans. _allowed admits it, so a new city
+needs no list edit -- but it quotes ONLY through the rain fair, failing
+closed, and a station the writer cannot map stands aside. Guard set on the
+archetype KXRAINNAPAM (KXRAINNYCW shares it; a new series clones it via
+FAMILY_OVERRIDE_PARENTS): rain band 5-90c, cutoff close - 1560 min = 22:00
+local the day before the period's last day (the monthlies' rule; the
+season stops 21:59 PDT Mar 30). As KXRAIN-prefix series they are "daily"
+(no quiet-hours or Saturday multipliers) and take the 7pm-01:59 ET halving.
+
+THE FAIR (rain_monthly_fair.py; the same file and refresher thread as the
+monthlies). P(to date + rest > K):
+- station from the rules: "at CLIxxx", "(Kxxx;", "at Kxxx", "at XXX in", or
+  an alias. CLI_STATIONS gains APC (Napa County Airport, CA_ASOS, US/Pacific;
+  ACIS record from 1998-05-22, 28 full seasons). The rules' "from <date>
+  through <date>" must equal the ticker's period, else no station.
+- to date: IEM daily summaries for the period's past days (the ACIS record
+  fills a day IEM lacks) + today's running total. Stale (fail closed) with
+  more than IMM_RAIN_PERIOD_MAX_MISSING_DAYS (1) unread days, or when the day
+  the station was last seen wet is unread, or wet today with no running
+  total. No CLI at these stations.
+- the rest: whole calendar-aligned historical windows (keeps the in-season
+  correlation), the NWS forecast injected over its horizon as for the
+  monthlies, and the historical part smoothed by a mean-one log-normal
+  kernel (IMM_RAIN_PERIOD_KERNEL_SIGMA 0.15): 28 Napa seasons never saw 30",
+  which is not 0%. Leave-one-out over those seasons, strikes 10-35: Brier
+  0.1123 raw, 0.1115 at sigma 0.15 (0.27 was worse).
+- rain counts only inside the period: before its first day an event reads
+  dry with no observation, so the season quotes through October's storms
+  and stands aside in Napa rain from Nov 1. (The monthlies still stand
+  aside on rain at the station before their month starts, e.g. a November
+  event in an October storm -- unchanged.)
+
+THE GATE (rain_period_gate). The monthly checks at IMM_RAIN_PERIOD_TOL_CENTS
+(10): no fresh fair / no observation / raining / drying 60 min / stale to
+date / within 0.05" of the to-date -> stand aside both sides. A touch that
+fights the fair CAPS that side at fair +- 10c instead (IMM_RAIN_PERIOD_CAP,
+the Carbon Arc rule: "the bot should sit on the bid if it's earning money
+on it, but not if it wouldnt earn"); the capped side rests only while the
+scored walk reaches it (drop_unearning_sides), the other side joins the
+touch. Logs "rain-period stand-aside / resume / capped / uncapped / not
+earning <t>", guard "rain_period" (risk table: gate guards).
+
+10/4 22:10Z, season fair vs book (YES bid x ask, depth at the touch):
+T10 78c vs 28x73 (1,739 / 45), T15 51 vs 28x74, T20 21 vs 26x74, T25 9 vs
+26x74 -> bid capped at 19 behind 1,099 (does not earn, ask only), T30 3 vs
+12x60 (inside the tolerance), T35 1 vs 12x59 -> bid capped at 10 behind 2
+(earns). October (in period, 0.00" through 10/3, 7 forecast days): T1 30c,
+T2 15, T3 10, T6 3. The touches are other makers' 1,000-3,000 lots; the
+bot's own sizing decides its share.
+
+ALSO FIXED: parse_event_date reads a KXRAIN period ticker's FIRST day. The
+YYMONDD reading made KXRAINSNYC-03OCT26-04OCT26 start 2003-10-26 (past), so
+every rainstorm span not starting on the 26th stood down unquoted; spans
+now stop at 00:00 ET on their real start day, as Jack asked on 9/24. The
+spans themselves stay blind (no fair): a 2-day storm window is a forecast
+bet the model's 30% climatology mix would price dry.
+
+KILL SWITCHES: IMM_RAIN_PERIOD_ENABLE=0 (the family leaves the allowlist;
+positions ride), IMM_RAIN_PERIOD_CAP=0 (a breach parks both sides);
+IMM_RAIN_PERIOD_SERIES (writer's default list, KXRAINNAPAM,KXRAINNYCW).
+Env => restart_imm.ps1 -Task.
+
+WATCH: the first refresh after the restart re-reads Kalshi's events at once
+(the old file has no events_series) and logs "rain-monthly refresh: N
+events"; the season's six markets then read "rain-period capped" (T25,
+T35) or quote. A month's TWC total vs IEM: unverified until the October
+event settles (the boundary rule covers rounding).
+
+Tests: TestRainPeriodGate (guards, cutoff, span start day, every gate
+reason and the caps, quote / cap-not-earning / rain end to end, a capped
+bid that earns), TestAllowlist.test_rain_period_family_allowed_by_shape,
+test_rain_monthly_fair.py (+11: period rules and station codes, events,
+segments across the new year and Feb 29, to-date incl. ACIS fill and
+the stale rules, the kernel, forecast injection, the writer's period
+weather rule and event re-read).

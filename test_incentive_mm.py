@@ -2648,6 +2648,35 @@ class TestAllowlist(unittest.TestCase):
         finally:
             imm.RAINSTORM_ALLOW = True
 
+    def test_rain_period_family_allowed_by_shape(self):
+        # Jack 2026-10-04: "quote KXRAINNAPAM and similar families based on
+        # rain feed". A FAMILY rule on the ticker shape (a KXRAIN series,
+        # then two DDMONYY days), quoted only through the rain fair, so the
+        # next city rides in without a member-list edit.
+        a = IncentiveMarketMaker._allowed
+        for t in ("KXRAINNAPAM-01NOV26-31MAR27-T20", "KXRAINNAPAM-01NOV26-31MAR27",
+                  "KXRAINNAPAM-01OCT26-31OCT26-T1", "KXRAINNYCW-28SEP26-04OCT26-T0P5",
+                  "KXRAINSONOMAM-01NOV26-30NOV26-T2"):
+            self.assertTrue(a(t), t)
+            self.assertTrue(imm.rain_period_gated(t), t)
+        # not the family: the probe, a one-date ticker, a month segment, a
+        # backwards or over-long period, another series
+        for t in ("KXRAINNAPAM-X", "KXRAINNAPAM-26OCT05", "KXRAINNAPAM-26OCT-3",
+                  "KXRAINNAPAM-31MAR27-01NOV26-T20", "KXRAINNAPAM-01JAN26-01JAN28-T5",
+                  "KXSNOWNAPAM-01NOV26-31MAR27-T20"):
+            self.assertFalse(imm.rain_period_gated(t), t)
+        self.assertFalse(a("KXRAINNAPAM-X"))
+        # the rainstorm spans share the shape and keep their own blind rule
+        self.assertTrue(imm.rain_period_ticker("KXRAINSBOS-26SEP26-27SEP26-T1"))
+        self.assertFalse(imm.rain_period_gated("KXRAINSBOS-26SEP26-27SEP26-T1"))
+        self.assertTrue(a("KXRAINSBOS-26SEP26-27SEP26-T1"))
+        # kill switch
+        imm.RAIN_PERIOD_ENABLE = False
+        try:
+            self.assertFalse(a("KXRAINNAPAM-01NOV26-31MAR27-T20"))
+        finally:
+            imm.RAIN_PERIOD_ENABLE = True
+
     def test_truev_sunset_winds_down_one_event(self):
         # Jack 2026-09-11: "quote KXTRUEV-26SEP11 until completion, but
         # block KXTRUEV going forward". The series prefix is blocklisted;
@@ -10370,6 +10399,187 @@ class TestRainMonthlyGate(unittest.TestCase):
         self.assertNotIn("KXRAINCHIM", out[-2])
         self.assertNotIn("KXRAINAUSM", out[-2])
         self.assertEqual(out[-1], "False")
+
+
+class TestRainPeriodGate(unittest.TestCase):
+    """KXRAINNAPAM and the other KXRAIN period totals (Jack 2026-10-04:
+    "quote KXRAINNAPAM and similar families based on rain feed"): the monthly
+    gate's file and checks at RAIN_PERIOD_TOL_CENTS, except that a touch that
+    fights the fair caps that side, which rests only while it earns, instead
+    of parking both. Fixture event KXRAINNAPAM-01NOV68-31MAR69 (far from any
+    cutoff), strike 20 inches."""
+
+    T = "KXRAINNAPAM-01NOV68-31MAR69-T20"
+    EV = "KXRAINNAPAM-01NOV68-31MAR69"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._rain_monthly_state.update(mtime=0.0, markets={}, events={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.RAIN_MONTHLY_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm.RAIN_PERIOD_CAP = True
+
+    def _write(self, p=0.5, wet=False, last_wet_mins=None):
+        now = datetime.now(timezone.utc)
+        lw = ((now - timedelta(minutes=last_wet_mins)).isoformat()
+              if last_wet_mins is not None else None)
+        with open(imm.RAIN_MONTHLY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"event": self.EV, "p": p, "boundary": False,
+                                            "fetched_at": now.isoformat()}},
+                       "event_state": {self.EV: {
+                           "wet": wet, "last_wet_at": lw, "stale_cli": False,
+                           "mtd": 0.0, "obs_time": now.isoformat()}}}, f)
+        os.utime(imm.RAIN_MONTHLY_FILE, (time.time(), time.time() + self._bump))
+        TestRainPeriodGate._bump += 1
+        return imm.load_rain_monthly()
+
+    def _bot(self, yes_lv=None):
+        client = FakeClient()
+        far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 5000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": far, "yes_bid_dollars": "0.4900",
+            "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": yes_lv or lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_family_guards_band_and_cutoff(self):
+        for s in ("KXRAINNAPAM", "KXRAINNYCW"):
+            ov = imm.series_override(s)
+            self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90), s)
+            self.assertEqual(ov.cutoff_from_close_min, 1560, s)
+            self.assertIsNone(ov.cutoff_before_event_min, s)
+        # a new city clones the archetype at first sight; a rainstorm city
+        # still takes the span archetype (out at the start date)
+        for s in ("KXRAINSONOMAM", "KXRAINSCHI"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+        try:
+            imm.ensure_family_override("KXRAINSONOMAM")
+            imm.ensure_family_override("KXRAINSCHI")
+            self.assertEqual(imm.series_override("KXRAINSONOMAM").cutoff_from_close_min,
+                             1560)
+            self.assertEqual(imm.series_override("KXRAINSCHI").cutoff_before_event_min, 0)
+            self.assertIsNone(imm.series_override("KXRAINSCHI").cutoff_from_close_min)
+        finally:
+            for s in ("KXRAINSONOMAM", "KXRAINSCHI"):
+                imm.SERIES_OVERRIDES.pop(s, None)
+        # the season closes 23:59 PDT Mar 31 and is out at 21:59 PDT Mar 30;
+        # its ticker reads day first (Nov 1, not 2001-11-26), and the close
+        # anchor replaces the ticker rule in refresh_universe
+        ev = "KXRAINNAPAM-01NOV26-31MAR27"
+        self.assertEqual(imm.parse_event_date(ev), utc(2026, 11, 1, 4, 0))
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINNAPAM", ev, None, utc(2027, 4, 1, 6, 59)), utc(2027, 3, 31, 4, 59))
+        self.assertTrue(imm.series_override("KXRAINNAPAM").cutoff_from_close_min)
+        for k in ("RAIN_PERIOD_ENABLE", "RAIN_PERIOD_TOL_CENTS", "RAIN_PERIOD_CAP"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_rainstorm_span_reads_its_start_day_first(self):
+        # KXRAINSBOS-03OCT26-04OCT26 is Oct 3-4. Read YYMONDD it started
+        # 2003-10-26, already past, so the span stood down unquoted; it is
+        # out at 00:00 ET Oct 3, "up until the start date"
+        ev = "KXRAINSBOS-03OCT26-04OCT26"
+        stop = utc(2026, 10, 3, 4, 0)
+        self.assertEqual(imm.parse_event_date(ev), stop)
+        exp = utc(2026, 10, 5, 5, 0)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINSBOS", ev, imm.trade_cutoff_utc(ev, exp, exp),
+            close_time=utc(2026, 10, 5, 3, 59)), stop)
+        # one-date tickers keep YYMONDD
+        self.assertEqual(imm.parse_event_date("KXRAINWKND-26OCT10"), utc(2026, 10, 10, 4, 0))
+        self.assertEqual(imm.parse_event_date("KXRAIN-26OCT05-NYC"), utc(2026, 10, 5, 4, 0))
+
+    def test_gate_reasons_and_caps(self):
+        g = imm.rain_period_gate
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], caps), ("no_read", None))
+        self.assertTrue(why)
+        self._write(p=0.5)
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self._write(wet=True, last_wet_mins=0)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], caps), ("raining", None))
+        # bid 49 > 30 + 10: bids capped at 40, the ask keeps the touch
+        self._write(p=0.30)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, caps), ("", (40, 20)))
+        self.assertEqual((inp["reason"], inp["bid_bad"], inp["ask_bad"]), ("band", True, False))
+        # ask 51 < 70 - 10: asks floored at 60
+        self._write(p=0.70)
+        self.assertEqual(g(self.T, time.time(), 49, 51)[2], (80, 60))
+        # the season's T35 on the 10/4 book: fair 0.84c, a 12c bid capped
+        # at 10, no ask floor
+        self._write(p=0.0084)
+        self.assertEqual(g(self.T, time.time(), 12, 59)[2], (10, 0))
+        # cap off: a breach parks both sides, as on the monthlies
+        imm.RAIN_PERIOD_CAP = False
+        self._write(p=0.30)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertTrue(why)
+        self.assertEqual((inp["reason"], caps), ("band", None))
+
+    def test_quotes_through_the_gate_and_caps_the_side_that_fights_it(self):
+        bot = self._bot()
+        bot.run_cycle()                                       # no file: closed
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self.assertEqual(bot._rain_period_series, {"KXRAINNAPAM"})
+        self._write(p=0.5)
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertIn(("ask", 51), q)
+        # the fair drops to 30: the 49c bid touch fights it. Capped at 40,
+        # behind 1,900 contracts of bids (over the 1,000 target), the bid
+        # earns nothing and does not rest; the ask stays at the touch
+        self._write(p=0.30)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertTrue(q)
+        self.assertEqual({s for s, _ in q}, {"ask"}, q)
+        self.assertIn(("ask", 51), q)
+        self.assertIn(self.T, bot._rain_period_capped)
+        self.assertEqual(bot._rain_period_unearning[self.T], {"bid"})
+        # rain at the station: both sides out
+        self._write(p=0.5, wet=True, last_wet_mins=0)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self.assertIn(self.T, bot.state.selected)                 # sticky
+
+    def test_a_capped_side_that_still_earns_rests_at_its_cap(self):
+        # 300 bid at 49 in front (under the 1,000 target), 900 at 30
+        # behind: the scored walk reaches a 40c bid, so it rests there
+        bot = self._bot(yes_lv=[["0.30", "900"], ["0.49", "300"]])
+        self._write(p=0.30)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("bid", 40), q)
+        self.assertIn(("ask", 51), q)
+        self.assertFalse([p for s, p in q if s == "bid" and p > 40], q)
 
 
 class TestOpenRouterShareFairGate(unittest.TestCase):

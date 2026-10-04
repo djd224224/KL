@@ -79,7 +79,7 @@ import uuid
 import zlib
 from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
@@ -899,6 +899,63 @@ SERIES_OVERRIDES[RAINSTORM_ARCHETYPE] = SeriesOverride(
     price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
     price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
     cutoff_before_event_min=_env_int("IMM_RAINSTORM_CUTOFF_BEFORE_MIN", 0))
+
+# PERIOD RAIN TOTALS (Jack 2026-10-04: "quote KXRAINNAPAM and similar
+# families based on rain feed"). KXRAINNAPAM-01NOV26-31MAR27-T20 = "total
+# precipitation at KAPC in Napa strictly greater than 20 inches", summed
+# from The Weather Company's daily values over the period in the ticker:
+# two DDMONYY day segments, both days inclusive. Napa lists Oct, Nov and
+# Dec and the November-March season ($500/market on the season's six
+# strikes, 10/4 20:46Z -> 10/6 03:59Z, target 1000); KXRAINNYCW the week.
+# A FAMILY rule keyed on the ticker shape (a KXRAIN series, then a start
+# and an end day), so the next city rides in without a member-list edit --
+# but ONLY through the rain fair (the monthly gate's file and writer,
+# rain_monthly_fair.py, which prices the period from the station the rules
+# name), failing closed; an unmapped station stands aside. The rainstorm
+# spans share the shape and keep their own rule (blind, out at the start
+# date): a 2-day storm window is a pure forecast bet that the model's
+# climatology mix would price dry. The gate is the monthly one with two
+# changes (see rain_period_gate): rain only matters inside the period, and
+# a touch that fights the fair caps that side instead of parking both
+# (CA_FAIR_CAP's rule, RAIN_PERIOD_CAP). Band 5-90c like every rain
+# market; cutoff 22:00 the day before the period's last day, local (close -
+# RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN, the monthlies' rule). Kill switch
+# IMM_RAIN_PERIOD_ENABLE=0 (env change = task-level restart).
+RAIN_PERIOD_ENABLE = os.environ.get("IMM_RAIN_PERIOD_ENABLE", "1") == "1"
+RAIN_PERIOD_ARCHETYPE = "KXRAINNAPAM"
+RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN = _env_int(
+    "IMM_RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN", 1560)
+
+
+def rain_period_ticker(ticker: str) -> bool:
+    """True for a market or event ticker of a KXRAIN period-total family:
+    <KXRAIN...>-<DDMONYY>-<DDMONYY>[-<strike>] (rain_period_days parses).
+    The rainstorm spans have the shape too; rain_period_gated leaves them
+    out."""
+    return ticker.startswith("KXRAIN") and rain_period_days(ticker) is not None
+
+
+def rain_period_gated(ticker: str) -> bool:
+    """A period-total rain market that quotes only through the rain fair:
+    the shape, minus the rainstorm spans (their own blind rule)."""
+    return (RAIN_PERIOD_ENABLE and rain_period_ticker(ticker)
+            and not RAINSTORM_SERIES_RE.fullmatch(ticker.split("-")[0]))
+
+
+def rain_period_family_series(series: str) -> bool:
+    """FAMILY_OVERRIDE_PARENTS predicate: a KXRAIN series with no guard set
+    of its own. Only a series whose tickers passed _allowed reaches it, so
+    in practice a new period family (the dailies, the weekend family and the
+    monthlies all carry their own overrides; the spans match theirs first)."""
+    return RAIN_PERIOD_ENABLE and series.startswith("KXRAIN") \
+        and not RAINSTORM_SERIES_RE.fullmatch(series)
+
+
+SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE] = SeriesOverride(
+    price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
+    price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
+    cutoff_from_close_min=RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN)
+SERIES_OVERRIDES["KXRAINNYCW"] = SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE]
 
 # UNDATED-TICKER GUARD SET for the five series allowed in code on
 # 2026-09-11 pm (KXMLBPLAYOFFS, KXMLBSEASONGAMES, KXVENUEPERFORM, then
@@ -5935,6 +5992,9 @@ FAMILY_OVERRIDE_PARENTS = (
     # The name regex also matches the KXRAINS*M monthlies, but only a
     # series that passed _allowed (the two-date ticker shape) reaches here.
     ("pattern", RAINSTORM_SERIES_RE, RAINSTORM_ARCHETYPE),
+    # period rain totals (2026-10-04): any other KXRAIN series that reached
+    # here did so through the period shape, archetype KXRAINNAPAM
+    ("predicate", rain_period_family_series, RAIN_PERIOD_ARCHETYPE),
     # elections (2026-09-28): a name pattern OR the exact general-election
     # list, so the family is a predicate rather than one regex
     ("predicate", election_series, ELECTION_ARCHETYPE),
@@ -6848,6 +6908,9 @@ _CONFIG_CODE_KNOBS = (
     # monthly rain gate (2026-10-01); model knobs ride in its file's "model"
     "RAIN_MONTHLY_ENABLE", "RAIN_MONTHLY_TOL_CENTS", "RAIN_MONTHLY_TTL_MIN",
     "RAIN_MONTHLY_DRY_MIN", "RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN",
+    # period rain totals (2026-10-04) on the same file and gate
+    "RAIN_PERIOD_ENABLE", "RAIN_PERIOD_TOL_CENTS", "RAIN_PERIOD_CAP",
+    "RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN",
     # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
     "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
@@ -8172,10 +8235,12 @@ def load_rain_monthly() -> int:
 
 
 def rain_monthly_gate_reason(ticker: str, now_ts: float,
-                             ext_bid: Optional[float], ext_ask: Optional[float]
-                             ) -> Tuple[str, dict]:
+                             ext_bid: Optional[float], ext_ask: Optional[float],
+                             tol: Optional[int] = None) -> Tuple[str, dict]:
     """('', {}) when a monthly rain market may quote, else (reason,
-    guard-skip inputs). Fails CLOSED."""
+    guard-skip inputs). Fails CLOSED. `tol` overrides
+    RAIN_MONTHLY_TOL_CENTS (the period markets' RAIN_PERIOD_TOL_CENTS)."""
+    tol = RAIN_MONTHLY_TOL_CENTS if tol is None else tol
     e = _rain_monthly_state["markets"].get(ticker)
     if e is None:
         return "no monthly rain fair for this market", {"reason": "no_read"}
@@ -8199,15 +8264,62 @@ def rain_monthly_gate_reason(ticker: str, now_ts: float,
         return (f"strike within the boundary of the month-to-date "
                 f"{st.get('mtd')}", {"reason": "boundary", "mtd": st.get("mtd")})
     fair_c = e["p"] * 100.0
-    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair_c, RAIN_MONTHLY_TOL_CENTS)
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair_c, tol)
     if bid_bad or ask_bad:
         return (f"book {ext_bid}x{ext_ask} vs fair {fair_c:.0f}c (tol "
-                f"{RAIN_MONTHLY_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+                f"{tol}c, {'bid' if bid_bad else 'ask'} side; "
                 f"MTD {st.get('mtd')}\")",
                 {"reason": "band", "fair": round(fair_c, 2),
-                 "tol": RAIN_MONTHLY_TOL_CENTS, "bid_bad": bid_bad,
+                 "tol": tol, "bid_bad": bid_bad,
                  "ask_bad": ask_bad, "mtd": st.get("mtd")})
     return "", {}
+
+
+# PERIOD RAIN GATE (2026-10-04, see RAIN_PERIOD_ENABLE): the monthly gate
+# above on the same file -- rain_monthly_fair.py prices the period events
+# beside the monthlies -- at RAIN_PERIOD_TOL_CENTS, with two differences.
+# The writer reads a period that has not started as dry, so the season
+# quotes through October's storms (rain before November 1 counts for
+# nothing) and stands aside in them from November 1. And a band breach
+# CAPS the side that fights the fair at fair +- tol instead of parking both
+# sides (RAIN_PERIOD_CAP, Carbon Arc's rule from the same day: "the bot
+# should sit on the bid if it's earning money on it, but not if it wouldnt
+# earn") -- the capped side rests only while the scored walk reaches it
+# (drop_unearning_sides in the quote loop), the other side joins the touch.
+# On the 10/4 season book (fair 78/51/21/9/3/1 for T10..T35 vs 26-28c bids
+# up the ladder) that is T25's bid capped at 19 and T35's at 10, both asks
+# at the touch. IMM_RAIN_PERIOD_CAP=0 parks both sides as the monthlies do.
+RAIN_PERIOD_TOL_CENTS = _env_int("IMM_RAIN_PERIOD_TOL_CENTS", 10)
+RAIN_PERIOD_CAP = os.environ.get("IMM_RAIN_PERIOD_CAP", "1") == "1"
+
+
+def rain_period_caps(fair_c: float, tol: float
+                     ) -> Tuple[Optional[int], Optional[int]]:
+    """(bid_cap, ask_floor) in whole cents: bids at most fair + tol, asks at
+    least fair - tol -- the limits fair_gate_breach judges the touch by, so
+    the side that does not fight the fair is never moved. A floor at or
+    under zero is no floor; None = that side not at all (ca_fair_caps)."""
+    bid_cap = int(math.floor(fair_c + tol + 1e-9))
+    ask_floor = int(math.ceil(fair_c - tol - 1e-9))
+    return (bid_cap if bid_cap >= 1 else None,
+            max(0, ask_floor) if ask_floor <= 99 else None)
+
+
+def rain_period_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                     ext_ask: Optional[float]
+                     ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', {}, None) when a period rain market may quote at the touch;
+    ('', inputs, (bid_cap, ask_floor)) when its touch fights the fair and
+    the side that does is capped (RAIN_PERIOD_CAP); else (why, guard-skip
+    inputs, None) -- stand aside. Fails CLOSED like the monthly gate."""
+    why, inp = rain_monthly_gate_reason(ticker, now_ts, ext_bid, ext_ask,
+                                        tol=RAIN_PERIOD_TOL_CENTS)
+    if not why or inp.get("reason") != "band" or not RAIN_PERIOD_CAP:
+        return why, inp, None
+    caps = rain_period_caps(inp["fair"], RAIN_PERIOD_TOL_CENTS)
+    if caps == (None, None):
+        return why, inp, None
+    return "", dict(inp, why=why, bid_cap=caps[0], ask_floor=caps[1]), caps
 
 
 # ----------------------------------------------------------------------------
@@ -9676,10 +9788,45 @@ _MONTHS = {m: i + 1 for i, m in enumerate(
 _TICKER_DATE_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})")
 
 
+_RAIN_PERIOD_SEG_RE = re.compile(r"(\d{2})([A-Z]{3})(\d{2})")
+
+
+def rain_period_days(ticker: str) -> Optional[Tuple[date, date]]:
+    """(first, last) day of a KXRAIN period ticker: two DDMONYY segments
+    after the series, KXRAINNAPAM-01NOV26-31MAR27 -> (2026-11-01,
+    2027-03-31) -- day FIRST, unlike the one-date YYMONDD tickers (the
+    weekly KXRAINNYCW-28SEP26-04OCT26 can only read that way). None for any
+    other series or shape, or a period that runs backwards or past 400
+    days."""
+    parts = ticker.split("-")
+    if len(parts) < 3 or not parts[0].startswith("KXRAIN"):
+        return None
+    days = []
+    for seg in parts[1:3]:
+        m = _RAIN_PERIOD_SEG_RE.fullmatch(seg)
+        month = _MONTHS.get(m.group(2)) if m else None
+        if month is None:
+            return None
+        try:
+            days.append(date(2000 + int(m.group(3)), month, int(m.group(1))))
+        except ValueError:
+            return None
+    if not days[0] <= days[1] or (days[1] - days[0]).days > 400:
+        return None
+    return days[0], days[1]
+
+
 def parse_event_date(event_ticker: str) -> Optional[datetime]:
     """Date embedded in an event ticker's second segment, as 00:00 ET that day
     (UTC). 'KXWCMENTION-26JUL11ARGSUI' -> 2026-07-11 00:00 ET. Segments like
-    '26OCTDELIV' (no day), '26NL', '30' don't parse -> None."""
+    '26OCTDELIV' (no day), '26NL', '30' don't parse -> None. A KXRAIN period
+    ticker reads its FIRST day (rain_period_days): the YYMONDD reading made
+    KXRAINSNYC-03OCT26-04OCT26 start 2003-10-26, already past, so every
+    rainstorm span not starting on the 26th stood down unquoted."""
+    per = rain_period_days(event_ticker)
+    if per is not None:
+        return ET.localize(datetime(per[0].year, per[0].month, per[0].day)) \
+            .astimezone(timezone.utc)
     parts = event_ticker.split("-")
     if len(parts) < 2:
         return None
@@ -12101,6 +12248,11 @@ class IncentiveMarketMaker:
         self._or_fair_stood: Set[str] = set()     # OpenRouter token-usage stand-asides
         self._share_fair_stood: Set[str] = set()  # OpenRouter market-share stand-asides
         self._rain_monthly_stood: Set[str] = set()  # monthly rain stand-asides
+        self._rain_period_capped: Set[str] = set()  # period rain side caps
+        self._rain_period_unearning: Dict[str, Set[str]] = {}  # sides dropped
+        # KXRAIN period series seen in the programs feed (the writer prices
+        # them beside its own list, rain_monthly_fair.PERIOD_SERIES)
+        self._rain_period_series: Set[str] = set()
         self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
         self._dc_stood: Set[str] = set()          # data center count stand-asides
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
@@ -14453,6 +14605,7 @@ class IncentiveMarketMaker:
             election_series(series) or \
             datacenter_series(series) or \
             rainstorm_span_allowed(ticker) or \
+            rain_period_gated(ticker) or \
             cpi_pilot_active(ticker) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
@@ -14694,6 +14847,14 @@ class IncentiveMarketMaker:
             # Per-period accrual baselines (Jack 2026-09-11). LIVE feed only,
             # same guard as the family expansion above.
             self._roll_reward_periods(by_market)
+            # Period rain series the feed programs (2026-10-04): the rain
+            # refresher prices them beside its own list, so a new city's
+            # fair exists by the time its markets reach the gate.
+            _rp = {series_of(t) for t in by_market if rain_period_gated(t)}
+            if _rp - self._rain_period_series:
+                log(f"{self.tag} rain-period series in the feed: "
+                    f"{','.join(sorted(_rp))}")
+            self._rain_period_series = _rp
             # Daily-family classification from the live feed (Jack 2026-09-12):
             # feeds hour_size_mult / saturday_size_mult; persisted each refresh.
             _added, _dropped = refresh_daily_series(by_market, now_utc)
@@ -18040,19 +18201,41 @@ class IncentiveMarketMaker:
 
             # MONTHLY RAIN GATE (Jack 2026-10-01, see RAIN_MONTHLY_ENABLE): the
             # daily rain gate's stand-aside on the monthly model, failing
-            # CLOSED, and out while it rains at the station.
-            if rain_monthly_series(meta.series):
-                rm_why, rm_in = rain_monthly_gate_reason(t, now_ts, ext_bid, ext_ask)
+            # CLOSED, and out while it rains at the station. The period
+            # totals (2026-10-04, RAIN_PERIOD_ENABLE) ride the same gate on
+            # the same file; a band breach there caps the side that fights
+            # the fair -- rain_caps, applied last below, where only a side
+            # that still earns rests (RAIN_PERIOD_CAP).
+            rain_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            rain_period = rain_period_gated(t)
+            if rain_monthly_series(meta.series) or rain_period:
+                if rain_period:
+                    rm_why, rm_in, rain_caps = rain_period_gate(
+                        t, now_ts, ext_bid, ext_ask)
+                else:
+                    rm_why, rm_in = rain_monthly_gate_reason(t, now_ts, ext_bid, ext_ask)
                 if rm_why:
                     if t not in self._rain_monthly_stood:
                         self._rain_monthly_stood.add(t)
-                        log(f"{self.tag} rain-monthly stand-aside {t}: {rm_why}")
+                        log(f"{self.tag} {'rain-period' if rain_period else 'rain-monthly'}"
+                            f" stand-aside {t}: {rm_why}")
                     self.cancel_market_orders(t, resting)
-                    self._gskip(t, "rain_monthly", lambda: rm_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    self._gskip(t, "rain_period" if rain_period else "rain_monthly", lambda: rm_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
+                if rain_caps is not None and t not in self._rain_period_capped:
+                    self._rain_period_capped.add(t)
+                    log(f"{self.tag} rain-period capped {t}: {rm_in['why']}; "
+                        + (f"bids capped at {rain_caps[0]}c" if rm_in.get("bid_bad")
+                           else f"asks floored at {rain_caps[1]}c")
+                        + ", resting only while it earns")
+            if rain_caps is None and t in self._rain_period_capped:
+                self._rain_period_capped.discard(t)
+                self._rain_period_unearning.pop(t, None)
+                log(f"{self.tag} rain-period uncapped {t}")
             if t in self._rain_monthly_stood:
                 self._rain_monthly_stood.discard(t)
-                log(f"{self.tag} rain-monthly resume {t}")
+                log(f"{self.tag} {'rain-period' if rain_period else 'rain-monthly'}"
+                    f" resume {t}")
 
             # GASBUDDY STATE-GAS GATE (Jack 2026-09-27, see GB_FAIR_ENABLE):
             # the same stand-aside on GasBuddy's live state averages, failing
@@ -18405,6 +18588,30 @@ class IncentiveMarketMaker:
                             f"the scored walk after the caps {ca_caps} "
                             f"(book {ext_bid}x{ext_ask}) -- not resting them")
                     self._ca_unearning[t] = _c_dropped
+            # period rain gate (RAIN_PERIOD_CAP): the Carbon Arc rule -- the
+            # side whose touch fights the fair rests at most at its cap, and
+            # only while the scored walk still reaches it
+            if rain_caps is not None:
+                mq = mort_cap_quotes(mq, *rain_caps)
+                _r_before = {q.book_side for q in mq if not q.is_pad}
+                if meta.price_step < 0.01:
+                    _ey, _en = orderbook_exact_levels(ob)
+                    mq = drop_unearning_sides(
+                        mq, _ey, _en,
+                        own_exact_by_ticker.get(t, []) if self.live else [],
+                        meta.target_size, meta.discount_factor)
+                else:
+                    mq = drop_unearning_sides(mq, yes_levels, no_levels,
+                                              own_in_book, meta.target_size,
+                                              meta.discount_factor)
+                _r_dropped = _r_before - {q.book_side for q in mq if not q.is_pad}
+                if _r_dropped != self._rain_period_unearning.get(t, set()):
+                    if _r_dropped:
+                        log(f"{self.tag} rain-period not earning {t}: "
+                            f"{'/'.join(sorted(_r_dropped))} side(s) out of "
+                            f"the scored walk after the caps {rain_caps} "
+                            f"(book {ext_bid}x{ext_ask}) -- not resting them")
+                    self._rain_period_unearning[t] = _r_dropped
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -19741,7 +19948,7 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_share_fair_refresh, daemon=True,
                              name="share-fair").start()
-        if RAIN_MONTHLY_ENABLE and not once:
+        if (RAIN_MONTHLY_ENABLE or RAIN_PERIOD_ENABLE) and not once:
             # Monthly rain refresher (2026-10-01): the share refresher's
             # contract -- every network call off the trading thread, the
             # quote loop reads only RAIN_MONTHLY_FILE. Every
@@ -19749,6 +19956,9 @@ class IncentiveMarketMaker:
             # month-to-date and the Monte Carlo (history and forecast cached
             # inside rain_monthly). A failed refresh keeps the old file, whose
             # entries age out of RAIN_MONTHLY_TTL_MIN (the gate fails closed).
+            # The period totals (2026-10-04) ride the same file: the writer
+            # prices its own PERIOD_SERIES plus every period series the
+            # programs feed shows (refresh_universe's _rain_period_series).
             def _rain_monthly_refresh():
                 try:
                     import rain_monthly_fair
@@ -19761,7 +19971,9 @@ class IncentiveMarketMaker:
                     delay = max(60, RAIN_MONTHLY_REFRESH_SECS)
                     try:
                         ok, miss = rain_monthly_fair.write_fair_file(
-                            RAIN_MONTHLY_FILE, get_json=kalshi_get)
+                            RAIN_MONTHLY_FILE, get_json=kalshi_get,
+                            period_series=(sorted(self._rain_period_series)
+                                           if RAIN_PERIOD_ENABLE else ()))
                         if last != (ok, miss):
                             log(f"{self.tag} rain-monthly refresh: {ok} events "
                                 f"with a fair"
