@@ -6742,3 +6742,94 @@ The halt is unchanged in kind: IMM P&L today (realized + marked, since the
 5am-CT roll, carried across restarts) at or below -$2,000 cancels every
 order and idles the bot until the roll. At the change P&L today was -$826,
 69% of the old limit and 41% of the new.
+
+## 2026-10-03 night — Open scan off; its 83 earning series graduate to the normal book; company KPIs, food trackers and AAA MAXM/MINM cut (Jack)
+
+Jack, after the rewards-statement review (10.3.26 paste): "yes do 1 - 4 but
+also keep Jobs (+$16), travel (+$10) and energy (+$5) and any other markets
+that are near-breakeven in addition to the 3 you mentioned (endorsements,
+strait transit, agriculture)". The four: (1) keep the scan's earners and turn
+the scan off, (2) block the food-price trackers, (3) take the Fiscal.ai
+company KPIs out of the normal book, (4) drop the AAA MAXM/MINM pair.
+
+EVIDENCE (dashboard days 9/06-10/03; rewards at each family's paid rate from
+the 10/3 calibration, trading marked to market; scan events from
+opportunistic_roster.json, classified with scan_universe_reason under the
+launcher's env so events already allowed or blocked are not counted):
+- Scan-only series: +$234. The 83 graduates +$501:
+  - endorsements, the weekly strait transits (Suez, Bab-el-Mandeb, Hormuz,
+    Panama; the port TEU counts are ~$0) and 17 agriculture series: +$344
+    (rewards $343, trading +$1, 46 fills), positive every week;
+  - jobs / state economies, travel, energy & mining: +$32;
+  - 26 more with a 4-week net of -$2 or better: +$124 (home prices, Netflix
+    top 10s, OER, KXGENERICBALLOTVOTEHUB +$45 mostly trading, gas EOY /
+    monthly ...). The next one down lost $8.
+- The 46 left behind: -$267 (KXBILLSSIGNED -$103 on 9 fills, monthly diesel
+  -$45 on 45 fills, KXTOP10BBSPOTS -$20, KXCASESSION, KXEOWEEK, KXTRUMPVH,
+  monthly diesel election, KXUSHOMEINVENT, and the scan's own Fiscal.ai KPI
+  and food series -$41). 22 of them earned under $0.50 with no fill (~$4
+  together, mostly vote counts): left out, one line to add back.
+- Fiscal.ai company KPIs: $367 of rewards against -$678 of trading. The 12
+  normal-book series that traded lost $166, 8 of 12 negative; KXBA -$99 on
+  60 fills.
+- Food-price trackers: $25 of rewards against -$151. They settle on Spice
+  Data (KXBKNUGGETS / KXAMSAVO list BLS), not Carbon Arc, so no fair gate
+  covers them.
+- AAA MAXM/MINM: lost on both of its events (the 10/3 tier review), -$42 over
+  four weeks.
+- NOT cut: Carbon Arc *POS. Its -$221 was the September-data book (138
+  fills) before the fair gate had a read it could use; the October book is
+  +$17 on 21 fills. The gate needs 10% of the month observed and the POS feed
+  lags ~2 days, so the November-settling POS events quote ungated until ~10/6
+  (carbon_arc_fair.json lists all 18 POS series as missing on 10/3). Re-judge
+  around 10/20 on gated fills.
+
+WHAT:
+- Launcher: `set IMM_SCAN_TOP_N=0` (scan_universe_reason -> "off"). Members
+  leave the universe at the next refresh: quotes cancelled, positions ride.
+- incentive_mm `SCAN_GRADUATE_SERIES` (IMM_ALLOW_SCAN_GRADUATE_SERIES, ""
+  removes them), joined into ALLOW_SERIES. They keep the treatment they
+  earned the +$501 under, as the data centers did on 10/1:
+  - SCAN_GRADUATE_ARCHETYPE (KXSUEZWEEKLY) via FAMILY_OVERRIDE_PARENTS: the
+    scan guard set (safe-join, no fresh-candidate rate bar, global ladder and
+    caps, or IMM_SCAN_LEVELS / IMM_SCAN_MAX_POSITION if ever set). Listed
+    after the KXAAAGASD prefix, which no graduate matches, so the gas
+    graduates take the scan guard, not the gas-daily one.
+  - At most SCAN_GRADUATE_EVENT_TOP_N (3, the scan's) strikes per event:
+    "=SERIES:3" entries appended to the EVENT_TOP_N spec.
+  - No yield size mode (yield_size_eligible False), as in the scan.
+  - Hour windows and the Saturday multiplier unchanged. Scan members took
+    both (IMM_SCAN_HOUR_MULT defaults to 1): the 9/30-10/02 cycle logs show
+    hour_mult 2.00 on them in 0-9 ET (Suez weekly ~78 contracts a side
+    overnight vs ~41 by day). The review had proposed "x1"; that would have
+    halved the size the +$501 was earned at, so they keep the scan's size.
+    From 10/5 that means the global 0-8 ET x3 and the evening window, which
+    the scan would have applied too.
+- SERIES_BLOCKLIST_PREFIXES: `<series>-` for 36 Fiscal.ai KPI series (the 27
+  in _DEFAULT_COMPANY_SERIES plus the 9-series finecon KPI set), 10 food
+  trackers (incl. KXBKDWHOPPER from the scan and KXAMSAVO) and
+  KXAAAGASMAXM / KXAAAGASMINM. The trailing dash makes each entry exactly one
+  series: "KXBA-" leaves KXBABELMANDEBWEEKLY quotable, "KXCMG-" leaves the
+  Carbon Arc KXCMGFT / KXCMGCC, "KXDG-" leaves KXDGCC. Markets, events and
+  the "<series>-X" probe match. Standard semantics: no new orders, resting
+  quotes cancelled next cycle, positions ride. The allowlist entries stay.
+- Foot traffic KXBKFT / KXYUMTBFT stay: they are Carbon Arc FT series (in
+  carbon_arc_fair's series map), not company KPIs.
+
+WATCH:
+- Startup / first refresh: no "open-scan admit" lines; graduates select as
+  normal-book members ("family override inherited from KXSUEZWEEKLY").
+- Graduates under the $300k budget: the scan's 60 slots no longer bound
+  them, the budget and the payout floor do. Strikes stay at 3 per event.
+- Blocked KPI / food positions ride to settlement unmanaged by quotes.
+
+REVERT: `IMM_SCAN_TOP_N` out of the launcher + restart_imm.ps1 -Task (the
+scan returns at 60 slots); IMM_ALLOW_SCAN_GRADUATE_SERIES="" in the launcher
+removes the graduates; delete the `_CUT_*` line in SERIES_BLOCKLIST_PREFIXES
+to un-block.
+
+Tests: test_imm_scan_graduates.py (7): graduates allowed / not blocked, scan
+losers stay out, 3 strikes per event, no yield mode, the guard-set clone
+(incl. a gas graduate), the cut series frozen, and the one-series-per-entry
+neighbours (KXBABELMANDEBWEEKLY, KXCMGFT, KXAMZNCC, KXDGCC, KXLOWCC, the
+Carbon Arc FT series, KXAAAGASM / KXAAAGASMTX) not.

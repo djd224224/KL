@@ -2090,6 +2090,75 @@ _SHARE_EVENT_TOP_N_SPEC = (
     "," + ",".join(f"={_s}:{SHARE_EVENT_TOP_N}"
                    for _s in _DEFAULT_OR_SHARE_SERIES.split(",") if _s)
     if SHARE_EVENT_TOP_N > 0 else "")
+# OPEN-SCAN GRADUATES (Jack 2026-10-03: "yes do 1 - 4 but also keep Jobs
+# (+$16), travel (+$10) and energy (+$5) and any other markets that are
+# near-breakeven in addition to the 3 you mentioned (endorsements, strait
+# transit, agriculture)"). The open scan goes off the same day
+# (IMM_SCAN_TOP_N=0 in the launcher); these are the series it admitted that
+# paid, moved into the normal book. Review 9/06-10/03 on the dashboard's days
+# (rewards at each family's paid rate, trading marked to market), scan-only
+# series:
+#   * endorsements, the weekly strait transits and agriculture: +$344
+#     (rewards $343, trading +$1, 46 fills), positive every week;
+#   * jobs / state economies, travel and energy & mining: +$32;
+#   * 26 more whose 4-week net was -$2 or better: +$124 (the next one down
+#     lost $8).
+#   The 83 together made +$501; the 46 scan-only series left behind lost
+#   $267 (KXBILLSSIGNED -$103, monthly diesel -$45, the Fiscal.ai company
+#   KPIs and food trackers cut in SERIES_BLOCKLIST_PREFIXES -$41, ...). 22 of
+#   those earned under $0.50 with no fill (~$4 between them, mostly vote
+#   counts) and stay out too.
+# The scan's guard set comes with them, as with the data centers on 10/1:
+# safe-join, no fresh-candidate rate bar, global ladder and caps
+# (SCAN_GRADUATE_ARCHETYPE via FAMILY_OVERRIDE_PARENTS), at most
+# SCAN_GRADUATE_EVENT_TOP_N strikes per event (the scan's 3) and no yield
+# size mode (the scan never had it). They keep the hour windows and the
+# Saturday multiplier, which scan members took too (IMM_SCAN_HOUR_MULT=1:
+# hour_mult 2.00 on them in 0-9 ET in the 9/30-10/02 cycle logs).
+# IMM_ALLOW_SCAN_GRADUATE_SERIES replaces the list ("" takes them out).
+_DEFAULT_SCAN_GRADUATE_SERIES = (
+    # endorsements; weekly strait transits and port TEU counts
+    "KXTRUMPENDORSEMENTS,"
+    "KXSUEZWEEKLY,KXBABELMANDEBWEEKLY,KXHORMUZWEEKLY,KXPANAMAWEEKLY,"
+    "KXMOBILETEU,KXNYNJPORTTEU,KXSAVTEU,KXSCPORTTEU,"
+    # agriculture
+    "KXORBOFHARVEST,KXKSWHEAT,KXSCREWWORMCOUNT,KXNECORNYIELD,KXRIQUAHOG,"
+    "KXMSCOTTON,KXIAETHANOL,KXVTMILK,KXWICORNYIELD,KXNECOF,KXIAFARMLAND,"
+    "KXSDCORNYIELD,KXIACORN,KXMELOBSTER,KXVTMAPLE,KXINCORNYIELD,KXMTCATTLE,"
+    # jobs and state economies
+    "KXMOMFGEMP,KXWYUNEMPLOW,KXNJPHARMAEMP,KXWVPOP,KXREMITSENT,KXSCTRANSEMP,"
+    "KXWIMFGEMP,KXWALLSTBONUS,KXCFNAI,KXALVEHICLEPROD,KXSAGDPQOQ,KXUSRETAIL,"
+    "KXMASCIENRDEMP,KXMIAUTOEMP,KXDECREDITJOBS,"
+    # travel and visits
+    "KXNJGOLFVISITCOUNT,KXNERIVISITS,KXNJONTIME,KXNVVISIT,KXORLHOTELDEMAND,"
+    "KXNYCSUBWAY,KXNHASKIVISITS,"
+    # energy and mining
+    "KXMARCELLUSGAS,KXMNTACONITE,KXWYCOAL,KXEIACRUDEW,KXOKOIL,KXKYCOAL,"
+    "KXAKCRUDEOIL,KXRIRESPOWER,KXWVCOAL,"
+    # near-breakeven: 4-week net -$2 or better
+    "KXGENERICBALLOTVOTEHUB,KXCANEVTARIFF,KXLAGODAYS,KXMANOFFVAC,KXALMWP,"
+    "KXAAAGASEOYNJ,KXWEEKSNUM1,KXNVHOMEPRICE,KXOER,KXNETFLIXTOPVIEWSMOVIE,"
+    "KXRIHOMEPRICE,KXRSENATEWON,KXCANALBERTAREMAIN,KXFLMAILVOTE,KXPAGAS,"
+    "KXUTHOMEPRICE,KXFLDENGUE,KXMAMDANIEO,KXKYBOURBONBARRELS,KXILHPIYOY,"
+    "KXDIESELYE,KXEXUSHOME,KXAAAGASMTX,KXBOZPERMITS,KXCAFAIRPLAN,"
+    "KXNETFLIXTOPVIEWSTV")
+SCAN_GRADUATE_SERIES = frozenset(
+    s.strip() for s in os.environ.get("IMM_ALLOW_SCAN_GRADUATE_SERIES",
+                                      _DEFAULT_SCAN_GRADUATE_SERIES).split(",")
+    if s.strip())
+SCAN_GRADUATE_EVENT_TOP_N = _env_int("IMM_SCAN_GRADUATE_EVENT_TOP_N", 3)
+_SCAN_GRADUATE_EVENT_TOP_N_SPEC = (
+    "," + ",".join(f"={_s}:{SCAN_GRADUATE_EVENT_TOP_N}"
+                   for _s in sorted(SCAN_GRADUATE_SERIES))
+    if SCAN_GRADUATE_EVENT_TOP_N > 0 and SCAN_GRADUATE_SERIES else "")
+
+
+def scan_graduate_series(series: str) -> bool:
+    """A series moved from the open scan into the normal book on 2026-10-03
+    (see SCAN_GRADUATE_SERIES)."""
+    return series in SCAN_GRADUATE_SERIES
+
+
 EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "KXAAAGAS:3,KXDIESEL:3,"
                                                 # Alaska diesel UNCAPPED
@@ -2128,7 +2197,8 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "=KXTOKENUSE:0,=KXTOKENUSEM:0"
                                                 + _CA_FAMILY_EVENT_TOP_N_SPEC
                                                 + _RAMP_EVENT_TOP_N_SPEC
-                                                + _SHARE_EVENT_TOP_N_SPEC))
+                                                + _SHARE_EVENT_TOP_N_SPEC
+                                                + _SCAN_GRADUATE_EVENT_TOP_N_SPEC))
 # Scales EVERY per-event cap above (event_top_n_for); 0 entries stay
 # uncapped. A multiplier rather than a launcher copy of the spec, so a family
 # cap added to the defaults later is scaled too instead of silently masked.
@@ -2663,6 +2733,34 @@ _CRYPTO_ASSETS = ("SOL", "ETH", "BTC", "XRP", "ZEC", "HYPE", "DOGE", "BNB")
 # the prefixes cover every variant (MAX/MON/MS/WS). Re-include by removing
 # these from the blocklist AND raising MAX_CANDIDATE_BOOKS.
 _GPU_RENTAL_PREFIXES = ["KXA100", "KXB200", "KXH100", "KXH200", "KXRTX5090"]
+# CUT 2026-10-03 (Jack: "yes do 1 - 4", after the 9/06-10/03 review): three
+# classes that lost money however it was counted (the dashboard's rewards at
+# the paid rate + trading marked to market, and the rewards report's credits
+# + MTM):
+#   * Fiscal.ai company KPIs (KX<stock>, "Boeing KPI" ...): $367 of rewards
+#     against -$678 of trading; the 12 normal-book series that traded lost
+#     $166, 8 of 12 negative, KXBA -$99 on 60 fills.
+#   * the branded food-price trackers (Spice Data / BLS menu prices): $25 of
+#     rewards against -$151 of trading, and no fair gate exists for them.
+#   * the AAA monthly max / min pair (finecon): lost on both of its events.
+# Each entry ends in a dash so it freezes exactly ONE series: "KXBA-" leaves
+# KXBABELMANDEBWEEKLY (an open-scan graduate) quotable, while its markets,
+# its events and the "<series>-X" probe all match. Standard semantics: no new
+# orders, resting quotes cancelled next cycle, NOT reduce-only, positions
+# ride to settlement. The allowlist entries stay, so an un-block is one line.
+_CUT_KPI_SERIES = (
+    "KXBA", "KXPM", "KXHOOD", "KXHOODA", "KXWING", "KXWINGA", "KXMETA",
+    "KXRDDT", "KXINTC", "KXGOOG", "KXSCHW", "KXCMG", "KXAMZN", "KXCOINBASE",
+    "KXCVNA", "KXDPZ", "KXFSLR", "KXFSLRA", "KXLUV", "KXNCLH", "KXRBLX",
+    "KXSBUX", "KXTLN", "KXTLNA", "KXWH", "KXYOU", "KXRACE",
+    # the finecon KPI set
+    "KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM", "KXBBY", "KXWSM",
+    "KXOKTA")
+_CUT_FOOD_SERIES = (
+    "KXSBUXSAR", "KXCFACHICKSAND", "KXPOPCHICKSAND", "KXCHIPBURRITO",
+    "KXDDCOLDBREW", "KXBKNUGGETS", "KXBKDWHOPPER", "KXAMSAVO",
+    "KXWENBACONATOR", "KXTBCRUNCHWRAP")
+_CUT_AAA_SERIES = ("KXAAAGASMAXM", "KXAAAGASMINM")
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
     # ANNUAL crypto = crypto_annual_mm.py's book as of 2026-08-13 (same
@@ -2699,6 +2797,8 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     # 2027 listing. Standard semantics: no new orders, resting quotes
     # cancelled next cycle, NOT reduce-only, positions ride to settlement.
     + ["KXMLBPLAYOFFS-26"]
+    # company KPIs, food-price trackers, AAA MAXM/MINM (2026-10-03, above)
+    + [f"{_s}-" for _s in _CUT_KPI_SERIES + _CUT_FOOD_SERIES + _CUT_AAA_SERIES]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 
@@ -4084,6 +4184,8 @@ ALLOW_SERIES = frozenset(
                 # Ramp AI Index family (2026-09-12); env IMM_ALLOW_RAMP_AI_SERIES
                 # is honored where RAMP_AI_SERIES is built, next to its guard
                 + "," + ",".join(RAMP_AI_SERIES)
+                # open-scan graduates (2026-10-03, SCAN_GRADUATE_SERIES)
+                + "," + ",".join(sorted(SCAN_GRADUATE_SERIES))
                 ).split(",") if s) | FINECON_SERIES
 
 # The finecon sweep quotes AT MOST 10 markets at once, best-ROI first with
@@ -5380,6 +5482,16 @@ SERIES_OVERRIDES[DATACENTER_ARCHETYPE] = SeriesOverride(
     safe_join=True,
     min_est_per_day=0.0)
 
+# OPEN-SCAN GRADUATE archetype (see SCAN_GRADUATE_SERIES): the guard set they
+# were admitted under -- safe-join, no fresh-candidate rate bar, global
+# ladder and caps (IMM_SCAN_LEVELS / IMM_SCAN_MAX_POSITION if ever set, as
+# ensure_scan_override reads them). Every member clones it
+# (FAMILY_OVERRIDE_PARENTS).
+SCAN_GRADUATE_ARCHETYPE = "KXSUEZWEEKLY"
+SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE] = SeriesOverride(
+    levels=SCAN_LEVELS, max_position=SCAN_MAX_POSITION,
+    safe_join=True, min_est_per_day=0.0)
+
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
 # The default midnight-ET ticker rule cost the whole overnight half of each
@@ -5580,6 +5692,8 @@ FAMILY_OVERRIDE_PARENTS = (
     ("predicate", election_series, ELECTION_ARCHETYPE),
     # data center counts (2026-10-01): KX<state code>DATACENTERS
     ("predicate", datacenter_series, DATACENTER_ARCHETYPE),
+    # open-scan graduates (2026-10-03): the scan's guard set, see above
+    ("predicate", scan_graduate_series, SCAN_GRADUATE_ARCHETYPE),
 )
 _family_override_warned: Set[str] = set()
 
@@ -5980,6 +6094,8 @@ def yield_size_eligible(series: str) -> bool:
         return False
     if _share_x1(series):
         return False       # the OpenRouter share family stays x1 (2026-10-03)
+    if scan_graduate_series(series):
+        return False       # open-scan graduates keep the scan's size (2026-10-03)
     if series in FINECON_SERIES or series in FINECON_FAMILY:
         return False
     # a family multiplier, or a hand-tuned ladder / cap / quote-all spec

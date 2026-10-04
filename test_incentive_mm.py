@@ -178,6 +178,19 @@ def utc(y, mo, d, h=0, mi=0):
     return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
 
 
+def _without_cut(*series):
+    """SERIES_BLOCKLIST_PREFIXES without the 2026-10-03 cut (the Fiscal.ai
+    company KPIs, food-price trackers and AAA MAXM/MINM; all of it when no
+    series is named), for tests of OTHER mechanisms whose fixtures are cut
+    series. The cut itself is test_imm_scan_graduates' subject."""
+    cut = series or (imm._CUT_KPI_SERIES + imm._CUT_FOOD_SERIES
+                     + imm._CUT_AAA_SERIES)
+    drop = {f"{s}-" for s in cut}
+    return mock.patch.object(
+        imm, "SERIES_BLOCKLIST_PREFIXES",
+        tuple(p for p in imm.SERIES_BLOCKLIST_PREFIXES if p not in drop))
+
+
 # ----------------------------------------------------------------------------
 # Event-start cutoff
 # ----------------------------------------------------------------------------
@@ -1415,8 +1428,10 @@ class TestScreen(unittest.TestCase):
                 self.assertEqual(imm.scan_universe_reason(t), "allowed", t)
             # Elections-category neighbours that are not a vote's result, and
             # the name-alikes the patterns must not take
+            # (KXGENERICBALLOTVOTEHUB is quotable since 2026-10-03 as an
+            # open-scan graduate, but never as an election)
+            self.assertFalse(imm.election_series("KXGENERICBALLOTVOTEHUB"))
             for t in ("KXSENMIN-27-JTHU", "KXSERBIAELECTIONCALL-26NOV01-26OCT15",
-                      "KXGENERICBALLOTVOTEHUB-26OCT02-T8.3",
                       "KXVPRESPERSON-29-WMOO", "KXISTANBULMAYOR-26-X",
                       "KXACKMANMAYOR-26-X", "KXAPCALLLAMAYOR-26-X",
                       "KXDIMAYORGAME-26SEP28AB-A", "KXMAYOROFKINGSTOWN-26-X",
@@ -2654,21 +2669,27 @@ class TestAllowlist(unittest.TestCase):
     def test_company_metric_series(self):
         # 2026-08-02 RE-ENTRY (Jack): company family quotes again (freeze
         # default emptied) behind the $2/day rate floor + safe-join rule.
+        # 2026-10-03 the Fiscal.ai KPIs and food-price trackers were CUT by
+        # the blocklist; their allowlist entries stay, so membership is
+        # checked with the cut lifted, and the cut wins otherwise.
         a = IncentiveMarketMaker._allowed
-        self.assertTrue(a("KXBA-26JULDELIV-130"))
-        self.assertTrue(a("KXHOOD-26JULFUNDED-28300000"))
-        self.assertTrue(a("KXCOINBASE-26JULVOL-240000000000"))
-        self.assertTrue(a("KXWINGA-27FEBREST-3400"))
-        self.assertTrue(a("KXSBUXSAR-26AUG02-T5.09"))
-        self.assertTrue(a("KXCHIPBURRITO-26AUG02-T9.77"))
-        import incentive_mm as _imm
-        old = _imm.FREEZE_SERIES
-        _imm.FREEZE_SERIES = frozenset({"KXBA"})
-        try:
-            # IMM_FREEZE_SERIES still refreezes on demand
-            self.assertFalse(a("KXBA-26JULDELIV-130"))
-        finally:
-            _imm.FREEZE_SERIES = old
+        with _without_cut():
+            self.assertTrue(a("KXBA-26JULDELIV-130"))
+            self.assertTrue(a("KXHOOD-26JULFUNDED-28300000"))
+            self.assertTrue(a("KXCOINBASE-26JULVOL-240000000000"))
+            self.assertTrue(a("KXWINGA-27FEBREST-3400"))
+            self.assertTrue(a("KXSBUXSAR-26AUG02-T5.09"))
+            self.assertTrue(a("KXCHIPBURRITO-26AUG02-T9.77"))
+            import incentive_mm as _imm
+            old = _imm.FREEZE_SERIES
+            _imm.FREEZE_SERIES = frozenset({"KXBA"})
+            try:
+                # IMM_FREEZE_SERIES still refreezes on demand
+                self.assertFalse(a("KXBA-26JULDELIV-130"))
+            finally:
+                _imm.FREEZE_SERIES = old
+        for t in ("KXBA-26JULDELIV-130", "KXSBUXSAR-26AUG02-T5.09"):
+            self.assertFalse(a(t), t)
         # non-ticker lookalikes still excluded
         self.assertFalse(a("KXMUSKNW-26JUL31-T950"))
         self.assertFalse(a("KXTRUTHSOCIAL-26JUL25-T240"))
@@ -3885,8 +3906,10 @@ class TestOverrideBuffer(unittest.TestCase):
         old_ov = imm.SERIES_OVERRIDES.get("KXINTC")
         imm.SERIES_OVERRIDES["KXINTC"] = imm.SeriesOverride()
         try:
-            bot = IncentiveMarketMaker(client=client, live=False)
-            bot.run_cycle()
+            # ... and from the 2026-10-03 company-KPI cut, for the same reason
+            with _without_cut("KXINTC"):
+                bot = IncentiveMarketMaker(client=client, live=False)
+                bot.run_cycle()
             self.assertIn(t, bot.state.selected)
             cutoff = bot.state.selected[t].cutoff
             # cutoff = release - OVERRIDE_BUFFER_MIN (10), NOT the 30-min game buffer
@@ -4239,11 +4262,15 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
         finally:
             imm.ALLOWLIST_ONLY = prev_only
-        # the national daily and the monthlies are deliberately KEPT
-        for keep in ("KXAAAGASD-26SEP02-3.1500", "KXAAAGASM-26SEP30-4.20",
-                     "KXAAAGASMINM-26SEP30-4.20", "KXAAAGASMAXM-26SEP30-4.20"):
+        # the national daily and the monthly are deliberately KEPT
+        for keep in ("KXAAAGASD-26SEP02-3.1500", "KXAAAGASM-26SEP30-4.20"):
             self.assertFalse(IncentiveMarketMaker._blocked(keep), keep)
             self.assertTrue(IncentiveMarketMaker._allowed(keep), keep)
+        # the monthly max / min pair is not pattern-blocked either: it was
+        # cut BY NAME on 2026-10-03 (test_imm_scan_graduates)
+        for s in ("KXAAAGASMINM", "KXAAAGASMAXM"):
+            self.assertFalse(imm.series_pattern_blocked(s), s)
+            self.assertTrue(IncentiveMarketMaker._blocked(f"{s}-26SEP30-4.20"), s)
         # full-match, not prefix-match: the pattern must not reach the national
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASD"))
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))
@@ -4498,7 +4525,10 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # so the block is an EVENT_BLOCK_PATTERNS full-match on the event
         # ticker and the company SERIES keeps its other KPIs. Meta's own
         # KXMETAHEADCOUNT series (26Q4 / 26JUL events, no suffix) is a
-        # SERIES_BLOCK_PATTERNS entry.
+        # SERIES_BLOCK_PATTERNS entry. (The 2026-10-03 company-KPI cut
+        # freezes these companies' whole series by name; lifted here, the
+        # subject is the event-pattern block.)
+        self.enterContext(_without_cut())
         prev_only = imm.ALLOWLIST_ONLY
         try:
             imm.ALLOWLIST_ONLY = True
@@ -4851,6 +4881,10 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # _allowed is tested with the REAL policy: the suite's setUpModule
         # turns ALLOWLIST_ONLY off for fixture series, and sibling classifier
         # tests leave EXTRA_ALLOW_SERIES scratch behind — both restored.
+        # The 2026-10-03 cut (the KPI set, the two food trackers, the AAA
+        # max/min pair) blocks members by name; lifted here, the subject is
+        # finecon membership and its guards.
+        self.enterContext(_without_cut())
         saved_extra = set(imm.EXTRA_ALLOW_SERIES)
         imm.EXTRA_ALLOW_SERIES.clear()
         imm.ALLOWLIST_ONLY = True
@@ -9055,8 +9089,9 @@ class TestYieldSizeMode(unittest.TestCase):
 
     def test_eligibility(self):
         e = imm.yield_size_eligible
-        for s in ("KXGOOD", "KXTRUMPMENTION", "KXWCMENTION", "KXAMZNCC", "KXSUEZWEEKLY"):
+        for s in ("KXGOOD", "KXTRUMPMENTION", "KXWCMENTION", "KXAMZNCC"):
             self.assertTrue(e(s), s)
+        self.assertFalse(e("KXSUEZWEEKLY"))      # an open-scan graduate (2026-10-03)
         for s in ("KXRT", "KXAAAGASD", "KXAAAGASW", "KXDIESELW", "KXUSGASCPI",       # RT, gas
                   "KXCPICOREYOY", "KXCBDECISIONNZ", "KXFEDDECISION", "KXUST10AD",     # econ / rates
                   "KX7YRDIRLM", "KXCTMFPERMITS", "KXJOBLESSCLAIMS", "KXGDP",
@@ -13733,7 +13768,9 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertIsNone(r("KXNOVEL-26OCT13-T5"))
         # everything the normal book quotes is NOT scan universe
         self.assertEqual(r("KXSPRLVL-26OCT13-T286"), "allowed")   # finecon
-        self.assertEqual(r("KXBA-26JULDELIV-130"), "allowed")     # company
+        self.assertEqual(r("KXBKFT-26NOV08-T100"), "allowed")     # company (Carbon Arc FT)
+        self.assertEqual(r("KXBA-26JULDELIV-130"), "blocked")     # company KPI, cut 2026-10-03
+        self.assertEqual(r("KXSUEZWEEKLY-26OCT11-T30"), "allowed")  # open-scan graduate
         self.assertEqual(r("KXWCMENTION-26JUL11ARGSUI-VAR"), "allowed")
         # state gas dailies: pattern-blocked 2026-09-14, so they are NOT
         # scan universe either (the de-allowlist-only route would have made
