@@ -43,6 +43,7 @@ Every row carries `run_id` and `config_hash`.
 | `guard_skips_*.jsonl` | on guard change + hourly | why a managed market went quiet, and on what book |
 | `floor_state_*.jsonl` | on member floor-state change | the hopeless clock and near-cliff, visible |
 | `ws_stale_*.jsonl` | per stale-quote episode event | would a fast WS cancel have paid (2026-10-04) |
+| `ws_sweep_*.jsonl` | per sweep-breaker trip | would pulling an event on a sweep have paid (2026-10-04) |
 
 ### fills
 
@@ -175,7 +176,9 @@ IMM_WS_FAST=1). `ev` is one of:
 
 - `flag`: the episode opens, once per order and price. It carries `mode`
   (dry/live), `ticker`, `order_id`, `side` (bid/ask), `px` (our YES cents),
-  `rem`, `age_s` (since placed), `ahead_s` (since first seen ahead),
+  `rem`, `age_s` (since placed), `ahead_s` (since first seen ahead), `phase`
+  (cycle = the in-cycle check caught it, idle = between cycles; flags before
+  the evening of 10/4 carry none),
   `ext_bid` / `ext_ask` (the external touch in cents, our own size taken
   out), `gap_c` (cents ahead of it), `yes` / `no` (the WS book's best 60
   levels as [cents, qty], deep enough to re-run the reward model) and `ours` (our orders on the market, as [side,
@@ -198,6 +201,21 @@ mid-cycle is flagged at the next idle. `ws_stale_score.py` turns a day of
 rows plus the fills and cycle logs into the verdict on a fast path.
 `IMM_WS_STALE_LOG=0` turns this file off.
 
+### ws_sweep (2026-10-04)
+
+One `trip` row per event the sweep breaker trips (SWEEP_BREAKER dry / on).
+The trigger is a maker WS fill that took all that was left of our order. Each
+row carries:
+- `mode`, `event`, `ticker`, `order_id`, `side`, `px` (YES cents);
+- `count` and `rem_before` (the fill and what was left of the order);
+- `fill_ts` (Kalshi's), `trade_id` and `hold_s`;
+- `pull`: our other resting orders in the event that the trip pulls (on) or
+  would pull (dry), as [ticker, order_id, side, cents, remaining].
+
+ws_stale_score.py scores the dry trips: our fills in the event inside
+(trip + 2s, trip + hold], marked out, against the event's modelled reward
+for the hold. `IMM_SWEEP_BREAKER=off` writes nothing.
+
 ### The `risk:` log line (2026-10-03)
 
 Not a sink: one bot-log line per FULL cycle, right after the cycle summary,
@@ -219,12 +237,15 @@ Not a sink: since 2026-10-03 `status_incentive_mm.json` carries
 `latency.ws` -- the WebSocket feed (kalshi_ws.py) in shadow: feed health
 (connected, healthy, books_ok, want, gaps, resnapshots, resyncs, errors,
 msgs), the shadow compare of every REST book read against the WS book
-(compared, exact, top, ws_missing), the dry stale-quote counts
+(compared, exact, top, ws_missing), `check_in_cycle`, the dry stale-quote counts
 (would_cancel, in episodes since 2026-10-04) and `stale_open` (episodes
 open in `ws_stale_*.jsonl`). Since 2026-10-04 also `audit`, the REST
 audit of the WS books: audits, rest_errors, trips, rearms, tripped,
 tripped_at, last_trip, every, and the trip window's size and mismatch
-counts (window, window_bad_top, window_bad_book). A live fast-path cancel
+counts (window, window_bad_top, window_bad_book). Since the same evening
+`latency.sweep` (the sweep breaker's trips and counts) and `latency.cycle`
+(the full cycles' REST read phase and length, medians of the last 30:
+reads_s, run_s, period_s, last_reads_s, last_run_s). A live fast-path cancel
 (IMM_WS=on + IMM_WS_FAST=1, not enabled) would carry the orders-row cancel
 reason `ws_stale`.
 
@@ -263,7 +284,7 @@ already skips rows whose first field is `ts`. Files from 09-07 on are clean.
 
 `IMM_ANALYTICS=0` (every JSONL sink), `IMM_CYCLE_LOG=0` (the two CSVs),
 `IMM_BOOK_LOG=0`, `IMM_BOOK_LOG_CANDIDATES=0`, `IMM_GUARD_LOG=0`,
-`IMM_SELECTION_INPUTS=0`, `IMM_WS_STALE_LOG=0`. Setting any of them in the launcher changes
+`IMM_SELECTION_INPUTS=0`, `IMM_WS_STALE_LOG=0`, `IMM_SWEEP_BREAKER=off`. Setting any of them in the launcher changes
 `CONFIG_HASH`, like every `IMM_*` variable. Tests prove order placement is
 identical with the logging on or off.
 

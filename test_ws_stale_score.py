@@ -13,6 +13,7 @@ import ws_stale_score as wss
 
 T = datetime(2026, 10, 4, 12, 0, 0, tzinfo=timezone.utc).timestamp()
 A, B = "KXTEST-26OCT04-A", "KXTEST-26OCT04-B"
+EV = "KXTEST-26OCT04"
 
 
 def _iso(ts):
@@ -20,11 +21,14 @@ def _iso(ts):
 
 
 def _flag(ts, oid, side, px, rem, yes, no, ours, ticker=A, run="r1", mode="dry",
-          gap=2.0):
-    return {"ev": "flag", "ts": ts, "mode": mode, "ticker": ticker, "order_id": oid,
-            "side": side, "px": px, "rem": rem, "age_s": 100.0, "ahead_s": 1.5,
-            "ext_bid": None, "ext_ask": None, "gap_c": gap, "yes": yes, "no": no,
-            "ours": ours, "run_id": run}
+          gap=2.0, phase=None):
+    r = {"ev": "flag", "ts": ts, "mode": mode, "ticker": ticker, "order_id": oid,
+         "side": side, "px": px, "rem": rem, "age_s": 100.0, "ahead_s": 1.5,
+         "ext_bid": None, "ext_ask": None, "gap_c": gap, "yes": yes, "no": no,
+         "ours": ours, "run_id": run}
+    if phase:
+        r["phase"] = phase           # flags before 10/4 evening carry none
+    return r
 
 
 def _end(ts, ev, oid, side, px, stale, ticker=A, run="r1", **kw):
@@ -66,7 +70,7 @@ def _write_day(d):
         _end(T + 615, "clear", "o2", "ask", 53.0, 5.0),
         _flag(T + 1200, "o3", "bid", 30.0, 15.0, ticker=B,
               yes=[[30.0, 15.0], [28.0, 1000.0]], no=[[60.0, 1000.0]],
-              ours=[["bid", 30.0, 15.0]]),                      # never ends: open
+              ours=[["bid", 30.0, 15.0]], phase="cycle"),       # never ends: open
         _flag(T + 2000, "o5", "bid", 49.0, 20.0, **BOOK_A),
         _end(T + 2030, "gone", "o5", "bid", 49.0, 30.0),
         # an ask already lifted mid-cycle: no NO size at 84c in its book
@@ -87,6 +91,17 @@ def _write_day(d):
         _fill(T + 2010, "f5", "o5", A, "bid", 49.0, 20),  # avoidable, then gone
         _fill(T + 2010, "f5", "o5", A, "bid", 49.0, 20),  # the sink wrote it twice
     ]
+    # the event sweep breaker's dry trips (A and B are one event)
+    trips = [
+        {"ev": "trip", "ts": T + 20, "mode": "dry", "event": EV, "ticker": A,
+         "order_id": "o0", "side": "bid", "px": 49.0, "count": 20.0, "hold_s": 300.0,
+         "pull": [[B, "ob", "bid", 30.0, 15.0]], "run_id": "r1"},
+        {"ev": "trip", "ts": T + 2000, "mode": "dry", "event": EV, "ticker": A,
+         "order_id": "o8", "side": "ask", "px": 51.0, "count": 5.0, "hold_s": 300.0,
+         "pull": [], "run_id": "r1"}]
+    with open(os.path.join(d, "ws_sweep_2026-10-04.jsonl"), "w") as f:
+        for r in trips:
+            f.write(json.dumps(r) + "\n")
     with open(os.path.join(d, "fills_2026-10-04.jsonl"), "w") as f:
         for r in fills:
             f.write(json.dumps(r) + "\n")
@@ -189,6 +204,37 @@ class TestScore(unittest.TestCase):
         empty = tempfile.mkdtemp()
         self.assertEqual(wss.main(["--dir", empty]), 1)
         os.rmdir(empty)
+
+    def test_the_phase_table_splits_in_cycle_from_idle(self):
+        s = self._summary()
+        self.assertEqual({k: v["episodes"] for k, v in s["by_phase"].items()},
+                         {"cycle": 1, "idle": 3})
+        self.assertAlmostEqual(s["by_phase"]["cycle"]["avoided_300"], 1.35, places=9)
+
+    def test_sweep_trips_are_scored_like_the_backtest(self):
+        trips = wss.load_sweeps(self.d, None, None)
+        efills = wss.load_event_fills(self.d, {EV})
+        self.assertEqual(len(efills[EV]), 5)               # f5 once
+        cyc = wss.load_cycle_rows(self.d, {A, B}, T - 3600, T + 9000)
+        res = wss.score_sweeps(trips, efills, cyc)
+        # trip 1 (T+20, 300s): f1 @T+30 10 @49 and f2 @T+90 10 @47 (any of our
+        # fills in the event), both marked 45: -$0.40 - $0.20; A + B at
+        # 4.32 + 8.64 $/day of reward for 300s
+        self.assertEqual([r["avoid_n"] for r in res], [2, 1])
+        self.assertAlmostEqual(res[0]["pnl"][300], -0.60, places=9)
+        self.assertAlmostEqual(res[0]["cost"], (4.32 + 8.64) / 86400 * 300, places=9)
+        # trip 2 (T+2000): f5 @T+2010 (once, though written twice) -> -$0.80
+        self.assertAlmostEqual(res[1]["pnl"][1800], -0.80, places=9)
+        self.assertAlmostEqual(res[1]["cost"], 4.32 / 86400 * 300, places=9)
+        text = wss.render_sweeps(res, 1.0)
+        self.assertIn("Event sweep breaker", text)
+        self.assertIn("$+1.40", text)                         # avoided 5m
+
+    def test_main_reports_the_sweeps_too(self):
+        out = os.path.join(self.d, "s.json")
+        self.assertEqual(wss.main(["--dir", self.d, "--json", out]), 0)
+        with open(out) as f:
+            self.assertEqual(len(json.load(f)["sweeps"]), 2)
 
 
 if __name__ == "__main__":

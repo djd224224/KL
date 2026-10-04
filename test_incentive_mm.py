@@ -20904,5 +20904,289 @@ class TestWSStaleEpisodes(unittest.TestCase):
                          ("flag", "oX", "ask", 48.0, 53.0, 2.0, imm.RUN_ID))
 
 
+class TestWSInCycleCheck(unittest.TestCase):
+    """The stale-quote check also runs INSIDE the cycle (WS_CHECK_IN_CYCLE,
+    Jack 2026-10-04: a fast path that watches continuously)."""
+    T = "KXGOOD-99DEC31-A"
+    _AHEAD = ({0.47: 500.0, 0.49: 20.0}, {0.49: 1200.0})   # our 20 alone at 49c
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("WS_FAST", False),
+                        ("WS_CHECK_IN_CYCLE", True)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        self.bot._resting_view = {self.T: [{
+            "order_id": "o1", "side": "bid", "px": 49.0, "rem": 20.0,
+            "placed": self.now - 100.0, "pad": False}]}
+        self.feed.books[self.T] = self._AHEAD
+
+    def _look(self, *dts, in_cycle=True):
+        for dt in dts:
+            self.feed.dirty = {self.T}
+            self.bot._ws_process_events(self.now + dt, in_cycle=in_cycle)
+
+    def test_it_flags_inside_the_cycle_and_tags_the_phase(self):
+        self._look(0.0, 1.5)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+        flags = [r for _n, r in self.recs if r["ev"] == "flag"]
+        self.assertEqual([r["phase"] for r in flags], ["cycle"])
+        self.assertEqual(self.cancelled, [])
+
+    def test_off_it_waits_for_the_idle_as_before(self):
+        with mock.patch.object(imm, "WS_CHECK_IN_CYCLE", False):
+            self._look(0.0, 1.5, 3.0)
+            self.assertEqual(self.bot._ws_fast["would_cancel"], 0)
+            self._look(4.0, 5.5, in_cycle=False)
+        self.assertEqual([r["phase"] for _n, r in self.recs if r["ev"] == "flag"],
+                         ["idle"])
+
+    def test_orders_this_cycle_acted_on_are_skipped_inside_it(self):
+        self.bot._cycle_amended = {"o1": 47}
+        self._look(0.0, 1.5)
+        self.bot._cycle_amended = {}
+        self.bot._cycle_cancelled = {"o1"}
+        self._look(3.0, 4.5)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 0)
+        # between cycles the view is rebuilt, so the same ids are fair game
+        self._look(6.0, 7.5, in_cycle=False)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+
+    def test_live_fast_mode_cancels_inside_the_cycle(self):
+        with mock.patch.object(imm, "WS_MODE", "on"), \
+                mock.patch.object(imm, "WS_FAST", True):
+            self._look(0.0, 1.5)
+        self.assertEqual(self.cancelled, [("o1", "ws_stale")])
+        self.assertTrue(self.bot._ws_wake)
+
+    def test_the_tick_is_throttled_and_never_reenters(self):
+        calls = []
+        self.bot._ws_process_events = lambda now_ts, in_cycle=False: \
+            calls.append(in_cycle)
+        with mock.patch.object(imm, "WS_TICK_SECS", 60.0):
+            for _ in range(5):
+                self.bot._ws_cycle_tick()
+            self.assertEqual(calls, [True])
+            self.bot._ws_tick_last = 0.0
+            self.bot._ws_ticking = True               # a tick already running
+            self.bot._ws_cycle_tick()
+            self.assertEqual(calls, [True])
+        with mock.patch.object(imm, "WS_CHECK_IN_CYCLE", False):
+            self.bot._ws_ticking = False
+            self.bot._ws_cycle_tick()
+        self.assertEqual(calls, [True])
+
+    def test_a_failing_tick_is_logged_not_raised(self):
+        def boom(now_ts, in_cycle=False):
+            raise RuntimeError("feed broke")
+        self.bot._ws_process_events = boom
+        self.bot._ws_cycle_tick()                     # no exception
+        self.assertFalse(self.bot._ws_ticking)
+
+    def test_a_full_cycle_ticks_from_its_book_reads(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()                               # select + quote via REST
+        bot.state.universe_at = time.time()
+        bot._ws = _FakeFeed()
+        seen = []
+        real = bot._ws_process_events
+
+        def spy(now_ts, in_cycle=False):
+            seen.append(in_cycle)
+            return real(now_ts, in_cycle=in_cycle)
+        bot._ws_process_events = spy
+        bot._ws_tick_last = 0.0
+        bot.run_cycle()
+        # the cycle-start drain plus at least one tick from inside the cycle
+        self.assertGreaterEqual(seen.count(True), 2)
+
+
+class TestSweepBreaker(unittest.TestCase):
+    """A maker fill that clears our order trips its EVENT (SWEEP_BREAKER,
+    Jack 2026-10-04: pull quotes when related markets move)."""
+    E = "KXEVT-26OCT05"
+    A, B, C = E + "-A", E + "-B", "KXOTHER-26OCT05-C"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("SWEEP_BREAKER", "dry"),
+                        ("SWEEP_HOLD_SECS", 300.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+        def o(oid, side, px, rem):
+            return {"order_id": oid, "side": side, "px": px, "rem": rem,
+                    "placed": self.now - 100.0, "pad": False}
+        self.bot._resting_view = {
+            self.A: [o("o1", "bid", 40.0, 20.0), o("o2", "ask", 45.0, 20.0)],
+            self.B: [o("o3", "bid", 30.0, 10.0)],
+            self.C: [o("o4", "bid", 50.0, 20.0)]}
+
+    def _fill(self, oid, n, ticker=None, dt=0.0, **kw):
+        body = {"order_id": oid, "market_ticker": ticker or self.A,
+                "count_fp": f"{n:.2f}", "is_taker": False,
+                "ts_ms": int((self.now + dt) * 1000), "trade_id": "t-" + oid}
+        body.update(kw)
+        self.feed.events = [("fill", body)]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _trips(self):
+        return [r for name, r in self.recs if name == "ws_sweep"]
+
+    def test_a_fill_that_clears_an_order_trips_its_event_dry(self):
+        self._fill("o1", 20)
+        trips = self._trips()
+        self.assertEqual(len(trips), 1)
+        t = trips[0]
+        self.assertEqual((t["ev"], t["mode"], t["event"], t["ticker"], t["order_id"],
+                          t["side"], t["px"], t["count"], t["rem_before"], t["hold_s"]),
+                         ("trip", "dry", self.E, self.A, "o1", "bid", 40.0, 20.0,
+                          20.0, 300.0))
+        self.assertEqual(sorted(x[1] for x in t["pull"]), ["o2", "o3"])  # not C
+        self.assertAlmostEqual(t["fill_ts"], self.now, places=2)
+        self.assertEqual(self.bot._sweep["trips"], 1)
+        self.assertAlmostEqual(self.bot._sweep_until[self.E], self.now + 300.0)
+        self.assertEqual(self.cancelled, [])          # dry: nothing pulled
+        self.assertFalse(self.bot.sweep_held(self.E, self.now))
+
+    def test_a_partial_fill_books_down_and_the_rest_trips(self):
+        self._fill("o1", 8)
+        self.assertEqual((self._trips(), self.bot._resting_view[self.A][0]["rem"]),
+                         ([], 12.0))
+        self._fill("o1", 12, dt=5.0)
+        self.assertEqual(len(self._trips()), 1)
+
+    def test_taker_unknown_and_unparsed_fills_never_trip(self):
+        self._fill("o1", 20, is_taker=True)
+        self._fill("zz", 20)
+        self._fill("", 20)
+        self._fill("o1", 0)
+        s = self.bot._sweep
+        self.assertEqual((self._trips(), s["unknown_order"], s["unparsed"]),
+                         ([], 1, 2))
+
+    def test_an_order_placed_this_cycle_is_known_from_the_ledger(self):
+        self.bot.state.ledger["o9"] = {"order_id": "o9", "ticker": self.B,
+                                       "book_side": "ask", "yes_price": 35,
+                                       "yes_price_exact": None,
+                                       "remaining_count": 15.0}
+        self._fill("o9", 15, ticker=self.B)
+        t = self._trips()[0]
+        self.assertEqual((t["order_id"], t["side"], t["px"]), ("o9", "ask", 35.0))
+
+    def test_a_held_event_does_not_retrip_until_the_hold_ends(self):
+        self._fill("o1", 20)
+        self._fill("o3", 10, ticker=self.B, dt=60.0)
+        self.assertEqual(len(self._trips()), 1)
+        self._fill("o2", 20, dt=301.0)
+        self.assertEqual(len(self._trips()), 2)
+
+    def test_on_pulls_the_event_now_and_holds_it(self):
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"):
+            self._fill("o1", 20)
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 10))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 301))
+            self.assertFalse(self.bot.sweep_held("KXOTHER-26OCT05", self.now))
+        self.assertEqual(sorted(self.cancelled),
+                         [("o2", "sweep_breaker"), ("o3", "sweep_breaker")])
+        self.assertEqual(self.bot._sweep["cancels"], 2)
+        self.assertEqual(self._trips()[0]["mode"], "on")
+
+    def test_on_respects_the_fast_cancel_budget(self):
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"), \
+                mock.patch.object(imm, "WS_FAST_MAX_CANCELS_PER_MIN", 1):
+            self._fill("o1", 20)
+        self.assertEqual((len(self.cancelled), self.bot._sweep["skipped_budget"]),
+                         (1, 1))
+
+    def test_off_does_nothing(self):
+        with mock.patch.object(imm, "SWEEP_BREAKER", "off"):
+            self._fill("o1", 20)
+        self.assertEqual((self._trips(), self.bot._sweep["fills_seen"]), ([], 0))
+
+    def test_a_trip_inside_the_cycle_comes_from_the_tick(self):
+        with mock.patch.object(imm, "WS_CHECK_IN_CYCLE", True):
+            self.feed.events = [("fill", {"order_id": "o1", "market_ticker": self.A,
+                                          "count_fp": "20.00", "is_taker": False})]
+            self.bot._ws_tick_last = 0.0
+            self.bot._ws_cycle_tick()
+        self.assertEqual(len(self._trips()), 1)
+
+
+class TestSweepBreakerCycle(unittest.TestCase):
+    """`on` keeps a held event's quotes out of the cycle; `dry` never does."""
+    T = "KXGOOD-99DEC31-A"
+
+    def _bot(self, mode):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        p = mock.patch.object(imm, "SWEEP_BREAKER", mode)
+        p.start()
+        self.addCleanup(p.stop)
+        bot.run_cycle()
+        bot.state.universe_at = time.time()
+        return bot
+
+    def _mine(self, bot):
+        return [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+
+    def test_on_holds_the_event_out_and_rejoins_after(self):
+        bot = self._bot("on")
+        self.assertTrue(self._mine(bot))
+        bot._sweep_until[bot._event_of(self.T)] = time.time() + 300.0
+        bot.run_cycle()
+        self.assertEqual(self._mine(bot), [])         # pulled for the hold
+        bot._sweep_until[bot._event_of(self.T)] = time.time() - 1.0
+        bot.run_cycle()
+        self.assertTrue(self._mine(bot))               # back after it
+
+    def test_dry_never_changes_the_quotes(self):
+        bot = self._bot("dry")
+        before = sorted((o["book_side"], o["yes_price"]) for o in self._mine(bot))
+        bot._sweep_until[bot._event_of(self.T)] = time.time() + 300.0
+        bot.run_cycle()
+        self.assertEqual(sorted((o["book_side"], o["yes_price"])
+                                for o in self._mine(bot)), before)
+
+
+class TestLatencyCycleAndSweepStatus(unittest.TestCase):
+    def test_the_status_carries_cycle_timing_and_the_breaker(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        t0 = 1_000_000.0
+        for k in range(4):                 # 60s of reads in a 130s cycle, 140s apart
+            s = t0 + 140.0 * k
+            bot._cycle_times.append((s, s + 60.0, s + 130.0))
+        bot._sweep["trips"] = 3
+        bot._sweep_until = {"E1": time.time() + 100, "E2": time.time() - 5}
+        lat = bot._latency_status()
+        self.assertEqual(lat["cycle"], {"n": 4, "reads_s": 60.0, "run_s": 130.0,
+                                        "period_s": 140.0, "last_reads_s": 60.0,
+                                        "last_run_s": 130.0})
+        self.assertEqual((lat["sweep"]["trips"], lat["sweep"]["held_now"],
+                          lat["sweep"]["mode"]), (3, 1, imm.SWEEP_BREAKER))
+        self.assertEqual(lat["ws"]["check_in_cycle"], imm.WS_CHECK_IN_CYCLE)
+
+
 if __name__ == "__main__":
     unittest.main()

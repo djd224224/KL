@@ -33,6 +33,12 @@ The dry check runs only in the bot's ~10s idle between cycles, so a rung that
 went stale mid-cycle is flagged at the next idle -- exactly what the fast
 path as built would see. Fills before the flag are reported, never counted.
 
+It also scores the EVENT SWEEP BREAKER's dry trips (ws_sweep_*.jsonl): each
+trip would have pulled every quote we had in its event for its hold, so
+our fills there in (trip + 2s, trip + hold] are what it would have avoided
+(marked out as above), against the event's modelled reward for the hold
+(pool_per_day x est_frac over the event's quoted markets at the trip).
+
     python ws_stale_score.py                        # every ws_stale file
     python ws_stale_score.py --since 2026-10-04T19:00 --json out.json
 """
@@ -413,6 +419,7 @@ def score(eps: List[dict], fills: Dict[str, List[dict]],
                      sum(1 for v in vals if v is None))
         res.append({
             "ticker": t, "family": _family(t), "order_id": oid, "side": fl["side"],
+            "phase": fl.get("phase") or "idle",
             "px": px, "rem": float(fl["rem"]), "gap_c": fl.get("gap_c"),
             "t0": t0, "end": ev, "stale_s": stale, "replace_s": A,
             "fills_before": sum(float(f["count"]) for f in before),
@@ -451,8 +458,10 @@ def summarize(sc: dict, t_lo: float, t_hi: float) -> dict:
         by_end[r["end"]] += 1
     fam = defaultdict(list)
     gap = defaultdict(list)
+    phase = defaultdict(list)
     for r in eps:
         fam[r["family"]].append(r)
+        phase[r["phase"]].append(r)
         g = r["gap_c"]
         gap["n/a" if g is None else "<=1c" if g <= 1.0 + 1e-9 else "1-3c"
             if g <= 3.0 + 1e-9 else "3-10c" if g <= 10.0 + 1e-9 else ">10c"].append(r)
@@ -467,6 +476,7 @@ def summarize(sc: dict, t_lo: float, t_hi: float) -> dict:
         "fills_before_ct": sum(r["fills_before"] for r in eps),
         "by_family": {k: agg(v) for k, v in fam.items()},
         "by_gap": {k: agg(v) for k, v in gap.items()},
+        "by_phase": {k: agg(v) for k, v in phase.items()},
         "worst": sorted((r for r in eps if r["avoid_n"]),
                         key=lambda r: r["pnl"][HORIZONS[0]])[:10],
     }
@@ -503,6 +513,19 @@ def render(s: dict) -> str:
     if T["reward_unscored"]:
         out += [f"{T['reward_unscored']} episodes had no cycle-log row for their "
                 f"market's pool (reward cost counted as 0).", ""]
+    if s.get("by_phase"):
+        out += ["## By when the check caught it", "",
+                "cycle = the in-cycle check (WS_CHECK_IN_CYCLE); idle = between "
+                "cycles, all the original fast path would see.", "",
+                "| phase | episodes | hit | avoided 5m | avoided 30m | reward | net 30m |",
+                "|---|---|---|---|---|---|---|"]
+        for k in ("cycle", "idle"):
+            v = s["by_phase"].get(k)
+            if v:
+                out.append(f"| {k} | {v['episodes']} | {v['hit']} | "
+                           f"${v[f'avoided_{h5}']:+.2f} | ${v[f'avoided_{h30}']:+.2f} | "
+                           f"${-v['reward_cost']:+.2f} | ${v[f'net_{h30}']:+.2f} |")
+        out.append("")
     out += ["## By family", "", "| family | episodes | hit | ct | avoided 5m | avoided 30m | reward | net 30m |",
             "|---|---|---|---|---|---|---|---|"]
     for k, v in sorted(s["by_family"].items(), key=lambda kv: kv[1][f"net_{h30}"]):
@@ -529,6 +552,137 @@ def render(s: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+
+# ---- event sweep breaker (ws_sweep_*.jsonl) ------------------------------------
+
+SWEEP_LAT = 2.0              # the bot reacts on its WS fill feed within ~1-2s
+
+
+def load_sweeps(d: str, since: Optional[float], until: Optional[float]
+                ) -> List[dict]:
+    out = []
+    for p in _day_files(d, "ws_sweep", ".jsonl"):
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                ts = float(r.get("ts") or 0)
+                if r.get("ev") == "trip" and (since is None or ts >= since) \
+                        and (until is None or ts < until):
+                    out.append(r)
+    out.sort(key=lambda r: float(r["ts"]))
+    return out
+
+
+def load_event_fills(d: str, events) -> Dict[str, List[dict]]:
+    """event -> our maker fills there (each fill_id once), by time."""
+    want = set(events)
+    out: Dict[str, List[dict]] = defaultdict(list)
+    seen = set()
+    for p in _day_files(d, "fills", ".jsonl"):
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                ev = r.get("event_ticker") or str(r.get("ticker", "")).rsplit("-", 1)[0]
+                if ev not in want or r.get("is_taker"):
+                    continue
+                fid = r.get("fill_id")
+                if fid:
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
+                out[ev].append(r)
+    for v in out.values():
+        v.sort(key=lambda r: float(r.get("ts") or 0))
+    return out
+
+
+def score_sweeps(trips: List[dict], efills: Dict[str, List[dict]],
+                 cyc: Dict[str, List[tuple]]) -> List[dict]:
+    """Each trip as if `on`: the event's fills in (t* + SWEEP_LAT, t* + hold]
+    avoided (each fill once), against the event's reward for the hold."""
+    used = set()
+    tsl: Dict[str, List[float]] = {}
+    res = []
+    for tr in trips:
+        t0, ev, hold = float(tr["ts"]), tr["event"], float(tr.get("hold_s") or 0)
+        avoid = [f for f in efills.get(ev, ())
+                 if t0 + SWEEP_LAT < float(f["ts"]) <= t0 + hold
+                 and f.get("fill_id") not in used]
+        used.update(f.get("fill_id") for f in avoid)
+        pnl = {h: 0.0 for h in HORIZONS}
+        unmarked = {h: 0 for h in HORIZONS}
+        for f in avoid:
+            rows = cyc.get(f["ticker"], [])
+            ts = tsl.setdefault(f["ticker"], [r[0] for r in rows])
+            for h in HORIZONS:
+                v = _fill_pnl(f, _mid_after(rows, ts, float(f["ts"]) + h))
+                if v is None:
+                    unmarked[h] += 1
+                else:
+                    pnl[h] += v
+        tickers = {tr["ticker"]} | {x[0] for x in tr.get("pull") or []}
+        rate = 0.0
+        for tk in tickers:
+            rows = cyc.get(tk, [])
+            ts = tsl.setdefault(tk, [r[0] for r in rows])
+            p = _row_at_or_before(rows, ts, t0)
+            if p and p[5] is not None and p[6] is not None:
+                rate += p[5] * p[6]                    # pool_per_day x est_frac
+        res.append({"ts": t0, "event": ev, "family": _family(tr["ticker"]),
+                    "ticker": tr["ticker"], "pulled": len(tr.get("pull") or []),
+                    "hold": hold, "avoid_n": len(avoid),
+                    "avoid_ct": sum(float(f["count"]) for f in avoid),
+                    "pnl": pnl, "unmarked": unmarked,
+                    "cost": rate / 86400.0 * hold})
+    return res
+
+
+def render_sweeps(res: List[dict], hours: float) -> str:
+    if not res:
+        return ""
+    h5, h30 = HORIZONS
+    k = 24.0 / max(hours, 1e-9)
+    cost = sum(r["cost"] for r in res)
+    a5 = -sum(r["pnl"][h5] for r in res)
+    a30 = -sum(r["pnl"][h30] for r in res)
+    hit = sum(1 for r in res if r["avoid_n"])
+    out = ["", f"# Event sweep breaker (dry), scored ({hours:.1f}h)", "",
+           f"{len(res)} trips ({len(res) * k:.0f}/day); {hit} saw our fills in the "
+           f"event inside its hold, {sum(r['avoid_ct'] for r in res):.0f} contracts. "
+           f"Each would have pulled a median "
+           f"{statistics.median([r['pulled'] for r in res]):.0f} order(s).", "",
+           "| | total | per day |", "|---|---|---|",
+           f"| avoided (5m mark-out) | ${a5:+.2f} | ${a5 * k:+.2f} |",
+           f"| avoided (30m mark-out) | ${a30:+.2f} | ${a30 * k:+.2f} |",
+           f"| reward given up (model) | ${-cost:+.2f} | ${-cost * k:+.2f} |",
+           f"| **net, 5m basis** | **${a5 - cost:+.2f}** | **${(a5 - cost) * k:+.2f}** |",
+           f"| **net, 30m basis** | **${a30 - cost:+.2f}** | **${(a30 - cost) * k:+.2f}** |",
+           "", "| family | trips | hit | ct | avoided 30m | reward | net 30m |",
+           "|---|---|---|---|---|---|---|"]
+    fam = defaultdict(list)
+    for r in res:
+        fam[r["family"]].append(r)
+    rows = []
+    for f, rs in fam.items():
+        c = sum(r["cost"] for r in rs)
+        a = -sum(r["pnl"][h30] for r in rs)
+        rows.append((a - c, f, len(rs), sum(1 for r in rs if r["avoid_n"]),
+                     sum(r["avoid_ct"] for r in rs), a, c))
+    for net, f, n, hh, ct, a, c in sorted(rows):
+        out.append(f"| {f} | {n} | {hh} | {ct:.0f} | ${a:+.2f} | ${-c:+.2f} | ${net:+.2f} |")
+    return "\n".join(out) + "\n"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--dir", default=DEFAULT_DIR)
@@ -538,21 +692,33 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     since, until = _parse_when(a.since), _parse_when(a.until)
     eps = load_episodes(a.dir, since, until)
-    if not eps:
-        print("no ws_stale episodes in the window")
+    trips = load_sweeps(a.dir, since, until)
+    if not eps and not trips:
+        print("no ws_stale episodes or ws_sweep trips in the window")
         return 1
-    t_lo = min(float(e["flag"]["ts"]) for e in eps)
-    t_hi = max(float(e["flag"]["ts"]) for e in eps)
-    fills = load_fills(a.dir, {e["flag"]["order_id"] for e in eps})
-    cyc = load_cycle_rows(a.dir, {e["flag"]["ticker"] for e in eps},
-                          t_lo - 3600.0, t_hi + 2 * 3600.0)
-    actions = load_order_actions(a.dir, {e["flag"]["order_id"] for e in eps},
-                                 t_lo - 60.0, t_hi + 2 * 3600.0)
-    s = summarize(score(eps, fills, cyc, actions), since or t_lo, until or t_hi)
-    sys.stdout.write(render(s))
+    stamps = [float(e["flag"]["ts"]) for e in eps] + [float(t["ts"]) for t in trips]
+    t_lo, t_hi = min(stamps), max(stamps)
+    efills = load_event_fills(a.dir, {t["event"] for t in trips}) if trips else {}
+    tickers = {e["flag"]["ticker"] for e in eps} | {t["ticker"] for t in trips} \
+        | {x[0] for t in trips for x in t.get("pull") or []} \
+        | {f["ticker"] for v in efills.values() for f in v}
+    cyc = load_cycle_rows(a.dir, tickers, t_lo - 3600.0, t_hi + 2 * 3600.0)
+    out: dict = {}
+    if eps:
+        fills = load_fills(a.dir, {e["flag"]["order_id"] for e in eps})
+        actions = load_order_actions(a.dir, {e["flag"]["order_id"] for e in eps},
+                                     t_lo - 60.0, t_hi + 2 * 3600.0)
+        s = summarize(score(eps, fills, cyc, actions), since or t_lo, until or t_hi)
+        sys.stdout.write(render(s))
+        out = s
+    if trips:
+        sres = score_sweeps(trips, efills, cyc)
+        hours = max(((until or t_hi) - (since or t_lo)) / 3600.0, 1e-9)
+        sys.stdout.write(render_sweeps(sres, hours))
+        out["sweeps"] = sres
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=1, default=str)
+            json.dump(out, f, indent=1, default=str)
     return 0
 
 

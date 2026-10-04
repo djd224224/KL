@@ -7543,3 +7543,76 @@ episodes). Feed status gains `resyncs`. A trip in the log reads "ALERT
 
 UNCHANGED. Trading still reads REST (IMM_WS=shadow). IMM_WS=on and
 IMM_WS_FAST=1 are still not enabled.
+
+## 2026-10-04 (evening) — in-cycle stale check, event sweep breaker (dry), cycle timing (Jack: "Build these 3")
+
+CONTEXT. First live hour of the episode log: 99 stale rungs flagged, and 1 hit
+before the cycle fixed it itself (median 73s). That hit was a winner. Over the
+4 days to 10/4, full-rung fills lost $141-450/day at 5 min. Most of that was on
+quotes LEVEL with the touch at the bot's last read (-$215/day at 5m: sweeps,
+which no cancel speed fixes). Quotes already AHEAD of the touch cost -$19/day
+at 5m and -$80 at 30m; that is the part a fast cancel can reach. The check
+only ran in the ~10s idle of each 2-4 min cycle. Three builds followed.
+Nothing here changes trading.
+
+1. WS BOOKS ON: READY, NOT FLIPPED. book_depth timing (17:52-18:45Z): a plain
+   cycle spends ~60s of its ~137s median period reading ~1,025 books over
+   REST. The universe-refresh cycles also read ~1,390 candidates over REST,
+   for ~142s, and the feed doesn't cover those. IMM_WS=on serves the managed
+   reads from the feed (1 in 20 audited), so a plain cycle should drop to
+   ~80s, and every stale quote gets fixed about a minute sooner at no reward
+   cost.
+   - Status `latency.cycle`: {n, reads_s (cycle start -> last managed book
+     read, median of the last 30 full cycles), run_s, period_s, last_reads_s,
+     last_run_s}. Before/after for the flip.
+   - The flip: IMM_WS=on in run_incentive_mm.ps1 + restart_imm.ps1 -Task,
+     after the 10/5 health check (task imm-ws-stale-score). Jack's call.
+
+2. EVENT SWEEP BREAKER (SWEEP_BREAKER, default dry). A maker WS fill that
+   takes ALL that was left of our order trips its event: every quote we have
+   there, all markets, both sides, for SWEEP_HOLD_SECS (300).
+   - Sources: the remaining size comes from the resting view, booked down by
+     earlier WS fills, or from the ledger for an order placed this cycle.
+   - dry: ws_sweep_<date>.jsonl `trip` lines (the fill, the event's resting
+     orders it would pull) plus a log line, and no cancels.
+   - on: those orders are cancelled at once on the fast-cancel budget
+     (WS_FAST_MAX_CANCELS_PER_MIN; the cycle's diff pulls any it skips), and
+     `desired` drops the event's quotes until the hold ends (sweep_held(),
+     next to the toxic-halt filter).
+   - Backtest (fills 9/6-10/4, 10,741 maker fills, 2s reaction, net of the
+     event's modelled reward for the hold; per day, 5m / 30m mark-outs):
+     30s +$9/+$10, 2 min +$12/+$18, 5 min +$13/+$26, 10 min +$13/+$25.
+     At 5 min: ~206 trips a day, avoiding ~36% of the book's adverse
+     selection for ~$9 of reward.
+   - Variants: one side only nets ~half. An order-group-style trigger (>= 20
+     contracts in 15s) nets about the same. A 0s exchange-side reaction adds
+     nothing over 2s, so Kalshi order groups aren't needed for this.
+   - The reward cost uses the event's day-average rate, which runs low while
+     the event is active; double it and 30m is still +$17/day.
+   - Script: imm_sweep_backtest.py.
+   - KNOWN GAP: a partial fill that lands between a cycle's resting read and
+     its view rebuild is lost from the rebuilt view. A later fill that clears
+     the rest can then miss its trip, so dry trips may run a little under the
+     backtest. Never a false trip.
+
+3. IN-CYCLE STALE CHECK (WS_CHECK_IN_CYCLE, default on; WS_TICK_SECS 1).
+   _ws_cycle_tick runs the stale check and the sweep breaker inside the
+   cycle, at most once a second. It is called from _read_book and the
+   amend / cancel / place loops, and guards against re-entering itself.
+   - In-cycle, an order this cycle already amended or cancelled is skipped.
+     Its view entry is stale until _build_resting_view at the cycle's end.
+   - Dry as before. Live only with IMM_WS=on + IMM_WS_FAST=1.
+   - An in-cycle cancel is safe for the rest of the cycle: the cycle's own
+     later cancel of it reads 404/409 as done (no cycle error), and an amend
+     of it fails soft, so the next cycle re-places.
+   - Episodes carry phase "cycle" / "idle". ws_stale_score.py splits them,
+     and also scores the sweep trips.
+
+WATCH.
+- Startup lines: "WS stale-quote check (2026-10-04): between cycles AND
+  inside them ..." and "event sweep breaker (2026-10-04): dry -- ...".
+- Log: "sweep breaker (dry): <ticker> BID @ <px>c filled out (<n>) -> would
+  pull <k> order(s) in <event> for 300s".
+- Status latency.sweep: {trips, cancels, skipped_budget, fills_seen,
+  unparsed, unknown_order, mode, hold_s, held_now}. `unparsed` should stay 0;
+  it would mean the WS fill format changed.
