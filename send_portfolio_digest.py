@@ -35,6 +35,10 @@ liquidity rewards already earned are paid out (imm_reward_recon.
 unpaid_estimate: accrual in program periods still running or ended since
 midnight ET yesterday, $1 floor per market per period, x each family's
 paid/modelled ratio). Kalshi has no credits endpoint, so it is a model.
+Under it, the TOTAL PROFIT (since 2026-10-04): the account value less every
+dollar deposited plus every dollar withdrawn since the account opened
+(fetch_transfers: /portfolio/deposits and /portfolio/withdrawals, read in
+full each morning), with the same after-rewards estimate.
 
 State lives in portfolio_daily\:
     pf_snapshot_YYYY-MM-DD.json  - per-event E components (diff baseline)
@@ -127,6 +131,11 @@ def _esc(v) -> str:
 def _pnl_span(v: float) -> str:
     color = C_POS if v > 0.005 else (C_NEG if v < -0.005 else "#777")
     return f'<span style="color:{color}">{v:+,.2f}</span>'
+
+
+def _signed_usd(v: float) -> str:
+    """+$1,234.56 / -$1,234.56."""
+    return f"{'-' if v < -0.005 else '+'}${abs(v):,.2f}"
 
 
 def event_from_ticker(ticker: str) -> str:
@@ -300,24 +309,45 @@ def fetch_fills(client, t0: datetime, t1: datetime):
     return out
 
 
-def fetch_net_transfers(client, t0: datetime, t1: datetime):
-    """Deposits minus withdrawals in (t0, t1] in dollars, or None when either
-    read fails (the day change then lumps them in with credits)."""
-    net = 0.0
+def fetch_transfers(client):
+    """Every deposit and withdrawal since the account opened, as [(ts, $)]:
+    deposits positive, withdrawals negative. None when either read fails:
+    the day change then lumps them in with credits, and the headline has no
+    total profit. Failed, cancelled, rejected and still-pending transfers
+    are left out. On 10/4 that was 12 deposits back to 2026-02-08 and no
+    withdrawals, but every page is read anyway."""
+    out = []
     for path, sign in (("/portfolio/deposits", 1.0), ("/portfolio/withdrawals", -1.0)):
-        try:
-            resp = client.get(path, params={"limit": 200})
-        except Exception as e:
-            log(f"! {path} read failed: {e!r}")
-            return None
-        items = next((v for v in resp.values() if isinstance(v, list)), [])
-        for it in items:
-            ts = it.get("finalized_ts") or it.get("created_ts") or 0
-            status = str(it.get("status") or "").lower()
-            if t0.timestamp() < float(ts) <= t1.timestamp() and \
-                    status not in ("failed", "cancelled", "canceled", "rejected", "pending"):
-                net += sign * _f(it.get("amount_cents")) / 100.0
-    return round(net, 2)
+        cursor = None
+        for _page in range(50):
+            p = {"limit": 200}
+            if cursor:
+                p["cursor"] = cursor
+            try:
+                resp = client.get(path, params=p)
+            except Exception as e:
+                log(f"! {path} read failed: {e!r}")
+                return None
+            items = next((v for v in resp.values() if isinstance(v, list)), [])
+            for it in items:
+                status = str(it.get("status") or "").lower()
+                if status in ("failed", "cancelled", "canceled", "rejected", "pending"):
+                    continue
+                ts = _f(it.get("finalized_ts") or it.get("created_ts"))
+                out.append((ts, sign * _f(it.get("amount_cents")) / 100.0))
+            cursor = resp.get("cursor") or None
+            if not cursor or not items:
+                break
+    return out
+
+
+def sum_transfers(transfers, t0, t1: datetime):
+    """(deposited $, withdrawn $) among fetch_transfers' records with
+    t0 < ts <= t1; t0 None = since the account opened."""
+    lo = float("-inf") if t0 is None else t0.timestamp()
+    amts = [a for ts, a in transfers if lo < ts <= t1.timestamp()]
+    return (round(sum(a for a in amts if a > 0), 2),
+            round(-sum(a for a in amts if a < 0), 2))
 
 
 def side_value(pos: float, mark, cost: float) -> float:
@@ -789,6 +819,19 @@ def build_portfolio(now_utc: datetime):
     account_value = round(equity_kalshi + (perps_equity or 0.0), 2)
     unpaid = estimate_unpaid_rewards(client, now_utc)
 
+    # Total profit (Jack 2026-10-04: "at the top also show total profit,
+    # excluding deposits/withdrawals"): the account value less every dollar
+    # deposited, plus every dollar withdrawn, since the account opened. The
+    # same read splits the day's transfers out of the day change below.
+    transfers = fetch_transfers(client)
+    deposited = withdrawn = total_profit = None
+    if transfers is not None:
+        deposited, withdrawn = sum_transfers(transfers, None, now_utc)
+        total_profit = round(account_value - deposited + withdrawn, 2)
+        log(f"total profit {total_profit:+,.2f} = account value "
+            f"{account_value:,.2f} - deposited {deposited:,.2f} + withdrawn "
+            f"{withdrawn:,.2f}")
+
     snapshot = {"date": today_str,
                 "created_utc": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "cash": round(cash, 2), "positions_value": positions_value,
@@ -799,6 +842,8 @@ def build_portfolio(now_utc: datetime):
                 "perps_positions": (perps or {}).get("positions"),
                 "account_value": account_value,
                 "unpaid_rewards_est": (unpaid or {}).get("total"),
+                "deposited": deposited, "withdrawn": withdrawn,
+                "total_profit": total_profit,
                 "events": {ev: e for ev, e in events_today.items()
                            if ev not in carried_dead},
                 "tickers": ev_tickers,
@@ -856,7 +901,9 @@ def build_portfolio(now_utc: datetime):
                          "value_d": value_d, "value_now": value_now, "note": note,
                          "markets": market_rows(ev, e.get("markets") or {})})
         no_trade_cash = round(cash - _f(prior.get("cash")) - trade_cash, 2)
-        net_transfers = fetch_net_transfers(client, prior_created, now_utc)
+        if transfers is not None:
+            dep, wd = sum_transfers(transfers, prior_created, now_utc)
+            net_transfers = round(dep - wd, 2)
         check = (sum(r["day"] for r in rows) - trade_cash
                  - (sum(v for _, v in tk_end.values()) - sum(v for _, v in start.values())))
         replay_info = {"fills": len(fills), "settlements": len(win_setts),
@@ -905,7 +952,8 @@ def build_portfolio(now_utc: datetime):
             "equity_kalshi": equity_kalshi,
             "perps_equity": perps_equity, "perps": perps,
             "perps_stale": perps_stale, "account_value": account_value,
-            "unpaid": unpaid,
+            "unpaid": unpaid, "deposited": deposited, "withdrawn": withdrawn,
+            "total_profit": total_profit,
             "rows": rows, "snapshot": snapshot, "prior": prior,
             "mark_src": mark_src, "unreadable": unreadable,
             "n_settlements": len(settlements),
@@ -1094,6 +1142,23 @@ def build_email(pf, history, chart_ok: bool, imm=None):
         perps_note = ("" if not pos else " (" + ", ".join(
             f"{p['ticker']} {p['position']:+g}, unrealized {p['unrealized']:+,.2f}"
             for p in pos[:3]) + (f", +{len(pos) - 3} more" if len(pos) > 3 else "") + ")")
+    # Total profit, all time, under the account value (Jack 2026-10-04: "at
+    # the top also show total profit, excluding deposits/withdrawals"). A
+    # failed transfer read says so rather than dropping the line.
+    profit = pf.get("total_profit")
+    if profit is None:
+        profit_txt = ("Total profit n/a today: Kalshi's deposit / withdrawal "
+                      "history did not load")
+        profit_basis = ""
+    else:
+        profit_txt = (f"Total profit {_signed_usd(profit)}"
+                      + ("" if unpaid_total is None else
+                         f"  (est. {_signed_usd(profit + unpaid_total)} after "
+                         f"rewards are paid out)"))
+        withdrawn = _f(pf.get("withdrawn"))
+        profit_basis = (f"account value - ${_f(pf.get('deposited')):,.2f} deposited"
+                        + (f" + ${withdrawn:,.2f} withdrawn" if withdrawn else "")
+                        + ", all time")
     unpaid_note = ("" if unpaid_total is None else
                    f"Rewards earned, not yet paid (est.): ${unpaid_total:,.2f} = the "
                    f"IMM's modelled accrual in {unpaid['market_periods']} program "
@@ -1141,6 +1206,9 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                  f"${pf['kalshi_positions_value']:,.2f}"
                  + ("" if perps_eq is None else
                     f"  +  perpetuals ${perps_eq:,.2f}{perps_note}"))
+    lines.append(profit_txt)
+    if profit_basis:
+        lines.append(f"  =  {profit_basis}")
     if unpaid_note:
         lines.append(unpaid_note)
     if first:
@@ -1209,6 +1277,18 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                 f' <span style="font-size:15px;font-weight:600;color:{C_INK2}">'
                 f'(est. ${acct + unpaid_total:,.2f} after rewards are paid out)</span>')
              + '</div>')
+    if profit is None:
+        h.append(f'<div style="font-size:15px;color:{C_INK2};margin:0 0 4px">'
+                 f'{_esc(profit_txt)}</div>')
+    else:
+        p_col = C_POS if profit > 0.005 else (C_NEG if profit < -0.005 else C_INK)
+        h.append(f'<div style="font-size:22px;font-weight:700;margin:0 0 4px">'
+                 f'Total profit <span style="color:{p_col}">{_signed_usd(profit)}</span>'
+                 + ("" if unpaid_total is None else
+                    f' <span style="font-size:15px;font-weight:600;color:{C_INK2}">'
+                    f'(est. {_signed_usd(profit + unpaid_total)} after rewards are '
+                    f'paid out)</span>')
+                 + '</div>')
     h.append(f'<div style="color:{C_INK2};margin-bottom:6px">'
              f'cash <b>${pf["cash"]:,.2f}</b> &nbsp;&middot;&nbsp; '
              f'open positions <b>${pf["kalshi_positions_value"]:,.2f}</b>'
@@ -1218,6 +1298,8 @@ def build_email(pf, history, chart_ok: bool, imm=None):
              + ("" if unpaid_total is None else
                 f' &nbsp;&middot;&nbsp; rewards earned, not yet paid '
                 f'<b>&asymp; ${unpaid_total:,.2f}</b>')
+             + ("" if not profit_basis else
+                f'<br>total profit = {_esc(profit_basis).replace(" - ", " &minus; ")}')
              + ("" if first else
                 f'<br>day change {_pnl_span(d_equity)} = '
                 + ' &nbsp;+&nbsp; '.join(f'{k.replace("&", "&amp;")} {_pnl_span(v)}'

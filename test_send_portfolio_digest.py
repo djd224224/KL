@@ -494,6 +494,107 @@ class PerpsAndRewardsTests(unittest.TestCase):
         self.assertEqual(back[0]["unpaid_rewards_est"], 1829.4)
 
 
+class _FakeTransfersClient:
+    """/portfolio/deposits over two pages and /portfolio/withdrawals, shaped
+    as Kalshi returned them on 2026-10-04."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = []
+
+    def get(self, path, params=None):
+        self.calls.append((path, dict(params or {})))
+        if self.fail and path == "/portfolio/withdrawals":
+            raise RuntimeError("HTTP 503")
+        if path == "/portfolio/deposits":
+            if not (params or {}).get("cursor"):
+                return {"deposits": [
+                    {"amount_cents": 250000, "status": "applied", "type": "debit",
+                     "created_ts": 1770584924, "finalized_ts": 1770584924},
+                    {"amount_cents": 50000, "status": "pending", "type": "apm",
+                     "created_ts": 1791122652, "finalized_ts": 0}],
+                    "cursor": "page2"}
+            return {"deposits": [
+                {"amount_cents": 350000, "status": "applied", "type": "apm",
+                 "created_ts": 1791036240, "finalized_ts": 1791036240},
+                {"amount_cents": 99900, "status": "failed", "type": "apm",
+                 "created_ts": 1791036300, "finalized_ts": 1791036300}]}
+        if path == "/portfolio/withdrawals":
+            return {"withdrawals": [
+                {"amount_cents": 100000, "status": "applied",
+                 "created_ts": 1791000000, "finalized_ts": 1791000060}]}
+        raise AssertionError(path)
+
+
+class TotalProfitTests(unittest.TestCase):
+    """Jack 2026-10-04: "in my daily portfolio email, at the top also show
+    total profit, excluding deposits/withdrawals"."""
+
+    def test_transfers_read_every_page_and_only_what_moved_money(self):
+        c = _FakeTransfersClient()
+        tr = pf.fetch_transfers(c)
+        self.assertEqual(sorted(tr), [(1770584924.0, 2500.0), (1791000060.0, -1000.0),
+                                      (1791036240.0, 3500.0)])
+        self.assertEqual(c.calls[1], ("/portfolio/deposits", {"limit": 200, "cursor": "page2"}))
+
+    def test_transfer_read_failure_is_none(self):
+        self.assertIsNone(pf.fetch_transfers(_FakeTransfersClient(fail=True)))
+
+    def test_sums_all_time_and_in_a_window(self):
+        from datetime import datetime, timezone
+        tr = pf.fetch_transfers(_FakeTransfersClient())
+        now = datetime.fromtimestamp(1791122700, timezone.utc)
+        self.assertEqual(pf.sum_transfers(tr, None, now), (6000.0, 1000.0))
+        # the day window: only the 10/3 deposit after the prior morning
+        t0 = datetime.fromtimestamp(1791000060, timezone.utc)
+        self.assertEqual(pf.sum_transfers(tr, t0, now), (3500.0, 0.0))
+        self.assertEqual(pf.sum_transfers(tr, None, t0), (2500.0, 1000.0))
+
+    def _pf(self, profit=6624.95, deposited=16000.0, withdrawn=0.0, unpaid=1829.4):
+        p = PerpsAndRewardsTests._pf(self, unpaid=unpaid)
+        p.update(total_profit=profit, deposited=deposited, withdrawn=withdrawn)
+        return p
+
+    def test_headline_has_total_profit_under_the_account_value(self):
+        subject, text, html = pf.build_email(self._pf(), [], chart_ok=True)
+        self.assertIn("Account value $22,624.95  (est. $24,454.35 after rewards are paid out)\n"
+                      "  =  cash $10,000.00", text)
+        self.assertIn("Total profit +$6,624.95  (est. +$8,454.35 after rewards are paid out)\n"
+                      "  =  account value - $16,000.00 deposited, all time\n", text)
+        self.assertLess(text.index("Total profit"), text.index("Biggest movers"))
+        self.assertIn(f'Total profit <span style="color:{pf.C_POS}">+$6,624.95</span>', html)
+        self.assertIn("(est. +$8,454.35 after rewards are paid out)", html)
+        self.assertIn("total profit = account value &minus; $16,000.00 deposited, all time", html)
+        # right under the account value, above its cash / positions line and the chart
+        self.assertLess(html.index("Account value $22,624.95"), html.index("Total profit"))
+        self.assertLess(html.index("Total profit"), html.index("cash <b>"))
+        self.assertLess(html.index("Total profit"), html.index("cid:balancechart"))
+        self.assertNotIn("profit", subject)
+
+    def test_a_loss_and_withdrawals(self):
+        _, text, html = pf.build_email(
+            self._pf(profit=-1234.5, withdrawn=2500.0, unpaid=None), [], chart_ok=False)
+        self.assertIn("Total profit -$1,234.50\n", text)
+        self.assertIn("account value - $16,000.00 deposited + $2,500.00 withdrawn, all time",
+                      text)
+        self.assertIn(f'<span style="color:{pf.C_NEG}">-$1,234.50</span>', html)
+        self.assertNotIn("after rewards are paid out", html)
+
+    def test_unreadable_transfers_say_so(self):
+        _, text, html = pf.build_email(self._pf(profit=None, deposited=None), [],
+                                       chart_ok=False)
+        self.assertIn("Total profit n/a today: Kalshi's deposit / withdrawal history "
+                      "did not load", text)
+        self.assertIn("Total profit n/a today", html)
+        self.assertNotIn("all time", text)
+        self.assertNotIn("total profit =", html)
+
+    def test_signed_usd(self):
+        self.assertEqual(pf._signed_usd(13138.5), "+$13,138.50")
+        self.assertEqual(pf._signed_usd(-0.5), "-$0.50")
+        self.assertEqual(pf._signed_usd(-0.004), "+$0.00")
+
+
 class ImmSectionTests(unittest.TestCase):
     """Jack 2026-10-02: "cut it as a standalone email and add it into the
     Kalshi portfolio ... email" -- the IMM digest is a section of this one."""
