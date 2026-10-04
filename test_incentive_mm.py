@@ -17628,6 +17628,93 @@ class TestNflPropGate(unittest.TestCase):
         bids, _asks = self._ungated("0.4000", "0.4900")  # the 40 / 51 book
         self.assertGreaterEqual(max(bids), 38)           # the old behaviour
 
+class TestNflFantasyLadderCutoff(unittest.TestCase):
+    """Jack 2026-10-04: "So block fantasy ladders 90min before kickoff to align
+    to when inactive reports come out". A fantasy ladder pays YES $0 when the
+    player never takes a snap (FFPTSSCALAR: deemed 0.0 points), while the
+    receptions / yards ladders and escalators resolve at the last fair price
+    before the news -- so only KXNFLFFPTSLADDER moves its cutoff to kickoff -
+    90; the rest of the family keeps kickoff - EVENT_START_BUFFER_MIN."""
+
+    KICKOFF = datetime(2067, 10, 6, 0, 15, tzinfo=timezone.utc)
+    FAMILY = ("KXNFLFFPTSLADDER", "KXNFLLADDERRECYDS", "KXNFLESCALATORREC",
+              "KXNBAFFPTSLADDER")
+
+    def setUp(self):
+        _clean_persist()
+        overrides = dict(imm.SERIES_OVERRIDES)
+        self.addCleanup(lambda: (imm.SERIES_OVERRIDES.clear(),
+                                 imm.SERIES_OVERRIDES.update(overrides)))
+        for s_ in self.FAMILY:
+            imm.SERIES_OVERRIDES.pop(s_, None)
+        saved = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        self.addCleanup(lambda: setattr(imm, "SERIES_HOUR_MULTS", saved))
+
+    def test_only_the_nfl_fantasy_ladder_takes_the_90(self):
+        self.assertEqual(imm.NFL_FFPTS_START_BUFFER_MIN, 90)
+        self.assertTrue(imm.nfl_ffpts_series("KXNFLFFPTSLADDER"))
+        for s_ in ("KXNFLLADDERREC", "KXNFLESCALATORREC", "KXNBAFFPTSLADDER",
+                   "KXGOOD"):
+            self.assertFalse(imm.nfl_ffpts_series(s_), s_)
+        for s_ in self.FAMILY:
+            imm.ensure_family_override(s_)
+        arch = imm.SERIES_OVERRIDES["KXNFLLADDERREC"]
+        self.assertIsNone(arch.start_buffer_min)
+        ff = imm.SERIES_OVERRIDES["KXNFLFFPTSLADDER"]
+        self.assertEqual(ff.start_buffer_min, 90)
+        # every other guard is still the family's
+        self.assertEqual(dataclasses.replace(ff, start_buffer_min=None), arch)
+        for s_ in ("KXNFLLADDERRECYDS", "KXNFLESCALATORREC", "KXNBAFFPTSLADDER"):
+            self.assertEqual(imm.SERIES_OVERRIDES[s_], arch, s_)
+
+    def test_knob(self):
+        with mock.patch.object(imm, "NFL_FFPTS_START_BUFFER_MIN", 120):
+            imm.ensure_family_override("KXNFLFFPTSLADDER")
+        self.assertEqual(imm.SERIES_OVERRIDES["KXNFLFFPTSLADDER"].start_buffer_min,
+                         120)
+
+    def _selected_cutoff(self, ticker):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": ticker, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[ticker] = {
+            "ticker": ticker, "event_ticker": ticker.rsplit("-", 1)[0],
+            "status": "active", "close_time": "2067-10-08T00:15:00Z",
+            "yes_bid_dollars": "0.2400", "yes_ask_dollars": "0.2500",
+            "volume_fp": "500.00"}
+        client.books[ticker] = {"orderbook_fp": {
+            "yes_dollars": [["0.2200", "400"], ["0.2300", "400"], ["0.2400", "400"]],
+            "no_dollars": [["0.7300", "400"], ["0.7400", "400"], ["0.7500", "400"]]}}
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=client, live=False)
+        kick = {"events": [{
+            "date": self.KICKOFF.strftime("%Y-%m-%dT%H:%MZ"),
+            "shortName": "ATL @ NO",
+            "status": {"type": {"name": "STATUS_SCHEDULED"}},
+            "competitions": [{"competitors": [
+                {"team": {"abbreviation": "NO", "location": "New Orleans"},
+                 "homeAway": "home"},
+                {"team": {"abbreviation": "ATL", "location": "Atlanta"},
+                 "homeAway": "away"}]}]}]}
+        bot.resolver = imm.EventStartResolver(http_get_json=lambda url: kick)
+        bot.run_cycle()
+        self.assertIn(ticker, bot.state.selected)
+        return bot.state.selected[ticker].cutoff
+
+    def test_the_selection_cutoff(self):
+        self.assertEqual(
+            self._selected_cutoff("KXNFLFFPTSLADDER-67OCT05ATLNO-ATLBROBINSON7"),
+            self.KICKOFF - timedelta(minutes=90))
+        self.assertEqual(
+            self._selected_cutoff("KXNFLLADDERREC-67OCT05ATLNO-ATLBROBINSON7"),
+            self.KICKOFF - timedelta(minutes=imm.EVENT_START_BUFFER_MIN))
+
+
 class TestGuardSkipSink(unittest.TestCase):
     """guard_skips_*.jsonl (2026-09-26): a market an in-loop guard skips wrote
     no cycle_log row that cycle, so what the guard saw was lost. Change-driven:

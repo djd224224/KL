@@ -6933,3 +6933,34 @@ Tests: test_nfl_prop_fair.py (14: payout tables, distributions, the EWMA,
 tickers / names / rosters, the snapshot, the watch end to end with caching),
 TestNflPropGate (fail-closed reasons, caps, the Robinson night end to end,
 kill switch); the suite neutralises the gate at import. 1,968 green.
+
+## 2026-10-04 — NFL fantasy ladders stop quoting 90 minutes before kickoff, when the inactive list posts (Jack)
+
+Jack: "So block fantasy ladders 90min before kickoff to align to when
+inactive reports come out", after the question whether a market cancels
+when the player is inactive.
+
+THE CONTRACT TERMS (assets.kalshi.com/contract_terms, read 2026-10-04):
+- FFPTSSCALAR.pdf (KXNFLFFPTSLADDER): a player Sleeper gives no figure
+  (bye, did not play, inactive, removed) is deemed to have scored 0.0
+  points -- YES pays $0, NO $1. A surprise inactive is a total loss for YES.
+- FOOTBALLENTITYSCALARSTAT.pdf (the receptions / yards ladders and
+  escalators): a player who takes no snap resolves at the Exchange's last
+  fair price, which may be the last trade before the non-participation
+  became known or reasonably anticipated. One snap and it settles on the
+  real stats.
+- No precedent yet: every one of the 602 props settled through 10/1 had a
+  stat line. McLaurin (Doubtful 10/3 14:42Z, reported out) would be first.
+
+CHANGE. NFL_FFPTS_START_BUFFER_MIN (IMM_NFL_FFPTS_START_BUFFER_MIN, 90):
+ensure_family_override sets start_buffer_min on the KXNFLFFPTSLADDER clone
+of the KXNFLLADDERREC archetype (nfl_ffpts_series: NFL + FFPTS), so the
+selection cutoff is kickoff - 90 where the rest of the family keeps kickoff
+- EVENT_START_BUFFER_MIN (30); the estimator window, the screen and
+imm_quote_gaps read the same override. Orphan-restored positions already
+stop at the ticker-date fallback. Positions ride past the cutoff, as with
+every cutoff.
+
+Tests: TestNflFantasyLadderCutoff (only the NFL fantasy ladder takes the 90,
+every other guard still the family's; the knob; a cycle's selection cutoff
+kickoff - 90 vs - 30 for a receptions ladder). 1,982 green.

@@ -5457,6 +5457,26 @@ SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     size_mult=_env_float("IMM_SPORTS_LADDER_SIZE_MULT", 5.0),
     unwind_full_position=os.environ.get("IMM_SPORTS_LADDER_UNWIND_FULL", "1") == "1")
 
+# NFL FANTASY LADDERS OUT 90 MIN BEFORE KICKOFF (Jack 2026-10-04: "So block
+# fantasy ladders 90min before kickoff to align to when inactive reports come
+# out"). NFL inactives post ~90 minutes before kickoff, and Kalshi's two
+# contract families treat a player who never takes a snap differently
+# (contract terms read 2026-10-04): FFPTSSCALAR deems him to have scored 0.0
+# points -- YES pays $0, a total loss for a YES holder -- while
+# FOOTBALLENTITYSCALARSTAT (the receptions / yards ladders and escalators)
+# resolves at the Exchange's last fair price from before the news. So only
+# the fantasy ladder moves its cutoff, from kickoff - EVENT_START_BUFFER_MIN
+# (30) to kickoff - NFL_FFPTS_START_BUFFER_MIN, set as start_buffer_min on
+# the family clone (ensure_family_override): the selection cutoff, the
+# estimator's window, the screen and imm_quote_gaps all read it from there.
+# Orphan-restored positions already stop at the ticker-date fallback.
+NFL_FFPTS_START_BUFFER_MIN = _env_int("IMM_NFL_FFPTS_START_BUFFER_MIN", 90)
+
+
+def nfl_ffpts_series(series: str) -> bool:
+    """An NFL fantasy-points ladder ('KXNFLFFPTSLADDER')."""
+    return sports_ladder_league(series) == "NFL" and "FFPTS" in series
+
 # ELECTION archetype (Jack 2026-09-28, see ELECTION_SERIES): "expand range to
 # quote between 1 and 99" -- price_min/max, which member_price_band, the quote
 # loop, the estimator's quotable sides and the extreme_mid screen all read.
@@ -5737,6 +5757,10 @@ def ensure_family_override(series: str) -> None:
             # $2/day rate floor (Jack 2026-09-27: "drop the $2/day floor"):
             # the $1-per-period payout floor still decides entry.
             ov = replace(ov, min_est_per_day=GB_STATE_MIN_RATE)
+        if parent == "KXNFLLADDERREC" and nfl_ffpts_series(series):
+            # NFL fantasy ladders stop at the inactive list, not kickoff - 30
+            # (Jack 2026-10-04, see NFL_FFPTS_START_BUFFER_MIN)
+            ov = replace(ov, start_buffer_min=NFL_FFPTS_START_BUFFER_MIN)
         SERIES_OVERRIDES[series] = ov
         log(f"[IMM] {series}: family override inherited from {parent}")
         return
