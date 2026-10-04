@@ -513,6 +513,63 @@ class TestExchangeBody(unittest.TestCase):
             self.assertAlmostEqual(ex.free_cash(2), 569.8724)
 
 
+class TestPnl(unittest.TestCase):
+    def test_settlement_and_marks(self):
+        self.assertEqual(sb.settlement_cents({"status": "settled",
+                                              "settlement_value_dollars": "0.2875"}), 28.75)
+        self.assertIsNone(sb.settlement_cents({"status": "active",
+                                               "settlement_value_dollars": "0.2875"}))
+        self.assertEqual(sb.settlement_cents({"status": "finalized", "result": "no"}), 0.0)
+        self.assertEqual(sb.mark_cents({"yes_bid_dollars": "0.2000",
+                                        "yes_ask_dollars": "0.3000"}), 25.0)
+        self.assertEqual(sb.mark_cents({"yes_bid_dollars": "0.2000"}), 20.0)
+        self.assertIsNone(sb.mark_cents({}))
+        # sold 50 at 34c, settled 15c: +$9.50 less the fee
+        self.assertAlmostEqual(sb.trade_pnl("sell", 50, 34.0, 0.5, 15.0), 9.0)
+        self.assertAlmostEqual(sb.trade_pnl("buy", 10, 10.0, 0.1, 19.0), 0.8)
+
+    def test_report_from_paper_rows(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        rows = [
+            {"ts": "2026-10-04T16:42:00+00:00", "ticker": "A", "player": "a", "side": "sell",
+             "count": 60, "dry": True, "filled": 60, "avg_cents": 30.0, "fair": 15.0,
+             "expected_net_cents": 13.5},
+            {"ts": "2026-10-04T16:43:00+00:00", "ticker": "B", "player": "b", "side": "sell",
+             "count": 300, "dry": True, "filled": 300, "avg_cents": 20.0, "fair": 10.0,
+             "expected_net_cents": 8.9},
+            {"ts": "2026-10-04T16:44:00+00:00", "ticker": "C", "dry": False, "filled": 9,
+             "side": "sell", "avg_cents": 5.0},                 # a live row: not paper
+        ]
+        with open(os.path.join(d, "orders_2026-10-04.jsonl"), "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        trades = sb.load_trades(d, "paper")
+        self.assertEqual([t["ticker"] for t in trades], ["A", "B"])
+        mk = {"A": {"status": "settled", "settlement_value_dollars": "0.1000"},
+              "B": {"status": "active", "yes_bid_dollars": "0.1800",
+                    "yes_ask_dollars": "0.2200"}}
+        rep = sb.pnl_report(trades, lambda t: mk[t], default_cap=100.0)
+        a, b = rep["rows"]
+        fee_a = 60 * sb.fee_cents(30.0) / 100
+        self.assertAlmostEqual(a["pnl"], 60 * 0.20 - fee_a)
+        self.assertTrue(a["settled"])
+        self.assertTrue(a["in_default_cap"])                    # $42 of risk
+        self.assertFalse(b["settled"])
+        self.assertAlmostEqual(b["value_cents"], 20.0)
+        self.assertFalse(b["in_default_cap"])                   # +$240 > $100
+        self.assertEqual(rep["all"]["settled"], 1)
+        self.assertEqual(rep["all"]["open"], 1)
+        self.assertEqual(rep["default_cap"]["trades"], 1)
+        self.assertAlmostEqual(rep["all"]["settled_expected"], 60 * 0.135, places=2)
+
+    def test_parse_until(self):
+        self.assertEqual(sb.parse_until("2026-10-05T00:06Z"),
+                         datetime(2026, 10, 5, 0, 6, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(sb.parse_until("1791000000"), 1791000000.0)
+        self.assertIsNone(sb.parse_until(None))
+
+
 class TestConfig(unittest.TestCase):
     def test_from_env(self):
         c = sb.Config.from_env({"SNIPE_LIVE": "1", "SNIPE_MAX_RISK_TOTAL": "500",

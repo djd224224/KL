@@ -80,6 +80,8 @@ and cooldowns behave as they would live. --live sends orders.
     python nfl_snipe_bot.py --live             # trades (subaccount 0)
     python nfl_snipe_bot.py --live --subaccount 1
     python nfl_snipe_bot.py --report           # the live and paper books
+    python nfl_snipe_bot.py --pnl paper        # P&L of the trades vs settlement
+    python nfl_snipe_bot.py --until 2026-10-05T00:06Z   # stop at that time
     python nfl_snipe_bot.py --setup            # subaccount setup steps
 Every threshold is also an env var: SNIPE_<FIELD> (SNIPE_MAX_RISK_TOTAL=500).
 Halt: create run-logs/nfl-snipe/HALT (no orders while it exists).
@@ -1109,6 +1111,156 @@ class SingleInstance:
         return True
 
 
+# ---------------------------------------------------------------------- P&L
+
+SETTLED_STATUSES = ("settled", "finalized", "determined")
+
+
+def settlement_cents(m: dict) -> Optional[float]:
+    """A settled market's YES payout in cents (its settlement value; a
+    binary's result), None while it is not settled."""
+    if str(m.get("status") or "").lower() not in SETTLED_STATUSES:
+        return None
+    for key, scale in (("settlement_value_dollars", 100.0), ("settlement_value", 1.0)):
+        v = m.get(key)
+        if v in (None, ""):
+            continue
+        try:
+            return round(float(v) * scale, 4)
+        except (TypeError, ValueError):
+            continue
+    r = str(m.get("result") or "").lower()
+    return 100.0 if r == "yes" else 0.0 if r == "no" else None
+
+
+def mark_cents(m: dict) -> Optional[float]:
+    """An unsettled market's mid (one side or the last trade when that is
+    all there is)."""
+    b, a = _px(m, "yes_bid_dollars"), _px(m, "yes_ask_dollars")
+    if b is not None and a is not None:
+        return (a + b) / 2.0
+    for v in (b, a, _px(m, "last_price_dollars")):
+        if v is not None:
+            return v
+    return None
+
+
+def trade_pnl(side: str, n: float, avg_cents: float, fee: float,
+              value_cents: float) -> float:
+    """Dollars a trade makes against a YES value (settlement or mark)."""
+    edge = (avg_cents - value_cents) if side == "sell" else (value_cents - avg_cents)
+    return n * edge / 100.0 - fee
+
+
+def load_trades(log_dir: str, mode: str) -> List[dict]:
+    """The bot's trades in time order: the dry-run orders rows (`paper`) or
+    the fills rows (`live`), across every day's log."""
+    import glob
+    name = "orders" if mode == "paper" else "fills"
+    out = []
+    for path in sorted(glob.glob(os.path.join(log_dir, f"{name}_*.jsonl"))):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if mode == "paper" and not r.get("dry"):
+                    continue
+                n = float(r.get("filled") or 0.0)
+                if n <= 0:
+                    continue
+                avg = float(r.get("avg_cents") or 0.0)
+                fee = (float(r["fee"]) if r.get("fee") is not None
+                       else n * fee_cents(avg) / 100.0)
+                out.append({"ts": r.get("ts"), "ticker": r["ticker"],
+                            "player": r.get("player") or "", "side": r["side"],
+                            "n": n, "avg_cents": avg, "fee": fee,
+                            "fair": r.get("fair"),
+                            "exp_net_cents": r.get("expected_net_cents"),
+                            "kickoff": r.get("kickoff")})
+    out.sort(key=lambda r: str(r["ts"]))
+    return out
+
+
+def pnl_report(trades: List[dict], get_market: Callable[[str], dict],
+               default_cap: float = 250.0) -> dict:
+    """Each trade valued at its market's settlement (or, unsettled, at the
+    mid), and totals -- all trades and the first ones that fit the default
+    $250 risk cap (what the live defaults would have taken)."""
+    cache: Dict[str, dict] = {}
+    rows, cum = [], 0.0
+    for tr in trades:
+        t = tr["ticker"]
+        if t not in cache:
+            try:
+                cache[t] = get_market(t) or {}
+            except Exception:                            # noqa: BLE001
+                cache[t] = {}
+        m = cache[t]
+        settle = settlement_cents(m)
+        value = settle if settle is not None else mark_cents(m)
+        risk = tr["n"] * risk_per_contract(tr["side"], tr["avg_cents"])
+        cum += risk
+        rows.append({**tr, "risk": risk, "settled": settle is not None,
+                     "value_cents": value,
+                     "pnl": (trade_pnl(tr["side"], tr["n"], tr["avg_cents"],
+                                       tr["fee"], value) if value is not None else None),
+                     "expected": (tr["n"] * tr["exp_net_cents"] / 100.0
+                                  if tr.get("exp_net_cents") is not None else None),
+                     "in_default_cap": cum <= default_cap + 1e-6})
+
+    def total(rs: List[dict]) -> dict:
+        done = [r for r in rs if r["settled"] and r["pnl"] is not None]
+        open_ = [r for r in rs if not r["settled"]]
+        return {"trades": len(rs), "settled": len(done),
+                "settled_pnl": round(sum(r["pnl"] for r in done), 2),
+                "settled_risk": round(sum(r["risk"] for r in done), 2),
+                "settled_expected": round(sum(r["expected"] or 0.0 for r in done), 2),
+                "won": sum(1 for r in done if r["pnl"] > 0),
+                "open": len(open_),
+                "open_marked_pnl": round(sum(r["pnl"] or 0.0 for r in open_), 2)}
+
+    return {"rows": rows, "all": total(rows),
+            "default_cap": total([r for r in rows if r["in_default_cap"]])}
+
+
+def print_pnl(rep: dict, mode: str) -> None:
+    print(f"\n{mode} trades: P&L at settlement (open ones at the mid)")
+    print(f"{'ticker':56s} {'player':20s} {'side':4s} {'n':>5s} {'@':>7s} "
+          f"{'value':>7s} {'P&L $':>8s} {'exp $':>7s}  state")
+    for r in rep["rows"]:
+        val = f"{r['value_cents']:.2f}" if r["value_cents"] is not None else "-"
+        pnl = f"{r['pnl']:+.2f}" if r["pnl"] is not None else "-"
+        exp = f"{r['expected']:+.2f}" if r["expected"] is not None else "-"
+        state = "settled" if r["settled"] else "OPEN (mid)"
+        cap = "" if r["in_default_cap"] else "  past $250"
+        print(f"{r['ticker']:56s} {r['player'][:20]:20s} {r['side']:4s} {r['n']:5.0f} "
+              f"{r['avg_cents']:7.2f} {val:>7s} {pnl:>8s} {exp:>7s}  {state}{cap}")
+    for key, label in (("all", "all trades"), ("default_cap", "inside the $250 default cap")):
+        tt = rep[key]
+        ror = (tt["settled_pnl"] / tt["settled_risk"]) if tt["settled_risk"] else 0.0
+        print(f"\n{label}: {tt['settled']}/{tt['trades']} settled, "
+              f"P&L ${tt['settled_pnl']:+.2f} on ${tt['settled_risk']:.2f} at risk "
+              f"({ror:+.1%}), {tt['won']} won; expected ${tt['settled_expected']:+.2f}; "
+              f"{tt['open']} open, marked ${tt['open_marked_pnl']:+.2f}")
+
+
+def parse_until(v: Optional[str]) -> Optional[float]:
+    """--until: an ISO time (UTC when no zone) or epoch seconds."""
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    v = v.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(v)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 # --------------------------------------------------------------------- CLI
 
 SETUP_TEXT = """\
@@ -1157,6 +1309,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--sides", choices=("sell", "buy", "both"), default=None)
     ap.add_argument("--max-risk-total", type=float, default=None)
     ap.add_argument("--report", action="store_true", help="print the books and exit")
+    ap.add_argument("--pnl", choices=("paper", "live"), default=None,
+                    help="P&L of the paper / live trades against settlement")
+    ap.add_argument("--until", default=None,
+                    help="stop scanning at this time (ISO, UTC) or epoch")
     ap.add_argument("--setup", action="store_true", help="subaccount setup steps")
     ap.add_argument("--log-dir", default=LOG_DIR)
     args = ap.parse_args(argv)
@@ -1166,6 +1322,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.report:
         report(args.log_dir)
         return 0
+    if args.pnl:
+        from kalshi_reads import kalshi_get
+
+        def get_market(t: str) -> dict:
+            return (kalshi_get(f"/markets/{t}", None, prefer="public") or {}).get("market") or {}
+
+        rep = pnl_report(load_trades(args.log_dir, args.pnl), get_market)
+        print_pnl(rep, args.pnl)
+        write_json(os.path.join(args.log_dir, f"pnl_{args.pnl}.json"),
+                   {"at": _utc().isoformat(), **rep})
+        return 0
+    until = parse_until(args.until)
     cfg = Config.from_env()
     if args.live:
         cfg.live = True
@@ -1203,6 +1371,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as ex:                          # noqa: BLE001
             bot.log(f"! scan failed: {type(ex).__name__}: {str(ex)[:300]}")
         if args.once:
+            return 0
+        if until is not None and time.time() >= until:
+            bot.log(f"--until {args.until} reached; stopping")
             return 0
         try:
             time.sleep(max(1.0, cfg.scan_secs - (time.time() - t0)))
