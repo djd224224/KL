@@ -16160,6 +16160,10 @@ class IncentiveMarketMaker:
             meta.est_frac = meta.est_dollars_per_day = 0.0
             meta.yield_per_contract = 0.0
             return True
+        # the universe refresh reads ~1,400 candidate books over REST (40-140s):
+        # without a tick here our WS fills waited it out (10/4 21:01Z: two
+        # sweep trips logged 37s after their fills)
+        self._ws_cycle_tick()
         try:
             ob = self.client.get_orderbook(ticker=meta.ticker)
         except Exception:

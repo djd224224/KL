@@ -7631,6 +7631,10 @@ followed. Nothing here changes trading.
      next check covers every market, not only the books that changed. Without
      it, a quote ahead from its placement on a book that then went quiet was
      never examined.
+   - REFRESH TICK (same evening): _estimate_candidate_yield ticks before each
+     REST candidate read. The universe refresh (~1,400 reads, 40-140s every
+     10 min) used to hold our WS fills: two sweep trips at 21:01Z were logged
+     37s after their fills.
 
 WATCH.
 - Startup lines: "WS stale-quote check (2026-10-04): between cycles AND

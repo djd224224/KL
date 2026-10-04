@@ -20982,6 +20982,28 @@ class TestWSInCycleCheck(unittest.TestCase):
         self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
         self.assertFalse(self.bot._ws_recheck_all)
 
+    def test_the_universe_refresh_ticks_from_its_candidate_reads(self):
+        # 10/4 21:01Z: two sweep trips logged 37s after their fills, queued
+        # behind the refresh's ~1,400 REST candidate reads
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        inside = {"on": False, "ticks": 0}
+        real_refresh = bot.refresh_universe
+
+        def refresh(*a, **kw):
+            inside["on"] = True
+            try:
+                return real_refresh(*a, **kw)
+            finally:
+                inside["on"] = False
+        bot.refresh_universe = refresh
+
+        def tick():
+            if inside["on"]:
+                inside["ticks"] += 1
+        bot._ws_cycle_tick = tick
+        bot.run_cycle()                                # the first cycle refreshes
+        self.assertGreaterEqual(inside["ticks"], 1)
+
     def test_the_tick_is_throttled_and_never_reenters(self):
         calls = []
         self.bot._ws_process_events = lambda now_ts, in_cycle=False: \
