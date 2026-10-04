@@ -7373,3 +7373,32 @@ queue. 42 books outside the band; recent form, news, siblings and the
 ratio guard leave ~2-16 to take.
 
 Tests: test_nfl_snipe_bot (28), TestSnipeBookNetOut (2).
+
+## 2026-10-04 — ladder / escalator asks: ON over $4,000, OFF under $2,000 (Jack)
+
+Jack, the same evening: "above $4k open up all ESCALATOR/LADDERS, below $2k
+turn off the ask side just like you did today". The one-way $4k latch
+(afd288b) is now a two-way switch with a band:
+
+- Free cash at or over SPORTS_LADDER_ASKS_ON_CASH ($4,000) turns the asks
+  on; under SPORTS_LADDER_ASKS_OFF_CASH ($2,000, env IMM_SPORTS_LADDER_ASKS_
+  OFF_CASH) turns them off (series_bid_only again: no ask rungs, no ask
+  pad, no full-unwind ask -- a long rides; resting asks go at the next
+  requote); between the two the last state holds. 0 = the old one-way latch.
+- THE CASH IS THE IMM'S SHARD'S: ladder_cash() reads exchange_index 0 of
+  the balance breakdown (10/4 16:05Z: $1,292 of the $1,862 total; the
+  crypto bots' shard-2 cash cannot back a ladder order), the cross-shard
+  balance_dollars only when the read has no breakdown. The balance floor
+  still uses the total.
+- Each switch: state.ladder_asks_on_at (0 = off, persisted), a log line,
+  a digest alert (ladder_asks_on / ladder_asks_off, not urgent).
+
+Also in this deploy: b122e65 (cherry-picked) -- the IMM nets the NFL
+sniper's subaccount-0 live book out of the account's positions, and a
+refused placement logs Kalshi's reason (e.body / error_body). A numbered
+subaccount's sniper book (snipe_book_sub<N>.json, "subaccount": N) is never
+netted: its positions are not in the primary's read.
+
+Tests: TestLadderAsksCashLatch (band both ways, the shard's cash, the 0
+knob), TestSnipeBookNetOut (a subaccount's book), test_nfl_snipe_bot
+TestBookFile. 2,046 green.

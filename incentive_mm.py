@@ -3449,19 +3449,47 @@ SPORTS_LADDER_PRICE_MAX_EXACT = _env_float("IMM_SPORTS_LADDER_PRICE_MAX_EXACT", 
 # account's free cash ran $1.5-3.8k that morning against ~$83k of planned
 # ladder collateral, and 42k of the day's 52k rejects were asks. The first
 # balance read (_check_balance_floor, every full live cycle) that finds
-# free cash (balance_dollars) at or over SPORTS_LADDER_ASKS_ON_CASH turns
-# the asks back on -- a ONE-WAY latch, as asked: persisted as
-# state.ladder_asks_on_at so a restart keeps it, never undone by a later dip
-# (asks off again: IMM_SPORTS_LADDER_ASKS_ON_CASH=0, which ignores the
-# latch, or clear the field). Logged and emailed when it fires.
+# free cash at or over SPORTS_LADDER_ASKS_ON_CASH turns the asks back on --
+# built as a one-way latch, made two-way the same evening (below). Persisted
+# as state.ladder_asks_on_at so a restart keeps it; IMM_SPORTS_LADDER_ASKS_
+# ON_CASH=0 ignores the switch (asks stay off). Logged and in the digest.
 SPORTS_LADDER_ASKS_ON_CASH = _env_float("IMM_SPORTS_LADDER_ASKS_ON_CASH", 4000.0)
-# when the latch fired (epoch), mirrored from state.ladder_asks_on_at
+# TWO-WAY, WITH A BAND (Jack 2026-10-04, the same evening: "above $4k open up
+# all ESCALATOR/LADDERS, below $2k turn off the ask side just like you did
+# today"). Free cash at or over SPORTS_LADDER_ASKS_ON_CASH turns the asks on;
+# under SPORTS_LADDER_ASKS_OFF_CASH turns them off again (bids only, as on
+# 10/4: no ask rungs, no ask pad, no full-unwind ask -- a long rides; the
+# resting asks go at the next requote); in between the last state holds, so
+# a $50 move cannot flap it. The cash is the IMM's own exchange shard's
+# (exchange_index 0 in the balance breakdown): the crypto bots' shard-2 cash
+# cannot back a ladder order (10/4: $1,292 of the $1,862 total) -- the
+# cross-shard total only when the read carries no breakdown. Each switch is
+# persisted (state.ladder_asks_on_at, 0 = off), logged and in the digest.
+# IMM_SPORTS_LADDER_ASKS_OFF_CASH=0 makes it the old one-way latch.
+SPORTS_LADDER_ASKS_OFF_CASH = _env_float("IMM_SPORTS_LADDER_ASKS_OFF_CASH", 2000.0)
+# when the asks last came on (epoch; None = off), mirrored from
+# state.ladder_asks_on_at
 _LADDER_ASKS_STATE: dict = {"on_at": None}
 
 
 def ladder_asks_relatched() -> bool:
-    """True once free cash reached SPORTS_LADDER_ASKS_ON_CASH (the latch)."""
+    """True while the cash switch has the asks on (SPORTS_LADDER_ASKS_ON_CASH)."""
     return SPORTS_LADDER_ASKS_ON_CASH > 0 and _LADDER_ASKS_STATE.get("on_at") is not None
+
+
+def ladder_cash(b: dict) -> Optional[float]:
+    """The IMM's shard's free cash from a /portfolio/balance read (dollars):
+    exchange_index 0 of balance_breakdown, else the cross-shard total."""
+    for row in b.get("balance_breakdown") or []:
+        try:
+            if int(row.get("exchange_index", -1)) == 0:
+                return float(row.get("balance"))
+        except (TypeError, ValueError):
+            continue
+    try:
+        return float(b.get("balance_dollars"))
+    except (TypeError, ValueError):
+        return None
 # ESPN scoreboard path per league prefix. site.web.api.espn.com: the
 # site.api host started answering 403 "Access Denied" to the browser UA in
 # 2026-09 (measured 2026-09-24 for nfl / wnba / cfb alike), this host serves
@@ -6399,10 +6427,13 @@ SNIPE_BOOK_FILE = os.environ.get(
 
 
 def load_snipe_book(path: Optional[str] = None) -> Dict[str, float]:
-    """ticker -> the sniper's signed YES position ({} when there is none)."""
+    """ticker -> the sniper's signed YES position ({} when there is none, or
+    when the book is a numbered subaccount's -- never in the primary's read)."""
     try:
         with open(path or SNIPE_BOOK_FILE, encoding="utf-8") as f:
             js = json.load(f)
+        if int(js.get("subaccount") or 0) != 0:
+            return {}
         return {str(t): float(v) for t, v in (js.get("positions") or {}).items()
                 if abs(float(v)) > 1e-9}
     except (OSError, ValueError, TypeError, AttributeError):
@@ -16223,26 +16254,41 @@ class IncentiveMarketMaker:
             self._save_persist()
 
     def _ladder_asks_latch(self, cash: float, now_utc: datetime) -> bool:
-        """Turn the ladder / escalator asks back on the first time free cash
-        reaches SPORTS_LADDER_ASKS_ON_CASH (Jack 2026-10-04: "once cash is
-        over $4k, turn on the full ladder/escalator again"). One-way and
-        persisted; True when it fires this call."""
+        """The ladder / escalator asks' cash switch: on at or over
+        SPORTS_LADDER_ASKS_ON_CASH (Jack 2026-10-04: "once cash is over $4k,
+        turn on the full ladder/escalator again"), off again under
+        SPORTS_LADDER_ASKS_OFF_CASH ("below $2k turn off the ask side just
+        like you did today"), unchanged in between. `cash` is the IMM's
+        shard's (ladder_cash). Persisted; True when it switches this call."""
         if not (SPORTS_LADDER_ASKS_OFF and SPORTS_LADDER_ASKS_ON_CASH > 0):
             return False
-        if _LADDER_ASKS_STATE.get("on_at") is not None:
-            return False
-        if cash < SPORTS_LADDER_ASKS_ON_CASH:
-            return False
         ts = now_utc.timestamp()
-        _LADDER_ASKS_STATE["on_at"] = ts
-        self.state.ladder_asks_on_at = ts
+        if _LADDER_ASKS_STATE.get("on_at") is None:
+            if cash < SPORTS_LADDER_ASKS_ON_CASH:
+                return False
+            _LADDER_ASKS_STATE["on_at"] = ts
+            self.state.ladder_asks_on_at = ts
+            self._save_persist()
+            off = (f"off again under ${SPORTS_LADDER_ASKS_OFF_CASH:,.0f}"
+                   if SPORTS_LADDER_ASKS_OFF_CASH > 0 else "one-way")
+            msg = (f"sports ladders / escalators: ASKS BACK ON -- free cash "
+                   f"${cash:,.0f} reached ${SPORTS_LADDER_ASKS_ON_CASH:,.0f}; "
+                   f"the family quotes both sides from this cycle ({off})")
+            log(f"{self.tag} {msg}")
+            self.alerter.alert("ladder_asks_on", msg, key="ladder_asks_on",
+                               urgent=False)
+            return True
+        if SPORTS_LADDER_ASKS_OFF_CASH <= 0 or cash >= SPORTS_LADDER_ASKS_OFF_CASH:
+            return False
+        _LADDER_ASKS_STATE["on_at"] = None
+        self.state.ladder_asks_on_at = 0.0
         self._save_persist()
-        msg = (f"sports ladders / escalators: ASKS BACK ON -- free cash "
-               f"${cash:,.0f} reached ${SPORTS_LADDER_ASKS_ON_CASH:,.0f}; the "
-               f"family quotes both sides again from this cycle (one-way: "
-               f"IMM_SPORTS_LADDER_ASKS_ON_CASH=0 turns them off again)")
+        msg = (f"sports ladders / escalators: ASKS OFF -- free cash "
+               f"${cash:,.0f} fell under ${SPORTS_LADDER_ASKS_OFF_CASH:,.0f}; "
+               f"YES bids only from this cycle (resting asks cancelled, longs "
+               f"ride) until it reaches ${SPORTS_LADDER_ASKS_ON_CASH:,.0f}")
         log(f"{self.tag} {msg}")
-        self.alerter.alert("ladder_asks_on", msg, key="ladder_asks_on",
+        self.alerter.alert("ladder_asks_off", msg, key="ladder_asks_off",
                            urgent=False)
         return True
 
@@ -16258,7 +16304,8 @@ class IncentiveMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! balance read failed ({e}); floor check skipped")
             return False
-        self._ladder_asks_latch(cash, now_utc)
+        lc = ladder_cash(b)
+        self._ladder_asks_latch(cash if lc is None else lc, now_utc)
         if value is None:
             log(f"{self.tag} ! balance read carried no portfolio_value; floor check skipped")
             return False
@@ -19357,15 +19404,19 @@ class IncentiveMarketMaker:
             log("sports ladders / escalators: OFF (pattern-blocked, "
                 "IMM_SPORTS_LADDER_BLOCK=1) -- no orders, positions ride")
         elif SPORTS_LADDER_ASKS_OFF and ladder_asks_relatched():
-            log("sports ladders / escalators: asks back ON since "
+            log("sports ladders / escalators: asks ON since "
                 + datetime.fromtimestamp(_LADDER_ASKS_STATE["on_at"],
                                          timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-                + f" (free cash reached ${SPORTS_LADDER_ASKS_ON_CASH:,.0f})")
+                + f" (free cash reached ${SPORTS_LADDER_ASKS_ON_CASH:,.0f}"
+                + (f"; off again under ${SPORTS_LADDER_ASKS_OFF_CASH:,.0f})"
+                   if SPORTS_LADDER_ASKS_OFF_CASH > 0 else ")"))
         elif SPORTS_LADDER_ASKS_OFF:
             log("sports ladders / escalators: YES BIDS ONLY (asks off, "
                 "IMM_SPORTS_LADDER_ASKS_OFF=1) -- no ask rungs, no ask pad, "
-                "no full-unwind ask -- until free cash reaches "
-                f"${SPORTS_LADDER_ASKS_ON_CASH:,.0f}"
+                "no full-unwind ask -- until free cash (the IMM's shard) "
+                f"reaches ${SPORTS_LADDER_ASKS_ON_CASH:,.0f}"
+                + (f", off again under ${SPORTS_LADDER_ASKS_OFF_CASH:,.0f}"
+                   if SPORTS_LADDER_ASKS_OFF_CASH > 0 else "")
                 if SPORTS_LADDER_ASKS_ON_CASH > 0 else
                 "sports ladders / escalators: YES BIDS ONLY (asks off, "
                 "IMM_SPORTS_LADDER_ASKS_OFF=1)")

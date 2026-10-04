@@ -112,7 +112,7 @@ from nfl_prop_snipe import implied_mu, taker_fee_cents
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.environ.get("SNIPE_LOG_DIR",
                          os.path.join(HERE, "run-logs", "nfl-snipe"))
-BOOK_FILE = "snipe_book.json"            # live: incentive_mm nets it out
+BOOK_FILE = "snipe_book.json"            # live, subaccount 0: the IMM nets it out
 PAPER_BOOK_FILE = "snipe_book_paper.json"
 STATUS_FILE = "snipe_status.json"
 WATCH_FILE = "watch_status.json"         # ESPN designations seen, across restarts
@@ -392,8 +392,9 @@ class SnipeBook:
     contracts and net YES premium paid (dollars). Persisted; the IMM nets
     `positions` out of the account's (live book only)."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, subaccount: int = 0):
         self.path = path
+        self.subaccount = int(subaccount)
         self.d: Dict[str, Any] = {"positions": {}, "cost": {}, "fees": {},
                                   "player": {}, "kickoff": {}, "last_trade": {},
                                   "fills": [], "closed": [],
@@ -480,6 +481,8 @@ class SnipeBook:
 
     def save(self) -> None:
         self.d["ts"] = time.time()
+        # the IMM nets only a subaccount-0 book out of the account's positions
+        self.d["subaccount"] = self.subaccount
         write_json(self.path, self.d)
 
 
@@ -838,8 +841,7 @@ class Sniper:
         self.watch = watch or nf.NflPropWatch(get_json=_signed_get_json,
                                               cache_dir=_seed_cache(log_dir))
         self.kick = kick or KickoffResolver()
-        self.book = SnipeBook(os.path.join(
-            log_dir, BOOK_FILE if cfg.live else PAPER_BOOK_FILE))
+        self.book = SnipeBook(os.path.join(log_dir, book_file(cfg)), cfg.subaccount)
         self.noted: Dict[Tuple[str, str], float] = {}
         self.scans = 0
         self._restore_watch()
@@ -1068,6 +1070,15 @@ class Sniper:
         except OSError as ex:
             self.log(f"! status write failed: {ex}")
         return out
+
+
+def book_file(cfg: Config) -> str:
+    """The book's file: the paper book, the live book the IMM reads
+    (subaccount 0), or a numbered subaccount's own (the IMM never reads it
+    -- its positions are not in the primary's)."""
+    if not cfg.live:
+        return PAPER_BOOK_FILE
+    return BOOK_FILE if not cfg.subaccount else f"snipe_book_sub{cfg.subaccount}.json"
 
 
 def _seed_cache(log_dir: str) -> str:

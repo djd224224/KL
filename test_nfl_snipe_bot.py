@@ -481,6 +481,19 @@ class TestScan(unittest.TestCase):
         self.assertEqual(len(ex.placed), 3)
 
 
+class TestBookFile(unittest.TestCase):
+    def test_which_file(self):
+        self.assertEqual(sb.book_file(cfg()), sb.PAPER_BOOK_FILE)
+        self.assertEqual(sb.book_file(cfg(live=True)), sb.BOOK_FILE)
+        self.assertEqual(sb.book_file(cfg(live=True, subaccount=3)), "snipe_book_sub3.json")
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        b = sb.SnipeBook(os.path.join(d, "x.json"), subaccount=3)
+        b.save()
+        with open(os.path.join(d, "x.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["subaccount"], 3)
+
+
 class TestExchangeBody(unittest.TestCase):
     def test_place_ioc_body(self):
         sent = {}

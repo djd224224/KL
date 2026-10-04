@@ -18062,6 +18062,9 @@ class TestSnipeBookNetOut(unittest.TestCase):
             fh.write("{not json")
         self.assertEqual(imm.load_snipe_book(p), {})               # unreadable
         with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"positions": {self.T: -60, "Z": 0}, "subaccount": 2}, fh)
+        self.assertEqual(imm.load_snipe_book(p), {})               # a subaccount's
+        with open(p, "w", encoding="utf-8") as fh:
             json.dump({"positions": {self.T: -60, "Z": 0}}, fh)
         self.assertEqual(imm.load_snipe_book(p), {self.T: -60.0})
         bot = imm.IncentiveMarketMaker(client=FakeClient(), live=False)
@@ -18235,12 +18238,31 @@ class TestLadderAsksCashLatch(unittest.TestCase):
         self.assertEqual(len(msgs), 1)
         self.assertIn("ASKS BACK ON", msgs[0])
         self.assertIn("$4,000", msgs[0])
-        # one-way: a dip does not turn them off, nor alert again
-        bot.client.get_balance = lambda: _bal(150.0, 20000.0)
+        # TWO-WAY (Jack: "below $2k turn off the ask side"): a dip inside
+        # the $2k-$4k band keeps them on, no new alert ...
+        bot.client.get_balance = lambda: _bal(2000.0, 20000.0)
         bot._check_balance_floor(now)
         self.assertFalse(imm.series_bid_only(self.S))
         self.assertEqual(len([1 for c, _m in bot.alerter.today
                               if c == "ladder_asks_on"]), 1)
+        # ... under $2k turns them off, persisted and alerted ...
+        bot.client.get_balance = lambda: _bal(1999.0, 20000.0)
+        bot._check_balance_floor(now)
+        self.assertTrue(imm.series_bid_only(self.S))
+        self.assertEqual(bot.state.ladder_asks_on_at, 0.0)
+        offs = [m for c, m in bot.alerter.today if c == "ladder_asks_off"]
+        self.assertEqual(len(offs), 1)
+        self.assertIn("ASKS OFF", offs[0])
+        self.assertIn("$2,000", offs[0])
+        # ... and back over $4k turns them on again
+        bot.client.get_balance = lambda: _bal(3999.0, 20000.0)
+        bot._check_balance_floor(now)
+        self.assertTrue(imm.series_bid_only(self.S))          # the band holds
+        bot.client.get_balance = lambda: _bal(4100.0, 20000.0)
+        bot._check_balance_floor(now)
+        self.assertFalse(imm.series_bid_only(self.S))
+        self.assertEqual(len([1 for c, _m in bot.alerter.today
+                              if c == "ladder_asks_on"]), 2)
         # the quake family stays bid-only whatever the latch says
         with mock.patch.object(imm, "QUAKE_ENABLE", True):
             self.assertTrue(imm.series_bid_only(next(iter(imm.QUAKE_SERIES))))
@@ -18254,6 +18276,32 @@ class TestLadderAsksCashLatch(unittest.TestCase):
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertGreater(bot2.state.ladder_asks_on_at, 0.0)
         self.assertFalse(imm.series_bid_only(self.S))
+
+    def test_cash_is_the_imm_shards(self):
+        # 10/4 16:05Z: $1,863 across shards, $1,293 of it on shard 0 (the
+        # IMM's); the crypto shard's cash cannot back a ladder order
+        b = {"balance_dollars": "1863.2765", "portfolio_value": 3123959,
+             "balance_breakdown": [{"balance": "1293.4041", "exchange_index": 0},
+                                   {"balance": "569.8724", "exchange_index": 2}]}
+        self.assertAlmostEqual(imm.ladder_cash(b), 1293.4041)
+        self.assertAlmostEqual(imm.ladder_cash(_bal(4200.0, 1.0)), 4200.0)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        rich_total = dict(b, balance_dollars="4500.0000",
+                          balance_breakdown=[{"balance": "1500.0", "exchange_index": 0},
+                                             {"balance": "3000.0", "exchange_index": 2}])
+        bot.client.get_balance = lambda: rich_total
+        bot._check_balance_floor(datetime.now(timezone.utc))
+        self.assertTrue(imm.series_bid_only(self.S))         # $1.5k on shard 0
+
+    def test_off_knob_zero_is_the_one_way_latch(self):
+        with mock.patch.object(imm, "SPORTS_LADDER_ASKS_OFF_CASH", 0.0):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            now = datetime.now(timezone.utc)
+            bot.client.get_balance = lambda: _bal(4000.0, 20000.0)
+            bot._check_balance_floor(now)
+            bot.client.get_balance = lambda: _bal(100.0, 20000.0)
+            bot._check_balance_floor(now)
+            self.assertFalse(imm.series_bid_only(self.S))     # stays on
 
     def test_knob_zero_keeps_bids_only(self):
         with mock.patch.object(imm, "SPORTS_LADDER_ASKS_ON_CASH", 0.0):
