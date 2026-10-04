@@ -37,10 +37,14 @@ RECENT FORM, A SECOND OPINION. The model's mean is a long EWMA (8-game
 half-life, prior seasons at half weight), slow to see a role that grew:
 on 10/4 Matthew Golden's yards ladder sat at 96 yds against a model mean
 of 51 -- and his last four games were 84, 95, 58, 100. So the band a book
-must clear is the WIDER of the model's and one built the same way (x0.7 /
-x1.5) on the mean of the player's last recent_games (4) games, and the
-edge is measured against the less favourable of the two fairs. A book
-outside both is stale or wrong under either reading of the player.
+must clear is the WIDER of the model's and one built the same way on the
+mean of the player's last 4 games, and the edge is measured against the
+less favourable of the two fairs. A book outside both is stale or wrong
+under either reading of the player. Since 10/4 18:00Z (Jack: "apply the
+recent-form band to the sniper too") the recent band is nfl_prop_fair's
+own (fair_recent / _lo / _hi, RECENT_GAMES), the one the IMM's gate
+quotes inside -- the same width rule too (x0.5 / x2 under 8 games of
+history, x0.7 / x1.5 otherwise) -- so the two bots read a player alike.
 
 THE PRICE. An order's limit is the WORST price it accepts (it sweeps every
 level at or better than it). A sell's limit is the lowest price on the
@@ -651,28 +655,32 @@ class Signal:
 
 def recent_mean(games: List[dict], stat: str, k: int) -> Optional[float]:
     """The mean of the stat over the player's last k games (negative yards
-    as 0, like the model); None under 3 games."""
-    sm = nf.STAT_MODEL[stat]
-    clip = not sm["discrete"] and stat != "ffpts"
-    vals = []
-    for g in games[-k:]:
-        v = g.get(sm["col"])
-        if v is None or v == "":
-            continue
-        v = float(v)
-        vals.append(max(0.0, v) if clip else v)
-    return sum(vals) / len(vals) if len(vals) >= 3 else None
+    as 0, like the model); None under 3 games. nfl_prop_fair's."""
+    return nf.recent_mean(games, stat, k)
 
 
 def recent_band(m: dict, e: dict, mean: float) -> Tuple[float, float, float]:
     """(fair, lo, hi) in cents with the recent mean in the model's place:
-    the same payout, the same x BAND_LO / x BAND_HI band, the entry's
-    teammate multiplier applied."""
+    nfl_prop_fair.fair_band -- the same payout and the same band width rule
+    (wide under FULL_GAMES of history) -- the entry's teammate multiplier
+    applied. What market_entry stores as fair_recent / _lo / _hi."""
     spec = nf.payout_spec(m, e["stat"], e["kind"])
     mu = mean * float(e.get("team_mult") or 1.0)
-    f, lo, hi = (nf.expected_payout(spec, x) * 100.0
-                 for x in (mu, mu * nf.BAND_LO, mu * nf.BAND_HI))
-    return f, lo, hi
+    f, lo, hi = nf.fair_band(spec, mu, int(e.get("n_games") or 0))
+    return f * 100.0, lo * 100.0, hi * 100.0
+
+
+def entry_recent(m: dict, e: dict, games: Optional[List[dict]],
+                 k: int) -> Tuple[Optional[float], Optional[Tuple[float, float, float]]]:
+    """(recent mean, (fair, lo, hi) cents) for an entry: the model's own
+    fields (fair_recent / _lo / _hi -- the band the IMM's gate uses), else
+    computed from the player's games the same way; (None, None) under 3."""
+    if e.get("fair_recent_lo") is not None and e.get("fair_recent_hi") is not None:
+        return (e.get("recent_mean"),
+                (float(e["fair_recent"]) * 100.0, float(e["fair_recent_lo"]) * 100.0,
+                 float(e["fair_recent_hi"]) * 100.0))
+    rm = recent_mean(games, e["stat"], k) if games else None
+    return rm, (recent_band(m, e, rm) if rm is not None else None)
 
 
 def find_signal(t: str, m: dict, e: Optional[dict], cfg: Config,
@@ -881,11 +889,10 @@ class Sniper:
             e = entries.get(t)
             if find_signal(t, m, e, cfg) is None:
                 continue                 # inside the model's band: no look
-            rmean = None
-            if index is not None and e.get("pid") in index.games:
-                rmean = recent_mean(index.games[e["pid"]], e["stat"], cfg.recent_games)
-            sig = find_signal(t, m, e, cfg, recent=(
-                recent_band(m, e, rmean) if rmean is not None else None))
+            games = (index.games.get(e.get("pid"))
+                     if index is not None and e.get("pid") is not None else None)
+            rmean, rband = entry_recent(m, e, games, cfg.recent_games)
+            sig = find_signal(t, m, e, cfg, recent=rband)
             if sig is None:
                 out["skips"]["recent_form"] += 1
                 continue

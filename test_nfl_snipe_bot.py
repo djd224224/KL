@@ -209,6 +209,31 @@ class TestSignal(unittest.TestCase):
         self.assertEqual(s.side, "sell")
         self.assertAlmostEqual(s.model_fair, 15.37)
 
+    def test_recent_band_width_follows_the_model(self):
+        # under FULL_GAMES of history the model's band is the WIDE one, and
+        # so is the recent band (Jeremiyah Love, a rookie, 10/4)
+        m = market(t="KXNFLLADDERRSHYDS-26OCT04ARINYG-ARIJLOVE4", bid=31, ask=99)
+        rookie = entry(stat="rshyds", mu=52.2, fair=13.05, lo=6.53, hi=26.11, n_games=3)
+        f, lo, hi = sb.recent_band(m, rookie, 53.3)
+        self.assertAlmostEqual(hi, 53.3 * nf.WIDE_HI * 0.25, places=1)  # $0.0025/yd
+        self.assertAlmostEqual(lo, 53.3 * nf.WIDE_LO * 0.25, places=1)
+        vet = dict(rookie, n_games=30)
+        self.assertAlmostEqual(sb.recent_band(m, vet, 53.3)[2], 53.3 * nf.BAND_HI * 0.25,
+                               places=1)
+
+    def test_entry_recent_prefers_the_models_fields(self):
+        m = market(bid=34, ask=98)
+        e = entry(recent_mean=3.75, fair_recent=0.1875, fair_recent_lo=0.13,
+                  fair_recent_hi=0.40)
+        rm, band = sb.entry_recent(m, e, [{"receptions": 9}] * 4, 4)
+        self.assertEqual(rm, 3.75)                         # not the games' 9
+        self.assertEqual(band, (18.75, 13.0, 40.0))
+        e2 = entry()                                        # no model fields
+        rm, band = sb.entry_recent(m, e2, [{"receptions": v} for v in (3, 3, 4, 5)], 4)
+        self.assertEqual(rm, 3.75)
+        self.assertAlmostEqual(band[2], 3.75 * nf.BAND_HI * 5.0, places=2)
+        self.assertEqual(sb.entry_recent(m, e2, None, 4), (None, None))
+
     def test_recent_mean_clips_and_needs_three(self):
         self.assertEqual(sb.recent_mean([{"rushing_yards": -4}, {"rushing_yards": 10},
                                          {"rushing_yards": 20}], "rshyds", 4), 10.0)
@@ -451,6 +476,15 @@ class TestScan(unittest.TestCase):
         with mock.patch.object(sb, "IMM_STATUS_FILE", imm):
             b, ex = self.bot()
             self.assertEqual(b.scan(NOW)["skips"], {"team_news": 1})
+
+    def test_scan_uses_the_models_recent_band(self):
+        # the entry's own recent band (top 40c) covers the 34c book: no trade,
+        # whatever the watch's games would say (3/3/4/5 -> top 28c)
+        b, ex = self.bot(entries={T: entry(recent_mean=8.0, fair_recent=0.40,
+                                           fair_recent_lo=0.28, fair_recent_hi=0.60)})
+        out = b.scan(NOW)
+        self.assertEqual(out["skips"], {"recent_form": 1})
+        self.assertEqual(ex.placed, [])
 
     def test_recent_form_skip_counts(self):
         games = {entry()["pid"]: [{"receptions": v} for v in (7, 8, 6, 7)]}
