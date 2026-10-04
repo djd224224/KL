@@ -7936,3 +7936,18 @@ Tests: TestSnowMonthlyGate (allowlist + pattern + other snow contracts out,
 guards, cutoff, every reason incl. snowing / drying / the stale reason / caps,
 end to end), test_snow_monthly_fair.py (13), dashboard family "Snow
 monthlies".
+
+### 2026-10-04 night — Snow monthlies and the period-rain family at x2 size (Jack)
+
+Jack: "2x snow markets, and rain ones like napa". After the 23:09Z restart
+the Napa season's books were 5-13k contracts deep at the touch and only T15
+($2.02) and T20 ($1.81) projected over the $1.50 payout floor; T10/T25/T30/
+T35 read $0.94-1.26 and sat out. RAIN_PERIOD_SIZE_MULT (KXRAINNAPAM,
+KXRAINNYCW and every cloned period series) and SNOW_MONTHLY_SIZE_MULT (the
+ten KX<CITY>SNOWM and clones), both 2.0, on the size_mult wire: rungs x2,
+per-market cap 150 -> 300 net, per-event cap 1,000 -> 2,000, and the floor
+projection sees the doubled ladder. Still "daily" (no quiet-hours, Saturday
+or yield size); the KXRAIN 7pm-01:59 ET halving still applies to the rain
+family (evenings x1). The KXRAIN<CITY>M monthlies are unchanged (x1).
+Revert: IMM_RAIN_PERIOD_SIZE_MULT=1.0 / IMM_SNOW_MONTHLY_SIZE_MULT=1.0
+(env => restart_imm.ps1 -Task).

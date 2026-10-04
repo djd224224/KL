@@ -10850,6 +10850,16 @@ class TestRainPeriodGate(unittest.TestCase):
             self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90), s)
             self.assertEqual(ov.cutoff_from_close_min, 1560, s)
             self.assertIsNone(ov.cutoff_before_event_min, s)
+            # x2 (Jack 2026-10-04 night: "2x snow markets, and rain ones like
+            # napa"): rungs, the per-market and per-event caps together
+            self.assertEqual(ov.size_mult, 2.0, s)
+            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            self.assertEqual(imm.series_max_position(s), imm.MAX_POSITION_CONTRACTS * 2, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-01NOV26-31MAR27"),
+                             imm.MAX_EVENT_CONTRACTS * 2, s)
+            self.assertEqual([q for _t, q in imm.base_scaled_levels(s)],
+                             [max(1, int(q * 2 + 0.5)) for _t, q in imm.series_levels(s)], s)
+        self.assertIn("RAIN_PERIOD_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
         # a new city clones the archetype at first sight; a rainstorm city
         # still takes the span archetype (out at the start date)
         for s in ("KXRAINSONOMAM", "KXRAINSCHI"):
@@ -11049,6 +11059,10 @@ class TestSnowMonthlyGate(unittest.TestCase):
             ov = imm.series_override(s)
             self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90), s)
             self.assertEqual(ov.cutoff_from_close_min, 1560, s)
+            # x2 (Jack 2026-10-04 night: "2x snow markets")
+            self.assertEqual(ov.size_mult, 2.0, s)
+            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            self.assertEqual(imm.series_max_position(s), imm.MAX_POSITION_CONTRACTS * 2, s)
             # with the rain monthlies: x1 at every hour, no Saturday/yield
             self.assertTrue(imm.is_daily_series(s), s)
             self.assertFalse(imm.yield_size_eligible(s), s)
@@ -11062,7 +11076,8 @@ class TestSnowMonthlyGate(unittest.TestCase):
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXCHISNOWM", "KXCHISNOWM-26DEC", None, utc(2027, 1, 1, 5, 59)),
             utc(2026, 12, 31, 3, 59))
-        for k in ("SNOW_MONTHLY_ENABLE", "SNOW_MONTHLY_TOL_CENTS", "SNOW_MONTHLY_CAP"):
+        for k in ("SNOW_MONTHLY_ENABLE", "SNOW_MONTHLY_TOL_CENTS", "SNOW_MONTHLY_CAP",
+                  "SNOW_MONTHLY_SIZE_MULT"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
         import imm_risk_controls
         self.assertIn("snow_monthly", imm_risk_controls.GATE_GUARDS)

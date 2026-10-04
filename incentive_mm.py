@@ -925,6 +925,17 @@ RAIN_PERIOD_ENABLE = os.environ.get("IMM_RAIN_PERIOD_ENABLE", "1") == "1"
 RAIN_PERIOD_ARCHETYPE = "KXRAINNAPAM"
 RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN = _env_int(
     "IMM_RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN", 1560)
+# x2 FAMILY SIZE (Jack 2026-10-04 night: "2x snow markets, and rain ones like
+# napa"): at x1 the Napa season's books (5-13k contracts at the touch by
+# 23:10Z) left T10/T25/T30/T35 projecting $0.94-1.26, under the $1.50
+# payout floor, and T15/T20 ~$2. The size_mult wire doubles the rungs, the
+# per-market cap (150 -> 300 net) and the per-event cap (1,000 -> 2,000)
+# together, and the floor projection sees the doubled ladder. As "daily"
+# KXRAIN the family still takes no quiet-hours / Saturday / yield size, and
+# the KXRAIN 7pm-01:59 ET halving brings the evenings back to x1. The
+# snow monthlies take the same x2 (SNOW_MONTHLY_SIZE_MULT).
+# IMM_RAIN_PERIOD_SIZE_MULT=1.0 reverts (env => task-level restart).
+RAIN_PERIOD_SIZE_MULT = _env_float("IMM_RAIN_PERIOD_SIZE_MULT", 2.0)
 
 
 def rain_period_ticker(ticker: str) -> bool:
@@ -954,7 +965,8 @@ def rain_period_family_series(series: str) -> bool:
 SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE] = SeriesOverride(
     price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
     price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
-    cutoff_from_close_min=RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN)
+    cutoff_from_close_min=RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN,
+    size_mult=RAIN_PERIOD_SIZE_MULT)
 SERIES_OVERRIDES["KXRAINNYCW"] = SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE]
 
 # UNDATED-TICKER GUARD SET for the five series allowed in code on
@@ -7013,10 +7025,11 @@ _CONFIG_CODE_KNOBS = (
     "RAIN_MONTHLY_DRY_MIN", "RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN",
     # period rain totals (2026-10-04) on the same file and gate
     "RAIN_PERIOD_ENABLE", "RAIN_PERIOD_TOL_CENTS", "RAIN_PERIOD_CAP",
-    "RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN",
+    "RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN", "RAIN_PERIOD_SIZE_MULT",
     # monthly snow gate (2026-10-04); model knobs ride in its file's "model"
     "SNOW_MONTHLY_ENABLE", "SNOW_MONTHLY_TOL_CENTS", "SNOW_MONTHLY_TTL_MIN",
     "SNOW_MONTHLY_DRY_MIN", "SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN", "SNOW_MONTHLY_CAP",
+    "SNOW_MONTHLY_SIZE_MULT",
     # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
     "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
@@ -8487,11 +8500,16 @@ SNOW_MONTHLY_CAP = os.environ.get("IMM_SNOW_MONTHLY_CAP", "1") == "1"
 SNOW_MONTHLY_FILE = os.environ.get(
     "IMM_SNOW_MONTHLY_FILE", os.path.join(STATUS_DIR, "snow_monthly_fair.json"))
 _snow_monthly_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+# x2 FAMILY SIZE (Jack 2026-10-04 night: "2x snow markets, and rain ones like
+# napa"; see RAIN_PERIOD_SIZE_MULT): rungs, per-market cap 300 and per-event
+# cap 2,000 net together. IMM_SNOW_MONTHLY_SIZE_MULT=1.0 reverts.
+SNOW_MONTHLY_SIZE_MULT = _env_float("IMM_SNOW_MONTHLY_SIZE_MULT", 2.0)
 
 SERIES_OVERRIDES[SNOW_MONTHLY_ARCHETYPE] = SeriesOverride(
     price_min_cents=_env_int("IMM_SNOW_PRICE_MIN", 5),
     price_max_cents=_env_int("IMM_SNOW_PRICE_MAX", 90),
-    cutoff_from_close_min=SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN)
+    cutoff_from_close_min=SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN,
+    size_mult=SNOW_MONTHLY_SIZE_MULT)
 for _s in SNOW_MONTHLY_SERIES:
     SERIES_OVERRIDES[_s] = SERIES_OVERRIDES[SNOW_MONTHLY_ARCHETYPE]
 
