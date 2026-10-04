@@ -55,13 +55,21 @@ class ScanGraduateTests(unittest.TestCase):
 class CutSeriesTests(unittest.TestCase):
 
     def test_kpi_food_and_aaa_maxmin_are_frozen(self):
-        for t in ("KXBA-26OCTDELIV-T50", "KXHOOD-26OCTFUNDED-T27",
-                  "KXHOODA-27JANFUNDED-T30", "KXDKS-26Q3-T1", "KXPM-26OCT-T1",
+        for t in ("KXBA-26OCTDELIV-T50", "KXRBLX-26OCTDAU-T100",
+                  "KXFSLRA-27JANBOOK-T50", "KXDKS-26Q3-T1", "KXPM-26OCT-T1",
                   "KXSBUXSAR-26NOV02-T5.1", "KXCHIPBURRITO-26NOV02-T9.8",
                   "KXWENBACONATOR-26NOV02-T8.73", "KXAMSAVO-26OCT10-T1.2",
                   "KXAAAGASMAXM-26OCT30-T3.5", "KXAAAGASMINM-26OCT31-T3",
                   "KXBA-X", "KXBA-26OCTDELIV"):
             self.assertTrue(M._blocked(t), t)
+
+    def test_the_four_unblocked_kpi_series_quote_again(self):
+        # Jack 2026-10-03: "unblock those four" -- Robinhood x2, First Solar,
+        # Coinbase (positive over their whole history); the annual FSLRA stays
+        for s in ("KXHOOD", "KXHOODA", "KXFSLR", "KXCOINBASE"):
+            self.assertNotIn(s, imm._CUT_KPI_SERIES, s)
+            self.assertFalse(M._blocked(f"{s}-26OCTFUNDED-T27"), s)
+            self.assertTrue(M._allowed(f"{s}-X"), s)
 
     def test_one_series_per_entry_never_a_neighbour(self):
         # the trailing dash: a KPI name that prefixes another series

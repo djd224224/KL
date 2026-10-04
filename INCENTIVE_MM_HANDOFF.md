@@ -6833,3 +6833,28 @@ losers stay out, 3 strikes per event, no yield mode, the guard-set clone
 (incl. a gas graduate), the cut series frozen, and the one-series-per-entry
 neighbours (KXBABELMANDEBWEEKLY, KXCMGFT, KXAMZNCC, KXDGCC, KXLOWCC, the
 Carbon Arc FT series, KXAAAGASM / KXAAAGASMTX) not.
+
+### 2026-10-03 night — Four company-KPI series un-blocked: Robinhood x2, First Solar, Coinbase (Jack)
+
+Jack asked why the rewards report showed Company KPIs positive in the weeks of
+Sep 21 and Sep 28. The report books rewards on the day Kalshi pays them, and
+KPI programs pay when each period ends: the $108 earned in the Sep 14 week
+(dashboard, at the paid rate) was paid over the next two weeks ($111, then
+$148), while trading lost money in every one of those weeks (report: -$10,
+-$295, -$36, -$86). On the report's own weeks Sep 7 - Oct 3 the class is
+-$164 credited / -$115 earned; since July -$429 (credits $405, trading
+-$790), negative in 7 of 11 weeks. The review's "-$312 over 4 weeks" was
+overstated: its window opened on Sat 9/6, a single -$194 trading day.
+
+Per series the losses are concentrated (lifetime: KXBA -$106, KXGOOG -$87,
+KXCMG -$84, KXRBLX -$47, KXINTC -$45, KXSBUX -$40, KXTLN -$38, KXDPZ -$31),
+and four series were positive throughout. Jack: "unblock those four":
+- KXHOOD + KXHOODA (Robinhood): +$92 lifetime, rewards $77 and trading +$15;
+  about -$6 on the dashboard's last 4 weeks.
+- KXFSLR (First Solar): +$29 lifetime, +$24 on the dashboard's last 4 weeks.
+- KXCOINBASE: +$16 lifetime (no market in the last 4 weeks).
+They leave _CUT_KPI_SERIES; the annual KXFSLRA (no history) stays cut.
+Code-only change: the bot's code-change exit applies it (handoff, no -Task).
+
+Tests: test_imm_scan_graduates.py gains test_the_four_unblocked_kpi_series_
+quote_again; 1,957 green.

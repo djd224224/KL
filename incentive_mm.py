@@ -2748,10 +2748,16 @@ _GPU_RENTAL_PREFIXES = ["KXA100", "KXB200", "KXH100", "KXH200", "KXRTX5090"]
 # its events and the "<series>-X" probe all match. Standard semantics: no new
 # orders, resting quotes cancelled next cycle, NOT reduce-only, positions
 # ride to settlement. The allowlist entries stay, so an un-block is one line.
+# UN-BLOCKED the same night (Jack: "unblock those four"): Robinhood (KXHOOD,
+# KXHOODA, +$92 lifetime in the rewards report, rewards and trading both
+# positive), First Solar (KXFSLR, +$29; +$24 on the dashboard's last 4 weeks)
+# and Coinbase (KXCOINBASE, +$16). The annual KXFSLRA has no history and
+# stays cut. The class's losses sit elsewhere: KXBA -$106, KXGOOG -$87,
+# KXCMG -$84, KXRBLX -$47, KXINTC -$45 lifetime.
 _CUT_KPI_SERIES = (
-    "KXBA", "KXPM", "KXHOOD", "KXHOODA", "KXWING", "KXWINGA", "KXMETA",
-    "KXRDDT", "KXINTC", "KXGOOG", "KXSCHW", "KXCMG", "KXAMZN", "KXCOINBASE",
-    "KXCVNA", "KXDPZ", "KXFSLR", "KXFSLRA", "KXLUV", "KXNCLH", "KXRBLX",
+    "KXBA", "KXPM", "KXWING", "KXWINGA", "KXMETA",
+    "KXRDDT", "KXINTC", "KXGOOG", "KXSCHW", "KXCMG", "KXAMZN",
+    "KXCVNA", "KXDPZ", "KXFSLRA", "KXLUV", "KXNCLH", "KXRBLX",
     "KXSBUX", "KXTLN", "KXTLNA", "KXWH", "KXYOU", "KXRACE",
     # the finecon KPI set
     "KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM", "KXBBY", "KXWSM",
