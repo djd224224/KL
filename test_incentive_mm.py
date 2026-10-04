@@ -17652,6 +17652,35 @@ class TestNflPropGate(unittest.TestCase):
         e["injury"] = "Questionable"
         self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[1]["reason"], "news_hold")
 
+    def test_recent_form_widens_the_band(self):
+        # Jack 2026-10-04 "yes add it and ship": Hubbard's DET@CAR fantasy
+        # ladder -- model band 8.84-18.94c (cap 19.94), recent-form band
+        # 12.74-27.30c (18.2 PPR over his last four) -> cap 28.30
+        now = time.time()
+        T = "KXNFLFFPTSLADDER-26OCT04DETCAR-CARCHUBBARD30"
+        self._snap(fair=0.126271, lo=0.088387, hi=0.189405, ticker=T)
+        e = imm._nfl_state["snap"]["markets"][T]
+        e.update(kind="ladder", stat="ffpts", recent_mean=18.2,
+                 fair_recent=0.182, fair_recent_lo=0.1274, fair_recent_hi=0.273)
+        why, inputs, caps = imm.nfl_gate(T, now, 20, 21)
+        self.assertEqual(why, "")
+        self.assertEqual(caps, (28.3, 7.84))          # top from recent, floor from model
+        self.assertEqual(inputs["model_band"], (8.839, 18.941))
+        self.assertEqual(inputs["recent_mean"], 18.2)
+        # a book far over the model's band is inside the recent one: no breach
+        self.assertEqual(imm.nfl_gate(T, now, 27, 28)[0], "")
+        # the knob off: the model's band alone (cap 19.94; 27 breaches it)
+        with mock.patch.object(imm, "NFL_RECENT_BAND", False):
+            self.assertEqual(imm.nfl_gate(T, now, 20, 21)[2], (19.94, 7.84))
+            self.assertEqual(imm.nfl_gate(T, now, 27, 28)[1]["reason"], "band")
+        # a declining player: the recent band's bottom lowers the ask floor
+        e.update(fair_recent=0.06, fair_recent_lo=0.042, fair_recent_hi=0.09)
+        self.assertEqual(imm.nfl_gate(T, now, 12, 13)[2], (19.94, 3.2))
+        # no recent fields (under 3 games): the model's band
+        for k in ("recent_mean", "fair_recent", "fair_recent_lo", "fair_recent_hi"):
+            e.pop(k)
+        self.assertEqual(imm.nfl_gate(T, now, 20, 21)[2], (19.94, 7.84))
+
     def test_caps(self):
         now = time.time()
         self._snap()

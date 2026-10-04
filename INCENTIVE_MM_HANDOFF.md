@@ -7405,3 +7405,27 @@ TestBookFile. 2,046 green.
 
 REVISED minutes later (Jack: "adjust to 1.5 and 3.5k instead of 2k and
 4k"): ON at $3,500, OFF under $1,500 (the env knobs unchanged).
+
+## 2026-10-04 — NFL gate: the band is the wider of the model's and the recent-form one (Jack)
+
+Jack asked why some KXNFLFFPTSLADDER-26OCT04DETCAR markets quoted one side:
+Hubbard's and McMillan's books were bid over the model's band, the bid cap
+(band top + 1c, 19c / 17c) sat behind 3,510 / 8,572 contracts at the touch,
+and only-what-earns dropped it. McMillan's model (10.75 PPR) matches his
+last four (10.6); Hubbard's (12.6) did not -- 2026 games 23.7 / 14.4 / 15.0,
+the EWMA weighed down by late-2025 games of 3-5. Jack: "yes add it and
+ship".
+
+- nfl_prop_fair: each entry also carries recent_mean (the stat's mean over
+  the player's last RECENT_GAMES = 4 games, IMM_NFL_RECENT_GAMES; >= 3
+  needed) and fair_recent / _lo / _hi -- the same payout and band on that
+  mean, the teammate multiplier applied (the fair cache shares it).
+- nfl_gate: lo / hi = the wider of the two bands (NFL_RECENT_BAND,
+  IMM_NFL_RECENT_BAND=0 = the model's alone), for the caps AND the band
+  breach check. Inputs carry model_band and recent_mean. The fair itself is
+  the model's (the sniper's model_mismatch check compares it).
+- Hubbard: cap 19.94 -> ~28.3c, the bid joins the 20c touch. A declining
+  player's recent band lowers the ask floor the same way.
+
+Tests: TestNflPropGate.test_recent_form_widens_the_band, test_nfl_prop_fair
+TestSnapshot.test_recent_form_band.

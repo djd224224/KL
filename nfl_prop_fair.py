@@ -151,6 +151,15 @@ MIN_GAMES = int(_env_float("IMM_NFL_MIN_GAMES", 3))
 # under this many games the band widens to WIDE_LO / WIDE_HI
 FULL_GAMES = int(_env_float("IMM_NFL_FULL_GAMES", 8))
 WIDE_LO = _env_float("IMM_NFL_WIDE_LO", 0.5)
+# RECENT FORM (Jack 2026-10-04: "yes add it and ship", on Chuba Hubbard's
+# DET@CAR fantasy ladder): the long EWMA is slow to see a role that changed
+# -- Hubbard's model mean was 12.6 PPR, his 2026 games 23.7 / 14.4 / 15.0
+# (late-2025 games of 3-5 points weighed it down), and the IMM's bid cap
+# (band top + 1c = 19c) sat behind 3,510 contracts at the 20c touch. Each
+# entry also carries the same band on the mean of the player's last
+# RECENT_GAMES games (fair_recent / _lo / _hi, the teammate multiplier
+# applied); the IMM gate quotes inside the WIDER of the two. 0 = off.
+RECENT_GAMES = int(_env_float("IMM_NFL_RECENT_GAMES", 4))
 WIDE_HI = _env_float("IMM_NFL_WIDE_HI", 2.0)
 SEASONS_BACK = int(_env_float("IMM_NFL_SEASONS_BACK", 2))
 NFLV_REFRESH_SECS = _env_float("IMM_NFL_NFLV_REFRESH_SECS", 6 * 3600)
@@ -443,6 +452,21 @@ def predict_mu(games: List[dict], stat: str, season: int
     raw = num / den
     mu = sm["a"] * raw + sm["b"]
     return mu, raw, n, sum(1 for _v, s in vals if s == season)
+
+
+def recent_mean(games: List[dict], stat: str, k: int = 4) -> Optional[float]:
+    """The stat's mean over the player's last k games (negative yards as 0,
+    like predict_mu); None under 3 games carrying it."""
+    sm = STAT_MODEL[stat]
+    clip = not sm["discrete"] and stat != "ffpts"
+    vals = []
+    for g in games[-k:]:
+        v = g.get(sm["col"])
+        if v is None or v == "":
+            continue
+        v = float(v)
+        vals.append(max(0.0, v) if clip else v)
+    return sum(vals) / len(vals) if len(vals) >= 3 else None
 
 
 def fair_band(spec: dict, mu: float, n_games: int) -> Tuple[float, float, float]:
@@ -937,6 +961,19 @@ def market_entry(m: dict, season: int, index: Optional[PlayerIndex],
         fb = fair_band(spec, mu, n)
         fair_cache[ck] = fb
     e["fair"], e["fair_lo"], e["fair_hi"] = (round(x, 6) for x in fb)
+    # the same band on the last RECENT_GAMES games (see RECENT_GAMES)
+    rm = recent_mean(games, stat, RECENT_GAMES) if RECENT_GAMES > 0 else None
+    if rm is not None:
+        rmu = rm * tm
+        rk = (series, spec["cap"], spec.get("exponent"), spec.get("step"),
+              round(rmu, 4), n >= FULL_GAMES)
+        rb = fair_cache.get(rk)
+        if rb is None:
+            rb = fair_band(spec, rmu, n)
+            fair_cache[rk] = rb
+        e["recent_mean"] = round(rm, 4)
+        e["fair_recent"], e["fair_recent_lo"], e["fair_recent_hi"] = (
+            round(x, 6) for x in rb)
     return e
 
 
@@ -979,6 +1016,7 @@ def build_snapshot(now_ts: float, season: int, family: List[dict],
                   "prior_season_weight": PRIOR_SEASON_WEIGHT,
                   "band": [BAND_LO, BAND_HI], "wide_band": [WIDE_LO, WIDE_HI],
                   "min_games": MIN_GAMES, "full_games": FULL_GAMES,
+                  "recent_games": RECENT_GAMES,
                   "stats": STAT_MODEL,
                   "teammates": {"enable": TEAMMATE_ENABLE,
                                 "window_games": TEAM_WINDOW_GAMES,

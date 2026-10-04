@@ -254,6 +254,26 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(snap["errors"], ["x"])
         json.dumps(snap)                                 # the status file
 
+    def test_recent_form_band(self):
+        # Robinson's last four games: 5 (2025), then 8 / 3 / 2 receptions
+        idx, fam, ros = self._world()
+        snap = nf.build_snapshot(2000.0, 2026, fam, idx, ros, {})
+        e = snap["markets"]["KXNFLLADDERREC-26OCT05ATLNO-ATLBROBINSON7"]
+        self.assertAlmostEqual(e["recent_mean"], 4.5)
+        self.assertAlmostEqual(e["fair_recent"], 4.5 / 20.0, places=4)  # linear
+        self.assertAlmostEqual(e["fair_recent_lo"], 4.5 * nf.BAND_LO / 20.0, places=4)
+        self.assertAlmostEqual(e["fair_recent_hi"], 4.5 * nf.BAND_HI / 20.0, places=4)
+        self.assertEqual(snap["model"]["recent_games"], nf.RECENT_GAMES)
+        # under three games carrying the stat: no recent band
+        self.assertIsNone(nf.recent_mean([{"receptions": 3}, {"receptions": None},
+                                          {"receptions": 4}], "rec", 4))
+        self.assertEqual(nf.recent_mean([{"rushing_yards": -4}, {"rushing_yards": 10},
+                                         {"rushing_yards": 20}], "rshyds", 4), 10.0)
+        with mock.patch.object(nf, "RECENT_GAMES", 0):
+            snap = nf.build_snapshot(2000.0, 2026, fam, idx, ros, {})
+            self.assertNotIn("fair_recent",
+                             snap["markets"]["KXNFLLADDERREC-26OCT05ATLNO-ATLBROBINSON7"])
+
     def test_not_on_roster_reads_as_a_designation(self):
         idx, fam, ros = self._world()
         ros["atl"]["roster"] = {}

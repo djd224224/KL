@@ -9220,6 +9220,14 @@ NFL_FAIR_REFRESH_SECS = _env_int("IMM_NFL_FAIR_REFRESH_SECS", 120)
 # (TEAMMATE_ALPHA), so once the hold lapses the band is centred on it.
 # 0 = off.
 NFL_NEWS_HOLD_MIN = _env_int("IMM_NFL_NEWS_HOLD_MIN", 30)
+# RECENT FORM (Jack 2026-10-04: "yes add it and ship"): the gate's band is
+# the WIDER of the model's and the same band on the player's last 4 games
+# (nfl_prop_fair.RECENT_GAMES -- fair_recent_lo / _hi in the snapshot), for
+# the caps and the band check alike. Hubbard's DET@CAR fantasy ladder:
+# model 12.6 PPR (band top 18.94c, cap 19c, behind 3,510 at the 20c touch,
+# so the bid never rested), 2026 games 23.7 / 14.4 / 15.0 -- recent-form top
+# ~27c, cap ~28c, the bid joins the touch. 0 = the model's band alone.
+NFL_RECENT_BAND = os.environ.get("IMM_NFL_RECENT_BAND", "1") == "1"
 NFL_STATUS_FILE = os.environ.get(
     "IMM_NFL_STATUS_FILE", os.path.join(STATUS_DIR, "nfl_prop_fair.json"))
 # the refresher's latest snapshot (nfl_prop_fair.build_snapshot)
@@ -9281,8 +9289,14 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     fair = float(e["fair"]) * 100.0
     lo = float(e["fair_lo"]) * 100.0
     hi = float(e["fair_hi"]) * 100.0
+    model_band = (round(lo, 3), round(hi, 3))
+    # the wider of the model's band and the recent-form one (NFL_RECENT_BAND)
+    rlo, rhi = e.get("fair_recent_lo"), e.get("fair_recent_hi")
+    if NFL_RECENT_BAND and rlo is not None and rhi is not None:
+        lo, hi = min(lo, float(rlo) * 100.0), max(hi, float(rhi) * 100.0)
     inputs = {"fair": round(fair, 3), "fair_lo": round(lo, 3),
-              "fair_hi": round(hi, 3), "mu": e.get("mu"),
+              "fair_hi": round(hi, 3), "model_band": model_band,
+              "recent_mean": e.get("recent_mean"), "mu": e.get("mu"),
               "n_games": e.get("n_games"), "player": e.get("player"),
               "mu_base": e.get("mu_base"), "team_mult": e.get("team_mult"),
               "injury": e.get("injury"),
