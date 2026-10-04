@@ -9118,8 +9118,12 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                 None)
     bid_cap = int(math.floor(hi + NFL_FAIR_TOL_CENTS + 1e-9))
     ask_floor = int(math.ceil(lo - NFL_FAIR_TOL_CENTS - 1e-9))
+    # a floor at or under zero is NO floor (0: mort_cap_quotes never moves an
+    # ask under it). It was clamped to 1c, which on a sub-penny book is a
+    # real floor: an ask snapped to the maker's 0.95 was lifted to 1.00,
+    # behind him, and dropped as unearning (Prescott / Montgomery 10/4)
     caps = (bid_cap if bid_cap >= 1 else None,
-            max(1, ask_floor) if ask_floor <= 99 else None)
+            max(0, ask_floor) if ask_floor <= 99 else None)
     if caps == (None, None):
         return (f"no side within the band {lo:.2f}-{hi:.2f}c",
                 dict(inputs, reason="decided"), None)

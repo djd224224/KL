@@ -17576,7 +17576,12 @@ class TestNflPropGate(unittest.TestCase):
         # an RB receiving-yards escalator worth ~0.2c: the book's 2c bid is
         # not joined (bids <= 1c), the ask side is free
         self._snap(fair=0.0018, lo=0.0011, hi=0.0034)
-        self.assertEqual(imm.nfl_gate(self.T, now, 2, 3)[2], (1, 1))
+        self.assertEqual(imm.nfl_gate(self.T, now, 2, 3)[2], (1, 0))
+        # ...and the 0 floor is no floor: a sub-penny ask at the maker's
+        # 0.95 keeps its exact price (a 1c floor lifted it behind him)
+        ask = imm.Quote(self.T, "ask", 1, 100, price_exact=0.95)
+        kept = imm.mort_cap_quotes([ask], 1, 0)
+        self.assertEqual([(q.price_cents, q.price_exact) for q in kept], [(1, 0.95)])
         # a ladder near the top: no ask floor above 99
         self._snap(fair=0.97, lo=0.95, hi=0.995)
         self.assertEqual(imm.nfl_gate(self.T, now, 95, 99)[2], (100, 94))
