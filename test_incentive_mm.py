@@ -17670,6 +17670,67 @@ class TestNflPropGate(unittest.TestCase):
         self.assertEqual(self._quotes(bot), (set(), set()))
         self.assertIn(self.T, bot._nfl_stood)
 
+    def test_drop_unearning_sides(self):
+        """Jack 2026-10-04: "only quote a market if you're earning"."""
+        Q = imm.Quote
+        T = self.T
+        quotes = [Q(T, "bid", 14, 200), Q(T, "ask", 17, 200),
+                  Q(T, "bid", 1, 50, is_pad=True), Q(T, "ask", 99, 50, is_pad=True)]
+        deep_yes = [[15, 5500.0], [14, 300.0]]
+        deep_no = [[83, 5000.0]]                       # YES ask 17
+        f = lambda qs, y, n, own=(): imm.drop_unearning_sides(
+            qs, y, n, list(own), 1000.0, 0.5)
+        # Downs: the bid capped at 14 behind 5,500 at 15 never enters the
+        # first 1,000 -- dropped; the ask at the 17 touch earns -- kept,
+        # and so are both pads
+        out = f(quotes, deep_yes, deep_no)
+        self.assertEqual(sorted((q.book_side, q.price_cents, q.is_pad) for q in out),
+                         [("ask", 17, False), ("ask", 99, True), ("bid", 1, True)])
+        # a thin touch: 15 x 100 puts the reference (target/5 = 200) at 14,
+        # so the capped 14 bid scores in full -- kept
+        out = f(quotes, [[15, 100.0], [14, 400.0], [13, 600.0]], deep_no)
+        self.assertIn(("bid", 14), [(q.book_side, q.price_cents) for q in out])
+        # neither side earns (the ask lifted behind a deep 17 too): nothing
+        # rests, the pads included
+        behind = [Q(T, "bid", 14, 200), Q(T, "ask", 18, 200),
+                  Q(T, "bid", 1, 50, is_pad=True)]
+        self.assertEqual(f(behind, deep_yes, deep_no), [])
+        # our own resting orders are netted out of the book first: 15 x 5,500
+        # of which 5,400 is ours leaves a 100-deep external touch, so a 14
+        # rung earns again
+        own = [("bid", 15, 5400.0)]
+        out = f([Q(T, "bid", 14, 200)], [[15, 5500.0], [14, 900.0]], deep_no, own)
+        self.assertEqual([(q.book_side, q.price_cents) for q in out], [("bid", 14)])
+        # a rung AT the deep touch shares it -- earns
+        self.assertEqual(len(f([Q(T, "bid", 15, 200)], deep_yes, deep_no)), 1)
+        self.assertEqual(f([], deep_yes, deep_no), [])
+
+    def test_downs_book_rests_only_the_earning_side(self):
+        # admitted on a shallow book (members stay selected), then the
+        # Downs shape: 15 x 5,500 / 17 x 5,000 with the bid capped at 14.
+        # The live ladder mode (launcher IMM_LADDER_MODE=atref) rests at the
+        # scored reference -- the deep touch; the suite's "offsets" default
+        # parks rungs a tick behind it, where (correctly) nothing earns.
+        p = mock.patch.object(imm, "LADDER_MODE", "atref")
+        p.start()
+        self.addCleanup(p.stop)
+        bot = self._bot()
+        self._snap(fair=0.0516, lo=0.0223, hi=0.1300)  # cap floor(13 + 1) = 14
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.1500", "5500"]],
+            "no_dollars": [["0.8300", "5000"]]}}
+        self._snap(fair=0.0516, lo=0.0223, hi=0.1300)
+        bot.run_cycle()
+        bids, asks = self._quotes(bot)
+        self.assertEqual(bids, set())                  # 14 would earn nothing
+        self.assertTrue(asks)
+        self.assertEqual(min(asks), 17)                # the ask at the touch
+        self.assertEqual(bot._nfl_unearning.get(self.T), {"bid"})
+        self.assertNotIn(self.T, bot._nfl_stood)
+
     def test_kill_switch_quotes_as_before(self):
         bids, _asks = self._ungated("0.4000", "0.4900")  # the 40 / 51 book
         self.assertGreaterEqual(max(bids), 38)           # the old behaviour

@@ -7045,3 +7045,34 @@ Tests: TestTeammates (P_MISS, window shares with misses as zero, the context
 and multipliers, lead back + QB out with the clamp, news needs a
 contributor and tracks changes, the snapshot carries it), TestNflPropGate
 .test_news_hold.
+
+### 2026-10-04 — NFL props: only the sides that earn rest (Jack) -- same branch, NOT MERGED
+
+Jack, on the branch's Downs case (escalator book 15 / 17, which the teammate
+adjustment moved from stand-aside to quoted with the bid capped at 14):
+"only quote a market if you're earning". A fair-gate cap moves a rung off
+the touch; when the program's scoring walk (the first target_size contracts
+from the best price, the reference where target/5 accumulate -- _side_share)
+never reaches it, it earns nothing and fills only when the book moves
+through it.
+
+drop_unearning_sides (after the NFL caps, in the quote loop and the
+estimator probe): each side's rungs are scored on the EXTERNAL book (our
+resting orders netted out, the side's rungs and pads overlaid); a side whose
+rungs score zero is dropped; with neither side earning nothing rests, pads
+included. Logged once per change ("nfl not earning <t>: bid side(s) out of
+the scored walk ..."), state _nfl_unearning.
+
+Live dry run 13:09Z 10/4 (511 props, target 500): 484 both sides at the
+touch, 22 stood aside (12 news hold, 10 injury), 3 capped but still inside
+the walk on both sides (Downs' escalator among them -- the 15 level had
+thinned since 03:23Z, so a 14 bid scores again), 2 with the bid dropped
+(Tuten's receptions ladder 9 / 11 capped at 8; Dobbins' receiving-yards
+escalator 2 / 3, its 1c bid behind the maker's 2c). The verdict is per cycle
+on the live book.
+
+Tests: TestNflPropGate.test_drop_unearning_sides (deep touch drops the
+capped side, a thin touch keeps it, nothing earning rests nothing, our own
+orders netted out, a rung at the touch earns) and
+.test_downs_book_rests_only_the_earning_side (atref, the live ladder mode).
+1,993 green.

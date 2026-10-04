@@ -9125,6 +9125,57 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
 
 
+# ONLY QUOTE WHAT EARNS (Jack 2026-10-04: "only quote a market if you're
+# earning"). A fair-gate cap moves a rung off the touch; behind a deep touch
+# (the NFL props' designated makers rest 5k-1M contracts there) the program's
+# scoring walk -- the first target_size contracts from the best price -- never
+# reaches it, so it earns nothing and fills only when the book moves through
+# it: all adverse selection, no rent. After the caps, each side's rungs are
+# scored on the EXTERNAL book (our resting orders netted out, the side's
+# rungs and pads overlaid) by the program's own walk (_side_share); a side
+# whose rungs would score zero is dropped, and with neither side earning
+# nothing rests at all (pads included -- they exist to qualify the snapshot
+# for our rungs). On the 10/4 slate: Downs' receptions escalator (15 / 17,
+# bid capped at 14 behind ~5,500 at 15) rests only its 16.99 ask; the RB
+# receiving-yards escalators' 1c capped bids behind the makers' 2c go.
+def drop_unearning_sides(quotes: List["Quote"], yes_levels: List[List[float]],
+                         no_levels: List[List[float]],
+                         own_in_book: List[Tuple[str, int, float]],
+                         target: float, df: float) -> List["Quote"]:
+    """The quotes minus every side whose non-pad rungs would earn no reward
+    share (see above); [] when neither side earns."""
+    if not quotes:
+        return quotes
+    ext = {"bid": {int(px): float(q) for px, q in yes_levels},
+           "ask": {int(px): float(q) for px, q in no_levels}}
+    for side, px, q in own_in_book:
+        lv = ext["bid" if side == "bid" else "ask"]
+        k = int(px) if side == "bid" else 100 - int(px)
+        lv[k] = max(0.0, lv.get(k, 0.0) - float(q))
+    earns = {}
+    for side in ("bid", "ask"):
+        rungs: Dict[int, float] = {}
+        depth = dict(ext[side])
+        for q in quotes:
+            if q.book_side != side:
+                continue
+            k = q.price_cents if side == "bid" else 100 - q.price_cents
+            depth[k] = depth.get(k, 0.0) + float(q.count)
+            if not q.is_pad:
+                rungs[k] = rungs.get(k, 0.0) + float(q.count)
+        if not rungs:
+            earns[side] = None             # no rungs on this side to judge
+            continue
+        levels = sorted(((px, n) for px, n in depth.items() if n > 0),
+                        key=lambda kv: -kv[0])
+        share, _qual = _side_share(levels, rungs, target, df)
+        earns[side] = share > 1e-9
+    if not any(earns.values()):
+        return []                          # nothing earns: stand aside
+    return [q for q in quotes
+            if q.is_pad or earns.get(q.book_side) is not False]
+
+
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
 _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 
@@ -11569,6 +11620,7 @@ class IncentiveMarketMaker:
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
         self._nfl_stood: Set[str] = set()         # NFL prop gate stand-asides
+        self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # (account value, anchor) from the last floor check, for risk_line
         self._acct_reading: Optional[Tuple[float, float]] = None
@@ -15119,9 +15171,14 @@ class IncentiveMarketMaker:
                 out = [] if (_pw or _pc is None) else mort_cap_quotes(out, *_pc)
             if nfl_series(meta.series):
                 # NFL prop gate: nothing while it stands aside, else the
-                # rungs held inside the player-history band
+                # rungs held inside the player-history band -- and only the
+                # sides that still earn (drop_unearning_sides)
                 _nw, _ni, _nc = nfl_gate(meta.ticker, _now.timestamp(), eb, ea)
                 out = [] if (_nw or _nc is None) else mort_cap_quotes(out, *_nc)
+                out = drop_unearning_sides(
+                    out, yes_levels, no_levels,
+                    own_live if self.live else [],
+                    meta.target_size, meta.discount_factor)
             return out
 
         def _overlay_with_pads(quotes: List[Quote],
@@ -17020,9 +17077,22 @@ class IncentiveMarketMaker:
             # Pokemon gate: likewise last, POKE_FAIR_TOL_CENTS clear
             if poke_caps is not None:
                 mq = mort_cap_quotes(mq, *poke_caps)
-            # NFL prop gate: likewise last, inside the player-history band
+            # NFL prop gate: likewise last, inside the player-history band,
+            # and a side the caps left out of the scored walk does not rest
+            # at all ("only quote a market if you're earning")
             if nfl_caps is not None:
                 mq = mort_cap_quotes(mq, *nfl_caps)
+                _n_before = {q.book_side for q in mq if not q.is_pad}
+                mq = drop_unearning_sides(mq, yes_levels, no_levels, own_in_book,
+                                          meta.target_size, meta.discount_factor)
+                _dropped = _n_before - {q.book_side for q in mq if not q.is_pad}
+                if _dropped != self._nfl_unearning.get(t, set()):
+                    if _dropped:
+                        log(f"{self.tag} nfl not earning {t}: "
+                            f"{'/'.join(sorted(_dropped))} side(s) out of the "
+                            f"scored walk after the caps {nfl_caps} "
+                            f"(book {ext_bid}x{ext_ask}) -- not resting them")
+                    self._nfl_unearning[t] = _dropped
             desired.extend(mq)
             if mq:
                 quoted += 1
