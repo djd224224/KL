@@ -25,6 +25,10 @@ the first episode whose window holds it; a re-flag of the same order inside
 an earlier episode's window is folded into that episode (the fast path had
 already pulled the order).
 
+The bot writes a cycle's amend / cancel end line with the CYCLE's start time,
+so the moment the cycle really acted comes from orders_*.jsonl (each of our
+amends / cancels, timestamped when sent).
+
 The dry check runs only in the bot's ~10s idle between cycles, so a rung that
 went stale mid-cycle is flagged at the next idle -- exactly what the fast
 path as built would see. Fills before the flag are reported, never counted.
@@ -154,6 +158,41 @@ def load_fills(d: str, order_ids) -> Dict[str, List[dict]]:
                 out[r["order_id"]].append(r)
     for v in out.values():
         v.sort(key=lambda r: float(r.get("ts") or 0))
+    return out
+
+
+def load_order_actions(d: str, order_ids, t_lo: float, t_hi: float
+                       ) -> Dict[str, List[float]]:
+    """order id -> the times (ascending) of our own amends / cancels of it,
+    from orders_*.jsonl. The file is large (~180 MB/day): lines are matched on
+    the order id before they are parsed."""
+    want = set(order_ids)
+    out: Dict[str, List[float]] = defaultdict(list)
+    lo_day = datetime.fromtimestamp(t_lo, timezone.utc).strftime("%Y-%m-%d")
+    hi_day = datetime.fromtimestamp(t_hi, timezone.utc).strftime("%Y-%m-%d")
+    key = '"order_id": "'
+    for p in _day_files(d, "orders", ".jsonl"):
+        day = os.path.basename(p)[len("orders_"):-len(".jsonl")]
+        if day < lo_day or day > hi_day:
+            continue
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                i = line.find(key)
+                if i < 0:
+                    continue
+                j = line.find('"', i + len(key))
+                if line[i + len(key):j] not in want:
+                    continue
+                try:
+                    r = json.loads(line)
+                    if r.get("kind") not in ("amend", "cancel"):
+                        continue
+                    ts = datetime.fromisoformat(str(r["ts"])).timestamp()
+                except (ValueError, KeyError, TypeError):
+                    continue
+                out[r["order_id"]].append(ts)
+    for v in out.values():
+        v.sort()
     return out
 
 
@@ -306,11 +345,24 @@ def _fill_pnl(f: dict, mid: Optional[float]) -> Optional[float]:
 
 # ---- scoring -----------------------------------------------------------------
 
+def _acted_stale(e: dict, actions: Dict[str, List[float]]) -> Optional[float]:
+    """Seconds from the flag to the cycle's own amend / cancel of the rung:
+    the first such action in orders_*.jsonl after the flag, else the end
+    line's figure (which counts to the cycle's start, so runs short)."""
+    end = e["end"]
+    if not end or end["ev"] not in ("amend", "cancel") or end.get("by") == "fast":
+        return None
+    t0 = float(e["flag"]["ts"])
+    later = [ts for ts in actions.get(e["flag"]["order_id"], ()) if ts > t0]
+    return (later[0] - t0) if later else float(end["stale_s"])
+
+
 def score(eps: List[dict], fills: Dict[str, List[dict]],
-          cyc: Dict[str, List[tuple]]) -> dict:
-    fixed = [float(e["end"]["stale_s"]) for e in eps
-             if e["end"] and e["end"]["ev"] in ("amend", "cancel")
-             and e["end"].get("by") != "fast"]
+          cyc: Dict[str, List[tuple]],
+          actions: Optional[Dict[str, List[float]]] = None) -> dict:
+    actions = actions or {}
+    acted = {id(e): _acted_stale(e, actions) for e in eps}
+    fixed = [v for v in acted.values() if v is not None]
     D = statistics.median(fixed) if fixed else 120.0
     used_fills = set()
     window_until: Dict[str, float] = {}
@@ -321,7 +373,8 @@ def score(eps: List[dict], fills: Dict[str, List[dict]],
         t0 = float(fl["ts"])
         oid, t = fl["order_id"], fl["ticker"]
         ev = end["ev"] if end else "open"
-        stale = float(end["stale_s"]) if end else None
+        stale = acted[id(e)] if acted[id(e)] is not None else \
+            (float(end["stale_s"]) if end else None)
         if fl.get("mode") == "live" or (end and end.get("by") == "fast"):
             res.append({"ticker": t, "order_id": oid, "end": ev, "live": True})
             continue
@@ -493,7 +546,9 @@ def main(argv=None) -> int:
     fills = load_fills(a.dir, {e["flag"]["order_id"] for e in eps})
     cyc = load_cycle_rows(a.dir, {e["flag"]["ticker"] for e in eps},
                           t_lo - 3600.0, t_hi + 2 * 3600.0)
-    s = summarize(score(eps, fills, cyc), since or t_lo, until or t_hi)
+    actions = load_order_actions(a.dir, {e["flag"]["order_id"] for e in eps},
+                                 t_lo - 60.0, t_hi + 2 * 3600.0)
+    s = summarize(score(eps, fills, cyc, actions), since or t_lo, until or t_hi)
     sys.stdout.write(render(s))
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:

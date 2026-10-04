@@ -188,7 +188,10 @@ IMM_WS_FAST=1). `ev` is one of:
 - `gone`: it left the book with no cancel or amend of ours: filled out, or
   expired. Its fills are in `fills_*.jsonl`, by `order_id`.
 
-Every end row carries `stale_s` (seconds since the flag). An episode can stay
+Every end row carries `stale_s` (seconds since the flag). A cycle's `amend` /
+`cancel` / `gone` row is stamped with that CYCLE's start time, so its
+`stale_s` runs short; the exact amend / cancel time is the order's row in
+`orders_*.jsonl` (ws_stale_score.py uses it). An episode can stay
 open across a restart, because the new process starts with none. The check
 runs only between cycles (the ~10s idle), so a rung that went stale
 mid-cycle is flagged at the next idle. `ws_stale_score.py` turns a day of

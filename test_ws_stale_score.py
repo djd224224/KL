@@ -54,7 +54,9 @@ RATE_O3 = 0.002 * (15 / 1015) / 2
 def _write_day(d):
     stale = [
         _flag(T, "o1", "bid", 49.0, 20.0, **BOOK_A),
-        _end(T + 60, "amend", "o1", "bid", 49.0, 60.0, new_px=47.0),
+        # the bot stamps a cycle's amend with the cycle's START (T+8.8); the
+        # amend itself went out at T+60 (orders_*.jsonl)
+        _end(T + 8.8, "amend", "o1", "bid", 49.0, 8.8, new_px=47.0),
         _flag(T + 600, "o2", "ask", 53.0, 10.0, yes=[[50.0, 300.0]],
               no=[[47.0, 10.0], [45.0, 400.0]], ours=[["ask", 53.0, 10.0]]),
         _end(T + 605, "clear", "o2", "ask", 53.0, 5.0),
@@ -88,6 +90,11 @@ def _write_day(d):
     with open(os.path.join(d, "fills_2026-10-04.jsonl"), "w") as f:
         for r in fills:
             f.write(json.dumps(r) + "\n")
+    with open(os.path.join(d, "orders_2026-10-04.jsonl"), "w") as f:
+        for ts, kind, oid in ((T - 100, "place", "o1"), (T + 60, "amend", "o1"),
+                              (T + 3000, "cancel", "o1"), (T + 30, "amend", "zz")):
+            f.write(json.dumps({"ts": datetime.fromtimestamp(ts, timezone.utc).isoformat(),
+                                "kind": kind, "order_id": oid, "ticker": A}) + "\n")
     hdr = imm.IncentiveMarketMaker.CYCLE_LOG_HEADER.strip().split(",")
     with open(os.path.join(d, "cycle_log_2026-10-04.csv"), "w", newline="") as f:
         w = csv.writer(f)
@@ -112,11 +119,17 @@ class TestScore(unittest.TestCase):
         self.d = self.tmp.name
         _write_day(self.d)
 
-    def _summary(self):
+    def _summary(self, actions=True):
         eps = wss.load_episodes(self.d, None, None)
-        fills = wss.load_fills(self.d, {e["flag"]["order_id"] for e in eps})
+        oids = {e["flag"]["order_id"] for e in eps}
+        fills = wss.load_fills(self.d, oids)
         cyc = wss.load_cycle_rows(self.d, {A, B}, T - 3600, T + 9000)
-        return wss.summarize(wss.score(eps, fills, cyc), T, T + 3600)
+        acts = wss.load_order_actions(self.d, oids, T - 60, T + 9000) if actions else {}
+        return wss.summarize(wss.score(eps, fills, cyc, acts), T, T + 3600)
+
+    def test_cycle_actions_are_timed_from_the_orders_sink(self):
+        self.assertEqual(self._summary(actions=False)["D"], 8.8)   # cycle start
+        self.assertEqual(self._summary()["D"], 60.0)              # the amend itself
 
     def test_the_hand_worked_day(self):
         s = self._summary()
@@ -138,10 +151,12 @@ class TestScore(unittest.TestCase):
 
     def test_replace_windows_follow_how_each_episode_ended(self):
         eps = wss.load_episodes(self.d, None, None)
-        fills = wss.load_fills(self.d, {e["flag"]["order_id"] for e in eps})
+        oids = {e["flag"]["order_id"] for e in eps}
+        fills = wss.load_fills(self.d, oids)
         cyc = wss.load_cycle_rows(self.d, {A, B}, T - 3600, T + 9000)
+        acts = wss.load_order_actions(self.d, oids, T - 60, T + 9000)
         got = {r["order_id"]: (r["end"], r.get("replace_s"))
-               for r in wss.score(eps, fills, cyc)["episodes"]
+               for r in wss.score(eps, fills, cyc, acts)["episodes"]
                if not (r.get("folded") or r.get("live") or r.get("phantom"))}
         self.assertEqual(got, {"o1": ("amend", 60.0), "o2": ("clear", 60.0),
                                "o3": ("open", 60.0), "o5": ("gone", 30.0)})
