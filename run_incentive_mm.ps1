@@ -345,15 +345,20 @@ if ($Probe) {
     # moved to the normal book the same day as open-scan graduates
     # (incentive_mm SCAN_GRADUATE_SERIES) made +$501, the other 46 lost $267.
     # Members leave at the next refresh (quotes cancelled, positions ride).
-    # WEBSOCKET BOOKS -- SHADOW (Jack 2026-10-03: "i only want to turn on the
-    # websocket shadow"). The kalshi_ws.py feed runs beside the bot: every REST
-    # book read is compared with the WebSocket book and the stale-quote check
-    # COUNTS the cancels a fast path would send (status_incentive_mm.json
-    # latency.ws). Trading reads REST exactly as before; nothing the feed says
-    # changes an order. Shadow is also the code default, so a plain code deploy
-    # (the bot's own restart) turns it on; IMM_WS=off removes the feed (+
-    # restart_imm.ps1 -Task). IMM_WS=on / IMM_WS_FAST=1 are NOT enabled.
-    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=shadow&&"
+    # WEBSOCKET BOOKS -- ON (Jack 2026-10-04: "turn on the websocket books
+    # now"). The quote loop reads each managed book from the kalshi_ws.py
+    # feed whenever the feed trusts it, and from REST otherwise.
+    # REST AUDIT: 1 read in 20 is also read from REST and traded on. Too many
+    # mismatches trip every read back to REST, reconnect the feed and email
+    # ALERT ws_audit; it re-arms after 15 min clean.
+    # WHY: on 10/4 a plain cycle spent ~60 of its ~137s on REST book reads.
+    # Shadow from 10/4 17:51Z: 99.7-100% of books equal to REST, 0 gaps.
+    # Status latency.ws (books_used, rest_fallback, audit) and latency.cycle
+    # (reads_s) show it working.
+    # STILL OFF: IMM_WS_FAST=1 (fast stale-quote cancels; the check runs dry).
+    # The event sweep breaker stays dry (code default).
+    # BACK OUT: IMM_WS=shadow (or off) here, then restart_imm.ps1 -Task.
+    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&&"
 }
 
 while ($true) {

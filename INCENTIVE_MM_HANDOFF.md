@@ -7644,3 +7644,22 @@ WATCH.
 - Status latency.sweep: {trips, cancels, skipped_budget, fills_seen,
   unparsed, unknown_order, mode, hold_s, held_now}. `unparsed` should stay 0;
   it would mean the WS fill format changed.
+
+## 2026-10-04 ~21:35Z -- WebSocket books ON (Jack: "turn on the websocket books now")
+
+run_incentive_mm.ps1 now sets IMM_WS=on, applied with restart_imm.ps1 -Task
+(handoff, so the book is kept). The quote loop reads each managed book from
+the feed when it is trusted, REST otherwise, with 1 read in 20 audited
+against REST. A trip sends every read back to REST and emails ALERT
+ws_audit.
+
+Before: shadow from 17:51Z, 99.7-100% of books equal to REST, 0 gaps; a
+plain cycle spent ~60s of its ~137s on REST book reads (latency.cycle
+reads_s). Expect reads_s to fall to a few seconds, books_used to climb
+and rest_fallback to stay small.
+
+Unchanged: IMM_WS_FAST=1 stays OFF (the stale-quote check runs dry), and
+the sweep breaker stays dry. Jack chose to flip it before the 10/5 scoring
+task (imm-ws-stale-score), which still scores the dry experiments.
+
+BACK OUT: IMM_WS=shadow in run_incentive_mm.ps1, then restart_imm.ps1 -Task.
