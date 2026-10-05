@@ -18467,7 +18467,14 @@ class IncentiveMarketMaker:
                 # BLOCKS resume for as long as it sits there (Jack
                 # 2026-08-31 #2: a settled strike holds its event down —
                 # and settlement ends the event anyway).
-                if mid_in_band:
+                # "In band" here is the MID in the series price band, the same
+                # test the jump confirm uses -- not pad_band_ok's 10-90 touch
+                # gate (2026-10-05, KXTRUMPMENTION-26OCT05: after a resumable
+                # fill-tripwire halt at 14:09Z, TRUMA 6x7 / FENT 6x7 / DRIL
+                # 8x9 / FARM 90x91 -- strikes the bot had been QUOTING --
+                # failed the touch gate forever, so the event could never
+                # resume). A real pin (95x97, mid 96) still blocks.
+                if two_sided and not mid_out_of_range:
                     event_depth_ok[ev] = event_depth_ok.get(ev, 0) + 1
                 if ev in self.state.event_depth_halt:
                     # market of a still-halted event: hold quiet (and keep

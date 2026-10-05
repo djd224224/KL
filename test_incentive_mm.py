@@ -12326,6 +12326,26 @@ class TestLiveEventDepthGate(unittest.TestCase):
         self.assertNotIn(self.EV, bot.state.event_live_halt)
         self.assertFalse(any(c == "event_live" for c, _m in bot.alerter.today))
 
+    def test_low_touch_strike_does_not_block_resume(self):
+        """2026-10-05 14:09Z: a resumable halt on an event with a 6x7 strike
+        (mid in the 5-90 band, touch under the 10c pad gate) must still
+        resume once the event is quiet."""
+        bot = self._bot()
+        bot.run_cycle()
+        self._books(bot, 1200, 1200, 300, 1200)           # B thin -> halt
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.06", "1500"]],
+            "no_dollars": [["0.93", "1500"]]}}             # 6x7, mid 6.5
+        bot.state.event_depth_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        self.assertNotIn(self.EV, bot.state.event_live_halt)
+
     def test_event_live_clear_file_releases_a_confirm(self):
         bot = self._bot()
         bot.state.event_live_halt[self.EV] = time.time()
