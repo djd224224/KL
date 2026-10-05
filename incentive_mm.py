@@ -1467,6 +1467,10 @@ def is_daily_series(series: str) -> bool:
     # KXRAIN floor covers: x1 at every hour, no Saturday or yield size
     if snow_monthly_series(series):
         return True
+    # the YouTube #2 pilot (2026-10-05) is x1 at every hour by spec -- not
+    # left to the feed classifier (read at call time: defined further down)
+    if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
+        return True
     return series in DAILY_SERIES_DYNAMIC
 
 
@@ -2079,6 +2083,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     series = series_of(event_ticker)
     if _share_x1(series):
         return SHARE_EVENT_CAP
+    # the YouTube #2 pilot (2026-10-05): YT2_EVENT_CAP net per event
+    if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
+        return globals()["YT2_EVENT_CAP"]
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
@@ -4278,6 +4285,17 @@ _DEFAULT_QUAKE_SERIES = "KXBIGGESTQUAKE"
 _VERCEL_LIVE = os.environ.get("IMM_VERCEL_ENABLE", "1") == "1"
 _DEFAULT_VERCEL_SERIES = ("KXOPENVSPEND,KXMOONVSPEND,KXANTHVSPEND,KXGOOGVREQ,"
                           "KXOPENVREQ,KXDEEPVREQ,KXANTHVREQ,KXOPENSOURCESHARE")
+# YOUTUBE #2 TOP-VIDEO PILOT (Jack 2026-10-05: "go ship the youtube #2
+# pilot"). KXYTTOPVIDEOG2D / KXYTTOPVIDEO2D: which video ranks #2 on the
+# YouTube Charts daily top music videos chart (global / US) dated the
+# ticker's UTC day. A live public view counter -- the open-scan tier rejects
+# it on `youtube.com` -- enrolled here as a size-capped PILOT with no fair:
+# the public tape paid makers (+1.3 / +13.4 c/ct over 20 / 21 events) because
+# #2 stays a toss-up even for the API watchers. Quoted only with the YT2_*
+# rules (see YT2_ENABLE); IMM_YT2_ENABLE=0 or IMM_ALLOW_YT2_SERIES="" takes
+# them out.
+_YT2_LIVE = os.environ.get("IMM_YT2_ENABLE", "1") == "1"
+_DEFAULT_YT2_SERIES = "KXYTTOPVIDEOG2D,KXYTTOPVIDEO2D"
 # LONG-DATED MORTGAGE RATES (Jack 2026-09-28: "yes" to "build a fair-value
 # gate for KXFM30YMTG and KXMORTGAGERATE"): Freddie Mac PMMS year-end and
 # how-high-in-a-year markets, $100 per strike per period from 9/28. Enrolled
@@ -4567,6 +4585,11 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_VERCEL_SERIES",
                                         _DEFAULT_VERCEL_SERIES)
                          if _VERCEL_LIVE else "")
+                # YouTube #2 top-video pilot (2026-10-05): only while the
+                # pilot is on
+                + "," + (os.environ.get("IMM_ALLOW_YT2_SERIES",
+                                        _DEFAULT_YT2_SERIES)
+                         if _YT2_LIVE else "")
                 # long-dated mortgage rates (2026-09-28): only while the
                 # mortgage gate is on
                 + "," + (os.environ.get("IMM_ALLOW_MORT_SERIES",
@@ -7119,6 +7142,9 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_FAIR_TOL_CENTS", "VERCEL_FAIR_MIN_P", "VERCEL_FAIR_TTL_MIN",
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
+    # YouTube #2 top-video pilot (2026-10-05)
+    "YT2_ENABLE", "YT2_SERIES", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
+    "YT2_MAX_POSITION", "YT2_EVENT_CAP", "YT2_DAILY_LOSS_LIMIT",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -9424,6 +9450,74 @@ def vercel_gate_reason(ticker: str, now_ts: float,
 
 
 # ----------------------------------------------------------------------------
+# YOUTUBE #2 TOP-VIDEO PILOT (Jack 2026-10-05: "go ship the youtube #2
+# pilot"). KXYTTOPVIDEOG2D / KXYTTOPVIDEO2D-<YYMMMDD>-<video>: "Will <video>
+# rank #2 on YouTube Charts' Daily Top Music Videos Global / United States
+# chart dated <D>?", 15 videos per event, listed ~18:00Z on D-1, closing
+# 03:59Z on D+1 (23:59 ET D), $84.85/market-day programs.
+# WHY A PILOT WITHOUT A FAIR. The 10/05 check-in (KL-data/youtube-analysis-
+# 2026-10-05/verdict.md) scored the public tape of the complete events: in-
+# band makers made +1.3 c/ct global (20 events, CI -8.9/+12.6) and +13.4 c/ct
+# US (21 events, CI -4.3/+31.5); +28-31 c/ct on the 3 events since 10/01.
+# Unlike #1 (called 5/5 days from the API, -27 c/ct to makers after the chart
+# day), #2 stays a toss-up for the API watchers: a leading contender's chart/
+# API ratio swings 0.96-1.35. MODELLED net at 20 lots, the bot's own scorer
+# x0.7 plus measured markouts: +$6-15/day global, +$5-20/day US.
+# THE RULES (each its own knob):
+#   - quoted to the END OF THE UTC CHART DAY: cutoff 00:00Z on D+1 less
+#     YT2_CUTOFF_BEFORE_DAY_END_MIN (0) -- after it the day's API views are
+#     complete, and the final hour before the close cost makers 30 c/ct on
+#     US #2. cutoff_from_close_min=0 takes out the ticker-date midnight-ET
+#     rule (it would stop at 04:00Z on D, 20h early); the tightener in
+#     apply_series_cutoff_adjustments sets the real one. Unparseable ticker
+#     -> stood down.
+#   - 20 lots, x1 at every hour: the global ladder (IMM_LEVELS 0:20), a
+#     hand-set per-market cap (YT2_MAX_POSITION 100; a hand-tuned cap also
+#     opts out of every family size multiplier), daily (no quiet-hours,
+#     evening or Saturday size; KXYT is already out of the yield mode).
+#   - at most YT2_EVENT_CAP (100) net per event.
+#   - FAMILY DAILY LOSS HALT: the pilot's realized + marked P&L today (the
+#     5am-CT roll day, carried across restarts like pnl_today) at or below
+#     -YT2_DAILY_LOSS_LIMIT ($40) cancels the family's orders and stands it
+#     aside until the roll; positions ride to settlement. Emails "yt2_halt".
+#   - otherwise the normal book: selection, payout floor, pads, the toxic-
+#     flow side halt and the sweep breaker all apply as for any series.
+# Review: the 10/15 YouTube re-score scores the pilot from fills_*.jsonl.
+# Kill switch IMM_YT2_ENABLE=0 (or IMM_ALLOW_YT2_SERIES="") takes both
+# series out of the allowlist; positions ride.
+YT2_ENABLE = _YT2_LIVE
+YT2_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_YT2_SERIES", _DEFAULT_YT2_SERIES).split(",") if s.strip())
+YT2_CUTOFF_BEFORE_DAY_END_MIN = _env_int("IMM_YT2_CUTOFF_BEFORE_DAY_END_MIN", 0)
+YT2_MAX_POSITION = _env_float("IMM_YT2_MAX_POSITION", 100)
+YT2_EVENT_CAP = _env_float("IMM_YT2_EVENT_CAP", 100)
+YT2_DAILY_LOSS_LIMIT = _env_float("IMM_YT2_DAILY_LOSS_LIMIT", 40)
+
+for _s in YT2_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        cutoff_from_close_min=0, max_position=YT2_MAX_POSITION)
+
+
+def yt2_series(series: str) -> bool:
+    return YT2_ENABLE and series in YT2_SERIES
+
+
+def yt2_chart_day(event_ticker: str) -> Optional[datetime]:
+    """00:00Z of the UTC day D whose YouTube Charts daily chart a #2 event
+    settles on (the ticker's YYMMMDD). None when it does not parse."""
+    parts = (event_ticker or "").split("-")
+    if len(parts) < 2 or len(parts[1]) != 7:
+        return None
+    seg = parts[1]
+    try:
+        return datetime(2000 + int(seg[:2]), _MONTHS[seg[2:5]], int(seg[5:7]),
+                        tzinfo=timezone.utc)
+    except (KeyError, ValueError):
+        return None
+
+
+# ----------------------------------------------------------------------------
 # LONG-DATED MORTGAGE GATE (Jack 2026-09-28: "yes" to "block KX30YMORTW and
 # build a fair-value gate for KXFM30YMTG and KXMORTGAGERATE ... stop quoting
 # if its data went stale ... start from Freddie's latest weekly number and
@@ -10904,6 +10998,22 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         else:
             pre = d0 - timedelta(minutes=VERCEL_CUTOFF_BEFORE_D_MIN)
         cutoff = pre if cutoff is None else min(cutoff, pre)
+    if yt2_series(series):
+        # YOUTUBE #2 PILOT CUTOFF (2026-10-05, see YT2_ENABLE): out at the
+        # end of the UTC chart day the event settles on (00:00Z D+1) less
+        # YT2_CUTOFF_BEFORE_DAY_END_MIN. Unparseable -> stood down, once.
+        d0 = yt2_chart_day(event_ticker)
+        if d0 is None:
+            end = RELEASE_GUARD_UNKNOWN
+            if event_ticker not in _release_guard_warned:
+                _release_guard_warned.add(event_ticker)
+                log(f"[IMM] ! {series}: YouTube #2 cutoff needs the chart day "
+                    f"but {event_ticker} does not parse -- standing it down "
+                    f"(fail closed)")
+        else:
+            end = d0 + timedelta(days=1,
+                                 minutes=-YT2_CUTOFF_BEFORE_DAY_END_MIN)
+        cutoff = end if cutoff is None else min(cutoff, end)
     if mort_series(series):
         # LONG-DATED MORTGAGE CUTOFF (2026-09-28, see MORT_ENABLE): out
         # MORT_CUTOFF_BUFFER_DAYS before the measurement week of the first
@@ -12413,6 +12523,12 @@ class BotState:
     #   the first measurement of each process (like day_baseline)
     scan_pnl_carry: float = 0.0     # tier P&L today carried across restarts
     scan_pnl_today_last: float = 0.0
+    # YouTube #2 pilot daily loss halt (2026-10-05, YT2_DAILY_LOSS_LIMIT):
+    # the same baseline / carry / roll-day scheme as the scan tier's
+    yt2_halt_day: str = ""          # roll day (_halt_day_key) the halt tripped
+    yt2_pnl_baseline: Optional[float] = None   # NOT persisted
+    yt2_pnl_carry: float = 0.0      # pilot P&L today carried across restarts
+    yt2_pnl_today_last: float = 0.0
     programmed: Set[str] = field(default_factory=set)   # markets with a LIVE incentive
     #   program at the last universe refresh — the no-rent freeze (Jack 2026-07-26,
     #   KXRT: "why still quoting when the rewards have expired") keys off this
@@ -13625,6 +13741,7 @@ class IncentiveMarketMaker:
                 for s, v in (data.get("scan_series_meta") or {}).items()
                 if isinstance(v, dict)}
             self.state.scan_halt_day = str(data.get("scan_halt_day") or "")
+            self.state.yt2_halt_day = str(data.get("yt2_halt_day") or "")
             for _t in sorted(self.state.scan_book):
                 ensure_scan_override(series_of(_t))
             # MIGRATION (2026-08-04, first load after the paid-basis counters
@@ -13691,6 +13808,8 @@ class IncentiveMarketMaker:
                     data.get("account_value_day_start") or 0.0)
                 # open-scan tier P&L carry (same roll-day rule as pnl_carry)
                 self.state.scan_pnl_carry = float(data.get("scan_pnl_carry") or 0.0)
+                # YouTube #2 pilot P&L carry (2026-10-05), same rule
+                self.state.yt2_pnl_carry = float(data.get("yt2_pnl_carry") or 0.0)
                 if self.state.halted_until > time.time():
                     log(f"{self.tag} restored ACTIVE daily-loss halt "
                         f"(pnl carry ${self.state.pnl_carry:+.2f})")
@@ -13913,6 +14032,8 @@ class IncentiveMarketMaker:
                                < SCAN_SERIES_META_TTL_SECS},
                            "scan_halt_day": self.state.scan_halt_day,
                            "scan_pnl_carry": round(self.state.scan_pnl_today_last, 2),
+                           "yt2_halt_day": self.state.yt2_halt_day,
+                           "yt2_pnl_carry": round(self.state.yt2_pnl_today_last, 2),
                            # live-event depth halts (pruned with the same 7d
                            # TTL: mention events settle within a day, this
                            # just stops dead events accreting)
@@ -16835,6 +16956,21 @@ class IncentiveMarketMaker:
                 total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
         return total
 
+    def _yt2_pnl(self) -> float:
+        """The YouTube #2 pilot's realized + mark-to-market over every ticker
+        of its series in the bot's own P&L book (in-process realized; the
+        cross-restart composition is yt2_pnl_carry)."""
+        total = 0.0
+        for t in set(self.pnl.realized) | set(self.pnl.pos):
+            if not yt2_series(series_of(t)):
+                continue
+            total += self.pnl.realized.get(t, 0.0)
+            p = self.pnl.pos.get(t, 0.0)
+            mark = self.state.last_mark.get(t)
+            if abs(p) > 1e-9 and mark is not None:
+                total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
+        return total
+
     def _coverage(self, ticker: str, counted: bool) -> float:
         """Update + return the per-market counted-snapshot EMA.
 
@@ -18933,6 +19069,17 @@ class IncentiveMarketMaker:
                 self._vercel_stood.discard(t)
                 log(f"{self.tag} vercel resume {t}")
 
+            # YOUTUBE #2 PILOT LOSS HALT (Jack 2026-10-05, see YT2_ENABLE):
+            # the family's daily loss limit tripped this roll day -- stood
+            # aside, both sides, until the 5am-CT roll; positions ride.
+            if yt2_series(meta.series) \
+                    and self.state.yt2_halt_day == _halt_day_key(now_utc):
+                self.cancel_market_orders(t, resting)
+                yt2_in = {"pnl_today": round(self.state.yt2_pnl_today_last, 2),
+                          "limit": YT2_DAILY_LOSS_LIMIT}
+                self._gskip(t, "yt2_halt", lambda: yt2_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                continue
+
             # TREASURY GATE (Jack 2026-10-01, see TREASURY_GATE_ENABLE; every
             # Treasury series since 2026-10-02, TREASURY_GATE_ALL): quoted
             # only against the live CNBC yield's fair; fails CLOSED without a
@@ -19552,6 +19699,37 @@ class IncentiveMarketMaker:
                     f"{len(halted_ids)} scan member(s) and closed the tier "
                     f"until the {SUMMARY_HOUR_CT}am CT roll (inventory winds down reduce-only)",
                     key="scan_halt")
+                self._save_persist()
+
+        # YOUTUBE #2 PILOT DAILY LOSS HALT (Jack 2026-10-05, see YT2_ENABLE):
+        # the pilot's realized + marked P&L today, composed across restarts
+        # like the scan tier's. At -YT2_DAILY_LOSS_LIMIT its orders are
+        # cancelled now and the quote loop stands the family aside until the
+        # 5am-CT roll (yt2_halt_day); positions ride to settlement.
+        if YT2_ENABLE and YT2_DAILY_LOSS_LIMIT > 0 and not fast_only:
+            yt2_total = self._yt2_pnl()
+            if self.state.yt2_pnl_baseline is None:
+                self.state.yt2_pnl_baseline = yt2_total
+            yt2_today = (yt2_total - self.state.yt2_pnl_baseline
+                         + self.state.yt2_pnl_carry)
+            self.state.yt2_pnl_today_last = yt2_today
+            _roll_day = _halt_day_key(now_utc)
+            if yt2_today <= -YT2_DAILY_LOSS_LIMIT \
+                    and self.state.yt2_halt_day != _roll_day:
+                self.state.yt2_halt_day = _roll_day
+                halted_ids = {str(o.get("ticker", "")) for o in resting
+                              if yt2_series(series_of(str(o.get("ticker", ""))))}
+                n_cx = 0
+                for t_h in sorted(halted_ids):
+                    n_cx += self.cancel_market_orders(t_h, resting)
+                desired = [q for q in desired if not yt2_series(series_of(q.ticker))]
+                self.alerter.alert(
+                    "yt2_halt",
+                    f"YouTube #2 pilot P&L today ${yt2_today:+.2f} <= "
+                    f"-${YT2_DAILY_LOSS_LIMIT:.0f}; cancelled {n_cx} orders on "
+                    f"{len(halted_ids)} market(s) and stood the family aside "
+                    f"until the {SUMMARY_HOUR_CT}am CT roll (positions ride)",
+                    key="yt2_halt")
                 self._save_persist()
 
         # TOXIC-FLOW SIDE HALT (Jack 2026-09-29, see TOXIC_HALT): judge the
@@ -20193,6 +20371,11 @@ class IncentiveMarketMaker:
         s.scan_pnl_baseline = None
         s.scan_pnl_carry = 0.0
         s.scan_pnl_today_last = 0.0
+        # YouTube #2 pilot loss halt: the same roll (yt2_halt_day is keyed by
+        # the roll day, so a tripped halt simply stops matching)
+        s.yt2_pnl_baseline = None
+        s.yt2_pnl_carry = 0.0
+        s.yt2_pnl_today_last = 0.0
         s.scan_book = {t for t in s.scan_book
                        if t in s.scan_members
                        or abs(self.pnl.pos.get(t, 0.0)) > 1e-9}
@@ -21155,6 +21338,19 @@ class IncentiveMarketMaker:
                 + f", file {VERCEL_FAIR_FILE}")
         else:
             log("vercel gate: OFF -- the Vercel series are not enrolled")
+        if YT2_ENABLE:
+            log(f"yt2 pilot: {','.join(sorted(YT2_SERIES))} quoted plain to "
+                f"00:00Z after the chart day"
+                + (f" less {YT2_CUTOFF_BEFORE_DAY_END_MIN}m"
+                   if YT2_CUTOFF_BEFORE_DAY_END_MIN else "")
+                + f", x1 at every hour, {YT2_MAX_POSITION:g}/market and "
+                f"{YT2_EVENT_CAP:g}/event net, family halt at "
+                f"-${YT2_DAILY_LOSS_LIMIT:g} P&L today"
+                + (f" (HALTED this roll day, ${self.state.yt2_pnl_carry:+.2f})"
+                   if self.state.yt2_halt_day == _halt_day_key(
+                       datetime.now(timezone.utc)) else ""))
+        else:
+            log("yt2 pilot: OFF -- the YouTube #2 series are not enrolled")
         if TREASURY_GATE_ENABLE:
             log("treasury gate: "
                 + (f"ALL {len(TREASURY_GATED_SERIES)} Treasury series"

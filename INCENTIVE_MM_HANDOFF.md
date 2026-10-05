@@ -8043,3 +8043,72 @@ Friday anchor pricing a Sunday D on both anchors, the Moonshot rebound in
 sqrt space on both anchors with no mass below zero, plain series
 unchanged, the model block + "adj", the 100-day history read);
 test_incentive_mm.TestVercelPreDGate unchanged and green.
+
+## 2026-10-05 — YouTube #2 top-video PILOT: KXYTTOPVIDEOG2D / KXYTTOPVIDEO2D quoted plain at 20 lots to the end of the chart day, 100/event, $40/day family halt (Jack)
+
+Jack, on the 10/05 YouTube check-in: "why not softlaunch the viable youtube
+markets yet?", then (after the proposed spec) "go ship the youtube #2 pilot".
+
+WHY THESE TWO, AND WITHOUT A FAIR. Check-in: KL-data/youtube-analysis-
+2026-10-05/verdict.md (markouts_out.txt, fill_cost_out.txt, reward_out.txt).
+Each event asks which video ranks #2 on the YouTube Charts daily top music
+videos chart (global / US) dated the ticker's UTC day D: 15 videos, listed
+~18:00Z on D-1, closing 03:59Z D+1, $84.85 per market-day. MEASURED on the
+public tape (complete events, in band): makers +1.3 c/ct global (20 events,
+69.5k ct, CI -8.9/+12.6) and +13.4 c/ct US (21 events, 73k ct, CI -4.3/
++31.5); +31 / +28 c/ct on the 3 events since 10/01. #2 stays a toss-up for
+the API watchers (a leading contender's chart/API ratio swings 0.96-1.35,
+the model called #2 on 2 of 5 days), unlike #1 (called 5/5; makers -27 c/ct
+after the chart day). MODELLED at 20 lots (the bot's own scorer x0.7 + fills
+x measured markouts, two fill models): +$6-15/day global, +$5-20/day US.
+Not piloted: KXYTVIEWSW (makers -5.1 c/ct, every complete week negative),
+KXYTVIEWSHIGH, #1 global (one market in band), KXYTVIEWSD.
+
+THE RULES (code: the YT2_* block after the Vercel gate):
+- Allowlist: IMM_ALLOW_YT2_SERIES (default the two) while IMM_YT2_ENABLE=1.
+  Normal book otherwise: selection, payout floor, pads, the toxic-flow side
+  halt and the sweep breaker apply as for any series. Joins the touch (no
+  safe_join).
+- Cutoff: 00:00Z on D+1 (the end of the UTC chart day) less
+  IMM_YT2_CUTOFF_BEFORE_DAY_END_MIN (0). cutoff_from_close_min=0 takes out
+  the ticker-date midnight-ET rule (it would have stopped at 04:00Z on D);
+  the tightener in apply_series_cutoff_adjustments sets the real cutoff;
+  an unparseable ticker is stood down (fail closed). After the chart day
+  the API views are complete; the final hour before the close cost makers
+  30 c/ct on US #2.
+- Size: x1 at every hour -- the global ladder (IMM_LEVELS 0:20 = one 20-lot
+  rung at the touch), is_daily_series (no quiet-hours / evening / Saturday
+  size), KXYT already out of the yield mode, and a hand-set per-market cap
+  (YT2_MAX_POSITION 100) that also opts out of every family multiplier.
+- YT2_EVENT_CAP 100 net per event (event_cap_contracts, the share family's
+  wire).
+- FAMILY DAILY LOSS HALT: the pilot's realized + marked P&L today (5am-CT
+  roll day; baseline / carry across restarts exactly like the scan tier's
+  loss budget) at or below -IMM_YT2_DAILY_LOSS_LIMIT ($40) cancels the
+  family's orders, emails "yt2_halt", and the quote loop stands both series
+  aside (guard "yt2_halt") until the roll. Positions ride to settlement.
+  State: yt2_halt_day + yt2_pnl_carry persisted.
+
+STARTUP LINE: "yt2 pilot: KXYTTOPVIDEO2D,KXYTTOPVIDEOG2D quoted plain to
+00:00Z after the chart day, x1 at every hour, 100/market and 100/event net,
+family halt at -$40 P&L today".
+
+KILL SWITCH: IMM_YT2_ENABLE=0 (or IMM_ALLOW_YT2_SERIES="") takes both out of
+the allowlist; positions ride. Env => restart_imm.ps1 -Task.
+
+REVIEW: the 10/15 YouTube re-score task (scheduled-tasks youtube-markets-
+rescore-oct15) checks whether this shipped and scores it from fills_*.jsonl
+(our markouts at settlement, rewards, net/day vs the modelled +$11-34) ->
+KEEP / CHANGE / STOP.
+
+WATCH: the 26OCT06 events list ~18:00Z 10/05 and quote to 00:00Z 10/07.
+Contended strikes (two-sided, mid 5-95) should rest 20 a side at the touch;
+decided ones sit out on extreme_mid. guard_skips "yt2_halt" only after a
+trip. Unlisted winners (all listed markets NO) hit 3 of 25 #2 events since
+9/9 -- the 100/event cap is the bound.
+
+Tests: TestYouTube2Pilot (enrolment, x1 at quiet / evening / Saturday
+hours, 100/100 caps, the rest of the YouTube catalog stays out under
+ALLOWLIST_ONLY, the end-of-chart-day cutoff incl. the knob and fail-closed,
+quotes end to end, the loss halt: inside / past the limit, alert, stays
+aside, persists across a restart, resumes at the roll).

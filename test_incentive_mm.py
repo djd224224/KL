@@ -17932,6 +17932,139 @@ class TestVercelPreDGate(unittest.TestCase):
         self.assertIn(self.T, bot._vercel_stood)
 
 
+
+class TestYouTube2Pilot(unittest.TestCase):
+    """The YouTube #2 top-video pilot (Jack 2026-10-05: "go ship the youtube
+    #2 pilot"): KXYTTOPVIDEOG2D / KXYTTOPVIDEO2D quoted plain, x1 at every
+    hour, to the end of the UTC chart day, 100 per market and per event, and a
+    family daily loss halt. Fixture event KXYTTOPVIDEOG2D-68DEC05 (chart day
+    2068-12-05, far from any cutoff)."""
+
+    T = "KXYTTOPVIDEOG2D-68DEC05-XAM"
+    EV = "KXYTTOPVIDEOG2D-68DEC05"
+    CLOSE = datetime(2068, 12, 6, 3, 59, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_enrolled_x1_daily_with_caps(self):
+        for s in ("KXYTTOPVIDEOG2D", "KXYTTOPVIDEO2D"):
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.yt2_series(s), s)
+            ov = imm.series_override(s)
+            self.assertEqual(ov.cutoff_from_close_min, 0, s)   # ticker rule out
+            self.assertEqual(ov.max_position, imm.YT2_MAX_POSITION, s)
+            self.assertFalse(ov.safe_join, s)                  # joins the touch
+            self.assertTrue(imm.is_daily_series(s), s)
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+            self.assertEqual(imm.series_max_position(s), 100.0, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-26OCT05"), 100.0, s)
+            self.assertFalse(imm.yield_size_eligible(s), s)
+            # x1 at a quiet hour, in the evening window and on a Saturday
+            for when in (datetime(2026, 10, 6, 7, 0, tzinfo=timezone.utc),
+                         datetime(2026, 10, 6, 23, 30, tzinfo=timezone.utc),
+                         datetime(2026, 10, 10, 15, 0, tzinfo=timezone.utc)):
+                self.assertEqual(imm.hour_size_mult(s, when), 1.0, (s, when))
+        # the rest of the YouTube catalog stays out (the suite runs with
+        # ALLOWLIST_ONLY off; live it is on)
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for s in ("KXYTDAILYTOPVIDEOG", "KXYTVIEWSW", "KXYTVIEWSHIGH",
+                      "KXYTVIEWSD"):
+                self.assertNotIn(s, imm.ALLOW_SERIES, s)
+                self.assertFalse(imm.yt2_series(s), s)
+                self.assertFalse(IncentiveMarketMaker._allowed(f"{s}-26OCT05-X"), s)
+            self.assertTrue(IncentiveMarketMaker._allowed("KXYTTOPVIDEO2D-26OCT05-DAI"))
+            self.assertTrue(IncentiveMarketMaker._allowed("KXYTTOPVIDEOG2D-26OCT05-XAM"))
+
+    def test_cutoff_is_the_end_of_the_utc_chart_day(self):
+        close = datetime(2026, 10, 6, 3, 59, tzinfo=timezone.utc)
+        end = datetime(2026, 10, 6, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.yt2_chart_day("KXYTTOPVIDEOG2D-26OCT05"),
+                         datetime(2026, 10, 5, tzinfo=timezone.utc))
+        # the producer hands a close-anchored series close - 0 = close
+        for s in ("KXYTTOPVIDEOG2D", "KXYTTOPVIDEO2D"):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                s, f"{s}-26OCT05", close, close_time=close), end, s)
+        with mock.patch.object(imm, "YT2_CUTOFF_BEFORE_DAY_END_MIN", 30):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-26OCT05", close,
+                close_time=close), end - timedelta(minutes=30))
+        self.assertIsNone(imm.yt2_chart_day("KXYTTOPVIDEO2D-XYZ"))
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-XYZ", close, close_time=close),
+            imm.RELEASE_GUARD_UNKNOWN)
+        # kill switch: not a pilot series, so no pilot cutoff
+        with mock.patch.object(imm, "YT2_ENABLE", False):
+            self.assertFalse(imm.yt2_series("KXYTTOPVIDEOG2D"))
+
+    def test_quotes_and_the_family_loss_halt(self):
+        bot = self._bot()
+        bot.run_cycle()                       # baseline anchors at 0
+        q = self._quotes(bot)
+        self.assertIn("bid", {s_ for s_, _p in q})
+        self.assertIn("ask", {s_ for s_, _p in q})
+        self.assertEqual(bot.state.yt2_pnl_baseline, 0.0)
+        self.assertEqual(bot.state.yt2_halt_day, "")
+        # a loss inside the limit: still quoting
+        bot.pnl.realized[self.T] = -(imm.YT2_DAILY_LOSS_LIMIT - 1)
+        bot.run_cycle()
+        self.assertAlmostEqual(bot.state.yt2_pnl_today_last,
+                               -(imm.YT2_DAILY_LOSS_LIMIT - 1))
+        self.assertEqual(bot.state.yt2_halt_day, "")
+        self.assertNotEqual(self._quotes(bot), [])
+        # past it: the family halts until the roll
+        bot.pnl.realized[self.T] = -(imm.YT2_DAILY_LOSS_LIMIT + 1)
+        bot.run_cycle()
+        roll_day = imm._halt_day_key(datetime.now(timezone.utc))
+        self.assertEqual(bot.state.yt2_halt_day, roll_day)
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn("yt2_halt", [c for c, _m in bot.alerter.today])
+        self.assertEqual(bot.state.halted_until, 0.0)      # whole book untouched
+        bot.run_cycle()                                    # stays aside
+        self.assertEqual(self._quotes(bot), [])
+        # the halt day and the P&L carry persist across a restart
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+        self.assertEqual(bot2.state.yt2_halt_day, roll_day)
+        self.assertAlmostEqual(bot2.state.yt2_pnl_carry,
+                               -(imm.YT2_DAILY_LOSS_LIMIT + 1))
+        # next roll day: quoting resumes
+        bot.state.yt2_halt_day = "2000-01-01"
+        bot.state.yt2_pnl_baseline = None
+        bot.pnl.realized[self.T] = 0.0
+        bot.run_cycle()
+        self.assertNotEqual(self._quotes(bot), [])
+        self.assertEqual(bot.state.yt2_halt_day, "2000-01-01")
+
 class TestTreasuryTouchGate(unittest.TestCase):
     """Jack 2026-10-01 ("i got sniped on KX10YRDIRLM-26OCT30L ... i got
     permission on cnbc"): the how-high / how-low ladders quote only against
@@ -19389,8 +19522,9 @@ class TestGuardSkipSink(unittest.TestCase):
         # (2026-09-28) + the data center count gate (2026-10-01) + the
         # OpenRouter market-share gate (2026-09-30) + the monthly rain gate
         # (2026-10-01) + the Treasury touch gate (2026-10-01) + the Pokemon
-        # gate (2026-10-03) + the NFL player-prop gate (2026-10-03)
-        self.assertEqual(len(conts), 36)
+        # gate (2026-10-03) + the NFL player-prop gate (2026-10-03) + the
+        # YouTube #2 pilot's family loss halt (2026-10-05)
+        self.assertEqual(len(conts), 37)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
