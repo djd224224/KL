@@ -932,8 +932,10 @@ RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN = _env_int(
 # per-market cap (150 -> 300 net) and the per-event cap (1,000 -> 2,000)
 # together, and the floor projection sees the doubled ladder. As "daily"
 # KXRAIN the family still takes no quiet-hours / Saturday / yield size, and
-# the KXRAIN 7pm-01:59 ET halving brings the evenings back to x1. The
-# snow monthlies take the same x2 (SNOW_MONTHLY_SIZE_MULT).
+# since 2026-10-05 not the KXRAIN 7pm-01:59 ET halving either (Jack: "isnt
+# at 2x" -- it rested the season at x1 every evening; rain_period_member in
+# _hour_window_mult): x2 at every hour. The snow monthlies take the same x2
+# (SNOW_MONTHLY_SIZE_MULT); no hour window ever matched them.
 # IMM_RAIN_PERIOD_SIZE_MULT=1.0 reverts (env => task-level restart).
 RAIN_PERIOD_SIZE_MULT = _env_float("IMM_RAIN_PERIOD_SIZE_MULT", 2.0)
 
@@ -951,6 +953,15 @@ def rain_period_gated(ticker: str) -> bool:
     the shape, minus the rainstorm spans (their own blind rule)."""
     return (RAIN_PERIOD_ENABLE and rain_period_ticker(ticker)
             and not RAINSTORM_SERIES_RE.fullmatch(ticker.split("-")[0]))
+
+
+def rain_period_member(series: str) -> bool:
+    """A series carrying the period-rain guard set: KXRAINNAPAM's override,
+    shared by KXRAINNYCW and every clone ensure_family_override made. (A
+    later per-series replace() would make its own copy and fall out -- into
+    the KXRAIN evening halving, the conservative side.)"""
+    ov = SERIES_OVERRIDES.get(series)
+    return ov is not None and ov is SERIES_OVERRIDES.get(RAIN_PERIOD_ARCHETYPE)
 
 
 def rain_period_family_series(series: str) -> bool:
@@ -1324,8 +1335,14 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     # its default for every other hour would silently cancel the global
     # window: adding the 4pm halving to KXDIESELD/KXAAAGASD would have taken
     # away their quiet-hours 3-7am x2 as a side effect, which nobody asked for.
+    # The period-rain family (KXRAINNAPAM) holds its x2 at every hour (Jack
+    # 2026-10-05, "KXRAINNAPAM-01NOV26-31MAR27 isnt at 2x"): the KXRAIN
+    # 19-1 ET halving matched it by prefix and rested the season at x1 every
+    # evening. That window is the rain DAILIES' (the evening before the rain
+    # day is informed by it); a November-March total has no such evening.
     for prefix, hours in SERIES_HOUR_MULTS:
-        if series.startswith(prefix) and hour in hours:
+        if series.startswith(prefix) and hour in hours \
+                and not rain_period_member(series):
             return hours[hour]
     # Daily (print) families never take the GLOBAL window (Jack 2026-09-12,
     # with the 0-9am ET extension): the quiet hours are quiet for long-dated

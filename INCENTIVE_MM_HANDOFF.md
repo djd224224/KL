@@ -7951,3 +7951,15 @@ or yield size); the KXRAIN 7pm-01:59 ET halving still applies to the rain
 family (evenings x1). The KXRAIN<CITY>M monthlies are unchanged (x1).
 Revert: IMM_RAIN_PERIOD_SIZE_MULT=1.0 / IMM_SNOW_MONTHLY_SIZE_MULT=1.0
 (env => restart_imm.ps1 -Task).
+
+### 2026-10-05 00:40 ET — the period-rain family keeps x2 in the evenings (Jack)
+
+Jack: "KXRAINNAPAM-01NOV26-31MAR27 isnt at 2x". The x2 was on (T15 10/30 ->
+20/60 at 23:37Z), but IMM_SERIES_HOUR_MULT's KXRAIN:19-1:0.5 matched
+KXRAINNAPAM by prefix, so from 19:00 to 01:59 ET the season rested at x1
+(20 a side). That halving is the rain DAILIES' (the evening before the rain
+day is informed by it); a November-March total has no such evening.
+_hour_window_mult now skips the per-series windows for rain_period_member
+series (KXRAINNAPAM's override object: KXRAINNYCW and every clone): x2 at
+every hour. KXRAIN dailies, KXRAINWKND and the KXRAIN<CITY>M monthlies keep
+the halving; the snow monthlies never matched an hour window.

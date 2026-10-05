@@ -10860,6 +10860,26 @@ class TestRainPeriodGate(unittest.TestCase):
             self.assertEqual([q for _t, q in imm.base_scaled_levels(s)],
                              [max(1, int(q * 2 + 0.5)) for _t, q in imm.series_levels(s)], s)
         self.assertIn("RAIN_PERIOD_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
+        # ...at every hour (Jack 2026-10-05, "KXRAINNAPAM-01NOV26-31MAR27
+        # isnt at 2x"): the KXRAIN 19-1 ET halving stays the dailies' and
+        # the city monthlies', never the period family's (a clone included)
+        imm.SERIES_HOUR_MULTS = imm._parse_series_hour_mults("KXRAIN:19-1:0.5")
+        imm.SERIES_OVERRIDES.pop("KXRAINSONOMAM", None)
+        try:
+            imm.ensure_family_override("KXRAINSONOMAM")
+            evening = utc(2026, 10, 5, 4, 30)            # 00:30 EDT Monday
+            noon = utc(2026, 10, 5, 16, 0)
+            for s in ("KXRAINNAPAM", "KXRAINNYCW", "KXRAINSONOMAM"):
+                self.assertTrue(imm.rain_period_member(s), s)
+                self.assertEqual(imm.hour_size_mult(s, evening), 1.0, s)
+                self.assertEqual([q for _t, q in imm.hour_scaled_levels(s, evening)],
+                                 [q for _t, q in imm.hour_scaled_levels(s, noon)], s)
+            for s in ("KXRAIN", "KXRAINWKND", "KXRAINCHIM"):
+                self.assertFalse(imm.rain_period_member(s), s)
+                self.assertEqual(imm.hour_size_mult(s, evening), 0.5, s)
+                self.assertEqual(imm.hour_size_mult(s, noon), 1.0, s)
+        finally:
+            imm.SERIES_OVERRIDES.pop("KXRAINSONOMAM", None)
         # a new city clones the archetype at first sight; a rainstorm city
         # still takes the span archetype (out at the start date)
         for s in ("KXRAINSONOMAM", "KXRAINSCHI"):
