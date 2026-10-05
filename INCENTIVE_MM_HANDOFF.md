@@ -8112,3 +8112,16 @@ hours, 100/100 caps, the rest of the YouTube catalog stays out under
 ALLOWLIST_ONLY, the end-of-chart-day cutoff incl. the knob and fail-closed,
 quotes end to end, the loss halt: inside / past the limit, alert, stays
 aside, persists across a restart, resumes at the roll).
+
+### 2026-10-05 16:10Z — the YouTube #2 pilot rests exactly 20 lots: no deep-reference size (YT2_REF_MULT_CAP 1.0)
+
+First live cycle (16:01Z, KXYTTOPVIDEOG2D-26OCT05): bids 20 at the touch,
+but asks 50 on XAM (55c, 6 ticks behind a 49 touch) and 30 on CAS (41c, 2
+behind 39) -- the atref deep-reference multiplier (+0.25 per tick behind,
+to 3x), not the 20 lots the pilot was approved at. capped_ref_mult now caps
+the pilot's multiplier at IMM_YT2_REF_MULT_CAP (1.0), the same lever the open
+scan used (SCAN_REF_MULT_CAP): the rung still rests at the reference level
+(full reward weight, fills only after the band above is eaten), 20 lots
+however deep. Every sizing site (ladder total, estimator meta, live side
+rooms) reads capped_ref_mult with the series. Test: TestYouTube2Pilot
+(capped_ref_mult 1.0 for both pilot series, > 1 for a plain series).

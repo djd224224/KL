@@ -17994,6 +17994,13 @@ class TestYouTube2Pilot(unittest.TestCase):
                          datetime(2026, 10, 6, 23, 30, tzinfo=timezone.utc),
                          datetime(2026, 10, 10, 15, 0, tzinfo=timezone.utc)):
                 self.assertEqual(imm.hour_size_mult(s, when), 1.0, (s, when))
+        # no deep-reference size: 20 lots wherever the atref rung rests (the
+        # first live cycle rested a 50-lot ask 6 ticks behind the touch)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            for s in ("KXYTTOPVIDEOG2D", "KXYTTOPVIDEO2D"):
+                self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0, s)
+                self.assertEqual(imm.capped_ref_mult(42, 36, "bid", series=s), 1.0, s)
+            self.assertGreater(imm.capped_ref_mult(49, 55, "ask", series="KXOPENVREQ"), 1.0)
         # the rest of the YouTube catalog stays out (the suite runs with
         # ALLOWLIST_ONLY off; live it is on)
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):

@@ -235,6 +235,12 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and SCAN_REF_MULT_CAP > 0 \
             and series in SCAN_GUARDED_SERIES:
         m = min(m, max(1.0, SCAN_REF_MULT_CAP))
+    # the YouTube #2 pilot (2026-10-05) rests its 20 lots at the reference
+    # level without the deep-reference size: YT2_REF_MULT_CAP, 1.0 (read at
+    # call time -- defined with the pilot block further down)
+    if series is not None and globals().get("YT2_ENABLE") \
+            and series in globals().get("YT2_SERIES", ()):
+        m = min(m, max(1.0, globals().get("YT2_REF_MULT_CAP", 1.0)))
     return m
 
 
@@ -7144,7 +7150,7 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
     # YouTube #2 top-video pilot (2026-10-05)
     "YT2_ENABLE", "YT2_SERIES", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
-    "YT2_MAX_POSITION", "YT2_EVENT_CAP", "YT2_DAILY_LOSS_LIMIT",
+    "YT2_MAX_POSITION", "YT2_REF_MULT_CAP", "YT2_EVENT_CAP", "YT2_DAILY_LOSS_LIMIT",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -9474,7 +9480,10 @@ def vercel_gate_reason(ticker: str, now_ts: float,
 #   - 20 lots, x1 at every hour: the global ladder (IMM_LEVELS 0:20), a
 #     hand-set per-market cap (YT2_MAX_POSITION 100; a hand-tuned cap also
 #     opts out of every family size multiplier), daily (no quiet-hours,
-#     evening or Saturday size; KXYT is already out of the yield mode).
+#     evening or Saturday size; KXYT is already out of the yield mode), and
+#     no deep-reference size (YT2_REF_MULT_CAP 1.0 in capped_ref_mult: the
+#     atref rung still rests at the reference level, 20 lots however deep --
+#     the first live cycle rested 50 / 30 asks 6 / 2 ticks behind the touch).
 #   - at most YT2_EVENT_CAP (100) net per event.
 #   - FAMILY DAILY LOSS HALT: the pilot's realized + marked P&L today (the
 #     5am-CT roll day, carried across restarts like pnl_today) at or below
@@ -9490,6 +9499,7 @@ YT2_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_YT2_SERIES", _DEFAULT_YT2_SERIES).split(",") if s.strip())
 YT2_CUTOFF_BEFORE_DAY_END_MIN = _env_int("IMM_YT2_CUTOFF_BEFORE_DAY_END_MIN", 0)
 YT2_MAX_POSITION = _env_float("IMM_YT2_MAX_POSITION", 100)
+YT2_REF_MULT_CAP = _env_float("IMM_YT2_REF_MULT_CAP", 1.0)
 YT2_EVENT_CAP = _env_float("IMM_YT2_EVENT_CAP", 100)
 YT2_DAILY_LOSS_LIMIT = _env_float("IMM_YT2_DAILY_LOSS_LIMIT", 40)
 
@@ -21351,7 +21361,8 @@ class IncentiveMarketMaker:
                 f"00:00Z after the chart day"
                 + (f" less {YT2_CUTOFF_BEFORE_DAY_END_MIN}m"
                    if YT2_CUTOFF_BEFORE_DAY_END_MIN else "")
-                + f", x1 at every hour, {YT2_MAX_POSITION:g}/market and "
+                + f", x1 at every hour (deep-ref cap {YT2_REF_MULT_CAP:g}), "
+                f"{YT2_MAX_POSITION:g}/market and "
                 f"{YT2_EVENT_CAP:g}/event net, family halt at "
                 f"-${YT2_DAILY_LOSS_LIMIT:g} P&L today"
                 + (f" (HALTED this roll day, ${self.state.yt2_pnl_carry:+.2f})"
