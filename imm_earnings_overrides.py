@@ -826,10 +826,56 @@ def _wh_words(s: str) -> set:
     return out
 
 
-def wh_schedule_start(title: str, date_et):
+# PLACE FALLBACK (2026-10-05, KXTRUMPMENTION-26OCT05 "his rally in Nebraska"):
+# the timed entry was "The President delivers Remarks [6:00 PM Local]" at
+# "Pinnacle Bank Expo Center, Grand Island, NE" -- not one word in common with
+# the title, so the event went UNRESOLVED and the bot ran it on the ticker-day
+# live gate (halted twice, 21h and 9h before a 7pm speech). Kalshi's sub_title
+# names the place ("Midterm Rally in Grand Island, Nebraska") and the entry's
+# LOCATION carries it. Only when the title-vs-details match finds nothing or
+# ties (AUG05 Las Vegas: nine entries naming the city tied at 2 words, the
+# remarks scored 1; the fallback picks them 3-to-2, the hand-set 16:30):
+# (title + sub_title) vs (details + location), trailing state code spelled out
+# for one-word states, numbers and the generic venue words every White House
+# entry shares dropped -- the same >=2-word, unique-best rule, so a tie (the
+# remarks AND a timed departure to the same city) still resolves to nothing.
+_WH_PLACE_STOP = frozenset(_wh_words(
+    "donald originally scheduled for white house oval office room center "
+    "joint base andrews january february march april may june july august "
+    "september october november december"))
+_WH_STATES = dict(s.split("=") for s in (
+    "AL=alabama AK=alaska AZ=arizona AR=arkansas CA=california CO=colorado "
+    "CT=connecticut DE=delaware FL=florida GA=georgia HI=hawaii ID=idaho "
+    "IL=illinois IN=indiana IA=iowa KS=kansas KY=kentucky LA=louisiana "
+    "ME=maine MD=maryland MA=massachusetts MI=michigan MN=minnesota "
+    "MS=mississippi MO=missouri MT=montana NE=nebraska NV=nevada OH=ohio "
+    "OK=oklahoma OR=oregon PA=pennsylvania TN=tennessee TX=texas UT=utah "
+    "VT=vermont VA=virginia WA=washington WI=wisconsin WY=wyoming").split())
+
+
+def _wh_place_words(s: str) -> set:
+    s = s.strip()
+    m = re.search(r",\s*([A-Z]{2})$", s)
+    if m and m.group(1) in _WH_STATES:
+        s = s[:m.start()] + " " + _WH_STATES[m.group(1)]
+    return {w for w in _wh_words(s) if w not in _WH_PLACE_STOP and not w.isdigit()}
+
+
+def _wh_unique_best(entries, score):
+    """The single entry with the top score (>= 2 shared words), or None when
+    nothing scores or the top score is tied (ambiguous match)."""
+    scored = sorted(((score(e), e) for e in entries), key=lambda x: -x[0])
+    scored = [x for x in scored if x[0] >= 2]
+    if not scored or (len(scored) > 1 and scored[0][0] == scored[1][0]):
+        return None
+    return scored[0][1]
+
+
+def wh_schedule_start(title: str, date_et, sub_title: str = ""):
     """(datetime ET, matched schedule details) from the Factbase WH calendar:
     the UNIQUE best keyword match on that date with >=2 shared content words
-    and a concrete time, else None."""
+    and a concrete time, else None. Title vs details first; the place
+    fallback (see _WH_PLACE_STOP) when that finds nothing or ties."""
     if "entries" not in _wh_cache:
         try:
             r = requests.get(WH_SCHEDULE_JSON, headers=UA, timeout=20)
@@ -840,20 +886,17 @@ def wh_schedule_start(title: str, date_et):
         except Exception as e:
             log(f"! WH schedule fetch failed: {e}")
             _wh_cache["entries"] = []
+    day = [it for it in _wh_cache["entries"]
+           if str(it.get("date")) == date_et.isoformat() and it.get("time")]
     want = _wh_words(title)
-    scored = []
-    for it in _wh_cache["entries"]:
-        if str(it.get("date")) != date_et.isoformat() or not it.get("time"):
-            continue
-        sc = len(want & _wh_words(str(it.get("details") or "")))
-        if sc >= 2:
-            scored.append((sc, it))
-    if not scored:
+    it = _wh_unique_best(day, lambda e: len(
+        want & _wh_words(str(e.get("details") or ""))))
+    if it is None and sub_title:
+        place = _wh_place_words(f"{title} {sub_title}")
+        it = _wh_unique_best(day, lambda e: len(place & _wh_place_words(
+            f"{e.get('details') or ''} {e.get('location') or ''}")))
+    if it is None:
         return None
-    scored.sort(key=lambda x: -x[0])
-    if len(scored) > 1 and scored[0][0] == scored[1][0]:
-        return None                              # ambiguous match
-    it = scored[0][1]
     try:
         hh, mm = str(it["time"]).split(":")[:2]
         dt = ET.localize(datetime(date_et.year, date_et.month, date_et.day,
@@ -1254,17 +1297,18 @@ def main(argv=None) -> int:
     for ev, series in discover_broadcast_mention_events(client, now):
         if ev in EVENT_START_OVERRIDES or ev in file_data:
             continue
-        title = ""
+        title = sub_title = ""
         try:
-            title = (((client.get_event(ev) or {}).get("event") or {})
-                     .get("title")) or ""
+            _e = ((client.get_event(ev) or {}).get("event") or {})
+            title = _e.get("title") or ""
+            sub_title = _e.get("sub_title") or ""
         except Exception as e:
             log(f"! event fetch failed {ev}: {e}")
         d_et = parse_event_date(ev).astimezone(ET).date()
         # WH-schedule series (KXTRUMPMENTION*): try the Factbase calendar
         # before TVmaze — these events are appearances, not shows.
         if series.startswith(WH_SCHEDULE_SERIES):
-            wh = wh_schedule_start(title, d_et)
+            wh = wh_schedule_start(title, d_et, sub_title)
             if wh:
                 dt_et, det = wh
                 iso = dt_et.isoformat()

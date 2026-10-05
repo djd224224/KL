@@ -12346,6 +12346,44 @@ class TestLiveEventDepthGate(unittest.TestCase):
         self.assertNotIn(self.EV, bot.state.event_depth_halt)
         self.assertNotIn(self.EV, bot.state.event_live_halt)
 
+    def test_known_start_arms_noisy_triggers_late_jump_keeps_the_day(self):
+        """Point 7 (Jack 2026-10-05, 26OCT05 rally at 7pm ET): with a known
+        start, thin / one-sided / fill triggers wait for start - pre-arm;
+        the settled-strike jump keeps the ticker-day arm."""
+        now_ts = time.time()
+        far = datetime.fromtimestamp(now_ts + 365 * 86400, timezone.utc)
+        near = datetime.fromtimestamp(now_ts + 20 * 60, timezone.utc)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {self.EV: far}):
+            self.assertFalse(imm.event_live_gate_armed(self.EV, now_ts))
+            self.assertTrue(imm.event_live_gate_armed(self.EV, now_ts,
+                                                      jump=True))
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertTrue(self._event_orders(bot))      # prev_mid seeded ~50
+            # the words get said anyway: the jump still confirms LIVE
+            bot.client.books[self.B] = {"orderbook_fp": {
+                "yes_dollars": [["0.98", "150"]],
+                "no_dollars": [["0.01", "300"]]}}         # 98x99
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            self.assertIn(self.EV, bot.state.event_live_halt)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {self.EV: near}):
+            self.assertTrue(imm.event_live_gate_armed(self.EV, now_ts))
+        # no override: the ticker-day rule, as before
+        self.assertTrue(imm.event_live_gate_armed(self.EV, now_ts))
+
+    def test_known_start_far_out_thin_book_does_not_halt(self):
+        _clean_persist()
+        far = datetime.fromtimestamp(time.time() + 365 * 86400, timezone.utc)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {self.EV: far}):
+            bot = self._bot()
+            bot.run_cycle()
+            self._books(bot, 1200, 1200, 1200, 200)       # B goes thin
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            self.assertNotIn(self.EV, bot.state.event_depth_halt)
+            self.assertTrue(self._event_orders(bot))
+
     def test_event_live_clear_file_releases_a_confirm(self):
         bot = self._bot()
         bot.state.event_live_halt[self.EV] = time.time()

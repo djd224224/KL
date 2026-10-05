@@ -540,6 +540,21 @@ EVENT_FILL_HALT_STRIKES = _env_int("IMM_EVENT_FILL_STRIKES", 2)
 # live triggers arm. 0 = strictly the ticker day (ET).
 EVENT_LIVE_GATE_PREARM_SECS = _env_float(
     "IMM_EVENT_LIVE_GATE_PREARM_H", 4) * 3600.0
+# 7. KNOWN START BEATS THE TICKER DAY (Jack 2026-10-05, KXTRUMPMENTION-26OCT05:
+#    "doesnt this market have a definite time at 7pm today? it shouldnt be
+#    getting halted like this"). The Grand Island rally was on the WH schedule
+#    for 7:00pm ET, yet the ticker-day arm halted the event at 02:15Z (a sweep
+#    of one ask) and again at 14:09Z (MADE ask filled out, 30) -- 21h and 9h
+#    before a speech that cannot be live until it starts. Those were ordinary
+#    fills; the per-market sweep breaker and toxic halts already own them.
+#    With an event_start_overrides entry (the cutoff source: quoting already
+#    ends OVERRIDE_BUFFER_MIN before it), the thin / one-sided / fill-tripwire
+#    triggers arm only from start minus this pre-arm. The settled-strike JUMP
+#    confirm keeps the ticker-day arm: if an override is wrong and the speech
+#    runs early, the words getting said (mid out of band, d306d0e) still
+#    kills the event. Existing halts are untouched, as in point 6.
+EVENT_LIVE_GATE_START_PREARM_SECS = _env_float(
+    "IMM_EVENT_LIVE_GATE_START_PREARM_MIN", 30) * 60.0
 
 
 # NO-CUTOFF MENTION CLASS (Jack 2026-09-08, KXWORLDNEWSMENTION-26SEP08:
@@ -628,10 +643,19 @@ def series_event_depth_gated(series: str) -> bool:
     return ts is not None and time.time() - ts <= MENTION_NO_CUTOFF_TTL_SECS
 
 
-def event_live_gate_armed(event_ticker: str, now_ts: float) -> bool:
+def event_live_gate_armed(event_ticker: str, now_ts: float,
+                          jump: bool = False) -> bool:
     """Point 6 (Jack 2026-09-04): live stand-down triggers fire only when
     the event-ticker date is unknown (parse -> None) or now is past
-    midnight ET of that date minus the pre-arm. Known-future -> False."""
+    midnight ET of that date minus the pre-arm. Known-future -> False.
+
+    Point 7 (see EVENT_LIVE_GATE_START_PREARM_SECS): with a known start
+    (an EVENT_START_OVERRIDES entry) the noisy triggers -- thin, one-sided,
+    fill tripwire -- arm only from start minus that pre-arm. The jump
+    confirm (jump=True) keeps the ticker-date rule as the backstop."""
+    start = None if jump else EVENT_START_OVERRIDES.get(event_ticker)
+    if start is not None:
+        return now_ts >= start.timestamp() - EVENT_LIVE_GATE_START_PREARM_SECS
     d = parse_event_date(event_ticker)
     if d is None:
         return True
@@ -18404,8 +18428,11 @@ class IncentiveMarketMaker:
                               and series_price_min(meta.series) <= pm_g
                               <= series_price_max(meta.series))
                 # Point 6: a known-future-dated event cannot be live, so
-                # none of the live signals may fire for it.
+                # none of the live signals may fire for it. Point 7: a known
+                # START arms the noisy signals late; the jump keeps the day.
                 armed = event_live_gate_armed(meta.event_ticker, now_ts)
+                armed_jump = event_live_gate_armed(meta.event_ticker, now_ts,
+                                                   jump=True)
                 went_one_sided = armed and not two_sided and pm_in_band
                 # Settled-strike signature (Jack 2026-08-31 #2): in-band ->
                 # out-of-band by a real one-cycle jump (49c -> 99c: the word
@@ -18421,7 +18448,7 @@ class IncentiveMarketMaker:
                 mid_out_of_range = two_sided and not (
                     series_price_min(meta.series) <= mid_g
                     <= series_price_max(meta.series))
-                jumped_out = (armed and two_sided and pm_in_band
+                jumped_out = (armed_jump and two_sided and pm_in_band
                               and mid_out_of_range
                               and abs(mid_g - pm_g) >= EVENT_DEPTH_JUMP_CENTS)
                 stacked = (EVENT_DEPTH_STACK_CONTRACTS > 0
