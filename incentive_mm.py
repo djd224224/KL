@@ -20416,9 +20416,17 @@ class IncentiveMarketMaker:
         meta = self.state.selected.get(ticker)
         if meta is None:
             return False
-        if (series_event_depth_gated(meta.series)
-                or series_fast_lane(meta.series)
-                or quake_gated(meta.series)):
+        if series_fast_lane(meta.series) or quake_gated(meta.series):
+            return False
+        # A gated (live-event) series rides through only while its event's
+        # live gate is NOT armed (2026-10-05, KXTRUMPMENTION-26OCT05: six
+        # deploy restarts in three hours each cancelled the whole event at
+        # handoff and left it dark ~2-3 min until the relaunch re-quoted --
+        # for a 7pm ET speech whose noisy triggers arm at 6:30pm). The
+        # refusal is for a restart MID-SPEECH;
+        # before the arm time (point 7: start - 30 min with a known start;
+        # the ticker day without one, as before) there is no speech to be in.
+        if series_event_depth_gated(meta.series)                 and event_live_gate_armed(meta.event_ticker, now_ts):
             return False
         if meta.event_ticker in self.state.event_depth_halt \
                 or meta.event_ticker in self.state.event_live_halt:

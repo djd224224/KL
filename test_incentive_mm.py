@@ -19911,8 +19911,10 @@ class TestRestartHandoff(unittest.TestCase):
     656 orders pulled at 17:27:03, first placements 17:30:32), 17 deploys that
     day. Now the exit hands the book over and the relaunch adopts it."""
 
+    # GATED is undated: an unknown event date always arms the live gate
+    # (point 6), so it is refused at handoff whatever the clock says
     OK, NEAR, GATED, UNSEL = ("KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B",
-                              "KXTRUMPMENTION-99DEC31-X", "KXGOOD-99DEC31-C")
+                              "KXTRUMPMENTION-NODATE-X", "KXGOOD-99DEC31-C")
 
     def setUp(self):
         _clean_persist()
@@ -19964,6 +19966,23 @@ class TestRestartHandoff(unittest.TestCase):
         bot.shutdown_cancel()
         self.assertEqual(sorted(bot.client.cancelled), ["o1", "o2", "o3"])
         self.assertEqual([o["order_id"] for o in bot.client.resting], ["o0"])
+
+    def test_gated_market_rides_through_before_its_live_gate_arms(self):
+        """2026-10-05, KXTRUMPMENTION-26OCT05: a known-start gated event (7pm
+        speech, noisy triggers armed from 6:30pm) keeps its orders through a
+        deploy restart until the arm; a halted event never does."""
+        bot = self._bot()
+        ev = self.GATED.rsplit("-", 1)[0]
+        now = datetime.now(timezone.utc)
+        far, near = now + timedelta(hours=3), now + timedelta(minutes=20)
+        self.assertFalse(bot._restart_keep_ok(self.GATED, time.time()))
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {ev: far}):
+            self.assertTrue(bot._restart_keep_ok(self.GATED, time.time()))
+            bot.state.event_depth_halt[ev] = time.time()
+            self.assertFalse(bot._restart_keep_ok(self.GATED, time.time()))
+            del bot.state.event_depth_halt[ev]
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {ev: near}):
+            self.assertFalse(bot._restart_keep_ok(self.GATED, time.time()))
 
     def test_failed_preflight_cancels_everything_as_before(self):
         bot = self._bot()
