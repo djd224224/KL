@@ -7963,3 +7963,83 @@ _hour_window_mult now skips the per-series windows for rain_period_member
 series (KXRAINNAPAM's override object: KXRAINNYCW and every clone): x2 at
 every hour. KXRAIN dailies, KXRAINWKND and the KXRAIN<CITY>M monthlies keep
 the halving; the snow monthlies never matched an hour window.
+
+## 2026-10-05 — Vercel fair: a weekday term for open-weights, mean reversion for Moonshot, D up to today+4 (Jack)
+
+Jack: "yes IMM_VERCEL_HORIZON_DAYS=4. fix open-weight shares and Moonshot."
+(after the 10/05 Vercel check-in, KL-data/vercel-logger/analysis-2026-10-05/
+verdict.md: the gate holds only ~4% of pre-D program hours, the payout-floor
+projection 48% and 1c x 99c placeholder books 35%. The running fair ran ~9 pp
+LOW on KXOPENSOURCESHARE for a weekend D and ~6 pp low on KXMOONVSPEND after
+its 10/01 drop, Brier vs the book +0.066 and +0.170.)
+
+WHAT CHANGED (vercel_fair.py only; incentive_mm.py and the launcher untouched):
+- HORIZON_DAYS default 3 -> 4. Programs post ~3.3 days before D; at 3 the
+  D = 10/8 set (posted 10/04 16:02Z) sat on "no Vercel read" until 00:00Z
+  (424 of the 608 stand-aside lines that day).
+- DOW_SERIES (default KXOPENSOURCESHARE): the change sample is taken from
+  the series less its weekday effect (each day's deviation from its centred
+  7-day mean over SEASON_DAYS 90, averaged by weekday; open-weights runs
+  ~+4 pp Sat/Sun, -1 to -2.6 Mon-Thu) and re-centred by effect(D) -
+  effect(anchor day). A Friday running share now prices a Sunday D ~+6 pp.
+- MR_SERIES (default KXMOONVSPEND): the k-day change is regressed on the
+  start day's deviation from its trailing MR_TRAIL_DAYS (7) mean, slope
+  clipped to [-1, 0] (Moonshot ~-0.3 at k=1, ~-0.6 at k=3); the residuals
+  are the sample, re-centred by slope x the anchor's deviation. After a dip
+  the fair now prices the rebound.
+- SQRT_SERIES (default KXMOONVSPEND): changes in sqrt(share), so a share
+  near zero moves in proportion to its level. It ran 0.6-20.7% in 90 days;
+  the additive model put its 5th percentile at -10 to -13% at a 5% level.
+- OPEN_WIDEN 1.0 -> 1.5: at 1.0 the open-weights 5-95% band missed 16-17% of
+  May-Oct outcomes (8% at 1.5).
+- The history read covers max(HISTORY_DAYS, SEASON_DAYS) + 10 = 100 days
+  (~2 MB, once per HISTORY_REFRESH_SECS / UTC day).
+- Entries of a changed series carry "adj": {space, dow, mr_slope}; the
+  file's "model" block lists the new knobs. The IMM reads x_l + errs as
+  before (errs are X_D - x_l), so the gate code is unchanged.
+
+EVIDENCE (walk-forward on Vercel's export 2025-10-01 -> 2026-10-04, every
+model built only from the 60 days of finals before its anchor; scripts and
+outputs in Documents/KL-data/vercel-logger/fairfix-2026-10-05/). Brier of
+P(X_D >= K) on a strike grid around the anchor, anchor = the day's final,
+k = 1..3, Jan-Apr / May-Jul / Aug-Oct:
+  open-weights  0.0797 / 0.1015 / 0.1272 -> 0.0816 / 0.0851 / 0.0982
+                wrong "decided" calls 1.5 / 2.3 / 4.0% -> 0.8 / 0.8 / 1.6%
+  Moonshot      0.1622 / 0.1028 / 0.1558 -> 0.1610 / 0.0986 / 0.1471
+                wrong "decided" calls 11.7 / 6.4 / 5.0% -> 6.3 / 5.6 / 4.5%
+CRPS (k = 1..4, Jun-Oct): open-weights 3.74 -> 3.16 (the weekday term),
+Moonshot 1.71 -> 1.58 (log-space MR; the shipped sqrt-space MR was chosen on
+the strike Brier: a log space put Moonshot's 95th percentile at 50-88%).
+crosscheck.py: the shipped code reproduces the backtest's percentiles to
+0.0001 pp. Not adopted: a weekday term on Moonshot (worse in every period),
+mean reversion on open-weights (no better than the weekday term alone).
+The other six series are unchanged; the same backtest suggests the weekday
+term would also help KXGOOGVREQ / KXDEEPVREQ / KXANTHVREQ (CRPS -9 to -28%
+Jun-Oct) -- not shipped, Jack's call.
+
+DRY RUN 10/05 15:00Z (run anchor, 7 calibration days): 32 entries (8 series
+x 4). KXMOONVSPEND (running 5.4%): old p5/50/95 -10.1 / 4.5 / 14.4 -> new
+0.1 / 5.9 / 18.6 for D = 10/6, and median 7.5 for D = 10/8 (the old fair
+called KXMOONVSPEND-08OCT26 T5P3 45c against a 73x85 book; the new one
+~60c). KXOPENSOURCESHARE (Monday, weekday D's): medians within ~2 pp of the
+old, bands ~1.5x wider.
+
+DEPLOY: vercel_fair.py is imported by the IMM's "vercel-fair" refresher
+thread, and the code-change exit watches only incentive_mm.py, so the sync
+alone does not reload it: restart_imm.ps1 (plain mode; no env change).
+
+KILL SWITCHES (env => restart_imm.ps1 -Task): IMM_VERCEL_DOW_SERIES="",
+IMM_VERCEL_MR_SERIES="", IMM_VERCEL_SQRT_SERIES="" restore the old model per
+term; IMM_VERCEL_OPEN_WIDEN=1.0; IMM_VERCEL_HORIZON_DAYS=3.
+
+WATCH: "vercel-fair refresh: 32 events with a read, anchor run" (was 24);
+vercel_fair.json entries for KXMOONVSPEND / KXOPENSOURCESHARE carry "adj";
+the next weekend D for open-weights (D = Sat 10/10 / Sun 10/11 events, if
+listed) should no longer stand aside as "decided" off a weekday running
+share. Re-score fair vs book on the settled D = 10/6 and 10/8 events.
+
+Tests: test_vercel_fair.py 17 -> 24 (defaults, the weekday profile, a
+Friday anchor pricing a Sunday D on both anchors, the Moonshot rebound in
+sqrt space on both anchors with no mass below zero, plain series
+unchanged, the model block + "adj", the 100-day history read);
+test_incentive_mm.TestVercelPreDGate unchanged and green.

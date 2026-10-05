@@ -43,16 +43,45 @@ degenerate, or with IMM_VERCEL_RUN_ANCHOR=0):
 e_h ~ the empirical h-day changes x_d - x_{d-h} over the last HISTORY_DAYS
 complete days, widened about their median by LAB_WIDEN for the lab series
 (the lab backtest was overconfident: fairs of 80-100% settled YES 67% of
-the time) and OPEN_WIDEN for KXOPENSOURCESHARE (well calibrated).
+the time) and OPEN_WIDEN for KXOPENSOURCESHARE.
 P(YES) = P(round1(X_D) > K) = P(X_D >= g - 0.05), g the first 0.1 step
 above K.
 
-Reads: the 70-day history (1.4 MB) once per HISTORY_REFRESH_SECS and at
+WEEKDAY + MEAN REVERSION (Jack 2026-10-05: "fix open-weight shares and
+Moonshot"). The 10/05 check-in (KL-data/vercel-logger/analysis-2026-10-05)
+found the running fair ~9 pp low on the open-weights share for a weekend D
+(a Friday running share priced a Sunday) and ~6 pp low on Moonshot spend
+after its 10/01 drop, with Brier vs the book +0.066 and +0.170. Two terms,
+each on by series (the other six series are unchanged):
+  DOW_SERIES (KXOPENSOURCESHARE): changes of the series less its weekday
+      effect (each day's deviation from its centred 7-day mean over
+      SEASON_DAYS, by weekday; open-weights runs ~+4 pp Sat/Sun, -1 to -2.6
+      Mon-Thu), re-centred by effect(D) - effect(anchor day).
+  MR_SERIES (KXMOONVSPEND): the k-day change regressed on the start day's
+      deviation from its trailing MR_TRAIL_DAYS mean (slope clipped to
+      [-1, 0]; Moonshot's daily changes mean-revert, ac1 -0.23); the
+      residuals are the sample, re-centred by slope x the anchor's deviation.
+  SQRT_SERIES (KXMOONVSPEND): changes modelled in sqrt(share), so a share
+      near zero moves in proportion to its level (it ran 0.6-20.7% in 90
+      days; additive changes from a 15% week put mass below zero at 5%).
+Walk-forward backtest on Vercel's export 2026-01..10 (KL-data/vercel-logger/
+fairfix-2026-10-05; anchor = the day's final, k = 1..3): Brier of P(X_D >= K)
+on a strike grid, Jan-Apr / May-Jul / Aug-Oct --
+  open-weights  0.0797 / 0.1015 / 0.1272 -> 0.0816 / 0.0851 / 0.0982 (x1.5)
+                wrong "decided" calls 1.5 / 2.3 / 4.0% -> 0.8 / 0.8 / 1.6%
+  Moonshot      0.1622 / 0.1028 / 0.1558 -> 0.1610 / 0.0986 / 0.1471
+                wrong "decided" calls 11.7 / 6.4 / 5.0% -> 6.3 / 5.6 / 4.5%
+OPEN_WIDEN 1.0 -> 1.5 with it: at 1.0 the open-weights 5-95% band missed
+16-17% of May-Oct outcomes (8% at 1.5). A log space was tried for Moonshot
+and dropped: comparable Brier, but 95th percentiles of 50-88% share.
+
+Reads: the 100-day history (~2 MB) once per HISTORY_REFRESH_SECS and at
 each new UTC day, plus a fresh yesterday + today read (~40 KB) every refresh.
 
-Writes VERCEL_FAIR_FILE: per EVENT ticker (D = today+1 .. today+3) the
-series, D, the anchor ("run" / "complete"), its tag (`last`: "<T>@run" or
-L), h, the anchor value (`x_l`) and the widened error sample.
+Writes VERCEL_FAIR_FILE: per EVENT ticker (D = today+1 .. today+HORIZON_DAYS,
+4 since 2026-10-05: programs post ~3.3 days before D) the series, D, the
+anchor ("run" / "complete"), its tag (`last`: "<T>@run" or L), h, the anchor
+value (`x_l`) and the widened error sample (X_D - x_l).
 """
 from __future__ import annotations
 
@@ -90,11 +119,24 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_set(name: str, default: str) -> frozenset:
+    return frozenset(s.strip() for s in os.environ.get(name, default).split(",")
+                     if s.strip())
+
+
 HISTORY_DAYS = int(_env_float("IMM_VERCEL_HISTORY_DAYS", 60))
 LAB_WIDEN = _env_float("IMM_VERCEL_LAB_WIDEN", 1.5)
-OPEN_WIDEN = _env_float("IMM_VERCEL_OPEN_WIDEN", 1.0)
-HORIZON_DAYS = int(_env_float("IMM_VERCEL_HORIZON_DAYS", 3))   # D up to today+3
+OPEN_WIDEN = _env_float("IMM_VERCEL_OPEN_WIDEN", 1.5)          # 1.0 until 2026-10-05
+# D up to today+4 (Jack 2026-10-05: "yes IMM_VERCEL_HORIZON_DAYS=4"; at 3 the
+# D = 10/8 programs, posted 10/4 16:02Z, sat without a read until 00:00Z)
+HORIZON_DAYS = int(_env_float("IMM_VERCEL_HORIZON_DAYS", 4))
 MIN_SAMPLE = 20
+# weekday effect / mean reversion / sqrt space, by series (2026-10-05)
+DOW_SERIES = _env_set("IMM_VERCEL_DOW_SERIES", "KXOPENSOURCESHARE")
+SEASON_DAYS = int(_env_float("IMM_VERCEL_SEASON_DAYS", 90))
+MR_SERIES = _env_set("IMM_VERCEL_MR_SERIES", "KXMOONVSPEND")
+MR_TRAIL_DAYS = int(_env_float("IMM_VERCEL_MR_TRAIL_DAYS", 7))
+SQRT_SERIES = _env_set("IMM_VERCEL_SQRT_SERIES", "KXMOONVSPEND")
 HISTORY_REFRESH_SECS = _env_float("IMM_VERCEL_HISTORY_REFRESH_SECS", 6 * 3600)
 # D-1 running anchor (2026-10-01); IMM_VERCEL_RUN_ANCHOR=0 restores the
 # complete-day anchor all day
@@ -166,12 +208,13 @@ def yes_threshold(k: float) -> float:
 def fetch_labs(now: Optional[datetime] = None, timeout: float = 30,
                days_back: Optional[int] = None) -> Dict[Tuple[str, str], Dict[str, float]]:
     """(lab, metric) -> {date: share_percent} from `days_back` days ago
-    (default HISTORY_DAYS+10) through today, the RUNNING day. The plain
-    export URL is cached 24 h, so each read uses a distinct documented `to`
-    date (the API clamps it to today) for a fresh copy."""
+    (default the longer of HISTORY_DAYS and SEASON_DAYS, +10) through today,
+    the RUNNING day. The plain export URL is cached 24 h, so each read uses a
+    distinct documented `to` date (the API clamps it to today) for a fresh
+    copy."""
     now = now or datetime.now(timezone.utc)
     today = now.date()
-    back = HISTORY_DAYS + 10 if days_back is None else days_back
+    back = max(HISTORY_DAYS, SEASON_DAYS) + 10 if days_back is None else days_back
     slot = (now.hour * 60 + now.minute) // 5
     r = requests.get(EXPORT, params={
         "dataset": "labs", "modality": "all",
@@ -360,37 +403,145 @@ def change_sample(x: Dict[str, float], last: date, h: int) -> List[float]:
     return out
 
 
-def fair_entry(x: Dict[str, float], d: date, last: date, widen: float) -> Optional[dict]:
-    """COMPLETE anchor: X_L and the widened h-day error sample for measured
-    day d, with L the latest complete day (h = d - L >= 1)."""
+def _space(series: Optional[str]):
+    """(f, finv) of the space a series' changes are modelled in: sqrt(share)
+    for SQRT_SERIES, the share itself otherwise."""
+    if series in SQRT_SERIES:
+        return (lambda v: math.sqrt(max(v, 0.0))), (lambda u: max(u, 0.0) ** 2)
+    return (lambda v: v), (lambda u: u)
+
+
+def dow_profile(z: Dict[str, float], last: date) -> Dict[int, float]:
+    """Weekday effect {0 = Mon .. 6: shift} of a daily series: each day's
+    deviation from its centred 7-day mean over the SEASON_DAYS ending at
+    `last` (days whose whole window is in), averaged by weekday, centred to
+    mean 0. All zeros unless every weekday has a day."""
+    rel: Dict[int, List[float]] = {}
+    for i in range(3, SEASON_DAYS - 3):
+        d = last - timedelta(days=i)
+        win = [z.get((d + timedelta(days=j)).isoformat()) for j in range(-3, 4)]
+        if any(v is None for v in win):
+            continue
+        rel.setdefault(d.weekday(), []).append(win[3] - statistics.fmean(win))
+    if len(rel) < 7:
+        return {i: 0.0 for i in range(7)}
+    m = statistics.fmean(statistics.fmean(v) for v in rel.values())
+    return {i: statistics.fmean(v) - m for i, v in rel.items()}
+
+
+def _trailing(y: Dict[str, float], day: date) -> Optional[float]:
+    """Mean of y over the MR_TRAIL_DAYS days before `day`, None with a gap."""
+    vals = [y.get((day - timedelta(days=j)).isoformat())
+            for j in range(1, MR_TRAIL_DAYS + 1)]
+    if any(v is None for v in vals):
+        return None
+    return statistics.fmean(vals)
+
+
+def change_model(x: Dict[str, float], last: date, h: int,
+                 series: Optional[str] = None) -> Optional[dict]:
+    """The h-day changes over the HISTORY_DAYS ending at `last`, in the
+    series' model space (_space) less its weekday effect (DOW_SERIES); for
+    MR_SERIES the residuals of their regression on the start day's deviation
+    from its trailing MR_TRAIL_DAYS mean (slope clipped to [-1, 0]). None
+    below MIN_SAMPLE pairs. A plain series gives change_sample's changes."""
+    f, finv = _space(series)
+    z = {d: f(v) for d, v in x.items()}
+    prof = dow_profile(z, last) if series in DOW_SERIES else {i: 0.0 for i in range(7)}
+    y = {d: v - prof[date.fromisoformat(d).weekday()] for d, v in z.items()}
+    mr = series in MR_SERIES
+    ch: List[float] = []
+    dev: List[float] = []
+    for i in range(HISTORY_DAYS):
+        de = last - timedelta(days=i)
+        ds = de - timedelta(days=h)
+        a, b = y.get(de.isoformat()), y.get(ds.isoformat())
+        if a is None or b is None:
+            continue
+        if mr:
+            tr = _trailing(y, ds)
+            if tr is None:
+                continue
+            dev.append(b - tr)
+        ch.append(a - b)
+    if len(ch) < MIN_SAMPLE:
+        return None
+    slope = 0.0
+    if mr:
+        mx, my = statistics.fmean(dev), statistics.fmean(ch)
+        vx = sum((u - mx) ** 2 for u in dev)
+        if vx > 0:
+            slope = sum((u - mx) * (v - my) for u, v in zip(dev, ch)) / vx
+        slope = min(0.0, max(-1.0, slope))
+        ch = [v - slope * u for u, v in zip(dev, ch)]
+    return {"f": f, "finv": finv, "prof": prof, "y": y, "mr": mr,
+            "slope": slope, "changes": ch}
+
+
+def _centre(m: dict, anchor_day: date, y_anchor: float, d: date) -> float:
+    """Model-space centre of X_D from the anchor's de-seasonalised value: plus
+    D's weekday effect, plus slope x the anchor's deviation from its trailing
+    mean (MR series)."""
+    c = y_anchor + m["prof"][d.weekday()]
+    if m["mr"]:
+        tr = _trailing(m["y"], anchor_day)
+        if tr is not None:
+            c += m["slope"] * (y_anchor - tr)
+    return c
+
+
+def _adj(m: dict, series: Optional[str], anchor_day: date, d: date) -> dict:
+    """What the 10/05 terms did to an entry, for the file (series with any)."""
+    if series not in DOW_SERIES and not m["mr"] and series not in SQRT_SERIES:
+        return {}
+    return {"adj": {"space": "sqrt" if series in SQRT_SERIES else "level",
+                    "dow": round(m["prof"][d.weekday()]
+                                 - m["prof"][anchor_day.weekday()], 4),
+                    "mr_slope": round(m["slope"], 4)}}
+
+
+def fair_entry(x: Dict[str, float], d: date, last: date, widen: float,
+               series: Optional[str] = None) -> Optional[dict]:
+    """COMPLETE anchor: X_L and the widened h-day error sample (X_D - X_L)
+    for measured day d, with L the latest complete day (h = d - L >= 1)."""
     h = (d - last).days
     if h < 1 or last.isoformat() not in x:
         return None
-    errs = change_sample(x, last, h)
-    if len(errs) < MIN_SAMPLE:
+    m = change_model(x, last, h, series)
+    if m is None:
         return None
-    med = statistics.median(errs)
-    wide = sorted(round(med + widen * (e - med), 4) for e in errs)
-    return {"x_l": round(x[last.isoformat()], 4), "h": h, "n": len(wide), "errs": wide}
+    ch, finv, x_l = m["changes"], m["finv"], x[last.isoformat()]
+    med = statistics.median(ch)
+    c = _centre(m, last, m["y"][last.isoformat()], d)
+    wide = sorted(round(finv(c + med + widen * (e - med)) - x_l, 4) for e in ch)
+    return dict({"x_l": round(x_l, 4), "h": h, "n": len(wide), "errs": wide},
+                **_adj(m, series, last, d))
 
 
 def run_entry(x: Dict[str, float], run_val: float, deltas: List[float], d: date,
-              today: date, widen: float) -> Optional[dict]:
-    """RUNNING anchor: R_T(tau) and the sample delta + e_k (k = d - today),
-    e_k widened about its median by `widen`, delta about its mean by
-    RUN_WIDEN; every pairing kept."""
+              today: date, widen: float, series: Optional[str] = None) -> Optional[dict]:
+    """RUNNING anchor: R_T(tau) and the sample X_D - R_T over every pairing of
+    delta (widened about its mean by RUN_WIDEN; R_T + delta = the day's
+    final) with e_k (k = d - today, widened about its median by `widen`)."""
     k = (d - today).days
     if k < 1 or len(deltas) < RUN_MIN_DAYS:
         return None
-    ch = change_sample(x, today - timedelta(days=1), k)
-    if len(ch) < MIN_SAMPLE:
+    m = change_model(x, today - timedelta(days=1), k, series)
+    if m is None:
         return None
+    ch, f, finv = m["changes"], m["f"], m["finv"]
     med, mu = statistics.median(ch), statistics.fmean(deltas)
     cw = [med + widen * (e - med) for e in ch]
     dw = [mu + RUN_WIDEN * (v - mu) for v in deltas]
-    errs = sorted(round(a + b, 4) for a in cw for b in dw)
-    return {"x_l": round(run_val, 4), "h": k, "n": len(errs), "errs": errs,
-            "delta_mean": round(mu, 4), "calib_days": len(deltas)}
+    shift_t = m["prof"][today.weekday()]
+    errs = []
+    for b in dw:
+        c = _centre(m, today, f(run_val + b) - shift_t, d)
+        errs.extend(round(finv(c + a) - run_val, 4) for a in cw)
+    errs.sort()
+    return dict({"x_l": round(run_val, 4), "h": k, "n": len(errs), "errs": errs,
+                 "delta_mean": round(mu, 4), "calib_days": len(deltas)},
+                **_adj(m, series, today, d))
 
 
 def p_yes(entry: dict, k: float) -> float:
@@ -439,10 +590,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
         for k in range(1, HORIZON_DAYS + 1):
             d = today + timedelta(days=k)
             if mode == "run":
-                e = run_entry(x, run_val, deltas.get(s, []), d, today, widen)
+                e = run_entry(x, run_val, deltas.get(s, []), d, today, widen, s)
                 tag = {"anchor": "run", "last": f"{t_iso}@run", "tau_min": round(tau, 1)}
             elif mode == "complete":
-                e = fair_entry(x, d, last, widen)
+                e = fair_entry(x, d, last, widen, s)
                 tag = {"anchor": "complete", "last": l_iso}
             else:
                 e = None
@@ -460,7 +611,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
                       "run_anchor": RUN_ANCHOR, "run_start_min": RUN_START_MIN,
                       "run_min_days": RUN_MIN_DAYS, "run_widen": RUN_WIDEN,
                       "run_calib_days": RUN_CALIB_DAYS,
-                      "run_tau_tol_min": RUN_TAU_TOL_MIN},
+                      "run_tau_tol_min": RUN_TAU_TOL_MIN,
+                      "dow_series": sorted(DOW_SERIES), "season_days": SEASON_DAYS,
+                      "mr_series": sorted(MR_SERIES), "mr_trail_days": MR_TRAIL_DAYS,
+                      "sqrt_series": sorted(SQRT_SERIES)},
             "anchor": {"mode": mode, "tau_min": round(tau, 1),
                        "rows_today": n_today, "rows_last": n_last,
                        "calib_days": sorted(calib) if calib else [],
@@ -484,7 +638,10 @@ if __name__ == "__main__":
         print(json.dumps(data["anchor"]))
         for ev, e in sorted(data["entries"].items()):
             mid = e["x_l"] + statistics.median(e["errs"])
+            a = e.get("adj")
             print(f"{ev:28s} {e['anchor']:8s} x {e['x_l']:7.3f} h {e['h']} "
                   f"median X_D {mid:7.3f} n {e['n']}"
                   + (f" delta {e['delta_mean']:+.2f} ({e['calib_days']}d)"
-                     if e["anchor"] == "run" else ""))
+                     if e["anchor"] == "run" else "")
+                  + (f" [{a['space']} dow {a['dow']:+.2f} mr {a['mr_slope']:+.2f}]"
+                     if a else ""))

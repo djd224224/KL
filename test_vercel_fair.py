@@ -1,6 +1,7 @@
 """Tests for vercel_fair (the pre-D Vercel gate's fair values)."""
 import json
 import os
+import statistics
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -305,6 +306,127 @@ class TestLoggerCalibration(unittest.TestCase):
         self.assertEqual(out["prev_final"]["KXOPENVREQ"], 22.0)
         full = vf.parse_logger_day(p, date(2026, 9, 26), want_run=True)
         self.assertEqual([v["KXOPENVREQ"] for _m, v in full["run"]], [30.0, 31.0, 32.0])
+
+
+def weekly_open(days=120, start=date(2026, 6, 1), weekday=60.0, weekend=75.0, wiggle=True):
+    """An open-weights-like series: `weekday` Mon-Fri, `weekend` Sat/Sun, with
+    an alternating +-0.5 wiggle so the change sample is not degenerate."""
+    vals = {}
+    for i in range(days):
+        d = start + timedelta(days=i)
+        v = weekend if d.weekday() >= 5 else weekday
+        vals[d.isoformat()] = v + ((0.5 if i % 2 else -0.5) if wiggle else 0.0)
+    return vals
+
+
+class TestWeekdayAndMeanReversion(unittest.TestCase):
+    """Jack 2026-10-05: "fix open-weight shares and Moonshot"."""
+
+    def test_defaults(self):
+        if os.environ.get("IMM_VERCEL_HORIZON_DAYS") is None:
+            self.assertEqual(vf.HORIZON_DAYS, 4)
+        self.assertEqual(vf.DOW_SERIES, frozenset({"KXOPENSOURCESHARE"}))
+        self.assertEqual(vf.MR_SERIES, frozenset({"KXMOONVSPEND"}))
+        self.assertEqual(vf.SQRT_SERIES, frozenset({"KXMOONVSPEND"}))
+
+    def test_dow_profile_of_a_weekly_pattern(self):
+        z = weekly_open(wiggle=False)
+        last = date.fromisoformat(max(z))
+        prof = vf.dow_profile(z, last)
+        self.assertAlmostEqual(prof[6] - prof[4], 15.0, places=6)     # Sun - Fri
+        self.assertAlmostEqual(prof[0] - prof[4], 0.0, places=6)
+        self.assertAlmostEqual(sum(prof.values()), 0.0, places=6)
+        # without every weekday there is no profile
+        short = {d: v for d, v in z.items() if d > (last - timedelta(days=8)).isoformat()}
+        self.assertEqual(set(vf.dow_profile(short, last).values()), {0.0})
+
+    def test_a_friday_anchor_prices_a_sunday_d(self):
+        x = weekly_open()
+        fri = max(date.fromisoformat(d) for d in x if date.fromisoformat(d).weekday() == 4)
+        x = {d: v for d, v in x.items() if d <= fri.isoformat()}
+        sun = fri + timedelta(days=2)
+        e = vf.fair_entry(x, sun, fri, 1.0, vf.OPEN_SERIES)
+        self.assertAlmostEqual(e["x_l"] + statistics.median(e["errs"]), 75.0, delta=1.0)
+        self.assertEqual(e["adj"]["space"], "level")
+        self.assertAlmostEqual(e["adj"]["dow"], 15.0, delta=0.6)
+        with mock.patch.object(vf, "DOW_SERIES", frozenset()):
+            old = vf.fair_entry(x, sun, fri, 1.0, vf.OPEN_SERIES)
+        self.assertNotIn("adj", old)
+        self.assertLess(old["x_l"] + statistics.median(old["errs"]), 66.0)
+        # running anchor: Friday's running share, Thursday the last complete day
+        xt = {d: v for d, v in x.items() if d < fri.isoformat()}
+        with mock.patch.object(vf, "RUN_WIDEN", 1.0):
+            r = vf.run_entry(xt, 60.0, [0.0, 0.0, 0.0], sun, fri, 1.0, vf.OPEN_SERIES)
+        self.assertEqual((r["x_l"], r["h"]), (60.0, 2))
+        self.assertAlmostEqual(r["x_l"] + statistics.median(r["errs"]), 75.0, delta=1.0)
+
+    def test_moonshot_rebound_is_priced_in_sqrt_space(self):
+        # a share that sits at 12 and drops to 2 for one day in every 5
+        start = date(2026, 6, 1)
+        vals = {(start + timedelta(days=i)).isoformat(): (2.0 if i % 5 == 0 else 12.0)
+                for i in range(100)}
+        last = start + timedelta(days=95)                       # a dip day
+        x = {d: v for d, v in vals.items() if d <= last.isoformat()}
+        d1 = last + timedelta(days=1)
+        e = vf.fair_entry(x, d1, last, 1.5, "KXMOONVSPEND")
+        self.assertEqual((e["x_l"], e["adj"]["space"]), (2.0, "sqrt"))
+        self.assertLess(e["adj"]["mr_slope"], -0.5)
+        self.assertGreater(e["x_l"] + statistics.median(e["errs"]), 8.0)
+        self.assertGreaterEqual(min(e["x_l"] + v for v in e["errs"]), -1e-9)
+        with mock.patch.object(vf, "MR_SERIES", frozenset()),                 mock.patch.object(vf, "SQRT_SERIES", frozenset()):
+            old = vf.fair_entry(x, d1, last, 1.5, "KXMOONVSPEND")
+        self.assertNotIn("adj", old)
+        self.assertLess(old["x_l"] + statistics.median(old["errs"]), 4.0)   # sticks at the dip
+        self.assertLess(min(old["x_l"] + v for v in old["errs"]), 0.0)      # mass below zero
+        # running anchor: the same rebound off a dipped running share
+        with mock.patch.object(vf, "RUN_WIDEN", 1.0):
+            r = vf.run_entry({d: v for d, v in x.items() if d < last.isoformat()}, 2.0,
+                             [0.0, 0.0, 0.0], d1, last, 1.5, "KXMOONVSPEND")
+        self.assertGreater(r["x_l"] + statistics.median(r["errs"]), 8.0)
+        self.assertGreaterEqual(min(r["x_l"] + v for v in r["errs"]), -1e-9)
+
+    def test_plain_series_are_unchanged(self):
+        tab = history(("openai", "requests"), 80, step=lambda i: (i % 7) * 0.4 + (i % 3) * 0.2)
+        dates = sorted(tab[("openai", "requests")])
+        x = vf.series_values(tab, "KXOPENVREQ", dates)
+        last = date.fromisoformat(dates[-1])
+        for h in (1, 2, 3):
+            e = vf.fair_entry(x, last + timedelta(days=h), last, 1.5, "KXOPENVREQ")
+            ch = vf.change_sample(x, last, h)
+            med = statistics.median(ch)
+            want = sorted(round(med + 1.5 * (c - med), 4) for c in ch)
+            self.assertEqual(len(e["errs"]), len(want))
+            for a, b in zip(e["errs"], want):
+                self.assertAlmostEqual(a, b, places=4)
+            self.assertNotIn("adj", e)
+
+    def test_file_carries_the_model_and_the_adjustments(self):
+        path = os.path.join(tempfile.mkdtemp(), "vf.json")
+        with mock.patch.object(vf, "RUN_ANCHOR", False):
+            n, miss, mode = vf.write_fair_file(path, now=NOW, tab=lab_table(today_block=False))
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual((n, miss, mode), (8 * vf.HORIZON_DAYS, 0, "complete"))
+        m = data["model"]
+        self.assertEqual((m["dow_series"], m["mr_series"], m["sqrt_series"]),
+                         (["KXOPENSOURCESHARE"], ["KXMOONVSPEND"], ["KXMOONVSPEND"]))
+        self.assertEqual((m["season_days"], m["mr_trail_days"], m["open_widen"]),
+                         (vf.SEASON_DAYS, vf.MR_TRAIL_DAYS, vf.OPEN_WIDEN))
+        self.assertIn("adj", data["entries"]["KXOPENSOURCESHARE-26SEP29"])
+        self.assertIn("adj", data["entries"]["KXMOONVSPEND-28SEP26"])
+        self.assertNotIn("adj", data["entries"]["KXOPENVREQ-28SEP26"])
+
+    def test_history_read_covers_the_weekday_window(self):
+        r = mock.Mock()
+        r.json.return_value = {"rows": [
+            {"date": "2026-09-26", "name": "openai", "metric": "requests", "share_percent": 18.9}]}
+        r.raise_for_status.return_value = None
+        now = datetime(2026, 9, 27, 18, 7, tzinfo=timezone.utc)
+        with mock.patch.object(vf.requests, "get", return_value=r) as g:
+            vf.fetch_labs(now)
+        back = max(vf.HISTORY_DAYS, vf.SEASON_DAYS) + 10
+        self.assertEqual(g.call_args.kwargs["params"]["from"],
+                         (now.date() - timedelta(days=back)).isoformat())
 
 
 class TestFetchTable(unittest.TestCase):
