@@ -7952,7 +7952,7 @@ family (evenings x1). The KXRAIN<CITY>M monthlies are unchanged (x1).
 Revert: IMM_RAIN_PERIOD_SIZE_MULT=1.0 / IMM_SNOW_MONTHLY_SIZE_MULT=1.0
 (env => restart_imm.ps1 -Task).
 
-### 2026-10-05 00:40 ET — the period-rain family keeps x2 in the evenings (Jack)
+### 2026-10-04 20:35 ET (00:35Z 10/5) — the period-rain family keeps x2 in the evenings (Jack)
 
 Jack: "KXRAINNAPAM-01NOV26-31MAR27 isnt at 2x". The x2 was on (T15 10/30 ->
 20/60 at 23:37Z), but IMM_SERIES_HOUR_MULT's KXRAIN:19-1:0.5 matched
