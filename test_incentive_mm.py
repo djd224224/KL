@@ -22078,6 +22078,29 @@ class TestSweepBreaker(unittest.TestCase):
             self._fill("o1", 20)
         self.assertEqual((self._trips(), self.bot._sweep["fills_seen"]), ([], 0))
 
+    def test_mention_series_are_exempt(self):
+        """Jack 2026-10-05: "remove breaker on MENTION markets" -- a cleared
+        order on a mention event is logged as "exempt" and pulls nothing."""
+        m = "KXTRUMPMENTION-26OCT05"
+        self.bot._resting_view[m + "-AMER"] = [
+            {"order_id": "m1", "side": "ask", "px": 43.0, "rem": 8.11,
+             "placed": self.now - 100.0, "pad": False}]
+        self.bot._resting_view[m + "-DEPO"] = [
+            {"order_id": "m2", "side": "ask", "px": 18.0, "rem": 38.0,
+             "placed": self.now - 100.0, "pad": False}]
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"):
+            self._fill("m1", 8.11, ticker=m + "-AMER")
+            self.assertFalse(self.bot.sweep_held(m, self.now + 10))
+            self._fill("o1", 20)                      # a non-mention event still trips
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 10))
+        self.assertNotIn("m2", [oid for oid, _r in self.cancelled])
+        self.assertEqual([(t["mode"], t["event"], t["pull"]) for t in self._trips()][0],
+                         ("exempt", m, []))
+        s = self.bot._sweep
+        self.assertEqual((s["exempt"], s["trips"], s["trips_live"]), (1, 1, 1))
+        self.assertTrue(imm.sweep_exempt("KXEARNINGSMENTIONCELH"))
+        self.assertFalse(imm.sweep_exempt("KXEVT"))
+
     def test_an_order_resized_by_this_cycles_amend_trips_at_its_new_size(self):
         # 10/4 20:42Z: KXRAIN-26OCT05-NOLA ask read at 38, amended to 30 this
         # cycle, then filled out for 30 -- the view must hold 30, not 38

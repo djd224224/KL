@@ -2980,6 +2980,23 @@ if SWEEP_BREAKER not in ("off", "dry", "on"):
 SWEEP_HOLD_SECS = max(0.0, _env_float("IMM_SWEEP_HOLD_SECS", 300.0))
 SWEEP_MIN_CT = max(0.0, _env_float("IMM_SWEEP_MIN_CT", 1.0))
 SWEEP_HOLDOUT = min(1.0, max(0.0, _env_float("IMM_SWEEP_HOLDOUT", 0.0)))
+# MENTION SERIES ARE EXEMPT (Jack 2026-10-05, "remove breaker on MENTION
+# markets"). KXTRUMPMENTION-26OCT05 went dark for ~2.5 min on every
+# filled-out ask: 4 trips by 15:28Z, the last on an 8-contract leftover
+# (AMER 43c). Only the 02:15Z SUPR fill (30c, 59/66 by afternoon) ran
+# against us; DEPO 18c and AMER 43c sat back inside their books minutes
+# later. Mention events keep their start-time cutoff, the per-market
+# breakers and, where gated, the live-event gate. An exempt trip is logged
+# to ws_sweep as mode "exempt" with nothing pulled; ws_stale_score.py reads
+# only on / control / dry, so the breaker's evaluation is unchanged.
+# IMM_SWEEP_EXEMPT: comma-separated words matched anywhere in the series
+# ("MENTION" = every mention family, the repo's usual test); empty = none.
+SWEEP_EXEMPT_WORDS = tuple(w.strip().upper() for w in os.environ.get(
+    "IMM_SWEEP_EXEMPT", "MENTION").split(",") if w.strip())
+
+
+def sweep_exempt(series: str) -> bool:
+    return any(w in series for w in SWEEP_EXEMPT_WORDS)
 
 # Series other repo bots trade (self-trade / infighting exclusion) + anything
 # broadcast-reactive the user wants out entirely. Prefix match on the ticker.
@@ -12625,7 +12642,8 @@ class IncentiveMarketMaker:
         self._resting_read_at = 0.0
         self._sweep = {"trips": 0, "trips_live": 0, "trips_control": 0,
                        "cancels": 0, "skipped_budget": 0, "skipped_writes": 0,
-                       "fills_seen": 0, "unparsed": 0, "unknown_order": 0}
+                       "fills_seen": 0, "unparsed": 0, "unknown_order": 0,
+                       "exempt": 0}
         self._load_persist()
         # the ladder-asks cash latch lives in module state for series_bid_only
         _LADDER_ASKS_STATE["on_at"] = self.state.ladder_asks_on_at or None
@@ -14630,6 +14648,19 @@ class IncentiveMarketMaker:
                 for e_old in [e for e, u in d.items() if u < now_ts - 3600]:
                     del d[e_old]
             self._sweep_until[ev] = now_ts + SWEEP_HOLD_SECS
+            if sweep_exempt(series_of(t)):
+                # mention families (SWEEP_EXEMPT_WORDS): logged, nothing pulled
+                self._sweep["exempt"] += 1
+                self._sink("ws_sweep", {
+                    "ev": "trip", "ts": round(now_ts, 3), "mode": "exempt",
+                    "event": ev, "ticker": t, "order_id": oid, "side": side,
+                    "px": px, "count": n, "rem_before": rem, "fill_ts": fts,
+                    "trade_id": body.get("trade_id"), "hold_s": SWEEP_HOLD_SECS,
+                    "pull": []})
+                log(f"{self.tag} sweep breaker (exempt): {t} "
+                    f"{side.upper()} @ {px:g}c filled out ({n:g}) -> mention "
+                    f"series, nothing pulled")
+                return
             self._sweep["trips"] += 1
             # on: live, unless drawn into the control (SWEEP_HOLDOUT)
             live = SWEEP_BREAKER == "on" and \
