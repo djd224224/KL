@@ -6692,6 +6692,16 @@ EVENT_LEVEL_STANDOFF = os.environ.get("IMM_EVENT_STANDOFF", "1") == "1"
 STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
 HALT_FILE = os.path.join(STATUS_DIR, "HALT")
+# ONE-SHOT LIVE-CONFIRM RELEASE (Jack 2026-10-05, KXTRUMPMENTION-26OCT05
+# false confirm). event_live_halt has no resume path by design, so lifting
+# a wrong confirm used to mean stopping the bot and hand-editing
+# imm_state.json (the running bot rewrites it on every save). Drop event
+# tickers into this file, one per line (# comments ok): the next cycle
+# removes each from event_live_halt / event_depth_halt /
+# event_fill_strikes, logs it, and renames the file to .done. The event
+# then re-enters selection like any fresh candidate (admission wait
+# included), and every live trigger stays armed.
+EVENT_LIVE_CLEAR_FILE = os.path.join(STATUS_DIR, "event_live_clear.txt")
 
 # THE SNIPER'S BOOK IS NOT MANUAL (Jack 2026-10-04: "Build the sniper taker
 # bot separately"). nfl_snipe_bot.py, run on this account (its subaccount 0
@@ -17810,6 +17820,27 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} balance-guard halt email sent: {subject}")
         return True
 
+    def _apply_event_live_clear(self) -> None:
+        """Consume EVENT_LIVE_CLEAR_FILE (see its definition)."""
+        try:
+            with open(EVENT_LIVE_CLEAR_FILE, encoding="utf-8") as f:
+                evs = [ln.split("#", 1)[0].strip() for ln in f]
+        except OSError as e:
+            log(f"{self.tag} ! {EVENT_LIVE_CLEAR_FILE} unreadable ({e})")
+            return
+        for ev in (e for e in evs if e):
+            had = ev in self.state.event_live_halt
+            self.state.event_live_halt.pop(ev, None)
+            self.state.event_depth_halt.pop(ev, None)
+            self.state.event_fill_strikes.pop(ev, None)
+            log(f"{self.tag} event-live clear: {ev} "
+                f"({'live confirm released' if had else 'was not live-confirmed'})")
+        try:
+            os.replace(EVENT_LIVE_CLEAR_FILE, EVENT_LIVE_CLEAR_FILE + ".done")
+        except OSError as e:
+            log(f"{self.tag} ! could not retire {EVENT_LIVE_CLEAR_FILE} ({e})")
+        self._save_persist()
+
     def run_cycle(self, fast_only: bool = False) -> None:
         # fast_only = a FAST-LANE mini-cycle (see FAST_LANE_SECS): same managed
         # set, same resting read, but only fast-lane series are (re)quoted and
@@ -17829,6 +17860,8 @@ class IncentiveMarketMaker:
         # and tripped again (2026-10-01).
         self.alerter.maybe_daily_summary(now_utc, self.build_daily_summary)
 
+        if os.path.exists(EVENT_LIVE_CLEAR_FILE):
+            self._apply_event_live_clear()
         if os.path.exists(HALT_FILE):
             n = self.cancel_all_bot_orders()
             log(f"{self.tag} HALT file present ({HALT_FILE}); cancelled {n}; idle")
@@ -18377,8 +18410,19 @@ class IncentiveMarketMaker:
                 # Settled-strike signature (Jack 2026-08-31 #2): in-band ->
                 # out-of-band by a real one-cycle jump (49c -> 99c: the word
                 # got said). Confirms the event LIVE — permanently.
+                # The MID must leave the series price band, not merely the
+                # pad gate (2026-10-05, KXTRUMPMENTION-26OCT05-SANC): pad_band_ok
+                # also fails on a touch outside 10-90, so a gapped book --
+                # 7x64, mid 35.5c, right after our sweep breaker pulled the
+                # event -- read as a "settled strike" and killed the event
+                # forever with every strike still trading 21-26c. A settled
+                # word pins the mid itself (98x99); a wide book only pulls
+                # a touch, which the thin / one-sided triggers already own.
+                mid_out_of_range = two_sided and not (
+                    series_price_min(meta.series) <= mid_g
+                    <= series_price_max(meta.series))
                 jumped_out = (armed and two_sided and pm_in_band
-                              and not mid_in_band
+                              and mid_out_of_range
                               and abs(mid_g - pm_g) >= EVENT_DEPTH_JUMP_CENTS)
                 stacked = (EVENT_DEPTH_STACK_CONTRACTS > 0
                            and max(d_yes, d_no)

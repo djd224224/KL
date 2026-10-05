@@ -97,6 +97,7 @@ def setUpModule():
     tmp = tempfile.mkdtemp(prefix="imm_test_")
     imm.STATUS_DIR = tmp
     imm.HALT_FILE = os.path.join(tmp, "HALT")
+    imm.EVENT_LIVE_CLEAR_FILE = os.path.join(tmp, "event_live_clear.txt")
     # a live sniper book on this machine must not net into the fixtures
     imm.SNIPE_BOOK_FILE = os.path.join(tmp, "nfl-snipe", "snipe_book.json")
     imm.IncentiveMarketMaker.PERSIST_PATH = os.path.join(tmp, "imm_state.json")
@@ -12309,6 +12310,39 @@ class TestLiveEventDepthGate(unittest.TestCase):
         self.assertFalse(self._event_orders(bot))
         self.assertIn(self.EV, bot.state.event_live_halt)
         self.assertIn(self.EV, bot.state.event_depth_halt)
+
+    def test_gapped_book_in_band_mid_is_not_a_live_confirm(self):
+        """2026-10-05 SANC: 28c -> a 7x64 gapped book (mid 35.5c). The touch
+        fails the pad gate but the mid never left the band -- no settled
+        strike, so no PERMANENT halt."""
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))          # prev_mid seeded ~50
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.07", "1500"]],
+            "no_dollars": [["0.36", "1500"]]}}             # 7x64, mid 35.5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_live_halt)
+        self.assertFalse(any(c == "event_live" for c, _m in bot.alerter.today))
+
+    def test_event_live_clear_file_releases_a_confirm(self):
+        bot = self._bot()
+        bot.state.event_live_halt[self.EV] = time.time()
+        bot.state.event_depth_halt[self.EV] = time.time()
+        bot.state.event_fill_strikes[self.EV] = 1
+        with open(imm.EVENT_LIVE_CLEAR_FILE, "w", encoding="utf-8") as f:
+            f.write(f"# false confirm\n{self.EV}\n")
+        try:
+            bot.run_cycle()
+            self.assertNotIn(self.EV, bot.state.event_live_halt)
+            self.assertNotIn(self.EV, bot.state.event_fill_strikes)
+            self.assertFalse(os.path.exists(imm.EVENT_LIVE_CLEAR_FILE))
+            self.assertTrue(os.path.exists(imm.EVENT_LIVE_CLEAR_FILE + ".done"))
+        finally:
+            for p in (imm.EVENT_LIVE_CLEAR_FILE, imm.EVENT_LIVE_CLEAR_FILE + ".done"):
+                if os.path.exists(p):
+                    os.remove(p)
 
     def test_live_confirm_survives_restart_and_refuses_reselection(self):
         bot = self._bot()
