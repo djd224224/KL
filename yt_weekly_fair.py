@@ -92,7 +92,8 @@ def _env_map(name: str, default: str) -> Dict[str, str]:
 
 SERIES = "KXYTVIEWSW"
 # ticker code -> the artist's name on YouTube Charts (and in the collector)
-ARTISTS = _env_map("IMM_YTW_ARTISTS", "KAT:KATSEYE,DRA:Drake,WEE:The Weeknd")
+# Tate McRae added 2026-10-06 (Jack: "yes add her")
+ARTISTS = _env_map("IMM_YTW_ARTISTS", "KAT:KATSEYE,DRA:Drake,WEE:The Weeknd,TAT:Tate McRae")
 SNAP_FILE = os.environ.get(
     "IMM_YTW_SNAP_FILE",
     r"C:\Users\jackd\Documents\KL-data\youtube-collect\yt_artist_snapshots.jsonl")
@@ -102,7 +103,7 @@ CHART_FILE = os.environ.get(
 WINDOW_H = int(_env_float("IMM_YTW_WINDOW_H", 15))
 API_STALE_SECS = _env_float("IMM_YTW_API_STALE_SECS", 9000)
 SIGMA_NOW = {k: float(v) for k, v in _env_map(
-    "IMM_YTW_SIGMA_NOW", "KATSEYE:0.045,Drake:0.04,The Weeknd:0.025").items()}
+    "IMM_YTW_SIGMA_NOW", "KATSEYE:0.045,Drake:0.04,The Weeknd:0.025,Tate McRae:0.025").items()}
 SIGMA_NOW_DEFAULT = 0.045
 RATIO_DRIFT_PER_DAY = _env_float("IMM_YTW_RATIO_DRIFT_PER_DAY", 0.01)
 RATIO_CV_MIN = 0.015

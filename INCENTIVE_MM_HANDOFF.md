@@ -8350,3 +8350,25 @@ published-day cap, fail closed, the file writer); TestYouTubeWeeklyPilot (3:
 admission per artist, x1 / caps / cutoff, every gate reason, quotes end to
 end with a hold and the loss halt); guard-sweep count 37 -> 39. 1117 green
 (test_incentive_mm, test_yt_weekly_fair, test_vercel_fair).
+
+### 2026-10-06 13:20Z — Tate McRae (TAT) joins the weekly pilot (Jack: "yes add her")
+
+The per-artist replay of the gate's windows (KL-data/youtube-analysis-2026-
+10-06-artists/gated_proxy.py: trades > 12h before the close and away from a
+pending print; 3 complete weeks, makers, MEASURED): Tate McRae +22.6 c/ct
+(1.1k ct, +21 / +23 by week), KATSEYE +17.0, Drake +6.1, Fuerza Regida +1.4
+(+25 / -11 / -11), YoungBoy +0.7, The Weeknd -2.9 (2.1k ct), Bad Bunny -4.9,
+Morgan Wallen -6.1, Taylor Swift -11.1, Justin Bieber -12.6, Future -21.9,
+Ariana -26.7, Post Malone -42.4. Across all artists the final 12h ran -12.8
+c/ct and the held trades +1.7, while the gated remainder ran -6.7: for most
+artists the losses are through the week, not the print snipes the gate
+removes. Tate: nowcast MAE ~1.1%, ratio CV ~1%; her ladder is 0.1M-spaced
+(31 strikes for 26OCT11, 2.6-2.9M contested).
+Defaults: yt_weekly_fair ARTISTS += TAT:Tate McRae (SIGMA_NOW 0.025),
+IMM_YTW_PILOT_ARTISTS KAT,DRA,WEE,TAT. Her chart history (8/25 -> 10/01) was
+added to run-logs/incentive-mm/yt_weekly_chart.json.
+Dry run 13:15Z: fair 2.6M 36c / 2.7M 19c / 2.8M 9c / 2.9M 4c vs the book
+65x88 / 37x56 / 25x26 / 15x20 -- the book prices last week's level; this
+Monday's API views run ~5% under last Monday for most artists (the intraday
+profile checks out: 0.885 measured vs 0.885 pooled at 20.8h), so 2.6-2.8M
+stand aside on the band and 2.9M quotes.

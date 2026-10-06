@@ -18146,7 +18146,7 @@ class TestYouTubeWeeklyPilot(unittest.TestCase):
 
     def test_admission_sizing_and_cutoff(self):
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
-            for code in ("KAT", "DRA", "WEE"):
+            for code in ("KAT", "DRA", "WEE", "TAT"):
                 self.assertTrue(IncentiveMarketMaker._allowed(
                     f"KXYTVIEWSW-{code}26OCT11-15.0M"), code)
             for code in ("ARI", "TAY", "BAD"):

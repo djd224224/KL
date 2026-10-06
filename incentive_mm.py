@@ -9669,8 +9669,10 @@ def yt2_chart_day(event_ticker: str) -> Optional[datetime]:
 # Kill switch IMM_YTW_ENABLE=0 (positions ride).
 YTW_ENABLE = _YTW_LIVE
 YTW_SERIES = "KXYTVIEWSW"
+# TAT (Tate McRae) added 2026-10-06 (Jack: "yes add her"): makers +22.6 c/ct
+# in the gate's windows on the tape (2 weeks, 1.1k ct), nowcast MAE ~1.1%
 YTW_ARTISTS = frozenset(s.strip() for s in os.environ.get(
-    "IMM_YTW_PILOT_ARTISTS", "KAT,DRA,WEE").split(",") if s.strip())
+    "IMM_YTW_PILOT_ARTISTS", "KAT,DRA,WEE,TAT").split(",") if s.strip())
 YTW_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_YTW_CUTOFF_FROM_CLOSE_MIN", 720)
 YTW_MAX_POSITION = _env_float("IMM_YTW_MAX_POSITION", 100)
 YTW_REF_MULT_CAP = _env_float("IMM_YTW_REF_MULT_CAP", 1.0)
