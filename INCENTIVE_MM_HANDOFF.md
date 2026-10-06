@@ -8351,7 +8351,7 @@ admission per artist, x1 / caps / cutoff, every gate reason, quotes end to
 end with a hold and the loss halt); guard-sweep count 37 -> 39. 1117 green
 (test_incentive_mm, test_yt_weekly_fair, test_vercel_fair).
 
-### 2026-10-06 13:20Z — Tate McRae (TAT) joins the weekly pilot (Jack: "yes add her")
+### 2026-10-06 12:57Z — Tate McRae (TAT) joins the weekly pilot (Jack: "yes add her")
 
 The per-artist replay of the gate's windows (KL-data/youtube-analysis-2026-
 10-06-artists/gated_proxy.py: trades > 12h before the close and away from a
@@ -8367,7 +8367,7 @@ removes. Tate: nowcast MAE ~1.1%, ratio CV ~1%; her ladder is 0.1M-spaced
 Defaults: yt_weekly_fair ARTISTS += TAT:Tate McRae (SIGMA_NOW 0.025),
 IMM_YTW_PILOT_ARTISTS KAT,DRA,WEE,TAT. Her chart history (8/25 -> 10/01) was
 added to run-logs/incentive-mm/yt_weekly_chart.json.
-Dry run 13:15Z: fair 2.6M 36c / 2.7M 19c / 2.8M 9c / 2.9M 4c vs the book
+Dry run 12:55Z: fair 2.6M 36c / 2.7M 19c / 2.8M 9c / 2.9M 4c vs the book
 65x88 / 37x56 / 25x26 / 15x20 -- the book prices last week's level; this
 Monday's API views run ~5% under last Monday for most artists (the intraday
 profile checks out: 0.885 measured vs 0.885 pooled at 20.8h), so 2.6-2.8M
