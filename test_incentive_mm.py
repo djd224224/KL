@@ -17981,7 +17981,7 @@ class TestYouTube2Pilot(unittest.TestCase):
             self.assertIn(s, imm.ALLOW_SERIES, s)
             self.assertTrue(imm.yt2_series(s), s)
             ov = imm.series_override(s)
-            self.assertEqual(ov.cutoff_from_close_min, 0, s)   # ticker rule out
+            self.assertEqual(ov.cutoff_from_close_min, 60, s)  # close - 1h
             self.assertEqual(ov.max_position, imm.YT2_MAX_POSITION, s)
             self.assertFalse(ov.safe_join, s)                  # joins the touch
             self.assertTrue(imm.is_daily_series(s), s)
@@ -18012,19 +18012,29 @@ class TestYouTube2Pilot(unittest.TestCase):
             self.assertTrue(IncentiveMarketMaker._allowed("KXYTTOPVIDEO2D-26OCT05-DAI"))
             self.assertTrue(IncentiveMarketMaker._allowed("KXYTTOPVIDEOG2D-26OCT05-XAM"))
 
-    def test_cutoff_is_the_end_of_the_utc_chart_day(self):
+    def test_cutoff_is_one_hour_before_the_close(self):
+        # Jack 2026-10-05 00:40Z: "move the cutoff to 1 hour before close"
         close = datetime(2026, 10, 6, 3, 59, tzinfo=timezone.utc)
-        end = datetime(2026, 10, 6, 0, 0, tzinfo=timezone.utc)
+        hour_before = datetime(2026, 10, 6, 2, 59, tzinfo=timezone.utc)
+        day_end = datetime(2026, 10, 6, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(imm.yt2_chart_day("KXYTTOPVIDEOG2D-26OCT05"),
                          datetime(2026, 10, 5, tzinfo=timezone.utc))
-        # the producer hands a close-anchored series close - 0 = close
         for s in ("KXYTTOPVIDEOG2D", "KXYTTOPVIDEO2D"):
+            # the producer hands a close-anchored series close - 60; a raw
+            # close (or the ticker-date 04:00Z D rule) is anchored here too
             self.assertEqual(imm.apply_series_cutoff_adjustments(
-                s, f"{s}-26OCT05", close, close_time=close), end, s)
-        with mock.patch.object(imm, "YT2_CUTOFF_BEFORE_DAY_END_MIN", 30):
+                s, f"{s}-26OCT05", hour_before, close_time=close), hour_before, s)
             self.assertEqual(imm.apply_series_cutoff_adjustments(
-                "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-26OCT05", close,
-                close_time=close), end - timedelta(minutes=30))
+                s, f"{s}-26OCT05", close, close_time=close), hour_before, s)
+        # the first rule (end of the UTC chart day) is still there, behind a knob
+        with mock.patch.object(imm, "YT2_CHART_DAY_CUTOFF", True):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-26OCT05", hour_before,
+                close_time=close), day_end)
+            with mock.patch.object(imm, "YT2_CUTOFF_BEFORE_DAY_END_MIN", 30):
+                self.assertEqual(imm.apply_series_cutoff_adjustments(
+                    "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-26OCT05", hour_before,
+                    close_time=close), day_end - timedelta(minutes=30))
         self.assertIsNone(imm.yt2_chart_day("KXYTTOPVIDEO2D-XYZ"))
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-XYZ", close, close_time=close),

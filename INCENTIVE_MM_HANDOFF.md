@@ -8125,3 +8125,19 @@ scan used (SCAN_REF_MULT_CAP): the rung still rests at the reference level
 however deep. Every sizing site (ladder total, estimator meta, live side
 rooms) reads capped_ref_mult with the series. Test: TestYouTube2Pilot
 (capped_ref_mult 1.0 for both pilot series, > 1 for a plain series).
+
+### 2026-10-06 00:45Z — the YouTube #2 pilot quotes to one hour before the close (Jack: "move the cutoff to 1 hour before close")
+
+Jack was watching KXYTTOPVIDEOG2D-26OCT05 stop at 00:00Z (the end of its
+UTC chart day; the market trades to 03:59Z). The cutoff is now the close
+anchor: cutoff_from_close_min = IMM_YT2_CUTOFF_FROM_CLOSE_MIN (60) -> 02:59Z
+on D+1 (22:59 ET on D). The end-of-chart-day rule stays behind
+IMM_YT2_CHART_DAY_CUTOFF=1 (with IMM_YT2_CUTOFF_BEFORE_DAY_END_MIN); an
+unparseable ticker is still stood down. Tape for the added window (D+1
+00-03Z, complete events, in band, makers): global +1.1 c/ct (16 events,
+5.7k ct, CI -7.7/+14.0), US +9.5 (11 events, 6.6k ct, CI -10/+64) -- the
+final hour before the close (-5.7 global, -30.4 US) stays out. Side effect at
+deploy: the 26OCT05 events (close 03:59Z 10/06) are quotable again to 02:59Z
+if they re-clear the payout floor on what is left of the window.
+Startup line: "yt2 pilot: ... quoted plain to 60m before the close, ...".
+Test: TestYouTube2Pilot.test_cutoff_is_one_hour_before_the_close.

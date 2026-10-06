@@ -7149,7 +7149,8 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
     # YouTube #2 top-video pilot (2026-10-05)
-    "YT2_ENABLE", "YT2_SERIES", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
+    "YT2_ENABLE", "YT2_SERIES", "YT2_CUTOFF_FROM_CLOSE_MIN",
+    "YT2_CHART_DAY_CUTOFF", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
     "YT2_MAX_POSITION", "YT2_REF_MULT_CAP", "YT2_EVENT_CAP", "YT2_DAILY_LOSS_LIMIT",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
@@ -9470,13 +9471,16 @@ def vercel_gate_reason(ticker: str, now_ts: float,
 # API ratio swings 0.96-1.35. MODELLED net at 20 lots, the bot's own scorer
 # x0.7 plus measured markouts: +$6-15/day global, +$5-20/day US.
 # THE RULES (each its own knob):
-#   - quoted to the END OF THE UTC CHART DAY: cutoff 00:00Z on D+1 less
-#     YT2_CUTOFF_BEFORE_DAY_END_MIN (0) -- after it the day's API views are
-#     complete, and the final hour before the close cost makers 30 c/ct on
-#     US #2. cutoff_from_close_min=0 takes out the ticker-date midnight-ET
-#     rule (it would stop at 04:00Z on D, 20h early); the tightener in
-#     apply_series_cutoff_adjustments sets the real one. Unparseable ticker
-#     -> stood down.
+#   - quoted to ONE HOUR BEFORE THE CLOSE (Jack 2026-10-05 00:40Z: "move
+#     the cutoff to 1 hour before close"): cutoff_from_close_min =
+#     YT2_CUTOFF_FROM_CLOSE_MIN (60) -> 02:59Z on D+1 (22:59 ET on D). The
+#     close anchor also takes out the ticker-date midnight-ET rule (it would
+#     stop at 04:00Z on D, 23h early). The final hour before the close cost
+#     makers 30 c/ct on US #2; the post-chart-day hours before it (D+1
+#     00-03Z) were roughly flat on global (+1.1 c/ct) and positive on US
+#     (+9.5), small samples. The shipped rule -- out at the END OF THE UTC
+#     CHART DAY, 00:00Z on D+1 less YT2_CUTOFF_BEFORE_DAY_END_MIN -- is kept
+#     behind IMM_YT2_CHART_DAY_CUTOFF=1. Unparseable ticker -> stood down.
 #   - 20 lots, x1 at every hour: the global ladder (IMM_LEVELS 0:20), a
 #     hand-set per-market cap (YT2_MAX_POSITION 100; a hand-tuned cap also
 #     opts out of every family size multiplier), daily (no quiet-hours,
@@ -9497,6 +9501,10 @@ def vercel_gate_reason(ticker: str, now_ts: float,
 YT2_ENABLE = _YT2_LIVE
 YT2_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_YT2_SERIES", _DEFAULT_YT2_SERIES).split(",") if s.strip())
+YT2_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_YT2_CUTOFF_FROM_CLOSE_MIN", 60)
+# the first rule (2026-10-05 15:40Z -> 10/06): out at the end of the UTC chart
+# day as well; off since Jack's "move the cutoff to 1 hour before close"
+YT2_CHART_DAY_CUTOFF = os.environ.get("IMM_YT2_CHART_DAY_CUTOFF", "0") == "1"
 YT2_CUTOFF_BEFORE_DAY_END_MIN = _env_int("IMM_YT2_CUTOFF_BEFORE_DAY_END_MIN", 0)
 YT2_MAX_POSITION = _env_float("IMM_YT2_MAX_POSITION", 100)
 YT2_REF_MULT_CAP = _env_float("IMM_YT2_REF_MULT_CAP", 1.0)
@@ -9506,7 +9514,8 @@ YT2_DAILY_LOSS_LIMIT = _env_float("IMM_YT2_DAILY_LOSS_LIMIT", 40)
 for _s in YT2_SERIES:
     SERIES_OVERRIDES[_s] = replace(
         SERIES_OVERRIDES.get(_s) or SeriesOverride(),
-        cutoff_from_close_min=0, max_position=YT2_MAX_POSITION)
+        cutoff_from_close_min=YT2_CUTOFF_FROM_CLOSE_MIN,
+        max_position=YT2_MAX_POSITION)
 
 
 def yt2_series(series: str) -> bool:
@@ -11009,9 +11018,11 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
             pre = d0 - timedelta(minutes=VERCEL_CUTOFF_BEFORE_D_MIN)
         cutoff = pre if cutoff is None else min(cutoff, pre)
     if yt2_series(series):
-        # YOUTUBE #2 PILOT CUTOFF (2026-10-05, see YT2_ENABLE): out at the
-        # end of the UTC chart day the event settles on (00:00Z D+1) less
-        # YT2_CUTOFF_BEFORE_DAY_END_MIN. Unparseable -> stood down, once.
+        # YOUTUBE #2 PILOT CUTOFF (2026-10-05, see YT2_ENABLE): the close
+        # anchor above (YT2_CUTOFF_FROM_CLOSE_MIN before the close) is the
+        # cutoff; with IMM_YT2_CHART_DAY_CUTOFF=1 also out at the end of the
+        # UTC chart day (00:00Z D+1) less YT2_CUTOFF_BEFORE_DAY_END_MIN.
+        # Unparseable -> stood down, once.
         d0 = yt2_chart_day(event_ticker)
         if d0 is None:
             end = RELEASE_GUARD_UNKNOWN
@@ -11020,10 +11031,11 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                 log(f"[IMM] ! {series}: YouTube #2 cutoff needs the chart day "
                     f"but {event_ticker} does not parse -- standing it down "
                     f"(fail closed)")
-        else:
+            cutoff = end if cutoff is None else min(cutoff, end)
+        elif YT2_CHART_DAY_CUTOFF:
             end = d0 + timedelta(days=1,
                                  minutes=-YT2_CUTOFF_BEFORE_DAY_END_MIN)
-        cutoff = end if cutoff is None else min(cutoff, end)
+            cutoff = end if cutoff is None else min(cutoff, end)
     if mort_series(series):
         # LONG-DATED MORTGAGE CUTOFF (2026-09-28, see MORT_ENABLE): out
         # MORT_CUTOFF_BUFFER_DAYS before the measurement week of the first
@@ -21358,9 +21370,11 @@ class IncentiveMarketMaker:
             log("vercel gate: OFF -- the Vercel series are not enrolled")
         if YT2_ENABLE:
             log(f"yt2 pilot: {','.join(sorted(YT2_SERIES))} quoted plain to "
-                f"00:00Z after the chart day"
-                + (f" less {YT2_CUTOFF_BEFORE_DAY_END_MIN}m"
-                   if YT2_CUTOFF_BEFORE_DAY_END_MIN else "")
+                f"{YT2_CUTOFF_FROM_CLOSE_MIN}m before the close"
+                + ((" and 00:00Z after the chart day"
+                    + (f" less {YT2_CUTOFF_BEFORE_DAY_END_MIN}m"
+                       if YT2_CUTOFF_BEFORE_DAY_END_MIN else ""))
+                   if YT2_CHART_DAY_CUTOFF else "")
                 + f", x1 at every hour (deep-ref cap {YT2_REF_MULT_CAP:g}), "
                 f"{YT2_MAX_POSITION:g}/market and "
                 f"{YT2_EVENT_CAP:g}/event net, family halt at "
