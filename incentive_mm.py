@@ -3866,7 +3866,25 @@ ELECTION_SERIES = frozenset(
         "KXSERBIAPRES,KXBC2ND,KXBC3RD,KXQUEBEC4TH,KXQUEBEC5TH,KXSAARLAND,"
         "KXNORDRHEINWESTFALEN,KXSCHLESWIGHOLSTEIN,KXPUNJABASSEMBLY,"
         "KXBRAZILTURNOUT,KXDEMTRIFECTA,KXUNDERHARRIS,KXVOTEGENERAL,"
-        "KXCAATTORNEYGENERAL,KXFULTONCHAIR").split(",") if s.strip())
+        "KXCAATTORNEYGENERAL,KXFULTONCHAIR,"
+        # the 2026-10-05 21:02Z batch (Jack: "add all of them including
+        # sweden and uk"): Spain's Nov 29 snap election, Brazil's Oct 25
+        # runoff, Argentina 2027, Israel's Oct 27 turnout, and two
+        # announcement/timing markets -- the KXSERBIAELECTIONCALL class the
+        # 9/28 list left out, taken in by Jack's call this time
+        "KXSPAIN2ND,KXSPAIN3RD,KXSPAINMOV,KXSPAINGOVT,KXVOTESPAIN,"
+        "KXBRPRES2MOV,KXBRPRES2MOVD,KXBRRUNOFFABROAD,KXBRRUNOFFCOUNTRIES,"
+        "KXBRRUNOFFSTATES,KXVOTEBR2,KXARGENTINAPRES1R,KXISRAELTURNOUT,"
+        "KXSNAPELECTIONSWE,KXUKBYELECTION").split(",") if s.strip())
+# The 9/28 carve-outs above, as data: Kalshi files them under Elections, so
+# the overrides task's Elections-category rule (ELECTION_EXTRA_FILE) would
+# otherwise enroll them. Refused by election_series() and by the loader.
+ELECTION_EXCLUDE = frozenset(
+    s.strip() for s in os.environ.get(
+        "IMM_ELECTION_EXCLUDE",
+        "KXSENMIN,KXSERBIAELECTIONCALL,KXGENERICBALLOTVOTEHUB,KXVPRESPERSON,"
+        "KXISTANBULMAYOR,KXACKMANMAYOR,KXAPCALLLAMAYOR,KXBBGMAYOR"
+        ).split(",") if s.strip())
 # FULL-match regexes, comma-separated -- so none may contain a comma (\d\d?,
 # not \d{1,2}). County judges incl. Williamson's KXWILCOJUDGE; <city>MAYOR
 # less the four carve-outs; House seat counts, district winners
@@ -3881,11 +3899,64 @@ ELECTION_SERIES_PATTERNS = tuple(
         r"KXATTYGEN[A-Z][A-Z]").split(",") if p.strip())
 
 
+# ELECTIONS BY KALSHI CATEGORY (Jack 2026-10-05: "create a rule in the
+# new-series pass for Kalshi's Elections category"). The 21:02Z batch that
+# evening lit 15 Elections series and 13 of them sat unquoted -- the exact
+# list above only knew the 9/28 feed, and the open-scan tier is off. The
+# overrides task now reads each novel programmed series' Kalshi category
+# and writes the Elections ones here, {"series": [...]}; hot-reloaded by
+# mtime at import and every universe refresh, like EXTRA_ALLOW_FILE. A
+# member still needs its verified ELECTION_DATES row to quote (no row ->
+# stood down, fail closed); the task's email lists the rows to add.
+# ELECTION_EXCLUDE and the blocklist always win.
+ELECTION_EXTRA_FILE = "election_extra_series.json"      # in STATUS_DIR
+ELECTION_EXTRA_SERIES: Set[str] = set()
+_election_extra_state = {"mtime": 0.0}
+
+
+def election_extra_path() -> str:
+    return os.path.join(STATUS_DIR, ELECTION_EXTRA_FILE)
+
+
+def load_election_extra_series() -> int:
+    try:
+        mtime = os.path.getmtime(election_extra_path())
+    except OSError:
+        return 0
+    if mtime == _election_extra_state["mtime"]:
+        return 0
+    _election_extra_state["mtime"] = mtime
+    try:
+        with open(election_extra_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! election extra file unreadable: {e}")
+        return 0
+    fresh: Set[str] = set()
+    for s in data.get("series") or []:
+        s = str(s).strip()
+        if not s or not s.startswith("KX") or s in ELECTION_EXCLUDE:
+            continue
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
+            log(f"[IMM] ! refused blocklisted series in election extra: {s}")
+            continue
+        fresh.add(s)
+    changed = len(fresh ^ ELECTION_EXTRA_SERIES)
+    ELECTION_EXTRA_SERIES.clear()
+    ELECTION_EXTRA_SERIES.update(fresh)
+    if changed:
+        log(f"[IMM] election extra series: {len(fresh)} enrolled "
+            f"({changed} changed)")
+    return changed
+
+
 def election_series(series: str) -> bool:
     """The election family (see ELECTION_SERIES): the exact general-election
-    list or a name pattern; nothing while IMM_ELECTION_ALLOW=0."""
-    return ELECTION_ALLOW and (
+    list, the Elections-category file (ELECTION_EXTRA_FILE) or a name
+    pattern, less ELECTION_EXCLUDE; nothing while IMM_ELECTION_ALLOW=0."""
+    return ELECTION_ALLOW and series not in ELECTION_EXCLUDE and (
         series in ELECTION_SERIES
+        or series in ELECTION_EXTRA_SERIES
         or any(p.fullmatch(series) for p in ELECTION_SERIES_PATTERNS))
 
 
@@ -7739,6 +7810,7 @@ def save_family_verdicts() -> None:
 
 load_family_verdicts()
 load_sat_gate()          # Saturday step-up verdict (defined next to saturday_size_mult)
+load_election_extra_series()   # Elections-category members (beside election_series)
 
 
 # ----------------------------------------------------------------------------
@@ -10778,6 +10850,56 @@ _ELECTION_DATES_DEFAULT = ",".join((
     # Brazil: first round Sun 2026-10-04, 8am-5pm Brasilia time (Senate
     # voter guide; runoff Oct 25).
     "KXBRAZILTURNOUT-26OCT04*=2026-10-04@America/Sao_Paulo",
+    # --- the 2026-10-05 21:02Z batch (each date read 10/5-10/6) ---
+    # Brazil runoff: Sun 2026-10-25, Lula v Flavio Bolsonaro after the Oct 4
+    # first round (TSE calendar: the last Sunday of October), 8am-5pm
+    # Brasilia. Consular votes abroad are cast the same day and released
+    # with Brazil's count, so the abroad / countries markets share the row.
+    "KXBRPRES2MOV-26OCT25*=2026-10-25@America/Sao_Paulo",
+    "KXBRPRES2MOVD-BRPRES26*=2026-10-25@America/Sao_Paulo",
+    "KXVOTEBR2-BRPRES26*=2026-10-25@America/Sao_Paulo",
+    "KXBRRUNOFFABROAD-26OCT25*=2026-10-25@America/Sao_Paulo",
+    "KXBRRUNOFFCOUNTRIES-26OCT25*=2026-10-25@America/Sao_Paulo",
+    "KXBRRUNOFFSTATES-26OCT25*=2026-10-25@America/Sao_Paulo",
+    # ...and the state governor runoffs the same day (Agencia Brasil 10/5:
+    # six states and the DF go to a second round) -- Espirito Santo
+    # (Pazolini v Ferraco), Tocantins (Dorinha v Vicentinho Junior). The
+    # Elections-category rule enrolls the series; these rows let them quote.
+    "KXESGOV-26OCT25*=2026-10-25@America/Sao_Paulo",
+    "KXTOCANTINSGOV-26OCT25*=2026-10-25@America/Sao_Paulo",
+    # Spain: SNAP general election Sun 2026-11-29 -- Sanchez dissolved the
+    # Cortes 2026-10-05 after Congress rejected his housing decrees (The
+    # Local / Euronews / CNN, 10/5; the scheduled date was Aug 2027).
+    "KXSPAIN2ND-26NOV29*=2026-11-29@Europe/Madrid",
+    "KXSPAIN3RD-26NOV29*=2026-11-29@Europe/Madrid",
+    "KXSPAINMOV-26NOV29*=2026-11-29@Europe/Madrid",
+    "KXVOTESPAIN-26NOV29*=2026-11-29@Europe/Madrid",
+    # the next government (before Jan 1 2028) forms after that vote, which
+    # is its first reveal -- the stand-down is there too
+    "KXSPAINGOVT-28JAN01*=2026-11-29@Europe/Madrid",
+    # Israel: 26th Knesset Tue 2026-10-27, the Knesset's full term (it
+    # dissolved in July; slates filed 9/9 -- Al Jazeera), polls 7am-10pm.
+    "KXISRAELTURNOUT-26OCT27*=2026-10-27@Asia/Jerusalem",
+    # Argentina: general election Sun 2027-10-24 (fourth Sunday of October,
+    # Ley 19.945), the first round.
+    "KXARGENTINAPRES1R-27OCT24*=2027-10-24@America/Argentina/Buenos_Aires",
+    # France: presidential first round Sun 2027-04-18, runoff May 2 (set by
+    # the cabinet 2026-06-30 -- France 24 / Bloomberg). The winner market's
+    # first reveal is the first round, so the stand-down is there.
+    "KXFRENCHPRES-27*=2027-04-18@Europe/Paris",
+    # Slovenia local (Ljubljana mayor): Sun 2026-11-15, called 2026-07-08 by
+    # the National Assembly Speaker (DVK; municipal notices; CoE calendar).
+    # Early voting Nov 10-12 is not counted before the 15th; runoff Nov 29.
+    "KXLJUBLJANAMAYOR-26NOV15*=2026-11-15@Europe/Ljubljana",
+    # ANNOUNCEMENT markets, in by Jack's call: no voting day, so the row is
+    # the market's own deadline and quoting runs until the announcement or
+    # the deadline; the 1h closing screen stops each dated bucket before its
+    # own close. Sweden: "announces a snap election before Jan 1, 2027".
+    "KXSNAPELECTIONSWE-27JAN01*=2027-01-01@Europe/Stockholm",
+    # UK: "a by-election writ issued before <date>", five buckets (Nov 1 2026
+    # .. Jan 1 2028) in ONE event, so the row is the last deadline. Expect
+    # the one-time "Kalshi dates the vote 2026-11-01" log line for it.
+    "KXUKBYELECTION-28*=2028-01-01@Europe/London",
     # SERBIA: NOT the presidential day, which is not set. Vucic resigned
     # 2026-09-27; the Speaker must call the vote >= 30 days ahead (RIK) and
     # hold it within three months (by Dec 26/27 -- Kalshi's 26DEC27 is that
@@ -15488,6 +15610,7 @@ class IncentiveMarketMaker:
         load_file_event_overrides()
         load_extra_allow_series()
         load_finecon_extra_series()
+        load_election_extra_series()
         load_family_verdicts()
         load_sat_gate()
         load_rain_fair()

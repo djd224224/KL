@@ -592,15 +592,31 @@ def enroll_new_series(client, dry: bool):
     # waiting in the review email. One /series read per NOVEL series per
     # run; everything already allowed was skipped above, so the steady
     # state is zero reads.
+    # Elections by Kalshi category (Jack 2026-10-05, after the 21:02Z batch
+    # left 13 of its 15 Elections series unquoted): a REVIEW series Kalshi
+    # files under "Elections" joins the election family through
+    # incentive_mm.ELECTION_EXTRA_FILE (hot-reloaded), less the 9/28
+    # carve-outs (ELECTION_EXCLUDE). It still needs a verified ELECTION_DATES
+    # row to quote -- the email's ACTION list names it. Same /series read as
+    # the Carbon Arc check below, so still one read per novel series.
     fin_additions = []
+    elec_additions = []
     still_review = []
     for s, why, sample in review:
-        if carbon_arc_series(client, s):
+        se = series_meta(client, s)
+        if s not in imm.ELECTION_EXCLUDE and se.get("category") == "Elections":
+            elec_additions.append(s)
+            enrolled.append((s, ELECTION_ENROLL_WHY, sample))
+        elif imm.series_is_carbon_arc(se):
             fin_additions.append(s)
             enrolled.append((s, "Carbon Arc source -> finecon group", sample))
         else:
             still_review.append((s, why, sample))
     review = still_review
+    if elec_additions and not dry:
+        _merge_series_file(imm.election_extra_path(), elec_additions)
+        log(f"election-enrolled {len(elec_additions)} Kalshi Elections "
+            f"series -> {imm.election_extra_path()}")
     if fin_additions and not dry:
         _merge_series_file(imm.FINECON_EXTRA_FILE, fin_additions)
         log(f"finecon-extended {len(fin_additions)} Carbon Arc series -> "
@@ -611,11 +627,22 @@ def enroll_new_series(client, dry: bool):
     return enrolled, review
 
 
+ELECTION_ENROLL_WHY = "Kalshi Elections category -> election family"
+
+
+def series_meta(client, series: str) -> dict:
+    """Kalshi's /series record ({} when the read fails)."""
+    try:
+        return (client.get(f"/series/{series}") or {}).get("series") or {}
+    except Exception as e:
+        log(f"! series read failed for {series}: {e}")
+        return {}
+
+
 def carbon_arc_series(client, series: str) -> bool:
     """True when the series' Kalshi settlement sources name Carbon Arc."""
     try:
-        se = (client.get(f"/series/{series}") or {}).get("series") or {}
-        return imm.series_is_carbon_arc(se)   # ONE test, shared with the bot
+        return imm.series_is_carbon_arc(series_meta(client, series))
     except Exception as e:
         log(f"! series source read failed for {series}: {e}")
         return False
@@ -1404,6 +1431,15 @@ def main(argv=None) -> int:
     if enrolled:
         for s, why, sample in enrolled:
             inf.append(f"series enrolled: {s}  [{why}]  e.g. {sample}")
+    elec = [(s, sample) for s, why, sample in enrolled if why == ELECTION_ENROLL_WHY]
+    if elec:
+        act.append("ELECTION series enrolled by Kalshi category -- each "
+                   "STANDS DOWN until it has a verified voting-day row in "
+                   "incentive_mm._ELECTION_DATES_DEFAULT (verify the date "
+                   "yourself; Kalshi's ticker dates are not trusted):")
+        for s, sample in elec:
+            act.append(f"  {s}  e.g. {sample}")
+        act.append("")
     # `review` (unclassified/blocked series, 242 as of 8/15) is deliberately
     # NOT in the email at all (Jack 8/15): it is chronic, and any such series
     # with real money on it already shows in the quote-gaps table as a

@@ -22409,5 +22409,97 @@ class TestLatencyCycleAndSweepStatus(unittest.TestCase):
         self.assertEqual(lat["ws"]["check_in_cycle"], imm.WS_CHECK_IN_CYCLE)
 
 
+class TestElectionBatch20261005(unittest.TestCase):
+    """Jack 2026-10-05: "add all of them including sweden and uk. also
+    create a rule in the new-series pass for Kalshi's Elections category"."""
+
+    NEW = ("KXSPAIN2ND-26NOV29-2-PP", "KXSPAIN3RD-26NOV29-3-VOX",
+           "KXSPAINMOV-26NOV29-A", "KXSPAINGOVT-28JAN01-PP",
+           "KXVOTESPAIN-26NOV29PSOE-30", "KXBRPRES2MOV-26OCT25-A",
+           "KXBRPRES2MOVD-BRPRES26LULA-A", "KXBRRUNOFFABROAD-26OCT25-1-A",
+           "KXBRRUNOFFCOUNTRIES-26OCT25-1-A", "KXBRRUNOFFSTATES-26OCT25-1-A",
+           "KXVOTEBR2-BRPRES26FBOL-45", "KXARGENTINAPRES1R-27OCT24-JMIL",
+           "KXISRAELTURNOUT-26OCT27-70", "KXSNAPELECTIONSWE-27JAN01",
+           "KXUKBYELECTION-28-26NOV01")
+
+    def setUp(self):
+        self.addCleanup(self._reset_extra)
+        self._reset_extra()
+
+    def _reset_extra(self):
+        try:
+            os.remove(imm.election_extra_path())
+        except OSError:
+            pass
+        imm.ELECTION_EXTRA_SERIES.clear()
+        imm._election_extra_state["mtime"] = 0.0
+
+    def test_the_batch_is_in_the_family_with_verified_cutoffs(self):
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for t in self.NEW:
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+            for t in ("KXSERBIAELECTIONCALL-26NOV01-26OCT15", "KXSENMIN-27-JTHU"):
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        for ev, want in (
+                ("KXSPAIN2ND-26NOV29-2", utc(2026, 11, 28, 23, 0)),   # 00:00 Madrid
+                ("KXSPAINGOVT-28JAN01", utc(2026, 11, 28, 23, 0)),
+                ("KXBRPRES2MOVD-BRPRES26LULA", utc(2026, 10, 25, 3, 0)),
+                ("KXVOTEBR2-BRPRES26FBOL", utc(2026, 10, 25, 3, 0)),
+                ("KXBRRUNOFFABROAD-26OCT25-1", utc(2026, 10, 25, 3, 0)),
+                ("KXARGENTINAPRES1R-27OCT24", utc(2027, 10, 24, 3, 0)),
+                ("KXISRAELTURNOUT-26OCT27", utc(2026, 10, 26, 22, 0)),
+                ("KXLJUBLJANAMAYOR-26NOV15", utc(2026, 11, 14, 23, 0)),
+                ("KXSNAPELECTIONSWE-27JAN01", utc(2026, 12, 31, 23, 0)),
+                ("KXUKBYELECTION-28", utc(2028, 1, 1, 0, 0))):
+            self.assertEqual(imm.election_cutoff_utc(ev), want, ev)
+
+    def test_the_category_file_joins_the_family_less_the_carve_outs(self):
+        self.assertFalse(imm.election_series("KXFOOELECTION"))
+        with open(imm.election_extra_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": ["KXFOOELECTION", "KXSERBIAELECTIONCALL",
+                                  "KXGENERICBALLOTVOTEHUB", "notaseries"]}, f)
+        self.assertEqual(imm.load_election_extra_series(), 1)
+        self.assertTrue(imm.election_series("KXFOOELECTION"))
+        self.assertFalse(imm.election_series("KXSERBIAELECTIONCALL"))
+        self.assertFalse(imm.election_series("KXGENERICBALLOTVOTEHUB"))
+        self.assertEqual(imm.load_election_extra_series(), 0)   # mtime-gated
+        with mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES", ("KXFOO",)):
+            os.utime(imm.election_extra_path(), None)
+            imm._election_extra_state["mtime"] = 0.0
+            imm.load_election_extra_series()
+            self.assertFalse(imm.election_series("KXFOOELECTION"))
+
+    def test_the_new_series_pass_enrolls_by_kalshi_category(self):
+        import imm_earnings_overrides as ieo
+        cats = {"KXFOOELECTION": "Elections", "KXSERBIAELECTIONCALL": "Elections",
+                "KXWIDGETCOUNT": "Economics"}
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [
+                        {"market_ticker": "KXFOOELECTION-26DEC06-A"},
+                        {"market_ticker": "KXSERBIAELECTIONCALL-26NOV01-26OCT15"},
+                        {"market_ticker": "KXWIDGETCOUNT-26DEC31-T5"}]}
+                if path.startswith("/series/"):
+                    return {"series": {"category": cats.get(path[8:], "")}}
+                raise AssertionError(path)
+        p = mock.patch.object(imm, "ALLOWLIST_ONLY", True)     # production default
+        p.start()
+        self.addCleanup(p.stop)
+        enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+        self.assertEqual([(s, why) for s, why, _ in enrolled],
+                         [("KXFOOELECTION", ieo.ELECTION_ENROLL_WHY)])
+        self.assertEqual(sorted(s for s, _w, _x in review),
+                         ["KXSERBIAELECTIONCALL", "KXWIDGETCOUNT"])
+        with open(imm.election_extra_path(), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["series"], ["KXFOOELECTION"])
+        imm.load_election_extra_series()
+        self.assertTrue(IncentiveMarketMaker._allowed("KXFOOELECTION-26DEC06-A"))
+        # the next run sees it as covered: no re-enroll
+        enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
+        self.assertEqual(enrolled2, [])
+
+
 if __name__ == "__main__":
     unittest.main()
