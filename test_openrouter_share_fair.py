@@ -650,6 +650,18 @@ class TestBreaks(unittest.TestCase):
         churn = [dict(h, ys=dict(h["ys"])) for h in snaps]
         churn[-1]["ys"]["Others"] += churn[-1]["ys"].pop("m")
         self.assertIsNone(osf.chart_revision(churn, self.W, now))
+        # 10/06 01:43Z: the ninth name swaps -- m (2%) out to Others, n (from
+        # Others, a hair bigger) in; Others hardly moves -- not a revision
+        swap = [dict(h, ys=dict(h["ys"])) for h in snaps]
+        m = swap[-1]["ys"].pop("m")
+        swap[-1]["ys"]["n"] = m * 1.004
+        swap[-1]["ys"]["Others"] += m - m * 1.004
+        self.assertIsNone(osf.chart_revision(swap, self.W, now))
+        # s (10%) leaves beside m's 2% and a newcomer arrives holding its
+        # count: re-attributed to a maker the chart did not name -- a revision
+        newco = [dict(h, ys=dict(h["ys"])) for h in snaps]
+        newco[-1]["ys"]["maker"] = newco[-1]["ys"].pop("s")
+        self.assertEqual(osf.chart_revision(newco, self.W, now)[0], now)
         # older than the hold: forgotten
         self.assertIsNone(osf.chart_revision(fell, self.W,
                                              now + (osf.SHARE_REVISION_HOLD_HOURS + 1) * 3600))
@@ -744,6 +756,26 @@ class TestWriterBreaks(unittest.TestCase):
         self.assertEqual((d["breaks"]["2026-10-05"]["bucket"], d["breaks"]["2026-10-05"]["t"]),
                          ("revision", snap["t"]))
         self.assertFalse(osf.LAST["data_current"])
+
+    def test_a_kept_revision_no_longer_found_is_dropped_and_the_break_refound(self):
+        # 10/06 02:17Z: the first deploy kept a "revision" at the ninth-name
+        # swap; the fixed rules drop it and re-find the 06:00Z break
+        i = 3 * 36 - 1                                  # 36h, the break in view
+        for j in range(i):
+            self._write_at(j)
+        d = self._write_at(i)
+        good = d["breaks"]["2026-10-05"]
+        self.assertEqual(good["bucket"], "s")
+        bogus = dict(good, bucket="revision", t=self.snaps[i - 3]["t"],
+                     ys=self.snaps[i - 3]["ys"], old=None, new=None)
+        d["breaks"] = {"2026-10-05": bogus}
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        d = self._write_at(i + 1)
+        self.assertTrue(d["data_current"])
+        self.assertEqual((d["breaks"]["2026-10-05"]["bucket"], d["breaks"]["2026-10-05"]["t"]),
+                         ("s", good["t"]))
+        self.assertEqual(d["entries"]["KXASHARE-26OCT12"]["anchor_mode"], "since break")
 
     def test_ladder_logged_on_each_event_read(self):
         markets = [{"event_ticker": "KXANTHSHARE-26OCT12", "ticker": "KXANTHSHARE-26OCT12-2.4",

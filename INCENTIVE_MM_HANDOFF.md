@@ -8240,3 +8240,25 @@ rate and vol-only sigma, and pull 1 = the plain last hours. New:
 - TestWriterBreaks: a break kept past the 48h of snapshots and dropped
   next week; the archive once per cachedAt; a revision standing the
   family aside; the ladder on each event read only.
+
+### 2026-10-06 ~02:25Z — share fair: the nine-name boundary swapping is not a revision
+
+The first deploy (dc14a7c, live 02:17Z) flagged a "revision" at 01:43:47Z
+and stood the family aside. What happened was the chart's ninth name
+swapping: mistralai (18.48M) went out to Others and meta-llama (18.55M)
+came in, so Others moved +0.38M. The vanish rule ("Others did not take it
+in") misread that. The kept revision also replaced the stealth break as
+the anchor.
+
+Fix:
+- An author leaving the named set is a revision only with >= 1% of the
+  week AND more than 1.5x the smallest name still listed.
+- The same test catches a newcomer arriving with such a count (the
+  stealth model's 74.7M re-attributed to an unnamed maker).
+- A kept revision the rules no longer find, while still inside the hold,
+  is dropped, and the break before it is re-found from the snapshots.
+
+On a copy of the live file, one write drops the 01:43Z revision, re-finds
+stealth at 16:04Z, and data_current is True again.
+
+Tests: the swap, the newcomer, and the self-heal (28 green; suite 2,237 OK).

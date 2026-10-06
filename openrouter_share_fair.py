@@ -472,9 +472,13 @@ def detect_break(hist: List[dict], week: date, chart_time: Optional[datetime],
 def chart_revision(hist: List[dict], week: date, now_t: float) -> Optional[Tuple[float, dict]]:
     """The last snapshot of `week` (time, counts) that revised the counts
     before it, within SHARE_REVISION_HOLD_HOURS of now_t: a named author's
-    count fell, an author holding >= 1% of the week vanished without Others
-    taking it in, or one interval's increase went >= SHARE_JUMP_FRAC to a
-    single author (requests re-attributed, not new flow). None otherwise."""
+    count fell; one interval's increase went >= SHARE_JUMP_FRAC to a single
+    author (requests re-attributed, not new flow); or an author holding >= 1%
+    of the week left -- or one arrived -- the nine named with more than 1.5x
+    the smallest name on the other side. The nine-name boundary swapping
+    (10/06 01:43Z: mistralai 18.48M out to Others, meta-llama 18.55M in) is
+    not a revision; the stealth model's 74.7M vanishing beside xiaomi's 24M
+    would be. None otherwise."""
     last = None
     snaps = week_snaps(hist, week)
     for (t0, y0), (t1, y1) in zip(snaps, snaps[1:]):
@@ -482,7 +486,8 @@ def chart_revision(hist: List[dict], week: date, now_t: float) -> Optional[Tuple
             continue
         tot0 = sum(y0.values())
         d_tot = sum(y1.values()) - tot0
-        d_oth = y1.get(OTHERS, 0.0) - y0.get(OTHERS, 0.0)
+        named0 = [v for k, v in y0.items() if k != OTHERS]
+        named1 = [v for k, v in y1.items() if k != OTHERS]
         for k, v0 in y0.items():
             if k == OTHERS:
                 continue
@@ -490,7 +495,10 @@ def chart_revision(hist: List[dict], week: date, now_t: float) -> Optional[Tuple
                 if y1[k] < v0 - 0.5 or (d_tot > 0 and y1[k] - v0 >= SHARE_JUMP_FRAC * d_tot
                                         and y1[k] - v0 > 0.01 * tot0):
                     last = (t1, y1)
-            elif v0 >= 0.01 * tot0 and d_oth < 0.5 * v0:
+            elif v0 >= 0.01 * tot0 and (not named1 or v0 > 1.5 * min(named1)):
+                last = (t1, y1)
+        for k, v1 in y1.items():
+            if k != OTHERS and k not in y0 and v1 >= 0.01 * tot0                     and (not named0 or v1 > 1.5 * min(named0)):
                 last = (t1, y1)
     return last
 
@@ -855,6 +863,12 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         cur_week = None
     if cur_week is not None and chart_time is not None:
         revised = chart_revision(hist, cur_week, chart_time.timestamp())
+        # a kept revision the rules no longer find while it is still in view
+        # is dropped (and the break before it re-found from the snapshots)
+        if brk is not None and brk.get("bucket") == "revision"                 and chart_time.timestamp() - float(brk["t"]) <= SHARE_REVISION_HOLD_HOURS * 3600.0                 and (revised is None or revised[0] < float(brk["t"])):
+            _log(f"dropping the revision kept at "
+                 f"{datetime.fromtimestamp(float(brk['t']), timezone.utc):%m-%d %H:%MZ}: not one now")
+            brk = None
         if revised is not None and (brk is None or revised[0] > float(brk["t"])):
             brk = {"t": revised[0], "x": cur_x, "ys": dict(revised[1]), "bucket": "revision",
                    "old": None, "new": None}
