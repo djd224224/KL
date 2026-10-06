@@ -8262,3 +8262,91 @@ On a copy of the live file, one write drops the 01:43Z revision, re-finds
 stealth at 16:04Z, and data_current is True again.
 
 Tests: the swap, the newcomer, and the self-heal (28 green; suite 2,237 OK).
+
+## 2026-10-06 — YouTube weekly artist-views PILOT: KXYTVIEWSW for KATSEYE / Drake / The Weeknd, quoted against a realtime API fair (Jack: "live now")
+
+Jack: "consider quoting KATSEYE, Drake and The Weeknd with realtime data",
+then (shadow-first or live) "live now".
+
+WHY THESE THREE. KXYTVIEWSW-<CODE><YYMMMDD>-<K>M = the max of the artist's
+daily Global views on charts.youtube.com over the 7 UTC days ending on the
+ticker date ($100 per strike per week, ~15 strikes per artist). Public tape,
+3 complete weeks, in band (MEASURED): makers +4.0 c/ct on these three (9
+artist-weeks, CI -2.8/+8.9) -- -20.4 c/ct in the final 2h before the close
+(13k ct, takers buying YES 99.8%: the last print sniped) and +9.4 c/ct on the
+59k ct before it. Every other artist but Fuerza Regida lost; Ariana -26.7
+c/ct (-$5.2k). KL-data/youtube-analysis-2026-10-05/ (markouts), the
+2026-10-06 check-in.
+
+THE FAIR (yt_weekly_fair.py, new; refresher thread "ytw-fair" every
+IMM_YTW_FAIR_REFRESH_SECS 600 -> run-logs/incentive-mm/yt_weekly_fair.json):
+- API views: the KL-data youtube-collect artist collector's hourly snapshots
+  of every tracked video (yt_artist_snapshots.jsonl; 386 / 649 / 450 videos),
+  read incrementally (first pass ~6 s). Chart day D <-> API window
+  [D 15:00Z, D+1 15:00Z) (the 10/05 study's most stable alignment).
+- ratio = median chart/API over the last 3 days with a print (the validated
+  NOWCAST3 form); prints from run-logs/incentive-mm/yt_weekly_chart.json
+  (seeded 10/06 from the 10/05 study: 8/25 -> 10/02-10/03) plus every print
+  Kalshi reveals (a YES-early close's expiration_value) that matches a day's
+  nowcast within 12% and 18-72h after the day -- written back to the file.
+  charts.youtube.com still 429s every request (10/05-10/06), so Kalshi's
+  early closes are the only print feed. Ratio sd = recent CV + 1%/day of age
+  (Drake / The Weeknd ratios fell ~1%/day 9/28-10/02).
+- each day: print / complete (r x API, sd 2.5-4.5% by artist) / partial
+  (r x API so far / the pooled intraday profile, sd 16% early -> 3.3% after
+  12h) / future (a weekday-factor random walk on bootstrapped de-seasonalized
+  daily log changes of the last 35 days, x1.25). Complete days > 50h old with
+  no revealed print are capped at the lowest open strike (they printed below
+  it). P(YES) = P(max(revealed max, every day) > K), 4,000 joint draws.
+- HOLD: a strike within 1.5 ladder spacings of a running or complete-but-
+  unprinted day (<= 50h after its UTC end) is flagged -- the gate stands it
+  aside until the print is known (the print-snipe guard; the API knows a
+  finished day ~8-23h before the chart prints it).
+- fails closed: snapshots > 2.5h old -> status stale_api, no entries; no
+  ratio inside 14 days, no open strike or a failed read -> no entry.
+
+THE GATE (incentive_mm.py, ytw_gate_reason in the quote loop, guard
+"ytw_fair"): stand aside (cancel) with no / a stale (YTW_FAIR_TTL_MIN 30)
+entry, a missing strike, a hold, a decided strike (fair < 5c / > 95c) or a
+touch fighting the fair by > YTW_FAIR_TOL_CENTS 15 on the adverse side.
+Logs "ytw stand-aside <t>: <why>" / "ytw resume <t>".
+
+ADMISSION: per TICKER (ytw_pilot_ticker in _allowed): KXYTVIEWSW events whose
+code is in IMM_YTW_PILOT_ARTISTS (KAT,DRA,WEE). The series is never in
+ALLOW_SERIES, so every other artist stays out.
+
+SIZING / RISK (the #2 pilot's): 20 lots x1 at every hour (is_daily_series,
+a hand-set 100 per-market cap, YTW_REF_MULT_CAP 1.0, KXYT out of the yield
+mode), YTW_EVENT_CAP 100 net per event, cutoff YTW_CUTOFF_FROM_CLOSE_MIN 720
+(12h before the 14:00Z close: out at 02:00Z, before the final print's snipe
+window), and its own family daily loss halt YTW_DAILY_LOSS_LIMIT $40 (state
+ytw_halt_day / ytw_pnl_carry, email "ytw_halt", guard "ytw_halt").
+
+DRY RUN 10/06 12:30Z (week Oct 5-11; 10/05 partial at 20.8h): Drake's fair
+sits inside the book on most strikes (13.5M 75c vs 48x87, 14M 63c vs 42x65);
+The Weeknd's 17-18M run 30c+ under the book (the market prices a higher
+level: band stand-asides); KATSEYE's API views fell ~25% week over week from
+Sunday 10/04 (broad, every top video) while the book still prices a 22M+
+weekend -- its 17M+ strikes stand aside on the band. Holds on the strikes
+around 10/05's estimate (DRA 12.5-13M, KAT 12-14M, WEE 15-17M) until its
+print (due ~10/06 23:30Z - 10/07).
+
+DATA DEPENDENCY: the collectors are bare python processes (no Windows task)
+running to 2026-10-18 12:00Z. After that the snapshots go stale and the gate
+stands the family aside (fail closed) until a feed replaces them -- the
+26OCT18 week's events trade to ~10/20.
+
+KILL SWITCH: IMM_YTW_ENABLE=0 (env => restart_imm.ps1 -Task); positions ride.
+
+WATCH: "ytw pilot: KXYTVIEWSW for DRA,KAT,WEE against the realtime fair ..."
+at startup; "ytw-fair refresh: N events with a fair, status ok"; the 10/05
+print revealed by Kalshi early closes ~10/06 23:30Z+ -> yt_weekly_chart.json
+gains 2026-10-05 and the ratio recalibrates; fills on KXYTVIEWSW only for
+KAT/DRA/WEE. The 10/15 re-score task should score this too.
+
+Tests: test_yt_weekly_fair.py (8: tickers, incremental snapshots + windows,
+day kinds / monotone fair / holds, revealed print floor + day match, the
+published-day cap, fail closed, the file writer); TestYouTubeWeeklyPilot (3:
+admission per artist, x1 / caps / cutoff, every gate reason, quotes end to
+end with a hold and the loss halt); guard-sweep count 37 -> 39. 1117 green
+(test_incentive_mm, test_yt_weekly_fair, test_vercel_fair).

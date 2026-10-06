@@ -241,6 +241,10 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("YT2_ENABLE") \
             and series in globals().get("YT2_SERIES", ()):
         m = min(m, max(1.0, globals().get("YT2_REF_MULT_CAP", 1.0)))
+    # the YouTube weekly pilot (2026-10-06): the same, YTW_REF_MULT_CAP
+    if series is not None and globals().get("YTW_ENABLE") \
+            and series == globals().get("YTW_SERIES"):
+        m = min(m, max(1.0, globals().get("YTW_REF_MULT_CAP", 1.0)))
     return m
 
 
@@ -1477,6 +1481,9 @@ def is_daily_series(series: str) -> bool:
     # left to the feed classifier (read at call time: defined further down)
     if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
         return True
+    # ... and so is the YouTube weekly pilot (2026-10-06)
+    if series == globals().get("YTW_SERIES") and globals().get("YTW_ENABLE"):
+        return True
     return series in DAILY_SERIES_DYNAMIC
 
 
@@ -2092,6 +2099,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the YouTube #2 pilot (2026-10-05): YT2_EVENT_CAP net per event
     if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
         return globals()["YT2_EVENT_CAP"]
+    # the YouTube weekly pilot (2026-10-06): YTW_EVENT_CAP net per event
+    if series == globals().get("YTW_SERIES") and globals().get("YTW_ENABLE"):
+        return globals()["YTW_EVENT_CAP"]
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
@@ -4373,6 +4383,13 @@ _DEFAULT_VERCEL_SERIES = ("KXOPENVSPEND,KXMOONVSPEND,KXANTHVSPEND,KXGOOGVREQ,"
 # them out.
 _YT2_LIVE = os.environ.get("IMM_YT2_ENABLE", "1") == "1"
 _DEFAULT_YT2_SERIES = "KXYTTOPVIDEOG2D,KXYTTOPVIDEO2D"
+# YOUTUBE WEEKLY ARTIST-VIEWS PILOT (Jack 2026-10-06: "consider quoting
+# KATSEYE, Drake and The Weeknd with realtime data" -> "live now"):
+# KXYTVIEWSW for three artist codes only, quoted against yt_weekly_fair's
+# realtime API nowcast (see YTW_ENABLE). Admitted per TICKER by
+# ytw_pilot_ticker in _allowed -- the series is never in ALLOW_SERIES, so
+# every other artist stays out. IMM_YTW_ENABLE=0 takes it out.
+_YTW_LIVE = os.environ.get("IMM_YTW_ENABLE", "1") == "1"
 # LONG-DATED MORTGAGE RATES (Jack 2026-09-28: "yes" to "build a fair-value
 # gate for KXFM30YMTG and KXMORTGAGERATE"): Freddie Mac PMMS year-end and
 # how-high-in-a-year markets, $100 per strike per period from 9/28. Enrolled
@@ -7223,6 +7240,11 @@ _CONFIG_CODE_KNOBS = (
     "YT2_ENABLE", "YT2_SERIES", "YT2_CUTOFF_FROM_CLOSE_MIN",
     "YT2_CHART_DAY_CUTOFF", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
     "YT2_MAX_POSITION", "YT2_REF_MULT_CAP", "YT2_EVENT_CAP", "YT2_DAILY_LOSS_LIMIT",
+    # YouTube weekly pilot (2026-10-06); yt_weekly_fair's knobs ride in the
+    # fair file's "model" block
+    "YTW_ENABLE", "YTW_ARTISTS", "YTW_CUTOFF_FROM_CLOSE_MIN", "YTW_MAX_POSITION",
+    "YTW_REF_MULT_CAP", "YTW_EVENT_CAP", "YTW_DAILY_LOSS_LIMIT", "YTW_FAIR_TOL_CENTS",
+    "YTW_FAIR_MIN_P", "YTW_FAIR_TTL_MIN", "YTW_FAIR_REFRESH_SECS",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -9614,6 +9636,139 @@ def yt2_chart_day(event_ticker: str) -> Optional[datetime]:
 
 
 # ----------------------------------------------------------------------------
+# YOUTUBE WEEKLY ARTIST-VIEWS PILOT (Jack 2026-10-06: "consider quoting
+# KATSEYE, Drake and The Weeknd with realtime data" -> "live now").
+# KXYTVIEWSW-<CODE><YYMMMDD>-<K>M: "Will <artist> have above K daily views at
+# any point during <Mon> - <Sun>?" -- the week's max of the artist's daily
+# Global views on charts.youtube.com; each day prints ~24-46h after it ends,
+# Kalshi closes a crossed strike YES early, the event closes ~14:00Z two days
+# after the week.
+# WHY THESE THREE (10/06 check-in, KL-data/youtube-analysis-2026-10-05; the
+# public tape of the 3 complete weeks): makers +4.0 c/ct on KATSEYE / Drake /
+# The Weeknd (9 artist-weeks, CI -2.8/+8.9): -20.4 c/ct in the final 2h
+# before the close (takers buying YES 99.8% -- the last print sniped), +9.4
+# c/ct on everything earlier. Every other artist but Fuerza Regida lost
+# (Ariana -26.7 c/ct).
+# THE FAIR: yt_weekly_fair.py (refresher thread "ytw-fair", every
+# YTW_FAIR_REFRESH_SECS) -- P(week max > K) per strike from the collector's
+# hourly API snapshots (chart day D <-> API window [D 15:00Z, D+1 15:00Z) x
+# the chart/API ratio), prints Kalshi reveals, and a weekday random walk for
+# the days to come; plus a HOLD flag on strikes within 1.5 ladder spacings of
+# a running or complete-but-unprinted day's estimate (the print snipe).
+# THE GATE (ytw_gate_reason, quote loop): stand aside (cancel) without a
+# fresh entry (YTW_FAIR_TTL_MIN; the module writes none when the API data is
+# stale), on a hold, a decided strike (fair < YTW_FAIR_MIN_P or > 1 - it) or
+# a touch fighting the fair by more than YTW_FAIR_TOL_CENTS on the adverse
+# side. Sizing as the #2 pilot: 20 lots x1 at every hour (daily, a hand-set
+# 100 per-market cap, no deep-reference size), YTW_EVENT_CAP 100 net per
+# event, cutoff YTW_CUTOFF_FROM_CLOSE_MIN (720 = 12h) before the close, and
+# its own family daily loss halt (YTW_DAILY_LOSS_LIMIT $40, "ytw_halt").
+# DATA DEPENDENCY: the KL-data youtube-collect collectors are bare processes
+# running to 2026-10-18 12:00Z; past that the fair goes stale and the gate
+# stands everything aside until a feed replaces them.
+# Kill switch IMM_YTW_ENABLE=0 (positions ride).
+YTW_ENABLE = _YTW_LIVE
+YTW_SERIES = "KXYTVIEWSW"
+YTW_ARTISTS = frozenset(s.strip() for s in os.environ.get(
+    "IMM_YTW_PILOT_ARTISTS", "KAT,DRA,WEE").split(",") if s.strip())
+YTW_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_YTW_CUTOFF_FROM_CLOSE_MIN", 720)
+YTW_MAX_POSITION = _env_float("IMM_YTW_MAX_POSITION", 100)
+YTW_REF_MULT_CAP = _env_float("IMM_YTW_REF_MULT_CAP", 1.0)
+YTW_EVENT_CAP = _env_float("IMM_YTW_EVENT_CAP", 100)
+YTW_DAILY_LOSS_LIMIT = _env_float("IMM_YTW_DAILY_LOSS_LIMIT", 40)
+YTW_FAIR_TOL_CENTS = _env_int("IMM_YTW_FAIR_TOL_CENTS", 15)
+YTW_FAIR_MIN_P = _env_float("IMM_YTW_FAIR_MIN_P", 0.05)
+YTW_FAIR_TTL_MIN = _env_int("IMM_YTW_FAIR_TTL_MIN", 30)
+YTW_FAIR_REFRESH_SECS = _env_int("IMM_YTW_FAIR_REFRESH_SECS", 600)
+YTW_FAIR_FILE = os.environ.get(
+    "IMM_YTW_FAIR_FILE", os.path.join(STATUS_DIR, "yt_weekly_fair.json"))
+_ytw_state: dict = {"mtime": 0.0, "entries": {}}
+_YTW_EVENT_RE = re.compile(r"^KXYTVIEWSW-([A-Z]+)\d{2}[A-Z]{3}\d{2}$")
+
+if YTW_ENABLE:
+    SERIES_OVERRIDES[YTW_SERIES] = replace(
+        SERIES_OVERRIDES.get(YTW_SERIES) or SeriesOverride(),
+        cutoff_from_close_min=YTW_CUTOFF_FROM_CLOSE_MIN,
+        max_position=YTW_MAX_POSITION)
+
+
+def ytw_series(series: str) -> bool:
+    return YTW_ENABLE and series == YTW_SERIES
+
+
+def ytw_event_code(event_ticker: str) -> Optional[str]:
+    """'KXYTVIEWSW-KAT26OCT11' -> 'KAT'; None when it does not parse."""
+    m = _YTW_EVENT_RE.match(event_ticker or "")
+    return m.group(1) if m else None
+
+
+def ytw_pilot_ticker(ticker: str) -> bool:
+    """A KXYTVIEWSW market of a pilot artist (the allowlist's per-ticker
+    admission: every other artist of the series stays out)."""
+    if not YTW_ENABLE or not (ticker or "").startswith(YTW_SERIES + "-"):
+        return False
+    return ytw_event_code(ticker.rsplit("-", 1)[0]) in YTW_ARTISTS
+
+
+def load_ytw_fair() -> int:
+    """Hot-reload YTW_FAIR_FILE by mtime into _ytw_state; events loaded on a
+    reload, else 0."""
+    try:
+        mtime = os.path.getmtime(YTW_FAIR_FILE)
+    except OSError:
+        return 0
+    if mtime == _ytw_state["mtime"]:
+        return 0
+    _ytw_state["mtime"] = mtime
+    try:
+        with open(YTW_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! yt weekly fair file unreadable: {e}")
+        return 0
+    fresh: Dict[str, dict] = {}
+    for ev, e in (data.get("entries") or {}).items():
+        ts = parse_iso_utc(str(e.get("fetched_at") or ""))
+        strikes = e.get("strikes")
+        if ts is None or not isinstance(strikes, dict):
+            continue
+        fresh[str(ev)] = {"ts": ts.timestamp(), "strikes": strikes}
+    _ytw_state["entries"] = fresh
+    return len(fresh)
+
+
+def ytw_gate_reason(ticker: str, now_ts: float, ext_bid: Optional[float],
+                    ext_ask: Optional[float]) -> Tuple[str, dict]:
+    """('', {}) when a weekly pilot market may quote, else (reason,
+    guard-skip inputs). Fails CLOSED on a missing / stale entry."""
+    ev, _, key = ticker.rpartition("-")
+    e = _ytw_state["entries"].get(ev)
+    if e is None:
+        return "no YouTube weekly fair for this event", {"reason": "no_read"}
+    if now_ts - e["ts"] > YTW_FAIR_TTL_MIN * 60:
+        return "YouTube weekly fair is stale", {"reason": "stale"}
+    s = e["strikes"].get(key)
+    if not isinstance(s, dict) or s.get("p") is None:
+        return f"no fair for strike {key}", {"reason": "no_strike"}
+    p = float(s["p"])
+    if s.get("hold"):
+        return (f"print pending: {s['hold']}",
+                {"reason": "hold", "fair": round(p * 100, 2)})
+    if p < YTW_FAIR_MIN_P or p > 1.0 - YTW_FAIR_MIN_P:
+        return (f"decided: fair {p * 100:.0f}c",
+                {"reason": "decided", "fair": round(p * 100, 2)})
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, p * 100.0,
+                                        YTW_FAIR_TOL_CENTS, p * 100.0)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {p * 100:.0f}c (tol "
+                f"{YTW_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side)",
+                {"reason": "band", "fair": round(p * 100, 2),
+                 "tol": YTW_FAIR_TOL_CENTS, "bid_bad": bid_bad,
+                 "ask_bad": ask_bad})
+    return "", {}
+
+
+# ----------------------------------------------------------------------------
 # LONG-DATED MORTGAGE GATE (Jack 2026-09-28: "yes" to "block KX30YMORTW and
 # build a fair-value gate for KXFM30YMTG and KXMORTGAGERATE ... stop quoting
 # if its data went stale ... start from Freddie's latest weekly number and
@@ -11163,6 +11318,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
             end = d0 + timedelta(days=1,
                                  minutes=-YT2_CUTOFF_BEFORE_DAY_END_MIN)
             cutoff = end if cutoff is None else min(cutoff, end)
+    if ytw_series(series) and ytw_event_code(event_ticker) is None:
+        # YOUTUBE WEEKLY PILOT (2026-10-06): the close anchor above is the
+        # cutoff; an event whose artist code does not parse stands down
+        cutoff = RELEASE_GUARD_UNKNOWN
     if mort_series(series):
         # LONG-DATED MORTGAGE CUTOFF (2026-09-28, see MORT_ENABLE): out
         # MORT_CUTOFF_BUFFER_DAYS before the measurement week of the first
@@ -12678,6 +12837,11 @@ class BotState:
     yt2_pnl_baseline: Optional[float] = None   # NOT persisted
     yt2_pnl_carry: float = 0.0      # pilot P&L today carried across restarts
     yt2_pnl_today_last: float = 0.0
+    # YouTube weekly pilot daily loss halt (2026-10-06, YTW_DAILY_LOSS_LIMIT)
+    ytw_halt_day: str = ""
+    ytw_pnl_baseline: Optional[float] = None   # NOT persisted
+    ytw_pnl_carry: float = 0.0
+    ytw_pnl_today_last: float = 0.0
     programmed: Set[str] = field(default_factory=set)   # markets with a LIVE incentive
     #   program at the last universe refresh — the no-rent freeze (Jack 2026-07-26,
     #   KXRT: "why still quoting when the rewards have expired") keys off this
@@ -12804,6 +12968,7 @@ class IncentiveMarketMaker:
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
         self._quake_held: Set[str] = set()        # quake gate holds (frozen bids)
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
+        self._ytw_stood: Set[str] = set()         # YouTube weekly pilot stand-asides
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -13891,6 +14056,7 @@ class IncentiveMarketMaker:
                 if isinstance(v, dict)}
             self.state.scan_halt_day = str(data.get("scan_halt_day") or "")
             self.state.yt2_halt_day = str(data.get("yt2_halt_day") or "")
+            self.state.ytw_halt_day = str(data.get("ytw_halt_day") or "")
             for _t in sorted(self.state.scan_book):
                 ensure_scan_override(series_of(_t))
             # MIGRATION (2026-08-04, first load after the paid-basis counters
@@ -13959,6 +14125,7 @@ class IncentiveMarketMaker:
                 self.state.scan_pnl_carry = float(data.get("scan_pnl_carry") or 0.0)
                 # YouTube #2 pilot P&L carry (2026-10-05), same rule
                 self.state.yt2_pnl_carry = float(data.get("yt2_pnl_carry") or 0.0)
+                self.state.ytw_pnl_carry = float(data.get("ytw_pnl_carry") or 0.0)
                 if self.state.halted_until > time.time():
                     log(f"{self.tag} restored ACTIVE daily-loss halt "
                         f"(pnl carry ${self.state.pnl_carry:+.2f})")
@@ -14183,6 +14350,8 @@ class IncentiveMarketMaker:
                            "scan_pnl_carry": round(self.state.scan_pnl_today_last, 2),
                            "yt2_halt_day": self.state.yt2_halt_day,
                            "yt2_pnl_carry": round(self.state.yt2_pnl_today_last, 2),
+                           "ytw_halt_day": self.state.ytw_halt_day,
+                           "ytw_pnl_carry": round(self.state.ytw_pnl_today_last, 2),
                            # live-event depth halts (pruned with the same 7d
                            # TTL: mention events settle within a day, this
                            # just stops dead events accreting)
@@ -15430,6 +15599,7 @@ class IncentiveMarketMaker:
             datacenter_series(series) or \
             rainstorm_span_allowed(ticker) or \
             rain_period_gated(ticker) or \
+            ytw_pilot_ticker(ticker) or \
             snow_monthly_series(series) or \
             cpi_pilot_active(ticker) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
@@ -15637,6 +15807,8 @@ class IncentiveMarketMaker:
         if _vc_moved:
             log(f"{self.tag} vercel-fair reloaded: {_vc_n} events, "
                 f"{_vc_moved} with a new anchor")
+        if YTW_ENABLE:
+            load_ytw_fair()
         load_gb_fair()
         load_dc_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
@@ -17099,6 +17271,21 @@ class IncentiveMarketMaker:
         realized; the cross-restart composition is scan_pnl_carry)."""
         total = 0.0
         for t in self.state.scan_book:
+            total += self.pnl.realized.get(t, 0.0)
+            p = self.pnl.pos.get(t, 0.0)
+            mark = self.state.last_mark.get(t)
+            if abs(p) > 1e-9 and mark is not None:
+                total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
+        return total
+
+    def _ytw_pnl(self) -> float:
+        """The YouTube weekly pilot's realized + mark-to-market over every
+        KXYTVIEWSW ticker in the bot's own P&L book (only pilot artists are
+        ever admitted); the cross-restart composition is ytw_pnl_carry."""
+        total = 0.0
+        for t in set(self.pnl.realized) | set(self.pnl.pos):
+            if not ytw_series(series_of(t)):
+                continue
             total += self.pnl.realized.get(t, 0.0)
             p = self.pnl.pos.get(t, 0.0)
             mark = self.state.last_mark.get(t)
@@ -19230,6 +19417,27 @@ class IncentiveMarketMaker:
                 self._gskip(t, "yt2_halt", lambda: yt2_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
 
+            # YOUTUBE WEEKLY PILOT (Jack 2026-10-06, see YTW_ENABLE): its own
+            # family loss halt, then the realtime fair gate (fails closed).
+            if ytw_series(meta.series):
+                if self.state.ytw_halt_day == _halt_day_key(now_utc):
+                    self.cancel_market_orders(t, resting)
+                    ytw_hin = {"pnl_today": round(self.state.ytw_pnl_today_last, 2),
+                               "limit": YTW_DAILY_LOSS_LIMIT}
+                    self._gskip(t, "ytw_halt", lambda: ytw_hin, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+                ytw_why, ytw_in = ytw_gate_reason(t, now_ts, ext_bid, ext_ask)
+                if ytw_why:
+                    if t not in self._ytw_stood:
+                        self._ytw_stood.add(t)
+                        log(f"{self.tag} ytw stand-aside {t}: {ytw_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "ytw_fair", lambda: ytw_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+                if t in self._ytw_stood:
+                    self._ytw_stood.discard(t)
+                    log(f"{self.tag} ytw resume {t}")
+
             # TREASURY GATE (Jack 2026-10-01, see TREASURY_GATE_ENABLE; every
             # Treasury series since 2026-10-02, TREASURY_GATE_ALL): quoted
             # only against the live CNBC yield's fair; fails CLOSED without a
@@ -19882,6 +20090,34 @@ class IncentiveMarketMaker:
                     key="yt2_halt")
                 self._save_persist()
 
+        # YOUTUBE WEEKLY PILOT DAILY LOSS HALT (Jack 2026-10-06, see
+        # YTW_ENABLE): the #2 pilot's scheme for KXYTVIEWSW.
+        if YTW_ENABLE and YTW_DAILY_LOSS_LIMIT > 0 and not fast_only:
+            ytw_total = self._ytw_pnl()
+            if self.state.ytw_pnl_baseline is None:
+                self.state.ytw_pnl_baseline = ytw_total
+            ytw_today = (ytw_total - self.state.ytw_pnl_baseline
+                         + self.state.ytw_pnl_carry)
+            self.state.ytw_pnl_today_last = ytw_today
+            _roll_day = _halt_day_key(now_utc)
+            if ytw_today <= -YTW_DAILY_LOSS_LIMIT \
+                    and self.state.ytw_halt_day != _roll_day:
+                self.state.ytw_halt_day = _roll_day
+                halted_ids = {str(o.get("ticker", "")) for o in resting
+                              if ytw_series(series_of(str(o.get("ticker", ""))))}
+                n_cx = 0
+                for t_h in sorted(halted_ids):
+                    n_cx += self.cancel_market_orders(t_h, resting)
+                desired = [q for q in desired if not ytw_series(series_of(q.ticker))]
+                self.alerter.alert(
+                    "ytw_halt",
+                    f"YouTube weekly pilot P&L today ${ytw_today:+.2f} <= "
+                    f"-${YTW_DAILY_LOSS_LIMIT:.0f}; cancelled {n_cx} orders on "
+                    f"{len(halted_ids)} market(s) and stood the family aside "
+                    f"until the {SUMMARY_HOUR_CT}am CT roll (positions ride)",
+                    key="ytw_halt")
+                self._save_persist()
+
         # TOXIC-FLOW SIDE HALT (Jack 2026-09-29, see TOXIC_HALT): judge the
         # fills that came due against this cycle's marks (quoted markets were
         # marked from their books, every open position by _refresh_marks),
@@ -20526,6 +20762,9 @@ class IncentiveMarketMaker:
         s.yt2_pnl_baseline = None
         s.yt2_pnl_carry = 0.0
         s.yt2_pnl_today_last = 0.0
+        s.ytw_pnl_baseline = None
+        s.ytw_pnl_carry = 0.0
+        s.ytw_pnl_today_last = 0.0
         s.scan_book = {t for t in s.scan_book
                        if t in s.scan_members
                        or abs(self.pnl.pos.get(t, 0.0)) > 1e-9}
@@ -21198,6 +21437,37 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_vercel_fair_refresh, daemon=True,
                              name="vercel-fair").start()
+        if YTW_ENABLE and not once:
+            # YouTube weekly fair refresher (2026-10-06): the Vercel
+            # refresher's contract; the first pass reads the collector's
+            # whole snapshot file (~6 s), later ones only what was appended.
+            def _ytw_fair_refresh():
+                try:
+                    import yt_weekly_fair
+                except Exception as e:
+                    log(f"{self.tag} ! ytw-fair refresher disabled: {e}")
+                    return
+                last = None
+                while True:
+                    delay = max(120, YTW_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss, status = yt_weekly_fair.write_fair_file(
+                            YTW_FAIR_FILE)
+                        if last != (ok, miss, status):
+                            log(f"{self.tag} ytw-fair refresh: {ok} events "
+                                f"with a fair, status {status}"
+                                + (f", {miss} without one" if miss else ""))
+                        last = (ok, miss, status)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! ytw-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = 120
+                    time.sleep(delay)
+            threading.Thread(target=_ytw_fair_refresh, daemon=True,
+                             name="ytw-fair").start()
         if TREASURY_GATE_ENABLE and not once:
             # Treasury live-yield refresher (2026-10-01): the quake
             # refresher's contract -- every network call off the trading
@@ -21512,6 +21782,19 @@ class IncentiveMarketMaker:
                        datetime.now(timezone.utc)) else ""))
         else:
             log("yt2 pilot: OFF -- the YouTube #2 series are not enrolled")
+        if YTW_ENABLE:
+            log(f"ytw pilot: {YTW_SERIES} for {','.join(sorted(YTW_ARTISTS))} "
+                f"against the realtime fair (tol {YTW_FAIR_TOL_CENTS}c, decided "
+                f"outside {YTW_FAIR_MIN_P * 100:g}-{100 - YTW_FAIR_MIN_P * 100:g}c, "
+                f"ttl {YTW_FAIR_TTL_MIN}m, print holds), out "
+                f"{YTW_CUTOFF_FROM_CLOSE_MIN}m before the close, x1 at every hour, "
+                f"{YTW_MAX_POSITION:g}/market and {YTW_EVENT_CAP:g}/event net, "
+                f"family halt at -${YTW_DAILY_LOSS_LIMIT:g} P&L today"
+                + (f" (HALTED this roll day, ${self.state.ytw_pnl_carry:+.2f})"
+                   if self.state.ytw_halt_day == _halt_day_key(
+                       datetime.now(timezone.utc)) else ""))
+        else:
+            log("ytw pilot: OFF -- KXYTVIEWSW is not enrolled")
         if TREASURY_GATE_ENABLE:
             log("treasury gate: "
                 + (f"ALL {len(TREASURY_GATED_SERIES)} Treasury series"

@@ -143,6 +143,9 @@ def setUpModule():
     # the Vercel pre-D fair file (2026-09-27) is read by every run_cycle
     imm.VERCEL_FAIR_FILE = os.path.join(tmp, "vercel_fair.json")
     imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+    # the YouTube weekly pilot's fair file (2026-10-06) is read by every run_cycle
+    imm.YTW_FAIR_FILE = os.path.join(tmp, "yt_weekly_fair.json")
+    imm._ytw_state.update(mtime=0.0, entries={})
     # the Treasury touch gate's status file + in-memory feed (2026-10-01)
     imm.TREASURY_STATUS_FILE = os.path.join(tmp, "treasury_yield_state.json")
     imm._treasury_state["watch"] = None
@@ -18082,6 +18085,146 @@ class TestYouTube2Pilot(unittest.TestCase):
         self.assertNotEqual(self._quotes(bot), [])
         self.assertEqual(bot.state.yt2_halt_day, "2000-01-01")
 
+
+class TestYouTubeWeeklyPilot(unittest.TestCase):
+    """The YouTube weekly artist-views pilot (Jack 2026-10-06: "live now"):
+    KXYTVIEWSW for KATSEYE / Drake / The Weeknd only, quoted against
+    yt_weekly_fair's realtime fair, x1 at every hour, 100 per market and per
+    event, out 12h before the close, a family daily loss halt. Fixture event
+    KXYTVIEWSW-KAT68DEC09 (far from any cutoff), strike 21.0M."""
+
+    T = "KXYTVIEWSW-KAT68DEC09-21.0M"
+    EV = "KXYTVIEWSW-KAT68DEC09"
+    CLOSE = datetime(2068, 12, 11, 14, 0, tzinfo=timezone.utc)
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._ytw_state.update(mtime=0.0, entries={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.YTW_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, p=0.5, hold="", age_secs=0.0, key="21.0M"):
+        fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
+        with open(imm.YTW_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {self.EV: {"fetched_at": fetched, "strikes": {
+                key: {"k": 21e6, "p": p, "hold": hold}}}}}, f)
+        os.utime(imm.YTW_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestYouTubeWeeklyPilot._bump += 1
+        return imm.load_ytw_fair()
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_admission_sizing_and_cutoff(self):
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for code in ("KAT", "DRA", "WEE"):
+                self.assertTrue(IncentiveMarketMaker._allowed(
+                    f"KXYTVIEWSW-{code}26OCT11-15.0M"), code)
+            for code in ("ARI", "TAY", "BAD"):
+                self.assertFalse(IncentiveMarketMaker._allowed(
+                    f"KXYTVIEWSW-{code}26OCT11-15.0M"), code)
+        self.assertNotIn("KXYTVIEWSW", imm.ALLOW_SERIES)    # per ticker only
+        s = "KXYTVIEWSW"
+        self.assertTrue(imm.is_daily_series(s))
+        self.assertEqual(imm.series_max_position(s), 100.0)
+        self.assertEqual(imm.event_cap_contracts(self.EV), 100.0)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0)
+        for when in (datetime(2026, 10, 6, 7, 0, tzinfo=timezone.utc),
+                     datetime(2026, 10, 10, 15, 0, tzinfo=timezone.utc)):
+            self.assertEqual(imm.hour_size_mult(s, when), 1.0)
+        close = datetime(2026, 10, 13, 14, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            s, "KXYTVIEWSW-KAT26OCT11", close, close_time=close),
+            close - timedelta(hours=12))
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            s, "KXYTVIEWSW-26OCT11", close, close_time=close), imm.RELEASE_GUARD_UNKNOWN)
+
+    def test_gate_reasons_fail_closed(self):
+        now = time.time()
+
+        def r(b=49, a=51, ts=now):
+            return imm.ytw_gate_reason(self.T, ts, b, a)[1].get("reason")
+        self.assertEqual(r(), "no_read")
+        self.assertEqual(self._write(p=0.5), 1)
+        self.assertIsNone(r())                                 # fair 50c, book 49x51
+        self.assertEqual(r(b=70, a=72), "band")                # bid 70 > 50 + 15
+        self.assertEqual(r(b=30, a=34), "band")                # ask 34 < 50 - 15
+        self.assertEqual(r(ts=now + imm.YTW_FAIR_TTL_MIN * 60 + 5), "stale")
+        self._write(p=0.03)
+        self.assertEqual(r(b=1, a=4), "decided")
+        self._write(p=0.5, hold="2068-12-05 complete est 20.80M within 1.5 strikes")
+        why, inp = imm.ytw_gate_reason(self.T, now, 49, 51)
+        self.assertEqual(inp["reason"], "hold")
+        self.assertIn("print pending", why)
+        self._write(p=0.5, key="22.0M")
+        self.assertEqual(r(), "no_strike")
+
+    def test_quotes_against_the_fair_and_the_loss_halt(self):
+        bot = self._bot()
+        bot.run_cycle()                                        # no fair: nothing
+        self.assertEqual(self._quotes(bot), [])
+        self._write(p=0.5)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn("bid", {s_ for s_, _p in q})
+        self.assertIn("ask", {s_ for s_, _p in q})
+        self.assertNotIn(self.T, bot._ytw_stood)
+        self._write(p=0.5, hold="print pending")               # a print is due
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._ytw_stood)
+        self._write(p=0.5)
+        bot.run_cycle()
+        self.assertNotEqual(self._quotes(bot), [])
+        # the family loss halt
+        bot.pnl.realized[self.T] = -(imm.YTW_DAILY_LOSS_LIMIT + 1)
+        bot.run_cycle()
+        roll_day = imm._halt_day_key(datetime.now(timezone.utc))
+        self.assertEqual(bot.state.ytw_halt_day, roll_day)
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn("ytw_halt", [c for c, _m in bot.alerter.today])
+        self.assertEqual(bot.state.yt2_halt_day, "")           # the #2 pilot untouched
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+        self.assertEqual(bot2.state.ytw_halt_day, roll_day)
+        bot.state.ytw_halt_day = "2000-01-01"
+        bot.state.ytw_pnl_baseline = None
+        bot.pnl.realized[self.T] = 0.0
+        bot.run_cycle()
+        self.assertNotEqual(self._quotes(bot), [])
+
 class TestTreasuryTouchGate(unittest.TestCase):
     """Jack 2026-10-01 ("i got sniped on KX10YRDIRLM-26OCT30L ... i got
     permission on cnbc"): the how-high / how-low ladders quote only against
@@ -19540,8 +19683,9 @@ class TestGuardSkipSink(unittest.TestCase):
         # OpenRouter market-share gate (2026-09-30) + the monthly rain gate
         # (2026-10-01) + the Treasury touch gate (2026-10-01) + the Pokemon
         # gate (2026-10-03) + the NFL player-prop gate (2026-10-03) + the
-        # YouTube #2 pilot's family loss halt (2026-10-05)
-        self.assertEqual(len(conts), 37)
+        # YouTube #2 pilot's family loss halt (2026-10-05) + the YouTube
+        # weekly pilot's loss halt and fair gate (2026-10-06)
+        self.assertEqual(len(conts), 39)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
