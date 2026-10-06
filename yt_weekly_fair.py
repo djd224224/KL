@@ -17,9 +17,12 @@ c/ct on everything earlier -- while every other artist but Fuerza Regida lost
 (Ariana -26.7). The losses are print snipes, which an API nowcast sees coming.
 
 THE MODEL (each piece validated in that folder; MODELLED):
-  API views: the "KL-data youtube-collect" artist collector snapshots every
-    tracked video of each artist's official + Topic channels hourly
-    (yt_artist_snapshots.jsonl); read incrementally here. An artist's API views
+  API views: hourly snapshots of every tracked video of each artist's
+    official + Topic channels, from SNAP_FILES: the "KL-data youtube-collect"
+    research collector's yt_artist_snapshots.jsonl (to 2026-10-18 12:00Z) and
+    the durable pilot feed's yt_pilot_snapshots.jsonl (yt_pilot_feed.py, task
+    "KL ytw-feed", from 2026-10-06), each read incrementally and merged per
+    video (time-ordered, a time already held skipped). An artist's API views
     over [T0, T1) = the sum over videos of the interpolated view-count delta
     (a video first seen after T0 back-extrapolated <= 4 h, the last snapshot
     forward-extrapolated <= 1.6 h).
@@ -50,11 +53,11 @@ THE MODEL (each piece validated in that folder; MODELLED):
   HOLD_RECENT_H after the day's UTC end) is flagged "print" -- the gate stands
   it aside until that print is known.
 
-FAIL CLOSED: snapshots older than API_STALE_SECS -> no entries at all; an
-artist without a ratio inside RATIO_MAX_AGE_DAYS, or whose event read failed,
+FAIL CLOSED: the newest snapshot (over every file) older than API_STALE_SECS
+-> no entries at all; an artist without a ratio inside RATIO_MAX_AGE_DAYS, or whose event read failed,
 -> no entries for it. The gate stands aside anything without a fresh entry.
 
-Writes FAIR_FILE: {"at", "api_last", "status", "entries": {event: {"artist",
+Writes FAIR_FILE: {"at", "api_last", "api_last_by_file", "status", "entries": {event: {"artist",
 "week_end", "fetched_at", "ratio", "ratio_day", "m_pub", "k_min_open", "days":
 {date: [kind, est, sd]}, "strikes": {"21.0M": {"k", "p", "hold"}}}}}.
 """
@@ -97,6 +100,14 @@ ARTISTS = _env_map("IMM_YTW_ARTISTS", "KAT:KATSEYE,DRA:Drake,WEE:The Weeknd,TAT:
 SNAP_FILE = os.environ.get(
     "IMM_YTW_SNAP_FILE",
     r"C:\Users\jackd\Documents\KL-data\youtube-collect\yt_artist_snapshots.jsonl")
+# the durable pilot feed (yt_pilot_feed.py, 2026-10-06): the collector's line
+# format in a file of its own (two processes appending to one file can tear
+# lines on Windows), so the fair outlives the collector's 10/18 --until
+FEED_SNAP_FILE = os.environ.get(
+    "IMM_YTW_FEED_SNAP_FILE",
+    r"C:\Users\jackd\Documents\KL-data\youtube-collect\yt_pilot_snapshots.jsonl")
+SNAP_FILES = [p.strip() for p in os.environ.get("IMM_YTW_SNAP_FILES", "").split(";")
+              if p.strip()] or [SNAP_FILE, FEED_SNAP_FILE]
 CHART_FILE = os.environ.get(
     "IMM_YTW_CHART_FILE",
     r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm\yt_weekly_chart.json")
@@ -162,39 +173,27 @@ def day0(d: date) -> float:
 # ---------------------------------------------------------------------------
 # API snapshots (the collector's jsonl, read incrementally)
 
-_snap: dict = {"path": None, "offset": 0, "partial": b"", "series": {}, "last_ts": 0.0}
+_snap: dict = {"paths": None, "files": {}, "series": {}, "last_ts": 0.0}
 
 
 def reset_snapshots() -> None:
-    _snap.update(path=None, offset=0, partial=b"", series={}, last_ts=0.0)
+    _snap.update(paths=None, files={}, series={}, last_ts=0.0)
 
 
-def load_snapshots(path: Optional[str] = None, names: Optional[set] = None,
-                   chunk: int = 16 << 20) -> Tuple[Dict[str, Dict[str, Tuple[List[float], List[float]]]], float]:
-    """{artist: {video: ([ts], [views])}} for the pilot artists, and the newest
-    snapshot time. Only the bytes appended since the last call are read."""
-    path = path or SNAP_FILE
-    names = names if names is not None else set(ARTISTS.values())
-    if _snap["path"] != path:
-        reset_snapshots()
-        _snap["path"] = path
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return _snap["series"], _snap["last_ts"]
-    if size < _snap["offset"]:               # truncated / replaced: start over
-        reset_snapshots()
-        _snap["path"] = path
-    keys = [('"artist": %s' % json.dumps(n)).encode("utf-8") for n in names]
+def _read_appended(path: str, st: dict, keys: List[bytes], chunk: int) -> None:
+    """Merge what one file gained since its last read into the shared series:
+    time-ordered per video, a time the video already holds skipped."""
+    series = _snap["series"]
+    last = st["last_ts"]
     with open(path, "rb") as f:
-        f.seek(_snap["offset"])
+        f.seek(st["offset"])
         while True:
             block = f.read(chunk)
             if not block:
                 break
-            _snap["offset"] += len(block)
-            lines = (_snap["partial"] + block).split(b"\n")
-            _snap["partial"] = lines.pop()
+            st["offset"] += len(block)
+            lines = (st["partial"] + block).split(b"\n")
+            st["partial"] = lines.pop()
             for ln in lines:
                 if not any(k in ln for k in keys):
                     continue
@@ -204,14 +203,62 @@ def load_snapshots(path: Optional[str] = None, names: Optional[set] = None,
                     ts, v = float(x["ts"]), float(x["views"])
                 except (ValueError, KeyError, TypeError):
                     continue
-                t, y = _snap["series"].setdefault(a, {}).setdefault(vid, ([], []))
-                if t and ts <= t[-1]:
-                    continue
-                t.append(ts)
-                y.append(v)
-                if ts > _snap["last_ts"]:
-                    _snap["last_ts"] = ts
+                t, y = series.setdefault(a, {}).setdefault(vid, ([], []))
+                if not t or ts > t[-1]:
+                    t.append(ts)
+                    y.append(v)
+                else:                        # the other file's older snapshot
+                    i = bisect.bisect_left(t, ts)
+                    if t[i] == ts:
+                        continue
+                    t.insert(i, ts)
+                    y.insert(i, v)
+                if ts > last:
+                    last = ts
+    st["last_ts"] = last
+    if last > _snap["last_ts"]:
+        _snap["last_ts"] = last
+
+
+def load_snapshots(path=None, names: Optional[set] = None,
+                   chunk: int = 16 << 20) -> Tuple[Dict[str, Dict[str, Tuple[List[float], List[float]]]], float]:
+    """{artist: {video: ([ts], [views])}} for the pilot artists, and the newest
+    snapshot time, merged over `path` (one file or a list; SNAP_FILES by
+    default). Only the bytes appended to each file since the last call are
+    read; a file not there (yet) is skipped until it appears."""
+    paths = [path] if isinstance(path, str) else list(path or SNAP_FILES)
+    names = names if names is not None else set(ARTISTS.values())
+    if _snap["paths"] != paths:
+        reset_snapshots()
+        _snap["paths"] = paths
+    sizes = {}
+    for p in paths:
+        try:
+            sizes[p] = os.path.getsize(p)
+        except OSError:
+            sizes[p] = None
+    if any(sizes[p] is not None and sizes[p] < _snap["files"].get(p, {}).get("offset", 0)
+           for p in paths):                  # one truncated / replaced: rebuild from all
+        reset_snapshots()
+        _snap["paths"] = paths
+    keys = [('"artist": %s' % json.dumps(n)).encode("utf-8") for n in names]
+    for p in paths:
+        if sizes[p] is None:
+            continue
+        st = _snap["files"].setdefault(p, {"offset": 0, "partial": b"", "last_ts": 0.0})
+        _read_appended(p, st, keys, chunk)
     return _snap["series"], _snap["last_ts"]
+
+
+def snapshot_files() -> Dict[str, Optional[str]]:
+    """{file name: its newest pilot-artist snapshot (ISO), None if none} as
+    last read -- which feed is carrying the fair."""
+    out = {}
+    for p in _snap["paths"] or []:
+        ts = (_snap["files"].get(p) or {}).get("last_ts") or 0.0
+        out[os.path.basename(p)] = (datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds")
+                                    if ts else None)
+    return out
 
 
 def _val(t: List[float], y: List[float], T: float, back_max: float = 4 * 3600,
@@ -596,6 +643,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None, reads: Optional[T
             save_chart(chart, chart_path)
     data = {"at": now.isoformat(timespec="seconds"),
             "api_last": datetime.fromtimestamp(last_ts, timezone.utc).isoformat(timespec="seconds") if last_ts else None,
+            "api_last_by_file": snapshot_files(),
             "status": status,
             "model": {"artists": ARTISTS, "window_h": WINDOW_H, "sigma_now": SIGMA_NOW,
                       "ratio_drift_per_day": RATIO_DRIFT_PER_DAY, "future_widen": FUTURE_WIDEN,
@@ -616,7 +664,7 @@ if __name__ == "__main__":
     print(write_fair_file(out), f"{time.time() - t0:.1f}s")
     with open(out, encoding="utf-8") as f:
         data = json.load(f)
-    print("api_last", data["api_last"], "status", data["status"])
+    print("api_last", data["api_last"], data.get("api_last_by_file"), "status", data["status"])
     for ev, e in sorted(data["entries"].items()):
         print(ev, "ratio", e["ratio"], "@", e["ratio_day"], "m_pub", e["m_pub"], "k_min_open", e["k_min_open"])
         print("   days:", {d[5:]: (x[0][0], None if x[1] is None else round(x[1] / 1e6, 2), x[2]) for d, x in e["days"].items()})

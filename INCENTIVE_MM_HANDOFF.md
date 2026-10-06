@@ -8335,6 +8335,8 @@ DATA DEPENDENCY: the collectors are bare python processes (no Windows task)
 running to 2026-10-18 12:00Z. After that the snapshots go stale and the gate
 stands the family aside (fail closed) until a feed replaces them -- the
 26OCT18 week's events trade to ~10/20.
+-> SUPERSEDED the same day: the durable "KL ytw-feed" task feeds the fair
+past 10/18 (see "YouTube weekly pilot: a durable API feed" below).
 
 KILL SWITCH: IMM_YTW_ENABLE=0 (env => restart_imm.ps1 -Task); positions ride.
 
@@ -8372,3 +8374,118 @@ Dry run 12:55Z: fair 2.6M 36c / 2.7M 19c / 2.8M 9c / 2.9M 4c vs the book
 Monday's API views run ~5% under last Monday for most artists (the intraday
 profile checks out: 0.885 measured vs 0.885 pooled at 20.8h), so 2.6-2.8M
 stand aside on the band and 2.9M quotes.
+
+## 2026-10-06 — YouTube weekly pilot: a durable API feed ("KL ytw-feed") so the KXYTVIEWSW fair outlives the 10/18 collectors
+
+The pilot's fair read only yt_artists.py's snapshots: a bare research process
+(no task, gone on a reboot) whose --until is 2026-10-18 12:00Z, while the
+26OCT18 week trades to ~10/20. Task: a durable feed before 10/17, total quota
+under 10k units/day while the old collector runs, collectors untouched.
+
+CHOICE: (a) a Windows scheduled task, not (b) a fetcher inside
+yt_weekly_fair. The bot restarts several times a day and imports the fair
+once per start, so (b) would need its own persisted cadence and quota ledger
+anyway, and would put API stalls and quota blocks inside the trading process.
+A one-pass task is a single writer, separate from the bot, and back after a
+reboot by its logon trigger.
+
+THE FEED (yt_pilot_feed.py, new; one pass, then exit):
+- snapshot: videos.list part=statistics, 50 ids a call, for every tracked
+  video of yt_weekly_fair.ARTISTS (1,909 videos with Tate McRae, 39 calls,
+  ~10 s; a new pilot artist is picked up from ARTISTS by itself); each batch
+  stamped at its request's midpoint; a hidden count writes no line (the
+  collector writes 0).
+- scan, every 3 h: the newest 50 uploads per channel (playlistItems); a new
+  video joins its artist at once. 9 of the 22 channels (Topic channels) have
+  no uploads playlist (404 playlistNotFound): marked in yt_pilot_ids.json and
+  rechecked weekly, so a scan is 13 units. (The collector retries each of
+  those 4x per scan.)
+- video lists: KL-data/youtube-collect/yt_pilot_ids.json, seeded from the
+  collector's yt_artist_ids.json, which every pass re-reads (read only) to
+  merge in what the collector found.
+- output: KL-data/youtube-collect/yt_pilot_snapshots.jsonl, the collector's
+  line format in its own file (two processes appending to one file can tear
+  lines on Windows). State yt_pilot_feed_state.json, log yt_pilot_feed.log,
+  tracebacks yt_pilot_feed.stdout.log, lock yt_pilot_feed.lock, all beside it.
+
+QUOTA (MEASURED from the logs, PT day 10/05): yt_artists 22 x 158 + 7 x 84
+= 4,064; yt_collect 72 x 9 + 8 x 30 = 888; total 4,952. The feed adds about
+24 x 39 + 8 x 13 = ~1,040/day, for ~6,000/day while the collectors run and
+~1,040 after. It keeps its own Pacific-day ledger and hard cap,
+IMM_YTW_FEED_DAILY_UNITS 2,000:
+- every attempt is charged, failed ones too;
+- the snapshot is budgeted before the scan;
+- a pass the remaining budget can't snapshot is skipped whole.
+Safeguards:
+- a quotaExceeded 403 keeps what was read and blocks the feed to the next
+  Pacific midnight;
+- a 40-minute gap guard (IMM_YTW_FEED_MIN_GAP_MIN) stops logon + :00 or a
+  manual run from snapshotting twice;
+- a pass makes no request after 10 minutes.
+
+KEY: read from ~/Downloads/youtube api key.txt and sent in the X-Goog-Api-Key
+header (verified live 10/06: 1,906 of 1,909 videos), so it never sits in a
+URL or in an exception's text. Every log line is scrubbed of it as well.
+
+THE FAIR (yt_weekly_fair.py): it now reads SNAP_FILES = [the collector's
+file, FEED_SNAP_FILE]; override with env IMM_YTW_SNAP_FILES (;-separated) or
+IMM_YTW_FEED_SNAP_FILE.
+- Each file is read incrementally and merged per video in time order; a time
+  already held is skipped.
+- The staleness clock is the newest snapshot across both files.
+- A file that isn't there yet is skipped until it appears.
+- Regression check on the real 141 MB file alone: the series is identical to
+  the old loader's (3.8 s warm vs 3.2 s).
+- FAIR_FILE gains "api_last_by_file" ({file: newest snapshot}), which shows
+  which feed is carrying the fair.
+Live check, 10/06 12:57Z: the feed (first three artists) vs the 12:49 pass, 1,482
+videos, 13 tiny negative deltas (API jitter). Views over those 7 min were
++17k / +26k / +28k (Drake / The Weeknd / KATSEYE), against +194k / +330k /
++336k the hour before.
+
+DEPLOY NOTE: the bot imports yt_weekly_fair once per start, and its
+self-restart watches incentive_mm.py only. The merge therefore goes live at
+the bot's next restart (several a day lately); the collector carries the fair
+until then. Check: "api_last_by_file" shows up in
+run-logs/incentive-mm/yt_weekly_fair.json.
+
+THE TASK: register_ytw_feed.ps1 registers "KL ytw-feed", which runs
+wscript //B run_ytw_feed_hidden.vbs -> python yt_pilot_feed.py.
+- Triggers: hourly at :00 (the fair's windows turn at 15:00Z) and 2 min after
+  logon.
+- Interactive, like every KL task; StartWhenAvailable, IgnoreNew, 15-min
+  limit.
+- Exit codes (the task's Last Result): 0 ok or skipped, 1 partial or failed,
+  2 no key or no video list, 3 lock held.
+
+COLLECTORS: untouched. yt_artists.py, yt_collect.py and yt_kalshi_books.py
+run to 10/18 12:00Z and exit by themselves. Ask Jack before stopping any of
+them. After that the feed alone carries the fair.
+
+WATCH:
+- yt_pilot_feed.log, one line an hour: "snapshot 1906 videos (KATSEYE
+  386/386, Drake 647/649, The Weeknd 449/450, Tate McRae 424/424) | ...
+  units PT <day>".
+- `python yt_pilot_feed.py --status` (and --dry-run, --force, --scan).
+- After 10/18 12:00Z: yt_weekly_fair.json shows api_last_by_file with
+  yt_pilot_snapshots.jsonl advancing and status ok, and the IMM log shows
+  "ytw-fair refresh: N events with a fair, status ok".
+- The file grows ~4 MB/day. That's fine for months, but the bot's startup
+  read grows with it: rotate past ~300 MB.
+New artist: it needs a row in yt_artist_ids.json (yt_artists.py setup;
+all 16 chart artists have one) and its code in IMM_YTW_ARTISTS; the feed then
+tracks it from its next pass. Each ~400-video artist adds ~9 calls (~220
+units/day).
+
+KILL: Disable-ScheduledTask -TaskName 'KL ytw-feed'. Once the collector has
+stopped too, the fair goes stale_api after 2.5 h and the gate stands the
+family aside.
+
+Tests:
+- test_yt_pilot_feed.py (14): batching, the fair reading the format, the key
+  only in a header and never in a file, seeding and merging, a torn source
+  file, the 3 h scan, no-uploads channels, the gap guard, the Pacific day,
+  the cap, quotaExceeded blocking, retries, partial passes, the deadline,
+  lock / dry-run / status.
+- test_yt_weekly_fair.py TestTwoFeeds (3): default files, the time-ordered
+  merge and a window from the feed alone, a late-appearing file.

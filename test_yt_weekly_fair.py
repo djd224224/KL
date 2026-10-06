@@ -88,13 +88,13 @@ class TestTickersAndSnapshots(Base):
         series, last = yf.load_snapshots(self.snap)
         self.assertEqual(set(series["KATSEYE"]), {"a", "b", "c"})
         self.assertAlmostEqual(last, (NOW - timedelta(hours=1)).timestamp())   # hourly from 00:00Z
-        off = yf._snap["offset"]
+        off = yf._snap["files"][self.snap]["offset"]
         # the next pass appends: only it is read, and an unknown artist is skipped
         write_snaps(self.snap, NOW + timedelta(minutes=30), NOW + timedelta(minutes=30), mode="a")
         write_snaps(self.snap, NOW + timedelta(minutes=30), NOW + timedelta(minutes=30),
                     artist="Taylor Swift", mode="a")
         series, last2 = yf.load_snapshots(self.snap)
-        self.assertGreater(yf._snap["offset"], off)
+        self.assertGreater(yf._snap["files"][self.snap]["offset"], off)
         self.assertNotIn("Taylor Swift", series)
         self.assertAlmostEqual(last2, (NOW + timedelta(minutes=30)).timestamp())
         # a full window of 3 videos at RATE/h
@@ -102,6 +102,64 @@ class TestTickersAndSnapshots(Base):
         self.assertAlmostEqual(yf.api_window(series["KATSEYE"], T0, T1), 3 * RATE * 24, delta=1)
         # a window the snapshots do not cover
         self.assertIsNone(yf.api_window(series["KATSEYE"], T0 - 40 * 86400, T0 - 39 * 86400))
+
+
+class TestTwoFeeds(Base):
+    """The collector's file (to 10/18) and the pilot feed's (yt_pilot_feed.py)
+    merged per video."""
+
+    def setUp(self):
+        super().setUp()
+        self.feed = os.path.join(self.dir, "feed.jsonl")
+
+    def test_default_files_include_the_feed(self):
+        if not os.environ.get("IMM_YTW_SNAP_FILES"):
+            self.assertEqual(yf.SNAP_FILES, [yf.SNAP_FILE, yf.FEED_SNAP_FILE])
+
+    def test_merged_in_time_order_and_the_feed_outlives_the_collector(self):
+        # the collector: hourly at :00 to 17:00Z; the feed: :30 from 12:30Z to 19:30Z
+        write_snaps(self.feed, NOW - timedelta(hours=5, minutes=30), NOW + timedelta(hours=1, minutes=30))
+        series, last = yf.load_snapshots([self.snap, self.feed])
+        nfiles = len(yf._snap["files"])
+        t = series["KATSEYE"]["a"][0]
+        self.assertEqual(t, sorted(set(t)))
+        self.assertEqual(nfiles, 2)
+        self.assertAlmostEqual(last, (NOW + timedelta(hours=1, minutes=30)).timestamp())
+        self.assertIn((NOW - timedelta(minutes=90)).timestamp(), t)     # feed 16:30
+        self.assertIn((NOW - timedelta(hours=1)).timestamp(), t)        # collector 17:00
+        # a window past the collector's last snapshot comes from the feed alone
+        T0, T1 = (NOW - timedelta(hours=4)).timestamp(), (NOW + timedelta(hours=1)).timestamp()
+        self.assertAlmostEqual(yf.api_window(series["KATSEYE"], T0, T1), 3 * RATE * 5, delta=1)
+        # the collector's later pass (older than the feed's last) slots in; a
+        # time already held is not doubled
+        n = len(t)
+        write_snaps(self.snap, NOW, NOW, mode="a")
+        write_snaps(self.feed, NOW + timedelta(minutes=30), NOW + timedelta(minutes=30), mode="a")
+        series, last2 = yf.load_snapshots([self.snap, self.feed])
+        t = series["KATSEYE"]["a"][0]
+        self.assertEqual(len(t), n + 1)
+        self.assertEqual(t, sorted(t))
+        self.assertEqual(series["KATSEYE"]["a"][1], sorted(series["KATSEYE"]["a"][1]))   # views too
+        self.assertEqual(last2, last)
+        by_file = yf.snapshot_files()
+        self.assertEqual(by_file["snaps.jsonl"], NOW.isoformat(timespec="seconds"))
+        self.assertEqual(by_file["feed.jsonl"],
+                         (NOW + timedelta(hours=1, minutes=30)).isoformat(timespec="seconds"))
+
+    def test_a_feed_file_not_there_yet_is_read_once_it_appears(self):
+        series, last = yf.load_snapshots([self.snap, self.feed])
+        self.assertAlmostEqual(last, (NOW - timedelta(hours=1)).timestamp())
+        self.assertIsNone(yf.snapshot_files()["feed.jsonl"])
+        write_snaps(self.feed, NOW + timedelta(minutes=10), NOW + timedelta(minutes=10))
+        series, last = yf.load_snapshots([self.snap, self.feed])
+        self.assertAlmostEqual(last, (NOW + timedelta(minutes=10)).timestamp())
+        # the fair is fresh off the feed alone once the collector stops
+        n, miss, status = yf.write_fair_file(
+            self.out, now=NOW + timedelta(hours=2), snap_path=[self.snap, self.feed],
+            chart_path=self.chart, reads=(lambda: [EV], lambda ev: markets()))
+        self.assertEqual((n, status), (1, "ok"))
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(sorted(json.load(f)["api_last_by_file"]), ["feed.jsonl", "snaps.jsonl"])
 
 
 class TestEventFair(Base):
