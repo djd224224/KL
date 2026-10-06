@@ -8141,3 +8141,102 @@ deploy: the 26OCT05 events (close 03:59Z 10/06) are quotable again to 02:59Z
 if they re-clear the payout floor on what is left of the window.
 Startup line: "yt2 pilot: ... quoted plain to 60m before the close, ...".
 Test: TestYouTube2Pilot.test_cutoff_is_one_hour_before_the_close.
+
+## 2026-10-05 (late) — OpenRouter share fair: week-to-date anchor pulled toward the last 6h, breaks in the mix, revisions stand aside, snapshot + ladder archive (Jack: "yes")
+
+WHY. The week of 9/28 settled: the share family lost -$155 trading against
+$19 of rewards. The loss sat on strikes priced 25-75c (-$172 vs $11 of
+rewards across the family since 10/01). The worst stretch was Saturday:
+-$112, mostly OpenAI 18.1 shorts that settled YES at 18.20, 0.05pp past
+the rounding edge. The fair agreed with those fills, so the fair was wrong.
+
+EVIDENCE (scratch backtest; week of 9/28, 4 authors, hourly):
+- Data: exact `chart_hist` from Sun 01Z. Earlier hours rebuilt from the
+  preds' wtd_share on a Mon/Sun hourly volume profile, within 0.1-0.7pp of
+  the exact 3h shares logged on Saturday.
+- RMS error of mu against the settled week, by run rate:
+
+  | run rate | Fri (2-3d left) | Sat (1-2d) | Sun (<1d) | all |
+  |---|---|---|---|---|
+  | last 3h (live since 10/03) | 0.53 | 0.57 | 0.23 | 0.47 |
+  | week-to-date | 0.58 | 0.27 | 0.18 | 0.39 |
+  | WTD + 0.3 x (last 6h - WTD) | 0.51 | 0.25 | 0.19 | 0.35 |
+
+- Pulls scheduled by days left (r/3, r/4, r/5) scored 0.33-0.35: noise.
+- The last hours chase the time of day. DeepSeek runs ~5pp higher at
+  18-21Z than at 00-05Z on both days seen. Google's 3h share went 26% ->
+  17% in 18 hours over the weekend; its week settled at 21.5%.
+- With that run rate, sigma = vol x r/7 (no 3/6/24h spread term) scores
+  RMS z 0.77-1.06.
+- The model's remaining-volume weight runs 6-19% high on weekends (Sun
+  ~34.5M req/h vs Mon ~43.5M). Its effect on mu is about 0.01pp; not
+  changed here.
+- Breaks: z-ai went 6.6% -> 21% at the 10/05 week turn, and the stealth
+  model's ~10% stopped at 16:04Z. A plain WTD anchor then runs low on every
+  named author (OpenAI 16.7 vs ~18.4 flow).
+
+WHAT (openrouter_share_fair):
+- Run rate. A named author's share is A + SHARE_RUN_PULL (0.3) x (L - A):
+  - L is the chart's last SHARE_RUN_HOURS, now 6 (was 3).
+  - A is the week-to-date, or the flow since the week's last break.
+  - Until SHARE_BREAK_MIN_HOURS (3) of flow sit behind a break, the last
+    hours alone.
+  - The blend stays the fallback, and R keeps the blend.
+- spread is 0 on the chart's rate. After a break it is half the gap
+  between the anchor and the week-to-date.
+- detect_break. Fires when a named bucket's last SHARE_BREAK_WINDOW_HOURS
+  (3) differ from its share since the anchor by >= SHARE_BREAK_ABS_PP (3)
+  and >= SHARE_BREAK_REL (0.5) of the larger share. The anchor must hold
+  >= SHARE_BREAK_MIN_BASE_HOURS (6) before the window.
+  - Google's Saturday 21.7% -> 26% is 17%: not a break.
+  - It is placed at the least-squares change point over the snapshots.
+  - Persisted in the fair file as `breaks` {week: {t, ys, bucket, old,
+    new}}, so it outlives the 48h of snapshots. Dropped at the week's turn.
+- chart_revision. Within SHARE_REVISION_HOLD_HOURS (6), any of these:
+  - a named count falls;
+  - an author with >= 1% of the week vanishes and Others does not take it
+    in (named-set churn is fine);
+  - one interval's increase goes >= SHARE_JUMP_FRAC (0.6) to a single
+    author: the stealth model's requests re-attributed to its maker.
+
+  Effect: data_current False and entries lag, so the gate stands aside. A
+  break is anchored at the revision.
+- Archive (no trading effect):
+  - every new chart snapshot -> openrouter_share_chart_YYYY-MM-DD.jsonl
+    (IMM_SHARE_ARCHIVE_DIR, "" = off);
+  - every strike's touch on each hourly Kalshi event read (same call, no
+    extra requests) -> openrouter_share_ladder.jsonl (IMM_SHARE_LADDER_FILE).
+- New entry fields: anchor_mode ("week to date" / "since break" / "break,
+  last hours"), anchor_share, break_at. run_mode reads "wtd+0.3x6h" /
+  "break+0.3x6h" / "chart 6h" / "blend". The preds log carries
+  anchor_share and break_at.
+
+REPLAY on the stored 48h (516 snapshots, both weeks):
+- No break and no revision across Sunday or the week's turn.
+- Stealth flagged at 17:26Z, placed at 16:04Z (10.67% -> 0.02%).
+- mu at 00:58Z 10/06, live -> new: Anthropic 2.50 -> 2.57, DeepSeek 22.64
+  -> 23.14, Google 15.99 -> 16.35, OpenAI 17.88 -> 18.07, Z-AI 21.18 ->
+  20.42.
+
+KILL SWITCHES (env in run_incentive_mm.ps1, then restart_imm.ps1 -Task):
+- IMM_SHARE_RUN_PULL=1 with IMM_SHARE_RUN_HOURS=3: the 10/03 rate, minus its spread.
+- IMM_SHARE_BREAK_ABS_PP=99: no breaks.
+- IMM_SHARE_REVISION_HOLD_HOURS=0: no revision hold.
+- IMM_SHARE_RUN_HOURS=0: the blend.
+
+WATCH:
+- run_mode "break+0.3x6h" on the 26OCT12 events: this week's stealth
+  break is re-found from the stored snapshots on the first write.
+- "[share-fair] break in the mix" / "chart revision" lines.
+- The openrouter_share_chart_*.jsonl files growing by ~150 rows a day.
+- Score at the 10/12 settlement: preds mu vs openrouter_share_finals.jsonl.
+
+Tests: test_openrouter_share_fair.py, 27 green. One reworked: the run
+rate and vol-only sigma, and pull 1 = the plain last hours. New:
+- TestBreaks: a withdrawn model at its change point and the since-break
+  anchor; a fresh break on the last hours alone; no break on a 17% swing,
+  at a week-turn launch, without a base, or again from the break itself;
+  revisions vs named-set churn and the hold.
+- TestWriterBreaks: a break kept past the 48h of snapshots and dropped
+  next week; the archive once per cachedAt; a revision standing the
+  family aside; the ladder on each event read only.

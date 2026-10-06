@@ -8299,6 +8299,11 @@ def or_gate_reason(ticker: str, now_ts: float,
 # family quotes x1 at every hour and nets at most SHARE_EVENT_CAP per event
 # (_share_x1). The tolerance stays 15c: on the 10/01-10/03 replay a tighter
 # band stopped no more losing fills and stood aside half the time.
+# 2026-10-05 (Jack: "yes" to the fair rework): the run rate is the
+# week-to-date -- or the flow since a break in the chart's mix -- pulled 0.3
+# toward the last 6h, sigma vol-only, and a revision of the chart's counts
+# marks the family lag for 6h (openrouter_share_fair.SHARE_RUN_PULL,
+# detect_break, chart_revision).
 SHARE_FAIR_ENABLE = _SHARE_LIVE
 SHARE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_SHARE_FAIR_SERIES", _DEFAULT_OR_SHARE_SERIES).split(",") if s.strip())

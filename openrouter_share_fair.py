@@ -27,9 +27,11 @@ after):
             leaderboard's last complete day and trailing 7 days, the chart's
             week-to-date (once it holds a day's worth) and the chart's last
             ~24 hours (from the snapshots this writer keeps). Since
-            2026-10-03 s_a is the chart's own last SHARE_RUN_HOURS (3)
-            whenever the snapshots cover them, the blend only the fallback;
-            R keeps the blend.
+            2026-10-05 s_a = A_a + SHARE_RUN_PULL (L_a - A_a) whenever the
+            snapshots cover the last SHARE_RUN_HOURS (6): L_a the chart's
+            share over those hours, A_a the anchor -- the week-to-date, or
+            the flow since a break in the mix (see detect_break). The blend
+            is only the fallback; R keeps the blend.
   mu_a    = 100 (K_a + r R s_a) / (K_T + r R)
   sigma_a = SHARE_SIGMA_MULT sqrt((vol_a (r + gap) / 7)^2
                                   + (spread_a r / 7)^2 + SHARE_SIGMA_FLOOR^2)
@@ -38,10 +40,12 @@ changes, winsorized RMS (9/30: deepseek 1.77pp, google 1.43, openai 1.04,
 qwen 0.59, z-ai 0.54, anthropic 0.43, mistralai 0.36); fewer than 4 changes
 -> SHARE_DEFAULT_VOL. Linear in r/7: a whole week ahead is one
 week-over-week change, the last day moves the week by a seventh of that
-day's surprise. spread_a = half the range of the run-rate estimators (they
-part while an author is on the move) -- with the chart's last-hours rate,
-half the range of its shares over the last 3 / 6 / 24 hours
-(SHARE_SPREAD_HOURS). gap = days between the data and
+day's surprise. spread_a = half the range of the blend's estimators (they
+part while an author is on the move); on the chart's own run rate it is 0
+-- the 3/6/24h range it used to take mostly measured the time of day, and
+vol alone scores RMS z 0.8-1.06 on the week of 9/28 -- except after a
+break: half the gap between the anchor and the week-to-date (the doubt
+that the new level holds). gap = days between the data and
 the start of a week not yet begun. p_ident = P(the author finishes among the
 SHARE_NAMED the chart names), normal on the margin to the boundary
 competitor. `complete` once W has ended (00:00Z Monday): from then on anyone
@@ -103,25 +107,48 @@ SHARE_VOL_WEEKS = int(_env_float("IMM_SHARE_VOL_WEEKS", 20))
 SHARE_NAMED = int(_env_float("IMM_SHARE_NAMED", 9))              # authors the chart names
 SHARE_CHART_MAX_AGE_MIN = _env_float("IMM_SHARE_CHART_MAX_AGE_MIN", 180)
 SHARE_RECENT_HOURS = _env_float("IMM_SHARE_RECENT_HOURS", 24)       # the blend's chart window
-# The run rate's share comes from the chart's own last SHARE_RUN_HOURS once
-# the stored snapshots cover them (Jack 2026-10-03, after the book ran over
-# the blend: "make the share market change"); 0 = the four-way blend alone.
-# Its uncertainty is half the range of the chart's shares over
-# SHARE_SPREAD_HOURS. Backtest on 10/01-10/03: the last 3h predicted the
-# next 12h of each author's share to 0.85pp (blend 1.32pp), and under the
-# live gate it would have stopped fills worth -$78 of -$101.
-SHARE_RUN_HOURS = _env_float("IMM_SHARE_RUN_HOURS", 3)
-
-
-def _env_hours(name: str, default: str) -> Tuple[float, ...]:
-    try:
-        return tuple(float(x) for x in os.environ.get(name, default).split(",") if x.strip())
-    except ValueError:
-        return tuple(float(x) for x in default.split(","))
-
-
-SHARE_SPREAD_HOURS = _env_hours("IMM_SHARE_SPREAD_HOURS", "3,6,24")
+# The run rate's share comes from the chart's own data once the stored
+# snapshots cover the last SHARE_RUN_HOURS (Jack 2026-10-03, after the book
+# ran over the blend: "make the share market change"); 0 = the four-way
+# blend alone. Since 2026-10-05 (Jack: "yes" to the fair rework) it is an
+# ANCHOR -- the week-to-date share, or the flow since a break in the chart's
+# mix -- pulled SHARE_RUN_PULL of the way toward the last SHARE_RUN_HOURS.
+# Backtest on the week of 9/28 (4 authors, hourly, scored on the settled
+# week): RMS error of mu 0.35pp against 0.47 for the plain last 3h (0.57 on
+# the Saturday, 0.25 now). The last hours mostly measure the time of day
+# (deepseek ~5pp higher at 18-21Z than 00-05Z, google's 26% Saturday spike
+# settled 21.5%), and those swings average out over the week.
+SHARE_RUN_HOURS = _env_float("IMM_SHARE_RUN_HOURS", 6)
+SHARE_RUN_PULL = _env_float("IMM_SHARE_RUN_PULL", 0.3)
+# A BREAK in the mix -- a model launched or withdrawn (10/05: z-ai 6.6% ->
+# 21% at the week's turn, the stealth model's ~10% to nothing at 16Z) --
+# makes the week-to-date the wrong anchor for every author. A named bucket
+# whose last SHARE_BREAK_WINDOW_HOURS differ from its share since the anchor
+# by >= SHARE_BREAK_ABS_PP and >= SHARE_BREAK_REL of the larger of the two
+# is a break (google's 26% Saturday against 21.7% was not: 17%), once the
+# anchor holds SHARE_BREAK_MIN_BASE_HOURS before the window. The anchor
+# then moves to the change point; until SHARE_BREAK_MIN_HOURS of flow sit
+# behind it the run rate is the last hours alone.
+SHARE_BREAK_WINDOW_HOURS = _env_float("IMM_SHARE_BREAK_WINDOW_HOURS", 3)
+SHARE_BREAK_ABS_PP = _env_float("IMM_SHARE_BREAK_ABS_PP", 3.0)
+SHARE_BREAK_REL = _env_float("IMM_SHARE_BREAK_REL", 0.5)
+SHARE_BREAK_MIN_BASE_HOURS = _env_float("IMM_SHARE_BREAK_MIN_BASE_HOURS", 6)
+SHARE_BREAK_MIN_HOURS = _env_float("IMM_SHARE_BREAK_MIN_HOURS", 3)
+# A REVISION of the week's counts -- a named author's count falls, one
+# with >= 1% of the week vanishes without Others taking it, or one
+# interval's increase goes >= SHARE_JUMP_FRAC to one author (requests
+# re-attributed, e.g. the stealth model's to its maker) -- marks the
+# entries lag for SHARE_REVISION_HOLD_HOURS and anchors the run rate after it.
+SHARE_REVISION_HOLD_HOURS = _env_float("IMM_SHARE_REVISION_HOLD_HOURS", 6)
+SHARE_JUMP_FRAC = _env_float("IMM_SHARE_JUMP_FRAC", 0.6)
 SHARE_HIST_HOURS = 48                                               # snapshots kept
+# every chart snapshot, one file per UTC day ("" = off), and the Kalshi
+# ladder (every strike's touch) on each hourly event read: the 48h of
+# snapshots above and the cycle log's three quoted strikes are too little
+# to fit the run rate or to score the fair against the market
+SHARE_ARCHIVE_DIR = os.environ.get("IMM_SHARE_ARCHIVE_DIR", STATUS_DIR)
+SHARE_LADDER_FILE = os.environ.get(
+    "IMM_SHARE_LADDER_FILE", os.path.join(STATUS_DIR, "openrouter_share_ladder.jsonl"))
 SHARE_LEADERBOARD_EVERY_SECS = _env_float("IMM_SHARE_LEADERBOARD_EVERY_SECS", 1800)
 SHARE_CATALOG_EVERY_SECS = _env_float("IMM_SHARE_CATALOG_EVERY_SECS", 6 * 3600)
 SHARE_PRED_EVERY_SECS = 3600
@@ -366,15 +393,119 @@ def recent_delta(hist: List[dict], week: date, chart_time: Optional[datetime],
     return by, tot, days
 
 
+def _counts(h: dict) -> Dict[str, float]:
+    return {k: float(v) for k, v in (h.get("ys") or {}).items() if isinstance(v, (int, float))}
+
+
+def week_snaps(hist: List[dict], week: date) -> List[Tuple[float, Dict[str, float]]]:
+    """The stored snapshots of `week`, oldest first."""
+    wk = week.isoformat()
+    return sorted(((float(h["t"]), _counts(h)) for h in hist or []
+                   if str(h.get("x"))[:10] == wk and h.get("t")), key=lambda s: s[0])
+
+
+def detect_break(hist: List[dict], week: date, chart_time: Optional[datetime],
+                 ys_now: Dict[str, float], base: Optional[dict] = None) -> Optional[dict]:
+    """A break in the chart's mix since `base` (the last break, else the
+    week's start): the named bucket whose last SHARE_BREAK_WINDOW_HOURS moved
+    furthest from its share between the base and that window, when the move
+    is >= SHARE_BREAK_ABS_PP and >= SHARE_BREAK_REL of the larger share.
+    Placed at the single change point of that bucket's share over the stored
+    snapshots (least squares, volume-weighted), the detection window's start
+    when the snapshots do not show one. {"t", "x", "ys" (counts at t),
+    "bucket", "old", "new" (its share either side, %)} or None."""
+    if chart_time is None or not ys_now:
+        return None
+    now_t = chart_time.timestamp()
+    b_t = float(base["t"]) if base else _week_start(week).timestamp()
+    b_ys = {k: float(v) for k, v in (base or {}).get("ys", {}).items()}
+    if now_t - SHARE_BREAK_WINDOW_HOURS * 3600.0 - b_t < SHARE_BREAK_MIN_BASE_HOURS * 3600.0:
+        return None
+    rec = recent_delta(hist, week, chart_time, ys_now, SHARE_BREAK_WINDOW_HOURS)
+    if rec is None:
+        return None
+    by, tot, days = rec
+    then_t = now_t - days * 86400.0
+    old_tot = sum(ys_now.values()) - tot - sum(b_ys.values())
+    if old_tot <= 0:
+        return None
+    best = None
+    for k, n in by.items():
+        if base and k not in b_ys:
+            continue
+        new = 100.0 * n / tot
+        old = 100.0 * (ys_now[k] - n - b_ys.get(k, 0.0)) / old_tot
+        d = abs(new - old)
+        if d >= SHARE_BREAK_ABS_PP and d >= SHARE_BREAK_REL * max(old, new) \
+                and (best is None or d > best[0]):
+            best = (d, k, old, new)
+    if best is None:
+        return None
+    _, k, old, new = best
+    pts = [(b_t, b_ys)] + [s for s in week_snaps(hist, week) if b_t < s[0] <= now_t]
+    segs = []                                  # (start, volume, k's share)
+    for (t0, y0), (t1, y1) in zip(pts, pts[1:]):
+        v = sum(y1.values()) - sum(y0.values())
+        if v > 0:
+            segs.append((t0, v, (y1.get(k, 0.0) - y0.get(k, 0.0)) / v, y0))
+
+    def cost(xs):
+        w = sum(v for _, v, _, _ in xs)
+        m = sum(v * s for _, v, s, _ in xs) / w
+        return sum(v * (s - m) ** 2 for _, v, s, _ in xs), m
+    # the window's own start snapshot (recent_delta measured from it) unless
+    # the best split shows the step
+    at, at_ys = min(pts[1:], key=lambda s: abs(s[0] - then_t))
+    fit = None
+    for i in range(1, len(segs)):
+        (cb, mb), (ca, ma) = cost(segs[:i]), cost(segs[i:])
+        if fit is None or cb + ca < fit:
+            fit = cb + ca
+            split = ((segs[i][0], segs[i][3], 100.0 * mb, 100.0 * ma)
+                     if abs(ma - mb) * 100.0 >= SHARE_BREAK_ABS_PP else None)
+    if fit is not None and split is not None:
+        at, at_ys, old, new = split            # the step's own levels
+    return {"t": at, "x": week.isoformat(), "ys": dict(at_ys), "bucket": k,
+            "old": round(old, 3), "new": round(new, 3)}
+
+
+def chart_revision(hist: List[dict], week: date, now_t: float) -> Optional[Tuple[float, dict]]:
+    """The last snapshot of `week` (time, counts) that revised the counts
+    before it, within SHARE_REVISION_HOLD_HOURS of now_t: a named author's
+    count fell, an author holding >= 1% of the week vanished without Others
+    taking it in, or one interval's increase went >= SHARE_JUMP_FRAC to a
+    single author (requests re-attributed, not new flow). None otherwise."""
+    last = None
+    snaps = week_snaps(hist, week)
+    for (t0, y0), (t1, y1) in zip(snaps, snaps[1:]):
+        if now_t - t1 > SHARE_REVISION_HOLD_HOURS * 3600.0:
+            continue
+        tot0 = sum(y0.values())
+        d_tot = sum(y1.values()) - tot0
+        d_oth = y1.get(OTHERS, 0.0) - y0.get(OTHERS, 0.0)
+        for k, v0 in y0.items():
+            if k == OTHERS:
+                continue
+            if k in y1:
+                if y1[k] < v0 - 0.5 or (d_tot > 0 and y1[k] - v0 >= SHARE_JUMP_FRAC * d_tot
+                                        and y1[k] - v0 > 0.01 * tot0):
+                    last = (t1, y1)
+            elif v0 >= 0.01 * tot0 and d_oth < 0.5 * v0:
+                last = (t1, y1)
+    return last
+
+
 def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
                last_day: Optional[date],
                day_counts: Tuple[Dict[str, float], float],
                week_counts: Tuple[Dict[str, float], float],
                vol: Dict[str, float],
                chart_time: Optional[datetime] = None,
-               hist: Optional[List[dict]] = None) -> Optional[dict]:
+               hist: Optional[List[dict]] = None,
+               anchor: Optional[dict] = None) -> Optional[dict]:
     """N(mu, sigma) in pp for the author's chart share of week W, p_ident and
-    the bookkeeping; None without a run rate.
+    the bookkeeping; None without a run rate. `anchor` is the week's last
+    break in the chart's mix (detect_break / chart_revision), if any.
 
     The run rate for the days still to come is the plain average of the
     estimators at hand: the leaderboard's last complete day and trailing 7
@@ -393,9 +524,19 @@ def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
     Others). The book traded the live chart's last hours while the blend's
     day-old windows lagged: on 10/02 OpenAI's last 3h fell from 19% to 16%
     while the blend held 18.9%, and the bot bought its strikes from the
-    sellers. Its spread is then half the range of the chart's shares over
-    SHARE_SPREAD_HOURS (3/6/24h part while an author is on the move). The
-    total request rate keeps the blend: volume swings by hour of day."""
+    sellers. Its spread was then half the range of the chart's shares over
+    the last 3/6/24h (until 2026-10-05). The total request rate keeps the
+    blend: volume swings by hour of day.
+
+    Since 2026-10-05 the chart's run rate is an anchor pulled SHARE_RUN_PULL
+    of the way toward the last SHARE_RUN_HOURS (6). The anchor is the
+    week-to-date; after a break in the mix the flow since it (until
+    SHARE_BREAK_MIN_HOURS of that sit behind the break, the last hours
+    alone). The last 3h alone ran 0.47pp RMS off the settled week of 9/28,
+    this 0.35: the last hours chase the time of day (google's 3h share went
+    26% -> 17% in 18 hours over the weekend; its week settled 21.5%). Its
+    spread is 0 -- vol alone is calibrated -- except after a break, where it
+    is half the gap between the anchor and the week-to-date."""
     d_by, d_tot = day_counts
     w_by, w_tot = week_counts
     wk = next((w for w in weeks if str(w["x"])[:10] == week.isoformat()), None)
@@ -434,16 +575,33 @@ def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
     fast = None
     if SHARE_RUN_HOURS > 0 and k_tot > 0:
         fast = recent_delta(hist or [], week, chart_time, ys, SHARE_RUN_HOURS)
-    fast_set = set()
+    fast_set: set = set()
+    anchor_mode, anchor_share = None, {}
+    brk = anchor if anchor and str(anchor.get("x"))[:10] == week.isoformat() else None
     if fast is not None:
-        wins = [recent_delta(hist or [], week, chart_time, ys, h) for h in SHARE_SPREAD_HOURS]
-        wins = [w for w in wins if w is not None]
+        since = None
+        anchor_mode = "week to date"
+        if brk is not None and chart_time is not None:
+            b_ys = {k: float(v) for k, v in (brk.get("ys") or {}).items()}
+            b_tot = sum(b_ys.values())
+            anchor_mode = "break, last hours"
+            if (chart_time.timestamp() - float(brk["t"])) / 3600.0 >= SHARE_BREAK_MIN_HOURS                     and k_tot > b_tot:
+                since = ({k: ys[k] - b_ys[k] for k in ys
+                          if k != OTHERS and k in b_ys and ys[k] >= b_ys[k]}, k_tot - b_tot)
+                anchor_mode = "since break"
         for a, n in fast[0].items():
-            s_rate[a] = n / fast[1]
+            last = n / fast[1]
+            if anchor_mode == "week to date":
+                anc = ys[a] / k_tot
+            elif since is not None and a in since[0]:
+                anc = since[0][a] / since[1]
+            else:
+                anc = last
+            s_rate[a] = anc + SHARE_RUN_PULL * (last - anc)
+            anchor_share[a] = anc
+            spread[a] = (0.0 if brk is None
+                         else 100.0 * abs(anc - ys.get(a, 0.0) / k_tot) / 2.0)
             fast_set.add(a)
-            xs = [w[0][a] / w[1] for w in wins if a in w[0]]
-            if len(xs) >= 2:
-                spread[a] = 100.0 * (max(xs) - min(xs)) / 2.0
     r = 7.0 - e
     gap = 0.0
     if chart_time is not None:  # a week not yet begun: the data ends at the chart
@@ -489,7 +647,15 @@ def event_fair(author: str, week: date, now: datetime, weeks: List[dict],
             "recent_share": (round(100.0 * recent[0][author] / recent[1], 4)
                              if recent is not None and author in recent[0] else None),
             "recent_hours": round(recent[2] * 24.0, 2) if recent is not None else None,
-            "run_mode": (f"chart {SHARE_RUN_HOURS:g}h" if author in fast_set else "blend"),
+            "run_mode": ((f"chart {SHARE_RUN_HOURS:g}h" if anchor_mode == "break, last hours"
+                          else f"{'break' if anchor_mode == 'since break' else 'wtd'}"
+                               f"+{SHARE_RUN_PULL:g}x{SHARE_RUN_HOURS:g}h")
+                         if author in fast_set else "blend"),
+            "anchor_mode": anchor_mode if author in fast_set else None,
+            "anchor_share": (round(100.0 * anchor_share[author], 4)
+                             if author in anchor_share else None),
+            "break_at": (datetime.fromtimestamp(float(brk["t"]), timezone.utc).isoformat()
+                         if brk is not None else None),
             "fast_share": (round(100.0 * fast[0][author] / fast[1], 4)
                            if fast is not None and author in fast[0] else None),
             "fast_hours": round(fast[2] * 24.0, 2) if fast is not None else None,
@@ -530,8 +696,23 @@ def _signed_or_public(get_json: Optional[Callable], params: dict) -> dict:
     return {}
 
 
-def fetch_events(get_json: Optional[Callable] = None) -> Dict[str, dict]:
-    """Open share events: event ticker -> {"series", "author", "week"}."""
+def _cents(m: dict, base: str) -> Optional[float]:
+    """A price off a Kalshi market object in cents: '<base>_dollars' (V2),
+    else the legacy integer-cent '<base>'."""
+    for key, mult in ((base + "_dollars", 100.0), (base, 1.0)):
+        v = m.get(key)
+        if v is not None:
+            try:
+                return round(float(v) * mult, 2)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def fetch_events(get_json: Optional[Callable] = None,
+                 ladder: Optional[List[dict]] = None) -> Dict[str, dict]:
+    """Open share events: event ticker -> {"series", "author", "week"}. With
+    `ladder`, every market's touch is appended to it as well."""
     out: Dict[str, dict] = {}
     for s in SHARE_SERIES:
         author = SERIES_AUTHOR.get(s)
@@ -540,6 +721,11 @@ def fetch_events(get_json: Optional[Callable] = None) -> Dict[str, dict]:
         js = _signed_or_public(get_json, {"series_ticker": s, "status": "open", "limit": 200})
         for m in js.get("markets") or []:
             ev = str(m.get("event_ticker") or "")
+            if ladder is not None and ev and m.get("ticker"):
+                ladder.append({"event": ev, "ticker": str(m["ticker"]),
+                               "yes_bid": _cents(m, "yes_bid"), "yes_ask": _cents(m, "yes_ask"),
+                               "last": _cents(m, "last_price"), "volume": m.get("volume"),
+                               "open_interest": m.get("open_interest")})
             if not ev or ev in out:
                 continue
             wk = week_of(ev, f"{m.get('rules_primary') or ''} {m.get('rules_secondary') or ''}")
@@ -598,6 +784,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         hist.append({"t": float(cached_at), "x": str(weeks[-1]["x"])[:10],
                      "ys": {k: float(v) for k, v in weeks[-1]["ys"].items()
                             if isinstance(v, (int, float))}})
+        if SHARE_ARCHIVE_DIR:
+            _append(os.path.join(SHARE_ARCHIVE_DIR, "openrouter_share_chart_"
+                                 f"{datetime.fromtimestamp(cached_at, timezone.utc):%Y-%m-%d}.jsonl"),
+                    [hist[-1]])
     hist = [h for h in hist if float(h.get("t") or 0)
             >= float(cached_at or ts) - SHARE_HIST_HOURS * 3600]
     lb = old.get("leaderboard") if isinstance(old.get("leaderboard"), dict) else {}
@@ -642,14 +832,46 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             events = ev_cache
         else:
             try:
-                events = fetch_events(get_json)
+                ladder: List[dict] = []
+                events = fetch_events(get_json, ladder=ladder)
                 events_at = ts
+                if SHARE_LADDER_FILE:
+                    _append(SHARE_LADDER_FILE, [dict(r, at=now.isoformat()) for r in ladder])
             except Exception as e:
                 if not ev_cache:
                     raise
                 _log(f"! Kalshi event read failed ({type(e).__name__}); "
                      f"reusing {len(ev_cache)} cached")
                 events = ev_cache
+    # the current week's last break in the mix (kept past the 48h of
+    # snapshots: its counts ride along) and a revision of its counts
+    cur_x = str(weeks[-1]["x"])[:10] if weeks else ""
+    old_brk = (old.get("breaks") or {}).get(cur_x) if isinstance(old.get("breaks"), dict) else None
+    brk = old_brk if isinstance(old_brk, dict) and old_brk.get("ys") else None
+    revised = None
+    try:
+        cur_week = date.fromisoformat(cur_x)
+    except ValueError:
+        cur_week = None
+    if cur_week is not None and chart_time is not None:
+        revised = chart_revision(hist, cur_week, chart_time.timestamp())
+        if revised is not None and (brk is None or revised[0] > float(brk["t"])):
+            brk = {"t": revised[0], "x": cur_x, "ys": dict(revised[1]), "bucket": "revision",
+                   "old": None, "new": None}
+            _log(f"chart revision at {datetime.fromtimestamp(revised[0], timezone.utc):%m-%d %H:%MZ}: "
+                 f"family lag {SHARE_REVISION_HOLD_HOURS:g}h, run rate anchored after it")
+        nb = detect_break(hist, cur_week, chart_time,
+                          {k: float(v) for k, v in weeks[-1]["ys"].items()
+                           if isinstance(v, (int, float))}, brk)
+        if nb is not None:
+            brk = nb
+            _log(f"break in the mix: {nb['bucket']} {nb['old']:.2f}% -> {nb['new']:.2f}%, "
+                 f"anchored at {datetime.fromtimestamp(nb['t'], timezone.utc):%m-%d %H:%MZ}")
+    if revised is not None:
+        current = False
+        lag_why = (f"the chart revised the week's counts at "
+                   f"{datetime.fromtimestamp(revised[0], timezone.utc):%m-%d %H:%MZ}")
+        LAST["data_current"] = current
     entries: Dict[str, dict] = {}
     missing: List[str] = []
     for ev, info in sorted(events.items()):
@@ -660,7 +882,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             missing.append(ev)
             continue
         f = event_fair(author, wk, now, weeks, last_day, day_counts, week_counts, vol,
-                       chart_time=chart_time, hist=hist)
+                       chart_time=chart_time, hist=hist, anchor=brk)
         if f is None:
             missing.append(ev)
             continue
@@ -692,7 +914,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                   "p_ident": e["p_ident"], "known": e["known"],
                   "wtd_share": e["wtd_share"], "rate_share": e["rate_share"],
                   "run_mode": e.get("run_mode"), "fast_share": e.get("fast_share"),
-                  "blend_share": e.get("blend_share")}
+                  "blend_share": e.get("blend_share"), "anchor_share": e.get("anchor_share"),
+                  "break_at": e.get("break_at")}
                  for ev, e in live])
         pred_at = ts
     cur_sh = chart_shares(weeks[-1:])
@@ -703,7 +926,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                    "missing": missing, "events": events, "events_at": events_at,
                    "data_current": current, "lag_reason": lag_why,
                    "chart_cached_at": chart_time.isoformat() if chart_time else None,
-                   "chart_hist": hist,
+                   "chart_hist": hist, "breaks": {cur_x: brk} if brk else {},
                    "chart_week": cur_sh[0][0] if cur_sh else None,
                    "chart_week_shares": ({k: round(v, 3) for k, v in
                                           sorted(cur_sh[0][1].items(), key=lambda kv: -kv[1])}
@@ -715,8 +938,13 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                              "default_vol": SHARE_DEFAULT_VOL, "vol_weeks": SHARE_VOL_WEEKS,
                              "named": SHARE_NAMED,
                              "chart_max_age_min": SHARE_CHART_MAX_AGE_MIN,
-                             "run_hours": SHARE_RUN_HOURS,
-                             "spread_hours": list(SHARE_SPREAD_HOURS)}},
+                             "run_hours": SHARE_RUN_HOURS, "run_pull": SHARE_RUN_PULL,
+                             "break_window_hours": SHARE_BREAK_WINDOW_HOURS,
+                             "break_abs_pp": SHARE_BREAK_ABS_PP,
+                             "break_rel": SHARE_BREAK_REL,
+                             "break_min_base_hours": SHARE_BREAK_MIN_BASE_HOURS,
+                             "break_min_hours": SHARE_BREAK_MIN_HOURS,
+                             "revision_hold_hours": SHARE_REVISION_HOLD_HOURS}},
                   fh, indent=1, sort_keys=True)
     os.replace(tmp, path)
     return len(entries), len(missing)
