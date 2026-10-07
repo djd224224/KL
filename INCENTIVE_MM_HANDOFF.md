@@ -8557,3 +8557,41 @@ media").
 
 Test: TestScreen.test_critics_choice_family_quotes_under_the_awards_rules
 (replaces the comedy-only test; suite 2,266 OK).
+
+### 2026-10-07 ~01:00Z — sports ladders / escalators at x3 every hour (Jack: "do the 3x overnight multiplier, at all times for ESCALATOR/LADDER events")
+
+WHY. On 10/06 TB@DAL (26OCT08TBDAL), all 37 ladder/escalator markets were
+admitted at listing (18:42Z). Between ~20:30Z and 21:40Z another maker
+rested 160k-1.1M contracts at the touch (1,106,733 YES @ 4.16c on
+ESCALATORREC-DALJFERGUSON87; 163,173 NO @ 81c on LADDERRECYDS-DALGPICKENS3,
+both checked against the REST book). Our 100-lot fell to 0.04-0.1% of the
+scored book, and 18 markets projected $0.37-0.95 through kickoff -- under the
+$1 cliff (the family bar is $1.20 fresh / $1.00 once banked, not the global
+$1.50). The hopeless exit pulled them at 21:30-22:10Z.
+
+WHAT. SPORTS_LADDER_HOUR_MULT (env IMM_SPORTS_LADDER_HOUR_MULT, default
+3.0): the hour part of hour_size_mult for every series the ladder pattern
+matches is that flat value at every ET hour. Before this it was the global
+window: 0-8 ET x3, otherwise x1, and never the evening x1.5. So it's 20 x 5
+(family) x 3 = 300 a side all day. Saturday still multiplies on top: x2
+while the gate is PASS = 600. Unchanged: the per-market / per-event caps
+(750 / 5,000) and the skew knees, which ride the family multiplier only;
+the near-cliff x1.5 still composes. The floor projection (size_mult_profile)
+sees x3 at every hour, so the projections of the TBDAL cuts rise ~1.7x
+(their window had been ~62% x1 / 38% x3). About 10 of the 18 clear $1 on
+that and re-enter after the 10-min admission clock. The deepest-diluted ~6
+stay out. It is applied before the daily-family and scan exclusions, so the
+whole family takes it. 0 = the old behaviour.
+
+Cash: TBDAL alone at 300 a side is ~$45 of bid and ~$255 of ask collateral
+a market. Shard-0 cash was $21.5k at 00:46Z. The ladder asks' cash switch
+(off under $1,500) still governs.
+
+imm_saturday_tracker: ladder rows now sit out of the Saturday-level
+hour_mult read (drop_ladder_hm, next to drop_evening_hm). Otherwise their x3 /
+x6 would read a x2 Saturday as ~x4. Rent, fills and contract-hours are kept.
+
+Tests: TestSportsLadderHourMult (7) +
+test_ladder_rows_sit_out_of_the_saturday_level_read. The suite pins the knob
+to 0 like the other dated knobs, so the ladder fixtures keep sizing off the
+global window (repo suite 2,274 OK).

@@ -488,6 +488,21 @@ class DatedQuietWindowTests(unittest.TestCase):
             self.assertEqual(sat._level(b.loc[("2026-10-10", "day"), "hm"]), 2.0)
             self.assertAlmostEqual(b.loc[("2026-10-10", "day"), "ct_h"], 2_000.0)   # contract-hours kept
 
+    def test_ladder_rows_sit_out_of_the_saturday_level_read(self):
+        # 2026-10-06: sports ladders / escalators rest a flat x3 every hour,
+        # x6 on a x2 Saturday -- they would read the Saturday as ~x4
+        rows = []
+        for d, sat_m in (("2026-10-10", 2.0), ("2026-10-07", 1.0)):
+            for series, fam in (("KXTRUMPMENTION", 1.0), ("KXNFLLADDERREC", 3.0)):
+                rows.append(dict(et_date=d, et_hour=12, series=series, sum_est_usd=240.0,
+                                 sum_quoted=50_000.0, n_rows=50, q_rows=50, hm_sum=50 * sat_m * fam))
+        ser = pd.DataFrame(rows)
+        cyc = pd.DataFrame([dict(et_date=d, et_hour=12, n_cycles=50) for d in ("2026-10-10", "2026-10-07")])
+        b = sat.gate_blocks(ser, cyc, None, "2026-10-11").set_index(["et_date", "block"])
+        self.assertAlmostEqual(b.loc[("2026-10-10", "day"), "hm"], 2.0)
+        self.assertAlmostEqual(b.loc[("2026-10-07", "day"), "hm"], 1.0)
+        self.assertAlmostEqual(b.loc[("2026-10-10", "day"), "ct_h"], 2_000.0)   # contract-hours kept
+
     def test_knob_line_states_the_switch(self):
         before = sat._quiet_hours_line("2026-10-04")
         self.assertTrue(before.startswith("0-9 ET x2"), before)

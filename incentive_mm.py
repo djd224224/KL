@@ -1359,6 +1359,21 @@ SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
     "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:19-1:0.5,"
     "KXTRUEV:17-1:0.5"))
 
+# SPORTS LADDERS / ESCALATORS AT x3 EVERY HOUR (Jack 2026-10-06: "do the 3x
+# overnight multiplier, at all times for ESCALATOR/LADDER events"). The
+# family's hour part is this flat value instead of the global window (0-8 ET
+# x3, x1 otherwise; they never took the evening x1.5): 20 x 5 (the family
+# size_mult) x 3 = 300 a side at every hour. Asked after the 10/06 TB@DAL
+# slate: ~3h after listing another maker rested 160k-1.1M contracts at the
+# touch, our 100-lot fell to 0.04-0.1% of the scored book, and 18 of 37
+# markets projected $0.37-0.95 through kickoff -- under the $1 cliff. The
+# floor projection walks hour_size_mult, so it sees the x3 too. Saturday
+# still multiplies on top (x1.5 = 450 a side, x2 gated = 600), and the per-market /
+# per-event caps (750 / 5,000) and skew knees are unchanged -- they ride the
+# family multiplier only. Wins over the daily-family and scan exclusions
+# below: the whole pattern family takes it. 0 = off (the global window).
+SPORTS_LADDER_HOUR_MULT = _env_float("IMM_SPORTS_LADDER_HOUR_MULT", 3.0)
+
 
 def _hour_window_mult(series: str, now_utc: datetime) -> float:
     """The hour-of-day part of hour_size_mult(): 1.0 outside configured
@@ -1378,6 +1393,9 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
         if series.startswith(prefix) and hour in hours \
                 and not rain_period_member(series):
             return hours[hour]
+    # sports ladders / escalators: one flat value at every hour (2026-10-06)
+    if SPORTS_LADDER_HOUR_MULT > 0 and sports_ladder_league(series):
+        return SPORTS_LADDER_HOUR_MULT
     # Daily (print) families never take the GLOBAL window (Jack 2026-09-12,
     # with the 0-9am ET extension): the quiet hours are quiet for long-dated
     # books, while a daily's overnight fills are informed by its own print
@@ -5982,6 +6000,10 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # 1,000, and the full unwind rests up to the 750. Reward is still linear in
 # size here (median est_frac 0.1-0.3% of the scored book on 9/28-10/2).
 # Paid rate NOT yet confirmed: no ladder credit is on the 9/27 statement.
+# 2026-10-06 (Jack: "do the 3x overnight multiplier, at all times for
+# ESCALATOR/LADDER events"): the hour part is a flat x3 at every hour
+# (SPORTS_LADDER_HOUR_MULT) -- 300 a side all day; Saturday x1.5 = 450, or
+# 600 when the Saturday gate steps it up to x2.
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
     min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.2),

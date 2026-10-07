@@ -434,7 +434,7 @@ def build_rows(ser, cyc, mid_tab, fills, results, through_et: str):
     day_cycles = cyc.groupby("et_date")["n_cycles"].sum()
     day_hours = cyc.groupby("et_date")["et_hour"].nunique()
     ser["group"] = ser["series"].map(group_of)
-    ser = drop_evening_hm(ser)
+    ser = drop_ladder_hm(drop_evening_hm(ser))
     g = ser.groupby(["et_date", "group"]).agg(sum_est=("sum_est_usd", "sum"), sum_q=("sum_quoted", "sum"),
                                               q_rows=("q_rows", "sum"), hm_sum=("hm_sum", "sum")).reset_index()
     g["cycles"] = g["et_date"].map(day_cycles)
@@ -581,6 +581,24 @@ def drop_evening_hm(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def drop_ladder_hm(df: pd.DataFrame) -> pd.DataFrame:
+    """df with q_rows / hm_sum zeroed on the sports ladder / escalator rows.
+    From 2026-10-06 that family rests a flat x3 at every hour
+    (imm.SPORTS_LADDER_HOUR_MULT), so its rows log x3 on a weekday day and
+    x6 on a x2 Saturday. Left in, they would pull the Saturday-level read
+    off its knob, so they sit out of it like the evening hours do. Before
+    10/6 they logged the same level as the rest, so dropping them leaves
+    those days' reads unchanged. Rent, fills and contract-hours are untouched."""
+    if df.empty or not {"q_rows", "hm_sum", "series"} <= set(df.columns):
+        return df
+    mask = df["series"].map(lambda s: imm.sports_ladder_league(s) is not None).to_numpy(dtype=bool)
+    if not mask.any():
+        return df
+    df = df.copy()
+    df.loc[mask, ["q_rows", "hm_sum"]] = 0.0
+    return df
+
+
 def gate_blocks(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, through_et: str) -> pd.DataFrame:
     """Long-dated sums per (et_date, block) from the tracker's own loaders:
     resting contract-hours, modelled $ accrued, fills, mark-out and
@@ -594,7 +612,7 @@ def gate_blocks(ser: pd.DataFrame, cyc: pd.DataFrame, scored: pd.DataFrame, thro
     c["block"] = block_of(c["et_date"], c["et_hour"])
     s = ser[(ser["et_date"] >= SINCE) & (ser["et_date"] <= through_et)]
     s = s[s["series"].map(group_of) == "long-dated"].merge(c, on=["et_date", "et_hour"], how="inner")
-    s = drop_evening_hm(s)
+    s = drop_ladder_hm(drop_evening_hm(s))
     s["ct_h"] = s["sum_quoted"] / s["n_cycles"]
     s["rent_usd"] = s["sum_est_usd"] / s["n_cycles"] / 24.0
     a = s.groupby(["et_date", "block"]).agg(ct_h=("ct_h", "sum"), rent_usd=("rent_usd", "sum"),

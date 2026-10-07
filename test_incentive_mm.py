@@ -88,6 +88,11 @@ imm.SERIES_BLOCK_PATTERNS = tuple(
 _LADDER_ASKS_OFF_CODE_DEFAULT = imm.SPORTS_LADDER_ASKS_OFF
 imm.SPORTS_LADDER_ASKS_OFF = False
 imm._LADDER_ASKS_STATE["on_at"] = None
+# ...and the family's flat x3 at every hour (2026-10-06): the ladder fixtures
+# size off the global window, so the suite runs it off; TestSportsLadderHourMult
+# arms it.
+_LADDER_HOUR_MULT_CODE_DEFAULT = imm.SPORTS_LADDER_HOUR_MULT
+imm.SPORTS_LADDER_HOUR_MULT = 0.0
 
 
 def setUpModule():
@@ -9545,6 +9550,78 @@ class TestEveningWindow(unittest.TestCase):
         self.assertAlmostEqual(prof[3.0], 9 / 24, places=9)
         self.assertAlmostEqual(prof[1.5], 4 / 24, places=9)
         self.assertAlmostEqual(prof[1.0], 11 / 24, places=9)
+
+
+class TestSportsLadderHourMult(unittest.TestCase):
+    """Jack 2026-10-06: "do the 3x overnight multiplier, at all times for
+    ESCALATOR/LADDER events" -- the family's hour part is a flat x3 at every
+    ET hour, Saturday still on top, everything else on the global window.
+    October => EDT (UTC-4)."""
+
+    LADDERS = ("KXNFLLADDERREC", "KXNFLESCALATORRECYDS", "KXNFLFFPTSLADDER",
+               "KXNBALADDERPTS")
+
+    def setUp(self):
+        self._saved = {k: getattr(imm, k) for k in (
+            "SPORTS_LADDER_HOUR_MULT", "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM",
+            "HOUR_SIZE_MULTS", "HOUR_SIZE_MULTS_NEXT", "HOUR_SIZE_MULT_FROM",
+            "SAT_SIZE_MULT")}
+        imm.SPORTS_LADDER_HOUR_MULT = 3.0
+        imm.EVENING_SIZE_MULTS = imm._parse_hour_mults("18-21:1.5")
+        imm.EVENING_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0")
+        imm.HOUR_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
+        imm.SAT_SIZE_MULT = 1.0
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(imm, k, v)
+
+    @staticmethod
+    def et(y, mo, d, h, mi=0):
+        return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
+
+    def test_code_default(self):
+        self.assertEqual(_LADDER_HOUR_MULT_CODE_DEFAULT, 3.0)
+
+    def test_x3_every_hour(self):
+        for s in self.LADDERS:
+            for h in range(24):             # a Tuesday: quiet, day, evening
+                self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, h)), 3.0,
+                                 (s, h))
+        # 20 x 5 (family) x 3 = 300 a side at midday
+        self.assertEqual([q for _t, q in imm.hour_scaled_levels(
+            "KXNFLLADDERREC", self.et(2026, 10, 6, 12))],
+            [int(sz * 15 + 0.5) for _t, sz in imm.series_levels("KXNFLLADDERREC")])
+
+    def test_rest_of_book_untouched(self):
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 6, 12)), 1.0)
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 6, 3)), 3.0)
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 6, 19)), 1.5)
+
+    def test_wins_over_daily_classification(self):
+        with mock.patch.object(imm, "DAILY_SERIES_DYNAMIC", {"KXNFLLADDERREC"}):
+            self.assertTrue(imm.is_daily_series("KXNFLLADDERREC"))
+            self.assertEqual(imm._hour_window_mult("KXNFLLADDERREC",
+                                                   self.et(2026, 10, 6, 12)), 3.0)
+
+    def test_saturday_composes(self):
+        imm.SAT_SIZE_MULT = 2.0
+        with mock.patch.object(imm, "gated_sat_mult", return_value=None):
+            self.assertEqual(imm.hour_size_mult("KXNFLLADDERREC",
+                                                self.et(2026, 10, 10, 12)), 6.0)
+
+    def test_floor_projection_sees_x3(self):
+        self.assertEqual(imm.size_mult_profile("KXNFLLADDERREC",
+                                               self.et(2026, 10, 6, 0), 2.0),
+                         [(3.0, 1.0)])
+
+    def test_off_restores_global_window(self):
+        imm.SPORTS_LADDER_HOUR_MULT = 0.0
+        self.assertEqual(imm.hour_size_mult("KXNFLLADDERREC", self.et(2026, 10, 6, 12)), 1.0)
+        self.assertEqual(imm.hour_size_mult("KXNFLLADDERREC", self.et(2026, 10, 6, 3)), 3.0)
+        self.assertEqual(imm.hour_size_mult("KXNFLLADDERREC", self.et(2026, 10, 6, 19)), 1.0)
 
 
 class TestYieldSizeMode(unittest.TestCase):
