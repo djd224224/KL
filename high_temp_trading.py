@@ -593,6 +593,23 @@ if RUN_SLOT != "evening":
 if not ACTIVE_CITIES:
     print(f"  nothing to trade (west_late enabled={WEST_LATE_ENABLED}); "
           f"exiting without cancelling or placing anything")
+    # A no-op because the trigger fired LATE is a broken test, not a quiet
+    # day, and it used to look identical to a deliberate kill in BigQuery.
+    # That is how the 2026-09-29 west-late test burned a week producing
+    # nothing: six consecutive noop rows, no alert, no fills. Alert unless
+    # the kill switch is deliberately off.
+    if RUN_SLOT == "west_late" and WEST_LATE_ENABLED:
+        _late_ct = central_time.strftime('%H:%M')
+        alert("WEST_LATE_NO_WINDOW",
+              f"west_late fired at {_late_ct} CT and had no tradeable city "
+              f"(variable={variable}). Expected ~09:07 CT. If this repeats, the "
+              f"trigger is being throttled — see the workflow header: the slot "
+              f"needs a cron-job.org dispatch, not a GH schedule.",
+              {"central_time": _late_ct, "variable": int(variable),
+               "run_slot": RUN_SLOT})
+        if _ALERTS:
+            upload_alerts_to_bq()
+            send_alert_notification()
     write_run_row("start", variable=int(variable), central_time_hour=int(central_time.hour),
                   run_slot=RUN_SLOT)
     write_run_row("end", finished_at=datetime.now(pytz.UTC), n_orders_placed=0,
@@ -1175,20 +1192,33 @@ print(f"  applied to {_n_corr}/{len(combined_table)} rows; "
 # -----------------------------------------------------------------------------
 
 # =====================================================================
-# FORECAST σ — MEASURED, NOT FLOORED               (2026-09-06)
+# FORECAST σ — MEASURED, NOT FLOORED      (2026-09-06, RECALIBRATED 10-06)
 # ---------------------------------------------------------------------
 # The old model used  σ = max(std of the 2 vendors, CITY_FLOOR_STD)  with
-# floors of 1.0–1.9°F. Scored against 2,412 city-days of final CLI highs
-# (2026-05-08 → 09-05, evening run, preliminary-report rows excluded), the
-# ACTUAL forecast-error σ at the lead the bot trades is 2.40°F pooled, and
-# every one of the 20 cities came in wider than its floor — median ratio
-# 1.8×, worst 2.8× (Seattle 1.2 → 3.34).
+# floors of 1.0–1.9°F. Scored against final CLI highs, the ACTUAL
+# forecast-error σ at the lead the bot trades is ~2.1°F and every one of
+# the 20 cities came in wider than its floor. For a centred 2°F band,
+# σ=1.3 implies P(yes)=55.8% when the truth is ~33% — the model was not
+# slightly miscalibrated, it was the wrong shape, which is why its own
+# claimed edge carried no information about realized P&L.
 #
-# Why it mattered: for a centred 2°F band, σ=1.3 implies P(yes)=55.8% when
-# the truth is ~33%. The model was not slightly miscalibrated, it was the
-# wrong shape — which is why its own claimed edge carried no information
-# about realized P&L across 4,374 fills (all buckets +3 to +9c/contract,
-# no monotonicity).
+# ---- 2026-10-06 RECALIBRATION. The 09-06 numbers were wrong. ----
+# `KXHIGH_market_snapshot.run_date` stores CENTRAL time with a UTC type
+# (see reference_kxhigh_snapshot_run_date_is_central). The original
+# calibration converted it as if it were UTC, so its lead arithmetic was
+# 5h off and its "first snapshot per city-day" sample silently MIXED run
+# slots. That produced a pooled σ of 2.40 and a day-of multiplier of
+# 0.876 — both shipped. Re-measured on 11,668 city-day-slot observations
+# keyed on the TRUE slot (raw hour + day gap, no tz conversion):
+#
+#     evening (20:02/23:02 CT, next-day market, variable=1)  σ = 2.102
+#     day-of  (05:02/07:02 CT, same-day market,  variable=0)  σ = 2.218
+#
+# So same-day error is LARGER, not smaller: the multiplier is 1.055, and
+# the old 0.876 had the sign inverted. The table base was also ~15% too
+# wide. σ is NOT seasonal (monthly evening σ 1.97–2.24, Oct 2.50), so
+# that is not the explanation. The direction of the original finding
+# stands — the floors were far too tight — it was over-corrected.
 #
 # The vendor spread is kept, but only as a WIDENER. A 2-vendor standard
 # deviation is a 1-degree-of-freedom estimate of vendor *agreement*, which
@@ -1196,31 +1226,40 @@ print(f"  applied to {_n_corr}/{len(combined_table)} rows; "
 # is only +0.35); it can say "both models are lost", it cannot say "this
 # forecast is unusually good".
 # =====================================================================
-# Realized error σ per city, evening run (~26h lead). ~120 city-days each.
+# Realized error σ per city at the EVENING slot. 248–291 city-days each,
+# 2026-05-01 → 10-05, preliminary-report rows excluded.
 MEASURED_SIGMA_F = {
-    "Seattle": 3.34, "San Francisco": 3.07, "Phoenix": 2.90,
-    "Oklahoma City": 2.89, "Denver": 2.83, "Boston": 2.80,
-    "Minneapolis": 2.61, "Washington DC": 2.22, "New Orleans": 2.20,
-    "Philadelphia": 2.19, "New York City": 2.15, "Atlanta": 2.13,
-    "Dallas": 2.11, "Los Angeles": 2.09, "Chicago": 1.94,
-    "Las Vegas": 1.93, "Houston": 1.91, "San Antonio": 1.75,
-    "Austin": 1.74, "Miami": 1.54,
+    "San Francisco": 2.81, "Oklahoma City": 2.73, "Boston": 2.64,
+    "Minneapolis": 2.53, "Seattle": 2.16, "Los Angeles": 2.15,
+    "New Orleans": 2.02, "Washington DC": 1.96, "Atlanta": 1.96,
+    "Philadelphia": 1.94, "Dallas": 1.94, "Denver": 1.93,
+    "New York City": 1.92, "Chicago": 1.83, "Phoenix": 1.79,
+    "San Antonio": 1.77, "Austin": 1.75, "Houston": 1.74,
+    "Las Vegas": 1.66, "Miami": 1.53,
 }
-MEASURED_SIGMA_DEFAULT_F = 2.40   # pooled, for a city not in the table
+# Pooled evening σ. Used for the four 2026-09-29 probe cities (San Diego,
+# Louisville, Trenton, Newark), which have only 10–12 city-days each.
+MEASURED_SIGMA_DEFAULT_F = 2.10
 
-# Convective days are harder to forecast: pooled σ 2.54°F on days whose NWS
-# short forecast mentions rain/showers/thunder/storms vs 2.30°F otherwise,
-# and 17 of the 19 cities with both samples agree. Applied as a pooled
-# multiplier rather than a per-city wet σ — several cities have <5 wet days
-# in-sample, so the city dimension comes from n≈120 and the wet dimension
-# from n=2,412. Mean error also runs +0.49°F warm on wet days (vs −0.03
-# dry); that half is left to the rolling bias correction above.
-WET_SIGMA_MULT = float(os.environ.get("WET_SIGMA_MULT", "1.057"))
-DRY_SIGMA_MULT = float(os.environ.get("DRY_SIGMA_MULT", "0.956"))
+# Convective days are harder to forecast, and by MORE at the evening lead
+# than same-day: wet/dry σ ratio 1.22 evening vs 1.09 same-day. Expressed
+# as multipliers on each slot's own base so the four measured cells
+# reproduce exactly:
+#     evening dry 2.10×0.914=1.92   evening wet 2.10×1.116=2.34
+#     day-of  dry 2.10×1.055×0.972=2.16   wet 2.10×1.055×1.058=2.34
+# Pooled rather than per-city: several cities have <5 wet days, so the
+# city dimension comes from n≈280 and the wet dimension from n=11,668.
+# Mean error also runs warm on wet days; the rolling bias correction above
+# owns that half.
+WET_SIGMA_MULT_EVENING = float(os.environ.get("WET_SIGMA_MULT_EVENING", "1.116"))
+DRY_SIGMA_MULT_EVENING = float(os.environ.get("DRY_SIGMA_MULT_EVENING", "0.914"))
+WET_SIGMA_MULT_DAYOF = float(os.environ.get("WET_SIGMA_MULT_DAYOF", "1.058"))
+DRY_SIGMA_MULT_DAYOF = float(os.environ.get("DRY_SIGMA_MULT_DAYOF", "0.972"))
 _WET_WORDS = ("rain", "shower", "thunder", "storm", "drizzle")
 
-# Day-of runs forecast ~15h out instead of ~26h: pooled σ 2.105 vs 2.402.
-DAYOF_SIGMA_MULT = float(os.environ.get("DAYOF_SIGMA_MULT", "0.876"))
+# Same-day runs are LESS accurate than the prior evening, not more:
+# σ 2.218 vs 2.102. Was 0.876 (inverted) until 2026-10-06.
+DAYOF_SIGMA_MULT = float(os.environ.get("DAYOF_SIGMA_MULT", "1.055"))
 
 # Hard floor. Not a modelling choice — just stops a bad table edit or a
 # multiplier typo from producing 100%/0% extremes.
@@ -1251,12 +1290,16 @@ combined_table['Is Wet'] = combined_table['NWS Short Conditions'].apply(
     lambda c: bool(c) and any(w in str(c).lower() for w in _WET_WORDS))
 combined_table['Measured Sigma'] = (
     combined_table['City'].map(MEASURED_SIGMA_F).fillna(MEASURED_SIGMA_DEFAULT_F))
-# variable==1 → evening run pricing tomorrow's market (the ~26h lead the
-# table was measured at). variable==0 → same-day market, shorter lead.
-_lead_mult = 1.0 if variable == 1 else DAYOF_SIGMA_MULT
+# variable==1 → evening run pricing tomorrow's market (the slot the table
+# was measured at, ×1.0). variable==0 → same-day market, which is LESS
+# accurate, not more (σ 2.218 vs 2.102) — hence a multiplier above 1.
+_is_evening_sigma = (variable == 1)
+_lead_mult = 1.0 if _is_evening_sigma else DAYOF_SIGMA_MULT
+_wet_mult = WET_SIGMA_MULT_EVENING if _is_evening_sigma else WET_SIGMA_MULT_DAYOF
+_dry_mult = DRY_SIGMA_MULT_EVENING if _is_evening_sigma else DRY_SIGMA_MULT_DAYOF
 combined_table['Sigma Lead Mult'] = _lead_mult
 combined_table['Sigma Wet Mult'] = np.where(
-    combined_table['Is Wet'], WET_SIGMA_MULT, DRY_SIGMA_MULT)
+    combined_table['Is Wet'], _wet_mult, _dry_mult)
 
 if SIGMA_MODEL == "legacy":
     combined_table['Effective Sigma'] = combined_table[
@@ -1277,8 +1320,8 @@ else:
         'vendor_spread', 'measured')
 
 print(f"\n========== FORECAST σ ({SIGMA_MODEL}) ==========")
-print(f"  lead: variable={variable} → ×{_lead_mult:g}   "
-      f"wet ×{WET_SIGMA_MULT:g} / dry ×{DRY_SIGMA_MULT:g}")
+print(f"  slot: {'evening' if _is_evening_sigma else 'same-day'} (variable={variable}) "
+      f"→ lead ×{_lead_mult:g}, wet ×{_wet_mult:g} / dry ×{_dry_mult:g}")
 print(f"  wet markets: {int(combined_table['Is Wet'].sum())}/{len(combined_table)}"
       f"   σ effective: mean={combined_table['Effective Sigma'].mean():.2f}°F"
       f"  min={combined_table['Effective Sigma'].min():.2f}"
@@ -1846,13 +1889,60 @@ price_count = list(range(0, 8))
 starting_contracts = 15
 
 # Night-run size multiplier: double size when orders rest overnight.
-# - variable==1: afternoon/evening run placing orders on tomorrow's market.
-# - variable==0 with early-morning hour (<5 CT): same-day market but still
-#   hours before the 9 AM CT close, so orders rest overnight-ish. Previously
-#   these runs used 1.0x and produced a smaller, asymmetric size vs. the
-#   evening run on the same market.
-is_night_run = variable == 1 or central_time.hour < 5
-night_size_mult = 2 if is_night_run else 1.0
+#
+# Was `variable == 1 or central_time.hour < 5`. The hour clause was a DST
+# time bomb: the cron is fixed UTC, so on 2026-11-01 the 10:02 UTC run
+# moves from 05:02 CDT to 04:02 CST, trips `hour < 5`, and would silently
+# double size on the 05:02 slot — the bot's most profitable run (+10 to
+# +12c/ct against the evening's +1.45) and the one carrying a live size
+# experiment, where it would compound to a 50-contract base. Nobody
+# decided that; the calendar would have.
+#
+# The clause has never fired under the current 01/04/10/12 UTC schedule
+# (earliest CT hour is 5), so keying off `variable` alone reproduces
+# today's behaviour exactly and is DST-proof. If you ever want to test a
+# bigger morning, do it deliberately via MORNING_NIGHT_MULT, not by
+# letting the clock drift into it.
+MORNING_NIGHT_MULT = float(os.environ.get("MORNING_NIGHT_MULT", "1.0"))
+is_night_run = (variable == 1)
+night_size_mult = 2 if is_night_run else MORNING_NIGHT_MULT
+
+# =====================================================================
+# MAKER BUFFER — 4c everywhere, 8c on the evening slot   (2026-10-06)
+# ---------------------------------------------------------------------
+# Filter B requires a rung to sit at least this far below the best NO bid.
+# It was 4c on every slot. Jul 1 - Oct 5, fills matched through their own
+# order id to the NO bid at placement:
+#
+#   offset    morning                evening
+#   4-7c      +7.34c/ct (51% vol)    -3.69c/ct (63% vol, -$767)
+#   8-12c    +10.58                  +8.80
+#   13-20c    +9.36                  +10.52
+#   >20c     +27.41                  +21.00
+#
+# So the evening's near-touch band is the only negative cell in the grid,
+# and it is where most of the evening's volume goes. Monthly it ran
+# -0.62 / -3.68 / -7.18 c/ct across Jul/Aug/Sep (Oct +7.95 on 952 ct, too
+# thin to count). A 9/29 session found the same thing from a different
+# join (-$837, -4.3c/ct). Mechanism: evening rungs rest near the touch for
+# twelve hours and get picked off as the next day's forecast firms up;
+# morning rungs rest two or three hours into an already-known day.
+#
+# The second reason is the cap. Evening refuses 44% of its wanted
+# contracts for want of headroom, so deleting the touch band does not just
+# remove -$767 — it hands that quota to the 8c+ rungs earning +8.8c. A
+# reallocation, not a subtraction.
+#
+# Morning KEEPS 4c: its 4-7c band earns +7.34c on half its volume.
+# Revert either slot independently via env; both default to the measured
+# recommendation.
+# =====================================================================
+MAKER_BUFFER_CENTS = int(os.environ.get("MAKER_BUFFER_CENTS", "4"))
+MAKER_BUFFER_CENTS_EVENING = int(os.environ.get("MAKER_BUFFER_CENTS_EVENING", "8"))
+_maker_buffer = (MAKER_BUFFER_CENTS_EVENING if RUN_SLOT == "evening"
+                 else MAKER_BUFFER_CENTS)
+print(f"[LADDER] maker buffer {_maker_buffer}c ({RUN_SLOT}) | "
+      f"night_size_mult={night_size_mult:g} (variable={variable})")
 
 # Per-city size multipliers — tilt size toward better-edge cities, shrink for worse ones.
 # Cities not listed default to 1.0x.
@@ -1967,6 +2057,31 @@ CITY_MAX_CONTRACTS = {
     "Trenton": 50,
     "Newark": 50,
 }
+
+# =====================================================================
+# MORNING-ONLY CAP MULTIPLIER                          (2026-10-06)
+# ---------------------------------------------------------------------
+# SHIPS INERT AT 1.0. Flip it with an env var once the evening maker
+# buffer has had a week to settle — deliberately not both at once.
+#
+# The ladder telemetry (KXHIGH_ladder_outcomes, 6,263 rows) measures what
+# the ladder WANTED, not what it filled, and the position cap is far
+# tighter than the 09-06 fills-based read suggested. Share of wanted
+# contracts the cap refuses:
+#     morning control 11.8%   morning treatment 35.0%
+#     evening control 44.3%   evening treatment 62.2%
+# Restricting to markets with zero carried position and zero resting
+# orders gives 10.2 / 33.7 / 44.2 / 62.0 — so it is one ladder outgrowing
+# its own ceiling in a single pass, not inventory piling up.
+#
+# The cap is therefore rationing hardest exactly where the edge is worst
+# (evening +1.45c/ct vs morning +10.03c). A GLOBAL raise would push size
+# into the losing slot — which is why this knob is morning-only. Applied
+# after the per-city cap, so the 150-cap cities and the 50-cap probe
+# cities scale in proportion.
+# =====================================================================
+MORNING_CAP_MULT = float(os.environ.get("MORNING_CAP_MULT", "1.0"))
+
 market_cutoff_probability = .2
 # print('hi')
 #################################################### CANCEL CONTRACT TIME
@@ -2430,8 +2545,9 @@ for index, row in combined_table.iterrows():
   _top_size = max(1, int(round(_base_contracts * night_size_mult * 1.0 * _city_mult)))
   _tail_inc = TAIL_INCREMENT_BY_CITY.get(row['City'], increment1)
   _inc_show = _tail_inc if is_tail else increment
-  _nm_reason = ("variable=1" if variable == 1 else
-                ("hour<5 CT" if central_time.hour < 5 else "daytime"))
+  # night_size_mult keys off `variable` alone since 2026-10-06 (DST fix), so
+  # the old "hour<5 CT" branch of this label would now be a lie.
+  _nm_reason = "variable=1 overnight" if variable == 1 else f"same-day ×{MORNING_NIGHT_MULT:g}"
   _arm_tag = f" [size-exp:{_size_arm}]" if SIZE_EXP_ENABLED else ""
   print(f"    Sizing:     base={_base_contracts}{_arm_tag} × night={night_size_mult:g}x "
         f"({_nm_reason}) × city={_city_mult:g}x ({row['City']})")
@@ -2440,6 +2556,11 @@ for index, row in combined_table.iterrows():
         f"increment={_inc_show}c)")
 
   _cap = CITY_MAX_CONTRACTS.get(row['City'], max_contracts)
+  # Morning-only cap multiplier (inert at 1.0) — see MORNING_CAP_MULT above.
+  # Keyed on RUN_SLOT, not on `variable`, so a west_late run keeps the base
+  # cap rather than inheriting the morning's.
+  if RUN_SLOT == "morning" and MORNING_CAP_MULT != 1.0:
+    _cap = int(round(_cap * MORNING_CAP_MULT))
   _headroom = _cap - float(row['position']) - float(row['resting_order_count'])
   print(f"    Position:   held={row['position']}, resting={row['resting_order_count']}, "
         f"cap={_cap} (headroom={_headroom:g})")
@@ -2447,7 +2568,8 @@ for index, row in combined_table.iterrows():
     print(f"    Cash:       filled=${_filled_cash:.2f} / ${MARKET_CASH_CAP_DOLLARS:.0f} cap "
           f"(headroom=${MARKET_CASH_CAP_DOLLARS - _filled_cash:.2f})")
 
-  print(f"    Ladder (maker-only post_only; filters: bid<no_offer AND bid<no_bid−3):")
+  print(f"    Ladder (maker-only post_only; filters: bid<no_offer AND "
+        f"no_bid−bid≥{_maker_buffer}c [{RUN_SLOT}]):")
 
   # ==================================================================
   # Ladder loop — collect per-rung records, render as a block after.
@@ -2522,10 +2644,12 @@ for index, row in combined_table.iterrows():
       _skip_cnt["bid>=no_offer"] += 1
       _skip_ct["bid>=no_offer"] += contracts
       continue
-    # Filter B: bid must be ≥4c below current best NO bid (maker buffer)
-    if not (bid_price < int(no_bid) - 3):
+    # Filter B: bid must sit at least MAKER_BUFFER_CENTS below the best NO
+    # bid. 4c everywhere until 2026-10-06; now 8c on the evening slot only
+    # (see MAKER_BUFFER_CENTS above).
+    if not ((int(no_bid) - bid_price) >= _maker_buffer):
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
-                     f'bid≥no_bid−3({int(no_bid) - 3})'))
+                     f'bid>no_bid−{_maker_buffer}({int(no_bid) - _maker_buffer})'))
       _skip_cnt["bid>=no_bid-3"] += 1
       _skip_ct["bid>=no_bid-3"] += contracts
       continue
@@ -2785,7 +2909,8 @@ for index, row in combined_table.iterrows():
     elif _skip_cnt["bid>=no_bid-3"] == len(_rungs):
       _reason = "no rung is ≥4c below current NO bid (market too tight for maker)"
     elif _skip_cnt["bid>=no_offer"] + _skip_cnt["bid>=no_bid-3"] == len(_rungs):
-      _reason = "every rung either crosses offer or fails the 4c maker buffer"
+      _reason = (f"every rung either crosses offer or fails the "
+                 f"{_maker_buffer}c maker buffer")
     elif _skip_cnt["cash_cap"] == len(_rungs):
       _reason = f"cash cap reached (${MARKET_CASH_CAP_DOLLARS:.0f}/market)"
     elif _skip_cnt["position_cap"] > 0 and _skip_cnt["order_failed"] == 0:
