@@ -93,6 +93,9 @@ imm._LADDER_ASKS_STATE["on_at"] = None
 # arms it.
 _LADDER_HOUR_MULT_CODE_DEFAULT = imm.SPORTS_LADDER_HOUR_MULT
 imm.SPORTS_LADDER_HOUR_MULT = 0.0
+# the daily series kept on the quiet hours (2026-10-06): TestQuietDailyMembers
+_QUIET_DAILY_SERIES_CODE_DEFAULT = imm.QUIET_DAILY_SERIES
+_QUIET_RAIN_PERIOD_CODE_DEFAULT = imm.QUIET_RAIN_PERIOD
 
 
 def setUpModule():
@@ -9622,6 +9625,86 @@ class TestSportsLadderHourMult(unittest.TestCase):
         self.assertEqual(imm.hour_size_mult("KXNFLLADDERREC", self.et(2026, 10, 6, 12)), 1.0)
         self.assertEqual(imm.hour_size_mult("KXNFLLADDERREC", self.et(2026, 10, 6, 3)), 3.0)
         self.assertEqual(imm.hour_size_mult("KXNFLLADDERREC", self.et(2026, 10, 6, 19)), 1.0)
+
+
+class TestQuietDailyMembers(unittest.TestCase):
+    """Jack 2026-10-06: "does KXTRUMPAPPROVE move much overnight? if not then
+    include it as part of 3x" / "same question on weekend and period rain" --
+    KXTRUMPAPPROVE and the period-rain family take the global quiet hours
+    although daily; nothing else about their hour part changes, and the
+    weekend family stays out. October => EDT (UTC-4)."""
+
+    def setUp(self):
+        self._saved = {k: getattr(imm, k) for k in (
+            "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM", "HOUR_SIZE_MULTS",
+            "HOUR_SIZE_MULTS_NEXT", "HOUR_SIZE_MULT_FROM", "SAT_SIZE_MULT",
+            "QUIET_DAILY_SERIES", "QUIET_RAIN_PERIOD")}
+        imm.EVENING_SIZE_MULTS = imm._parse_hour_mults("18-21:1.5")
+        imm.EVENING_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0")
+        imm.HOUR_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
+        imm.SAT_SIZE_MULT = 1.5
+        imm.QUIET_DAILY_SERIES = frozenset({"KXTRUMPAPPROVE"})
+        imm.QUIET_RAIN_PERIOD = True
+        self._dyn = mock.patch.object(imm, "DAILY_SERIES_DYNAMIC",
+                                      {"KXTRUMPAPPROVE": {}, "KXYTTOPVIDEO2D": {}})
+        self._dyn.start()
+        self._gate = mock.patch.object(imm, "gated_sat_mult", return_value=None)
+        self._gate.start()
+
+    def tearDown(self):
+        self._dyn.stop()
+        self._gate.stop()
+        for k, v in self._saved.items():
+            setattr(imm, k, v)
+
+    @staticmethod
+    def et(y, mo, d, h, mi=0):
+        return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
+
+    def test_code_defaults(self):
+        self.assertEqual(_QUIET_DAILY_SERIES_CODE_DEFAULT, frozenset({"KXTRUMPAPPROVE"}))
+        self.assertTrue(_QUIET_RAIN_PERIOD_CODE_DEFAULT)
+
+    def test_trumpapprove_quiet_hours_only(self):
+        s = "KXTRUMPAPPROVE"
+        self.assertTrue(imm.is_daily_series(s))
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 0)), 3.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 6, 59)), 3.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 8, 59)), 3.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 9)), 1.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 19)), 1.0)   # no evening
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 10, 3)), 3.0)   # no Saturday
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 10, 12)), 1.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 2, 9, 30)), 2.0)  # old window
+
+    def test_period_rain(self):
+        s = imm.RAIN_PERIOD_ARCHETYPE
+        self.assertTrue(imm.rain_period_member(s))
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 0, 30)), 3.0)  # not halved
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 4)), 3.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 20)), 1.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 10, 4)), 3.0)
+
+    def test_other_dailies_untouched(self):
+        for s in ("KXYTTOPVIDEO2D", "KXAAAGASD", "KXTEMPNYCH"):
+            self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 6, 4)), 1.0, s)
+        self.assertEqual(imm.hour_size_mult("KXRAINWKND", self.et(2026, 10, 6, 4)), 1.0)
+        self.assertEqual(imm.hour_size_mult("KXRAINWKND", self.et(2026, 10, 6, 0, 30)), 0.5)
+        self.assertEqual(imm.hour_size_mult("KXRAIN", self.et(2026, 10, 6, 4)), 1.0)
+
+    def test_knobs_off(self):
+        imm.QUIET_DAILY_SERIES = frozenset()
+        imm.QUIET_RAIN_PERIOD = False
+        self.assertEqual(imm.hour_size_mult("KXTRUMPAPPROVE", self.et(2026, 10, 6, 4)), 1.0)
+        self.assertEqual(imm.hour_size_mult(imm.RAIN_PERIOD_ARCHETYPE,
+                                            self.et(2026, 10, 6, 4)), 1.0)
+
+    def test_floor_projection_sees_quiet_hours(self):
+        prof = dict(imm.size_mult_profile("KXTRUMPAPPROVE", self.et(2026, 10, 6, 0), 1.0))
+        self.assertAlmostEqual(prof[3.0], 9 / 24, places=9)
+        self.assertAlmostEqual(prof[1.0], 15 / 24, places=9)
 
 
 class TestYieldSizeMode(unittest.TestCase):

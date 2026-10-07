@@ -999,10 +999,12 @@ RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN = _env_int(
 # payout floor, and T15/T20 ~$2. The size_mult wire doubles the rungs, the
 # per-market cap (150 -> 300 net) and the per-event cap (1,000 -> 2,000)
 # together, and the floor projection sees the doubled ladder. As "daily"
-# KXRAIN the family still takes no quiet-hours / Saturday / yield size, and
-# since 2026-10-05 not the KXRAIN 7pm-01:59 ET halving either (Jack: "isnt
-# at 2x" -- it rested the season at x1 every evening; rain_period_member in
-# _hour_window_mult): x2 at every hour. The snow monthlies take the same x2
+# KXRAIN the family still takes no Saturday / yield size, and since
+# 2026-10-05 not the KXRAIN 7pm-01:59 ET halving either (Jack: "isnt at 2x"
+# -- it rested the season at x1 every evening; rain_period_member in
+# _hour_window_mult): x2 at every hour, x6 in the global quiet hours since
+# 2026-10-06 (QUIET_RAIN_PERIOD, Jack: "same question on ... period rain" --
+# the books barely move overnight). The snow monthlies take the same x2
 # (SNOW_MONTHLY_SIZE_MULT); no hour window ever matched them.
 # IMM_RAIN_PERIOD_SIZE_MULT=1.0 reverts (env => task-level restart).
 RAIN_PERIOD_SIZE_MULT = _env_float("IMM_RAIN_PERIOD_SIZE_MULT", 2.0)
@@ -1408,6 +1410,42 @@ SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
 # below: the whole pattern family takes it. 0 = off (the global window).
 SPORTS_LADDER_HOUR_MULT = _env_float("IMM_SPORTS_LADDER_HOUR_MULT", 3.0)
 
+# DAILY SERIES BACK ON THE QUIET HOURS (Jack 2026-10-06: "does
+# KXTRUMPAPPROVE move much overnight? if not then include it as part of 3x",
+# then "same question on weekend and period rain"). Members take the GLOBAL
+# quiet-hours window (0-8 ET x3 from 10/05) although they classify daily --
+# the quiet hours ONLY: no evening x1.5, no Saturday (saturday_size_mult
+# still skips every daily), and a per-series window above still wins the
+# hours it names. Measured on the 9/10-10/06 cycle logs, the public tape
+# (markets closing since 9/01, marked to settlement) and our fills:
+#   * KXTRUMPAPPROVE -- daily by the feed classifier since 9/13, so the quiet
+#     hours its 9/26 enrollment counted on never applied. Overnight (00:00-
+#     06:59 ET on the read day, up to the 07:00 cutoff) the book moved 1.0c
+#     per ticker-hour vs 1.9c in the D-1 day hours; tape makers there made
+#     +2.3c/contract to settlement (positive 22 of 34 nights) vs -1.7c by
+#     day and -0.9c in the 07-13 update window; our own overnight fills made
+#     +3.4c on 6.9k contracts (+$234; -1.8c by day, -2.9c evening) -- with
+#     the modelled rent, $18 net per 1k resting contract-hours vs $4 by day.
+#   * period rain (rain_period_member: KXRAINNAPAM and its clones): the
+#     books barely move overnight (0.1c per ticker-hour, none >= 2c) -- on
+#     10/04-10/06 only, with no overnight fills of ours and nothing settled.
+#   * NOT the weekend family (KXRAINWKND): its book moves as much overnight
+#     as by day (0.8c, ~15% of ticker-hours >= 2c either way), tape makers
+#     lose more there (-1.9c to settlement vs -0.4c by day) and our
+#     overnight fills (-9.6c) about cancel the rent -- x3 would scale a ~$0
+#     block.
+# IMM_QUIET_DAILY_SERIES = exact series names ("" = none);
+# IMM_QUIET_RAIN_PERIOD=0 takes the period family back out.
+QUIET_DAILY_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_QUIET_DAILY_SERIES", "KXTRUMPAPPROVE").split(",") if s.strip())
+QUIET_RAIN_PERIOD = os.environ.get("IMM_QUIET_RAIN_PERIOD", "1") == "1"
+
+
+def quiet_daily_member(series: str) -> bool:
+    """A daily-classified series that still takes the global quiet hours."""
+    return series in QUIET_DAILY_SERIES or (
+        QUIET_RAIN_PERIOD and rain_period_member(series))
+
 
 def _hour_window_mult(series: str, now_utc: datetime) -> float:
     """The hour-of-day part of hour_size_mult(): 1.0 outside configured
@@ -1434,8 +1472,11 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     # with the 0-9am ET extension): the quiet hours are quiet for long-dated
     # books, while a daily's overnight fills are informed by its own print
     # (gas dailies at 8-9am ET fill at 0.093/contract-hour, 3.2c lost per
-    # fill; rain 11.8c). Their per-series windows above still apply.
+    # fill; rain 11.8c). Their per-series windows above still apply, and the
+    # QUIET_DAILY members take the global window's quiet hours (2026-10-06).
     if is_daily_series(series):
+        if quiet_daily_member(series):
+            return global_hour_mults(et.date()).get(hour, 1.0)
         return 1.0
     # Open-scan members (2026-09-05) never take the quiet-hours doubling:
     # the 3-7am ET x2 was measured on the enrolled families' fill data, and
@@ -6160,18 +6201,20 @@ for _s in os.environ.get("IMM_RATES_EXTRA_SERIES", _DEFAULT_RATES_EXTRA_SERIES).
 # undercuts it (checked on 26SEP27). What this does NOT cover: inventory
 # taken overnight still rides through the morning update to the 1:00 PM ET
 # snapshot (positions ride, standard cutoff semantics), and the quiet-hour
-# size multiplier (00:00-09:00 ET) applies right up to 07:00 -- the
-# overnight flow measured benign. IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET /
+# size multiplier applies right up to 07:00 -- the overnight flow measured
+# benign. (It did NOT until 2026-10-06: the feed classifier had made the
+# series daily on 9/13, and dailies skip the global window, so it rested
+# x1 every hour; QUIET_DAILY_SERIES puts the quiet hours back, the Saturday
+# multiplier stays off as for every daily.) IMM_TRUMPAPPROVE_CUTOFF_HOUR_ET /
 # IMM_TRUMPAPPROVE_CUTOFF_MIN_ET move it.
 # x3 FAMILY SIZE (Jack 2026-09-26 pm: "give KXTRUMPAPPROVE markets a 3x
 # multiplier, like LADDER/ESCALATOR"): the ladders' size_mult wire --
 # applied_mention_mult scales the rungs, the per-market and per-event caps
 # and the skew knees together, and the estimator's hypothetical ladder, so
 # the payout-floor projection sees the x3 size. With the launcher geometry
-# (20-lot rung, 150 / 1,000 caps): 60 on a weekday, 90 Saturday, 120 in
-# quiet hours up to the 07:00 cutoff, 180 when the settlement day is a
-# Saturday (00:00-07:00 ET = Saturday x quiet hours; checked with the
-# launcher env); caps 450 per market / 3,000 net per event. Only the size
+# (20-lot rung, 150 / 1,000 caps): 60 a side, 180 in the 0-8 ET quiet hours
+# (x3 since 10/05) up to the 07:00 cutoff, no Saturday step (a daily
+# series); caps 450 per market / 3,000 net per event. Only the size
 # -- not the ladders' 1-99c band or $1.20 entry bar.
 # IMM_TRUMPAPPROVE_SIZE_MULT=1.0 reverts.
 SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
@@ -22413,7 +22456,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if HOUR_SIZE_MULTS:
         log(f"[IMM] hour-size multipliers (ET hour -> x, long-dated only): "
             f"{dict(sorted(HOUR_SIZE_MULTS.items()))}; excluded prefixes: "
-            f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'} + daily families")
+            f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'} + daily families "
+            f"(quiet hours kept: {','.join(sorted(QUIET_DAILY_SERIES)) or '(none)'}"
+            f"{' + period rain' if QUIET_RAIN_PERIOD else ''})")
     for _knob, _has_next, _from in (
             ("IMM_HOUR_SIZE_MULT", bool(HOUR_SIZE_MULTS_NEXT), HOUR_SIZE_MULT_FROM),
             ("IMM_EARNINGS_SIZE_MULT", EARNINGS_SIZE_MULT_NEXT > 0, EARNINGS_SIZE_MULT_FROM)):
