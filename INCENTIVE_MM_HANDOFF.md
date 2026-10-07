@@ -8782,3 +8782,17 @@ Tests:
   22:45 ET the evening before.
 - TestSingleWordUnique (2).
 - Suite 2,288 OK.
+
+## 2026-10-07 — Critics Choice: the 8 TV categories listed after the first 25 get the Dec 4 row (Jack)
+
+Jack: "why is KXCRITICSCOMEDYACTR-27, KXCRITICSCOMEDYSUPACTR-27 not quoted".
+The KXCRITICS family is table-only (exact rows in _AWARDS_DATES_DEFAULT; a
+category without one stands down fail closed), built from the 25 series lit
+by 10/07 00:02Z. Kalshi then listed 8 more TV categories -- COMEDYACTR,
+COMEDYSUPACTO, COMEDYSUPACTR, LSERIES, LSERIESACTO, LSERIESACTR,
+LSERIESSUPACTO, LSERIESSUPACTR -- and every start since 02:17Z logged
+"pre-event stand-down needs the event start ... no usable date". They join
+_CRITICS_OTHER_27 (Dec 4 2026 nominations -> out Nov 3), like COMEDY, DRAMA
+and the other series acting rows. Test: the family test's list.
+Also: test_launcher_freezes_no_monthly_rain now expects KXDIESELW in the
+launcher blocklist (80daf48 had left main red on it).

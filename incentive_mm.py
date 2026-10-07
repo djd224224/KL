@@ -10989,12 +10989,18 @@ _OSCAR_SHORTLIST_SERIES_27 = (
 # 32nd Critics Choice categories by first narrowing: the crafts' shortlist
 # (conservative Nov 16 2026, see above) or the Dec 4 2026 nominations.
 # Exact rows, no family glob: a category Kalshi adds later stands down until
-# someone gives it a date.
+# someone gives it a date. 2026-10-07 (Jack: "why is KXCRITICSCOMEDYACTR-27,
+# KXCRITICSCOMEDYSUPACTR-27 not quoted"): 8 TV categories listed after the
+# first 25 -- the rest of comedy acting and the limited series with its
+# acting -- stood down on "no usable date" from 02:17Z; they take the Dec 4
+# row like the other TV categories.
 _CRITICS_CRAFTS_27 = ("CINE", "COST", "EDIT", "HAIR", "PROD", "SCORE", "VIS")
 _CRITICS_OTHER_27 = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR", "ASPLAY",
                      "OSPLAY", "ANIM", "COM", "FOREIGN", "COMEDY", "COMEDYACTO",
+                     "COMEDYACTR", "COMEDYSUPACTO", "COMEDYSUPACTR",
                      "DRAMA", "DRAMAACTO", "DRAMAACTR", "DRAMASUPACTO",
-                     "DRAMASUPACTR")
+                     "DRAMASUPACTR", "LSERIES", "LSERIESACTO", "LSERIESACTR",
+                     "LSERIESSUPACTO", "LSERIESSUPACTR")
 _AWARDS_DATES_DEFAULT = (
     "KXGRAMMY-*69=2026-11-16,KXNATBOOKAWARDS-*26=2026-10-06,"
     + "".join(f"KXCRITICS{_c}-27=2026-11-16," for _c in _CRITICS_CRAFTS_27)

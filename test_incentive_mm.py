@@ -1684,7 +1684,10 @@ class TestScreen(unittest.TestCase):
         crafts = ("CINE", "COST", "EDIT", "HAIR", "PROD", "SCORE", "VIS")
         rest = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR", "ASPLAY",
                 "OSPLAY", "ANIM", "COM", "FOREIGN", "COMEDY", "COMEDYACTO",
-                "DRAMA", "DRAMAACTO", "DRAMAACTR", "DRAMASUPACTO", "DRAMASUPACTR")
+                "DRAMA", "DRAMAACTO", "DRAMAACTR", "DRAMASUPACTO", "DRAMASUPACTR",
+                # 2026-10-07: the 8 TV categories listed after the first 25
+                "COMEDYACTR", "COMEDYSUPACTO", "COMEDYSUPACTR", "LSERIES",
+                "LSERIESACTO", "LSERIESACTR", "LSERIESSUPACTO", "LSERIESSUPACTR")
         names = ["KXCRITICS" + c for c in crafts + rest]
         prev_only = imm.ALLOWLIST_ONLY
         try:
@@ -10982,7 +10985,8 @@ class TestRainMonthlyGate(unittest.TestCase):
         env = dict(re.findall(r"set ([A-Za-z_][A-Za-z0-9_]*)=([^&]*)&&", chunks[-1]))
         blocked = [b for b in env["IMM_BLOCKLIST"].split(",") if b]
         self.assertEqual([b for b in blocked if b.startswith("KXRAIN")], [], blocked)
-        self.assertEqual(set(blocked), {"KXCRYPTOSTRUCTURE", "KXAAAGASW"})
+        # KXDIESELW since 80daf48 (Jack 2026-10-06: "Block diesel weeklies")
+        self.assertEqual(set(blocked), {"KXCRYPTOSTRUCTURE", "KXAAAGASW", "KXDIESELW"})
 
     def test_gate_off_takes_the_family_out(self):
         import subprocess
