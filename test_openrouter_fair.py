@@ -109,6 +109,35 @@ class TestModel(unittest.TestCase):
         thin = flat_daily(self.today - timedelta(days=1), 10)
         self.assertIsNone(orf.window_fair(thin, date(2026, 9, 21), date(2026, 9, 27), self.today))
 
+    def test_a_spike_day_is_capped_in_the_run_rate_not_the_known_days(self):
+        # 2026-10-06: a launch day (+50% on its prior-7 median) counts in full
+        # toward the window it sits in, but the run rate reads it at 1 +
+        # OR_SPIKE_CAP (1.15) x that median
+        spike = dict(self.daily)
+        sp = self.today - timedelta(days=2)                      # 9/25, known
+        spike[sp] = 30.0 * T
+        with mock.patch.object(orf, "OR_SPIKE_CAP", 0.15):
+            run = orf.cap_spikes(spike)
+            self.assertAlmostEqual(run[sp] / T, 23.0)
+            self.assertEqual(run[sp - timedelta(days=1)], spike[sp - timedelta(days=1)])
+            first = min(spike)                                    # no 7 days before it
+            self.assertEqual(run[first], spike[first])
+            f = orf.window_fair(spike, date(2026, 9, 21), date(2026, 9, 27), self.today)
+        self.assertAlmostEqual(f["known_sum"], 130.0)             # actual, uncapped
+        self.assertEqual(f["spike_capped"], ["2026-09-25"])
+        base = (6 * 20.0 + 23.0) / 7
+        g = (base / 20.0 - 1.0) * orf.OR_TREND_WEIGHT
+        want = 130.0 + base * (1 + g) ** (4 / 7) + orf.OR_BIAS_WEIGHT * orf.BIAS[1] * base
+        self.assertAlmostEqual(f["base"], round(base, 4), places=4)
+        self.assertAlmostEqual(f["mu"], want, places=3)
+        # off: the old model, the spike in the base
+        with mock.patch.object(orf, "OR_SPIKE_CAP", 0.0):
+            g0 = orf.window_fair(spike, date(2026, 9, 21), date(2026, 9, 27), self.today)
+            self.assertEqual(orf.cap_spikes(spike), spike)
+        self.assertAlmostEqual(g0["base"], round((6 * 20.0 + 30.0) / 7, 4), places=4)
+        self.assertEqual(g0["spike_capped"], [])
+        self.assertGreater(g0["mu"], f["mu"])
+
     def test_growth_raises_the_remaining_days(self):
         grow = {}
         for i in range(40):

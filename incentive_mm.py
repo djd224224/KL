@@ -8365,7 +8365,12 @@ def or_gate_reason(ticker: str, now_ts: float,
 # week-to-date -- or the flow since a break in the chart's mix -- pulled 0.3
 # toward the last 6h, sigma vol-only, and a revision of the chart's counts
 # marks the family lag for 6h (openrouter_share_fair.SHARE_RUN_PULL,
-# detect_break, chart_revision).
+# detect_break, chart_revision). 2026-10-06 (Jack: "implement all 3", after
+# z-ai's 21% -> 8% step at 10:15 ET cost -$107): breaks are found on a 1h
+# window (11:06 ET that day, not 12:44) and the family stands aside until
+# 3h of chart time sit behind the break (SHARE_BREAK_HOLD_HOURS) -- the
+# "OpenRouter feed stalled (break in the mix ...)" stand-aside lines. The
+# token fair caps launch-day spikes in its run rate (OR_SPIKE_CAP, 15%).
 SHARE_FAIR_ENABLE = _SHARE_LIVE
 SHARE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_SHARE_FAIR_SERIES", _DEFAULT_OR_SHARE_SERIES).split(",") if s.strip())

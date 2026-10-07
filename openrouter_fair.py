@@ -24,7 +24,9 @@ Model for a window of days (the event's week or month):
             base * weekday_factor(day) * (1 + g * OR_TREND_WEIGHT) ** ((h + 3) / 7)
             + OR_BIAS_WEIGHT * BIAS[r] * base
     sigma = OR_SIGMA_MULT * RMSE[r] * base
-where base = mean of the last 7 completed days, weekday_factor = that
+where (on the days through cap_spikes: none above 1 + OR_SPIKE_CAP x the
+median of the 7 before it) base = mean of the last 7 completed days,
+weekday_factor = that
 weekday's share of its trailing 4 weeks, g = last-7 over prior-7 growth
 (clipped -10%..+20%), h = days ahead, r = remaining days. RMSE[r] and
 BIAS[r] are MEASURED in units of one day's volume by a backtest over
@@ -84,6 +86,18 @@ OR_VINTAGE_FILE = os.environ.get(
 OR_TREND_WEIGHT = _env_float("IMM_OR_TREND_WEIGHT", 0.5)
 OR_BIAS_WEIGHT = _env_float("IMM_OR_BIAS_WEIGHT", 1.0)
 OR_SIGMA_MULT = _env_float("IMM_OR_SIGMA_MULT", 1.2)
+# SPIKE CAP (Jack 2026-10-06: "implement all 3"): in the run-rate inputs --
+# base, trend and weekday factors, never the window's own known days, which
+# settle at their actual totals -- a day counts at most (1 + OR_SPIKE_CAP) x
+# the median of the 7 days before it, so one launch day (8/24-8/26, GLM-5.3-
+# Flash: +31-38% on that median) does not run on into the forecast.
+# Backtest 8/03-10/04, forecasts at every day of each window: weekly RMSE
+# 5.34T -> 4.61T, 4-week 36.2 -> 29.2 (10%: 5.02 / 28.9; 20%: 4.67 / 30.8);
+# the mean error goes a little lower (-1.43 -> -2.04T weekly) -- the BIAS
+# table below was fit uncapped. 10/05 (+8.1%) is NOT capped at 15%: that
+# week's miss was intraday information the completed days do not hold.
+# 0 = off.
+OR_SPIKE_CAP = _env_float("IMM_OR_SPIKE_CAP", 0.15)
 HISTORY_DAYS = 70
 HTTP_TIMEOUT = 30
 T = 1e12
@@ -301,10 +315,28 @@ def weekday_factor(daily: Dict[date, float], d: date, asof: date,
     return statistics.mean(vals) if vals else 1.0
 
 
+def cap_spikes(daily: Dict[date, float], cap: Optional[float] = None) -> Dict[date, float]:
+    """`daily` with each day held to at most (1 + cap) x the median of the 7
+    days before it (raw values; days without 7 before them as they are).
+    cap <= 0 -> unchanged (OR_SPIKE_CAP when None)."""
+    cap = OR_SPIKE_CAP if cap is None else cap
+    if cap <= 0:
+        return dict(daily)
+    out: Dict[date, float] = {}
+    for d in sorted(daily):
+        prior = [daily[d - timedelta(days=i)] for i in range(1, 8)
+                 if d - timedelta(days=i) in daily]
+        out[d] = (min(daily[d], (1.0 + cap) * statistics.median(prior))
+                  if len(prior) == 7 else daily[d])
+    return out
+
+
 def window_fair(daily: Dict[date, float], start: date, end: date,
                 today: date) -> Optional[dict]:
     """N(mu, sigma) in T for the window's total as of `today` (days before
-    today are completed). None without 14 completed days of history."""
+    today are completed). None without 14 completed days of history. The
+    known days count at their actual totals; the run rate reads them through
+    cap_spikes."""
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
     last7 = [today - timedelta(days=i) for i in range(1, 8)]
     prev7 = [today - timedelta(days=i) for i in range(8, 15)]
@@ -312,14 +344,16 @@ def window_fair(daily: Dict[date, float], start: date, end: date,
         return None
     known = [x for x in days if x < today and x in daily]
     remaining = [x for x in days if x not in known]
-    base = statistics.mean(daily[x] for x in last7)
-    g = statistics.mean(daily[x] for x in last7) / max(
-        1.0, statistics.mean(daily[x] for x in prev7)) - 1.0
+    run = cap_spikes({k: v for k, v in daily.items() if k < today})
+    capped = sorted(x for x in last7 + prev7 if run[x] < daily[x])
+    base = statistics.mean(run[x] for x in last7)
+    g = statistics.mean(run[x] for x in last7) / max(
+        1.0, statistics.mean(run[x] for x in prev7)) - 1.0
     g = max(-0.10, min(0.20, g)) * OR_TREND_WEIGHT
     mu = sum(daily[x] for x in known)
     for x in remaining:
         h = max(1, (x - today).days + 1)
-        mu += base * weekday_factor(daily, x, today) * (1.0 + g) ** ((h + 3) / 7.0)
+        mu += base * weekday_factor(run, x, today) * (1.0 + g) ** ((h + 3) / 7.0)
     r = min(len(remaining), len(RMSE) - 1)
     if len(remaining) > len(RMSE) - 1:      # beyond the table: extend linearly
         r_extra = len(remaining) - (len(RMSE) - 1)
@@ -332,7 +366,8 @@ def window_fair(daily: Dict[date, float], start: date, end: date,
     return {"mu": round(mu / T, 4), "sigma": round(sigma / T, 4),
             "known": len(known), "days": len(days),
             "known_sum": round(sum(daily[x] for x in known) / T, 4),
-            "base": round(base / T, 4), "complete": not remaining}
+            "base": round(base / T, 4), "complete": not remaining,
+            "spike_capped": [x.isoformat() for x in capped]}
 
 
 def _read_json(path: str) -> dict:
@@ -407,7 +442,7 @@ def write_fair_file(path: str, daily: Optional[Dict[date, float]] = None,
                                   for d, v in sorted(daily.items())[-21:]},
                    "model": {"trend_weight": OR_TREND_WEIGHT,
                              "bias_weight": OR_BIAS_WEIGHT,
-                             "sigma_mult": OR_SIGMA_MULT}},
+                             "sigma_mult": OR_SIGMA_MULT, "spike_cap": OR_SPIKE_CAP}},
                   fh, indent=1, sort_keys=True)
     os.replace(tmp, path)
     return len(entries), len(missing)

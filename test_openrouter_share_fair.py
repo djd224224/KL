@@ -622,8 +622,9 @@ class TestBreaks(unittest.TestCase):
         # a launch at the week's turn: the week-to-date already holds it
         snaps, cur = hourly_week(self.W, 40, lambda h: {"z": 0.21, "Others": 0.79})
         self.assertIsNone(osf.detect_break(snaps, self.W, self._now(snaps), cur))
-        # the week's first hours: no base to break from
-        snaps, cur = hourly_week(self.W, 8, self.stealth_gone(6))
+        # the week's first hours: no base to break from (the window's 1h
+        # leaves 5h before it, under SHARE_BREAK_MIN_BASE_HOURS)
+        snaps, cur = hourly_week(self.W, 6, self.stealth_gone(5), step_min=10)
         self.assertIsNone(osf.detect_break(snaps, self.W, self._now(snaps), cur))
         # and none again from the break itself once the flow since it is steady
         snaps, cur = hourly_week(self.W, 48, self.stealth_gone(30), step_min=10)
@@ -740,6 +741,40 @@ class TestWriterBreaks(unittest.TestCase):
                            chart=(self.prior + [week(snap["x"], snap["ys"])], snap["t"]),
                            events={})
         self.assertEqual(d["breaks"], {})
+
+    def test_a_fresh_break_stands_the_family_aside_until_its_hold_ends(self):
+        # 2026-10-06: from the break's detection until SHARE_BREAK_HOLD_HOURS
+        # (3) of chart time after its change point (06:00Z), entries lag
+        brk_t = datetime(2026, 10, 6, 6, tzinfo=timezone.utc).timestamp()
+        seen = None
+        for i in range(len(self.snaps)):
+            d = self._write_at(i)
+            b = d["breaks"].get("2026-10-05")
+            if b and seen is None:
+                seen = self.snaps[i]["t"]
+                self.assertEqual(b["t"], brk_t)
+                self.assertFalse(d["data_current"])
+                self.assertIn("break in the mix at 10-06 06:00Z (s 10.0% -> 0.0%); "
+                              "standing aside to 09:00Z", d["lag_reason"])
+                self.assertTrue(d["entries"]["KXASHARE-26OCT12"]["lag"])
+            if seen is not None:
+                in_hold = self.snaps[i]["t"] - brk_t < 3 * 3600
+                self.assertEqual(d["data_current"], not in_hold, i)
+            if self.snaps[i]["t"] > brk_t + 4 * 3600:
+                break
+        self.assertLess(seen - brk_t, 3600 + 1)            # the 1h window: within the hour
+        # hold 0: the break re-anchors but the family keeps quoting
+        old = osf.SHARE_BREAK_HOLD_HOURS
+        osf.SHARE_BREAK_HOLD_HOURS = 0
+        try:
+            os.remove(self.path)
+            j = next(k for k, h in enumerate(self.snaps) if h["t"] == seen)
+            for k in range(j - 3 * 6, j + 1):
+                d = self._write_at(k)
+        finally:
+            osf.SHARE_BREAK_HOLD_HOURS = old
+        self.assertTrue(d["data_current"])
+        self.assertEqual(d["breaks"]["2026-10-05"]["t"], brk_t)
 
     def test_revision_stands_the_family_aside_and_anchors_after_it(self):
         for i in range(3 * 20):

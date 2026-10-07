@@ -30,7 +30,8 @@ after):
             2026-10-05 s_a = A_a + SHARE_RUN_PULL (L_a - A_a) whenever the
             snapshots cover the last SHARE_RUN_HOURS (6): L_a the chart's
             share over those hours, A_a the anchor -- the week-to-date, or
-            the flow since a break in the mix (see detect_break). The blend
+            the flow since a break in the mix (see detect_break; the family
+            stands aside for SHARE_BREAK_HOLD_HOURS after one). The blend
             is only the fallback; R keeps the blend.
   mu_a    = 100 (K_a + r R s_a) / (K_T + r R)
   sigma_a = SHARE_SIGMA_MULT sqrt((vol_a (r + gap) / 7)^2
@@ -129,7 +130,17 @@ SHARE_RUN_PULL = _env_float("IMM_SHARE_RUN_PULL", 0.3)
 # anchor holds SHARE_BREAK_MIN_BASE_HOURS before the window. The anchor
 # then moves to the change point; until SHARE_BREAK_MIN_HOURS of flow sit
 # behind it the run rate is the last hours alone.
-SHARE_BREAK_WINDOW_HOURS = _env_float("IMM_SHARE_BREAK_WINDOW_HOURS", 3)
+# 2026-10-06 (Jack: "implement all 3", after z-ai's 21% -> 8% step at 10:15
+# ET): the window is 1h, not 3h. On every stored snapshot 10/04-10/07 (790)
+# it finds the same two breaks and nothing else, 56 min (stealth) and 1h38m
+# (z-ai, 11:06 ET instead of 12:44) sooner; 21 of the 23 share fills that
+# day's step cost (-$95 of -$107) came after 11:06. And the family STANDS
+# ASIDE (entries lag) until SHARE_BREAK_HOLD_HOURS of chart time have passed
+# since the change point: before that the run rate is mostly pre-break
+# flow (at 11:06 the last 6h held z-ai at ~18% against a live 8%), the
+# exact mispricing the book was buying. 0 = quote through on the last hours.
+SHARE_BREAK_WINDOW_HOURS = _env_float("IMM_SHARE_BREAK_WINDOW_HOURS", 1)
+SHARE_BREAK_HOLD_HOURS = _env_float("IMM_SHARE_BREAK_HOLD_HOURS", 3)
 SHARE_BREAK_ABS_PP = _env_float("IMM_SHARE_BREAK_ABS_PP", 3.0)
 SHARE_BREAK_REL = _env_float("IMM_SHARE_BREAK_REL", 0.5)
 SHARE_BREAK_MIN_BASE_HOURS = _env_float("IMM_SHARE_BREAK_MIN_BASE_HOURS", 6)
@@ -886,6 +897,16 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         lag_why = (f"the chart revised the week's counts at "
                    f"{datetime.fromtimestamp(revised[0], timezone.utc):%m-%d %H:%MZ}")
         LAST["data_current"] = current
+    elif brk is not None and chart_time is not None and SHARE_BREAK_HOLD_HOURS > 0             and chart_time.timestamp() - float(brk["t"]) < SHARE_BREAK_HOLD_HOURS * 3600.0:
+        # a fresh break: stand aside until enough flow sits behind it
+        current = False
+        moved = (f" ({brk['bucket']} {brk['old']:.1f}% -> {brk['new']:.1f}%)"
+                 if brk.get("old") is not None and brk.get("new") is not None else "")
+        lag_why = (f"break in the mix at "
+                   f"{datetime.fromtimestamp(float(brk['t']), timezone.utc):%m-%d %H:%MZ}"
+                   f"{moved}; standing aside to "
+                   f"{datetime.fromtimestamp(float(brk['t']) + SHARE_BREAK_HOLD_HOURS * 3600.0, timezone.utc):%H:%MZ}")
+        LAST["data_current"] = current
     entries: Dict[str, dict] = {}
     missing: List[str] = []
     for ev, info in sorted(events.items()):
@@ -958,6 +979,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                              "break_rel": SHARE_BREAK_REL,
                              "break_min_base_hours": SHARE_BREAK_MIN_BASE_HOURS,
                              "break_min_hours": SHARE_BREAK_MIN_HOURS,
+                             "break_hold_hours": SHARE_BREAK_HOLD_HOURS,
                              "revision_hold_hours": SHARE_REVISION_HOLD_HOURS}},
                   fh, indent=1, sort_keys=True)
     os.replace(tmp, path)
