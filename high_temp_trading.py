@@ -1994,15 +1994,41 @@ max_contracts1 = 100
 # ladders in 150-cap cities. Set <= 0 to disable.
 MARKET_CASH_CAP_DOLLARS = float(os.environ.get("MARKET_CASH_CAP_DOLLARS", "125"))
 
-# 61–80c NO entry band size tilt. Aug 2026 fill-level analysis: entries in
-# this band earned +9.86c/contract (win 0.749 vs 0.650 breakeven, 15.2% ROI)
-# vs +0.45c/contract for the 41–60c workhorse that carries 82% of volume.
-# Rungs land here mainly on tail markets whose dynamic hi_no (prev-day bid
-# − 15c) sits above 61c. Capacity at these prices is unproven — scale the
-# multiplier gradually via env. 1.0 disables the tilt.
-BAND_TILT_LO_CENTS = int(os.environ.get("BAND_TILT_LO_CENTS", "61"))
+# NO entry-price band size tilt: order BAND_TILT_MULT× at any rung whose own
+# price lands in the band. Introduced 2026-08-09 at 61–80c, when 61c+ entries
+# earned +9.86c/contract against +0.45c for the 41–60c workhorse.
+#
+# ---- 2026-10-06: floor dropped 61 → 51 on non-evening slots. ----
+# The 61c floor was aimed at the right price and almost never fired. Band
+# entries, Jul 1 – Oct 4:
+#     41–50c   34,401 ct   +3.04 c/ct
+#     51–60c   24,020 ct   +8.3  c/ct      <-- newly tilted
+#     61–70c    1,635 ct  +17.22 c/ct      <-- the only band tilted before
+# 61–70c does earn most, but a paired day-bootstrap cannot separate it from
+# 51–60c (difference −9.05 c/ct, 90% CI [−20.72, +3.02]) and 51–60c carries
+# 15× the contracts. Measured on a month of real orders the tilt goes from
+# covering 6.4% to 31.2% of morning quoted volume.
+#
+# EVENING KEEPS THE 61c FLOOR. In the evening, 51–60c IS the near-touch band
+# that MAKER_BUFFER_CENTS_EVENING is deleting for losing 3.69c/contract —
+# boosting size there would upsize exactly what the buffer removes. The split
+# is by mechanism, not by clock: morning and west_late rest a few hours into
+# an already-known day, the evening rests twelve hours through a forecast
+# update. west_late therefore groups with morning (it has no fills of its own
+# yet, so it inherits the morning evidence).
+#
+# Interaction to watch: tilting 51–60c adds ~27k wanted morning contracts a
+# month, consuming a little over half the ~49k of headroom MORNING_CAP_MULT
+# just freed. That is a good trade — these are shallow rungs that fill at
+# ~17–22%, while the deep rungs the cap had been cutting fill at ~3% — but the
+# two knobs do meet at the cap, so read them together.
+# 1.0 disables the tilt entirely.
+BAND_TILT_LO_CENTS = int(os.environ.get("BAND_TILT_LO_CENTS", "51"))
+BAND_TILT_LO_CENTS_EVENING = int(os.environ.get("BAND_TILT_LO_CENTS_EVENING", "61"))
 BAND_TILT_HI_CENTS = int(os.environ.get("BAND_TILT_HI_CENTS", "80"))
 BAND_TILT_MULT = float(os.environ.get("BAND_TILT_MULT", "1.5"))
+_band_tilt_lo = (BAND_TILT_LO_CENTS_EVENING if RUN_SLOT == "evening"
+                 else BAND_TILT_LO_CENTS)
 
 # =====================================================================
 # SIZE EXPERIMENT — is the book capacity-bound?          (2026-09-06)
@@ -2552,7 +2578,7 @@ for index, row in combined_table.iterrows():
   print(f"    Sizing:     base={_base_contracts}{_arm_tag} × night={night_size_mult:g}x "
         f"({_nm_reason}) × city={_city_mult:g}x ({row['City']})")
   print(f"                ladder size: {_base_size} contracts (flat across rungs; "
-        f"×{BAND_TILT_MULT:g} on rungs in {BAND_TILT_LO_CENTS}-{BAND_TILT_HI_CENTS}c; "
+        f"×{BAND_TILT_MULT:g} on rungs in {_band_tilt_lo}-{BAND_TILT_HI_CENTS}c; "
         f"increment={_inc_show}c)")
 
   _cap = CITY_MAX_CONTRACTS.get(row['City'], max_contracts)
@@ -2624,7 +2650,7 @@ for index, row in combined_table.iterrows():
     # 61–80c band tilt: upsize rungs priced in the proven-edge band
     # (see BAND_TILT_* above). Price-conditional, so only the rungs that
     # actually land in-band get the multiplier.
-    band_mult = BAND_TILT_MULT if BAND_TILT_LO_CENTS <= bid_price <= BAND_TILT_HI_CENTS else 1.0
+    band_mult = BAND_TILT_MULT if _band_tilt_lo <= bid_price <= BAND_TILT_HI_CENTS else 1.0
     contracts = max(1, int(round(_base_contracts * night_size_mult * ladder_mult * city_mult * band_mult)))
     # Edge = NO-side EV per $1 staked = (1 − P(yes)) − bid/100
     edge = (1.0 - yes_prob) - (bid_price / 100.0)
