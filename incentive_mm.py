@@ -1434,10 +1434,18 @@ SPORTS_LADDER_HOUR_MULT = _env_float("IMM_SPORTS_LADDER_HOUR_MULT", 3.0)
 #     lose more there (-1.9c to settlement vs -0.4c by day) and our
 #     overnight fills (-9.6c) about cancel the rent -- x3 would scale a ~$0
 #     block.
+#   * KXTRUMPMENTIONB, PINNED (Jack 2026-10-07, "yes" to keeping it at 3x
+#     overnight whatever the classifier says): long-dated today, so it
+#     already rests x3 0-8 ET (10/07: x3.00 on every quoted row), but the
+#     9/12 feed validation found it daily and the classifier can flip it
+#     back the day Kalshi lists two of its dated events at once. Pinned
+#     here, a flip keeps the quiet hours (and drops only the evening x1.5
+#     and the Saturday step, as for every daily).
 # IMM_QUIET_DAILY_SERIES = exact series names ("" = none);
 # IMM_QUIET_RAIN_PERIOD=0 takes the period family back out.
 QUIET_DAILY_SERIES = frozenset(s.strip() for s in os.environ.get(
-    "IMM_QUIET_DAILY_SERIES", "KXTRUMPAPPROVE").split(",") if s.strip())
+    "IMM_QUIET_DAILY_SERIES", "KXTRUMPAPPROVE,KXTRUMPMENTIONB").split(",")
+    if s.strip())
 QUIET_RAIN_PERIOD = os.environ.get("IMM_QUIET_RAIN_PERIOD", "1") == "1"
 
 

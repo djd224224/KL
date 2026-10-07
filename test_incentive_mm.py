@@ -9648,7 +9648,7 @@ class TestQuietDailyMembers(unittest.TestCase):
         imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0")
         imm.HOUR_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
         imm.SAT_SIZE_MULT = 1.5
-        imm.QUIET_DAILY_SERIES = frozenset({"KXTRUMPAPPROVE"})
+        imm.QUIET_DAILY_SERIES = frozenset({"KXTRUMPAPPROVE", "KXTRUMPMENTIONB"})
         imm.QUIET_RAIN_PERIOD = True
         self._dyn = mock.patch.object(imm, "DAILY_SERIES_DYNAMIC",
                                       {"KXTRUMPAPPROVE": {}, "KXYTTOPVIDEO2D": {}})
@@ -9667,8 +9667,23 @@ class TestQuietDailyMembers(unittest.TestCase):
         return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
 
     def test_code_defaults(self):
-        self.assertEqual(_QUIET_DAILY_SERIES_CODE_DEFAULT, frozenset({"KXTRUMPAPPROVE"}))
+        self.assertEqual(_QUIET_DAILY_SERIES_CODE_DEFAULT,
+                         frozenset({"KXTRUMPAPPROVE", "KXTRUMPMENTIONB"}))
         self.assertTrue(_QUIET_RAIN_PERIOD_CODE_DEFAULT)
+
+    def test_trumpmentionb_pinned_through_a_daily_flip(self):
+        """Jack 2026-10-07 "yes": x3 in the quiet hours whether or not the
+        classifier calls it daily; long-dated it keeps the whole window."""
+        s = "KXTRUMPMENTIONB"
+        self.assertFalse(imm.is_daily_series(s))
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 7, 3)), 3.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 7, 19)), 1.5)
+        with mock.patch.dict(imm.DAILY_SERIES_DYNAMIC, {s: {}}):
+            self.assertTrue(imm.is_daily_series(s))
+            self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 7, 3)), 3.0)
+            self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 7, 19)), 1.0)
+            imm.QUIET_DAILY_SERIES = frozenset({"KXTRUMPAPPROVE"})
+            self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 7, 3)), 1.0)
 
     def test_trumpapprove_quiet_hours_only(self):
         s = "KXTRUMPAPPROVE"
