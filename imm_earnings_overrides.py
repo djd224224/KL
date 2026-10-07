@@ -902,7 +902,8 @@ def wh_schedule_start(title: str, date_et, sub_title: str = ""):
     """(datetime ET, matched schedule details) from the Factbase WH calendar:
     the UNIQUE best keyword match on that date with >=2 shared content words
     and a concrete time, else None. Title vs details first; the place
-    fallback (see _WH_PLACE_STOP) when that finds nothing or ties."""
+    fallback (see _WH_PLACE_STOP) when that finds nothing or ties; then a
+    title word exactly one timed entry of the day carries."""
     if "entries" not in _wh_cache:
         try:
             r = requests.get(WH_SCHEDULE_JSON, headers=UA, timeout=20)
@@ -922,6 +923,20 @@ def wh_schedule_start(title: str, date_et, sub_title: str = ""):
         place = _wh_place_words(f"{title} {sub_title}")
         it = _wh_unique_best(day, lambda e: len(place & _wh_place_words(
             f"{e.get('details') or ''} {e.get('location') or ''}")))
+    if it is None and len(want) == 1:
+        # SINGLE WORD, UNIQUE (Jack 2026-10-06, KXTRUMPMENTIONB-26OCT07: "his
+        # announcement?" vs "13:00 The President makes an Announcement" --
+        # a title with ONE content word can never reach the >=2 bar): that
+        # word in exactly ONE timed entry of the day. Two entries with it (the
+        # two 10/07 Policy Meetings) resolve to nothing, and travel entries
+        # never count. Titles with more words stay on the >=2 rules: "his
+        # rally in Nebraska" would otherwise pick the one timed entry naming
+        # Nebraska -- the 8:30pm DEPARTURE (test_place_tie_resolves_to_nothing).
+        hits = [e for e in day
+                if want & _wh_words(str(e.get("details") or ""))
+                and not re.search(r"\b(departs|arrives)\b", str(e.get("details") or ""), re.I)]
+        if len(hits) == 1:
+            it = hits[0]
     if it is None:
         return None
     try:

@@ -8752,3 +8752,33 @@ A running process is unchanged; a regional network still waits
 NEIC_WAIT_MIN from the origin. Live feed check: all 18 M4.5+ events carry
 the stamp; us6000u0nb credited ~1,300 s -> confirmed on startup.
 Test: test_a_restart_credits_a_settled_usgs_solution.
+### 2026-10-07 ~02:55Z — the live gate arms at midnight ET of the ticker day (pre-arm 4h -> 0); the WH matcher takes a one-word title's unique match (Jack: "yes" / "teach the matcher...")
+
+1. EVENT_LIVE_GATE_PREARM_H 4 -> 0.
+   - WHY: the 4h covered a UTC-dated ticker (a 9pm ET speech is the next
+     UTC day). Kalshi does not date mention events that way: all 28
+     non-earnings mention events with a known start have ticker date ==
+     the ET date of the start, KXFOXNEWSMENTION-26AUG01 at 21:00 ET
+     included.
+   - What the 4h did was halt KXTRUMPMENTION-26OCT07 (8:41pm ET 10/06, a
+     22-lot fill) and KXTRUMPMENTIONB-26OCT07 (9:00pm, TARI 650/850) the
+     evening before. Armed gated events also lose their orders at every
+     restart handoff (6f12196).
+   - Events with a start time are unaffected (point 7: start - 30 min).
+2. wh_schedule_start: a title with exactly ONE content word (KXTRUMPMENTIONB:
+   "his announcement?") can never reach the >=2-word bar. It now takes the
+   one timed, non-travel entry of the day carrying that word ("13:00 The
+   President makes an Announcement"). Two entries with it (the 10/07 Policy
+   Meetings) resolve to nothing.
+   - Multi-word titles stay on the >=2 rules. A looser version picked Grand
+     Island's 8:30pm DEPARTURE for "his rally in Nebraska"
+     (test_place_tie_resolves_to_nothing).
+   - Replay over the 27 TRUMPMENTION events with a start on file: 23 match,
+     3 none, 1 different (JUL24 WHCA dinner 20:55 vs 19:00, from the
+     pre-existing title rule). The new rule fires on none of them.
+
+Tests:
+- TestLiveEventDepthGate: gate armed at 00:01 ET on the ticker day, not
+  22:45 ET the evening before.
+- TestSingleWordUnique (2).
+- Suite 2,288 OK.

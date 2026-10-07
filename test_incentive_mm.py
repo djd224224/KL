@@ -12274,6 +12274,23 @@ class TestLiveEventDepthGate(unittest.TestCase):
         finally:
             imm.EVENT_LIVE_GATE_PREARM_SECS = float("inf")
 
+    def test_gate_arms_at_midnight_et_of_the_ticker_day_not_the_evening_before(self):
+        """Jack 2026-10-06 ("yes"): IMM_EVENT_LIVE_GATE_PREARM_H defaults to 0
+        -- Kalshi dates mention tickers by the ET date, so an OCT07 event
+        cannot be live at 10:45pm ET on Oct 6 (KXTRUMPMENTION-26OCT07 and
+        KXTRUMPMENTIONB-26OCT07 were both halted in that window)."""
+        imm.EVENT_LIVE_GATE_PREARM_SECS = self._prearm
+        try:
+            self.assertEqual(imm.EVENT_LIVE_GATE_PREARM_SECS, 0.0)
+            ev = "KXGOOD-26OCT07"
+            evening_before = imm.ET.localize(datetime(2026, 10, 6, 22, 45)).timestamp()
+            just_after = imm.ET.localize(datetime(2026, 10, 7, 0, 1)).timestamp()
+            self.assertFalse(imm.event_live_gate_armed(ev, evening_before))
+            self.assertFalse(imm.event_live_gate_armed(ev, evening_before, jump=True))
+            self.assertTrue(imm.event_live_gate_armed(ev, just_after))
+        finally:
+            imm.EVENT_LIVE_GATE_PREARM_SECS = float("inf")
+
     def _bot(self, yes_a=1200, no_a=1200, yes_b=1200, no_b=1200):
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)

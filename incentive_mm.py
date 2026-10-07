@@ -498,8 +498,8 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 #      be live on Sep 4: SEP08 was falsely live-confirmed twice (9/2,
 #      9/4) by news sweeps days early. Armed from
 #      EVENT_LIVE_GATE_PREARM_H hours before midnight ET of the ticker
-#      day (default 4h ~= the UTC date roll, so an evening speech dated
-#      by either naming convention is covered), through the day itself,
+#      day (default 0 since 2026-10-06 -- was 4h for UTC-dated tickers,
+#      which Kalshi's mention events are not), through the day itself,
 #      and — deliberately wider than the literal spec — every day after:
 #      a still-trading past-dated ticker is either a post-speech book
 #      settling out or a listing-date program (the parse_event_date
@@ -561,8 +561,18 @@ EVENT_FILL_HALT_STRIKES = _env_int("IMM_EVENT_FILL_STRIKES", 2)
 EVENT_FILL_STRIKE_TTL_SECS = _env_float("IMM_EVENT_FILL_STRIKE_TTL_MIN", 30) * 60.0
 # Point 6 pre-arm: hours before midnight ET of the ticker day that the
 # live triggers arm. 0 = strictly the ticker day (ET).
+# 0 since 2026-10-06 (Jack: "doesnt 10/7 suggest the event is tomorrow and
+# not today and so you can quote it today?" -- "yes"). The 4h guarded a UTC-
+# dated ticker (a 9pm ET speech is the next UTC day), a convention Kalshi
+# does not use: all 28 non-earnings mention events with a known start had
+# ticker date == the ET date of the start, KXFOXNEWSMENTION-26AUG01 at 9pm ET
+# included. Its only measured effect was the evening before: 10/06 8:41pm ET
+# KXTRUMPMENTION-26OCT07 (a routine 22-lot fill) and 9:00pm KXTRUMPMENTIONB-
+# 26OCT07 (650/850 on TARI) were both halted, and armed gated events lose
+# their orders at every restart handoff (6f12196). A known start time
+# (point 7) still arms 30 min before it.
 EVENT_LIVE_GATE_PREARM_SECS = _env_float(
-    "IMM_EVENT_LIVE_GATE_PREARM_H", 4) * 3600.0
+    "IMM_EVENT_LIVE_GATE_PREARM_H", 0) * 3600.0
 # 7. KNOWN START BEATS THE TICKER DAY (Jack 2026-10-05, KXTRUMPMENTION-26OCT05:
 #    "doesnt this market have a definite time at 7pm today? it shouldnt be
 #    getting halted like this"). The Grand Island rally was on the WH schedule

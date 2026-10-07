@@ -195,5 +195,71 @@ class TestRncRallyStart(unittest.TestCase):
                          ["broadcast schedule [RNC events]", "broadcast schedule"])
         self.assertEqual(ieo.provenance_of(out[0][2]), "read")
 
+# KXTRUMPMENTIONB-26OCT07 / KXTRUMPMENTION-26OCT07, as the calendar read the
+# night before (2026-10-07 02:40Z)
+OCT07 = [
+    _e("2026-10-07", None, "TBD: The President departs the White House en "
+       "route San Antonio, Texas", "The White House"),
+    _e("2026-10-07", "08:00:00", "The President participates in Executive Time",
+       "The White House"),
+    _e("2026-10-07", "10:00:00", "The President participates in a Policy "
+       "Meeting", "Oval Office"),
+    _e("2026-10-07", "12:30:00", "The President participates in a Policy "
+       "Meeting", "Oval Office"),
+    _e("2026-10-07", "13:00:00", "The President makes an Announcement",
+       "The White House"),
+    _e("2026-10-07", "13:30:00", "Out-of-Town Travel Pool Call Time",
+       "Joint Base Andrews"),
+    _e("2026-10-07", "19:00:00", "The President delivers Remarks [6:00 PM "
+       "Local]", "Freeman Coliseum, San Antonio, TX"),
+]
+
+
+class TestSingleWordUnique(unittest.TestCase):
+    """Jack 2026-10-06: "teach the matcher to accept a single-word match when
+    exactly one timed entry that day contains it"."""
+
+    def setUp(self):
+        self._saved = dict(ieo._wh_cache)
+        ieo._wh_cache.clear()
+        self.addCleanup(lambda: (ieo._wh_cache.clear(), ieo._wh_cache.update(self._saved)))
+
+    def test_one_word_one_entry_resolves(self):
+        ieo._wh_cache["entries"] = OCT07
+        dt, det = ieo.wh_schedule_start(
+            "What will Trump say during his announcement?", date(2026, 10, 7),
+            "Donald Trump - Oval Office announcement originally scheduled for "
+            "October 7, 2026")
+        self.assertEqual((dt.isoformat(), det),
+                         ("2026-10-07T13:00:00-04:00", "The President makes an Announcement"))
+        # the rally still resolves through the place fallback
+        dt, _ = ieo.wh_schedule_start(
+            "What will Trump say during his rally in Texas?", date(2026, 10, 7),
+            "Donald Trump - Midterm Rally in San Antonio, Texas originally "
+            "scheduled for October 7, 2026")
+        self.assertEqual(dt.isoformat(), "2026-10-07T19:00:00-04:00")
+
+    def test_one_word_two_entries_is_nothing(self):
+        ieo._wh_cache["entries"] = OCT07
+        self.assertIsNone(ieo.wh_schedule_start(
+            "What will Trump say during his meeting?", date(2026, 10, 7)))
+        ieo._wh_cache["entries"] = OCT07 + [
+            _e("2026-10-07", "16:00:00", "The President makes an Announcement",
+               "Roosevelt Room")]
+        self.assertIsNone(ieo.wh_schedule_start(
+            "What will Trump say during his announcement?", date(2026, 10, 7)))
+        # a travel entry never counts
+        ieo._wh_cache["entries"] = [
+            _e("2026-10-07", "13:00:00", "The President departs for the "
+               "Announcement venue", "x")]
+        self.assertIsNone(ieo.wh_schedule_start(
+            "What will Trump say during his announcement?", date(2026, 10, 7)))
+        # an untimed entry does not count, nor does another day's
+        ieo._wh_cache["entries"] = [
+            _e("2026-10-07", None, "TBD: The President makes an Announcement", "x"),
+            _e("2026-10-08", "13:00:00", "The President makes an Announcement", "x")]
+        self.assertIsNone(ieo.wh_schedule_start(
+            "What will Trump say during his announcement?", date(2026, 10, 7)))
+
 if __name__ == "__main__":
     unittest.main()
