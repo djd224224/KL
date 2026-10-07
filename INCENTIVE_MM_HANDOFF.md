@@ -8502,3 +8502,31 @@ currents, the KSEA CLI, ACIS snowfall back to 1980) and "Seattle" to
 CITY_CODES. Dry run: P(December total > 2/4/6/8/10/12 in) = 20 / 11 / 7 / 5 /
 3 / 2% from 38 Decembers. snow_monthly_fair is imported by the IMM's refresher
 thread: deploy = restart_imm.ps1. Test lists gain Seattle.
+## 2026-10-07 ~00:45Z — KXCRITICSCOMEDY (Critics Choice, Best Comedy Series) quoted under the awards rules (Jack: "KXCRITICSCOMEDY series should be quoting")
+
+WHY. 25 KXCRITICS* series (the 32nd Critics Choice Awards, one per
+category, all -27 events) got programs between 10/06 19:06Z and 10/07
+00:02Z. None was on the allowlist, and the open scan is off, so the bot
+never saw them: no cycle-log, guard-skip or selection rows.
+
+WHAT. KXCRITICSCOMEDY joins the award-show set (the 9/25-9/26 rules):
+- exact allow in _DEFAULT_ENTERTAINMENT_SERIES (KXCRITICSCOMEDYACTO,
+  Best Actor in a Comedy Series, is a different series and stays out);
+- `=KXCRITICSCOMEDY:3` in EVENT_TOP_N;
+- AWARDS_SERIES + AWARDS_TABLE_ONLY_SERIES (safe-join, out 31 days before
+  the nominations, table date only);
+- table row KXCRITICSCOMEDY-27=2026-12-04: nominations Fri Dec 4 2026,
+  film and TV together, per the Critics Choice Association's Apr 20
+  announcement (Awards Radar; @CriticsChoice). Ceremony Jan 3 2027.
+
+So it quotes from the deploy to Nov 3 2026 00:00 ET. A -28 event has no row
+and stands down (fail closed).
+
+NOT DONE: the other 24 KXCRITICS* series (Picture, Director, the acting
+categories, Drama Series ...) are still unlisted -- Jack's call. The film
+craft categories (Cinematography, Editing, Production Design, Costume, Hair
+& Makeup, VFX, Score) would need November's below-the-line shortlist date
+as their row, the Oscars' shortlist pattern.
+
+Test: TestScreen.test_critics_choice_comedy_series_quotes_under_the_awards_rules
+(suite 2,266 OK).

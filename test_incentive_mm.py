@@ -1664,6 +1664,36 @@ class TestScreen(unittest.TestCase):
             for s in ("KXCOLLINCOUNTYJUDGE", "KXSAARLAND"):
                 imm.SERIES_OVERRIDES.pop(s, None)
 
+    def test_critics_choice_comedy_series_quotes_under_the_awards_rules(self):
+        # Jack 2026-10-06: "KXCRITICSCOMEDY series should be quoting". The
+        # awards rule set: exact allow (KXCRITICSCOMEDYACTO is a different
+        # category and stays out), 3 per event, safe-join, out 31 days before
+        # the nominations (Dec 4 2026 -> Nov 3), table-only
+        place = {"expected_expiration_time": "2027-12-31T15:00:00Z",
+                 "close_time": "2027-12-31T15:00:00Z"}
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            self.assertTrue(IncentiveMarketMaker._allowed("KXCRITICSCOMEDY-27-TED"))
+            self.assertFalse(IncentiveMarketMaker._blocked("KXCRITICSCOMEDY-27-TED"))
+            self.assertFalse(IncentiveMarketMaker._allowed("KXCRITICSCOMEDYACTO-27-X"))
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        self.assertEqual(imm.event_top_n_for("KXCRITICSCOMEDY"), 3)
+        self.assertEqual(imm.event_top_n_for("KXCRITICSCOMEDYACTO"), 0)
+        ov = imm.series_override("KXCRITICSCOMEDY")
+        self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
+                         (31.0, True, True))
+        self.assertEqual(imm.awards_event_start("KXCRITICSCOMEDY-27", place),
+                         utc(2026, 12, 4, 5, 0))
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXCRITICSCOMEDY", "KXCRITICSCOMEDY-27", None, close_time=None,
+            market=place), utc(2026, 11, 3, 5, 0))
+        # next year's show has no row yet: stood down, fail closed
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXCRITICSCOMEDY", "KXCRITICSCOMEDY-28", None, close_time=None,
+            market=place), imm.RELEASE_GUARD_UNKNOWN)
+
     def test_award_shows_three_per_event_and_one_month_stand_down(self):
         # Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY,
         # KXOSCAR, KXVMA. max 3 markets per event, and do not quote within

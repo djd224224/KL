@@ -2325,6 +2325,9 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 # FAMILY (KXOSCAR<CATEGORY>)
                                                 "=KXGGNOM:3,=KXNATBOOKAWARDS:3,"
                                                 "=KXGRAMMY:3,=KXVMA:3,KXOSCAR:3,"
+                                                # Critics Choice comedy
+                                                # series (2026-10-06)
+                                                "=KXCRITICSCOMEDY:3,"
                                                 # OpenRouter token usage
                                                 # UNCAPPED (Jack 2026-09-29:
                                                 # "remove the 3-strike cap on
@@ -4162,8 +4165,16 @@ _DEFAULT_ECON_SERIES = (
 # the awards rule set registered beside awards_event_start: 3 per event by
 # ROI (EVENT_TOP_N), safe-join (the KXCMA precedent for nominee binaries)
 # and the pre-event stand-down (pre_event_days).
+# CRITICS CHOICE, BEST COMEDY SERIES (Jack 2026-10-06: "KXCRITICSCOMEDY
+# series should be quoting"). KXCRITICSCOMEDY-27-<SHOW>, the 32nd Critics
+# Choice Awards' TV comedy category; its program opened 10/07 00:02Z, one
+# of 25 KXCRITICS* series lit 10/06-10/07 (the open scan is off, so none
+# was quoted). Same awards rule set as the five above; EXACT name, since
+# KXCRITICSCOMEDY is a prefix of KXCRITICSCOMEDYACTO (Best Actor in a
+# Comedy Series), which is not admitted here.
 _DEFAULT_ENTERTAINMENT_SERIES = ("KXRT,KXRTTV,KXVENUEPERFORM,KXCMA,KXMC,KXART,"
-                                 "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA")
+                                 "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,"
+                                 "KXCRITICSCOMEDY")
 # ROTTEN TOMATOES RELEASE-WEEK STAND-DOWN (Jack 2026-09-24 pm: "stand down
 # KXRT events 7 days before close"). Every KXRT market closes 10:00 ET on
 # the Monday after a Friday release, so close - 7d is 10:00 ET on the Monday
@@ -10817,18 +10828,24 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #   2026 VMAs           nominations landed in early September; no row on
 #                       purpose (unverified day, and the family is inside
 #                       its month either way -> stood down)
+#   32nd Critics Choice nominations Fri Dec 4 2026, film and TV together
+#                       (Critics Choice Association's announcement, Apr 20
+#                       2026, via Awards Radar and @CriticsChoice; ceremony
+#                       Jan 3 2027) -> KXCRITICSCOMEDY out Nov 3 2026. The
+#                       film-only below-the-line shortlists (November) do
+#                       not touch the TV categories.
 # Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES
 # (replaces the WHOLE table), IMM_AWARDS_TABLE_ONLY_SERIES.
 AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 31.0)
 AWARDS_SERIES = tuple(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_SERIES",
-        "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR").split(",")
+        "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR,KXCRITICSCOMEDY").split(",")
     if s.strip())
 AWARDS_TABLE_ONLY_SERIES = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_TABLE_ONLY_SERIES",
-        "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR").split(",") if s.strip())
+        "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR,KXCRITICSCOMEDY").split(",") if s.strip())
 # 99th-Oscars categories whose first narrowing is the Dec 15 2026 SHORTLIST
 # (winner AND nomination series, by Kalshi's own names; KXOSCARNOMBSOUND is
 # "Oscar nomination for Best Song" and KXOSCARVIS is Makeup & Hairstyling
@@ -10847,6 +10864,7 @@ _OSCAR_SHORTLIST_SERIES_27 = (
     "KXOSCARCASTING", "KXOSCARNOMBCASTING")
 _AWARDS_DATES_DEFAULT = (
     "KXGRAMMY-*69=2026-11-16,KXNATBOOKAWARDS-*26=2026-10-06,"
+    "KXCRITICSCOMEDY-27=2026-12-04,"
     + ",".join(f"{_s}-27=2026-12-15" for _s in _OSCAR_SHORTLIST_SERIES_27)
     + ",KXOSCAR*-27=2027-01-21")
 
