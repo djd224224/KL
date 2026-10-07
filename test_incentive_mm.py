@@ -1707,6 +1707,11 @@ class TestScreen(unittest.TestCase):
                 ov = imm.series_override(s)
                 self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
                                  (31.0, True, True), s)
+                # x2 on the family (Jack 2026-10-07: "2x"), caps with it
+                self.assertEqual(ov.size_mult, 2.0, s)
+                self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+                self.assertEqual(imm.series_max_position(s),
+                                 2.0 * imm.MAX_POSITION_CONTRACTS, s)
                 want = (utc(2026, 10, 16, 5, 0) if s[len("KXCRITICS"):] in crafts
                         else utc(2026, 11, 3, 5, 0))
                 self.assertEqual(imm.apply_series_cutoff_adjustments(
@@ -1738,6 +1743,7 @@ class TestScreen(unittest.TestCase):
                           imm._config_gaps["KXCRITICSPIC-28"]["msg"])
             # outside the table-only families there is no default
             self.assertIsNone(imm.awards_family_default("KXRT-ABC"))
+            self.assertEqual(imm.CRITICS_SIZE_MULT, 2.0)
             # a mention book under the prefix keeps the mention rules: no
             # prefix cap, no awards override
             self.assertEqual(imm.event_top_n_for("KXCRITICSMENTION"), 0)

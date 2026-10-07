@@ -8832,3 +8832,15 @@ three are NOT votes and are left for Jack: KXLULAFLAVIODEBATE (will they
 debate before the runoff), KXOBAMARALLY (who Obama rallies with), and
 KXBKLYNDEMCHAIR (a court ruling on the Brooklyn chair) -- an election-day
 cutoff would quote through their news; carve out or give each its own rule.
+
+## 2026-10-07 — Critics Choice family x2 (Jack: "2x")
+
+Jack: "KXCRITICSCOMEDYSUPACTO-27 still not quoting" -> "2x". After 4fafdda
+gave the 8 late TV categories their dates, 6 still sat out: 12-13 of each
+event's 16 nominees are under 5c (extreme_mid), and every in-band one shares
+its $19.40/day with 26k-57k contracts already in the band, so the standard
+ladder's ~2.5% share projected $0.40-0.52/day -- under the $1.50 entry bar
+over the Oct 7-11 period. CRITICS_SIZE_MULT 2.0 on the KXCRITICS family
+parent (every member clones it; caps scale; hour windows compose). The
+estimator's x6 line had SROO at $0.82/day. Expect ~1 favorite per event in,
+~+$4-5/day across the six. Revert: IMM_CRITICS_SIZE_MULT=1.

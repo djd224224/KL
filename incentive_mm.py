@@ -11131,6 +11131,18 @@ for _s in AWARDS_SERIES:
         SERIES_OVERRIDES.get(_s) or SeriesOverride(),
         safe_join=True, pre_event_days=AWARDS_PRE_EVENT_DAYS,
         pre_event_dates_only=(_s in AWARDS_TABLE_ONLY_SERIES))
+# CRITICS CHOICE x2 (Jack 2026-10-07: "2x"). Six of the 8 TV categories
+# Kalshi listed late sat out on the floor: every in-band nominee shares its
+# $19.40/day with 26k-57k contracts already in the band, so the standard
+# ladder's ~2.5% share projected $0.40-0.52/day -- under the $1.50 entry bar
+# over the Oct 7-11 period (e.g. KXCRITICSCOMEDYSUPACTO-27-SROO $0.48/day,
+# ~$1.26 left). The estimator's own x6 line put SROO at $0.82/day. Set on
+# the family parent, so every KXCRITICS* member clones it (caps scale with
+# it); the hour windows still compose. IMM_CRITICS_SIZE_MULT=1 reverts
+# (env => task-level restart).
+CRITICS_SIZE_MULT = _env_float("IMM_CRITICS_SIZE_MULT", 2.0)
+SERIES_OVERRIDES["KXCRITICS"] = replace(SERIES_OVERRIDES["KXCRITICS"],
+                                        size_mult=CRITICS_SIZE_MULT)
 
 
 # ELECTION DAY (Jack 2026-09-28: "quote until election day", see
