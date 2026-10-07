@@ -8595,3 +8595,89 @@ Tests: TestSportsLadderHourMult (7) +
 test_ladder_rows_sit_out_of_the_saturday_level_read. The suite pins the knob
 to 0 like the other dated knobs, so the ladder fixtures keep sizing off the
 global window (repo suite 2,274 OK).
+
+## 2026-10-07 ~01:20Z — OpenRouter: breaks on a 1h window, the family stands aside 3h after one, token run rate caps launch-day spikes (Jack: "implement all 3")
+
+WHY (10/06, first day of the reworked share fair). OpenRouter was -$142 at
+marks against ~$29 of raw rewards.
+
+- At 10:15 ET z-ai/glm-5.3-flash's requests stepped from ~148k to ~52k/min
+  in one 5-minute snapshot (everyone else flat ~620k/min). Z-AI's share went
+  21% -> 8%, so every other author's rose.
+- The 3h break window fired at 12:44 ET. Meanwhile the run rate (6h flow)
+  was mostly pre-break traffic, and the bot sold YES on the risers: 23 share
+  fills, -$107 (-$95 after 11:06).
+- The Kalshi books themselves only repriced from ~11:05-11:20 ET.
+- KXTOKENUSE lost -$45 on 4 overnight buys: the fair read 43-67c on
+  T174-T186 where the book read 15-51c, and Tuesday printed 22.1T after
+  Monday's 25.9T.
+
+WHAT:
+1. SHARE_BREAK_WINDOW_HOURS 3 -> 1. Replay on all 790 stored snapshots
+   (10/04 01Z - 10/07 01Z): the same two breaks (stealth Mon 12:04 ET,
+   z-ai Tue 10:15 ET) and nothing else, found 56 min / 1h38m sooner
+   (z-ai at 11:06 ET).
+2. SHARE_BREAK_HOLD_HOURS (3). While the chart time is within 3h of the
+   week's last break, data_current is False and the entries lag, so the gate
+   stands the family aside ("break in the mix at HH:MMZ (bucket old -> new);
+   standing aside to HH:MMZ"). After that the since-break anchor has 3h
+   behind it. On 10/06 this would have held 22 share fills (375 ct) worth
+   -$95.6 at marks; the other 20 fills netted -$0.75. 0 = quote through on
+   the last hours.
+3. openrouter_fair OR_SPIKE_CAP (0.15). cap_spikes holds each day at most
+   1.15x the median of the 7 days before it, in base, trend and weekday
+   factors only. The known days of a window still count at their actual
+   totals. Entries carry spike_capped.
+   - Backtest 8/03-10/04, every day of every window: weekly RMSE 5.34 ->
+     4.61T, 4-week 36.2 -> 29.2T. The mean error goes -1.43 -> -2.04T
+     (the BIAS table was fit uncapped).
+   - It would NOT have changed 10/06: Monday was +8.1% on its median, and
+     a 10% cap moves that forecast only 182.6 -> 180.6. That miss was
+     intraday information -- the book saw Tuesday running low -- which
+     completed days cannot hold.
+
+FOLLOW-UP for Jack (not built): an intraday nowcast of the current day's
+tokens from the share chart's live request totals (the 10/06 token miss).
+
+KILL SWITCHES:
+- IMM_SHARE_BREAK_WINDOW_HOURS=3 / IMM_SHARE_BREAK_HOLD_HOURS=0 (env in
+  run_incentive_mm.ps1 + restart_imm.ps1 -Task);
+- IMM_OR_SPIKE_CAP=0.
+
+Tests:
+- test_openrouter_share_fair: the hold (lag from detection to 3h after the
+  change point; hold 0 quotes on); the early-week no-base case resized for
+  the 1h window.
+- test_openrouter_fair: the spike capped in the run rate, not the known
+  days; off = the old model.
+- 49 green across both files.
+
+## 2026-10-07 — Quake freeze clock anchored on the quake's origin; KXBIGGESTQUAKE x4; every rain family x2 (Jack)
+
+QUAKE FREEZE (Jack: "why is KXBIGGESTQUAKE-07OCT26 not quoting", then "yes"
+to the fix). A GFZ M5.08 (gfz2026tpui, origin 00:30:02Z 10/07) that USGS
+still had not listed an hour later froze the 07OCT26 book -- the design --
+but FREEZE_MAX_MIN (45) ran from when the watch FIRST SAW the detection, in
+memory, and the 00:46Z and 00:56Z IMM restarts each re-saw it as new: the
+freeze stretched from ~01:15Z to ~01:42Z. usgs_quake_fair: the clock now
+starts at min(first seen, origin + FIRST_SEEN_MAX_LAG_MIN 20) for both USGS
+and GFZ detections, so a live process is unchanged and a restart cannot hold
+a freeze past origin + 65 min (NEWS_MAX_AGE_MIN 105 still bounds it too).
+Test: test_a_restart_does_not_extend_the_freeze.
+
+SIZES (Jack: "add 2x multiplier on KXBIGGESTQUAKE and rain events"; asked
+which, he chose "Keep x3" for the quake and "Bring all rain to x2", then
+"increase KXBIGGESTQUAKE to 4x"):
+- KXBIGGESTQUAKE: QUAKE_SIZE_MULT 3.0 -> 4.0. Not a daily series, so the hour
+  windows compose on top: x4 by day, x6 in the 18-21 ET evening window, x12
+  in the 0-8 ET quiet hours (80 / 120 / 240 per rung at the 20-lot base),
+  per-market cap 400, per-event 4,000. Bid-only YES at fair - 1c as before.
+- Rain: daily KXRAIN 1.5 -> 2.0 (RAIN_DAILY_SIZE_MULT); the KXRAIN<CITY>M
+  monthlies 1 -> 2 (RAIN_MONTHLY_SIZE_MULT, in the monthly gate's override);
+  KXRAINWKND 1 -> 2 (RAINWKND_SIZE_MULT); the KXRAINS<CITY> rainstorm spans
+  1 -> 2 (RAINSTORM_SIZE_MULT); the period family (KXRAINNAPAM) stays 2. The
+  19-01 ET halving still applies to the dailies, weekend and monthlies (x1 in
+  those evenings). Each knob reverts with its env var (task-level restart).
+Tests: TestDailyRainSizeMult rewritten (x2 everywhere, the halving to x1,
+quake x4). 1141 green (test_incentive_mm, test_usgs_quake_fair,
+test_rain_monthly_fair, test_snow_monthly_fair).

@@ -168,6 +168,28 @@ class TestVerdict(unittest.TestCase):
         self.poll(w, later, [], gfz=g3)                        # both feeds fresh
         self.assertEqual(w.verdict(6.0, DAY, later)["action"], "quote")  # expired
 
+    def test_a_restart_does_not_extend_the_freeze(self):
+        # Jack 2026-10-07: the 00:46Z / 00:56Z restarts each re-saw a 00:30Z
+        # GFZ M5.08 as new. The clock starts no later than origin +
+        # FIRST_SEEN_MAX_LAG_MIN, whatever the process saw.
+        now = DAY + 12 * H
+        origin = now - 60 * 60                    # an hour-old detection
+        g = [gfz_ev("g7", 5.1, origin)]
+        w = self.watch(now, gfz=g, gfz_age=0)     # a fresh process: first seen now
+        end = origin + (q.FIRST_SEEN_MAX_LAG_MIN + q.FREEZE_MAX_MIN) * 60
+        self.assertGreater(end, now)
+        self.assertEqual(w.verdict(6.0, DAY, now)["action"], "hold")
+        self.poll(w, end + 1, [], gfz=g)
+        self.assertEqual(w.verdict(6.0, DAY, end + 1)["action"], "quote")
+        # a live process that saw it at publication keeps the full freeze
+        t0 = now - 5 * 60
+        g2 = [gfz_ev("g8", 5.1, t0)]
+        w = self.watch(now, gfz=g2, gfz_age=0)    # first seen 5 min after origin
+        self.poll(w, now + q.FREEZE_MAX_MIN * 60 - 30, [], gfz=g2)
+        self.assertEqual(w.verdict(6.0, DAY, now + q.FREEZE_MAX_MIN * 60 - 30)["action"], "hold")
+        self.poll(w, now + q.FREEZE_MAX_MIN * 60 + 30, [], gfz=g2)
+        self.assertEqual(w.verdict(6.0, DAY, now + q.FREEZE_MAX_MIN * 60 + 30)["action"], "quote")
+
     def test_stale_gfz_holds_then_prices_on_usgs_alone(self):
         now = DAY + 12 * H
         w = self.watch(now, gfz_age=q.GFZ_STALE_SECS + 10)

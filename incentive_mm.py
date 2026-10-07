@@ -824,7 +824,14 @@ _RAIN_LEVELS_SPEC = os.environ.get("IMM_RAIN_LEVELS", "").strip()
 # directional take (RAIN_DIR_SIZE is its own fixed size). A hand-tuned
 # IMM_RAIN_LEVELS ladder stays literal (applied_mention_mult exempts it).
 # IMM_RAIN_DAILY_SIZE_MULT=1.0 reverts (env => task-level restart).
-RAIN_DAILY_SIZE_MULT = _env_float("IMM_RAIN_DAILY_SIZE_MULT", 1.5)
+# x1.5 -> x2 (Jack 2026-10-07: "add 2x multiplier on ... rain events", then
+# "Bring all rain to x2"): the daily KXRAIN binaries, and the monthlies
+# (RAIN_MONTHLY_SIZE_MULT), weekend KXRAINWKND (RAINWKND_SIZE_MULT) and the
+# KXRAINS<CITY> rainstorm spans (RAINSTORM_SIZE_MULT) with them; the period
+# family (KXRAINNAPAM, RAIN_PERIOD_SIZE_MULT) was already x2. The 19-01 ET
+# halving still composes on top where it applied (dailies, weekend,
+# monthlies): x1 in those evenings.
+RAIN_DAILY_SIZE_MULT = _env_float("IMM_RAIN_DAILY_SIZE_MULT", 2.0)
 for _s in os.environ.get(
         "IMM_RAIN_SERIES",
         "KXRAIN,KXRAINAUSM,KXRAINCHIM,KXRAINDALM,KXRAINDENM,KXRAINHOUM,"
@@ -869,9 +876,11 @@ for _s in os.environ.get(
 # which the daily station fair does not price. Allowance is in code
 # (_DEFAULT_WEATHER_SERIES), unlike the daily KXRAIN, which rides the
 # extra-allow file.
+RAINWKND_SIZE_MULT = _env_float("IMM_RAINWKND_SIZE_MULT", 2.0)     # 2026-10-07
 for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
+            size_mult=RAINWKND_SIZE_MULT,
             price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
             cutoff_before_event_min=_env_int(
@@ -929,7 +938,9 @@ def rainstorm_span_allowed(ticker: str) -> bool:
                 and _RAINSTORM_DATE_SEG_RE.fullmatch(parts[2]))
 
 
+RAINSTORM_SIZE_MULT = _env_float("IMM_RAINSTORM_SIZE_MULT", 2.0)   # 2026-10-07
 SERIES_OVERRIDES[RAINSTORM_ARCHETYPE] = SeriesOverride(
+    size_mult=RAINSTORM_SIZE_MULT,
     price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
     price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
     cutoff_before_event_min=_env_int("IMM_RAINSTORM_CUTOFF_BEFORE_MIN", 0))
@@ -8365,7 +8376,12 @@ def or_gate_reason(ticker: str, now_ts: float,
 # week-to-date -- or the flow since a break in the chart's mix -- pulled 0.3
 # toward the last 6h, sigma vol-only, and a revision of the chart's counts
 # marks the family lag for 6h (openrouter_share_fair.SHARE_RUN_PULL,
-# detect_break, chart_revision).
+# detect_break, chart_revision). 2026-10-06 (Jack: "implement all 3", after
+# z-ai's 21% -> 8% step at 10:15 ET cost -$107): breaks are found on a 1h
+# window (11:06 ET that day, not 12:44) and the family stands aside until
+# 3h of chart time sit behind the break (SHARE_BREAK_HOLD_HOURS) -- the
+# "OpenRouter feed stalled (break in the mix ...)" stand-aside lines. The
+# token fair caps launch-day spikes in its run rate (OR_SPIKE_CAP, 15%).
 SHARE_FAIR_ENABLE = _SHARE_LIVE
 SHARE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_SHARE_FAIR_SERIES", _DEFAULT_OR_SHARE_SERIES).split(",") if s.strip())
@@ -8542,10 +8558,13 @@ RAIN_MONTHLY_FILE = os.environ.get(
 # market -> entry; event -> state (both from the last reload)
 _rain_monthly_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
 
+# x2 (Jack 2026-10-07, "Bring all rain to x2"; see RAIN_DAILY_SIZE_MULT)
+RAIN_MONTHLY_SIZE_MULT = _env_float("IMM_RAIN_MONTHLY_SIZE_MULT", 2.0)
 for _s in RAIN_MONTHLY_SERIES:
     SERIES_OVERRIDES[_s] = replace(
         SERIES_OVERRIDES.get(_s) or SeriesOverride(),
-        cutoff_from_close_min=RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN)
+        cutoff_from_close_min=RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN,
+        size_mult=RAIN_MONTHLY_SIZE_MULT)
 
 
 def rain_monthly_series(series: str) -> bool:
@@ -9096,7 +9115,11 @@ QUAKE_MARGIN_CENTS = _env_float("IMM_QUAKE_MARGIN_CENTS", 1.0)
 QUAKE_USGS_POLL_SECS = _env_float("IMM_QUAKE_USGS_POLL_SECS", 15)
 QUAKE_GFZ_POLL_SECS = _env_float("IMM_QUAKE_GFZ_POLL_SECS", 20)
 QUAKE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN", 10)
-QUAKE_SIZE_MULT = _env_float("IMM_QUAKE_SIZE_MULT", 3.0)
+# x3 -> x4 (Jack 2026-10-07: "increase KXBIGGESTQUAKE to 4x"). Not a daily
+# series, so the hour windows still compose on top: x4 by day, x6 in the
+# 18-21 ET evening window, x12 in the 0-8 ET quiet hours (the per-market cap
+# scales to 400).
+QUAKE_SIZE_MULT = _env_float("IMM_QUAKE_SIZE_MULT", 4.0)
 # HOLD RENEWAL (Jack 2026-09-28, "yes" to renewing held bids): a hold leaves
 # the resting bids exactly as they are, but every IMM order carries an
 # exchange-side expiration (ORDER_TTL_SECS; 1800 in the launcher) and a held
