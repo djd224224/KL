@@ -2325,9 +2325,9 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 # FAMILY (KXOSCAR<CATEGORY>)
                                                 "=KXGGNOM:3,=KXNATBOOKAWARDS:3,"
                                                 "=KXGRAMMY:3,=KXVMA:3,KXOSCAR:3,"
-                                                # Critics Choice comedy
-                                                # series (2026-10-06)
-                                                "=KXCRITICSCOMEDY:3,"
+                                                # Critics Choice, a prefix
+                                                # FAMILY (2026-10-06)
+                                                "KXCRITICS:3,"
                                                 # OpenRouter token usage
                                                 # UNCAPPED (Jack 2026-09-29:
                                                 # "remove the 3-strike cap on
@@ -3683,7 +3683,8 @@ def ca_late_month_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
 ALLOW_SERIES_PREFIXES = tuple(
     p for p in os.environ.get(
         "IMM_ALLOW_PREFIXES",
-        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT,KXAAAGASD,KXOSCAR").split(",") if p)
+        "KXTEMP,KXEARNINGSMENTION,KXAQICITY,KXAVGT,KXAAAGASD,KXOSCAR,"
+        "KXCRITICS").split(",") if p)
 # SPORTS LADDERS & ESCALATORS (Jack 2026-09-24: "allowlist sports ladders
 # and escalators, up until the game starts. e.g. NFLLADDERREC-26SEP24ATLGB,
 # NFLLADDERRECYDS-26SEP24ATLGB. though these shouldnt be quoted since the
@@ -4165,16 +4166,19 @@ _DEFAULT_ECON_SERIES = (
 # the awards rule set registered beside awards_event_start: 3 per event by
 # ROI (EVENT_TOP_N), safe-join (the KXCMA precedent for nominee binaries)
 # and the pre-event stand-down (pre_event_days).
-# CRITICS CHOICE, BEST COMEDY SERIES (Jack 2026-10-06: "KXCRITICSCOMEDY
-# series should be quoting"). KXCRITICSCOMEDY-27-<SHOW>, the 32nd Critics
-# Choice Awards' TV comedy category; its program opened 10/07 00:02Z, one
-# of 25 KXCRITICS* series lit 10/06-10/07 (the open scan is off, so none
-# was quoted). Same awards rule set as the five above; EXACT name, since
-# KXCRITICSCOMEDY is a prefix of KXCRITICSCOMEDYACTO (Best Actor in a
-# Comedy Series), which is not admitted here.
+# CRITICS CHOICE (Jack 2026-10-06: "KXCRITICSCOMEDY series should be
+# quoting", then "yes add all critics choice series"). The 32nd Critics
+# Choice Awards are a FAMILY of per-category series like the Oscars --
+# KXCRITICS<CATEGORY>-27-<NOMINEE>, 25 lit 10/06 19:06Z-10/07 00:02Z: 18
+# film (PIC, DIR, the four acting, both screenplays, ANIM, COM, FOREIGN and
+# seven crafts) and 7 TV (COMEDY, DRAMA and five series acting). None was
+# quoted: no allow entry, and the open scan is off. So KXCRITICS is a
+# PREFIX allow entry (ALLOW_SERIES_PREFIXES) with a family override parent
+# (CRITICS_FAMILY_RE, mentions carved out) carrying the awards rule set,
+# table-only: each series needs its own row in _AWARDS_DATES_DEFAULT, and
+# a category without one stands down (fail closed).
 _DEFAULT_ENTERTAINMENT_SERIES = ("KXRT,KXRTTV,KXVENUEPERFORM,KXCMA,KXMC,KXART,"
-                                 "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,"
-                                 "KXCRITICSCOMEDY")
+                                 "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA")
 # ROTTEN TOMATOES RELEASE-WEEK STAND-DOWN (Jack 2026-09-24 pm: "stand down
 # KXRT events 7 days before close"). Every KXRT market closes 10:00 ET on
 # the Monday after a Friday release, so close - 7d is 10:00 ET on the Monday
@@ -6229,9 +6233,12 @@ if GAS_TRIAL_BLACKOUT_ET:
 # the awards guard set registered on "KXOSCAR" (beside awards_event_start),
 # EXCEPT the mention book, which belongs to the mention family's rules.
 OSCAR_FAMILY_RE = re.compile(r"(?!.*MENTION)KXOSCAR[A-Z0-9]*")
+# Critics Choice (2026-10-06): the same shape on "KXCRITICS"
+CRITICS_FAMILY_RE = re.compile(r"(?!.*MENTION)KXCRITICS[A-Z0-9]*")
 FAMILY_OVERRIDE_PARENTS = (
     ("prefix", "KXAAAGASD", "KXAAAGASD"),
     ("pattern", OSCAR_FAMILY_RE, "KXOSCAR"),
+    ("pattern", CRITICS_FAMILY_RE, "KXCRITICS"),
     ("suffix", "FT", "KXBKFT"),
     ("suffix", "APP", "KXCLAUDEAPP"),
     ("family_suffix", "CC", "KXAMZNCC"),
@@ -10831,21 +10838,27 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #   32nd Critics Choice nominations Fri Dec 4 2026, film and TV together
 #                       (Critics Choice Association's announcement, Apr 20
 #                       2026, via Awards Radar and @CriticsChoice; ceremony
-#                       Jan 3 2027) -> KXCRITICSCOMEDY out Nov 3 2026. The
-#                       film-only below-the-line shortlists (November) do
-#                       not touch the TV categories.
+#                       Jan 3 2027) -> out Nov 3 2026, every category but
+#                       the crafts. The CRAFTS (CINE, COST, EDIT, HAIR,
+#                       PROD, SCORE, VIS) were first narrowed by the
+#                       below-the-line shortlists: Mon Nov 24 2025 for the
+#                       31st, 11 days before its Dec 5 nominations
+#                       (Awards Radar), not announced ahead. The 32nd's is
+#                       unannounced, so their row is a CONSERVATIVE Nov 16
+#                       2026 -- a week before last year's spacing -> out
+#                       Oct 16. Move it when the CCA posts the date.
 # Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES
 # (replaces the WHOLE table), IMM_AWARDS_TABLE_ONLY_SERIES.
 AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 31.0)
 AWARDS_SERIES = tuple(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_SERIES",
-        "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR,KXCRITICSCOMEDY").split(",")
+        "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR,KXCRITICS").split(",")
     if s.strip())
 AWARDS_TABLE_ONLY_SERIES = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_TABLE_ONLY_SERIES",
-        "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR,KXCRITICSCOMEDY").split(",") if s.strip())
+        "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR,KXCRITICS").split(",") if s.strip())
 # 99th-Oscars categories whose first narrowing is the Dec 15 2026 SHORTLIST
 # (winner AND nomination series, by Kalshi's own names; KXOSCARNOMBSOUND is
 # "Oscar nomination for Best Song" and KXOSCARVIS is Makeup & Hairstyling
@@ -10862,9 +10875,19 @@ _OSCAR_SHORTLIST_SERIES_27 = (
     "KXOSCARMAH", "KXOSCARNOMMAKEUP", "KXOSCARVIS",
     "KXOSCARSOUND", "KXOSCARNOMVISUAL",
     "KXOSCARCASTING", "KXOSCARNOMBCASTING")
+# 32nd Critics Choice categories by first narrowing: the crafts' shortlist
+# (conservative Nov 16 2026, see above) or the Dec 4 2026 nominations.
+# Exact rows, no family glob: a category Kalshi adds later stands down until
+# someone gives it a date.
+_CRITICS_CRAFTS_27 = ("CINE", "COST", "EDIT", "HAIR", "PROD", "SCORE", "VIS")
+_CRITICS_OTHER_27 = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR", "ASPLAY",
+                     "OSPLAY", "ANIM", "COM", "FOREIGN", "COMEDY", "COMEDYACTO",
+                     "DRAMA", "DRAMAACTO", "DRAMAACTR", "DRAMASUPACTO",
+                     "DRAMASUPACTR")
 _AWARDS_DATES_DEFAULT = (
     "KXGRAMMY-*69=2026-11-16,KXNATBOOKAWARDS-*26=2026-10-06,"
-    "KXCRITICSCOMEDY-27=2026-12-04,"
+    + "".join(f"KXCRITICS{_c}-27=2026-11-16," for _c in _CRITICS_CRAFTS_27)
+    + "".join(f"KXCRITICS{_c}-27=2026-12-04," for _c in _CRITICS_OTHER_27)
     + ",".join(f"{_s}-27=2026-12-15" for _s in _OSCAR_SHORTLIST_SERIES_27)
     + ",KXOSCAR*-27=2027-01-21")
 

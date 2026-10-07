@@ -281,7 +281,7 @@ _SPORTS_PREFIX = ("KXNFL", "KXMLB", "KXNBA", "KXNHL", "KXWNBA", "KXNCAA", "KXUFC
                   "KXATP", "KXWTA")
 _AWARDS_PREFIX = ("KXGGNOM", "KXGRAMMY", "KXOSCAR", "KXCMA", "KXART", "KXTOP10BB",
                   "KXNETFLIXTOP", "KXWEEKSNUM", "KXNATBOOK", "KXVMA", "KXEMMY",
-                  "KXSPOTIFY", "KXBILLBOARD", "KXBOXOFFICE")
+                  "KXSPOTIFY", "KXBILLBOARD", "KXBOXOFFICE", "KXCRITICS")
 _imm_mod = None      # set by _import_imm() when incentive_mm is importable
 # the rewards report's exact "Politics & policy" members (_QP_RULES)
 _POLICY_EXACT = frozenset(("KXBCNDPSEATS", "KXCANALBERTAREMAIN", "KXMAMDANIEO",

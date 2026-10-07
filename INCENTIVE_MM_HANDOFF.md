@@ -8530,3 +8530,30 @@ as their row, the Oscars' shortlist pattern.
 
 Test: TestScreen.test_critics_choice_comedy_series_quotes_under_the_awards_rules
 (suite 2,266 OK).
+
+### 2026-10-07 ~01:10Z — every Critics Choice series, as a prefix family (Jack: "yes add all critics choice series")
+
+Replaces the exact KXCRITICSCOMEDY entry with the Oscar shape:
+- KXCRITICS in ALLOW_SERIES_PREFIXES.
+- CRITICS_FAMILY_RE ((?!.*MENTION)KXCRITICS...) in FAMILY_OVERRIDE_PARENTS,
+  parent "KXCRITICS" in AWARDS_SERIES and AWARDS_TABLE_ONLY_SERIES.
+- `KXCRITICS:3` prefix cap. A mention book under the prefix keeps the
+  mention rules: no cap, no awards override.
+
+All 25 KXCRITICS*-27 series (18 film, 7 TV) quote at 3 per event with
+safe-join, out 31 days before their first narrowing. The dates are exact
+per-series rows; a category Kalshi adds later stands down until it gets one:
+- CRAFTS (CINE, COST, EDIT, HAIR, PROD, SCORE, VIS) = 2026-11-16, out Oct 16.
+  The 31st's below-the-line shortlists came Mon Nov 24 2025, 11 days before
+  its Dec 5 nominations, and were not announced ahead (Awards Radar). The
+  32nd's is unannounced, so the row is a week earlier than that spacing.
+  MOVE IT when the CCA posts the date.
+- Everything else (picture, director, acting, screenplays, animated, comedy
+  film, foreign language, and the 7 TV series) = 2026-12-04, the
+  nominations, out Nov 3.
+
+imm_dashboard `_AWARDS_PREFIX` gains KXCRITICS (family "Awards, charts &
+media").
+
+Test: TestScreen.test_critics_choice_family_quotes_under_the_awards_rules
+(replaces the comedy-only test; suite 2,266 OK).

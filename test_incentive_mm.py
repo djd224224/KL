@@ -1664,35 +1664,61 @@ class TestScreen(unittest.TestCase):
             for s in ("KXCOLLINCOUNTYJUDGE", "KXSAARLAND"):
                 imm.SERIES_OVERRIDES.pop(s, None)
 
-    def test_critics_choice_comedy_series_quotes_under_the_awards_rules(self):
-        # Jack 2026-10-06: "KXCRITICSCOMEDY series should be quoting". The
-        # awards rule set: exact allow (KXCRITICSCOMEDYACTO is a different
-        # category and stays out), 3 per event, safe-join, out 31 days before
-        # the nominations (Dec 4 2026 -> Nov 3), table-only
+    def test_critics_choice_family_quotes_under_the_awards_rules(self):
+        # Jack 2026-10-06: "KXCRITICSCOMEDY series should be quoting", then
+        # "yes add all critics choice series". The 25 KXCRITICS*-27 series
+        # are a prefix FAMILY (like the Oscars) under the awards rule set:
+        # 3 per event, safe-join, out 31 days before the first narrowing --
+        # the crafts' shortlist (conservative Nov 16 -> Oct 16), the Dec 4
+        # nominations for the rest (-> Nov 3); table-only, exact rows
         place = {"expected_expiration_time": "2027-12-31T15:00:00Z",
                  "close_time": "2027-12-31T15:00:00Z"}
+        crafts = ("CINE", "COST", "EDIT", "HAIR", "PROD", "SCORE", "VIS")
+        rest = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR", "ASPLAY",
+                "OSPLAY", "ANIM", "COM", "FOREIGN", "COMEDY", "COMEDYACTO",
+                "DRAMA", "DRAMAACTO", "DRAMAACTR", "DRAMASUPACTO", "DRAMASUPACTR")
+        names = ["KXCRITICS" + c for c in crafts + rest]
         prev_only = imm.ALLOWLIST_ONLY
         try:
             imm.ALLOWLIST_ONLY = True
-            self.assertTrue(IncentiveMarketMaker._allowed("KXCRITICSCOMEDY-27-TED"))
-            self.assertFalse(IncentiveMarketMaker._blocked("KXCRITICSCOMEDY-27-TED"))
-            self.assertFalse(IncentiveMarketMaker._allowed("KXCRITICSCOMEDYACTO-27-X"))
+            for s in names:
+                self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-27-X"), s)
+                self.assertFalse(IncentiveMarketMaker._blocked(f"{s}-27-X"), s)
         finally:
             imm.ALLOWLIST_ONLY = prev_only
-        self.assertEqual(imm.event_top_n_for("KXCRITICSCOMEDY"), 3)
-        self.assertEqual(imm.event_top_n_for("KXCRITICSCOMEDYACTO"), 0)
-        ov = imm.series_override("KXCRITICSCOMEDY")
-        self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
-                         (31.0, True, True))
-        self.assertEqual(imm.awards_event_start("KXCRITICSCOMEDY-27", place),
-                         utc(2026, 12, 4, 5, 0))
-        self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXCRITICSCOMEDY", "KXCRITICSCOMEDY-27", None, close_time=None,
-            market=place), utc(2026, 11, 3, 5, 0))
-        # next year's show has no row yet: stood down, fail closed
-        self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXCRITICSCOMEDY", "KXCRITICSCOMEDY-28", None, close_time=None,
-            market=place), imm.RELEASE_GUARD_UNKNOWN)
+        for s in names + ["KXCRITICSSONG", "KXCRITICSMENTION"]:
+            imm.SERIES_OVERRIDES.pop(s, None)
+        try:
+            for s in names:
+                self.assertEqual(imm.event_top_n_for(s), 3, s)
+                imm.ensure_family_override(s)
+                ov = imm.series_override(s)
+                self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
+                                 (31.0, True, True), s)
+                want = (utc(2026, 10, 16, 5, 0) if s[len("KXCRITICS"):] in crafts
+                        else utc(2026, 11, 3, 5, 0))
+                self.assertEqual(imm.apply_series_cutoff_adjustments(
+                    s, f"{s}-27", None, close_time=None, market=place), want, s)
+            self.assertEqual(imm.awards_event_start("KXCRITICSCOMEDY-27", place),
+                             utc(2026, 12, 4, 5, 0))
+            self.assertEqual(imm.awards_event_start("KXCRITICSCINE-27", place),
+                             utc(2026, 11, 16, 5, 0))
+            # a category Kalshi adds later, and next year's show: no row ->
+            # stood down, fail closed
+            imm.ensure_family_override("KXCRITICSSONG")
+            for s, ev in (("KXCRITICSSONG", "KXCRITICSSONG-27"),
+                          ("KXCRITICSPIC", "KXCRITICSPIC-28")):
+                self.assertEqual(imm.apply_series_cutoff_adjustments(
+                    s, ev, None, close_time=None, market=place),
+                    imm.RELEASE_GUARD_UNKNOWN, ev)
+            # a mention book under the prefix keeps the mention rules: no
+            # prefix cap, no awards override
+            self.assertEqual(imm.event_top_n_for("KXCRITICSMENTION"), 0)
+            imm.ensure_family_override("KXCRITICSMENTION")
+            self.assertNotIn("KXCRITICSMENTION", imm.SERIES_OVERRIDES)
+        finally:
+            for s in names + ["KXCRITICSSONG", "KXCRITICSMENTION"]:
+                imm.SERIES_OVERRIDES.pop(s, None)
 
     def test_award_shows_three_per_event_and_one_month_stand_down(self):
         # Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY,
