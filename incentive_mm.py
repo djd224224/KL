@@ -471,6 +471,11 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 #      one-sided book does NOT count as healthy: it blocks resume for as
 #      long as it sits there (a settled strike holds its event down; these
 #      markets die at settlement anyway, so "until settlement" IS forever).
+#      2026-10-06 (Jack, KXTRUMPMENTION-26OCT07): a strike whose mid
+#      ALREADY sat outside the band when the halt began (event_depth_ignore)
+#      no longer blocks: TRUM 5c / FRAU 91c / DIVI 93c / SAVE 93c held a
+#      false fill-tripwire halt down with nothing moving. A strike that goes
+#      out of band DURING the halt still blocks (the settled-strike rule).
 #   5. FILL TRIPWIRE (Jack 2026-09-01, SEP01 postmortem): our own book
 #      moving EVENT_FILL_HALT_CONTRACTS+ on a gated market in one cycle
 #      stands the WHOLE event down (resumable), and a SECOND such burst on
@@ -482,7 +487,9 @@ PAD_TO_TARGET_GLOBAL = os.environ.get("IMM_PAD_TO_TARGET", "1") == "1"
 #      101,699 yes contracts, 31 of them priced in-band). Fills ARE the
 #      adverse selection; everything else only predicts it. Active
 #      regardless of IMM_BREAKERS (the old per-market fill-burst breaker
-#      is default-OFF and was never event-wide).
+#      is default-OFF and was never event-wide). Since 2026-10-06 the
+#      second burst must land within EVENT_FILL_STRIKE_TTL_SECS (30 min) of
+#      the first to confirm; an older strike has expired.
 #   6. DATE ARM (Jack 2026-09-04: trigger "only when 1/ the date of the
 #      event is not known or 2/ the date of the event is known and is
 #      the current date"): every trigger above — thin, one-sided, jump
@@ -546,6 +553,12 @@ EVENT_DEPTH_STACK_CONTRACTS = _env_float("IMM_EVENT_DEPTH_STACK", 10000)
 # is permanent).
 EVENT_FILL_HALT_CONTRACTS = _env_float("IMM_EVENT_FILL_HALT", 15)
 EVENT_FILL_HALT_STRIKES = _env_int("IMM_EVENT_FILL_STRIKES", 2)
+# Strikes EXPIRE (Jack 2026-10-06: "fill-tripwire expires after 30min"): a
+# burst counts toward the live confirm only while the previous one is at
+# most EVENT_FILL_STRIKE_TTL_SECS old, so two routine fills hours apart no
+# longer add up to a permanent kill (they never decayed before: 2 bursts on
+# one event at ANY distance = live forever). 0 = never expire (the old rule).
+EVENT_FILL_STRIKE_TTL_SECS = _env_float("IMM_EVENT_FILL_STRIKE_TTL_MIN", 30) * 60.0
 # Point 6 pre-arm: hours before midnight ET of the ticker day that the
 # live triggers arm. 0 = strictly the ticker day (ET).
 EVENT_LIVE_GATE_PREARM_SECS = _env_float(
@@ -12830,6 +12843,14 @@ class BotState:
     # Fill-tripwire strike counts per gated event (persisted: ~20
     # restarts/day must not reset the two-strikes-and-out escalation).
     event_fill_strikes: Dict[str, int] = field(default_factory=dict)
+    # ...and the time of each event's last burst (EVENT_FILL_STRIKE_TTL_SECS)
+    event_fill_strike_ts: Dict[str, float] = field(default_factory=dict)
+    # Strikes of a depth-halted event whose mid already sat OUTSIDE the series
+    # band when the halt began (event -> tickers): they neither block nor
+    # argue for the resume (Jack 2026-10-06, KXTRUMPMENTION-26OCT07, held
+    # down by TRUM 5c / FRAU 91c / DIVI 93c / SAVE 93c strikes that never
+    # moved). Persisted with the halt.
+    event_depth_ignore: Dict[str, List[str]] = field(default_factory=dict)
     bench_until: Dict[str, float] = field(default_factory=dict)
     # Toxic-flow side halt (TOXIC_*): maker fills awaiting their pick-off
     # check [ticker, book_side, yes_px_cents, fill_ts]; confirmed pick-off
@@ -14179,6 +14200,17 @@ class IncentiveMarketMaker:
             self.state.event_fill_strikes = {
                 str(e): int(v) for e, v in
                 (data.get("event_fill_strikes") or {}).items()}
+            self.state.event_fill_strike_ts = {
+                str(e): float(v) for e, v in
+                (data.get("event_fill_strike_ts") or {}).items()}
+            self.state.event_depth_ignore = {
+                str(e): [str(t) for t in (v or [])] for e, v in
+                (data.get("event_depth_ignore") or {}).items()}
+            # a halt persisted before the ignore set existed keeps the old
+            # rule (every strike must be healthy): its out-of-band strikes may
+            # have SETTLED during the halt, which must still hold it down
+            for _e in self.state.event_depth_halt:
+                self.state.event_depth_ignore.setdefault(_e, [])
             self.state.prev_mid.update(
                 {str(t): float(v) for t, v in
                  (data.get("prev_mid_gated") or {}).items()})
@@ -14460,6 +14492,16 @@ class IncentiveMarketMaker:
                                for e, n in self.state.event_fill_strikes.items()
                                if e in self.state.event_depth_halt
                                or e in self.state.event_live_halt},
+                           "event_fill_strike_ts": {
+                               e: round(v, 1)
+                               for e, v in self.state.event_fill_strike_ts.items()
+                               if e in self.state.event_fill_strikes
+                               and (e in self.state.event_depth_halt
+                                    or e in self.state.event_live_halt)},
+                           "event_depth_ignore": {
+                               e: sorted(v)
+                               for e, v in self.state.event_depth_ignore.items()
+                               if e in self.state.event_depth_halt},
                            # gated-series mid history: the settled-strike
                            # jump detector needs prev_mid ACROSS restarts, or
                            # a strike that jumps to 99c during the seconds a
@@ -18449,6 +18491,8 @@ class IncentiveMarketMaker:
             self.state.event_live_halt.pop(ev, None)
             self.state.event_depth_halt.pop(ev, None)
             self.state.event_fill_strikes.pop(ev, None)
+            self.state.event_fill_strike_ts.pop(ev, None)
+            self.state.event_depth_ignore.pop(ev, None)
             log(f"{self.tag} event-live clear: {ev} "
                 f"({'live confirm released' if had else 'was not live-confirmed'})")
         try:
@@ -18756,6 +18800,17 @@ class IncentiveMarketMaker:
         by_event: Dict[str, List[MarketMeta]] = {}
         for _m in managed.values():
             by_event.setdefault(_m.event_ticker, []).append(_m)
+        # A depth halt's already-out-of-band strikes (event_depth_ignore,
+        # 2026-10-06), taken on the first cycle that sees the halt from the
+        # mids it found: the resume pass counts them as not blocking.
+        for _ev in self.state.event_depth_halt:
+            if _ev not in self.state.event_depth_ignore and _ev in by_event:
+                self.state.event_depth_ignore[_ev] = sorted(
+                    _m.ticker for _m in by_event[_ev]
+                    if self.state.prev_mid.get(_m.ticker) is not None
+                    and not (series_price_min(_m.series)
+                             <= self.state.prev_mid[_m.ticker]
+                             <= series_price_max(_m.series)))
         # Near-cliff markets lead their event (NEAR_CLIFF_ROOM_PRIORITY,
         # 2026-09-27) so they claim event room before any sibling; the event
         # order itself still follows the event's best pool.
@@ -18896,8 +18951,14 @@ class IncentiveMarketMaker:
             if (series_event_depth_gated(meta.series) and prev is not None
                     and abs(own_pos - prev) >= EVENT_FILL_HALT_CONTRACTS
                     and event_live_gate_armed(meta.event_ticker, now_ts)):
+                last_burst = self.state.event_fill_strike_ts.get(ev)
+                if EVENT_FILL_STRIKE_TTL_SECS > 0 and (
+                        last_burst is None
+                        or now_ts - last_burst > EVENT_FILL_STRIKE_TTL_SECS):
+                    self.state.event_fill_strikes.pop(ev, None)   # expired
                 strikes = self.state.event_fill_strikes.get(ev, 0) + 1
                 self.state.event_fill_strikes[ev] = strikes
+                self.state.event_fill_strike_ts[ev] = now_ts
                 event_depth_thin.add(ev)
                 self.state.event_depth_halt[ev] = now_ts
                 confirmed = strikes >= EVENT_FILL_HALT_STRIKES
@@ -19093,7 +19154,10 @@ class IncentiveMarketMaker:
                 # 8x9 / FARM 90x91 -- strikes the bot had been QUOTING --
                 # failed the touch gate forever, so the event could never
                 # resume). A real pin (95x97, mid 96) still blocks.
-                if two_sided and not mid_out_of_range:
+                # A strike already out of band when the halt began
+                # (event_depth_ignore) counts too: it never argued for the
+                # live event, so it must not hold the resume down forever.
+                if (two_sided and not mid_out_of_range)                         or t in self.state.event_depth_ignore.get(ev, ()):
                     event_depth_ok[ev] = event_depth_ok.get(ev, 0) + 1
                 if ev in self.state.event_depth_halt:
                     # market of a still-halted event: hold quiet (and keep
@@ -20017,9 +20081,12 @@ class IncentiveMarketMaker:
                         and now_ts - self.state.event_depth_halt[ev_h]
                         >= EVENT_DEPTH_RESUME_SECS):
                     del self.state.event_depth_halt[ev_h]
+                    n_ign = len(self.state.event_depth_ignore.pop(ev_h, ()))
                     log(f"{self.tag} event-depth resume {ev_h}: all "
                         f"{n_mkts} market(s) healthy and no thin side for "
-                        f"{EVENT_DEPTH_RESUME_SECS // 60}min")
+                        f"{EVENT_DEPTH_RESUME_SECS // 60}min"
+                        + (f" ({n_ign} out-of-band at the halt ignored)"
+                           if n_ign else ""))
 
         # Reward accrual estimate between cycles (share x $/day x dt), plus the
         # objective's denominator: contract-minutes actually resting.

@@ -115,5 +115,85 @@ class TestWhScheduleStart(unittest.TestCase):
         self.assertFalse({"white", "house"} & ieo._wh_place_words("The White House"))
 
 
+# RNC events page (2026-10-06): the San Antonio rally page as served, trimmed
+# to the date line and the venue the matcher reads
+SA_SUB = ("Donald Trump - Midterm Rally in San Antonio, Texas originally "
+          "scheduled for October 7, 2026")
+SA_URL = ("https://events.gop.com/events/"
+          "midterm-rally-in-san-antonio-texas-president-donald-j-trump")
+SA_HTML = ("<title>Midterm Rally in San Antonio, Texas featuring President "
+           "Donald J. Trump</title><div class=\"mobile-info\"><p>\n"
+           "                 Wed, October 07, 2026 - 06:00 pm\n"
+           "                                     (US/Central)\n"
+           "                             </p><p>Doors Open: 02:30 PM</p>"
+           "<p>Freeman Coliseum<br></p>3201 E Houston St, San Antonio, TX")
+
+
+class _Resp:
+    def __init__(self, code, text=""):
+        self.status_code, self.text = code, text
+
+
+class TestRncRallyStart(unittest.TestCase):
+
+    def _get(self, pages):
+        calls = []
+
+        def get(url):
+            calls.append(url)
+            return _Resp(200, pages[url]) if url in pages else _Resp(404)
+        return get, calls
+
+    def test_name_from_the_sub_title_rallies_only(self):
+        self.assertEqual(ieo.rnc_event_name(SA_SUB), "Midterm Rally in San Antonio, Texas")
+        self.assertIsNone(ieo.rnc_event_name(
+            "Donald Trump - Oval Office announcement originally scheduled for "
+            "October 7, 2026"))
+        self.assertIsNone(ieo.rnc_event_name("Donald Trump - Rally"))   # no place
+        self.assertIsNone(ieo.rnc_event_name(""))
+
+    def test_the_page_time_in_its_own_zone(self):
+        get, calls = self._get({SA_URL: SA_HTML})
+        dt, url = ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get)
+        self.assertEqual(url, SA_URL)
+        self.assertEqual(dt.isoformat(), "2026-10-07T19:00:00-04:00")   # 6pm CDT
+        self.assertEqual(calls, [SA_URL])                 # first slug hit
+
+    def test_later_slug_variants_are_tried(self):
+        alt = SA_URL.replace("-president-donald-j-trump",
+                             "-featuring-president-donald-j-trump")
+        get, calls = self._get({alt: SA_HTML})
+        dt, url = ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get)
+        self.assertEqual((url, len(calls)), (alt, 2))
+
+    def test_wrong_date_wrong_city_or_no_page_is_nothing(self):
+        get, _ = self._get({SA_URL: SA_HTML})
+        self.assertIsNone(ieo.rnc_rally_start(SA_SUB, date(2026, 10, 8), get=get))
+        get, _ = self._get({SA_URL: SA_HTML.replace("San Antonio", "Austin")})
+        self.assertIsNone(ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get))
+        get, calls = self._get({})
+        self.assertIsNone(ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get))
+        self.assertEqual(len(calls), len(ieo.RNC_SLUG_SUFFIXES))
+        get, calls = self._get({SA_URL: SA_HTML.replace("06:00 pm", "TBD")})
+        self.assertIsNone(ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get))
+        # a fetch error is a miss, not a crash
+        def boom(url):
+            raise OSError("down")
+        self.assertIsNone(ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=boom))
+        # not a rally: never fetched
+        get, calls = self._get({})
+        self.assertIsNone(ieo.rnc_rally_start(
+            "Donald Trump - Oval Office announcement originally scheduled for "
+            "October 7, 2026", date(2026, 10, 7), get=get))
+        self.assertEqual(calls, [])
+
+    def test_rnc_provenance_is_labelled_so_the_wh_schedule_can_replace_it(self):
+        out = ieo.provenance_batch([], [], [], [
+            ("KXTRUMPMENTION-26OCT07", "2026-10-07T19:00:00-04:00", "RNC events", "x"),
+            ("KXTRUMPMENTION-26OCT05", "2026-10-05T19:00:00-04:00", "WH schedule", "y")])
+        self.assertEqual([t[2] for t in out],
+                         ["broadcast schedule [RNC events]", "broadcast schedule"])
+        self.assertEqual(ieo.provenance_of(out[0][2]), "read")
+
 if __name__ == "__main__":
     unittest.main()

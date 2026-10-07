@@ -12587,6 +12587,69 @@ class TestLiveEventDepthGate(unittest.TestCase):
         bot.run_cycle()
         self.assertTrue(self._event_orders(bot))
 
+    def test_strike_out_of_band_before_the_halt_does_not_block_resume(self):
+        """Jack 2026-10-06 (KXTRUMPMENTION-26OCT07): a strike whose mid was
+        ALREADY outside the band when the halt began is ignored by the
+        resume pass; one that leaves the band DURING the halt still blocks
+        (test_pinned_strike_blocks_thin_halt_resume)."""
+        pinned = {"orderbook_fp": {"yes_dollars": [["0.91", "1500"]],
+                                   "no_dollars": [["0.07", "1500"]]}}   # 91x93
+        bot = self._bot()
+        bot.run_cycle()
+        # B creeps out of band before the halt (85 -> 88 -> 92: no one-cycle
+        # jump, so not a settled-strike confirm)
+        for lo in ("0.84", "0.87"):
+            bot.client.books[self.B] = {"orderbook_fp": {
+                "yes_dollars": [[lo, "1500"]],
+                "no_dollars": [[f"{1 - float(lo) - 0.02:.2f}", "1500"]]}}
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+        bot.client.books[self.B] = pinned                  # 91x93, mid 92
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_live_halt)
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        self.assertIn(self.B, bot.state.selected)          # still a member
+        self.assertEqual(bot.state.prev_mid.get(self.B), 92.0)
+        bot.client.books[self.A] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", "300"]],
+            "no_dollars": [["0.49", "1200"]]}}             # A thin -> halt
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        bot.client.books[self.A] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", "1200"]],
+            "no_dollars": [["0.49", "1200"]]}}             # A recovers
+        bot.state.universe_at = time.time()
+        bot.run_cycle()                                    # snapshot taken
+        self.assertEqual(bot.state.event_depth_ignore.get(self.EV), [self.B])
+        # persisted with the halt
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot2.state.event_depth_ignore.get(self.EV), [self.B])
+        bot.state.event_depth_halt[self.EV] =             time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertNotIn(self.EV, bot.state.event_depth_halt,
+                         "B sat at 92 before the halt and never moved")
+        self.assertNotIn(self.EV, bot.state.event_depth_ignore)
+        self.assertNotIn(self.EV, bot.state.event_live_halt)
+
+    def test_halt_from_before_the_ignore_set_keeps_the_old_rule(self):
+        """A halt persisted by older code has no ignore set: on load it gets
+        an empty one, so a strike that may have settled during it still
+        blocks."""
+        bot = self._bot()
+        bot.state.event_depth_halt[self.EV] = time.time()
+        bot._save_persist()
+        with open(imm.IncentiveMarketMaker.PERSIST_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        d.pop("event_depth_ignore", None)
+        with open(imm.IncentiveMarketMaker.PERSIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot2.state.event_depth_ignore.get(self.EV), [])
+
     def test_thin_then_pin_with_history_escalates_to_live_confirm(self):
         """With mid history intact the same pin IS the jump signature: the
         halt branch keeps prev_mid fresh precisely so a later settle-jump
@@ -12649,6 +12712,34 @@ class TestLiveEventDepthGate(unittest.TestCase):
         bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertEqual(bot2.state.event_fill_strikes.get(self.EV), 2)
         self.assertIn(self.EV, bot2.state.event_live_halt)
+        self.assertIn(self.EV, bot2.state.event_fill_strike_ts)
+
+    def test_fill_strike_expires_after_30_minutes(self):
+        """Jack 2026-10-06: "fill-tripwire expires after 30min". A second
+        burst more than EVENT_FILL_STRIKE_TTL_SECS after the first is a
+        fresh burst 1 (resumable), not a permanent live confirm."""
+        self.assertEqual(imm.EVENT_FILL_STRIKE_TTL_SECS, 30 * 60.0)
+        bot = self._bot()
+        bot.run_cycle()
+        bot.pnl.pos[self.B] = 20.0                        # burst 1
+        bot.client.positions[self.B] = 20.0
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertEqual(bot.state.event_fill_strikes.get(self.EV), 1)
+        bot.state.event_depth_halt.pop(self.EV, None)     # halt cleared
+        bot.state.event_fill_strike_ts[self.EV] = time.time() - 31 * 60
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        bot.pnl.pos[self.B] = 45.0                        # burst 31 min on
+        bot.client.positions[self.B] = 45.0
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+        self.assertEqual(bot.state.event_fill_strikes.get(self.EV), 1)
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertNotIn(self.EV, bot.state.event_live_halt)
+        self.assertTrue(any("burst 1/" in m for c, m in bot.alerter.today
+                            if c == "event_fill"))
 
 
 class TestSidesCanQualify(unittest.TestCase):

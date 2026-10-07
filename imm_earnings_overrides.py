@@ -933,6 +933,78 @@ def wh_schedule_start(title: str, date_et, sub_title: str = ""):
     return dt, str(it.get("details") or "")
 
 
+# RNC EVENTS PAGE (Jack 2026-10-06: "Rally start times: use the RNC events
+# page as a source", after KXTRUMPMENTION-26OCT07 -- the San Antonio rally,
+# events.gop.com "Wed, October 07, 2026 - 06:00 pm (US/Central)" -- went
+# UNRESOLVED at the 4:45pm run the day before: the WH schedule lists a rally
+# only a day ahead, so the event ran on the ticker-day live gate and a routine
+# 8:41pm ET fill halted it). The site has no index or API ("Powered by
+# Nucleus", /events and /sitemap.xml 404), but a rally page's slug is its
+# name + "-president-donald-j-trump", and Kalshi's event sub_title carries the
+# name ("Donald Trump - Midterm Rally in San Antonio, Texas originally
+# scheduled for October 7, 2026"): verified on San Antonio (10/07) and Grand
+# Island (10/05). Rallies only (the RNC site does not list Oval Office or
+# White House events), tried AFTER the WH schedule, and a page counts only
+# when it names the city and its own date is the event's date -- a wrong
+# start time is worse than the UNRESOLVED email.
+RNC_EVENTS_BASE = os.environ.get("IMM_RNC_EVENTS_BASE", "https://events.gop.com/events/")
+RNC_SLUG_SUFFIXES = ("-president-donald-j-trump", "-featuring-president-donald-j-trump",
+                     "-with-president-donald-j-trump", "")
+_RNC_WHEN_RE = re.compile(
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,\s+([A-Z][a-z]+)\s+(\d{1,2}),\s+(\d{4})"
+    r"\s*-\s*(\d{1,2}):(\d{2})\s*([ap]m)\s*\(\s*([A-Za-z_]+/[A-Za-z_]+)\s*\)", re.I)
+
+
+def rnc_event_name(sub_title: str):
+    """'Midterm Rally in San Antonio, Texas' out of Kalshi's sub_title, or
+    None when it is not a rally."""
+    name = re.sub(r"^\s*Donald Trump\s*-\s*", "", sub_title or "")
+    name = re.sub(r"\s+originally scheduled for .*$", "", name).strip(" ?")
+    return name if re.search(r"\brally\b", name, re.I) and " in " in name else None
+
+
+def _rnc_slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def rnc_rally_start(sub_title: str, date_et, get=None):
+    """(datetime ET, page url) for a Trump rally from its RNC events page, or
+    None: the slug from Kalshi's sub_title, the page's own date/time/zone
+    line, accepted only when the page names the city and its date is
+    `date_et`."""
+    import pytz
+    name = rnc_event_name(sub_title)
+    if not name:
+        return None
+    city = name.rsplit(" in ", 1)[1].split(",")[0].strip().lower()
+    get = get or (lambda u: requests.get(u, headers=UA, timeout=20))
+    for suf in RNC_SLUG_SUFFIXES:
+        url = RNC_EVENTS_BASE + _rnc_slug(name) + suf
+        try:
+            r = get(url)
+        except Exception as e:
+            log(f"! RNC events fetch failed {url}: {e}")
+            continue
+        if getattr(r, "status_code", 0) != 200:
+            continue
+        html = r.text or ""
+        m = _RNC_WHEN_RE.search(html)
+        if not m or city not in html.lower():
+            continue
+        try:
+            mon = datetime.strptime(m.group(1)[:3], "%b").month
+            hh = int(m.group(4)) % 12 + (12 if m.group(6).lower() == "pm" else 0)
+            local = pytz.timezone(m.group(7)).localize(datetime(
+                int(m.group(3)), mon, int(m.group(2)), hh, int(m.group(5))))
+        except (ValueError, pytz.UnknownTimeZoneError):
+            continue
+        dt_et = local.astimezone(ET)
+        if dt_et.date() != date_et and local.date() != date_et:
+            continue                       # a page for another date
+        return dt_et, url
+    return None
+
+
 def load_file() -> dict:
     try:
         with open(EVENT_OVERRIDES_FILE, encoding="utf-8") as f:
@@ -1011,7 +1083,9 @@ def provenance_batch(resolved, rel_resolved, stale_fixed, bc_resolved) -> list:
         m = re.search(r"\[([^\]]{0,80})\]", str(t[4]) if len(t) > 4 else "")
         out.append((t[0], t[1], m.group(1) if m else "stale-ticker autofix"))
     for t in bc_resolved:                 # (ev, iso, network, title)
-        out.append((t[0], t[1], "broadcast schedule"))
+        # an RNC rally page is named so the WH schedule can replace it later
+        out.append((t[0], t[1], "broadcast schedule [RNC events]"
+                    if len(t) > 2 and t[2] == "RNC events" else "broadcast schedule"))
     return out
 
 
@@ -1321,6 +1395,34 @@ def main(argv=None) -> int:
 
     # Phase 4: scheduled-broadcast mention events the bot cannot window.
     bc_resolved, bc_unresolved = [], []
+    # RNC -> WH upgrade (2026-10-06): an RNC rally page gives the EVENT's start
+    # (Grand Island: 4:30pm local), the WH schedule -- once it lists the rally,
+    # usually the day of -- Trump's remarks (6:00pm local), the time a mention
+    # market turns on. A start the RNC page set (and nothing has changed since)
+    # gives way to a WH match; hand-set values are never touched.
+    meta = load_meta()
+    for ev, iso in sorted(file_data.items()):
+        m_ev = meta.get(ev) or {}
+        if not ev.startswith(WH_SCHEDULE_SERIES) \
+                or "[RNC events]" not in str(m_ev.get("label") or "") \
+                or m_ev.get("iso") != iso:
+            continue
+        d = parse_event_date(ev)
+        if d is None or d.astimezone(ET).date() < now.astimezone(ET).date():
+            continue
+        try:
+            _e = ((client.get_event(ev) or {}).get("event") or {})
+        except Exception as e:
+            log(f"! event fetch failed {ev}: {e}")
+            continue
+        wh = wh_schedule_start(_e.get("title") or "", d.astimezone(ET).date(),
+                               _e.get("sub_title") or "")
+        if wh and wh[0].isoformat() != iso:
+            new = wh[0].isoformat()
+            file_data[ev] = new
+            bc_resolved.append((ev, new, "WH schedule",
+                                f"{wh[1][:60]} (was {iso} from the RNC page)"))
+            log(f"broadcast {ev} = {new}  [WH schedule over RNC {iso}]  {wh[1][:70]}")
     for ev, series in discover_broadcast_mention_events(client, now):
         if ev in EVENT_START_OVERRIDES or ev in file_data:
             continue
@@ -1343,6 +1445,16 @@ def main(argv=None) -> int:
                 bc_resolved.append((ev, iso, "WH schedule",
                                     f"{title[:60]} => {det[:60]}"))
                 log(f"broadcast {ev} = {iso}  [WH schedule]  {det[:70]}")
+                continue
+            # a rally the WH schedule does not list yet: its RNC events page
+            rnc = rnc_rally_start(sub_title, d_et)
+            if rnc:
+                dt_et, url = rnc
+                iso = dt_et.isoformat()
+                file_data[ev] = iso
+                bc_resolved.append((ev, iso, "RNC events",
+                                    f"{sub_title[:60]} => {url[-60:]}"))
+                log(f"broadcast {ev} = {iso}  [RNC events]  {url}")
                 continue
         m = SHOW_TITLE_RE.search(title)
         hit = tvmaze_airtime(m.group(1), d_et) if m else None

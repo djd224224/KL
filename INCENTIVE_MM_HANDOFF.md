@@ -8681,3 +8681,53 @@ which, he chose "Keep x3" for the quake and "Bring all rain to x2", then
 Tests: TestDailyRainSizeMult rewritten (x2 everywhere, the halving to x1,
 quake x4). 1141 green (test_incentive_mm, test_usgs_quake_fair,
 test_rain_monthly_fair, test_snow_monthly_fair).
+
+## 2026-10-07 ~02:00Z — TRUMPMENTION gate: out-of-band strikes stop blocking resume, fill strikes expire after 30 min, rally start times from the RNC events page (Jack: "build all 3. fill-tripwire expires after 30min")
+
+WHY. KXTRUMPMENTION-26OCT07 (the San Antonio rally, Wed 10/7 6:00pm CT) sat
+dark from 8:42pm ET 10/06 with 0 resting orders:
+- No start time existed (the WH schedule lists a rally about a day ahead),
+  so the fill tripwire was armed for the whole ticker day from 8pm ET the
+  night before.
+- A routine SAVE -22 @92 at the touch halted the event.
+- The resume needs every managed strike's mid in band, and TRUM 5c / FRAU
+  91c / DIVI 93c / SAVE 93c never were, so nothing could release it.
+- Released by hand at 01:35Z: `--set ... 2026-10-07T19:00:00-04:00` +
+  event_live_clear.txt.
+
+WHAT:
+1. event_depth_ignore. A depth halt records, on the first cycle that sees
+   it, the event's managed strikes whose prev_mid already sat outside
+   series_price_min..max. The resume pass counts them as not blocking.
+   - A strike that leaves the band DURING the halt still blocks (the
+     settled-strike rule; test_pinned_strike_blocks_thin_halt_resume is
+     unchanged).
+   - A halt loaded from older state gets an empty set (old rule).
+   - Persisted with the halt; cleared on resume and by event_live_clear.txt.
+     The resume log line says how many were ignored.
+2. EVENT_FILL_STRIKE_TTL_SECS (IMM_EVENT_FILL_STRIKE_TTL_MIN, 30). A burst
+   whose previous burst is older than 30 min starts over at strike 1
+   (resumable). Only two bursts within 30 min confirm the event live.
+   event_fill_strike_ts is persisted. 0 = never expire (the old rule).
+3. imm_earnings_overrides: rnc_rally_start.
+   - Rallies only. Kalshi's event sub_title gives the name ("Donald Trump -
+     Midterm Rally in San Antonio, Texas originally scheduled for ...").
+   - The page is events.gop.com/events/<slug>-president-donald-j-trump
+     (+ two variants). The site has no index or API; verified on San
+     Antonio and Grand Island.
+   - The page's own "Wed, October 07, 2026 - 06:00 pm (US/Central)" line is
+     used, only if the page names the city and its date is the event's.
+   - Tried after the WH schedule in Phase 4, labelled "broadcast schedule
+     [RNC events]".
+   - A later run replaces an RNC value with a WH match, because the RNC page
+     gives the EVENT start and WH gives Trump's remarks (Grand Island: RNC
+     4:30pm CT, WH remarks 6:00pm CT). Hand-set values are never touched.
+   - The 4:45pm ET task run now places next-day rallies before the 8pm ET
+     ticker-day arm.
+
+Tests:
+- TestLiveEventDepthGate: an out-of-band strike before the halt does not
+  block resume (and persists); a legacy halt keeps the old rule; a strike
+  expires after 30 min.
+- test_imm_earnings_overrides TestRncRallyStart (5).
+- Suite 2,285 OK.
