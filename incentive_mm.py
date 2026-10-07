@@ -10860,6 +10860,50 @@ _MONTH_NUM = {m: i for i, m in enumerate(
 # horizon, the pre-cutoff reduce-only window) reads it as already over.
 RELEASE_GUARD_UNKNOWN = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _release_guard_warned: Set[str] = set()
+# CONFIG GAPS (Jack 2026-10-07: "also resolve issues like this going
+# forward", after 8 Critics Choice categories Kalshi listed late sat dark
+# ~10h on "no usable date" with only a log line to say so). Every hand-
+# config gap apply_series_cutoff_adjustments meets -- a stand-down waiting
+# on a date / shape row, or an awards category riding its family's default
+# date -- is logged once (the "! " line) AND kept in CONFIG_GAPS_FILE: this
+# process's view, emptied at startup (each event re-logs on its first
+# evaluation). Only the live bot (incentive_mm.py run as the script) writes
+# the file; the offline instances imm_quote_gaps / the tests build must not
+# overwrite it. imm_quote_gaps lists it under ACTION NEEDED in the morning
+# "IMM quotes and overrides" email.
+CONFIG_GAPS_FILE = os.path.join(STATUS_DIR, "config_gaps.json")
+_CONFIG_GAPS_WRITE = __name__ == "__main__"
+_config_gaps: Dict[str, dict] = {}
+
+
+def _write_config_gaps() -> None:
+    if not _CONFIG_GAPS_WRITE:
+        return
+    try:
+        tmp = CONFIG_GAPS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"updated_at": datetime.now(timezone.utc).strftime(
+                           "%Y-%m-%dT%H:%M:%SZ"),
+                       "pid": os.getpid(), "gaps": _config_gaps}, f, indent=1)
+        os.replace(tmp, CONFIG_GAPS_FILE)
+    except OSError as e:
+        log(f"[IMM] config gaps write failed: {e}")
+
+
+def _config_gap(series: str, event_ticker: str, msg: str) -> None:
+    """A hand-config gap on one event: logged once ("[IMM] ! <series>: msg")
+    and recorded in CONFIG_GAPS_FILE."""
+    if event_ticker in _release_guard_warned:
+        return
+    _release_guard_warned.add(event_ticker)
+    log(f"[IMM] ! {series}: {msg}")
+    _config_gaps[event_ticker] = {
+        "series": series, "msg": msg,
+        "since": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    _write_config_gaps()
+
+
+_write_config_gaps()           # the live bot starts the file empty
 
 # AUCTION-DAY CUTOFF (Jack 2026-09-25: "allowlist KXART, max 3 markets per
 # event"). A KXART market settles on the hammer price of one Sotheby's lot
@@ -11057,6 +11101,29 @@ def awards_event_start(event_ticker: str, market: Optional[dict],
     if start is None or (start.month == 12 and start.day == 31):
         return None          # absent, or Kalshi's year-end placeholder
     return start
+
+
+def awards_family_default(event_ticker: str) -> Optional[datetime]:
+    """A category Kalshi lists after its table-only family's rows were
+    written (Jack 2026-10-07, after 8 Critics Choice TV categories sat dark:
+    "also resolve issues like this going forward"): the family's EARLIEST
+    row for the same show, so the newcomer stands down no later than any
+    sibling (an early stand-down is the safe error) and quotes until then
+    instead of not at all. A show with no rows (next year's) still gets
+    None, as does a series outside AWARDS_TABLE_ONLY_SERIES."""
+    series, _, suffix = event_ticker.partition("-")
+    fam = max((f for f in AWARDS_TABLE_ONLY_SERIES if series.startswith(f)),
+              key=len, default=None)
+    if fam is None or not suffix:
+        return None
+    best = None
+    for glob_s, when in AWARDS_EVENT_DATES:
+        g_series, _, g_suffix = glob_s.partition("-")
+        if g_series.startswith(fam) and g_suffix \
+                and fnmatch.fnmatchcase(suffix, g_suffix) \
+                and (best is None or when < best):
+            best = when
+    return best
 
 
 for _s in AWARDS_SERIES:
@@ -11390,11 +11457,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         ym = market_data_month(market)
         if ym is None:
             guard = RELEASE_GUARD_UNKNOWN
-            if event_ticker not in _release_guard_warned:
-                _release_guard_warned.add(event_ticker)
-                log(f"[IMM] ! {series}: release guard needs the data month "
-                    f"but {event_ticker}'s market text does not say "
-                    f"'for <Month> <Year>' -- standing it down (fail closed)")
+            _config_gap(series, event_ticker,
+                        f"release guard needs the data month "
+                        f"but {event_ticker}'s market text does not say "
+                        f"'for <Month> <Year>' -- standing it down (fail closed)")
         else:
             guard = release_guard_cutoff(ym[0], ym[1], ov.release_guard_day)
         cutoff = guard if cutoff is None else min(cutoff, guard)
@@ -11405,26 +11471,35 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         ad = auction_event_date(event_ticker)
         if ad is None:
             ad = RELEASE_GUARD_UNKNOWN
-            if event_ticker not in _release_guard_warned:
-                _release_guard_warned.add(event_ticker)
-                log(f"[IMM] ! {series}: auction-day cutoff needs a trailing "
-                    f"DDMMMYY date in {event_ticker} -- standing it down "
-                    f"(fail closed)")
+            _config_gap(series, event_ticker,
+                        f"auction-day cutoff needs a trailing "
+                        f"DDMMMYY date in {event_ticker} -- standing it down "
+                        f"(fail closed)")
         cutoff = ad if cutoff is None else min(cutoff, ad)
     if ov and ov.pre_event_days is not None:
         # AWARDS PRE-EVENT STAND-DOWN (2026-09-25, see AWARDS_SERIES): out
-        # pre_event_days before the event's start; no usable start ->
-        # stood down (fail closed), logged once.
+        # pre_event_days before the event's start; a table-only family's
+        # category with no row takes the family's earliest row for the show
+        # (awards_family_default, 2026-10-07); no usable start at all ->
+        # stood down (fail closed). Either way a config gap, logged once.
         start = awards_event_start(event_ticker, market,
                                    ov.pre_event_dates_only)
+        if start is None and ov.pre_event_dates_only:
+            start = awards_family_default(event_ticker)
+            if start is not None:
+                _config_gap(series, event_ticker,
+                            f"no hand-table row for {event_ticker} -- on its "
+                            f"family's earliest date for the show, "
+                            f"{start.astimezone(ET):%Y-%m-%d} (out "
+                            f"{ov.pre_event_days:g}d before, the safe "
+                            f"error) until a row is added")
         if start is None:
             pre = RELEASE_GUARD_UNKNOWN
-            if event_ticker not in _release_guard_warned:
-                _release_guard_warned.add(event_ticker)
-                log(f"[IMM] ! {series}: pre-event stand-down needs the event "
-                    f"start but {event_ticker} has no usable date (hand "
-                    f"table, occurrence, expected expiration) -- standing it "
-                    f"down (fail closed)")
+            _config_gap(series, event_ticker,
+                        f"pre-event stand-down needs the event "
+                        f"start but {event_ticker} has no usable date (hand "
+                        f"table, occurrence, expected expiration) -- standing it "
+                        f"down (fail closed)")
         else:
             pre = start - timedelta(days=ov.pre_event_days)
         cutoff = pre if cutoff is None else min(cutoff, pre)
@@ -11440,11 +11515,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         eday = election_cutoff_utc(event_ticker, market)
         if eday is None:
             eday = RELEASE_GUARD_UNKNOWN
-            if event_ticker not in _release_guard_warned:
-                _release_guard_warned.add(event_ticker)
-                log(f"[IMM] ! {series}: {event_ticker} has no verified "
-                    f"election day in ELECTION_DATES -- standing it down "
-                    f"(fail closed) until a checked row is added")
+            _config_gap(series, event_ticker,
+                        f"{event_ticker} has no verified "
+                        f"election day in ELECTION_DATES -- standing it down "
+                        f"(fail closed) until a checked row is added")
         hand = EVENT_START_OVERRIDES.get(event_ticker)
         if hand is not None:
             eday = min(eday, hand - timedelta(minutes=OVERRIDE_BUFFER_MIN))
@@ -11459,11 +11533,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         d0 = vercel_measured_day(event_ticker)
         if d0 is None:
             pre = RELEASE_GUARD_UNKNOWN
-            if event_ticker not in _release_guard_warned:
-                _release_guard_warned.add(event_ticker)
-                log(f"[IMM] ! {series}: Vercel pre-D cutoff needs the measured "
-                    f"day but {event_ticker} does not parse -- standing it "
-                    f"down (fail closed)")
+            _config_gap(series, event_ticker,
+                        f"Vercel pre-D cutoff needs the measured "
+                        f"day but {event_ticker} does not parse -- standing it "
+                        f"down (fail closed)")
         else:
             pre = d0 - timedelta(minutes=VERCEL_CUTOFF_BEFORE_D_MIN)
         cutoff = pre if cutoff is None else min(cutoff, pre)
@@ -11476,11 +11549,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         d0 = yt2_chart_day(event_ticker)
         if d0 is None:
             end = RELEASE_GUARD_UNKNOWN
-            if event_ticker not in _release_guard_warned:
-                _release_guard_warned.add(event_ticker)
-                log(f"[IMM] ! {series}: YouTube #2 cutoff needs the chart day "
-                    f"but {event_ticker} does not parse -- standing it down "
-                    f"(fail closed)")
+            _config_gap(series, event_ticker,
+                        f"YouTube #2 cutoff needs the chart day "
+                        f"but {event_ticker} does not parse -- standing it down "
+                        f"(fail closed)")
             cutoff = end if cutoff is None else min(cutoff, end)
         elif YT2_CHART_DAY_CUTOFF:
             end = d0 + timedelta(days=1,
@@ -11498,11 +11570,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         mc = mort_cutoff_utc(event_ticker)
         if mc is None:
             mc = RELEASE_GUARD_UNKNOWN
-            if event_ticker not in _release_guard_warned:
-                _release_guard_warned.add(event_ticker)
-                log(f"[IMM] ! {series}: {event_ticker} is not a modelled "
-                    f"mortgage shape (year-end / how-high-in-a-year) -- "
-                    f"standing it down (fail closed)")
+            _config_gap(series, event_ticker,
+                        f"{event_ticker} is not a modelled "
+                        f"mortgage shape (year-end / how-high-in-a-year) -- "
+                        f"standing it down (fail closed)")
         cutoff = mc if cutoff is None else min(cutoff, mc)
     # CARBON ARC LATE-MONTH STOP (Jack 2026-09-24 pm, see CA_LATE_STOP_DAYS):
     # keyed on the bot's own source verdict, not the name, so a *FT that is

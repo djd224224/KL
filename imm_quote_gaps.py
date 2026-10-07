@@ -753,12 +753,41 @@ def load_overrides_runs(now_utc: datetime):
     return latest.get("tallies", ""), act, info, ""
 
 
+def config_gap_lines(now_utc: datetime, path: str = "") -> list:
+    """ACTION NEEDED lines for the live bot's hand-config gaps
+    (incentive_mm.CONFIG_GAPS_FILE, Jack 2026-10-07: "also resolve issues
+    like this going forward" -- 8 Critics Choice categories had sat dark on
+    a missing date row with nothing but a log line). One line per series:
+    how many events, a sample, the bot's own reason. [] when none / no file."""
+    path = path or imm.CONFIG_GAPS_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            js = json.load(f)
+    except (OSError, ValueError):
+        return []
+    by: dict = {}
+    for ev, g in sorted((js.get("gaps") or {}).items()):
+        by.setdefault(g.get("series") or "?", []).append((ev, g))
+    if not by:
+        return []
+    out = [f"CONFIG GAPS -- {sum(len(v) for v in by.values())} event(s) in "
+           f"{len(by)} series the bot stands down (or quotes on a default) "
+           f"until a hand row is added (as of {js.get('updated_at', '?')}):"]
+    for series, rows in sorted(by.items()):
+        ev, g = rows[0]
+        more = f" (+{len(rows) - 1} more)" if len(rows) > 1 else ""
+        out.append(f"  {series}{more}: {g.get('msg', '')}")
+    out.append("")
+    return out
+
+
 def build_report(now_utc: datetime):
     """Returns (plain_text, html, subject)."""
     client = imm.build_client()
     bot = imm.IncentiveMarketMaker(client, live=False)
     event_rows, ctx = classify_and_estimate(client, bot, now_utc)
     ovr_tallies, ovr_act, ovr_info, ovr_warn = load_overrides_runs(now_utc)
+    ovr_act = list(ovr_act or []) + config_gap_lines(now_utc)
     # Kalshi event start LATER than the real event (imm_pickoff); never raises
     pick = imm_pickoff.scan(client, now_utc)
     pick_lines = imm_pickoff.text_lines(pick, now_utc)

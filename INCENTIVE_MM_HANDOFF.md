@@ -8796,3 +8796,27 @@ _CRITICS_OTHER_27 (Dec 4 2026 nominations -> out Nov 3), like COMEDY, DRAMA
 and the other series acting rows. Test: the family test's list.
 Also: test_launcher_freezes_no_monthly_rain now expects KXDIESELW in the
 launcher blocklist (80daf48 had left main red on it).
+
+## 2026-10-07 — Config gaps: awards categories Kalshi lists late take the family's earliest date; every hand-config gap reaches the morning email (Jack)
+
+Jack, after the 8 Critics Choice TV categories (4fafdda) had sat dark ~10h
+on "no usable date": "also resolve issues like this going forward".
+
+1. awards_family_default: in a table-only awards family (AWARDS_TABLE_ONLY_
+   SERIES), a category with no hand row now takes the family's EARLIEST row
+   for the same show (event suffix), so it quotes until the earliest sibling
+   stands down instead of not at all -- an early stand-down is the safe
+   error. KXCRITICS*-27 newcomers: Nov 16 (the crafts' conservative
+   shortlist) -> out Oct 16. Next year's show (no rows) still stands down.
+2. CONFIG_GAPS_FILE (run-logs/incentive-mm/config_gaps.json): every hand-
+   config gap apply_series_cutoff_adjustments meets (awards default or no
+   date, election day, release-guard month, auction day, Vercel day, YT2
+   chart day, mortgage shape) goes through _config_gap: the same once-per-
+   event "! " log line, plus a row in the file. Live bot only (__name__ ==
+   "__main__"; the offline instance imm_quote_gaps builds and the tests
+   never write it), emptied at startup.
+3. imm_quote_gaps (7:20 ET "IMM quotes and overrides"): a CONFIG GAPS block
+   under ACTION NEEDED, one line per series with the bot's own reason --
+   the morning email's subject then carries "— ACTION".
+Tests: the Critics family test (newcomer -> Oct 16, -28 still stood down),
+TestConfigGaps, new test_imm_quote_gaps.py; setUpModule redirects the file.

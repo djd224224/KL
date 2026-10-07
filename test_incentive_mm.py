@@ -147,6 +147,7 @@ def setUpModule():
     # the quake gate's status file and in-memory watch (2026-09-27): only the
     # refresher thread writes the file, but never let a test touch the live one
     imm.QUAKE_STATUS_FILE = os.path.join(tmp, "usgs_quake_state.json")
+    imm.CONFIG_GAPS_FILE = os.path.join(tmp, "config_gaps.json")
     imm._quake_state["watch"] = None
     # the Vercel pre-D fair file (2026-09-27) is read by every run_cycle
     imm.VERCEL_FAIR_FILE = os.path.join(tmp, "vercel_fair.json")
@@ -1714,14 +1715,29 @@ class TestScreen(unittest.TestCase):
                              utc(2026, 12, 4, 5, 0))
             self.assertEqual(imm.awards_event_start("KXCRITICSCINE-27", place),
                              utc(2026, 11, 16, 5, 0))
-            # a category Kalshi adds later, and next year's show: no row ->
-            # stood down, fail closed
+            # a category Kalshi adds later (2026-10-07, "also resolve issues
+            # like this going forward"): the family's EARLIEST row for the
+            # show -- the crafts' Nov 16 -> out Oct 16 -- recorded as a config
+            # gap; next year's show has no row at all -> stood down
             imm.ensure_family_override("KXCRITICSSONG")
-            for s, ev in (("KXCRITICSSONG", "KXCRITICSSONG-27"),
-                          ("KXCRITICSPIC", "KXCRITICSPIC-28")):
-                self.assertEqual(imm.apply_series_cutoff_adjustments(
-                    s, ev, None, close_time=None, market=place),
-                    imm.RELEASE_GUARD_UNKNOWN, ev)
+            for ev in ("KXCRITICSSONG-27", "KXCRITICSPIC-28"):
+                imm._release_guard_warned.discard(ev)
+                imm._config_gaps.pop(ev, None)
+            self.assertEqual(imm.awards_family_default("KXCRITICSSONG-27"),
+                             utc(2026, 11, 16, 5, 0))
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXCRITICSSONG", "KXCRITICSSONG-27", None, close_time=None,
+                market=place), utc(2026, 10, 16, 5, 0))
+            self.assertIn("family's earliest date",
+                          imm._config_gaps["KXCRITICSSONG-27"]["msg"])
+            self.assertIsNone(imm.awards_family_default("KXCRITICSPIC-28"))
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXCRITICSPIC", "KXCRITICSPIC-28", None, close_time=None,
+                market=place), imm.RELEASE_GUARD_UNKNOWN)
+            self.assertIn("no usable date",
+                          imm._config_gaps["KXCRITICSPIC-28"]["msg"])
+            # outside the table-only families there is no default
+            self.assertIsNone(imm.awards_family_default("KXRT-ABC"))
             # a mention book under the prefix keeps the mention rules: no
             # prefix cap, no awards override
             self.assertEqual(imm.event_top_n_for("KXCRITICSMENTION"), 0)
@@ -22987,6 +23003,33 @@ class TestElectionBatch20261005(unittest.TestCase):
         # the next run sees it as covered: no re-enroll
         enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
         self.assertEqual(enrolled2, [])
+
+
+
+class TestConfigGaps(unittest.TestCase):
+    """Jack 2026-10-07: "also resolve issues like this going forward" -- a
+    hand-config gap is logged once AND kept in CONFIG_GAPS_FILE for the
+    morning email; only the live bot (run as the script) writes it."""
+
+    def test_recorded_once_per_event_and_written_only_live(self):
+        import json as _json
+        import tempfile as _tempfile
+        self.assertFalse(imm._CONFIG_GAPS_WRITE)       # imported: never writes
+        with _tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "config_gaps.json")
+            with mock.patch.object(imm, "CONFIG_GAPS_FILE", path), \
+                    mock.patch.object(imm, "_config_gaps", {}), \
+                    mock.patch.object(imm, "_release_guard_warned", set()):
+                imm._config_gap("KXFOO", "KXFOO-27", "first")
+                self.assertFalse(os.path.exists(path))
+                with mock.patch.object(imm, "_CONFIG_GAPS_WRITE", True):
+                    imm._config_gap("KXFOO", "KXFOO-27", "again")   # once
+                    imm._config_gap("KXBAR", "KXBAR-26", "no row")
+                with open(path, encoding="utf-8") as f:
+                    js = _json.load(f)
+                self.assertEqual(sorted(js["gaps"]), ["KXBAR-26", "KXFOO-27"])
+                self.assertEqual(js["gaps"]["KXFOO-27"]["msg"], "first")
+                self.assertEqual(js["gaps"]["KXBAR-26"]["series"], "KXBAR")
 
 
 if __name__ == "__main__":
