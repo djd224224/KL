@@ -8490,7 +8490,7 @@ Tests:
 - test_yt_weekly_fair.py TestTwoFeeds (3): default files, the time-ordered
   merge and a window from the feed alone, a late-appearing file.
 
-### 2026-10-07 00:05Z — Seattle joins the monthly snow fair (Jack: "i thought snow markets would automatially quote. why isnt KXSEASNOWM-26DEC?")
+### 2026-10-07 00:42Z — Seattle joins the monthly snow fair (Jack: "i thought snow markets would automatially quote. why isnt KXSEASNOWM-26DEC?")
 
 KXSEASNOWM ("total snowfall in Seattle in <month>") was admitted by the
 KX<CITY>SNOWM pattern and SELECTED (19:42Z 10/06), but snow_monthly_fair had
