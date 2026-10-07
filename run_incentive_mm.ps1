@@ -230,6 +230,11 @@ if ($Probe) {
     # entry was lost once on 9/1 when the pause sat uncommitted through a
     # main sync — it is committed now; prefix-matched, catches state
     # weeklies too. Open weekly positions ride to the 9/7 settlement.
+    # KXDIESELW blocked (Jack 2026-10-06 "Block diesel weeklies"): since 9/06
+    # -$311 settled/marked fill P&L vs $34 reward credits, every week net
+    # negative (SEP07 week -$300 vs $28). Prefix-matched: the weekly only --
+    # KXDIESELD dailies and the KXDIESELMAXY/MINY/YE annuals stay live. The
+    # open OCT12 position (177 YES on $6.22-6.26) rides to settlement.
     # NQE STRIKE-SUFFIX BLOCK (Jack 2026-09-11 pm "implement the suffix
     # block"): the mention family's "Event does not qualify" leg is frozen
     # IN CODE by market-ticker suffix (incentive_mm.MARKET_BLOCK_SUFFIXES,
@@ -371,7 +376,7 @@ if ($Probe) {
     # netted against its control trips"), and a daily task reports it. Set
     # the holdout to 0 once it has proven out.
     # BACK OUT: IMM_SWEEP_BREAKER=dry here, then restart_imm.ps1 -Task.
-    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=120&& set IMM_SWEEP_HOLDOUT=0.2&&"
+    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=120&& set IMM_SWEEP_HOLDOUT=0.2&&"
 }
 
 while ($true) {
