@@ -35,7 +35,8 @@ class TestStations(unittest.TestCase):
         for place, code in (("Boston", "BOS"), ("Washington DC", "DCA"), ("Denver", "DEN"),
                             ("Detroit", "DTW"), ("Milwaukee", "MKE"),
                             ("Minneapolis", "MSP"), ("New York City", "NYC"),
-                            ("Philadelphia", "PHL"), ("Pittsburgh", "PIT")):
+                            ("Philadelphia", "PHL"), ("Pittsburgh", "PIT"),
+                            ("Seattle", "SEA")):
             self.assertEqual(smf.station_code(RULES.format(
                 place=place, month="December", k=8), ev), code, place)
         # a bare "Chicago" is two stations; an unknown city; another month
@@ -47,7 +48,8 @@ class TestStations(unittest.TestCase):
             place="Boston", month="December", k=8), "KXBOSSNOWM-X"))
 
     def test_station_table(self):
-        for code in ("BOS", "ORD", "DCA", "DEN", "DTW", "MKE", "MSP", "NYC", "PHL", "PIT"):
+        for code in ("BOS", "ORD", "DCA", "DEN", "DTW", "MKE", "MSP", "NYC", "PHL", "PIT",
+                     "SEA"):
             spec = smf.SNOW_STATIONS[code]
             self.assertEqual(spec["icao"], "K" + code)
             for k in ("iem", "net", "lat", "lon", "tz"):

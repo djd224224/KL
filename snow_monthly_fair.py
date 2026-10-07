@@ -96,7 +96,11 @@ for _code, _net, _name, _lat, _lon, _tz, _acis in (
         ("MSP", "MN_ASOS", "Minneapolis-St Paul", 44.8831, -93.2289, "US/Central", None),
         ("NYC", "NY_ASOS", "NY Central Park", 40.779, -73.969, "US/Eastern", None),
         ("PHL", "PA_ASOS", "Philadelphia Intl", 39.8721, -75.2411, "US/Eastern", None),
-        ("PIT", "PA_ASOS", "Pittsburgh Intl", 40.4915, -80.2329, "US/Eastern", None)):
+        ("PIT", "PA_ASOS", "Pittsburgh Intl", 40.4915, -80.2329, "US/Eastern", None),
+        # Seattle (Jack 2026-10-06: "why isnt KXSEASNOWM-26DEC [quoting]?"):
+        # Sea-Tac, checked live that day -- IEM currents WA_ASOS, the KSEA
+        # CLI, ACIS snowfall back to 1980
+        ("SEA", "WA_ASOS", "Seattle-Tacoma Intl", 47.4447, -122.3144, "US/Pacific", None)):
     SNOW_STATIONS[_code] = {"icao": f"K{_code}", "iem": _code, "net": _net,
                             "name": _name, "lat": _lat, "lon": _lon, "tz": _tz}
     if _acis:
@@ -106,7 +110,8 @@ for _code, _net, _name, _lat, _lon, _tz, _acis in (
 CITY_CODES = {"Boston": "BOS", "Chicago (O'Hare)": "ORD", "Chicago (Midway)": "MDW",
               "Washington DC": "DCA", "Washington, DC": "DCA", "Denver": "DEN",
               "Detroit": "DTW", "Milwaukee": "MKE", "Minneapolis": "MSP",
-              "New York City": "NYC", "Philadelphia": "PHL", "Pittsburgh": "PIT"}
+              "New York City": "NYC", "Philadelphia": "PHL", "Pittsburgh": "PIT",
+              "Seattle": "SEA"}
 
 _RULES_RE = re.compile(r"\btotal snowfall (?:at|in) (.+?) in ([A-Z][a-z]+) (\d{4})\b")
 _MONTH_NAMES = {n: i for i, n in enumerate(calendar.month_name) if n}

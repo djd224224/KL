@@ -8489,3 +8489,16 @@ Tests:
   lock / dry-run / status.
 - test_yt_weekly_fair.py TestTwoFeeds (3): default files, the time-ordered
   merge and a window from the feed alone, a late-appearing file.
+
+### 2026-10-07 00:05Z — Seattle joins the monthly snow fair (Jack: "i thought snow markets would automatially quote. why isnt KXSEASNOWM-26DEC?")
+
+KXSEASNOWM ("total snowfall in Seattle in <month>") was admitted by the
+KX<CITY>SNOWM pattern and SELECTED (19:42Z 10/06), but snow_monthly_fair had
+no station for "Seattle", so its event sat in the fair file's "missing" list
+with code null and every market stood aside ("no monthly snow fair for this
+market") -- the designed fail-closed path for a new city. Added SEA to
+SNOW_STATIONS (Seattle-Tacoma Intl, WA_ASOS, US/Pacific; checked live: IEM
+currents, the KSEA CLI, ACIS snowfall back to 1980) and "Seattle" to
+CITY_CODES. Dry run: P(December total > 2/4/6/8/10/12 in) = 20 / 11 / 7 / 5 /
+3 / 2% from 38 Decembers. snow_monthly_fair is imported by the IMM's refresher
+thread: deploy = restart_imm.ps1. Test lists gain Seattle.
