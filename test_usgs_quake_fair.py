@@ -54,11 +54,14 @@ class TestParsing(unittest.TestCase):
             {"id": "us1", "properties": {"mag": 5.4, "magType": "mww", "net": "us",
                                          "time": 1790490000000, "place": "Fiji"}},
             {"id": "ak2", "properties": {"mag": None, "time": 1790490000000}},
-            {"id": "ak3", "properties": {"mag": 4.9, "net": "AK", "time": 1790491000000}}]}
+            {"id": "ak3", "properties": {"mag": 4.9, "net": "AK", "time": 1790491000000,
+                                         "updated": 1790492000000}}]}
         gen, evs = q.parse_usgs(payload)
         self.assertEqual(gen, 1790500000.0)
         self.assertEqual([e["id"] for e in evs], ["us1", "ak3"])
         self.assertEqual(evs[1]["net"], "ak")
+        self.assertNotIn("updated", evs[0])
+        self.assertEqual(evs[1]["updated"], 1790492000.0)
         self.assertEqual(q.parse_usgs({}), (None, []))
 
     def test_gfz_text(self):
@@ -189,6 +192,40 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(w.verdict(6.0, DAY, now + q.FREEZE_MAX_MIN * 60 - 30)["action"], "hold")
         self.poll(w, now + q.FREEZE_MAX_MIN * 60 + 30, [], gfz=g2)
         self.assertEqual(w.verdict(6.0, DAY, now + q.FREEZE_MAX_MIN * 60 + 30)["action"], "quote")
+
+    def test_a_restart_credits_a_settled_usgs_solution(self):
+        # Jack 2026-10-07: the 02:33Z restart re-froze on gfz2026tpwq, already
+        # matched to NEIC's settled M4.6. On the first read the clock runs
+        # from the solution's 'updated' stamp up to the feed copy.
+        now = DAY + 12 * H
+        t0 = now - 25 * 60
+        g = [gfz_ev("g9", 5.05, t0)]
+        settled = dict(usgs_ev("us9", 4.6, t0 + 4), updated=now - 10 * 60)
+        w = self.watch(now, usgs=[settled], gfz=g, gfz_age=0)
+        self.assertEqual(w.verdict(6.0, DAY, now)["action"], "quote")
+        # revised 20 s before the copy (generated now - 30): 100 s still to wait
+        recent = dict(usgs_ev("us9", 4.6, t0 + 4), updated=now - 50)
+        w = self.watch(now, usgs=[recent], gfz=g, gfz_age=0)
+        self.assertEqual(w.verdict(6.0, DAY, now)["action"], "hold")
+        self.poll(w, now + 90, [recent], gfz=g)
+        self.assertEqual(w.verdict(6.0, DAY, now + 90)["action"], "hold")
+        self.poll(w, now + 101, [recent], gfz=g)
+        self.assertEqual(w.verdict(6.0, DAY, now + 101)["action"], "quote")
+        # a stamp past the copy, or none: the old clock from the first read
+        for ev in (dict(usgs_ev("us9", 4.6, t0 + 4), updated=now + 5),
+                   usgs_ev("us9", 4.6, t0 + 4)):
+            w = self.watch(now, usgs=[ev], gfz=g, gfz_age=0)
+            self.assertEqual(w.verdict(6.0, DAY, now)["action"], "hold")
+            self.poll(w, now + q.CONFIRM_SECS, [ev], gfz=g)
+            self.assertEqual(w.verdict(6.0, DAY, now + q.CONFIRM_SECS)["action"], "quote")
+        # only the first read: a running process keeps the full clock
+        w = self.watch(now, usgs=[], gfz=g, gfz_age=0)
+        self.poll(w, now + 15, [settled], gfz=g)
+        self.assertEqual(w.verdict(6.0, DAY, now + 15)["action"], "hold")
+        # a regional network still waits out NEIC_WAIT_MIN from the origin
+        ak = dict(usgs_ev("ak9", 5.0, now - 5 * 60, net="ak"), updated=now - 4 * 60)
+        w = self.watch(now, usgs=[ak], gfz_age=0)
+        self.assertEqual(w.verdict(6.0, DAY, now)["action"], "hold")
 
     def test_stale_gfz_holds_then_prices_on_usgs_alone(self):
         now = DAY + 12 * H

@@ -8731,3 +8731,24 @@ Tests:
   expires after 30 min.
 - test_imm_earnings_overrides TestRncRallyStart (5).
 - Suite 2,285 OK.
+
+## 2026-10-07 — Quake gate: a restart credits a USGS solution that has already settled (Jack)
+
+Jack: "KXBIGGESTQUAKE-07OCT26 still not trading" -> "on startup, start the
+120-second stability timer from the 'updated' time USGS publishes with each
+quake rather than from the restart". The 02:33Z IMM restart handed off the
+book (quake bids are cancelled at a handoff), and the new process re-froze
+on GFZ M5.05 gfz2026tpwq, which the old process had matched to NEIC's
+settled M4.6 us6000u0nb at 02:30Z: QuakeWatch's CONFIRM_SECS clock
+(stable_since) lived in memory and restarted at the first read, so the
+event sat bare from 02:33 to 02:39Z.
+
+usgs_quake_fair: parse_usgs keeps each feature's `updated` stamp. On the
+watch's FIRST successful USGS read only, a solution's stable_since is
+now - (the copy's generation time - updated) -- USGS bumps `updated` on
+every revision, so the copy shows it unchanged over that span, and only
+that is credited (no stamp, or one past the copy -> now, the old clock).
+A running process is unchanged; a regional network still waits
+NEIC_WAIT_MIN from the origin. Live feed check: all 18 M4.5+ events carry
+the stamp; us6000u0nb credited ~1,300 s -> confirmed on startup.
+Test: test_a_restart_credits_a_settled_usgs_solution.

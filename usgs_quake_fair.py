@@ -172,10 +172,17 @@ def parse_usgs(payload: dict) -> Tuple[Optional[float], List[dict]]:
             continue
         if not (math.isfinite(mag) and math.isfinite(t)):
             continue
-        out.append({"id": str(f.get("id") or p.get("code") or ""),
-                    "mag": mag, "mag_type": str(p.get("magType") or ""),
-                    "net": str(p.get("net") or "").lower(), "time": t,
-                    "place": str(p.get("place") or "")[:80]})
+        ev = {"id": str(f.get("id") or p.get("code") or ""),
+              "mag": mag, "mag_type": str(p.get("magType") or ""),
+              "net": str(p.get("net") or "").lower(), "time": t,
+              "place": str(p.get("place") or "")[:80]}
+        try:
+            upd = float(p["updated"]) / 1000.0
+            if math.isfinite(upd):
+                ev["updated"] = upd
+        except (KeyError, TypeError, ValueError):
+            pass
+        out.append(ev)
     try:
         gen_ts = float(gen) / 1000.0 if gen is not None else None
     except (TypeError, ValueError):
@@ -242,9 +249,27 @@ class QuakeWatch:
         self.created = time.time()
 
     # -- updates -----------------------------------------------------------
+    @staticmethod
+    def _settled_since(e: dict, generated: Optional[float],
+                       now_ts: float) -> float:
+        """stable_since for a solution on the watch's FIRST USGS read (Jack
+        2026-10-07: the 02:33Z restart re-froze KXBIGGESTQUAKE-07OCT26 on
+        gfz2026tpwq, which the old process had already matched to NEIC's
+        settled M4.6 us6000u0nb -- the CONFIRM_SECS clock had restarted with
+        the process). USGS bumps an event's 'updated' stamp on every
+        revision, so the feed copy shows the solution unchanged from
+        'updated' to its own generation time; only that span is credited.
+        No stamp (or one past the copy) -> now, the old clock."""
+        u = e.get("updated")
+        if u is None:
+            return now_ts
+        seen_to = now_ts if generated is None else min(generated, now_ts)
+        return now_ts - max(0.0, seen_to - u)
+
     def update_usgs(self, generated: Optional[float], events: List[dict],
                     now_ts: float) -> None:
         with self._lock:
+            startup = self.usgs_ok is None         # this process's first read
             fresh: Dict[str, dict] = {}
             for e in events:
                 old = self.usgs.get(e["id"])
@@ -252,7 +277,12 @@ class QuakeWatch:
                 rec["first_seen"] = old["first_seen"] if old else now_ts
                 same = old is not None and old["mag"] == e["mag"] \
                     and old["net"] == e["net"]
-                rec["stable_since"] = old["stable_since"] if same else now_ts
+                if same:
+                    rec["stable_since"] = old["stable_since"]
+                elif old is None and startup:
+                    rec["stable_since"] = self._settled_since(e, generated, now_ts)
+                else:
+                    rec["stable_since"] = now_ts
                 fresh[e["id"]] = rec
             self.usgs = fresh
             self.usgs_ok = now_ts
