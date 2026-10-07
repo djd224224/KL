@@ -8820,3 +8820,15 @@ on "no usable date": "also resolve issues like this going forward".
    the morning email's subject then carries "— ACTION".
 Tests: the Critics family test (newcomer -> Oct 16, -28 still stood down),
 TestConfigGaps, new test_imm_quote_gaps.py; setUpModule redirects the file.
+
+## 2026-10-07 — Election rows for two config gaps: KXSECSTATEIN-26 (Nov 3), KXBRAZILTURNOUT-26OCT25 (Oct 25)
+
+Jack: "also resolve issues like this going forward". Of the 5 Elections-
+category series standing down on "no verified election day", two are real
+votes with a checked day: the Indiana Secretary of State (Nov 3 general,
+IC 3-10-2-1; last filled 2022) and the Brazil runoff's turnout (Oct 25, the
+TSE runoff day already verified for the other runoff series). The other
+three are NOT votes and are left for Jack: KXLULAFLAVIODEBATE (will they
+debate before the runoff), KXOBAMARALLY (who Obama rallies with), and
+KXBKLYNDEMCHAIR (a court ruling on the Brooklyn chair) -- an election-day
+cutoff would quote through their news; carve out or give each its own rule.

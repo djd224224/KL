@@ -22957,6 +22957,16 @@ class TestElectionBatch20261005(unittest.TestCase):
                 ("KXUKBYELECTION-28", utc(2028, 1, 1, 0, 0))):
             self.assertEqual(imm.election_cutoff_utc(ev), want, ev)
 
+    def test_the_2026_10_07_config_gap_rows(self):
+        # Jack 2026-10-07: "also resolve issues like this going forward" --
+        # the two real elections in config_gaps get their verified days
+        self.assertEqual(imm.election_cutoff_utc("KXSECSTATEIN-26"),
+                         utc(2026, 11, 3, 5, 0))                  # 00:00 EST
+        self.assertEqual(imm.election_cutoff_utc("KXBRAZILTURNOUT-26OCT25"),
+                         utc(2026, 10, 25, 3, 0))                 # 00:00 Brasilia
+        self.assertEqual(imm.election_cutoff_utc("KXBRAZILTURNOUT-26OCT04"),
+                         utc(2026, 10, 4, 3, 0))                  # unchanged
+
     def test_the_category_file_joins_the_family_less_the_carve_outs(self):
         self.assertFalse(imm.election_series("KXFOOELECTION"))
         with open(imm.election_extra_path(), "w", encoding="utf-8") as f:

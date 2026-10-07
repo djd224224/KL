@@ -11211,6 +11211,11 @@ _ELECTION_DATES_DEFAULT = ",".join((
     "KXHOUSE??[0-9][0-9]-26=2026-11-03",
     "KXATTYGEN??-26=2026-11-03",
     "KXCAATTORNEYGENERAL-26=2026-11-03",
+    # Indiana Secretary of State (2026-10-07, in config_gaps since its
+    # Elections-category enrollment): on the Nov 3 general ballot -- IC
+    # 3-10-2-1, the even-year general election; the office's four-year term
+    # was last filled in 2022. Eastern, the earlier of Indiana's two zones.
+    "KXSECSTATEIN-26=2026-11-03",
     # Texas county judges: the Nov 3 general election (Texas Election Code
     # s.41.002); El Paso votes on Mountain time, ET midnight is earlier.
     "KX*COUNTYJUDGE-26=2026-11-03",
@@ -11256,6 +11261,9 @@ _ELECTION_DATES_DEFAULT = ",".join((
     "KXBRRUNOFFABROAD-26OCT25*=2026-10-25@America/Sao_Paulo",
     "KXBRRUNOFFCOUNTRIES-26OCT25*=2026-10-25@America/Sao_Paulo",
     "KXBRRUNOFFSTATES-26OCT25*=2026-10-25@America/Sao_Paulo",
+    # runoff turnout (2026-10-07, in config_gaps since enrollment): the same
+    # Oct 25 vote; KXBRAZILTURNOUT-26OCT04 above was the first round's
+    "KXBRAZILTURNOUT-26OCT25*=2026-10-25@America/Sao_Paulo",
     # ...and the state governor runoffs the same day (Agencia Brasil 10/5:
     # six states and the DF go to a second round) -- Espirito Santo
     # (Pazolini v Ferraco), Tocantins (Dorinha v Vicentinho Junior). The
