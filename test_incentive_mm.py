@@ -13047,29 +13047,30 @@ class TestHopelessExitDipGuard(unittest.TestCase):
 
 class TestDailyRainSizeMult(unittest.TestCase):
     """Jack 2026-09-27: "1.5x multiplier on KXUST and daily RAIN since it's
-    consistently performed well". The daily city binaries (series KXRAIN)
-    only: the monthlies, the weekend contract and the rainstorm spans keep
-    the global size."""
+    consistently performed well" -- then 2026-10-07 ("add 2x multiplier on
+    ... rain events", "Bring all rain to x2"): the daily city binaries
+    (series KXRAIN), the monthlies, the weekend contract and the rainstorm
+    spans all at x2; the period family (KXRAINNAPAM) already was."""
 
-    def test_daily_rain_x1_5(self):
-        self.assertEqual(imm.RAIN_DAILY_SIZE_MULT, 1.5)
+    def test_daily_rain_x2(self):
+        self.assertEqual(imm.RAIN_DAILY_SIZE_MULT, 2.0)
         S = "KXRAIN"
         ov = imm.SERIES_OVERRIDES[S]
-        self.assertEqual(ov.size_mult, 1.5)
-        self.assertEqual(imm.applied_mention_mult(S), 1.5)
+        self.assertEqual(ov.size_mult, 2.0)
+        self.assertEqual(imm.applied_mention_mult(S), 2.0)
         self.assertEqual(imm.series_max_position(S),
-                         1.5 * imm.MAX_POSITION_CONTRACTS)
+                         2.0 * imm.MAX_POSITION_CONTRACTS)
         self.assertEqual(imm.event_cap_contracts("KXRAIN-26SEP29"),
-                         1.5 * imm.MAX_EVENT_CONTRACTS)
+                         2.0 * imm.MAX_EVENT_CONTRACTS)
         base = imm.series_levels(S)
         self.assertEqual(imm.base_scaled_levels(S),
-                         [(t, max(1, int(z * 1.5 + 0.5))) for t, z in base])
+                         [(t, max(1, int(z * 2.0 + 0.5))) for t, z in base])
         # the rain band and the 10pm-the-day-before cutoff are untouched
         self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90))
         self.assertEqual(ov.cutoff_before_event_min, 120)
 
     def test_the_evening_halving_composes(self):
-        # the code-default 19-01 ET halving sits on top: x1.5 x 0.5 = x0.75
+        # the code-default 19-01 ET halving sits on top: x2 x 0.5 = x1
         S = "KXRAIN"
         base = imm.series_levels(S)
         with mock.patch.object(imm, "SERIES_HOUR_MULTS",
@@ -13079,19 +13080,19 @@ class TestDailyRainSizeMult(unittest.TestCase):
             self.assertEqual(imm.hour_size_mult(S, day), 1.0)
             self.assertEqual(imm.hour_size_mult(S, eve), 0.5)
             self.assertEqual(imm.hour_scaled_levels(S, day),
-                             [(t, max(1, int(z * 1.5 + 0.5))) for t, z in base])
+                             [(t, max(1, int(z * 2.0 + 0.5))) for t, z in base])
             self.assertEqual(imm.hour_scaled_levels(S, eve),
-                             [(t, max(1, int(z * 0.75 + 0.5))) for t, z in base])
+                             [(t, max(1, int(z * 1.0 + 0.5))) for t, z in base])
 
-    def test_other_rain_shapes_keep_the_global_size(self):
+    def test_every_other_rain_shape_is_x2(self):
         for s in ("KXRAINNYCM", "KXRAINAUSM", "KXRAINWKND",
-                  imm.RAINSTORM_ARCHETYPE):
+                  imm.RAINSTORM_ARCHETYPE, "KXRAINNAPAM"):
             self.assertIn(s, imm.SERIES_OVERRIDES, s)
-            self.assertIsNone(imm.SERIES_OVERRIDES[s].size_mult, s)
-            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+            self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, 2.0, s)
+            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
             self.assertEqual(imm.series_max_position(s),
-                             imm.MAX_POSITION_CONTRACTS, s)
-
+                             2.0 * imm.MAX_POSITION_CONTRACTS, s)
+        self.assertEqual(imm.QUAKE_SIZE_MULT, 4.0)          # Jack 2026-10-07: x4
 
 class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
     """Jack 2026-08-04: allowlist the five daily Treasury-yield tenors."""

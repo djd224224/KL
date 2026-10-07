@@ -8651,3 +8651,33 @@ Tests:
 - test_openrouter_fair: the spike capped in the run rate, not the known
   days; off = the old model.
 - 49 green across both files.
+
+## 2026-10-07 — Quake freeze clock anchored on the quake's origin; KXBIGGESTQUAKE x4; every rain family x2 (Jack)
+
+QUAKE FREEZE (Jack: "why is KXBIGGESTQUAKE-07OCT26 not quoting", then "yes"
+to the fix). A GFZ M5.08 (gfz2026tpui, origin 00:30:02Z 10/07) that USGS
+still had not listed an hour later froze the 07OCT26 book -- the design --
+but FREEZE_MAX_MIN (45) ran from when the watch FIRST SAW the detection, in
+memory, and the 00:46Z and 00:56Z IMM restarts each re-saw it as new: the
+freeze stretched from ~01:15Z to ~01:42Z. usgs_quake_fair: the clock now
+starts at min(first seen, origin + FIRST_SEEN_MAX_LAG_MIN 20) for both USGS
+and GFZ detections, so a live process is unchanged and a restart cannot hold
+a freeze past origin + 65 min (NEWS_MAX_AGE_MIN 105 still bounds it too).
+Test: test_a_restart_does_not_extend_the_freeze.
+
+SIZES (Jack: "add 2x multiplier on KXBIGGESTQUAKE and rain events"; asked
+which, he chose "Keep x3" for the quake and "Bring all rain to x2", then
+"increase KXBIGGESTQUAKE to 4x"):
+- KXBIGGESTQUAKE: QUAKE_SIZE_MULT 3.0 -> 4.0. Not a daily series, so the hour
+  windows compose on top: x4 by day, x6 in the 18-21 ET evening window, x12
+  in the 0-8 ET quiet hours (80 / 120 / 240 per rung at the 20-lot base),
+  per-market cap 400, per-event 4,000. Bid-only YES at fair - 1c as before.
+- Rain: daily KXRAIN 1.5 -> 2.0 (RAIN_DAILY_SIZE_MULT); the KXRAIN<CITY>M
+  monthlies 1 -> 2 (RAIN_MONTHLY_SIZE_MULT, in the monthly gate's override);
+  KXRAINWKND 1 -> 2 (RAINWKND_SIZE_MULT); the KXRAINS<CITY> rainstorm spans
+  1 -> 2 (RAINSTORM_SIZE_MULT); the period family (KXRAINNAPAM) stays 2. The
+  19-01 ET halving still applies to the dailies, weekend and monthlies (x1 in
+  those evenings). Each knob reverts with its env var (task-level restart).
+Tests: TestDailyRainSizeMult rewritten (x2 everywhere, the halving to x1,
+quake x4). 1141 green (test_incentive_mm, test_usgs_quake_fair,
+test_rain_monthly_fair, test_snow_monthly_fair).

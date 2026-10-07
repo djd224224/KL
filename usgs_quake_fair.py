@@ -97,6 +97,15 @@ GFZ_LOOKBACK_MIN = _env_float("IMM_QUAKE_GFZ_LOOKBACK_MIN", 180)
 # a detection is NEWS only while the quake itself is this recent (so a
 # restart does not freeze on the past day's feed)
 NEWS_MAX_AGE_MIN = _env_float("IMM_QUAKE_NEWS_MAX_AGE_MIN", 105)
+# FREEZE CLOCK (Jack 2026-10-07, after KXBIGGESTQUAKE-07OCT26 sat frozen on
+# an unconfirmed GFZ M5.08): FREEZE_MAX_MIN runs from when the watch FIRST
+# SAW a detection, and that lives in memory -- the 00:46Z and 00:56Z IMM
+# restarts each re-saw gfz2026tpui (origin 00:30Z) as new and pushed the
+# freeze from ~01:15Z to ~01:42Z. The clock now starts no later than
+# FIRST_SEEN_MAX_LAG_MIN after the quake's origin (GFZ and USGS publish
+# well inside it), so a live process is unchanged and a restart cannot
+# extend a freeze past origin + FIRST_SEEN_MAX_LAG_MIN + FREEZE_MAX_MIN.
+FIRST_SEEN_MAX_LAG_MIN = _env_float("IMM_QUAKE_FIRST_SEEN_MAX_LAG_MIN", 20)
 
 
 def lam_eff(k: float) -> Optional[float]:
@@ -298,6 +307,13 @@ class QuakeWatch:
             return held
         return held and now_ts - cp["time"] >= NEIC_WAIT_MIN * 60
 
+    @staticmethod
+    def _freeze_start(e: dict) -> float:
+        """When a detection's FREEZE_MAX_MIN clock starts: first seen, but
+        never later than FIRST_SEEN_MAX_LAG_MIN after the quake's origin (a
+        restart re-sees every detection as new)."""
+        return min(e["first_seen"], e["time"] + FIRST_SEEN_MAX_LAG_MIN * 60)
+
     def _match_usgs(self, t: float) -> Optional[dict]:
         best, gap = None, None
         for e in self.usgs.values():
@@ -308,18 +324,19 @@ class QuakeWatch:
 
     def _open_detections(self, now_ts: float) -> List[dict]:
         """Detections that still freeze the book: M >= FREEZE_MIN_MAG, first
-        seen within FREEZE_MAX_MIN, not yet confirmed on USGS."""
+        seen (_freeze_start) within FREEZE_MAX_MIN, not yet confirmed on
+        USGS."""
         out = []
         limit = FREEZE_MAX_MIN * 60
         news = NEWS_MAX_AGE_MIN * 60
         for e in self.usgs.values():
-            if e["mag"] >= FREEZE_MIN_MAG and now_ts - e["first_seen"] <= limit \
+            if e["mag"] >= FREEZE_MIN_MAG and now_ts - self._freeze_start(e) <= limit \
                     and now_ts - e["time"] <= news \
                     and not self._confirmed(e, now_ts):
                 out.append({"src": "usgs", "id": e["id"], "mag": e["mag"],
                             "net": e["net"], "time": e["time"]})
         for g in self.gfz.values():
-            if g["mag"] < FREEZE_MIN_MAG or now_ts - g["first_seen"] > limit \
+            if g["mag"] < FREEZE_MIN_MAG or now_ts - self._freeze_start(g) > limit \
                     or now_ts - g["time"] > news:
                 continue
             if not self._confirmed(self._match_usgs(g["time"]), now_ts):
@@ -396,6 +413,7 @@ class QuakeWatch:
                           "confirm_secs": CONFIRM_SECS,
                           "neic_wait_min": NEIC_WAIT_MIN,
                           "freeze_max_min": FREEZE_MAX_MIN,
+                          "first_seen_max_lag_min": FIRST_SEEN_MAX_LAG_MIN,
                           "news_max_age_min": NEWS_MAX_AGE_MIN,
                           "match_secs": MATCH_SECS,
                           "usgs_stale_secs": USGS_STALE_SECS,
