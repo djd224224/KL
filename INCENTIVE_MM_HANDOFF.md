@@ -8844,3 +8844,31 @@ over the Oct 7-11 period. CRITICS_SIZE_MULT 2.0 on the KXCRITICS family
 parent (every member clones it; caps scale; hour windows compose). The
 estimator's x6 line had SROO at $0.82/day. Expect ~1 favorite per event in,
 ~+$4-5/day across the six. Revert: IMM_CRITICS_SIZE_MULT=1.
+
+### 2026-10-08 ~00:10Z — KXSTATELEG (state legislature control, 28 chambers) joins the election family, all dated Nov 3 2026 (Jack: "why isnt XSTATELEG-TXSENA26, KXSTATELEG-MNHOUSE26 quoting as part of elections?")
+
+WHY. Kalshi lit KXSTATELEG ("State legislature winners", category Elections,
+tag Other US Elections) at 22:31Z 10/07: 56 markets, 28 chambers x R/D,
+7-day programs. The overrides task's Elections-category pass last ran at
+4:45pm ET, and the next is 6:45am. Even enrolled, every member needs a
+verified ELECTION_DATES row, so the series was dark.
+
+WHAT:
+- "KXSTATELEG" is on the exact ELECTION_SERIES list.
+- _STATELEG_CHAMBERS_26 holds the 28 chamber codes Kalshi uses (AKHOUSE
+  ... WISEN, including its spellings TXHOUS / TXSENA / FLHOUS / FLSENA /
+  NVASSE / NVSENA). Each gets an exact row KXSTATELEG-<code>26=2026-11-03.
+- Verified: Wikipedia "2026 United States state legislative elections"
+  (seats-up table: all 28 have seats up on Nov 3), Ballotpedia and NCSL
+  (88 of 99 chambers in 46 states). None is among the 11 not up (KS / NM /
+  SC Senates, LA, MS, NJ, VA).
+- ET start of day. Alaska, Arizona and Nevada vote later in the day, so ET
+  is the conservative zone.
+- A chamber added later has no row, so it stands down and shows in
+  config_gaps.
+
+Note: many chambers are lopsided (TX Senate R 91/94, MN House D 86/91) and
+will screen out on the band / extreme-mid rules. The competitive ones
+(AZ, MI, WI, NH, MN) are the likely quoters.
+
+Test: test_state_legislature_control_is_an_election_dated_nov_3 (suite 2,300 OK).
