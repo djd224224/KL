@@ -8872,3 +8872,35 @@ will screen out on the band / extreme-mid rules. The competitive ones
 (AZ, MI, WI, NH, MN) are the likely quoters.
 
 Test: test_state_legislature_control_is_an_election_dated_nov_3 (suite 2,300 OK).
+
+### 2026-10-08 ~00:15Z — nomination series under the awards rules: KXCRITICSCHOICENOM (33 categories) and the Grammy nominees KXGRAMMYNOM* (Jack: "why isnt KXCRITICSCHOICENOM-COM27, KXCRITICSCHOICENOM-DRAMA27, etc quoting ... its nominations but should still be allowed", "same with grammy nominees e.g. KXGRAMMYNOMAOTY-69")
+
+WHY.
+- KXCRITICSCHOICENOM ("Critics Choice Nominees") is ONE series with the
+  category in the event segment (-ACTR27, -COMSER27 ...). It rode in on the
+  KXCRITICS prefix, but every hand row is KXCRITICS<CAT>-27, so none matched.
+  awards_family_default only fnmatched the segment, so "ACTR27" vs "27" had
+  no fallback either. All 33 stood down on "no usable date" from 16:10Z (22
+  sat in config_gaps.json). 25 events carry ~$257-284/day programs to
+  10/11 03:59Z.
+- The Grammy nominees (KXGRAMMYNOMAOTY / ROTY / SOTY / NAOTY / BRA, -69)
+  were never admitted, because KXGRAMMY is an EXACT allow entry. On 10/08,
+  only AOTY / ROTY / SOTY carry programs (4 markets, ~$14/day each).
+
+WHAT:
+- Critics: exact rows KXCRITICSCHOICENOM-<CAT>27. The seven crafts go on the
+  conservative Nov 16 (-> out Oct 16), the other 26 (Kalshi's TV codes
+  COM* / LIM*) on the Dec 4 nominations (-> out Nov 3). The family's x2
+  rides along on its parent.
+- awards_family_default also matches by EDITION (the segment's trailing
+  number, _awards_edition), so a category Kalshi adds later in this shape
+  takes the family's earliest row and is listed as a config gap.
+- Grammy nominees are admitted by name pattern KXGRAMMYNOM(?!COUNT)[A-Z0-9]+
+  (ALLOW_SERIES_PATTERNS). The KXGRAMMYNOMCOUNT<ARTIST> count ladders stay
+  out. Parent "KXGRAMMYNOM" (FAMILY_OVERRIDE_PARENTS) is in AWARDS_SERIES
+  and is table-only, with 3/event ("KXGRAMMYNOM:3") and safe-join. Row
+  KXGRAMMYNOM*-69=2026-11-16: the 69th nominations are Mon Nov 16 per the
+  Recording Academy's May 12 release, so they go out Oct 16. Kalshi's Nov 2
+  occurrence on AOTY / BRA is not the date, and is not used (table-only).
+
+Test: test_nomination_series_quote_under_the_awards_rules (suite 1,108 OK).
