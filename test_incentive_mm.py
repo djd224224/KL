@@ -18353,6 +18353,17 @@ class TestVercelPreDGate(unittest.TestCase):
                       for o in bot.state.sim_orders.values()
                       if o["ticker"] == self.T)
 
+    def test_anthvreq_doubled_size(self):
+        # Jack 2026-10-08: "double size of series" -- KXANTHVREQ x2 on the
+        # global geometry; the caps scale with it, the other labs stay x1
+        self.assertEqual(imm.ANTHVREQ_SIZE_MULT, 2.0)
+        self.assertEqual(imm.series_override("KXANTHVREQ").size_mult, 2.0)
+        self.assertEqual(imm.applied_mention_mult("KXANTHVREQ"), 2.0)
+        self.assertEqual(imm.series_max_position("KXANTHVREQ"),
+                         2.0 * imm.MAX_POSITION_CONTRACTS)
+        for s in ("KXANTHVSPEND", "KXGOOGVREQ", "KXOPENVREQ", "KXDEEPVREQ"):
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+
     def test_enrolled_with_a_pre_d_cutoff(self):
         for s in ("KXOPENVSPEND", "KXMOONVSPEND", "KXANTHVSPEND", "KXGOOGVREQ",
                   "KXOPENVREQ", "KXDEEPVREQ", "KXANTHVREQ", "KXOPENSOURCESHARE"):

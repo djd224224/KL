@@ -9619,6 +9619,18 @@ for _s in VERCEL_SERIES:
     SERIES_OVERRIDES[_s] = replace(
         SERIES_OVERRIDES.get(_s) or SeriesOverride(),
         cutoff_from_close_min=0, safe_join=True)
+# KXANTHVREQ x2 (Jack 2026-10-08: "double size of series"). The 12OCT26
+# strikes each pay $18/day (programs 10/08 16:02Z -> 10/11 03:59Z) with
+# 8k-12k contracts already in band, so the standard ladder's 1-3% share
+# projected $1.11-1.36 on five strikes against the $1.50 entry bar and
+# only T7P2 ($2.08) quoted. x2 roughly doubles the share; the per-market
+# and per-event caps scale with it (applied_mention_mult), and the pre-D
+# cutoff and the fair gate are unchanged. IMM_ANTHVREQ_SIZE_MULT=1
+# reverts (env => task-level restart).
+ANTHVREQ_SIZE_MULT = _env_float("IMM_ANTHVREQ_SIZE_MULT", 2.0)
+if "KXANTHVREQ" in SERIES_OVERRIDES:
+    SERIES_OVERRIDES["KXANTHVREQ"] = replace(SERIES_OVERRIDES["KXANTHVREQ"],
+                                             size_mult=ANTHVREQ_SIZE_MULT)
 
 
 def vercel_series(series: str) -> bool:
