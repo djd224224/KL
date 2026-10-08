@@ -11130,13 +11130,94 @@ AWARDS_EVENT_DATES = _parse_awards_dates(os.environ.get(
     "IMM_AWARDS_EVENT_DATES", _AWARDS_DATES_DEFAULT))
 
 
+# HOT-RELOADED ROWS (Jack 2026-10-07: "how to ensure new events get quoted
+# when they should fall under existing quote families e.g. elections, award
+# ceremonies, rain, etc. dont want to manually catch this going fwd" -> "yes
+# build all 5"). Dated rows the code tables lack live in two files beside the
+# state, {"rows": [{"glob", "date", "zone" (elections), "sources", "by", "at",
+# "note"}]}, written by imm_rows.py (the gap-fixer routine and hand fixes: two
+# different sources a row) and by imm_family_watch.py's US-general rule. Re-read
+# by mtime at import and every universe refresh, so a fix lands in one refresh
+# with no deploy. The code tables are checked first and win on an event both
+# match.
+ELECTION_DATES_EXTRA_FILE = "election_dates_extra.json"     # in STATUS_DIR
+AWARDS_DATES_EXTRA_FILE = "awards_dates_extra.json"         # in STATUS_DIR
+ROWS_GLOB_RE = re.compile(r"KX[A-Z0-9*?\[\]-]+")
+ELECTION_DATES_EXTRA: List[Tuple[str, datetime, Any, Any]] = []
+AWARDS_DATES_EXTRA: List[Tuple[str, datetime]] = []
+_rows_extra_state: Dict[str, float] = {}
+
+
+def election_dates_extra_path() -> str:
+    return os.path.join(STATUS_DIR, ELECTION_DATES_EXTRA_FILE)
+
+
+def awards_dates_extra_path() -> str:
+    return os.path.join(STATUS_DIR, AWARDS_DATES_EXTRA_FILE)
+
+
+def _rows_file(path: str) -> Optional[list]:
+    """A hot-reloaded rows file's rows when it changed since the last read
+    (by mtime; a file that went away reads as []), else None."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        if _rows_extra_state.get(path):
+            _rows_extra_state[path] = 0.0
+            return []
+        return None
+    if mtime == _rows_extra_state.get(path):
+        return None
+    _rows_extra_state[path] = mtime
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! {os.path.basename(path)} unreadable: {e}")
+        return None
+    return [r for r in (data.get("rows") or []) if isinstance(r, dict)]
+
+
+def _row_spec(r: dict, with_zone: bool) -> Optional[str]:
+    """'<glob>=<date>[@<zone>]' for a well-formed row, else None."""
+    g = str(r.get("glob") or "").strip()
+    d = str(r.get("date") or "").strip()
+    z = str(r.get("zone") or "").strip() if with_zone else ""
+    if not ROWS_GLOB_RE.fullmatch(g) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return None
+    return f"{g}={d}" + (f"@{z}" if z else "")
+
+
+def load_awards_dates_extra() -> int:
+    """Re-read AWARDS_DATES_EXTRA_FILE when it changed. Returns how many
+    rows changed (0 when unchanged)."""
+    rows = _rows_file(awards_dates_extra_path())
+    if rows is None:
+        return 0
+    fresh = []
+    for r in rows:
+        spec = _row_spec(r, with_zone=False)
+        try:
+            fresh += list(_parse_awards_dates(spec)) if spec else []
+        except ValueError as e:
+            log(f"[IMM] ! awards dates extra: {e}")
+    changed = len(set(fresh) ^ set(AWARDS_DATES_EXTRA))
+    AWARDS_DATES_EXTRA[:] = fresh
+    if changed:
+        log(f"[IMM] awards dates extra: {len(fresh)} row(s) ({changed} changed)")
+    return changed
+
+
+load_awards_dates_extra()
+
+
 def awards_event_start(event_ticker: str, market: Optional[dict],
                        dates_only: bool = False) -> Optional[datetime]:
     """When an award event starts (UTC): the hand table first, then Kalshi's
     occurrence / expected expiration off the market object unless
     `dates_only`. None when nothing trustworthy says (the caller fails
     closed)."""
-    for glob_s, when in AWARDS_EVENT_DATES:
+    for glob_s, when in tuple(AWARDS_EVENT_DATES) + tuple(AWARDS_DATES_EXTRA):
         if fnmatch.fnmatchcase(event_ticker, glob_s):
             return when
     if dates_only or not isinstance(market, dict):
@@ -11171,7 +11252,7 @@ def awards_family_default(event_ticker: str) -> Optional[datetime]:
         return None
     edition = _awards_edition(suffix)
     best = None
-    for glob_s, when in AWARDS_EVENT_DATES:
+    for glob_s, when in tuple(AWARDS_EVENT_DATES) + tuple(AWARDS_DATES_EXTRA):
         g_series, _, g_suffix = glob_s.partition("-")
         if g_series.startswith(fam) and g_suffix \
                 and (fnmatch.fnmatchcase(suffix, g_suffix)
@@ -11455,6 +11536,29 @@ def _parse_election_dates(spec: str) -> Tuple[Tuple[str, datetime, Any, Any], ..
 
 ELECTION_DATES = _parse_election_dates(os.environ.get(
     "IMM_ELECTION_DATES", _ELECTION_DATES_DEFAULT))
+
+
+def load_election_dates_extra() -> int:
+    """Re-read ELECTION_DATES_EXTRA_FILE when it changed. Returns how many
+    rows changed (0 when unchanged)."""
+    rows = _rows_file(election_dates_extra_path())
+    if rows is None:
+        return 0
+    fresh = []
+    for r in rows:
+        spec = _row_spec(r, with_zone=True)
+        try:
+            fresh += list(_parse_election_dates(spec)) if spec else []
+        except ValueError as e:
+            log(f"[IMM] ! election dates extra: {e}")
+    changed = len(set(fresh) ^ set(ELECTION_DATES_EXTRA))
+    ELECTION_DATES_EXTRA[:] = fresh
+    if changed:
+        log(f"[IMM] election dates extra: {len(fresh)} row(s) ({changed} changed)")
+    return changed
+
+
+load_election_dates_extra()
 ELECTION_OCC_BACK_HOURS = 6
 _election_disagree_warned: Set[str] = set()
 
@@ -11466,7 +11570,7 @@ def election_cutoff_utc(event_ticker: str,
     market down). Kalshi's own dates are never used; when the ticker date or
     the occurrence's day is EARLIER than the verified day it is logged once,
     so a stale row shows up."""
-    for glob_s, when, day, zone in ELECTION_DATES:
+    for glob_s, when, day, zone in tuple(ELECTION_DATES) + tuple(ELECTION_DATES_EXTRA):
         if fnmatch.fnmatchcase(event_ticker, glob_s):
             break
     else:
@@ -16152,6 +16256,8 @@ class IncentiveMarketMaker:
         load_extra_allow_series()
         load_finecon_extra_series()
         load_election_extra_series()
+        load_election_dates_extra()   # hot-reloaded rows (2026-10-07)
+        load_awards_dates_extra()
         load_family_verdicts()
         load_sat_gate()
         load_rain_fair()

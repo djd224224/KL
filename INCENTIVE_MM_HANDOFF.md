@@ -8904,3 +8904,61 @@ WHAT:
   occurrence on AOTY / BRA is not the date, and is not used (table-only).
 
 Test: test_nomination_series_quote_under_the_awards_rules (suite 1,108 OK).
+
+## 2026-10-08 ~00:40Z — family watch: new members of existing families get admitted, dated and alerted without a hand catch (Jack: "how to ensure new events get quoted when they should fall under existing quote families ... dont want to manually catch this going fwd" -> "yes build all 5. $5/day is the right threshold")
+
+WHY. This week's misses all had the same shape:
+- KXCRITICS*, KXSTATELEG, the 10/07 evening election batch: Kalshi lights
+  batches in the evening; the new-series pass ran 3x/day (6:45 / 12:45 /
+  4:45 ET).
+- An admitted series still needed a hand row (an election date, an award
+  date, a start time), and the bot fails closed without one.
+- The 7:20 email surfaced it the next morning.
+
+WHAT (five pieces):
+1. imm_family_watch.py, every 30 min (Windows task "KL imm family-watch",
+   log run-logs/incentive-mm/family-watch.log). It imports imm_quote_gaps
+   first (the launcher env), then runs imm_earnings_overrides.enroll_new_series.
+   - Dry run 00:35Z found 7 Elections series lit after 4:45pm: KXPAHOUSE,
+     KXPASEN, KXTXHOUSE, KXISRAELBLOCMAJ / -MOST, KXSPAINTURNOUT, KXRETIREMM.
+2. us_general_vote_ok gives an undated election-family event its Nov 3 2026
+   row (election_dates_extra.json, by "family-watch:us-general-2026"). It
+   needs all of:
+   - Kalshi category Elections and a US tag ("US Elections" / "Other US
+     Elections"), not "International elections";
+   - its terms (rules_primary + title) or ticker segment name 2026;
+   - vote language, and none of rally / debate / attend / endorse / court /
+     announce / primary / runoff / special election / recall / nominate /
+     resign / impeach / indict / appoint;
+   - expiry from Nov 3 2026 to Jan 31 2027.
+   Validated on every election-family event with a verified row: 58 of 59
+   Nov 3 events pass, 0 false positives, all 19 other-date events refused.
+3. Hot-reloaded rows, re-read every universe refresh:
+   - incentive_mm ELECTION_DATES_EXTRA / AWARDS_DATES_EXTRA from
+     election_dates_extra.json / awards_dates_extra.json. The code tables
+     win; awards_family_default sees the extras.
+   - imm_rows.py is the writer: add / list / remove. It needs two different
+     sources, refuses a glob the code table dates, and validates glob, date
+     and zone.
+4. A scheduled Claude routine "imm-gap-fixer" (desktop scheduled task;
+   0:00 and every 2h from 8am ET). It reads the quote-gaps ACTION list and
+   config_gaps.json and researches each row:
+   - election days via `imm_rows.py election add` with two sources;
+   - award first-narrowing dates via `imm_rows.py award add`;
+   - mention start times via `imm_earnings_overrides.py --set`.
+   It lists judgment calls (new families, non-vote "Elections" series) and
+   never edits code, git, or the bot.
+5. Alert: one IMM-WATCH email per run for items dark >= 30 min and worth
+   >= $5/day of estimated reward (event pool $/day x GAP_CAPTURE 0.022, the
+   median est_frac of 10/07's quoted rows). Covers the live bot's config gaps
+   (re-sent daily while open) and newly paying not-allowed series (a new
+   family, sent once, then baselined). family_watch_state.json; the first
+   run baselines today's not-allowed list.
+
+Knobs:
+- IMM_GAP_ALERT_MIN_DPD (5), IMM_GAP_ALERT_AFTER_MIN (30),
+  IMM_GAP_REALERT_HOURS (24), IMM_GAP_CAPTURE (0.022).
+- Disable the task / the routine to stop.
+
+Tests: test_imm_family_watch.py (10: rule, rows, reload, alert timing).
+Suite 2,311 OK.
