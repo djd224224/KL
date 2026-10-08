@@ -2429,6 +2429,9 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 # Critics Choice, a prefix
                                                 # FAMILY (2026-10-06)
                                                 "KXCRITICS:3,"
+                                                # Grammy nominees, a pattern
+                                                # FAMILY (2026-10-07)
+                                                "KXGRAMMYNOM:3,"
                                                 # OpenRouter token usage
                                                 # UNCAPPED (Jack 2026-09-29:
                                                 # "remove the 3-strike cap on
@@ -3817,9 +3820,21 @@ ALLOW_SERIES_PREFIXES = tuple(
 _SPORTS_LADDER_PATTERN = (
     r"KX(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAB|CFB|CBB|MLS)[A-Z0-9]*"
     r"(LADDER|ESCALATOR)[A-Z0-9]*")
+# GRAMMY NOMINEES (Jack 2026-10-07: "same with grammy nominees e.g.
+# KXGRAMMYNOMAOTY-69"). The 69th Grammys' nomination binaries are one series
+# per category, KXGRAMMYNOM<CATEGORY>-69-<NOMINEE> -- AOTY, ROTY, SOTY,
+# NAOTY (Best New Artist) and BRA (Best Rap Album) open on 10/07 -- and none
+# was quoted: KXGRAMMY is an EXACT allow entry. Allowed by name pattern so a
+# category Kalshi adds later rides in; KXGRAMMYNOMCOUNT<ARTIST> ("how many
+# nominations for ...", a count ladder) is another shape and stays out. The
+# family parent "KXGRAMMYNOM" (FAMILY_OVERRIDE_PARENTS) carries the awards
+# rule set: 3/event, safe-join, out 31 days before the Nov 16 nominations.
+_GRAMMY_NOM_PATTERN = r"KXGRAMMYNOM(?!COUNT)[A-Z0-9]+"
+GRAMMY_NOM_FAMILY_RE = re.compile(_GRAMMY_NOM_PATTERN)
 ALLOW_SERIES_PATTERNS = tuple(
     re.compile(p.strip()) for p in os.environ.get(
-        "IMM_ALLOW_SERIES_PATTERNS", _SPORTS_LADDER_PATTERN).split(",")
+        "IMM_ALLOW_SERIES_PATTERNS",
+        _SPORTS_LADDER_PATTERN + "," + _GRAMMY_NOM_PATTERN).split(",")
     if p.strip())
 SPORTS_LADDER_LEAGUE_RE = re.compile("^" + _SPORTS_LADDER_PATTERN + "$")
 # SPORTS LADDERS / ESCALATORS OFF (Jack 2026-10-04: "turn off
@@ -3922,7 +3937,7 @@ ESPN_SITE_API = "https://site.web.api.espn.com/apis/site/v2/sports"
 
 
 def series_pattern_allowed(series: str) -> bool:
-    """The regex allowlist (sports ladders / escalators)."""
+    """The regex allowlist (sports ladders / escalators, Grammy nominees)."""
     return any(p.fullmatch(series) for p in ALLOW_SERIES_PATTERNS)
 
 
@@ -6346,6 +6361,8 @@ FAMILY_OVERRIDE_PARENTS = (
     ("prefix", "KXAAAGASD", "KXAAAGASD"),
     ("pattern", OSCAR_FAMILY_RE, "KXOSCAR"),
     ("pattern", CRITICS_FAMILY_RE, "KXCRITICS"),
+    # Grammy nominees (2026-10-07), see GRAMMY_NOM_FAMILY_RE
+    ("pattern", GRAMMY_NOM_FAMILY_RE, "KXGRAMMYNOM"),
     ("suffix", "FT", "KXBKFT"),
     ("suffix", "APP", "KXCLAUDEAPP"),
     ("family_suffix", "CC", "KXAMZNCC"),
@@ -11010,18 +11027,33 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #                       unannounced, so their row is a CONSERVATIVE Nov 16
 #                       2026 -- a week before last year's spacing -> out
 #                       Oct 16. Move it when the CCA posts the date.
+#   NOMINATION SERIES (2026-10-07, Jack: "its nominations but should still
+#   be allowed"). Their markets ARE the first narrowing, so they take the
+#   same day as their category's winner series:
+#     KXCRITICSCHOICENOM  one series, a category per event (-ACTR27,
+#                       -COMSER27 ...; 33 lit 10/07, Kalshi's TV codes are
+#                       COM*/LIM*, not COMEDY*/LSERIES*); it rode in on the
+#                       KXCRITICS prefix but no -27 row matched, so all 33
+#                       stood down on "no usable date" from 16:10Z. Crafts
+#                       Nov 16, the rest Dec 4, exact rows like the winners.
+#     KXGRAMMYNOM*        69th Grammy nominations Mon Nov 16 2026 (the
+#                       Recording Academy's May 12 2026 release, grammy.com)
+#                       for every category -> out Oct 16. Kalshi's
+#                       occurrence on AOTY / BRA (Nov 2 04:59Z) is not it.
 # Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES
 # (replaces the WHOLE table), IMM_AWARDS_TABLE_ONLY_SERIES.
 AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 31.0)
 AWARDS_SERIES = tuple(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_SERIES",
-        "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR,KXCRITICS").split(",")
+        "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR,KXCRITICS,"
+        "KXGRAMMYNOM").split(",")
     if s.strip())
 AWARDS_TABLE_ONLY_SERIES = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_TABLE_ONLY_SERIES",
-        "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR,KXCRITICS").split(",") if s.strip())
+        "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR,KXCRITICS,"
+        "KXGRAMMYNOM").split(",") if s.strip())
 # 99th-Oscars categories whose first narrowing is the Dec 15 2026 SHORTLIST
 # (winner AND nomination series, by Kalshi's own names; KXOSCARNOMBSOUND is
 # "Oscar nomination for Best Song" and KXOSCARVIS is Makeup & Hairstyling
@@ -11053,10 +11085,23 @@ _CRITICS_OTHER_27 = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR", "ASPLAY
                      "DRAMA", "DRAMAACTO", "DRAMAACTR", "DRAMASUPACTO",
                      "DRAMASUPACTR", "LSERIES", "LSERIESACTO", "LSERIESACTR",
                      "LSERIESSUPACTO", "LSERIESSUPACTR")
+# KXCRITICSCHOICENOM-<CATEGORY>27, the nominations (2026-10-07): the same
+# seven crafts, and Kalshi's own codes for the rest
+_CRITICS_NOM_OTHER_27 = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR",
+                         "ASPLAY", "OSPLAY", "ANIM", "COM", "FOREIGN",
+                         "COMSER", "COMACTO", "COMACTR", "COMSUPACTO",
+                         "COMSUPACTR", "DRAMA", "DRAMAACTO", "DRAMAACTR",
+                         "DRAMASUPACTO", "DRAMASUPACTR", "LIM", "LIMACTO",
+                         "LIMACTR", "LIMSUPACTO", "LIMSUPACTR")
 _AWARDS_DATES_DEFAULT = (
-    "KXGRAMMY-*69=2026-11-16,KXNATBOOKAWARDS-*26=2026-10-06,"
+    "KXGRAMMY-*69=2026-11-16,KXGRAMMYNOM*-69=2026-11-16,"
+    "KXNATBOOKAWARDS-*26=2026-10-06,"
     + "".join(f"KXCRITICS{_c}-27=2026-11-16," for _c in _CRITICS_CRAFTS_27)
     + "".join(f"KXCRITICS{_c}-27=2026-12-04," for _c in _CRITICS_OTHER_27)
+    + "".join(f"KXCRITICSCHOICENOM-{_c}27=2026-11-16,"
+              for _c in _CRITICS_CRAFTS_27)
+    + "".join(f"KXCRITICSCHOICENOM-{_c}27=2026-12-04,"
+              for _c in _CRITICS_NOM_OTHER_27)
     + ",".join(f"{_s}-27=2026-12-15" for _s in _OSCAR_SHORTLIST_SERIES_27)
     + ",KXOSCAR*-27=2027-01-21")
 
@@ -11110,20 +11155,33 @@ def awards_family_default(event_ticker: str) -> Optional[datetime]:
     row for the same show, so the newcomer stands down no later than any
     sibling (an early stand-down is the safe error) and quotes until then
     instead of not at all. A show with no rows (next year's) still gets
-    None, as does a series outside AWARDS_TABLE_ONLY_SERIES."""
+    None, as does a series outside AWARDS_TABLE_ONLY_SERIES. The same show
+    is the same edition, the event segment's trailing number, so a series
+    that carries the category IN the segment (KXCRITICSCHOICENOM-SONG27)
+    finds its siblings' rows (-CINE27, and the winners' -27) too."""
     series, _, suffix = event_ticker.partition("-")
     fam = max((f for f in AWARDS_TABLE_ONLY_SERIES if series.startswith(f)),
               key=len, default=None)
     if fam is None or not suffix:
         return None
+    edition = _awards_edition(suffix)
     best = None
     for glob_s, when in AWARDS_EVENT_DATES:
         g_series, _, g_suffix = glob_s.partition("-")
         if g_series.startswith(fam) and g_suffix \
-                and fnmatch.fnmatchcase(suffix, g_suffix) \
+                and (fnmatch.fnmatchcase(suffix, g_suffix)
+                     or (edition is not None
+                         and _awards_edition(g_suffix) == edition)) \
                 and (best is None or when < best):
             best = when
     return best
+
+
+def _awards_edition(segment: str) -> Optional[str]:
+    """The show's edition off an event segment or its glob: the trailing
+    number ('27' of '27' / 'ACTR27' / '*27', '69' of 'BAMP69'), else None."""
+    m = re.search(r"\d+$", segment)
+    return m.group(0) if m else None
 
 
 for _s in AWARDS_SERIES:

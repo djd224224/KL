@@ -1753,6 +1753,103 @@ class TestScreen(unittest.TestCase):
             for s in names + ["KXCRITICSSONG", "KXCRITICSMENTION"]:
                 imm.SERIES_OVERRIDES.pop(s, None)
 
+    def test_nomination_series_quote_under_the_awards_rules(self):
+        # Jack 2026-10-07: "why isnt KXCRITICSCHOICENOM-COM27,
+        # KXCRITICSCHOICENOM-DRAMA27, etc quoting ... its nominations but
+        # should still be allowed", then "same with grammy nominees e.g.
+        # KXGRAMMYNOMAOTY-69". The Critics Choice nominations are ONE series
+        # with the category in the event segment -- admitted by the
+        # KXCRITICS prefix, but no -27 row matched, so all 33 stood down on
+        # "no usable date"; the Grammy nominees are a series per category,
+        # never admitted (KXGRAMMY is exact). Both: 3/event, safe-join, out
+        # 31 days before the first narrowing. Market objects as on 10/07.
+        ccn = {"occurrence_datetime": "2027-01-03T15:00:00Z",
+               "expected_expiration_time": "2027-01-04T15:00:00Z",
+               "close_time": "2028-01-03T15:00:00Z"}
+        grn = {"occurrence_datetime": "2026-11-02T04:59:00Z",
+               "expected_expiration_time": "2027-11-01T15:00:00Z",
+               "close_time": "2027-11-01T15:00:00Z"}
+        crafts = ("CINE", "COST", "EDIT", "HAIR", "PROD", "SCORE", "VIS")
+        rest = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR", "ASPLAY",
+                "OSPLAY", "ANIM", "COM", "FOREIGN", "COMSER", "COMACTO",
+                "COMACTR", "COMSUPACTO", "COMSUPACTR", "DRAMA", "DRAMAACTO",
+                "DRAMAACTR", "DRAMASUPACTO", "DRAMASUPACTR", "LIM", "LIMACTO",
+                "LIMACTR", "LIMSUPACTO", "LIMSUPACTR")
+        grammy = ("KXGRAMMYNOMAOTY", "KXGRAMMYNOMROTY", "KXGRAMMYNOMSOTY",
+                  "KXGRAMMYNOMNAOTY", "KXGRAMMYNOMBRA")
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            for t in ["KXCRITICSCHOICENOM-COM27-X"] + [f"{s}-69-X" for s in grammy]:
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+                self.assertFalse(IncentiveMarketMaker._blocked(t), t)
+            # the nomination COUNT ladders are another shape and stay out
+            for t in ("KXGRAMMYNOMCOUNTKL-69-T10", "KXGRAMMYNOMCOUNTBB-69-T5"):
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        names = ("KXCRITICSCHOICENOM",) + grammy + ("KXGRAMMYNOMBPVA",
+                                                    "KXGRAMMYNOMCOUNTKL")
+        evs = ("KXCRITICSCHOICENOM-SONG27", "KXCRITICSCHOICENOM-PIC28",
+               "KXGRAMMYNOMBPVA-69")
+        for s in names:
+            imm.SERIES_OVERRIDES.pop(s, None)
+        try:
+            for s in ("KXCRITICSCHOICENOM",) + grammy:
+                self.assertEqual(imm.event_top_n_for(s), 3, s)
+                imm.ensure_family_override(s)
+                ov = imm.series_override(s)
+                self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
+                                 (31.0, True, True), s)
+            # the Critics family's x2 rides along on its parent
+            self.assertEqual(imm.series_override("KXCRITICSCHOICENOM").size_mult, 2.0)
+            for c in crafts + rest:
+                ev = f"KXCRITICSCHOICENOM-{c}27"
+                want = (utc(2026, 10, 16, 5, 0) if c in crafts
+                        else utc(2026, 11, 3, 5, 0))
+                self.assertEqual(imm.apply_series_cutoff_adjustments(
+                    "KXCRITICSCHOICENOM", ev, None, close_time=None,
+                    market=ccn), want, ev)
+                self.assertNotIn(ev, imm._config_gaps, ev)
+            for s in grammy:
+                # nominations Mon Nov 16 -> out Oct 16, not Kalshi's Nov 2
+                self.assertEqual(imm.apply_series_cutoff_adjustments(
+                    s, f"{s}-69", None, close_time=None, market=grn),
+                    utc(2026, 10, 16, 5, 0), s)
+                self.assertNotIn(f"{s}-69", imm._config_gaps, s)
+            for ev in evs:
+                imm._release_guard_warned.discard(ev)
+                imm._config_gaps.pop(ev, None)
+            # a category added later: the family's earliest row for the same
+            # edition (the crafts' Nov 16), recorded as a gap; next year's
+            # show has none
+            self.assertEqual(imm.awards_family_default("KXCRITICSCHOICENOM-SONG27"),
+                             utc(2026, 11, 16, 5, 0))
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXCRITICSCHOICENOM", "KXCRITICSCHOICENOM-SONG27", None,
+                close_time=None, market=ccn), utc(2026, 10, 16, 5, 0))
+            self.assertIn("family's earliest date",
+                          imm._config_gaps["KXCRITICSCHOICENOM-SONG27"]["msg"])
+            self.assertIsNone(imm.awards_family_default("KXCRITICSCHOICENOM-PIC28"))
+            self.assertEqual(imm._awards_edition("ACTR27"), "27")
+            self.assertEqual(imm._awards_edition("*69"), "69")
+            self.assertIsNone(imm._awards_edition("ABC"))
+            # a Grammy category added later is covered by the family glob
+            imm.ensure_family_override("KXGRAMMYNOMBPVA")
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXGRAMMYNOMBPVA", "KXGRAMMYNOMBPVA-69", None, close_time=None,
+                market=grn), utc(2026, 10, 16, 5, 0))
+            self.assertNotIn("KXGRAMMYNOMBPVA-69", imm._config_gaps)
+            # the count ladders get no awards override
+            imm.ensure_family_override("KXGRAMMYNOMCOUNTKL")
+            self.assertNotIn("KXGRAMMYNOMCOUNTKL", imm.SERIES_OVERRIDES)
+        finally:
+            for s in names:
+                imm.SERIES_OVERRIDES.pop(s, None)
+            for ev in evs:
+                imm._release_guard_warned.discard(ev)
+                imm._config_gaps.pop(ev, None)
+
     def test_award_shows_three_per_event_and_one_month_stand_down(self):
         # Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY,
         # KXOSCAR, KXVMA. max 3 markets per event, and do not quote within
@@ -1888,7 +1985,10 @@ class TestScreen(unittest.TestCase):
                       "KXOSCARINTLFILM-27-LAB", "KXOSCARPIC-27-ODY"):
                 self.assertTrue(IncentiveMarketMaker._allowed(t), t)
                 self.assertEqual(imm.scan_universe_reason(t), "allowed", t)
-            for t in ("KXGRAMMYWINNERS-69-X", "KXGRAMMYNOMSOTY-69-X",
+            # (the KXGRAMMYNOM nominee family is admitted by pattern since
+            # 2026-10-07, see test_nomination_series_...; its count ladders
+            # are not)
+            for t in ("KXGRAMMYWINNERS-69-X", "KXGRAMMYNOMCOUNTKL-69-T10",
                       "KXGRAMMYCOUNTSZA-69-T3", "KXVMAPOP-26-X",
                       "KXGGWIN-26-X"):
                 self.assertFalse(IncentiveMarketMaker._allowed(t), t)
@@ -1897,7 +1997,7 @@ class TestScreen(unittest.TestCase):
         for s in ("KXGGNOM", "KXNATBOOKAWARDS", "KXGRAMMY", "KXVMA",
                   "KXOSCARPIC", "KXOSCARINTLFILM", "KXOSCARSVIEWER"):
             self.assertEqual(imm.event_top_n_for(s), 3, s)
-        for s in ("KXGRAMMYNOMSOTY", "KXVMAPOP", "KXOSCARMENTION",
+        for s in ("KXGRAMMYWINNERS", "KXVMAPOP", "KXOSCARMENTION",
                   "KXTRUMPMENTION", "KXGGWIN"):
             self.assertEqual(imm.event_top_n_for(s), 0, s)
         # screen: the VMAs are Sep 27 2026, so on Sep 25 the family is
