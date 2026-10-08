@@ -2977,11 +2977,16 @@ class TestAllowlist(unittest.TestCase):
 
     def test_econ_series(self):
         a = IncentiveMarketMaker._allowed
-        for t in ("KXAAAGASD-26JUL23-4.150", "KXAAAGASW-26JUL27-4.040",
+        for t in ("KXAAAGASW-26JUL27-4.040",
                   "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
                   # diesel enrolled 2026-08-02 evening under re-entry guards
-                  "KXDIESELD-26AUG03-T5.350", "KXDIESELW-26AUG09-T5.30"):
+                  "KXDIESELW-26AUG09-T5.30"):
             self.assertTrue(a(t), t)
+        # the gas trial ended 2026-10-08 (Jack: "block both"): the national
+        # and diesel dailies are blocked by name, the entries kept
+        for t in ("KXAAAGASD-26JUL23-4.150", "KXDIESELD-26AUG03-T5.350"):
+            self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+            self.assertFalse(a(t), t)
         # KXUSGASCPI (US gasoline CPI) is still an econ allow entry, but it
         # is a CPI print: the 2026-09-24 CPI pattern block wins over the
         # allowlist (Jack "blocklist CPI markets"); the entry is kept for a
@@ -4543,10 +4548,12 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
         finally:
             imm.ALLOWLIST_ONLY = prev_only
-        # the national daily and the monthly are deliberately KEPT
-        for keep in ("KXAAAGASD-26SEP02-3.1500", "KXAAAGASM-26SEP30-4.20"):
+        # the monthly is deliberately KEPT; the national daily was too, until
+        # the gas trial ended 2026-10-08 -- blocked by NAME, not by pattern
+        for keep in ("KXAAAGASM-26SEP30-4.20",):
             self.assertFalse(IncentiveMarketMaker._blocked(keep), keep)
             self.assertTrue(IncentiveMarketMaker._allowed(keep), keep)
+        self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASD-26SEP02-3.1500"))
         # the monthly max / min pair is not pattern-blocked either: it was
         # cut BY NAME on 2026-10-03 (test_imm_scan_graduates)
         for s in ("KXAAAGASMINM", "KXAAAGASMAXM"):
@@ -15271,7 +15278,7 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"),
                          "allowed" if imm.GB_STATE_QUOTE else "blocked")
         self.assertEqual(r("KXAAAGASDNYC-26SEP08-4.14"), "blocked")
-        self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "allowed")   # national kept
+        self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "blocked")   # gas trial ended 10/08
         # blocklist wins over everything (other bots' books)
         self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")
         self.assertEqual(r("KXXRPMAXMON-XRP-26JUL31-140"), "blocked")

@@ -3185,6 +3185,18 @@ _CUT_FOOD_SERIES = (
     "KXDDCOLDBREW", "KXBKNUGGETS", "KXBKDWHOPPER", "KXAMSAVO",
     "KXWENBACONATOR", "KXTBCRUNCHWRAP")
 _CUT_AAA_SERIES = ("KXAAAGASMAXM", "KXAAAGASMINM")
+# GAS TRIAL ENDED (Jack 2026-10-08: "block both", on the 1-week report).
+# The national daily KXAAAGASD and the diesel daily KXDIESELD, quoted plain
+# 13:00 ET to the close from 9/30, each lost more trading than it earned:
+# national -$34.68 trading (the report showed -$25.88 because it counted
+# fill 07231aa8 twice) against ~$11 est reward (Kalshi credited $3.41),
+# diesel -$21.83 against $5.56. Both were worst at 18-20 ET. The national
+# pool was unchanged at $150/day, but our share of it fell ~75% from
+# September. Exact series (the dash), so these stay as they are: the state
+# dailies (pattern-blocked), the weeklies (launcher IMM_BLOCKLIST), the
+# monthly KXAAAGASM and the diesel annuals. Standard semantics; the
+# trial's blackout hours and the GasBuddy refresher stay in code.
+_CUT_GAS_TRIAL_SERIES = ("KXAAAGASD", "KXDIESELD")
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
     # ANNUAL crypto = crypto_annual_mm.py's book as of 2026-08-13 (same
@@ -3223,6 +3235,8 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + ["KXMLBPLAYOFFS-26"]
     # company KPIs, food-price trackers, AAA MAXM/MINM (2026-10-03, above)
     + [f"{_s}-" for _s in _CUT_KPI_SERIES + _CUT_FOOD_SERIES + _CUT_AAA_SERIES]
+    # the gas trial's national + diesel dailies (2026-10-08, above)
+    + [f"{_s}-" for _s in _CUT_GAS_TRIAL_SERIES]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 
