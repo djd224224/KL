@@ -363,7 +363,7 @@ def family_of(series: str, category: str = ""):
                                     "Weekend rain" if s.startswith("KXRAINWKND") else "Rain spans")
     if s.startswith("KXTEMP"):
         return "Weather & quakes", "Hourly temp"
-    if any(k in s for k in ("QUAKE", "HURRICANE", "AQI", "TORNADO")) or s.startswith(("KXAVGT", "KXHIGH", "KXLOWT")):
+    if any(k in s for k in ("QUAKE", "HURRICANE", "AQI", "TORNADO")) or s.startswith(("KXAVGT", "KXHIGH", "KXLOWT", "KXHURCAT")):
         return "Weather & quakes", s
     if s.startswith(("KXDIESEL", "KXAAAGAS", "KXUSGASCPI", "KXPAGAS")):
         if s == "KXAAAGASD":

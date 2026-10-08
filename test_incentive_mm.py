@@ -2214,6 +2214,19 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         for s in self.SERIES:
             self.assertIn(s, imm.ALLOW_SERIES, s)
 
+    def test_hurcat_allowed_with_safe_join_and_no_cutoff(self):
+        # Jack 2026-10-08: "Add KXHURCAT" -- one event per storm, no date in
+        # the ticker, so it rides the undated guard set
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        for t in ("KXHURCAT-26ISAIAS-T3", "KXHURCAT-26RACHEL-T5"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+        self.assertIn("KXHURCAT", imm.ALLOW_SERIES)
+        self.assertTrue(imm.series_override("KXHURCAT").safe_join)
+        self.assertIsNone(imm.parse_event_date("KXHURCAT-26ISAIAS"))
+        self.assertIsNone(imm.trade_cutoff_utc("KXHURCAT-26ISAIAS", None, None))
+        self.assertFalse(a("KXHURCATX-26ISAIAS-T3"))          # exact series only
+
     def test_mlbplayoffs_26_event_blocked(self):
         # Jack 2026-09-26: "blocklist KXMLBPLAYOFFS-26". Every market of
         # the 2026 event and the event ticker are frozen; the series (the

@@ -9093,3 +9093,34 @@ CHECKED, NOT CHANGED -- does an untimed Trump-mention day quote? Yes.
 
 Tests: test_imm_earnings_overrides +2 (remarks beat the header, in the
 header's zone, bounds; the state-code slug). Suite 2,320 OK.
+
+## 2026-10-08 ~03:25Z — KXHURCAT allowlisted (Jack: "Add KXHURCAT")
+
+The family watch's first new-family alert (02:20Z): KXHURCAT, $500/day pool,
+not allowed.
+
+WHAT IT IS. KXHURCAT-26<STORM>-T<n>: does the named storm reach Category n
+or above, on NHC maximum sustained winds. The market expires the first
+10:00 AM ET after it happens, else Dec 1.
+- One event per storm (21 open); programs light per active storm.
+- Paying now: KXHURCAT-26ISAIAS only, 5 x $100/market/day, target 1,000,
+  24h from 10/08 01:15Z.
+- Isaias book at enrollment:
+  - T1 98/100 and T5 0/2 sit outside the band;
+  - T2 90/92 is at its edge;
+  - T3 50/52 and T4 6/9 are the quotable strikes.
+
+HOW.
+- _DEFAULT_WEATHER_SERIES += KXHURCAT (exact series).
+- IMM_UNDATED_GUARD_SERIES += KXHURCAT, i.e. safe-join. The ticker carries
+  no date, so trade_cutoff_utc is None -- the KXMLBPLAYOFFS shape.
+- imm_dashboard.family_of: KXHURCAT* -> "Weather & quakes" (was "Other
+  prints").
+
+RISK, accepted without a fair. NHC advisories (every 6h; 3h with
+watches/warnings) and recon fixes can move T3 30-40c. The protection is the
+band, safe-join (never in front of a thin touch) and the toxic-halt / sweep
+breakers. Not built: an NHC advisory-window stand-aside, or an NHC
+intensity fair (current Vmax + forecast peak from the advisory).
+
+Tests: TestSportsAndVenueAllowlist +1. Suite 2,321 OK.

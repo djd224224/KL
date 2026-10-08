@@ -1085,9 +1085,11 @@ SERIES_OVERRIDES["KXRAINNYCW"] = SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE]
 # to anchor to (qualification resolves across a fortnight of games, a tour
 # announcement lands whenever it lands), and a made-up hour would read like
 # a real event window to every later reader of this file.
+# KXHURCAT (2026-10-08) is the same shape: one event per storm, no date.
 for _s in os.environ.get(
         "IMM_UNDATED_GUARD_SERIES",
-        "KXMLBPLAYOFFS,KXMLBSEASONGAMES,KXVENUEPERFORM,KXCMA,KXMC").split(","):
+        "KXMLBPLAYOFFS,KXMLBSEASONGAMES,KXVENUEPERFORM,KXCMA,KXMC,"
+        "KXHURCAT").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(safe_join=True)
 
@@ -4427,7 +4429,18 @@ register_close_cutoff_days(CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS,
 # cutoff and band. Exact series, no prefix: nothing else KXRAIN* rides in.
 # (The daily KXRAIN is allowed through the extra-allow file, and the rain
 # monthlies sit behind the launcher blocklist — neither lives here.)
-_DEFAULT_WEATHER_SERIES = "KXRAINWKND"
+# HURRICANE CATEGORY (Jack 2026-10-08: "Add KXHURCAT", after the family
+# watch's new-family alert). KXHURCAT-26<STORM>-T<n>: does the named storm
+# reach Category n or above (NHC maximum sustained winds; the market expires
+# the first 10:00 AM ET after it happens, else Dec 1). One event per storm;
+# programs light per active storm (KXHURCAT-26ISAIAS: 5 x $100/market/day,
+# target 1,000, 24h from 10/08 01:15Z). The ticker carries no date, so
+# trade_cutoff_utc is None and it joins the undated guard set (safe-join,
+# IMM_UNDATED_GUARD_SERIES). No NHC fair: an advisory (every 3-6h) or a
+# recon fix can move the contested strike 30-40c, and the band, safe-join
+# and the toxic-halt / sweep breakers are what stand between it and a
+# pick-off.
+_DEFAULT_WEATHER_SERIES = "KXRAINWKND,KXHURCAT"
 # SPORTS series allowed IN CODE (Jack 2026-09-11 pm: "allowlist
 # KXMLBPLAYOFFS into IMM", then "allowlist KXMLBSEASONGAMES"). First sports
 # entries in the normal book -- the 9/6 open-scan category lift already
