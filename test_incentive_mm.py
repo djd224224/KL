@@ -1444,6 +1444,25 @@ class TestScreen(unittest.TestCase):
                                        and not ov.safe_join
                                        and ov.cutoff_from_close_min is None))
 
+    def test_state_legislature_control_is_an_election_dated_nov_3(self):
+        # Jack 2026-10-07: "why isnt XSTATELEG-TXSENA26, KXSTATELEG-MNHOUSE26
+        # quoting as part of elections?" -- 28 chambers, all up Nov 3 2026
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            self.assertTrue(imm.election_series("KXSTATELEG"))
+            for t in ("KXSTATELEG-TXSENA26-R", "KXSTATELEG-MNHOUSE26-D",
+                      "KXSTATELEG-WIASSEMBLY26-R", "KXSTATELEG-AKSEN26-D"):
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        self.assertEqual(len(imm._STATELEG_CHAMBERS_26), 28)
+        for c in imm._STATELEG_CHAMBERS_26:
+            self.assertEqual(imm.election_cutoff_utc(f"KXSTATELEG-{c}26"),
+                             utc(2026, 11, 3, 5, 0), c)
+        # a chamber without a verified row stands down (fail closed)
+        self.assertIsNone(imm.election_cutoff_utc("KXSTATELEG-LAHOUSE26"))
+
     def test_election_family_quoted_1_to_99_until_election_day(self):
         # Jack 2026-09-28: "allowlist county judge markets e.g.
         # KXBEXARCOUNTYJUDGE, KXCOLLINCOUNTYJUDGE / house election markets

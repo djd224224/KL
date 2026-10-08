@@ -4005,7 +4005,12 @@ ELECTION_SERIES = frozenset(
         "KXSPAIN2ND,KXSPAIN3RD,KXSPAINMOV,KXSPAINGOVT,KXVOTESPAIN,"
         "KXBRPRES2MOV,KXBRPRES2MOVD,KXBRRUNOFFABROAD,KXBRRUNOFFCOUNTRIES,"
         "KXBRRUNOFFSTATES,KXVOTEBR2,KXARGENTINAPRES1R,KXISRAELTURNOUT,"
-        "KXSNAPELECTIONSWE,KXUKBYELECTION").split(",") if s.strip())
+        "KXSNAPELECTIONSWE,KXUKBYELECTION,"
+        # state legislature control, the 2026-10-07 22:31Z batch (Jack: "why
+        # isnt XSTATELEG-TXSENA26, KXSTATELEG-MNHOUSE26 quoting as part of
+        # elections?"): 28 chambers x R/D. Kalshi files it under Elections,
+        # but it lit after the 4:45pm ET category pass, so it is listed here
+        "KXSTATELEG").split(",") if s.strip())
 # The 9/28 carve-outs above, as data: Kalshi files them under Elections, so
 # the overrides task's Elections-category rule (ELECTION_EXTRA_FILE) would
 # otherwise enroll them. Refused by election_series() and by the loader.
@@ -11230,6 +11235,13 @@ SERIES_OVERRIDES["KXCRITICS"] = replace(SERIES_OVERRIDES["KXCRITICS"],
 #
 # THE TABLE (checked 2026-09-28/29; an event glob names the event only --
 # the date beside it is the verified one, never Kalshi's):
+# State legislature chambers Kalshi lists (KXSTATELEG-<code>26, 2026-10-07),
+# each dated Nov 3 2026 below.
+_STATELEG_CHAMBERS_26 = (
+    "AKHOUSE", "AKSEN", "AZHOUSE", "AZSEN", "FLHOUS", "FLSENA", "GAHOUSE",
+    "GASEN", "IAHOUSE", "IASEN", "MEHOUSE", "MESEN", "MIHOUSE", "MISEN",
+    "MNHOUSE", "MNSEN", "NCHOUSE", "NCSEN", "NHHOUSE", "NHSEN", "NVASSE",
+    "NVSENA", "OHHOUSE", "OHSEN", "TXHOUS", "TXSENA", "WIASSEMBLY", "WISEN")
 _ELECTION_DATES_DEFAULT = ",".join((
     # --- CANADA (all read on the official pages 9/29) ---
     # BC 44th provincial general election: a SNAP election -- the writ was
@@ -11300,6 +11312,14 @@ _ELECTION_DATES_DEFAULT = ",".join((
     # trifectas, underperforming Harris (certified 2026 general shares).
     "KXVOTEGENERAL-*-26*=2026-11-03",
     "KXDEMTRIFECTA-26NOV03*=2026-11-03",
+    # State legislature control (KXSTATELEG, 2026-10-07): 88 of 99 chambers
+    # hold regularly scheduled elections on Nov 3 2026 (Wikipedia "2026
+    # United States state legislative elections", seats-up table; Ballotpedia
+    # and NCSL agree), and all 28 Kalshi lists are among them (the 11 not up:
+    # Kansas, New Mexico and South Carolina Senates; both chambers of
+    # Louisiana, Mississippi, New Jersey, Virginia). Exact rows: a chamber
+    # added later stands down until it gets one. ET, the earliest zone.
+    *(f"KXSTATELEG-{_c}26=2026-11-03" for _c in _STATELEG_CHAMBERS_26),
     "KXUNDERHARRIS-27JAN04*=2026-11-03",
     # Local offices on the Nov 3 ballot (county / city election offices):
     # Fulton chair (Georgia runoff Dec 1 only without a majority); Henderson
