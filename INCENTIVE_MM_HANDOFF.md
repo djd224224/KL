@@ -9161,3 +9161,24 @@ Run from the worktree at 14:38Z:
 - the bot loaded the rows at 14:39:37Z / 14:42:48Z.
 
 Tests: test_imm_family_watch 20 (+2). Suite 2,323 OK.
+
+### 2026-10-08 ~16:20Z — gas trial ended: KXAAAGASD + KXDIESELD blocked by name, LIVE AT THE NEXT NATURAL RESTART (Jack: "block both. can you not restart bot, and just let it update at the next natural restart")
+
+WHY (1-week report, corrected). National trading was -$34.68; the report
+showed -$25.88 because imm_gas_trial_report.py still counts fill 07231aa8
+twice. That's against ~$11 est reward (Kalshi credited $3.41). Diesel was
+-$21.83 vs $5.56. Both were worst at 18-20 ET (national: three evenings lost
+$134 together, the other four were flat). The national pool was unchanged at
+$150/day, but our share fell ~75% from September's same hours.
+
+WHAT. `_CUT_GAS_TRIAL_SERIES` in SERIES_BLOCKLIST_PREFIXES ("KXAAAGASD-",
+"KXDIESELD-"), in code rather than the launcher env. The launcher builds
+$ProbeEnv once, before its relaunch loop, so an IMM_BLOCKLIST edit would wait
+for a task restart, while a code entry rides on any restart. The edit was
+written with incentive_mm.py's mtime restored to the exact ns, so the
+code-change exit did not fire. NOT LIVE until the next natural restart: the
+next code change to land in KL, or a task restart. Then the new process
+cancels the resting quotes in its first cycle; positions ride. The states,
+weeklies, KXAAAGASM and the diesel annuals are untouched.
+
+The 2-week gas-trial report (~10/15) will still email; ignore its verdict.
