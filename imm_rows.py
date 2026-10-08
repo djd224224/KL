@@ -8,16 +8,17 @@ Two files beside the bot's state, re-read every universe refresh (no deploy):
   awards_dates_extra.json   -- award nomination/announcement rows (AWARDS_DATES_EXTRA)
 each {"rows": [{"glob", "date", "zone", "sources", "by", "at", "note"}]}.
 
-Writers: the scheduled gap-fixer routine and hand fixes (this CLI), and
-imm_family_watch.py's US-general rule (add_row). Every row needs TWO different
+Writers: hand fixes and imm_family_watch.py's research run (this CLI), and
+the watch's US-general rule (add_row). Every row needs TWO different
 sources -- Jack on election dates: "dont trust that, verify yourself". A row the
 code table already covers is refused (the code row wins at lookup; fix it there).
 
   python imm_rows.py election add KXSTATELEG-LAHOUSE27 2027-10-23 --zone America/Chicago \\
-      --source "https://www.sos.la.gov/..." --source "https://ballotpedia.org/..." --by gap-fixer
+      --source "https://www.sos.la.gov/..." --source "https://ballotpedia.org/..." --by hand
   python imm_rows.py award add KXCRITICSCHOICENOM-SONG27 2026-11-16 --source ... --source ...
   python imm_rows.py election list
   python imm_rows.py award remove KXCRITICSCHOICENOM-SONG27
+  python imm_rows.py election lookup KXSTATELEG-TXSENA26   # read-only Kalshi wording
 """
 
 import argparse
@@ -115,6 +116,28 @@ def remove_row(kind: str, glob: str) -> Tuple[bool, str]:
     return True, f"removed {kind} row {glob}"
 
 
+def lookup(event: str) -> str:
+    """Read-only: what Kalshi says about an event -- its title, sub_title and
+    the first markets' own terms and dates -- for the research run."""
+    c = imm._fair_reader_client()
+    try:
+        e = (c.get_event(event) or {}).get("event") or {}
+    except Exception as ex:
+        return f"event {event}: read failed ({ex})"
+    try:
+        ms = (c.get_markets(event_ticker=event) or {}).get("markets") or []
+    except Exception:
+        ms = []
+    out = [f"event {event}: {e.get('title')} | sub_title: {e.get('sub_title')} | "
+           f"category {e.get('category')}"]
+    for m in ms[:3]:
+        out.append(f"  {m.get('ticker')} ({m.get('yes_sub_title') or ''}): "
+                   f"{(m.get('rules_primary') or '').strip()[:500]} | expected_expiration "
+                   f"{m.get('expected_expiration_time')} | occurrence "
+                   f"{m.get('occurrence_datetime')} | close {m.get('close_time')}")
+    return "\n".join(out)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("kind", choices=KINDS)
@@ -130,7 +153,12 @@ def main(argv=None) -> int:
     r = sub.add_parser("remove")
     r.add_argument("glob")
     sub.add_parser("list")
+    lk = sub.add_parser("lookup", help="read-only: Kalshi's own wording and dates")
+    lk.add_argument("event")
     args = ap.parse_args(argv)
+    if args.cmd == "lookup":
+        print(lookup(args.event))
+        return 0
     if args.cmd == "list":
         for row in load_rows(args.kind):
             print(f"{row.get('glob')} = {row.get('date')}"

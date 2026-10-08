@@ -190,5 +190,122 @@ class TestGapAlert(unittest.TestCase):
         self.assertIn("fix: add a row", body)
 
 
+class TestResearchOnArrival(unittest.TestCase):
+    """Jack 2026-10-08: "instead of separate gap-fixer routine, why not just
+    research when a new series enrolls?" -> "yes switch"."""
+
+    T = {"gap:KXISR-26OCT27": {"kind": "election", "event": "KXISR-26OCT27",
+                               "series": "KXISR", "msg": "no verified election day"},
+         "start:KXTRUMPMENTION-26OCT08": {"kind": "start", "event": "KXTRUMPMENTION-26OCT08",
+                                          "series": "KXTRUMPMENTION", "msg": "no start time"}}
+
+    def test_gap_kinds(self):
+        self.assertEqual(fw.gap_kind("KXA-26 has no verified election day in ELECTION_DATES"),
+                         "election")
+        self.assertEqual(fw.gap_kind("no hand-table row for KXA-27 -- on its family's earliest"),
+                         "award")
+        self.assertEqual(fw.gap_kind("pre-event stand-down needs the event start but KXA-27 "
+                                     "has no usable date (hand table, ...)"), "award")
+        self.assertEqual(fw.gap_kind("Vercel pre-D cutoff needs the measured day"), "")
+
+    def test_due_on_first_sight_then_backoff_judgment_and_cap(self):
+        t = 1_800_000_000.0
+        self.assertEqual(sorted(fw.research_due({}, self.T, t)), sorted(self.T))
+        r = {"gap:KXISR-26OCT27": {"attempts": 1, "last": t, "status": "unresolved"},
+             "start:KXTRUMPMENTION-26OCT08": {"attempts": 1, "last": t, "status": "judgment"}}
+        self.assertEqual(fw.research_due(r, self.T, t + 1.9 * 3600), [])
+        self.assertEqual(fw.research_due(r, self.T, t + 2.1 * 3600), ["gap:KXISR-26OCT27"])
+        r["gap:KXISR-26OCT27"].update(attempts=2, last=t)
+        self.assertEqual(fw.research_due(r, self.T, t + 3.9 * 3600), [])  # 4h after try 2
+        self.assertEqual(fw.research_due(r, self.T, t + 4.1 * 3600), ["gap:KXISR-26OCT27"])
+        r["gap:KXISR-26OCT27"].update(attempts=fw.RESEARCH_MAX_ATTEMPTS)
+        self.assertEqual(fw.research_due(r, self.T, t + 99 * 3600), [])
+        # highest value first, capped
+        many = {f"gap:KX{i}-26": dict(self.T["gap:KXISR-26OCT27"], event=f"KX{i}-26")
+                for i in range(20)}
+        est = {f"gap:KX{i}-26": float(i) for i in range(20)}
+        due = fw.research_due({}, many, t, est)
+        self.assertEqual(len(due), fw.RESEARCH_MAX_TARGETS)
+        self.assertEqual(due[0], "gap:KX19-26")
+
+    def test_prompt_names_each_target_its_command_and_the_result_line(self):
+        p = fw.research_prompt([(k, v, "Kalshi says ...") for k, v in self.T.items()])
+        self.assertIn("KEY gap:KXISR-26OCT27 -- election", p)
+        self.assertIn("python imm_rows.py election add KXISR-26OCT27 YYYY-MM-DD", p)
+        self.assertIn("python imm_earnings_overrides.py --set KXTRUMPMENTION-26OCT08", p)
+        self.assertIn("TWO independent sources", p)
+        self.assertIn("RESULT_JSON:", p)
+        self.assertIn("NOT a vote", p)
+
+    def test_parse_result_line(self):
+        txt = ("did the work\n```\nRESULT_JSON: {\"gap:KXISR-26OCT27\": {\"status\": "
+               "\"written\", \"note\": \"2026-10-27 via a, b\"}}\n```")
+        self.assertEqual(fw.parse_research(txt)["gap:KXISR-26OCT27"]["status"], "written")
+        self.assertEqual(fw.parse_research("no result line"), {})
+        self.assertEqual(fw.parse_research("RESULT_JSON: {not json"), {})
+
+    def test_run_research_passes_the_allowlist_and_budget(self):
+        seen = {}
+
+        class P:
+            returncode = 0
+            stdout = json.dumps({"result": "RESULT_JSON: {}", "total_cost_usd": 0.42})
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["kw"] = cmd, kw
+            return P()
+        from unittest import mock
+        with mock.patch.object(fw.subprocess, "run", fake_run):
+            text, cost, err = fw.run_research("do it")
+        self.assertEqual((text, cost, err), ("RESULT_JSON: {}", 0.42, ""))
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[1:3], ["-p", "do it"])
+        self.assertIn("--no-session-persistence", cmd)
+        self.assertIn("--restricted", cmd)
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertEqual(cmd[cmd.index("--max-budget-usd") + 1], f"{fw.RESEARCH_BUDGET_USD:g}")
+        self.assertIn("Bash(python imm_rows.py:*)", cmd)
+        self.assertIn("Bash(python imm_earnings_overrides.py --set:*)", cmd)
+        self.assertEqual(seen["kw"]["cwd"], fw.KL_DIR)
+        self.assertEqual(seen["kw"]["timeout"], fw.RESEARCH_TIMEOUT_SECS)
+
+    def test_hold_until_research_gives_up_or_stale(self):
+        t = 1_800_000_000.0
+        items = {"gap:KXISR-26OCT27": {"est": 30.0, "what": "w", "fix": "f"},
+                 "new:KXNEW": {"est": 30.0, "what": "n", "fix": "f"}}
+        state = {"research": {"gap:KXISR-26OCT27": {"attempts": 1, "status": "unresolved",
+                                                     "note": "page not up"}},
+                 "items": {"gap:KXISR-26OCT27": {"first": t}}}
+        fw.hold_researched(items, self.T, state, t + 3600)
+        self.assertTrue(items["gap:KXISR-26OCT27"]["hold"])           # research pending
+        self.assertNotIn("hold", items["new:KXNEW"])                  # not researchable
+        self.assertIn("research (1 try): unresolved -- page not up",
+                      items["gap:KXISR-26OCT27"]["fix"])
+        state["research"]["gap:KXISR-26OCT27"]["attempts"] = 2        # gave up
+        fw.hold_researched(items, self.T, state, t + 3600)
+        self.assertFalse(items["gap:KXISR-26OCT27"]["hold"])
+        state["research"]["gap:KXISR-26OCT27"].update(attempts=1, status="judgment")
+        fw.hold_researched(items, self.T, state, t + 3600)
+        self.assertFalse(items["gap:KXISR-26OCT27"]["hold"])
+        state["research"]["gap:KXISR-26OCT27"].update(status="unresolved")
+        fw.hold_researched(items, self.T, state, t + 7 * 3600)        # stale: alert anyway
+        self.assertFalse(items["gap:KXISR-26OCT27"]["hold"])
+        # a held item is tracked but never due
+        due, st = fw.due_alerts({"gap:KXISR-26OCT27": {"first": t}},
+                                {"gap:KXISR-26OCT27": dict(items["gap:KXISR-26OCT27"],
+                                                           hold=True)}, t + 3 * 3600)
+        self.assertEqual((due, set(st)), ([], {"gap:KXISR-26OCT27"}))
+
+    def test_start_targets_become_alert_items(self):
+        progs = {"KXTRUMPMENTION-26OCT08-AI": {
+            "period_reward": 5000 * 10000, "start_date": "2026-10-07T00:00:00Z",
+            "end_date": "2026-10-08T00:00:00Z"}}
+        items = fw.gap_items(progs, {}, {}, set(), self.T)
+        self.assertEqual(set(items), {"start:KXTRUMPMENTION-26OCT08"})
+        self.assertAlmostEqual(items["start:KXTRUMPMENTION-26OCT08"]["est"],
+                               5000 * fw.GAP_CAPTURE, places=2)
+
+
 if __name__ == "__main__":
     unittest.main()

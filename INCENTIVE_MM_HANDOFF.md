@@ -8962,3 +8962,84 @@ Knobs:
 
 Tests: test_imm_family_watch.py (10: rule, rows, reload, alert timing).
 Suite 2,311 OK.
+
+
+## 2026-10-08 ~02:40Z — family watch researches gaps on arrival; the imm-gap-fixer routine is gone (Jack: "instead of separate gap-fixer routine, why not just research when a new series enrolls?" -> "yes switch")
+
+WHY. The 2-hourly routine (piece 4 of the entry above):
+- lagged by up to 2h, plus the overnight 0:00 -> 8:00 gap, and ran whether or
+  not anything was dark;
+- never worked: its first run (02:06Z 10/08) sat on its first PowerShell
+  call's permission prompt, with no one there to approve it. Stopped and
+  deleted.
+The watch already sees each gap within 30 min of the bot writing it.
+
+WHAT. Pass 3 of imm_family_watch.py is now RESEARCH (before the alert pass).
+- Targets:
+  - config gaps a row fixes (gap_kind: "election day" -> election;
+    "hand-table row" / "no usable date" -> award);
+  - broadcast mention events with no start time.
+- research_targets first runs the automatic resolvers, through
+  imm_earnings_overrides.auto_broadcast_start (Phase 4's resolver, factored
+  out): WH schedule, then RNC events, then TVmaze. What they place is written
+  with provenance right away.
+- research_due:
+  - a target is tried on first sight, then 2h / 4h / 8h after each
+    unresolved try, at most 6 tries;
+  - a judgment call is never retried;
+  - highest est first, at most 8 per run.
+- The due targets go to ONE headless run: `claude -p` (--output-format json,
+  --no-session-persistence, --max-budget-usd 3, 720 s timeout, cwd KL).
+  - --restricted --strict-mcp-config: no user hooks, settings or MCP servers.
+  - Tools: Bash, WebSearch, WebFetch. Bash is allowed only for
+    `python imm_rows.py ...` and `python imm_earnings_overrides.py --set ...`.
+    Anything else is denied, not prompted, so a run can't stall.
+  - Probed 10/08: a python file write and `imm_earnings_overrides.py --help`
+    were denied. Read-only git (status, stash list) still runs, via the CLI's
+    built-in safe list.
+  - Each target carries Kalshi's own wording (new `imm_rows.py election
+    lookup EVENT`, read-only).
+  - Rules: two fetched sources; a non-vote is judgment; the earliest credible
+    start time.
+  - The run ends with one RESULT_JSON line: written / judgment / unresolved
+    per key. That goes into family_watch_state.json "research".
+- Alerts:
+  - A researchable item is held (tracked, not emailed) until research gives
+    up: a judgment call, unresolved twice, or the cap.
+  - It is emailed anyway once it has been dark 6h (IMM_GAP_ALERT_STALE_HOURS).
+  - The email's fix line carries research's last note.
+
+Knobs: IMM_WATCH_RESEARCH (1; 0 = off), IMM_WATCH_RESEARCH_MAX (8),
+IMM_WATCH_RESEARCH_TIMEOUT (720), IMM_WATCH_RESEARCH_BUDGET_USD (3),
+IMM_WATCH_RESEARCH_ATTEMPTS (6), IMM_GAP_ALERT_STALE_HOURS (6);
+`--no-research` for one run.
+
+Ops:
+- Desktop scheduled task imm-gap-fixer deleted.
+- "KL imm family-watch" ExecutionTimeLimit 20 -> 25 min (a research run is at
+  most 12).
+- No bot restart: the watch, imm_rows and imm_earnings_overrides are
+  task-run helpers.
+
+Tests: test_imm_family_watch.py 17 (+7: kinds, backoff / judgment / cap /
+ordering, prompt, RESULT_JSON parse, CLI flags, hold, start items);
+test_imm_earnings_overrides 13 OK after the refactor.
+
+Validation run 02:21Z 10/08 (from the worktree, --no-enroll --no-date
+--no-alert): 8 targets, $1.56, 317 s.
+- Written:
+  - KXISRAELBLOCMAJ / -MOST-26OCT27 = 2026-10-27 @Asia/Jerusalem (Wikipedia
+    + ElectionGuide);
+  - KXSPAINTURNOUT-26NOV29 = 2026-11-29 @Europe/Madrid (Time + the BOE royal
+    decree via Infobae). All three match the code rows of their siblings.
+  - KXTRUMPMENTION-26OCT09 = 17:30 ET, the Syracuse rally program start
+    (events.gop.com + a second source). Remarks are at 19:00: earliest
+    credible, as told.
+- Judgment: KXOBAMARALLY (attend a rally), KXBKLYNDEMCHAIR (court),
+  KXLULAFLAVIODEBATE (a debate).
+- Unresolved: KXTRUMPMENTION-26OCT08, the Golden Age summit "morning
+  address" with no clock time yet; retried at +2h.
+Seen but not yet a gap: KXSFBALLOTMEASURES-26NOV03 (SF props, enrolled
+02:20Z). us_general_vote_ok refuses it: "passes" is not vote language, and
+Kalshi's expiry is 2027-11-03. Left strict on purpose; research takes it
+once the bot lists the gap.

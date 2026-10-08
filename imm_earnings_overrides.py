@@ -1020,6 +1020,43 @@ def rnc_rally_start(sub_title: str, date_et, get=None):
     return None
 
 
+def auto_broadcast_start(client, ev: str, series: str):
+    """(iso, source, detail, title) for a broadcast mention event from the
+    automatic resolvers -- for the WH-schedule series (KXTRUMPMENTION*) the
+    Factbase calendar, then the RNC events page; then TVmaze for shows -- or
+    (None, None, None, title) when none places it. Phase 4 below and the
+    family watch (imm_family_watch.research_targets) share it."""
+    title = sub_title = ""
+    try:
+        _e = ((client.get_event(ev) or {}).get("event") or {})
+        title = _e.get("title") or ""
+        sub_title = _e.get("sub_title") or ""
+    except Exception as e:
+        log(f"! event fetch failed {ev}: {e}")
+    d = parse_event_date(ev)
+    if d is None:
+        return None, None, None, title
+    d_et = d.astimezone(ET).date()
+    # WH-schedule series: try the Factbase calendar before TVmaze -- these
+    # events are appearances, not shows
+    if series.startswith(WH_SCHEDULE_SERIES):
+        wh = wh_schedule_start(title, d_et, sub_title)
+        if wh:
+            dt_et, det = wh
+            return dt_et.isoformat(), "WH schedule", f"{title[:60]} => {det[:60]}", title
+        # a rally the WH schedule does not list yet: its RNC events page
+        rnc = rnc_rally_start(sub_title, d_et)
+        if rnc:
+            dt_et, url = rnc
+            return dt_et.isoformat(), "RNC events", f"{sub_title[:60]} => {url[-60:]}", title
+    m = SHOW_TITLE_RE.search(title)
+    hit = tvmaze_airtime(m.group(1), d_et) if m else None
+    if hit:
+        dt_et, net = hit
+        return dt_et.isoformat(), net, title[:90], title
+    return None, None, None, title
+
+
 def load_file() -> dict:
     try:
         with open(EVENT_OVERRIDES_FILE, encoding="utf-8") as f:
@@ -1441,44 +1478,11 @@ def main(argv=None) -> int:
     for ev, series in discover_broadcast_mention_events(client, now):
         if ev in EVENT_START_OVERRIDES or ev in file_data:
             continue
-        title = sub_title = ""
-        try:
-            _e = ((client.get_event(ev) or {}).get("event") or {})
-            title = _e.get("title") or ""
-            sub_title = _e.get("sub_title") or ""
-        except Exception as e:
-            log(f"! event fetch failed {ev}: {e}")
-        d_et = parse_event_date(ev).astimezone(ET).date()
-        # WH-schedule series (KXTRUMPMENTION*): try the Factbase calendar
-        # before TVmaze — these events are appearances, not shows.
-        if series.startswith(WH_SCHEDULE_SERIES):
-            wh = wh_schedule_start(title, d_et, sub_title)
-            if wh:
-                dt_et, det = wh
-                iso = dt_et.isoformat()
-                file_data[ev] = iso
-                bc_resolved.append((ev, iso, "WH schedule",
-                                    f"{title[:60]} => {det[:60]}"))
-                log(f"broadcast {ev} = {iso}  [WH schedule]  {det[:70]}")
-                continue
-            # a rally the WH schedule does not list yet: its RNC events page
-            rnc = rnc_rally_start(sub_title, d_et)
-            if rnc:
-                dt_et, url = rnc
-                iso = dt_et.isoformat()
-                file_data[ev] = iso
-                bc_resolved.append((ev, iso, "RNC events",
-                                    f"{sub_title[:60]} => {url[-60:]}"))
-                log(f"broadcast {ev} = {iso}  [RNC events]  {url}")
-                continue
-        m = SHOW_TITLE_RE.search(title)
-        hit = tvmaze_airtime(m.group(1), d_et) if m else None
-        if hit:
-            dt_et, net = hit
-            iso = dt_et.isoformat()
+        iso, src, detail, title = auto_broadcast_start(client, ev, series)
+        if iso:
             file_data[ev] = iso
-            bc_resolved.append((ev, iso, net, title[:90]))
-            log(f"broadcast {ev} = {iso}  [tvmaze {net}]  {title[:70]}")
+            bc_resolved.append((ev, iso, src, detail))
+            log(f"broadcast {ev} = {iso}  [{src}]  {detail[:70]}")
         else:
             bc_unresolved.append((ev, title))
             log(f"BROADCAST UNRESOLVED: {ev}  {title[:90]}")
