@@ -104,17 +104,22 @@ def us_general_vote_ok(series: dict, market: dict) -> Tuple[bool, str]:
     return True, "US race of the Nov 3 2026 general election"
 
 
+# Events are keyed with imm.event_ticker_of, not a bare rsplit: a one-market
+# event's market ticker IS its event ticker (KXTUREKOUTPERFORMRCP-26NOV03, the
+# 10/08 02:02Z RCP-outperform batch), and the rsplit made it the SERIES -- so
+# the dating pass found no markets and skipped it unlogged, and research and
+# the alert both read a $0 pool while nine of them paid ~$56/market/day.
 def _by_event(progs: Dict[str, dict]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = defaultdict(list)
     for t in progs:
-        out[t.rsplit("-", 1)[0]].append(t)
+        out[imm.event_ticker_of(t)].append(t)
     return out
 
 
 def event_pools(progs: Dict[str, dict]) -> Dict[str, float]:
     pools: Dict[str, float] = defaultdict(float)
     for t, p in progs.items():
-        pools[t.rsplit("-", 1)[0]] += ifa._dollars_per_day(p)
+        pools[imm.event_ticker_of(t)] += ifa._dollars_per_day(p)
     return pools
 
 
@@ -137,6 +142,7 @@ def date_us_general(client, progs: Dict[str, dict], dry: bool) -> List[Tuple[str
             out.append((ev, False, f"market read failed: {e}"))
             continue
         if not mk:
+            out.append((ev, False, "no markets listed for the event"))
             continue
         ok, why = us_general_vote_ok(cache[series], mk[0])
         if not ok:
@@ -301,8 +307,14 @@ def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, 
     here and now (as the overrides task's Phase 4 would), not researched."""
     targets: Dict[str, dict] = {}
     imm.load_file_event_overrides()       # a --set since import is not a target
+    imm.load_election_dates_extra()       # nor a row written since the bot's
+    imm.load_awards_dates_extra()         # last config_gaps.json (the dating pass)
     for ev, g in sorted((gaps or {}).items()):
         kind = gap_kind(g.get("msg") or "")
+        if kind == "election" and imm.election_cutoff_utc(ev) is not None:
+            continue
+        if kind == "award" and imm.awards_event_start(ev, None, dates_only=True) is not None:
+            continue
         if kind:
             targets[f"gap:{ev}"] = {"kind": kind, "event": ev,
                                     "series": g.get("series") or imm.series_of(ev),

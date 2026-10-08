@@ -190,6 +190,23 @@ class TestGapAlert(unittest.TestCase):
         self.assertIn("fix: add a row", body)
 
 
+class TestEventKeys(unittest.TestCase):
+
+    def test_one_market_event_is_keyed_by_its_own_ticker(self):
+        # KXTUREKOUTPERFORMRCP-26NOV03: the market ticker IS the event ticker
+        day = {"start_date": "2026-10-08T00:00:00Z", "end_date": "2026-10-09T00:00:00Z"}
+        progs = {"KXTUREKOUTPERFORMRCP-26NOV03": dict(day, period_reward=56 * 10000),
+                 "KXHURCAT-26ISAIAS-T3": dict(day, period_reward=100 * 10000),
+                 "KXHURCAT-26ISAIAS-T4": dict(day, period_reward=100 * 10000)}
+        self.assertEqual(dict(fw._by_event(progs)), {
+            "KXTUREKOUTPERFORMRCP-26NOV03": ["KXTUREKOUTPERFORMRCP-26NOV03"],
+            "KXHURCAT-26ISAIAS": ["KXHURCAT-26ISAIAS-T3", "KXHURCAT-26ISAIAS-T4"]})
+        pools = fw.event_pools(progs)
+        self.assertAlmostEqual(pools["KXTUREKOUTPERFORMRCP-26NOV03"], 56.0)
+        self.assertAlmostEqual(pools["KXHURCAT-26ISAIAS"], 200.0)
+        self.assertNotIn("KXTUREKOUTPERFORMRCP", pools)
+
+
 class TestResearchOnArrival(unittest.TestCase):
     """Jack 2026-10-08: "instead of separate gap-fixer routine, why not just
     research when a new series enrolls?" -> "yes switch"."""
@@ -301,6 +318,22 @@ class TestResearchOnArrival(unittest.TestCase):
                                 {"gap:KXISR-26OCT27": dict(items["gap:KXISR-26OCT27"],
                                                            hold=True)}, t + 3 * 3600)
         self.assertEqual((due, set(st)), ([], {"gap:KXISR-26OCT27"}))
+
+    def test_a_gap_a_row_now_covers_is_not_researched(self):
+        # 10/08 14:38Z: the dating pass wrote 8 rows seconds before research
+        # read the bot's (older) config_gaps.json and re-confirmed 7 of them
+        from unittest import mock
+        gaps = {"KXA-26NOV03": {"series": "KXA", "msg": "KXA-26NOV03 has no verified "
+                                "election day in ELECTION_DATES"},
+                "KXB-26NOV03": {"series": "KXB", "msg": "KXB-26NOV03 has no verified "
+                                "election day in ELECTION_DATES"}}
+        dated = lambda ev, market=None: (datetime(2026, 11, 3, 5, tzinfo=timezone.utc)
+                                         if ev == "KXA-26NOV03" else None)
+        with mock.patch.object(fw.imm, "election_cutoff_utc", dated), \
+                mock.patch.object(fw.ieo, "discover_broadcast_mention_events",
+                                  lambda c, now: []):
+            t = fw.research_targets(None, gaps, datetime.now(timezone.utc), dry=True)
+        self.assertEqual(sorted(t), ["gap:KXB-26NOV03"])
 
     def test_start_targets_become_alert_items(self):
         progs = {"KXTRUMPMENTION-26OCT08-AI": {

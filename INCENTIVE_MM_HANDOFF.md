@@ -9124,3 +9124,40 @@ breakers. Not built: an NHC advisory-window stand-aside, or an NHC
 intensity fair (current Vmax + forecast peak from the advisory).
 
 Tests: TestSportsAndVenueAllowlist +1. Suite 2,321 OK.
+
+## 2026-10-08 ~14:50Z — family watch keyed one-market events by their SERIES; the RCP-outperform batch sat dark 12.5h (Jack: "why arent KXTUREKOUTPERFORMRCP, KXCOOPEROUTPERFORMRCP, etc captured in the election family and quoted?")
+
+WHAT HAPPENED.
+- Enrolled into the election family at 02:20Z: KX<CANDIDATE>OUTPERFORMRCP,
+  nine Senate candidates. Each asks whether the candidate's margin beats the
+  RCP average of 10 AM ET Nov 3.
+- Their programs lit at 02:02Z: $170/market over 3 days, ~$56/market/day,
+  target 1,000.
+- Each is a ONE-market event, so its market ticker IS its event ticker
+  (KXTUREKOUTPERFORMRCP-26NOV03, no strike segment).
+- imm_family_watch keyed events with t.rsplit("-", 1)[0], which turned
+  those into the SERIES:
+  - the dating pass found no markets for "KXTUREKOUTPERFORMRCP" and skipped
+    it without a log line;
+  - research and the alert read a $0 pool. c0de8f5 skips $0 targets, so
+    research never ran.
+- The bot itself was right (event_ticker_of / the market's event_ticker):
+  it stood them down fail-closed for want of a row.
+
+FIX.
+- _by_event / event_pools key by imm.event_ticker_of.
+- The dating pass logs "no markets listed" instead of skipping silently.
+- research_targets reloads both row files and skips a gap a row now
+  covers. On the fix run, research spent ~$1.30 re-confirming 7 events the
+  dating pass had dated seconds earlier, because the bot's config_gaps.json
+  lagged.
+
+Run from the worktree at 14:38Z:
+- the rule dated 8: COLLINS, COOPER, ELSAYED, HAMILTON, HILTON, OSSOFF,
+  TALARICO, TUREK;
+- research dated KXBROWNOUTPERFORMRCP-26NOV03 = 2026-11-03, the Ohio
+  SPECIAL Senate election ("special election" is refused by the rule on
+  purpose), from Wikipedia + Ballotpedia;
+- the bot loaded the rows at 14:39:37Z / 14:42:48Z.
+
+Tests: test_imm_family_watch 20 (+2). Suite 2,323 OK.
