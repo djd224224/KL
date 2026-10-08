@@ -75,6 +75,20 @@ positions, which the IMM's reads (primary by default) never see. Creating
 it and moving cash into it are the account owner's steps (--setup prints
 them); this bot never moves money.
 
+LIVE IN A SUBACCOUNT (Jack 2026-10-08: "yes subaccount, $250 at risk"),
+after a paper Sunday of +$26 on $350 at risk (14 of 17 settled won):
+  python kalshi_subaccount.py create            (Jack; prints its number N)
+  python kalshi_subaccount.py fund N 300        (Jack; primary -> N, shard 0)
+  powershell -File run_nfl_snipe.ps1 -Live -Subaccount N
+Orders and the subaccount's balance go to Kalshi's production host
+(external-api.kalshi.com, SNIPE_API_BASE); its balance is balance_dollars,
+because balance_breakdown is the WHOLE account's (measured 10/8: subaccount
+1 read $0.00 with the primary's $18,373 in the breakdown). The cash floor is
+$0 there (the cash is the bot's own). Every live order is read back: an
+order Kalshi booked to any other subaccount writes HALT and stops the bot,
+and a fill that landed in the primary goes into snipe_book.json so the IMM
+nets it out. --live refuses to start on a subaccount holding no cash.
+
 DRY RUN BY DEFAULT: it reads everything, sizes everything, logs "[DRY]
 would SELL ..." and books a PAPER fill (snipe_book_paper.json) so its caps
 and cooldowns behave as they would live. --live sends orders.
@@ -555,8 +569,22 @@ class Exchange:
     `subaccount` > 0 scopes this bot's balance and orders to a numbered
     Kalshi subaccount."""
 
-    def __init__(self, subaccount: int = 0):
+    def __init__(self, subaccount: int = 0, api_base: Optional[str] = None):
         self.subaccount = int(subaccount)
+        self.api_base = api_base or os.environ.get(
+            "SNIPE_API_BASE", "https://external-api.kalshi.com/trade-api/v2")
+        self._acct = None
+
+    def acct(self) -> Any:
+        """The signed client on Kalshi's production host, for orders and the
+        account reads a subaccount scopes (the key is kalshi_reads')."""
+        if self._acct is None:
+            import kalshi_reads as kr
+            from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient
+            self._acct = ExchangeClient(exchange_api_base=self.api_base,
+                                        key_id=kr.KEY_ID,
+                                        private_key=kr.load_private_key())
+        return self._acct
 
     @staticmethod
     def _get(path: str, params: Optional[dict] = None, prefer: str = "signed") -> Any:
@@ -590,11 +618,14 @@ class Exchange:
         return out
 
     def free_cash(self, shard: int = 0) -> Optional[float]:
-        """Dollars on the shard for this bot's subaccount (the balance does
-        not net out resting orders: measured 10/4, $339 of bids cancelled
-        and the balance did not move)."""
-        params = {"subaccount": self.subaccount} if self.subaccount else None
-        js = self._get("/portfolio/balance", params)
+        """Dollars this bot may spend: the subaccount's balance_dollars (its
+        balance_breakdown is the whole account's -- measured 10/8), or the
+        primary's cash on the shard (the balance does not net out resting
+        orders: measured 10/4, $339 of bids cancelled and it did not move)."""
+        if self.subaccount:
+            js = self.acct().get("/portfolio/balance", {"subaccount": self.subaccount})
+            return float(js.get("balance_dollars") or 0.0)
+        js = self._get("/portfolio/balance", None)
         for b in js.get("balance_breakdown") or []:
             if int(b.get("exchange_index", -1)) == int(shard):
                 return float(b.get("balance") or 0.0)
@@ -608,8 +639,7 @@ class Exchange:
         """An immediate-or-cancel order: side 'sell' = sell YES (the book's
         ask side), 'buy' = buy YES. Never rests; never trades against the
         account's own orders (taker_at_cross cancels it there instead)."""
-        from kalshi_reads import signed_client
-        c = signed_client()
+        c = self.acct()
         body = {"ticker": ticker,
                 "side": "ask" if side == "sell" else "bid",
                 "count": f"{float(count):.2f}",
@@ -620,6 +650,20 @@ class Exchange:
         if self.subaccount:
             body["subaccount"] = self.subaccount
         return c.post(path=c.events_orders_url, body=json.dumps(body))
+
+    def order_subaccount(self, order_id: str) -> Optional[int]:
+        """The subaccount Kalshi booked an order to (subaccount_number on
+        the order record), None when it cannot be read."""
+        c = self.acct()
+        for params in ({"subaccount": self.subaccount}, {}):
+            try:
+                js = c.get(f"/portfolio/orders/{order_id}", params)
+            except Exception:                            # noqa: BLE001
+                continue
+            o = (js or {}).get("order") or js or {}
+            if o.get("subaccount_number") is not None:
+                return int(o["subaccount_number"])
+        return None
 
 
 def _signed_get_json(path: str, params: dict) -> dict:
@@ -1004,6 +1048,11 @@ class Sniper:
         avg_fill = float(resp.get("average_fill_price") or 0.0) * 100.0
         fee = float(resp.get("average_fee_paid") or 0.0) * filled
         oid = resp.get("order_id") or ""
+        if cfg.subaccount and oid:
+            booked = self.ex.order_subaccount(oid)
+            if booked != cfg.subaccount:
+                return self._wrong_subaccount(sig, row, coid, oid, booked, filled,
+                                              avg_fill, fee, now_ts)
         if filled > 0:
             self.book.apply_fill(sig.ticker, sig.side, filled, avg_fill, fee,
                                  sig.player_key, sig.kickoff, now_ts, order_id=oid)
@@ -1020,6 +1069,30 @@ class Sniper:
         self.book.save()
         return {**row, "filled": filled, "avg_cents": avg_fill, "fee": fee,
                 "order_id": oid}
+
+    def _wrong_subaccount(self, sig: Signal, row: dict, coid: str, oid: str,
+                          booked: Optional[int], filled: float, avg_fill: float,
+                          fee: float, now_ts: float) -> dict:
+        """An order Kalshi did not book to our subaccount: HALT (the bot idles
+        until the file goes), and a fill that landed in the primary goes into
+        the primary's sniper book so the IMM nets it out of the account."""
+        why = (f"order {oid} on {sig.ticker} was booked to subaccount {booked}, "
+               f"not {self.cfg.subaccount} ({filled:g} filled @ {avg_fill:.2f}c)")
+        self.log(f"!! {why} -- HALTED; delete {HALT_FILE} to resume")
+        try:
+            with open(os.path.join(self.log_dir, HALT_FILE), "w", encoding="utf-8") as f:
+                f.write(why + "\n")
+        except OSError:
+            pass
+        if filled > 0 and booked == 0:
+            primary = SnipeBook(os.path.join(self.log_dir, BOOK_FILE), 0)
+            primary.apply_fill(sig.ticker, sig.side, filled, avg_fill, fee,
+                               sig.player_key, sig.kickoff, now_ts, order_id=oid)
+            primary.save()
+        self.log.row("orders", {**row, "order_id": oid, "client_order_id": coid,
+                                "filled": filled, "avg_cents": avg_fill, "fee": fee,
+                                "error": "wrong_subaccount", "booked_subaccount": booked})
+        return {"skip": "wrong_subaccount"}
 
     def _restore_watch(self) -> None:
         """The ESPN designations this bot's watch saw before a restart: a
@@ -1127,6 +1200,11 @@ class SingleInstance:
             self.fh = None
             return False
         return True
+
+    def release(self) -> None:
+        if self.fh is not None:
+            self.fh.close()
+            self.fh = None
 
 
 # ---------------------------------------------------------------------- P&L
@@ -1287,16 +1365,14 @@ positions stay apart from the IMM's, and the IMM's reads (the primary
 subaccount by default) never see them. Both steps are the account owner's --
 this bot never creates accounts or moves money.
 
- 1. Create a numbered subaccount: Kalshi's API, POST /portfolio/subaccounts
-    (docs.kalshi.com, "Create Subaccount"), or the website if offered.
-    Note its number (1-63).
- 2. Move cash into it: POST /portfolio/subaccounts/transfer with
-      {"client_transfer_id": "<new uuid>", "from_subaccount": 0,
-       "to_subaccount": <N>, "amount_cents": <cents>, "exchange_index": 0}
-    NFL props trade on exchange shard 0.
+ 1. Create a numbered subaccount (prints its number N, 1-63):
+      python kalshi_subaccount.py create
+ 2. Move cash into it from the primary (NFL props trade on shard 0):
+      python kalshi_subaccount.py fund <N> 300
  3. Dry run against it, then go live:
       python nfl_snipe_bot.py --once --subaccount <N>
-      python nfl_snipe_bot.py --live --subaccount <N>
+      powershell -ExecutionPolicy Bypass -File run_nfl_snipe.ps1 -Live -Subaccount <N>
+    To take the cash back: python kalshi_subaccount.py withdraw <N> <dollars>
 On the primary account instead (--subaccount 0), the IMM must net this bot's
 book out of the account's positions (incentive_mm.fetch_positions reads
 run-logs/nfl-snipe/snipe_book.json), or it reads every snipe as a manual
@@ -1361,17 +1437,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.sides = args.sides
     if args.max_risk_total is not None:
         cfg.max_risk_total = args.max_risk_total
+    if cfg.subaccount and "SNIPE_CASH_FLOOR" not in os.environ:
+        cfg.cash_floor = 0.0          # the subaccount's cash is the bot's own
     lock = SingleInstance(os.path.join(
         args.log_dir, "snipe_live.lock" if cfg.live else "snipe_paper.lock"))
     if not lock.acquire():
         print(f"another {'live' if cfg.live else 'dry-run'} sniper holds the lock; exiting")
         return 1
-    bot = Sniper(cfg, log_dir=args.log_dir)
+    ex = Exchange(cfg.subaccount)
+    if cfg.live and cfg.subaccount:
+        try:
+            cash = ex.free_cash()
+        except Exception as e:                           # noqa: BLE001
+            print(f"cannot read subaccount {cfg.subaccount}'s balance: {e}; not starting")
+            lock.release()
+            return 2
+        if not cash or cash <= 0:
+            print(f"subaccount {cfg.subaccount} holds $0.00 -- fund it first: "
+                  f"python kalshi_subaccount.py fund {cfg.subaccount} 300")
+            lock.release()
+            return 2
+    bot = Sniper(cfg, exchange=ex, log_dir=args.log_dir)
     bot.log(f"start: {'LIVE' if cfg.live else 'DRY RUN'}, subaccount {cfg.subaccount}, "
             f"sides {cfg.sides}, margin {cfg.band_margin_cents}c past the band, "
             f"min {cfg.min_net_cents}c and {cfg.min_ror:.0%} of risk a contract, "
             f"risk caps ${cfg.max_risk_market:g} market / ${cfg.max_risk_player:g} "
-            f"player / ${cfg.max_risk_total:g} total, cash floor ${cfg.cash_floor:g}")
+            f"player / ${cfg.max_risk_total:g} total, cash floor ${cfg.cash_floor:g}"
+            + (f", orders via {ex.api_base}" if cfg.live else ""))
     while True:
         t0 = time.time()
         try:

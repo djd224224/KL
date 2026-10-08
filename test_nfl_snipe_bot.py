@@ -326,13 +326,18 @@ class TestSizing(unittest.TestCase):
 # ------------------------------------------------------------- end to end
 
 class FakeExchange:
-    def __init__(self, markets, books, own=None, cash=2000.0, resp=None):
+    def __init__(self, markets, books, own=None, cash=2000.0, resp=None, booked=None):
         self.markets, self.books = markets, books
         self.own = own or {}
         self.cash = cash
         self.resp = resp
         self.placed = []
         self.subaccount = 0
+        self.booked = booked
+        self.api_base = "fake"
+
+    def order_subaccount(self, order_id):
+        return self.booked
 
     def open_markets(self):
         return list(self.markets.values())
@@ -528,6 +533,80 @@ class TestBookFile(unittest.TestCase):
             self.assertEqual(json.load(f)["subaccount"], 3)
 
 
+class TestSubaccountLive(unittest.TestCase):
+    """Jack 2026-10-08: "yes subaccount, $250 at risk"."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        p = mock.patch.object(sb, "IMM_STATUS_FILE", os.path.join(self.d, "none.json"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def bot(self, booked):
+        ex = FakeExchange(
+            {T: market(bid=34, ask=98)},
+            {T: {"orderbook_fp": {"yes_dollars": [["0.3400", "60"]], "no_dollars": []}}},
+            booked=booked)
+        games = {entry()["pid"]: [{"receptions": v} for v in (3, 3, 4, 5)]}
+        b = sb.Sniper(cfg(live=True, subaccount=3), exchange=ex,
+                      watch=FakeWatch({T: entry()}, games), kick=FakeKick(),
+                      log_dir=self.d, log=sb.Log(self.d, echo=False))
+        return b, ex
+
+    def test_booked_to_our_subaccount_trades_on(self):
+        b, ex = self.bot(booked=3)
+        out = b.scan(NOW)
+        self.assertEqual(len(out["taken"]), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.d, sb.HALT_FILE)))
+        self.assertTrue(os.path.exists(os.path.join(self.d, "snipe_book_sub3.json")))
+
+    def test_booked_elsewhere_halts_and_books_the_primary(self):
+        b, ex = self.bot(booked=0)
+        out = b.scan(NOW)
+        self.assertEqual(out["skips"].get("wrong_subaccount"), 1)
+        self.assertTrue(os.path.exists(os.path.join(self.d, sb.HALT_FILE)))
+        # the fill sits in the primary's book, which the IMM nets out
+        with open(os.path.join(self.d, sb.BOOK_FILE), encoding="utf-8") as f:
+            js = json.load(f)
+        self.assertLess(js["positions"][T], 0)
+        self.assertEqual(js["subaccount"], 0)
+        # ... and the next scan does nothing
+        self.assertTrue(b.scan(NOW + 1000).get("halted"))
+
+    def test_free_cash_reads_the_subaccounts_own_balance(self):
+        got = {}
+
+        class C:
+            def get(self, path, params):
+                got["path"], got["params"] = path, params
+                return {"balance_dollars": "300.0000",
+                        "balance_breakdown": [{"balance": "18373.1369", "exchange_index": 0}]}
+
+        ex = sb.Exchange(subaccount=2)
+        ex._acct = C()
+        self.assertEqual(ex.free_cash(0), 300.0)        # not the account-wide 18,373
+        self.assertEqual(got, {"path": "/portfolio/balance", "params": {"subaccount": 2}})
+
+    def test_order_subaccount_read(self):
+        class C:
+            def get(self, path, params):
+                if params:
+                    raise RuntimeError("404")          # not in the subaccount
+                return {"order": {"order_id": "x", "subaccount_number": 0}}
+
+        ex = sb.Exchange(subaccount=2)
+        ex._acct = C()
+        self.assertEqual(ex.order_subaccount("x"), 0)
+
+    def test_live_refuses_an_unfunded_subaccount(self):
+        with mock.patch.object(sb.Exchange, "free_cash", return_value=0.0), \
+                mock.patch.object(sb, "Sniper") as S:
+            self.assertEqual(sb.main(["--live", "--subaccount", "2",
+                                      "--log-dir", self.d]), 2)
+            S.assert_not_called()
+
+
 class TestExchangeBody(unittest.TestCase):
     def test_place_ioc_body(self):
         sent = {}
@@ -539,7 +618,7 @@ class TestExchangeBody(unittest.TestCase):
                 sent["path"], sent["body"] = path, json.loads(body)
                 return {"order_id": "x", "fill_count": "0.00"}
 
-        with mock.patch("kalshi_reads.signed_client", return_value=C()):
+        with mock.patch.object(sb.Exchange, "acct", lambda self: C()):
             sb.Exchange(subaccount=0).place_ioc(T, "sell", 60, 24.0, "snp-1")
             self.assertEqual(sent["body"], {
                 "ticker": T, "side": "ask", "count": "60.00", "price": "0.2400",
