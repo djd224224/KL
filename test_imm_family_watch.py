@@ -227,6 +227,11 @@ class TestResearchOnArrival(unittest.TestCase):
         due = fw.research_due({}, many, t, est)
         self.assertEqual(len(due), fw.RESEARCH_MAX_TARGETS)
         self.assertEqual(due[0], "gap:KX19-26")
+        # no active program ($0, or absent from est): waits until one lights
+        unpaid = {k: 0.0 for k in many}
+        unpaid["gap:KX3-26"] = 2.0
+        self.assertEqual(fw.research_due({}, many, t, unpaid), ["gap:KX3-26"])
+        self.assertEqual(fw.research_due({}, self.T, t, {}), [])
 
     def test_prompt_names_each_target_its_command_and_the_result_line(self):
         p = fw.research_prompt([(k, v, "Kalshi says ...") for k, v in self.T.items()])

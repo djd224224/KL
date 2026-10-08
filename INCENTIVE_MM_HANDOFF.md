@@ -9043,3 +9043,11 @@ Seen but not yet a gap: KXSFBALLOTMEASURES-26NOV03 (SF props, enrolled
 02:20Z). us_general_vote_ok refuses it: "passes" is not vote language, and
 Kalshi's expiry is 2027-11-03. Left strict on purpose; research takes it
 once the bot lists the gap.
+
+Follow-up ~02:40Z: research only PAYING targets. The bot lists unpaid
+election events as gaps too: the 02:20Z batch KX*OUTPERFORMRCP (x8) and
+KXBAYAREATRANSIT, $0/day pool. They would have taken research slots at $0.
+research_due now skips a target with est 0; it is researched once a program
+lights. The dating pass also dates 7 of the 8 OUTPERFORMRCP by rule then.
+KXBROWNOUTPERFORMRCP is the Ohio special: "special election" is refused by
+design, so research takes it.

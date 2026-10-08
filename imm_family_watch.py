@@ -331,10 +331,14 @@ def research_due(rstate: Dict[str, dict], targets: Dict[str, dict], now_ts: floa
                  est: Dict[str, float] = None) -> List[str]:
     """The target keys to research now: never tried, or the backoff after the
     last unresolved try has run out; not judgment calls, not past
-    RESEARCH_MAX_ATTEMPTS. Highest estimated value first, at most
-    RESEARCH_MAX_TARGETS."""
+    RESEARCH_MAX_ATTEMPTS; and paying -- with `est`, a target with no active
+    program ($0) waits until one lights (the bot lists unpaid election
+    events as gaps too: the 02:20Z 10/08 KX*OUTPERFORMRCP batch). Highest
+    estimated value first, at most RESEARCH_MAX_TARGETS."""
     due = []
     for key in targets:
+        if est is not None and est.get(key, 0.0) <= 0:
+            continue
         r = rstate.get(key) or {}
         n = int(r.get("attempts") or 0)
         if r.get("status") == "judgment" or n >= RESEARCH_MAX_ATTEMPTS:
