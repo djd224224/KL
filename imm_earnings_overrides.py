@@ -968,6 +968,17 @@ RNC_SLUG_SUFFIXES = ("-president-donald-j-trump", "-featuring-president-donald-j
 _RNC_WHEN_RE = re.compile(
     r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,\s+([A-Z][a-z]+)\s+(\d{1,2}),\s+(\d{4})"
     r"\s*-\s*(\d{1,2}):(\d{2})\s*([ap]m)\s*\(\s*([A-Za-z_]+/[A-Za-z_]+)\s*\)", re.I)
+# SPEAKER TIME (Jack 2026-10-08: "Use the speaker time for things like trump
+# remarks"). The page's header time is the PROGRAM start, not Trump's: the
+# Syracuse page (10/09) reads "05:30 pm (US/Eastern)" over an Event Schedule
+# of "3:00 PM EST: Doors Open / 5:30 PM EST: Program Begins / 7:00 PM EST:
+# Remarks Begin". A remarks line on the header's day, at or up to
+# RNC_REMARKS_MAX_AFTER_H after the header time, wins; its wall time is read
+# in the header's zone (the pages write "EST" year-round).
+_RNC_REMARKS_RE = re.compile(
+    r"(\d{1,2}):(\d{2})\s*([ap])\.?m\.?\s*(?:[A-Z]{1,4})?\s*[:-]\s*"
+    r"(?:(?:President\s+)?(?:Donald\s+J\.?\s+)?Trump(?:'s)?\s+)?Remarks\b", re.I)
+RNC_REMARKS_MAX_AFTER_H = 6
 
 
 def rnc_event_name(sub_title: str):
@@ -982,6 +993,35 @@ def _rnc_slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
+# The slug spells the state out (San Antonio "-texas", Grand Island
+# "-nebraska") or abbreviates it (Syracuse 10/09: "midterm-rally-in-syracuse-
+# ny-president-donald-j-trump", which the full-name slug missed and research
+# had to find). Full name first, then the USPS code.
+_US_STATE_ABBR = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
+    "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
+    "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id",
+    "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
+    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn",
+    "mississippi": "ms", "missouri": "mo", "montana": "mt", "nebraska": "ne",
+    "nevada": "nv", "new hampshire": "nh", "new jersey": "nj",
+    "new mexico": "nm", "new york": "ny", "north carolina": "nc",
+    "north dakota": "nd", "ohio": "oh", "oklahoma": "ok", "oregon": "or",
+    "pennsylvania": "pa", "rhode island": "ri", "south carolina": "sc",
+    "south dakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut",
+    "vermont": "vt", "virginia": "va", "washington": "wa",
+    "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy",
+    "district of columbia": "dc"}
+
+
+def _rnc_names(name: str) -> list:
+    """The rally name as Kalshi gives it, then with its state abbreviated."""
+    head, _, state = name.rpartition(", ")
+    abbr = _US_STATE_ABBR.get(state.strip().lower()) if head else None
+    return [name] + ([f"{head} {abbr}"] if abbr else [])
+
+
 def rnc_rally_start(sub_title: str, date_et, get=None):
     """(datetime ET, page url) for a Trump rally from its RNC events page, or
     None: the slug from Kalshi's sub_title, the page's own date/time/zone
@@ -993,8 +1033,8 @@ def rnc_rally_start(sub_title: str, date_et, get=None):
         return None
     city = name.rsplit(" in ", 1)[1].split(",")[0].strip().lower()
     get = get or (lambda u: requests.get(u, headers=UA, timeout=20))
-    for suf in RNC_SLUG_SUFFIXES:
-        url = RNC_EVENTS_BASE + _rnc_slug(name) + suf
+    for nm, suf in [(n, x) for n in _rnc_names(name) for x in RNC_SLUG_SUFFIXES]:
+        url = RNC_EVENTS_BASE + _rnc_slug(nm) + suf
         try:
             r = get(url)
         except Exception as e:
@@ -1009,10 +1049,23 @@ def rnc_rally_start(sub_title: str, date_et, get=None):
         try:
             mon = datetime.strptime(m.group(1)[:3], "%b").month
             hh = int(m.group(4)) % 12 + (12 if m.group(6).lower() == "pm" else 0)
-            local = pytz.timezone(m.group(7)).localize(datetime(
+            tz = pytz.timezone(m.group(7))
+            local = tz.localize(datetime(
                 int(m.group(3)), mon, int(m.group(2)), hh, int(m.group(5))))
         except (ValueError, pytz.UnknownTimeZoneError):
             continue
+        # the speaker's own time when the page lists it (see _RNC_REMARKS_RE)
+        rm = _RNC_REMARKS_RE.search(re.sub(r"<[^>]+>", " ", html).replace("&nbsp;", " "))
+        if rm:
+            try:
+                rh = int(rm.group(1)) % 12 + (12 if rm.group(3).lower() == "p" else 0)
+                said = tz.localize(datetime(local.year, local.month, local.day,
+                                            rh, int(rm.group(2))))
+            except ValueError:
+                said = None
+            if said is not None and timedelta(0) <= said - local <= timedelta(
+                    hours=RNC_REMARKS_MAX_AFTER_H):
+                local = said
         dt_et = local.astimezone(ET)
         if dt_et.date() != date_et and local.date() != date_et:
             continue                       # a page for another date

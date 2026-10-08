@@ -159,6 +159,44 @@ class TestRncRallyStart(unittest.TestCase):
         self.assertEqual(dt.isoformat(), "2026-10-07T19:00:00-04:00")   # 6pm CDT
         self.assertEqual(calls, [SA_URL])                 # first slug hit
 
+    def test_remarks_time_beats_the_program_start(self):
+        # Jack 2026-10-08: "Use the speaker time for things like trump remarks"
+        # (Syracuse, 10/09: header 05:30 pm = program start; remarks 7:00 PM)
+        html = (SA_HTML.replace("Wed, October 07, 2026 - 06:00 pm",
+                                "Wed, October 07, 2026 - 05:30 pm")
+                .replace("(US/Central)", "(US/Eastern)")
+                + "<p>Event Schedule: 3:00 PM EST: Doors Open&nbsp; 5:30 PM EST: "
+                  "Program Begins&nbsp; 7:00 PM EST: Remarks Begin</p>")
+        get, _ = self._get({SA_URL: html})
+        dt, _ = ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get)
+        self.assertEqual(dt.isoformat(), "2026-10-07T19:00:00-04:00")
+        # read in the header's zone: 7:00 PM CDT = 8:00 PM EDT
+        get, _ = self._get({SA_URL: html.replace("(US/Eastern)", "(US/Central)")})
+        dt, _ = ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get)
+        self.assertEqual(dt.isoformat(), "2026-10-07T20:00:00-04:00")
+        # a remarks time before the header, or > 6h after it, is not taken
+        for bad in ("4:00 PM EST: Remarks Begin", "11:45 PM EST: Remarks Begin"):
+            get, _ = self._get({SA_URL: html.replace("7:00 PM EST: Remarks Begin", bad)})
+            dt, _ = ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get)
+            self.assertEqual(dt.isoformat(), "2026-10-07T17:30:00-04:00", bad)
+
+    def test_state_abbreviated_slug(self):
+        # Syracuse 10/09: the page is "...-in-syracuse-ny-president-donald-j-trump"
+        sub = ("Donald Trump - Midterm Rally in Syracuse, New York originally "
+               "scheduled for October 9, 2026")
+        url = ieo.RNC_EVENTS_BASE + "midterm-rally-in-syracuse-ny-president-donald-j-trump"
+        html = ("Fri, October 09, 2026 - 05:30 pm (US/Eastern) Doors Open: 03:00 PM "
+                "Nicholas J. Pirro Convention Center, Syracuse, NY. Event Schedule: "
+                "3:00 PM EST: Doors Open&nbsp; 5:30 PM EST: Program Begins&nbsp; "
+                "7:00 PM EST: Remarks Begin")
+        get, calls = self._get({url: html})
+        dt, got = ieo.rnc_rally_start(sub, date(2026, 10, 9), get=get)
+        self.assertEqual((got, dt.isoformat()), (url, "2026-10-09T19:00:00-04:00"))
+        self.assertEqual(len(calls), len(ieo.RNC_SLUG_SUFFIXES) + 1)  # full names first
+        self.assertEqual(ieo._rnc_names("Rally in Washington, District of Columbia"),
+                         ["Rally in Washington, District of Columbia", "Rally in Washington dc"])
+        self.assertEqual(ieo._rnc_names("Rally at Mar-a-Lago"), ["Rally at Mar-a-Lago"])
+
     def test_later_slug_variants_are_tried(self):
         alt = SA_URL.replace("-president-donald-j-trump",
                              "-featuring-president-donald-j-trump")
@@ -173,7 +211,7 @@ class TestRncRallyStart(unittest.TestCase):
         self.assertIsNone(ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get))
         get, calls = self._get({})
         self.assertIsNone(ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get))
-        self.assertEqual(len(calls), len(ieo.RNC_SLUG_SUFFIXES))
+        self.assertEqual(len(calls), 2 * len(ieo.RNC_SLUG_SUFFIXES))   # -texas, -tx
         get, calls = self._get({SA_URL: SA_HTML.replace("06:00 pm", "TBD")})
         self.assertIsNone(ieo.rnc_rally_start(SA_SUB, date(2026, 10, 7), get=get))
         # a fetch error is a miss, not a crash

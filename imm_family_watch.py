@@ -361,8 +361,10 @@ _HOW = {
               "shortlist or finalists announcement -- not the ceremony)",
               "python imm_rows.py award add {ev} YYYY-MM-DD --source \"...\" "
               "--source \"...\" --by family-watch-research"),
-    "start": ("when the speaker actually starts / the broadcast airs (if sources give "
-              "a window or disagree by under an hour, the EARLIEST credible time -- "
+    "start": ("when the SPEAKER the market is about starts speaking -- for a rally or "
+              "speech the scheduled remarks time ('7:00 PM: Remarks Begin'), NOT doors "
+              "or program start; for a show, its air time (if sources give the speaker "
+              "only a window or disagree by under an hour, the EARLIEST credible time -- "
               "the bot stands down at the start, so late is the costly error)",
               "python imm_earnings_overrides.py --set {ev} \"YYYY-MM-DDTHH:MM:00-04:00\"   "
               "(-04:00 through Oct 31 2026, -05:00 from Nov 1 2026)"),

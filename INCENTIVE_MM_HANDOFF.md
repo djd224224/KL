@@ -9051,3 +9051,45 @@ research_due now skips a target with est 0; it is researched once a program
 lights. The dating pass also dates 7 of the 8 OUTPERFORMRCP by rule then.
 KXBROWNOUTPERFORMRCP is the Ohio special: "special election" is refused by
 design, so research takes it.
+
+## 2026-10-08 ~03:15Z — mention start = the SPEAKER's time; RNC slugs with state codes (Jack: "Use the speaker time for things like trump remarks")
+
+WHY.
+- Research set KXTRUMPMENTION-26OCT09 (the Syracuse rally) to 17:30 ET,
+  the program start. The page lists "7:00 PM EST: Remarks Begin". The bot
+  would have stood down 1.5h early.
+- The RNC resolver reads the page HEADER time, which is the program start
+  ("Fri, October 09, 2026 - 05:30 pm (US/Eastern)").
+- It never found the page anyway: the slug is
+  "midterm-rally-in-syracuse-ny-...", and the resolver only tried
+  "-new-york-".
+
+WHAT.
+- rnc_rally_start: a "H:MM PM [TZ]: [President Trump] Remarks [Begin]" line
+  wins over the header. It must be on the header's day, 0-6h after the
+  header time (RNC_REMARKS_MAX_AFTER_H), and is read in the header's zone
+  (the pages write "EST" year-round).
+- Slugs: Kalshi's full state name first, then the USPS code (_rnc_names).
+  Live check: auto_broadcast_start(KXTRUMPMENTION-26OCT09) =
+  2026-10-09T19:00-04:00 [RNC events].
+- Research prompt ("start"): the time the speaker the market is about starts
+  speaking. For a rally or speech, that is the remarks time, not doors or
+  program start; for a show, its air time. Still the earliest credible time
+  when the speaker's own time is a window.
+- Hand fix: `--set KXTRUMPMENTION-26OCT09 2026-10-09T19:00:00-04:00`
+  (events.gop.com Event Schedule).
+
+CHECKED, NOT CHANGED -- does an untimed Trump-mention day quote? Yes.
+- Jack asked about KXTRUMPMENTION-26OCT08: Golden Age summit, a "morning
+  address" with no clock time.
+- Every KXTRUMPMENTION / -B event expires 14-22 days after its ticker date,
+  so ticker_date_is_listing_date always holds. The cutoff is Kalshi's
+  expiration (26OCT08: 10/22 14:00Z), never midnight ET.
+- The event quotes through its day under the live-event gate, armed from
+  00:00 ET of the ticker day. A start that lands later (the watch's
+  resolvers every 30 min, research +2h) tightens it to start - 10 min.
+- An "untimed event day" cutoff change was written and reverted: dead code
+  for this series.
+
+Tests: test_imm_earnings_overrides +2 (remarks beat the header, in the
+header's zone, bounds; the state-code slug). Suite 2,320 OK.
