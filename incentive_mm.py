@@ -3279,6 +3279,22 @@ _CUT_AAA_SERIES = ("KXAAAGASMAXM", "KXAAAGASMINM")
 # monthly KXAAAGASM and the diesel annuals. Standard semantics; the
 # trial's blackout hours and the GasBuddy refresher stay in code.
 _CUT_GAS_TRIAL_SERIES = ("KXAAAGASD", "KXDIESELD")
+# OPENROUTER SHARE FAMILY OFF (Jack 2026-10-09: "yes do both", after "is it
+# still underperforming after the latest changes around breaks and control
+# measures?"). The ten KX<AUTHOR>SHARE series (_DEFAULT_OR_SHARE_SERIES)
+# kept losing to the market through every fair revision. Fills marked to
+# the 10/09 13:11Z ladder (positions reconcile with Kalshi to the cent):
+# old fair -$143 trading vs $22 est reward over 8.1 days; the dc14a7c
+# rework -$127 vs $10 in its first day; 9fa00ba (1h break window + 3h
+# stand-aside) -$133 vs $9.5 in 2.3 days, i.e. -$53/day net. The hold
+# fired 3x but the losses were not around breaks (-$27 in the 3h after a
+# hold, -$106 elsewhere). Mark-outs worsen with time (-4c/ct at 1h, -8c at
+# 6h, -21c at 24h), and ATM and wing strikes lost alike. A blocklist entry
+# rather than IMM_SHARE_FAIR_ENABLE=0 keeps the share-fair refresher and
+# its chart/ladder archives running for scoring. Exact series (the dash),
+# so KXOPENSOURCESHARE (Vercel) and KXTOKENUSE stay. Standard semantics:
+# open positions ride to settlement. Un-block by removing this entry.
+_CUT_OR_SHARE_SERIES = tuple(s for s in _DEFAULT_OR_SHARE_SERIES.split(",") if s)
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
     # ANNUAL crypto = crypto_annual_mm.py's book as of 2026-08-13 (same
@@ -3319,6 +3335,8 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [f"{_s}-" for _s in _CUT_KPI_SERIES + _CUT_FOOD_SERIES + _CUT_AAA_SERIES]
     # the gas trial's national + diesel dailies (2026-10-08, above)
     + [f"{_s}-" for _s in _CUT_GAS_TRIAL_SERIES]
+    # the OpenRouter share family (2026-10-09, above)
+    + [f"{_s}-" for _s in _CUT_OR_SHARE_SERIES]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 

@@ -11617,6 +11617,12 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
         imm._share_fair_state.update(mtime=0.0, entries={}, moved_at={})
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
+        # the family is blocklisted since 2026-10-09 (test_family_is_blocked);
+        # these tests keep the gate machinery covered for an un-block
+        self._saved_block = imm.SERIES_BLOCKLIST_PREFIXES
+        _share = tuple(f"{s}-" for s in imm._CUT_OR_SHARE_SERIES)
+        imm.SERIES_BLOCKLIST_PREFIXES = tuple(
+            p for p in imm.SERIES_BLOCKLIST_PREFIXES if p not in _share)
         try:
             os.remove(imm.SHARE_FAIR_FILE)
         except FileNotFoundError:
@@ -11624,6 +11630,22 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm.SERIES_BLOCKLIST_PREFIXES = self._saved_block
+
+    def test_family_is_blocked(self):
+        # Jack 2026-10-09 ("yes do both"): the ten share series are off by
+        # exact-series blocklist entries; Vercel's open-source share and the
+        # token series are not part of it
+        self.assertEqual(len(imm._CUT_OR_SHARE_SERIES), 10)
+        for s in imm._CUT_OR_SHARE_SERIES:
+            self.assertIn(f"{s}-", self._saved_block, s)
+        imm.SERIES_BLOCKLIST_PREFIXES = self._saved_block
+        for t in ("KXANTHSHARE-26OCT12-2.9", "KXOPENSHARE-26OCT12-18.7",
+                  "KXSTEALTHSHARE-26OCT12-5"):
+            self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        for t in ("KXOPENSOURCESHARE-26OCT10-T70", "KXTOKENUSE-26OCT12-T170"):
+            self.assertFalse(IncentiveMarketMaker._blocked(t), t)
 
     def _write(self, mu=2.75, sigma=0.2, p_ident=1.0, complete=False, lag=False,
                version="v1", age_secs=0.0):
