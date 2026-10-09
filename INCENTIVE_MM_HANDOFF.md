@@ -9476,3 +9476,32 @@ RE-SCORE on the D=10/12 and 10/14 events.
 
 Tests: TestVercelPreDGate.test_the_whole_family_is_doubled (replaces
 test_anthvreq_doubled_size). test_incentive_mm 1132 OK.
+
+## 2026-10-09 ~13:40Z -- dark email: each item's $ over the rest of its program, per event (Jack: "it should also show $ per event (for the whole duration)")
+
+real_estimates now also sets:
+- est_total: each market's forward $/day x the days it can still accrue,
+  i.e. the bot's own _quotable_days to the program end or the market's
+  close. That is the same total its $1-floor test reads.
+- est_events: [event, $/day, $ total, days left, program days, end] per
+  event.
+
+Fallback markets (pool proxy) use the program's days left. The cache keeps
+both; older cache entries without a total recompute.
+
+alert_body:
+- Each line reads "~$X/day, ~$Y over the rest of its program (L of P days,
+  ends <end>)".
+- A per-event line is added when an item spans several events, e.g.
+  KXTRUMPUFC: 26NOV ~$5.02/day = ~$8.03, 26DEC ~$1.59/day = ~$2.55.
+- The subject adds "(~$T over their programs)".
+- The threshold is still $/day.
+
+Checked against the books: KXCOACHOUTMLBDATE-27NYY is Aaron Boone out
+before Nov 15 / Mar 24, $200 a market over a 7.5-day program, target 500.
+- The books are thin and wide (18/28, 51/89): est_frac 6-11% at x1, more at
+  the schedule's bigger sizes.
+- The estimate moved $11.08 -> ~$9 -> $5.24/day between 13:20Z and 13:37Z
+  as the books changed: a live snapshot, not a smoothed figure.
+
+Tests: TestRealEstimates 5. Suite 2,371 OK.

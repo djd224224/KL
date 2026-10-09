@@ -275,25 +275,45 @@ def hold_researched(items: Dict[str, dict], targets: Dict[str, dict], state: dic
             it["fix"] = f"research ({n} tr{'y' if n == 1 else 'ies'}): {r['status']} -- {r.get('note', '')}"
 
 
+def _fmt_end(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).strftime("%b %d %H:%MZ")
+    except (TypeError, ValueError):
+        return "?"
+
+
 def alert_body(due: List[Tuple[str, dict, float]]) -> Tuple[str, str]:
-    total = sum(it["est"] for _, it, _ in due)
-    subject = (f"IMM watch: {len(due)} dark item(s) worth ~${total:,.0f}/day "
-               f"need a row or a call")
+    daily = sum(it["est"] for _, it, _ in due)
+    whole = sum(it.get("est_total") or 0.0 for _, it, _ in due)
+    subject = (f"IMM watch: {len(due)} dark item(s) worth ~${daily:,.0f}/day"
+               + (f" (~${whole:,.0f} over their programs)" if whole else "")
+               + " need a row or a call")
     lines = [subject, ""]
     for key, it, dark in sorted(due, key=lambda d: -d[1]["est"]):
         src = it.get("est_src") or "pool proxy"
-        lines.append(f"- ~${it['est']:,.2f}/day ({src}), dark {dark / 60:.1f}h  "
-                     f"{it['what']}")
+        evs = it.get("est_events") or []
+        worth = f"~${it['est']:,.2f}/day"
+        if evs and it.get("est_total") is not None:
+            worth += (f", ~${it['est_total']:,.2f} over the rest of its program ("
+                      f"{max(e[3] for e in evs):.1f} of {max(e[4] for e in evs):.1f} "
+                      f"days, ends {_fmt_end(max(e[5] for e in evs))})")
+        lines.append(f"- {worth} ({src}), dark {dark / 60:.1f}h  {it['what']}")
+        if len(evs) > 1:
+            per = "; ".join(f"{e[0]} ~${e[1]:,.2f}/day = ~${e[2]:,.2f} "
+                            f"({e[3]:.1f}d left)" for e in evs[:4])
+            lines.append(f"    per event: {per}"
+                         + (f"; +{len(evs) - 4} more" if len(evs) > 4 else ""))
         lines.append(f"    fix: {it['fix']}")
     lines += ["", "(est = the bot's own reward estimator, as if the gap were "
                   "fixed: its standard ladder against each market's live book, "
-                  "the forward $/day over the size schedule, summed over the "
-                  "item's paying markets -- no $1/market floor applied; "
+                  "the forward $/day over its size schedule, summed over the "
+                  "item's paying markets -- no $1/market floor applied. The "
+                  "program total is that $/day over the days each market can "
+                  "still accrue (to the program end or its close), per event. "
                   f"'pool proxy' = pool $/day x {GAP_CAPTURE:.3f} where no book "
                   f"was read. Threshold ${GAP_ALERT_MIN_DPD:g}/day, dark >= "
                   f"{GAP_ALERT_AFTER_MIN:g} min)"]
     return subject, "\n".join(lines)
-
 
 # REAL ESTIMATES (Jack 2026-10-09, of the dark email's "$41/day" for five
 # Israeli minister events -- 102 markets paying $40 each per 2-day program,
@@ -329,12 +349,29 @@ def _item_markets(key: str, progs: Dict[str, dict]) -> List[str]:
     return sorted(t for t in progs if event_key(t) == name)
 
 
+def _program_days(p: dict, now: datetime) -> Tuple[float, float, str]:
+    """(days left, program length in days, end ISO) of a raw program."""
+    start = imm.parse_iso_utc(p.get("start_date", ""))
+    end = imm.parse_iso_utc(p.get("end_date", ""))
+    if end is None:
+        return 1.0, 1.0, ""
+    left = max((end - now).total_seconds() / 86400.0, 0.0)
+    length = max((end - start).total_seconds() / 86400.0, left) if start else left
+    return left, length, end.isoformat()
+
+
 def real_estimates(client, items: Dict[str, dict], progs: Dict[str, dict],
                    state: dict, now_ts: float, max_books: int = None,
                    make_bot=None) -> List[str]:
     """Replace the pool-proxy est of each paying, un-held item with the bot's
-    own estimate (see REAL ESTIMATES). Mutates items; caches in
-    state["est_cache"]; returns log lines."""
+    own estimate (see REAL ESTIMATES), and add what it is worth over the rest
+    of its program, per event (Jack 2026-10-09: "it should also show $ per
+    event (for the whole duration)"): each market's $/day times the days it
+    can still accrue -- the bot's own _quotable_days, to the program end or
+    the market's close -- the same total its $1-floor test reads. Sets
+    est, est_src, est_total and est_events ([event, $/day, $ total, days
+    left, program days, end ISO], largest total first). Mutates items;
+    caches in state["est_cache"]; returns log lines."""
     max_books = EST_MAX_BOOKS if max_books is None else max_books
     make_bot = make_bot or _estimator
     cache = {k: v for k, v in (state.get("est_cache") or {}).items() if k in items}
@@ -342,59 +379,77 @@ def real_estimates(client, items: Dict[str, dict], progs: Dict[str, dict],
     bot = programs = None
     details: Dict[str, dict] = {}
     books = 0
+    now = datetime.fromtimestamp(now_ts, timezone.utc)
     for key, it in sorted(items.items(), key=lambda kv: -kv[1]["est"]):
         markets = _item_markets(key, progs)
         if it.get("hold") or not markets:
             continue
         c = cache.get(key)
         if c and now_ts - float(c.get("at") or 0) < EST_CACHE_HOURS * 3600 \
-                and int(c.get("n") or 0) == len(markets):
-            it["est"], it["est_src"] = c["est"], c["src"]
+                and int(c.get("n") or 0) == len(markets) and "total" in c:
+            it.update(est=c["est"], est_src=c["src"], est_total=c["total"],
+                      est_events=c["events"])
             continue
         if bot is None:
             bot = make_bot(client)
             programs = bot.fetch_programs() or {}
-        total, best, read, proxied = 0.0, 0.0, 0, 0
-        now = datetime.fromtimestamp(now_ts, timezone.utc)
+        rate, best, read, proxied = 0.0, 0.0, 0, 0
+        evs: Dict[str, dict] = {}
         for t in sorted(markets, key=lambda t: -ifa._dollars_per_day(progs[t])):
-            proxy = ifa._dollars_per_day(progs[t]) * GAP_CAPTURE
+            left, length, end = _program_days(progs[t], now)
+            v = ifa._dollars_per_day(progs[t]) * GAP_CAPTURE     # the fallback
+            days, ok = left, False
             info = programs.get(t)
             ev = event_key(t)
-            if info is None or books >= max_books:
-                total, proxied = total + proxy, proxied + 1
-                continue
-            if ev not in details:
-                try:
-                    ms = (client.get("/markets", params={"event_ticker": ev, "limit": 1000})
-                          or {}).get("markets") or []
-                except Exception:
-                    ms = []
-                details[ev] = {m.get("ticker"): m for m in ms}
-            m = details[ev].get(t)
-            if m is None:
-                total, proxied = total + proxy, proxied + 1
-                continue
-            books += 1
-            try:
-                meta = imm_quote_gaps.build_meta(bot, t, info, m, now)
-                meta.cutoff = None            # the "if fixed" view
-                ok = bot._estimate_candidate_yield(meta, [])
-            except Exception as e:
-                notes.append(f"estimate {t} failed: {e!r}")
-                ok = False
-            if not ok:
-                total, proxied = total + proxy, proxied + 1
-                continue
-            v = float(meta.floor_dollars_per_day or 0.0)
-            total, best, read = total + v, max(best, v), read + 1
+            if info is not None and books < max_books:
+                if ev not in details:
+                    try:
+                        ms = (client.get("/markets", params={"event_ticker": ev,
+                                                             "limit": 1000})
+                              or {}).get("markets") or []
+                    except Exception:
+                        ms = []
+                    details[ev] = {m.get("ticker"): m for m in ms}
+                m = details[ev].get(t)
+                if m is not None:
+                    books += 1
+                    try:
+                        meta = imm_quote_gaps.build_meta(bot, t, info, m, now)
+                        meta.cutoff = None            # the "if fixed" view
+                        ok = bot._estimate_candidate_yield(meta, [])
+                    except Exception as e:
+                        notes.append(f"estimate {t} failed: {e!r}")
+                        ok = False
+                    if ok:
+                        v = float(meta.floor_dollars_per_day or 0.0)
+                        days = imm._quotable_days(meta, now)
+            if ok:
+                read, best = read + 1, max(best, v)
+            else:
+                proxied += 1
+            rate += v
+            e = evs.setdefault(ev, {"rate": 0.0, "total": 0.0, "left": 0.0,
+                                    "length": 0.0, "end": ""})
+            e["rate"] += v
+            e["total"] += v * days
+            e["left"] = max(e["left"], days)
+            e["length"] = max(e["length"], length)
+            e["end"] = max(e["end"], end)
         src = (f"bot estimate, {read} market{'s' if read != 1 else ''}"
-               + (f", best ${best:,.2f}" if read > 1 else "")
+               + (f", best ${best:,.2f}/day" if read > 1 else "")
                + (f"; {proxied} at pool proxy" if proxied else ""))
         if not read:
             src = "pool proxy"
-        it["est"], it["est_src"] = round(total, 2), src
-        cache[key] = {"at": now_ts, "n": len(markets), "est": it["est"], "src": src}
-        notes.append(f"est {key}: ${it['est']:,.2f}/day ({src})")
+        it["est"], it["est_src"] = round(rate, 2), src
+        it["est_total"] = round(sum(e["total"] for e in evs.values()), 2)
+        it["est_events"] = sorted(
+            ([ev, round(e["rate"], 2), round(e["total"], 2), round(e["left"], 2),
+              round(e["length"], 2), e["end"]] for ev, e in evs.items()),
+            key=lambda r: -r[2])
+        cache[key] = {"at": now_ts, "n": len(markets), "est": it["est"], "src": src,
+                      "total": it["est_total"], "events": it["est_events"]}
+        notes.append(f"est {key}: ${it['est']:,.2f}/day, ${it['est_total']:,.2f} "
+                     f"over the rest of its program ({src})")
     state["est_cache"] = cache
     return notes
 
