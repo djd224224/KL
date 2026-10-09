@@ -103,6 +103,25 @@ class TestToxicHaltsEmail(unittest.TestCase):
         self.assertEqual(th.subject_for(ctx),
                          "IMM toxic halts Mon Sep 28: 1 event, 1 side (5 pick-offs)")
 
+    def test_exempt_mention_pick_offs_are_tagged(self):
+        """Jack 2026-10-09: mention series never halt. Their pick-offs still
+        show in the most-picked-off table, tagged, and the rule says why."""
+        m = "KXTRUMPMENTION-26SEP28-ISRA"
+        t0 = _ts(2026, 9, 28, 20, 0)
+        _write("toxic_halts_2026-09-28.jsonl", [
+            {"kind": "pickoff", "ts": t0, "ticker": m,
+             "event": "KXTRUMPMENTION-26SEP28", "side": "ask", "fill_px": 30.0,
+             "fill_ts": t0 - 300, "mark": 37.0, "exempt": True}])
+        ctx = th.build_report(self.day)
+        self.assertEqual(ctx["n_picks"], 6)
+        text, html = th.render_text(ctx), th.render_html(ctx)
+        self.assertIn("Exempt: series containing MENTION", text)
+        lines = text.splitlines()
+        self.assertTrue(next(l for l in lines if m in l).endswith("37 (exempt)"))
+        self.assertNotIn("(exempt)", next(l for l in lines if "LATE-A" in l))
+        self.assertIn(f"{m} (exempt)", html)
+        text.encode("ascii")
+
     def test_a_quiet_day_still_reports(self):
         ctx = th.build_report(date(2026, 9, 20))
         self.assertFalse(ctx["seen_file"])

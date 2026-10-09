@@ -3567,6 +3567,46 @@ class TestToxicSideHalt(unittest.TestCase):
             self.assertEqual(b._toxic_confirm(self.now, {a, c}), [])
         self.assertFalse(b.toxic_event_halted(ev, self.now))
 
+    def test_mention_series_are_exempt(self):
+        """Jack 2026-10-09: "turn off toxic halts on MENTION markets" -- a
+        mention pick-off is still written to the sink (flagged exempt) but
+        counts toward no side or event halt, and a halt already in saved
+        state no longer stands anything down."""
+        b = self.bot
+        ev = "KXTRUMPMENTION-26OCT09"
+        a, c = f"{ev}-ISRA", f"{ev}-TRUMA"
+        b.state.last_mark.update({a: 40.0, c: 60.0, self.t: 40.0})
+        before = len(self._sink_rows())
+        # two bid pick-offs on ISRA + one ask on TRUMA: a side AND an event
+        # halt anywhere else
+        b.state.toxic_pending = [[a, "bid", 50.0, self.now - 400],
+                                 [a, "bid", 50.0, self.now - 350],
+                                 [c, "ask", 50.0, self.now - 400]]
+        self.assertEqual(b._toxic_confirm(self.now, {a, c}), [])
+        self.assertEqual((b.state.toxic_halt_until, b.state.toxic_event_halt_until,
+                          b.state.toxic_picks, b.state.toxic_event_picks,
+                          b.state.toxic_pending), ({}, {}, {}, {}, []))
+        rows = self._sink_rows()[before:]
+        self.assertEqual([(r["kind"], r["ticker"], r["exempt"]) for r in rows],
+                         [("pickoff", a, True), ("pickoff", a, True),
+                          ("pickoff", c, True)])
+        # the same pick-offs on a non-mention market still halt it
+        self._due("bid", 50.0)
+        self._due("bid", 50.0)
+        self.assertEqual(b._toxic_confirm(self.now, {self.t}), [f"{self.t}|bid"])
+        self.assertFalse(self._sink_rows()[-2]["exempt"])
+        # halts saved before the change are ignored, restored with the knob
+        b.state.toxic_halt_until[f"{a}|bid"] = self.now + 600
+        b.state.toxic_event_halt_until[ev] = self.now + 600
+        self.assertFalse(b.toxic_market_halted(a, self.now))
+        self.assertFalse(b.toxic_market_halted(c, self.now))
+        with mock.patch.object(imm, "TOXIC_EXEMPT_WORDS", ()):
+            self.assertTrue(b.toxic_side_halted(a, "bid", self.now))
+            self.assertTrue(b.toxic_event_halted(ev, self.now))
+        self.assertTrue(imm.toxic_exempt("KXEARNINGSMENTIONDPZ"))
+        self.assertTrue(imm.toxic_exempt("KXWORLDNEWSMENTION"))
+        self.assertFalse(imm.toxic_exempt("KXAAAGASD"))
+
     def test_halts_and_near_misses_survive_a_restart(self):
         b = self.bot
         now = time.time()

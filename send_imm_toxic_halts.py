@@ -207,7 +207,7 @@ def subject_for(ctx) -> str:
 
 
 def _rule_lines() -> list:
-    return [
+    lines = [
         f"Rule: a pick-off = one of our fills with the price "
         f"{imm.TOXIC_PICKOFF_CENTS:g}c+ against it "
         f"{imm.TOXIC_CONFIRM_SECS // 60} min later (pads/takers excluded).",
@@ -217,6 +217,17 @@ def _rule_lines() -> list:
         f"  Side halt: {imm.TOXIC_PICKOFFS} pick-offs on one side of a market "
         f"within {imm.TOXIC_WINDOW_SECS / 3600:g}h -> that side off "
         f"{imm.TOXIC_HALT_SECS / 60:g} min."]
+    if imm.TOXIC_EXEMPT_WORDS:
+        # Jack 2026-10-09: "turn off toxic halts on MENTION markets"
+        lines.append(f"  Exempt: series containing "
+                     f"{' / '.join(imm.TOXIC_EXEMPT_WORDS)} -- their pick-offs "
+                     f"are listed below but never halt anything.")
+    return lines
+
+
+def _exempt_tag(ps) -> str:
+    """' (exempt)' when the pick-offs are on an exempt series."""
+    return " (exempt)" if any(p.get("exempt") for p in ps) else ""
 
 
 def _c(v) -> str:
@@ -267,10 +278,11 @@ def render_text(ctx) -> str:
         for t, s, ps in ctx["top"]:
             worst = max(ps, key=lambda p: abs(p["mark"] - p["fill_px"]))
             L.append(f"  {len(ps):3d}x  {t[:44]:44s} {s.upper():4s} worst "
-                     f"{_c(worst['fill_px'])}->{_c(worst['mark'])}")
+                     f"{_c(worst['fill_px'])}->{_c(worst['mark'])}{_exempt_tag(ps)}")
     L += ["", "Knobs: IMM_TOXIC_HALT=0 kills both rules; IMM_TOXIC_EVENT_MARKETS=0 "
           "the event rule alone; IMM_TOXIC_PICKOFF_CENTS / _PICKOFFS / "
-          "_HALT_MIN / _EVENT_WINDOW_MIN / _EVENT_HALT_MIN tune them."]
+          "_HALT_MIN / _EVENT_WINDOW_MIN / _EVENT_HALT_MIN tune them; "
+          "IMM_TOXIC_EXEMPT lists the exempt series words."]
     return "\n".join(L)
 
 
@@ -316,7 +328,7 @@ def render_html(ctx) -> str:
         rows = []
         for t, s, ps in ctx["top"]:
             worst = max(ps, key=lambda p: abs(p["mark"] - p["fill_px"]))
-            rows.append((len(ps), t, s.upper(),
+            rows.append((len(ps), t + _exempt_tag(ps), s.upper(),
                          f"{_c(worst['fill_px'])}->{_c(worst['mark'])}"))
         parts.append(table(["count", "market", "side", "worst"], rows))
     return "\n".join(parts)

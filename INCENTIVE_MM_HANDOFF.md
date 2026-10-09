@@ -9227,3 +9227,42 @@ FIX.
 
 Tests: TestConfigGapsPrune 2; test_imm_family_watch 22 (+live_gaps, + the
 post-vote prompt line). Suite 2,340 OK.
+
+## 2026-10-09 ~12:40Z — toxic halts off on MENTION series (Jack: "turn off toxic halts on MENTION markets")
+
+WHY. Since the toxic_halts sink started (9/29), mention series took 39 of
+the rule's 240 halts: 24 event halts plus 15 side halts. Each event halt
+took 13-34 markets (median 26) dark for 30 min. By series: TRUMPMENTION 14,
+TRUMPMENTIONB 6, WORLDNEWSMENTION 3, ARITZIA earnings 1. That was $76 of
+the $155 of modelled reward the rule idled. The 9/29 backtest had credited
+the event rule with +$80 on mentions over 22.5 days, and this gives that up.
+
+WHAT. TOXIC_EXEMPT_WORDS (IMM_TOXIC_EXEMPT, default "MENTION", matched
+anywhere in the series) works like the sweep breaker's SWEEP_EXEMPT_WORDS
+(118aba1, 10/5).
+- `_toxic_confirm` still judges a mention fill and writes its pickoff row,
+  then stops, so the fill counts toward no side or event halt. Every
+  pickoff row now carries "exempt".
+- `toxic_side_halted` / `toxic_event_halted` return False on an exempt
+  series, so a halt already in imm_state.json is ignored too.
+- The 7:15 ET email adds an "Exempt:" rule line and tags exempt rows
+  "(exempt)" in the most-picked-off table.
+- The knob is in the config hash.
+
+Mention events keep their start-time cutoff, the skew and position caps,
+and (TRUMPMENTION plus the no-cutoff class) the live-event gate.
+
+Tests: TestToxicSideHalt.test_mention_series_are_exempt,
+TestToxicHaltsEmail.test_exempt_mention_pick_offs_are_tagged.
+test_incentive_mm alone passes 1111. In a single process together with the
+dashboard / risk-controls / email suites, TestSignedFairReads' wiring guard
+fails (inspect.getsource of run()), but it passes on its own; this change
+doesn't touch run().
+
+DEPLOY. Pushed behind 02240b1. The KL sync (:15/:45 ET) fast-forwards
+both, and the code-change exit restarts the bot (handoff; TRUMPMENTION-
+26OCT09's live gate doesn't arm until 18:30 ET, so its orders ride). The
+process it replaced dated from 10/08 03:47Z. That restart also takes live
+the three edits written since with the mtime preserved: e03b9a6 (gas
+national + diesel dailies blocked), 395d3df (KXANTHVREQ x2) and 6347d8e
+(KXPUBLICTALARICO out of the election family).

@@ -580,6 +580,8 @@ EVENT_LIVE_GATE_PREARM_SECS = _env_float(
 #    of one ask) and again at 14:09Z (MADE ask filled out, 30) -- 21h and 9h
 #    before a speech that cannot be live until it starts. Those were ordinary
 #    fills; the per-market sweep breaker and toxic halts already own them.
+#    (Both have since exempted mention series: SWEEP_EXEMPT_WORDS 10/5,
+#    TOXIC_EXEMPT_WORDS 10/9.)
 #    With an event_start_overrides entry (the cutoff source: quoting already
 #    ends OVERRIDE_BUFFER_MIN before it), the thin / one-sided / fill-tripwire
 #    triggers arm only from start minus this pre-arm. The settled-strike JUMP
@@ -2854,6 +2856,28 @@ TOXIC_MAX_LATE_SECS = 3600.0
 TOXIC_EVENT_MARKETS = _env_int("IMM_TOXIC_EVENT_MARKETS", 2)
 TOXIC_EVENT_WINDOW_SECS = _env_float("IMM_TOXIC_EVENT_WINDOW_MIN", 60.0) * 60.0
 TOXIC_EVENT_HALT_SECS = _env_float("IMM_TOXIC_EVENT_HALT_MIN", 30.0) * 60.0
+# MENTION SERIES ARE EXEMPT (Jack 2026-10-09, "turn off toxic halts on
+# MENTION markets"), like the sweep breaker (SWEEP_EXEMPT_WORDS). From the
+# sink's start on 9/29 to 10/9, mention series took 39 of the 240 halts:
+# 24 event halts, each darkening 13-34 markets for 30 min (TRUMPMENTION 14,
+# TRUMPMENTIONB 6, WORLDNEWSMENTION 3, ARITZIA earnings 1), plus 15 side
+# halts. That was $76 of the $155 of modelled reward the rule idled (the
+# 9/29 backtest above had credited the event rule with +$80 on mentions).
+# Their fills are still judged, so the pick-offs keep landing in the
+# toxic_halts sink and the morning email, flagged "exempt". They never count
+# toward a side or event halt, and a halt already in saved state is ignored.
+# Mention events keep their start-time cutoff, the skew and position caps
+# and, where gated, the live-event gate. IMM_TOXIC_EXEMPT: comma-separated
+# words matched anywhere in the series ("MENTION" = every mention family);
+# empty = none.
+TOXIC_EXEMPT_WORDS = tuple(w.strip().upper() for w in os.environ.get(
+    "IMM_TOXIC_EXEMPT", "MENTION").split(",") if w.strip())
+
+
+def toxic_exempt(series: str) -> bool:
+    return any(w in series for w in TOXIC_EXEMPT_WORDS)
+
+
 # DROPPED MARKETS CARRY NO ORDERS (Jack 2026-09-07: "fine for market to get
 # dropped, but quotes on the dropped market should all be canceled").
 #
@@ -7459,6 +7483,7 @@ _CONFIG_CODE_KNOBS = (
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
     "TOXIC_EVENT_MARKETS", "TOXIC_EVENT_WINDOW_SECS", "TOXIC_EVENT_HALT_SECS",
+    "TOXIC_EXEMPT_WORDS",         # mention families exempt (2026-10-09)
     # wide-book marks (2026-10-01)
     "MARK_WIDE_SPREAD_CENTS",
     # WebSocket books, shadow (2026-10-03)
@@ -14230,8 +14255,9 @@ class IncentiveMarketMaker:
         different markets of it. Only a mark refreshed THIS cycle (`fresh`)
         judges a fill; one with no fresh mark waits, and is dropped unjudged
         once TOXIC_MAX_LATE_SECS past due. Every pick-off and halt is written
-        to the toxic_halts sink (the morning email reads it). Returns the
-        side keys and event tickers halted by this call."""
+        to the toxic_halts sink (the morning email reads it). A pick-off on an
+        exempt series (TOXIC_EXEMPT_WORDS) is written and goes no further.
+        Returns the side keys and event tickers halted by this call."""
         keep: List[list] = []
         halted: List[str] = []
         for p in self.state.toxic_pending:
@@ -14250,10 +14276,14 @@ class IncentiveMarketMaker:
             if d * (float(mark) - px) > -TOXIC_PICKOFF_CENTS:
                 continue                              # not picked off
             ev = self._event_of(t)
+            exempt = toxic_exempt(series_of(t))
             self._sink("toxic_halts", {
                 "kind": "pickoff", "ts": round(now_ts, 1), "ticker": t,
                 "event": ev, "side": side, "fill_px": px,
-                "fill_ts": round(fts, 1), "mark": round(float(mark), 2)})
+                "fill_ts": round(fts, 1), "mark": round(float(mark), 2),
+                "exempt": exempt})
+            if exempt:
+                continue                  # mention families: recorded, never halt
             # ---- the side rule ----
             key = self._toxic_key(t, side)
             picks = [x for x in self.state.toxic_picks.get(key, [])
@@ -14313,8 +14343,9 @@ class IncentiveMarketMaker:
         return halted
 
     def toxic_event_halted(self, event: str, now_ts: float) -> bool:
-        """True while `event` is halted whole by the event rule."""
-        return TOXIC_HALT and \
+        """True while `event` is halted whole by the event rule. Never on an
+        exempt series, so a halt saved before the exemption lapses too."""
+        return TOXIC_HALT and not toxic_exempt(series_of(event)) and \
             self.state.toxic_event_halt_until.get(event, 0.0) > now_ts
 
     def toxic_market_halted(self, ticker: str, now_ts: float) -> bool:
@@ -14325,9 +14356,11 @@ class IncentiveMarketMaker:
 
     def toxic_side_halted(self, ticker: str, book_side: str,
                           now_ts: float) -> bool:
-        """True while `book_side` of `ticker` is halted by the toxic rule."""
-        return TOXIC_HALT and self.state.toxic_halt_until.get(
-            self._toxic_key(ticker, book_side), 0.0) > now_ts
+        """True while `book_side` of `ticker` is halted by the toxic rule
+        (never on an exempt series)."""
+        return TOXIC_HALT and not toxic_exempt(series_of(ticker)) and \
+            self.state.toxic_halt_until.get(
+                self._toxic_key(ticker, book_side), 0.0) > now_ts
 
     def _log_order(self, kind: str, ticker: str, book_side: str,
                    price_cents: Optional[int], count: Optional[float],
