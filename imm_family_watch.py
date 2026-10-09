@@ -24,8 +24,9 @@ threshold". Three passes, each fail-safe on its own:
    event the WH / RNC / TVmaze resolvers cannot place) goes to one headless
    Claude Code run on first sight, retried on a backoff; see research_pass.
 4. ALERT -- one email per run for what has stayed dark >= GAP_ALERT_AFTER_MIN
-   (30 min) and is worth >= GAP_ALERT_MIN_DPD ($5/day of estimated reward =
-   pool $/day x GAP_CAPTURE, the median share our quoted markets earn): the live
+   (30 min) and is worth >= GAP_ALERT_MIN_DPD ($5/day of estimated reward: the
+   bot's own estimator on the live books since 2026-10-09, see REAL ESTIMATES;
+   pool $/day x GAP_CAPTURE where no book was read): the live
    bot's config gaps (re-sent daily while open), and series that newly appear
    paying but not allowed -- a new family, which is Jack's call (sent once).
 
@@ -249,12 +250,122 @@ def alert_body(due: List[Tuple[str, dict, float]]) -> Tuple[str, str]:
                f"need a row or a call")
     lines = [subject, ""]
     for key, it, dark in sorted(due, key=lambda d: -d[1]["est"]):
-        lines.append(f"- ~${it['est']:,.2f}/day, dark {dark / 60:.1f}h  {it['what']}")
+        src = it.get("est_src") or "pool proxy"
+        lines.append(f"- ~${it['est']:,.2f}/day ({src}), dark {dark / 60:.1f}h  "
+                     f"{it['what']}")
         lines.append(f"    fix: {it['fix']}")
-    lines += ["", f"(est = pool $/day x {GAP_CAPTURE:.3f}, the median share our "
-                  f"quoted markets earn; threshold ${GAP_ALERT_MIN_DPD:g}/day, "
-                  f"dark >= {GAP_ALERT_AFTER_MIN:g} min)"]
+    lines += ["", "(est = the bot's own reward estimator, as if the gap were "
+                  "fixed: its standard ladder against each market's live book, "
+                  "the forward $/day over the size schedule, summed over the "
+                  "item's paying markets -- no $1/market floor applied; "
+                  f"'pool proxy' = pool $/day x {GAP_CAPTURE:.3f} where no book "
+                  f"was read. Threshold ${GAP_ALERT_MIN_DPD:g}/day, dark >= "
+                  f"{GAP_ALERT_AFTER_MIN:g} min)"]
     return subject, "\n".join(lines)
+
+
+# REAL ESTIMATES (Jack 2026-10-09, of the dark email's "$41/day" for five
+# Israeli minister events -- 102 markets paying $40 each per 2-day program,
+# which the bot projected at <= ~$0.53/day a market: "in the dark email, try
+# to apply what the actual rewards would be not just a 2% proxy"). Each
+# paying item the alert pass sees gets the bot's own estimate: an offline,
+# log-only IncentiveMarketMaker (the imm_quote_gaps path) builds each market's
+# meta, clears the cutoff (the "if fixed" view: a gap's cutoff is the
+# fail-closed sentinel) and runs _estimate_candidate_yield on the live book;
+# the item's est is the sum of floor_dollars_per_day -- the forward $/day the
+# bot projects over its size schedule (hour / quiet / Saturday multipliers),
+# its admission figure -- with NO $1 floor ("dont need to apply the $1 per
+# market floor"). Cached per item for EST_CACHE_HOURS, at most EST_MAX_BOOKS
+# book reads a run (highest pool first); an unread market keeps the proxy and
+# the label says how many. Research still ranks on the pool proxy (it runs
+# before any book is read).
+EST_MAX_BOOKS = int(os.environ.get("IMM_WATCH_EST_MAX_BOOKS", "200"))
+EST_CACHE_HOURS = float(os.environ.get("IMM_WATCH_EST_CACHE_H", "2"))
+
+
+def _estimator(client):
+    """An offline bot for the estimator: never live, alerts log only."""
+    bot = imm.IncentiveMarketMaker(client, live=False)
+    bot.alerter.enabled = False
+    return bot
+
+
+def _item_markets(key: str, progs: Dict[str, dict]) -> List[str]:
+    """The paying market tickers behind an alert item."""
+    kind, _, name = key.partition(":")
+    if kind == "new":
+        return sorted(t for t in progs if imm.series_of(t) == name)
+    return sorted(t for t in progs if imm.event_ticker_of(t) == name)
+
+
+def real_estimates(client, items: Dict[str, dict], progs: Dict[str, dict],
+                   state: dict, now_ts: float, max_books: int = None,
+                   make_bot=None) -> List[str]:
+    """Replace the pool-proxy est of each paying, un-held item with the bot's
+    own estimate (see REAL ESTIMATES). Mutates items; caches in
+    state["est_cache"]; returns log lines."""
+    max_books = EST_MAX_BOOKS if max_books is None else max_books
+    make_bot = make_bot or _estimator
+    cache = {k: v for k, v in (state.get("est_cache") or {}).items() if k in items}
+    notes: List[str] = []
+    bot = programs = None
+    details: Dict[str, dict] = {}
+    books = 0
+    for key, it in sorted(items.items(), key=lambda kv: -kv[1]["est"]):
+        markets = _item_markets(key, progs)
+        if it.get("hold") or not markets:
+            continue
+        c = cache.get(key)
+        if c and now_ts - float(c.get("at") or 0) < EST_CACHE_HOURS * 3600 \
+                and int(c.get("n") or 0) == len(markets):
+            it["est"], it["est_src"] = c["est"], c["src"]
+            continue
+        if bot is None:
+            bot = make_bot(client)
+            programs = bot.fetch_programs() or {}
+        total, best, read, proxied = 0.0, 0.0, 0, 0
+        now = datetime.fromtimestamp(now_ts, timezone.utc)
+        for t in sorted(markets, key=lambda t: -ifa._dollars_per_day(progs[t])):
+            proxy = ifa._dollars_per_day(progs[t]) * GAP_CAPTURE
+            info = programs.get(t)
+            ev = imm.event_ticker_of(t)
+            if info is None or books >= max_books:
+                total, proxied = total + proxy, proxied + 1
+                continue
+            if ev not in details:
+                try:
+                    ms = (client.get("/markets", params={"event_ticker": ev, "limit": 1000})
+                          or {}).get("markets") or []
+                except Exception:
+                    ms = []
+                details[ev] = {m.get("ticker"): m for m in ms}
+            m = details[ev].get(t)
+            if m is None:
+                total, proxied = total + proxy, proxied + 1
+                continue
+            books += 1
+            try:
+                meta = imm_quote_gaps.build_meta(bot, t, info, m, now)
+                meta.cutoff = None            # the "if fixed" view
+                ok = bot._estimate_candidate_yield(meta, [])
+            except Exception as e:
+                notes.append(f"estimate {t} failed: {e!r}")
+                ok = False
+            if not ok:
+                total, proxied = total + proxy, proxied + 1
+                continue
+            v = float(meta.floor_dollars_per_day or 0.0)
+            total, best, read = total + v, max(best, v), read + 1
+        src = (f"bot estimate, {read} market{'s' if read != 1 else ''}"
+               + (f", best ${best:,.2f}" if read > 1 else "")
+               + (f"; {proxied} at pool proxy" if proxied else ""))
+        if not read:
+            src = "pool proxy"
+        it["est"], it["est_src"] = round(total, 2), src
+        cache[key] = {"at": now_ts, "n": len(markets), "est": it["est"], "src": src}
+        notes.append(f"est {key}: ${it['est']:,.2f}/day ({src})")
+    state["est_cache"] = cache
+    return notes
 
 
 # RESEARCH ON ARRIVAL (Jack 2026-10-07: "instead of separate gap-fixer
@@ -586,6 +697,11 @@ def main(argv=None) -> int:
             baseline = set(state["baseline_not_allowed"])
             items = gap_items(progs, gaps, audit["not_allowed"], baseline, targets)
             hold_researched(items, targets, state, time.time())
+            try:
+                for n in real_estimates(client, items, progs, state, time.time()):
+                    log(f"[WATCH] {n}")
+            except Exception as e:
+                log(f"[WATCH] ! real estimates failed ({e!r}); pool proxy kept")
             due, state["items"] = due_alerts(state.get("items") or {}, items, time.time())
             if due:
                 subject, body = alert_body(due)

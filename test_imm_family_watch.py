@@ -186,7 +186,7 @@ class TestGapAlert(unittest.TestCase):
         subject, body = fw.alert_body([("gap:KXA-26", {"est": 44.0, "what": "KXA-26: no row",
                                                        "fix": "add a row"}, 95.0)])
         self.assertIn("1 dark item(s) worth ~$44/day", subject)
-        self.assertIn("~$44.00/day, dark 1.6h  KXA-26: no row", body)
+        self.assertIn("~$44.00/day (pool proxy), dark 1.6h  KXA-26: no row", body)
         self.assertIn("fix: add a row", body)
 
 
@@ -376,6 +376,100 @@ class TestResearchOnArrival(unittest.TestCase):
         self.assertEqual(set(items), {"start:KXTRUMPMENTION-26OCT08"})
         self.assertAlmostEqual(items["start:KXTRUMPMENTION-26OCT08"]["est"],
                                5000 * fw.GAP_CAPTURE, places=2)
+
+
+class TestRealEstimates(unittest.TestCase):
+    """Jack 2026-10-09: "in the dark email, try to apply what the actual
+    rewards would be not just a 2% proxy"."""
+
+    DAY = {"start_date": "2026-10-09T00:00:00Z", "end_date": "2026-10-10T00:00:00Z"}
+
+    def _progs(self):
+        return {f"KXISRINTMIN-26OCT27-{c}": dict(self.DAY, period_reward=18 * 10000)
+                for c in ("A", "B", "C")}
+
+    def _fakes(self, per_market, unreadable=()):
+        from types import SimpleNamespace
+        calls = {"bots": 0, "books": 0}
+
+        class Bot:
+            def fetch_programs(self_):
+                return {t: {"dollars_per_day": 18.0} for t in self._progs()}
+
+            def _estimate_candidate_yield(self_, meta, own):
+                calls["books"] += 1
+                if meta.ticker in unreadable:
+                    return False
+                meta.floor_dollars_per_day = per_market[meta.ticker]
+                return True
+
+        def make_bot(client):
+            calls["bots"] += 1
+            return Bot()
+
+        class Client:
+            def get(self_, path, params=None):
+                return {"markets": [{"ticker": t} for t in self._progs()]}
+
+        def build_meta(bot, t, info, m, now):
+            return SimpleNamespace(ticker=t, cutoff="sentinel", floor_dollars_per_day=0.0)
+        return calls, make_bot, Client(), build_meta
+
+    def test_the_bot_estimate_replaces_the_proxy(self):
+        from unittest import mock
+        progs = self._progs()
+        items = fw.gap_items(progs, {"KXISRINTMIN-26OCT27": {"msg": "no verified election day"}},
+                             {}, set())
+        self.assertAlmostEqual(items["gap:KXISRINTMIN-26OCT27"]["est"], 3 * 18 * fw.GAP_CAPTURE, 2)
+        per = {"KXISRINTMIN-26OCT27-A": 0.53, "KXISRINTMIN-26OCT27-B": 0.20,
+               "KXISRINTMIN-26OCT27-C": 0.0}
+        calls, make_bot, client, build_meta = self._fakes(per)
+        state = {}
+        with mock.patch.object(fw.imm_quote_gaps, "build_meta", build_meta):
+            fw.real_estimates(client, items, progs, state, 1_800_000_000.0, make_bot=make_bot)
+        it = items["gap:KXISRINTMIN-26OCT27"]
+        self.assertAlmostEqual(it["est"], 0.73, 2)
+        self.assertEqual(it["est_src"], "bot estimate, 3 markets, best $0.53")
+        # cached: a second run reads no book and builds no bot
+        items2 = fw.gap_items(progs, {"KXISRINTMIN-26OCT27": {"msg": "x election day"}}, {}, set())
+        with mock.patch.object(fw.imm_quote_gaps, "build_meta", build_meta):
+            fw.real_estimates(client, items2, progs, state, 1_800_000_000.0 + 3600,
+                              make_bot=make_bot)
+        self.assertEqual((calls["bots"], calls["books"]), (1, 3))
+        self.assertAlmostEqual(items2["gap:KXISRINTMIN-26OCT27"]["est"], 0.73, 2)
+
+    def test_unread_books_keep_the_proxy_and_say_so(self):
+        from unittest import mock
+        progs = self._progs()
+        items = fw.gap_items(progs, {"KXISRINTMIN-26OCT27": {"msg": "no verified election day"}},
+                             {}, set())
+        per = {"KXISRINTMIN-26OCT27-A": 0.5, "KXISRINTMIN-26OCT27-B": 0.5,
+               "KXISRINTMIN-26OCT27-C": 0.5}
+        calls, make_bot, client, build_meta = self._fakes(per, unreadable={"KXISRINTMIN-26OCT27-C"})
+        with mock.patch.object(fw.imm_quote_gaps, "build_meta", build_meta):
+            fw.real_estimates(client, items, progs, {}, 1_800_000_000.0, max_books=2,
+                              make_bot=make_bot)
+        it = items["gap:KXISRINTMIN-26OCT27"]
+        self.assertAlmostEqual(it["est"], 1.0 + 18 * fw.GAP_CAPTURE, 2)   # 2 read + 1 proxy
+        self.assertIn("1 at pool proxy", it["est_src"])
+
+    def test_held_and_unpaid_items_are_not_estimated(self):
+        progs = self._progs()
+        items = {"gap:KXISRINTMIN-26OCT27": {"est": 1.2, "what": "w", "fix": "f", "hold": True},
+                 "gap:KXUNPAID-26": {"est": 0.0, "what": "w", "fix": "f"}}
+        calls, make_bot, client, _ = self._fakes({})
+        fw.real_estimates(client, items, progs, {}, 1_800_000_000.0, make_bot=make_bot)
+        self.assertEqual(calls["bots"], 0)
+        self.assertNotIn("est_src", items["gap:KXISRINTMIN-26OCT27"])
+
+    def test_alert_body_labels_the_source(self):
+        due = [("gap:A", {"est": 12.5, "est_src": "bot estimate, 3 markets, best $5.00",
+                          "what": "A: x", "fix": "f"}, 90.0),
+               ("new:KXB", {"est": 6.0, "what": "KXB: y", "fix": "g"}, 60.0)]
+        subject, body = fw.alert_body(due)
+        self.assertIn("~$12.50/day (bot estimate, 3 markets, best $5.00)", body)
+        self.assertIn("~$6.00/day (pool proxy)", body)
+        self.assertIn("no $1/market floor", body)
 
 
 if __name__ == "__main__":

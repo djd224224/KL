@@ -9272,3 +9272,46 @@ process it replaced dated from 10/08 03:47Z, so this restart also took live
 the three mtime-preserved edits: e03b9a6 (gas national + diesel dailies
 blocked: 0 placed), 395d3df (KXANTHVREQ x2) and 6347d8e (KXPUBLICTALARICO
 out of the election family).
+
+## 2026-10-09 ~13:20Z — dark-item email uses the bot's own reward estimate, not a 2.2% proxy (Jack: "dont need to apply the $1 per market floor but in the dark email, try to apply what the actual rewards would be not just a 2% proxy")
+
+WHY.
+- The 03:22Z email put the five Israeli minister events at ~$41/day:
+  pool x GAP_CAPTURE 0.022, summed over 102 markets.
+- The bot's own estimator puts them at $1.22-3.50/day each, ~$10/day in
+  all; the best market is $0.53/day.
+- The proxy also hid items: on thin books our ladder takes far more than
+  2.2%.
+
+WHAT (imm_family_watch.real_estimates, in the alert pass after the hold):
+- Each paying, un-held item gets the bot's estimate. An offline
+  IncentiveMarketMaker (live=False, alerter.enabled=False; the
+  imm_quote_gaps path) does it:
+  - imm_quote_gaps.build_meta per market, cutoff cleared -- the "if fixed"
+    view, since a gap's cutoff is the fail-closed sentinel;
+  - _estimate_candidate_yield on the live book.
+- The item's est is the sum of floor_dollars_per_day: the forward $/day over
+  the size schedule, the bot's own admission figure. No $1 floor.
+- Cache per item for 2h (IMM_WATCH_EST_CACHE_H). At most 200 book reads a
+  run (IMM_WATCH_EST_MAX_BOOKS), highest pool first.
+- An unread market keeps the proxy, and the label says how many.
+- The email line names the source, e.g. "(bot estimate, 29 markets, best
+  $0.25)" or "(pool proxy)". The $5/day threshold now applies to the real
+  figure.
+- Research still ranks on the pool proxy: it runs before any book is read.
+
+Live check 13:12Z: 102 minister books plus the bot in 7 s.
+- Minister events: $11.79/$9.76/$7.32/$6.50/$6.10 proxy ->
+  $2.19/$3.50/$1.71/$1.22/$1.36.
+- Dry run of the whole watch (10 s). Newly over $5: KXCOACHOUTMLBDATE
+  $10.02 (proxy $1.17), KXOBAMARALLY-26NOV03 $8.68, KXTRUMPUFC $6.53,
+  KXBOLSONAROPARDON $5.08. The first scheduled run after deploy emails
+  those four. OBAMARALLY is an open gap, so it re-sends daily until Jack
+  decides (ELECTION_EXCLUDE or a row).
+
+Tests: test_imm_family_watch 25 (+4). Suite 2,346 OK.
+
+Correction to the 12:45Z entry: floor_by_mult entries are [size mult,
+window weight, $/day at that mult] -- per DAY, not period totals. The best
+minister market projected ~$0.53/day, ~$0.87 over the rest of the period:
+still under the $1 floor.
