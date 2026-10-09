@@ -9405,3 +9405,36 @@ errors or gaps at the larger book count) -- Jack's call.
 Tests: TestWSCandidateBooks, TestWSNarrowGate (test_incentive_mm);
 test_ready_counts_the_servable_books_without_copying (test_kalshi_ws);
 TestNarrowGate (test_ws_stale_score).
+
+### 2026-10-09 ~13:30Z — OpenRouter share family OFF: the ten KX<AUTHOR>SHARE series blocklisted by exact series (Jack: "yes do both", after "is it still underperforming after the latest changes around breaks and control measures?")
+
+WHY. Fills were marked to the 10/09 13:11Z ladder; positions rebuilt from
+fills_account.json reconcile with Kalshi's to the cent.
+
+| Window | Trading | Est. reward | Net/day |
+|---|---|---|---|
+| Old fair (9/28 - 10/6 03:18Z) | -$143 | $22 | -$15 |
+| dc14a7c rework, first day | -$127 | $10 | -$116 |
+| 9fa00ba, 1h break window + 3h stand-aside (10/7 03:28Z on, 2.3d) | -$133 | $9.5 | -$53 |
+
+The stand-aside fired 3x (~2h each), but the losses were not around breaks:
+-$27 in the 3h after a hold, -$106 elsewhere. Mark-outs worsen with time
+(-4c/ct at 1h, -8c at 6h, -21c at 24h): mid-week fair error, with the market
+leading. ATM and wings lost alike, and all four quoted series were negative.
+
+WHAT.
+- `_CUT_OR_SHARE_SERIES` (= _DEFAULT_OR_SHARE_SERIES) goes into
+  SERIES_BLOCKLIST_PREFIXES as `<series>-` (4d28315).
+- This is a blocklist entry, not IMM_SHARE_FAIR_ENABLE=0, so the share-fair
+  refresher and its chart/ladder archives keep running for the 10/12 scoring.
+- KXOPENSOURCESHARE (Vercel) and KXTOKENUSE are unaffected.
+- Live with the 13:29Z handoff restart, which 2bcaa9d triggered. The 7 resting
+  share orders were cancelled 13:34Z; Kalshi showed 0 resting share orders at
+  13:36Z.
+- The 26OCT12 positions (-$251 at marks) ride to Monday's settlement.
+- TestOpenRouterShareFairGate lifts the block in setUp so the gate stays
+  covered. test_family_is_blocked holds the block.
+
+Also 10/09: the rewards report's fill-cost convention was fixed (report v24).
+The fills API returns the bot's NO buys as action "sell", side "no", and the
+generator had priced those at the YES price. See report_tools/README.md.
