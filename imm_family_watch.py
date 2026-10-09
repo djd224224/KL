@@ -105,22 +105,53 @@ def us_general_vote_ok(series: dict, market: dict) -> Tuple[bool, str]:
     return True, "US race of the Nov 3 2026 general election"
 
 
-# Events are keyed with imm.event_ticker_of, not a bare rsplit: a one-market
-# event's market ticker IS its event ticker (KXTUREKOUTPERFORMRCP-26NOV03, the
-# 10/08 02:02Z RCP-outperform batch), and the rsplit made it the SERIES -- so
-# the dating pass found no markets and skipped it unlogged, and research and
-# the alert both read a $0 pool while nine of them paid ~$56/market/day.
+# Events are keyed with event_key, not a bare rsplit: a one-market event's
+# market ticker IS its event ticker (KXTUREKOUTPERFORMRCP-26NOV03, the 10/08
+# 02:02Z RCP-outperform batch), and the rsplit made it the SERIES -- so the
+# dating pass found no markets and skipped it unlogged, and research and the
+# alert both read a $0 pool while nine of them paid ~$56/market/day. And a
+# strike can carry a dash (2026-10-09: KXSENGOPLEADRUN-26-27JAN01-JTHU is
+# event KXSENGOPLEADRUN-26, which imm.event_ticker_of reads as
+# ...-26-27JAN01; 187 of 6,238 paying markets have 3+ dashes): those are read
+# from the market data once (load_event_map) and cached in the watch state.
+_EVENT_OF: Dict[str, str] = {}
+
+
+def event_key(t: str) -> str:
+    """The event of a paying market ticker: the market data's event_ticker
+    when load_event_map read it, else imm.event_ticker_of."""
+    return _EVENT_OF.get(t) or imm.event_ticker_of(t)
+
+
+def load_event_map(client, progs: Dict[str, dict], state: dict) -> int:
+    """Fill _EVENT_OF for the paying markets whose ticker is ambiguous (3+
+    dashes), from state["event_of"] and a bulk market read for the new ones.
+    Returns how many were read now."""
+    cached = state.get("event_of") or {}
+    ambiguous = [t for t in progs if t.count("-") >= 3]
+    need = [t for t in ambiguous if t not in cached]
+    got = imm_quote_gaps.bulk_market_details(client, need) if need else {}
+    for t in need:
+        ev = (got.get(t) or {}).get("event_ticker")
+        if ev:
+            cached[t] = ev
+    state["event_of"] = {t: cached[t] for t in ambiguous if t in cached}
+    _EVENT_OF.clear()
+    _EVENT_OF.update(state["event_of"])
+    return len(need)
+
+
 def _by_event(progs: Dict[str, dict]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = defaultdict(list)
     for t in progs:
-        out[imm.event_ticker_of(t)].append(t)
+        out[event_key(t)].append(t)
     return out
 
 
 def event_pools(progs: Dict[str, dict]) -> Dict[str, float]:
     pools: Dict[str, float] = defaultdict(float)
     for t, p in progs.items():
-        pools[imm.event_ticker_of(t)] += ifa._dollars_per_day(p)
+        pools[event_key(t)] += ifa._dollars_per_day(p)
     return pools
 
 
@@ -295,7 +326,7 @@ def _item_markets(key: str, progs: Dict[str, dict]) -> List[str]:
     kind, _, name = key.partition(":")
     if kind == "new":
         return sorted(t for t in progs if imm.series_of(t) == name)
-    return sorted(t for t in progs if imm.event_ticker_of(t) == name)
+    return sorted(t for t in progs if event_key(t) == name)
 
 
 def real_estimates(client, items: Dict[str, dict], progs: Dict[str, dict],
@@ -328,7 +359,7 @@ def real_estimates(client, items: Dict[str, dict], progs: Dict[str, dict],
         for t in sorted(markets, key=lambda t: -ifa._dollars_per_day(progs[t])):
             proxy = ifa._dollars_per_day(progs[t]) * GAP_CAPTURE
             info = programs.get(t)
-            ev = imm.event_ticker_of(t)
+            ev = event_key(t)
             if info is None or books >= max_books:
                 total, proxied = total + proxy, proxied + 1
                 continue
@@ -664,6 +695,13 @@ def main(argv=None) -> int:
         except Exception as e:
             log(f"[WATCH] ! enroll pass failed: {e!r}")
     progs = ifa.fetch_active_programs(client)
+    state = _load_state()
+    try:
+        n = load_event_map(client, progs, state)
+        if n:
+            log(f"[WATCH] event map: read {n} ambiguous market ticker(s)")
+    except Exception as e:
+        log(f"[WATCH] ! event map read failed ({e!r}); rsplit keys kept")
     if not args.no_date:
         try:
             dated = date_us_general(client, progs, args.dry)
@@ -672,7 +710,6 @@ def main(argv=None) -> int:
             summary.append(f"dated {sum(1 for _, a, _ in dated if a)}")
         except Exception as e:
             log(f"[WATCH] ! dating pass failed: {e!r}")
-    state = _load_state()
     try:
         with open(imm.CONFIG_GAPS_FILE, encoding="utf-8") as f:
             gaps = (json.load(f) or {}).get("gaps") or {}

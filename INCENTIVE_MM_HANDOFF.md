@@ -9315,3 +9315,34 @@ Correction to the 12:45Z entry: floor_by_mult entries are [size mult,
 window weight, $/day at that mult] -- per DAY, not period totals. The best
 minister market projected ~$0.53/day, ~$0.87 over the rest of the period:
 still under the $1 floor.
+
+## 2026-10-09 ~13:30Z -- family watch: a dash inside the strike no longer mis-keys the event
+
+Found via e3adb9e's "no markets listed" log line. KXSENGOPLEADRUN-26-27JAN01-JTHU
+belongs to event KXSENGOPLEADRUN-26: the strike itself is "27JAN01-JTHU".
+imm.event_ticker_of splits on the last dash and read the event as
+...-26-27JAN01. 187 of 6,238 paying markets have 3+ dashes. The incentive
+program objects carry no event ticker.
+
+What the wrong key broke for those events:
+- the dating pass found no markets;
+- research and the alert saw a $0 pool;
+- the new estimate found no markets.
+
+Fix (imm_family_watch):
+- load_event_map reads the market data's event_ticker for every ambiguous
+  (3+ dash) paying market. It uses imm_quote_gaps.bulk_market_details, 50
+  per call, so the first run is 4 calls.
+- The mapping is cached in family_watch_state.json "event_of" (a market's
+  event never changes) and pruned to the paying set.
+- event_key() uses that mapping, else event_ticker_of. _by_event,
+  event_pools, _item_markets and real_estimates all key through it.
+- The state is now loaded before the dating pass.
+
+Dry run 13:22Z:
+- the dating pass evaluates the four *LEADRUN-26 events and
+  KXBRISRAELSENCOMBO-27OCT and refuses all five: not US-tagged, or
+  'announced' (a candidacy, not a vote);
+- their real estimates are $0.56-3.79/day, all under $5.
+
+Tests: TestEventMap. Suite 2,347 OK.

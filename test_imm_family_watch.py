@@ -207,6 +207,41 @@ class TestEventKeys(unittest.TestCase):
         self.assertNotIn("KXTUREKOUTPERFORMRCP", pools)
 
 
+class TestEventMap(unittest.TestCase):
+
+    def tearDown(self):
+        fw._EVENT_OF.clear()
+
+    def test_a_dash_in_the_strike_is_read_from_the_market_data(self):
+        # KXSENGOPLEADRUN-26-27JAN01-JTHU is event KXSENGOPLEADRUN-26
+        from unittest import mock
+        day = {"start_date": "2026-10-09T00:00:00Z", "end_date": "2026-10-10T00:00:00Z",
+               "period_reward": 10 * 10000}
+        progs = {"KXSENGOPLEADRUN-26-27JAN01-JTHU": day,
+                 "KXSENGOPLEADRUN-26-27JAN01-JBAR": day,
+                 "KXHURCAT-26ISAIAS-T3": day}
+        reads = []
+
+        def bulk(client, tickers):
+            reads.append(list(tickers))
+            return {t: {"ticker": t, "event_ticker": "KXSENGOPLEADRUN-26"} for t in tickers}
+        state = {}
+        with mock.patch.object(fw.imm_quote_gaps, "bulk_market_details", bulk):
+            self.assertEqual(fw.load_event_map(None, progs, state), 2)
+            self.assertEqual(sorted(fw._by_event(progs)),
+                             ["KXHURCAT-26ISAIAS", "KXSENGOPLEADRUN-26"])
+            self.assertAlmostEqual(fw.event_pools(progs)["KXSENGOPLEADRUN-26"], 20.0)
+            self.assertEqual(fw._item_markets("gap:KXSENGOPLEADRUN-26", progs),
+                             ["KXSENGOPLEADRUN-26-27JAN01-JBAR",
+                              "KXSENGOPLEADRUN-26-27JAN01-JTHU"])
+            # cached in the state: the next run reads nothing
+            fw._EVENT_OF.clear()
+            self.assertEqual(fw.load_event_map(None, progs, state), 0)
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(fw.event_key("KXSENGOPLEADRUN-26-27JAN01-JTHU"), "KXSENGOPLEADRUN-26")
+        self.assertEqual(fw.event_key("KXHURCAT-26ISAIAS-T3"), "KXHURCAT-26ISAIAS")
+
+
 class TestResearchOnArrival(unittest.TestCase):
     """Jack 2026-10-08: "instead of separate gap-fixer routine, why not just
     research when a new series enrolls?" -> "yes switch"."""
