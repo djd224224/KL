@@ -9259,10 +9259,16 @@ dashboard / risk-controls / email suites, TestSignedFairReads' wiring guard
 fails (inspect.getsource of run()), but it passes on its own; this change
 doesn't touch run().
 
-DEPLOY. Pushed behind 02240b1. The KL sync (:15/:45 ET) fast-forwards
-both, and the code-change exit restarts the bot (handoff; TRUMPMENTION-
-26OCT09's live gate doesn't arm until 18:30 ET, so its orders ride). The
-process it replaced dated from 10/08 03:47Z. That restart also takes live
-the three edits written since with the mtime preserved: e03b9a6 (gas
-national + diesel dailies blocked), 395d3df (KXANTHVREQ x2) and 6347d8e
-(KXPUBLICTALARICO out of the election family).
+DEPLOY (what happened). The KL sync fast-forwarded d80d878..cc6330c at
+12:45:03Z. The old process never reached its code-change exit: its cycle
+had stopped heart-beating at 12:43:59Z (CNBC SSL errors and a silent WS
+feed came in the same minutes), and the watchdog hard-exited it at
+12:54:14Z (code 86). That means NO handoff. The relaunch (run 5019f8f1,
+config e577e84e, git cc6330c, 12:55:44Z) cancelled 1968 leftover imm-
+orders at 12:58:48Z and rebuilt: 1000 placed 13:04:30Z, 1000 more
+13:10:53Z, then 1130/1233 markets quoted (2048 quotes) at 13:11Z.
+config_history_2026-10-09 shows TOXIC_EXEMPT_WORDS ('MENTION',). The
+process it replaced dated from 10/08 03:47Z, so this restart also took live
+the three mtime-preserved edits: e03b9a6 (gas national + diesel dailies
+blocked: 0 placed), 395d3df (KXANTHVREQ x2) and 6347d8e (KXPUBLICTALARICO
+out of the election family).
