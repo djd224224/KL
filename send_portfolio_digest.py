@@ -237,9 +237,11 @@ def collateral_returned(events, mkt_pos) -> float:
     back when the positions change or settle (2026-10-09: Quebec 4th place,
     NO on three parties, settled with cash $100 under its revenue). The cash
     moves with no fill or settlement behind it, and Kalshi's portfolio_value
-    nets it out ($2,819.57 returned vs Kalshi $2.8k under our mids, 10/9), so
-    a release is no gain: before 10/10 it read as reward credits (Jack:
-    "the reward credit is wrong in the email")."""
+    is the positions at their last trade less this amount (10/9 19:37Z:
+    $21,285.24 + $2,859.57 = $24,144.81 against $24,143.54 at the last
+    trades), so a release lifts the cash and lowers the valuation alike: no
+    gain, and no reward. Before 10/10 it read as reward credits (Jack: "the
+    reward credit is wrong in the email")."""
     return round(sum(r["cost"] for r in mkt_pos.values())
                  - sum(e.get("exposure", 0.0) for e in events.values()), 2)
 
@@ -1293,9 +1295,12 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     transfers = None if first else pf.get("net_transfers")
     ntc = None if first else pf.get("no_trade_cash")
     # The day's change in collateral Kalshi has returned early (+ = released,
-    # - = taken back): cash with no fill or settlement behind it, which
-    # Kalshi's valuation offsets, so it leaves the reward credits for
-    # Kalshi's pricing vs mid. None = the prior morning did not record it.
+    # - = taken back): cash with no fill or settlement behind it, and Kalshi's
+    # valuation moves the other way by the same amount, so it is neither a
+    # reward nor P&L and drops out of the split: the reward credits are the
+    # no-trade cash less it, and Kalshi's pricing vs mid compares Kalshi's
+    # last-trade prices with our mids without it (it held -collat_d before
+    # 10/10). None = the prior morning did not record it.
     collat_d = None if first else pf.get("collateral_d", 0.0)
     rewards = None
     if not first:
@@ -1422,9 +1427,9 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                      f"{trading:+,.2f}"
                      + "".join(f"  +  {k} {v:+,.2f}" for k, v in parts[1:]) + ")")
         if collat_d:
-            lines.append(f"(Kalshi's pricing vs mid includes {collat_d:+,.2f} of collateral "
-                         f"Kalshi {'released' if collat_d > 0 else 'took back'} on mutually "
-                         f"exclusive positions: cash its valuation offsets, not rewards)")
+            lines.append(f"(reward credits leave out {collat_d:+,.2f} of collateral Kalshi "
+                         f"{'released' if collat_d > 0 else 'took back'} on mutually exclusive "
+                         f"positions: its valuation moved the other way, so it is not profit)")
     if imm is not None:
         lines.append("")
         lines.append(imm.get("text") or
@@ -1564,14 +1569,14 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                      + ("" if not collat_d else
                         f', less {_pnl_span(collat_d)} of collateral Kalshi '
                         f'{"released" if collat_d > 0 else "took back"} on mutually '
-                        f'exclusive positions (in Kalshi\'s pricing vs mid, which '
-                        f'offsets it)')
+                        f'exclusive positions (its valuation moved the other way, so '
+                        f'it is not profit)')
                      + ("" if collat_d is not None else
-                        ' (it still holds collateral Kalshi released or took back on '
-                        'mutually exclusive positions: the prior morning did not '
-                        'record it)')
-                     + '; Kalshi values open positions near what they would sell '
-                       'for, this table at the mid.</div>')
+                        ' (today they still hold collateral Kalshi released or took '
+                        'back on mutually exclusive positions, and Kalshi\'s pricing '
+                        'vs mid the opposite: the prior morning did not record it)')
+                     + '; Kalshi values open positions at their last trade, less the '
+                       'collateral it has handed back, this table at the mid.</div>')
     else:
         h.append(f'<div style="color:{C_INK2}">Nothing moved since the prior '
                  f'morning.</div>')

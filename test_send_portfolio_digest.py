@@ -818,21 +818,25 @@ class CollateralTests(unittest.TestCase):
 
     def test_a_take_back_leaves_the_reward_credits(self):
         # the 10/9 email with Kalshi taking back $450 of collateral: the
-        # credits are the $803.24 that really came in, Kalshi's pricing vs
-        # mid carries the -450, the day is unchanged
+        # credits are the $803.24 that really came in; the -450 had sat in
+        # them and +450 in Kalshi's pricing vs mid (its valuation rose as
+        # the cash went), so both drop it and the day is unchanged
         subject, text, html = pf.build_email(self._pf(-450.0), [], chart_ok=False)
         self.assertIn("vs yesterday: +412.35  =  trading (at mid) -551.18  +  reward "
                       "credits +803.24  +  Kalshi's pricing vs mid +160.95  +  perpetuals "
                       "-0.66  (excludes subaccount transfers -300.00)", text)
-        self.assertIn("(Kalshi's pricing vs mid includes -450.00 of collateral Kalshi took "
-                      "back on mutually exclusive positions", text)
+        self.assertIn("(reward credits leave out -450.00 of collateral Kalshi took back on "
+                      "mutually exclusive positions: its valuation moved the other way, so "
+                      "it is not profit)", text)
         self.assertIn("rewards +$0.8k", subject)
         self.assertIn("of collateral Kalshi took back on mutually exclusive positions", html)
+        self.assertIn("Kalshi values open positions at their last trade, less the "
+                      "collateral it has handed back", html)
 
     def test_a_release_is_not_a_reward(self):
         _, text, _ = pf.build_email(self._pf(200.0), [], chart_ok=False)
         self.assertIn("reward credits +153.24", text)
-        self.assertIn("includes +200.00 of collateral Kalshi released", text)
+        self.assertIn("leave out +200.00 of collateral Kalshi released", text)
 
     def test_unrecorded_prior_lumps_and_says_so(self):
         # the first morning after the change: the prior snapshot has no
