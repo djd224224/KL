@@ -19387,15 +19387,16 @@ class TestNflPropGate(unittest.TestCase):
         self.assertIsNone(r(b=10, a=17))
 
     def test_news_hold(self):
-        # Jack 2026-10-04: "stand aside for 30min, not an hour"
-        self.assertEqual(imm.NFL_NEWS_HOLD_MIN, 30)
+        # Jack 2026-10-04: "stand aside for 30min, not an hour";
+        # 2026-10-09: "shorten the team news hold to 15 min"
+        self.assertEqual(imm.NFL_NEWS_HOLD_MIN, 15)
         now = time.time()
         self._snap()
         e = imm._nfl_state["snap"]["markets"][self.T]
         e.update(news_at=now - 600, news="Keenan Allen WR Out")
         why, inputs, caps = imm.nfl_gate(self.T, now, 6, 7)
         self.assertEqual((inputs["reason"], caps), ("news_hold", None))
-        self.assertIn("Keenan Allen WR Out 10m ago (hold 30m)", why)
+        self.assertIn("Keenan Allen WR Out 10m ago (hold 15m)", why)
         e["news_at"] = now + 120                       # a little ahead: holds
         self.assertEqual(imm.nfl_gate(self.T, now, 6, 7)[1]["reason"], "news_hold")
         e["news_at"] = now + 7200                      # far ahead: junk, ignored

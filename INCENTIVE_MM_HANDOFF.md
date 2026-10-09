@@ -7028,9 +7028,9 @@ teammate_mult per stat and position (QBs untouched, V clamped at 0.6). The
 entry's mu is the adjusted one; mu_base, team_mult and teammates show the
 working. Knobs IMM_NFL_TEAMMATE_ENABLE (1), IMM_NFL_TEAM_WINDOW_GAMES (4).
 
-NEWS HOLD (incentive_mm.nfl_gate, NFL_NEWS_HOLD_MIN 30 -- Jack: "stand aside
-for 30min, not an hour"; 0 = off): every prop of a team stands aside for
-30 minutes after a CONTRIBUTOR (>= 8% of targets,
+NEWS HOLD (incentive_mm.nfl_gate, NFL_NEWS_HOLD_MIN 15 -- Jack: "stand aside
+for 30min, not an hour", then 2026-10-09 "shorten the team news hold to 15
+min"; 0 = off): every prop of a team stands aside for 15 minutes after a CONTRIBUTOR (>= 8% of targets,
 15% of carries or 50% of attempts over the window) is designated, changes
 designation or is cleared -- ESPN's designation time, or the refresher
 seeing the status change between reads (first sighting stamps nothing). A

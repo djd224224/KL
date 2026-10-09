@@ -10412,7 +10412,8 @@ NFL_FAIR_TTL_MIN = _env_int("IMM_NFL_FAIR_TTL_MIN", 30)
 NFL_ROSTER_TTL_MIN = _env_int("IMM_NFL_ROSTER_TTL_MIN", 45)
 NFL_FAIR_REFRESH_SECS = _env_int("IMM_NFL_FAIR_REFRESH_SECS", 120)
 # NEWS HOLD (Jack 2026-10-04: "build the teammate adjustment and news
-# hold"; "stand aside for 30min, not an hour"): every prop of a team stands
+# hold"; "stand aside for 30min, not an hour"; 2026-10-09: "shorten the team
+# news hold to 15 min"): every prop of a team stands
 # aside for this long after a QB / WR /
 # TE / RB on it is designated, re-designated or cleared (ESPN's designation
 # time, or the refresher seeing the status change) -- the book reprices on
@@ -10420,7 +10421,7 @@ NFL_FAIR_REFRESH_SECS = _env_int("IMM_NFL_FAIR_REFRESH_SECS", 120)
 # nfl_prop_fair also moves the teammates' means for the absence itself
 # (TEAMMATE_ALPHA), so once the hold lapses the band is centred on it.
 # 0 = off.
-NFL_NEWS_HOLD_MIN = _env_int("IMM_NFL_NEWS_HOLD_MIN", 30)
+NFL_NEWS_HOLD_MIN = _env_int("IMM_NFL_NEWS_HOLD_MIN", 15)
 # RECENT FORM (Jack 2026-10-04: "yes add it and ship"): the gate's band is
 # the WIDER of the model's and the same band on the player's last 4 games
 # (nfl_prop_fair.RECENT_GAMES -- fair_recent_lo / _hi in the snapshot), for
