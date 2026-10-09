@@ -4034,7 +4034,12 @@ ELECTION_EXCLUDE = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_ELECTION_EXCLUDE",
         "KXSENMIN,KXSERBIAELECTIONCALL,KXGENERICBALLOTVOTEHUB,KXVPRESPERSON,"
-        "KXISTANBULMAYOR,KXACKMANMAYOR,KXAPCALLLAMAYOR,KXBBGMAYOR"
+        "KXISTANBULMAYOR,KXACKMANMAYOR,KXAPCALLLAMAYOR,KXBBGMAYOR,"
+        # "When will James Talarico be seen in public?" (2026-10-08, Jack:
+        # "Talarico should not be quoted"): an appearance ladder filed under
+        # Elections. Excluded so neither the family nor the research pass
+        # dates it.
+        "KXPUBLICTALARICO"
         ).split(",") if s.strip())
 # FULL-match regexes, comma-separated -- so none may contain a comma (\d\d?,
 # not \d{1,2}). County judges incl. Williamson's KXWILCOJUDGE; <city>MAYOR

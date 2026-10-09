@@ -335,6 +335,22 @@ class TestResearchOnArrival(unittest.TestCase):
             t = fw.research_targets(None, gaps, datetime.now(timezone.utc), dry=True)
         self.assertEqual(sorted(t), ["gap:KXB-26NOV03"])
 
+    def test_an_election_excluded_series_is_not_researched(self):
+        # 10/08 (Jack: "Talarico should not be quoted"): the bot keeps the gap
+        # in config_gaps.json until a restart, so research must skip it itself
+        from unittest import mock
+        self.assertIn("KXPUBLICTALARICO", fw.imm.ELECTION_EXCLUDE)
+        self.assertFalse(fw.imm.election_series("KXPUBLICTALARICO"))
+        msg = " has no verified election day in ELECTION_DATES"
+        gaps = {"KXPUBLICTALARICO-26OCT15": {"series": "KXPUBLICTALARICO",
+                                             "msg": "KXPUBLICTALARICO-26OCT15" + msg},
+                "KXB-26NOV03": {"series": "KXB", "msg": "KXB-26NOV03" + msg}}
+        with mock.patch.object(fw.imm, "election_cutoff_utc", lambda ev, market=None: None), \
+                mock.patch.object(fw.ieo, "discover_broadcast_mention_events",
+                                  lambda c, now: []):
+            t = fw.research_targets(None, gaps, datetime.now(timezone.utc), dry=True)
+        self.assertEqual(sorted(t), ["gap:KXB-26NOV03"])
+
     def test_start_targets_become_alert_items(self):
         progs = {"KXTRUMPMENTION-26OCT08-AI": {
             "period_reward": 5000 * 10000, "start_date": "2026-10-07T00:00:00Z",

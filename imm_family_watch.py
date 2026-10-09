@@ -313,6 +313,12 @@ def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, 
         kind = gap_kind(g.get("msg") or "")
         if kind == "election" and imm.election_cutoff_utc(ev) is not None:
             continue
+        # a series carved out of the election family (2026-10-08, Jack on
+        # KXPUBLICTALARICO: "should not be quoted") is never dated: the bot
+        # only drops its gap at a restart, so the gap alone is no target
+        if kind == "election" and \
+                (g.get("series") or imm.series_of(ev)) in imm.ELECTION_EXCLUDE:
+            continue
         if kind == "award" and imm.awards_event_start(ev, None, dates_only=True) is not None:
             continue
         if kind:
