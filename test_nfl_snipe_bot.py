@@ -273,8 +273,8 @@ class TestSkipReasons(unittest.TestCase):
         self.assertEqual(self.r(e=entry(roster_ts=None)), "stale_roster")
         self.assertEqual(self.r(e=entry(injury="Questionable")), "injury")
         self.assertEqual(self.r(e=entry(injury="not on roster")), "injury")
-        self.assertEqual(self.r(e=entry(news_at=NOW - 3600)), "team_news")
-        self.assertEqual(self.r(e=entry(news_at=NOW - 13 * 3600)), "")
+        self.assertEqual(self.r(e=entry(news_at=NOW - 1800)), "team_news")
+        self.assertEqual(self.r(e=entry(news_at=NOW - 3601)), "")   # 1h skip
         self.assertEqual(self.r(imm_fair=20.0), "model_mismatch")   # 15 vs 20
         self.assertEqual(self.r(imm_fair=15.5), "")
         self.assertEqual(self.r(self.sig(implied_mu=None)), "no_implied_mean")

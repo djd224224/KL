@@ -17,7 +17,8 @@ The losing kind is the move the market makes on NEWS the model does not
 have (Keenan Allen out -> Downs' ladder 24 -> 34). A signal is SKIPPED when:
   injury        the player has any ESPN designation (or is off the roster)
   team_news     a contributor on his team changed designation in the last
-                news_skip_hours (12) -- this bot's watch or the IMM's (a
+                news_skip_hours (1; 12 until Jack 2026-10-09: "move sniper
+                down to 1hr") -- this bot's watch or the IMM's (a
                 designation CLEARED is only seen by a watch that saw it set;
                 the watch's history survives restarts in watch_status.json)
   sibling       his other contract on the same stat (ladder vs escalator)
@@ -182,7 +183,7 @@ class Config:
     cash_floor: float = 500.0            # free cash left on the shard
     stop_before_kickoff_min: float = 15.0
     max_hours_before: float = 72.0
-    news_skip_hours: float = 12.0
+    news_skip_hours: float = 1.0          # Jack 2026-10-09 (was 12)
     roster_ttl_min: float = 45.0
     model_ttl_min: float = 10.0
     sibling_tol: float = 0.15
