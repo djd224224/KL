@@ -664,6 +664,185 @@ class TotalProfitTests(unittest.TestCase):
         self.assertEqual(pf._signed_k(0.0), "$0.0k")
 
 
+class _FakeSubaccountClient:
+    """The subaccount endpoints, shaped as Kalshi returned them on 10/9."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    def get(self, path, params=None):
+        if self.fail:
+            raise RuntimeError("HTTP 503")
+        if path == "/portfolio/subaccounts/balances":
+            return {"subaccount_balances": [
+                {"balance": "19859.5966", "exchange_index": 0, "subaccount_number": 0},
+                {"balance": "319.2742", "exchange_index": 2, "subaccount_number": 0},
+                {"balance": "290.0000", "exchange_index": 0, "subaccount_number": 1},
+                {"balance": "40.0000", "exchange_index": 0, "subaccount_number": 2}]}
+        if path == "/portfolio/subaccounts/transfers":
+            return {"transfers": [
+                {"amount_cents": 30000, "created_ts": 1791509617, "from_subaccount": 0,
+                 "to_subaccount": 1},
+                {"amount_cents": 5000, "created_ts": 1791520000, "from_subaccount": 1,
+                 "to_subaccount": 0},
+                {"amount_cents": 4000, "created_ts": 1791530000, "from_subaccount": 1,
+                 "to_subaccount": 2}]}
+        if path == "/portfolio/balance":
+            n = (params or {}).get("subaccount")
+            return {1: {"balance_dollars": "290.0000", "portfolio_value": 1225},
+                    2: {"balance_dollars": "40.0000", "portfolio_value": 0}}[n]
+        raise AssertionError(path)
+
+
+class SubaccountTests(unittest.TestCase):
+    """Jack 2026-10-09: "the reward credit is wrong in the email". The $300
+    that funded the NFL sniper's subaccount 1 left the primary's cash with no
+    trade behind it, so it read as reward credits +53.24 for +353.24, and
+    the subaccount's cash was in neither the account value nor the profit."""
+
+    def test_reads_numbered_subaccounts_and_moves_to_and_from_the_primary(self):
+        s = pf.fetch_subaccounts(_FakeSubaccountClient())
+        self.assertEqual(s["accounts"], {1: 302.25, 2: 40.0})
+        self.assertEqual(s["equity"], 342.25)
+        # 1 -> 2 never touches the primary
+        self.assertEqual(s["moves"], [(1791509617.0, -300.0), (1791520000.0, 50.0)])
+
+    def test_read_failure_is_none(self):
+        self.assertIsNone(pf.fetch_subaccounts(_FakeSubaccountClient(fail=True)))
+
+    def _pf(self, prior_subs=None, subs=300.0, moves=-300.0, ntc=53.24, ek=40287.76,
+            stale=False):
+        prior = {"equity_kalshi": 40174.75, "perps_equity": 120.93}
+        if prior_subs is not None:
+            prior["subs_equity"] = prior_subs
+        acct = round(ek + 120.27 + (subs or 0.0), 2)
+        return {"today": "2026-10-09", "rows": [_row("KXA-26", value_d=-551.18)],
+                "first_run": False, "prior": prior, "equity_kalshi": ek,
+                "cash": 20127.28, "kalshi_positions_value": 20160.48,
+                "equity": 43125.0, "positions_value": 22997.7,
+                "perps_equity": 120.27, "perps_stale": False,
+                "perps": {"equity": 120.27, "positions": []},
+                "subs_equity": subs, "subs_stale": stale,
+                "subs": None if stale else {"accounts": {1: subs}, "moves": []},
+                "sub_moves": moves, "account_value": acct, "unpaid": None,
+                "no_trade_cash": ntc, "net_transfers": 0.0,
+                "total_profit": round(acct - 16000.0, 2), "deposited": 16000.0,
+                "withdrawn": 0.0}
+
+    def test_the_10_9_email(self):
+        # the 10/9 7am run: trading -551.18, no-trade cash +53.24 of which
+        # -300.00 was the move to subaccount 1, Kalshi's pricing +610.95,
+        # perps -0.66; subaccount 1 held its $300 untouched
+        subject, text, html = pf.build_email(self._pf(), [], chart_ok=False)
+        self.assertEqual(subject, "portfolio 2026-10-09: profit +$24.7k "
+                                  "(day +$0.4k: trading -$0.6k, rewards +$0.4k)")
+        self.assertIn("Account value $40,708.03\n", text)
+        self.assertIn("perpetuals $120.27  +  subaccount 1 $300.00 (first counted today, "
+                      "so not in the day change)", text)
+        self.assertIn("Total profit +$24,708.03", text)
+        self.assertIn("vs yesterday: +412.35  =  trading (at mid) -551.18  +  reward "
+                      "credits +353.24  +  Kalshi's pricing vs mid +610.95  +  perpetuals "
+                      "-0.66  (excludes subaccount transfers -300.00)", text)
+        self.assertIn("(account value ex-perpetuals & subaccounts moved +113.01 = this "
+                      "table -551.18  +  reward credits +353.24  +  subaccount transfers "
+                      "-300.00  +  Kalshi's pricing vs mid +610.95)", text)
+        self.assertIn("subaccount 1 <b>$300.00</b>", html)
+        self.assertIn("Account value ex-perpetuals &amp; subaccounts moved", html)
+        self.assertIn("(excludes subaccount transfers -300.00)", html)
+
+    def test_next_morning_the_subaccount_is_in_the_day_change(self):
+        # the sniper made +12.25; nothing moved
+        p = self._pf(prior_subs=300.0, subs=312.25, moves=0.0, ntc=353.24, ek=40587.76)
+        subject, text, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("vs yesterday: +424.60  =  trading (at mid) -551.18  +  reward "
+                      "credits +353.24  +  Kalshi's pricing vs mid +610.95  +  perpetuals "
+                      "-0.66  +  subaccount 1 +12.25\n", text)
+        self.assertNotIn("first counted today", text)
+        self.assertIn("rewards +$0.4k", subject)
+
+    def test_a_move_with_both_mornings_counted_nets_out(self):
+        # $200 more funded, the sniper +12.25: the subaccount is up 212.25,
+        # the primary's no-trade cash down 200, and neither is the day
+        p = self._pf(prior_subs=300.0, subs=512.25, moves=-200.0, ntc=153.24, ek=40387.76)
+        _, text, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("vs yesterday: +424.60  =  trading (at mid) -551.18  +  reward "
+                      "credits +353.24  +  Kalshi's pricing vs mid +610.95  +  perpetuals "
+                      "-0.66  +  subaccount 1 +12.25  (excludes subaccount transfers "
+                      "-200.00)", text)
+
+    def test_unread_moves_are_lumped_and_said(self):
+        p = self._pf(prior_subs=300.0, moves=None, stale=True)
+        subject, text, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("reward credits & subaccount moves +53.24", text)
+        self.assertIn("rewards & subaccount moves +$0.1k", subject)
+        self.assertIn("subaccounts $300.00 (yesterday's value: today's read failed)", text)
+
+    def test_history_and_chart_carry_the_subaccounts(self):
+        import os
+        import tempfile
+        rows = pf.upsert_history([], "2026-10-09", 20127.28, 22997.7, 43125.0,
+                                 20160.48, 120.27, 1897.31, 300.0)
+        tmp = tempfile.mkdtemp()
+        old = (pf.DATA_DIR, pf.HISTORY_CSV)
+        pf.DATA_DIR, pf.HISTORY_CSV = tmp, os.path.join(tmp, "h.csv")
+        try:
+            pf.write_history(rows)
+            back = pf.load_history()
+        finally:
+            pf.DATA_DIR, pf.HISTORY_CSV = old
+        self.assertEqual(back[0]["subs_equity"], 300.0)
+
+
+class CollateralTests(unittest.TestCase):
+    """Jack 2026-10-09, after the subaccount fix: "still seems wrong. i see
+    $700+ of incentive rewards this morning". Kalshi hands back collateral
+    on positions across mutually exclusive outcomes and takes it back when
+    they change or settle: cash with no fill or settlement behind it, which
+    Kalshi's valuation offsets. It read as reward credits."""
+
+    def test_returned_is_markets_exposure_less_events_exposure(self):
+        # Quebec 4th place, NO on three parties (80 + 40 + 60): at most one
+        # NO loses, so $100 is guaranteed and came back up front
+        events = {"KXQUEBEC4TH-26OCT05": {"realized": 0.0, "fees": 0.0, "exposure": 52.0},
+                  "KXHIGHNY-26OCT09": {"realized": 0.0, "fees": 0.0, "exposure": 12.5}}
+        mkt = {"KXQUEBEC4TH-26OCT05-4-QS": {"pos": -80.0, "cost": 72.0},
+               "KXQUEBEC4TH-26OCT05-4-PCQ": {"pos": -40.0, "cost": 30.0},
+               "KXQUEBEC4TH-26OCT05-4-CAQ": {"pos": -60.0, "cost": 50.0},
+               "KXHIGHNY-26OCT09-B70.5": {"pos": 25.0, "cost": 12.5}}
+        self.assertEqual(pf.collateral_returned(events, mkt), 100.0)
+
+    def _pf(self, collateral_d):
+        p = SubaccountTests._pf(self)
+        p["collateral_d"] = collateral_d
+        return p
+
+    def test_a_take_back_leaves_the_reward_credits(self):
+        # the 10/9 email with Kalshi taking back $450 of collateral: the
+        # credits are the $803.24 that really came in, Kalshi's pricing vs
+        # mid carries the -450, the day is unchanged
+        subject, text, html = pf.build_email(self._pf(-450.0), [], chart_ok=False)
+        self.assertIn("vs yesterday: +412.35  =  trading (at mid) -551.18  +  reward "
+                      "credits +803.24  +  Kalshi's pricing vs mid +160.95  +  perpetuals "
+                      "-0.66  (excludes subaccount transfers -300.00)", text)
+        self.assertIn("(Kalshi's pricing vs mid includes -450.00 of collateral Kalshi took "
+                      "back on mutually exclusive positions", text)
+        self.assertIn("rewards +$0.8k", subject)
+        self.assertIn("of collateral Kalshi took back on mutually exclusive positions", html)
+
+    def test_a_release_is_not_a_reward(self):
+        _, text, _ = pf.build_email(self._pf(200.0), [], chart_ok=False)
+        self.assertIn("reward credits +153.24", text)
+        self.assertIn("includes +200.00 of collateral Kalshi released", text)
+
+    def test_unrecorded_prior_lumps_and_says_so(self):
+        # the first morning after the change: the prior snapshot has no
+        # collateral reading, so the credits still hold its move
+        subject, text, html = pf.build_email(self._pf(None), [], chart_ok=False)
+        self.assertIn("reward credits & Kalshi collateral +353.24", text)
+        self.assertIn("rewards & collateral +$0.4k", subject)
+        self.assertIn("the prior morning did not record it", html)
+
+
 class ImmSectionTests(unittest.TestCase):
     """Jack 2026-10-02: "cut it as a standalone email and add it into the
     Kalshi portfolio ... email" -- the IMM digest is a section of this one."""

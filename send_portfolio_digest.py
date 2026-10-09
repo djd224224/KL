@@ -201,7 +201,7 @@ def family_for(event_ticker: str) -> str:
 
 def fetch_unsettled_positions(client):
     """All unsettled positions account-wide. Returns (events, mkt_pos):
-    events: ev -> {"realized": $, "fees": $};
+    events: ev -> {"realized": $, "fees": $, "exposure": $};
     mkt_pos: ticker -> {"pos": contracts, "cost": $ paid for them}."""
     events, mkt_pos = {}, {}
     cursor = None
@@ -213,7 +213,8 @@ def fetch_unsettled_positions(client):
             t = ev.get("event_ticker")
             if t:
                 events[t] = {"realized": _f(ev.get("realized_pnl_dollars")),
-                             "fees": _f(ev.get("fees_paid_dollars"))}
+                             "fees": _f(ev.get("fees_paid_dollars")),
+                             "exposure": _f(ev.get("event_exposure_dollars"))}
         for p in resp.get("market_positions") or []:
             pos = _f(p.get("position"))
             if abs(pos) > 0.0001 and p.get("ticker"):
@@ -226,6 +227,21 @@ def fetch_unsettled_positions(client):
     log(f"positions: {len(events)} unsettled events, "
         f"{len(mkt_pos)} open market positions ({pages} pages)")
     return events, mkt_pos
+
+
+def collateral_returned(events, mkt_pos) -> float:
+    """Collateral Kalshi has handed back on open positions: the markets'
+    exposure summed less their events' exposure. Across mutually exclusive
+    outcomes (vote-share buckets, awards, "who finishes 4th") at most one NO
+    can lose, so Kalshi releases the guaranteed part up front, and takes it
+    back when the positions change or settle (2026-10-09: Quebec 4th place,
+    NO on three parties, settled with cash $100 under its revenue). The cash
+    moves with no fill or settlement behind it, and Kalshi's portfolio_value
+    nets it out ($2,819.57 returned vs Kalshi $2.8k under our mids, 10/9), so
+    a release is no gain: before 10/10 it read as reward credits (Jack:
+    "the reward credit is wrong in the email")."""
+    return round(sum(r["cost"] for r in mkt_pos.values())
+                 - sum(e.get("exposure", 0.0) for e in events.values()), 2)
 
 
 def fetch_recent_settlements(client, cutoff_utc: datetime):
@@ -282,6 +298,37 @@ def fetch_perps(client):
     except Exception as e:
         log(f"! perps positions read failed: {e}")
     return out
+
+
+def fetch_subaccounts(client):
+    """The numbered subaccounts (nfl_snipe_bot trades live in subaccount 1
+    since 2026-10-09, funded from the primary). The primary's balance and
+    portfolio_value leave them out, so a move between the primary and a
+    subaccount read as cash that left with no trade behind it: on 10/9 the
+    $300 funding showed as reward credits +53.24 for +353.24 (Jack: "the
+    reward credit is wrong in the email").
+
+    {"equity": $ over every numbered subaccount (its cash + Kalshi's
+    portfolio_value, as the primary), "accounts": {n: $}, "moves": [(ts, $
+    into the primary)]}, None when a read fails."""
+    try:
+        bals = client.get("/portfolio/subaccounts/balances").get("subaccount_balances") or []
+        moves = []
+        for t in client.get("/portfolio/subaccounts/transfers").get("transfers") or []:
+            amt = _f(t.get("amount_cents")) / 100.0
+            src, dst = int(t.get("from_subaccount") or 0), int(t.get("to_subaccount") or 0)
+            if (src == 0) != (dst == 0):          # numbered <-> numbered nets to 0
+                moves.append((_f(t.get("created_ts")), amt if dst == 0 else -amt))
+        accounts = {}
+        for n in sorted({int(b.get("subaccount_number") or 0) for b in bals} - {0}):
+            b = client.get("/portfolio/balance", params={"subaccount": n})
+            accounts[n] = round(_f(b.get("balance_dollars"))
+                                + _f(b.get("portfolio_value")) / 100.0, 2)
+    except Exception as e:
+        log(f"! subaccount read failed: {e!r}")
+        return None
+    return {"equity": round(sum(accounts.values()), 2), "accounts": accounts,
+            "moves": moves}
 
 
 def estimate_unpaid_rewards(client, now_utc):
@@ -621,7 +668,8 @@ def load_prior_snapshot(today_str: str):
 
 
 HISTORY_COLS = ["date", "cash", "positions_value", "equity",
-                "kalshi_positions_value", "perps_equity", "unpaid_rewards_est"]
+                "kalshi_positions_value", "perps_equity", "unpaid_rewards_est",
+                "subs_equity"]
 
 
 def load_history():
@@ -640,7 +688,8 @@ def load_history():
                         r.get("kalshi_positions_value") or "")
                 except ValueError:
                     row["kalshi_positions_value"] = ""
-                for k in ("perps_equity", "unpaid_rewards_est"):   # 9/28 on
+                for k in ("perps_equity", "unpaid_rewards_est",    # 9/28 on
+                          "subs_equity"):                          # 10/9 on
                     try:
                         row[k] = float(r.get(k) or "")
                     except ValueError:
@@ -651,14 +700,15 @@ def load_history():
 
 
 def upsert_history(rows, today_str, cash, pos_value, equity, kalshi_pv,
-                   perps_equity=None, unpaid=None):
+                   perps_equity=None, unpaid=None, subs_equity=None):
     rows = [r for r in rows if r["date"] != today_str]
     rows.append({"date": today_str, "cash": round(cash, 2),
                  "positions_value": round(pos_value, 2),
                  "equity": round(equity, 2),
                  "kalshi_positions_value": round(kalshi_pv, 2),
                  "perps_equity": "" if perps_equity is None else round(perps_equity, 2),
-                 "unpaid_rewards_est": "" if unpaid is None else round(unpaid, 2)})
+                 "unpaid_rewards_est": "" if unpaid is None else round(unpaid, 2),
+                 "subs_equity": "" if subs_equity is None else round(subs_equity, 2)})
     rows.sort(key=lambda r: r["date"])
     return rows
 
@@ -684,6 +734,8 @@ def build_portfolio(now_utc: datetime):
     cash = _f(bal.get("balance_dollars"))
     kalshi_pv = _f(bal.get("portfolio_value")) / 100.0   # Kalshi's own valuation
     ev_roll, mkt_pos = fetch_unsettled_positions(client)
+    collat = collateral_returned(ev_roll, mkt_pos)
+    log(f"collateral Kalshi has returned on open positions: ${collat:,.2f}")
     cutoff = now_utc - timedelta(hours=LOOKBACK_H)
     settlements = fetch_recent_settlements(client, cutoff)
     prior = load_prior_snapshot(today_str)
@@ -825,8 +877,19 @@ def build_portfolio(now_utc: datetime):
         perps_equity, perps_stale = _f(prior["perps_equity"]), True
     else:
         perps_equity = None
+    # Numbered subaccounts, the same way: a failed read carries the prior
+    # value, flagged, and leaves the day's moves unknown (sub_moves None).
+    subs = fetch_subaccounts(client)
+    subs_stale = False
+    if subs is not None:
+        subs_equity = subs["equity"] if subs["accounts"] else None
+    elif (prior or {}).get("subs_equity") is not None:
+        subs_equity, subs_stale = _f(prior["subs_equity"]), True
+    else:
+        subs_equity = None
     equity_kalshi = round(cash + kalshi_pv, 2)
-    account_value = round(equity_kalshi + (perps_equity or 0.0), 2)
+    account_value = round(equity_kalshi + (perps_equity or 0.0)
+                          + (subs_equity or 0.0), 2)
     unpaid = estimate_unpaid_rewards(client, now_utc)
 
     # Total profit (Jack 2026-10-04: "at the top also show total profit,
@@ -850,6 +913,10 @@ def build_portfolio(now_utc: datetime):
                 "equity_kalshi": equity_kalshi,
                 "perps_equity": perps_equity, "perps_stale": perps_stale,
                 "perps_positions": (perps or {}).get("positions"),
+                "subs_equity": subs_equity, "subs_stale": subs_stale,
+                "collateral_returned": collat,
+                "subs": None if subs is None else {
+                    str(n): v for n, v in subs["accounts"].items()},
                 "account_value": account_value,
                 "unpaid_rewards_est": (unpaid or {}).get("total"),
                 "deposited": deposited, "withdrawn": withdrawn,
@@ -866,6 +933,7 @@ def build_portfolio(now_utc: datetime):
     # event-rollup diff below is kept only for a prior snapshot without
     # per-market positions (none since 8/14).
     rows, no_trade_cash, net_transfers, replay_info = [], None, None, None
+    sub_moves = None
     prior_tickers = (prior or {}).get("tickers")
     if prior and prior_created is not None and prior_tickers:
         ev_map, start = {}, {}
@@ -914,6 +982,9 @@ def build_portfolio(now_utc: datetime):
         if transfers is not None:
             dep, wd = sum_transfers(transfers, prior_created, now_utc)
             net_transfers = round(dep - wd, 2)
+        if subs is not None:
+            sub_moves = round(sum(a for ts, a in subs["moves"]
+                                  if prior_created.timestamp() < ts <= now_utc.timestamp()), 2)
         check = (sum(r["day"] for r in rows) - trade_cash
                  - (sum(v for _, v in tk_end.values()) - sum(v for _, v in start.values())))
         replay_info = {"fills": len(fills), "settlements": len(win_setts),
@@ -921,7 +992,9 @@ def build_portfolio(now_utc: datetime):
         log(f"replay: {len(fills)} fills, {len(win_setts)} settlements, "
             f"{len(mism)} mismatches; trading cash {trade_cash:+,.2f}, cash with "
             f"no trade behind it {no_trade_cash:+,.2f}, transfers "
-            f"{'n/a' if net_transfers is None else f'{net_transfers:+,.2f}'}; "
+            f"{'n/a' if net_transfers is None else f'{net_transfers:+,.2f}'}, "
+            f"into the primary from subaccounts "
+            f"{'n/a' if sub_moves is None else f'{sub_moves:+,.2f}'}; "
             f"rows vs cash+value check {check:+.2f}")
     else:
         def P(e):
@@ -961,7 +1034,12 @@ def build_portfolio(now_utc: datetime):
             "kalshi_positions_value": round(kalshi_pv, 2),
             "equity_kalshi": equity_kalshi,
             "perps_equity": perps_equity, "perps": perps,
-            "perps_stale": perps_stale, "account_value": account_value,
+            "perps_stale": perps_stale, "subs_equity": subs_equity,
+            "subs": subs, "subs_stale": subs_stale, "sub_moves": sub_moves,
+            "collateral_returned": collat,
+            "collateral_d": (None if (prior or {}).get("collateral_returned") is None
+                             else round(collat - _f(prior["collateral_returned"]), 2)),
+            "account_value": account_value,
             "unpaid": unpaid, "deposited": deposited, "withdrawn": withdrawn,
             "total_profit": total_profit,
             "rows": rows, "snapshot": snapshot, "prior": prior,
@@ -990,10 +1068,12 @@ def render_chart(history, out_png: str) -> bool:
     dates = [datetime.strptime(r["date"], "%Y-%m-%d").date() for r in hist]
     # Account value on Kalshi's own positions valuation (Jack 8/14: "value it
     # based on Kalshi"); rows predating that column fall back to our marks.
-    # Perpetuals are in from 9/28 (earlier rows have none recorded).
+    # Perpetuals are in from 9/28, numbered subaccounts from 10/9 (earlier
+    # rows have none recorded).
     eq = [(r["cash"] + r["kalshi_positions_value"]
            if isinstance(r.get("kalshi_positions_value"), float) else r["equity"])
-          + (r["perps_equity"] if isinstance(r.get("perps_equity"), float) else 0.0)
+          + sum(r[k] for k in ("perps_equity", "subs_equity")
+                if isinstance(r.get(k), float))
           for r in hist]
 
     fig, ax = plt.subplots(figsize=(7.6, 3.1), dpi=180)
@@ -1136,7 +1216,28 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     prior_perps = prior.get("perps_equity")
     d_perps = (None if first or perps_eq is None or prior_perps is None
                else round(perps_eq - _f(prior_perps), 2))
-    d_equity = None if first else round(d_ek + (d_perps or 0.0), 2)
+    # Numbered subaccounts (10/9 on), like the perps: in the day change once
+    # both mornings have a value. Cash moved between them and the primary
+    # (sub_moves, + = into the primary) is no gain or loss: it comes out of
+    # the reward credits, and the subaccounts' line is their move net of it.
+    subs_eq = pf.get("subs_equity")
+    prior_subs = prior.get("subs_equity")
+    d_subs = (None if first or subs_eq is None or prior_subs is None
+              else round(subs_eq - _f(prior_subs), 2))
+    moves = None if first else pf.get("sub_moves", 0.0)
+    subs_pnl = None if d_subs is None else round(d_subs + (moves or 0.0), 2)
+    d_equity = None if first else round(d_ek + (d_perps or 0.0) + (d_subs or 0.0), 2)
+    if subs_eq is None:
+        subs_note = ""
+    elif pf.get("subs_stale"):
+        subs_note = " (yesterday's value: today's read failed)"
+    elif not first and prior_subs is None:
+        subs_note = " (first counted today, so not in the day change)"
+    else:
+        subs_note = ""
+    accts = (pf.get("subs") or {}).get("accounts") or {}
+    subs_label = (f"subaccount {next(iter(accts))}" if len(accts) == 1
+                  else "subaccounts")
     unpaid = pf.get("unpaid") or None
     unpaid_total = unpaid.get("total") if unpaid else None
     after_txt = ("" if unpaid_total is None else
@@ -1184,31 +1285,57 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     # credits; deposits apart when the transfer reads work), and Kalshi's
     # valuation of the open positions against the mids these rows use.
     movers, mv_tot, (mv_hidden_n, mv_hidden_net) = family_movers(pf["rows"])
-    ex_perps = " ex-perpetuals" if perps_eq is not None else ""
+    ex_what = [w for w, v in (("perpetuals", perps_eq), ("subaccounts", subs_eq))
+               if v is not None]
+    ex_perps = " ex-" + " & ".join(ex_what) if ex_what else ""
     trading = mv_tot["day"]
     parts = None                        # [(label, $)] summing to d_ek exactly
     transfers = None if first else pf.get("net_transfers")
     ntc = None if first else pf.get("no_trade_cash")
+    # The day's change in collateral Kalshi has returned early (+ = released,
+    # - = taken back): cash with no fill or settlement behind it, which
+    # Kalshi's valuation offsets, so it leaves the reward credits for
+    # Kalshi's pricing vs mid. None = the prior morning did not record it.
+    collat_d = None if first else pf.get("collateral_d", 0.0)
+    rewards = None
     if not first:
         if ntc is None:                 # no replay (legacy prior snapshot)
             parts = [("trading (at mid)", trading),
                      ("credits, deposits & Kalshi's pricing vs mid",
                       round(d_ek - trading, 2))]
         else:
+            rewards = round(ntc - (transfers or 0.0) - (moves or 0.0)
+                            - (collat_d or 0.0), 2)
             parts = [("trading (at mid)", trading),
-                     ("reward credits" if transfers is not None
-                      else "reward credits & deposits",
-                      round(ntc - (transfers or 0.0), 2))]
+                     ("reward credits" + ("" if transfers is not None else " & deposits")
+                      + ("" if moves is not None else " & subaccount moves")
+                      + ("" if collat_d is not None else " & Kalshi collateral"), rewards)]
             if transfers:
                 parts.append(("deposits/withdrawals", transfers))
-            parts.append(("Kalshi's pricing vs mid", round(d_ek - trading - ntc, 2)))
+            if moves:
+                parts.append(("subaccount transfers", moves))
+            parts.append(("Kalshi's pricing vs mid",
+                          round(d_ek - trading - ntc + (collat_d or 0.0), 2)))
 
     # The day figure, in the subject and the body, leaves deposits and
     # withdrawals out (Jack 2026-10-04: "make the day figure exclude
     # deposits"): it is the day's change in total profit. Unread transfers
-    # stay in it, and the subject says so.
-    d_day = None if first else round(d_equity - (transfers or 0.0), 2)
-    day_parts = [(k, v) for k, v in parts or [] if k != "deposits/withdrawals"]
+    # stay in it, and the subject says so. Cash moved to a subaccount is
+    # still the account's: with the subaccounts in the day change it nets
+    # out there; without them (their first morning) it is taken back out.
+    d_day = None if first else round(
+        d_equity - (transfers or 0.0) - ((moves or 0.0) if d_subs is None else 0.0), 2)
+    day_parts = [(k, v) for k, v in parts or []
+                 if k not in ("deposits/withdrawals", "subaccount transfers")]
+    day_tail = (("" if d_perps is None else f"  +  perpetuals {d_perps:+,.2f}")
+                + ("" if subs_pnl is None else f"  +  {subs_label} {subs_pnl:+,.2f}"))
+    day_tail_html = (("" if d_perps is None else
+                      f' &nbsp;+&nbsp; perpetuals {_pnl_span(d_perps)}')
+                     + ("" if subs_pnl is None else
+                        f' &nbsp;+&nbsp; {subs_label} {_pnl_span(subs_pnl)}'))
+    excl = (([f"deposits/withdrawals {transfers:+,.2f}"] if transfers else [])
+            + ([f"subaccount transfers {moves:+,.2f}"] if moves else []))
+    excl_txt = f"  (excludes {', '.join(excl)})" if excl else ""
 
     # Jack 2026-10-04: "shorten like this: portfolio 2026-10-04: profit
     # +$18.2k (day +$1.6k, trading -$0.7K)", then "yes add rewards to the
@@ -1222,9 +1349,11 @@ def build_email(pf, history, chart_ok: bool, imm=None):
         tail = (f"day {_signed_k(d_day)}"
                 + ("" if transfers is not None else " incl. any deposits")
                 + f": trading {_signed_k(trading)}")
-        if ntc is not None:
+        if rewards is not None:
             tail += (", rewards" + ("" if transfers is not None else " & deposits")
-                     + f" {_signed_k(ntc - (transfers or 0.0))}")
+                     + ("" if moves is not None else " & subaccount moves")
+                     + ("" if collat_d is not None else " & collateral")
+                     + f" {_signed_k(rewards)}")
     subject = (f"portfolio {today}: profit "
                + ("n/a" if profit is None else _signed_k(profit)) + f" ({tail})")
     if imm and imm.get("subject_flag"):
@@ -1236,7 +1365,9 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     lines.append(f"  =  cash ${pf['cash']:,.2f}  +  open positions "
                  f"${pf['kalshi_positions_value']:,.2f}"
                  + ("" if perps_eq is None else
-                    f"  +  perpetuals ${perps_eq:,.2f}{perps_note}"))
+                    f"  +  perpetuals ${perps_eq:,.2f}{perps_note}")
+                 + ("" if subs_eq is None else
+                    f"  +  {subs_label} ${subs_eq:,.2f}{subs_note}"))
     lines.append(profit_txt)
     if profit_basis:
         lines.append(f"  =  {profit_basis}")
@@ -1247,10 +1378,7 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     else:
         lines.append(f"vs yesterday: {d_day:+,.2f}  =  "
                      + "  +  ".join(f"{k} {v:+,.2f}" for k, v in day_parts)
-                     + ("" if d_perps is None else
-                        f"  +  perpetuals {d_perps:+,.2f}")
-                     + ("" if not transfers else
-                        f"  (excludes deposits/withdrawals {transfers:+,.2f})"))
+                     + day_tail + excl_txt)
     lines.append("")
     # the risk-controls block under the account summary, as in the html
     # (Jack 2026-10-03: "move the risk controls section right under the
@@ -1293,6 +1421,10 @@ def build_email(pf, history, chart_ok: bool, imm=None):
         lines.append(f"(account value{ex_perps} moved {d_ek:+,.2f} = this table "
                      f"{trading:+,.2f}"
                      + "".join(f"  +  {k} {v:+,.2f}" for k, v in parts[1:]) + ")")
+        if collat_d:
+            lines.append(f"(Kalshi's pricing vs mid includes {collat_d:+,.2f} of collateral "
+                         f"Kalshi {'released' if collat_d > 0 else 'took back'} on mutually "
+                         f"exclusive positions: cash its valuation offsets, not rewards)")
     if imm is not None:
         lines.append("")
         lines.append(imm.get("text") or
@@ -1328,6 +1460,9 @@ def build_email(pf, history, chart_ok: bool, imm=None):
              + ("" if perps_eq is None else
                 f' &nbsp;&middot;&nbsp; perpetuals <b>${perps_eq:,.2f}</b>'
                 f'<span style="color:{C_MUTED}">{perps_note}</span>')
+             + ("" if subs_eq is None else
+                f' &nbsp;&middot;&nbsp; {subs_label} <b>${subs_eq:,.2f}</b>'
+                f'<span style="color:{C_MUTED}">{subs_note}</span>')
              + ("" if unpaid_total is None else
                 f' &nbsp;&middot;&nbsp; rewards earned, not yet paid '
                 f'<b>&asymp; ${unpaid_total:,.2f}</b>')
@@ -1337,11 +1472,9 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                 f'<br>day change {_pnl_span(d_day)} = '
                 + ' &nbsp;+&nbsp; '.join(f'{k.replace("&", "&amp;")} {_pnl_span(v)}'
                                          for k, v in day_parts)
-                + ("" if d_perps is None else
-                   f' &nbsp;+&nbsp; perpetuals {_pnl_span(d_perps)}')
-                + ("" if not transfers else
-                   f' <span style="color:{C_MUTED}">(excludes deposits/withdrawals '
-                   f'{transfers:+,.2f})</span>'))
+                + day_tail_html
+                + ("" if not excl else
+                   f' <span style="color:{C_MUTED}">{excl_txt.strip()}</span>'))
              + '</div>')
     if unpaid_note:
         h.append(f'<div style="color:{C_MUTED};font-size:12px;margin-bottom:6px">'
@@ -1421,13 +1554,24 @@ def build_email(pf, history, chart_ok: bool, imm=None):
         h.append('</table>')
         if parts is not None:
             h.append(f'<div style="color:{C_MUTED};font-size:12px;margin:4px 0 0">'
-                     f'Account value{ex_perps} moved {_pnl_span(d_ek)} = this table '
+                     f'Account value{ex_perps.replace("&", "&amp;")} moved '
+                     f'{_pnl_span(d_ek)} = this table '
                      f'{_pnl_span(trading)}'
                      + "".join(f' &nbsp;+&nbsp; {k.replace("&", "&amp;")} {_pnl_span(v)}'
                                for k, v in parts[1:])
                      + '. Reward credits = cash that came in with no trade or '
-                       'settlement behind it; Kalshi values open positions near '
-                       'what they would sell for, this table at the mid.</div>')
+                       'settlement behind it'
+                     + ("" if not collat_d else
+                        f', less {_pnl_span(collat_d)} of collateral Kalshi '
+                        f'{"released" if collat_d > 0 else "took back"} on mutually '
+                        f'exclusive positions (in Kalshi\'s pricing vs mid, which '
+                        f'offsets it)')
+                     + ("" if collat_d is not None else
+                        ' (it still holds collateral Kalshi released or took back on '
+                        'mutually exclusive positions: the prior morning did not '
+                        'record it)')
+                     + '; Kalshi values open positions near what they would sell '
+                       'for, this table at the mid.</div>')
     else:
         h.append(f'<div style="color:{C_INK2}">Nothing moved since the prior '
                  f'morning.</div>')
@@ -1567,7 +1711,8 @@ def main(argv=None) -> int:
                                      pf["positions_value"], pf["equity"],
                                      pf["kalshi_positions_value"],
                                      pf.get("perps_equity"),
-                                     (pf.get("unpaid") or {}).get("total"))
+                                     (pf.get("unpaid") or {}).get("total"),
+                                     pf.get("subs_equity"))
     if not (args.test or args.dry_run):
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(snapshot_path(today_str), "w", encoding="utf-8") as f:
