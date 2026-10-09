@@ -103,6 +103,11 @@ and cooldowns behave as they would live. --live sends orders.
     python nfl_snipe_bot.py --setup            # subaccount setup steps
 Every threshold is also an env var: SNIPE_<FIELD> (SNIPE_MAX_RISK_TOTAL=500).
 Halt: create run-logs/nfl-snipe/HALT (no orders while it exists).
+Email (Jack 2026-10-08: "email alert everytime it buys"): every live fill,
+and a halt, mails SNIPE_ALERT_TO (default ALERT_EMAIL_TO, else the sender)
+through the ALERT_EMAIL_FROM / ALERT_EMAIL_PASSWORD Gmail account the other
+bots use; SNIPE_EMAIL=0 turns it off. Sent on a thread; a failed send is
+logged and never stops trading.
 Logs: run-logs/nfl-snipe/ -- snipe_<date>.log, decisions_ / orders_ /
 fills_<date>.jsonl, snipe_status.json.
 """
@@ -114,9 +119,12 @@ import json
 import math
 import os
 import shutil
+import smtplib
 import sys
+import threading
 import time
 import uuid
+from email.mime.text import MIMEText
 from collections import Counter
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
@@ -878,6 +886,65 @@ def size_order(sig: Signal, limit: float, available: float, book: SnipeBook,
     return 0, min(rooms, key=rooms.get)
 
 
+# ------------------------------------------------------------------ email
+
+def email_enabled() -> bool:
+    return (os.environ.get("SNIPE_EMAIL", "1") == "1"
+            and bool(os.environ.get("ALERT_EMAIL_FROM"))
+            and bool(os.environ.get("ALERT_EMAIL_PASSWORD")))
+
+
+def send_email(subject: str, body: str,
+               smtp: Callable[..., Any] = smtplib.SMTP_SSL) -> bool:
+    """One alert email through the bots' Gmail account; False (never an
+    exception) when it is not configured or the send fails."""
+    frm = os.environ.get("ALERT_EMAIL_FROM", "")
+    pw = os.environ.get("ALERT_EMAIL_PASSWORD", "")
+    to = (os.environ.get("SNIPE_ALERT_TO") or os.environ.get("ALERT_EMAIL_TO")
+          or frm)
+    if not (frm and pw and to):
+        return False
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = frm
+    msg["To"] = to
+    try:
+        with smtp("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(frm, pw)
+            server.sendmail(frm, [r.strip() for r in to.split(",") if r.strip()],
+                            msg.as_string())
+        return True
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def fill_email(sig: "Signal", filled: float, avg: float, fee: float, oid: str,
+               subaccount: int, book_risk: float, cash: Optional[float]
+               ) -> Tuple[str, str]:
+    """(subject, body) for a live fill."""
+    verb = "SOLD" if sig.side == "sell" else "BOUGHT"
+    what = sig.ticker.split("-", 1)[0].replace("KXNFL", "")
+    risk = filled * risk_per_contract(sig.side, avg)
+    edge = (avg - sig.fair if sig.side == "sell" else sig.fair - avg) - fee_cents(avg)
+    subject = (f"NFL sniper {verb} {filled:g} YES @ {avg:.2f}c -- {sig.player} "
+               f"{what} (+${filled * edge / 100:.2f} exp)")
+    body = "\n".join([
+        f"{verb} {filled:g} YES of {sig.ticker} at {avg:.2f}c (limit {sig.limit:g}c)",
+        f"Player: {sig.player}  stat: {sig.stat} {sig.kind}",
+        f"Fair {sig.fair:.2f}c (model {sig.model_fair if sig.model_fair is not None else sig.fair:.2f}c), "
+        f"band {sig.lo:.2f}-{sig.hi:.2f}c; mean {sig.mu:.1f} vs book {sig.implied_mu or 0:.1f}"
+        + (f", last games {sig.recent_mean:.1f}" if sig.recent_mean is not None else ""),
+        f"Expected edge {edge:.2f}c a contract = ${filled * edge / 100:+.2f}; "
+        f"money at risk ${risk:.2f}; fee ${fee:.2f}",
+        f"Kickoff {_utc(sig.kickoff).strftime('%a %m/%d %H:%MZ') if sig.kickoff else '?'}",
+        f"Subaccount {subaccount}: ${book_risk:.2f} at risk on the book"
+        + (f", ${cash:.2f} cash left" if cash is not None else ""),
+        f"Order {oid}",
+        "Halt: create C:\\Users\\jackd\\Documents\\KL\\run-logs\\nfl-snipe\\HALT",
+    ])
+    return subject, body
+
+
 # ------------------------------------------------------------------ the bot
 
 class Sniper:
@@ -897,6 +964,21 @@ class Sniper:
         self.noted: Dict[Tuple[str, str], float] = {}
         self.scans = 0
         self._restore_watch()
+        # set to None to send nothing (tests); live fills and halts only
+        self.mailer: Optional[Callable[[str, str], Any]] = (
+            send_email if cfg.live and email_enabled() else None)
+
+    def _mail(self, subject: str, body: str) -> None:
+        """Send on a thread: SMTP can take seconds, the scan cannot wait."""
+        if self.mailer is None:
+            return
+        mailer = self.mailer
+
+        def run() -> None:
+            ok = mailer(subject, body)
+            if ok is False:
+                self.log(f"! alert email failed: {subject}")
+        threading.Thread(target=run, daemon=True).start()
 
     # -- one scan
     def scan(self, now_ts: Optional[float] = None) -> dict:
@@ -1061,6 +1143,8 @@ class Sniper:
             self.log.row("fills", {**row, "order_id": oid, "client_order_id": coid,
                                    "filled": filled, "avg_cents": avg_fill,
                                    "fee": fee})
+            self._mail(*fill_email(sig, filled, avg_fill, fee, oid, cfg.subaccount,
+                                   self.book.total_risk(), cash[shard]))
         self.log(f"{'FILLED' if filled > 0 else 'no fill'} {desc} -> "
                  f"{filled:g} @ {avg_fill:.2f}c, fee ${fee:.2f} ({oid})")
         self.log.row("orders", {**row, "order_id": oid, "client_order_id": coid,
@@ -1079,6 +1163,8 @@ class Sniper:
         why = (f"order {oid} on {sig.ticker} was booked to subaccount {booked}, "
                f"not {self.cfg.subaccount} ({filled:g} filled @ {avg_fill:.2f}c)")
         self.log(f"!! {why} -- HALTED; delete {HALT_FILE} to resume")
+        self._mail(f"NFL sniper HALTED: order booked to subaccount {booked}",
+                   why + "\n\nThe bot idles until run-logs\\nfl-snipe\\HALT is deleted.")
         try:
             with open(os.path.join(self.log_dir, HALT_FILE), "w", encoding="utf-8") as f:
                 f.write(why + "\n")

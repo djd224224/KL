@@ -5,9 +5,14 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
+
+# never send real email from the suite: the machine's user env carries the
+# bots' Gmail credentials (TestEmail sets its own environment)
+os.environ["SNIPE_EMAIL"] = "0"
 
 import nfl_prop_fair as nf
 import nfl_snipe_bot as sb
@@ -605,6 +610,82 @@ class TestSubaccountLive(unittest.TestCase):
             self.assertEqual(sb.main(["--live", "--subaccount", "2",
                                       "--log-dir", self.d]), 2)
             S.assert_not_called()
+
+
+class TestEmail(unittest.TestCase):
+    """Jack 2026-10-08: "email alert everytime it buys"."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        p = mock.patch.object(sb, "IMM_STATUS_FILE", os.path.join(self.d, "none.json"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_every_live_fill_mails(self):
+        sent = []
+        ex = FakeExchange(
+            {T: market(bid=34, ask=98)},
+            {T: {"orderbook_fp": {"yes_dollars": [["0.3400", "60"]], "no_dollars": []}}},
+            booked=1)
+        games = {entry()["pid"]: [{"receptions": v} for v in (3, 3, 4, 5)]}
+        b = sb.Sniper(cfg(live=True, subaccount=1), exchange=ex,
+                      watch=FakeWatch({T: entry()}, games), kick=FakeKick(),
+                      log_dir=self.d, log=sb.Log(self.d, echo=False))
+        b.mailer = lambda s, body: sent.append((s, body)) or True
+        b.scan(NOW)
+        for _ in range(50):                        # the mail runs on a thread
+            if sent:
+                break
+            time.sleep(0.02)
+        self.assertEqual(len(sent), 1)
+        subject, body = sent[0]
+        self.assertIn("SOLD", subject)
+        self.assertIn("Malik Washington", subject)
+        self.assertIn(T, body)
+        self.assertIn("Subaccount 1", body)
+
+    def test_dry_run_and_no_fill_send_nothing(self):
+        b = sb.Sniper(cfg(), exchange=FakeExchange({}, {}), watch=FakeWatch({}),
+                      kick=FakeKick(), log_dir=self.d, log=sb.Log(self.d, echo=False))
+        self.assertIsNone(b.mailer)                # dry run: no mailer at all
+
+    def test_send_email_uses_the_alert_account(self):
+        calls = {}
+
+        class S:
+            def __init__(self, host, port, timeout):
+                calls["host"] = (host, port)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def login(self, u, p):
+                calls["login"] = u
+
+            def sendmail(self, frm, to, msg):
+                calls["to"] = to
+
+        env = {"ALERT_EMAIL_FROM": "bot@x.com", "ALERT_EMAIL_PASSWORD": "pw",
+               "SNIPE_ALERT_TO": "jack@x.com", "SNIPE_EMAIL": "1"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertTrue(sb.send_email("s", "b", smtp=S))
+            self.assertTrue(sb.email_enabled())
+        self.assertEqual(calls, {"host": ("smtp.gmail.com", 465), "login": "bot@x.com",
+                                 "to": ["jack@x.com"]})
+        with mock.patch.dict(os.environ, {"ALERT_EMAIL_FROM": "", "ALERT_EMAIL_PASSWORD": ""}):
+            self.assertFalse(sb.send_email("s", "b", smtp=S))
+        with mock.patch.dict(os.environ, {**env, "SNIPE_EMAIL": "0"}):
+            self.assertFalse(sb.email_enabled())
+
+        class Boom(S):
+            def login(self, u, p):
+                raise OSError("smtp down")
+        with mock.patch.dict(os.environ, env):
+            self.assertFalse(sb.send_email("s", "b", smtp=Boom))   # never raises
 
 
 class TestExchangeBody(unittest.TestCase):
